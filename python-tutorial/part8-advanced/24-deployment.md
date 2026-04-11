@@ -18,6 +18,8 @@
 
 ## 24.1 模型导出（TorchScript、ONNX）
 
+> 延伸阅读：如果你想补齐 `torch.compile`、混合精度、CUDA 后端执行路径背后的底层背景，可继续阅读 [CUDA 教程：Profiling 与 Benchmarking](../../cuda-tutorial/part5-performance-and-tooling/14-profiling-and-benchmarking.md)、[WMMA 与 Tensor Core](../../cuda-tutorial/part7-libraries-and-dl/20-wmma-and-tensor-cores.md) 与 [PyTorch 自定义 CUDA 算子](../../cuda-tutorial/part7-libraries-and-dl/21-pytorch-custom-cuda-ops.md)。
+
 训练完成的 PyTorch 模型默认以 Python 对象的形式存在，无法直接运行在非 Python 环境（如 C++ 服务、移动端、嵌入式设备）中。**模型导出**将模型序列化为与运行时环境无关的格式，是部署的第一步。
 
 ### 24.1.1 TorchScript 导出

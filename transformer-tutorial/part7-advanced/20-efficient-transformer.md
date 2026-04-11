@@ -18,6 +18,8 @@
 
 ## 20.1 注意力的效率问题
 
+> 延伸阅读：本章会多次提到 FlashAttention、块稀疏注意力、cuBLAS 和自定义 CUDA kernel。若你希望从 GPU 执行与访存角度理解这些实现背景，可继续阅读 [CUDA 教程：共享内存与分块优化](../../cuda-tutorial/part3-memory-and-execution/08-shared-memory-and-tiling.md)、[访存合并与 Occupancy](../../cuda-tutorial/part5-performance-and-tooling/13-memory-coalescing-and-occupancy.md) 与 [cuBLAS、cuDNN 与 CUB](../../cuda-tutorial/part7-libraries-and-dl/19-cublas-cudnn-and-cub.md)。
+
 ### 20.1.1 $O(L^2)$ 的时间和空间复杂度
 
 标准自注意力机制的核心计算是：

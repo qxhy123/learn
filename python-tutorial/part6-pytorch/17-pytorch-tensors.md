@@ -18,6 +18,8 @@
 
 ## 17.1 PyTorch简介与安装
 
+> 延伸阅读：如果你想进一步理解 `.cuda()`、device 张量背后的 GPU 执行模型、显存分配和 CUDA kernel 基础，可继续阅读 [CUDA 教程：环境配置与第一个 CUDA 程序](../../cuda-tutorial/part1-foundations/02-environment-and-first-program.md) 与 [CUDA 教程：内存分配与数据传输](../../cuda-tutorial/part2-programming-model/05-memory-allocation-and-transfer.md)。
+
 ### 什么是PyTorch
 
 *PyTorch* 是由Meta AI Research（Facebook）开发的深度学习框架，于2016年开源。它以**动态计算图**为核心特性，使得调试和实验极为便捷，已成为学术研究和工业实践中最受欢迎的深度学习框架之一。
