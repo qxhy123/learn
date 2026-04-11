@@ -45,6 +45,8 @@
 | Trace | OpenTelemetry、Jaeger | 跨服务链路追踪 |
 | 成本与审计 | 云账单系统、自建 cost attribution、审计日志 | 成本归因、权限审计 |
 
+> 延伸阅读：如果你想把 OpenTelemetry 从“工具名称”继续学到“统一埋点模型、Collector 管道、跨信号关联与生产治理”，可阅读 [OpenTelemetry 教程](../../opentelemetry-tutorial/README.md)，尤其是 [OpenTelemetry Collector 基础](../../opentelemetry-tutorial/part5-collector-and-pipelines/13-opentelemetry-collector-basics.md) 与 [搭建一个观测栈](../../opentelemetry-tutorial/part8-advanced-and-capstone/24-build-an-observability-stack.md)。
+
 ## RAG 与向量基础设施
 
 | 类别 | 常见示例 | 主要作用 |

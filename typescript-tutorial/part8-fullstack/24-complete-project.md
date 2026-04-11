@@ -877,6 +877,8 @@ jobs:
 
 使用 Pino 实现高性能结构化日志，每条日志都是 JSON，便于 ELK/Loki 等日志系统解析：
 
+> 延伸阅读：如果你想把本节里的 `Pino + OpenTelemetry` 方案系统化理解为完整的 traces / metrics / logs 体系，可继续阅读 [OpenTelemetry 教程：用 Node.js / TypeScript 接入 OTel](../../opentelemetry-tutorial/part4-instrumentation-and-sdks/12-nodejs-otel-instrumentation-in-practice.md)、[Logs 与跨信号关联](../../opentelemetry-tutorial/part3-metrics-logs-and-semantics/08-logs-and-cross-signal-correlation.md) 与 [调试断裂链路与缺失信号](../../opentelemetry-tutorial/part6-production-operations/18-debugging-broken-telemetry.md)。
+
 **`apps/backend/src/config/logger.ts`**：
 
 ```typescript
