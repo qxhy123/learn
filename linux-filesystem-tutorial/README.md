@@ -105,6 +105,8 @@
 | A1 | [常用命令速查](./appendix/command-cheatsheet.md) | 文件系统观察、容量、挂载、inode、writeback 与排障命令 |
 | A2 | [核心结构速查表](./appendix/structure-cheatsheet.md) | inode、dentry、superblock、page cache、writeback、journal、namespace 等速查 |
 | A3 | [练习题答案索引](./appendix/answers.md) | 各章练习题方向与核对要点 |
+| A4 | [高阶实验与源码阅读路线](./appendix/advanced-labs-and-source-roadmap.md) | 进阶实验、故障演练、内核源码入口与继续深入建议 |
+| A5 | [分区、mkfs、挂载与动态扩容实操](./appendix/practical-mount-partition-and-resize.md) | 从裸盘初始化到持久挂载、LVM 与在线扩容的实践路线 |
 
 ---
 
@@ -149,6 +151,26 @@
 3. 深读第11章、第18章，理解 page cache、writeback、基准与持久化之间的错位
 4. 回看第16章、第17章，把本地语义和容器/远端语义区别开
 
+### 路径五：高阶实验与源码阅读（1-2 周）
+
+适合已经读完主要章节、希望把“知道概念”升级成“能做实验、能读源码、能复盘事故”的读者：
+
+1. 先读第10章、第12章、第17章、第18章、第20章，建立一致性、远端语义和基准方法的高阶框架
+2. 按照[附录 A4：高阶实验与源码阅读路线](./appendix/advanced-labs-and-source-roadmap.md)完成 4-6 个实验
+3. 结合[附录 A1：常用命令速查](./appendix/command-cheatsheet.md)补上 `mountinfo`、writeback、NFS 观测、`perf`/`bpftrace` 的基本观察路径
+4. 选择一个专题做源码阅读：`fs/namei.c`、`mm/filemap.c`、`fs/ext4/`、`fs/namespace.c`、`fs/overlayfs/` 或 `fs/nfs/`
+5. 最后用第20章的案例分析框架，重写一次自己遇到过的文件系统或容器存储问题
+
+### 路径六：实操初始化与扩容（2-4 天）
+
+适合已经理解基本对象关系、希望把“会看图”和“会动手”连起来的读者：
+
+1. 先读第9章，理解 mount、filesystem instance、`/etc/fstab` 和挂载视图是同一条链上的不同层次
+2. 读第13章，理解空间、配额、预分配和动态扩容不是同一个问题
+3. 按照[附录 A5：分区、mkfs、挂载与动态扩容实操](./appendix/practical-mount-partition-and-resize.md)完成一遍“新盘初始化 -> 持久挂载 -> 在线扩容”
+4. 配合[附录 A1：常用命令速查](./appendix/command-cheatsheet.md)核对 `lsblk`、`blkid`、`findmnt`、`parted`、`pvresize`、`resize2fs`、`xfs_growfs`
+5. 最后回到第10章，重新检查这些操作分别改变的是块层、分区层、卷管理层，还是文件系统层
+
 ---
 
 ## 前置要求
@@ -183,7 +205,24 @@
 - **显式区分“能工作”和“语义可靠”**：重点解释 `rename`、`fsync`、page cache、close-to-open 等常见误判点
 - **重视一致性与恢复语义**：帮助你理解 `fsync`、journal、崩溃恢复为何如此关键
 - **面向工程排障**：关注容量、inode 耗尽、挂载错位、缓存效应、性能瓶颈等真实问题
+- **新增高阶实验与源码入口**：把概念、观测命令、实验设计和内核源码入口连成一条继续深入的路径
+- **补入实操初始化与扩容路线**：把分区、`mkfs`、挂载、`/etc/fstab`、LVM 和在线扩容串成一条可操作路径
+- **补足高阶机制细节**：补入 RCU path walk、`openat2()`、unwritten extent、writeback error、DAX、metadata server / split-brain 等更贴近生产系统的问题
 - **中文编写**：术语统一，便于连续学习与复习
+
+---
+
+## 如果你觉得“前面还是太基础”，应该怎样读
+
+可以直接跳过“按章顺读”的心态，改成按问题读：
+
+- 想搞清路径和安全边界：第6章 + 附录 A1 + 附录 A4
+- 想搞清 ext4 到底保证什么：第8章 + 第10章 + 第12章
+- 想搞清为什么 benchmark 总是骗人：第11章 + 第18章
+- 想真的从裸盘做到持久挂载和扩容：第9章 + 第13章 + 附录 A1 + 附录 A5
+- 想搞清容器和远端共享存储为什么老出玄学问题：第15-17章 + 第20章
+
+这条读法更适合已经熟悉 Linux 基本命令、但想快速建立高阶工程判断的人。
 
 ---
 
