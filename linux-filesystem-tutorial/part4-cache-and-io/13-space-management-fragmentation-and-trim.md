@@ -192,6 +192,438 @@
 
 ---
 
+### 13.13 ext4 块分配器内部：mballoc 与 `struct ext4_group_info`
+
+理解 ext4 的空间管理，需要深入 multi-block allocator（mballoc）的数据结构：
+
+```c
+/* fs/ext4/mballoc.h */
+
+/* 每个块组的运行时状态（驻留内存，不在磁盘上）*/
+struct ext4_group_info {
+    unsigned long   bb_state;           /* 状态标志（EXT4_GROUP_INFO_NEED_INIT_BIT 等）*/
+    struct rb_root  bb_free_root;       /* 空闲 extent 的红黑树（按大小和位置索引）*/
+    ext4_grpblk_t   bb_first_free;      /* 首个空闲块号（快速找起点）*/
+    ext4_grpblk_t   bb_free;           /* 组内空闲块总数 */
+    ext4_grpblk_t   bb_fragments;      /* 空闲片段数（碎片化程度指标）*/
+    ext4_grpblk_t   bb_largest_free_order;  /* 最大连续空闲块的幂次（优化快速查找）*/
+    ext4_group_t    bb_group;          /* 块组编号 */
+    struct list_head bb_prealloc_list; /* 预分配区间链表 */
+    struct rw_semaphore alloc_sem;     /* 分配锁 */
+    ext4_grpblk_t   bb_counters[];    /* 按幂次统计的空闲 extent 数组
+                                         bb_counters[k] = 长度 >= 2^k 块的空闲区间数
+                                         用于快速判断能否满足请求 */
+};
+
+/* 分配请求描述 */
+struct ext4_allocation_request {
+    struct inode    *inode;         /* 分配给哪个 inode */
+    unsigned int    len;            /* 请求分配的块数 */
+    ext4_lblk_t     logical;        /* 文件内逻辑块号 */
+    ext4_lblk_t     lleft;          /* 左邻居逻辑块（局部性提示）*/
+    ext4_lblk_t     lright;         /* 右邻居逻辑块（局部性提示）*/
+    ext4_fsblk_t    goal;           /* 理想的物理块位置（块组 + 偏移）*/
+    ext4_fsblk_t    pleft;          /* 左邻居物理块（辅助局部性判断）*/
+    ext4_fsblk_t    pright;         /* 右邻居物理块 */
+    unsigned int    flags;          /* EXT4_MB_HINT_MERGE / EXT4_MB_HINT_RESERVED 等 */
+};
+```
+
+**mballoc 分配策略**（三级查找）：
+
+```
+mballoc 分配流程（ext4_mb_new_blocks → ext4_mb_regular_allocator）：
+
+第 1 级：局部化分配（locality）
+  → 优先在 goal 块所在块组内查找
+  → 遍历 bb_free_root 红黑树，找符合 len 要求的空闲 extent
+  → 若找到且质量好（连续性高），直接分配 → 最快路径
+
+第 2 级：块组间搜索
+  → 在目标块组失败时，按轮询或策略顺序搜索其他块组
+  → 参考 bb_largest_free_order 快速跳过无法满足的块组
+  → 每个块组用 ext4_mb_find_by_goal() 或 ext4_mb_simple_scan_group()
+
+第 3 级：碎片整合搜索
+  → 最后手段：允许分配比请求更小的 extent（ext4_mb_scan_group）
+  → 结果可能是若干不连续的小 extent，形成更多的 extent tree 节点
+  → 这是性能退化和 extent 碎裂的根因
+
+预分配机制（减少频繁小分配的锁竞争）：
+  inode 预分配（per-inode prealloc）：
+    → ext4_mb_use_inode_pa() → 先从 inode 的 bb_prealloc_list 中取
+    → 若预分配有剩余，直接使用，无需查块组位图
+    → 文件关闭时归还未用的预分配空间
+
+  局部组预分配（group prealloc）：
+    → ext4_mb_use_group_pa() → 从块组级预分配池中取
+    → 用于同一进程密集创建多个小文件的场景
+```
+
+**观察 ext4 分配器状态**：
+
+```bash
+# 查看每个块组的碎片化程度（需 debugfs）
+debugfs -R "stats" /dev/sda1 2>/dev/null | grep -E "Block|Group|Fragment"
+# Block count: 52428800
+# Fragment count: 12345678    ← 碎片总数（越高说明外部碎片越严重）
+
+# 查看具体块组的空闲信息
+debugfs -R "group_info 0" /dev/sda1 2>/dev/null
+# Group 0: block bitmap at 1025, inode bitmap at 1041, inode table at 1057
+#   32637 free blocks, 1 free inodes, 2 used directories
+#   Free blocks: 1058-32751, 32753-65535
+
+# 用 e2freefrag 分析空闲空间碎片化程度
+e2freefrag /dev/sda1
+# Device: /dev/sda1
+# Blocksize: 4096 bytes
+# Total blocks: 52428800
+# Free blocks: 23456789 (44.7%)
+#
+# Min. free extent: 1 KB
+# Max. free extent: 512 MB      ← 最大连续空闲区间
+# Avg. free extent: 2048 KB
+# Num. free extents: 12345       ← 碎片数
+#
+# HISTOGRAM OF FREE EXTENT SIZES:
+# Extent Size Range    Free extents   Free Blocks    Pct
+# 4K...    8K-  :         3456          3456          0.01%
+# 8K...   16K-  :         2345          4690          0.02%
+# ...
+# 512M...  1G-  :            8        131072         0.56%
+# 1G...    2G-  :            3        786432         3.35%  ← 大连续区间
+
+# 查看文件的 extent 分布
+filefrag -v /var/lib/mysql/ibdata1
+# File size of /var/lib/mysql/ibdata1 is 1073741824 (262144 blocks of 4096 bytes)
+# ext:     logical_offset:        physical_offset: length:   expected: flags:
+#   0:        0..   32767:    2097152..   2129919:  32768:
+#   1:    32768..   65535:    2162688..   2195455:  32768:    2129920:
+#   2:    65536..  131071:    3145728..   3211263:  65536:    2195456:
+# ↑ 3 个 extent（此文件碎片化程度不严重）
+# 如果 extent 数达到数百个，说明严重碎片化
+
+# 量化碎片化程度
+filefrag /var/log/syslog 2>&1 | grep extents
+# /var/log/syslog: 23 extents found    ← 23 个不连续区间，碎片明显
+```
+
+---
+
+### 13.14 `fiemap` 与稀疏文件洞的内核实现
+
+`fiemap` ioctl 是比 `FIBMAP` 更现代的逻辑到物理块映射查询接口：
+
+```c
+/* include/uapi/linux/fiemap.h */
+struct fiemap {
+    __u64   fm_start;           /* 查询的文件内起始偏移（字节）*/
+    __u64   fm_length;          /* 查询范围长度 */
+    __u32   fm_flags;           /* 查询标志 */
+    __u32   fm_mapped_extents;  /* 返回的 extent 数量 */
+    __u32   fm_extent_count;    /* 调用者分配的 fm_extents 数组容量 */
+    __u32   fm_reserved;
+    struct fiemap_extent fm_extents[];  /* extent 数组 */
+};
+
+struct fiemap_extent {
+    __u64   fe_logical;         /* extent 的文件内逻辑起始偏移（字节）*/
+    __u64   fe_physical;        /* extent 的物理起始偏移（字节，磁盘地址）*/
+    __u64   fe_length;          /* extent 长度（字节）*/
+    __u32   fe_flags;           /* 标志（见下）*/
+    __u32   fe_reserved[3];
+};
+
+/* fe_flags 标志 */
+#define FIEMAP_EXTENT_LAST          0x00000001  /* 最后一个 extent */
+#define FIEMAP_EXTENT_UNKNOWN       0x00000002  /* 物理位置不确定（延迟分配）*/
+#define FIEMAP_EXTENT_DELALLOC      0x00000004  /* 延迟分配：逻辑已分配，物理未分配 */
+#define FIEMAP_EXTENT_ENCODED       0x00000008  /* 压缩或加密（不能直接 IO）*/
+#define FIEMAP_EXTENT_DATA_ENCRYPTED 0x00000080 /* 数据已加密 */
+#define FIEMAP_EXTENT_NOT_ALIGNED   0x00000100  /* 不对齐（对象存储等）*/
+#define FIEMAP_EXTENT_DATA_INLINE   0x00000200  /* 数据内联在元数据中 */
+#define FIEMAP_EXTENT_DATA_TAIL     0x00000400  /* 尾部打包数据 */
+#define FIEMAP_EXTENT_UNWRITTEN     0x00000800  /* 已分配但未写（fallocate 产生）*/
+#define FIEMAP_EXTENT_MERGED        0x00001000  /* 多个 extent 合并显示 */
+#define FIEMAP_EXTENT_SHARED        0x00002000  /* 与其他文件共享（reflink/dedupe）*/
+
+/* fm_flags */
+#define FIEMAP_FLAG_SYNC   0x00000001  /* 先 fsync 再查询 */
+#define FIEMAP_FLAG_XATTR  0x00000002  /* 查询 xattr 的 extent 布局 */
+#define FIEMAP_FLAG_CACHE  0x00000004  /* 只返回已缓存的 extent（不触发 I/O）*/
+```
+
+**Python 程序直接调用 `fiemap` ioctl**：
+
+```python
+import fcntl, struct, os, ctypes
+
+def fiemap(fd, start=0, length=None, max_extents=1024):
+    """查询文件的 extent 映射"""
+    if length is None:
+        length = os.fstat(fd).st_size - start
+
+    # struct fiemap + struct fiemap_extent * max_extents
+    FIEMAP_SIZE = 32  # sizeof(struct fiemap)
+    EXTENT_SIZE = 56  # sizeof(struct fiemap_extent)
+    buf_size = FIEMAP_SIZE + EXTENT_SIZE * max_extents
+
+    buf = bytearray(buf_size)
+
+    # 填写 fiemap 头部
+    struct.pack_into('QQIIII', buf, 0,
+        start,           # fm_start
+        length,          # fm_length
+        0,               # fm_flags
+        0,               # fm_mapped_extents（输出）
+        max_extents,     # fm_extent_count
+        0)               # fm_reserved
+
+    FS_IOC_FIEMAP = 0xC020660B  # 从 linux/fs.h 计算或 python-fiemap 包
+    fcntl.ioctl(fd, FS_IOC_FIEMAP, buf)
+
+    # 解析输出
+    _, _, _, n_extents, _, _ = struct.unpack_from('QQIIII', buf, 0)
+
+    extents = []
+    for i in range(n_extents):
+        offset = FIEMAP_SIZE + i * EXTENT_SIZE
+        fe_logical, fe_physical, fe_length, fe_flags = \
+            struct.unpack_from('QQQII', buf, offset)[:4]
+        extents.append({
+            'logical': fe_logical,
+            'physical': fe_physical,
+            'length': fe_length,
+            'flags': fe_flags,
+            'unwritten': bool(fe_flags & 0x800),
+            'delalloc': bool(fe_flags & 0x004),
+            'shared': bool(fe_flags & 0x2000),
+        })
+    return extents
+
+# 使用示例
+fd = os.open('/var/lib/postgresql/data/base/16384/1259', os.O_RDONLY)
+extents = fiemap(fd)
+os.close(fd)
+
+for ext in extents:
+    physical_mb = ext['physical'] / (1024**2)
+    length_kb = ext['length'] / 1024
+    flags_str = ' '.join(k for k, v in ext.items() if k not in ('logical','physical','length','flags') and v)
+    print(f"logical={ext['logical']:10d}  physical={physical_mb:8.2f}MB  "
+          f"len={length_kb:6.1f}KB  {flags_str}")
+```
+
+**稀疏文件与"洞"的内核表示**：
+
+```bash
+# 创建稀疏文件（10GB 但只占几 KB）
+truncate -s 10G /tmp/sparse_test
+ls -lh /tmp/sparse_test    # 显示 10G
+du -sh /tmp/sparse_test    # 显示 ~0（几乎没有物理块）
+
+# 用 SEEK_DATA / SEEK_HOLE 定位数据区和洞（lseek 扩展）
+python3 -c "
+import os
+
+fd = os.open('/tmp/sparse_test', os.O_RDWR)
+# 在偏移 1G 处写入数据（创建一个数据岛）
+os.lseek(fd, 1024**3, os.SEEK_SET)
+os.write(fd, b'data island in sparse file')
+
+# 在偏移 5G 处写入数据
+os.lseek(fd, 5 * 1024**3, os.SEEK_SET)
+os.write(fd, b'another island')
+
+SEEK_DATA = 3   # lseek(fd, offset, SEEK_DATA) → 下一个数据区起点
+SEEK_HOLE = 4   # lseek(fd, offset, SEEK_HOLE) → 下一个洞起点
+
+# 定位所有数据区和洞
+pos = 0
+size = 10 * 1024**3
+while pos < size:
+    try:
+        data_start = os.lseek(fd, pos, SEEK_DATA)
+        hole_start = os.lseek(fd, data_start, SEEK_HOLE)
+        print(f'DATA: [{data_start:12d}, {hole_start:12d}) = {(hole_start-data_start)//1024}KB')
+        pos = hole_start
+    except OSError:
+        break
+os.close(fd)
+"
+# 输出：
+# DATA: [ 1073741824,  1073741850) = 0KB   ← 1G 处的 26 字节
+# DATA: [ 5368709120,  5368709134) = 0KB   ← 5G 处的 14 字节
+```
+
+---
+
+### 13.15 discard / TRIM 内核机制：`blkdev_issue_discard` 与 fstrim
+
+**内核的 discard 请求路径**：
+
+```
+discard 的生命周期（以 ext4 delete 为例）：
+
+1. 文件删除：ext4_free_blocks()
+   → 把块标记为空闲（block bitmap 清零）
+   → 若挂载了 -o discard（在线 discard）：
+       ext4_discard_preallocations()
+         → sb_issue_discard()
+             → blkdev_issue_discard(bdev, sector, nr_sects, GFP_NOFS)
+                   → 创建一个 REQ_OP_DISCARD 类型的 bio
+                   → submit_bio() → 块层 → 设备驱动
+                   → 对 NVMe：转换为 NVMe Dataset Management（DSM）命令
+                   → 对 SATA SSD：转换为 ATA TRIM 命令
+                   → 设备固件记录这些 LBA 可被 GC 回收
+
+2. 定期 fstrim（推荐方式）：
+   fstrim /mountpoint
+     → ioctl(fd, FITRIM, &range)
+         → file系统 .trim_fs() 方法
+               ext4_trim_fs()
+                 → 遍历所有块组
+                 → 对每个块组的空闲区间调用 ext4_trim_extent()
+                     → sb_issue_discard(sb, start, count)
+                         → 批量提交 discard bio（比在线 discard 更高效）
+
+在线 discard vs 定期 fstrim 的对比：
+
+| 特性 | 在线 discard (-o discard) | 定期 fstrim |
+|------|--------------------------|-------------|
+| 触发时机 | 每次删除立刻触发 | 手动或定时（systemd-fstrim.timer）|
+| 粒度 | 细粒度，每次小块 | 批量，合并后下发 |
+| 对前台延迟的影响 | 删除操作延迟增加（等待设备响应）| 几乎不影响前台 |
+| 写放大影响 | 持续产生小 discard 命令 | 集中产生，设备更容易优化 |
+| 适合场景 | 对空间回收实时性要求高 | 大多数生产环境推荐 |
+| 企业 SSD 建议 | 通常不推荐（增加磨损） | 每周一次 fstrim |
+```
+
+**观察 discard/TRIM 行为**：
+
+```bash
+# 检查文件系统是否支持 discard（查看挂载参数）
+mount | grep discard
+# /dev/nvme0n1p1 on / type ext4 (rw,relatime,discard)
+
+# 检查设备是否支持 TRIM
+cat /sys/block/nvme0n1/queue/discard_granularity   # 非零说明支持
+cat /sys/block/nvme0n1/queue/discard_max_bytes      # 单次最大 discard 大小
+cat /sys/block/sda/queue/discard_granularity        # 0 = 不支持（旧 HDD）
+
+# 手动执行 fstrim 并观察效果
+df -h /                     # 记录前空间
+fstrim -v /                 # -v 打印已释放的字节数
+# /: 5.5 GiB (5902737408 bytes) trimmed
+df -h /                     # 对比：文件系统空间不变（fstrim 改变的是设备内部）
+
+# 设置 systemd 定时 fstrim（每周一次）
+systemctl enable --now fstrim.timer
+systemctl list-timers fstrim.timer
+# NEXT                          LEFT       LAST  PASSED  UNIT           ACTIVATES
+# Mon 2026-04-13 00:00:00 CST   11h left   n/a   n/a     fstrim.timer   fstrim.service
+
+# 用 blktrace 观察 discard 请求
+blktrace -d /dev/nvme0n1 -o - | blkparse -i - -f "%T %a %s+%n\n" | grep D
+# 0.000000000  D  2097152+8192    ← discard 操作：从 LBA 2097152 开始，长度 8192 块
+# 0.001234567  D  3145728+16384
+
+# 观察 NVMe 的 TRIM 命令（nvme-cli）
+nvme id-ctrl /dev/nvme0n1 | grep -E "oncs|dsm"
+# oncs      : 0x5f  ← bit 2 = 支持 Dataset Management（TRIM）
+nvme dsm /dev/nvme0n1 --namespace-id=1 --ad  # 手动发送 DSM（了解即可，勿随意执行）
+
+# SSD 的写放大因子（WAF）观察
+nvme smart-log /dev/nvme0n1 | grep -E "host_write|nand_write"
+# 计算 WAF = nand_write / host_write（理想值接近 1，越大越坏）
+```
+
+---
+
+### 13.16 空间碎片化的量化模型与在线整理
+
+**碎片化的工程量化**：
+
+```bash
+# 方法 1: filefrag 计算碎片率
+# 对整个文件系统的重要文件做检查
+for f in $(find /var/lib/mysql -type f -size +1M); do
+    extents=$(filefrag "$f" 2>&1 | awk '/extents found/{print $1}')
+    size=$(stat -c%s "$f")
+    ideal=$(( (size + 4095) / 4096 ))  # 理想情况下的 extent 数（全连续 = 1）
+    echo "$extents extents  ideal=1  file=$f"
+done
+
+# 方法 2: e2freefrag 分析空闲空间碎片
+e2freefrag /dev/sda1
+# 关注 "Avg. free extent" 和 "Num. free extents"
+# 若 Avg < 1MB 且 Num 很大 → 严重碎片化
+
+# 方法 3: 通过 inode 的 extent 数量统计（debugfs）
+debugfs -R "stat <inode_number>" /dev/sda1
+# Extents: 1      ← 好，连续存储
+# Extents: 2048   ← 坏，严重碎片化
+```
+
+**ext4 在线碎片整理（e4defrag）**：
+
+```bash
+# e4defrag 原理：对每个文件，使用 EXT4_IOC_MOVE_EXT ioctl
+# 1. 分配一个临时的、连续的 donor extent
+# 2. 把原文件数据移到 donor extent
+# 3. 原文件 extent 变为连续（原地替换页缓存中的映射）
+
+# 检查碎片化状态（不修改）
+e4defrag -c /var/lib/mysql/ibdata1
+# <Fragmentation score (before defragmentation)>
+# Score = 0 [0-30 low, 31-55 moderate, 56-100 high]
+# Result = OK (score = 2)
+
+# 对单个文件整理
+e4defrag /var/lib/mysql/ibdata1
+
+# 对整个目录整理（可能耗时较长）
+e4defrag /var/lib/mysql/
+
+# EXT4_IOC_MOVE_EXT ioctl（内核接口）
+# 用于实现在线整理：把文件的某个 extent 移到物理位置更好的地方
+# 应用程序可以调用此 ioctl 实现自定义的碎片整理策略
+
+# 观察 e4defrag 的效果（比较整理前后的 filefrag 输出）
+filefrag -v /var/lib/mysql/ibdata1 | tail -3  # 整理前：Extents: 1234
+e4defrag /var/lib/mysql/ibdata1
+filefrag -v /var/lib/mysql/ibdata1 | tail -3  # 整理后：Extents: 3
+```
+
+**XFS 的空间管理特性**：
+
+```bash
+# XFS 用 B+树管理空闲空间（两棵：按起始块号索引 + 按大小索引）
+# 查看 XFS 空间使用情况
+xfs_info /mountpoint
+# meta-data=/dev/sda1   isize=512    agcount=4,    agsize=6553600 blks
+#          =            sectsz=512   attr=2, projid32bit=1
+# data     =            bsize=4096   blocks=26214400, imaxpct=25
+#          =            sunit=0      swidth=0 blks
+# naming   =version 2  bsize=4096   ascii-ci=0, ftype=1
+# log      =internal   bsize=4096   blocks=14400, version=2
+#          =            sectsz=512   sunit=0 blks, lazy-count=1
+# realtime =none        extsz=4096   blocks=0, rtextents=0
+
+# XFS 有 4 个分配组（AG），每个 AG 独立管理空间
+# → 多线程写入时，不同文件分布到不同 AG，减少锁竞争
+
+# XFS 碎片整理（xfs_fsr：文件系统重排器）
+xfs_fsr /mountpoint  # 整理整个挂载点
+xfs_fsr -v /var/lib/postgres/data/base/16384/1259  # 整理单个文件
+
+# XFS 实时空间（realtime subvolume）— 大文件顺序写特化
+# mkfs.xfs -r rtdev=/dev/nvme1n1 /dev/nvme0n1  # 数据和实时卷分离
+```
+
+---
+
 ## 本章小结
 
 | 主题 | 结论 |

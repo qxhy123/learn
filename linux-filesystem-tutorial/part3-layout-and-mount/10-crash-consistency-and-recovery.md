@@ -1,6 +1,11 @@
 # 第10章：崩溃一致性与恢复
 
-> 文件系统最难回答的问题不是“正常时怎么写”，而是“任意一个写入点突然断电、内核崩溃、设备重排、缓存未刷时，重启后还能解释成什么状态”。
+> **本章导读**：文件系统最难回答的问题不是”正常时怎么写”，而是”任意一个写入点突然断电、内核崩溃、设备重排、缓存未刷时，重启后还能解释成什么状态”。
+
+**前置知识**：第8章（ext4 布局与日志机制）
+**预计学习时间**：55 分钟
+
+---
 
 ## 学习目标
 
@@ -277,17 +282,553 @@ fsync(parent directory)
 
 ### 10.18 设计评审时，先把恢复判定表写出来
 
-评审一个依赖文件系统持久化的系统时，与其反复争论“这样大概没问题”，不如先写一张恢复判定表：
+评审一个依赖文件系统持久化的系统时，与其反复争论”这样大概没问题”，不如先写一张恢复判定表：
 
 | 崩溃点 | 重启后允许出现什么 | 必须拒绝什么 |
 |--------|--------------------|--------------|
 | 新数据写入中 | 旧版本继续有效 | 把半写入对象当成已提交版本 |
 | 数据 `fsync` 前 | 旧版本有效，临时对象可丢 | 默认相信新数据已经稳定 |
-| 指针/manifest 切换前 | 旧版本仍是提交版本 | 让新旧对象混杂组成“伪新版本” |
+| 指针/manifest 切换前 | 旧版本仍是提交版本 | 让新旧对象混杂组成”伪新版本” |
 | 指针切换后、目录持久化前 | 结果取决于目录项是否稳定 | 不加检查地假设新版本必然可见 |
 | 恢复阶段 | 通过 checksum / version 判定可信状态 | 看到文件存在就直接加载 |
 
 只要这张表写不出来，协议就还没有真正设计完成。
+
+---
+
+### 10.19 torn write 的设备层机制：为什么 4K 对齐不等于原子性
+
+torn write（撕裂写）是一个常被低估的崩溃一致性危险源。在应用层，人们常假设”一次 write() 系统调用的数据要么全写要么全不写”，但这个假设在设备层可能并不成立。
+
+#### 物理写入单位 vs 逻辑块大小
+
+```
+块设备的三种写入粒度：
+
+1. 逻辑扇区大小（Logical Sector Size）
+   → 块设备向操作系统暴露的寻址单位
+   → 历史上 512B，现代设备通常 4096B（512e 或 4Kn）
+   → 由 blockdev --getss /dev/sda 或 cat /sys/block/sda/queue/logical_block_size 查看
+
+2. 物理扇区大小（Physical Sector Size）
+   → 设备内部的实际写入原子单位
+   → 大多数现代 SSD/HDD：4096B
+   → 由 cat /sys/block/sda/queue/physical_block_size 查看
+
+3. 擦写块大小（Erase Block Size，SSD 专有）
+   → SSD 需要按擦写块为单位清零后才能写入新数据
+   → 通常 128KB ~ 2MB，远大于物理扇区
+   → 写入小于擦写块的数据时，设备内部做 read-erase-write，增加写放大
+```
+
+**torn write 发生条件**：
+
+当文件系统块大小（通常 4096B）恰好等于设备物理扇区大小时，单个文件系统块的写入在设备层是原子的（要么写完要么不写）。但以下情况会导致 torn write：
+
+```
+场景 1：512B 逻辑扇区的老式设备
+  文件系统块 = 4096B = 8 × 512B 扇区
+  设备按扇区写入，断电可能只完成前 4 个扇区
+  结果：文件系统块的前 2048B 是新数据，后 2048B 是旧数据
+  → torn write
+
+场景 2：4096B 块但跨两个物理扇区边界的写入
+  某些 NVMe 设备的写入原子单位是 512B（Physical Sector Size = 512B）
+  即使用 4096B 写入，设备内部可能分多次提交
+  → 断电可能导致 4096B 内部撕裂
+
+场景 3：RAID 5/6 stripe write
+  RAID 5 的 stripe 通常远大于文件系统块
+  写入未对齐的小数据需要 read-modify-write 一整个 stripe
+  断电在 read-modify-write 中间 → parity 与数据不一致（RAID write hole）
+
+场景 4：日志文件系统的 journal commit block
+  JBD2 在 journal 中写 commit block 标记事务完成
+  如果 commit block 的 4096B 本身发生 torn write
+  → replay 时可能读到部分写入的 commit block
+  → JBD2 通过 commit block 的 checksum 检测并拒绝此事务
+```
+
+**查看设备的写入原子单位**：
+
+```bash
+# 查看物理/逻辑扇区大小
+cat /sys/block/sda/queue/logical_block_size    # 逻辑扇区（操作系统视角）
+cat /sys/block/sda/queue/physical_block_size   # 物理扇区（设备内部原子写入）
+cat /sys/block/sda/queue/minimum_io_size       # 建议最小 I/O 大小
+cat /sys/block/sda/queue/optimal_io_size       # 最优 I/O 大小（RAID stripe）
+blockdev --getpbsz /dev/sda                    # 物理扇区大小（字节）
+
+# NVMe 的写入原子单位（AWUN: Atomic Write Unit Normal）
+nvme id-ns /dev/nvme0n1 -H | grep -i atomic
+# Atomic Write Unit Normal (AWUN): 0 (1 logical block)
+# Atomic Write Unit Power Fail (AWUPF): 0 (1 logical block)
+# → AWUN=0 表示 1 个逻辑块（512B 或 4096B）是原子的
+
+# 查看 SSD 是否支持 Atomic Write（较新 NVMe 特性）
+nvme id-ctrl /dev/nvme0 | grep -i “atomic\|awun\|awupf”
+```
+
+#### 数据库如何防范 torn write
+
+```
+PostgreSQL 的 full_page_write 机制：
+
+正常写入流程（无 torn write 保护）：
+  事务修改 page（8KB）
+  → WAL 只记录变更（delta）
+  → checkpoint 时把 dirty page 写到磁盘
+  → 如果写 page 时断电，page 可能半写（torn）
+  → redo 日志只有 delta，无法在撕裂 base page 上正确 redo
+
+full_page_write 保护机制：
+  checkpoint 后第一次修改某 page 时
+  → WAL 中记录完整的 page 快照（8KB full image）
+  → redo 时如果发现 torn page，用 WAL 中的完整快照覆盖
+  → 之后的 delta redo 基于可信的完整 page
+
+MySQL InnoDB 的 doublewrite buffer 机制：
+  page 在写入到真实位置之前，先写入 doublewrite buffer（连续区域）
+  → doublewrite buffer 写完成（fsync）
+  → 再写真实位置
+  → 如果真实位置写到一半断电：重启时检测到 torn page
+    → 从 doublewrite buffer 恢复完整 page
+    → 再基于 redo log 重放
+```
+
+**PostgreSQL full_page_write 的实际效果**：
+
+```bash
+# 查看 PostgreSQL full_page_write 设置
+psql -c “SHOW full_page_writes;”
+# full_page_writes
+# -----------------
+# on
+# (已启用，保护 torn write 场景)
+
+# 禁用 full_page_write（危险，只在有下层保护时才考虑）
+# postgresql.conf: full_page_writes = off
+# → 仅当底层设备保证原子写入 8KB（如 NVMe with AWUN >= 16）时才安全
+
+# WAL 中 full page write 的体积影响
+psql -c “SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/1000000');”
+# 启用 full_page_write 后，checkpoint 后期的 WAL 明显更大
+```
+
+---
+
+### 10.20 应用层 WAL 实现模式：从 SQLite 到 LevelDB
+
+理解应用 WAL 不只是”知道有日志”，而是要理解具体记录什么、何时提交、如何恢复。
+
+#### WAL 的基本结构
+
+```
+WAL 文件（顺序追加，崩溃后从尾部向前扫描）：
+
+  ┌──────────────────────────────────────────────────────┐
+  │ LSN=1  BEGIN TXN=100                                 │  ← 事务开始
+  │ LSN=2  UPDATE page=42 offset=128 len=64 data=...     │  ← 操作记录
+  │ LSN=3  UPDATE page=7  offset=0   len=512 data=...    │
+  │ LSN=4  COMMIT TXN=100 checksum=0xABCD1234            │  ← 提交标记+校验
+  │ LSN=5  BEGIN TXN=101                                 │
+  │ LSN=6  UPDATE page=99 offset=512 len=128 data=...    │
+  │ LSN=7  COMMIT TXN=101 checksum=0xDEADBEEF            │
+  │ LSN=8  BEGIN TXN=102                                 │
+  │ LSN=9  UPDATE page=3  offset=0   len=256 data=...    │
+  │                                                      │  ← 崩溃点（TXN=102 未提交）
+  └──────────────────────────────────────────────────────┘
+
+恢复逻辑：
+  1. 从 WAL 开头向后扫描
+  2. 验证每个 COMMIT 的 checksum
+  3. 找到 checksum 有效的最后一个 COMMIT（此处为 LSN=7，TXN=101）
+  4. 将 TXN=100 和 TXN=101 的操作 redo 到主文件
+  5. LSN=8 之后的未提交事务（TXN=102）丢弃
+```
+
+#### SQLite WAL 模式实现
+
+SQLite 的 WAL 模式（WAL mode）是一个精心设计的单文件 WAL 实现，值得深入理解。
+
+```
+SQLite WAL 模式的核心数据结构：
+
+主数据库文件（database.db）：
+  → 稳定已提交的数据（checkpoint 之后的状态）
+  → 读者优先读这里
+
+WAL 文件（database.db-wal）：
+  → 所有新写入都先追加到这里
+  → 多个读者可以并发访问（读 WAL 或读主文件）
+  → WAL header（32 字节）+ 一系列 WAL frame（页大小 + 24 字节 frame header）
+
+WAL frame header（24 字节）：
+  pgno        4B   // 此 frame 对应的数据库 page 号
+  szPage      4B   // page 大小（第一帧有效，后续为 0）
+  mxFrame     4B   // 当前写入的最大 frame 号（commit marker 用）
+  aDbSize     4B   // commit 时数据库的 page 数（commit 帧有效）
+  aFrameCksum 8B   // 此 frame 的 checksum（累积计算）
+
+WAL index（database.db-shm，共享内存）：
+  → 内存中的哈希表，page_no → 最新 WAL frame 号
+  → 加速读者”找到这个 page 最新版本在哪个 frame”
+  → 可以从 WAL 文件重建，不需要持久化
+```
+
+**SQLite WAL 的读写并发模型**：
+
+```
+WAL 模式的并发优势（相比 journal 模式）：
+  读者：读主文件 + WAL 中的最新版本，不阻塞写者
+  写者：追加到 WAL，不修改主文件，不阻塞读者
+  checkpoint：把 WAL 中已提交的页写回主文件，需要独占访问
+
+journal 模式（对比）：
+  写者获取写锁 → 旧数据写 rollback journal → 修改主文件
+  读者在写者持锁期间必须等待
+
+SQLite WAL 读事务流程：
+  1. 获取 WAL 读锁（共享，允许多个读者并发）
+  2. 记录当前 mxFrame（WAL 的最大有效 frame 号）
+  3. 读某 page 时：查 WAL index 找此 page 最近一次在 WAL 中的 frame
+     - frame 号 <= mxFrame → 从 WAL 中读（最新已提交版本）
+     - 不在 WAL → 从主文件读
+  4. 释放读锁（不需要提交）
+
+SQLite WAL 写事务流程：
+  1. 获取写锁（独占，只允许一个写者）
+  2. 将修改的每个 page 追加到 WAL
+  3. 最后追加 commit frame（mxFrame 字段反映提交点）
+  4. fsync WAL 文件
+  5. 更新 WAL index（共享内存）
+  6. 释放写锁
+```
+
+**命令行验证 SQLite WAL 模式**：
+
+```bash
+# 切换到 WAL 模式
+sqlite3 mydb.db “PRAGMA journal_mode=WAL;”
+# journal_mode
+# WAL
+
+ls -la mydb.db*
+# mydb.db       ← 主数据库
+# mydb.db-shm   ← WAL index（共享内存映射）
+# mydb.db-wal   ← WAL 文件
+
+# 写入数据观察 WAL 增长
+sqlite3 mydb.db “INSERT INTO t VALUES (1, 'test');”
+ls -lh mydb.db mydb.db-wal
+# mydb.db     → 大小不变（数据还在 WAL）
+# mydb.db-wal → 增大（新数据写在这里）
+
+# 触发 checkpoint（将 WAL 内容写回主文件）
+sqlite3 mydb.db “PRAGMA wal_checkpoint(FULL);”
+# 0|N|N  ← (result=0, wal_frames, checkpointed_frames)
+
+# 查看 WAL 状态
+sqlite3 mydb.db “PRAGMA wal_checkpoint;”
+sqlite3 mydb.db “PRAGMA journal_mode;”
+```
+
+#### LevelDB/RocksDB 的 WAL 与 memtable 设计
+
+```
+LevelDB 写入路径：
+
+  write(key, value)
+    │
+    ├── 1. 追加到 WAL 文件（顺序写，O(1) 持久化）
+    │      WAL 记录格式：
+    │      ┌─────────────────────────────────────────┐
+    │      │ checksum(4B) length(2B) type(1B) data... │
+    │      └─────────────────────────────────────────┘
+    │      type: kFullType(1) / kFirstType(2) / kMiddleType(3) / kLastType(4)
+    │      （大记录可跨多个 32KB block，用 type 标记片段关系）
+    │
+    ├── 2. 写入 memtable（内存中的 SkipList，O(log n)）
+    │
+    └── 3. 返回（此时写入已”持久化”到 WAL + 内存 memtable）
+
+  memtable 满时（默认 4MB）：
+    → 冻结为 immutable memtable
+    → 启动 compaction 线程将 immutable memtable 写到 SSTable（Level-0）
+    → 新 WAL 文件开始记录
+
+  崩溃恢复：
+    → 扫描 WAL 文件（可能有多个，按序号排列）
+    → 验证每条记录的 checksum
+    → 跳过 checksum 错误的记录（truncate 到最后有效记录）
+    → 将有效记录重放到新 memtable
+    → memtable 写入 SSTable 完成后，删除旧 WAL
+```
+
+**RocksDB WAL 的可观察性**：
+
+```bash
+# 查看 RocksDB WAL 文件
+ls -lh /path/to/rocksdb/data/*.log
+# 000001.log  ← 当前活跃 WAL（数字是序列号）
+# 000002.log  ← 可能是等待 flush 的旧 WAL
+
+# RocksDB 的 WAL 统计（通过 db_stats）
+db.GetProperty(“rocksdb.stats”)
+# ...
+# ** Compaction Stats [default] **
+# ...
+# WAL:
+# Writes: 12345  Syncs: 1234  Write With Wal: 12345  Bytes: 123456789
+# WAL syncs: 数字越大说明调用 fsync 越频繁
+
+# 调整 WAL sync 策略（权衡持久性与性能）
+# Options::wal_bytes_per_sync = 0（默认，每次 write 同步）
+# Options::wal_bytes_per_sync = 1024*1024（1MB 批量 sync，提升吞吐但增加丢失窗口）
+```
+
+---
+
+### 10.21 crash testing 工具链：从理论到实验验证
+
+#### dm-flakey：内核级故障注入
+
+`dm-flakey` 是 Linux Device Mapper 的一个目标类型，可以模拟设备在特定时间段内的写入失败或数据损坏，是崩溃一致性测试的重要工具。
+
+```bash
+# 创建 dm-flakey 设备（在真实设备或 loop device 上）
+# 参数：up_interval down_interval [feature...]
+# up_interval：正常工作的秒数
+# down_interval：返回错误的秒数
+
+# 准备 loop device
+dd if=/dev/zero of=/tmp/test.img bs=1M count=100
+LOOP=$(losetup -f --show /tmp/test.img)
+# LOOP=/dev/loop0
+
+# 获取设备大小（扇区数）
+SECTORS=$(blockdev --getsz $LOOP)
+
+# 创建 dm-flakey：每 30 秒正常工作，随后 5 秒模拟写失败
+echo “0 $SECTORS flakey $LOOP 0 30 5” | dmsetup create flakey-test
+
+# 在 flakey 设备上创建文件系统并挂载
+mkfs.ext4 /dev/mapper/flakey-test
+mount /dev/mapper/flakey-test /mnt/test
+
+# 运行负载测试（在 down_interval 期间会遇到 I/O 错误）
+for i in $(seq 1 1000); do
+    echo “data $i” > /mnt/test/file_$i
+    sync
+done &
+
+# 等待几个 up/down 周期后，模拟突然断电：强制卸载并检查
+sleep 70
+umount -l /mnt/test
+e2fsck -n /dev/mapper/flakey-test  # -n 表示只检查不修复
+
+# 清理
+dmsetup remove flakey-test
+losetup -d $LOOP
+```
+
+**dm-flakey 的高级 feature**：
+
+```bash
+# feature 1: drop_writes（直接丢弃写请求，不报错）
+# 模拟”写入成功但数据没有落盘”（write cache 场景）
+echo “0 $SECTORS flakey $LOOP 0 10 5 1 drop_writes” | dmsetup create flakey-drop
+
+# feature 2: error_writes（写入返回 EIO 错误）
+# 默认行为
+
+# feature 3: corrupt_bio_byte N percent direction
+# 随机损坏写入数据的第 N 字节（percent% 概率，direction: w=写/r=读）
+echo “0 $SECTORS flakey $LOOP 0 30 5 3 corrupt_bio_byte 10 50 w 0” | \
+    dmsetup create flakey-corrupt
+```
+
+#### ALICE：崩溃一致性系统级测试框架
+
+ALICE（Application-Level Intelligent Crash Explorer）是 OSDI 2014 论文的配套工具，系统化地探索崩溃点空间。
+
+```
+ALICE 工作原理：
+
+1. strace 记录：录制应用的完整系统调用序列
+   strace -e trace=file,write,read,fsync,rename,open,close,unlink \
+          -o syscalls.log ./application_under_test
+
+2. 构建系统调用图：
+   → 提取 write/pwrite 操作
+   → 记录每次 write 的 fd、offset、length
+   → 追踪 fsync/fdatasync/sync 调用
+   → 记录 rename、unlink 等元数据操作
+
+3. 生成崩溃状态：
+   → 对每个可能的崩溃点（write 之间的间隙）
+   → 枚举哪些写入已到磁盘、哪些未到
+   → 考虑 write 内部的 partial write（torn write）
+   → 每种组合产生一个”崩溃状态”
+
+4. 验证崩溃后应用行为：
+   → 将每个崩溃状态应用到文件系统
+   → 启动应用程序的恢复/检查逻辑
+   → 检查应用是否报告一致或数据丢失
+
+典型发现（原论文）：
+   测试 11 个主流应用（LevelDB、HSQLDB、Git、SQLite 等）
+   发现 60 个崩溃一致性 bug
+   其中许多在正常测试中从未触发
+```
+
+**简化的崩溃模拟脚本**：
+
+```bash
+#!/bin/bash
+# 手动崩溃点注入测试框架（简化版）
+
+TEST_DIR=/mnt/crash-test
+PROTOCOL_SCRIPT=”$1”  # 要测试的协议脚本
+
+crash_and_check() {
+    local crash_point=”$1”  # 在哪一步崩溃
+
+    echo “=== 测试崩溃点: $crash_point ===”
+
+    # 1. 准备干净的文件系统状态
+    umount $TEST_DIR 2>/dev/null
+    mkfs.ext4 -q /dev/mapper/flakey-test
+    mount /dev/mapper/flakey-test $TEST_DIR
+
+    # 2. 建立”旧版本”基准状态
+    echo “old config v1” > $TEST_DIR/config.dat
+    fsync $TEST_DIR/config.dat
+    sync
+
+    # 3. 注入崩溃点（通过 flakey 设备）
+    case “$crash_point” in
+        “after_write”)
+            # 写完临时文件后崩溃（在 fsync 之前）
+            echo “new config v2” > $TEST_DIR/config.tmp
+            # 不调用 fsync，模拟崩溃
+            echo b > /proc/sysrq-trigger  # 强制重启（真实测试用）
+            ;;
+        “after_fsync”)
+            echo “new config v2” > $TEST_DIR/config.tmp
+            sync $TEST_DIR/config.tmp
+            # rename 之前崩溃
+            echo b > /proc/sysrq-trigger
+            ;;
+        “after_rename”)
+            echo “new config v2” > $TEST_DIR/config.tmp
+            sync $TEST_DIR/config.tmp
+            mv $TEST_DIR/config.tmp $TEST_DIR/config.dat
+            # fsync(dir) 之前崩溃
+            echo b > /proc/sysrq-trigger
+            ;;
+    esac
+
+    # 4. 模拟重启后检查（对 loop device 场景不真实重启，而是重新挂载）
+    umount $TEST_DIR
+    mount /dev/mapper/flakey-test $TEST_DIR
+
+    # 5. 检查恢复状态
+    echo “重启后状态：”
+    cat $TEST_DIR/config.dat 2>/dev/null || echo “(文件不存在)”
+    ls $TEST_DIR/config.tmp 2>/dev/null && echo “WARNING: 临时文件仍然存在”
+}
+
+# 运行所有崩溃点测试
+for point in “after_write” “after_fsync” “after_rename”; do
+    crash_and_check “$point”
+done
+```
+
+#### ext4 自带的错误注入（debugfs）
+
+```bash
+# 使用 debugfs 注入磁盘错误（需要 CONFIG_EXT4_DEBUG）
+debugfs -w /dev/sda1 << 'EOF'
+# 损坏特定 inode 的 extent tree（用于测试 e2fsck 恢复能力）
+set_inode_field <12345> i_blocks_hi 0xDEAD
+EOF
+
+# 验证 e2fsck 能检测并修复
+e2fsck -f /dev/sda1
+# e2fsck 1.46: checking /dev/sda1
+# Pass 1: Checking inodes, blocks, and sizes
+# Inode 12345 has illegal block(s). FIXED.
+
+# 使用 debugfs 查看 journal 内容
+debugfs -R “logdump -a” /dev/sda1 | head -50
+# Journal starts at block 1, transaction 42
+# Found expected sequence 42, type 1 (descriptor block) at block 1
+# Dumping descriptor block, sequence 42, at block 1:
+#   FS block 8192 logged at journal block 2 (flags 0x0)
+# ...
+```
+
+---
+
+### 10.22 `fdatasync` vs `fsync`：在持久化成本上做精确切割
+
+```
+fsync(fd)：
+  → 刷新文件数据（dirty page）+ 所有元数据（inode: size, mtime, ctime）
+  → 对于追加写的日志文件，mtime 也要落盘，多一次元数据写
+
+fdatasync(fd)：
+  → 刷新文件数据 + 仅刷新影响数据可读性的元数据（如文件大小）
+  → 不刷新 mtime/ctime/atime 等”时间类元数据”
+  → 比 fsync 少一次元数据 I/O（如果文件大小未变化）
+
+实际差异（何时 fdatasync 比 fsync 快）：
+  追加写场景：fdatasync 需要更新 i_size，仍需元数据 I/O，差距不大
+  覆写场景（文件大小不变）：fdatasync 不更新 mtime → 省去一次 inode 写
+  对于高频 fsync 的数据库日志：使用 fdatasync 可减少 10-20% inode 写 I/O
+
+O_DSYNC 标志（更细粒度的 fdatasync 语义）：
+  open(“wal.log”, O_WRONLY|O_DSYNC)
+  → 每次 write() 完成后自动做 fdatasync 语义的刷新
+  → 适合 WAL 文件：每次写入立即持久化，无需手动调用 fdatasync
+```
+
+**内核实现差异**：
+
+```bash
+# 用 strace + perf 观察 fsync vs fdatasync 的系统调用差异
+strace -T -e trace=fsync,fdatasync dd if=/dev/zero of=/tmp/test bs=4K count=1000 \
+    oflag=dsync 2>&1 | tail -10
+# write(1, “”, 4096) = 4096 <0.000023>       ← O_DSYNC 的每次写
+# ... 每次写后内核自动做 fdatasync 语义
+
+# 比较 fsync 和 fdatasync 的实际延迟
+python3 -c “
+import os, time
+
+f = open('/tmp/fsync_test', 'w+b')
+f.write(b'x' * 4096)
+
+t0 = time.monotonic()
+for _ in range(100):
+    f.write(b'x' * 4096)
+    os.fsync(f.fileno())
+t1 = time.monotonic()
+print(f'fsync: {(t1-t0)*10:.1f} ms per call')
+
+f.seek(0)
+t0 = time.monotonic()
+for _ in range(100):
+    f.write(b'x' * 4096)
+    os.fdatasync(f.fileno())
+t1 = time.monotonic()
+print(f'fdatasync: {(t1-t0)*10:.1f} ms per call')
+f.close()
+“
+# fsync:     15.2 ms per call   （含 mtime 更新）
+# fdatasync: 13.8 ms per call   （跳过 mtime，略快）
+```
 
 ---
 
@@ -311,11 +852,56 @@ fsync(parent directory)
 
 ## 练习题
 
-1. 结构一致性、名字持久化、数据持久性、应用事务一致性有什么区别？
-2. 为什么 `write()` 成功不能说明数据已经可靠持久化？
-3. `fsync(file)`、`rename()`、`fsync(dir)` 各自补哪个语义缺口？
-4. 为什么文件系统 journal 不能替代数据库 WAL？
-5. 设计一个配置文件可靠更新协议，并说明每个崩溃点的恢复结果。
-6. 如果系统一次要推进 3 个数据文件和 1 个 manifest，真正的提交点应该放在哪里？
-7. 为什么“文件长度对了”仍然不能证明最后一条记录一定完整可用？
-8. 你会怎样为一个可靠写入协议设计 crash testing，最少要覆盖哪些崩溃点？
+### 基础题
+
+**10.1** 结构一致性、名字持久化、数据持久性、应用事务一致性有什么区别？说明文件系统 journal 主要覆盖哪层，应用 WAL 主要覆盖哪层。
+
+**10.2** 为什么 `write()` 成功不能说明数据已经可靠持久化？描述 `write()`→`fsync(file)`→`rename()`→`fsync(dir)` 四步各自补哪个语义缺口。
+
+### 中级题
+
+**10.3** 为什么文件系统 journal 不能替代数据库 WAL？从”文件系统保证什么、WAL 保证什么”两个角度分析，并说明 `data=ordered` 模式下仍需要应用层 WAL 的根本原因。
+
+**10.4** 设计一个配置文件可靠更新协议，列出所有关键步骤，并用崩溃矩阵说明每个崩溃点的期望恢复结果与禁止出现的状态。
+
+### 提高题
+
+**10.5** 如果系统需要原子推进 3 个数据文件和 1 个 manifest，真正的提交点应该放在哪里？为该协议设计 crash testing 方案（至少覆盖 5 个崩溃点），并解释为什么”文件长度对了”不能证明最后一条记录完整可用（提示：torn write、checksum、序列号）。
+
+---
+
+## 练习答案
+
+**10.1** 结构一致性：inode、目录项、位图、extent tree 不互相矛盾，文件系统结构可被正确解释；名字持久化：目录中预期名字在崩溃后稳定存在；数据持久性：文件内容以预期字节稳定落盘；应用事务一致性：业务逻辑能判断某次多步更新是否完整提交。journal 主要覆盖结构一致性和部分名字持久化（data=ordered 还部分覆盖数据持久性顺序）；应用 WAL 主要覆盖应用事务一致性，通常也依赖底层提供数据持久性。
+
+**10.2** write() 成功说明数据进入内核路径（page cache 或内核缓冲区），不说明物理块已分配、设备已写入、设备缓存已 flush。四步语义：fsync(file) 将文件 dirty 数据页和必要 inode 元数据推到设备稳定边界；rename() 将目录项原子切换，使新文件名对读者可见而不出现中间态；fsync(dir) 将父目录 dirty 元数据持久化，确保新名字关系在崩溃后仍存在；完整协议才能覆盖”内容可靠 + 名字原子切换 + 名字持久化”三个缺口。
+
+**10.3** 文件系统 journal 保护文件系统元数据结构的原子性（inode/目录项/位图不自相矛盾），不知道业务记录边界、多文件提交关系、版本号和 checksum。data=ordered 仍需 WAL 的原因：①journal 不知道哪两个文件的更新属于同一业务事务；②journal 不记录 checksum 或版本号，无法判断业务记录是否完整；③多个数据文件之间的一致性约束需要应用自己定义提交点（manifest）并在 WAL 中记录。数据库 WAL 记录每个事务的 begin/end 边界、操作日志和 checksum，崩溃后 redo/undo 到一致事务边界，这些是文件系统 journal 从设计上就不提供的能力。
+
+**10.4** 协议步骤：①write(tmpfile, new_content)；②fsync(tmpfile)（数据持久化）；③rename(tmpfile, target)（名字原子切换）；④fsync(parent_dir)（目录项持久化）。崩溃矩阵：
+- 步骤①中崩溃：tmpfile 部分写入或不存在 → 旧配置不变，临时文件清理即可 ✓
+- 步骤①②之间崩溃：tmpfile 存在但数据未持久 → 旧配置仍有效，临时文件视为无效 ✓
+- 步骤②③之间崩溃：tmpfile 数据已持久但 rename 未发生 → 旧配置仍是有效版本 ✓
+- 步骤③④之间崩溃：rename 可能已发生，但目录项未必持久 → 结果取决于日志模式；协议必须能接受旧版本仍然有效 ✓，不能假设新版本必然出现
+- 步骤④后崩溃：新名字已持久 → 新配置为有效版本 ✓
+禁止出现：新旧内容混合的”伪版本”；空文件被当成有效配置。
+
+**10.5** 提交点设计：先对 3 个数据文件各自执行 write+fsync，确保内容持久；然后写 manifest（包含 checksum 和版本号）并 fsync(manifest)；最后如需原子可见，对 manifest 做 rename+fsync(dir)。manifest 切换是唯一的提交点，崩溃后根据 manifest 存在性和版本号判断是否已提交。Crash testing 覆盖点：①数据文件 1 写入中；②数据文件 3 fsync 后 manifest 写入前；③manifest write 后 fsync 前；④manifest fsync 后 rename 前；⑤rename 后 fsync(dir) 前。”文件长度对了”不能证明完整：torn write（扇区内的部分写入）可能使最后几字节未落盘但文件 size 已更新（crash 在写入中间，设备缓存丢失部分数据）；没有 checksum 无法区分完整记录和被截断的记录；没有 sequence number 无法知道写入是否处于预期位置；正确做法：每条记录加 length + checksum，回放时逐条验证，发现 checksum 错误则截断到上一条有效记录。
+
+---
+
+## 延伸阅读
+
+1. **Pillai, et al.** *All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications* (OSDI 2014) — 分析主流文件系统崩溃一致性行为差异
+2. **Arpaci-Dusseau**. *Operating Systems: Three Easy Pieces*, Ch.42 — 崩溃一致性与日志
+3. **man 2 fsync / man 2 fdatasync** — fsync 与 fdatasync 语义区别（fdatasync 不更新 mtime，但更快）
+4. **LWN.net**. *Ensuring data reaches disk* — `fsync`、`rename`、barrier 完整语义分析
+5. **SQLite 文档**. *How SQLite Works* — WAL 模式崩溃一致性设计参考实例
+
+---
+
+[← 上一章：VFS、挂载与文件系统家族](./09-vfs-mount-and-filesystem-family.md)
+
+[下一章：页缓存、脏页与回写 →](../part4-cache-and-io/11-page-cache-and-read-write-path.md)
+
+[返回目录](../README.md)

@@ -240,6 +240,353 @@
 
 ---
 
+### 18.16 `fio` 完整使用指南：从工作负载到可信结论
+
+`fio`（Flexible I/O Tester）是文件系统性能测试的标准工具：
+
+```bash
+# 安装
+apt install fio     # Debian/Ubuntu
+yum install fio     # CentOS/RHEL
+
+# 基础用法：4KB 随机读，测试 page cache 热/冷差异
+fio --name=randread_hot \
+    --ioengine=libaio \     # 异步 I/O 引擎（模拟数据库 I/O 模式）
+    --iodepth=32 \          # 队列深度 32（并发未完成的 I/O 数）
+    --rw=randread \         # 随机读
+    --bs=4k \               # 块大小 4KB
+    --size=4G \             # 测试文件大小 4GB
+    --numjobs=4 \           # 4 个并发工作进程
+    --runtime=30 \          # 运行 30 秒
+    --time_based \          # 按时间而非完成量停止
+    --filename=/tmp/fio_test \
+    --output-format=json \  # JSON 格式输出（便于解析）
+    --output=/tmp/fio_hot.json \
+    --group_reporting
+
+# 先清 page cache，测冷读
+sync && echo 3 > /proc/sys/vm/drop_caches
+fio --name=randread_cold \
+    --ioengine=libaio --iodepth=32 --rw=randread --bs=4k \
+    --size=4G --numjobs=4 --runtime=30 --time_based \
+    --filename=/tmp/fio_test \
+    --output-format=json --output=/tmp/fio_cold.json \
+    --group_reporting
+
+# 解析结果：比较热/冷 IOPS 和延迟
+python3 - <<'EOF'
+import json
+
+for label, path in [("HOT", "/tmp/fio_hot.json"), ("COLD", "/tmp/fio_cold.json")]:
+    with open(path) as f:
+        data = json.load(f)
+    job = data['jobs'][0]
+    read = job['read']
+    print(f"\n{label} cache:")
+    print(f"  IOPS:    {read['iops']:,.0f}")
+    print(f"  BW:      {read['bw_bytes']/1024/1024:.1f} MB/s")
+    print(f"  lat avg: {read['lat_ns']['mean']/1000:.1f} μs")
+    print(f"  lat p99: {read['clat_ns']['percentile']['99.000000']/1000:.1f} μs")
+    print(f"  lat p99.9:{read['clat_ns']['percentile']['99.900000']/1000:.1f} μs")
+EOF
+# 典型 NVMe SSD 结果：
+# HOT cache:
+#   IOPS:    2,456,789     ← page cache 命中，极高 IOPS
+#   BW:      9,596.8 MB/s
+#   lat avg: 52.3 μs
+#   lat p99: 134.5 μs
+#
+# COLD cache:
+#   IOPS:    456,789       ← 直接读设备，受限于 NVMe 延迟
+#   BW:      1,784.0 MB/s
+#   lat avg: 278.4 μs
+#   lat p99: 512.6 μs
+```
+
+**关键工作负载的标准 fio 配方**：
+
+```ini
+# 配方 1: 数据库 OLTP 模拟（随机读写混合，含 fsync）
+# 文件：db_oltp.fio
+[global]
+ioengine=libaio
+iodepth=32
+bs=4k
+direct=1          # O_DIRECT（数据库自管 buffer pool）
+size=10G
+numjobs=8
+runtime=120
+time_based
+group_reporting
+filename=/tmp/fio_db_test
+
+[read]
+rw=randread
+rate_iops=5000    # 限制读 IOPS，模拟混合比例
+
+[write]
+rw=randwrite
+rate_iops=1000    # 限制写 IOPS
+fsync=1           # 每次写后 fsync（数据库事务提交场景）
+```
+
+```bash
+# 配方 2: 日志写入（顺序追加写，含 fdatasync）
+fio --name=log_write \
+    --ioengine=sync \
+    --rw=write \
+    --bs=128k \          # 日志通常大块顺序写
+    --size=20G \
+    --numjobs=1 \        # 单线程（WAL 通常单写线程）
+    --fdatasync=1 \      # 每次写后 fdatasync
+    --filename=/var/log/fio_log_test \
+    --group_reporting
+
+# 配方 3: 元数据密集（海量小文件创建/删除）
+fio --name=metadata_storm \
+    --ioengine=sync \
+    --rw=write \
+    --bs=4k \
+    --size=4k \          # 每个文件只有 4KB
+    --numjobs=16 \
+    --nrfiles=10000 \    # 每个 job 创建 10000 个文件
+    --openfiles=100 \    # 同时打开 100 个
+    --directory=/tmp/fio_small_files/ \
+    --group_reporting
+
+# 配方 4: overlayfs copy-up 热点模拟
+# 在 overlayfs 上进行，每次写都触发 copy-up（文件来自 lower 层）
+mount -t overlay overlay \
+    -o lowerdir=/tmp/lower,upperdir=/tmp/upper,workdir=/tmp/work \
+    /tmp/overlay_test
+
+# 先在 lower 层创建大文件
+dd if=/dev/zero of=/tmp/lower/testfile bs=1M count=1024
+
+fio --name=copyup_bench \
+    --ioengine=sync --rw=write --bs=4k \
+    --size=1G --numjobs=1 \
+    --filename=/tmp/overlay_test/testfile \
+    --group_reporting
+# 第一次 write → copy-up 触发 → 延迟极高
+# 之后写入直接到 upper → 正常延迟
+```
+
+---
+
+### 18.17 `perf` 文件系统性能分析：从火焰图到函数级延迟
+
+```bash
+# 1. 采集文件系统操作的 CPU 热点火焰图
+# 目标：找到哪个内核函数消耗最多 CPU
+
+# 运行工作负载时同时采集
+perf record -F 999 -a -g --call-graph=dwarf \
+    --filter 'ip > 0xffffffff80000000' \  # 只采集内核栈（可选）
+    -- fio --name=test --ioengine=sync --rw=randwrite --bs=4k \
+            --size=1G --runtime=30 --time_based --filename=/tmp/perf_test
+
+# 生成 SVG 火焰图
+perf script | stackcollapse-perf.pl | flamegraph.pl > fs_flame.svg
+# 打开 fs_flame.svg，点击各函数块查看详情
+
+# 常见热点函数含义：
+# ext4_da_write_begin      ← 写操作的延迟分配开始（元数据准备）
+# jbd2_journal_dirty_metadata ← journal 元数据标记（事务相关）
+# __d_lookup_rcu           ← dcache 查找（路径解析热点）
+# shrink_slab              ← slab 内存回收（内存压力时出现）
+# writeback_inodes_wb      ← 脏页回写（writeback 线程）
+
+# 2. perf stat 精确统计特定工作负载的事件
+perf stat -e \
+    cache-references,cache-misses,\
+    L1-dcache-loads,L1-dcache-load-misses,\
+    LLC-loads,LLC-load-misses,\
+    page-faults,major-faults,\
+    context-switches \
+    -- fio --name=test --ioengine=sync --rw=randread \
+            --bs=4k --size=4G --runtime=30 --time_based --filename=/tmp/perf_test
+
+# 输出示例：
+#  12,345,678      cache-misses              #    8.92 % of all cache refs
+#      45,678      page-faults
+#         123      major-faults              # ← 几乎为 0 说明全是 page cache 命中
+#      12,345      context-switches
+
+# 3. 追踪特定函数的调用延迟（perf probe）
+# 为 ext4_sync_file 加入动态探针
+perf probe --add 'ext4_sync_file entry'
+perf probe --add 'ext4_sync_file%return latency=\$retval'
+
+# 采集
+perf record -e 'probe:ext4_sync_file*' -a -- sleep 30
+
+# 分析
+perf script | awk '/ext4_sync_file return/ {print $NF}' | \
+    sort -n | awk 'NR%10==0' | head -20
+# → 打印 fsync 的延迟分布（每 10 个打一个）
+
+# 4. 用 perf-trace 分析系统调用层面的延迟（轻量版 strace）
+perf trace --call-graph=dwarf -e 'read,write,fsync,fdatasync' \
+    -p $(pgrep mysqld) -- sleep 30 2>&1 | \
+    awk '/fsync/{split($0,a,/[()]/); if(a[2]+0 > 10) print}' | \
+    sort -t'<' -k2 -rn | head -20
+# → 找出超过 10ms 的 fsync 调用及其内核调用栈
+
+# 5. 用 BPF 精确分析每个 I/O 操作的延迟分布
+bpftrace -e '
+kprobe:ext4_file_write_iter { @start[tid] = nsecs; }
+kretprobe:ext4_file_write_iter /@start[tid]/ {
+    $lat_us = (nsecs - @start[tid]) / 1000;
+    @write_us = hist($lat_us);
+    if ($lat_us > 50000) {  // 超过 50ms 的写打印堆栈
+        printf("SLOW WRITE: %s(%d) lat=%d us\n", comm, pid, $lat_us);
+        print(kstack);
+    }
+    delete(@start[tid]);
+}
+interval:s:30 { print(@write_us); }
+' -- sleep 60
+```
+
+---
+
+### 18.18 基准测试协议模板
+
+设计可信 benchmark 的标准协议：
+
+```bash
+#!/bin/bash
+# 文件系统性能测试标准协议模板
+
+DEVICE="/dev/nvme0n1"
+FS_TYPE="ext4"
+MOUNT_POINT="/mnt/benchmark"
+TEST_DIR="$MOUNT_POINT/fio_test"
+RESULTS_DIR="/tmp/benchmark_results_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p "$RESULTS_DIR"
+
+# === 环境记录（必须！）===
+{
+    echo "=== System Info ==="
+    uname -r
+    lscpu | grep "Model name"
+    free -h
+    echo ""
+
+    echo "=== Storage Info ==="
+    lsblk -o NAME,TYPE,SIZE,ROTA,SCHED,MODEL "$DEVICE"
+    cat /sys/block/$(basename $DEVICE)/queue/scheduler
+    echo ""
+
+    echo "=== Filesystem Info ==="
+    tune2fs -l "$DEVICE" 2>/dev/null | grep -E "Block size|Filesystem features|Mount options"
+    mount | grep "$MOUNT_POINT"
+    echo ""
+
+    echo "=== Kernel Params ==="
+    sysctl vm.dirty_ratio vm.dirty_background_ratio
+    echo ""
+} > "$RESULTS_DIR/environment.txt"
+
+# === 准备阶段 ===
+# 挂载文件系统
+mkfs.ext4 -q "$DEVICE"
+mount "$DEVICE" "$MOUNT_POINT"
+mkdir -p "$TEST_DIR"
+
+# 预分配测试文件（排除文件创建时间）
+fio --name=prepare --ioengine=libaio --rw=write --bs=1M \
+    --size=20G --numjobs=1 --iodepth=16 \
+    --filename="$TEST_DIR/testfile" > /dev/null
+
+# === 测试 1: 顺序读（冷缓存 vs 热缓存）===
+echo "Test 1: Sequential Read"
+
+# 冷缓存
+sync && echo 3 > /proc/sys/vm/drop_caches
+fio --name=seq_read_cold --ioengine=libaio --rw=read --bs=1M \
+    --size=10G --numjobs=1 --iodepth=16 --runtime=60 --time_based \
+    --filename="$TEST_DIR/testfile" \
+    --output-format=json --output="$RESULTS_DIR/seq_read_cold.json"
+
+# 热缓存（不清 cache）
+fio --name=seq_read_hot --ioengine=libaio --rw=read --bs=1M \
+    --size=10G --numjobs=1 --iodepth=16 --runtime=60 --time_based \
+    --filename="$TEST_DIR/testfile" \
+    --output-format=json --output="$RESULTS_DIR/seq_read_hot.json"
+
+# === 测试 2: 随机读写（IOPS 测试）===
+echo "Test 2: Random 4K Read/Write"
+
+sync && echo 3 > /proc/sys/vm/drop_caches
+fio --name=rand_rw --ioengine=libaio --rw=randrw --rwmixread=70 --bs=4k \
+    --size=10G --numjobs=8 --iodepth=64 --runtime=60 --time_based \
+    --direct=1 \        # 绕过 page cache（纯设备 IOPS）
+    --filename="$TEST_DIR/testfile" \
+    --output-format=json --output="$RESULTS_DIR/rand_rw.json" \
+    --group_reporting
+
+# === 测试 3: 同步写入（持久化延迟）===
+echo "Test 3: Sync Write (fsync latency)"
+
+fio --name=sync_write --ioengine=sync --rw=randwrite --bs=4k \
+    --size=4G --numjobs=1 --fsync=1 \
+    --filename="$TEST_DIR/testfile" \
+    --output-format=json --output="$RESULTS_DIR/sync_write.json"
+
+# === 测试 4: 元数据操作（小文件风暴）===
+echo "Test 4: Metadata Storm (small files)"
+
+mkdir -p "$TEST_DIR/small_files"
+fio --name=small_files --ioengine=sync --rw=write --bs=4k \
+    --size=4k --numjobs=16 --nrfiles=5000 \
+    --directory="$TEST_DIR/small_files" \
+    --output-format=json --output="$RESULTS_DIR/metadata.json" \
+    --group_reporting
+
+# === 收集证据（与 benchmark 同期）===
+# 启动背景监控
+(while true; do
+    date "+%H:%M:%S" >> "$RESULTS_DIR/iostat.txt"
+    iostat -xz 1 1 "$DEVICE" >> "$RESULTS_DIR/iostat.txt"
+    grep -E "Dirty|Writeback|Cached" /proc/meminfo >> "$RESULTS_DIR/meminfo.txt"
+    sleep 5
+done) &
+MONITOR_PID=$!
+trap "kill $MONITOR_PID 2>/dev/null" EXIT
+
+# === 结果汇总 ===
+python3 - "$RESULTS_DIR" <<'PYEOF'
+import json, sys, os, glob
+
+results_dir = sys.argv[1]
+print(f"\n{'='*60}")
+print(f"Benchmark Results: {results_dir}")
+print(f"{'='*60}")
+
+for json_file in sorted(glob.glob(f"{results_dir}/*.json")):
+    name = os.path.basename(json_file).replace('.json', '')
+    try:
+        with open(json_file) as f:
+            data = json.load(f)
+        job = data['jobs'][0]
+        print(f"\n{name}:")
+        for io_type in ['read', 'write']:
+            d = job.get(io_type)
+            if d and d.get('iops', 0) > 0:
+                print(f"  {io_type}: IOPS={d['iops']:>8,.0f}  "
+                      f"BW={d['bw_bytes']/1024/1024:>7.1f}MB/s  "
+                      f"avg_lat={d['lat_ns']['mean']/1000:>7.1f}μs  "
+                      f"p99_lat={d['clat_ns']['percentile']['99.000000']/1000:>8.1f}μs")
+    except Exception as e:
+        print(f"  Error parsing {name}: {e}")
+PYEOF
+```
+
+---
+
 ## 本章小结
 
 | 主题 | 结论 |

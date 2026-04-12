@@ -249,6 +249,280 @@ POSIX 的很多直觉在单机上很自然：
 
 ---
 
+### 17.17 NFS 协议内部：RPC、属性缓存与 close-to-open 实现
+
+**NFS 客户端的内核结构**：
+
+```c
+/* include/linux/nfs_fs.h — NFS inode 扩展结构 */
+struct nfs_inode {
+    /* VFS inode（必须是第一个字段，用于 container_of 转换）*/
+    struct inode        vfs_inode;
+
+    /* NFS 文件句柄（服务端 inode 的不透明标识符）*/
+    struct nfs_fh       fh;             /* 文件句柄（最长 64 字节）*/
+
+    /* 属性缓存 */
+    unsigned long       read_cache_jiffies; /* 上次从服务器刷新属性的时间 */
+    unsigned long       attrtimeo;      /* 属性缓存超时（动态调整：actimeo）*/
+    unsigned long       attrtimeo_timestamp; /* 超时时间戳 */
+    struct timespec64   atime;          /* 缓存的访问时间 */
+    struct timespec64   mtime;          /* 缓存的修改时间 */
+    struct timespec64   ctime;          /* 缓存的状态改变时间 */
+    __u64               change_attr;    /* NFSv4 change attribute（单调递增版本号）*/
+    loff_t              cur_size;       /* 缓存的文件大小 */
+
+    /* 目录缓存 */
+    unsigned long       cache_validity;  /* 缓存有效性标志（NFS_INO_INVALID_DATA 等）*/
+    struct nfs_open_context *cache_head; /* 当前 open file 上下文链表 */
+
+    /* page cache 状态 */
+    struct radix_tree_root  nfs_page_tree; /* 待提交的写请求树 */
+    unsigned long       ncommit;        /* 待提交的写请求数 */
+    atomic_long_t       nrequests;      /* 进行中的读写请求数 */
+
+    /* 锁状态（NFSv4）*/
+    struct list_head    open_files;     /* 此 inode 的所有 open 上下文 */
+    struct rw_semaphore rwsem;          /* 保护 nfs4 stateid 等 */
+};
+
+/* NFS 挂载参数（影响属性缓存行为）*/
+/* acregmin=N (默认 3s):  普通文件属性缓存最短时间 */
+/* acregmax=N (默认 60s): 普通文件属性缓存最长时间 */
+/* acdirmin=N (默认 30s): 目录属性缓存最短时间 */
+/* acdirmax=N (默认 60s): 目录属性缓存最长时间 */
+/* actimeo=N:             统一设置 acregmin/max 和 acdirmin/max */
+/* noac:                  禁用属性缓存（总是从服务器获取，极慢但总是最新）*/
+```
+
+**属性缓存的动态调整算法（Solaris 发明，Linux 沿用）**：
+
+```
+属性缓存超时的自适应算法（exponential backoff）：
+
+初始：attrtimeo = acregmin（默认 3 秒）
+
+每次访问时：
+  if (文件在 attrtimeo 内未被修改):
+      attrtimeo = min(attrtimeo * 2, acregmax)  ← 指数增加（最长 60s）
+  else:
+      attrtimeo = acregmin                       ← 重置为最短
+
+效果：
+  - 频繁修改的文件 → 缓存时间短（3-6s），较快看到更新
+  - 长期稳定的文件 → 缓存时间长（最长 60s），减少 GETATTR RPC 次数
+
+观察 NFS 属性缓存命中率：
+```
+
+```bash
+# 查看 NFS 统计（挂载点的 RPC 调用次数）
+nfsstat -c           # 客户端统计
+# 或
+cat /proc/net/rpc/nfs
+# net 0 0 0 0                   ← 网络层统计
+# rpc 12345 0 0                 ← RPC 调用总数、重传数、认证错误数
+# proc4 58 0 3456 2345 ...      ← NFSv4 各 operation 调用次数
+
+# 查看特定挂载点的详细统计
+cat /proc/self/mountstats | grep -A50 "device server:/path"
+# device server:/export mounted on /mnt/nfs with fstype nfs4 statvers=1.1
+# opts: rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,acregmin=3,acregmax=60
+# age: 3600 seconds
+# impl_id: name='',domain='',date='0,0'
+# caps:   caps=0x3ffdf,wtmult=512,dtsize=32768,bsize=0,namlen=255
+# nfsv4:  bm0=0x7ffffbff,bm1=0x40f9be3e,...
+# sec: flavor=unix,pseudoflavor=0
+# events: 1234 5678 90 ...     ← 各类缓存事件（inode revalidate 等）
+# bytes:  12345678 87654321 0 0 ...  ← 读/写/直接读/直接写 字节数
+# RPC iostats version: 1.0 p/v: 100003/4 (nfs)
+# ops[0]  GETATTR 4500  0 0 ...  ← GETATTR: 次数、超时、重传、RTT(ms)...
+# ops[1]  SETATTR 12    0 0 ...
+# ops[8]  READ    789   0 0 0 0 3456789 0 0 234    ← 每个 op 的延迟分布
+
+# 用 mountstats 工具格式化输出
+mountstats /mnt/nfs
+# ...
+# NFS byte counts:
+#   Applications read 123456789 bytes via read(2)
+#   Applications wrote 12345678 bytes via write(2)
+#   Applications read 0 bytes via O_DIRECT read(2)
+#
+# RPC statistics:
+#   736 RPC requests sent, 736 RPC requests completed (100.0% successful)
+#   Average bytes sent per RPC: 212
+#   GETATTR: 245 ops (33%), avg RTT: 1.2ms  ← 高比例 GETATTR 说明属性缓存失效频繁
+#   READ:    456 ops (62%), avg RTT: 3.4ms
+```
+
+**close-to-open 一致性的内核实现**：
+
+```bash
+# close-to-open 的 NFS 实现（fs/nfs/file.c）：
+# nfs_file_release()（close 系统调用的文件系统钩子）：
+#   → nfs_wb_all()：把所有脏页写回服务器（刷写本地 page cache）
+#   → nfs_commit_all()：等待写入被服务器 commit（若是 unstable write）
+#
+# nfs_open()（open 系统调用的文件系统钩子）：
+#   → nfs_revalidate_inode()：向服务器发 GETATTR，刷新属性缓存
+#   → 若 change_attr 变化 → 使本地 page cache 失效（丢弃旧数据）
+
+# 演示 close-to-open 效果
+# 在服务端修改文件
+ssh nfs-server "echo 'new content' > /export/test.txt"
+
+# 客户端立刻读（属性缓存可能命中旧值）
+cat /mnt/nfs/test.txt     # 可能看到旧内容
+
+# 关闭并重新打开（触发 close-to-open 一致性）
+exec 3< /mnt/nfs/test.txt
+exec 3>&-   # 关闭
+cat /mnt/nfs/test.txt     # 现在应该看到新内容
+
+# 用 strace 确认
+strace -e trace=network -p $$ &
+cat /mnt/nfs/test.txt   # 观察 GETATTR RPC 是否被发送
+```
+
+---
+
+### 17.18 CephFS 架构：MDS、OSD 与客户端缓存
+
+CephFS 是 Ceph 存储系统的文件系统层，理解其架构有助于理解分布式文件系统的复杂性：
+
+```
+CephFS 架构：
+
+客户端（libcephfs / ceph-fuse / kcephfs）
+       │
+       ├── 元数据操作 ──→ MDS 集群（Metadata Server）
+       │                  ├── 维护目录树、inode、权限、锁
+       │                  ├── 动态分片（目录可以分布到多个 MDS）
+       │                  ├── 基于 RADOS 持久化元数据（metadata pool）
+       │                  └── 向客户端发放 capability（读/写/缓存授权）
+       │
+       └── 数据操作 ───→ OSD 集群（Object Storage Daemon）
+                         ├── 文件数据分片为 objects（默认 4MB/object）
+                         ├── 每个 object 按 CRUSH 算法分布到多个 OSD
+                         ├── 每个 OSD 通常对应一块物理磁盘
+                         └── 直接与客户端通信（bypass MDS）
+
+capability 机制（Ceph 的 delegation 实现）：
+  MDS 向客户端发放 capability：
+  - Fc (file cache)  → 允许客户端缓存文件内容
+  - Fw (file write)  → 允许客户端本地脏数据
+  - Fr (file read)   → 允许客户端读数据
+  - Fx (file excl)   → 排他锁
+  - Fs (file shared) → 共享锁（读锁）
+
+  当其他客户端需要不兼容的 capability 时：
+  → MDS 发 revoke 消息撤销已有 capability
+  → 持有 capability 的客户端必须在超时内：
+      1. 刷写本地脏数据到 OSD
+      2. 返回 capability 给 MDS
+  → MDS 再把 capability 授予新请求者
+```
+
+**CephFS 客户端观察**：
+
+```bash
+# 查看 CephFS 客户端状态（在挂载节点上）
+ceph tell mds.* session ls  # 所有活跃客户端会话
+
+# 查看 MDS 缓存状态
+ceph tell mds.0 cache status
+# {
+#   "capacity": 4294967296,      ← MDS 内存缓存容量
+#   "num_inodes": 123456,        ← 缓存的 inode 数
+#   "num_dentries": 234567,      ← 缓存的 dentry 数
+#   "heap": 2345678900,          ← 堆内存使用量
+# }
+
+# 观察 MDS 的 capability 撤销事件（可能影响应用延迟）
+ceph tell mds.0 dump_tree /
+# 查看目录树和 capability 分布
+
+# 挂载 CephFS（内核客户端）
+mount -t ceph mon1:6789,mon2:6789,mon3:6789:/ /mnt/cephfs \
+    -o name=admin,secret=AQDxxxxxx...==
+
+# 挂载选项
+# rbytes=1        ← 报告真实目录大小（而非快速估算）
+# nocrc           ← 禁用校验和（提高写性能，降低可靠性）
+# readdir_max_entries=N ← 每次 readdir 最大条目数
+
+# 通过 /sys/kernel/debug/ceph 观察内核客户端状态
+ls /sys/kernel/debug/ceph/
+# 每个挂载点一个目录（包含 mds_sessions、caps、osd_requests 等文件）
+cat /sys/kernel/debug/ceph/*/caps
+# total 12345, implemented 11111, issued 9876
+# ↑ 客户端持有的 capability 总数（过多可能导致 MDS revoke 延迟）
+```
+
+---
+
+### 17.19 NFS 挂载参数调优与常见问题排查
+
+```bash
+# 查看当前 NFS 挂载参数
+mount | grep nfs
+cat /proc/mounts | grep nfs4
+
+# NFS 关键挂载参数对性能的影响：
+
+# 1. rsize/wsize：读写块大小（影响每次 RPC 传输量）
+mount -t nfs4 server:/path /mnt -o rsize=1048576,wsize=1048576
+# 默认通常 1MB（较老内核可能只有 32KB），大 rsize/wsize 减少 RPC 次数
+
+# 2. soft vs hard 挂载（决定 NFS 故障时应用的行为）
+mount -t nfs4 server:/path /mnt -o soft,timeo=100,retrans=3
+# soft: 超时后返回 EIO 给应用（应用能感知错误，避免永久挂起）
+# hard（默认）: 永久重试，应用进程会一直阻塞（在 D 状态）
+# timeo=100: 超时 10 秒（单位：0.1秒）
+# retrans=3: 重试 3 次
+
+# 3. async vs sync 挂载（写入语义）
+mount -t nfs4 server:/path /mnt -o async  # 默认：异步（write 立即返回，后台 commit）
+mount -t nfs4 server:/path /mnt -o sync   # 每次 write 都同步到服务器（极慢但安全）
+
+# 4. 属性缓存调整
+mount -t nfs4 server:/path /mnt -o actimeo=0   # 禁用属性缓存（总是 GETATTR）
+mount -t nfs4 server:/path /mnt -o acregmax=5  # 文件属性最长缓存 5 秒（比默认 60s 更激进）
+
+# 常见问题排查：
+
+# 问题 1: df 挂起（NFS 服务器不可达）
+# → D 状态进程
+ps aux | grep " D "  # 找到阻塞在 NFS 的进程
+# → 用 soft 挂载或 nfsidmap + 超时保护
+
+# 问题 2: stale file handle (ESTALE)
+# → 服务端文件被删除/重建，但客户端还持有旧 fh
+stat /mnt/nfs/file  # 返回 ESTALE
+# → umount 并重新挂载（或 mount -o remount）
+
+# 问题 3: 权限问题（nobody:nobody）
+# → uid/gid 映射问题
+ls -la /mnt/nfs/file  # 显示 nobody:nobody
+# → 检查 /etc/idmapd.conf 和服务端的 /etc/exports
+# → 确认客户端和服务端的 Domain = 一致
+
+# 问题 4: 写入速度慢（COMMIT RPC 频繁）
+nfsstat -c | grep commit  # 统计 COMMIT 次数
+# → 大量 COMMIT 说明 write 是 unstable write，每次都等服务端 commit
+# → 在服务端启用 write cache 或调整应用写入批次大小
+
+# 调试 NFS 性能的完整工具链
+rpcdebug -m nfs -s all    # 开启 NFS 调试（输出到 dmesg）
+mountstats /mnt/nfs       # 查看每个 operation 的延迟统计
+nfsiostat 1 5 /mnt/nfs    # 实时 NFS I/O 统计（类似 iostat）
+# ops/s   kB/s    kB/op   retrans  avg RTT (ms)  avg exe (ms)
+# Read:  234.5  1234.5    5.3      0.0           3.4           3.6
+# Write:  45.6   456.7   10.0      0.0           8.9          12.3
+```
+
+---
+
 ## 本章小结
 
 | 主题 | 结论 |

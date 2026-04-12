@@ -237,6 +237,407 @@ page cache 很容易制造一种错觉：只要本机再次读到新内容，就
 
 ---
 
+### 11.16 address_space 与 folio：page cache 的内核数据结构
+
+#### struct address_space（`include/linux/fs.h`）
+
+`struct address_space` 是 VFS 层连接 inode 与其缓存页集合的核心对象。每个文件 inode 有一个关联的 `address_space`（通过 `inode->i_mapping`）。
+
+```c
+struct address_space {
+    struct inode        *host;              /* 关联的 inode（NULL 表示匿名映射）*/
+    struct xarray        i_pages;           /* 页缓存 radix tree（现代版本用 XArray）*/
+    struct rw_semaphore  invalidate_lock;   /* 保护 invalidate/truncate vs 读路径 */
+    gfp_t                gfp_mask;          /* 分配新页使用的 GFP 标志 */
+    atomic_t             i_mmap_writable;   /* 可写 mmap 映射数（影响 O_TRUNC 等操作）*/
+    struct rb_root_cached i_mmap;           /* 此文件的所有 VMA 区域（mmap 追踪）*/
+    unsigned long        nrpages;           /* 当前缓存的总页数 */
+    unsigned long        nrexceptional;     /* shadow/swap entry 数（回收后的踪迹）*/
+    pgoff_t              writeback_index;   /* writeback 从这个偏移开始扫描脏页 */
+    const struct address_space_operations *a_ops; /* 操作表 */
+    unsigned long        flags;             /* AS_EIO（writeback 错误）等标志 */
+    struct klist         private_list;      /* 文件系统私有链表（buffer_head 等）*/
+    errseq_t             wb_err;            /* writeback 错误序列号（供 fsync 检查）*/
+    spinlock_t           private_lock;
+};
+```
+
+关键字段说明：
+
+- `i_pages`（XArray）：用稀疏数组/基数树存储缓存页，key 是文件内的页索引（`page_index = file_offset / PAGE_SIZE`），value 是 `struct folio *`（或旧版的 `struct page *`）。
+- `wb_err`：writeback 错误通过此字段传播。调用 `fsync()` 时，VFS 通过比较错误序列号判断自上次 `fsync` 以来是否有新写入错误。
+- `nrpages`：当前在 page cache 中的页数（不含 shadow entry），`/proc/meminfo` 的 `Cached` 字段部分来自这里。
+- `a_ops`：操作表（见下）。
+
+#### struct address_space_operations（操作表）
+
+```c
+struct address_space_operations {
+    int   (*writepage)(struct page *, struct writeback_control *);
+        /* 把单个脏页写回底层设备（单页回写入口）*/
+    int   (*read_folio)(struct file *, struct folio *);
+        /* 从底层设备读入一页（page cache miss 时调用）*/
+    int   (*writepages)(struct address_space *, struct writeback_control *);
+        /* 批量回写脏页（优先于 writepage，ext4/xfs 用此实现多页合并）*/
+    bool  (*dirty_folio)(struct address_space *, struct folio *);
+        /* 将页标记为脏（ext4: 同时通知 jbd2 记录事务）*/
+    void  (*readahead)(struct readahead_control *);
+        /* 预读多页（一次性提交 bio 批量读取）*/
+    int   (*write_begin)(struct file *, struct address_space *, loff_t,
+                         unsigned, struct page **, void **);
+        /* write() 路径开始前：分配/锁定目标页，处理 COW/hole 等 */
+    int   (*write_end)(struct file *, struct address_space *, loff_t,
+                       unsigned, unsigned, struct page *, void *);
+        /* write() 路径结束：标记脏页，释放锁 */
+    sector_t (*bmap)(struct address_space *, sector_t);
+        /* 文件逻辑块号 → 物理块号（swap 和 mmap 用）*/
+    void  (*invalidate_folio)(struct folio *, size_t offset, size_t len);
+        /* truncate/hole_punch 时使部分或全部页失效 */
+    bool  (*release_folio)(struct folio *, gfp_t);
+        /* 内存回收时询问文件系统是否可以释放此页 */
+    void  (*free_folio)(struct folio *);
+        /* 页彻底释放时清理文件系统私有数据 */
+    ssize_t (*direct_IO)(struct kiocb *, struct iov_iter *);
+        /* O_DIRECT 路径：绕过 page cache 的 I/O 实现 */
+    int   (*swap_activate)(struct swap_info_struct *, struct file *,
+                           sector_t *);
+        /* 允许文件作为 swap 设备 */
+};
+```
+
+#### struct folio（Linux 5.16+，替代 struct page 的新抽象）
+
+```c
+/* folio 是一个"可能跨多个连续 page 的缓存单元" */
+/* 对于普通 4K page：folio = 一个 page */
+/* 对于 huge page / THP：folio = 多个连续 page */
+
+struct folio {
+    /* -- 继承自 struct page -- */
+    unsigned long flags;            /* PG_dirty, PG_writeback, PG_locked, PG_uptodate 等 */
+    struct list_head lru;           /* LRU 链表节点 */
+    struct address_space *mapping;  /* 关联的 address_space */
+    pgoff_t index;                  /* 在文件中的页索引（byte_offset / PAGE_SIZE）*/
+    atomic_t _refcount;             /* 引用计数 */
+    atomic_t _mapcount;             /* 被页表映射的次数（>= 0 表示有进程映射它）*/
+    /* ... */
+
+    /* -- folio 特有 -- */
+    union {
+        struct {
+            unsigned long _flags_1;
+            unsigned long _head;     /* 标记这是 folio head（非 tail page）*/
+        };
+    };
+};
+
+/* 关键 page flags（PG_xxx 宏）：
+   PG_dirty      - 页被修改（需要回写）
+   PG_writeback  - 正在被回写（I/O 进行中）
+   PG_locked     - 被某个进程锁定（保护并发访问）
+   PG_uptodate   - 页内容与磁盘一致（读完成后设置）
+   PG_referenced - 被 LRU 标记为近期访问
+   PG_active     - 在 active LRU 链表中
+   PG_swapbacked - 是匿名页（backed by swap，不是文件页）
+   PG_workingset - workingset 追踪标记（用于 refault 检测）
+*/
+```
+
+**观察缓存页状态**：
+
+```bash
+# 查看当前 page cache 总量
+cat /proc/meminfo | grep -E "Cached|Dirty|Writeback|Active|Inactive"
+# Cached:         2048576 kB    ← 文件 page cache（含部分 tmpfs）
+# Dirty:            12288 kB    ← 脏页量（已写但未落盘）
+# Writeback:         1024 kB    ← 正在写回的页
+# Active(file):   1024000 kB   ← 活跃文件缓存（近期访问）
+# Inactive(file):  512000 kB   ← 不活跃文件缓存（等待回收）
+
+# 查看特定文件在 page cache 中的驻留情况
+# 工具 1: fincore（需要 util-linux）
+fincore /var/log/syslog
+# FILE            PAGES  SIZE    PAGES CACHED  CACHED%
+# /var/log/syslog  2048  8.0 MiB  1200          58.6%
+
+# 工具 2: pcstat（Go 工具，https://github.com/tobert/pcstat）
+# pcstat /path/to/file
+
+# 工具 3: vmtouch
+vmtouch /var/lib/postgresql/data/base/
+# Files: 1203
+# Directories: 23
+# Resident Pages: 128000/256000  500M/1000M  50.0%
+# Elapsed: 0.42 seconds
+
+# 强制预热（将整个文件读入 page cache）
+vmtouch -t /var/lib/postgresql/data/base/pg_wal/
+cat /var/lib/postgresql/data/base/pg_wal/* > /dev/null
+```
+
+---
+
+### 11.17 readahead 状态机：file_ra_state 与异步预读
+
+内核为每个 `struct file`（open file description）维护一个 `file_ra_state` 结构，追踪该文件的预读状态：
+
+```c
+/* include/linux/fs.h */
+struct file_ra_state {
+    pgoff_t     start;          /* 当前预读窗口起始页索引 */
+    unsigned    size;           /* 当前预读窗口大小（页数）*/
+    unsigned    async_size;     /* 异步预读阈值（当读到此处时，触发下一次预读）*/
+    unsigned    ra_pages;       /* 最大预读页数（受 /sys/block/sdX/queue/read_ahead_kb 限制）*/
+    unsigned    mmap_miss;      /* mmap 访问未命中次数（用于判断 mmap 是否是随机访问）*/
+    loff_t      prev_pos;       /* 上次读结束位置（用于检测顺序访问模式）*/
+};
+```
+
+**预读算法逻辑**：
+
+```
+首次读取（cold start）：
+  → 发起初始预读窗口（通常 4 页）
+  → 同步读所需页 + 异步预读后续页
+
+连续读取（顺序检测）：
+  → 每次读取确认当前位置 ≈ prev_pos + last_read_size
+  → 确认顺序 → 预读窗口指数增长（4 → 8 → 16 → ... → ra_pages 上限）
+
+随机读取检测：
+  → 当前读位置与 prev_pos 偏差大 → mmap_miss++ 或 start = 0 重置
+  → 禁用预读（避免无效预读浪费内存和 I/O）
+
+触发时机（异步预读）：
+  → 读到"当前窗口起始 + (size - async_size)"位置时
+  → 异步提交下一个预读窗口的 bio
+  → 应用程序的 read() 感受不到这次 I/O（并发进行）
+```
+
+**观察预读效果**：
+
+```bash
+# 通过 /sys/block 调整预读大小
+cat /sys/block/sda/queue/read_ahead_kb   # 默认通常 128KB
+echo 2048 > /sys/block/sda/queue/read_ahead_kb  # 调大预读（顺序读受益）
+
+# 通过 posix_fadvise 提示预读策略
+python3 -c "
+import os, ctypes
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+POSIX_FADV_SEQUENTIAL = 2
+POSIX_FADV_RANDOM = 1
+POSIX_FADV_WILLNEED = 3
+POSIX_FADV_DONTNEED = 4
+
+fd = os.open('/var/log/syslog', os.O_RDONLY)
+# 告诉内核即将顺序读取（激进预读）
+libc.posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)
+# 读取后告诉内核不再需要缓存
+# libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+os.close(fd)
+"
+
+# 观察实际 I/O 与预读的关系（iostat + vmstat 联动）
+# Terminal 1: 监控 I/O
+iostat -x 1 /dev/sda &
+
+# Terminal 2: 测试顺序读 vs 随机读
+dd if=/var/log/large.log of=/dev/null bs=4K count=1000 iflag=direct  # 顺序读，观察 r/s
+python3 -c "
+import random, os
+f = open('/var/log/large.log', 'rb')
+size = os.path.getsize('/var/log/large.log')
+for _ in range(1000):
+    f.seek(random.randint(0, size - 4096))
+    f.read(4096)   # 随机读，r/s 高但预读命中率低
+"
+```
+
+---
+
+### 11.18 writeback 基础设施：bdi_writeback 与脏页控制参数
+
+#### writeback 架构
+
+```
+脏页产生：write() → page cache 中对应页设置 PG_dirty → inode 加入 writeback_index
+
+writeback 触发来源（三种）：
+  1. 周期性刷（flusher 线程每 5 秒扫描一次）
+  2. 压力触发（脏页比例超过 dirty_background_ratio）
+  3. 显式同步（fsync/sync/syncfs 调用）
+
+关键内核线程：
+  每个 backing device（块设备）对应一个 bdi_writeback 结构
+  每个 bdi_writeback 有一个 wb 工作线程（kworker/uXX:X-flush-MAJ:MIN）
+```
+
+```bash
+# 观察 writeback 线程
+ps aux | grep "flush-"
+# root  234  0.0  0.0  0  0 ?  S  00:00  0:02 [kworker/u4:1-flush-8:1]
+# root  235  0.0  0.0  0  0 ?  S  00:00  0:01 [kworker/u4:2-flush-8:16]
+# 命名格式：flush-MAJ:MIN（对应设备 major:minor 号）
+```
+
+#### 关键 /proc/sys/vm 参数
+
+```bash
+# 查看所有 vm 相关参数
+ls /proc/sys/vm/ | sort | head -20
+sysctl -a | grep vm.dirty
+
+# 参数 1: vm.dirty_background_ratio（默认 10）
+# 脏页占总内存的百分比超过此值时，后台刷写开始
+cat /proc/sys/vm/dirty_background_ratio   # 默认 10（即 10%）
+# → 总内存 8GB，脏页超过 800MB 时后台刷写启动
+
+# 参数 2: vm.dirty_ratio（默认 20）
+# 脏页占总内存超过此值时，写入进程被迫阻塞（dirty throttling）
+cat /proc/sys/vm/dirty_ratio   # 默认 20（即 20%）
+# → 总内存 8GB，脏页超过 1.6GB 时写入进程开始被阻塞
+
+# 参数 3: vm.dirty_expire_centisecs（默认 3000 = 30秒）
+# 脏页超过多少厘秒后，必须被回写（即使未触发 ratio）
+cat /proc/sys/vm/dirty_expire_centisecs   # 3000 = 30 秒
+
+# 参数 4: vm.dirty_writeback_centisecs（默认 500 = 5秒）
+# 刷写线程的唤醒周期
+cat /proc/sys/vm/dirty_writeback_centisecs  # 500 = 每 5 秒
+
+# 参数 5: vm.vfs_cache_pressure（默认 100）
+# 内存回收时 page cache vs 匿名页的压力权重
+# 越大 → 越积极回收文件缓存；越小 → 更多保留 page cache
+cat /proc/sys/vm/vfs_cache_pressure  # 100
+
+# 参数 6: vm.min_free_kbytes
+# 保持最小空闲内存量（防止分配时卡死）
+cat /proc/sys/vm/min_free_kbytes
+
+# 数据库场景常用调优（减少延迟抖动）：
+sysctl -w vm.dirty_background_ratio=5   # 更早开始后台回写
+sysctl -w vm.dirty_ratio=10             # 更早触发写入阻塞（压力曲线更平稳）
+sysctl -w vm.dirty_expire_centisecs=1000  # 缩短脏页存活时间
+sysctl -w vm.vfs_cache_pressure=50     # 保留更多 page cache
+```
+
+#### cgroup 内存限制对 writeback 的影响
+
+```bash
+# 查看容器的内存 cgroup 设置
+cat /sys/fs/cgroup/memory/docker/<container_id>/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/docker/<container_id>/memory.stat
+
+# memory.stat 中与 page cache 相关的字段：
+# cache: 4096000        ← 此 cgroup 的 page cache 用量（字节）
+# rss: 102400000        ← 匿名页 + swap
+# mapped_file: 1048576  ← 被 mmap 映射的文件页
+# pgpgin: 12345         ← 从磁盘读入的页数（自启动起累积）
+# pgpgout: 23456        ← 写出到磁盘的页数
+# pgfault: 345678       ← page fault 次数（含 minor fault）
+# pgmajfault: 123       ← major page fault（必须从磁盘读）
+
+# 观察 cgroup 的内存压力
+cat /sys/fs/cgroup/memory/docker/<container_id>/memory.pressure_level
+# 或使用 PSI（Pressure Stall Information，Linux 4.20+）
+cat /proc/pressure/memory
+# some avg10=0.00 avg60=0.00 avg300=0.00 total=0        ← 没有内存压力
+# full avg10=1.23 avg60=0.45 avg300=0.12 total=123456   ← 有压力（1.23% of time stalled）
+```
+
+---
+
+### 11.19 实践工具：观察 page cache 状态与性能
+
+**基础指标读取**：
+
+```bash
+# /proc/meminfo 完整解读
+grep -E "Mem|Cache|Dirty|Writeback|Active|Inactive|Mapped|Shmem|Slab|Buff" /proc/meminfo
+# MemTotal:       16384000 kB   ← 总物理内存
+# MemFree:         2048000 kB   ← 完全空闲
+# Buffers:          131072 kB   ← 块设备元数据缓存（非文件页）
+# Cached:          8192000 kB   ← 文件 page cache（不含 Buffers）
+# SwapCached:            0 kB
+# Active:          6144000 kB   ← 活跃 LRU（近期访问，不易被回收）
+# Inactive:        3200000 kB   ← 不活跃 LRU（候选回收）
+# Active(anon):    2048000 kB   ← 活跃匿名页
+# Inactive(anon):   256000 kB
+# Active(file):    4096000 kB   ← 活跃文件 page cache
+# Inactive(file):  2944000 kB   ← 不活跃文件 page cache
+# Dirty:             12288 kB   ← 脏页（已修改，待回写）
+# Writeback:          1024 kB   ← 正在回写中的页
+# AnonPages:       1843200 kB   ← 非文件页（堆、栈、mmap(MAP_ANON)）
+# Mapped:           512000 kB   ← 被进程 mmap 映射的页（是 Cached 的子集）
+# Shmem:            102400 kB   ← 共享内存 / tmpfs 用量
+
+# vmstat：系统级页操作速率
+vmstat -S M 1 10   # 每秒采样，MB 单位
+# r  b   swpd  free  buff  cache  si  so  bi   bo   in   cs  us  sy  id  wa
+# 2  0   0     2048  128   8192   0   0   256  128  1024 2048 20  5   74  1
+# ↑                                               bi=块读入速率, bo=块写出速率
+
+# 观察脏页/回写的实时变化
+watch -n 1 'grep -E "Dirty|Writeback" /proc/meminfo'
+```
+
+**page cache 命中分析（eBPF 工具）**：
+
+```bash
+# cachestat（来自 BCC/bpftrace）：实时显示 cache 命中/失误
+cachestat 1
+# HITS   MISSES  DIRTIES  HITRATIO
+# 2048   128     64       94.12%    ← 94% 命中率
+# 4096   0       128      100.0%
+# 1024   512     256      66.67%    ← 命中率下降，可能有冷扫描
+
+# cachestat 原理（eBPF probe 挂载的内核函数）：
+# add_to_page_cache_lru → miss（page 从磁盘读入，未命中）
+# mark_page_accessed    → hit（page 已在 cache，被访问）
+# account_page_dirtied  → dirty（page 被修改）
+
+# cachetop：类似 top 的按进程显示
+cachetop 5   # 每 5 秒刷新
+
+# perf：分析 page fault 热点
+perf stat -e cache-references,cache-misses,page-faults,major-faults ./workload
+# page-faults:        12345  ← minor fault（page 在 cache，只需建页表）
+# major-faults:         123  ← major fault（page 不在 cache，需磁盘 I/O）
+```
+
+**writeback 延迟分析**：
+
+```bash
+# 观察 writeback 事件（通过 ftrace）
+echo 1 > /sys/kernel/debug/tracing/events/writeback/writeback_dirty_page/enable
+echo 1 > /sys/kernel/debug/tracing/events/writeback/writeback_write_inode/enable
+cat /sys/kernel/debug/tracing/trace | head -20
+# 每次页变脏和 inode 被回写时的事件
+
+# 实际测量写入延迟与 writeback 的关系
+python3 -c "
+import os, time, statistics
+delays = []
+f = open('/tmp/writeback_test', 'wb')
+for _ in range(100):
+    t0 = time.monotonic()
+    f.write(b'x' * 1024 * 1024)  # 1MB write
+    t1 = time.monotonic()
+    delays.append(t1 - t0)
+f.close()
+os.unlink('/tmp/writeback_test')
+print(f'avg={statistics.mean(delays)*1000:.2f}ms max={max(delays)*1000:.2f}ms')
+# avg=0.12ms max=15.34ms  ← max 突刺通常是 dirty throttling 生效
+"
+
+# 显式控制回写（不影响应用）
+sync  # 同步所有文件系统
+echo 3 > /proc/sys/vm/drop_caches  # 回收所有可回收缓存（注意：影响性能）
+```
+
+---
+
 ## 本章小结
 
 | 主题 | 结论 |
