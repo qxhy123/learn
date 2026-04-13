@@ -95,6 +95,14 @@
 | 第25章 | [asyncio基础与结构化并发](./part9-asyncio/25-asyncio-foundations.md) | 协程、Task、TaskGroup、取消、超时、同步原语 | 异步特征抓取与批量推理控制面 |
 | 第26章 | [asyncio网络编程与异步服务实战](./part9-asyncio/26-asyncio-networking-and-services.md) | `start_server`、背压、限流、优雅关闭、异步服务 | 异步模型网关与日志摄取服务 |
 | 第27章 | [asyncio极端复杂场景实战](./part9-asyncio/27-asyncio-extreme-scenarios.md) | deadline预算、微批处理、多租户限流、取消风暴、复杂编排 | 高并发推理网关与RAG编排器 |
+| 第28章 | [asyncio同步原语完整指南](./part9-asyncio/28-asyncio-sync-primitives.md) | Lock、Condition、BoundedSemaphore、Queue变体、Event高级模式、选择决策树 | 优先级调度器、推理并发控制、多租户配额 |
+| 第29章 | [asyncio高级并发控制](./part9-asyncio/29-asyncio-advanced-concurrency.md) | wait()、as_completed()、shield()、timeout_at()、Task自省、自定义awaitable | 竞速取最快副本、流式特征处理、deadline预算传递 |
+| 第30章 | [asyncio与同步代码集成](./part9-asyncio/30-asyncio-sync-integration.md) | to_thread()、run_in_executor()、asyncio.subprocess、contextvars、线程安全桥接 | 同步模型推理异步化、trace ID传播、混合推理服务 |
+| 第31章 | [asyncio测试实战](./part9-asyncio/31-asyncio-testing.md) | pytest-asyncio、AsyncMock、时间控制、测试取消/超时/并发、常见陷阱 | 推理服务测试、mock模型接口、并发行为验证 |
+| 第32章 | [asyncio可观测性与调试](./part9-asyncio/32-asyncio-observability-debugging.md) | debug模式、loop lag检测、任务自省、结构化日志、指标收集、任务泄漏、tracemalloc | 推理服务监控、请求追踪、生产级故障排查 |
+| 第33章 | [事件循环深度解析](./part9-asyncio/33-asyncio-event-loop-deep-dive.md) | asyncio.Runner、add_reader/add_writer、call_at()、run_forever()、自定义loop policy、Windows ProactorEventLoop、Jupyter嵌套loop | 测试框架复用loop、推理网关主循环、deadline回调触发 |
+| 第34章 | [极端复杂场景模式](./part9-asyncio/34-asyncio-extreme-advanced-patterns.md) | 熔断器、令牌桶限流、连接池、加权公平调度、批量偏失败隔离、惊群效应防治、缓存击穿防护 | 弹性推理网关、多租户限流、生产级容错编排 |
+| 第35章 | [FastAPI 与 asyncio 实战](./part9-asyncio/35-fastapi-asyncio.md) | 路由、Pydantic、Depends、lifespan、BackgroundTasks、WebSocket、Semaphore限流、timeout、SSE流式推理 | 异步推理网关、流式LLM服务、特征聚合API |
 
 ### 附录
 
@@ -142,7 +150,7 @@
 1. 复习第2章（函数）、第7章（异常）、第8章（生成器）
 2. 学习第10-11章（装饰器、上下文管理）
 3. 学习第24章（部署）
-4. 重点学习第25-27章（`asyncio` 与复杂系统场景）
+4. 重点学习第25-34章（`asyncio` 与复杂系统场景）
 
 ---
 
@@ -170,9 +178,9 @@
 
 ## 教程特色
 
-- **27章完整内容**：从环境搭建到模型部署、异步并发与复杂系统编排
+- **34章完整内容**：从环境搭建到模型部署、异步并发与复杂系统编排
 - **深度学习融合**：每章配有AI应用案例和PyTorch代码示例
-- **135道练习题**：每章5道精选习题，含详细解答
+- **170道练习题**：每章5道精选习题，含详细解答
 - **零基础友好**：无需任何编程经验，从零开始讲解
 - **中文编写**：专为中文学习者设计，术语准确，表达清晰
 
