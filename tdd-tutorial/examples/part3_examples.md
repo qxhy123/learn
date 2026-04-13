@@ -1,3 +1,8 @@
+# Part 3 示例：中级技巧 - Mock、异常、参数化、IO
+
+运行方式：`python -m unittest examples/part3_examples.py -v`
+
+```python
 """
 Part 3 示例：中级技巧 - Mock、异常、参数化、IO
 运行方式：python -m unittest examples/part3_examples.py -v
@@ -253,3 +258,4 @@ class TestConfigReader(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+```

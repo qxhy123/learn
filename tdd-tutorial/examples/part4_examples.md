@@ -1,3 +1,8 @@
+# Part 4 示例：高阶技巧 - 测试替身、异步、覆盖率
+
+运行方式：`python -m unittest examples/part4_examples.py -v`
+
+```python
 """
 Part 4 示例：高阶技巧 - 测试替身、异步、覆盖率
 运行方式：python -m unittest examples/part4_examples.py -v
@@ -308,3 +313,4 @@ class TestBestPracticesAAA(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+```

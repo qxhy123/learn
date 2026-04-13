@@ -1,3 +1,10 @@
+# Part 5 示例：深度专题 - 属性测试、六边形架构、遗留代码、Mock内部、设计模式
+
+运行方式：`python -m unittest examples/part5_examples.py -v`
+
+> 注意：属性测试部分需要 `pip install hypothesis`
+
+```python
 """
 Part 5 示例：深度专题 - 属性测试、六边形架构、遗留代码、Mock内部、设计模式
 运行方式：python -m unittest examples/part5_examples.py -v
@@ -544,3 +551,4 @@ class TestUserBuilder(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+```

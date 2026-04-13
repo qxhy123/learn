@@ -1,3 +1,8 @@
+# Part 2 示例：核心概念 - 断言、夹具、套件
+
+运行方式：`python -m unittest examples/part2_examples.py -v`
+
+```python
 """
 Part 2 示例：核心概念 - 断言、夹具、套件
 运行方式：python -m unittest examples/part2_examples.py -v
@@ -235,3 +240,4 @@ class TestDictAsStorage(BaseStorageTest, unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+```

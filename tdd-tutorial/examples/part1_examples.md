@@ -1,3 +1,8 @@
+# Part 1 示例：TDD 基础与 unittest 入门
+
+运行方式：`python -m unittest examples/part1_examples.py -v`
+
+```python
 """
 Part 1 示例：TDD 基础与 unittest 入门
 运行方式：python -m unittest examples/part1_examples.py -v
@@ -145,3 +150,4 @@ class TestUnittestBasics(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+```
