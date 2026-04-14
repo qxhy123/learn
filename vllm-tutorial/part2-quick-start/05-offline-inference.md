@@ -85,7 +85,6 @@ params = SamplingParams(
 
     # --- 多输出 ---
     n=1,                   # 每个 prompt 生成几个结果
-    best_of=1,             # 生成几个候选，返回最好的
 
     # --- 其他 ---
     seed=42,               # 随机种子，保证可复现
@@ -282,7 +281,6 @@ llm = LLM(
 
     # --- KV Cache ---
     block_size=16,                 # KV Cache 块大小（通常不需要修改）
-    swap_space=4,                  # CPU swap 空间 (GB)
 
     # --- 前缀缓存 ---
     enable_prefix_caching=False,   # 是否启用前缀缓存

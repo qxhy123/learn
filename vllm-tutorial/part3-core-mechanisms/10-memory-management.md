@@ -1,6 +1,6 @@
 # 第10章：内存管理与块引擎
 
-> 如果说 PagedAttention 是理论创新，那么 BlockSpaceManager 就是让这个理论真正运转起来的工程实现。它就像操作系统的内存管理子系统——看不见，但一旦出问题，整个系统就崩了。
+> 如果说 PagedAttention 解决了“显存应该怎样被切块”这个问题，那么当前仓库中的 `KVCacheManager` 解决的就是“这些块到底如何被分配、缓存、回收和复用”。
 
 ---
 
@@ -8,238 +8,323 @@
 
 学完本章，你将能够：
 
-1. 理解 BlockSpaceManager 的职责和工作方式
-2. 掌握物理块的分配、释放和引用计数机制
-3. 理解 GPU 块和 CPU 块（swap space）的管理
-4. 跟踪一个请求完整生命周期中的块变化
-5. 理解块管理对系统容量和性能的影响
+1. 理解当前仓库中 `KVCacheManager` 在 V1 架构里的职责
+2. 掌握 KV block pool、free queue、prefix cache 和 request blocks 的关系
+3. 跟踪一次请求从命中缓存到分配新块、再到释放块的完整路径
+4. 理解为什么当前 V1 不再把 CPU swap 当成主路径
+5. 结合源码估算 KV Cache 容量并定位显存瓶颈
 
 ---
 
-## 10.1 BlockSpaceManager 概览
+## 10.1 从 BlockSpaceManager 到 KVCacheManager
 
-### 职责
+如果你读过较早期的 vLLM 资料，可能见过 `BlockSpaceManager` 这个名字。
+但当前仓库的 V1 主实现里，真正负责 KV 块生命周期的核心类是：
 
-BlockSpaceManager 是 vLLM 内存管理的核心组件，负责：
+- `vllm/vllm/v1/core/kv_cache_manager.py` 中的 `KVCacheManager`
+- 它背后的 `coordinator`
+- 以及 `vllm/vllm/v1/core/kv_cache_utils.py` 中定义的 block pool / free queue / hash 数据结构
 
-1. 管理 GPU 上的物理块池（分配和回收）
-2. 管理 CPU 上的 swap 块池
-3. 为每个请求维护块表（逻辑块到物理块的映射）
-4. 处理块的共享和 Copy-on-Write
-5. 计算可用块数，辅助调度器决策
+可以把它理解成三层：
 
-### 初始化
+```text
+Scheduler
+  ↓
+KVCacheManager
+  ↓
+KV cache coordinator / block pool / prefix cache metadata
+```
+
+`KVCacheManager` 给调度器暴露的是比较干净的接口：
+
+- `get_computed_blocks(request)`
+- `can_fit_full_sequence(request, ...)`
+- `allocate_slots(request, ...)`
+- `free(request)`
+- `reset_prefix_cache()`
+
+这意味着调度器不用直接操心：
+
+- block pool 的空闲链表
+- block hash 的维护
+- prefix cache 的触碰与逐出
+- 多个 KV cache group 的细节
+
+---
+
+## 10.2 启动时，vLLM 怎么决定能放多少 KV Cache？
+
+当前仓库的初始化主路径在：
+
+- `vllm/vllm/v1/engine/core.py`
+
+关键函数是：
+
+- `EngineCore._initialize_kv_caches()`
+
+它大致做这几件事：
+
+1. 调 `model_executor.get_kv_cache_specs()` 询问模型需要哪些 KV cache 规格
+2. 调 `model_executor.determine_available_memory()` 估算除模型权重之外还能留多少显存给 KV cache
+3. 用 `get_kv_cache_configs(...)` 计算每组 cache 能分成多少个 block
+4. 把结果同步回 `vllm_config.cache_config`
+5. 调 `model_executor.initialize_from_config(...)` 真正初始化 worker 侧 KV cache
+
+随后，调度器初始化时再创建：
 
 ```python
-# BlockSpaceManager 在 vLLM 启动时初始化
-# 它根据 GPU 显存和模型大小计算可用的物理块数量
-
-total_gpu_memory = get_gpu_memory()        # 例如 80 GB
-model_weight_memory = get_model_memory()   # 例如 16 GB
-kv_cache_memory = total_gpu_memory * gpu_memory_utilization - model_weight_memory
-
-# 每个块的大小
-block_memory = 2 * num_layers * num_kv_heads * head_dim * block_size * dtype_size
-
-# 可用物理块数
-num_gpu_blocks = kv_cache_memory // block_memory
-num_cpu_blocks = swap_space // block_memory
+self.kv_cache_manager = KVCacheManager(
+    kv_cache_config=kv_cache_config,
+    max_model_len=self.max_model_len,
+    enable_caching=self.cache_config.enable_prefix_caching,
+    ...
+)
 ```
 
-### 块池结构
+### 直觉公式
 
+虽然源码实际还要考虑：
+
+- 多个 KV cache group
+- attention 类型差异
+- context parallel
+- hybrid attention / mamba cache
+
+但粗略估算仍可以先用这个公式：
+
+```text
+可用 KV 显存
+= GPU 总显存 * gpu_memory_utilization - 模型权重/激活/工作区
+
+总 block 数
+= 可用 KV 显存 / 每个 block 的字节数
 ```
-GPU 块池:
-┌──────┬──────┬──────┬──────┬──────┬──────┬───────┐
-│ 块 0 │ 块 1 │ 块 2 │ 块 3 │ 块 4 │ ...  │ 块 N  │
-│(used)│(free)│(used)│(free)│(used)│      │(free) │
-└──────┴──────┴──────┴──────┴──────┴──────┴───────┘
 
-CPU 块池 (swap):
-┌──────┬──────┬──────┬──────┬───────┐
-│ 块 0 │ 块 1 │ 块 2 │ ...  │ 块 M  │
-│(free)│(free)│(free)│      │(free) │
-└──────┴──────┴──────┴──────┴───────┘
-
-空闲块列表: [1, 3, ...]
-```
+一旦总 block 数确定，系统能容纳的并发上限，本质上就受它约束。
 
 ---
 
-## 10.2 块的生命周期
+## 10.3 当前源码里的核心数据结构
 
-### 分配
+### 1. `KVCacheBlock`
 
-当一个新请求被接纳时，BlockSpaceManager 分配初始块：
+在 `vllm/vllm/v1/core/kv_cache_utils.py` 里，`KVCacheBlock` 是最底层的元数据单元。
 
-```
-请求 A 开始 (prompt = 50 tokens, block_size = 16):
-  需要 ceil(50/16) = 4 个块
+它至少记录：
 
-分配前空闲块: [0, 1, 2, 3, 4, 5, 6, 7, ...]
+- `block_id`
+- `ref_cnt`
+- `block_hash`
+- `prev_free_block / next_free_block`
 
-分配: 块 0, 1, 2, 3 分配给请求 A
-块表 A: [逻辑0→物理0, 逻辑1→物理1, 逻辑2→物理2, 逻辑3→物理3]
+也就是说，一个 block 既是：
 
-分配后空闲块: [4, 5, 6, 7, ...]
+- “某一段 KV cache 的身份”
+- 又是 prefix cache 的可缓存对象
+- 同时还是 free queue 里的链表节点
 
-块 3 的填充情况: [tok₄₉, tok₅₀, _, _, _, _, _, _, _, _, _, _, _, _, _, _]
-                                 ↑ 还有 14 个 slot 可用
-```
+### 2. block pool
 
-### 追加（生成新 token）
+启动时会一次性创建整池 block，而不是按需 new Python 对象。
+这样做的原因很工程化：
 
-每生成一个新 token，将其 KV 向量写入当前最后一个块的下一个 slot：
+- 少 GC 压力
+- 元数据总量固定
+- 空闲/占用/缓存状态都好追踪
 
-```
-生成第 51 个 token:
-  块 3 还有空间 → 直接写入 slot 3
-  块 3: [tok₄₉, tok₅₀, tok₅₁, _, _, ..., _]
+### 3. free queue
 
-生成第 64 个 token:
-  块 3: [tok₄₉, tok₅₀, ..., tok₆₄]  ← 块 3 已满
+当前仓库没有简单地用 `deque` 来存空闲块，而是把双向链表指针直接挂在 `KVCacheBlock` 上。
+这样可以做到：
 
-生成第 65 个 token:
-  需要新块 → 从空闲池分配块 4
-  块表 A: [..., 逻辑4→物理4]
-  块 4: [tok₆₅, _, _, ..., _]
-```
+- O(1) 从中间移除某个 block
+- O(1) 追加到队尾
 
-### 释放
+这对 prefix cache 的 LRU 逐出尤其关键。
 
-请求完成后，释放所有块回空闲池：
+### 4. request blocks
 
-```
-请求 A 完成:
-  释放块 0, 1, 2, 3, 4
-  空闲块: [0, 1, 2, 3, 4, 5, 6, 7, ...]
-  块表 A: 删除
-```
+每个请求都会在管理器里对应一组 block 列表。
+调度器看到的是 `KVCacheBlocks` 这种更高层的包装，用它来拿 block id、拼接块组等。
 
-### 引用计数
+### 5. cache blocks
 
-当块被共享时（如并行采样），使用引用计数管理生命周期：
-
-```
-请求 A 使用 n=2 生成两个结果:
-
-Prefill 后:
-  序列 A₁ → 块表: [块0(ref=2), 块1(ref=2), 块2(ref=2)]
-  序列 A₂ → 块表: [块0(ref=2), 块1(ref=2), 块2(ref=2)]
-
-Decode 阶段（分叉）:
-  序列 A₁ 生成新 token → 新块 3 (ref=1)
-  序列 A₂ 生成新 token → 新块 4 (ref=1)
-
-  序列 A₁: [块0(ref=2), 块1(ref=2), 块2(ref=2), 块3(ref=1)]
-  序列 A₂: [块0(ref=2), 块1(ref=2), 块2(ref=2), 块4(ref=1)]
-
-序列 A₁ 完成:
-  释放块 3 (ref=1→0, 回收)
-  块 0,1,2 的 ref: 2→1 (不回收，A₂ 还在用)
-
-序列 A₂ 完成:
-  释放块 4 (ref=1→0, 回收)
-  块 0,1,2 的 ref: 1→0 (全部回收)
-```
+如果某个 block 已经“完整填满”，并且 prefix caching 打开，它就可能进入 cache map，供后续请求复用。
 
 ---
 
-## 10.3 Swap 操作
+## 10.4 一次请求的块生命周期
 
-### GPU → CPU（换出）
+### 阶段 1：先查能不能复用
 
-当调度器决定抢占一个请求时，BlockSpaceManager 执行 swap out：
+当新请求第一次进入调度器时，waiting 流程会先调用：
 
 ```python
-def swap_out(self, seq):
-    """将请求的 KV Cache 从 GPU 换出到 CPU"""
-    gpu_to_cpu_mapping = {}
-    for logical_block in seq.block_table:
-        gpu_block = logical_block.physical_block
-        cpu_block = self.cpu_allocator.allocate()
-        gpu_to_cpu_mapping[gpu_block] = cpu_block
-
-    # 异步复制 GPU → CPU
-    # 实际通过 CUDA memcpy async 实现
-    return gpu_to_cpu_mapping
+computed_blocks, num_cached_tokens = kv_cache_manager.get_computed_blocks(request)
 ```
 
-### CPU → GPU（换入）
+这一步的含义是：
 
-当被换出的请求重新被调度时，执行 swap in：
+1. 对请求已有 token 按 block 计算 hash
+2. 找最长的前缀命中
+3. 返回已经算好的完整 block
+
+当前仓库里有两个关键约束：
+
+- **只有完整 block 才会进入 prefix cache**
+- **即使整段 prompt 都命中，最后一个 token 仍常常要重算一次来拿 logits**
+
+这正是 `get_computed_blocks()` 里把最大 cache hit 长度限制为 `prompt_length - 1` 的原因。
+
+### 阶段 2：为真正需要推进的 token 申请 slot
+
+真正的重头戏在：
 
 ```python
-def swap_in(self, seq):
-    """将请求的 KV Cache 从 CPU 换回 GPU"""
-    cpu_to_gpu_mapping = {}
-    for cpu_block in seq.swapped_blocks:
-        gpu_block = self.gpu_allocator.allocate()
-        cpu_to_gpu_mapping[cpu_block] = gpu_block
-
-    # 异步复制 CPU → GPU
-    return cpu_to_gpu_mapping
+kv_cache_manager.allocate_slots(...)
 ```
 
-### Swap 的性能开销
+它会做几件事：
 
+1. 先移除 sliding window 等场景下已经不再需要的块
+2. 计算本轮到底需要分配多少新块
+3. 如果空闲块不够，直接返回 `None`
+4. 如果存在 prefix cache 命中的 block，先把这些已算好的 block 接到请求上
+5. 再从 free queue 里拿出真正的新块
+6. 如果有完整 block 达到可缓存状态，再调用 `cache_blocks()` 写回缓存
+
+它处理的不只是“新 token”本身，还会统一考虑：
+
+- 已经命中的本地缓存 token
+- 来自 connector 的远端已算 token
+- speculative decoding 的 lookahead token
+- encoder-decoder cross-attention 需要的额外 token
+
+所以这个接口虽然名字简单，实际上是 V1 内存管理的汇合点。
+
+### 阶段 3：请求完成后释放
+
+请求结束时，调度器会走到：
+
+```python
+kv_cache_manager.free(request)
 ```
-PCIe Gen4 x16 带宽: ~32 GB/s
-NVLink 带宽:         ~600 GB/s (GPU 间)
 
-假设换出一个请求的 KV Cache = 0.5 GB:
-  PCIe 传输时间 ≈ 0.5 / 32 ≈ 16ms
-  
-这 16ms 相当于多少个 decode iteration？
-  如果 TPOT ≈ 20ms，那就是 ~1 个 iteration 的时间
+释放时有两个关键点：
 
-结论：swap 的开销不可忽略，但对于长 prompt 请求来说，
-     比重新 prefill 还是快得多。
-```
+1. 不是所有 block 都会立刻消失，只有 `ref_cnt == 0` 的才真正回收
+2. 回收到 free queue 时，通常按“尾块优先逐出”的思路反向挂回
+
+这能让：
+
+- 更短命、更不可能被复用的尾块
+- 在未来更早被 LRU 逐出
 
 ---
 
-## 10.4 请求完整生命周期中的块变化
+## 10.5 前缀缓存在当前实现里怎么落地？
 
-### 全流程跟踪
+本章重点是内存管理，但前缀缓存已经和它绑死了，所以必须一起看。
 
+### 当前仓库的 block hash 由什么组成？
+
+依据 `docs/design/prefix_caching.md` 和 `kv_cache_utils.py`，一个 block hash 不只是“这一块的 token”：
+
+- 父 block 的 hash
+- 当前 block 的 token
+- 额外哈希信息
+
+额外信息可能包括：
+
+- LoRA ID
+- 多模态输入 hash
+- `cache_salt`
+
+所以它更像：
+
+```text
+block_hash = hash(parent_hash, block_tokens, extra_hashes)
 ```
-时刻 T0: 请求到达 (prompt=100 tokens)
-  状态: Waiting
-  块: 无
 
-时刻 T1: 被调度器接纳，开始 Prefill
-  状态: Waiting → Running
-  分配: ceil(100/16) = 7 个块
-  块表: [块5, 块12, 块3, 块8, 块21, 块9, 块15]
-  块 15 使用: 4/16 slots
+这能保证：
 
-时刻 T2-T50: Decode 阶段
-  每生成 1 个 token，填充当前块
-  块 15 满后，分配新块 22
-  块 22 满后，分配新块 7
-  ...
+- 同一个 block 内容，但前缀不同，不会误命中
+- 多租户环境下，不同 salt 的请求不会共享缓存
 
-时刻 T60: 显存不足，被抢占 (swap)
-  状态: Running → Swapped
-  GPU 块释放，KV Cache 复制到 CPU 块
-  CPU 块表: [cpu_0, cpu_1, ..., cpu_10]
+### 只缓存完整块
 
-时刻 T80: 显存充足，恢复
-  状态: Swapped → Running
-  CPU 块复制回 GPU 新块
-  GPU 块表: [块2, 块14, 块6, ...]
+这是理解 prefix caching 命中率的关键：
 
-时刻 T120: 生成完毕 (总计 200 tokens)
-  状态: Running → 完成
-  所有 GPU 块释放回空闲池
-```
+- 前缀虽然很长
+- 但如果最后一段只填满了半个 block
+- 那半块不会被缓存，也不会被后续请求直接复用
+
+所以命中往往是“按完整 block 的最长公共前缀”命中，而不是按 token 逐个命中。
+
+### V1 的一个实现细节：append-only block table
+
+当前 V1 的 block table 设计偏向 append-only。
+这带来一个实际后果：
+
+- 如果一个新请求又生成出一个内容完全重复的完整 block
+- 它短时间内可能和旧 block 同时存在
+- 重复块通常要到请求释放时才被彻底消掉
+
+这也是官方 prefix caching 设计文档专门解释的一点。
 
 ---
 
-## 10.5 容量规划
+## 10.6 抢占时，当前 V1 为什么不走 CPU swap？
 
-### 计算最大并发数
+这是本章最需要“用源码纠偏”的地方。
+
+旧资料常见叙述：
+
+- 块管理器同时维护 GPU 块池和 CPU swap 块池
+- OOM 时先 swap out，恢复时再 swap in
+
+但当前仓库的 V1 主路径不是这样。
+
+### 真实情况
+
+当 `allocate_slots()` 返回 `None` 时：
+
+- 调度器会触发抢占
+- 被抢占请求标记为 `PREEMPTED`
+- 其相关 KV block 被释放
+- 后续再次调度时，通过重新计算和 prefix cache 复用来恢复进度
+
+也就是说：
+
+- **V1 主线是 recompute-oriented**
+- **不是本地 CPU swap-oriented**
+
+官方 `docs/usage/v1_guide.md` 也明确把：
+
+- `GPU <> CPU KV Cache Swapping`
+
+标成了 removed feature。
+
+### 这不意味着仓库里没有 offload 代码
+
+当前仓库仍然有：
+
+- `distributed/kv_transfer/...`
+- `v1/simple_kv_offload/...`
+
+但这些更多是：
+
+- connector
+- 远端 KV 传输
+- disaggregated / offload 场景
+
+不能把它们简单等同于“旧教程里的 swapped 队列”。
+
+---
+
+## 10.7 如何估算容量？
+
+### 一个够用的工程估算式
 
 ```python
 def estimate_max_concurrent(
@@ -253,79 +338,69 @@ def estimate_max_concurrent(
     avg_seq_len: int,
     dtype_bytes: int = 2,
 ) -> int:
-    """估算最大并发请求数"""
-    # 可用于 KV Cache 的显存
-    available = gpu_memory_gb * gpu_memory_utilization - model_memory_gb
-
-    # 每个块的大小 (GB)
+    available_gb = gpu_memory_gb * gpu_memory_utilization - model_memory_gb
     block_gb = (
-        2 * num_layers * num_kv_heads * head_dim
-        * block_size * dtype_bytes
+        2 * num_layers * num_kv_heads * head_dim * block_size * dtype_bytes
     ) / (1024**3)
-
-    # 总块数
-    total_blocks = int(available / block_gb)
-
-    # 每个请求需要的块数
-    blocks_per_request = (avg_seq_len + block_size - 1) // block_size
-
-    # 最大并发数
-    return total_blocks // blocks_per_request
-
-# 示例：A100 80GB, Llama-3.1-8B
-max_concurrent = estimate_max_concurrent(
-    gpu_memory_gb=80,
-    model_memory_gb=16,
-    gpu_memory_utilization=0.9,
-    num_layers=32,
-    num_kv_heads=8,
-    head_dim=128,
-    block_size=16,
-    avg_seq_len=2048,
-)
-print(f"最大并发: {max_concurrent}")
+    total_blocks = int(available_gb / block_gb)
+    blocks_per_req = (avg_seq_len + block_size - 1) // block_size
+    return total_blocks // blocks_per_req
 ```
 
-### 显存分布
+这个估算忽略了：
 
-```
-典型的 vLLM 显存分布 (A100 80GB, 7B 模型):
+- hybrid attention
+- 多 group cache
+- encoder cache
+- lookahead/spec decode
 
-模型权重:     16 GB  (20%)
-KV Cache:    56 GB  (70%)
-激活值/开销:   8 GB  (10%)
-─────────────────────────
-总计:         80 GB  (100%)
+但对理解“为什么显存一满系统就开始频繁 preempt”已经很够用了。
 
-KV Cache 部分是显存的主要使用者！
-```
+### 线上最值得盯的几个指标
+
+当前仓库文档 `docs/design/metrics.md` 里明确列出了这些指标：
+
+- `vllm:kv_cache_usage_perc`
+- `vllm:prefix_cache_queries`
+- `vllm:prefix_cache_hits`
+
+如果你发现：
+
+- `kv_cache_usage_perc` 长期接近 1
+- 同时 TTFT 和 TPOT 都开始恶化
+
+那大概率不是“模型变慢了”，而是 KV Cache 容量已经在逼近极限。
+
+---
+
+## 10.8 源码阅读地图
+
+| 主题 | 关键文件 | 重点关注 |
+|------|----------|----------|
+| 启动时计算 KV 容量 | `vllm/vllm/v1/engine/core.py` | `_initialize_kv_caches()` |
+| 内存管理外观接口 | `vllm/vllm/v1/core/kv_cache_manager.py` | `get_computed_blocks` / `allocate_slots` / `free` |
+| block 元数据和 free queue | `vllm/vllm/v1/core/kv_cache_utils.py` | `KVCacheBlock`、`FreeKVCacheBlockQueue` |
+| 前缀缓存设计文档 | `vllm/docs/design/prefix_caching.md` | hash 组成、LRU、append-only block table |
+| 调度器如何使用内存管理 | `vllm/vllm/v1/core/sched/scheduler.py` | waiting/running 两段分配逻辑 |
+
+推荐顺序：
+
+1. 先看 `KVCacheBlock`
+2. 再看 `KVCacheManager.allocate_slots()`
+3. 接着看 `Scheduler.schedule()` 在 waiting 路径里怎么调用它
+4. 最后看 prefix caching 设计文档，把 hash 和 LRU 的设计补上
 
 ---
 
 ## 本章小结
 
-| 概念 | 要点 |
-|------|------|
-| BlockSpaceManager | 管理物理块池、块表、引用计数 |
-| 块生命周期 | 分配 → 填充 → 共享/CoW → 释放 |
-| 引用计数 | 支持块共享，ref=0 时回收 |
-| Swap | GPU ↔ CPU 块传输，开销 ~16ms/0.5GB |
-| 容量规划 | 可用显存 / 每请求 KV Cache = 最大并发 |
-
----
-
-## 动手实验
-
-### 实验 1：估算你的 GPU 容量
-
-用上面的公式计算你的 GPU 在不同模型和序列长度下的最大并发数。
-
-### 实验 2：观察 KV Cache 使用率
-
-```bash
-# 启动 vLLM 后查看 KV Cache 信息
-curl http://localhost:8000/metrics | grep gpu_cache
-```
+| 概念 | 当前仓库中的真实实现 |
+|------|----------------------|
+| 内存管理核心类 | `KVCacheManager`，不是旧资料里的 `BlockSpaceManager` |
+| 空闲块管理 | block pool + 双向链表 free queue |
+| 前缀缓存 | 只缓存完整 block，按 hash 复用 |
+| 抢占恢复 | `PREEMPTED + recompute` 为主 |
+| 关键瓶颈 | block 数不够时，会直接传导到调度器抢占和 TTFT/TPOT 波动 |
 
 ---
 
@@ -333,15 +408,16 @@ curl http://localhost:8000/metrics | grep gpu_cache
 
 ### 基础题
 
-1. BlockSpaceManager 管理哪两种块池？
-2. 块的引用计数在什么情况下会大于 1？
-3. Swap out 操作的性能开销主要来自哪里？
+1. 当前仓库里负责 KV 块生命周期管理的核心类叫什么？
+2. 为什么 free queue 要用双向链表而不是简单 `deque`？
+3. 为什么 prefix cache 只缓存完整 block？
 
 ### 实践题
 
-4. 计算 A100 80GB 上运行 Llama-3.1-70B（4 卡张量并行）时，每张卡的最大并发数。
+4. 在 `kv_cache_manager.py` 中找到 `allocate_slots()`，标出“检查空闲块是否足够”和“写回 cache_blocks”分别发生在什么位置。
+5. 在 `kv_cache_utils.py` 中找到 `KVCacheBlock` 和 `FreeKVCacheBlockQueue`，梳理 block 被回收到空闲队列后的 LRU 语义。
 
 ### 思考题
 
-5. 如果 swap 空间（CPU 内存）也不够了，系统应该怎么处理？
-6. 块大小为什么不能设得太小（如 1）？管理开销包括哪些？
+6. 为什么 V1 选择让调度器围绕 recompute 而不是本地 CPU swap 建模？
+7. 如果 `kv_cache_usage_perc` 很高但 `prefix_cache_hits` 很低，你更应该先调 prompt 结构、调度参数，还是直接加显存？

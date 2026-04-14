@@ -21,7 +21,6 @@ vllm serve <model> \
     --max-model-len 4096 \               # 最大序列长度
     --max-num-seqs 256 \                 # 最大并发序列数
     --max-num-batched-tokens 8192 \      # 每 iteration 最大 token 数
-    --swap-space 4 \                     # CPU swap 空间 (GB)
     --block-size 16                      # KV Cache 块大小
 ```
 
@@ -45,8 +44,7 @@ vllm serve <model> \
 ```bash
     --enable-prefix-caching \            # 启用前缀缓存
     --enable-chunked-prefill \           # 启用分块 prefill
-    --speculative-model draft-model \    # 投机解码草稿模型
-    --num-speculative-tokens 5 \         # 投机 token 数
+    --speculative-config '{"method":"ngram","num_speculative_tokens":4}' \  # 投机解码配置
     --enable-lora \                      # 启用 LoRA
     --max-loras 4 \                      # 最大 LoRA 数
     --trust-remote-code                  # 信任远程代码
@@ -77,11 +75,10 @@ params = SamplingParams(
     
     # 多输出
     n=1,                         # 每请求生成数
-    best_of=None,                # 候选数（返回最好的 n 个）
     
     # 其他
     seed=None,                   # 随机种子
-    use_beam_search=False,       # 使用 beam search
+    structured_outputs=None,     # JSON/regex/choice/grammar 约束
     skip_special_tokens=True,    # 跳过特殊 token
     ignore_eos=False,            # 忽略 EOS
 )

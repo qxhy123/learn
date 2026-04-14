@@ -172,11 +172,12 @@ Beam Search:
 ### 在 vLLM 中使用 Beam Search
 
 ```python
-params = SamplingParams(
-    use_beam_search=True,
-    best_of=4,        # beam width
-    temperature=0,    # beam search 通常配合 T=0
+from vllm.sampling_params import BeamSearchParams
+
+params = BeamSearchParams(
+    beam_width=4,
     max_tokens=200,
+    temperature=0,    # beam search 通常配合 T=0
 )
 ```
 

@@ -66,9 +66,9 @@
 
 ## 第9章：调度器
 
-1. Waiting（等待 prefill）、Running（正在生成）、Swapped（KV Cache 换出到 CPU）。
+1. 当前仓库 V1 的主状态是 Waiting、Running、Preempted；如果请求依赖 grammar、远端 KV 或流式输入，还会先进入对应的阻塞等待态。
 
-2. Recompute：丢弃 KV Cache 重算，简单但浪费计算。Swap：换出到 CPU，保留 KV Cache 但有传输开销。
+2. 当前仓库主路径是 Recompute / Preempted：释放块后重新调度并重算；旧资料里的本地 CPU swap 不再是 V1 主线语义。
 
 ---
 

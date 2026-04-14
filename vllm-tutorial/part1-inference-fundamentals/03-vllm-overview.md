@@ -96,15 +96,16 @@ vLLM 是一个**高吞吐、低延迟的 LLM 推理和服务引擎**，由加州
 
 详细原理将在第 8 章展开。
 
-### 核心技术 3：高效调度
+### 核心技术 3：统一调度
 
-**问题**：高并发场景下，如何决定哪些请求先执行、如何处理显存不足、如何保证公平性？
+**问题**：高并发场景下，如何让长 prompt、短 prompt、decode 请求、prefix cache 命中请求和 speculative decoding 请求共享同一套资源，而不是互相把系统拖死？
 
-**解决方案**：vLLM 的调度器实现了：
+**当前仓库里的解决方案**：vLLM V1 使用统一 token 预算调度，而不是把 prefill/decode 拆成两套几乎独立的流程。
 
-- **优先级调度**：区分 prefill 和 decode 请求
-- **抢占机制**：显存不足时，可以暂停低优先级请求，释放其 KV Cache
-- **恢复策略**：被抢占的请求可以通过重计算或 swap 到 CPU 内存来恢复
+- **统一进度抽象**：用 `num_computed_tokens` 和 `num_tokens_with_spec` 表示“已经算到哪里”和“应该算到哪里”
+- **统一预算模型**：所有请求竞争同一套 `max_num_batched_tokens` / `max_num_seqs`
+- **运行中请求优先**：先尽量推进已经持有 KV Cache 的请求，减少浪费
+- **抢占以 recompute 为主**：当前 V1 主路径是 `PREEMPTED + 重新调度/重算`，而不是旧资料常写的 CPU swap 队列
 
 详细原理将在第 9 章展开。
 
@@ -112,60 +113,66 @@ vLLM 是一个**高吞吐、低延迟的 LLM 推理和服务引擎**，由加州
 
 ## 3.3 vLLM 架构总览
 
-vLLM 的架构可以分为几个主要层次：
+结合当前仓库，vLLM 更适合被理解成下面这几层：
 
-```
-┌─────────────────────────────────────────────────┐
-│                  API 层                          │
-│  OpenAI Compatible Server / Offline LLM API      │
-├─────────────────────────────────────────────────┤
-│                 引擎层                           │
-│  LLMEngine / AsyncLLMEngine                      │
-│  ┌─────────────┬──────────────┬────────────────┐│
-│  │  Scheduler  │ BlockManager │ TokenizerGroup ││
-│  │  (调度器)    │ (块管理器)   │ (分词器)        ││
-│  └─────────────┴──────────────┴────────────────┘│
-├─────────────────────────────────────────────────┤
-│                执行层                            │
-│  Worker / ModelRunner                            │
-│  ┌─────────────┬──────────────┬────────────────┐│
-│  │   Model     │ Attention    │ KV Cache       ││
-│  │  (模型实例)  │ Backend     │ (KV缓存存储)    ││
-│  └─────────────┴──────────────┴────────────────┘│
-├─────────────────────────────────────────────────┤
-│              硬件抽象层                          │
-│  CUDA / ROCm / PagedAttention Kernels            │
-└─────────────────────────────────────────────────┘
+```text
+┌────────────────────────────────────────────────────┐
+│                    入口层                          │
+│  entrypoints/llm.py  /  openai/api_server.py      │
+├────────────────────────────────────────────────────┤
+│                  外层引擎层                         │
+│  v1/engine/llm_engine.py                          │
+│  InputProcessor / EngineCoreClient / OutputProcessor │
+├────────────────────────────────────────────────────┤
+│                  核心内循环层                       │
+│  v1/engine/core.py                                │
+│  Scheduler / KVCacheManager / StructuredOutputManager │
+├────────────────────────────────────────────────────┤
+│                  执行与设备层                        │
+│  v1/executor/  →  v1/worker/                      │
+│  GPUWorker / GPUModelRunner                        │
+├────────────────────────────────────────────────────┤
+│                模型与注意力后端层                    │
+│  model_executor/models/                            │
+│  v1/attention/backends/ / ops/paged_attn.py        │
+└────────────────────────────────────────────────────┘
 ```
 
 ### 各层职责
 
-**API 层**：接收用户请求，支持 OpenAI 兼容接口和 Python 离线 API。
+**入口层**：接收 Python 调用或 HTTP 请求，把协议层输入转换成引擎可消费的请求。
 
-**引擎层**：vLLM 的大脑。
-- Scheduler：决定每次 iteration 运行哪些请求
-- BlockManager：管理 KV Cache 物理块的分配和释放
-- TokenizerGroup：处理分词
+**外层引擎层**：负责把输入整理成 `EngineCoreRequest`，并把底层输出重新拼成用户能直接消费的 `RequestOutput`。
 
-**执行层**：实际执行模型推理。
-- Worker：管理单个 GPU 上的执行
-- ModelRunner：准备输入、运行模型、处理输出
-- Attention Backend：实现 PagedAttention 的高效 CUDA kernel
+**核心内循环层**：真正做调度、KV 块管理、结构化输出编排和执行批次组织。
 
-**硬件抽象层**：底层的 CUDA kernel 和硬件交互。
+**执行与设备层**：把 scheduler 给出的 batch 送到具体设备上，由 worker/model runner 完成前向执行。
+
+**模型与注意力后端层**：实现具体模型结构、PagedAttention、FlashAttention/FlashInfer/Triton 等后端。
+
+### 当前仓库里的源码对照
+
+| 主题 | 关键文件 |
+|------|----------|
+| 离线入口 | `vllm/vllm/entrypoints/llm.py` |
+| 在线入口 | `vllm/vllm/entrypoints/openai/api_server.py` |
+| 外层引擎 | `vllm/vllm/v1/engine/llm_engine.py` |
+| 核心内循环 | `vllm/vllm/v1/engine/core.py` |
+| 调度器 | `vllm/vllm/v1/core/sched/scheduler.py` |
+| KV 管理 | `vllm/vllm/v1/core/kv_cache_manager.py` |
+| 设备执行 | `vllm/vllm/v1/worker/gpu_worker.py` / `vllm/vllm/v1/worker/gpu/model_runner.py` |
+| 注意力后端 | `vllm/vllm/v1/attention/backends/` |
 
 ### 一次请求的生命周期
 
-```
-1. 用户发送请求 → API Server 接收
-2. 请求进入 Scheduler 的等待队列
-3. Scheduler 将请求加入执行批次
-4. BlockManager 为请求分配 KV Cache 块
-5. Worker/ModelRunner 执行模型前向计算
-6. 生成 1 个 token → 返回给用户（流式）
-7. 重复 3-6 直到生成完成
-8. BlockManager 释放 KV Cache 块
-9. 请求从 Scheduler 移除
+```text
+1. 用户请求进入入口层
+2. InputProcessor 生成 EngineCoreRequest
+3. EngineCore 把请求交给 Scheduler
+4. Scheduler 通过 KVCacheManager 查询前缀命中并分配 block
+5. Executor / Worker / GPUModelRunner 执行模型前向
+6. OutputProcessor 汇总和流式返回输出
+7. 请求完成后，KV block 被释放或保留在 prefix cache 中复用
 ```
 
 ---

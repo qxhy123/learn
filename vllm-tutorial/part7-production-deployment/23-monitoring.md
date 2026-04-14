@@ -31,9 +31,9 @@ curl http://localhost:8000/metrics
 |------|------|------|
 | `vllm:num_requests_running` | Gauge | 当前运行中的请求数 |
 | `vllm:num_requests_waiting` | Gauge | 当前等待中的请求数 |
-| `vllm:num_requests_swapped` | Gauge | 当前被换出的请求数 |
-| `vllm:gpu_cache_usage_perc` | Gauge | GPU KV Cache 使用率 |
-| `vllm:cpu_cache_usage_perc` | Gauge | CPU swap 使用率 |
+| `vllm:kv_cache_usage_perc` | Gauge | KV Cache block 使用率 |
+| `vllm:prefix_cache_queries` | Counter | 前缀缓存查询次数 |
+| `vllm:prefix_cache_hits` | Counter | 前缀缓存命中次数 |
 | `vllm:num_preemptions_total` | Counter | 累计抢占次数 |
 | `vllm:request_success_total` | Counter | 成功完成的请求数 |
 | `vllm:avg_prompt_throughput_toks_per_s` | Gauge | 输入 token 吞吐 |

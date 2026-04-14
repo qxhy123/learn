@@ -46,8 +46,8 @@
 |------|------|----------|----------|
 | 第7章 | [PagedAttention](./part3-core-mechanisms/07-paged-attention.md) | 虚拟内存类比、物理块与逻辑块、显存碎片消除 | 可视化块分配与显存利用率 |
 | 第8章 | [连续批处理](./part3-core-mechanisms/08-continuous-batching.md) | 静态vs动态批处理、iteration-level调度、吞吐提升 | 对比静态批处理与连续批处理的吞吐 |
-| 第9章 | [调度器与请求管理](./part3-core-mechanisms/09-scheduler.md) | 调度策略、抢占机制、等待队列、公平性 | 观察高并发下的调度行为 |
-| 第10章 | [内存管理与块引擎](./part3-core-mechanisms/10-memory-management.md) | BlockSpaceManager、块分配/释放、Copy-on-Write | 跟踪请求生命周期中的块变化 |
+| 第9章 | [调度器与请求管理](./part3-core-mechanisms/09-scheduler.md) | 统一 token 预算调度、`PREEMPTED`、chunked prefill、公平性 | 观察高并发下的调度行为 |
+| 第10章 | [内存管理与块引擎](./part3-core-mechanisms/10-memory-management.md) | `KVCacheManager`、block pool、prefix cache、块分配/释放 | 跟踪请求生命周期中的块变化 |
 
 ### 第四部分：模型与量化
 
@@ -62,9 +62,9 @@
 
 | 章节 | 标题 | 主要内容 | 实验重点 |
 |------|------|----------|----------|
-| 第15章 | [投机解码](./part5-advanced-inference/15-speculative-decoding.md) | 草稿模型、验证机制、加速原理、配置方法 | 测量投机解码对延迟的改善 |
-| 第16章 | [前缀缓存与 Prompt 复用](./part5-advanced-inference/16-prefix-caching.md) | 自动前缀缓存、hash 匹配、适用场景 | 对比有无前缀缓存时的 TTFT |
-| 第17章 | [结构化输出](./part5-advanced-inference/17-structured-output.md) | JSON Schema 约束、正则引导、guided decoding 原理 | 生成严格符合 Schema 的 JSON |
+| 第15章 | [投机解码](./part5-advanced-inference/15-speculative-decoding.md) | `speculative_config`、多 proposer、接受率与加速权衡 | 测量投机解码对延迟的改善 |
+| 第16章 | [前缀缓存与 Prompt 复用](./part5-advanced-inference/16-prefix-caching.md) | 自动前缀缓存、block hash、`cache_salt`、命中条件 | 对比有无前缀缓存时的 TTFT |
+| 第17章 | [结构化输出](./part5-advanced-inference/17-structured-output.md) | `structured_outputs`、`response_format`、grammar backend | 生成严格符合 Schema 的 JSON |
 | 第18章 | [采样参数与解码策略](./part5-advanced-inference/18-sampling-and-decoding.md) | temperature、top-p/top-k、beam search、最佳实践 | 不同策略对生成质量与多样性的影响 |
 
 ### 第六部分：分布式推理
@@ -88,7 +88,7 @@
 
 | 章节 | 标题 | 主要内容 | 实验重点 |
 |------|------|----------|----------|
-| 第26章 | [vLLM 源码架构](./part8-architecture-and-extensions/26-source-architecture.md) | 模块划分、请求生命周期、执行引擎、Worker | 阅读关键路径源码并绘制调用链 |
+| 第26章 | [vLLM 源码架构](./part8-architecture-and-extensions/26-source-architecture.md) | V1 进程架构、请求生命周期、EngineCore、Scheduler、Worker | 阅读关键路径源码并绘制调用链 |
 | 第27章 | [自定义模型接入](./part8-architecture-and-extensions/27-custom-model-integration.md) | 模型注册、自定义层、注意力后端适配 | 将一个自定义模型接入 vLLM |
 | 第28章 | [前沿进展与生态](./part8-architecture-and-extensions/28-frontier-and-ecosystem.md) | Disaggregated Prefill、chunked prefill、FlashInfer、SGLang 对比 | 跟踪社区 Roadmap 与关键 PR |
 
@@ -203,7 +203,8 @@ docker run --runtime nvidia --gpus all \
 
 重要说明：
 
-- vLLM **仅支持 NVIDIA GPU**（CUDA），部分实验性支持 AMD ROCm
+- 本教程的实验仍以 **NVIDIA CUDA** 路线为主
+- 结合当前仓库与 `v1_guide`，vLLM V1 已覆盖更广硬件后端（如 AMD、Intel GPU、TPU、CPU 等），但不同平台的成熟度、安装方式和示例路径并不完全相同
 - 建议至少 **16GB 显存**（运行 7B 模型），**24GB+ 显存**可获得更好体验
 - 如果没有本地 GPU，可使用云 GPU（如 AWS、GCP、Lambda Labs）
 - 部分章节涉及多 GPU，需要至少 2 块 GPU

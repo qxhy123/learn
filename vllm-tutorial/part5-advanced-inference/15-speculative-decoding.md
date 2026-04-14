@@ -1,6 +1,6 @@
 # 第15章：投机解码
 
-> 投机解码的核心思想出奇地简单：用一个小模型猜，用大模型验证。猜对了就赚到了，猜错了也不亏——因为验证可以并行完成。
+> 投机解码的直觉没有变，仍然是“先猜，再验证”；但当前仓库里的实现已经比最早期的 draft-model 方案更丰富，包含 `ngram`、`draft_model`、`eagle/eagle3`、`mtp` 等多种路径，并且这些能力已经被调度器统一吸收到同一套 token 预算模型里。
 
 ---
 
@@ -8,226 +8,309 @@
 
 学完本章，你将能够：
 
-1. 理解投机解码的核心思想和数学保证
-2. 掌握 draft model 和 target model 的协作机制
-3. 在 vLLM 中配置和使用投机解码
-4. 分析投机解码在不同场景下的加速效果
-5. 选择合适的草稿模型和投机长度
+1. 理解投机解码为什么能减少大模型 decode 次数
+2. 区分当前仓库中不同 speculative 方法的实现路径
+3. 用当前仓库真实支持的 `speculative_config` 接口启用投机解码
+4. 理解 speculative token 如何进入 V1 调度器
+5. 结合源码和指标观察 acceptance length / acceptance rate
 
 ---
 
-## 15.1 为什么需要投机解码？
+## 15.1 为什么 decode 阶段适合做投机？
 
-### Decode 阶段的瓶颈回顾
+decode 的核心问题是：
 
-Decode 阶段每步只生成 1 个 token，但需要读取全部模型权重。GPU 的计算单元大量空闲。
+- 每一步通常只生成 1 个 token
+- 却要重新走一遍大模型的大量权重读写与算子调度
 
-```
-标准 decode: 每步 1 个 token
-  Step 1: 读权重(14GB) → 算 1 个 token → 写回
-  Step 2: 读权重(14GB) → 算 1 个 token → 写回
-  Step 3: 读权重(14GB) → 算 1 个 token → 写回
-  ...
-  
-  10 个 token 需要 10 次完整的权重读取
-```
+所以直觉上你会问：
 
-**核心问题**：能不能每次读取权重时，多产出几个 token？
+> 能不能一次让大模型“确认”多个 token，而不是每次只确认 1 个？
 
-### 投机解码的直觉
+投机解码给出的答案是：
 
-```
-投机解码: 每步可能产出多个 token
+1. 先用更便宜的方法生成候选 token
+2. 再让主模型一次性验证一串候选
+3. 接受连续正确的前缀
+4. 在第一个不一致的位置退回主模型真实结果
 
-  1. 小模型快速"猜"出 k 个 token
-  2. 大模型一次性验证这 k 个 token（只需 1 次前向计算）
-  3. 接受连续正确的部分，拒绝第一个错误的
+只要候选质量足够好，就能把：
 
-  如果 5 个全猜对: 1 次大模型前向 → 5 个 token ✓
-  如果前 3 个对:   1 次大模型前向 → 3 个 token ✓ + 1 个修正 token
-```
+- “一次主模型前向 = 一个 token”
+
+变成：
+
+- “一次主模型前向 = 多个被接受 token”
 
 ---
 
-## 15.2 工作原理
+## 15.2 当前仓库里有哪些 speculative 方法？
 
-### Draft-Then-Verify
+直接看源码目录：
 
-投机解码由两个模型协作：
+- `vllm/vllm/v1/spec_decode/`
 
-- **Draft Model（草稿模型）**：小而快的模型，用于生成候选 token
-- **Target Model（目标模型）**：大而准的模型，用于验证候选 token
+你会看到这些实现文件：
 
-### 一次投机迭代的流程
+- `ngram_proposer.py`
+- `draft_model.py`
+- `eagle.py`
+- `medusa.py`
+- `dflash.py`
+- `suffix_decoding.py`
 
-```
-1. Draft Phase（草稿阶段）:
-   小模型连续生成 k 个 token: [d₁, d₂, d₃, d₄, d₅]
-   
-   耗时: 很短（小模型速度快）
+从当前仓库公开示例 `examples/offline_inference/spec_decode.py` 看，教程里最值得掌握的是：
 
-2. Verify Phase（验证阶段）:
-   大模型一次性处理 [original_tokens, d₁, d₂, d₃, d₄, d₅]
-   同时计算每个位置的概率分布
-   
-   耗时: ≈ 1 次标准 decode（因为可以并行计算）
+| 方法 | 说明 | 典型场景 |
+|------|------|----------|
+| `ngram` | 不需要额外草稿模型，直接从 prompt / 历史模式做猜测 | 翻译、改写、重复模式强 |
+| `draft_model` | 传统“小模型草稿 + 大模型验证” | target 很大、draft 很小 |
+| `eagle` / `eagle3` | 使用专门训练的 speculative 模型路径 | 延迟优化重点场景 |
+| `mtp` | multi-token prediction 路线 | 模型本身支持对应能力时 |
 
-3. Accept/Reject（接受/拒绝）:
-   逐个检查: 大模型是否同意小模型的选择？
-   
-   位置 1: P_target(d₁) 足够高 → 接受 ✓
-   位置 2: P_target(d₂) 足够高 → 接受 ✓
-   位置 3: P_target(d₃) 足够高 → 接受 ✓
-   位置 4: P_target(d₄) 太低   → 拒绝 ✗ → 用大模型重新采样
-   位置 5: 不再检查（前面已拒绝）
-   
-   结果: 接受 3 个 token + 1 个修正 = 4 个 token
-```
-
-### 数学保证
-
-投机解码有一个重要的理论保证：**无论草稿模型质量如何，最终输出的分布与只用目标模型完全一致。**
-
-接受概率的计算：
-
-```
-对于草稿模型生成的 token x:
-  如果 p_target(x) >= p_draft(x):  直接接受
-  否则: 以概率 p_target(x) / p_draft(x) 接受
-```
-
-这意味着投机解码**不影响输出质量**，只影响生成速度。
+仓库里还能看到 `medusa`、`dflash` 等实现，但教程这里先聚焦主流、可直接上手的几种。
 
 ---
 
-## 15.3 在 vLLM 中使用投机解码
+## 15.3 当前 V1 里，投机 token 是怎么进入调度器的？
 
-### 使用独立的 Draft 模型
+这是最值得结合源码理解的一点。
+
+V1 并没有给 speculative decoding 单独搞一套调度器，而是把它并入了统一抽象：
+
+- `request.spec_token_ids`
+- `request.num_tokens_with_spec`
+- `scheduled_spec_decode_tokens`
+
+在 `vllm/vllm/v1/core/sched/scheduler.py` 顶部的注释里，源码已经明确说明：
+
+- 调度器只关心“请求应该算到哪里”和“已经算到哪里”
+- speculative token 只是把 `num_tokens_with_spec` 往前推得更远
+
+因此，同一个 `schedule()` 可以同时处理：
+
+- 普通 prefill
+- 普通 decode
+- chunked prefill
+- prefix caching
+- speculative decoding
+
+这正是 V1 架构比旧实现更整洁的地方。
+
+---
+
+## 15.4 一次 speculative 迭代在源码层面的直觉
+
+你可以把它粗略理解成下面这个过程：
+
+```text
+当前上下文
+  ↓
+proposer 先给出 spec token 序列
+  ↓
+request.spec_token_ids 被写入请求状态
+  ↓
+Scheduler 按 num_tokens_with_spec 给该请求分配预算
+  ↓
+Worker / attention backend 一次处理更多位置
+  ↓
+根据验证结果接受前缀、拒绝第一个不一致位置
+  ↓
+更新真实 output token 和下一轮状态
+```
+
+也就是说，投机解码的关键不只是“猜”，还包括：
+
+- 如何让调度器为这些 speculative positions 留预算
+- 如何让 worker 知道哪些 token 是 draft，哪些是 bonus/verified
+- 如何把 acceptance 统计出来
+
+这些逻辑在当前仓库里散布于：
+
+- `v1/spec_decode/`
+- `v1/core/sched/scheduler.py`
+- `v1/attention/backend.py`
+- `v1/worker/gpu/model_runner.py`
+
+---
+
+## 15.5 用当前仓库真实接口启用投机解码
+
+### 离线推理：推荐使用 `speculative_config`
+
+当前仓库官方示例写法是：
 
 ```python
 from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="meta-llama/Llama-3.1-70B-Instruct",
-    speculative_model="meta-llama/Llama-3.1-8B-Instruct",
-    num_speculative_tokens=5,    # 每次投机的 token 数
+    speculative_config={
+        "method": "draft_model",
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "num_speculative_tokens": 5,
+    },
 )
 
 params = SamplingParams(temperature=0, max_tokens=200)
 outputs = llm.generate(["Explain quantum computing."], params)
 ```
 
-### 使用 ngram 投机（无需额外模型）
+### `ngram` 示例
 
 ```python
-# ngram 投机：基于输入中的 n-gram 模式预测
 llm = LLM(
     model="meta-llama/Llama-3.1-8B-Instruct",
-    speculative_model="[ngram]",
-    num_speculative_tokens=5,
-    ngram_prompt_lookup_max=4,
+    speculative_config={
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_min": 2,
+        "prompt_lookup_max": 5,
+    },
 )
 ```
 
-ngram 投机适合 prompt 中包含大量可复用模式的场景（如翻译、改写）。
+### `eagle3` 示例
 
-### API 服务器配置
+```python
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    speculative_config={
+        "method": "eagle3",
+        "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        "num_speculative_tokens": 3,
+    },
+)
+```
+
+### 为什么教程不再把 `speculative_model=...` 作为主写法？
+
+因为当前仓库更稳定、也更通用的接口已经是：
+
+- `speculative_config={...}`
+
+它能表达：
+
+- 具体方法
+- 草稿模型
+- speculative token 数
+- ngram 查找参数
+- eagle 并行 drafting 等额外开关
+
+---
+
+## 15.6 服务模式的真实配置方式
+
+当前仓库服务端已经把 speculative 参数收敛成一个 JSON 配置：
 
 ```bash
 vllm serve meta-llama/Llama-3.1-70B-Instruct \
-    --speculative-model meta-llama/Llama-3.1-8B-Instruct \
-    --num-speculative-tokens 5 \
-    --tensor-parallel-size 4
+  --speculative-config '{
+    "method": "draft_model",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "num_speculative_tokens": 5
+  }'
 ```
+
+对于 `ngram`：
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-config '{
+    "method": "ngram",
+    "num_speculative_tokens": 4,
+    "prompt_lookup_min": 2,
+    "prompt_lookup_max": 5
+  }'
+```
+
+这比旧教程里分散的 `--speculative-model`、`--num-speculative-tokens` 更贴近当前源码和参数系统。
 
 ---
 
-## 15.4 加速效果分析
+## 15.7 接受率、接受长度和加速效果怎么理解？
 
-### 加速倍数
+### 关键不是“猜了多少”，而是“接受了多少”
 
-加速倍数取决于**接受率（acceptance rate）**：
+真正决定收益的指标不是：
 
-```
-加速倍数 ≈ 平均每次接受的 token 数 / (draft 时间 + verify 时间 / 标准 decode 时间)
-```
+- 每次 draft 了几个 token
 
-典型的加速效果：
+而是：
 
-| 场景 | 接受率 | 加速倍数 |
-|------|--------|---------|
-| 同系列小-大模型（Llama 8B→70B） | 70-85% | 1.5-2× |
-| 翻译/改写（输入与输出相似） | 80-90% | 2-3× |
-| 创意生成（输出不可预测） | 40-60% | 1.0-1.3× |
-| ngram（重复模式多） | 取决于内容 | 1.0-2× |
+- 平均每次主模型验证后，能接受几个 token
 
-### 什么时候投机解码最有效？
+当前仓库的官方示例就会统计：
 
-```
-✓ 大模型远大于小模型（如 70B vs 8B）
-✓ 任务输出相对可预测（翻译、摘要、格式化）
-✓ 延迟敏感的场景（实时交互）
-✓ 大模型是 memory-bound 的（batch size 较小）
+- `vllm:spec_decode_num_drafts`
+- `vllm:spec_decode_num_draft_tokens`
+- `vllm:spec_decode_num_accepted_tokens`
+- `vllm:spec_decode_num_accepted_tokens_per_pos`
 
-✗ 大模型不够大（7B vs 3B，加速有限）
-✗ 创意性生成（接受率低）
-✗ 已经是高 batch 场景（GPU 已经利用率高）
-✗ 显存紧张（需要额外空间放小模型）
-```
+### 经验判断
 
-### num_speculative_tokens 的选择
+| 场景 | 典型现象 |
+|------|----------|
+| 草稿和目标模型高度同族 | acceptance 通常更高 |
+| 翻译、格式转换、固定模板输出 | `ngram`/spec decode 更容易赚钱 |
+| 创意写作、强随机采样 | acceptance 往往下降 |
+| 已经高 batch 跑满 GPU | speculative 收益会被摊薄 |
 
-```
-太少 (1-2): 开销不够分摊，加速有限
-太多 (10+): 后面的 token 接受率低，浪费小模型计算
-推荐: 3-7，视接受率调整
+### `num_speculative_tokens` 不是越大越好
 
-经验法则: 如果接受率 > 80%，可以增加投机长度
-          如果接受率 < 50%，应该减少投机长度
-```
+它太小：
+
+- 主模型一次验证不了多少 token
+
+它太大：
+
+- 后段 token 很容易被拒绝
+- draft 成本反而浪费
+
+工程上通常从 `2~5` 开始试最合理。
 
 ---
 
-## 15.5 Draft 模型选择
+## 15.8 当前仓库里和投机解码耦合最紧的模块
 
-### 选择原则
+| 主题 | 关键文件 | 说明 |
+|------|----------|------|
+| 参数入口 | `vllm/vllm/engine/arg_utils.py` | `--speculative-config` 解析 |
+| 示例用法 | `vllm/examples/offline_inference/spec_decode.py` | 当前仓库最直观的配置参考 |
+| 核心实现 | `vllm/vllm/v1/spec_decode/` | 各 speculative 方法 |
+| 调度协同 | `vllm/vllm/v1/core/sched/scheduler.py` | spec token 如何进入调度预算 |
+| 注意力元数据 | `vllm/vllm/v1/attention/backend.py` | speculative positions 对 attention 的影响 |
+| 运行时指标 | `vllm/vllm/v1/spec_decode/metrics.py` | acceptance 相关指标 |
 
-1. **同系列更好**：Llama-8B 作为 Llama-70B 的 draft，比随机小模型效果好
-2. **足够小**：draft 模型应该比 target 快很多（至少 5-10×）
-3. **词表一致**：draft 和 target 必须使用相同的 tokenizer/词表
-4. **领域匹配**：fine-tuned target 最好配同领域的 draft
+---
 
-### 常见 Draft-Target 配对
+## 15.9 源码阅读建议
 
-| Target Model | Draft Model | 建议 |
-|-------------|-------------|------|
-| Llama-3.1-70B | Llama-3.1-8B | 推荐 |
-| Qwen2.5-72B | Qwen2.5-1.5B | 推荐 |
-| Mistral Large | Mistral 7B | 可用 |
+如果你打算顺着 speculative decoding 读一遍源码，建议顺序是：
+
+1. `examples/offline_inference/spec_decode.py`
+2. `engine/arg_utils.py` 中 `speculative_config` 的解析
+3. `v1/spec_decode/` 中你关心的方法实现
+4. `scheduler.py` 中 `request.spec_token_ids` 的处理
+5. 指标与 acceptance 统计
+
+这么读的好处是：
+
+- 先把“怎么配”搞清楚
+- 再把“怎么跑”串起来
+- 最后再下沉到某个具体 proposer
 
 ---
 
 ## 本章小结
 
-| 概念 | 要点 |
-|------|------|
-| 核心思想 | 小模型快速猜测，大模型并行验证 |
-| 数学保证 | 输出分布与只用大模型完全一致 |
-| 典型加速 | 1.5-2× 延迟改善 |
-| 适用场景 | 延迟敏感、大模型、可预测输出 |
-| 不适用场景 | 高 batch、显存紧张、创意生成 |
-
----
-
-## 动手实验
-
-### 实验 1：投机解码加速测试
-
-对比有无投机解码时的 TPOT 和端到端延迟。
-
-### 实验 2：接受率观察
-
-用不同类型的 prompt（翻译、创意写作、代码生成）测试接受率差异。
+| 概念 | 当前仓库中的真实语义 |
+|------|----------------------|
+| 主配置接口 | `speculative_config={...}` |
+| 主方法族 | `ngram`、`draft_model`、`eagle/eagle3`、`mtp` |
+| 调度抽象 | speculative token 并入统一 token 预算模型 |
+| 关键收益指标 | acceptance length / acceptance rate |
+| 典型误区 | 只盯 draft 长度，不看实际接受长度 |
 
 ---
 
@@ -235,11 +318,16 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
 
 ### 基础题
 
-1. 投机解码为什么不影响输出质量？
-2. 什么情况下投机解码的加速效果最好？
-3. draft model 和 target model 的 tokenizer 为什么必须一致？
+1. 为什么 speculative decoding 能减少主模型 decode 次数？
+2. 当前仓库为什么更推荐 `speculative_config`，而不是孤立的 `speculative_model` 参数？
+3. `ngram` 和 `draft_model` 的最大区别是什么？
+
+### 实践题
+
+4. 打开 `examples/offline_inference/spec_decode.py`，列出当前示例支持的全部 method。
+5. 在 `scheduler.py` 中找到 `request.spec_token_ids` 的处理逻辑，确认 speculative token 是如何进入本轮调度的。
 
 ### 思考题
 
-4. 如果所有投机的 token 都被拒绝，投机解码比标准 decode 更慢还是一样快？
-5. 投机解码与连续批处理如何配合？高 batch 时投机解码还有意义吗？
+6. 为什么说 speculative decoding 在高 batch、GPU 已经接近打满时收益会下降？
+7. 如果 acceptance 很低，你应该优先减小 `num_speculative_tokens`、换 proposer，还是先调采样温度？
