@@ -39,12 +39,25 @@ vllm serve <model> \
     --kv-cache-dtype auto                # KV Cache 类型: auto/fp8
 ```
 
+### 调度参数
+
+```bash
+    --max-num-partial-prefills 1 \       # 最大并发 partial prefill 数
+    --max-long-partial-prefills 1 \      # 最大并发长 prompt partial prefill 数
+    --long-prefill-token-threshold 0 \   # 长 prefill 阈值 (0=自动)
+    --scheduling-policy fcfs \           # 调度策略: fcfs/priority
+    --async-scheduling \                 # 启用异步调度
+    --stream-interval 1                  # 流式输出间隔
+```
+
 ### 高级参数
 
 ```bash
     --enable-prefix-caching \            # 启用前缀缓存
+    --prefix-caching-hash-algo sha256 \  # 前缀缓存 hash 算法
     --enable-chunked-prefill \           # 启用分块 prefill
     --speculative-config '{"method":"ngram","num_speculative_tokens":4}' \  # 投机解码配置
+    --structured-outputs-config.backend auto \  # 结构化输出后端
     --enable-lora \                      # 启用 LoRA
     --max-loras 4 \                      # 最大 LoRA 数
     --trust-remote-code                  # 信任远程代码

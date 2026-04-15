@@ -67,8 +67,8 @@ completion = client.chat.completions.create(
 
 在线协议转换的源码入口主要在：
 
-- `vllm/vllm/entrypoints/openai/chat_completion/protocol.py`
-- `vllm/vllm/entrypoints/openai/completion/protocol.py`
+- `vllm/vllm/entrypoints/openai/chat_completion/`
+- `vllm/vllm/entrypoints/openai/completion/`
 
 这些协议层会把 `response_format` 进一步转成内部的：
 
@@ -144,12 +144,20 @@ print(outputs[0].outputs[0].text)
 
 | 字段 | 含义 |
 |------|------|
-| `json` | 约束为 JSON Schema |
+| `json` | 约束为 JSON Schema（`str | dict | None`）|
 | `json_object` | 只保证输出为合法 JSON 对象 |
 | `regex` | 输出必须匹配正则 |
 | `choice` | 输出只能是候选列表之一 |
 | `grammar` | 输出必须符合 CFG / EBNF 文法 |
 | `structural_tag` | 在指定 tag 内遵循结构化约束 |
+
+以上 6 个字段互斥（只能设一个）。另外还有几个控制选项：
+
+| 选项 | 含义 |
+|------|------|
+| `disable_any_whitespace` | 禁止 JSON 中的额外空白 |
+| `disable_additional_properties` | 禁止 JSON Schema 中未定义的额外属性 |
+| `whitespace_pattern` | 自定义空白匹配模式 |
 
 ### 例 1：choice
 
@@ -354,9 +362,10 @@ vllm serve model --structured-outputs-config.backend auto
 | 主题 | 关键文件 | 重点 |
 |------|----------|------|
 | 参数定义 | `vllm/vllm/sampling_params.py` | `StructuredOutputsParams` |
-| OpenAI 协议映射 | `vllm/vllm/entrypoints/openai/chat_completion/protocol.py` | `response_format -> structured_outputs` |
+| OpenAI 协议映射 | `vllm/vllm/entrypoints/openai/chat_completion/` | `response_format -> structured_outputs` |
 | 请求对象 | `vllm/vllm/v1/structured_output/request.py` | grammar future、key 生成 |
 | 引擎级管理器 | `vllm/vllm/v1/structured_output/__init__.py` | backend 选择、grammar 编译、bitmask |
+| Worker 侧应用 | `vllm/vllm/v1/worker/gpu/structured_outputs.py` | bitmask 在 GPU 侧的实际应用 |
 | 调度器协同 | `vllm/vllm/v1/core/sched/scheduler.py` | `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR` |
 | 官方特性文档 | `vllm/docs/features/structured_outputs.md` | 当前支持能力与示例 |
 

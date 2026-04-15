@@ -67,7 +67,7 @@ except ValueError as e:
 
 ```
 1. 确定模型架构
-   └── 读取 config.json 中的 model_type 和 architectures
+   └── 读取 config.json 中的 architectures → ModelRegistry 解析
 
 2. 下载权重文件
    └── 从 HF Hub 或本地路径加载 safetensors/bin 文件
@@ -76,14 +76,36 @@ except ValueError as e:
    └── 根据 config 创建 vLLM 内部的模型实例
 
 4. 加载权重
-   └── 将权重张量映射到 vLLM 模型参数
+   └── 将权重张量映射到 vLLM 模型参数（通过 load_weights）
 
-5. 分配 KV Cache
+5. 显存 Profiling + KV Cache 分配
    └── 根据剩余显存计算可用块数
 
 6. 预热
    └── 运行 dummy 推理确保 CUDA kernel 编译完成
 ```
+
+### V1 中步骤 5 的真实实现
+
+步骤 5 在 V1 中由 `EngineCore._initialize_kv_caches()` 完成，这是整个初始化流程中最关键的环节：
+
+```python
+# 1. 询问模型需要哪些 KV cache 规格（每层的 head 数、head dim、dtype 等）
+kv_cache_specs = self.model_executor.get_kv_cache_specs()
+
+# 2. 做一次 dummy 前向来 profile 峰值显存，得出"除模型权重/激活外还剩多少显存"
+available_gpu_memory = self.model_executor.determine_available_memory()
+
+# 3. 根据可用显存和 KV cache 规格，计算每组 cache 能分成多少个 block
+kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory)
+
+# 4. 真正在 GPU 上分配 KV cache 张量并预热模型
+self.model_executor.initialize_from_config(kv_cache_configs)
+```
+
+这个 profiling 过程解释了为什么 vLLM 启动时有一段明显的"初始化时间"——它在真正做一次完整的显存探测，而不是简单估算。日志中的 `init engine (profile, create kv cache, warmup model) took X.XX seconds` 就是这个阶段。
+
+如果 profiling 后发现可用显存不足以支持配置的 `max_model_len`，V1 还会自动尝试缩减 `max_model_len`（auto-fit），并将新值同步到所有 worker。
 
 ### 权重格式
 

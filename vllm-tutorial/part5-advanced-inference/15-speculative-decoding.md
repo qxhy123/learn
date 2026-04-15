@@ -52,23 +52,31 @@ decode 的核心问题是：
 
 你会看到这些实现文件：
 
-- `ngram_proposer.py`
+- `ngram_proposer.py` / `ngram_proposer_gpu.py`（含 GPU 加速版）
 - `draft_model.py`
 - `eagle.py`
 - `medusa.py`
 - `dflash.py`
 - `suffix_decoding.py`
+- `extract_hidden_states.py`（提取隐藏状态，供 EAGLE 等方法使用）
+- `metadata.py` / `metrics.py` / `utils.py`（元数据、指标、工具）
+
+此外，worker 侧的 speculative decoding 实现在 `v1/worker/gpu/spec_decode/` 下，包括：
+
+- `rejection_sampler.py`（rejection sampling 验证逻辑）
+- `eagle/speculator.py`（EAGLE speculator 实现）
+- `eagle/cudagraph.py`（EAGLE cudagraph 支持）
 
 从当前仓库公开示例 `examples/offline_inference/spec_decode.py` 看，教程里最值得掌握的是：
 
 | 方法 | 说明 | 典型场景 |
 |------|------|----------|
-| `ngram` | 不需要额外草稿模型，直接从 prompt / 历史模式做猜测 | 翻译、改写、重复模式强 |
-| `draft_model` | 传统“小模型草稿 + 大模型验证” | target 很大、draft 很小 |
+| `ngram` | 不需要额外草稿模型，直接从 prompt / 历史模式做猜测（含 GPU 加速版） | 翻译、改写、重复模式强 |
+| `draft_model` | 传统”小模型草稿 + 大模型验证” | target 很大、draft 很小 |
 | `eagle` / `eagle3` | 使用专门训练的 speculative 模型路径 | 延迟优化重点场景 |
-| `mtp` | multi-token prediction 路线 | 模型本身支持对应能力时 |
+| `medusa` | 多头并行预测 | 模型有对应 Medusa head 时 |
 
-仓库里还能看到 `medusa`、`dflash` 等实现，但教程这里先聚焦主流、可直接上手的几种。
+仓库里还能看到 `dflash`、`suffix_decoding` 等实现，可根据具体场景选择。
 
 ---
 
@@ -277,9 +285,11 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 |------|----------|------|
 | 参数入口 | `vllm/vllm/engine/arg_utils.py` | `--speculative-config` 解析 |
 | 示例用法 | `vllm/examples/offline_inference/spec_decode.py` | 当前仓库最直观的配置参考 |
-| 核心实现 | `vllm/vllm/v1/spec_decode/` | 各 speculative 方法 |
+| 核心实现 | `vllm/vllm/v1/spec_decode/` | 各 speculative 方法（proposer 层） |
+| Worker 侧实现 | `vllm/vllm/v1/worker/gpu/spec_decode/` | rejection sampler、EAGLE speculator |
 | 调度协同 | `vllm/vllm/v1/core/sched/scheduler.py` | spec token 如何进入调度预算 |
 | 注意力元数据 | `vllm/vllm/v1/attention/backend.py` | speculative positions 对 attention 的影响 |
+| 树形注意力 | `vllm/vllm/v1/attention/backends/tree_attn.py` | 投机验证时的 tree attention |
 | 运行时指标 | `vllm/vllm/v1/spec_decode/metrics.py` | acceptance 相关指标 |
 
 ---
@@ -307,8 +317,9 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 | 概念 | 当前仓库中的真实语义 |
 |------|----------------------|
 | 主配置接口 | `speculative_config={...}` |
-| 主方法族 | `ngram`、`draft_model`、`eagle/eagle3`、`mtp` |
+| 主方法族 | `ngram`（含 GPU 加速版）、`draft_model`、`eagle/eagle3`、`medusa` |
 | 调度抽象 | speculative token 并入统一 token 预算模型 |
+| 验证机制 | rejection sampling（在 `v1/worker/gpu/spec_decode/rejection_sampler.py`）|
 | 关键收益指标 | acceptance length / acceptance rate |
 | 典型误区 | 只盯 draft 长度，不看实际接受长度 |
 

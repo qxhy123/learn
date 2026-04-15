@@ -196,7 +196,62 @@ LoRA 计算缓冲:     0.5 GB
 
 ---
 
-## 13.5 性能考量
+## 13.5 V1 源码中的 LoRA 集成
+
+当前 V1 架构中，LoRA 的集成不是简单的"加载权重然后算一下增量"。它贯穿了调度器、worker 和 model runner 三层。
+
+### 调度器层：LoRA 约束
+
+在 `v1/core/sched/scheduler.py` 的 waiting 流程中，调度器会检查当前 batch 已有的 LoRA 种类：
+
+```python
+# 如果已调度的 LoRA 数量达到 max_loras，
+# 且新请求使用的 LoRA 不在已调度集合中，则跳过该请求
+if (self.lora_config
+    and request.lora_request
+    and len(scheduled_loras) == self.lora_config.max_loras
+    and request.lora_request.lora_int_id not in scheduled_loras):
+    step_skipped_waiting.prepend_request(request)
+    continue
+```
+
+这意味着 `max_loras` 不只是限制"GPU 上加载几个 LoRA 权重"，还直接影响调度决策——同一 batch 中最多混合几种 LoRA。
+
+### Worker 层：LoraState
+
+`v1/worker/gpu/lora_utils.py` 中的 `LoraState` 管理 GPU 侧每个请求的 LoRA 映射：
+
+```python
+class LoraState:
+    def __init__(self, max_num_reqs):
+        self.lora_ids = np.zeros(max_num_reqs, dtype=np.int32)
+        self.lora_requests: dict[str, LoRARequest] = {}
+
+    def make_lora_inputs(self, req_ids, idx_mapping, num_scheduled_tokens):
+        # 生成 prompt_lora_mapping 和 token_lora_mapping
+        # 用于告诉 LoRA kernel 每个 token 属于哪个 LoRA
+```
+
+### Model Runner 层：LoRAModelRunnerMixin
+
+`v1/worker/lora_model_runner_mixin.py` 中的 `LoRAModelRunnerMixin` 负责：
+
+1. 用 `LRUCacheWorkerLoRAManager` 管理 LoRA 权重的加载/卸载（LRU 缓存策略）
+2. 在每个前向计算前调用 `_set_active_loras()` 设置当前 batch 的 LoRA 映射
+3. 使用 SGMV kernel（fused LoRA 计算）在 GPU 上高效执行多 LoRA batch
+
+### 源码对照
+
+| 层级 | 文件 | 职责 |
+|------|------|------|
+| 调度约束 | `v1/core/sched/scheduler.py` | `max_loras` 检查、LoRA 集合管理 |
+| 请求对象 | `vllm/lora/request.py` | `LoRARequest` 定义 |
+| Worker 状态 | `v1/worker/gpu/lora_utils.py` | `LoraState`，token→LoRA 映射 |
+| Model Runner | `v1/worker/lora_model_runner_mixin.py` | LoRA 权重加载、SGMV kernel |
+
+---
+
+## 13.6 性能考量
 
 ### LoRA 对推理速度的影响
 
@@ -206,6 +261,8 @@ LoRA 引入额外的矩阵乘法，但因为 rank 很小，开销通常 < 5%：
 原始:  y = W × x                    1次大矩阵乘
 LoRA: y = W × x + B × (A × x)      1次大矩阵乘 + 2次小矩阵乘
 ```
+
+当前 V1 使用 SGMV（Sparse Grouped Matrix-Vector）kernel 做融合 LoRA 计算，比 naive 实现更高效。
 
 ### 多 LoRA 批处理
 
@@ -225,6 +282,10 @@ Batch 中的请求:
 ```
 
 不同 LoRA 的请求越多，额外开销越大（因为需要分开计算 LoRA 增量）。
+
+### LoRA 权重的 LRU 缓存
+
+V1 使用 `LRUCacheWorkerLoRAManager` 管理 GPU 上的 LoRA 权重。当注册的 LoRA 数量超过 `max_loras` 时，最近最少使用的 LoRA 会被卸载，新请求的 LoRA 会被动态加载。这个过程对用户透明，但频繁切换 LoRA 会带来额外的加载开销。
 
 ---
 

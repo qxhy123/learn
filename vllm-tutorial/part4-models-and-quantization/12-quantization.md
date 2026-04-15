@@ -152,6 +152,17 @@ llm = LLM(
 
 KV Cache FP8 可以进一步减少 KV Cache 显存占用 50%，从而大幅提升并发能力。
 
+### KV Cache 量化在 V1 源码中的落点
+
+KV Cache 量化不只是"把 KV 存成 FP8"，它还影响注意力后端的行为。在 `v1/attention/backends/flash_attn.py` 中：
+
+- `FlashAttentionBackend` 会根据 `kv_cache_dtype` 判断是否启用量化 KV cache
+- 使用 `is_quantized_kv_cache()` 工具函数检测
+- 量化 KV cache 需要额外的 `k_scale` / `v_scale` 参数传入 `write_to_paged_cache`
+- 部分后端（如 FlashInfer）对 FP8 KV cache 有专门的优化路径
+
+这也是为什么 KV cache FP8 在 H100 上效果最好——不仅存储减半，还能利用硬件的原生 FP8 支持减少 dequantize 开销。
+
 ---
 
 ## 12.4 质量评估

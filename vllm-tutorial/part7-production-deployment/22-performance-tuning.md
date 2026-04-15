@@ -35,7 +35,7 @@
 | GPU 显存满 | KV Cache 空间不足 | 量化、减小 max_model_len |
 | TTFT 高 | prefill 计算量大 | chunked prefill、前缀缓存 |
 | TPOT 高 | batch 太大或模型太大 | 减少并发、量化、TP |
-| 频繁抢占 | 显存不足 | 增加 swap 空间、减少并发 |
+| 频繁抢占 | 显存不足 | 减少并发、启用 prefix caching、量化 |
 | 排队长 | 到达率超过处理能力 | 多副本、多 GPU |
 
 ---
@@ -82,6 +82,36 @@ vllm serve model --enable-prefix-caching
 ```bash
 # 长 prompt 多的场景，开启可减少 TPOT 抖动
 vllm serve model --enable-chunked-prefill --max-num-batched-tokens 2048
+```
+
+### V1 调度专属参数
+
+当前 V1 引入了一组更精细的调度参数，很多旧教程没有覆盖：
+
+```bash
+# 控制长 prompt 如何被切分
+vllm serve model \
+    --max-num-partial-prefills 2 \         # 最多同时有几个请求在做 partial prefill
+    --max-long-partial-prefills 1 \        # 其中长 prompt 的 partial prefill 最多几个
+    --long-prefill-token-threshold 1024    # 超过多少 token 算"长 prompt"
+
+# 异步调度（减少 GPU 空等 CPU 调度的时间）
+vllm serve model --async-scheduling
+
+# 调度策略
+vllm serve model --scheduling-policy priority  # 支持 fcfs（默认）和 priority
+```
+
+这些参数直接对应 `vllm/vllm/config/scheduler.py` 中的 `SchedulerConfig`。
+
+### 前缀缓存 hash 算法
+
+如果你的场景对 prefix cache 命中率很敏感，可以调整 hash 算法：
+
+```bash
+vllm serve model \
+    --enable-prefix-caching \
+    --prefix-caching-hash-algo xxhash   # 更快，也可选 sha256（更稳妥）
 ```
 
 ---

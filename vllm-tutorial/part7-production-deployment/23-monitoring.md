@@ -97,11 +97,12 @@ services:
 
 建议创建以下面板：
 
-1. **请求状态**：running/waiting/swapped 请求数
-2. **KV Cache 使用率**：GPU 和 CPU cache 使用百分比
-3. **吞吐量**：输入和生成 token 吞吐
-4. **延迟分布**：TTFT 和 TPOT 的 P50/P95/P99
-5. **抢占率**：每分钟抢占次数
+1. **请求状态**：running / waiting 请求数（V1 不再有 swapped 状态）
+2. **KV Cache 使用率**：`vllm:kv_cache_usage_perc`
+3. **Prefix Cache 命中率**：`vllm:prefix_cache_hits` / `vllm:prefix_cache_queries`
+4. **吞吐量**：输入和生成 token 吞吐
+5. **延迟分布**：TTFT 和 TPOT 的 P50/P95/P99
+6. **抢占率**：每分钟抢占次数
 
 ---
 
@@ -115,7 +116,7 @@ groups:
   - name: vllm_alerts
     rules:
       - alert: HighKVCacheUsage
-        expr: vllm:gpu_cache_usage_perc > 0.95
+        expr: vllm:kv_cache_usage_perc > 0.95
         for: 5m
         annotations:
           summary: "KV Cache usage > 95%, preemption likely"
@@ -139,6 +140,19 @@ groups:
           summary: "P95 TTFT > 5s"
 ```
 
+### V1 特有的关键指标
+
+当前 V1 引擎暴露了一些旧教程没有覆盖的重要指标：
+
+| 指标 | 含义 | 关注点 |
+|------|------|--------|
+| `vllm:prefix_cache_queries` | 前缀缓存查询总次数 | 配合 hits 算命中率 |
+| `vllm:prefix_cache_hits` | 前缀缓存命中总次数 | 命中率下降说明 prompt 结构变了 |
+| `vllm:spec_decode_num_accepted_tokens` | 投机解码接受 token 数 | 低接受率意味着 draft 质量差 |
+| `vllm:spec_decode_num_draft_tokens` | 投机解码 draft token 数 | 配合 accepted 算接受率 |
+
+注意：V1 已经移除了 `swapped` 状态和 CPU swap 相关指标。如果你在旧配置中引用了 `gpu_cache_usage_perc` 或 `cpu_cache_usage_perc`，需要更新为 `kv_cache_usage_perc`。
+
 ---
 
 ## 23.4 日志分析
@@ -157,8 +171,8 @@ VLLM_LOGGING_LEVEL=WARNING vllm serve model  # 只看警告
 ```
 # 正常启动
 INFO: Model loaded successfully
-INFO: Using PagedAttention with block_size=16
-INFO: # GPU blocks: 7854, # CPU blocks: 512
+INFO: Initializing a V1 LLM engine ...
+INFO: init engine (profile, create kv cache, warmup model) took X.XX seconds
 
 # 性能警告
 WARNING: Preempting 3 sequences

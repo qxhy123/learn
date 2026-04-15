@@ -9,7 +9,7 @@
 | TPOT 抖动 | 长 prefill 阻塞 decode | 启用 chunked prefill |
 | GPU 利用率低 | Batch 太小 | 增加 max_num_seqs |
 | GPU 显存满 | KV Cache 不足 | 减小 max_model_len、量化 |
-| 频繁抢占 | 并发太高、序列太长 | 减少 max_num_seqs、增加 swap |
+| 频繁抢占 | 并发太高、序列太长 | 减少 max_num_seqs、量化、启用 prefix caching |
 | 排队严重 | 到达率超过处理能力 | 多副本、多 GPU |
 | 模型加载慢 | 模型大、网络慢 | 本地存储、safetensors 格式 |
 | OOM | 显存不足 | 量化、限制 max_model_len、TP |
@@ -137,9 +137,10 @@ KV Cache = 2 × 层数 × KV头数 × head_dim × 序列长度 × dtype_bytes
 
 | 指标 | 健康范围 | 告警阈值 |
 |------|---------|---------|
-| `gpu_cache_usage_perc` | < 0.85 | > 0.95 |
-| `num_requests_waiting` | 0 | > 50 持续 2min |
-| `num_preemptions_total` (rate) | 0 | > 1/min |
+| `vllm:kv_cache_usage_perc` | < 0.85 | > 0.95 |
+| `vllm:num_requests_waiting` | 0 | > 50 持续 2min |
+| `vllm:num_preemptions_total` (rate) | 0 | > 1/min |
+| `vllm:prefix_cache_hits` / `vllm:prefix_cache_queries` | 命中率 > 50% | 命中率骤降 |
 | TTFT P95 | < 2s | > 5s |
 | TPOT P95 | < 50ms | > 100ms |
 

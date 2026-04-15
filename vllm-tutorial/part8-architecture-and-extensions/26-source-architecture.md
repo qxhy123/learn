@@ -72,13 +72,24 @@ vllm/
 │   ├── sampling_params.py          # 采样与 structured_outputs 参数
 │   ├── model_executor/             # 模型定义、加载、层实现、kernel glue
 │   ├── v1/
-│   │   ├── engine/                 # LLMEngine、EngineCore、Input/OutputProcessor
-│   │   ├── core/                   # Scheduler、KVCacheManager、request queue
-│   │   ├── executor/               # 单进程/多进程执行器
+│   │   ├── engine/                 # LLMEngine、AsyncLLM、EngineCore、Input/OutputProcessor
+│   │   │   │                       #   core_client、detokenizer、coordinator 等
+│   │   ├── core/                   # Scheduler、KVCacheManager、KVCacheCoordinator、
+│   │   │   │                       #   BlockPool、request queue、encoder cache
+│   │   │   └── sched/              # 调度器核心：scheduler、async_scheduler、output、interface
+│   │   ├── executor/               # 单进程/多进程/Ray 执行器
 │   │   ├── worker/                 # GPU/CPU/XPU worker 和 model runner
+│   │   │   └── gpu/                # GPU 专属：model_runner、input_batch、block_table、
+│   │   │       │                   #   sample/、spec_decode/、mm/、structured_outputs 等
 │   │   ├── attention/              # V1 注意力后端与 paged attention op
+│   │   │   ├── backends/           # flash_attn、flashinfer、triton、MLA、mamba、flex 等
+│   │   │   └── ops/                # paged_attn、merge_attn_states、prefix_prefill 等算子
+│   │   ├── sample/                 # V1 采样器：logits processor、sampler、rejection sampler
 │   │   ├── spec_decode/            # speculative decoding 实现
 │   │   ├── structured_output/      # grammar/backend/bitmask 管理
+│   │   ├── kv_offload/             # KV offload（CPU offload、策略、worker）
+│   │   ├── simple_kv_offload/      # 简化版 KV offload
+│   │   ├── pool/                   # pooling / late interaction 推理
 │   │   └── metrics/                # 运行时指标与统计
 │   ├── distributed/                # KV transfer、通信、DP/TP 等
 │   └── ...
@@ -93,11 +104,14 @@ vllm/
 | 模块 | 当前职责 |
 |------|----------|
 | `entrypoints/` | 用户入口，接收 HTTP 请求或 Python 调用 |
-| `v1/engine/` | 输入处理、引擎主循环、输出聚合 |
-| `v1/core/` | 调度、KV 块管理、等待队列、请求状态 |
-| `v1/executor/` | 把调度好的 batch 分发到 worker |
+| `v1/engine/` | 输入处理、引擎主循环、输出聚合、detokenizer、core_client |
+| `v1/core/` | 调度、KV 块管理（KVCacheManager → Coordinator → BlockPool）、等待队列 |
+| `v1/core/sched/` | 调度器核心：同步/异步 scheduler、输出定义、请求队列、调度策略 |
+| `v1/executor/` | 把调度好的 batch 分发到 worker（uniproc/multiproc/ray） |
 | `v1/worker/` | 单设备上的模型执行、cudagraph、输入 batch |
+| `v1/worker/gpu/` | GPU 专属子模块：model_runner、sample/、spec_decode/、mm/、structured_outputs |
 | `v1/attention/` | 注意力后端和 paged attention 算子 |
+| `v1/sample/` | V1 采样器：logits processor、sampler、rejection sampler |
 | `model_executor/models/` | 各模型架构在 vLLM 中的实现 |
 | `sampling_params.py` | 采样参数、structured outputs 参数定义 |
 
@@ -185,12 +199,13 @@ OutputProcessor
 | 阶段 | 关键文件 |
 |------|----------|
 | 入口 | `vllm/vllm/entrypoints/llm.py` / `vllm/vllm/entrypoints/openai/api_server.py` |
-| 引擎外层 | `vllm/vllm/v1/engine/llm_engine.py` |
+| 引擎外层 | `vllm/vllm/v1/engine/llm_engine.py` / `vllm/vllm/v1/engine/async_llm.py` |
 | 输入处理 | `vllm/vllm/v1/engine/input_processor.py` |
+| engine core 客户端 | `vllm/vllm/v1/engine/core_client.py` |
 | engine core | `vllm/vllm/v1/engine/core.py` |
-| 调度 | `vllm/vllm/v1/core/sched/scheduler.py` |
-| 内存管理 | `vllm/vllm/v1/core/kv_cache_manager.py` |
-| 执行器 | `vllm/vllm/v1/executor/uniproc_executor.py` / `multiproc_executor.py` |
+| 调度 | `vllm/vllm/v1/core/sched/scheduler.py` / `async_scheduler.py` |
+| 内存管理 | `vllm/vllm/v1/core/kv_cache_manager.py` → `kv_cache_coordinator.py` → `block_pool.py` |
+| 执行器 | `vllm/vllm/v1/executor/uniproc_executor.py` / `multiproc_executor.py` / `ray_executor.py` |
 | worker | `vllm/vllm/v1/worker/gpu_worker.py` |
 | model runner | `vllm/vllm/v1/worker/gpu/model_runner.py` |
 | 输出处理 | `vllm/vllm/v1/engine/output_processor.py` |
@@ -204,18 +219,24 @@ OutputProcessor
 它在初始化时做了几件关键事：
 
 1. 保存 `vllm_config`
-2. 创建 `InputProcessor`
-3. 创建 `OutputProcessor`
-4. 通过 `EngineCoreClient.make_client(...)` 建立和 engine core 的连接
+2. 创建 `renderer`（负责 chat template / tokenizer）
+3. 创建 `InputProcessor`（把用户输入转成 `EngineCoreRequest`）
+4. 创建 `OutputProcessor`（把 `EngineCoreOutputs` 转成 `RequestOutput`）
+5. 通过 `EngineCoreClient.make_client(...)` 建立和 engine core 的连接
+6. 可选创建 `StatLoggerManager` 进行指标统计
 
 你可以把它看成：
 
 ```text
 LLMEngine
+  ├── renderer (tokenizer + chat template)
   ├── InputProcessor
   ├── EngineCoreClient
-  └── OutputProcessor
+  ├── OutputProcessor
+  └── StatLoggerManager (可选)
 ```
+
+注意：异步服务场景下，对应的入口是 `vllm/vllm/v1/engine/async_llm.py` 中的 `AsyncLLM`，它和 `LLMEngine` 共享相同的 Input/Output Processor 架构，但使用异步 `EngineCoreClient`。
 
 这层自己不实现真正的调度算法，也不直接操作 KV block。
 它更像一个“胶水层”：
@@ -237,25 +258,69 @@ LLMEngine
 
 它初始化时会做这些关键工作：
 
-1. 创建 `model_executor`
-2. 调 `_initialize_kv_caches()` 计算和初始化 KV cache
-3. 创建 `StructuredOutputManager`
-4. 根据 `SchedulerConfig` 选择调度器类并初始化 scheduler
-5. 初始化 batch queue、connector、指标统计等
+1. 创建 `model_executor`（通过 `executor_class`）
+2. 调 `_initialize_kv_caches()` 进行显存 profiling、计算 KV cache 容量并初始化
+3. 创建 `StructuredOutputManager`（结构化输出 grammar 管理）
+4. 根据 `SchedulerConfig.get_scheduler_cls()` 选择调度器类（同步 `Scheduler` 或异步 `AsyncScheduler`）并初始化
+5. 初始化 batch queue（用于 pipeline parallelism 消除 pipeline bubbles）
+6. 初始化 request block hasher（用于 prefix caching）
+7. 选择 `step_fn`：根据是否启用 batch queue 选择 `step` 或 `step_with_batch_queue`
 
 ### `EngineCore.step()` 的核心结构
 
-`step()` 的职责可以概括成：
+`step()` 的源码可以直接展开：
 
-```text
-收集请求
-  → 调度
-  → 执行模型
-  → 更新请求状态
-  → 产出输出
+```python
+def step(self):
+    if not self.scheduler.has_requests():
+        return {}, False
+
+    # 1. 调度：决定这一轮谁跑、分配 KV block
+    scheduler_output = self.scheduler.schedule()
+
+    # 2. 执行模型前向（非阻塞）
+    future = self.model_executor.execute_model(scheduler_output, non_block=True)
+
+    # 3. 获取结构化输出的 grammar bitmask（CPU 侧并行）
+    grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+
+    # 4. 等待模型执行完成
+    model_output = future.result()
+
+    # 5. 如果模型没有直接采样，用 grammar bitmask 做采样
+    if model_output is None:
+        model_output = self.model_executor.sample_tokens(grammar_output)
+
+    # 6. 处理本轮中发生的 abort
+    self._process_aborts_queue()
+
+    # 7. 根据模型输出更新所有请求状态
+    engine_core_outputs = self.scheduler.update_from_output(
+        scheduler_output, model_output
+    )
+
+    return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 ```
 
-这也是你理解整个 V1 的最短路径。
+有几个值得注意的设计：
+
+1. **模型执行和 grammar bitmask 是并行的**：`execute_model` 以 `non_block=True` 启动，然后 CPU 侧立刻去算 grammar bitmask，再等模型结果。
+2. **采样可以延迟**：如果模型前向没有直接产出采样结果（例如需要先应用 bitmask），采样在 `sample_tokens` 中完成。
+3. **speculative decoding 的 draft token 更新**：在 `post_step()` 中，如果不是异步调度，会从 executor 获取 draft token ids 并更新到调度器。
+
+### Pipeline Parallelism 时的变体：`step_with_batch_queue`
+
+当 `batch_queue_size > 1` 时（PP 场景），engine core 使用 `step_with_batch_queue` 代替 `step`。它通过一个双端队列实现批次的异步调度和执行：
+
+```text
+调度 batch N+1（非阻塞）→ 加入队列
+                         ↓
+                   等队列头部 batch N 执行完
+                         ↓
+                   处理 batch N 的输出
+```
+
+这样可以在 batch N 还在 GPU 上执行时，CPU 侧提前完成 batch N+1 的调度，消除 pipeline bubbles。
 
 ---
 
@@ -280,12 +345,16 @@ LLMEngine
 
 ### `KVCacheManager` 负责的事
 
-- prefix cache 命中查询
-- block 是否够用
-- 新 block 分配
-- block hash 和 cache blocks 维护
-- block 释放
+`KVCacheManager` 内部通过 `KVCacheCoordinator`（在 `kv_cache_coordinator.py`）和 `BlockPool`（在 `block_pool.py`）分层管理：
+
+- prefix cache 命中查询（`get_computed_blocks`）
+- block 是否够用（通过 coordinator 判断）
+- 新 block 分配（`allocate_slots`）
+- block hash 和 cache blocks 维护（coordinator → block pool）
+- block 释放（`free`）
 - prefix cache reset
+
+当前架构是三层：`KVCacheManager` → `KVCacheCoordinator` → `BlockPool` + `FreeKVCacheBlockQueue`
 
 这也是为什么当前教程里应该讲：
 
@@ -302,13 +371,15 @@ LLMEngine
 
 执行器在：
 
-- `vllm/vllm/v1/executor/uniproc_executor.py`
-- `vllm/vllm/v1/executor/multiproc_executor.py`
+- `vllm/vllm/v1/executor/uniproc_executor.py`（单进程，调试和小规模场景）
+- `vllm/vllm/v1/executor/multiproc_executor.py`（多进程，TP/PP 场景）
+- `vllm/vllm/v1/executor/ray_executor.py` / `ray_executor_v2.py`（Ray 分布式场景）
+- `vllm/vllm/v1/executor/abstract.py`（抽象基类 `Executor`）
 
 它负责把调度器给出的 batch：
 
 - 组织成 worker 能吃的执行请求
-- 发往单进程或多进程 worker
+- 发往单进程、多进程或 Ray worker
 
 ### Worker：设备级的运行实体
 
@@ -340,10 +411,25 @@ GPU worker 主要在：
 可以粗略理解成：
 
 ```text
-Scheduler 决定“谁跑”
-Executor 负责“怎么送过去”
-GPUModelRunner 决定“送过去之后怎么真正算”
+Scheduler 决定”谁跑”
+Executor 负责”怎么送过去”
+GPUModelRunner 决定”送过去之后怎么真正算”
 ```
+
+### GPUModelRunner 的内部子模块
+
+当前 `v1/worker/gpu/` 目录已经非常丰富，model_runner 的职责被进一步拆分：
+
+| 子模块 | 职责 |
+|--------|------|
+| `input_batch.py` | 管理 GPU 侧的 input batch 状态 |
+| `block_table.py` | GPU 侧的 block table 管理 |
+| `sample/` | 采样器（sampler、logprob、penalties、min_p、bad_words 等）|
+| `spec_decode/` | GPU 侧的 speculative decoding（rejection sampler、EAGLE speculator）|
+| `mm/` | 多模态：encoder_cache、encoder_runner、RoPE 处理 |
+| `structured_outputs.py` | 结构化输出的 bitmask 应用 |
+| `cudagraph_utils.py` | CUDAGraph 捕获和回放 |
+| `warmup.py` | 模型预热逻辑 |
 
 ---
 
@@ -363,12 +449,22 @@ V1 的注意力后端在：
 
 - `vllm/vllm/v1/attention/backends/`
 
-常见后端包括：
+当前已经非常丰富，主要包括：
 
-- `flash_attn.py`
-- `flashinfer.py`
-- `triton_attn.py`
-- `rocm_attn.py`
+| 后端 | 说明 |
+|------|------|
+| `flash_attn.py` | Flash Attention 主力后端 |
+| `flashinfer.py` | FlashInfer 后端 |
+| `triton_attn.py` | Triton 实现的注意力 |
+| `rocm_attn.py` / `rocm_aiter_fa.py` | AMD ROCm 后端 |
+| `mla/` | Multi-head Latent Attention（MLA）后端族，含 flashmla、cutlass_mla、triton_mla 等多种实现 |
+| `flex_attention.py` | PyTorch Flex Attention 后端 |
+| `mamba_attn.py` / `mamba1_attn.py` / `mamba2_attn.py` | Mamba SSM 系列后端 |
+| `linear_attn.py` | 线性注意力后端 |
+| `tree_attn.py` | 树形注意力（用于 speculative decoding 验证） |
+| `cpu_attn.py` | CPU 注意力后端 |
+
+后端注册和选择逻辑在 `registry.py` 和 `selector.py`。
 
 ### PagedAttention 相关算子
 
@@ -391,9 +487,10 @@ V1 的注意力后端在：
 
 ### 结构化输出
 
-- 参数入口：`vllm/vllm/sampling_params.py`
-- runtime 管理：`vllm/vllm/v1/structured_output/`
-- engine 集成：`StructuredOutputManager`
+- 参数入口：`vllm/vllm/sampling_params.py`（`StructuredOutputsParams`）
+- runtime 管理：`vllm/vllm/v1/structured_output/`（后端选择、grammar 编译）
+- engine 集成：`StructuredOutputManager`（在 `EngineCore` 初始化时创建）
+- worker 侧：`vllm/vllm/v1/worker/gpu/structured_outputs.py`（bitmask 应用）
 
 ### 投机解码
 
@@ -401,12 +498,16 @@ V1 的注意力后端在：
 
 这里有：
 
-- `draft_model.py`
-- `ngram_proposer.py`
-- `eagle.py`
-- `medusa.py`
-- `dflash.py`
-- `suffix_decoding.py`
+- `draft_model.py`（传统小模型草稿）
+- `ngram_proposer.py` / `ngram_proposer_gpu.py`（N-gram 猜测，含 GPU 加速版）
+- `eagle.py`（EAGLE/EAGLE3 方法）
+- `medusa.py`（Medusa 多头预测）
+- `dflash.py`（DFlash 方法）
+- `suffix_decoding.py`（后缀解码）
+- `extract_hidden_states.py`（提取隐藏状态，供 EAGLE 等使用）
+- `metadata.py` / `metrics.py` / `utils.py`（元数据、指标统计、工具函数）
+
+此外，`v1/worker/gpu/spec_decode/` 下还有 worker 侧的 rejection sampler 和 EAGLE speculator 实现。
 
 调度器并不会为它们单独写一套“特判流程”，而是通过：
 
@@ -469,19 +570,21 @@ V1 的注意力后端在：
 
 如果你准备第一次系统读 vLLM 源码，我推荐这个顺序：
 
-1. `vllm/vllm/v1/request.py`
-2. `vllm/vllm/config/scheduler.py`
-3. `vllm/vllm/v1/core/sched/scheduler.py`
-4. `vllm/vllm/v1/core/kv_cache_manager.py`
-5. `vllm/vllm/v1/engine/core.py`
-6. `vllm/vllm/v1/engine/llm_engine.py`
-7. `vllm/vllm/v1/worker/gpu/model_runner.py`
-8. `vllm/vllm/v1/attention/backends/flash_attn.py`
+1. `vllm/vllm/v1/request.py`（请求对象和状态定义）
+2. `vllm/vllm/config/scheduler.py`（调度器所有可调参数）
+3. `vllm/vllm/v1/core/sched/scheduler.py`（核心调度算法）
+4. `vllm/vllm/v1/core/kv_cache_manager.py`（KV 块管理外观接口）
+5. `vllm/vllm/v1/core/kv_cache_coordinator.py`（coordinator 调度块分配策略）
+6. `vllm/vllm/v1/core/block_pool.py`（block pool 和 prefix cache 实现）
+7. `vllm/vllm/v1/engine/core.py`（引擎主循环）
+8. `vllm/vllm/v1/engine/llm_engine.py`（外层编排器）
+9. `vllm/vllm/v1/worker/gpu/model_runner.py`（GPU 侧 batch 准备和模型前向）
+10. `vllm/vllm/v1/attention/backends/flash_attn.py`（Flash Attention 后端）
 
 为什么是这个顺序？
 
 - 先搞清请求对象和调度配置
-- 再搞清调度和内存管理
+- 再搞清调度和内存管理（KVCacheManager → Coordinator → BlockPool 三层）
 - 然后回到 engine core 把主循环串起来
 - 最后再下探到 worker 和 attention backend
 
@@ -494,13 +597,14 @@ V1 的注意力后端在：
 | 概念 | 当前仓库里的真实位置 |
 |------|----------------------|
 | 入口层 | `entrypoints/` |
-| 外层引擎 | `v1/engine/llm_engine.py` |
+| 外层引擎 | `v1/engine/llm_engine.py`（同步）/ `v1/engine/async_llm.py`（异步）|
 | 核心内循环 | `v1/engine/core.py` |
-| 调度 | `v1/core/sched/scheduler.py` |
-| KV 管理 | `v1/core/kv_cache_manager.py` |
-| 执行器 | `v1/executor/` |
-| 设备执行 | `v1/worker/` |
-| 注意力后端 | `v1/attention/backends/` |
+| 调度 | `v1/core/sched/scheduler.py`（同步）/ `async_scheduler.py`（异步）|
+| KV 管理 | `v1/core/kv_cache_manager.py` → `kv_cache_coordinator.py` → `block_pool.py` |
+| 执行器 | `v1/executor/`（uniproc / multiproc / ray）|
+| 设备执行 | `v1/worker/gpu_worker.py` + `v1/worker/gpu/model_runner.py` |
+| 注意力后端 | `v1/attention/backends/`（flash_attn、flashinfer、MLA、mamba 等）|
+| 采样器 | `v1/sample/`（logits processor、sampler）|
 | 模型实现 | `model_executor/models/` |
 
 ---

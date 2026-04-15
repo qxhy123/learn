@@ -167,7 +167,46 @@ response = client.chat.completions.create(
 
 ---
 
-## 14.4 性能特点
+## 14.4 V1 源码中的多模态调度机制
+
+在 V1 架构中，多模态推理不只是"图片变成更多 token"这么简单。当前源码有两个专门的子系统来管理多模态资源。
+
+### Encoder Cache Manager
+
+多模态模型的视觉编码器输出需要缓存，调度器通过 `EncoderCacheManager`（`v1/core/encoder_cache_manager.py`）管理：
+
+- 每个多模态输入有独立的 encoder cache 槽位
+- 调度器在接纳请求时要同时检查 encoder cache 是否有空间
+- 请求完成后 encoder cache 被释放
+
+### Encoder Compute Budget
+
+调度器维护一个独立的 `encoder_compute_budget`，和 token budget 并行约束：
+
+```python
+encoder_compute_budget = self.max_num_encoder_input_tokens
+```
+
+每当一个带多模态输入的请求被调度，encoder budget 会被扣减。这样可以防止太多图像/视频请求同时 prefill，导致 GPU 计算量暴增。
+
+### 对调度的直接影响
+
+在 `scheduler.py` 的 running 和 waiting 流程中，encoder 相关逻辑随处可见：
+
+```python
+if request.has_encoder_inputs:
+    (encoder_inputs_to_schedule, num_new_tokens, new_encoder_compute_budget,
+     external_load_encoder_input) = self._try_schedule_encoder_inputs(
+        request, num_computed_tokens, num_new_tokens, encoder_compute_budget)
+    if num_new_tokens == 0:
+        break  # encoder 预算耗尽
+```
+
+这意味着多模态请求有**双重准入门禁**：既要满足 token budget，又要满足 encoder budget。
+
+---
+
+## 14.5 性能特点
 
 ### 图像 token 的影响
 
@@ -210,7 +249,7 @@ vllm serve model --max-model-len 2048  # 限制总序列长度
 
 ---
 
-## 14.5 支持的多模态模型
+## 14.6 支持的多模态模型
 
 | 模型 | 输入模态 | 图像 token 数 | 说明 |
 |------|---------|-------------|------|

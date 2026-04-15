@@ -59,7 +59,12 @@
 | `WAITING_FOR_STREAMING_REQ` | 在等流式输入补全 |
 | `RUNNING` | 已有 KV 分配，正在活跃执行 |
 | `PREEMPTED` | 被抢占后重新回到等待队列，后续需要重算部分或全部 token |
-| `FINISHED_*` | 各类完成/停止/错误终态 |
+| `FINISHED_STOPPED` | 遇到 stop token / stop 条件正常结束 |
+| `FINISHED_LENGTH_CAPPED` | 达到 max_tokens 限制 |
+| `FINISHED_ABORTED` | 被用户主动取消 |
+| `FINISHED_IGNORED` | prompt 长度超出模型上限被忽略 |
+| `FINISHED_ERROR` | 执行出错 |
+| `FINISHED_REPETITION` | 因检测到过度重复而终止 |
 
 可以用下面这个图理解主路径：
 
@@ -82,6 +87,7 @@ WAITING ───────────────→ RUNNING ─────
 
 - `vllm/vllm/v1/engine/core.py` 中的 `EngineCore.step()`
 - `vllm/vllm/v1/core/sched/scheduler.py` 中的 `Scheduler.schedule()`
+- 异步调度变体在 `vllm/vllm/v1/core/sched/async_scheduler.py`
 
 调度器每轮大致做这几步：
 
@@ -89,16 +95,23 @@ WAITING ───────────────→ RUNNING ─────
 def schedule():
     token_budget = max_num_scheduled_tokens or max_num_batched_tokens
 
+    kv_cache_manager.new_step_starts()
+
     # 1. 先处理 running 请求
     for request in running:
-        num_new_tokens = request.num_tokens_with_spec - request.num_computed_tokens
+        num_new_tokens = (request.num_tokens_with_spec
+                         + request.num_output_placeholders
+                         - request.num_computed_tokens)
+        num_new_tokens = min(num_new_tokens, token_budget)
         new_blocks = kv_cache_manager.allocate_slots(request, num_new_tokens)
         if new_blocks is None:
+            # 循环抢占最低优先级请求，直到分配成功或无可抢占
             preempt_lowest_priority_request()
         else:
             schedule_running(request)
 
-    # 2. 再处理 waiting / skipped_waiting 请求
+    # 2. 再处理 skipped_waiting（上轮被跳过的异步阻塞请求）
+    # 3. 再处理 waiting 队列中的新请求
     while waiting and token_budget > 0:
         request = pick_next_waiting_request()
         computed_blocks = kv_cache_manager.get_computed_blocks(request)
@@ -110,6 +123,8 @@ def schedule():
 
     return SchedulerOutput(...)
 ```
+
+注意源码中 `num_output_placeholders` 是异步调度引入的概念——当启用 `async_scheduling` 时，调度器可以在上一轮模型执行完成前就开始调度下一轮，placeholder 表示尚未确认的异步输出 token。
 
 这段伪代码和源码并不逐行相同，但抓住了 3 个真实原则。
 
@@ -134,7 +149,7 @@ V1 里最重要的预算是：
 
 ### 原则 3：waiting 队列接纳前会先看缓存命中
 
-对于一个从未运行过的新请求，调度器不会马上把整段 prompt 都当成“未计算”：
+对于一个从未运行过的新请求，调度器不会马上把整段 prompt 都当成”未计算”：
 
 1. 先调用 `kv_cache_manager.get_computed_blocks(request)`
 2. 让 prefix cache 尝试找出已经命中的完整 block
@@ -144,7 +159,107 @@ V1 里最重要的预算是：
 
 ---
 
-## 9.4 抢占：当前 V1 里真正发生了什么？
+## 9.4 Waiting 流程深入：源码里真实发生了什么？
+
+上面的伪代码对 waiting 流程做了简化。实际源码里的 waiting 调度要复杂得多，这里按源码展开。
+
+### 第一步：处理阻塞状态的请求
+
+调度器维护两个等待队列：
+
+- `self.waiting`：普通等待队列
+- `self.skipped_waiting`：上一轮因异步阻塞被跳过的请求
+
+遍历时，调度器会先检查请求是否处于”阻塞等待态”：
+
+```python
+if self._is_blocked_waiting_status(request.status):
+    if not self._try_promote_blocked_waiting_request(request):
+        # 还没准备好，放到 step_skipped_waiting
+        step_skipped_waiting.prepend_request(request)
+        continue
+```
+
+阻塞状态包括：
+
+| 阻塞状态 | 含义 | promote 条件 |
+|----------|------|-------------|
+| `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR` | grammar 还没编译完 | grammar future 完成 |
+| `WAITING_FOR_REMOTE_KVS` | 远端 KV 传输未完成 | connector 确认完成 |
+| `WAITING_FOR_STREAMING_REQ` | 流式输入还没补完 | 新输入到达 |
+
+### 第二步：查询缓存命中（本地 + 远端）
+
+对于首次调度的请求（`num_computed_tokens == 0`），调度器会同时查本地和远端缓存：
+
+```python
+# 本地 prefix cache 命中
+new_computed_blocks, num_new_local_computed_tokens = (
+    self.kv_cache_manager.get_computed_blocks(request)
+)
+
+# 远端 KV connector 命中（P/D disaggregation 场景）
+if self.connector is not None:
+    ext_tokens, load_kv_async = (
+        self.connector.get_num_new_matched_tokens(
+            request, num_new_local_computed_tokens
+        )
+    )
+
+# 总缓存命中 = 本地 + 远端
+num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
+```
+
+### 第三步：`can_fit_full_sequence` 准入门禁
+
+当 `scheduler_reserve_full_isl=True`（默认）时，调度器在真正分配前会先问：
+
+> “如果这个请求的完整序列长度都要占 KV Cache，总容量够不够？”
+
+```python
+if self.scheduler_reserve_full_isl:
+    if not self.kv_cache_manager.can_fit_full_sequence(
+        request,
+        num_new_computed_tokens=num_new_local_computed_tokens,
+        new_computed_blocks=new_computed_blocks,
+        num_external_computed_tokens=num_external_computed_tokens,
+    ):
+        break  # 容量不够，停止接纳新请求
+```
+
+这个检查非常关键——它防止了一种叫 **KV Cache thrashing** 的恶性循环：
+
+1. Chunked prefill 接纳了太多请求（每次只看第一个 chunk 够不够）
+2. 后续 chunk 需要更多 block，但总容量已经不够
+3. 被迫频繁抢占和重算，系统进入振荡
+
+### 第四步：真正分配 block 并接纳
+
+通过准入检查后，才调用 `allocate_slots` 分配 block，然后把请求从 waiting 移入 running：
+
+```python
+new_blocks = self.kv_cache_manager.allocate_slots(
+    request, num_new_tokens,
+    num_new_computed_tokens=num_new_local_computed_tokens,
+    new_computed_blocks=new_computed_blocks,
+    ...
+)
+if new_blocks is None:
+    break  # 分配失败，停止调度
+
+# 接纳成功
+self.running.append(request)
+request.status = RequestStatus.RUNNING
+request.num_computed_tokens = num_computed_tokens
+```
+
+### LoRA 约束
+
+如果启用了 LoRA，调度器还会检查当前 batch 中的 LoRA 种类是否已达 `max_loras` 上限。如果某个请求的 LoRA 不在当前已调度集合中且集合已满，该请求会被暂时跳过。
+
+---
+
+## 9.5 抢占的内部机制
 
 ### 旧说法：swap 到 CPU
 
@@ -162,10 +277,25 @@ V1 里最重要的预算是：
 - 它会被重新放回等待队列
 - 后续再次被调度时，从已有可复用状态重新推进
 
+源码中 `_preempt_request()` 的实现非常清晰：
+
+```python
+def _preempt_request(self, request, timestamp):
+    self.kv_cache_manager.free(request)        # 释放所有 KV block
+    self.encoder_cache_manager.free(request)    # 释放 encoder cache
+    request.status = RequestStatus.PREEMPTED
+    request.num_computed_tokens = 0             # 重置为零！
+    request.spec_token_ids = []                 # 清空 speculative token
+    request.num_preemptions += 1                # 记录被抢占次数
+    self.waiting.prepend_request(request)        # 放回等待队列头部
+```
+
+注意 `num_computed_tokens = 0` 这一行——它意味着被抢占的请求**必须从头重算**。但由于 prefix caching 的存在，重新调度时 `get_computed_blocks()` 可能仍然能命中大量之前算过的 block，从而避免完全重算。
+
 换句话说，**当前 V1 调度器默认不是围绕本地 GPU↔CPU swap 队列设计的**。
 
 这点也能从官方文档 `docs/usage/v1_guide.md` 看出来：
-V1 已经把“GPU <> CPU KV Cache Swapping”列为 removed feature。
+V1 已经把”GPU <> CPU KV Cache Swapping”列为 removed feature。
 
 ### 为什么这样改？
 
@@ -183,7 +313,7 @@ V1 的取舍是：
 
 ---
 
-## 9.5 公平性、优先级和被谁抢占
+## 9.6 公平性、优先级和被谁抢占
 
 ### 默认策略：FCFS
 
@@ -226,7 +356,7 @@ preempted_req = max(
 
 ---
 
-## 9.6 Chunked Prefill 为什么会直接影响调度？
+## 9.7 Chunked Prefill 为什么会直接影响调度？
 
 V1 里 chunked prefill 已经不是“附属优化”，而是调度器本身的一部分。
 
@@ -265,7 +395,7 @@ V1 里 chunked prefill 已经不是“附属优化”，而是调度器本身的
 
 ---
 
-## 9.7 当前仓库里真正该调哪些参数？
+## 9.8 当前仓库里真正该调哪些参数？
 
 下面这些参数和当前源码是一一对应的：
 
@@ -294,6 +424,15 @@ vllm serve model \
 | `--async-scheduling` | 减少 host 侧空转和调度间隙 | 通常能改善 GPU 利用率 |
 | `--stream-interval` | 流式输出粒度 | 1 最丝滑，但 host 负担更高 |
 
+### 异步调度补充说明
+
+当前仓库支持两种调度器实现：
+
+- `Scheduler`（同步，在 `v1/core/sched/scheduler.py`）
+- `AsyncScheduler`（异步，在 `v1/core/sched/async_scheduler.py`）
+
+异步调度通过 `--async-scheduling` 启用，可以减少 GPU 空闲等待调度的时间。它引入了 `num_output_placeholders` 来处理上一轮结果尚未返回时的调度决策。
+
 ### 两个已经过时的旧参数
 
 如果你在旧文章里看到这些选项，要知道它们并不对应当前仓库的 V1 主路径：
@@ -303,12 +442,16 @@ vllm serve model \
 
 ---
 
-## 9.8 源码对照：本章该看哪些文件？
+## 9.9 源码对照：本章该看哪些文件？
 
 | 主题 | 关键文件 | 你会看到什么 |
 |------|----------|--------------|
 | 调度入口 | `vllm/vllm/v1/engine/core.py` | `EngineCore.step()` 如何调用 scheduler 和 executor |
 | 核心调度器 | `vllm/vllm/v1/core/sched/scheduler.py` | token 预算、运行队列、等待队列、抢占 |
+| 异步调度器 | `vllm/vllm/v1/core/sched/async_scheduler.py` | 异步调度变体 |
+| 调度接口 | `vllm/vllm/v1/core/sched/interface.py` | `SchedulerInterface` 抽象和 `PauseState` |
+| 请求队列 | `vllm/vllm/v1/core/sched/request_queue.py` | `SchedulingPolicy`、`RequestQueue` 实现 |
+| 调度输出 | `vllm/vllm/v1/core/sched/output.py` | `SchedulerOutput`、`NewRequestData`、`CachedRequestData` |
 | 调度配置 | `vllm/vllm/config/scheduler.py` | 所有用户可调参数的真实定义 |
 | 请求状态 | `vllm/vllm/v1/request.py` | `RequestStatus`、`num_computed_tokens` 等字段 |
 | 输出汇总 | `vllm/vllm/v1/engine/output_processor.py` | 流式输出如何被整理和返回 |
@@ -322,7 +465,7 @@ vllm serve model \
 
 ---
 
-## 9.9 观察调度行为的实验建议
+## 9.10 观察调度行为的实验建议
 
 ### 实验 1：对比短 prompt 和长 prompt 竞争
 

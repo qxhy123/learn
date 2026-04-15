@@ -271,6 +271,56 @@ vLLM 的 PagedAttention kernel 做了大量优化：
 3. **向量化内存访问**：合并显存读取，最大化带宽利用
 4. **支持 GQA**：正确处理 Query 头和 KV 头的多对一映射
 
+### 在 V1 源码中的落点
+
+当前仓库里，PagedAttention 的算子层实现在 `vllm/vllm/v1/attention/ops/paged_attn.py`：
+
+```python
+class PagedAttention:
+    @staticmethod
+    def split_kv_cache(kv_cache, num_kv_heads, head_size):
+        """将合并的 KV cache 张量拆成 key_cache 和 value_cache"""
+        x = 16 // kv_cache.element_size()
+        key_cache = kv_cache[0].view(num_blocks, num_kv_heads, head_size // x, -1, x)
+        value_cache = kv_cache[1].view(num_blocks, num_kv_heads, head_size, -1)
+        return key_cache, value_cache
+
+    @staticmethod
+    def write_to_paged_cache(key, value, key_cache, value_cache, slot_mapping, ...):
+        """把新生成的 KV 向量写入 paged cache 的指定 slot"""
+        ops.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, ...)
+```
+
+`split_kv_cache` 展示了 KV cache 的真实物理布局——key 的最内层维度做了 `16 / element_size()` 的向量化拆分（`x` 维度），这正是为了优化 CUDA kernel 的内存访问模式。
+
+### GPU 侧的 Block Table 管理
+
+更上层的 block table 管理在 `vllm/vllm/v1/worker/gpu/block_table.py` 中的 `BlockTables` 类：
+
+```python
+class BlockTables:
+    def __init__(self, block_sizes, max_num_reqs, max_num_batched_tokens, ...):
+        # 每个 KV cache group 一张 block table: [max_num_reqs, max_num_blocks]
+        self.block_tables: list[StagedWriteTensor] = [...]
+        # slot_mapping: [num_kv_cache_groups, max_num_batched_tokens]
+        self.slot_mappings = torch.zeros(...)
+```
+
+这里能看到两个工程细节：
+
+1. **多 KV cache group 支持**：block table 不是一张，而是每个 KV cache group 一张（用于混合 attention+mamba 模型）
+2. **StagedWriteTensor**：block table 使用分段写入策略，在 CPU 侧准备数据后批量传输到 GPU
+
+### 注意力后端不只是 PagedAttention
+
+当前 V1 的注意力后端已经远超原始 PagedAttention kernel。真正被调用的是 `v1/attention/backends/` 下的高级后端：
+
+- **Flash Attention**（`flash_attn.py`）：使用 `reshape_and_cache_flash` 写 KV cache，然后调 `flash_attn_varlen_func` 做注意力计算
+- **FlashInfer**（`flashinfer.py`）：更新版的高性能后端
+- **MLA 后端族**（`mla/`）：DeepSeek 的 Multi-head Latent Attention
+
+这些后端内部都包含了 paged KV cache 的写入和读取逻辑，但使用了更高效的融合 kernel 而非原始的分步 PagedAttention kernel。
+
 ---
 
 ## 7.7 块大小的选择

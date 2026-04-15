@@ -21,18 +21,23 @@
 如果你读过较早期的 vLLM 资料，可能见过 `BlockSpaceManager` 这个名字。
 但当前仓库的 V1 主实现里，真正负责 KV 块生命周期的核心类是：
 
-- `vllm/vllm/v1/core/kv_cache_manager.py` 中的 `KVCacheManager`
-- 它背后的 `coordinator`
-- 以及 `vllm/vllm/v1/core/kv_cache_utils.py` 中定义的 block pool / free queue / hash 数据结构
+- `vllm/vllm/v1/core/kv_cache_manager.py` 中的 `KVCacheManager`（对外接口层）
+- `vllm/vllm/v1/core/kv_cache_coordinator.py` 中的 `KVCacheCoordinator`（协调多 KV group 的分配策略）
+- `vllm/vllm/v1/core/block_pool.py` 中的 `BlockPool` 和 `BlockHashToBlockMap`（底层 block 管理和 prefix cache）
+- `vllm/vllm/v1/core/kv_cache_utils.py` 中的 `KVCacheBlock`、`FreeKVCacheBlockQueue` 和 hash 工具
 
-可以把它理解成三层：
+可以把它理解成四层：
 
 ```text
 Scheduler
   ↓
-KVCacheManager
+KVCacheManager        ← 对外接口：get_computed_blocks / allocate_slots / free
   ↓
-KV cache coordinator / block pool / prefix cache metadata
+KVCacheCoordinator    ← 协调多 KV cache group 的分配策略、prefix cache 读写
+  ↓
+BlockPool             ← 底层 block 管理：block hash map、free queue、LRU 逐出
+  ↓
+FreeKVCacheBlockQueue ← 双向链表实现的空闲块队列
 ```
 
 `KVCacheManager` 给调度器暴露的是比较干净的接口：
@@ -77,9 +82,17 @@ self.kv_cache_manager = KVCacheManager(
     kv_cache_config=kv_cache_config,
     max_model_len=self.max_model_len,
     enable_caching=self.cache_config.enable_prefix_caching,
-    ...
+    use_eagle=self.use_eagle,
+    log_stats=self.log_stats,
+    enable_kv_cache_events=self.enable_kv_cache_events,
+    dcp_world_size=self.dcp_world_size,
+    pcp_world_size=self.pcp_world_size,
+    hash_block_size=self.block_size,
+    metrics_collector=self.kv_metrics_collector,
 )
 ```
+
+`KVCacheManager` 内部会通过 `get_kv_cache_coordinator(...)` 工厂函数，根据是否启用 prefix caching 和 KV cache group 数量，选择不同的 `KVCacheCoordinator` 实现。
 
 ### 直觉公式
 
@@ -110,12 +123,13 @@ self.kv_cache_manager = KVCacheManager(
 
 在 `vllm/vllm/v1/core/kv_cache_utils.py` 里，`KVCacheBlock` 是最底层的元数据单元。
 
-它至少记录：
+它记录的字段包括：
 
-- `block_id`
-- `ref_cnt`
-- `block_hash`
-- `prev_free_block / next_free_block`
+- `block_id`：全局唯一标识，范围 0 ~ num_gpu_blocks-1
+- `ref_cnt`：引用计数
+- `_block_hash`：类型为 `BlockHashWithGroupId | None`，只有完整且已缓存的 block 才有
+- `prev_free_block / next_free_block`：双向链表指针，只由 `FreeKVCacheBlockQueue` 操作
+- `is_null`：标记 null block（不应被缓存的特殊 block）
 
 也就是说，一个 block 既是：
 
@@ -123,7 +137,15 @@ self.kv_cache_manager = KVCacheManager(
 - 又是 prefix cache 的可缓存对象
 - 同时还是 free queue 里的链表节点
 
-### 2. block pool
+### 2. BlockPool
+
+当前仓库已把 block pool 抽取为独立模块 `vllm/vllm/v1/core/block_pool.py`。
+
+`BlockPool` 管理着：
+
+- `FreeKVCacheBlockQueue`：空闲块队列
+- `BlockHashToBlockMap`：hash → block 的缓存映射（用于 prefix caching）
+- block 的分配、缓存、逐出和释放
 
 启动时会一次性创建整池 block，而不是按需 new Python 对象。
 这样做的原因很工程化：
@@ -178,29 +200,75 @@ computed_blocks, num_cached_tokens = kv_cache_manager.get_computed_blocks(reques
 
 ### 阶段 2：为真正需要推进的 token 申请 slot
 
-真正的重头戏在：
+真正的重头戏在 `KVCacheManager.allocate_slots(...)`。源码里有一段非常直观的 block layout 注释，展示了不同 token 段的关系：
 
-```python
-kv_cache_manager.allocate_slots(...)
+```text
+----------------------------------------------------------------------
+| < comp > | < new_comp > | < ext_comp >  | < new >  | < lookahead > |
+----------------------------------------------------------------------
+                                          |   < to be computed >     |
+----------------------------------------------------------------------
+                          |            < to be allocated >           |
+----------------------------------------------------------------------
+                          | < to be cached (roughly) >  |
+----------------------------------------------------------------------
 ```
 
-它会做几件事：
+各缩写含义：
 
-1. 先移除 sliding window 等场景下已经不再需要的块
-2. 计算本轮到底需要分配多少新块
-3. 如果空闲块不够，直接返回 `None`
-4. 如果存在 prefix cache 命中的 block，先把这些已算好的 block 接到请求上
-5. 再从 free queue 里拿出真正的新块
-6. 如果有完整 block 达到可缓存状态，再调用 `cache_blocks()` 写回缓存
+| 缩写 | 含义 |
+|------|------|
+| `comp` | `request.num_computed_tokens`，已经算过并持有 block 的 token |
+| `new_comp` | `num_new_computed_tokens`，本轮 prefix cache 新命中的 token |
+| `ext_comp` | `num_external_computed_tokens`，KV connector 远端命中的 token |
+| `new` | `num_new_tokens`，本轮要真正计算的新 token（含未验证的 draft token）|
+| `lookahead` | `num_lookahead_tokens`，speculative decoding 的前瞻 token |
 
-它处理的不只是“新 token”本身，还会统一考虑：
+### 分配的三个阶段
 
-- 已经命中的本地缓存 token
-- 来自 connector 的远端已算 token
-- speculative decoding 的 lookahead token
-- encoder-decoder cross-attention 需要的额外 token
+源码把 `allocate_slots` 拆成明确的三个阶段：
 
-所以这个接口虽然名字简单，实际上是 V1 内存管理的汇合点。
+**阶段 A：释放不再需要的旧块**
+
+比如在 sliding window 场景下，已经滑出窗口的 block 不再被注意力访问，可以提前释放来腾出空间。
+
+**阶段 B：处理 prefix token（comp + new_comp + ext_comp）**
+
+- 把新命中的缓存 block 接到请求上（通过 `coordinator.allocate_new_computed_blocks`）
+- 为远端 KV（ext_comp）分配对应 block
+- 释放 sliding window 之外的不需要的 prefix block
+
+**阶段 C：为要计算的 token 分配新块（new + lookahead）**
+
+- 调用 `coordinator.allocate_new_blocks` 从 `BlockPool` 的空闲队列获取新 block
+- 如果空闲块不够，返回 `None`（调度器据此触发抢占）
+- 如果有新的完整 block 生成，通过 `coordinator.cache_blocks()` 写入 prefix cache
+
+这个接口虽然名字简单，实际上是 V1 内存管理的汇合点——它统一处理本地缓存、远端缓存、speculative decoding 和 encoder-decoder cross-attention 的 block 分配。
+
+---
+
+## 10.5 KVCacheCoordinator：三种策略
+
+当前仓库的 `get_kv_cache_coordinator()` 工厂函数会根据配置选择三种不同的 coordinator：
+
+| Coordinator | 适用场景 | 特点 |
+|-------------|---------|------|
+| `KVCacheCoordinatorNoPrefixCache` | prefix caching 未启用 | 最简单，不做 hash、不查缓存 |
+| `UnitaryKVCacheCoordinator` | 只有 1 个 KV cache group | 纯 attention 模型的标准路径 |
+| `HybridKVCacheCoordinator` | 多个 KV cache group | 混合模型（如 attention + mamba）|
+
+选择逻辑：
+
+```python
+if not enable_caching:
+    return KVCacheCoordinatorNoPrefixCache(...)
+if len(kv_cache_config.kv_cache_groups) == 1:
+    return UnitaryKVCacheCoordinator(...)
+return HybridKVCacheCoordinator(...)
+```
+
+每个 coordinator 内部持有一组 `SingleTypeKVCacheManager`，每个 manager 负责一种 KV cache group 的 block 管理。coordinator 负责协调多个 manager 之间的一致性。
 
 ### 阶段 3：请求完成后释放
 
@@ -222,7 +290,7 @@ kv_cache_manager.free(request)
 
 ---
 
-## 10.5 前缀缓存在当前实现里怎么落地？
+## 10.6 前缀缓存在当前实现里怎么落地？
 
 本章重点是内存管理，但前缀缓存已经和它绑死了，所以必须一起看。
 
@@ -274,7 +342,7 @@ block_hash = hash(parent_hash, block_tokens, extra_hashes)
 
 ---
 
-## 10.6 抢占时，当前 V1 为什么不走 CPU swap？
+## 10.7 抢占时，当前 V1 为什么不走 CPU swap？
 
 这是本章最需要“用源码纠偏”的地方。
 
@@ -322,7 +390,7 @@ block_hash = hash(parent_hash, block_tokens, extra_hashes)
 
 ---
 
-## 10.7 如何估算容量？
+## 10.8 如何估算容量？
 
 ### 一个够用的工程估算式
 
@@ -373,22 +441,26 @@ def estimate_max_concurrent(
 
 ---
 
-## 10.8 源码阅读地图
+## 10.9 源码阅读地图
 
 | 主题 | 关键文件 | 重点关注 |
 |------|----------|----------|
 | 启动时计算 KV 容量 | `vllm/vllm/v1/engine/core.py` | `_initialize_kv_caches()` |
 | 内存管理外观接口 | `vllm/vllm/v1/core/kv_cache_manager.py` | `get_computed_blocks` / `allocate_slots` / `free` |
+| 协调器层 | `vllm/vllm/v1/core/kv_cache_coordinator.py` | `KVCacheCoordinator` 及其子类 |
+| block pool 和 prefix cache | `vllm/vllm/v1/core/block_pool.py` | `BlockPool`、`BlockHashToBlockMap` |
 | block 元数据和 free queue | `vllm/vllm/v1/core/kv_cache_utils.py` | `KVCacheBlock`、`FreeKVCacheBlockQueue` |
 | 前缀缓存设计文档 | `vllm/docs/design/prefix_caching.md` | hash 组成、LRU、append-only block table |
 | 调度器如何使用内存管理 | `vllm/vllm/v1/core/sched/scheduler.py` | waiting/running 两段分配逻辑 |
 
 推荐顺序：
 
-1. 先看 `KVCacheBlock`
-2. 再看 `KVCacheManager.allocate_slots()`
-3. 接着看 `Scheduler.schedule()` 在 waiting 路径里怎么调用它
-4. 最后看 prefix caching 设计文档，把 hash 和 LRU 的设计补上
+1. 先看 `KVCacheBlock`（kv_cache_utils.py）
+2. 再看 `BlockPool`（block_pool.py），理解底层 block 管理
+3. 然后看 `KVCacheCoordinator`（kv_cache_coordinator.py），理解多 group 协调
+4. 再看 `KVCacheManager.allocate_slots()`，理解对外接口
+5. 接着看 `Scheduler.schedule()` 在 waiting 路径里怎么调用它
+6. 最后看 prefix caching 设计文档，把 hash 和 LRU 的设计补上
 
 ---
 
@@ -396,9 +468,9 @@ def estimate_max_concurrent(
 
 | 概念 | 当前仓库中的真实实现 |
 |------|----------------------|
-| 内存管理核心类 | `KVCacheManager`，不是旧资料里的 `BlockSpaceManager` |
-| 空闲块管理 | block pool + 双向链表 free queue |
-| 前缀缓存 | 只缓存完整 block，按 hash 复用 |
+| 内存管理核心类 | `KVCacheManager` → `KVCacheCoordinator` → `BlockPool` 三层架构 |
+| 空闲块管理 | `BlockPool` + `FreeKVCacheBlockQueue`（双向链表） |
+| 前缀缓存 | 只缓存完整 block，通过 `BlockHashToBlockMap` 按 hash 复用 |
 | 抢占恢复 | `PREEMPTED + recompute` 为主 |
 | 关键瓶颈 | block 数不够时，会直接传导到调度器抢占和 TTFT/TPOT 波动 |
 

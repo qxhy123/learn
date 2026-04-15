@@ -179,7 +179,52 @@ Iter 5: [D₁, D₂, D₃, D₄_new]         ← P 的 prefill 完成，开始 d
 
 ---
 
-## 8.4 吞吐分析
+## 8.4 连续批处理在 V1 源码中的落点
+
+上面的"每次 iteration"在当前仓库中直接对应 `EngineCore.step()`：
+
+```python
+def step(self):
+    scheduler_output = self.scheduler.schedule()              # 1. 调度
+    future = self.model_executor.execute_model(               # 2. 前向
+        scheduler_output, non_block=True)
+    grammar_output = self.scheduler.get_grammar_bitmask(...)  # 3. 结构化输出
+    model_output = future.result()                            # 4. 等待结果
+    if model_output is None:
+        model_output = self.model_executor.sample_tokens(     # 5. 采样
+            grammar_output)
+    engine_core_outputs = self.scheduler.update_from_output(  # 6. 更新状态
+        scheduler_output, model_output)
+    return engine_core_outputs
+```
+
+每次调用就是一个 iteration。V1 的连续批处理正是通过 `scheduler.schedule()` 实现的：
+
+- `schedule()` 先遍历 `self.running`，为仍在 decode 的请求分配下一步预算
+- 然后遍历 `self.waiting`，把等待中的新请求接纳进来
+- 两种请求的 token 共享同一份 `token_budget`
+
+`update_from_output()` 处理完成后：
+
+- 已到达 stop 条件的请求会被标为 `FINISHED_*` 并从 running 移除
+- 释放的 KV block 和 batch 预算立刻可被下一轮 `schedule()` 使用
+
+这就是为什么"请求完成后立即释放资源给新请求"不是框架外层做的，而是**内置在调度-执行-更新的主循环中**。
+
+### Chunked Prefill 在调度器中的实现
+
+Chunked prefill 不是 model runner 的行为，而是调度器层面的决策。当一个新请求进入 waiting 流程时：
+
+1. 调度器检查 `enable_chunked_prefill` 和 `long_prefill_token_threshold`
+2. 如果 prompt 长度超过阈值，只分配 threshold 数量的 token 预算
+3. 请求被标记为 `is_prefill_chunk = True`
+4. 下一轮 `schedule()` 时，该请求仍在 running 队列中，继续推进剩余 token
+
+所以 chunked prefill 的本质是：**调度器故意不一次给完 token 预算，让 prefill 分多轮完成**。
+
+---
+
+## 8.5 吞吐分析
 
 ### 为什么连续批处理能提升吞吐？
 
@@ -216,7 +261,7 @@ Iter 5: [D₁, D₂, D₃, D₄_new]         ← P 的 prefill 完成，开始 d
 
 ---
 
-## 8.5 延迟的影响
+## 8.6 延迟的影响
 
 ### TTFT（首 Token 延迟）
 

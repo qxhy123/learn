@@ -350,7 +350,8 @@ extra_body = {
 | 请求如何维护 block hash | `vllm/vllm/v1/request.py` | `update_block_hashes()` |
 | prefix cache 查询 | `vllm/vllm/v1/core/kv_cache_manager.py` | `get_computed_blocks()` |
 | block 分配与缓存写回 | `vllm/vllm/v1/core/kv_cache_manager.py` | `allocate_slots()` |
-| block 元数据 / free queue | `vllm/vllm/v1/core/kv_cache_utils.py` | `KVCacheBlock`、LRU |
+| block pool 和 hash map | `vllm/vllm/v1/core/block_pool.py` | `BlockPool`、`BlockHashToBlockMap` |
+| block 元数据 / free queue | `vllm/vllm/v1/core/kv_cache_utils.py` | `KVCacheBlock`、`FreeKVCacheBlockQueue` |
 | 设计文档 | `vllm/docs/design/prefix_caching.md` | hash 规则、逐出、隔离 |
 
 ---

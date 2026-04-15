@@ -18,7 +18,7 @@
 
 ## 18.1 从 Logits 到 Token
 
-### 基本流程
+### 基本流程（概念版）
 
 ```
 模型输出 logits → 变换/过滤 → 概率分布 → 采样 → token
@@ -30,6 +30,42 @@
 5. softmax: 转为概率分布
 6. 采样: 从概率分布中选择一个 token
 ```
+
+### V1 源码里的真实 9 步 Pipeline
+
+上面是简化版。当前仓库 `vllm/vllm/v1/sample/sampler.py` 的 `Sampler` 类的 docstring 明确写了完整的 9 步：
+
+```text
+1. 如果需要 logprobs：
+   a) raw_logprobs 模式：先算 logprobs 作为最终返回值
+   b) raw_logits 模式：克隆 logits 作为最终返回值
+2. 转 float32
+3. 应用 allowed_token_ids 白名单（结构化输出的 bitmask 在这里生效）
+4. 应用 bad_words 排除
+5. 应用"会影响 greedy 结果"的 logit processors：
+   a) min_tokens processor（强制最小生成长度）
+   b) logit_bias processor
+6. 应用惩罚：
+   a) repetition_penalty
+   b) frequency_penalty
+   c) presence_penalty
+7. 采样：
+   a) 如果不是全随机，先做 greedy（argmax）
+   b) 应用 temperature
+   c) 应用 min_p（argmax-invariant 的 logit processor）
+   d) 应用 top_k / top_p
+   e) 从概率分布中随机采样
+   f) 根据 temperature 决定最终用 greedy 还是随机结果
+8. 收集 top logprobs 和 sampled token 的 logprob
+9. 返回 SamplerOutput
+```
+
+这里有几个和教程简化版不同的关键点：
+
+- **步骤 3 和 4**：结构化输出的 bitmask 和 bad_words 在 temperature 之前就已应用
+- **步骤 5 vs 6 的顺序**：min_tokens / logit_bias 在惩罚之前
+- **步骤 7a**：即使是随机采样，也会先做一次 greedy 作为 fallback——当 temperature 极小时直接用 greedy 结果
+- **logprobs 用的是原始 logits**：V1 的 logprobs 基于变换前的 logits，而不是采样后的概率，这和 V0 不同
 
 ---
 
@@ -241,6 +277,47 @@ params = SamplingParams(
     max_tokens=1,
 )
 ```
+
+---
+
+## 18.7 V1 采样器的工程实现细节
+
+### TopKTopPSampler 的多后端支持
+
+当前仓库的 `TopKTopPSampler`（`v1/sample/ops/topk_topp_sampler.py`）根据平台自动选择实现：
+
+| 平台 | 实现 | 说明 |
+|------|------|------|
+| CUDA + FlashInfer | `forward_cuda` | 需要 `VLLM_USE_FLASHINFER_SAMPLER=1` 显式开启 |
+| CUDA + Triton | `forward_native` | 默认 CUDA 路径 |
+| ROCm + aiter | `forward_rocm_aiter` | AMD 加速路径 |
+| CPU | `forward_cpu` | CPU fallback |
+
+### 采样和 logprobs 的分离
+
+V1 的一个重要设计决策是：**logprobs 基于原始 logits 计算，而不是采样后的概率分布**。
+
+这意味着如果你请求了 `logprobs=5`，返回的 top-5 logprobs 反映的是模型的"原始置信度"，而不是经过 temperature、top-p、penalties 后的分布。这和一些其他推理框架不同。
+
+### 结构化输出在采样中的位置
+
+结构化输出的 token bitmask 在 pipeline 的**步骤 3**生效——即在 allowed_token_ids 白名单阶段。这意味着：
+
+1. 不合法 token 在 temperature 缩放之前就被屏蔽
+2. 后续的 top-k/top-p 只会在合法 token 集合上操作
+3. 这保证了结构化约束的绝对性——不管采样参数怎么设，输出都不会违反 grammar
+
+### 源码对照
+
+| 主题 | 关键文件 |
+|------|----------|
+| V1 采样器主逻辑 | `vllm/vllm/v1/sample/sampler.py` |
+| TopK/TopP 实现 | `vllm/vllm/v1/sample/ops/topk_topp_sampler.py` |
+| Penalties 实现 | `vllm/vllm/v1/sample/ops/penalties.py` |
+| Bad words 处理 | `vllm/vllm/v1/sample/ops/bad_words.py` |
+| Logits processor 接口 | `vllm/vllm/v1/sample/logits_processor/` |
+| 采样元数据 | `vllm/vllm/v1/sample/metadata.py` |
+| GPU 侧采样（worker） | `vllm/vllm/v1/worker/gpu/sample/` |
 
 ---
 
