@@ -52,8 +52,11 @@
 | $e^{ix}$ | 复指数，描述旋转与振荡 |
 | $z=re^{i\theta}$ | 复数极形式，其中 $r$ 为模长，$\theta$ 为辐角 |
 | $\sinh,\cosh,\tanh$ | 双曲正弦、双曲余弦、双曲正切 |
+| $\text{arsinh},\text{arcosh},\text{artanh}$ | 反双曲函数，可用对数表示 |
 | $e^A$ | 矩阵指数 |
 | $\operatorname{LSE}(x_1,\dots,x_n)$ | log-sum-exp，常写作 $\log(e^{x_1}+\cdots+e^{x_n})$ |
+| $\mathcal{L}\{f\}$ 或 $F(s)$ | Laplace 变换 |
+| $\mathcal{F}\{f\}$ 或 $\hat{f}(\omega)$ | Fourier 变换 |
 
 ---
 
