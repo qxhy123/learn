@@ -151,10 +151,11 @@ $ python -m harness.evaluate --task my_task
 |------|------|------|
 | Python | 3.11+ | 推荐 3.12 |
 | lm-evaluation-harness | 0.4.x | EleutherAI 评估框架 |
-| DeepEval | 1.x | AI 系统评估框架 |
-| RAGAS | 0.2.x | RAG 评估框架 |
-| LangGraph | 0.3.x | Agent 编排框架 |
-| Langfuse | 2.x | 可观测性平台 |
+| DeepEval | 3.x | AI 系统评估框架 |
+| RAGAS | 0.4.x | RAG 评估框架 |
+| LangGraph | 1.1.x | Agent 编排框架 |
+| Langfuse | 4.x | 可观测性平台（v4 重写版） |
+| CrewAI | 1.14.x | 多 Agent 协作框架（已脱离 LangChain） |
 | OpenAI Agents SDK | 1.x | OpenAI 官方 Agent 框架 |
 
 AI 工程领域的工具链演进极快。本教程注重概念和架构层面的知识——这些知识的半衰期远长于具体 API。当具体工具的 API 发生变化时，核心设计理念仍然适用。

@@ -61,7 +61,7 @@
 |------|------|----------|----------|
 | 第15章 | [单 Agent Harness 设计](./part4-orchestration-harness/15-single-agent-harness.md) | 单 Agent 的 Harness 骨架（输入验证/Prompt 管理/工具注册/输出解析/重试策略）、状态机模式 | 从零构建一个结构清晰的单 Agent Harness |
 | 第16章 | [OpenAI Harness 蓝图](./part4-orchestration-harness/16-openai-harness-blueprint.md) | OpenAI 百万行代码实验的 Harness 架构、Agents SDK 的设计理念、Handoff 模式、Guardrails 集成 | 用 OpenAI Agents SDK 实现一个多步任务 Harness |
-| 第17章 | [多 Agent Harness 架构](./part4-orchestration-harness/17-multi-agent-harness.md) | Anthropic 多 Agent 架构模式（委托/路由/并行）、LangGraph 状态图、AutoGen 对话模式、Agent 间通信协议 | 实现一个多 Agent 协作 Harness |
+| 第17章 | [多 Agent Harness 架构](./part4-orchestration-harness/17-multi-agent-harness.md) | Anthropic 多 Agent 架构模式（Planner/Generator/Evaluator）、GAN 式反馈循环、Sub-agent 协调与冲突解决 | 实现一个多 Agent 协作 Harness |
 | 第18章 | [长时运行 Agent Harness](./part4-orchestration-harness/18-long-running-agent-harness.md) | 长任务的特殊挑战（超时/检查点/恢复/人类介入）、持久化执行引擎、异步 Harness 模式 | 构建一个支持检查点和恢复的长时运行 Harness |
 | 第19章 | [RAG 生产系统 Harness](./part4-orchestration-harness/19-rag-production-harness.md) | RAG 系统的完整 Harness（索引管线/检索链/生成链/缓存/回退策略）、混合检索编排、查询路由 | 搭建一个生产级 RAG Harness |
 

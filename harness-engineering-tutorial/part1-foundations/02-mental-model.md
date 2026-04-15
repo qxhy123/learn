@@ -221,7 +221,7 @@ class Orchestrator:
 │  Framework (框架)                                            │
 │  ├── 通用的代码库/SDK                                        │
 │  ├── 提供构建 agent 的积木                                   │
-│  └── 例：LangChain, CrewAI, Anthropic Agent SDK              │
+│  └── 例：LangGraph, CrewAI, Anthropic Agent SDK               │
 │                                                              │
 │  Scaffold (脚手架)                                           │
 │  ├── 项目模板或起步代码                                      │

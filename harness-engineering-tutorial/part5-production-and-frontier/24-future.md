@@ -109,7 +109,7 @@ class ModelAgnosticHarness:
 ```
 2025 年的 AI 工程工具链：
 
-编排:        LangChain / LlamaIndex / CrewAI / Autogen
+编排:        LangGraph / CrewAI / MS Agent Framework / OpenAI Agents SDK
 评估:        DeepEval / Ragas / Braintrust / HELM
 可观测性:    Langfuse / Arize / Galileo / Weights & Biases
 部署:        Modal / Replicate / Together AI
@@ -538,7 +538,7 @@ AutoHarness 能做的：                  AutoHarness 做不好的：
         │ - Anthropic  │ │ - DeepEval   │ │ - OTel for  │
         │   Agent SDK  │ │   深度使用   │ │   LLM       │
         │ - CrewAI /   │ │ - 评估集构建 │ │ - K8s AI    │
-        │   Autogen    │ │   方法论     │ │   Workloads │
+        │   LangGraph  │ │   方法论     │ │   Workloads │
         │ - Tool use   │ │ - Human eval │ │ - 成本优化  │
         │   最佳实践   │ │   设计       │ │   高级技术  │
         └──────────────┘ └──────────────┘ └──────────────┘

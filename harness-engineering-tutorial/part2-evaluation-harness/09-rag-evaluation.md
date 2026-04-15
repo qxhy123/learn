@@ -452,38 +452,37 @@ metrics = [
 results = evaluate([test_case], metrics)
 ```
 
-### 9.5.3 RAGAS 示例
+### 9.5.3 RAGAS 示例（v0.4+ API）
 
 ```python
 from ragas import evaluate as ragas_evaluate
-from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    context_precision,
-    context_recall,
-)
-from datasets import Dataset
+from ragas.metrics import Faithfulness, ResponseRelevancy, ContextPrecision, ContextRecall
+from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
 
-# 准备数据（RAGAS 使用 HF Dataset 格式）
-data = {
-    "question": ["公司的年假政策是什么？"],
-    "answer": ["员工入职满一年后享有 10 天年假，满五年后 15 天。"],
-    "contexts": [[
-        "根据公司员工手册第 5.2 条，员工入职满一年后享有 10 天带薪年假。"
-        "入职满五年后，年假增加至 15 天。年假需提前两周申请。"
-    ]],
-    "ground_truth": ["入职满一年享有10天年假，满五年15天年假。"],
-}
-dataset = Dataset.from_dict(data)
+# 准备数据（RAGAS v0.4+ 使用 SingleTurnSample + EvaluationDataset）
+samples = [
+    SingleTurnSample(
+        user_input="公司的年假政策是什么？",
+        response="员工入职满一年后享有 10 天年假，满五年后 15 天。",
+        retrieved_contexts=[
+            "根据公司员工手册第 5.2 条，员工入职满一年后享有 10 天带薪年假。"
+            "入职满五年后，年假增加至 15 天。年假需提前两周申请。"
+        ],
+        reference="入职满一年享有10天年假，满五年15天年假。",
+    )
+]
+dataset = EvaluationDataset(samples=samples)
 
 # 运行评估
 result = ragas_evaluate(
     dataset=dataset,
-    metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+    metrics=[Faithfulness(), ResponseRelevancy(), ContextPrecision(), ContextRecall()],
 )
 print(result)
-# {'faithfulness': 0.95, 'answer_relevancy': 0.88, ...}
+# {faithfulness: 0.95, response_relevancy: 0.88, ...}
 ```
+
+> **注意**：RAGAS v0.4 相对 v0.3 有重大 API 变更——`ground_truths`（列表）改为 `reference`（字符串），`question/answer` 改为 `user_input/response`，指标类从小写实例改为大写类实例化。详见 [迁移指南](https://docs.ragas.io/en/stable/howtos/migrations/migrate_from_v03_to_v04/)。
 
 ### 9.5.4 框架选择决策树
 

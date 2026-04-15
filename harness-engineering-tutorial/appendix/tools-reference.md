@@ -38,8 +38,8 @@
 |------|------|----------|----------|
 | **LangGraph** | LangChain 生态的有状态 Agent 编排框架 | 复杂 Agent 工作流、有状态对话、人类介入循环 | https://github.com/langchain-ai/langgraph |
 | **OpenAI Agents SDK** | OpenAI 官方的 Agent 构建框架 | Agent 编排、Handoff 模式、Guardrails 集成 | https://github.com/openai/openai-agents-python |
-| **AutoGen** | Microsoft 的多 Agent 对话框架 | 多 Agent 协作、角色扮演、群聊编排 | https://github.com/microsoft/autogen |
-| **CrewAI** | 基于角色的多 Agent 协作框架 | 团队式 Agent 编排、任务分配、顺序/并行执行 | https://github.com/crewAIInc/crewAI |
+| **Microsoft Agent Framework** | Microsoft 企业级 Agent 编排 SDK（AutoGen + Semantic Kernel 统一后继） | 企业级多 Agent 编排、多模型支持、A2A/MCP 互操作 | https://devblogs.microsoft.com/agent-framework/ |
+| **CrewAI** | 独立的多 Agent 协作框架（v1.14+，已脱离 LangChain） | 团队式 Agent 编排、任务分配、顺序/并行执行 | https://github.com/crewAIInc/crewAI |
 | **Claude Agent SDK** | Anthropic 的 Agent 构建框架 | Claude 模型的 Agent 编排、工具使用 | https://github.com/anthropics/claude-code-sdk |
 | **Semantic Kernel** | Microsoft 的 AI 编排 SDK | 企业级 AI 集成、插件系统、多模型编排 | https://github.com/microsoft/semantic-kernel |
 | **DSPy** | 声明式 LLM 编程框架 | Prompt 优化、模块化 LLM 管线、自动调优 | https://github.com/stanfordnlp/dspy |
@@ -47,10 +47,10 @@
 
 ### 选型建议
 
-- **有状态工作流**：LangGraph 最灵活，支持复杂的状态图
-- **多 Agent 对话**：AutoGen 的对话模式最成熟
-- **快速原型**：CrewAI 上手最快，适合简单的多 Agent 场景
-- **企业集成**：Semantic Kernel 的企业级特性最完善
+- **有状态工作流**：LangGraph（v1.1+）最灵活，支持复杂的状态图
+- **企业级 Agent**：Microsoft Agent Framework 1.0 统一了 AutoGen 和 Semantic Kernel
+- **快速原型**：CrewAI（v1.14+）上手最快，完全独立无需 LangChain
+- **声明式 Agent**：OpenAI Agents SDK 定义 Agent 指令和工具，框架处理编排
 
 ---
 
