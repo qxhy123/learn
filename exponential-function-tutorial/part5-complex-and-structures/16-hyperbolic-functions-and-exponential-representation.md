@@ -249,7 +249,44 @@ $$
 
 ---
 
-## 16.5 例题：从定义直接算
+## 16.5 反双曲函数
+
+双曲函数的反函数可以用对数表示——这再次体现了指数与对数的反向关系。
+
+### 反双曲正弦
+
+$\sinh x$ 在 $\mathbb{R}$ 上严格递增，反函数为：
+
+$$\text{arsinh}\,x = \ln(x + \sqrt{x^2+1}), \quad x \in \mathbb{R}$$
+
+**推导**：设 $y = \sinh x = \frac{e^x - e^{-x}}{2}$，令 $t = e^x > 0$，则 $2y = t - 1/t$，即 $t^2 - 2yt - 1 = 0$。解得 $t = y + \sqrt{y^2+1}$（取正根），故 $x = \ln(y + \sqrt{y^2+1})$。
+
+### 反双曲余弦
+
+$\cosh x$ 在 $[0, +\infty)$ 上递增，反函数为：
+
+$$\text{arcosh}\,x = \ln(x + \sqrt{x^2-1}), \quad x \geq 1$$
+
+### 反双曲正切
+
+$\tanh x$ 在 $\mathbb{R}$ 上严格递增且值域 $(-1, 1)$，反函数为：
+
+$$\text{artanh}\,x = \frac{1}{2}\ln\frac{1+x}{1-x}, \quad |x| < 1$$
+
+### 常见双曲函数积分
+
+| 积分 | 结果 |
+|------|------|
+| $\int \sinh x\,dx$ | $\cosh x + C$ |
+| $\int \cosh x\,dx$ | $\sinh x + C$ |
+| $\int \tanh x\,dx$ | $\ln(\cosh x) + C$ |
+| $\int \text{sech}^2 x\,dx$ | $\tanh x + C$ |
+| $\int \frac{dx}{\sqrt{x^2+1}}$ | $\text{arsinh}\,x + C = \ln(x+\sqrt{x^2+1}) + C$ |
+| $\int \frac{dx}{\sqrt{x^2-1}}$ | $\text{arcosh}\,x + C$（$x > 1$） |
+
+---
+
+## 16.6 例题：从定义直接算
 
 **问题**：求 $\sinh 0$ 与 $\cosh 0$。
 

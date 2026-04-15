@@ -35,6 +35,11 @@
 | $\displaystyle e=\lim_{n\to\infty}\left(1+\frac1n\right)^n$ | 自然常数定义 |
 | $\displaystyle \lim_{n\to\infty}\left(1+\frac{x}{n}\right)^n=e^x$ | 连续增长极限 |
 | $\ln x \ll x^\alpha \ll a^x$ | 对数、幂、指数的增长层级 |
+| $\displaystyle\lim_{h\to 0}\frac{e^h-1}{h}=1$ | 指数函数在0处的变化率 |
+| $\displaystyle\lim_{h\to 0}\frac{a^h-1}{h}=\ln a$ | 一般指数的变化率 |
+| $e^x \geq 1+x$（$\forall x$） | 指数函数的切线不等式（凸性） |
+| $e^x \approx 1+x$（$|x| \ll 1$） | 一阶近似，误差 $O(x^2)$ |
+| $e^x \approx 1+x+\frac{x^2}{2}$（$|x|$ 较小） | 二阶近似，误差 $O(x^3)$ |
 
 ---
 
@@ -72,6 +77,11 @@
 | $\sinh x=\dfrac{e^x-e^{-x}}{2}$ | 双曲正弦 |
 | $\cosh x=\dfrac{e^x+e^{-x}}{2}$ | 双曲余弦 |
 | $\cosh^2x-\sinh^2x=1$ | 双曲恒等式 |
+| $\tanh x=\dfrac{\sinh x}{\cosh x}=\dfrac{e^x-e^{-x}}{e^x+e^{-x}}$ | 双曲正切 |
+| $(\sinh x)'=\cosh x$，$(\cosh x)'=\sinh x$ | 双曲函数导数 |
+| $\text{arsinh}\,x=\ln(x+\sqrt{x^2+1})$ | 反双曲正弦 |
+| $\text{arcosh}\,x=\ln(x+\sqrt{x^2-1})$ | 反双曲余弦（$x \geq 1$） |
+| $\text{artanh}\,x=\frac{1}{2}\ln\frac{1+x}{1-x}$ | 反双曲正切（$|x|<1$） |
 
 ---
 
@@ -81,6 +91,11 @@
 |------|------|
 | $e^A=I+A+\dfrac{A^2}{2!}+\cdots$ | 矩阵指数定义 |
 | $\mathbf{x}'=A\mathbf{x}\Rightarrow \mathbf{x}(t)=e^{At}\mathbf{x}(0)$ | 线性系统解形式 |
+| $e^{O}=I$ | 零矩阵的指数 |
+| $(e^A)^{-1}=e^{-A}$ | 矩阵指数总可逆 |
+| $\det(e^A)=e^{\text{tr}(A)}$ | Jacobi 公式 |
+| $e^{PAP^{-1}}=Pe^AP^{-1}$ | 相似不变性 |
+| $e^{A+B}=e^Ae^B$ **仅当** $AB=BA$ | 注意：一般不成立！ |
 
 ---
 
