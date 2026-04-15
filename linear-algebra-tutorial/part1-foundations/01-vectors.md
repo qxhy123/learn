@@ -320,6 +320,48 @@ $$\mathbf{u} \cdot \mathbf{v} = 0$$
 
 ---
 
+## 1.5 叉积（向量积）
+
+内积的结果是**标量**，叉积（Cross Product）的结果是**向量**，且仅在 $\mathbb{R}^3$ 中定义。
+
+### 叉积的定义
+
+设 $\mathbf{u} = (u_1, u_2, u_3)^T$，$\mathbf{v} = (v_1, v_2, v_3)^T$，则叉积定义为：
+
+$$\mathbf{u} \times \mathbf{v} = \begin{vmatrix} \mathbf{e}_1 & \mathbf{e}_2 & \mathbf{e}_3 \\ u_1 & u_2 & u_3 \\ v_1 & v_2 & v_3 \end{vmatrix} = \begin{pmatrix} u_2 v_3 - u_3 v_2 \\ u_3 v_1 - u_1 v_3 \\ u_1 v_2 - u_2 v_1 \end{pmatrix}$$
+
+### 叉积的几何意义
+
+1. **方向**：$\mathbf{u} \times \mathbf{v}$ 同时垂直于 $\mathbf{u}$ 和 $\mathbf{v}$（右手法则确定方向）
+2. **大小**：$\|\mathbf{u} \times \mathbf{v}\| = \|\mathbf{u}\| \|\mathbf{v}\| \sin\theta$，等于以 $\mathbf{u}, \mathbf{v}$ 为边的**平行四边形面积**
+
+### 叉积的性质
+
+| 性质 | 公式 |
+|------|------|
+| **反交换律** | $\mathbf{u} \times \mathbf{v} = -(\mathbf{v} \times \mathbf{u})$ |
+| 分配律 | $\mathbf{u} \times (\mathbf{v} + \mathbf{w}) = \mathbf{u} \times \mathbf{v} + \mathbf{u} \times \mathbf{w}$ |
+| 标量结合 | $(c\mathbf{u}) \times \mathbf{v} = c(\mathbf{u} \times \mathbf{v})$ |
+| 自叉为零 | $\mathbf{u} \times \mathbf{u} = \mathbf{0}$ |
+
+**注意**：叉积**不满足结合律**：$(\mathbf{u} \times \mathbf{v}) \times \mathbf{w} \neq \mathbf{u} \times (\mathbf{v} \times \mathbf{w})$。
+
+### 混合积与体积
+
+**标量三重积**：$\mathbf{u} \cdot (\mathbf{v} \times \mathbf{w})$ 的绝对值等于以 $\mathbf{u}, \mathbf{v}, \mathbf{w}$ 为棱的**平行六面体体积**：
+
+$$\mathbf{u} \cdot (\mathbf{v} \times \mathbf{w}) = \begin{vmatrix} u_1 & u_2 & u_3 \\ v_1 & v_2 & v_3 \\ w_1 & w_2 & w_3 \end{vmatrix}$$
+
+该值为零当且仅当三个向量共面（线性相关）。
+
+**例 1.8** 求 $\mathbf{u} = (1, 2, 3)^T$ 与 $\mathbf{v} = (4, 5, 6)^T$ 的叉积。
+
+$$\mathbf{u} \times \mathbf{v} = \begin{pmatrix} 2 \cdot 6 - 3 \cdot 5 \\ 3 \cdot 4 - 1 \cdot 6 \\ 1 \cdot 5 - 2 \cdot 4 \end{pmatrix} = \begin{pmatrix} -3 \\ 6 \\ -3 \end{pmatrix}$$
+
+验证正交性：$\mathbf{u} \cdot (\mathbf{u} \times \mathbf{v}) = 1(-3) + 2(6) + 3(-3) = 0$ ✓
+
+---
+
 ## 本章小结
 
 本章从几何直觉出发，建立了向量的代数体系，并引入了内积这一核心工具。

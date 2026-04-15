@@ -18,6 +18,12 @@ $$\langle \mathbf{u}, \mathbf{v} \rangle = \mathbf{u} \cdot \mathbf{v} = \sum_{i
 
 **矩阵形式**：$\langle \mathbf{u}, \mathbf{v} \rangle = \mathbf{u}^T \mathbf{v}$
 
+### 叉积（仅 $\mathbb{R}^3$）
+
+$$\mathbf{u} \times \mathbf{v} = \begin{pmatrix} u_2v_3 - u_3v_2 \\ u_3v_1 - u_1v_3 \\ u_1v_2 - u_2v_1 \end{pmatrix}, \quad \|\mathbf{u} \times \mathbf{v}\| = \|\mathbf{u}\|\|\mathbf{v}\|\sin\theta$$
+
+**标量三重积**：$\mathbf{u} \cdot (\mathbf{v} \times \mathbf{w}) = \det[\mathbf{u}\ \mathbf{v}\ \mathbf{w}]$（平行六面体体积）
+
 ### 向量范数
 
 **2-范数（欧几里得范数）**：
@@ -177,6 +183,17 @@ $$\dim(V) = \text{rank}(A)$$
 
 $$\dim(\ker(A)) + \dim(\text{Im}(A)) = n$$
 
+### 秩的不等式
+
+- $\text{rank}(AB) \leq \min(\text{rank}(A), \text{rank}(B))$
+- Sylvester：$\text{rank}(A) + \text{rank}(B) - n \leq \text{rank}(AB)$
+- $\text{rank}(A + B) \leq \text{rank}(A) + \text{rank}(B)$
+- $\text{rank}(A^TA) = \text{rank}(A) = \text{rank}(A^T)$
+
+### Sherman-Morrison 公式
+
+$(A + \mathbf{u}\mathbf{v}^T)^{-1} = A^{-1} - \dfrac{A^{-1}\mathbf{u}\mathbf{v}^T A^{-1}}{1 + \mathbf{v}^T A^{-1}\mathbf{u}}$
+
 即：$\text{nullity}(A) + \text{rank}(A) = n$
 
 ### 四个基本子空间
@@ -244,6 +261,16 @@ $$p(\lambda) = \det(A - \lambda I) = (-1)^n(\lambda^n - \text{tr}(A)\lambda^{n-1
 - $A$ 可逆 $\Leftrightarrow$ 所有特征值非零
 - $A^k$ 的特征值是 $\lambda^k$
 - $A^{-1}$ 的特征值是 $\frac{1}{\lambda}$
+
+### Cayley-Hamilton 定理
+
+矩阵满足自身的特征多项式：若 $p(\lambda) = \det(\lambda I - A)$，则 $p(A) = O$。
+
+二阶情形：$A^2 - \text{tr}(A) \cdot A + \det(A) \cdot I = O$
+
+### 正交矩阵
+
+$Q^TQ = QQ^T = I$（$Q^{-1} = Q^T$），保持内积、范数和夹角，$\det(Q) = \pm 1$，$\kappa(Q) = 1$。
 
 ### 对角化
 

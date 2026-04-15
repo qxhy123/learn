@@ -234,6 +234,37 @@ $$\text{Null}(A) = \text{span}\!\left(\begin{pmatrix} -1 \\ -1 \\ 1 \end{pmatrix
 
 这与定理一致：零空间是一维的（$\mathbb{R}^3$ 中的一条直线）。
 
+### 秩的重要不等式
+
+以下是秩的常用不等式，在证明和计算中非常有用。设 $A$ 为 $m \times n$ 矩阵，$B$ 为 $n \times p$ 矩阵。
+
+**1. 乘积的秩不等式**：
+
+$$\text{rank}(AB) \leq \min(\text{rank}(A), \text{rank}(B))$$
+
+**直觉**：线性映射的复合不会增加像的维数。
+
+**2. Sylvester 秩不等式**（下界）：
+
+$$\boxed{\text{rank}(A) + \text{rank}(B) - n \leq \text{rank}(AB)}$$
+
+**证明思路**：由零化度不等式 $\text{nullity}(AB) \leq \text{nullity}(A) + \text{nullity}(B)$ 及秩-零化度定理推出。
+
+**3. 秩一更新**：若 $\mathbf{u}, \mathbf{v}$ 为非零向量，则 $|\text{rank}(A + \mathbf{u}\mathbf{v}^T) - \text{rank}(A)| \leq 1$。
+
+**4. 其他常用不等式**：
+
+| 不等式 | 条件 |
+|--------|------|
+| $\text{rank}(A + B) \leq \text{rank}(A) + \text{rank}(B)$ | 秩的次可加性 |
+| $\text{rank}(A^T A) = \text{rank}(A)$ | 恒成立 |
+| $\text{rank}(A) = \text{rank}(A^T)$ | 行秩 = 列秩 |
+| $\text{rank}(PAQ) = \text{rank}(A)$ | $P, Q$ 可逆 |
+
+**例题** 设 $A$ 为 $3 \times 5$ 矩阵，$B$ 为 $5 \times 4$ 矩阵，$\text{rank}(A) = 3$，$\text{rank}(B) = 4$。求 $\text{rank}(AB)$ 的范围。
+
+**解**：上界 $\text{rank}(AB) \leq \min(3, 4) = 3$。Sylvester 下界 $\text{rank}(AB) \geq 3 + 4 - 5 = 2$。故 $2 \leq \text{rank}(AB) \leq 3$。
+
 ---
 
 ## 12.4 子空间的交与和

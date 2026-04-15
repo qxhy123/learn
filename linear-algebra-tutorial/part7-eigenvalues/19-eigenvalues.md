@@ -310,6 +310,41 @@ $$A^k\mathbf{v} = \lambda^k\mathbf{v}$$
 
 ---
 
+## 19.6 Cayley-Hamilton 定理
+
+### 19.6.1 定理陈述
+
+**定理（Cayley-Hamilton）** 设 $A$ 是 $n \times n$ 矩阵，$p(\lambda) = \det(\lambda I - A)$ 是其特征多项式，则：
+
+$$\boxed{p(A) = O}$$
+
+即**每个方阵都满足自身的特征多项式**。这里将 $\lambda$ 替换为矩阵 $A$，常数项 $c_0$ 替换为 $c_0 I$。
+
+### 19.6.2 二阶矩阵的验证
+
+设 $A = \begin{pmatrix} a & b \\ c & d \end{pmatrix}$，特征多项式为：
+
+$$p(\lambda) = \lambda^2 - (a+d)\lambda + (ad - bc) = \lambda^2 - \text{tr}(A)\lambda + \det(A)$$
+
+Cayley-Hamilton 定理断言：
+
+$$A^2 - \text{tr}(A) \cdot A + \det(A) \cdot I = O$$
+
+**例** $A = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$，$\text{tr}(A) = 5$，$\det(A) = -2$。
+
+$A^2 = \begin{pmatrix} 7 & 10 \\ 15 & 22 \end{pmatrix}$，验证：$A^2 - 5A + (-2)I = \begin{pmatrix} 7-5-2 & 10-10 \\ 15-15 & 22-20-2 \end{pmatrix} = O$ ✓
+
+### 19.6.3 应用
+
+1. **求逆矩阵**：由 $A^2 - \text{tr}(A)A + \det(A)I = O$，若 $\det(A) \neq 0$：
+   $$A^{-1} = \frac{1}{\det(A)}[\text{tr}(A) \cdot I - A]$$
+
+2. **化简矩阵高次幂**：任何 $A^k$（$k \geq n$）都可以表示为 $I, A, A^2, \ldots, A^{n-1}$ 的线性组合。对 $n$ 阶矩阵，只需保留 $n-1$ 次以下的项。
+
+3. **矩阵函数计算**：结合多项式取余，可以计算 $e^A$、$\sin(A)$ 等矩阵函数。
+
+---
+
 ## 本章小结
 
 - **特征方程** $A\mathbf{v} = \lambda\mathbf{v}$：特征向量 $\mathbf{v}$ 在矩阵作用下只改变幅度，方向不变（或反向）；特征值 $\lambda$ 是缩放比例。

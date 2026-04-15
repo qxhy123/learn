@@ -231,6 +231,32 @@ $$\begin{pmatrix} A_{11} & A_{12} \\ A_{21} & A_{22} \end{pmatrix} \begin{pmatri
 
 ---
 
+## 3.6 矩阵的迹
+
+### 迹的定义
+
+方阵 $A \in \mathbb{R}^{n \times n}$ 的**迹**（Trace）定义为对角元素之和：
+
+$$\text{tr}(A) = \sum_{i=1}^{n} a_{ii}$$
+
+### 迹的性质
+
+| 性质 | 公式 | 说明 |
+|------|------|------|
+| 线性性 | $\text{tr}(aA + bB) = a\,\text{tr}(A) + b\,\text{tr}(B)$ | |
+| 转置不变 | $\text{tr}(A^T) = \text{tr}(A)$ | |
+| **循环置换不变性** | $\text{tr}(ABC) = \text{tr}(BCA) = \text{tr}(CAB)$ | 最重要的性质 |
+| 乘积交换 | $\text{tr}(AB) = \text{tr}(BA)$ | 循环置换的特例 |
+| 与特征值 | $\text{tr}(A) = \sum_i \lambda_i$ | 所有特征值之和 |
+| 与Frobenius范数 | $\|A\|_F^2 = \text{tr}(A^T A)$ | |
+| 内积表示 | $\mathbf{x}^T A \mathbf{x} = \text{tr}(A\mathbf{x}\mathbf{x}^T)$ | 矩阵微积分常用 |
+
+**注意**：循环置换不变性要求维度兼容，且只能**循环移位**，不能任意重排：$\text{tr}(ABC) \neq \text{tr}(ACB)$（一般不等）。
+
+**迹在矩阵微积分中的核心作用**：矩阵求导中的"迹技巧"（Trace Trick）可以将标量表达式写成迹的形式以方便求导，在第24章中详细应用。
+
+---
+
 ## 本章小结
 
 | 运算 | 条件 | 结果形状 | 是否满足交换律 |

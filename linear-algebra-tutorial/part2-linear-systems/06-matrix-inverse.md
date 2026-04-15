@@ -215,6 +215,33 @@ $$\mathbf{x} = A^{-1}\mathbf{b} = \begin{pmatrix} 7 & -3 & 1 \\ -4 & 2 & -1 \\ 2
 
 ---
 
+## 6.5 矩阵求逆引理
+
+### Sherman-Morrison 公式
+
+若 $A$ 可逆，$\mathbf{u}, \mathbf{v}$ 为列向量，且 $1 + \mathbf{v}^T A^{-1} \mathbf{u} \neq 0$，则：
+
+$$\boxed{(A + \mathbf{u}\mathbf{v}^T)^{-1} = A^{-1} - \frac{A^{-1}\mathbf{u}\mathbf{v}^T A^{-1}}{1 + \mathbf{v}^T A^{-1}\mathbf{u}}}$$
+
+**意义**：当矩阵发生**秩1更新**（$A \to A + \mathbf{u}\mathbf{v}^T$）时，逆矩阵可以**增量更新**，无需重新计算，复杂度从 $O(n^3)$ 降为 $O(n^2)$。
+
+### Woodbury 公式（一般化）
+
+将秩1更新推广为秩 $k$ 更新。若 $A \in \mathbb{R}^{n \times n}$ 可逆，$U \in \mathbb{R}^{n \times k}$，$C \in \mathbb{R}^{k \times k}$ 可逆，$V \in \mathbb{R}^{k \times n}$，则：
+
+$$(A + UCV)^{-1} = A^{-1} - A^{-1}U(C^{-1} + VA^{-1}U)^{-1}VA^{-1}$$
+
+**关键**：右侧只需求逆一个 $k \times k$ 的小矩阵 $C^{-1} + VA^{-1}U$（而非 $n \times n$）。
+
+### 应用场景
+
+- **在线学习**：每收到一个新样本，协方差矩阵发生秩1更新，用 Sherman-Morrison 增量更新逆
+- **Kalman 滤波**：状态估计中的协方差矩阵更新
+- **自然梯度**：Fisher 信息矩阵的近似求逆
+- **岭回归**：$(X^TX + \lambda I)^{-1}$ 在 $\lambda$ 变化时的高效更新
+
+---
+
 ## 本章小结
 
 | 概念 | 核心内容 |

@@ -310,6 +310,28 @@ $$\text{tr}(A) = \sum_{i=1}^n a_{ii} = \sum_{i=1}^n \lambda_i$$
 
 行列式和迹分别是特征多项式的常数项（取绝对值）和一次项系数，是矩阵最基本的两个不变量。
 
+### 分块矩阵的行列式与 Schur 补
+
+对分块矩阵 $M = \begin{pmatrix} A & B \\ C & D \end{pmatrix}$，当 $A$ 可逆时：
+
+$$\det(M) = \det(A) \cdot \det(D - CA^{-1}B)$$
+
+其中 $S = D - CA^{-1}B$ 称为 $A$ 的 **Schur 补**（Schur Complement）。
+
+类似地，当 $D$ 可逆时：$\det(M) = \det(D) \cdot \det(A - BD^{-1}C)$。
+
+**特殊情形**：
+
+1. **分块三角矩阵**：若 $C = O$（或 $B = O$），则 $\det(M) = \det(A) \cdot \det(D)$
+2. **$2 \times 2$ 分块对角**：$\det\begin{pmatrix} A & O \\ O & D \end{pmatrix} = \det(A) \cdot \det(D)$
+
+**Schur 补的应用**：
+
+- **正定性判别**：$M \succ 0$ 当且仅当 $A \succ 0$ 且 $S = D - CA^{-1}B \succ 0$
+- **分块矩阵求逆**：利用 Schur 补可以将大矩阵求逆化为小矩阵求逆
+- **条件概率**：多元正态分布的条件分布公式中，条件协方差正是 Schur 补
+- **半定规划（SDP）**：约束条件常表述为 Schur 补的正定性
+
 ---
 
 ## 本章小结
