@@ -24,6 +24,22 @@ $$
 \frac{d}{dx}\ln x=\frac1x\qquad (x>0)
 $$
 
+**从定义推导**：
+
+$$
+\frac{d}{dx}\ln x = \lim_{h\to 0}\frac{\ln(x+h)-\ln x}{h} = \lim_{h\to 0}\frac{1}{h}\ln\frac{x+h}{x} = \lim_{h\to 0}\frac{1}{h}\ln\left(1+\frac{h}{x}\right)
+$$
+
+令 $t = h/x$（当 $h\to 0$ 时 $t\to 0$），则：
+
+$$
+= \lim_{t\to 0}\frac{1}{xt}\ln(1+t) = \frac{1}{x}\lim_{t\to 0}\frac{\ln(1+t)}{t} = \frac{1}{x}\cdot 1 = \frac{1}{x}
+$$
+
+其中用到了基本极限 $\lim_{t\to 0}\frac{\ln(1+t)}{t} = 1$（见第12章补充）。
+
+这个结果的意义深远：它说明 $\ln x$ 的变化率与 $x$ 成反比——$x$ 越大，同样的增量对 $\ln x$ 的影响越小。这正是"尺度压缩"的微积分表达。
+
 由换底公式
 
 $$

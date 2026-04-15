@@ -64,7 +64,42 @@
 
 ---
 
-## 6. 增长比较
+## 6. 重要极限
+
+| 极限 | 结果 | 说明 |
+|------|------|------|
+| $\lim_{x\to 0}\dfrac{\ln(1+x)}{x}$ | $1$ | 对数的基本极限，导数推导的基础 |
+| $\lim_{x\to +\infty}\dfrac{\ln x}{x}$ | $0$ | 对数增长慢于线性 |
+| $\lim_{x\to +\infty}\dfrac{\ln x}{x^\alpha}$ | $0$（$\alpha > 0$） | 对数慢于任意正幂 |
+| $\lim_{n\to\infty}\left(1+\dfrac{1}{n}\right)^n$ | $e$ | $e$ 的极限定义 |
+| $\lim_{x\to 0}\dfrac{a^x - 1}{x}$ | $\ln a$ | 指数函数在0处的变化率 |
+
+---
+
+## 7. 重要近似
+
+| 近似 | 条件 | 误差阶 |
+|------|------|--------|
+| $\ln(1+x) \approx x$ | $\|x\| \ll 1$ | $O(x^2)$ |
+| $\ln(1+x) \approx x - \dfrac{x^2}{2}$ | $\|x\|$ 较小 | $O(x^3)$ |
+| $\ln n! \approx n\ln n - n$ | $n$ 较大 | Stirling 近似 |
+| $\ln n! \approx n\ln n - n + \frac{1}{2}\ln(2\pi n)$ | $n$ 较大 | 精确 Stirling |
+
+---
+
+## 8. 常见积分
+
+| 积分 | 结果 | 方法 |
+|------|------|------|
+| $\int \dfrac{1}{x}\,dx$ | $\ln\|x\| + C$ | 基本公式 |
+| $\int \ln x\,dx$ | $x\ln x - x + C$ | 分部积分 |
+| $\int x^n\ln x\,dx$ | $\frac{x^{n+1}}{n+1}\ln x - \frac{x^{n+1}}{(n+1)^2} + C$ | 分部积分 |
+| $\int \dfrac{\ln x}{x}\,dx$ | $\frac{(\ln x)^2}{2} + C$ | 令 $u = \ln x$ |
+| $\int \dfrac{f'(x)}{f(x)}\,dx$ | $\ln\|f(x)\| + C$ | 识别 $u'/u$ 结构 |
+
+---
+
+## 9. 增长比较
 
 | 结论 | 含义 | 备注 |
 |------|------|------|
@@ -76,7 +111,7 @@
 
 ---
 
-## 7. 概率、信息与计算
+## 10. 概率、信息与计算
 
 | 公式 | 含义 | 备注 |
 |------|------|------|
@@ -84,11 +119,12 @@
 | $H(X)=-\sum p_i\log p_i$ | 熵 | 底数为 2 常用 bit，底数为 $e$ 常用 nat |
 | $H(p,q)=-\sum p_i\log q_i$ | 交叉熵 | 要求 $q_i>0$ 在 $p_i>0$ 的位置上成立 |
 | $\ell(\theta)=\sum_i \log p(x_i\mid\theta)$ | 对数似然 | 把概率连乘变成求和 |
+| $D_{\mathrm{KL}}(p \| q) = \sum p_i\log\dfrac{p_i}{q_i}$ | KL 散度 | $= H(p,q) - H(p) \geq 0$ |
 | $\log\sum_i e^{x_i}=m+\log\sum_i e^{x_i-m}$ | `log-sum-exp` 稳定形式 | 取 $m=\max_i x_i$ 最稳定 |
 
 ---
 
-## 8. 复对数
+## 11. 复对数
 
 | 公式 | 含义 | 备注 |
 |------|------|------|
