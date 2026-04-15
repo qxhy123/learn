@@ -89,21 +89,29 @@ $$
 
 ---
 
-## 22.5 例题：同频不同相位叠加
+## 22.5 例题：同频不同相位叠加（完整计算）
 
-设
+**问题**：求 $\cos t + \cos\left(t+\frac{\pi}{3}\right)$ 的合成结果。
 
-$$
-\cos t+\cos\left(t+\frac\pi3\right)
-$$
+**方法一：和差化积**
 
-可先用和差化积，也可以直接看成两个同频向量的叠加。 
-两种方法都说明：
+$$\cos t + \cos\left(t+\frac{\pi}{3}\right) = 2\cos\frac{t+(t+\pi/3)}{2}\cos\frac{t-(t+\pi/3)}{2}$$
 
-- 叠加后的频率不变
-- 但振幅和相位会改变
+$$= 2\cos\left(t+\frac{\pi}{6}\right)\cos\left(-\frac{\pi}{6}\right) = 2\cos\frac{\pi}{6}\cos\left(t+\frac{\pi}{6}\right) = \sqrt{3}\cos\left(t+\frac{\pi}{6}\right)$$
 
-这类题是相量思想最直观的入口。
+**方法二：相量法**
+
+将两个余弦波视为复平面上的向量：$\mathbf{V}_1 = 1\angle 0°$ 和 $\mathbf{V}_2 = 1\angle 60°$。
+
+$$\mathbf{V}_1 + \mathbf{V}_2 = (1+\cos 60°) + i\sin 60° = \frac{3}{2} + i\frac{\sqrt{3}}{2}$$
+
+合成振幅：$A = \sqrt{(3/2)^2+(\sqrt{3}/2)^2} = \sqrt{3}$
+
+合成相位：$\varphi = \arctan\frac{\sqrt{3}/2}{3/2} = \arctan\frac{1}{\sqrt{3}} = \frac{\pi}{6}$
+
+结果：$\sqrt{3}\cos(t+\pi/6)$。两种方法完全一致。
+
+**要点**：相量法在同频叠加中特别高效——把三角运算转为向量加法。当叠加超过2个波时，相量法的优势更加明显。
 
 ---
 

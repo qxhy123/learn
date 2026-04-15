@@ -90,7 +90,35 @@ $$
 
 ---
 
-## 23.5 与复数旋转的统一
+## 23.5 三维旋转矩阵
+
+在三维中，绕坐标轴的旋转由以下矩阵描述：
+
+**绕 $z$ 轴旋转** $\theta$（$xy$ 平面内旋转，$z$ 不变）：
+
+$$R_z(\theta) = \begin{pmatrix} \cos\theta & -\sin\theta & 0 \\ \sin\theta & \cos\theta & 0 \\ 0 & 0 & 1 \end{pmatrix}$$
+
+**绕 $x$ 轴旋转** $\theta$：
+
+$$R_x(\theta) = \begin{pmatrix} 1 & 0 & 0 \\ 0 & \cos\theta & -\sin\theta \\ 0 & \sin\theta & \cos\theta \end{pmatrix}$$
+
+**绕 $y$ 轴旋转** $\theta$：
+
+$$R_y(\theta) = \begin{pmatrix} \cos\theta & 0 & \sin\theta \\ 0 & 1 & 0 \\ -\sin\theta & 0 & \cos\theta \end{pmatrix}$$
+
+**性质**：所有旋转矩阵都是正交矩阵（$R^TR = I$），且 $\det R = 1$。
+
+**组合旋转**：绕不同轴依次旋转等价于矩阵乘积。但三维旋转**不满足交换律**：$R_x(\alpha)R_z(\beta) \neq R_z(\beta)R_x(\alpha)$。
+
+### 例题：将 $(1, 0, 0)$ 绕 $z$ 轴旋转 $90°$
+
+$$R_z(90°)\begin{pmatrix}1\\0\\0\end{pmatrix} = \begin{pmatrix}0&-1&0\\1&0&0\\0&0&1\end{pmatrix}\begin{pmatrix}1\\0\\0\end{pmatrix} = \begin{pmatrix}0\\1\\0\end{pmatrix}$$
+
+$x$ 轴上的点转到了 $y$ 轴上，符合直觉。
+
+---
+
+## 23.6 与复数旋转的统一
 
 在复平面里，乘以
 
