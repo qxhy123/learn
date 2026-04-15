@@ -177,6 +177,20 @@ $$(1+x)^\alpha = 1 + \alpha x + \frac{\alpha(\alpha-1)}{2!}x^2 + \frac{\alpha(\a
 
 一般项为：$\dfrac{\alpha(\alpha-1)\cdots(\alpha-n+1)}{n!}x^n$（广义二项式系数 $\binom{\alpha}{n}$）
 
+**广义二项式系数**：对于任意实数 $\alpha$ 和正整数 $n$，定义
+
+$$\binom{\alpha}{n} = \frac{\alpha(\alpha-1)(\alpha-2)\cdots(\alpha-n+1)}{n!}$$
+
+并约定 $\binom{\alpha}{0} = 1$。当 $\alpha$ 为正整数 $m$ 时，$\binom{m}{n}$ 在 $n > m$ 时为零，退化为通常的二项式系数，展开式变为有限项（即经典的二项式定理）。
+
+**推导过程**：设 $f(x) = (1+x)^\alpha$，逐阶求导：
+- $f(0) = 1$
+- $f'(x) = \alpha(1+x)^{\alpha-1}$，故 $f'(0) = \alpha$
+- $f''(x) = \alpha(\alpha-1)(1+x)^{\alpha-2}$，故 $f''(0) = \alpha(\alpha-1)$
+- 一般地，$f^{(n)}(x) = \alpha(\alpha-1)\cdots(\alpha-n+1)(1+x)^{\alpha-n}$，故 $f^{(n)}(0) = \alpha(\alpha-1)\cdots(\alpha-n+1)$
+
+代入 Maclaurin 公式即得展开式。当 $\alpha$ 为非负整数 $m$ 时，$f^{(m+1)}(x) = 0$，故展开式在 $n = m$ 项后终止，成为有限和 $\sum_{n=0}^{m}\binom{m}{n}x^n$。
+
 **特例**：
 - $\alpha = -1$：$\dfrac{1}{1+x} = 1 - x + x^2 - x^3 + \cdots + (-1)^n x^n + o(x^n)$
 - $\alpha = \frac{1}{2}$：$\sqrt{1+x} = 1 + \dfrac{x}{2} - \dfrac{x^2}{8} + \dfrac{x^3}{16} - \cdots$

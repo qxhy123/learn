@@ -266,6 +266,76 @@ $$S = \frac{1}{2}\oint_L x\,dy - y\,dx = \frac{1}{2}\int_0^{2\pi} [a\cos t \cdot
 
 $$= \frac{1}{2}\int_0^{2\pi} ab(\cos^2 t + \sin^2 t)\,dt = \frac{ab}{2}\int_0^{2\pi} 1\,dt = \pi ab$$
 
+### 20.3.5 多连通区域的 Green 公式
+
+前面讨论的 Green 公式适用于单连通区域（无"洞"的区域）。对于**多连通区域**（有一个或多个洞的区域），需要将公式作适当推广。
+
+**多连通区域的 Green 公式**：设 $D$ 是由外边界 $L_0$（正向，逆时针）和内边界 $L_1, L_2, \ldots, L_k$（正向，**顺时针**，即使区域 $D$ 始终在边界的左侧）所围成的多连通区域。若 $P$、$Q$ 在 $D$（含所有边界）上有连续的一阶偏导数，则
+
+$$\iint_D \left(\frac{\partial Q}{\partial x} - \frac{\partial P}{\partial y}\right) dx\,dy = \oint_{L_0} P\,dx + Q\,dy + \sum_{i=1}^{k} \oint_{L_i} P\,dx + Q\,dy$$
+
+其中所有边界曲线都取**正向**（区域 $D$ 在边界的左侧）。
+
+**注意**：对于多连通区域的正向规定——外边界取逆时针方向，内边界取顺时针方向。
+
+**割线法（挖洞法）的基本思想**：
+
+当被积函数 $P$、$Q$ 在区域的"洞"内（即某个内边界包围的区域内）不满足条件（例如存在奇点）时，不能直接对整个区域应用 Green 公式。此时可用**割线法**：
+
+1. 在区域内作一条（或多条）割线，连接外边界和内边界，将多连通区域切割为单连通区域
+2. 对切割后的单连通区域应用 Green 公式
+3. 由于割线被经过了两次（方向相反），其上的积分互相抵消
+
+等价地，可以用另一种直观的方法：**挖洞法**。在奇点周围作一个包含奇点的小闭曲线 $l$（通常取以奇点为圆心的小圆），利用 Green 公式将原积分转化为在这个小曲线上的积分。
+
+**几何直观**：割线法的实质是将多连通区域的"洞"用割线"缝合"，使之变为单连通区域，从而可以使用标准的 Green 公式。
+
+> **例题 20.7** 计算 $\oint_C \dfrac{-y\,dx + x\,dy}{x^2+y^2}$，其中 $C$ 是包围原点的任意一条正向简单闭曲线。
+
+**解**：设 $P = \dfrac{-y}{x^2+y^2}$，$Q = \dfrac{x}{x^2+y^2}$。
+
+首先验证：当 $(x,y) \neq (0,0)$ 时，
+
+$$\frac{\partial P}{\partial y} = \frac{-(x^2+y^2) + y \cdot 2y}{(x^2+y^2)^2} = \frac{y^2 - x^2}{(x^2+y^2)^2}$$
+
+$$\frac{\partial Q}{\partial x} = \frac{(x^2+y^2) - x \cdot 2x}{(x^2+y^2)^2} = \frac{y^2 - x^2}{(x^2+y^2)^2}$$
+
+故 $\dfrac{\partial Q}{\partial x} = \dfrac{\partial P}{\partial y}$（在原点之外）。
+
+但 $P$、$Q$ 在原点没有定义（奇点），不能直接对 $C$ 围成的区域应用 Green 公式得出积分为零的结论。
+
+**挖洞法**：以原点为圆心，取充分小的圆 $l: x^2 + y^2 = \varepsilon^2$（$\varepsilon > 0$ 足够小使 $l$ 完全在 $C$ 内部），取**顺时针方向**（即 $l$ 的正向，使环形区域 $D$ 在边界左侧）。
+
+在环形区域 $D$（$C$ 与 $l$ 之间的区域）上，$P$、$Q$ 有连续偏导数且 $\dfrac{\partial Q}{\partial x} - \dfrac{\partial P}{\partial y} = 0$。
+
+由多连通区域的 Green 公式：
+
+$$0 = \iint_D 0\,dx\,dy = \oint_C P\,dx + Q\,dy + \oint_{l^-} P\,dx + Q\,dy$$
+
+其中 $l^-$ 表示 $l$ 取顺时针方向。因此
+
+$$\oint_C P\,dx + Q\,dy = -\oint_{l^-} P\,dx + Q\,dy = \oint_l P\,dx + Q\,dy$$
+
+其中 $l$ 取逆时针方向。
+
+现在计算小圆 $l$ 上的积分。将 $l$ 参数化为 $x = \varepsilon\cos t$，$y = \varepsilon\sin t$，$t$ 从 $0$ 到 $2\pi$（逆时针）：
+
+$$dx = -\varepsilon\sin t\,dt, \quad dy = \varepsilon\cos t\,dt$$
+
+$$P = \frac{-\varepsilon\sin t}{\varepsilon^2} = \frac{-\sin t}{\varepsilon}, \quad Q = \frac{\varepsilon\cos t}{\varepsilon^2} = \frac{\cos t}{\varepsilon}$$
+
+$$\oint_l P\,dx + Q\,dy = \int_0^{2\pi} \left[\frac{-\sin t}{\varepsilon} \cdot (-\varepsilon\sin t) + \frac{\cos t}{\varepsilon} \cdot \varepsilon\cos t\right] dt$$
+
+$$= \int_0^{2\pi} (\sin^2 t + \cos^2 t)\,dt = \int_0^{2\pi} 1\,dt = 2\pi$$
+
+因此
+
+$$\oint_C \frac{-y\,dx + x\,dy}{x^2+y^2} = 2\pi$$
+
+**注**：此结果与 $C$ 的具体形状无关，只要 $C$ 包围原点。这是因为 $P\,dx + Q\,dy$ 在原点之外满足 $\dfrac{\partial Q}{\partial x} = \dfrac{\partial P}{\partial y}$，故在不包含原点的区域内，积分与路径无关。但若 $C$ 不包围原点，则 $C$ 围成的区域内处处有 $\dfrac{\partial Q}{\partial x} - \dfrac{\partial P}{\partial y} = 0$，由 Green 公式直接得到积分值为 $0$。
+
+从势函数的角度看，$\dfrac{-y\,dx + x\,dy}{x^2+y^2} = d(\arctan\dfrac{y}{x})$，而 $\arctan\dfrac{y}{x}$ 是多值函数（辐角函数），沿包围原点的闭曲线绕一圈后增加 $2\pi$，这正是积分值 $2\pi$ 的来源。 $\square$
+
 ---
 
 ## 20.4 路径无关与保守场
@@ -310,7 +380,7 @@ $$u(x, y) = \int_{(x_0, y_0)}^{(x, y)} P\,dx + Q\,dy$$
 
 2. 对上式关于 $y$ 求偏导，令其等于 $Q$，解出 $\varphi(y)$
 
-> **例题 20.7** 验证 $(2x + y)\,dx + (x + 2y)\,dy$ 是全微分，并求其势函数。
+> **例题 20.8** 验证 $(2x + y)\,dx + (x + 2y)\,dy$ 是全微分，并求其势函数。
 
 **解**：$P = 2x + y$，$Q = x + 2y$。
 
@@ -338,7 +408,7 @@ $$\frac{\partial u}{\partial y} = x + \varphi'(y) = Q = x + 2y$$
 
 **解法**：若 $du = P\,dx + Q\,dy$，则方程变为 $du = 0$，其通解为 $u(x, y) = C$。
 
-> **例题 20.8** 解方程 $(3x^2 + 6xy^2)\,dx + (6x^2y + 4y^3)\,dy = 0$。
+> **例题 20.9** 解方程 $(3x^2 + 6xy^2)\,dx + (6x^2y + 4y^3)\,dy = 0$。
 
 **解**：$P = 3x^2 + 6xy^2$，$Q = 6x^2y + 4y^3$。
 

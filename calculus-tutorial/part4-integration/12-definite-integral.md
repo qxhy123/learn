@@ -339,6 +339,130 @@ $$L = \int_0^1 \sqrt{1 + x} \, dx = \frac{2}{3}(1 + x)^{3/2}\Big|_0^1 = \frac{2}
 
 $\square$
 
+### 12.5.4 旋转曲面的面积
+
+当曲线 $y = f(x)$（$a \leq x \leq b$，$f(x) \geq 0$）绕 $x$ 轴旋转时，所得旋转曲面的面积可以用定积分来计算。
+
+**公式推导**：取曲线上一小段弧，弧长微元为 $ds = \sqrt{1 + [f'(x)]^2} \, dx$。这段小弧绕 $x$ 轴旋转形成一个窄带，近似为一个圆台侧面。当弧段足够小时，圆台退化为圆环带，其面积约为
+
+$$dS = 2\pi f(x) \, ds = 2\pi f(x) \sqrt{1 + [f'(x)]^2} \, dx$$
+
+对整条曲线积分，得到**旋转曲面面积公式**：
+
+$$S = 2\pi \int_a^b |f(x)| \sqrt{1 + [f'(x)]^2} \, dx$$
+
+> **几何直观**：$2\pi f(x)$ 是旋转半径对应的圆周长，$\sqrt{1 + [f'(x)]^2} \, dx$ 是弧长微元，两者的乘积即为旋转面的面积微元。
+
+> **例题 12.16** 求曲线 $y = \sqrt{x}$（$0 \leq x \leq 1$）绕 $x$ 轴旋转所得旋转曲面的面积。
+
+**解**：$f(x) = \sqrt{x}$，$f'(x) = \dfrac{1}{2\sqrt{x}}$，$1 + [f'(x)]^2 = 1 + \dfrac{1}{4x}= \dfrac{4x + 1}{4x}$。
+
+$$S = 2\pi \int_0^1 \sqrt{x} \cdot \sqrt{\frac{4x + 1}{4x}} \, dx = 2\pi \int_0^1 \sqrt{x} \cdot \frac{\sqrt{4x + 1}}{2\sqrt{x}} \, dx = \pi \int_0^1 \sqrt{4x + 1} \, dx$$
+
+设 $u = 4x + 1$，$du = 4 \, dx$：
+
+$$S = \pi \cdot \frac{1}{4} \int_1^5 \sqrt{u} \, du = \frac{\pi}{4} \cdot \frac{2}{3} u^{3/2} \Big|_1^5 = \frac{\pi}{6}(5\sqrt{5} - 1)$$
+
+$\square$
+
+> **例题 12.17** 求球体 $x^2 + y^2 + z^2 = R^2$ 的表面积。
+
+**解**：球面可视为上半圆 $y = \sqrt{R^2 - x^2}$（$-R \leq x \leq R$）绕 $x$ 轴旋转得到。
+
+$$f(x) = \sqrt{R^2 - x^2}, \quad f'(x) = \frac{-x}{\sqrt{R^2 - x^2}}$$
+
+$$1 + [f'(x)]^2 = 1 + \frac{x^2}{R^2 - x^2} = \frac{R^2}{R^2 - x^2}$$
+
+$$S = 2\pi \int_{-R}^{R} \sqrt{R^2 - x^2} \cdot \frac{R}{\sqrt{R^2 - x^2}} \, dx = 2\pi \int_{-R}^{R} R \, dx = 2\pi R \cdot 2R = 4\pi R^2$$
+
+这正是球的表面积公式。$\square$
+
+### 12.5.5 极坐标下的定积分应用
+
+**极坐标面积公式**
+
+设平面曲线以极坐标方程 $r = r(\theta)$（$\alpha \leq \theta \leq \beta$）表示，则由射线 $\theta = \alpha$、$\theta = \beta$ 及曲线 $r = r(\theta)$ 所围成的扇形区域的面积为：
+
+$$S = \frac{1}{2} \int_\alpha^\beta r^2(\theta) \, d\theta$$
+
+> **推导**：将区间 $[\alpha, \beta]$ 分割为小角度 $d\theta$，每个小扇形的面积近似为 $\dfrac{1}{2} r^2(\theta) \, d\theta$（半径为 $r(\theta)$ 的圆的扇形面积），累加取极限即得。
+
+> **例题 12.18** 求心形线 $r = a(1 + \cos\theta)$（$a > 0$）所围区域的面积。
+
+**解**：心形线关于极轴对称，$\theta$ 从 $0$ 到 $\pi$ 扫过上半部分。
+
+$$S = 2 \cdot \frac{1}{2} \int_0^{\pi} [a(1 + \cos\theta)]^2 \, d\theta = a^2 \int_0^{\pi} (1 + \cos\theta)^2 \, d\theta$$
+
+展开：
+
+$$(1 + \cos\theta)^2 = 1 + 2\cos\theta + \cos^2\theta = 1 + 2\cos\theta + \frac{1 + \cos 2\theta}{2} = \frac{3}{2} + 2\cos\theta + \frac{\cos 2\theta}{2}$$
+
+$$S = a^2 \int_0^{\pi} \left(\frac{3}{2} + 2\cos\theta + \frac{\cos 2\theta}{2}\right) d\theta = a^2 \left[\frac{3}{2}\theta + 2\sin\theta + \frac{\sin 2\theta}{4}\right]_0^{\pi} = a^2 \cdot \frac{3\pi}{2} = \frac{3\pi a^2}{2}$$
+
+$\square$
+
+**极坐标弧长公式**
+
+设曲线的极坐标方程为 $r = r(\theta)$（$\alpha \leq \theta \leq \beta$），则曲线的弧长为：
+
+$$L = \int_\alpha^\beta \sqrt{r^2(\theta) + [r'(\theta)]^2} \, d\theta$$
+
+> **推导**：将极坐标转化为直角坐标 $x = r\cos\theta$，$y = r\sin\theta$，利用参数形式的弧长公式 $L = \int \sqrt{x'^2 + y'^2} \, d\theta$，其中 $x' = r'\cos\theta - r\sin\theta$，$y' = r'\sin\theta + r\cos\theta$，化简后 $x'^2 + y'^2 = r'^2 + r^2$。
+
+> **例题 12.19** 求阿基米德螺旋线 $r = a\theta$（$0 \leq \theta \leq 2\pi$，$a > 0$）的弧长。
+
+**解**：$r = a\theta$，$r' = a$。
+
+$$L = \int_0^{2\pi} \sqrt{a^2\theta^2 + a^2} \, d\theta = a\int_0^{2\pi} \sqrt{\theta^2 + 1} \, d\theta$$
+
+设 $\theta = \tan u$，$d\theta = \sec^2 u \, du$，$\sqrt{\theta^2 + 1} = \sec u$：
+
+$$L = a\int_0^{\arctan 2\pi} \sec^3 u \, du$$
+
+利用公式 $\int \sec^3 u \, du = \dfrac{1}{2}(\sec u \tan u + \ln|\sec u + \tan u|) + C$：
+
+$$L = \frac{a}{2}\left[\theta\sqrt{\theta^2 + 1} + \ln(\theta + \sqrt{\theta^2 + 1})\right]_0^{2\pi}$$
+
+$$= \frac{a}{2}\left[2\pi\sqrt{4\pi^2 + 1} + \ln(2\pi + \sqrt{4\pi^2 + 1})\right]$$
+
+$\square$
+
+### 12.5.6 参数方程下的应用公式
+
+当曲线以参数方程 $x = x(t)$，$y = y(t)$（$\alpha \leq t \leq \beta$）给出时，各几何量的计算公式可以统一表述。
+
+**参数形式的面积**：由曲线 $x = x(t), y = y(t)$、$x$ 轴及直线 $x = a, x = b$ 围成的面积为
+
+$$S = \int_\alpha^\beta |y(t) \cdot x'(t)| \, dt$$
+
+其中 $x(\alpha) = a$，$x(\beta) = b$（或反向，视参数方向而定）。
+
+**参数形式的弧长**（已在 12.5.3 中给出）：
+
+$$L = \int_\alpha^\beta \sqrt{[x'(t)]^2 + [y'(t)]^2} \, dt$$
+
+**参数形式的旋转体体积**：曲线绕 $x$ 轴旋转的体积为
+
+$$V_x = \pi \int_\alpha^\beta [y(t)]^2 |x'(t)| \, dt$$
+
+**参数形式的旋转曲面面积**：
+
+$$S = 2\pi \int_\alpha^\beta |y(t)| \sqrt{[x'(t)]^2 + [y'(t)]^2} \, dt$$
+
+> **例题 12.20** 求摆线 $x = a(t - \sin t)$，$y = a(1 - \cos t)$（$0 \leq t \leq 2\pi$）的一拱弧长。
+
+**解**：$x'(t) = a(1 - \cos t)$，$y'(t) = a\sin t$。
+
+$$[x'(t)]^2 + [y'(t)]^2 = a^2(1 - \cos t)^2 + a^2\sin^2 t = a^2(1 - 2\cos t + \cos^2 t + \sin^2 t) = 2a^2(1 - \cos t)$$
+
+利用半角公式 $1 - \cos t = 2\sin^2\dfrac{t}{2}$：
+
+$$\sqrt{[x']^2 + [y']^2} = a\sqrt{2 \cdot 2\sin^2\frac{t}{2}} = 2a\left|\sin\frac{t}{2}\right| = 2a\sin\frac{t}{2} \quad (0 \leq t \leq 2\pi)$$
+
+$$L = \int_0^{2\pi} 2a\sin\frac{t}{2} \, dt = 2a \cdot \left[-2\cos\frac{t}{2}\right]_0^{2\pi} = 2a \cdot [(-2)(-1) - (-2)(1)] = 2a \cdot 4 = 8a$$
+
+$\square$
+
 ---
 
 ## 本章小结
@@ -363,6 +487,9 @@ $\square$
    - 面积：$S = \int_a^b |f(x) - g(x)| \, dx$
    - 旋转体体积：$V_x = \pi \int_a^b [f(x)]^2 \, dx$
    - 弧长：$L = \int_a^b \sqrt{1 + [f'(x)]^2} \, dx$
+   - 旋转曲面面积：$S = 2\pi \int_a^b |f(x)| \sqrt{1 + [f'(x)]^2} \, dx$
+   - 极坐标面积：$S = \dfrac{1}{2} \int_\alpha^\beta r^2(\theta) \, d\theta$
+   - 极坐标弧长：$L = \int_\alpha^\beta \sqrt{r^2 + r'^2} \, d\theta$
 
 ---
 
@@ -497,6 +624,12 @@ print(f"e^{{-1}} 理论值: {np.exp(-1):.6f}")
 
 **5.** 求由曲线 $y = x^2$ 与 $y = \sqrt{x}$ 围成的图形绕 $x$ 轴旋转所得旋转体的体积。
 
+**6.** 求曲线 $y = x^3$（$0 \leq x \leq 1$）绕 $x$ 轴旋转所得旋转曲面的面积。
+
+**7.** 求双纽线 $r^2 = 2a^2\cos 2\theta$ 所围区域的面积。
+
+**8.** 求心形线 $r = 1 + \cos\theta$ 的全长。
+
 ---
 
 ## 练习答案
@@ -543,5 +676,29 @@ $$S = \int_0^1 (e^x - e^{-x}) \, dx = (e^x + e^{-x})\Big|_0^1 = (e + e^{-1}) - (
 
 $$V = \pi \int_0^1 \left[(\sqrt{x})^2 - (x^2)^2\right] dx = \pi \int_0^1 (x - x^4) \, dx$$
 $$= \pi \left[\frac{x^2}{2} - \frac{x^5}{5}\right]_0^1 = \pi \left(\frac{1}{2} - \frac{1}{5}\right) = \frac{3\pi}{10}$$
+
+---
+
+**6.** $f(x) = x^3$，$f'(x) = 3x^2$，$1 + [f'(x)]^2 = 1 + 9x^4$。
+
+$$S = 2\pi \int_0^1 x^3 \sqrt{1 + 9x^4} \, dx$$
+
+设 $u = 1 + 9x^4$，$du = 36x^3 \, dx$：
+
+$$S = 2\pi \cdot \frac{1}{36} \int_1^{10} \sqrt{u} \, du = \frac{\pi}{18} \cdot \frac{2}{3} u^{3/2}\Big|_1^{10} = \frac{\pi}{27}(10\sqrt{10} - 1)$$
+
+---
+
+**7.** 双纽线由 $r^2 = 2a^2\cos 2\theta$ 定义，仅在 $\cos 2\theta \geq 0$ 时存在，即 $\theta \in [-\pi/4, \pi/4]$ 和 $\theta \in [3\pi/4, 5\pi/4]$。利用对称性：
+
+$$S = 4 \cdot \frac{1}{2} \int_0^{\pi/4} 2a^2\cos 2\theta \, d\theta = 4a^2 \left[\frac{\sin 2\theta}{2}\right]_0^{\pi/4} = 4a^2 \cdot \frac{1}{2} = 2a^2$$
+
+---
+
+**8.** $r = 1 + \cos\theta$，$r' = -\sin\theta$。利用对称性，全长 $= 2 \int_0^{\pi} \sqrt{r^2 + r'^2} \, d\theta$。
+
+$$r^2 + r'^2 = (1 + \cos\theta)^2 + \sin^2\theta = 2 + 2\cos\theta = 4\cos^2\frac{\theta}{2}$$
+
+$$L = 2\int_0^{\pi} 2\cos\frac{\theta}{2} \, d\theta = 4 \left[2\sin\frac{\theta}{2}\right]_0^{\pi} = 4 \cdot 2 = 8$$
 
 </details>

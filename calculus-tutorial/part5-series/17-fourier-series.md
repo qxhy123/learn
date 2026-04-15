@@ -240,6 +240,38 @@ $$0 = \frac{\pi}{2} - \frac{4}{\pi} \sum_{k=0}^{\infty} \frac{1}{(2k+1)^2}$$
 
 $$\sum_{k=0}^{\infty} \frac{1}{(2k+1)^2} = 1 + \frac{1}{9} + \frac{1}{25} + \frac{1}{49} + \cdots = \frac{\pi^2}{8}$$
 
+### 17.3.4 Gibbs现象
+
+在跳跃间断点附近，Fourier级数的部分和表现出一种特殊的行为，称为**Gibbs现象**。
+
+**现象描述**：设 $f(x)$ 在 $x_0$ 处有跳跃间断点，跳跃量为 $d = f(x_0^+) - f(x_0^-)$。则 $f(x)$ 的 Fourier 级数的第 $N$ 项部分和 $S_N(x)$ 在 $x_0$ 附近总会出现**过冲**（overshoot），且无论 $N$ 取多大，过冲的幅度始终约为跳跃量的 $9\%$。
+
+更精确地说，部分和在间断点附近的最大值超过 $f(x_0^+)$ 约 $0.089d$，最小值低于 $f(x_0^-)$ 约 $0.089d$。随着 $N \to \infty$，过冲的位置越来越靠近间断点，但过冲的**相对幅度不变**。
+
+**直观解释**：Fourier级数中的每一项都是连续函数，有限项的和也是连续函数，因此无法精确逼近函数的跳跃。增加项数只能使过冲变得更窄更尖，但无法消除约 $9\%$ 的过冲幅度。
+
+**实际意义**：在数字信号处理中，Gibbs现象表现为**振铃效应**（ringing artifact）。例如，对方波信号进行有限带宽传输时，接收端信号在跳变沿附近会出现振荡。这也是图像处理中JPEG压缩在高对比度边缘附近产生伪影的数学原因。
+
+### 17.3.5 复数形式的Fourier级数
+
+除了用正弦和余弦表示，Fourier级数还有更简洁的**复指数形式**。
+
+利用 Euler 公式 $e^{inx} = \cos nx + i\sin nx$，可以将三角形式的Fourier级数改写为：
+
+$$f(x) = \sum_{n=-\infty}^{\infty} c_n e^{inx}$$
+
+其中复Fourier系数为
+
+$$c_n = \frac{1}{2\pi}\int_{-\pi}^{\pi} f(x)e^{-inx}\,dx \quad (n = 0, \pm 1, \pm 2, \ldots)$$
+
+**与实数形式的关系**：复系数 $c_n$ 与实系数 $a_n, b_n$ 之间的关系为
+
+$$c_0 = \frac{a_0}{2}, \quad c_n = \frac{a_n - ib_n}{2}, \quad c_{-n} = \frac{a_n + ib_n}{2} = \overline{c_n} \quad (n \geq 1)$$
+
+当 $f(x)$ 为实值函数时，$c_{-n} = \overline{c_n}$（共轭对称）。
+
+复数形式在理论推导和信号处理中更为简洁，它将正频率和负频率统一在一个求和符号下，也是 Fourier 变换的离散版本。
+
 ---
 
 ## 17.4 正弦级数与余弦级数
@@ -326,9 +358,77 @@ $$1 = \frac{4}{\pi}\left(\sin \frac{\pi x}{l} + \frac{1}{3}\sin \frac{3\pi x}{l}
 
 ---
 
-## 17.5 Fourier级数的应用
+## 17.5 Parseval 恒等式
 
-### 17.5.1 求和公式
+### 17.5.1 定理表述
+
+**定理 17.1**（Parseval 恒等式）：设 $f(x)$ 是周期为 $2\pi$ 的可积函数，且在 $[-\pi, \pi]$ 上平方可积，其 Fourier 系数为 $a_n$、$b_n$，则
+
+$$\frac{1}{\pi} \int_{-\pi}^{\pi} [f(x)]^2 \, dx = \frac{a_0^2}{2} + \sum_{n=1}^{\infty} (a_n^2 + b_n^2)$$
+
+更一般地，对于周期为 $2l$ 的情形：
+
+$$\frac{1}{l} \int_{-l}^{l} [f(x)]^2 \, dx = \frac{a_0^2}{2} + \sum_{n=1}^{\infty} (a_n^2 + b_n^2)$$
+
+> **直观理解**：Parseval 恒等式建立了函数在"时域"（或空域）和"频域"之间的桥梁。左端 $\dfrac{1}{\pi}\int_{-\pi}^{\pi} [f(x)]^2 \, dx$ 度量的是函数的"总能量"；右端是各 Fourier 系数的平方和，即各频率分量的"能量"之和。该恒等式断言：**函数的总能量等于其各频率分量能量之和**，能量在 Fourier 分解过程中既不增加也不减少。
+
+### 17.5.2 物理意义：能量守恒
+
+在物理学和信号处理中，Parseval 恒等式具有深刻的能量守恒意义：
+
+- 对于周期信号 $f(t)$，$[f(t)]^2$ 正比于信号的瞬时功率，$\int [f(t)]^2 \, dt$ 正比于一个周期内的总能量
+- Fourier 系数 $a_n, b_n$ 描述了第 $n$ 次谐波的振幅，$a_n^2 + b_n^2 = A_n^2$ 是第 $n$ 次谐波的能量（其中 $A_n$ 是振幅）
+- Parseval 恒等式就是**时域总能量 = 频域总能量**，即信号从时域表示变换到频域表示时，能量守恒
+
+这一原理是现代信号处理和量子力学中能量谱分析的数学基础。
+
+### 17.5.3 应用举例
+
+> **例题 17.10** 利用 $f(x) = x$（$-\pi < x < \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^2}$。
+
+**解**：由例题 17.1，$f(x) = x$ 的 Fourier 系数为 $a_n = 0$（$n \geq 0$），$b_n = \dfrac{2(-1)^{n+1}}{n}$。
+
+计算左端：
+
+$$\frac{1}{\pi} \int_{-\pi}^{\pi} x^2 \, dx = \frac{1}{\pi} \cdot \frac{2\pi^3}{3} = \frac{2\pi^2}{3}$$
+
+由 Parseval 恒等式：
+
+$$\frac{2\pi^2}{3} = \frac{0}{2} + \sum_{n=1}^{\infty} \left(0 + \frac{4}{n^2}\right) = 4\sum_{n=1}^{\infty} \frac{1}{n^2}$$
+
+因此
+
+$$\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}$$
+
+这提供了 Basel 问题的另一种优雅证法。
+
+> **例题 17.11** 利用 $f(x) = x^2$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^4}$。
+
+**解**：由练习题第1题的结果，$f(x) = x^2$ 的 Fourier 系数为
+
+$$a_0 = \frac{2\pi^2}{3}, \quad a_n = \frac{4(-1)^n}{n^2} \quad (n \geq 1), \quad b_n = 0$$
+
+计算左端：
+
+$$\frac{1}{\pi} \int_{-\pi}^{\pi} x^4 \, dx = \frac{1}{\pi} \cdot \frac{2\pi^5}{5} = \frac{2\pi^4}{5}$$
+
+由 Parseval 恒等式：
+
+$$\frac{2\pi^4}{5} = \frac{1}{2}\left(\frac{2\pi^2}{3}\right)^2 + \sum_{n=1}^{\infty} \frac{16}{n^4} = \frac{2\pi^4}{9} + 16\sum_{n=1}^{\infty} \frac{1}{n^4}$$
+
+因此
+
+$$16\sum_{n=1}^{\infty} \frac{1}{n^4} = \frac{2\pi^4}{5} - \frac{2\pi^4}{9} = 2\pi^4 \cdot \frac{9 - 5}{45} = \frac{8\pi^4}{45}$$
+
+$$\sum_{n=1}^{\infty} \frac{1}{n^4} = \frac{8\pi^4}{45 \times 16} = \frac{\pi^4}{90}$$
+
+这就是著名的结果 $\zeta(4) = \dfrac{\pi^4}{90}$。
+
+---
+
+## 17.6 Fourier级数的应用
+
+### 17.6.1 求和公式
 
 利用Fourier级数在特定点的收敛值，可以求某些数项级数的和。
 
@@ -364,7 +464,7 @@ $$x = 2\sum_{n=1}^{\infty} \frac{(-1)^{n+1}}{n} \sin nx$$
 
 $$\ln 2 = 1 - \frac{1}{2} + \frac{1}{3} - \frac{1}{4} + \cdots = \sum_{n=1}^{\infty} \frac{(-1)^{n+1}}{n}$$
 
-### 17.5.2 信号分析简介
+### 17.6.2 信号分析简介
 
 Fourier级数在信号处理中有重要应用。任何周期信号都可以分解为不同频率的正弦波（谐波）的叠加。
 
@@ -399,7 +499,9 @@ $$a_n \cos n\omega t + b_n \sin n\omega t = A_n \cos(n\omega t - \varphi_n)$$
    - **奇延拓**得到正弦级数：$b_n = \dfrac{2}{l} \int_0^{l} f(x) \sin \dfrac{n\pi x}{l} \, dx$
    - **偶延拓**得到余弦级数：$a_n = \dfrac{2}{l} \int_0^{l} f(x) \cos \dfrac{n\pi x}{l} \, dx$
 
-5. **应用**：Fourier级数可用于求数项级数的和（如 $\sum \dfrac{1}{n^2} = \dfrac{\pi^2}{6}$），以及信号的频谱分析。
+5. **Parseval 恒等式**：$\dfrac{1}{\pi}\int_{-\pi}^{\pi} [f(x)]^2 \, dx = \dfrac{a_0^2}{2} + \sum_{n=1}^{\infty}(a_n^2 + b_n^2)$，表达了时域能量与频域能量的守恒关系。
+
+6. **应用**：Fourier级数可用于求数项级数的和（如 $\sum \dfrac{1}{n^2} = \dfrac{\pi^2}{6}$、$\sum \dfrac{1}{n^4} = \dfrac{\pi^4}{90}$），以及信号的频谱分析。
 
 ---
 
@@ -407,7 +509,7 @@ $$a_n \cos n\omega t + b_n \sin n\omega t = A_n \cos(n\omega t - \varphi_n)$$
 
 Fourier 分析不仅是经典数学工具，也是现代深度学习的理论基础之一。本节介绍其在神经网络中的四个核心应用场景。
 
-### 17.6.1 频域分析与 CNN
+### 17.7.1 频域分析与 CNN
 
 **卷积定理**指出，时域的卷积运算等价于频域的逐点乘法：
 
@@ -423,7 +525,7 @@ $$\mathcal{F}\{f * g\} = \mathcal{F}\{f\} \cdot \mathcal{F}\{g\}$$
 
 **CNN 的频域解释**：卷积神经网络的每个滤波器本质上是一个**频率选择器**。低频滤波器捕捉图像中的平滑结构和整体形状，高频滤波器检测边缘、纹理等细节。网络通过训练学习到不同频段的特征表示。
 
-### 17.6.2 谱归一化（Spectral Normalization）
+### 17.7.2 谱归一化（Spectral Normalization）
 
 在生成对抗网络（GAN）训练中，判别器的 Lipschitz 常数决定了训练稳定性。**谱归一化**通过限制权重矩阵的**谱范数**（最大奇异值 $\sigma_1$）来控制 Lipschitz 常数：
 
@@ -439,7 +541,7 @@ $$\|W\|_2 = \sigma_1(W) = \max_{\|x\|=1} \|Wx\|$$
 
 $$\tilde{v} \leftarrow \frac{W^\top \hat{u}}{\|W^\top \hat{u}\|}, \quad \tilde{u} \leftarrow \frac{W\tilde{v}}{\|W\tilde{v}\|}, \quad \sigma_1 \approx \hat{u}^\top W \tilde{v}$$
 
-### 17.6.3 傅里叶特征编码
+### 17.7.3 傅里叶特征编码
 
 神经网络在拟合高频信号时存在"谱偏差"（spectral bias）——网络倾向于先学习低频分量。**傅里叶特征编码**通过显式引入高频基函数来克服这一问题。
 
@@ -455,7 +557,7 @@ $$\gamma(p) = [\sin(2^0 \pi p),\ \cos(2^0 \pi p),\ \sin(2^1 \pi p),\ \cos(2^1 \p
 
 频率以 $2$ 的幂次递增，覆盖从粗到细的多个尺度，使网络能够重建细节丰富的三维场景。
 
-### 17.6.4 图神经网络的谱方法
+### 17.7.4 图神经网络的谱方法
 
 对于图 $\mathcal{G} = (V, E)$，定义**图拉普拉斯矩阵** $L = D - A$，其中 $D$ 是度矩阵，$A$ 是邻接矩阵。$L$ 是半正定矩阵，可做特征分解 $L = U \Lambda U^\top$，其中特征向量矩阵 $U$ 构成图上的"Fourier 基"。
 
@@ -471,7 +573,7 @@ $$\mathbf{x} *_{\mathcal{G}} g = U \left( (U^\top \mathbf{x}) \odot (U^\top \mat
 
 GCN（Chebyshev 近似版本）通过截断 Chebyshev 多项式展开，将谱方法转化为局部空域操作，避免了完整特征分解的 $O(n^3)$ 计算开销，成为现代图神经网络的理论基础。
 
-### 17.6.5 代码示例
+### 17.7.5 代码示例
 
 ```python
 import torch
@@ -559,6 +661,8 @@ print("频域结果:", y_freq[:len(x)])  # 截取有效部分
 
 **5.** 设 $f(x) = \begin{cases} 0, & -\pi \leq x < 0 \\ 1, & 0 \leq x \leq \pi \end{cases}$，以 $2\pi$ 为周期延拓，求其Fourier级数，并求 $\sum_{n=0}^{\infty} \dfrac{(-1)^n}{2n+1}$ 的值。
 
+**6.** 利用 $f(x) = |x|$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=0}^{\infty} \dfrac{1}{(2n+1)^4}$。
+
 ---
 
 ## 练习答案
@@ -639,5 +743,19 @@ $$1 = \frac{1}{2} + \frac{2}{\pi}\sum_{k=0}^{\infty} \frac{(-1)^k}{2k+1}$$
 $$\sum_{k=0}^{\infty} \frac{(-1)^k}{2k+1} = 1 - \frac{1}{3} + \frac{1}{5} - \frac{1}{7} + \cdots = \frac{\pi}{4}$$
 
 这就是著名的**Leibniz公式**。
+
+---
+
+**6.** 由例题 17.2，$f(x) = |x|$ 的 Fourier 系数为 $a_0 = \pi$，$a_n = 0$（$n$ 为偶数），$a_n = -\dfrac{4}{\pi n^2}$（$n$ 为奇数），$b_n = 0$。
+
+由 Parseval 恒等式：
+
+$$\frac{1}{\pi} \int_{-\pi}^{\pi} x^2 \, dx = \frac{\pi^2}{2} + \sum_{k=0}^{\infty} \frac{16}{\pi^2 (2k+1)^4}$$
+
+左端 $= \dfrac{2\pi^2}{3}$。因此
+
+$$\frac{16}{\pi^2} \sum_{k=0}^{\infty} \frac{1}{(2k+1)^4} = \frac{2\pi^2}{3} - \frac{\pi^2}{2} = \frac{\pi^2}{6}$$
+
+$$\sum_{k=0}^{\infty} \frac{1}{(2k+1)^4} = \frac{\pi^4}{96}$$
 
 </details>

@@ -145,7 +145,52 @@ $$\sqrt[n]{a_n} = \frac{n}{2n+1} = \frac{1}{2 + \frac{1}{n}} \to \frac{1}{2} < 1
 
 由根值判别法，级数收敛。
 
-### 15.2.4 p级数与几何级数
+### 15.2.4 积分判别法（Cauchy 积分判别法）
+
+**定理 15.1**（积分判别法）：设 $f(x)$ 在 $[1, +\infty)$ 上非负且单调递减，则级数 $\sum_{n=1}^{\infty} f(n)$ 与广义积分 $\int_1^{\infty} f(x) \, dx$ 同敛散。即
+
+$$\sum_{n=1}^{\infty} f(n) \text{ 收敛} \quad \Longleftrightarrow \quad \int_1^{\infty} f(x) \, dx \text{ 收敛}$$
+
+> **几何直观（面积比较）**：由于 $f(x)$ 单调递减，在区间 $[n, n+1]$ 上有 $f(n+1) \leq f(x) \leq f(n)$。对两侧积分得
+>
+> $$f(n+1) \leq \int_n^{n+1} f(x) \, dx \leq f(n)$$
+>
+> 对 $n = 1, 2, \ldots, N$ 求和：
+>
+> $$\sum_{n=2}^{N+1} f(n) \leq \int_1^{N+1} f(x) \, dx \leq \sum_{n=1}^{N} f(n)$$
+>
+> 左侧不等式说明：若积分收敛，则部分和有上界，级数收敛。右侧不等式说明：若积分发散，则部分和趋于无穷，级数发散。
+
+**积分判别法的优势**：当比值法和根值法失效（$\rho = 1$）时，积分判别法往往能给出判断。它特别适用于含对数因子的级数。
+
+> **例题 15.8** 判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n \ln n}$ 的收敛性。
+
+**解**：取 $f(x) = \dfrac{1}{x \ln x}$，在 $[2, +\infty)$ 上非负且单调递减。
+
+$$\int_2^{\infty} \frac{1}{x \ln x} \, dx = \lim_{t \to \infty} \int_2^{t} \frac{1}{x \ln x} \, dx = \lim_{t \to \infty} [\ln(\ln x)]_2^{t} = \lim_{t \to \infty} [\ln(\ln t) - \ln(\ln 2)] = +\infty$$
+
+广义积分发散，由积分判别法，级数 $\sum_{n=2}^{\infty} \dfrac{1}{n \ln n}$ **发散**。
+
+> **注**：对此级数，比值法给出 $\lim \dfrac{a_{n+1}}{a_n} = 1$（失效），但积分判别法可以明确判定。
+
+> **例题 15.9** 判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n(\ln n)^p}$ 的收敛性（$p > 0$）。
+
+**解**：取 $f(x) = \dfrac{1}{x(\ln x)^p}$，在 $[2, +\infty)$ 上非负且单调递减。
+
+$$\int_2^{\infty} \frac{1}{x(\ln x)^p} \, dx = \lim_{t \to \infty} \int_2^{t} \frac{1}{x(\ln x)^p} \, dx$$
+
+设 $u = \ln x$，$du = \dfrac{dx}{x}$：
+
+$$\int_2^{t} \frac{dx}{x(\ln x)^p} = \int_{\ln 2}^{\ln t} \frac{du}{u^p}$$
+
+- 当 $p > 1$ 时，$\int_{\ln 2}^{\infty} u^{-p} \, du = \dfrac{(\ln 2)^{1-p}}{p - 1}$ 收敛
+- 当 $p \leq 1$ 时，$\int_{\ln 2}^{\infty} u^{-p} \, du$ 发散
+
+由积分判别法：级数 $\sum_{n=2}^{\infty} \dfrac{1}{n(\ln n)^p}$ 在 $p > 1$ 时**收敛**，在 $p \leq 1$ 时**发散**。
+
+> **注**：$p = 1$ 时即为上一例的结果。此结论表明 $\dfrac{1}{n(\ln n)^p}$ 的角色类似于 p 级数 $\dfrac{1}{n^p}$，但"临界指数"依然是 $p = 1$。
+
+### 15.2.5 p级数与几何级数
 
 **p级数**：$\sum_{n=1}^{\infty} \dfrac{1}{n^p}$ 在 $p > 1$ 时收敛，在 $p \leq 1$ 时发散。
 
@@ -275,6 +320,7 @@ $$\left(\sum_{n=0}^{\infty} x^n\right)^2 = \sum_{n=0}^{\infty} (n+1)x^n = \frac{
    - **比较判别法**：与已知敛散性的级数比较
    - **比值判别法**：$\lim \dfrac{a_{n+1}}{a_n} < 1$ 收敛，$> 1$ 发散
    - **根值判别法**：$\lim \sqrt[n]{a_n} < 1$ 收敛，$> 1$ 发散
+   - **积分判别法**：$f(x)$ 非负递减时，$\sum f(n)$ 与 $\int_1^\infty f(x) \, dx$ 同敛散
 
 3. **交错级数**满足莱布尼茨条件（单调递减趋于零）时收敛，余项估计 $|R_n| \leq a_{n+1}$。
 
@@ -434,6 +480,10 @@ def train_with_gradient_clipping(model, optimizer, loss_fn, x, y, max_norm=1.0):
 
 **5.** ⭐⭐⭐ 设 $\sum_{n=1}^{\infty} a_n$ 绝对收敛，证明 $\sum_{n=1}^{\infty} a_n^2$ 也收敛。
 
+**6.** ⭐⭐ 用积分判别法判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n(\ln n)^2}$ 的收敛性。
+
+**7.** ⭐⭐ 用积分判别法判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n \ln n \cdot \ln(\ln n)}$ 的收敛性。
+
 ---
 
 ## 练习答案
@@ -490,5 +540,21 @@ $$\sqrt[n]{a_n} = \frac{n+1}{3n} = \frac{1}{3}\left(1 + \frac{1}{n}\right) \to \
 由比较判别法，$\sum_{n=N+1}^{\infty} a_n^2$ 收敛。
 
 加上有限项 $\sum_{n=1}^{N} a_n^2$ 不影响收敛性，故 $\sum_{n=1}^{\infty} a_n^2$ 收敛。 $\square$
+
+---
+
+**6.** 取 $f(x) = \dfrac{1}{x(\ln x)^2}$，这是例题 15.9 中 $p = 2 > 1$ 的情形。
+
+$$\int_2^{\infty} \frac{dx}{x(\ln x)^2} = \left[-\frac{1}{\ln x}\right]_2^{\infty} = 0 - \left(-\frac{1}{\ln 2}\right) = \frac{1}{\ln 2}$$
+
+广义积分收敛，由积分判别法，级数**收敛**。
+
+---
+
+**7.** 取 $f(x) = \dfrac{1}{x \ln x \cdot \ln(\ln x)}$，设 $u = \ln(\ln x)$：
+
+$$\int_3^{\infty} \frac{dx}{x \ln x \cdot \ln(\ln x)} = \int_{\ln(\ln 3)}^{\infty} \frac{du}{u} = +\infty$$
+
+广义积分发散，由积分判别法，级数**发散**。
 
 </details>

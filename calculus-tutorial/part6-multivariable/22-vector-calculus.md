@@ -305,6 +305,16 @@ $$\int_M d\omega = \int_{\partial M} \omega$$
 
 即"微分形式在流形上的积分等于它在边界上的积分"。
 
+**三大积分定理对比**：
+
+| 定理 | 维度 | 区域 $\to$ 边界 | 微分算子 | 适用条件 |
+|:---:|:---:|:---:|:---:|:---:|
+| Green | 2D | 平面区域 $\to$ 闭曲线 | $\dfrac{\partial Q}{\partial x}-\dfrac{\partial P}{\partial y}$ | 单连通区域，边界分段光滑 |
+| Gauss | 3D | 空间体 $\to$ 闭曲面 | $\nabla\cdot\mathbf{F}$（散度） | 分片光滑封闭曲面 |
+| Stokes | 3D | 曲面 $\to$ 边界曲线 | $\nabla\times\mathbf{F}$（旋度） | 曲面与边界满足右手定向，分片光滑 |
+
+三者的共同本质：**区域内部的微分算子积分 $=$ 边界上的场量积分**。Green公式可以看作Stokes公式在平面上的特例，而三者都统一于广义Stokes定理。
+
 ### 22.4.3 物理应用
 
 **电磁场中的 Maxwell 方程组**

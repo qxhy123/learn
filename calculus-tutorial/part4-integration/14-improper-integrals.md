@@ -337,6 +337,64 @@ $\square$
 
 ---
 
+## 14.5 Beta函数
+
+### 14.5.1 定义
+
+**定义**（Beta函数）：对于 $p > 0$，$q > 0$，定义
+
+$$B(p,q) = \int_0^1 x^{p-1}(1-x)^{q-1}\,dx$$
+
+**收敛性分析**：被积函数在 $x = 0$ 附近的行为由 $x^{p-1}$ 决定，在 $x = 1$ 附近由 $(1-x)^{q-1}$ 决定。当 $p > 0$ 时 $x = 0$ 处的瑕积分收敛，当 $q > 0$ 时 $x = 1$ 处的瑕积分收敛。
+
+### 14.5.2 基本性质
+
+**对称性**：
+
+$$B(p,q) = B(q,p)$$
+
+**证明**：在 $B(p,q) = \int_0^1 x^{p-1}(1-x)^{q-1}\,dx$ 中令 $t = 1 - x$，则 $dx = -dt$，
+
+$$B(p,q) = \int_1^0 (1-t)^{p-1}t^{q-1}(-dt) = \int_0^1 t^{q-1}(1-t)^{p-1}\,dt = B(q,p) \quad \square$$
+
+**与Gamma函数的关系**：
+
+$$\boxed{B(p,q) = \frac{\Gamma(p)\,\Gamma(q)}{\Gamma(p+q)}}$$
+
+这是Beta函数最重要的性质，将Beta函数完全归结为Gamma函数。证明需要用到二重积分的技巧（此处从略）。
+
+### 14.5.3 常用特殊值
+
+| $B(p,q)$ | 值 |
+|:---:|:---:|
+| $B(1,1)$ | $1$ |
+| $B\!\left(\dfrac{1}{2},\dfrac{1}{2}\right)$ | $\pi$ |
+| $B(m,n)$（$m,n$ 为正整数） | $\dfrac{(m-1)!(n-1)!}{(m+n-1)!}$ |
+
+其中 $B\!\left(\dfrac{1}{2},\dfrac{1}{2}\right) = \dfrac{\Gamma(1/2)\,\Gamma(1/2)}{\Gamma(1)} = \dfrac{\sqrt{\pi}\cdot\sqrt{\pi}}{1} = \pi$。
+
+### 14.5.4 例题
+
+> **例题 14.20** 计算 $\int_0^1 x^3(1-x)^4\,dx$。
+
+**解**：由Beta函数定义，$\int_0^1 x^3(1-x)^4\,dx = B(4,5)$。
+
+利用与Gamma函数的关系：
+
+$$B(4,5) = \frac{\Gamma(4)\,\Gamma(5)}{\Gamma(9)} = \frac{3!\cdot 4!}{8!} = \frac{6 \times 24}{40320} = \frac{144}{40320} = \frac{1}{280}$$
+
+$\square$
+
+> **例题 14.21** 计算 $\int_0^1 \dfrac{1}{\sqrt{x(1-x)}}\,dx$。
+
+**解**：被积函数可写为 $x^{-1/2}(1-x)^{-1/2}$，故
+
+$$\int_0^1 \frac{1}{\sqrt{x(1-x)}}\,dx = B\!\left(\frac{1}{2},\frac{1}{2}\right) = \frac{\Gamma(1/2)\,\Gamma(1/2)}{\Gamma(1)} = \frac{\sqrt{\pi}\cdot\sqrt{\pi}}{1} = \pi$$
+
+$\square$
+
+---
+
 ## 本章小结
 
 1. **无穷区间上的积分**：
@@ -358,6 +416,11 @@ $\square$
    - 递推公式：$\Gamma(s+1) = s\Gamma(s)$
    - 与阶乘关系：$\Gamma(n+1) = n!$
    - 重要值：$\Gamma(1) = 1$，$\Gamma\left(\dfrac{1}{2}\right) = \sqrt{\pi}$
+
+5. **Beta函数**：
+   - 定义：$B(p,q) = \int_0^1 x^{p-1}(1-x)^{q-1}\,dx$（$p,q > 0$）
+   - 与Gamma函数的关系：$B(p,q) = \dfrac{\Gamma(p)\,\Gamma(q)}{\Gamma(p+q)}$
+   - 对称性：$B(p,q) = B(q,p)$
 
 ---
 
