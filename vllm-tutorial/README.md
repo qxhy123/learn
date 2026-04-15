@@ -71,9 +71,9 @@
 
 | 章节 | 标题 | 主要内容 | 实验重点 |
 |------|------|----------|----------|
-| 第19章 | [张量并行](./part6-distributed-inference/19-tensor-parallelism.md) | 张量切分策略、通信开销、GPU 间同步 | 用多 GPU 启动张量并行推理 |
-| 第20章 | [流水线并行](./part6-distributed-inference/20-pipeline-parallelism.md) | 层间切分、micro-batch、气泡开销 | 对比张量并行与流水线并行 |
-| 第21章 | [多节点分布式部署](./part6-distributed-inference/21-multi-node-deployment.md) | Ray 集群、跨节点通信、网络配置 | 搭建双节点 vLLM 推理集群 |
+| 第19章 | [张量并行](./part6-distributed-inference/19-tensor-parallelism.md) | 当前 TP 决策逻辑、并行线性层、KV head 切分/复制、V1 executor 拓扑 | 用多 GPU 启动张量并行并观察 KV cache 日志 |
+| 第20章 | [流水线并行](./part6-distributed-inference/20-pipeline-parallelism.md) | `supports_pp` 契约、`intermediate_tensors`、`PPMissingLayer`、TP+PP 组合 | 对照模型源码确认 PP 支持并 benchmark TP vs PP |
+| 第21章 | [多节点分布式部署](./part6-distributed-inference/21-multi-node-deployment.md) | Ray 与 multiprocessing/headless 两条主路径、网络与排障 | 搭建双节点 vLLM 推理集群并验证节点发现 |
 
 ### 第七部分：生产部署
 
@@ -89,8 +89,8 @@
 | 章节 | 标题 | 主要内容 | 实验重点 |
 |------|------|----------|----------|
 | 第26章 | [vLLM 源码架构](./part8-architecture-and-extensions/26-source-architecture.md) | V1 进程架构、请求生命周期、EngineCore、Scheduler、Worker | 阅读关键路径源码并绘制调用链 |
-| 第27章 | [自定义模型接入](./part8-architecture-and-extensions/27-custom-model-integration.md) | 模型注册、自定义层、注意力后端适配 | 将一个自定义模型接入 vLLM |
-| 第28章 | [前沿进展与生态](./part8-architecture-and-extensions/28-frontier-and-ecosystem.md) | Disaggregated Prefill、chunked prefill、FlashInfer、SGLang 对比 | 跟踪社区 Roadmap 与关键 PR |
+| 第27章 | [自定义模型接入](./part8-architecture-and-extensions/27-custom-model-integration.md) | `ModelRegistry`、plugin system、out-of-tree model / platform 扩展 | 将一个自定义架构以 plugin 方式接入 vLLM |
+| 第28章 | [前沿进展与生态](./part8-architecture-and-extensions/28-frontier-and-ecosystem.md) | V1 基线、disaggregated prefill / encoder、FlashInfer、connector 与平台插件生态 | 顺着源码继续跟踪 frontier 目录与集成面 |
 
 ### 附录
 

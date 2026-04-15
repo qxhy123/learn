@@ -1,6 +1,6 @@
 # 第28章：前沿进展与生态
 
-> LLM 推理是一个快速发展的领域。理解当前的前沿方向，能帮你判断哪些技术值得关注，哪些问题即将被解决。
+> 如果继续把“vLLM 前沿进展”理解成泛泛的趋势展望，这一章就很容易写空。更有价值的做法，是只谈当前仓库里已经落地或明确暴露出来的 frontier：V1 核心架构、disaggregated serving、FlashInfer、连接器生态、平台插件和分布式扩展面。
 
 ---
 
@@ -8,237 +8,457 @@
 
 学完本章，你将能够：
 
-1. 了解 Disaggregated Prefill/Decode 的设计思想
-2. 理解 FlashInfer 等新注意力后端的优势
-3. 比较 vLLM 与 SGLang、TensorRT-LLM 的最新进展
-4. 跟踪 vLLM 社区的发展路线图
-5. 评估新技术对自己场景的适用性
+1. 用当前仓库事实校准“vLLM 现在处在哪个阶段”
+2. 理解 `disaggregated prefill` 和 `disaggregated encoder` 在源码里的真实落点
+3. 知道 FlashInfer 在当前仓库里已经扮演了哪些角色
+4. 理解 vLLM 的生态已经扩展到 connector、platform plugin、部署集成，而不只是 OpenAI 兼容 API
+5. 建立一个更适合继续追源码和追版本更新的观察框架
 
 ---
 
-## 28.1 Disaggregated Prefill/Decode
+## 28.1 第一件事：当前仓库的基线已经是 V1
 
-### 问题：Prefill 和 Decode 的资源冲突
+`vllm/docs/usage/v1_guide.md` 现在明确写着：
 
-```
-传统架构（混合 Prefill 和 Decode）:
+- **V0 已 fully deprecated**
+- 当前主线是 **V1 core engine**
 
-同一个 GPU 上:
-  - Prefill: 计算密集，短时间内高 GPU 利用率
-  - Decode: 内存带宽密集，低 GPU 利用率
-  - 两者混合时互相影响
+这意味着你今天理解“前沿进展”时，不该再把下面这些旧概念当成未来路线图：
 
-问题:
-  - 长 prefill 阻塞 decode → TPOT 抖动
-  - Decode 的 batch 很大时，新请求的 prefill 被延迟 → TTFT 增高
-```
+- `BlockSpaceManager`
+- `GPU <-> CPU KV swap` 作为主线语义
+- V0 / V1 并存且 V1 只是实验分支
 
-### 解决方案：分离 Prefill 和 Decode
+### 当前 V1 关注的不是“做一个新引擎原型”，而是统一核心抽象
 
-```
-Disaggregated 架构:
+V1 guide 里明确提到，V1 重做的核心包括：
 
-┌─────────────────┐     ┌─────────────────┐
-│  Prefill GPU(s)  │     │  Decode GPU(s)   │
-│                  │     │                  │
-│  专做 prefill    │ ──→ │  专做 decode     │
-│  计算密集优化    │ KV  │  内存带宽优化    │
-│  可以用更高算力  │ 传输│  可以用更多显存  │
-└─────────────────┘     └─────────────────┘
-```
+- scheduler
+- KV cache manager
+- worker
+- sampler
+- API server
 
-优势：
-- Prefill 和 Decode 可以独立扩缩容
-- 各自针对不同的计算特点优化硬件配置
-- TTFT 和 TPOT 更稳定
+所以今天的“前沿”不是说 V1 还没开始，而是说：
 
-vLLM 正在积极开发这一特性。
-
----
-
-## 28.2 注意力后端演进
-
-### Flash Attention
-
-当前主流的注意力 kernel：
-- IO 感知的 tiling 策略
-- 减少 HBM 访问次数
-- vLLM 默认使用的后端
-
-### FlashInfer
-
-新一代注意力后端，在 PagedAttention 场景下有额外优化：
-
-```
-FlashInfer 优势:
-  1. 更高效的 paged KV cache 访问
-  2. 支持 Ragged Tensor（可变长度）的原生优化
-  3. 更好的 GQA 支持
-  4. 针对 decode 阶段的特化 kernel
-
-在 vLLM 中启用:
-  vllm serve model --attention-backend flashinfer
-```
-
-### 其他后端
-
-- **FlashDecoding**：专门优化 decode 阶段的长序列注意力
-- **xFormers**：通用的高效注意力库
-- **Triton**：可编程的 GPU kernel 编写框架
-
----
-
-## 28.3 SGLang 对比
-
-### RadixAttention
-
-SGLang 的核心创新是 RadixAttention——使用基数树（Radix Tree）管理 KV Cache：
-
-```
-vLLM 的前缀缓存:
-  Hash 匹配 → 逐块比对 → 缓存/复用
-
-SGLang 的 RadixAttention:
-  基数树 → 自动识别共享前缀 → 更灵活的缓存策略
-  
-  树结构示例:
-       root
-      /    \
-  "system"  "user"
-   /   \
-  "A"  "B"
-```
-
-SGLang 在前缀复用密集的场景（如 agentic workflow）中有优势。
-
-### 编程模型
-
-SGLang 提供了结构化生成的编程 DSL：
-
-```python
-# SGLang 的编程方式
-@function
-def multi_step(s, question):
-    s += "Think step by step.\n"
-    s += question
-    s += sgl.gen("thinking", max_tokens=200)
-    s += "Therefore the answer is:"
-    s += sgl.gen("answer", max_tokens=50)
-```
-
-vLLM 更专注于服务端引擎，SGLang 更强调前端编程灵活性。
-
----
-
-## 28.4 其他前沿方向
-
-### KV Cache 压缩
-
-```
-方向:
-  1. KV Cache 量化 (FP8/INT4)
-  2. KV Cache 蒸馏（丢弃不重要的 KV）
-  3. 滑动窗口 + 少量全局 token
-  4. 跨层 KV 共享
-
-目标: 在有限显存下支持更长的序列和更多的并发
-```
-
-### 更高效的 Prefill
-
-```
-Chunked Prefill:     将长 prompt 分块处理
-Prompt Caching:      缓存常用 prompt 的 KV Cache
-Tree Attention:      树状结构的并行 prefill
-Cascade Inference:   小模型先处理简单请求
-```
-
-### 硬件适配
-
-```
-不同硬件的推理优化:
-  - NVIDIA H100/H200: FP8、HBM3 优化
-  - AMD MI300X: ROCm 支持（实验性）
-  - Google TPU: 特化的注意力实现
-  - 国产芯片: 逐步适配中
+```text
+V1 已经是当前仓库的地基
+frontier 是在这个地基上继续扩展
 ```
 
 ---
 
-## 28.5 跟踪社区
+## 28.2 Frontier 方向 1：Disaggregated Prefill
 
-### 重要资源
+`vllm/docs/features/disagg_prefill.md` 是当前最值得读的 frontier 文档之一。
 
-| 资源 | 地址 | 内容 |
-|------|------|------|
-| GitHub | github.com/vllm-project/vllm | 源码、Issues、PR |
-| 文档 | docs.vllm.ai | 官方文档 |
-| Blog | blog.vllm.ai | 技术博客 |
-| Discord | 社区链接见 GitHub | 社区讨论 |
-| 论文 | arxiv.org/abs/2309.06180 | 原始论文 |
+它给出的核心结论非常明确：
 
-### 值得关注的 Issue 和 PR
+### 1. 它的目标是把 TTFT 和 ITL 分开调
 
+文档里直接写了两大收益：
+
+1. **分别调 TTFT 和 ITL**
+2. **控制 tail ITL**
+
+也就是：
+
+- prefill 单独用一组实例 / 并行策略
+- decode 单独用另一组实例 / 并行策略
+
+### 2. 它不是吞吐优化银弹
+
+文档甚至专门强调：
+
+```text
+Disaggregated prefilling DOES NOT improve throughput.
 ```
-关注标签:
-  - [RFC]: 重要的设计提案
-  - [Feature]: 新特性
-  - [Performance]: 性能优化
-  - [V1]: V1 引擎相关
+
+这句话很重要，因为很多外部文章会下意识把“更复杂的架构”理解成“更高吞吐”。当前官方文档并不这么承诺。
+
+### 3. 当前源码里的实现位置非常明确
+
+文档直接指出实现目录在：
+
+- `vllm/distributed/kv_transfer`
+
+核心抽象包括：
+
+- `Connector`
+- `LookupBuffer`
+- `Pipe`
+
+并且每个进程都有对应的 connector：
+
+- scheduler connector
+- worker connector
+
+这意味着它不是“论文概念”，而是已经在当前仓库里形成了清晰的模块边界。
+
+### 4. 当前仓库里已经有 example 和协议入口
+
+你可以顺着这些位置继续看：
+
+- `vllm/examples/online_serving/disaggregated_prefill.sh`
+- `vllm/examples/online_serving/disaggregated_serving/README.md`
+- `vllm/vllm/entrypoints/serve/disagg/api_router.py`
+
+这说明 disaggregated serving 不只是内部实验代码，而是已经有：
+
+- 示例脚本
+- 代理 demo
+- 独立路由协议
+
+---
+
+## 28.3 Frontier 方向 2：Disaggregated Encoder
+
+如果你只盯着 decode-only 模型，就会错过当前仓库另一条很有代表性的 frontier：**多模态 encoder 的拆分**。
+
+`vllm/docs/features/disagg_encoder.md` 给出的收益有三类：
+
+1. **独立扩缩容**
+2. **更低 TTFT**
+3. **跨进程复用 encoder 输出**
+
+### 当前源码落点
+
+相关代码位于：
+
+- `vllm/distributed/ec_transfer`
+
+而 example README 还补充了更具体的现实约束：
+
+- 当前 `1e1p1d` 路径相对更稳定
+- encoder 实例需要 `--enforce-eager`
+- encoder 实例通常关闭 prefix caching
+- E + P + D 组合时还需要 `kv_transfer_config`
+
+### 为什么这是一个重要信号？
+
+它说明当前 vLLM 的 frontier 已经不仅仅在做：
+
+- “更快的 decode kernel”
+
+而是在继续把 serving 拆成可组合的阶段：
+
+- encoder
+- prefill
+- decode
+
+这也让 vLLM 的生态从“单体引擎”更像“可组合 serving 平台”。
+
+---
+
+## 28.4 Frontier 方向 3：FlashInfer 已经深入当前执行栈
+
+很多人提到 FlashInfer，还停留在一句：
+
+```text
+它是另一个 attention backend
 ```
 
-### 版本更新策略
+这在当前仓库里已经太轻了。
 
-```
-建议:
-  1. 生产环境使用稳定版本（最近的 release tag）
-  2. 测试环境可以尝试 main 分支
-  3. 关注每个版本的 breaking changes
-  4. 定期更新（vLLM 迭代快，新版本通常有显著改进）
+### 1. `vllm/utils/flashinfer.py` 说明它先是一个兼容与能力探测层
+
+这里可以看到当前仓库围绕 FlashInfer 做了很多工程化包装：
+
+- 检查包是否存在
+- 检查是否有 `nvcc` 或预编译 cubin
+- 兼容不同 FlashInfer API 变化
+- 探测 fused MoE、NVLink all-to-all 等能力是否可用
+
+这说明 FlashInfer 在 vLLM 里不是“随便 import 一下”，而是一个被认真治理的可选后端生态。
+
+### 2. `vllm/vllm/v1/attention/backends/flashinfer.py` 说明它已经进入 V1 attention 主路径
+
+当前 V1 backend 里能直接看到：
+
+- paged KV prefill / decode wrapper
+- ragged KV cache wrapper
+- multi-level cascade attention
+- 针对不同 cache dtype、layout、DCP 组合的处理
+
+这说明 FlashInfer 在当前仓库里已经不只是“decode kernel 加速器”，而是和 V1 attention backend 深度耦合。
+
+### 3. `kernel_warmup.py` 说明它还影响启动时行为
+
+`vllm/vllm/model_executor/warmup/kernel_warmup.py` 做了两件很有代表性的事：
+
+1. 在 Hopper / Blackwell 上尝试 FlashInfer autotune
+2. 对 FlashInfer attention 做 dummy warmup
+
+这说明当前 vLLM 已经把 FlashInfer 当成一个需要：
+
+- 探测
+- 预热
+- autotune
+
+的正式性能组件，而不是随手可换的边缘插件。
+
+### 4. 它的影响范围已经超出 attention
+
+从仓库里的 `flashinfer_*` 搜索结果还能看到：
+
+- fused MoE
+- NVLink one-sided / two-sided all-to-all
+- quantized MoE kernels
+
+所以今天说 FlashInfer，更准确的说法应该是：
+
+```text
+它正在成为 vLLM 当前 kernel 生态里的重要基建之一
 ```
 
 ---
 
-## 28.6 下一步学习
+## 28.5 Frontier 方向 4：connector 与 serving 生态在快速扩张
 
-### 深入方向
+如果只看核心代码，很容易低估生态层正在发生的变化。
 
-| 方向 | 建议资源 |
-|------|---------|
-| 推理系统论文 | Orca, PagedAttention, FlashAttention 系列论文 |
-| GPU 编程 | 本仓库 CUDA 教程 |
-| 分布式系统 | Megatron-LM, DeepSpeed Inference 论文 |
-| 量化技术 | GPTQ, AWQ, SmoothQuant 论文 |
-| Transformer 架构 | 本仓库 Transformer 教程 |
+### 当前 disagg prefill 已支持多种 connector
 
-### 实践方向
+`docs/features/disagg_prefill.md` 当前列出的 connector 包括：
 
+- `ExampleConnector`
+- `LMCacheConnectorV1`
+- `NixlConnector`
+- `P2pNcclConnector`
+- `MooncakeConnector`
+- `MultiConnector`
+- `OffloadingConnector`
+- `FlexKVConnectorV1`
+
+这背后传达的信号非常清晰：
+
+- vLLM 不想把 disaggregated serving 绑定到单一实现
+- 当前生态方向是 connector interface + 第三方基础设施协作
+
+### 当前仓库也已经直接承认第三方基础设施的重要性
+
+文档里明确写到：
+
+- 生产级 disaggregated prefilling 高度依赖第三方 connector
+- vLLM 团队会积极 review / merge 新 connector PR
+
+这说明 frontier 不只是“官方自己造所有轮子”，而是主动把接口开放出来。
+
+---
+
+## 28.6 Frontier 方向 5：platform plugin 与硬件生态
+
+`v1_guide.md` 对这一点说得很直接：
+
+更多平台支持可以通过 plugin 生态扩展，例如：
+
+- `vllm-ascend`
+- `vllm-spyre`
+- `vllm-gaudi`
+- `vllm-openvino`
+
+这说明当前仓库对“生态”的定义已经不是：
+
+```text
+只有一个官方 CUDA 版本
 ```
-1. 部署一个完整的 LLM 推理服务（包括监控和扩缩容）
-2. 对比不同模型和量化方案在你的场景下的表现
-3. 尝试给 vLLM 提交一个 PR（从小 bug 开始）
-4. 搭建一个多模型服务平台
-5. 研究特定场景的优化（如超长上下文、高并发聊天）
+
+而是：
+
+```text
+V1 core + plugin system + 平台扩展仓库
 ```
+
+### 对学习者意味着什么？
+
+如果你关心：
+
+- 新硬件适配
+- 平台侧 worker / backend 扩展
+- 非 CUDA 环境
+
+那你应该把 plugin system 和平台扩展仓库一起看，而不是只盯住主仓库里的 `cuda` 路径。
+
+---
+
+## 28.7 Frontier 方向 6：部署集成已经溢出主仓库边界
+
+当前仓库的生态线索还体现在部署集成上。
+
+### 1. Ray / KubeRay
+
+`parallelism_scaling.md` 已经把：
+
+- Ray cluster
+- KubeRay
+
+作为正式的多节点部署路径来写。
+
+### 2. NVIDIA Dynamo
+
+`docs/deployment/integrations/dynamo.md` 直接提到：
+
+- Dynamo 可以在 Kubernetes 上运行 vLLM
+- 支持 aggregated / disaggregated 等灵活 serving 架构
+
+这很能代表当前生态位置：
+
+- vLLM 不一定自己承担所有编排职责
+- 它也正在成为上层推理平台的执行引擎
+
+---
+
+## 28.8 如何用“源码视角”看生态，而不是只做口水比较
+
+很多教程会在这一章直接进入：
+
+- vLLM vs SGLang
+- vLLM vs TensorRT-LLM
+- 谁更强
+
+这类比较很容易随版本变化失真。基于当前仓库，更稳妥的比较框架其实是四个维度：
+
+### 维度 1：核心执行架构是否清晰
+
+当前 vLLM 给出的答案是：
+
+- V1 core engine
+- 统一 scheduler
+- 统一 KV cache manager
+
+### 维度 2：服务形态是否丰富
+
+当前仓库里已经同时存在：
+
+- Python `LLM`
+- OpenAI-compatible API
+- Anthropic / Responses 路径
+- disaggregated serve router
+
+### 维度 3：扩展面是否开放
+
+当前答案包括：
+
+- `ModelRegistry`
+- plugin system
+- platform plugins
+- connector interface
+
+### 维度 4：分布式路线是否完整
+
+当前仓库至少覆盖：
+
+- TP / PP
+- DP
+- DCP
+- EP
+- disaggregated prefill
+- disaggregated encoder
+
+用这四个维度去观察生态，比追逐一时的“谁最快”更不容易过时。
+
+---
+
+## 28.9 旧版本认知里最该更新的三件事
+
+### 旧认知 1：V1 还只是未来路线
+
+不对。当前官方文档已经明确：
+
+- V0 fully deprecated
+- V1 是当前主线
+
+### 旧认知 2：Disaggregated serving 只是概念展示
+
+不对。当前仓库里已经有：
+
+- 文档
+- 目录结构
+- connector 抽象
+- example 脚本
+- 路由入口
+
+### 旧认知 3：FlashInfer 只是一个可选 kernel 开关
+
+也不对。当前它已经影响：
+
+- attention backend
+- warmup / autotune
+- 部分 MoE / all-to-all 能力探测
+
+---
+
+## 当前最值得持续跟踪的文件与目录
+
+| 主题 | 当前文件 |
+|------|----------|
+| V1 总览与边界 | `vllm/docs/usage/v1_guide.md` |
+| disaggregated prefill | `vllm/docs/features/disagg_prefill.md` |
+| disaggregated encoder | `vllm/docs/features/disagg_encoder.md` |
+| disagg serving examples | `vllm/examples/online_serving/disaggregated_serving/` |
+| disagg encoder examples | `vllm/examples/online_serving/disaggregated_encoder/` |
+| FlashInfer wrapper | `vllm/vllm/utils/flashinfer.py` |
+| V1 FlashInfer backend | `vllm/vllm/v1/attention/backends/flashinfer.py` |
+| kernel warmup | `vllm/vllm/model_executor/warmup/kernel_warmup.py` |
+| plugin system | `vllm/docs/design/plugin_system.md` |
+| Dynamo integration | `vllm/docs/deployment/integrations/dynamo.md` |
 
 ---
 
 ## 本章小结
 
-| 方向 | 状态 | 影响 |
-|------|------|------|
-| Disaggregated Prefill/Decode | 积极开发中 | TTFT 和 TPOT 独立优化 |
-| FlashInfer | 已集成 | decode 性能提升 |
-| KV Cache 压缩 | 研究阶段 | 更长上下文、更多并发 |
-| V1 引擎 | 开发中 | 更好的架构和扩展性 |
+| 方向 | 当前仓库里的真实状态 |
+|------|--------------------|
+| V1 | 已是主线，不再是旁支实验 |
+| Disaggregated Prefill | 已有文档、抽象、connector 和示例，但文档明确不承诺提升吞吐 |
+| Disaggregated Encoder | 已形成独立特性与示例，代表多模态 serving 的新拆分方向 |
+| FlashInfer | 已深入 V1 attention、warmup 和部分 MoE / 通信生态 |
+| 生态 | 已扩展到 connector、platform plugin、Ray/KubeRay/Dynamo 等集成面 |
+
+---
+
+## 动手实验
+
+### 实验 1：追踪一次 disaggregated prefill 的目录结构
+
+按这个顺序读：
+
+1. `docs/features/disagg_prefill.md`
+2. `examples/online_serving/disaggregated_prefill.sh`
+3. `entrypoints/serve/disagg/api_router.py`
+4. `distributed/kv_transfer/`
+
+画出：
+
+- prefill instance
+- decode instance
+- connector
+- proxy / router
+
+之间的关系图。
+
+### 实验 2：确认 FlashInfer 在你环境中的状态
+
+阅读：
+
+- `vllm/vllm/utils/flashinfer.py`
+- `vllm/vllm/model_executor/warmup/kernel_warmup.py`
+
+然后回答：
+
+- 你的环境里没有 `flashinfer` 包时会发生什么？
+- 有包但没有 `nvcc`、也没有 cubin 时会发生什么？
 
 ---
 
 ## 练习题
 
+### 基础题
+
+1. `Disaggregated Prefill` 在当前官方文档里主要优化什么？又明确说**不**优化什么？
+2. FlashInfer 在当前仓库里至少出现在哪三类位置？
+
 ### 思考题
 
-1. Disaggregated Prefill/Decode 在什么场景下价值最大？什么场景下不需要？
-2. vLLM 和 SGLang 各自的核心优势是什么？你的场景更适合哪个？
-3. 如果你要设计下一代 LLM 推理引擎，你会优先解决哪三个问题？
-4. 随着模型变得越来越大（万亿参数级别），推理系统设计会面临哪些新挑战？
+3. 为什么说当前 vLLM 的“生态”已经不只是 OpenAI 兼容 API？
+4. 如果你未来要持续跟踪 vLLM frontier，应该优先盯哪几类目录或文档，而不是只看 release note 标题？

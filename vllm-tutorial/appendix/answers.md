@@ -90,9 +90,61 @@
 
 ## 第19章：张量并行
 
-1. AllReduce 通信。每层 2 次（attention 后 + FFN 后）。
+1. `tensor_parallel_size` 会同时影响两类对象：一类是模型内部并行层与 attention head / KV head 的切分方式；另一类是 `ParallelConfig`、executor world size 和 worker 拓扑。
 
-2. AllReduce 需要高带宽和低延迟，NVLink 提供 600+ GB/s 的 GPU 间带宽，远高于 PCIe 的 32 GB/s。
+2. 因为当前模型实现里，当 `total_num_kv_heads < tp_size` 时，KV heads 可能在多个 TP rank 上复制，而不是被完全均分，所以 KV cache 不一定严格缩成原来的 `1 / tp_size`。
+
+3. 因为在无 NVLink 或切分不整齐的机器上，PP 的 stage 间传递可能比 TP 的重通信更便宜，官方文档明确建议把 `TP=1, PP=<GPU数>` 作为 benchmark 候选。
+
+4. 先看 `GPU KV cache size` 和 `Maximum concurrency for ... tokens per request` 这两条日志，它们比经验公式更能说明 TP 调整后是否真的换来了更大缓存和更高并发。
+
+---
+
+## 第20章：流水线并行
+
+1. 当前仓库里一个模型想支持 PP，至少要满足三点：`supports_pp=True`、实现 `make_empty_intermediate_tensors(...)`、并让 `forward(...)` 接受 `intermediate_tensors`。
+
+2. 因为 PP 不是 executor 单方面就能“替模型打开”的能力，模型类必须显式实现 stage 间中间态传递逻辑，否则 registry / runtime 无法安全支持它。
+
+3. 因为在 PCIe-only 机器上，TP 需要更频繁的集合通信，而 PP 主要是 stage 间传 hidden states，通信模式可能更适合这种硬件。
+
+4. `TP=4, PP=2` 在当前 executor 里意味着总共 8 个并行 rank。部署时你要据此规划 GPU 数、节点数和 world size，而不是只盯着单一维度的“4 卡 TP”。
+
+---
+
+## 第21章：多节点分布式部署
+
+1. 当前至少有两条主路径：Ray 集群路线，以及 `--nnodes/--node-rank/--headless` 的 multiprocessing 路线。
+
+2. `--headless` 让非主节点只运行 engine / worker，而不启动 API server，因此它是 multiprocessing 多节点部署里的执行节点形态，不是单纯的调试开关。
+
+3. 优先检查 `VLLM_HOST_IP`、Ray 看到的节点 IP，以及 `ray status` / `ray list nodes` 的输出是否和你的机器实际 IP 对得上。
+
+4. 用 `NCCL_DEBUG=TRACE` 跑起来看日志；出现 `NET/IB/GDRDMA` 说明走到了高性能 RDMA 路线，出现 `NET/Socket` 则说明只是普通 socket。
+
+---
+
+## 第27章：自定义模型接入
+
+1. 当前推荐的 out-of-tree 路径是 `vllm.general_plugins + ModelRegistry.register_model(...)`。直改 `models/__init__.py` 属于 in-tree 老路径，难维护，也不适合插件化扩展。
+
+2. `trust_remote_code=True` 能帮助 vLLM 读取 HF 侧自定义 config / class；但它不能自动替你完成 vLLM-native 模型实现、权重映射、attention backend 或 worker/platform 扩展。
+
+3. 当你的问题已经变成“新设备 / 新 worker / 新 attention backend / 新通信后端”时，只写 model plugin 不够，需要继续写 platform plugin，以及对应的 `WorkerBase`、`AttentionBackend`、`DeviceCommunicatorBase` 实现。
+
+4. 如果一个新模型要支持 `pipeline_parallel_size > 1`，还必须补齐 `supports_pp` 相关接口，而不是只让单卡 forward 能跑通。
+
+---
+
+## 第28章：前沿进展与生态
+
+1. `Disaggregated Prefill` 的主要目标是分开调 TTFT 和 ITL，并控制 tail ITL；官方文档明确说它**不**提升吞吐。
+
+2. FlashInfer 在当前仓库里至少出现在三类位置：能力探测与兼容包装（`utils/flashinfer.py`）、V1 attention backend（`v1/attention/backends/flashinfer.py`）、启动期 warmup / autotune（`model_executor/warmup/kernel_warmup.py`）。
+
+3. 因为当前 vLLM 的生态已经包含 model / platform plugin、connector、disaggregated serving、Ray/KubeRay、Dynamo 等集成面，OpenAI 兼容 API 只是其中一个入口。
+
+4. 持续跟踪 frontier 时，优先看 `docs/usage/v1_guide.md`、`docs/features/`、`docs/serving/`、`distributed/`、`examples/online_serving/` 和 plugin / integration 文档，而不是只看版本标题。
 
 ---
 
