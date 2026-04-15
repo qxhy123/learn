@@ -32,7 +32,29 @@
 
 ---
 
-## 5.2 和差公式的结构
+## 5.2 和差公式的推导与结构
+
+### 从旋转推导余弦和角公式
+
+考虑单位圆上两个点：$P = (\cos\alpha, \sin\alpha)$ 和 $Q = (\cos\beta, \sin\beta)$。
+
+$P$ 与 $Q$ 之间的距离可以用两种方式计算：
+
+**方法一**（坐标距离公式）：
+
+$$|PQ|^2 = (\cos\alpha-\cos\beta)^2+(\sin\alpha-\sin\beta)^2 = 2-2(\cos\alpha\cos\beta+\sin\alpha\sin\beta)$$
+
+**方法二**（$P$ 和 $Q$ 之间的角度差为 $\alpha-\beta$，取 $Q'=(1,0)$，$P'=(\cos(\alpha-\beta),\sin(\alpha-\beta))$，距离相等）：
+
+$$|P'Q'|^2 = (\cos(\alpha-\beta)-1)^2+\sin^2(\alpha-\beta) = 2-2\cos(\alpha-\beta)$$
+
+令两式相等，得到：
+
+$$\boxed{\cos(\alpha-\beta) = \cos\alpha\cos\beta + \sin\alpha\sin\beta}$$
+
+用 $-\beta$ 替换 $\beta$（利用 $\cos(-\beta)=\cos\beta$，$\sin(-\beta)=-\sin\beta$）得到和角公式。正弦的和差公式由 $\sin\theta = \cos(\pi/2-\theta)$ 推出。
+
+### 公式汇总
 
 正弦和差：
 
@@ -99,6 +121,24 @@ $$
 $$
 
 这说明倍角公式本质不是额外要背的表，而是和差公式的特例。
+
+### 三倍角公式
+
+用倍角+和角公式推导，设 $3x = 2x + x$：
+
+$$\sin 3x = \sin(2x+x) = \sin 2x\cos x + \cos 2x\sin x$$
+$$= 2\sin x\cos^2 x + (1-2\sin^2 x)\sin x = \sin x(2\cos^2 x+1-2\sin^2 x)$$
+$$= \sin x(2(1-\sin^2 x)+1-2\sin^2 x) = \sin x(3-4\sin^2 x)$$
+
+$$\boxed{\sin 3x = 3\sin x - 4\sin^3 x}$$
+
+类似地：
+
+$$\boxed{\cos 3x = 4\cos^3 x - 3\cos x}$$
+
+**记忆**：正弦三倍角"3减4立方"，余弦三倍角"4立方减3"。
+
+三倍角公式在解三次三角方程和竞赛中常用。
 
 ---
 

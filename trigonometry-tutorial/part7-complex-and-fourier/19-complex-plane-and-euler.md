@@ -32,6 +32,22 @@ $$
 
 这就是为什么欧拉公式常被看作连接初等三角与高阶数学的桥。
 
+### 欧拉公式的推导
+
+从 $e^x$ 的幂级数出发，将 $x$ 替换为 $i\theta$：
+
+$$e^{i\theta} = \sum_{n=0}^{\infty}\frac{(i\theta)^n}{n!} = 1 + i\theta + \frac{(i\theta)^2}{2!} + \frac{(i\theta)^3}{3!} + \frac{(i\theta)^4}{4!} + \cdots$$
+
+利用 $i^2 = -1$，$i^3 = -i$，$i^4 = 1$ 的循环，将实部和虚部分开：
+
+$$= \underbrace{\left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\right)}_{\cos\theta} + i\underbrace{\left(\theta - \frac{\theta^3}{3!} + \frac{\theta^5}{5!} - \cdots\right)}_{\sin\theta}$$
+
+这正是 $\cos\theta$ 和 $\sin\theta$ 的Taylor级数！因此：
+
+$$\boxed{e^{i\theta} = \cos\theta + i\sin\theta}$$
+
+**特殊值**：令 $\theta = \pi$，得到被称为"最美数学公式"的 **Euler 恒等式**：$e^{i\pi} + 1 = 0$。
+
 ---
 
 ## 19.2 复数极形式

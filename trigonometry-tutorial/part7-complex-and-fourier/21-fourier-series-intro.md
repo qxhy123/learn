@@ -76,9 +76,53 @@ $$
 
 ---
 
-## 21.4 Fourier 系数的意义
+## 21.4 Fourier 级数的形式与系数公式
 
-Fourier 系数不是“神秘常数”，它们代表的是：
+设 $f(x)$ 是周期为 $2\pi$ 的函数，其 Fourier 级数为：
+
+$$f(x) \sim \frac{a_0}{2} + \sum_{n=1}^{\infty}\left(a_n\cos nx + b_n\sin nx\right)$$
+
+**Fourier 系数**由正交性投影确定：
+
+$$\boxed{a_0 = \frac{1}{\pi}\int_{-\pi}^{\pi}f(x)\,dx}$$
+
+$$\boxed{a_n = \frac{1}{\pi}\int_{-\pi}^{\pi}f(x)\cos nx\,dx, \quad n = 1, 2, 3, \ldots}$$
+
+$$\boxed{b_n = \frac{1}{\pi}\int_{-\pi}^{\pi}f(x)\sin nx\,dx, \quad n = 1, 2, 3, \ldots}$$
+
+**推导思路**：在级数两边乘以 $\cos mx$（或 $\sin mx$），对 $[-\pi, \pi]$ 积分，利用三角函数组的正交性（不同频率的乘积积分为零），只有 $n=m$ 的项存活，从而解出 $a_n$（或 $b_n$）。
+
+### 周期为 $2L$ 的推广
+
+若 $f(x)$ 周期为 $2L$，则用 $\frac{n\pi x}{L}$ 代替 $nx$：
+
+$$a_n = \frac{1}{L}\int_{-L}^{L}f(x)\cos\frac{n\pi x}{L}\,dx, \quad b_n = \frac{1}{L}\int_{-L}^{L}f(x)\sin\frac{n\pi x}{L}\,dx$$
+
+### 收敛条件（Dirichlet 条件）
+
+若 $f(x)$ 在一个周期内满足：
+1. 分段连续（只有有限个间断点）
+2. 分段单调（只有有限个极值点）
+
+则 Fourier 级数收敛，且：
+- 在连续点处收敛到 $f(x)$
+- 在间断点处收敛到 $\frac{f(x^+)+f(x^-)}{2}$（左右极限的平均值）
+
+### 经典例子：方波的 Fourier 展开
+
+设方波 $f(x) = \begin{cases} 1, & 0 < x < \pi \\ -1, & -\pi < x < 0 \end{cases}$，$f(x)$ 为奇函数，故 $a_n = 0$。
+
+$$b_n = \frac{1}{\pi}\int_{-\pi}^{\pi}f(x)\sin nx\,dx = \frac{2}{\pi}\int_0^\pi \sin nx\,dx = \frac{2}{n\pi}(1-\cos n\pi) = \begin{cases} \frac{4}{n\pi}, & n\text{ 奇} \\ 0, & n\text{ 偶} \end{cases}$$
+
+$$f(x) = \frac{4}{\pi}\left(\sin x + \frac{\sin 3x}{3} + \frac{\sin 5x}{5} + \cdots\right)$$
+
+令 $x = \pi/2$：$1 = \frac{4}{\pi}\left(1 - \frac{1}{3} + \frac{1}{5} - \cdots\right)$，即 **Leibniz 公式** $\frac{\pi}{4} = 1 - \frac{1}{3} + \frac{1}{5} - \frac{1}{7} + \cdots$。
+
+---
+
+## 21.5 Fourier 系数的意义
+
+Fourier 系数不是”神秘常数”，它们代表的是：
 
 - 某个频率分量在原函数中占多大权重
 - 哪些频率最强
