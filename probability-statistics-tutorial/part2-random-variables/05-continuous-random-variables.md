@@ -171,7 +171,102 @@ $$\text{Var}(X) = \frac{1}{\lambda^2}$$
 
 ---
 
-## 5.5 常用连续分布预览
+## 5.5 随机变量函数的分布
+
+已知 $X$ 的分布，如何求 $Y = g(X)$ 的分布？这是概率论中的核心问题。
+
+### 5.5.1 CDF 法（万能方法）
+
+**基本思路**：先求 $Y$ 的 CDF $F_Y(y) = P(Y \leq y) = P(g(X) \leq y)$，再对 $y$ 求导得到 PDF。
+
+**例5.6** 设 $X \sim \mathcal{N}(0, 1)$，求 $Y = X^2$ 的 PDF。
+
+**解**：当 $y \leq 0$ 时，$F_Y(y) = 0$。当 $y > 0$ 时：
+
+$$F_Y(y) = P(X^2 \leq y) = P(-\sqrt{y} \leq X \leq \sqrt{y}) = \Phi(\sqrt{y}) - \Phi(-\sqrt{y}) = 2\Phi(\sqrt{y}) - 1$$
+
+求导：
+
+$$f_Y(y) = 2\phi(\sqrt{y}) \cdot \frac{1}{2\sqrt{y}} = \frac{1}{\sqrt{2\pi y}} e^{-y/2}, \quad y > 0$$
+
+这正是**自由度为 1 的卡方分布** $\chi^2(1)$ 的 PDF。
+
+### 5.5.2 公式法（单调函数）
+
+**定理** 设 $X$ 的 PDF 为 $f_X(x)$，$y = g(x)$ 是**严格单调**的可微函数，反函数为 $x = g^{-1}(y)$，则 $Y = g(X)$ 的 PDF 为：
+
+$$\boxed{f_Y(y) = f_X(g^{-1}(y)) \cdot \left|\frac{d\,g^{-1}(y)}{dy}\right|}$$
+
+**直觉**：概率"密度"在变量变换时，需要乘以 Jacobian 的绝对值来补偿坐标伸缩。
+
+**例5.7** 设 $X \sim \text{Exp}(\lambda)$，求 $Y = \sqrt{X}$ 的 PDF。
+
+**解**：$g(x) = \sqrt{x}$ 在 $x > 0$ 上严格单调递增。反函数 $x = y^2$，$\frac{dx}{dy} = 2y$。
+
+$$f_Y(y) = f_X(y^2) \cdot |2y| = \lambda e^{-\lambda y^2} \cdot 2y = 2\lambda y \, e^{-\lambda y^2}, \quad y > 0$$
+
+**例5.8** 设 $X \sim \mathcal{N}(\mu, \sigma^2)$，求 $Y = e^X$（对数正态分布）的 PDF。
+
+**解**：$g(x) = e^x$ 严格单调递增，$g^{-1}(y) = \ln y$，$\frac{d}{dy}\ln y = \frac{1}{y}$。
+
+$$f_Y(y) = \frac{1}{\sqrt{2\pi}\sigma y} \exp\left(-\frac{(\ln y - \mu)^2}{2\sigma^2}\right), \quad y > 0$$
+
+这就是**对数正态分布** $\text{LogNormal}(\mu, \sigma^2)$ 的 PDF。
+
+### 5.5.3 非单调函数的处理
+
+当 $g(x)$ 不单调时，需将定义域分段为若干单调区间，分别求 PDF 后相加：
+
+$$f_Y(y) = \sum_{k} f_X(x_k) \cdot \left|\frac{dx_k}{dy}\right|$$
+
+其中 $x_k$ 是方程 $g(x_k) = y$ 的各个根。例5.6 中的 $Y = X^2$ 就是这种情况（$X^2 = y$ 有两个根 $\pm\sqrt{y}$）。
+
+---
+
+## 5.6 矩母函数（连续情形）
+
+### 定义
+
+连续随机变量 $X$ 的**矩母函数**（MGF）为：
+
+$$M_X(t) = E[e^{tX}] = \int_{-\infty}^{+\infty} e^{tx} f(x) \, dx$$
+
+性质与离散情形完全一致：$M_X^{(n)}(0) = E[X^n]$。
+
+### 例5.9：正态分布的 MGF
+
+设 $X \sim \mathcal{N}(\mu, \sigma^2)$，则：
+
+$$M_X(t) = \exp\left(\mu t + \frac{\sigma^2 t^2}{2}\right)$$
+
+验证：$M_X'(0) = \mu = E[X]$ ✓，$M_X''(0) = \sigma^2 + \mu^2 = E[X^2]$ ✓
+
+**应用**：利用 MGF 证明独立正态之和仍为正态——若 $X_i \sim \mathcal{N}(\mu_i, \sigma_i^2)$ 独立，则 $S = \sum a_i X_i$ 的 MGF 为：
+
+$$M_S(t) = \prod_i M_{X_i}(a_i t) = \exp\left(\sum_i a_i \mu_i \cdot t + \frac{\sum_i a_i^2 \sigma_i^2}{2} t^2\right)$$
+
+这正是 $\mathcal{N}(\sum a_i \mu_i, \sum a_i^2 \sigma_i^2)$ 的 MGF，由唯一性定理即得。
+
+### 例5.10：指数分布的 MGF
+
+设 $X \sim \text{Exp}(\lambda)$，则对 $t < \lambda$：
+
+$$M_X(t) = \int_0^\infty e^{tx} \lambda e^{-\lambda x} dx = \frac{\lambda}{\lambda - t}$$
+
+### 常见分布的 MGF 汇总
+
+| 分布 | MGF $M_X(t)$ | 存在条件 |
+|------|--------------|----------|
+| Bernoulli$(p)$ | $(1-p) + pe^t$ | 所有 $t$ |
+| Binomial$(n,p)$ | $[(1-p) + pe^t]^n$ | 所有 $t$ |
+| Poisson$(\lambda)$ | $e^{\lambda(e^t-1)}$ | 所有 $t$ |
+| Exp$(\lambda)$ | $\frac{\lambda}{\lambda-t}$ | $t < \lambda$ |
+| $\mathcal{N}(\mu,\sigma^2)$ | $e^{\mu t + \sigma^2 t^2/2}$ | 所有 $t$ |
+| Gamma$(\alpha,\beta)$ | $\left(\frac{\beta}{\beta-t}\right)^\alpha$ | $t < \beta$ |
+
+---
+
+## 5.7 常用连续分布预览
 
 ### 正态分布（高斯分布）
 
@@ -193,6 +288,35 @@ CDF记作 $\Phi(x)$，无解析表达式，通过查表或数值计算。
 
 $$Z = \frac{X - \mu}{\sigma} \sim \mathcal{N}(0, 1)$$
 
+### 分位数
+
+**定义** 随机变量 $X$ 的 **$p$ 分位数**（$0 < p < 1$）是满足 $F(x_p) = p$ 的值 $x_p$，即：
+
+$$x_p = F^{-1}(p) = \inf\{x : F(x) \geq p\}$$
+
+- **中位数**：$p = 0.5$ 的分位数，满足 $P(X \leq m) = 0.5$
+- **四分位数**：$Q_1 = x_{0.25}$，$Q_2 = x_{0.5}$（中位数），$Q_3 = x_{0.75}$
+
+中位数与期望的区别：期望受极端值影响，中位数更稳健。
+
+### 高阶矩：偏度与峰度
+
+**$n$ 阶矩**：$E[X^n]$（原点矩），$E[(X-\mu)^n]$（中心矩）。
+
+**偏度**（Skewness）衡量分布的不对称性：
+
+$$\gamma_1 = \frac{E[(X - \mu)^3]}{\sigma^3}$$
+
+- $\gamma_1 = 0$：对称分布（如正态分布）
+- $\gamma_1 > 0$：右偏（长右尾），如指数分布
+- $\gamma_1 < 0$：左偏（长左尾）
+
+**峰度**（Kurtosis）衡量分布的尾部厚度：
+
+$$\gamma_2 = \frac{E[(X - \mu)^4]}{\sigma^4} - 3$$
+
+减去 3 是为了以正态分布为基准（正态分布的 $E[(X-\mu)^4]/\sigma^4 = 3$）。$\gamma_2 > 0$ 称为**尖峰**（重尾），$\gamma_2 < 0$ 称为**平峰**（轻尾）。
+
 ---
 
 ## 本章小结
@@ -206,6 +330,8 @@ $$Z = \frac{X - \mu}{\sigma} \sim \mathcal{N}(0, 1)$$
 | 方差 | $\text{Var}(X) = E[X^2] - (E[X])^2$ |
 | 均匀分布 | $E[X] = \frac{a+b}{2}$，$\text{Var}(X) = \frac{(b-a)^2}{12}$ |
 | 指数分布 | $E[X] = \frac{1}{\lambda}$，$\text{Var}(X) = \frac{1}{\lambda^2}$ |
+| 变量变换（单调） | $f_Y(y) = f_X(g^{-1}(y)) \cdot \|dg^{-1}/dy\|$ |
+| 矩母函数 | $M_X(t) = E[e^{tX}]$，$M_X^{(n)}(0) = E[X^n]$ |
 
 **核心要点**：
 - 连续随机变量用密度函数描述，面积等于概率

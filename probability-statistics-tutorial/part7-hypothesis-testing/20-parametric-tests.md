@@ -226,6 +226,26 @@ $$\underbrace{\sum_{i=1}^k\sum_{j=1}^{n_i}(X_{ij} - \bar{X}_{..})^2}_{SS_T} = \u
 
 在 $H_0$ 下，$F \sim F(k-1, N-k)$；$MS_A$ 和 $MS_E$ 都是 $\sigma^2$ 的无偏估计，但当 $H_1$ 成立时 $E(MS_A) > \sigma^2$，因此大的 $F$ 值支持 $H_1$。
 
+### 20.3.5 ANOVA 的事后多重比较
+
+当 ANOVA 拒绝 $H_0$ 后，我们知道至少有一对均值不等，但不知道**哪些对**不等。需要进行**事后比较**（Post-hoc Tests）。
+
+**Tukey HSD（Honestly Significant Difference）法**：基于学生化极差分布，对所有 $\binom{k}{2}$ 对均值差同时进行检验：
+
+$$|\bar{X}_{i.} - \bar{X}_{j.}| > q_{\alpha}(k, N-k) \cdot \sqrt{\frac{MS_E}{2}\left(\frac{1}{n_i} + \frac{1}{n_j}\right)}$$
+
+其中 $q_\alpha(k, N-k)$ 是学生化极差分布的上 $\alpha$ 分位数。
+
+**Bonferroni 校正**：对每对比较使用 $\alpha' = \alpha/\binom{k}{2}$ 的显著性水平进行 $t$ 检验。简单保守，但当比较组数很多时过于严格。
+
+**Scheffé 法**：基于 F 分布，可检验任意线性对比 $\sum c_i \mu_i = 0$，是最保守但最灵活的方法。
+
+| 方法 | 特点 | 适用场景 |
+|------|------|----------|
+| Tukey HSD | 控制整体第一类错误率，功效较好 | 各组等样本量，比较所有配对 |
+| Bonferroni | 简单通用，偏保守 | 比较组数较少时 |
+| Scheffé | 最保守，可检验任意对比 | 需要灵活性时 |
+
 ---
 
 ## 20.4 卡方检验

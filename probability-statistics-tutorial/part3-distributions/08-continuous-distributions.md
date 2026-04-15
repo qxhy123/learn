@@ -248,7 +248,60 @@ $$p \sim \text{Beta}(\alpha, \beta) \;\Longrightarrow\; p \mid \text{data} \sim 
 
 ---
 
-## 8.5 分布之间的关系
+## 8.5 其他重要连续分布
+
+### 8.5.1 对数正态分布
+
+若 $\ln X \sim \mathcal{N}(\mu, \sigma^2)$，则 $X$ 服从**对数正态分布**，记作 $X \sim \text{LogNormal}(\mu, \sigma^2)$。
+
+**PDF**（$x > 0$）：
+
+$$f(x) = \frac{1}{x\sqrt{2\pi}\sigma} \exp\left(-\frac{(\ln x - \mu)^2}{2\sigma^2}\right)$$
+
+**期望与方差**：
+
+$$E[X] = e^{\mu + \sigma^2/2}, \quad \text{Var}(X) = e^{2\mu + \sigma^2}(e^{\sigma^2} - 1)$$
+
+**特点**：
+- PDF 是右偏的（长右尾），适合建模**正值且右偏**的数据
+- 典型应用：金融资产价格、收入分布、颗粒大小、生物生长等
+- 在深度学习中，模型权重的梯度范数、训练损失的分布常近似对数正态
+
+### 8.5.2 柯西分布
+
+**定义** $X$ 服从**柯西分布**（Cauchy Distribution）$\text{Cauchy}(x_0, \gamma)$ 时，PDF 为：
+
+$$f(x) = \frac{1}{\pi \gamma \left[1 + \left(\frac{x - x_0}{\gamma}\right)^2\right]}$$
+
+其中 $x_0$ 是位置参数（中位数），$\gamma > 0$ 是尺度参数。标准柯西分布取 $x_0 = 0, \gamma = 1$。
+
+**关键性质——期望和方差不存在**：
+
+$$\int_{-\infty}^{+\infty} |x| \cdot \frac{1}{\pi(1+x^2)} dx = \frac{2}{\pi}\int_0^{\infty} \frac{x}{1+x^2} dx = +\infty$$
+
+因此 $E[|X|] = \infty$，柯西分布**没有期望**，方差更不存在。
+
+**重要意义**：
+- 柯西分布是"期望不一定存在"的经典反例
+- 标准柯西分布等价于两个独立标准正态之比：$Z_1/Z_2 \sim \text{Cauchy}(0,1)$
+- $n$ 个独立柯西变量的样本均值仍服从柯西分布——大数定律不适用（因为期望不存在）
+- 柯西分布也是自由度为 1 的 $t$ 分布：$t(1) = \text{Cauchy}(0,1)$
+
+### 8.5.3 韦布尔分布
+
+**定义** $X \sim \text{Weibull}(k, \lambda)$（$k > 0$ 为形状参数，$\lambda > 0$ 为尺度参数），PDF 为：
+
+$$f(x) = \frac{k}{\lambda}\left(\frac{x}{\lambda}\right)^{k-1} \exp\left(-\left(\frac{x}{\lambda}\right)^k\right), \quad x \geq 0$$
+
+**特殊情形**：$k = 1$ 时退化为指数分布 $\text{Exp}(1/\lambda)$。
+
+**期望与方差**：$E[X] = \lambda \Gamma(1 + 1/k)$，$\text{Var}(X) = \lambda^2[\Gamma(1+2/k) - \Gamma^2(1+1/k)]$
+
+**应用**：可靠性工程（元器件寿命分析）、材料强度建模、风速分布。
+
+---
+
+## 8.6 分布之间的关系
 
 连续分布族并非相互孤立，它们之间存在丰富的联系。
 
@@ -304,6 +357,25 @@ $$\min(X_1, \ldots, X_n) \sim \text{Exp}(\lambda_1 + \cdots + \lambda_n)$$
 
 若 $U \sim \mathcal{U}(0,1)$，则 $-\frac{1}{\lambda}\ln U \sim \text{Exp}(\lambda)$（逆变换法的具体应用）。
 
+### 混合分布
+
+**定义** 若 $X$ 以概率 $w_i$（$\sum w_i = 1$）从分布 $f_i(x)$ 中取值，则 $X$ 的 PDF 为：
+
+$$f(x) = \sum_{i=1}^{k} w_i f_i(x)$$
+
+称为 $k$ 个分布的**混合分布**（Mixture Distribution），$w_i$ 称为**混合权重**。
+
+**性质**：
+- 期望：$E[X] = \sum_i w_i \mu_i$
+- 方差（全方差公式）：$\text{Var}(X) = \sum_i w_i \sigma_i^2 + \sum_i w_i (\mu_i - \bar{\mu})^2$
+- 混合分布可以建模**多峰**或复杂形状的数据
+
+**最常见的混合分布——高斯混合模型（GMM）**：
+
+$$f(x) = \sum_{i=1}^{k} w_i \cdot \frac{1}{\sqrt{2\pi}\sigma_i} \exp\left(-\frac{(x-\mu_i)^2}{2\sigma_i^2}\right)$$
+
+GMM 可以逼近任意连续分布（只要混合成分足够多），在聚类分析和密度估计中广泛使用。参数估计通常使用 EM 算法（见第24章）。
+
 ### 分布比较汇总
 
 | 分布 | 支撑 | 参数 | 均值 | 方差 | 特征 |
@@ -328,6 +400,10 @@ $$\min(X_1, \ldots, X_n) \sim \text{Exp}(\lambda_1 + \cdots + \lambda_n)$$
 | 无记忆性 | $P(X>s+t\mid X>s)=P(X>t)$ | 指数分布的唯一性定理 |
 | 标准化 | $Z=(X-\mu)/\sigma$ | 正态计算的统一框架 |
 | Gamma-Beta 关系 | $\frac{X}{X+Y}\sim\text{Beta}(\alpha,\beta)$ | 分布族的内在统一性 |
+| 对数正态分布 | $\ln X \sim \mathcal{N}(\mu,\sigma^2)$ | 正值右偏数据；金融建模 |
+| 柯西分布 | $f(x)=\frac{1}{\pi\gamma[1+(x-x_0)^2/\gamma^2]}$ | 期望不存在的经典反例 |
+| 韦布尔分布 | $f(x)=\frac{k}{\lambda}(x/\lambda)^{k-1}e^{-(x/\lambda)^k}$ | 可靠性工程；推广指数分布 |
+| 混合分布 | $f(x)=\sum w_i f_i(x)$ | 建模多峰、复杂分布 |
 
 ---
 

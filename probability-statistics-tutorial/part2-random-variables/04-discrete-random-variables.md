@@ -191,6 +191,56 @@ $\sigma = \sqrt{\frac{35}{12}} \approx 1.71$
 
 ---
 
+## 4.6 矩母函数与特征函数
+
+### 矩母函数（Moment Generating Function）
+
+**定义** 随机变量 $X$ 的**矩母函数**（MGF）定义为：
+
+$$M_X(t) = E[e^{tX}] = \sum_i e^{tx_i} p(x_i)$$
+
+其中 $t$ 是实数参数，要求 $E[e^{tX}]$ 在包含 $0$ 的某个开区间内有限。
+
+**名称由来**：MGF 之所以叫"矩母函数"，是因为对 $M_X(t)$ 求 $n$ 阶导数并令 $t=0$，恰好得到 $X$ 的 $n$ 阶矩：
+
+$$M_X^{(n)}(0) = E[X^n]$$
+
+**推导**：将 $e^{tX}$ 展开为幂级数 $e^{tX} = \sum_{n=0}^{\infty} \frac{(tX)^n}{n!}$，求期望后得 $M_X(t) = \sum_{n=0}^{\infty} \frac{E[X^n]}{n!} t^n$，对 $t$ 求 $n$ 次导后令 $t=0$ 即得。
+
+### MGF 的核心性质
+
+1. **唯一性**：若 $M_X(t) = M_Y(t)$ 在某开区间 $(-h, h)$ 上成立，则 $X$ 与 $Y$ 同分布
+2. **独立变量的 MGF**：若 $X, Y$ 独立，则 $M_{X+Y}(t) = M_X(t) \cdot M_Y(t)$
+3. **线性变换**：$M_{aX+b}(t) = e^{bt} M_X(at)$
+
+### 例4.7：伯努利分布的 MGF
+
+设 $X \sim \text{Bernoulli}(p)$，则：
+
+$$M_X(t) = E[e^{tX}] = e^{t \cdot 0}(1-p) + e^{t \cdot 1} p = (1-p) + pe^t$$
+
+验证：$M_X'(t) = pe^t$，$M_X'(0) = p = E[X]$ ✓
+
+$M_X''(t) = pe^t$，$M_X''(0) = p = E[X^2]$，$\text{Var}(X) = p - p^2 = p(1-p)$ ✓
+
+### 例4.8：泊松分布的 MGF
+
+设 $X \sim \text{Poisson}(\lambda)$，则：
+
+$$M_X(t) = \sum_{k=0}^{\infty} e^{tk} \frac{\lambda^k e^{-\lambda}}{k!} = e^{-\lambda} \sum_{k=0}^{\infty} \frac{(\lambda e^t)^k}{k!} = e^{-\lambda} \cdot e^{\lambda e^t} = e^{\lambda(e^t - 1)}$$
+
+验证：$M_X'(t) = \lambda e^t \cdot e^{\lambda(e^t-1)}$，$M_X'(0) = \lambda = E[X]$ ✓
+
+### 特征函数简介
+
+当 MGF 不存在时（如柯西分布），可以使用**特征函数**（Characteristic Function）：
+
+$$\varphi_X(t) = E[e^{itX}]$$
+
+其中 $i = \sqrt{-1}$。特征函数**对任何分布都存在**（因为 $|e^{itX}| = 1$），且同样具有唯一确定分布的性质。特征函数将在极限定理（第10-11章）中发挥关键作用。
+
+---
+
 ## 本章小结
 
 | 概念 | 定义/公式 |
@@ -201,12 +251,14 @@ $\sigma = \sqrt{\frac{35}{12}} \approx 1.71$
 | 期望 | $E[X] = \sum_i x_i p(x_i)$ |
 | 方差 | $\text{Var}(X) = E[X^2] - (E[X])^2$ |
 | 标准差 | $\sigma = \sqrt{\text{Var}(X)}$ |
+| 矩母函数 | $M_X(t) = E[e^{tX}]$，$M_X^{(n)}(0) = E[X^n]$ |
 
 **核心要点**：
 - 随机变量将随机试验的结果数值化
 - PMF描述离散随机变量的完整概率分布
 - 期望是概率加权平均，具有线性性
 - 方差度量分布的离散程度
+- 矩母函数是求矩、证明分布唯一性和研究独立变量之和的强力工具
 
 ---
 

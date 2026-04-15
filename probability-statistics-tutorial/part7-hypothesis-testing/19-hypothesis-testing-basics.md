@@ -354,6 +354,66 @@ $$p \leq \alpha \iff T \in W$$
 
 ---
 
+## 19.6 最优检验理论
+
+### 19.6.1 最优检验的含义
+
+在给定显著性水平 $\alpha$ 下，是否存在**功效最大**（最容易发现 $H_0$ 为假）的检验？答案由 Neyman-Pearson 引理给出。
+
+### 19.6.2 Neyman-Pearson 引理
+
+**定理（Neyman-Pearson 引理）** 考虑**简单假设 vs 简单假设**的检验：
+
+$$H_0: \theta = \theta_0 \quad \text{vs} \quad H_1: \theta = \theta_1$$
+
+设样本 $\mathbf{x} = (x_1, \ldots, x_n)$，似然函数分别为 $L(\theta_0) = \prod f(x_i; \theta_0)$ 和 $L(\theta_1) = \prod f(x_i; \theta_1)$。
+
+定义**似然比**：
+
+$$\Lambda(\mathbf{x}) = \frac{L(\theta_1)}{L(\theta_0)}$$
+
+则在所有显著性水平为 $\alpha$ 的检验中，**拒绝域为 $\Lambda(\mathbf{x}) > c$**（其中 $c$ 由 $P(\Lambda > c \mid H_0) = \alpha$ 确定）的检验具有**最大功效**。
+
+$$\boxed{W^* = \left\{\mathbf{x} : \frac{L(\theta_1)}{L(\theta_0)} > c\right\} \quad \text{是水平 } \alpha \text{ 下的一致最优（UMP）检验}}$$
+
+**直觉**：似然比 $\Lambda$ 衡量"数据更支持 $H_1$ 还是 $H_0$"。$\Lambda$ 越大，证据越倾向 $H_1$，所以应当拒绝 $H_0$。
+
+### 19.6.3 示例：正态均值的最优检验
+
+设 $X_1, \ldots, X_n \overset{iid}{\sim} \mathcal{N}(\mu, \sigma^2)$（$\sigma^2$ 已知），检验 $H_0: \mu = \mu_0$ vs $H_1: \mu = \mu_1$（$\mu_1 > \mu_0$）。
+
+似然比：
+
+$$\Lambda = \frac{L(\mu_1)}{L(\mu_0)} = \exp\left(\frac{(\mu_1 - \mu_0)}{\sigma^2}\sum_{i=1}^n x_i - \frac{n(\mu_1^2 - \mu_0^2)}{2\sigma^2}\right)$$
+
+取对数后，$\ln\Lambda$ 是 $\bar{X}$ 的递增函数，因此 $\Lambda > c$ 等价于 $\bar{X} > c'$，即**z 检验**的拒绝域。
+
+**结论**：z 检验在这种设定下是最优的——它不仅直觉合理，而且在功效意义下不可能被超越。
+
+### 19.6.4 广义似然比检验（GLRT）
+
+对于**复合假设**（参数取值范围而非单点），Neyman-Pearson 引理不直接适用，需推广为**广义似然比检验**。
+
+定义广义似然比统计量：
+
+$$\Lambda^*(\mathbf{x}) = \frac{\sup_{\theta \in \Theta_0} L(\theta; \mathbf{x})}{\sup_{\theta \in \Theta} L(\theta; \mathbf{x})}$$
+
+其中 $\Theta_0$ 是 $H_0$ 约束下的参数空间，$\Theta$ 是完整参数空间。
+
+拒绝域为 $\Lambda^* < c$（比值小表示 $H_0$ 下的最大似然远小于总体最大似然）。
+
+**Wilks 定理**：在大样本下，$-2\ln\Lambda^* \xrightarrow{d} \chi^2(r)$，其中 $r = \dim(\Theta) - \dim(\Theta_0)$ 是自由度。
+
+**重要性**：t 检验、F 检验、卡方检验等常用检验，实际上都可以视为广义似然比检验的特例。
+
+---
+
+## 本章小结（更新）
+
+> 补充：Neyman-Pearson 引理说明，似然比检验在简单 vs 简单假设下具有最大功效；广义似然比检验将此思想推广到复合假设，并通过 Wilks 定理获得渐近分布。
+
+---
+
 ## 深度学习应用
 
 ### 应用一：A/B 测试——评估模型改进效果

@@ -114,6 +114,33 @@
 | 多元正态 | $f(\mathbf{x}) = \dfrac{1}{(2\pi)^{n/2}|\Sigma|^{1/2}} \exp\left(-\dfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^T\Sigma^{-1}(\mathbf{x}-\boldsymbol{\mu})\right)$ |
 | Dirichlet | $f(\mathbf{x}) = \dfrac{\Gamma(\sum_i \alpha_i)}{\prod_i \Gamma(\alpha_i)} \prod_{i=1}^{K} x_i^{\alpha_i - 1}$ |
 
+### 3.4 矩母函数（MGF）
+
+| 分布 | $M_X(t) = E[e^{tX}]$ | 存在条件 |
+|------|------------------------|----------|
+| Bernoulli$(p)$ | $(1-p) + pe^t$ | 所有 $t$ |
+| Binomial$(n,p)$ | $[(1-p) + pe^t]^n$ | 所有 $t$ |
+| Poisson$(\lambda)$ | $e^{\lambda(e^t - 1)}$ | 所有 $t$ |
+| Geometric$(p)$ | $\dfrac{pe^t}{1-(1-p)e^t}$ | $t < -\ln(1-p)$ |
+| Uniform$(a,b)$ | $\dfrac{e^{tb} - e^{ta}}{t(b-a)}$ | 所有 $t$ |
+| Exp$(\lambda)$ | $\dfrac{\lambda}{\lambda - t}$ | $t < \lambda$ |
+| $\mathcal{N}(\mu, \sigma^2)$ | $\exp(\mu t + \sigma^2 t^2/2)$ | 所有 $t$ |
+| Gamma$(\alpha, \beta)$ | $\left(\dfrac{\beta}{\beta - t}\right)^\alpha$ | $t < \beta$ |
+| $\chi^2(n)$ | $(1 - 2t)^{-n/2}$ | $t < 1/2$ |
+
+**核心性质**：$M_X^{(n)}(0) = E[X^n]$；独立变量之和 $M_{X+Y}(t) = M_X(t) M_Y(t)$
+
+### 3.5 常见共轭先验对
+
+| 似然（数据模型） | 先验分布 | 后验分布 | 后验参数更新 |
+|-----------------|----------|----------|-------------|
+| Bernoulli / Binomial | Beta$(\alpha, \beta)$ | Beta$(\alpha+k, \beta+n-k)$ | $k$: 成功次数 |
+| Poisson$(\lambda)$ | Gamma$(\alpha, \beta)$ | Gamma$(\alpha+\sum x_i, \beta+n)$ | |
+| Normal (均值, $\sigma^2$ 已知) | Normal$(\mu_0, \tau^2)$ | Normal$(\tilde{\mu}, \tilde{\tau}^2)$ | 精度加权平均 |
+| Normal (方差, $\mu$ 已知) | Inv-Gamma$(\alpha, \beta)$ | Inv-Gamma$(\alpha+n/2, \beta+\frac{1}{2}\sum(x_i-\mu)^2)$ | |
+| Multinomial | Dirichlet$(\boldsymbol{\alpha})$ | Dirichlet$(\boldsymbol{\alpha} + \mathbf{x})$ | |
+| Exponential$(\lambda)$ | Gamma$(\alpha, \beta)$ | Gamma$(\alpha+n, \beta+\sum x_i)$ | |
+
 ---
 
 ## 四、极限定理

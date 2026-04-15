@@ -252,9 +252,31 @@ Wishart 分布在高斯过程、贝叶斯线性回归、多元时间序列等模
 
 设 $\mathbf{X} \sim f_{\mathbf{X}}(\mathbf{x})$，$\mathbf{Y} = g(\mathbf{X})$ 是可逆变换，令 $\mathbf{x} = g^{-1}(\mathbf{y})$，则 $\mathbf{Y}$ 的 PDF 为：
 
-$$f_{\mathbf{Y}}(\mathbf{y}) = f_{\mathbf{X}}\!\left(g^{-1}(\mathbf{y})\right) \cdot \left|\det\mathbf{J}_{g^{-1}}(\mathbf{y})\right|$$
+$$\boxed{f_{\mathbf{Y}}(\mathbf{y}) = f_{\mathbf{X}}\!\left(g^{-1}(\mathbf{y})\right) \cdot \left|\det\mathbf{J}_{g^{-1}}(\mathbf{y})\right|}$$
 
 其中 $\mathbf{J}_{g^{-1}}$ 是逆变换的 **Jacobian 矩阵**（各偏导数组成的矩阵），行列式的绝对值 $|\det \mathbf{J}|$ 是体积缩放因子。
+
+**Jacobian 矩阵** 的具体形式：设 $\mathbf{x} = (x_1, \ldots, x_n)$，$\mathbf{y} = (y_1, \ldots, y_n)$，则：
+
+$$\mathbf{J}_{g^{-1}} = \begin{pmatrix} \frac{\partial x_1}{\partial y_1} & \cdots & \frac{\partial x_1}{\partial y_n} \\ \vdots & \ddots & \vdots \\ \frac{\partial x_n}{\partial y_1} & \cdots & \frac{\partial x_n}{\partial y_n} \end{pmatrix}$$
+
+**直觉**：Jacobian 行列式度量变换在局部的"体积伸缩"比例。概率密度 = 概率质量/体积，因此变换后需要除以伸缩比例。
+
+### 例9.4b：二维变量变换
+
+设 $(X, Y)$ 的联合 PDF 为 $f_{X,Y}(x,y)$，令 $U = X + Y$，$V = X - Y$。
+
+逆变换：$X = (U+V)/2$，$Y = (U-V)/2$。Jacobian 行列式：
+
+$$\left|\det\begin{pmatrix} \partial x/\partial u & \partial x/\partial v \\ \partial y/\partial u & \partial y/\partial v \end{pmatrix}\right| = \left|\det\begin{pmatrix} 1/2 & 1/2 \\ 1/2 & -1/2 \end{pmatrix}\right| = \left|-\frac{1}{2}\right| = \frac{1}{2}$$
+
+$$f_{U,V}(u, v) = f_{X,Y}\!\left(\frac{u+v}{2}, \frac{u-v}{2}\right) \cdot \frac{1}{2}$$
+
+**应用**：若只需要 $U = X+Y$ 的分布，对 $v$ 积分即得**卷积公式**：
+
+$$f_U(u) = \int_{-\infty}^{+\infty} f_{X,Y}\!\left(\frac{u+v}{2}, \frac{u-v}{2}\right) \cdot \frac{1}{2} \, dv$$
+
+当 $X, Y$ 独立时简化为 $f_U(u) = \int f_X(x) f_Y(u-x) dx$（即 $f_X * f_Y$）。
 
 ### 常用变换技术
 

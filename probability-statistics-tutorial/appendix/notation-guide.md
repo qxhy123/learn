@@ -69,6 +69,11 @@
 | $\text{Cov}(X, Y)$ | 协方差 | $E[(X - \mu_X)(Y - \mu_Y)]$ |
 | $\rho_{XY}$ 或 $\text{Corr}(X, Y)$ | 相关系数 | $\text{Cov}(X,Y)/(\sigma_X \sigma_Y)$ |
 | $E[X \mid Y]$ | 条件期望 | 给定 $Y$ 时 $X$ 的期望 |
+| $\text{Var}(X \mid Y)$ | 条件方差 | 给定 $Y$ 时 $X$ 的方差 |
+| $M_X(t)$ | 矩母函数 (MGF) | $E[e^{tX}]$，$M_X^{(n)}(0) = E[X^n]$ |
+| $\varphi_X(t)$ | 特征函数 | $E[e^{itX}]$，对任意分布都存在 |
+| $E[X^n]$ | $n$ 阶矩 | $n$ 阶原点矩 |
+| $E[(X-\mu)^n]$ | $n$ 阶中心矩 | 围绕均值的矩 |
 
 ---
 
