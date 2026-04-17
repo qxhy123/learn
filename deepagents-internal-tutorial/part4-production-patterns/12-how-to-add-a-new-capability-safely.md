@@ -50,6 +50,16 @@
 
 ---
 
+## 常看文件与常回跳章节
+
+做这类改动时，最常回看的文件通常是 `deepagents/.../graph.py`、`middleware/subagents.py`、`middleware/filesystem.py`，因为装配根、parent-child handoff、工具面和 backend 接口经常在这里汇合。
+
+如果你在判断“这项能力到底落在哪层”，先回跳 [第3章](../part1-foundations/03-create-deep-agent-as-assembly-root.md)；
+如果你在判断 subagent / interrupt / visibility 边界，再回跳 [第5章](../part2-core-runtime/05-subagents-and-context-isolation.md)；
+如果你在判断这项改动最少该补哪些验证，再回跳 [第10章](../part3-extensibility/10-testing-the-harness.md)。
+
+---
+
 ## 推荐工作流
 
 ### 1. 先做层次归属判断

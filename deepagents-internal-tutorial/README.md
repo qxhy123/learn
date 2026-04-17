@@ -91,6 +91,16 @@
 
 ---
 
+## 这套教程如何形成一个系统
+
+- [第1章](./part1-foundations/01-what-deepagents-builds.md) 到 [第3章](./part1-foundations/03-create-deep-agent-as-assembly-root.md) 先把三层 ownership、跨仓调用链和 assembly root 讲清，负责建立系统地图。
+- [第4章](./part2-core-runtime/04-filesystem-and-state-model.md) 到第7章负责 runtime case studies，把 filesystem、subagent、memory/config、streaming/permissions 这些高频边界逐个拆开。
+- [第8章](./part3-extensibility/08-backend-protocol-and-storage-strategy.md) 到第10章负责扩展与验证，回答“新能力该落哪层、怎样测、怎样避免把 harness 改坏”。
+- [第11章](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 和第12章负责维护工作流，把 examples 反推成源码入口，再把新增能力的工作流收束成维护者动作。
+- 换句话说，这套教程不是按仓库切开写，而是按“先系统地图，再运行时，再扩展面，最后维护动作”来组织。
+
+---
+
 ## 推荐阅读路径
 
 ### 路径 1：先抓总边界

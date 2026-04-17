@@ -123,6 +123,19 @@
 
 ---
 
+## 如何把后续章节挂回装配根
+
+如果你后面在 [第4章](../part2-core-runtime/04-filesystem-and-state-model.md) 查 filesystem / backend 问题，或者在 [第8章](../part3-extensibility/08-backend-protocol-and-storage-strategy.md) 查扩展策略，最后都应该回到这里确认：
+这些能力究竟是在哪个 middleware、backend、profile 位置被接进 `create_deep_agent()` 的。
+
+如果你在 [第11章](../part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 里通过 example 追到某个 wiring，也应该回跳本章确认：
+那个 wiring 究竟是在复用默认 harness，还是 example 自己又包了一层本地装配。
+
+所以这章的作用不是再讲一遍 runtime，而是给后续所有 case study 和扩展章节提供一个固定回挂点：
+先回到 assembly root，再判断问题属于上游 primitive，还是属于 Deep Agents 的默认装配策略。
+
+---
+
 ## 为什么 middleware 顺序不能随便动
 
 ### `SubAgentMiddleware` 不只是多一个工具

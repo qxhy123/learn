@@ -75,6 +75,14 @@
 
 只保留维护者最容易误判的边界问题。
 
+### 哪些章节是受控例外
+
+- 大多数章节都会尽量沿着上面的骨架写，但这不是要求每章长得完全一样。
+- [第2章](./part1-foundations/02-repo-map-and-package-boundaries.md) 是“架构图谱型”特例，它更像全书的跨仓地图，所以会比普通章节更像一份大型档案。
+- [第11章](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 是“example-lens”特例，它的职责是让你从样本反推三层边界，而不是再重复一遍通用模板。
+- 这些特例并没有脱离教程主线；它们仍然在回答同一组问题：
+  ownership 在哪层、传播经过哪条线、出了问题该修上游还是修本地 harness。
+
 ---
 
 ## 学习目标

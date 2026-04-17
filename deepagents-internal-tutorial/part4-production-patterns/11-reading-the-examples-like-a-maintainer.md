@@ -31,6 +31,15 @@
 
 ---
 
+## 为什么这一章故意长得不一样
+
+这一章是 example-lens / index 型特例章节，所以它不会像 [第2章](../part1-foundations/02-repo-map-and-package-boundaries.md) 或 [第3章](../part1-foundations/03-create-deep-agent-as-assembly-root.md) 那样先给一整套通用分层模板。
+它的职责是把样本目录和源码入口一一钉住，再把你引回系统章节和 [附录 C](../appendix/examples-index.md)。
+
+读 example 时如果你发现自己开始争论 ownership、assembly root、streaming visibility、callback propagation 这些通用问题，就说明应该先回跳到系统章节，再回来继续读样本。
+
+---
+
 ## 先把 Examples 分三类
 
 | 类别 | 代表目录 | 这类样本最适合回答什么问题 |

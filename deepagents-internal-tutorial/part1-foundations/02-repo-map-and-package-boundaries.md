@@ -84,6 +84,13 @@
 
 ---
 
+## 这一章为什么是架构图谱型特例
+
+这一章故意比普通章节更像一份跨仓地图，因为它要先把三层 ownership、主交互链和扩展面一次性摆平。
+读到具体装配问题时回跳第 3 章；读到 runtime / 可见性问题时回跳第 4 到第 7 章；读到扩展与验证问题时回跳第 8 到第 10 章。
+
+---
+
 ## 跨仓模块交互关系图
 
 这张图只画主调用链，故意省略 provider-specific 叶子模块，例如
@@ -513,6 +520,13 @@ result = child_graph.invoke(
 | callback tree、`get_child()`、config 合并与上下文传播 | `langchain_core` |
 | `BaseTool.run()` / `BaseChatModel.stream()` 的事件触发与参数传递 | `langchain_core` |
 | agent middleware hook 语义、动态工具、structured output agent loop | `langchain_v1/agents` |
+
+---
+
+## 什么时候该优先修上游
+
+如果问题落在 `ToolRuntime`、`stream_mode`、`nostream`、callback tree、`RunnableConfig` merge 这些语义层，优先回看 `langgraph` 或 `langchain_core`。
+如果问题只涉及默认 middleware 顺序、profile、permissions、subagent policy 这类 harness 装配策略，就不要先动上游。
 
 ---
 
