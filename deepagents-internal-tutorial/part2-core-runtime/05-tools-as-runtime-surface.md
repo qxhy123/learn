@@ -28,9 +28,10 @@ tools 在这条路里不是孤立专题，而是 runtime surface 的一个具体
 建议同时打开：
 
 - `langgraph/libs/langgraph/langgraph/graph/state.py`
-- `langgraph/libs/langgraph/langgraph/pregel/__init__.py`
-- `langgraph/libs/langgraph/langgraph/pregel/loop.py`
-- `langgraph/libs/langgraph/langgraph/pregel/runner.py`
+- `langgraph/libs/langgraph/langgraph/pregel/main.py`
+- `langgraph/libs/langgraph/langgraph/pregel/_loop.py`
+- `langgraph/libs/langgraph/langgraph/pregel/_runner.py`
+- `langgraph/libs/langgraph/langgraph/pregel/__init__.py`（只作为 `Pregel` / `NodeBuilder` 的 re-export surface，不是主逻辑入口）
 - `deepagents/libs/deepagents/deepagents/graph.py`
 - `deepagents/libs/deepagents/deepagents/middleware/filesystem.py`
 - `deepagents/libs/deepagents/deepagents/middleware/subagents.py`
@@ -89,19 +90,20 @@ compile 的意义是把 “业务图长什么样” 固化成一个 Pregel 可�
 
 ### `Pregel._defaults()` 在运行前装配了什么
 
-`_defaults()` 在进入 loop 前整理 stream mode、subgraphs、checkpointer、store、cache、interrupt 与 runtime config。
+`_defaults()` 在进入 loop 前计算并返回 stream modes、output keys、interrupt 设置、checkpointer、store、cache、durability，以及本轮执行要沿用的相关 pre-loop defaults。
 
-这是 Pregel 真正开始跑之前的装配层。它不定义 graph shape，而是把“这次 invocation 应该带着什么运行参数进去”统一整理出来。
+这是 Pregel 真正开始跑之前的默认值整理层。它不定义 graph shape，也不等于把后续 runtime assembly 一次做完。
 
-维护者可以把它理解成 execution envelope 的归口点。到这里，Pregel 会把：
+维护者可以把它理解成“先把 loop 需要的默认参数算齐”的阶段。到这里，Pregel 会先确定：
 
 - 这次要不要开 `messages` / `updates` / `custom` 等 stream mode
-- subgraph 是否需要向上透出事件
-- checkpointer、store、cache 是否存在以及怎样挂到本轮执行
-- interrupt 与 runtime config 怎样合并进本次 loop
-- invocation config 怎样传给后续 loop、runner 与 task
+- 哪些 key 会作为本轮 output keys 被使用
+- checkpointer、store、cache、durability 是否存在以及各自取什么值
+- interrupt 与其他 pre-loop defaults 怎样传给后续 loop
 
-这就是为什么很多“为什么这里能拿到 store / stream / interrupt 配置”的问题，不能直接怪到 tool 实现头上。那些东西先在 `_defaults()` 里被整理，后面才轮到 loop 和 runner 消费。
+subgraph stream handling，以及 `Pregel.stream()` / `astream()` 里对 `Runtime` 的构造与 merge，都发生在 `_defaults()` 返回之后、loop 启动之前。
+
+这就是为什么很多“为什么这里能拿到 store / stream / interrupt 配置”的问题，不能直接怪到 tool 实现头上。`_defaults()` 先把 pre-loop defaults 算出来，后面才轮到 `stream()` / `astream()` 继续装 runtime，再交给 loop 和 runner 消费。
 
 ### `SyncPregelLoop` / `AsyncPregelLoop` 如何推进 step
 
