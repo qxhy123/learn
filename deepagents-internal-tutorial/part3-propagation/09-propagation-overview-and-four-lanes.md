@@ -45,6 +45,8 @@
 
 ## 运行时链路
 
+这一章默认你已经接受第4章的 Pregel 模型和第5章的 Pregel 主路径；这里不重复解释 step、runner 或 runtime injection 本身。
+
 一次内部调用，最稳妥的读法是按四条线并排看，而不是把它们拍成一条“总传播链”：
 
 1. 执行线先决定某个 node、tool、model call 到底有没有真的跑起来。
@@ -80,6 +82,13 @@ flowchart TD
   A --> D
   A --> E
 ```
+
+### 四条线与 Pregel runtime 的对应关系
+
+- 执行线：step、task、runner 的执行背景回第4章和第5章。
+- 观测线：callback/config/run tree 的判断回第10章。
+- 流输出线：`messages` / `updates` / `custom` 的 consumer 可见性回第11章。
+- 结果折返线：state update、tool return、subagent return surface 要同时回看第4章、第5章、第7章和第12章。
 
 ### 执行线
 
