@@ -8,6 +8,13 @@
 
 ## 四条线速查
 
+在继续看 selective visibility 之前，先分清回跳入口：
+
+- 执行模型先回第4章。
+- 执行路径先回第5章。
+- callback/config 判断回第10章。
+- 流可见性再继续看本页。
+
 - 执行线
   先回答“它到底有没有跑起来”。第一站看 `BaseTool.run()`、`BaseChatModel.invoke()/stream()`、LangGraph node / subgraph step。
 - 观测线

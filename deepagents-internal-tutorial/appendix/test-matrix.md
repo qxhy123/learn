@@ -36,6 +36,8 @@
 | `graph.py` 默认 middleware 顺序 | `test_graph.py`、相关 smoke tests、至少一个 integration test |
 | subagent handoff / state bubbling | `test_subagents.py`、`test_async_subagents.py`、`integration_tests/test_subagent_middleware.py` |
 | callback / config 传播相关结论 | 本地 `test_subagents.py` 对应 case，外加上游 `langchain_core` 源码核对 |
+| Pregel state model / reducer / step boundary 相关结论 | 本地 state-native regression + Chapter 4 claims cross-check，外加 `langgraph/pregel/main.py`、`_loop.py` 核对 |
+| Pregel execution path / runtime injection 相关结论 | 本地 runtime-path regression + Chapter 5 claims cross-check，外加 `langgraph/pregel/main.py`、`_runner.py` 核对 |
 | streaming visibility / `nostream` / `subgraphs` 相关结论 | 本地 streaming 测试，外加 `langgraph/pregel/main.py`、`_messages.py` 核对 |
 | result-return / parent-visible state / summary 折返相关结论 | 本地 subagent integration test + state / summary 相关断言，外加 `middleware/subagents.py` 与 LangGraph reducer 路径核对 |
 | 文件工具 / backend | `test_file_system_tools.py`、`test_filesystem_middleware.py`、backend 对应单测 |
@@ -118,7 +120,9 @@
 2. streaming visibility 是否仍按 `messages` / `updates` / `custom` 分开成立
 3. result-return / state bubbling / summary 折返语义是否漂移
 4. `ToolRuntime` 注入字段是否变化
-5. Deep Agents 本地文档是否仍然准确
+5. Pregel state model 的 step boundary 解释是否仍然准确
+6. Pregel execution path 的 `_defaults()` / loop / runner / runtime injection 解释是否仍然准确
+7. Deep Agents 本地文档是否仍然准确
 
 ---
 
