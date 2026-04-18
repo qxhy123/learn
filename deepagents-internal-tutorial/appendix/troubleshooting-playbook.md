@@ -18,6 +18,11 @@
 - 然后看 `LangChain`
 - 最后才看 `Deep Agents`
 
+### 先查哪条线
+
+- 先查流输出线
+- 再回看观测线和执行线
+
 ### 常见原因
 
 - 外层 consumer 开了 `stream_mode="messages"`
@@ -52,6 +57,11 @@
 
 - `Deep Agents` + `LangGraph`
 
+### 先查哪条线
+
+- 先查结果折返线
+- 再确认流输出线是不是已经被过滤
+
 ### 常见原因
 
 - `nostream` 只过滤 `messages` 流
@@ -79,6 +89,11 @@
 - 首先看 `LangChain`
 - 同时留意 `Deep Agents` 当前已知缺口
 
+### 先查哪条线
+
+- 先查观测线
+- 再确认执行线是否真的走了你以为的 runnable / tool 路径
+
 ### 常见原因
 
 - `BaseTool.run()` 的 child callback tree 传播不是你想象的那样
@@ -90,7 +105,7 @@
 - `langchain/libs/core/langchain_core/runnables/config.py`
 - `langchain/libs/core/langchain_core/callbacks/manager.py`
 - `langchain/libs/core/langchain_core/tools/base.py`
-- 第 6 章中的证据矩阵
+- 第10章中的 callback/config 证据矩阵
 - `deepagents/libs/deepagents/tests/unit_tests/test_subagents.py`
 - `deepagents/libs/deepagents/tests/integration_tests/test_subagent_middleware.py`
 
@@ -107,6 +122,11 @@
 ### 最可能的 owner layer
 
 - `LangGraph`
+
+### 先查哪条线
+
+- 先查流输出线
+- 再确认执行线里相关 node / tool 是否真的跑到发事件那一步
 
 ### 常见原因
 
@@ -133,6 +153,11 @@
 
 - `Deep Agents` 本地 policy 设计
 
+### 先查哪条线
+
+- 先查执行线
+- 再看结果折返线和对外暴露的 tool surface
+
 ### 常见原因
 
 - Deep Agents 的 permissions 主要守默认文件工具面
@@ -141,7 +166,7 @@
 
 ### 先看哪里
 
-- 第 7 章的 permissions 边界分析
+- 第 8 章的 permissions 边界分析
 - `deepagents/libs/deepagents/deepagents/middleware/subagents.py`
 - `deepagents/libs/deepagents/deepagents/middleware/async_subagents.py`
 - 远端 server 或 child graph 自己的 tool / backend 实现
@@ -159,6 +184,11 @@
 ### 最可能的 owner layer
 
 - `Deep Agents`
+
+### 先查哪条线
+
+- 先查结果折返线和 prompt / state 装配面
+- 如果你怀疑 tracing 泄漏，再单独查观测线
 
 ### 常见原因
 
@@ -187,6 +217,11 @@
 
 - `Deep Agents` async subagent workflow
 
+### 先查哪条线
+
+- 先查结果折返线
+- 再补查执行线确认当前 live status 是不是重新获取的
+
 ### 常见原因
 
 - 你在复述旧的 tool result，而不是重新查询 live status
@@ -211,6 +246,11 @@
 
 ### 最小分层判断法
 
+### 先查哪条线
+
+- 先按四条线把症状拆开
+- 再决定先去 `LangChain`、`LangGraph` 还是 `Deep Agents`
+
 先问这三个问题：
 
 1. 是 tool/model primitive 的 callback/config 语义变了？
@@ -225,7 +265,7 @@
 ### 升级前最小检查清单
 
 - 对照第 2 章重新确认边界归属
-- 对照第 6、7 章确认传播线和可见性线有没有混淆
+- 对照第9章到第12章确认传播四线和可见性线有没有混淆
 - 对照第 10 章补最小 regression test
 - 用附录 C 找一个最像的 example 做现实样本
 - 能复现到上游 primitive / runtime 层，就不要先在本地 harness 打补丁

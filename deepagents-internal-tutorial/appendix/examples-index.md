@@ -2,7 +2,7 @@
 
 这一页把 `deepagents/examples/` 当成“源码阅读入口表”，不是“照抄模板集合”。
 
-如果你只想知道某个问题先看哪个目录，这一页比第 11 章更适合快速检索。
+如果你只想知道某个问题先看哪个目录，这一页比第16章更适合快速检索。
 
 ---
 
@@ -138,6 +138,19 @@
 
 ---
 
+## 按横向主题查 example
+
+| 横向主题 | 推荐 example | 为什么先看它 |
+|----------|--------------|--------------|
+| `Assembly` | `deep_research`、`text-to-sql-agent` | 最容易看清 `create_deep_agent()` 如何把上游 primitive 和本地策略装成一个 harness |
+| `Context` | `content-builder-agent` | memory、skills、filesystem、`AGENTS.md` / `SKILL.md` 的装配关系最集中 |
+| `Execution` | `deep_research`、`async-subagent-server` | 一个代表本地 `task` handoff，一个代表远端 async handoff |
+| `Propagation` | `deep_research`、`async-subagent-server` | 最适合对照 callback/config、stream、结果折返三条不同可见面 |
+| `Extension` | `text-to-sql-agent`、`better-harness` | 一个看 toolkit 接缝，一个看 harness 本身如何作为扩展对象 |
+| `Operations` | `better-harness`、`ralph_mode`、`deploy-*` | 一个偏评估和回归，一个偏外循环，一个偏部署与运行环境 |
+
+---
+
 ## 阅读时要始终标注的三件事
 
 读任何 example，都建议先在旁边记下这三类标签：
@@ -157,6 +170,6 @@
 
 ## 本页小结
 
-- 先用这一页定位 example，再去第 11 章看详细拆解。
+- 先用这一页定位 example，再去第16章看详细拆解。
 - 六个主样本优先级最高，其余目录更适合按专题补充。
 - examples 的最大价值，不是提供“标准答案”，而是提供“最短追源码入口”。

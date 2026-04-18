@@ -10,7 +10,7 @@
 
 - 横向主题：`Assembly`, `Propagation`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第1章：这一栈到底在构建什么](./01-what-deepagents-builds.md)
-- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第6章：Memory、Skills、Prompt Layering 与 Config 传播](../part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、拦截边界与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章：Summarization、Streaming、Permissions 与安全边界](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)
+- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第6章：Memory、Skills、Prompt Layering 与 Config 传播](../part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章：Summarization、Permissions 与安全边界](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)
 
 ## 静态结构
 

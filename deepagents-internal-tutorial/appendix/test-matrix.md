@@ -37,6 +37,7 @@
 | subagent handoff / state bubbling | `test_subagents.py`、`test_async_subagents.py`、`integration_tests/test_subagent_middleware.py` |
 | callback / config 传播相关结论 | 本地 `test_subagents.py` 对应 case，外加上游 `langchain_core` 源码核对 |
 | streaming visibility / `nostream` / `subgraphs` 相关结论 | 本地 streaming 测试，外加 `langgraph/pregel/main.py`、`_messages.py` 核对 |
+| result-return / parent-visible state / summary 折返相关结论 | 本地 subagent integration test + state / summary 相关断言，外加 `middleware/subagents.py` 与 LangGraph reducer 路径核对 |
 | 文件工具 / backend | `test_file_system_tools.py`、`test_filesystem_middleware.py`、backend 对应单测 |
 | memory / skills / private state 过滤 | `middleware/test_memory_middleware.py`、`middleware/test_skills_middleware.py` |
 | provider profile / model routing | `test_models.py`、必要时加 smoke snapshot |
@@ -85,6 +86,15 @@
 - `langchain/libs/core/langchain_core/tools/base.py`
 - `langchain/libs/core/langchain_core/language_models/chat_models.py`
 
+### 改 result-return / state bubbling / summary 结论
+
+至少同时核对：
+
+- `deepagents/libs/deepagents/tests/unit_tests/test_subagents.py`
+- `deepagents/libs/deepagents/tests/integration_tests/test_subagent_middleware.py`
+- `deepagents/libs/deepagents/deepagents/middleware/subagents.py`
+- 相关 state reducer / summary 写回路径
+
 ---
 
 ## 维护者应主动补的测试类型
@@ -105,9 +115,10 @@
 至少重新核对：
 
 1. callback/config 是否仍按原路径传播
-2. `subgraphs=True` 与 `messages` / `updates` / `custom` 语义是否漂移
-3. `ToolRuntime` 注入字段是否变化
-4. Deep Agents 本地文档是否仍然准确
+2. streaming visibility 是否仍按 `messages` / `updates` / `custom` 分开成立
+3. result-return / state bubbling / summary 折返语义是否漂移
+4. `ToolRuntime` 注入字段是否变化
+5. Deep Agents 本地文档是否仍然准确
 
 ---
 

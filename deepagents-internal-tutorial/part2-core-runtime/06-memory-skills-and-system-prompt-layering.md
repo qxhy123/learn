@@ -12,7 +12,7 @@
 
 - 横向主题：`Context Injection`、`Prompt Layering`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第3章：create_deep_agent 作为装配根](../part1-foundations/03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](./04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](./05-tools-as-runtime-surface.md)
-- 后续章节：[第7章：Subagents、拦截边界与上下文隔离](./07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
+- 后续章节：[第7章：Subagents、任务交接与上下文隔离](./07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
 
 这一章只讨论“哪些上下文材料会被装进当前 run”，不再把 callback tree、token streaming、外层观测矩阵一起揉进来。这里的核心是注入面，不是传播理论。
 
@@ -174,7 +174,7 @@
 - parent 的 `memory_contents` / `skills_metadata` 不应直接泄漏给 child
 - child 要有自己的 skills/memory，就应该显式装配自己的 source 或 middleware
 
-更完整的 parent-child 隔离边界，继续看 [第7章：Subagents、拦截边界与上下文隔离](./07-subagents-and-context-isolation.md)。
+更完整的 parent-child 隔离边界，继续看 [第7章：Subagents、任务交接与上下文隔离](./07-subagents-and-context-isolation.md)。
 
 ### 4. 这里不展开 callback tree 与 stream 可见性
 

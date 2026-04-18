@@ -12,7 +12,7 @@
 
 - 横向主题：`State`、`Storage`、`Runtime Carrier`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第3章：create_deep_agent 作为装配根](../part1-foundations/03-create-deep-agent-as-assembly-root.md)、[第5章：Tools 作为 Runtime Surface](./05-tools-as-runtime-surface.md)
-- 后续章节：[第6章：Memory、Skills、Prompt Layering 与 Config 传播](./06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、拦截边界与上下文隔离](./07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
+- 后续章节：[第6章：Memory、Skills、Prompt Layering 与 Config 传播](./06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、任务交接与上下文隔离](./07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
 
 这一章只回答 filesystem 作为运行载体时的事实：文件能力挂在哪里、状态落在哪里、backend 怎么决定真实介质。通用的 tool-surface 理论已经收口到 [第5章](./05-tools-as-runtime-surface.md)，这里不再重复展开。
 

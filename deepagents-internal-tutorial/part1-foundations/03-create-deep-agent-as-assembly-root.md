@@ -10,7 +10,7 @@
 
 - 横向主题：`Assembly`, `Execution`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第1章：这一栈到底在构建什么](./01-what-deepagents-builds.md)、[第2章：仓库地图与包边界](./02-repo-map-and-package-boundaries.md)
-- 后续章节：[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)、[第7章：Subagents、拦截边界与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第16章：像维护者一样阅读 examples](../part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md)
+- 后续章节：[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第16章：像维护者一样阅读 examples](../part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md)
 
 ## 静态结构
 
