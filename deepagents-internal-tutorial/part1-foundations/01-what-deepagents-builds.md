@@ -1,37 +1,24 @@
 # 第1章：这一栈到底在构建什么
 
-## 学习目标
+## 本章回答什么
 
-学完本章，你应该能回答：
+- `LangChain`、`LangGraph`、`Deep Agents` 各自在解决什么问题，为什么不能只看 `deepagents/`
+- Deep Agents 为什么不是“重新发明 agent runtime”，而是把上游能力约束成默认 harness
+- 维护者第一次定位问题时，为什么必须先用三层 ownership 视角，而不是直接钻某个类或某个仓库
 
-1. `LangChain`、`LangGraph`、`Deep Agents` 各自在解决什么问题
-2. 为什么 Deep Agents 不是一个“重新发明 agent runtime”的项目
-3. 维护者为什么必须用三层视角，而不能只看 `deepagents/`
+## 在整套系统中的位置
 
----
+- 横向主题：`Assembly`
+- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)
+- 后续章节：[第2章：仓库地图与包边界](./02-repo-map-and-package-boundaries.md)、[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)
 
-## 问题是什么
+## 静态结构
 
-第一次读 Deep Agents 时，最容易出现两种误判：
+这一章是全书的 ownership 起点。它先不追某个具体 bug，而是先把三层栈的职责边界摆正，避免后续把所有行为都错误归因到 Deep Agents。
 
-- 误判 1：把所有行为都算到 Deep Agents 头上
-- 误判 2：把 Deep Agents 误看成“只是一些 prompt 和工具的拼装”
+### 三层各自负责什么
 
-这两种看法都不对。
-
-更准确的说法是：
-
-- `LangChain` 提供 agent primitive
-- `LangGraph` 提供 stateful runtime
-- `Deep Agents` 提供 opinionated harness
-
-真正要理解的不是某个类名，而是三层怎么接起来。
-
----
-
-## 哪一层负责什么
-
-### `LangChain`
+#### `LangChain`
 
 负责：
 
@@ -39,7 +26,7 @@
 - `RunnableConfig`、tags、metadata、callbacks 的传播
 - agent middleware hook surface，例如 `wrap_model_call`、`before_model`、`wrap_tool_call`
 
-### `LangGraph`
+#### `LangGraph`
 
 负责：
 
@@ -47,7 +34,7 @@
 - Pregel step 执行、reducer、checkpoint、subgraph
 - `stream_mode`、`subgraphs=True`、`Runtime` / `ToolRuntime`
 
-### `Deep Agents`
+#### `Deep Agents`
 
 负责：
 
@@ -56,9 +43,7 @@
 - 默认 general-purpose subagent
 - backend adapter 与本地策略边界
 
----
-
-## 代码在哪里
+### 代码在哪里
 
 建议同时打开：
 
@@ -68,9 +53,7 @@
 - `langgraph/libs/langgraph/langgraph/pregel/main.py`
 - `langgraph/libs/prebuilt/langgraph/prebuilt/tool_node.py`
 
----
-
-## 实现怎么工作
+## 运行时链路
 
 ### 1. `LangChain` 提供的是 primitive，不是最终 harness
 
@@ -125,9 +108,9 @@ Deep Agents 之所以叫 “deep”，不是因为默认模型更强，而是因
 
 这是一种 harness 深度，而不是单次 LLM 调用深度。
 
----
+## 传播 / 可见性 / 拦截点
 
-## 为什么这不是“几个 feature 的堆叠”
+### 为什么这不是“几个 feature 的堆叠”
 
 如果它只是 feature 堆叠，那么：
 
@@ -139,23 +122,36 @@ Deep Agents 之所以叫 “deep”，不是因为默认模型更强，而是因
 
 > 一个把上游 runtime 约束成默认工作流的 assembly layer。
 
----
+### 维护者在这一章要先记住的三个边界
 
-## 容易踩什么坑
+- callback / config 传播主要属于 `langchain_core`，不是 Deep Agents 自己发明的新机制
+- token 是否能被外层看到，优先看 LangGraph 的 stream observer，而不是先猜 Deep Agents middleware
+- subagent 是否会被主 agent 拦截，和 subagent 的事件是否会被外层观测到，不是同一个问题
 
-- 坑 1：把 `task`、`nostream`、checkpoint、callback manager 全都说成是 Deep Agents 的机制。
-  实际上这些点分别落在不同上游层。
+## 扩展接口
 
-- 坑 2：看到 Deep Agents 有自己的 middleware，就以为上游 agent middleware 不重要。
-  实际上 Deep Agents 正是建立在 LangChain agent middleware surface 之上。
+这一章不展开完整 API 清单，但需要先把扩展面落到对的层：
 
+- `LangChain`：`BaseTool`、`BaseChatModel`、agent middleware hook surface
+- `LangGraph`：`StateGraph`、`Runtime` / `ToolRuntime`、stream mode、checkpoint / subgraph 能力
+- `Deep Agents`：`create_deep_agent()` 装配、middleware 顺序、backend / profile / permissions / subagent policy
+
+如果你还没判断清楚自己在改 primitive、runtime 还是本地装配，就不该直接开始改 Deep Agents 代码。
+
+## 常见问题与排障入口
+
+- 坑 1：把 `task`、`nostream`、checkpoint、callback manager 全都说成是 Deep Agents 的机制。实际上这些点分别落在不同上游层。
+- 坑 2：看到 Deep Agents 有自己的 middleware，就以为上游 agent middleware 不重要。实际上 Deep Agents 正是建立在 LangChain agent middleware surface 之上。
 - 坑 3：把 bug 归因写成“Deep Agents stream 有问题”，但真正的问题在 LangGraph runtime 或 `langchain_core` callback/config 传播。
 
----
+排障入口建议这样选：
 
-## 本章小结
+- 怀疑 config、callbacks、run tree：先看 `langchain/libs/core/langchain_core/`
+- 怀疑 stream、subgraph、checkpoint、可见性：先看 `langgraph/libs/langgraph/langgraph/`
+- 怀疑默认工具、permissions、subagent policy、profile 装配：再回到 `deepagents/libs/deepagents/deepagents/`
 
-- `LangChain` 提供 primitive。
-- `LangGraph` 提供 runtime。
-- `Deep Agents` 提供默认 harness。
-- 维护者读 Deep Agents 时，第一步不是钻实现，而是先认清这三层各自负责什么。
+## 本章结论
+
+- 谁提供：`LangChain` 提供 primitive，`LangGraph` 提供 runtime，`Deep Agents` 提供默认 harness 与 assembly contract。
+- 如何传播：行为先沿 model / tool / callback / config / state / stream 这些上游机制传播，再被 Deep Agents 通过 middleware、profile、backend 重新装配成默认工作流。
+- 修在哪层：先判断问题属于 primitive、runtime 还是本地装配；只有默认顺序、策略和 harness wiring 才优先改 `deepagents`。
