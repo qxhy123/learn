@@ -35,3 +35,36 @@ class RuntimeEvent:
     redacted_payload: Mapping[str, Any] = field(default_factory=dict)
     summary_payload: Mapping[str, Any] = field(default_factory=dict)
     projection_tags: tuple[ProjectionTag, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "session_id": self.session_id,
+            "run_id": self.run_id,
+            "parent_event_id": self.parent_event_id,
+            "actor": self.actor,
+            "event_type": self.event_type,
+            "phase": self.phase.value,
+            "raw_payload": dict(self.raw_payload),
+            "redacted_payload": dict(self.redacted_payload),
+            "summary_payload": dict(self.summary_payload),
+            "projection_tags": [tag.value for tag in self.projection_tags],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RuntimeEvent":
+        return cls(
+            event_id=str(value["event_id"]),
+            session_id=str(value["session_id"]),
+            run_id=str(value["run_id"]),
+            parent_event_id=value.get("parent_event_id"),
+            actor=str(value["actor"]),
+            event_type=str(value["event_type"]),
+            phase=EventPhase(str(value["phase"])),
+            raw_payload=dict(value.get("raw_payload", {})),
+            redacted_payload=dict(value.get("redacted_payload", {})),
+            summary_payload=dict(value.get("summary_payload", {})),
+            projection_tags=tuple(
+                ProjectionTag(tag) for tag in value.get("projection_tags", [])
+            ),
+        )
