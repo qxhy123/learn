@@ -10,7 +10,7 @@
 
 - 横向主题：`Assembly`, `Propagation`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第1章：这一栈到底在构建什么](./01-what-deepagents-builds.md)
-- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
+- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与 Pregel State Model](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
 
 ## 静态结构
 
@@ -178,7 +178,7 @@ Chapter 2 在这里只需要建立一个判断标准：
 
 这一章到这里为止，只负责把 boundary map 立起来，并告诉你后续该去哪一章继续追：
 
-- Pregel 执行模型详见第4章：Filesystem 与状态模型。
+- Pregel 执行模型详见第4章：Filesystem 与 Pregel State Model。
 - Pregel 主执行路径详见第5章：Tools 作为 Runtime Surface。
 - callback / config 传播判断回第10章。
 - stream 可见性与 selective exposure 回第11章与附录 D。

@@ -10,8 +10,8 @@
 ## 在整套系统中的位置
 
 - 横向主题：`Execution`、`Propagation`
-- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第3章：create_deep_agent 作为装配根](../part1-foundations/03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](./04-filesystem-and-state-model.md)
-- 后续章节：[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[Subagents、任务交接与上下文隔离](./07-subagents-and-context-isolation.md)、[Summarization、Permissions 与安全边界](./08-summarization-permissions-and-safety-boundaries.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
+- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第3章：create_deep_agent 作为装配根](../part1-foundations/03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与 Pregel State Model](./04-filesystem-and-state-model.md)
+- 后续章节：[第6章：Memory、Skills、Prompt Layering 与 Config 传播](./06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、任务交接与上下文隔离](./07-subagents-and-context-isolation.md)、[第8章：Summarization、Permissions 与安全边界](./08-summarization-permissions-and-safety-boundaries.md)、[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
 
 ## 静态结构
 
@@ -301,7 +301,7 @@ permissions 最稳妥的理解方式是：
 - 工具里拿不到预期的 `state` / `context`：先确认它是不是经由 LangGraph `ToolNode` 执行，而不是被脱离 graph context 直接调用。
 - 我能看到 `task`，为什么看不到子代理内部所有调用：因为 `task` 是正式 handoff surface，child graph 内部可见性要另看 subgraph runtime、stream mode 和具体 runnable。
 - 顶层 permissions 为什么没挡住 compiled subagent 里的危险逻辑：因为 permissions 主要守的是当前 harness 暴露出来的 tool surface，不是 compiled runnable 的通用安全模型。
-- 文件工具返回成功，但状态没有按预期持久：回查 [第4章：Filesystem 与状态模型](./04-filesystem-and-state-model.md)，确认 backend、`files` state channel、reducer、checkpoint 语义是否吻合。
+- 文件工具返回成功，但状态没有按预期持久：回查 [第4章：Filesystem 与 Pregel State Model](./04-filesystem-and-state-model.md)，确认 backend、`files` state channel、reducer、checkpoint 语义是否吻合。
 - tracing 里看得到 tool run，但 UI 或外层流看不全：把 callback 可见性、stream visibility、parent return 分开排；先看 [附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)。
 
 ## 本章结论
