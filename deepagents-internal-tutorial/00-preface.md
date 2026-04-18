@@ -2,106 +2,93 @@
 
 ## 教程设计理念
 
-这份教程的核心原则只有一句：
+这份教程的基本原则只有一句：先分清三层 ownership，再讨论具体实现。
 
-> 先分清三层 ownership，再讨论实现细节。
+Deep Agents 的大量行为都不是单仓库事实，而是三层协作结果：
 
-如果你只盯住 `deepagents/libs/deepagents`，很多现象会解释不通。因为 Deep Agents 的大量行为其实是三层协作结果：
+- `LangChain / langchain-core` 决定 tool、model、callback manager、`RunnableConfig` 和 middleware surface
+- `LangGraph` 决定 graph runtime、subgraph、checkpoint、stream mode、`Runtime` / `ToolRuntime`
+- `Deep Agents` 决定默认 middleware、backend、profile、subagent policy、permissions 等本地装配策略
 
-- `LangChain / langchain-core` 决定 tool、model、callback manager、`RunnableConfig` 怎么跑
-- `LangGraph` 决定 graph、subgraph、checkpoint、stream mode、`Runtime` / `ToolRuntime` 怎么跑
-- `Deep Agents` 决定默认 middleware、backend、profile、subagent policy、permissions 怎么装配
+因此，本教程不会把 LangGraph / LangChain 当成背景知识，而是把它们视为解释 Deep Agents 的必要组成部分。
 
-因此，本教程不把 LangGraph / LangChain 当成“背景知识”，而把它们当成 Deep Agents 内部教程的一部分。
+## 阅读契约
 
----
+阅读本教程时，默认接受以下约定：
 
-## 推荐的阅读姿势
+1. 不把 `deepagents` 当成孤立仓库阅读；遇到边界问题时必须同时看上游
+2. 不把“看得见”误当成“被父级拦截”，也不把“当前实现如此”误写成硬契约
+3. 每一章都优先回答维护问题：谁负责、怎样传播、哪里可观测、应修哪层、怎样验证
+4. 当教程明确标记某个行为是 `Current implementation` 或 `Known limitation` 时，不要把它当成稳定承诺
+5. 当教程给出最小测试闭环时，默认那是维护者做改动前后的验证基线
 
-### 1. 先看 ownership，再看调用链
+如果你只想记 API 名称而不关心边界、传播和验证，这套教程不会高效。
 
-每章先回答：
+## 来源标签与稳定性标签
 
-- 这个行为属于哪一层
-- 这一层给下游暴露了什么 surface
-- Deep Agents 是在“直接提供能力”，还是“只是把上游能力装配成默认策略”
+后续章节会同时标记“行为来自哪一层”和“它有多稳定”。
 
-### 2. 同时打开上游源码
+| 标签 | 含义 |
+| --- | --- |
+| `LC` | LangChain / langchain-core 提供的 primitive、callback、config 传播语义 |
+| `LG` | LangGraph 提供的 graph runtime、streaming、subgraph、checkpoint 语义 |
+| `DA` | Deep Agents 本地装配、middleware、policy、profile 语义 |
+| `Stable mechanism` | 已被上游 contract 或长期实现稳定支持 |
+| `Current implementation` | 当前实现如此，但不应写成硬契约 |
+| `Known limitation` | 已知缺口或刻意保留的不完整能力 |
+| `Test-backed behavior` | 当前有测试或明确代码证据支持 |
 
-本教程会频繁同时引用：
+使用这些标签的目的，是把“来源”和“稳定性”分开说清，避免混写。
 
-- `deepagents/libs/deepagents/deepagents/graph.py`
-- `langgraph/libs/langgraph/langgraph/pregel/main.py`
-- `langchain/libs/core/langchain_core/runnables/config.py`
+## 每章的统一章法
 
-不要只看 Deep Agents 本地代码，再靠记忆猜上游行为。
+除少数特例外，每章都尽量沿着同一条章法展开：
 
-### 3. 把“传播”和“拦截”分开
+1. 先定义维护者真正要判断的问题，而不是先堆 API
+2. 显式写出 `LC`、`LG`、`DA` 三层分别负责什么
+3. 给出建议同时打开的本地文件和上游文件
+4. 按调用链解释 state、messages、callbacks/config、stream、prompt / policy 是怎么流动的
+5. 标出哪些点是稳定机制，哪些只是当前实现，哪些是已知限制
+6. 收束到维护动作：这个问题应该修哪层，最小验证闭环是什么
 
-很多维护者第一次读 subagent / streaming / callbacks 相关代码时，最容易把下面两件事混为一谈：
+这套章法的目标不是让所有章节形式一致，而是保证读者每次都能快速定位相同类型的信息。
 
-- 一个事件是不是对外部观察者可见
-- 一个行为是不是被父级 middleware 真正包裹或拦截
+## 哪些章节是受控例外
 
-本教程会反复区分这两件事。
+以下章节会偏离标准骨架，但偏离是受控的：
 
----
+- [第2章：仓库地图与包边界](./part1-foundations/02-repo-map-and-package-boundaries.md) 更像跨仓系统地图，重点是建立边界与文件入口，而不是展开单一案例
+- [第11章：像维护者一样阅读 examples](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 以样例反推系统行为，重点是构造阅读入口，而不是重复通用模板
+- 各附录更偏检索和执行清单，例如测试矩阵、传播速查表、排障手册，它们服务于维护动作，不承担完整叙述职责
 
-## 每章的组织方式
+这些例外仍然遵守同一个总目标：帮助维护者分清 ownership、传播路径、观测点和修复落层。
 
-每章都尽量保持同一骨架：
+## 推荐的两种读法
 
-### 问题是什么
+### 读法一：顺着系统展开
 
-先定义维护者真正要判断的问题，而不是先解释 API。
+适合第一次完整阅读：
 
-### 哪一层负责什么
+1. 先读本前言，接受标签体系和阅读契约
+2. 读 Part 1，建立三层边界和 assembly root
+3. 读 Part 2，理解状态、上下文和执行机制
+4. 读 Part 3，专门处理传播、可见性和观测
+5. 读 Part 4，把理解收束到扩展、测试、排障和维护工作流
 
-显式写出：
+### 读法二：按维护问题跳读
 
-- `LangChain`
-- `LangGraph`
-- `Deep Agents`
+适合已经在改代码或排问题：
 
-### 代码在哪里
-
-给出应同时打开的本地文件和上游文件。
-
-### 实现怎么工作
-
-按调用链解释数据、state、callbacks、stream、middleware 是怎么穿过去的。
-
-### 容易踩什么坑
-
-只保留维护者最容易误判的边界问题。
-
-### 哪些章节是受控例外
-
-- 大多数章节都会尽量沿着上面的骨架写，但这不是要求每章长得完全一样。
-- [第2章](./part1-foundations/02-repo-map-and-package-boundaries.md) 是“架构图谱型”特例，它更像全书的跨仓地图，所以会比普通章节更像一份大型档案。
-- [第11章](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 是“example-lens”特例，它的职责是让你从样本反推三层边界，而不是再重复一遍通用模板。
-- 这些特例并没有脱离教程主线；它们仍然在回答同一组问题：
-  ownership 在哪层、传播经过哪条线、出了问题该修上游还是修本地 harness。
-
----
-
-## 学习目标
-
-读完整份教程后，你应该能稳定回答：
-
-1. 一个行为到底属于 LangChain、LangGraph 还是 Deep Agents
-2. `create_deep_agent()` 到底是“新 runtime”还是“上游 runtime 的装配根”
-3. 为什么 subagent / streaming / callbacks 这类问题必须跨仓库分析
-4. 什么时候应该去修上游，什么时候应该只改 Deep Agents 本地策略
-5. 做一项功能改动时，最小测试闭环该怎么补
-
----
+- 改边界判断或装配策略时，从 Part 1 开始
+- 查 state、subagent、tool runtime 时，从 Part 2 开始
+- 查 callback、config、stream、visibility 时，从 Part 3 开始
+- 做扩展、补测试、做升级回归或排障时，从 Part 4 和附录开始
 
 ## 建议的并行阅读材料
 
-按主题推荐：
+建议至少同时打开以下文件，与教程交叉阅读：
 
-### 装配
+### 装配与边界
 
 - `deepagents/libs/deepagents/deepagents/graph.py`
 - `langchain/libs/langchain_v1/langchain/agents/factory.py`
@@ -112,7 +99,7 @@
 - `langgraph/libs/prebuilt/langgraph/prebuilt/tool_node.py`
 - `langchain/libs/core/langchain_core/tools/base.py`
 
-### Callback / Config
+### Callback / Config / Prompt
 
 - `langchain/libs/core/langchain_core/runnables/config.py`
 - `langchain/libs/core/langchain_core/callbacks/manager.py`
@@ -124,21 +111,19 @@
 - `langgraph/libs/langgraph/langgraph/pregel/_messages.py`
 - `langgraph/libs/langgraph/langgraph/constants.py`
 
----
-
 ## 范围声明
 
-本教程的重点不是：
+本教程不以以下内容为重点：
 
-- 外部产品文档
-- CLI 使用说明
-- LangSmith trace UI 教学
+- 外部产品文档或 CLI 使用说明
+- LangSmith UI 教学
 - 某个 example 的业务逻辑细节
+- 与三层边界无关的泛化 agent 概念复述
 
-本教程的重点是：
+本教程重点解释的是：
 
 - 三层栈如何协作
-- Deep Agents 在这三层里添加了哪些本地策略
-- 这些策略靠什么测试、回调、stream、state contract 被锁住
+- Deep Agents 在其中增加了哪些本地策略
+- 这些策略靠哪些 code path、测试和观测点被约束
 
-如果你读到某一章发现问题已经不再是 Deep Agents 本地策略，而是上游 primitive 行为，那么那一章就应该把你带到上游源码，而不是继续在本地仓库里兜圈子。
+如果某一章已经把问题带到上游 primitive 或 runtime contract，那一章就应把你送到上游源码，而不是继续让你在本地仓库里兜圈子。
