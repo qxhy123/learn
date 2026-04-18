@@ -122,161 +122,73 @@ flowchart LR
 
 ## 运行时链路
 
-### 一、`deepagents`：装配层架构与交互链
+### `deepagents`：装配层入口，不是执行引擎
 
-#### 架构定位
+这一层回答的是“默认 harness 是怎么被装起来的”，不是“图运行时每一步怎么调度”。维护者在这里主要看三类 ownership：
 
-`deepagents` 不是新的 runtime。它做的核心工作是：
+- `create_deep_agent()` 如何归一化 model、profile、subagent、permissions
+- middleware 顺序、default tools、backend wiring 为什么是本地 contract
+- 哪些扩展属于装配面，哪些应该直接交给上游 `create_agent()`
 
-- 解析模型与 provider profile
-- 生成默认 general-purpose subagent
-- 把 filesystem / todo / skills / subagent / summarization / memory / permissions 等策略按固定顺序装进 middleware 栈
-- 最后把一切交给上游 `create_agent()`
+因此第2章只保留入口级判断：Deep Agents 负责 assembly、policy、default wiring；真正执行 graph 的 runtime ownership 不在这里。
 
-所以它最像 assembly layer，而不是 execution engine。
+### `langgraph`：Pregel runtime 的 ownership 在哪里
 
-#### 核心交互链
+LangGraph 负责把 declarative graph 变成真正可运行的 Pregel runtime。这里该记住的是 ownership，而不是完整调用栈：
 
-1. `create_deep_agent()` 先经由 `resolve_model()` 和 `_harness_profile_for_model()` 归一化模型与 profile。
-2. 先单独拼出 general-purpose subagent 的默认 middleware 栈，这说明“通用子代理”是设计期能力，不是事后补丁。
-3. 遍历用户传入的 `subagents`：
-   - declarative `SubAgent`：补全 model / tools / middleware / permissions / `interrupt_on`
-   - `CompiledSubAgent`：直接 use-as-is
-   - `AsyncSubAgent`：改走 `AsyncSubAgentMiddleware`
-4. 构造主 agent middleware 栈。顺序是本地 contract，不是美观问题。
-5. 最后调用上游 `create_agent()` 产出 compiled graph。
-6. 再通过 `.with_config(...)` 提高 `recursion_limit` 并附加 `ls_integration=deepagents` 等 metadata。
+- `StateGraph` 属于 authoring / compile surface
+- `Pregel` 属于 step execution、state transition、barrier、streaming
+- checkpoint、store、cache 属于 runtime persistence substrate
+- `Runtime` / `ToolRuntime` 属于运行期上下文注入，不等于持久化 state
 
-### 二、`langgraph`：运行时架构与交互链
+如果问题开始涉及 state、writes、reducers、barrier、tool step、stream mode，那已经进入 LangGraph 的 runtime 语义，而不是 Chapter 2 要展开讲完的内容。
 
-#### 架构定位
+### `langchain`：primitive、callback、config 的 ownership 在哪里
 
-LangGraph 负责把 declarative graph 变成可执行 runtime：
+LangChain 在这套栈里提供的是 primitive 和传播机制，不是另一层 graph runtime：
 
-- `StateGraph` 负责 authoring / compile
-- `Pregel` 负责 step 执行与 streaming
-- checkpoint / store / cache 负责持久化与长期记忆 substrate
-- `Runtime` / `ToolRuntime` 负责把运行期上下文注进 node / tool
+- `langchain_core` 提供 `BaseTool`、`BaseChatModel`、callback manager、`RunnableConfig`
+- `langchain_v1/agents` 提供 `create_agent()` 和 middleware hook surface
 
-`StateGraph.compile()` 只是把图降成 `CompiledStateGraph`；真正执行的是 Pregel。
+所以维护者看到 callback tree、tool/model 事件、ambient config 传播时，第一反应应该是“这是不是 LangChain ownership”，而不是继续在 Deep Agents 里找调度主线。
 
-#### 核心交互链
+### 为什么 `StateGraph.compile()` 不是执行主线
 
-1. `StateGraph.compile()` 降到 `CompiledStateGraph` / `Pregel`，同时固化 channel、output keys、interrupt 配置。
-2. `Pregel.stream()` / `astream()` 进入后，会先做 `_defaults()`、checkpointer / store / cache 解析。
-3. 如果开启 `stream_mode="messages"`，会在 callback tree 上挂 `StreamMessagesHandler`。
-4. 如果开启 `stream_mode="custom"`，则设置 `stream_writer`，供 node / tool 主动推 side-channel 数据。
-5. 运行时构造 `Runtime` 并塞回 config，再进入 `SyncPregelLoop` / `AsyncPregelLoop`。
-6. tool step 通过 `ToolNode` 执行，工具收到的是 `ToolRuntime`，而不是裸参数。
-7. checkpoint 记录的是 channel snapshot / pending writes，不是 callback 流。
+`StateGraph.compile()` 的作用是把 authoring graph 降成可执行对象，并固化 channels、output keys、interrupt 配置。它很重要，但它不是“系统已经开始跑”的同义词。
 
-### 三、`langchain`：primitive / callback / middleware 层交互链
+Chapter 2 在这里只需要建立一个判断标准：
 
-#### 架构定位
+- compile 说明 graph shape 已经落成
+- 真正的 Pregel 执行、step 推进、writes 合并、stream 发射，发生在 compile 之后的 runtime
+- 所以从 `compile()` 往后再追，已经不该在这一章里做逐步 walkthrough
 
-Deep Agents 真正依赖的 LangChain 代码可以拆成两层：
+### 维护者该先打开哪些 Pregel 文件
 
-- `langchain_core`
-  提供 `RunnableConfig`、callback manager、`BaseTool`、`BaseChatModel`
-- `langchain_v1/agents`
-  提供 `AgentMiddleware` hook surface 与 `create_agent()` 这层 agent factory
+如果你已经确认问题属于 LangGraph runtime，先打开这些文件建立方位感：
 
-所以 LangChain 在这套栈里的职责不是“又一个 runtime”，而是 primitive 与 hook layer。
+- `langgraph/libs/langgraph/langgraph/graph/state.py`
+- `langgraph/libs/langgraph/langgraph/pregel/main.py`
+- `langgraph/libs/langgraph/langgraph/pregel/_loop.py`
+- `langgraph/libs/langgraph/langgraph/pregel/_messages.py`
+- `langgraph/libs/langgraph/langgraph/runtime.py`
 
-#### 核心交互链
+这组入口足够回答“runtime ownership 大概落在哪里”，但不要求你在本章里把 `SyncPregelLoop` / `AsyncPregelLoop`、`Pregel.stream()` / `astream()`、subgraph token visibility 全部追完。
 
-1. `create_agent()` 先规范 model、tools、response format，并把 middleware 的 hook surface 组合起来。
-2. `wrap_model_call`、`before_model`、`after_model`、`wrap_tool_call` 等 hook 被编进 agent graph。
-3. 工具执行时，`BaseTool.run()` 会：
-   - `CallbackManager.configure(...)`
-   - `on_tool_start(...)`
-   - `patch_config(config, callbacks=run_manager.get_child())`
-   - `set_config_context(child_config)`
-   - 再真正调用 `_run`
-4. 模型执行时，`BaseChatModel.stream()` / `astream()` 会：
-   - `ensure_config(config)`
-   - `CallbackManager.configure(...)`
-   - `on_chat_model_start(...)`
-   - 在每个 chunk 上 `on_llm_new_token(...)`
-   - 结束时 `on_llm_end(...)`
-5. 这条 callback tree 后续会被 LangGraph 的 `StreamMessagesHandler` 观察到。
+### 这一章不负责讲完 Pregel runtime
 
-## 传播 / 可见性 / 拦截点
+这一章到这里为止，只负责把 boundary map 立起来，并告诉你后续该去哪一章继续追：
 
-### LangGraph 的 streaming 与可见性边界
+- Pregel 执行模型详见第4章：Filesystem 与状态模型。
+- Pregel 主执行路径详见第5章：Tools 作为 Runtime Surface。
+- callback / config 传播判断回第10章。
+- stream 可见性与 selective exposure 回第11章。
 
-这里最容易说错的点有四个：
+如果你现在要回答的是：
 
-- `stream_mode="messages"` 是观测机制，不是执行控制机制。`StreamMessagesHandler` 只是观察 callback events，把它们转成流事件，不参与 step scheduling。
-- `subgraphs=True` 只是扩大可见性，不会把父图和子图拍平成一个状态机。你看到的是更深层的事件，不是 graph 边界被消灭了。
-- `TAG_NOSTREAM` 是 `langgraph.constants` 里的公开常量，不是 Deep Agents 自己定义的 tag。`StreamMessagesHandler.on_chat_model_start()` 会检查这个 tag 决定是否注册当前模型 run。
-- `Runtime` / `ToolRuntime` 不是持久化 state。它们是本次运行的上下文载体；真正会进 checkpoint 的仍然是 graph state / channel values。
-
-### LangChain 的 callbacks / config 传播机制为什么关键
-
-这部分要从“树”来理解，而不是“单个 handler 列表”：
-
-- `CallbackManager.configure()` 负责把显式传入 callbacks、本对象自带 callbacks、tags、metadata 合并成当前 run 的根 manager
-- 一次模型调用或工具调用都会先得到自己的 `run_manager`
-- `run_manager.get_child()` 再给下游子调用创建 child callback manager
-- child manager 会带着 `parent_run_id`、继承的 handler、tags、metadata 继续往下传
-
-这意味着 callback manager 主要承担四种职责：
-
-- LangSmith tracing / run tree 记录
-- token / tool / chain 事件转发
-- 日志、监控、埋点、调试面板
-- runtime 观测扩展，例如被 LangGraph `StreamMessagesHandler` 拿来做 token streaming
-
-`RunnableConfig` 也不是普通 kwargs，它有两条传播路径：
-
-- 显式 config 参数
-- `set_config_context(...)` 写入的 ambient context
-
-`ensure_config()` 会先把 ambient child config 合并进来，再叠显式 config。于是很多“我明明没传 config，为什么下游还能继承 callbacks / tags / metadata”的问题，答案都在这里。
-
-再加上一点很关键：
-
-- `patch_config(..., callbacks=run_manager.get_child())` 会替换 callbacks，并清空 `run_name` / `run_id`
-
-所以 callback tree 的传播不是“原样透传”，而是“沿 child run 树重建”。
-
-### 典型跨层诊断案例：为什么 `CompiledSubAgent` 内部的 LLM token 可能出现在外层 stream consumer
-
-这是一个典型的“三层都要看”的问题。
-
-#### 先说结论
-
-- 它通常不是“被主 agent 直接拦截”
-- 更准确地说，是：`Deep Agents task tool -> LangChain callback / config 传播 -> LangGraph stream observer`
-
-#### 具体链路
-
-1. 在 Deep Agents 里，`SubAgentMiddleware` 生成 `task` 工具。对 `CompiledSubAgent`，`task` 工具内部直接调用 `subagent.invoke(subagent_state)` / `ainvoke(...)`。
-2. 这个 `task` 工具本身是通过 LangChain `BaseTool.run()` / `arun()` 执行的。在真正执行 `_run` 之前，LangChain 会：
-   - `patch_config(config, callbacks=run_manager.get_child())`
-   - `set_config_context(child_config)`
-3. 因此，哪怕 `task(...)` 代码本身没有显式把 config 传给 `CompiledSubAgent`，内层 runnable 仍可能通过 `ensure_config()` 吃到 ambient child config。
-4. 如果这个 compiled subagent 内部又调用了 LangChain chat model，那么模型 run 会触发：
-   - `on_chat_model_start`
-   - `on_llm_new_token`
-   - `on_llm_end`
-5. 如果外层 graph 此时启用了 `stream_mode="messages"`，LangGraph 在 `Pregel.stream()` 里挂上的 `StreamMessagesHandler` 就会观察到这些 callback 事件，并把 token 推给外层 stream consumer。
-
-#### 这意味着什么
-
-- `CompiledSubAgent` 虽然不自动继承主 agent 的 middleware 栈
-- 但它仍可能继承主 run 的 callback / tags / metadata 传播链
-- 所以“compiled subagent 是 use-as-is”和“compiled subagent 对外完全不可见”不是同一句话
-
-#### 如果你想阻止外层看到这些 token
-
-优先从 LangChain / LangGraph 这两层下手，而不是期待 Deep Agents 顶层 middleware 自动拦住：
-
-- 在 compiled subagent 内部显式覆写调用 config，替换 callbacks，而不是继续沿 ambient child config 往下传
-- 给你不希望外显的内部模型 run 打上 `nostream` tag
-- 外层如果根本不需要 token 级观测，就不要使用 `stream_mode="messages"`
-- 如果你只想让消费者看到最终结果，就保留最终 state update / `ToolMessage`，把中间 token streaming 关掉
+- Pregel 的 state、writes、reducer、barrier 是什么：去第4章。
+- Pregel 从 compile 之后如何真正跑起来：去第5章。
+- callback/config 为什么还能连到内部 runnable：去第10章。
+- 为什么外层 consumer 看到了 `messages` / `updates` / `custom`：去第11章。
 
 ## 扩展接口
 
