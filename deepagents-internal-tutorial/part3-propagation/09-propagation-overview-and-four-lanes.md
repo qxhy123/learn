@@ -10,7 +10,7 @@
 ## 在整套系统中的位置
 
 - 横向主题：`Propagation`、`Visibility`、`Observation`
-- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第6章：Memory、Skills、Prompt Layering 与 Config 传播](../part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章：Summarization、Permissions 与安全边界](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)
+- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第4章：Filesystem 与 Pregel State Model](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第6章：Memory、Skills、Prompt Layering 与 Config 传播](../part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章：Summarization、Permissions 与安全边界](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)
 - 后续章节：[第10章：Callbacks、Config 与 Callback Manager](./10-callbacks-config-and-callback-manager.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
 
 这一章是 Part 3 的主线入口，不是附录式补丁。它先给出维护者判断传播问题时必须复用的统一坐标系，后面的 callback/config、streaming、subagent matrix 章节都只是在这套坐标系里展开更细的 case。

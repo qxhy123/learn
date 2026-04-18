@@ -10,7 +10,7 @@
 ## 在整套系统中的位置
 
 - 横向主题：`Propagation`、`Visibility`、`Observation`
-- 前置章节：[第9章：传播层总览与四条线](./09-propagation-overview-and-four-lanes.md)、[第10章：Callbacks、Config 与 Callback Manager](./10-callbacks-config-and-callback-manager.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)
+- 前置章节：[第4章：Filesystem 与 Pregel State Model](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第9章：传播层总览与四条线](./09-propagation-overview-and-four-lanes.md)、[第10章：Callbacks、Config 与 Callback Manager](./10-callbacks-config-and-callback-manager.md)、[第7章：Subagents、任务交接与上下文隔离](../part2-core-runtime/07-subagents-and-context-isolation.md)
 - 后续章节：[第12章：Subagent 传播矩阵与维护者 recipes](./12-subagent-propagation-matrix-and-maintainer-recipes.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
 
 这一章故意不把 streaming 写成 Deep Agents 专属特性说明。它讨论的是更上层的传播问题：执行已经发生之后，哪些事件会进入观测线，哪些又会进一步暴露到流输出线，最后还有哪些结果会沿结果折返线回到 parent。只有先把这三件事拆开，`nostream` 与 selective visibility 才不会被误写成“禁止执行”。
@@ -57,7 +57,7 @@
 
 ### 1. `stream()` / `astream()` 与 `stream_mode`
 
-`stream()` / `astream()` 只是把 Pregel 的运行过程暴露成一条可消费外流。它们不重新定义内部执行，也不单独创造结果折返机制。
+这里直接关心 `stream_mode` 带来的后果：它决定外部 consumer 消费到哪一类实时事件，而不是改写内部执行 contract。
 
 更稳妥的读法是：
 
@@ -68,7 +68,6 @@
 
 因此：
 
-- `stream()` / `astream()` 是 Pregel runtime 的暴露面，不是另一套执行引擎。
 - `stream_mode` 是“选择暴露哪种事件切片”，不是“改变内部调用真实发生了什么”。
 - 同一轮执行里，`messages` 可见、`updates` 可见、最终结果可折返，可能重合，也可能只发生其中一部分。
 
