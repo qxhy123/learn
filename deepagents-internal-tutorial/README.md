@@ -78,10 +78,10 @@ flowchart LR
 | --- | --- | --- |
 | `Assembly` | Deep Agents 只是装配根，还是引入了新的本地 contract | [第1章](./part1-foundations/01-what-deepagents-builds.md)、[第2章](./part1-foundations/02-repo-map-and-package-boundaries.md)、[第3章](./part1-foundations/03-create-deep-agent-as-assembly-root.md) |
 | `Context` | state、memory、prompt、profile、permissions 分别由谁拥有 | [第4章](./part2-core-runtime/04-filesystem-and-state-model.md)、[第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md) |
-| `Execution` | tool、subagent、graph runtime、checkpoint、interrupt 是怎么跑起来的 | [第4章](./part2-core-runtime/04-filesystem-and-state-model.md)、[第5章](./part2-core-runtime/05-subagents-and-context-isolation.md)、[第7章](./part2-core-runtime/07-summarization-permissions-and-safety-boundaries.md) |
-| `Propagation` | callbacks、config、messages、stream events 究竟沿哪条线传播 | [第5章](./part2-core-runtime/05-subagents-and-context-isolation.md)、[第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[附录 D](./appendix/propagation-and-visibility-cheatsheet.md) |
-| `Extension` | backend、provider profile、middleware、新 capability 应该怎么安全扩展 | [第8章](./part3-extensibility/08-backend-protocol-and-storage-strategy.md)、[第9章](./part3-extensibility/09-provider-profiles-and-model-routing.md)、[第12章](./part4-production-patterns/12-how-to-add-a-new-capability-safely.md) |
-| `Operations` | 维护者如何测试、升级、排障，并从 examples 反推系统行为 | [第10章](./part3-extensibility/10-testing-the-harness.md)、[第11章](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md)、[附录 B](./appendix/test-matrix.md)、[附录 E](./appendix/troubleshooting-playbook.md) |
+| `Execution` | tool、subagent、graph runtime、checkpoint、interrupt 是怎么跑起来的 | [第4章](./part2-core-runtime/04-filesystem-and-state-model.md)、[第7章](./part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章](./part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md) |
+| `Propagation` | callbacks、config、messages、stream events 究竟沿哪条线传播 | [第7章](./part2-core-runtime/07-subagents-and-context-isolation.md)、[第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[附录 D](./appendix/propagation-and-visibility-cheatsheet.md) |
+| `Extension` | backend、provider profile、middleware、新 capability 应该怎么安全扩展 | [第13章](./part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第14章](./part4-maintenance-and-extension/14-provider-profiles-and-model-routing.md)、[第17章](./part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md) |
+| `Operations` | 维护者如何测试、升级、排障，并从 examples 反推系统行为 | [第15章](./part4-maintenance-and-extension/15-testing-the-harness.md)、[第16章](./part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md)、[附录 B](./appendix/test-matrix.md)、[附录 E](./appendix/troubleshooting-playbook.md) |
 
 ## 章节导航
 
@@ -98,20 +98,20 @@ flowchart LR
 ### Part 2：运行时状态与执行机制
 
 - [第4章：Filesystem 与状态模型](./part2-core-runtime/04-filesystem-and-state-model.md)
-- [第5章：Subagents、拦截边界与上下文隔离](./part2-core-runtime/05-subagents-and-context-isolation.md)
+- [第7章：Subagents、拦截边界与上下文隔离](./part2-core-runtime/07-subagents-and-context-isolation.md)
 
 ### Part 3：传播、可见性与观测
 
 - [第6章：Memory、Skills、Prompt Layering 与 Config 传播](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)
-- [第7章：Summarization、Streaming、Permissions 与安全边界](./part2-core-runtime/07-summarization-permissions-and-safety-boundaries.md)
+- [第8章：Summarization、Streaming、Permissions 与安全边界](./part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)
 
 ### Part 4：维护、排障与安全扩展
 
-- [第8章：Backend 协议与存储策略](./part3-extensibility/08-backend-protocol-and-storage-strategy.md)
-- [第9章：Provider Profiles、模型路由与 Middleware Surface](./part3-extensibility/09-provider-profiles-and-model-routing.md)
-- [第10章：如何测试一个 Harness](./part3-extensibility/10-testing-the-harness.md)
-- [第11章：像维护者一样阅读 examples](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md)
-- [第12章：如何安全地新增一种能力](./part4-production-patterns/12-how-to-add-a-new-capability-safely.md)
+- [第13章：Backend 协议与存储策略](./part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
+- [第14章：Provider Profiles、模型路由与 Middleware Surface](./part4-maintenance-and-extension/14-provider-profiles-and-model-routing.md)
+- [第15章：如何测试一个 Harness](./part4-maintenance-and-extension/15-testing-the-harness.md)
+- [第16章：像维护者一样阅读 examples](./part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md)
+- [第17章：如何安全地新增一种能力](./part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md)
 
 ### 附录
 
@@ -140,18 +140,18 @@ flowchart LR
 | 任务 | 先看哪里 | 目的 |
 | --- | --- | --- |
 | 判断 bug 应修上游还是修本地 harness | [第2章](./part1-foundations/02-repo-map-and-package-boundaries.md)、[第3章](./part1-foundations/03-create-deep-agent-as-assembly-root.md) | 先划清 ownership 和 assembly 边界 |
-| 排 callback / config / stream 可见性问题 | [第5章](./part2-core-runtime/05-subagents-and-context-isolation.md)、[第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第7章](./part2-core-runtime/07-summarization-permissions-and-safety-boundaries.md)、[附录 D](./appendix/propagation-and-visibility-cheatsheet.md) | 明确传播链和观测点 |
-| 新增 backend、profile、middleware 或 capability | [第8章](./part3-extensibility/08-backend-protocol-and-storage-strategy.md)、[第9章](./part3-extensibility/09-provider-profiles-and-model-routing.md)、[第12章](./part4-production-patterns/12-how-to-add-a-new-capability-safely.md) | 判断落层、边界和安全扩展方式 |
-| 补测试或做升级回归 | [第10章](./part3-extensibility/10-testing-the-harness.md)、[附录 B](./appendix/test-matrix.md) | 明确最小验证矩阵 |
-| 从 examples 反推系统行为 | [第11章](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md)、[附录 C](./appendix/examples-index.md) | 把样例转换为源码入口 |
+| 排 callback / config / stream 可见性问题 | [第7章](./part2-core-runtime/07-subagents-and-context-isolation.md)、[第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)、[第8章](./part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)、[附录 D](./appendix/propagation-and-visibility-cheatsheet.md) | 明确传播链和观测点 |
+| 新增 backend、profile、middleware 或 capability | [第13章](./part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第14章](./part4-maintenance-and-extension/14-provider-profiles-and-model-routing.md)、[第17章](./part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md) | 判断落层、边界和安全扩展方式 |
+| 补测试或做升级回归 | [第15章](./part4-maintenance-and-extension/15-testing-the-harness.md)、[附录 B](./appendix/test-matrix.md) | 明确最小验证矩阵 |
+| 从 examples 反推系统行为 | [第16章](./part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md)、[附录 C](./appendix/examples-index.md) | 把样例转换为源码入口 |
 | 做故障定位或维护值班 | [附录 E](./appendix/troubleshooting-playbook.md) | 快速获得排障入口和观察点 |
 
 ## 高频问题索引
 
 - `create_deep_agent()` 是新 runtime 吗：不是。它是把 LangChain 与 LangGraph 的现成能力装配成默认 harness 的 assembly root；详见 [第3章](./part1-foundations/03-create-deep-agent-as-assembly-root.md)。
-- subagent 的事件为什么外层能看到，但父级 middleware 不一定能拦截：可见性和拦截边界不是同一个问题；先读 [第5章](./part2-core-runtime/05-subagents-and-context-isolation.md) 与 [第7章](./part2-core-runtime/07-summarization-permissions-and-safety-boundaries.md)。
+- subagent 的事件为什么外层能看到，但父级 middleware 不一定能拦截：可见性和拦截边界不是同一个问题；先读 [第7章](./part2-core-runtime/07-subagents-and-context-isolation.md) 与 [第8章](./part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)。
 - callback / config 传播异常该先查哪层：先确认入口点在 `langchain_core` 还是 `langgraph`，再回看 Deep Agents 是否只是在透传或加策略；详见 [第6章](./part2-core-runtime/06-memory-skills-and-system-prompt-layering.md)。
-- 新能力应该做成上游 primitive 还是本地 policy：先判断是否需要跨 harness 复用。如果只是 Deep Agents 的默认策略，用本地扩展；如果需要 runtime contract，优先看上游；详见 [第8章](./part3-extensibility/08-backend-protocol-and-storage-strategy.md)、[第9章](./part3-extensibility/09-provider-profiles-and-model-routing.md)、[第12章](./part4-production-patterns/12-how-to-add-a-new-capability-safely.md)。
+- 新能力应该做成上游 primitive 还是本地 policy：先判断是否需要跨 harness 复用。如果只是 Deep Agents 的默认策略，用本地扩展；如果需要 runtime contract，优先看上游；详见 [第13章](./part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第14章](./part4-maintenance-and-extension/14-provider-profiles-and-model-routing.md)、[第17章](./part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md)。
 - 维护时应该最少打开哪些文件：先从 [附录 A](./appendix/code-reading-checklist.md) 的最短源码路径开始。
 
 ## 与三个仓库的关系

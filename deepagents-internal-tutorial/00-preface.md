@@ -58,7 +58,7 @@ Deep Agents 的大量行为都不是单仓库事实，而是三层协作结果�
 以下章节会偏离标准骨架，但偏离是受控的：
 
 - [第2章：仓库地图与包边界](./part1-foundations/02-repo-map-and-package-boundaries.md) 更像跨仓系统地图，重点是建立边界与文件入口，而不是展开单一案例
-- [第11章：像维护者一样阅读 examples](./part4-production-patterns/11-reading-the-examples-like-a-maintainer.md) 以样例反推系统行为，重点是构造阅读入口，而不是重复通用模板
+- [第16章：像维护者一样阅读 examples](./part4-maintenance-and-extension/16-reading-the-examples-like-a-maintainer.md) 以样例反推系统行为，重点是构造阅读入口，而不是重复通用模板
 - 各附录更偏检索和执行清单，例如测试矩阵、传播速查表、排障手册，它们服务于维护动作，不承担完整叙述职责
 
 这些例外仍然遵守同一个总目标：帮助维护者分清 ownership、传播路径、观测点和修复落层。
