@@ -4,6 +4,10 @@
 
 这一章不再把 filesystem 当成“先有文件，再顺便有状态”的主题，而是把它收回到 Pregel runtime 的主线里：channel 如何承载状态、task 如何产生 writes、reducer 如何在 barrier 后合并、backend 又如何决定真实介质。filesystem 仍然是本章的材料，但它的作用是把 Pregel state model 讲清楚。
 
+## 在整套系统中的位置
+
+这一章是 Part 2 里解释 runtime state spine 的一章：先把 Pregel 如何定义 channel snapshot、pending writes、barrier 与 checkpoint 说清楚，再用 `files` channel 把这些概念落地。若你要追执行路径、tool surface 或 runtime carrier 的调用链，请转到 [第5章：Tools 作为 Runtime Surface](./05-tools-as-runtime-surface.md)；若你要追更远处的传播、分层存储策略与 backend 设计，则继续看后续章节与 Part 4。
+
 ## 静态结构
 
 ### 为什么这一章先讲 Pregel state model
@@ -90,6 +94,21 @@ checkpoint 的职责不是记录整个执行故事，而是记录 Pregel 状态�
 - backend 看到了写入，不等于 graph state 和宿主机介质已经统一。
 
 这些误判之所以常见，是因为不同观测面回答的是不同问题：task return 回答“本轮执行做了什么”，consumer update 回答“外层收到了什么信号”，callback / tracing 回答“系统发出过什么事件”，backend 回答“某个介质层看见了什么写入”。只有跨过 barrier 并完成 reducer 之后，某个 channel 才真正成为下一轮稳定可见状态。
+
+## 扩展接口
+
+这一章相关的扩展面只讨论 state model 本身，不讨论 Chapter 5 的执行路径细节：
+
+- 定义或修改 channel：决定某块状态是不是 Pregel state surface，以及它的命名边界。
+- 定义或修改 reducer：决定 pending writes 在 barrier 后如何归并成下一轮可见 snapshot。
+- 选择或组合 backend：决定某条路径的真实介质，但不改变 Pregel 对 superstep 和 checkpoint 的边界定义。
+
+## 常见问题与排障入口
+
+- 你现在看到的是 task 返回值、consumer update、callback event，还是已经跨过 barrier 的 channel snapshot？
+- 你要确认的是“写入发生过”，还是“reducer 已经把 writes 合并进下一轮可见状态”？
+- 你要排查的是 checkpoint 为什么没有记录某个状态边界，还是某个事件流为什么出现过但没有形成稳定状态？
+- 你面对的是 `files` channel 的 Pregel 可见性问题，还是 backend 介质层已经写入但尚未与 graph state 对齐的问题？
 
 ## 本章结论
 
