@@ -10,7 +10,7 @@
 
 - 横向主题：`Assembly`, `Propagation`
 - 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第1章：这一栈到底在构建什么](./01-what-deepagents-builds.md)
-- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)
+- 后续章节：[第3章：create_deep_agent 作为装配根](./03-create-deep-agent-as-assembly-root.md)、[第4章：Filesystem 与状态模型](../part2-core-runtime/04-filesystem-and-state-model.md)、[第5章：Tools 作为 Runtime Surface](../part2-core-runtime/05-tools-as-runtime-surface.md)、[第10章：Callbacks、Config 与 Callback Manager](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章：Streaming、Visibility 与 Selective Exposure](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[附录 D：传播与可见性速查表](../appendix/propagation-and-visibility-cheatsheet.md)
 
 ## 静态结构
 
@@ -29,7 +29,7 @@
 ### 这一章为什么是架构图谱型特例
 
 这一章故意比普通章节更像一份跨仓地图，因为它要先把三层 ownership、主交互链和扩展面一次性摆平。
-读到具体装配问题时回跳 [第3章](./03-create-deep-agent-as-assembly-root.md)；读到 state / runtime ownership 时回跳 [第4章](../part2-core-runtime/04-filesystem-and-state-model.md) 与 [第5章](../part2-core-runtime/05-tools-as-runtime-surface.md)；读到 callback / config 传播时回跳 [第10章](../part3-propagation/10-callbacks-config-and-callback-manager.md)；读到 stream / visibility 问题时回跳 [第11章](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)；读到 subagent isolation、permissions 与安全边界时再回跳 [第7章](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)；读到扩展与验证问题时回跳 [第13章](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第15章](../part4-maintenance-and-extension/15-testing-the-harness.md)、[第17章](../part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md)。
+读到具体装配问题时回跳 [第3章](./03-create-deep-agent-as-assembly-root.md)；读到 state / runtime ownership 时回跳 [第4章](../part2-core-runtime/04-filesystem-and-state-model.md) 与 [第5章](../part2-core-runtime/05-tools-as-runtime-surface.md)；读到 callback / config 传播时回跳 [第10章](../part3-propagation/10-callbacks-config-and-callback-manager.md)；读到 stream / visibility 问题时回跳 [第11章](../part3-propagation/11-streaming-visibility-and-selective-exposure.md) 与 [附录 D](../appendix/propagation-and-visibility-cheatsheet.md)；读到 subagent isolation、permissions 与安全边界时再回跳 [第7章](../part2-core-runtime/07-subagents-and-context-isolation.md)、[第8章](../part2-core-runtime/08-summarization-permissions-and-safety-boundaries.md)；读到扩展与验证问题时回跳 [第13章](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)、[第15章](../part4-maintenance-and-extension/15-testing-the-harness.md)、[第17章](../part4-maintenance-and-extension/17-how-to-add-a-new-capability-safely.md)。
 
 ### 代码在哪里
 
@@ -181,21 +181,21 @@ Chapter 2 在这里只需要建立一个判断标准：
 - Pregel 执行模型详见第4章：Filesystem 与状态模型。
 - Pregel 主执行路径详见第5章：Tools 作为 Runtime Surface。
 - callback / config 传播判断回第10章。
-- stream 可见性与 selective exposure 回第11章。
+- stream 可见性与 selective exposure 回第11章与附录 D。
 
 如果你现在要回答的是：
 
 - Pregel 的 state、writes、reducer、barrier 是什么：去第4章。
 - Pregel 从 compile 之后如何真正跑起来：去第5章。
 - callback/config 为什么还能连到内部 runnable：去第10章。
-- 为什么外层 consumer 看到了 `messages` / `updates` / `custom`：去第11章。
+- 为什么外层 consumer 看到了 `messages` / `updates` / `custom`：去第11章与附录 D。
 
 ## 传播 / 可见性 / 拦截点
 
 这一节只负责保留教程骨架里的定位，不在本章展开追调用链：
 
 - callback / config 传播机制主要回第10章。
-- `messages` / `updates` / `custom` 的对外可见性主要回第11章。
+- `messages` / `updates` / `custom` 的对外可见性主要回第11章与附录 D。
 - subagent 的上下文隔离回第7章。
 - permissions、summarization、安全边界回第8章。
 
