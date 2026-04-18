@@ -1,482 +1,193 @@
 # 第4章：Filesystem 与状态模型
 
-## 学习目标
+## 本章回答什么
 
-学完本章，你应该能回答：
+- Deep Agents 的 filesystem 默认到底由谁提供，为什么它默认不是宿主机磁盘
+- `FilesystemState.files`、backend、`ToolRuntime` 分别承担什么职责
+- `StateBackend`、`FilesystemBackend`、`CompositeBackend` 的语义边界是什么
+- 文件内容什么时候落在 graph state，什么时候落在 backend
+- 出现“文件没写进去 / 下一步看不到 / `execute` 消失”时该先查哪一层
 
-1. Deep Agents 的 filesystem 到底是不是“真实文件系统”
-2. `FilesystemMiddleware`、`ToolRuntime`、`files` state channel、backend 之间各自负责什么
-3. 文件工具是如何运行的，为什么默认 backend 是 `StateBackend`
-4. filesystem 能做什么，哪些能力需要 backend 额外支持
-5. 哪些约束是 prompt / tool description 规则，哪些才是代码里的硬 contract
+## 在整套系统中的位置
 
----
+- 横向主题：`State`、`Storage`、`Runtime Carrier`
+- 前置章节：[README](../README.md)、[前言：如何使用本教程](../00-preface.md)、[第3章：create_deep_agent 作为装配根](../part1-foundations/03-create-deep-agent-as-assembly-root.md)、[第5章：Tools 作为 Runtime Surface](./05-tools-as-runtime-surface.md)
+- 后续章节：[第6章：Memory、Skills、Prompt Layering 与 Config 传播](./06-memory-skills-and-system-prompt-layering.md)、[第7章：Subagents、拦截边界与上下文隔离](./07-subagents-and-context-isolation.md)、[第13章：Backend 协议与存储策略](../part4-maintenance-and-extension/13-backend-protocol-and-storage-strategy.md)
 
-## 问题是什么
+这一章只回答 filesystem 作为运行载体时的事实：文件能力挂在哪里、状态落在哪里、backend 怎么决定真实介质。通用的 tool-surface 理论已经收口到 [第5章](./05-tools-as-runtime-surface.md)，这里不再重复展开。
 
-“Deep Agents 有文件系统”这句话很容易让人误解。
+## 静态结构
 
-它听上去像是：
-
-- agent 直接拿到了宿主机磁盘
-- 或者 Deep Agents 内部自己实现了一套完整虚拟文件系统
-
-但源码里真正存在的是四层叠加：
-
-1. 模型可见的 filesystem tool surface
-2. graph 内部的 `files` state channel
-3. 把文件能力接到具体介质上的 backend adapter
-4. 一套写进 system prompt / tool description 的使用约束
-
-如果这四层不拆开，你就会很难判断：
-
-- “这个能力是谁提供的”
-- “这次写文件到底落在哪里”
-- “为什么某些场景有 `execute`，某些场景没有”
-- “read-before-edit 到底是不是硬约束”
-
----
-
-## 哪一层负责什么
-
-### `LangChain`
-
-- `BaseTool.run()` / `arun()` 负责 tool lifecycle、callback tree、config patch
-- tool schema、tool call 输入输出归一化在这里发生
-
-### `LangGraph`
-
-- `ToolRuntime` 把 `state`、`context`、`config`、`tool_call_id`、`stream_writer` 注入工具
-- graph state / reducer / checkpoint 决定 `files` 的生命周期
-
-### `Deep Agents`
-
-- `FilesystemMiddleware` 决定暴露哪些文件工具
-- 决定 filesystem 相关 system prompt 和 tool descriptions
-- 决定大结果何时落盘、何时裁剪消息
-- `BackendProtocol` / `SandboxBackendProtocol` 决定最终读写和执行落到什么介质
-
----
-
-## 代码在哪里
-
-建议同时打开：
+这一章建议同时打开这些实现文件，但把它们按“状态面”和“介质面”来读，而不是按工具名字来读：
 
 - `deepagents/libs/deepagents/deepagents/middleware/filesystem.py`
-- `deepagents/libs/deepagents/deepagents/backends/protocol.py`
 - `deepagents/libs/deepagents/deepagents/backends/state.py`
 - `deepagents/libs/deepagents/deepagents/backends/filesystem.py`
 - `deepagents/libs/deepagents/deepagents/backends/composite.py`
+- `deepagents/libs/deepagents/deepagents/backends/protocol.py`
 - `deepagents/libs/deepagents/deepagents/graph.py`
-- `langchain/libs/core/langchain_core/tools/base.py`
-- `langgraph/libs/prebuilt/langgraph/prebuilt/tool_node.py`
-- `deepagents/libs/deepagents/tests/unit_tests/test_file_system_tools.py`
-- `deepagents/libs/deepagents/tests/integration_tests/test_filesystem_middleware.py`
 
----
+### 四个静态部件
 
-## 先给结论：filesystem 机制是什么
+| 部件 | 本章关心的职责 |
+| --- | --- |
+| `FilesystemMiddleware` | 把 filesystem 作为默认 capability 装进 agent，并在运行时解析 backend、过滤 `execute` |
+| `FilesystemState.files` | graph 内部的文件状态 channel；只有走 state-native 路径时，它才是文件内容的 canonical surface |
+| backend (`StateBackend` / `FilesystemBackend` / `CompositeBackend`) | 决定文件真实落到哪种介质，以及读写、搜索、执行能力的语义 |
+| `ToolRuntime` | 文件工具在执行期拿到 `state`、`context`、`config` 的载体；backend factory 也通过它解析当前运行上下文 |
 
-更准确的说法是：
+### `FilesystemState.files` 是什么
 
-> Deep Agents 把一组文件工具装进 agent，把这些工具接到 `BackendProtocol`，再让 graph state 决定文件状态如何在 thread / step / checkpoint 中流动。
-
-所以“filesystem”不是一个单独模块，而是：
-
-- 工具集合：`ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`
-- 可选执行：`execute`
-- 状态载体：`FilesystemState.files`
-- 介质适配：`StateBackend` / `FilesystemBackend` / `CompositeBackend` / 其他 backend
-- 使用策略：system prompt 里的 read-before-edit、分页读取、避免用 shell `find` / `grep`
-
----
-
-## 实现怎么工作
-
-### 1. `FilesystemMiddleware` 提供的是 tool surface + policy layer
-
-`FilesystemMiddleware` 初始化时会创建这些工具：
-
-- `ls`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `glob`
-- `grep`
-- `execute`
-
-但这不代表每次都真的能执行 shell。
-
-因为 `execute` 是否真正可用，后面还要看 backend 是否实现了 `SandboxBackendProtocol`。
-
-同一个 middleware 还负责两类策略：
-
-- 往 system prompt 里补 filesystem 使用说明
-- 在模型调用前根据 backend 能力过滤 `execute`
-
-所以它不是纯工具注册器，而是“文件能力的装配入口”。
-
-### 2. `FilesystemState.files` 才是 graph 内部真正的文件状态面
-
-`FilesystemState` 里定义了：
+`FilesystemState` 在 `filesystem.py` 里定义了：
 
 - `files: Annotated[..., _file_data_reducer]`
 
-这意味着文件状态在 graph 内不是普通字段，而是带 reducer 的 channel。
+这说明 `files` 不是普通字典字段，而是带 reducer 的 graph channel。对维护者最重要的含义有两条：
 
-`_file_data_reducer` 做的事情很重要：
+1. 它适合承载 thread-scoped、checkpoint-aware 的工作区文件。
+2. 它只描述“graph state 里的文件视图”，不自动等价于所有 backend 的真实存储。
 
-- 合并新增或更新的文件
-- 支持通过 `None` 做删除标记
-- 允许多次写入在 state merge 时统一收口
+### backend 与 graph state 不是一回事
 
-因此，filesystem 不是“工具直接改全局字典”，而是：
+| 问题 | 应先看哪一层 |
+| --- | --- |
+| 当前线程里有哪些文件快照 | `FilesystemState.files` |
+| 文件最终写到哪里 | backend |
+| 为什么这次能不能 `execute` | backend 是否满足 `SandboxBackendProtocol` |
+| 为什么同一份路径既像统一 filesystem，又落到多种介质 | `CompositeBackend` |
 
-- 工具通过 backend 产生读写
-- backend 再通过 state / send 机制更新 `files`
-- reducer 决定这些更新怎样并进 graph state
+### 什么算 graph state，什么算 backend
 
-### 3. `create_deep_agent()` 把 filesystem 当默认能力装进去
+- 当 backend 是 `StateBackend` 时，文件内容本身就存放在 `files` channel 里，graph state 是 canonical source of truth。
+- 当 backend 是 `FilesystemBackend` 时，文件内容落在宿主机文件系统；graph state 仍然存在，但不再是文件字节的唯一真源。
+- 当 backend 是 `CompositeBackend` 时，不同路径前缀可以分别落到 state、host filesystem 或其他后端；“统一 filesystem 视图”来自路由层，而不是来自单一状态容器。
 
-在 `graph.py` 里你会看到：
+## 运行时链路
 
-- 主 agent 默认 middleware 栈里有 `FilesystemMiddleware`
-- general-purpose subagent 默认 middleware 栈里也有 `FilesystemMiddleware`
-- declarative subagent 的默认 base stack 里同样会加 `FilesystemMiddleware`
+### 1. `create_deep_agent()` 默认把 filesystem 装进去
 
-所以对大多数 Deep Agents 来说，filesystem 不是“额外插件”，而是默认 harness 的一部分。
+`graph.py` 默认会给主 agent 和 general-purpose subagent 注入 `FilesystemMiddleware`，并在未显式传参时把 backend 设为 `StateBackend()`。
 
-这也解释了为什么很多 example 不显式定义文件工具，却仍然能：
+因此默认结论是：
 
-- 读文件
-- 写文件
-- 搜代码
-- 在支持 execution 的 backend 上跑命令
+- filesystem 是默认能力，不是可选插件
+- 默认文件介质是 graph state，不是宿主机磁盘
 
-### 4. 一条真实执行链：从 model tool call 到 backend 读写
+### 2. `ToolRuntime` 是文件工具的运行时载体
 
-真正的运行链大致是：
+filesystem 工具真正执行时，并不是手工传一堆环境参数，而是由 LangGraph 注入 `ToolRuntime`。在这一章里，`ToolRuntime` 的意义很具体：
 
-1. `FilesystemMiddleware.wrap_model_call()` 在 model call 前更新 system prompt，并按 backend 能力决定是否保留 `execute`
-2. model 产出 `read_file` / `write_file` / `edit_file` / `glob` / `grep` / `execute` tool call
-3. LangGraph `ToolNode` 调用 tool，并注入 `ToolRuntime`
-4. LangChain `BaseTool.run()` 负责 callback/config child run 语义
-5. Filesystem tool wrapper 通过 `runtime` 解析 backend，并调用 `backend.read()` / `write()` / `edit()` / `glob()` / `grep()` / `execute()`
-6. backend 返回标准化结果
-7. tool wrapper 把结果转成 `ToolMessage` 或 `Command(update=...)`
-8. LangGraph 再把这些更新合并回 `files` 或 `messages` state
+- tool wrapper 通过它读取 `state`
+- backend factory 通过它决定当前应该返回哪个 backend 实例
+- 同一次调用里的 `config`、`context`、`tool_call_id` 也都从这里进入工具
 
-这个链路里没有任何一步是在“绕开上游自己搞一套 agent 执行器”。
+这就是为什么“文件工具怎么知道当前线程状态”首先要看 `ToolRuntime`，而不是先猜 middleware 自己维护了额外全局变量。
 
-### 5. 一张时序图：filesystem tool 是怎么跑起来的
+### 3. 默认链路：`StateBackend` 把文件写回 `files` channel
 
-```mermaid
-sequenceDiagram
-    participant Graph as create_deep_agent
-    participant FSMW as FilesystemMiddleware
-    participant Model as ChatModel
-    participant ToolNode as LangGraph ToolNode
-    participant LC as BaseTool.run
-    participant RT as ToolRuntime
-    participant BE as BackendProtocol
-    participant State as files/messages state
+默认 backend 下，一条典型写路径是：
 
-    Graph->>FSMW: wrap_model_call()
-    FSMW->>FSMW: append filesystem system prompt
-    FSMW->>FSMW: filter execute if backend unsupported
-    FSMW->>Model: model call
-    Model-->>ToolNode: tool call (read_file / write_file / ...)
-    ToolNode->>LC: invoke tool
-    LC->>RT: inject runtime(state, context, config, tool_call_id)
-    LC->>BE: backend.read/write/edit/glob/grep/execute
-    BE-->>LC: result
-    LC-->>ToolNode: ToolMessage or Command(update=...)
-    ToolNode-->>State: merge messages/files updates
-```
+1. 模型发出 `read_file` / `write_file` / `edit_file` / `glob` / `grep`
+2. `FilesystemMiddleware` 暴露出来的工具被 `ToolNode` 调用
+3. 工具通过 `ToolRuntime` 解析到 `StateBackend`
+4. `StateBackend` 通过 `CONFIG_KEY_READ` 读取当前 `files` 快照
+5. 写操作通过 `CONFIG_KEY_SEND` 把增量更新排队进 `files` channel
+6. `_file_data_reducer` 在 node boundary 合并这些更新
 
-这张图强调三点：
+对维护者最关键的运行时语义是：
 
-- tool lifecycle 主要还是 LangChain / LangGraph 在跑
-- filesystem 的“环境能力”是 backend 提供的
-- `files` 的生命周期仍然是 graph state 语义
+- 同一步里读取看到的是一致快照
+- 写入不会在同一步内“瞬时改写全局状态”
+- 文件会随着 thread / checkpoint 生命周期一起保存
 
-### 6. `ToolRuntime` 为什么关键
+### 4. `FilesystemBackend` 才是真实宿主机文件系统
 
-filesystem 工具之所以能在不显式传很多参数的情况下工作，是因为 LangGraph 注入了 `ToolRuntime`。
+只有显式提供 `FilesystemBackend(...)` 时，filesystem 才真正落到宿主机磁盘。
 
-它能给工具带来：
+这里要抓住两个容易写错的点：
 
-- `state`
-- `context`
-- `config`
-- `tool_call_id`
-- `store`
-- `stream_writer`
+1. `root_dir` 在默认 `virtual_mode=False` 下主要影响相对路径解析，不是硬隔离边界。
+2. `virtual_mode=True` 提供的是虚拟路径语义和路径逃逸防护，不等于 sandbox。
 
-因此这些现象首先要往上游看，而不是先怪 Deep Agents：
+所以“给了 `root_dir` 就等于把 agent 关进这个目录”不是本章应当接受的说法。
 
-- 工具里为什么拿得到 thread 相关 config
-- 为什么 tool result 还能继续带 callback tree
-- 为什么某些运行时上下文对子工具仍然可见
+### 5. `CompositeBackend` 提供统一视图，不提供单一介质
 
-### 7. 默认 backend 为什么是 `StateBackend`
+`CompositeBackend` 按路径前缀路由 backend。它的价值不在于“多 backend 并存”，而在于让 agent 仍然看到一个统一的 filesystem 视图。
 
-Deep Agents 默认不是直接用宿主机磁盘，而是 `StateBackend()`。
+典型分工是：
 
-这是一个非常重要的设计选择。
+- 默认工作区走 `StateBackend`
+- `/memories/` 走长期存储 backend
+- `/artifacts/` 走独立产物 backend
 
-`StateBackend` 的核心不是“方便 mock”，而是：
+因此 `/` 下看到的目录列表，可能只是多个介质拼出来的一个虚拟入口。
 
-- 它直接通过 LangGraph 的 `CONFIG_KEY_READ` / `CONFIG_KEY_SEND` 读写 `files`
-- 写入不是立即改某个全局对象，而是排队进 state channel
-- 当前 step 内读取看到的是一致快照
-- node boundary 之后，写入才被并进后续 step 可见的 state
+### 6. `execute` 仍然由 backend 能力决定
 
-这意味着默认 filesystem 更像：
+虽然 `FilesystemMiddleware` 会创建 `execute` 这个工具，但它只在 backend 具备 `SandboxBackendProtocol` 时才算真正可用。运行时拦截点是 `wrap_model_call()`：
 
-> thread-scoped、checkpoint-aware、graph-native 工作区。
+- 有 `execute` 工具定义，不等于这次请求里一定保留它
+- backend 不支持执行时，middleware 会把它从本次工具列表里过滤掉
 
-而不是：
+因此“为什么这次没有 `execute`”是 backend 能力问题，不是 `files` state 问题。
 
-> 直接暴露宿主机磁盘。
+## 传播 / 可见性 / 拦截点
 
-### 8. `StateBackend` 的真实语义是什么
+这一章只保留和 runtime state 直接相关的可见性判断。
 
-从 `state.py` 看，`StateBackend` 有几个必须讲清的点：
+### 1. `files` 的可见性取决于 backend 语义
 
-- 它必须运行在 LangGraph graph context 里
-- 在 graph 外直接调用会报错
-- 预填文件的推荐方式是 `agent.invoke({"messages": [...], "files": {...}})`
-- 文件在同一 thread 内可持续，但不是跨 thread 的长期全局磁盘
+- `StateBackend`：文件内容对后续 step 与 checkpoint 可见，因为它本来就在 `files` channel 里。
+- `FilesystemBackend`：文件内容的真源在宿主机文件系统，排障时应先查磁盘路径解析，而不是先查 reducer。
+- `CompositeBackend`：先判断这条路径被路由到了哪个 backend，再判断它该不该出现在 state 或长期存储里。
 
-这就解释了为什么教程里不能把它写成“普通内存对象”。
+### 2. 运行时拦截点只有两个最重要
 
-它其实是：
+- `FilesystemMiddleware.wrap_model_call()`：决定本次模型请求看见哪些 filesystem 工具，尤其是 `execute`
+- backend 实现：决定读写、搜索、执行到底落到哪种介质
 
-- 绑定 graph context 的 backend
-- 借助 LangGraph config keys 读写 state
-- 与 checkpoint 机制天然兼容
+### 3. 不要把本章扩写成 callback / stream 理论
 
-### 9. `FilesystemBackend` 什么时候才是真实宿主机文件系统
+如果你现在关心的是传播、stream consumer 可见性、或者 callback tree 的形状，而不是本章的运行时职责，请跳到 Part 3。
 
-如果你显式传：
+## 扩展接口
 
-- `FilesystemBackend(root_dir=...)`
+围绕本章主题，真正稳定的扩展入口只有这些：
 
-那 filesystem 才会真正去读写宿主机磁盘。
+### 1. 换 backend
 
-这时要特别注意两件事：
+- 需要 thread-scoped 工作区：用 `StateBackend`
+- 需要真实文件系统：用 `FilesystemBackend`
+- 需要按路径拆多种介质：用 `CompositeBackend`
 
-1. `root_dir` 在 `virtual_mode=False` 下主要影响相对路径解析，不是硬安全边界
-2. `virtual_mode=True` 也只是虚拟路径语义和路径逃逸防护，不是 sandbox
+### 2. 用 backend factory 接运行时
 
-所以教程里最容易讲错的一句话是：
+`FilesystemMiddleware`、`MemoryMiddleware` 等都允许通过 runtime-aware factory 解析 backend。这里的关键不是“少写一层配置”，而是让 backend 决策能读到 `ToolRuntime` 当前上下文。
 
-> “给了 root_dir，agent 就被限制在这个目录了。”
+### 3. 预填 state-native 文件
 
-这在默认 `virtual_mode=False` 下并不成立。
+如果你故意选择 `StateBackend`，预填文件的正确入口是：
 
-### 10. `CompositeBackend` 把 filesystem 变成“虚拟路径视图”
+- `agent.invoke({"messages": [...], "files": {...}})`
 
-`CompositeBackend` 的价值，不只是“多 backend 拼起来”，而是：
+这属于 graph state 初始化，而不是宿主机文件预置。
 
-- 按路径前缀做路由
-- 把外部路径映射到内部 backend 视图
-- 在根目录 `"/"` 下把 routed directories 再聚合回统一列表
+### 4. 扩路径路由，而不是扩散状态语义
 
-经典例子是：
+想把 `/memories/`、`/artifacts/`、普通工作区拆开时，优先扩 `CompositeBackend.routes`。不要试图靠 prompt 文案或 tool 描述去模拟“不同介质”的事实。
 
-- 默认文件走 `StateBackend`
-- `/memories/` 走 `StoreBackend`
-- `/artifacts/` 或别的目录走其他介质
+## 常见问题与排障入口
 
-因此对 agent 来说，它看到的是单一 filesystem 视图；对维护者来说，底下其实是多介质拼接。
+- 文件明明写成功，下一次调用却看不到：先确认是不是 `StateBackend`，再确认你看的是否是同一 thread / node boundary 之后的状态。
+- 默认 agent 为什么没有读到本地磁盘文件：因为默认 backend 是 `StateBackend()`，除非你显式传了 `FilesystemBackend`。
+- `root_dir` 明明设了，为什么还能访问目录外路径：先看 `virtual_mode`，默认 `virtual_mode=False` 并不提供安全边界。
+- `/memories/...` 为什么没有长期保存：先看 backend 路由；只有对应路径真的被路由到长期 backend 时，它才不是 thread-local state。
+- `execute` 为什么有时出现有时消失：查 `FilesystemMiddleware.wrap_model_call()` 和 backend 是否满足 `SandboxBackendProtocol`。
+- 想排查通用 tool 描述、tool schema、tool-return surface：转去 [第5章：Tools 作为 Runtime Surface](./05-tools-as-runtime-surface.md)。
 
-### 11. `execute` 不是 filesystem 的天然组成部分
+## 本章结论
 
-`execute` 虽然出现在 `FilesystemMiddleware.tools` 里，但它不是任何 backend 都能用。
-
-当前逻辑是：
-
-- middleware 先把 `execute` 作为候选工具建出来
-- `wrap_model_call()` 里检查 backend 是否支持执行
-- 如果 backend 不支持，就把 `execute` 从当次 request tools 里过滤掉
-
-所以要分清三件事：
-
-- `execute` 出现在源码工具列表里
-- `execute` 实际暴露给当次模型
-- `execute` 真正在哪个环境执行
-
-这三件事不是同一个层次。
-
-### 12. filesystem 到底能做什么
-
-当前这套机制，按能力面可以分成下面几类：
-
-| 能力 | 由谁提供 | 备注 |
-|------|----------|------|
-| 列目录 `ls` | `FilesystemMiddleware` + backend `ls` | 返回绝对路径列表或条目 |
-| 文本文件分页读取 `read_file` | middleware + backend `read` | 默认支持 `offset` / `limit`，返回带行号内容 |
-| 多模态文件读取 | middleware `_handle_read_result` | 图片、音频、视频、PDF 走 multimodal content blocks |
-| 新建文件 `write_file` | middleware + backend `write` | 已存在文件默认报错 |
-| 精确替换 `edit_file` | middleware + backend `edit` | 依赖 exact string replacement 语义 |
-| 文件查找 `glob` | middleware + backend `glob` | 带超时保护 |
-| 文本搜索 `grep` | middleware + backend `grep` | 语义是 literal text，不是 regex |
-| shell 执行 `execute` | 仅 `SandboxBackendProtocol` | 可带 timeout，上限受 middleware 限制 |
-| 大结果落盘 | `FilesystemMiddleware` | tool result 过大时写到 `/large_tool_results/...` |
-| 超长用户消息落盘 | `FilesystemMiddleware` | HumanMessage 过大时写到 `/conversation_history/...` |
-
-所以“filesystem 能做什么”不能只回答“读写文件”。
-
-它实际上还是：
-
-- 搜索界面
-- 大内容中转层
-- 在支持执行的 backend 上的 shell 能力入口
-
-### 13. `read_file` 的真实 contract 比想象中更复杂
-
-`read_file` 不只是“读整个文件字符串”。
-
-它当前还承担了：
-
-- 分页读取
-- 行号格式化
-- 长行截断说明
-- 空文件提醒
-- 多模态文件返回 content blocks
-
-所以如果你要改 `read_file`，不是只看 backend 的 `read()` 返回值，还要看 middleware 的 `_handle_read_result()`。
-
-### 14. `edit_file` 的真实 contract 是 exact replacement，不是 patch engine
-
-`edit_file` 当前的语义更接近：
-
-- 给我旧字符串
-- 给我新字符串
-- 按 exact match 做一次或多次替换
-
-它不是：
-
-- AST 级编辑器
-- diff/patch 引擎
-- “凭上下文猜哪里该改”的模糊编辑器
-
-因此很多失败其实不是 backend 坏了，而是：
-
-- `old_string` 不唯一
-- 文件不存在
-- 替换文本不精确
-
-### 15. “必须先读再改”目前更像使用约束，不应过度写成硬状态机
-
-`filesystem.py` 里的 system prompt 和 `edit_file` tool description 都强调：
-
-- 先读再改
-- 必须确保文件已经读过
-
-但就当前源码表面看：
-
-- 我看到了这条规则在 prompt / tool description 中被反复强调
-- 没看到 `FilesystemMiddleware` 里有独立“读历史登记表”来硬性校验这个顺序
-
-所以一个更严谨的写法是：
-
-> `read-before-edit` 当前显然是核心使用约束，但从 `filesystem.py` 表面实现看，它首先是 prompt/tool contract；不要轻率写成“middleware 内部有独立 read-history state machine”。
-
-这是我基于当前源码做的判断。
-
-### 16. 大结果落盘是 filesystem 机制里非常容易忽略的一层
-
-`FilesystemMiddleware` 还做了两件很 runtime 的事：
-
-- tool result 太大时，写到 `large_tool_results_prefix`
-- HumanMessage 太大时，写到 `conversation_history_prefix`
-
-然后模型看到的是：
-
-- 一个截断预览
-- 一个可以再 `read_file` 回去的路径
-
-这说明 filesystem 不只是业务文件区，还是：
-
-> context overflow 的缓冲层。
-
-如果你只把它理解成“模型能改代码”，会漏掉这个很重要的运行时角色。
-
-### 17. 一张运行面矩阵
-
-| 你观察到的现象 | 先看哪里 |
-|----------------|----------|
-| 为什么有 `ls/read_file/write_file/edit_file/glob/grep` | `FilesystemMiddleware.__init__` |
-| 为什么这次没有 `execute` | `wrap_model_call()` 的 tool filtering |
-| 为什么文件写完下一步才稳定可见 | `StateBackend` + LangGraph step boundary |
-| 为什么 `/memories/` 能长期保存 | `CompositeBackend` route + routed backend |
-| 为什么大 tool result 只给了预览和路径 | `wrap_tool_call()` + eviction helpers |
-| 为什么图片/PDF 读出来不是纯文本 | `_handle_read_result()` 的 multimodal 分支 |
-
----
-
-## filesystem 与 memory 的关系
-
-两者相关，但不是一回事。
-
-- filesystem 是通用文件能力
-- memory 是把某些 `AGENTS.md` source 当作 always-on prompt material 读取
-
-memory 之所以能“保存回去”，靠的不是独立 memory API，而是 filesystem 的：
-
-- `write_file`
-- `edit_file`
-- backend 持久化能力
-
-所以可以把 memory 理解成：
-
-> 架设在 filesystem 之上的一层特殊读取策略。
-
----
-
-## 什么时候该修上游
-
-### 更像上游问题
-
-- `ToolRuntime` 注入字段缺失
-- tool callback tree / config propagation 异常
-- LangGraph step / reducer / checkpoint 行为与你预期不一致
-
-### 更像 Deep Agents 本地问题
-
-- filesystem tools 的默认描述或提示词不合理
-- `execute` 过滤逻辑不合理
-- 大结果落盘策略不合理
-- backend 适配层返回值与 tool wrapper 对不上
-- `CompositeBackend` 路由后的外部视图不一致
-
----
-
-## 容易踩什么坑
-
-- 坑 1：把 filesystem 直接等同于宿主机磁盘。
-  默认其实是 `StateBackend`。
-
-- 坑 2：把 backend 当成唯一 state owner。
-  graph state 才是主生命周期中心。
-
-- 坑 3：把 `execute` 当成所有 filesystem backend 都天然支持。
-  它依赖 `SandboxBackendProtocol`。
-
-- 坑 4：把 read-before-edit 写成已经被单独状态机硬检查的事实。
-  当前更稳妥的说法是：这是关键使用约束，但源码表面首先体现为 prompt / tool contract。
-
-- 坑 5：忽略 large result eviction。
-  filesystem 还承担 context overflow 缓冲层角色。
-
----
-
-## 本章小结
-
-- Deep Agents 的 filesystem 不是单一模块，而是 tool surface、`files` state channel、backend adapter、prompt policy 的组合。
-- 默认运行介质是 `StateBackend`，所以它首先是 graph-native 工作区，而不是宿主机磁盘。
-- `FilesystemMiddleware` 不只提供文件工具，还会动态决定 `execute` 暴露、系统提示词注入，以及大结果落盘。
-- 真正的运行链路仍然建立在 LangChain tool lifecycle 和 LangGraph `ToolRuntime` / state 上。
+- 谁提供：`FilesystemMiddleware` 提供默认 filesystem capability，`ToolRuntime` 提供执行期载体，backend 提供真实读写介质，`FilesystemState.files` 提供 graph 内部文件状态面。
+- 如何传播：默认情况下文件经由 `ToolRuntime -> StateBackend -> files channel -> reducer` 进入线程状态；换成 `FilesystemBackend` 或 `CompositeBackend` 后，真实内容则由 backend 持有。
+- 修在哪层：看不到文件、写入时序、checkpoint 语义先修 `StateBackend` / `FilesystemState.files`；路径解析与宿主机读写先修 `FilesystemBackend`；多介质路由先修 `CompositeBackend`；`execute` 可见性先修 `FilesystemMiddleware` 的 backend 能力判断。
