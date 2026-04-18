@@ -1,424 +1,181 @@
-# 第11章：像维护者一样阅读 Examples
+# 第16章：像维护者一样阅读 Examples
 
-## 学习目标
+## 本章回答什么
 
-学完本章，你应该能回答：
+- 为什么 examples 在维护工作流里应该被当成“证据入口”，而不是“官方 contract 目录”
+- 读 `deepagents/examples/` 时，怎样快速区分 example 本地约定、Deep Agents 装配约定、上游 runtime / primitive 约定
+- 哪些样本最适合回答装配、部署、outer loop、评测优化这些不同问题
+- 什么时候该继续追源码，什么时候该停止从 example 推理，回到 Part 3 或附录
+- 第 13 到 15 章判断完边界、provider 与测试之后，为什么这一章是维护工作流后半段的“证据校准”步骤
 
-1. 为什么 example 只能当“边界样本”，不能直接当 SDK contract
-2. 读 `deepagents/examples/` 时，应该如何一路追到 `deepagents`、`langgraph`、`langchain`
-3. 哪些 example 主要回答装配问题，哪些主要回答部署问题，哪些主要回答 outer loop / eval 问题
-4. `deep_research`、`async-subagent-server`、`content-builder-agent`、`text-to-sql-agent`、`ralph_mode`、`better-harness` 各自最值得维护者看的入口在哪里
+## 在整套系统中的位置
 
----
+- 这一部分默认假设你已经读过 Part 1 和 Part 2。
+- 如果当前问题和传播、可见性、callback tree 有关，先回看 Part 3。
+- 横向主题：`Maintenance`、`Examples as evidence`、`Code-reading workflow`
+- 前置章节：[第13章：Backend 协议、存储介质与执行边界](./13-backend-protocol-and-storage-strategy.md)、[第14章：Provider Profiles、模型解析与 Middleware Surface](./14-provider-profiles-and-model-routing.md)、[第15章：如何测试一个三层栈 Harness](./15-testing-the-harness.md)
+- 配套索引：[附录 C：Examples 索引与阅读顺序](../appendix/examples-index.md)、[附录 E：Troubleshooting Playbook](../appendix/troubleshooting-playbook.md)
+- 后续章节：[第17章：如何安全地新增一种跨三层能力](./17-how-to-add-a-new-capability-safely.md)
 
-## 问题是什么
+第 13 到 15 章先教你判断问题属于哪层、哪些默认策略会影响行为、怎样用测试钉住回归。到了这里，维护工作流进入后半段：你要开始把 example 当成证据，去验证“这个行为到底是谁装出来的、谁暴露出来的、谁只是顺带演示了它”。
 
-很多人读 example 的方式是：
+## 静态结构
 
-- 看 README
-- 跑通 demo
-- 把能工作的 wiring 直接当成“官方架构”
+这一章保留 example-index 的写法，但这是一个受控例外：顶层仍按 Part 4 的共享合同组织，内部才用样本矩阵展开。原因很简单，examples 不是一组平行概念，而是一组读源码入口。
 
-这对使用者够了，但对维护者不够。
+先把 `deepagents/examples/` 分成三类：
 
-维护者更该问的是：
-
-- 这个目录到底在复用哪一层能力
-- 哪些行为是 example 本地 helper，哪些是 Deep Agents 默认装配，哪些是 LangGraph / LangChain 上游语义
-- 如果这里出 bug，第一站应该追哪个文件
-
-所以本章的重点不是“怎么运行 examples”，而是“怎么用 examples 反推三层栈的责任边界”。
-
----
-
-## 为什么这一章故意长得不一样
-
-这一章是 example-lens / index 型特例章节，所以它不会像 [第2章](../part1-foundations/02-repo-map-and-package-boundaries.md) 或 [第3章](../part1-foundations/03-create-deep-agent-as-assembly-root.md) 那样先给一整套通用分层模板。
-它的职责是把样本目录和源码入口一一钉住，再把你引回系统章节和 [附录 C](../appendix/examples-index.md)。
-
-读 example 时如果你发现自己开始争论 ownership、assembly root、streaming visibility、callback propagation 这些通用问题，就说明应该先回跳到系统章节，再回来继续读样本。
-
----
-
-## 先把 Examples 分三类
-
-| 类别 | 代表目录 | 这类样本最适合回答什么问题 |
-|------|----------|----------------------------|
+| 类别 | 代表目录 | 最适合回答什么 |
+| --- | --- | --- |
 | harness 装配样本 | `deep_research`、`content-builder-agent`、`text-to-sql-agent` | `create_deep_agent()` 被怎样参数化，memory / skills / tools / subagents / backend 怎样组合 |
 | runtime / deployment 样本 | `async-subagent-server`、`deploy-*`、`nvidia_deep_agent` | LangGraph server、远端 thread/run、MCP、sandbox、部署配置怎样接入 |
 | outer loop / meta-harness 样本 | `ralph_mode`、`better-harness` | 哪些能力该放在 graph 外层，eval 驱动优化如何围住 harness 本身 |
 
-如果你一开始就把这三类混在一起看，很容易得出错误结论：
+读例子前先把三类标签写在旁边：
 
-- 把部署目录里的 `deepagents.toml` 当成 runtime 内核
-- 把 example 里的 YAML loader 当成 SDK contract
-- 把 CLI outer loop 当成 graph 内节点
+- `example 本地约定`
+  例如 `subagents.yaml` loader、FastAPI server、REPL、eval config、README 驱动流程。
+- `Deep Agents 装配约定`
+  例如 `create_deep_agent()`、memory / skills / permissions / backend / profile。
+- `上游 runtime / primitive 约定`
+  例如 callback manager、`RunnableConfig`、`stream_mode`、checkpoint、tool runtime。
 
----
+如果这三个标签还没分开，就不要急着把 example 里的 wiring 当成结论。
 
-## 维护者阅读总流程
+## 运行时链路
 
-读任何一个 example，建议固定走这四步：
+把 example 当证据来读，建议固定走这条维护者链路：
 
-1. 先找入口文件。
-   先定位 `create_deep_agent()`、`langgraph.json`、`deepagents.toml`、`run_non_interactive(...)`、`SQLDatabaseToolkit(...)` 这种真正决定 wiring 的地方。
+### 1. 先找装配入口，不要先看 README 文案
 
-2. 再标出 example 自己新增了什么。
-   例如 `subagents.yaml` loader、FastAPI server、eval runner、本地 REPL、产品化 prompt。这些 often 是 example 私有层，不是框架默认层。
+优先定位这些地方：
 
-3. 再追到 `deepagents` 装配层。
-   重点看 `deepagents/libs/deepagents/deepagents/graph.py` 和对应 middleware / backend 文件，确认这些参数最终怎样被装配成 graph。
+- `create_deep_agent()`
+- `langgraph.json`
+- `deepagents.toml`
+- `run_non_interactive(...)`
+- `SQLDatabaseToolkit(...)`
+- server / supervisor 的入口函数
 
-4. 最后去上游确认执行语义。
-   例如 tool callback、token stream、`RunnableConfig`、`stream_mode`、`ToolRuntime`、checkpoint、remote thread/run 生命周期，这些都不是 example 自己定义的。
+这些位置真正决定了“样本把哪一层能力接到了哪一层”。
 
----
+### 2. 再标出 example 自己新增了什么
 
-## 六个核心 Example
+你要先判断哪些只是样本私有层：
 
-下面这六个目录，是本教程最值得当 maintainer 样本反复读的 examples。
+- `subagents.yaml` loader
+- FastAPI server
+- eval runner
+- CLI REPL
+- 业务 prompt
+- 研究型 patch / scorecard / keep-or-discard 逻辑
 
-### 1. `deep_research`
+这些内容常常解释“这个 example 为什么这么工作”，但不自动解释“框架为什么必须这样工作”。
 
-#### 这个 example 真正展示什么
+### 3. 然后追到 Deep Agents 装配层
 
-它展示的不是“Deep Agents 内建 research mode”，而是：
+对大多数样本，下一站都还是：
 
-- 如何用额外 prompt 把默认 harness 专门化成 research orchestrator
-- 如何用 `task` 工具把 research subagent 接进主线程
-- 如何把 example 自己的搜索工具和反思工具注入进去
+- `deepagents/libs/deepagents/deepagents/graph.py`
+- `deepagents/libs/deepagents/deepagents/middleware/subagents.py`
+- `deepagents/libs/deepagents/deepagents/middleware/async_subagents.py`
+- `deepagents/libs/deepagents/deepagents/middleware/memory.py`
+- `deepagents/libs/deepagents/deepagents/middleware/skills.py`
+- `deepagents/libs/deepagents/deepagents/backends/filesystem.py`
 
-也就是说，它是“specialized harness”样本，不是“SDK 核心功能清单”。
+这一步的目的不是“把所有实现看完”，而是确认 example 传进去的参数最终收敛成了什么 harness contract。
 
-#### 三层落点
+### 4. 最后再去上游确认执行语义
 
-- `LangChain`
-  `init_chat_model(...)`、`@tool`、`InjectedToolArg`、model/tool callback 都在这层。
-- `LangGraph`
-  `langgraph.json`、server/studio 接入、`messages`/`updates` stream 面在这层。
-- `Deep Agents`
-  `create_deep_agent()`、`SubAgentMiddleware`、默认文件与 todo harness、prompt layering 在这层。
+如果你查的是 callback、stream、tool runtime、checkpoint、remote thread/run 生命周期，这些都不是 example 自己定义的。最终要回到上游：
 
-#### 追源码顺序
+- `langchain/libs/core/langchain_core/tools/base.py`
+- `langchain/libs/core/langchain_core/language_models/chat_models.py`
+- `langchain/libs/core/langchain_core/runnables/config.py`
+- `langgraph/libs/langgraph/langgraph/pregel/main.py`
+- `langgraph/libs/langgraph/langgraph/pregel/_messages.py`
 
-1. 看 `deepagents/examples/deep_research/agent.py`
-2. 看 `deepagents/examples/deep_research/research_agent/prompts.py`
-3. 看 `deepagents/examples/deep_research/research_agent/tools.py`
-4. 追到 `deepagents/libs/deepagents/deepagents/graph.py`
-5. 再看 `deepagents/libs/deepagents/deepagents/middleware/subagents.py`
-6. 如果你在查 streaming / UI 可见性，再看 `langgraph/libs/langgraph/langgraph/pregel/main.py` 和 `langgraph/libs/langgraph/langgraph/pregel/_messages.py`
-7. 如果你在查 tool/model callback 事件，再看 `langchain/libs/core/langchain_core/tools/base.py` 和 `langchain/libs/core/langchain_core/language_models/chat_models.py`
+### 5. 六个主样本分别回答什么
 
-#### 容易误判什么
+| Example | 真正最值得看的地方 | 维护者最该追的下一站 |
+| --- | --- | --- |
+| `deep_research` | specialized harness，不是“Deep Agents 内建 research mode” | `graph.py`、`middleware/subagents.py` |
+| `async-subagent-server` | remote async task 协议，不是“多一个 `async def`” | `middleware/async_subagents.py`、server 的 `/threads` `/runs` |
+| `content-builder-agent` | 文件化 harness；最适合分辨 filesystem primitive 与 example helper | `memory.py`、`skills.py`、`filesystem.py` |
+| `text-to-sql-agent` | LangChain toolkit 接入 Deep Agents harness 的标准样本 | `SQLDatabaseToolkit`、`graph.py` |
+| `ralph_mode` | fresh context outer loop，不是 graph 内部循环教程 | 先确认 CLI boundary，再回 `graph.py` |
+| `better-harness` | harness 自己成为优化对象的研究样本 | `core.py`、`agent.py`、`runners.py`、`patching.py` |
 
-- 误判 1：research workflow 是 Deep Agents 默认内核。
-  其实这些 workflow prompt 基本都在 example 自己的 `prompts.py`。
+## 传播 / 可见性 / 拦截点
 
-- 误判 2：research subagent 的存在说明主 agent 会自动并行拆任务。
-  实际是 example prompt 在驱动拆分，`task` 只是提供隔离执行面。
+examples 最容易误导维护者的地方，不是代码本身，而是你会不知不觉把“看到了某种现象”和“知道它的 owner layer”混成一句。
 
-- 误判 3：Tavily + think tool 属于框架能力。
-  它们只是 example 注入的普通工具。
+### 哪些问题不要继续靠 example 推理
 
-### 2. `async-subagent-server`
+如果你已经进入下面这些问题，就该先回系统章节，而不是继续在 example 目录里找“类似写法”：
 
-#### 这个 example 真正展示什么
+- callback tree 怎样接起来
+- token 为什么出现在外层流里
+- `subgraphs=True` 时哪些事件会被消费者看到
+- `nostream` 过滤了什么，没过滤什么
+- parent / child state、结果折返、阶段事件分别沿哪条线走
 
-它展示的不是“subagent 的 async 版本”，而是：
+统一回跳规则如下：
 
-- Deep Agents 如何把远端 Agent Protocol server 暴露成一组 async task tools
-- 本地 supervisor 怎样通过 task id 跟远端 thread/run 生命周期交互
-- `start` / `check` / `update` / `cancel` / `list` 这些动作如何映射到远端 server
+- streaming 的说明统一回看第9章到第12章：[第9章](../part3-propagation/09-propagation-overview-and-four-lanes.md)、[第10章](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第11章](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[第12章](../part3-propagation/12-subagent-propagation-matrix-and-maintainer-recipes.md)
+- subagent + callback 的混合说明统一回看第10章与第12章：[第10章](../part3-propagation/10-callbacks-config-and-callback-manager.md)、[第12章](../part3-propagation/12-subagent-propagation-matrix-and-maintainer-recipes.md)
+- 可见性速查表回跳统一回看第11章 + 附录 D：[第11章](../part3-propagation/11-streaming-visibility-and-selective-exposure.md)、[附录 D](../appendix/propagation-and-visibility-cheatsheet.md)
 
-它是“远端任务协议样本”，不是“Python 里多一个 `async def` 就完了”的样本。
+### 例子能提供什么“传播证据”
 
-#### 三层落点
+例子依然有价值，但它提供的是“哪条线值得追”的证据：
 
-- `LangChain`
-  远端 server 里的 `_agent = create_deep_agent(...)` 依然靠 LangChain model/tool primitive 工作。
-- `LangGraph`
-  `MemorySaver`、thread id、LangGraph SDK client、remote runs/status 协议都属于这一层及其邻接生态。
-- `Deep Agents`
-  `AsyncSubAgentMiddleware` 把远端 server 暴露成 `start_async_task` / `check_async_task` / `update_async_task` / `cancel_async_task` / `list_async_tasks`。
+- `deep_research` 能证明 `task` tool、research prompt 与 subagent wiring 是怎样拼起来的
+- `async-subagent-server` 能证明远端任务状态是 live 查询而不是会话复述
+- `content-builder-agent` 能证明 memory / skills / filesystem 这三条装配线怎样在一个样本里同时出现
+- `ralph_mode` 能证明 outer loop 可以在 graph 外，而不是 graph 内必有循环节点
 
-#### 追源码顺序
+但它们不能替代 Part 3 去定义传播 contract。
 
-1. 先看 `deepagents/examples/async-subagent-server/supervisor.py`
-2. 再看 `deepagents/libs/deepagents/deepagents/middleware/async_subagents.py`
-3. 再看 `deepagents/examples/async-subagent-server/server.py`
-4. 如果你在查本地 supervisor 状态保存，再看 `langgraph.checkpoint.memory.MemorySaver` 的使用点
-5. 如果你在查远端结果为什么最终回到父线程，再回看 `async_subagents.py` 里各 tool 返回的 `Command(update=...)`
-6. 如果你在查远端 agent 内部 model/tool 语义，再按普通 Deep Agents 路径追回 `graph.py`、`tools/base.py`、`chat_models.py`
+## 扩展接口
 
-#### 容易误判什么
-
-- 误判 1：async subagent 只是本地 subagent 的非阻塞包装。
-  不对，它背后是远端 thread/run 协议和状态轮询。
-
-- 误判 2：只要 conversation 里写着某个 task 正在 running，就可以直接复述。
-  不对，源码里明确要求状态必须重新调用 tool 获取。
-
-- 误判 3：远端 server 的安全边界由本地 permissions 自动接管。
-  不对，远端 agent 要在自己的 server / tool / sandbox 层再做一遍。
-
-### 3. `content-builder-agent`
-
-#### 这个 example 真正展示什么
-
-它是当前仓库里最好的“文件化 harness”阅读样本，能同时看到：
-
-- `AGENTS.md` 作为 memory
-- `skills/*/SKILL.md` 作为按需技能
-- `FilesystemBackend` 作为工作目录与持久文件层
-- 自定义工具与自定义 subagent 配置如何插进 `create_deep_agent()`
-
-它非常适合维护者用来分辨“filesystem primitive”与“example helper”的边界。
-
-#### 三层落点
-
-- `LangChain`
-  `@tool`、`AIMessage` / `ToolMessage`、工具调用协议在这层。
-- `LangGraph`
-  `agent.astream(..., stream_mode="values")` 的执行与流传播在这层。
-- `Deep Agents`
-  `MemoryMiddleware`、`SkillsMiddleware`、`FilesystemBackend`、`SubAgentMiddleware` 和默认文件工具在这层。
-
-#### 追源码顺序
-
-1. 看 `deepagents/examples/content-builder-agent/content_writer.py` 的 `create_content_writer()`
-2. 再看 `deepagents/examples/content-builder-agent/AGENTS.md`
-3. 再看 `deepagents/examples/content-builder-agent/skills/*/SKILL.md`
-4. 再看 `deepagents/examples/content-builder-agent/subagents.yaml` 和同文件里的 `load_subagents()`
-5. 追到 `deepagents/libs/deepagents/deepagents/graph.py`
-6. 再看 `deepagents/libs/deepagents/deepagents/middleware/memory.py`、`deepagents/libs/deepagents/deepagents/middleware/skills.py`、`deepagents/libs/deepagents/deepagents/middleware/subagents.py`
-7. 如果你在查文件读写根目录，再看 `deepagents/libs/deepagents/deepagents/backends/filesystem.py`
-8. 如果你在查为什么 `values` 流里会看到整批消息，再看 `langgraph/libs/langgraph/langgraph/pregel/main.py`
-
-#### 容易误判什么
-
-- 误判 1：`subagents.yaml` 是 Deep Agents 原生配置格式。
-  不是。源码里 `load_subagents()` 明确说明这只是 example 自己的 helper。
-
-- 误判 2：skills 是一开始整包注入模型上下文。
-  不是。它们是按需加载的 progressive disclosure。
-
-- 误判 3：界面里看到的输出顺序就是 graph 内部节点顺序。
-  不一定。这里的展示层还叠加了 `Rich` 的 live rendering。
-
-### 4. `text-to-sql-agent`
-
-#### 这个 example 真正展示什么
-
-它最有价值的地方不是 SQL 本身，而是边界拆分：
-
-- SQL toolkit 与数据库访问 primitive 来自 LangChain 生态
-- memory / skills / filesystem / planning harness 来自 Deep Agents
-- 运行时仍然落到 LangGraph 编译图上
-
-所以它是“上游 toolkit 接入 Deep Agents harness”的标准样本。
-
-#### 三层落点
-
-- `LangChain`
-  `SQLDatabaseToolkit`、`SQLDatabase`、SQL 工具集合都在这层。
-- `LangGraph`
-  `create_deep_agent()` 返回的其实是 LangGraph 编译结果，`invoke()` 仍在这层执行。
-- `Deep Agents`
-  memory / skills / filesystem / 默认 planning 与文件工具装配在这层。
-
-#### 追源码顺序
-
-1. 看 `deepagents/examples/text-to-sql-agent/agent.py`
-2. 再看 `deepagents/examples/text-to-sql-agent/AGENTS.md` 与 `skills/*/SKILL.md`
-3. 再追 `langchain_community.agent_toolkits.SQLDatabaseToolkit` 与 `langchain_community.utilities.SQLDatabase`
-4. 然后回到 `deepagents/libs/deepagents/deepagents/graph.py`
-5. 再看 `deepagents/libs/deepagents/deepagents/backends/filesystem.py`
-6. 如果你在查 toolkit tools 为什么会继续带 callbacks/config，再看 `langchain/libs/core/langchain_core/tools/base.py`
-7. 如果你在查 graph 执行与 state，再看 `langgraph/libs/langgraph/langgraph/pregel/main.py`
-
-#### 容易误判什么
-
-- 误判 1：SQL 能力属于 Deep Agents 内建工具集。
-  不对，这里真正的数据库能力来自 LangChain Community toolkit。
-
-- 误判 2：没有 subagent，就说明这个例子不涉及 context isolation。
-  也不对，filesystem、skills、todo planning 仍然在控制上下文组织方式。
-
-- 误判 3：只要 toolkit 能跑，Deep Agents 层就不用关心测试。
-  错。真正容易回归的是 harness 和 toolkit 交界处。
-
-### 5. `ralph_mode`
-
-#### 这个 example 真正展示什么
-
-它最重要的价值是把一个常见误会拆开：
-
-- fresh context loop 不一定要做成 graph 内部循环节点
-- 文件系统和 git 可以承担跨轮记忆
-- 真正的 agent 执行发生在 outer loop 每轮重新调用时
-
-所以 Ralph 读法的关键不是“图里怎么循环”，而是“为什么循环根本不在图里”。
-
-#### 三层落点
-
-- `LangChain`
-  每轮真正 agent 调用时，底层 model/tool primitive 仍然是 LangChain。
-- `LangGraph`
-  每轮 fresh thread 进入的 compiled graph 仍然是 LangGraph runtime。
-- `Deep Agents`
-  这个目录本身更像 Deep Agents CLI 的外层使用模式，而不是库内 middleware 组合样本。
-
-#### 追源码顺序
-
-1. 看 `deepagents/examples/ralph_mode/ralph_mode.py`
-2. 先标出边界点：`deepagents_cli.non_interactive.run_non_interactive(...)` 不在当前三仓源码里
-3. 再回到本教程第 3 章对应的 `deepagents/libs/deepagents/deepagents/graph.py`
-4. 如果你在查 streaming / checkpoint / thread 语义，再看 `langgraph/libs/langgraph/langgraph/pregel/main.py`
-5. 如果你在查 tool/model 事件，再看 `langchain/libs/core/langchain_core/tools/base.py` 与 `langchain/libs/core/langchain_core/language_models/chat_models.py`
-
-#### 容易误判什么
-
-- 误判 1：Ralph 模式应该被抽回 `graph.py`。
-  不一定。这个例子恰恰说明有些模式天然属于 CLI outer loop。
-
-- 误判 2：fresh context 等于完全没有记忆。
-  不对。文件系统和 git 依然在承担跨轮记忆。
-
-- 误判 3：这个例子能直接证明 compiled graph 的 loop 语义。
-  不能。它主要证明的是“外层编排”。
-
-### 6. `better-harness`
-
-#### 这个 example 真正展示什么
-
-它不是普通业务 agent example，而是“用一个 Deep Agent 去优化另一个 harness”的研究样本。
-
-对维护者最有启发的不是业务流程，而是这几个概念：
-
-- editable surfaces
-- proposer workspace
-- baseline / candidate / keep-or-discard
-- train / holdout / scorecard
-
-也就是说，它展示的是“harness 自己成为优化对象”。
-
-#### 三层落点
-
-- `LangChain`
-  外层 proposer agent 本身仍然调用 LangChain model/tool primitive。
-- `LangGraph`
-  外层 proposer 由 `create_deep_agent()` 装配后仍在 LangGraph runtime 上执行。
-- `Deep Agents`
-  这个例子把 `create_deep_agent()` 作为 outer optimizer 的内核，而不是直接业务 agent。
-
-#### 追源码顺序
-
-1. 先看 `deepagents/examples/better-harness/README.md`
-2. 再看 `deepagents/examples/better-harness/examples/deepagents_example.toml`
-3. 再看 `deepagents/examples/better-harness/better_harness/core.py`
-4. 再看 `deepagents/examples/better-harness/better_harness/agent.py`
-5. 再看 `deepagents/examples/better-harness/better_harness/patching.py`
-6. 最后看 `deepagents/examples/better-harness/better_harness/runners.py`
-7. 如果你想确认 proposer agent 自己是怎么装起来的，再回到 `deepagents/libs/deepagents/deepagents/graph.py`
-
-#### 容易误判什么
-
-- 误判 1：这是 Deep Agents 官方默认工作流。
-  不是。它是研究 artifact。
-
-- 误判 2：只有 prompt 值得当 surface。
-  不对。这个例子明确把 tool、skill、middleware 实现、middleware 注册都当成 surface。
-
-- 误判 3：holdout/private 可见性已经是严格安全隔离。
-  README 已经说明这里更接近 research infrastructure，而不是强隔离沙箱。
-
----
-
-## 次级 Example 该怎么用
-
-下面这些目录也值得看，但更适合作为“补全局部主题”的样本，而不是第一个读的入口。
-
-### `deploy-content-writer`、`deploy-coding-agent`、`deploy-mcp-docs-agent`
-
-这三个目录最适合回答：
-
-- `deepagents.toml` 怎么组织 deployment-facing 配置
-- `AGENTS.md`、`skills/`、`mcp.json` 怎样变成一个可部署 agent 包
-- sandbox / MCP / user memory 这种产品化接缝放在哪里
-
-不适合直接拿来回答：
-
-- callback manager 怎样传播
-- subagent 内部 token 为什么可见
-- `CompiledSubAgent` 为什么不继承某个 middleware
-
-### `nvidia_deep_agent`
-
-这个目录适合在你已经看完 `content-builder-agent` 和 `deep_research` 后再读，因为它把多个主题叠在一起：
-
-- 多模型路由
-- sandbox backend
-- skills 上传到 sandbox
-- 自我修正式 memory / skills 维护
-
-它是“高密度综合样本”，不是第一站。
-
-### `downloading_agents`
-
-这个目录很适合拿来解释：
-
-- agent 为什么本质上可以是一个文件夹
-- `AGENTS.md + skills/` 为什么足够构成可分发 artifact
-
-但它不适合拿来学习 runtime internals，因为这里几乎没有装配源码可追。
-
----
-
-## 哪些模式值得抽回库里，哪些应该留在 Example
-
-更像应该抽回库里的信号：
-
-- 多个 example 都在重复相同的装配逻辑
-- 这个逻辑与具体产品场景无关
-- 它已经开始在多个目录里手写复制
-
-更应该留在 example 的信号：
-
-- 它主要是业务 prompt、产品 UX、部署脚本或 README 约定
-- 它依赖某个场景专属工具或服务
-- 抽回库里会扩大默认 contract，却没有足够测试和通用性支持
-
----
-
-## 用 Example 反查问题的最快路径
-
-如果你要查这些问题，第一站通常是：
+维护者最常做的，不是“新增一个 example”，而是把 example 当成路由表，判断下一步该读哪一层、修哪一层。下面这张表就是最实用的扩展接口。
 
 | 你在查什么 | 先看哪个 example | 再追哪里 |
-|------------|------------------|----------|
+| --- | --- | --- |
 | memory / skills / filesystem 到底怎样组合 | `content-builder-agent` | `graph.py`、`memory.py`、`skills.py`、`filesystem.py` |
 | 同步 subagent handoff 与结果回传 | `deep_research` | `subagents.py`、`pregel/main.py` |
-| 远端 async task 生命周期 | `async-subagent-server` | `async_subagents.py`、server 里的 `/threads` `/runs` 处理 |
+| 远端 async task 生命周期 | `async-subagent-server` | `async_subagents.py`、server 的 `/threads` `/runs` 处理 |
 | 上游 toolkit 怎样接入 harness | `text-to-sql-agent` | `SQLDatabaseToolkit`、`tools/base.py`、`graph.py` |
 | outer loop 是否该进 graph | `ralph_mode` | 先确认 CLI boundary，再回 `graph.py` |
 | eval 驱动优化 harness 本身 | `better-harness` | `core.py`、`agent.py`、`runners.py`、`patching.py` |
 
----
+次级样本则更适合按专题补充，而不是作为维护工作流第一站：
 
-## 容易踩什么坑
+- `deploy-content-writer`、`deploy-coding-agent`、`deploy-mcp-docs-agent`
+  更适合看 `deepagents.toml`、`AGENTS.md`、MCP、sandbox、部署打包接缝。
+- `nvidia_deep_agent`
+  更像高密度综合样本，适合在前面几类已经读熟后再看。
+- `downloading_agents`
+  更适合解释“agent 为什么本质上可以是一个文件夹”，不适合学习 runtime internals。
 
-- 坑 1：把 example 目录中的 helper、YAML、脚本、REPL、README 文案当成 SDK 保证。
+## 常见问题与排障入口
 
-- 坑 2：只读 example，不继续追 `deepagents` 装配层和上游 runtime / primitive。
+- “这个 example 跑通了，为什么我还不能把它当 SDK 保证”：因为 example 展示的是组合证据，不是稳定公共 contract；先回 [第3章：Create Deep Agent 作为 Assembly Root](../part1-foundations/03-create-deep-agent-as-assembly-root.md) 和本章的三类标签。
+- “我在 example 里看到了流输出，所以是不是已经知道 streaming 规则”：不是；规则定义回到第9章到第12章，不在样本目录里。
+- “为什么 `subagents.yaml` / `deepagents.toml` / `langgraph.json` 看起来都像配置，但意义完全不同”：因为它们分别落在 example helper、部署包装、上游 runtime 接缝，不属于同一层。
+- “我想知道 bug 该修在 example、Deep Agents 还是上游”：先用 [附录 E：Troubleshooting Playbook](../appendix/troubleshooting-playbook.md) 按症状分层，再决定是否回 [第13章](./13-backend-protocol-and-storage-strategy.md)、[第14章](./14-provider-profiles-and-model-routing.md)、[第15章](./15-testing-the-harness.md)。
+- “我只想快速知道某个问题先看哪个目录”：先查 [附录 C：Examples 索引与阅读顺序](../appendix/examples-index.md)，它比本章更适合做检索。
 
-- 坑 3：看到 `langgraph.json`、`deepagents.toml`、CLI 脚本，就误以为它们描述的是同一层。
+最容易踩的坑有四类：
 
-- 坑 4：把产品化外层模式强行抽回 `graph.py`。
+- 把 example 里的 helper、YAML、脚本、REPL、README 文案当成 SDK 保证。
+- 只读 example，不继续追 `deepagents` 装配层和上游 runtime / primitive。
+- 看到 `langgraph.json`、`deepagents.toml`、CLI 脚本，就误以为它们描述的是同一层。
+- 把产品化 outer loop 或研究型工作流强行抽回 `graph.py`。
 
----
+## 本章结论
 
-## 本章小结
-
-- examples 是“边界样本”，不是“合同文本”。
-- 维护者读 example 的正确方式，是先找入口，再分清 example 私有层、Deep Agents 装配层、LangGraph runtime、LangChain primitive。
-- 六个核心 example 分别回答了 specialized harness、remote async task、filesystem harness、toolkit 接入、outer loop、meta-harness 这六类问题。
+- 谁提供：examples 提供的是维护者的证据入口；真正的 contract 仍由 `LangChain`、`LangGraph` 和 `Deep Agents` 各自提供。
+- 如何传播：先从 example 找到装配入口，再追到 `deepagents` 装配层，最后把 callback、streaming、visibility 之类的问题回收到 Part 3 的传播章节。
+- 修在哪层：样本私有 helper 修在 example，本地默认装配修在 Deep Agents，上游 runtime / primitive 语义问题回到 LangGraph 或 LangChain。
