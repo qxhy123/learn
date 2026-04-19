@@ -1,5 +1,7 @@
 # Learning Paths
 
+The default path is still full sequential completion from Part 1 through Part 4.
+
 ## Language-First Path
 
 Read all of Part 1, then Part 2, before specializing.

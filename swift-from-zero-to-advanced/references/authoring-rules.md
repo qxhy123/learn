@@ -6,6 +6,7 @@
 - Every chapter must include runnable code.
 - Every chapter must include drills.
 - Every chapter must explain common mistakes, not just happy paths.
+- Every part must define explicit outcomes.
 - Project work must evolve incrementally from earlier material.
 - Advanced material should be explicitly labeled when it is optional.
 

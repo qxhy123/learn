@@ -5,6 +5,7 @@
 - explain concepts
 - explain pitfalls
 - explain design reasoning
+- explain design tradeoffs
 - explain exercise instructions
 
 ## English Responsibilities
@@ -13,6 +14,7 @@
 - API names
 - type names
 - canonical technical terms
+- selected rule titles where clarity benefits
 
 ## Rules
 
