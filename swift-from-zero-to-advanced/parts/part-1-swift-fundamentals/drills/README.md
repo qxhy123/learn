@@ -1,9 +1,10 @@
 # Part 1 Drills
 
-Each Part 1 chapter should include:
+Part 1 drills should stay short enough for normal study sessions, but they
+should never collapse into one-mode repetition.
+
+Each chapter should contain:
 
 - one concept check
 - one code-reading task
-- one hands-on code change
-
-The drills should stay short enough to fit inside a normal study session.
+- one hands-on extension

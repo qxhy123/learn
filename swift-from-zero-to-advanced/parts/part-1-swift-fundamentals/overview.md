@@ -1,26 +1,30 @@
 # Part 1: Swift Fundamentals
 
-## What This Part Covers
+## Why Part 1 Exists
 
-Part 1 establishes the language foundation for the whole course.
+Part 1 teaches Swift as a language through one continuous command-line project.
 
-## Learning Outcomes
+## What You Will Learn
 
-- read and write small Swift programs
-- understand types, control flow, collections, and optionals
-- prepare for the first CLI project
+- how Swift code runs
+- how Swift models values and types
+- how to move from loose scripts to a small structured program
+- how to model domain data with structs, enums, collections, and optionals
 
-## Chapter Map
+## Chapter Sequence
 
-1. Swift Setup and First Program
-2. Constants, Variables, and Types
-3. Control Flow
-4. Functions and Decomposition
-5. Collections
-6. Optionals and Basic Error Handling
-7. Strings, Tuples, and Pattern Matching
-8. Part 1 Project
+1. Running Swift
+2. Values and Types
+3. Strings and Program I/O
+4. Control Flow for Commands
+5. Functions and Program Shape
+6. Structs and Data Modeling
+7. Collections and Task State
+8. Optionals and Safe Parsing
+9. Enums and Pattern Matching
+10. Build TaskCLI Lite v1
 
-## Part Project
+## Project Spine
 
-The Part 1 project is `TaskCLI Lite`, a small command-line task manager.
+The whole part builds toward `TaskCLI Lite v1`, a small Swift command-line task
+manager that stays intentionally simple while teaching real Swift semantics.

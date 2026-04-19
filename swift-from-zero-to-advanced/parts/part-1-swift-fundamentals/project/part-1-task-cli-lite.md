@@ -1,19 +1,16 @@
 # Part 1 Project: TaskCLI Lite
 
-## Project Goal
+## Goal
 
-Build a small command-line task manager that can:
+Build a small task-oriented command-line tool that stays simple enough for Part
+1 while still feeling like a real program.
+
+## Required Capabilities
 
 - list tasks
 - add tasks
 - mark tasks as done
 
-## Why This Project Fits Part 1
+## Part 1 Constraint
 
-The project is small enough for language learners, but rich enough to practice
-types, control flow, functions, collections, and optionals.
-
-## Part 1 Finish Line
-
-The project does not need industrial architecture yet. It needs clarity,
-correctness, and visible use of the concepts from Part 1.
+The goal is clarity and semantic control, not industrial architecture.

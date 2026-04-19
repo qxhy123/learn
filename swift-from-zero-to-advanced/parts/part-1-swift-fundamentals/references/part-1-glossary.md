@@ -2,10 +2,7 @@
 
 | English | 中文 | Meaning |
 | --- | --- | --- |
-| constant | 常量 | A value declared with `let`. |
-| variable | 变量 | A value declared with `var`. |
-| type inference | 类型推断 | Swift deduces the type from context. |
-| control flow | 控制流 | The structures that guide execution order. |
-| function | 函数 | A reusable unit of named behavior. |
-| optional binding | 可选值绑定 | A safe way to unwrap optional values. |
-| pattern matching | 模式匹配 | Matching values against structured cases. |
+| Toolchain | 工具链 | The commands used to build and run Swift code. |
+| Struct | 结构体 | A value type used to model grouped data. |
+| Optional binding | 可选值绑定 | A safe way to unwrap an optional. |
+| Pattern matching | 模式匹配 | Matching a value against structured cases. |

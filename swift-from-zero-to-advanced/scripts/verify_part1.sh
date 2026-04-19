@@ -3,14 +3,16 @@ set -euo pipefail
 
 required_files=(
   "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/overview.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-swift-setup-and-first-program.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/02-constants-variables-and-types.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/03-control-flow.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/04-functions-and-decomposition.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/05-collections.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/06-optionals-and-basic-error-handling.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/07-strings-tuples-and-pattern-matching.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/08-part-1-project.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-running-swift.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/02-values-and-types.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/03-strings-and-program-io.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/04-control-flow-for-commands.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/05-functions-and-program-shape.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/06-structs-and-data-modeling.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/07-collections-and-task-state.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/08-optionals-and-safe-parsing.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/09-enums-and-pattern-matching.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/10-build-task-cli-lite-v1.md"
   "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/drills/README.md"
   "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/checkpoint/part-1-checkpoint.md"
   "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/project/part-1-task-cli-lite.md"
@@ -18,25 +20,29 @@ required_files=(
 )
 
 chapter_files=(
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-swift-setup-and-first-program.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/02-constants-variables-and-types.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/03-control-flow.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/04-functions-and-decomposition.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/05-collections.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/06-optionals-and-basic-error-handling.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/07-strings-tuples-and-pattern-matching.md"
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/08-part-1-project.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-running-swift.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/02-values-and-types.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/03-strings-and-program-io.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/04-control-flow-for-commands.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/05-functions-and-program-shape.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/06-structs-and-data-modeling.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/07-collections-and-task-state.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/08-optionals-and-safe-parsing.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/09-enums-and-pattern-matching.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/10-build-task-cli-lite-v1.md"
 )
 
-required_chapter_sections=(
-  "^## What You Will Build$"
-  "^## Core Concepts$"
-  "^## Code Walkthrough$"
+required_sections=(
+  "^## Problem$"
+  "^## Running Example$"
+  "^## Semantic Deep Dive$"
+  "^## Code Evolution$"
   "^## Common Mistakes$"
   "^## Drills$"
   "^## Checkpoint$"
   "^## Glossary$"
-  "^## Further Reading$"
+  "^## English Recap$"
+  "^## Project Bridge$"
 )
 
 for path in "${required_files[@]}"; do
@@ -52,20 +58,20 @@ rg -q "^# Part 1: Swift Fundamentals$" \
   exit 1
 }
 
-rg -q "^# Chapter 01: Swift Setup and First Program$" \
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-swift-setup-and-first-program.md" || {
+rg -q "^# Chapter 01: Running Swift$" \
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-running-swift.md" || {
   echo "missing-heading:chapter-01"
   exit 1
 }
 
-rg -q "^# Part 1 Checkpoint$" \
-  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/checkpoint/part-1-checkpoint.md" || {
-  echo "missing-heading:checkpoint"
+rg -q "^# Chapter 10: Build TaskCLI Lite v1$" \
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/10-build-task-cli-lite-v1.md" || {
+  echo "missing-heading:chapter-10"
   exit 1
 }
 
 for chapter in "${chapter_files[@]}"; do
-  for heading in "${required_chapter_sections[@]}"; do
+  for heading in "${required_sections[@]}"; do
     rg -q "$heading" "$chapter" || {
       echo "missing-section:$chapter:$heading"
       exit 1

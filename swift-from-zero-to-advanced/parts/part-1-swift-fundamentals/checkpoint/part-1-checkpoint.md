@@ -1,12 +1,9 @@
 # Part 1 Checkpoint
 
-## Required Demonstrations
+## What The Reader Should Be Able To Do
 
-- explain the role of types and inference
-- use control flow to route commands
-- extract functions to simplify a script
+- explain how Swift code runs
+- model task data with structs
 - use collections and optionals safely
-
-## Completion Standard
-
-The learner should be able to explain and extend the `TaskCLI Lite` starter without starting over from scratch.
+- route commands through readable control flow
+- integrate a small typed command-line program
