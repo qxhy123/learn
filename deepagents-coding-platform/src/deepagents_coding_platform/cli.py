@@ -4,6 +4,8 @@ import typer
 from rich.console import Console
 
 from deepagents_coding_platform.actions import ActionKind, ActionRequest
+from deepagents_coding_platform.chat import ChatSession
+from deepagents_coding_platform.coding.preset import build_coding_agent
 from deepagents_coding_platform.plugins import PluginRegistry
 from deepagents_coding_platform.policy import StaticPolicyEvaluator
 from deepagents_coding_platform.runner import LocalRunner
@@ -31,6 +33,15 @@ def _build_runner(workspace: Path, ledger_root: Path) -> LocalRunner:
     )
 
 
+def _build_chat_session(*, model: str, workspace: Path, ledger_root: Path) -> ChatSession:
+    agent = build_coding_agent(
+        model=model,
+        workspace_root=workspace,
+        ledger_root=ledger_root,
+    )
+    return ChatSession(agent=agent, console=console)
+
+
 @app.command("run-action")
 def run_action(
     kind: ActionKind,
@@ -54,3 +65,21 @@ def resume_session(ledger_root: Path = typer.Option(...)) -> None:
     resumed = runner.ledger.resume()
     console.print(f"checkpoint={resumed.checkpoint_name}")
     console.print(f"event_count={len(resumed.events_after_checkpoint)}")
+
+
+@app.command("chat")
+def chat(
+    model: str | None = typer.Option(None),
+    workspace: Path = typer.Option(...),
+    ledger_root: Path = typer.Option(...),
+) -> None:
+    if model is None:
+        console.print("Missing option '--model'.")
+        raise typer.Exit(code=2)
+
+    session = _build_chat_session(
+        model=model,
+        workspace=workspace,
+        ledger_root=ledger_root,
+    )
+    session.repl()
