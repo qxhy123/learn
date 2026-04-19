@@ -15,3 +15,8 @@
 
 - `part1-shell`
 - `part2-v1-workbench`
+
+## 当前第一阶段交付
+
+- Part 1：SwiftUI 应用结构、基础组合、基础组件、状态驱动
+- Part 2：列表、表单、导航、Binding、Observable Model、桌面骨架

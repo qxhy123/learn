@@ -12,8 +12,8 @@
 
 ## 学习路径
 
-1. `part1-swiftui-language-and-basic-view-system`
-2. `part2-components-navigation-and-state-ownership`
+1. [Part 1](part1-swiftui-language-and-basic-view-system/)
+2. [Part 2](part2-components-navigation-and-state-ownership/)
 3. 后续 Part：工作台、画布、绘制、文档、互操作、性能
 
 ## BoardFlow 主线
