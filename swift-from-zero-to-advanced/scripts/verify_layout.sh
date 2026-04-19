@@ -17,4 +17,14 @@ for path in "${required_files[@]}"; do
   }
 done
 
+rg -q "^# Swift From Zero to Advanced$" "$root/README.md" || {
+  echo "missing-heading:$root/README.md"
+  exit 1
+}
+
+rg -q "^# Projects$" "$root/projects/README.md" || {
+  echo "missing-heading:$root/projects/README.md"
+  exit 1
+}
+
 echo "layout-ok"

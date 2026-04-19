@@ -1,33 +1,46 @@
 # Chapter Template
 
-## What You Will Build
+## Problem
 
-One paragraph describing the concrete output of the chapter.
+State the concrete programming or design problem the chapter solves.
 
-## Core Concepts
+## Running Example
 
-List the Swift ideas the learner should understand before moving on.
+Show a minimal but complete Swift example the reader can run.
 
-## Code Walkthrough
+## Semantic Deep Dive
 
-Explain the example code in a top-down order.
+Explain what the code means in Swift, especially where Swift differs from other
+languages.
+
+## Code Evolution
+
+Refactor the first version into a better version and explain the tradeoff.
 
 ## Common Mistakes
 
-Call out the likely semantic traps and debugging patterns.
+Explain the error pattern, why it happens, and what the reader would observe.
 
 ## Drills
 
-Include concept checks, code reading, and hands-on changes.
+Include:
+
+- one concept check
+- one code-reading task
+- one hands-on extension
 
 ## Checkpoint
 
-Define what the learner should be able to explain or implement.
+State what the reader should now be able to explain or change.
 
 ## Glossary
 
-List the chapter-specific terms in Chinese and English.
+List the chapter-specific bilingual vocabulary that was introduced.
 
-## Further Reading
+## English Recap
 
-Point to focused extensions instead of widening the chapter body.
+Summarize the technical takeaways in short English prose or bullets.
+
+## Project Bridge
+
+Say exactly what this chapter adds to the active project.
