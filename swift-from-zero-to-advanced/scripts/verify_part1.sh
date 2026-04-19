@@ -17,6 +17,28 @@ required_files=(
   "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/references/part-1-glossary.md"
 )
 
+chapter_files=(
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/01-swift-setup-and-first-program.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/02-constants-variables-and-types.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/03-control-flow.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/04-functions-and-decomposition.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/05-collections.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/06-optionals-and-basic-error-handling.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/07-strings-tuples-and-pattern-matching.md"
+  "swift-from-zero-to-advanced/parts/part-1-swift-fundamentals/chapters/08-part-1-project.md"
+)
+
+required_chapter_sections=(
+  "^## What You Will Build$"
+  "^## Core Concepts$"
+  "^## Code Walkthrough$"
+  "^## Common Mistakes$"
+  "^## Drills$"
+  "^## Checkpoint$"
+  "^## Glossary$"
+  "^## Further Reading$"
+)
+
 for path in "${required_files[@]}"; do
   [[ -f "$path" ]] || {
     echo "missing:$path"
@@ -41,5 +63,14 @@ rg -q "^# Part 1 Checkpoint$" \
   echo "missing-heading:checkpoint"
   exit 1
 }
+
+for chapter in "${chapter_files[@]}"; do
+  for heading in "${required_chapter_sections[@]}"; do
+    rg -q "$heading" "$chapter" || {
+      echo "missing-section:$chapter:$heading"
+      exit 1
+    }
+  done
+done
 
 echo "part1-ok"
