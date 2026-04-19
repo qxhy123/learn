@@ -4,6 +4,7 @@ from typing import Any, Mapping
 from deepagents import create_deep_agent
 
 from deepagents_coding_platform.actions import ActionKind, ActionRequest
+from deepagents_coding_platform.policy import PolicyOutcome
 from deepagents_coding_platform.runner import LocalRunner
 
 
@@ -27,6 +28,9 @@ class DeepagentsRuntimeAdapter:
                 payload={**dict(spec.static_payload), **payload},
             )
             result = self.runner.run_action(request)
+            decision = getattr(result, "decision", None)
+            if decision is not None and decision.outcome is not PolicyOutcome.ALLOW:
+                raise RuntimeError(f"{decision.outcome.value}: {decision.reason}")
             return dict(result.output or {})
 
         runtime_wrapped_tool.__name__ = spec.name

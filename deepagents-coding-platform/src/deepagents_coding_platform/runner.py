@@ -16,6 +16,7 @@ class LocalRunner:
     ledger_root: Path
     kernel: RuntimeKernel
     executors: dict[ActionKind, Executor] = field(default_factory=dict)
+    named_executors: dict[str, Executor] = field(default_factory=dict)
     ledger: SessionLedger = field(init=False)
 
     def __post_init__(self) -> None:
@@ -25,7 +26,9 @@ class LocalRunner:
         self.ledger = SessionLedger(self.ledger_root)
 
     def run_action(self, action: ActionRequest) -> RuntimeResult:
-        executor = self.executors.get(action.kind, self._default_executor)
+        executor = self.named_executors.get(action.name)
+        if executor is None:
+            executor = self.executors.get(action.kind, self._default_executor)
         return self.kernel.handle(action=action, executor=executor, ledger=self.ledger)
 
     def _default_executor(self, action: ActionRequest) -> Mapping[str, object]:
