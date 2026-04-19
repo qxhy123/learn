@@ -155,6 +155,8 @@ Labs:
 - `bash swift-tutorial/scripts/verify_taskcore_taskcli.sh`
 - `git diff --check -- swift-tutorial docs/superpowers`
 
+Note: `verify_parts.sh`, `verify_projects.sh`, and `verify_appendix.sh` are full-product verifiers. Until the corresponding trees are fully authored, intermediate tasks should use targeted file-existence, heading, and keyword checks for the files created in that task rather than expecting the global verifiers to pass early.
+
 ---
 
 ### Task 1: Create the Root Contract and Verification Scripts
@@ -394,8 +396,29 @@ Run:
 ```bash
 cd /Users/yangyang/ai_projs/math
 bash swift-tutorial/scripts/verify_task_cli_lite.sh
-bash swift-tutorial/scripts/verify_projects.sh || true
-bash swift-tutorial/scripts/verify_parts.sh
+for file in \
+  swift-tutorial/projects/task-cli-lite/README.md \
+  swift-tutorial/projects/task-cli-lite/milestones/part1-v1.md \
+  swift-tutorial/projects/task-cli-lite/final/README.md \
+  swift-tutorial/part1-language-foundations/01-toolchain-and-first-swift-program.md \
+  swift-tutorial/part1-language-foundations/02-values-types-and-mutability.md \
+  swift-tutorial/part1-language-foundations/03-strings-collections-and-control-flow.md \
+  swift-tutorial/part1-language-foundations/04-functions-optionals-enums-and-structs.md \
+  swift-tutorial/part1-language-foundations/05-build-taskcli-lite-v1.md
+do
+  test -f "$file"
+done
+for file in \
+  swift-tutorial/part1-language-foundations/01-toolchain-and-first-swift-program.md \
+  swift-tutorial/part1-language-foundations/02-values-types-and-mutability.md \
+  swift-tutorial/part1-language-foundations/03-strings-collections-and-control-flow.md \
+  swift-tutorial/part1-language-foundations/04-functions-optionals-enums-and-structs.md \
+  swift-tutorial/part1-language-foundations/05-build-taskcli-lite-v1.md
+do
+  rg -q '^# 第' "$file"
+done
+rg -F -q 'TaskCLI Lite' swift-tutorial/projects/task-cli-lite/README.md
+rg -F -q 'TaskCLI Lite' swift-tutorial/projects/task-cli-lite/final/README.md
 git diff --check -- swift-tutorial docs/superpowers
 ```
 
@@ -403,10 +426,9 @@ Expected:
 
 ```text
 task-cli-lite-ok
-parts-ok
 ```
 
-`verify_projects.sh` may still fail because later project surfaces are not written yet.
+The targeted file/heading checks should exit successfully. Do not expect `verify_projects.sh` or `verify_parts.sh` to pass yet because later project surfaces and parts are not written.
 
 - [ ] **Step 5: Commit Part 1 and TaskCLI Lite**
 
@@ -430,7 +452,7 @@ Scope-risk: moderate
 Reversibility: clean
 Directive: Keep future Part 2 work continuous with this CLI line instead of replacing it with a new domain or unrelated project
 Tested: bash swift-tutorial/scripts/verify_task_cli_lite.sh
-Tested: bash swift-tutorial/scripts/verify_parts.sh
+Tested: Targeted file, heading, and keyword checks for TaskCLI Lite docs and Part 1 chapters
 Tested: git diff --check -- swift-tutorial docs/superpowers
 Not-tested: Future Part 2+ project evolution
 EOF
@@ -462,7 +484,7 @@ These chapters must:
 
 - [ ] **Step 2: Update the part verifier expectations if needed**
 
-Ensure `verify_parts.sh` checks these chapter files by exact path.
+Ensure `verify_parts.sh` checks these chapter files by exact path if any path is missing, but keep it as a full-tree verifier rather than weakening it for partial progress.
 
 - [ ] **Step 3: Verify Part 2**
 
@@ -470,14 +492,23 @@ Run:
 
 ```bash
 cd /Users/yangyang/ai_projs/math
-bash swift-tutorial/scripts/verify_parts.sh
+for file in \
+  swift-tutorial/part2-type-system-and-modeling/06-methods-properties-and-initializers.md \
+  swift-tutorial/part2-type-system-and-modeling/07-classes-vs-structs-and-value-vs-reference.md \
+  swift-tutorial/part2-type-system-and-modeling/08-protocols-protocol-extensions-and-abstraction-boundaries.md \
+  swift-tutorial/part2-type-system-and-modeling/09-generics-associated-types-and-type-driven-api-design.md \
+  swift-tutorial/part2-type-system-and-modeling/10-errors-results-and-modeling-failure.md
+do
+  test -f "$file"
+  rg -q '^# 第' "$file"
+done
 git diff --check -- swift-tutorial docs/superpowers
 ```
 
 Expected:
 
 ```text
-parts-ok
+The targeted checks exit successfully
 ```
 
 - [ ] **Step 4: Commit Part 2**
@@ -498,7 +529,7 @@ Confidence: high
 Scope-risk: moderate
 Reversibility: clean
 Directive: Maintain continuity with the task domain and Part 1 code evolution instead of teaching these topics as detached theory
-Tested: bash swift-tutorial/scripts/verify_parts.sh
+Tested: Targeted file and heading checks for the Part 2 chapters
 Tested: git diff --check -- swift-tutorial docs/superpowers
 Not-tested: Part 3 package/project integration
 EOF
@@ -573,8 +604,28 @@ Run:
 ```bash
 cd /Users/yangyang/ai_projs/math
 bash swift-tutorial/scripts/verify_taskcore_taskcli.sh
-bash swift-tutorial/scripts/verify_projects.sh
-bash swift-tutorial/scripts/verify_parts.sh
+for file in \
+  swift-tutorial/projects/taskcore-taskcli/README.md \
+  swift-tutorial/projects/taskcore-taskcli/milestones/part3-v1.md \
+  swift-tutorial/projects/taskcore-taskcli/final/README.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/11-swift-package-manager-and-module-boundaries.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/12-testing-with-xctest-and-core-behavior.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/13-parsing-rendering-and-storage-seams.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/14-command-organization-and-cli-architecture.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/15-build-taskcore-taskcli-v1.md
+do
+  test -f "$file"
+done
+for file in \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/11-swift-package-manager-and-module-boundaries.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/12-testing-with-xctest-and-core-behavior.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/13-parsing-rendering-and-storage-seams.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/14-command-organization-and-cli-architecture.md \
+  swift-tutorial/part3-packages-testing-and-cli-engineering/15-build-taskcore-taskcli-v1.md
+do
+  rg -q '^# 第' "$file"
+done
+rg -F -q 'TaskCore + TaskCLI' swift-tutorial/projects/taskcore-taskcli/README.md
 git diff --check -- swift-tutorial docs/superpowers
 ```
 
@@ -582,9 +633,9 @@ Expected:
 
 ```text
 taskcore-taskcli-ok
-projects-ok
-parts-ok
 ```
+
+The targeted file/heading checks should exit successfully. Do not expect `verify_projects.sh` or `verify_parts.sh` to pass yet because the TaskFlow surface and later parts are not written.
 
 - [ ] **Step 5: Commit Part 3 and TaskCore + TaskCLI**
 
@@ -608,8 +659,7 @@ Scope-risk: moderate
 Reversibility: clean
 Directive: Future runtime and UI work must reuse this package line rather than fork away from it
 Tested: bash swift-tutorial/scripts/verify_taskcore_taskcli.sh
-Tested: bash swift-tutorial/scripts/verify_projects.sh
-Tested: bash swift-tutorial/scripts/verify_parts.sh
+Tested: Targeted file, heading, and keyword checks for TaskCore + TaskCLI docs and Part 3 chapters
 Not-tested: SwiftUI project surface
 EOF
 ```
@@ -651,17 +701,36 @@ Run:
 
 ```bash
 cd /Users/yangyang/ai_projs/math
-bash swift-tutorial/scripts/verify_parts.sh
-bash swift-tutorial/scripts/verify_projects.sh
+bash swift-tutorial/scripts/verify_taskcore_taskcli.sh
+for file in \
+  swift-tutorial/projects/taskcore-taskcli/milestones/part4-runtime-upgrade.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/16-async-await-and-task-basics.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/17-actors-isolation-and-sendability.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/18-arc-memory-and-ownership-in-practice.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/19-performance-copying-and-measurement-mindset.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/20-reliability-cancellation-and-failure-surfaces.md
+do
+  test -f "$file"
+done
+for file in \
+  swift-tutorial/part4-concurrency-performance-and-reliability/16-async-await-and-task-basics.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/17-actors-isolation-and-sendability.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/18-arc-memory-and-ownership-in-practice.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/19-performance-copying-and-measurement-mindset.md \
+  swift-tutorial/part4-concurrency-performance-and-reliability/20-reliability-cancellation-and-failure-surfaces.md
+do
+  rg -q '^# 第' "$file"
+done
 git diff --check -- swift-tutorial docs/superpowers
 ```
 
 Expected:
 
 ```text
-parts-ok
-projects-ok
+taskcore-taskcli-ok
 ```
+
+The targeted file/heading checks should exit successfully. Do not expect `verify_parts.sh` or `verify_projects.sh` to pass yet because later parts and the TaskFlow surface are not written.
 
 - [ ] **Step 4: Commit Part 4**
 
@@ -683,8 +752,8 @@ Confidence: high
 Scope-risk: moderate
 Reversibility: clean
 Directive: Keep this part focused on engineering consequences of language/runtime features, not on framework-specific side quests
-Tested: bash swift-tutorial/scripts/verify_parts.sh
-Tested: bash swift-tutorial/scripts/verify_projects.sh
+Tested: bash swift-tutorial/scripts/verify_taskcore_taskcli.sh
+Tested: Targeted file and heading checks for Part 4 chapters and the runtime-upgrade milestone
 Not-tested: Runtime behavior of hypothetical future code snapshots beyond current project assets
 EOF
 ```
@@ -749,17 +818,30 @@ Run:
 
 ```bash
 cd /Users/yangyang/ai_projs/math
-bash swift-tutorial/scripts/verify_parts.sh
 bash swift-tutorial/scripts/verify_projects.sh
+for file in \
+  swift-tutorial/part5-swiftui-foundations/21-swiftui-mental-model-and-view-composition.md \
+  swift-tutorial/part5-swiftui-foundations/22-state-binding-and-observable-models.md \
+  swift-tutorial/part5-swiftui-foundations/23-lists-forms-and-navigation-basics.md \
+  swift-tutorial/part5-swiftui-foundations/24-build-taskflow-v1.md \
+  swift-tutorial/part6-swiftui-dataflow-and-app-architecture/25-app-state-and-data-flow.md \
+  swift-tutorial/part6-swiftui-dataflow-and-app-architecture/26-persistence-and-model-integration.md \
+  swift-tutorial/part6-swiftui-dataflow-and-app-architecture/27-async-ui-updates-previews-and-testing.md \
+  swift-tutorial/part6-swiftui-dataflow-and-app-architecture/28-taskflow-architecture-and-feature-growth.md
+do
+  test -f "$file"
+  rg -q '^# 第' "$file"
+done
 git diff --check -- swift-tutorial docs/superpowers
 ```
 
 Expected:
 
 ```text
-parts-ok
 projects-ok
 ```
+
+The targeted Part 5 and Part 6 checks should exit successfully. Do not expect `verify_parts.sh` to pass yet because Parts 7 and 8 are not written.
 
 - [ ] **Step 5: Commit the SwiftUI specialization path**
 
@@ -782,8 +864,8 @@ Confidence: high
 Scope-risk: moderate
 Reversibility: clean
 Directive: Preserve the shared-domain continuity between CLI/core and TaskFlow in all later capstone work
-Tested: bash swift-tutorial/scripts/verify_parts.sh
 Tested: bash swift-tutorial/scripts/verify_projects.sh
+Tested: Targeted file and heading checks for the Part 5 and Part 6 chapters
 Not-tested: Build execution of a future full TaskFlow app project
 EOF
 ```
