@@ -18,10 +18,16 @@ class ChatSession:
     messages: list[dict[str, str]] = field(default_factory=list)
 
     def run_turn(self, user_text: str) -> str:
-        self.messages.append({"role": "user", "content": user_text})
-        result = self.agent.invoke({"messages": list(self.messages)})
+        turn_messages = [
+            *self.messages,
+            {"role": "user", "content": user_text},
+        ]
+        result = self.agent.invoke({"messages": turn_messages})
         answer = _extract_assistant_text(result)
-        self.messages.append({"role": "assistant", "content": answer})
+        self.messages = [
+            *turn_messages,
+            {"role": "assistant", "content": answer},
+        ]
         self.console.print(answer)
         return answer
 

@@ -33,11 +33,12 @@ def test_chat_session_runs_turn_and_records_history():
 
 def test_chat_session_repl_continues_after_agent_failure():
     console = Console(record=True, width=120)
-    state = {"calls": 0}
+    state = {"calls": 0, "payloads": []}
 
     class FakeAgent:
         def invoke(self, payload):
             state["calls"] += 1
+            state["payloads"].append(payload)
             if state["calls"] == 1:
                 raise RuntimeError("boom")
             return {
@@ -54,3 +55,6 @@ def test_chat_session_repl_continues_after_agent_failure():
     output = console.export_text()
     assert "boom" in output
     assert "Recovered." in output
+    assert state["payloads"][1]["messages"] == [
+        {"role": "user", "content": "second turn"}
+    ]
