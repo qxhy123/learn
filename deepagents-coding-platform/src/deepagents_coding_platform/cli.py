@@ -69,14 +69,10 @@ def resume_session(ledger_root: Path = typer.Option(...)) -> None:
 
 @app.command("chat")
 def chat(
-    model: str | None = typer.Option(None),
+    model: str = typer.Option(...),
     workspace: Path = typer.Option(...),
     ledger_root: Path = typer.Option(...),
 ) -> None:
-    if model is None:
-        console.print("Missing option '--model'.")
-        raise typer.Exit(code=2)
-
     session = _build_chat_session(
         model=model,
         workspace=workspace,

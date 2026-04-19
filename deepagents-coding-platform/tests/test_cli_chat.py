@@ -20,7 +20,19 @@ def test_chat_requires_model(tmp_path: Path):
     )
 
     assert result.exit_code != 0
-    assert "--model" in result.stdout
+    assert "--model" in result.output
+
+
+def test_chat_help_marks_model_as_required():
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["chat", "--help"])
+
+    assert result.exit_code == 0
+    model_line = next(
+        line for line in result.stdout.splitlines() if "--model" in line
+    )
+    assert "[required]" in model_line
 
 
 def test_chat_builds_session_and_runs_repl(monkeypatch, tmp_path: Path):
