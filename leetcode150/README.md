@@ -7,6 +7,15 @@ This repository is an English-first, Python-based tutorial for LeetCode's Top In
 - Official order: `docs/official-order.md`
 - Pattern roadmap: `docs/pattern-roadmap.md`
 
+## Repository Map
+
+- `data/top_interview_150.yaml`: canonical metadata for all 150 problems.
+- `docs/problems/`: English tutorial pages grouped by pattern.
+- `solutions/`: Python `Solution` placeholders grouped by pattern.
+- `tests/`: skipped pytest examples for unimplemented problems.
+- `scripts/validate_metadata.py`: validates metadata consistency.
+- `scripts/generate_scaffold.py`: regenerates missing scaffold files.
+
 ## Setup
 
 ```bash
