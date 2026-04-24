@@ -64,6 +64,28 @@ def test_generate_scaffold_overwrites_with_force(tmp_path: Path) -> None:
     assert "class Solution" in solution_path.read_text(encoding="utf-8")
 
 
+def test_generate_scaffold_preserves_existing_index_without_force(tmp_path: Path) -> None:
+    official_order_path = tmp_path / "docs/official-order.md"
+    official_order_path.parent.mkdir(parents=True)
+    official_order_path.write_text("custom index\n", encoding="utf-8")
+
+    generate_scaffold(sample_metadata(), tmp_path, force=False)
+
+    assert official_order_path.read_text(encoding="utf-8") == "custom index\n"
+
+
+def test_generate_scaffold_overwrites_existing_index_with_force(tmp_path: Path) -> None:
+    official_order_path = tmp_path / "docs/official-order.md"
+    official_order_path.parent.mkdir(parents=True)
+    official_order_path.write_text("custom index\n", encoding="utf-8")
+
+    generate_scaffold(sample_metadata(), tmp_path, force=True)
+
+    official_order_content = official_order_path.read_text(encoding="utf-8")
+    assert official_order_content != "custom index\n"
+    assert "# Top Interview 150 in Official Order" in official_order_content
+
+
 def test_generated_test_file_is_skipped_until_implemented(tmp_path: Path) -> None:
     generate_scaffold(sample_metadata(), tmp_path, force=False)
 

@@ -178,7 +178,7 @@ def generate_scaffold(metadata: dict[str, Any], root: Path, force: bool = False)
         "docs/pattern-roadmap.md": render_pattern_roadmap(problems),
     }
     for relative_path, content in generated_docs.items():
-        if write_file(root / relative_path, content, force=True):
+        if write_file(root / relative_path, content, force=force):
             written.append(relative_path)
 
     return written
