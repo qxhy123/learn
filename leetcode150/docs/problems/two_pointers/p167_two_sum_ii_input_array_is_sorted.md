@@ -59,7 +59,7 @@ See `solutions/two_pointers/p167_two_sum_ii_input_array_is_sorted.py`. The imple
 
 ## Tests
 
-See `tests/two_pointers/test_p167_two_sum_ii_input_array_is_sorted.py`. The tests cover official examples, negative values, minimal input, and duplicate values forming the answer.
+See `tests/two_pointers/test_p167_two_sum_ii_input_array_is_sorted.py`. The tests cover official examples, negative values, minimal input, and duplicate values forming the unique answer.
 
 ## Interview Script
 

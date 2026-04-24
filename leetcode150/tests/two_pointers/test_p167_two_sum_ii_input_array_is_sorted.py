@@ -26,4 +26,4 @@ def test_minimal_two_element_input() -> None:
 def test_duplicate_values_can_form_answer() -> None:
     solution = Solution()
 
-    assert solution.twoSum([1, 2, 2, 3], 4) == [2, 3]
+    assert solution.twoSum([1, 2, 2, 5], 4) == [2, 3]
