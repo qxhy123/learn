@@ -1,68 +1,85 @@
 from __future__ import annotations
 
-"""Valid Palindrome — two-pointer tutorial implementation.
+"""125. Valid Palindrome.
 
-The input may contain spaces, punctuation, digits, and mixed-case letters. The
-palindrome decision is made only on alphanumeric characters, compared
-case-insensitively. Instead of building a cleaned copy of the string, this
-solution performs that filtering lazily from both ends.
+Goal
+----
+Decide whether the string reads the same from both ends after applying the
+problem's normalization rules:
 
-Pattern:
-    Use two inward-moving pointers when a property is defined by mirrored
-    positions. Each pointer skips values that do not participate in the
-    comparison, then the algorithm validates the next meaningful pair.
+1. keep only alphanumeric characters;
+2. compare letters case-insensitively.
 
-Invariant:
-    Before every comparison, all meaningful character pairs outside the current
-    [left, right] window have already matched. If the current meaningful pair
-    differs, no later pointer movement can repair that mismatch.
+The direct beginner solution is:
 
-Complexity:
-    Time: O(n), because each character is crossed by at most one pointer.
-    Space: O(1), because no filtered copy of the string is created.
+    cleaned = [ch.lower() for ch in s if ch.isalnum()]
+    return cleaned == cleaned[::-1]
+
+That is perfectly valid logically, but it builds an extra list. This file uses
+the interview-oriented two-pointer version: perform the same filtering lazily
+while scanning from both ends of the original string.
+
+Key idea
+--------
+A palindrome is a sequence of mirrored pairs. The first meaningful character
+must match the last meaningful character, the second meaningful character must
+match the second-to-last, and so on.
+
+`left` always searches for the next meaningful character from the front.
+`right` always searches for the next meaningful character from the back.
+
+After both pointers land on meaningful characters, they represent the next pair
+that must match in the normalized string.
 """
 
 
 class Solution:
-    """See `docs/problems/two_pointers/p125_valid_palindrome.md`."""
+    """LeetCode-style solution container."""
 
     def isPalindrome(self, s: str) -> bool:
-        """Return whether `s` is a palindrome after normalization.
+        """Return True if `s` is a palindrome after normalization.
 
-        Normalization rules follow the LeetCode problem statement:
-        - ignore non-alphanumeric characters;
-        - compare remaining characters case-insensitively.
+        Walk-through on "A man, a plan, a canal: Panama":
+        - `left` starts at 'A', `right` starts at 'a'; compare 'a' == 'a'.
+        - punctuation and spaces are skipped whenever a pointer reaches them.
+        - every meaningful mirrored pair matches, so the pointers eventually
+          cross and the method returns True.
 
-        Example:
-            "A man, a plan, a canal: Panama" is treated as
-            "amanaplanacanalpanama", so the method returns True.
+        Walk-through on "0P":
+        - both characters are meaningful;
+        - compare '0' with 'p'; they differ, so return False immediately.
 
-        The method intentionally scans the original string directly. A common
-        alternative is `cleaned == cleaned[::-1]`, but that uses O(n) extra
-        memory. The two-pointer version keeps the same linear runtime while
-        preserving constant auxiliary space.
+        Invariant:
+            At the start of each outer loop iteration, all meaningful pairs
+            outside the current [left, right] window have already matched.
+
+        Complexity:
+            Time: O(n), because each pointer only moves inward.
+            Space: O(1), because no normalized copy is built.
         """
         left = 0
         right = len(s) - 1
 
         while left < right:
-            # Move both pointers to the next characters that actually matter.
-            # The `left < right` guard avoids reading a crossed pointer on
-            # inputs that are empty after filtering, such as ".,,   :;".
+            # Move `left` to the next character that participates in the
+            # palindrome check. The boundary guard matters for inputs such as
+            # "   !!!", where the normalized string is empty.
             while left < right and not s[left].isalnum():
                 left += 1
+
+            # Move `right` to the previous participating character.
             while left < right and not s[right].isalnum():
                 right -= 1
 
-            # These two characters are the next required mirrored pair in the
-            # normalized string. Any mismatch proves the whole string invalid.
+            # Now s[left] and s[right] are the next mirrored characters in the
+            # normalized string. A mismatch cannot be fixed by later choices.
             if s[left].lower() != s[right].lower():
                 return False
 
-            # The pair matched, so shrink the unresolved window.
+            # This pair is proven. Shrink the unverified window.
             left += 1
             right -= 1
 
-        # No mismatched meaningful pair remains. This also covers strings that
-        # normalize to the empty string or a single character.
+        # If the pointers cross, every required mirrored pair matched. This also
+        # handles normalized strings of length 0 or 1.
         return True
