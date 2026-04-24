@@ -7,6 +7,12 @@ This repository is an English-first, Python-based tutorial for LeetCode's Top In
 - Official order: `docs/official-order.md`
 - Pattern roadmap: `docs/pattern-roadmap.md`
 
+## Completed Topics
+
+Completed topics have final English tutorials, implemented Python solutions, and active pytest coverage.
+
+- ✅ Two Pointers: 5 / 5 problems complete
+
 ## Repository Map
 
 - `data/top_interview_150.yaml`: canonical metadata for all 150 problems.

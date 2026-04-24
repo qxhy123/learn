@@ -211,10 +211,12 @@
 - [211. Design Add and Search Words Data Structure](docs/problems/trie/p211_design_add_and_search_words_data_structure.md) — trie
 - [212. Word Search II](docs/problems/trie/p212_word_search_ii.md) — trie
 
-## Two Pointers
+## Two Pointers ✅ Complete
 
-- [125. Valid Palindrome](docs/problems/two_pointers/p125_valid_palindrome.md) — two-pointers
-- [392. Is Subsequence](docs/problems/two_pointers/p392_is_subsequence.md) — two-pointers
-- [167. Two Sum II - Input Array Is Sorted](docs/problems/two_pointers/p167_two_sum_ii_input_array_is_sorted.md) — two-pointers, sum
-- [11. Container With Most Water](docs/problems/two_pointers/p011_container_with_most_water.md) — two-pointers
-- [15. 3Sum](docs/problems/two_pointers/p015_3sum.md) — two-pointers, sum
+Recommended order:
+
+1. [125. Valid Palindrome](docs/problems/two_pointers/p125_valid_palindrome.md) — symmetry scan, filtering, case normalization
+2. [392. Is Subsequence](docs/problems/two_pointers/p392_is_subsequence.md) — ordered matching across two sequences
+3. [167. Two Sum II - Input Array Is Sorted](docs/problems/two_pointers/p167_two_sum_ii_input_array_is_sorted.md) — sorted pair elimination
+4. [11. Container With Most Water](docs/problems/two_pointers/p011_container_with_most_water.md) — dominance argument with shrinking width
+5. [15. 3Sum](docs/problems/two_pointers/p015_3sum.md) — fixed value plus inner two-pointer scan
