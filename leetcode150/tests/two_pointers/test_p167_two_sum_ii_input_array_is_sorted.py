@@ -1,17 +1,29 @@
 from __future__ import annotations
 
-import pytest
-
 from solutions.two_pointers.p167_two_sum_ii_input_array_is_sorted import Solution
-
-pytestmark = pytest.mark.skip(reason="Scaffold placeholder until the solution is implemented.")
-
-EXAMPLES = [{'input': {'numbers': [2, 7, 11, 15], 'target': 9}, 'output': [1, 2]}, {'input': {'numbers': [2, 3, 4], 'target': 6}, 'output': [1, 3]}, {'input': {'numbers': [-1, 0], 'target': -1}, 'output': [1, 2]}]
 
 
 def test_official_examples() -> None:
     solution = Solution()
-    # Equivalent direct call form: Solution().twoSum(**example["input"])
-    for example in EXAMPLES:
-        result = solution.twoSum(**example["input"])
-        assert result == example["output"]
+
+    assert solution.twoSum([2, 7, 11, 15], 9) == [1, 2]
+    assert solution.twoSum([2, 3, 4], 6) == [1, 3]
+    assert solution.twoSum([-1, 0], -1) == [1, 2]
+
+
+def test_negative_numbers_and_positive_target() -> None:
+    solution = Solution()
+
+    assert solution.twoSum([-5, -2, 1, 4, 9], 7) == [2, 5]
+
+
+def test_minimal_two_element_input() -> None:
+    solution = Solution()
+
+    assert solution.twoSum([1, 2], 3) == [1, 2]
+
+
+def test_duplicate_values_can_form_answer() -> None:
+    solution = Solution()
+
+    assert solution.twoSum([1, 2, 2, 3], 4) == [2, 3]
