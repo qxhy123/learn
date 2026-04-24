@@ -1,17 +1,31 @@
 from __future__ import annotations
 
-import pytest
-
 from solutions.two_pointers.p125_valid_palindrome import Solution
-
-pytestmark = pytest.mark.skip(reason="Scaffold placeholder until the solution is implemented.")
-
-EXAMPLES = [{'input': {'s': 'A man, a plan, a canal: Panama'}, 'output': True}, {'input': {'s': 'race a car'}, 'output': False}, {'input': {'s': ' '}, 'output': True}]
 
 
 def test_official_examples() -> None:
     solution = Solution()
-    # Equivalent direct call form: Solution().isPalindrome(**example["input"])
-    for example in EXAMPLES:
-        result = solution.isPalindrome(**example["input"])
-        assert result == example["output"]
+
+    assert solution.isPalindrome("A man, a plan, a canal: Panama") is True
+    assert solution.isPalindrome("race a car") is False
+    assert solution.isPalindrome(" ") is True
+
+
+def test_empty_after_filtering_is_palindrome() -> None:
+    solution = Solution()
+
+    assert solution.isPalindrome(".,,   :;") is True
+
+
+def test_mixed_case_and_digits() -> None:
+    solution = Solution()
+
+    assert solution.isPalindrome("No 'x' in Nixon") is True
+    assert solution.isPalindrome("1A2a1") is True
+
+
+def test_detects_mismatch_after_filtering() -> None:
+    solution = Solution()
+
+    assert solution.isPalindrome("0P") is False
+    assert solution.isPalindrome("ab@c") is False
