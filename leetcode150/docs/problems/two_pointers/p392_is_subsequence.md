@@ -4,79 +4,87 @@
 - LeetCode: https://leetcode.com/problems/is-subsequence/
 - Official Group: Two Pointers
 - Pattern Group: Two Pointers
-- Patterns: two-pointers
+- Tags: two-pointers, strings
 
 ## Core Pattern
 
-When one sequence must appear inside another while preserving order, scan the larger sequence once and advance the smaller-sequence pointer only when a match is found.
+When one ordered sequence must appear inside another, scan the larger sequence once and advance the smaller sequence only when the next required item matches. The smaller pointer always represents the next character you still need.
 
 ## Why Two Pointers Fits
 
-A subsequence does not require contiguous positions, but it does require relative order. That means each character in `s` must be matched by a later character in `t`. A pointer into `s` tracks the next required character, while the scan through `t` offers candidates in order.
+A subsequence preserves order but not contiguity. That means `s` can skip characters from `t`, but it cannot reorder them. Two pointers fit because one pointer tracks the next needed character in `s`, while the other walks through `t` and offers candidates in the only order they can appear.
 
 ## Recommended Approach
 
-1. Start `s_index` at `0`, meaning the next needed character is `s[0]`.
-2. Iterate through every character in `t` from left to right.
-3. If all characters in `s` have already matched, return `True`.
-4. When the current `t` character equals `s[s_index]`, advance `s_index`.
-5. Ignore non-matching `t` characters because subsequences may skip characters.
-6. At the end, return whether `s_index == len(s)`.
+1. Set `s_index = 0` to mean “the next needed character is `s[0]`.”
+2. Scan `t` from left to right.
+3. If `s_index == len(s)`, return `True` early because the whole subsequence is already matched.
+4. When `t_char == s[s_index]`, advance `s_index` by one.
+5. Otherwise ignore `t_char` and keep scanning.
+6. After the loop ends, return whether `s_index == len(s)`.
+
+The empty string is always a subsequence because there are no required characters to match.
 
 ## Alternative Approaches
 
-A recursive solution can express the same idea but uses call-stack space and is unnecessary. For many repeated queries against the same `t`, a preprocessing approach can store character positions and binary-search the next valid position for each character of `s`. For one query, the linear two-pointer scan is simpler and optimal.
+If you need to answer many subsequence queries against the same `t`, you can preprocess the positions of each character and binary-search the next valid occurrence for every character in `s`. That is useful for repeated queries, but it is unnecessary for a single check. Recursive matching also expresses the same idea, but it adds call-stack overhead without improving the logic.
 
 ## Correctness Sketch
 
-Maintain the invariant that `s[:s_index]` has been matched as a subsequence of the part of `t` already scanned. If the next `t` character does not match `s[s_index]`, skipping it cannot hurt because a subsequence is allowed to ignore characters. If it matches, consuming it is safe because it is the earliest available match for the next required character. When the scan ends, all of `s` is a subsequence exactly when every required character has been consumed.
+Maintain this invariant: `s[:s_index]` has already been matched as a subsequence of the prefix of `t` that has been scanned. Skipping a non-matching character in `t` is safe because subsequences are allowed to drop characters. Consuming a matching character is also safe because it is the next required character in order, and taking it cannot make a valid solution disappear. When the scan ends, `s` is a subsequence of `t` exactly when every required character has been consumed, which is equivalent to `s_index == len(s)`.
+
+Repeated characters are handled naturally by the same invariant. If `s` needs two `a` characters, the pointer in `s` advances only after two distinct matching positions have been seen in `t` in the correct order.
 
 ## Trace
 
-For `s = "abc"`, `t = "ahbgdc"`:
+For `s = "abc"` and `t = "ahbgdc"`:
 
-| `t` char | Needed char | Action |
-| --- | --- | --- |
-| `a` | `a` | Match, advance to need `b` |
-| `h` | `b` | Skip |
-| `b` | `b` | Match, advance to need `c` |
-| `g` | `c` | Skip |
-| `d` | `c` | Skip |
-| `c` | `c` | Match, all of `s` consumed |
+| `t` character | `s_index` before | Needed char | Action |
+| --- | --- | --- | --- |
+| `a` | `0` | `a` | Match, advance to need `b` |
+| `h` | `1` | `b` | Skip |
+| `b` | `1` | `b` | Match, advance to need `c` |
+| `g` | `2` | `c` | Skip |
+| `d` | `2` | `c` | Skip |
+| `c` | `2` | `c` | Match, subsequence complete |
+
+For `s = "aab"` and `t = "aaab"`, the repeated `a` characters in `t` are enough because the pointer in `s` only advances after each ordered match. If `t` had only one `a`, the second `a` requirement would remain unmet and the answer would be `False`.
 
 ## Complexity
 
-- Time: `O(len(t))` for a single query because each character in `t` is scanned once.
-- Space: `O(1)` because only the pointer into `s` is stored.
+- Time: `O(len(t))` for one query because each character in `t` is inspected once.
+- Space: `O(1)` because the algorithm keeps only a pointer into `s`.
 
 ## Common Pitfalls
 
-- Sorting either string, which destroys order information.
-- Requiring characters to be contiguous, which would solve substring matching instead.
-- Forgetting that the empty string is a subsequence of every string.
-- Advancing the `s` pointer on a mismatch.
+- Confusing subsequence with substring and requiring contiguity.
+- Advancing `s_index` on a mismatch instead of waiting for the next matching character.
+- Forgetting that the empty string is always a subsequence.
+- Assuming repeated characters in `t` are enough without checking order.
+- Missing the early exit when `s_index` reaches `len(s)`.
 
 ## Implementation Notes
 
-See `solutions/two_pointers/p392_is_subsequence.py`. The implementation uses one explicit pointer for `s`; the loop over `t` acts as the second pointer.
+See `solutions/two_pointers/p392_is_subsequence.py`. The implementation uses one explicit pointer into `s`, and the loop over `t` acts as the second pointer. The early return once `s_index == len(s)` keeps the scan short when the subsequence is already complete.
 
 ## Tests
 
-See `tests/two_pointers/test_p392_is_subsequence.py`. The tests cover official examples, empty strings, repeated characters, insufficient repeated matches, and order-sensitive false cases.
+See `tests/two_pointers/test_p392_is_subsequence.py`. The tests cover the official examples, an empty `s`, an empty `t`, repeated characters that require multiple matches, and false cases where the characters appear in the wrong order.
 
 ## Interview Script
 
-"I scan the target string once while keeping a pointer to the next character needed from the subsequence. A mismatch is ignored, and a match advances the subsequence pointer. If that pointer reaches the end of `s`, every character appeared in order."
+"I scan `t` once while keeping a pointer to the next character I still need from `s`. Matching characters advance that pointer, and non-matching characters are skipped because subsequences can ignore them. If the pointer reaches the end of `s`, every required character appeared in order. Repeated characters are fine as long as `t` contains enough ordered matches."
 
 ## Review Questions
 
-1. Why does skipping a non-matching character in `t` never remove a needed solution?
+1. Why does skipping a non-matching character in `t` never hurt the answer?
 2. Why is the empty string always a subsequence?
-3. How would the approach change for many different `s` queries against one fixed `t`?
-4. What invariant does `s_index` represent?
+3. What does `s_index` mean at any point in the scan?
+4. How do repeated characters change the reasoning, if at all?
+5. When would a preprocessing approach be better than one linear scan?
 
 ## Follow-up Practice
 
-- Preprocess `t` for many subsequence queries.
 - Count how many words in a list are subsequences of one string.
-- Compare subsequence matching with substring matching.
+- Preprocess one fixed `t` to support many subsequence queries efficiently.
+- Compare subsequence matching with substring matching to see why contiguity changes the problem.
