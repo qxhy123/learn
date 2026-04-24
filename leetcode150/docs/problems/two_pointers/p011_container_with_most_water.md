@@ -8,80 +8,80 @@
 
 ## Core Pattern
 
-When a score is determined by two boundaries and the distance between them, start with the widest boundary pair and move the boundary that currently limits the score.
+When two boundaries define a score and the distance between them shrinks as pointers move, evaluate the widest remaining pair first and discard the boundary that provably limits all future pairs using it.
 
 ## Why Two Pointers Fits
 
-The area between two bars is `width * min(height[left], height[right])`. Starting at both ends maximizes width. After evaluating a pair, width will only shrink, so the only way to improve the area is to find a taller limiting bar. Moving the taller bar cannot increase the limiting height while the shorter bar remains in place; moving the shorter bar is the only move with upside.
+The area for two bars is `width * min(height[left], height[right])`. The width is largest when the pointers start at the two ends. After any pointer move, width decreases. Therefore, a future improvement can only come from increasing the limiting height.
 
-This is a dominance-style two-pointer problem: each move discards a boundary after proving it cannot produce a better answer with any narrower partner.
+If the left bar is shorter, keeping it while moving the right bar inward cannot help: the width gets smaller and the height is still capped by the same left bar. The only move with potential is to discard the shorter bar and search for a taller one. This dominance argument is exactly what the two-pointer method captures.
 
 ## Recommended Approach
 
-1. Initialize `left = 0`, `right = len(height) - 1`, and `best_area = 0`.
-2. Compute the current width as `right - left`.
-3. Compute the current limiting height as `min(height[left], height[right])`.
-4. Update `best_area` with the current area.
+1. Set `left = 0`, `right = len(height) - 1`, and `best_area = 0`.
+2. While `left < right`, compute `width = right - left`.
+3. Compute the limiting height as `min(height[left], height[right])`.
+4. Update `best_area` with `width * limiting_height`.
 5. Move the pointer at the shorter bar inward.
-6. If both bars are equal, moving either one is safe; the implementation moves `right`.
-7. Repeat until the pointers meet, then return `best_area`.
+6. If the heights are equal, moving either side is safe; the implementation moves `right`.
+7. Return `best_area` after the pointers meet.
 
 ## Alternative Approaches
 
-The brute-force solution checks every pair and takes `O(n^2)` time. Sorting is invalid because positions determine width; reordering bars changes the problem. A stack or dynamic-programming table is unnecessary because the dominance argument gives a direct local decision at each step.
+A brute-force solution checks every pair of bars and takes `O(n^2)` time, which is too slow for `n` up to `10^5`. Sorting the heights is invalid because the original indices determine width. Dynamic programming does not add value because the local dominance proof tells us exactly which boundary can be discarded.
 
 ## Correctness Sketch
 
-Assume `height[left] <= height[right]`. For any `k` with `left < k < right`, the container `(left, k)` has smaller width than `(left, right)` and limiting height at most `height[left]`. Therefore it cannot exceed the area already computed for `(left, right)`. So after evaluating `(left, right)`, no optimal solution uses `left`, and moving `left` is safe. The same reasoning applies symmetrically when `height[right] < height[left]`. Since every discarded boundary is proven unable to improve the best area, the algorithm never discards an optimal answer before considering an area at least as large.
+Assume `height[left] <= height[right]`. For any index `k` with `left < k < right`, the container formed by `(left, k)` has smaller width than `(left, right)` and limiting height at most `height[left]`. Its area therefore cannot exceed the area already evaluated for `(left, right)`. So no optimal solution is lost by discarding `left`. The argument is symmetric when `height[right] < height[left]`. Since each step records the current area before discarding a boundary and discards only boundaries that cannot improve the answer, the maximum area is preserved in `best_area`.
 
 ## Trace
 
-For `[1, 8, 6, 2, 5, 4, 8, 3, 7]`:
+For `height = [1, 8, 6, 2, 5, 4, 8, 3, 7]`:
 
-| Left index/value | Right index/value | Width | Area | Move |
-| --- | --- | --- | --- | --- |
-| `0 / 1` | `8 / 7` | `8` | `8` | Move left because `1` limits area |
-| `1 / 8` | `8 / 7` | `7` | `49` | Move right because `7` limits area |
-| `1 / 8` | `7 / 3` | `6` | `18` | Move right |
-| `1 / 8` | `6 / 8` | `5` | `40` | Tie, move right |
+| `left` | `right` | Width | Limiting height | Area | Move |
+| --- | --- | --- | --- | --- | --- |
+| `0 / 1` | `8 / 7` | `8` | `1` | `8` | move `left` |
+| `1 / 8` | `8 / 7` | `7` | `7` | `49` | move `right` |
+| `1 / 8` | `7 / 3` | `6` | `3` | `18` | move `right` |
+| `1 / 8` | `6 / 8` | `5` | `8` | `40` | tie, move `right` |
 
-The best value found is `49`.
+The best recorded area is `49`.
 
 ## Complexity
 
-- Time: `O(n)` because exactly one pointer moves on each iteration.
-- Space: `O(1)` because the algorithm stores only pointer positions and the best area.
+- Time: `O(n)` because each iteration moves exactly one pointer inward.
+- Space: `O(1)` because only pointer indices and the best area are stored.
 
 ## Common Pitfalls
 
-- Moving the taller bar and losing the proof that the discarded side is impossible.
-- Using the taller height in the area formula instead of the shorter height.
-- Sorting the heights and destroying width information.
-- Forgetting that width shrinks every time a pointer moves.
-- Trying to prove the move by intuition instead of the dominance argument.
+- Moving the taller side without a proof.
+- Using the taller bar in the area formula instead of the shorter bar.
+- Sorting bars and losing the original widths.
+- Forgetting to evaluate the current area before moving a pointer.
+- Assuming the tallest two bars always form the best container; width matters as much as height.
 
 ## Implementation Notes
 
-See `solutions/two_pointers/p011_container_with_most_water.py`. The implementation keeps the limiting-height calculation explicit, which makes the pointer move easy to audit.
+See `solutions/two_pointers/p011_container_with_most_water.py`. The code explicitly computes `width`, `current_height`, and `best_area`, then moves the shorter side according to the dominance proof.
 
 ## Tests
 
-See `tests/two_pointers/test_p011_container_with_most_water.py`. The tests cover official examples, the minimal two-bar case, monotonic arrays, and equal-height bars.
+See `tests/two_pointers/test_p011_container_with_most_water.py`. The tests cover official examples, the minimum two-bar input, increasing and decreasing height arrays, and equal-height arrays.
 
 ## Interview Script
 
-"I start with the widest possible container. The shorter wall limits the current area; if I keep it and move the taller wall inward, width decreases and the limiting height cannot improve. So after recording the area, I move the shorter side and keep the best area seen."
+"I start with the widest possible container. The shorter wall limits the area. If I keep that shorter wall and move the taller wall inward, width decreases and the limiting height cannot improve, so that cannot beat the current pair. Therefore I record the area and move the shorter side."
 
 ## Review Questions
 
-1. Why does the shorter side determine the current area's maximum possible height?
-2. Why is sorting invalid for this problem?
-3. What exactly is proven when we discard a boundary?
-4. Why is moving either pointer safe when the heights are equal?
-5. How is this dominance argument different from the sorted-sum argument in Two Sum II?
+1. Why does the shorter wall limit the current area?
+2. What exactly is proven before a boundary is discarded?
+3. Why are the tallest two bars not always the answer?
+4. Why is sorting invalid even though this is a two-pointer problem?
+5. What makes this proof different from the sorted-sum proof in Two Sum II?
 
 ## Follow-up Practice
 
 - Trapping Rain Water.
-- Maximize a score involving two endpoints and distance.
-- Practice writing dominance proofs for pointer movement.
+- Problems where two endpoints and distance define a score.
+- Writing dominance proofs for pointer movement decisions.
