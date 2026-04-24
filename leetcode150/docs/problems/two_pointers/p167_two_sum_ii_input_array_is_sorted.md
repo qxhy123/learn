@@ -4,82 +4,82 @@
 - LeetCode: https://leetcode.com/problems/two-sum-ii-input-array-is-sorted/
 - Official Group: Two Pointers
 - Pattern Group: Two Pointers
-- Tags: two-pointers, sorted-array, sum
+- Patterns: two-pointers, sum
 
 ## Core Pattern
 
-In a sorted array, compare the smallest and largest remaining candidates for a target sum. Move only the side that is guaranteed not to help, because the sorted order turns every pointer move into a safe elimination.
+In a sorted array, start with the smallest and largest remaining candidates. If their sum is too small, discard the smaller candidate; if their sum is too large, discard the larger candidate.
 
 ## Why Two Pointers Fits
 
-The input is sorted in nondecreasing order, so the sum changes predictably when a pointer moves. If the current sum is too small, increasing the left pointer is the only move that can make the sum larger. If the current sum is too large, decreasing the right pointer is the only move that can make the sum smaller. That monotonic behavior is exactly what two pointers exploit.
+Sorted order gives the algorithm a monotonic direction. With `left < right`, increasing `left` can only keep or increase the chosen left value, and decreasing `right` can only keep or decrease the chosen right value. Therefore, each comparison tells us which side cannot participate in the target pair.
+
+The problem also guarantees exactly one valid answer, so the algorithm does not need to collect every pair or handle ambiguity. It only needs to find the one pair while preserving the required 1-indexed return format.
 
 ## Recommended Approach
 
 1. Set `left = 0` and `right = len(numbers) - 1`.
 2. Compute `current_sum = numbers[left] + numbers[right]`.
-3. If `current_sum == target`, return `[left + 1, right + 1]` because LeetCode expects 1-indexed positions.
-4. If `current_sum < target`, move `left += 1` to increase the sum.
-5. If `current_sum > target`, move `right -= 1` to decrease the sum.
-6. Continue until the unique solution is found.
-
-The problem guarantees exactly one solution, so the search should end with a direct return rather than a collection of candidates.
+3. If `current_sum == target`, return `[left + 1, right + 1]`.
+4. If `current_sum < target`, increment `left` because the smaller value is too small to work with any remaining right candidate.
+5. If `current_sum > target`, decrement `right` because the larger value is too large to work with any remaining left candidate.
+6. Continue until the guaranteed answer is found.
 
 ## Alternative Approaches
 
-A hash map solves the unsorted Two Sum problem in linear time, but it ignores the sorted order and uses extra memory. Another option is to binary-search the complement for each index, which gives `O(n log n)` time. The two-pointer version is the cleanest answer here because the sorted input already gives you the elimination rule for free.
+The unsorted Two Sum problem is usually solved with a hash map, but that spends `O(n)` extra space and does not use the sorted input. Another option is to fix one index and binary-search for its complement, which uses constant extra space but takes `O(n log n)` time. The two-pointer method is both linear and constant-space because it uses sorted order at every step.
 
 ## Correctness Sketch
 
-Maintain this invariant: if the answer exists, it lies somewhere inside the current `[left, right]` window. When the sum is too small, `numbers[left]` cannot pair with any element at or to the left of `right` to reach the target, because all of those elements are `<= numbers[right]`, so every such pair is also too small. Discarding `left` is therefore safe. The too-large case is symmetric: `numbers[right]` cannot pair with any element at or to the right of `left` to reach the target, so discarding `right` is safe. Because each move removes only impossible candidates and the contract promises exactly one answer, the algorithm must eventually return the correct 1-indexed pair.
+Maintain this invariant: the unique valid pair, if not already returned, lies inside the current `[left, right]` window. If `numbers[left] + numbers[right] < target`, then `numbers[left]` paired with any index at most `right` is also too small, so no valid answer uses `left`; moving `left` preserves the invariant. If the sum is too large, then `numbers[right]` paired with any index at least `left` is also too large, so no valid answer uses `right`; moving `right` preserves the invariant. Since each step discards only impossible candidates and the input has exactly one solution, the algorithm must return that solution.
 
 ## Trace
 
-For `numbers = [2, 7, 11, 15]` and `target = 9`:
+For `numbers = [2, 7, 11, 15]`, `target = 9`:
 
-| Left index | Right index | Pair | Sum | Action |
-| --- | --- | --- | --- | --- |
-| `1` | `4` | `2 + 15` | `17` | Too large, move `right` left |
-| `1` | `3` | `2 + 11` | `13` | Too large, move `right` left |
-| `1` | `2` | `2 + 7` | `9` | Return `[1, 2]` |
+| `left` value | `right` value | Sum | Decision |
+| --- | --- | --- | --- |
+| `2` | `15` | `17` | Too large, move `right` left |
+| `2` | `11` | `13` | Too large, move `right` left |
+| `2` | `7` | `9` | Return `[1, 2]` |
 
-The elimination story is the same for negative values or duplicate values, because the sorted order still guarantees monotonic sums.
+The returned indices are 1-indexed, so zero-based `(0, 1)` becomes `[1, 2]`.
 
 ## Complexity
 
-- Time: `O(n)` because each pointer moves inward at most `n` times total.
-- Space: `O(1)` because the algorithm only stores pointer indices and the running sum.
+- Time: `O(n)` because each iteration moves exactly one pointer inward.
+- Space: `O(1)` because the method stores only two indices and the current sum.
 
 ## Common Pitfalls
 
-- Returning zero-based indices instead of 1-indexed positions.
-- Moving both pointers at once instead of eliminating one impossible side at a time.
-- Falling back to a hash map and missing the sorted-order advantage.
-- Overthinking duplicate values even though the contract guarantees a unique solution.
-- Forgetting that the “exactly one solution” guarantee is part of the reasoning.
+- Returning zero-based indices.
+- Using a hash map and missing the sorted-array optimization.
+- Moving both pointers when the sum is too small or too large.
+- Testing with inputs that have multiple valid answers even though the problem guarantees exactly one.
+- Adding duplicate-skipping logic; duplicates are allowed and may be the answer.
 
 ## Implementation Notes
 
-See `solutions/two_pointers/p167_two_sum_ii_input_array_is_sorted.py`. The implementation returns the 1-indexed answer as soon as it finds the matching pair. The defensive `ValueError` is only there to guard against invalid input outside the LeetCode contract.
+See `solutions/two_pointers/p167_two_sum_ii_input_array_is_sorted.py`. The defensive `ValueError` is unreachable for valid LeetCode inputs, but it makes the function explicit about its required contract.
 
 ## Tests
 
-See `tests/two_pointers/test_p167_two_sum_ii_input_array_is_sorted.py`. The tests cover the official examples, negative values, the minimal two-element input, and duplicate values that still produce the unique valid pair.
+See `tests/two_pointers/test_p167_two_sum_ii_input_array_is_sorted.py`. The tests cover official examples, negative numbers, two-element input, and duplicate values under the exactly-one-solution contract.
 
 ## Interview Script
 
-"Because the array is sorted, I can eliminate one side at a time. If the sum is too small, the left value is too small to work with anything else on the right, so I move left. If the sum is too large, the right value is too large to work with anything else on the left, so I move right. When the sum matches, I return the 1-indexed pair immediately."
+"Because the array is sorted, I compare the smallest and largest remaining numbers. If the sum is too small, the smallest number cannot work with any remaining partner, so I move left. If the sum is too large, the largest number cannot work, so I move right. When the sum matches, I return the two positions using 1-indexing."
 
 ## Review Questions
 
-1. Why does sorted order make it safe to move only one pointer?
-2. Why does the answer have to be converted to 1-indexed positions?
-3. How is this different from the unsorted Two Sum problem?
-4. Why do duplicate values not need special handling here?
-5. How does the “exactly one solution” contract simplify the loop?
+1. What sorted-order fact justifies moving `left` when the sum is too small?
+2. Why is no duplicate-skipping step needed?
+3. Why is the answer returned with `+1` on each index?
+4. How does the problem's exactly-one-solution guarantee affect testing?
+5. When would a hash-map solution be more appropriate?
 
 ## Follow-up Practice
 
-- Solve the unsorted Two Sum problem with a hash map.
+- Original Two Sum on an unsorted array.
 - Count pairs with sum less than a target in a sorted array.
-- Use the same left/right elimination idea as the inner loop of 3Sum.
+- 3Sum, which fixes one value and then uses this pattern on the suffix.

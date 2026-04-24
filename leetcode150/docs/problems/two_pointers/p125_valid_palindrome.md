@@ -4,85 +4,86 @@
 - LeetCode: https://leetcode.com/problems/valid-palindrome/
 - Official Group: Two Pointers
 - Pattern Group: Two Pointers
-- Tags: two-pointers, strings
+- Patterns: two-pointers
 
 ## Core Pattern
 
-Use mirrored pointers when the answer depends on whether the left side and the right side agree after ignoring irrelevant symbols. Check one pair at a time, move inward, and keep the window shrinking until the pointers cross.
+Use symmetric pointers when the required property is defined by matching the left side of a sequence with the right side. Each iteration should either discard irrelevant input or prove that the current mirrored pair is valid before shrinking the window.
 
 ## Why Two Pointers Fits
 
-This problem is a mirror test, not a full-string transformation problem. The first meaningful character must match the last meaningful character, the second must match the second-to-last, and so on. Two pointers let you verify those mirrored pairs directly while skipping punctuation and spaces on the fly, so you do not need to build a filtered copy first.
+Palindrome checking is naturally a two-ended problem: the first meaningful character must match the last meaningful character, then the second meaningful character must match the second-to-last, and so on. The input also contains characters that do not participate in the comparison. Two pointers let us skip those characters in place and compare only the meaningful mirrored pairs without allocating a filtered copy.
+
+This is the simplest form of the two-pointer pattern: both pointers move inward, and the active window always represents the part of the string that still needs proof.
 
 ## Recommended Approach
 
-1. Set `left = 0` and `right = len(s) - 1`.
-2. Advance `left` while it points to a non-alphanumeric character and `left < right`.
-3. Move `right` left while it points to a non-alphanumeric character and `left < right`.
+1. Initialize `left` at index `0` and `right` at `len(s) - 1`.
+2. While `left < right`, advance `left` until it points to an alphanumeric character or crosses `right`.
+3. Similarly, move `right` backward until it points to an alphanumeric character or crosses `left`.
 4. Compare `s[left].lower()` with `s[right].lower()`.
-5. If they differ, return `False` immediately.
-6. Otherwise move both pointers inward and repeat.
-7. If the loop finishes without a mismatch, return `True`.
-
-An effectively empty string, such as `"   ,,, "`, is a palindrome because there are no meaningful characters to contradict the mirror rule.
+5. If they differ, return `False`; one required mirrored pair is invalid.
+6. If they match, move both pointers inward and continue.
+7. If the pointers meet or cross, every meaningful mirrored pair has matched, so return `True`.
 
 ## Alternative Approaches
 
-A common alternative is to normalize the string first: keep only alphanumeric characters, convert them to lowercase, and compare the cleaned result with its reverse. That approach is easy to read, but it uses `O(n)` extra space for the filtered copy. The two-pointer version is the better pattern-transfer answer because it teaches the same mirror reasoning without the extra allocation.
+The most direct alternative is to build a cleaned lowercase string and compare it with its reverse. That version is concise, but it uses `O(n)` extra space and hides the pointer invariant. The in-place scan is better for interviews because it exposes the reasoning: ignore irrelevant characters, compare the next required pair, and shrink the unresolved window.
+
+A recursive mirrored comparison is also possible, but it adds call-stack overhead without improving clarity or asymptotic complexity.
 
 ## Correctness Sketch
 
-Maintain this invariant: every meaningful character outside the current `[left, right]` window has already been matched with its mirrored partner. The skip loops are safe because punctuation and spaces do not affect the palindrome decision. If two meaningful characters differ after lowercase normalization, then the string cannot be a palindrome because mirrored positions must match exactly under the problem’s comparison rules. If the characters match, moving both pointers inward preserves the invariant. When the pointers cross, every mirrored meaningful pair has matched, so the string is a palindrome. If there are no meaningful characters at all, the invariant is vacuously true, so the answer is also `True`.
+Maintain this invariant: before each comparison, every meaningful character pair outside the current `[left, right]` window has already been checked and matched. The skip loops preserve the invariant because non-alphanumeric characters are irrelevant by definition. When both pointers reference meaningful characters, those two positions are the next required mirrored pair. If they differ after case normalization, no later decision can repair that mismatch, so returning `False` is correct. If they match, moving both pointers inward marks that pair as proven and restores the invariant for the smaller window. When the loop ends, no unproven mirrored pair remains, so the string is a valid palindrome.
 
 ## Trace
 
 For `"A man, a plan, a canal: Panama"`:
 
-| Step | Left pointer | Right pointer | Meaningful pair | Action |
-| --- | --- | --- | --- | --- |
-| 1 | `A` | `a` | `a` vs `a` | Match, move both pointers inward |
-| 2 | skip space | `m` | `m` vs `m` | Skip ignored characters, then match |
-| 3 | `a` | `a` | `a` vs `a` | Match, continue inward |
-| 4 | `p` | `p` | `p` vs `p` | Match, continue inward |
-| End | pointers cross | pointers cross | all mirrored pairs checked | Return `True` |
+| Window focus | Left action | Right action | Result |
+| --- | --- | --- | --- |
+| Full string | `A` is meaningful | `a` is meaningful | `a == a`, shrink |
+| After shrinking | skip spaces and punctuation | `m` is meaningful | compare next meaningful pair |
+| Middle scan | letters match in mirrored order | punctuation is skipped | invariant remains true |
+| End | pointers meet/cross | no mismatch found | return `True` |
 
-For `"0P"`, the first meaningful pair is `0` and `p`, which does not match after lowercasing, so the algorithm returns `False` immediately.
+For `"0P"`, both characters are meaningful and `"0" != "p"`, so the algorithm returns `False` immediately.
 
 ## Complexity
 
-- Time: `O(n)` because each pointer advances across the string at most once.
-- Space: `O(1)` because the algorithm only stores indices and a few temporary characters.
+- Time: `O(n)` because each pointer only moves inward and each character is inspected at most a constant number of times.
+- Space: `O(1)` because the algorithm stores only two indices and temporary character comparisons.
 
 ## Common Pitfalls
 
-- Skipping spaces but forgetting punctuation and symbols.
-- Comparing raw characters without lowercase normalization.
-- Reading `s[left]` or `s[right]` without guarding the skip loops with `left < right`.
-- Building a filtered string when the interviewer asked for constant auxiliary space.
-- Treating an effectively empty string as a special failure case instead of a valid palindrome.
+- Skipping only spaces and forgetting punctuation or symbols.
+- Comparing uppercase and lowercase letters directly.
+- Accessing `s[left]` or `s[right]` after a skip loop without checking `left < right`.
+- Building a filtered string when the intended follow-up asks for constant extra space.
+- Treating an empty or punctuation-only string as false; after filtering, it has no mismatched pair, so it is a palindrome.
 
 ## Implementation Notes
 
-See `solutions/two_pointers/p125_valid_palindrome.py`. The implementation uses `str.isalnum()` to decide what to skip and `str.lower()` to compare the mirrored characters in a case-insensitive way.
+See `solutions/two_pointers/p125_valid_palindrome.py`. The implementation keeps the skip loops inside the main `left < right` loop and uses `str.isalnum()` plus `str.lower()` to match the problem's comparison rules.
 
 ## Tests
 
-See `tests/two_pointers/test_p125_valid_palindrome.py`. The tests cover the official examples, strings that become empty after filtering, mixed case with digits, punctuation-heavy inputs, and a false case that only fails after non-alphanumeric characters are removed.
+See `tests/two_pointers/test_p125_valid_palindrome.py`. The tests cover official examples, punctuation-only input, mixed case, digits, and real mismatches after filtering.
 
 ## Interview Script
 
-"I use two pointers because palindrome checking is symmetric. I skip non-alphanumeric characters on both sides, compare the lowercase meaningful characters, and move inward. If any mirrored pair disagrees, the string is not a palindrome. If the pointers cross, every required pair matched, and even an effectively empty string counts as a palindrome."
+"I use two pointers because palindrome validity is symmetric. I move the left pointer to the next alphanumeric character and the right pointer to the previous alphanumeric character, compare them case-insensitively, and shrink inward. A mismatch proves failure; if the pointers cross, all required mirrored pairs matched."
 
 ## Review Questions
 
-1. Why can punctuation and spaces be ignored without changing the answer?
-2. What does the loop invariant say about the window that remains unexplored?
-3. Why does an effectively empty string return `True`?
-4. Why is lowercase normalization required before comparison?
-5. What makes the scan `O(1)` extra space instead of `O(n)`?
+1. What exact invariant is true after each successful comparison?
+2. Why is a punctuation-only string considered a valid palindrome?
+3. Why is it safe to skip non-alphanumeric characters before comparing?
+4. How would the space complexity change if we built a filtered string first?
+5. What bug can occur if the skip loops do not check `left < right`?
 
 ## Follow-up Practice
 
-- Check whether a string can become a palindrome after deleting at most one character.
-- Adapt the same mirrored scan to arrays of numbers instead of characters.
-- Handle palindrome checking with Unicode normalization rules instead of ASCII-style character classes.
+- Valid Palindrome II: allow deleting at most one character.
+- Compare two strings after applying backspaces.
+- Check whether an array segment is symmetric under a custom equality rule.
