@@ -75,8 +75,24 @@ def test_validate_metadata_rejects_mismatched_paths() -> None:
     assert "problem 1 solution_path should be solutions/hash_table/p001_two_sum.py" in errors
 
 
+def test_validate_metadata_rejects_non_int_number_without_crashing() -> None:
+    problem = valid_problem() | {"number": "one"}
+
+    errors = validate_metadata({"problems": [problem]})
+
+    assert "problem at index 0 has invalid number: one" in errors
+
+
 def test_load_metadata_rejects_missing_file(tmp_path: Path) -> None:
     missing_path = tmp_path / "missing.yaml"
 
     with pytest.raises(MetadataError, match="metadata file does not exist"):
         load_metadata(missing_path)
+
+
+def test_load_metadata_rejects_malformed_yaml(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "broken.yaml"
+    metadata_path.write_text("problems: [\n", encoding="utf-8")
+
+    with pytest.raises(MetadataError, match="failed to parse metadata YAML"):
+        load_metadata(metadata_path)

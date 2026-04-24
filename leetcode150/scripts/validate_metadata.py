@@ -34,8 +34,11 @@ class MetadataError(RuntimeError):
 def load_metadata(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise MetadataError(f"metadata file does not exist: {path}")
-    with path.open("r", encoding="utf-8") as file:
-        data = yaml.safe_load(file)
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = yaml.safe_load(file)
+    except yaml.YAMLError as error:
+        raise MetadataError(f"failed to parse metadata YAML: {path}") from error
     if not isinstance(data, dict):
         raise MetadataError("metadata root must be a mapping")
     return data
@@ -70,7 +73,8 @@ def validate_problem(problem: dict[str, Any], index: int) -> list[str]:
         return errors
 
     number = problem["number"]
-    if not isinstance(number, int) or number <= 0:
+    number_is_valid = type(number) is int and number > 0
+    if not number_is_valid:
         errors.append(f"problem at index {index} has invalid number: {number}")
 
     difficulty = problem["difficulty"]
@@ -85,13 +89,14 @@ def validate_problem(problem: dict[str, Any], index: int) -> list[str]:
     if not isinstance(examples, list) or not examples:
         errors.append(f"problem {number} examples must be a non-empty list")
 
-    solution_path, doc_path, test_path = expected_paths(problem)
-    if problem["solution_path"] != solution_path:
-        errors.append(f"problem {number} solution_path should be {solution_path}")
-    if problem["doc_path"] != doc_path:
-        errors.append(f"problem {number} doc_path should be {doc_path}")
-    if problem["test_path"] != test_path:
-        errors.append(f"problem {number} test_path should be {test_path}")
+    if number_is_valid:
+        solution_path, doc_path, test_path = expected_paths(problem)
+        if problem["solution_path"] != solution_path:
+            errors.append(f"problem {number} solution_path should be {solution_path}")
+        if problem["doc_path"] != doc_path:
+            errors.append(f"problem {number} doc_path should be {doc_path}")
+        if problem["test_path"] != test_path:
+            errors.append(f"problem {number} test_path should be {test_path}")
 
     return errors
 
@@ -114,7 +119,7 @@ def validate_metadata(metadata: dict[str, Any]) -> list[str]:
         errors.extend(validate_problem(problem, index))
         number = problem.get("number")
         slug = problem.get("slug")
-        if isinstance(number, int):
+        if type(number) is int:
             if number in seen_numbers:
                 errors.append(f"duplicate number: {number}")
             seen_numbers.add(number)
