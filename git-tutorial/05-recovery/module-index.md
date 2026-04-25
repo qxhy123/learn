@@ -7,7 +7,7 @@
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 13 | [撤销本地改动](./13-undo-local-changes.md) | 从工作区、暂存区和本地提交三层判断该撤哪一层。 | `LAB-RECOVERY-UNDO-01` |
 | 14 | [修正错误提交](./14-fix-a-bad-commit.md) | 区分 amend、revert、reset 与 cherry-pick 的协作边界。 | `LAB-RECOVERY-BAD-COMMIT-01` |
 | 15 | [用 reflog 找回工作](./15-recover-lost-work-with-reflog.md) | 用 reflog 和救援分支找回 reset、游离 HEAD、误删分支后的提交。 | `LAB-RECOVERY-REFLOG-01` |

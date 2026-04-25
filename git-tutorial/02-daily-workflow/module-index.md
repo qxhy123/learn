@@ -2,12 +2,13 @@
 
 ## 模块目标
 
-本模块把心智模型落到每天都会发生的闭环：修改文件、观察状态、设计提交、review diff、提交、保持仓库卫生。重点不是“尽快 commit”，而是让每个提交都可解释、可 review、可回滚。
+本模块把心智模型落到每天都会发生的闭环：修改文件、观察状态、设计提交、review diff、提交、保持仓库卫生。
+重点不是“尽快 commit”，而是让每个提交都可解释、可 review、可回滚。
 
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 04 | [第一次干净提交](./04-first-change-to-clean-commit.md) | 从修改到暂存、提交、验证，完成一次小步闭环。 | `LAB-DAILY-CLEAN-COMMIT-01` |
 | 05 | [提交设计与 diff review](./05-commit-design-and-diff-review.md) | 拆分混杂修改，确认提交只表达一个意图。 | `LAB-DAILY-DIFF-REVIEW-01` |
 | 06 | [忽略文件与仓库卫生](./06-ignore-files-and-repo-hygiene.md) | 判断哪些文件应入库、应忽略、应从跟踪集合移除。 | `LAB-DAILY-IGNORE-01` |

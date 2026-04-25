@@ -8,7 +8,8 @@ git branch -vv
 git log --oneline --graph --decorate --all --max-count=12
 ```
 
-如果命令可能改变历史、删除文件或更新远程引用，先阅读 [危险区](danger-zone.md)。术语不确定时查 [术语表](glossary.md)，高频命令查 [速查表](cheatsheet.md)。
+如果命令可能改变历史、删除文件或更新远程引用，先阅读 [危险区](danger-zone.md)。
+术语不确定时查 [术语表](glossary.md)，高频命令查 [速查表](cheatsheet.md)。
 
 ## 我不知道当前仓库状态是否安全
 

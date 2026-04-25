@@ -2,12 +2,13 @@
 
 ## 模块目标
 
-远程协作的核心不是“把代码传上去”，而是在本地历史、远程跟踪分支、团队主干和 Pull Request 之间保持可解释的同步关系。本模块覆盖 clone/fetch/pull/push、同步主干、处理 push rejected、打开 PR、review 与团队约定。
+远程协作的核心不是“把代码传上去”，而是在本地历史、远程跟踪分支、团队主干和 Pull Request 之间保持可解释的同步关系。
+本模块覆盖 clone/fetch/pull/push、同步主干、处理 push rejected、打开 PR、review 与团队约定。
 
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 10 | [clone、fetch、pull 与 push](./10-clone-fetch-pull-push.md) | 区分远程名、远程跟踪分支、上游分支和本地分支。 | `LAB-COLLAB-REMOTE-01` |
 | 11 | [同步主干并打开 PR](./11-sync-with-main-and-open-pr.md) | 处理本地领先、远程领先、双方都前进和 push rejected。 | `LAB-COLLAB-PUSH-REJECTED-01` |
 | 12 | [Review 与团队约定](./12-review-and-team-conventions.md) | 把 PR 当作团队历史治理接口，而不只是代码审查页面。 | `LAB-COLLAB-PR-01` |
