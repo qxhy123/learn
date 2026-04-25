@@ -22,7 +22,7 @@ git tag --list --sort=-creatordate | head
 ```bash
 git blame <path>
 git show <commit>
-git bisect status
+git bisect log
 ```
 
 ## 决策底线
