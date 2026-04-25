@@ -56,7 +56,7 @@ git log --oneline --graph --decorate --max-count=8
 
 ### 起点
 
-- [课程导向：怎样用状态观察学习 Git](./00-orientation.md)
+- [课程导向：怎样用状态观察学习 Git](./00-orientation.md)：建立“先观察、再操作、能恢复”的学习节奏，并完成 `LAB-ORIENT-STATUS-01`。
 
 ### 01 心智模型：先看懂仓库状态
 
@@ -67,6 +67,8 @@ git log --oneline --graph --decorate --max-count=8
 | [工作区、暂存区与提交](./01-mental-model/02-working-tree-index-commit.md) | 理解 `add`、`commit`、`restore --staged` 改变哪一层。 |
 | [有信心地阅读历史](./01-mental-model/03-read-history-with-confidence.md) | 用 `log`、`show`、`diff` 读懂线性、分叉和汇合历史。 |
 
+对应实验：`LAB-MODEL-STATE-01`、`LAB-MODEL-INDEX-01`、`LAB-MODEL-HISTORY-01`。
+
 ### 02 日常工作流：从修改到可 review 提交
 
 | 文件 | 你将学会 |
@@ -76,15 +78,73 @@ git log --oneline --graph --decorate --max-count=8
 | [提交设计与 diff review](./02-daily-workflow/05-commit-design-and-diff-review.md) | 让提交变小、可读、可回滚、可审查。 |
 | [忽略文件与仓库卫生](./02-daily-workflow/06-ignore-files-and-repo-hygiene.md) | 正确使用 `.gitignore`，避免把生成物和秘密带进历史。 |
 
-### 后续模块（由其他并行工作包交付）
+对应实验：`LAB-DAILY-CLEAN-COMMIT-01`、`LAB-DAILY-DIFF-REVIEW-01`、`LAB-DAILY-IGNORE-01`。
 
-- `03-branching-work/`：任务分支、冲突处理、rebase 边界。
-- `04-collaboration/`：clone/fetch/pull/push、PR、团队约定。
-- `05-recovery/`：restore/reset/revert/reflog 的恢复决策。
-- `06-release-and-debugging/`：stash、worktree、标签、hotfix、bisect。
-- `07-scale-and-governance/`：hooks、config、LFS、大仓库、治理和灾难手册。
-- `labs/`：统一实验清单、准备/执行/观察/恢复/清理步骤。
-- `appendix/`：命令决策树、危险区、术语表、速查表。
+### 03 分支工作：任务分支、冲突与 rebase
+
+| 文件 | 你将学会 |
+|---|---|
+| [模块导览](./03-branching-work/module-index.md) | 分支、冲突和 rebase 前后的观察面板。 |
+| [为一个任务创建分支](./03-branching-work/07-branch-for-a-task.md) | 从干净主干创建短生命周期任务分支，并小步提交。 |
+| [用 playbook 解决合并冲突](./03-branching-work/08-merge-conflicts-with-a-playbook.md) | 把冲突当成需要人工判断的历史汇合点。 |
+| [不恐惧地使用 rebase](./03-branching-work/09-rebase-without-fear.md) | 只在未共享边界内重放提交，并知道何时中止。 |
+
+对应实验：`LAB-BRANCH-TASK-01`、`LAB-BRANCH-CONFLICT-01`、`LAB-BRANCH-REBASE-01`。
+
+### 04 远程协作：同步、推送与 Pull Request
+
+| 文件 | 你将学会 |
+|---|---|
+| [模块导览](./04-collaboration/module-index.md) | 本地分支、远程跟踪分支和 PR 之间的同步关系。 |
+| [clone、fetch、pull 与 push](./04-collaboration/10-clone-fetch-pull-push.md) | 区分 fetch 更新远程跟踪分支与 pull/push 改动当前协作状态。 |
+| [同步主干并打开 PR](./04-collaboration/11-sync-with-main-and-open-pr.md) | 处理 ahead、behind、diverged 和 push rejected。 |
+| [Review 与团队约定](./04-collaboration/12-review-and-team-conventions.md) | 用 PR 自检和团队规则保护共享历史。 |
+
+对应实验：`LAB-COLLAB-REMOTE-01`、`LAB-COLLAB-PUSH-REJECTED-01`、`LAB-COLLAB-PR-01`。
+
+### 05 恢复：撤销、回退与找回
+
+| 文件 | 你将学会 |
+|---|---|
+| [模块导览](./05-recovery/module-index.md) | 从工作区、暂存区、提交历史和共享边界选择恢复路线。 |
+| [Undo Local Changes](./05-recovery/13-undo-local-changes.md) | 撤销未提交改动、取消暂存，并避免误删 untracked 文件。 |
+| [Fix a Bad Commit](./05-recovery/14-fix-a-bad-commit.md) | 区分 amend、reset、revert、cherry-pick 的协作边界。 |
+| [Recover Lost Work with Reflog](./05-recovery/15-recover-lost-work-with-reflog.md) | 用 reflog 和救援分支找回误移动引用后的工作。 |
+
+对应实验：`LAB-RECOVERY-UNDO-01`、`LAB-RECOVERY-BAD-COMMIT-01`、`LAB-RECOVERY-REFLOG-01`。
+
+### 06 发布与排障：中断、标签与历史定位
+
+| 文件 | 你将学会 |
+|---|---|
+| [模块导览](./06-release-and-debugging/module-index.md) | 用 Git 支撑中断处理、发布表达和历史排障。 |
+| [Stash, Worktree and Interruptions](./06-release-and-debugging/16-stash-worktree-and-interruptions.md) | 在任务切换时选择提交、stash、分支或 worktree。 |
+| [Tags, Releases and Hotfixes](./06-release-and-debugging/17-tags-releases-and-hotfixes.md) | 用标签和维护分支表达发布点与热修流程。 |
+| [Blame、Bisect 与历史排障](./06-release-and-debugging/18-blame-bisect-and-history-debugging.md) | 从症状回溯到提交，用 bisect 缩小回归范围。 |
+
+对应实验：`LAB-RELEASE-STASH-WORKTREE-01`、`LAB-RELEASE-HOTFIX-TAG-01`、`LAB-DEBUG-BISECT-01`。
+
+### 07 规模与治理：规则自动化、大仓库与灾难预案
+
+| 文件 | 你将学会 |
+|---|---|
+| [模块导览](./07-scale-and-governance/module-index.md) | 把个人 Git 熟练度扩展成团队系统。 |
+| [Hooks、配置与别名](./07-scale-and-governance/19-hooks-config-and-aliases.md) | 用 hooks、别名和配置层级自动化低风险规则。 |
+| [Monorepo、LFS 与大仓库](./07-scale-and-governance/20-monorepo-lfs-and-large-repos.md) | 识别大仓库成本，并选择忽略、拆分或 LFS 等治理手段。 |
+| [分支策略与灾难手册](./07-scale-and-governance/21-branching-policy-and-disaster-playbook.md) | 为团队写出最低分支策略和事故分流卡片。 |
+
+对应实验：`LAB-GOV-HOOKS-01`、`LAB-GOV-LARGE-REPO-01`、`LAB-GOV-DISASTER-01`。
+
+### Labs 与附录
+
+| 文件 | 用途 |
+|---|---|
+| [实验总览](./labs/README.md) | 按 lab id 查找准备、执行、观察、恢复和清理步骤。 |
+| [实验脚本](./labs/bin/git-lab.sh) | 在临时目录创建可重复实验仓库。 |
+| [速查表](./appendix/cheatsheet.md) | 按状态观察、提交、分支、协作、恢复、发布和治理快速查命令。 |
+| [命令决策树](./appendix/command-decision-trees.md) | 从“我要撤销/同步/找回”等问题反推安全命令。 |
+| [危险区](./appendix/danger-zone.md) | 查看高风险命令的影响、边界和恢复入口。 |
+| [术语表](./appendix/glossary.md) | 统一 working tree、index、ref、reflog、worktree、LFS 等术语。 |
 
 ## 推荐学习路径
 
@@ -104,13 +164,22 @@ git log --oneline --graph --decorate --max-count=8
 2. [工作区、暂存区与提交](./01-mental-model/02-working-tree-index-commit.md)
 3. [有信心地阅读历史](./01-mental-model/03-read-history-with-confidence.md)
 4. [提交设计与 diff review](./02-daily-workflow/05-commit-design-and-diff-review.md)
-5. 后续进入 `05-recovery/` 与 `04-collaboration/`。
+5. [用 playbook 解决合并冲突](./03-branching-work/08-merge-conflicts-with-a-playbook.md)
+6. [Fix a Bad Commit](./05-recovery/14-fix-a-bad-commit.md)
+7. [Recover Lost Work with Reflog](./05-recovery/15-recover-lost-work-with-reflog.md)
 
 ### 路径 C：团队协作准备
 
-1. 先完成 01 和 02，保证个人提交质量。
-2. 再进入 `03-branching-work/` 与 `04-collaboration/`。
-3. 最后用 `07-scale-and-governance/` 制定团队最低协作规则。
+1. 先完成 [01 心智模型](./01-mental-model/module-index.md) 和 [02 日常工作流](./02-daily-workflow/module-index.md)，保证个人提交质量。
+2. 进入 [03 分支工作](./03-branching-work/module-index.md) 与 [04 远程协作](./04-collaboration/module-index.md)，练习冲突、同步和 PR。
+3. 补齐 [06 发布与排障](./06-release-and-debugging/module-index.md)，理解标签、hotfix 与 bisect。
+4. 最后用 [07 规模与治理](./07-scale-and-governance/module-index.md) 制定团队最低协作规则。
+
+### 路径 D：只想查命令或恢复事故
+
+1. 先看 [命令决策树](./appendix/command-decision-trees.md)，按问题定位安全路线。
+2. 涉及 `reset --hard`、`clean -fd`、rebase、强推、删除分支或标签时，先读 [危险区](./appendix/danger-zone.md)。
+3. 不确定术语时查 [术语表](./appendix/glossary.md)，需要命令短表时查 [速查表](./appendix/cheatsheet.md)。
 
 ## 最小验收
 

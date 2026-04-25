@@ -6,6 +6,12 @@
 
 本教程从这个时刻开始：**先观察状态，再做操作**。
 
+如果你已经知道自己要解决哪类问题，可以把本章当作入口页：
+
+- 第一次系统学习：读完本章后进入 [课程地图](./README.md#课程地图)，按 01 到 07 顺序推进。
+- 只想练习：使用 [实验总览](./labs/README.md) 找到本章或后续章节的 lab id。
+- 遇到危险命令：先查 [危险区](./appendix/danger-zone.md)，再回到对应章节执行。
+
 ## 学习目标
 
 读完本章，你应该能够：
@@ -54,7 +60,7 @@ Git 命令可以先粗略分成三类。
 
 **Lab id：`LAB-ORIENT-STATUS-01`**
 
-目标：初始化一个练习仓库，并记录第一次状态观察。
+目标：初始化一个练习仓库，并记录第一次状态观察。完整实验说明见 [labs/scenarios/LAB-ORIENT-STATUS-01.md](./labs/scenarios/LAB-ORIENT-STATUS-01.md)。
 
 ```bash
 mkdir git-practice
