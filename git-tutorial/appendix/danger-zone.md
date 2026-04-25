@@ -12,12 +12,11 @@ git branch -vv
 git log --oneline --graph --decorate --all --max-count=20
 ```
 
-2. 备份：
+2. 备份或命名当前状态：
 
 ```bash
-git switch -c rescue/$(date +%Y%m%d-%H%M%S)
-# 或至少记录当前提交
 git rev-parse HEAD
+git switch -c rescue/$(date +%Y%m%d-%H%M%S)
 ```
 
 3. 判断：改动是否已经 push 到别人会基于它继续工作的分支？
@@ -42,6 +41,32 @@ git rev-parse HEAD
 git reflog --date=relative
 git switch -c rescue/reset-before <old-sha>
 ```
+
+## `git reset --mixed` / `git reset --soft`
+
+影响：移动当前分支；`--soft` 保留 index 和 working tree，`--mixed` 重置 index 但保留 working tree。
+
+风险：提交 ID 会从当前分支历史中消失；若这些提交已经共享，再强推会改写别人依赖的历史。
+
+使用边界：
+
+- 适合拆分或重做本地未共享提交。
+- 不适合作为修复共享错误提交的默认手段。
+
+恢复：使用 reflog 找回 reset 前的提交，再创建救援分支。
+
+## `git commit --amend`
+
+影响：用新提交替换当前提交；即使只改提交说明，也会生成新的提交 ID。
+
+风险：如果原提交已经 push，amend 后再推送通常需要改写远程分支。
+
+安全边界：
+
+- 未共享提交：可用于补漏文件、改说明。
+- 已共享提交：优先新提交修复；不要为了美化历史破坏协作者基线。
+
+恢复：reflog 中通常能看到 amend 前后的提交位置。
 
 ## `git clean -fd`
 
@@ -77,7 +102,7 @@ git rebase --abort
 恢复：
 
 ```bash
-git reflog
+git reflog --date=relative
 git switch -c rescue/rebase-before <old-sha>
 ```
 
@@ -96,11 +121,29 @@ git switch -c rescue/rebase-before <old-sha>
 
 恢复：找平台审计、同事本地 reflog 或镜像备份，恢复最后好提交。
 
+## `git cherry-pick`
+
+影响：把某个提交的补丁复制到当前分支，生成新的提交 ID。
+
+风险：可能重复引入同一修复、遗漏上下文，或在维护分支制造隐藏冲突。
+
+安全流程：
+
+```bash
+git status -sb
+git show --stat <sha>
+git cherry-pick <sha>
+# 不确定时
+git cherry-pick --abort
+```
+
+使用边界：适合把小修复移植到维护分支；不适合搬运一串依赖复杂的功能提交。
+
 ## 删除分支或标签
 
 影响：移除引用；对象可能仍在一段时间内可通过 reflog 或其他引用找回。
 
-风险：删除远程分支/移动公开标签会影响 CI、发布系统和协作者。
+风险：删除远程分支、移动公开标签会影响 CI、发布系统和协作者。
 
 安全流程：
 
@@ -119,18 +162,48 @@ git tag corrected-tag <sha>
 
 公开标签打错时，优先发布修正标签并公告；不要静默移动。
 
+## `git stash pop`
+
+影响：应用 stash 并在成功时删除该 stash 条目。
+
+风险：冲突或误用时，学习者容易同时丢失“补丁来源”和当前工作区上下文。
+
+安全替代：
+
+```bash
+git stash show -p stash@{0}
+git stash apply stash@{0}
+# 验证完成后再删除
+git stash drop stash@{0}
+```
+
+## Hooks 与配置改动
+
+影响：改变本机或仓库的默认行为，如提交检查、提交信息格式、push 前检查。
+
+风险：规则过严会阻断正常工作；规则不可复现会导致“我机器上能提交”。
+
+安全边界：
+
+- 先用只读提示或 CI 检查验证规则。
+- 仓库级 hooks 路径要写清安装方式。
+- 全局配置不要假设所有团队成员都拥有同样设置。
+
 ## 历史清理工具
 
-影响：批量重写提交历史。
+影响：批量重写提交历史，例如移除大文件或敏感信息。
 
 风险：所有提交 ID 改变，fork、clone、CI 缓存、未合并分支都会受影响。
+
+典型命令包括：`git filter-repo`、`git filter-branch`、BFG、`git lfs migrate import`、`git push --mirror`。
 
 最低要求：
 
 1. 镜像备份。
 2. 冻结窗口。
-3. 全员迁移说明。
-4. 平台保护规则临时调整计划。
-5. 回滚负责人。
+3. 临时远端演练。
+4. 全员迁移说明。
+5. 平台保护规则临时调整计划。
+6. 明确回滚负责人。
 
 没有这些条件，不要在共享仓库执行历史清理。
