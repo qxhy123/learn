@@ -13,7 +13,7 @@
 3. 比较 merge commit、squash merge、rebase merge 的长期影响。
 4. 为小团队制定最低限度的 Git 协作规则。
 
-## 状态观察
+## 观察点
 
 review 前后继续使用命令行确认真实状态：
 
