@@ -7,7 +7,7 @@
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 19 | [Hooks、配置与别名](./19-hooks-config-and-aliases.md) | 把高频观察和低风险规则自动化，同时保留可解释性。 | `LAB-GOV-HOOKS-01` |
 | 20 | [Monorepo、LFS 与大仓库](./20-monorepo-lfs-and-large-repos.md) | 识别大仓库成本，并选择合适的治理手段。 | `LAB-GOV-LARGE-REPO-01` |
 | 21 | [分支策略与灾难手册](./21-branching-policy-and-disaster-playbook.md) | 为团队制定最低协作规则和事故分流卡片。 | `LAB-GOV-DISASTER-01` |

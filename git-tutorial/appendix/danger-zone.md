@@ -195,7 +195,8 @@ git stash drop stash@{0}
 
 风险：所有提交 ID 改变，fork、clone、CI 缓存、未合并分支都会受影响。
 
-典型命令包括：`git filter-repo`、`git filter-branch`、BFG、`git lfs migrate import`、`git push --mirror`。
+典型命令包括：`git filter-repo`、`git filter-branch`、BFG、
+`git lfs migrate import`、`git push --mirror`。
 
 最低要求：
 

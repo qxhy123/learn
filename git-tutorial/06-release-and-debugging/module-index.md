@@ -7,7 +7,7 @@
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 16 | [Stash、Worktree 与中断处理](./16-stash-worktree-and-interruptions.md) | 区分短期收纳、上下文切换和长期并行任务。 | `LAB-RELEASE-STASH-WORKTREE-01` |
 | 17 | [Tags、Releases 与 Hotfixes](./17-tags-releases-and-hotfixes.md) | 用标签和维护分支表达发布点与热修流程。 | `LAB-RELEASE-HOTFIX-TAG-01` |
 | 18 | [Blame、Bisect 与历史排障](./18-blame-bisect-and-history-debugging.md) | 从症状回溯到提交，用历史缩小排障范围。 | `LAB-DEBUG-BISECT-01` |

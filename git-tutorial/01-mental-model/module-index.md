@@ -7,7 +7,7 @@
 ## 学习路径
 
 | 顺序 | 章节 | 你要学会的判断 | Lab id |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 01 | [看见仓库状态](./01-see-the-repo-state.md) | 用 `status`、分支名、短状态判断当前仓库是否安全可操作。 | `LAB-MODEL-STATE-01` |
 | 02 | [工作区、暂存区与提交](./02-working-tree-index-commit.md) | 区分 working tree、index、HEAD，并用 diff 验证下一次提交内容。 | `LAB-MODEL-INDEX-01` |
 | 03 | [有信心地阅读历史](./03-read-history-with-confidence.md) | 用 `log`、`show`、`diff` 和范围语法解释提交之间的关系。 | `LAB-MODEL-HISTORY-01` |
