@@ -98,11 +98,11 @@ git merge feature/profile-copy
 典型冲突块如下：
 
 ```text
-<<<<<<< HEAD
-显示给团队内部用户的个人资料说明
-=======
-显示给新注册用户的个人资料引导
->>>>>>> feature/profile-copy
+ <<<<<<< HEAD
+ 显示给团队内部用户的个人资料说明
+ =======
+ 显示给新注册用户的个人资料引导
+ >>>>>>> feature/profile-copy
 ```
 
 - `<<<<<<< HEAD` 到 `=======` 之间：当前分支，也就是你执行 `git merge` 时所在分支的内容。
