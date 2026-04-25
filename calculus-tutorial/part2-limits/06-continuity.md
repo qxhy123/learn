@@ -478,11 +478,32 @@ print(f"谱归一化后的 Lipschitz 常数: {estimate_lipschitz(linear):.2f}")
    (b) $f(x) = \dfrac{|x|}{x}$
    (c) $f(x) = x \sin\dfrac{1}{x}$（$x \neq 0$），$f(0) = 0$
 
-**3.** ⭐⭐ 证明方程 $\cos x = x$ 在 $(0, \dfrac{\pi}{2})$ 内有且仅有一个根。
+**3.** ⭐ 证明方程 $\cos x = x$ 在 $(0, \dfrac{\pi}{2})$ 内有且仅有一个根。
 
 **4.** ⭐⭐ 设 $f(x)$ 在 $[0, 2]$ 上连续，$f(0) = f(2)$。证明存在 $\xi \in [0, 1]$ 使得 $f(\xi) = f(\xi + 1)$。
 
-**5.** ⭐⭐⭐ 设 $f(x)$ 在 $[a, b]$ 上连续，在 $(a, b)$ 内 $f(x) > 0$，且 $f(a) = f(b) = 0$。证明 $f$ 在 $[a, b]$ 上有最大值。
+**5.** ⭐⭐ 设 $f(x)$ 在 $[a, b]$ 上连续，在 $(a, b)$ 内 $f(x) > 0$，且 $f(a) = f(b) = 0$。证明 $f$ 在 $[a, b]$ 上有最大值。
+
+**6.** ⭐⭐ 证明 ReLU 函数
+$$
+\operatorname{ReLU}(x)=\max(0,x)=
+\begin{cases}
+0, & x<0,\\
+x, & x\ge 0
+\end{cases}
+$$
+在 $\mathbb{R}$ 上连续。
+
+**7.** ⭐⭐⭐ 证明函数 $f(x)=\dfrac{1}{x}$ 在区间 $(0,1)$ 上不是一致连续的。
+
+**8.** ⭐⭐⭐ 对任意 $\beta>0$，定义 softplus 函数
+$$
+s_\beta(x)=\frac{1}{\beta}\ln(1+e^{\beta x}).
+$$
+证明：$s_\beta(x)$ 对每个固定的 $\beta$ 都连续，且当 $\beta\to+\infty$ 时，
+$$
+s_\beta(x)\to \max(0,x).
+$$
 
 ---
 
@@ -557,5 +578,87 @@ $g(1) = f(1) - f(2) = f(1) - f(0)$（因为 $f(2) = f(0)$）
 因此 $x_0 \neq a$ 且 $x_0 \neq b$，即 $x_0 \in (a, b)$。
 
 这就证明了 $f$ 在 $[a, b]$ 上的最大值在开区间 $(a, b)$ 内取得。 $\square$
+
+---
+
+**6.** 当 $x<0$ 时，$\operatorname{ReLU}(x)=0$，是常函数，连续；当 $x>0$ 时，$\operatorname{ReLU}(x)=x$，也是连续函数。
+
+只需检查 $x=0$：
+$$
+\lim_{x\to 0^-}\operatorname{ReLU}(x)=0,
+\qquad
+\lim_{x\to 0^+}\operatorname{ReLU}(x)=0,
+$$
+且
+$$
+\operatorname{ReLU}(0)=0.
+$$
+
+左右极限都存在且等于函数值，所以 ReLU 在 $x=0$ 处连续。
+
+综上，ReLU 在 $\mathbb{R}$ 上连续。 $\square$
+
+---
+
+**7.** 取两列点
+$$
+x_n=\frac{1}{n},\qquad y_n=\frac{1}{n+1},\qquad n\in\mathbb{N}^+.
+$$
+
+则
+$$
+|x_n-y_n|=\frac{1}{n(n+1)}\to 0.
+$$
+
+但
+$$
+\left|f(x_n)-f(y_n)\right|
+=
+\left|n-(n+1)\right|
+=1.
+$$
+
+这说明即使两个点在 $(0,1)$ 中越来越接近，函数值之差也不会被统一地压到任意小。
+
+因此 $f(x)=\dfrac{1}{x}$ 在 $(0,1)$ 上不是一致连续的。 $\square$
+
+---
+
+**8.** 对固定的 $\beta>0$，指数函数、对数函数与四则运算都是连续的，而 $1+e^{\beta x}>0$，所以
+$$
+s_\beta(x)=\frac{1}{\beta}\ln(1+e^{\beta x})
+$$
+对每个固定的 $\beta$ 都连续。
+
+分情况讨论极限。
+
+- 若 $x>0$，则
+$$
+s_\beta(x)
+=\frac{1}{\beta}\ln\bigl(e^{\beta x}(1+e^{-\beta x})\bigr)
+=x+\frac{1}{\beta}\ln(1+e^{-\beta x})\to x.
+$$
+
+- 若 $x<0$，则 $e^{\beta x}\to 0$，故
+$$
+s_\beta(x)=\frac{1}{\beta}\ln(1+e^{\beta x})\to 0.
+$$
+
+- 若 $x=0$，则
+$$
+s_\beta(0)=\frac{\ln 2}{\beta}\to 0.
+$$
+
+因此
+$$
+\lim_{\beta\to+\infty}s_\beta(x)=
+\begin{cases}
+x, & x>0,\\
+0, & x\le 0,
+\end{cases}
+=\max(0,x).
+$$
+
+这说明 softplus 是 ReLU 的连续光滑近似。 $\square$
 
 </details>

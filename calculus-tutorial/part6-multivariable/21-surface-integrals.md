@@ -400,15 +400,36 @@ print(f"各层激活值范数: {flow}")
 
 ## 练习题
 
-**1.** 计算 $\iint_S (x^2 + y^2)\,dS$，其中 $S$ 是锥面 $z = \sqrt{x^2 + y^2}$ 位于 $0 \leq z \leq 1$ 的部分。
+**1.** ⭐ 计算 $\iint_S (x^2 + y^2)\,dS$，其中 $S$ 是锥面 $z = \sqrt{x^2 + y^2}$ 位于 $0 \leq z \leq 1$ 的部分。
 
-**2.** 计算 $\iint_\Sigma z\,dx\,dy$，其中 $\Sigma$ 是抛物面 $z = 1 - x^2 - y^2$（$z \geq 0$）的上侧。
+**2.** ⭐ 计算 $\iint_\Sigma z\,dx\,dy$，其中 $\Sigma$ 是抛物面 $z = 1 - x^2 - y^2$（$z \geq 0$）的上侧。
 
-**3.** 用 Gauss 公式计算 $\oiint_\Sigma (x^2 + y)\,dy\,dz + (y^2 + z)\,dz\,dx + (z^2 + x)\,dx\,dy$，其中 $\Sigma$ 是立方体 $0 \leq x, y, z \leq 1$ 的表面外侧。
+**3.** ⭐ 用 Gauss 公式计算 $\oiint_\Sigma (x^2 + y)\,dy\,dz + (y^2 + z)\,dz\,dx + (z^2 + x)\,dx\,dy$，其中 $\Sigma$ 是立方体 $0 \leq x, y, z \leq 1$ 的表面外侧。
 
-**4.** 用 Stokes 公式计算 $\oint_C (y - z)\,dx + (z - x)\,dy + (x - y)\,dz$，其中 $C$ 是球面 $x^2 + y^2 + z^2 = 1$ 与平面 $x + y + z = 0$ 的交线，从 $x$ 轴正向看去为逆时针方向。
+**4.** ⭐⭐ 用 Stokes 公式计算 $\oint_C (y - z)\,dx + (z - x)\,dy + (x - y)\,dz$，其中 $C$ 是球面 $x^2 + y^2 + z^2 = 1$ 与平面 $x + y + z = 0$ 的交线，从 $x$ 轴正向看去为逆时针方向。
 
-**5.** 设 $\mathbf{F} = (2xy + z^3)\mathbf{i} + x^2\mathbf{j} + 3xz^2\mathbf{k}$，验证 $\text{curl}\,\mathbf{F} = \mathbf{0}$，并求 $\mathbf{F}$ 的势函数 $\varphi$ 使得 $\mathbf{F} = \nabla\varphi$。
+**5.** ⭐⭐ 设 $\mathbf{F} = (2xy + z^3)\mathbf{i} + x^2\mathbf{j} + 3xz^2\mathbf{k}$，验证 $\text{curl}\,\mathbf{F} = \mathbf{0}$，并求 $\mathbf{F}$ 的势函数 $\varphi$ 使得 $\mathbf{F} = \nabla\varphi$。
+
+**6.** ⭐⭐ 计算上半球面
+$$
+S:\ x^2+y^2+z^2=1,\ z\ge 0
+$$
+上的第一类曲面积分
+$$
+\iint_S z\,dS.
+$$
+
+**7.** ⭐⭐⭐ 设 $\mathbf{F}=(x,y,z)$，计算它穿过半径为 $R$ 的球面
+$$
+x^2+y^2+z^2=R^2
+$$
+外侧的通量。
+
+**8.** ⭐⭐⭐ 在连续生成模型里，可把向量场
+$$
+\mathbf{F}(x,y,z)=-\lambda(x,y,z)\qquad (\lambda>0)
+$$
+看成把“概率质量”向原点收缩的流。计算它穿过半径为 $R$ 的球面外侧的通量，并解释符号的意义。
 
 ---
 
@@ -480,5 +501,82 @@ $$\frac{\partial\varphi}{\partial y} = x^2 + \frac{\partial g}{\partial y} = x^2
 $$\frac{\partial\varphi}{\partial z} = 3xz^2 + h'(z) = 3xz^2 \Rightarrow h'(z) = 0 \Rightarrow h = C$$
 
 故势函数为 $\varphi = x^2y + xz^3 + C$。
+
+---
+
+**6.** 采用球坐标参数化上半球：
+$$
+x=\sin\varphi\cos\theta,\quad y=\sin\varphi\sin\theta,\quad z=\cos\varphi,
+$$
+其中
+$$
+0\le \theta\le 2\pi,\qquad 0\le \varphi\le \frac{\pi}{2}.
+$$
+
+球面元为
+$$
+dS=\sin\varphi\,d\varphi\,d\theta.
+$$
+
+因此
+$$
+\iint_S z\,dS
+=\int_0^{2\pi}\int_0^{\pi/2}\cos\varphi\sin\varphi\,d\varphi\,d\theta.
+$$
+
+先对 $\varphi$ 积分：
+$$
+\int_0^{\pi/2}\cos\varphi\sin\varphi\,d\varphi=\frac12.
+$$
+
+于是
+$$
+\iint_S z\,dS=2\pi\cdot \frac12=\pi.
+$$
+
+---
+
+**7.** 用 Gauss 公式。对
+$$
+\mathbf{F}=(x,y,z),
+$$
+有
+$$
+\nabla\cdot \mathbf{F}=1+1+1=3.
+$$
+
+半径为 $R$ 的球体体积为
+$$
+V=\frac{4}{3}\pi R^3.
+$$
+
+故外侧通量
+$$
+\oiint_S \mathbf{F}\cdot d\mathbf{S}
+=\iiint_V (\nabla\cdot \mathbf{F})\,dV
+=3\cdot \frac{4}{3}\pi R^3
+=4\pi R^3.
+$$
+
+---
+
+**8.** 对向量场
+$$
+\mathbf{F}=-\lambda(x,y,z),
+$$
+有
+$$
+\nabla\cdot \mathbf{F}=-\lambda-\lambda-\lambda=-3\lambda.
+$$
+
+由 Gauss 公式，
+$$
+\oiint_S \mathbf{F}\cdot d\mathbf{S}
+=\iiint_V (-3\lambda)\,dV
+=-3\lambda\cdot \frac{4}{3}\pi R^3
+=-4\pi\lambda R^3.
+$$
+
+结果为负，说明相对于外法向，净流量指向球内，也就是整个流场在把质量向原点收缩。这正符合扩散反演或收缩动力系统中的“向中心汇聚”直觉。
 
 </details>

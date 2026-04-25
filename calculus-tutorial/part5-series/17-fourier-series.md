@@ -384,7 +384,7 @@ $$\frac{1}{l} \int_{-l}^{l} [f(x)]^2 \, dx = \frac{a_0^2}{2} + \sum_{n=1}^{\inft
 
 ### 17.5.3 应用举例
 
-> **例题 17.10** 利用 $f(x) = x$（$-\pi < x < \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^2}$。
+> **例题 17.8** 利用 $f(x) = x$（$-\pi < x < \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^2}$。
 
 **解**：由例题 17.1，$f(x) = x$ 的 Fourier 系数为 $a_n = 0$（$n \geq 0$），$b_n = \dfrac{2(-1)^{n+1}}{n}$。
 
@@ -402,7 +402,7 @@ $$\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}$$
 
 这提供了 Basel 问题的另一种优雅证法。
 
-> **例题 17.11** 利用 $f(x) = x^2$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^4}$。
+> **例题 17.9** 利用 $f(x) = x^2$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^4}$。
 
 **解**：由练习题第1题的结果，$f(x) = x^2$ 的 Fourier 系数为
 
@@ -432,7 +432,7 @@ $$\sum_{n=1}^{\infty} \frac{1}{n^4} = \frac{8\pi^4}{45 \times 16} = \frac{\pi^4}
 
 利用Fourier级数在特定点的收敛值，可以求某些数项级数的和。
 
-> **例题 17.8** 求级数 $\sum_{n=1}^{\infty} \dfrac{1}{n^2}$ 的和。
+> **例题 17.10** 求级数 $\sum_{n=1}^{\infty} \dfrac{1}{n^2}$ 的和。
 
 **解**：由例题17.2，对于 $f(x) = |x|$ 的Fourier展开，在 $x = \pi$ 处：
 
@@ -454,7 +454,7 @@ $$\sum_{n=1}^{\infty} \frac{1}{n^2} = 1 + \frac{1}{4} + \frac{1}{9} + \frac{1}{1
 
 这就是著名的**Basel问题**的解答。
 
-> **例题 17.9** 利用Fourier级数证明 $\sum_{n=1}^{\infty} \dfrac{(-1)^{n+1}}{n} = \ln 2$。
+> **例题 17.11** 利用Fourier级数证明 $\sum_{n=1}^{\infty} \dfrac{(-1)^{n+1}}{n} = \ln 2$。
 
 **解**：考虑 $f(x) = x$（$-\pi < x < \pi$）的Fourier级数（例题17.1）：
 
@@ -483,6 +483,116 @@ $$a_n \cos n\omega t + b_n \sin n\omega t = A_n \cos(n\omega t - \varphi_n)$$
 
 其中**振幅** $A_n = \sqrt{a_n^2 + b_n^2}$，**相位** $\varphi_n = \arctan\dfrac{b_n}{a_n}$。
 
+### 17.6.3 从 Fourier 级数到 Fourier 变换
+
+Fourier 级数处理的是**周期函数**：频率是离散的。而许多信号并不周期，此时更自然的对象是 **Fourier 变换**。
+
+可以把 Fourier 变换理解为“让周期 $T\to\infty$ 后，频率间隔越来越密，离散频谱极限地变成连续频谱”。
+
+连续 Fourier 变换定义为
+
+$$
+\hat f(\omega)=\int_{-\infty}^{+\infty} f(x)e^{-i\omega x}\,dx,
+$$
+
+逆变换为
+
+$$
+f(x)=\frac{1}{2\pi}\int_{-\infty}^{+\infty}\hat f(\omega)e^{i\omega x}\,d\omega.
+$$
+
+它把“时域/空域函数”转化为“频域函数”。
+
+一些最重要的性质：
+
+- 线性性
+- 时移对应相移
+- 微分对应乘以 $i\omega$
+- 缩放对应频谱伸缩
+- Parseval 定理仍成立，表达能量守恒
+
+> **例题 17.12** 说明为什么微分在频域里对应乘以 $i\omega$。
+
+**解**：对可积且足够光滑的 $f$，
+
+$$
+\mathcal F[f'](\omega)
+= \int_{-\infty}^{+\infty} f'(x)e^{-i\omega x}\,dx.
+$$
+
+分部积分得
+
+$$
+\mathcal F[f'](\omega)
+= \left[f(x)e^{-i\omega x}\right]_{-\infty}^{+\infty}
++ i\omega \int_{-\infty}^{+\infty} f(x)e^{-i\omega x}\,dx.
+$$
+
+若边界项消失，则
+
+$$
+\mathcal F[f'](\omega)=i\omega \hat f(\omega).
+$$
+
+这说明微分在频域里只是乘以一个频率因子，因此高频分量会被放大。$\square$
+
+### 17.6.4 卷积定理
+
+卷积定义为
+
+$$
+(f*g)(x)=\int_{-\infty}^{+\infty} f(\tau)g(x-\tau)\,d\tau.
+$$
+
+它在信号处理、概率论和神经网络里都极其常见。
+
+**卷积定理**：
+
+$$
+\mathcal F[f*g](\omega)=\hat f(\omega)\hat g(\omega).
+$$
+
+也就是说：
+
+> 时域卷积 = 频域逐点乘法
+
+反过来，
+
+$$
+\mathcal F[f\cdot g]=\frac{1}{2\pi}(\hat f * \hat g).
+$$
+
+这条定理之所以强大，是因为卷积本来是“滑动积分”，计算昂贵；但到频域后变成简单乘法。
+
+> **例题 17.13** 为什么大卷积核时 FFT 卷积更有优势？
+
+**解**：直接时域卷积需要对每个位置做一遍核大小量级的乘加，复杂度通常接近 $O(NK)$；FFT 卷积则先做 FFT，再做点乘，整体复杂度约为 $O(N\log N)$。当核很大时，后者更划算。$\square$
+
+### 17.6.5 DFT 与 FFT
+
+在计算机里，信号是离散的。因此实际实现常用 **离散 Fourier 变换（DFT）**：
+
+$$
+X[k]=\sum_{n=0}^{N-1}x[n]e^{-i2\pi kn/N},
+$$
+
+逆变换为
+
+$$
+x[n]=\frac1N\sum_{k=0}^{N-1}X[k]e^{i2\pi kn/N}.
+$$
+
+直接计算 DFT 需要 $O(N^2)$ 次操作。快速 Fourier 变换（FFT）利用分治思想把复杂度降到
+
+$$
+O(N\log N).
+$$
+
+这也是现代频域算法可用的关键。
+
+> ⚠️ **常见陷阱**
+> Fourier 级数在间断点处一般不收敛到函数值本身，而是收敛到左右极限的平均值。把这一点忘掉，会在分析方波、阶跃信号或注意力窗口化近似时得出错误结论。
+
 ---
 
 ## 本章小结
@@ -502,6 +612,11 @@ $$a_n \cos n\omega t + b_n \sin n\omega t = A_n \cos(n\omega t - \varphi_n)$$
 5. **Parseval 恒等式**：$\dfrac{1}{\pi}\int_{-\pi}^{\pi} [f(x)]^2 \, dx = \dfrac{a_0^2}{2} + \sum_{n=1}^{\infty}(a_n^2 + b_n^2)$，表达了时域能量与频域能量的守恒关系。
 
 6. **应用**：Fourier级数可用于求数项级数的和（如 $\sum \dfrac{1}{n^2} = \dfrac{\pi^2}{6}$、$\sum \dfrac{1}{n^4} = \dfrac{\pi^4}{90}$），以及信号的频谱分析。
+
+7. **连续 Fourier 变换与 FFT**：
+   - Fourier 变换把离散频谱推广为连续频谱
+   - 卷积定理把时域卷积转化为频域乘法
+   - FFT 是现代频域计算可行的核心算法
 
 ---
 
@@ -573,7 +688,25 @@ $$\mathbf{x} *_{\mathcal{G}} g = U \left( (U^\top \mathbf{x}) \odot (U^\top \mat
 
 GCN（Chebyshev 近似版本）通过截断 Chebyshev 多项式展开，将谱方法转化为局部空域操作，避免了完整特征分解的 $O(n^3)$ 计算开销，成为现代图神经网络的理论基础。
 
-### 17.7.5 代码示例
+### 17.7.5 扩散模型的频率行为
+
+扩散模型的去噪过程常表现出一个经验规律：先恢复低频结构，再补高频细节。
+
+这可以用 Fourier 视角理解：
+
+- 白噪声在各频率上近似均匀分布
+- 自然图像的功率谱通常更偏向低频
+- 因此低频成分在加噪后信噪比相对更高，更容易先被恢复
+
+这也解释了为什么扩散模型生成图片时，常常先出现整体轮廓，再逐渐长出边缘、纹理和局部细节。
+
+从工程角度看，Fourier 分析为以下问题提供了语言：
+
+- 噪声调度是否让高频损失过大
+- 采样步数减少后，是否优先损伤高频细节
+- 频域损失能否更直接约束感知质量
+
+### 17.7.6 代码示例
 
 ```python
 import torch
@@ -651,17 +784,21 @@ print("频域结果:", y_freq[:len(x)])  # 截取有效部分
 
 ## 练习题
 
-**1.** 将函数 $f(x) = x^2$（$-\pi \leq x \leq \pi$），以 $2\pi$ 为周期延拓，求其Fourier级数。
+**1.** ⭐ 将函数 $f(x) = x^2$（$-\pi \leq x \leq \pi$），以 $2\pi$ 为周期延拓，求其Fourier级数。
 
-**2.** 将函数 $f(x) = e^x$（$-\pi < x < \pi$），以 $2\pi$ 为周期延拓，求其Fourier级数。
+**2.** ⭐ 将函数 $f(x) = e^x$（$-\pi < x < \pi$），以 $2\pi$ 为周期延拓，求其Fourier级数。
 
-**3.** 将 $f(x) = \pi - x$（$0 < x < \pi$）展开为正弦级数。
+**3.** ⭐ 将 $f(x) = \pi - x$（$0 < x < \pi$）展开为正弦级数。
 
-**4.** 利用第1题的结果，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^4}$ 的值。
+**4.** ⭐⭐ 利用第1题的结果，求 $\sum_{n=1}^{\infty} \dfrac{1}{n^4}$ 的值。
 
-**5.** 设 $f(x) = \begin{cases} 0, & -\pi \leq x < 0 \\ 1, & 0 \leq x \leq \pi \end{cases}$，以 $2\pi$ 为周期延拓，求其Fourier级数，并求 $\sum_{n=0}^{\infty} \dfrac{(-1)^n}{2n+1}$ 的值。
+**5.** ⭐⭐ 设 $f(x) = \begin{cases} 0, & -\pi \leq x < 0 \\ 1, & 0 \leq x \leq \pi \end{cases}$，以 $2\pi$ 为周期延拓，求其Fourier级数，并求 $\sum_{n=0}^{\infty} \dfrac{(-1)^n}{2n+1}$ 的值。
 
-**6.** 利用 $f(x) = |x|$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=0}^{\infty} \dfrac{1}{(2n+1)^4}$。
+**6.** ⭐⭐ 利用 $f(x) = |x|$（$-\pi \leq x \leq \pi$）的 Fourier 展开和 Parseval 恒等式，求 $\sum_{n=0}^{\infty} \dfrac{1}{(2n+1)^4}$。
+
+**7.** ⭐⭐⭐ 写出连续 Fourier 变换的定义，并说明它与 Fourier 级数的核心区别。
+
+**8.** ⭐⭐⭐ 解释为什么卷积定理能为大卷积核 CNN 提供频域加速。
 
 ---
 
@@ -757,5 +894,19 @@ $$\frac{1}{\pi} \int_{-\pi}^{\pi} x^2 \, dx = \frac{\pi^2}{2} + \sum_{k=0}^{\inf
 $$\frac{16}{\pi^2} \sum_{k=0}^{\infty} \frac{1}{(2k+1)^4} = \frac{2\pi^2}{3} - \frac{\pi^2}{2} = \frac{\pi^2}{6}$$
 
 $$\sum_{k=0}^{\infty} \frac{1}{(2k+1)^4} = \frac{\pi^4}{96}$$
+
+---
+
+**7.** 连续 Fourier 变换定义为
+
+$$
+\hat f(\omega)=\int_{-\infty}^{+\infty} f(x)e^{-i\omega x}\,dx.
+$$
+
+它与 Fourier 级数的区别在于：Fourier 级数处理周期函数，频率是离散的；Fourier 变换处理非周期函数，频率变量 $\omega$ 连续取值。
+
+---
+
+**8.** 卷积在时域里是滑动积分或滑动求和，计算量较大；根据卷积定理，先做 FFT 到频域后，卷积变成逐点乘法，再逆变换回来即可。当卷积核较大时，这通常比直接时域卷积更快，因此频域方法常用于大核卷积或长序列卷积。
 
 </details>

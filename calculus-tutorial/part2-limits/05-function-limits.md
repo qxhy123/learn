@@ -403,6 +403,25 @@ $$\log(p + \varepsilon), \quad \varepsilon \to 0^+$$
 
 当 $p > 0$ 时，$\lim_{\varepsilon \to 0^+} \log(p + \varepsilon) = \log p$，数值上用 $\varepsilon = 10^{-8}$ 等小量来保证计算稳定。
 
+### Softmax 温度参数的极限行为
+
+设 logits 为 $z_1,\dots,z_K$，带温度参数 $\tau$ 的 softmax 为
+
+$$
+\mathrm{softmax}_\tau(z_i)=\frac{e^{z_i/\tau}}{\sum_j e^{z_j/\tau}}.
+$$
+
+它有两个非常重要的极限：
+
+1. 当 $\tau\to 0^+$ 时，最大 logit 的指数项会压倒其它项，输出趋向 one-hot。
+2. 当 $\tau\to+\infty$ 时，所有指数项都趋向 $1$，输出趋向均匀分布。
+
+这说明温度参数控制了“选择有多硬”：
+
+- 大温度：输出更平滑，适合知识蒸馏中的软标签
+- 小温度：输出更尖锐，更接近硬分类
+- Gumbel-Softmax 正是利用 $\tau\to 0$ 的极限来逼近离散采样
+
 ### 两个重要极限的应用
 
 **Sinc 函数与信号处理**
@@ -448,15 +467,27 @@ print(f"Sigmoid导数最大值: {sigmoid_grad.max():.4f}")  # ≈ 0.25
 
 ## 练习题
 
-**1.** 用 $\varepsilon$-$\delta$ 定义证明：$\lim_{x \to 3} (2x + 1) = 7$。
+**1.** ⭐ 用 $\varepsilon$-$\delta$ 定义证明：$\lim_{x \to 3} (2x + 1) = 7$。
 
-**2.** 求极限：$\lim_{x \to 1} \dfrac{x^3 - 1}{x^2 - 1}$。
+**2.** ⭐ 求极限：$\lim_{x \to 1} \dfrac{x^3 - 1}{x^2 - 1}$。
 
-**3.** 求极限：$\lim_{x \to 0} \dfrac{\sin 5x}{\sin 3x}$。
+**3.** ⭐ 求极限：$\lim_{x \to 0} \dfrac{\sin 5x}{\sin 3x}$。
 
-**4.** 求极限：$\lim_{x \to 0} \dfrac{\sqrt{1+x} - 1}{x}$。
+**4.** ⭐⭐ 求极限：$\lim_{x \to 0} \dfrac{\sqrt{1+x} - 1}{x}$。
 
-**5.** 求极限：$\lim_{x \to 0} \dfrac{e^{2x} - 1}{\tan x}$。
+**5.** ⭐⭐ 求极限：$\lim_{x \to 0} \dfrac{e^{2x} - 1}{\tan x}$。
+
+**6.** ⭐⭐ 求极限：
+$$
+\lim_{\tau\to+\infty}\frac{e^{z_i/\tau}}{\sum_{j=1}^K e^{z_j/\tau}}.
+$$
+
+**7.** ⭐⭐⭐ 设 $z_m=\max_j z_j$ 且唯一，说明为什么
+$$
+\lim_{\tau\to 0^+}\mathrm{softmax}_\tau(z_m)=1.
+$$
+
+**8.** ⭐⭐⭐ 解释为什么在计算 softmax 时，先减去 $\max_j z_j$ 不会改变结果。
 
 ---
 
@@ -506,5 +537,47 @@ $$\lim_{x \to 0} \frac{\sqrt{1+x} - 1}{x} = \lim_{x \to 0} \frac{1}{\sqrt{1+x} +
 
 因此：
 $$\lim_{x \to 0} \frac{e^{2x} - 1}{\tan x} = \lim_{x \to 0} \frac{2x}{x} = 2$$
+
+---
+
+**6.** 当 $\tau\to+\infty$ 时，对每个 $j$ 都有 $z_j/\tau\to 0$，故
+
+$$
+e^{z_j/\tau}\to 1.
+$$
+
+因此
+
+$$
+\lim_{\tau\to+\infty}\frac{e^{z_i/\tau}}{\sum_{j=1}^K e^{z_j/\tau}}
+= \frac{1}{K}.
+$$
+
+---
+
+**7.** 若 $z_m$ 唯一最大，则对任意 $j\neq m$，都有 $z_j-z_m<0$。于是
+
+$$
+\mathrm{softmax}_\tau(z_m)
+= \frac{1}{1+\sum_{j\neq m} e^{(z_j-z_m)/\tau}}.
+$$
+
+当 $\tau\to 0^+$ 时，每项 $e^{(z_j-z_m)/\tau}\to 0$，因此
+
+$$
+\lim_{\tau\to 0^+}\mathrm{softmax}_\tau(z_m)=1.
+$$
+
+---
+
+**8.** 记 $c=\max_j z_j$，则
+
+$$
+\frac{e^{z_i-c}}{\sum_j e^{z_j-c}}
+= \frac{e^{-c}e^{z_i}}{e^{-c}\sum_j e^{z_j}}
+= \frac{e^{z_i}}{\sum_j e^{z_j}}.
+$$
+
+分子分母同时乘了同一个非零常数，所以结果不变。但由于 $z_i-c\leq 0$，指数项都不超过 $1$，从而避免数值溢出。
 
 </details>

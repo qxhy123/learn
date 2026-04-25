@@ -266,4 +266,41 @@ $$\sinh x = \frac{e^x - e^{-x}}{2}, \quad \cosh x = \frac{e^x + e^{-x}}{2}$$
 
 ---
 
+## 11. 矩阵微积分常用公式（A.7）
+
+| 公式 | 说明 |
+|:---|:---|
+| $\dfrac{\partial (Ax)}{\partial x} = A$ | 线性层对输入的 Jacobian |
+| $\dfrac{\partial (x^\top a)}{\partial x} = a$ | 向量内积求导 |
+| $\dfrac{\partial (x^\top A x)}{\partial x} = (A + A^\top)x$ | 对称矩阵时化为 $2Ax$ |
+| $\dfrac{\partial \operatorname{tr}(AB)}{\partial A} = B^\top$ | 迹技巧基础公式 |
+| $\dfrac{\partial \operatorname{tr}(ABA^\top)}{\partial A} = A(B + B^\top)$ | 常见二次型矩阵求导 |
+| $\dfrac{\partial \ln|A|}{\partial A} = A^{-\top}$ | 对数行列式求导 |
+| $\dfrac{\partial A^{-1}}{\partial t} = -A^{-1}\left(\dfrac{\partial A}{\partial t}\right)A^{-1}$ | 逆矩阵微分公式 |
+
+---
+
+## 12. 概率分布积分公式（A.8）
+
+| 公式 | 说明 |
+|:---|:---|
+| $\displaystyle \int_{-\infty}^{+\infty} e^{-ax^2}\,dx = \sqrt{\frac{\pi}{a}} \quad (a>0)$ | 高斯积分 |
+| $\displaystyle \Gamma(n) = \int_0^\infty t^{n-1}e^{-t}\,dt = (n-1)! \quad (n\in\mathbb{N}^+)$ | Gamma 函数 |
+| $\displaystyle B(\alpha,\beta) = \int_0^1 t^{\alpha-1}(1-t)^{\beta-1}\,dt = \frac{\Gamma(\alpha)\Gamma(\beta)}{\Gamma(\alpha+\beta)}$ | Beta 函数 |
+| $\displaystyle \mathrm{KL}\!\left(\mathcal N(\mu_1,\sigma_1^2)\|\mathcal N(\mu_2,\sigma_2^2)\right) = \ln\frac{\sigma_2}{\sigma_1} + \frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2} - \frac12$ | 一维高斯 KL 散度 |
+
+---
+
+## 13. 常用不等式（A.9）
+
+| 不等式 | 形式 |
+|:---|:---|
+| AM-GM | $\displaystyle \frac{a+b}{2} \ge \sqrt{ab}$ |
+| Cauchy-Schwarz | $\displaystyle |\langle x,y\rangle| \le \|x\|\,\|y\|$ |
+| Jensen | $\displaystyle f(\mathbb E[X]) \le \mathbb E[f(X)]$（$f$ 为凸函数） |
+| Young | $\displaystyle ab \le \frac{a^p}{p} + \frac{b^q}{q}, \quad \frac{1}{p}+\frac{1}{q}=1$ |
+| Hölder | $\displaystyle \|fg\|_1 \le \|f\|_p\,\|g\|_q, \quad \frac{1}{p}+\frac{1}{q}=1$ |
+
+---
+
 > 本速查表涵盖微积分核心公式，供复习和快速查阅使用。

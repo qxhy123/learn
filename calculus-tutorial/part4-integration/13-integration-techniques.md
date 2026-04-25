@@ -655,15 +655,35 @@ def flow_log_prob(z, flow_layers):
 
 ## 练习题
 
-**1.** 求不定积分：$\int \dfrac{x^2 + 1}{x(x-1)^2} \, dx$。
+**1.** ⭐ 求不定积分：$\int \dfrac{x^2 + 1}{x(x-1)^2} \, dx$。
 
-**2.** 求不定积分：$\int \sin^4 x \cos^3 x \, dx$。
+**2.** ⭐ 求不定积分：$\int \sin^4 x \cos^3 x \, dx$。
 
-**3.** 求不定积分：$\int \dfrac{1}{2 + \sin x} \, dx$。
+**3.** ⭐ 求不定积分：$\int \dfrac{1}{2 + \sin x} \, dx$。
 
-**4.** 计算定积分：$\int_0^{\pi/2} \sin^4 x \cos^2 x \, dx$。
+**4.** ⭐⭐ 计算定积分：$\int_0^{\pi/2} \sin^4 x \cos^2 x \, dx$。
 
-**5.** 计算定积分：$\int_0^{\pi} \dfrac{x}{1 + \sin x} \, dx$。
+**5.** ⭐⭐ 计算定积分：$\int_0^{\pi} \dfrac{x}{1 + \sin x} \, dx$。
+
+**6.** ⭐⭐ 求不定积分：
+$$
+\int \frac{dx}{x^2-1}.
+$$
+
+**7.** ⭐⭐⭐ 求不定积分：
+$$
+\int \frac{dx}{1+\sin x}.
+$$
+
+**8.** ⭐⭐⭐ softplus 函数定义为
+$$
+\operatorname{softplus}(x)=\ln(1+e^x).
+$$
+利用积分技巧计算
+$$
+\int \frac{1}{1+e^{-x}}\,dx.
+$$
+并说明它与 softplus 的关系。
 
 ---
 
@@ -729,5 +749,82 @@ $$I = \int_0^{\pi} \frac{\pi - t}{1 + \sin(\pi - t)} \, dt = \int_0^{\pi} \frac{
 $$\int_0^{\pi} \frac{1}{1 + \sin x} \, dx = \int_0^{+\infty} \frac{1}{1 + \frac{2t}{1+t^2}} \cdot \frac{2}{1+t^2} \, dt = \int_0^{+\infty} \frac{2}{(1+t)^2} \, dt = -\frac{2}{1+t}\Big|_0^{+\infty} = 2$$
 
 故 $I = \dfrac{\pi \cdot 2}{2} = \pi$。
+
+---
+
+**6.** 作部分分式分解：
+$$
+\frac{1}{x^2-1}=\frac{1}{(x-1)(x+1)}=\frac{A}{x-1}+\frac{B}{x+1}.
+$$
+
+通分得
+$$
+1=A(x+1)+B(x-1).
+$$
+
+令 $x=1$，得 $A=\dfrac12$；令 $x=-1$，得 $B=-\dfrac12$。
+
+所以
+$$
+\int \frac{dx}{x^2-1}
+=\frac12\int \frac{dx}{x-1}-\frac12\int \frac{dx}{x+1}
+=\frac12\ln|x-1|-\frac12\ln|x+1|+C.
+$$
+
+即
+$$
+\int \frac{dx}{x^2-1}
+=\frac12\ln\left|\frac{x-1}{x+1}\right|+C.
+$$
+
+---
+
+**7.** 乘以共轭式：
+$$
+\frac{1}{1+\sin x}
+=\frac{1-\sin x}{1-\sin^2 x}
+=\frac{1-\sin x}{\cos^2 x}
+=\sec^2 x-\sec x\tan x.
+$$
+
+因此
+$$
+\int \frac{dx}{1+\sin x}
+=\int (\sec^2 x-\sec x\tan x)\,dx
+=\tan x-\sec x+C.
+$$
+
+---
+
+**8.** 注意
+$$
+\frac{1}{1+e^{-x}}=\frac{e^x}{1+e^x}.
+$$
+
+令
+$$
+u=1+e^x,\qquad du=e^x\,dx.
+$$
+
+则
+$$
+\int \frac{1}{1+e^{-x}}\,dx
+=\int \frac{e^x}{1+e^x}\,dx
+=\int \frac{du}{u}
+=\ln|u|+C.
+$$
+
+由于 $1+e^x>0$，所以
+$$
+\int \frac{1}{1+e^{-x}}\,dx
+=\ln(1+e^x)+C.
+$$
+
+这正是 softplus 函数加一个常数：
+$$
+\operatorname{softplus}(x)=\ln(1+e^x).
+$$
+
+因此 softplus 可以看作 sigmoid 的一个原函数。
 
 </details>

@@ -416,7 +416,38 @@ $$\tilde{g} = \begin{cases} g, & \|g\|_2 \leq c \\ \dfrac{c}{\|g\|_2} g, & \|g\|
 
 这保证了参数更新量构成的级数 $\sum_{t=1}^{\infty} \|\Delta\theta_t\|$ 有上界，从而保证训练过程中参数序列的收敛性。
 
-### 15.6.5 代码示例
+### 15.6.5 LoRA 的低秩近似与级数截断
+
+把一个矩阵写成奇异值分解
+
+$$
+W = U\Sigma V^\top = \sum_{i=1}^{r} \sigma_i u_i v_i^\top
+$$
+
+可以把它看成一种“矩阵级数”。若只保留前 $k$ 项，就得到低秩近似
+
+$$
+W_k=\sum_{i=1}^{k}\sigma_i u_i v_i^\top.
+$$
+
+这和普通级数中“截断到前 $k$ 项”非常类似：
+
+- 奇异值衰减快，少量项就能逼近得很好
+- 奇异值衰减慢，则需要更多项
+
+LoRA（Low-Rank Adaptation）并不显式地对大矩阵做完整 SVD，而是直接学习低秩增量
+
+$$
+\Delta W = BA,
+$$
+
+其中 $B\in\mathbb R^{n\times r},\ A\in\mathbb R^{r\times m}$，$r$ 很小。
+
+因此 LoRA 的数学直觉可以概括为：
+
+> 大模型参数更新往往主要集中在少数“主方向”上，类似于一个快速收敛的矩阵级数，截断后仍能保留主要信息。
+
+### 15.6.6 代码示例
 
 以下代码展示了 ResNet 的级数结构，以及梯度裁剪在训练中的应用：
 
@@ -472,17 +503,19 @@ def train_with_gradient_clipping(model, optimizer, loss_fn, x, y, max_norm=1.0):
 
 **1.** ⭐ 判断级数 $\sum_{n=1}^{\infty} \dfrac{1}{n(n+1)}$ 的收敛性，若收敛求其和。
 
-**2.** ⭐⭐ 用比值判别法判断级数 $\sum_{n=1}^{\infty} \dfrac{n^2}{2^n}$ 的收敛性。
+**2.** ⭐ 用比值判别法判断级数 $\sum_{n=1}^{\infty} \dfrac{n^2}{2^n}$ 的收敛性。
 
-**3.** ⭐⭐ 判断级数 $\sum_{n=1}^{\infty} \dfrac{(-1)^{n-1}}{\sqrt{n}}$ 是绝对收敛、条件收敛还是发散。
+**3.** ⭐ 判断级数 $\sum_{n=1}^{\infty} \dfrac{(-1)^{n-1}}{\sqrt{n}}$ 是绝对收敛、条件收敛还是发散。
 
 **4.** ⭐⭐ 用根值判别法判断级数 $\sum_{n=1}^{\infty} \left(\dfrac{n+1}{3n}\right)^n$ 的收敛性。
 
-**5.** ⭐⭐⭐ 设 $\sum_{n=1}^{\infty} a_n$ 绝对收敛，证明 $\sum_{n=1}^{\infty} a_n^2$ 也收敛。
+**5.** ⭐⭐ 设 $\sum_{n=1}^{\infty} a_n$ 绝对收敛，证明 $\sum_{n=1}^{\infty} a_n^2$ 也收敛。
 
 **6.** ⭐⭐ 用积分判别法判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n(\ln n)^2}$ 的收敛性。
 
-**7.** ⭐⭐ 用积分判别法判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n \ln n \cdot \ln(\ln n)}$ 的收敛性。
+**7.** ⭐⭐⭐ 用积分判别法判断级数 $\sum_{n=2}^{\infty} \dfrac{1}{n \ln n \cdot \ln(\ln n)}$ 的收敛性。
+
+**8.** ⭐⭐⭐ 解释为什么 LoRA 可以看作对“矩阵级数”的低阶截断近似。
 
 ---
 
@@ -556,5 +589,21 @@ $$\int_2^{\infty} \frac{dx}{x(\ln x)^2} = \left[-\frac{1}{\ln x}\right]_2^{\inft
 $$\int_3^{\infty} \frac{dx}{x \ln x \cdot \ln(\ln x)} = \int_{\ln(\ln 3)}^{\infty} \frac{du}{u} = +\infty$$
 
 广义积分发散，由积分判别法，级数**发散**。
+
+---
+
+**8.** 矩阵的奇异值分解
+
+$$
+W=\sum_{i=1}^{r}\sigma_i u_i v_i^\top
+$$
+
+可以看作一个“矩阵级数”。如果主要信息集中在前几个奇异值对应的方向上，那么只保留前 $k$ 项就已经能近似重构原矩阵：
+
+$$
+W_k=\sum_{i=1}^{k}\sigma_i u_i v_i^\top.
+$$
+
+LoRA 学习低秩增量 $\Delta W=BA$，本质上是在假设“真正需要更新的方向远少于完整矩阵自由度”，因此只保留少量主方向就够了。这和普通级数中“截断到低阶项但仍保留主要贡献”是完全类似的思想。
 
 </details>

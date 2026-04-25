@@ -143,6 +143,9 @@ $$\frac{dy}{dx} = \frac{dy}{du} \cdot \frac{du}{dv} \cdot \frac{dv}{dx} = f'(u) 
 
 $$y' = \frac{1}{u} \cdot (-\sin v) \cdot e^x = \frac{-\sin(e^x) \cdot e^x}{\cos(e^x)} = -e^x \tan(e^x)$$
 
+> ⚠️ **常见陷阱**
+> 链式法则里最容易漏掉的是“中间变量本身还依赖 $x$”。尤其在多路径依赖里，$\dfrac{\partial f}{\partial x}$ 与 $\dfrac{df}{dx}$ 不是一回事：若还有其它变量依赖于 $x$，全导数必须把所有路径贡献都加上。
+
 ---
 
 ## 8.3 反函数求导法则
@@ -544,18 +547,24 @@ print(f"二阶导数 d²(x³)/dx² = 6x = {grad2.item():.1f}")
 
 ## 练习题
 
-**1.** 求下列函数的导数：
+**1.** ⭐ 求下列函数的导数：
    (a) $y = x^3 \ln x$
    (b) $y = \dfrac{e^x}{1 + x^2}$
    (c) $y = \sin^3(2x)$
 
-**2.** 设 $x^3 + y^3 = 3xy$，求 $\dfrac{dy}{dx}$。
+**2.** ⭐ 设 $x^3 + y^3 = 3xy$，求 $\dfrac{dy}{dx}$。
 
-**3.** 求 $y = (\sin x)^x$（$0 < x < \pi$）的导数。
+**3.** ⭐ 求 $y = (\sin x)^x$（$0 < x < \pi$）的导数。
 
-**4.** 设 $x = \ln(1 + t^2)$，$y = t - \arctan t$，求 $\dfrac{dy}{dx}$ 和 $\dfrac{d^2y}{dx^2}$。
+**4.** ⭐⭐ 设 $x = \ln(1 + t^2)$，$y = t - \arctan t$，求 $\dfrac{dy}{dx}$ 和 $\dfrac{d^2y}{dx^2}$。
 
-**5.** 求 $y = x^2 \sin x$ 的 $n$ 阶导数（$n \geq 2$）。
+**5.** ⭐⭐ 求 $y = x^2 \sin x$ 的 $n$ 阶导数（$n \geq 2$）。
+
+**6.** ⭐⭐ 设 $z=f(x,y)$，其中 $y=y(x)$，写出 $\dfrac{dz}{dx}$ 的链式法则。
+
+**7.** ⭐⭐⭐ 求 $y=(1+x)^{\sin x}$ 的导数。
+
+**8.** ⭐⭐⭐ 解释为什么反向传播本质上是链式法则在多层复合函数上的系统应用。
 
 ---
 
@@ -643,5 +652,67 @@ $$y^{(n)} = x^2 \sin\left(x + \frac{n\pi}{2}\right) + 2nx \sin\left(x + \frac{(n
 利用 $\sin\left(x + \dfrac{(n-1)\pi}{2}\right) = \cos\left(x + \dfrac{(n-2)\pi}{2}\right)$ 和 $\sin\left(x + \dfrac{(n-2)\pi}{2}\right) = -\cos\left(x + \dfrac{(n-1)\pi}{2}\right)$，可进一步化简为：
 
 $$y^{(n)} = (x^2 - n^2 + n) \sin\left(x + \frac{n\pi}{2}\right) + 2nx \cos\left(x + \frac{n\pi}{2}\right)$$
+
+---
+
+**6.** 若 $z=f(x,y)$ 且 $y=y(x)$，则 $z$ 既直接依赖 $x$，也通过 $y$ 间接依赖 $x$。因此全导数为
+
+$$
+\frac{dz}{dx}
+=
+\frac{\partial z}{\partial x}
+ +
+ \frac{\partial z}{\partial y}\frac{dy}{dx}.
+$$
+
+这正是“偏导 + 链式法则”的组合形式。
+
+---
+
+**7.** $y=(1+x)^{\sin x}$。
+
+取对数：
+
+$$
+\ln y=\sin x\cdot \ln(1+x).
+$$
+
+两边求导：
+
+$$
+\frac{y'}{y}
+=
+\cos x\ln(1+x)+\sin x\cdot \frac{1}{1+x}.
+$$
+
+因此
+
+$$
+y'
+=
+(1+x)^{\sin x}\left[\cos x\ln(1+x)+\frac{\sin x}{1+x}\right].
+$$
+
+---
+
+**8.** 设多层网络的损失写成
+
+$$
+L = f_m\bigl(f_{m-1}(\cdots f_2(f_1(x))\cdots)\bigr).
+$$
+
+若要求某一层参数 $\theta_k$ 对损失的影响，就必须沿着“参数 $\to$ 当前层输出 $\to$ 后续层输出 $\to$ 损失”的整条路径逐层相乘：
+
+$$
+\frac{\partial L}{\partial \theta_k}
+=
+\frac{\partial L}{\partial h_m}
+\cdot \frac{\partial h_m}{\partial h_{m-1}}
+\cdot \cdots
+\cdot \frac{\partial h_{k+1}}{\partial h_k}
+\cdot \frac{\partial h_k}{\partial \theta_k}.
+$$
+
+这正是链式法则。所谓反向传播，只是把这种多层复合函数的求导过程系统化、程序化：从输出层开始，把“上游梯度”逐层乘以本层的局部导数，再传回前一层。因此它的数学本质不是新的法则，而是链式法则在计算图上的高效实现。
 
 </details>

@@ -363,6 +363,107 @@ $$\oint_C \mathbf{F} \cdot d\mathbf{r} = \iint_S (\nabla \times \mathbf{F}) \cdo
 
 ---
 
+## 22.5 微分形式初步（选读）
+
+### 22.5.1 为什么需要统一语言
+
+到目前为止，我们已经见过几类看似不同的公式：
+
+- 微积分基本定理：区间上的积分与端点有关
+- Green 公式：平面区域上的积分与边界曲线有关
+- Gauss / Stokes 公式：空间体或曲面上的积分与边界有关
+
+它们的共同骨架都是：
+
+> 区域内部某种“微分”的积分，等于边界上的积分。
+
+微分形式（differential forms）正是用来把这些定理统一成一句话的工具：
+
+$$
+\int_{\partial \Omega}\omega=\int_\Omega d\omega.
+$$
+
+### 22.5.2 0-形式、1-形式与 2-形式
+
+- **0-形式**：普通标量函数 $f$
+- **1-形式**：例如
+  $$
+  \omega=P\,dx+Q\,dy+R\,dz
+  $$
+  它与线积分最接近
+- **2-形式**：例如
+  $$
+  \eta=P\,dy\wedge dz+Q\,dz\wedge dx+R\,dx\wedge dy
+  $$
+  它与通量积分最接近
+
+其中 $\wedge$ 是楔积，满足反交换性：
+
+$$
+dx\wedge dy = -dy\wedge dx.
+$$
+
+### 22.5.3 外微分与 $d^2=0$
+
+外微分 $d$ 会把 $k$-形式变成 $(k+1)$-形式。
+
+对标量函数 $f$，
+
+$$
+df=f_x\,dx+f_y\,dy+f_z\,dz,
+$$
+
+它实际上对应梯度。
+
+对二维 1-形式
+
+$$
+\omega=P\,dx+Q\,dy,
+$$
+
+有
+
+$$
+d\omega = \left(\frac{\partial Q}{\partial x}-\frac{\partial P}{\partial y}\right)dx\wedge dy.
+$$
+
+这个系数就是二维旋度的核心部分。
+
+更深刻的性质是
+
+$$
+d^2=0.
+$$
+
+它统一解释了熟悉恒等式：
+
+- $\mathrm{curl}(\nabla f)=0$
+- $\mathrm{div}(\mathrm{curl}\,F)=0$
+
+因为它们都对应“再做一次外微分必为零”。
+
+> **例题 22.9** 设 $\omega=x\,dy-y\,dx$，求 $d\omega$。
+
+**解**：这里 $P=-y,\ Q=x$，故
+
+$$
+d\omega
+= \left(\frac{\partial Q}{\partial x}-\frac{\partial P}{\partial y}\right)dx\wedge dy
+= (1-(-1))dx\wedge dy
+= 2\,dx\wedge dy.
+$$
+
+这说明该 1-形式对应的“局部旋转密度”是常数 $2$。$\square$
+
+> **统一视角**：
+> - 一维：$\int_a^b df = f(b)-f(a)$
+> - 二维：$\int_{\partial S}\omega = \int_S d\omega$
+> - 三维：$\int_{\partial V}\eta = \int_V d\eta$
+>
+> 这就是同一个广义 Stokes 定理在不同维度上的表现。
+
+---
+
 ## 本章小结
 
 1. **标量场与向量场**是场论的基本对象。标量场的等值面和向量场的场线是可视化场的重要工具。
@@ -384,6 +485,12 @@ $$\oint_C \mathbf{F} \cdot d\mathbf{r} = \iint_S (\nabla \times \mathbf{F}) \cdo
    - $\nabla \cdot (\nabla \times \mathbf{F}) = 0$（旋度场必无源）
 
 6. **三大积分定理的统一**：Green、Gauss、Stokes 公式都是微积分基本定理在高维的推广，体现了"区域上的积分 = 边界上的积分"这一核心思想。
+
+7. **微分形式**为这些定理提供了统一表达：广义 Stokes 定理
+   $$
+   \int_{\partial \Omega}\omega=\int_\Omega d\omega
+   $$
+   把一维、二维、三维的结论看成同一结构在不同维度下的体现。
 
 ---
 
@@ -505,15 +612,25 @@ $$\oint_{\partial S} \mathbf{F} \cdot d\mathbf{r} = \iint_S (\nabla \times \math
 
 ## 练习题
 
-**1.** 设 $f(x, y, z) = x^2y + yz^2$，求 $\nabla f$ 和 $\nabla^2 f$。
+**1.** ⭐ 设 $f(x, y, z) = x^2y + yz^2$，求 $\nabla f$ 和 $\nabla^2 f$。
 
-**2.** 设 $\mathbf{F} = (x^2 + y)\,\mathbf{i} + (y^2 + z)\,\mathbf{j} + (z^2 + x)\,\mathbf{k}$，求 $\nabla \cdot \mathbf{F}$ 和 $\nabla \times \mathbf{F}$。
+**2.** ⭐ 设 $\mathbf{F} = (x^2 + y)\,\mathbf{i} + (y^2 + z)\,\mathbf{j} + (z^2 + x)\,\mathbf{k}$，求 $\nabla \cdot \mathbf{F}$ 和 $\nabla \times \mathbf{F}$。
 
-**3.** 验证向量场 $\mathbf{F} = yz\,\mathbf{i} + xz\,\mathbf{j} + xy\,\mathbf{k}$ 是无旋场，并求其势函数 $\varphi$ 使得 $\mathbf{F} = \nabla\varphi$。
+**3.** ⭐ 验证向量场 $\mathbf{F} = yz\,\mathbf{i} + xz\,\mathbf{j} + xy\,\mathbf{k}$ 是无旋场，并求其势函数 $\varphi$ 使得 $\mathbf{F} = \nabla\varphi$。
 
-**4.** 用 Gauss 公式计算 $\displaystyle\oiint_S (x^2\,dy\,dz + y^2\,dz\,dx + z^2\,dx\,dy)$，其中 $S$ 是立方体 $0 \leq x, y, z \leq 1$ 的表面外侧。
+**4.** ⭐⭐ 用 Gauss 公式计算 $\displaystyle\oiint_S (x^2\,dy\,dz + y^2\,dz\,dx + z^2\,dx\,dy)$，其中 $S$ 是立方体 $0 \leq x, y, z \leq 1$ 的表面外侧。
 
-**5.** 设 $\mathbf{F} = (y - z)\,\mathbf{i} + (z - x)\,\mathbf{j} + (x - y)\,\mathbf{k}$，用 Stokes 公式计算 $\displaystyle\oint_C \mathbf{F} \cdot d\mathbf{r}$，其中 $C$ 是圆周 $x^2 + y^2 = 1$，$z = 0$（逆时针方向）。
+**5.** ⭐⭐ 设 $\mathbf{F} = (y - z)\,\mathbf{i} + (z - x)\,\mathbf{j} + (x - y)\,\mathbf{k}$，用 Stokes 公式计算 $\displaystyle\oint_C \mathbf{F} \cdot d\mathbf{r}$，其中 $C$ 是圆周 $x^2 + y^2 = 1$，$z = 0$（逆时针方向）。
+
+**6.** ⭐⭐ 将 1-形式
+$$
+\omega=(x^2+y)\,dx+(x-y)\,dy
+$$
+写出 $d\omega$。
+
+**7.** ⭐⭐⭐ 说明为什么 $\mathrm{curl}(\nabla f)=0$ 可以看作 $d^2=0$ 的具体体现。
+
+**8.** ⭐⭐⭐ 举一个简单向量场的例子，解释它对应的 1-形式与线积分之间的关系。
 
 ---
 
@@ -582,5 +699,53 @@ $$= (-1 - 1)\mathbf{i} + (-1 - 1)\mathbf{j} + (-1 - 1)\mathbf{k} = -2\mathbf{i} 
 取曲面 $S$ 为圆盘 $x^2 + y^2 \leq 1$，$z = 0$，法向量 $\mathbf{n} = \mathbf{k}$（指向 $z$ 轴正向，与边界逆时针方向成右手系）。
 
 $$\oint_C \mathbf{F} \cdot d\mathbf{r} = \iint_S (\nabla \times \mathbf{F}) \cdot \mathbf{n}\,dS = \iint_S (-2)\,dS = -2 \cdot \pi \cdot 1^2 = -2\pi$$
+
+---
+
+**6.** 令 $P=x^2+y,\ Q=x-y$，则
+
+$$
+d\omega
+= \left(\frac{\partial Q}{\partial x}-\frac{\partial P}{\partial y}\right)dx\wedge dy
+= (1-1)dx\wedge dy = 0.
+$$
+
+---
+
+**7.** 对标量函数 $f$，先做一次外微分得 $df$，它对应梯度；再做一次外微分有
+
+$$
+d(df)=0.
+$$
+
+翻译回向量分析语言，就是
+
+$$
+\mathrm{curl}(\nabla f)=0.
+$$
+
+因此“梯度场必无旋”并不是孤立事实，而是 $d^2=0$ 的一个具体版本。
+
+---
+
+**8.** 例如平面向量场 $\mathbf F=(P,Q)$ 对应 1-形式
+
+$$
+\omega=P\,dx+Q\,dy.
+$$
+
+沿曲线 $\gamma$ 的线积分
+
+$$
+\int_\gamma \mathbf F\cdot d\mathbf r
+$$
+
+正好就是
+
+$$
+\int_\gamma \omega.
+$$
+
+因此 1-形式可以理解为“线积分对象”的统一写法。
 
 </details>

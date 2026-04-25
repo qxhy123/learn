@@ -420,11 +420,28 @@ for epoch in range(100):
 
 **2.** ⭐ 求极限：$\lim_{n \to \infty} \dfrac{n^2 - 2n + 3}{2n^2 + n - 1}$。
 
-**3.** ⭐⭐ 利用夹逼定理求：$\lim_{n \to \infty} \left(\dfrac{1}{n^2+1} + \dfrac{1}{n^2+2} + \cdots + \dfrac{1}{n^2+n}\right)$。
+**3.** ⭐ 利用夹逼定理求：$\lim_{n \to \infty} \left(\dfrac{1}{n^2+1} + \dfrac{1}{n^2+2} + \cdots + \dfrac{1}{n^2+n}\right)$。
 
 **4.** ⭐⭐ 设 $a_1 = \sqrt{2}$，$a_{n+1} = \sqrt{2 + a_n}$（$n \geq 1$）。证明数列 $\{a_n\}$ 收敛，并求其极限。
 
-**5.** ⭐⭐⭐ 设 $a_1 > 0$，$a_{n+1} = \dfrac{1}{2}\left(a_n + \dfrac{2}{a_n}\right)$。证明 $\{a_n\}$ 从第二项起单调递减且有下界，并求 $\lim_{n \to \infty} a_n$。
+**5.** ⭐⭐ 设 $a_1 > 0$，$a_{n+1} = \dfrac{1}{2}\left(a_n + \dfrac{2}{a_n}\right)$。证明 $\{a_n\}$ 从第二项起单调递减且有下界，并求 $\lim_{n \to \infty} a_n$。
+
+**6.** ⭐⭐ 求极限
+$$
+\lim_{n\to\infty}\left(1-\frac{1}{n}\right)^n.
+$$
+
+**7.** ⭐⭐⭐ 设数列满足
+$$
+a_{n+1}=\frac{a_n+3}{4}\qquad (n\ge 1),
+$$
+其中 $a_1$ 为任意实数。证明 $\{a_n\}$ 收敛，并求其极限。
+
+**8.** ⭐⭐⭐ 在梯度下降分析中，若误差序列满足
+$$
+e_{k+1}=0.8e_k,\qquad e_0=1,
+$$
+证明 $\{e_k\}$ 收敛到 $0$，并求使 $e_k<10^{-3}$ 的最小整数 $k$。
 
 ---
 
@@ -507,5 +524,94 @@ $$L = \frac{1}{2}\left(L + \frac{2}{L}\right)$$
 解得 $2L = L + \dfrac{2}{L}$，即 $L = \dfrac{2}{L}$，$L^2 = 2$。
 
 由于 $L > 0$，得 $L = \sqrt{2}$。 $\square$
+
+---
+
+**6.** 利用经典极限
+$$
+\lim_{n\to\infty}\left(1+\frac{1}{n}\right)^n=e.
+$$
+
+注意
+$$
+\left(1-\frac{1}{n}\right)^n
+=
+\left(\frac{n-1}{n}\right)^n
+=
+\frac{1}{\left(\frac{n}{n-1}\right)^n}
+=
+\frac{1}{\left(1+\frac{1}{n-1}\right)^n}.
+$$
+
+而
+$$
+\left(1+\frac{1}{n-1}\right)^n
+=
+\left(1+\frac{1}{n-1}\right)^{n-1}\left(1+\frac{1}{n-1}\right)\to e\cdot 1=e.
+$$
+
+因此
+$$
+\lim_{n\to\infty}\left(1-\frac{1}{n}\right)^n=\frac{1}{e}=e^{-1}.
+$$
+
+---
+
+**7.** 观察偏差：
+$$
+a_{n+1}-1=\frac{a_n+3}{4}-1=\frac{a_n-1}{4}.
+$$
+
+于是
+$$
+a_n-1=\frac{a_1-1}{4^{\,n-1}}.
+$$
+
+由于
+$$
+\frac{1}{4^{\,n-1}}\to 0,
+$$
+故
+$$
+a_n\to 1.
+$$
+
+所以数列 $\{a_n\}$ 收敛，极限为 $1$。
+
+---
+
+**8.** 由递推关系可知 $\{e_k\}$ 是等比数列：
+$$
+e_k=0.8^k.
+$$
+
+因为 $|0.8|<1$，所以
+$$
+\lim_{k\to\infty}e_k=\lim_{k\to\infty}0.8^k=0.
+$$
+
+要求
+$$
+e_k<10^{-3}
+\Longleftrightarrow
+0.8^k<10^{-3}.
+$$
+
+取对数得
+$$
+k\ln 0.8<\ln 10^{-3}.
+$$
+
+由于 $\ln 0.8<0$，不等号反向：
+$$
+k>\frac{\ln 10^{-3}}{\ln 0.8}\approx \frac{-6.9078}{-0.2231}\approx 30.96.
+$$
+
+故满足条件的最小整数是
+$$
+k=31.
+$$
+
+这说明当误差按固定比例衰减时，可以直接用等比数列估算训练迭代步数。
 
 </details>

@@ -395,6 +395,183 @@ $\square$
 
 ---
 
+## 14.6 含参量积分与积分-极限交换
+
+### 14.6.1 含参积分的连续性与可微性
+
+很多分析与机器学习中的积分并不是固定函数的积分，而是带参数的积分：
+
+$$
+I(\theta)=\int_a^b f(x,\theta)\,dx.
+$$
+
+我们自然会问：
+
+- 当 $\theta$ 变化时，$I(\theta)$ 是否连续？
+- 能否把对 $\theta$ 的导数直接推进积分号内部？
+
+在适当正则性条件下，可以。直观上需要：
+
+- $f(x,\theta)$ 对参数连续
+- $\dfrac{\partial f}{\partial \theta}$ 存在并连续
+- 它们都能被某个与参数无关的可积函数统一控制
+
+这时有 Leibniz 公式：
+
+$$
+\frac{d}{d\theta}\int_a^b f(x,\theta)\,dx
+= \int_a^b \frac{\partial f(x,\theta)}{\partial \theta}\,dx.
+$$
+
+若积分上下限也依赖参数，则
+
+$$
+\frac{d}{d\theta}\int_{a(\theta)}^{b(\theta)} f(x,\theta)\,dx
+= f(b(\theta),\theta)b'(\theta)
+- f(a(\theta),\theta)a'(\theta)
++ \int_{a(\theta)}^{b(\theta)} \frac{\partial f}{\partial \theta}(x,\theta)\,dx.
+$$
+
+> **例题 14.22** 设
+> $$
+> I(\alpha)=\int_0^\infty e^{-\alpha x}\sin x\,dx \qquad (\alpha>0),
+> $$
+> 计算 $I'(\alpha)$。
+
+**解**：因为被积函数与其对 $\alpha$ 的偏导都被可积函数控制，所以可将导数推进积分号内：
+
+$$
+I'(\alpha)
+= \int_0^\infty \frac{\partial}{\partial \alpha}
+\left(e^{-\alpha x}\sin x\right)\,dx
+= -\int_0^\infty x e^{-\alpha x}\sin x\,dx.
+$$
+
+另一方面，已知
+
+$$
+I(\alpha)=\frac{1}{1+\alpha^2},
+$$
+
+故
+
+$$
+I'(\alpha)=-\frac{2\alpha}{(1+\alpha^2)^2}.
+$$
+
+因此
+
+$$
+\int_0^\infty x e^{-\alpha x}\sin x\,dx
+= \frac{2\alpha}{(1+\alpha^2)^2}.
+$$
+
+$\square$
+
+### 14.6.2 积分与极限的交换
+
+另一个常见问题是：
+
+$$
+\lim_{n\to\infty}\int f_n(x)\,dx
+\overset{?}{=}
+\int \lim_{n\to\infty} f_n(x)\,dx.
+$$
+
+这个交换并不总是成立。成立时通常依赖某种“统一控制”。
+
+**直觉版控制收敛原则**：
+
+- 若 $f_n(x)\to f(x)$
+- 且存在可积函数 $g(x)$，使得对所有 $n$ 都有 $|f_n(x)|\leq g(x)$
+
+则常可交换极限与积分。
+
+**单调收敛直觉**：
+
+- 若 $f_n(x)\uparrow f(x)$
+- 且每个 $f_n\geq 0$
+
+则也常能交换顺序。
+
+虽然这些结论在严格意义上属于 Lebesgue 理论，但在当前阶段你至少应该建立如下习惯：
+
+> 交换顺序前，先找“统一上界”或“单调性”，而不是只看形式是否像。
+
+> ⚠️ **常见陷阱**
+> 交换积分与极限、求和或求导的顺序，不能只凭“写起来顺手”就默认成立。没有统一控制时，$\lim\int$ 和 $\int\lim$ 完全可能给出不同结果。
+
+> **例题 14.23** 构造一个不能交换极限与积分的反例。
+
+**解**：取
+
+$$
+f_n(x)=n\mathbf{1}_{(0,1/n)}(x),\qquad x\in(0,1).
+$$
+
+对每个固定的 $x>0$，当 $n$ 足够大时，$x\notin(0,1/n)$，所以
+
+$$
+f_n(x)\to 0.
+$$
+
+因此
+
+$$
+\int_0^1 \lim_{n\to\infty} f_n(x)\,dx = 0.
+$$
+
+但另一方面，
+
+$$
+\int_0^1 f_n(x)\,dx=\int_0^{1/n} n\,dx=1.
+$$
+
+故
+
+$$
+\lim_{n\to\infty}\int_0^1 f_n(x)\,dx = 1 \neq 0.
+$$
+
+这说明没有统一控制时，交换顺序会失败。$\square$
+
+### 14.6.3 AI 应用：REINFORCE、重参数化与梯度估计
+
+带参数积分在 AI 中最典型的两个场景是：
+
+1. **REINFORCE / score function estimator**
+
+   对参数化分布 $p_\theta(x)$，
+
+   $$
+   \nabla_\theta \mathbb{E}_{p_\theta}[R(x)]
+   = \nabla_\theta \int R(x)p_\theta(x)\,dx
+   = \int R(x)\nabla_\theta p_\theta(x)\,dx.
+   $$
+
+   再利用
+
+   $$
+   \nabla_\theta p_\theta(x)=p_\theta(x)\nabla_\theta\log p_\theta(x),
+   $$
+
+   得到
+
+   $$
+   \nabla_\theta \mathbb{E}_{p_\theta}[R(x)]
+   = \mathbb{E}_{p_\theta}\left[R(x)\nabla_\theta \log p_\theta(x)\right].
+   $$
+
+2. **重参数化技巧**
+
+   若 $z=\mu+\sigma\varepsilon$，$\varepsilon\sim \mathcal N(0,1)$，则关于 $z$ 的带参数期望可转成对无参数噪声的期望，从而更稳定地把梯度推进积分号内。
+
+3. **批量大小趋于无穷时的梯度估计**
+
+   大样本极限能否和梯度或积分交换，依然需要控制条件。很多“看起来合理”的估计式，问题恰恰出在这一步。
+
+---
+
 ## 本章小结
 
 1. **无穷区间上的积分**：
@@ -421,6 +598,10 @@ $\square$
    - 定义：$B(p,q) = \int_0^1 x^{p-1}(1-x)^{q-1}\,dx$（$p,q > 0$）
    - 与Gamma函数的关系：$B(p,q) = \dfrac{\Gamma(p)\,\Gamma(q)}{\Gamma(p+q)}$
    - 对称性：$B(p,q) = B(q,p)$
+
+6. **含参量积分与顺序交换**：
+   - Leibniz 公式允许在条件满足时把导数推进积分号
+   - 积分与极限/求和的交换需要统一控制，不能只凭形式推断
 
 ---
 
@@ -539,15 +720,32 @@ def lp_regularization(weights, p=2):
 
 ## 练习题
 
-**1.** 计算广义积分 $\int_0^{+\infty} xe^{-x} \, dx$。
+**1.** ⭐ 计算广义积分 $\int_0^{+\infty} xe^{-x} \, dx$。
 
-**2.** 判断广义积分 $\int_1^{+\infty} \dfrac{1}{\sqrt{x^3 + 1}} \, dx$ 的敛散性。
+**2.** ⭐ 判断广义积分 $\int_1^{+\infty} \dfrac{1}{\sqrt{x^3 + 1}} \, dx$ 的敛散性。
 
-**3.** 计算瑕积分 $\int_0^4 \dfrac{1}{\sqrt{4-x}} \, dx$。
+**3.** ⭐ 计算瑕积分 $\int_0^4 \dfrac{1}{\sqrt{4-x}} \, dx$。
 
-**4.** 判断广义积分 $\int_0^1 \dfrac{\ln x}{\sqrt{x}} \, dx$ 的敛散性，若收敛，求其值。
+**4.** ⭐⭐ 判断广义积分 $\int_0^1 \dfrac{\ln x}{\sqrt{x}} \, dx$ 的敛散性，若收敛，求其值。
 
-**5.** 利用Gamma函数计算 $\int_0^{+\infty} x^4 e^{-x^2} \, dx$。
+**5.** ⭐⭐ 利用Gamma函数计算 $\int_0^{+\infty} x^4 e^{-x^2} \, dx$。
+
+**6.** ⭐⭐ 设
+$$
+I(\theta)=\int_0^1 \frac{1}{1+\theta x}\,dx \qquad (\theta>-1),
+$$
+计算 $I'(\theta)$。
+
+**7.** ⭐⭐⭐ 用一个具体例子说明：若缺乏控制条件，则
+$$
+\lim_{n\to\infty}\int f_n \neq \int \lim_{n\to\infty} f_n.
+$$
+
+**8.** ⭐⭐⭐ 推导 REINFORCE 公式
+$$
+\nabla_\theta \mathbb E_{p_\theta(x)}[R(x)]
+= \mathbb E_{p_\theta(x)}[R(x)\nabla_\theta \log p_\theta(x)].
+$$
 
 ---
 
@@ -607,5 +805,80 @@ $$\int_0^{+\infty} x^4 e^{-x^2} \, dx = \int_0^{+\infty} t^2 e^{-t} \cdot \frac{
 由 $\Gamma\left(\dfrac{5}{2}\right) = \dfrac{3}{2} \cdot \dfrac{1}{2} \cdot \Gamma\left(\dfrac{1}{2}\right) = \dfrac{3}{4}\sqrt{\pi}$：
 
 $$\int_0^{+\infty} x^4 e^{-x^2} \, dx = \frac{1}{2} \cdot \frac{3\sqrt{\pi}}{4} = \frac{3\sqrt{\pi}}{8}$$
+
+---
+
+**6.** 先计算原积分：
+
+$$
+I(\theta)=\int_0^1 \frac{1}{1+\theta x}\,dx
+= \frac{1}{\theta}\ln(1+\theta)\qquad (\theta\neq 0).
+$$
+
+因此
+
+$$
+I'(\theta)
+= -\frac{1}{\theta^2}\ln(1+\theta)+\frac{1}{\theta(1+\theta)}.
+$$
+
+若直接把导数推进积分号，也有
+
+$$
+I'(\theta)
+= -\int_0^1 \frac{x}{(1+\theta x)^2}\,dx,
+$$
+
+两者一致。
+
+---
+
+**7.** 可取
+
+$$
+f_n(x)=n\mathbf{1}_{(0,1/n)}(x),\quad x\in(0,1).
+$$
+
+则对每个固定 $x>0$，都有 $f_n(x)\to 0$，所以
+
+$$
+\int_0^1 \lim_{n\to\infty} f_n(x)\,dx=0.
+$$
+
+但
+
+$$
+\int_0^1 f_n(x)\,dx=1,
+$$
+
+因此
+
+$$
+\lim_{n\to\infty}\int_0^1 f_n(x)\,dx=1\neq 0.
+$$
+
+---
+
+**8.**
+
+$$
+\nabla_\theta \mathbb E_{p_\theta(x)}[R(x)]
+= \nabla_\theta \int R(x)p_\theta(x)\,dx
+= \int R(x)\nabla_\theta p_\theta(x)\,dx.
+$$
+
+再利用
+
+$$
+\nabla_\theta p_\theta(x)=p_\theta(x)\nabla_\theta \log p_\theta(x),
+$$
+
+可得
+
+$$
+\nabla_\theta \mathbb E_{p_\theta(x)}[R(x)]
+= \int R(x)p_\theta(x)\nabla_\theta \log p_\theta(x)\,dx
+= \mathbb E_{p_\theta(x)}[R(x)\nabla_\theta \log p_\theta(x)].
+$$
 
 </details>

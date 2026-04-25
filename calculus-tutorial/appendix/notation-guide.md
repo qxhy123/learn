@@ -166,4 +166,21 @@
 
 ---
 
+## 八、AI 与机器学习常用符号
+
+| 符号 | LaTeX | 含义 |
+|------|-------|------|
+| $\theta$ | `\theta` | 模型参数向量 |
+| $\nabla_\theta L$ | `\nabla_\theta L` | 损失函数对参数 $\theta$ 的梯度 |
+| $H$ 或 $\nabla^2 f$ | `H`，`\nabla^2 f` | Hessian 矩阵，描述二阶曲率 |
+| $J$ | `J` | Jacobian 矩阵 |
+| $\mathrm{KL}(p\|q)$ | `\mathrm{KL}(p\|q)` | KL 散度 |
+| $H(p)$ | `H(p)` | 信息熵 |
+| $\mathbb{E}_p[\cdot]$ | `\mathbb{E}_p[\cdot]` | 在分布 $p$ 下的期望 |
+| $\mathcal{N}(\mu,\sigma^2)$ | `\mathcal{N}(\mu,\sigma^2)` | 高斯分布 |
+| $\succeq 0$ | `\succeq 0` | 半正定 |
+| $\operatorname{tr}(A)$ | `\operatorname{tr}(A)` | 矩阵的迹 |
+
+---
+
 > 本附录所列符号以标准数学惯例为准。不同教材或领域偶有差异，阅读时请结合上下文判断具体含义。

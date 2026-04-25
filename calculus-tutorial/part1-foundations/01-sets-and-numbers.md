@@ -285,11 +285,24 @@ print(f"训练集大小: {len(train_set)}, 验证集: {len(val_set)}, 测试集:
 
 **2.** ⭐ 解不等式 $|3x + 2| \leq 5$，并用区间表示解集。
 
-**3.** ⭐⭐ 证明三角不等式：对任意 $a, b \in \mathbb{R}$，有 $|a + b| \leq |a| + |b|$。
+**3.** ⭐ 证明三角不等式：对任意 $a, b \in \mathbb{R}$，有 $|a + b| \leq |a| + |b|$。
 
 **4.** ⭐⭐ 求集合 $S = \left\{\frac{1}{n} \mid n \in \mathbb{N}^+\right\}$ 的上确界和下确界，并说明它们是否属于 $S$。
 
-**5.** ⭐⭐⭐ 设 $A$ 和 $B$ 是 $\mathbb{R}$ 的非空有界子集，定义 $A + B = \{a + b \mid a \in A, b \in B\}$。证明：$\sup(A + B) = \sup A + \sup B$。
+**5.** ⭐⭐ 设 $A$ 和 $B$ 是 $\mathbb{R}$ 的非空有界子集，定义 $A + B = \{a + b \mid a \in A, b \in B\}$。证明：$\sup(A + B) = \sup A + \sup B$。
+
+**6.** ⭐⭐ 设区间 $I = [-1, 2)$，$J = (0, 3]$，求 $I \cap J$ 与 $I \cup J$。
+
+**7.** ⭐⭐⭐ 在低精度训练中，参数有时会被量化为
+$$
+Q(x)=0.1\cdot \operatorname{round}(10x).
+$$
+证明：对任意实数 $x$，都有 $|Q(x)-x|\le 0.05$。
+
+**8.** ⭐⭐⭐ 设 $A,B\subset \mathbb{R}$ 非空且都有下界，定义 $A+B=\{a+b\mid a\in A,\ b\in B\}$。证明：
+$$
+\inf(A+B)=\inf A+\inf B.
+$$
 
 ---
 
@@ -342,5 +355,80 @@ $$-(|a| + |b|) \leq a + b \leq |a| + |b|$$
 则 $a_0 + b_0 > \alpha + \beta - \varepsilon$，而 $a_0 + b_0 \in A + B$。
 
 由上确界定义，$\sup(A + B) = \alpha + \beta = \sup A + \sup B$。 $\square$
+
+---
+
+**6.** 因为
+$$
+I=[-1,2),\qquad J=(0,3],
+$$
+所以同时属于两个区间的点必须满足 $0<x<2$，故
+$$
+I\cap J=(0,2).
+$$
+
+属于任一区间的点组成并集，因此
+$$
+I\cup J=[-1,3].
+$$
+
+---
+
+**7.** 令 $y=10x$，则
+$$
+Q(x)-x=\frac{\operatorname{round}(10x)-10x}{10}
+=\frac{\operatorname{round}(y)-y}{10}.
+$$
+
+对任意实数 $y$，四舍五入误差不超过 $\dfrac12$，即
+$$
+|\operatorname{round}(y)-y|\le \frac12.
+$$
+
+因此
+$$
+|Q(x)-x|
+=\frac{|\operatorname{round}(y)-y|}{10}
+\le \frac{1/2}{10}
+=0.05.
+$$
+
+所以任意实数在量化到十分位后，误差至多为 $0.05$。这正是低精度参数表示的基本误差界。 $\square$
+
+---
+
+**8.** 设
+$$
+\alpha=\inf A,\qquad \beta=\inf B.
+$$
+
+先证 $\alpha+\beta$ 是 $A+B$ 的下界。对任意 $a\in A,\ b\in B$，都有
+$$
+a\ge \alpha,\qquad b\ge \beta,
+$$
+从而
+$$
+a+b\ge \alpha+\beta.
+$$
+
+再证它是最大下界。任取 $\varepsilon>0$，由下确界定义，存在 $a_\varepsilon\in A,\ b_\varepsilon\in B$ 使得
+$$
+\alpha\le a_\varepsilon<\alpha+\frac{\varepsilon}{2},
+\qquad
+\beta\le b_\varepsilon<\beta+\frac{\varepsilon}{2}.
+$$
+
+于是
+$$
+a_\varepsilon+b_\varepsilon<\alpha+\beta+\varepsilon.
+$$
+
+由于 $a_\varepsilon+b_\varepsilon\in A+B$，说明任何大于 $\alpha+\beta$ 的数都不能作为 $A+B$ 的下界。
+
+故
+$$
+\inf(A+B)=\alpha+\beta=\inf A+\inf B.
+$$
+证毕。 $\square$
 
 </details>

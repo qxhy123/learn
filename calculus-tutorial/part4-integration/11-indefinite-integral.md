@@ -401,15 +401,34 @@ def reparameterize(mu, logvar):
 
 ## 练习题
 
-**1.** 求不定积分：$\int \dfrac{x^3 + 1}{x^2} \, dx$。
+**1.** ⭐ 求不定积分：$\int \dfrac{x^3 + 1}{x^2} \, dx$。
 
-**2.** 用凑微分法求：$\int \dfrac{e^{\sqrt{x}}}{\sqrt{x}} \, dx$。
+**2.** ⭐ 用凑微分法求：$\int \dfrac{e^{\sqrt{x}}}{\sqrt{x}} \, dx$。
 
-**3.** 用三角代换求：$\int \dfrac{x^2}{\sqrt{4-x^2}} \, dx$。
+**3.** ⭐ 用三角代换求：$\int \dfrac{x^2}{\sqrt{4-x^2}} \, dx$。
 
-**4.** 用分部积分法求：$\int x^2 e^{-x} \, dx$。
+**4.** ⭐⭐ 用分部积分法求：$\int x^2 e^{-x} \, dx$。
 
-**5.** 求不定积分：$\int e^{2x} \sin 3x \, dx$。
+**5.** ⭐⭐ 求不定积分：$\int e^{2x} \sin 3x \, dx$。
+
+**6.** ⭐⭐ 求不定积分：
+$$
+\int x e^{x^2}\,dx.
+$$
+
+**7.** ⭐⭐⭐ 求不定积分：
+$$
+\int \frac{dx}{x^2+4x+5}.
+$$
+
+**8.** ⭐⭐⭐ 设 sigmoid 函数
+$$
+\sigma(x)=\frac{1}{1+e^{-x}}.
+$$
+求不定积分
+$$
+\int \sigma(x)\bigl(1-\sigma(x)\bigr)\,dx.
+$$
 
 ---
 
@@ -462,5 +481,51 @@ $$I = \frac{1}{2}e^{2x}\sin 3x - \frac{3}{2}\left(\frac{1}{2}e^{2x}\cos 3x + \fr
 $$I = \frac{1}{2}e^{2x}\sin 3x - \frac{3}{4}e^{2x}\cos 3x - \frac{9}{4}I$$
 $$\frac{13}{4}I = \frac{1}{2}e^{2x}\sin 3x - \frac{3}{4}e^{2x}\cos 3x$$
 $$I = \frac{e^{2x}(2\sin 3x - 3\cos 3x)}{13} + C$$
+
+---
+
+**6.** 令
+$$
+u=x^2,\qquad du=2x\,dx.
+$$
+
+则
+$$
+\int x e^{x^2}\,dx
+=\frac12\int e^u\,du
+=\frac12 e^u+C
+=\frac12 e^{x^2}+C.
+$$
+
+---
+
+**7.** 先配方：
+$$
+x^2+4x+5=(x+2)^2+1.
+$$
+
+因此
+$$
+\int \frac{dx}{x^2+4x+5}
+=\int \frac{dx}{(x+2)^2+1}
+=\arctan(x+2)+C.
+$$
+
+---
+
+**8.** 注意到
+$$
+\sigma'(x)=\sigma(x)\bigl(1-\sigma(x)\bigr).
+$$
+
+因此
+$$
+\int \sigma(x)\bigl(1-\sigma(x)\bigr)\,dx
+=\int \sigma'(x)\,dx
+=\sigma(x)+C
+=\frac{1}{1+e^{-x}}+C.
+$$
+
+这说明 sigmoid 导数的原函数就是 sigmoid 本身（差一个常数），这在二分类梯度推导中非常常见。
 
 </details>

@@ -476,7 +476,69 @@ $$AC - B^2 = 2 \times (-2) - 0^2 = -4 < 0$$
 
 $$f(1, 1) = 1 + 1 - 3 = -1$$
 
-### 18.7.4 闭区域上的最大值与最小值
+### 18.7.4 Hessian 特征值与优化地形（扩展）
+
+在二元情形里，我们常用判别式 $\Delta = AC-B^2$。但在更一般的高维优化里，更直接的语言是：看 Hessian 的**特征值**。
+
+设 $H=\nabla^2 f(x^\star)$，则：
+
+- 所有特征值都大于 $0$：$H \succ 0$，对应局部极小值
+- 所有特征值都小于 $0$：$H \prec 0$，对应局部极大值
+- 同时存在正特征值和负特征值：$H$ 不定，对应鞍点
+- 存在零特征值：二阶信息不足以判定，需要更高阶分析
+
+这个结论和一元函数中“看二阶导数正负”完全一致，只是把一个数 $f''(x)$ 推广为一整个矩阵。
+
+**深度学习中的地形直觉**：
+
+- 真正的局部最小值往往不像初学者想象得那样多
+- 大量临界点其实是鞍点
+- Hessian 谱常呈现“少数大特征值 + 大量近零特征值”的结构
+
+这意味着深度网络损失面通常很扁、很高维、又夹杂少量高曲率方向。
+
+**条件数与收敛速度**：
+
+若在局部近似里 $H \succ 0$，记最小与最大特征值分别为 $\lambda_{\min},\lambda_{\max}$，则条件数
+
+$$
+\kappa(H)=\frac{\lambda_{\max}}{\lambda_{\min}}
+$$
+
+越大，问题越“病态”（ill-conditioned）。在这种情况下：
+
+- 梯度下降会沿狭长谷底来回摆动
+- 牛顿法或预条件化方法能更快拉直几何形状
+- Adam、RMSProp 等方法可看作对角预条件化的近似
+
+> ⚠️ **常见陷阱**
+> Hessian 不定并不意味着“极值不存在”，而是说明当前驻点不是局部极大或局部极小，更可能是鞍点。若 Hessian 存在零特征值，也不能直接下结论，需要看更高阶项。
+
+> **例题 18.16** 分析函数 $f(x,y)=x^4+y^4$ 在原点的 Hessian 与极值类型。
+
+**解**：有
+
+$$
+f_x = 4x^3,\qquad f_y = 4y^3,
+$$
+
+因此原点是驻点。二阶偏导为
+
+$$
+f_{xx}=12x^2,\qquad f_{yy}=12y^2,\qquad f_{xy}=0.
+$$
+
+在原点处 Hessian 为零矩阵，所有特征值都为 $0$，二阶判别法失效。
+
+但由于
+
+$$
+f(x,y)=x^4+y^4\geq 0,
+$$
+
+且仅在原点取零，所以原点仍是极小值点。这说明“零特征值”意味着需要更高阶分析，而不是问题结束。$\square$
+
+### 18.7.5 闭区域上的最大值与最小值
 
 **定理 18.3**：设 $f(x, y)$ 在有界闭区域 $D$ 上连续，则 $f$ 在 $D$ 上必取得最大值和最小值。
 
@@ -639,6 +701,82 @@ $$L_z = 1 + \lambda_2 = 0 \quad \Rightarrow \quad \lambda_2 = -1$$
 
 代入 $L_y$ 的方程：$1 + 2\lambda_1 y - 1 = 0$，即 $\lambda_1 y = 0$。
 
+### 18.8.4 隐式微分在超参数优化中的应用
+
+隐函数定理不仅能证明“某个约束方程可以局部解出一个变量”，还能告诉我们：当最优解本身依赖超参数时，它的变化率如何计算。
+
+设训练问题为
+
+$$
+\theta^\star(\lambda) = \arg\min_\theta L_{\text{train}}(\theta,\lambda),
+$$
+
+其中 $\lambda$ 可能是学习率、权重衰减系数或其它超参数。最优点满足一阶条件
+
+$$
+\nabla_\theta L_{\text{train}}(\theta^\star,\lambda)=0.
+$$
+
+对 $\lambda$ 再求导，可得
+
+$$
+\frac{d\theta^\star}{d\lambda}
+= -\left(\frac{\partial^2 L}{\partial \theta^2}\right)^{-1}
+\frac{\partial^2 L}{\partial \theta \partial \lambda}.
+$$
+
+这就是**隐式微分（implicit differentiation）** 的核心公式。
+
+它的重要意义在于：
+
+- 不必显式展开所有训练步骤，也能研究超参数如何影响最优解
+- 在双层优化（bilevel optimization）中非常常见
+- 与元学习、超参数自动调优、MAML 等主题直接相关
+
+> **例题 18.21** 设
+> $$
+> L(\theta,\lambda)=\frac12(\theta-a)^2+\frac{\lambda}{2}\theta^2,
+> $$
+> 求最优解 $\theta^\star(\lambda)$ 以及 $\dfrac{d\theta^\star}{d\lambda}$。
+
+**解**：一阶条件为
+
+$$
+\frac{\partial L}{\partial \theta}
+= (\theta-a)+\lambda\theta=0.
+$$
+
+故
+
+$$
+\theta^\star(\lambda)=\frac{a}{1+\lambda}.
+$$
+
+直接求导得
+
+$$
+\frac{d\theta^\star}{d\lambda}
+= -\frac{a}{(1+\lambda)^2}.
+$$
+
+若用隐式微分公式，则有
+
+$$
+\frac{\partial^2 L}{\partial \theta^2}=1+\lambda,\qquad
+\frac{\partial^2 L}{\partial \theta\partial \lambda}=\theta.
+$$
+
+因此
+
+$$
+\frac{d\theta^\star}{d\lambda}
+= -(1+\lambda)^{-1}\theta^\star
+= -\frac{1}{1+\lambda}\cdot \frac{a}{1+\lambda}
+= -\frac{a}{(1+\lambda)^2},
+$$
+
+与直接计算一致。$\square$
+
 若 $\lambda_1 = 0$，则由 $L_x$：$1 = 0$，矛盾。故 $y = 0$。
 
 由 $x^2 + y^2 = 1$ 得 $x = \pm 1$，由 $y + z = 1$ 得 $z = 1$。
@@ -766,21 +904,21 @@ print(f"Weight matrix:\n{model.weight}")
 
 ## 练习题
 
-**1.** 设 $f(x, y) = \ln(x + \sqrt{x^2 + y^2})$，求 $f_x$ 和 $f_y$。
+**1.** ⭐ 设 $f(x, y) = \ln(x + \sqrt{x^2 + y^2})$，求 $f_x$ 和 $f_y$。
 
-**2.** 设 $z = \arctan\dfrac{y}{x}$，验证 $\dfrac{\partial^2 z}{\partial x^2} + \dfrac{\partial^2 z}{\partial y^2} = 0$（调和函数）。
+**2.** ⭐ 设 $z = \arctan\dfrac{y}{x}$，验证 $\dfrac{\partial^2 z}{\partial x^2} + \dfrac{\partial^2 z}{\partial y^2} = 0$（调和函数）。
 
-**3.** 设 $z = f(x^2 - y^2, e^{xy})$，其中 $f$ 可微，求 $\dfrac{\partial z}{\partial x}$ 和 $\dfrac{\partial z}{\partial y}$。
+**3.** ⭐ 设 $z = f(x^2 - y^2, e^{xy})$，其中 $f$ 可微，求 $\dfrac{\partial z}{\partial x}$ 和 $\dfrac{\partial z}{\partial y}$。
 
-**4.** 求函数 $f(x, y) = x^2 - xy + y^2$ 在点 $(1, 1)$ 处沿方向 $\mathbf{l} = \left(\dfrac{1}{\sqrt{2}}, \dfrac{1}{\sqrt{2}}\right)$ 的方向导数，并求该点处的梯度。
+**4.** ⭐⭐ 求函数 $f(x, y) = x^2 - xy + y^2$ 在点 $(1, 1)$ 处沿方向 $\mathbf{l} = \left(\dfrac{1}{\sqrt{2}}, \dfrac{1}{\sqrt{2}}\right)$ 的方向导数，并求该点处的梯度。
 
-**5.** 设 $x^3 + y^3 - 3xy = 0$ 确定隐函数 $y = y(x)$，求 $\dfrac{dy}{dx}$ 和 $\dfrac{d^2y}{dx^2}$。
+**5.** ⭐⭐ 设 $x^3 + y^3 - 3xy = 0$ 确定隐函数 $y = y(x)$，求 $\dfrac{dy}{dx}$ 和 $\dfrac{d^2y}{dx^2}$。
 
-**6.** 求函数 $f(x, y) = x^3 - 3xy + y^3$ 的极值，并判定所有驻点的类型。
+**6.** ⭐⭐ 求函数 $f(x, y) = x^3 - 3xy + y^3$ 的极值，并判定所有驻点的类型。
 
-**7.** 在约束条件 $2x + 3y = 6$ 下，求 $f(x, y) = x^2 + y^2$ 的极小值。
+**7.** ⭐⭐⭐ 在约束条件 $2x + 3y = 6$ 下，求 $f(x, y) = x^2 + y^2$ 的极小值。
 
-**8.** 求原点到曲线 $xy = 1$（$x > 0, y > 0$）上最近的点。
+**8.** ⭐⭐⭐ 求原点到曲线 $xy = 1$（$x > 0, y > 0$）上最近的点。
 
 ---
 

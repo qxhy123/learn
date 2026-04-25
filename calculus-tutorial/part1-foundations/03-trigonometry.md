@@ -4,377 +4,918 @@
 
 通过本章学习，你将能够：
 
-- 理解三角函数的单位圆定义，掌握任意角的三角函数
-- 熟练运用弧度制进行角度计算
-- 掌握三角函数的基本性质：周期性、奇偶性、单调性、有界性
-- 熟练运用各类三角恒等式进行化简与证明
-- 理解反三角函数的定义、定义域、值域及基本性质
+- 理解弧度制为什么是微积分中的自然角度单位，并熟练进行弧度、角度、弧长与扇形面积计算
+- 用单位圆定义六个三角函数，掌握参考角、象限符号和任意角三角函数求值方法
+- 从定义域、值域、周期性、奇偶性、单调性、有界性和图像变换角度分析三角函数
+- 熟练使用三角恒等式进行化简、证明、解方程，并理解常用公式的来源
+- 理解反三角函数为什么必须限制主值区间，能正确处理 $\arcsin(\sin x)$、$\arccos(\cos x)$、$\arctan(\tan x)$ 等复合表达式
+- 建立三角函数与后续极限、导数、积分、Fourier 分析、位置编码和周期特征工程之间的联系
 
 ---
 
-## 3.1 三角函数的定义
+## 3.1 为什么微积分需要三角函数
 
-### 3.1.1 弧度制
+三角函数最初来自直角三角形的边角关系，但在微积分中更重要的视角是：它们描述**圆周运动、周期变化和旋转**。只要一个量会重复振荡，或者一个二维向量会旋转，正弦和余弦就自然出现。
 
-在微积分中，我们统一使用**弧度制**来度量角度。
+例如：
 
-**定义**：在单位圆中，弧长等于半径的弧所对的圆心角定义为 **1 弧度**（rad）。
+- 物理中的简谐振动可写为 $x(t)=A\cos(\omega t+\varphi)$；
+- 信号可以分解为不同频率的正弦波，这就是 Fourier 分析的核心；
+- 神经网络中的位置编码常用不同频率的 $\sin$ 和 $\cos$ 表示序列位置；
+- 多元微积分中的极坐标、柱坐标、球坐标都离不开三角函数。
+
+因此，本章不仅要记公式，更要掌握三个核心思想：
+
+1. **弧度制把角度和弧长统一起来**；
+2. **单位圆把三角函数推广为实数函数**；
+3. **恒等式本质上是旋转、投影和周期性的代数表达**。
+
+> **资料参考**：OpenStax Calculus Volume 1 强调弧度与单位圆的自然联系；OpenStax Precalculus 系统介绍单位圆、三角恒等式和反三角函数；Paul's Online Math Notes 与 Khan Academy 提供了大量求值、恒等变形和反三角函数练习。
+
+---
+
+## 3.2 弧度制与单位圆
+
+### 3.2.1 弧度制
+
+在微积分中，我们默认使用**弧度制**。如果角度没有标注单位，通常视为弧度。
+
+**定义**：在半径为 $r$ 的圆中，圆心角 $\theta$ 所对弧长为 $l$。当
+
+$$
+\theta=\frac{l}{r}
+$$
+
+时，$\theta$ 称为该角的弧度数。特别地，在单位圆中 $r=1$，所以
+
+$$
+\theta=l.
+$$
+
+这说明：**单位圆上的弧长就是弧度数**。这正是弧度制在微积分中自然的原因。
 
 弧度与角度的换算关系：
 
-$$\pi \text{ rad} = 180°$$
+$$
+\pi\text{ rad}=180^\circ,
+\qquad
+1^\circ=\frac{\pi}{180}\text{ rad},
+\qquad
+1\text{ rad}=\frac{180^\circ}{\pi}.
+$$
 
 常用换算：
 
-| 角度 | $0°$ | $30°$ | $45°$ | $60°$ | $90°$ | $180°$ | $360°$ |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 弧度 | $0$ | $\frac{\pi}{6}$ | $\frac{\pi}{4}$ | $\frac{\pi}{3}$ | $\frac{\pi}{2}$ | $\pi$ | $2\pi$ |
+| 角度 | $0^\circ$ | $30^\circ$ | $45^\circ$ | $60^\circ$ | $90^\circ$ | $120^\circ$ | $135^\circ$ | $150^\circ$ | $180^\circ$ | $270^\circ$ | $360^\circ$ |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 弧度 | $0$ | $\frac{\pi}{6}$ | $\frac{\pi}{4}$ | $\frac{\pi}{3}$ | $\frac{\pi}{2}$ | $\frac{2\pi}{3}$ | $\frac{3\pi}{4}$ | $\frac{5\pi}{6}$ | $\pi$ | $\frac{3\pi}{2}$ | $2\pi$ |
 
-**弧长公式**：半径为 $r$ 的圆，圆心角为 $\theta$（弧度）的弧长为
+**弧长公式**：
 
-$$l = r\theta$$
+$$
+l=r\theta.
+$$
 
-**扇形面积**：
+**扇形面积公式**：
 
-$$S = \frac{1}{2}r^2\theta = \frac{1}{2}lr$$
+$$
+S=\frac12 r^2\theta=\frac12 lr.
+$$
 
-### 3.1.2 单位圆定义
+> **注意**：公式 $l=r\theta$ 和 $S=\frac12r^2\theta$ 中的 $\theta$ 必须用弧度。若题目给角度，先换成弧度。
 
-**单位圆**是以原点为圆心、半径为 1 的圆，其方程为 $x^2 + y^2 = 1$。
+> **例题 3.1** 半径为 $6$ 的圆中，圆心角为 $150^\circ$ 的弧长和扇形面积分别是多少？
 
-设角 $\theta$ 的终边与单位圆交于点 $P(x, y)$，则定义：
+**解**：先换成弧度：
 
-$$\sin\theta = y, \quad \cos\theta = x, \quad \tan\theta = \frac{y}{x} \, (x \neq 0)$$
+$$
+150^\circ=150\cdot\frac{\pi}{180}=\frac{5\pi}{6}.
+$$
 
-$$\csc\theta = \frac{1}{y} \, (y \neq 0), \quad \sec\theta = \frac{1}{x} \, (x \neq 0), \quad \cot\theta = \frac{x}{y} \, (y \neq 0)$$
+所以
 
-### 3.1.3 任意角的三角函数
+$$
+l=r\theta=6\cdot\frac{5\pi}{6}=5\pi,
+$$
 
-单位圆定义自然地将三角函数推广到任意实数。角 $\theta$ 可以是正角（逆时针旋转）、负角（顺时针旋转）或零角。
+$$
+S=\frac12r^2\theta=\frac12\cdot36\cdot\frac{5\pi}{6}=15\pi.
+$$
 
-**特殊角的三角函数值**：
+---
+
+### 3.2.2 单位圆定义
+
+**单位圆**是以原点为圆心、半径为 $1$ 的圆：
+
+$$
+x^2+y^2=1.
+$$
+
+从 $x$ 轴正向出发，逆时针旋转角 $\theta$，终边与单位圆交于点 $P(x,y)$。定义：
+
+$$
+\sin\theta=y,
+\qquad
+\cos\theta=x,
+\qquad
+\tan\theta=\frac{y}{x}\quad(x\ne0).
+$$
+
+另外三个函数定义为倒数：
+
+$$
+\csc\theta=\frac1{\sin\theta}\quad(\sin\theta\ne0),
+$$
+
+$$
+\sec\theta=\frac1{\cos\theta}\quad(\cos\theta\ne0),
+$$
+
+$$
+\cot\theta=\frac1{\tan\theta}=\frac{x}{y}\quad(y\ne0).
+$$
+
+单位圆定义比直角三角形定义更强，因为它允许 $\theta$ 是任意实数：正角、负角、超过一周的角都可以处理。
+
+### 3.2.3 终边相同的角
+
+两个角如果相差 $2\pi$ 的整数倍，就有相同终边：
+
+$$
+\theta\quad\text{与}\quad \theta+2k\pi\quad(k\in\mathbb Z)
+$$
+
+对应同一个单位圆点。因此：
+
+$$
+\sin(\theta+2k\pi)=\sin\theta,
+\qquad
+\cos(\theta+2k\pi)=\cos\theta.
+$$
+
+对正切，由于 $\tan(\theta+\pi)=\tan\theta$，它的周期更短，是 $\pi$。
+
+### 3.2.4 参考角与象限符号
+
+求任意角三角函数值的基本流程：
+
+1. **化同终边角**：把角化到 $[0,2\pi)$ 或 $(-\pi,\pi]$；
+2. **找参考角**：终边与 $x$ 轴的锐角；
+3. **查特殊角值**：用 $\pi/6,\pi/4,\pi/3$；
+4. **看象限定符号**。
+
+象限符号表：
+
+| 象限 | $\sin$ | $\cos$ | $\tan$ |
+|:---:|:---:|:---:|:---:|
+| 第一象限 | $+$ | $+$ | $+$ |
+| 第二象限 | $+$ | $-$ | $-$ |
+| 第三象限 | $-$ | $-$ | $+$ |
+| 第四象限 | $-$ | $+$ | $-$ |
+
+特殊角值：
 
 | $\theta$ | $0$ | $\frac{\pi}{6}$ | $\frac{\pi}{4}$ | $\frac{\pi}{3}$ | $\frac{\pi}{2}$ |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| $\sin\theta$ | $0$ | $\frac{1}{2}$ | $\frac{\sqrt{2}}{2}$ | $\frac{\sqrt{3}}{2}$ | $1$ |
-| $\cos\theta$ | $1$ | $\frac{\sqrt{3}}{2}$ | $\frac{\sqrt{2}}{2}$ | $\frac{1}{2}$ | $0$ |
-| $\tan\theta$ | $0$ | $\frac{\sqrt{3}}{3}$ | $1$ | $\sqrt{3}$ | 无定义 |
+| $\sin\theta$ | $0$ | $\frac12$ | $\frac{\sqrt2}{2}$ | $\frac{\sqrt3}{2}$ | $1$ |
+| $\cos\theta$ | $1$ | $\frac{\sqrt3}{2}$ | $\frac{\sqrt2}{2}$ | $\frac12$ | $0$ |
+| $\tan\theta$ | $0$ | $\frac{\sqrt3}{3}$ | $1$ | $\sqrt3$ | 无定义 |
 
-> **例题 3.1** 求 $\sin\frac{5\pi}{4}$ 和 $\cos\left(-\frac{2\pi}{3}\right)$ 的值。
+> **例题 3.2** 求 $\sin\frac{5\pi}{4}$、$\cos\left(-\frac{2\pi}{3}\right)$ 和 $\tan\frac{11\pi}{6}$。
 
 **解**：
 
-$\frac{5\pi}{4} = \pi + \frac{\pi}{4}$，终边在第三象限，故
+$\frac{5\pi}{4}=\pi+\frac{\pi}{4}$，在第三象限，参考角为 $\frac\pi4$，所以
 
-$$\sin\frac{5\pi}{4} = -\sin\frac{\pi}{4} = -\frac{\sqrt{2}}{2}$$
+$$
+\sin\frac{5\pi}{4}=-\frac{\sqrt2}{2}.
+$$
 
-$-\frac{2\pi}{3}$ 与 $\frac{4\pi}{3}$ 终边相同，在第三象限，故
+$-\frac{2\pi}{3}+2\pi=\frac{4\pi}{3}$，在第三象限，参考角为 $\frac\pi3$，所以
 
-$$\cos\left(-\frac{2\pi}{3}\right) = \cos\frac{4\pi}{3} = -\cos\frac{\pi}{3} = -\frac{1}{2}$$
+$$
+\cos\left(-\frac{2\pi}{3}\right)=\cos\frac{4\pi}{3}=-\frac12.
+$$
 
----
+$\frac{11\pi}{6}=2\pi-\frac\pi6$，在第四象限，参考角为 $\frac\pi6$，所以
 
-## 3.2 三角函数的基本性质
-
-### 3.2.1 定义域与值域
-
-| 函数 | 定义域 | 值域 |
-|:---:|:---:|:---:|
-| $\sin x$ | $\mathbb{R}$ | $[-1, 1]$ |
-| $\cos x$ | $\mathbb{R}$ | $[-1, 1]$ |
-| $\tan x$ | $\{x \mid x \neq \frac{\pi}{2} + k\pi, k \in \mathbb{Z}\}$ | $\mathbb{R}$ |
-
-### 3.2.2 周期性
-
-若存在非零常数 $T$，使得对定义域内的所有 $x$ 都有 $f(x + T) = f(x)$，则称 $f(x)$ 是周期函数，满足条件的最小正数 $T$ 称为**最小正周期**。
-
-- $\sin x$ 和 $\cos x$ 的最小正周期为 $2\pi$
-- $\tan x$ 和 $\cot x$ 的最小正周期为 $\pi$
-
-### 3.2.3 奇偶性
-
-**奇函数**：$f(-x) = -f(x)$，图像关于原点对称
-
-**偶函数**：$f(-x) = f(x)$，图像关于 $y$ 轴对称
-
-- $\sin x$、$\tan x$、$\cot x$、$\csc x$ 是**奇函数**
-- $\cos x$、$\sec x$ 是**偶函数**
-
-### 3.2.4 单调性
-
-**正弦函数** $y = \sin x$：
-- 在 $\left[-\frac{\pi}{2} + 2k\pi, \frac{\pi}{2} + 2k\pi\right]$ 上单调递增
-- 在 $\left[\frac{\pi}{2} + 2k\pi, \frac{3\pi}{2} + 2k\pi\right]$ 上单调递减
-
-**余弦函数** $y = \cos x$：
-- 在 $[-\pi + 2k\pi, 2k\pi]$ 上单调递增
-- 在 $[2k\pi, \pi + 2k\pi]$ 上单调递减
-
-**正切函数** $y = \tan x$：
-- 在每个区间 $\left(-\frac{\pi}{2} + k\pi, \frac{\pi}{2} + k\pi\right)$ 上单调递增
-
-### 3.2.5 有界性
-
-$\sin x$ 和 $\cos x$ 是有界函数：
-
-$$-1 \leq \sin x \leq 1, \quad -1 \leq \cos x \leq 1$$
-
-$\tan x$ 在其定义域上无界。
-
-### 3.2.6 函数图像
-
-**正弦曲线** $y = \sin x$：从原点出发，向上到最高点 $({\pi}/{2}, 1)$，下降经过 $(\pi, 0)$，到最低点 $({3\pi}/{2}, -1)$，再回到 $(2\pi, 0)$，周而复始。
-
-**余弦曲线** $y = \cos x$：可看作正弦曲线向左平移 $\frac{\pi}{2}$，即 $\cos x = \sin\left(x + \frac{\pi}{2}\right)$。
-
-**正切曲线** $y = \tan x$：以 $x = \frac{\pi}{2} + k\pi$ 为渐近线，在每个周期内从 $-\infty$ 单调递增到 $+\infty$。
+$$
+\tan\frac{11\pi}{6}=-\tan\frac\pi6=-\frac{\sqrt3}{3}.
+$$
 
 ---
 
-## 3.3 三角恒等式
+## 3.3 三角函数的基本性质
 
-### 3.3.1 基本恒等式
+### 3.3.1 定义域与值域
 
-**平方关系**：
+| 函数 | 定义域 | 值域 | 不存在的位置 |
+|:---:|:---:|:---:|:---:|
+| $\sin x$ | $\mathbb R$ | $[-1,1]$ | 无 |
+| $\cos x$ | $\mathbb R$ | $[-1,1]$ | 无 |
+| $\tan x$ | $\mathbb R\setminus\{\frac\pi2+k\pi\mid k\in\mathbb Z\}$ | $\mathbb R$ | $\cos x=0$ |
+| $\cot x$ | $\mathbb R\setminus\{k\pi\mid k\in\mathbb Z\}$ | $\mathbb R$ | $\sin x=0$ |
+| $\sec x$ | $\mathbb R\setminus\{\frac\pi2+k\pi\mid k\in\mathbb Z\}$ | $(-\infty,-1]\cup[1,\infty)$ | $\cos x=0$ |
+| $\csc x$ | $\mathbb R\setminus\{k\pi\mid k\in\mathbb Z\}$ | $(-\infty,-1]\cup[1,\infty)$ | $\sin x=0$ |
 
-$$\sin^2 x + \cos^2 x = 1$$
+### 3.3.2 周期性
 
-$$1 + \tan^2 x = \sec^2 x$$
+若存在 $T>0$，使得对定义域内所有允许的 $x$ 都有
 
-$$1 + \cot^2 x = \csc^2 x$$
+$$
+f(x+T)=f(x),
+$$
 
-**商数关系**：
+则称 $f$ 是周期函数，最小的正周期称为**最小正周期**。
 
-$$\tan x = \frac{\sin x}{\cos x}, \quad \cot x = \frac{\cos x}{\sin x}$$
+| 函数 | 最小正周期 |
+|:---:|:---:|
+| $\sin x,\cos x,\sec x,\csc x$ | $2\pi$ |
+| $\tan x,\cot x$ | $\pi$ |
 
-**倒数关系**：
+更一般地，若 $b\ne0$，则
 
-$$\sin x \cdot \csc x = 1, \quad \cos x \cdot \sec x = 1, \quad \tan x \cdot \cot x = 1$$
+$$
+\sin(bx),\ \cos(bx)\quad\text{的周期为}\quad \frac{2\pi}{|b|},
+$$
 
-### 3.3.2 诱导公式
+$$
+\tan(bx),\ \cot(bx)\quad\text{的周期为}\quad \frac{\pi}{|b|}.
+$$
 
-设 $k \in \mathbb{Z}$，有：
+### 3.3.3 奇偶性
 
-$$\sin(x + 2k\pi) = \sin x, \quad \cos(x + 2k\pi) = \cos x$$
+由单位圆关于坐标轴的对称性可得：
 
-$$\sin(-x) = -\sin x, \quad \cos(-x) = \cos x$$
+$$
+\sin(-x)=-\sin x,
+\qquad
+\cos(-x)=\cos x,
+\qquad
+\tan(-x)=-\tan x.
+$$
 
-$$\sin(\pi - x) = \sin x, \quad \cos(\pi - x) = -\cos x$$
+所以：
 
-$$\sin\left(\frac{\pi}{2} - x\right) = \cos x, \quad \cos\left(\frac{\pi}{2} - x\right) = \sin x$$
+- $\sin x,\tan x,\cot x,\csc x$ 是奇函数；
+- $\cos x,\sec x$ 是偶函数。
 
-**口诀**："奇变偶不变，符号看象限"
+### 3.3.4 单调性
 
-### 3.3.3 和差公式
+正弦函数：
 
-$$\sin(\alpha \pm \beta) = \sin\alpha\cos\beta \pm \cos\alpha\sin\beta$$
+- 在 $\left[-\frac\pi2+2k\pi,\frac\pi2+2k\pi\right]$ 上单调递增；
+- 在 $\left[\frac\pi2+2k\pi,\frac{3\pi}{2}+2k\pi\right]$ 上单调递减。
 
-$$\cos(\alpha \pm \beta) = \cos\alpha\cos\beta \mp \sin\alpha\sin\beta$$
+余弦函数：
 
-$$\tan(\alpha \pm \beta) = \frac{\tan\alpha \pm \tan\beta}{1 \mp \tan\alpha\tan\beta}$$
+- 在 $[-\pi+2k\pi,2k\pi]$ 上单调递增；
+- 在 $[2k\pi,\pi+2k\pi]$ 上单调递减。
 
-> **例题 3.2** 求 $\cos 75°$ 的精确值。
+正切函数：
 
-**解**：$75° = 45° + 30°$，由余弦和角公式：
+- 在每个 $\left(-\frac\pi2+k\pi,\frac\pi2+k\pi\right)$ 上单调递增。
 
-$$\cos 75° = \cos(45° + 30°) = \cos 45°\cos 30° - \sin 45°\sin 30°$$
+这些结论以后可以用导数快速证明：$(\sin x)'=\cos x$，$(\cos x)'=-\sin x$，$(\tan x)'=\sec^2x>0$。
 
-$$= \frac{\sqrt{2}}{2} \cdot \frac{\sqrt{3}}{2} - \frac{\sqrt{2}}{2} \cdot \frac{1}{2} = \frac{\sqrt{6} - \sqrt{2}}{4}$$
+### 3.3.5 图像与参数变换
 
-### 3.3.4 倍角公式
+函数
 
-$$\sin 2\alpha = 2\sin\alpha\cos\alpha$$
+$$
+y=A\sin(Bx+C)+D
+$$
 
-$$\cos 2\alpha = \cos^2\alpha - \sin^2\alpha = 2\cos^2\alpha - 1 = 1 - 2\sin^2\alpha$$
+可由 $y=\sin x$ 经过以下变换得到：
 
-$$\tan 2\alpha = \frac{2\tan\alpha}{1 - \tan^2\alpha}$$
+| 参数 | 作用 |
+|:---:|:---|
+| $|A|$ | 振幅，控制上下伸缩 |
+| $\frac{2\pi}{|B|}$ | 周期 |
+| $-\frac{C}{B}$ | 相位平移 |
+| $D$ | 竖直平移，中心线为 $y=D$ |
 
-### 3.3.5 半角公式
+> **例题 3.3** 分析函数 $y=3\sin(2x-\frac\pi3)-1$ 的振幅、周期、相位平移和中心线。
 
-$$\sin\frac{\alpha}{2} = \pm\sqrt{\frac{1 - \cos\alpha}{2}}$$
+**解**：写成
 
-$$\cos\frac{\alpha}{2} = \pm\sqrt{\frac{1 + \cos\alpha}{2}}$$
+$$
+y=3\sin\left(2\left(x-\frac\pi6\right)\right)-1.
+$$
 
-$$\tan\frac{\alpha}{2} = \pm\sqrt{\frac{1 - \cos\alpha}{1 + \cos\alpha}} = \frac{\sin\alpha}{1 + \cos\alpha} = \frac{1 - \cos\alpha}{\sin\alpha}$$
-
-（符号由 $\frac{\alpha}{2}$ 所在象限决定）
-
-### 3.3.6 积化和差与和差化积
-
-**积化和差**：
-
-$$\sin\alpha\cos\beta = \frac{1}{2}[\sin(\alpha + \beta) + \sin(\alpha - \beta)]$$
-
-$$\cos\alpha\sin\beta = \frac{1}{2}[\sin(\alpha + \beta) - \sin(\alpha - \beta)]$$
-
-$$\cos\alpha\cos\beta = \frac{1}{2}[\cos(\alpha + \beta) + \cos(\alpha - \beta)]$$
-
-$$\sin\alpha\sin\beta = -\frac{1}{2}[\cos(\alpha + \beta) - \cos(\alpha - \beta)]$$
-
-**和差化积**：
-
-$$\sin A + \sin B = 2\sin\frac{A + B}{2}\cos\frac{A - B}{2}$$
-
-$$\sin A - \sin B = 2\cos\frac{A + B}{2}\sin\frac{A - B}{2}$$
-
-$$\cos A + \cos B = 2\cos\frac{A + B}{2}\cos\frac{A - B}{2}$$
-
-$$\cos A - \cos B = -2\sin\frac{A + B}{2}\sin\frac{A - B}{2}$$
+因此振幅为 $3$，周期为 $\frac{2\pi}{2}=\pi$，向右平移 $\frac\pi6$，中心线为 $y=-1$。
 
 ---
 
-## 3.4 反三角函数
+## 3.4 三角恒等式
 
-由于三角函数不是一一映射，为定义反函数需要限制定义域。
+三角恒等式不是孤立公式，而是单位圆和旋转规律的代数结果。学习时建议先掌握少数核心公式，再由核心公式推导其他公式。
 
-### 3.4.1 反正弦函数
+### 3.4.1 基本恒等式
 
-**定义**：$y = \arcsin x$ 是 $y = \sin x$（$x \in \left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$）的反函数。
+由单位圆方程 $x^2+y^2=1$，且 $x=\cos\theta, y=\sin\theta$，得到最重要的平方关系：
 
-- **定义域**：$[-1, 1]$
-- **值域**：$\left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$
-- **性质**：奇函数，在定义域上单调递增
+$$
+\sin^2x+\cos^2x=1.
+$$
 
-**基本关系**：
+两边分别除以 $\cos^2x$ 或 $\sin^2x$ 得到：
 
-$$\sin(\arcsin x) = x, \quad x \in [-1, 1]$$
+$$
+1+\tan^2x=\sec^2x,
+\qquad
+1+\cot^2x=\csc^2x.
+$$
 
-$$\arcsin(\sin x) = x, \quad x \in \left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$$
+商数关系：
 
-### 3.4.2 反余弦函数
+$$
+\tan x=\frac{\sin x}{\cos x},
+\qquad
+\cot x=\frac{\cos x}{\sin x}.
+$$
 
-**定义**：$y = \arccos x$ 是 $y = \cos x$（$x \in [0, \pi]$）的反函数。
+倒数关系：
 
-- **定义域**：$[-1, 1]$
-- **值域**：$[0, \pi]$
-- **性质**：非奇非偶，在定义域上单调递减
+$$
+\csc x=\frac1{\sin x},
+\qquad
+\sec x=\frac1{\cos x},
+\qquad
+\cot x=\frac1{\tan x}.
+$$
 
-**重要恒等式**：
+### 3.4.2 诱导公式
 
-$$\arcsin x + \arccos x = \frac{\pi}{2}, \quad x \in [-1, 1]$$
+常用诱导公式：
 
-### 3.4.3 反正切函数
+$$
+\sin(\pi-x)=\sin x,
+\qquad
+\cos(\pi-x)=-\cos x,
+$$
 
-**定义**：$y = \arctan x$ 是 $y = \tan x$（$x \in \left(-\frac{\pi}{2}, \frac{\pi}{2}\right)$）的反函数。
+$$
+\sin(\pi+x)=-\sin x,
+\qquad
+\cos(\pi+x)=-\cos x,
+$$
 
-- **定义域**：$\mathbb{R}$
-- **值域**：$\left(-\frac{\pi}{2}, \frac{\pi}{2}\right)$
-- **性质**：奇函数，在定义域上单调递增
-- **渐近线**：$\lim_{x \to +\infty}\arctan x = \frac{\pi}{2}$，$\lim_{x \to -\infty}\arctan x = -\frac{\pi}{2}$
+$$
+\sin\left(\frac\pi2-x\right)=\cos x,
+\qquad
+\cos\left(\frac\pi2-x\right)=\sin x,
+$$
 
-**重要恒等式**：
+$$
+\sin\left(\frac\pi2+x\right)=\cos x,
+\qquad
+\cos\left(\frac\pi2+x\right)=-\sin x.
+$$
 
-$$\arctan x + \arctan\frac{1}{x} = \begin{cases} \frac{\pi}{2}, & x > 0 \\ -\frac{\pi}{2}, & x < 0 \end{cases}$$
+记忆原则：
 
-> **例题 3.3** 求 $\arcsin\left(-\frac{\sqrt{3}}{2}\right)$ 和 $\arctan(-1)$ 的值。
+- 与 $\pi\pm x$ 相关时，函数名通常不变；
+- 与 $\frac\pi2\pm x$ 相关时，正弦、余弦互换；
+- 最后根据所在象限确定符号。
+
+“奇变偶不变，符号看象限”中的“奇、偶”指 $\frac\pi2$ 的奇数倍或偶数倍。
+
+### 3.4.3 和差公式
+
+$$
+\sin(\alpha\pm\beta)=\sin\alpha\cos\beta\pm\cos\alpha\sin\beta,
+$$
+
+$$
+\cos(\alpha\pm\beta)=\cos\alpha\cos\beta\mp\sin\alpha\sin\beta,
+$$
+
+$$
+\tan(\alpha\pm\beta)=\frac{\tan\alpha\pm\tan\beta}{1\mp\tan\alpha\tan\beta}.
+$$
+
+其中正切公式要求分母不为 $0$，且相关正切值有定义。
+
+> **例题 3.4** 求 $\cos 75^\circ$ 的精确值。
+
+**解**：$75^\circ=45^\circ+30^\circ$，所以
+
+$$
+\begin{aligned}
+\cos75^\circ
+&=\cos(45^\circ+30^\circ)\\
+&=\cos45^\circ\cos30^\circ-\sin45^\circ\sin30^\circ\\
+&=\frac{\sqrt2}{2}\cdot\frac{\sqrt3}{2}-\frac{\sqrt2}{2}\cdot\frac12\\
+&=\frac{\sqrt6-\sqrt2}{4}.
+\end{aligned}
+$$
+
+### 3.4.4 倍角与半角公式
+
+倍角公式：
+
+$$
+\sin2\alpha=2\sin\alpha\cos\alpha,
+$$
+
+$$
+\cos2\alpha=\cos^2\alpha-\sin^2\alpha=2\cos^2\alpha-1=1-2\sin^2\alpha,
+$$
+
+$$
+\tan2\alpha=\frac{2\tan\alpha}{1-\tan^2\alpha}.
+$$
+
+半角公式：
+
+$$
+\sin\frac\alpha2=\pm\sqrt{\frac{1-\cos\alpha}{2}},
+\qquad
+\cos\frac\alpha2=\pm\sqrt{\frac{1+\cos\alpha}{2}},
+$$
+
+$$
+\tan\frac\alpha2=\frac{\sin\alpha}{1+\cos\alpha}=\frac{1-\cos\alpha}{\sin\alpha},
+$$
+
+符号由 $\frac\alpha2$ 所在象限决定。
+
+### 3.4.5 积化和差与和差化积
+
+积化和差：
+
+$$
+\sin\alpha\cos\beta=\frac12[\sin(\alpha+\beta)+\sin(\alpha-\beta)],
+$$
+
+$$
+\cos\alpha\sin\beta=\frac12[\sin(\alpha+\beta)-\sin(\alpha-\beta)],
+$$
+
+$$
+\cos\alpha\cos\beta=\frac12[\cos(\alpha+\beta)+\cos(\alpha-\beta)],
+$$
+
+$$
+\sin\alpha\sin\beta=\frac12[\cos(\alpha-\beta)-\cos(\alpha+\beta)].
+$$
+
+和差化积：
+
+$$
+\sin A+\sin B=2\sin\frac{A+B}{2}\cos\frac{A-B}{2},
+$$
+
+$$
+\sin A-\sin B=2\cos\frac{A+B}{2}\sin\frac{A-B}{2},
+$$
+
+$$
+\cos A+\cos B=2\cos\frac{A+B}{2}\cos\frac{A-B}{2},
+$$
+
+$$
+\cos A-\cos B=-2\sin\frac{A+B}{2}\sin\frac{A-B}{2}.
+$$
+
+这些公式在求积分、Fourier 级数和信号处理中非常常见。例如积分 $\int\sin mx\cos nx\,dx$ 往往先积化和差。
+
+### 3.4.6 恒等式证明策略
+
+证明三角恒等式时，常用策略如下：
+
+1. **从复杂一边化向简单一边**；
+2. **全部化成 $\sin$ 和 $\cos$**；
+3. **使用 $\sin^2x+\cos^2x=1$ 消去平方项**；
+4. **遇到 $2x$ 考虑倍角，遇到 $\frac x2$ 考虑半角**；
+5. **先写定义域限制**，避免在分母为零处做非法变形。
+
+> **例题 3.5** 证明
+> $$
+> \frac{1-\cos2x}{\sin2x}=\tan x.
+> $$
+
+**解**：当 $\sin2x\ne0$ 且 $\cos x\ne0$ 时，
+
+$$
+\begin{aligned}
+\frac{1-\cos2x}{\sin2x}
+&=\frac{1-(1-2\sin^2x)}{2\sin x\cos x}\\
+&=\frac{2\sin^2x}{2\sin x\cos x}\\
+&=\frac{\sin x}{\cos x}\\
+&=\tan x.
+\end{aligned}
+$$
+
+证毕。 $\square$
+
+---
+
+## 3.5 三角方程与不等式入门
+
+### 3.5.1 基本三角方程
+
+基本方程的通解应同时表达周期性和对称性。
+
+若 $a\in[-1,1]$，设 $\alpha=\arcsin a$，则
+
+$$
+\sin x=a
+\quad\Longleftrightarrow\quad
+x=\alpha+2k\pi\ \text{或}\ x=\pi-\alpha+2k\pi,
+\quad k\in\mathbb Z.
+$$
+
+若 $a\in[-1,1]$，设 $\beta=\arccos a$，则
+
+$$
+\cos x=a
+\quad\Longleftrightarrow\quad
+x=\pm\beta+2k\pi,
+\quad k\in\mathbb Z.
+$$
+
+若 $a\in\mathbb R$，设 $\gamma=\arctan a$，则
+
+$$
+\tan x=a
+\quad\Longleftrightarrow\quad
+x=\gamma+k\pi,
+\quad k\in\mathbb Z.
+$$
+
+> **例题 3.6** 解方程 $\sin x=\frac{\sqrt3}{2}$，并写出 $[0,2\pi]$ 内全部解。
+
+**解**：参考角为 $\frac\pi3$。正弦为正在第一、第二象限，所以
+
+$$
+x=\frac\pi3+2k\pi
+\quad\text{或}\quad
+x=\frac{2\pi}{3}+2k\pi,
+\quad k\in\mathbb Z.
+$$
+
+在 $[0,2\pi]$ 内，解为
+
+$$
+x=\frac\pi3,\quad \frac{2\pi}{3}.
+$$
+
+### 3.5.2 三角不等式的单位圆理解
+
+例如解
+
+$$
+\sin x\ge\frac12.
+$$
+
+在单位圆上，$y\ge\frac12$ 的弧段对应
+
+$$
+x\in\left[\frac\pi6,\frac{5\pi}{6}\right]+2k\pi,
+\quad k\in\mathbb Z.
+$$
+
+三角不等式的关键是把函数值看作单位圆上的坐标，再找满足坐标条件的弧段。
+
+---
+
+## 3.6 反三角函数
+
+三角函数有周期性，所以不是一一映射，不能直接在整个定义域上取反函数。为了定义反函数，需要选定一个**主值区间**，使原函数在该区间上一一对应。
+
+### 3.6.1 反正弦函数
+
+$y=\arcsin x$ 是 $y=\sin y$ 在主值区间 $\left[-\frac\pi2,\frac\pi2\right]$ 上的反函数。
+
+- 定义域：$[-1,1]$；
+- 值域：$\left[-\frac\pi2,\frac\pi2\right]$；
+- 性质：奇函数，单调递增。
+
+基本关系：
+
+$$
+\sin(\arcsin x)=x,
+\qquad x\in[-1,1],
+$$
+
+$$
+\arcsin(\sin x)=x,
+\qquad x\in\left[-\frac\pi2,\frac\pi2\right].
+$$
+
+第二个式子只在主值区间内直接成立；主值区间外必须先把角折回主值区间。
+
+### 3.6.2 反余弦函数
+
+$y=\arccos x$ 是 $y=\cos y$ 在主值区间 $[0,\pi]$ 上的反函数。
+
+- 定义域：$[-1,1]$；
+- 值域：$[0,\pi]$；
+- 性质：单调递减，非奇非偶。
+
+基本关系：
+
+$$
+\cos(\arccos x)=x,
+\qquad x\in[-1,1],
+$$
+
+$$
+\arccos(\cos x)=x,
+\qquad x\in[0,\pi].
+$$
+
+重要恒等式：
+
+$$
+\arcsin x+\arccos x=\frac\pi2,
+\qquad x\in[-1,1].
+$$
+
+### 3.6.3 反正切函数
+
+$y=\arctan x$ 是 $y=\tan y$ 在主值区间 $\left(-\frac\pi2,\frac\pi2\right)$ 上的反函数。
+
+- 定义域：$\mathbb R$；
+- 值域：$\left(-\frac\pi2,\frac\pi2\right)$；
+- 性质：奇函数，单调递增；
+- 渐近行为：$x\to+\infty$ 时 $\arctan x\to\frac\pi2$，$x\to-\infty$ 时 $\arctan x\to-\frac\pi2$。
+
+基本关系：
+
+$$
+\tan(\arctan x)=x,
+\qquad x\in\mathbb R,
+$$
+
+$$
+\arctan(\tan x)=x,
+\qquad x\in\left(-\frac\pi2,\frac\pi2\right).
+$$
+
+常用关系：
+
+$$
+\arctan x+\arctan\frac1x=
+\begin{cases}
+\frac\pi2, & x>0,\\
+-\frac\pi2, & x<0.
+\end{cases}
+$$
+
+> **例题 3.7** 求 $\arcsin\left(\sin\frac{5\pi}{6}\right)$、$\arccos\left(\cos\frac{5\pi}{3}\right)$ 和 $\arctan(\tan\frac{7\pi}{4})$。
 
 **解**：
 
-由于 $\sin\left(-\frac{\pi}{3}\right) = -\frac{\sqrt{3}}{2}$ 且 $-\frac{\pi}{3} \in \left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$，故
+$\arcsin$ 的值域是 $\left[-\frac\pi2,\frac\pi2\right]$。由于
 
-$$\arcsin\left(-\frac{\sqrt{3}}{2}\right) = -\frac{\pi}{3}$$
+$$
+\sin\frac{5\pi}{6}=\frac12=\sin\frac\pi6,
+$$
 
-由于 $\tan\left(-\frac{\pi}{4}\right) = -1$ 且 $-\frac{\pi}{4} \in \left(-\frac{\pi}{2}, \frac{\pi}{2}\right)$，故
+且 $\frac\pi6$ 在主值区间内，所以
 
-$$\arctan(-1) = -\frac{\pi}{4}$$
+$$
+\arcsin\left(\sin\frac{5\pi}{6}\right)=\frac\pi6.
+$$
+
+$\arccos$ 的值域是 $[0,\pi]$。由于
+
+$$
+\cos\frac{5\pi}{3}=\frac12=\cos\frac\pi3,
+$$
+
+且 $\frac\pi3$ 在主值区间内，所以
+
+$$
+\arccos\left(\cos\frac{5\pi}{3}\right)=\frac\pi3.
+$$
+
+$\arctan$ 的值域是 $\left(-\frac\pi2,\frac\pi2\right)$。由于 $\frac{7\pi}{4}$ 与 $-\frac\pi4$ 相差 $2\pi$，且 $-\frac\pi4$ 在主值区间内，所以
+
+$$
+\arctan\left(\tan\frac{7\pi}{4}\right)=-\frac\pi4.
+$$
+
+---
+
+## 3.7 与微积分的连接
+
+本章是后续微积分中许多重要结论的前置基础。
+
+### 3.7.1 两个重要极限
+
+后面学习极限时会证明：
+
+$$
+\lim_{x\to0}\frac{\sin x}{x}=1,
+\qquad
+\lim_{x\to0}\frac{1-\cos x}{x}=0.
+$$
+
+这些极限只有在 $x$ 使用弧度时才具有这种简洁形式。若用角度制，导数公式会多出常数因子。
+
+### 3.7.2 导数与积分
+
+三角函数的基本导数公式是：
+
+$$
+(\sin x)'=\cos x,
+\qquad
+(\cos x)'=-\sin x,
+\qquad
+(\tan x)'=\sec^2x.
+$$
+
+相应地，不定积分中会出现：
+
+$$
+\int\cos x\,dx=\sin x+C,
+\qquad
+\int\sin x\,dx=-\cos x+C.
+$$
+
+反三角函数也会出现在积分中，例如：
+
+$$
+\int\frac1{1+x^2}\,dx=\arctan x+C,
+$$
+
+$$
+\int\frac1{\sqrt{1-x^2}}\,dx=\arcsin x+C.
+$$
+
+### 3.7.3 极坐标与旋转矩阵
+
+单位圆点可写为
+
+$$
+(\cos\theta,\sin\theta).
+$$
+
+平面中半径为 $r$、极角为 $\theta$ 的点可写为
+
+$$
+(x,y)=(r\cos\theta,r\sin\theta).
+$$
+
+二维旋转矩阵为
+
+$$
+R_\theta=
+\begin{bmatrix}
+\cos\theta & -\sin\theta\\
+\sin\theta & \cos\theta
+\end{bmatrix}.
+$$
+
+它本质上就是和差公式的矩阵形式。
+
+---
+
+## 3.8 深度学习应用
+
+三角函数在现代深度学习中有多处核心应用，以下介绍三个重要场景。
+
+### 3.8.1 Transformer 中的位置编码
+
+Transformer 模型处理序列时，自注意力机制本身不含位置信息，需要额外的**位置编码**（Positional Encoding）来注入序列顺序。Vaswani 等人（2017）选择正弦/余弦函数：
+
+$$
+PE_{(pos,2i)}=\sin\left(\frac{pos}{10000^{2i/d}}\right),
+$$
+
+$$
+PE_{(pos,2i+1)}=\cos\left(\frac{pos}{10000^{2i/d}}\right).
+$$
+
+其中 $pos$ 是词在序列中的位置，$i$ 是维度索引，$d$ 是模型的嵌入维度。
+
+关键优势在于：对固定偏移 $k$，$PE_{pos+k}$ 可以由 $PE_{pos}$ 通过线性变换表示。这直接来自和差公式：
+
+$$
+\sin(A+B)=\sin A\cos B+\cos A\sin B.
+$$
+
+因此模型可以通过线性运算学习相对位置关系。
+
+### 3.8.2 Fourier 特征
+
+神经网络常有谱偏差：更容易学习低频函数，较难学习高频细节。Fourier 特征把输入 $\mathbf x$ 映射到正弦、余弦特征空间：
+
+$$
+\gamma(\mathbf x)=\left[\cos(2\pi\mathbf B\mathbf x),\ \sin(2\pi\mathbf B\mathbf x)\right].
+$$
+
+这种映射常用于 NeRF、隐式神经表示和核方法近似中，使模型更容易表示快速变化的函数。
+
+### 3.8.3 周期特征工程
+
+现实数据经常具有周期性：小时、星期、月份、季节等。若周期为 $T$，可把时间 $t$ 编码为
+
+$$
+\left(\sin\frac{2\pi t}{T},\ \cos\frac{2\pi t}{T}\right).
+$$
+
+使用一对 $\sin$、$\cos$ 而不是单个函数，是为了避免歧义。单个 $\sin$ 在一个周期内不是单射，而二维向量位于单位圆上，可以唯一表示周期中的相位。
+
+### 代码示例：Transformer 位置编码
+
+```python
+import math
+import torch
+
+
+def positional_encoding(seq_len, d_model):
+    """Transformer 正余弦位置编码。"""
+    pe = torch.zeros(seq_len, d_model)
+    position = torch.arange(0, seq_len).unsqueeze(1).float()
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+    )
+
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+pe = positional_encoding(seq_len=100, d_model=512)
+print(pe.shape)  # torch.Size([100, 512])
+```
+
+`div_term` 利用指数与对数的等价形式：
+
+$$
+\frac1{10000^{2i/d}}=e^{-\frac{2i}{d}\ln10000}.
+$$
 
 ---
 
 ## 本章小结
 
-1. **三角函数的定义**：通过单位圆将三角函数推广到任意实数，弧度制是微积分的标准角度度量。
-
-2. **基本性质**：三角函数具有周期性、奇偶性、单调性和有界性，这些性质在分析中有重要应用。
-
-3. **三角恒等式**：包括基本恒等式、和差公式、倍角公式、半角公式、积化和差与和差化积，是化简和证明的有力工具。
-
-4. **反三角函数**：通过限制三角函数的定义域得到一一映射，从而定义反函数。$\arcsin$、$\arccos$、$\arctan$ 是最常用的三个反三角函数。
+1. **弧度制**把角度与单位圆弧长统一起来，是微积分中最自然的角度单位。
+2. **单位圆定义**将三角函数推广为实数函数，参考角与象限符号是任意角求值的核心。
+3. **基本性质**包括定义域、值域、周期性、奇偶性、单调性、有界性和图像变换。
+4. **三角恒等式**主要来自单位圆与旋转，核心公式包括平方关系、和差公式、倍角公式、半角公式、积化和差与和差化积。
+5. **反三角函数**依赖主值区间。处理复合表达式时，要把结果落回对应反函数的值域。
+6. **应用连接**包括极限、求导、积分、极坐标、Fourier 分析、位置编码与周期特征工程。
 
 ---
 
-## 深度学习应用
+## 资料与延伸阅读
 
-三角函数在现代深度学习中有多处核心应用，以下介绍三个重要场景。
-
-### 3.5.1 Transformer 中的位置编码
-
-Transformer 模型处理序列时，自注意力机制本身不含位置信息，需要额外的**位置编码**（Positional Encoding）来注入序列顺序。Vaswani 等人（2017）选择正弦/余弦函数：
-
-$$PE_{(pos,\ 2i)} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right)$$
-
-$$PE_{(pos,\ 2i+1)} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)$$
-
-其中 $pos$ 是词在序列中的位置，$i$ 是维度索引，$d$ 是模型的嵌入维度。
-
-**为什么使用三角函数？**
-
-关键优势在于**相对位置可以用线性变换表示**。对于固定的偏移量 $k$，$PE_{pos+k}$ 可以表示为 $PE_{pos}$ 的线性函数——这直接来自正弦/余弦的和差公式：
-
-$$\sin(A + B) = \sin A\cos B + \cos A\sin B$$
-
-因此模型可以通过线性运算学习到"某个位置比另一个位置早 $k$ 步"这一相对关系，而这对绝对位置编码方案（如可学习的嵌入）并不成立。
-
-### 3.5.2 傅里叶特征（Fourier Features）
-
-神经网络难以直接拟合高频函数（谱偏差/频率偏置）。**随机傅里叶特征**（Random Fourier Features，Rahimi & Recht 2007）将低维输入 $\mathbf{x} \in \mathbb{R}^n$ 映射到高维特征空间：
-
-$$\gamma(\mathbf{x}) = \left[\cos(2\pi \mathbf{B}\mathbf{x}),\ \sin(2\pi \mathbf{B}\mathbf{x})\right]$$
-
-其中 $\mathbf{B}$ 的每一行从高斯分布中随机采样。这一映射将核函数的内积近似为欧氏空间的内积，同时帮助网络突破谱偏差，更好地学习高频细节——在 NeRF（神经辐射场）等任务中效果显著。
-
-### 3.5.3 周期性数据建模
-
-现实中大量数据具有周期性：日销售量（7 天周期）、电力负荷（24 小时周期）、气温（365 天周期）。将原始时间特征 $t$ 转化为三角函数特征，能让模型无需学习即可感知周期性：
-
-$$\left(\sin\frac{2\pi t}{T},\ \cos\frac{2\pi t}{T}\right)$$
-
-使用**一对** $(\sin, \cos)$ 而非单个函数的原因：单个 $\sin$ 或 $\cos$ 在一个周期内不是单射（同一函数值对应两个时间点），而二维向量 $(\sin\theta, \cos\theta)$ 在单位圆上唯一确定角度 $\theta$，从而无歧义地表示周期内的相对位置。
-
-### 代码示例：Transformer 位置编码实现
-
-```python
-import torch
-import math
-
-def positional_encoding(seq_len, d_model):
-    """Transformer位置编码"""
-    pe = torch.zeros(seq_len, d_model)
-    position = torch.arange(0, seq_len).unsqueeze(1).float()
-
-    div_term = torch.exp(torch.arange(0, d_model, 2).float() *
-                         (-math.log(10000.0) / d_model))
-
-    pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维度
-    pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维度
-
-    return pe
-
-# 示例
-pe = positional_encoding(seq_len=100, d_model=512)
-print(f"位置编码形状: {pe.shape}")  # torch.Size([100, 512])
-```
-
-`div_term` 的计算利用了指数与对数的等价形式：
-
-$$\frac{1}{10000^{2i/d}} = e^{-\frac{2i}{d}\ln 10000}$$
-
-用指数运算代替幂运算，在数值上更稳定。
+- [OpenStax Calculus Volume 1, Section 1.3: Trigonometric Functions](https://openstax.org/books/calculus-volume-1/pages/1-3-trigonometric-functions)。重点参考弧度制、单位圆、六个三角函数和基本恒等式。
+- [OpenStax Precalculus 2e, Section 6.3: Inverse Trigonometric Functions](https://openstax.org/books/precalculus-2e/pages/6-3-inverse-trigonometric-functions)。重点参考反三角函数的主值区间与复合表达式。
+- [OpenStax Precalculus 2e, Appendix A: Basic Functions and Identities](https://openstax.org/books/precalculus-2e/pages/a-basic-functions-and-identities)。重点参考三角图像与恒等式汇总。
+- [Paul's Online Math Notes, Algebra/Trig Review](https://tutorial.math.lamar.edu/extras/algebratrigreview/TrigIntro.aspx)。重点参考三角函数求值、单位圆与反三角函数常见误区。
+- [Khan Academy Trigonometry: Unit circle with radians](https://www.khanacademy.org/math/trigonometry/unit-circle-trig-func/radians_tutorial)。重点参考弧度、单位圆和交互式练习路径。
 
 ---
 
 ## 练习题
 
 **1.** ⭐ 将下列角度化为弧度，或将弧度化为角度：
-   (a) $150°$　　(b) $-45°$　　(c) $\frac{5\pi}{6}$　　(d) $-\frac{3\pi}{4}$
+   (a) $150^\circ$　　(b) $-45^\circ$　　(c) $\frac{5\pi}{6}$　　(d) $-\frac{3\pi}{4}$
 
 **2.** ⭐ 求下列三角函数值：
    (a) $\sin\frac{7\pi}{6}$　　(b) $\cos\left(-\frac{5\pi}{3}\right)$　　(c) $\tan\frac{3\pi}{4}$
 
-**3.** ⭐⭐ 已知 $\sin\alpha = \frac{3}{5}$，$\alpha \in \left(\frac{\pi}{2}, \pi\right)$，求 $\cos\alpha$、$\tan\alpha$ 和 $\sin 2\alpha$ 的值。
+**3.** ⭐ 已知 $\sin\alpha=\frac35$，$\alpha\in\left(\frac\pi2,\pi\right)$，求 $\cos\alpha$、$\tan\alpha$ 和 $\sin2\alpha$ 的值。
 
-**4.** ⭐⭐ 证明恒等式：$\frac{1 - \cos 2x}{\sin 2x} = \tan x$
+**4.** ⭐⭐ 证明恒等式：$\frac{1-\cos2x}{\sin2x}=\tan x$，并说明该等式成立时需要排除哪些 $x$。
 
-**5.** ⭐⭐⭐ 求 $\arcsin\left(\sin\frac{5\pi}{6}\right)$ 和 $\arccos\left(\cos\frac{5\pi}{3}\right)$ 的值。
+**5.** ⭐⭐ 求 $\arcsin\left(\sin\frac{5\pi}{6}\right)$、$\arccos\left(\cos\frac{5\pi}{3}\right)$ 和 $\arctan\left(\tan\frac{7\pi}{4}\right)$ 的值。
+
+**6.** ⭐⭐ 解方程
+$$
+\sin x=\frac{\sqrt3}{2},
+$$
+写出通解，并写出 $x\in[0,2\pi]$ 内的全部解。
+
+**7.** ⭐⭐⭐ 已知 $y=2\cos(3x+\frac\pi2)-1$，求它的振幅、周期、相位平移和中心线，并说明其图像由 $y=\cos x$ 经过哪些变换得到。
+
+**8.** ⭐⭐⭐ 
+Transformer 的正余弦位置编码常写作 $(\sin t,\cos t)$。证明对任意位移 $\delta$，
+
+$$
+\begin{bmatrix}
+\sin(t+\delta)\\
+\cos(t+\delta)
+\end{bmatrix} =
+\begin{bmatrix}
+\cos\delta & \sin\delta\\
+-\sin\delta & \cos\delta
+\end{bmatrix}
+\begin{bmatrix}
+\sin t\\
+\cos t
+\end{bmatrix},
+$$
+
+并说明为什么这种表示会保持向量长度不变。
 
 ---
 
@@ -384,60 +925,181 @@ $$\frac{1}{10000^{2i/d}} = e^{-\frac{2i}{d}\ln 10000}$$
 <summary>点击展开答案</summary>
 
 **1.**
-(a) $150° = 150 \times \frac{\pi}{180} = \frac{5\pi}{6}$
+(a) $150^\circ=150\cdot\frac\pi{180}=\frac{5\pi}{6}$。
 
-(b) $-45° = -45 \times \frac{\pi}{180} = -\frac{\pi}{4}$
+(b) $-45^\circ=-45\cdot\frac\pi{180}=-\frac\pi4$。
 
-(c) $\frac{5\pi}{6} = \frac{5\pi}{6} \times \frac{180}{\pi} = 150°$
+(c) $\frac{5\pi}{6}=\frac{5\pi}{6}\cdot\frac{180^\circ}{\pi}=150^\circ$。
 
-(d) $-\frac{3\pi}{4} = -\frac{3\pi}{4} \times \frac{180}{\pi} = -135°$
+(d) $-\frac{3\pi}{4}=-\frac{3\pi}{4}\cdot\frac{180^\circ}{\pi}=-135^\circ$。
 
 ---
 
 **2.**
-(a) $\frac{7\pi}{6} = \pi + \frac{\pi}{6}$，在第三象限，$\sin\frac{7\pi}{6} = -\sin\frac{\pi}{6} = -\frac{1}{2}$
+(a) $\frac{7\pi}{6}=\pi+\frac\pi6$，在第三象限，正弦为负，所以
+$$
+\sin\frac{7\pi}{6}=-\sin\frac\pi6=-\frac12.
+$$
 
-(b) $-\frac{5\pi}{3}$ 与 $\frac{\pi}{3}$ 终边相同，$\cos\left(-\frac{5\pi}{3}\right) = \cos\frac{\pi}{3} = \frac{1}{2}$
+(b) $-\frac{5\pi}{3}+2\pi=\frac\pi3$，所以
+$$
+\cos\left(-\frac{5\pi}{3}\right)=\cos\frac\pi3=\frac12.
+$$
 
-(c) $\frac{3\pi}{4} = \pi - \frac{\pi}{4}$，在第二象限，$\tan\frac{3\pi}{4} = -\tan\frac{\pi}{4} = -1$
-
----
-
-**3.** 由于 $\alpha \in \left(\frac{\pi}{2}, \pi\right)$（第二象限），$\cos\alpha < 0$。
-
-由 $\sin^2\alpha + \cos^2\alpha = 1$：
-
-$$\cos\alpha = -\sqrt{1 - \sin^2\alpha} = -\sqrt{1 - \frac{9}{25}} = -\frac{4}{5}$$
-
-$$\tan\alpha = \frac{\sin\alpha}{\cos\alpha} = \frac{3/5}{-4/5} = -\frac{3}{4}$$
-
-$$\sin 2\alpha = 2\sin\alpha\cos\alpha = 2 \times \frac{3}{5} \times \left(-\frac{4}{5}\right) = -\frac{24}{25}$$
+(c) $\frac{3\pi}{4}=\pi-\frac\pi4$，在第二象限，正切为负，所以
+$$
+\tan\frac{3\pi}{4}=-\tan\frac\pi4=-1.
+$$
 
 ---
 
-**4.** **证明**：利用倍角公式
+**3.** 因为 $\alpha\in\left(\frac\pi2,\pi\right)$，所以 $\alpha$ 在第二象限，$\cos\alpha<0$。
 
-$$\frac{1 - \cos 2x}{\sin 2x} = \frac{1 - (1 - 2\sin^2 x)}{2\sin x\cos x} = \frac{2\sin^2 x}{2\sin x\cos x} = \frac{\sin x}{\cos x} = \tan x$$
+由 $\sin^2\alpha+\cos^2\alpha=1$，
+$$
+\cos\alpha=-\sqrt{1-\sin^2\alpha}
+=-\sqrt{1-\frac9{25}}
+=-\frac45.
+$$
+
+因此
+$$
+\tan\alpha=\frac{\sin\alpha}{\cos\alpha}=\frac{3/5}{-4/5}=-\frac34,
+$$
+
+$$
+\sin2\alpha=2\sin\alpha\cos\alpha
+=2\cdot\frac35\cdot\left(-\frac45\right)
+=-\frac{24}{25}.
+$$
+
+---
+
+**4.** 当原式有意义且化简过程中不除以 $0$ 时，需要 $\sin2x\ne0$ 且 $\cos x\ne0$。由于 $\sin2x=2\sin x\cos x$，这等价于 $\sin x\ne0$ 且 $\cos x\ne0$，即
+$$
+x\ne\frac{k\pi}{2},\qquad k\in\mathbb Z.
+$$
+
+在这些点之外，利用倍角公式：
+$$
+\begin{aligned}
+\frac{1-\cos2x}{\sin2x}
+&=\frac{1-(1-2\sin^2x)}{2\sin x\cos x}\\
+&=\frac{2\sin^2x}{2\sin x\cos x}\\
+&=\frac{\sin x}{\cos x}\\
+&=\tan x.
+\end{aligned}
+$$
 
 证毕。 $\square$
 
 ---
 
 **5.**
-对于 $\arcsin\left(\sin\frac{5\pi}{6}\right)$：
 
-$\sin\frac{5\pi}{6} = \sin\left(\pi - \frac{\pi}{6}\right) = \sin\frac{\pi}{6} = \frac{1}{2}$
+对 $\arcsin\left(\sin\frac{5\pi}{6}\right)$：
+$$
+\sin\frac{5\pi}{6}=\frac12=\sin\frac\pi6.
+$$
+由于 $\arcsin$ 的值域是 $\left[-\frac\pi2,\frac\pi2\right]$，而 $\frac\pi6$ 在该区间内，所以
+$$
+\arcsin\left(\sin\frac{5\pi}{6}\right)=\frac\pi6.
+$$
 
-由于 $\arcsin$ 的值域是 $\left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$，而 $\frac{\pi}{6} \in \left[-\frac{\pi}{2}, \frac{\pi}{2}\right]$，故
+对 $\arccos\left(\cos\frac{5\pi}{3}\right)$：
+$$
+\cos\frac{5\pi}{3}=\frac12=\cos\frac\pi3.
+$$
+由于 $\arccos$ 的值域是 $[0,\pi]$，而 $\frac\pi3$ 在该区间内，所以
+$$
+\arccos\left(\cos\frac{5\pi}{3}\right)=\frac\pi3.
+$$
 
-$$\arcsin\left(\sin\frac{5\pi}{6}\right) = \arcsin\frac{1}{2} = \frac{\pi}{6}$$
+对 $\arctan\left(\tan\frac{7\pi}{4}\right)$：
+$\frac{7\pi}{4}$ 与 $-\frac\pi4$ 终边相同，且 $-\frac\pi4\in\left(-\frac\pi2,\frac\pi2\right)$，所以
+$$
+\arctan\left(\tan\frac{7\pi}{4}\right)=-\frac\pi4.
+$$
 
-对于 $\arccos\left(\cos\frac{5\pi}{3}\right)$：
+---
 
-$\cos\frac{5\pi}{3} = \cos\left(2\pi - \frac{\pi}{3}\right) = \cos\frac{\pi}{3} = \frac{1}{2}$
+**6.** 在单位圆上，$\sin x=\frac{\sqrt3}{2}$ 的参考角是 $\frac\pi3$，正弦在第一、第二象限为正。
 
-由于 $\arccos$ 的值域是 $[0, \pi]$，而 $\frac{\pi}{3} \in [0, \pi]$，故
+通解为
+$$
+x=\frac\pi3+2k\pi
+\quad\text{或}\quad
+x=\frac{2\pi}{3}+2k\pi,
+\qquad k\in\mathbb Z.
+$$
 
-$$\arccos\left(\cos\frac{5\pi}{3}\right) = \arccos\frac{1}{2} = \frac{\pi}{3}$$
+在 $[0,2\pi]$ 内，全部解为
+$$
+x=\frac\pi3,\qquad x=\frac{2\pi}{3}.
+$$
+
+---
+
+**7.** 将函数改写为
+$$
+y=2\cos\left(3\left(x+\frac\pi6\right)\right)-1.
+$$
+
+所以：
+
+- 振幅为 $2$；
+- 周期为 $\frac{2\pi}{3}$；
+- 相位平移为向左平移 $\frac\pi6$；
+- 中心线为 $y=-1$。
+
+图像可由 $y=\cos x$ 先横向压缩为原来的 $\frac13$，再向左平移 $\frac\pi6$，纵向拉伸为原来的 $2$ 倍，最后向下平移 $1$ 个单位得到。
+
+---
+
+**8.** 由和角公式，
+$$
+\sin(t+\delta)=\sin t\cos\delta+\cos t\sin\delta,
+$$
+$$
+\cos(t+\delta)=\cos t\cos\delta-\sin t\sin\delta.
+$$
+
+写成矩阵形式就是
+$$
+\begin{bmatrix}
+\sin(t+\delta)\\
+\cos(t+\delta)
+\end{bmatrix}
+=
+\begin{bmatrix}
+\cos\delta & \sin\delta\\
+-\sin\delta & \cos\delta
+\end{bmatrix}
+\begin{bmatrix}
+\sin t\\
+\cos t
+\end{bmatrix}.
+$$
+
+记该矩阵为 $M$，则
+$$
+M^TM=
+\begin{bmatrix}
+\cos\delta & -\sin\delta\\
+\sin\delta & \cos\delta
+\end{bmatrix}
+\begin{bmatrix}
+\cos\delta & \sin\delta\\
+-\sin\delta & \cos\delta
+\end{bmatrix}
+=I.
+$$
+
+因此 $M$ 是正交矩阵，会保持向量长度不变。等价地，
+$$
+\sin^2(t+\delta)+\cos^2(t+\delta)=1=\sin^2t+\cos^2t.
+$$
+
+这说明位置平移对应二维旋转变换，它改变相位，但不改变模长。这也是正余弦位置编码便于表达相对位移的原因。
 
 </details>

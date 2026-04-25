@@ -475,6 +475,151 @@ $$\frac{\partial u}{\partial y} = -\frac{1}{x} + \varphi'(y) = -\frac{1}{x}$$
 
 ---
 
+## 23.6 常微分方程组
+
+### 23.6.1 向量形式与高阶方程化一阶系统
+
+一阶常微分方程并不一定只有一个未知函数。更一般地，我们常写成向量形式：
+
+$$
+\frac{d\mathbf{x}}{dt}=f(\mathbf{x},t),\qquad \mathbf{x}\in\mathbb R^n.
+$$
+
+这就是**常微分方程组**。它的重要性在于：
+
+- 实际系统往往同时跟踪多个状态变量
+- 高阶方程可以统一改写为一阶系统
+- Neural ODE、控制系统、动力系统都天然采用这种形式
+
+例如二阶方程
+
+$$
+mx''+cx'+kx=0
+$$
+
+令 $x_1=x,\ x_2=x'$，则
+
+$$
+\begin{cases}
+x_1' = x_2,\\
+x_2' = -\dfrac{k}{m}x_1-\dfrac{c}{m}x_2.
+\end{cases}
+$$
+
+这就把二阶方程转化为了二维一阶系统。
+
+### 23.6.2 线性系统与矩阵指数
+
+最基本的一阶系统是
+
+$$
+\frac{d\mathbf{x}}{dt}=A\mathbf{x},
+$$
+
+其中 $A$ 是常矩阵。它的解可写成
+
+$$
+\mathbf{x}(t)=e^{At}\mathbf{x}(0),
+$$
+
+这里
+
+$$
+e^{At}=I+At+\frac{(At)^2}{2!}+\frac{(At)^3}{3!}+\cdots
+$$
+
+称为**矩阵指数**。
+
+若 $A=P\Lambda P^{-1}$ 可对角化，则
+
+$$
+e^{At}=Pe^{\Lambda t}P^{-1},
+$$
+
+而 $e^{\Lambda t}$ 只需对角元逐个指数化即可。
+
+**特征值决定动态行为**：
+
+- $\mathrm{Re}(\lambda)<0$：衰减，系统稳定
+- $\mathrm{Re}(\lambda)>0$：增长，系统不稳定
+- $\mathrm{Re}(\lambda)=0$：振荡或临界情况
+
+> **例题 23.13** 求解系统
+> $$
+> \frac{d}{dt}
+> \begin{bmatrix}
+> x\\y
+> \end{bmatrix}
+> =
+> \begin{bmatrix}
+> 0 & 1\\
+> -2 & -3
+> \end{bmatrix}
+> \begin{bmatrix}
+> x\\y
+> \end{bmatrix}.
+> $$
+
+**解**：矩阵的特征方程为
+
+$$
+\lambda^2+3\lambda+2=0,
+$$
+
+解得 $\lambda_1=-1,\ \lambda_2=-2$，都为负，因此系统稳定。
+
+把它理解成方程 $x''+3x'+2x=0$，则
+
+$$
+x(t)=C_1e^{-t}+C_2e^{-2t},
+$$
+
+再由 $y=x'$ 得
+
+$$
+y(t)=-C_1e^{-t}-2C_2e^{-2t}.
+$$
+
+这就是系统通解。$\square$
+
+### 23.6.3 AI 应用：Neural ODE、数值求解与稳定性
+
+Neural ODE 的真实形式并不是单个标量方程，而是高维系统：
+
+$$
+\frac{d\mathbf{h}(t)}{dt}=f_\theta(\mathbf{h}(t),t),
+$$
+
+其中 $\mathbf{h}(t)\in\mathbb R^n$ 是隐藏状态。
+
+实际求解时，需要数值方法：
+
+- **Euler 法**
+  $$
+  x_{n+1}=x_n+h f(x_n,t_n)
+  $$
+- **四阶 Runge-Kutta（RK4）**
+  精度更高，但每一步计算更多
+- **自适应步长方法**
+  在简单区域用大步，在剧烈变化区用小步
+
+这恰好对应深度学习里的工程权衡：
+
+- 步数少，速度快，但误差可能大
+- 步数多，精度高，但计算更慢
+
+从 ResNet 角度看，
+
+$$
+h_{k+1}=h_k+f(h_k)
+$$
+
+就像对连续系统做一步 Euler 离散化。于是“层数很深的残差网络”可以看作“连续动力系统的离散近似”。
+
+稳定性也与 Jacobian 特征值有关：若局部线性化后特征值实部过大，数值积分与训练都更容易不稳定。
+
+---
+
 ## 本章小结
 
 1. **微分方程基本概念**：
@@ -493,6 +638,11 @@ $$\frac{\partial u}{\partial y} = -\frac{1}{x} + \varphi'(y) = -\frac{1}{x}$$
 5. **全微分方程** $M \, dx + N \, dy = 0$：
    - 恰当条件：$\dfrac{\partial M}{\partial y} = \dfrac{\partial N}{\partial x}$
    - 不恰当时可尝试找积分因子
+
+6. **常微分方程组**：
+   - 向量形式统一描述多状态系统
+   - 高阶 ODE 可转化为一阶系统
+   - 线性系统的动态由矩阵特征值决定
 
 ---
 
@@ -629,19 +779,47 @@ print(f"梯度流轨迹: 从 {trajectory[0]:.2f} 收敛到 {trajectory[-1]:.2f}"
 
 ## 练习题
 
-**1.** 求方程 $\dfrac{dy}{dx} = \dfrac{y}{x + y^2}$ 的通解。
+**1.** ⭐ 求方程 $\dfrac{dy}{dx} = \dfrac{y}{x + y^2}$ 的通解。
 
 （提示：将 $x$ 看作 $y$ 的函数，方程变为 $\dfrac{dx}{dy} = \dfrac{x + y^2}{y}$）
 
-**2.** 求初值问题 $\begin{cases} y' + y\tan x = \sin 2x \\ y(0) = 1 \end{cases}$ 的解。
+**2.** ⭐ 求初值问题 $\begin{cases} y' + y\tan x = \sin 2x \\ y(0) = 1 \end{cases}$ 的解。
 
-**3.** 求方程 $y' + xy = xy^3$ 的通解。
+**3.** ⭐ 求方程 $y' + xy = xy^3$ 的通解。
 
-**4.** 验证 $(3x^2 + 6xy^2) \, dx + (6x^2 y + 4y^3) \, dy = 0$ 是恰当方程，并求其通解。
+**4.** ⭐⭐ 验证 $(3x^2 + 6xy^2) \, dx + (6x^2 y + 4y^3) \, dy = 0$ 是恰当方程，并求其通解。
 
-**5.** 求方程 $(y + xy) \, dx + (x + xy) \, dy = 0$ 的通解。
+**5.** ⭐⭐ 求方程 $(y + xy) \, dx + (x + xy) \, dy = 0$ 的通解。
 
 （提示：先化简，再判断是否需要积分因子）
+
+**6.** ⭐⭐ 将方程
+$$
+x''+5x'+6x=0
+$$
+改写为一阶系统。
+
+**7.** ⭐⭐⭐ 求解线性系统
+$$
+\frac{d}{dt}
+\begin{bmatrix}
+x\\y
+\end{bmatrix}
+=
+\begin{bmatrix}
+1 & 0\\
+0 & -2
+\end{bmatrix}
+\begin{bmatrix}
+x\\y
+\end{bmatrix}.
+$$
+
+**8.** ⭐⭐⭐ 编程题：用 Euler 法与 RK4 分别求解初值问题
+$$
+x'=-x,\qquad x(0)=1,
+$$
+比较在同样步数下两者对 $x(1)=e^{-1}$ 的误差。
 
 ---
 
@@ -738,12 +916,86 @@ $$\left(\frac{1}{x} + 1\right) dx = -\left(\frac{1}{y} + 1\right) dy$$
 
 两边积分：
 
-$$\ln|x| + x = -\ln|y| - y + C$$
+$$
+\ln|x| + x = -\ln|y| - y + C
+$$
 
-$$\ln|x| + \ln|y| + x + y = C$$
+整理得
 
-$$\ln|xy| + x + y = C$$
+$$
+\ln|x| + \ln|y| + x + y = C
+$$
 
-通解为 $\ln|xy| + x + y = C$。
+即
+
+$$
+\ln|xy| + x + y = C.
+$$
+
+这就是通解。
+
+---
+
+**6.** 令 $x_1=x,\ x_2=x'$，则
+
+$$
+\begin{cases}
+x_1' = x_2,\\
+x_2' = -5x_2-6x_1.
+\end{cases}
+$$
+
+写成矩阵形式为
+
+$$
+\frac{d}{dt}
+\begin{bmatrix}
+x_1\\x_2
+\end{bmatrix}
+=
+\begin{bmatrix}
+0 & 1\\
+-6 & -5
+\end{bmatrix}
+\begin{bmatrix}
+x_1\\x_2
+\end{bmatrix}.
+$$
+
+---
+
+**7.** 这是对角系统，方程可分开求：
+
+$$
+x'=x,\qquad y'=-2y.
+$$
+
+故通解为
+
+$$
+x(t)=C_1e^t,\qquad y(t)=C_2e^{-2t}.
+$$
+
+因此
+
+$$
+\begin{bmatrix}
+x(t)\\y(t)
+\end{bmatrix}
+=
+\begin{bmatrix}
+C_1e^t\\C_2e^{-2t}
+\end{bmatrix}.
+$$
+
+---
+
+**8.** Euler 法一步更新为
+
+$$
+x_{n+1}=x_n-hx_n=(1-h)x_n.
+$$
+
+RK4 对该线性方程的单步精度更高，局部截断误差为 $O(h^5)$，而 Euler 仅为 $O(h^2)$。因此在相同步数下，RK4 对真解 $e^{-1}$ 的近似通常明显更准。编程时可直接计算两者在 $t=1$ 的数值解，再与 $e^{-1}$ 比较误差大小。
 
 </details>
