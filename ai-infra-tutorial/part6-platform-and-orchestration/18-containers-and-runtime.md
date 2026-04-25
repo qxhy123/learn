@@ -2,6 +2,8 @@
 
 > AI 平台里的容器不是简单“打包个 Python 环境”，而是把驱动兼容、框架依赖、设备访问和可复现执行一起封装起来。
 
+> **关联章节**：本章解释“镜像 -> 运行时 -> 设备 -> 驱动”的执行路径，是理解 [第19章](./19-kubernetes-for-ai.md) 中 Pod、Device Plugin 和 GPU 调度的前置。
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -16,7 +18,7 @@
 
 ## 正文内容
 
-## 18.1 AI 容器为什么更复杂
+### 18.1 AI 容器为什么更复杂
 
 普通 Web 服务镜像通常主要关心：
 
@@ -34,14 +36,14 @@ AI 容器则往往还要携带：
 
 这导致 AI 镜像更大、更复杂，也更容易出现兼容性问题。
 
-## 18.2 一条从镜像到 GPU 的运行路径
+### 18.2 一条从镜像到 GPU 的运行路径
 
 可以把运行过程看成：
 
 ```text
 image
   -> container runtime
-  -> device plugin / hooks
+  -> device mounts / NVIDIA container toolkit
   -> host driver
   -> GPU device access
 ```
@@ -53,7 +55,11 @@ image
 - 库加载失败
 - 运行时报错
 
-## 18.3 训练镜像和推理镜像为什么最好分开
+如果是在 Kubernetes 里，这条链路还会再包上一层 `device plugin + 调度 + runtime hook`。也就是说，`device plugin` 是 K8s 场景下的编排接口，不是所有容器运行环境都天然存在的一跳。
+
+这条路径到了 Kubernetes 里，会被包装成 Pod、runtime hook、device plugin 和宿主机驱动的组合链路（详见 [第19章](./19-kubernetes-for-ai.md) §19.5）。
+
+### 18.3 训练镜像和推理镜像为什么最好分开
 
 ### 训练镜像更看重
 
@@ -76,7 +82,7 @@ image
 - 安全面扩大
 - 运维边界模糊
 
-## 18.4 一个镜像分层示例
+### 18.4 一个镜像分层示例
 
 ```text
 base-os
@@ -93,7 +99,54 @@ base-os
 - 团队共用依赖更容易维护
 - 项目变更不会影响基础 GPU 运行层
 
-## 18.5 运行时层的关键关注点
+#### 18.4.1 CUDA 基础镜像选择指南
+
+为什么这里要单独讲基础镜像？因为 AI 镜像里最常见的“能 build、不能跑”问题，往往不是 Python 包，而是 CUDA userspace、框架二进制和宿主机 Driver 的组合关系。
+
+| `nvidia/cuda` 类型 | 适合放什么 | 不适合放什么 | 常见场景 |
+|------|-----------|--------------|----------|
+| `base` | 最小 CUDA userspace 基线、少量自定义运行库 | 直接承载需要完整 CUDA runtime 的训练 / 推理框架 | 自建极简基础层 |
+| `runtime` | CUDA runtime 动态库、框架运行时、推理服务 | 需要 `nvcc`、头文件和静态库的编译步骤 | 推理镜像、纯运行训练镜像 |
+| `devel` | `runtime` + `nvcc` + 头文件 + 编译工具链 | 直接作为生产最终镜像长期运行 | 编译自定义算子、多阶段构建的 builder 层 |
+
+驱动兼容可以先记一条工程规则：**宿主机 Driver 必须满足容器内 CUDA 版本要求；新 Driver 往往能向前兼容旧 CUDA userspace，反过来通常不成立。** 平台如果不维护“Driver 版本 + CUDA 版本 + 框架版本”的支持矩阵，排障会迅速变成黑箱。
+
+| 常见踩坑点 | 典型表现 | 更稳妥的做法 |
+|------|----------|--------------|
+| 宿主机 Driver 偏旧 | 容器能起但框架初始化 GPU 失败 | 先以 Driver 为基线维护受支持 CUDA 列表 |
+| 运行镜像里临时编译扩展 | 启动时缺 `nvcc`、头文件或编译耗时过长 | 编译放到 `devel` builder 阶段，最终镜像只保留产物 |
+| 生产直接用 `devel` 镜像 | 体积过大、漏洞面扩大、冷启动更慢 | 最终层落到 `runtime` 或更小的自定义基线 |
+
+#### 18.4.2 多阶段构建最佳实践
+
+为什么 AI 镜像尤其适合多阶段构建？因为训练和推理经常都需要“编译时很重、运行时很轻”的二段式结构。把编译工具链留在 builder 层，能同时减小镜像体积和攻击面。
+
+| 镜像类型 | builder 层重点 | final 层重点 |
+|------|----------------|-------------|
+| 训练镜像 | 编译自定义算子、安装 profiling / debug 依赖 | 保留训练运行时和必要工具，但去掉无关构建缓存 |
+| 推理镜像 | 预编译 wheel、engine、Tokenizer 资源 | 只保留推理引擎、模型服务入口和最小运行依赖 |
+
+```dockerfile
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --prefix=/opt/venv -r requirements.txt
+COPY . .
+RUN python setup.py bdist_wheel
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /build/dist/*.whl /tmp/
+RUN pip install /tmp/*.whl && rm -rf /tmp/*.whl
+COPY serve.py .
+USER 10001
+CMD ["python", "serve.py"]
+```
+
+这个示例表达的不是固定写法，而是固定边界：**编译、下载、缓存清理放前一层；最终层只留下运行必需品。**
+
+### 18.5 运行时层的关键关注点
 
 ### 设备发现
 
@@ -115,7 +168,17 @@ base-os
 
 容器日志、指标、trace 是否能被平台统一采集。
 
-## 18.6 典型故障模式
+#### 18.5.1 镜像安全
+
+镜像安全不是“上线前扫一次漏洞”这么简单。对 AI 平台来说，更重要的是把镜像治理接到发布默认流程里。
+
+| 安全动作 | 目的 | 平台侧最小要求 |
+|------|------|----------------|
+| 镜像签名 | 确认镜像来源和发布责任 | 关键镜像发布后签名，部署前校验 |
+| 漏洞扫描 | 提前暴露高危系统包和基础镜像问题 | 基线镜像进入仓库前执行扫描 |
+| 非 root 运行 | 降低逃逸和误操作影响面 | 默认使用非 root UID，按需最小化能力 |
+
+### 18.6 典型故障模式
 
 ### 故障一：镜像能起，但 GPU 不可用
 
@@ -141,12 +204,21 @@ base-os
 - 设备拓扑差异
 - 节点本地缓存差异
 
-## 18.7 工程建议
+### 18.7 工程建议
 
 - 维护官方支持的镜像矩阵，而不是让每个项目自由组合
 - 训练和推理镜像分开治理
 - 把镜像版本、驱动版本、框架版本一起纳入排障信息
 - 对关键镜像做漏洞扫描、签名和回滚管理
+
+### 本章涉及的常见工具
+
+| 概念 | 常见工具 / 命令 | 备注 |
+|------|-----------------|------|
+| GPU 容器运行时 | NVIDIA Container Toolkit、`nvidia-smi` | 验证容器是否真实看到 GPU |
+| 多阶段构建 | Docker BuildKit、`docker buildx build` | 适合把 builder 层和 final 层拆开 |
+| 漏洞扫描 | Trivy、`trivy image <image>` | 常用于镜像基线扫描 |
+| 镜像签名 | cosign、`cosign sign` / `cosign verify` | 适合把镜像来源校验接入发布链路 |
 
 ---
 
@@ -167,4 +239,3 @@ base-os
 2. 容器能启动但 GPU 不可用时，你会从哪几层排查？
 3. 请设计一个 AI 镜像的最小分层结构。
 4. 为什么 AI 镜像治理必须和宿主机驱动治理一起看？
-
