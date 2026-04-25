@@ -16,15 +16,32 @@ cd git-tutorial/labs
 
 | Lab id | 对应模块 | 目标 | 场景文件 |
 |---|---|---|---|
-| `LAB-SETUP-STATE-01` | 00/01 | 初始化仓库并观察 working tree/index/HEAD | [scenarios/LAB-SETUP-STATE-01.md](scenarios/LAB-SETUP-STATE-01.md) |
-| `LAB-DAILY-COMMIT-01` | 02 | 拆分提交、审查 diff、保持干净工作区 | [scenarios/LAB-DAILY-COMMIT-01.md](scenarios/LAB-DAILY-COMMIT-01.md) |
-| `LAB-BRANCH-CONFLICT-01` | 03 | 创建任务分支并解决一次冲突 | [scenarios/LAB-BRANCH-CONFLICT-01.md](scenarios/LAB-BRANCH-CONFLICT-01.md) |
-| `LAB-COLLAB-PUSH-REJECTED-01` | 04 | 模拟双人协作和 push rejected | [scenarios/LAB-COLLAB-PUSH-REJECTED-01.md](scenarios/LAB-COLLAB-PUSH-REJECTED-01.md) |
-| `LAB-RECOVERY-RESET-01` | 05 | 练习 restore/reset/revert/reflog 选择边界 | [scenarios/LAB-RECOVERY-RESET-01.md](scenarios/LAB-RECOVERY-RESET-01.md) |
-| `LAB-RELEASE-BISECT-01` | 06 | 标签、hotfix、bisect 定位坏提交 | [scenarios/LAB-RELEASE-BISECT-01.md](scenarios/LAB-RELEASE-BISECT-01.md) |
-| `LAB-GOV-HOOKS-01` | 07 | 本地 hooks、别名、配置层级 | [scenarios/LAB-GOV-HOOKS-01.md](scenarios/LAB-GOV-HOOKS-01.md) |
-| `LAB-GOV-LARGE-REPO-01` | 07 | 大文件、忽略规则、LFS 决策 | [scenarios/LAB-GOV-LARGE-REPO-01.md](scenarios/LAB-GOV-LARGE-REPO-01.md) |
-| `LAB-GOV-DISASTER-01` | 07 | 分支策略和灾难恢复卡片 | [scenarios/LAB-GOV-DISASTER-01.md](scenarios/LAB-GOV-DISASTER-01.md) |
+| `LAB-BRANCH-CONFLICT-01` | 03 | branch conflict 01 | [scenarios/LAB-BRANCH-CONFLICT-01.md](scenarios/LAB-BRANCH-CONFLICT-01.md) |
+| `LAB-BRANCH-REBASE-01` | 03 | branch rebase 01 | [scenarios/LAB-BRANCH-REBASE-01.md](scenarios/LAB-BRANCH-REBASE-01.md) |
+| `LAB-BRANCH-TASK-01` | 03 | branch task 01 | [scenarios/LAB-BRANCH-TASK-01.md](scenarios/LAB-BRANCH-TASK-01.md) |
+| `LAB-COLLAB-PR-01` | 04 | colpr 01 | [scenarios/LAB-COLLAB-PR-01.md](scenarios/LAB-COLLAB-PR-01.md) |
+| `LAB-COLLAB-PUSH-REJECTED-01` | 04 | colpush rejected 01 | [scenarios/LAB-COLLAB-PUSH-REJECTED-01.md](scenarios/LAB-COLLAB-PUSH-REJECTED-01.md) |
+| `LAB-COLLAB-REMOTE-01` | 04 | colremote 01 | [scenarios/LAB-COLLAB-REMOTE-01.md](scenarios/LAB-COLLAB-REMOTE-01.md) |
+| `LAB-DAILY-CLEAN-COMMIT-01` | 02 | daily clean commit 01 | [scenarios/LAB-DAILY-CLEAN-COMMIT-01.md](scenarios/LAB-DAILY-CLEAN-COMMIT-01.md) |
+| `LAB-DAILY-COMMIT-01` | 02 | daily commit 01 | [scenarios/LAB-DAILY-COMMIT-01.md](scenarios/LAB-DAILY-COMMIT-01.md) |
+| `LAB-DAILY-DIFF-REVIEW-01` | 02 | daily diff review 01 | [scenarios/LAB-DAILY-DIFF-REVIEW-01.md](scenarios/LAB-DAILY-DIFF-REVIEW-01.md) |
+| `LAB-DAILY-IGNORE-01` | 02 | daily ignore 01 | [scenarios/LAB-DAILY-IGNORE-01.md](scenarios/LAB-DAILY-IGNORE-01.md) |
+| `LAB-DEBUG-BISECT-01` | 06 | debug bisect 01 | [scenarios/LAB-DEBUG-BISECT-01.md](scenarios/LAB-DEBUG-BISECT-01.md) |
+| `LAB-GOV-DISASTER-01` | 07 | gov disaster 01 | [scenarios/LAB-GOV-DISASTER-01.md](scenarios/LAB-GOV-DISASTER-01.md) |
+| `LAB-GOV-HOOKS-01` | 07 | gov hooks 01 | [scenarios/LAB-GOV-HOOKS-01.md](scenarios/LAB-GOV-HOOKS-01.md) |
+| `LAB-GOV-LARGE-REPO-01` | 07 | gov large repo 01 | [scenarios/LAB-GOV-LARGE-REPO-01.md](scenarios/LAB-GOV-LARGE-REPO-01.md) |
+| `LAB-MODEL-HISTORY-01` | 01 | model history 01 | [scenarios/LAB-MODEL-HISTORY-01.md](scenarios/LAB-MODEL-HISTORY-01.md) |
+| `LAB-MODEL-INDEX-01` | 01 | model index 01 | [scenarios/LAB-MODEL-INDEX-01.md](scenarios/LAB-MODEL-INDEX-01.md) |
+| `LAB-MODEL-STATE-01` | 01 | model state 01 | [scenarios/LAB-MODEL-STATE-01.md](scenarios/LAB-MODEL-STATE-01.md) |
+| `LAB-ORIENT-STATUS-01` | 00/01 | orient status 01 | [scenarios/LAB-ORIENT-STATUS-01.md](scenarios/LAB-ORIENT-STATUS-01.md) |
+| `LAB-RECOVERY-BAD-COMMIT-01` | 05 | recovery bad commit 01 | [scenarios/LAB-RECOVERY-BAD-COMMIT-01.md](scenarios/LAB-RECOVERY-BAD-COMMIT-01.md) |
+| `LAB-RECOVERY-REFLOG-01` | 05 | recovery reflog 01 | [scenarios/LAB-RECOVERY-REFLOG-01.md](scenarios/LAB-RECOVERY-REFLOG-01.md) |
+| `LAB-RECOVERY-RESET-01` | 05 | recovery reset 01 | [scenarios/LAB-RECOVERY-RESET-01.md](scenarios/LAB-RECOVERY-RESET-01.md) |
+| `LAB-RECOVERY-UNDO-01` | 05 | recovery undo 01 | [scenarios/LAB-RECOVERY-UNDO-01.md](scenarios/LAB-RECOVERY-UNDO-01.md) |
+| `LAB-RELEASE-BISECT-01` | 06 | release bisect 01 | [scenarios/LAB-RELEASE-BISECT-01.md](scenarios/LAB-RELEASE-BISECT-01.md) |
+| `LAB-RELEASE-HOTFIX-TAG-01` | 06 | release hotfix tag 01 | [scenarios/LAB-RELEASE-HOTFIX-TAG-01.md](scenarios/LAB-RELEASE-HOTFIX-TAG-01.md) |
+| `LAB-RELEASE-STASH-WORKTREE-01` | 06 | release stash worktree 01 | [scenarios/LAB-RELEASE-STASH-WORKTREE-01.md](scenarios/LAB-RELEASE-STASH-WORKTREE-01.md) |
+| `LAB-SETUP-STATE-01` | 00/01 | setup state 01 | [scenarios/LAB-SETUP-STATE-01.md](scenarios/LAB-SETUP-STATE-01.md) |
 
 ## 默认观察面板
 

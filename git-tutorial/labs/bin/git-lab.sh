@@ -7,15 +7,32 @@ WORKSPACES_ROOT="$LABS_ROOT/workspaces"
 FORCE=0
 
 LAB_IDS=(
-  LAB-SETUP-STATE-01
-  LAB-DAILY-COMMIT-01
   LAB-BRANCH-CONFLICT-01
+  LAB-BRANCH-REBASE-01
+  LAB-BRANCH-TASK-01
+  LAB-COLLAB-PR-01
   LAB-COLLAB-PUSH-REJECTED-01
-  LAB-RECOVERY-RESET-01
-  LAB-RELEASE-BISECT-01
+  LAB-COLLAB-REMOTE-01
+  LAB-DAILY-CLEAN-COMMIT-01
+  LAB-DAILY-COMMIT-01
+  LAB-DAILY-DIFF-REVIEW-01
+  LAB-DAILY-IGNORE-01
+  LAB-DEBUG-BISECT-01
+  LAB-GOV-DISASTER-01
   LAB-GOV-HOOKS-01
   LAB-GOV-LARGE-REPO-01
-  LAB-GOV-DISASTER-01
+  LAB-MODEL-HISTORY-01
+  LAB-MODEL-INDEX-01
+  LAB-MODEL-STATE-01
+  LAB-ORIENT-STATUS-01
+  LAB-RECOVERY-BAD-COMMIT-01
+  LAB-RECOVERY-REFLOG-01
+  LAB-RECOVERY-RESET-01
+  LAB-RECOVERY-UNDO-01
+  LAB-RELEASE-BISECT-01
+  LAB-RELEASE-HOTFIX-TAG-01
+  LAB-RELEASE-STASH-WORKTREE-01
+  LAB-SETUP-STATE-01
 )
 
 usage() {
@@ -37,15 +54,32 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 slug_for() {
   case "$1" in
-    LAB-SETUP-STATE-01) printf 'setup-state' ;;
-    LAB-DAILY-COMMIT-01) printf 'daily-commit' ;;
-    LAB-BRANCH-CONFLICT-01) printf 'branch-conflict' ;;
-    LAB-COLLAB-PUSH-REJECTED-01) printf 'collab-push-rejected' ;;
-    LAB-RECOVERY-RESET-01) printf 'recovery-reset' ;;
-    LAB-RELEASE-BISECT-01) printf 'release-bisect' ;;
-    LAB-GOV-HOOKS-01) printf 'gov-hooks' ;;
-    LAB-GOV-LARGE-REPO-01) printf 'gov-large-repo' ;;
-    LAB-GOV-DISASTER-01) printf 'gov-disaster' ;;
+    LAB-BRANCH-CONFLICT-01) printf 'branch_conflict_01' ;;
+    LAB-BRANCH-REBASE-01) printf 'branch_rebase_01' ;;
+    LAB-BRANCH-TASK-01) printf 'branch_task_01' ;;
+    LAB-COLLAB-PR-01) printf 'colpr_01' ;;
+    LAB-COLLAB-PUSH-REJECTED-01) printf 'colpush_rejected_01' ;;
+    LAB-COLLAB-REMOTE-01) printf 'colremote_01' ;;
+    LAB-DAILY-CLEAN-COMMIT-01) printf 'daily_clean_commit_01' ;;
+    LAB-DAILY-COMMIT-01) printf 'daily_commit_01' ;;
+    LAB-DAILY-DIFF-REVIEW-01) printf 'daily_diff_review_01' ;;
+    LAB-DAILY-IGNORE-01) printf 'daily_ignore_01' ;;
+    LAB-DEBUG-BISECT-01) printf 'debug_bisect_01' ;;
+    LAB-GOV-DISASTER-01) printf 'gov_disaster_01' ;;
+    LAB-GOV-HOOKS-01) printf 'gov_hooks_01' ;;
+    LAB-GOV-LARGE-REPO-01) printf 'gov_large_repo_01' ;;
+    LAB-MODEL-HISTORY-01) printf 'model_history_01' ;;
+    LAB-MODEL-INDEX-01) printf 'model_index_01' ;;
+    LAB-MODEL-STATE-01) printf 'model_state_01' ;;
+    LAB-ORIENT-STATUS-01) printf 'orient_status_01' ;;
+    LAB-RECOVERY-BAD-COMMIT-01) printf 'recovery_bad_commit_01' ;;
+    LAB-RECOVERY-REFLOG-01) printf 'recovery_reflog_01' ;;
+    LAB-RECOVERY-RESET-01) printf 'recovery_reset_01' ;;
+    LAB-RECOVERY-UNDO-01) printf 'recovery_undo_01' ;;
+    LAB-RELEASE-BISECT-01) printf 'release_bisect_01' ;;
+    LAB-RELEASE-HOTFIX-TAG-01) printf 'release_hotfix_tag_01' ;;
+    LAB-RELEASE-STASH-WORKTREE-01) printf 'release_stash_worktree_01' ;;
+    LAB-SETUP-STATE-01) printf 'setup_state_01' ;;
     *) return 1 ;;
   esac
 }
@@ -288,15 +322,32 @@ parse_args "$@"
 SLUG="$(slug_for "$LAB_ID")" || die "Unknown lab id: $LAB_ID (run --list)"
 prepare_target "$SLUG"
 case "$LAB_ID" in
-  LAB-SETUP-STATE-01) create_setup_state ;;
-  LAB-DAILY-COMMIT-01) create_daily_commit ;;
   LAB-BRANCH-CONFLICT-01) create_branch_conflict ;;
+  LAB-BRANCH-REBASE-01) create_setup_state ;;
+  LAB-BRANCH-TASK-01) create_setup_state ;;
+  LAB-COLLAB-PR-01) create_setup_state ;;
   LAB-COLLAB-PUSH-REJECTED-01) create_collab_push_rejected ;;
-  LAB-RECOVERY-RESET-01) create_recovery_reset ;;
-  LAB-RELEASE-BISECT-01) create_release_bisect ;;
+  LAB-COLLAB-REMOTE-01) create_setup_state ;;
+  LAB-DAILY-CLEAN-COMMIT-01) create_setup_state ;;
+  LAB-DAILY-COMMIT-01) create_daily_commit ;;
+  LAB-DAILY-DIFF-REVIEW-01) create_setup_state ;;
+  LAB-DAILY-IGNORE-01) create_setup_state ;;
+  LAB-DEBUG-BISECT-01) create_setup_state ;;
+  LAB-GOV-DISASTER-01) create_gov_disaster ;;
   LAB-GOV-HOOKS-01) create_gov_hooks ;;
   LAB-GOV-LARGE-REPO-01) create_gov_large_repo ;;
-  LAB-GOV-DISASTER-01) create_gov_disaster ;;
+  LAB-MODEL-HISTORY-01) create_setup_state ;;
+  LAB-MODEL-INDEX-01) create_setup_state ;;
+  LAB-MODEL-STATE-01) create_setup_state ;;
+  LAB-ORIENT-STATUS-01) create_setup_state ;;
+  LAB-RECOVERY-BAD-COMMIT-01) create_setup_state ;;
+  LAB-RECOVERY-REFLOG-01) create_setup_state ;;
+  LAB-RECOVERY-RESET-01) create_recovery_reset ;;
+  LAB-RECOVERY-UNDO-01) create_setup_state ;;
+  LAB-RELEASE-BISECT-01) create_release_bisect ;;
+  LAB-RELEASE-HOTFIX-TAG-01) create_setup_state ;;
+  LAB-RELEASE-STASH-WORKTREE-01) create_setup_state ;;
+  LAB-SETUP-STATE-01) create_setup_state ;;
 esac
 
 info "Created $LAB_ID at: $TARGET"
