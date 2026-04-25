@@ -82,10 +82,10 @@ git diff
 git log --oneline --graph --decorate --all --max-count=12
 ```
 
-2. 能否明确冲突文件里的 ours/theirs 含义？
+1. 能否明确冲突文件里的 ours/theirs 含义？
    - 能：编辑冲突文件，运行检查，`git add <file>`，再继续 merge/rebase。
    - 不能：优先 `git merge --abort` 或 `git rebase --abort` 回到操作前。
-3. 冲突解决后是否验证业务结果？
+2. 冲突解决后是否验证业务结果？
    - 没有验证不要提交或继续 rebase。
 
 ## 我 push 被拒绝
@@ -98,11 +98,11 @@ git branch -vv
 git log --oneline --graph --decorate --all --max-count=20
 ```
 
-2. 如果远端有新提交：
+1. 如果远端有新提交：
    - 团队约定 merge：`git merge origin/main`。
    - 团队约定 rebase：`git rebase origin/main`。
-3. 解决冲突并验证后再 push。
-4. 不要用普通 `--force` 覆盖他人历史；自己独占分支也优先 `--force-with-lease`。
+2. 解决冲突并验证后再 push。
+3. 不要用普通 `--force` 覆盖他人历史；自己独占分支也优先 `--force-with-lease`。
 
 ## 我要同步主干
 

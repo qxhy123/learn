@@ -12,16 +12,16 @@ git branch -vv
 git log --oneline --graph --decorate --all --max-count=20
 ```
 
-2. 备份或命名当前状态：
+1. 备份或命名当前状态：
 
 ```bash
 git rev-parse HEAD
 git switch -c rescue/$(date +%Y%m%d-%H%M%S)
 ```
 
-3. 判断：改动是否已经 push 到别人会基于它继续工作的分支？
-4. 执行：优先选择可逆、可审查的命令。
-5. 验证：重新跑观察面板和必要测试。
+1. 判断：改动是否已经 push 到别人会基于它继续工作的分支？
+2. 执行：优先选择可逆、可审查的命令。
+3. 验证：重新跑观察面板和必要测试。
 
 ## `git reset --hard`
 
