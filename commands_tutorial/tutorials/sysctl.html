@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>sysctl 深度教程：AI Infra Linux 内核参数调优与安全变更</title>
+<style>
+:root{--bg:#f5f8fb;--card:#fff;--ink:#172033;--muted:#5d6b7c;--line:#d7e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 14px 34px rgba(15,23,42,.09)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 8% 0%,#e0f2fe 0,#f8fbff 28%,#f5f8fb 62%,#f2f6fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#ffffff 0%,#f2fbff 58%,#fff7ed 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>sysctl 深度教程：AI Infra Linux 内核参数调优与安全变更</h1>
+<p class="sub">这份教程面向 AI Infra、GPU 训练集群、推理网关、Kubernetes 节点和高吞吐网络场景，系统讲清楚 <code>sysctl</code> 的心智模型：它如何读取和写入内核运行时 tunable，如何与 <code>/proc/sys</code> 对应，如何临时变更、持久化、回滚，并重点覆盖网络缓冲区、TCP 参数、<code>vm.swappiness</code>、Huge Pages、连接队列、端口范围和生产安全变更流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">Linux Kernel</span><span class="chip">/proc/sys</span><span class="chip">网络缓冲区</span><span class="chip">TCP 调优</span><span class="chip">vm.swappiness</span><span class="chip">Huge Pages</span><span class="chip">回滚</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>sysctl</code> 是“内核运行时参数控制台”：它把 <code>net.ipv4.tcp_tw_reuse</code> 这类点号参数映射到 <code>/proc/sys/net/ipv4/tcp_tw_reuse</code> 文件，并通过读写这些文件影响正在运行的内核行为。</div>
+<div class="success"><strong>最重要原则：</strong> AI 集群调内核参数时，不要直接在全量节点上 <code>sysctl -w</code>。先记录当前值，单节点或 canary dry-run/应用，观察网络、内存、训练吞吐和错误率，再写入 <code>/etc/sysctl.d/*.conf</code> 并保留回滚文件。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">sysctl 是什么</a></li>
+<li><a class="anchor" href="#s2">核心模型：名字、/proc/sys 与内核变量</a></li>
+<li><a class="anchor" href="#s3">读取参数：单项、批量、过滤</a></li>
+<li><a class="anchor" href="#s4">临时写入：sysctl -w 与 /proc/sys</a></li>
+<li><a class="anchor" href="#s5">持久化：/etc/sysctl.conf 与 sysctl.d</a></li>
+<li><a class="anchor" href="#s6">应用配置：sysctl -p、--system 与 systemd</a></li>
+<li><a class="anchor" href="#s7">AI Infra 调优地图</a></li>
+<li><a class="anchor" href="#s8">网络缓冲区：rmem、wmem 与 backlog</a></li>
+<li><a class="anchor" href="#s9">TCP 设置：拥塞控制、TIME_WAIT、keepalive</a></li>
+<li><a class="anchor" href="#s10">内存参数：swappiness、dirty、overcommit</a></li>
+<li><a class="anchor" href="#s11">Huge Pages：显式大页与 THP 边界</a></li>
+<li><a class="anchor" href="#s12">安全变更工作流与回滚</a></li>
+<li><a class="anchor" href="#s13">Kubernetes、容器与命名空间</a></li>
+<li><a class="anchor" href="#s14">sysctl vs /proc/sys</a></li>
+<li><a class="anchor" href="#s15">常见故障与排障</a></li>
+<li><a class="anchor" href="#s16">实战模板、检查清单与参考资料</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. sysctl 是什么</h2>
+<p><code>sysctl</code> 用来查看和修改 Linux 内核运行时参数。它不重新编译内核，也不必重启机器；多数参数写入后立即生效，但只对当前运行时有效，除非你把它持久化到配置文件。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>调整网络栈、虚拟内存、文件句柄、连接队列、端口范围、内核安全开关等节点级行为。</div>
+<div class="card"><strong>它不负责什么</strong><br>不能替代应用限流、NCCL 参数、网卡驱动调优、GPU 拓扑优化，也不能修复错误的 workload 架构。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>训练集群和推理网关常受网络 buffer、连接队列、swap、Huge Pages、端口耗尽影响，<code>sysctl</code> 是节点基线的一部分。</div>
+</div>
+<pre><code># 查看一个参数
+sysctl vm.swappiness
+
+# 查看所有参数并过滤
+sysctl -a | grep '^net.ipv4.tcp_'
+
+# 临时写入，重启后通常丢失
+sudo sysctl -w net.core.somaxconn=4096
+
+# 从配置文件加载
+sudo sysctl -p /etc/sysctl.d/99-ai-infra.conf</code></pre>
+<div class="warn"><strong>权限提醒：</strong> 大多数写操作需要 root。生产节点上使用 <code>sudo sysctl -w</code> 前，先保存原值并确认该参数是否可在运行时安全变更。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：sysctl、/proc/sys 与内核 tunable 的关系</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="sysctl 映射到 /proc/sys 并读写内核参数">
+<rect x="18" y="18" width="1064" height="614" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">sysctl 是 /proc/sys 的友好控制层</text>
+<rect x="70" y="130" width="250" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="195" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">sysctl 名字</text>
+<text x="195" y="207" text-anchor="middle" font-size="15">net.core.somaxconn</text>
+<text x="195" y="231" text-anchor="middle" font-size="15">vm.swappiness</text>
+<rect x="425" y="130" width="250" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">/proc/sys 文件</text>
+<text x="550" y="207" text-anchor="middle" font-size="15">/proc/sys/net/core/somaxconn</text>
+<text x="550" y="231" text-anchor="middle" font-size="15">/proc/sys/vm/swappiness</text>
+<rect x="780" y="130" width="250" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="905" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">内核运行时变量</text>
+<text x="905" y="207" text-anchor="middle" font-size="15">网络栈 / VM / FS</text>
+<text x="905" y="231" text-anchor="middle" font-size="15">立即影响新行为</text>
+<rect x="160" y="380" width="780" height="140" rx="20" fill="#fff7ed" stroke="#fdba74"/>
+<text x="550" y="420" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">点号参数与路径互相转换</text>
+<text x="550" y="458" text-anchor="middle" font-size="16">net.ipv4.ip_local_port_range</text>
+<text x="550" y="486" text-anchor="middle" font-size="16">/proc/sys/net/ipv4/ip_local_port_range</text>
+<line x1="320" y1="190" x2="425" y2="190" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="675" y1="190" x2="780" y2="190" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M545 250 C510 300, 510 335, 550 380" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">把点号换成斜杠，基本就得到对应的 <code>/proc/sys</code> 路径。<code>sysctl</code> 帮你处理读写格式、批量加载和配置文件解析。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 读取参数：单项、批量、过滤</h2>
+<p>读取是最安全的第一步。AI Infra 场景建议把节点基线参数纳入巡检：网络队列、端口范围、TCP keepalive、buffer 上限、swappiness、Huge Pages 等都应可观测、可比对。</p>
+<table>
+<tr><th>命令</th><th>含义</th><th>适合场景</th></tr>
+<tr><td><code>sysctl vm.swappiness</code></td><td>读取单个参数</td><td>确认当前节点内存策略</td></tr>
+<tr><td><code>sysctl -n vm.swappiness</code></td><td>只输出值，不输出键名</td><td>脚本判断</td></tr>
+<tr><td><code>sysctl -a</code></td><td>列出可见参数</td><td>基线采集，配合 grep</td></tr>
+<tr><td><code>sysctl -e -a</code></td><td>忽略未知键错误</td><td>跨内核版本巡检</td></tr>
+</table>
+<pre><code># 单项读取
+sysctl net.core.somaxconn
+sysctl -n net.ipv4.ip_local_port_range
+
+# AI 节点常见巡检
+sysctl net.core.somaxconn net.core.netdev_max_backlog
+sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_keepalive_time
+sysctl vm.swappiness vm.nr_hugepages vm.overcommit_memory
+
+# 按前缀过滤网络参数
+sysctl -a 2&gt;/dev/null | grep -E '^(net.core|net.ipv4.tcp|vm)\.'</code></pre>
+<div class="note"><strong>脚本建议：</strong> 用 <code>sysctl -n</code> 获取机器可读值；用 <code>sysctl -a 2&gt;/dev/null</code> 避免个别权限或虚拟文件读取警告污染输出。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 临时写入：sysctl -w 与 /proc/sys</h2>
+<p>临时写入会修改当前内核运行时状态，通常重启后丢失。它适合实验、canary、故障缓解和验证参数效果。不要把它当成永久配置管理。</p>
+<pre><code># 先记录原值
+sysctl net.core.somaxconn
+
+# 临时设置，立即生效
+sudo sysctl -w net.core.somaxconn=4096
+
+# 等价的 /proc/sys 写法
+cat /proc/sys/net/core/somaxconn
+echo 4096 | sudo tee /proc/sys/net/core/somaxconn
+
+# 回滚到记录的原值
+sudo sysctl -w net.core.somaxconn=128</code></pre>
+<div class="grid-2">
+<div class="card"><strong><code>sysctl -w</code></strong><br>更可读，会显示设置结果，适合人工操作、变更记录和脚本日志。</div>
+<div class="card"><strong>写 <code>/proc/sys</code></strong><br>更底层，适合理解机制或极简环境；但脚本可读性和错误提示通常不如 <code>sysctl</code>。</div>
+</div>
+<div class="danger"><strong>危险参数提醒：</strong> 网络转发、反向路径过滤、panic 行为、overcommit、dirty ratio 等参数可能影响安全边界或稳定性。不要在不了解影响面的情况下套用互联网上的“万能优化”。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 持久化：/etc/sysctl.conf 与 sysctl.d</h2>
+<p>持久化配置放在 <code>/etc/sysctl.conf</code> 或 <code>/etc/sysctl.d/*.conf</code>。现代发行版更推荐按用途拆到 <code>/etc/sysctl.d/</code>，例如 <code>60-k8s.conf</code>、<code>90-ai-network.conf</code>、<code>99-ai-infra.conf</code>。</p>
+<pre><code># 新建 AI Infra 节点基线文件，先不要直接覆盖共享配置
+sudo install -m 0644 /dev/null /etc/sysctl.d/99-ai-infra.conf
+
+# 示例内容
+cat &lt;&lt;'EOF' | sudo tee /etc/sysctl.d/99-ai-infra.conf
+# AI Infra baseline: review per kernel, NIC, workload and cluster policy.
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 250000
+net.ipv4.ip_local_port_range = 20000 60999
+vm.swappiness = 10
+EOF
+
+# 只加载这个文件验证
+sudo sysctl -p /etc/sysctl.d/99-ai-infra.conf</code></pre>
+<table>
+<tr><th>位置</th><th>用途</th><th>建议</th></tr>
+<tr><td><code>/etc/sysctl.conf</code></td><td>传统单文件配置</td><td>少量本机配置可用；大规模节点不建议堆所有规则</td></tr>
+<tr><td><code>/etc/sysctl.d/*.conf</code></td><td>按组件或策略拆分</td><td>推荐，用文件名前缀控制顺序</td></tr>
+<tr><td><code>/usr/lib/sysctl.d/*.conf</code></td><td>发行版或包默认配置</td><td>不要直接改，使用 <code>/etc/sysctl.d</code> 覆盖</td></tr>
+<tr><td><code>/run/sysctl.d/*.conf</code></td><td>运行时临时配置</td><td>适合启动流程临时注入</td></tr>
+</table>
+<div class="warn"><strong>顺序提醒：</strong> 多个文件设置同一个键时，后加载的值会覆盖前面的值。用清晰的文件名和注释说明“为什么改”，比把所有参数塞进一个文件更可维护。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 应用配置：sysctl -p、--system 与 systemd</h2>
+<p><code>sysctl -p</code> 默认读取 <code>/etc/sysctl.conf</code>；指定文件时只应用该文件。<code>sysctl --system</code> 会按系统规则加载多个 sysctl.d 目录，是模拟启动时加载行为的常用方式。</p>
+<pre><code># 只加载默认 /etc/sysctl.conf
+sudo sysctl -p
+
+# 只加载指定文件，适合 canary 验证
+sudo sysctl -p /etc/sysctl.d/99-ai-infra.conf
+
+# 加载系统目录中的全部 sysctl 配置
+sudo sysctl --system
+
+# systemd 环境下查看负责加载的服务
+systemctl status systemd-sysctl.service
+journalctl -u systemd-sysctl.service -b</code></pre>
+<div class="grid-3">
+<div class="card"><strong>单文件验证</strong><br><code>sysctl -p file</code> 能缩小影响面，适合变更前验证。</div>
+<div class="card"><strong>全量模拟</strong><br><code>sysctl --system</code> 接近启动加载路径，适合发布前检查覆盖顺序。</div>
+<div class="card"><strong>启动排障</strong><br>如果重启后值不对，先看 <code>systemd-sysctl</code> 日志和重复配置。</div>
+</div>
+</section>
+
+<section class="figure" id="s7">
+<h3>地图：AI Infra 节点常见 sysctl 调优面</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="AI Infra sysctl 调优面地图">
+<rect x="18" y="18" width="1064" height="684" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">AI Infra 的 sysctl 不是单点优化，而是节点基线</text>
+<rect x="410" y="105" width="280" height="110" rx="22" fill="#111827" stroke="#1f2937"/>
+<text x="550" y="150" text-anchor="middle" font-size="24" font-weight="700" fill="#f9fafb">GPU / CPU 节点</text>
+<text x="550" y="184" text-anchor="middle" font-size="15" fill="#d1d5db">训练、推理、数据加载、网关</text>
+<rect x="72" y="292" width="230" height="130" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="187" y="329" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">网络入口</text>
+<text x="187" y="360" text-anchor="middle" font-size="14">somaxconn</text>
+<text x="187" y="384" text-anchor="middle" font-size="14">netdev_max_backlog</text>
+<text x="187" y="408" text-anchor="middle" font-size="14">rmem / wmem</text>
+<rect x="322" y="292" width="230" height="130" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="437" y="329" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">TCP 行为</text>
+<text x="437" y="360" text-anchor="middle" font-size="14">congestion_control</text>
+<text x="437" y="384" text-anchor="middle" font-size="14">keepalive</text>
+<text x="437" y="408" text-anchor="middle" font-size="14">port range</text>
+<rect x="572" y="292" width="230" height="130" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="687" y="329" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">内存策略</text>
+<text x="687" y="360" text-anchor="middle" font-size="14">swappiness</text>
+<text x="687" y="384" text-anchor="middle" font-size="14">dirty ratio</text>
+<text x="687" y="408" text-anchor="middle" font-size="14">overcommit</text>
+<rect x="822" y="292" width="230" height="130" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="937" y="329" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">大页与映射</text>
+<text x="937" y="360" text-anchor="middle" font-size="14">nr_hugepages</text>
+<text x="937" y="384" text-anchor="middle" font-size="14">hugetlb_shm_group</text>
+<text x="937" y="408" text-anchor="middle" font-size="14">mmap limits</text>
+<rect x="190" y="535" width="720" height="86" rx="18" fill="#f0fdf4" stroke="#86efac"/>
+<text x="550" y="570" text-anchor="middle" font-size="21" font-weight="700" fill="#15803d">目标：降低排队、避免 swap 抖动、提高吞吐稳定性，而不是追求孤立 benchmark 数字</text>
+<text x="550" y="600" text-anchor="middle" font-size="15" fill="#166534">每个参数都要绑定 workload、内核版本、网卡、容器策略和回滚方案</text>
+<line x1="498" y1="215" x2="187" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="526" y1="215" x2="437" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="574" y1="215" x2="687" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="602" y1="215" x2="937" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">AI Infra 的 sysctl 调优应从“节点基线 + 观测指标”出发，而不是复制固定参数表。网络、TCP、内存、大页之间可能互相影响。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>6. 网络缓冲区：rmem、wmem 与 backlog</h2>
+<p>大模型训练、参数服务器、对象存储读取、推理网关和 RDMA/TCP 混合环境都可能受网络队列和 socket buffer 影响。调大 buffer 不等于更快；它可能增加内存占用和排队延迟。正确方式是结合吞吐、丢包、重传、延迟和应用错误率观察。</p>
+<table>
+<tr><th>参数</th><th>作用</th><th>AI Infra 关注点</th></tr>
+<tr><td><code>net.core.rmem_max</code></td><td>单个 socket 接收缓冲区上限</td><td>高带宽接收、数据加载、服务网关</td></tr>
+<tr><td><code>net.core.wmem_max</code></td><td>单个 socket 发送缓冲区上限</td><td>大吞吐发送、模型分发、日志/数据上报</td></tr>
+<tr><td><code>net.ipv4.tcp_rmem</code></td><td>TCP 接收缓冲 min/default/max</td><td>长肥网络、跨 AZ/跨机房链路</td></tr>
+<tr><td><code>net.ipv4.tcp_wmem</code></td><td>TCP 发送缓冲 min/default/max</td><td>高吞吐 TCP 传输</td></tr>
+<tr><td><code>net.core.netdev_max_backlog</code></td><td>网络设备队列积压上限</td><td>突发流量、软中断处理不及时</td></tr>
+<tr><td><code>net.core.somaxconn</code></td><td>listen backlog 上限</td><td>推理网关、API server、服务发现高并发连接</td></tr>
+</table>
+<pre><code># 读取当前网络缓冲区和队列设置
+sysctl net.core.rmem_max net.core.wmem_max
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+sysctl net.core.somaxconn net.core.netdev_max_backlog
+
+# 临时 canary：仅在一台节点验证，先记录原值
+sysctl net.core.rmem_max net.core.wmem_max &gt; /tmp/sysctl-net.before
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+
+# 验证后再考虑持久化
+printf '%s\n' \
+  'net.core.rmem_max = 134217728' \
+  'net.core.wmem_max = 134217728' \
+  | sudo tee /etc/sysctl.d/90-ai-network-buffer.conf
+sudo sysctl -p /etc/sysctl.d/90-ai-network-buffer.conf</code></pre>
+<div class="note"><strong>观测建议：</strong> 配合 <code>ss -tin</code>、<code>sar -n TCP,ETCP</code>、<code>nstat</code>、网卡 counters、应用 P99 延迟和训练 step time 看效果。只看带宽峰值容易误判。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>7. TCP 设置：拥塞控制、TIME_WAIT、keepalive</h2>
+<p>TCP 参数常被误调。AI Infra 中常见目标包括：提高东西向流量稳定性、减少短连接端口耗尽、让故障连接更快被发现、避免队列溢出。不要为了“减少 TIME_WAIT”关闭协议保护，也不要盲目启用不符合内核和网络环境的拥塞控制算法。</p>
+<table>
+<tr><th>参数</th><th>说明</th><th>注意事项</th></tr>
+<tr><td><code>net.ipv4.tcp_congestion_control</code></td><td>当前 TCP 拥塞控制算法</td><td>BBR/CUBIC 等效果依赖内核、链路和排队模型</td></tr>
+<tr><td><code>net.ipv4.tcp_available_congestion_control</code></td><td>可用算法列表</td><td>只读，用来确认内核支持</td></tr>
+<tr><td><code>net.ipv4.ip_local_port_range</code></td><td>本地临时端口范围</td><td>短连接多的推理服务、代理、拉取任务需要关注</td></tr>
+<tr><td><code>net.ipv4.tcp_tw_reuse</code></td><td>允许特定场景复用 TIME_WAIT socket</td><td>语义随内核版本变化，必须查目标内核文档并灰度</td></tr>
+<tr><td><code>net.ipv4.tcp_keepalive_time</code></td><td>TCP keepalive 空闲时间</td><td>只影响启用 SO_KEEPALIVE 的 socket</td></tr>
+<tr><td><code>net.ipv4.tcp_max_syn_backlog</code></td><td>SYN 队列上限</td><td>入口服务高并发连接建立时关注</td></tr>
+</table>
+<pre><code># 查看拥塞控制能力
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.ipv4.tcp_available_congestion_control
+
+# 示例：扩大本地端口范围，先检查现值
+sysctl net.ipv4.ip_local_port_range
+sudo sysctl -w net.ipv4.ip_local_port_range="20000 60999"
+
+# keepalive 仅对启用 SO_KEEPALIVE 的连接有效
+sysctl net.ipv4.tcp_keepalive_time
+sudo sysctl -w net.ipv4.tcp_keepalive_time=600
+sudo sysctl -w net.ipv4.tcp_keepalive_intvl=30
+sudo sysctl -w net.ipv4.tcp_keepalive_probes=5</code></pre>
+<div class="warn"><strong>短连接问题不要只靠 sysctl：</strong> 端口耗尽、TIME_WAIT 堆积、连接重置，往往还需要应用连接池、HTTP keepalive、服务端 backlog、LB/NAT 策略一起修。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>8. 内存参数：swappiness、dirty、overcommit</h2>
+<p>AI workload 对内存抖动敏感：GPU 训练可能被数据加载、page cache、checkpoint 写盘、Python allocator、容器 memory limit 共同影响。<code>vm.swappiness</code>、dirty page 和 overcommit 参数能改变内核内存策略，但错误设置可能导致 OOM、长时间写回阻塞或系统响应变差。</p>
+<table>
+<tr><th>参数</th><th>作用</th><th>实践提示</th></tr>
+<tr><td><code>vm.swappiness</code></td><td>控制内核倾向于使用 swap 的程度</td><td>训练节点常设低值，但不等于必须为 0</td></tr>
+<tr><td><code>vm.dirty_background_ratio</code></td><td>后台写回阈值</td><td>checkpoint/日志大量写入时关注</td></tr>
+<tr><td><code>vm.dirty_ratio</code></td><td>进程可能被迫同步写回的阈值</td><td>过高可能导致突发长延迟</td></tr>
+<tr><td><code>vm.overcommit_memory</code></td><td>内存 overcommit 策略</td><td>影响 mmap、fork、大内存申请成功率</td></tr>
+<tr><td><code>vm.max_map_count</code></td><td>单进程 mmap 区域数量上限</td><td>向量数据库、搜索、部分数据处理进程常见</td></tr>
+</table>
+<pre><code># 查看内存相关 sysctl
+sysctl vm.swappiness vm.dirty_background_ratio vm.dirty_ratio
+sysctl vm.overcommit_memory vm.overcommit_ratio vm.max_map_count
+
+# 训练节点常见 canary：降低 swap 倾向
+sysctl vm.swappiness &gt; /tmp/sysctl-vm.before
+sudo sysctl -w vm.swappiness=10
+
+# 观察是否真的发生 swap 和内存回收
+free -h
+vmstat 1
+grep -E 'pswpin|pswpout|pgscan|pgsteal' /proc/vmstat</code></pre>
+<div class="danger"><strong>不要机械设为 0：</strong> <code>vm.swappiness=0</code> 在不同内核语义下并不总是“禁用 swap”，而且完全排斥 swap 可能让节点更早触发 OOM。生产值应结合 swap 策略、cgroup、OOM 保护和 workload 验证。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>9. Huge Pages：显式大页与 THP 边界</h2>
+<p><code>sysctl</code> 可以管理显式 HugeTLB 大页，例如 <code>vm.nr_hugepages</code>。这和 Transparent Huge Pages（THP）不是一回事：THP 通常通过 <code>/sys/kernel/mm/transparent_hugepage/*</code> 控制，不是传统 sysctl。AI 场景中，大页可能用于共享内存、数据库、推理 runtime 或特定通信栈，但 GPU 显存本身不由这些参数直接控制。</p>
+<table>
+<tr><th>参数/路径</th><th>类型</th><th>说明</th></tr>
+<tr><td><code>vm.nr_hugepages</code></td><td>sysctl</td><td>配置默认大小 HugeTLB 页数量</td></tr>
+<tr><td><code>vm.hugetlb_shm_group</code></td><td>sysctl</td><td>允许指定组使用 hugetlb shared memory</td></tr>
+<tr><td><code>/proc/meminfo</code></td><td>观测</td><td>查看 HugePages_Total、Free、Rsvd、Surp</td></tr>
+<tr><td><code>/sys/kernel/mm/transparent_hugepage/enabled</code></td><td>sysfs</td><td>THP 开关，不是 sysctl 文件</td></tr>
+</table>
+<pre><code># 查看 HugeTLB 状态
+grep -E 'HugePages|Hugepagesize|Hugetlb' /proc/meminfo
+sysctl vm.nr_hugepages vm.hugetlb_shm_group
+
+# 临时调整显式 Huge Pages 数量，先确认内存余量
+free -h
+sudo sysctl -w vm.nr_hugepages=1024
+grep -E 'HugePages_Total|HugePages_Free' /proc/meminfo
+
+# THP 不是 sysctl，查看方式不同
+cat /sys/kernel/mm/transparent_hugepage/enabled
+cat /sys/kernel/mm/transparent_hugepage/defrag</code></pre>
+<div class="warn"><strong>容量提醒：</strong> HugeTLB 页会预留物理内存。设置过高可能让普通内存不足，导致数据加载、page cache 或容器 workload 受影响。</div>
+</section>
+
+<section class="figure" id="s12">
+<h3>流程图：安全变更、验证与回滚</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="sysctl 安全变更工作流">
+<rect x="18" y="18" width="1064" height="724" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">生产 sysctl 变更必须可验证、可回滚</text>
+<rect x="90" y="115" width="240" height="76" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="210" y="146" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">1. 明确目标</text>
+<text x="210" y="171" text-anchor="middle" font-size="13">吞吐 / 延迟 / 端口 / swap</text>
+<rect x="430" y="115" width="240" height="76" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="146" text-anchor="middle" font-size="18" font-weight="700" fill="#334155">2. 记录当前值</text>
+<text x="550" y="171" text-anchor="middle" font-size="13">sysctl key &gt; before.txt</text>
+<rect x="770" y="115" width="240" height="76" rx="16" fill="#fff7ed" stroke="#fdba74"/>
+<text x="890" y="146" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">3. 单节点 canary</text>
+<text x="890" y="171" text-anchor="middle" font-size="13">sysctl -w 临时应用</text>
+<rect x="770" y="300" width="240" height="76" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="890" y="331" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">4. 观测指标</text>
+<text x="890" y="356" text-anchor="middle" font-size="13">错误率 / P99 / step time</text>
+<polygon points="550,280 700,360 550,440 400,360" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="354" text-anchor="middle" font-size="17" font-weight="700" fill="#6d28d9">效果是否满足？</text>
+<text x="550" y="379" text-anchor="middle" font-size="13">且无副作用</text>
+<rect x="90" y="300" width="240" height="76" rx="16" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="210" y="331" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">回滚原值</text>
+<text x="210" y="356" text-anchor="middle" font-size="13">sysctl -w key=old</text>
+<rect x="430" y="525" width="240" height="76" rx="16" fill="#dcfce7" stroke="#86efac"/>
+<text x="550" y="556" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">5. 写 sysctl.d</text>
+<text x="550" y="581" text-anchor="middle" font-size="13">注释原因、范围、日期</text>
+<rect x="770" y="525" width="240" height="76" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="890" y="556" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">6. 分批发布</text>
+<text x="890" y="581" text-anchor="middle" font-size="13">配置管理 + 监控告警</text>
+<line x1="330" y1="153" x2="430" y2="153" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="670" y1="153" x2="770" y2="153" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="890" y1="191" x2="890" y2="300" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="770" y1="338" x2="700" y2="360" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="400" y1="360" x2="330" y2="338" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="550" y1="440" x2="550" y2="525" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="670" y1="563" x2="770" y2="563" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<text x="360" y="331" font-size="14" fill="#b91c1c">否</text>
+<text x="565" y="489" font-size="14" fill="#15803d">是</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">安全不是“慢”，而是让变更具备实验边界、观测证据和低成本回滚路径。sysctl 变更尤其适合先临时验证，再持久化。</div>
+</section>
+
+<section class="section">
+<h2>10. 安全变更工作流与回滚</h2>
+<p>sysctl 变更的风险在于：它影响节点上所有进程，且很多问题不是立即爆炸，而是在流量高峰、checkpoint、网络抖动或节点重启后出现。因此要把“记录、应用、观测、持久化、回滚”做成固定动作。</p>
+<pre><code># 1. 定义变更集
+cat &gt; /tmp/ai-sysctl.keys &lt;&lt;'EOF'
+net.core.somaxconn
+net.core.netdev_max_backlog
+net.ipv4.ip_local_port_range
+vm.swappiness
+EOF
+
+# 2. 记录变更前状态
+xargs -a /tmp/ai-sysctl.keys sysctl &gt; /tmp/sysctl.before.$(date +%Y%m%d%H%M%S)
+
+# 3. 临时应用一项或少量项
+sudo sysctl -w net.core.somaxconn=4096
+
+# 4. 验证现值
+sysctl net.core.somaxconn
+
+# 5. 回滚示例：使用变更前记录中的值
+sudo sysctl -w net.core.somaxconn=128</code></pre>
+<table>
+<tr><th>阶段</th><th>检查点</th><th>失败时动作</th></tr>
+<tr><td>变更前</td><td>原值、目标、影响节点、监控指标、回滚命令</td><td>缺任意一项就不要发布</td></tr>
+<tr><td>canary</td><td>单节点或小比例节点，观察至少一个业务周期</td><td>立即恢复原值，保留指标截图和日志</td></tr>
+<tr><td>持久化</td><td>配置文件注释原因，纳入配置管理</td><td>发现覆盖顺序错误时撤回该文件</td></tr>
+<tr><td>重启后</td><td>确认 <code>sysctl --system</code> 和实际值一致</td><td>查 systemd-sysctl 日志和重复配置</td></tr>
+</table>
+<div class="success"><strong>变更模板：</strong> 每个参数都写明“问题是什么、为什么这个值合理、在哪些节点生效、怎么观测、怎么回滚”。未来排障时这比参数本身更重要。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>11. Kubernetes、容器与命名空间</h2>
+<p>Kubernetes 中 sysctl 分为节点级和命名空间级。很多网络参数是 pod network namespace 内的“safe sysctls”，但也有大量参数会影响整个节点，需要 kubelet 配置允许或由节点配置管理系统下发。AI 平台要避免让业务 Pod 随意改节点级内核参数。</p>
+<table>
+<tr><th>类别</th><th>例子</th><th>实践建议</th></tr>
+<tr><td>节点级 sysctl</td><td><code>net.core.somaxconn</code>、<code>vm.swappiness</code></td><td>通过镜像外的节点基线、DaemonSet 或配置管理控制</td></tr>
+<tr><td>Pod 命名空间 sysctl</td><td>部分 <code>net.ipv4.*</code></td><td>需要确认 Kubernetes safe/unsafe sysctl 策略</td></tr>
+<tr><td>容器内只读限制</td><td><code>/proc/sys</code> 可能不可写</td><td>不要假设容器内 root 可改宿主机参数</td></tr>
+</table>
+<pre><code># 宿主机上看节点级参数
+sysctl net.core.somaxconn vm.swappiness
+
+# 容器内可能只能读，写入会被权限或安全策略拒绝
+kubectl exec -it POD -- sysctl net.ipv4.ip_local_port_range
+
+# Kubernetes Pod 示例片段，具体允许项取决于集群策略
+securityContext:
+  sysctls:
+  - name: net.ipv4.tcp_keepalive_time
+    value: "600"</code></pre>
+<div class="warn"><strong>平台边界：</strong> AI 平台应把节点级 sysctl 放进节点池基线，而不是交给训练任务自由设置。否则同一台 GPU 节点上的任务会互相影响。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>12. sysctl vs /proc/sys</h2>
+<p><code>sysctl</code> 和 <code>/proc/sys</code> 是两种入口：前者是用户态命令和配置加载工具，后者是内核暴露的虚拟文件接口。理解二者关系能帮助你在极简容器、救援系统和脚本中做正确选择。</p>
+<table>
+<tr><th>比较项</th><th><code>sysctl</code></th><th><code>/proc/sys</code></th></tr>
+<tr><td>读取</td><td><code>sysctl net.ipv4.ip_forward</code></td><td><code>cat /proc/sys/net/ipv4/ip_forward</code></td></tr>
+<tr><td>写入</td><td><code>sysctl -w key=value</code></td><td><code>echo value &gt; /proc/sys/path</code></td></tr>
+<tr><td>批量加载</td><td>支持 <code>-p</code> 和 <code>--system</code></td><td>需要自己写脚本</td></tr>
+<tr><td>可读性</td><td>点号命名，适合配置管理</td><td>路径命名，适合理解底层映射</td></tr>
+<tr><td>错误提示</td><td>通常更友好</td><td>取决于 shell 和文件写入错误</td></tr>
+</table>
+<pre><code># 两者读取的是同一个内核参数
+sysctl -n net.ipv4.ip_forward
+cat /proc/sys/net/ipv4/ip_forward
+
+# 点号与路径的转换
+key=net.core.somaxconn
+path=/proc/sys/${key//./\/}
+printf '%s\n' "$path"
+cat "$path"</code></pre>
+<div class="note"><strong>选择建议：</strong> 人工操作和配置管理优先用 <code>sysctl</code>；底层排障、极简环境或验证映射时使用 <code>/proc/sys</code>。</div>
+</section>
+
+<section class="figure">
+<h3>对比图：临时写入、持久化与启动加载</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="sysctl 临时写入和持久化对比">
+<rect x="18" y="18" width="1064" height="624" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">三条路径，生效时机不同</text>
+<rect x="78" y="128" width="280" height="145" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="218" y="171" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">临时写入</text>
+<text x="218" y="207" text-anchor="middle" font-size="15">sysctl -w key=value</text>
+<text x="218" y="235" text-anchor="middle" font-size="15">立即生效，重启可能丢失</text>
+<rect x="410" y="128" width="280" height="145" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="171" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">配置文件</text>
+<text x="550" y="207" text-anchor="middle" font-size="15">/etc/sysctl.d/*.conf</text>
+<text x="550" y="235" text-anchor="middle" font-size="15">记录意图，便于审计</text>
+<rect x="742" y="128" width="280" height="145" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="882" y="171" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">加载动作</text>
+<text x="882" y="207" text-anchor="middle" font-size="15">sysctl -p / --system</text>
+<text x="882" y="235" text-anchor="middle" font-size="15">把文件值写入内核</text>
+<rect x="170" y="420" width="760" height="95" rx="18" fill="#fff7ed" stroke="#fdba74"/>
+<text x="550" y="455" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">常见误区：写了文件不代表当前已生效；临时写入不代表重启后仍生效</text>
+<text x="550" y="486" text-anchor="middle" font-size="15">验证永远看实际值：sysctl key，而不是只看配置文件内容</text>
+<line x1="358" y1="200" x2="410" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="690" y1="200" x2="742" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M882 273 C890 345, 742 390, 650 420" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M218 273 C220 350, 365 395, 455 420" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">排障时要区分“配置文件里写了什么”和“当前内核实际值是什么”。后者才决定当前 workload 行为。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>13. 常见故障与排障</h2>
+<p>sysctl 排障的核心是确认三件事：参数是否存在、写入是否成功、是否被后续配置覆盖。不同内核、容器权限、发行版默认配置和 systemd 加载顺序都会改变结果。</p>
+<table>
+<tr><th>现象</th><th>常见原因</th><th>排查命令</th></tr>
+<tr><td><code>cannot stat /proc/sys/...</code></td><td>参数在当前内核不存在或模块未启用</td><td><code>uname -r</code>、<code>sysctl -a | grep key</code></td></tr>
+<tr><td><code>permission denied</code></td><td>非 root、容器限制、只读 proc</td><td><code>id</code>、<code>mount | grep proc</code></td></tr>
+<tr><td>写入后重启丢失</td><td>只用了 <code>sysctl -w</code>，未持久化</td><td><code>grep -R key /etc/sysctl*</code></td></tr>
+<tr><td>配置文件值和实际值不同</td><td>加载顺序覆盖，或文件未加载</td><td><code>sysctl --system</code>、<code>journalctl -u systemd-sysctl -b</code></td></tr>
+<tr><td>写入报 invalid argument</td><td>值格式不对或超出内核允许范围</td><td><code>cat /proc/sys/path</code>、查内核文档</td></tr>
+</table>
+<pre><code># 查某个键在所有 sysctl 配置中的来源
+grep -R --line-number 'net.core.somaxconn' \
+  /etc/sysctl.conf /etc/sysctl.d /run/sysctl.d /usr/lib/sysctl.d 2&gt;/dev/null
+
+# 模拟全量加载，查看是否有错误或覆盖
+sudo sysctl --system
+
+# systemd 启动加载日志
+journalctl -u systemd-sysctl.service -b --no-pager
+
+# 当前实际值永远以 sysctl 读取为准
+sysctl net.core.somaxconn</code></pre>
+<div class="danger"><strong>排障底线：</strong> 不要在故障高峰时连续尝试多个 sysctl 参数。一次只改一组相关参数，否则无法判断哪一项造成改善或副作用。</div>
+</section>
+
+<section class="section">
+<h2>14. AI Infra 常用参数速查</h2>
+<p>下面不是“推荐值表”，而是排查入口。不同内核版本、云厂商镜像、裸金属网卡、Kubernetes CNI、NAT/LB 形态和 workload 都会改变合理值。</p>
+<table>
+<tr><th>问题</th><th>优先查看</th><th>不要忽略</th></tr>
+<tr><td>推理网关连接建立慢或排队</td><td><code>net.core.somaxconn</code>、<code>net.ipv4.tcp_max_syn_backlog</code></td><td>应用 listen backlog、LB、线程池、accept 速度</td></tr>
+<tr><td>短连接端口耗尽</td><td><code>net.ipv4.ip_local_port_range</code>、TIME_WAIT 数量</td><td>连接池、HTTP keepalive、NAT 端口限制</td></tr>
+<tr><td>跨节点 TCP 吞吐不稳定</td><td><code>tcp_rmem</code>、<code>tcp_wmem</code>、拥塞控制</td><td>丢包、ECN、MTU、网卡队列、CNI overlay</td></tr>
+<tr><td>训练 step 偶发长尾</td><td><code>vm.swappiness</code>、dirty 参数</td><td>数据加载、checkpoint、page cache、存储延迟</td></tr>
+<tr><td>mmap 数量耗尽</td><td><code>vm.max_map_count</code></td><td>进程实际 map 数、库行为、容器限制</td></tr>
+<tr><td>需要显式 HugeTLB</td><td><code>vm.nr_hugepages</code>、<code>/proc/meminfo</code></td><td>预留内存、副作用、THP 是否另行配置</td></tr>
+</table>
+<pre><code># 生成一个简洁的 AI 节点 sysctl 快照
+for k in \
+  net.core.somaxconn \
+  net.core.netdev_max_backlog \
+  net.core.rmem_max \
+  net.core.wmem_max \
+  net.ipv4.ip_local_port_range \
+  net.ipv4.tcp_congestion_control \
+  net.ipv4.tcp_max_syn_backlog \
+  vm.swappiness \
+  vm.dirty_background_ratio \
+  vm.dirty_ratio \
+  vm.max_map_count \
+  vm.nr_hugepages
+do
+  sysctl "$k" 2&gt;/dev/null
+done</code></pre>
+</section>
+
+<section class="section">
+<h2>15. 实战模板：可审计的 sysctl.d 文件</h2>
+<p>一个好的 sysctl 配置文件不仅有键值，还要有上下文。未来如果节点异常，工程师需要知道这些参数为哪个 workload、哪个问题、哪个验证结果而存在。</p>
+<pre><code># /etc/sysctl.d/99-ai-infra.conf
+# Purpose: AI training and inference node baseline.
+# Scope: gpu-node-pool-a only.
+# Change workflow: canary 2 nodes, observe P99 latency, retransmits, step time.
+# Rollback: remove this file and run `sysctl --system`, or set values from backup.
+
+# Inference/API connection backlog. Must align with application listen backlog.
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# High-throughput TCP receive/send upper bounds. Validate memory impact.
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+
+# Reduce accidental swap pressure on training workers.
+vm.swappiness = 10
+
+# Increase mmap area limit for vector/search/data-heavy processes if needed.
+vm.max_map_count = 262144</code></pre>
+<div class="success"><strong>发布建议：</strong> 把这个文件交给配置管理系统，而不是手工复制到节点。发布后用巡检脚本确认“配置文件存在”和“实际内核值正确”。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 检查清单与练习任务</h2>
+<div class="grid-2">
+<div class="card">
+<strong>上线前检查清单</strong>
+<ul>
+<li>是否记录了每个参数的原值和回滚命令。</li>
+<li>是否确认目标内核版本支持该参数和取值。</li>
+<li>是否先在 canary 节点临时应用并观察指标。</li>
+<li>是否区分了临时写入和持久化配置。</li>
+<li>是否检查了重复配置和加载顺序。</li>
+<li>是否把变更和节点池、workload、监控指标绑定。</li>
+</ul>
+</div>
+<div class="card">
+<strong>练习任务</strong>
+<ul>
+<li>写一个脚本采集 12 个 AI 节点关键 sysctl 参数。</li>
+<li>把 <code>net.core.somaxconn</code> 临时改为 4096，再回滚。</li>
+<li>创建一个 <code>/etc/sysctl.d</code> 文件并只加载该文件。</li>
+<li>找出系统里所有设置 <code>vm.swappiness</code> 的配置来源。</li>
+<li>比较 <code>sysctl -n key</code> 与 <code>cat /proc/sys/path</code> 输出。</li>
+</ul>
+</div>
+</div>
+<pre><code># 最小安全练习：只读检查，不修改系统
+sysctl -n vm.swappiness
+cat /proc/sys/vm/swappiness
+grep -R --line-number 'vm.swappiness' /etc/sysctl* /usr/lib/sysctl.d 2&gt;/dev/null || true
+
+# 如果要练习写入，请在测试机执行，并先记录原值
+old=$(sysctl -n vm.swappiness)
+sudo sysctl -w vm.swappiness="$old"</code></pre>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<ul>
+<li><code>man sysctl</code>：命令选项、<code>-p</code>、<code>--system</code>、<code>-w</code> 等行为。</li>
+<li><code>man sysctl.conf</code>：配置文件格式、注释、加载规则。</li>
+<li>Linux kernel documentation：<code>Documentation/admin-guide/sysctl/</code> 下的 <code>net.rst</code>、<code>vm.rst</code>、<code>kernel.rst</code>。</li>
+<li>systemd 文档：<code>systemd-sysctl.service</code> 和 sysctl.d 目录加载顺序。</li>
+<li>Kubernetes 文档：Pod security context 中 sysctls、safe sysctls 与 unsafe sysctls 策略。</li>
+<li>发行版文档：不同 Linux 发行版可能有不同默认值、补丁和配置目录优先级。</li>
+</ul>
+<div class="note"><strong>学习路径：</strong> 先掌握 <code>sysctl key</code>、<code>sysctl -w</code>、<code>sysctl -p file</code>、<code>sysctl --system</code>，再进入网络、VM、大页等具体子系统。不要从参数表开始学。</div>
+</section>
+
+<div class="footer">sysctl AI Infra/Linux 命令教程 · 单文件 HTML · 无外部依赖 · 面向生产安全变更</div>
+</div>
+</body>
+</html>

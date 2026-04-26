@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ibv_devinfo 深度教程：AI Infra RDMA verbs 设备能力与链路排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ibv_devinfo 深度教程：AI Infra RDMA verbs 设备能力与链路排障</h1>
+<p class="sub">这份教程围绕 Linux/RDMA 命令 <code>ibv_devinfo</code> 展开，面向 GPU 训练集群、RoCE/InfiniBand 网络、NCCL RDMA readiness、存储网络和高性能推理节点。重点不是背字段，而是建立“verbs 设备 → HCA 能力 → 端口状态 → MTU/GID/P_Key/link layer → NCCL 与 RDMA 应用可用性”的排障模型，覆盖 <code>active_mtu</code>、HCA/port/GID/P_Key、RoCE vs InfiniBand 线索、<code>ibv_devinfo</code> 与 <code>ibstat</code>/<code>rdma</code>/<code>mlxlink</code> 的边界，以及生产采集和故障定位流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">RDMA verbs</span><span class="chip">HCA 能力</span><span class="chip">Port State</span><span class="chip">active_mtu</span><span class="chip">GID/P_Key</span><span class="chip">RoCE/IB</span><span class="chip">NCCL Readiness</span><span class="chip">Troubleshooting</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ibv_devinfo</code> 是 RDMA verbs 设备的“体检报告”：它从用户态 verbs 视角展示本机 HCA、端口和能力，帮助判断应用能不能创建 Queue Pair、选择端口、使用正确 GID/P_Key，并在预期 MTU/link layer 上通信。</div>
+<div class="success"><strong>最重要原则：</strong> 先只读采集，再把输出和 <code>ip</code>、<code>rdma link</code>、<code>ibstat</code>、<code>mlxlink</code>、NCCL 日志、交换机遥测交叉验证；不要把 <code>ibv_devinfo</code> 中“设备存在”误读为“RoCE/IB 数据面已经健康”。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ibv_devinfo 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：verbs 设备到 AI 作业</a></li>
+<li><a class="anchor" href="#s3">安装、权限与快速确认</a></li>
+<li><a class="anchor" href="#s4">常用语法与输出范围</a></li>
+<li><a class="anchor" href="#s5">HCA 身份与全局能力</a></li>
+<li><a class="anchor" href="#s6">端口状态、物理状态与速率线索</a></li>
+<li><a class="anchor" href="#s7">MTU、active_mtu 与路径 MTU</a></li>
+<li><a class="anchor" href="#s8">link_layer：RoCE 与 InfiniBand 线索</a></li>
+<li><a class="anchor" href="#s9">GID 表与 RoCE 地址选择</a></li>
+<li><a class="anchor" href="#s10">P_Key 与 InfiniBand 分区</a></li>
+<li><a class="anchor" href="#s11">cap_flags、atomics、ODP 与资源上限</a></li>
+<li><a class="anchor" href="#s12">NCCL RDMA readiness 检查</a></li>
+<li><a class="anchor" href="#s13">ibv_devinfo vs ibstat/rdma/mlxlink</a></li>
+<li><a class="anchor" href="#s14">自动化基线采集</a></li>
+<li><a class="anchor" href="#s15">容器、Kubernetes 与设备暴露</a></li>
+<li><a class="anchor" href="#s16">常见故障与排障流程</a></li>
+<li><a class="anchor" href="#s17">生产安全与变更边界</a></li>
+<li><a class="anchor" href="#s18">练习任务与学习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ibv_devinfo 是什么</h2>
+<p><code>ibv_devinfo</code> 来自 rdma-core / libibverbs 工具集，用于列出本机 verbs 设备并查询设备属性、端口属性和扩展能力。AI Infra 中它常用于回答三个问题：节点是否暴露了 RDMA HCA；目标端口是否 <code>PORT_ACTIVE</code>；GID、P_Key、MTU、link layer 是否符合 NCCL、MPI、NVMe-oF、分布式存储或自研 RDMA 服务的要求。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>查看 verbs 设备名、node GUID、firmware、vendor、device capability、端口状态、<code>active_mtu</code>、GID 表、P_Key 表、link layer、QP/CQ/MR 等资源上限。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不直接显示交换机 ECN/PFC、RoCE UDP 端口、NCCL 选路、GPU Direct RDMA 是否命中、真实吞吐、链路误码或物理光模块细节。</div>
+<div class="card"><strong>它的本质</strong><br>用户态 verbs API 的观察窗口：应用能看到什么 RDMA 设备和端口，<code>ibv_devinfo</code> 基本也能看到什么。</div>
+</div>
+<pre><code># 列出 verbs 设备
+ibv_devices
+ibv_devinfo -l
+
+# 查看全部设备的常规属性
+ibv_devinfo
+
+# 查看详细属性，包含更多能力和表项
+ibv_devinfo -v
+
+# 只看指定 HCA 和端口
+ibv_devinfo -d mlx5_0 -i 1</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>ibv_devinfo</code> 显示端口 active 只说明本机 verbs 端口状态可用；跨节点 RDMA 通信还依赖对端、路由、GID index、P_Key、MTU、QoS、PFC/ECN、交换机和防火墙/安全策略。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. 整体模型：verbs 设备到 AI 作业</h2>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="ibv_devinfo RDMA stack model">
+<rect x="16" y="16" width="1068" height="620" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">从 HCA 到 NCCL/RDMA 应用的观察链路</text>
+<rect x="65" y="120" width="190" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="160" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">HCA 设备</text>
+<text x="160" y="190" text-anchor="middle" font-size="14">mlx5_0 / hfi1_0</text>
+<text x="160" y="214" text-anchor="middle" font-size="14">node_guid / firmware</text>
+<rect x="315" y="120" width="190" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="410" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">Port 属性</text>
+<text x="410" y="190" text-anchor="middle" font-size="14">state / phys_state</text>
+<text x="410" y="214" text-anchor="middle" font-size="14">active_mtu / rate</text>
+<rect x="565" y="120" width="190" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="660" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">地址与隔离</text>
+<text x="660" y="190" text-anchor="middle" font-size="14">GID table</text>
+<text x="660" y="214" text-anchor="middle" font-size="14">P_Key table</text>
+<rect x="815" y="120" width="190" height="120" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="910" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">应用路径</text>
+<text x="910" y="190" text-anchor="middle" font-size="14">NCCL / MPI</text>
+<text x="910" y="214" text-anchor="middle" font-size="14">NVMe-oF / storage</text>
+<rect x="120" y="360" width="860" height="155" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="402" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">ibv_devinfo 的结论必须落到字段</text>
+<text x="550" y="442" text-anchor="middle" font-size="16">mlx5_0 port 1: PORT_ACTIVE, active_mtu=4096, link_layer=Ethernet, GID index 3 为 RoCEv2 IPv4</text>
+<text x="550" y="474" text-anchor="middle" font-size="16">如果 NCCL 仍退回 Socket，需要继续查 NCCL_IB_HCA / GID index / ACS / IOMMU / GPU 拓扑 / counters</text>
+<line x1="255" y1="180" x2="315" y2="180" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="505" y1="180" x2="565" y2="180" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="755" y1="180" x2="815" y2="180" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M160 240 C210 310, 330 330, 425 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M410 240 C445 305, 500 332, 520 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M660 240 C635 305, 600 332, 580 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M910 240 C850 315, 730 335, 660 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption"><code>ibv_devinfo</code> 的价值在于把“应用不可用/性能差”向下分解成 HCA、端口、MTU、地址表和能力字段。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、权限与快速确认</h2>
+<p>大多数发行版把 <code>ibv_devinfo</code> 放在 rdma-core、libibverbs-utils 或 ibverbs-utils 包中。只读查询通常不需要 root，但容器、Kubernetes、受限 cgroup、设备插件或安全策略可能让用户态看不到 RDMA 设备。</p>
+<pre><code># Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y rdma-core ibverbs-utils
+
+# RHEL / Rocky / Alma / CentOS
+sudo dnf install -y rdma-core libibverbs-utils
+
+# 快速确认工具和设备
+command -v ibv_devinfo
+ibv_devinfo -l
+ibv_devices
+rdma link
+
+# 常见 Mellanox/NVIDIA mlx5 设备映射
+ls -l /sys/class/infiniband
+for d in /sys/class/infiniband/*; do echo "== $d =="; cat "$d"/node_guid; done</code></pre>
+<table>
+<tr><th>检查项</th><th>正常线索</th><th>异常含义</th></tr>
+<tr><td>命令存在</td><td><code>command -v ibv_devinfo</code> 有路径</td><td>工具包未安装，或容器镜像缺少 rdma-core 用户态工具</td></tr>
+<tr><td>设备列表</td><td><code>mlx5_0</code>、<code>mlx5_1</code> 等可见</td><td>驱动未加载、VF 未暴露、容器未挂载设备、权限或设备插件问题</td></tr>
+<tr><td>端口 active</td><td><code>state: PORT_ACTIVE</code></td><td>链路、交换机端口、线缆、RoCE netdev、IB fabric 或固件状态异常</td></tr>
+<tr><td>link layer</td><td><code>Ethernet</code> 或 <code>InfiniBand</code> 符合预期</td><td>把 RoCE 当 IB，或把 IB 当以太网工具排障，都会走错方向</td></tr>
+</table>
+<div class="note"><strong>容器提示：</strong> 容器中能运行 <code>ibv_devinfo</code> 不代表 NCCL 能用到所有 HCA；还要检查 <code>/dev/infiniband/*</code>、<code>/sys/class/infiniband</code>、net namespace、RDMA device plugin、<code>NCCL_IB_HCA</code> 和 cgroup device 规则。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 常用语法与输出范围</h2>
+<p><code>ibv_devinfo</code> 的常用参数很少，但输出字段很多。日常排障建议先列设备，再对单个 HCA/端口采集详细信息，避免多 HCA 节点输出太长导致误读。</p>
+<table>
+<tr><th>命令</th><th>用途</th><th>适合场景</th></tr>
+<tr><td><code>ibv_devinfo -l</code></td><td>只列出可见 verbs 设备</td><td>脚本 smoke test、容器设备暴露检查</td></tr>
+<tr><td><code>ibv_devinfo</code></td><td>显示所有设备的基础属性与端口属性</td><td>人工巡检、节点验收</td></tr>
+<tr><td><code>ibv_devinfo -v</code></td><td>显示更详细能力、GID/P_Key 等信息</td><td>排查 GID index、能力字段、资源上限</td></tr>
+<tr><td><code>ibv_devinfo -d mlx5_0</code></td><td>只看指定 HCA</td><td>多 HCA/GPU 节点，减少噪声</td></tr>
+<tr><td><code>ibv_devinfo -d mlx5_0 -i 1</code></td><td>只看指定 HCA 的指定端口</td><td>NCCL 或 RDMA 应用绑定到特定端口时</td></tr>
+</table>
+<pre><code># 推荐的单端口采集格式
+host=$(hostname -s)
+dev=mlx5_0
+port=1
+mkdir -p /tmp/rdma-baseline
+ibv_devinfo -v -d "$dev" -i "$port" &gt; "/tmp/rdma-baseline/${host}.${dev}.${port}.ibv_devinfo.txt"
+rdma link &gt; "/tmp/rdma-baseline/${host}.rdma-link.txt"
+ip -br addr &gt; "/tmp/rdma-baseline/${host}.ip-addr.txt"</code></pre>
+<div class="success"><strong>好习惯：</strong> 报告中不要写“RDMA 正常”这种粗结论，而要写“<code>mlx5_0:1 state=PORT_ACTIVE active_mtu=4096 link_layer=Ethernet gid[3]=RoCEv2 IPv4</code>”。</div>
+</section>
+
+<section class="figure" id="fig-output">
+<h3>信息图：ibv_devinfo 输出解剖</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="ibv_devinfo output anatomy">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="65" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">从上到下读输出：设备 → 端口 → 表项 → 能力</text>
+<rect x="80" y="120" width="260" height="125" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="210" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">HCA 身份</text>
+<text x="210" y="190" text-anchor="middle" font-size="14">hca_id / transport</text>
+<text x="210" y="214" text-anchor="middle" font-size="14">fw_ver / node_guid</text>
+<rect x="420" y="120" width="260" height="125" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">端口事实</text>
+<text x="550" y="190" text-anchor="middle" font-size="14">state / phys_state</text>
+<text x="550" y="214" text-anchor="middle" font-size="14">active_mtu / link_layer</text>
+<rect x="760" y="120" width="260" height="125" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="890" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">地址隔离表</text>
+<text x="890" y="190" text-anchor="middle" font-size="14">GID table</text>
+<text x="890" y="214" text-anchor="middle" font-size="14">P_Key table</text>
+<rect x="170" y="365" width="330" height="120" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="335" y="405" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">资源上限</text>
+<text x="335" y="437" text-anchor="middle" font-size="14">max_qp / max_cq / max_mr</text>
+<text x="335" y="461" text-anchor="middle" font-size="14">max_qp_wr / max_sge</text>
+<rect x="600" y="365" width="330" height="120" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="765" y="405" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">能力标志</text>
+<text x="765" y="437" text-anchor="middle" font-size="14">device_cap_flags</text>
+<text x="765" y="461" text-anchor="middle" font-size="14">atomic / ODP / RSS 线索</text>
+<rect x="205" y="585" width="690" height="60" rx="14" fill="#f0fdf4" stroke="#86efac"/>
+<text x="550" y="622" text-anchor="middle" font-size="18" font-weight="700">先确认端口可用，再解释能力；先解释本机，再验证对端和 fabric</text>
+<line x1="340" y1="182" x2="420" y2="182" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="680" y1="182" x2="760" y2="182" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M550 245 C500 300, 415 320, 360 365" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M550 245 C605 300, 700 320, 750 365" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="335" y1="485" x2="505" y2="585" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="765" y1="485" x2="595" y2="585" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">输出很多时，阅读顺序比字段数量更重要：设备身份、端口事实、GID/P_Key、资源和能力。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. HCA 身份与全局能力</h2>
+<p>HCA 层字段告诉你“这块 RDMA 设备是谁、由什么固件驱动、最大能创建多少资源”。AI 节点常见多 HCA、多端口、多 VF、BlueField DPU、SR-IOV VF 和容器透传，设备名与物理网口/GPU 拓扑不一定一眼对应。</p>
+<pre><code># 示例输出片段，字段名会随设备和 rdma-core 版本略有差异
+hca_id: mlx5_0
+    transport:                      InfiniBand (0)
+    fw_ver:                         28.39.1002
+    node_guid:                      248a:0703:00ab:cdef
+    sys_image_guid:                 248a:0703:00ab:cdef
+    vendor_id:                      0x02c9
+    vendor_part_id:                 4129
+    hw_ver:                         0x0
+    phys_port_cnt:                  1
+    max_qp:                         262144
+    max_cq:                         16777216
+    max_mr:                         16777216</code></pre>
+<table>
+<tr><th>字段</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>hca_id</code></td><td>verbs 设备名，例如 <code>mlx5_0</code></td><td>NCCL 的 <code>NCCL_IB_HCA</code>、MPI provider、RDMA 服务绑定常用它</td></tr>
+<tr><td><code>fw_ver</code></td><td>HCA 固件版本</td><td>同一训练池建议基线一致；异常节点先与健康节点对比</td></tr>
+<tr><td><code>node_guid</code></td><td>设备全局唯一标识</td><td>IB fabric、资产映射、跨工具关联时有用</td></tr>
+<tr><td><code>phys_port_cnt</code></td><td>物理端口数量</td><td>双口卡、单口 VF、DPU 环境要特别确认端口编号</td></tr>
+<tr><td><code>max_qp/max_cq/max_mr</code></td><td>资源上限</td><td>大规模多进程、多容器或高连接数 RDMA 服务可能碰到资源耗尽</td></tr>
+</table>
+<div class="note"><strong>映射习惯：</strong> 把 <code>hca_id</code>、PCI BDF、netdev、NUMA node、GPU PCI 拓扑放在同一张表里，才能解释 NCCL 选哪块 HCA、跨不跨 NUMA、是否经过 PCIe switch。</div>
+<pre><code># mlx5 设备常用映射方法
+for dev in /sys/class/infiniband/*; do
+  name=$(basename "$dev")
+  echo "== $name =="
+  readlink -f "$dev/device"
+  ls "$dev/device/net" 2&gt;/dev/null || true
+  cat "$dev/device/numa_node" 2&gt;/dev/null || true
+done</code></pre>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 端口状态、物理状态与速率线索</h2>
+<p>端口是 RDMA 应用真正要用的通信入口。最关键字段是 <code>state</code>、<code>phys_state</code>、<code>active_mtu</code>、<code>link_layer</code>、<code>active_speed</code>/<code>active_width</code> 或等价速率字段。不同设备输出细节会不同，但排障目标一致：端口是否 active，链路是否跑在预期模式。</p>
+<pre><code># 只看端口相关关键字段
+ibv_devinfo -d mlx5_0 -i 1 | egrep 'port:|state:|phys_state:|active_mtu|link_layer|active_speed|active_width|rate'
+
+# 和内核 RDMA link 视角交叉验证
+rdma link show
+
+# RoCE 场景还要看对应 netdev
+ip -br link
+ethtool ens5f0 | egrep 'Speed|Link detected'</code></pre>
+<table>
+<tr><th>字段</th><th>正常线索</th><th>异常排查方向</th></tr>
+<tr><td><code>state</code></td><td><code>PORT_ACTIVE</code></td><td><code>DOWN</code>/<code>INIT</code> 时查驱动、线缆、交换机端口、netdev、SM 或 fabric</td></tr>
+<tr><td><code>phys_state</code></td><td>以设备输出为准，常见是 LinkUp/Polling 等语义</td><td>物理层未建立时优先查光模块、线缆、FEC、交换机 profile</td></tr>
+<tr><td><code>active_speed</code>/<code>active_width</code></td><td>与 100G/200G/400G/IB NDR 等预期匹配</td><td>降速、降宽、链路 flap 或混插线缆可能导致性能异常</td></tr>
+<tr><td><code>link_layer</code></td><td><code>Ethernet</code> 表示 RoCE，<code>InfiniBand</code> 表示 IB</td><td>决定后续用 IP/RoCE 还是 IB fabric 的排障路径</td></tr>
+</table>
+<div class="warn"><strong>不要只看 active：</strong> 端口 active 但速率降级、MTU 不一致、PFC/ECN 错误、GID index 选错，仍然会让 NCCL 慢、丢包、重传或直接连接失败。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. MTU、active_mtu 与路径 MTU</h2>
+<p><code>active_mtu</code> 是 verbs 端口当前可用 MTU 的重要线索。IB 常见 2048/4096；RoCE 环境中还要同时看 Linux netdev MTU，例如 1500、9000。AI 训练网络里，MTU 不一致会导致 RoCE 性能差、丢包、NCCL 报错或 fallback。</p>
+<pre><code># verbs 视角
+ibv_devinfo -d mlx5_0 -i 1 | grep -E 'max_mtu|active_mtu'
+
+# RoCE 对应以太网接口的 MTU
+ip link show ens5f0
+cat /sys/class/net/ens5f0/mtu
+
+# 非破坏性检查大包路径，按环境选择合适大小
+ping -M do -s 8972 10.10.20.12 -c 3</code></pre>
+<table>
+<tr><th>概念</th><th>说明</th><th>排障价值</th></tr>
+<tr><td><code>max_mtu</code></td><td>端口支持的最大 verbs MTU</td><td>能力上限，不代表当前正在使用</td></tr>
+<tr><td><code>active_mtu</code></td><td>端口当前 active 的 verbs MTU</td><td>NCCL/RDMA 路径 MTU 判断的基础字段</td></tr>
+<tr><td>netdev MTU</td><td>RoCE 对应以太网接口 MTU</td><td>RoCEv2 走 UDP/IP，和 jumbo frame、交换机 MTU 密切相关</td></tr>
+<tr><td>路径 MTU</td><td>从源到目的整条路径可通过的 MTU</td><td>任一跳不支持都会导致分片、丢包或性能下降</td></tr>
+</table>
+<div class="danger"><strong>变更警告：</strong> 修改 MTU 可能瞬断流量，并且必须端到端一致：主机 netdev、bond/VLAN、交换机端口、fabric profile、对端节点都要匹配。<code>ibv_devinfo</code> 只读，不负责修复 MTU。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. link_layer：RoCE 与 InfiniBand 线索</h2>
+<p><code>link_layer</code> 是排障分叉点。<code>Ethernet</code> 通常表示 RoCE，需要同时考虑 IP 地址、GID、VLAN、MTU、PFC/ECN、交换机 QoS 和 UDP/IP 路径；<code>InfiniBand</code> 则更关注 Subnet Manager、LID、P_Key、IB fabric 路由、SL/VL 和 HCA 端口状态。</p>
+<div class="grid-2">
+<div class="card"><strong>RoCE 线索</strong><br><code>link_layer: Ethernet</code>；GID 表常包含 IPv4/IPv6 映射或 RoCE v1/v2 类型；需要用 <code>ip</code>、<code>ethtool</code>、<code>rdma link</code>、交换机 ECN/PFC counters 继续验证。</div>
+<div class="card"><strong>InfiniBand 线索</strong><br><code>link_layer: InfiniBand</code>；关注 <code>lid</code>、<code>sm_lid</code>、<code>pkey_tbl_len</code>、P_Key 表；需要用 <code>ibstat</code>、<code>ibnetdiscover</code>、<code>perfquery</code> 等 fabric 工具继续验证。</div>
+</div>
+<pre><code># 判断当前端口链路类型
+ibv_devinfo -d mlx5_0 -i 1 | grep link_layer
+
+# RoCE：把 HCA 关联到 netdev 和 IP
+ls /sys/class/infiniband/mlx5_0/device/net
+ip addr show ens5f0
+rdma link show
+
+# IB：查看 LID/SM/P_Key 线索
+ibv_devinfo -v -d mlx5_0 -i 1 | egrep 'lid|sm_lid|pkey|link_layer'</code></pre>
+<div class="note"><strong>心智模型：</strong> RoCE 是“RDMA verbs + 以太网/IP fabric”；InfiniBand 是“RDMA verbs + IB fabric”。同样是 verbs，底层网络排障工具和字段完全不同。</div>
+</section>
+
+<section class="figure" id="fig-roce-ib">
+<h3>对比图：RoCE 与 InfiniBand 排障分叉</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="RoCE versus InfiniBand troubleshooting split">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="390" y="55" width="320" height="70" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="98" text-anchor="middle" font-size="22" font-weight="700">读取 link_layer</text>
+<polygon points="550,170 730,260 550,350 370,260" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="253" text-anchor="middle" font-size="18" font-weight="700">Ethernet 还是 InfiniBand？</text>
+<text x="550" y="278" text-anchor="middle" font-size="14">同一 verbs API，不同 fabric</text>
+<rect x="85" y="220" width="245" height="100" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="207" y="258" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">Ethernet / RoCE</text>
+<text x="207" y="287" text-anchor="middle" font-size="14">IP、GID、MTU、PFC/ECN</text>
+<rect x="770" y="220" width="245" height="100" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="892" y="258" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">InfiniBand</text>
+<text x="892" y="287" text-anchor="middle" font-size="14">LID、SM、P_Key、fabric</text>
+<rect x="75" y="445" width="365" height="145" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="257" y="482" text-anchor="middle" font-size="18" font-weight="700">RoCE 继续查</text>
+<text x="257" y="516" text-anchor="middle" font-size="14">ip route / GID index / DSCP</text>
+<text x="257" y="542" text-anchor="middle" font-size="14">jumbo MTU / PFC / ECN / counters</text>
+<text x="257" y="568" text-anchor="middle" font-size="14">NCCL_IB_GID_INDEX / netdev mapping</text>
+<rect x="660" y="445" width="365" height="145" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="842" y="482" text-anchor="middle" font-size="18" font-weight="700">IB 继续查</text>
+<text x="842" y="516" text-anchor="middle" font-size="14">SM 是否运行 / LID 是否分配</text>
+<text x="842" y="542" text-anchor="middle" font-size="14">P_Key 分区 / SL / fabric 路由</text>
+<text x="842" y="568" text-anchor="middle" font-size="14">ibstat / ibnetdiscover / perfquery</text>
+<line x1="550" y1="125" x2="550" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="370" y1="260" x2="330" y2="260" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="730" y1="260" x2="770" y2="260" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M207 320 C220 385, 240 410, 257 445" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M892 320 C880 385, 860 410, 842 445" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">看到 <code>link_layer</code> 后再选择工具链；RoCE 和 InfiniBand 的“同名 RDMA 问题”经常需要完全不同的证据。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. GID 表与 RoCE 地址选择</h2>
+<p>GID 是 RDMA 地址选择的核心字段之一。RoCE 环境中，同一端口可能有多个 GID index，对应 IPv6 link-local、IPv4-mapped、VLAN、RoCE v1/v2 或不同地址族。NCCL、MPI、UCX、libfabric 和自研服务选错 GID index 时，症状可能是连接失败、跨网段不通、性能异常或走到错误网卡。</p>
+<pre><code># 查看 GID 表，详细输出更有价值
+ibv_devinfo -v -d mlx5_0 -i 1 | sed -n '/GID/p;/gid/p'
+
+# sysfs 中也可观察 GID 与类型，路径随驱动存在差异
+ls /sys/class/infiniband/mlx5_0/ports/1/gids
+for i in /sys/class/infiniband/mlx5_0/ports/1/gids/*; do
+  idx=$(basename "$i")
+  printf 'gid[%s]=%s ' "$idx" "$(cat "$i")"
+  cat "/sys/class/infiniband/mlx5_0/ports/1/gid_attrs/types/$idx" 2&gt;/dev/null || true
+done
+
+# NCCL 常见调试环境变量示例
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET NCCL_IB_HCA=mlx5_0 NCCL_IB_GID_INDEX=3 ./train.sh</code></pre>
+<table>
+<tr><th>现象</th><th>GID 相关解释</th><th>下一步</th></tr>
+<tr><td>同机房节点可通，跨网段不通</td><td>选到 link-local 或错误 VLAN 的 GID</td><td>对照 GID index、IP 地址、路由、VLAN 和 NCCL/UCX 配置</td></tr>
+<tr><td>NCCL 日志显示使用 IB/RDMA 但性能差</td><td>可能选到非预期 HCA、GID 或网段</td><td>固定 <code>NCCL_IB_HCA</code>、<code>NCCL_IB_GID_INDEX</code> 做 A/B</td></tr>
+<tr><td>容器内 GID 表缺失或不一致</td><td>设备、sysfs 或 net namespace 暴露不完整</td><td>检查 RDMA device plugin、hostNetwork、CNI 和挂载</td></tr>
+<tr><td>RoCEv1/v2 混淆</td><td>不同 GID type 走不同封装语义</td><td>以集群标准为准，统一驱动、固件和 NCCL/UCX 配置</td></tr>
+</table>
+<div class="warn"><strong>GID 提醒：</strong> “GID index 3 是正确值”不是普适规则。正确 index 取决于 HCA、驱动、IP/VLAN、RoCE 类型和集群配置，必须在目标节点上采集确认。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. P_Key 与 InfiniBand 分区</h2>
+<p>P_Key 是 InfiniBand 分区机制的核心字段，类似 fabric 层访问隔离。RoCE 环境通常不靠 P_Key 做以太网隔离；IB 环境中 P_Key 不匹配可能导致端口 active 但通信失败。<code>ibv_devinfo -v</code> 可展示 P_Key 表长度和表项线索。</p>
+<pre><code># 查看 P_Key 相关字段
+ibv_devinfo -v -d mlx5_0 -i 1 | egrep 'pkey|P_Key|pkey_tbl_len'
+
+# sysfs 查看 P_Key 表
+ls /sys/class/infiniband/mlx5_0/ports/1/pkeys
+for p in /sys/class/infiniband/mlx5_0/ports/1/pkeys/*; do
+  echo "$(basename "$p") $(cat "$p")"
+done</code></pre>
+<table>
+<tr><th>字段/表项</th><th>含义</th><th>排障价值</th></tr>
+<tr><td><code>pkey_tbl_len</code></td><td>端口 P_Key 表长度</td><td>判断 fabric 是否下发了分区表项</td></tr>
+<tr><td><code>0x7fff</code></td><td>常见 default limited membership P_Key</td><td>默认分区可见不代表目标业务分区可用</td></tr>
+<tr><td><code>0xffff</code></td><td>常见 default full membership P_Key</td><td>权限语义要结合 IB fabric 配置确认</td></tr>
+<tr><td>自定义 P_Key</td><td>业务或租户隔离分区</td><td>对端和本端 P_Key 不匹配会导致连接失败</td></tr>
+</table>
+<div class="note"><strong>IB 排障顺序：</strong> 先看端口 active 和 SM/LID，再看 P_Key，再看路由、SL/VL 和性能计数。不要只凭 <code>ibv_devinfo</code> 判断整个 fabric 健康。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. cap_flags、atomics、ODP 与资源上限</h2>
+<p>详细输出中的能力字段决定应用能否使用某些 verbs 特性。多数 NCCL 基础通信不需要你逐个调这些字段，但当涉及 GPUDirect RDMA、SHARP/collectives、MPI one-sided、原子操作、ODP、内存注册缓存或高连接数服务时，能力差异会变成真实问题。</p>
+<table>
+<tr><th>能力/资源</th><th>用途</th><th>异常影响</th></tr>
+<tr><td><code>device_cap_flags</code></td><td>设备能力位集合</td><td>特定 verbs 功能不可用，应用可能 fallback 或启动失败</td></tr>
+<tr><td>Atomic capabilities</td><td>RDMA 原子操作支持范围</td><td>MPI/数据库/自研 RDMA 协议可能依赖原子语义</td></tr>
+<tr><td>ODP</td><td>On-Demand Paging，减少部分内存注册负担</td><td>不支持时应用需走传统 MR 注册路径</td></tr>
+<tr><td><code>max_qp_wr</code>/<code>max_sge</code></td><td>QP 工作请求和 scatter-gather 上限</td><td>高吞吐应用参数过大时创建 QP 或 post WR 失败</td></tr>
+<tr><td><code>max_mr</code>/<code>max_mr_size</code></td><td>Memory Region 数量和大小</td><td>大模型训练和 RDMA storage 的内存注册压力可能触顶</td></tr>
+</table>
+<pre><code># 抽取能力和资源字段做基线对比
+ibv_devinfo -v -d mlx5_0 | egrep 'cap_flags|max_qp|max_cq|max_mr|max_sge|max_qp_wr|atomic|ODP|odp'
+
+# 对比两台节点的能力差异
+ssh node-a 'ibv_devinfo -v -d mlx5_0' &gt; /tmp/node-a.ibv
+ssh node-b 'ibv_devinfo -v -d mlx5_0' &gt; /tmp/node-b.ibv
+diff -u /tmp/node-a.ibv /tmp/node-b.ibv</code></pre>
+<div class="warn"><strong>解释提醒：</strong> 能力字段名称和展示细节随 rdma-core、驱动和硬件不同而变化。自动化脚本应容忍字段缺失，并保留原始输出用于人工复核。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. NCCL RDMA readiness 检查</h2>
+<p><code>ibv_devinfo</code> 不能证明 NCCL 一定走 RDMA，但它能确认 NCCL 走 RDMA 前的基础条件：HCA 可见、目标端口 active、link layer 符合集群类型、GID/P_Key 可解释、MTU 合理、设备名可用于 <code>NCCL_IB_HCA</code>。之后还要用 NCCL 日志、<code>nccl-tests</code>、GPU 拓扑和 RDMA counters 验证。</p>
+<h3>最小 readiness 清单</h3>
+<table>
+<tr><th>检查</th><th>命令</th><th>通过标准</th></tr>
+<tr><td>HCA 可见</td><td><code>ibv_devinfo -l</code></td><td>训练用 HCA 出现在容器/宿主机中</td></tr>
+<tr><td>端口 active</td><td><code>ibv_devinfo -d mlx5_0 -i 1</code></td><td><code>state: PORT_ACTIVE</code></td></tr>
+<tr><td>RoCE/IB 类型正确</td><td><code>grep link_layer</code></td><td>与集群设计一致</td></tr>
+<tr><td>MTU 合理</td><td><code>grep active_mtu</code> + <code>ip link</code></td><td>端到端 MTU 符合集群基线</td></tr>
+<tr><td>地址/分区可解释</td><td><code>ibv_devinfo -v</code></td><td>RoCE GID 或 IB P_Key 与应用配置一致</td></tr>
+<tr><td>NCCL 实际选择</td><td><code>NCCL_DEBUG=INFO</code></td><td>日志显示 NET/IB 使用预期 HCA/GID，而非 Socket fallback</td></tr>
+</table>
+<pre><code># NCCL 排障常用启动前采集
+ibv_devinfo -v -d mlx5_0 -i 1
+rdma link
+ip route get 10.10.20.12
+nvidia-smi topo -m
+
+# NCCL 运行时确认网络选择
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET \
+NCCL_IB_HCA=mlx5_0 NCCL_SOCKET_IFNAME=ens5f0 \
+./build/all_reduce_perf -b 8M -e 8G -f 2 -g 8</code></pre>
+<div class="danger"><strong>不要过度推断：</strong> <code>ibv_devinfo</code> 没有 GPU 拓扑、PCIe ACS、IOMMU、GDRCopy、CUDA IPC、NCCL 算法和交换机拥塞信息。NCCL 慢时，它是第一层证据，不是最终判决。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. ibv_devinfo vs ibstat/rdma/mlxlink</h2>
+<p>RDMA 排障经常需要多个工具交叉验证。<code>ibv_devinfo</code> 是 verbs 视角；<code>ibstat</code> 更偏 IB/CA 状态摘要；<code>rdma</code> 是内核 RDMA netlink 视角；<code>mlxlink</code> 更接近 Mellanox/NVIDIA 物理链路和模块/FEC 诊断。</p>
+<table>
+<tr><th>工具</th><th>主要视角</th><th>适合回答</th><th>不适合替代</th></tr>
+<tr><td><code>ibv_devinfo</code></td><td>用户态 verbs 设备和端口属性</td><td>应用能看到哪些 HCA/port/GID/P_Key/caps</td><td>物理误码、交换机 QoS、NCCL 实际选路</td></tr>
+<tr><td><code>ibstat</code></td><td>CA/port 状态摘要，IB 语义更强</td><td>IB 端口 state、LID、SM、rate 简查</td><td>详细 verbs caps 和 RoCE GID 解释</td></tr>
+<tr><td><code>rdma link</code></td><td>内核 RDMA link 与 netdev 关联</td><td>RDMA 设备、端口和网络接口映射</td><td>完整 HCA 能力和 GID/P_Key 细节</td></tr>
+<tr><td><code>mlxlink</code></td><td>NVIDIA/Mellanox 物理链路</td><td>FEC、模块、误码、链路降级、物理层诊断</td><td>非 mlx 设备或通用 verbs 资源信息</td></tr>
+<tr><td><code>ib_write_bw</code>/<code>qperf</code></td><td>主动性能测试</td><td>实际 RDMA latency/bandwidth 是否达标</td><td>静态设备能力基线</td></tr>
+</table>
+<pre><code># 典型分层组合
+ibv_devinfo -v -d mlx5_0 -i 1     # verbs 设备和端口
+rdma link show                    # RDMA link 与 netdev
+ibstat                            # IB/CA 状态摘要
+mlxlink -d /dev/mst/mt4129_pciconf0 # mlx 物理链路线索，设备路径按现场调整
+ib_write_bw -d mlx5_0 -i 1 peer   # 主动 RDMA 带宽测试</code></pre>
+<div class="success"><strong>工具选择原则：</strong> 静态能力用 <code>ibv_devinfo</code>，内核映射用 <code>rdma</code>，IB fabric 用 IB 工具，物理链路用 <code>mlxlink</code>/<code>ethtool</code>，真实性能用 <code>perftest</code>/<code>qperf</code>/NCCL tests。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 自动化基线采集</h2>
+<p>AI 集群中不要等训练失败才第一次看 RDMA。建议在节点验收、驱动升级、固件升级、交换机变更、Kubernetes 节点加入和大作业上线前采集基线，并保留原始文本。</p>
+<pre><code># 只读采集脚本：不会修改系统状态
+#!/usr/bin/env bash
+set -euo pipefail
+out=${1:-/tmp/rdma-baseline-$(hostname -s)}
+mkdir -p "$out"
+
+date -Is &gt; "$out/timestamp.txt"
+hostname -f &gt; "$out/hostname.txt"
+uname -a &gt; "$out/uname.txt"
+ibv_devinfo -l &gt; "$out/ibv-devices.txt" 2&gt;&amp;1 || true
+ibv_devinfo -v &gt; "$out/ibv-devinfo-v.txt" 2&gt;&amp;1 || true
+rdma link &gt; "$out/rdma-link.txt" 2&gt;&amp;1 || true
+ip -br addr &gt; "$out/ip-addr.txt" 2&gt;&amp;1 || true
+for dev in /sys/class/infiniband/*; do
+  [ -e "$dev" ] || continue
+  name=$(basename "$dev")
+  mkdir -p "$out/sysfs-$name"
+  cp "$dev/node_guid" "$out/sysfs-$name/node_guid" 2&gt;/dev/null || true
+  ls "$dev/device/net" &gt; "$out/sysfs-$name/netdevs.txt" 2&gt;/dev/null || true
+  cat "$dev/device/numa_node" &gt; "$out/sysfs-$name/numa_node.txt" 2&gt;/dev/null || true
+done</code></pre>
+<table>
+<tr><th>采集维度</th><th>为什么保留</th><th>对比场景</th></tr>
+<tr><td>原始 <code>ibv_devinfo -v</code></td><td>字段随版本变化，原文最可靠</td><td>健康节点 vs 异常节点、升级前 vs 升级后</td></tr>
+<tr><td><code>rdma link</code> 与 <code>ip</code></td><td>把 HCA 和 netdev/IP 关联起来</td><td>RoCE 选错接口、容器网络命名空间问题</td></tr>
+<tr><td>NUMA/PCI 映射</td><td>解释 GPU-HCA 亲和性</td><td>NCCL 跨 NUMA、PCIe 拓扑异常</td></tr>
+<tr><td>时间戳和内核</td><td>定位变更窗口</td><td>驱动、固件、内核升级后回归</td></tr>
+</table>
+<div class="note"><strong>脚本原则：</strong> 自动化解析可以提取少数字段，但必须保存完整原始输出。RDMA 字段命名和展示细节太依赖硬件/驱动，过度结构化容易丢证据。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 容器、Kubernetes 与设备暴露</h2>
+<p>AI 训练大多运行在容器中。宿主机 <code>ibv_devinfo</code> 正常，不代表 Pod 内正常；Pod 内正常，也不代表 NCCL 选到正确 HCA。容器排障要同时看设备节点、sysfs、net namespace、CNI、RDMA device plugin 和环境变量。</p>
+<pre><code># 宿主机：设备节点
+ls -l /dev/infiniband
+ls -l /sys/class/infiniband
+
+# Pod 内：确认是否看得到同样的 verbs 设备
+ibv_devinfo -l
+ibv_devinfo -d mlx5_0 -i 1
+ls -l /dev/infiniband
+ip -br addr
+
+# Kubernetes 侧常见线索
+kubectl describe pod train-0 | grep -i -E 'rdma|resource|device|network'
+kubectl exec train-0 -- env | grep -E 'NCCL|UCX|FI_'</code></pre>
+<div class="grid-2">
+<div class="card"><strong>设备暴露</strong><br>需要 <code>/dev/infiniband/uverbs*</code>、<code>rdma_cm</code>、对应 sysfs 和合适 cgroup device 权限。SR-IOV VF 场景还要确认 VF 与 netdev/IP 绑定。</div>
+<div class="card"><strong>网络命名空间</strong><br>RoCE 依赖 IP/GID/netdev，Pod 网络、hostNetwork、Multus、VLAN 和路由都会影响 GID 与 NCCL socket bootstrap。</div>
+<div class="card"><strong>NCCL 配置</strong><br><code>NCCL_IB_HCA</code>、<code>NCCL_SOCKET_IFNAME</code>、<code>NCCL_IB_GID_INDEX</code>、<code>NCCL_IB_DISABLE</code> 常直接改变选路。</div>
+<div class="card"><strong>权限与安全</strong><br>有些集群限制 privileged、capabilities 或设备插件资源名；不要通过放宽权限掩盖设备映射错误。</div>
+</div>
+<div class="warn"><strong>容器误区：</strong> Pod 内 <code>ibv_devinfo -l</code> 能看到设备，只证明 verbs 设备可见；还要确认 Pod IP/路由/GID 与 NCCL 选择一致。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常见故障与排障流程</h2>
+<p>RDMA 故障最好按层排查：工具可用性、设备可见性、端口状态、link layer、MTU、GID/P_Key、对端一致性、主动性能测试、应用日志。不要从 NCCL 错误直接跳到交换机或驱动结论。</p>
+<div class="grid-2">
+<div class="card"><strong>故障 1：No IB devices found</strong><br>检查驱动、<code>/sys/class/infiniband</code>、<code>/dev/infiniband</code>、容器设备挂载、SR-IOV VF 和 rdma-core 安装。</div>
+<div class="card"><strong>故障 2：端口不是 PORT_ACTIVE</strong><br>查 netdev up、光模块/线缆、交换机端口、IB SM、FEC/profile、固件和 link flapping。</div>
+<div class="card"><strong>故障 3：RoCE 连接失败</strong><br>重点看 GID index、IP 路由、VLAN、MTU、PFC/ECN、RoCE type、对端是否同网段或可路由。</div>
+<div class="card"><strong>故障 4：IB 连接失败</strong><br>重点看 LID、SM、P_Key、fabric 路由、端口 state、partition membership。</div>
+<div class="card"><strong>故障 5：NCCL fallback 到 Socket</strong><br>看 NCCL 日志、<code>NCCL_IB_DISABLE</code>、<code>NCCL_IB_HCA</code>、容器设备、libibverbs/provider 是否可用。</div>
+<div class="card"><strong>故障 6：能连但带宽低</strong><br>查 MTU、速率、NUMA/GPU 拓扑、PCIe、PFC/ECN、重传/丢包 counters、单流限制和 CPU 绑定。</div>
+</div>
+<pre><code># 一条保守的只读 triage 路径
+ibv_devinfo -l
+ibv_devinfo -v -d mlx5_0 -i 1
+rdma link show
+ip route get &lt;peer_ip&gt;
+ip -br addr
+ethtool &lt;roce_netdev&gt; | egrep 'Speed|Link detected'
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET ./run_nccl_test.sh</code></pre>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障流程图：从 ibv_devinfo 到 NCCL 结论</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="ibv_devinfo troubleshooting workflow">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="87" text-anchor="middle" font-size="22" font-weight="700">NCCL/RDMA 异常</text>
+<rect x="410" y="150" width="280" height="70" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="193" text-anchor="middle" font-size="20" font-weight="700">ibv_devinfo -l</text>
+<polygon points="550,260 720,345 550,430 380,345" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="338" text-anchor="middle" font-size="17" font-weight="700">HCA 可见且端口 active？</text>
+<text x="550" y="364" text-anchor="middle" font-size="14">设备、端口、MTU、link_layer</text>
+<rect x="85" y="305" width="240" height="92" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="205" y="340" text-anchor="middle" font-size="18" font-weight="700">否</text>
+<text x="205" y="368" text-anchor="middle" font-size="14">修驱动/设备/链路/SM</text>
+<rect x="775" y="305" width="240" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="895" y="340" text-anchor="middle" font-size="18" font-weight="700">是</text>
+<text x="895" y="368" text-anchor="middle" font-size="14">进入地址和 fabric 验证</text>
+<rect x="610" y="500" width="205" height="90" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="712" y="534" text-anchor="middle" font-size="17" font-weight="700">RoCE</text>
+<text x="712" y="562" text-anchor="middle" font-size="13">GID/IP/MTU/PFC/ECN</text>
+<rect x="850" y="500" width="205" height="90" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="952" y="534" text-anchor="middle" font-size="17" font-weight="700">InfiniBand</text>
+<text x="952" y="562" text-anchor="middle" font-size="13">LID/SM/P_Key/fabric</text>
+<rect x="165" y="545" width="360" height="86" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="345" y="578" text-anchor="middle" font-size="17" font-weight="700">主动验证</text>
+<text x="345" y="606" text-anchor="middle" font-size="13">ib_write_bw/qperf/nccl-tests + counters</text>
+<rect x="315" y="665" width="470" height="48" rx="12" fill="#f0fdf4" stroke="#86efac"/>
+<text x="550" y="696" text-anchor="middle" font-size="16" font-weight="700">静态字段通过后，必须用主动测试和应用日志闭环</text>
+<line x1="550" y1="113" x2="550" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="550" y1="220" x2="550" y2="260" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="380" y1="345" x2="325" y2="345" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="720" y1="345" x2="775" y2="345" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M895 397 C865 455, 785 470, 735 500" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M895 397 C920 455, 945 470, 952 500" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M712 590 C640 630, 595 650, 570 665" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M952 590 C830 640, 685 655, 610 665" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M345 631 C400 650, 455 660, 500 665" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">排障闭环：静态可见性 → 端口事实 → fabric 地址/分区 → 主动性能 → 应用日志。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 生产安全与变更边界</h2>
+<p><code>ibv_devinfo</code> 本身是只读命令，适合在生产节点上采集。但它常引出后续变更，例如改 MTU、改 PFC/ECN、升级固件、调整 NCCL 环境变量、切换 GID index 或替换线缆。这些变更必须灰度、可回滚，并且避开训练高峰。</p>
+<table>
+<tr><th>动作</th><th>风险</th><th>安全做法</th></tr>
+<tr><td>采集 <code>ibv_devinfo</code></td><td>低，通常只读</td><td>可批量执行，但注意输出中可能包含资产标识</td></tr>
+<tr><td>调整 NCCL 环境变量</td><td>中，可能改变作业选路</td><td>单作业 A/B，保留 NCCL 日志和性能曲线</td></tr>
+<tr><td>修改 MTU/PFC/ECN</td><td>高，可能影响整网</td><td>端到端方案、交换机联动、维护窗口、回滚预案</td></tr>
+<tr><td>升级固件/驱动</td><td>高，可能需要重启或影响兼容性</td><td>同型号灰度、基线采集、回滚包和节点排空</td></tr>
+<tr><td>替换线缆/模块</td><td>中到高，可能链路中断</td><td>确认端口映射，维护窗口，替换后复测速率和 counters</td></tr>
+</table>
+<div class="danger"><strong>生产警告：</strong> 不要在只拿到 <code>ibv_devinfo</code> 单一证据时批量改网络。RDMA 故障常是端到端系统问题，主机、交换机、应用和作业调度都可能参与。</div>
+<pre><code># 安全变更前后至少保留这些只读证据
+ibv_devinfo -v &gt; before.ibv_devinfo.txt
+rdma link &gt; before.rdma-link.txt
+ip -br addr &gt; before.ip-addr.txt
+ethtool ens5f0 &gt; before.ethtool.txt
+
+# 变更后再采集并 diff
+ibv_devinfo -v &gt; after.ibv_devinfo.txt
+diff -u before.ibv_devinfo.txt after.ibv_devinfo.txt</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 练习任务与学习路线</h2>
+<h3>第一阶段：会读字段</h3>
+<ul>
+<li>在一台节点上运行 <code>ibv_devinfo -l</code>，记录所有 HCA 名称。</li>
+<li>对每个 HCA 运行 <code>ibv_devinfo -d DEV -i 1</code>，找出 <code>state</code>、<code>active_mtu</code>、<code>link_layer</code>。</li>
+<li>把 <code>hca_id</code>、netdev、IP、NUMA node 写成一张表。</li>
+</ul>
+<h3>第二阶段：会分 RoCE/IB</h3>
+<ul>
+<li>看到 <code>link_layer: Ethernet</code> 时，继续查 GID 表、IP、MTU、<code>rdma link</code> 和 <code>ethtool</code>。</li>
+<li>看到 <code>link_layer: InfiniBand</code> 时，继续查 LID、SM、P_Key、<code>ibstat</code> 和 fabric 状态。</li>
+<li>解释为什么“端口 active”不是“NCCL 一定走 RDMA”。</li>
+</ul>
+<h3>第三阶段：工程化排障</h3>
+<ul>
+<li>写一个只读基线采集脚本，保存 <code>ibv_devinfo -v</code>、<code>rdma link</code>、<code>ip -br addr</code> 和 sysfs 映射。</li>
+<li>对比一台健康节点和一台异常节点的 <code>active_mtu</code>、GID 表、固件版本和 link layer。</li>
+<li>用 <code>NCCL_DEBUG=INFO</code> 验证 NCCL 是否使用预期 HCA/GID。</li>
+</ul>
+<pre><code># 练习：生成一份本机 RDMA 快照
+mkdir -p /tmp/ibv-lab
+ibv_devinfo -l | tee /tmp/ibv-lab/devices.txt
+ibv_devinfo -v | tee /tmp/ibv-lab/ibv-devinfo-v.txt
+rdma link | tee /tmp/ibv-lab/rdma-link.txt
+ip -br addr | tee /tmp/ibv-lab/ip-addr.txt
+
+# 练习：抽取端口关键字段
+awk '/hca_id:|port:|state:|phys_state:|active_mtu|link_layer|gid_tbl_len|pkey_tbl_len/' /tmp/ibv-lab/ibv-devinfo-v.txt</code></pre>
+<div class="success"><strong>学习目标：</strong> 能把 <code>ibv_devinfo</code> 输出翻译成一句可操作结论：哪块 HCA、哪个端口、什么 link layer、什么 MTU、什么 GID/P_Key 线索，以及下一步该用哪个工具验证。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages / rdma-core 文档：<code>ibv_devinfo(1)</code>、<code>ibv_devices(1)</code>、<code>rdma(8)</code>、<code>ibv_query_device(3)</code>、<code>ibv_query_port(3)</code>。</li>
+<li>rdma-core / libibverbs 用户态工具与 API：verbs 设备枚举、设备属性、端口属性、GID/P_Key 查询。</li>
+<li>NVIDIA NCCL 文档：<code>NCCL_DEBUG</code>、<code>NCCL_IB_HCA</code>、<code>NCCL_IB_GID_INDEX</code>、网络选择与调试环境变量。</li>
+<li>NVIDIA/Mellanox OFED、mlx5、RoCE 配置资料：GID table、RoCE v2、PFC/ECN、MTU、firmware/driver 基线。</li>
+<li>InfiniBand Architecture 与 fabric 工具资料：Subnet Manager、LID、P_Key、SL/VL、<code>ibstat</code>、<code>ibnetdiscover</code>、<code>perfquery</code>。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 verbs 设备和端口模型，再学习 RoCE/InfiniBand 分叉，最后把 <code>ibv_devinfo</code> 与 NCCL 日志、perftest、链路 counters 和交换机遥测组合起来。</p>
+</section>
+<div class="footer">ibv_devinfo 深度教程 · AI Infra RDMA verbs 设备能力、端口、GID/P_Key、MTU、NCCL readiness 与排障</div>
+</div>
+</body>
+</html>

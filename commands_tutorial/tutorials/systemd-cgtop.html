@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>systemd-cgtop 深度教程：AI Infra cgroup 资源现场视图</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>systemd-cgtop 深度教程：AI Infra cgroup 资源现场视图</h1>
+<p class="sub">这份教程面向 AI Infra、训练平台、推理服务和多租户 Linux 节点排障场景，系统讲清楚 <code>systemd-cgtop</code> 如何按 cgroup 显示 CPU、内存、I/O 与任务数，如何理解 <code>slice</code>/<code>scope</code>/<code>service</code>，如何把 Docker、containerd、Kubernetes、Slurm 作业映射到 systemd cgroup 树，如何定位 noisy training job，以及 cgroup v2、记账开关、容器视角和 <code>top</code>/<code>systemd-cgls</code>/<code>cadvisor</code> 之间的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">cgroup</span><span class="chip">systemd</span><span class="chip">CPU%</span><span class="chip">Memory</span><span class="chip">IO</span><span class="chip">slice/scope/service</span><span class="chip">Kubernetes</span><span class="chip">noisy neighbor</span><span class="chip">cgroup v2</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>systemd-cgtop</code> 是按“资源边界”而不是按“单个进程”看负载的现场仪表盘；它回答的是哪个服务、会话、容器或作业 cgroup 正在消耗 CPU、内存和磁盘 I/O。</div>
+<div class="success"><strong>生产实践：</strong> 它是只读观测工具，适合先定位大方向；真正处置前必须再用 <code>systemctl status</code>、<code>systemd-cgls</code>、<code>/proc/PID/cgroup</code>、容器运行时、Kubernetes 事件和业务日志交叉确认。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">systemd-cgtop 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：进程到 cgroup 再到资源列</a></li>
+<li><a class="anchor" href="#s3">安装、权限与运行环境</a></li>
+<li><a class="anchor" href="#s4">输出列：Path、Tasks、CPU、Memory、Input、Output</a></li>
+<li><a class="anchor" href="#s5">交互按键与排序</a></li>
+<li><a class="anchor" href="#s6">常用命令模板</a></li>
+<li><a class="anchor" href="#s7">slice、scope、service 怎么读</a></li>
+<li><a class="anchor" href="#s8">AI 训练节点的 noisy job 定位流程</a></li>
+<li><a class="anchor" href="#s9">容器与 Kubernetes cgroup 映射</a></li>
+<li><a class="anchor" href="#s10">cgroup v2 与记账 caveats</a></li>
+<li><a class="anchor" href="#s11">CPU 列的正确解读</a></li>
+<li><a class="anchor" href="#s12">内存列与 OOMKilled 排查</a></li>
+<li><a class="anchor" href="#s13">I/O 列与数据加载瓶颈</a></li>
+<li><a class="anchor" href="#s14">systemd-cgtop vs top/systemd-cgls/cadvisor</a></li>
+<li><a class="anchor" href="#s15">批处理采样与留证</a></li>
+<li><a class="anchor" href="#s16">故障排查决策树</a></li>
+<li><a class="anchor" href="#s17">生产安全与操作边界</a></li>
+<li><a class="anchor" href="#s18">练习任务与检查清单</a></li>
+<li><a class="anchor" href="#s19">常见误区与 FAQ</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. systemd-cgtop 是什么</h2>
+<p><code>systemd-cgtop</code> 是 systemd 提供的 cgroup 资源观察工具。它把本机 cgroup 层级中的控制组按 CPU、内存或 I/O 使用量排序，并像 <code>top</code> 一样周期刷新。对 AI Infra 来说，它的价值是把“一个训练作业、一个 Pod、一个 systemd 服务、一批用户进程”的资源使用先聚合起来，而不是在上千个 Python、DataLoader、NCCL helper、runtime shim 和 kernel thread 里逐个猜。</p>
+<div class="grid-3">
+<div class="card"><strong>它能回答</strong><br>哪个 cgroup 正在吃 CPU？哪个服务或容器内存最高？I/O 峰值是否集中在某个训练作业？</div>
+<div class="card"><strong>它不能回答</strong><br>不能直接给出 GPU 显存、网络 RDMA 计数器、Python 对象泄漏栈、每个 Pod 的语义标签。</div>
+<div class="card"><strong>AI Infra 用法</strong><br>先用它按 cgroup 找“责任边界”，再用 <code>systemd-cgls</code>、<code>pidstat</code>、<code>iotop</code>、<code>kubectl</code> 或业务日志下钻。</div>
+</div>
+<pre><code># 交互式查看本机 cgroup 资源排行
+systemd-cgtop
+
+# 只看前 2 层，适合先看 slice 级别
+systemd-cgtop --depth=2
+
+# 按内存排序
+systemd-cgtop --order=memory
+
+# 按 I/O 排序，1 秒刷新
+systemd-cgtop --order=io --delay=1s</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>systemd-cgtop</code> 的内存和 I/O 列依赖 cgroup 控制器与 systemd accounting。空白或 0 不一定代表没有消耗，可能是记账没开启或当前层级不可见。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. 整体模型：进程到 cgroup 再到资源列</h2>
+<svg viewBox="0 0 1100 670" width="100%" role="img" aria-label="systemd-cgtop 整体模型">
+<rect x="18" y="18" width="1064" height="632" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="65" text-anchor="middle" font-size="27" font-weight="700">systemd-cgtop 的心智模型</text>
+<rect x="65" y="118" width="220" height="122" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="175" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">进程/线程</text>
+<text x="175" y="190" text-anchor="middle" font-size="15">python / dataloader</text>
+<text x="175" y="216" text-anchor="middle" font-size="15">containerd-shim / worker</text>
+<rect x="355" y="118" width="220" height="122" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="465" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">cgroup 边界</text>
+<text x="465" y="190" text-anchor="middle" font-size="15">service / scope</text>
+<text x="465" y="216" text-anchor="middle" font-size="15">pod / container / job</text>
+<rect x="645" y="118" width="220" height="122" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="755" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">内核记账</text>
+<text x="755" y="190" text-anchor="middle" font-size="15">cpu / memory / io</text>
+<text x="755" y="216" text-anchor="middle" font-size="15">cgroupfs 统计文件</text>
+<rect x="805" y="340" width="230" height="138" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="920" y="382" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">cgtop 表格</text>
+<text x="920" y="416" text-anchor="middle" font-size="15">Path / Tasks / CPU</text>
+<text x="920" y="443" text-anchor="middle" font-size="15">Memory / Input / Output</text>
+<rect x="80" y="356" width="640" height="118" rx="20" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="400" y="394" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">AI Infra 读法</text>
+<text x="400" y="428" text-anchor="middle" font-size="16">先按 cgroup 找责任边界，再映射到服务、Pod、作业、用户和业务 owner</text>
+<text x="400" y="456" text-anchor="middle" font-size="16">它不是替代进程级 profiler，而是减少定位空间的第一层聚合视角</text>
+<line x1="285" y1="179" x2="355" y2="179" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="575" y1="179" x2="645" y2="179" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M755 240 C775 300, 845 318, 900 340" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">核心不是“看一个 PID”，而是看系统把一批进程放在哪个资源控制边界里，并把这个边界上的资源账本显示出来。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、权限与运行环境</h2>
+<p><code>systemd-cgtop</code> 随 systemd 工具集提供，常见 systemd 发行版默认安装。它需要本机使用 systemd 管理 cgroup；在 macOS、非 systemd 容器、极简镜像或旧式 init 环境中通常不可用。</p>
+<table>
+<tr><th>检查项</th><th>命令</th><th>说明</th></tr>
+<tr><td>命令是否存在</td><td><code>command -v systemd-cgtop</code></td><td>不存在时安装 systemd 相关包，或改用节点侧工具。</td></tr>
+<tr><td>systemd 是否为 PID 1</td><td><code>ps -p 1 -o comm=</code></td><td>容器内 PID 1 可能不是 systemd，此时 cgroup 视图可能受限。</td></tr>
+<tr><td>cgroup 版本</td><td><code>stat -fc %T /sys/fs/cgroup</code></td><td><code>cgroup2fs</code> 表示统一层级 cgroup v2。</td></tr>
+<tr><td>版本</td><td><code>systemd-cgtop --version</code></td><td>不同 systemd 版本的列、选项和默认行为可能略有差异。</td></tr>
+</table>
+<pre><code># Debian/Ubuntu 常见检查
+command -v systemd-cgtop || dpkg -S systemd-cgtop
+
+# RHEL/CentOS/Rocky 常见检查
+rpm -qf "$(command -v systemd-cgtop)"
+
+# 确认当前环境是不是容器内受限视角
+cat /proc/1/cgroup
+cat /proc/self/cgroup</code></pre>
+<div class="note"><strong>权限模型：</strong> 普通用户通常可以运行它看到部分或全部 cgroup 统计；但某些发行版、容器、rootless 环境或安全策略会限制对其他用户/服务 cgroup 的可见性。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 输出列：Path、Tasks、CPU、Memory、Input、Output</h2>
+<p>表格列是 <code>systemd-cgtop</code> 的核心。排障时不要只看最大数字，要把列和 cgroup 层级、记账开关、采样窗口一起解读。</p>
+<table>
+<tr><th>列</th><th>含义</th><th>AI Infra 解读</th><th>常见陷阱</th></tr>
+<tr><td><code>Path</code></td><td>cgroup 路径</td><td>可映射到 service、scope、user slice、pod、container、Slurm 作业。</td><td>路径不是业务名；需要再映射 owner。</td></tr>
+<tr><td><code>Tasks</code></td><td>任务/线程或进程计数</td><td>DataLoader worker、线程池、runtime shim、kernel thread 会推高计数。</td><td>默认按 task 计数，和 <code>ps</code> 进程数不一定一致。</td></tr>
+<tr><td><code>%CPU</code></td><td>该 cgroup CPU 使用率</td><td>多核机器上可超过 100%，例如 64 核可接近 6400%。</td><td>不能按单核百分比理解。</td></tr>
+<tr><td><code>Memory</code></td><td>cgroup 内存用量</td><td>适合判断 Pod/服务/作业是否接近 limit 或异常增长。</td><td>需要 memory controller 和 accounting 支持。</td></tr>
+<tr><td><code>Input/s</code></td><td>读 I/O 速率</td><td>数据加载、checkpoint 读取、缓存未命中会体现。</td><td>需要 IOAccounting；page cache 命中不一定体现为磁盘读。</td></tr>
+<tr><td><code>Output/s</code></td><td>写 I/O 速率</td><td>checkpoint、日志风暴、临时文件写入会体现。</td><td>overlayfs、网络盘和缓存会影响归因。</td></tr>
+</table>
+<pre><code># 示例输出形态，不同版本列名可能略有差异
+Control Group                         Tasks   %CPU   Memory  Input/s Output/s
+/                                      1842  750.0    92.1G   90.2M   410.0M
+/system.slice/containerd.service        91   12.0     1.4G    2.0M     4.1M
+/kubepods.slice/podabc...              320  610.0    44.8G   74.0M   380.0M
+/user.slice/user-1000.slice             52   18.0     2.2G      0B   120.0K</code></pre>
+<div class="warn"><strong>读表原则：</strong> <code>Path</code> 是归因入口，数值列是症状强度。不要在未确认路径归属前直接杀进程或重启服务。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 交互按键与排序</h2>
+<p>交互模式适合现场排障。你可以先按 CPU 排序找算力争抢，再按内存或 I/O 切换视角，最后按路径排序观察层级位置。</p>
+<table>
+<tr><th>按键/选项</th><th>作用</th><th>典型用途</th></tr>
+<tr><td><span class="kbd">c</span> / <code>--order=cpu</code></td><td>按 CPU 使用排序</td><td>找 DataLoader 过量、CPU inference、压缩/解压、日志处理风暴。</td></tr>
+<tr><td><span class="kbd">m</span> / <code>--order=memory</code></td><td>按内存排序</td><td>找接近 cgroup limit 的训练、推理服务或用户会话。</td></tr>
+<tr><td><span class="kbd">i</span> / <code>--order=io</code></td><td>按 I/O 排序</td><td>找 checkpoint 写入、数据集扫描、日志风暴、缓存 miss。</td></tr>
+<tr><td><span class="kbd">t</span> / <code>--order=tasks</code></td><td>按任务数排序</td><td>发现 worker 爆炸、线程池失控、fork storm。</td></tr>
+<tr><td><span class="kbd">p</span> / <code>--order=path</code></td><td>按路径排序</td><td>按层级看 slice/scope/service 结构。</td></tr>
+<tr><td><span class="kbd">%</span> / <code>--cpu=time</code></td><td>CPU 百分比和累计时间切换</td><td>区分瞬时热点和长期累计消耗。</td></tr>
+<tr><td><span class="kbd">Space</span></td><td>立即刷新</td><td>观察操作前后变化。</td></tr>
+<tr><td><span class="kbd">q</span></td><td>退出</td><td>结束现场观察。</td></tr>
+</table>
+<pre><code># 从命令行直接指定排序和刷新间隔
+systemd-cgtop --order=cpu --delay=500ms
+systemd-cgtop --order=memory --delay=2s
+systemd-cgtop --order=io --depth=5</code></pre>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 常用命令模板</h2>
+<p>先用浅层视图判断是系统服务、用户会话、容器还是某个 pod slice；再加深层级或指定路径下钻。</p>
+<div class="grid-2">
+<div class="card"><strong>先看大类</strong><br><code>--depth=2</code> 能快速看 <code>/system.slice</code>、<code>/user.slice</code>、<code>/kubepods.slice</code> 哪一类最重。</div>
+<div class="card"><strong>再看细节</strong><br>对可疑路径加参数，只显示该 cgroup 子树，减少噪声。</div>
+</div>
+<pre><code># 大盘：前 2 层，快速看系统/用户/kube 作业哪类最重
+systemd-cgtop --depth=2
+
+# 只看 system.slice 下的服务
+systemd-cgtop /system.slice
+
+# 只看用户会话
+systemd-cgtop /user.slice
+
+# 只跑一次，适合留证或脚本
+systemd-cgtop --batch --iterations=1 --depth=4
+
+# 每 5 秒采样一次，共 12 次，约 1 分钟
+systemd-cgtop --batch --iterations=12 --delay=5s --depth=5</code></pre>
+<div class="note"><strong>脚本提醒：</strong> 非 TTY 输出时默认通常只运行一轮；需要持续采样时显式加 <code>--batch</code>、<code>--iterations=</code> 和 <code>--delay=</code>。</div>
+</section>
+
+<section class="figure" id="s7">
+<h2>7. slice、scope、service 怎么读</h2>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="systemd slice scope service cgroup 层级">
+<rect x="18" y="18" width="1064" height="642" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">systemd cgroup 树：资源边界的名字</text>
+<rect x="455" y="105" width="190" height="62" rx="15" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="144" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">/</text>
+<rect x="80" y="245" width="230" height="96" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="195" y="282" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">system.slice</text>
+<text x="195" y="313" text-anchor="middle" font-size="14">系统服务</text>
+<rect x="435" y="245" width="230" height="96" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="282" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">user.slice</text>
+<text x="550" y="313" text-anchor="middle" font-size="14">登录用户与 user manager</text>
+<rect x="790" y="245" width="230" height="96" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="905" y="282" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">kubepods.slice</text>
+<text x="905" y="313" text-anchor="middle" font-size="14">Kubernetes Pod/容器</text>
+<rect x="75" y="445" width="240" height="90" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="195" y="482" text-anchor="middle" font-size="18" font-weight="700">containerd.service</text>
+<text x="195" y="511" text-anchor="middle" font-size="14">长期服务 unit</text>
+<rect x="430" y="445" width="240" height="90" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="550" y="482" text-anchor="middle" font-size="18" font-weight="700">session-12.scope</text>
+<text x="550" y="511" text-anchor="middle" font-size="14">登录会话/临时进程组</text>
+<rect x="785" y="445" width="240" height="90" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="905" y="482" text-anchor="middle" font-size="18" font-weight="700">pod*.slice / cri-containerd*.scope</text>
+<text x="905" y="511" text-anchor="middle" font-size="14">Pod 与容器 scope</text>
+<line x1="550" y1="167" x2="195" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="550" y1="167" x2="550" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="550" y1="167" x2="905" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="195" y1="341" x2="195" y2="445" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="550" y1="341" x2="550" y2="445" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="905" y1="341" x2="905" y2="445" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption"><code>slice</code> 是层级分组，<code>service</code> 是 systemd 管理的长期服务，<code>scope</code> 常表示由外部进程创建并交给 systemd 记账的进程组，例如登录会话、容器、临时作业。</div>
+<table>
+<tr><th>名称</th><th>含义</th><th>AI Infra 例子</th></tr>
+<tr><td><code>*.slice</code></td><td>资源层级分组，不一定直接包含主进程。</td><td><code>system.slice</code>、<code>user.slice</code>、<code>kubepods.slice</code>。</td></tr>
+<tr><td><code>*.service</code></td><td>systemd 管理的服务 unit。</td><td><code>containerd.service</code>、<code>kubelet.service</code>、<code>nvidia-fabricmanager.service</code>。</td></tr>
+<tr><td><code>*.scope</code></td><td>外部创建的进程组，由 systemd 追踪。</td><td>SSH 会话、容器 scope、<code>systemd-run --scope</code> 启动的训练。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s8">
+<h2>8. AI 训练节点的 noisy job 定位流程</h2>
+<p>训练节点上的噪声通常来自 CPU 数据加载、checkpoint I/O、日志爆炸、容器内存接近上限、解压/预处理、推理 sidecar 或相邻用户会话。<code>systemd-cgtop</code> 适合先把噪声定位到 cgroup，再用更细工具确认具体进程和业务。</p>
+<pre><code># 1. 先看节点级 cgroup 大类
+systemd-cgtop --depth=2 --delay=1s
+
+# 2. CPU 维度找 CPU noisy neighbor
+systemd-cgtop --order=cpu --depth=5
+
+# 3. 内存维度找大 cgroup
+systemd-cgtop --order=memory --depth=5
+
+# 4. I/O 维度找 checkpoint 或数据扫描
+systemd-cgtop --order=io --depth=6</code></pre>
+<table>
+<tr><th>观察</th><th>常见原因</th><th>下一步</th></tr>
+<tr><td>某 pod cgroup CPU 很高，GPU 利用率低</td><td>DataLoader worker 太多、CPU 预处理瓶颈、解压/增强耗 CPU。</td><td><code>pidstat -t -p PID 1</code>、框架 dataloader 配置、CPU affinity。</td></tr>
+<tr><td>Output/s 周期性冲高</td><td>checkpoint 保存、tensorboard/logging、临时文件写入。</td><td><code>iotop</code>、<code>lsof</code>、训练日志时间点、存储监控。</td></tr>
+<tr><td>Memory 持续增长</td><td>batch 缓存、worker 泄漏、数据集预加载、推理 KV cache。</td><td>cgroup <code>memory.current</code>/<code>events</code>、<code>smaps_rollup</code>、OOM 事件。</td></tr>
+<tr><td>Tasks 异常多</td><td>fork storm、线程池爆炸、DataLoader 多进程未回收。</td><td><code>systemd-cgls</code> 展开、<code>pstree</code>、业务启动参数。</td></tr>
+</table>
+<div class="success"><strong>定位模板：</strong> “在 60 秒窗口内，<code>/kubepods.slice/.../podX</code> 持续占用约 2800% CPU，Tasks 约 420，GPU util 同期只有 35%；初步判断是 Pod X 的 CPU 数据管线瓶颈，而不是 GPU 计算饱和。”</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 容器与 Kubernetes cgroup 映射</h2>
+<p>Kubernetes 节点上，<code>systemd-cgtop</code> 看到的是宿主机 cgroup 路径，不一定直接显示 namespace/name。你需要把路径中的 pod UID、container ID、scope 名称映射回 Kubernetes 对象。</p>
+<pre><code># 从可疑 PID 反查 cgroup
+cat /proc/12345/cgroup
+
+# 展开 cgroup 树，找到里面的 PID
+systemd-cgls /kubepods.slice
+
+# containerd/CRI 场景：列出容器与 Pod
+crictl ps
+crictl inspect &lt;container-id&gt; | grep -E 'podSandboxId|pid|name|namespace'
+
+# Kubernetes 侧映射 Pod UID
+kubectl get pod -A -o wide
+kubectl get pod -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.metadata.uid}{"\n"}{end}'</code></pre>
+<table>
+<tr><th>路径片段</th><th>可能含义</th><th>映射方法</th></tr>
+<tr><td><code>kubepods.slice</code></td><td>Kubelet 管理的 Pod cgroup 根</td><td>看子路径中的 QoS class、pod UID。</td></tr>
+<tr><td><code>kubepods-burstable.slice</code></td><td>Burstable QoS Pod</td><td>对照 requests/limits，检查是否资源争抢。</td></tr>
+<tr><td><code>pod&lt;uid&gt;.slice</code></td><td>某个 Pod 的 cgroup</td><td>把 <code>_</code> 或转义还原为 UID 后查 Kubernetes。</td></tr>
+<tr><td><code>cri-containerd-&lt;id&gt;.scope</code></td><td>某个 containerd 容器 scope</td><td>用 <code>crictl inspect</code> 或运行时元数据映射。</td></tr>
+<tr><td><code>libpod-&lt;id&gt;.scope</code></td><td>Podman 容器 scope</td><td>用 <code>podman inspect</code> 映射。</td></tr>
+</table>
+<div class="warn"><strong>容器视角提醒：</strong> 在 Pod 内运行 <code>systemd-cgtop</code> 往往没有完整宿主机视图。AI 平台排障通常应在节点调试容器、宿主机、运维 bastion 或受控诊断 DaemonSet 中执行。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. cgroup v2 与记账 caveats</h2>
+<p><code>systemd-cgtop</code> 的可靠性依赖内核 cgroup 控制器和 systemd accounting 设置。CPU 在统一 cgroup v2 上通常更容易看到；内存和 I/O 需要对应控制器、unit 配置和系统默认策略支持。</p>
+<table>
+<tr><th>项目</th><th>检查命令</th><th>解释</th></tr>
+<tr><td>cgroup 文件系统类型</td><td><code>stat -fc %T /sys/fs/cgroup</code></td><td><code>cgroup2fs</code> 是 cgroup v2；旧系统可能是 hybrid/v1。</td></tr>
+<tr><td>可用控制器</td><td><code>cat /sys/fs/cgroup/cgroup.controllers</code></td><td>应关注 <code>cpu</code>、<code>memory</code>、<code>io</code>、<code>pids</code>。</td></tr>
+<tr><td>子树启用情况</td><td><code>cat /sys/fs/cgroup/cgroup.subtree_control</code></td><td>控制器未启用时，下层 cgroup 可能无法记账或控制。</td></tr>
+<tr><td>systemd 默认记账</td><td><code>systemctl show -p DefaultMemoryAccounting -p DefaultIOAccounting</code></td><td>不同发行版默认值可能不同。</td></tr>
+<tr><td>单个 unit 记账</td><td><code>systemctl show foo.service -p MemoryAccounting -p IOAccounting</code></td><td>内存/I/O 为空时先查这里。</td></tr>
+</table>
+<pre><code># 临时为服务开启资源记账，先确认影响范围
+systemctl show my-trainer.service -p MemoryAccounting -p IOAccounting
+sudo systemctl set-property my-trainer.service MemoryAccounting=yes IOAccounting=yes
+
+# 持久配置示例：/etc/systemd/system/my-trainer.service.d/accounting.conf
+[Service]
+MemoryAccounting=yes
+IOAccounting=yes</code></pre>
+<div class="danger"><strong>配置变更警告：</strong> <code>systemctl set-property</code> 会修改 unit 运行时属性并可能落盘成 drop-in。生产集群要先确认平台策略，不要在共享节点上绕过配置管理。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. CPU 列的正确解读</h2>
+<p><code>%CPU</code> 是 cgroup 在采样窗口内消耗 CPU 的百分比，范围可到 <code>100 × CPU 数</code>。例如 8 核机器上 800% 代表近似用满 8 个 CPU；128 核 AI 节点上 3200% 可能只是 25% 整机 CPU。</p>
+<pre><code># 看机器 CPU 数
+nproc
+lscpu | sed -n '1,20p'
+
+# 对照 cgroup CPU quota/cpuset
+cat /sys/fs/cgroup/cpu.max 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpuset.cpus.effective 2&gt;/dev/null || true
+
+# 进程/线程级下钻
+pidstat -u -t -p 12345 1
+ps -L -p 12345 -o pid,tid,psr,pcpu,comm</code></pre>
+<table>
+<tr><th>现象</th><th>解读</th><th>下钻</th></tr>
+<tr><td>Pod CPU 高、GPU 低</td><td>CPU 数据管线可能成为瓶颈。</td><td>看 worker 数、预处理、解码、CPU affinity、NUMA。</td></tr>
+<tr><td>Tasks 多但 CPU 不高</td><td>大量线程阻塞、sleep 或 I/O 等待。</td><td><code>pidstat -w</code>、<code>strace -p</code>、锁等待、I/O。</td></tr>
+<tr><td>CPU 高但吞吐没涨</td><td>可能是 busy loop、日志格式化、压缩、重试风暴。</td><td><code>perf top</code>、<code>py-spy</code>、业务日志。</td></tr>
+</table>
+<div class="note"><strong>配额提醒：</strong> 容器限 8 核时，cgroup 内 800% 可能已经满载；宿主机有 128 核不代表该 Pod 可用 128 核。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 内存列与 OOMKilled 排查</h2>
+<p>内存列适合快速找大 cgroup，但它不是完整内存诊断。AI 任务里，page cache、tmpfs、共享内存、pinned host memory、DataLoader worker 复制、推理 KV cache 都可能影响 cgroup 内存。</p>
+<pre><code># 对可疑 cgroup 读取 cgroup v2 内存文件
+CG=/sys/fs/cgroup/kubepods.slice/...
+cat "$CG/memory.current" 2&gt;/dev/null
+cat "$CG/memory.max" 2&gt;/dev/null
+cat "$CG/memory.high" 2&gt;/dev/null
+cat "$CG/memory.events" 2&gt;/dev/null
+grep -E 'anon|file|kernel|slab|shmem|pgfault|pgmajfault' "$CG/memory.stat" 2&gt;/dev/null
+
+# 进程级内存下钻
+cat /proc/12345/status | egrep 'VmRSS|VmHWM|VmSwap|Threads'
+cat /proc/12345/smaps_rollup 2&gt;/dev/null</code></pre>
+<table>
+<tr><th>信号</th><th>可能原因</th><th>建议</th></tr>
+<tr><td><code>memory.current</code> 接近 <code>memory.max</code></td><td>Pod limit 将触发 OOMKilled。</td><td>降 batch、worker、prefetch，或调整 limit。</td></tr>
+<tr><td><code>memory.events</code> 中 <code>oom</code>/<code>oom_kill</code> 增加</td><td>cgroup 内发生 OOM。</td><td>结合 kube events、dmesg、应用日志确认。</td></tr>
+<tr><td><code>file</code> 很高</td><td>page cache、mmap 数据集、checkpoint 文件缓存。</td><td>看是否可回收，不要简单等同泄漏。</td></tr>
+<tr><td><code>anon</code> 持续增长</td><td>进程堆、Python 对象、KV cache、worker 复制。</td><td>用 profiler 或进程级 smaps 下钻。</td></tr>
+</table>
+<div class="warn"><strong>GPU 显存边界：</strong> <code>systemd-cgtop</code> 不显示 GPU 显存。GPU OOM 要看 <code>nvidia-smi</code>、DCGM、框架分配器和训练日志；cgroup 内存只解释 CPU/主机内存侧压力。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. I/O 列与数据加载瓶颈</h2>
+<p>I/O 列能帮助判断一个 cgroup 是否在读数据、写 checkpoint 或刷日志，但它不是完整存储诊断。page cache、网络文件系统、overlayfs、块设备队列和对象存储客户端都会影响你看到的读写速率。</p>
+<pre><code># 按 I/O 排序观察 cgroup
+systemd-cgtop --order=io --delay=1s --depth=6
+
+# 对照设备级压力
+iostat -xz 1
+
+# 进程级 I/O
+pidstat -d -p 12345 1
+iotop -oPa
+
+# 从 PID 找具体打开文件
+lsof -p 12345 | head -50</code></pre>
+<table>
+<tr><th>现象</th><th>解释</th><th>下钻工具</th></tr>
+<tr><td>Input/s 高，GPU idle</td><td>数据集扫描或缓存 miss，训练在等 I/O。</td><td><code>iostat</code>、<code>pidstat -d</code>、数据管线日志。</td></tr>
+<tr><td>Output/s 周期性高</td><td>checkpoint、日志、指标写入。</td><td><code>lsof</code>、训练保存间隔、存储监控。</td></tr>
+<tr><td>cgtop I/O 不高但应用慢</td><td>可能是 page cache、网络、元数据锁、对象存储延迟。</td><td><code>strace</code>、NFS/并行文件系统指标、应用 tracing。</td></tr>
+<tr><td>多个 Pod 同时 I/O 高</td><td>共享存储或本地 NVMe 被邻居任务争抢。</td><td>按 Pod cgroup 分摊，结合设备队列和平台调度。</td></tr>
+</table>
+<div class="success"><strong>AI 数据管线建议：</strong> 如果 I/O 噪声频繁出现，把 <code>systemd-cgtop --batch</code>、<code>iostat</code>、<code>pidstat -d</code> 和 Pod 映射做成统一采样包，事故后才能还原时间线。</div>
+</section>
+
+<section class="figure" id="s14">
+<h2>14. systemd-cgtop vs top/systemd-cgls/cadvisor</h2>
+<svg viewBox="0 0 1100 670" width="100%" role="img" aria-label="systemd-cgtop top systemd-cgls cadvisor 对比">
+<rect x="18" y="18" width="1064" height="632" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="27" font-weight="700">选择工具：先问你要看的对象是什么</text>
+<rect x="70" y="135" width="220" height="168" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="180" y="178" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">top / htop</text>
+<text x="180" y="218" text-anchor="middle" font-size="15">对象：进程/线程</text>
+<text x="180" y="247" text-anchor="middle" font-size="15">强项：单 PID 热点</text>
+<text x="180" y="276" text-anchor="middle" font-size="14">弱项：容器归因弱</text>
+<rect x="320" y="135" width="220" height="168" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="178" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">systemd-cgls</text>
+<text x="430" y="218" text-anchor="middle" font-size="15">对象：cgroup 树</text>
+<text x="430" y="247" text-anchor="middle" font-size="15">强项：展开层级和 PID</text>
+<text x="430" y="276" text-anchor="middle" font-size="14">弱项：无资源速率</text>
+<rect x="570" y="135" width="220" height="168" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="680" y="178" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">systemd-cgtop</text>
+<text x="680" y="218" text-anchor="middle" font-size="15">对象：cgroup 资源</text>
+<text x="680" y="247" text-anchor="middle" font-size="15">强项：现场聚合排行</text>
+<text x="680" y="276" text-anchor="middle" font-size="14">弱项：标签与历史弱</text>
+<rect x="820" y="135" width="220" height="168" rx="20" fill="#ffedd5" stroke="#fdba74"/>
+<text x="930" y="178" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">cadvisor/metrics</text>
+<text x="930" y="218" text-anchor="middle" font-size="15">对象：容器时间序列</text>
+<text x="930" y="247" text-anchor="middle" font-size="15">强项：历史和标签</text>
+<text x="930" y="276" text-anchor="middle" font-size="14">弱项：现场下钻慢</text>
+<rect x="170" y="405" width="760" height="105" rx="20" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="444" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">推荐组合</text>
+<text x="550" y="478" text-anchor="middle" font-size="16">cgtop 找 cgroup 热点 → cgls 找 PID → top/pidstat/perf/iotop 下钻 → cadvisor/Prometheus 看历史趋势</text>
+<text x="550" y="506" text-anchor="middle" font-size="15">Kubernetes 语义标签通常来自 kubelet/CRI/Prometheus，而不是 cgtop 本身</text>
+</svg>
+<div class="caption">四类工具不是互相替代：<code>systemd-cgtop</code> 最适合“现场谁最重”的 cgroup 聚合视角。</div>
+<table>
+<tr><th>工具</th><th>最佳问题</th><th>不适合的问题</th></tr>
+<tr><td><code>systemd-cgtop</code></td><td>哪个 cgroup 当前最耗 CPU/内存/I/O？</td><td>长期趋势、业务标签、函数级热点。</td></tr>
+<tr><td><code>systemd-cgls</code></td><td>某个 cgroup 下有哪些进程？层级怎样？</td><td>资源速率排行。</td></tr>
+<tr><td><code>top</code>/<code>htop</code></td><td>哪个 PID 或线程当前最耗 CPU/内存？</td><td>把多个进程聚合成 Pod/服务/作业。</td></tr>
+<tr><td><code>cadvisor</code>/Prometheus</td><td>容器历史曲线、标签化告警、容量报告。</td><td>临时 SSH 到节点后的快速层级下钻。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 批处理采样与留证</h2>
+<p>事故排查需要证据。<code>--batch</code>、<code>--iterations</code>、<code>--delay</code>、<code>--raw</code> 适合把 cgroup 资源快照保存成文本，便于和日志、训练 step、Kubernetes event 对齐。</p>
+<pre><code># 创建一次性采样目录
+out=/tmp/cgtop-debug-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$out"
+
+# 记录版本与环境
+systemd-cgtop --version &gt; "$out/version.txt" 2&gt;&amp;1
+uname -a &gt; "$out/uname.txt"
+stat -fc %T /sys/fs/cgroup &gt; "$out/cgroup-fstype.txt" 2&gt;&amp;1
+
+# 1 分钟 cgroup 资源采样
+systemd-cgtop --batch --iterations=12 --delay=5s --depth=6 &gt; "$out/cgtop.txt"
+
+# 同步保存 cgroup 树和进程快照
+systemd-cgls --no-pager &gt; "$out/cgls.txt" 2&gt;&amp;1
+ps -eo pid,ppid,user,stat,pcpu,pmem,comm,args --sort=-pcpu | head -80 &gt; "$out/ps-cpu.txt"
+ps -eo pid,ppid,user,stat,pcpu,pmem,comm,args --sort=-pmem | head -80 &gt; "$out/ps-mem.txt"</code></pre>
+<div class="warn"><strong>隐私提醒：</strong> <code>ps args</code>、容器名称、路径、环境变量和日志可能包含用户名、项目名、token 或数据集路径。共享采样包前要脱敏。</div>
+<table>
+<tr><th>参数</th><th>作用</th><th>建议</th></tr>
+<tr><td><code>--batch</code></td><td>非交互输出，适合重定向。</td><td>脚本中显式使用。</td></tr>
+<tr><td><code>--iterations=N</code></td><td>运行 N 轮。</td><td>现场短采样用 12×5s 或 60×1s。</td></tr>
+<tr><td><code>--delay=</code></td><td>刷新间隔。</td><td>CPU 抖动看 1s；长期趋势看 5s/10s。</td></tr>
+<tr><td><code>--raw</code></td><td>输出原始数值。</td><td>便于后续脚本解析。</td></tr>
+<tr><td><code>--depth=</code></td><td>限制展开深度。</td><td>先浅后深，避免输出过大。</td></tr>
+</table>
+</section>
+
+<section class="figure" id="s16">
+<h2>16. 故障排查决策树</h2>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="systemd-cgtop 故障排查决策树">
+<rect x="18" y="18" width="1064" height="682" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="27" font-weight="700">从 cgtop 读数到可执行结论</text>
+<rect x="420" y="105" width="260" height="64" rx="15" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="145" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">看到异常 cgroup</text>
+<polygon points="550,215 725,300 550,385 375,300" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="292" text-anchor="middle" font-size="17" font-weight="700">哪一列异常？</text>
+<text x="550" y="318" text-anchor="middle" font-size="14">CPU / Memory / IO / Tasks</text>
+<rect x="70" y="470" width="210" height="94" rx="15" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="175" y="506" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">CPU 高</text>
+<text x="175" y="533" text-anchor="middle" font-size="14">pidstat / perf / py-spy</text>
+<rect x="320" y="470" width="210" height="94" rx="15" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="425" y="506" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">Memory 高</text>
+<text x="425" y="533" text-anchor="middle" font-size="14">memory.current/events</text>
+<rect x="570" y="470" width="210" height="94" rx="15" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="675" y="506" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">I/O 高</text>
+<text x="675" y="533" text-anchor="middle" font-size="14">iostat / iotop / lsof</text>
+<rect x="820" y="470" width="210" height="94" rx="15" fill="#fee2e2" stroke="#fecaca"/>
+<text x="925" y="506" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">Tasks 高</text>
+<text x="925" y="533" text-anchor="middle" font-size="14">cgls / pstree / ps -L</text>
+<rect x="240" y="620" width="620" height="54" rx="14" fill="#dcfce7" stroke="#86efac"/>
+<text x="550" y="654" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">映射 owner → 验证业务影响 → 选择降载/隔离/扩容/修配置</text>
+<line x1="550" y1="169" x2="550" y2="215" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="445" y1="360" x2="175" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="515" y1="385" x2="425" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="585" y1="385" x2="675" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="655" y1="360" x2="925" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="175" y1="564" x2="405" y2="620" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="425" y1="564" x2="500" y2="620" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="675" y1="564" x2="600" y2="620" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="925" y1="564" x2="695" y2="620" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">不要停在“某个 cgroup 很高”。合格结论必须包含列、路径、时间窗口、owner、影响面和下一步验证。</div>
+<div class="grid-2">
+<div class="card"><strong>输出为空或列全是横线</strong><br>检查是否在 systemd 主机上运行、cgroup 控制器是否启用、unit 是否开启 Memory/IOAccounting。</div>
+<div class="card"><strong>路径看不懂</strong><br>用 <code>systemd-cgls</code> 展开，再从 PID 查 <code>/proc/PID/cgroup</code>，最后映射到容器或 Kubernetes 对象。</div>
+<div class="card"><strong>CPU 百分比离谱</strong><br>先看 CPU 数和 quota。多核机器超过 100% 是正常现象。</div>
+<div class="card"><strong>容器内结果不可信</strong><br>切到宿主机或节点调试视角，容器内权限和 namespace 可能隐藏其他 cgroup。</div>
+</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 生产安全与操作边界</h2>
+<p><code>systemd-cgtop</code> 本身是只读低风险工具，但它常引出高风险动作：杀进程、重启服务、调整 cgroup 限额、迁移训练作业、删除 checkpoint、改 Kubernetes limit。排障流程必须把“观察”和“处置”分开。</p>
+<table>
+<tr><th>动作</th><th>风险</th><th>安全做法</th></tr>
+<tr><td>杀掉最大 CPU PID</td><td>可能杀错容器 runtime、共享服务或系统组件。</td><td>先确认 cgroup owner、业务影响和回滚方案。</td></tr>
+<tr><td>重启 <code>containerd</code>/<code>kubelet</code></td><td>影响整节点 Pod 生命周期。</td><td>先 cordon/drain 或按平台应急手册执行。</td></tr>
+<tr><td>调整 <code>MemoryMax</code>/<code>CPUQuota</code></td><td>可能改变调度公平性或触发 OOM。</td><td>通过配置管理和变更流程落地，不在现场随手改。</td></tr>
+<tr><td>降低训练 worker/batch</td><td>影响吞吐和实验可复现性。</td><td>记录配置、对比指标、通知 owner。</td></tr>
+<tr><td>清理缓存或临时文件</td><td>可能破坏数据集缓存或 checkpoint。</td><td>确认路径归属和保留策略，避免自动递归删除。</td></tr>
+</table>
+<pre><code># 只读确认链路示例：观察 → 展开 → 映射 → 再决定
+systemd-cgtop --batch --iterations=1 --depth=6
+systemd-cgls /kubepods.slice --no-pager
+cat /proc/12345/cgroup
+crictl inspect &lt;container-id&gt;
+kubectl describe pod -n &lt;ns&gt; &lt;pod&gt;</code></pre>
+<div class="danger"><strong>红线：</strong> 不要只凭 <code>systemd-cgtop</code> 一屏输出直接 <code>kill -9</code>、重启 runtime 或修改限额。它负责发现嫌疑 cgroup，不负责完成业务归因和变更审批。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 练习任务与检查清单</h2>
+<ol>
+<li>在一台 systemd Linux 机器上运行 <code>systemd-cgtop --depth=2</code>，解释 <code>system.slice</code>、<code>user.slice</code>、容器相关 slice 的资源占比。</li>
+<li>用 <code>systemd-cgtop --order=cpu</code> 找一个 CPU 高的 cgroup，再用 <code>systemd-cgls</code> 找到其中的 PID。</li>
+<li>从一个 PID 的 <code>/proc/PID/cgroup</code> 反查它属于哪个 service、scope、Pod 或容器。</li>
+<li>比较 <code>systemd-cgtop</code> 与 <code>top</code> 的视角差异：哪个按 cgroup 聚合，哪个按进程排序。</li>
+<li>在测试服务上开启 <code>MemoryAccounting=yes</code> 与 <code>IOAccounting=yes</code>，观察内存/I/O 列变化。</li>
+<li>模拟 checkpoint 写入，观察 <code>Output/s</code> 是否出现周期性峰值，并用 <code>iostat</code> 对照设备压力。</li>
+</ol>
+<div class="grid-3">
+<div class="card"><strong>现场结论必须有路径</strong><br>例如 <code>/kubepods.slice/.../podX</code>，不要只说“CPU 高”。</div>
+<div class="card"><strong>必须有时间窗口</strong><br>瞬时峰值、1 分钟持续高、训练 step 周期性峰值的处理不同。</div>
+<div class="card"><strong>必须能映射 owner</strong><br>服务名、Pod、namespace、job id、用户或队列至少要确认一个。</div>
+<div class="card"><strong>必须交叉验证</strong><br>CPU 用 <code>pidstat/perf</code>，内存用 cgroup 文件，I/O 用 <code>iostat/iotop</code>。</div>
+<div class="card"><strong>必须说明 caveat</strong><br>记账未开启、容器内视角、cgroup v1/v2、GPU 显存不在列里。</div>
+<div class="card"><strong>必须记录处置边界</strong><br>只读采样可以直接做；杀进程、重启、改限额需要变更流程。</div>
+</div>
+</section>
+
+<section class="section" id="s19">
+<h2>19. 常见误区与 FAQ</h2>
+<div class="grid-2">
+<div class="card"><strong>误区 1：CPU 2500% 一定异常</strong><br>不一定。先看节点 CPU 数和该 cgroup 的 quota；在 64 核机器上 2500% 只是约 25 个 CPU 的使用量。</div>
+<div class="card"><strong>误区 2：Memory 为空就是没有内存占用</strong><br>不一定。可能是 memory accounting 未开启、控制器不可用、权限受限或当前层级没有直接记账。</div>
+<div class="card"><strong>误区 3：Path 就是 Kubernetes 名称</strong><br>不是。Path 是 cgroup 路径，Pod 名、namespace、owner 要通过 UID、container ID、CRI 或 Kubernetes API 映射。</div>
+<div class="card"><strong>误区 4：I/O 高就一定是磁盘坏</strong><br>高 I/O 可能来自 checkpoint、数据预取、日志、缓存 miss、元数据风暴或共享存储争抢，需要结合 <code>iostat</code> 和应用时间线。</div>
+<div class="card"><strong>误区 5：cgtop 能解释 GPU OOM</strong><br>不能直接解释。GPU 显存不属于 cgroup Memory 列，必须看 <code>nvidia-smi</code>、DCGM 和框架日志。</div>
+<div class="card"><strong>误区 6：容器内结果等于宿主机结果</strong><br>通常不等。容器内可能缺 systemd、缺权限或只看到自身 cgroup；节点级排障应尽量用宿主机或受控 node debug 视角。</div>
+</div>
+<table>
+<tr><th>问题</th><th>快速回答</th><th>更可靠的验证</th></tr>
+<tr><td>能不能替代 <code>kubectl top</code>？</td><td>不能。它没有 Kubernetes 标签和历史聚合。</td><td>用它做节点现场下钻，用 metrics server/Prometheus 做平台视角。</td></tr>
+<tr><td>能不能只看第一行根 cgroup？</td><td>只能看全机合计，不能归因。</td><td>用 <code>--depth=2</code> 到 <code>--depth=6</code> 逐层展开。</td></tr>
+<tr><td>为什么和 Prometheus 数字不同？</td><td>采样窗口、口径、cgroup 路径、容器重启和 rate 计算都可能不同。</td><td>对齐时间窗口、Pod UID、container ID 和节点。</td></tr>
+<tr><td>为什么 Tasks 比进程数多？</td><td>Tasks 可能包含线程。</td><td>用 <code>ps -L</code> 或 <code>pidstat -t</code> 对照。</td></tr>
+</table>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>systemd 官方手册：<code>systemd-cgtop(1)</code>，包含排序、批处理、CPU 显示、任务计数、深度限制和 accounting caveats。</li>
+<li>systemd 官方手册：<code>systemd-cgls(1)</code>，用于展开 cgroup 树并查看其中的进程。</li>
+<li>systemd 官方手册：<code>systemd.resource-control(5)</code>，理解 <code>MemoryAccounting=</code>、<code>IOAccounting=</code>、<code>CPUQuota=</code>、<code>MemoryMax=</code> 等资源控制项。</li>
+<li>Linux kernel 文档：Control Groups v2，理解 <code>cpu</code>、<code>memory</code>、<code>io</code>、<code>pids</code> 控制器与 <code>/sys/fs/cgroup</code> 文件。</li>
+<li>Kubernetes 官方文档：Pod QoS、resource requests/limits、node debugging、container runtime 与 cgroup driver。</li>
+<li>AI Infra 相关工具：<code>pidstat</code>、<code>iostat</code>、<code>iotop</code>、<code>perf</code>、<code>nvidia-smi</code>、DCGM、Prometheus/cadvisor。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 cgroup 路径和 systemd unit 类型，再理解 accounting 开关和 cgroup v2 文件，最后把 <code>systemd-cgtop</code> 放入 Kubernetes/训练平台的完整排障链路。</p>
+</section>
+
+<div class="footer">systemd-cgtop 深度教程 · AI Infra cgroup 资源视图、训练作业噪声定位、Kubernetes 映射与生产排障</div>
+</div>
+</body>
+</html>

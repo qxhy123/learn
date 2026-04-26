@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>tcpdump 深度教程：AI Infra 网络抓包、过滤与故障定位</title>
+<style>
+:root{--bg:#f5f7f3;--card:#fffef8;--ink:#1f2933;--muted:#64706f;--line:#d9dfd2;--green:#15803d;--green2:#dcfce7;--blue:#2563eb;--blue2:#dbeafe;--orange:#c2410c;--orange2:#ffedd5;--red:#b91c1c;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--amber:#a16207;--amber2:#fef3c7;--slate2:#eef2f7;--shadow:0 14px 34px rgba(20,38,24,.09)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#e8f7df 0,#f7faf4 34%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--green2);color:#166534;font-size:13px;font-weight:700;border:1px solid #bbf7d0}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdf8;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#111827;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1f2937;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f4faf1;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>tcpdump 深度教程：AI Infra 网络抓包、过滤与故障定位</h1>
+<p class="sub">这份教程面向 AI Infra/Linux 场景讲解 <code>tcpdump</code>：从“网卡上经过的包如何被内核复制给抓包程序”这个心智模型出发，系统覆盖接口选择、BPF 过滤器、host/port/protocol 条件、pcap 写入和回放、采样安全、TCP 握手与重传线索、NCCL/RDMA 观察边界、与 <code>tshark</code>/<code>ss</code> 的分工，以及线上排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">packet capture</span><span class="chip">BPF filter</span><span class="chip">pcap</span><span class="chip">TCP handshake</span><span class="chip">retransmit</span><span class="chip">NCCL</span><span class="chip">RDMA caveats</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>tcpdump</code> 不是“网络测速工具”，而是“把某个接口上匹配过滤条件的数据包复制出来并解码/保存”的抓包工具。</div>
+<div class="success"><strong>最重要原则：</strong> 线上抓包必须限制接口、方向、host/port、包数、时长和 snaplen；先做小样本验证，再扩大范围，避免抓到敏感载荷或把高吞吐训练节点拖慢。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">tcpdump 是什么</a></li>
+<li><a class="anchor" href="#s2">抓包心智模型</a></li>
+<li><a class="anchor" href="#s3">安装、权限与版本</a></li>
+<li><a class="anchor" href="#s4">接口选择与方向</a></li>
+<li><a class="anchor" href="#s5">输出字段怎么读</a></li>
+<li><a class="anchor" href="#s6">BPF 过滤器基础</a></li>
+<li><a class="anchor" href="#s7">host、port、protocol 组合</a></li>
+<li><a class="anchor" href="#s8">安全采样与性能控制</a></li>
+<li><a class="anchor" href="#s9">pcap 写入、轮转与读取</a></li>
+<li><a class="anchor" href="#s10">TCP 握手与连接失败</a></li>
+<li><a class="anchor" href="#s11">重传、乱序与零窗口线索</a></li>
+<li><a class="anchor" href="#s12">AI 训练流量画像</a></li>
+<li><a class="anchor" href="#s13">NCCL/RDMA Caveats</a></li>
+<li><a class="anchor" href="#s14">tcpdump vs tshark/ss</a></li>
+<li><a class="anchor" href="#s15">故障排查流程</a></li>
+<li><a class="anchor" href="#s16">常见命令手册</a></li>
+<li><a class="anchor" href="#s17">常见坑与练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. tcpdump 是什么</h2>
+<p><code>tcpdump</code> 是基于 libpcap 的命令行抓包工具。它从指定网络接口读取数据包，使用 BPF 表达式在内核侧尽量早过滤，再把匹配包打印到终端或写入 pcap 文件。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>验证某台机器是否发包/收包、确认 SYN/SYN-ACK/RST、保存小样本 pcap、用 host/port/protocol 快速缩小问题面。</div>
+<div class="card"><strong>它不擅长什么</strong><br>长时间全量流量审计、应用层协议深度解析、大规模可视化分析、RDMA 数据路径完整观测。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>在分布式训练、参数服务器、对象存储、推理网关和 NCCL 初始化阶段，快速判断问题在应用、内核、路由、防火墙还是对端。</div>
+</div>
+<pre><code># 最小抓包：在指定接口上抓 10 个包，不解析 DNS，不解析端口名
+sudo tcpdump -i eth0 -nn -c 10
+
+# 抓某个训练节点之间的 TCP 控制面流量
+sudo tcpdump -i eth0 -nn 'host 10.0.3.21 and tcp'
+
+# 把小样本写入 pcap，后续用 tcpdump/tshark/Wireshark 分析
+sudo tcpdump -i eth0 -nn -s 128 -c 500 -w /tmp/train-node.pcap 'host 10.0.3.21'</code></pre>
+<div class="warn"><strong>边界提醒：</strong> tcpdump 看到的是“经过该接口且能被捕获的数据包”。如果流量走了另一个网卡、被 offload 改写、在内核旁路/RDMA 数据路径中传输，tcpdump 看到的内容可能不完整。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：packet capture 心智模型</h3>
+<svg viewBox="0 0 1120 660" width="100%" role="img" aria-label="tcpdump packet capture model">
+<rect x="18" y="18" width="1084" height="624" rx="22" fill="#fbfdf8" stroke="#d9dfd2"/>
+<text x="560" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2933">tcpdump 抓到的是接口上的“包副本”</text>
+<rect x="70" y="128" width="190" height="104" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="165" y="168" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">应用</text><text x="165" y="198" text-anchor="middle" font-size="15">PyTorch / NCCL / API</text>
+<rect x="330" y="128" width="190" height="104" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="425" y="168" text-anchor="middle" font-size="23" font-weight="700" fill="#166534">内核网络栈</text><text x="425" y="198" text-anchor="middle" font-size="15">TCP/IP / 路由 / qdisc</text>
+<rect x="590" y="128" width="190" height="104" rx="18" fill="#fef3c7" stroke="#facc15"/><text x="685" y="168" text-anchor="middle" font-size="23" font-weight="700" fill="#854d0e">网卡接口</text><text x="685" y="198" text-anchor="middle" font-size="15">eth0 / ens / bond / ib</text>
+<rect x="850" y="128" width="190" height="104" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="945" y="168" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">网络</text><text x="945" y="198" text-anchor="middle" font-size="15">ToR / RoCE / WAN</text>
+<rect x="415" y="360" width="290" height="112" rx="20" fill="#ccfbf1" stroke="#5eead4"/><text x="560" y="402" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">libpcap + BPF</text><text x="560" y="432" text-anchor="middle" font-size="15">按表达式过滤包副本</text><text x="560" y="455" text-anchor="middle" font-size="15">打印摘要或写入 pcap</text>
+<rect x="420" y="535" width="280" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="571" text-anchor="middle" font-size="17" font-weight="700">tcpdump 输出 != 应用日志</text>
+<line x1="260" y1="180" x2="330" y2="180" stroke="#7c8b78" stroke-width="4" marker-end="url(#a1)"/><line x1="520" y1="180" x2="590" y2="180" stroke="#7c8b78" stroke-width="4" marker-end="url(#a1)"/><line x1="780" y1="180" x2="850" y2="180" stroke="#7c8b78" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M685 232 C680 292, 635 328, 590 360" fill="none" stroke="#0f766e" stroke-width="4" marker-end="url(#a1)"/><path d="M425 232 C430 296, 475 330, 525 360" fill="none" stroke="#0f766e" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="560" y1="472" x2="560" y2="535" stroke="#7c8b78" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#7c8b78"/></marker></defs>
+</svg>
+<div class="caption">tcpdump 通常在内核网络栈和接口附近观察包副本。抓不到包不一定代表应用没发，也可能是接口、命名空间、offload、隧道或 RDMA 数据路径选择错误。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、权限与版本</h2>
+<p>tcpdump 需要抓取原始包，通常要求 root 权限或 <code>CAP_NET_RAW</code>/<code>CAP_NET_ADMIN</code> 能力。生产环境不要为了方便给普通用户永久开放抓包权限，应通过受控 sudo、堡垒机或应急流程执行。</p>
+<table>
+<tr><th>任务</th><th>命令</th><th>说明</th></tr>
+<tr><td>查看版本</td><td><code>tcpdump --version</code></td><td>确认 tcpdump 与 libpcap 版本，排查过滤语法兼容性。</td></tr>
+<tr><td>Debian/Ubuntu 安装</td><td><code>sudo apt-get install tcpdump</code></td><td>容器镜像中常被裁剪，需要临时安装或用 debug 镜像。</td></tr>
+<tr><td>RHEL/CentOS 安装</td><td><code>sudo yum install tcpdump</code></td><td>新系统也可能使用 <code>dnf</code>。</td></tr>
+<tr><td>列接口</td><td><code>sudo tcpdump -D</code></td><td>比只看 <code>ip link</code> 更接近 tcpdump 可捕获接口列表。</td></tr>
+</table>
+<pre><code># 容器里检查权限和命名空间
+id
+capsh --print 2&gt;/dev/null | grep -E 'cap_net_raw|cap_net_admin' || true
+ip netns identify $$ 2&gt;/dev/null || true
+
+# 在 Kubernetes 节点上抓 Pod 流量时，先确认流量在哪个命名空间/接口
+ip addr
+ip route
+sudo tcpdump -D</code></pre>
+<div class="danger"><strong>权限提醒：</strong> pcap 文件可能包含 token、Cookie、请求体、内部 IP 和模型服务路径。保存、传输、上传前必须脱敏或确认安全边界。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 接口选择与方向</h2>
+<p>抓包第一步不是写复杂过滤器，而是选对接口。AI 服务器常见多网卡：管理网、业务网、IB/RoCE 网、bond、VLAN、容器 veth、CNI bridge。接口选错时，过滤器再正确也看不到包。</p>
+<table>
+<tr><th>选项</th><th>作用</th><th>适合场景</th></tr>
+<tr><td><code>-i eth0</code></td><td>指定接口</td><td>最推荐，范围可控。</td></tr>
+<tr><td><code>-i any</code></td><td>抓所有可见接口的合并视图</td><td>快速判断包是否经过本机，但链路层信息可能简化。</td></tr>
+<tr><td><code>-Q in</code>/<code>-Q out</code></td><td>限制方向</td><td>排查只发不收、只收不回时有用，支持情况依平台而异。</td></tr>
+<tr><td><code>-e</code></td><td>打印二层头</td><td>观察 MAC、VLAN、bond/交换侧线索。</td></tr>
+</table>
+<pre><code># 看路由决定流量可能走哪张网卡
+ip route get 10.0.3.21
+
+# 在候选接口上抓少量 ICMP/TCP 样本
+sudo tcpdump -i eth0 -nn -c 20 'host 10.0.3.21'
+sudo tcpdump -i bond0 -nn -c 20 'host 10.0.3.21'
+
+# 快速确认本机是否看到相关流量
+sudo tcpdump -i any -nn -c 50 'host 10.0.3.21 and (tcp or udp)'</code></pre>
+<div class="note"><strong>容器场景：</strong> Pod 内抓包看到的是 Pod 网络命名空间；节点上可能要看 <code>veth*</code>、CNI bridge、overlay 接口或物理 NIC。先用 <code>ip route get</code>、<code>ss -tnp</code>、CNI 工具定位路径。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 输出字段怎么读</h2>
+<p>tcpdump 默认输出是“每个包一行”的摘要。理解时间戳、五元组、flags、seq/ack、窗口和长度，能快速看出 TCP 是否建立、谁先关闭、是否出现 RST 或重传迹象。</p>
+<pre><code>12:01:03.123456 IP 10.0.1.10.45678 &gt; 10.0.1.20.443: Flags [S], seq 100, win 64240, options [mss 1460,sackOK,TS val 1 ecr 0], length 0
+12:01:03.124010 IP 10.0.1.20.443 &gt; 10.0.1.10.45678: Flags [S.], seq 900, ack 101, win 65160, options [mss 1460,sackOK,TS val 2 ecr 1], length 0
+12:01:03.124060 IP 10.0.1.10.45678 &gt; 10.0.1.20.443: Flags [.], ack 901, win 502, length 0</code></pre>
+<table>
+<tr><th>字段</th><th>含义</th><th>排障价值</th></tr>
+<tr><td><code>12:01:03.123456</code></td><td>抓包主机时间戳</td><td>和应用日志、NCCL 日志、内核日志对齐。</td></tr>
+<tr><td><code>IP</code>/<code>IP6</code></td><td>三层协议</td><td>确认 IPv4/IPv6 是否和配置一致。</td></tr>
+<tr><td><code>src.port &gt; dst.port</code></td><td>源和目的地址端口</td><td>确认实际连接方向、NAT 后地址、端口是否符合预期。</td></tr>
+<tr><td><code>Flags [S]</code></td><td>TCP 标志位</td><td>SYN、SYN-ACK、ACK、FIN、RST 是连接生命周期线索。</td></tr>
+<tr><td><code>length</code></td><td>TCP 负载长度</td><td>区分控制包和有载荷数据包。</td></tr>
+</table>
+<pre><code># 常用输出控制：不做名称解析，打印绝对 seq，时间戳更详细
+sudo tcpdump -i eth0 -nn -tttt -S -c 20 'tcp and host 10.0.1.20'
+
+# 打印链路层头，观察 VLAN/MAC
+sudo tcpdump -i eth0 -nn -e -c 20 'host 10.0.1.20'</code></pre>
+</section>
+
+<section class="section" id="s6">
+<h2>5. BPF 过滤器基础</h2>
+<p>BPF 过滤器是 tcpdump 的核心能力。表达式越精确，内核复制给用户态的包越少，对生产节点越安全。基本结构是：限定类型、限定方向、限定地址/端口、用布尔逻辑组合。</p>
+<table>
+<tr><th>过滤器</th><th>含义</th><th>例子</th></tr>
+<tr><td><code>host</code></td><td>源或目的主机</td><td><code>host 10.0.1.20</code></td></tr>
+<tr><td><code>src host</code>/<code>dst host</code></td><td>源/目的主机</td><td><code>src host 10.0.1.10</code></td></tr>
+<tr><td><code>port</code></td><td>源或目的端口</td><td><code>port 443</code></td></tr>
+<tr><td><code>tcp</code>/<code>udp</code>/<code>icmp</code></td><td>协议</td><td><code>tcp and port 443</code></td></tr>
+<tr><td><code>net</code></td><td>网段</td><td><code>net 10.0.0.0/8</code></td></tr>
+<tr><td><code>and</code>/<code>or</code>/<code>not</code></td><td>布尔组合</td><td><code>host A and not port 22</code></td></tr>
+</table>
+<pre><code># 注意 shell 里的括号要加引号
+sudo tcpdump -i eth0 -nn 'host 10.0.1.20 and (tcp port 443 or tcp port 8443)'
+
+# 排除 SSH，避免自己的远程登录刷屏
+sudo tcpdump -i eth0 -nn 'host 10.0.1.20 and not port 22'
+
+# 只看 SYN 包，定位连接发起和是否被回应
+sudo tcpdump -i eth0 -nn 'tcp[tcpflags] &amp; tcp-syn != 0 and host 10.0.1.20'</code></pre>
+<div class="warn"><strong>语法提醒：</strong> BPF 表达式建议整体用单引号包起来，避免 shell 把括号、<code>&amp;</code>、<code>|</code>、<code>!</code> 提前解释。</div>
+</section>
+
+<section class="figure" id="s7">
+<h3>流程图：从问题到 BPF 过滤器</h3>
+<svg viewBox="0 0 1120 720" width="100%" role="img" aria-label="BPF filter workflow">
+<rect x="18" y="18" width="1084" height="684" rx="22" fill="#fbfdf8" stroke="#d9dfd2"/>
+<rect x="430" y="48" width="260" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="560" y="89" text-anchor="middle" font-size="22" font-weight="700">先定义问题</text>
+<rect x="80" y="170" width="220" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="190" y="203" text-anchor="middle" font-size="18" font-weight="700">哪台机器？</text><text x="190" y="230" text-anchor="middle" font-size="14">host / net</text>
+<rect x="330" y="170" width="220" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="440" y="203" text-anchor="middle" font-size="18" font-weight="700">哪个协议？</text><text x="440" y="230" text-anchor="middle" font-size="14">tcp / udp / icmp</text>
+<rect x="580" y="170" width="220" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="690" y="203" text-anchor="middle" font-size="18" font-weight="700">哪个端口？</text><text x="690" y="230" text-anchor="middle" font-size="14">port / portrange</text>
+<rect x="830" y="170" width="220" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="940" y="203" text-anchor="middle" font-size="18" font-weight="700">哪个方向？</text><text x="940" y="230" text-anchor="middle" font-size="14">src / dst / -Q</text>
+<rect x="230" y="365" width="660" height="88" rx="18" fill="#fef3c7" stroke="#facc15"/><text x="560" y="400" text-anchor="middle" font-size="20" font-weight="700">组合成最小过滤器</text><text x="560" y="428" text-anchor="middle" font-size="15">host 10.0.1.20 and tcp and port 443 and not port 22</text>
+<rect x="230" y="535" width="290" height="76" rx="16" fill="#ccfbf1" stroke="#5eead4"/><text x="375" y="566" text-anchor="middle" font-size="18" font-weight="700">先 -c 20 验证</text><text x="375" y="592" text-anchor="middle" font-size="14">确认有包且方向正确</text>
+<rect x="600" y="535" width="290" height="76" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="745" y="566" text-anchor="middle" font-size="18" font-weight="700">再扩大样本</text><text x="745" y="592" text-anchor="middle" font-size="14">加 -s/-w/timeout/轮转</text>
+<line x1="560" y1="114" x2="190" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="114" x2="440" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="114" x2="690" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="114" x2="940" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="190" y1="256" x2="380" y2="365" stroke="#7c8b78" stroke-width="3"/><line x1="440" y1="256" x2="500" y2="365" stroke="#7c8b78" stroke-width="3"/><line x1="690" y1="256" x2="620" y2="365" stroke="#7c8b78" stroke-width="3"/><line x1="940" y1="256" x2="740" y2="365" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="453" x2="375" y2="535" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="453" x2="745" y2="535" stroke="#7c8b78" stroke-width="3"/>
+</svg>
+<div class="caption">过滤器不是越复杂越好，而是越贴近问题越好。先用小包数验证，再扩大样本。</div>
+</section>
+
+<section class="section">
+<h2>6. host、port、protocol 组合</h2>
+<p>AI Infra 排障常围绕“训练节点 A 到节点 B 的某个端口是否通”“对象存储/参数服务/调度器有没有响应”“连接被谁 RST”。下面是常用组合。</p>
+<pre><code># 单 host 的所有 TCP/UDP
+sudo tcpdump -i eth0 -nn 'host 10.0.1.20 and (tcp or udp)'
+
+# 两个训练节点之间的流量
+sudo tcpdump -i eth0 -nn 'host 10.0.1.10 and host 10.0.1.20'
+
+# 只看访问对象存储或推理网关的 HTTPS
+sudo tcpdump -i eth0 -nn 'dst host 10.0.2.15 and tcp dst port 443'
+
+# 端口范围，例如服务动态端口或分布式训练 rendezvous 范围
+sudo tcpdump -i eth0 -nn 'tcp and portrange 20000-20100'
+
+# DNS 解析问题
+sudo tcpdump -i eth0 -nn 'udp port 53 or tcp port 53'</code></pre>
+<table>
+<tr><th>排障问题</th><th>推荐过滤器</th><th>看什么</th></tr>
+<tr><td>节点 A 连接 B 超时</td><td><code>host A and host B and tcp</code></td><td>A 是否发 SYN，B 是否回 SYN-ACK/RST。</td></tr>
+<tr><td>服务端没收到请求</td><td><code>dst host server and dst port P</code></td><td>包是否到达服务端网卡。</td></tr>
+<tr><td>怀疑本机回包走错路</td><td><code>src host server and dst host client</code></td><td>回包接口和源地址是否符合预期。</td></tr>
+<tr><td>DNS 慢或失败</td><td><code>port 53</code></td><td>查询发往哪个 resolver，是否有响应。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 安全采样与性能控制</h2>
+<p>高吞吐训练节点上，全量抓包可能消耗 CPU、内存、磁盘和 I/O，甚至改变被观测系统的时延。生产抓包要把“观察成本”当成排障风险的一部分。</p>
+<table>
+<tr><th>控制项</th><th>命令</th><th>作用</th></tr>
+<tr><td>限制包数</td><td><code>-c 1000</code></td><td>达到包数自动退出。</td></tr>
+<tr><td>限制时长</td><td><code>timeout 30 tcpdump ...</code></td><td>避免忘记停止。</td></tr>
+<tr><td>限制 snaplen</td><td><code>-s 96</code>/<code>-s 128</code></td><td>只保存包头和少量载荷，降低敏感数据和磁盘压力。</td></tr>
+<tr><td>不解析名称</td><td><code>-nn</code></td><td>避免 DNS/服务名解析带来延迟和噪声。</td></tr>
+<tr><td>行缓冲</td><td><code>-l</code></td><td>管道实时处理时减少缓冲等待。</td></tr>
+<tr><td>丢弃统计</td><td>结束输出</td><td>关注 captured/received/dropped by kernel。</td></tr>
+</table>
+<pre><code># 生产推荐起步：短时、小包数、小 snaplen、精确过滤
+sudo timeout 20 tcpdump -i eth0 -nn -s 128 -c 1000 \
+  -w /tmp/sample.pcap 'host 10.0.1.20 and tcp and not port 22'
+
+# 只看摘要，不保存载荷
+sudo timeout 10 tcpdump -i eth0 -nn -q -c 100 'host 10.0.1.20'
+
+# 抓包结束后关注 dropped by kernel；如果非零，样本可能不完整
+sudo tcpdump -i eth0 -nn -c 1000 'tcp port 443'</code></pre>
+<div class="danger"><strong>生产红线：</strong> 不要在忙碌的 100G/200G/400G 训练网卡上长时间 <code>-s 0</code> 全包保存；不要把 pcap 发到外部工单系统前不脱敏；不要在 SSH 会话里抓 <code>port 22</code> 导致输出刷屏。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. pcap 写入、轮转与读取</h2>
+<p>终端输出适合快速判断，pcap 适合离线分析和共享证据。写 pcap 时优先保存最小可复现样本：明确接口、过滤器、时长、snaplen、机器名和时间窗口。</p>
+<pre><code># 写入 pcap：-w 后 tcpdump 不再打印逐包摘要
+sudo tcpdump -i eth0 -nn -s 128 -c 5000 \
+  -w /tmp/$(hostname)-api-$(date +%Y%m%d-%H%M%S).pcap \
+  'host 10.0.2.15 and tcp port 443'
+
+# 读取 pcap 并用新过滤器二次筛选
+tcpdump -nn -r /tmp/sample.pcap 'tcp[tcpflags] &amp; tcp-rst != 0'
+
+# 轮转：每 60 秒一个文件，最多保留 5 个
+sudo tcpdump -i eth0 -nn -s 128 -G 60 -W 5 \
+  -w '/tmp/api-%Y%m%d-%H%M%S.pcap' \
+  'host 10.0.2.15 and tcp port 443'</code></pre>
+<table>
+<tr><th>选项</th><th>含义</th><th>建议</th></tr>
+<tr><td><code>-w file.pcap</code></td><td>写 pcap</td><td>适合证据留存和离线分析。</td></tr>
+<tr><td><code>-r file.pcap</code></td><td>读 pcap</td><td>可继续加 BPF 过滤器。</td></tr>
+<tr><td><code>-s 0</code></td><td>保存完整包</td><td>仅在低流量、安全授权、确需应用载荷时使用。</td></tr>
+<tr><td><code>-C size</code></td><td>按文件大小轮转，单位 MB</td><td>防止磁盘被打满。</td></tr>
+<tr><td><code>-G sec</code></td><td>按时间轮转</td><td>适合等待偶发问题。</td></tr>
+</table>
+<div class="note"><strong>证据命名：</strong> pcap 文件名建议包含主机、接口、目标、时间和过滤条件摘要；排障记录中写清楚抓包主机时钟是否和集群 NTP 同步。</div>
+</section>
+
+<section class="figure" id="s10">
+<h3>信息图：TCP 握手、失败与关闭线索</h3>
+<svg viewBox="0 0 1120 720" width="100%" role="img" aria-label="TCP handshake troubleshooting">
+<rect x="18" y="18" width="1084" height="684" rx="22" fill="#fbfdf8" stroke="#d9dfd2"/>
+<text x="560" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2933">看 TCP Flags 判断连接卡在哪里</text>
+<rect x="100" y="120" width="230" height="74" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="215" y="165" text-anchor="middle" font-size="21" font-weight="700">Client / Rank A</text>
+<rect x="790" y="120" width="230" height="74" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="905" y="165" text-anchor="middle" font-size="21" font-weight="700">Server / Rank B</text>
+<line x1="215" y1="220" x2="215" y2="615" stroke="#64748b" stroke-width="3"/><line x1="905" y1="220" x2="905" y2="615" stroke="#64748b" stroke-width="3"/>
+<line x1="230" y1="255" x2="890" y2="255" stroke="#15803d" stroke-width="4" marker-end="url(#c1)"/><text x="560" y="242" text-anchor="middle" font-size="16" font-weight="700">SYN [S]</text>
+<line x1="890" y1="330" x2="230" y2="330" stroke="#15803d" stroke-width="4" marker-end="url(#c1)"/><text x="560" y="318" text-anchor="middle" font-size="16" font-weight="700">SYN-ACK [S.]</text>
+<line x1="230" y1="405" x2="890" y2="405" stroke="#15803d" stroke-width="4" marker-end="url(#c1)"/><text x="560" y="393" text-anchor="middle" font-size="16" font-weight="700">ACK [.]</text>
+<rect x="345" y="475" width="430" height="94" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="510" text-anchor="middle" font-size="18" font-weight="700">异常模式</text><text x="560" y="538" text-anchor="middle" font-size="14">只有 SYN：路由/防火墙/对端监听/回包路径</text><text x="560" y="562" text-anchor="middle" font-size="14">收到 RST：端口关闭、应用拒绝、中间设备重置</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#15803d"/></marker></defs>
+</svg>
+<div class="caption">三次握手是定位连接问题的第一张地图：SYN 有没有出去，SYN-ACK 有没有回来，是否被 RST，决定下一步查路由、防火墙、监听还是应用。</div>
+</section>
+
+<section class="section">
+<h2>9. TCP 握手与连接失败</h2>
+<p>连接超时、连接拒绝、偶发初始化失败，是分布式训练和推理服务中最常见的网络症状。tcpdump 能把应用报错拆成具体包序列。</p>
+<table>
+<tr><th>抓包现象</th><th>常见含义</th><th>下一步</th></tr>
+<tr><td>只看到客户端 SYN 重复</td><td>服务端没收到、回包丢失、防火墙丢弃、路由不通</td><td>在服务端同时抓；查安全组、iptables、路由、ToR。</td></tr>
+<tr><td>SYN 后立即 RST</td><td>目标端口未监听或被中间设备拒绝</td><td>服务端查 <code>ss -ltnp</code>、应用日志、端口配置。</td></tr>
+<tr><td>SYN/SYN-ACK/ACK 完成但应用超时</td><td>TCP 通了，问题可能在 TLS、协议、应用处理或队列</td><td>结合 <code>ss -ti</code>、应用指标、服务端 pcap。</td></tr>
+<tr><td>握手方向地址不符合预期</td><td>NAT、容器网络、源地址选择或多网卡路由问题</td><td>查 <code>ip route get</code>、policy routing、CNI。</td></tr>
+</table>
+<pre><code># 只抓 TCP 握手和 RST/FIN 类控制包
+sudo tcpdump -i eth0 -nn -tttt \
+  'host 10.0.1.20 and tcp and (tcp[tcpflags] &amp; (tcp-syn|tcp-fin|tcp-rst) != 0)'
+
+# 服务端确认某端口是否有 SYN 到达
+sudo tcpdump -i eth0 -nn 'dst host 10.0.1.20 and tcp dst port 29500'
+
+# 客户端确认是否收到 SYN-ACK/RST
+sudo tcpdump -i eth0 -nn 'src host 10.0.1.20 and tcp src port 29500'</code></pre>
+<div class="success"><strong>双端抓包：</strong> 单端抓包只能说明“这台机器看到什么”。连接问题最好在客户端和服务端同一时间窗口各抓一份，对齐时间戳后比较包是否在中途消失。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 重传、乱序与零窗口线索</h2>
+<p>tcpdump 不像 Wireshark 那样直接标注 “TCP Retransmission”，但可以从重复 seq、重复 SYN、重复 ACK、窗口变化和时间间隔中找线索。对性能问题，tcpdump 更适合提供方向性证据，而不是单独完成定量归因。</p>
+<pre><code># 用绝对序列号更容易比较重复 seq
+sudo tcpdump -i eth0 -nn -S -tttt 'host 10.0.1.20 and tcp port 443'
+
+# 抓窗口和 ACK 变化，配合 ss -ti 看拥塞/重传计数
+ss -ti dst 10.0.1.20
+sudo tcpdump -i eth0 -nn -tttt 'host 10.0.1.20 and tcp'
+
+# 只看 ACK 包和小包时，可以降低样本量
+sudo tcpdump -i eth0 -nn -c 2000 'host 10.0.1.20 and tcp and less 128'</code></pre>
+<table>
+<tr><th>线索</th><th>可能原因</th><th>辅助工具</th></tr>
+<tr><td>相同 seq 的数据包重复出现</td><td>丢包、ACK 丢失、重传</td><td><code>ss -ti</code>、网卡计数、交换机端口错误。</td></tr>
+<tr><td>大量 duplicate ACK</td><td>乱序或丢包</td><td>Wireshark/tshark 专业分析。</td></tr>
+<tr><td>窗口变小或零窗口</td><td>接收端应用读不动、内核缓冲受限</td><td><code>ss -m</code>、进程 CPU、GC/阻塞日志。</td></tr>
+<tr><td>周期性 SYN 重传</td><td>连接建立阶段无响应</td><td>双端抓包、路由和防火墙。</td></tr>
+</table>
+<div class="warn"><strong>精度提醒：</strong> TSO/GSO/GRO/LRO 等 offload 会改变主机侧看到的包形态。需要精细分析包大小和分段时，要同时查看 <code>ethtool -k</code>，必要时在镜像口或对端抓包验证。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. AI 训练流量画像</h2>
+<p>AI Infra 的网络流量通常分为控制面、数据面、存储面和观测面。tcpdump 对控制面最有用，对高吞吐数据面要谨慎采样。</p>
+<div class="grid-4">
+<div class="card"><strong>控制面</strong><br>rendezvous、scheduler、etcd、API、SSH、DNS。适合 tcpdump 精确定位。</div>
+<div class="card"><strong>训练数据面</strong><br>NCCL、Gloo、parameter server、RPC。吞吐高，抓包必须限量。</div>
+<div class="card"><strong>存储面</strong><br>S3/OSS、NFS、Lustre、Ceph、镜像拉取。关注连接、TLS、重试和 DNS。</div>
+<div class="card"><strong>观测面</strong><br>Prometheus、日志、trace、metrics。可确认采集是否到达和响应。</div>
+</div>
+<pre><code># PyTorch rendezvous 常见端口示例，按实际 MASTER_PORT 修改
+sudo tcpdump -i eth0 -nn 'host 10.0.1.10 and tcp port 29500'
+
+# 观察对象存储访问是否建立 TCP/TLS 连接
+sudo tcpdump -i eth0 -nn -s 128 -c 1000 \
+  '(tcp port 443 or tcp port 80) and host 10.0.2.15'
+
+# DNS 对训练启动时间影响很大
+sudo tcpdump -i eth0 -nn -tttt 'port 53'</code></pre>
+<div class="note"><strong>排障顺序建议：</strong> 训练任务启动失败先抓控制面端口和 DNS；训练中吞吐抖动再结合 NCCL 日志、网卡计数、交换机遥测、<code>ss</code>、<code>ethtool</code> 和 pcap 小样本。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. NCCL/RDMA Caveats</h2>
+<p>NCCL 与 RDMA/RoCE 场景要特别小心 tcpdump 的观察边界。RoCEv2 使用 UDP/IP 封装，可能能在以太网接口看到部分包；InfiniBand verbs 或内核旁路路径上，tcpdump 可能看不到实际数据流，只能看到控制面或相关 IP 流量。</p>
+<table>
+<tr><th>场景</th><th>tcpdump 能帮什么</th><th>不能替代什么</th></tr>
+<tr><td>NCCL 初始化失败</td><td>确认 bootstrap/rendezvous TCP 连接、DNS、错误网卡选择。</td><td>不能解释所有 NCCL 内部拓扑和算法选择。</td></tr>
+<tr><td>RoCEv2</td><td>可能观察 UDP 4791、ECN/DSCP、源目的 IP。</td><td>不能完整评估 PFC、ECN、交换机队列和 NIC 拥塞控制。</td></tr>
+<tr><td>InfiniBand</td><td>可辅助看 IPoIB 或控制面。</td><td>不能完整抓 verbs 数据路径。</td></tr>
+<tr><td>GPUDirect RDMA</td><td>可确认控制连接和主机网络配置。</td><td>不能直接证明 GPU-NIC DMA 路径健康。</td></tr>
+</table>
+<pre><code># NCCL 常见第一步：确认它选了哪张网卡
+env | grep -E 'NCCL_SOCKET_IFNAME|NCCL_IB_HCA|NCCL_DEBUG'
+ip addr
+ip route get 10.0.1.20
+
+# RoCEv2 常见 UDP 端口，是否适用取决于网卡/驱动/网络
+sudo tcpdump -i eth0 -nn -s 128 -c 1000 'udp port 4791'
+
+# NCCL bootstrap TCP 连接按实际 peer 和端口过滤
+sudo tcpdump -i eth0 -nn 'host 10.0.1.20 and tcp'</code></pre>
+<div class="warn"><strong>RDMA 注意：</strong> RDMA 性能问题不要只看 pcap。必须结合 <code>ibstat</code>/<code>ibv_devinfo</code>、<code>rdma link</code>、NIC counters、DCGM、交换机 telemetry、PFC/ECN 配置和 NCCL_DEBUG 日志。</div>
+</section>
+
+<section class="figure" id="s14">
+<h3>用例图：tcpdump、tshark、ss、ethtool 怎么分工</h3>
+<svg viewBox="0 0 1120 680" width="100%" role="img" aria-label="tcpdump tshark ss ethtool comparison">
+<rect x="18" y="18" width="1084" height="644" rx="22" fill="#fbfdf8" stroke="#d9dfd2"/>
+<text x="560" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2933">网络排障工具分工</text>
+<rect x="95" y="135" width="420" height="160" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="305" y="178" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">tcpdump</text><text x="305" y="213" text-anchor="middle" font-size="15">现场抓包、最小过滤、pcap 证据</text><text x="305" y="241" text-anchor="middle" font-size="15">回答：这台机器看到哪些包？</text>
+<rect x="605" y="135" width="420" height="160" rx="22" fill="#dcfce7" stroke="#86efac"/><text x="815" y="178" text-anchor="middle" font-size="24" font-weight="700" fill="#166534">tshark / Wireshark</text><text x="815" y="213" text-anchor="middle" font-size="15">协议解码、重传标注、离线分析</text><text x="815" y="241" text-anchor="middle" font-size="15">回答：包序列说明了什么？</text>
+<rect x="95" y="380" width="420" height="160" rx="22" fill="#fef3c7" stroke="#facc15"/><text x="305" y="423" text-anchor="middle" font-size="24" font-weight="700" fill="#854d0e">ss</text><text x="305" y="458" text-anchor="middle" font-size="15">socket 状态、队列、拥塞、进程</text><text x="305" y="486" text-anchor="middle" font-size="15">回答：连接在内核里是什么状态？</text>
+<rect x="605" y="380" width="420" height="160" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="815" y="423" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">ethtool / counters</text><text x="815" y="458" text-anchor="middle" font-size="15">网卡错误、offload、速率、丢包计数</text><text x="815" y="486" text-anchor="middle" font-size="15">回答：链路和 NIC 是否健康？</text>
+<line x1="515" y1="215" x2="605" y2="215" stroke="#7c8b78" stroke-width="4"/><line x1="305" y1="295" x2="305" y2="380" stroke="#7c8b78" stroke-width="4"/><line x1="815" y1="295" x2="815" y2="380" stroke="#7c8b78" stroke-width="4"/><line x1="515" y1="460" x2="605" y2="460" stroke="#7c8b78" stroke-width="4"/>
+</svg>
+<div class="caption">tcpdump 是现场取证入口，不是唯一答案。复杂问题要把 pcap、socket 状态、网卡计数和应用日志放在同一条时间线上。</div>
+</section>
+
+<section class="section">
+<h2>13. tcpdump vs tshark/ss</h2>
+<table>
+<tr><th>工具</th><th>优势</th><th>限制</th><th>AI Infra 用法</th></tr>
+<tr><td><code>tcpdump</code></td><td>轻量、几乎随处可用、BPF 精确过滤、能写 pcap。</td><td>协议解析有限，重传等高级标注不如 Wireshark。</td><td>线上短时抓包、证据采集、验证是否发/收。</td></tr>
+<tr><td><code>tshark</code></td><td>解码强、字段过滤强、适合离线批处理 pcap。</td><td>安装较重，线上直接跑需谨慎。</td><td>对 pcap 做重传、TLS、HTTP/2、DNS 细分析。</td></tr>
+<tr><td><code>ss</code></td><td>读取内核 socket 状态，能看进程、队列、拥塞信息。</td><td>不显示逐包路径。</td><td>确认连接状态、Send-Q/Recv-Q、重传计数。</td></tr>
+<tr><td><code>ethtool</code></td><td>看 NIC counters、offload、速率和错误。</td><td>不告诉你具体哪条连接受影响。</td><td>定位丢包、CRC、pause、offload 干扰。</td></tr>
+</table>
+<pre><code># tcpdump 取证
+sudo tcpdump -i eth0 -nn -s 128 -c 5000 -w /tmp/evidence.pcap 'host 10.0.1.20 and tcp'
+
+# ss 看同一连接的内核状态
+ss -ti dst 10.0.1.20
+
+# tshark 离线统计协议层信息
+tshark -r /tmp/evidence.pcap -q -z conv,tcp 2&gt;/dev/null
+
+# ethtool 看网卡计数
+ethtool -S eth0 | egrep -i 'drop|err|timeout|crc|pause|discard'</code></pre>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 故障排查流程</h2>
+<p>tcpdump 排障应遵循“先定位路径，再抓最小样本，再双端对齐，再扩大证据”的顺序。不要一开始就全接口、全包、长时间抓取。</p>
+<ol>
+<li>明确问题：连接失败、吞吐低、DNS 慢、偶发 RST、某 rank 掉线。</li>
+<li>定位路径：<code>ip route get</code>、<code>ss -tnp</code>、服务端监听、容器命名空间。</li>
+<li>写最小过滤器：host + protocol + port + not port 22。</li>
+<li>短时验证：<code>-c 20</code> 或 <code>timeout 10</code> 看是否抓到预期包。</li>
+<li>保存证据：<code>-s 128 -w file.pcap</code>，必要时双端同时抓。</li>
+<li>关联证据：应用日志、NCCL 日志、<code>ss</code>、<code>ethtool</code>、交换机计数。</li>
+</ol>
+<pre><code># 一个可复用的最小排障模板
+PEER=10.0.1.20
+PORT=29500
+IFACE=eth0
+
+ip route get "$PEER"
+ss -tnp "dst $PEER" 2&gt;/dev/null || true
+sudo timeout 15 tcpdump -i "$IFACE" -nn -s 128 -c 1000 \
+  -w "/tmp/$(hostname)-${PEER}-${PORT}.pcap" \
+  "host $PEER and tcp port $PORT and not port 22"</code></pre>
+<div class="success"><strong>结论写法：</strong> 好的抓包结论应描述“在哪台机器、哪个接口、什么时间窗口、用什么过滤器、看到了什么包序列、没有看到什么预期包”。</div>
+</section>
+
+<section class="figure">
+<h3>安全排障图：线上抓包的风险控制</h3>
+<svg viewBox="0 0 1120 720" width="100%" role="img" aria-label="tcpdump safety troubleshooting workflow">
+<rect x="18" y="18" width="1084" height="684" rx="22" fill="#fbfdf8" stroke="#d9dfd2"/>
+<rect x="420" y="48" width="280" height="68" rx="16" fill="#fee2e2" stroke="#fca5a5"/><text x="560" y="90" text-anchor="middle" font-size="22" font-weight="700" fill="#991b1b">线上抓包前先限流</text>
+<rect x="90" y="170" width="210" height="88" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="195" y="204" text-anchor="middle" font-size="18" font-weight="700">范围</text><text x="195" y="231" text-anchor="middle" font-size="14">接口 + host + port</text>
+<rect x="330" y="170" width="210" height="88" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="435" y="204" text-anchor="middle" font-size="18" font-weight="700">时间</text><text x="435" y="231" text-anchor="middle" font-size="14">timeout / -c</text>
+<rect x="580" y="170" width="210" height="88" rx="14" fill="#fef3c7" stroke="#facc15"/><text x="685" y="204" text-anchor="middle" font-size="18" font-weight="700">大小</text><text x="685" y="231" text-anchor="middle" font-size="14">-s 96 / -s 128</text>
+<rect x="820" y="170" width="210" height="88" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="925" y="204" text-anchor="middle" font-size="18" font-weight="700">敏感数据</text><text x="925" y="231" text-anchor="middle" font-size="14">脱敏 / 权限</text>
+<rect x="220" y="360" width="680" height="90" rx="18" fill="#ccfbf1" stroke="#5eead4"/><text x="560" y="395" text-anchor="middle" font-size="20" font-weight="700">小样本验证：sudo tcpdump -i eth0 -nn -s 128 -c 100 ...</text><text x="560" y="425" text-anchor="middle" font-size="15">确认过滤器正确、dropped 为 0、没有抓到不该抓的数据</text>
+<rect x="250" y="545" width="270" height="74" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="385" y="575" text-anchor="middle" font-size="18" font-weight="700">证据归档</text><text x="385" y="601" text-anchor="middle" font-size="14">命令、时间、主机、接口</text>
+<rect x="600" y="545" width="270" height="74" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="735" y="575" text-anchor="middle" font-size="18" font-weight="700">清理文件</text><text x="735" y="601" text-anchor="middle" font-size="14">pcap 权限和生命周期</text>
+<line x1="560" y1="116" x2="195" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="116" x2="435" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="116" x2="685" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="116" x2="925" y2="170" stroke="#7c8b78" stroke-width="3"/><line x1="195" y1="258" x2="390" y2="360" stroke="#7c8b78" stroke-width="3"/><line x1="435" y1="258" x2="500" y2="360" stroke="#7c8b78" stroke-width="3"/><line x1="685" y1="258" x2="620" y2="360" stroke="#7c8b78" stroke-width="3"/><line x1="925" y1="258" x2="730" y2="360" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="450" x2="385" y2="545" stroke="#7c8b78" stroke-width="3"/><line x1="560" y1="450" x2="735" y2="545" stroke="#7c8b78" stroke-width="3"/>
+</svg>
+<div class="caption">线上 tcpdump 的第一目标是得到足够证据，第二目标是尽量少打扰业务，第三目标是避免敏感数据扩散。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 常见命令手册</h2>
+<div class="grid-2">
+<div class="card"><strong>快速看包</strong><pre><code>sudo tcpdump -i eth0 -nn -c 20</code></pre></div>
+<div class="card"><strong>指定主机</strong><pre><code>sudo tcpdump -i eth0 -nn 'host 10.0.1.20'</code></pre></div>
+<div class="card"><strong>指定端口</strong><pre><code>sudo tcpdump -i eth0 -nn 'tcp port 443'</code></pre></div>
+<div class="card"><strong>排除 SSH</strong><pre><code>sudo tcpdump -i eth0 -nn 'not port 22'</code></pre></div>
+<div class="card"><strong>写 pcap</strong><pre><code>sudo tcpdump -i eth0 -nn -s 128 -w /tmp/a.pcap 'host 10.0.1.20'</code></pre></div>
+<div class="card"><strong>读 pcap</strong><pre><code>tcpdump -nn -r /tmp/a.pcap 'tcp'</code></pre></div>
+<div class="card"><strong>看 SYN/RST/FIN</strong><pre><code>sudo tcpdump -i eth0 -nn 'tcp[tcpflags] &amp; (tcp-syn|tcp-rst|tcp-fin) != 0'</code></pre></div>
+<div class="card"><strong>短时安全采样</strong><pre><code>sudo timeout 15 tcpdump -i eth0 -nn -s 128 -c 1000 'host 10.0.1.20'</code></pre></div>
+</div>
+<div class="note"><strong>默认组合：</strong> 新手建议把 <code>-i</code>、<code>-nn</code>、<code>-c</code>、精确 BPF 当成固定模板；需要保存时再加 <code>-s 128 -w</code>。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 常见坑与练习</h2>
+<div class="grid-2">
+<div class="card"><strong>坑 1：接口选错</strong><br>先用 <code>ip route get PEER</code> 和 <code>tcpdump -D</code> 定位接口。</div>
+<div class="card"><strong>坑 2：忘记 <code>-nn</code></strong><br>名称解析会引入 DNS 噪声，也会让输出不稳定。</div>
+<div class="card"><strong>坑 3：过滤器没加引号</strong><br><code>&amp;</code>、括号、<code>or</code> 可能被 shell 解释。</div>
+<div class="card"><strong>坑 4：抓到自己的 SSH</strong><br>远程排障时通常加 <code>and not port 22</code>。</div>
+<div class="card"><strong>坑 5：把无包误判为无流量</strong><br>也可能是命名空间、接口、offload、隧道或 RDMA 路径问题。</div>
+<div class="card"><strong>坑 6：pcap 泄露敏感数据</strong><br>限制 <code>-s</code>，控制权限，必要时脱敏。</div>
+<div class="card"><strong>坑 7：忽略 dropped by kernel</strong><br>抓包丢弃意味着样本不完整，不能据此做精确统计。</div>
+<div class="card"><strong>坑 8：单端抓包下结论过重</strong><br>网络路径问题需要双端或中间设备证据。</div>
+</div>
+<h3>练习任务</h3>
+<ol>
+<li>用 <code>tcpdump -D</code> 找出可抓包接口，并解释每个接口可能对应的网络。</li>
+<li>对一个可访问的 HTTPS 服务抓 20 个 TCP 包，识别 SYN、SYN-ACK、ACK。</li>
+<li>写一个过滤器：只抓某 peer 的 TCP 443，排除 SSH。</li>
+<li>把 500 个包写入 pcap，再用 <code>tcpdump -r</code> 只筛选 RST 包。</li>
+<li>在客户端和服务端同时抓同一连接，对齐时间戳判断包是否中途丢失。</li>
+<li>查看 <code>ethtool -k</code> 和 <code>ethtool -S</code>，说明 offload/counter 对 pcap 解释的影响。</li>
+</ol>
+<pre><code># 本机安全练习：抓 loopback 上的 HTTP 请求
+python3 -m http.server 18080 &gt;/tmp/tcpdump-demo.log 2&gt;&amp;1 &amp;
+PID=$!
+sudo timeout 10 tcpdump -i lo -nn -c 20 'tcp port 18080' &amp;
+curl -s http://127.0.0.1:18080/ &gt;/dev/null
+wait
+kill "$PID" 2&gt;/dev/null || true</code></pre>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>tcpdump man page：选项、输出格式、pcap 写入和读取。</li>
+<li>pcap-filter man page：BPF 过滤表达式、host/net/port/proto、字节偏移过滤。</li>
+<li>libpcap 文档：抓包机制、snaplen、过滤器和平台差异。</li>
+<li>Linux man-pages：<code>packet(7)</code>、<code>socket(7)</code>、<code>tcp(7)</code>，理解内核网络栈和 socket 状态。</li>
+<li>NVIDIA NCCL 文档：环境变量、网络接口选择、NCCL_DEBUG 与 IB/RoCE 配置。</li>
+<li>Wireshark/tshark 文档：pcap 离线协议解析和 TCP 分析标注。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握接口选择和 BPF，再学习 TCP Flags 与 pcap 管理，最后把 tcpdump 证据和 <code>ss</code>、<code>ethtool</code>、NCCL 日志、交换机遥测结合起来。</p>
+</section>
+
+<div class="footer">tcpdump 深度教程 · AI Infra 网络抓包、BPF 过滤、pcap 取证、TCP 排障与生产安全</div>
+</div>
+</body>
+</html>

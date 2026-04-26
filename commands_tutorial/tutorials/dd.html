@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>dd 深度教程：AI Infra/Linux 顺序 IO、镜像与危险写入安全指南</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>dd 深度教程：AI Infra/Linux 顺序 IO、镜像与危险写入安全指南</h1>
+<p class="sub">这份教程面向 AI Infra、Linux 运维和平台工程场景，系统讲清楚 <code>dd</code> 的核心模型：从 <code>if</code> 读、按 <code>bs</code> 分块、用 <code>count</code>/<code>skip</code>/<code>seek</code> 控制范围，再写到 <code>of</code>。重点覆盖简单顺序 IO 测试、<code>oflag=direct</code> 与页缓存陷阱、<code>status=progress</code>、磁盘镜像、零填充的破坏性、dd 与 fio 的边界，以及生产排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">顺序 IO</span><span class="chip">if/of</span><span class="chip">bs/count</span><span class="chip">oflag=direct</span><span class="chip">page cache</span><span class="chip">status=progress</span><span class="chip">磁盘镜像</span><span class="chip">零填充风险</span><span class="chip">dd vs fio</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>dd</code> 是一个低层级字节搬运工具：它不理解文件系统语义，只按块把输入复制到输出，所以特别适合构造测试文件、镜像、截取数据和做粗粒度顺序吞吐观察。</div>
+<div class="danger"><strong>最重要原则：</strong> 任何写到块设备的 <code>of=/dev/...</code> 都可能不可逆地覆盖数据。先 <code>lsblk -o NAME,SIZE,MODEL,MOUNTPOINTS</code> 确认目标，再用文件路径演练；不确定时不要运行。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">dd 是什么，为什么 AI Infra 会用到</a></li>
+<li><a class="anchor" href="#s2">核心模型：输入、块、输出</a></li>
+<li><a class="anchor" href="#s3">基本语法：if/of/bs/count</a></li>
+<li><a class="anchor" href="#s4">单位、块大小与完整读</a></li>
+<li><a class="anchor" href="#s5">安全演练：只写普通文件</a></li>
+<li><a class="anchor" href="#s6">简单顺序写测试</a></li>
+<li><a class="anchor" href="#s7">简单顺序读测试</a></li>
+<li><a class="anchor" href="#s8">page cache 对结果的影响</a></li>
+<li><a class="anchor" href="#s9">oflag=direct 与对齐限制</a></li>
+<li><a class="anchor" href="#s10">status=progress 与进度观测</a></li>
+<li><a class="anchor" href="#s11">dd vs fio：何时换工具</a></li>
+<li><a class="anchor" href="#s12">磁盘镜像与恢复</a></li>
+<li><a class="anchor" href="#s13">零填充、擦除与破坏性写入</a></li>
+<li><a class="anchor" href="#s14">AI Infra 常见场景</a></li>
+<li><a class="anchor" href="#s15">故障排查流程</a></li>
+<li><a class="anchor" href="#s16">练习路线与检查清单</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. dd 是什么，为什么 AI Infra 会用到</h2>
+<p><code>dd</code> 的定位不是“性能基准测试工具”，而是“可控的字节复制工具”。它常被用来快速生成大文件、观察单线程顺序读写吞吐、制作磁盘镜像、从设备或文件中跳过/截取固定范围，以及验证存储路径是否出现明显异常。</p>
+<div class="grid-3">
+<div class="card"><strong>适合</strong><br>顺序读写粗测、生成训练缓存占位文件、镜像备份、截取固定偏移数据、验证磁盘写入链路。</div>
+<div class="card"><strong>不适合</strong><br>随机 IO、并发队列深度、多 job 混合负载、延迟分布、真实训练 dataloader 模拟。</div>
+<div class="card"><strong>核心风险</strong><br>参数短、权限高、反馈少；一旦把 <code>of</code> 指向错误磁盘，覆盖会立即发生。</div>
+</div>
+<pre><code># 生成一个 1 GiB 测试文件
+dd if=/dev/zero of=test-1g.bin bs=1M count=1024 status=progress
+
+# 从文件复制前 64 MiB
+dd if=dataset.bin of=head-64m.bin bs=1M count=64 status=progress
+
+# 查看 dd 的最终统计：复制字节数、耗时、平均吞吐
+dd if=test-1g.bin of=/dev/null bs=4M status=progress</code></pre>
+<div class="warn"><strong>生产提醒：</strong> <code>dd</code> 输出的 MB/s 只是本次单进程复制平均值。它不是训练吞吐、不是 P99 延迟、也不是存储系统容量规划结论。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：dd 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="dd 输入块输出模型">
+<rect x="16" y="16" width="1068" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="60" y="92" width="210" height="115" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="165" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">输入 if=</text><text x="165" y="162" text-anchor="middle" font-size="15">文件 / 设备 / stdin</text><text x="165" y="187" text-anchor="middle" font-size="15">/dev/zero / image.bin</text>
+<rect x="332" y="92" width="210" height="115" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="437" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">分块 bs=</text><text x="437" y="162" text-anchor="middle" font-size="15">每次读写大小</text><text x="437" y="187" text-anchor="middle" font-size="15">count / skip / seek</text>
+<rect x="604" y="92" width="210" height="115" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="709" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">转换 conv=</text><text x="709" y="162" text-anchor="middle" font-size="15">fsync / fdatasync</text><text x="709" y="187" text-anchor="middle" font-size="15">notrunc / noerror</text>
+<rect x="876" y="92" width="170" height="115" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="961" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">输出 of=</text><text x="961" y="162" text-anchor="middle" font-size="15">文件 / 设备</text><text x="961" y="187" text-anchor="middle" font-size="15">stdout</text>
+<line x1="270" y1="150" x2="332" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="542" y1="150" x2="604" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="814" y1="150" x2="876" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="145" y="332" width="810" height="150" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="372" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">dd = 按块复制字节，不理解文件系统或业务语义</text><text x="550" y="414" text-anchor="middle" font-size="16">if=/dev/zero of=file bs=1M count=1024 生成 1 GiB 文件</text><text x="550" y="446" text-anchor="middle" font-size="16">if=file of=/dev/null bs=4M 观察顺序读取路径</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">理解 dd 的关键是看清楚字节流：输入从哪里来、每块多大、复制多少块、输出写到哪里。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 基本语法：if/of/bs/count</h2>
+<pre><code>dd if=输入 of=输出 bs=块大小 count=块数量 [选项...]
+
+# 不写 if 时从标准输入读
+# 不写 of 时写到标准输出
+# bs * count 约等于总复制量</code></pre>
+<table><tr><th>参数</th><th>含义</th><th>AI Infra 常见用法</th></tr><tr><td><code>if=</code></td><td>input file，输入文件或设备</td><td><code>/dev/zero</code>、模型缓存文件、磁盘镜像</td></tr><tr><td><code>of=</code></td><td>output file，输出文件或设备</td><td>测试文件、镜像文件、块设备；最危险参数</td></tr><tr><td><code>bs=</code></td><td>一次读写的块大小</td><td><code>1M</code>、<code>4M</code>、<code>16M</code> 做顺序 IO 粗测</td></tr><tr><td><code>count=</code></td><td>复制多少个输入块</td><td>控制测试文件大小，避免写满磁盘</td></tr><tr><td><code>skip=</code></td><td>输入端跳过多少块</td><td>从镜像或大文件中截取偏移区域</td></tr><tr><td><code>seek=</code></td><td>输出端跳过多少块</td><td>写稀疏文件或覆盖指定偏移</td></tr></table>
+<pre><code># 复制 256 MiB：bs=1M count=256
+dd if=/dev/zero of=/tmp/dd-demo.bin bs=1M count=256 status=progress
+
+# 读取 256 MiB 丢弃，观察读取吞吐
+dd if=/tmp/dd-demo.bin of=/dev/null bs=1M count=256 status=progress
+
+# 从 1 GiB 偏移处截取 128 MiB
+dd if=large-cache.bin of=slice.bin bs=1M skip=1024 count=128 status=progress</code></pre>
+<div class="note"><strong>心算公式：</strong> <code>bs=4M count=256</code> 约等于 1 GiB；<code>bs=1M count=10240</code> 约等于 10 GiB。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 单位、块大小与完整读</h2>
+<p>GNU <code>dd</code> 支持多种大小后缀。工程沟通时要区分十进制 MB 与二进制 MiB：<code>M</code> 在 GNU coreutils 中通常表示 1024*1024 字节，适合 Linux 环境下的容量心算。</p>
+<table><tr><th>写法</th><th>大致含义</th><th>建议</th></tr><tr><td><code>bs=4K</code></td><td>4 KiB 级别块</td><td>贴近页大小，但对顺序吞吐测试调用次数多</td></tr><tr><td><code>bs=1M</code></td><td>1 MiB 级别块</td><td>简单、常用，适合生成文件与粗测</td></tr><tr><td><code>bs=4M</code></td><td>4 MiB 级别块</td><td>常用于顺序读写粗测，系统调用开销较低</td></tr><tr><td><code>bs=64M</code></td><td>大块复制</td><td>不一定更快，可能增加内存压力和进度颗粒度</td></tr></table>
+<pre><code># 比较不同 bs 的单进程顺序读差异
+for bs in 4K 1M 4M 16M; do
+  echo "== bs=$bs =="
+  dd if=/tmp/dd-demo.bin of=/dev/null bs="$bs" status=progress
+done
+
+# 管道或特殊输入可能出现短读，iflag=fullblock 可要求填满输入块
+gzip -dc dataset.bin.gz | dd of=dataset.bin bs=4M iflag=fullblock status=progress</code></pre>
+<div class="warn"><strong>块大小不是魔法旋钮：</strong> 如果后端瓶颈是网络、RAID、对象存储网关或文件系统锁，单纯增大 <code>bs</code> 不会把系统变快。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 安全演练：只写普通文件</h2>
+<p>学习 <code>dd</code> 时，应先把所有输出限定在临时目录的普通文件中。确认命令含义后，再讨论块设备。下面的演练不会写磁盘设备，只会在 <code>/tmp</code> 创建和删除测试文件。</p>
+<pre><code>set -euo pipefail
+mkdir -p /tmp/dd-lab
+cd /tmp/dd-lab
+
+# 确认当前目录，避免误删其他路径
+pwd
+
+# 生成 128 MiB 文件
+dd if=/dev/zero of=sample.bin bs=1M count=128 status=progress
+
+# 看文件大小和磁盘占用
+ls -lh sample.bin
+du -h sample.bin
+
+# 清理只删除本实验文件
+rm -f /tmp/dd-lab/sample.bin</code></pre>
+<div class="success"><strong>推荐习惯：</strong> 把危险命令中的 <code>of=</code> 先写成普通文件，确认大小、耗时和输出后，再考虑是否需要设备级操作。</div>
+</section>
+
+<section class="figure" id="fig-write-workflow">
+<h3>流程图：用 dd 做简单顺序写测试</h3>
+<svg viewBox="0 0 1100 710" width="100%" role="img" aria-label="dd 顺序写测试流程">
+<rect x="20" y="20" width="1060" height="670" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="89" text-anchor="middle" font-size="22" font-weight="700">选择测试目录</text>
+<rect x="88" y="175" width="230" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="203" y="211" text-anchor="middle" font-size="18" font-weight="700">确认剩余空间</text><text x="203" y="239" text-anchor="middle" font-size="14">df -h /path</text>
+<rect x="435" y="175" width="230" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="211" text-anchor="middle" font-size="18" font-weight="700">选择文件大小</text><text x="550" y="239" text-anchor="middle" font-size="14">bs * count</text>
+<rect x="782" y="175" width="230" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="897" y="211" text-anchor="middle" font-size="18" font-weight="700">选择缓存策略</text><text x="897" y="239" text-anchor="middle" font-size="14">buffered / direct</text>
+<rect x="235" y="368" width="270" height="84" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="370" y="401" text-anchor="middle" font-size="18" font-weight="700">运行 dd 写普通文件</text><text x="370" y="429" text-anchor="middle" font-size="14">status=progress</text>
+<rect x="595" y="368" width="270" height="84" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="730" y="401" text-anchor="middle" font-size="18" font-weight="700">落盘或绕缓存</text><text x="730" y="429" text-anchor="middle" font-size="14">conv=fdatasync / oflag=direct</text>
+<rect x="335" y="560" width="430" height="68" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="589" text-anchor="middle" font-size="19" font-weight="700">只把结果当成单线程顺序写粗略观察</text><text x="550" y="614" text-anchor="middle" font-size="14">严肃评测请使用 fio 并记录 job 参数</text>
+<line x1="550" y1="114" x2="203" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="550" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="897" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="203" y1="263" x2="370" y2="368" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="263" x2="370" y2="368" stroke="#94a3b8" stroke-width="3"/><line x1="897" y1="263" x2="730" y2="368" stroke="#94a3b8" stroke-width="3"/><line x1="370" y1="452" x2="455" y2="560" stroke="#94a3b8" stroke-width="3"/><line x1="730" y1="452" x2="645" y2="560" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">写测试必须先确认路径和空间；普通 buffered 写入很容易测到页缓存，不等价于真实设备写入能力。</div></section>
+
+<section class="section" id="s6">
+<h2>5. 简单顺序写测试</h2>
+<p>AI 训练节点常需要快速判断本地 NVMe、共享文件系统或挂载路径是否明显异常。<code>dd</code> 可以做一个低成本 smoke test，但要明确它只测单进程顺序写。</p>
+<pre><code># 先确认测试路径和剩余空间
+TEST_DIR=/mnt/nvme0/dd-test
+mkdir -p "$TEST_DIR"
+df -h "$TEST_DIR"
+
+# buffered 写：可能主要测到 page cache 和回写策略
+dd if=/dev/zero of="$TEST_DIR/write-buffered.bin" bs=1M count=4096 status=progress
+sync
+
+# 更保守：把数据同步到介质后再结束统计
+dd if=/dev/zero of="$TEST_DIR/write-fdatasync.bin" bs=1M count=4096 conv=fdatasync status=progress
+
+# 清理测试文件
+rm -f "$TEST_DIR"/write-buffered.bin "$TEST_DIR"/write-fdatasync.bin</code></pre>
+<table><tr><th>写法</th><th>统计含义</th><th>风险/ caveat</th></tr><tr><td><code>dd ...</code></td><td>写入系统缓存完成即可返回</td><td>可能高估真实落盘能力</td></tr><tr><td><code>conv=fdatasync</code></td><td>结束前同步文件数据</td><td>仍是单文件、单进程、顺序写</td></tr><tr><td><code>oflag=direct</code></td><td>尝试绕过页缓存</td><td>要求对齐，文件系统和设备行为可能不同</td></tr></table>
+<div class="warn"><strong>不要写满盘：</strong> 训练节点写满本地盘可能导致 kubelet、容器运行时、日志系统和 checkpoint 全部异常。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 简单顺序读测试</h2>
+<p>读测试要先有一个足够大的文件。文件过小会被缓存完全命中，得到的只是内存读速度。建议测试文件至少大于可用内存的一部分，或者使用 direct IO，并清楚记录方法。</p>
+<pre><code>TEST_DIR=/mnt/nvme0/dd-test
+mkdir -p "$TEST_DIR"
+
+# 先生成 8 GiB 文件，结束时同步数据
+dd if=/dev/zero of="$TEST_DIR/read-source.bin" bs=1M count=8192 conv=fdatasync status=progress
+
+# 普通读：第二次通常会因为 page cache 变快
+dd if="$TEST_DIR/read-source.bin" of=/dev/null bs=4M status=progress
+dd if="$TEST_DIR/read-source.bin" of=/dev/null bs=4M status=progress
+
+# direct 读：减少 page cache 干扰，但仍需理解文件系统和对齐限制
+dd if="$TEST_DIR/read-source.bin" of=/dev/null bs=4M iflag=direct status=progress
+
+rm -f "$TEST_DIR/read-source.bin"</code></pre>
+<div class="note"><strong>读测试解释：</strong> 如果第一次慢、第二次极快，多半是页缓存命中；这不是磁盘突然变快，而是数据已经在内存里。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. page cache 对结果的影响</h2>
+<p>Linux 会把文件读写缓存到内存中。<code>dd</code> 的默认 buffered IO 会经过 page cache，因此它的结果经常混合了内存缓存、文件系统回写策略、设备吞吐和后台 flush 行为。</p>
+<div class="grid-2">
+<div class="card"><strong>写入时</strong><br>命令可能在数据真正写入设备前返回；后续 <code>sync</code> 或后台回写才承担落盘成本。</div>
+<div class="card"><strong>读取时</strong><br>重复读取同一文件可能从内存命中，吞吐远高于设备能力。</div>
+<div class="card"><strong>清缓存</strong><br><code>echo 3 &gt; /proc/sys/vm/drop_caches</code> 需要 root，影响整机，不适合共享生产节点随意执行。</div>
+<div class="card"><strong>替代方案</strong><br>使用大于内存的文件、切换测试文件、使用 direct IO，或使用 fio 明确参数。</div>
+</div>
+<pre><code># 不推荐在共享训练节点随意清缓存；如必须在隔离测试机执行：
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# 更安全的做法：记录这是 buffered 测试，并用 direct IO 追加对照
+dd if=source.bin of=/dev/null bs=4M status=progress
+dd if=source.bin of=/dev/null bs=4M iflag=direct status=progress</code></pre>
+<div class="danger"><strong>平台影响：</strong> 在多租户 GPU 节点上清 page cache 可能让其他训练任务瞬间抖动。除非你拥有隔离测试窗口，否则不要把清缓存当成常规步骤。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. oflag=direct 与对齐限制</h2>
+<p><code>oflag=direct</code> 请求使用 direct IO 写输出，<code>iflag=direct</code> 请求 direct IO 读输入。它们可减少 page cache 干扰，但并不等于“真实业务性能”，也不保证所有文件系统、块设备、网络挂载都支持。</p>
+<table><tr><th>选项</th><th>方向</th><th>常见用途</th><th>常见失败</th></tr><tr><td><code>oflag=direct</code></td><td>写</td><td>顺序写粗测时减少缓存影响</td><td><code>Invalid argument</code>，块大小或地址未对齐</td></tr><tr><td><code>iflag=direct</code></td><td>读</td><td>顺序读粗测时减少缓存影响</td><td>文件系统不支持或设备限制</td></tr><tr><td><code>conv=fdatasync</code></td><td>写结束</td><td>结束前同步数据</td><td>不绕过缓存，只把落盘成本计入尾部</td></tr></table>
+<pre><code>TEST_DIR=/mnt/nvme0/dd-test
+mkdir -p "$TEST_DIR"
+
+# direct 写通常使用较大的、对齐友好的 bs
+dd if=/dev/zero of="$TEST_DIR/direct-write.bin" bs=4M count=2048 oflag=direct status=progress
+
+# direct 读
+dd if="$TEST_DIR/direct-write.bin" of=/dev/null bs=4M iflag=direct status=progress
+
+rm -f "$TEST_DIR/direct-write.bin"</code></pre>
+<div class="warn"><strong>解释 caveat：</strong> direct IO 绕过页缓存，但仍会受文件系统、块层调度、RAID、加密、网络存储和虚拟化层影响。结果只能说明“这条路径在这个参数下”的表现。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. status=progress 与进度观测</h2>
+<p>GNU coreutils 的 <code>dd</code> 支持 <code>status=progress</code>，会周期性显示已复制字节数、耗时和平均速度。没有该选项时，也可以向运行中的 <code>dd</code> 发送 <code>USR1</code> 信号打印统计。</p>
+<pre><code># 直接显示进度
+dd if=/dev/zero of=/tmp/progress-demo.bin bs=1M count=4096 status=progress
+
+# 另一个终端查看进程并打印一次统计
+pgrep -af 'dd if=/dev/zero'
+kill -USR1 &lt;dd-pid&gt;
+
+# 只输出最终统计，减少日志噪声
+dd if=/tmp/progress-demo.bin of=/dev/null bs=4M status=none
+rm -f /tmp/progress-demo.bin</code></pre>
+<table><tr><th>status 值</th><th>作用</th><th>场景</th></tr><tr><td><code>status=progress</code></td><td>显示运行中进度和最终统计</td><td>长时间复制、生成大文件</td></tr><tr><td><code>status=none</code></td><td>不显示统计</td><td>脚本中只关心退出码</td></tr><tr><td>默认</td><td>结束时显示统计</td><td>短命令或交互执行</td></tr></table>
+<div class="note"><strong>日志建议：</strong> 在 CI 或批量巡检中记录完整命令、路径、文件系统、内核版本和最终统计，否则单个 MB/s 数字很难复现。</div>
+</section>
+
+<section class="figure" id="fig-dd-fio">
+<h3>对比图：dd 与 fio 的边界</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="dd 与 fio 对比">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="26" font-weight="700">选 dd 还是 fio？</text>
+<rect x="90" y="130" width="410" height="365" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="295" y="178" text-anchor="middle" font-size="28" font-weight="700" fill="#1d4ed8">dd</text><text x="295" y="225" text-anchor="middle" font-size="16">单进程、顺序、快速 smoke test</text><text x="295" y="265" text-anchor="middle" font-size="15">生成文件 / 镜像 / 截取字节</text><text x="295" y="305" text-anchor="middle" font-size="15">粗看读写路径是否明显异常</text><text x="295" y="345" text-anchor="middle" font-size="15">脚本依赖少，几乎每台 Linux 都有</text><text x="295" y="407" text-anchor="middle" font-size="15" fill="#b91c1c">不能给出随机 IO、延迟分布或并发结论</text>
+<rect x="600" y="130" width="410" height="365" rx="24" fill="#ccfbf1" stroke="#99f6e4"/><text x="805" y="178" text-anchor="middle" font-size="28" font-weight="700" fill="#0f766e">fio</text><text x="805" y="225" text-anchor="middle" font-size="16">可配置 job、队列深度、读写比例</text><text x="805" y="265" text-anchor="middle" font-size="15">随机/顺序、多线程、多文件、多设备</text><text x="805" y="305" text-anchor="middle" font-size="15">输出 IOPS、带宽、延迟百分位</text><text x="805" y="345" text-anchor="middle" font-size="15">适合基准测试和容量规划证据</text><text x="805" y="407" text-anchor="middle" font-size="15" fill="#166534">严肃结论优先用 fio 并保存 job 文件</text>
+<rect x="260" y="540" width="580" height="54" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="574" text-anchor="middle" font-size="17">dd 用来快速发现“明显坏了”；fio 用来回答“到底有多快、多稳、尾延迟如何”。</text>
+</svg><div class="caption">dd 是好用的手电筒，不是完整的实验室。性能结论需要 fio 这类可复现实验工具。</div></section>
+
+<section class="section" id="s11">
+<h2>10. dd vs fio：何时换工具</h2>
+<table><tr><th>问题</th><th>dd 是否足够</th><th>推荐工具</th></tr><tr><td>这块盘顺序写是不是只有几十 MB/s？</td><td>通常足够做初筛</td><td><code>dd</code> + <code>iostat</code></td></tr><tr><td>训练 dataloader 随机读小文件是否卡？</td><td>不够</td><td><code>fio</code>、业务 profile</td></tr><tr><td>NVMe 在 QD=32 随机读 IOPS 如何？</td><td>不够</td><td><code>fio</code></td></tr><tr><td>制作磁盘镜像或截取文件范围</td><td>适合</td><td><code>dd</code></td></tr><tr><td>比较文件系统挂载参数的延迟分布</td><td>不够</td><td><code>fio</code>、<code>blktrace</code>、eBPF 工具</td></tr></table>
+<pre><code># dd：快速 smoke test
+dd if=/dev/zero of=/mnt/nvme0/smoke.bin bs=4M count=1024 conv=fdatasync status=progress
+
+# fio：严肃顺序写基准的起点示例
+fio --name=seqwrite --directory=/mnt/nvme0 --size=4G --rw=write \
+    --bs=1M --iodepth=16 --numjobs=1 --direct=1 --group_reporting</code></pre>
+<div class="success"><strong>决策规则：</strong> 用 <code>dd</code> 快速定位“路径是否离谱”；只要要比较方案、出报告、做容量规划，就切到 <code>fio</code>。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 磁盘镜像与恢复</h2>
+<p><code>dd</code> 能把块设备复制成镜像文件，也能把镜像写回设备。这是它最有用也最危险的能力之一。读取设备做镜像通常风险较低；把镜像写回设备则会覆盖目标。</p>
+<pre><code># 只读方向：把设备保存为镜像文件
+lsblk -o NAME,SIZE,MODEL,MOUNTPOINTS
+sudo dd if=/dev/sdX of=/backup/sdX-$(date +%F).img bs=4M status=progress conv=fsync
+
+# 镜像压缩：节省空间，但恢复前要验证
+sudo dd if=/dev/sdX bs=4M status=progress | gzip -1 &gt; /backup/sdX.img.gz
+
+# 查看镜像文件分区，可在隔离环境中使用 loop 设备
+sudo losetup --find --show --partscan /backup/sdX-2026-04-25.img
+lsblk</code></pre>
+<div class="danger"><strong>写回镜像前必须确认：</strong> 目标设备大小、型号、序列号、挂载点都要核对。不要在生产节点上凭 <code>/dev/sdX</code> 的字母猜目标盘。</div>
+<pre><code># 危险示例：写回镜像会覆盖目标设备
+lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINTS
+read -rp "确认目标 /dev/sdX 会被覆盖，输入 YES 继续: " ans
+[ "$ans" = YES ] || exit 1
+sudo dd if=/backup/sdX.img of=/dev/sdX bs=4M status=progress conv=fsync</code></pre>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 零填充、擦除与破坏性写入</h2>
+<p><code>if=/dev/zero of=...</code> 可以把输出写成全 0。写到普通文件时它只是生成零文件；写到块设备时，它会覆盖磁盘内容。对 SSD/NVMe，零填充也不等于安全擦除，可能增加写放大；安全擦除应优先使用设备支持的 sanitize/secure erase 流程。</p>
+<pre><code># 安全：只在临时目录创建一个零文件
+dd if=/dev/zero of=/tmp/zero-file.bin bs=1M count=1024 status=progress
+rm -f /tmp/zero-file.bin
+
+# 危险：下面命令会覆盖整块设备，默认不要运行
+lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINTS
+read -rp "确认要清零 /dev/sdX，输入 WIPE: " ans
+[ "$ans" = WIPE ] || exit 1
+sudo dd if=/dev/zero of=/dev/sdX bs=16M status=progress oflag=direct</code></pre>
+<div class="danger"><strong>零填充危险：</strong> <code>of=/dev/sda</code> 与 <code>of=/dev/sdb</code> 只差一个字符，但后果可能是系统盘被覆盖。复制粘贴前先把目标设备路径单独核对一遍。</div>
+<table><tr><th>目标</th><th>更合适的做法</th><th>说明</th></tr><tr><td>释放文件空间</td><td><code>rm</code> 或应用级清理</td><td>不需要 dd 清零文件</td></tr><tr><td>安全擦除 SSD/NVMe</td><td><code>blkdiscard</code>、NVMe sanitize、厂商工具</td><td>依设备和合规要求选择</td></tr><tr><td>生成占位文件</td><td><code>dd</code> 或 <code>fallocate</code></td><td><code>fallocate</code> 更快但可能创建未实际写入的空间</td></tr></table>
+</section>
+
+<section class="section" id="s14">
+<h2>13. AI Infra 常见场景</h2>
+<div class="grid-2">
+<div class="card"><strong>节点验收 smoke test</strong><br>在本地 NVMe 上写 4-16 GiB 普通文件，观察吞吐是否和同类机器差几个数量级。</div>
+<div class="card"><strong>缓存盘预热/占位</strong><br>快速创建固定大小文件验证 quota、挂载权限、inode 和路径可写性。</div>
+<div class="card"><strong>镜像备份</strong><br>对离线盘制作镜像，便于取证或迁移；写回前必须核对设备。</div>
+<div class="card"><strong>故障隔离</strong><br>把业务 dataloader 慢的问题拆成：磁盘顺序读、随机读、小文件元数据、网络路径、CPU 解码。</div>
+</div>
+<pre><code># 节点验收：记录硬件和挂载信息
+hostname
+uname -a
+lsblk -o NAME,SIZE,MODEL,ROTA,MOUNTPOINTS
+findmnt /mnt/nvme0
+
+# 单线程顺序写 smoke test
+dd if=/dev/zero of=/mnt/nvme0/dd-smoke.bin bs=4M count=4096 conv=fdatasync status=progress
+
+# 单线程顺序读 smoke test
+dd if=/mnt/nvme0/dd-smoke.bin of=/dev/null bs=4M iflag=direct status=progress
+rm -f /mnt/nvme0/dd-smoke.bin</code></pre>
+<div class="note"><strong>和训练性能的关系：</strong> GPU 利用率低不一定是磁盘慢。可能是小文件过多、解码 CPU 瓶颈、网络抖动、分布式采样、容器限速或数据格式问题。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障/安全图：dd 结果异常或命令危险时怎么查</h3>
+<svg viewBox="0 0 1100 730" width="100%" role="img" aria-label="dd 排障与安全流程">
+<rect x="20" y="20" width="1060" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="280" height="66" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="89" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">dd 结果异常或将写设备</text>
+<rect x="75" y="160" width="220" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="195" text-anchor="middle" font-size="17" font-weight="700">先确认目标</text><text x="185" y="224" text-anchor="middle" font-size="14">lsblk / findmnt / df</text>
+<rect x="320" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="195" text-anchor="middle" font-size="17" font-weight="700">确认缓存策略</text><text x="430" y="224" text-anchor="middle" font-size="14">buffered / direct</text>
+<rect x="565" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="675" y="195" text-anchor="middle" font-size="17" font-weight="700">确认块大小</text><text x="675" y="224" text-anchor="middle" font-size="14">bs / count / 对齐</text>
+<rect x="810" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="920" y="195" text-anchor="middle" font-size="17" font-weight="700">确认系统压力</text><text x="920" y="224" text-anchor="middle" font-size="14">iostat / dmesg</text>
+<rect x="165" y="355" width="250" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="290" y="391" text-anchor="middle" font-size="18" font-weight="700">普通文件复现</text><text x="290" y="419" text-anchor="middle" font-size="14">不要先写块设备</text>
+<rect x="430" y="355" width="250" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="555" y="391" text-anchor="middle" font-size="18" font-weight="700">direct / fdatasync 对照</text><text x="555" y="419" text-anchor="middle" font-size="14">解释 page cache</text>
+<rect x="695" y="355" width="250" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="820" y="391" text-anchor="middle" font-size="18" font-weight="700">换 fio 做复验</text><text x="820" y="419" text-anchor="middle" font-size="14">需要严肃结论时</text>
+<rect x="305" y="565" width="490" height="74" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="598" text-anchor="middle" font-size="20" font-weight="700">危险写入：停、查、确认、再执行</text><text x="550" y="623" text-anchor="middle" font-size="14">任何不确定都应退出，而不是靠运气运行</text>
+<line x1="550" y1="114" x2="185" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="430" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="675" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="920" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="185" y1="252" x2="290" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="430" y1="252" x2="555" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="675" y1="252" x2="555" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="920" y1="252" x2="820" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="290" y1="447" x2="430" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="555" y1="447" x2="555" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="820" y1="447" x2="675" y2="565" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">dd 排障同时是安全流程：先确认目标，再解释缓存，再复验工具，不要在设备上试错。</div></section>
+
+<section class="section" id="s15">
+<h2>14. 故障排查流程</h2>
+<p>当 <code>dd</code> 速度“看起来不对”时，先判断是命令测法问题，还是存储路径真的异常。下面的流程适合 AI 节点、容器宿主机、裸机和虚拟机。</p>
+<pre><code># 1. 记录路径和挂载
+TARGET=/mnt/nvme0
+df -h "$TARGET"
+findmnt "$TARGET"
+lsblk -o NAME,SIZE,MODEL,ROTA,MOUNTPOINTS
+
+# 2. 记录系统压力
+iostat -xz 1 5
+dmesg | tail -n 80
+
+# 3. buffered 与 direct 对照
+dd if=/dev/zero of="$TARGET/dd-check.bin" bs=4M count=1024 conv=fdatasync status=progress
+dd if="$TARGET/dd-check.bin" of=/dev/null bs=4M iflag=direct status=progress
+rm -f "$TARGET/dd-check.bin"
+
+# 4. 如果要下结论，用 fio 复验并保存参数
+fio --name=readcheck --directory="$TARGET" --size=4G --rw=read \
+    --bs=1M --iodepth=16 --direct=1 --numjobs=1 --group_reporting</code></pre>
+<div class="grid-2">
+<div class="card"><strong><code>Invalid argument</code></strong><br>常见于 direct IO 对齐或文件系统不支持。尝试 <code>bs=4M</code>，或去掉 direct 做对照。</div>
+<div class="card"><strong><code>No space left on device</code></strong><br>测试文件太大、quota 满、容器 writable layer 满。先 <code>df -h</code> 和 <code>df -i</code>。</div>
+<div class="card"><strong>速度忽高忽低</strong><br>可能是 page cache、后台 flush、共享盘争用、热迁移、网络存储抖动。</div>
+<div class="card"><strong>写入很快但 sync 很慢</strong><br>前面写入多在缓存，真正落盘成本集中在同步阶段。</div>
+</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 练习路线与检查清单</h2>
+<h3>第一阶段：理解复制模型</h3><ul><li>用 <code>/dev/zero</code> 生成 64 MiB、1 GiB 文件。</li><li>改变 <code>bs</code> 和 <code>count</code>，确认总大小如何变化。</li><li>用 <code>of=/dev/null</code> 观察读取路径。</li></ul>
+<h3>第二阶段：理解缓存与 direct IO</h3><ul><li>连续读取同一个文件两次，观察第二次是否变快。</li><li>比较 <code>conv=fdatasync</code>、<code>oflag=direct</code>、普通 buffered 写。</li><li>记录测试目录所在文件系统和挂载方式。</li></ul>
+<h3>第三阶段：生产安全</h3><ul><li>每次写设备前运行 <code>lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINTS</code>。</li><li>把危险命令先改成普通文件演练。</li><li>需要性能结论时写 fio job 或完整命令，避免只贴一个速度数字。</li></ul>
+<h3>安全检查清单</h3>
+<table><tr><th>检查项</th><th>通过标准</th></tr><tr><td>目标路径</td><td><code>of=</code> 指向预期普通文件；如果是设备，已确认型号、序列号、挂载点</td></tr><tr><td>容量</td><td><code>bs * count</code> 小于可用空间，并留有系统余量</td></tr><tr><td>缓存解释</td><td>结果标注 buffered、fdatasync 或 direct</td></tr><tr><td>清理</td><td>测试文件明确删除，不留下占满盘的垃圾文件</td></tr><tr><td>结论边界</td><td>没有把 dd 单点结果夸大成完整存储性能报告</td></tr></table>
+<pre><code># 一个安全、可复现的小练习
+mkdir -p /tmp/dd-practice && cd /tmp/dd-practice
+dd if=/dev/zero of=a.bin bs=1M count=256 conv=fdatasync status=progress
+dd if=a.bin of=/dev/null bs=4M status=progress
+dd if=a.bin of=/dev/null bs=4M iflag=direct status=progress
+ls -lh a.bin
+rm -f a.bin</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>GNU Coreutils Manual：<code>dd</code> invocation、block size、<code>iflag</code>/<code>oflag</code>、<code>status</code>、<code>conv</code>。</li><li>Linux man-pages：<code>dd(1)</code>、<code>open(2)</code> 中 <code>O_DIRECT</code> 相关说明。</li><li>fio 官方文档：job file、<code>rw</code>、<code>bs</code>、<code>iodepth</code>、<code>direct</code>、延迟统计。</li><li>Linux 内核文档与发行版手册：page cache、writeback、block layer、NVMe sanitize/secure erase。</li><li>生产排障工具：<code>iostat</code>、<code>iotop</code>、<code>pidstat</code>、<code>dmesg</code>、eBPF/trace 工具。</li></ul><p class="mini">建议阅读顺序：先掌握 <code>if/of/bs/count</code> 和危险边界，再理解 page cache 与 direct IO，最后用 fio 建立严肃性能测试方法。</p></section>
+<div class="footer">dd 深度教程 · AI Infra/Linux · 顺序 IO、页缓存、direct IO、磁盘镜像、零填充风险与生产排障</div>
+</div>
+</body>
+</html>

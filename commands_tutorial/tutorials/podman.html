@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>podman 深度教程：AI Infra 的无守护进程容器实践</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>podman 深度教程：AI Infra 的无守护进程容器实践</h1>
+<p class="sub">这份教程围绕 Linux 命令 <code>podman</code> 展开，面向 AI Infra、GPU 节点、训练容器、开发镜像和长期服务。重点不是把 Docker 命令逐条翻译成 Podman，而是建立清晰模型：Podman 无中心守护进程，直接调用 OCI runtime 管理容器；支持 rootless/rootful 两种运行方式；能构建和运行镜像、管理 pods、挂载数据集与模型缓存、接入 GPU、生成 systemd 单元，并在安全边界更严格的环境中交付训练或推理工作负载。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">daemonless</span><span class="chip">rootless/rootful</span><span class="chip">GPU passthrough</span><span class="chip">volumes</span><span class="chip">networking</span><span class="chip">pods</span><span class="chip">systemd</span><span class="chip">security</span><span class="chip">troubleshooting</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>podman</code> 是无守护进程的 OCI 容器工具：你执行 <code>podman run</code> 时，当前用户直接创建容器进程、网络、挂载和 cgroup，而不是把请求交给一个长期运行的 Docker daemon。</div>
+<div class="success"><strong>实践原则：</strong> 开发和单用户训练优先 rootless；需要特权设备、主机网络、底层驱动调试或集群节点守护任务时再选择 rootful。任何删除镜像、清理卷、挂载宿主机目录和开放端口的操作，都先列出目标再执行。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">Podman 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：CLI、镜像、容器、runtime</a></li>
+<li><a class="anchor" href="#s3">安装、版本与运行环境检查</a></li>
+<li><a class="anchor" href="#s4">基本命令：run、ps、exec、logs、inspect</a></li>
+<li><a class="anchor" href="#s5">镜像构建：Containerfile 到 AI 镜像</a></li>
+<li><a class="anchor" href="#s6">rootless 与 rootful 怎么选</a></li>
+<li><a class="anchor" href="#s7">GPU 透传与训练容器 caveats</a></li>
+<li><a class="anchor" href="#s8">卷、数据集、模型缓存与 SELinux 标签</a></li>
+<li><a class="anchor" href="#s9">网络、端口与 rootless 限制</a></li>
+<li><a class="anchor" href="#s10">Pods：多容器共享网络命名空间</a></li>
+<li><a class="anchor" href="#s11">systemd 集成与长期运行服务</a></li>
+<li><a class="anchor" href="#s12">镜像仓库、登录、推送与离线迁移</a></li>
+<li><a class="anchor" href="#s13">安全模型：capabilities、userns、seccomp</a></li>
+<li><a class="anchor" href="#s14">Podman vs Docker vs nerdctl</a></li>
+<li><a class="anchor" href="#s15">训练容器排障手册</a></li>
+<li><a class="anchor" href="#s16">安全清理、检查清单与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. Podman 是什么</h2>
+<p><code>podman</code> 是一个管理 OCI 镜像和容器的命令行工具。它可以拉取镜像、构建镜像、运行容器、管理网络和卷，也可以把容器组织成 pod。它的命令体验接近 Docker CLI，但运行架构不同：Podman 默认没有中央 daemon，容器进程通常是当前用户的子进程或由 systemd 管理。</p>
+<div class="grid-3">
+<div class="card"><strong>AI Infra 价值</strong><br>在 GPU 节点上隔离训练环境、锁定 CUDA/Python/框架版本、复现实验依赖，并减少用户直接污染宿主机。</div>
+<div class="card"><strong>无守护进程</strong><br>没有一个 root daemon 代替所有用户创建容器。rootless 模式下，用户权限边界更清楚，适合多租户开发节点。</div>
+<div class="card"><strong>OCI 兼容</strong><br>镜像格式和 runtime 生态与 Docker、containerd、Kubernetes 有大量重叠，便于在本机和集群之间迁移。</div>
+</div>
+<pre><code># 拉取并运行一个基础镜像
+podman run --rm quay.io/podman/hello
+
+# 进入交互式 Ubuntu 容器
+podman run --rm -it ubuntu:24.04 bash
+
+# 查看当前用户能看到的容器
+podman ps -a
+
+# 查看 Podman 运行环境、rootless 状态、runtime、网络后端
+podman info</code></pre>
+<div class="warn"><strong>不要机械替换：</strong> 很多 <code>docker</code> 命令可以改成 <code>podman</code>，但 GPU、rootless 网络、SELinux 卷标签、systemd 管理和 build cache 的行为需要单独验证。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 整体模型：CLI、镜像、容器、runtime</h2>
+<p>Podman 的核心对象仍然是镜像、容器、网络、卷和 pod。区别在于控制面更轻：<code>podman</code> 命令读取本地 storage 和配置，然后调用底层组件创建容器进程。AI 节点排障时，要同时看 Podman、OCI runtime、cgroup、设备节点、驱动和挂载。</p>
+<div class="figure">
+<h3>信息图：Podman 在 AI 节点上的执行链路</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="Podman 整体模型">
+<rect x="16" y="16" width="1068" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="60" y="85" width="180" height="96" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="124" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">podman CLI</text><text x="150" y="154" text-anchor="middle" font-size="14">当前用户执行</text>
+<rect x="315" y="85" width="190" height="96" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="410" y="124" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">本地状态</text><text x="410" y="154" text-anchor="middle" font-size="14">images / containers</text>
+<rect x="580" y="85" width="190" height="96" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="675" y="124" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">OCI runtime</text><text x="675" y="154" text-anchor="middle" font-size="14">crun / runc</text>
+<rect x="845" y="85" width="190" height="96" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="940" y="124" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">容器进程</text><text x="940" y="154" text-anchor="middle" font-size="14">Python / NCCL / 服务</text>
+<rect x="140" y="315" width="820" height="170" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="355" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">容器不是虚拟机：共享宿主机内核，通过 namespace、cgroup、mount、seccomp 隔离</text><text x="550" y="395" text-anchor="middle" font-size="16">GPU 不是自动出现：需要宿主机驱动、设备节点、OCI hook 或 CDI 设备声明</text><text x="550" y="425" text-anchor="middle" font-size="16">数据也不是自动持久化：训练数据、checkpoint、缓存通常应显式挂载 volume/bind mount</text>
+<line x1="240" y1="133" x2="315" y2="133" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="505" y1="133" x2="580" y2="133" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="770" y1="133" x2="845" y2="133" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">Podman 管的是容器生命周期；训练能否跑通还取决于宿主机 GPU 驱动、cgroup、网络、卷权限和镜像内用户态库。</div>
+</div>
+<table><tr><th>对象</th><th>Podman 命令</th><th>AI Infra 关注点</th></tr><tr><td>镜像</td><td><code>podman pull/build/images/push</code></td><td>CUDA、Python、PyTorch、NCCL、系统包和镜像大小</td></tr><tr><td>容器</td><td><code>podman run/exec/logs/inspect</code></td><td>训练命令、退出码、资源限制、GPU 可见性</td></tr><tr><td>卷</td><td><code>podman volume create/ls/inspect</code></td><td>数据集、模型权重、checkpoint、缓存持久化</td></tr><tr><td>网络</td><td><code>podman network ls/create</code></td><td>Jupyter、TensorBoard、推理服务、分布式训练端口</td></tr><tr><td>Pod</td><td><code>podman pod create/ps/inspect</code></td><td>共享 localhost 的 sidecar、exporter、代理或多服务开发环境</td></tr></table>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、版本与运行环境检查</h2>
+<p>Podman 的行为会受发行版、内核、cgroup v2、网络后端、storage driver、SELinux/AppArmor、GPU runtime 集成影响。教程和工单里不要只写“Podman 不行”，先把环境证据收集完整。</p>
+<pre><code># 版本和编译信息
+podman version
+
+# 最重要的环境报告：rootless、runtime、cgroup、store、networkBackend
+podman info
+
+# 当前用户是否 rootless
+podman info --format '{{.Host.Security.Rootless}}'
+
+# 查看运行时和 cgroup 版本
+podman info --format 'runtime={{.Host.OCIRuntime.Name}} cgroup={{.Host.CgroupsVersion}}'
+
+# 查看镜像和容器存储占用
+podman system df</code></pre>
+<table><tr><th>检查项</th><th>为什么重要</th><th>常见影响</th></tr><tr><td><code>Rootless</code></td><td>决定权限、网络、低端口绑定、设备访问方式</td><td>GPU、InfiniBand、host network、volume 权限可能不同</td></tr><tr><td><code>CgroupsVersion</code></td><td>资源限制和 rootless 管理更依赖 cgroup v2</td><td><code>--memory</code>、<code>--cpus</code>、systemd scope 行为</td></tr><tr><td><code>networkBackend</code></td><td>rootless 端口和吞吐表现受后端影响</td><td><code>pasta</code>、<code>slirp4netns</code> 行为不完全一致</td></tr><tr><td><code>graphDriverName</code></td><td>镜像层存储性能和兼容性</td><td>构建大 AI 镜像时影响明显</td></tr><tr><td>LSM</td><td>SELinux/AppArmor 会约束挂载和权限</td><td>目录挂载可能需要 <code>:Z</code> 或策略调整</td></tr></table>
+<div class="note"><strong>工单模板：</strong> 报告 Podman 问题时至少贴 <code>podman version</code>、<code>podman info</code> 中 rootless/cgroup/runtime/network/storage、完整 <code>podman run</code> 命令和容器日志。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 基本命令：run、ps、exec、logs、inspect</h2>
+<p>日常使用可以先掌握一条主线：用镜像启动容器，查看容器状态，进入容器调试，读取日志，最后删除临时容器。训练容器推荐显式命名，避免后续排障时只看到随机名称。</p>
+<pre><code># 临时运行命令，退出后自动删除容器
+podman run --rm ubuntu:24.04 cat /etc/os-release
+
+# 创建一个可复用的训练容器名称
+podman run -d --name train-demo \
+  -v "$PWD":/workspace:Z \
+  -w /workspace \
+  python:3.12-slim \
+  sleep infinity
+
+# 查看容器
+podman ps
+podman ps -a
+
+# 进入容器
+podman exec -it train-demo bash
+
+# 查看日志和退出码
+podman logs --tail=100 train-demo
+podman inspect train-demo --format 'status={{.State.Status}} exit={{.State.ExitCode}}'
+
+# 先确认目标，再删除
+podman ps -a --filter name=train-demo
+podman rm -f train-demo</code></pre>
+<div class="grid-4">
+<div class="card"><strong><code>--rm</code></strong><br>适合一次性命令和验证环境。</div>
+<div class="card"><strong><code>--name</code></strong><br>给训练任务固定名字，便于 logs/exec/inspect。</div>
+<div class="card"><strong><code>-w</code></strong><br>设置容器内工作目录，避免脚本路径混乱。</div>
+<div class="card"><strong><code>-e</code></strong><br>传递代理、HF_HOME、NCCL 等环境变量。</div>
+</div>
+<div class="warn"><strong>日志现实：</strong> <code>podman logs</code> 只能看到 stdout/stderr。训练框架如果把日志写到文件，记得挂载日志目录或在命令中同时输出到 stdout。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 镜像构建：Containerfile 到 AI 镜像</h2>
+<p>Podman 使用 <code>Containerfile</code> 或 <code>Dockerfile</code> 构建镜像。AI 镜像通常大、层多、构建慢，应把系统包、Python 依赖、模型缓存和源码复制顺序设计清楚，避免每次改一行代码都重装整个 PyTorch 环境。</p>
+<pre><code># Containerfile 示例：开发型 CPU 镜像
+cat &gt; Containerfile &lt;&lt'EOF'
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+WORKDIR /workspace
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install -r /tmp/requirements.txt
+COPY . /workspace
+CMD ["python", "train.py"]
+EOF
+
+# 构建并打标签
+podman build -t localhost/ai/train-demo:dev .
+
+# 查看镜像层和大小
+podman images localhost/ai/train-demo
+podman history localhost/ai/train-demo:dev
+
+# 运行构建结果
+podman run --rm -v "$PWD/data":/data:Z localhost/ai/train-demo:dev</code></pre>
+<table><tr><th>构建习惯</th><th>原因</th><th>AI 场景例子</th></tr><tr><td>先复制依赖清单，再复制源码</td><td>最大化缓存命中</td><td><code>requirements.txt</code>、<code>environment.yml</code> 单独 COPY</td></tr><tr><td>固定基础镜像 tag</td><td>提升可复现性</td><td>不要在生产镜像里长期使用裸 <code>latest</code></td></tr><tr><td>清理包管理器缓存</td><td>降低镜像体积</td><td><code>rm -rf /var/lib/apt/lists/*</code></td></tr><tr><td>把数据集放在卷里</td><td>避免镜像巨大且不可复用</td><td><code>-v /datasets:/datasets:ro,Z</code></td></tr></table>
+<div class="note"><strong>命名建议：</strong> 本地实验镜像可用 <code>localhost/team/project:dev</code>；准备推送时再改成真实 registry 路径，如 <code>registry.example.com/ai/train:2026-04-25</code>。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. rootless 与 rootful 怎么选</h2>
+<p>Rootless 是 Podman 的重要能力：普通用户可以运行容器，容器内的 root 会映射到宿主机上的非特权 UID/GID 范围。Rootful 则由 root 管理，设备、网络和低层系统能力更完整，但误操作影响更大。</p>
+<div class="figure">
+<h3>对比图：rootless 与 rootful 的权限边界</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="rootless rootful 对比">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">Podman 运行模式选择</text>
+<rect x="90" y="120" width="420" height="360" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="300" y="165" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">rootless</text><text x="300" y="210" text-anchor="middle" font-size="16">普通用户启动容器</text><text x="300" y="245" text-anchor="middle" font-size="16">容器 root 映射到宿主机非特权 UID</text><text x="300" y="280" text-anchor="middle" font-size="16">更适合开发、实验、单用户训练</text><text x="300" y="315" text-anchor="middle" font-size="16">网络和设备访问可能有限制</text><rect x="155" y="370" width="290" height="62" rx="12" fill="#eff6ff" stroke="#bfdbfe"/><text x="300" y="407" text-anchor="middle" font-size="15">优先默认选择，除非能力不够</text>
+<rect x="590" y="120" width="420" height="360" rx="24" fill="#ffedd5" stroke="#fdba74"/><text x="800" y="165" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">rootful</text><text x="800" y="210" text-anchor="middle" font-size="16">root 用户或 sudo 启动容器</text><text x="800" y="245" text-anchor="middle" font-size="16">设备、网络、cgroup 控制更直接</text><text x="800" y="280" text-anchor="middle" font-size="16">适合节点守护、特权调试、低层设备</text><text x="800" y="315" text-anchor="middle" font-size="16">误挂载和特权容器风险更高</text><rect x="655" y="370" width="290" height="62" rx="12" fill="#fff7ed" stroke="#fed7aa"/><text x="800" y="407" text-anchor="middle" font-size="15">用前写清楚为什么必须 rootful</text>
+<rect x="245" y="535" width="610" height="54" rx="14" fill="#f0fdf4" stroke="#86efac"/><text x="550" y="568" text-anchor="middle" font-size="17">决策顺序：先 rootless 验证功能；功能缺口明确后，再最小化 rootful 权限</text>
+</svg>
+<div class="caption">Rootless 降低了单用户容器对宿主机的影响面；rootful 则换来更完整的系统能力。</div>
+</div>
+<table><tr><th>问题</th><th>rootless</th><th>rootful</th></tr><tr><td>普通开发和实验</td><td>推荐</td><td>通常没必要</td></tr><tr><td>访问 GPU</td><td>可行，但取决于 CDI/hook、权限、cgroup</td><td>通常更少权限问题</td></tr><tr><td>绑定 80/443 等低端口</td><td>通常受限，需要端口转发或系统配置</td><td>直接可行，但风险更高</td></tr><tr><td>host network</td><td>支持度和语义需按版本/后端验证</td><td>更接近 Docker rootful 行为</td></tr><tr><td>多租户安全</td><td>更友好</td><td>需要更强的节点治理</td></tr></table>
+<pre><code># 检查当前用户 subordinate uid/gid，rootless 依赖它们做用户命名空间映射
+grep "^$USER:" /etc/subuid /etc/subgid
+
+# 迁移或修复 rootless storage 后，常见的重建用户命名空间映射动作
+podman system migrate
+
+# 对比 rootless/rootful 信息
+podman info --format '{{.Host.Security.Rootless}}'
+sudo podman info --format '{{.Host.Security.Rootless}}'</code></pre>
+<div class="danger"><strong>避免偷懒：</strong> 不要因为一个权限错误就直接长期使用 <code>--privileged</code> 或 <code>sudo podman</code>。先确认缺的是设备、capability、SELinux 标签、cgroup 权限还是文件所有权。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. GPU 透传与训练容器 caveats</h2>
+<p>Podman 本身不提供 GPU 驱动。GPU 能否在容器中工作，取决于宿主机驱动、用户态库、设备节点、NVIDIA/AMD 运行时集成、CDI 设备描述或 OCI hook。AI Infra 中，GPU 问题要先确认宿主机可用，再确认容器可见。</p>
+<pre><code># 1. 先在宿主机验证 GPU
+nvidia-smi
+
+# 2. 查看 Podman 是否能看到 CDI 设备（如果平台使用 CDI）
+podman info --format '{{json .Host.CDIPackages}}'
+podman run --rm --device nvidia.com/gpu=all \
+  docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# 3. 旧环境可能依赖 OCI hook，需由节点管理员安装和验证
+podman run --rm \
+  --hooks-dir=/usr/share/containers/oci/hooks.d \
+  docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# 4. 训练示例：显式挂载数据、缓存、输出目录
+podman run --rm -it --name torch-train \
+  --device nvidia.com/gpu=all \
+  --shm-size=16g \
+  -e HF_HOME=/cache/huggingface \
+  -e NCCL_DEBUG=INFO \
+  -v /datasets/imagenet:/datasets/imagenet:ro,Z \
+  -v "$HOME/.cache/huggingface":/cache/huggingface:Z \
+  -v "$PWD/outputs":/outputs:Z \
+  localhost/ai/torch:cuda12 \
+  python train.py --data /datasets/imagenet --out /outputs</code></pre>
+<table><tr><th>症状</th><th>优先检查</th><th>说明</th></tr><tr><td><code>nvidia-smi</code> 在宿主机失败</td><td>驱动、内核模块、MIG 状态</td><td>容器层无法修复宿主机驱动问题</td></tr><tr><td>宿主机成功，容器内找不到 GPU</td><td><code>--device</code>、CDI/hook、设备权限</td><td>不同发行版和 Podman 版本配置方式可能不同</td></tr><tr><td>能看到 GPU，但框架报 CUDA 库错误</td><td>镜像内 CUDA 用户态库与驱动兼容性</td><td>宿主机驱动版本要支持镜像内 CUDA runtime</td></tr><tr><td>NCCL 初始化失败</td><td>网络、IPC、IB/RDMA 设备、NCCL 环境变量</td><td>多机训练不是只透传 GPU，还要透传网络设备和端口</td></tr></table>
+<div class="warn"><strong>GPU caveat：</strong> <code>--device nvidia.com/gpu=all</code> 是 CDI 风格示例；如果你的节点仍用 OCI hook 或厂商专用工具，命令会不同。以节点基线文档和 <code>podman info</code> 为准。</div>
+<div class="note"><strong>共享内存：</strong> PyTorch DataLoader、NCCL 和大 batch 训练常因 <code>/dev/shm</code> 太小失败。先用 <code>--shm-size</code> 明确设置，而不是盲目加 <code>--privileged</code>。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 卷、数据集、模型缓存与 SELinux 标签</h2>
+<p>训练容器的生命周期通常短于数据。数据集、模型权重、Hugging Face 缓存、checkpoint、TensorBoard 日志应该放在显式挂载的宿主机目录或 Podman volume 中，而不是写进容器可写层。</p>
+<pre><code># bind mount：宿主机目录挂载到容器内
+mkdir -p data outputs cache
+podman run --rm -it \
+  -v "$PWD/data":/data:ro,Z \
+  -v "$PWD/outputs":/outputs:Z \
+  -v "$PWD/cache":/cache:Z \
+  -e HF_HOME=/cache/huggingface \
+  localhost/ai/train:dev \
+  python train.py --data /data --out /outputs
+
+# named volume：适合缓存或服务状态
+podman volume create hf-cache
+podman volume inspect hf-cache
+podman run --rm -v hf-cache:/cache localhost/ai/train:dev python -c 'print("cache ready")'
+
+# 只读挂载数据集，降低误删风险
+podman run --rm -v /datasets/coco:/datasets/coco:ro,Z localhost/ai/eval:dev python eval.py</code></pre>
+<table><tr><th>挂载后缀</th><th>用途</th><th>注意</th></tr><tr><td><code>:ro</code></td><td>只读挂载</td><td>数据集、预训练权重优先只读</td></tr><tr><td><code>:Z</code></td><td>给单个容器重新标记 SELinux label</td><td>常用于 Fedora/RHEL/CentOS Stream 系列</td></tr><tr><td><code>:z</code></td><td>给多个容器共享的路径设置共享 label</td><td>共享目录时使用，但要理解安全影响</td></tr><tr><td><code>:U</code></td><td>根据 user namespace 调整所有权</td><td>可能递归 chown，数据集大时谨慎</td></tr></table>
+<div class="danger"><strong>数据安全：</strong> 不要把宿主机根目录、<code>/home</code> 整体或敏感凭据目录随手挂进训练容器。需要访问 token 时优先挂载单个只读文件，并限制容器内路径。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 网络、端口与 rootless 限制</h2>
+<p>Podman 的网络在 rootless 和 rootful 下差异明显。AI 开发常见需求是暴露 Jupyter、TensorBoard、推理 HTTP 服务，或做多机训练通信。端口映射、host network、DNS 和吞吐都要按模式验证。</p>
+<pre><code># 暴露 Jupyter：只监听本机回环更安全
+podman run --rm -it --name jupyter \
+  -p 127.0.0.1:8888:8888 \
+  -v "$PWD":/workspace:Z \
+  localhost/ai/notebook:dev \
+  jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
+
+# 暴露 TensorBoard
+podman run --rm -p 127.0.0.1:6006:6006 \
+  -v "$PWD/runs":/runs:ro,Z \
+  tensorflow/tensorflow:latest \
+  tensorboard --host=0.0.0.0 --logdir=/runs
+
+# 查看网络
+podman network ls
+podman network inspect podman
+
+# 创建隔离网络
+podman network create ai-dev-net
+podman run -d --name api --network ai-dev-net localhost/ai/api:dev</code></pre>
+<table><tr><th>场景</th><th>建议</th><th>风险</th></tr><tr><td>Jupyter/TensorBoard</td><td><code>-p 127.0.0.1:host:container</code></td><td>不要默认暴露到 <code>0.0.0.0</code></td></tr><tr><td>推理服务联调</td><td>自定义 bridge 网络或 pod</td><td>注意服务发现和端口冲突</td></tr><tr><td>多机训练</td><td>明确 master addr/port、防火墙、host network 语义</td><td>rootless 网络可能影响性能和可达性</td></tr><tr><td>低端口</td><td>使用高端口反代或由 systemd/socket 处理</td><td>rootless 绑定低端口受系统限制</td></tr></table>
+<div class="warn"><strong>暴露端口前先问：</strong> 这个服务只给本机用户访问，还是要给同网段访问？开发默认用 <code>127.0.0.1</code>，需要远程访问时再加认证、TLS、ACL 或跳板机策略。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Pods：多容器共享网络命名空间</h2>
+<p>Podman 的 pod 借鉴 Kubernetes 概念：一个 pod 内多个容器共享网络命名空间，因此它们可以通过 <code>localhost</code> 互相访问。AI 开发中，一个 pod 可以同时跑推理服务、指标 exporter、sidecar 代理或数据库。</p>
+<div class="figure">
+<h3>结构图：Pod 中的训练服务与 sidecar</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="Podman pod 结构图">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">Pod = 共享网络命名空间的一组容器</text>
+<rect x="145" y="125" width="810" height="390" rx="26" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">pod: ai-infer</text>
+<rect x="215" y="220" width="230" height="170" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="330" y="260" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">inference</text><text x="330" y="295" text-anchor="middle" font-size="15">:8000</text><text x="330" y="325" text-anchor="middle" font-size="15">加载模型权重</text>
+<rect x="495" y="220" width="230" height="170" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="610" y="260" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">metrics</text><text x="610" y="295" text-anchor="middle" font-size="15">:9100</text><text x="610" y="325" text-anchor="middle" font-size="15">采集服务指标</text>
+<rect x="775" y="220" width="130" height="170" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="840" y="260" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">proxy</text><text x="840" y="295" text-anchor="middle" font-size="15">localhost</text><text x="840" y="325" text-anchor="middle" font-size="15">转发/鉴权</text>
+<rect x="375" y="440" width="350" height="46" rx="12" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="469" text-anchor="middle" font-size="15">宿主机端口映射挂在 pod 上，而不是每个容器各自抢端口</text>
+<line x1="445" y1="305" x2="495" y2="305" stroke="#94a3b8" stroke-width="3" marker-end="url(#p1)"/><line x1="725" y1="305" x2="775" y2="305" stroke="#94a3b8" stroke-width="3" marker-end="url(#p1)"/>
+<defs><marker id="p1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">Pod 适合“多个进程需要共享 localhost”的开发和边车场景；单个训练脚本通常不需要 pod。</div>
+</div>
+<pre><code># 创建 pod，并在 pod 级别暴露端口
+podman pod create --name ai-infer -p 127.0.0.1:8000:8000 -p 127.0.0.1:9100:9100
+
+# 添加推理服务容器
+podman run -d --pod ai-infer --name infer \
+  -v "$PWD/models":/models:ro,Z \
+  localhost/ai/infer:dev \
+  python serve.py --host 0.0.0.0 --port 8000 --model /models/model.pt
+
+# 添加 metrics sidecar
+podman run -d --pod ai-infer --name metrics localhost/ai/metrics:dev
+
+# 查看和清理：先列出，再删除
+podman pod ps
+podman pod inspect ai-infer
+podman pod rm -f ai-infer</code></pre>
+<div class="note"><strong>和 Kubernetes 的关系：</strong> Podman pod 能帮助本机模拟一部分 pod 语义，但它不是完整 Kubernetes。生产编排仍应看集群调度、资源配额、CNI、secret 和 rollout 策略。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. systemd 集成与长期运行服务</h2>
+<p>Podman 与 systemd 集成紧密，适合把容器作为节点服务管理，例如推理 API、模型缓存代理、监控 exporter 或开发机上的 Jupyter 服务。现代 Podman 常用 Quadlet（<code>.container</code> 文件）描述容器，由 systemd 生成服务单元。</p>
+<pre><code># 用户级 Quadlet 目录
+mkdir -p ~/.config/containers/systemd
+
+# 创建一个 rootless 用户服务：ai-infer.container
+cat &gt; ~/.config/containers/systemd/ai-infer.container &lt;&lt'EOF'
+[Unit]
+Description=AI inference container
+After=network-online.target
+
+[Container]
+Image=localhost/ai/infer:dev
+ContainerName=ai-infer
+PublishPort=127.0.0.1:8000:8000
+Volume=%h/models:/models:ro,Z
+Environment=MODEL_PATH=/models/model.pt
+Exec=python serve.py --host 0.0.0.0 --port 8000
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+EOF
+
+# 重新加载用户级 systemd，并启动服务
+systemctl --user daemon-reload
+systemctl --user start ai-infer.service
+systemctl --user status ai-infer.service
+journalctl --user -u ai-infer.service -f
+
+# 需要登录后继续运行时，由管理员按策略启用 linger
+loginctl enable-linger "$USER"</code></pre>
+<table><tr><th>方式</th><th>适用</th><th>说明</th></tr><tr><td>Quadlet</td><td>新服务、可维护配置</td><td>把容器声明交给 systemd 生成服务</td></tr><tr><td><code>podman generate systemd</code></td><td>已有容器迁移或旧环境</td><td>可生成 service 文件，但长期维护性不如声明式文件</td></tr><tr><td>手写 systemd + <code>podman run</code></td><td>特殊控制需求</td><td>要处理好停止、清理和重复启动</td></tr></table>
+<div class="warn"><strong>服务化前检查：</strong> 确认镜像 tag 不会被意外覆盖，挂载路径稳定，日志进入 journald 或持久目录，健康检查和重启策略符合业务要求。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 镜像仓库、登录、推送与离线迁移</h2>
+<p>AI 镜像往往包含公司内部依赖、CUDA 运行环境和业务代码。推送前要确认 registry 路径、tag、凭据来源和敏感文件是否被误打包。离线集群可以用 <code>podman save/load</code> 或 registry mirror 迁移。</p>
+<pre><code># 登录私有仓库
+podman login registry.example.com
+
+# 给本地镜像加远端 tag
+podman tag localhost/ai/train-demo:dev registry.example.com/ai/train-demo:2026-04-25
+
+# 推送前先确认镜像列表和大小
+podman images registry.example.com/ai/train-demo
+podman push registry.example.com/ai/train-demo:2026-04-25
+
+# 离线导出和导入
+podman save -o train-demo-2026-04-25.tar registry.example.com/ai/train-demo:2026-04-25
+podman load -i train-demo-2026-04-25.tar
+
+# 查看镜像 digest，便于记录实验环境
+podman inspect registry.example.com/ai/train-demo:2026-04-25 --format '{{.Digest}}'</code></pre>
+<div class="danger"><strong>凭据安全：</strong> 不要把 SSH key、云 token、registry 密码、<code>.netrc</code> 或私有数据复制进镜像层。即使后续 <code>RUN rm</code> 删除，旧层也可能仍包含敏感内容。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 安全模型：capabilities、userns、seccomp</h2>
+<p>容器安全不是一个开关，而是多层边界：用户命名空间、Linux capabilities、seccomp、SELinux/AppArmor、只读文件系统、资源限制、镜像来源和宿主机挂载。AI 工作负载为了 GPU、共享内存、RDMA 和性能经常请求更多权限，但应该逐项增加，而不是直接全开。</p>
+<pre><code># 更保守的只读推理容器：可写目录显式 tmpfs
+podman run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,size=2g \
+  --pids-limit=2048 \
+  --memory=16g \
+  --cpus=8 \
+  -v "$PWD/models":/models:ro,Z \
+  -p 127.0.0.1:8000:8000 \
+  localhost/ai/infer:prod
+
+# 逐项增加 capability，而不是 --privileged
+podman run --rm --cap-drop=all --cap-add=NET_BIND_SERVICE localhost/ai/api:prod
+
+# 查看容器最终配置
+podman inspect ai-infer --format '{{json .HostConfig.CapAdd}}'</code></pre>
+<table><tr><th>选项</th><th>作用</th><th>AI Infra 建议</th></tr><tr><td><code>--privileged</code></td><td>大幅放宽隔离</td><td>只用于短时底层诊断，禁止成为默认模板</td></tr><tr><td><code>--cap-add</code></td><td>增加单项 capability</td><td>缺什么加什么，并记录原因</td></tr><tr><td><code>--security-opt</code></td><td>调整安全配置</td><td>需要平台安全基线批准</td></tr><tr><td><code>--read-only</code></td><td>根文件系统只读</td><td>推理服务和生产容器优先考虑</td></tr><tr><td><code>--user</code></td><td>指定容器内用户</td><td>避免业务进程长期以容器内 root 运行</td></tr></table>
+<div class="warn"><strong>最小权限路线：</strong> 先 rootless、只读数据、固定端口、明确资源限制；发现缺口后添加单个设备、挂载或 capability；每次加权限都留下原因。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. Podman vs Docker vs nerdctl</h2>
+<p>三者都能运行 OCI 容器，但控制面和默认假设不同。AI Infra 中，选择工具时要看节点治理、Kubernetes 对接、rootless 需求、GPU runtime 支持、团队熟悉度和发行版标准。</p>
+<div class="figure">
+<h3>选择图：容器 CLI 在 AI Infra 中怎么选</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="Podman Docker nerdctl 对比">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">Podman / Docker / nerdctl 的定位</text>
+<rect x="85" y="145" width="290" height="340" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="230" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">Podman</text><text x="230" y="235" text-anchor="middle" font-size="16">daemonless</text><text x="230" y="270" text-anchor="middle" font-size="16">rootless 体验强</text><text x="230" y="305" text-anchor="middle" font-size="16">systemd/Quadlet 友好</text><text x="230" y="340" text-anchor="middle" font-size="16">RHEL/Fedora 生态常见</text>
+<rect x="405" y="145" width="290" height="340" rx="24" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">Docker</text><text x="550" y="235" text-anchor="middle" font-size="16">daemon 模型成熟</text><text x="550" y="270" text-anchor="middle" font-size="16">生态教程最多</text><text x="550" y="305" text-anchor="middle" font-size="16">桌面和开发者体验强</text><text x="550" y="340" text-anchor="middle" font-size="16">daemon 权限治理要谨慎</text>
+<rect x="725" y="145" width="290" height="340" rx="24" fill="#ccfbf1" stroke="#99f6e4"/><text x="870" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">nerdctl</text><text x="870" y="235" text-anchor="middle" font-size="16">containerd CLI</text><text x="870" y="270" text-anchor="middle" font-size="16">贴近 Kubernetes 节点</text><text x="870" y="305" text-anchor="middle" font-size="16">适合 containerd 工作流</text><text x="870" y="340" text-anchor="middle" font-size="16">体验依赖发行版集成</text>
+<rect x="230" y="540" width="640" height="52" rx="12" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="573" text-anchor="middle" font-size="16">不是谁绝对更好：以节点基线、权限模型、GPU 集成和交付路径为准</text>
+</svg>
+<div class="caption">Podman 的优势在无 daemon、rootless 和 systemd 集成；Docker 的优势在生态惯性；nerdctl 更贴近 containerd/Kubernetes 节点。</div>
+</div>
+<table><tr><th>维度</th><th>Podman</th><th>Docker</th><th>nerdctl</th></tr><tr><td>控制面</td><td>默认无 daemon</td><td>Docker daemon</td><td>containerd</td></tr><tr><td>rootless</td><td>核心能力之一</td><td>支持但部署体验不同</td><td>支持，依赖 rootless containerd 配置</td></tr><tr><td>systemd</td><td>Quadlet 和服务化体验强</td><td>常用 service 管 daemon 或容器</td><td>更多面向 containerd 节点</td></tr><tr><td>Kubernetes 贴近度</td><td>本机开发/pod 概念友好</td><td>开发生态丰富</td><td>与 containerd 运行时贴近</td></tr><tr><td>AI GPU</td><td>可用，但需按 CDI/hook 配置验证</td><td>NVIDIA 生态教程多</td><td>取决于 containerd GPU 配置</td></tr></table>
+<div class="note"><strong>迁移建议：</strong> 如果团队从 Docker 切到 Podman，先迁移开发和 CI 构建；GPU 训练、host network、privileged 任务要单独做验收清单。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 训练容器排障手册</h2>
+<p>训练容器失败时，不要从最终 Python stack trace 直接猜。按层排查：宿主机、Podman 配置、镜像、挂载、设备、网络、资源限制、训练脚本。每一层都用最小命令验证。</p>
+<div class="figure">
+<h3>排障流程图：训练容器从启动失败到性能异常</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="Podman 训练容器排障流程">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="45" width="260" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">训练容器失败</text>
+<rect x="75" y="160" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="180" y="195" text-anchor="middle" font-size="18" font-weight="700">能启动吗？</text><text x="180" y="224" text-anchor="middle" font-size="14">image / entrypoint</text>
+<rect x="320" y="160" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="195" text-anchor="middle" font-size="18" font-weight="700">能读数据吗？</text><text x="425" y="224" text-anchor="middle" font-size="14">volume / label / uid</text>
+<rect x="565" y="160" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="195" text-anchor="middle" font-size="18" font-weight="700">能看到 GPU 吗？</text><text x="670" y="224" text-anchor="middle" font-size="14">driver / CDI / hook</text>
+<rect x="810" y="160" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="915" y="195" text-anchor="middle" font-size="18" font-weight="700">能通信吗？</text><text x="915" y="224" text-anchor="middle" font-size="14">ports / NCCL / DNS</text>
+<rect x="135" y="350" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="250" y="386" text-anchor="middle" font-size="18" font-weight="700">最小容器命令</text><text x="250" y="414" text-anchor="middle" font-size="14">python -V / import torch</text>
+<rect x="435" y="350" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="386" text-anchor="middle" font-size="18" font-weight="700">最小设备命令</text><text x="550" y="414" text-anchor="middle" font-size="14">nvidia-smi / rocm-smi</text>
+<rect x="735" y="350" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="850" y="386" text-anchor="middle" font-size="18" font-weight="700">最小网络命令</text><text x="850" y="414" text-anchor="middle" font-size="14">curl / nc / env</text>
+<rect x="300" y="555" width="500" height="82" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="590" text-anchor="middle" font-size="20" font-weight="700">先证明基础层可用，再跑完整训练</text><text x="550" y="618" text-anchor="middle" font-size="14">不要用 --privileged 掩盖真正缺口</text>
+<line x1="550" y1="111" x2="180" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="425" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="670" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="915" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="180" y1="252" x2="250" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="252" x2="250" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="252" x2="550" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="252" x2="850" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="250" y1="442" x2="410" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="442" x2="550" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="850" y1="442" x2="690" y2="555" stroke="#94a3b8" stroke-width="3"/>
+</svg>
+<div class="caption">训练排障的核心是分层验证：镜像能否启动、数据能否读取、GPU 能否可见、网络能否通信、资源是否足够。</div>
+</div>
+<h3>常用最小验证命令</h3>
+<pre><code># 镜像基础环境
+podman run --rm localhost/ai/torch:cuda12 python -V
+podman run --rm localhost/ai/torch:cuda12 python -c 'import torch; print(torch.__version__)'
+
+# 文件权限和挂载
+podman run --rm -v "$PWD/data":/data:ro,Z ubuntu:24.04 sh -lc 'id && ls -lah /data | head'
+
+# GPU 可见性
+podman run --rm --device nvidia.com/gpu=all \
+  docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# PyTorch GPU
+podman run --rm --device nvidia.com/gpu=all localhost/ai/torch:cuda12 \
+  python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.device_count())'
+
+# 端口监听
+podman run --rm -p 127.0.0.1:8000:8000 localhost/ai/api:dev
+curl -v http://127.0.0.1:8000/health</code></pre>
+<table><tr><th>问题</th><th>定位命令</th><th>常见修复方向</th></tr><tr><td>容器立刻退出</td><td><code>podman logs</code>、<code>podman inspect --format '{{.State.ExitCode}}'</code></td><td>entrypoint、工作目录、环境变量、缺文件</td></tr><tr><td>Permission denied</td><td><code>id</code>、<code>ls -ln</code>、<code>podman unshare</code></td><td>UID/GID、SELinux label、只读挂载、userns 映射</td></tr><tr><td>磁盘爆满</td><td><code>podman system df</code>、<code>df -h</code></td><td>清理构建缓存、输出目录、未使用镜像和卷</td></tr><tr><td>OOM 或被 kill</td><td><code>podman inspect</code>、<code>journalctl</code>、训练日志</td><td>降低 batch、加内存限制证据、检查 cgroup</td></tr><tr><td>训练很慢</td><td><code>nvidia-smi dmon</code>、<code>iostat</code>、<code>pidstat</code></td><td>数据加载、CPU pinning、共享内存、网络存储瓶颈</td></tr></table>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 安全清理、检查清单与练习</h2>
+<p>Podman 清理命令可能删除容器、镜像、网络、卷和构建缓存。生产节点上不要直接复制 <code>prune -a</code>。先看占用、列出目标，再按范围清理。</p>
+<pre><code># 先看占用，不删除任何东西
+podman system df
+podman ps -a
+podman images
+podman volume ls
+
+# 清理已退出容器：先列出，再删除
+podman ps -a --filter status=exited
+podman container prune
+
+# 清理悬空镜像：先观察，再执行
+podman images --filter dangling=true
+podman image prune
+
+# 谨慎清理未使用对象，执行前会提示确认
+podman system prune
+
+# 卷通常最危险：先 inspect，确认不是 checkpoint/缓存/模型数据
+podman volume ls
+podman volume inspect hf-cache</code></pre>
+<h3>AI Infra 上线前检查清单</h3>
+<ul>
+<li>镜像 tag 固定，构建来源可追溯，未包含密钥和私有数据。</li>
+<li>数据集和模型权重使用只读挂载，输出和缓存目录显式挂载。</li>
+<li>GPU 访问方式在目标节点验证过，记录 CDI/hook/driver 依赖。</li>
+<li>端口只暴露到需要的地址，Jupyter 和 TensorBoard 不裸奔到公网。</li>
+<li>资源限制、共享内存、日志、退出码和重启策略已定义。</li>
+<li>没有把 <code>--privileged</code>、宿主机根目录挂载、rootful 运行作为默认模板。</li>
+</ul>
+<h3>练习任务</h3>
+<ol>
+<li>用 <code>podman run --rm</code> 验证一个 Python 镜像能输出版本。</li>
+<li>写一个 <code>Containerfile</code>，构建本地 <code>localhost/ai/demo:dev</code> 镜像。</li>
+<li>用只读卷挂载数据目录，用可写卷保存输出目录。</li>
+<li>把 Jupyter 只暴露到 <code>127.0.0.1</code>，确认浏览器能访问。</li>
+<li>在有 GPU 的节点上分别验证宿主机 <code>nvidia-smi</code> 和容器内 <code>nvidia-smi</code>。</li>
+<li>创建一个 pod，放入 API 容器和 metrics 容器，并观察共享 localhost 行为。</li>
+<li>写一个用户级 Quadlet，让一个简单推理服务由 systemd 管理。</li>
+</ol>
+<div class="danger"><strong>清理红线：</strong> <code>podman volume prune</code>、<code>podman system prune -a</code>、批量 <code>podman rmi -f</code> 都可能破坏他人工作或删除模型缓存。在共享 AI 节点上必须遵守平台清理策略。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Podman 官方文档：<code>podman-run(1)</code>、<code>podman-build(1)</code>、<code>podman-pod(1)</code>、<code>podman-systemd.unit(5)</code>、rootless 和 networking 章节。</li>
+<li>containers/common 文档：<code>containers.conf</code>、<code>storage.conf</code>、<code>registries.conf</code> 的系统级与用户级配置。</li>
+<li>NVIDIA Container Toolkit 与 CDI 文档：GPU 设备声明、OCI hook 迁移、CUDA 容器运行要求。</li>
+<li>Linux man-pages 与发行版安全文档：user namespaces、cgroups v2、SELinux/AppArmor、systemd user services。</li>
+<li>Kubernetes 文档：理解 pod、容器资源限制、镜像拉取策略和本机 Podman 开发到集群部署之间的差异。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 daemonless 与 rootless 心智模型，再练熟 <code>run/build/exec/logs/inspect</code>，随后学习 GPU、卷、网络、pod、systemd 和安全基线。</p>
+</section>
+<div class="footer">podman 深度教程 · AI Infra 图文穿插版 · daemonless、rootless/rootful、GPU、卷、网络、pods、systemd 与训练容器排障</div>
+</div>
+</body>
+</html>

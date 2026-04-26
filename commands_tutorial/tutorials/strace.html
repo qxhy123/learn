@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>strace 深度教程：AI Infra/Linux 系统调用追踪实战</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>strace 深度教程：AI Infra/Linux 系统调用追踪实战</h1>
+<p class="sub">这份教程面向 AI Infra 和 Linux 生产排障，系统讲清 <code>strace</code> 的心智模型和实战路径：系统调用是什么、如何安全附加到进程、如何用 <code>-f -p</code> 跟踪多进程/多线程、如何用 <code>-e</code> 过滤文件/网络/进程/信号调用、如何读懂时间戳和耗时、如何定位卡住的 dataloader、文件系统、网络连接、权限、容器和安全边界问题，并解释它与 <code>perf</code>、<code>bpftrace</code>、<code>lsof</code> 的分工。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">syscall tracing</span><span class="chip">-f -p</span><span class="chip">attach safety</span><span class="chip">-e 过滤</span><span class="chip">文件/网络调用</span><span class="chip">时间戳/耗时</span><span class="chip">dataloader 卡住</span><span class="chip">容器排障</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>strace</code> 是“用户态进程和 Linux 内核之间的黑匣子记录仪”：它记录进程向内核发起的系统调用、参数、返回值、错误码和耗时。</div>
+<div class="success"><strong>最重要原则：</strong> 生产环境先短窗口、窄过滤、写文件、必要时只追踪一个线程；附加 <code>-p</code> 会暂停被跟踪进程片刻并增加开销，必须确认目标进程、权限和数据敏感性。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">strace 是什么，解决什么问题</a></li>
+<li><a class="anchor" href="#s2">核心模型：进程、syscall、内核、返回值</a></li>
+<li><a class="anchor" href="#s3">安装、版本、权限与内核限制</a></li>
+<li><a class="anchor" href="#s4">第一批命令：运行新进程与附加旧进程</a></li>
+<li><a class="anchor" href="#s5">安全附加：<code>-p</code>、<code>-f</code>、短窗口与输出文件</a></li>
+<li><a class="anchor" href="#s6">过滤核心：<code>-e trace=...</code> 和 <code>-e status=...</code></a></li>
+<li><a class="anchor" href="#s7">时间戳、耗时和卡住判断</a></li>
+<li><a class="anchor" href="#s8">读懂输出：参数、返回值、errno、未完成调用</a></li>
+<li><a class="anchor" href="#s9">文件系统 syscall：open、stat、read、write、fsync</a></li>
+<li><a class="anchor" href="#s10">网络 syscall：connect、accept、send、recv、DNS</a></li>
+<li><a class="anchor" href="#s11">进程、线程、fork/exec 与 <code>-f</code></a></li>
+<li><a class="anchor" href="#s12">AI dataloader / 训练进程卡住排障</a></li>
+<li><a class="anchor" href="#s13">容器、Kubernetes 和命名空间中的 strace</a></li>
+<li><a class="anchor" href="#s14">降低噪声：字符串、缓冲区、路径和 FD 解码</a></li>
+<li><a class="anchor" href="#s15">开销、安全和数据治理</a></li>
+<li><a class="anchor" href="#s16">strace vs perf vs bpftrace vs lsof</a></li>
+<li><a class="anchor" href="#s17">常见错误与 troubleshooting</a></li>
+<li><a class="anchor" href="#s18">速查、练习和生产 playbook</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. strace 是什么，解决什么问题</h2>
+<p><code>strace</code> 基于 Linux <code>ptrace</code> 机制观察进程的系统调用。只要程序需要文件、网络、进程、内存映射、信号、时间、权限或设备，它最终会通过 syscall 请求内核服务；<code>strace</code> 能把这些请求打印出来。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长</strong><br>定位文件不存在、权限拒绝、动态库加载、阻塞 I/O、网络连接失败、子进程启动、信号、进程卡在某个 syscall。</div>
+<div class="card"><strong>它不擅长</strong><br>CPU 热点函数、GPU kernel、业务对象状态、Python 行级逻辑、内核内部长路径剖析和低开销全局观测。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>训练/推理进程卡住、dataloader 读盘慢、NFS 抖动、容器权限问题、模型文件打开失败、RPC 连接异常、进程 fork/exec 风暴。</div>
+</div>
+<pre><code># 看一个命令发起了哪些系统调用
+strace -o /tmp/ls.strace ls /data/models
+
+# 附加到运行中的进程，10 秒后 Ctrl-C 停止 strace，不会杀掉目标进程
+strace -ttT -p 12345 -o /tmp/app.strace
+
+# 只看文件相关调用，噪声更低
+strace -f -e trace=file -p 12345 -o /tmp/app.file.strace</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>strace</code> 看到的是“进程问内核要什么，以及内核怎么回答”。如果问题发生在纯用户态计算热点，应换 <code>perf</code>、语言 profiler 或应用日志。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. 核心模型：进程、syscall、内核、返回值</h2>
+<h3>信息图：strace 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="strace 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="92" width="200" height="118" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="155" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">用户进程</text><text x="155" y="164" text-anchor="middle" font-size="15">Python / C++ / shell</text><text x="155" y="188" text-anchor="middle" font-size="15">需要文件、网络、进程</text>
+<rect x="322" y="92" width="200" height="118" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="422" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">系统调用</text><text x="422" y="164" text-anchor="middle" font-size="15">openat / read</text><text x="422" y="188" text-anchor="middle" font-size="15">connect / futex</text>
+<rect x="589" y="92" width="200" height="118" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="689" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">Linux 内核</text><text x="689" y="164" text-anchor="middle" font-size="15">VFS / TCP / scheduler</text><text x="689" y="188" text-anchor="middle" font-size="15">权限和资源管理</text>
+<rect x="856" y="92" width="190" height="118" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="951" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">返回结果</text><text x="951" y="164" text-anchor="middle" font-size="15">fd / 字节数</text><text x="951" y="188" text-anchor="middle" font-size="15">errno / signal</text>
+<rect x="205" y="350" width="690" height="150" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="390" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">strace 插在用户进程和内核边界</text><text x="550" y="430" text-anchor="middle" font-size="16">记录：syscall 名称、参数、返回值、错误码、时间戳、耗时</text><text x="550" y="462" text-anchor="middle" font-size="16">适合回答：它卡在哪个内核请求？它到底打开了哪个文件？连接了哪个地址？</text>
+<line x1="255" y1="151" x2="322" y2="151" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="522" y1="151" x2="589" y2="151" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="789" y1="151" x2="856" y2="151" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M420 210 C430 285, 485 325, 535 350" fill="none" stroke="#7c3aed" stroke-width="4" marker-end="url(#a2)"/><text x="405" y="286" text-anchor="middle" font-size="15" fill="#6d28d9">strace 观察点</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="a2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#7c3aed"/></marker></defs>
+</svg>
+<div class="caption">心智模型：strace 不理解你的业务逻辑，但能精确记录进程和内核之间的请求与回应。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、版本、权限与内核限制</h2>
+<p>多数发行版可以直接安装 <code>strace</code> 包。附加到已有进程通常需要同用户、可 ptrace 权限，或 root/capability；容器中还可能受到 seccomp、AppArmor、SELinux、<code>CAP_SYS_PTRACE</code> 和宿主机策略限制。</p>
+<table>
+<tr><th>环境</th><th>安装/检查</th><th>说明</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>sudo apt install strace</code></td><td>容器镜像里常被裁剪，需要临时安装或用 debug image。</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>sudo dnf install strace</code></td><td>旧系统可用 <code>yum install strace</code>。</td></tr>
+<tr><td>版本检查</td><td><code>strace -V</code></td><td>新版本对 syscall 解码、<code>-e status</code>、路径/FD 展示更友好。</td></tr>
+<tr><td>权限检查</td><td><code>cat /proc/sys/kernel/yama/ptrace_scope</code></td><td>Ubuntu 等系统可能限制非父子进程 attach。</td></tr>
+</table>
+<pre><code># 查看当前用户是否能附加目标进程
+ps -o pid,user,comm -p 12345
+strace -p 12345 -e trace=none
+
+# 如果出现 Operation not permitted，需要检查用户、Yama、capability、容器权限
+cat /proc/sys/kernel/yama/ptrace_scope 2&gt;/dev/null || true
+grep -E 'TracerPid|NoNewPrivs|Seccomp' /proc/12345/status</code></pre>
+<div class="danger"><strong>不要绕过平台策略：</strong> 在生产集群中提升 <code>CAP_SYS_PTRACE</code>、改 <code>ptrace_scope</code> 或进入宿主 namespace 都属于高权限操作，应走变更/审批流程。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 第一批命令：运行新进程与附加旧进程</h2>
+<p><code>strace</code> 有两种基本用法：让它启动一个新命令，或附加到一个已经运行的进程。排障线上服务时通常用附加；复现问题和学习时建议启动新命令。</p>
+<table>
+<tr><th>目标</th><th>命令</th><th>适用场景</th></tr>
+<tr><td>追踪新命令</td><td><code>strace -o /tmp/cmd.strace command args...</code></td><td>本地复现、短命令、启动失败。</td></tr>
+<tr><td>追踪已有进程</td><td><code>strace -p PID -o /tmp/app.strace</code></td><td>线上进程卡住、服务异常。</td></tr>
+<tr><td>跟踪子进程/线程</td><td><code>strace -f -p PID -o /tmp/app.strace</code></td><td>Python multiprocessing、DataLoader workers、shell 脚本。</td></tr>
+<tr><td>命令统计摘要</td><td><code>strace -c command</code></td><td>粗略看哪些 syscall 次数/耗时高。</td></tr>
+</table>
+<pre><code># 追踪模型文件是否打开成功
+strace -e trace=file -o /tmp/load-model.strace python load_model.py
+grep -E 'ENOENT|EACCES|model|safetensors|bin' /tmp/load-model.strace
+
+# 对运行中的推理服务追踪 15 秒，输出到文件
+PID=$(pgrep -n -f 'python.*serve.py')
+timeout 15s strace -ttT -f -p "$PID" -o /tmp/serve.strace</code></pre>
+<div class="note"><strong>输出建议：</strong> 线上排障优先用 <code>-o</code> 写文件，不要把大量 syscall 打到终端；终端渲染本身会增加噪声，也不利于后处理。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 安全附加：<code>-p</code>、<code>-f</code>、短窗口与输出文件</h2>
+<p><code>strace -p</code> 会通过 ptrace 附加目标进程。附加瞬间目标会被暂停，之后每次 syscall 进入/退出都可能触发上下文切换，所以开销可观。生产使用应控制窗口、过滤范围和输出量。</p>
+<section class="figure">
+<h3>流程图：生产安全附加步骤</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="strace 生产附加安全流程">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">准备 attach</text>
+<rect x="75" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="185" y="200" text-anchor="middle" font-size="18" font-weight="700">确认 PID</text><text x="185" y="228" text-anchor="middle" font-size="14">ps / pgrep / cgroup</text>
+<rect x="320" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="200" text-anchor="middle" font-size="18" font-weight="700">确认权限</text><text x="430" y="228" text-anchor="middle" font-size="14">用户 / ptrace / 容器</text>
+<rect x="565" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="675" y="200" text-anchor="middle" font-size="18" font-weight="700">缩小过滤</text><text x="675" y="228" text-anchor="middle" font-size="14">file / network / process</text>
+<rect x="810" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="920" y="200" text-anchor="middle" font-size="18" font-weight="700">限制窗口</text><text x="920" y="228" text-anchor="middle" font-size="14">timeout 10s / Ctrl-C</text>
+<rect x="160" y="365" width="270" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="295" y="400" text-anchor="middle" font-size="18" font-weight="700">写入文件</text><text x="295" y="428" text-anchor="middle" font-size="14">-o /tmp/trace.log</text>
+<rect x="485" y="365" width="270" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="620" y="400" text-anchor="middle" font-size="18" font-weight="700">必要时跟子进程</text><text x="620" y="428" text-anchor="middle" font-size="14">-f 或 -ff</text>
+<rect x="310" y="555" width="480" height="72" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="586" text-anchor="middle" font-size="20" font-weight="700">观察完立即停止 strace</text><text x="550" y="613" text-anchor="middle" font-size="14">Ctrl-C 停止 tracer，不等于 kill 目标进程</text>
+<line x1="550" y1="111" x2="185" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="430" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="675" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="920" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="185" y1="257" x2="295" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="430" y1="257" x2="295" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="675" y1="257" x2="620" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="920" y1="257" x2="620" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="295" y1="455" x2="460" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="620" y1="455" x2="620" y2="555" stroke="#94a3b8" stroke-width="3"/>
+</svg>
+<div class="caption">安全目标不是“永远不用 strace”，而是在可控窗口内收集足够证据，避免把观测变成事故。</div>
+</section>
+<pre><code># 推荐模板：短窗口 + 时间 + 耗时 + 子进程 + 输出文件
+timeout 10s strace -ttT -f -p 12345 -o /tmp/app.strace
+
+# 噪声更低：只看文件系统调用
+timeout 10s strace -ttT -f -e trace=file -p 12345 -o /tmp/app.file.strace
+
+# 线程很多时，先找最可疑 TID，再只追踪该线程
+ps -L -p 12345 -o pid,tid,psr,stat,pcpu,wchan:24,comm
+timeout 10s strace -ttT -p 12378 -o /tmp/thread.strace</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要对高 QPS 主路径长时间运行无过滤 <code>strace -f -p</code>。它会显著增加 syscall 密集型程序的延迟，尤其是网络代理、日志密集服务和大量小文件读取场景。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 过滤核心：<code>-e trace=...</code> 和 <code>-e status=...</code></h2>
+<p><code>-e</code> 是 strace 的核心降噪工具。多数生产问题不需要完整 syscall 流，而是需要聚焦文件、网络、进程、信号、内存映射或失败调用。</p>
+<table>
+<tr><th>过滤方式</th><th>命令示例</th><th>适合定位</th></tr>
+<tr><td>文件相关</td><td><code>-e trace=file</code></td><td>路径不存在、权限拒绝、模型/配置/动态库查找。</td></tr>
+<tr><td>网络相关</td><td><code>-e trace=network</code></td><td>connect、accept、sendto、recvfrom、socket 配置。</td></tr>
+<tr><td>进程相关</td><td><code>-e trace=process</code></td><td>fork、clone、execve、wait、进程风暴。</td></tr>
+<tr><td>描述符相关</td><td><code>-e trace=desc</code></td><td>read/write/close/poll/select/epoll 等 FD 行为。</td></tr>
+<tr><td>只看失败</td><td><code>-e status=failed</code></td><td>快速找 ENOENT、EACCES、ECONNREFUSED、ETIMEDOUT。</td></tr>
+<tr><td>指定 syscall</td><td><code>-e trace=openat,statx,read</code></td><td>精确追踪某类调用。</td></tr>
+</table>
+<pre><code># 快速找失败调用
+strace -f -e status=failed -p 12345 -o /tmp/failed.strace
+
+# 文件问题：路径、权限、动态库、checkpoint
+strace -f -e trace=file -yy -s 256 -p 12345 -o /tmp/file.strace
+
+# 网络问题：连接、收发、socket 选项
+strace -f -e trace=network -ttT -p 12345 -o /tmp/net.strace
+
+# 只看 read/write/poll/epoll，判断是否卡在 I/O 等待
+strace -f -e trace=read,write,poll,ppoll,select,pselect6,epoll_wait,epoll_pwait -ttT -p 12345 -o /tmp/io.strace</code></pre>
+<div class="note"><strong>实战习惯：</strong> 先用 <code>-e status=failed</code> 找硬错误，再根据错误类型切到 <code>trace=file</code>、<code>trace=network</code> 或指定 syscall。</div>
+</section>
+
+<section class="figure">
+<h3>选择图：不同问题该追踪什么</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="strace 过滤选择图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="26" font-weight="700">问题现象 → strace 过滤器 → 典型证据</text>
+<rect x="65" y="125" width="245" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="188" y="164" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">文件打不开</text><text x="188" y="198" text-anchor="middle" font-size="15">-e trace=file</text><text x="188" y="224" text-anchor="middle" font-size="15">ENOENT / EACCES</text>
+<rect x="425" y="125" width="245" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="548" y="164" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">网络连不上</text><text x="548" y="198" text-anchor="middle" font-size="15">-e trace=network</text><text x="548" y="224" text-anchor="middle" font-size="15">ECONNREFUSED / ETIMEDOUT</text>
+<rect x="790" y="125" width="245" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="913" y="164" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">进程卡住</text><text x="913" y="198" text-anchor="middle" font-size="15">-ttT + desc/futex</text><text x="913" y="224" text-anchor="middle" font-size="15">长耗时 syscall</text>
+<rect x="65" y="335" width="245" height="120" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="188" y="374" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">worker 起不来</text><text x="188" y="408" text-anchor="middle" font-size="15">-f -e trace=process</text><text x="188" y="434" text-anchor="middle" font-size="15">clone / execve / wait</text>
+<rect x="425" y="335" width="245" height="120" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="548" y="374" text-anchor="middle" font-size="20" font-weight="700" fill="#166534">只想找错误</text><text x="548" y="408" text-anchor="middle" font-size="15">-e status=failed</text><text x="548" y="434" text-anchor="middle" font-size="15">errno 聚焦</text>
+<rect x="790" y="335" width="245" height="120" rx="18" fill="#fee2e2" stroke="#fecaca"/><text x="913" y="374" text-anchor="middle" font-size="20" font-weight="700" fill="#b91c1c">噪声太大</text><text x="913" y="408" text-anchor="middle" font-size="15">-o / -ff / -s / -y</text><text x="913" y="434" text-anchor="middle" font-size="15">拆文件、限制字符串</text>
+<rect x="240" y="535" width="620" height="52" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="568" text-anchor="middle" font-size="17">过滤越窄，开销越低，结论越容易被验证</text>
+</svg>
+<div class="caption">大多数 strace 排障从“现象分类”开始，而不是直接打印所有 syscall。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 时间戳、耗时和卡住判断</h2>
+<p>判断“卡住”必须看时间。<code>-tt</code> 打印绝对时间，<code>-T</code> 打印每个 syscall 花费的时间，<code>-r</code> 打印相邻 syscall 的相对时间。AI 训练中常用 <code>-ttT</code> 找长时间停在 <code>read</code>、<code>futex</code>、<code>poll</code>、<code>connect</code> 或 <code>wait4</code> 的位置。</p>
+<table>
+<tr><th>选项</th><th>含义</th><th>用法</th></tr>
+<tr><td><code>-t</code></td><td>秒级时间</td><td>粗略排序。</td></tr>
+<tr><td><code>-tt</code></td><td>微秒级绝对时间</td><td>和应用日志、GPU 日志对齐。</td></tr>
+<tr><td><code>-ttt</code></td><td>epoch 时间</td><td>便于脚本处理。</td></tr>
+<tr><td><code>-T</code></td><td>syscall 耗时</td><td>找慢调用。</td></tr>
+<tr><td><code>-r</code></td><td>相邻调用间隔</td><td>找调用之间的用户态停顿。</td></tr>
+</table>
+<pre><code># 找 10 秒内耗时明显的系统调用
+timeout 10s strace -ttT -f -p 12345 -o /tmp/trace.timing
+grep -E '&lt;[0-9]+\.[0-9]{3,}&gt;' /tmp/trace.timing | head -50
+
+# 只看可能阻塞的调用
+timeout 10s strace -ttT -f \
+  -e trace=read,write,poll,ppoll,select,pselect6,epoll_wait,futex,connect,accept4,wait4 \
+  -p 12345 -o /tmp/blocking.strace</code></pre>
+<div class="warn"><strong>解释 caveat：</strong> <code>&lt;0.500123&gt;</code> 表示该 syscall 本身耗时约 500ms；如果相邻两行时间差很大但每个 syscall 耗时不长，可能时间花在用户态计算，此时应考虑 <code>perf</code> 或语言 profiler。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 读懂输出：参数、返回值、errno、未完成调用</h2>
+<p>一行 strace 输出通常是：时间、PID、syscall 名称、参数、返回值、错误码、耗时。理解返回值和 errno 是判断问题的关键。</p>
+<pre><code>12:10:33.123456 openat(AT_FDCWD, "/data/model.bin", O_RDONLY) = -1 ENOENT (No such file or directory) &lt;0.000041&gt;
+12:10:33.124001 read(17, "....", 4096) = 4096 &lt;0.000083&gt;
+12:10:33.125900 connect(8, {sa_family=AF_INET, sin_port=htons(6379), sin_addr=inet_addr("10.0.0.9")}, 16) = -1 ECONNREFUSED (Connection refused) &lt;0.001432&gt;
+12:10:34.000000 futex(0x7f..., FUTEX_WAIT_PRIVATE, 2, NULL &lt;unfinished ...&gt;
+12:10:37.000000 &lt;... futex resumed&gt;) = 0 &lt;3.000000&gt;</code></pre>
+<table>
+<tr><th>片段</th><th>含义</th><th>怎么解读</th></tr>
+<tr><td><code>= 3</code></td><td>返回文件描述符 3</td><td>open/socket 成功。</td></tr>
+<tr><td><code>= 4096</code></td><td>返回字节数</td><td>read/write 成功处理 4096 字节。</td></tr>
+<tr><td><code>= -1 ENOENT</code></td><td>失败且 errno 是 ENOENT</td><td>路径不存在，常见于配置、模型、动态库查找。</td></tr>
+<tr><td><code>&lt;unfinished ...&gt;</code></td><td>调用尚未返回</td><td>多线程/阻塞调用常见，稍后可能有 resumed 行。</td></tr>
+<tr><td><code>&lt;0.123456&gt;</code></td><td>syscall 耗时</td><td>配合 <code>-T</code> 找慢调用。</td></tr>
+</table>
+<div class="note"><strong>错误不是都异常：</strong> 程序经常试探多个路径，看到少量 <code>ENOENT</code> 不一定是故障；故障证据通常是“关键路径上的失败”或“失败后没有有效 fallback”。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 文件系统 syscall：open、stat、read、write、fsync</h2>
+<p>AI Infra 中，文件问题常出现在模型加载、checkpoint、dataset shard、动态库、配置、证书、NFS/对象存储挂载和临时目录。<code>trace=file</code> 是定位这类问题的首选。</p>
+<table>
+<tr><th>syscall</th><th>常见含义</th><th>异常线索</th></tr>
+<tr><td><code>openat</code>/<code>open</code></td><td>打开文件、目录、设备、动态库。</td><td><code>ENOENT</code>、<code>EACCES</code>、路径不符合预期。</td></tr>
+<tr><td><code>stat</code>/<code>statx</code>/<code>newfstatat</code></td><td>检查路径和元数据。</td><td>大量重复 stat 表示路径搜索或 metadata 开销。</td></tr>
+<tr><td><code>read</code>/<code>pread64</code></td><td>读文件或 socket。</td><td>小块读太多、耗时长、返回 0 表示 EOF。</td></tr>
+<tr><td><code>write</code>/<code>pwrite64</code></td><td>写日志、checkpoint、socket。</td><td><code>EPIPE</code>、短写、写入耗时长。</td></tr>
+<tr><td><code>fsync</code>/<code>fdatasync</code></td><td>强制落盘。</td><td>checkpoint、日志系统导致长尾延迟。</td></tr>
+</table>
+<pre><code># 找模型/数据路径访问错误
+strace -f -e trace=file -yy -s 256 \
+  python train.py --data /mnt/dataset --model /mnt/model \
+  -o /tmp/train.file.strace
+
+# 在运行中进程上查看文件失败
+timeout 20s strace -f -e trace=file -e status=failed -p 12345 -o /tmp/file.failed
+
+# 观察是否卡在读数据或 fsync
+timeout 15s strace -ttT -f -e trace=read,pread64,write,pwrite64,fsync,fdatasync -p 12345 -o /tmp/file.io</code></pre>
+<div class="success"><strong>dataloader 经验：</strong> 如果 GPU 低利用且 dataloader worker 大量停在 <code>read</code>/<code>pread64</code> 或 <code>newfstatat</code>，优先检查数据集存储、元数据压力、小文件数量、缓存命中、并发 worker 数和预取策略。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 网络 syscall：connect、accept、send、recv、DNS</h2>
+<p><code>strace</code> 可观察 socket 创建、连接、收发和等待事件。它不替代抓包，但能快速回答：进程是否真的发起连接、连接到哪个 IP/端口、错误码是什么、是否卡在 <code>connect</code> 或 <code>recvfrom</code>。</p>
+<table>
+<tr><th>syscall</th><th>含义</th><th>故障线索</th></tr>
+<tr><td><code>socket</code></td><td>创建 socket。</td><td>地址族、协议是否符合预期。</td></tr>
+<tr><td><code>connect</code></td><td>主动连接。</td><td><code>ECONNREFUSED</code>、<code>ETIMEDOUT</code>、<code>EINPROGRESS</code>。</td></tr>
+<tr><td><code>accept</code>/<code>accept4</code></td><td>服务端接受连接。</td><td>是否有新连接进入。</td></tr>
+<tr><td><code>sendto</code>/<code>recvfrom</code></td><td>发送/接收。</td><td>短写、EAGAIN、长时间等待。</td></tr>
+<tr><td><code>poll</code>/<code>epoll_wait</code></td><td>等待 FD 事件。</td><td>服务空闲、等待上游、事件循环阻塞。</td></tr>
+</table>
+<pre><code># 网络连接失败定位
+timeout 10s strace -ttT -f -e trace=network -p 12345 -o /tmp/net.strace
+grep -E 'connect|ECONN|ETIMEDOUT|EHOST|ENET' /tmp/net.strace
+
+# DNS 解析也常体现为文件和网络调用：resolv.conf、hosts、DNS socket
+strace -f -ttT -e trace=file,network getent hosts example.com
+
+# 推理服务是否一直等网络事件
+timeout 10s strace -ttT -p 12345 -e trace=epoll_wait,poll,ppoll,recvfrom,sendto -o /tmp/eventloop.strace</code></pre>
+<div class="warn"><strong>网络解释边界：</strong> <code>strace</code> 看不到 TCP 重传、丢包、拥塞窗口、TLS 明文内容。需要包级证据时，配合 <code>ss</code>、<code>tcpdump</code>、<code>tshark</code> 或 eBPF 网络工具。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 进程、线程、fork/exec 与 <code>-f</code></h2>
+<p>Python <code>multiprocessing</code>、PyTorch <code>DataLoader(num_workers&gt;0)</code>、shell wrapper、worker supervisor 都可能创建子进程。默认 <code>strace -p PID</code> 不会自动跟踪新 fork 出来的进程；需要 <code>-f</code> 或 <code>-ff</code>。</p>
+<table>
+<tr><th>选项</th><th>作用</th><th>建议</th></tr>
+<tr><td><code>-f</code></td><td>跟踪 fork/clone/vfork 出来的子进程，输出混在一个文件。</td><td>快速查看整体行为。</td></tr>
+<tr><td><code>-ff</code></td><td>每个进程写独立输出文件，文件名附加 PID。</td><td>worker 多、输出大时更易分析。</td></tr>
+<tr><td><code>-p PID</code></td><td>附加一个进程或线程。</td><td>先定位目标，再窄追踪。</td></tr>
+<tr><td><code>-e trace=process</code></td><td>只看进程创建/执行/等待。</td><td>排查 worker 启动、exec 失败。</td></tr>
+</table>
+<pre><code># 跟踪 DataLoader worker 创建和 exec 行为
+strace -f -e trace=process -o /tmp/train.process.strace python train.py
+
+# 每个 PID 单独文件，适合多 worker
+timeout 15s strace -ff -ttT -e trace=file,desc -p 12345 -o /tmp/train.worker
+ls /tmp/train.worker.*
+
+# 结合 ps 找线程/worker 状态
+ps -eLf | grep 'train.py' | head -30
+ps -L -p 12345 -o pid,tid,stat,wchan:24,pcpu,comm</code></pre>
+<div class="note"><strong>线程说明：</strong> Linux 线程也是 task，有 TID。对高线程数服务，追踪整个进程可能噪声巨大；先用 <code>ps -L</code>、<code>top -H</code>、<code>pidstat -t</code> 找可疑 TID，再精确 <code>-p TID</code>。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. AI dataloader / 训练进程卡住排障</h2>
+<p>训练“卡住”不等于 GPU 或框架 bug。常见原因包括数据读取慢、NFS metadata 卡顿、worker 阻塞在队列/锁、fork 后权限问题、共享内存不足、随机访问小文件、日志或 checkpoint fsync 抖动。<code>strace</code> 可以把这些猜测落到 syscall 证据。</p>
+<section class="figure">
+<h3>案例图：GPU 等数据时的 syscall 线索</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="dataloader syscall 排障图">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="26" font-weight="700">GPU 利用率低：从训练主进程追到 dataloader worker</text>
+<rect x="70" y="130" width="230" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="170" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">训练主进程</text><text x="185" y="202" text-anchor="middle" font-size="15">wait / futex / recv</text><text x="185" y="226" text-anchor="middle" font-size="15">等待 batch</text>
+<rect x="435" y="130" width="230" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="170" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">DataLoader worker</text><text x="550" y="202" text-anchor="middle" font-size="15">openat / read / statx</text><text x="550" y="226" text-anchor="middle" font-size="15">读样本和元数据</text>
+<rect x="800" y="130" width="230" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="915" y="170" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">存储/网络</text><text x="915" y="202" text-anchor="middle" font-size="15">NFS / object fuse</text><text x="915" y="226" text-anchor="middle" font-size="15">长尾 I/O</text>
+<rect x="100" y="375" width="265" height="96" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="232" y="412" text-anchor="middle" font-size="18" font-weight="700">证据 1</text><text x="232" y="440" text-anchor="middle" font-size="14">主进程 futex 等待很久</text>
+<rect x="417" y="375" width="265" height="96" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="412" text-anchor="middle" font-size="18" font-weight="700">证据 2</text><text x="550" y="440" text-anchor="middle" font-size="14">worker read/stat 耗时高</text>
+<rect x="735" y="375" width="265" height="96" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="868" y="412" text-anchor="middle" font-size="18" font-weight="700">证据 3</text><text x="868" y="440" text-anchor="middle" font-size="14">路径集中在远端挂载</text>
+<line x1="300" y1="185" x2="435" y2="185" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="665" y1="185" x2="800" y2="185" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="185" y1="240" x2="232" y2="375" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="240" x2="550" y2="375" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="240" x2="868" y2="375" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">strace 的价值是把“GPU 在等数据”拆成可观察的主进程等待、worker 行为和存储路径证据。</div>
+</section>
+<pre><code># 1. 找训练进程和 worker
+pgrep -af 'python.*train'
+ps -eLf | grep 'train.py' | head -50
+
+# 2. 对整个进程树短窗口追踪，拆分到每个 PID 文件
+timeout 15s strace -ff -ttT -e trace=file,desc,process -p 12345 -o /tmp/train.strace
+
+# 3. 找耗时 syscall 和关键错误
+grep -R 'ENOENT\|EACCES\|&lt;[1-9][0-9]*\.' /tmp/train.strace.* | head -100
+
+# 4. 如果怀疑锁/队列等待，专门看 futex 和 poll
+timeout 10s strace -ff -ttT -e trace=futex,poll,ppoll,epoll_wait,read,write -p 12345 -o /tmp/train.wait</code></pre>
+<table>
+<tr><th>观察</th><th>可能原因</th><th>下一步</th></tr>
+<tr><td>worker 大量 <code>newfstatat</code>/<code>openat</code> 小文件</td><td>数据集小文件和 metadata 压力。</td><td>打包 shard、缓存 metadata、降低随机路径查找。</td></tr>
+<tr><td><code>read</code>/<code>pread64</code> 单次耗时长</td><td>远端存储、磁盘抖动、页缓存未命中。</td><td>结合 <code>iostat</code>、<code>pidstat -d</code>、存储监控。</td></tr>
+<tr><td>主进程长时间 <code>futex</code></td><td>等待 worker 队列、锁或线程同步。</td><td>看 worker 是否忙于 I/O 或已异常退出。</td></tr>
+<tr><td>频繁 <code>clone</code>/<code>wait4</code></td><td>worker 反复崩溃/重启或脚本频繁拉起子进程。</td><td>配合日志和 <code>-e trace=process</code> 定位退出码。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 容器、Kubernetes 和命名空间中的 strace</h2>
+<p>容器内使用 <code>strace</code> 的核心问题是权限和命名空间。你可能看不到宿主 PID，可能没有 <code>CAP_SYS_PTRACE</code>，也可能被 seccomp 禁止 ptrace。生产集群中应优先使用平台提供的 debug 工具链。</p>
+<pre><code># Docker 本地调试：显式添加 ptrace 权限和放宽 seccomp
+docker run --rm -it --cap-add SYS_PTRACE --security-opt seccomp=unconfined ubuntu:24.04 bash
+
+# Kubernetes：用临时 debug 容器进入同一个 Pod 的进程 namespace
+kubectl debug -it pod/my-pod --image=ubuntu:24.04 --target=my-container -- bash
+
+# 容器内确认目标进程与权限
+ps aux
+grep -E 'CapEff|NoNewPrivs|Seccomp|TracerPid' /proc/1/status</code></pre>
+<table>
+<tr><th>问题</th><th>表现</th><th>处理思路</th></tr>
+<tr><td>没有 strace 二进制</td><td><code>strace: command not found</code></td><td>debug image、临时安装、sidecar/debug container。</td></tr>
+<tr><td>没有 ptrace 权限</td><td><code>Operation not permitted</code></td><td>检查 <code>CAP_SYS_PTRACE</code>、securityContext、宿主策略。</td></tr>
+<tr><td>PID namespace 不一致</td><td>看不到目标 PID</td><td>进入同一 Pod/容器 namespace 或用平台 debug 能力。</td></tr>
+<tr><td>seccomp 限制</td><td>ptrace 或某些 syscall 被拒绝</td><td>使用受控 debug profile，不要私自放宽生产策略。</td></tr>
+</table>
+<div class="danger"><strong>Kubernetes 安全提醒：</strong> 给 Pod 添加 <code>SYS_PTRACE</code> 或 <code>seccomp=unconfined</code> 会扩大攻击面。排障完成后必须移除，不要把 debug 权限固化到业务 Deployment。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 降低噪声：字符串、缓冲区、路径和 FD 解码</h2>
+<p>默认输出有时会截断字符串、只显示 FD 数字、或输出过多二进制内容。合理使用解码和长度选项能让结果更可读，但也可能暴露敏感数据。</p>
+<table>
+<tr><th>选项</th><th>作用</th><th>注意</th></tr>
+<tr><td><code>-s N</code></td><td>设置字符串最大打印长度。</td><td><code>-s 256</code> 常用于路径/HTTP 片段；过大可能泄露 payload。</td></tr>
+<tr><td><code>-y</code></td><td>显示 FD 对应路径/对象。</td><td>有助于看 read/write 在哪个文件或 socket。</td></tr>
+<tr><td><code>-yy</code></td><td>更详细解码 FD 协议地址等。</td><td>网络和文件定位更直观。</td></tr>
+<tr><td><code>-o FILE</code></td><td>输出到文件。</td><td>生产必备，便于 grep 和归档。</td></tr>
+<tr><td><code>-ff -o PREFIX</code></td><td>每个 PID 一个文件。</td><td>多进程任务更容易分析。</td></tr>
+<tr><td><code>-qq</code></td><td>减少附加/退出提示。</td><td>脚本化输出更干净。</td></tr>
+</table>
+<pre><code># 更容易读路径和 FD
+timeout 10s strace -f -ttT -yy -s 256 -e trace=file,network -p 12345 -o /tmp/rich.strace
+
+# 多进程拆文件
+timeout 10s strace -ff -ttT -yy -s 128 -p 12345 -o /tmp/app.strace
+
+# 只保留失败和路径关键字
+grep -E 'ENOENT|EACCES|ECONN|ETIMEDOUT|/data|/models|/dev/shm' /tmp/rich.strace | head -100</code></pre>
+<div class="warn"><strong>隐私提醒：</strong> <code>-s</code> 过大时可能打印 token、请求参数、文件路径、用户名、密钥片段或业务数据。共享 strace 日志前必须脱敏。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 开销、安全和数据治理</h2>
+<p><code>strace</code> 的开销来自 ptrace trap、上下文切换、参数解码和输出写入。syscall 越密集，开销越高；输出越详细，开销和泄露风险越高。</p>
+<div class="grid-2">
+<div class="card"><strong>低风险做法</strong><br>短窗口、窄过滤、输出到本地临时文件、只追踪可疑 TID、复现环境先跑、业务低峰执行。</div>
+<div class="card"><strong>高风险做法</strong><br>长时间无过滤 <code>-f</code>、大 <code>-s</code> 打印 payload、追踪高 QPS 代理、在共享节点随意提权。</div>
+<div class="card"><strong>性能风险</strong><br>延迟上升、吞吐下降、调度扰动、trace 文件写满磁盘。</div>
+<div class="card"><strong>安全风险</strong><br>泄露路径、参数、环境、网络地址、用户数据、密钥片段和内核/进程信息。</div>
+</div>
+<pre><code># 限制输出大小：timeout + 窄过滤 + 写 /tmp
+timeout 8s strace -qq -ttT -f -e trace=file -s 128 -p 12345 -o /tmp/app.file.strace
+du -h /tmp/app.file.strace
+
+# 采集后先做基本脱敏示例，再共享
+sed -E 's#(/home|/data)/[^" ]+#\1/REDACTED#g; s#token=[^&" ]+#token=REDACTED#g' /tmp/app.file.strace &gt; /tmp/app.file.redacted</code></pre>
+<div class="danger"><strong>磁盘警告：</strong> 高吞吐进程的 strace 日志增长非常快。不要把输出写到业务数据盘或满盘敏感的目录；必要时用 <code>timeout</code>、<code>head</code>、独立临时盘或更窄过滤。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. strace vs perf vs bpftrace vs lsof</h2>
+<p>这些工具回答的问题不同。正确选择工具，比把一个工具用到极限更重要。</p>
+<table>
+<tr><th>工具</th><th>主要回答</th><th>优势</th><th>局限</th></tr>
+<tr><td><code>strace</code></td><td>进程发起了哪些 syscall，结果和耗时是什么？</td><td>直观、无需写程序、单进程证据强。</td><td>开销较高，对高频 syscall 干扰明显。</td></tr>
+<tr><td><code>perf</code></td><td>CPU 时间花在哪里，硬件/内核事件如何？</td><td>低开销采样、适合 CPU 热点和调用栈。</td><td>不直接显示 syscall 参数和具体路径。</td></tr>
+<tr><td><code>bpftrace</code></td><td>在内核/用户探针上做低开销条件观测。</td><td>灵活、可聚合、适合全局和生产观测。</td><td>需要内核/BPF 权限和脚本能力。</td></tr>
+<tr><td><code>lsof</code></td><td>当前打开了哪些文件、socket、设备？</td><td>快照简单，适合 FD 清点。</td><td>不是时间序列，看不到调用过程和 errno。</td></tr>
+<tr><td><code>tcpdump</code>/<code>ss</code></td><td>网络包和 socket 状态。</td><td>网络层证据强。</td><td>不能解释应用为什么发起/不发起调用。</td></tr>
+</table>
+<section class="figure">
+<h3>对比图：工具分工</h3>
+<svg viewBox="0 0 1100 600" width="100%" role="img" aria-label="strace perf bpftrace lsof 对比">
+<rect x="20" y="20" width="1060" height="560" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">从问题类型选择观测工具</text>
+<rect x="80" y="145" width="210" height="270" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">strace</text><text x="185" y="238" text-anchor="middle" font-size="16">syscall 参数</text><text x="185" y="272" text-anchor="middle" font-size="16">errno / 路径</text><text x="185" y="306" text-anchor="middle" font-size="16">单进程排障</text><text x="185" y="355" text-anchor="middle" font-size="14">文件/网络/阻塞</text>
+<rect x="330" y="145" width="210" height="270" rx="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="435" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">perf</text><text x="435" y="238" text-anchor="middle" font-size="16">CPU 采样</text><text x="435" y="272" text-anchor="middle" font-size="16">热点函数</text><text x="435" y="306" text-anchor="middle" font-size="16">硬件事件</text><text x="435" y="355" text-anchor="middle" font-size="14">CPU 高/IPC 低</text>
+<rect x="580" y="145" width="210" height="270" rx="22" fill="#ccfbf1" stroke="#99f6e4"/><text x="685" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">bpftrace</text><text x="685" y="238" text-anchor="middle" font-size="16">条件观测</text><text x="685" y="272" text-anchor="middle" font-size="16">聚合统计</text><text x="685" y="306" text-anchor="middle" font-size="16">低开销</text><text x="685" y="355" text-anchor="middle" font-size="14">全局/长期趋势</text>
+<rect x="830" y="145" width="210" height="270" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="935" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">lsof/ss</text><text x="935" y="238" text-anchor="middle" font-size="16">当前快照</text><text x="935" y="272" text-anchor="middle" font-size="16">FD/socket</text><text x="935" y="306" text-anchor="middle" font-size="16">低风险</text><text x="935" y="355" text-anchor="middle" font-size="14">先看概况</text>
+<rect x="250" y="485" width="600" height="48" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="516" text-anchor="middle" font-size="17">经验顺序：lsof/ss 快照 → strace 证据 → perf/bpftrace 深挖</text>
+</svg>
+<div class="caption">strace 最强的是“具体 syscall 证据”，不是低开销长期监控。</div>
+</section>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 常见错误与 troubleshooting</h2>
+<div class="grid-2">
+<div class="card"><strong>Operation not permitted</strong><br>检查用户是否一致、<code>ptrace_scope</code>、<code>CAP_SYS_PTRACE</code>、容器 seccomp/AppArmor/SELinux。</div>
+<div class="card"><strong>输出太多看不懂</strong><br>加 <code>-e trace=...</code>、<code>-e status=failed</code>、<code>-o</code>、<code>-ff</code>，先按问题分类。</div>
+<div class="card"><strong>附加后服务变慢</strong><br>缩短 <code>timeout</code>，只追踪 TID，减少 <code>-s</code>，避免无过滤 <code>-f</code>。</div>
+<div class="card"><strong>看到很多 ENOENT</strong><br>确认是否为正常路径探测；找关键路径、最后成功路径和业务报错附近时间。</div>
+<div class="card"><strong>只有 futex 看不懂</strong><br><code>futex</code> 常表示锁/条件变量等待；结合线程状态、应用栈、<code>perf</code> 或语言 dump。</div>
+<div class="card"><strong>没有看到子进程</strong><br>使用 <code>-f</code> 或 <code>-ff</code>，并确认 attach 时子进程是否已经存在。</div>
+<div class="card"><strong>网络问题证据不足</strong><br>strace 只能看进程 socket 调用；配合 <code>ss -tanp</code>、<code>tcpdump</code>、DNS 工具。</div>
+<div class="card"><strong>日志包含敏感数据</strong><br>降低 <code>-s</code>，避免追踪 payload syscall，分享前脱敏。</div>
+</div>
+<section class="figure">
+<h3>排障流程图：strace 结果不符合预期</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="strace troubleshooting 流程图">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">strace 没得到结论</text>
+<rect x="70" y="165" width="225" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="182" y="200" text-anchor="middle" font-size="18" font-weight="700">PID 对吗？</text><text x="182" y="228" text-anchor="middle" font-size="14">pgrep / ps / namespace</text>
+<rect x="320" y="165" width="225" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="432" y="200" text-anchor="middle" font-size="18" font-weight="700">权限够吗？</text><text x="432" y="228" text-anchor="middle" font-size="14">ptrace / container</text>
+<rect x="570" y="165" width="225" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="682" y="200" text-anchor="middle" font-size="18" font-weight="700">过滤对吗？</text><text x="682" y="228" text-anchor="middle" font-size="14">file / network / desc</text>
+<rect x="820" y="165" width="225" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="932" y="200" text-anchor="middle" font-size="18" font-weight="700">问题在用户态？</text><text x="932" y="228" text-anchor="middle" font-size="14">perf / profiler</text>
+<rect x="120" y="365" width="250" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="245" y="402" text-anchor="middle" font-size="18" font-weight="700">加 -ttT</text><text x="245" y="430" text-anchor="middle" font-size="14">先找时间证据</text>
+<rect x="425" y="365" width="250" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="402" text-anchor="middle" font-size="18" font-weight="700">加 -f/-ff</text><text x="550" y="430" text-anchor="middle" font-size="14">不要漏掉 worker</text>
+<rect x="730" y="365" width="250" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="855" y="402" text-anchor="middle" font-size="18" font-weight="700">换工具验证</text><text x="855" y="430" text-anchor="middle" font-size="14">lsof / ss / perf / logs</text>
+<rect x="300" y="560" width="500" height="72" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="591" text-anchor="middle" font-size="20" font-weight="700">结论必须能被 syscall、时间或错误码支持</text><text x="550" y="618" text-anchor="middle" font-size="14">否则把假设降级为猜测，继续缩小范围</text>
+<line x1="550" y1="111" x2="182" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="432" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="682" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="932" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="182" y1="257" x2="245" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="432" y1="257" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="682" y1="257" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="932" y1="257" x2="855" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="245" y1="459" x2="420" y2="560" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="459" x2="550" y2="560" stroke="#94a3b8" stroke-width="3"/><line x1="855" y1="459" x2="680" y2="560" stroke="#94a3b8" stroke-width="3"/>
+</svg>
+<div class="caption">当 strace 不够时，不要硬猜：检查目标、权限、过滤和问题层级，再决定是否换工具。</div>
+</section>
+<h3>排障模板</h3>
+<pre><code># 1. 确认目标进程
+ps -fp 12345
+ps -L -p 12345 -o pid,tid,stat,wchan:24,pcpu,comm
+
+# 2. 先只看失败
+timeout 10s strace -f -e status=failed -p 12345 -o /tmp/failed.strace
+
+# 3. 按失败类型切过滤
+timeout 10s strace -f -ttT -e trace=file -p 12345 -o /tmp/file.strace
+timeout 10s strace -f -ttT -e trace=network -p 12345 -o /tmp/net.strace
+
+# 4. 如果 syscall 没有长耗时，考虑用户态 CPU/锁/语言运行时
+perf top -p 12345</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 速查、练习和生产 playbook</h2>
+<h3>常用命令速查</h3>
+<table>
+<tr><th>目标</th><th>命令</th></tr>
+<tr><td>追踪新命令</td><td><code>strace -o /tmp/cmd.strace command args...</code></td></tr>
+<tr><td>附加运行中进程</td><td><code>timeout 10s strace -ttT -p PID -o /tmp/app.strace</code></td></tr>
+<tr><td>跟踪子进程</td><td><code>strace -f -p PID -o /tmp/app.strace</code></td></tr>
+<tr><td>每个 PID 独立输出</td><td><code>strace -ff -p PID -o /tmp/app.strace</code></td></tr>
+<tr><td>只看文件</td><td><code>strace -e trace=file -p PID</code></td></tr>
+<tr><td>只看网络</td><td><code>strace -e trace=network -p PID</code></td></tr>
+<tr><td>只看失败</td><td><code>strace -e status=failed -p PID</code></td></tr>
+<tr><td>显示耗时</td><td><code>strace -ttT -p PID</code></td></tr>
+<tr><td>统计 syscall</td><td><code>strace -c command</code></td></tr>
+</table>
+<h3>生产 playbook</h3>
+<ol>
+<li>先确认业务现象、时间窗口、目标 PID/TID 和是否有子进程。</li>
+<li>先跑只读快照工具：<code>ps</code>、<code>top -H</code>、<code>lsof</code>、<code>ss</code>，避免盲目 attach。</li>
+<li>用 <code>timeout</code> 控制窗口，用 <code>-o</code> 写文件，用 <code>-e</code> 缩小范围。</li>
+<li>优先收集 <code>-ttT</code> 时间证据和 <code>errno</code> 错误证据。</li>
+<li>输出共享前脱敏，排障完成后删除含敏感信息的 trace。</li>
+</ol>
+<h3>练习任务</h3>
+<pre><code># 练习 1：观察命令启动时查找动态库和 locale 文件
+strace -e trace=file -o /tmp/ls.file.strace ls
+grep -E 'openat|ENOENT' /tmp/ls.file.strace | head
+
+# 练习 2：观察网络连接失败
+strace -ttT -e trace=network nc -vz 127.0.0.1 1
+
+# 练习 3：观察 Python 打开不存在文件
+strace -e trace=file python3 -c 'open("/tmp/not-exist-demo")'
+
+# 练习 4：统计 syscall 次数和耗时
+strace -c python3 -c 'print(sum(range(100000)))'</code></pre>
+<div class="success"><strong>学习路线：</strong> 先掌握 <code>-p</code>、<code>-f</code>、<code>-e trace=file/network</code>、<code>-ttT</code>、errno；再学习容器权限、FD 解码、<code>-ff</code>、与 perf/bpftrace 的组合。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>strace(1)</code>、<code>ptrace(2)</code>、<code>proc(5)</code>，理解附加机制、选项和 <code>/proc</code> 证据。</li>
+<li>strace 官方文档与 release notes：关注 <code>-e trace</code>、<code>-e status</code>、<code>-yy</code>、syscall 解码能力变化。</li>
+<li>Linux man-pages：<code>openat(2)</code>、<code>read(2)</code>、<code>connect(2)</code>、<code>futex(2)</code>、<code>clone(2)</code>，理解常见 syscall 语义。</li>
+<li>Kubernetes 文档：debug containers、securityContext、capabilities、seccomp，用于受控地排查容器内进程。</li>
+<li>Brendan Gregg 的 Linux performance materials：用于理解 strace、perf、eBPF 工具在生产性能排障中的分工。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解 syscall 边界，再掌握 <code>-p/-f/-e/-ttT</code>，最后把 strace 放进 AI Infra 的文件、网络、进程、容器和性能工具链中使用。</p></section>
+<div class="footer">strace 深度教程 · AI Infra/Linux syscall tracing、attach safety、过滤、时间证据、dataloader 排障与生产安全</div>
+</div>
+</body>
+</html>

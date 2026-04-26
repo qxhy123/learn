@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>objdump 深度教程：AI Infra 场景下的 ELF、反汇编与动态链接诊断</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>objdump 深度教程：AI Infra 场景下的 ELF、反汇编与动态链接诊断</h1>
+<p class="sub">这份教程面向 AI Infra、Linux 性能排障、CUDA/C++ 扩展发布和二进制兼容性诊断。<code>objdump</code> 不是“把程序变成源码”的工具，而是把 ELF 目标文件、可执行文件和共享库中的头信息、段表、符号、重定位、动态依赖和机器指令以可读形式展开。掌握它，可以快速回答：这个 <code>.so</code> 是不是 x86_64？是否依赖了错误版本的 <code>GLIBCXX</code>？符号是否导出？是否被 strip？热点函数有没有 AVX512 指令？Python 扩展为什么 import 失败？</p>
+<div class="chips"><span class="chip">ELF 结构</span><span class="chip">反汇编</span><span class="chip">符号表</span><span class="chip">动态链接</span><span class="chip">CUDA/C++ 扩展</span><span class="chip">CPU ISA</span><span class="chip">strip 诊断</span><span class="chip">AI Infra</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>objdump</code> 是二进制文件的“静态解剖台”：不执行程序，只读取文件结构和机器码，帮助你定位架构、链接、符号和指令层面的事实。</div>
+<div class="success"><strong>安全实践：</strong> 排查陌生二进制时先用 <code>file</code>、<code>sha256sum</code>、<code>readelf -h</code> 做轻量确认；不要为了验证依赖而直接运行未知程序。对不可信样本使用容器、只读挂载和最新 binutils。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">objdump 是什么</a></li>
+<li><a class="anchor" href="#s2">ELF 心智模型</a></li>
+<li><a class="anchor" href="#s3">安装、版本与目标格式</a></li>
+<li><a class="anchor" href="#s4">最常用命令速查</a></li>
+<li><a class="anchor" href="#s5">文件头与架构确认</a></li>
+<li><a class="anchor" href="#s6">Section 表与内存布局</a></li>
+<li><a class="anchor" href="#s7">反汇编工作流</a></li>
+<li><a class="anchor" href="#s8">符号表、C++ 名字与导出诊断</a></li>
+<li><a class="anchor" href="#s9">动态信息、依赖与 RPATH</a></li>
+<li><a class="anchor" href="#s10">重定位与 PLT/GOT</a></li>
+<li><a class="anchor" href="#s11">CUDA/C++ 扩展诊断</a></li>
+<li><a class="anchor" href="#s12">CPU ISA 与性能排查</a></li>
+<li><a class="anchor" href="#s13">strip 后的二进制怎么查</a></li>
+<li><a class="anchor" href="#s14">objdump vs readelf/nm/ldd</a></li>
+<li><a class="anchor" href="#s15">安全与生产注意事项</a></li>
+<li><a class="anchor" href="#s16">常见故障剧本</a></li>
+<li><a class="anchor" href="#s17">练习路线与参考资料</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. objdump 是什么</h2>
+<p><code>objdump</code> 来自 GNU binutils，主要用于展示目标文件、可执行文件、静态库和共享库的内部信息。它常用于“构建产物已经生成，但运行时行为不符合预期”的阶段：无需源码也能检查文件格式、机器架构、符号导出、动态链接条目和反汇编结果。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长</strong><br>查看 ELF 头、section、符号、动态节、重定位、反汇编和原始 section 内容。</div>
+<div class="card"><strong>它不擅长</strong><br>解析 DWARF 的全部细节、给出动态加载最终决策、替代调试器或还原高级语言源码。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>诊断 PyTorch/TensorFlow 扩展、NCCL/RDMA 插件、C++ ABI、CPU 指令集和容器内运行时依赖。</div>
+</div>
+<pre><code># 先确认文件类型，再用 objdump 深挖
+file build/libcustom_ops.so
+objdump -f build/libcustom_ops.so
+objdump -p build/libcustom_ops.so | sed -n '/Dynamic Section:/,/Version References:/p'
+objdump -TC build/libcustom_ops.so | grep -E 'forward|torch|GLIBCXX'</code></pre>
+<div class="warn"><strong>边界：</strong> <code>objdump</code> 的输出是“文件里写了什么”，不等于“动态加载器最终选择了什么”。运行时搜索路径、<code>LD_LIBRARY_PATH</code>、容器挂载和 audit hook 仍需要 <code>ldd</code>、<code>LD_DEBUG=libs</code> 或实际加载日志确认。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：ELF 文件在 objdump 眼中的结构</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="ELF 文件结构">
+<rect x="18" y="18" width="1064" height="614" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">ELF = 头信息 + 装载视图 + 链接视图 + 机器码/数据</text>
+<rect x="70" y="110" width="220" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="180" y="148" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">ELF Header</text><text x="180" y="178" text-anchor="middle" font-size="14">架构、位数、端序</text><text x="180" y="199" text-anchor="middle" font-size="14">入口点、类型</text>
+<rect x="330" y="110" width="220" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="440" y="148" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">Program Headers</text><text x="440" y="178" text-anchor="middle" font-size="14">加载器视角</text><text x="440" y="199" text-anchor="middle" font-size="14">LOAD / DYNAMIC</text>
+<rect x="590" y="110" width="220" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="700" y="148" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">Sections</text><text x="700" y="178" text-anchor="middle" font-size="14">链接器视角</text><text x="700" y="199" text-anchor="middle" font-size="14">.text / .data / .rodata</text>
+<rect x="850" y="110" width="180" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="940" y="148" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">Symbols</text><text x="940" y="178" text-anchor="middle" font-size="14">函数/变量名</text><text x="940" y="199" text-anchor="middle" font-size="14">导入与导出</text>
+<rect x="92" y="320" width="916" height="170" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<rect x="125" y="360" width="160" height="72" rx="12" fill="#fff" stroke="#cbd5e1"/><text x="205" y="390" text-anchor="middle" font-size="17" font-weight="700">.text</text><text x="205" y="414" text-anchor="middle" font-size="13">机器指令</text>
+<rect x="320" y="360" width="160" height="72" rx="12" fill="#fff" stroke="#cbd5e1"/><text x="400" y="390" text-anchor="middle" font-size="17" font-weight="700">.plt/.got</text><text x="400" y="414" text-anchor="middle" font-size="13">动态调用跳板</text>
+<rect x="515" y="360" width="160" height="72" rx="12" fill="#fff" stroke="#cbd5e1"/><text x="595" y="390" text-anchor="middle" font-size="17" font-weight="700">.dynamic</text><text x="595" y="414" text-anchor="middle" font-size="13">NEEDED/RPATH</text>
+<rect x="710" y="360" width="160" height="72" rx="12" fill="#fff" stroke="#cbd5e1"/><text x="790" y="390" text-anchor="middle" font-size="17" font-weight="700">.symtab</text><text x="790" y="414" text-anchor="middle" font-size="13">静态符号</text>
+<text x="550" y="546" text-anchor="middle" font-size="16" fill="#475569">objdump 用不同选项切换视角：-f 看文件头，-h 看 section，-p 看动态私有头，-t/-T 看符号，-d/-D 看指令</text>
+</svg>
+<div class="caption">排查二进制问题时先建立结构视角：加载器看 program header，链接器看 section，开发者常从符号和反汇编定位问题。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与目标格式</h2>
+<p>Linux 发行版通常把 <code>objdump</code> 放在 <code>binutils</code> 包中。交叉编译环境会提供带前缀的版本，例如 <code>aarch64-linux-gnu-objdump</code>、<code>riscv64-linux-gnu-objdump</code>。LLVM 也有 <code>llvm-objdump</code>，输出格式和选项略有差异。</p>
+<table>
+<tr><th>环境</th><th>安装/检查</th><th>说明</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>apt-get install binutils</code></td><td>常见 x86_64 服务器默认已安装。</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>dnf install binutils</code></td><td>老系统可能是 <code>yum</code>。</td></tr>
+<tr><td>交叉工具链</td><td><code>aarch64-linux-gnu-objdump -f app</code></td><td>用目标架构对应工具，避免反汇编器解码错误。</td></tr>
+<tr><td>LLVM 工具链</td><td><code>llvm-objdump --version</code></td><td>常用于 Clang/LLVM 构建链，语法不完全等同 GNU objdump。</td></tr>
+</table>
+<pre><code># 查看版本与支持的目标格式
+objdump --version
+objdump -i | sed -n '1,80p'
+
+# 交叉编译产物应优先使用匹配架构的 objdump
+file build/arm64_worker
+aarch64-linux-gnu-objdump -f build/arm64_worker</code></pre>
+<div class="note"><strong>版本意识：</strong> 新 CPU 指令、较新的 ELF 扩展或供应商工具链生成的对象文件，可能需要更新的 binutils 才能正确解码。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 最常用命令速查</h2>
+<table>
+<tr><th>命令</th><th>作用</th><th>AI Infra 场景</th></tr>
+<tr><td><code>objdump -f file</code></td><td>文件头摘要</td><td>确认 x86_64/aarch64、ELF 类型、入口点。</td></tr>
+<tr><td><code>objdump -h file</code></td><td>section headers</td><td>查看 <code>.text</code>、<code>.rodata</code>、<code>.debug_*</code> 是否存在。</td></tr>
+<tr><td><code>objdump -p file</code></td><td>private headers</td><td>查看 <code>NEEDED</code>、<code>RPATH</code>、<code>RUNPATH</code>、SONAME。</td></tr>
+<tr><td><code>objdump -t file</code></td><td>普通符号表</td><td>未 strip 产物中查内部函数。</td></tr>
+<tr><td><code>objdump -T file</code></td><td>动态符号表</td><td>共享库导入/导出符号诊断。</td></tr>
+<tr><td><code>objdump -C -T file</code></td><td>动态符号并 C++ demangle</td><td>查 <code>torch::</code>、<code>std::</code>、自定义 op 名称。</td></tr>
+<tr><td><code>objdump -d file</code></td><td>反汇编可执行 section</td><td>看函数机器码、调用路径、CPU 指令。</td></tr>
+<tr><td><code>objdump -D file</code></td><td>反汇编所有 section</td><td>深挖异常布局；噪声大，谨慎使用。</td></tr>
+<tr><td><code>objdump -r/-R file</code></td><td>静态/动态重定位</td><td>看外部符号引用、PLT/GOT 绑定。</td></tr>
+<tr><td><code>objdump -s -j .rodata file</code></td><td>转储 section 内容</td><td>查编译进二进制的字符串、版本标记。</td></tr>
+</table>
+<pre><code># 一个共享库的标准体检
+so=build/libcustom_ops.so
+file "$so"
+objdump -f "$so"
+objdump -h "$so" | sed -n '1,40p'
+objdump -p "$so" | grep -E 'NEEDED|RPATH|RUNPATH|SONAME'
+objdump -TC "$so" | grep -E 'custom|torch|GLIBCXX|CXXABI'</code></pre>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 文件头与架构确认</h2>
+<p>文件头是排障第一步。容器里常见问题包括：把 aarch64 镜像产物拷到 x86_64 机器、把静态库误当共享库、或者 Python wheel 中混入不匹配平台的 <code>.so</code>。</p>
+<pre><code># 确认 ELF 类型、机器架构、入口点
+objdump -f ./bin/inference_server
+
+# 对 Python wheel 解包后的扩展逐个检查
+find wheel-unpack -name '*.so' -print0 |
+  xargs -0 -n1 sh -c 'echo "== $1"; objdump -f "$1" | sed -n "1,6p"' sh</code></pre>
+<table>
+<tr><th>字段</th><th>怎么看</th><th>常见结论</th></tr>
+<tr><td><code>file format elf64-x86-64</code></td><td>目标格式和位数</td><td>x86_64 Linux ELF，适合 x86_64 用户态。</td></tr>
+<tr><td><code>architecture: i386:x86-64</code></td><td>反汇编架构</td><td>如果与机器不符，运行会报 <code>Exec format error</code>。</td></tr>
+<tr><td><code>HAS_SYMS</code></td><td>是否有普通符号表</td><td>没有不代表不能运行，但调试能力下降。</td></tr>
+<tr><td><code>DYNAMIC</code></td><td>是否动态链接</td><td>共享库和动态可执行文件通常有该标志。</td></tr>
+</table>
+<div class="warn"><strong>注意：</strong> <code>objdump -f</code> 给的是文件级摘要；要看加载段、解释器和动态节，继续用 <code>objdump -p</code> 或 <code>readelf -l/-d</code>。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. Section 表与内存布局</h2>
+<p><code>objdump -h</code> 展示 section headers。AI Infra 中常用它判断：是否保留 debug 信息、是否有 CUDA fatbin、<code>.text</code> 是否异常大、是否含 <code>.gnu.version*</code> 版本信息、是否被 strip。</p>
+<pre><code># 查看 section 摘要
+objdump -h build/libcustom_ops.so
+
+# 只关注关键 section
+objdump -h build/libcustom_ops.so |
+  grep -E 'Idx|\\.text|\\.rodata|\\.dynsym|\\.symtab|\\.debug|\\.nv_fatbin|\\.dynamic|\\.gnu.version'</code></pre>
+<table>
+<tr><th>section</th><th>含义</th><th>诊断价值</th></tr>
+<tr><td><code>.text</code></td><td>机器指令</td><td>反汇编入口；大小突增可能来自模板膨胀或重复实例化。</td></tr>
+<tr><td><code>.rodata</code></td><td>只读常量和字符串</td><td>可查编译选项、错误字符串、算子名。</td></tr>
+<tr><td><code>.dynsym</code>/<code>.dynstr</code></td><td>动态符号与字符串</td><td>动态链接器可见的导入/导出符号。</td></tr>
+<tr><td><code>.symtab</code>/<code>.strtab</code></td><td>普通符号表</td><td>strip 后通常消失；调试和反汇编定位受影响。</td></tr>
+<tr><td><code>.dynamic</code></td><td>动态链接元数据</td><td>包含依赖库、RPATH/RUNPATH、初始化函数等。</td></tr>
+<tr><td><code>.nv_fatbin</code></td><td>CUDA device code 容器</td><td>说明库可能包含 GPU kernel，但具体 cubin/PTX 更适合 <code>cuobjdump</code>。</td></tr>
+<tr><td><code>.debug_*</code></td><td>DWARF 调试信息</td><td><code>objdump -S</code> 混合源码需要它和源码路径。</td></tr>
+</table>
+<div class="note"><strong>读表技巧：</strong> <code>VMA</code> 是运行时虚拟地址，<code>File off</code> 是文件偏移；反汇编定位函数时通常关注 VMA。</div>
+</section>
+
+<section class="figure" id="s7">
+<h3>流程图：一次可复用的反汇编工作流</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="objdump 反汇编工作流">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="45" width="260" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="84" text-anchor="middle" font-size="22" font-weight="700">拿到二进制</text>
+<rect x="85" y="165" width="220" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="195" y="199" text-anchor="middle" font-size="18" font-weight="700">确认架构</text><text x="195" y="225" text-anchor="middle" font-size="14">file / objdump -f</text>
+<rect x="330" y="165" width="220" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="440" y="199" text-anchor="middle" font-size="18" font-weight="700">找目标符号</text><text x="440" y="225" text-anchor="middle" font-size="14">objdump -TC / nm -C</text>
+<rect x="575" y="165" width="220" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="685" y="199" text-anchor="middle" font-size="18" font-weight="700">限制范围</text><text x="685" y="225" text-anchor="middle" font-size="14">-j .text / grep 地址</text>
+<rect x="820" y="165" width="220" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="930" y="199" text-anchor="middle" font-size="18" font-weight="700">选择语法</text><text x="930" y="225" text-anchor="middle" font-size="14">-M intel 或默认 AT&amp;T</text>
+<rect x="145" y="365" width="250" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="270" y="401" text-anchor="middle" font-size="18" font-weight="700">反汇编函数附近</text><text x="270" y="429" text-anchor="middle" font-size="14">objdump -d -C</text>
+<rect x="425" y="365" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="401" text-anchor="middle" font-size="18" font-weight="700">检查调用和跳转</text><text x="550" y="429" text-anchor="middle" font-size="14">call / jmp / PLT</text>
+<rect x="705" y="365" width="250" height="92" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="830" y="401" text-anchor="middle" font-size="18" font-weight="700">检查 ISA 指令</text><text x="830" y="429" text-anchor="middle" font-size="14">avx512 / amx / neon</text>
+<rect x="285" y="570" width="530" height="56" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="605" text-anchor="middle" font-size="19" font-weight="700">结论必须回到构建参数、运行机器和依赖版本验证</text>
+<line x1="550" y1="109" x2="195" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="550" y1="109" x2="440" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="550" y1="109" x2="685" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="550" y1="109" x2="930" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/>
+<line x1="440" y1="251" x2="270" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="685" y1="251" x2="550" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="930" y1="251" x2="830" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/>
+<line x1="270" y1="457" x2="420" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="550" y1="457" x2="550" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><line x1="830" y1="457" x2="680" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">不要直接对整个大库盲目 <code>objdump -D</code>。先确认架构和符号，再缩小到函数、section 或地址范围。</div>
+</section>
+
+<section class="section">
+<h2>6. 反汇编：从函数、调用到源码行</h2>
+<p><code>objdump -d</code> 反汇编可执行 section，通常足够；<code>-D</code> 会把所有 section 当指令解码，噪声很大。C++ 代码建议加 <code>-C</code> demangle，x86 排障常加 <code>-M intel</code> 切换 Intel 语法。</p>
+<pre><code># C++ 共享库反汇编，显示 demangle 后的函数名
+objdump -d -C build/libcustom_ops.so | sed -n '/&lt;custom_forward/,/^$/p'
+
+# x86_64 使用 Intel 语法，更接近性能分析报告习惯
+objdump -d -C -M intel build/libcustom_ops.so | sed -n '/&lt;custom_forward/,/^$/p'
+
+# 只反汇编 .text，减少噪声
+objdump -d -C -j .text build/libcustom_ops.so &gt; disasm.txt
+
+# 如果保留了 debug info，可尝试源码和汇编混排
+objdump -d -S -C build/libcustom_ops_debug.so | less</code></pre>
+<table>
+<tr><th>观察点</th><th>含义</th><th>排障问题</th></tr>
+<tr><td><code>call ...@plt</code></td><td>通过 PLT 调用外部动态符号</td><td>依赖库是否正确提供该符号？</td></tr>
+<tr><td><code>vaddps</code>/<code>vmovapd</code></td><td>AVX/AVX2/AVX512 向量指令</td><td>目标机器是否支持？是否触发 illegal instruction？</td></tr>
+<tr><td><code>endbr64</code></td><td>CET/IBT 相关指令</td><td>工具链安全特性是否启用？老反汇编器是否识别？</td></tr>
+<tr><td>没有函数名</td><td>符号被 strip 或没有导出</td><td>需要 debug 包、map 文件或动态符号辅助定位。</td></tr>
+</table>
+<div class="warn"><strong>源码混排限制：</strong> <code>-S</code> 需要调试信息和可访问的源码路径；生产 wheel 常被 strip，输出可能只有汇编。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 符号表、C++ 名字与导出诊断</h2>
+<p>Python/C++ 扩展最常见的 import 报错是 <code>undefined symbol</code>。此时要区分：符号是否在本库导出、是否只是本库引用外部符号、符号是否被 C++ name mangling 改名、是否因为 <code>-fvisibility=hidden</code> 被隐藏。</p>
+<pre><code># 动态符号：动态加载器能看到的导入/导出
+objdump -T build/libcustom_ops.so | head
+
+# C++ demangle，便于搜索类名、命名空间、模板
+objdump -TC build/libcustom_ops.so | grep -E 'torch::|at::|custom_forward'
+
+# 普通符号表：未 strip 时更完整
+objdump -t -C build/libcustom_ops.so | grep custom_forward
+
+# 只看未定义动态符号，即运行时需要别人提供的符号
+objdump -T build/libcustom_ops.so | awk '$4 == "*UND*" {print}' | head -50</code></pre>
+<table>
+<tr><th>符号表现象</th><th>可能原因</th><th>下一步</th></tr>
+<tr><td><code>*UND*</code></td><td>该库引用外部符号</td><td>确认依赖库是否通过 <code>NEEDED</code> 或宿主进程提供。</td></tr>
+<tr><td><code>Base</code> 或版本号</td><td>动态符号带版本</td><td>检查目标机器 <code>GLIBC</code>/<code>GLIBCXX</code> 版本。</td></tr>
+<tr><td>函数只在 <code>-t</code> 可见</td><td>非动态导出或局部符号</td><td>需要导出给 Python/插件时检查 visibility 和链接脚本。</td></tr>
+<tr><td>完全找不到</td><td>被优化、内联、strip 或没链接进来</td><td>检查构建日志、静态库顺序、LTO 和 dead strip。</td></tr>
+</table>
+<div class="note"><strong>C++ 名字：</strong> 编译器会把 <code>namespace::Class::method</code> 编码成 mangled name。<code>objdump -C</code> 只是显示层 demangle，不会改变真实符号。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 动态信息、依赖与 RPATH</h2>
+<p><code>objdump -p</code> 对 ELF 共享库特别有用：它能显示动态节中的 <code>NEEDED</code>、<code>SONAME</code>、<code>RPATH</code>、<code>RUNPATH</code>、初始化数组等。AI 训练/推理环境里，很多问题不是代码错，而是加载到了错误的 <code>libstdc++.so</code>、<code>libcuda.so</code>、<code>libnccl.so</code> 或系统 glibc。</p>
+<pre><code># 查看动态依赖和运行时搜索路径
+objdump -p build/libcustom_ops.so | grep -E 'NEEDED|RPATH|RUNPATH|SONAME'
+
+# 查看版本需求，例如 GLIBCXX_3.4.30
+objdump -T build/libcustom_ops.so | grep -E 'GLIBCXX|GLIBC|CXXABI' | sort -u
+
+# 对 wheel 中所有 .so 批量扫描 libstdc++ 版本需求
+find wheel-unpack -name '*.so' -print0 |
+  xargs -0 -n1 sh -c 'echo "== $1"; objdump -T "$1" | grep -Eo "GLIBCXX_[0-9.]+" | sort -Vu | tail -5' sh</code></pre>
+<table>
+<tr><th>条目</th><th>含义</th><th>风险</th></tr>
+<tr><td><code>NEEDED libtorch_cpu.so</code></td><td>运行时必须找到该库</td><td>容器、conda、系统路径中版本不一致。</td></tr>
+<tr><td><code>RUNPATH $ORIGIN</code></td><td>相对当前库目录搜索依赖</td><td>wheel 打包常用；路径错误会 import 失败。</td></tr>
+<tr><td><code>RPATH</code></td><td>旧式搜索路径</td><td>优先级和 <code>RUNPATH</code> 不同，可能覆盖预期依赖。</td></tr>
+<tr><td><code>SONAME</code></td><td>库的逻辑名字</td><td>发布 ABI 兼容库时很关键。</td></tr>
+</table>
+<div class="warn"><strong>静态 vs 动态：</strong> <code>objdump -p</code> 能告诉你二进制声明依赖谁，但不能告诉你运行时实际选中了哪个路径。路径决策用 <code>ldd</code>、<code>LD_DEBUG=libs</code> 或加载器日志确认。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 重定位与 PLT/GOT</h2>
+<p>重定位记录描述“这个位置稍后需要链接器或动态加载器填入地址”。当 C++ 扩展导入失败、插件符号晚绑定失败、或你想确认外部函数调用走不走 PLT 时，<code>-r</code>、<code>-R</code> 和反汇编结合很有用。</p>
+<pre><code># 静态重定位，常用于 .o 或未完全链接对象
+objdump -r build/temp.linux-x86_64/custom_kernel.o | head -60
+
+# 动态重定位，常用于 .so
+objdump -R build/libcustom_ops.so | head -80
+
+# 看 PLT 表附近
+objdump -d -C -j .plt build/libcustom_ops.so
+objdump -d -C -j .plt.got build/libcustom_ops.so 2&gt;/dev/null || true</code></pre>
+<table>
+<tr><th>现象</th><th>说明</th><th>处理方向</th></tr>
+<tr><td>大量 <code>R_X86_64_JUMP_SLOT</code></td><td>外部函数调用延迟绑定</td><td>正常动态链接行为。</td></tr>
+<tr><td>未定义符号出现在动态重定位</td><td>运行时必须解析</td><td>确认依赖库和导出符号版本。</td></tr>
+<tr><td>链接阶段 relocation 错误</td><td>对象文件编译模式不兼容</td><td>检查 <code>-fPIC</code>、静态库构建参数、架构。</td></tr>
+</table>
+<div class="note"><strong>实践：</strong> 对共享库链接静态库时，静态库也通常需要用 <code>-fPIC</code> 编译，否则可能在链接 <code>.so</code> 时出现重定位错误。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. CUDA/C++ 扩展诊断</h2>
+<p>CUDA 扩展往往同时包含 host 侧 C++ 代码、device 侧 fatbin/PTX/cubin、PyTorch 或 TensorFlow ABI、libstdc++ 版本、CUDA runtime 依赖。<code>objdump</code> 主要检查 host ELF 层；device 代码请结合 <code>cuobjdump</code> 或 <code>nvdisasm</code>。</p>
+<pre><code># 1. 确认扩展是正确平台的共享库
+file build/lib.linux-x86_64-cpython-311/my_ops.cpython-311-x86_64-linux-gnu.so
+objdump -f build/lib.linux-x86_64-cpython-311/my_ops*.so
+
+# 2. 检查是否带 CUDA fatbin section
+objdump -h build/lib.linux-x86_64-cpython-311/my_ops*.so | grep -E 'nv_fatbin|nvFatBin|cuda'
+
+# 3. 检查动态依赖
+objdump -p build/lib.linux-x86_64-cpython-311/my_ops*.so |
+  grep -E 'NEEDED|RPATH|RUNPATH'
+
+# 4. 检查 PyTorch/TensorFlow/C++ ABI 相关符号
+objdump -TC build/lib.linux-x86_64-cpython-311/my_ops*.so |
+  grep -E 'torch::|at::|c10::|tensorflow|GLIBCXX|CXXABI' | head -80</code></pre>
+<div class="grid-2">
+<div class="card"><strong>import 报 undefined symbol</strong><br>用 <code>objdump -TC</code> 查该符号是未定义还是缺失；再查宿主框架版本是否提供。</div>
+<div class="card"><strong>容器中能跑，宿主机不能跑</strong><br>扫描 <code>GLIBCXX_*</code>、<code>GLIBC_*</code> 需求，确认宿主系统库版本。</div>
+<div class="card"><strong>illegal instruction</strong><br>反汇编 host 热点函数，查 AVX512/AMX 等指令是否超出机器能力。</div>
+<div class="card"><strong>GPU kernel 不匹配</strong><br><code>objdump</code> 只能提示是否存在 fatbin；SM 架构细节应转到 <code>cuobjdump --list</code>。</div>
+</div>
+<div class="warn"><strong>不要误用：</strong> <code>objdump -d</code> 看到的是 host 机器码，不是 CUDA device SASS 的完整视图。GPU 指令排查要用 NVIDIA 专用工具。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. CPU ISA 与性能排查</h2>
+<p>AI 推理和预处理库常因为编译器自动向量化、手写 kernel 或第三方 math 库引入特定 CPU 指令。<code>objdump</code> 可以快速确认二进制里是否出现 AVX2、AVX512、AMX、NEON 等指令，但“出现”不等于“运行一定会执行”，还要结合 CPU feature gate 和代码路径。</p>
+<pre><code># x86_64：搜索常见向量指令
+objdump -d -C -M intel build/libcpu_kernels.so |
+  grep -E '\b(vfmadd|vmovap|vaddps|vpdpbusd|tileloadd|tdpbf16ps)\b' | head -50
+
+# 检查本机 CPU flags
+lscpu | grep -E 'Model name|Flags'
+
+# 对特定函数附近查看指令
+objdump -d -C -M intel build/libcpu_kernels.so |
+  sed -n '/&lt;gemm_bf16_kernel/,/^$/p'</code></pre>
+<table>
+<tr><th>指令/模式</th><th>大致含义</th><th>风险</th></tr>
+<tr><td><code>vaddps</code>、<code>vmulps</code></td><td>AVX 浮点向量</td><td>老 CPU 缺 AVX 会 illegal instruction。</td></tr>
+<tr><td><code>vpermt2ps</code>、<code>vpdpbusd</code></td><td>AVX512/VNNI 相关</td><td>云上不同实例代际差异明显。</td></tr>
+<tr><td><code>tileloadd</code>、<code>tdpbf16ps</code></td><td>Intel AMX</td><td>需要硬件、内核和运行时启用。</td></tr>
+<tr><td><code>fmla</code>、<code>ldp</code></td><td>AArch64/NEON 常见指令</td><td>需用 aarch64 objdump 正确解码。</td></tr>
+</table>
+<div class="success"><strong>发布建议：</strong> 面向异构 CPU 集群时，优先构建 baseline wheel，并把 AVX2/AVX512/AMX 优化放到运行时 dispatch 的独立代码路径中。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. stripped binaries：符号被剥离后还能查什么</h2>
+<p>生产镜像常用 <code>strip</code> 减小体积。strip 后普通符号表 <code>.symtab</code> 可能消失，但动态符号 <code>.dynsym</code> 通常仍在，因为动态加载需要它。此时 <code>objdump</code> 仍能查看头、section、动态依赖、动态符号和反汇编地址。</p>
+<pre><code># 判断是否保留普通符号表和调试信息
+objdump -h prod/libcustom_ops.so | grep -E '\\.symtab|\\.debug'
+objdump -t -C prod/libcustom_ops.so | head
+objdump -T -C prod/libcustom_ops.so | head
+
+# strip 后仍可按地址反汇编，但函数名可能缺失
+objdump -d -M intel prod/libcustom_ops.so | sed -n '1,120p'</code></pre>
+<table>
+<tr><th>还能做</th><th>不能轻易做</th><th>补救方式</th></tr>
+<tr><td>确认架构和动态依赖</td><td>定位所有内部函数名</td><td>保留单独 debug package 或 build-id 符号服务器。</td></tr>
+<tr><td>查看导出动态符号</td><td>源码/汇编混排</td><td>发布 debug wheel 或带 <code>-g</code> 的旁路产物。</td></tr>
+<tr><td>按地址看机器码</td><td>从地址直接还原业务语义</td><td>结合 perf map、linker map、崩溃栈和构建产物。</td></tr>
+</table>
+<div class="note"><strong>实践：</strong> 生产产物可以 strip，但 CI/CD 应保留同 build-id 的未剥离产物，便于线上崩溃和性能剖析回溯。</div>
+</section>
+
+<section class="figure" id="fig-tools">
+<h3>对比图：objdump、readelf、nm、ldd 怎么选</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="二进制工具选择图">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700">同一个 ELF，四类工具回答不同问题</text>
+<rect x="75" y="135" width="220" height="130" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="176" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">objdump</text><text x="185" y="207" text-anchor="middle" font-size="14">结构 + 反汇编</text><text x="185" y="231" text-anchor="middle" font-size="14">符号、重定位、动态节</text>
+<rect x="325" y="135" width="220" height="130" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="435" y="176" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">readelf</text><text x="435" y="207" text-anchor="middle" font-size="14">ELF 结构权威视图</text><text x="435" y="231" text-anchor="middle" font-size="14">头、段、版本、notes</text>
+<rect x="575" y="135" width="220" height="130" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="685" y="176" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">nm</text><text x="685" y="207" text-anchor="middle" font-size="14">符号检索更轻量</text><text x="685" y="231" text-anchor="middle" font-size="14">导出、未定义、排序</text>
+<rect x="825" y="135" width="220" height="130" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="935" y="176" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">ldd</text><text x="935" y="207" text-anchor="middle" font-size="14">运行时解析结果</text><text x="935" y="231" text-anchor="middle" font-size="14">实际依赖路径</text>
+<rect x="120" y="360" width="860" height="160" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="402" text-anchor="middle" font-size="20" font-weight="700">推荐组合</text>
+<text x="550" y="440" text-anchor="middle" font-size="16">架构/section/反汇编：objdump + readelf</text>
+<text x="550" y="472" text-anchor="middle" font-size="16">符号是否存在：objdump -TC 或 nm -D -C</text>
+<text x="550" y="504" text-anchor="middle" font-size="16">运行时到底加载哪个库：ldd 或 LD_DEBUG=libs</text>
+</svg>
+<div class="caption">不要把工具混为一谈：<code>objdump</code> 很全面，但 <code>readelf</code> 更贴近 ELF 原始结构，<code>nm</code> 更适合快速查符号，<code>ldd</code> 看运行时解析路径。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. objdump vs readelf/nm/ldd</h2>
+<table>
+<tr><th>问题</th><th>优先工具</th><th>原因</th><th>补充</th></tr>
+<tr><td>这个文件是不是目标架构？</td><td><code>file</code> + <code>objdump -f</code></td><td>最快确认格式和架构。</td><td><code>readelf -h</code> 更详细。</td></tr>
+<tr><td>ELF program header/动态节细节？</td><td><code>readelf -l -d</code></td><td>readelf 不依赖 BFD 解码，结构更直接。</td><td><code>objdump -p</code> 便于日常查看。</td></tr>
+<tr><td>查 C++ 符号是否导出？</td><td><code>nm -D -C</code> 或 <code>objdump -TC</code></td><td>两者都可 demangle 动态符号。</td><td>普通符号用 <code>nm -C</code> 或 <code>objdump -tC</code>。</td></tr>
+<tr><td>看机器指令和调用路径？</td><td><code>objdump -d -C</code></td><td>objdump 是反汇编主力。</td><td>LLVM 场景可用 <code>llvm-objdump</code>。</td></tr>
+<tr><td>实际加载了哪个 <code>libstdc++.so</code>？</td><td><code>ldd</code> 或 <code>LD_DEBUG=libs</code></td><td>这是运行时加载器决策。</td><td>不要直接 ldd 不可信可执行文件；共享库相对安全但仍建议隔离。</td></tr>
+</table>
+<div class="danger"><strong>ldd 安全提示：</strong> 某些系统上对不可信可执行文件运行 <code>ldd</code> 可能有执行风险。陌生样本优先用 <code>objdump -p</code> 或 <code>readelf -d</code> 静态查看 <code>NEEDED</code>。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 安全与生产注意事项</h2>
+<p><code>objdump</code> 通常只读文件，不会运行目标程序，但它仍然是复杂二进制解析器。对恶意构造的对象文件，解析器历史上也可能出现漏洞。因此生产排障要把“不执行”和“隔离解析”都纳入流程。</p>
+<div class="grid-2">
+<div class="card"><strong>不执行未知程序</strong><br>依赖信息先用 <code>objdump -p</code>、<code>readelf -d</code>。需要动态验证时进容器或沙箱。</div>
+<div class="card"><strong>保持工具更新</strong><br>过旧 binutils 可能无法识别新指令，也可能有已修复的解析漏洞。</div>
+<div class="card"><strong>限制输出规模</strong><br>大库 <code>-D</code> 输出巨大；用 <code>-j</code>、<code>grep</code>、<code>sed</code>、重定向文件控制范围。</div>
+<div class="card"><strong>保护客户/模型资产</strong><br>反汇编和 <code>.rodata</code> 可能暴露路径、字符串、密钥误植和内部算子名。</div>
+</div>
+<pre><code># 对不可信样本的保守静态检查
+sample=unknown.so
+sha256sum "$sample"
+file "$sample"
+objdump -f "$sample"
+objdump -p "$sample" | grep -E 'NEEDED|RPATH|RUNPATH' || true
+
+# 控制反汇编范围，避免输出爆炸
+objdump -d -j .text "$sample" | head -300</code></pre>
+<div class="warn"><strong>隐私提醒：</strong> <code>objdump -s -j .rodata</code> 可能把硬编码 URL、token、模型路径或用户名打印出来，日志系统中要谨慎保存。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障图：AI Infra 二进制问题的定位路径</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="objdump 排障路径">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="46" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="87" text-anchor="middle" font-size="22" font-weight="700">二进制运行/加载失败</text>
+<rect x="60" y="168" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="170" y="203" text-anchor="middle" font-size="17" font-weight="700">Exec format error</text><text x="170" y="231" text-anchor="middle" font-size="14">file / objdump -f</text>
+<rect x="315" y="168" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="203" text-anchor="middle" font-size="17" font-weight="700">undefined symbol</text><text x="425" y="231" text-anchor="middle" font-size="14">objdump -TC / nm -D</text>
+<rect x="570" y="168" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="680" y="203" text-anchor="middle" font-size="17" font-weight="700">lib*.so not found</text><text x="680" y="231" text-anchor="middle" font-size="14">objdump -p / ldd</text>
+<rect x="825" y="168" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="935" y="203" text-anchor="middle" font-size="17" font-weight="700">illegal instruction</text><text x="935" y="231" text-anchor="middle" font-size="14">objdump -d / lscpu</text>
+<rect x="95" y="365" width="250" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="220" y="398" text-anchor="middle" font-size="17" font-weight="700">确认构建目标</text><text x="220" y="425" text-anchor="middle" font-size="14">arch、ABI、glibc baseline</text>
+<rect x="425" y="365" width="250" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="398" text-anchor="middle" font-size="17" font-weight="700">确认依赖解析</text><text x="550" y="425" text-anchor="middle" font-size="14">NEEDED、RUNPATH、LD_LIBRARY_PATH</text>
+<rect x="755" y="365" width="250" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="880" y="398" text-anchor="middle" font-size="17" font-weight="700">确认机器能力</text><text x="880" y="425" text-anchor="middle" font-size="14">CPU flags、GPU SM、驱动版本</text>
+<rect x="235" y="570" width="630" height="70" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="604" text-anchor="middle" font-size="19" font-weight="700">修复通常发生在构建参数、打包依赖、运行镜像或发布矩阵</text><text x="550" y="628" text-anchor="middle" font-size="14">objdump 给证据，不替代 CI 兼容性测试</text>
+<line x1="550" y1="112" x2="170" y2="168" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="550" y1="112" x2="425" y2="168" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="550" y1="112" x2="680" y2="168" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="550" y1="112" x2="935" y2="168" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<line x1="170" y1="260" x2="220" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="425" y1="260" x2="550" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="680" y1="260" x2="550" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="935" y1="260" x2="880" y2="365" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<line x1="220" y1="451" x2="420" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="550" y1="451" x2="550" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><line x1="880" y1="451" x2="680" y2="570" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">AI Infra 的二进制故障通常落在四类：架构不匹配、符号/ABI 不匹配、动态库路径错误、指令集不兼容。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 常见故障剧本</h2>
+<h3>剧本 A：Python import 报 undefined symbol</h3>
+<pre><code># 假设报错中符号片段是 c10::Error 或某个自定义 op
+so=build/my_ops.cpython-311-x86_64-linux-gnu.so
+objdump -TC "$so" | grep -F 'c10::Error'
+objdump -p "$so" | grep -E 'NEEDED|RPATH|RUNPATH'
+python - <<'PY'
+import torch, sys
+print(torch.__version__)
+print(sys.version)
+PY</code></pre>
+<p>如果符号是 <code>*UND*</code>，说明扩展需要宿主框架或依赖库提供它；检查 PyTorch/TensorFlow 版本、编译 ABI、wheel 绑定的运行时依赖。</p>
+<h3>剧本 B：容器里导入成功，裸机导入失败</h3>
+<pre><code># 比较 GLIBCXX 需求
+objdump -T "$so" | grep -Eo 'GLIBCXX_[0-9.]+' | sort -Vu | tail
+
+# 查裸机 libstdc++ 能提供的最高版本
+strings /usr/lib64/libstdc++.so.6 2&gt;/dev/null | grep GLIBCXX_ | sort -Vu | tail</code></pre>
+<p>如果扩展需要的 <code>GLIBCXX_*</code> 高于宿主库，解决方向是降低构建基线、绑定兼容的 libstdc++、或升级运行环境。</p>
+<h3>剧本 C：illegal instruction</h3>
+<pre><code># 先看 CPU flags，再查二进制中是否有高阶 ISA
+lscpu | grep Flags
+objdump -d -M intel -C "$so" |
+  grep -E '\b(vpdpbusd|vpermt2|tileloadd|tdpbf16ps)\b' | head</code></pre>
+<p>如果二进制无条件执行目标 CPU 不支持的指令，需要重新编译 baseline 版本，或实现运行时 CPU dispatch。</p>
+<h3>剧本 D：链接共享库时报 relocation against ... can not be used</h3>
+<pre><code># 对中间 .o 或静态库成员看重定位
+objdump -r build/temp/custom_kernel.o | head -80
+
+# 查看静态库成员
+ar t third_party/libfoo.a | head
+objdump -r third_party/libfoo.a | grep -E 'R_X86_64_32|R_X86_64_PC32' | head</code></pre>
+<p>共享库中链接的对象通常需要 <code>-fPIC</code>。如果第三方静态库不是 PIC，需要重新构建或改为动态库。</p>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 学习路线与练习任务</h2>
+<h3>第一阶段：会读 ELF 摘要</h3>
+<ul>
+<li>用 <code>file</code> 和 <code>objdump -f</code> 判断架构、类型、入口点。</li>
+<li>用 <code>objdump -h</code> 找 <code>.text</code>、<code>.dynamic</code>、<code>.dynsym</code>、<code>.symtab</code>。</li>
+<li>用 <code>objdump -p</code> 查 <code>NEEDED</code>、<code>RUNPATH</code>、<code>SONAME</code>。</li>
+</ul>
+<h3>第二阶段：会查符号和反汇编</h3>
+<ul>
+<li>用 <code>objdump -TC</code> 查 C++ 动态符号，并理解 <code>*UND*</code>。</li>
+<li>用 <code>objdump -d -C -M intel</code> 查看函数附近机器码。</li>
+<li>用 <code>-j .text</code>、<code>sed</code>、<code>grep</code> 控制输出范围。</li>
+</ul>
+<h3>第三阶段：面向 AI Infra 故障闭环</h3>
+<ul>
+<li>把 <code>undefined symbol</code> 关联到框架版本、ABI 和动态依赖。</li>
+<li>把 <code>illegal instruction</code> 关联到 CPU flags、编译参数和运行时 dispatch。</li>
+<li>把容器/宿主差异关联到 <code>GLIBC</code>、<code>GLIBCXX</code>、<code>RPATH</code> 和实际加载路径。</li>
+</ul>
+<h3>练习命令</h3>
+<pre><code># 准备一个最小 C++ 共享库
+cat &gt; demo.cc &lt;&lt'CPP'
+#include &lt;string&gt;
+extern "C" int answer() { return 42; }
+std::string hello() { return "objdump-demo"; }
+CPP
+
+g++ -O2 -g -fPIC -shared demo.cc -o libdemo.so
+
+# 练习 1：看头、section、动态依赖
+objdump -f libdemo.so
+objdump -h libdemo.so | grep -E 'Idx|\\.text|\\.rodata|\\.dynamic|\\.symtab|\\.debug'
+objdump -p libdemo.so | grep -E 'NEEDED|SONAME|RPATH|RUNPATH' || true
+
+# 练习 2：看符号和反汇编
+objdump -TC libdemo.so | grep -E 'answer|hello|GLIBCXX'
+objdump -d -C -M intel libdemo.so | sed -n '/&lt;answer&gt;/,/^$/p'
+
+# 练习 3：strip 后比较
+cp libdemo.so libdemo.stripped.so
+strip libdemo.stripped.so
+objdump -h libdemo.stripped.so | grep -E '\\.symtab|\\.debug' || true
+objdump -T -C libdemo.stripped.so | grep answer</code></pre>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>GNU Binutils Manual：<code>objdump</code> 选项、BFD 目标格式、反汇编器选项。</li>
+<li>Linux man-pages：<code>objdump(1)</code>、<code>readelf(1)</code>、<code>nm(1)</code>、<code>ldd(1)</code>。</li>
+<li>System V ABI 与 x86-64 psABI：ELF、动态链接、符号版本和调用约定基础。</li>
+<li>GCC/Clang 文档：<code>-fPIC</code>、<code>-fvisibility</code>、<code>-march</code>、<code>-mtune</code>、LTO 与调试信息。</li>
+<li>NVIDIA CUDA Binary Utilities：<code>cuobjdump</code>、<code>nvdisasm</code>，用于 device code 与 SASS/PTX 诊断。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解 ELF 文件结构，再熟悉 <code>-f/-h/-p/-t/-T/-d/-r</code>，最后把 objdump 证据和构建系统、运行时加载器、CPU/GPU 能力矩阵结合。</p>
+</section>
+<div class="footer">objdump 深度教程 · AI Infra 图文穿插版 · ELF 检查、反汇编、符号、动态链接、CUDA/C++ 扩展与生产排障</div>
+</div>
+</body>
+</html>

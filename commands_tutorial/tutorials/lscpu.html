@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>lscpu 深度教程：AI Infra 视角理解 CPU 拓扑、NUMA 与性能放置</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>lscpu 深度教程：AI Infra 视角理解 CPU 拓扑、NUMA 与性能放置</h1>
+<p class="sub">这份教程围绕 Linux 命令 <code>lscpu</code> 展开，重点不是背字段，而是把 CPU 拓扑看成 AI 基础设施里的“调度地图”：socket、core、thread 决定并行度边界，NUMA 节点决定内存访问距离，cache 层级影响 dataloader 与推理线程，CPU flags 暴露指令集能力，虚拟化字段提示你是否在受限环境中运行，GPU locality 则需要把 <code>lscpu</code> 与 <code>numactl</code>、<code>lstopo</code>、PCIe 信息一起看。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">CPU 拓扑</span><span class="chip">Socket/Core/Thread</span><span class="chip">NUMA</span><span class="chip">Cache</span><span class="chip">CPU Flags</span><span class="chip">虚拟化</span><span class="chip">GPU Locality</span><span class="chip">性能放置</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>lscpu</code> 是读取内核暴露的 CPU 架构与拓扑信息的快速入口，用来回答“这台机器有多少可用逻辑 CPU、它们如何归属于核心/socket/NUMA 节点、具备哪些指令集能力”。</div>
+<div class="success"><strong>实践原则：</strong> <code>lscpu</code> 本身是只读命令，安全；但根据它调整亲和性、NUMA 绑定或容器 CPU 配额前，先 dry-run 查看拓扑，再用小规模任务验证吞吐、延迟和远端 NUMA 访问。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">lscpu 是什么</a></li>
+<li><a class="anchor" href="#s2">整体心智模型</a></li>
+<li><a class="anchor" href="#s3">快速上手与常用选项</a></li>
+<li><a class="anchor" href="#s4">读懂 sockets、cores、threads</a></li>
+<li><a class="anchor" href="#s5">NUMA 节点与内存距离</a></li>
+<li><a class="anchor" href="#s6">缓存层级与 AI 数据管道</a></li>
+<li><a class="anchor" href="#s7">CPU flags 与指令集能力</a></li>
+<li><a class="anchor" href="#s8">虚拟化与容器线索</a></li>
+<li><a class="anchor" href="#s9">GPU locality 上下文</a></li>
+<li><a class="anchor" href="#s10">可解析输出与脚本化</a></li>
+<li><a class="anchor" href="#s11">lscpu vs numactl vs lstopo</a></li>
+<li><a class="anchor" href="#s12">线程放置与亲和性排障</a></li>
+<li><a class="anchor" href="#s13">容器、Kubernetes 与 cgroup 限制</a></li>
+<li><a class="anchor" href="#s14">AI 训练/推理场景清单</a></li>
+<li><a class="anchor" href="#s15">常见坑与排障流程</a></li>
+<li><a class="anchor" href="#s16">生产巡检模板与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. lscpu 是什么</h2>
+<p><code>lscpu</code> 来自 util-linux，主要汇总 <code>/proc/cpuinfo</code>、<code>/sys/devices/system/cpu/</code> 等内核接口暴露的 CPU 架构、在线状态、拓扑关系、缓存、NUMA 与虚拟化信息。它适合在登录节点、训练节点、推理服务器、CI runner、容器镜像里快速确认 CPU 资源画像。</p>
+<div class="grid-3"><div class="card"><strong>它能回答</strong><br>CPU 架构是什么？逻辑 CPU 有多少？每个 socket 有多少 core？每个 core 有几个 thread？NUMA 节点如何划分？</div><div class="card"><strong>它不能单独回答</strong><br>GPU 与 NUMA 的完整距离、实际内存带宽、运行时线程是否真的绑定、容器被 cgroup 限制后的有效 CPU 配额。</div><div class="card"><strong>AI Infra 用法</strong><br>给 dataloader、CPU inference、RDMA/NIC 中断、GPU worker、MPI rank、Kubernetes CPU requests/limits 提供拓扑依据。</div></div>
+<pre><code># 最常用：查看汇总拓扑
+lscpu
+
+# 查看每个逻辑 CPU 的归属关系
+lscpu -e
+
+# 明确显示在线/离线 CPU
+lscpu -a -e=CPU,ONLINE,SOCKET,CORE,NODE
+
+# JSON 输出，便于采集系统解析
+lscpu --json</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>lscpu</code> 显示的是操作系统看到的 CPU 拓扑。BIOS 设置、超线程开关、虚拟机暴露方式、容器 cpuset/cgroup、CPU hotplug 都可能让它与硬件铭牌不一致。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：AI Infra 里 lscpu 的位置</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="lscpu AI Infra 整体模型">
+<rect x="18" y="18" width="1064" height="624" rx="22" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">lscpu = CPU 拓扑地图的入口</text>
+<rect x="70" y="115" width="230" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="151" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">内核数据源</text><text x="185" y="181" text-anchor="middle" font-size="14">/proc/cpuinfo</text><text x="185" y="204" text-anchor="middle" font-size="14">/sys/devices/system/cpu</text>
+<rect x="435" y="115" width="230" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="151" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">lscpu 汇总</text><text x="550" y="181" text-anchor="middle" font-size="14">架构 / 拓扑 / flags</text><text x="550" y="204" text-anchor="middle" font-size="14">NUMA / cache / 虚拟化</text>
+<rect x="800" y="115" width="230" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="915" y="151" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">调度决策</text><text x="915" y="181" text-anchor="middle" font-size="14">绑定线程 / 选 NUMA</text><text x="915" y="204" text-anchor="middle" font-size="14">定位异常 / 容量规划</text>
+<rect x="88" y="330" width="195" height="100" rx="16" fill="#fff7ed" stroke="#fdba74"/><text x="185" y="366" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">Socket</text><text x="185" y="395" text-anchor="middle" font-size="14">物理 CPU 插槽</text>
+<rect x="328" y="330" width="195" height="100" rx="16" fill="#fff7ed" stroke="#fdba74"/><text x="425" y="366" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">Core</text><text x="425" y="395" text-anchor="middle" font-size="14">物理核心</text>
+<rect x="578" y="330" width="195" height="100" rx="16" fill="#fff7ed" stroke="#fdba74"/><text x="675" y="366" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">Thread</text><text x="675" y="395" text-anchor="middle" font-size="14">SMT/超线程</text>
+<rect x="818" y="330" width="195" height="100" rx="16" fill="#fff7ed" stroke="#fdba74"/><text x="915" y="366" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">NUMA</text><text x="915" y="395" text-anchor="middle" font-size="14">CPU 与内存距离</text>
+<rect x="170" y="510" width="760" height="65" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="537" text-anchor="middle" font-size="17" font-weight="700">AI 任务落地：Dataloader worker、CPU 推理线程、GPU 进程、NIC 中断、MPI rank</text><text x="550" y="562" text-anchor="middle" font-size="14">先用 lscpu 定位 CPU 侧地图，再结合 GPU/PCIe/NUMA 工具做完整放置</text>
+<line x1="300" y1="168" x2="435" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="665" y1="168" x2="800" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="550" y1="220" x2="185" y2="330" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="220" x2="425" y2="330" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="220" x2="675" y2="330" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="220" x2="915" y2="330" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">把 <code>lscpu</code> 当成“CPU 侧地图”：它不能替代性能测试，但能解释很多放置错误为什么会慢。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 快速上手与常用选项</h2>
+<p><code>lscpu</code> 的默认输出适合人读；<code>-e</code> 和 <code>-p</code> 适合看每个逻辑 CPU 的关系；<code>--json</code> 适合被采集器或巡检脚本消费。</p>
+<table><tr><th>命令</th><th>用途</th><th>AI Infra 场景</th></tr><tr><td><code>lscpu</code></td><td>汇总视图</td><td>确认节点规格、socket/core/thread/NUMA 数量</td></tr><tr><td><code>lscpu -e</code></td><td>扩展表格，逐 CPU 展示</td><td>给 <code>taskset</code>、<code>numactl</code>、进程绑定准备 CPU 列表</td></tr><tr><td><code>lscpu -p</code></td><td>可解析格式，注释以 <code>#</code> 开头</td><td>脚本生成 CPU 到 NUMA/socket/core 映射</td></tr><tr><td><code>lscpu --json</code></td><td>JSON 格式</td><td>资产采集、CI 验证、节点巡检</td></tr><tr><td><code>lscpu -C</code></td><td>缓存详情</td><td>理解 L1/L2/L3 共享边界和 CPU worker 干扰</td></tr></table>
+<pre><code># 人读汇总
+lscpu | sed -n '1,25p'
+
+# 只看和拓扑最相关的字段
+lscpu | grep -E '^(Architecture|CPU\\(s\\)|Thread|Core|Socket|NUMA|Model name|Flags)'
+
+# 每个逻辑 CPU 的 socket/core/node 归属
+lscpu -e=CPU,ONLINE,SOCKET,CORE,NODE
+
+# 可解析格式，去掉注释
+lscpu -p=CPU,SOCKET,CORE,NODE | awk -F, '!/^#/ {print}'</code></pre>
+<div class="note"><strong>版本差异：</strong> 不同 util-linux 版本支持的列名略有差异。脚本里固定列名比解析默认输出更稳；跨发行版巡检要先在目标 OS 上验证。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 读懂 sockets、cores、threads</h2>
+<p>AI 任务调参时最容易混淆的是“逻辑 CPU 数”和“物理核心数”。<code>CPU(s)</code> 通常是逻辑 CPU 数；<code>Socket(s)</code> 是物理 CPU 插槽；<code>Core(s) per socket</code> 是每个 socket 的物理核心；<code>Thread(s) per core</code> 是每个物理核心暴露的硬件线程数。</p>
+<table><tr><th>字段</th><th>含义</th><th>计算关系</th><th>实践意义</th></tr><tr><td><code>CPU(s)</code></td><td>在线或可见逻辑 CPU 数</td><td><code>Socket(s) * Core(s) per socket * Thread(s) per core</code>，但容器/热插拔可能改变可见值</td><td>线程池上限、容器 cpuset、监控基线</td></tr><tr><td><code>Thread(s) per core</code></td><td>每个物理核心的硬件线程</td><td>常见为 1 或 2</td><td>CPU-bound 任务通常不要把 SMT 当成等价物理核</td></tr><tr><td><code>Core(s) per socket</code></td><td>单 socket 物理核心数</td><td>乘 socket 得到物理核心总数</td><td>推理 worker、dataloader worker、OpenMP 线程估算</td></tr><tr><td><code>Socket(s)</code></td><td>物理 CPU 插槽数</td><td>多 socket 往往对应多个 NUMA 域</td><td>跨 socket 调度可能带来远端内存访问</td></tr></table>
+<pre><code># 从默认输出快速计算物理核心数
+lscpu | awk -F: '
+  /Socket\\(s\\)/ {gsub(/ /,"",$2); sockets=$2}
+  /Core\\(s\\) per socket/ {gsub(/ /,"",$2); cores=$2}
+  END {print "physical_cores=" sockets * cores}'
+
+# 找出同一个物理 core 对应的逻辑 CPU 兄弟线程
+lscpu -e=CPU,SOCKET,CORE,NODE | awk 'NR&gt;1 {k=$2":"$3; a[k]=a[k] " " $1} END {for (k in a) print k ":" a[k]}'</code></pre>
+<div class="warn"><strong>调参提醒：</strong> PyTorch dataloader、OpenMP、MKL、oneDNN、tokenizer 线程池都可能吃 CPU。不要只看 GPU 利用率；CPU worker 过多会争抢 cache 和内存带宽，过少会饿死 GPU。</div>
+</section>
+
+<section class="figure" id="fig-topology">
+<h3>结构图：socket、core、thread 与 NUMA 节点</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="CPU socket core thread NUMA 拓扑图">
+<rect x="18" y="18" width="1064" height="684" rx="22" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="26" font-weight="700">从逻辑 CPU 反推物理拓扑</text>
+<rect x="85" y="105" width="430" height="380" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="300" y="140" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">Socket 0 / NUMA node 0</text>
+<rect x="130" y="185" width="150" height="110" rx="16" fill="#fff" stroke="#93c5fd"/><text x="205" y="214" text-anchor="middle" font-size="17" font-weight="700">Core 0</text><circle cx="175" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="175" y="261" text-anchor="middle" font-size="13">CPU0</text><circle cx="235" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="235" y="261" text-anchor="middle" font-size="13">CPU1</text>
+<rect x="320" y="185" width="150" height="110" rx="16" fill="#fff" stroke="#93c5fd"/><text x="395" y="214" text-anchor="middle" font-size="17" font-weight="700">Core 1</text><circle cx="365" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="365" y="261" text-anchor="middle" font-size="13">CPU2</text><circle cx="425" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="261" text-anchor="middle" font-size="13">CPU3</text>
+<rect x="130" y="330" width="340" height="88" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="300" y="365" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">本地内存通道</text><text x="300" y="394" text-anchor="middle" font-size="14">访问延迟低，带宽更稳定</text>
+<rect x="585" y="105" width="430" height="380" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="800" y="140" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">Socket 1 / NUMA node 1</text>
+<rect x="630" y="185" width="150" height="110" rx="16" fill="#fff" stroke="#fdba74"/><text x="705" y="214" text-anchor="middle" font-size="17" font-weight="700">Core 0</text><circle cx="675" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="675" y="261" text-anchor="middle" font-size="13">CPU4</text><circle cx="735" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="735" y="261" text-anchor="middle" font-size="13">CPU5</text>
+<rect x="820" y="185" width="150" height="110" rx="16" fill="#fff" stroke="#fdba74"/><text x="895" y="214" text-anchor="middle" font-size="17" font-weight="700">Core 1</text><circle cx="865" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="865" y="261" text-anchor="middle" font-size="13">CPU6</text><circle cx="925" cy="255" r="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="925" y="261" text-anchor="middle" font-size="13">CPU7</text>
+<rect x="630" y="330" width="340" height="88" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="800" y="365" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">本地内存通道</text><text x="800" y="394" text-anchor="middle" font-size="14">跨 socket 访问变成远端 NUMA</text>
+<path d="M470 374 C540 330, 560 330, 630 374" fill="none" stroke="#dc2626" stroke-width="4" stroke-dasharray="8 8"/><text x="550" y="330" text-anchor="middle" font-size="15" font-weight="700" fill="#dc2626">远端访问更慢</text>
+<rect x="170" y="565" width="760" height="74" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="596" text-anchor="middle" font-size="18" font-weight="700">放置目标：让线程、内存、GPU/NIC 尽量靠近同一个 NUMA 域</text><text x="550" y="622" text-anchor="middle" font-size="14">lscpu 给 CPU/NUMA 基础地图；GPU 和 NIC 还要结合 PCIe locality 工具</text>
+</svg><div class="caption">同一个物理核心上的兄弟逻辑 CPU 共享执行资源；同一个 NUMA 节点里的 CPU 访问本地内存更近。</div></section>
+
+<section class="section" id="s5">
+<h2>4. NUMA 节点与内存距离</h2>
+<p>NUMA 是多 socket 服务器的核心性能边界。训练或推理作业的 CPU 线程如果跑在 NUMA node 0，却频繁访问 node 1 的内存或驱动 node 1 旁边的 GPU，就可能出现吞吐抖动、GPU 利用率周期性下降、CPU system time 升高。</p>
+<pre><code># lscpu 默认输出中的典型 NUMA 字段
+lscpu | grep -E '^NUMA|^CPU\\(s\\)'
+
+# 逐 CPU 看 NUMA node
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+
+# 和 numactl 对照看节点内存与距离矩阵
+numactl --hardware</code></pre>
+<table><tr><th>现象</th><th>可能解释</th><th>下一步</th></tr><tr><td><code>NUMA node(s): 1</code></td><td>单 NUMA 或 BIOS 关闭/合并 NUMA</td><td>继续关注 core/thread/cache，不必做跨 NUMA 绑定</td></tr><tr><td><code>NUMA node0 CPU(s): 0-31</code><br><code>NUMA node1 CPU(s): 32-63</code></td><td>两个 NUMA 节点</td><td>GPU worker、dataloader、NIC IRQ 尽量按节点分组</td></tr><tr><td>CPU 列表交错</td><td>BIOS 枚举或平台拓扑特殊</td><td>用 <code>lscpu -e</code> 和 <code>numactl -H</code> 建立真实映射，不要凭编号猜</td></tr></table>
+<div class="success"><strong>放置经验：</strong> 对单机多 GPU 训练，通常先按 GPU 的 PCIe/NUMA 归属把进程分组，再把每组 dataloader worker 绑定到相邻 NUMA 的 CPU 集合。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 缓存层级与 AI 数据管道</h2>
+<p><code>lscpu</code> 会显示 L1d、L1i、L2、L3 cache 信息。现代 CPU 的 L3 常按 socket 或芯片小片共享，L2 常按核心私有或小范围共享。对 AI Infra 来说，cache 影响 tokenization、image decode、feature preprocessing、CPU inference、embedding 检索前处理等 CPU-heavy 阶段。</p>
+<pre><code># 查看缓存汇总
+lscpu | grep -E 'cache|L1|L2|L3'
+
+# 新版本 util-linux 可显示缓存表
+lscpu -C
+
+# 如果 -C 不可用，可从 sysfs 查看
+find /sys/devices/system/cpu/cpu0/cache -maxdepth 2 -type f -name size -o -name level -o -name type</code></pre>
+<table><tr><th>缓存</th><th>通常特点</th><th>AI Infra 关注点</th></tr><tr><td>L1d/L1i</td><td>最小最快，通常核心私有</td><td>紧密循环、解码、tokenizer 热路径</td></tr><tr><td>L2</td><td>比 L1 大，延迟较低</td><td>CPU 推理算子、小 batch 预处理</td></tr><tr><td>L3</td><td>较大，常被多个核心共享</td><td>多 worker 是否互相挤占，跨 socket 是否命中远端缓存/内存</td></tr></table>
+<div class="warn"><strong>不要过度解读：</strong> cache 大小不等于性能。真实吞吐还受内存带宽、频率、指令集、NUMA、数据格式和软件库调度影响。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. CPU flags 与指令集能力</h2>
+<p><code>Flags</code> 字段非常长，但它直接影响 AI 框架能否使用 AVX2、AVX-512、AMX、BF16、VNNI、AES、虚拟化扩展等能力。CPU-only inference、embedding 服务、量化推理、数据压缩/加密、特征工程都可能受它影响。</p>
+<table><tr><th>Flag</th><th>大致含义</th><th>常见影响</th></tr><tr><td><code>avx2</code></td><td>256-bit SIMD 扩展</td><td>通用 CPU 向量化、oneDNN/MKL 路径</td></tr><tr><td><code>avx512f</code>、<code>avx512_vnni</code></td><td>AVX-512 基础与 VNNI</td><td>INT8/BF16 推理、矩阵乘路径，注意频率降档</td></tr><tr><td><code>amx_bf16</code>、<code>amx_int8</code></td><td>Intel AMX tile 能力</td><td>新一代 CPU 推理/训练加速，需要内核与库支持</td></tr><tr><td><code>sve</code>、<code>asimd</code></td><td>Arm SIMD/SVE 能力</td><td>Arm 服务器上的向量化后端</td></tr><tr><td><code>vmx</code>、<code>svm</code></td><td>硬件虚拟化扩展</td><td>KVM/嵌套虚拟化线索，不代表当前一定可用</td></tr></table>
+<pre><code># 检查关键指令集是否存在
+lscpu | grep -oE 'avx512[^ ]*|avx2|amx_[^ ]+|vnni|sve|asimd' | sort -u
+
+# 用 awk 把 Flags 拆成一行一个，便于审计
+lscpu | awk -F: '/^Flags/ {gsub(/^ /,"",$2); n=split($2,a," "); for(i=1;i&lt;=n;i++) print a[i]}' | sort
+
+# Python 中记录运行环境
+python3 - &lt;&lt'PY'
+import subprocess
+print(subprocess.check_output(["lscpu"], text=True).splitlines()[0:12])
+PY</code></pre>
+<div class="note"><strong>验证原则：</strong> 有 flag 不代表框架一定启用该路径。还要看内核、微码、编译选项、运行库版本、环境变量和实际 benchmark。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 虚拟化与容器线索</h2>
+<p><code>lscpu</code> 常显示 <code>Hypervisor vendor</code>、<code>Virtualization type</code>、<code>Virtualization</code> 等字段。它们能提示你当前是在裸金属、虚拟机还是被 hypervisor 抽象过的环境里运行。AI Infra 中，这会影响性能可预测性、PMU/性能计数器、NUMA 暴露、CPU pinning 和嵌套虚拟化。</p>
+<pre><code># 查看虚拟化相关字段
+lscpu | grep -E 'Virtualization|Hypervisor|Vendor ID|Model name'
+
+# 容器里再看 cgroup 约束，不要只信 lscpu CPU(s)
+grep -H . /sys/fs/cgroup/cpu.max 2&gt;/dev/null || true
+grep -H . /sys/fs/cgroup/cpuset.cpus.effective 2&gt;/dev/null || true
+
+# systemd 环境也可查看
+systemd-detect-virt 2&gt;/dev/null || true</code></pre>
+<div class="grid-2"><div class="card"><strong>裸金属常见特征</strong><br>没有 Hypervisor vendor；NUMA 和 cache 信息较完整；可结合 BIOS/firmware、<code>dmidecode</code>、BMC 资产信息确认。</div><div class="card"><strong>虚拟机常见特征</strong><br>Hypervisor vendor 可能是 KVM、VMware、Microsoft、Xen；CPU flags 可能被屏蔽；拓扑可能由云厂商策略决定。</div><div class="card"><strong>容器常见特征</strong><br><code>lscpu</code> 可能看到宿主机拓扑，但进程被 cpuset 或 cpu quota 限制；调度上限要看 cgroup。</div><div class="card"><strong>CI runner 常见特征</strong><br>CPU 数、型号、flags 可能随机器池变化；不要把一次 <code>lscpu</code> 输出写死为长期假设。</div></div>
+</section>
+
+<section class="figure" id="fig-locality">
+<h3>关联图：CPU NUMA 与 GPU locality</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="CPU NUMA GPU locality 关联图">
+<rect x="18" y="18" width="1064" height="664" rx="22" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="26" font-weight="700">GPU locality 不能只靠 lscpu，但必须从 lscpu 开始</text>
+<rect x="80" y="120" width="390" height="210" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="275" y="155" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">NUMA node 0</text><text x="275" y="190" text-anchor="middle" font-size="15">CPU 0-31</text><rect x="130" y="235" width="105" height="55" rx="12" fill="#fff" stroke="#93c5fd"/><text x="182" y="268" text-anchor="middle" font-size="14">GPU0</text><rect x="315" y="235" width="105" height="55" rx="12" fill="#fff" stroke="#93c5fd"/><text x="367" y="268" text-anchor="middle" font-size="14">NIC0</text>
+<rect x="630" y="120" width="390" height="210" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="825" y="155" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">NUMA node 1</text><text x="825" y="190" text-anchor="middle" font-size="15">CPU 32-63</text><rect x="680" y="235" width="105" height="55" rx="12" fill="#fff" stroke="#fdba74"/><text x="732" y="268" text-anchor="middle" font-size="14">GPU1</text><rect x="865" y="235" width="105" height="55" rx="12" fill="#fff" stroke="#fdba74"/><text x="917" y="268" text-anchor="middle" font-size="14">NIC1</text>
+<rect x="130" y="420" width="235" height="75" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="247" y="451" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">GPU0 worker</text><text x="247" y="477" text-anchor="middle" font-size="14">绑定 CPU 0-31 更合理</text>
+<rect x="735" y="420" width="235" height="75" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="852" y="451" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">GPU1 worker</text><text x="852" y="477" text-anchor="middle" font-size="14">绑定 CPU 32-63 更合理</text>
+<path d="M235 290 C235 340, 247 372, 247 420" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#g1)"/><path d="M785 290 C820 338, 852 372, 852 420" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#g1)"/>
+<path d="M365 420 C520 365, 590 365, 735 420" fill="none" stroke="#dc2626" stroke-width="4" stroke-dasharray="8 7"/><text x="550" y="386" text-anchor="middle" font-size="14" font-weight="700" fill="#dc2626">跨 NUMA 放置可能增加 H2D/IRQ/内存访问开销</text>
+<rect x="155" y="560" width="790" height="62" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="586" text-anchor="middle" font-size="16" font-weight="700">组合工具：lscpu -e + numactl -H + nvidia-smi topo -m / rocm-smi / lstopo</text><text x="550" y="610" text-anchor="middle" font-size="14">目标是让 CPU worker、内存、GPU、NIC 的距离最短且负载均衡</text>
+<defs><marker id="g1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker></defs>
+</svg><div class="caption">GPU locality 是跨 CPU、内存、PCIe、NIC 的问题。<code>lscpu</code> 提供 CPU/NUMA 坐标系，GPU 距离还需要专用拓扑工具确认。</div></section>
+
+<section class="section" id="s9">
+<h2>8. GPU locality 上下文</h2>
+<p>在多 GPU 节点上，CPU 的 NUMA 拓扑决定了 host-side worker 的最佳位置。虽然 <code>lscpu</code> 不显示 GPU，但它告诉你“哪些 CPU 属于哪个 NUMA 节点”，再与 GPU topo 输出对齐，就能规划进程和线程。</p>
+<pre><code># CPU/NUMA 侧地图
+lscpu -e=CPU,NODE,SOCKET,CORE | column -t
+numactl --hardware
+
+# NVIDIA GPU 拓扑和 CPU affinity 示例
+nvidia-smi topo -m
+nvidia-smi topo -m | grep -E 'GPU|CPU Affinity|NUMA'
+
+# AMD/ROCm 环境可结合 rocm-smi 或 hwloc
+rocm-smi --showtoponuma 2&gt;/dev/null || true
+lstopo-no-graphics 2&gt;/dev/null | sed -n '1,80p'</code></pre>
+<table><tr><th>目标</th><th>做法</th><th>验证</th></tr><tr><td>让 GPU0 的 dataloader 靠近本地 CPU</td><td>从 GPU topo 找 CPU affinity，再用 <code>lscpu -e</code> 转成 CPU 列表</td><td>看 GPU 利用率、H2D 拷贝时间、dataloader wait</td></tr><tr><td>减少 NIC 到 GPU 的跨 socket 路径</td><td>将通信进程、IRQ、GPU rank 放在相邻 NUMA</td><td>看 NCCL/RCCL 日志、RDMA counters、吞吐抖动</td></tr><tr><td>避免所有 worker 堆在 node0</td><td>按 GPU/NUMA 分片 CPU worker 池</td><td>看 <code>pidstat -t</code>、<code>numastat -p</code>、perf top</td></tr></table>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 可解析输出与脚本化</h2>
+<p>生产巡检不要解析默认人读输出，因为字段名、缩进、locale、版本差异都可能破坏脚本。优先使用 <code>--json</code>、<code>--parse</code>/<code>-p</code> 或明确列名的 <code>-e=...</code>。</p>
+<pre><code># JSON 输出：适合 jq 或 Python 解析
+lscpu --json
+
+# 解析 JSON 中的字段名和值
+lscpu --json | jq -r '.lscpu[] | "\(.field)\t\(.data)"'
+
+# CSV-like parse 输出：注释行以 # 开头
+lscpu -p=CPU,SOCKET,CORE,NODE | awk -F, '!/^#/ {print "cpu="$1,"socket="$2,"core="$3,"node="$4}'
+
+# 生成每个 NUMA 节点的 CPU 列表
+lscpu -p=CPU,NODE | awk -F, '!/^#/ {a[$2]=a[$2]","$1} END {for (n in a) {sub(/^,/,"",a[n]); print "node" n "=" a[n]}}'</code></pre>
+<div class="warn"><strong>脚本建议：</strong> 采集脚本里同时记录 <code>lscpu --version</code>、内核版本、容器 cgroup 约束和命令原始输出；只保存派生结果会丢失排障上下文。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. lscpu vs numactl vs lstopo</h2>
+<p>这三个工具经常一起出现，但关注层级不同。<code>lscpu</code> 快速、轻量、适合 CPU 汇总；<code>numactl --hardware</code> 更直接展示 NUMA 内存和距离；<code>lstopo</code> 来自 hwloc，能把 CPU、cache、NUMA、PCIe 设备放进同一张拓扑图。</p>
+<table><tr><th>工具</th><th>优势</th><th>不足</th><th>何时使用</th></tr><tr><td><code>lscpu</code></td><td>默认系统常见；输出清晰；可看 CPU flags、cache、拓扑</td><td>GPU/NIC/PCIe 关系有限</td><td>节点登录后的第一步巡检</td></tr><tr><td><code>numactl --hardware</code></td><td>NUMA CPU 列表、节点内存、距离矩阵直接</td><td>不展示 CPU flags/cache 细节</td><td>调优内存绑定、排查远端 NUMA</td></tr><tr><td><code>lstopo</code></td><td>全系统拓扑，包含 PCI/OS device，适合 locality</td><td>可能需要额外安装；输出较复杂</td><td>多 GPU、多 NIC、复杂 NUMA 机器</td></tr></table>
+<pre><code># 推荐组合巡检
+echo "== lscpu =="; lscpu
+echo "== per-cpu topology =="; lscpu -e=CPU,ONLINE,NODE,SOCKET,CORE
+echo "== numactl =="; numactl --hardware
+echo "== hwloc =="; lstopo-no-graphics 2&gt;/dev/null | sed -n '1,120p'</code></pre>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>流程图：性能放置排障路径</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="AI Infra CPU placement troubleshooting flow">
+<rect x="18" y="18" width="1064" height="724" rx="22" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="21" font-weight="700">GPU 吞吐低或延迟抖动</text>
+<rect x="80" y="170" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="195" y="206" text-anchor="middle" font-size="17" font-weight="700">看 CPU 拓扑</text><text x="195" y="234" text-anchor="middle" font-size="14">lscpu / lscpu -e</text>
+<rect x="435" y="170" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="206" text-anchor="middle" font-size="17" font-weight="700">看 NUMA/GPU 距离</text><text x="550" y="234" text-anchor="middle" font-size="14">numactl / topo -m / lstopo</text>
+<rect x="790" y="170" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="905" y="206" text-anchor="middle" font-size="17" font-weight="700">看线程实际位置</text><text x="905" y="234" text-anchor="middle" font-size="14">taskset / ps / pidstat</text>
+<rect x="145" y="350" width="260" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="275" y="386" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">CPU worker 是否跨 NUMA?</text><text x="275" y="414" text-anchor="middle" font-size="14">Dataloader / tokenizer / OpenMP</text>
+<rect x="695" y="350" width="260" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="825" y="386" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">线程数是否过量?</text><text x="825" y="414" text-anchor="middle" font-size="14">SMT、cache、内存带宽争抢</text>
+<rect x="145" y="535" width="260" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="275" y="571" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">绑定到近端 CPU</text><text x="275" y="599" text-anchor="middle" font-size="14">taskset / numactl / cpuset</text>
+<rect x="695" y="535" width="260" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="825" y="571" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">降低或分片线程池</text><text x="825" y="599" text-anchor="middle" font-size="14">OMP_NUM_THREADS / workers</text>
+<rect x="390" y="665" width="320" height="48" rx="13" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="696" text-anchor="middle" font-size="16" font-weight="700">用 benchmark 验证，不凭拓扑假设上线</text>
+<line x1="550" y1="111" x2="195" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="550" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="905" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="195" y1="262" x2="275" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="262" x2="275" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="905" y1="262" x2="825" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="275" y1="444" x2="275" y2="535" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="825" y1="444" x2="825" y2="535" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="275" y1="627" x2="465" y2="665" stroke="#94a3b8" stroke-width="3"/><line x1="825" y1="627" x2="635" y2="665" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="t1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">拓扑只能提出假设；最终要用真实 workload 的吞吐、延迟、CPU 利用率、NUMA 统计和 GPU 指标验证。</div></section>
+
+<section class="section" id="s12">
+<h2>11. 线程放置与亲和性排障</h2>
+<p>当 GPU 等 CPU 数据、CPU 推理延迟抖动、或者训练吞吐不稳定时，先确认线程实际跑在哪里。<code>lscpu</code> 给出可选 CPU 集合，<code>taskset</code>、<code>numactl</code>、<code>ps</code>、<code>pidstat</code> 用来验证和调整。</p>
+<pre><code># 查看当前 shell 可运行在哪些 CPU 上
+taskset -pc $$
+
+# 只读检查某进程亲和性
+taskset -pc &lt;PID&gt;
+
+# dry-run 思路：先打印计划使用的 CPU 列表
+lscpu -p=CPU,NODE | awk -F, '!/^#/ && $2==0 {print $1}' | paste -sd, -
+
+# 小规模验证：绑定一个 benchmark 到 NUMA node 0 的 CPU
+numactl --cpunodebind=0 --membind=0 python train_or_infer_smoke.py</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要直接把在线服务进程强行迁移到新 CPU 集合。先在 canary、副本、离线 benchmark 或低流量窗口验证；错误绑定可能让服务只剩少量 CPU、跨 NUMA 访问变多或与系统中断争抢。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 容器、Kubernetes 与 cgroup 限制</h2>
+<p>容器里运行 <code>lscpu</code> 时，最危险的误判是：命令显示宿主机有 128 个 CPU，但当前容器只被允许使用 8 个 CPU 或 4 个 CPU quota。AI 服务如果按 <code>lscpu</code> 的逻辑 CPU 数自动开线程，可能严重超卖。</p>
+<pre><code># cgroup v2：CPU quota，max 表示不限制
+cat /sys/fs/cgroup/cpu.max 2&gt;/dev/null || true
+
+# cgroup v2：实际 cpuset
+cat /sys/fs/cgroup/cpuset.cpus.effective 2&gt;/dev/null || true
+
+# cgroup v1 兼容路径
+cat /sys/fs/cgroup/cpuset/cpuset.cpus 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2&gt;/dev/null || true</code></pre>
+<table><tr><th>环境变量/参数</th><th>常见用途</th><th>为什么与 lscpu 有关</th></tr><tr><td><code>OMP_NUM_THREADS</code></td><td>控制 OpenMP 线程数</td><td>默认可能按可见 CPU 过度开线程</td></tr><tr><td><code>MKL_NUM_THREADS</code></td><td>控制 MKL 线程数</td><td>CPU 算子可能与 dataloader 争抢核心</td></tr><tr><td><code>torch.set_num_threads()</code></td><td>PyTorch CPU intra-op 线程</td><td>CPU 前处理/推理需要按配额调小</td></tr><tr><td>Kubernetes <code>resources.limits.cpu</code></td><td>容器 CPU quota</td><td>不等价于拓扑亲和，可能导致 throttling</td></tr></table>
+<div class="note"><strong>容器原则：</strong> 拓扑用 <code>lscpu</code>，有效上限看 cgroup，调度归属看 Kubernetes CPU manager / cpuset，性能结果看实际 benchmark。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. AI 训练/推理场景清单</h2>
+<div class="grid-2"><div class="card"><strong>单机多 GPU 训练</strong><br>为每个 rank 分配靠近对应 GPU 的 CPU worker；避免所有 rank 的 dataloader 默认挤在同一 NUMA 节点。</div><div class="card"><strong>在线推理服务</strong><br>按 CPU quota 和物理核心设置线程池；对 CPU-heavy tokenizer、reranker、embedding 前处理做独立亲和性验证。</div><div class="card"><strong>CPU-only 推理</strong><br>检查 AVX2/AVX-512/AMX/VNNI；评估 SMT 是否增益，很多低延迟场景更看重物理核心和 cache 隔离。</div><div class="card"><strong>数据预处理集群</strong><br>压缩、解码、特征转换通常受内存带宽和 cache 影响；用 NUMA 分片减少跨 socket 访问。</div><div class="card"><strong>NCCL/RCCL 通信</strong><br>通信线程、NIC IRQ、GPU 进程尽量在相邻拓扑域；跨 socket 会放大尾延迟。</div><div class="card"><strong>Benchmark 对比</strong><br>记录 <code>lscpu</code>、内核、微码、BIOS NUMA/SMT 设置、容器限制，避免机器差异污染结论。</div></div>
+<pre><code># 训练脚本前记录环境快照
+mkdir -p run-env
+lscpu &gt; run-env/lscpu.txt
+lscpu -e=CPU,ONLINE,NODE,SOCKET,CORE &gt; run-env/lscpu-extended.txt
+numactl --hardware &gt; run-env/numactl-hardware.txt 2&gt;&amp;1 || true
+nvidia-smi topo -m &gt; run-env/nvidia-topo.txt 2&gt;&amp;1 || true</code></pre>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 常见坑与排障流程</h2>
+<div class="grid-2"><div class="card"><strong>坑 1：把逻辑 CPU 当物理核心</strong><br><code>CPU(s)</code> 包含 SMT 线程；CPU-bound 线程池通常先按物理核心估算。</div><div class="card"><strong>坑 2：凭 CPU 编号猜 NUMA</strong><br>编号可能交错或被容器裁剪；用 <code>lscpu -e=CPU,NODE</code> 验证。</div><div class="card"><strong>坑 3：忽略 cgroup</strong><br>容器里 <code>lscpu</code> 可能看见宿主机，但 quota/cpuset 才是当前进程可用资源。</div><div class="card"><strong>坑 4：看到 AVX-512 就认为更快</strong><br>频率降档、库实现、batch size、内存带宽都可能改变结果。</div><div class="card"><strong>坑 5：只看 CPU 不看 GPU/NIC</strong><br>多 GPU 节点需要把 NUMA 与 PCIe、NIC、GPU topo 一起看。</div><div class="card"><strong>坑 6：绑定后不验证</strong><br>错误亲和性可能让性能更差；必须用真实 workload 或代表性 benchmark 验证。</div></div>
+<h3>排障命令模板</h3>
+<pre><code># 1. 拓扑快照
+lscpu
+lscpu -e=CPU,ONLINE,NODE,SOCKET,CORE
+
+# 2. NUMA 与 GPU/NIC 关系
+numactl --hardware
+nvidia-smi topo -m 2&gt;/dev/null || true
+lstopo-no-graphics 2&gt;/dev/null | sed -n '1,120p'
+
+# 3. 进程实际亲和性和线程状态
+taskset -pc &lt;PID&gt;
+ps -L -o pid,tid,psr,pcpu,comm -p &lt;PID&gt;
+pidstat -t -p &lt;PID&gt; 1 5
+
+# 4. NUMA 访问倾向
+numastat -p &lt;PID&gt; 2&gt;/dev/null || true</code></pre>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 生产巡检模板与练习</h2>
+<h3>节点巡检模板</h3>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+out="${1:-cpu-topology-report}"
+mkdir -p "$out"
+
+lscpu &gt; "$out/lscpu.txt"
+lscpu -e=CPU,ONLINE,NODE,SOCKET,CORE &gt; "$out/lscpu-extended.txt"
+lscpu -p=CPU,SOCKET,CORE,NODE &gt; "$out/lscpu-parse.csv"
+lscpu --json &gt; "$out/lscpu.json" 2&gt;/dev/null || true
+numactl --hardware &gt; "$out/numactl-hardware.txt" 2&gt;&amp;1 || true
+nvidia-smi topo -m &gt; "$out/nvidia-topo.txt" 2&gt;&amp;1 || true
+cat /sys/fs/cgroup/cpu.max &gt; "$out/cgroup-cpu-max.txt" 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpuset.cpus.effective &gt; "$out/cgroup-cpuset-effective.txt" 2&gt;/dev/null || true
+
+echo "report written to $out"</code></pre>
+<h3>练习任务</h3>
+<ol><li>用 <code>lscpu</code> 计算当前机器的物理核心数，并与 <code>nproc</code> 对比。</li><li>用 <code>lscpu -e</code> 找出每个 NUMA 节点包含哪些逻辑 CPU。</li><li>检查当前环境是否暴露 <code>avx2</code>、<code>avx512</code>、<code>amx</code> 或 Arm SIMD flags。</li><li>在容器中比较 <code>lscpu</code> 的 CPU 数与 cgroup quota/cpuset。</li><li>为一个 GPU worker 设计 CPU 绑定方案，并说明需要哪些额外工具验证 GPU locality。</li><li>运行一次小 benchmark，对比绑定前后吞吐或延迟，不要只凭拓扑判断。</li></ol>
+<div class="success"><strong>上线前检查：</strong> 记录基线、只改一个变量、保留回滚方案、用真实指标验证。CPU 拓扑优化通常是“测量驱动”的工程，不是一次命令就能永久解决。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>Linux man-pages：<code>lscpu(1)</code>，包含汇总、extended、parse、JSON、cache 输出等选项说明。</li><li>util-linux 项目文档：<code>lscpu</code> 的数据来源、输出格式和版本差异。</li><li>Linux kernel 文档：CPU topology、cpuset、cgroup v2、NUMA memory policy。</li><li>hwloc 文档：<code>lstopo</code>、PCI device locality、NUMA/cache 拓扑建模。</li><li>NVIDIA System Management Interface 文档：<code>nvidia-smi topo -m</code> 与 CPU affinity/NUMA 相关输出。</li><li>AMD ROCm SMI 文档：ROCm 环境下 GPU 拓扑与 NUMA 信息查询。</li></ul><p class="mini">建议阅读顺序：先理解 socket/core/thread/NUMA，再看 cache 与 flags，最后把 CPU 拓扑和 GPU/NIC/容器限制合并到性能放置决策中。</p></section>
+<div class="footer">lscpu 深度教程 · AI Infra 图文版 · CPU 拓扑、NUMA、cache、flags、GPU locality 与性能放置</div>
+</div>
+</body>
+</html>

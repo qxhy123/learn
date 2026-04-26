@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>nvidia-debugdump 深度教程：AI Infra GPU 故障现场采集与升级证据</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>nvidia-debugdump 深度教程：AI Infra GPU 故障现场采集与升级证据</h1>
+<p class="sub">这份教程面向 AI Infra、集群 SRE、平台工程和 GPU 值班人员，讲清楚 <code>nvidia-debugdump</code> 的定位、何时使用、如何安全采集 NVIDIA GPU 内部调试状态、如何与 XID 日志和崩溃现场关联、如何保护二进制调试工件，以及它和 <code>nvidia-bug-report.sh</code>、DCGM、<code>nvidia-smi</code> 的边界。重点不是“读懂 dump 内容”，而是把故障发生时的证据链采得完整、可追溯、可升级。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">GPU 故障现场</span><span class="chip">XID triage</span><span class="chip">二进制 dump</span><span class="chip">权限与安全</span><span class="chip">供应商升级</span><span class="chip">DCGM 对照</span><span class="chip">隐私脱敏</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>nvidia-debugdump</code> 是 NVIDIA Linux 驱动随附的低层调试状态采集工具，输出通常是需要 NVIDIA 内部工具解释的二进制 blob；AI 集群里应把它当成“故障现场证物采集器”，而不是普通可读诊断命令。</div>
+<div class="success"><strong>最重要原则：</strong> 优先运行 <code>nvidia-bug-report.sh</code> 收集完整上下文；只有在支持流程、runbook 或 NVIDIA 支持明确要求时，才单独运行 <code>nvidia-debugdump</code>。采集前记录时间、GPU UUID、PCI BDF、XID、作业 ID，采集后按敏感工件处理。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">nvidia-debugdump 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：从故障信号到升级证据</a></li>
+<li><a class="anchor" href="#s3">什么时候应该使用</a></li>
+<li><a class="anchor" href="#s4">安装来源、版本与帮助</a></li>
+<li><a class="anchor" href="#s5">权限、影响面与采集窗口</a></li>
+<li><a class="anchor" href="#s6">基础命令与安全 dry-run</a></li>
+<li><a class="anchor" href="#s7">采集前上下文清单</a></li>
+<li><a class="anchor" href="#s8">XID 与 crash triage</a></li>
+<li><a class="anchor" href="#s9">核心工作流图</a></li>
+<li><a class="anchor" href="#s10">与 nvidia-bug-report.sh 的关系</a></li>
+<li><a class="anchor" href="#s11">与 DCGM / nvidia-smi 的关系</a></li>
+<li><a class="anchor" href="#s12">容器与 Kubernetes 节点采集</a></li>
+<li><a class="anchor" href="#s13">安全工件处理与隐私保护</a></li>
+<li><a class="anchor" href="#s14">供应商升级包怎么组织</a></li>
+<li><a class="anchor" href="#s15">常见问题与排障矩阵</a></li>
+<li><a class="anchor" href="#s16">不要做什么</a></li>
+<li><a class="anchor" href="#s17">团队 runbook 模板</a></li>
+<li><a class="anchor" href="#s18">参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. nvidia-debugdump 是什么</h2>
+<p><code>nvidia-debugdump</code> 是 NVIDIA Linux 图形/数据中心驱动包里的调试工具，用于收集 GPU 内部状态。NVIDIA 官方说明中明确提到，它通常由 <code>/usr/bin/nvidia-bug-report.sh</code> 调用；少数情况下，在 NVIDIA 技术支持代表指示下，也可作为独立诊断程序运行。</p>
+<div class="grid-3">
+<div class="card"><strong>它输出什么</strong><br>通常是二进制 dump/blob，面向 NVIDIA 工程分析。平台团队一般不能直接解释其中寄存器、引擎或微控制器状态。</div>
+<div class="card"><strong>它解决什么</strong><br>为 GPU hang、XID、驱动崩溃、疑似硬件异常、供应商升级提供“发生当时”的低层状态证据。</div>
+<div class="card"><strong>它不是什么</strong><br>不是性能 profiler，不是健康检查，不是替代 DCGM 的自动化诊断，也不是能直接给出根因的命令。</div>
+</div>
+<pre><code># 查找命令是否随驱动安装
+command -v nvidia-debugdump || echo "未找到 nvidia-debugdump"
+
+# 查看帮助，不采集 dump，适合作为安全 dry-run
+nvidia-debugdump --help
+
+# 查看 NVIDIA 驱动与 GPU 基本状态
+nvidia-smi
+nvidia-smi -L</code></pre>
+<div class="warn"><strong>边界提醒：</strong> 如果你只是想确认 GPU 是否在线、温度是否异常、ECC 是否增加、作业是否占用显存，先用 <code>nvidia-smi</code>、DCGM 或调度系统；不要把 <code>nvidia-debugdump</code> 当成日常巡检命令。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：nvidia-debugdump 在 AI Infra 故障证据链中的位置</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="nvidia-debugdump 故障证据链整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="88" width="205" height="112" rx="18" fill="#fee2e2" stroke="#fca5a5"/><text x="157" y="126" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">故障信号</text><text x="157" y="158" text-anchor="middle" font-size="15">XID / GPU lost</text><text x="157" y="182" text-anchor="middle" font-size="15">作业失败 / 节点异常</text>
+<rect x="315" y="88" width="205" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="417" y="126" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">上下文快照</text><text x="417" y="158" text-anchor="middle" font-size="15">日志、BDF、UUID</text><text x="417" y="182" text-anchor="middle" font-size="15">驱动、内核、作业</text>
+<rect x="575" y="88" width="205" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="677" y="126" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">低层 dump</text><text x="677" y="158" text-anchor="middle" font-size="15">nvidia-debugdump</text><text x="677" y="182" text-anchor="middle" font-size="15">二进制内部状态</text>
+<rect x="835" y="88" width="205" height="112" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="937" y="126" text-anchor="middle" font-size="22" font-weight="700" fill="#15803d">升级包</text><text x="937" y="158" text-anchor="middle" font-size="15">NVIDIA / OEM / CSP</text><text x="937" y="182" text-anchor="middle" font-size="15">可复现证据</text>
+<rect x="120" y="332" width="860" height="160" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="374" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">它不是独立结论，而是证据链中的低层状态快照</text><text x="550" y="416" text-anchor="middle" font-size="16">XID 告诉你“发生了什么类型的 GPU 错误”</text><text x="550" y="446" text-anchor="middle" font-size="16">nvidia-debugdump 帮 NVIDIA 分析“当时 GPU 内部是什么状态”</text>
+<line x1="260" y1="144" x2="315" y2="144" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="520" y1="144" x2="575" y2="144" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="780" y1="144" x2="835" y2="144" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">AI 集群排障时，最有价值的是“同一时间线上的证据包”：XID、内核日志、驱动状态、作业信息、拓扑、健康检查和 debug dump。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 什么时候应该使用</h2>
+<p>使用 <code>nvidia-debugdump</code> 的判断标准不是“GPU 有点慢”，而是“需要保留足够低层的现场状态，供驱动/硬件支持团队分析”。常见触发条件如下。</p>
+<table>
+<tr><th>场景</th><th>是否适合</th><th>原因</th><th>优先动作</th></tr>
+<tr><td>节点出现 XID 79、GPU fallen off bus、持续不可恢复</td><td>适合</td><td>可能涉及 PCIe、硬件、驱动或平台问题，需要完整证据</td><td>记录 XID、BDF、GPU UUID，先跑 bug report，再按支持要求 dump</td></tr>
+<tr><td>训练任务 OOM、吞吐下降但无 XID</td><td>通常不适合</td><td>更像容量、调度、框架或性能问题</td><td>用 <code>nvidia-smi</code>、DCGM、profiling、作业日志</td></tr>
+<tr><td>GPU hang、CUDA 调用卡死、驱动堆栈异常</td><td>适合</td><td>hang 现场可能很快丢失，低层状态有升级价值</td><td>先保存进程、dmesg、nvidia-smi，再采集</td></tr>
+<tr><td>多节点 NCCL 失败</td><td>视情况</td><td>多数是网络、拓扑、容器或配置；只有伴随 XID/驱动错误时才需要</td><td>先查 NCCL 日志、拓扑、IB/RDMA、DCGM</td></tr>
+<tr><td>NVIDIA/OEM/CSP 支持要求提供 debug dump</td><td>适合</td><td>这是最明确的使用理由</td><td>严格按工单说明执行并保留校验和</td></tr>
+</table>
+<div class="note"><strong>AI Infra 经验：</strong> 真正能加速供应商响应的不是单个 dump 文件，而是“dump + bug report + XID 时间点 + 节点硬件身份 + 业务影响 + 复现步骤”。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 安装来源、版本与帮助</h2>
+<p><code>nvidia-debugdump</code> 随 NVIDIA Linux 驱动安装。不同驱动版本的选项可能不同，所以教程不假设固定参数名；生产 runbook 应以目标节点上的 <code>--help</code> 输出为准。</p>
+<pre><code># 定位二进制
+command -v nvidia-debugdump
+ls -l "$(command -v nvidia-debugdump)"
+
+# 读取本机支持的参数
+nvidia-debugdump --help
+
+# 保存版本和环境，便于后续复盘
+{
+  date -Is
+  uname -a
+  nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,driver_version --format=csv
+  nvidia-debugdump --help
+} &gt; precheck-nvidia-debugdump.txt</code></pre>
+<div class="warn"><strong>版本提醒：</strong> 不要从另一台机器复制 <code>nvidia-debugdump</code> 到当前节点凑合运行。调试工具、内核模块、驱动版本应保持一致，否则采集结果和支持流程都可能失真。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 权限、影响面与采集窗口</h2>
+<p>GPU 低层状态采集通常需要访问 NVIDIA 设备文件、内核驱动接口和系统日志。实际权限取决于驱动、发行版和节点安全策略；生产环境一般由 root 或受控的值班账号执行。</p>
+<div class="grid-4">
+<div class="card"><strong>权限</strong><br>优先使用节点运维权限执行；避免把调试二进制暴露给普通租户。</div>
+<div class="card"><strong>窗口</strong><br>尽量在故障刚发生、GPU 未 reset、节点未重启前采集。</div>
+<div class="card"><strong>影响</strong><br>采集可能读取大量状态或短暂增加驱动压力；不要在健康节点上批量无差别运行。</div>
+<div class="card"><strong>隔离</strong><br>多租户场景先冻结调度、标记节点不可调度，避免新作业覆盖现场。</div>
+</div>
+<pre><code># 采集前建议先从调度侧隔离节点，示例：Kubernetes
+kubectl cordon NODE_NAME
+
+# 记录当前作业和进程，避免后续无法关联
+nvidia-smi pmon -c 1
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv
+ps -eo pid,user,ppid,cmd --sort=pid | grep -E 'python|torchrun|deepspeed|ray|nvidia' || true</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要为了采集 dump 立即重启节点。重启会清掉大量现场证据；除非业务恢复优先级高于根因分析，或 runbook 明确要求先恢复。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 基础命令与安全 dry-run</h2>
+<p>由于 <code>nvidia-debugdump</code> 的参数随驱动版本可能变化，最安全的起点是先查看帮助并保存帮助文本。若帮助里显示需要指定输出文件或 GPU 选择参数，再按本机帮助执行。</p>
+<pre><code># 安全 dry-run：只看帮助，不生成 dump
+nvidia-debugdump --help
+
+# 常见采集骨架：以本机 --help 为准替换参数
+sudo nvidia-debugdump [本机帮助中显示的 GPU 选择参数] [本机帮助中显示的输出参数] ./nvdebugdump-GPU0.bin
+
+# 如果没有把握，优先运行官方聚合脚本
+sudo nvidia-bug-report.sh
+
+# 记录产物元数据，不直接打开或尝试解析二进制 blob
+ls -lh ./nvdebugdump-*.bin 2&gt;/dev/null || true
+shasum -a 256 ./nvdebugdump-*.bin 2&gt;/dev/null || sha256sum ./nvdebugdump-*.bin</code></pre>
+<div class="note"><strong>命令策略：</strong> 教程中的独立采集命令故意写成骨架形式，因为可靠做法是以目标驱动版本的 <code>--help</code> 为准；硬编码过期参数会比没有命令更危险。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 采集前上下文清单</h2>
+<p>单独的 dump 文件缺少上下文时，供应商通常很难判断影响范围和触发路径。下面这组命令用于构建同一时间点的最小证据包。</p>
+<pre><code># 建议每次故障建一个目录，避免工件混杂
+case_id="gpu-incident-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$case_id"
+cd "$case_id"
+
+# 时间、内核、驱动、GPU 身份
+date -u +%FT%TZ | tee time.txt
+uname -a &gt; uname.txt
+nvidia-smi -q &gt; nvidia-smi-q.txt
+nvidia-smi -L &gt; nvidia-smi-L.txt
+nvidia-smi topo -m &gt; nvidia-smi-topo.txt
+
+# XID 和内核日志，按发行版选择可用命令
+dmesg -T | grep -iE 'NVRM|Xid|nvidia|pcie|aer' &gt; dmesg-gpu.txt || true
+journalctl -k --since "-2 hours" | grep -iE 'NVRM|Xid|nvidia|pcie|aer' &gt; journal-gpu.txt || true
+
+# 作业和进程上下文
+nvidia-smi pmon -c 1 &gt; nvidia-smi-pmon.txt
+ps -eo pid,user,ppid,stat,etime,cmd --sort=pid &gt; ps.txt</code></pre>
+<table>
+<tr><th>字段</th><th>为什么重要</th><th>建议来源</th></tr>
+<tr><td>GPU UUID / PCI BDF</td><td>把 XID、进程、物理槽位、支持工单关联到同一张卡</td><td><code>nvidia-smi -L</code>、<code>nvidia-smi --query-gpu</code></td></tr>
+<tr><td>UTC 时间</td><td>跨时区、跨系统日志对齐</td><td><code>date -u</code>、调度系统事件</td></tr>
+<tr><td>驱动/内核/CUDA</td><td>判断已知问题、兼容性和升级建议</td><td><code>nvidia-smi</code>、<code>uname -a</code>、镜像标签</td></tr>
+<tr><td>作业 ID / 租户</td><td>区分应用 bug、资源争用和节点硬件问题</td><td>Slurm/K8s/Ray/内部调度系统</td></tr>
+</table>
+</section>
+
+<section class="section" id="s8">
+<h2>7. XID 与 crash triage</h2>
+<p>XID 是 NVIDIA 驱动写入内核日志的 GPU 错误报告。它可能指向用户程序错误、驱动问题、硬件问题、PCIe/NVLink 问题或“伴随其他错误出现的二次错误”。<code>nvidia-debugdump</code> 的价值在于补足 XID 之外的低层状态。</p>
+<pre><code># 提取最近的 XID
+dmesg -T | grep -i 'NVRM: Xid' | tail -50
+
+# systemd 系统上按时间过滤
+journalctl -k --since "2026-04-25 10:00:00" | grep -i 'Xid'
+
+# 把 XID 和 GPU 身份放到同一个文件
+{
+  echo "## GPU inventory"
+  nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,serial --format=csv
+  echo
+  echo "## Recent XID"
+  dmesg -T | grep -i 'NVRM: Xid' | tail -50
+} &gt; xid-summary.txt</code></pre>
+<div class="grid-3">
+<div class="card"><strong>应用侧优先</strong><br>XID 13、31 等常见类型可能与非法内存访问、CUDA 程序错误有关，应结合 Compute Sanitizer、cuda-gdb 或框架日志。</div>
+<div class="card"><strong>硬件/链路优先</strong><br>GPU fallen off bus、重复 ECC/PCIe/AER、同一槽位重复故障，更需要节点硬件、固件、线缆、主板和散热证据。</div>
+<div class="card"><strong>升级优先</strong><br>同版本驱动多节点重复、升级后消失/出现、支持方要求复现包时，dump 与 bug report 的时序完整性最关键。</div>
+</div>
+<div class="warn"><strong>不要过度解读：</strong> XID 编号本身不是完整根因。NVIDIA 的 XID 文档给的是分类和建议动作，最终仍要结合具体 GPU、驱动版本、平台、负载和复现条件。</div>
+</section>
+
+<section class="figure" id="s9">
+<h3>流程图：从告警到 nvidia-debugdump 的安全采集路径</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="nvidia-debugdump 安全采集工作流">
+<rect x="18" y="18" width="1064" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="48" width="260" height="64" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="88" text-anchor="middle" font-size="21" font-weight="700" fill="#b91c1c">GPU 告警 / XID / 作业失败</text>
+<rect x="420" y="150" width="260" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="190" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">隔离节点并冻结现场</text>
+<polygon points="550,255 735,340 550,425 365,340" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="330" text-anchor="middle" font-size="17" font-weight="700">是否需要低层 dump？</text><text x="550" y="356" text-anchor="middle" font-size="14">支持要求 / 严重 XID / hang</text>
+<rect x="105" y="305" width="225" height="70" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="217" y="333" text-anchor="middle" font-size="17" font-weight="700">否：常规 triage</text><text x="217" y="358" text-anchor="middle" font-size="14">DCGM / nvidia-smi / 应用日志</text>
+<rect x="770" y="305" width="235" height="70" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="887" y="333" text-anchor="middle" font-size="17" font-weight="700">是：采集上下文</text><text x="887" y="358" text-anchor="middle" font-size="14">bug report + debugdump</text>
+<rect x="770" y="465" width="235" height="72" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="887" y="494" text-anchor="middle" font-size="17" font-weight="700">加密、校验、归档</text><text x="887" y="520" text-anchor="middle" font-size="14">sha256 / 权限 / 工单</text>
+<rect x="420" y="595" width="260" height="64" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="635" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">供应商升级或节点恢复</text>
+<line x1="550" y1="112" x2="550" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="550" y1="214" x2="550" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="365" y1="340" x2="330" y2="340" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="345" y="322" font-size="14">否</text>
+<line x1="735" y1="340" x2="770" y2="340" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="745" y="322" font-size="14">是</text>
+<line x1="887" y1="375" x2="887" y2="465" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M887 537 C845 595, 710 615, 680 627" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M217 375 C260 530, 390 600, 420 627" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">关键决策点是“是否需要低层 dump”。多数性能、调度和应用问题不需要；严重 XID、hang、支持升级才进入 debugdump 路径。</div></section>
+
+<section class="section" id="s10">
+<h2>8. 与 nvidia-bug-report.sh 的关系</h2>
+<p><code>nvidia-bug-report.sh</code> 是更常用的聚合采集入口，会收集系统和 NVIDIA 驱动相关信息并生成压缩日志。NVIDIA 官方说明里，<code>nvidia-debugdump</code> 大多数情况下由它调用。因此实际 runbook 应优先把 bug report 作为基础证据。</p>
+<table>
+<tr><th>工具</th><th>定位</th><th>输出</th><th>适用方式</th></tr>
+<tr><td><code>nvidia-bug-report.sh</code></td><td>完整环境与驱动问题采集</td><td>通常为 <code>nvidia-bug-report.log.gz</code></td><td>绝大多数 NVIDIA 工单的第一证据</td></tr>
+<tr><td><code>nvidia-debugdump</code></td><td>GPU 内部状态 dump</td><td>二进制 blob 或工具指定格式</td><td>支持要求、严重现场、补充低层证据</td></tr>
+<tr><td><code>nvidia-smi -q</code></td><td>可读的 GPU 状态快照</td><td>文本</td><td>值班人员初筛、健康状态、ECC/时钟/温度</td></tr>
+<tr><td>DCGM</td><td>数据中心监控、健康、诊断</td><td>指标、诊断结果、日志</td><td>自动化巡检、节点验收、故障后诊断</td></tr>
+</table>
+<pre><code># 推荐：先收集完整 bug report
+sudo nvidia-bug-report.sh
+ls -lh nvidia-bug-report.log.gz
+shasum -a 256 nvidia-bug-report.log.gz || sha256sum nvidia-bug-report.log.gz
+
+# 若 bug report 卡住，再查看脚本帮助或安全模式选项
+nvidia-bug-report.sh --help 2&gt;&amp;1 | tee nvidia-bug-report-help.txt</code></pre>
+<div class="success"><strong>优先级建议：</strong> 没有特殊指示时，提交 <code>nvidia-bug-report.log.gz</code>、XID 摘要、<code>nvidia-smi -q</code>、DCGM 结果和复现信息；只有支持方要求时再补独立 debug dump。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>9. 与 DCGM / nvidia-smi 的关系</h2>
+<p>DCGM 和 <code>nvidia-smi</code> 更适合平台侧日常自动化；<code>nvidia-debugdump</code> 更像事故现场的低层取证。把三者分清楚，能避免在生产集群里做过度采集。</p>
+<div class="grid-3">
+<div class="card"><strong><code>nvidia-smi</code></strong><br>低成本、可读、随处可用。适合查看 GPU 是否在线、进程、显存、ECC、时钟、拓扑、持久化模式。</div>
+<div class="card"><strong>DCGM / <code>dcgmi</code></strong><br>面向数据中心的监控和诊断。适合节点准入、健康检查、压力诊断、故障后验证。</div>
+<div class="card"><strong><code>nvidia-debugdump</code></strong><br>低层调试状态采集。适合工单升级和 NVIDIA 工程分析，不适合日常循环巡检。</div>
+</div>
+<pre><code># DCGM 诊断示例：先确认 dcgmi 可用和目标 GPU
+dcgmi discovery -l
+
+# 按 runbook 运行诊断级别，具体级别和时长需结合生产窗口
+sudo dcgmi diag -r 1
+sudo dcgmi diag -r 3 -p diagnostic.test_duration=300.0
+
+# nvidia-smi 快照：适合在 debugdump 前后都保存
+nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,temperature.gpu,power.draw,ecc.errors.uncorrected.volatile.total --format=csv</code></pre>
+<div class="warn"><strong>运行顺序：</strong> 如果 GPU 正处于 hang 或刚出现 XID，先保存静态现场和 bug report；耗时或施压型 DCGM 诊断可能改变现场状态，应放在取证之后或在备用窗口执行。</div>
+</section>
+
+<section class="figure" id="s11-fig">
+<h3>对比图：四类 NVIDIA 诊断工具的使用边界</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="nvidia-debugdump 与其他 NVIDIA 诊断工具对比">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">工具边界：日常可读性 vs 低层取证深度</text>
+<line x1="150" y1="520" x2="950" y2="520" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="550" y="558" text-anchor="middle" font-size="15" fill="#475569">越往右：越偏向供应商/工程级低层取证</text>
+<line x1="150" y1="520" x2="150" y2="120" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="84" y="320" text-anchor="middle" font-size="15" fill="#475569" transform="rotate(-90 84 320)">越往上：越适合自动化和日常使用</text>
+<circle cx="280" cy="210" r="74" fill="#dbeafe" stroke="#93c5fd"/><text x="280" y="202" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">nvidia-smi</text><text x="280" y="232" text-anchor="middle" font-size="14">可读快照</text>
+<circle cx="440" cy="180" r="82" fill="#ccfbf1" stroke="#99f6e4"/><text x="440" y="172" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">DCGM</text><text x="440" y="202" text-anchor="middle" font-size="14">监控/诊断</text>
+<circle cx="635" cy="310" r="86" fill="#ffedd5" stroke="#fdba74"/><text x="635" y="300" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">bug report</text><text x="635" y="330" text-anchor="middle" font-size="14">聚合证据</text>
+<circle cx="815" cy="405" r="90" fill="#ede9fe" stroke="#c4b5fd"/><text x="815" y="395" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">debugdump</text><text x="815" y="425" text-anchor="middle" font-size="14">低层 blob</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">越靠近右下角，越不适合无条件自动化批量运行，越需要明确故障上下文和访问控制。</div></section>
+
+<section class="section" id="s12">
+<h2>10. 容器与 Kubernetes 节点采集</h2>
+<p>在 Kubernetes、Slurm on Kubernetes、Ray 或容器化训练平台中，<code>nvidia-debugdump</code> 通常应在宿主机侧采集，而不是在普通业务容器里采集。原因是容器可能缺少完整设备节点、驱动工具、内核日志和主机硬件上下文。</p>
+<pre><code># Kubernetes：先隔离节点，避免新 Pod 调度进来
+kubectl cordon NODE_NAME
+
+# 标记故障，便于平台和调度侧追踪
+kubectl label node NODE_NAME gpu-incident=true --overwrite
+
+# 找到该节点上的 GPU Pod
+kubectl get pods -A -o wide --field-selector spec.nodeName=NODE_NAME
+
+# 进入节点侧运维通道后采集，而不是在租户容器内直接采集
+ssh NODE_NAME
+sudo nvidia-bug-report.sh
+sudo nvidia-debugdump --help</code></pre>
+<table>
+<tr><th>位置</th><th>优点</th><th>风险</th><th>建议</th></tr>
+<tr><td>宿主机</td><td>日志和设备完整，便于关联 BDF、内核、驱动</td><td>需要严格运维权限</td><td>首选</td></tr>
+<tr><td>特权 debug 容器</td><td>可审计、可模板化</td><td>容易权限过大，仍可能缺日志</td><td>仅平台团队维护</td></tr>
+<tr><td>普通训练容器</td><td>接近应用</td><td>缺权限、缺工具、跨租户风险</td><td>不建议</td></tr>
+</table>
+<div class="danger"><strong>多租户安全：</strong> 不要把 dump 工具和宿主机日志读取权限交给租户容器。debug dump、进程列表和 bug report 可能暴露其他租户的路径、用户名、命令行参数或拓扑信息。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>11. 安全工件处理与隐私保护</h2>
+<p>debug dump 虽然不是普通文本，但仍应按敏感工件处理；它与 bug report、系统日志、进程列表一起打包时，往往包含主机名、用户名、路径、命令行参数、集群拓扑、驱动版本和潜在客户数据痕迹。</p>
+<pre><code># 设置保守权限
+umask 077
+mkdir -p "$case_id"/private
+
+# 生成清单和校验和
+find "$case_id" -type f -maxdepth 2 -print0 | xargs -0 ls -lh &gt; "$case_id"/MANIFEST.txt
+find "$case_id" -type f -maxdepth 2 -print0 | xargs -0 shasum -a 256 &gt; "$case_id"/SHA256SUMS.txt
+
+# 打包前先查看文件列表，不要误打包大规模训练数据或密钥
+tar -tzf "$case_id".tar.gz 2&gt;/dev/null || true
+find "$case_id" -type f -maxdepth 2 -print
+
+# 加密传输示例：按公司密钥管理规范替换收件人
+tar -czf "$case_id".tar.gz "$case_id"
+gpg --encrypt --recipient infra-support@example.com "$case_id".tar.gz</code></pre>
+<div class="grid-3">
+<div class="card"><strong>保留</strong><br>XID、时间线、驱动版本、GPU 身份、拓扑、dump、bug report、DCGM 结果。</div>
+<div class="card"><strong>审查</strong><br>命令行参数、环境变量、路径、主机名、用户信息、内部 IP、作业配置。</div>
+<div class="card"><strong>避免</strong><br>私钥、token、训练数据样本、模型权重、客户数据、无关日志全集。</div>
+</div>
+<div class="warn"><strong>脱敏原则：</strong> 不要修改二进制 dump 本体，否则可能破坏可分析性。需要脱敏时，通常对外围文本日志做最小替换，并在工单中说明替换规则。</div>
+</section>
+
+<section class="figure" id="s13-fig">
+<h3>安全图：debug dump 工件的保护边界</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="debug dump 安全工件处理边界">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="90" y="100" width="920" height="430" rx="28" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="145" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">故障工件包 = 受控证据，不是普通附件</text>
+<rect x="140" y="205" width="190" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="235" y="248" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">debug dump</text><text x="235" y="278" text-anchor="middle" font-size="14">不改写本体</text>
+<rect x="365" y="205" width="190" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="460" y="248" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">bug report</text><text x="460" y="278" text-anchor="middle" font-size="14">审查文本信息</text>
+<rect x="590" y="205" width="190" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="685" y="248" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">日志/作业</text><text x="685" y="278" text-anchor="middle" font-size="14">最小必要</text>
+<rect x="815" y="205" width="150" height="110" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="890" y="248" text-anchor="middle" font-size="20" font-weight="700" fill="#15803d">校验和</text><text x="890" y="278" text-anchor="middle" font-size="14">可追溯</text>
+<rect x="260" y="390" width="580" height="64" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="430" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">访问控制 + 加密传输 + 生命周期删除</text>
+</svg><div class="caption">最安全的做法是：工件目录独立、权限收紧、生成校验和、受控传输、按工单生命周期清理。</div></section>
+
+<section class="section" id="s14">
+<h2>12. 供应商升级包怎么组织</h2>
+<p>升级给 NVIDIA、服务器 OEM、云厂商或集群硬件团队时，按“可复现、可定位、可验证”的结构组织材料。不要只发一句“GPU 挂了”和一个 dump。</p>
+<pre><code>gpu-incident-host123-20260425T021530Z/
+  README.md
+  MANIFEST.txt
+  SHA256SUMS.txt
+  time.txt
+  xid-summary.txt
+  dmesg-gpu.txt
+  journal-gpu.txt
+  nvidia-smi-q.txt
+  nvidia-smi-L.txt
+  nvidia-smi-topo.txt
+  nvidia-bug-report.log.gz
+  nvdebugdump-GPU0.bin
+  dcgm-diag.txt
+  scheduler-event.txt
+  reproduction-notes.md</code></pre>
+<table>
+<tr><th>README 项</th><th>示例</th></tr>
+<tr><td>影响范围</td><td>host123 GPU0，A100 80GB，训练作业 84721 失败，节点已 cordon</td></tr>
+<tr><td>首次发生时间</td><td>2026-04-25T02:15:30Z</td></tr>
+<tr><td>错误摘要</td><td><code>NVRM: Xid (PCI:0000:81:00): 79, GPU has fallen off the bus</code></td></tr>
+<tr><td>复现条件</td><td>同一模型启动 15-30 分钟后概率出现；其他节点未复现</td></tr>
+<tr><td>已做动作</td><td>已隔离节点，未重启，已采集 bug report 和 debugdump</td></tr>
+<tr><td>希望支持方判断</td><td>是否建议 RMA、驱动升级、BIOS/固件升级、槽位/主板排查</td></tr>
+</table>
+<div class="success"><strong>升级技巧：</strong> 如果多个节点出现同类 XID，分别保留每个节点的证据包，并额外提供聚合表：节点、GPU UUID、BDF、驱动版本、XID、时间、机型、槽位、作业类型。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>13. 常见问题与排障矩阵</h2>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>处理方式</th></tr>
+<tr><td><code>nvidia-debugdump: command not found</code></td><td>驱动包未安装完整、路径不在 <code>PATH</code>、容器内缺工具</td><td>在宿主机检查驱动安装；用 <code>command -v</code>、包管理器或驱动安装目录定位</td></tr>
+<tr><td>普通用户权限不足</td><td>设备文件或驱动接口需要管理员权限</td><td>使用受控 sudo/runbook，不要放宽设备文件给所有租户</td></tr>
+<tr><td>采集卡住</td><td>GPU/驱动已 hang、内核接口无响应、bug report 同步等待</td><td>保留终端输出和时间；尝试官方脚本安全模式或支持方建议；不要反复施压</td></tr>
+<tr><td>dump 文件很小或为空</td><td>参数错误、目标 GPU 不存在、采集时状态已丢失</td><td>核对 <code>--help</code>、GPU index/UUID/BDF、XID 时间，重新收集上下文</td></tr>
+<tr><td>支持方说不能分析</td><td>驱动版本不匹配、dump 损坏、缺少上下文、文件被改写</td><td>提交校验和、bug report、原始文件、完整 README</td></tr>
+<tr><td>节点恢复后无法复现</td><td>一次性硬件/链路事件、现场已被重置</td><td>保留证据，观察同卡/同槽位重复率，配置告警和后续 DCGM 验证</td></tr>
+</table>
+<pre><code># 采集卡住时，另开窗口记录状态，不要先 kill
+date -u +%FT%TZ
+ps -ef | grep -E 'nvidia-debugdump|nvidia-bug-report' | grep -v grep
+dmesg -T | tail -200
+
+# 若必须终止，记录原因和时间
+echo "terminated debug collection at $(date -u +%FT%TZ), reason: business recovery window" &gt;&gt; incident-notes.txt</code></pre>
+</section>
+
+<section class="section" id="s16">
+<h2>14. 不要做什么</h2>
+<p><code>nvidia-debugdump</code> 的风险主要来自误用：错误时间采集、错误对象采集、权限过度开放、工件泄漏，以及用它替代更合适的诊断工具。</p>
+<div class="grid-2">
+<div class="card"><strong>不要批量扫全集群</strong><br>这不是健康巡检。全量运行可能制造噪声、影响节点，并产生大量敏感工件。</div>
+<div class="card"><strong>不要在无上下文时单发 dump</strong><br>没有 XID、时间、驱动、GPU 身份和作业背景，dump 很难被有效分析。</div>
+<div class="card"><strong>不要直接公开上传</strong><br>不要把 bug report、dump、日志贴到公开 issue、论坛或未授权对象存储。</div>
+<div class="card"><strong>不要修改 dump 本体</strong><br>二进制 blob 需要保持原样；需要脱敏时处理外围文本并说明。</div>
+</div>
+<div class="danger"><strong>恢复与取证冲突：</strong> 如果业务恢复必须优先，可以重启或摘除节点；但必须在事故记录里写清楚“未采集 dump 的原因”，避免后续复盘误判为证据缺失。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>15. 团队 runbook 模板</h2>
+<p>下面模板适合放进值班手册。按本地驱动版本补齐 <code>nvidia-debugdump --help</code> 中的实际参数，并把工件传输目标替换成公司内部安全渠道。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+node="$(hostname -s)"
+case_id="gpu-incident-${node}-$(date -u +%Y%m%dT%H%M%SZ)"
+umask 077
+mkdir -p "$case_id"
+cd "$case_id"
+
+echo "case_id=$case_id" | tee README.md
+date -u +%FT%TZ | tee time.txt
+uname -a &gt; uname.txt
+nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,driver_version --format=csv &gt; gpu-inventory.csv
+nvidia-smi -q &gt; nvidia-smi-q.txt || true
+nvidia-smi topo -m &gt; nvidia-smi-topo.txt || true
+dmesg -T | grep -iE 'NVRM|Xid|nvidia|pcie|aer' &gt; dmesg-gpu.txt || true
+journalctl -k --since "-2 hours" | grep -iE 'NVRM|Xid|nvidia|pcie|aer' &gt; journal-gpu.txt || true
+ps -eo pid,user,ppid,stat,etime,cmd --sort=pid &gt; ps.txt
+
+sudo nvidia-bug-report.sh || echo "nvidia-bug-report failed: $?" &gt;&gt; README.md
+nvidia-debugdump --help &gt; nvidia-debugdump-help.txt 2&gt;&amp;1 || true
+
+# 如果支持方要求独立 dump，在这里按本机 help 增加明确参数：
+# sudo nvidia-debugdump ... ./nvdebugdump-GPU0.bin
+
+find . -type f -print0 | xargs -0 ls -lh &gt; MANIFEST.txt
+find . -type f -print0 | xargs -0 shasum -a 256 &gt; SHA256SUMS.txt
+cd ..
+tar -czf "${case_id}.tar.gz" "$case_id"
+shasum -a 256 "${case_id}.tar.gz"</code></pre>
+<div class="note"><strong>模板策略：</strong> 默认只保存 <code>nvidia-debugdump --help</code>，不自动执行独立 dump；这样可以安全纳入通用 runbook。真正执行 dump 的参数应由支持工单或本机帮助确认。</div>
+</section>
+
+<section class="section">
+<h2>16. 快速决策卡片</h2>
+<div class="grid-3">
+<div class="card"><strong>先看 XID</strong><br>没有 XID 也可能有 GPU 问题，但 XID 是最重要的第一分类信号。先保存最近两小时内核日志。</div>
+<div class="card"><strong>先聚合再深入</strong><br><code>nvidia-bug-report.sh</code> 是默认入口，<code>nvidia-debugdump</code> 是支持要求下的深入补充。</div>
+<div class="card"><strong>先保现场再恢复</strong><br>如果 SLA 允许，采集完关键证据再 reset/reboot；如果不允许，记录跳过原因。</div>
+<div class="card"><strong>按 GPU 身份组织</strong><br>始终记录 GPU index、UUID、PCI BDF、序列号或资产号，避免 index 重排造成混淆。</div>
+<div class="card"><strong>按敏感工件处理</strong><br>最小权限、校验和、加密传输、受控存储、到期删除。</div>
+<div class="card"><strong>不要代替诊断</strong><br>性能慢、OOM、NCCL 配置错，通常先走 profiler、DCGM、网络和作业日志。</div>
+</div>
+</section>
+
+<section class="refbox" id="s18">
+<h2>17. 参考资料</h2>
+<ul>
+<li>NVIDIA Linux Driver README：<a href="https://download.nvidia.com/XFree86/Linux-x86_64/510.73.05/README/nvidia-debugdump.html">Using the nvidia-debugdump Utility</a></li>
+<li>NVIDIA XID Errors 文档：<a href="https://docs.nvidia.com/deploy/xid-errors/index.html">XID Errors</a></li>
+<li>NVIDIA XID Catalog 分析指南：<a href="https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html">Analyzing Xid Errors with the Xid Catalog</a></li>
+<li>NVIDIA GPU Debug Guidelines：<a href="https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html">GPU Debug Guidelines</a></li>
+<li>NVIDIA DCGM Diagnostics：<a href="https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html">DCGM Diagnostics</a></li>
+<li>本机权威来源：<code>nvidia-debugdump --help</code>、<code>nvidia-bug-report.sh --help</code>、当前驱动版本的发行说明和企业支持 runbook。</li>
+</ul>
+<div class="warn"><strong>时效说明：</strong> NVIDIA 驱动工具选项会随版本变化。本文强调稳定的排障流程和安全边界；具体参数以目标节点的命令帮助和官方支持要求为准。</div>
+</section>
+
+<div class="footer">nvidia-debugdump 中文教程 · 面向 AI Infra 的 NVIDIA GPU 故障取证、XID triage 与供应商升级工作流</div>
+</div>
+</body>
+</html>

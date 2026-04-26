@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>iotop 深度教程：AI Infra 场景下的进程级 IO 观测与排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>iotop 深度教程：AI Infra 场景下的进程级 IO 观测与排障</h1>
+<p class="sub"><code>iotop</code> 是 Linux 上按进程/线程查看磁盘 IO 的交互式工具。它特别适合 AI Infra 排障：判断训练卡顿到底是 dataloader 读不动、checkpoint 写爆盘、swap 触发、日志过量、还是某个容器/后台任务抢占了存储带宽。本教程从内核 IO 记账模型讲起，覆盖权限、列含义、交互模式、batch 采样、容器 caveat、与 <code>iostat</code>/<code>pidstat</code>/<code>lsof</code> 的边界，以及面向训练任务的实战流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">进程级 IO</span><span class="chip">读写带宽</span><span class="chip">SWAPIN</span><span class="chip">IO wait</span><span class="chip">dataloader</span><span class="chip">checkpoint</span><span class="chip">batch 模式</span><span class="chip">容器限制</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>iotop</code> 不是看“哪块盘忙”，而是看“哪个进程正在造成块设备 IO 压力”；它把 Linux task IO 记账以类似 <code>top</code> 的方式实时呈现。</div>
+<div class="success"><strong>最重要原则：</strong> 先用只读观测定位进程，再结合 <code>iostat</code> 看设备饱和、<code>pidstat</code> 做时间序列、<code>lsof</code> 找文件路径；不要只凭瞬时带宽就杀进程或调整训练参数。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">iotop 解决什么问题</a></li>
+<li><a class="anchor" href="#s2">核心模型：进程、内核 IO 记账、块设备</a></li>
+<li><a class="anchor" href="#s3">安装、版本与环境前提</a></li>
+<li><a class="anchor" href="#s4">权限与内核配置</a></li>
+<li><a class="anchor" href="#s5">界面列含义：DISK READ、DISK WRITE、SWAPIN、IO</a></li>
+<li><a class="anchor" href="#s6">交互式使用与常用快捷键</a></li>
+<li><a class="anchor" href="#s7">只看活跃 IO：定位谁在读写</a></li>
+<li><a class="anchor" href="#s8">AI 训练 dataloader 读瓶颈</a></li>
+<li><a class="anchor" href="#s9">checkpoint 与日志写瓶颈</a></li>
+<li><a class="anchor" href="#s10">SWAPIN、IO wait 与内存压力</a></li>
+<li><a class="anchor" href="#s11">batch 模式与可复现采样</a></li>
+<li><a class="anchor" href="#s12">容器、Kubernetes 与命名空间 caveat</a></li>
+<li><a class="anchor" href="#s13">iotop vs iostat/pidstat/lsof/du</a></li>
+<li><a class="anchor" href="#s14">生产排障工作流</a></li>
+<li><a class="anchor" href="#s15">常用命令模板</a></li>
+<li><a class="anchor" href="#s16">常见误判与安全注意事项</a></li>
+<li><a class="anchor" href="#s17">故障速查表</a></li>
+<li><a class="anchor" href="#s18">练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. iotop 解决什么问题</h2>
+<p>AI 训练或推理服务出现吞吐下降时，GPU 利用率低不一定是 GPU 问题。常见根因包括样本文件读取慢、远程文件系统抖动、checkpoint 同步写入、日志或 tensorboard 事件文件暴增、数据预处理进程占满盘、以及内存不足导致 swap。<code>iotop</code> 的价值是把“系统 IO 忙”拆到进程/线程维度。</p>
+<div class="grid-3">
+<div class="card"><strong>适合回答</strong><br>哪个 PID/TID 正在读写磁盘？训练进程是不是读数据读不动？checkpoint 写入是否压住整机？</div>
+<div class="card"><strong>不适合单独回答</strong><br>具体哪块盘饱和？队列深度是多少？文件系统延迟多高？这些要结合 <code>iostat</code>、<code>fio</code>、存储监控。</div>
+<div class="card"><strong>AI Infra 视角</strong><br>先把 IO 压力归因到进程，再映射到 job、container、dataset、checkpoint 目录或后台维护任务。</div>
+</div>
+<pre><code># 典型入口：只显示正在发生 IO 的任务
+sudo iotop -o
+
+# 非交互采样 5 次，每秒一次，便于贴到工单或日志
+sudo iotop -b -o -d 1 -n 5</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>iotop</code> 显示的是内核能归因到 task 的 IO 记账。页缓存命中、网络文件系统、某些 overlay 层和异步写回可能让读数与应用体感不完全一致。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：iotop 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="iotop 整体模型">
+<rect x="18" y="18" width="1064" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="65" text-anchor="middle" font-size="28" font-weight="700">从训练任务到块设备：iotop 看的是“谁制造了 IO”</text>
+<rect x="70" y="125" width="215" height="115" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="177" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">AI Job</text><text x="177" y="195" text-anchor="middle" font-size="15">trainer / dataloader</text><text x="177" y="218" text-anchor="middle" font-size="15">checkpoint writer</text>
+<rect x="335" y="125" width="215" height="115" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="442" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">Linux task</text><text x="442" y="195" text-anchor="middle" font-size="15">PID / TID</text><text x="442" y="218" text-anchor="middle" font-size="15">taskstats IO accounting</text>
+<rect x="600" y="125" width="215" height="115" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="707" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">VFS / Page Cache</text><text x="707" y="195" text-anchor="middle" font-size="15">read/write</text><text x="707" y="218" text-anchor="middle" font-size="15">cache hit / writeback</text>
+<rect x="865" y="125" width="165" height="115" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="948" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">Block IO</text><text x="948" y="195" text-anchor="middle" font-size="15">NVMe / SSD</text><text x="948" y="218" text-anchor="middle" font-size="15">NFS client cache</text>
+<rect x="145" y="365" width="810" height="130" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="405" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">iotop 把 task IO 记账按时间窗口汇总成表格</text><text x="550" y="444" text-anchor="middle" font-size="16">DISK READ / DISK WRITE 代表采样窗口内的读写速率</text><text x="550" y="475" text-anchor="middle" font-size="16">SWAPIN / IO 代表等待 swap 或块 IO 的时间占比信号</text>
+<line x1="285" y1="183" x2="335" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="550" y1="183" x2="600" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="815" y1="183" x2="865" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">心智模型：<code>iotop</code> 是进程归因工具；设备是否饱和、文件路径是什么、容器是谁，需要用其他工具补齐。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与环境前提</h2>
+<p>多数发行版软件仓库提供 <code>iotop</code>。传统实现依赖 Python 与 taskstats；部分系统还提供 <code>iotop-c</code>，是 C 语言重写版本，启动更轻、兼容性可能不同。生产环境以发行版包为准，避免在节点上随意安装未知来源脚本。</p>
+<table>
+<tr><th>系统</th><th>安装命令</th><th>说明</th></tr>
+<tr><td>Debian/Ubuntu</td><td><code>sudo apt-get install iotop</code></td><td>常见云主机和训练节点可直接安装。</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>sudo dnf install iotop</code></td><td>老系统可能使用 <code>yum</code> 或需要 EPEL。</td></tr>
+<tr><td>Arch</td><td><code>sudo pacman -S iotop</code></td><td>也可能提供 <code>iotop-c</code> 包。</td></tr>
+<tr><td>容器镜像</td><td>不建议只在业务容器内安装</td><td>通常需要宿主机权限和完整 <code>/proc</code> 视图。</td></tr>
+</table>
+<pre><code># 查看版本和帮助
+iotop --version
+iotop --help
+
+# 如果系统提供 iotop-c，也先确认参数兼容性
+iotop-c --help 2&gt;/dev/null || true</code></pre>
+<div class="note"><strong>环境前提：</strong> <code>iotop</code> 需要 Linux 内核的 per-task IO accounting 支持，并通常要求 root 权限或足够 capability。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 权限与内核配置</h2>
+<p>运行 <code>iotop</code> 最常见失败原因是权限不足或内核未开启任务 IO 记账。AI 集群上，普通用户经常只能看到自己的进程，无法观察整机租户、容器 runtime、缓存预热任务或后台同步进程。</p>
+<table>
+<tr><th>检查项</th><th>命令</th><th>期望</th></tr>
+<tr><td>是否 root</td><td><code>id -u</code></td><td><code>0</code> 可看到完整系统视图。</td></tr>
+<tr><td>内核配置</td><td><code>grep TASK_IO_ACCOUNTING /boot/config-$(uname -r)</code></td><td><code>CONFIG_TASK_IO_ACCOUNTING=y</code>。</td></tr>
+<tr><td>进程 IO 文件</td><td><code>head /proc/self/io</code></td><td>能看到 <code>read_bytes</code>、<code>write_bytes</code> 等字段。</td></tr>
+<tr><td>容器可见性</td><td><code>ls -ld /proc/1 /proc/self</code></td><td>容器内可能只看到本命名空间。</td></tr>
+</table>
+<pre><code># 推荐以 sudo 运行，先只读观察
+sudo iotop -o
+
+# 如果报错，可以先检查内核是否暴露 /proc IO 记账
+cat /proc/self/io
+
+# 常见内核配置检查
+zgrep TASK_IO_ACCOUNTING /proc/config.gz 2&gt;/dev/null || \
+  grep TASK_IO_ACCOUNTING /boot/config-$(uname -r)</code></pre>
+<div class="danger"><strong>权限安全：</strong> 不要为了运行 <code>iotop</code> 给业务容器长期授予 <code>--privileged</code>。更安全的做法是在宿主机、调试节点或受控的 node debug 会话中观测。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 界面列含义：DISK READ、DISK WRITE、SWAPIN、IO</h2>
+<p><code>iotop</code> 的列不是“累计文件大小”，而是采样窗口内按 task 归因的速率和等待占比。理解每列含义，才能避免把缓存、异步写回或短暂尖峰误判为稳定瓶颈。</p>
+<table>
+<tr><th>列</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>TID</code>/<code>PID</code></td><td>任务或进程 ID，视线程显示模式而定。</td><td>多 worker dataloader 常表现为多个 Python 子进程/线程。</td></tr>
+<tr><td><code>PRIO</code></td><td>IO 调度优先级或 best-effort 类别。</td><td>通常不是第一排障入口，除非确认 IO scheduler 支持且策略被修改。</td></tr>
+<tr><td><code>USER</code></td><td>进程所属用户。</td><td>可快速区分训练用户、root 后台任务、日志代理或容器 runtime。</td></tr>
+<tr><td><code>DISK READ</code></td><td>采样窗口内归因到该 task 的读速率。</td><td>dataloader 或预处理任务高读速率，GPU 利用低，常指向输入管线。</td></tr>
+<tr><td><code>DISK WRITE</code></td><td>采样窗口内归因到该 task 的写速率。</td><td>checkpoint、日志、缓存生成、数据解压可能造成写峰值。</td></tr>
+<tr><td><code>SWAPIN</code></td><td>任务等待 swap-in 的时间比例。</td><td>训练内存超限、page cache 被挤压、batch 太大时要警惕。</td></tr>
+<tr><td><code>IO</code></td><td>任务等待 IO 完成的时间比例。</td><td>高 IO% 且 GPU 空闲，说明任务经常阻塞在存储路径上。</td></tr>
+<tr><td><code>COMMAND</code></td><td>命令行。</td><td>映射到训练脚本、DataLoader worker、压缩/同步/日志进程。</td></tr>
+</table>
+<div class="warn"><strong>读数解释：</strong> <code>DISK WRITE</code> 高不一定表示物理盘立即同步写入；page cache 和 writeback 会改变时间归因。对存储设备饱和度要再看 <code>iostat -xz</code>。</div>
+</section>
+
+<section class="figure" id="f6">
+<h3>流程图：交互式 iotop 的一次排障循环</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="iotop 交互式排障流程">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">sudo iotop -o</text>
+<polygon points="550,155 725,245 550,335 375,245" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="238" text-anchor="middle" font-size="18" font-weight="700">是否有高 READ/WRITE/IO?</text><text x="550" y="263" text-anchor="middle" font-size="14">持续多个刷新周期才算信号</text>
+<rect x="105" y="215" width="215" height="70" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="212" y="257" text-anchor="middle" font-size="18" font-weight="700">延长采样窗口</text>
+<rect x="780" y="215" width="230" height="70" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="895" y="257" text-anchor="middle" font-size="18" font-weight="700">记录 PID/命令</text>
+<rect x="170" y="430" width="235" height="78" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="288" y="463" text-anchor="middle" font-size="18" font-weight="700">用 lsof 找路径</text><text x="288" y="490" text-anchor="middle" font-size="14">dataset / ckpt / logs</text>
+<rect x="435" y="430" width="235" height="78" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="553" y="463" text-anchor="middle" font-size="18" font-weight="700">用 iostat 看设备</text><text x="553" y="490" text-anchor="middle" font-size="14">%util / await / aqu-sz</text>
+<rect x="700" y="430" width="235" height="78" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="818" y="463" text-anchor="middle" font-size="18" font-weight="700">映射到 job/container</text><text x="818" y="490" text-anchor="middle" font-size="14">cgroup / kube / runtime</text>
+<rect x="315" y="575" width="470" height="56" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="611" text-anchor="middle" font-size="19" font-weight="700">形成假设，再做最小变更验证</text>
+<line x1="550" y1="114" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="375" y1="245" x2="320" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="342" y="228" font-size="14">否</text><line x1="725" y1="245" x2="780" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="746" y="228" font-size="14">是</text><path d="M895 285 C850 350, 760 385, 818 430" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M895 285 C755 360, 612 370, 553 430" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M895 285 C650 360, 420 370, 288 430" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="288" y1="508" x2="440" y2="575" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="553" y1="508" x2="553" y2="575" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="818" y1="508" x2="660" y2="575" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">交互式排障不要停在“看到一个 PID 很高”；要把 PID 连接到文件路径、设备、job/container 和业务阶段。</div></section>
+
+<section class="section" id="s6">
+<h2>5. 交互式使用与常用快捷键</h2>
+<p>最常用启动方式是 <code>sudo iotop -o</code>：只显示当前有 IO 的任务，降低噪声。不同版本快捷键可能略有差异，生产节点上可以按 <span class="kbd">?</span> 查看帮助。</p>
+<table>
+<tr><th>操作</th><th>作用</th><th>使用建议</th></tr>
+<tr><td><code>sudo iotop</code></td><td>显示所有任务。</td><td>适合初次观察，但噪声较多。</td></tr>
+<tr><td><code>sudo iotop -o</code></td><td>只显示有 IO 的任务。</td><td>AI 节点排障首选。</td></tr>
+<tr><td><code>Left/Right</code></td><td>切换排序列。</td><td>在读、写、IO% 之间快速切换。</td></tr>
+<tr><td><code>r</code></td><td>反转排序。</td><td>确认低值/高值边界。</td></tr>
+<tr><td><code>o</code></td><td>切换只显示活跃 IO。</td><td>观察短时尖峰时很有用。</td></tr>
+<tr><td><code>p</code></td><td>切换线程/进程聚合显示。</td><td>多进程 dataloader 需要留意 TID/PID 语义。</td></tr>
+<tr><td><code>q</code></td><td>退出。</td><td>只读观测，无需清理。</td></tr>
+</table>
+<pre><code># 2 秒刷新一次，降低终端抖动
+sudo iotop -o -d 2
+
+# 只观察某个用户的训练任务
+sudo iotop -o -u trainuser</code></pre>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 只看活跃 IO：定位谁在读写</h2>
+<p><code>-o</code> 是日常排障最实用的参数。训练节点上进程很多，直接看全量列表会被 idle 进程淹没。先用 <code>-o</code> 找活跃 PID，再用 <code>ps</code>、<code>lsof</code>、<code>readlink /proc/PID/cwd</code> 做映射。</p>
+<pre><code># 找出当前正在制造 IO 的任务
+sudo iotop -o -d 1
+
+# 记录 PID 后，看完整命令行
+ps -fp 12345
+tr '\0' ' ' &lt; /proc/12345/cmdline; echo
+
+# 看进程工作目录和打开的文件
+readlink -f /proc/12345/cwd
+sudo lsof -p 12345 | head -50</code></pre>
+<div class="grid-2">
+<div class="card"><strong>读高</strong><br>关注 dataset 路径、解压/预处理、cache miss、远程 FS、随机小文件读取。</div>
+<div class="card"><strong>写高</strong><br>关注 checkpoint、日志、样本缓存生成、临时目录、对象存储同步 agent。</div>
+<div class="card"><strong>IO% 高</strong><br>任务经常阻塞等待 IO，可能拖低 GPU pipeline。</div>
+<div class="card"><strong>瞬时尖峰</strong><br>单次刷新不够，要用 batch 模式采多次或结合 <code>pidstat -d</code>。</div>
+</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. AI 训练 dataloader 读瓶颈</h2>
+<p>Dataloader 读瓶颈的典型表现是 GPU 利用率周期性掉到低位，训练 step time 抖动，<code>iotop</code> 中 Python worker、数据解码进程或缓存预热进程持续高读速率/高 IO%。</p>
+<h3>观察流程</h3>
+<pre><code># 1. 训练运行时观察有 IO 的任务
+sudo iotop -b -o -d 1 -n 20 | tee /tmp/iotop.train.log
+
+# 2. 找到高 READ 的 PID 后映射到命令
+ps -fp 12345
+readlink -f /proc/12345/cwd
+
+# 3. 看它正在打开哪些数据文件
+sudo lsof -p 12345 | grep -E '/dataset|/data|\.tar|\.parquet|\.jpg|\.npy' | head</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>验证方式</th><th>常见修复方向</th></tr>
+<tr><td>多个 worker 低速随机读</td><td>海量小文件、元数据开销高。</td><td><code>lsof</code> 看文件类型，<code>iostat -xz 1</code> 看 await。</td><td>打包为 tar/webdataset/LMDB，预热本地 NVMe。</td></tr>
+<tr><td>读速率很高但 GPU 仍空闲</td><td>解码/CPU transform 慢，不是纯 IO。</td><td>同时看 CPU、<code>py-spy</code>、dataloader profiling。</td><td>增加 worker、优化 transform、缓存解码结果。</td></tr>
+<tr><td>远程挂载读抖动</td><td>NFS/对象存储网关/分布式 FS 抖动。</td><td>看网络、挂载客户端日志、存储监控。</td><td>本地缓存、分片、错峰预热。</td></tr>
+<tr><td>只有 rank0 读高</td><td>数据分片或采样策略不均衡。</td><td>按 PID 映射 rank/local_rank。</td><td>修正 sampler、shard 规划和数据布局。</td></tr>
+</table>
+<div class="note"><strong>判断技巧：</strong> 如果 <code>iotop</code> 读高但 <code>iostat</code> 设备不忙，可能是页缓存或网络文件系统路径；如果两者都高且 await 升高，才更像块设备瓶颈。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. checkpoint 与日志写瓶颈</h2>
+<p>大模型训练经常周期性写 checkpoint。写入阶段如果阻塞训练主线程，<code>iotop</code> 会看到 Python、torchrun、deepspeed、rsync、tar、压缩进程或日志 agent 的 <code>DISK WRITE</code>/<code>IO</code> 突增。</p>
+<pre><code># 采样覆盖至少一个 checkpoint 周期
+sudo iotop -b -o -d 2 -n 120 | tee /tmp/iotop.ckpt.log
+
+# 观察 checkpoint 目录增长
+watch -n 2 'du -sh /mnt/nvme/exp/checkpoints 2&gt;/dev/null; ls -lh /mnt/nvme/exp/checkpoints | tail'
+
+# 映射写文件
+sudo lsof -p 12345 | grep -E 'checkpoint|ckpt|\.pt|\.safetensors|events.out'</code></pre>
+<div class="grid-3">
+<div class="card"><strong>同步 checkpoint</strong><br>训练 step 卡住，主进程写高。优先评估异步保存、减少保存频率、分片和本地落盘。</div>
+<div class="card"><strong>日志过量</strong><br>event 文件、JSONL、debug dump 写高。检查日志级别、flush 频率和 tensorboard 图片/直方图。</div>
+<div class="card"><strong>后台同步</strong><br><code>rsync</code>、<code>rclone</code>、对象存储 sidecar 抢 IO。需要限速、错峰或调整同步策略。</div>
+</div>
+<div class="warn"><strong>不要直接删除：</strong> 看到 checkpoint 写高不代表可以删文件。先确认训练恢复策略、保留策略、rank 写入方式和实验追踪要求。</div>
+</section>
+
+<section class="figure" id="f10">
+<h3>信息图：SWAPIN、IO% 与训练吞吐的关系</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="SWAPIN 和 IO wait 对训练吞吐的影响">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">GPU 空闲不一定是 GPU 问题：等待链路要向上追</text>
+<rect x="80" y="135" width="205" height="95" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="182" y="172" text-anchor="middle" font-size="20" font-weight="700" fill="#15803d">GPU</text><text x="182" y="202" text-anchor="middle" font-size="15">等待 batch</text>
+<rect x="330" y="135" width="205" height="95" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="432" y="172" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">Trainer</text><text x="432" y="202" text-anchor="middle" font-size="15">等待 dataloader</text>
+<rect x="580" y="135" width="205" height="95" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="682" y="172" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">Workers</text><text x="682" y="202" text-anchor="middle" font-size="15">等待 IO / swap</text>
+<rect x="830" y="135" width="205" height="95" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="932" y="172" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">Storage</text><text x="932" y="202" text-anchor="middle" font-size="15">磁盘/远程 FS</text>
+<rect x="130" y="345" width="270" height="140" rx="18" fill="#fef2f2" stroke="#fecaca"/><text x="265" y="382" text-anchor="middle" font-size="21" font-weight="700" fill="#b91c1c">SWAPIN 高</text><text x="265" y="418" text-anchor="middle" font-size="15">页面被换出后又被读回</text><text x="265" y="448" text-anchor="middle" font-size="15">常见于内存超限或 page cache 被挤压</text>
+<rect x="450" y="345" width="270" height="140" rx="18" fill="#fff7ed" stroke="#fed7aa"/><text x="585" y="382" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">IO% 高</text><text x="585" y="418" text-anchor="middle" font-size="15">任务大量时间在等 IO 完成</text><text x="585" y="448" text-anchor="middle" font-size="15">常见于慢盘、远程 FS 或写回压力</text>
+<rect x="770" y="345" width="230" height="140" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="885" y="382" text-anchor="middle" font-size="21" font-weight="700" fill="#334155">下一步</text><text x="885" y="418" text-anchor="middle" font-size="15">free/vmstat 看内存</text><text x="885" y="448" text-anchor="middle" font-size="15">iostat 看设备延迟</text>
+<line x1="285" y1="183" x2="330" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="535" y1="183" x2="580" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="785" y1="183" x2="830" y2="183" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M682 230 C615 275, 350 295, 265 345" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M682 230 C675 285, 625 305, 585 345" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M932 230 C928 285, 905 310, 885 345" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">SWAPIN 是内存压力信号，IO% 是等待 IO 的时间信号；两者都可能通过 dataloader 链路让 GPU 挨饿。</div></section>
+
+<section class="section" id="s10">
+<h2>9. SWAPIN、IO wait 与内存压力</h2>
+<p><code>SWAPIN</code> 高说明任务等待换入被换出的内存页。AI 训练中，这往往来自 batch 太大、DataLoader worker 太多、CPU cache/样本缓存过大、多个 job 共享节点、或 page cache 与匿名内存竞争。</p>
+<pre><code># iotop 看到 SWAPIN 或 IO% 高后，立刻看内存和 swap
+free -h
+vmstat 1 10
+
+# 看目标进程内存
+grep -E 'VmRSS|VmSwap|Threads' /proc/12345/status
+
+# 如果是 cgroup v2，可查看容器/作业内存事件
+cat /sys/fs/cgroup/&lt;path&gt;/memory.current 2&gt;/dev/null
+cat /sys/fs/cgroup/&lt;path&gt;/memory.events 2&gt;/dev/null</code></pre>
+<table>
+<tr><th>信号组合</th><th>倾向判断</th><th>下一步</th></tr>
+<tr><td><code>SWAPIN</code> 高 + <code>free</code> 显示 swap 使用高</td><td>内存不足或 cgroup 过紧。</td><td>降 batch/worker/prefetch，增加内存，检查泄漏。</td></tr>
+<tr><td><code>IO%</code> 高 + <code>iostat await</code> 高</td><td>设备或远程存储延迟高。</td><td>迁移数据、限速写入、调整并发。</td></tr>
+<tr><td><code>IO%</code> 高但设备不忙</td><td>可能是锁、网络 FS、容器层或应用级等待。</td><td>结合 <code>strace</code>、应用日志、存储客户端指标。</td></tr>
+</table>
+<div class="danger"><strong>操作安全：</strong> 不要在共享训练节点上随意执行 <code>swapoff -a</code> 或清 page cache。那是全局破坏性操作，可能让其他任务 OOM 或抖动。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. batch 模式与可复现采样</h2>
+<p>交互式界面适合现场观察，batch 模式适合留证据、写入工单、对齐训练 step timeline。核心参数是 <code>-b</code> 非交互、<code>-d</code> 刷新间隔、<code>-n</code> 采样次数、<code>-o</code> 只输出活跃 IO。</p>
+<pre><code># 每秒采样一次，共 60 秒
+sudo iotop -b -o -d 1 -n 60 | tee /tmp/iotop.$(date +%Y%m%d-%H%M%S).log
+
+# 每 5 秒采样一次，覆盖长 checkpoint 周期
+sudo iotop -b -o -d 5 -n 120 &gt; /tmp/iotop.long.log
+
+# 只看指定用户，减少多租户节点噪声
+sudo iotop -b -o -u trainuser -d 1 -n 30</code></pre>
+<h3>轻量解析示例</h3>
+<pre><code># 找出日志中出现频率最高的命令片段，适合快速归因
+awk '/K\/s|M\/s|G\/s/ {cmd=$0; sub(/^.*[0-9.]+ [KMG]\/s[[:space:]]+[0-9.]+ [KMG]\/s[[:space:]]+[0-9.]+ %[[:space:]]+[0-9.]+ %[[:space:]]+/, "", cmd); print cmd}' /tmp/iotop.long.log | \
+  sort | uniq -c | sort -nr | head</code></pre>
+<div class="note"><strong>采样建议：</strong> 覆盖完整业务周期。Dataloader 问题通常要覆盖多个 step；checkpoint 问题至少覆盖一次保存；后台同步问题要覆盖同步窗口。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 容器、Kubernetes 与命名空间 caveat</h2>
+<p>在容器内运行 <code>iotop</code> 经常得到不完整视图：PID namespace 只看到容器内进程，权限不足无法访问 taskstats，overlayfs 写入归因复杂，宿主机 page cache/writeback 让读数和容器内文件路径不完全一致。AI 平台排障时，优先在宿主机或 node debug 环境中观察。</p>
+<table>
+<tr><th>场景</th><th>风险</th><th>建议</th></tr>
+<tr><td>普通业务容器内跑 <code>iotop</code></td><td>看不到宿主机其他进程，权限常不足。</td><td>在宿主机或受控 debug pod 中运行。</td></tr>
+<tr><td>Kubernetes pod</td><td>PID、mount、cgroup 命名空间影响映射。</td><td>用 <code>kubectl debug node</code> 或平台侧节点工具。</td></tr>
+<tr><td>overlayfs</td><td>容器层写入与宿主机实际路径不同。</td><td>结合 container runtime、<code>crictl inspect</code>、cgroup 路径。</td></tr>
+<tr><td>多租户节点</td><td>只看容器内部会漏掉邻居任务。</td><td>宿主机按 PID/cgroup 映射到 pod/job。</td></tr>
+</table>
+<pre><code># 宿主机上从 PID 找 cgroup，映射到容器或 pod
+cat /proc/12345/cgroup
+
+# containerd 环境可结合 crictl 查询
+sudo crictl ps | head
+sudo crictl inspect &lt;container-id&gt; | grep -E 'pid|sandbox|io.kubernetes'
+
+# systemd/cgroup 视图
+systemd-cgls --no-pager | head -80</code></pre>
+<div class="warn"><strong>平台建议：</strong> 如果团队频繁排 AI 作业 IO，最好把 <code>iotop</code> batch 采样、<code>iostat</code>、cgroup 映射封装成只读诊断脚本，而不是让每个用户进宿主机手工操作。</div>
+</section>
+
+<section class="figure" id="f13">
+<h3>选择图：iotop 与 iostat、pidstat、lsof、du 怎么配合</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="iotop 工具选择图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700">IO 排障不是一个工具完成：先归因，再验证</text>
+<ellipse cx="550" cy="185" rx="170" ry="55" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="178" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">iotop</text><text x="550" y="207" text-anchor="middle" font-size="15">哪个进程/线程在读写？</text>
+<ellipse cx="230" cy="370" rx="145" ry="48" fill="#ede9fe" stroke="#c4b5fd"/><text x="230" y="365" text-anchor="middle" font-size="19" font-weight="700" fill="#6d28d9">iostat</text><text x="230" y="391" text-anchor="middle" font-size="14">哪块设备忙？延迟多少？</text>
+<ellipse cx="445" cy="470" rx="145" ry="48" fill="#ccfbf1" stroke="#99f6e4"/><text x="445" y="465" text-anchor="middle" font-size="19" font-weight="700" fill="#0f766e">pidstat -d</text><text x="445" y="491" text-anchor="middle" font-size="14">进程 IO 时间序列</text>
+<ellipse cx="665" cy="470" rx="145" ry="48" fill="#ffedd5" stroke="#fdba74"/><text x="665" y="465" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">lsof</text><text x="665" y="491" text-anchor="middle" font-size="14">进程打开了哪些文件？</text>
+<ellipse cx="875" cy="370" rx="145" ry="48" fill="#dcfce7" stroke="#86efac"/><text x="875" y="365" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">du/ncdu</text><text x="875" y="391" text-anchor="middle" font-size="14">哪个目录增长？</text>
+<rect x="250" y="555" width="600" height="56" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="590" text-anchor="middle" font-size="18" font-weight="700">AI Infra 常用顺序：iotop → lsof/ps → iostat → pidstat → 业务配置</text>
+<line x1="465" y1="225" x2="270" y2="335" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="520" y1="238" x2="455" y2="425" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="585" y1="238" x2="655" y2="425" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="635" y1="225" x2="835" y2="335" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption"><code>iotop</code> 是入口，不是终点。设备级、文件级、时间序列和目录增长需要其他工具补证。</div></section>
+
+<section class="section" id="s13">
+<h2>12. iotop vs iostat/pidstat/lsof/du</h2>
+<table>
+<tr><th>工具</th><th>回答的问题</th><th>强项</th><th>盲区</th></tr>
+<tr><td><code>iotop</code></td><td>哪个进程/线程正在制造 IO？</td><td>进程归因直观，适合现场排障。</td><td>不直接告诉你设备队列、具体文件路径、长期趋势。</td></tr>
+<tr><td><code>iostat -xz</code></td><td>哪块设备饱和，延迟多高？</td><td>设备级利用率、await、队列深度。</td><td>不能直接归因到进程。</td></tr>
+<tr><td><code>pidstat -d</code></td><td>某些 PID 的 IO 随时间如何变化？</td><td>时间序列清晰，适合记录。</td><td>现场交互归因不如 iotop 快。</td></tr>
+<tr><td><code>lsof</code></td><td>进程打开了哪些文件？</td><td>把 PID 连接到 dataset、checkpoint、日志路径。</td><td>不显示实时带宽。</td></tr>
+<tr><td><code>du</code>/<code>ncdu</code></td><td>哪个目录占空间或增长？</td><td>空间排查。</td><td>不代表当前 IO 压力。</td></tr>
+<tr><td><code>strace</code></td><td>进程系统调用卡在哪里？</td><td>能看到 read/write/open/fsync 等调用。</td><td>开销和噪声较高，生产慎用。</td></tr>
+</table>
+<pre><code># 组合拳：进程归因 + 设备验证 + 文件路径
+sudo iotop -o -d 1
+iostat -xz 1
+sudo lsof -p 12345 | head -80
+pidstat -d -p 12345 1 20</code></pre>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 生产排障工作流</h2>
+<p>生产环境的关键不是“看到高 IO 就立刻处理”，而是形成可验证假设。下面流程适合训练节点、推理节点、数据预处理节点和共享开发机。</p>
+<ol>
+<li>确认症状：GPU 利用低、step time 抖动、checkpoint 超时、节点负载高、磁盘告警。</li>
+<li>用 <code>sudo iotop -b -o -d 1 -n 30</code> 采证据，记录时间窗口。</li>
+<li>记录高 IO PID/TID、USER、COMMAND，并用 <code>ps</code> 映射完整命令。</li>
+<li>用 <code>lsof -p</code> 或 <code>/proc/PID/fd</code> 找 dataset/checkpoint/log 路径。</li>
+<li>用 <code>iostat -xz 1</code> 判断是否真实设备饱和。</li>
+<li>映射到 job/container/pod/rank，确认是不是目标任务或邻居任务。</li>
+<li>提出最小修复：限速、错峰、调 worker、改本地缓存、降低 checkpoint 频率、迁移数据。</li>
+<li>再次采样验证，比较修复前后吞吐和 IO 指标。</li>
+</ol>
+<div class="success"><strong>输出证据模板：</strong> “在 14:03-14:04，PID 12345 <code>python train.py</code> 持续 <code>DISK READ</code> 500-800 MB/s、<code>IO</code> 70% 左右；<code>lsof</code> 指向 <code>/mnt/nfs/dataset</code>；同时 <code>iostat</code> 显示 <code>nvme1n1 await</code> 正常但 NFS 客户端日志有重传，因此倾向远程 FS 抖动。”</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 常用命令模板</h2>
+<h3>现场观察</h3>
+<pre><code># 只看活跃 IO，1 秒刷新
+sudo iotop -o -d 1
+
+# 指定用户
+sudo iotop -o -u trainuser
+
+# 拉长刷新间隔，观察 checkpoint 峰值
+sudo iotop -o -d 5</code></pre>
+<h3>可复现记录</h3>
+<pre><code># 30 秒证据
+sudo iotop -b -o -d 1 -n 30 | tee /tmp/iotop.30s.log
+
+# 10 分钟低频证据
+sudo iotop -b -o -d 10 -n 60 | tee /tmp/iotop.10m.log
+
+# 同步记录设备状态
+(iostat -xz 1 30 &gt; /tmp/iostat.30s.log) &
+sudo iotop -b -o -d 1 -n 30 &gt; /tmp/iotop.30s.log</code></pre>
+<h3>进程映射</h3>
+<pre><code># PID 到命令、工作目录、文件
+PID=12345
+ps -fp "$PID"
+tr '\0' ' ' &lt; "/proc/$PID/cmdline"; echo
+readlink -f "/proc/$PID/cwd"
+sudo ls -l "/proc/$PID/fd" | head
+sudo lsof -p "$PID" | head -80</code></pre>
+</section>
+
+<section class="figure" id="f16">
+<h3>排障图：从 iotop 异常到安全处置</h3>
+<svg viewBox="0 0 1100 730" width="100%" role="img" aria-label="iotop 安全排障流程">
+<rect x="20" y="20" width="1060" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">iotop 发现异常 PID</text>
+<rect x="75" y="165" width="225" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="187" y="198" text-anchor="middle" font-size="18" font-weight="700">确认持续性</text><text x="187" y="226" text-anchor="middle" font-size="14">batch 采样多次</text>
+<rect x="335" y="165" width="225" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="447" y="198" text-anchor="middle" font-size="18" font-weight="700">映射责任主体</text><text x="447" y="226" text-anchor="middle" font-size="14">user / job / pod / rank</text>
+<rect x="595" y="165" width="225" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="707" y="198" text-anchor="middle" font-size="18" font-weight="700">定位文件路径</text><text x="707" y="226" text-anchor="middle" font-size="14">lsof / proc fd</text>
+<rect x="855" y="165" width="180" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="945" y="198" text-anchor="middle" font-size="18" font-weight="700">验证设备</text><text x="945" y="226" text-anchor="middle" font-size="14">iostat / 存储监控</text>
+<polygon points="550,330 735,425 550,520 365,425" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="415" text-anchor="middle" font-size="18" font-weight="700">是否影响生产任务？</text><text x="550" y="442" text-anchor="middle" font-size="14">吞吐下降 / 超时 / 邻居干扰</text>
+<rect x="100" y="555" width="310" height="82" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="255" y="588" text-anchor="middle" font-size="18" font-weight="700">低风险处理</text><text x="255" y="616" text-anchor="middle" font-size="14">限速、错峰、调 worker、改路径</text>
+<rect x="690" y="555" width="310" height="82" rx="14" fill="#fef2f2" stroke="#fecaca"/><text x="845" y="588" text-anchor="middle" font-size="18" font-weight="700">高风险处理需确认</text><text x="845" y="616" text-anchor="middle" font-size="14">杀进程、删 checkpoint、swapoff</text>
+<line x1="550" y1="111" x2="187" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="447" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="707" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="945" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="187" y1="247" x2="450" y2="360" stroke="#94a3b8" stroke-width="3"/><line x1="447" y1="247" x2="510" y2="330" stroke="#94a3b8" stroke-width="3"/><line x1="707" y1="247" x2="590" y2="330" stroke="#94a3b8" stroke-width="3"/><line x1="945" y1="247" x2="650" y2="360" stroke="#94a3b8" stroke-width="3"/><line x1="420" y1="490" x2="300" y2="555" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><text x="380" y="535" font-size="14">否/可控</text><line x1="680" y1="490" x2="800" y2="555" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><text x="735" y="535" font-size="14">是/不确定</text>
+<defs><marker id="e1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">安全处置原则：证据先于动作；低风险调参先于破坏性操作；共享节点上任何杀进程、删文件、关 swap 都需要明确责任边界。</div></section>
+
+<section class="section" id="s16">
+<h2>15. 常见误判与安全注意事项</h2>
+<div class="grid-2">
+<div class="card"><strong>误判 1：把瞬时尖峰当瓶颈</strong><br>单次刷新可能只是 checkpoint 或预读。用 <code>-b -n</code> 覆盖完整周期。</div>
+<div class="card"><strong>误判 2：只看 iotop 不看设备</strong><br>进程读写高不等于设备饱和。用 <code>iostat -xz</code> 验证 await、util、队列。</div>
+<div class="card"><strong>误判 3：容器内读数代表整机</strong><br>容器内可能看不见邻居任务和宿主机 writeback。</div>
+<div class="card"><strong>误判 4：SWAPIN 高只怪磁盘</strong><br>SWAPIN 更多是内存压力信号，要同时看 <code>free</code>、<code>vmstat</code>、cgroup memory。</div>
+<div class="card"><strong>误判 5：看到日志写高就删日志</strong><br>日志可能是实验追踪或审计要求。先限频、轮转、压缩或调整级别。</div>
+<div class="card"><strong>误判 6：高写入一定来自当前进程</strong><br>异步 writeback、overlayfs 和 page cache 会改变归因边界。</div>
+</div>
+<div class="danger"><strong>高风险操作清单：</strong> <code>kill -9</code> 训练进程、删除 checkpoint、清理 page cache、<code>swapoff</code>、卸载文件系统、直接改容器 runtime 配置，都必须先确认影响范围和回滚方式。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 故障速查表</h2>
+<table>
+<tr><th>现象</th><th>优先检查</th><th>常用命令</th><th>下一步</th></tr>
+<tr><td>GPU 利用低，Python worker 读高</td><td>dataloader、数据布局、远程 FS。</td><td><code>sudo iotop -o</code>、<code>lsof -p PID</code></td><td>优化分片、本地缓存、减少小文件随机读。</td></tr>
+<tr><td>每隔 N 分钟训练卡顿</td><td>checkpoint 周期。</td><td><code>sudo iotop -b -o -d 2 -n 120</code></td><td>异步保存、降低频率、独立写盘、限速同步。</td></tr>
+<tr><td>SWAPIN 高</td><td>内存超限、cgroup、worker/prefetch。</td><td><code>free -h</code>、<code>vmstat 1</code>、<code>/proc/PID/status</code></td><td>降内存占用、调 batch/worker、排查泄漏。</td></tr>
+<tr><td>IO% 高但读写速率不高</td><td>高延迟、小 IO、远程 FS、fsync。</td><td><code>iostat -xz 1</code>、<code>strace -p PID</code></td><td>降低 fsync 频率、改存储路径、联系存储侧。</td></tr>
+<tr><td>容器内看不到高 IO 进程</td><td>PID namespace、权限、宿主机邻居任务。</td><td><code>cat /proc/PID/cgroup</code>、<code>crictl ps</code></td><td>到宿主机或 node debug 视角排查。</td></tr>
+<tr><td>磁盘空间增长快</td><td>checkpoint、日志、缓存目录。</td><td><code>du -xh --max-depth=2</code>、<code>lsof +L1</code></td><td>清理策略、日志轮转、保留最近 N 个 checkpoint。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习任务</h2>
+<p>下面练习尽量在测试机或临时目录中完成，不要在共享生产节点制造大量 IO。</p>
+<h3>练习 1：制造可控读写并观察</h3>
+<pre><code># 在临时目录制造一个小文件，避免影响生产盘
+mkdir -p /tmp/iotop-demo
+dd if=/dev/zero of=/tmp/iotop-demo/blob bs=1M count=256 status=progress
+
+# 另一个终端观察
+sudo iotop -o -d 1
+
+# 读取测试文件
+dd if=/tmp/iotop-demo/blob of=/dev/null bs=4M status=progress</code></pre>
+<h3>练习 2：batch 采样并写报告</h3>
+<pre><code># 采样 10 秒
+sudo iotop -b -o -d 1 -n 10 &gt; /tmp/iotop.demo.log
+
+# 查看是否记录到 dd 或其他 IO 任务
+grep -E 'dd|python|tar|rsync' /tmp/iotop.demo.log | head</code></pre>
+<h3>练习 3：把 PID 映射到文件</h3>
+<pre><code># 找到 PID 后
+PID=12345
+ps -fp "$PID"
+sudo lsof -p "$PID" | head -50
+readlink -f "/proc/$PID/cwd"</code></pre>
+<div class="success"><strong>练习目标：</strong> 能从 <code>iotop</code> 的一行输出，走到“谁、在读写什么、是否让设备饱和、是否影响训练”的完整判断链路。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>proc(5)</code> 中 <code>/proc/[pid]/io</code> 字段说明。</li>
+<li>Linux kernel documentation：taskstats、per-task IO accounting、cgroup v2 memory/io 控制器相关文档。</li>
+<li><code>iotop</code> 项目帮助与发行版手册页：<code>iotop --help</code>、<code>man iotop</code>。</li>
+<li>sysstat 工具集文档：<code>iostat(1)</code>、<code>pidstat(1)</code>。</li>
+<li><code>lsof(8)</code> 手册：进程打开文件、已删除文件占用、网络与文件描述符排查。</li>
+<li>Kubernetes 官方文档：debug node、ephemeral containers、container runtime 与 cgroup 观测边界。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握进程级 IO 记账和 <code>iotop</code> 列含义，再学习 <code>iostat</code> 设备指标、<code>pidstat</code> 时间序列、<code>lsof</code> 文件映射，最后结合容器/cgroup 建立 AI 作业到节点资源的映射。</p></section>
+<div class="footer">iotop 深度教程 · AI Infra 图文穿插版 · 进程级 IO、训练数据管线、checkpoint、容器 caveat 与生产排障</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>mpstat 深度教程：AI Infra 的 per-CPU 利用率、NUMA 与数据加载排障</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#182235;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.metric{font-weight:700;color:#0f766e}.bad{font-weight:700;color:#dc2626}.ok{font-weight:700;color:#16a34a}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>mpstat 深度教程：AI Infra 的 per-CPU 利用率、NUMA 与数据加载排障</h1>
+<p class="sub">这份教程围绕 Linux <code>mpstat</code> 展开，面向训练、推理、数据加载、存储和虚拟化混合场景。它不是只列参数，而是从“按 CPU 汇总内核计数器的采样器”这个心智模型出发，讲清楚 <code>-P ALL</code>、<code>%usr</code>、<code>%sys</code>、<code>%iowait</code>、<code>%soft</code>、<code>%steal</code>、NUMA 不均衡线索、dataloader 饱和、sysstat 历史、与 <code>top</code>/<code>perf</code>/<code>sar</code> 的边界，以及生产排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">per-CPU</span><span class="chip">-P ALL</span><span class="chip">sysstat</span><span class="chip">NUMA</span><span class="chip">dataloader</span><span class="chip">iowait</span><span class="chip">softirq</span><span class="chip">steal</span><span class="chip">训练排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>mpstat</code> 是 sysstat 套件里的 CPU 采样器：它按时间间隔读取内核 CPU 计数器，把总体或每个逻辑 CPU 的时间占比分解成 user、system、iowait、irq、softirq、steal、idle 等维度。</div>
+<div class="success"><strong>生产实践：</strong> AI 训练 GPU 利用率下降时，先用 <code>mpstat -P ALL 1</code> 看 CPU 是否单核打满、系统态/软中断是否异常、iowait 是否抬高、虚拟机 steal 是否存在；再结合 <code>pidstat</code>、<code>numastat</code>、<code>iostat</code>、<code>perf</code> 定位根因。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">mpstat 是什么</a></li>
+<li><a class="anchor" href="#s2">核心模型：采样间隔与 CPU 时间桶</a></li>
+<li><a class="anchor" href="#s3">安装、版本与环境确认</a></li>
+<li><a class="anchor" href="#s4">基本语法与输出字段</a></li>
+<li><a class="anchor" href="#s5">per-CPU 视角：<code>-P ALL</code></a></li>
+<li><a class="anchor" href="#s6">AI Infra 快速巡检命令</a></li>
+<li><a class="anchor" href="#s7">理解 user、nice、guest</a></li>
+<li><a class="anchor" href="#s8">理解 system、irq、softirq</a></li>
+<li><a class="anchor" href="#s9">理解 iowait：存储瓶颈还是等待假象</a></li>
+<li><a class="anchor" href="#s10">理解 steal：虚拟化与云上噪声</a></li>
+<li><a class="anchor" href="#s11">NUMA 不均衡线索</a></li>
+<li><a class="anchor" href="#s12">dataloader 饱和与 GPU 饥饿</a></li>
+<li><a class="anchor" href="#s13">sysstat 历史与 sar 回放</a></li>
+<li><a class="anchor" href="#s14">mpstat vs top/perf/sar/pidstat</a></li>
+<li><a class="anchor" href="#s15">故障模式速查表</a></li>
+<li><a class="anchor" href="#s16">生产排障工作流</a></li>
+<li><a class="anchor" href="#s17">采样、容器与可观测性注意事项</a></li>
+<li><a class="anchor" href="#s18">练习任务与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. mpstat 是什么</h2>
+<p><code>mpstat</code> 的名字来自 multi-processor statistics。它读取 Linux 内核暴露的 CPU 时间计数，按采样间隔计算百分比，并可以把结果拆到每个逻辑 CPU。对 AI Infra 来说，它的价值在于快速回答三个问题：CPU 是否足够忙、忙在哪一类内核时间、忙得是否均匀。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>低开销观察总体 CPU、每核 CPU、软中断、iowait、steal、guest 等时间占比，适合训练/推理节点的第一轮体检。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能告诉你具体函数热点、具体线程栈、具体磁盘队列、具体网络包路径。需要继续用 <code>perf</code>、<code>pidstat</code>、<code>iostat</code>、<code>ss</code> 等工具。</div>
+<div class="card"><strong>它的本质</strong><br>时间窗口里的 CPU 时间分账：逻辑 CPU 在这一秒里把时间花在 user、system、iowait、softirq、idle 等桶里的比例。</div>
+</div>
+<pre><code># 每 1 秒输出一次所有 CPU 的利用率
+mpstat -P ALL 1
+
+# 采样 5 次后退出，适合保存证据
+mpstat -P ALL 1 5
+
+# 只看总体 CPU
+mpstat 1
+
+# 显示时间戳，保存到排障记录
+mpstat -P ALL 1 10 | tee mpstat.$(date +%F-%H%M%S).log</code></pre>
+<div class="warn"><strong>关键边界：</strong> <code>mpstat</code> 展示的是 CPU 时间分布，不是 GPU 利用率，也不是进程级根因。看到异常后要继续向进程、线程、NUMA、I/O 或网络层下钻。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：mpstat 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="mpstat 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="86" width="210" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="160" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">内核计数器</text>
+<text x="160" y="158" text-anchor="middle" font-size="15">/proc/stat</text>
+<text x="160" y="181" text-anchor="middle" font-size="15">每 CPU 时间累计值</text>
+<rect x="325" y="86" width="210" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">采样间隔</text>
+<text x="430" y="158" text-anchor="middle" font-size="15">interval = 1s / 5s</text>
+<text x="430" y="181" text-anchor="middle" font-size="15">计算前后差值</text>
+<rect x="595" y="86" width="210" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="700" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">时间桶</text>
+<text x="700" y="158" text-anchor="middle" font-size="15">usr sys iowait</text>
+<text x="700" y="181" text-anchor="middle" font-size="15">irq soft steal idle</text>
+<rect x="865" y="86" width="180" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="955" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">输出表</text>
+<text x="955" y="158" text-anchor="middle" font-size="15">all 或 CPU0..N</text>
+<text x="955" y="181" text-anchor="middle" font-size="15">百分比</text>
+<line x1="265" y1="142" x2="325" y2="142" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="535" y1="142" x2="595" y2="142" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="805" y1="142" x2="865" y2="142" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="145" y="310" width="810" height="164" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="350" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">mpstat = CPU 时间差值 ÷ 采样窗口</text>
+<text x="550" y="391" text-anchor="middle" font-size="16">CPU0 在 1 秒内 70% user + 10% system + 5% softirq + 15% idle</text>
+<text x="550" y="424" text-anchor="middle" font-size="16">说明这颗逻辑 CPU 大部分时间运行用户态代码，仍有少量空闲</text>
+<text x="550" y="454" text-anchor="middle" font-size="16">如果只有 CPU0 满、其他 CPU 空，常见于单线程瓶颈、IRQ 绑定或 NUMA/亲和性问题</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">mpstat 不看瞬时“当前正在跑什么”，而是看一个采样窗口内每个 CPU 的时间分账。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与环境确认</h2>
+<p><code>mpstat</code> 通常由 <code>sysstat</code> 包提供。训练节点、推理节点和云上实例最好预装它，因为故障发生后再安装可能已经错过现场。</p>
+<table>
+<tr><th>系统</th><th>安装命令</th><th>确认命令</th></tr>
+<tr><td>Ubuntu / Debian</td><td><code>sudo apt-get install sysstat</code></td><td><code>mpstat -V</code></td></tr>
+<tr><td>RHEL / CentOS / Rocky</td><td><code>sudo dnf install sysstat</code> 或 <code>sudo yum install sysstat</code></td><td><code>rpm -q sysstat</code></td></tr>
+<tr><td>SUSE</td><td><code>sudo zypper install sysstat</code></td><td><code>mpstat -V</code></td></tr>
+<tr><td>容器镜像</td><td>推荐在 debug 镜像安装，不一定放进业务镜像</td><td><code>which mpstat</code></td></tr>
+</table>
+<pre><code># 确认 CPU 拓扑
+lscpu
+nproc --all
+
+# 确认 mpstat 来自 sysstat
+mpstat -V
+
+# 查看帮助，确认当前版本支持的选项
+mpstat --help 2&gt;&amp;1 | sed -n '1,80p'</code></pre>
+<div class="note"><strong>版本提醒：</strong> 不同 sysstat 版本的字段和选项可能略有差异。教程里的核心字段在常见 Linux 发行版上可用，但生产脚本应先在目标镜像和宿主机验证。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 基本语法与输出字段</h2>
+<pre><code>mpstat [options] [interval [count]]
+
+# interval：采样间隔，单位秒
+# count：采样次数；省略时持续输出
+# -P：选择 CPU，ALL 表示每个逻辑 CPU 都输出</code></pre>
+<table>
+<tr><th>字段</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>%usr</code></td><td>用户态普通进程占用 CPU 时间</td><td>Python dataloader、预处理、tokenizer、推理服务业务逻辑常体现在这里。</td></tr>
+<tr><td><code>%nice</code></td><td>nice 调整过优先级的用户态进程</td><td>如果批处理任务被 nice 降权，可能在这里看到消耗。</td></tr>
+<tr><td><code>%sys</code></td><td>内核态执行时间</td><td>系统调用、内核网络栈、文件系统、驱动路径增加时会升高。</td></tr>
+<tr><td><code>%iowait</code></td><td>CPU 空闲且系统有未完成 I/O 请求的时间</td><td>数据集读取、网络存储、checkpoint 写入、日志刷盘可能让它抬高。</td></tr>
+<tr><td><code>%irq</code></td><td>硬中断处理时间</td><td>高包量网卡或设备中断异常时关注。</td></tr>
+<tr><td><code>%soft</code></td><td>软中断处理时间</td><td>网络收发、存储、内核 softirq 压力常见信号。</td></tr>
+<tr><td><code>%steal</code></td><td>虚拟机等待宿主机调度 CPU 的时间</td><td>云上实例被邻居或宿主机超卖影响时会升高。</td></tr>
+<tr><td><code>%guest</code>/<code>%gnice</code></td><td>运行虚拟 CPU 的时间</td><td>嵌套虚拟化或宿主机场景才常见。</td></tr>
+<tr><td><code>%idle</code></td><td>空闲时间</td><td>GPU 低利用且 CPU 大量 idle，常说明瓶颈不在 CPU 算力本身。</td></tr>
+</table>
+<pre><code># 典型输出形态
+$ mpstat -P ALL 1 1
+Linux 6.x (...)  04/25/2026  _x86_64_  (64 CPU)
+
+10:00:01 AM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+10:00:02 AM  all   38.12    0.00    8.44    2.17    0.00    1.92    0.00    0.00    0.00   49.35
+10:00:02 AM    0   95.00    0.00    3.00    0.00    0.00    1.00    0.00    0.00    0.00    1.00
+10:00:02 AM    1   12.00    0.00    6.00    0.00    0.00    2.00    0.00    0.00    0.00   80.00</code></pre>
+<div class="warn"><strong>读表原则：</strong> 先看 <code>all</code> 判断总体压力，再看 <code>-P ALL</code> 判断是否少数 CPU 异常；只看平均值会掩盖单核打满和 IRQ 集中。</div>
+</section>
+
+<section class="figure" id="fig-percpu">
+<h3>核心图：<code>-P ALL</code> 如何暴露单核瓶颈</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="mpstat -P ALL per CPU imbalance">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">平均值看起来正常，per-CPU 才看到真实问题</text>
+<rect x="90" y="115" width="410" height="170" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="295" y="150" text-anchor="middle" font-size="20" font-weight="700" fill="#334155">只看 all</text>
+<text x="295" y="188" text-anchor="middle" font-size="16">all %usr = 25%</text>
+<text x="295" y="219" text-anchor="middle" font-size="16">all %idle = 70%</text>
+<text x="295" y="250" text-anchor="middle" font-size="15" fill="#64748b">容易误判：CPU 还有很多空闲</text>
+<rect x="600" y="115" width="410" height="170" rx="18" fill="#fff7ed" stroke="#fdba74"/>
+<text x="805" y="150" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">看 -P ALL</text>
+<text x="805" y="188" text-anchor="middle" font-size="16">CPU0 %usr = 99%</text>
+<text x="805" y="219" text-anchor="middle" font-size="16">CPU1..63 大多 idle</text>
+<text x="805" y="250" text-anchor="middle" font-size="15" fill="#9a3412">真实线索：单线程、亲和性或 IRQ 集中</text>
+<rect x="110" y="375" width="880" height="190" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="550" y="410" text-anchor="middle" font-size="20" font-weight="700">CPU 利用率热力条</text>
+<rect x="175" y="455" width="720" height="34" rx="8" fill="#e2e8f0"/>
+<rect x="175" y="455" width="700" height="34" rx="8" fill="#dc2626"/>
+<text x="140" y="478" text-anchor="middle" font-size="14">CPU0</text>
+<text x="925" y="478" font-size="14">99%</text>
+<rect x="175" y="505" width="720" height="34" rx="8" fill="#e2e8f0"/>
+<rect x="175" y="505" width="86" height="34" rx="8" fill="#16a34a"/>
+<text x="140" y="528" text-anchor="middle" font-size="14">CPU1</text>
+<text x="925" y="528" font-size="14">12%</text>
+<rect x="175" y="555" width="720" height="34" rx="8" fill="#e2e8f0"/>
+<rect x="175" y="555" width="58" height="34" rx="8" fill="#16a34a"/>
+<text x="140" y="578" text-anchor="middle" font-size="14">CPU2</text>
+<text x="925" y="578" font-size="14">8%</text>
+</svg>
+<div class="caption"><code>mpstat -P ALL</code> 是发现 CPU 不均衡的第一工具：平均值低并不代表没有 CPU 瓶颈。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. per-CPU 视角：<code>-P ALL</code></h2>
+<p>AI 训练节点通常有几十到上百个逻辑 CPU。总体利用率只能说明平均情况，无法揭示单核打满、软中断集中、NUMA 局部热点、进程亲和性配置错误等问题。排障时应默认使用 <code>-P ALL</code>。</p>
+<pre><code># 每秒采样，显示每个逻辑 CPU
+mpstat -P ALL 1
+
+# 只观察 CPU 0、1、32、33，适合验证特定 NUMA 节点或亲和性
+mpstat -P 0,1,32,33 1
+
+# 保存 60 秒证据，避免凭感觉判断
+mpstat -P ALL 1 60 &gt; /tmp/mpstat.percpu.log</code></pre>
+<table>
+<tr><th>现象</th><th>常见原因</th><th>下一步</th></tr>
+<tr><td>单个 CPU <code>%usr</code> 接近 100%</td><td>单线程 Python、tokenizer、压缩/解压、日志格式化、全局锁</td><td><code>pidstat -t -u 1</code> 找线程；<code>py-spy</code> 或 <code>perf top</code> 看热点。</td></tr>
+<tr><td>少数 CPU <code>%soft</code> 高</td><td>网卡 RX 队列、RPS/RFS、存储中断、NCCL 网络流量集中</td><td>看 <code>/proc/softirqs</code>、<code>ethtool -l/-x</code>、IRQ 亲和性。</td></tr>
+<tr><td>一个 socket 的 CPU 忙，另一个 socket 闲</td><td>NUMA 绑定、数据线程集中、内存远端访问</td><td><code>numactl -H</code>、<code>numastat -p PID</code>、进程 CPU affinity。</td></tr>
+<tr><td>所有 CPU <code>%idle</code> 很高但 GPU 低</td><td>网络、存储、分布式同步、GPU kernel 小且碎、数据管道外部等待</td><td>结合 <code>nvidia-smi dmon</code>、<code>iostat</code>、训练日志 step time。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s6">
+<h2>5. AI Infra 快速巡检命令</h2>
+<p>下面是一组生产上常用的“低侵入观察”命令。它们不会修改系统状态，适合在故障现场先收集证据。</p>
+<pre><code># 1. 总体 + 每核 CPU，持续观察
+mpstat -P ALL 1
+
+# 2. 固定 30 秒证据，便于贴到 incident
+mpstat -P ALL 1 30 | tee /tmp/mpstat.$(hostname).$(date +%F-%H%M%S).log
+
+# 3. 同时看进程/线程级 CPU，关联到 dataloader worker 或服务线程
+pidstat -t -u 1
+
+# 4. 同时看磁盘 I/O
+iostat -xz 1
+
+# 5. 同时看 GPU 利用与 PCIe/显存趋势
+nvidia-smi dmon -s pucm 1</code></pre>
+<div class="grid-3">
+<div class="card"><strong>训练慢</strong><br>先看 GPU 是否饥饿，再用 <code>mpstat -P ALL</code> 判断 CPU/dataloader 是否跟不上。</div>
+<div class="card"><strong>推理 P99 抖动</strong><br>看 <code>%soft</code>、<code>%sys</code>、单核热点和 <code>%steal</code>，再关联网卡、线程池和容器限额。</div>
+<div class="card"><strong>checkpoint 卡顿</strong><br>看 <code>%iowait</code> 与 <code>iostat -xz</code>，区分本地盘、网络盘、对象存储 FUSE 和元数据瓶颈。</div>
+</div>
+<div class="note"><strong>建议：</strong> 采样间隔常用 1 秒；如果系统负载很高或日志量太大，可用 2 到 5 秒。不要用单次截图证明长期问题，至少保存 30 到 60 秒。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 理解 <code>%usr</code>、<code>%nice</code>、<code>%guest</code></h2>
+<p><code>%usr</code> 表示普通用户态代码消耗的 CPU 时间。AI 工作负载里的 Python 解释器、数据增强、图片解码、tokenization、batch collate、RPC 序列化、推理服务业务逻辑，都可能主要出现在 <code>%usr</code>。</p>
+<table>
+<tr><th>字段</th><th>高值说明</th><th>典型 AI 场景</th></tr>
+<tr><td><code>%usr</code></td><td>用户态代码正在大量运行</td><td>PyTorch dataloader worker、CPU 图像增强、文本 tokenizer、CPU fallback op。</td></tr>
+<tr><td><code>%nice</code></td><td>被 nice 调整优先级的任务在运行</td><td>后台离线预处理、低优先级数据整理任务。</td></tr>
+<tr><td><code>%guest</code></td><td>宿主机上运行虚拟 CPU 的时间</td><td>KVM 宿主机或嵌套虚拟化环境，普通训练容器里通常不是重点。</td></tr>
+</table>
+<pre><code># 观察 user 态是否单核打满
+mpstat -P ALL 1 10
+
+# 找到是哪一个线程在跑
+pidstat -t -u 1
+
+# 如果怀疑 Python dataloader，列出 worker
+ps -eLo pid,tid,psr,pcpu,comm,args | grep -E 'python|DataLoader' | head -40</code></pre>
+<div class="warn"><strong>不要误读：</strong> <code>%usr</code> 高不一定是坏事。训练时 CPU 数据预处理充分并行可能会让多个 CPU 忙起来；只有当 GPU 等待、step time 变慢或延迟抖动时，它才是瓶颈线索。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 理解 <code>%sys</code>、<code>%irq</code>、<code>%soft</code></h2>
+<p><code>%sys</code> 是内核态时间，<code>%irq</code> 是硬中断，<code>%soft</code> 是软中断。对高吞吐 AI 系统而言，网络、存储、IPC、容器网络、NCCL 通信和日志写入都可能把时间推到这些桶里。</p>
+<table>
+<tr><th>字段</th><th>可能原因</th><th>验证方向</th></tr>
+<tr><td><code>%sys</code> 高</td><td>系统调用密集、文件系统路径、页缓存、内核锁、容器/网络栈</td><td><code>strace -c -p PID</code>、<code>perf top</code>、<code>pidstat -w</code>。</td></tr>
+<tr><td><code>%irq</code> 高</td><td>硬件中断处理集中</td><td><code>cat /proc/interrupts</code>，检查 IRQ affinity 和设备队列。</td></tr>
+<tr><td><code>%soft</code> 高</td><td>网络包处理、softirq backlog、存储完成队列、虚拟网络</td><td><code>cat /proc/softirqs</code>、<code>sar -n DEV 1</code>、<code>ethtool -S</code>。</td></tr>
+</table>
+<pre><code># 软中断是否集中在少数 CPU
+mpstat -P ALL 1
+cat /proc/softirqs | sed -n '1,12p'
+
+# 网卡队列和 IRQ 分布
+grep -E 'CPU|eth|mlx|ens|eno' /proc/interrupts
+for f in /proc/irq/*/smp_affinity_list; do printf '%s ' "$f"; cat "$f"; done 2&gt;/dev/null | head
+
+# 内核热点，低侵入先短采样
+sudo perf top</code></pre>
+<div class="danger"><strong>安全注意：</strong> 修改 IRQ affinity、RPS/XPS、网卡队列数会改变系统行为，可能影响线上流量。先收集 <code>mpstat</code>、<code>/proc/interrupts</code>、<code>/proc/softirqs</code> 证据，再在维护窗口或灰度节点调整。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 理解 <code>%iowait</code>：存储瓶颈还是等待假象</h2>
+<p><code>%iowait</code> 表示 CPU 空闲且系统存在未完成 I/O 请求的时间。它常被误解为“磁盘忙的百分比”，但它本质仍是 CPU 时间桶。高 iowait 是线索，不是最终结论。</p>
+<div class="grid-2">
+<div class="card"><strong>可能是真瓶颈</strong><br>数据集在网络盘、对象存储挂载、冷缓存随机读、checkpoint 同步写、日志刷盘、元数据操作过多。</div>
+<div class="card"><strong>也可能是等待假象</strong><br>CPU 没有其他可运行任务，所以 I/O 等待被显著显示；如果 GPU、网络或分布式同步也在等待，需要多工具交叉验证。</div>
+</div>
+<pre><code># 同时观察 CPU iowait 与块设备
+mpstat -P ALL 1
+iostat -xz 1
+
+# 观察具体进程 I/O
+pidstat -d 1
+
+# 查看数据集目录所在文件系统
+df -hT /data
+findmnt /data</code></pre>
+<table>
+<tr><th>mpstat 现象</th><th>iostat 现象</th><th>可能判断</th></tr>
+<tr><td><code>%iowait</code> 高</td><td><code>%util</code> 高、<code>await</code> 高</td><td>块设备或网络盘可能成为瓶颈。</td></tr>
+<tr><td><code>%iowait</code> 高</td><td>磁盘不忙</td><td>可能是远端存储、FUSE、网络、元数据服务或采样窗口问题。</td></tr>
+<tr><td><code>%iowait</code> 低</td><td>GPU 仍低利用</td><td>瓶颈可能在 CPU user、分布式同步、数据队列、GPU kernel 调度或外部服务。</td></tr>
+</table>
+<div class="note"><strong>AI 训练经验：</strong> dataloader 读小文件、图片随机增强和远程数据集组合时，<code>%iowait</code> 与 <code>%usr</code> 可能交替升高。只看一个字段很容易误判。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 理解 <code>%steal</code>：虚拟化与云上噪声</h2>
+<p><code>%steal</code> 表示虚拟机想运行但宿主机没有给它 CPU 的时间。云上训练、共享开发机、CI runner、虚拟化推理环境都要关注它。裸金属上通常接近 0。</p>
+<pre><code># 云上实例 CPU 性能抖动时先看 steal
+mpstat -P ALL 1 30
+
+# 同时记录负载和运行队列
+vmstat 1 30
+
+# 容器里也可以观察，但要理解看到的是宿主机或容器命名空间暴露的视图
+cat /proc/stat | sed -n '1,5p'</code></pre>
+<table>
+<tr><th><code>%steal</code></th><th>解释</th><th>行动</th></tr>
+<tr><td>长期 0</td><td>没有明显宿主机抢占</td><td>继续看 user/sys/iowait/softirq。</td></tr>
+<tr><td>偶发 1% 到 5%</td><td>可能有轻微邻居噪声</td><td>对延迟敏感服务要记录与 P99 的相关性。</td></tr>
+<tr><td>持续高于 5%</td><td>虚拟化调度可能影响性能</td><td>更换实例、申请独占宿主机、联系云厂商或避开共享资源池。</td></tr>
+</table>
+<div class="warn"><strong>排障重点：</strong> <code>%steal</code> 高时，应用层优化通常收效有限，因为 CPU 时间没有真正分配给虚拟机。</div>
+</section>
+
+<section class="figure" id="fig-numa">
+<h3>对比图：NUMA 不均衡如何出现在 mpstat 里</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="NUMA imbalance in mpstat">
+<rect x="20" y="20" width="1060" height="640" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">NUMA 不均衡：一个 socket 忙，另一个 socket 闲</text>
+<rect x="90" y="120" width="430" height="410" rx="24" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="305" y="160" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">NUMA node 0</text>
+<rect x="145" y="205" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="145" y="205" width="288" height="38" rx="8" fill="#dc2626"/><text x="115" y="230" font-size="14">CPU0</text><text x="475" y="230" font-size="14">90%</text>
+<rect x="145" y="260" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="145" y="260" width="270" height="38" rx="8" fill="#ea580c"/><text x="115" y="285" font-size="14">CPU1</text><text x="475" y="285" font-size="14">84%</text>
+<rect x="145" y="315" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="145" y="315" width="300" height="38" rx="8" fill="#dc2626"/><text x="115" y="340" font-size="14">CPU2</text><text x="475" y="340" font-size="14">94%</text>
+<rect x="145" y="370" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="145" y="370" width="252" height="38" rx="8" fill="#ea580c"/><text x="115" y="395" font-size="14">CPU3</text><text x="475" y="395" font-size="14">79%</text>
+<text x="305" y="475" text-anchor="middle" font-size="15" fill="#1e40af">dataloader / tokenizer / IRQ 集中</text>
+<rect x="580" y="120" width="430" height="410" rx="24" fill="#dcfce7" stroke="#86efac"/>
+<text x="795" y="160" text-anchor="middle" font-size="23" font-weight="700" fill="#15803d">NUMA node 1</text>
+<rect x="635" y="205" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="635" y="205" width="45" height="38" rx="8" fill="#16a34a"/><text x="605" y="230" font-size="14">CPU32</text><text x="965" y="230" font-size="14">14%</text>
+<rect x="635" y="260" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="635" y="260" width="38" height="38" rx="8" fill="#16a34a"/><text x="605" y="285" font-size="14">CPU33</text><text x="965" y="285" font-size="14">12%</text>
+<rect x="635" y="315" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="635" y="315" width="32" height="38" rx="8" fill="#16a34a"/><text x="605" y="340" font-size="14">CPU34</text><text x="965" y="340" font-size="14">10%</text>
+<rect x="635" y="370" width="320" height="38" rx="8" fill="#e2e8f0"/><rect x="635" y="370" width="26" height="38" rx="8" fill="#16a34a"/><text x="605" y="395" font-size="14">CPU35</text><text x="965" y="395" font-size="14">8%</text>
+<text x="795" y="475" text-anchor="middle" font-size="15" fill="#166534">空闲但可能跨 socket 访问内存/GPU</text>
+<rect x="250" y="570" width="600" height="54" rx="14" fill="#fff7ed" stroke="#fdba74"/>
+<text x="550" y="603" text-anchor="middle" font-size="17" font-weight="700">mpstat 只能给线索；NUMA 结论需要结合 lscpu、numactl、numastat、进程 affinity</text>
+</svg>
+<div class="caption">当 per-CPU 热点按 socket 聚集时，优先怀疑 NUMA 绑定、GPU 亲和性、内存分配位置、IRQ/队列分布。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. NUMA 不均衡线索</h2>
+<p>多 socket AI 服务器里，CPU、内存、PCIe Root Complex、GPU/NIC 之间有拓扑距离。<code>mpstat</code> 不能直接显示 NUMA 远端访问，但它能暴露“某一组 CPU 过忙、另一组 CPU 过闲”的形态，这是继续检查 NUMA 的强线索。</p>
+<pre><code># 查看 CPU 到 NUMA 节点的映射
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+numactl -H
+
+# 观察每个 CPU
+mpstat -P ALL 1
+
+# 查看进程在哪些 CPU 上跑
+ps -eLo pid,tid,psr,pcpu,comm,args | sort -k4 -nr | head -30
+
+# 查看进程内存 NUMA 分布
+numastat -p &lt;PID&gt;</code></pre>
+<table>
+<tr><th>线索</th><th>可能原因</th><th>修复方向</th></tr>
+<tr><td>某个 NUMA 节点 CPU 长期高 <code>%usr</code></td><td>dataloader worker 只在一个 socket 上运行</td><td>检查 <code>taskset</code>、Kubernetes CPU manager、进程 affinity。</td></tr>
+<tr><td>靠近某张 NIC/GPU 的 CPU <code>%soft</code> 高</td><td>IRQ 或网络队列集中</td><td>调整 IRQ affinity、网卡队列、NCCL 网卡选择。</td></tr>
+<tr><td>CPU 利用高但 GPU 仍饥饿</td><td>远端内存访问、跨 socket 拷贝、数据队列锁竞争</td><td>按 GPU 拓扑绑定 worker 和内存，验证 <code>numactl --cpunodebind --membind</code>。</td></tr>
+</table>
+<div class="warn"><strong>不要只凭 mpstat 下结论：</strong> NUMA 问题需要拓扑、进程亲和性、内存分布和业务流向共同确认。<code>mpstat</code> 的作用是快速指出“哪里不均匀”。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. dataloader 饱和与 GPU 饥饿</h2>
+<p>训练 step time 抖动、GPU 利用率周期性掉到 0、显存占用稳定但 SM 利用低，常常与数据加载有关。<code>mpstat</code> 可以把数据加载瓶颈拆成 CPU 算力不够、I/O 等待、单线程瓶颈、软中断/网络问题几类。</p>
+<table>
+<tr><th>mpstat 形态</th><th>dataloader 解释</th><th>验证与行动</th></tr>
+<tr><td>多核 <code>%usr</code> 高、<code>%idle</code> 低</td><td>CPU 预处理真的吃满了</td><td>减少增强成本、增加缓存、预处理离线化、调 <code>num_workers</code> 与 batch size。</td></tr>
+<tr><td>单核 <code>%usr</code> 近 100%</td><td>主进程 collate、Python GIL、单线程 tokenizer 或解码</td><td>看 <code>pidstat -t</code>；把热点移到多进程、native 扩展或预计算。</td></tr>
+<tr><td><code>%iowait</code> 高</td><td>读取数据或 checkpoint I/O 等待</td><td>看 <code>iostat</code>、缓存命中、数据格式、小文件数量、远程存储。</td></tr>
+<tr><td><code>%soft</code> 高</td><td>远程数据集、分布式通信或网络栈压力</td><td>看网卡吞吐、softirq 分布、NCCL 日志、对象存储网关。</td></tr>
+<tr><td>CPU 很 idle</td><td>瓶颈可能不在 CPU 数据预处理</td><td>看 GPU kernel、分布式同步、数据队列阻塞、外部服务。</td></tr>
+</table>
+<pre><code># PyTorch 训练现场常用组合
+mpstat -P ALL 1 60 &gt; /tmp/mpstat.log &
+pidstat -t -u -d 1 60 &gt; /tmp/pidstat.log &
+nvidia-smi dmon -s pucm 1 -c 60 &gt; /tmp/gpu.log &
+wait
+
+# 查 dataloader worker 是否集中在少数 CPU
+ps -eLo pid,tid,psr,pcpu,comm,args | grep python | sort -k4 -nr | head -50</code></pre>
+<div class="success"><strong>优化顺序：</strong> 先用证据判断是哪类瓶颈，再优化。盲目增大 <code>num_workers</code> 可能加重上下文切换、内存压力和远程存储压力。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. sysstat 历史与 sar 回放</h2>
+<p><code>mpstat</code> 和 <code>sar</code> 同属 sysstat。<code>mpstat</code> 适合现场实时观察，<code>sar</code> 适合回放历史。很多线上事故在发生后才被发现，此时历史采集是否开启非常关键。</p>
+<pre><code># 查看 sysstat 是否开启历史采集
+systemctl status sysstat 2&gt;/dev/null || true
+ls -lh /var/log/sa/ 2&gt;/dev/null
+
+# 回放今天的 CPU 历史
+sar -u -f /var/log/sa/sa$(date +%d)
+
+# 回放每 CPU 历史，不同版本 sar 选项可能略有差异
+sar -P ALL -f /var/log/sa/sa$(date +%d)
+
+# 回放指定时间窗口
+sar -u -s 10:00:00 -e 10:30:00</code></pre>
+<table>
+<tr><th>需求</th><th>用 mpstat</th><th>用 sar</th></tr>
+<tr><td>事故正在发生</td><td>直接 <code>mpstat -P ALL 1</code></td><td>可同时开，但不是第一观察入口。</td></tr>
+<tr><td>事故已经过去</td><td>无法回到过去，除非当时保存了日志</td><td>如果 sysstat 采集开启，可回放历史。</td></tr>
+<tr><td>自动化日报</td><td>不适合作为长期存储</td><td>更适合周期采集、归档和报表。</td></tr>
+</table>
+<div class="note"><strong>生产建议：</strong> 训练集群基础镜像或节点初始化脚本应开启 sysstat 历史采集，并明确保留周期。否则很多“昨天晚上训练变慢”的问题只能靠业务日志间接推断。</div>
+</section>
+
+<section class="figure" id="fig-tools">
+<h3>选择图：mpstat、top、perf、sar、pidstat 怎么选</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="mpstat tool comparison">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">从“现象”到“根因”的工具分层</text>
+<rect x="90" y="125" width="220" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="200" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">mpstat</text>
+<text x="200" y="194" text-anchor="middle" font-size="14">总体/每 CPU 时间桶</text>
+<rect x="340" y="125" width="220" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="450" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">pidstat</text>
+<text x="450" y="194" text-anchor="middle" font-size="14">进程/线程 CPU 与 I/O</text>
+<rect x="590" y="125" width="220" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="700" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">perf</text>
+<text x="700" y="194" text-anchor="middle" font-size="14">函数级热点与调用栈</text>
+<rect x="840" y="125" width="180" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="930" y="164" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">sar</text>
+<text x="930" y="194" text-anchor="middle" font-size="14">历史回放</text>
+<line x1="310" y1="178" x2="340" y2="178" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="560" y1="178" x2="590" y2="178" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="810" y1="178" x2="840" y2="178" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<rect x="120" y="335" width="860" height="170" rx="20" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="373" text-anchor="middle" font-size="22" font-weight="700">推荐路径</text>
+<text x="550" y="415" text-anchor="middle" font-size="16">mpstat 判断 CPU 时间桶和不均衡</text>
+<text x="550" y="447" text-anchor="middle" font-size="16">pidstat 找到进程/线程</text>
+<text x="550" y="479" text-anchor="middle" font-size="16">perf / strace / iostat / numastat 继续定位根因</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption"><code>mpstat</code> 是入口，不是终点。它告诉你往 user、kernel、I/O、softirq、steal 还是 NUMA 方向下钻。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. mpstat vs top/perf/sar/pidstat</h2>
+<table>
+<tr><th>工具</th><th>最佳问题</th><th>不适合</th><th>和 mpstat 的关系</th></tr>
+<tr><td><code>mpstat</code></td><td>每 CPU 时间花在哪里，是否不均衡</td><td>找具体函数、具体线程栈</td><td>第一层分流工具。</td></tr>
+<tr><td><code>top</code>/<code>htop</code></td><td>当前哪个进程看起来忙</td><td>准确分解 CPU 时间桶和历史保存</td><td>辅助看进程，但容易被瞬时视图误导。</td></tr>
+<tr><td><code>pidstat</code></td><td>哪个进程/线程消耗 CPU、I/O、上下文切换</td><td>系统整体每核分布</td><td>mpstat 发现异常后用它定位线程。</td></tr>
+<tr><td><code>perf</code></td><td>函数级热点、内核/用户栈</td><td>初学者快速巡检、长期低开销常驻</td><td>mpstat 指向 user/sys 后用 perf 深挖。</td></tr>
+<tr><td><code>sar</code></td><td>历史回放、趋势报表</td><td>实时交互排障的第一入口</td><td>同属 sysstat，弥补 mpstat 无历史的问题。</td></tr>
+<tr><td><code>iostat</code></td><td>块设备吞吐、延迟、队列</td><td>CPU per-core 不均衡</td><td>mpstat <code>%iowait</code> 高时必须配合使用。</td></tr>
+</table>
+<pre><code># 一个常见下钻链路
+mpstat -P ALL 1       # 发现 CPU7 %usr 100%
+pidstat -t -u 1       # 找到某个 python 线程
+perf top -p &lt;PID&gt;     # 看热点函数
+py-spy top --pid &lt;PID&gt; # 如果是 Python，进一步看 Python 栈</code></pre>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 故障模式速查表</h2>
+<div class="grid-2">
+<div class="card"><strong>单核 <code>%usr</code> 100%</strong><br>常见于单线程瓶颈、GIL、tokenizer、collate、压缩解压。下一步：<code>pidstat -t -u 1</code>。</div>
+<div class="card"><strong>多核 <code>%usr</code> 高且 GPU 低</strong><br>CPU 预处理可能跟不上。下一步：减少增强、缓存、离线预处理、调整 worker。</div>
+<div class="card"><strong><code>%sys</code> 高</strong><br>系统调用、文件系统、网络栈或内核锁。下一步：<code>perf top</code>、<code>strace -c</code>。</div>
+<div class="card"><strong><code>%soft</code> 高且集中</strong><br>网络/存储 softirq 或 IRQ 亲和性问题。下一步：<code>/proc/softirqs</code>、网卡队列。</div>
+<div class="card"><strong><code>%iowait</code> 高</strong><br>数据读取或写盘等待，但要用 <code>iostat</code> 验证。下一步：看 await、util、文件系统。</div>
+<div class="card"><strong><code>%steal</code> 高</strong><br>云上宿主机抢占或超卖。下一步：换实例/独占宿主机/联系云厂商。</div>
+<div class="card"><strong>socket 间冷热不均</strong><br>NUMA、affinity、IRQ/GPU/NIC 拓扑。下一步：<code>lscpu -e</code>、<code>numastat</code>。</div>
+<div class="card"><strong>CPU idle 高但服务慢</strong><br>瓶颈可能在 GPU、网络、锁、外部依赖或排队模型。下一步：关联业务指标。</div>
+</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障流程图：从 GPU 低利用到 CPU 根因</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="mpstat troubleshooting workflow">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="50" width="290" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">GPU 利用率低 / step time 抖动</text>
+<polygon points="550,155 735,245 550,335 365,245" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="238" text-anchor="middle" font-size="17" font-weight="700">mpstat -P ALL 是否异常？</text>
+<text x="550" y="264" text-anchor="middle" font-size="14">usr / sys / iowait / soft / steal / idle</text>
+<rect x="75" y="210" width="230" height="72" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="190" y="253" text-anchor="middle" font-size="17" font-weight="700">CPU 基本空闲</text>
+<rect x="795" y="210" width="230" height="72" rx="14" fill="#fee2e2" stroke="#fecaca"/>
+<text x="910" y="253" text-anchor="middle" font-size="17" font-weight="700">CPU 时间桶异常</text>
+<rect x="90" y="390" width="220" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="200" y="423" text-anchor="middle" font-size="17" font-weight="700">看 GPU/通信/锁</text>
+<text x="200" y="449" text-anchor="middle" font-size="14">nvidia-smi / NCCL / profiler</text>
+<rect x="360" y="390" width="180" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="450" y="423" text-anchor="middle" font-size="17" font-weight="700">%usr 高</text>
+<text x="450" y="449" text-anchor="middle" font-size="14">pidstat / perf / py-spy</text>
+<rect x="570" y="390" width="180" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="660" y="423" text-anchor="middle" font-size="17" font-weight="700">%iowait 高</text>
+<text x="660" y="449" text-anchor="middle" font-size="14">iostat / pidstat -d</text>
+<rect x="780" y="390" width="180" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="870" y="423" text-anchor="middle" font-size="17" font-weight="700">%soft 高</text>
+<text x="870" y="449" text-anchor="middle" font-size="14">softirqs / NIC</text>
+<rect x="420" y="570" width="260" height="74" rx="14" fill="#dcfce7" stroke="#86efac"/>
+<text x="550" y="603" text-anchor="middle" font-size="18" font-weight="700">形成假设后做小步验证</text>
+<text x="550" y="629" text-anchor="middle" font-size="14">改 worker / 缓存 / 亲和性 / 存储路径</text>
+<line x1="550" y1="114" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="365" y1="245" x2="305" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="735" y1="245" x2="795" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M190 282 C185 330, 190 350, 200 390" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M910 282 C850 330, 500 340, 450 390" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M910 282 C830 330, 690 345, 660 390" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M910 282 C900 330, 875 350, 870 390" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="450" y1="472" x2="505" y2="570" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="660" y1="472" x2="595" y2="570" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="870" y1="472" x2="650" y2="570" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">安全排障的核心是先观察，再定位，再小步验证；不要看到 CPU 高就直接改生产亲和性或 worker 数。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 生产排障工作流</h2>
+<h3>第一步：保存现场</h3>
+<pre><code>mkdir -p /tmp/ai-infra-debug
+ts=$(date +%F-%H%M%S)
+mpstat -P ALL 1 60 &gt; /tmp/ai-infra-debug/mpstat.$ts.log &
+pidstat -t -u -d 1 60 &gt; /tmp/ai-infra-debug/pidstat.$ts.log &
+iostat -xz 1 60 &gt; /tmp/ai-infra-debug/iostat.$ts.log &
+vmstat 1 60 &gt; /tmp/ai-infra-debug/vmstat.$ts.log &
+wait</code></pre>
+<h3>第二步：分类判断</h3>
+<table>
+<tr><th>先看</th><th>判断</th><th>下钻</th></tr>
+<tr><td><code>all</code> 行</td><td>总体 CPU 是否忙</td><td>忙则看字段；不忙则看 GPU/通信/外部等待。</td></tr>
+<tr><td>每个 CPU</td><td>是否单核或 socket 集中</td><td>看 affinity、NUMA、IRQ、线程分布。</td></tr>
+<tr><td>字段构成</td><td>user/sys/iowait/soft/steal 哪个高</td><td>分别走进程、内核、I/O、网络、云宿主机路径。</td></tr>
+</table>
+<h3>第三步：小步验证</h3>
+<pre><code># 示例：怀疑 dataloader worker 不够，先只在一轮实验中调整
+# 记录 baseline: step time、GPU 利用率、mpstat、pidstat
+# 调整 num_workers 后重复同样采样窗口
+
+# 示例：怀疑 NUMA，先在单 job 上验证绑定，不要直接改全局
+numactl --cpunodebind=0 --membind=0 python train.py ...
+
+# 示例：怀疑存储，先切一小份数据到本地 NVMe 对比
+rsync -a --info=progress2 /remote/dataset/sample/ /local_nvme/sample/</code></pre>
+<div class="danger"><strong>变更安全：</strong> <code>mpstat</code> 本身是只读工具，但你根据它做出的修复动作可能是高风险变更。调整 IRQ、NUMA、Kubernetes CPU manager、存储挂载参数前，应先在单节点或单任务验证。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 采样、容器与可观测性注意事项</h2>
+<p>在容器、Kubernetes、虚拟机和裸金属混合环境中，<code>mpstat</code> 的输出需要结合边界理解。它通常反映内核暴露的 CPU 视图，而不一定等同于某个容器的 CPU quota 或 cpuset。</p>
+<table>
+<tr><th>场景</th><th>注意事项</th><th>建议</th></tr>
+<tr><td>容器有 CPU quota</td><td><code>mpstat</code> 可能看到宿主机全部 CPU，而业务只能用部分配额</td><td>同时看 cgroup：<code>cpu.max</code>、<code>cpuset.cpus</code>、容器监控。</td></tr>
+<tr><td>Kubernetes cpuset</td><td>Guaranteed Pod 可能绑定特定 CPU</td><td>用 <code>cat /sys/fs/cgroup/.../cpuset.cpus</code> 与 <code>mpstat -P</code> 对齐。</td></tr>
+<tr><td>超短 spike</td><td>1 秒采样可能平均掉毫秒级尖峰</td><td>配合应用日志、eBPF、perf 或更细粒度 profiler。</td></tr>
+<tr><td>超大 CPU 数</td><td><code>-P ALL</code> 输出很长</td><td>保存日志后用脚本聚合，或先按 NUMA 选择 CPU 列表。</td></tr>
+</table>
+<pre><code># cgroup v2 常见检查
+cat /sys/fs/cgroup/cpu.max 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpuset.cpus.effective 2&gt;/dev/null || true
+
+# 如果只想看 cpuset 内 CPU，可手工指定
+mpstat -P 0,1,2,3 1
+
+# 大机器上提取高利用 CPU 行
+mpstat -P ALL 1 5 | awk '$3 ~ /^[0-9]+$/ && ($4+$6+$8) &gt; 80 {print}'</code></pre>
+<div class="note"><strong>监控集成：</strong> 长期监控更适合 node exporter、sysstat、eBPF agent 或云监控；<code>mpstat</code> 更适合人类在现场快速建立假设。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习任务与学习路线</h2>
+<h3>第一阶段：会读表</h3>
+<ol>
+<li>运行 <code>mpstat 1 5</code>，解释 <code>all</code> 行里每个字段。</li>
+<li>运行 <code>mpstat -P ALL 1 5</code>，找出最忙的逻辑 CPU。</li>
+<li>用 <code>lscpu -e</code> 把 CPU 编号映射到 socket 和 NUMA 节点。</li>
+</ol>
+<h3>第二阶段：能定位方向</h3>
+<ol>
+<li>制造一个单线程 CPU 压力，再观察 <code>-P ALL</code> 是否只有一个 CPU 满。</li>
+<li>并行读取大文件，观察 <code>%iowait</code> 与 <code>iostat</code> 是否同步变化。</li>
+<li>在云主机上观察 <code>%steal</code> 是否长期为 0。</li>
+</ol>
+<h3>第三阶段：AI Infra 联动</h3>
+<ol>
+<li>训练任务运行时同时采集 <code>mpstat</code>、<code>pidstat</code>、<code>nvidia-smi dmon</code>，对齐 step time。</li>
+<li>改变 dataloader <code>num_workers</code>，比较 CPU 字段构成和 GPU 利用率变化。</li>
+<li>在多 socket 机器上尝试不同 CPU/内存绑定，观察 per-CPU 和吞吐变化。</li>
+</ol>
+<pre><code># 单线程 CPU 压力演示，结束后按 Ctrl-C
+python3 - &lt;&lt'PY'
+while True:
+    pass
+PY
+
+# 另一个终端观察
+mpstat -P ALL 1</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>mpstat(1)</code>，包含 <code>-P</code>、<code>interval</code>、<code>count</code> 和 CPU 字段定义。</li>
+<li>sysstat 官方文档：<code>mpstat</code>、<code>sar</code>、<code>pidstat</code> 的采集模型与历史数据文件说明。</li>
+<li>Linux man-pages：<code>proc_stat(5)</code>，解释 <code>/proc/stat</code> 中 user、nice、system、idle、iowait、irq、softirq、steal、guest 等计数器。</li>
+<li>Linux kernel documentation：CPU accounting、softirq、IRQ affinity、cgroup CPU controller、NUMA policy 相关文档。</li>
+<li>PyTorch Data Loading 文档：<code>DataLoader</code>、<code>num_workers</code>、prefetch、pin memory 与多进程数据加载行为。</li>
+<li>NVIDIA GPU 与 NCCL 排障资料：用于把 CPU 侧线索与 GPU 利用率、通信、PCIe/NIC 拓扑联系起来。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 <code>mpstat -P ALL 1</code> 与字段含义，再学习 sysstat 历史，最后把它与 <code>pidstat</code>、<code>iostat</code>、<code>perf</code>、NUMA 工具和 GPU 监控串成完整排障链路。</p>
+</section>
+
+<div class="footer">mpstat 深度教程 · AI Infra/Linux 命令 · per-CPU 利用率、sysstat 历史、NUMA、dataloader 与生产排障</div>
+</div>
+</body>
+</html>

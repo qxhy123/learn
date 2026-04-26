@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>docker 深度教程：AI Infra 中的镜像、容器、GPU 与训练排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>docker 深度教程：AI Infra 中的镜像、容器、GPU 与训练排障</h1>
+<p class="sub">这份教程面向 AI Infra / Linux 运维和训练平台场景。它不把 <code>docker</code> 当成单纯的“启动容器命令”，而是从镜像层、容器进程、GPU runtime、数据卷、网络、资源隔离、<code>/dev/shm</code>、日志与交互调试出发，讲清楚如何构建、运行、约束、排障和安全管理训练容器。</p>
+<div class="chips"><span class="chip">镜像与容器</span><span class="chip">GPU Runtime</span><span class="chip">NVIDIA</span><span class="chip">训练任务</span><span class="chip">Volume</span><span class="chip">Network</span><span class="chip">cgroup</span><span class="chip">shm/ipc</span><span class="chip">BuildKit</span><span class="chip">安全基线</span></div>
+<div class="note"><strong>一句话理解：</strong> Docker 把“用户空间文件系统 + 进程启动参数 + 隔离/限额规则”打包成可重复运行的环境；AI Infra 关注的是这个环境是否能稳定访问 GPU、数据、网络和足够的共享内存。</div>
+<div class="success"><strong>最重要原则：</strong> 训练容器先用只读/最小权限/显式资源参数启动，逐项放开 GPU、volume、IPC、端口和 capability；不要为了省事长期使用 <code>--privileged</code>、宿主机根目录挂载或不受控的 <code>:latest</code> 镜像。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">Docker 在 AI Infra 中解决什么问题</a></li>
+<li><a class="anchor" href="#s2">核心模型：镜像、容器、运行时、宿主机</a></li>
+<li><a class="anchor" href="#s3">安装、权限与基本健康检查</a></li>
+<li><a class="anchor" href="#s4">镜像基础：pull、tag、inspect、清理</a></li>
+<li><a class="anchor" href="#s5">容器生命周期：run、ps、stop、rm</a></li>
+<li><a class="anchor" href="#s6">GPU 容器运行：NVIDIA runtime 与验证</a></li>
+<li><a class="anchor" href="#s7">AI 训练数据与模型目录：volume/bind/tmpfs</a></li>
+<li><a class="anchor" href="#s8">网络模式、端口映射与分布式训练</a></li>
+<li><a class="anchor" href="#s9">资源限制：CPU、内存、GPU、ulimit</a></li>
+<li><a class="anchor" href="#s10">共享内存、IPC 与 PyTorch DataLoader</a></li>
+<li><a class="anchor" href="#s11">日志、exec、cp、commit 与现场调试</a></li>
+<li><a class="anchor" href="#s12">构建镜像：Dockerfile、BuildKit、缓存</a></li>
+<li><a class="anchor" href="#s13">Build/Run 生产模式与训练脚本模板</a></li>
+<li><a class="anchor" href="#s14">安全：权限、镜像供应链、Secrets</a></li>
+<li><a class="anchor" href="#s15">docker vs podman/nerdctl/crictl</a></li>
+<li><a class="anchor" href="#s16">训练容器排障路线图</a></li>
+<li><a class="anchor" href="#s17">常用命令速查与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. Docker 在 AI Infra 中解决什么问题</h2>
+<p>AI 训练环境通常同时依赖 CUDA、cuDNN、NCCL、Python、PyTorch/TensorFlow、系统库、编译器、网络插件、数据挂载和集群调度参数。Docker 的价值是把这些运行时依赖固化成镜像，把每次训练启动变成可重复的容器进程。</p>
+<div class="grid-3">
+<div class="card"><strong>可重复</strong><br>同一个镜像 digest、同一组启动参数和同一份代码，能显著减少“机器 A 可以、机器 B 不行”的环境差异。</div>
+<div class="card"><strong>可隔离</strong><br>用 namespace/cgroup 隔离进程、网络、文件系统和资源限额，避免训练任务污染宿主环境。</div>
+<div class="card"><strong>可交付</strong><br>把研发镜像、评测镜像和线上推理镜像以 registry 方式交付，便于 CI/CD、回滚和审计。</div>
+</div>
+<pre><code># 最小健康检查：确认 docker client/server 可用
+docker version
+docker info
+
+# 拉取一个 CUDA 基础镜像并验证 GPU 可见性
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi</code></pre>
+<div class="warn"><strong>边界提醒：</strong> Docker 不会替你解决驱动版本、内核模块、NVIDIA Container Toolkit、RDMA/NCCL 网络和存储性能问题；它只是把用户空间环境变得可控。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：Docker 在训练节点上的整体模型</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="Docker AI Infra 整体模型">
+<rect x="18" y="18" width="1064" height="624" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">Docker = 镜像文件系统 + 容器进程 + 宿主机资源接入</text>
+<rect x="65" y="110" width="250" height="180" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="190" y="150" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">镜像 Image</text>
+<text x="190" y="188" text-anchor="middle" font-size="15">只读层：OS / CUDA / Python</text>
+<text x="190" y="218" text-anchor="middle" font-size="15">应用层：代码 / 依赖 / entrypoint</text>
+<text x="190" y="248" text-anchor="middle" font-size="15">可 tag，也应 pin digest</text>
+<rect x="425" y="110" width="250" height="180" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="150" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">容器 Container</text>
+<text x="550" y="188" text-anchor="middle" font-size="15">一个或多个 Linux 进程</text>
+<text x="550" y="218" text-anchor="middle" font-size="15">可写层、环境变量、命令</text>
+<text x="550" y="248" text-anchor="middle" font-size="15">namespace + cgroup 隔离</text>
+<rect x="785" y="110" width="250" height="180" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="910" y="150" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">宿主机 Host</text>
+<text x="910" y="188" text-anchor="middle" font-size="15">Linux kernel / Docker daemon</text>
+<text x="910" y="218" text-anchor="middle" font-size="15">GPU 驱动 / 网络 / 存储</text>
+<text x="910" y="248" text-anchor="middle" font-size="15">cgroup / devices / mounts</text>
+<rect x="112" y="400" width="876" height="132" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="438" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">AI Infra 运行重点</text>
+<text x="550" y="474" text-anchor="middle" font-size="16">GPU 设备是否注入 · 数据卷是否正确 · shm/ipc 是否足够 · 网络是否匹配分布式训练</text>
+<text x="550" y="504" text-anchor="middle" font-size="16">资源限额是否合理 · 日志是否可观测 · 镜像是否安全可追溯</text>
+<line x1="315" y1="200" x2="425" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="675" y1="200" x2="785" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="550" y1="290" x2="550" y2="400" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">容器不是虚拟机：它共享宿主机内核。GPU、RDMA、文件系统和网络能力最终都来自宿主机，只是通过 runtime 和参数暴露给容器。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 安装、权限与基本健康检查</h2>
+<p>排查 Docker 问题时先分清三层：Docker CLI 是否能连接 daemon、daemon 是否正常管理容器、宿主机 GPU/网络/存储是否满足训练任务要求。</p>
+<table><tr><th>检查项</th><th>命令</th><th>判断重点</th></tr>
+<tr><td>Client/Server 版本</td><td><code>docker version</code></td><td>能看到 Client 和 Server；只有 Client 通常说明 daemon 未连接。</td></tr>
+<tr><td>Daemon 配置</td><td><code>docker info</code></td><td>确认 cgroup driver、storage driver、runtimes、registry mirror、root dir。</td></tr>
+<tr><td>当前用户权限</td><td><code>groups</code></td><td>是否在 <code>docker</code> 组；生产环境不应把 Docker 权限视为普通低权限。</td></tr>
+<tr><td>GPU 宿主状态</td><td><code>nvidia-smi</code></td><td>驱动加载、GPU 可见、无异常 Xid 或掉卡。</td></tr>
+</table>
+<pre><code># daemon 是否运行
+systemctl status docker --no-pager
+
+# 查看 Docker daemon 关键配置
+docker info --format 'Runtimes={{json .Runtimes}} Cgroup={{.CgroupDriver}} Storage={{.Driver}}'
+
+# 当前用户如果不能访问 docker.sock，会出现 permission denied
+ls -l /var/run/docker.sock</code></pre>
+<div class="danger"><strong>权限警告：</strong> 能访问 <code>/var/run/docker.sock</code> 基本等价于可在宿主机获得 root 级控制权。不要把用户加入 <code>docker</code> 组后仍当成低权限账户管理。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 镜像基础：pull、tag、inspect、清理</h2>
+<p>镜像是容器的只读模板。AI 镜像常见问题包括 tag 漂移、基础镜像过大、CUDA 版本与驱动不匹配、pip/apt 缓存膨胀，以及没有记录构建来源。</p>
+<pre><code># 拉取镜像
+docker pull nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# 查看本地镜像
+docker image ls
+
+# 查看镜像元数据：入口命令、环境变量、层、架构
+docker image inspect nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# 给内部 registry 打 tag
+docker tag train:dev registry.example.com/ai/train:2026-04-25
+
+# 推送镜像
+docker push registry.example.com/ai/train:2026-04-25</code></pre>
+<table><tr><th>概念</th><th>建议</th><th>原因</th></tr>
+<tr><td><code>tag</code></td><td>开发可用语义 tag，生产记录 digest</td><td><code>:latest</code> 会漂移，复现实验困难。</td></tr>
+<tr><td><code>runtime</code> 镜像</td><td>训练运行优先 runtime，编译单独 builder</td><td>减少体积和攻击面。</td></tr>
+<tr><td>清理</td><td>先 dry-run 式查看，再 prune</td><td>避免删除仍需回滚的镜像。</td></tr>
+</table>
+<pre><code># 只查看可清理对象，不马上删除
+docker system df
+docker image ls --filter dangling=true
+
+# 确认无用后再清理悬空镜像
+docker image prune</code></pre>
+<div class="warn"><strong>清理提醒：</strong> <code>docker system prune -a</code> 会删除所有未被容器引用的镜像，训练节点上可能影响回滚和离线启动。执行前先看 <code>docker system df</code> 和镜像列表。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 容器生命周期：run、ps、stop、rm</h2>
+<p><code>docker run</code> 本质上是 <code>create + start</code>：从镜像创建容器可写层，配置 namespace、mount、network、env、resource limit，然后启动进程。</p>
+<pre><code># 一次性容器：退出后自动删除
+docker run --rm ubuntu:22.04 cat /etc/os-release
+
+# 后台运行服务容器
+docker run -d --name tensorboard -p 6006:6006 -v "$PWD/runs:/runs:ro" \
+  python:3.11-slim python -m http.server 6006 -d /runs
+
+# 查看容器
+docker ps
+docker ps -a
+
+# 优雅停止，确认后删除
+docker stop tensorboard
+docker rm tensorboard</code></pre>
+<table><tr><th>参数</th><th>含义</th><th>AI Infra 用法</th></tr>
+<tr><td><code>--rm</code></td><td>退出后删除容器</td><td>适合短命令验证，不适合需要保留现场的失败训练。</td></tr>
+<tr><td><code>--name</code></td><td>固定容器名</td><td>便于 <code>logs</code>、<code>exec</code>、监控采集定位。</td></tr>
+<tr><td><code>-d</code></td><td>后台运行</td><td>服务、训练 launcher、长任务。</td></tr>
+<tr><td><code>--entrypoint</code></td><td>覆盖镜像入口</td><td>调试镜像启动脚本或进入 shell。</td></tr>
+</table>
+<div class="note"><strong>调试习惯：</strong> 训练失败时不要马上 <code>rm</code> 容器；先 <code>docker logs</code>、<code>docker inspect</code>、必要时 <code>docker commit</code> 保存现场。</div>
+</section>
+
+<section class="figure" id="fig-gpu-runtime">
+<h3>流程图：GPU 容器从宿主机到训练进程</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="Docker GPU runtime 流程图">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">GPU 容器启动路径</text>
+<rect x="70" y="120" width="215" height="98" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="178" y="157" text-anchor="middle" font-size="19" font-weight="700" fill="#1d4ed8">宿主机驱动</text>
+<text x="178" y="187" text-anchor="middle" font-size="14">nvidia-smi 正常</text>
+<rect x="335" y="120" width="215" height="98" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="443" y="157" text-anchor="middle" font-size="19" font-weight="700" fill="#6d28d9">NVIDIA Toolkit</text>
+<text x="443" y="187" text-anchor="middle" font-size="14">runtime hook 注入设备</text>
+<rect x="600" y="120" width="215" height="98" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="708" y="157" text-anchor="middle" font-size="19" font-weight="700" fill="#0f766e">docker run</text>
+<text x="708" y="187" text-anchor="middle" font-size="14">--gpus all / device=0</text>
+<rect x="865" y="120" width="165" height="98" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="948" y="157" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">训练进程</text>
+<text x="948" y="187" text-anchor="middle" font-size="14">CUDA / NCCL</text>
+<rect x="145" y="340" width="810" height="180" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="378" text-anchor="middle" font-size="22" font-weight="700">常见断点</text>
+<text x="550" y="415" text-anchor="middle" font-size="15">驱动过旧 · toolkit 未安装 · 默认 runtime 配置错误 · CUDA 镜像版本不兼容</text>
+<text x="550" y="447" text-anchor="middle" font-size="15">容器内缺少 libcuda 挂载 · MIG/device 选择错误 · rootless 模式设备访问受限</text>
+<text x="550" y="479" text-anchor="middle" font-size="15">NCCL 需要的网卡、IPC、ulimit 或 shm 没有一起配置</text>
+<line x1="285" y1="169" x2="335" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#g1)"/>
+<line x1="550" y1="169" x2="600" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#g1)"/>
+<line x1="815" y1="169" x2="865" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#g1)"/>
+<line x1="550" y1="218" x2="550" y2="340" stroke="#94a3b8" stroke-width="4" marker-end="url(#g1)"/>
+<defs><marker id="g1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">容器内的 CUDA 用户态库来自镜像，GPU 驱动和设备节点来自宿主机；两者必须兼容。</div></section>
+
+<section class="section" id="s6">
+<h2>5. GPU 容器运行：NVIDIA runtime 与验证</h2>
+<p>现代 Docker 通常使用 <code>--gpus</code> 参数请求 GPU。前提是宿主机安装并配置了 NVIDIA Container Toolkit，且 Docker daemon 能识别对应 runtime。</p>
+<pre><code># 宿主机先确认 GPU 正常
+nvidia-smi
+
+# Docker 侧确认 runtime 能被识别
+docker info --format '{{json .Runtimes}}'
+
+# 容器内验证 GPU
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# 指定 GPU 0 和 2
+docker run --rm --gpus '"device=0,2"' nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi</code></pre>
+<h3>PyTorch 快速验证</h3>
+<pre><code>docker run --rm --gpus all pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime \
+  python - &lt;&lt;'PY'
+import torch
+print("cuda:", torch.cuda.is_available())
+print("count:", torch.cuda.device_count())
+print("name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+PY</code></pre>
+<div class="warn"><strong>版本心智模型：</strong> 宿主机 NVIDIA 驱动必须支持容器镜像中的 CUDA 运行时版本；容器通常不安装内核驱动，只带用户态 CUDA/cuDNN/NCCL 等库。</div>
+<table><tr><th>现象</th><th>优先检查</th><th>常见原因</th></tr>
+<tr><td>容器内没有 <code>nvidia-smi</code></td><td>镜像是否包含工具、runtime 是否注入</td><td>用错镜像或 <code>--gpus</code> 未生效。</td></tr>
+<tr><td><code>CUDA driver version is insufficient</code></td><td>宿主驱动版本</td><td>驱动太旧，不支持镜像 CUDA。</td></tr>
+<tr><td>只看到部分 GPU</td><td><code>--gpus</code>、<code>NVIDIA_VISIBLE_DEVICES</code>、MIG</td><td>设备选择或 MIG 分区配置。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s7">
+<h2>6. AI 训练数据与模型目录：volume/bind/tmpfs</h2>
+<p>训练容器的文件系统分三类：镜像只读层、容器可写层、外部挂载。大型数据集、checkpoint、日志和缓存不要写在容器可写层里，应该显式挂载。</p>
+<table><tr><th>挂载方式</th><th>命令形式</th><th>适合场景</th></tr>
+<tr><td>bind mount</td><td><code>-v /host/data:/data:ro</code></td><td>挂载宿主机数据集、代码、checkpoint。</td></tr>
+<tr><td>named volume</td><td><code>-v pip-cache:/root/.cache/pip</code></td><td>跨容器复用缓存或状态。</td></tr>
+<tr><td>tmpfs</td><td><code>--tmpfs /tmp:rw,size=8g</code></td><td>高速临时文件，不需要持久化。</td></tr>
+</table>
+<pre><code># 只读挂载数据集，读写挂载输出目录
+docker run --rm --gpus all \
+  -v /datasets/imagenet:/data/imagenet:ro \
+  -v /checkpoints/exp42:/out:rw \
+  -v "$PWD":/workspace:ro \
+  -w /workspace \
+  registry.example.com/ai/train:2026-04-25 \
+  python train.py --data /data/imagenet --output /out
+
+# 使用 --mount 语法更明确
+docker run --rm \
+  --mount type=bind,src=/datasets,dst=/data,readonly \
+  --mount type=volume,src=pip-cache,dst=/root/.cache/pip \
+  ubuntu:22.04 bash -lc 'df -h /data /root/.cache/pip'</code></pre>
+<div class="danger"><strong>数据安全：</strong> 不要把 <code>/</code>、<code>/var/run/docker.sock</code>、云厂商凭据目录或宿主机私钥随意挂入训练容器。能写宿主敏感路径的容器可以破坏节点。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 网络模式、端口映射与分布式训练</h2>
+<p>Docker 默认使用 bridge 网络，容器有独立网络 namespace。训练场景要根据需求选择：单机调试通常 bridge 足够，分布式训练常需要 host 网络、固定端口、NCCL 网卡选择和防火墙配合。</p>
+<pre><code># bridge 模式：把容器内 8888 映射到宿主机 18888
+docker run --rm -p 18888:8888 jupyter/base-notebook start-notebook.py
+
+# host 网络：容器直接使用宿主机网络 namespace
+docker run --rm --network host registry.example.com/ai/train:2026-04-25 \
+  python -m torch.distributed.run --nproc_per_node=8 --master_addr=10.0.0.11 \
+  --master_port=29500 train.py
+
+# 容器内检查路由、DNS、监听端口
+docker exec -it train-0 bash -lc 'ip addr; ip route; ss -lntp; getent hosts registry.example.com'</code></pre>
+<table><tr><th>模式</th><th>优点</th><th>风险/限制</th></tr>
+<tr><td><code>bridge</code></td><td>隔离好，端口显式映射</td><td>NCCL 多机通信和服务发现更复杂。</td></tr>
+<tr><td><code>host</code></td><td>网络路径最直接，常用于高性能训练</td><td>端口冲突、隔离弱、容器能看到宿主网络。</td></tr>
+<tr><td>自定义 bridge</td><td>容器间 DNS 名称好用</td><td>仍有 NAT/路由复杂度。</td></tr>
+</table>
+<div class="note"><strong>NCCL 提示：</strong> 多网卡节点经常需要显式设置 <code>NCCL_SOCKET_IFNAME</code>，并确认容器内能看到目标网卡名称；host 网络能减少一层变量，但不替代 RDMA/IB 配置。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 资源限制：CPU、内存、GPU、ulimit</h2>
+<p>Docker 使用 cgroup 管理 CPU、内存、pids 等资源。AI 训练容易触发 OOM、文件句柄不足、锁页内存不足、进程数过多、DataLoader worker 争抢 CPU 等问题。</p>
+<pre><code># 限制 CPU 和内存，避免压垮共享节点
+docker run --rm --cpus 16 --memory 96g --memory-swap 96g ubuntu:22.04 \
+  bash -lc 'nproc; free -h'
+
+# 训练常见 ulimit：memlock 和 stack
+docker run --rm --gpus all \
+  --ulimit memlock=-1:-1 \
+  --ulimit stack=67108864 \
+  registry.example.com/ai/train:2026-04-25 python train.py
+
+# 查看容器实时资源
+docker stats</code></pre>
+<table><tr><th>参数</th><th>作用</th><th>训练影响</th></tr>
+<tr><td><code>--cpus</code></td><td>限制 CPU 时间配额</td><td>影响 DataLoader、预处理、通信线程。</td></tr>
+<tr><td><code>--cpuset-cpus</code></td><td>绑定 CPU 核</td><td>适合 NUMA/GPU 拓扑优化。</td></tr>
+<tr><td><code>--memory</code></td><td>限制内存</td><td>超过可能被 OOM kill。</td></tr>
+<tr><td><code>--pids-limit</code></td><td>限制进程/线程数</td><td>DataLoader worker 太多时可能失败。</td></tr>
+</table>
+<div class="warn"><strong>观测提醒：</strong> 容器内 <code>free</code>、<code>top</code>、Python 看到的资源不一定等于 cgroup 限额。必要时查看 <code>/sys/fs/cgroup</code> 或宿主机监控。</div>
+</section>
+
+<section class="figure" id="fig-resource-plane">
+<h3>对比图：训练容器关键资源面</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="训练容器关键资源对比图">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">训练任务不是只要 GPU：四个资源面必须同时成立</text>
+<rect x="80" y="135" width="210" height="330" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="185" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">GPU</text>
+<text x="185" y="225" text-anchor="middle" font-size="15">--gpus</text>
+<text x="185" y="255" text-anchor="middle" font-size="15">CUDA / Driver</text>
+<text x="185" y="285" text-anchor="middle" font-size="15">MIG / device</text>
+<text x="185" y="315" text-anchor="middle" font-size="15">NCCL topo</text>
+<rect x="325" y="135" width="210" height="330" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">内存/IPC</text>
+<text x="430" y="225" text-anchor="middle" font-size="15">--memory</text>
+<text x="430" y="255" text-anchor="middle" font-size="15">--shm-size</text>
+<text x="430" y="285" text-anchor="middle" font-size="15">--ipc host</text>
+<text x="430" y="315" text-anchor="middle" font-size="15">DataLoader</text>
+<rect x="570" y="135" width="210" height="330" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="675" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">存储</text>
+<text x="675" y="225" text-anchor="middle" font-size="15">volume / bind</text>
+<text x="675" y="255" text-anchor="middle" font-size="15">checkpoint</text>
+<text x="675" y="285" text-anchor="middle" font-size="15">dataset</text>
+<text x="675" y="315" text-anchor="middle" font-size="15">cache</text>
+<rect x="815" y="135" width="210" height="330" rx="20" fill="#ffedd5" stroke="#fdba74"/>
+<text x="920" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">网络</text>
+<text x="920" y="225" text-anchor="middle" font-size="15">bridge / host</text>
+<text x="920" y="255" text-anchor="middle" font-size="15">ports</text>
+<text x="920" y="285" text-anchor="middle" font-size="15">NCCL_SOCKET_IFNAME</text>
+<text x="920" y="315" text-anchor="middle" font-size="15">RDMA / IB</text>
+<rect x="250" y="530" width="600" height="54" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="563" text-anchor="middle" font-size="17" font-weight="700">任何一面配置错误，都可能表现为训练慢、卡死、OOM 或通信失败</text>
+</svg><div class="caption">AI 训练容器的运行质量取决于 GPU、内存/IPC、存储和网络的组合，而不是单个 <code>--gpus all</code> 参数。</div></section>
+
+<section class="section" id="s10">
+<h2>9. 共享内存、IPC 与 PyTorch DataLoader</h2>
+<p>Docker 默认 <code>/dev/shm</code> 通常很小。PyTorch DataLoader、多进程队列、NCCL、浏览器/Jupyter、Ray 等组件都可能用共享内存，导致 “bus error”、“DataLoader worker exited unexpectedly” 或训练卡死。</p>
+<pre><code># 查看容器内 /dev/shm
+docker run --rm ubuntu:22.04 df -h /dev/shm
+
+# 增大共享内存
+docker run --rm --gpus all --shm-size 64g registry.example.com/ai/train:2026-04-25 \
+  python train.py --num-workers 16
+
+# 如果需要与宿主或同机容器共享 IPC，谨慎使用
+docker run --rm --ipc=host --gpus all registry.example.com/ai/train:2026-04-25 python train.py</code></pre>
+<table><tr><th>参数</th><th>优点</th><th>风险</th></tr>
+<tr><td><code>--shm-size 64g</code></td><td>隔离仍较好，解决多数 DataLoader 共享内存不足</td><td>需要按节点内存规划。</td></tr>
+<tr><td><code>--ipc=host</code></td><td>兼容某些多进程/NCCL/性能场景</td><td>隔离变弱，可能与宿主/其他容器 IPC 资源互相影响。</td></tr>
+<tr><td><code>--tmpfs /dev/shm:size=64g</code></td><td>显式 tmpfs 挂载</td><td>语法和运行时支持需测试。</td></tr>
+</table>
+<div class="success"><strong>实战建议：</strong> 单机训练优先尝试 <code>--shm-size</code>；只有明确需要共享 IPC 或框架文档要求时，再使用 <code>--ipc=host</code>。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 日志、exec、cp、commit 与现场调试</h2>
+<p>容器调试要尽量保留现场：先看日志和元数据，再进入容器确认环境，最后再决定是否复制文件或保存临时镜像。</p>
+<pre><code># 查看日志，限制输出量避免刷屏
+docker logs --tail 200 train-0
+docker logs -f --since 10m train-0
+
+# 进入正在运行的容器
+docker exec -it train-0 bash
+
+# 在容器里快速检查训练环境
+docker exec train-0 bash -lc 'pwd; id; env | sort | grep -E "CUDA|NCCL|NVIDIA"; df -h; nvidia-smi'
+
+# 从失败容器复制日志和配置
+docker cp train-0:/workspace/output/train.log ./train.log
+docker cp train-0:/workspace/config.yaml ./config.yaml</code></pre>
+<table><tr><th>命令</th><th>用途</th><th>注意</th></tr>
+<tr><td><code>docker inspect</code></td><td>查看完整启动参数、mount、network、env、state</td><td>排障时比口述启动命令可靠。</td></tr>
+<tr><td><code>docker diff</code></td><td>查看容器可写层变更</td><td>定位程序写到了哪里。</td></tr>
+<tr><td><code>docker commit</code></td><td>把现场保存成临时镜像</td><td>只适合救急，不应替代 Dockerfile。</td></tr>
+<tr><td><code>docker events</code></td><td>观察 OOM、die、restart 等事件</td><td>适合定位容器被谁停止。</td></tr>
+</table>
+<pre><code># 保存失败现场镜像，便于离线分析
+docker commit train-0 debug/train-0-failed:2026-04-25
+docker run --rm -it --entrypoint bash debug/train-0-failed:2026-04-25</code></pre>
+<div class="warn"><strong>现场纪律：</strong> <code>docker exec</code> 进容器手工安装包可以帮助定位问题，但最终修复应回写到 Dockerfile 或启动脚本，否则下一次训练不可复现。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 构建镜像：Dockerfile、BuildKit、缓存</h2>
+<p>AI 镜像构建的关键是可复现、缓存友好、体积可控。把变化频率低的系统依赖放前面，把频繁变化的代码放后面；训练运行镜像不要保留不必要的编译缓存和凭据。</p>
+<pre><code># syntax=docker/dockerfile:1.7
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip git ca-certificates tini \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "train.py"]</code></pre>
+<pre><code># 开启 BuildKit 构建，并打上明确 tag
+DOCKER_BUILDKIT=1 docker build -t registry.example.com/ai/train:2026-04-25 .
+
+# 查看镜像历史，定位大层
+docker history registry.example.com/ai/train:2026-04-25</code></pre>
+<table><tr><th>构建策略</th><th>好处</th><th>注意</th></tr>
+<tr><td>固定基础镜像 tag/digest</td><td>复现实验</td><td>需要定期安全更新。</td></tr>
+<tr><td>依赖文件先 COPY</td><td>提高 pip/apt 缓存命中</td><td>不要过早 COPY 全仓库。</td></tr>
+<tr><td>多阶段构建</td><td>去掉编译工具链</td><td>CUDA 扩展需要保留运行时库。</td></tr>
+<tr><td>BuildKit cache mount</td><td>加速构建</td><td>缓存不应成为运行时依赖。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>12. Build/Run 生产模式与训练脚本模板</h2>
+<p>生产训练任务需要把镜像、命令、数据、输出、资源、网络和日志参数显式写清楚。不要依赖交互 shell 里的隐式环境。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="registry.example.com/ai/train:2026-04-25"
+NAME="train-$(date +%Y%m%d-%H%M%S)"
+DATA="/datasets/imagenet"
+OUT="/checkpoints/${NAME}"
+
+mkdir -p "$OUT"
+
+docker run --name "$NAME" --rm \
+  --gpus all \
+  --network host \
+  --shm-size 64g \
+  --ulimit memlock=-1:-1 \
+  --ulimit stack=67108864 \
+  -e NCCL_DEBUG=INFO \
+  -e NCCL_SOCKET_IFNAME=eth0 \
+  -v "$DATA":/data:ro \
+  -v "$OUT":/out:rw \
+  "$IMAGE" \
+  python3 train.py --data /data --output /out --epochs 90</code></pre>
+<div class="grid-3">
+<div class="card"><strong>镜像固定</strong><br>生产脚本中记录 tag 和 digest，CI 输出 SBOM/扫描报告时更容易追踪。</div>
+<div class="card"><strong>参数显式</strong><br>GPU、网络、shm、ulimit、volume、env 都在脚本里声明，便于复现。</div>
+<div class="card"><strong>输出外置</strong><br>checkpoint、metrics、日志写到挂载目录，不依赖容器可写层。</div>
+</div>
+<div class="note"><strong>调度系统迁移：</strong> 这些参数在 Kubernetes、Slurm+Enroot、containerd/nerdctl 中仍有对应概念：设备、挂载、网络、资源、env、entrypoint。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 安全：权限、镜像供应链、Secrets</h2>
+<p>Docker 安全不是一个开关，而是一组边界：镜像来源、容器用户、Linux capability、文件系统权限、设备访问、网络暴露、secret 注入和 socket 挂载。</p>
+<table><tr><th>风险</th><th>安全做法</th><th>避免</th></tr>
+<tr><td>容器 root 写宿主目录</td><td><code>--user $(id -u):$(id -g)</code>、只读挂载</td><td>训练容器随意写 <code>/</code> 或共享代码库。</td></tr>
+<tr><td>权限过大</td><td>按需添加 <code>--cap-add</code></td><td>长期使用 <code>--privileged</code>。</td></tr>
+<tr><td>镜像不可追踪</td><td>固定 tag/digest，记录构建 commit</td><td>生产拉取 <code>:latest</code>。</td></tr>
+<tr><td>凭据泄露</td><td>运行时挂载 secret，只读且最小范围</td><td>把 token 写入 Dockerfile 或镜像层。</td></tr>
+<tr><td>Docker socket 暴露</td><td>避免挂载或使用隔离代理</td><td><code>-v /var/run/docker.sock:/var/run/docker.sock</code> 给不可信容器。</td></tr>
+</table>
+<pre><code># 用非 root 用户运行，并把根文件系统设为只读
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --read-only \
+  --tmpfs /tmp:rw,size=4g \
+  -v "$PWD":/workspace:ro \
+  ubuntu:22.04 id
+
+# 查看镜像配置中是否意外写入敏感 env
+docker image inspect train:dev --format '{{json .Config.Env}}'</code></pre>
+<div class="danger"><strong>高危参数：</strong> <code>--privileged</code>、<code>--pid=host</code>、<code>--network=host</code>、<code>--ipc=host</code>、Docker socket 挂载都可能削弱隔离。训练场景可以按需使用，但必须知道为什么用、谁能用、如何审计。</div>
+</section>
+
+<section class="figure" id="fig-runtime-tools">
+<h3>选择图：docker、podman、nerdctl、crictl 怎么选</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="docker podman nerdctl crictl 选择图">
+<rect x="20" y="20" width="1060" height="640" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">容器 CLI 选择：先看你要控制哪个运行时</text>
+<rect x="80" y="135" width="205" height="330" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="183" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">docker</text>
+<text x="183" y="222" text-anchor="middle" font-size="15">Docker Engine</text>
+<text x="183" y="252" text-anchor="middle" font-size="15">开发/CI 常用</text>
+<text x="183" y="282" text-anchor="middle" font-size="15">生态和文档最多</text>
+<text x="183" y="312" text-anchor="middle" font-size="15">daemon + socket</text>
+<rect x="325" y="135" width="205" height="330" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="428" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">podman</text>
+<text x="428" y="222" text-anchor="middle" font-size="15">daemonless</text>
+<text x="428" y="252" text-anchor="middle" font-size="15">rootless 友好</text>
+<text x="428" y="282" text-anchor="middle" font-size="15">CLI 近似 docker</text>
+<text x="428" y="312" text-anchor="middle" font-size="15">HPC/多用户常见</text>
+<rect x="570" y="135" width="205" height="330" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="673" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">nerdctl</text>
+<text x="673" y="222" text-anchor="middle" font-size="15">containerd CLI</text>
+<text x="673" y="252" text-anchor="middle" font-size="15">K8s 节点常见</text>
+<text x="673" y="282" text-anchor="middle" font-size="15">支持 Dockerfile/buildkit</text>
+<text x="673" y="312" text-anchor="middle" font-size="15">贴近底层运行时</text>
+<rect x="815" y="135" width="205" height="330" rx="20" fill="#ffedd5" stroke="#fdba74"/>
+<text x="918" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">crictl</text>
+<text x="918" y="222" text-anchor="middle" font-size="15">CRI 调试工具</text>
+<text x="918" y="252" text-anchor="middle" font-size="15">看 kubelet 管的容器</text>
+<text x="918" y="282" text-anchor="middle" font-size="15">不等同 docker CLI</text>
+<text x="918" y="312" text-anchor="middle" font-size="15">排 K8s 现场</text>
+<rect x="210" y="535" width="680" height="54" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="568" text-anchor="middle" font-size="17" font-weight="700">开发机用 docker；rootless/HPC 看 podman；containerd/K8s 节点看 nerdctl/crictl</text>
+</svg><div class="caption">这些工具的命令长得相似，但控制对象不同。排障前先确认节点上真正运行的是 Docker Engine、containerd 还是 CRI 管理的 Pod。</div></section>
+
+<section class="section" id="s15">
+<h2>14. docker vs podman/nerdctl/crictl</h2>
+<table><tr><th>工具</th><th>控制对象</th><th>适合场景</th><th>不适合误用</th></tr>
+<tr><td><code>docker</code></td><td>Docker daemon / Docker Engine</td><td>本地开发、CI 构建、单机服务、教学和常规镜像流程。</td><td>把 Docker socket 暴露给不可信租户。</td></tr>
+<tr><td><code>podman</code></td><td>libpod/OCI runtime，可 rootless</td><td>多用户 Linux、HPC、希望少依赖常驻 daemon 的场景。</td><td>假设所有 Docker Compose/插件行为完全一致。</td></tr>
+<tr><td><code>nerdctl</code></td><td>containerd</td><td>Kubernetes/containerd 节点底层调试，贴近 Docker CLI 的体验。</td><td>误以为能管理 Docker daemon 里的容器。</td></tr>
+<tr><td><code>crictl</code></td><td>Kubelet 使用的 CRI runtime</td><td>排查 Kubernetes Pod、sandbox、容器日志和镜像。</td><td>日常构建镜像或替代 Dockerfile 工作流。</td></tr>
+</table>
+<pre><code># 判断当前节点可能有哪些运行时
+docker info 2&gt;/dev/null | head
+podman info 2&gt;/dev/null | head
+nerdctl info 2&gt;/dev/null | head
+crictl info 2&gt;/dev/null | head
+
+# K8s/containerd 节点上，docker ps 看不到 kubelet 管理的容器很常见
+crictl ps
+crictl images</code></pre>
+<div class="note"><strong>迁移心智：</strong> 镜像格式通常是 OCI 兼容的，但 CLI、网络、rootless、volume、GPU 集成和日志路径可能不同。迁移前先验证 GPU、volume、IPC、网络和权限模型。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障图：训练容器失败时的安全路线</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="训练容器排障路线图">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="50" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="91" text-anchor="middle" font-size="22" font-weight="700">训练容器失败</text>
+<rect x="70" y="165" width="210" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="175" y="198" text-anchor="middle" font-size="18" font-weight="700">启动失败</text>
+<text x="175" y="225" text-anchor="middle" font-size="14">image / command / env</text>
+<rect x="315" y="165" width="210" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="420" y="198" text-anchor="middle" font-size="18" font-weight="700">GPU 不可见</text>
+<text x="420" y="225" text-anchor="middle" font-size="14">driver / toolkit / --gpus</text>
+<rect x="560" y="165" width="210" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="665" y="198" text-anchor="middle" font-size="18" font-weight="700">OOM / bus error</text>
+<text x="665" y="225" text-anchor="middle" font-size="14">memory / shm / workers</text>
+<rect x="805" y="165" width="210" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="910" y="198" text-anchor="middle" font-size="18" font-weight="700">分布式卡死</text>
+<text x="910" y="225" text-anchor="middle" font-size="14">network / NCCL / ports</text>
+<rect x="105" y="365" width="235" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="223" y="400" text-anchor="middle" font-size="18" font-weight="700">先保留现场</text>
+<text x="223" y="428" text-anchor="middle" font-size="14">logs / inspect / events</text>
+<rect x="432" y="365" width="235" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="400" text-anchor="middle" font-size="18" font-weight="700">最小复现</text>
+<text x="550" y="428" text-anchor="middle" font-size="14">nvidia-smi / python import</text>
+<rect x="760" y="365" width="235" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="878" y="400" text-anchor="middle" font-size="18" font-weight="700">逐项加参数</text>
+<text x="878" y="428" text-anchor="middle" font-size="14">gpu / volume / shm / net</text>
+<rect x="250" y="585" width="600" height="74" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="618" text-anchor="middle" font-size="20" font-weight="700">不要直接扩大到 --privileged；先证明是哪条边界阻塞</text>
+<text x="550" y="643" text-anchor="middle" font-size="14">每次只改变一个变量，并记录 docker run 完整命令</text>
+<line x1="550" y1="116" x2="175" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="420" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="665" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="910" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="175" y1="253" x2="223" y2="365" stroke="#94a3b8" stroke-width="3"/>
+<line x1="420" y1="253" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/>
+<line x1="665" y1="253" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/>
+<line x1="910" y1="253" x2="878" y2="365" stroke="#94a3b8" stroke-width="3"/>
+<line x1="223" y1="459" x2="395" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="459" x2="550" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<line x1="878" y1="459" x2="705" y2="585" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">训练容器排障的核心是保留现场、最小复现、一次改变一个变量；不要用大权限掩盖真实根因。</div></section>
+
+<section class="section" id="s16">
+<h2>15. 训练容器排障路线图</h2>
+<h3>1. 启动失败</h3>
+<pre><code># 看退出码、启动命令、错误日志
+docker ps -a --filter name=train-0
+docker inspect train-0 --format 'Exit={{.State.ExitCode}} Error={{.State.Error}} Cmd={{json .Config.Cmd}}'
+docker logs --tail 200 train-0
+
+# 覆盖 entrypoint 进入 shell
+docker run --rm -it --entrypoint bash registry.example.com/ai/train:2026-04-25</code></pre>
+<h3>2. GPU 不可见或 CUDA 报错</h3>
+<pre><code>nvidia-smi
+docker info --format '{{json .Runtimes}}'
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all registry.example.com/ai/train:2026-04-25 \
+  python3 -c 'import torch; print(torch.cuda.is_available(), torch.cuda.device_count())'</code></pre>
+<h3>3. OOM、bus error、DataLoader worker 退出</h3>
+<pre><code># 查看是否 OOM killed
+docker inspect train-0 --format 'OOMKilled={{.State.OOMKilled}} Exit={{.State.ExitCode}}'
+docker events --since 30m --filter container=train-0
+
+# 检查共享内存
+docker run --rm --shm-size 64g registry.example.com/ai/train:2026-04-25 df -h /dev/shm</code></pre>
+<h3>4. 分布式训练卡死</h3>
+<pre><code># 容器内检查网络和端口
+docker exec train-0 bash -lc 'hostname -I; ip addr; ss -lntp; env | grep -E "NCCL|MASTER|RANK|WORLD"'
+
+# 提高 NCCL 日志粒度
+docker run --rm --network host --gpus all \
+  -e NCCL_DEBUG=INFO \
+  -e NCCL_DEBUG_SUBSYS=INIT,NET \
+  -e NCCL_SOCKET_IFNAME=eth0 \
+  registry.example.com/ai/train:2026-04-25 python train.py</code></pre>
+<div class="success"><strong>排障顺序：</strong> 先证明宿主机正常，再证明基础 CUDA 镜像正常，再证明你的训练镜像正常，最后才进入数据、网络、shm、ulimit 和业务代码排查。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 常用命令速查与练习</h2>
+<div class="grid-2">
+<div class="card"><strong>镜像</strong><br><code>docker pull</code>、<code>docker build</code>、<code>docker image ls</code>、<code>docker image inspect</code>、<code>docker tag</code>、<code>docker push</code></div>
+<div class="card"><strong>容器</strong><br><code>docker run</code>、<code>docker ps -a</code>、<code>docker stop</code>、<code>docker rm</code>、<code>docker inspect</code></div>
+<div class="card"><strong>调试</strong><br><code>docker logs</code>、<code>docker exec</code>、<code>docker cp</code>、<code>docker diff</code>、<code>docker events</code></div>
+<div class="card"><strong>资源</strong><br><code>docker stats</code>、<code>--cpus</code>、<code>--memory</code>、<code>--shm-size</code>、<code>--ulimit</code></div>
+</div>
+<h3>练习任务</h3>
+<ol>
+<li>运行 <code>hello-world</code> 或 <code>ubuntu:22.04</code>，观察 <code>docker ps -a</code> 中的退出状态。</li>
+<li>用 <code>docker run --rm -v "$PWD":/workspace:ro</code> 验证只读挂载。</li>
+<li>用 CUDA 基础镜像执行 <code>nvidia-smi</code>，确认 GPU runtime 是否可用。</li>
+<li>用 <code>--shm-size</code> 对比容器内 <code>df -h /dev/shm</code>。</li>
+<li>构建一个包含 <code>requirements.txt</code> 的最小训练镜像，并用 <code>docker history</code> 查看层大小。</li>
+<li>模拟失败容器，使用 <code>docker logs</code>、<code>inspect</code>、<code>cp</code> 保留现场。</li>
+<li>比较 <code>bridge</code> 与 <code>host</code> 网络下容器内看到的 IP、路由和监听端口。</li>
+</ol>
+<pre><code># 练习：最小 Python 镜像
+mkdir -p /tmp/docker-ai-demo && cd /tmp/docker-ai-demo
+cat &gt; requirements.txt &lt;&lt'EOF2'
+numpy
+EOF2
+cat &gt; Dockerfile &lt;&lt'EOF2'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+CMD ["python", "-c", "import numpy as np; print(np.__version__)"]
+EOF2
+
+docker build -t ai-demo:numpy .
+docker run --rm ai-demo:numpy</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>Docker 官方文档：Docker Engine、Dockerfile reference、BuildKit、docker run reference、storage volumes、networking、resource constraints。</li><li>NVIDIA Container Toolkit 文档：GPU runtime 配置、<code>--gpus</code>、<code>NVIDIA_VISIBLE_DEVICES</code>、CUDA 镜像兼容性。</li><li>OCI Runtime Specification 与 Image Specification：容器镜像和运行时的底层标准。</li><li>PyTorch 分布式与 NCCL 文档：<code>torchrun</code>、NCCL 环境变量、DataLoader 多进程与共享内存注意事项。</li><li>Kubernetes/containerd 排障资料：<code>nerdctl</code>、<code>crictl</code>、CRI 与 Docker Engine 的边界。</li></ul><p class="mini">建议阅读顺序：先掌握镜像/容器/宿主机资源模型，再学习 GPU runtime、volume、network、cgroup 和 shm/ipc，最后把安全基线与训练排障流程固化到团队脚本和平台模板中。</p></section>
+<div class="footer">docker 深度教程 · AI Infra 图文版 · 镜像、容器、GPU、资源隔离、构建、安全与训练排障</div>
+</div>
+</body>
+</html>

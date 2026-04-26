@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>systemd-cgls 深度教程：从 cgroup 树到 AI 训练进程定位</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>systemd-cgls 深度教程：从 cgroup 树到 AI 训练进程定位</h1>
+<p class="sub">这份教程面向 AI Infra、Linux SRE、训练平台和容器平台排障场景。它从 <code>systemd-cgls</code> 的核心心智模型开始：把主机上的进程按 Linux cgroup 层级画成树，而不是只按 PID 平铺。你会系统掌握：system/user slice、service/scope、训练任务和容器进程定位、Kubernetes/containerd cgroup 路径、资源隔离线索、cgroup v1/v2 差异、与 <code>systemd-cgtop</code>/<code>ps</code>/<code>/proc</code> 的边界，以及生产排障时如何安全取证。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">cgroup 树</span><span class="chip">systemd slice</span><span class="chip">训练进程定位</span><span class="chip">Kubernetes</span><span class="chip">containerd</span><span class="chip">cgroup v2</span><span class="chip">资源隔离</span><span class="chip">排障流程</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>systemd-cgls</code> 是 cgroup 的“树状地图”：它告诉你某个 Python、NCCL、DataLoader、容器 shim 或 kubelet 子进程归属于哪个 systemd unit、slice、scope 或 Kubernetes pod cgroup。</div>
+<div class="success"><strong>实践原则：</strong> <code>systemd-cgls</code> 主要是只读观察工具，适合排障取证；不要仅凭树形位置下结论，资源限制和压力还要继续读取 <code>/sys/fs/cgroup</code>、<code>systemctl show</code>、<code>ps</code>、<code>nvidia-smi</code>、<code>crictl</code> 或 <code>kubectl</code> 交叉验证。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">systemd-cgls 是什么</a></li>
+<li><a class="anchor" href="#s2">核心模型：进程属于 cgroup 树</a></li>
+<li><a class="anchor" href="#s3">语法、选项与权限</a></li>
+<li><a class="anchor" href="#s4">读懂输出：树、PID、命令行</a></li>
+<li><a class="anchor" href="#s5">system.slice、user.slice、machine.slice</a></li>
+<li><a class="anchor" href="#s6">service、scope、slice 的关系</a></li>
+<li><a class="anchor" href="#s7">定位 AI 训练进程</a></li>
+<li><a class="anchor" href="#s8">从 PID 反查 cgroup</a></li>
+<li><a class="anchor" href="#s9">Kubernetes 与 containerd cgroup</a></li>
+<li><a class="anchor" href="#s10">Docker、Podman、nerdctl 场景</a></li>
+<li><a class="anchor" href="#s11">资源隔离线索</a></li>
+<li><a class="anchor" href="#s12">cgroup v1/v2 caveats</a></li>
+<li><a class="anchor" href="#s13">systemd-cgls vs cgtop/proc/ps</a></li>
+<li><a class="anchor" href="#s14">AI Infra 排障工作流</a></li>
+<li><a class="anchor" href="#s15">常见问题与陷阱</a></li>
+<li><a class="anchor" href="#s16">安全与生产取证</a></li>
+<li><a class="anchor" href="#s17">命令速查与练习</a></li>
+<li><a class="anchor" href="#refs">参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. systemd-cgls 是什么</h2>
+<p><code>systemd-cgls</code> 的全称可以理解为 “systemd control group list”。它递归显示 Linux control group 层级中的 cgroup 和成员进程。和 <code>ps aux</code> 不同，<code>systemd-cgls</code> 关注“进程被谁管理、被放进哪个资源边界”，这对 AI 训练平台尤其重要。</p>
+<div class="grid-3">
+<div class="card"><strong>它回答的问题</strong><br>这个 <code>python train.py</code> 是登录会话、systemd service、Slurm step、Docker 容器、Kubernetes pod，还是某个 transient scope 启动的？</div>
+<div class="card"><strong>它不直接回答的问题</strong><br>CPU/GPU/内存当前消耗是多少、谁在 OOM、哪个 GPU kernel 卡住。那些要用 <code>systemd-cgtop</code>、<code>ps</code>、<code>nvidia-smi</code>、<code>journalctl</code> 和 cgroup 文件继续查。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>训练任务经常通过 launcher、容器 runtime、kubelet、systemd-run 或 job scheduler 间接启动；cgroup 树能把“谁创建谁、谁隔离谁”重新串起来。</div>
+</div>
+<pre><code># 查看整棵 systemd cgroup 树
+systemd-cgls
+
+# 输出完整命令行，避免长命令被省略
+systemd-cgls --full --no-pager
+
+# 只看某个 systemd unit 的 cgroup 子树
+systemd-cgls --unit kubelet.service
+
+# 只看当前用户的 user unit 子树
+systemd-cgls --user-unit my-training.scope</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>systemd-cgls</code> 显示的是 cgroup 归属和树形结构，不是实时性能采样器。看到某个训练进程在 pod cgroup 下，只说明归属；要判断是否被限流、OOM 或资源争抢，还需要继续读限制文件和指标。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：AI 节点上的 cgroup 树心智模型</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="AI 节点 cgroup 树心智模型">
+<rect x="18" y="18" width="1064" height="664" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">systemd-cgls 看到的是“资源控制树”，不是普通进程树</text>
+<rect x="460" y="100" width="180" height="62" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="137" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">/sys/fs/cgroup</text>
+<rect x="115" y="230" width="205" height="82" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="217" y="262" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">system.slice</text>
+<text x="217" y="288" text-anchor="middle" font-size="14">系统服务</text>
+<rect x="448" y="230" width="205" height="82" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="262" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">user.slice</text>
+<text x="550" y="288" text-anchor="middle" font-size="14">登录会话/用户服务</text>
+<rect x="780" y="230" width="205" height="82" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="882" y="262" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">machine.slice</text>
+<text x="882" y="288" text-anchor="middle" font-size="14">虚拟机/容器机器</text>
+<rect x="70" y="410" width="295" height="168" rx="18" fill="#fbfdff" stroke="#cbd5e1"/>
+<text x="217" y="446" text-anchor="middle" font-size="17" font-weight="700">kubelet.service</text>
+<text x="217" y="476" text-anchor="middle" font-size="14">containerd.service</text>
+<text x="217" y="506" text-anchor="middle" font-size="14">docker.service</text>
+<text x="217" y="536" text-anchor="middle" font-size="14">dcgm-exporter.service</text>
+<rect x="402" y="410" width="295" height="168" rx="18" fill="#fbfdff" stroke="#cbd5e1"/>
+<text x="550" y="446" text-anchor="middle" font-size="17" font-weight="700">user-1000.slice</text>
+<text x="550" y="476" text-anchor="middle" font-size="14">session-42.scope</text>
+<text x="550" y="506" text-anchor="middle" font-size="14">jupyter.service</text>
+<text x="550" y="536" text-anchor="middle" font-size="14">training.scope</text>
+<rect x="735" y="410" width="295" height="168" rx="18" fill="#fbfdff" stroke="#cbd5e1"/>
+<text x="882" y="446" text-anchor="middle" font-size="17" font-weight="700">kubepods.slice</text>
+<text x="882" y="476" text-anchor="middle" font-size="14">pod&lt;uid&gt;.slice</text>
+<text x="882" y="506" text-anchor="middle" font-size="14">cri-containerd-&lt;id&gt;.scope</text>
+<text x="882" y="536" text-anchor="middle" font-size="14">python / torchrun / dataloader</text>
+<line x1="550" y1="162" x2="217" y2="230" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="162" x2="550" y2="230" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="162" x2="882" y2="230" stroke="#94a3b8" stroke-width="4"/>
+<line x1="217" y1="312" x2="217" y2="410" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="312" x2="550" y2="410" stroke="#94a3b8" stroke-width="4"/>
+<line x1="882" y1="312" x2="882" y2="410" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">普通进程树回答父子关系；cgroup 树回答资源边界和管理归属。训练任务、容器 runtime 和 kubelet 往往在 cgroup 树里更容易定位。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 语法、选项与权限</h2>
+<p>基本语法是 <code>systemd-cgls [OPTIONS...] [CGROUP...]</code>，也可以通过 <code>--unit</code> 或 <code>--user-unit</code> 查看指定 unit 的 cgroup 子树。没有参数时，一般显示完整 systemd cgroup 层级；如果当前目录位于 <code>/sys/fs/cgroup/</code> 下，则可能显示当前目录对应的 cgroup。</p>
+<table>
+<tr><th>选项</th><th>含义</th><th>AI Infra 用法</th></tr>
+<tr><td><code>--all</code></td><td>显示空 cgroup</td><td>确认某个 service/scope 是否存在但没有进程</td></tr>
+<tr><td><code>-l</code>, <code>--full</code></td><td>不省略过长进程命令行</td><td>查看 <code>torchrun</code>、launcher 参数、容器 entrypoint</td></tr>
+<tr><td><code>-u</code>, <code>--unit</code></td><td>显示指定 system unit 子树</td><td><code>kubelet.service</code>、<code>containerd.service</code>、自建 trainer service</td></tr>
+<tr><td><code>--user-unit</code></td><td>显示指定 user unit 子树</td><td>定位用户态 <code>systemd-run --user --scope</code> 启动的训练任务</td></tr>
+<tr><td><code>-k</code></td><td>包含 kernel threads</td><td>排查节点底层线程归属时使用，默认多数训练排障不需要</td></tr>
+<tr><td><code>-M</code>, <code>--machine=</code></td><td>限制到某个 machine/container</td><td>systemd-nspawn 或 machined 管理的容器/VM 场景</td></tr>
+<tr><td><code>--xattr=</code></td><td>显示 cgroup 扩展属性信息</td><td>少见，通常用于深入 systemd/cgroup 元数据排障</td></tr>
+<tr><td><code>--cgroup-id=</code></td><td>显示 cgroup 数字 ID</td><td>与 eBPF、内核事件或审计日志按 cgroup id 关联时有用</td></tr>
+<tr><td><code>--no-pager</code></td><td>不进入 pager</td><td>脚本、远程命令、工单粘贴时必备</td></tr>
+</table>
+<pre><code># 推荐排障默认组合：完整命令行 + 不进 pager
+sudo systemd-cgls --full --no-pager
+
+# 查看空 cgroup，适合确认 unit 是否只剩目录没有进程
+sudo systemd-cgls --all --no-pager --unit kubelet.service
+
+# 指定 cgroup 路径
+sudo systemd-cgls /sys/fs/cgroup/system.slice/containerd.service
+
+# 查看命令是否支持某个新选项
+systemd-cgls --help
+systemd-cgls --version</code></pre>
+<div class="note"><strong>权限模型：</strong> 普通用户通常能看到不少进程和 cgroup 名称，但命令行、其他用户进程、容器细节可能受权限或内核 hidepid 设置影响。生产排障建议使用具备授权的 root/sudo 只读观察。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 读懂输出：树、PID、命令行</h2>
+<p><code>systemd-cgls</code> 输出由 cgroup 节点和进程叶子组成。cgroup 节点一般以路径片段、unit 名、slice 名或 scope 名出现；叶子进程通常显示 PID 和命令行。树缩进表达 cgroup 层级，不等价于进程父子关系。</p>
+<pre><code>Control group /:
+-.slice
+├─system.slice
+│ ├─containerd.service
+│ │ ├─  908 /usr/bin/containerd
+│ │ └─14201 containerd-shim-runc-v2 -namespace k8s.io -id 7f0...
+│ └─kubelet.service
+│   └─  936 /usr/bin/kubelet --container-runtime-endpoint=unix:///run/containerd/containerd.sock
+├─user.slice
+│ └─user-1000.slice
+│   └─session-12.scope
+│     └─22591 sshd: ubuntu@pts/3
+└─kubepods.slice
+  └─kubepods-burstable.slice
+    └─kubepods-burstable-pod9d4a...slice
+      └─cri-containerd-7f0....scope
+        ├─31772 /usr/bin/python train.py --model llama --epochs 3
+        └─31808 /usr/bin/python -c from torch.utils.data...</code></pre>
+<table>
+<tr><th>输出片段</th><th>解释</th><th>排障动作</th></tr>
+<tr><td><code>system.slice</code></td><td>系统服务集合</td><td>查 kubelet/containerd/docker/slurm 等守护进程</td></tr>
+<tr><td><code>user-1000.slice</code></td><td>UID 1000 的用户资源树</td><td>关联登录会话、Jupyter、用户级训练任务</td></tr>
+<tr><td><code>session-12.scope</code></td><td>一次登录会话或 PAM 创建的 scope</td><td>判断训练是否从 SSH/tmux/screen 手动启动</td></tr>
+<tr><td><code>cri-containerd-&lt;id&gt;.scope</code></td><td>containerd 管理的容器 scope</td><td>用容器 ID 前缀反查 pod/container</td></tr>
+<tr><td><code>31772 /usr/bin/python ...</code></td><td>成员进程</td><td>拿 PID 继续查 <code>/proc</code>、GPU、文件句柄、网络</td></tr>
+</table>
+<div class="warn"><strong>读树提醒：</strong> 同一 cgroup 下的多个进程是同一个资源控制边界内的成员，不表示它们互为父子。父子关系请用 <code>pstree -ap</code> 或 <code>ps -o pid,ppid,cmd</code> 查看。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. system.slice、user.slice、machine.slice</h2>
+<p>systemd 把资源管理抽象为 slice。对 AI 节点来说，最常见的是系统服务所在的 <code>system.slice</code>、用户会话所在的 <code>user.slice</code>，以及某些虚拟机/容器场景下的 <code>machine.slice</code>。Kubernetes pod cgroup 也经常以 slice 形式出现，具体取决于 kubelet cgroup driver 和 cgroup 版本。</p>
+<div class="grid-3">
+<div class="card"><strong>system.slice</strong><br>kubelet、containerd、docker、slurmd、node exporter、DCGM exporter 等守护进程通常在这里。平台级故障先看这里。</div>
+<div class="card"><strong>user.slice</strong><br>SSH、Jupyter、tmux、用户级 systemd service/scope 常在这里。手动训练、Notebook 训练和开发机排障先看这里。</div>
+<div class="card"><strong>machine.slice</strong><br>systemd-machined 管理的 machine、nspawn 容器或某些 VM 方案可能在这里。普通 Kubernetes 节点不一定明显使用它。</div>
+</div>
+<pre><code># 只看系统服务层
+sudo systemd-cgls /sys/fs/cgroup/system.slice --full --no-pager
+
+# 只看某个用户资源层，UID 1000 只是示例
+sudo systemd-cgls /sys/fs/cgroup/user.slice/user-1000.slice --full --no-pager
+
+# 观察 machine 相关 cgroup，若不存在则说明当前节点未使用这类管理方式
+sudo systemd-cgls /sys/fs/cgroup/machine.slice --full --no-pager</code></pre>
+<div class="note"><strong>定位技巧：</strong> 如果一个训练进程在 <code>user.slice/session-*.scope</code> 下，通常说明它来自登录会话；如果在 <code>kubepods.slice</code> 或 <code>cri-containerd-*.scope</code> 下，通常说明它来自容器编排；如果在自定义 <code>*.service</code> 下，说明它被 systemd unit 托管。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. service、scope、slice 的关系</h2>
+<p><code>systemd-cgls</code> 输出里的 <code>*.service</code>、<code>*.scope</code>、<code>*.slice</code> 不是装饰字符串，而是 systemd 管理资源边界的关键线索。</p>
+<table>
+<tr><th>类型</th><th>含义</th><th>AI Infra 示例</th><th>常用交叉验证</th></tr>
+<tr><td><code>service</code></td><td>由 systemd 按 unit 文件启动和监督的服务</td><td><code>kubelet.service</code>、<code>containerd.service</code>、<code>slurmd.service</code></td><td><code>systemctl status kubelet</code>、<code>systemctl show kubelet</code></td></tr>
+<tr><td><code>scope</code></td><td>外部创建、systemd 只负责归组和资源控制的一组进程</td><td><code>session-12.scope</code>、<code>cri-containerd-*.scope</code>、<code>run-*.scope</code></td><td><code>systemctl status run-xxx.scope</code>、<code>loginctl session-status</code></td></tr>
+<tr><td><code>slice</code></td><td>资源层级分组，不直接代表一个进程</td><td><code>kubepods-burstable.slice</code>、<code>user-1000.slice</code></td><td><code>systemctl show user-1000.slice</code>、读 cgroup 文件</td></tr>
+</table>
+<pre><code># 查看 unit 的资源属性，常用于确认是否设置了 CPU/Memory 限制
+systemctl show kubelet.service -p Slice -p ControlGroup -p CPUWeight -p MemoryMax -p TasksMax
+
+# 查看登录会话对应 scope
+loginctl list-sessions
+loginctl session-status 12
+
+# 用 systemd-run 创建一个可控 scope，适合做资源隔离实验
+systemd-run --user --scope -p MemoryMax=8G -p CPUWeight=200 python train.py</code></pre>
+<div class="danger"><strong>实验边界：</strong> <code>systemd-run</code> 会真正启动进程；生产节点不要为了演示随意创建训练进程或调整资源属性。先在测试机验证。</div>
+</section>
+
+<section class="figure" id="s7">
+<h3>流程图：从“GPU 上有陌生 Python”定位到 cgroup 和工作负载</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="GPU Python 进程定位流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="280" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="87" text-anchor="middle" font-size="21" font-weight="700">发现陌生 GPU 进程</text>
+<rect x="80" y="175" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="205" y="211" text-anchor="middle" font-size="17" font-weight="700">1. 取 PID</text>
+<text x="205" y="238" text-anchor="middle" font-size="14">nvidia-smi / ps</text>
+<rect x="425" y="175" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="211" text-anchor="middle" font-size="17" font-weight="700">2. 读 /proc/PID/cgroup</text>
+<text x="550" y="238" text-anchor="middle" font-size="14">得到 cgroup 路径</text>
+<rect x="770" y="175" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="895" y="211" text-anchor="middle" font-size="17" font-weight="700">3. systemd-cgls 子树</text>
+<text x="895" y="238" text-anchor="middle" font-size="14">看兄弟进程和 unit</text>
+<rect x="108" y="390" width="250" height="102" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="233" y="425" text-anchor="middle" font-size="17" font-weight="700">Kubernetes?</text>
+<text x="233" y="453" text-anchor="middle" font-size="14">kubepods / cri-containerd</text>
+<rect x="425" y="390" width="250" height="102" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="425" text-anchor="middle" font-size="17" font-weight="700">用户会话?</text>
+<text x="550" y="453" text-anchor="middle" font-size="14">user.slice / session.scope</text>
+<rect x="742" y="390" width="250" height="102" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="867" y="425" text-anchor="middle" font-size="17" font-weight="700">系统服务?</text>
+<text x="867" y="453" text-anchor="middle" font-size="14">*.service / *.scope</text>
+<rect x="300" y="595" width="500" height="70" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="624" text-anchor="middle" font-size="19" font-weight="700">关联 owner、pod、container、job，再判断是否需要干预</text>
+<text x="550" y="649" text-anchor="middle" font-size="14">先取证，后操作；不要直接 kill 未归属清楚的训练进程</text>
+<line x1="550" y1="112" x2="205" y2="175" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="112" x2="550" y2="175" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="112" x2="895" y2="175" stroke="#94a3b8" stroke-width="4"/>
+<line x1="895" y1="267" x2="233" y2="390" stroke="#94a3b8" stroke-width="4"/>
+<line x1="895" y1="267" x2="550" y2="390" stroke="#94a3b8" stroke-width="4"/>
+<line x1="895" y1="267" x2="867" y2="390" stroke="#94a3b8" stroke-width="4"/>
+<line x1="233" y1="492" x2="415" y2="595" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="492" x2="550" y2="595" stroke="#94a3b8" stroke-width="4"/>
+<line x1="867" y1="492" x2="685" y2="595" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">定位训练归属的核心顺序：先拿 PID，再查 cgroup，再展开子树，最后关联平台对象。</div>
+</section>
+
+<section class="section">
+<h2>6. 定位 AI 训练进程</h2>
+<p>AI 训练节点常见问题是“GPU 被占用，但平台看不到任务”或“训练进程还在，调度器认为任务结束”。<code>systemd-cgls</code> 能帮助判断这个进程来自容器、登录会话、服务，还是被遗留在某个 scope 中。</p>
+<pre><code># 1. 从 GPU 侧拿 PID
+nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
+
+# 2. 查看 PID 的基础信息
+ps -o pid,ppid,user,stat,etime,cmd -p 31772
+
+# 3. 反查 cgroup 归属
+cat /proc/31772/cgroup
+
+# 4. 用 systemd-cgls 展开相关 cgroup 或整棵树中过滤 PID
+sudo systemd-cgls --full --no-pager | grep -C 8 '31772'
+
+# 5. 如果知道路径，直接看子树
+sudo systemd-cgls /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/pod-example.slice --full --no-pager</code></pre>
+<h3>训练进程常见形态</h3>
+<div class="grid-2">
+<div class="card"><strong><code>torchrun</code> + 多个 worker</strong><br>通常会看到一个 launcher 和多个 Python worker；如果在同一个 cgroup 下，说明资源限制对整组进程生效。</div>
+<div class="card"><strong>DataLoader worker</strong><br>大量短命 Python 子进程可能和主训练进程同属一个容器 cgroup；CPU 飙升时要结合 <code>ps -L</code>、<code>pidstat</code> 查线程和子进程。</div>
+<div class="card"><strong>NCCL/通信辅助进程</strong><br>通常仍在训练 cgroup 下，但网络和 RDMA 问题要继续用 <code>ss</code>、<code>rdma</code>、<code>ibstat</code>、<code>nvidia-smi topo</code> 交叉验证。</div>
+<div class="card"><strong>Jupyter 启动训练</strong><br>常见于 <code>user.slice</code> 或 notebook 容器 cgroup 下；要分清 notebook server、kernel 和真实训练 worker。</div>
+</div>
+<div class="danger"><strong>操作警告：</strong> <code>kill</code>、<code>systemctl stop</code>、<code>crictl stop</code>、<code>kubectl delete pod</code> 都是破坏性操作。先截图/保存 <code>systemd-cgls</code>、<code>ps</code>、<code>/proc/PID/cgroup</code>、平台任务 ID，再按组织流程处理。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 从 PID 反查 cgroup</h2>
+<p><code>systemd-cgls</code> 适合从树找进程；<code>/proc/PID/cgroup</code> 适合从进程找树。AI Infra 排障中，两者通常一起使用。</p>
+<pre><code># cgroup v2 常见输出：0:: 后面是统一层级路径
+cat /proc/31772/cgroup
+0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9d4a.slice/cri-containerd-7f0.scope
+
+# 拼成实际 cgroup 文件路径
+CG=$(awk -F: '$1=="0"{print $3}' /proc/31772/cgroup)
+echo "/sys/fs/cgroup$CG"
+
+# 查看该 cgroup 的进程列表和线程列表
+sudo cat "/sys/fs/cgroup$CG/cgroup.procs"
+sudo cat "/sys/fs/cgroup$CG/cgroup.threads"
+
+# 直接展开这个 cgroup
+sudo systemd-cgls "/sys/fs/cgroup$CG" --full --no-pager</code></pre>
+<table>
+<tr><th>文件</th><th>用途</th><th>注意</th></tr>
+<tr><td><code>/proc/PID/cgroup</code></td><td>查看 PID 所属 cgroup 路径</td><td>v1 会按 controller 多行显示，v2 通常是 <code>0::/path</code></td></tr>
+<tr><td><code>cgroup.procs</code></td><td>该 cgroup 及其直接成员进程</td><td>不同层级读取结果可能不同，注意是否在叶子 cgroup</td></tr>
+<tr><td><code>cgroup.threads</code></td><td>线程级成员</td><td>排查多线程 CPU 问题时有用</td></tr>
+<tr><td><code>cgroup.controllers</code></td><td>v2 可用 controller</td><td>确认 CPU、memory、io、pids 等 controller 是否启用</td></tr>
+</table>
+<div class="note"><strong>实用习惯：</strong> 在工单里同时贴 <code>PID</code>、<code>/proc/PID/cgroup</code>、<code>systemd-cgls --full</code> 相关子树，后续关联 pod/container/job 会快很多。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. Kubernetes 与 containerd cgroup</h2>
+<p>Kubernetes 节点上，训练容器的 cgroup 名称取决于 kubelet 的 cgroup driver、runtime 和 cgroup 版本。systemd driver 下经常能看到 <code>kubepods.slice</code>、QoS slice、pod UID slice、<code>cri-containerd-&lt;container-id&gt;.scope</code>。这正是从 Linux 视角映射回 Kubernetes 对象的入口。</p>
+<pre><code># 查看 kubelet cgroup driver 和运行参数线索
+ps -o pid,cmd -C kubelet
+systemctl show kubelet.service -p ControlGroup -p ExecStart
+
+# containerd 进程和 shim 通常在 system.slice 下
+sudo systemd-cgls --unit containerd.service --full --no-pager
+
+# 在整棵树中寻找某个容器 ID 前缀
+sudo systemd-cgls --full --no-pager | grep -C 5 '7f0a1b2c3d4e'
+
+# 用 crictl 从容器 ID 反查 pod/container 元数据
+sudo crictl ps -a | grep '7f0a1b2c3d4e'
+sudo crictl inspect 7f0a1b2c3d4e | grep -E '"name"|"podSandboxId"|"pid"'</code></pre>
+<h3>常见 Kubernetes cgroup 形态</h3>
+<table>
+<tr><th>形态</th><th>常见含义</th><th>排障动作</th></tr>
+<tr><td><code>kubepods.slice/kubepods-besteffort.slice/...</code></td><td>BestEffort pod，没有显式 request/limit</td><td>资源争抢风险高，优先查调度规格和节点压力</td></tr>
+<tr><td><code>kubepods-burstable-pod&lt;uid&gt;.slice</code></td><td>Burstable pod，部分容器设置 request/limit</td><td>检查 CPU quota、memory.max、OOM 事件</td></tr>
+<tr><td><code>kubepods-pod&lt;uid&gt;.slice</code></td><td>Guaranteed pod 或不同发行版命名</td><td>按 pod UID 反查 Kubernetes 对象</td></tr>
+<tr><td><code>cri-containerd-&lt;id&gt;.scope</code></td><td>containerd 创建的具体容器 scope</td><td>取容器 ID 前缀，用 <code>crictl inspect</code> 关联</td></tr>
+</table>
+<pre><code># 从 pod UID 反查集群对象，注意 Kubernetes UID 中的 '-' 在 cgroup 名里可能被转义或改写
+kubectl get pod -A -o wide | grep 'train'
+kubectl get pod -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.metadata.uid}{"\n"}{end}' | grep '9d4a'
+
+# 查看 pod 资源规格和 QoS
+kubectl describe pod -n ml train-job-0 | sed -n '/Containers:/,/Conditions:/p'
+kubectl get pod -n ml train-job-0 -o jsonpath='{.status.qosClass}{"\n"}'</code></pre>
+<div class="warn"><strong>路径 caveat：</strong> 不同 Kubernetes 版本、发行版、runtime、cgroup driver 会导致路径差异。不要把示例路径写死到自动化脚本中；脚本应从 <code>/proc/PID/cgroup</code> 或 runtime API 动态获取。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. Docker、Podman、nerdctl 场景</h2>
+<p>非 Kubernetes 场景中，容器可能由 Docker、Podman、nerdctl 或直接由 containerd 管理。<code>systemd-cgls</code> 的作用仍然是回答“容器进程在哪个 cgroup/scope 里”。</p>
+<pre><code># Docker 守护进程归属
+sudo systemd-cgls --unit docker.service --full --no-pager
+
+# containerd 归属，Docker 和 nerdctl 都可能间接使用它
+sudo systemd-cgls --unit containerd.service --full --no-pager
+
+# 用 Docker 反查容器主进程 PID
+docker ps --no-trunc
+docker inspect -f '{{.State.Pid}} {{.Name}} {{.Id}}' CONTAINER_ID
+cat /proc/$(docker inspect -f '{{.State.Pid}}' CONTAINER_ID)/cgroup
+
+# Podman rootless 常在 user.slice 下，先从整棵树中过滤线索
+systemd-cgls --full --no-pager | grep -C 8 -E 'podman|libpod|conmon'</code></pre>
+<div class="grid-2">
+<div class="card"><strong>rootful Docker</strong><br>守护进程在 <code>system.slice/docker.service</code>，容器进程路径可能体现 docker/containerd scope，具体取决于 cgroup driver。</div>
+<div class="card"><strong>rootless Podman</strong><br>经常落在用户 cgroup 树下，排障时不要只看 <code>system.slice</code>。</div>
+<div class="card"><strong>nerdctl/containerd</strong><br>容器 shim 常由 containerd 管理；容器 ID 前缀是关联 runtime 元数据的重要线索。</div>
+<div class="card"><strong>AI 镜像训练</strong><br>训练进程可能是容器 entrypoint、launcher 子进程或 notebook kernel；要结合容器内外 PID 映射判断。</div>
+</div>
+<div class="note"><strong>容器内外 PID：</strong> 容器内看到的 PID 1 不一定是宿主机 PID 1。<code>systemd-cgls</code> 在宿主机上显示的是宿主机 PID；关联容器内进程时要通过 runtime inspect 或 <code>nsenter</code> 进一步确认。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 资源隔离线索</h2>
+<p><code>systemd-cgls</code> 本身不会显示所有资源限制，但它给出 cgroup 路径。拿到路径后，就可以读取 CPU、memory、io、pids 等控制文件，判断训练是否被 quota、cpuset、内存上限或 pids 上限影响。</p>
+<pre><code># 假设 CG 是从 /proc/PID/cgroup 得到的 v2 路径
+CG=$(awk -F: '$1=="0"{print $3}' /proc/31772/cgroup)
+CGDIR="/sys/fs/cgroup$CG"
+
+# CPU 限制和权重
+cat "$CGDIR/cpu.max"        # max 100000 表示不设 quota；50000 100000 表示 50% 一个 CPU
+cat "$CGDIR/cpu.weight"     # v2 权重，范围通常 1..10000
+
+# 内存限制、当前值、事件
+cat "$CGDIR/memory.max"
+cat "$CGDIR/memory.current"
+cat "$CGDIR/memory.events"
+
+# pids 限制
+cat "$CGDIR/pids.max"
+cat "$CGDIR/pids.current"
+
+# cpuset，排查 CPU 绑核/NUMA 约束
+cat "$CGDIR/cpuset.cpus.effective"
+cat "$CGDIR/cpuset.mems.effective"</code></pre>
+<table>
+<tr><th>线索</th><th>可能现象</th><th>下一步</th></tr>
+<tr><td><code>cpu.max</code> 很低</td><td>DataLoader 慢、CPU 预处理跟不上 GPU</td><td>检查 pod CPU limit、systemd CPUQuota、调度规格</td></tr>
+<tr><td><code>memory.events</code> 中 <code>oom</code>/<code>oom_kill</code> 增加</td><td>训练 worker 被杀、进程消失、容器重启</td><td>查 <code>journalctl -k</code>、<code>kubectl describe pod</code>、应用日志</td></tr>
+<tr><td><code>pids.current</code> 接近 <code>pids.max</code></td><td>无法 fork、DataLoader worker 创建失败</td><td>检查 pids limit、线程/进程泄漏</td></tr>
+<tr><td><code>cpuset.cpus.effective</code> 很窄</td><td>多卡训练 CPU 侧瓶颈、NUMA 不匹配</td><td>结合 <code>numactl -H</code>、<code>lscpu</code>、pod CPU manager 策略</td></tr>
+</table>
+<div class="success"><strong>关键连接：</strong> <code>systemd-cgls</code> 给你 cgroup 位置；cgroup 文件告诉你资源规则和事件；指标工具告诉你当前消耗。三者合起来才是完整判断。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. cgroup v1/v2 caveats</h2>
+<p>现代发行版越来越多默认使用 cgroup v2 unified hierarchy，但老节点、容器宿主机或特殊内核参数可能仍是 v1 或 hybrid。<code>systemd-cgls</code> 会尽量展示 systemd 管理的层级，但你读取限制文件和解析 <code>/proc/PID/cgroup</code> 时必须区分版本。</p>
+<pre><code># 判断 cgroup v2 是否启用
+stat -fc %T /sys/fs/cgroup
+# cgroup2fs 表示 unified cgroup v2
+
+# v2 常见：/proc/PID/cgroup 只有 0::/path
+cat /proc/31772/cgroup
+0::/user.slice/user-1000.slice/session-12.scope
+
+# v1 常见：每个 controller 一行，路径可能不完全相同
+cat /proc/31772/cgroup
+11:memory:/kubepods/burstable/pod9d4a/7f0...
+10:cpu,cpuacct:/kubepods/burstable/pod9d4a/7f0...
+9:pids:/kubepods/burstable/pod9d4a/7f0...</code></pre>
+<table>
+<tr><th>主题</th><th>cgroup v1</th><th>cgroup v2</th><th>排障建议</th></tr>
+<tr><td>层级</td><td>每个 controller 可有不同层级</td><td>统一层级</td><td>v1 不要假设 memory/cpu 路径完全一致</td></tr>
+<tr><td>CPU quota 文件</td><td><code>cpu.cfs_quota_us</code>、<code>cpu.cfs_period_us</code></td><td><code>cpu.max</code></td><td>脚本按版本分支读取</td></tr>
+<tr><td>内存限制文件</td><td><code>memory.limit_in_bytes</code></td><td><code>memory.max</code></td><td>注意 v1 可能出现很大的“无限制”数值</td></tr>
+<tr><td>事件文件</td><td>分散在 controller 文件中</td><td><code>memory.events</code> 等更统一</td><td>OOM 排障优先确认版本</td></tr>
+<tr><td>systemd driver</td><td>路径可能较旧式</td><td>slice/scope 命名更常见</td><td>不要写死 Kubernetes 路径模板</td></tr>
+</table>
+<div class="warn"><strong>兼容性提醒：</strong> <code>--xattr</code> 和 <code>--cgroup-id</code> 是较新的 systemd 选项；在旧发行版上可能不可用。自动化脚本应先检测 <code>systemd-cgls --help</code>。</div>
+</section>
+
+<section class="figure" id="s13">
+<h3>对比图：systemd-cgls、systemd-cgtop、ps、/proc 怎么分工</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="cgroup 诊断工具对比">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">同一个故障，要用不同视角拼起来</text>
+<rect x="70" y="135" width="220" height="150" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="180" y="174" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">systemd-cgls</text>
+<text x="180" y="211" text-anchor="middle" font-size="15">结构视角</text>
+<text x="180" y="240" text-anchor="middle" font-size="14">谁属于哪个 cgroup</text>
+<rect x="320" y="135" width="220" height="150" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="174" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">systemd-cgtop</text>
+<text x="430" y="211" text-anchor="middle" font-size="15">实时消耗视角</text>
+<text x="430" y="240" text-anchor="middle" font-size="14">哪个 cgroup 正在烧资源</text>
+<rect x="570" y="135" width="220" height="150" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="680" y="174" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">ps / pstree</text>
+<text x="680" y="211" text-anchor="middle" font-size="15">进程视角</text>
+<text x="680" y="240" text-anchor="middle" font-size="14">PID、PPID、状态、命令</text>
+<rect x="820" y="135" width="220" height="150" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="930" y="174" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">/proc + cgroupfs</text>
+<text x="930" y="211" text-anchor="middle" font-size="15">事实文件视角</text>
+<text x="930" y="240" text-anchor="middle" font-size="14">限制、事件、命名空间</text>
+<rect x="170" y="395" width="760" height="120" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="433" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">推荐组合</text>
+<text x="550" y="470" text-anchor="middle" font-size="15">systemd-cgls 找归属 → cgtop/ps 看消耗 → /sys/fs/cgroup 看限制事件 → runtime/K8s 查业务对象</text>
+<text x="550" y="500" text-anchor="middle" font-size="15">GPU 问题再接 nvidia-smi、dcgmi、NCCL 日志和调度平台</text>
+<line x1="180" y1="285" x2="330" y2="395" stroke="#94a3b8" stroke-width="4"/>
+<line x1="430" y1="285" x2="475" y2="395" stroke="#94a3b8" stroke-width="4"/>
+<line x1="680" y1="285" x2="625" y2="395" stroke="#94a3b8" stroke-width="4"/>
+<line x1="930" y1="285" x2="775" y2="395" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">不要把 systemd-cgls 当成万能性能工具；它最强的是结构归属，其他信息要靠配套工具补齐。</div>
+</section>
+
+<section class="section">
+<h2>12. systemd-cgls vs cgtop/proc/ps</h2>
+<table>
+<tr><th>工具</th><th>最适合回答</th><th>不适合回答</th><th>典型命令</th></tr>
+<tr><td><code>systemd-cgls</code></td><td>进程属于哪个 cgroup/unit/slice/scope</td><td>实时 CPU/GPU 利用率</td><td><code>systemd-cgls --full --no-pager</code></td></tr>
+<tr><td><code>systemd-cgtop</code></td><td>哪个 cgroup 当前消耗 CPU/内存/IO/任务数</td><td>完整命令行和平台对象映射</td><td><code>systemd-cgtop --depth=4</code></td></tr>
+<tr><td><code>ps</code></td><td>PID、PPID、用户、状态、启动时间、命令</td><td>层级资源限制</td><td><code>ps -eo pid,ppid,user,stat,etime,cmd</code></td></tr>
+<tr><td><code>/proc</code></td><td>单进程事实、命名空间、fd、cgroup、状态</td><td>全局树状概览</td><td><code>cat /proc/PID/status</code></td></tr>
+<tr><td><code>/sys/fs/cgroup</code></td><td>资源限制、事件、当前值</td><td>业务对象元数据</td><td><code>cat memory.events</code></td></tr>
+<tr><td><code>crictl/kubectl</code></td><td>容器/pod/job 元数据</td><td>宿主机所有 cgroup 结构</td><td><code>crictl inspect</code>、<code>kubectl describe pod</code></td></tr>
+</table>
+<pre><code># 结构
+sudo systemd-cgls --full --no-pager | grep -C 8 'python'
+
+# 消耗
+sudo systemd-cgtop --depth=5 --iterations=3
+
+# 进程状态
+ps -o pid,ppid,user,stat,ni,psr,etime,cmd -p 31772
+
+# 事实文件
+cat /proc/31772/status
+cat /proc/31772/cgroup
+readlink /proc/31772/ns/pid</code></pre>
+</section>
+
+<section class="section" id="s14">
+<h2>13. AI Infra 排障工作流</h2>
+<p>下面是一个生产可用的排障框架：先确认现象，再定位归属，再验证资源限制，最后决定操作路径。</p>
+<h3>场景 A：GPU 被占用但平台无任务</h3>
+<pre><code># 取 GPU PID
+nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
+
+# 查 PID 属于哪个 cgroup
+PID=31772
+ps -o pid,ppid,user,stat,etime,cmd -p "$PID"
+cat "/proc/$PID/cgroup"
+sudo systemd-cgls --full --no-pager | grep -C 10 "$PID"
+
+# 判断是否是 Kubernetes 容器
+cat "/proc/$PID/cgroup" | grep -E 'kubepods|cri-containerd|docker|libpod' || true</code></pre>
+<h3>场景 B：训练很慢，怀疑 CPU 被限</h3>
+<pre><code>PID=31772
+CG=$(awk -F: '$1=="0"{print $3}' "/proc/$PID/cgroup")
+CGDIR="/sys/fs/cgroup$CG"
+
+cat "$CGDIR/cpu.max"
+cat "$CGDIR/cpuset.cpus.effective"
+ps -o pid,psr,pcpu,stat,cmd -p "$PID"
+pidstat -p "$PID" 1 5</code></pre>
+<h3>场景 C：容器重启或 worker 消失</h3>
+<pre><code>PID=31772
+CG=$(awk -F: '$1=="0"{print $3}' "/proc/$PID/cgroup")
+CGDIR="/sys/fs/cgroup$CG"
+
+cat "$CGDIR/memory.events"
+journalctl -k --since '30 min ago' | grep -Ei 'oom|killed process|memory'
+kubectl describe pod -n ml train-job-0 | grep -A8 -Ei 'State:|Last State:|OOM|Reason'</code></pre>
+<div class="warn"><strong>推理纪律：</strong> 看到 <code>memory.events</code> 有 <code>oom_kill</code> 只能说明该 cgroup 发生过 OOM kill；要判断是不是当前训练导致，还要看时间、容器 restart count、内核日志和应用日志。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 常见问题与陷阱</h2>
+<div class="grid-2">
+<div class="card"><strong>陷阱 1：把 cgroup 树当进程树</strong><br>缩进表示资源层级，不表示 PPID。父子关系请用 <code>ps</code> 或 <code>pstree</code>。</div>
+<div class="card"><strong>陷阱 2：忘记 <code>--full</code></strong><br>训练命令行很长，默认输出可能省略关键参数；排障取证优先加 <code>--full --no-pager</code>。</div>
+<div class="card"><strong>陷阱 3：只看 <code>system.slice</code></strong><br>Jupyter、rootless Podman、用户级 scope 可能在 <code>user.slice</code>。</div>
+<div class="card"><strong>陷阱 4：Kubernetes 路径写死</strong><br>cgroup driver、runtime、版本不同会改变路径；自动化应从 <code>/proc/PID/cgroup</code> 动态取。</div>
+<div class="card"><strong>陷阱 5：空 cgroup 默认隐藏</strong><br>怀疑 unit 存在但没进程时，用 <code>--all</code>。</div>
+<div class="card"><strong>陷阱 6：权限导致信息缺失</strong><br>普通用户可能看不到完整命令行或其他用户进程；用授权的 <code>sudo</code> 只读查看。</div>
+<div class="card"><strong>陷阱 7：混淆 v1/v2 文件名</strong><br><code>cpu.max</code> 是 v2；v1 要读 <code>cpu.cfs_quota_us</code> 等 controller 文件。</div>
+<div class="card"><strong>陷阱 8：只靠单一工具下结论</strong><br>cgroup 归属、资源限制、实际消耗、业务对象必须交叉验证。</div>
+</div>
+<h3>排障模板</h3>
+<pre><code># 最小取证包：不修改系统状态
+date -Is
+hostname -f
+systemd-cgls --version
+sudo systemd-cgls --full --no-pager | sed -n '1,220p'
+
+# 针对某个 PID 的取证包
+PID=31772
+ps -o pid,ppid,user,stat,etime,cmd -p "$PID"
+cat "/proc/$PID/cgroup"
+cat "/proc/$PID/status" | sed -n '1,80p'
+sudo systemd-cgls --full --no-pager | grep -C 12 "$PID"</code></pre>
+</section>
+
+<section class="figure" id="s16">
+<h3>安全图：生产节点上如何用 systemd-cgls 取证而不扩大影响</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="systemd-cgls 生产安全取证流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">生产取证：先观察、再关联、后处置</text>
+<rect x="95" y="130" width="230" height="92" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="210" y="166" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">只读采集</text>
+<text x="210" y="194" text-anchor="middle" font-size="14">cgls / ps / proc</text>
+<rect x="435" y="130" width="230" height="92" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="166" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">关联对象</text>
+<text x="550" y="194" text-anchor="middle" font-size="14">unit / pod / job / user</text>
+<rect x="775" y="130" width="230" height="92" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="890" y="166" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">确认影响</text>
+<text x="890" y="194" text-anchor="middle" font-size="14">资源 / SLA / owner</text>
+<rect x="155" y="340" width="330" height="116" rx="18" fill="#f0fdf4" stroke="#86efac"/>
+<text x="320" y="379" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">安全命令</text>
+<text x="320" y="411" text-anchor="middle" font-size="14">systemd-cgls --full --no-pager</text>
+<text x="320" y="438" text-anchor="middle" font-size="14">cat /proc/PID/cgroup</text>
+<rect x="615" y="340" width="330" height="116" rx="18" fill="#fef2f2" stroke="#fecaca"/>
+<text x="780" y="379" text-anchor="middle" font-size="19" font-weight="700" fill="#dc2626">高风险操作</text>
+<text x="780" y="411" text-anchor="middle" font-size="14">kill / systemctl stop</text>
+<text x="780" y="438" text-anchor="middle" font-size="14">kubectl delete / 调整 limit</text>
+<rect x="260" y="570" width="580" height="70" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="598" text-anchor="middle" font-size="18" font-weight="700">处置前必须具备：证据、owner、影响面、回滚或恢复路径</text>
+<text x="550" y="623" text-anchor="middle" font-size="14">systemd-cgls 帮你确认归属，但不替你做处置决策</text>
+<line x1="325" y1="176" x2="435" y2="176" stroke="#94a3b8" stroke-width="4" marker-end="url(#safea)"/>
+<line x1="665" y1="176" x2="775" y2="176" stroke="#94a3b8" stroke-width="4" marker-end="url(#safea)"/>
+<line x1="550" y1="222" x2="320" y2="340" stroke="#94a3b8" stroke-width="4"/>
+<line x1="890" y1="222" x2="780" y2="340" stroke="#94a3b8" stroke-width="4"/>
+<line x1="320" y1="456" x2="455" y2="570" stroke="#94a3b8" stroke-width="4"/>
+<line x1="780" y1="456" x2="645" y2="570" stroke="#94a3b8" stroke-width="4"/>
+<defs><marker id="safea" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">systemd-cgls 是安全的观察入口；真正改变系统状态的操作必须经过确认和授权。</div>
+</section>
+
+<section class="section">
+<h2>15. 安全与生产取证</h2>
+<p>在共享 GPU 集群或训练平台上，排障的目标不是“最快杀掉可疑进程”，而是先把归属和影响面查清楚，避免误杀长期训练、在线推理服务或其他团队作业。</p>
+<h3>建议保存的证据</h3>
+<pre><code># 建议把输出重定向到工单附件目录，路径按现场规范选择
+mkdir -p /tmp/cgls-evidence
+date -Is | tee /tmp/cgls-evidence/time.txt
+hostname -f | tee /tmp/cgls-evidence/host.txt
+
+sudo systemd-cgls --full --no-pager &gt; /tmp/cgls-evidence/systemd-cgls.full.txt
+ps -eo pid,ppid,user,stat,etime,pcpu,pmem,cmd &gt; /tmp/cgls-evidence/ps.txt
+nvidia-smi &gt; /tmp/cgls-evidence/nvidia-smi.txt 2&gt;&amp;1
+
+# 针对目标 PID
+PID=31772
+cat "/proc/$PID/cgroup" &gt; "/tmp/cgls-evidence/$PID.cgroup.txt"
+cat "/proc/$PID/status" &gt; "/tmp/cgls-evidence/$PID.status.txt"</code></pre>
+<div class="danger"><strong>处置红线：</strong> 未确认 owner、平台对象和影响面前，不要直接执行 <code>kill -9</code>、<code>systemctl stop</code>、<code>kubectl delete pod</code> 或清理容器 runtime 目录。尤其不要删除 <code>/sys/fs/cgroup</code> 下文件来“清理”进程。</div>
+<h3>何时升级</h3>
+<ul>
+<li>同一 cgroup 下有在线推理服务和训练进程混跑，资源隔离边界不清楚。</li>
+<li><code>memory.events</code>、内核日志、容器状态三者互相矛盾。</li>
+<li>PID 属于 kubelet/containerd/dockerd 等关键服务本身，而不是普通工作负载。</li>
+<li>怀疑 runtime 泄漏、shim 残留、pod 已删除但 cgroup 未回收。</li>
+</ul>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 命令速查与练习</h2>
+<h3>常用命令速查</h3>
+<table>
+<tr><th>目标</th><th>命令</th></tr>
+<tr><td>查看完整 cgroup 树</td><td><code>sudo systemd-cgls --full --no-pager</code></td></tr>
+<tr><td>包含空 cgroup</td><td><code>sudo systemd-cgls --all --full --no-pager</code></td></tr>
+<tr><td>查看 kubelet unit</td><td><code>sudo systemd-cgls --unit kubelet.service --full --no-pager</code></td></tr>
+<tr><td>查看 containerd unit</td><td><code>sudo systemd-cgls --unit containerd.service --full --no-pager</code></td></tr>
+<tr><td>查看用户 unit</td><td><code>systemd-cgls --user-unit my-training.scope --full --no-pager</code></td></tr>
+<tr><td>从 PID 反查 cgroup</td><td><code>cat /proc/PID/cgroup</code></td></tr>
+<tr><td>读取 v2 CPU quota</td><td><code>cat /sys/fs/cgroup/.../cpu.max</code></td></tr>
+<tr><td>读取 v2 OOM 事件</td><td><code>cat /sys/fs/cgroup/.../memory.events</code></td></tr>
+</table>
+<h3>练习任务</h3>
+<ol>
+<li>在一台测试 Linux 机器上运行 <code>systemd-cgls --full --no-pager</code>，找出 <code>system.slice</code>、<code>user.slice</code> 和你的登录 <code>session-*.scope</code>。</li>
+<li>启动一个普通 <code>sleep 600</code>，用 <code>ps</code> 找 PID，再用 <code>/proc/PID/cgroup</code> 和 <code>systemd-cgls</code> 定位它在哪个 scope。</li>
+<li>如果有容器环境，启动一个测试容器，比较 <code>docker inspect</code>/<code>crictl inspect</code> 的 PID 与宿主机 <code>systemd-cgls</code> 输出。</li>
+<li>在 cgroup v2 节点上读取 <code>cpu.max</code>、<code>memory.max</code>、<code>memory.events</code>，理解无限制和有限制的表示方式。</li>
+<li>比较 <code>systemd-cgls</code> 和 <code>systemd-cgtop</code> 对同一训练或测试进程给出的不同信息。</li>
+</ol>
+<pre><code># 安全练习：只启动 sleep，不占用 GPU
+sleep 600 &amp;
+PID=$!
+echo "PID=$PID"
+ps -o pid,ppid,user,stat,etime,cmd -p "$PID"
+cat "/proc/$PID/cgroup"
+systemd-cgls --full --no-pager | grep -C 5 "$PID"
+kill "$PID"</code></pre>
+<div class="note"><strong>练习说明：</strong> 最后一行 <code>kill "$PID"</code> 只清理你刚刚创建的 <code>sleep</code> 练习进程；在真实训练排障中不要套用到未知 PID。</div>
+</section>
+
+<section class="refbox" id="refs">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li><a href="https://www.freedesktop.org/software/systemd/man/systemd-cgls.html">systemd-cgls upstream manual</a>：命令语法、默认行为、选项和退出状态。</li>
+<li><a href="https://man.archlinux.org/man/systemd-cgls.1.en">Arch Linux systemd-cgls(1)</a>：当前发行版 man page 镜像，便于查看新选项和版本说明。</li>
+<li><a href="https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html">systemd.resource-control</a>：systemd unit 资源控制属性，如 CPU、Memory、Tasks、IO。</li>
+<li><a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7)</a>：Linux cgroup 基础概念、v1/v2 层级和 controller 行为。</li>
+<li><a href="https://kubernetes.io/docs/concepts/architecture/cgroups/">Kubernetes cgroups documentation</a>：Kubernetes 与 Linux cgroup 的关系、cgroup driver 背景。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 <code>systemd-cgls</code> 的树状模型，再学 systemd unit/slice/scope，最后补齐 cgroup v2 文件语义和 Kubernetes runtime 映射。</p>
+</section>
+<div class="footer">systemd-cgls 深度教程 · AI Infra 视角 · cgroup 树、训练进程定位、Kubernetes/containerd、资源隔离与生产排障</div>
+</div>
+</body>
+</html>

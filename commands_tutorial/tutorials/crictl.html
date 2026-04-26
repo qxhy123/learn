@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>crictl 深度教程：AI Infra 场景下的 CRI 与 Kubernetes 节点调试</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:#eef2ff;color:#3730a3}.ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>crictl 深度教程：AI Infra 场景下的 CRI 与 Kubernetes 节点调试</h1>
+<p class="sub">这份教程面向 AI Infra、Kubernetes 平台和 GPU 集群运维场景，系统讲清楚 <code>crictl</code> 如何直接连接节点上的 CRI 运行时，查看 Pod sandbox、容器、镜像、日志、exec、inspect、stats、runtime 配置和 GPU 运行时线索。它不是替代 <code>kubectl</code> 的通用管理工具，而是在 API Server 不可用、kubelet 异常、GPU Pod 启动失败、镜像拉取慢、containerd/CRI-O 需要现场排障时，绕过控制面直接读节点事实的工具。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">Kubernetes Node</span><span class="chip">CRI</span><span class="chip">containerd</span><span class="chip">CRI-O</span><span class="chip">GPU Pod</span><span class="chip">日志与 exec</span><span class="chip">inspect</span><span class="chip">安全清理</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>crictl</code> 是 CRI 客户端。它不通过 Kubernetes API Server，而是连接本机 containerd、CRI-O 或其他 CRI endpoint，查看 kubelet 交给运行时之后的真实 Pod/容器/镜像状态。</div>
+<div class="success"><strong>生产原则：</strong> 先用 <code>crictl ps -a</code>、<code>crictl pods</code>、<code>crictl inspect*</code> 和日志确认事实；删除容器、Pod sandbox 或镜像前必须先列出目标并确认归属，优先让 kubelet/controller 自愈，不要把 <code>crictl rm</code>/<code>rmp</code>/<code>rmi</code> 当成常规发布手段。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">crictl 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：kubectl、kubelet、CRI 与运行时</a></li>
+<li><a class="anchor" href="#s3">安装、版本与兼容性</a></li>
+<li><a class="anchor" href="#s4">连接 containerd 与 CRI-O endpoint</a></li>
+<li><a class="anchor" href="#s5">基础命令速览</a></li>
+<li><a class="anchor" href="#s6">Pod sandbox 调试</a></li>
+<li><a class="anchor" href="#s7">容器列表、状态与退出码</a></li>
+<li><a class="anchor" href="#s8">日志、exec 与现场确认</a></li>
+<li><a class="anchor" href="#s9">inspect 与字段定位</a></li>
+<li><a class="anchor" href="#s10">镜像与拉取排障</a></li>
+<li><a class="anchor" href="#s11">Kubernetes 节点故障工作流</a></li>
+<li><a class="anchor" href="#s12">GPU Pod 与 AI 训练任务线索</a></li>
+<li><a class="anchor" href="#s13">stats、info 与运行时健康</a></li>
+<li><a class="anchor" href="#s14">crictl vs kubectl/nerdctl/docker</a></li>
+<li><a class="anchor" href="#s15">安全清理与回收空间</a></li>
+<li><a class="anchor" href="#s16">常见错误与排障树</a></li>
+<li><a class="anchor" href="#s17">AI Infra 实战剧本</a></li>
+<li><a class="anchor" href="#s18">命令清单与练习路线</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. crictl 是什么</h2>
+<p><code>crictl</code> 是 Kubernetes SIG Node 维护的 CRI 工具，面向实现了 Container Runtime Interface 的运行时。Kubernetes 节点上的 kubelet 通过 CRI 调用运行时创建 Pod sandbox、容器和镜像；<code>crictl</code> 使用同一类接口读取或操作这些对象。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>在节点本地查看 Pod sandbox、容器、镜像、日志、inspect、stats 和 runtime info，尤其适合控制面不可用时排障。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不负责 Deployment/Job/Service 等 Kubernetes API 资源编排，也不理解调度、控制器期望状态和 RBAC 审计上下文。</div>
+<div class="card"><strong>它的定位</strong><br>节点现场工具。它看的是运行时事实，不是 Kubernetes API Server 里的期望状态。</div>
+</div>
+<pre><code># 查看节点上 CRI 运行时看到的容器
+sudo crictl ps -a
+
+# 查看 Pod sandbox，通常能看到 Kubernetes Pod 名称、namespace、attempt
+sudo crictl pods
+
+# 查看容器日志，不需要 kubectl 连接 API Server
+sudo crictl logs &lt;container-id&gt;
+
+# 查看容器详细配置、状态、挂载、环境变量、标签
+sudo crictl inspect &lt;container-id&gt;</code></pre>
+<div class="warn"><strong>权限提醒：</strong> CRI socket 通常属于 root 或特定运行时用户组。生产节点上使用 <code>sudo</code> 等同于本机高权限操作，应遵守变更窗口和审计要求。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 整体模型：kubectl、kubelet、CRI 与运行时</h2>
+<p>调试 Kubernetes Pod 时，最容易混淆的是“API 里显示什么”和“节点运行时实际做了什么”。<code>kubectl</code> 主要看 API Server；<code>crictl</code> 直接看节点 runtime。两者经常互补，而不是互相替代。</p>
+<div class="figure">
+<h3>信息图：crictl 位于 Kubernetes 控制面之外</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="crictl 与 Kubernetes CRI 整体模型">
+<rect x="18" y="18" width="1064" height="614" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="60" y="70" width="245" height="115" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="182" y="116" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">kubectl</text><text x="182" y="148" text-anchor="middle" font-size="15">访问 API Server</text><text x="182" y="171" text-anchor="middle" font-size="15">看期望状态和事件</text>
+<rect x="425" y="70" width="245" height="115" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="548" y="116" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">kubelet</text><text x="548" y="148" text-anchor="middle" font-size="15">节点代理</text><text x="548" y="171" text-anchor="middle" font-size="15">调用 CRI 管理容器</text>
+<rect x="795" y="70" width="245" height="115" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="918" y="116" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">运行时</text><text x="918" y="148" text-anchor="middle" font-size="15">containerd / CRI-O</text><text x="918" y="171" text-anchor="middle" font-size="15">Pod sandbox / container</text>
+<rect x="310" y="310" width="480" height="135" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="356" text-anchor="middle" font-size="27" font-weight="700" fill="#c2410c">crictl</text><text x="550" y="392" text-anchor="middle" font-size="16">直接连接本机 CRI socket</text><text x="550" y="420" text-anchor="middle" font-size="16">绕过 API Server，读取运行时事实</text>
+<rect x="185" y="520" width="730" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="556" text-anchor="middle" font-size="17">AI Infra 排障常见路径：kubectl 看调度/事件，crictl 看节点实际容器、日志、镜像和 GPU runtime 线索</text>
+<line x1="305" y1="128" x2="425" y2="128" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/><line x1="670" y1="128" x2="795" y2="128" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/><path d="M550 310 C590 245, 760 215, 870 185" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/><path d="M550 310 C515 245, 515 210, 535 185" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<defs><marker id="m1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">当 API Server、kubectl 或控制器路径不可用时，crictl 仍可在节点本机读取 runtime 状态。</div>
+</div>
+<table>
+<tr><th>层级</th><th>主要工具</th><th>你能确认什么</th></tr>
+<tr><td>Kubernetes API</td><td><code>kubectl</code></td><td>Pod 期望状态、调度结果、事件、控制器、Service、Secret、ConfigMap 等。</td></tr>
+<tr><td>kubelet</td><td><code>journalctl -u kubelet</code></td><td>节点代理是否能注册、拉镜像、创建 sandbox、调用 CNI/CSI/Device Plugin。</td></tr>
+<tr><td>CRI 运行时</td><td><code>crictl</code></td><td>runtime 实际创建了哪些 sandbox/container，容器退出码、日志、镜像和资源统计。</td></tr>
+<tr><td>底层系统</td><td><code>systemctl</code>、<code>journalctl</code>、<code>nvidia-smi</code></td><td>containerd/CRI-O、CNI、GPU 驱动、内核、磁盘、网络是否正常。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、版本与兼容性</h2>
+<p>生产环境中建议让 <code>cri-tools</code> 与 Kubernetes 小版本保持一致或接近。CRI 会随 Kubernetes 演进，版本差距过大可能导致新字段、新命令或行为不完全匹配。</p>
+<pre><code># 查看 crictl 版本
+crictl --version
+
+# 查看运行时版本和 CRI 服务响应
+sudo crictl version
+
+# 查看帮助和子命令
+crictl --help
+crictl ps --help</code></pre>
+<table>
+<tr><th>检查项</th><th>命令</th><th>判断</th></tr>
+<tr><td>二进制存在</td><td><code>command -v crictl</code></td><td>没有输出说明未安装或 PATH 不包含。</td></tr>
+<tr><td>版本匹配</td><td><code>crictl --version</code></td><td>优先与节点 Kubernetes 小版本一致。</td></tr>
+<tr><td>能连 runtime</td><td><code>sudo crictl info</code></td><td>能返回 runtime 配置和状态，说明 endpoint 可用。</td></tr>
+<tr><td>权限正常</td><td><code>sudo crictl ps</code></td><td>普通用户失败但 sudo 成功，通常是 socket 权限问题。</td></tr>
+</table>
+<div class="note"><strong>版本心智模型：</strong> <code>crictl</code> 是客户端，containerd/CRI-O 是服务端，kubelet 也是客户端。排障时同时记录三者版本，避免把协议不匹配误判成业务故障。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 连接 containerd 与 CRI-O endpoint</h2>
+<p><code>crictl</code> 必须知道 runtime endpoint 和 image endpoint。常见配置文件是 <code>/etc/crictl.yaml</code>，也可以使用环境变量或命令行参数。AI 集群节点大多使用 containerd，也可能使用 CRI-O 或 cri-dockerd。</p>
+<div class="figure">
+<h3>信息图：endpoint 选择路径</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="crictl endpoint 选择路径">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="55" width="280" height="70" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="98" text-anchor="middle" font-size="22" font-weight="700">crictl 命令</text>
+<polygon points="550,165 740,250 550,335 360,250" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="242" text-anchor="middle" font-size="17" font-weight="700">endpoint 从哪里来？</text><text x="550" y="267" text-anchor="middle" font-size="14">参数 / 环境变量 / 配置文件</text>
+<rect x="70" y="405" width="250" height="94" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="195" y="442" text-anchor="middle" font-size="18" font-weight="700">命令行参数</text><text x="195" y="470" text-anchor="middle" font-size="13">--runtime-endpoint</text><text x="195" y="491" text-anchor="middle" font-size="13">--image-endpoint</text>
+<rect x="425" y="405" width="250" height="94" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="442" text-anchor="middle" font-size="18" font-weight="700">环境变量</text><text x="550" y="470" text-anchor="middle" font-size="13">CONTAINER_RUNTIME_ENDPOINT</text><text x="550" y="491" text-anchor="middle" font-size="13">IMAGE_SERVICE_ENDPOINT</text>
+<rect x="780" y="405" width="250" height="94" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="905" y="442" text-anchor="middle" font-size="18" font-weight="700">配置文件</text><text x="905" y="470" text-anchor="middle" font-size="13">/etc/crictl.yaml</text><text x="905" y="491" text-anchor="middle" font-size="13">--config=PATH</text>
+<rect x="210" y="560" width="680" height="48" rx="12" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="590" text-anchor="middle" font-size="16">推荐生产节点写 /etc/crictl.yaml，临时排障再用参数覆盖</text>
+<line x1="550" y1="125" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="360" y1="250" x2="195" y2="405" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="550" y1="335" x2="550" y2="405" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="740" y1="250" x2="905" y2="405" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/>
+<defs><marker id="e1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">endpoint 配错时，crictl 的错误通常是连接失败、超时或看不到预期容器。</div>
+</div>
+<h3>containerd 常见配置</h3>
+<pre><code># /etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+debug: false</code></pre>
+<h3>CRI-O 常见配置</h3>
+<pre><code># /etc/crictl.yaml
+runtime-endpoint: unix:///run/crio/crio.sock
+image-endpoint: unix:///run/crio/crio.sock
+timeout: 10
+debug: false</code></pre>
+<h3>临时指定 endpoint</h3>
+<pre><code># containerd
+sudo crictl \
+  --runtime-endpoint unix:///run/containerd/containerd.sock \
+  --image-endpoint unix:///run/containerd/containerd.sock \
+  ps -a
+
+# CRI-O
+sudo crictl \
+  --runtime-endpoint unix:///run/crio/crio.sock \
+  --image-endpoint unix:///run/crio/crio.sock \
+  pods</code></pre>
+<table>
+<tr><th>运行时</th><th>常见 socket</th><th>确认方式</th></tr>
+<tr><td>containerd</td><td><code>unix:///run/containerd/containerd.sock</code></td><td><code>systemctl status containerd</code>、<code>ls -l /run/containerd/containerd.sock</code></td></tr>
+<tr><td>CRI-O</td><td><code>unix:///run/crio/crio.sock</code></td><td><code>systemctl status crio</code>、<code>ls -l /run/crio/crio.sock</code></td></tr>
+<tr><td>cri-dockerd</td><td><code>unix:///var/run/cri-dockerd.sock</code></td><td>旧 Docker 兼容路径，现代 Kubernetes 集群较少见。</td></tr>
+</table>
+<div class="danger"><strong>不要盲扫 endpoint：</strong> 连接到错误 socket 可能看到空结果或旧运行时对象。先从 kubelet 参数 <code>--container-runtime-endpoint</code>、systemd unit 或节点基线配置确认。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 基础命令速览</h2>
+<p>先建立对象关系：Pod sandbox 是 Pod 的运行时外壳，容器运行在 sandbox 里，镜像由 image service 管理。大多数排障从 <code>pods</code> 和 <code>ps -a</code> 开始。</p>
+<table>
+<tr><th>目标</th><th>常用命令</th><th>用途</th></tr>
+<tr><td>运行时健康</td><td><code>crictl info</code>、<code>crictl version</code></td><td>确认 CRI 服务可用、版本和 runtime 配置。</td></tr>
+<tr><td>Pod sandbox</td><td><code>crictl pods</code>、<code>crictl inspectp</code></td><td>定位 Kubernetes Pod 对应的 sandbox。</td></tr>
+<tr><td>容器</td><td><code>crictl ps -a</code>、<code>crictl inspect</code></td><td>查看容器状态、退出码、镜像、标签、挂载。</td></tr>
+<tr><td>日志和交互</td><td><code>crictl logs</code>、<code>crictl exec</code></td><td>控制面异常时直接读取容器日志或进入容器。</td></tr>
+<tr><td>镜像</td><td><code>crictl images</code>、<code>crictl pull</code>、<code>crictl rmi</code></td><td>排查镜像缓存、拉取失败、磁盘占用。</td></tr>
+<tr><td>统计</td><td><code>crictl stats</code>、<code>crictl statsp</code></td><td>查看容器和 Pod sandbox 的 CPU、内存、文件系统指标。</td></tr>
+</table>
+<pre><code># 排障起手式：确认 endpoint、Pod、容器、最近失败容器
+sudo crictl info
+sudo crictl pods
+sudo crictl ps -a
+
+# 只看非 running 的容器，快速找 CrashLoop / Exited
+sudo crictl ps -a | grep -v Running
+
+# 查看某个容器的日志和 inspect
+sudo crictl logs &lt;container-id&gt; | tail -100
+sudo crictl inspect &lt;container-id&gt;</code></pre>
+<div class="note"><strong>ID 使用习惯：</strong> <code>crictl</code> 多数命令支持短 ID，但事故排查记录建议保留完整 ID、节点名、时间和 endpoint。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Pod sandbox 调试</h2>
+<p>CRI 里 Pod 通常先表现为 sandbox。网络命名空间、Pod IP、labels、annotations、attempt 等信息常能从 <code>inspectp</code> 看到。GPU 训练任务排障时，sandbox 能帮你确认 Pod 是否已经在目标节点创建，还是停留在调度/API 层。</p>
+<pre><code># 列出所有 Pod sandbox
+sudo crictl pods
+
+# 按名称或 namespace 粗筛
+sudo crictl pods | grep training
+sudo crictl pods | grep kube-system
+
+# 查看 sandbox 详情
+sudo crictl inspectp &lt;pod-sandbox-id&gt;
+
+# 查看 Pod sandbox 统计
+sudo crictl statsp &lt;pod-sandbox-id&gt;</code></pre>
+<table>
+<tr><th>字段或现象</th><th>排障意义</th></tr>
+<tr><td><code>metadata.name</code> / <code>namespace</code></td><td>确认对应 Kubernetes Pod，而不是同名旧对象。</td></tr>
+<tr><td><code>state</code></td><td>确认 sandbox 是否 Ready。sandbox 不 Ready 时容器通常无法正常创建。</td></tr>
+<tr><td><code>attempt</code></td><td>重建次数。频繁增加可能对应网络、镜像、runtime 或 kubelet 重试。</td></tr>
+<tr><td><code>labels</code> / <code>annotations</code></td><td>可映射 Kubernetes UID、容器名、runtime handler、sandbox 配置。</td></tr>
+<tr><td>Pod IP</td><td>判断 CNI 是否成功分配网络，以及日志服务或训练通信是否有地址。</td></tr>
+</table>
+<div class="warn"><strong>sandbox 删除风险：</strong> <code>crictl rmp</code> 会移除 Pod sandbox。除非确认它已停止、孤儿化或 kubelet 无法清理，否则应优先让 kubelet 自己回收。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 容器列表、状态与退出码</h2>
+<p><code>crictl ps</code> 默认只显示运行中容器；排障必须加 <code>-a</code>，否则会漏掉刚退出的 init 容器、失败任务容器和 CrashLoop 中间态。</p>
+<pre><code># 运行中容器
+sudo crictl ps
+
+# 所有容器，包括 Exited 和 Unknown
+sudo crictl ps -a
+
+# 根据 Pod sandbox 查询容器
+sudo crictl ps -a --pod &lt;pod-sandbox-id&gt;
+
+# 根据名称粗筛 AI 任务容器
+sudo crictl ps -a | grep -E 'train|worker|launcher|nccl'</code></pre>
+<table>
+<tr><th>状态</th><th>常见含义</th><th>下一步</th></tr>
+<tr><td>Running</td><td>容器进程仍在运行。</td><td>看 <code>logs</code>、<code>exec</code>、<code>stats</code> 和 GPU 使用情况。</td></tr>
+<tr><td>Exited</td><td>进程已退出，可能成功也可能失败。</td><td>看 <code>inspect</code> 里的 exitCode、reason、finishedAt，再看日志。</td></tr>
+<tr><td>Created</td><td>已创建但未运行，可能等待 runtime 启动或 kubelet 动作。</td><td>看 kubelet/containerd 日志和 inspect。</td></tr>
+<tr><td>Unknown</td><td>runtime 状态异常或查询失败。</td><td>检查 runtime 服务、节点压力、shim 进程和系统日志。</td></tr>
+</table>
+<pre><code># 从 inspect 中定位退出信息，适合没有 jq 的节点
+sudo crictl inspect &lt;container-id&gt; | grep -E 'exitCode|reason|message|startedAt|finishedAt' -A2 -B2
+
+# 保存现场，便于事故复盘
+sudo crictl inspect &lt;container-id&gt; &gt; /tmp/crictl-inspect-&lt;container-id&gt;.json
+sudo crictl logs &lt;container-id&gt; &gt; /tmp/crictl-logs-&lt;container-id&gt;.log</code></pre>
+<div class="note"><strong>AI 训练任务提示：</strong> 多 worker 任务里，launcher 退出和 worker 退出含义不同。先用 Pod sandbox 或容器名确认你看的容器角色。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 日志、exec 与现场确认</h2>
+<p>当 <code>kubectl logs</code> 因 API Server、kubelet 代理或网络问题不可用时，<code>crictl logs</code> 常能直接读取节点本地日志。<code>crictl exec</code> 则适合确认容器内环境变量、挂载、GPU 设备文件和训练进程。</p>
+<pre><code># 查看最后 200 行日志
+sudo crictl logs --tail=200 &lt;container-id&gt;
+
+# 跟随日志
+sudo crictl logs -f &lt;container-id&gt;
+
+# 带时间戳查看
+sudo crictl logs --timestamps &lt;container-id&gt;
+
+# 进入容器执行命令
+sudo crictl exec -it &lt;container-id&gt; /bin/sh</code></pre>
+<h3>AI Infra 现场检查</h3>
+<pre><code># 容器内确认 GPU 设备和环境变量
+sudo crictl exec -it &lt;container-id&gt; /bin/sh -c 'ls -l /dev/nvidia* 2&gt;/dev/null; env | grep -E "CUDA|NVIDIA|ROCR|HSA|GPU"'
+
+# 容器内确认训练进程
+sudo crictl exec -it &lt;container-id&gt; /bin/sh -c 'ps -ef | grep -E "python|torchrun|deepspeed|mpirun|ray" | grep -v grep'
+
+# 容器内确认共享内存大小，NCCL/数据加载常受影响
+sudo crictl exec -it &lt;container-id&gt; /bin/sh -c 'df -h /dev/shm; mount | grep shm'</code></pre>
+<div class="danger"><strong>exec 边界：</strong> <code>crictl exec</code> 是节点高权限调试入口。不要在生产训练容器内修改模型文件、依赖或运行时配置，除非这是明确批准的临时处置。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. inspect 与字段定位</h2>
+<p><code>inspect</code>、<code>inspectp</code> 和 <code>inspecti</code> 输出 JSON。它们能回答很多 <code>ps</code> 看不到的问题：容器是哪个 Pod 创建的、使用什么镜像、挂载了哪些路径、环境变量是什么、runtime handler 是什么、退出码和失败消息是什么。</p>
+<table>
+<tr><th>命令</th><th>对象</th><th>常查内容</th></tr>
+<tr><td><code>crictl inspect CONTAINER</code></td><td>容器</td><td>状态、exitCode、env、mounts、labels、annotations、image、pid。</td></tr>
+<tr><td><code>crictl inspectp POD</code></td><td>Pod sandbox</td><td>Pod metadata、namespace、network、labels、attempt、sandbox 状态。</td></tr>
+<tr><td><code>crictl inspecti IMAGE</code></td><td>镜像</td><td>镜像 ID、repoTags、repoDigests、size、image spec。</td></tr>
+</table>
+<pre><code># 没有 jq 时，用 grep 定位关键字段
+sudo crictl inspect &lt;container-id&gt; | grep -E 'name|image|state|exitCode|reason|message|runtime|mounts|env' -A3 -B2
+
+# 如果节点有 jq，可以更精确地取字段
+sudo crictl inspect &lt;container-id&gt; | jq '.status'
+sudo crictl inspectp &lt;pod-id&gt; | jq '.status.metadata, .status.network'
+
+# 查看容器标签，映射回 Kubernetes Pod
+sudo crictl inspect &lt;container-id&gt; | grep -E 'io.kubernetes.pod.name|io.kubernetes.pod.namespace|io.kubernetes.container.name' -A1</code></pre>
+<div class="success"><strong>复盘建议：</strong> 事故现场先保存 inspect 原始 JSON，不要只贴终端截图。JSON 能保留时间戳、exitCode、labels、annotations 和 runtime 字段。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 镜像与拉取排障</h2>
+<p>AI 镜像通常体积大、层数多、依赖私有 registry、跨地域镜像缓存和凭证。<code>crictl images</code> 与 <code>pull</code> 能帮助确认“节点 runtime 能否拉到镜像”，这比只看 Pod 事件更接近真实问题。</p>
+<pre><code># 列出镜像缓存
+sudo crictl images
+
+# 按仓库名筛选
+sudo crictl images | grep -E 'cuda|pytorch|training|registry.example.com'
+
+# 手动拉取镜像，复现 ImagePullBackOff
+sudo crictl pull registry.example.com/ai/pytorch:cuda12.4
+
+# 查看镜像详情
+sudo crictl inspecti registry.example.com/ai/pytorch:cuda12.4</code></pre>
+<table>
+<tr><th>现象</th><th>常见原因</th><th>crictl 侧检查</th></tr>
+<tr><td>拉取超时</td><td>registry 网络、代理、DNS、跨地域带宽。</td><td><code>crictl pull</code> 复现，配合 <code>journalctl -u containerd</code>。</td></tr>
+<tr><td>认证失败</td><td>imagePullSecret、credential provider、节点凭证配置错误。</td><td><code>pull</code> 错误消息和 kubelet 日志一起看。</td></tr>
+<tr><td>磁盘不足</td><td>镜像层和容器 writable layer 占满。</td><td><code>crictl images</code>、<code>crictl stats</code>、节点磁盘工具。</td></tr>
+<tr><td>架构不匹配</td><td>arm64/amd64 镜像或 manifest 配置错误。</td><td><code>inspecti</code> 查看镜像 spec，结合节点架构。</td></tr>
+</table>
+<div class="warn"><strong>清理提醒：</strong> 大镜像不能随手删。先确认没有运行中容器使用，再删除未使用或过期镜像；否则 kubelet 可能立即重新拉取，造成更大网络压力。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. Kubernetes 节点故障工作流</h2>
+<p>节点故障时，按层次排查能避免误判：先确认 kubelet 和 runtime 服务，再确认 CRI endpoint，再看 sandbox、容器、日志、镜像和系统资源。</p>
+<div class="figure">
+<h3>流程图：节点现场排障路径</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="crictl Kubernetes 节点排障工作流">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">Pod 异常或节点异常</text>
+<rect x="80" y="165" width="230" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="195" y="199" text-anchor="middle" font-size="18" font-weight="700">1. 控制面视角</text><text x="195" y="225" text-anchor="middle" font-size="14">kubectl describe/events</text>
+<rect x="435" y="165" width="230" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="199" text-anchor="middle" font-size="18" font-weight="700">2. 节点服务</text><text x="550" y="225" text-anchor="middle" font-size="14">kubelet / runtime</text>
+<rect x="790" y="165" width="230" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="905" y="199" text-anchor="middle" font-size="18" font-weight="700">3. CRI endpoint</text><text x="905" y="225" text-anchor="middle" font-size="14">crictl info/version</text>
+<rect x="120" y="350" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="235" y="384" text-anchor="middle" font-size="18" font-weight="700">4. Pod sandbox</text><text x="235" y="410" text-anchor="middle" font-size="14">crictl pods/inspectp</text>
+<rect x="435" y="350" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="384" text-anchor="middle" font-size="18" font-weight="700">5. 容器状态</text><text x="550" y="410" text-anchor="middle" font-size="14">crictl ps -a/inspect</text>
+<rect x="750" y="350" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="865" y="384" text-anchor="middle" font-size="18" font-weight="700">6. 日志与镜像</text><text x="865" y="410" text-anchor="middle" font-size="14">logs/pull/images</text>
+<rect x="290" y="555" width="520" height="78" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="589" text-anchor="middle" font-size="20" font-weight="700">最后再考虑清理、重启或驱逐</text><text x="550" y="615" text-anchor="middle" font-size="14">先保存现场，避免把根因一起删除</text>
+<line x1="550" y1="111" x2="195" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="550" y1="111" x2="550" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="550" y1="111" x2="905" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="195" y1="247" x2="235" y2="350" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="550" y1="247" x2="550" y2="350" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="905" y1="247" x2="865" y2="350" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="235" y1="432" x2="420" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="550" y1="432" x2="550" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/><line x1="865" y1="432" x2="680" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#w1)"/>
+<defs><marker id="w1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">排障顺序越稳定，越不容易在高压现场执行危险操作。</div>
+</div>
+<pre><code># 1. 节点上确认服务
+systemctl status kubelet --no-pager
+systemctl status containerd --no-pager   # 或 systemctl status crio
+
+# 2. 看 kubelet 和 runtime 日志
+journalctl -u kubelet -n 200 --no-pager
+journalctl -u containerd -n 200 --no-pager
+
+# 3. 确认 CRI 可用
+sudo crictl info
+sudo crictl version
+
+# 4. 查 Pod 和容器
+sudo crictl pods
+sudo crictl ps -a
+sudo crictl logs --tail=200 &lt;container-id&gt;</code></pre>
+<div class="note"><strong>控制面不可用时：</strong> 如果 <code>kubectl</code> 完全不可用，<code>crictl</code> 仍可以帮助确认关键组件容器，例如 kube-apiserver、etcd、coredns、device-plugin 是否在节点上运行。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. GPU Pod 与 AI 训练任务线索</h2>
+<p><code>crictl</code> 不能替代 <code>nvidia-smi</code>、<code>dcgmi</code>、<code>rocm-smi</code> 或 device plugin 日志，但它能确认 GPU 容器在 CRI 层是否拿到了正确的环境、挂载、runtime handler 和启动错误信息。</p>
+<div class="grid-2">
+<div class="card"><strong>容器层线索</strong><br>看 <code>inspect</code> 中的 env、mounts、annotations、labels、logPath、pid、image 和 runtime 相关字段。</div>
+<div class="card"><strong>节点层线索</strong><br>结合 <code>nvidia-smi</code>、<code>ls -l /dev/nvidia*</code>、device plugin 日志、containerd/CRI-O 日志判断。</div>
+</div>
+<pre><code># 筛选 GPU 相关 Pod/容器
+sudo crictl pods | grep -E 'gpu|train|worker|llm|nccl'
+sudo crictl ps -a | grep -E 'gpu|train|worker|llm|nccl|device-plugin'
+
+# 查看 NVIDIA device plugin 日志
+sudo crictl ps -a | grep nvidia-device-plugin
+sudo crictl logs &lt;nvidia-device-plugin-container-id&gt; | tail -200
+
+# 查看容器内 GPU 可见性
+sudo crictl exec -it &lt;container-id&gt; /bin/sh -c 'ls -l /dev/nvidia* 2&gt;/dev/null; nvidia-smi 2&gt;/dev/null || true'
+
+# 查 runtime handler、NVIDIA 环境变量和设备挂载线索
+sudo crictl inspect &lt;container-id&gt; | grep -E 'runtime|NVIDIA|CUDA|ROCR|HSA|/dev/nvidia|/dev/dri|mounts' -A4 -B2</code></pre>
+<table>
+<tr><th>现象</th><th>可能位置</th><th>检查路径</th></tr>
+<tr><td>Pod Pending，节点没有容器</td><td>调度、配额、资源声明、taint/toleration。</td><td><code>kubectl describe pod</code>，<code>crictl pods</code> 看不到目标是正常的。</td></tr>
+<tr><td>容器创建失败</td><td>runtime handler、OCI hook、NVIDIA Container Toolkit、CDI 配置。</td><td><code>crictl inspect</code>、kubelet/containerd 日志、device plugin 日志。</td></tr>
+<tr><td>容器运行但无 GPU</td><td>设备文件、环境变量、MIG/CDI、驱动容器、权限。</td><td><code>crictl exec</code> 检查 <code>/dev/nvidia*</code> 和 <code>NVIDIA_VISIBLE_DEVICES</code>。</td></tr>
+<tr><td>NCCL 初始化失败</td><td>网络、IB/RDMA、共享内存、GPU 拓扑。</td><td>容器日志、<code>/dev/shm</code>、主机网络/RDMA/GPU 工具一起看。</td></tr>
+</table>
+<div class="warn"><strong>GPU 排障边界：</strong> <code>crictl</code> 只能说明 runtime 层给了什么，不保证驱动、CUDA、NCCL、RDMA 或训练框架可用。不要只凭 <code>crictl ps</code> 的 Running 判定训练健康。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. stats、info 与运行时健康</h2>
+<p><code>crictl stats</code> 能给出 CRI 视角的资源使用，但它不是完整性能分析工具。AI 任务排障时，应把它作为“容器是否明显耗尽资源”的快速信号，再结合 <code>nvidia-smi</code>、<code>pidstat</code>、<code>iostat</code>、<code>sar</code>、cgroup 和 runtime 日志。</p>
+<pre><code># 所有容器统计
+sudo crictl stats
+
+# 指定容器统计
+sudo crictl stats &lt;container-id&gt;
+
+# Pod sandbox 统计
+sudo crictl statsp &lt;pod-sandbox-id&gt;
+
+# runtime 配置和状态
+sudo crictl info</code></pre>
+<table>
+<tr><th>信号</th><th>解读</th><th>补充工具</th></tr>
+<tr><td>CPU 很高</td><td>训练进程、数据加载、压缩解压、日志输出可能占满 CPU。</td><td><code>pidstat</code>、<code>top</code>、<code>perf</code>。</td></tr>
+<tr><td>内存接近 limit</td><td>可能 OOMKilled 或进入内存压力。</td><td><code>crictl inspect</code>、<code>dmesg</code>、<code>journalctl -u kubelet</code>。</td></tr>
+<tr><td>文件系统占用增长</td><td>日志、checkpoint、缓存或容器 writable layer 膨胀。</td><td><code>du</code>、<code>iotop</code>、runtime 存储目录。</td></tr>
+<tr><td>runtime info 异常</td><td>runtime 配置、CNI、snapshotter 或 plugin 状态异常。</td><td>containerd/CRI-O 日志和配置文件。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s14">
+<h2>14. crictl vs kubectl/nerdctl/docker</h2>
+<p>这些工具常在同一节点出现，但服务对象不同。排障时先选对接口，否则会出现“kubectl 看不到但 crictl 看得到”或“nerdctl namespace 不对所以看不到容器”的混乱。</p>
+<div class="figure">
+<h3>对比图：选工具先选控制面</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="crictl kubectl nerdctl docker 工具对比图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="27" font-weight="700">同一节点上的四类视角</text>
+<rect x="70" y="135" width="225" height="310" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="183" y="182" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">kubectl</text><text x="183" y="225" text-anchor="middle" font-size="15">Kubernetes API</text><text x="183" y="258" text-anchor="middle" font-size="15">Deployment / Pod / Event</text><text x="183" y="310" text-anchor="middle" font-size="15">看期望状态</text><text x="183" y="340" text-anchor="middle" font-size="15">需要 API Server</text><text x="183" y="392" text-anchor="middle" font-size="14">适合：调度和控制器排障</text>
+<rect x="325" y="135" width="225" height="310" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="438" y="182" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">crictl</text><text x="438" y="225" text-anchor="middle" font-size="15">CRI API</text><text x="438" y="258" text-anchor="middle" font-size="15">Pod sandbox / container</text><text x="438" y="310" text-anchor="middle" font-size="15">看运行时事实</text><text x="438" y="340" text-anchor="middle" font-size="15">本机 socket</text><text x="438" y="392" text-anchor="middle" font-size="14">适合：节点现场排障</text>
+<rect x="580" y="135" width="225" height="310" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="693" y="182" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">nerdctl</text><text x="693" y="225" text-anchor="middle" font-size="15">containerd API</text><text x="693" y="258" text-anchor="middle" font-size="15">namespace / image / build</text><text x="693" y="310" text-anchor="middle" font-size="15">更像 Docker CLI</text><text x="693" y="340" text-anchor="middle" font-size="15">注意 k8s.io namespace</text><text x="693" y="392" text-anchor="middle" font-size="14">适合：containerd 交互</text>
+<rect x="835" y="135" width="225" height="310" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="948" y="182" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">docker</text><text x="948" y="225" text-anchor="middle" font-size="15">Docker Engine</text><text x="948" y="258" text-anchor="middle" font-size="15">Docker container/image</text><text x="948" y="310" text-anchor="middle" font-size="15">非现代 K8s 默认路径</text><text x="948" y="340" text-anchor="middle" font-size="15">dockershim 已移除</text><text x="948" y="392" text-anchor="middle" font-size="14">适合：Docker 主机</text>
+<rect x="220" y="515" width="660" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="551" text-anchor="middle" font-size="17">Kubernetes 节点容器排障优先 kubectl + crictl；不要默认用 docker ps 找 Pod</text>
+</svg>
+<div class="caption">工具不是越底层越好。先确定你要看 Kubernetes API、CRI、containerd 还是 Docker Engine。</div>
+</div>
+<table>
+<tr><th>工具</th><th>接口</th><th>优点</th><th>风险或限制</th></tr>
+<tr><td><code>kubectl</code></td><td>Kubernetes API</td><td>理解控制器、事件、调度、权限和资源对象。</td><td>依赖 API Server 和 kubelet 代理路径。</td></tr>
+<tr><td><code>crictl</code></td><td>CRI</td><td>直接看 kubelet 调用 runtime 后的事实。</td><td>缺少 Kubernetes 期望状态语义，误删风险高。</td></tr>
+<tr><td><code>nerdctl</code></td><td>containerd</td><td>适合 containerd namespace、镜像和类似 Docker 的操作。</td><td>Kubernetes 容器通常在 <code>k8s.io</code> namespace，直接操作需谨慎。</td></tr>
+<tr><td><code>docker</code></td><td>Docker Engine</td><td>适合 Docker 主机。</td><td>现代 Kubernetes 已不通过 dockershim 使用 Docker Engine 管理 Pod。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 安全清理与回收空间</h2>
+<p>空间告警时最危险的动作是直接删除容器、Pod sandbox 或镜像。正确流程是先确认对象状态、归属、是否由 kubelet 管理、是否仍被运行中容器引用，再执行最小范围清理。</p>
+<h3>只读确认</h3>
+<pre><code># 看磁盘压力和 runtime 缓存大致情况
+df -h
+sudo crictl images
+sudo crictl ps -a
+sudo crictl stats
+
+# 列出已退出容器，先人工确认
+sudo crictl ps -a | grep Exited
+
+# 列出可能很大的 AI 镜像
+sudo crictl images | grep -E 'cuda|pytorch|tensorflow|training|llm'</code></pre>
+<h3>谨慎清理容器</h3>
+<pre><code># 先列出候选容器，不删除
+sudo crictl ps -a | grep Exited
+
+# 对单个已退出容器，先保存日志和 inspect
+sudo crictl logs &lt;container-id&gt; &gt; /tmp/&lt;container-id&gt;.log 2&gt;&amp;1
+sudo crictl inspect &lt;container-id&gt; &gt; /tmp/&lt;container-id&gt;.inspect.json
+
+# 确认不再需要后，删除单个容器
+sudo crictl rm &lt;container-id&gt;</code></pre>
+<h3>谨慎清理镜像</h3>
+<pre><code># 先确认没有运行中容器使用目标镜像
+sudo crictl ps -a | grep 'registry.example.com/ai/pytorch:old'
+
+# 确认可删除后，再删除指定镜像
+sudo crictl rmi registry.example.com/ai/pytorch:old</code></pre>
+<div class="danger"><strong>危险命令边界：</strong> 不要在不了解节点状态时批量执行 <code>crictl rm</code>、<code>crictl rmp</code>、<code>crictl rmi --prune</code>。这些动作会改变 runtime 事实，可能触发 kubelet 重建、镜像重新拉取、训练任务中断或现场证据丢失。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常见错误与排障树</h2>
+<p><code>crictl</code> 报错通常集中在 endpoint、权限、runtime 服务、版本兼容、对象 ID 和镜像认证。先判断错误发生在“连接 CRI”还是“操作对象”。</p>
+<div class="figure">
+<h3>排障图：crictl 命令失败时怎么查</h3>
+<svg viewBox="0 0 1100 735" width="100%" role="img" aria-label="crictl 排障和安全流程图">
+<rect x="20" y="20" width="1060" height="695" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="45" width="260" height="66" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">crictl 失败</text>
+<rect x="70" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="180" y="200" text-anchor="middle" font-size="18" font-weight="700">连接失败</text><text x="180" y="226" text-anchor="middle" font-size="14">endpoint / socket</text>
+<rect x="315" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="200" text-anchor="middle" font-size="18" font-weight="700">权限失败</text><text x="425" y="226" text-anchor="middle" font-size="14">root / group / SELinux</text>
+<rect x="560" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="200" text-anchor="middle" font-size="18" font-weight="700">对象不存在</text><text x="670" y="226" text-anchor="middle" font-size="14">ID / namespace / 已回收</text>
+<rect x="805" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="915" y="200" text-anchor="middle" font-size="18" font-weight="700">操作失败</text><text x="915" y="226" text-anchor="middle" font-size="14">镜像 / runtime / CNI</text>
+<rect x="80" y="370" width="225" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="193" y="406" text-anchor="middle" font-size="18" font-weight="700">查 /etc/crictl.yaml</text><text x="193" y="432" text-anchor="middle" font-size="14">ls -l socket</text>
+<rect x="325" y="370" width="225" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="438" y="406" text-anchor="middle" font-size="18" font-weight="700">加 sudo 复测</text><text x="438" y="432" text-anchor="middle" font-size="14">检查 socket 权限</text>
+<rect x="570" y="370" width="225" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="683" y="406" text-anchor="middle" font-size="18" font-weight="700">重新 ps/pods</text><text x="683" y="432" text-anchor="middle" font-size="14">确认完整 ID</text>
+<rect x="815" y="370" width="225" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="928" y="406" text-anchor="middle" font-size="18" font-weight="700">看 runtime 日志</text><text x="928" y="432" text-anchor="middle" font-size="14">containerd / crio</text>
+<rect x="280" y="580" width="540" height="78" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="613" text-anchor="middle" font-size="20" font-weight="700">删除前必须先列出目标、保存现场、确认不影响运行中任务</text><text x="550" y="639" text-anchor="middle" font-size="14">排障命令优先只读；变更命令最小化执行</text>
+<line x1="550" y1="111" x2="180" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="550" y1="111" x2="425" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="550" y1="111" x2="670" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="550" y1="111" x2="915" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="180" y1="257" x2="193" y2="370" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="425" y1="257" x2="438" y2="370" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="670" y1="257" x2="683" y2="370" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="915" y1="257" x2="928" y2="370" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="193" y1="462" x2="390" y2="580" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="438" y1="462" x2="500" y2="580" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="683" y1="462" x2="600" y2="580" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/><line x1="928" y1="462" x2="710" y2="580" stroke="#94a3b8" stroke-width="3" marker-end="url(#t1)"/>
+<defs><marker id="t1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">crictl 排障先解决连接和权限，再看对象和运行时错误；不要用删除动作验证猜想。</div>
+</div>
+<table>
+<tr><th>错误/现象</th><th>可能原因</th><th>处理</th></tr>
+<tr><td><code>connection refused</code> 或 <code>deadline exceeded</code></td><td>runtime 未运行、endpoint 错误、socket 不存在、服务卡死。</td><td>检查 <code>/etc/crictl.yaml</code>、<code>systemctl status</code>、<code>ls -l</code> socket 和 runtime 日志。</td></tr>
+<tr><td><code>permission denied</code></td><td>当前用户无权访问 CRI socket。</td><td>使用 <code>sudo</code> 或按组织规范加入受控用户组。</td></tr>
+<tr><td><code>not found</code></td><td>ID 写错、对象已被 kubelet 回收、endpoint 指向另一运行时。</td><td>重新执行 <code>ps -a</code> 或 <code>pods</code> 获取当前 ID。</td></tr>
+<tr><td><code>ImagePull</code> 失败</td><td>认证、DNS、代理、registry、磁盘或架构问题。</td><td><code>crictl pull</code> 复现并结合 kubelet/runtime 日志。</td></tr>
+<tr><td>看不到 Pod</td><td>Pod 尚未调度到该节点、endpoint 错误或已被清理。</td><td>先用 <code>kubectl get pod -o wide</code> 确认节点；控制面不可用时查 kubelet 日志。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s17">
+<h2>17. AI Infra 实战剧本</h2>
+<h3>剧本 A：训练 Pod CrashLoopBackOff</h3>
+<pre><code># API 侧确认节点和事件
+kubectl get pod -n train -o wide | grep job-a
+kubectl describe pod -n train job-a-worker-0
+
+# 节点侧确认容器和日志
+sudo crictl pods | grep job-a
+sudo crictl ps -a | grep job-a
+sudo crictl logs --tail=300 &lt;container-id&gt;
+sudo crictl inspect &lt;container-id&gt; | grep -E 'exitCode|reason|message|OOM|finishedAt' -A3 -B2</code></pre>
+<h3>剧本 B：GPU Pod Running 但训练看不到 GPU</h3>
+<pre><code># 看 device plugin 是否健康
+sudo crictl ps -a | grep -E 'nvidia-device-plugin|amd-gpu|device-plugin'
+sudo crictl logs &lt;device-plugin-container-id&gt; | tail -200
+
+# 看业务容器的设备和环境
+sudo crictl exec -it &lt;container-id&gt; /bin/sh -c 'ls -l /dev/nvidia* 2&gt;/dev/null; env | grep -E "NVIDIA|CUDA"'
+sudo crictl inspect &lt;container-id&gt; | grep -E 'NVIDIA|CUDA|runtime|/dev/nvidia|mounts' -A4 -B2</code></pre>
+<h3>剧本 C：大镜像拉取慢或失败</h3>
+<pre><code># 节点上直接复现拉取
+time sudo crictl pull registry.example.com/ai/llm-train:cuda12.4
+
+# 看 runtime 日志中的 registry、认证、代理、解压错误
+journalctl -u containerd -n 300 --no-pager
+
+# 查看镜像是否已缓存
+sudo crictl images | grep 'llm-train'</code></pre>
+<h3>剧本 D：API Server 不可用但要确认控制面容器</h3>
+<pre><code># 控制平面节点上直接看静态 Pod 容器
+sudo crictl ps -a | grep -E 'kube-apiserver|etcd|kube-controller|kube-scheduler'
+sudo crictl logs --tail=200 &lt;kube-apiserver-container-id&gt;
+sudo crictl logs --tail=200 &lt;etcd-container-id&gt;</code></pre>
+<div class="success"><strong>记录模板：</strong> 每次现场排障至少记录节点名、时间、crictl 版本、endpoint、Pod UID/名称、container ID、exitCode、日志片段、inspect JSON 路径和你执行过的变更命令。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 命令清单与练习路线</h2>
+<h3>常用命令清单</h3>
+<table>
+<tr><th>类别</th><th>命令</th><th>说明</th></tr>
+<tr><td>健康</td><td><code>crictl info</code>、<code>crictl version</code></td><td>确认 CRI endpoint 和 runtime 状态。</td></tr>
+<tr><td>Pod</td><td><code>crictl pods</code>、<code>crictl inspectp</code>、<code>crictl statsp</code></td><td>查看 Pod sandbox、网络和统计。</td></tr>
+<tr><td>容器</td><td><code>crictl ps -a</code>、<code>crictl inspect</code>、<code>crictl stats</code></td><td>查看容器状态、资源和详细配置。</td></tr>
+<tr><td>交互</td><td><code>crictl logs</code>、<code>crictl exec</code>、<code>crictl attach</code></td><td>读取日志、进入容器、附加进程输出。</td></tr>
+<tr><td>镜像</td><td><code>crictl images</code>、<code>crictl pull</code>、<code>crictl inspecti</code>、<code>crictl rmi</code></td><td>排查镜像缓存和拉取。</td></tr>
+<tr><td>清理</td><td><code>crictl rm</code>、<code>crictl rmp</code></td><td>删除容器或 sandbox，必须谨慎。</td></tr>
+</table>
+<h3>练习路线</h3>
+<ol>
+<li>在测试节点上配置 <code>/etc/crictl.yaml</code>，分别用 <code>crictl info</code> 和 <code>crictl version</code> 验证 endpoint。</li>
+<li>创建一个测试 Pod，用 <code>kubectl get pod -o wide</code> 找到节点，再登录节点用 <code>crictl pods</code> 和 <code>ps -a</code> 映射它。</li>
+<li>让测试容器主动退出，观察 <code>crictl ps -a</code>、<code>logs</code> 和 <code>inspect</code> 中的退出码。</li>
+<li>拉取一个大镜像，比较 <code>kubectl describe pod</code> 事件和 <code>crictl pull</code> 的错误信息。</li>
+<li>在 GPU 测试 Pod 中用 <code>crictl exec</code> 查看 <code>/dev/nvidia*</code>、环境变量和 <code>nvidia-smi</code>。</li>
+<li>模拟磁盘压力时，只做只读确认，写出清理计划后再删除单个已退出容器。</li>
+</ol>
+<pre><code># 最小现场采集脚本片段，只读为主
+date
+hostname
+crictl --version
+sudo crictl info &gt; /tmp/crictl-info.json
+sudo crictl pods &gt; /tmp/crictl-pods.txt
+sudo crictl ps -a &gt; /tmp/crictl-ps-a.txt
+sudo crictl images &gt; /tmp/crictl-images.txt</code></pre>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Kubernetes 官方文档：<a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/">Debugging Kubernetes nodes with crictl</a>，介绍 crictl 用于节点调试、endpoint 配置和常用命令。</li>
+<li>Kubernetes SIGs cri-tools：<a href="https://github.com/kubernetes-sigs/cri-tools">kubernetes-sigs/cri-tools</a>，crictl 源码、发布和文档入口。</li>
+<li>cri-tools crictl 文档：<a href="https://github.com/kubernetes-sigs/cri-tools/blob/master/docs/crictl.md">docs/crictl.md</a>，命令、配置和使用示例。</li>
+<li>containerd 文档：<a href="https://containerd.io/docs/2.1/cri/crictl/">crictl with containerd</a>，containerd CRI endpoint 与 <code>/etc/crictl.yaml</code> 示例。</li>
+<li>Kubernetes CRI 概念：理解 kubelet 通过 CRI 与 containerd、CRI-O 等运行时交互的边界。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解 kubectl/kubelet/CRI/runtime 的分层，再掌握 endpoint 配置、<code>pods</code>/<code>ps</code>/<code>logs</code>/<code>inspect</code>，最后练习 GPU Pod、镜像拉取和安全清理的节点现场剧本。</p>
+</section>
+
+<div class="footer">crictl 深度教程 · AI Infra 节点调试 · CRI、containerd/CRI-O、GPU Pod、日志、inspect 与安全清理</div>
+</div>
+</body>
+</html>

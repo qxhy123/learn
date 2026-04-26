@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>kubectl 深度教程：面向 AI Infra 的集群操作、GPU 调度与训练任务排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>kubectl 深度教程：面向 AI Infra 的集群操作、GPU 调度与训练任务排障</h1>
+<p class="sub">这份教程按 AI Infra 日常值班和训练平台运维来讲 <code>kubectl</code>：先建立“本地客户端把声明式意图发送到 Kubernetes API Server，再由控制器、调度器和 kubelet 收敛状态”的心智模型，然后覆盖 Pods、Jobs、Nodes、GPU 资源、describe/logs/exec/events、requests/limits、nodeSelector、taints、JSONPath、安全 apply/delete、kubectl 与 crictl/k9s 的边界，以及卡住的训练任务如何系统排障。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">GPU 调度</span><span class="chip">Pods / Jobs</span><span class="chip">Nodes</span><span class="chip">describe / logs / exec</span><span class="chip">Events</span><span class="chip">JSONPath</span><span class="chip">安全变更</span><span class="chip">训练任务排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>kubectl</code> 不是直接登录节点改进程，而是通过 API Server 读取或提交 Kubernetes 对象，让控制器和节点代理把“期望状态”收敛成“实际状态”。</div>
+<div class="success"><strong>最重要原则：</strong> 生产集群先 <code>get</code>/<code>describe</code>/<code>diff</code>/<code>--dry-run=server</code>，再 <code>apply</code>；删除训练任务前先确认 namespace、label selector、ownerReferences 和是否需要保留日志、PVC、checkpoint。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">kubectl 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：客户端、API Server 与控制面</a></li>
+<li><a class="anchor" href="#s3">上下文、命名空间与权限边界</a></li>
+<li><a class="anchor" href="#s4">AI Infra 常见对象地图</a></li>
+<li><a class="anchor" href="#s5">get：快速盘点 Pods、Jobs、Nodes</a></li>
+<li><a class="anchor" href="#s6">describe：读懂调度失败与事件</a></li>
+<li><a class="anchor" href="#s7">logs：训练日志、崩溃日志与多容器</a></li>
+<li><a class="anchor" href="#s8">exec：进入容器做最小侵入诊断</a></li>
+<li><a class="anchor" href="#s9">events：按时间线排查集群行为</a></li>
+<li><a class="anchor" href="#s10">资源请求、限制与 GPU 资源</a></li>
+<li><a class="anchor" href="#s11">调度约束：nodeSelector、亲和性、污点容忍</a></li>
+<li><a class="anchor" href="#s12">Jobs、CronJobs 与训练任务生命周期</a></li>
+<li><a class="anchor" href="#s13">调试卡住的训练任务</a></li>
+<li><a class="anchor" href="#s14">JSONPath 与自定义输出</a></li>
+<li><a class="anchor" href="#s15">安全 apply、diff、rollout 与 delete</a></li>
+<li><a class="anchor" href="#s16">kubectl vs crictl vs k9s</a></li>
+<li><a class="anchor" href="#s17">常见故障速查表</a></li>
+<li><a class="anchor" href="#s18">练习路线与值班清单</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. kubectl 是什么</h2>
+<p><code>kubectl</code> 是 Kubernetes 的命令行客户端。它负责把你的读取、创建、更新、删除请求发给 API Server，并把返回的对象、状态、事件和日志展示出来。AI Infra 场景下，它通常用于查看 GPU 节点、定位训练 Pod 为什么没被调度、跟踪 Job 是否重试、确认资源请求是否合理，以及在不破坏运行中的训练任务前提下做诊断。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>对象查询、状态解释、声明式变更、日志查看、进入容器、端口转发、rollout 观察。</div>
+<div class="card"><strong>它不擅长什么</strong><br>直接调试节点容器运行时、长期监控、交互式集群浏览、深度 GPU 驱动诊断。</div>
+<div class="card"><strong>核心边界</strong><br><code>kubectl</code> 面向 Kubernetes API；如果 kubelet、containerd 或 GPU 驱动坏在节点本地，可能要配合 <code>crictl</code>、SSH、DCGM 或节点日志。</div>
+</div>
+<pre><code># 查看当前集群和 namespace
+kubectl config current-context
+kubectl config view --minify --output 'jsonpath={..namespace}{"\n"}'
+
+# 查看训练命名空间下的核心对象
+kubectl get pods,jobs,nodes -n ml-training -o wide
+
+# 查看 GPU 节点标签和可分配资源
+kubectl get nodes -L accelerator,nvidia.com/gpu.product
+kubectl describe node gpu-node-01</code></pre>
+<div class="warn"><strong>值班习惯：</strong> 每次操作前先确认 <code>current-context</code> 和 <code>namespace</code>。误在生产集群执行删除，比命令写错本身更常见。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. 整体模型：客户端、API Server 与控制面</h2>
+<h3>信息图：kubectl 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="kubectl 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">kubectl 通过 API 操作对象，控制面负责收敛状态</text>
+<rect x="55" y="130" width="190" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">kubectl</text><text x="150" y="200" text-anchor="middle" font-size="15">本地 kubeconfig</text><text x="150" y="222" text-anchor="middle" font-size="15">命令、YAML、JSONPath</text>
+<rect x="320" y="130" width="205" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="423" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">API Server</text><text x="423" y="200" text-anchor="middle" font-size="15">认证 / 鉴权 / 准入</text><text x="423" y="222" text-anchor="middle" font-size="15">对象读写入口</text>
+<rect x="600" y="130" width="205" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="703" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">控制面</text><text x="703" y="200" text-anchor="middle" font-size="15">Scheduler / Controllers</text><text x="703" y="222" text-anchor="middle" font-size="15">把期望变成计划</text>
+<rect x="860" y="130" width="190" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="955" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">节点</text><text x="955" y="200" text-anchor="middle" font-size="15">kubelet / runtime</text><text x="955" y="222" text-anchor="middle" font-size="15">CPU / 内存 / GPU</text>
+<rect x="115" y="355" width="260" height="118" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="245" y="394" text-anchor="middle" font-size="20" font-weight="700">读取实际状态</text><text x="245" y="425" text-anchor="middle" font-size="15">get / describe / logs / events</text><text x="245" y="448" text-anchor="middle" font-size="15">回答“现在发生了什么”</text>
+<rect x="420" y="355" width="260" height="118" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="550" y="394" text-anchor="middle" font-size="20" font-weight="700">提交期望状态</text><text x="550" y="425" text-anchor="middle" font-size="15">apply / patch / scale / rollout</text><text x="550" y="448" text-anchor="middle" font-size="15">回答“希望变成什么”</text>
+<rect x="725" y="355" width="260" height="118" rx="18" fill="#fee2e2" stroke="#fecaca"/><text x="855" y="394" text-anchor="middle" font-size="20" font-weight="700" fill="#991b1b">破坏性动作</text><text x="855" y="425" text-anchor="middle" font-size="15">delete / replace / force</text><text x="855" y="448" text-anchor="middle" font-size="15">先 dry-run、确认 selector</text>
+<line x1="245" y1="186" x2="320" y2="186" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="525" y1="186" x2="600" y2="186" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="805" y1="186" x2="860" y2="186" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M955 242 C920 300, 775 310, 680 355" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/><path d="M423 242 C380 300, 310 322, 265 355" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">排障时优先区分：这是 API 对象状态问题、调度控制面问题，还是节点本地运行时/GPU 问题。</div></section>
+
+<section class="section" id="s3">
+<h2>3. 上下文、命名空间与权限边界</h2>
+<p>多数事故不是因为 <code>kubectl get</code>，而是因为在错误的集群、错误的 namespace、错误的 selector 上执行了变更。AI 平台通常同时有 dev、staging、prod、多租户训练 namespace 和系统 namespace；操作前要把边界显式打出来。</p>
+<table><tr><th>目标</th><th>命令</th><th>说明</th></tr>
+<tr><td>确认当前上下文</td><td><code>kubectl config current-context</code></td><td>检查是否连到生产集群。</td></tr>
+<tr><td>列出上下文</td><td><code>kubectl config get-contexts</code></td><td>查看 cluster/user/namespace 映射。</td></tr>
+<tr><td>临时指定 namespace</td><td><code>kubectl get pod -n ml-training</code></td><td>推荐在脚本中显式写 <code>-n</code>。</td></tr>
+<tr><td>检查权限</td><td><code>kubectl auth can-i delete jobs -n ml-training</code></td><td>先确认 RBAC，而不是等命令失败。</td></tr>
+</table>
+<pre><code># 值班开场三件事
+kubectl config current-context
+kubectl get ns
+kubectl auth can-i get pods -n ml-training
+
+# 不切全局配置，单次命令显式指定上下文和 namespace
+kubectl --context prod-gpu-a -n ml-training get pods -o wide</code></pre>
+<div class="danger"><strong>避免全局副作用：</strong> <code>kubectl config set-context --current --namespace=...</code> 会影响后续命令。脚本和 runbook 中优先显式传 <code>--context</code>、<code>-n</code>。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. AI Infra 常见对象地图</h2>
+<p>训练平台通常把用户提交的训练任务包装成 <code>Job</code>、<code>Pod</code>、自定义资源或工作流对象。无论上层框架是 Kubeflow、Volcano、Kueue、Argo 还是自研平台，落到 Kubernetes 后，排障仍会回到对象关系：谁创建了谁、Pod 被调度到哪个节点、容器为什么启动或退出。</p>
+<div class="grid-4">
+<div class="card"><strong>Pod</strong><br>容器运行的最小调度单元。训练任务通常至少包含 trainer 容器，可能还有 sidecar。</div>
+<div class="card"><strong>Job</strong><br>一次性任务控制器，负责重试、并行度和完成状态。</div>
+<div class="card"><strong>Node</strong><br>承载 Pod 的机器，AI 场景重点看 GPU、驱动、allocatable、taints。</div>
+<div class="card"><strong>PVC / PV</strong><br>数据集、checkpoint、模型输出的持久化存储。</div>
+</div>
+<pre><code># 从 Job 追到 Pod
+kubectl get job -n ml-training train-resnet -o wide
+kubectl get pods -n ml-training -l job-name=train-resnet -o wide
+
+# 从 Pod 追到创建者和所在节点
+kubectl get pod -n ml-training train-resnet-abcde -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+kubectl get pod -n ml-training train-resnet-abcde -o jsonpath='{.spec.nodeName}{"\n"}'</code></pre>
+</section>
+
+<section class="section" id="s5">
+<h2>5. get：快速盘点 Pods、Jobs、Nodes</h2>
+<p><code>get</code> 是所有排障的第一步：先缩小范围，再进入 <code>describe</code>、<code>logs</code> 或节点诊断。AI Infra 的常用观察维度是 namespace、label、node、phase、restart、age、GPU 节点标签和可分配资源。</p>
+<table><tr><th>场景</th><th>命令</th></tr>
+<tr><td>查看训练 Pod 分布</td><td><code>kubectl get pods -n ml-training -o wide</code></td></tr>
+<tr><td>按用户或队列筛选</td><td><code>kubectl get pods -n ml-training -l user=alice,queue=gpu-a</code></td></tr>
+<tr><td>查看 Job 完成/失败</td><td><code>kubectl get jobs -n ml-training</code></td></tr>
+<tr><td>查看 GPU 节点</td><td><code>kubectl get nodes -L nvidia.com/gpu.product,accelerator</code></td></tr>
+<tr><td>排序查看重启</td><td><code>kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount'</code></td></tr>
+</table>
+<pre><code># 列出非 Running/Succeeded 的训练 Pod
+kubectl get pods -n ml-training \
+  --field-selector=status.phase!=Running,status.phase!=Succeeded
+
+# 查看所有 Pending Pod 被卡在哪些节点选择条件上
+kubectl get pods -n ml-training --field-selector=status.phase=Pending -o wide
+
+# 查看节点 allocatable 中的 GPU
+kubectl get nodes -o custom-columns=NODE:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu',CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory</code></pre>
+<div class="note"><strong>输出选择：</strong> <code>-o wide</code> 适合值班快速看节点；<code>-o yaml/json</code> 适合查完整字段；<code>custom-columns</code> 和 <code>jsonpath</code> 适合写 runbook。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. describe：读懂调度失败与事件</h2>
+<p><code>describe</code> 是面向人的诊断视图，会把对象摘要、状态、容器、挂载、资源请求、调度条件和最近事件拼在一起。训练 Pod 卡住时，先看 <code>describe pod</code> 末尾的 Events；GPU 不够、节点选择不匹配、污点未容忍、PVC 未绑定、镜像拉取失败都会出现在这里。</p>
+<pre><code># Pod 为什么 Pending、CrashLoopBackOff 或 ImagePullBackOff
+kubectl describe pod -n ml-training train-resnet-abcde
+
+# Job 为什么重试、失败或未完成
+kubectl describe job -n ml-training train-resnet
+
+# 节点是否 NotReady、GPU 是否可分配、是否有污点
+kubectl describe node gpu-node-01</code></pre>
+<table><tr><th>Events 关键词</th><th>常见含义</th><th>下一步</th></tr>
+<tr><td><code>FailedScheduling</code></td><td>调度器找不到合适节点。</td><td>看 GPU/CPU/memory requests、nodeSelector、affinity、taints。</td></tr>
+<tr><td><code>FailedMount</code></td><td>数据集或 checkpoint PVC 挂载失败。</td><td>查 PVC/PV、CSI、存储配额和权限。</td></tr>
+<tr><td><code>ErrImagePull</code></td><td>镜像无法拉取。</td><td>查镜像名、tag、registry secret、节点网络。</td></tr>
+<tr><td><code>BackOff</code></td><td>容器重复崩溃或拉取重试。</td><td>看 <code>logs --previous</code> 和容器 exit code。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s7">
+<h2>7. logs：训练日志、崩溃日志与多容器</h2>
+<p><code>kubectl logs</code> 从 kubelet 暴露的容器日志读取 stdout/stderr。AI 训练中常见需求是跟踪当前 trainer 输出、查看上一次崩溃日志、只看最近几分钟、同时看 Job 下所有 Pod，或在多容器 Pod 中指定主容器。</p>
+<pre><code># 跟踪单个训练 Pod 日志
+kubectl logs -n ml-training pod/train-resnet-abcde -f --tail=200
+
+# 多容器 Pod 指定容器
+kubectl logs -n ml-training train-resnet-abcde -c trainer --tail=200
+
+# 容器重启后查看上一次崩溃日志
+kubectl logs -n ml-training train-resnet-abcde -c trainer --previous
+
+# 查看 Job 关联 Pod 日志，适合小规模任务
+kubectl logs -n ml-training job/train-resnet --all-containers=true --tail=300
+
+# 限制时间窗口，避免刷屏
+kubectl logs -n ml-training train-resnet-abcde --since=15m --timestamps</code></pre>
+<div class="warn"><strong>日志边界：</strong> <code>kubectl logs</code> 不是长期日志系统。Pod 被删除、节点日志轮转或容器运行时清理后，日志可能不可用；生产训练应接入集中日志或把关键 checkpoint/metrics 写到持久化系统。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. exec：进入容器做最小侵入诊断</h2>
+<p><code>exec</code> 适合做短时诊断：查看进程、环境变量、挂载路径、NCCL 配置、GPU 可见性、数据集路径是否存在。它不适合把运行容器当服务器长期手工修复；容器内临时改动不会被声明式配置记录，重启后也可能消失。</p>
+<pre><code># 进入 trainer 容器
+kubectl exec -n ml-training -it train-resnet-abcde -c trainer -- bash
+
+# 无交互检查 GPU 是否可见
+kubectl exec -n ml-training train-resnet-abcde -c trainer -- nvidia-smi
+
+# 检查数据挂载、环境变量和进程
+kubectl exec -n ml-training train-resnet-abcde -c trainer -- sh -lc 'pwd; df -h /data; env | grep -E "CUDA|NCCL|RANK|WORLD"; ps aux'</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要在训练容器里手工安装包、覆盖代码或删除 checkpoint 来“修复”问题。正确做法是更新镜像、配置或 Job 模板，然后通过可审计的变更重新提交。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. events：按时间线排查集群行为</h2>
+<p><code>events</code> 能把调度、拉镜像、挂载、启动、重启等行为按时间线展示出来。相比 <code>describe</code> 的对象视图，事件视图更适合回答“刚才发生了什么”和“是不是多个任务同时被同一种原因卡住”。</p>
+<pre><code># Kubernetes 新版本可用 events 子命令
+kubectl events -n ml-training --for pod/train-resnet-abcde --watch
+
+# 兼容写法：按时间排序查看 namespace 事件
+kubectl get events -n ml-training --sort-by='.lastTimestamp'
+
+# 看全局近期调度失败
+kubectl get events -A --field-selector reason=FailedScheduling --sort-by='.lastTimestamp'</code></pre>
+<div class="note"><strong>事件会过期：</strong> Events 有 TTL，不是审计日志。重大生产事故要结合 API audit log、调度器日志、节点日志和平台提交记录。</div>
+</section>
+
+<section class="figure" id="fig-gpu-scheduling">
+<h3>信息图：GPU 训练 Pod 的调度链路</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="GPU 训练 Pod 调度链路">
+<rect x="18" y="18" width="1064" height="660" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">GPU Pod 能否运行，取决于请求、约束、节点和设备插件共同满足</text>
+<rect x="60" y="120" width="210" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="165" y="160" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">Pod Spec</text><text x="165" y="190" text-anchor="middle" font-size="15">requests / limits</text><text x="165" y="212" text-anchor="middle" font-size="15">nvidia.com/gpu: 8</text>
+<rect x="330" y="120" width="210" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="435" y="160" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">调度过滤</text><text x="435" y="190" text-anchor="middle" font-size="15">nodeSelector / affinity</text><text x="435" y="212" text-anchor="middle" font-size="15">taints / tolerations</text>
+<rect x="600" y="120" width="210" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="705" y="160" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">节点资源</text><text x="705" y="190" text-anchor="middle" font-size="15">allocatable GPU</text><text x="705" y="212" text-anchor="middle" font-size="15">CPU / 内存 / ephemeral</text>
+<rect x="870" y="120" width="180" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="960" y="160" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">设备插件</text><text x="960" y="190" text-anchor="middle" font-size="15">NVIDIA Plugin</text><text x="960" y="212" text-anchor="middle" font-size="15">MIG / DCGM</text>
+<rect x="90" y="355" width="280" height="118" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="230" y="394" text-anchor="middle" font-size="20" font-weight="700">成功：Pod 绑定节点</text><text x="230" y="425" text-anchor="middle" font-size="15">kubelet 拉镜像、挂载卷</text><text x="230" y="448" text-anchor="middle" font-size="15">容器看到 CUDA_VISIBLE_DEVICES</text>
+<rect x="410" y="355" width="280" height="118" rx="18" fill="#fee2e2" stroke="#fecaca"/><text x="550" y="394" text-anchor="middle" font-size="20" font-weight="700" fill="#991b1b">失败：Pending</text><text x="550" y="425" text-anchor="middle" font-size="15">0/N nodes are available</text><text x="550" y="448" text-anchor="middle" font-size="15">看 FailedScheduling</text>
+<rect x="730" y="355" width="280" height="118" rx="18" fill="#f8fafc" stroke="#cbd5e1"/><text x="870" y="394" text-anchor="middle" font-size="20" font-weight="700">失败：运行后崩溃</text><text x="870" y="425" text-anchor="middle" font-size="15">驱动、NCCL、OOM、数据路径</text><text x="870" y="448" text-anchor="middle" font-size="15">看 logs / exec / node</text>
+<rect x="220" y="565" width="660" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="601" text-anchor="middle" font-size="18" font-weight="700">排障顺序：Pod spec → Events → Node allocatable → Device plugin → Container logs</text>
+<line x1="270" y1="175" x2="330" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="540" y1="175" x2="600" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="810" y1="175" x2="870" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M435 230 C380 290, 290 315, 230 355" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M705 230 C650 290, 585 315, 550 355" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M960 230 C940 290, 900 320, 870 355" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">GPU 不是普通整数资源那么简单：Kubernetes 只负责调度扩展资源，真正设备发现和注入依赖节点插件、驱动与运行时配置。</div></section>
+
+<section class="section" id="s10">
+<h2>10. 资源请求、限制与 GPU 资源</h2>
+<p>调度器主要根据 <code>requests</code> 判断节点是否能承载 Pod。CPU 和内存的 request 太小会导致训练任务互相挤压；GPU request 写错会导致 Pending；内存 limit 太低会导致 OOMKilled；ephemeral-storage 忽略后可能在解压数据集或写缓存时把节点磁盘打满。</p>
+<table><tr><th>资源</th><th>AI 训练关注点</th><th>典型症状</th></tr>
+<tr><td><code>cpu</code></td><td>DataLoader、预处理、通信线程需要足够 CPU。</td><td>GPU 利用率低，训练吞吐波动。</td></tr>
+<tr><td><code>memory</code></td><td>数据缓存、模型加载、worker 进程会吃内存。</td><td><code>OOMKilled</code>、节点内存压力。</td></tr>
+<tr><td><code>nvidia.com/gpu</code></td><td>必须通过 limits/request 请求扩展资源，通常 request=limit。</td><td><code>Insufficient nvidia.com/gpu</code>。</td></tr>
+<tr><td><code>ephemeral-storage</code></td><td>本地缓存、临时数据、日志和解压目录。</td><td>Pod 被驱逐、节点 DiskPressure。</td></tr>
+</table>
+<pre><code># 查看 Pod 实际声明的资源
+kubectl get pod -n ml-training train-resnet-abcde -o jsonpath='{range .spec.containers[*]}{.name}{" requests="}{.resources.requests}{" limits="}{.resources.limits}{"\n"}{end}'
+
+# 查看节点可分配 GPU
+kubectl describe node gpu-node-01 | sed -n '/Allocatable:/,/Events:/p'
+
+# Job YAML 片段：GPU 训练容器资源
+resources:
+  requests:
+    cpu: "16"
+    memory: "128Gi"
+    ephemeral-storage: "200Gi"
+    nvidia.com/gpu: "8"
+  limits:
+    memory: "128Gi"
+    nvidia.com/gpu: "8"</code></pre>
+<div class="warn"><strong>GPU 配额提醒：</strong> <code>nvidia.com/gpu</code> 这类扩展资源不能像 CPU 一样超卖。Pending 时先查 namespace ResourceQuota、队列配额、节点 allocatable 和是否启用了 MIG。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 调度约束：nodeSelector、亲和性、污点容忍</h2>
+<p>AI 集群经常按 GPU 型号、网络拓扑、存储靠近性和租户隔离做节点分层。<code>nodeSelector</code> 简单直接；node affinity 表达更强；taints/tolerations 用于“默认不让普通 Pod 上 GPU 节点”或隔离故障节点。</p>
+<div class="grid-3">
+<div class="card"><strong>nodeSelector</strong><br>精确匹配节点标签。适合指定 <code>A100</code>、<code>H100</code>、高速盘池。</div>
+<div class="card"><strong>affinity</strong><br>支持 In、NotIn、Exists、权重和软硬约束。适合复杂平台调度。</div>
+<div class="card"><strong>taints/tolerations</strong><br>节点打污点，Pod 必须容忍才能调度。适合 GPU 池隔离和故障排空。</div>
+</div>
+<pre><code># 查看节点标签和污点
+kubectl get node gpu-node-01 --show-labels
+kubectl describe node gpu-node-01 | grep -i taints
+
+# 给节点打标签：先确认目标节点，再执行
+kubectl get node gpu-node-01 --show-labels
+kubectl label node gpu-node-01 accelerator=nvidia-a100 --dry-run=server -o yaml
+kubectl label node gpu-node-01 accelerator=nvidia-a100
+
+# 训练 Pod 片段
+nodeSelector:
+  accelerator: nvidia-a100
+tolerations:
+- key: "gpu"
+  operator: "Equal"
+  value: "true"
+  effect: "NoSchedule"</code></pre>
+<div class="danger"><strong>节点变更警告：</strong> 给节点加删 label/taint 会影响后续调度，甚至触发平台级任务倾斜。生产环境应先确认调度策略和自动化系统是否会覆盖这些字段。</div>
+</section>
+
+<section class="figure" id="fig-job-lifecycle">
+<h3>流程图：训练 Job 从提交到完成</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="训练 Job 生命周期">
+<rect x="18" y="18" width="1064" height="650" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">训练 Job 生命周期：对象创建、Pod 调度、容器运行、状态回写</text>
+<rect x="70" y="130" width="180" height="82" rx="15" fill="#dbeafe" stroke="#93c5fd"/><text x="160" y="164" text-anchor="middle" font-size="19" font-weight="700">apply Job</text><text x="160" y="190" text-anchor="middle" font-size="14">提交期望状态</text>
+<rect x="315" y="130" width="180" height="82" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="405" y="164" text-anchor="middle" font-size="19" font-weight="700">Job 控制器</text><text x="405" y="190" text-anchor="middle" font-size="14">创建 Pod</text>
+<rect x="560" y="130" width="180" height="82" rx="15" fill="#ffedd5" stroke="#fdba74"/><text x="650" y="164" text-anchor="middle" font-size="19" font-weight="700">Scheduler</text><text x="650" y="190" text-anchor="middle" font-size="14">选择 GPU 节点</text>
+<rect x="805" y="130" width="210" height="82" rx="15" fill="#ccfbf1" stroke="#99f6e4"/><text x="910" y="164" text-anchor="middle" font-size="19" font-weight="700">kubelet</text><text x="910" y="190" text-anchor="middle" font-size="14">拉镜像、挂载、启动</text>
+<polygon points="550,300 690,370 550,440 410,370" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="365" text-anchor="middle" font-size="18" font-weight="700">容器退出码？</text><text x="550" y="390" text-anchor="middle" font-size="14">0 / 非 0 / 被驱逐</text>
+<rect x="160" y="520" width="230" height="76" rx="15" fill="#dcfce7" stroke="#86efac"/><text x="275" y="552" text-anchor="middle" font-size="19" font-weight="700">Complete</text><text x="275" y="577" text-anchor="middle" font-size="14">保留日志和输出</text>
+<rect x="710" y="520" width="230" height="76" rx="15" fill="#fee2e2" stroke="#fecaca"/><text x="825" y="552" text-anchor="middle" font-size="19" font-weight="700" fill="#991b1b">Failed / Retry</text><text x="825" y="577" text-anchor="middle" font-size="14">看 backoffLimit 和 logs</text>
+<line x1="250" y1="171" x2="315" y2="171" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="495" y1="171" x2="560" y2="171" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="740" y1="171" x2="805" y2="171" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M910 212 C845 270, 705 300, 620 330" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M445 405 C390 455, 335 485, 285 520" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#c2)"/><text x="382" y="485" font-size="14" fill="#166534">退出码 0</text>
+<path d="M655 405 C710 455, 770 485, 820 520" fill="none" stroke="#dc2626" stroke-width="4" marker-end="url(#c3)"/><text x="730" y="485" font-size="14" fill="#991b1b">非 0 / 超时 / OOM</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="c2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker><marker id="c3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#dc2626"/></marker></defs>
+</svg><div class="caption">Job 失败不等于 Pod 还在。排障时先保存 YAML、describe、events 和 previous logs，再决定是否清理对象。</div></section>
+
+<section class="section" id="s12">
+<h2>12. Jobs、CronJobs 与训练任务生命周期</h2>
+<p>训练任务通常比 Web 服务更接近 <code>Job</code>：它运行到完成或失败，而不是长期滚动更新。关键字段包括 <code>parallelism</code>、<code>completions</code>、<code>backoffLimit</code>、<code>activeDeadlineSeconds</code> 和 <code>ttlSecondsAfterFinished</code>。</p>
+<pre><code># 查看 Job 的完成数、失败数和持续时间
+kubectl get jobs -n ml-training
+kubectl describe job -n ml-training train-resnet
+
+# 暂停 CronJob，先 dry-run 预览
+kubectl patch cronjob -n ml-training nightly-eval \
+  -p '{"spec":{"suspend":true}}' --type=merge --dry-run=server -o yaml
+
+# 确认后再执行
+kubectl patch cronjob -n ml-training nightly-eval \
+  -p '{"spec":{"suspend":true}}' --type=merge</code></pre>
+<table><tr><th>字段</th><th>作用</th><th>AI 训练建议</th></tr>
+<tr><td><code>backoffLimit</code></td><td>失败后最多重试次数。</td><td>数据或代码错误时过高会浪费 GPU。</td></tr>
+<tr><td><code>activeDeadlineSeconds</code></td><td>总运行时长上限。</td><td>防止训练挂死长期占 GPU。</td></tr>
+<tr><td><code>ttlSecondsAfterFinished</code></td><td>完成后自动清理 Job/Pod。</td><td>不要短到日志和排障证据来不及采集。</td></tr>
+<tr><td><code>parallelism</code></td><td>同时运行 Pod 数。</td><td>分布式训练需配合 rendezvous、rank、网络策略。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 调试卡住的训练任务</h2>
+<p>卡住的训练任务不要一上来就删除。先判断它卡在哪一层：尚未调度、镜像或存储未准备、容器启动后崩溃、进程运行但训练无吞吐、分布式通信互等，还是节点/GPU 层异常。</p>
+<h3>排障顺序</h3>
+<pre><code># 1. 找到 Pod 和节点
+kubectl get pods -n ml-training -l job-name=train-resnet -o wide
+
+# 2. 看 Pod 事件：Pending、Mount、Image、OOM、BackOff
+kubectl describe pod -n ml-training train-resnet-abcde
+
+# 3. 看当前日志和上一次崩溃日志
+kubectl logs -n ml-training train-resnet-abcde -c trainer --tail=200
+kubectl logs -n ml-training train-resnet-abcde -c trainer --previous --tail=200
+
+# 4. 检查资源声明和节点资源
+kubectl get pod -n ml-training train-resnet-abcde -o yaml | sed -n '/resources:/,/volumeMounts:/p'
+kubectl describe node gpu-node-01 | sed -n '/Allocated resources:/,/Events:/p'
+
+# 5. 只做只读 exec 诊断
+kubectl exec -n ml-training train-resnet-abcde -c trainer -- nvidia-smi</code></pre>
+<div class="grid-2">
+<div class="card"><strong>Pending</strong><br>看 <code>FailedScheduling</code>，重点查 GPU 不足、label 不匹配、taint 未容忍、PVC 未绑定、ResourceQuota。</div>
+<div class="card"><strong>CrashLoopBackOff</strong><br>看 <code>logs --previous</code>，重点查启动命令、依赖、CUDA/NCCL、数据路径、内存 OOM。</div>
+<div class="card"><strong>Running 但无进展</strong><br>看训练日志、GPU 利用率、DataLoader CPU、存储吞吐、分布式 rank 是否互等。</div>
+<div class="card"><strong>Node 异常</strong><br>看 Node Conditions、device plugin Pod、kubelet/containerd 日志、DCGM/驱动健康。</div>
+</div>
+<div class="success"><strong>保留证据：</strong> 删除前保存 <code>get -o yaml</code>、<code>describe</code>、<code>events</code>、当前/previous logs 和平台提交参数，避免清理后无法复盘。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. JSONPath 与自定义输出</h2>
+<p>当你需要把 kubectl 放进 runbook 或脚本时，不要靠人眼解析表格。<code>-o jsonpath</code>、<code>-o custom-columns</code> 和 <code>-o name</code> 可以把对象字段稳定输出出来。</p>
+<pre><code># 输出 Pod -> Node 映射
+kubectl get pods -n ml-training -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+
+# 输出每个 Pod 的容器重启次数
+kubectl get pods -n ml-training -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}:{.restartCount}{" "}{end}{"\n"}{end}'
+
+# 输出所有节点 GPU allocatable
+kubectl get nodes -o custom-columns=NODE:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+
+# 只取对象名，适合继续 xargs
+kubectl get pods -n ml-training -l job-name=train-resnet -o name</code></pre>
+<table><tr><th>输出格式</th><th>适合场景</th><th>注意</th></tr>
+<tr><td><code>-o wide</code></td><td>人工快速查看。</td><td>字段有限，不适合脚本强依赖。</td></tr>
+<tr><td><code>-o yaml/json</code></td><td>完整对象、备份证据。</td><td>输出大，包含 managedFields。</td></tr>
+<tr><td><code>-o jsonpath</code></td><td>抽取字段、脚本化。</td><td>语法转义较多，复杂时考虑 <code>jq</code>。</td></tr>
+<tr><td><code>-o custom-columns</code></td><td>生成表格。</td><td>只适合字段路径较简单的场景。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 安全 apply、diff、rollout 与 delete</h2>
+<p>声明式管理的基本流程是：本地 YAML 先服务端 dry-run，通过准入和 schema 校验；再 <code>diff</code> 看真实变化；最后 <code>apply</code>。删除和批量 patch 必须先验证 selector 和影响对象。</p>
+<pre><code># 服务端 dry-run：让 API Server 做校验和准入
+kubectl apply -f train-job.yaml --dry-run=server -o yaml
+
+# 查看将要改变什么
+kubectl diff -f train-job.yaml
+
+# 确认后提交
+kubectl apply -f train-job.yaml
+
+# 观察 Deployment 类对象发布
+kubectl rollout status deployment/training-api -n platform
+kubectl rollout history deployment/training-api -n platform</code></pre>
+<h3>删除前的安全模板</h3>
+<pre><code># 先列出将被删除的对象
+kubectl get pods -n ml-training -l job-name=train-resnet -o wide
+kubectl get pods -n ml-training -l job-name=train-resnet -o name
+
+# dry-run 预览 delete 请求
+kubectl delete pod -n ml-training -l job-name=train-resnet --dry-run=server -o yaml
+
+# 确认不需要保留运行现场后再删除
+kubectl delete pod -n ml-training -l job-name=train-resnet</code></pre>
+<div class="danger"><strong>高危命令：</strong> 避免 <code>kubectl delete pod --all -A</code>、宽泛 label selector、<code>--force --grace-period=0</code>。强删可能绕过优雅退出，导致 checkpoint 损坏或分布式任务集体失败。</div>
+</section>
+
+<section class="figure" id="fig-change-safety">
+<h3>安全图：apply/delete 的变更护栏</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="kubectl 安全变更护栏">
+<rect x="18" y="18" width="1064" height="682" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700">生产 kubectl 变更：先证明影响范围，再执行</text>
+<rect x="80" y="125" width="200" height="86" rx="15" fill="#dbeafe" stroke="#93c5fd"/><text x="180" y="160" text-anchor="middle" font-size="19" font-weight="700">1. 确认边界</text><text x="180" y="186" text-anchor="middle" font-size="14">context / namespace</text>
+<rect x="330" y="125" width="200" height="86" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="160" text-anchor="middle" font-size="19" font-weight="700">2. 预览对象</text><text x="430" y="186" text-anchor="middle" font-size="14">get -o name / labels</text>
+<rect x="580" y="125" width="200" height="86" rx="15" fill="#ffedd5" stroke="#fdba74"/><text x="680" y="160" text-anchor="middle" font-size="19" font-weight="700">3. dry-run/diff</text><text x="680" y="186" text-anchor="middle" font-size="14">server 校验和差异</text>
+<rect x="830" y="125" width="200" height="86" rx="15" fill="#dcfce7" stroke="#86efac"/><text x="930" y="160" text-anchor="middle" font-size="19" font-weight="700">4. 执行并观察</text><text x="930" y="186" text-anchor="middle" font-size="14">apply / rollout / events</text>
+<rect x="155" y="320" width="310" height="112" rx="18" fill="#f0fdf4" stroke="#86efac"/><text x="310" y="360" text-anchor="middle" font-size="21" font-weight="700" fill="#166534">低风险路径</text><text x="310" y="390" text-anchor="middle" font-size="15">apply -f + diff + rollout status</text><text x="310" y="414" text-anchor="middle" font-size="15">可回滚、可审计、范围明确</text>
+<rect x="635" y="320" width="310" height="112" rx="18" fill="#fef2f2" stroke="#fecaca"/><text x="790" y="360" text-anchor="middle" font-size="21" font-weight="700" fill="#991b1b">高风险路径</text><text x="790" y="390" text-anchor="middle" font-size="15">delete --all / force / 宽 selector</text><text x="790" y="414" text-anchor="middle" font-size="15">可能丢日志、丢现场、损坏 checkpoint</text>
+<rect x="260" y="545" width="580" height="62" rx="15" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="583" text-anchor="middle" font-size="18" font-weight="700">如果无法解释“会影响哪些对象”，就还不能执行破坏性命令</text>
+<line x1="280" y1="168" x2="330" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="530" y1="168" x2="580" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="780" y1="168" x2="830" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M430 211 C400 260, 350 290, 315 320" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#d2)"/><path d="M680 211 C710 260, 760 290, 790 320" fill="none" stroke="#dc2626" stroke-width="4" marker-end="url(#d3)"/><path d="M310 432 C380 490, 455 520, 520 545" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/><path d="M790 432 C720 490, 645 520, 580 545" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="d2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker><marker id="d3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#dc2626"/></marker></defs>
+</svg><div class="caption">安全不是不操作，而是每次操作都能提前证明范围、影响和回滚路径。</div></section>
+
+<section class="section" id="s16">
+<h2>16. kubectl vs crictl vs k9s</h2>
+<p>这三个工具的层级不同。<code>kubectl</code> 是 API 级工具，适合绝大多数对象和状态操作；<code>crictl</code> 是节点容器运行时诊断工具，通常需要登录节点；<code>k9s</code> 是交互式 TUI，适合浏览和观察，但生产变更仍应回到可复制、可审计的命令或 YAML。</p>
+<table><tr><th>工具</th><th>层级</th><th>适合</th><th>不适合</th></tr>
+<tr><td><code>kubectl</code></td><td>Kubernetes API</td><td>对象查询、声明式变更、日志、exec、rollout。</td><td>节点本地 containerd 深度故障。</td></tr>
+<tr><td><code>crictl</code></td><td>CRI / 节点运行时</td><td>kubelet 或 API 不通时，在节点上查容器、镜像、Pod sandbox。</td><td>跨集群对象管理和声明式变更。</td></tr>
+<tr><td><code>k9s</code></td><td>交互式 Kubernetes 客户端</td><td>快速浏览对象、日志、事件。</td><td>作为 runbook 的唯一依据；难以审计批量操作。</td></tr>
+</table>
+<pre><code># kubectl：从 API 看 Pod
+kubectl get pod -n ml-training train-resnet-abcde -o wide
+
+# crictl：登录对应节点后，从运行时看容器
+sudo crictl ps -a | grep train-resnet
+sudo crictl logs CONTAINER_ID
+
+# k9s：适合交互浏览，但关键结论要落回命令记录
+k9s -n ml-training</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 常见故障速查表</h2>
+<table><tr><th>症状</th><th>优先命令</th><th>常见根因</th><th>处理方向</th></tr>
+<tr><td>Pod Pending</td><td><code>describe pod</code>、<code>get events</code></td><td>GPU 不足、label 不匹配、taint 未容忍、PVC 未绑定。</td><td>调整 requests、调度约束、配额或存储。</td></tr>
+<tr><td>ImagePullBackOff</td><td><code>describe pod</code></td><td>镜像不存在、secret 错误、节点网络或 registry 故障。</td><td>校验镜像 tag、imagePullSecrets、registry 访问。</td></tr>
+<tr><td>CrashLoopBackOff</td><td><code>logs --previous</code></td><td>入口命令错误、依赖缺失、配置错误、代码异常。</td><td>修镜像/命令/配置，重提 Job。</td></tr>
+<tr><td>OOMKilled</td><td><code>describe pod</code>、<code>logs --previous</code></td><td>内存 limit 过低、batch size 过大、DataLoader 过多。</td><td>调内存、batch、worker、模型加载方式。</td></tr>
+<tr><td>GPU 不可见</td><td><code>exec -- nvidia-smi</code>、<code>describe node</code></td><td>未请求 GPU、device plugin/驱动/runtime 异常。</td><td>查资源声明、NVIDIA plugin、节点驱动。</td></tr>
+<tr><td>训练 Running 但不动</td><td><code>logs</code>、<code>exec</code>、节点监控</td><td>数据读取慢、NCCL 互等、网络/存储瓶颈。</td><td>查吞吐、rank、NCCL env、存储和网络。</td></tr>
+</table>
+<h3>最小证据包</h3>
+<pre><code># 事故复盘前采集，不修改对象
+kubectl get pod -n ml-training train-resnet-abcde -o yaml &gt; pod.yaml
+kubectl describe pod -n ml-training train-resnet-abcde &gt; pod.describe.txt
+kubectl get events -n ml-training --sort-by='.lastTimestamp' &gt; events.txt
+kubectl logs -n ml-training train-resnet-abcde -c trainer --tail=1000 &gt; trainer.log
+kubectl logs -n ml-training train-resnet-abcde -c trainer --previous --tail=1000 &gt; trainer.previous.log</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 练习路线与值班清单</h2>
+<h3>第一阶段：会读状态</h3>
+<ul><li>熟练使用 <code>get pods/jobs/nodes -o wide</code>。</li><li>能从 <code>describe pod</code> 的 Events 解释 Pending、BackOff、FailedMount。</li><li>能用 <code>logs --previous</code> 找到崩溃前的错误。</li></ul>
+<h3>第二阶段：会定位 GPU 调度问题</h3>
+<ul><li>能检查 <code>nvidia.com/gpu</code> requests/limits。</li><li>能读取节点 allocatable、labels、taints 和 device plugin 状态。</li><li>能解释 <code>0/N nodes are available</code> 的关键原因。</li></ul>
+<h3>第三阶段：会安全变更</h3>
+<ul><li>所有 YAML 变更先 <code>--dry-run=server</code> 和 <code>kubectl diff</code>。</li><li>删除前先 <code>get -o name</code> 验证 selector。</li><li>保留故障证据后再清理训练 Pod/Job。</li></ul>
+<h3>值班前 60 秒清单</h3>
+<pre><code>kubectl config current-context
+kubectl get ns
+kubectl get pods -n ml-training -o wide
+kubectl get events -n ml-training --sort-by='.lastTimestamp' | tail -40
+kubectl get nodes -L accelerator,nvidia.com/gpu.product</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>Kubernetes 官方文档：kubectl 命令参考、对象管理、调试 Pods 与节点、Jobs、资源管理、调度约束。</li>
+<li>Kubernetes 官方概念文档：Pods、Jobs、Nodes、Labels/Selectors、Taints and Tolerations、Assign Pods to Nodes。</li>
+<li>NVIDIA Kubernetes Device Plugin 文档：<code>nvidia.com/gpu</code> 扩展资源、MIG、GPU 节点运行时要求。</li>
+<li>Kubernetes JSONPath 支持文档：<code>-o jsonpath</code> 语法、range、转义和输出模板。</li>
+<li>CRI Tools / crictl 文档：节点容器运行时排障边界。</li>
+</ul><p class="mini">建议阅读顺序：先掌握 kubectl 与 API Server 的对象模型，再学习 get/describe/logs/exec/events 五件套，最后深入 GPU 调度、JSONPath 自动化和生产安全变更。</p></section>
+<div class="footer">kubectl 深度教程 · AI Infra 图文版 · Pods、Jobs、Nodes、GPU 调度、训练任务排障与生产安全</div>
+</div>
+</body>
+</html>

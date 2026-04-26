@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ibstat 深度教程：AI Infra 中的 InfiniBand HCA、端口状态与 RDMA 就绪排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ibstat 深度教程：AI Infra 中的 InfiniBand HCA、端口状态与 RDMA 就绪排障</h1>
+<p class="sub">这份教程围绕 <code>ibstat</code> 讲解 InfiniBand 主机通道适配器（HCA）的可见状态。重点不是背字段，而是建立“节点有 HCA，HCA 有端口，端口必须从物理链路到子网管理都就绪，GPU/NCCL/RDMA 才可能稳定通信”的心智模型，并把 <code>State</code>、<code>Physical state</code>、<code>Rate</code>、<code>Base lid</code>、<code>SM lid</code>、<code>Port GUID</code> 等字段放进真实 AI 集群排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">InfiniBand</span><span class="chip">RDMA</span><span class="chip">HCA</span><span class="chip">NCCL</span><span class="chip">Subnet Manager</span><span class="chip">GUID/LID</span><span class="chip">链路速率</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ibstat</code> 是 InfiniBand 端口健康的第一眼检查：它告诉你机器上有哪些 HCA、每个端口是否 <code>Active</code>、链路层是不是 <code>InfiniBand</code>、速率是多少，以及该端口是否从子网管理器拿到了 LID。</div>
+<div class="success"><strong>实践原则：</strong> <code>ibstat</code> 是只读诊断命令，适合先跑；但它只能证明“端口状态看起来可用”，不能单独证明 NCCL、RoCE、GID index、PFC/ECN、路由和带宽都正确。生产排障要继续用 <code>ibv_devinfo</code>、<code>rdma link</code>、<code>mlxlink</code>、<code>ib_write_bw</code> 和 <code>nccl-tests</code> 交叉验证。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ibstat 是什么</a></li>
+<li><a class="anchor" href="#s2">AI Infra 心智模型</a></li>
+<li><a class="anchor" href="#s3">安装来源与权限</a></li>
+<li><a class="anchor" href="#s4">快速读取输出</a></li>
+<li><a class="anchor" href="#s5">HCA 与端口命名</a></li>
+<li><a class="anchor" href="#s6">State 与 Physical state</a></li>
+<li><a class="anchor" href="#s7">Link layer、Rate 与 Width</a></li>
+<li><a class="anchor" href="#s8">GUID、LID 与 SM 线索</a></li>
+<li><a class="anchor" href="#s9">NCCL/RDMA 就绪检查</a></li>
+<li><a class="anchor" href="#s10">多 HCA、多端口与 NUMA/GPU</a></li>
+<li><a class="anchor" href="#s11">ibstat vs 相关工具</a></li>
+<li><a class="anchor" href="#s12">常见状态与根因映射</a></li>
+<li><a class="anchor" href="#s13">排障流程</a></li>
+<li><a class="anchor" href="#s14">脚本化巡检</a></li>
+<li><a class="anchor" href="#s15">安全边界与误判</a></li>
+<li><a class="anchor" href="#s16">实战练习与参考</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ibstat 是什么</h2>
+<p><code>ibstat</code> 来自 InfiniBand 诊断工具集，常用于查看本机 HCA 和端口的摘要状态。它不会发起带宽压测，也不会修改网络配置；它做的是读取本机 RDMA/InfiniBand 设备暴露出来的状态，并用适合人看的格式展示。</p>
+<div class="grid-3">
+<div class="card"><strong>它回答什么</strong><br>这台机器有没有 InfiniBand HCA？端口有没有起来？链路速率是多少？有没有 LID 和 SM LID？端口 GUID 是什么？</div>
+<div class="card"><strong>它不回答什么</strong><br>NCCL 是否一定能跑满、RoCE 优先级是否正确、GID index 是否匹配、交换机 QoS 是否配置正确、线缆误码是否持续增长。</div>
+<div class="card"><strong>AI 集群价值</strong><br>当训练任务报 <code>NCCL WARN</code>、RDMA 连接失败、跨节点吞吐异常时，<code>ibstat</code> 是低成本第一步。</div>
+</div>
+<pre><code># 查看所有本机 InfiniBand/RDMA HCA 的摘要
+ibstat
+
+# 查看指定 HCA
+ibstat mlx5_0
+
+# 查看命令帮助
+ibstat --help 2&gt;/dev/null || man ibstat</code></pre>
+<div class="note"><strong>名称提醒：</strong> 新 Mellanox/NVIDIA ConnectX 设备常见内核设备名是 <code>mlx5_0</code>、<code>mlx5_1</code>；老设备可能看到 <code>mlx4_0</code>。这些名字不等于 Linux 网卡名，例如 <code>ib0</code>、<code>ens5f0np0</code>。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. AI Infra 心智模型：从 HCA 到 NCCL 通信</h2>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="ibstat 在 AI Infra RDMA 通信链路中的位置">
+<rect x="18" y="18" width="1064" height="624" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">ibstat 看的是 RDMA 通信路径的底座状态</text>
+<rect x="70" y="120" width="185" height="92" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="162" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">GPU 任务</text><text x="162" y="187" text-anchor="middle" font-size="14">PyTorch / JAX</text>
+<rect x="315" y="120" width="185" height="92" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="407" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">NCCL</text><text x="407" y="187" text-anchor="middle" font-size="14">选择网卡与路径</text>
+<rect x="560" y="120" width="185" height="92" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="652" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">RDMA verbs</text><text x="652" y="187" text-anchor="middle" font-size="14">QP / CQ / MR</text>
+<rect x="805" y="120" width="185" height="92" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="897" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">HCA Port</text><text x="897" y="187" text-anchor="middle" font-size="14">ibstat 重点</text>
+<rect x="165" y="330" width="770" height="185" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="370" text-anchor="middle" font-size="23" font-weight="700" fill="#334155">端口必须同时满足：物理连通 + 子网可用 + 速率符合预期</text>
+<text x="550" y="410" text-anchor="middle" font-size="16">Physical state: LinkUp 说明电/光链路起来</text>
+<text x="550" y="440" text-anchor="middle" font-size="16">State: Active 说明端口进入可通信状态</text>
+<text x="550" y="470" text-anchor="middle" font-size="16">Base lid / SM lid 非零是 InfiniBand 子网管理的重要线索</text>
+<line x1="255" y1="166" x2="315" y2="166" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<line x1="500" y1="166" x2="560" y2="166" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<line x1="745" y1="166" x2="805" y2="166" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<line x1="897" y1="212" x2="725" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<defs><marker id="m1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">当 <code>ibstat</code> 已经显示端口不是 <code>Active</code>，上层 NCCL、MPI、UCX、Gloo 的错误通常只是症状；先把 HCA 端口和 IB 子网恢复正常。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装来源与权限</h2>
+<p><code>ibstat</code> 通常由 <code>infiniband-diags</code> 或发行版等价包提供。大多数读取场景不需要 root；但在受限容器里，缺少 <code>/sys</code>、<code>/dev/infiniband</code>、RDMA 设备透传或 capabilities 时会看不到设备。</p>
+<table>
+<tr><th>环境</th><th>安装/检查示例</th><th>说明</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>dpkg -S "$(command -v ibstat)"</code></td><td>常见包名为 <code>infiniband-diags</code>。</td></tr>
+<tr><td>RHEL/Rocky/CentOS</td><td><code>rpm -qf "$(command -v ibstat)"</code></td><td>常见包名同样与 InfiniBand diagnostics 相关。</td></tr>
+<tr><td>容器</td><td><code>ls /dev/infiniband /sys/class/infiniband</code></td><td>容器内无设备时，<code>ibstat</code> 不能代表宿主机没有 HCA。</td></tr>
+<tr><td>Kubernetes</td><td><code>kubectl exec ... -- ibstat</code></td><td>需要 RDMA device plugin 或等价设备透传配置。</td></tr>
+</table>
+<pre><code># 找到 ibstat 路径
+command -v ibstat
+
+# 查看内核是否暴露了 InfiniBand class
+ls -1 /sys/class/infiniband
+
+# 查看 verbs 设备节点
+ls -l /dev/infiniband 2&gt;/dev/null</code></pre>
+<div class="warn"><strong>容器提醒：</strong> 在 AI 平台里，容器内 <code>ibstat</code> 报空不一定是硬件坏了；先确认 Pod 是否拿到了 RDMA 设备、宿主机是否正常、容器运行时是否挂载了必要设备节点。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 快速读取输出</h2>
+<p>典型输出按 HCA 分组，每个 HCA 下列出固件、节点 GUID、系统镜像 GUID、CA type、端口数，以及每个端口的状态。</p>
+<pre><code>$ ibstat mlx5_0
+CA 'mlx5_0'
+        CA type: MT4129
+        Number of ports: 1
+        Firmware version: 28.39.1002
+        Hardware version: 0
+        Node GUID: 0x98039b0300abcd10
+        System image GUID: 0x98039b0300abcd10
+        Port 1:
+                State: Active
+                Physical state: LinkUp
+                Rate: 200
+                Base lid: 37
+                LMC: 0
+                SM lid: 1
+                Capability mask: 0x2651e848
+                Port GUID: 0x98039b0300abcd11
+                Link layer: InfiniBand</code></pre>
+<table>
+<tr><th>字段</th><th>怎么看</th><th>AI Infra 关注点</th></tr>
+<tr><td><code>CA 'mlx5_0'</code></td><td>本机 HCA 名称。</td><td>用于和 <code>NCCL_IB_HCA</code>、<code>ibv_devinfo</code>、NUMA 拓扑对应。</td></tr>
+<tr><td><code>State</code></td><td>端口逻辑状态。</td><td>训练前期望是 <code>Active</code>。</td></tr>
+<tr><td><code>Physical state</code></td><td>物理链路状态。</td><td>不是 <code>LinkUp</code> 时优先查线缆、模块、交换机端口。</td></tr>
+<tr><td><code>Rate</code></td><td>端口协商速率。</td><td>低于预期会直接影响 all-reduce 和 checkpoint 同步。</td></tr>
+<tr><td><code>Base lid</code>/<code>SM lid</code></td><td>IB 子网分配信息。</td><td>为 0 或异常时要查 Subnet Manager。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. HCA 与端口命名</h2>
+<p><code>ibstat</code> 展示的是 RDMA 设备视角，不是传统 Linux 网络接口视角。一个物理 ConnectX 卡可能有一个或多个端口；每个端口还可能在 Linux 网络栈里对应 <code>ib0</code>、<code>ib1</code> 或 RoCE Ethernet 接口。</p>
+<div class="grid-2">
+<div class="card"><strong>HCA 名称</strong><br><code>mlx5_0</code> 是 RDMA verbs 设备名。NCCL 的 <code>NCCL_IB_HCA=mlx5_0</code> 这类变量通常使用它。</div>
+<div class="card"><strong>端口号</strong><br><code>Port 1</code> 是 HCA 内部端口序号。双端口卡可能有 <code>Port 1</code> 和 <code>Port 2</code>。</div>
+<div class="card"><strong>Linux 网卡名</strong><br><code>ib0</code>、<code>ens*</code> 是 netdev 名称。它们和 <code>mlx5_0</code> 的映射需用 <code>rdma link</code>、<code>ibdev2netdev</code> 或 sysfs 查。</div>
+<div class="card"><strong>GPU 亲和性</strong><br>HCA 距离 GPU 的 PCIe/NUMA 拓扑影响通信性能；状态正常不代表选路最优。</div>
+</div>
+<pre><code># RDMA 设备列表
+ls -1 /sys/class/infiniband
+
+# HCA 到 netdev 的映射，若系统提供
+ibdev2netdev
+
+# 通用 RDMA link 视图
+rdma link show
+
+# GPU/HCA PCIe 拓扑辅助检查
+nvidia-smi topo -m
+lspci -D | grep -Ei 'mellanox|nvidia|network|infiniband'</code></pre>
+</section>
+
+<section class="section" id="s6">
+<h2>6. State 与 Physical state：Active、Init、Down 怎么读</h2>
+<p><code>State</code> 是端口逻辑状态，<code>Physical state</code> 是物理层状态。AI 集群里最常见的判断是：<code>Physical state: LinkUp</code> 但 <code>State: Init</code> 常指向子网管理器或子网配置问题；两者都 <code>Down</code> 更像物理链路问题。</p>
+<table>
+<tr><th>组合</th><th>含义</th><th>优先排查</th></tr>
+<tr><td><code>State: Active</code><br><code>Physical state: LinkUp</code></td><td>端口已可用于 IB 通信。</td><td>继续测 <code>ib_write_bw</code>、NCCL 和拓扑亲和性。</td></tr>
+<tr><td><code>State: Init</code><br><code>Physical state: LinkUp</code></td><td>物理链路已起，但端口还没进入可通信子网状态。</td><td>Subnet Manager、分区/PKey、交换机子网、线缆连接到错误 fabric。</td></tr>
+<tr><td><code>State: Down</code><br><code>Physical state: Polling</code></td><td>端口在找链路伙伴或训练链路。</td><td>线缆、光模块、对端端口、端口 admin state。</td></tr>
+<tr><td><code>State: Down</code><br><code>Physical state: Disabled</code></td><td>端口可能被禁用。</td><td>交换机/主机端口配置、固件、驱动、BIOS/PCIe。</td></tr>
+</table>
+<pre><code># 快速只看端口状态
+ibstat | awk '
+  /^CA / {ca=$2}
+  /Port [0-9]+:/ {port=$1 " " $2}
+  /State:/ || /Physical state:/ || /Rate:/ || /Link layer:/ {
+    print ca, port, $0
+  }'</code></pre>
+<div class="success"><strong>训练前最低门槛：</strong> 用于 NCCL/RDMA 的端口应至少显示 <code>State: Active</code>、<code>Physical state: LinkUp</code>、<code>Link layer: InfiniBand</code> 或符合预期的 RoCE/Ethernet 配置。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. Link layer、Rate 与 Width</h2>
+<p><code>Link layer</code> 区分端口当前工作在 InfiniBand 还是 Ethernet/RoCE 模式。<code>Rate</code> 是协商出来的链路速率，常见为 100、200、400 等，具体显示格式因工具版本可能略有差异。</p>
+<table>
+<tr><th>字段</th><th>期望</th><th>异常信号</th></tr>
+<tr><td><code>Link layer: InfiniBand</code></td><td>传统 IB fabric，用 LID/SM 组织子网。</td><td>如果你以为是 IB 但显示 Ethernet，要确认 VPI/端口模式。</td></tr>
+<tr><td><code>Link layer: Ethernet</code></td><td>RoCE 场景可能正常。</td><td><code>ibstat</code> 对 RoCE 就绪度信息有限，需查 GID、PFC、ECN。</td></tr>
+<tr><td><code>Rate: 100/200/400</code></td><td>应符合网卡、线缆、交换机端口规格。</td><td>低于预期可能是线缆规格、端口降速、模块兼容或交换机配置。</td></tr>
+</table>
+<pre><code># ibstat 看到速率后，用 mlxlink 查更底层的链路信息
+mlxlink -d /dev/mst/mt4129_pciconf0
+
+# 如果没有 mst 设备，先看系统是否有 mst 工具
+mst status 2&gt;/dev/null || true
+
+# RoCE/Ethernet 场景继续看 netdev 和 GID
+rdma link show
+show_gids 2&gt;/dev/null || true</code></pre>
+<div class="warn"><strong>速率提醒：</strong> <code>ibstat</code> 的 <code>Rate</code> 是摘要信号，不是吞吐证明。实际 all-reduce 性能还受 PCIe、NUMA、GPU Direct RDMA、交换机拥塞、消息大小和 NCCL 算法影响。</div>
+</section>
+
+<section class="figure" id="s8">
+<h2>8. GUID、LID 与 Subnet Manager 线索</h2>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="InfiniBand GUID LID 和 Subnet Manager 关系">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">GUID 是身份，LID 是子网内地址，SM 负责分配和路由</text>
+<rect x="75" y="125" width="255" height="160" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="202" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">节点 A HCA</text>
+<text x="202" y="202" text-anchor="middle" font-size="15">Port GUID</text>
+<text x="202" y="230" text-anchor="middle" font-size="15" font-family="ui-monospace">0x9803...0011</text>
+<text x="202" y="260" text-anchor="middle" font-size="15">Base lid: 37</text>
+<rect x="770" y="125" width="255" height="160" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="897" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">节点 B HCA</text>
+<text x="897" y="202" text-anchor="middle" font-size="15">Port GUID</text>
+<text x="897" y="230" text-anchor="middle" font-size="15" font-family="ui-monospace">0x9803...1011</text>
+<text x="897" y="260" text-anchor="middle" font-size="15">Base lid: 48</text>
+<rect x="405" y="185" width="290" height="150" rx="22" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="229" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">Subnet Manager</text>
+<text x="550" y="265" text-anchor="middle" font-size="16">分配 LID，计算路径</text>
+<text x="550" y="295" text-anchor="middle" font-size="16">ibstat 中常见 SM lid: 1</text>
+<rect x="145" y="430" width="810" height="135" rx="20" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="470" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">如果 Base lid 是 0 或端口停在 Init</text>
+<text x="550" y="507" text-anchor="middle" font-size="16">物理链路可能已通，但 IB 子网未完成管理和路由</text>
+<text x="550" y="536" text-anchor="middle" font-size="16">优先检查 OpenSM/交换机 SM、分区、fabric 连接和同一子网一致性</text>
+<line x1="330" y1="205" x2="405" y2="242" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="695" y1="242" x2="770" y2="205" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="550" y1="335" x2="550" y2="430" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<defs><marker id="m2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption"><code>Port GUID</code> 是端口硬件身份；<code>Base lid</code> 是 IB 子网内用于路由的本地 ID；<code>SM lid</code> 指向当前子网管理器。</div>
+<p><code>ibstat</code> 输出里 GUID/LID 对 AI Infra 很有用：GUID 可用于和交换机端口、线缆标签、资产系统对齐；LID/SM LID 则能判断 IB 子网管理是否正常。</p>
+<pre><code># 查看本机端口 GUID 和 LID 摘要
+ibstat | egrep 'CA |Port [0-9]+:|Port GUID|Base lid|SM lid|State|Physical'
+
+# 更完整的 IB fabric 视图通常需要其它 ibdiagnet/ibnetdiscover 工具
+ibnetdiscover 2&gt;/dev/null | head
+ibdiagnet 2&gt;/dev/null || true</code></pre>
+</section>
+
+<section class="section" id="s9">
+<h2>9. NCCL/RDMA 就绪检查</h2>
+<p>在多节点 GPU 训练中，<code>ibstat</code> 是就绪检查的第一层：它确认端口状态、链路层和速率。之后还要验证 NCCL 是否选择了正确 HCA、RDMA verbs 是否可用、点对点带宽是否合理。</p>
+<h3>建议顺序</h3>
+<pre><code># 1. 所有节点先看 HCA/端口
+ibstat
+
+# 2. verbs 设备和端口能力
+ibv_devinfo -v | less
+
+# 3. RDMA link/netdev 映射
+rdma link show
+ibdev2netdev 2&gt;/dev/null || true
+
+# 4. 两节点间做 verbs 带宽/延迟测试
+# server 节点
+ib_write_bw -d mlx5_0 -i 1
+# client 节点
+ib_write_bw -d mlx5_0 -i 1 &lt;server_ip_or_name&gt;
+
+# 5. 再跑 NCCL all_reduce 性能测试
+NCCL_DEBUG=INFO NCCL_IB_HCA=mlx5_0 ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 8</code></pre>
+<table>
+<tr><th>检查层</th><th>工具</th><th>通过信号</th></tr>
+<tr><td>端口状态</td><td><code>ibstat</code></td><td><code>Active</code>、<code>LinkUp</code>、速率符合预期。</td></tr>
+<tr><td>verbs 能力</td><td><code>ibv_devinfo</code></td><td>端口、MTU、GID/PKey、device cap 可见。</td></tr>
+<tr><td>网络映射</td><td><code>rdma link</code>/<code>ibdev2netdev</code></td><td>HCA、端口、netdev 对应关系清楚。</td></tr>
+<tr><td>点对点 RDMA</td><td><code>ib_write_bw</code>/<code>ib_read_bw</code></td><td>吞吐接近链路和平台预期。</td></tr>
+<tr><td>训练通信</td><td><code>nccl-tests</code></td><td>NCCL 日志选中了预期 HCA，带宽稳定。</td></tr>
+</table>
+<div class="danger"><strong>不要跳层：</strong> 如果 <code>ibstat</code> 已经显示端口 <code>Down</code> 或 <code>Init</code>，直接调 NCCL 环境变量通常只会制造噪声；先修复底层链路和子网。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 多 HCA、多端口与 NUMA/GPU</h2>
+<p>高端 AI 服务器常有 4、8 甚至更多张 HCA，以匹配 8 GPU 或更多 GPU 的带宽需求。<code>ibstat</code> 能告诉你每个 HCA 端口是否起来，但不会告诉你 NCCL 是否把 GPU 绑定到了最近的 HCA。</p>
+<div class="grid-3">
+<div class="card"><strong>端口全 Active</strong><br>所有训练用 HCA 都应一致为 <code>Active/LinkUp</code>，避免单卡退化拖慢整组 all-reduce。</div>
+<div class="card"><strong>速率一致</strong><br>同一通信平面的端口速率不一致，常导致性能长尾或环形算法瓶颈。</div>
+<div class="card"><strong>拓扑亲和</strong><br>HCA 离 GPU 太远，跨 NUMA/PCIe switch 可能降低 GPUDirect RDMA 性能。</div>
+</div>
+<pre><code># 汇总所有 HCA 的端口状态
+for dev in /sys/class/infiniband/*; do
+  name=$(basename "$dev")
+  echo "===== $name ====="
+  ibstat "$name" | egrep 'Port [0-9]+:|State:|Physical state:|Rate:|Link layer:|Base lid:'
+done
+
+# 看 GPU 和网卡拓扑
+nvidia-smi topo -m
+numactl --hardware
+lspci -tv</code></pre>
+<div class="warn"><strong>NCCL 变量提醒：</strong> <code>NCCL_IB_HCA</code> 可以限制使用哪些 HCA，但错误限制会让 NCCL 避开健康网卡或只用少量端口。修改前先记录 <code>NCCL_DEBUG=INFO</code> 的实际选择。</div>
+</section>
+
+<section class="figure" id="s11">
+<h2>11. ibstat vs ibv_devinfo/rdma/mlxlink/nccl-tests</h2>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="ibstat 和相关 RDMA 工具对比">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">不同工具检查不同层，不要用一个工具替代全部证据</text>
+<rect x="110" y="120" width="880" height="76" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="166" font-size="20" font-weight="700" fill="#1d4ed8">ibstat</text><text x="355" y="166" font-size="16">HCA/端口摘要：State、Physical state、Rate、LID、GUID</text>
+<rect x="110" y="230" width="880" height="76" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="185" y="276" font-size="20" font-weight="700" fill="#6d28d9">ibv_devinfo</text><text x="355" y="276" font-size="16">verbs 能力：端口能力、MTU、GID、PKey、设备属性</text>
+<rect x="110" y="340" width="880" height="76" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="185" y="386" font-size="20" font-weight="700" fill="#0f766e">rdma/ip</text><text x="355" y="386" font-size="16">内核网络视图：link、netdev、地址、路由、命名空间</text>
+<rect x="110" y="450" width="880" height="76" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="185" y="496" font-size="20" font-weight="700" fill="#c2410c">mlxlink</text><text x="355" y="496" font-size="16">物理层细节：模块、误码、FEC、lane、协商和降速原因</text>
+<rect x="110" y="560" width="880" height="76" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="185" y="606" font-size="20" font-weight="700" fill="#15803d">nccl-tests</text><text x="355" y="606" font-size="16">训练通信实测：all-reduce 吞吐、算法选择、端到端瓶颈</text>
+</svg>
+<div class="caption"><code>ibstat</code> 是“端口摘要层”，不是带宽测试、不是物理误码分析、也不是 NCCL 端到端验证。</div>
+<table>
+<tr><th>你想知道</th><th>首选工具</th><th>原因</th></tr>
+<tr><td>端口是否 Active</td><td><code>ibstat</code></td><td>最快看到 HCA 和端口状态。</td></tr>
+<tr><td>GID index、MTU、PKey</td><td><code>ibv_devinfo</code></td><td>verbs 视图更完整。</td></tr>
+<tr><td>HCA 端口对应哪个 netdev</td><td><code>rdma link</code>、<code>ibdev2netdev</code></td><td>需要内核 link 映射。</td></tr>
+<tr><td>是不是线缆/模块/FEC 问题</td><td><code>mlxlink</code>、交换机 CLI</td><td>需要物理层细节和计数器。</td></tr>
+<tr><td>NCCL 是否真正跑得动</td><td><code>nccl-tests</code></td><td>端到端验证 GPU 通信栈。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 常见状态与根因映射</h2>
+<div class="grid-2">
+<div class="card"><strong>所有 HCA 都看不到</strong><br>驱动未加载、容器未透传设备、PCIe 设备不可见、OFED/rdma-core 安装不完整。</div>
+<div class="card"><strong>个别 HCA 缺失</strong><br>硬件故障、PCIe 枚举问题、固件异常、BIOS/插槽或线缆维护后未恢复。</div>
+<div class="card"><strong>Physical state 不是 LinkUp</strong><br>线缆、光模块、对端交换机端口、端口 admin down、速率/模式不兼容。</div>
+<div class="card"><strong>Physical LinkUp 但 State Init</strong><br>Subnet Manager 不可达、分区/PKey、fabric 接错、交换机子网配置不一致。</div>
+<div class="card"><strong>Active 但 Rate 低</strong><br>线缆等级不足、端口协商降速、交换机端口配置、模块兼容性或 FEC 问题。</div>
+<div class="card"><strong>ibstat 正常但 NCCL 慢</strong><br>GPU/HCA 拓扑、NCCL 选错网卡、PCIe 瓶颈、拥塞、RoCE QoS、消息大小或算法问题。</div>
+</div>
+<pre><code># 最小化采集包：适合提交给网络/平台团队
+hostname -f
+date -Is
+uname -a
+ibstat
+ibv_devinfo
+rdma link show
+nvidia-smi topo -m 2&gt;/dev/null || true
+dmesg | egrep -i 'mlx|rdma|infiniband|ib|link' | tail -100</code></pre>
+</section>
+
+<section class="figure" id="s13">
+<h2>13. 排障流程：从 ibstat 异常到根因定位</h2>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="ibstat 排障流程">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="52" width="290" height="70" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="95" text-anchor="middle" font-size="22" font-weight="700">训练/RDMA 异常</text>
+<polygon points="550,165 735,250 550,335 365,250" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="242" text-anchor="middle" font-size="18" font-weight="700">ibstat 端口 Active?</text><text x="550" y="268" text-anchor="middle" font-size="14">State + Physical state</text>
+<rect x="90" y="215" width="230" height="86" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="205" y="250" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">不是 Active</text><text x="205" y="277" text-anchor="middle" font-size="14">先修底层</text>
+<rect x="780" y="215" width="230" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="895" y="250" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">是 Active</text><text x="895" y="277" text-anchor="middle" font-size="14">继续上层验证</text>
+<rect x="85" y="395" width="245" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="207" y="431" text-anchor="middle" font-size="17" font-weight="700">Physical Down/Polling</text><text x="207" y="459" text-anchor="middle" font-size="14">线缆/模块/交换机端口</text>
+<rect x="375" y="395" width="245" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="497" y="431" text-anchor="middle" font-size="17" font-weight="700">LinkUp 但 Init</text><text x="497" y="459" text-anchor="middle" font-size="14">SM/PKey/fabric 子网</text>
+<rect x="665" y="395" width="245" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="787" y="431" text-anchor="middle" font-size="17" font-weight="700">Rate 正常?</text><text x="787" y="459" text-anchor="middle" font-size="14">低速则查 mlxlink</text>
+<rect x="665" y="565" width="245" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="787" y="601" text-anchor="middle" font-size="17" font-weight="700">NCCL/verbs 实测</text><text x="787" y="629" text-anchor="middle" font-size="14">ib_write_bw + nccl-tests</text>
+<rect x="155" y="565" width="360" height="92" rx="14" fill="#fef2f2" stroke="#fecaca"/><text x="335" y="601" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">修复后回到 ibstat 复查</text><text x="335" y="629" text-anchor="middle" font-size="14">不要只看一次截图</text>
+<line x1="550" y1="122" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="365" y1="250" x2="320" y2="250" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="735" y1="250" x2="780" y2="250" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<path d="M205 301 C205 340, 207 360, 207 395" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<path d="M320 280 C430 330, 497 350, 497 395" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<path d="M895 301 C865 345, 810 355, 787 395" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="787" y1="487" x2="787" y2="565" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<path d="M207 487 C225 535, 280 545, 335 565" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<path d="M497 487 C470 535, 410 545, 335 565" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<defs><marker id="m3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">排障顺序固定：先确认端口和子网，再确认物理速率和误码，最后验证 verbs/NCCL 端到端性能。</div>
+<h3>命令化流程</h3>
+<pre><code># A. 端口是否存在且 Active
+ibstat
+
+# B. 物理链路或速率异常时
+mlxlink -d &lt;pci_or_mst_device&gt; 2&gt;/dev/null || echo "需要 mlxlink/mst 或交换机侧配合"
+
+# C. Init/SM/LID 异常时
+ibstat | egrep 'State|Physical|Base lid|SM lid|Link layer'
+systemctl status opensm 2&gt;/dev/null || true
+
+# D. Active 后做端到端验证
+ib_write_bw -d mlx5_0 -i 1 &lt;peer&gt;
+NCCL_DEBUG=INFO ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 8</code></pre>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 脚本化巡检</h2>
+<p><code>ibstat</code> 输出主要面向人读，脚本里可以先做轻量解析；更严格的自动化建议结合 sysfs、<code>ibv_devinfo</code> 或平台资产系统。</p>
+<h3>检查是否存在非 Active 端口</h3>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+bad=0
+current=""
+
+while IFS= read -r line; do
+  case "$line" in
+    CA\ *) current="$line" ;;
+    *"State:"*)
+      if ! grep -q 'State: Active' &lt;&lt;&lt;"$line"; then
+        echo "WARN $current $line"
+        bad=1
+      fi
+      ;;
+  esac
+done &lt; &lt;(ibstat)
+
+exit "$bad"</code></pre>
+<h3>生成简短状态快照</h3>
+<pre><code>host=$(hostname -s)
+ts=$(date -Is)
+echo "## $host $ts"
+ibstat | awk '
+  /^CA / {ca=$2}
+  /Port [0-9]+:/ {port=$1 " " $2}
+  /State:/ {state=$2}
+  /Physical state:/ {phy=$3}
+  /Rate:/ {rate=$2}
+  /Base lid:/ {lid=$3}
+  /Link layer:/ {
+    print ca, port, "state=" state, "physical=" phy, "rate=" rate, "lid=" lid, "layer=" $3
+  }'</code></pre>
+<div class="warn"><strong>脚本提醒：</strong> 不同版本输出格式可能略有差异。生产巡检脚本要保留原始 <code>ibstat</code> 附件，并用实际机型样本测试解析逻辑。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 安全边界与误判</h2>
+<p><code>ibstat</code> 是安全的只读命令，但围绕它的后续操作可能有风险。例如重启驱动、重启 OpenSM、切换端口模式、修改交换机 QoS、调整 NCCL 环境变量，都可能影响正在运行的训练任务。</p>
+<table>
+<tr><th>操作</th><th>风险</th><th>安全做法</th></tr>
+<tr><td>运行 <code>ibstat</code></td><td>低，只读。</td><td>可在问题现场先采集。</td></tr>
+<tr><td>重启 <code>opensm</code></td><td>可能影响整个 IB 子网。</td><td>确认 SM 主备、维护窗口和影响范围。</td></tr>
+<tr><td>重载 RDMA/网卡驱动</td><td>会中断本机 RDMA 通信。</td><td>先排空训练任务，再操作。</td></tr>
+<tr><td>调整交换机端口</td><td>可能影响多台机器。</td><td>用端口描述、GUID、线缆标签交叉确认。</td></tr>
+<tr><td>设置 NCCL 变量</td><td>可能绕开健康链路或掩盖底层问题。</td><td>记录基线日志，单变量实验，保留回滚方式。</td></tr>
+</table>
+<div class="danger"><strong>生产警告：</strong> <code>ibstat</code> 显示异常时，不要在不确认影响面的情况下批量重启网络服务或交换机端口。先采集证据，再定位到单节点、单端口、单链路或单 fabric。</div>
+<div class="note"><strong>常见误判：</strong> <code>State: Active</code> 只能说明端口逻辑可用；如果 NCCL 仍慢，继续检查 GPU/HCA 拓扑、PCIe 降级、RoCE QoS、交换机拥塞、误码计数和应用实际选择的网卡。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 实战练习与参考</h2>
+<h3>练习 1：读懂本机所有端口</h3>
+<pre><code>ibstat
+ibstat | egrep 'CA |Port [0-9]+:|State:|Physical state:|Rate:|Base lid:|SM lid:|Port GUID:|Link layer:'</code></pre>
+<h3>练习 2：把 ibstat 和 NCCL 选择关联起来</h3>
+<pre><code># 先列出 HCA
+ls -1 /sys/class/infiniband
+
+# 再观察 NCCL 实际使用的网卡
+NCCL_DEBUG=INFO ./build/all_reduce_perf -b 8 -e 128M -f 2 -g 8 2&gt;&amp;1 | tee nccl.log
+grep -Ei 'NET/IB|mlx5|HCA|GID|Socket' nccl.log</code></pre>
+<h3>练习 3：故障汇报模板</h3>
+<pre><code>cat &gt; rdma-report.txt &lt;&ltEOF
+host: $(hostname -f)
+time: $(date -Is)
+kernel: $(uname -r)
+
+## ibstat
+$(ibstat 2&gt;&amp;1)
+
+## rdma link
+$(rdma link show 2&gt;&amp;1)
+
+## ibv_devinfo summary
+$(ibv_devinfo 2&gt;&amp;1 | head -120)
+EOF</code></pre>
+<h3>练习 4：写出你的节点准入条件</h3>
+<p>把本教程中的状态检查整理成集群准入规则，例如：所有训练 HCA 必须 <code>Active/LinkUp</code>、速率不低于机型基线、<code>Base lid</code> 非零、NCCL 日志选中预期 HCA、点对点 RDMA 带宽达到基线。</p>
+</section>
+
+<section class="refbox"><h2>参考资料与速查卡</h2>
+<ul>
+<li>Linux man-pages / distribution manuals：<code>ibstat(8)</code>、<code>ibv_devinfo(1)</code>、<code>rdma(8)</code>。</li>
+<li>NVIDIA/Mellanox OFED 与 WinOF-2 文档：ConnectX 端口模式、mlxlink、mst、固件和链路诊断。</li>
+<li>OpenSM 文档：Subnet Manager、LID 分配、分区和 InfiniBand fabric 管理。</li>
+<li>NCCL 官方文档：<code>NCCL_DEBUG</code>、<code>NCCL_IB_HCA</code>、<code>NCCL_SOCKET_IFNAME</code>、RDMA 网络选择和调优。</li>
+<li>perftest 工具文档：<code>ib_write_bw</code>、<code>ib_read_bw</code>、<code>ib_send_bw</code> 的点对点验证方法。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 HCA/端口/State/LID，再用 <code>ibv_devinfo</code> 补齐 verbs 视图，最后用 <code>ib_write_bw</code> 和 <code>nccl-tests</code> 做端到端验证。</p>
+<table>
+<tr><th>目标</th><th>命令</th><th>通过标准</th></tr>
+<tr><td>看所有 HCA</td><td><code>ibstat</code></td><td>训练使用的端口都 <code>Active/LinkUp</code>。</td></tr>
+<tr><td>看指定 HCA</td><td><code>ibstat mlx5_0</code></td><td>状态、速率、LID 符合预期。</td></tr>
+<tr><td>看 verbs 详情</td><td><code>ibv_devinfo -v</code></td><td>端口能力、MTU、GID/PKey 清楚。</td></tr>
+<tr><td>看 HCA-netdev 映射</td><td><code>rdma link show</code></td><td>知道 NCCL/应用实际该选哪个设备。</td></tr>
+<tr><td>看物理链路细节</td><td><code>mlxlink -d ...</code></td><td>速率、FEC、模块、误码无异常。</td></tr>
+<tr><td>验证 RDMA 吞吐</td><td><code>ib_write_bw</code></td><td>带宽接近硬件和拓扑预期。</td></tr>
+</table>
+</section>
+
+<div class="footer">ibstat 深度教程 · AI Infra/RDMA 图文版 · HCA 端口状态、GUID/LID、Subnet Manager、NCCL 就绪与生产排障</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ethtool 深度教程：AI Infra 网卡链路、队列、卸载与性能排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ethtool 深度教程：AI Infra 网卡链路、队列、卸载与性能排障</h1>
+<p class="sub">这份教程面向 AI Infra、训练集群、推理集群、RoCE/RDMA 网络和高速以太网节点，系统讲解 Linux 命令 <code>ethtool</code>。重点不是死记参数，而是建立“网卡接口 → 驱动/固件 → 物理链路 → 队列/中断 → 内核卸载 → 统计计数 → NCCL/RDMA 现象”的排障模型，覆盖链路速率/双工、驱动固件、ring buffer、offload、channels、stats、NCCL/RDMA 性能线索、变更安全，以及与 <code>ip</code>、<code>ss</code>、<code>rdma</code>、<code>mlxlink</code> 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">NIC 链路</span><span class="chip">Speed/Duplex</span><span class="chip">Driver/Firmware</span><span class="chip">Ring -g/-G</span><span class="chip">Offload -k/-K</span><span class="chip">Channels -l/-L</span><span class="chip">Stats -S</span><span class="chip">NCCL/RDMA</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ethtool</code> 是 Linux 网卡的“低层体检和调参工具”：它能查看链路、速率、驱动、固件、队列、offload 和硬件统计，也能修改部分 NIC 行为。</div>
+<div class="success"><strong>最重要原则：</strong> 先只读采集，再单机灰度，再可回滚变更；不要在训练高峰期直接批量执行 <code>-G</code>、<code>-K</code>、<code>-L</code>、<code>-C</code> 或速率协商修改。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ethtool 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：从物理链路到 AI 任务</a></li>
+<li><a class="anchor" href="#s3">安装、权限与接口识别</a></li>
+<li><a class="anchor" href="#s4">链路、速率、双工与自协商</a></li>
+<li><a class="anchor" href="#s5">驱动、固件、总线与 NIC 身份</a></li>
+<li><a class="anchor" href="#s6">端口定位、模块与光电链路线索</a></li>
+<li><a class="anchor" href="#s7">Ring buffer：<code>-g</code> / <code>-G</code></a></li>
+<li><a class="anchor" href="#s8">Offload：<code>-k</code> / <code>-K</code></a></li>
+<li><a class="anchor" href="#s9">Channels 与队列：<code>-l</code> / <code>-L</code></a></li>
+<li><a class="anchor" href="#s10">统计计数：<code>-S</code></a></li>
+<li><a class="anchor" href="#s11">Interrupt moderation：<code>-c</code> / <code>-C</code></a></li>
+<li><a class="anchor" href="#s12">RSS、队列映射与 CPU/NUMA</a></li>
+<li><a class="anchor" href="#s13">NCCL/RDMA 性能线索</a></li>
+<li><a class="anchor" href="#s14">ethtool vs ip/ss/rdma/mlxlink</a></li>
+<li><a class="anchor" href="#s15">安全变更流程与回滚</a></li>
+<li><a class="anchor" href="#s16">常见故障场景与排障</a></li>
+<li><a class="anchor" href="#s17">自动化基线采集</a></li>
+<li><a class="anchor" href="#s18">学习路线与练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ethtool 是什么</h2>
+<p><code>ethtool</code> 用于查询和配置 Linux 网络接口的硬件与驱动参数。它比 <code>ip addr</code>、<code>ip link</code> 更贴近 NIC 本身，适合回答“这块网卡以什么速率连上了交换机、用什么驱动和固件、队列是否够、offload 是否打开、硬件是否在丢包”等问题。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>检查链路状态、速率、双工、自协商、驱动/固件、ring、channels、offloads、coalesce、NIC 私有统计。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不显示 socket 队列、TCP 会话、路由策略、RDMA QP 细节、交换机端口内部状态或 NCCL collective 算法。</div>
+<div class="card"><strong>它的本质</strong><br>通过内核和驱动接口读取或设置 NIC 参数；能看到很多硬件线索，但解释这些线索需要结合 <code>ip</code>、<code>ss</code>、<code>rdma</code>、<code>mlxlink</code>、NCCL 日志和交换机遥测。</div>
+</div>
+<pre><code># 查看接口链路、速率、双工、自协商
+ethtool eth0
+
+# 查看驱动、固件、PCI 总线信息
+ethtool -i eth0
+
+# 查看 ring buffer 上限和当前值
+ethtool -g eth0
+
+# 查看 offload 开关
+ethtool -k eth0
+
+# 查看 NIC 私有统计
+ethtool -S eth0</code></pre>
+<div class="warn"><strong>权限提醒：</strong> 只读查询通常普通用户可运行；修改链路、offload、ring、channels、coalesce 通常需要 <code>sudo</code>，并且可能瞬断或影响线上流量。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：ethtool 在 AI Infra 网络栈中的位置</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="ethtool AI Infra network stack model">
+<rect x="16" y="16" width="1068" height="620" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">从 NIC 到训练任务的观察路径</text>
+<rect x="70" y="120" width="190" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="165" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">物理链路</text>
+<text x="165" y="188" text-anchor="middle" font-size="14">Speed / Duplex</text>
+<text x="165" y="212" text-anchor="middle" font-size="14">Auto-neg / FEC</text>
+<rect x="315" y="120" width="190" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="410" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">驱动固件</text>
+<text x="410" y="188" text-anchor="middle" font-size="14">driver / version</text>
+<text x="410" y="212" text-anchor="middle" font-size="14">firmware / bus</text>
+<rect x="560" y="120" width="190" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="655" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">队列缓冲</text>
+<text x="655" y="188" text-anchor="middle" font-size="14">rings / channels</text>
+<text x="655" y="212" text-anchor="middle" font-size="14">RSS / IRQ / NUMA</text>
+<rect x="805" y="120" width="190" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="900" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">内核卸载</text>
+<text x="900" y="188" text-anchor="middle" font-size="14">TSO/GSO/GRO</text>
+<text x="900" y="212" text-anchor="middle" font-size="14">checksum / LRO</text>
+<rect x="145" y="350" width="810" height="145" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="390" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">AI Infra 解释层</text>
+<text x="550" y="430" text-anchor="middle" font-size="16">iperf3 吞吐低、NCCL all-reduce 慢、RDMA 重传、对象存储抖动、推理延迟尾部变高</text>
+<text x="550" y="462" text-anchor="middle" font-size="16">用 ethtool 先确认 NIC 基线，再结合 ip / ss / rdma / mlxlink / 交换机计数定位</text>
+<line x1="260" y1="175" x2="315" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="505" y1="175" x2="560" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="750" y1="175" x2="805" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M165 230 C210 305, 355 325, 430 350" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M410 230 C445 300, 500 322, 520 350" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M655 230 C640 300, 600 322, 580 350" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M900 230 C850 305, 725 325, 665 350" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">ethtool 不是 NCCL/RDMA 专用工具，但它能快速确认 NIC 层是否存在明显基线问题。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、权限与接口识别</h2>
+<p>使用 <code>ethtool</code> 前先确认目标接口。AI 节点常同时有管理网、业务网、存储网、RoCE 网和容器虚拟网卡，误查接口会直接导致错误结论。</p>
+<pre><code># Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y ethtool
+
+# RHEL / CentOS / Rocky / Alma
+sudo dnf install -y ethtool
+
+# 确认版本
+ethtool --version
+
+# 列出接口摘要，先排除 lo、docker、veth、cni 等虚拟接口
+ip -br link
+ip -br addr
+
+# 看访问目标 IP 会走哪张网卡
+ip route get 10.20.30.40</code></pre>
+<table>
+<tr><th>对象</th><th>示例</th><th>AI Infra 含义</th></tr>
+<tr><td>物理网卡</td><td><code>eth0</code>、<code>ens5f0</code>、<code>enp193s0f0np0</code></td><td>通常是 ethtool 的主要目标</td></tr>
+<tr><td>bond/team</td><td><code>bond0</code></td><td>需要同时看 bond 逻辑接口和 slave 物理口</td></tr>
+<tr><td>VLAN</td><td><code>bond0.100</code></td><td>ethtool 常应下钻到底层物理接口</td></tr>
+<tr><td>容器接口</td><td><code>veth*</code>、<code>cali*</code>、<code>cni*</code></td><td>更多是网络命名空间和 CNI 问题，不代表 NIC 硬件</td></tr>
+</table>
+<div class="note"><strong>实用习惯：</strong> 先用 <code>ip route get &lt;peer_ip&gt;</code> 找实际出口，再对出口接口和底层物理接口分别运行 <code>ethtool</code>。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 链路、速率、双工与自协商</h2>
+<p><code>ethtool DEV</code> 是第一条必跑命令。它能快速判断接口是否连上、链路速率是否降级、双工是否异常、自协商是否符合预期。高速训练网络中，100G 接成 25G、200G 接成 100G、链路反复 flap 都会直接影响 NCCL 和存储吞吐。</p>
+<pre><code># 查看链路基础状态
+ethtool ens5f0
+
+# 只看关键字段
+ethtool ens5f0 | egrep 'Speed|Duplex|Auto-negotiation|Link detected|Port|Transceiver'
+
+# 只判断是否有 carrier
+cat /sys/class/net/ens5f0/carrier
+cat /sys/class/net/ens5f0/operstate</code></pre>
+<table>
+<tr><th>字段</th><th>正常含义</th><th>异常线索</th></tr>
+<tr><td><code>Speed</code></td><td>当前协商速率，例如 <code>100000Mb/s</code></td><td>低于预期，可能是线缆、模块、交换机端口、FEC、端口 profile 或分叉模式问题</td></tr>
+<tr><td><code>Duplex</code></td><td>高速以太网一般应为 <code>Full</code></td><td>半双工在现代数据中心几乎不应出现</td></tr>
+<tr><td><code>Auto-negotiation</code></td><td>是否自协商</td><td>两端配置不一致会导致链路不上或速率异常</td></tr>
+<tr><td><code>Link detected</code></td><td>物理链路是否检测到</td><td><code>no</code> 表示先查光模块、线缆、交换机端口和网卡状态</td></tr>
+</table>
+<div class="danger"><strong>变更警告：</strong> 修改 speed、duplex、autoneg 可能导致链路重协商甚至中断。除非明确知道交换机端配置，否则不要在生产流量接口上直接强制速率。</div>
+<pre><code># 只读记录当前状态
+ethtool ens5f0 &gt; /tmp/ens5f0.link.before.txt
+
+# 如果必须变更，先确认维护窗口和交换机端配置
+# 示例：启用自协商。执行后可能短暂断链。
+sudo ethtool -s ens5f0 autoneg on
+
+# 示例：强制 100G 全双工。仅在明确两端都支持且需要时使用。
+sudo ethtool -s ens5f0 speed 100000 duplex full autoneg off</code></pre>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 驱动、固件、总线与 NIC 身份</h2>
+<p><code>ethtool -i DEV</code> 用来确认网卡由哪个驱动管理、驱动版本、固件版本、PCI 总线位置。AI 集群中，固件版本不一致、驱动版本混杂、网卡插槽/NUMA 位置不同，都可能造成节点间性能差异。</p>
+<pre><code># 查看驱动、固件、总线
+ethtool -i ens5f0
+
+# 结合 PCI 设备信息
+lspci -s 0000:ca:00.0 -vv
+
+# 看接口到 NUMA 节点的归属
+cat /sys/class/net/ens5f0/device/numa_node
+
+# 记录网卡身份
+printf 'iface=%s\n' ens5f0
+ethtool -i ens5f0
+cat /sys/class/net/ens5f0/address</code></pre>
+<table>
+<tr><th>字段</th><th>用途</th><th>排障价值</th></tr>
+<tr><td><code>driver</code></td><td>内核驱动名，例如 <code>mlx5_core</code>、<code>ice</code>、<code>i40e</code></td><td>判断是否使用预期驱动，是否支持目标功能</td></tr>
+<tr><td><code>version</code></td><td>驱动版本或内核集成版本</td><td>与已知问题、发行版内核、OFED/厂商驱动版本关联</td></tr>
+<tr><td><code>firmware-version</code></td><td>NIC 固件版本</td><td>同型号节点应尽量一致；异常节点先对比固件</td></tr>
+<tr><td><code>bus-info</code></td><td>PCI 地址</td><td>用于映射 NUMA、PCIe 拓扑和物理槽位</td></tr>
+</table>
+<div class="note"><strong>AI 节点建议：</strong> 把 <code>ethtool -i</code> 输出纳入节点验收基线；同一训练池内的 NIC 型号、固件和驱动差异应可解释。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 端口定位、模块与光电链路线索</h2>
+<p>链路问题常来自物理层：插错口、线缆质量、光模块兼容性、交换机端口 profile、FEC、分叉模式。<code>ethtool</code> 能辅助定位接口对应的物理端口，并读取部分模块信息。</p>
+<pre><code># 让网口 LED 闪烁 10 秒，用于机房定位端口
+sudo ethtool -p ens5f0 10
+
+# 读取模块 EEPROM 信息，是否支持取决于驱动和权限
+sudo ethtool -m ens5f0
+
+# 查看支持和广告的链路模式
+ethtool ens5f0 | sed -n '/Supported link modes:/,/Advertised pause frame use:/p'</code></pre>
+<div class="grid-3">
+<div class="card"><strong>插错口</strong><br>用 <code>-p</code> 闪灯，比只看接口名更可靠，尤其是多口 NIC 和多张 NIC 的 GPU 服务器。</div>
+<div class="card"><strong>模块异常</strong><br><code>-m</code> 可提供厂商、波长、序列号、温度等线索，但并非所有驱动都开放完整信息。</div>
+<div class="card"><strong>速率降级</strong><br>对比 supported、advertised、link partner advertised，判断两端是否都宣告了目标速率。</div>
+</div>
+<div class="warn"><strong>边界提醒：</strong> FEC、SerDes、交换机侧误码和端口 profile 往往需要交换机命令或厂商工具确认；<code>ethtool</code> 只能提供主机侧的一部分证据。</div>
+</section>
+
+<section class="figure" id="fig-tuning">
+<h3>流程图：ring、offload、channels 的安全调参路径</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="ethtool tuning workflow for rings offloads channels">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">不要从“直接改参数”开始</text>
+<rect x="85" y="125" width="210" height="88" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="190" y="160" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">1. 采集当前值</text>
+<text x="190" y="190" text-anchor="middle" font-size="14">-g / -k / -l / -c / -S</text>
+<rect x="330" y="125" width="210" height="88" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="435" y="160" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">2. 明确瓶颈假设</text>
+<text x="435" y="190" text-anchor="middle" font-size="14">drop、CPU、pps、latency</text>
+<rect x="575" y="125" width="210" height="88" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="680" y="160" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">3. 单节点灰度</text>
+<text x="680" y="190" text-anchor="middle" font-size="14">维护窗口 + 回滚命令</text>
+<rect x="820" y="125" width="210" height="88" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="925" y="160" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">4. 对比验证</text>
+<text x="925" y="190" text-anchor="middle" font-size="14">NCCL / iperf3 / counters</text>
+<line x1="295" y1="169" x2="330" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="540" y1="169" x2="575" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="785" y1="169" x2="820" y2="169" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<rect x="115" y="330" width="250" height="108" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="240" y="365" text-anchor="middle" font-size="19" font-weight="700">Ring -G</text>
+<text x="240" y="394" text-anchor="middle" font-size="14">缓冲更深可降低 burst drop</text>
+<text x="240" y="420" text-anchor="middle" font-size="14">但可能增加排队延迟</text>
+<rect x="425" y="330" width="250" height="108" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="550" y="365" text-anchor="middle" font-size="19" font-weight="700">Offload -K</text>
+<text x="550" y="394" text-anchor="middle" font-size="14">降低 CPU 开销</text>
+<text x="550" y="420" text-anchor="middle" font-size="14">也可能影响抓包可见性</text>
+<rect x="735" y="330" width="250" height="108" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="860" y="365" text-anchor="middle" font-size="19" font-weight="700">Channels -L</text>
+<text x="860" y="394" text-anchor="middle" font-size="14">提升多队列并行</text>
+<text x="860" y="420" text-anchor="middle" font-size="14">需匹配 CPU/IRQ/RSS</text>
+<rect x="245" y="560" width="610" height="70" rx="16" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="550" y="590" text-anchor="middle" font-size="19" font-weight="700" fill="#b91c1c">任何调参都必须能回答：改了什么、为什么改、怎么证明、如何回滚</text>
+<text x="550" y="616" text-anchor="middle" font-size="14">否则只是随机试参数</text>
+<path d="M240 438 C245 500, 350 530, 455 560" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<path d="M550 438 L550 560" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<path d="M860 438 C855 500, 750 530, 645 560" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">ring、offload、channels 都可能影响性能，也都可能引入副作用；先建立假设再改。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. Ring buffer：<code>-g</code> / <code>-G</code></h2>
+<p>ring buffer 是网卡与驱动之间的收发描述符队列。RX ring 太小可能在突发流量下出现丢包；TX ring 太小可能影响发送排队。增大 ring 有时能减少 burst drop，但也可能增加排队延迟和缓存占用。</p>
+<pre><code># 查看 ring 最大值和当前值
+ethtool -g ens5f0
+
+# 典型输出包含 Pre-set maximums 和 Current hardware settings
+# 先保存当前值，便于回滚
+ethtool -g ens5f0 &gt; /tmp/ens5f0.ring.before.txt
+
+# 示例：把 RX/TX ring 调到 4096。执行前确认驱动支持和维护窗口。
+sudo ethtool -G ens5f0 rx 4096 tx 4096
+
+# 回滚到原值示例
+sudo ethtool -G ens5f0 rx 1024 tx 1024</code></pre>
+<table>
+<tr><th>现象</th><th>可能相关</th><th>验证方式</th></tr>
+<tr><td>短时间突发丢包</td><td>RX ring、CPU 中断处理、交换机微突发</td><td>对比 <code>-S</code> 中 rx drop/missed/errors 与业务时间线</td></tr>
+<tr><td>吞吐不稳</td><td>ring、channels、IRQ、NUMA、拥塞</td><td>调 ring 前后做相同 iperf3/NCCL microbenchmark</td></tr>
+<tr><td>延迟尾部变差</td><td>过深队列、coalesce、上游拥塞</td><td>同时观察 p99/p999 延迟，不只看吞吐</td></tr>
+</table>
+<div class="warn"><strong>调参边界：</strong> ring 不是越大越好。训练流量追求吞吐时可考虑增大；低延迟推理流量需要更谨慎地评估排队延迟。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. Offload：<code>-k</code> / <code>-K</code></h2>
+<p>offload 把部分网络处理交给 NIC 或内核聚合路径，常见包括 checksum、TSO、GSO、GRO、LRO、RX/TX VLAN offload。AI Infra 中，offload 通常有助于降低 CPU 开销，但某些排障、抓包、虚拟化、隧道或低延迟场景需要临时关闭。</p>
+<pre><code># 查看所有 offload 开关
+ethtool -k ens5f0
+
+# 保存基线
+ethtool -k ens5f0 &gt; /tmp/ens5f0.offload.before.txt
+
+# 示例：临时关闭 GRO，用于验证聚合对抓包/延迟观察的影响
+sudo ethtool -K ens5f0 gro off
+
+# 回滚
+sudo ethtool -K ens5f0 gro on
+
+# 示例：查看常见 offload
+ethtool -k ens5f0 | egrep 'tcp-segmentation|generic-segmentation|generic-receive|large-receive|rx-checksumming|tx-checksumming'</code></pre>
+<table>
+<tr><th>开关</th><th>常见作用</th><th>注意事项</th></tr>
+<tr><td><code>rx-checksumming</code>/<code>tx-checksumming</code></td><td>校验和卸载</td><td>抓包中看到 checksum 异常不一定是真错，可能是卸载导致</td></tr>
+<tr><td><code>tso</code>/<code>gso</code></td><td>发送大包分段卸载</td><td>通常降低 CPU 消耗；关闭后 CPU 压力可能明显上升</td></tr>
+<tr><td><code>gro</code>/<code>lro</code></td><td>接收侧聚合</td><td>提升吞吐但可能影响包级可见性和延迟分析</td></tr>
+<tr><td><code>rx-vlan-offload</code>/<code>tx-vlan-offload</code></td><td>VLAN 标签处理卸载</td><td>与虚拟化、抓包、交换配置一起分析</td></tr>
+</table>
+<div class="danger"><strong>生产警告：</strong> 不要为了“抓包更直观”长期关闭 offload。关闭后可能把 CPU 打满，让 NCCL、数据加载或推理服务性能更差。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. Channels 与队列：<code>-l</code> / <code>-L</code></h2>
+<p>channels 表示 NIC 可用的 RX/TX/combined 队列数量。高速网卡依赖多队列、RSS 和 IRQ 分布把流量并行分摊到多个 CPU 核。队列太少时，100G/200G/400G 链路可能因为单核软中断或队列瓶颈跑不满。</p>
+<pre><code># 查看队列上限和当前配置
+ethtool -l ens5f0
+
+# 保存当前值
+ethtool -l ens5f0 &gt; /tmp/ens5f0.channels.before.txt
+
+# 示例：设置 combined 队列数。需要结合 CPU 核数、NUMA 和 IRQ 亲和性。
+sudo ethtool -L ens5f0 combined 16
+
+# 查看网卡队列目录
+ls /sys/class/net/ens5f0/queues
+
+# 查看中断分布
+grep -i ens5f0 /proc/interrupts</code></pre>
+<div class="grid-3">
+<div class="card"><strong>combined</strong><br>许多驱动用 combined 表示一组 RX/TX 队列，常见于多队列网卡。</div>
+<div class="card"><strong>队列数不是越多越好</strong><br>过多队列可能增加调度和缓存开销，还要看实际流数、CPU 核数和中断亲和性。</div>
+<div class="card"><strong>与 RSS 联动</strong><br>多队列要靠 RSS hash 把不同 flow 分散，否则仍可能集中到少数队列。</div>
+</div>
+<div class="note"><strong>NCCL 线索：</strong> 多连接、多 rail、多个 rank 并发通信时，channels/RSS/IRQ 分布不合理会表现为某些 CPU 核 <code>softirq</code> 高、吞吐上不去或方向不对称。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 统计计数：<code>-S</code></h2>
+<p><code>ethtool -S DEV</code> 输出驱动暴露的 NIC 私有统计。不同厂商字段差异很大，但它是判断硬件层是否丢包、错误、拥塞、队列溢出、pause、buffer 不足的重要入口。</p>
+<pre><code># 查看全部 NIC 统计
+ethtool -S ens5f0
+
+# 过滤常见异常关键字
+ethtool -S ens5f0 | egrep -i 'drop|discard|error|crc|miss|timeout|pause|overflow|buffer|retry|retrans|ecn|pfc'
+
+# 间隔观察计数是否增长
+watch -n 1 "ethtool -S ens5f0 | egrep -i 'drop|discard|error|crc|miss|pause|pfc|ecn'"
+
+# 做测试前后快照
+ethtool -S ens5f0 &gt; /tmp/ens5f0.stats.before.txt
+# run iperf3 / nccl-tests / workload
+ethtool -S ens5f0 &gt; /tmp/ens5f0.stats.after.txt
+diff -u /tmp/ens5f0.stats.before.txt /tmp/ens5f0.stats.after.txt</code></pre>
+<table>
+<tr><th>计数类型</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>crc</code>、<code>symbol</code>、<code>phy</code> error</td><td>物理链路、线缆、模块、交换端口问题</td><td>查交换机端口错误、换线/模块、看 FEC 和链路 flap</td></tr>
+<tr><td><code>rx_missed</code>、<code>rx_no_buffer</code>、<code>drop</code></td><td>接收侧处理不过来或队列/缓冲不足</td><td>看 ring、channels、IRQ、CPU softirq、burst</td></tr>
+<tr><td><code>pause</code>、<code>pfc</code>、<code>ecn</code></td><td>拥塞控制或无损网络相关信号</td><td>结合 RDMA、DCQCN/PFC、交换机队列水位排查</td></tr>
+<tr><td><code>tx_timeout</code>、<code>reset</code></td><td>驱动、固件或硬件异常</td><td>查 <code>dmesg</code>、驱动版本、固件、PCIe AER</td></tr>
+</table>
+<div class="warn"><strong>解释提醒：</strong> <code>-S</code> 字段不是标准化 API。不要跨不同驱动硬套字段含义；先看驱动文档或厂商说明。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. Interrupt moderation：<code>-c</code> / <code>-C</code></h2>
+<p>coalesce 控制网卡中断合并策略。合并更多包再中断可以降低 CPU 开销、提高吞吐；更快中断可以降低延迟但增加 CPU 压力。训练吞吐型流量和在线推理低延迟流量的偏好可能相反。</p>
+<pre><code># 查看当前中断合并参数
+ethtool -c ens5f0
+
+# 保存当前值
+ethtool -c ens5f0 &gt; /tmp/ens5f0.coalesce.before.txt
+
+# 示例：设置 RX/TX usecs。执行前先确认目标延迟和 CPU 余量。
+sudo ethtool -C ens5f0 rx-usecs 16 tx-usecs 16
+
+# 回滚示例，使用你环境中的原始值
+sudo ethtool -C ens5f0 rx-usecs 8 tx-usecs 8</code></pre>
+<div class="grid-2">
+<div class="card"><strong>吞吐优先</strong><br>适度中断合并可降低 CPU 中断频率，让大流量更平稳。</div>
+<div class="card"><strong>延迟优先</strong><br>过度合并会推高尾延迟，在线推理或控制面请求需要谨慎。</div>
+<div class="card"><strong>CPU 饱和</strong><br>如果 <code>softirq</code> 高、单核满，coalesce 可能缓解，但不替代队列和 IRQ 亲和性治理。</div>
+<div class="card"><strong>验证指标</strong><br>同时看吞吐、重传、p99/p999、CPU、<code>-S</code> drop，而不是只看单一指标。</div>
+</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. RSS、队列映射与 CPU/NUMA</h2>
+<p><code>ethtool</code> 可以查看部分 RSS hash 配置和 indirection table。AI 服务器通常有多 NUMA、多 GPU、多 NIC，网络中断落在远端 NUMA 或少数 CPU 核上，会造成链路看似正常但应用吞吐低。</p>
+<pre><code># 查看 RSS hash indirection table
+ethtool -x ens5f0
+
+# 查看指定协议的 hash 字段，支持取决于驱动
+ethtool -n ens5f0
+
+# 查看接口所在 NUMA 节点
+cat /sys/class/net/ens5f0/device/numa_node
+
+# 查看 IRQ 分布和 CPU softirq
+grep -i ens5f0 /proc/interrupts
+mpstat -P ALL 1
+
+# 查看队列对应的 RPS/XPS 配置
+for q in /sys/class/net/ens5f0/queues/rx-*; do echo "$q"; cat "$q/rps_cpus"; done</code></pre>
+<table>
+<tr><th>问题</th><th>表现</th><th>检查</th></tr>
+<tr><td>RSS 没有分散</td><td>多流量仍集中到少数队列</td><td><code>ethtool -x</code>、<code>/proc/interrupts</code>、队列统计</td></tr>
+<tr><td>IRQ 亲和性不合理</td><td>单核 <code>softirq</code> 高，吞吐方向不对称</td><td><code>irqbalance</code>、<code>smp_affinity</code>、NUMA 绑定</td></tr>
+<tr><td>NIC/GPU 跨 NUMA</td><td>RDMA 或数据加载吞吐差</td><td><code>lstopo</code>、<code>nvidia-smi topo -m</code>、PCI bus-info</td></tr>
+</table>
+<div class="note"><strong>实践建议：</strong> <code>ethtool -L</code> 只解决队列数量问题；队列是否真正被 CPU 和流量均匀使用，还要继续看 RSS、IRQ、NUMA 和业务连接分布。</div>
+</section>
+
+<section class="figure" id="fig-nccl">
+<h3>对照图：NCCL/RDMA 慢时 ethtool 能提供哪些线索</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="NCCL RDMA troubleshooting clues with ethtool">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="26" font-weight="700">NCCL / RDMA 性能异常：先区分层次</text>
+<rect x="70" y="120" width="230" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="185" y="158" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">链路层</text>
+<text x="185" y="188" text-anchor="middle" font-size="14">Speed 降级 / Link flap</text>
+<text x="185" y="214" text-anchor="middle" font-size="14">CRC / symbol error</text>
+<rect x="435" y="120" width="230" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="158" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">主机队列层</text>
+<text x="550" y="188" text-anchor="middle" font-size="14">ring / channels / IRQ</text>
+<text x="550" y="214" text-anchor="middle" font-size="14">rx_missed / no_buffer</text>
+<rect x="800" y="120" width="230" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="915" y="158" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">RDMA 拥塞层</text>
+<text x="915" y="188" text-anchor="middle" font-size="14">PFC / ECN / retrans</text>
+<text x="915" y="214" text-anchor="middle" font-size="14">结合 rdma / mlxlink</text>
+<rect x="120" y="355" width="860" height="86" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="390" text-anchor="middle" font-size="21" font-weight="700">ethtool 结论必须和应用证据闭环</text>
+<text x="550" y="418" text-anchor="middle" font-size="15">NCCL_DEBUG、nccl-tests、ib_write_bw、iperf3、CPU softirq、交换机端口计数一起看</text>
+<rect x="155" y="530" width="790" height="76" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="562" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">如果 ethtool 基线正常，问题可能在路由、RDMA 配置、交换机拥塞、NCCL 拓扑或应用通信模式</text>
+<text x="550" y="588" text-anchor="middle" font-size="14">不要把所有 NCCL 慢都归因于网卡参数</text>
+<path d="M185 240 C220 300, 350 330, 455 355" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M550 240 L550 355" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M915 240 C880 300, 750 330, 645 355" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="550" y1="441" x2="550" y2="530" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">ethtool 常用于排除或确认 NIC 层问题；RDMA/NCCL 真正根因还需要跨层证据。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. NCCL/RDMA 性能线索</h2>
+<p>在 RoCE 或高速以太网训练集群里，<code>ethtool</code> 的价值是快速发现主机侧明显异常，并为 NCCL/RDMA 排障提供方向。它不能替代 <code>rdma</code>、<code>ibv_devinfo</code>、<code>ib_write_bw</code>、<code>mlxlink</code> 或交换机遥测。</p>
+<pre><code># 训练任务慢时，先采集 NIC 快照
+iface=ens5f0
+mkdir -p /tmp/net-snapshot
+ethtool "$iface"       &gt; /tmp/net-snapshot/$iface.link.txt
+ethtool -i "$iface"    &gt; /tmp/net-snapshot/$iface.driver.txt
+ethtool -g "$iface"    &gt; /tmp/net-snapshot/$iface.ring.txt
+ethtool -k "$iface"    &gt; /tmp/net-snapshot/$iface.offload.txt
+ethtool -l "$iface"    &gt; /tmp/net-snapshot/$iface.channels.txt
+ethtool -S "$iface"    &gt; /tmp/net-snapshot/$iface.stats.before.txt
+
+# 跑一次可复现的 nccl-tests / ib_write_bw / iperf3 后再采集
+ethtool -S "$iface"    &gt; /tmp/net-snapshot/$iface.stats.after.txt
+diff -u /tmp/net-snapshot/$iface.stats.before.txt /tmp/net-snapshot/$iface.stats.after.txt</code></pre>
+<table>
+<tr><th>应用现象</th><th>ethtool 重点</th><th>下一层工具</th></tr>
+<tr><td>NCCL 吞吐低但 CPU 不高</td><td>速率是否降级、<code>-S</code> 是否有错误、pause/PFC 是否异常</td><td><code>NCCL_DEBUG=INFO</code>、<code>nccl-tests</code>、交换机端口计数</td></tr>
+<tr><td>iperf3 多流也跑不满</td><td>channels、IRQ、ring、offload、链路速率</td><td><code>mpstat</code>、<code>sar -n DEV</code>、<code>perf</code></td></tr>
+<tr><td>RoCE 抖动或重传</td><td>PFC/ECN/pause 相关计数、丢包错误</td><td><code>rdma statistic</code>、<code>mlxlink</code>、交换机 buffer/ECN</td></tr>
+<tr><td>某些节点显著慢</td><td>驱动固件版本、PCI/NUMA、队列配置是否偏离集群基线</td><td><code>lstopo</code>、<code>nvidia-smi topo -m</code>、资产系统</td></tr>
+</table>
+<div class="success"><strong>排障思路：</strong> 对比“快节点”和“慢节点”的 <code>ethtool</code> 快照，经常比单看慢节点更快发现固件、速率、队列或 offload 差异。</div>
+</section>
+
+<section class="figure" id="fig-tools">
+<h3>选择图：ethtool vs ip/ss/rdma/mlxlink</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="tool selection diagram ethtool ip ss rdma mlxlink">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">网络排障工具各看一层</text>
+<rect x="80" y="125" width="190" height="130" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="175" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">ethtool</text>
+<text x="175" y="197" text-anchor="middle" font-size="14">NIC 硬件/驱动</text>
+<text x="175" y="224" text-anchor="middle" font-size="14">链路、队列、offload</text>
+<rect x="330" y="125" width="190" height="130" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="425" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">ip</text>
+<text x="425" y="197" text-anchor="middle" font-size="14">地址/路由/链路状态</text>
+<text x="425" y="224" text-anchor="middle" font-size="14">MTU、邻居、策略路由</text>
+<rect x="580" y="125" width="190" height="130" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="675" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">ss</text>
+<text x="675" y="197" text-anchor="middle" font-size="14">Socket / TCP</text>
+<text x="675" y="224" text-anchor="middle" font-size="14">拥塞、重传、队列</text>
+<rect x="830" y="125" width="190" height="130" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="925" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">rdma/mlxlink</text>
+<text x="925" y="197" text-anchor="middle" font-size="14">RDMA/端口物理层</text>
+<text x="925" y="224" text-anchor="middle" font-size="14">QP、PFC、FEC、SerDes</text>
+<rect x="135" y="365" width="830" height="145" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="405" text-anchor="middle" font-size="23" font-weight="700" fill="#334155">一个可靠结论通常来自多工具交叉验证</text>
+<text x="550" y="445" text-anchor="middle" font-size="16">链路速率正常 ≠ 路由正确；TCP 正常 ≠ RDMA 正常；RDMA 正常 ≠ NCCL 拓扑最优</text>
+<text x="550" y="477" text-anchor="middle" font-size="16">先确定问题层次，再选择工具，不要用一个命令解释所有现象</text>
+</svg>
+<div class="caption">ethtool 负责 NIC 层证据，其他工具负责路由、socket、RDMA 和交换侧证据。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. ethtool vs ip/ss/rdma/mlxlink</h2>
+<table>
+<tr><th>工具</th><th>主要视角</th><th>典型问题</th><th>不能替代什么</th></tr>
+<tr><td><code>ethtool</code></td><td>NIC、驱动、链路、offload、队列、硬件统计</td><td>速率降级、ring/drop、offload、channels、固件差异</td><td>路由、socket 状态、RDMA QP、交换机内部队列</td></tr>
+<tr><td><code>ip</code></td><td>Linux 网络配置</td><td>地址、MTU、路由、邻居、bond/VLAN</td><td>NIC 私有统计和驱动固件</td></tr>
+<tr><td><code>ss</code></td><td>Socket/TCP 连接</td><td>发送/接收队列、拥塞控制、TCP retrans</td><td>物理链路和 NIC ring</td></tr>
+<tr><td><code>rdma</code></td><td>RDMA 设备、link、resource、statistics</td><td>RoCE/IB 资源、QP、RDMA 计数</td><td>普通 TCP socket 细节和部分 NIC offload</td></tr>
+<tr><td><code>mlxlink</code></td><td>NVIDIA/Mellanox 设备物理链路</td><td>FEC、SerDes、模块、物理层错误</td><td>非 mlx 设备和 Linux 路由/socket 语义</td></tr>
+</table>
+<pre><code># 一组跨层排障命令
+iface=ens5f0
+peer=10.20.30.40
+
+ethtool "$iface"
+ethtool -i "$iface"
+ethtool -S "$iface" | egrep -i 'drop|error|crc|pause|pfc|ecn'
+ip route get "$peer"
+ip -s link show dev "$iface"
+ss -tin dst "$peer"
+rdma link show
+rdma statistic show</code></pre>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 安全变更流程与回滚</h2>
+<p><code>ethtool</code> 的修改类命令经常立即生效，部分会导致链路抖动、驱动重配、流量短暂中断或性能回退。生产环境要把它当成基础设施变更，而不是普通查询命令。</p>
+<h3>推荐流程</h3>
+<ol>
+<li>明确目标：降低 drop、提升吞吐、降低 CPU、降低尾延迟，不能只说“优化网卡”。</li>
+<li>保存基线：<code>ethtool</code>、<code>-i</code>、<code>-g</code>、<code>-k</code>、<code>-l</code>、<code>-c</code>、<code>-S</code>。</li>
+<li>选单台或少量节点灰度，避开训练高峰，记录维护窗口。</li>
+<li>一次只改一类参数，例如只改 ring 或只改 channels。</li>
+<li>跑同一套验证：<code>iperf3</code>、<code>nccl-tests</code>、业务压测、CPU、<code>-S</code> 计数。</li>
+<li>准备回滚命令，并确认重启、NetworkManager、systemd-networkd 或厂商工具是否会覆盖配置。</li>
+</ol>
+<pre><code># 采集基线
+iface=ens5f0
+out=/tmp/ethtool-$iface-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$out"
+ethtool "$iface"    &gt; "$out/link.txt"
+ethtool -i "$iface" &gt; "$out/driver.txt"
+ethtool -g "$iface" &gt; "$out/ring.txt"
+ethtool -k "$iface" &gt; "$out/offload.txt"
+ethtool -l "$iface" &gt; "$out/channels.txt"
+ethtool -c "$iface" &gt; "$out/coalesce.txt"
+ethtool -S "$iface" &gt; "$out/stats.before.txt"
+
+# 示例灰度：只改 ring
+sudo ethtool -G "$iface" rx 4096 tx 4096
+
+# 验证后采集
+ethtool -S "$iface" &gt; "$out/stats.after.txt"
+diff -u "$out/stats.before.txt" "$out/stats.after.txt"
+
+# 回滚使用基线中的原始值，不要照抄示例数字
+sudo ethtool -G "$iface" rx 1024 tx 1024</code></pre>
+<div class="danger"><strong>不要这样做：</strong> 不要在所有 GPU 节点上直接循环执行 <code>sudo ethtool -K $iface gro off</code> 或 <code>sudo ethtool -L $iface combined 64</code>，除非已有灰度数据和回滚策略。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障图：从症状到 ethtool 检查点</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="ethtool troubleshooting flow">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="415" y="50" width="270" height="68" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="92" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">网络性能或链路异常</text>
+<rect x="65" y="175" width="230" height="96" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="180" y="212" text-anchor="middle" font-size="18" font-weight="700">链路不上/降速</text>
+<text x="180" y="242" text-anchor="middle" font-size="14">ethtool DEV / -m</text>
+<rect x="315" y="175" width="230" height="96" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="212" text-anchor="middle" font-size="18" font-weight="700">吞吐低</text>
+<text x="430" y="242" text-anchor="middle" font-size="14">-l / -g / -k / CPU</text>
+<rect x="565" y="175" width="230" height="96" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="680" y="212" text-anchor="middle" font-size="18" font-weight="700">丢包/错误增长</text>
+<text x="680" y="242" text-anchor="middle" font-size="14">-S / ip -s link</text>
+<rect x="815" y="175" width="230" height="96" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="930" y="212" text-anchor="middle" font-size="18" font-weight="700">延迟尾部高</text>
+<text x="930" y="242" text-anchor="middle" font-size="14">-c / offload / queues</text>
+<rect x="90" y="380" width="920" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="418" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">做前后对比，而不是只看一次输出</text>
+<text x="550" y="450" text-anchor="middle" font-size="15">业务前快照 → 运行可复现测试 → 业务后快照 → diff 计数增长 → 和应用日志时间线对齐</text>
+<rect x="190" y="600" width="720" height="72" rx="16" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="550" y="630" text-anchor="middle" font-size="19" font-weight="700" fill="#b91c1c">如果要修改参数，先写回滚命令并确认维护窗口</text>
+<text x="550" y="656" text-anchor="middle" font-size="14">排障不是在生产上随机试开关</text>
+<line x1="550" y1="118" x2="180" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="118" x2="430" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="118" x2="680" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="118" x2="930" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="180" y1="271" x2="355" y2="380" stroke="#94a3b8" stroke-width="3"/>
+<line x1="430" y1="271" x2="500" y2="380" stroke="#94a3b8" stroke-width="3"/>
+<line x1="680" y1="271" x2="610" y2="380" stroke="#94a3b8" stroke-width="3"/>
+<line x1="930" y1="271" x2="745" y2="380" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="492" x2="550" y2="600" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">先判断症状属于链路、吞吐、错误还是延迟，再选择对应的 ethtool 检查点。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 常见故障场景与排障</h2>
+<div class="grid-2">
+<div class="card"><strong>场景 1：100G 网卡只协商到 25G</strong><br>查 <code>ethtool DEV</code> 的 Speed、advertised modes、link partner advertised；继续查模块、线缆、交换机端口 profile、分叉模式和 FEC。</div>
+<div class="card"><strong>场景 2：iperf3 多流跑不满</strong><br>查 <code>-l</code> 队列数、<code>/proc/interrupts</code>、CPU softirq、RSS、offload 和 <code>-S</code> drop。</div>
+<div class="card"><strong>场景 3：NCCL 某些节点慢</strong><br>对比快慢节点的 <code>-i</code>、<code>-g</code>、<code>-k</code>、<code>-l</code>、<code>-S</code>，再看 GPU/NIC NUMA 拓扑。</div>
+<div class="card"><strong>场景 4：抓包显示 checksum 错误</strong><br>先查 checksum offload。发送侧抓包看到 checksum “bad” 可能只是硬件尚未填充校验和。</div>
+<div class="card"><strong>场景 5：突发时丢包</strong><br>用测试前后 <code>-S</code> diff 找 rx_missed/no_buffer/drop，结合 ring、channels、coalesce 和交换机队列。</div>
+<div class="card"><strong>场景 6：低延迟推理尾延迟升高</strong><br>检查 GRO/LRO、coalesce、ring 深度和 CPU 争用；吞吐优化参数可能不适合低延迟服务。</div>
+</div>
+<h3>排障模板</h3>
+<pre><code>iface=ens5f0
+peer=10.20.30.40
+
+echo "== route =="
+ip route get "$peer"
+
+echo "== link =="
+ethtool "$iface" | egrep 'Speed|Duplex|Auto-negotiation|Link detected'
+
+echo "== driver =="
+ethtool -i "$iface"
+
+echo "== queues =="
+ethtool -g "$iface"
+ethtool -l "$iface"
+
+echo "== offload =="
+ethtool -k "$iface" | egrep 'tcp-segmentation|generic-segmentation|generic-receive|large-receive|checksum'
+
+echo "== suspicious stats =="
+ethtool -S "$iface" | egrep -i 'drop|discard|error|crc|miss|pause|pfc|ecn|timeout|reset'</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 自动化基线采集</h2>
+<p>对 AI 集群来说，<code>ethtool</code> 最有价值的用法之一是周期性或验收时采集基线。出现性能异常时，用快慢节点、变更前后、不同机架之间的基线 diff 快速定位偏差。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+out=${1:-/tmp/ethtool-baseline-$(hostname)-$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$out"
+
+# 只采集物理接口示例：按需调整过滤规则
+for iface in $(ls /sys/class/net | grep -Ev '^(lo|docker|veth|cni|flannel|br-|virbr)'); do
+  echo "collect $iface"
+  {
+    echo "### ip addr"
+    ip -br addr show dev "$iface" || true
+    echo "### ethtool link"
+    ethtool "$iface" || true
+    echo "### driver"
+    ethtool -i "$iface" || true
+    echo "### ring"
+    ethtool -g "$iface" || true
+    echo "### offload"
+    ethtool -k "$iface" || true
+    echo "### channels"
+    ethtool -l "$iface" || true
+    echo "### coalesce"
+    ethtool -c "$iface" || true
+    echo "### stats"
+    ethtool -S "$iface" || true
+  } &gt; "$out/$iface.txt"
+done
+
+echo "saved to $out"</code></pre>
+<div class="success"><strong>基线字段建议：</strong> 至少保留接口名、MAC、PCI bus-info、driver、firmware-version、Speed、ring、channels、offload、coalesce 和关键 <code>-S</code> 计数。</div>
+<div class="warn"><strong>脚本提醒：</strong> 采集脚本可以宽容失败；变更脚本不能宽容失败。不要把只读采集脚本改成批量调参脚本后直接跑全量节点。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 学习路线与练习任务</h2>
+<h3>第一阶段：会读状态</h3>
+<ul>
+<li>用 <code>ip route get</code> 找到访问目标节点的实际出口接口。</li>
+<li>用 <code>ethtool DEV</code> 判断链路是否 up、速率是否符合预期。</li>
+<li>用 <code>ethtool -i DEV</code> 记录驱动、固件和 PCI bus-info。</li>
+</ul>
+<h3>第二阶段：会定位性能线索</h3>
+<ul>
+<li>用 <code>-g</code>、<code>-l</code>、<code>-k</code> 理解 ring、channels、offload 当前配置。</li>
+<li>用 <code>-S</code> 做测试前后 diff，找增长的 drop/error/pause 计数。</li>
+<li>把 <code>ethtool</code> 输出和 <code>iperf3</code>、NCCL 日志、CPU softirq 对齐。</li>
+</ul>
+<h3>第三阶段：会安全变更</h3>
+<ul>
+<li>每次只改一个变量，例如只改 ring 或只改 coalesce。</li>
+<li>写下变更假设、验证指标和回滚命令。</li>
+<li>先在单节点或小流量窗口灰度，再考虑集群推广。</li>
+</ul>
+<h3>练习</h3>
+<ol>
+<li>找出一台机器上所有物理接口，并记录每个接口的 speed、driver、firmware-version。</li>
+<li>对某个接口执行 <code>ethtool -S</code>，过滤 drop/error/pause 相关计数。</li>
+<li>跑一次 <code>iperf3</code> 前后分别采集 <code>-S</code>，用 <code>diff -u</code> 观察哪些计数增长。</li>
+<li>比较两台同型号节点的 <code>ethtool -i</code> 和 <code>-l</code> 输出，找出差异。</li>
+<li>在非生产测试接口上修改 ring，并用基线值回滚。</li>
+<li>关闭再恢复 <code>gro</code>，观察抓包和 CPU 使用变化；不要在生产接口长期关闭。</li>
+</ol>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>ethtool(8)</code>，包含 link settings、driver info、rings、offloads、channels、coalesce、statistics 等说明。</li>
+<li>Linux kernel networking documentation：网络设备、NAPI、RSS、RPS/XPS、segmentation offload、GRO/GSO 等机制。</li>
+<li>NVIDIA Networking / Mellanox 文档：<code>mlx5</code>、RoCE、PFC/ECN、DCQCN、<code>mlxlink</code> 与固件工具相关说明。</li>
+<li>发行版网络文档：NetworkManager、systemd-networkd、udev 命名、持久化 ethtool 配置方式。</li>
+<li>NCCL 官方文档：NCCL 环境变量、拓扑、网络接口选择、调试日志和性能测试方法。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 <code>ethtool DEV</code>、<code>-i</code>、<code>-S</code>，再学习 ring/offload/channels/coalesce，最后结合 RDMA、NCCL、交换机和 NUMA 拓扑做跨层排障。</p>
+</section>
+<div class="footer">ethtool 深度教程 · AI Infra 网络链路、驱动固件、ring/offload/channels、NCCL/RDMA 排障与生产安全</div>
+</div>
+</body>
+</html>

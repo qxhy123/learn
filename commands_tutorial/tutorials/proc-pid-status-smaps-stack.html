@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>/proc/&lt;pid&gt;/status、smaps、stack 深度教程：AI Infra 进程内省与排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>/proc/&lt;pid&gt;/status、smaps、stack 深度教程</h1>
+<p class="sub">这份教程面向 AI Infra 和 Linux 生产排障：用 <code>/proc/&lt;pid&gt;/status</code> 快速读进程身份、线程数、内存高水位、CPU/NUMA 亲和性；用 <code>smaps</code> 与 <code>smaps_rollup</code> 拆解匿名页、文件映射、共享库、PSS/RSS；用 <code>stack</code> 观察线程在内核态卡在哪里。重点不是背字段，而是建立“单进程内省 → 训练任务症状 → 容器/cgroup/NUMA/线程根因”的诊断路径。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">/proc</span><span class="chip">status</span><span class="chip">smaps</span><span class="chip">smaps_rollup</span><span class="chip">kernel stack</span><span class="chip">VmRSS/VmHWM</span><span class="chip">Threads</span><span class="chip">Cpus_allowed</span><span class="chip">Mems_allowed</span><span class="chip">NUMA</span><span class="chip">容器排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>/proc/&lt;pid&gt;/status</code> 是进程健康摘要，<code>smaps</code> 是内存映射账本，<code>stack</code> 是内核态调用栈快照；三者合起来能解释“这个训练进程到底占了多少内存、被限制在哪些 CPU/NUMA 节点、线程是否异常、是否卡在内核 I/O 或 futex”。</div>
+<div class="success"><strong>生产原则：</strong> 这些文件主要是只读观察，但仍要控制频率和权限范围；<code>smaps</code> 对超大进程读取成本较高，线上优先用 <code>smaps_rollup</code> 做汇总，只有需要定位具体映射时再读完整 <code>smaps</code>。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">/proc/&lt;pid&gt; 是什么</a></li>
+<li><a class="anchor" href="#s2">安全找到目标 PID</a></li>
+<li><a class="anchor" href="#s3">status：进程摘要与身份</a></li>
+<li><a class="anchor" href="#s4">VmRSS、VmHWM 与内存高水位</a></li>
+<li><a class="anchor" href="#s5">Threads 与 AI 训练线程膨胀</a></li>
+<li><a class="anchor" href="#s6">Cpus_allowed 与 CPU 亲和性</a></li>
+<li><a class="anchor" href="#s7">Mems_allowed 与 NUMA 节点</a></li>
+<li><a class="anchor" href="#s8">smaps：逐映射内存账本</a></li>
+<li><a class="anchor" href="#s9">smaps_rollup：快速总览</a></li>
+<li><a class="anchor" href="#s10">RSS、PSS、Private 与 Shared</a></li>
+<li><a class="anchor" href="#s11">AI 训练内存诊断流程</a></li>
+<li><a class="anchor" href="#s12">stack：内核调用栈快照</a></li>
+<li><a class="anchor" href="#s13">权限、安全与生产影响</a></li>
+<li><a class="anchor" href="#s14">容器、PID namespace 与 cgroup</a></li>
+<li><a class="anchor" href="#s15">proc 文件 vs ps/free/pmap</a></li>
+<li><a class="anchor" href="#s16">排障场景与命令模板</a></li>
+<li><a class="anchor" href="#s17">限制、陷阱与检查清单</a></li>
+<li><a class="anchor" href="#s18">学习路线与练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. /proc/&lt;pid&gt; 是什么</h2>
+<p><code>/proc</code> 是 Linux 内核暴露运行时状态的伪文件系统。<code>/proc/&lt;pid&gt;</code> 不是磁盘上的真实目录，而是内核按需生成的单个进程视图。AI Infra 排障中，它常用于回答四类问题：进程是谁、吃了多少内存、被调度在哪些 CPU/NUMA 节点、是否卡在内核态。</p>
+<div class="grid-4">
+<div class="card"><strong>身份</strong><br><code>Name</code>、<code>Pid</code>、<code>PPid</code>、<code>Uid</code>、<code>Gid</code>、<code>NStgid</code> 帮你确认看到的是不是目标 worker。</div>
+<div class="card"><strong>内存</strong><br><code>VmRSS</code>、<code>VmHWM</code>、<code>RssAnon</code>、<code>RssFile</code>、<code>smaps</code> 帮你区分当前驻留、历史峰值和映射来源。</div>
+<div class="card"><strong>调度</strong><br><code>Threads</code>、<code>Cpus_allowed_list</code>、<code>Mems_allowed_list</code> 暴露线程数、CPU 绑定和 NUMA 限制。</div>
+<div class="card"><strong>卡顿</strong><br><code>stack</code>、<code>wchan</code>、<code>stat</code> 可辅助判断线程是否阻塞在 futex、I/O、内存回收或驱动路径。</div>
+</div>
+<pre><code># 当前 shell 的 proc 视图
+cat /proc/$$/status
+head -40 /proc/$$/smaps
+cat /proc/$$/smaps_rollup 2&gt;/dev/null || echo "kernel does not expose smaps_rollup"
+
+# 对目标 PID 读取摘要
+pid=12345
+grep -E '^(Name|State|Pid|PPid|Uid|Threads|VmRSS|VmHWM|RssAnon|RssFile|Cpus_allowed_list|Mems_allowed_list):' /proc/$pid/status</code></pre>
+<div class="warn"><strong>动态性提醒：</strong> <code>/proc/&lt;pid&gt;</code> 是瞬时快照。训练进程、DataLoader worker、NCCL helper 线程都可能在你读取时变化；做结论前最好连续采样。</div>
+</section>
+
+<section class="figure" id="fig-overall">
+<h3>信息图：status、smaps、stack 的整体分工</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="/proc pid status smaps stack 整体模型">
+<rect x="18" y="18" width="1064" height="624" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">单个 Linux 进程的三层内省</text>
+<rect x="70" y="125" width="280" height="160" rx="22" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="210" y="168" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">status</text>
+<text x="210" y="205" text-anchor="middle" font-size="15">身份、状态、线程数</text>
+<text x="210" y="232" text-anchor="middle" font-size="15">VmRSS / VmHWM</text>
+<text x="210" y="259" text-anchor="middle" font-size="15">CPU / NUMA allowed mask</text>
+<rect x="410" y="125" width="280" height="160" rx="22" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="168" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">smaps</text>
+<text x="550" y="205" text-anchor="middle" font-size="15">逐 VMA 映射账本</text>
+<text x="550" y="232" text-anchor="middle" font-size="15">RSS / PSS / Shared / Private</text>
+<text x="550" y="259" text-anchor="middle" font-size="15">匿名页、文件页、库、堆、栈</text>
+<rect x="750" y="125" width="280" height="160" rx="22" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="890" y="168" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">stack</text>
+<text x="890" y="205" text-anchor="middle" font-size="15">内核态调用栈</text>
+<text x="890" y="232" text-anchor="middle" font-size="15">futex / I/O / page fault</text>
+<text x="890" y="259" text-anchor="middle" font-size="15">线程卡顿线索</text>
+<rect x="160" y="390" width="780" height="140" rx="22" fill="#fff7ed" stroke="#fdba74"/>
+<text x="550" y="432" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">AI Infra 排障路径</text>
+<text x="550" y="470" text-anchor="middle" font-size="16">先用 status 看是否异常，再用 smaps_rollup 定量，再用 smaps 定位具体映射</text>
+<text x="550" y="500" text-anchor="middle" font-size="16">如果进程不动、GPU 空转、DataLoader 卡住，再看 stack / wchan / strace</text>
+<line x1="210" y1="285" x2="360" y2="390" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<line x1="550" y1="285" x2="550" y2="390" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<line x1="890" y1="285" x2="740" y2="390" stroke="#94a3b8" stroke-width="4" marker-end="url(#m1)"/>
+<defs><marker id="m1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">心智模型：<code>status</code> 快速判定方向，<code>smaps</code> 定量拆账，<code>stack</code> 在进程“看起来没动”时提供内核态线索。</div></section>
+
+<section class="section" id="s2">
+<h2>2. 安全找到目标 PID</h2>
+<p>不要只凭进程名猜 PID。AI 训练任务里可能同时存在 launcher、rank 进程、DataLoader worker、torch elastic agent、NCCL helper、Python 子进程和容器 shim。先确认命令行、父子关系、容器和用户，再读取 proc 文件。</p>
+<pre><code># 按命令行查找，避免只看到 python 这个泛名
+pgrep -af 'torchrun|deepspeed|train.py|python'
+
+# 展示父子关系，确认 launcher 与 rank 进程
+ps -eo pid,ppid,user,stat,comm,args --forest | grep -E 'torchrun|deepspeed|train.py|python' | grep -v grep
+
+# 选择一个 PID 后，确认身份和命令行
+pid=12345
+tr '\0' ' ' &lt; /proc/$pid/cmdline; echo
+grep -E '^(Name|State|Pid|PPid|Uid|Gid|NStgid|Threads):' /proc/$pid/status</code></pre>
+<table><tr><th>字段/文件</th><th>用途</th><th>排障价值</th></tr>
+<tr><td><code>/proc/&lt;pid&gt;/cmdline</code></td><td>NUL 分隔的启动参数</td><td>确认具体 rank、脚本、配置文件和环境传参。</td></tr>
+<tr><td><code>/proc/&lt;pid&gt;/environ</code></td><td>NUL 分隔的环境变量</td><td>可查 <code>OMP_NUM_THREADS</code>、<code>CUDA_VISIBLE_DEVICES</code>、<code>NCCL_*</code>，但权限更敏感。</td></tr>
+<tr><td><code>/proc/&lt;pid&gt;/status</code></td><td>身份、状态、内存、亲和性摘要</td><td>最适合第一眼快速检查。</td></tr>
+<tr><td><code>/proc/&lt;pid&gt;/task/</code></td><td>线程目录</td><td>逐线程看 <code>status</code>、<code>stack</code>、<code>wchan</code>。</td></tr>
+</table>
+<div class="danger"><strong>权限提醒：</strong> <code>cmdline</code> 和 <code>status</code> 通常较容易读；<code>environ</code>、<code>stack</code>、跨用户进程和开启 <code>hidepid</code>/<code>ptrace_scope</code> 的系统可能需要同 UID、root 或额外 capability。不要为了排障扩大权限后忘记恢复安全基线。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. status：进程摘要与身份</h2>
+<p><code>/proc/&lt;pid&gt;/status</code> 是面向人读的摘要文件，字段比 <code>stat</code> 稳定易读。它很适合在训练任务异常时先扫一遍：进程状态是否可运行、线程数是否膨胀、内存是否接近限制、CPU/NUMA 是否被错误绑定。</p>
+<pre><code>pid=12345
+awk '
+/^(Name|State|Tgid|Pid|PPid|TracerPid|Uid|Gid|FDSize|Threads|VmPeak|VmSize|VmHWM|VmRSS|RssAnon|RssFile|RssShmem|VmSwap|HugetlbPages|Cpus_allowed_list|Mems_allowed_list):/ {
+  print
+}' /proc/$pid/status</code></pre>
+<table><tr><th>字段</th><th>含义</th><th>AI Infra 读法</th></tr>
+<tr><td><code>State</code></td><td>运行、睡眠、僵尸、停止等状态</td><td><code>D</code> 常提示不可中断 I/O 或内核等待；<code>R</code> 多但吞吐低要看 CPU 绑定和调度竞争。</td></tr>
+<tr><td><code>TracerPid</code></td><td>是否被调试器/追踪器附加</td><td>非 0 时，<code>strace</code>、profiler 或安全代理可能改变行为。</td></tr>
+<tr><td><code>FDSize</code></td><td>文件描述符表容量</td><td>数据集、日志、socket 泄漏可导致 fd 增长；需要结合 <code>/proc/&lt;pid&gt;/fd</code>。</td></tr>
+<tr><td><code>voluntary_ctxt_switches</code>、<code>nonvoluntary_ctxt_switches</code></td><td>上下文切换计数</td><td>线程过多或锁竞争时计数增长快，需结合 <code>pidstat -w</code>。</td></tr>
+</table>
+<div class="note"><strong>读法建议：</strong> 先用 <code>grep -E</code> 抽字段，不要把完整 <code>status</code> 粘到告警里；稳定字段加上时间戳，连续采样更有价值。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. VmRSS、VmHWM 与内存高水位</h2>
+<p><code>VmRSS</code> 是当前驻留在物理内存中的页总量；<code>VmHWM</code> 是历史驻留高水位。训练任务出现 OOM、被 kubelet 驱逐或 cgroup 接近上限时，这两个字段能快速判断“现在高”还是“曾经高”。</p>
+<div class="grid-3">
+<div class="card"><strong><code>VmRSS</code></strong><br>当前 resident set size。包括匿名页、文件页和共享内存驻留部分，但共享页会被每个进程重复计入。</div>
+<div class="card"><strong><code>VmHWM</code></strong><br>RSS 历史峰值。训练 warmup、模型加载、checkpoint、dataset cache 可能让峰值远高于当前值。</div>
+<div class="card"><strong><code>VmSize</code></strong><br>虚拟地址空间大小。CUDA、mmap、allocator arena 可能让它很大，不等于真实物理内存占用。</div>
+</div>
+<pre><code># 连续观察 RSS 与高水位，适合训练启动和 checkpoint 阶段
+pid=12345
+while sleep 2; do
+  date '+%F %T'
+  grep -E '^(VmRSS|VmHWM|RssAnon|RssFile|RssShmem|VmSwap|HugetlbPages):' /proc/$pid/status
+  echo
+done</code></pre>
+<table><tr><th>现象</th><th>可能解释</th><th>下一步</th></tr>
+<tr><td><code>VmHWM</code> 高，<code>VmRSS</code> 已回落</td><td>阶段性峰值，例如加载权重、构建索引、checkpoint 临时 buffer。</td><td>对齐日志时间点；看 cgroup OOM 记录和训练阶段。</td></tr>
+<tr><td><code>VmRSS</code> 持续上升</td><td>缓存无界、DataLoader prefetch、Python 对象增长、C++ allocator 未释放。</td><td>用 <code>smaps_rollup</code> 判断匿名页还是文件页增长。</td></tr>
+<tr><td><code>VmSize</code> 极大但 <code>VmRSS</code> 不高</td><td>虚拟预留、mmap、CUDA 或 malloc arena 地址空间。</td><td>不要仅凭 <code>VIRT</code>/<code>VmSize</code> 报警。</td></tr>
+</table>
+<div class="warn"><strong>口径提醒：</strong> <code>VmRSS</code> 对共享页重复计数，多个 rank 加总可能虚高。跨进程归因优先看 <code>PSS</code>，它来自 <code>smaps</code>/<code>smaps_rollup</code>。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. Threads 与 AI 训练线程膨胀</h2>
+<p><code>Threads</code> 是进程内线程数量。AI 任务线程数异常常来自 OpenMP/MKL/OpenBLAS、DataLoader worker、数据解码库、gRPC/HTTP clients、日志/监控 agent 或 native runtime。线程过多会造成上下文切换、内存栈开销、CPU 抢占和 NUMA 迁移。</p>
+<pre><code>pid=12345
+grep '^Threads:' /proc/$pid/status
+ls /proc/$pid/task | wc -l
+
+# 找出每个线程名和状态
+for tid in /proc/$pid/task/*; do
+  awk '/^(Name|State|Tgid|Pid):/ {printf "%s ", $0} END {print ""}' "$tid/status"
+done | head -30</code></pre>
+<table><tr><th>检查点</th><th>命令</th><th>解释</th></tr>
+<tr><td>线程总数</td><td><code>grep '^Threads:' /proc/$pid/status</code></td><td>和预期的 rank、DataLoader、BLAS 线程配置对比。</td></tr>
+<tr><td>线程状态</td><td><code>grep '^State:' /proc/$pid/task/*/status</code></td><td>大量 <code>D</code> 看 I/O；大量 sleeping 不一定异常，要看栈和吞吐。</td></tr>
+<tr><td>CPU 亲和性</td><td><code>grep Cpus_allowed_list /proc/$pid/task/*/status</code></td><td>线程级亲和性可能不同于进程主线程。</td></tr>
+<tr><td>运行开销</td><td><code>pidstat -t -p $pid 1</code></td><td>看线程级 CPU、上下文切换和调度。</td></tr>
+</table>
+<div class="success"><strong>实践建议：</strong> 训练入口脚本中显式记录 <code>OMP_NUM_THREADS</code>、<code>MKL_NUM_THREADS</code>、<code>OPENBLAS_NUM_THREADS</code>、DataLoader <code>num_workers</code> 和 CPU 绑定策略，排障时能少猜很多。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Cpus_allowed 与 CPU 亲和性</h2>
+<p><code>Cpus_allowed</code> 是十六进制位图，<code>Cpus_allowed_list</code> 是更好读的 CPU 列表。AI 节点上它常由 <code>taskset</code>、Kubernetes CPU Manager、cpuset cgroup、systemd 或作业调度器设置。错误绑定会导致 GPU 供数不足、NCCL helper 线程竞争、NUMA 远端访问增多。</p>
+<pre><code>pid=12345
+grep -E '^Cpus_allowed|^Mems_allowed' /proc/$pid/status
+
+# 主线程与子线程可能不同，抽样检查线程级 CPU mask
+for tid in /proc/$pid/task/*; do
+  printf '%s ' "${tid##*/}"
+  grep '^Cpus_allowed_list:' "$tid/status"
+done | head -20
+
+# 与 lscpu/numactl 对照
+lscpu -e=CPU,NODE,SOCKET,CORE | head
+numactl --hardware</code></pre>
+<div class="grid-3">
+<div class="card"><strong>绑定太窄</strong><br>DataLoader 和通信线程抢少量 CPU，GPU 利用率呈锯齿，<code>top -H</code> 看到少数核打满。</div>
+<div class="card"><strong>绑定跨 NUMA</strong><br>CPU 列表跨 socket，但内存或 GPU 亲和在另一侧，可能增加远端内存访问和 PCIe/NVLink 路径成本。</div>
+<div class="card"><strong>线程级差异</strong><br>某些 runtime 会在线程创建后设置 affinity，排障不能只看主进程一行。</div>
+</div>
+<div class="note"><strong>读法：</strong> <code>Cpus_allowed_list: 0-31</code> 说明该线程可在 0 到 31 号 CPU 上运行；这不代表它当前正在这些 CPU 上平均运行，实际调度还要看 <code>ps -L -o psr</code> 或 <code>pidstat -t</code>。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. Mems_allowed 与 NUMA 节点</h2>
+<p><code>Mems_allowed</code>/<code>Mems_allowed_list</code> 表示进程允许在哪些 NUMA memory node 分配内存。AI 训练通常同时关心 GPU locality、CPU locality、host memory、page cache 和 pinned memory。若 CPU 可跨节点运行但内存只允许某个节点，或容器 cpuset 与 NUMA 策略不匹配，就可能出现远端访问、局部 OOM 或吞吐抖动。</p>
+<pre><code>pid=12345
+grep -E '^Mems_allowed|^Cpus_allowed' /proc/$pid/status
+numactl --show
+numastat -p $pid 2&gt;/dev/null || true
+
+# 如果在容器中，主机侧也要看 cpuset cgroup
+cat /proc/$pid/cgroup
+grep -R . /sys/fs/cgroup/* 2&gt;/dev/null | grep -E 'cpuset.cpus|cpuset.mems' | head</code></pre>
+<table><tr><th>信号</th><th>风险</th><th>排查动作</th></tr>
+<tr><td><code>Mems_allowed_list</code> 只有一个节点</td><td>该节点内存压力高时容易局部回收或 OOM。</td><td>对照 <code>numactl -H</code>、cgroup cpuset 和作业调度策略。</td></tr>
+<tr><td>CPU 允许多个 socket，mems 只允许一个 node</td><td>跨 socket 线程可能远端访问内存。</td><td>检查 CPU/GPU topology，必要时统一绑定。</td></tr>
+<tr><td>容器内看到的 CPU/mem 与主机不一致</td><td>namespace/cgroup 视图造成误判。</td><td>在主机 PID namespace 读取目标进程 proc。</td></tr>
+</table>
+<div class="warn"><strong>NUMA 提醒：</strong> <code>Mems_allowed</code> 说明“允许在哪里分配”，不直接说明“已经分配在哪里”。已经分布在哪里要看 <code>numastat -p</code>、<code>/proc/&lt;pid&gt;/numa_maps</code> 或 perf/PMU。</div>
+</section>
+
+<section class="figure" id="fig-memory-flow">
+<h3>流程图：从 status 到 smaps 的内存诊断路径</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="status 到 smaps 内存诊断流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="48" width="290" height="70" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">训练进程内存异常</text>
+<polygon points="550,160 730,250 550,340 370,250" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="242" text-anchor="middle" font-size="17" font-weight="700">status 看到什么？</text>
+<text x="550" y="268" text-anchor="middle" font-size="14">VmRSS / VmHWM / VmSwap</text>
+<rect x="70" y="420" width="240" height="92" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="190" y="456" text-anchor="middle" font-size="17" font-weight="700">VmHWM 高但 RSS 回落</text>
+<text x="190" y="484" text-anchor="middle" font-size="14">找阶段性峰值</text>
+<rect x="335" y="420" width="240" height="92" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="455" y="456" text-anchor="middle" font-size="17" font-weight="700">RSS 持续上升</text>
+<text x="455" y="484" text-anchor="middle" font-size="14">看 smaps_rollup 趋势</text>
+<rect x="600" y="420" width="240" height="92" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="720" y="456" text-anchor="middle" font-size="17" font-weight="700">PSS/RSS 口径不清</text>
+<text x="720" y="484" text-anchor="middle" font-size="14">用 smaps 拆共享页</text>
+<rect x="865" y="420" width="180" height="92" rx="16" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="955" y="456" text-anchor="middle" font-size="17" font-weight="700">VmSwap 非 0</text>
+<text x="955" y="484" text-anchor="middle" font-size="14">检查压力与延迟</text>
+<rect x="260" y="590" width="580" height="72" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="624" text-anchor="middle" font-size="20" font-weight="700">定位映射：heap、anon、file、shmem、库、栈、mmap cache</text>
+<text x="550" y="649" text-anchor="middle" font-size="14">再回到训练阶段、容器限制和 allocator 行为解释</text>
+<line x1="550" y1="118" x2="550" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="370" y1="250" x2="190" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="505" y1="340" x2="455" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="595" y1="340" x2="720" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="730" y1="250" x2="955" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#m2)"/>
+<line x1="190" y1="512" x2="410" y2="590" stroke="#94a3b8" stroke-width="3"/>
+<line x1="455" y1="512" x2="505" y2="590" stroke="#94a3b8" stroke-width="3"/>
+<line x1="720" y1="512" x2="620" y2="590" stroke="#94a3b8" stroke-width="3"/>
+<line x1="955" y1="512" x2="720" y2="590" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="m2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">内存排障先看摘要，再决定是否读取较重的 <code>smaps</code>。不要上来就把几十万行 <code>smaps</code> 扔进日志。</div></section>
+
+<section class="section" id="s8">
+<h2>8. smaps：逐映射内存账本</h2>
+<p><code>/proc/&lt;pid&gt;/smaps</code> 以 VMA（virtual memory area）为单位列出映射区间，每个区间后面跟一组内存统计。它能回答：RSS 来自堆、匿名 mmap、共享库、文件 mmap、tmpfs/shmem、线程栈，还是大页。</p>
+<pre><code>pid=12345
+head -80 /proc/$pid/smaps
+
+# 只看映射头，快速了解地址空间组成
+grep -E '^[0-9a-f]+-[0-9a-f]+' /proc/$pid/smaps | head -40
+
+# 按字段粗略汇总 KiB
+awk '
+/^Rss:/ {rss += $2}
+/^Pss:/ {pss += $2}
+/^Private_Dirty:/ {pd += $2}
+/^Shared_Clean:/ {sc += $2}
+END {printf "Rss=%d MiB Pss=%d MiB Private_Dirty=%d MiB Shared_Clean=%d MiB\n", rss/1024, pss/1024, pd/1024, sc/1024}
+' /proc/$pid/smaps</code></pre>
+<table><tr><th>smaps 字段</th><th>含义</th><th>常见 AI 场景</th></tr>
+<tr><td><code>Size</code></td><td>映射虚拟大小</td><td>不等于已驻留；大 mmap 可能只触碰一部分。</td></tr>
+<tr><td><code>Rss</code></td><td>该映射驻留物理页</td><td>判断哪个 VMA 正在占 RAM。</td></tr>
+<tr><td><code>Pss</code></td><td>按共享比例分摊后的 RSS</td><td>多个 rank 共享库和文件页时，PSS 更适合加总。</td></tr>
+<tr><td><code>Private_Dirty</code></td><td>进程独占且被修改的页</td><td>Python 对象、模型 CPU 副本、allocator 堆增长常体现在这里。</td></tr>
+<tr><td><code>Shared_Clean</code></td><td>共享且干净的页</td><td>共享库、只读 mmap 数据集、page cache 映射。</td></tr>
+<tr><td><code>Anonymous</code></td><td>匿名内存</td><td>堆、匿名 mmap、运行时 buffer；通常和 CPU RAM 压力相关。</td></tr>
+<tr><td><code>Locked</code></td><td>mlock 锁定页</td><td>pinned memory、RDMA 或特定 runtime 可能导致不可回收内存。</td></tr>
+</table>
+<div class="warn"><strong>成本提醒：</strong> 读取 <code>smaps</code> 需要内核遍历映射和页表统计，超大进程上可能有可感知开销。监控系统不要高频全量抓取。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. smaps_rollup：快速总览</h2>
+<p><code>/proc/&lt;pid&gt;/smaps_rollup</code> 提供整个进程的汇总统计，适合告警、采样和第一轮判断。它不告诉你具体哪个映射异常，但能快速区分 RSS、PSS、匿名页、共享页和 swap 的大方向。</p>
+<pre><code>pid=12345
+cat /proc/$pid/smaps_rollup
+
+# 连续记录 rollup，观察增长来自哪里
+while sleep 5; do
+  printf '\n== %s ==\n' "$(date '+%F %T')"
+  awk '/^(Rss|Pss|Private_Clean|Private_Dirty|Shared_Clean|Shared_Dirty|Anonymous|Swap|Locked):/ {print}' /proc/$pid/smaps_rollup
+done</code></pre>
+<div class="grid-3">
+<div class="card"><strong>适合</strong><br>低频采样、趋势判断、PSS 口径、告警现场快速摘要。</div>
+<div class="card"><strong>不适合</strong><br>定位具体 VMA、找哪个文件 mmap、区分 heap 与某段匿名 mmap。</div>
+<div class="card"><strong>兼容性</strong><br>较老内核可能没有 <code>smaps_rollup</code>；脚本要有 fallback。</div>
+</div>
+<pre><code># 带 fallback 的读取方式
+pid=12345
+if [ -r /proc/$pid/smaps_rollup ]; then
+  awk '/^(Rss|Pss|Anonymous|Swap|Locked):/ {print}' /proc/$pid/smaps_rollup
+else
+  awk '/^Rss:/ {rss += $2} /^Pss:/ {pss += $2} /^Anonymous:/ {anon += $2} END {print "Rss:", rss, "kB\nPss:", pss, "kB\nAnonymous:", anon, "kB"}' /proc/$pid/smaps
+fi</code></pre>
+</section>
+
+<section class="section" id="s10">
+<h2>10. RSS、PSS、Private 与 Shared</h2>
+<p>AI 节点上常见误判是把多个进程的 RSS 直接相加，得出“内存不够”的错误结论。共享库、只读文件 mmap、fork 后共享页会在每个进程 RSS 中重复出现。<code>PSS</code> 把共享页按共享者数量分摊，更适合跨 rank 或 worker 加总。</p>
+<table><tr><th>口径</th><th>含义</th><th>什么时候用</th><th>风险</th></tr>
+<tr><td><code>RSS</code></td><td>进程可见的驻留页总和，共享页重复计入</td><td>看单进程当前驻留压力</td><td>多进程加总会虚高</td></tr>
+<tr><td><code>PSS</code></td><td>共享页按比例分摊</td><td>估算一组进程对物理内存的公平占用</td><td>读取成本比 status 高</td></tr>
+<tr><td><code>Private_Clean/Dirty</code></td><td>只有该进程使用的页</td><td>定位不可共享的真实增长</td><td>clean 页仍可能被回收，dirty 页回收成本更高</td></tr>
+<tr><td><code>Shared_Clean/Dirty</code></td><td>多个进程共享的页</td><td>判断共享库、mmap 数据集、tmpfs</td><td>shared dirty 可能与 shmem、IPC、fork 写时复制相关</td></tr>
+</table>
+<pre><code># 汇总同一用户下训练进程的 PSS，避免 RSS 简单相加
+for pid in $(pgrep -u "$USER" -f 'train.py|torchrun|deepspeed'); do
+  awk -v pid="$pid" '
+    /^Name:/ {name=$2}
+    /^Pss:/ {pss += $2}
+    END {printf "pid=%s name=%s pss=%.1f MiB\n", pid, name, pss/1024}
+  ' /proc/$pid/smaps 2&gt;/dev/null
+done</code></pre>
+<div class="note"><strong>判断经验：</strong> <code>Private_Dirty</code> 持续增长更像进程独占内存增长；<code>Shared_Clean</code> 高常见于共享库和只读 mmap；<code>Anonymous</code> 高通常比 <code>RssFile</code> 更值得关注训练进程自身。</div>
+</section>
+
+<section class="figure" id="fig-tool-compare">
+<h3>对比图：proc 文件、ps、free、pmap 的观测口径</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="proc ps free pmap 观测口径对比">
+<rect x="20" y="20" width="1060" height="640" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="27" font-weight="700">同一个内存问题，工具看到的层次不同</text>
+<rect x="65" y="130" width="215" height="360" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="172" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">status</text>
+<text x="172" y="215" text-anchor="middle" font-size="15">单进程摘要</text>
+<text x="172" y="245" text-anchor="middle" font-size="15">VmRSS / VmHWM</text>
+<text x="172" y="275" text-anchor="middle" font-size="15">Threads / affinity</text>
+<text x="172" y="335" text-anchor="middle" font-size="14">快、轻、适合第一眼</text>
+<rect x="320" y="130" width="215" height="360" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="427" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">smaps</text>
+<text x="427" y="215" text-anchor="middle" font-size="15">逐映射账本</text>
+<text x="427" y="245" text-anchor="middle" font-size="15">RSS / PSS</text>
+<text x="427" y="275" text-anchor="middle" font-size="15">Private / Shared</text>
+<text x="427" y="335" text-anchor="middle" font-size="14">重、细、适合归因</text>
+<rect x="575" y="130" width="215" height="360" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="682" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">ps / pmap</text>
+<text x="682" y="215" text-anchor="middle" font-size="15">用户态汇总展示</text>
+<text x="682" y="245" text-anchor="middle" font-size="15">常来自 proc</text>
+<text x="682" y="275" text-anchor="middle" font-size="15">便于排序和扫描</text>
+<text x="682" y="335" text-anchor="middle" font-size="14">快，但字段口径要确认</text>
+<rect x="830" y="130" width="215" height="360" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="937" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">free / meminfo</text>
+<text x="937" y="215" text-anchor="middle" font-size="15">整机口径</text>
+<text x="937" y="245" text-anchor="middle" font-size="15">cache / available</text>
+<text x="937" y="275" text-anchor="middle" font-size="15">不能归因单进程</text>
+<text x="937" y="335" text-anchor="middle" font-size="14">判断节点压力</text>
+<rect x="235" y="555" width="630" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="590" text-anchor="middle" font-size="18" font-weight="700">推荐顺序：free 看节点压力，status 找目标进程，smaps_rollup 定量，smaps/pmap 定位映射</text>
+</svg><div class="caption">工具不是互相替代，而是不同层次的视角。排障报告要写清楚使用的是 RSS、PSS 还是整机 available memory。</div></section>
+
+<section class="section" id="s11">
+<h2>11. AI 训练内存诊断流程</h2>
+<p>训练任务内存问题通常不是一个数字能解释。模型加载、CPU offload、dataset cache、DataLoader prefetch、tokenizer、checkpoint、通信 buffer、pinned memory 和 mmap 数据集都可能改变宿主机内存曲线。下面是一个低风险诊断顺序。</p>
+<ol>
+<li>用 <code>free -h</code> 或 <code>/proc/meminfo</code> 确认节点是否真的有内存压力。</li>
+<li>用 <code>ps</code> 或 <code>pgrep -af</code> 找到训练主进程、rank 进程和 worker。</li>
+<li>读取每个进程 <code>status</code>，记录 <code>VmRSS</code>、<code>VmHWM</code>、<code>Threads</code>、<code>VmSwap</code>。</li>
+<li>读取 <code>smaps_rollup</code>，比较 <code>Pss</code>、<code>Anonymous</code>、<code>Shared_Clean</code>、<code>Private_Dirty</code>。</li>
+<li>只有在需要归因具体映射时，才读取完整 <code>smaps</code> 并按映射名聚合。</li>
+<li>把采样时间和训练日志阶段对齐：init、load checkpoint、first batch、eval、save checkpoint。</li>
+</ol>
+<pre><code># 轻量采样模板：每 10 秒记录 status + smaps_rollup 核心字段
+pid=12345
+out=/tmp/proc-memory-$pid.log
+while sleep 10; do
+  {
+    echo "== $(date '+%F %T') pid=$pid =="
+    grep -E '^(State|Threads|VmRSS|VmHWM|RssAnon|RssFile|RssShmem|VmSwap):' /proc/$pid/status
+    awk '/^(Rss|Pss|Anonymous|Private_Dirty|Shared_Clean|Swap|Locked):/ {print}' /proc/$pid/smaps_rollup 2&gt;/dev/null
+  } &gt;&gt; "$out"
+done</code></pre>
+<div class="success"><strong>报告模板：</strong> “节点 available memory 从 A 到 B；rank 0 <code>VmRSS</code> 从 X 到 Y，<code>VmHWM</code> 为 Z；<code>smaps_rollup</code> 显示 <code>Anonymous</code>/<code>Private_Dirty</code> 增长；增长发生在 first batch 后 3 分钟。” 这比“内存爆了”可行动得多。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. stack：内核调用栈快照</h2>
+<p><code>/proc/&lt;pid&gt;/stack</code> 显示目标任务当前在内核态的调用栈。更常用的是逐线程读取 <code>/proc/&lt;pid&gt;/task/&lt;tid&gt;/stack</code>，因为一个训练进程可能有上百个线程，只有少数线程真正卡住。它不能显示 Python 栈或用户态 C++ 栈；如果线程在用户态运行，可能看到空或非常短的内核栈。</p>
+<pre><code>pid=12345
+
+# 主线程内核栈
+sudo cat /proc/$pid/stack
+
+# 逐线程查看 wchan 与 kernel stack，适合进程吞吐停滞时抽样
+for tid in /proc/$pid/task/*; do
+  tid=${tid##*/}
+  printf '\n== tid=%s wchan=' "$tid"
+  cat /proc/$pid/task/$tid/wchan 2&gt;/dev/null || true
+  echo
+  sudo cat /proc/$pid/task/$tid/stack 2&gt;/dev/null | head -20
+done</code></pre>
+<table><tr><th>常见线索</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>futex_wait</code>、<code>do_futex</code></td><td>锁、条件变量、线程池等待；不一定异常。</td><td>结合用户态 profiler、<code>py-spy</code>、<code>gdb</code> 或应用日志。</td></tr>
+<tr><td><code>io_schedule</code>、块设备路径</td><td>磁盘或网络文件系统 I/O 等待。</td><td>看 <code>iostat</code>、<code>pidstat -d</code>、存储日志。</td></tr>
+<tr><td><code>page_fault</code>、内存回收路径</td><td>缺页、mmap 数据集、内存压力或 page cache 行为。</td><td>结合 <code>perf</code>、<code>vmstat</code>、<code>numastat</code>。</td></tr>
+<tr><td>驱动相关符号</td><td>GPU、RDMA、文件系统或网络驱动路径。</td><td>保留现场，结合驱动日志和厂商工具。</td></tr>
+</table>
+<div class="danger"><strong>边界提醒：</strong> <code>stack</code> 是内核态视角，不是 Python traceback。想看 Python 代码停在哪里，用 <code>py-spy</code>、<code>faulthandler</code>、<code>gdb py-bt</code> 或框架 profiler；想看系统调用，用 <code>strace -p</code>，但附加追踪本身会影响进程。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 权限、安全与生产影响</h2>
+<p>读取 proc 文件看起来简单，但在多租户训练平台上属于安全边界的一部分。跨用户读取进程细节可能泄露命令行、路径、环境变量、模型名、数据集位置或密钥。生产平台需要明确谁能读、从哪里读、采样频率是多少。</p>
+<table><tr><th>机制</th><th>影响</th><th>排障动作</th></tr>
+<tr><td><code>/proc</code> 挂载参数 <code>hidepid</code></td><td>限制普通用户查看其他用户进程。</td><td>如果看不到目标 PID，先查 <code>mount | grep ' /proc '</code>。</td></tr>
+<tr><td><code>kernel.yama.ptrace_scope</code></td><td>限制 ptrace 相关访问，可能影响 <code>stack</code>、调试器和 profiler。</td><td>确认安全策略，避免临时改完不恢复。</td></tr>
+<tr><td>容器 capability</td><td>缺少 <code>SYS_PTRACE</code> 或主机 PID 视图时无法深入观察。</td><td>优先从节点侧或受控 debug 容器观察。</td></tr>
+<tr><td>高频读取 <code>smaps</code></td><td>对大进程有额外遍历成本。</td><td>用 <code>smaps_rollup</code> 低频采样，完整 <code>smaps</code> 留给人工定位。</td></tr>
+</table>
+<pre><code># 检查 proc 挂载参数和 ptrace 策略
+mount | grep ' /proc '
+cat /proc/sys/kernel/yama/ptrace_scope 2&gt;/dev/null || true
+
+# 检查当前用户是否能读目标文件
+pid=12345
+for f in status smaps smaps_rollup stack; do
+  [ -r /proc/$pid/$f ] && echo "readable: $f" || echo "not readable: $f"
+done</code></pre>
+<div class="warn"><strong>生产习惯：</strong> 排障脚本默认只读，不自动 <code>sudo</code>，不采集 <code>environ</code>，不把完整 <code>cmdline</code> 和路径上传到公共日志，除非有明确脱敏策略。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 容器、PID namespace 与 cgroup</h2>
+<p>容器里看到的 PID 和主机 PID 可能不同；容器内 <code>/proc/1/status</code> 可能是容器 init，而主机上同一进程有另一个 PID。<code>status</code> 中的 <code>NStgid</code>/<code>NSpid</code> 可以帮助跨 namespace 对齐。内存限制、CPU 限制和 NUMA 限制则主要来自 cgroup。</p>
+<pre><code># 在主机上查看一个容器进程的 namespace PID 映射
+pid=12345
+grep -E '^(Pid|Tgid|NStgid|NSpid|NSpgid|NSsid):' /proc/$pid/status
+cat /proc/$pid/cgroup
+
+# cgroup v2 常见文件
+cg=$(awk -F: '$1=="0"{print $3}' /proc/$pid/cgroup)
+base=/sys/fs/cgroup$cg
+cat "$base/memory.current" 2&gt;/dev/null
+cat "$base/memory.max" 2&gt;/dev/null
+cat "$base/cpuset.cpus.effective" 2&gt;/dev/null
+cat "$base/cpuset.mems.effective" 2&gt;/dev/null</code></pre>
+<div class="grid-2">
+<div class="card"><strong>容器内读 proc</strong><br>方便、权限较小，但只看到容器 namespace 和挂载视图；有些 host 信息不可见。</div>
+<div class="card"><strong>节点侧读 proc</strong><br>能看到真实主机 PID、cgroup 路径和完整 topology，但需要平台授权和审计。</div>
+<div class="card"><strong>cgroup memory</strong><br>容器 OOM 由 cgroup 限制决定，不是只看整机 <code>free</code>。</div>
+<div class="card"><strong>cpuset</strong><br><code>Cpus_allowed_list</code> 通常反映 cpuset 结果，但线程级亲和性仍可能进一步收窄。</div>
+</div>
+<div class="note"><strong>Kubernetes 读法：</strong> Pod 内 <code>ps</code> 看到的 PID 不一定能在节点侧直接用；用容器 runtime、<code>crictl inspect</code> 或 <code>NSpid</code> 做映射，再读主机 <code>/proc/&lt;host-pid&gt;</code>。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. proc 文件 vs ps/free/pmap</h2>
+<p><code>ps</code>、<code>free</code>、<code>pmap</code> 很多信息本质上来自 proc，但它们做了汇总、格式化或口径选择。理解底层 proc 文件，可以避免把不同工具的字段混用。</p>
+<table><tr><th>工具/文件</th><th>层次</th><th>优势</th><th>常见误区</th></tr>
+<tr><td><code>/proc/&lt;pid&gt;/status</code></td><td>单进程摘要</td><td>轻量、字段清楚、脚本友好</td><td><code>VmRSS</code> 不是 PSS，多进程加总可能虚高。</td></tr>
+<tr><td><code>/proc/&lt;pid&gt;/smaps</code></td><td>单进程逐映射</td><td>归因最细，有 PSS 和 private/shared</td><td>读取较重，不适合高频全量监控。</td></tr>
+<tr><td><code>ps</code></td><td>进程列表</td><td>排序、扫描方便</td><td><code>VSZ</code> 常被误认为真实内存占用。</td></tr>
+<tr><td><code>free</code>/<code>/proc/meminfo</code></td><td>整机</td><td>判断节点总压力和 page cache</td><td>不能说明哪个进程负责。</td></tr>
+<tr><td><code>pmap -x</code></td><td>进程映射展示</td><td>比手读 smaps 更易扫</td><td>不同实现字段口径有差异，仍需回到 smaps 确认。</td></tr>
+</table>
+<pre><code># 三种视角并排看
+pid=12345
+ps -o pid,ppid,stat,threads,vsz,rss,comm,args -p $pid
+grep -E '^(VmSize|VmRSS|VmHWM|Threads):' /proc/$pid/status
+pmap -x $pid | tail -20</code></pre>
+<div class="success"><strong>推荐表达：</strong> 报告里写“<code>/proc/$pid/smaps_rollup</code> 的 PSS 为 18.4 GiB”，不要只写“进程占 18G”，否则别人不知道是 RSS、PSS、VIRT、cgroup current 还是整机 used。</div>
+</section>
+
+<section class="figure" id="fig-troubleshoot">
+<h3>排障图：训练慢、内存高、线程多、NUMA 异常怎么分流</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="AI 训练 proc 排障分流图">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="390" y="48" width="320" height="68" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">训练任务异常</text>
+<rect x="70" y="175" width="220" height="88" rx="15" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="180" y="210" text-anchor="middle" font-size="17" font-weight="700">GPU 利用率低</text>
+<text x="180" y="238" text-anchor="middle" font-size="14">供数/CPU/锁等待</text>
+<rect x="315" y="175" width="220" height="88" rx="15" fill="#ffedd5" stroke="#fdba74"/>
+<text x="425" y="210" text-anchor="middle" font-size="17" font-weight="700">内存升高</text>
+<text x="425" y="238" text-anchor="middle" font-size="14">RSS/PSS/匿名页</text>
+<rect x="560" y="175" width="220" height="88" rx="15" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="670" y="210" text-anchor="middle" font-size="17" font-weight="700">线程过多</text>
+<text x="670" y="238" text-anchor="middle" font-size="14">OMP/DataLoader/库</text>
+<rect x="805" y="175" width="220" height="88" rx="15" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="915" y="210" text-anchor="middle" font-size="17" font-weight="700">进程卡住</text>
+<text x="915" y="238" text-anchor="middle" font-size="14">stack/wchan/strace</text>
+<rect x="70" y="360" width="220" height="105" rx="15" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="180" y="395" text-anchor="middle" font-size="15" font-weight="700">查 Cpus_allowed_list</text>
+<text x="180" y="424" text-anchor="middle" font-size="13">pidstat -t / top -H</text>
+<text x="180" y="448" text-anchor="middle" font-size="13">DataLoader 是否抢 CPU</text>
+<rect x="315" y="360" width="220" height="105" rx="15" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="425" y="395" text-anchor="middle" font-size="15" font-weight="700">查 smaps_rollup</text>
+<text x="425" y="424" text-anchor="middle" font-size="13">PSS / Anonymous</text>
+<text x="425" y="448" text-anchor="middle" font-size="13">Private_Dirty 趋势</text>
+<rect x="560" y="360" width="220" height="105" rx="15" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="670" y="395" text-anchor="middle" font-size="15" font-weight="700">查 Threads 和 task</text>
+<text x="670" y="424" text-anchor="middle" font-size="13">每线程状态/亲和性</text>
+<text x="670" y="448" text-anchor="middle" font-size="13">环境变量和配置</text>
+<rect x="805" y="360" width="220" height="105" rx="15" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="915" y="395" text-anchor="middle" font-size="15" font-weight="700">查 task/*/stack</text>
+<text x="915" y="424" text-anchor="middle" font-size="13">futex / io_schedule</text>
+<text x="915" y="448" text-anchor="middle" font-size="13">结合用户态 profiler</text>
+<rect x="205" y="585" width="690" height="78" rx="18" fill="#dcfce7" stroke="#86efac"/>
+<text x="550" y="619" text-anchor="middle" font-size="20" font-weight="700">把 proc 证据和训练阶段、容器限制、节点拓扑放到同一时间线</text>
+<text x="550" y="646" text-anchor="middle" font-size="14">单个字段只能提示方向，闭环需要多视角交叉验证</text>
+<line x1="550" y1="116" x2="180" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="425" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="670" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="550" y1="116" x2="915" y2="175" stroke="#94a3b8" stroke-width="3"/>
+<line x1="180" y1="263" x2="180" y2="360" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="425" y1="263" x2="425" y2="360" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="670" y1="263" x2="670" y2="360" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="915" y1="263" x2="915" y2="360" stroke="#94a3b8" stroke-width="4" marker-end="url(#m3)"/>
+<line x1="180" y1="465" x2="360" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<line x1="425" y1="465" x2="485" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<line x1="670" y1="465" x2="615" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<line x1="915" y1="465" x2="740" y2="585" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="m3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">排障不要从“读哪个文件”开始，而要从症状分流：慢、涨、卡、错绑分别对应不同 proc 证据。</div></section>
+
+<section class="section" id="s16">
+<h2>16. 排障场景与命令模板</h2>
+<h3>场景 A：GPU 空转但进程还在</h3>
+<pre><code>pid=12345
+grep -E '^(State|Threads|Cpus_allowed_list|Mems_allowed_list):' /proc/$pid/status
+pidstat -t -p $pid 1 5
+for tid in /proc/$pid/task/*; do
+  tid=${tid##*/}
+  printf '%s ' "$tid"
+  cat /proc/$pid/task/$tid/wchan 2&gt;/dev/null
+done | sort | uniq -c | sort -nr | head</code></pre>
+<p>如果大量线程在 <code>futex</code>，可能是等待数据、锁或线程池；如果在 I/O 路径，转向存储；如果 CPU 亲和性很窄，检查 cpuset 和 DataLoader 配置。</p>
+<h3>场景 B：容器被 OOMKilled，但进程 RSS 看起来不夸张</h3>
+<pre><code>pid=12345
+cat /proc/$pid/cgroup
+grep -E '^(VmRSS|VmHWM|RssAnon|RssFile|RssShmem):' /proc/$pid/status
+awk '/^(Rss|Pss|Anonymous|Private_Dirty|Shared_Clean|Swap):/ {print}' /proc/$pid/smaps_rollup
+
+# cgroup v2，节点侧执行
+cg=$(awk -F: '$1=="0"{print $3}' /proc/$pid/cgroup)
+cat /sys/fs/cgroup$cg/memory.current /sys/fs/cgroup$cg/memory.max 2&gt;/dev/null</code></pre>
+<p>容器 OOM 看的是 cgroup 账本，可能包含多个进程和 page cache；单个进程 <code>VmRSS</code> 不是完整答案。</p>
+<h3>场景 C：只在多卡训练时 host 内存飙升</h3>
+<pre><code># 对所有 rank 汇总 PSS 与线程数
+for pid in $(pgrep -f 'train.py|torchrun|deepspeed'); do
+  threads=$(awk '/^Threads:/ {print $2}' /proc/$pid/status)
+  pss=$(awk '/^Pss:/ {s+=$2} END {printf "%.1f", s/1024}' /proc/$pid/smaps 2&gt;/dev/null)
+  cmd=$(tr '\0' ' ' &lt; /proc/$pid/cmdline | cut -c1-100)
+  printf 'pid=%s threads=%s pss=%sMiB cmd=%s\n' "$pid" "$threads" "$pss" "$cmd"
+done</code></pre>
+<p>对比各 rank 的 PSS 和线程数，能发现 rank 0 额外加载验证集、checkpoint 或日志组件的问题。</p>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 限制、陷阱与检查清单</h2>
+<div class="grid-2">
+<div class="card"><strong>陷阱 1：把 VIRT 当内存占用</strong><br><code>VmSize</code>/<code>VSZ</code> 是虚拟地址空间，不等于物理内存压力。</div>
+<div class="card"><strong>陷阱 2：RSS 多进程相加</strong><br>共享页重复计入，多个 rank 应优先用 PSS。</div>
+<div class="card"><strong>陷阱 3：只看主线程</strong><br>线程级 <code>status</code>、<code>wchan</code>、<code>stack</code> 更适合定位卡顿。</div>
+<div class="card"><strong>陷阱 4：容器 PID 混淆</strong><br>容器内 PID 和主机 PID 不同，注意 <code>NSpid</code>。</div>
+<div class="card"><strong>陷阱 5：高频读 smaps</strong><br>大进程上有成本，自动化采样优先 <code>smaps_rollup</code>。</div>
+<div class="card"><strong>陷阱 6：stack 当用户态栈</strong><br><code>stack</code> 是内核栈，不是 Python traceback。</div>
+</div>
+<h3>生产检查清单</h3>
+<ul>
+<li>确认 PID、用户、容器、rank 和命令行，不对泛名 <code>python</code> 下结论。</li>
+<li>记录时间戳，至少连续采样 3 到 5 次，避免把瞬时抖动当趋势。</li>
+<li>内存报告区分 <code>VmRSS</code>、<code>VmHWM</code>、<code>PSS</code>、cgroup memory 和整机 available。</li>
+<li>CPU/NUMA 报告同时写 <code>Cpus_allowed_list</code>、<code>Mems_allowed_list</code>、节点拓扑和容器 cpuset。</li>
+<li>卡顿报告同时给出 <code>State</code>、<code>wchan</code>、关键线程 <code>stack</code> 和应用日志阶段。</li>
+<li>采集脚本默认只读、低频、脱敏，不把环境变量和敏感路径发到公共系统。</li>
+</ul>
+<pre><code># 最小只读现场包，按需执行，不采集 environ
+pid=12345
+dir=/tmp/proc-snapshot-$pid-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$dir"
+cp /proc/$pid/status "$dir/status"
+tr '\0' ' ' &lt; /proc/$pid/cmdline &gt; "$dir/cmdline.txt"
+cat /proc/$pid/cgroup &gt; "$dir/cgroup.txt"
+cat /proc/$pid/smaps_rollup &gt; "$dir/smaps_rollup.txt" 2&gt;/dev/null || true
+find /proc/$pid/task -maxdepth 2 -name status -print -exec sh -c 'echo "== $1 =="; grep -E "^(Name|State|Pid|Threads|Cpus_allowed_list|Mems_allowed_list):" "$1"' _ {} \; &gt; "$dir/task-status.txt" 2&gt;/dev/null
+echo "$dir"</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 学习路线与练习任务</h2>
+<h3>第一阶段：会读摘要</h3>
+<ul>
+<li>用自己的 shell PID 练习 <code>/proc/$$/status</code>，理解 <code>Pid</code>、<code>PPid</code>、<code>State</code>、<code>Threads</code>。</li>
+<li>观察一个长期运行进程的 <code>VmRSS</code>、<code>VmHWM</code>，理解当前值与峰值差异。</li>
+<li>用 <code>Cpus_allowed_list</code> 对照 <code>taskset -pc $$</code>。</li>
+</ul>
+<h3>第二阶段：会做内存归因</h3>
+<ul>
+<li>读取 <code>smaps_rollup</code>，区分 <code>Rss</code>、<code>Pss</code>、<code>Anonymous</code>、<code>Private_Dirty</code>。</li>
+<li>用 <code>awk</code> 汇总 <code>smaps</code>，确认 rollup 与手工汇总的大致一致。</li>
+<li>找出 <code>[heap]</code>、<code>[stack]</code>、共享库和文件 mmap 的映射头。</li>
+</ul>
+<h3>第三阶段：结合 AI Infra 现场</h3>
+<ul>
+<li>在测试训练任务中对齐 first batch、eval、checkpoint 与 proc 内存曲线。</li>
+<li>比较不同 <code>num_workers</code>、<code>OMP_NUM_THREADS</code> 下 <code>Threads</code> 和吞吐。</li>
+<li>在容器内外分别读取同一进程，理解 <code>NSpid</code> 和 cgroup 限制。</li>
+</ul>
+<pre><code># 本机无风险练习：只读取当前 shell 和 sleep 进程
+sleep 300 &
+pid=$!
+grep -E '^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|Cpus_allowed_list|Mems_allowed_list):' /proc/$pid/status
+cat /proc/$pid/smaps_rollup 2&gt;/dev/null | awk '/^(Rss|Pss|Anonymous):/ {print}'
+kill "$pid"</code></pre>
+<div class="note"><strong>练习提醒：</strong> 最后一行 <code>kill "$pid"</code> 只终止你刚启动的 <code>sleep</code> 练习进程；不要把模板直接套到生产训练 PID 上。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>Linux man-pages：<code>proc(5)</code>，包含 <code>/proc/&lt;pid&gt;/status</code>、<code>smaps</code>、<code>smaps_rollup</code>、<code>stack</code>、<code>numa_maps</code> 等说明。</li>
+<li>Linux kernel documentation：proc filesystem、cgroup v2、cpuset、NUMA memory policy。</li>
+<li>man-pages：<code>ps(1)</code>、<code>pmap(1)</code>、<code>numactl(8)</code>、<code>proc_pid_status(5)</code>、<code>proc_pid_smaps(5)</code>。</li>
+<li>Kubernetes documentation：CPU Manager、memory limits、OOMKilled、debug containers。</li>
+<li>PyTorch 与 NCCL 运维资料：DataLoader workers、OpenMP/MKL 线程变量、NCCL helper threads、CPU affinity 和 NUMA 亲和。</li>
+</ul><p class="mini">建议阅读顺序：先掌握 <code>status</code> 摘要字段，再用 <code>smaps_rollup</code> 建立 RSS/PSS 口径，最后学习完整 <code>smaps</code> 和逐线程 <code>stack</code> 的生产排障边界。</p></section>
+<div class="footer">/proc/&lt;pid&gt;/status、smaps、stack 深度教程 · AI Infra 进程内省、内存归因、NUMA/线程诊断与生产安全</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ulimit 与 limits.conf 深度教程：AI Infra 资源限制、RDMA、容器与 systemd</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:#eef2ff;color:#3730a3}.ok{color:var(--green);font-weight:700}.bad{color:var(--red);font-weight:700}.mid{color:#c2410c;font-weight:700}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ulimit 与 limits.conf 深度教程：AI Infra 资源限制、RDMA、容器与 systemd</h1>
+<p class="sub">这份教程面向 GPU 训练节点、推理服务、RDMA/RoCE 集群和多租户 Linux 平台，系统讲清 <code>ulimit</code>、<code>/proc/&lt;pid&gt;/limits</code>、PAM <code>/etc/security/limits.conf</code>、systemd <code>Limit*</code>、容器/Kubernetes 限制之间的关系。重点不是背参数，而是建立“进程继承资源上限，软限制可在硬限制内调整，服务管理器和容器运行时可能覆盖登录会话配置”的心智模型。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">ulimit -a</span><span class="chip">soft / hard</span><span class="chip">nofile</span><span class="chip">nproc</span><span class="chip">memlock</span><span class="chip">RDMA</span><span class="chip">limits.conf</span><span class="chip">systemd</span><span class="chip">Kubernetes</span><span class="chip">容器 caveats</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ulimit</code> 是 shell 暴露的进程资源限制视图；新进程会继承父进程的 limits，应用真正看到的是启动它的那条路径已经设置好的软/硬上限。</div>
+<div class="success"><strong>最重要原则：</strong> 先只读确认 <code>ulimit -a</code>、<code>ulimit -Sa/-Ha</code>、<code>/proc/&lt;pid&gt;/limits</code>，再做最小范围变更；不要把 <code>nofile</code>、<code>nproc</code>、<code>memlock</code> 直接改成 <code>unlimited</code> 当作通用修复。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ulimit 解决什么问题</a></li>
+<li><a class="anchor" href="#s2">整体模型：从 shell 到进程</a></li>
+<li><a class="anchor" href="#s3">快速巡检：ulimit -a 与 /proc</a></li>
+<li><a class="anchor" href="#s4">soft 与 hard：谁能改什么</a></li>
+<li><a class="anchor" href="#s5">常见限制项速查</a></li>
+<li><a class="anchor" href="#s6">nofile：文件描述符与高并发</a></li>
+<li><a class="anchor" href="#s7">nproc：线程、进程与 fork 失败</a></li>
+<li><a class="anchor" href="#s8">stack、core、fsize 与虚拟内存</a></li>
+<li><a class="anchor" href="#s9">memlock：RDMA、CUDA IPC 与锁页内存</a></li>
+<li><a class="anchor" href="#s10">limits.conf 语法与 PAM 生效路径</a></li>
+<li><a class="anchor" href="#s11">安全变更流程</a></li>
+<li><a class="anchor" href="#s12">systemd 服务 caveat</a></li>
+<li><a class="anchor" href="#s13">容器与 Kubernetes caveat</a></li>
+<li><a class="anchor" href="#s14">调度器、SSH 与非交互 shell</a></li>
+<li><a class="anchor" href="#s15">故障症状映射</a></li>
+<li><a class="anchor" href="#s16">排障流程图</a></li>
+<li><a class="anchor" href="#s17">AI Infra 推荐基线模板</a></li>
+<li><a class="anchor" href="#s18">练习路线与检查清单</a></li>
+<li><a class="anchor" href="#refs">参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ulimit 解决什么问题</h2>
+<p><code>ulimit</code> 控制当前 shell 及其子进程能使用的某些资源上限，例如最多打开多少文件、最多创建多少进程/线程、栈大小、core dump 大小、锁页内存大小。它不是性能优化开关，而是防止单个用户或服务把节点资源耗尽的保护栏。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>快速查看和临时调整当前 shell 的资源限制，适合复现实验、诊断“Too many open files”“fork: Resource temporarily unavailable”“cannot allocate locked memory”等问题。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能替代 cgroup、systemd、Kubernetes resource requests/limits；不能改变已经运行进程的 limits；也不能自动让所有登录方式、服务和容器都继承同一配置。</div>
+<div class="card"><strong>AI Infra 视角</strong><br>训练框架、数据加载器、NCCL/RDMA、Web 推理服务、日志采集器、sidecar 都可能撞到 limits。排障必须确认“应用进程实际 limits”，而不是只看当前终端。</div>
+</div>
+<pre><code># 当前 shell 的全部资源限制
+ulimit -a
+
+# 单项查看：open files / user processes / locked memory
+ulimit -n
+ulimit -u
+ulimit -l
+
+# 查看已经运行进程实际继承到的 limits
+cat /proc/$(pidof python | awk '{print $1}')/limits</code></pre>
+<div class="warn"><strong>关键区别：</strong> <code>ulimit</code> 是 shell 内建命令，不是普通二进制程序；不同 shell 输出略有差异，脚本中要明确使用 <code>bash -lc</code>、<code>sh -lc</code> 或目标运行时。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：Linux limits 从哪里来、到哪里去</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="ulimit limits inheritance model">
+<rect x="18" y="18" width="1064" height="644" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">limits 是启动路径的一部分：父进程设置，上下游继承</text>
+<rect x="65" y="125" width="210" height="100" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="170" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">登录会话</text>
+<text x="170" y="194" text-anchor="middle" font-size="14">PAM + limits.conf</text>
+<rect x="325" y="125" width="210" height="100" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="430" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">shell</text>
+<text x="430" y="194" text-anchor="middle" font-size="14">ulimit -S/-H</text>
+<rect x="585" y="125" width="210" height="100" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="690" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">应用进程</text>
+<text x="690" y="194" text-anchor="middle" font-size="14">/proc/&lt;pid&gt;/limits</text>
+<rect x="845" y="125" width="210" height="100" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="950" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">内核检查</text>
+<text x="950" y="194" text-anchor="middle" font-size="14">open / fork / mlock</text>
+<line x1="275" y1="175" x2="325" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="535" y1="175" x2="585" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="795" y1="175" x2="845" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="85" y="330" width="285" height="118" rx="18" fill="#fff" stroke="#cbd5e1"/>
+<text x="228" y="370" text-anchor="middle" font-size="20" font-weight="700">systemd 路径</text>
+<text x="228" y="402" text-anchor="middle" font-size="14">LimitNOFILE / LimitMEMLOCK</text>
+<text x="228" y="427" text-anchor="middle" font-size="14">通常不读 limits.conf</text>
+<rect x="407" y="330" width="285" height="118" rx="18" fill="#fff" stroke="#cbd5e1"/>
+<text x="550" y="370" text-anchor="middle" font-size="20" font-weight="700">容器路径</text>
+<text x="550" y="402" text-anchor="middle" font-size="14">runtime ulimits + cgroup</text>
+<text x="550" y="427" text-anchor="middle" font-size="14">宿主机 limits 不一定透传</text>
+<rect x="730" y="330" width="285" height="118" rx="18" fill="#fff" stroke="#cbd5e1"/>
+<text x="873" y="370" text-anchor="middle" font-size="20" font-weight="700">调度器路径</text>
+<text x="873" y="402" text-anchor="middle" font-size="14">Slurm / batch / SSH</text>
+<text x="873" y="427" text-anchor="middle" font-size="14">提交端与执行端可能不同</text>
+<rect x="190" y="535" width="720" height="62" rx="16" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="550" y="572" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">排障时只看当前终端不够：必须看目标进程 /proc/&lt;pid&gt;/limits</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">同一个用户从 SSH、systemd、Docker、Kubernetes、Slurm 启动的进程，limits 可能完全不同。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 快速巡检：ulimit -a 与 /proc</h2>
+<p>排障第一步是建立事实：当前 shell 的 soft/hard limits 是多少，目标进程实际继承到多少，单位是什么。<code>ulimit -a</code> 常用人类可读单位；<code>/proc/&lt;pid&gt;/limits</code> 则更接近最终真相。</p>
+<pre><code># 当前 shell：软限制
+ulimit -Sa
+
+# 当前 shell：硬限制
+ulimit -Ha
+
+# 只看关键项
+printf 'nofile soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
+printf 'nproc  soft=%s hard=%s\n' "$(ulimit -Su)" "$(ulimit -Hu)"
+printf 'memlock soft=%s KB hard=%s KB\n' "$(ulimit -Sl)" "$(ulimit -Hl)"
+
+# 目标进程：最可靠的排障入口
+pid=12345
+cat /proc/$pid/limits
+grep -E 'Max open files|Max processes|Max locked memory|Max stack size|Max core file size' /proc/$pid/limits</code></pre>
+<table>
+<tr><th>检查对象</th><th>说明</th><th>适用场景</th></tr>
+<tr><td><code>ulimit -Sa</code></td><td>当前 shell 软限制</td><td>临时运行命令前确认</td></tr>
+<tr><td><code>ulimit -Ha</code></td><td>当前 shell 硬限制</td><td>判断普通用户还能否升高软限制</td></tr>
+<tr><td><code>/proc/&lt;pid&gt;/limits</code></td><td>某个运行中进程实际限制</td><td>服务、容器、训练任务排障</td></tr>
+<tr><td><code>prlimit --pid PID</code></td><td>读取或调整运行进程限制</td><td>需要 root/权限，适合临时救火和确认</td></tr>
+</table>
+<div class="note"><strong>单位提醒：</strong> <code>ulimit -l</code> 通常以 KB 显示 locked memory，<code>/proc/&lt;pid&gt;/limits</code> 的 <code>Max locked memory</code> 通常显示 bytes。对 memlock 排障时不要把 KB 和 bytes 混在一起。</div>
+</section>
+
+<section class="figure" id="s4">
+<h3>流程图：soft limit 与 hard limit 的关系</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="soft hard limit workflow">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="27" font-weight="700">软限制是当前生效值，硬限制是普通用户可调上限</text>
+<rect x="115" y="135" width="290" height="120" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="260" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">soft limit</text>
+<text x="260" y="210" text-anchor="middle" font-size="15">内核检查时使用的当前值</text>
+<text x="260" y="234" text-anchor="middle" font-size="15">例如 nofile soft=1024</text>
+<rect x="695" y="135" width="290" height="120" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="840" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">hard limit</text>
+<text x="840" y="210" text-anchor="middle" font-size="15">普通用户可升高 soft 的天花板</text>
+<text x="840" y="234" text-anchor="middle" font-size="15">例如 nofile hard=1048576</text>
+<rect x="405" y="325" width="290" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="366" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">普通用户</text>
+<text x="550" y="398" text-anchor="middle" font-size="15">可降低 hard；可在 hard 内调 soft</text>
+<rect x="405" y="505" width="290" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="546" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">root / CAP_SYS_RESOURCE</text>
+<text x="550" y="578" text-anchor="middle" font-size="15">可升高 hard，受内核与系统配置约束</text>
+<line x1="405" y1="195" x2="695" y2="195" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<text x="550" y="180" text-anchor="middle" font-size="14" fill="#475569">soft 不能超过 hard</text>
+<line x1="260" y1="255" x2="445" y2="325" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<line x1="840" y1="255" x2="655" y2="325" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<line x1="550" y1="435" x2="550" y2="505" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">生产配置通常同时设置 soft 和 hard：soft 给应用即时可用值，hard 给受控调高空间。</div>
+</section>
+
+<section class="section">
+<h2>3. soft 与 hard：谁能改什么</h2>
+<p>每个限制项都有 soft 和 hard 两个值。内核实际判定多数情况下看 soft；hard 是普通用户能把 soft 调高到的最大值。普通用户可以降低 hard，但通常不能再升回去；root 或具备 <code>CAP_SYS_RESOURCE</code> 的进程才能升高 hard。</p>
+<pre><code># 查看 nofile 的 soft/hard
+ulimit -Sn
+ulimit -Hn
+
+# 临时把当前 shell 的 soft nofile 提高到硬限制内
+ulimit -Sn 65535
+
+# 同时设置 soft/hard，通常需要当前 hard 足够高或 root
+ulimit -n 1048576
+
+# 使用 prlimit 查看某个进程
+prlimit --pid 12345
+
+# root 临时调整运行进程，救火前先记录原值
+prlimit --pid 12345 --nofile
+sudo prlimit --pid 12345 --nofile=65535:65535</code></pre>
+<div class="danger"><strong>救火警告：</strong> <code>prlimit</code> 可以改变运行进程限制，但不是持久配置。事故处理时先保存 <code>prlimit --pid PID</code> 输出，修复后把配置固化到真正的启动路径，例如 systemd unit、容器 runtime 或 PAM limits。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 常见限制项速查</h2>
+<table>
+<tr><th>ulimit 选项</th><th>limits.conf 项</th><th>/proc 名称</th><th>AI Infra 常见影响</th></tr>
+<tr><td><code>-n</code></td><td><code>nofile</code></td><td>Max open files</td><td>高并发推理服务、日志 tail、数据集小文件、socket 连接</td></tr>
+<tr><td><code>-u</code></td><td><code>nproc</code></td><td>Max processes</td><td>PyTorch DataLoader、Ray、Jupyter、fork/clone 失败</td></tr>
+<tr><td><code>-l</code></td><td><code>memlock</code></td><td>Max locked memory</td><td>RDMA verbs、NCCL、DPDK、低延迟网络、部分 GPU/IPC 场景</td></tr>
+<tr><td><code>-s</code></td><td><code>stack</code></td><td>Max stack size</td><td>深递归、OpenMP/线程库、C/C++ 扩展栈溢出</td></tr>
+<tr><td><code>-c</code></td><td><code>core</code></td><td>Max core file size</td><td>崩溃后是否生成 core dump，调试训练/推理崩溃</td></tr>
+<tr><td><code>-f</code></td><td><code>fsize</code></td><td>Max file size</td><td>checkpoint、日志、dump 文件被截断或写入失败</td></tr>
+<tr><td><code>-v</code></td><td><code>as</code></td><td>Max address space</td><td>限制虚拟地址空间，可能干扰大模型 mmap/allocator</td></tr>
+<tr><td><code>-t</code></td><td><code>cpu</code></td><td>Max cpu time</td><td>批处理任务 CPU 时间限制，通常 AI 节点不靠它做隔离</td></tr>
+</table>
+<div class="note"><strong>配置口径：</strong> <code>limits.conf</code> 的字段名不总等于 <code>ulimit</code> 选项名。例如 <code>ulimit -n</code> 对应 <code>nofile</code>，<code>ulimit -l</code> 对应 <code>memlock</code>。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. nofile：文件描述符与高并发</h2>
+<p><code>nofile</code> 限制进程最多能打开多少文件描述符。Linux 中 socket、pipe、eventfd、epoll、普通文件、日志文件都消耗 FD。高并发推理服务、分布式训练控制面、数据加载器、对象存储客户端很容易撞到它。</p>
+<pre><code># 当前 shell 查看和临时设置
+ulimit -Sn
+ulimit -Hn
+ulimit -Sn 65535
+
+# 目标进程已经打开多少 FD
+pid=12345
+ls /proc/$pid/fd | wc -l
+grep 'Max open files' /proc/$pid/limits
+
+# 按进程查看 FD 数，定位泄漏嫌疑
+for p in /proc/[0-9]*; do
+  pid=${p##*/}
+  count=$(ls "$p/fd" 2&gt;/dev/null | wc -l | tr -d ' ')
+  comm=$(cat "$p/comm" 2&gt;/dev/null || true)
+  printf '%8s %8s %s\n' "$count" "$pid" "$comm"
+done | sort -n | tail</code></pre>
+<table>
+<tr><th>症状</th><th>常见日志</th><th>下一步</th></tr>
+<tr><td>打开文件失败</td><td><code>Too many open files</code></td><td>看 <code>/proc/PID/fd</code> 数量和 <code>Max open files</code></td></tr>
+<tr><td>服务 accept 失败</td><td><code>EMFILE</code>、连接突然失败</td><td>检查进程 FD 泄漏、连接池、日志轮转和 nofile</td></tr>
+<tr><td>训练数据读取异常</td><td>worker 读取小文件失败</td><td>检查 DataLoader worker 数、预取、文件句柄关闭</td></tr>
+</table>
+<div class="warn"><strong>不是越大越好：</strong> 把 <code>nofile</code> 提高只能避免过早撞限，不能修复 FD 泄漏。若 FD 数持续增长，先定位泄漏，否则节点会被内存、socket buffer 或后端服务拖垮。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. nproc：线程、进程与 fork 失败</h2>
+<p><code>nproc</code> 名字像“进程数”，实际和 Linux task 计数关系紧密，线程也可能计入。AI 训练中常见的 PyTorch DataLoader、OpenMP、Ray worker、Jupyter 多用户环境都可能触发 <code>fork: Resource temporarily unavailable</code>。</p>
+<pre><code># 查看当前用户限制
+ulimit -Su
+ulimit -Hu
+
+# 查看目标进程能用多少
+grep 'Max processes' /proc/12345/limits
+
+# 当前用户大致 task 数
+ps -u "$USER" -o pid= | wc -l
+ps -eLf | awk -v u="$USER" '$3==u {count++} END {print count+0}'
+
+# 观察线程多的进程
+ps -eLo pid,ppid,user,nlwp,comm --sort=-nlwp | head</code></pre>
+<div class="grid-2">
+<div class="card"><strong>训练节点常见触发点</strong><br>每个 rank 多个 DataLoader worker，每个 worker 又使用 OpenMP/BLAS 线程，叠加日志/监控/sidecar 后超过用户级 task 限制。</div>
+<div class="card"><strong>修复顺序</strong><br>先降低不必要 worker/线程数，再提高 nproc；不要只把 nproc 改大掩盖进程风暴。</div>
+</div>
+<pre><code># 常见降噪变量：按作业实际调小
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+# PyTorch 示例：减少 DataLoader worker
+# DataLoader(..., num_workers=4, persistent_workers=True)</code></pre>
+<div class="danger"><strong>多租户警告：</strong> 对共享登录节点和 JupyterHub 节点，盲目给所有用户 <code>nproc unlimited</code> 会削弱防护；更推荐按组设置合理 hard limit，并用 cgroup/作业调度器隔离。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. stack、core、fsize 与虚拟内存</h2>
+<p>不是所有 limits 都应该在生产中放开。<code>stack</code> 影响线程栈；<code>core</code> 控制 core dump 大小；<code>fsize</code> 限制单文件大小；<code>as</code>/<code>v</code> 限制虚拟地址空间。AI Infra 中它们通常用于调试、安全和故障隔离。</p>
+<table>
+<tr><th>限制项</th><th>常见建议</th><th>注意事项</th></tr>
+<tr><td><code>stack</code></td><td>默认通常够用；C/C++ 深递归或复杂线程栈再评估</td><td>线程多时过大 stack 会增加虚拟地址空间消耗</td></tr>
+<tr><td><code>core</code></td><td>调试崩溃时临时启用或由 systemd-coredump 管理</td><td>core 可能包含模型权重、输入、密钥和用户数据</td></tr>
+<tr><td><code>fsize</code></td><td>通常不人为限制训练/推理服务输出</td><td>低 fsize 会让 checkpoint、日志、dump 写失败</td></tr>
+<tr><td><code>as</code></td><td>AI 节点通常不靠它限制内存</td><td>大模型 mmap、CUDA、allocator 可能依赖大虚拟地址空间</td></tr>
+</table>
+<pre><code># 临时允许当前 shell 下程序生成 core，适合测试环境
+ulimit -c unlimited
+
+# 查看 core 配置与目标进程限制
+cat /proc/sys/kernel/core_pattern
+grep 'Max core file size' /proc/12345/limits
+
+# 查看 stack
+ulimit -s
+grep 'Max stack size' /proc/12345/limits</code></pre>
+<div class="warn"><strong>安全提醒：</strong> core dump 是调试利器，也是敏感数据泄漏源。生产启用前要确认落盘路径、权限、清理策略和合规要求。</div>
+</section>
+
+<section class="figure" id="s9">
+<h3>对照图：AI Infra 中最常撞限的资源</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="AI Infra ulimit resource comparison">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="27" font-weight="700">从症状反推 limits：先看目标进程，再看启动路径</text>
+<rect x="120" y="135" width="860" height="80" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="150" y="182" font-size="18" font-weight="700" fill="#1d4ed8">nofile</text>
+<rect x="275" y="158" width="560" height="34" rx="8" fill="#2563eb"/>
+<text x="855" y="181" font-size="14">文件、socket、日志、数据集</text>
+<rect x="120" y="245" width="860" height="80" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="150" y="292" font-size="18" font-weight="700" fill="#6d28d9">nproc</text>
+<rect x="275" y="268" width="440" height="34" rx="8" fill="#7c3aed"/>
+<text x="735" y="291" font-size="14">DataLoader、Ray、OpenMP、Jupyter</text>
+<rect x="120" y="355" width="860" height="80" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="150" y="402" font-size="18" font-weight="700" fill="#0f766e">memlock</text>
+<rect x="275" y="378" width="500" height="34" rx="8" fill="#0f766e"/>
+<text x="795" y="401" font-size="14">RDMA verbs、NCCL、DPDK</text>
+<rect x="120" y="465" width="860" height="80" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="150" y="512" font-size="18" font-weight="700" fill="#c2410c">core/stack</text>
+<rect x="275" y="488" width="330" height="34" rx="8" fill="#ea580c"/>
+<text x="625" y="511" font-size="14">崩溃调试、C++ 扩展、线程栈</text>
+<text x="550" y="595" text-anchor="middle" font-size="15" fill="#475569">条形长度表示 AI Infra 排障中常见程度，不表示应统一放开的大小。</text>
+</svg>
+<div class="caption">最常见的撞限项是 nofile、nproc、memlock；core/stack 常在调试和 C/C++ 扩展场景出现。</div>
+</section>
+
+<section class="section">
+<h2>8. memlock：RDMA、CUDA IPC 与锁页内存</h2>
+<p><code>memlock</code> 限制进程可锁定在物理内存中的大小。RDMA verbs 注册内存区域时需要把内存页 pin/lock，许多 InfiniBand/RoCE、DPDK、低延迟网络场景会受它影响。NCCL 或 UCX 报内存注册失败时，<code>memlock</code> 是必须检查的第一批项目之一。</p>
+<pre><code># 查看 memlock，ulimit 通常以 KB 显示
+ulimit -Sl
+ulimit -Hl
+
+# 目标训练进程实际值，/proc 通常显示 bytes
+grep 'Max locked memory' /proc/12345/limits
+
+# RDMA 相关基础确认
+ls -l /dev/infiniband 2&gt;/dev/null || true
+ibv_devinfo 2&gt;/dev/null | head -40 || true
+rdma link 2&gt;/dev/null || true</code></pre>
+<table>
+<tr><th>典型错误</th><th>可能含义</th><th>检查</th></tr>
+<tr><td><code>Cannot allocate memory</code></td><td>内存注册失败，可能是 memlock 或真实内存压力</td><td><code>Max locked memory</code>、dmesg、RDMA 驱动日志</td></tr>
+<tr><td><code>ibv_reg_mr failed</code></td><td>verbs 注册 MR 失败</td><td>memlock、设备权限、HCA 状态、容器设备透传</td></tr>
+<tr><td>NCCL/UCX fallback</td><td>通信没有走预期 RDMA 路径</td><td>NCCL/UCX 日志、<code>/proc/PID/limits</code>、容器配置</td></tr>
+</table>
+<div class="success"><strong>实践建议：</strong> 对专用训练节点，常见做法是给训练用户或训练服务设置较高 <code>memlock</code>，很多 RDMA 场景会设置为 <code>unlimited</code>；但要限定在可信用户/服务/容器运行时范围内，不要无差别放开共享节点。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. limits.conf 语法与 PAM 生效路径</h2>
+<p><code>/etc/security/limits.conf</code> 和 <code>/etc/security/limits.d/*.conf</code> 通过 PAM 的 <code>pam_limits.so</code> 在登录会话建立时设置限制。它主要影响 SSH、login、su 等 PAM 会话，不自动影响已经运行的进程，也通常不影响 systemd 启动的服务。</p>
+<pre><code># 查看 PAM 是否加载 pam_limits
+grep -R 'pam_limits.so' /etc/pam.d 2&gt;/dev/null
+
+# 推荐把自定义配置放到 limits.d，便于审计和回滚
+sudo install -m 0644 /dev/null /etc/security/limits.d/90-ai-infra.conf
+
+# 先编辑测试文件，不要直接覆盖系统文件
+sudoedit /etc/security/limits.d/90-ai-infra.conf</code></pre>
+<table>
+<tr><th>字段</th><th>示例</th><th>含义</th></tr>
+<tr><td><code>domain</code></td><td><code>aiuser</code>、<code>@trainers</code>、<code>*</code></td><td>用户、组或全局匹配。组名前加 <code>@</code></td></tr>
+<tr><td><code>type</code></td><td><code>soft</code>、<code>hard</code>、<code>-</code></td><td>设置软限制、硬限制，或同时设置</td></tr>
+<tr><td><code>item</code></td><td><code>nofile</code>、<code>nproc</code>、<code>memlock</code></td><td>资源限制项</td></tr>
+<tr><td><code>value</code></td><td><code>65535</code>、<code>1048576</code>、<code>unlimited</code></td><td>限制值，单位按 item 语义解释</td></tr>
+</table>
+<pre><code># /etc/security/limits.d/90-ai-infra.conf
+# 面向训练用户组的示例，按节点容量和租户策略调整
+@trainers soft nofile 1048576
+@trainers hard nofile 1048576
+@trainers soft nproc  262144
+@trainers hard nproc  262144
+@trainers soft memlock unlimited
+@trainers hard memlock unlimited
+
+# 推理服务用户：高 nofile，但不一定需要 unlimited memlock
+infer soft nofile 262144
+infer hard nofile 262144
+infer soft nproc  65535
+infer hard nproc  65535</code></pre>
+<div class="warn"><strong>生效提醒：</strong> 修改 <code>limits.conf</code> 后，已有 shell 和已有进程不会变化。退出并重新登录，或重新启动由 PAM 创建的会话后再检查 <code>ulimit -Sa/-Ha</code>。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 安全变更流程</h2>
+<p>limits 变更看似简单，但错误范围很大：可能让服务仍不生效，也可能让共享节点失去保护。推荐用“备份、最小范围、重登/重启、验证目标进程”的流程。</p>
+<pre><code># 1. 记录现状
+date
+ulimit -Sa
+ulimit -Ha
+cat /proc/$$/limits
+sudo test -f /etc/security/limits.conf && sudo cp -a /etc/security/limits.conf /etc/security/limits.conf.$(date +%Y%m%d%H%M%S).bak
+
+# 2. 新增独立 drop-in，不直接大改主文件
+sudo tee /etc/security/limits.d/90-ai-infra.conf &gt;/dev/null &lt;&lt'EOF'
+@trainers soft nofile 1048576
+@trainers hard nofile 1048576
+@trainers soft memlock unlimited
+@trainers hard memlock unlimited
+EOF
+
+# 3. 重新登录后验证，不要在旧 shell 里判断
+ssh "$USER@$(hostname)" 'ulimit -Sn; ulimit -Hn; ulimit -Sl; ulimit -Hl'
+
+# 4. 启动真实应用后看目标进程
+pid=12345
+cat /proc/$pid/limits</code></pre>
+<div class="grid-3">
+<div class="card"><strong>先确认影响面</strong><br>优先按用户或组配置，避免直接用 <code>*</code> 放开全系统。</div>
+<div class="card"><strong>先验证启动路径</strong><br>登录 shell、systemd 服务、容器 Pod 分别验证，不要互相推断。</div>
+<div class="card"><strong>保留回滚路径</strong><br>drop-in 文件更容易删除和审计；主配置改坏时影响更难定位。</div>
+</div>
+<div class="danger"><strong>不要这样做：</strong> 不要在生产共享节点上无差别写入 <code>* - nofile unlimited</code>、<code>* - nproc unlimited</code>。这会削弱防护，并可能让故障从“单作业失败”扩大成“整节点耗尽”。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. systemd 服务 caveat</h2>
+<p>systemd 启动的服务通常不通过交互式 PAM 登录会话，因此 <code>/etc/security/limits.conf</code> 往往不会影响它们。服务要用 unit 文件里的 <code>LimitNOFILE</code>、<code>LimitNPROC</code>、<code>LimitMEMLOCK</code> 等配置，或者通过 drop-in 覆盖。</p>
+<pre><code># 查看服务主进程实际 limits
+svc=training-worker.service
+systemctl show "$svc" -p MainPID -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK
+pid=$(systemctl show "$svc" -p MainPID --value)
+cat /proc/$pid/limits
+
+# 创建 drop-in，推荐不要直接编辑 vendor unit
+sudo systemctl edit training-worker.service</code></pre>
+<pre><code># /etc/systemd/system/training-worker.service.d/override.conf
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=262144
+LimitMEMLOCK=infinity
+
+# 生效
+sudo systemctl daemon-reload
+sudo systemctl restart training-worker.service
+systemctl show training-worker.service -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK</code></pre>
+<table>
+<tr><th>systemd 字段</th><th>对应限制</th><th>常见值</th></tr>
+<tr><td><code>LimitNOFILE</code></td><td><code>nofile</code></td><td><code>65535</code>、<code>1048576</code></td></tr>
+<tr><td><code>LimitNPROC</code></td><td><code>nproc</code></td><td>按服务线程/worker 模型设置</td></tr>
+<tr><td><code>LimitMEMLOCK</code></td><td><code>memlock</code></td><td><code>infinity</code> 或明确字节大小</td></tr>
+<tr><td><code>LimitCORE</code></td><td><code>core</code></td><td>调试时启用，结合 core 策略</td></tr>
+</table>
+<div class="note"><strong>验证标准：</strong> 对 systemd 服务，最终以 <code>/proc/MainPID/limits</code> 为准；<code>ulimit -a</code> 只说明当前终端，不说明服务。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 容器与 Kubernetes caveat</h2>
+<p>容器里的 limits 由宿主机内核执行，但启动时可能被 OCI runtime、Docker/containerd、Kubernetes、systemd 和 cgroup 共同影响。宿主机 <code>limits.conf</code> 不等于 Pod 内进程 limits；必须进入容器看 <code>/proc/1/limits</code> 或目标进程 limits。</p>
+<pre><code># Docker：启动时显式设置 ulimits
+docker run --rm \
+  --ulimit nofile=1048576:1048576 \
+  --ulimit memlock=-1:-1 \
+  --cap-add IPC_LOCK \
+  ubuntu:24.04 bash -lc 'ulimit -a; cat /proc/$$/limits'
+
+# Docker：查看容器 1 号进程实际 limits
+docker exec CONTAINER bash -lc 'cat /proc/1/limits'
+
+# Kubernetes：进入 Pod 验证
+kubectl exec -n train pod/name -- sh -lc 'ulimit -a; cat /proc/1/limits'</code></pre>
+<div class="grid-2">
+<div class="card"><strong>nofile caveat</strong><br>Kubernetes 原生 Pod spec 长期没有像 Docker CLI 一样直接的 per-container ulimit 字段；很多集群需要通过 container runtime 默认配置、CRI 配置、节点 systemd/containerd 配置或准入控制统一设置。</div>
+<div class="card"><strong>memlock caveat</strong><br>即使 <code>memlock</code> 足够，容器也可能缺少 <code>CAP_IPC_LOCK</code>、<code>/dev/infiniband</code> 设备、RDMA device plugin、IPC/hostNetwork/驱动挂载等条件。</div>
+</div>
+<pre><code># containerd / CRI 场景：从节点侧确认运行时和 shim
+ps -ef | egrep 'containerd|runc|crun' | grep -v grep
+systemctl show containerd -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK
+
+# Pod 内确认 RDMA 设备与 limits
+kubectl exec -n train pod/name -- sh -lc '
+  cat /proc/1/limits
+  ls -l /dev/infiniband 2&gt;/dev/null || true
+  grep Cap /proc/1/status
+'</code></pre>
+<div class="warn"><strong>结论边界：</strong> 容器内 <code>ulimit -a</code> 正常，只说明 limits 这一层正常；RDMA/NCCL 仍可能被设备插件、网络、GID、PFC/ECN、NCCL 参数或驱动版本阻塞。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 调度器、SSH 与非交互 shell</h2>
+<p>AI 集群常见启动路径包括 SSH 登录、JupyterHub、Slurm/PBS 作业、systemd timers、cron、Kubernetes Job、CI runner。不同路径是否走 PAM、是否读取用户 shell profile、是否继承提交端 limits，都不一样。</p>
+<table>
+<tr><th>启动路径</th><th>limits 来源</th><th>验证方式</th></tr>
+<tr><td>SSH 交互登录</td><td>PAM <code>pam_limits.so</code> + shell</td><td><code>ssh node 'ulimit -Sa; ulimit -Ha'</code></td></tr>
+<tr><td>systemd service</td><td>unit <code>Limit*</code>、manager 默认值</td><td><code>systemctl show</code> + <code>/proc/MainPID/limits</code></td></tr>
+<tr><td>cron</td><td>PAM/cron 服务配置与 daemon limits</td><td>在任务里输出 <code>ulimit -a</code></td></tr>
+<tr><td>Slurm/PBS</td><td>调度器 daemon、作业 prolog、PAM/插件配置</td><td>作业脚本内 <code>cat /proc/$$/limits</code></td></tr>
+<tr><td>Kubernetes</td><td>runtime、CRI、cgroup、镜像入口</td><td>Pod 内看 <code>/proc/1/limits</code></td></tr>
+</table>
+<pre><code># 把 limits 打进作业日志，避免猜测
+cat &gt; check-limits.sh &lt;&lt'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+hostname
+id
+ulimit -Sa
+ulimit -Ha
+cat /proc/$$/limits
+EOF
+chmod +x check-limits.sh
+
+# Slurm 示例
+srun -N1 ./check-limits.sh</code></pre>
+<div class="success"><strong>平台化建议：</strong> 把 limits 巡检写入节点验收、镜像验收、作业 prolog 或训练启动器，避免每次 NCCL/FD/fork 失败后再人工猜启动路径。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 故障症状映射</h2>
+<p>limits 类故障通常表现为系统调用失败，上层框架错误信息可能很绕。排障时把错误消息翻译回资源项，再用 <code>/proc/PID/limits</code> 和实际使用量确认。</p>
+<table>
+<tr><th>症状/日志</th><th>优先怀疑</th><th>确认命令</th><th>常见修复</th></tr>
+<tr><td><code>Too many open files</code></td><td><code>nofile</code> 太低或 FD 泄漏</td><td><code>ls /proc/PID/fd | wc -l</code>、<code>grep 'Max open files'</code></td><td>提高 nofile，同时修复泄漏/连接池</td></tr>
+<tr><td><code>fork: Resource temporarily unavailable</code></td><td><code>nproc</code>、pids cgroup、线程风暴</td><td><code>grep 'Max processes'</code>、<code>ps -eLf</code>、cgroup pids</td><td>调小 worker/线程数，提高受控 nproc/pids</td></tr>
+<tr><td><code>ibv_reg_mr failed</code></td><td><code>memlock</code>、RDMA 设备权限</td><td><code>grep 'Max locked memory'</code>、<code>ls /dev/infiniband</code></td><td>设置 memlock、CAP_IPC_LOCK、设备插件</td></tr>
+<tr><td>core 没生成</td><td><code>core</code> 为 0 或 core_pattern/systemd-coredump</td><td><code>ulimit -c</code>、<code>cat /proc/sys/kernel/core_pattern</code></td><td>临时启用 core，配置落盘和权限</td></tr>
+<tr><td>checkpoint 写入失败</td><td><code>fsize</code> 或磁盘/配额</td><td><code>grep 'Max file size'</code>、<code>df -h</code>、配额命令</td><td>提高 fsize 或修复存储容量/配额</td></tr>
+</table>
+<pre><code># 一次性采集某进程 limits 与资源使用
+pid=12345
+{
+  echo "== limits =="; cat /proc/$pid/limits
+  echo "== fd count =="; ls /proc/$pid/fd 2&gt;/dev/null | wc -l
+  echo "== thread count =="; grep '^Threads:' /proc/$pid/status
+  echo "== status caps =="; grep '^Cap' /proc/$pid/status
+} | tee limits-debug.$pid.txt</code></pre>
+</section>
+
+<section class="figure" id="s16">
+<h3>排障流程图：limits 问题不要只改配置文件</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="ulimit troubleshooting workflow">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="45" width="260" height="66" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">应用疑似撞 limits</text>
+<rect x="90" y="165" width="230" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="205" y="200" text-anchor="middle" font-size="18" font-weight="700">定位目标 PID</text>
+<text x="205" y="228" text-anchor="middle" font-size="14">不是当前终端 PID</text>
+<rect x="435" y="165" width="230" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="200" text-anchor="middle" font-size="18" font-weight="700">读 /proc/PID/limits</text>
+<text x="550" y="228" text-anchor="middle" font-size="14">确认 soft/hard/单位</text>
+<rect x="780" y="165" width="230" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="895" y="200" text-anchor="middle" font-size="18" font-weight="700">看实际使用量</text>
+<text x="895" y="228" text-anchor="middle" font-size="14">FD / threads / memlock</text>
+<rect x="90" y="340" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="205" y="375" text-anchor="middle" font-size="18" font-weight="700">识别启动路径</text>
+<text x="205" y="403" text-anchor="middle" font-size="14">SSH/systemd/K8s/Slurm</text>
+<rect x="435" y="340" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="375" text-anchor="middle" font-size="18" font-weight="700">改正确入口</text>
+<text x="550" y="403" text-anchor="middle" font-size="14">limits.d / unit / runtime</text>
+<rect x="780" y="340" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="895" y="375" text-anchor="middle" font-size="18" font-weight="700">重登或重启</text>
+<text x="895" y="403" text-anchor="middle" font-size="14">新进程才继承</text>
+<rect x="250" y="545" width="600" height="82" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="578" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">再次看目标进程 /proc/PID/limits</text>
+<text x="550" y="607" text-anchor="middle" font-size="14">验证配置生效，再判断是否还有应用泄漏、cgroup 或设备权限问题</text>
+<line x1="550" y1="111" x2="205" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="550" y1="111" x2="550" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="550" y1="111" x2="895" y2="165" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="205" y1="257" x2="205" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="550" y1="257" x2="550" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="895" y1="257" x2="895" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="320" y1="386" x2="435" y2="386" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="665" y1="386" x2="780" y2="386" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<line x1="895" y1="432" x2="690" y2="545" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">正确闭环：目标 PID 事实 → 启动路径 → 正确配置入口 → 新进程验证。</div>
+</section>
+
+<section class="section">
+<h2>15. 排障流程与命令模板</h2>
+<p>下面是一套可直接复制到事故现场的只读采集模板。它不修改系统，只把 limits、FD、线程、cgroup、systemd/container 线索集中保存，便于判断下一步该改哪里。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+pid="${1:?usage: $0 PID}"
+out="limits-triage-${pid}-$(date +%Y%m%d%H%M%S).txt"
+{
+  echo "== host =="; hostname; date; uname -a
+  echo "== process =="; ps -p "$pid" -o pid,ppid,user,comm,args
+  echo "== limits =="; cat "/proc/$pid/limits"
+  echo "== fd count =="; ls "/proc/$pid/fd" 2&gt;/dev/null | wc -l
+  echo "== threads =="; grep -E '^Threads:|^NStgid:|^NSpid:' "/proc/$pid/status" || true
+  echo "== cgroup =="; cat "/proc/$pid/cgroup" || true
+  echo "== caps =="; grep '^Cap' "/proc/$pid/status" || true
+  echo "== parent limits =="; ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status"); cat "/proc/$ppid/limits" 2&gt;/dev/null || true
+} | tee "$out"
+echo "saved: $out"</code></pre>
+<div class="success"><strong>判断方法：</strong> 如果目标进程 limits 已经足够高，但错误仍在，继续查应用泄漏、cgroup pids/memory、容器 capability、RDMA 设备权限、内核参数或后端服务瓶颈。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. AI Infra 推荐基线模板</h2>
+<p>以下不是“一刀切标准”，而是起点模板。真实值要结合节点角色、租户隔离、内存容量、训练框架、推理并发、RDMA 使用方式和安全策略确认。</p>
+<table>
+<tr><th>节点/服务类型</th><th>nofile</th><th>nproc</th><th>memlock</th><th>备注</th></tr>
+<tr><td>专用 GPU 训练节点</td><td>1048576</td><td>262144 或更高</td><td>unlimited</td><td>常见于 RDMA/NCCL，仍需 cgroup/调度器隔离</td></tr>
+<tr><td>推理服务节点</td><td>262144 到 1048576</td><td>按 worker/线程模型</td><td>按是否使用 RDMA/低延迟网络</td><td>重点监控 FD 泄漏和连接数</td></tr>
+<tr><td>共享登录/Jupyter 节点</td><td>65535 到 262144</td><td>受控设置</td><td>按用户组授权</td><td>避免全局 unlimited，防止单用户拖垮节点</td></tr>
+<tr><td>系统守护进程</td><td>按服务需要</td><td>按服务需要</td><td>通常不放开</td><td>用 systemd drop-in 单独设置</td></tr>
+</table>
+<pre><code># 训练节点用户组：PAM 登录会话示例
+@trainers soft nofile 1048576
+@trainers hard nofile 1048576
+@trainers soft nproc 262144
+@trainers hard nproc 262144
+@trainers soft memlock unlimited
+@trainers hard memlock unlimited
+
+# systemd 训练服务示例
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=262144
+LimitMEMLOCK=infinity</code></pre>
+<div class="warn"><strong>基线不是证明：</strong> 配置模板落地后必须用真实启动路径验证：登录 shell 看 <code>ulimit -Sa/-Ha</code>，服务看 <code>/proc/MainPID/limits</code>，Pod 看容器内目标进程。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习路线与检查清单</h2>
+<h3>第一阶段：看懂当前限制</h3>
+<ul>
+<li>运行 <code>ulimit -Sa</code> 和 <code>ulimit -Ha</code>，解释 <code>nofile</code>、<code>nproc</code>、<code>memlock</code> 的 soft/hard。</li>
+<li>启动一个 <code>sleep 300</code>，读取 <code>/proc/PID/limits</code>，确认它继承当前 shell。</li>
+<li>比较 <code>ulimit -l</code> 与 <code>/proc/PID/limits</code> 的单位。</li>
+</ul>
+<h3>第二阶段：安全修改</h3>
+<ul>
+<li>只在测试用户上新增 <code>/etc/security/limits.d/90-lab.conf</code>，重新登录后验证。</li>
+<li>为一个测试 systemd 服务添加 <code>LimitNOFILE</code> drop-in，重启服务后看 <code>/proc/MainPID/limits</code>。</li>
+<li>用 Docker <code>--ulimit</code> 启动容器，并在容器内看 <code>/proc/1/limits</code>。</li>
+</ul>
+<h3>第三阶段：AI Infra 排障</h3>
+<ul>
+<li>模拟打开大量文件，观察 <code>Too many open files</code> 与 <code>nofile</code> 的关系。</li>
+<li>检查训练进程的 FD 数、线程数、memlock，并把结果保存到排障报告。</li>
+<li>把 limits 检查加入训练启动脚本或作业 prolog。</li>
+</ul>
+<pre><code># 最小实验：观察子进程继承
+ulimit -Sn 4096
+bash -lc 'echo child nofile=$(ulimit -Sn); cat /proc/$$/limits | grep "Max open files"'
+
+# 最小实验：临时提高 soft 到 hard 内
+echo "before soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+ulimit -Sn "$(ulimit -Hn)"
+echo "after  soft=$(ulimit -Sn) hard=$(ulimit -Hn)"</code></pre>
+<div class="note"><strong>最终检查清单：</strong> 确认目标 PID、确认启动路径、确认 soft/hard、确认实际使用量、确认 cgroup/容器/systemd 是否另有限制、确认变更后新进程已经继承。</div>
+</section>
+
+<section class="section">
+<h2>18. 常见误区</h2>
+<div class="grid-2">
+<div class="card"><strong>误区 1：改了 limits.conf 服务就会生效</strong><br>systemd 服务通常要设置 <code>Limit*</code> 并重启服务。</div>
+<div class="card"><strong>误区 2：当前终端正常，Pod 就正常</strong><br>Pod 由容器运行时启动，必须在容器内看目标进程。</div>
+<div class="card"><strong>误区 3：unlimited 是万能修复</strong><br>它可能绕过保护栏，并掩盖 FD 泄漏、线程风暴或权限问题。</div>
+<div class="card"><strong>误区 4：只看 soft，不看 hard</strong><br>普通用户只能在 hard 内调 soft；hard 太低时临时 <code>ulimit</code> 会失败。</div>
+<div class="card"><strong>误区 5：只查 limits，不查 cgroup</strong><br>Kubernetes 和 systemd 还会用 cgroup 限制 pids、memory、CPU 和设备访问。</div>
+<div class="card"><strong>误区 6：RDMA 报错都归因于 memlock</strong><br>memlock 很重要，但设备、GID、路由、PFC/ECN、NCCL/UCX 配置也同样关键。</div>
+</div>
+</section>
+
+<section class="refbox" id="refs">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>bash(1)</code> 中 <code>ulimit</code>、<code>prlimit(1)</code>、<code>getrlimit(2)</code>、<code>setrlimit(2)</code>、<code>proc(5)</code>。</li>
+<li>PAM 文档：<code>pam_limits(8)</code>、<code>limits.conf(5)</code>，理解 <code>/etc/security/limits.conf</code> 与 <code>limits.d</code> 生效路径。</li>
+<li>systemd 文档：<code>systemd.exec(5)</code> 的 <code>LimitNOFILE</code>、<code>LimitNPROC</code>、<code>LimitMEMLOCK</code>、<code>LimitCORE</code>。</li>
+<li>OCI/Docker/containerd/Kubernetes 运行时文档：理解容器 ulimits、capabilities、cgroup pids/memory 和设备透传边界。</li>
+<li>RDMA/rdma-core、NCCL、UCX 文档：排查 <code>memlock</code>、<code>ibv_reg_mr</code>、设备权限和通信 fallback。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 soft/hard 与进程继承模型，再学习 PAM limits、systemd <code>Limit*</code>、容器 runtime，最后把 nofile/nproc/memlock 检查固化到 AI Infra 节点验收和作业启动流程。</p>
+</section>
+<div class="footer">ulimit 与 limits.conf 深度教程 · AI Infra/Linux · shell 资源限制、RDMA memlock、systemd、Kubernetes 与生产排障</div>
+</div>
+</body>
+</html>

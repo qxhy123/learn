@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>nccl-tests 深度教程：AI Infra GPU 通信压测与拓扑排障</title>
+<style>
+:root{--bg:#f5f7f4;--card:#fff;--ink:#1f2933;--muted:#5f6b62;--line:#d8e2d6;--green:#15803d;--green2:#dcfce7;--lime:#65a30d;--lime2:#ecfccb;--blue:#2563eb;--blue2:#dbeafe;--orange:#ea580c;--orange2:#ffedd5;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--dark:#0f172a;--shadow:0 14px 36px rgba(23,39,24,.09)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0%,#ecfccb 0,#f6faf1 30%,transparent 54%),linear-gradient(180deg,#fbfff8 0%,#f1f6ef 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#ffffff 0%,#f3faed 64%,#e9f7e3 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--green2);color:#166534;font-size:13px;font-weight:700;border:1px solid #bbf7d0}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfef9;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:var(--dark);color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f4fbef;text-align:left}.metric{font-weight:800;color:#14532d}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>nccl-tests 深度教程：AI Infra GPU 通信压测与拓扑排障</h1>
+<p class="sub"><code>nccl-tests</code> 是 AI 集群里验证 GPU 集合通信能力的基础工具。它不训练模型，也不代表完整业务吞吐，但能把 <code>all_reduce</code>、<code>all_gather</code>、<code>reduce_scatter</code> 等通信模式拆出来，帮助你判断单机 NVLink/PCIe、跨机 RDMA、NCCL 环境变量、MPI 启动方式和拓扑绑定是否正确。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">NCCL</span><span class="chip">all_reduce_perf</span><span class="chip">algbw / busbw</span><span class="chip">NVLink</span><span class="chip">RDMA</span><span class="chip">MPI</span><span class="chip">torchrun 对照</span><span class="chip">拓扑排障</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>nccl-tests</code> 用固定张量大小和固定 collective 算法负载，测出 GPU 之间“做一次通信操作”的耗时、算法带宽与总线带宽，是集群上线前验证 GPU 通信面的标尺。</div>
+<div class="success"><strong>实践原则：</strong> 先单机、再双机、再扩到目标规模；每次只改一个变量，例如网卡、NCCL 环境变量、进程布局或容器挂载。不要一上来跑全量节点，否则失败信号会被拓扑、调度和网络噪声淹没。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">nccl-tests 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：Collective 压测流水线</a></li>
+<li><a class="anchor" href="#s3">构建与二进制</a></li>
+<li><a class="anchor" href="#s4">单机 all_reduce_perf 快速开始</a></li>
+<li><a class="anchor" href="#s5">输出列：time、algbw、busbw、wrong</a></li>
+<li><a class="anchor" href="#s6">all_reduce、all_gather、reduce_scatter</a></li>
+<li><a class="anchor" href="#s7">单节点 GPU 拓扑验证</a></li>
+<li><a class="anchor" href="#s8">多节点 MPI 启动模式</a></li>
+<li><a class="anchor" href="#s9">torchrun 与训练链路对照</a></li>
+<li><a class="anchor" href="#s10">NCCL 环境变量速查</a></li>
+<li><a class="anchor" href="#s11">algbw 与 busbw 的解释</a></li>
+<li><a class="anchor" href="#s12">拓扑、NVLink、PCIe 与 RDMA 三角定位</a></li>
+<li><a class="anchor" href="#s13">与 nvidia-smi、iperf3、ib_write_bw 的边界</a></li>
+<li><a class="anchor" href="#s14">容器、调度器与权限注意事项</a></li>
+<li><a class="anchor" href="#s15">安全压测与生产影响控制</a></li>
+<li><a class="anchor" href="#s16">常见故障与排查流程</a></li>
+<li><a class="anchor" href="#s17">基准记录模板</a></li>
+<li><a class="anchor" href="#s18">参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. nccl-tests 是什么</h2>
+<p><code>nccl-tests</code> 是 NVIDIA NCCL 的配套测试集，核心目标是测量多 GPU、多进程、多节点之间的 collective 通信性能与正确性。AI Infra 场景里，它常用于新机器验收、驱动/CUDA/NCCL 升级回归、网络变更验证、容器镜像验证，以及训练慢、挂起、跨节点不通时的最小复现。</p>
+<div class="grid-3">
+<div class="card"><strong>它能回答</strong><br>单机 8 卡通信是否走 NVLink？跨节点是否走 RDMA？NCCL 是否选对网卡？all_reduce 在大消息时是否达到预期带宽？</div>
+<div class="card"><strong>它不能回答</strong><br>模型端到端吞吐、数据加载瓶颈、优化器开销、框架图编译、checkpoint I/O 或业务代码 bug。</div>
+<div class="card"><strong>它的位置</strong><br>介于硬件裸测和训练框架之间：比 <code>nvidia-smi</code> 更接近训练通信，比完整训练更容易定位。</div>
+</div>
+<pre><code># 常见二进制名称
+all_reduce_perf
+all_gather_perf
+reduce_scatter_perf
+broadcast_perf
+reduce_perf
+sendrecv_perf</code></pre>
+<div class="warn"><strong>基准语义：</strong> <code>nccl-tests</code> 结果是通信微基准，不是训练性能承诺。它适合做“通信面是否健康”的证据，而不是单独作为模型吞吐 SLA。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：nccl-tests 在 AI Infra 验证链路中的位置</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="nccl-tests 整体模型">
+<rect x="18" y="18" width="1064" height="620" rx="22" fill="#fbfef9" stroke="#d8e2d6"/>
+<text x="550" y="68" text-anchor="middle" font-size="28" font-weight="700" fill="#14532d">从硬件到训练：通信健康检查的中间层</text>
+<rect x="70" y="130" width="205" height="118" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="172" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">硬件可见性</text><text x="172" y="202" text-anchor="middle" font-size="15">nvidia-smi</text><text x="172" y="226" text-anchor="middle" font-size="15">ibstat / lspci</text>
+<rect x="325" y="130" width="205" height="118" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="427" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#166534">通信微基准</text><text x="427" y="202" text-anchor="middle" font-size="15">nccl-tests</text><text x="427" y="226" text-anchor="middle" font-size="15">collective 性能</text>
+<rect x="580" y="130" width="205" height="118" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="682" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">框架分布式</text><text x="682" y="202" text-anchor="middle" font-size="15">torchrun / MPI</text><text x="682" y="226" text-anchor="middle" font-size="15">进程组初始化</text>
+<rect x="835" y="130" width="205" height="118" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="937" y="170" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">训练业务</text><text x="937" y="202" text-anchor="middle" font-size="15">LLM / CV / RL</text><text x="937" y="226" text-anchor="middle" font-size="15">端到端吞吐</text>
+<line x1="275" y1="189" x2="325" y2="189" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="530" y1="189" x2="580" y2="189" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="785" y1="189" x2="835" y2="189" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="125" y="360" width="850" height="150" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="400" text-anchor="middle" font-size="23" font-weight="700" fill="#334155">典型定位策略</text><text x="550" y="438" text-anchor="middle" font-size="16">硬件可见但 nccl-tests 慢：优先查拓扑、NCCL 网卡选择、RDMA/GDR</text><text x="550" y="468" text-anchor="middle" font-size="16">nccl-tests 正常但训练慢：转向框架、模型并行策略、数据和 I/O</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">nccl-tests 最适合作为“通信面健康”的证据：上游看硬件和网络，下游再看框架与业务。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 构建与二进制</h2>
+<p>构建时要让 CUDA、NCCL、MPI 与运行环境一致。单机不一定需要 MPI；多机测试通常需要 MPI 支持，或使用集群已有的 MPI launcher 启动多个进程。</p>
+<pre><code># 获取源码后构建。实际 CUDA_HOME/NCCL_HOME 按环境调整。
+git clone https://github.com/NVIDIA/nccl-tests.git
+cd nccl-tests
+
+# 单机构建：适合先验证同机多 GPU
+make -j
+
+# 多节点 MPI 构建：需要 MPI 编译器和运行时
+make MPI=1 MPI_HOME=/usr/local/mpi -j
+
+# 查看生成的测试程序
+ls build/*_perf</code></pre>
+<table>
+<tr><th>构建项</th><th>检查点</th><th>常见问题</th></tr>
+<tr><td>CUDA</td><td><code>nvcc --version</code>、驱动支持的 CUDA 版本</td><td>容器 CUDA 与宿主驱动不兼容，运行时报库错误</td></tr>
+<tr><td>NCCL</td><td><code>libnccl.so</code> 路径、版本一致性</td><td>编译链接一个版本，运行时加载另一个版本</td></tr>
+<tr><td>MPI</td><td><code>mpirun --version</code>、<code>mpicc</code>、SSH/PMI</td><td>MPI 没把环境变量传到远端，或容器内外 MPI 不匹配</td></tr>
+</table>
+<div class="note"><strong>最小原则：</strong> 如果只是排查训练通信，优先使用和训练容器相同的 CUDA/NCCL/MPI 镜像构建并运行，避免“裸机能跑、容器不能跑”的双环境问题。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 单机 all_reduce_perf 快速开始</h2>
+<p><code>all_reduce_perf</code> 是最常用的入口，因为数据并行训练里的梯度同步主要就是 all-reduce 语义。先用小规模命令确认能跑，再扩大消息大小与 GPU 数量。</p>
+<pre><code># 1 张 GPU，功能冒烟
+./build/all_reduce_perf -b 8 -e 128M -f 2 -g 1
+
+# 单机 8 张 GPU，大消息通信性能
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+
+# 增加迭代，降低短测抖动；-w 是 warmup，-n 是正式迭代次数
+./build/all_reduce_perf -b 1M -e 8G -f 2 -g 8 -w 20 -n 100</code></pre>
+<table>
+<tr><th>参数</th><th>含义</th><th>AI Infra 使用建议</th></tr>
+<tr><td><code>-b</code></td><td>起始消息大小</td><td>从 8B 或 1K 开始看小包延迟，从 1M 开始看稳定带宽</td></tr>
+<tr><td><code>-e</code></td><td>结束消息大小</td><td>单机常到 1G 或 8G；大规模集群先别直接拉满显存</td></tr>
+<tr><td><code>-f</code></td><td>消息大小增长倍数</td><td><code>2</code> 最常用，便于画趋势</td></tr>
+<tr><td><code>-g</code></td><td>每个进程使用的 GPU 数</td><td>单进程单机常用 <code>-g 8</code>；多进程模式需按 rank 布局设计</td></tr>
+<tr><td><code>-w</code> / <code>-n</code></td><td>预热/正式迭代次数</td><td>做基准记录时增加迭代，排除首次初始化噪声</td></tr>
+</table>
+<div class="success"><strong>推荐路径：</strong> 先 <code>-g 1</code> 验证二进制，再 <code>-g 2</code> 验证点对点拓扑，再 <code>-g 8</code> 验证整机通信面。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 输出列：time、algbw、busbw、wrong</h2>
+<p>多数 <code>*_perf</code> 输出会按消息大小打印耗时和带宽。做排障时，不要只看最后一行；小消息、中等消息、大消息分别代表延迟、协议切换和链路吞吐。</p>
+<pre><code># 输出示意，数值仅用于说明列含义
+# size         count    type   redop   root   time(us)  algbw(GB/s)  busbw(GB/s)  #wrong
+# 1048576      262144   float  sum     -1     83.20     12.60        22.05        0
+# 8388608      2097152  float  sum     -1     225.30    37.24        65.17        0
+# 67108864     16777216 float  sum     -1     980.40    68.45        119.78       0</code></pre>
+<table>
+<tr><th>列</th><th>怎么看</th><th>异常信号</th></tr>
+<tr><td><code>time</code></td><td>单次 collective 平均耗时，通常单位为微秒</td><td>小消息耗时异常高，多为初始化、CPU 绑定、PCIe/NUMA 或网络握手问题</td></tr>
+<tr><td><code>algbw</code></td><td>按算法处理的数据量除以耗时得到的算法带宽</td><td>大消息上不去，说明通信路径、协议或链路存在瓶颈</td></tr>
+<tr><td><code>busbw</code></td><td>按 collective 实际总线流量折算的链路压力指标</td><td>和预期拓扑差距大，常见于没走 NVLink/RDMA 或 rank 布局错误</td></tr>
+<tr><td><code>#wrong</code></td><td>正确性检查错误数</td><td>非 0 要先停下排查，不要继续解读性能数据</td></tr>
+</table>
+<div class="danger"><strong>硬规则：</strong> <code>#wrong</code> 非 0 时，性能数值没有可信意义。先查驱动、NCCL/CUDA 版本、GPU ECC/Xid、超频/温度、电源和硬件稳定性。</div>
+</section>
+
+<section class="figure" id="fig-collectives">
+<h3>对比图：三类常用 Collective 的数据流</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="all_reduce all_gather reduce_scatter 对比">
+<rect x="18" y="18" width="1064" height="650" rx="22" fill="#fbfef9" stroke="#d8e2d6"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#14532d">不同 collective 对应不同训练通信形态</text>
+<rect x="70" y="105" width="300" height="470" rx="20" fill="#dcfce7" stroke="#86efac"/><text x="220" y="145" text-anchor="middle" font-size="22" font-weight="700" fill="#166534">all_reduce</text><text x="220" y="177" text-anchor="middle" font-size="15">每卡输入梯度，输出全局求和结果</text>
+<circle cx="145" cy="255" r="34" fill="#16a34a"/><text x="145" y="262" text-anchor="middle" font-size="17" fill="#fff">G0</text><circle cx="295" cy="255" r="34" fill="#16a34a"/><text x="295" y="262" text-anchor="middle" font-size="17" fill="#fff">G1</text><circle cx="145" cy="380" r="34" fill="#16a34a"/><text x="145" y="387" text-anchor="middle" font-size="17" fill="#fff">G2</text><circle cx="295" cy="380" r="34" fill="#16a34a"/><text x="295" y="387" text-anchor="middle" font-size="17" fill="#fff">G3</text><path d="M170 280 C210 320 230 320 270 280" fill="none" stroke="#14532d" stroke-width="4" marker-end="url(#b1)"/><path d="M270 355 C230 315 210 315 170 355" fill="none" stroke="#14532d" stroke-width="4" marker-end="url(#b1)"/><text x="220" y="500" text-anchor="middle" font-size="15">典型用途：数据并行梯度同步</text>
+<rect x="400" y="105" width="300" height="470" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="145" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">all_gather</text><text x="550" y="177" text-anchor="middle" font-size="15">每卡持有分片，最终每卡拿到全量</text><rect x="472" y="240" width="48" height="48" rx="8" fill="#2563eb"/><rect x="535" y="240" width="48" height="48" rx="8" fill="#60a5fa"/><rect x="598" y="240" width="48" height="48" rx="8" fill="#93c5fd"/><rect x="482" y="365" width="136" height="48" rx="8" fill="#bfdbfe" stroke="#2563eb"/><text x="550" y="395" text-anchor="middle" font-size="15">完整张量</text><line x1="550" y1="295" x2="550" y2="355" stroke="#1d4ed8" stroke-width="4" marker-end="url(#b1)"/><text x="550" y="500" text-anchor="middle" font-size="15">典型用途：张量并行参数/激活拼接</text>
+<rect x="730" y="105" width="300" height="470" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="880" y="145" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">reduce_scatter</text><text x="880" y="177" text-anchor="middle" font-size="15">先规约，再把结果切片分发</text><rect x="812" y="240" width="136" height="48" rx="8" fill="#fed7aa" stroke="#ea580c"/><text x="880" y="270" text-anchor="middle" font-size="15">全量梯度</text><line x1="880" y1="295" x2="880" y2="355" stroke="#c2410c" stroke-width="4" marker-end="url(#b1)"/><rect x="795" y="365" width="48" height="48" rx="8" fill="#ea580c"/><rect x="857" y="365" width="48" height="48" rx="8" fill="#fb923c"/><rect x="919" y="365" width="48" height="48" rx="8" fill="#fdba74"/><text x="880" y="500" text-anchor="middle" font-size="15">典型用途：ZeRO / FSDP 梯度分片</text>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#64748b"/></marker></defs>
+</svg><div class="caption">选择哪个测试程序取决于你要模拟的训练通信：数据并行优先 all_reduce，分片策略还要看 all_gather 和 reduce_scatter。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. all_reduce、all_gather、reduce_scatter 怎么选</h2>
+<p>不同训练并行策略对应的通信热点不同。只跑 <code>all_reduce_perf</code> 不足以覆盖所有 AI Infra 场景，尤其是 FSDP、ZeRO、张量并行和 MoE 场景。</p>
+<table>
+<tr><th>测试程序</th><th>最接近的训练通信</th><th>重点观察</th></tr>
+<tr><td><code>all_reduce_perf</code></td><td>数据并行梯度同步、部分张量并行规约</td><td>大消息带宽、跨节点扩展、<code>#wrong</code></td></tr>
+<tr><td><code>all_gather_perf</code></td><td>FSDP 参数 gather、张量并行拼接</td><td>跨节点全量聚合开销，是否受网卡选择影响</td></tr>
+<tr><td><code>reduce_scatter_perf</code></td><td>ZeRO/FSDP 梯度分片、分布式优化器</td><td>分片通信带宽和 rank 布局敏感度</td></tr>
+<tr><td><code>sendrecv_perf</code></td><td>流水并行、点对点通信、链路局部验证</td><td>单链路延迟/带宽，定位坏链路很有用</td></tr>
+</table>
+<pre><code># 同一环境下横向跑三类 collective，避免只看 all_reduce
+for t in all_reduce_perf all_gather_perf reduce_scatter_perf; do
+  ./build/$t -b 1M -e 4G -f 2 -g 8 -w 20 -n 100 | tee ${t}.single-node.log
+done</code></pre>
+<div class="note"><strong>对照思维：</strong> 如果训练使用 FSDP/ZeRO，只证明 <code>all_reduce_perf</code> 正常是不够的；还要验证 <code>all_gather_perf</code> 与 <code>reduce_scatter_perf</code>。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 单节点 GPU 拓扑验证</h2>
+<p>单机先确认 GPU 可见性、拓扑、NVLink 状态和 NUMA 关系。通信测试慢不一定是 NCCL bug，常见原因是 GPU 没走预期链路、进程 CPU 绑错 NUMA、容器没暴露 NVLink/NVML 信息，或机器处于降频/错误状态。</p>
+<pre><code># 查看 GPU 与 CPU/网卡拓扑
+nvidia-smi topo -m
+
+# 查看 NVLink 链路状态和吞吐计数
+nvidia-smi nvlink --status
+
+# 单机分步测试：1 卡、2 卡、4 卡、8 卡
+for g in 1 2 4 8; do
+  ./build/all_reduce_perf -b 1M -e 8G -f 2 -g $g -w 20 -n 100 | tee ar_g${g}.log
+done</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>下一步</th></tr>
+<tr><td>2 卡就很慢</td><td>GPU 间是 PCIe PHB/SYS，或 NVLink 链路不可用</td><td>对照 <code>nvidia-smi topo -m</code>，换 GPU pair 测试</td></tr>
+<tr><td>小包延迟高</td><td>CPU 绑核/NUMA 不佳，进程被调度打断</td><td>用 <code>numactl</code> 或调度器 CPU binding 固定</td></tr>
+<tr><td>大包带宽低</td><td>没走 NVLink、PCIe 降速、GPU 温度/功耗限制</td><td>查 <code>nvidia-smi -q</code>、链路宽度、功耗和 Xid</td></tr>
+</table>
+<div class="success"><strong>单机基线：</strong> 单节点结果是多节点排障的地基。单机都不稳定时，不要继续调 RDMA 或 MPI。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 多节点 MPI 启动模式</h2>
+<p>多节点通常用 MPI 启动每台机器上的 rank。两种常见布局是“每节点 1 个 rank，rank 内用 <code>-g 8</code> 管理 8 卡”和“每 GPU 1 个 rank，<code>-g 1</code>”。前者简单，后者更贴近部分框架布局。排障时先选择一种并固定下来。</p>
+<pre><code># hosts.txt 示例，每行一个节点，可带 slots
+node-a slots=1
+node-b slots=1
+
+# 两节点，每节点一个进程，每进程 8 张 GPU
+mpirun -np 2 --hostfile hosts.txt \
+  -x NCCL_DEBUG=INFO \
+  -x NCCL_SOCKET_IFNAME=eth0 \
+  -x NCCL_IB_HCA=mlx5_0,mlx5_1 \
+  ./build/all_reduce_perf -b 1M -e 8G -f 2 -g 8 -w 20 -n 100
+
+# 两节点，每 GPU 一个进程。此时 hostfile slots 通常应等于每节点 GPU 数。
+mpirun -np 16 --host node-a:8,node-b:8 \
+  -x NCCL_DEBUG=INFO \
+  -x NCCL_SOCKET_IFNAME=eth0 \
+  ./build/all_reduce_perf -b 1M -e 2G -f 2 -g 1 -w 20 -n 100</code></pre>
+<div class="warn"><strong>MPI 环境变量：</strong> 不同 MPI 实现传参方式不同。Open MPI 常用 <code>-x VAR=value</code>，MPICH/Intel MPI 可能使用不同语法。确认远端 rank 真的拿到了 NCCL 环境变量。</div>
+<table>
+<tr><th>布局</th><th>优点</th><th>风险</th></tr>
+<tr><td>每节点 1 rank，<code>-g 8</code></td><td>命令短，适合节点级验收</td><td>不完全等同每 GPU 一个训练进程</td></tr>
+<tr><td>每 GPU 1 rank，<code>-g 1</code></td><td>更接近 PyTorch DDP/FSDP 常见进程布局</td><td>MPI、CPU binding、rank-GPU 映射更容易错</td></tr>
+</table>
+</section>
+
+<section class="section" id="s9">
+<h2>8. torchrun 与训练链路对照</h2>
+<p><code>nccl-tests</code> 本身不由 <code>torchrun</code> 启动，但 AI Infra 排障经常需要把它和 PyTorch 分布式最小脚本对照：如果 nccl-tests 正常而 torchrun 失败，问题更可能在框架、容器环境、 rendezvous、rank 映射或训练代码；如果二者都失败，先查 NCCL/网络/权限。</p>
+<pre><code># torchrun 对照脚本：只做一次 all_reduce，验证框架链路
+cat &gt; torch_nccl_smoke.py &lt;&lt;'PY'
+import os
+import torch
+import torch.distributed as dist
+
+dist.init_process_group("nccl")
+rank = dist.get_rank()
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+x = torch.ones(1024 * 1024, device="cuda") * (rank + 1)
+dist.all_reduce(x)
+if rank == 0:
+    print("ok", x[0].item(), "world", dist.get_world_size())
+dist.destroy_process_group()
+PY
+
+# 单机 8 进程
+NCCL_DEBUG=INFO torchrun --standalone --nproc_per_node=8 torch_nccl_smoke.py
+
+# 多机示意：两台都执行，node_rank 分别为 0 和 1
+NCCL_DEBUG=INFO torchrun \
+  --nnodes=2 --nproc_per_node=8 \
+  --node_rank=0 --master_addr=node-a --master_port=29500 \
+  torch_nccl_smoke.py</code></pre>
+<div class="note"><strong>对照技巧：</strong> 让 <code>torchrun</code> 使用和 <code>mpirun nccl-tests</code> 相同的 <code>NCCL_SOCKET_IFNAME</code>、<code>NCCL_IB_HCA</code>、<code>NCCL_DEBUG</code>，否则对比没有意义。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. NCCL 环境变量速查</h2>
+<p>NCCL 环境变量是定位通信路径的核心工具。排障时应显式记录变量，而不是依赖默认选择。默认选择可能随 NCCL 版本、网卡命名、容器网络和 PCIe 拓扑变化。</p>
+<table>
+<tr><th>变量</th><th>用途</th><th>示例</th></tr>
+<tr><td><code>NCCL_DEBUG</code></td><td>输出 NCCL 日志级别</td><td><code>NCCL_DEBUG=INFO</code></td></tr>
+<tr><td><code>NCCL_DEBUG_SUBSYS</code></td><td>限制日志子系统，便于看网络/拓扑</td><td><code>NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH</code></td></tr>
+<tr><td><code>NCCL_SOCKET_IFNAME</code></td><td>选择 TCP bootstrap 或 socket 网络接口</td><td><code>NCCL_SOCKET_IFNAME=eth0</code></td></tr>
+<tr><td><code>NCCL_IB_HCA</code></td><td>选择 RDMA HCA</td><td><code>NCCL_IB_HCA=mlx5_0,mlx5_1</code></td></tr>
+<tr><td><code>NCCL_IB_DISABLE</code></td><td>禁用 InfiniBand/RDMA 路径做 A/B 对照</td><td><code>NCCL_IB_DISABLE=1</code></td></tr>
+<tr><td><code>NCCL_P2P_DISABLE</code></td><td>禁用 GPU P2P 做对照</td><td><code>NCCL_P2P_DISABLE=1</code></td></tr>
+<tr><td><code>NCCL_TOPO_FILE</code></td><td>指定拓扑文件，复现实验路径</td><td><code>NCCL_TOPO_FILE=/tmp/topo.xml</code></td></tr>
+<tr><td><code>NCCL_ALGO</code> / <code>NCCL_PROTO</code></td><td>限制算法/协议做定位</td><td><code>NCCL_ALGO=Ring NCCL_PROTO=Simple</code></td></tr>
+</table>
+<pre><code># 推荐的排障日志组合
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_HCA=mlx5_0,mlx5_1
+
+mpirun -np 2 --host node-a,node-b \
+  -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA \
+  ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8</code></pre>
+<div class="danger"><strong>不要永久化排障变量：</strong> <code>NCCL_IB_DISABLE=1</code>、<code>NCCL_P2P_DISABLE=1</code>、强制 <code>NCCL_ALGO</code> 适合 A/B 定位，不应不经验证写进生产训练环境。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. algbw 与 busbw 的解释</h2>
+<p><span class="metric">algbw</span> 是算法视角的有效带宽，<span class="metric">busbw</span> 是按 collective 在链路上产生的数据流量折算后的总线带宽。不同 collective 的 busbw 公式不同，所以跨程序比较时要谨慎。</p>
+<div class="grid-2">
+<div class="card"><strong>什么时候看 algbw</strong><br>评估某个 collective 对训练步骤的有效吞吐，例如大梯度 all-reduce 的整体完成速度。</div>
+<div class="card"><strong>什么时候看 busbw</strong><br>判断底层链路是否接近预期，例如 NVLink、PCIe、IB/RoCE 的可用带宽是否被打满。</div>
+</div>
+<table>
+<tr><th>判断</th><th>解释</th><th>行动</th></tr>
+<tr><td>algbw 和 busbw 都低</td><td>链路或进程布局可能有明显瓶颈</td><td>从拓扑、网卡选择、CPU binding 开始</td></tr>
+<tr><td>小消息低，大消息正常</td><td>延迟敏感，可能是启动、协议、CPU 调度影响</td><td>增加迭代，固定 CPU，观察 p50/p99 外的整体趋势</td></tr>
+<tr><td>单机正常，多机低</td><td>跨节点网络、RDMA、路由或交换机侧问题</td><td>对照 <code>ib_write_bw</code>、<code>iperf3</code>、NCCL NET 日志</td></tr>
+<tr><td>多次结果抖动大</td><td>共享集群干扰、温度/功耗、后台任务或拥塞</td><td>隔离节点，记录时间段，查交换机/作业负载</td></tr>
+</table>
+<div class="warn"><strong>不要机械套公式：</strong> busbw 是 nccl-tests 为不同 collective 做的折算指标，适合同类同规模对比；跨版本、跨拓扑、跨 collective 时，应结合 NCCL 日志和硬件理论值解释。</div>
+</section>
+
+<section class="figure" id="fig-topology">
+<h3>拓扑图：从 GPU 到跨节点网络的三段链路</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="GPU 拓扑 RDMA NVLink triage">
+<rect x="18" y="18" width="1064" height="670" rx="22" fill="#fbfef9" stroke="#d8e2d6"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700" fill="#14532d">通信慢时，把路径拆成三段看</text>
+<rect x="80" y="120" width="420" height="210" rx="20" fill="#dcfce7" stroke="#86efac"/><text x="290" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#166534">节点 A</text>
+<rect x="125" y="205" width="70" height="54" rx="10" fill="#16a34a"/><text x="160" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU0</text><rect x="225" y="205" width="70" height="54" rx="10" fill="#16a34a"/><text x="260" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU1</text><rect x="325" y="205" width="70" height="54" rx="10" fill="#16a34a"/><text x="360" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU2</text>
+<line x1="195" y1="232" x2="225" y2="232" stroke="#14532d" stroke-width="5"/><line x1="295" y1="232" x2="325" y2="232" stroke="#14532d" stroke-width="5"/><text x="260" y="290" text-anchor="middle" font-size="15">段 1：NVLink / PCIe / NUMA</text>
+<rect x="410" y="210" width="64" height="44" rx="8" fill="#2563eb"/><text x="442" y="238" text-anchor="middle" font-size="13" fill="#fff">HCA</text>
+<rect x="600" y="120" width="420" height="210" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="810" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">节点 B</text>
+<rect x="645" y="205" width="70" height="54" rx="10" fill="#2563eb"/><text x="680" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU0</text><rect x="745" y="205" width="70" height="54" rx="10" fill="#2563eb"/><text x="780" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU1</text><rect x="845" y="205" width="70" height="54" rx="10" fill="#2563eb"/><text x="880" y="238" text-anchor="middle" font-size="14" fill="#fff">GPU2</text>
+<rect x="626" y="210" width="64" height="44" rx="8" fill="#0f766e"/><text x="658" y="238" text-anchor="middle" font-size="13" fill="#fff">HCA</text>
+<path d="M474 232 C525 175, 575 175, 626 232" fill="none" stroke="#0f766e" stroke-width="6" marker-end="url(#c1)"/><text x="550" y="180" text-anchor="middle" font-size="15">段 2：IB/RoCE fabric、路由、拥塞</text>
+<path d="M442 254 C442 360, 550 372, 550 440" fill="none" stroke="#64748b" stroke-width="4" marker-end="url(#c1)"/><path d="M658 254 C658 360, 550 372, 550 440" fill="none" stroke="#64748b" stroke-width="4" marker-end="url(#c1)"/>
+<rect x="260" y="440" width="580" height="140" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="482" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">段 3：NCCL 选择的实际路径</text><text x="550" y="520" text-anchor="middle" font-size="16">NCCL_DEBUG=INFO + INIT,NET,GRAPH 看它选了哪张网卡、哪个算法、几条 channel</text><text x="550" y="550" text-anchor="middle" font-size="16">工具对照：nvidia-smi topo / ib_write_bw / iperf3 / nccl-tests</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#64748b"/></marker></defs>
+</svg><div class="caption">定位不要直接跳到“网络慢”：先拆成同机 GPU 链路、跨节点网络链路、NCCL 实际选择路径三层。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 拓扑、NVLink、PCIe 与 RDMA 三角定位</h2>
+<p>通信慢通常不是单点问题，而是拓扑、网络和 NCCL 选择共同作用。最有效的方法是 A/B：禁用某条路径或固定某张网卡，观察结果是否按预期变化。</p>
+<pre><code># A/B 1：禁用 RDMA，强制走 TCP，验证 RDMA 是否真的带来提升
+NCCL_IB_DISABLE=1 \
+mpirun -np 2 --host node-a,node-b \
+  ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8
+
+# A/B 2：禁用 GPU P2P，观察单机是否明显下降
+NCCL_P2P_DISABLE=1 ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8
+
+# A/B 3：固定 HCA，逐个测试网卡
+for hca in mlx5_0 mlx5_1 mlx5_2 mlx5_3; do
+  NCCL_IB_HCA=$hca mpirun -np 2 --host node-a,node-b \
+    ./build/all_reduce_perf -b 1M -e 2G -f 2 -g 8 | tee ar_${hca}.log
+done</code></pre>
+<table>
+<tr><th>对照结果</th><th>含义</th><th>后续</th></tr>
+<tr><td>禁用 RDMA 后几乎不变</td><td>原本可能就没走 RDMA，或 RDMA 路径异常</td><td>查 NCCL NET 日志、HCA、GID、RoCE PFC/ECN、IB link</td></tr>
+<tr><td>禁用 P2P 后单机大幅下降</td><td>NVLink/P2P 路径有效</td><td>单机拓扑基本健康，再看跨机</td></tr>
+<tr><td>某个 HCA 明显慢</td><td>网卡、线缆、交换机端口或 NUMA 关系可能异常</td><td>用 <code>ib_write_bw</code> 点测，再查交换机计数</td></tr>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>12. nccl-tests vs nvidia-smi / iperf3 / ib_write_bw</h2>
+<p>这几个工具不是互相替代，而是从不同层面观察同一个系统。排障时先用低层工具确认硬件和网络，再用 <code>nccl-tests</code> 验证 NCCL collective。</p>
+<table>
+<tr><th>工具</th><th>测什么</th><th>不能说明什么</th><th>和 nccl-tests 的关系</th></tr>
+<tr><td><code>nvidia-smi</code></td><td>GPU 可见性、温度、功耗、进程、拓扑、NVLink 状态</td><td>不能证明 NCCL collective 带宽正常</td><td>先验健康检查</td></tr>
+<tr><td><code>iperf3</code></td><td>TCP/IP 网络吞吐</td><td>不能证明 RDMA 或 GPU Direct RDMA 正常</td><td>排除基础 IP 网络问题</td></tr>
+<tr><td><code>ib_write_bw</code></td><td>RDMA verbs 层点对点带宽/延迟</td><td>不能证明 NCCL rank 拓扑和算法选择正确</td><td>验证 HCA/链路/交换机</td></tr>
+<tr><td><code>nccl-tests</code></td><td>GPU collective 的端到端通信表现</td><td>不能单独解释底层哪一段坏</td><td>AI 训练通信面的主基准</td></tr>
+</table>
+<pre><code># 一个合理的跨节点排障顺序
+nvidia-smi topo -m
+ibstat
+ib_write_bw node-b
+iperf3 -c node-b -P 8
+mpirun -np 2 --host node-a,node-b ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8</code></pre>
+<div class="note"><strong>判断边界：</strong> <code>ib_write_bw</code> 好而 nccl-tests 差，重点查 NCCL 环境、GPU-HCA 亲和性和 GDR；nccl-tests 好而训练差，重点转向框架和模型。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 容器、调度器与权限注意事项</h2>
+<p>AI 集群通常在容器和调度器中运行，很多问题来自“容器里看见的世界”和宿主机不一致。做验收时应记录镜像、驱动、NCCL 版本、挂载设备、网络模式和调度器资源绑定。</p>
+<pre><code># Docker 示例：需要按集群安全策略调整，不要照搬到生产共享节点
+docker run --rm --gpus all --ipc=host --network=host \
+  --ulimit memlock=-1 --cap-add IPC_LOCK \
+  -v /dev/infiniband:/dev/infiniband \
+  nccl-test-image:cuda12 \
+  ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8
+
+# Slurm 示例：每节点 8 GPU，两节点运行
+srun -N 2 --ntasks-per-node=1 --gres=gpu:8 \
+  --mpi=pmix \
+  bash -lc 'NCCL_DEBUG=INFO ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 8'</code></pre>
+<table>
+<tr><th>检查项</th><th>为什么重要</th></tr>
+<tr><td><code>/dev/infiniband</code></td><td>容器内缺失时通常无法使用 RDMA verbs</td></tr>
+<tr><td><code>--network=host</code> 或 CNI 配置</td><td>NCCL bootstrap 需要可达的节点间地址</td></tr>
+<tr><td><code>memlock</code> / IPC lock</td><td>RDMA 注册内存可能受限制</td></tr>
+<tr><td>GPU 与 CPU 绑定</td><td>NUMA 不匹配会造成小包延迟和 host staging 开销</td></tr>
+<tr><td>镜像内 NCCL 版本</td><td>不同版本可能选择不同算法/协议，日志和性能都变</td></tr>
+</table>
+<div class="warn"><strong>生产注意：</strong> 提权参数、host network 和设备挂载要符合平台策略。教程中的容器命令是诊断模板，不是默认生产安全基线。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 安全压测与生产影响控制</h2>
+<p><code>nccl-tests</code> 会占用 GPU、显存、PCIe/NVLink、RDMA 网络和交换机缓冲。共享训练集群里，盲目跑大规模测试可能影响其他作业。</p>
+<div class="grid-4">
+<div class="card"><strong>隔离节点</strong><br>优先在维护窗口或独占节点运行。</div>
+<div class="card"><strong>逐步放大</strong><br>1 节点 → 2 节点 → 1 个机架 → 目标规模。</div>
+<div class="card"><strong>限制消息</strong><br>先用 <code>-e 1G</code>，确认稳定后再扩大。</div>
+<div class="card"><strong>记录环境</strong><br>保存命令、变量、NCCL 日志和节点列表。</div>
+</div>
+<pre><code># 安全 dry-run 思路：先确认节点、GPU、命令，不直接跑大规模
+hostname
+nvidia-smi --query-gpu=index,name,uuid,pci.bus_id --format=csv
+env | grep -E '^(NCCL|CUDA|UCX|OMPI|PMI)_' | sort
+
+# 小流量冒烟
+./build/all_reduce_perf -b 8 -e 16M -f 2 -g 8 -w 5 -n 20
+
+# 通过后再跑正式基准
+./build/all_reduce_perf -b 1M -e 8G -f 2 -g 8 -w 20 -n 100</code></pre>
+<div class="danger"><strong>避免事故：</strong> 不要在业务高峰对整集群运行全量 all_reduce；不要在未知 RoCE 配置上直接打满网络；不要把排障变量写入全局 profile 影响其他训练作业。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障流程图：从挂起、报错、低带宽到根因</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="nccl-tests 故障排查流程">
+<rect x="18" y="18" width="1064" height="710" rx="22" fill="#fbfef9" stroke="#d8e2d6"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#14532d">nccl-tests 故障定位的收敛路径</text>
+<rect x="420" y="100" width="260" height="70" rx="16" fill="#fee2e2" stroke="#fecaca"/><text x="550" y="142" text-anchor="middle" font-size="19" font-weight="700" fill="#b91c1c">失败 / 挂起 / 带宽低</text>
+<polygon points="550,215 700,290 550,365 400,290" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="284" text-anchor="middle" font-size="17" font-weight="700">单机是否正常？</text><text x="550" y="309" text-anchor="middle" font-size="14">-g 1/2/8 分步</text>
+<rect x="110" y="250" width="220" height="82" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="220" y="283" text-anchor="middle" font-size="16" font-weight="700" fill="#1d4ed8">先查本机</text><text x="220" y="309" text-anchor="middle" font-size="14">GPU / NVLink / NUMA / Xid</text>
+<polygon points="550,415 700,490 550,565 400,490" fill="#dcfce7" stroke="#86efac"/><text x="550" y="484" text-anchor="middle" font-size="17" font-weight="700">跨节点基础网络正常？</text><text x="550" y="509" text-anchor="middle" font-size="14">iperf3 / ib_write_bw</text>
+<rect x="770" y="450" width="240" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="890" y="483" text-anchor="middle" font-size="16" font-weight="700" fill="#0f766e">查网络层</text><text x="890" y="509" text-anchor="middle" font-size="14">HCA / GID / PFC / 线缆</text>
+<rect x="395" y="620" width="310" height="78" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="653" text-anchor="middle" font-size="16" font-weight="700" fill="#334155">查 NCCL 实际选择</text><text x="550" y="679" text-anchor="middle" font-size="14">NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH</text>
+<line x1="550" y1="170" x2="550" y2="215" stroke="#64748b" stroke-width="4" marker-end="url(#d1)"/><line x1="400" y1="290" x2="330" y2="290" stroke="#64748b" stroke-width="4" marker-end="url(#d1)"/><text x="357" y="274" font-size="14">否</text><line x1="550" y1="365" x2="550" y2="415" stroke="#64748b" stroke-width="4" marker-end="url(#d1)"/><text x="565" y="392" font-size="14">是</text><line x1="700" y1="490" x2="770" y2="490" stroke="#64748b" stroke-width="4" marker-end="url(#d1)"/><text x="728" y="474" font-size="14">否</text><line x1="550" y1="565" x2="550" y2="620" stroke="#64748b" stroke-width="4" marker-end="url(#d1)"/><text x="565" y="595" font-size="14">是</text>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#64748b"/></marker></defs>
+</svg><div class="caption">排障要先收敛层次：本机不正常先别看网络，基础网络不正常先别调 NCCL 算法。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 常见故障与排查流程</h2>
+<table>
+<tr><th>症状</th><th>常见原因</th><th>建议动作</th></tr>
+<tr><td>启动后挂起</td><td>节点间地址不可达、MPI/SSH/PMI 问题、NCCL bootstrap 选错接口</td><td>设置 <code>NCCL_DEBUG=INFO</code>、固定 <code>NCCL_SOCKET_IFNAME</code>，先两节点测试</td></tr>
+<tr><td><code>unhandled system error</code></td><td>RDMA 权限、设备不可见、内存锁限制、驱动/NCCL 不匹配</td><td>查容器设备挂载、<code>ulimit -l</code>、<code>/dev/infiniband</code>、dmesg/Xid</td></tr>
+<tr><td>多机比单机低很多</td><td>没走 RDMA、HCA 亲和性差、交换机拥塞、RoCE 配置问题</td><td>对照 <code>NCCL_IB_DISABLE=1</code>、逐 HCA 测试、查交换机计数</td></tr>
+<tr><td>同型号机器差异大</td><td>PCIe 降速、NVLink down、BIOS/固件差异、温度功耗限制</td><td>对比 <code>nvidia-smi topo -m</code>、<code>nvidia-smi -q</code>、固件版本</td></tr>
+<tr><td><code>#wrong</code> 非 0</td><td>硬件不稳定、版本/内存错误、GPU 错误状态</td><td>停止性能解读，查 ECC、Xid、驱动、复现最小 GPU 组合</td></tr>
+</table>
+<pre><code># 一个可复用的最小排障采集包
+date
+hostname -f
+nvidia-smi
+nvidia-smi topo -m
+ibstat || true
+env | grep -E '^(NCCL|CUDA|UCX|OMPI|PMI)_' | sort
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH \
+  ./build/all_reduce_perf -b 1M -e 1G -f 2 -g 8 -w 10 -n 50</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 基准记录模板</h2>
+<p>基准的价值在于可复现。每次记录至少包含硬件、软件、命令、环境变量、节点列表、时间段和原始日志。只贴一个峰值带宽很难支持后续决策。</p>
+<pre><code># benchmark.md 模板
+## 环境
+- 日期：
+- 节点：
+- GPU 型号/数量：
+- NIC/HCA：
+- 驱动/CUDA/NCCL/MPI：
+- 容器镜像：
+
+## 命令
+```bash
+mpirun -np 2 --host node-a,node-b \
+  -x NCCL_DEBUG=INFO \
+  -x NCCL_SOCKET_IFNAME=eth0 \
+  -x NCCL_IB_HCA=mlx5_0,mlx5_1 \
+  ./build/all_reduce_perf -b 1M -e 8G -f 2 -g 8 -w 20 -n 100
+```
+
+## 结果摘要
+- all_reduce 大消息 algbw：
+- all_reduce 大消息 busbw：
+- all_gather 大消息 algbw：
+- reduce_scatter 大消息 algbw：
+- #wrong：
+- 异常/备注：</code></pre>
+<div class="success"><strong>版本化建议：</strong> 把每次升级驱动、CUDA、NCCL、OFED、交换机配置前后的基准日志归档，后续训练慢时可以快速判断是不是基础设施回退。</div>
+</section>
+
+<section class="refbox" id="s18">
+<h2>17. 参考资料</h2>
+<ul>
+<li>NVIDIA nccl-tests GitHub 仓库：构建方式、测试程序与命令参数说明。</li>
+<li>NVIDIA NCCL 官方文档：环境变量、调试日志、算法/协议、网络和拓扑行为。</li>
+<li>NVIDIA CUDA 与驱动文档：驱动兼容性、GPU Direct RDMA、NVLink/NVML 相关能力。</li>
+<li>Open MPI / MPICH 文档：多节点启动、环境变量传递、hostfile、进程绑定。</li>
+<li>InfiniBand/RoCE 厂商文档：HCA、GID、PFC/ECN、交换机计数器和 verbs 测试。</li>
+</ul>
+<div class="note"><strong>生产实践：</strong> 引用资料只能给出通用机制；最终基准要以你自己的节点型号、网络拓扑、NCCL 版本和调度器环境为准。</div>
+</section>
+
+<footer class="footer">nccl-tests 教程 · 面向 AI Infra 的 GPU 通信压测、基准记录与故障定位 · 单文件 HTML，无外部依赖</footer>
+</div>
+</body>
+</html>

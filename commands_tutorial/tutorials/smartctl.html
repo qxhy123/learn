@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>smartctl 深度教程：AI Infra 磁盘健康、介质错误与故障预测</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>smartctl 深度教程：AI Infra 磁盘健康、介质错误与故障预测</h1>
+<p class="sub">这份教程面向 AI Infra、GPU 集群、训练平台和存储节点运维，系统讲解 <code>smartctl</code> 如何读取 SMART/NVMe 健康信息、解释 SATA 与 NVMe 指标差异、排查介质错误、温度、磨损、自检结果、错误日志和预测性故障，并把单盘信号放进节点、RAID、分布式存储和调度系统的 triage 流程里。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">SMART 健康</span><span class="chip">NVMe/SATA</span><span class="chip">介质错误</span><span class="chip">自检</span><span class="chip">温度</span><span class="chip">磨损</span><span class="chip">预测性故障</span><span class="chip">集群排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>smartctl</code> 是从磁盘控制器读取“设备自述健康证据”的工具；它不替代监控系统，但能把故障判断从“IO 慢了”推进到“哪块盘、哪类错误、是否应下线”。</div>
+<div class="success"><strong>实践原则：</strong> 先用只读查询收集证据，再结合内核日志、文件系统/RAID/对象存储告警和业务影响决策；不要把单个 SMART 字段孤立当成绝对结论。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">smartctl 是什么</a></li><li><a class="anchor" href="#s2">AI Infra 为什么必须关注磁盘健康</a></li><li><a class="anchor" href="#s3">整体模型：设备、控制器、SMART、系统日志</a></li><li><a class="anchor" href="#s4">安装与权限</a></li><li><a class="anchor" href="#s5">发现磁盘与设备名</a></li><li><a class="anchor" href="#s6">第一次健康检查</a></li><li><a class="anchor" href="#s7">SATA/SAS 与 NVMe 差异</a></li><li><a class="anchor" href="#s8">关键属性与指标解释</a></li><li><a class="anchor" href="#s9">错误日志与介质错误</a></li><li><a class="anchor" href="#s10">自检：short、long、conveyance</a></li><li><a class="anchor" href="#s11">温度与热降速</a></li><li><a class="anchor" href="#s12">磨损、寿命与写入量</a></li><li><a class="anchor" href="#s13">预测性故障判断</a></li><li><a class="anchor" href="#s14">存储集群 triage 流程</a></li><li><a class="anchor" href="#s15">smartctl vs nvme vs lsblk</a></li><li><a class="anchor" href="#s16">RAID、HBA、USB 和虚拟化场景</a></li><li><a class="anchor" href="#s17">自动化采集与监控</a></li><li><a class="anchor" href="#s18">常见排障清单</a></li><li><a class="anchor" href="#s19">安全边界与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. smartctl 是什么</h2>
+<p><code>smartctl</code> 来自 smartmontools，用于查询和控制磁盘的 SMART、SCSI/SAS log sense、NVMe health log、自检和错误日志。它常被用在节点巡检、故障盘定位、RMA 证据收集、性能异常 triage 和数据迁移前检查。</p>
+<div class="grid-3"><div class="card"><strong>它能回答</strong><br>设备是否报告健康异常？是否有重映射扇区、不可纠正错误、介质错误、温度过高、寿命耗尽或自检失败？</div><div class="card"><strong>它不能保证</strong><br>SMART 显示 PASSED 不代表一定安全；很多故障来自线缆、背板、控制器、固件、文件系统或上层服务。</div><div class="card"><strong>它的定位</strong><br>底层设备证据采集工具，通常和 <code>dmesg</code>、<code>journalctl</code>、<code>lsblk</code>、<code>nvme</code>、RAID 工具、监控系统一起使用。</div></div>
+<pre><code># 查看某块盘的完整健康与日志摘要
+sudo smartctl -a /dev/sda
+
+# NVMe 设备也可以用 smartctl 读取健康日志
+sudo smartctl -a /dev/nvme0n1
+
+# 更详细输出，包含更多日志页和厂商信息
+sudo smartctl -x /dev/sda</code></pre>
+<div class="warn"><strong>重要心智模型：</strong> <code>smartctl</code> 读到的是设备和控制器暴露出来的信号；不同厂商、协议、固件版本的字段含义和阈值不完全相同。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 为什么必须关注磁盘健康</h2>
+<p>AI 基础设施里的磁盘故障不只是“坏一块盘”。它可能表现为 checkpoint 写入抖动、数据集读取长尾、训练作业挂起、分布式存储恢复风暴、GPU 空转、节点被调度器误判健康，甚至导致多副本系统在 rebalance 时进一步放大 IO。</p>
+<div class="grid-4"><div class="card"><strong>训练节点</strong><br>本地 NVMe 常用于数据缓存、临时 shard、checkpoint staging；低层介质错误会变成 GPU 利用率下降。</div><div class="card"><strong>存储节点</strong><br>HDD/SSD 盘组承载对象存储、Ceph、Lustre、BeeGFS 或 NFS；坏盘误判会触发恢复和副本迁移。</div><div class="card"><strong>日志节点</strong><br>高写入量导致 SSD 磨损、温度上升、写放大和延迟抖动。</div><div class="card"><strong>调度系统</strong><br>SMART 信号可用于 cordon/drain、自动报修、节点健康评分和容量规划。</div></div>
+<pre><code># AI 节点 triage 常用组合：硬件健康 + 内核 IO 错误 + 块设备拓扑
+sudo smartctl -a /dev/nvme0n1
+journalctl -k -p warning..alert --since "2 hours ago"
+lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,ROTA,MOUNTPOINTS</code></pre>
+<div class="success"><strong>实践建议：</strong> 把 SMART 异常当作“需要操作的证据”，而不是“仪表盘上的红点”：结合业务延迟、错误率、恢复状态和副本安全性决定是否下线。</div>
+</section>
+
+<section class="figure" id="s3">
+<h3>信息图：smartctl 在 AI Infra 存储排障中的位置</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="smartctl AI Infra 整体模型">
+<rect x="18" y="18" width="1064" height="640" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700">从业务异常到磁盘证据</text>
+<rect x="55" y="120" width="205" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="158" y="158" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">AI 作业异常</text><text x="158" y="188" text-anchor="middle" font-size="14">checkpoint 慢</text><text x="158" y="211" text-anchor="middle" font-size="14">GPU 等数据</text>
+<rect x="315" y="120" width="205" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="418" y="158" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">系统证据</text><text x="418" y="188" text-anchor="middle" font-size="14">dmesg / journal</text><text x="418" y="211" text-anchor="middle" font-size="14">blk_update_request</text>
+<rect x="575" y="120" width="205" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="678" y="158" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">smartctl</text><text x="678" y="188" text-anchor="middle" font-size="14">SMART / NVMe health</text><text x="678" y="211" text-anchor="middle" font-size="14">self-test / error log</text>
+<rect x="835" y="120" width="205" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="938" y="158" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">处置动作</text><text x="938" y="188" text-anchor="middle" font-size="14">drain / replace</text><text x="938" y="211" text-anchor="middle" font-size="14">rebalance / RMA</text>
+<rect x="105" y="365" width="890" height="160" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="404" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">smartctl 的核心输出</text><text x="550" y="440" text-anchor="middle" font-size="16">健康状态 · 关键属性 · 温度 · 写入量 · 磨损 · 介质错误 · 自检历史 · 错误日志</text><text x="550" y="475" text-anchor="middle" font-size="16">在集群里，它用于定位单盘风险，并指导是否下线节点或触发硬件更换。</text>
+<line x1="260" y1="176" x2="315" y2="176" stroke="#94a3b8" stroke-width="4" marker-end="url(#a)"/><line x1="520" y1="176" x2="575" y2="176" stroke="#94a3b8" stroke-width="4" marker-end="url(#a)"/><line x1="780" y1="176" x2="835" y2="176" stroke="#94a3b8" stroke-width="4" marker-end="url(#a)"/>
+<path d="M678 232 C675 285, 640 325, 605 365" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a)"/>
+<defs><marker id="a" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">业务层只看到“慢”和“错”；smartctl 负责把问题落到磁盘健康证据，但最后决策仍要结合系统和集群状态。</div></section>
+
+<section class="section" id="s4">
+<h2>3. 安装与权限</h2>
+<p>大多数发行版通过 smartmontools 包提供 <code>smartctl</code>。读取底层设备通常需要 root 权限，因为命令会向块设备发送 ATA/SCSI/NVMe 管理命令。</p>
+<pre><code># Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install smartmontools
+
+# RHEL / CentOS / Rocky / Alma
+sudo dnf install smartmontools
+
+# 验证版本与基础可用性
+smartctl --version
+sudo smartctl --scan</code></pre>
+<table><tr><th>命令</th><th>作用</th><th>备注</th></tr><tr><td><code>smartctl --scan</code></td><td>列出可能支持 SMART 的设备</td><td>比盲猜 <code>/dev/sdX</code> 更安全</td></tr><tr><td><code>smartctl --scan-open</code></td><td>尝试打开设备并给出推荐参数</td><td>适合排查 USB、RAID、HBA</td></tr><tr><td><code>smartctl -i DEV</code></td><td>只看设备身份信息</td><td>确认型号、序列号、协议</td></tr></table>
+<div class="note"><strong>权限建议：</strong> 自动化采集可以通过 root 运行的 exporter 或受控 sudoers 规则实现；不要给普通用户开放任意块设备写入权限。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 发现磁盘与设备名</h2>
+<p>AI 集群节点里常同时存在系统盘、数据盘、本地 NVMe、RAID 虚拟盘和容器挂载。先识别真实物理设备，再运行 SMART 查询。</p>
+<pre><code># 查看块设备拓扑、型号、序列号、是否旋转盘
+lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN,MOUNTPOINTS
+
+# 查看 smartctl 认为可检测的设备
+sudo smartctl --scan-open
+
+# 按稳定路径查看，避免 /dev/sdX 重排
+ls -l /dev/disk/by-id/ | sed -n '1,20p'</code></pre>
+<table><tr><th>设备名</th><th>常见含义</th><th>smartctl 示例</th></tr><tr><td><code>/dev/sda</code></td><td>SATA/SAS/SCSI 磁盘或 RAID 暴露的逻辑盘</td><td><code>sudo smartctl -a /dev/sda</code></td></tr><tr><td><code>/dev/nvme0n1</code></td><td>NVMe 第 0 个控制器的第 1 个 namespace</td><td><code>sudo smartctl -a /dev/nvme0n1</code></td></tr><tr><td><code>/dev/disk/by-id/...</code></td><td>按序列号/WWN 的稳定路径</td><td><code>sudo smartctl -a /dev/disk/by-id/nvme-...</code></td></tr><tr><td><code>/dev/sgX</code></td><td>SCSI generic 设备</td><td>常用于 RAID/HBA 或老式 SAS 场景</td></tr></table>
+<div class="warn"><strong>定位提醒：</strong> 在有热插拔、RAID、容器和多路径的环境中，不要只凭 <code>/dev/sdb</code> 更换硬盘；必须核对序列号、槽位、控制器工具输出和机房资产信息。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 第一次健康检查</h2>
+<p>第一次检查不要从复杂字段开始。先回答四个问题：设备身份对不对、SMART 是否可用、总体健康是否异常、有没有明显错误日志或自检失败。</p>
+<pre><code># 设备身份：型号、序列号、固件、容量、协议
+sudo smartctl -i /dev/sda
+
+# 总体健康：快速判断，但不要作为唯一证据
+sudo smartctl -H /dev/sda
+
+# 常用完整摘要：身份、属性、错误日志、自检日志
+sudo smartctl -a /dev/sda
+
+# 扩展信息：更多日志页，适合故障证据收集
+sudo smartctl -x /dev/sda</code></pre>
+<div class="grid-2"><div class="card"><strong>PASSED 的含义</strong><br>表示设备当前没有触发厂商定义的 SMART 总体失败阈值；不代表没有坏块、没有历史错误、没有性能风险。</div><div class="card"><strong>FAILED 的含义</strong><br>通常应视为高优先级硬件风险：先确认副本安全和业务影响，再安排下线、备份、替换或 RMA。</div></div>
+<div class="danger"><strong>不要误判：</strong> 很多正在恶化的盘仍会显示 <code>SMART overall-health self-assessment test result: PASSED</code>，必须继续看属性、错误日志和自检。</div>
+</section>
+
+<section class="figure" id="fig-s7">
+<h3>对比图：SATA/SAS SMART 与 NVMe Health Log</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="SATA SAS 与 NVMe smartctl 输出差异">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="28" font-weight="700">同一个 smartctl，不同协议的健康语言不同</text>
+<rect x="70" y="125" width="440" height="410" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="290" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">SATA / SAS / HDD / SATA SSD</text>
+<rect x="115" y="215" width="350" height="52" rx="12" fill="#fff" stroke="#bfdbfe"/><text x="290" y="247" text-anchor="middle" font-size="16">SMART Attributes 表</text>
+<rect x="115" y="285" width="350" height="52" rx="12" fill="#fff" stroke="#bfdbfe"/><text x="290" y="317" text-anchor="middle" font-size="16">Reallocated / Pending / UDMA CRC</text>
+<rect x="115" y="355" width="350" height="52" rx="12" fill="#fff" stroke="#bfdbfe"/><text x="290" y="387" text-anchor="middle" font-size="16">SMART Error Log / Self-test Log</text>
+<rect x="115" y="425" width="350" height="52" rx="12" fill="#fff" stroke="#bfdbfe"/><text x="290" y="457" text-anchor="middle" font-size="16">厂商 RAW_VALUE 差异很大</text>
+<rect x="590" y="125" width="440" height="410" rx="22" fill="#ccfbf1" stroke="#99f6e4"/><text x="810" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">NVMe SSD</text>
+<rect x="635" y="215" width="350" height="52" rx="12" fill="#fff" stroke="#99f6e4"/><text x="810" y="247" text-anchor="middle" font-size="16">SMART / Health Information Log</text>
+<rect x="635" y="285" width="350" height="52" rx="12" fill="#fff" stroke="#99f6e4"/><text x="810" y="317" text-anchor="middle" font-size="16">Critical Warning / Media Errors</text>
+<rect x="635" y="355" width="350" height="52" rx="12" fill="#fff" stroke="#99f6e4"/><text x="810" y="387" text-anchor="middle" font-size="16">Percentage Used / Available Spare</text>
+<rect x="635" y="425" width="350" height="52" rx="12" fill="#fff" stroke="#99f6e4"/><text x="810" y="457" text-anchor="middle" font-size="16">Error Information Log Entries</text>
+<rect x="225" y="575" width="650" height="52" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="608" text-anchor="middle" font-size="17">结论：不要拿 SATA 属性编号直接套 NVMe；先识别协议，再解释字段。</text>
+</svg><div class="caption">SATA/SAS 常见输出是属性表；NVMe 更偏向标准化健康日志。smartctl 统一入口，但解释逻辑不同。</div></section>
+
+<section class="section" id="s7">
+<h2>6. SATA/SAS 与 NVMe 差异</h2>
+<p><code>smartctl</code> 能统一读取多种协议，但输出结构不是一回事。SATA HDD 的 <code>Reallocated_Sector_Ct</code>、<code>Current_Pending_Sector</code> 与 NVMe 的 <code>Media and Data Integrity Errors</code>、<code>Available Spare</code>、<code>Percentage Used</code> 不能机械对照。</p>
+<table><tr><th>维度</th><th>SATA/SAS 常见输出</th><th>NVMe 常见输出</th><th>AI Infra 解读</th></tr><tr><td>总体健康</td><td><code>SMART overall-health...</code></td><td><code>SMART overall-health...</code> + <code>Critical Warning</code></td><td>只做入口判断，不能替代详细日志</td></tr><tr><td>介质错误</td><td>重映射、待重映射、离线不可纠正</td><td><code>Media and Data Integrity Errors</code></td><td>任何增长趋势都应高优先级关注</td></tr><tr><td>磨损</td><td>厂商属性如 177/202/233 等</td><td><code>Percentage Used</code></td><td>用于寿命规划，阈值依 SLA 和副本策略决定</td></tr><tr><td>温度</td><td>194 或厂商属性</td><td><code>Temperature</code> 与传感器字段</td><td>关注峰值、热降速和机箱风道</td></tr><tr><td>错误日志</td><td>SMART Error Log、SCT Error Recovery Control</td><td>Error Information Log Entries</td><td>结合时间、LBA、内核错误判断</td></tr></table>
+<pre><code># SATA/HDD 常见完整输出
+sudo smartctl -a /dev/sda
+
+# NVMe 常见完整输出
+sudo smartctl -a /dev/nvme0n1
+
+# 如果需要 NVMe 专用更细日志，可再用 nvme-cli 补充
+sudo nvme smart-log /dev/nvme0n1</code></pre>
+<div class="note"><strong>字段解释原则：</strong> 先看协议，再看厂商文档，再看趋势；不要只看某个 RAW_VALUE 的单次绝对值。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 关键属性与指标解释</h2>
+<p>SMART 属性表里通常有 <code>VALUE</code>、<code>WORST</code>、<code>THRESH</code>、<code>TYPE</code>、<code>UPDATED</code>、<code>WHEN_FAILED</code>、<code>RAW_VALUE</code>。AI Infra 排障最关心的是错误类、温度类、磨损类和接口类指标。</p>
+<table><tr><th>指标</th><th>常见于</th><th>关注点</th><th>处置倾向</th></tr><tr><td><code>Reallocated_Sector_Ct</code></td><td>SATA HDD/SSD</td><td>已重映射扇区；增长说明介质退化</td><td>增长趋势明显时准备更换</td></tr><tr><td><code>Current_Pending_Sector</code></td><td>SATA HDD</td><td>等待重读/重映射的不稳定扇区</td><td>高风险，尽快备份/迁移/长测</td></tr><tr><td><code>Offline_Uncorrectable</code></td><td>SATA HDD</td><td>离线扫描发现不可纠正错误</td><td>结合自检失败和日志决定下线</td></tr><tr><td><code>UDMA_CRC_Error_Count</code></td><td>SATA</td><td>链路传输错误，常见于线缆/背板/接口</td><td>若只增长 CRC，优先查线缆和背板</td></tr><tr><td><code>Media and Data Integrity Errors</code></td><td>NVMe</td><td>控制器报告介质或数据完整性错误</td><td>生产集群中通常应高优先级处置</td></tr><tr><td><code>Percentage Used</code></td><td>NVMe</td><td>厂商估算寿命消耗百分比</td><td>用于容量和寿命规划，接近/超过 100% 要评估替换</td></tr><tr><td><code>Available Spare</code></td><td>NVMe</td><td>可用备用块余量</td><td>低于阈值或 Critical Warning 时应下线评估</td></tr><tr><td><code>Temperature_Celsius</code></td><td>SATA/NVMe</td><td>当前温度、历史温度、传感器温度</td><td>高温会导致降速和寿命风险</td></tr></table>
+<pre><code># 只抽取常见高价值字段，适合人工快速看
+sudo smartctl -a /dev/sda | egrep -i \
+  'overall|reallocated|pending|uncorrect|crc|temperature|power_on|error|self-test'
+
+sudo smartctl -a /dev/nvme0n1 | egrep -i \
+  'critical|temperature|available spare|percentage used|media|error|unsafe|power cycles'</code></pre>
+<div class="warn"><strong>厂商差异：</strong> SATA SSD 的磨损属性编号高度厂商化；同一个属性名的 RAW 值单位也可能不同。自动化告警要按型号白名单校准。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 错误日志与介质错误</h2>
+<p>错误日志比总体健康更接近故障现场。HDD 上的 LBA 读写失败、NVMe 的 media/data integrity error、内核里的 I/O error，都可能指向同一块盘或同一条链路。</p>
+<pre><code># SATA/SAS：查看完整输出中的 Error Log 和 Self-test Log
+sudo smartctl -a /dev/sda
+
+# 扩展日志，有些设备会输出更多细节
+sudo smartctl -x /dev/sda
+
+# 同时查看内核日志中的块设备错误
+journalctl -k --since "24 hours ago" | egrep -i \
+  'I/O error|medium error|blk_update_request|nvme|ata|reset|timeout'</code></pre>
+<table><tr><th>现象</th><th>可能原因</th><th>验证方向</th></tr><tr><td>介质错误增长</td><td>盘面/闪存介质退化</td><td>看自检、LBA、增长趋势，准备迁移</td></tr><tr><td>CRC/链路错误增长</td><td>线缆、背板、HBA、连接器问题</td><td>换槽/换线/查控制器日志</td></tr><tr><td>大量 timeout/reset</td><td>设备卡死、固件、供电、控制器问题</td><td>看 dmesg 时间线和同控制器其他盘</td></tr><tr><td>NVMe unsafe shutdown 增长</td><td>断电、热重启、PCIe 复位</td><td>查节点电源、BMC、内核 PCIe/AER 日志</td></tr></table>
+<div class="danger"><strong>数据安全优先：</strong> 对已经出现不可纠正读错误的盘，不要先跑重负载压力测试；先确认副本、备份、恢复窗口和上层存储健康。</div>
+</section>
+
+<section class="figure" id="fig-s10">
+<h3>流程图：smartctl 自检与故障判断</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="smartctl 自检流程图">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="415" y="45" width="270" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">发现可疑磁盘</text>
+<rect x="105" y="165" width="245" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="228" y="198" text-anchor="middle" font-size="18" font-weight="700">收集只读证据</text><text x="228" y="226" text-anchor="middle" font-size="14">smartctl -a / -x</text>
+<rect x="428" y="165" width="245" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="198" text-anchor="middle" font-size="18" font-weight="700">确认业务风险</text><text x="550" y="226" text-anchor="middle" font-size="14">副本/RAID/作业影响</text>
+<rect x="750" y="165" width="245" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="873" y="198" text-anchor="middle" font-size="18" font-weight="700">选择自检窗口</text><text x="873" y="226" text-anchor="middle" font-size="14">short 或 long</text>
+<polygon points="550,315 715,395 550,475 385,395" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="387" text-anchor="middle" font-size="17" font-weight="700">自检失败或错误增长？</text><text x="550" y="413" text-anchor="middle" font-size="14">介质/完整性/待重映射</text>
+<rect x="135" y="560" width="300" height="88" rx="15" fill="#dcfce7" stroke="#86efac"/><text x="285" y="596" text-anchor="middle" font-size="18" font-weight="700">暂不换盘</text><text x="285" y="624" text-anchor="middle" font-size="14">继续监控趋势和日志</text>
+<rect x="665" y="560" width="300" height="88" rx="15" fill="#fee2e2" stroke="#fca5a5"/><text x="815" y="596" text-anchor="middle" font-size="18" font-weight="700">下线/替换/RMA</text><text x="815" y="624" text-anchor="middle" font-size="14">先 drain，再操作硬件</text>
+<line x1="550" y1="111" x2="228" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><line x1="550" y1="111" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><line x1="550" y1="111" x2="873" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/>
+<path d="M228 251 C270 300, 370 330, 450 356" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><line x1="550" y1="251" x2="550" y2="315" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><path d="M873 251 C835 305, 730 335, 650 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/>
+<path d="M450 455 C385 500, 330 530, 285 560" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><text x="385" y="510" font-size="14">否</text><path d="M650 455 C710 505, 770 532, 815 560" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b)"/><text x="730" y="510" font-size="14">是</text>
+<defs><marker id="b" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">自检不是第一步，也不是唯一证据。先确认副本和业务风险，再选择合适自检窗口。</div></section>
+
+<section class="section" id="s10">
+<h2>9. 自检：short、long、conveyance</h2>
+<p>SMART 自检由设备固件执行，通常不会破坏数据，但会占用设备资源，可能让已经不稳定的盘暴露更多错误。在生产集群中，先确保副本安全和维护窗口，再运行长自检。</p>
+<table><tr><th>自检类型</th><th>命令</th><th>特点</th><th>适合场景</th></tr><tr><td>short</td><td><code>smartctl -t short DEV</code></td><td>几分钟，覆盖有限</td><td>快速验证可疑盘</td></tr><tr><td>long</td><td><code>smartctl -t long DEV</code></td><td>全盘扫描，耗时长</td><td>维护窗口、RMA 证据、深度排查</td></tr><tr><td>conveyance</td><td><code>smartctl -t conveyance DEV</code></td><td>运输损伤相关，部分 ATA 盘支持</td><td>新盘上架验收</td></tr><tr><td>abort</td><td><code>smartctl -X DEV</code></td><td>终止正在运行的自检</td><td>业务受影响时停止</td></tr></table>
+<pre><code># 启动短自检
+sudo smartctl -t short /dev/sda
+
+# 查看预计完成时间和当前状态
+sudo smartctl -c /dev/sda
+
+# 等待完成后查看自检日志
+sudo smartctl -l selftest /dev/sda
+
+# 长自检通常要在维护窗口执行
+sudo smartctl -t long /dev/sda</code></pre>
+<div class="warn"><strong>生产提醒：</strong> 不要在恢复风暴、训练高峰、RAID rebuild 或 Ceph backfill 正忙时批量跑 long test；它可能放大尾延迟。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 温度与热降速</h2>
+<p>NVMe 和高密度 HDD/SSD 在 AI 服务器里很容易受 GPU 热排、风道、PCIe 插槽位置影响。温度异常常表现为吞吐下降、延迟长尾、NVMe thermal throttling、错误率上升或寿命缩短。</p>
+<pre><code># SATA/HDD/SSD 温度通常在 194 或 Temperature 字段
+sudo smartctl -a /dev/sda | egrep -i 'temperature|airflow'
+
+# NVMe 温度和温度传感器
+sudo smartctl -a /dev/nvme0n1 | egrep -i 'temperature|sensor|thermal'
+
+# 同时看内核是否记录 nvme reset/timeout
+journalctl -k --since "6 hours ago" | egrep -i 'nvme|thermal|timeout|reset'</code></pre>
+<table><tr><th>观察项</th><th>为什么重要</th><th>排查方向</th></tr><tr><td>当前温度</td><td>持续高温影响寿命和性能</td><td>风扇策略、灰尘、风道、环境温度</td></tr><tr><td>温度历史/峰值</td><td>峰值可能解释偶发降速</td><td>BMC 传感器、机箱事件、作业时间线</td></tr><tr><td>NVMe thermal throttling</td><td>直接造成 IO 延迟和吞吐下降</td><td>散热片、插槽位置、固件、气流遮挡</td></tr><tr><td>同节点多盘温度</td><td>区分单盘问题和机箱问题</td><td>同一背板/同一风道批量比较</td></tr></table>
+<div class="success"><strong>AI 节点经验：</strong> 如果所有 NVMe 同时升温，优先查机箱气流和 GPU 风扇策略；如果单盘异常热，优先查该盘、插槽或散热接触。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 磨损、寿命与写入量</h2>
+<p>训练缓存、特征落盘、日志、checkpoint 和数据预处理会造成大量写入。SSD/NVMe 的寿命管理要看写入量、磨损百分比、备用块、错误趋势和业务 SLA。</p>
+<pre><code># NVMe 寿命和写入量
+sudo smartctl -a /dev/nvme0n1 | egrep -i \
+  'percentage used|data units written|host writes|available spare|media'
+
+# SATA SSD 厂商字段差异大，先查看完整属性表
+sudo smartctl -A /dev/sda</code></pre>
+<table><tr><th>字段</th><th>解释</th><th>注意事项</th></tr><tr><td><code>Percentage Used</code></td><td>NVMe 估算寿命消耗</td><td>可能超过 100；不是精确剩余寿命</td></tr><tr><td><code>Data Units Written</code></td><td>NVMe 写入单位计数</td><td>需要换算，适合趋势监控</td></tr><tr><td><code>Total_LBAs_Written</code></td><td>部分 SATA SSD 写入量</td><td>单位依厂商而定</td></tr><tr><td><code>Available Spare</code></td><td>可用备用容量余量</td><td>低于阈值通常触发 Critical Warning</td></tr><tr><td>厂商磨损属性</td><td>如 wear leveling、media wearout 等</td><td>必须按型号确认含义</td></tr></table>
+<div class="note"><strong>容量规划：</strong> 对本地 NVMe 缓存盘，应按实际写入速率估算寿命，并把“接近寿命阈值”的盘提前纳入滚动替换计划。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 预测性故障判断</h2>
+<p>预测性故障不是看一个字段，而是看证据组合：错误是否增长、是否影响读写、是否有自检失败、是否与内核日志一致、是否发生在关键业务路径上、是否有副本或恢复风险。</p>
+<div class="grid-2"><div class="card"><strong>强烈建议下线/替换</strong><br>总体健康 FAILED、NVMe Critical Warning、介质/完整性错误增长、自检读失败、pending/uncorrectable 增长、同 LBA 反复读失败。</div><div class="card"><strong>先排查链路/环境</strong><br>只有 CRC 增长、timeout/reset 集中在同控制器、所有盘同时高温、unsafe shutdown 与节点掉电一致。</div><div class="card"><strong>继续观察趋势</strong><br>历史老错误不增长、温度短时峰值但无降速、磨损高但仍在可接受替换窗口内。</div><div class="card"><strong>立即保护数据</strong><br>副本不足、RAID degraded、Ceph PG 不干净、训练 checkpoint 唯一副本在可疑盘上。</div></div>
+<pre><code># 建立同一块盘的时间线：SMART + 内核日志 + 挂载点
+DEV=/dev/nvme0n1
+sudo smartctl -a "$DEV" | tee smart.$(basename "$DEV").txt
+journalctl -k --since "24 hours ago" | egrep -i 'nvme|I/O error|timeout|reset'
+lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINTS "$DEV"</code></pre>
+<div class="danger"><strong>决策优先级：</strong> 如果已经有不可纠正错误且上层冗余不足，先迁移/备份/隔离，后做诊断；不要为了“证明坏盘”增加数据风险。</div>
+</section>
+
+<section class="figure" id="fig-s14">
+<h3>安全图：存储集群故障 triage</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="AI Infra 存储集群 smartctl triage">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700">AI Infra 存储集群 triage：先保护副本，再处理硬件</text>
+<rect x="85" y="120" width="230" height="90" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="200" y="156" text-anchor="middle" font-size="18" font-weight="700">告警入口</text><text x="200" y="184" text-anchor="middle" font-size="14">IO error / latency / SMART</text>
+<rect x="435" y="120" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="156" text-anchor="middle" font-size="18" font-weight="700">确认冗余</text><text x="550" y="184" text-anchor="middle" font-size="14">副本、RAID、PG、rebuild</text>
+<rect x="785" y="120" width="230" height="90" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="900" y="156" text-anchor="middle" font-size="18" font-weight="700">业务保护</text><text x="900" y="184" text-anchor="middle" font-size="14">drain / cordon / stop writes</text>
+<rect x="95" y="315" width="260" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="225" y="350" text-anchor="middle" font-size="18" font-weight="700">设备证据</text><text x="225" y="378" text-anchor="middle" font-size="14">smartctl -a/-x, selftest</text>
+<rect x="420" y="315" width="260" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="350" text-anchor="middle" font-size="18" font-weight="700">系统证据</text><text x="550" y="378" text-anchor="middle" font-size="14">journalctl, dmesg, controller log</text>
+<rect x="745" y="315" width="260" height="94" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="875" y="350" text-anchor="middle" font-size="18" font-weight="700">集群证据</text><text x="875" y="378" text-anchor="middle" font-size="14">Ceph/Lustre/NFS/metrics</text>
+<polygon points="550,480 725,565 550,650 375,565" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="557" text-anchor="middle" font-size="17" font-weight="700">硬件风险是否明确？</text><text x="550" y="583" text-anchor="middle" font-size="14">错误增长 / 自检失败 / 健康失败</text>
+<rect x="100" y="640" width="250" height="64" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="225" y="680" text-anchor="middle" font-size="17" font-weight="700">修链路/散热/固件</text>
+<rect x="750" y="640" width="250" height="64" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="875" y="680" text-anchor="middle" font-size="17" font-weight="700">下线盘并替换</text>
+<line x1="315" y1="165" x2="435" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><line x1="665" y1="165" x2="785" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/>
+<path d="M200 210 C210 260, 215 285, 225 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><path d="M550 210 C550 260, 550 285, 550 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><path d="M900 210 C895 260, 885 285, 875 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/>
+<path d="M225 409 C300 455, 390 500, 460 530" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><line x1="550" y1="409" x2="550" y2="480" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><path d="M875 409 C795 455, 710 500, 640 530" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/>
+<path d="M415 610 C345 640, 300 650, 225 640" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><text x="338" y="645" font-size="14">否</text><path d="M685 610 C760 640, 820 650, 875 640" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c)"/><text x="755" y="645" font-size="14">是</text>
+<defs><marker id="c" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">集群处置的第一原则是保护冗余和业务，再定位硬件。smartctl 是关键证据，不是唯一决策器。</div></section>
+
+<section class="section" id="s14">
+<h2>13. 存储集群 triage 流程</h2>
+<p>当一个节点出现磁盘告警，不要直接拔盘。先看上层系统是否还有足够副本、是否正在 rebalance/rebuild、是否影响训练或推理任务，再决定 drain、cordon、停止写入、替换或继续观察。</p>
+<pre><code># 单机证据收集模板
+HOST=$(hostname)
+OUT=/tmp/disk-triage-$HOST-$(date +%Y%m%d%H%M)
+mkdir -p "$OUT"
+lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN,MOUNTPOINTS > "$OUT/lsblk.txt"
+sudo smartctl --scan-open > "$OUT/smart-scan.txt"
+journalctl -k --since "24 hours ago" > "$OUT/kernel-24h.txt"
+
+# 对扫描到的设备逐个采集，先人工审查 smart-scan.txt 再执行
+sudo smartctl -x /dev/sda > "$OUT/sda.smart.txt"
+sudo smartctl -x /dev/nvme0n1 > "$OUT/nvme0n1.smart.txt"</code></pre>
+<table><tr><th>阶段</th><th>问题</th><th>证据</th><th>动作</th></tr><tr><td>入口</td><td>是业务慢还是硬件告警？</td><td>监控、训练日志、内核日志</td><td>确定影响范围</td></tr><tr><td>冗余</td><td>副本是否安全？</td><td>Ceph PG、RAID 状态、备份状态</td><td>必要时先停止新写入</td></tr><tr><td>设备</td><td>哪块盘异常？</td><td>序列号、槽位、smartctl 输出</td><td>锁定物理盘</td></tr><tr><td>处置</td><td>换盘还是修链路？</td><td>介质错误、自检、CRC、控制器日志</td><td>drain、replace、RMA 或修复环境</td></tr></table>
+<div class="danger"><strong>集群警告：</strong> 多盘同时告警时，优先怀疑背板、控制器、供电、散热或批次问题；不要并发下线过多 OSD/磁盘导致副本不足。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. smartctl vs nvme vs lsblk</h2>
+<p>这三个工具解决的问题不同。<code>lsblk</code> 负责“有哪些块设备以及挂到哪里”，<code>smartctl</code> 负责“设备健康和自检证据”，<code>nvme</code> 负责“NVMe 协议专用管理与日志”。</p>
+<table><tr><th>工具</th><th>最擅长</th><th>不擅长</th><th>典型命令</th></tr><tr><td><code>lsblk</code></td><td>拓扑、挂载点、容量、传输类型、序列号</td><td>深度健康日志</td><td><code>lsblk -o NAME,SIZE,MODEL,SERIAL,MOUNTPOINTS</code></td></tr><tr><td><code>smartctl</code></td><td>SMART、健康、自检、错误日志、跨协议统一入口</td><td>NVMe 高级管理和厂商专用操作</td><td><code>smartctl -a /dev/nvme0n1</code></td></tr><tr><td><code>nvme</code></td><td>NVMe identify、smart-log、error-log、firmware-log</td><td>SATA/HDD/SAS 通用健康</td><td><code>nvme smart-log /dev/nvme0n1</code></td></tr><tr><td>RAID 工具</td><td>控制器、虚拟盘、物理槽位、rebuild 状态</td><td>通用跨厂商一致性</td><td><code>storcli /c0 /eall /sall show all</code></td></tr></table>
+<pre><code># 推荐顺序：先定位，再看健康，再补协议专用信息
+lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINTS
+sudo smartctl --scan-open
+sudo smartctl -a /dev/nvme0n1
+sudo nvme smart-log /dev/nvme0n1</code></pre>
+<div class="note"><strong>选择原则：</strong> 不是三选一；AI Infra 排障常常需要组合使用，避免只看一个工具导致证据断层。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. RAID、HBA、USB 和虚拟化场景</h2>
+<p>当磁盘不直接暴露给操作系统时，<code>smartctl -a /dev/sdX</code> 可能只能看到逻辑盘，甚至看不到 SMART。需要通过 <code>-d</code> 指定设备类型或使用控制器厂商工具。</p>
+<pre><code># 让 smartctl 尝试识别可用设备类型
+sudo smartctl --scan-open
+
+# USB-SATA 桥接常见写法，具体取决于桥接芯片
+sudo smartctl -a -d sat /dev/sdb
+
+# MegaRAID 示例：N 是物理盘索引，必须结合控制器工具确认
+sudo smartctl -a -d megaraid,0 /dev/sda
+
+# 有些 HBA/SAS 场景可能需要 /dev/sgX
+sudo smartctl -a /dev/sg2</code></pre>
+<table><tr><th>场景</th><th>症状</th><th>处理</th></tr><tr><td>硬 RAID</td><td>只能看到虚拟盘</td><td>使用 <code>-d megaraid,N</code> 或 storcli/perccli/arcconf</td></tr><tr><td>HBA 直通</td><td>通常能直接读到物理盘</td><td>优先按 by-id 和序列号定位</td></tr><tr><td>USB/SATA 桥</td><td>SMART unsupported 或字段缺失</td><td>尝试 <code>-d sat</code>，必要时更换桥接盒</td></tr><tr><td>虚拟机</td><td>看到的是虚拟磁盘</td><td>在宿主机或存储后端采集真实 SMART</td></tr><tr><td>容器</td><td>没有块设备权限</td><td>使用宿主机 agent，不建议把整块设备随意暴露给容器</td></tr></table>
+<div class="warn"><strong>槽位风险：</strong> RAID 下的编号、Linux 设备名和机箱槽位不是天然一致的；换盘前必须通过控制器工具点灯/定位并核对序列号。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 自动化采集与监控</h2>
+<p>生产环境不应靠人工 SSH 到节点看 SMART。更合理的方式是周期性采集关键指标、保存趋势、将强信号接入告警，并在工单里附上完整 <code>smartctl -x</code> 输出。</p>
+<pre><code># 简单巡检脚本：只读采集，不做处置
+#!/usr/bin/env bash
+set -euo pipefail
+out="/var/log/smart-snapshots/$(hostname)-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$out"
+sudo smartctl --scan-open > "$out/scan.txt"
+awk '{print $1}' "$out/scan.txt" | while read -r dev; do
+  safe=$(basename "$dev" | tr '/' '_')
+  sudo smartctl -x "$dev" > "$out/$safe.txt" 2>&1 || true
+done
+
+# 人工快速检查高风险关键词
+grep -RniE 'FAILED|Critical Warning|Media and Data Integrity Errors|Current_Pending|Offline_Uncorrectable' "$out"</code></pre>
+<table><tr><th>告警类型</th><th>建议级别</th><th>说明</th></tr><tr><td>总体健康 FAILED</td><td>严重</td><td>立即进入下线/替换评估</td></tr><tr><td>NVMe Critical Warning 非 0</td><td>严重</td><td>检查 spare、温度、可靠性、只读模式等原因</td></tr><tr><td>介质错误增长</td><td>严重</td><td>趋势比单次值更重要</td></tr><tr><td>CRC 增长</td><td>警告</td><td>通常先查链路，持续增长需处理</td></tr><tr><td>温度持续过高</td><td>警告/严重</td><td>按设备规格和业务影响定级</td></tr><tr><td>磨损接近阈值</td><td>计划</td><td>进入容量和备件计划</td></tr></table>
+<div class="success"><strong>自动化边界：</strong> 自动采集可以很激进，自动处置要保守；下线盘/节点前应检查副本、恢复状态和当前业务负载。</div>
+</section>
+
+<section class="figure" id="fig-s18">
+<h3>排障图：smartctl 结果不符合预期时怎么查</h3>
+<svg viewBox="0 0 1100 730" width="100%" role="img" aria-label="smartctl 排障流程图">
+<rect x="20" y="20" width="1060" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="48" width="260" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="89" text-anchor="middle" font-size="22" font-weight="700">smartctl 异常</text>
+<rect x="75" y="165" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="185" y="201" text-anchor="middle" font-size="18" font-weight="700">设备名对吗？</text><text x="185" y="229" text-anchor="middle" font-size="14">lsblk / by-id / 序列号</text>
+<rect x="315" y="165" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="201" text-anchor="middle" font-size="18" font-weight="700">协议识别对吗？</text><text x="425" y="229" text-anchor="middle" font-size="14">SATA / SAS / NVMe</text>
+<rect x="555" y="165" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="665" y="201" text-anchor="middle" font-size="18" font-weight="700">被控制器挡住？</text><text x="665" y="229" text-anchor="middle" font-size="14">RAID / HBA / USB</text>
+<rect x="795" y="165" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="905" y="201" text-anchor="middle" font-size="18" font-weight="700">权限足够吗？</text><text x="905" y="229" text-anchor="middle" font-size="14">sudo / 容器 / VM</text>
+<rect x="115" y="360" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="240" y="396" text-anchor="middle" font-size="18" font-weight="700">运行 --scan-open</text><text x="240" y="424" text-anchor="middle" font-size="14">获取推荐 -d 参数</text>
+<rect x="425" y="360" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="396" text-anchor="middle" font-size="18" font-weight="700">补充系统日志</text><text x="550" y="424" text-anchor="middle" font-size="14">journalctl -k / 控制器日志</text>
+<rect x="735" y="360" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="860" y="396" text-anchor="middle" font-size="18" font-weight="700">换工具验证</text><text x="860" y="424" text-anchor="middle" font-size="14">nvme / storcli / vendor</text>
+<rect x="295" y="575" width="510" height="74" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="608" text-anchor="middle" font-size="20" font-weight="700">先确认“读的是哪块真实物理盘”</text><text x="550" y="633" text-anchor="middle" font-size="14">再解释健康字段，否则结论可能完全错误</text>
+<line x1="550" y1="114" x2="185" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="425" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="665" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="114" x2="905" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="185" y1="255" x2="240" y2="360" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="255" x2="550" y2="360" stroke="#94a3b8" stroke-width="3"/><line x1="665" y1="255" x2="860" y2="360" stroke="#94a3b8" stroke-width="3"/><line x1="905" y1="255" x2="860" y2="360" stroke="#94a3b8" stroke-width="3"/>
+<line x1="240" y1="450" x2="430" y2="575" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="450" x2="550" y2="575" stroke="#94a3b8" stroke-width="3"/><line x1="860" y1="450" x2="670" y2="575" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">smartctl 排障先从设备身份、协议、控制器和权限开始；字段解释要建立在“目标盘正确”的基础上。</div></section>
+
+<section class="section" id="s18">
+<h2>17. 常见排障清单</h2>
+<div class="grid-2"><div class="card"><strong>问题 1：SMART support is Unavailable</strong><br>可能是虚拟磁盘、RAID 控制器遮挡、USB 桥不透传或权限不足。先运行 <code>smartctl --scan-open</code>。</div><div class="card"><strong>问题 2：PASSED 但业务仍然报 IO 错</strong><br>继续看错误日志、自检日志、内核日志和上层存储；PASSED 不是无故障证明。</div><div class="card"><strong>问题 3：CRC 错误增长但介质字段正常</strong><br>优先查 SATA 线缆、背板、接口、电源和控制器，不要立刻定性为盘面坏。</div><div class="card"><strong>问题 4：NVMe Media Errors 增长</strong><br>高风险，结合 Error Information Log、内核日志和副本状态，准备下线/替换。</div><div class="card"><strong>问题 5：自检一直中断</strong><br>可能是掉电、设备 reset、负载、控制器问题或不支持相关测试。看 <code>journalctl -k</code> 时间线。</div><div class="card"><strong>问题 6：盘符变化导致查错盘</strong><br>使用 <code>/dev/disk/by-id</code>、序列号、WWN、控制器槽位映射，不依赖 <code>/dev/sdX</code>。</div><div class="card"><strong>问题 7：容器里看不到设备</strong><br>SMART 应在宿主机采集；不要为了方便把所有块设备暴露给业务容器。</div><div class="card"><strong>问题 8：多盘同时异常</strong><br>优先考虑背板、HBA、供电、散热、固件批次或机房事件，而不是多个盘同时自然损坏。</div></div>
+<h3>最小排障模板</h3>
+<pre><code># 1. 确认目标盘身份
+lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINTS
+sudo smartctl -i /dev/sdX
+
+# 2. 收集完整 smartctl 输出
+sudo smartctl -x /dev/sdX | tee /tmp/sdX.smart.txt
+
+# 3. 对齐系统错误时间线
+journalctl -k --since "24 hours ago" | egrep -i 'sdX|ata|scsi|I/O error|timeout|reset'
+
+# 4. 如果是 NVMe，补充 NVMe 专用日志
+sudo nvme smart-log /dev/nvme0n1
+sudo nvme error-log /dev/nvme0n1</code></pre>
+</section>
+
+<section class="refbox" id="s19">
+<h2>18. 安全边界与参考资料</h2>
+<h3>安全边界</h3>
+<ul><li><code>smartctl -a</code>、<code>-x</code>、<code>-i</code>、<code>-H</code> 主要是只读查询，适合生产排障采集。</li><li><code>smartctl -t short/long</code> 通常不破坏数据，但会占用设备资源，并可能让不稳定盘暴露更多错误。</li><li><code>smartctl -X</code> 会终止自检，适合业务受影响时使用。</li><li>不要把 <code>smartctl</code> 与破坏性写测试混淆；介质已异常时，先保护数据，再考虑压力测试。</li><li>换盘前必须核对序列号、槽位、控制器映射和上层副本状态。</li></ul>
+<h3>参考资料与延伸阅读</h3>
+<ul><li>smartmontools 官方文档：<code>smartctl(8)</code>、<code>smartd(8)</code>、设备数据库和 FAQ。</li><li>NVMe Base Specification：SMART / Health Information Log、Error Information Log、Critical Warning 字段。</li><li>Linux man-pages 与发行版文档：块设备、<code>lsblk(8)</code>、<code>journalctl(1)</code>、内核 I/O 错误日志。</li><li>控制器厂商文档：Broadcom/LSI MegaRAID、PERC、Adaptec、HBA、NVMe 背板和点灯工具。</li><li>分布式存储运维文档：Ceph OSD replacement、Lustre/BeeGFS/NFS 节点维护与副本恢复流程。</li></ul>
+<p class="mini">建议学习顺序：先掌握设备发现和 <code>smartctl -a/-x</code>，再区分 SATA/SAS 与 NVMe 指标，最后把 SMART 信号接入集群级 triage 和自动化监控。</p>
+</section>
+
+<div class="footer">smartctl 深度教程 · AI Infra 磁盘健康、NVMe/SATA 指标、自检、错误日志、预测性故障与集群 triage</div>
+</div>
+</body>
+</html>

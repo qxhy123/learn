@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>vmstat 深度教程：AI Infra 场景下的 CPU、内存、IO 与调度观测</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>vmstat 深度教程：AI Infra 场景下的 CPU、内存、IO 与调度观测</h1>
+<p class="sub">这份教程按常用 Linux 命令 <code>vmstat</code> 讲解。它不是简单字段翻译，而是从“每个采样周期里，内核把调度队列、内存、交换、块 IO、系统中断/上下文切换、CPU 时间切片汇总成一行”这个模型出发，系统解释如何在 AI 训练、推理服务、数据加载、NFS/本地盘 IO、NUMA/CPU 争用和虚拟化环境中快速判断瓶颈。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">运行队列 r</span><span class="chip">阻塞队列 b</span><span class="chip">内存与 swap</span><span class="chip">bi/bo</span><span class="chip">in/cs</span><span class="chip">CPU wa/st</span><span class="chip">采样窗口</span><span class="chip">训练排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>vmstat</code> 是系统级“生命体征监视器”：它不告诉你哪个进程最慢，但能在一眼内判断机器是否被 CPU 调度、内存回收、swap、磁盘 IO、上下文切换或虚拟化 steal time 拖住。</div>
+<div class="success"><strong>实践原则：</strong> 诊断 AI 任务卡顿时先跑 <code>vmstat 1 30</code> 看趋势，再用 <code>pidstat</code>、<code>mpstat</code>、<code>iostat</code>、<code>sar</code>、<code>nvidia-smi</code> 或框架 profiler 下钻；不要只凭单行快照下结论。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">vmstat 是什么</a></li>
+<li><a class="anchor" href="#s2">AI Infra 为什么需要 vmstat</a></li>
+<li><a class="anchor" href="#s3">整体心智模型</a></li>
+<li><a class="anchor" href="#s4">安装、权限与可用性</a></li>
+<li><a class="anchor" href="#s5">基本语法与第一批命令</a></li>
+<li><a class="anchor" href="#s6">输出字段总览</a></li>
+<li><a class="anchor" href="#s7">procs：r 与 b 队列</a></li>
+<li><a class="anchor" href="#s8">memory：free、buff、cache</a></li>
+<li><a class="anchor" href="#s9">swap：si 与 so</a></li>
+<li><a class="anchor" href="#s10">io：bi 与 bo</a></li>
+<li><a class="anchor" href="#s11">system：in 与 cs</a></li>
+<li><a class="anchor" href="#s12">cpu：us、sy、id、wa、st</a></li>
+<li><a class="anchor" href="#s13">采样间隔与首行陷阱</a></li>
+<li><a class="anchor" href="#s14">训练 dataloader stall 排查</a></li>
+<li><a class="anchor" href="#s15">推理服务与 GPU 利用率排查</a></li>
+<li><a class="anchor" href="#s16">vmstat vs sar/mpstat/iostat</a></li>
+<li><a class="anchor" href="#s17">故障模式速查</a></li>
+<li><a class="anchor" href="#s18">安全采集与生产注意事项</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. vmstat 是什么</h2>
+<p><code>vmstat</code> 来自 <code>procps</code> 工具集，用来周期性展示虚拟内存、进程队列、块设备 IO、系统中断/上下文切换和 CPU 时间分布。它读取内核暴露的统计信息，按固定列输出，非常适合在 SSH 终端里快速判断“整机正在被什么资源限制”。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>低开销、秒级采样、系统级瓶颈判断、长期卡顿现场的第一屏观察。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能直接定位具体 Python 函数、具体文件、具体 GPU kernel 或单个线程的调用栈。</div>
+<div class="card"><strong>它的定位</strong><br>先判断瓶颈类别，再切到更专门的工具下钻。</div>
+</div>
+<pre><code># 每 1 秒采样一次，共 10 次
+vmstat 1 10
+
+# 带单位输出，便于阅读内存数字
+vmstat -S M 1 10
+
+# 显示内存、磁盘、fork、slab 等摘要
+vmstat -s
+vmstat -d
+vmstat -f
+vmstat -m</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>vmstat</code> 是整机视角。如果同一台节点上有多个训练任务、容器或租户，它只能说明主机层面发生了什么，不能自动替你分摊到某个 job。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 为什么需要 vmstat</h2>
+<p>AI 训练和推理的性能问题经常表现为“GPU 利用率掉下去”，但根因可能在 CPU、内存、页缓存、数据集存储、网络文件系统、解压/增强线程、容器 CPU 限额或虚拟机宿主机争用。<code>vmstat</code> 的价值在于：它能快速告诉你 GPU 之前的主机侧流水线是否健康。</p>
+<table>
+<tr><th>AI 场景</th><th>vmstat 观察重点</th><th>典型解释</th></tr>
+<tr><td>PyTorch/TF 训练吞吐下降</td><td><code>r</code>、<code>b</code>、<code>wa</code>、<code>bi</code>、<code>cs</code></td><td>数据加载线程 CPU 不够、IO 阻塞、过度进程/线程切换。</td></tr>
+<tr><td>GPU 利用率周期性锯齿</td><td><code>b</code> 和 <code>wa</code> 周期升高</td><td>dataloader 或 checkpoint 读写把训练 step 卡住。</td></tr>
+<tr><td>推理服务 p99 抖动</td><td><code>r</code>、<code>sy</code>、<code>cs</code>、<code>st</code></td><td>CPU 调度争用、网络/系统调用开销、虚拟化 steal time。</td></tr>
+<tr><td>大模型权重加载慢</td><td><code>bi</code>、<code>b</code>、<code>wa</code>、<code>cache</code></td><td>冷页缓存、磁盘或远端存储吞吐不足。</td></tr>
+</table>
+<div class="note"><strong>AI Infra 心法：</strong> GPU 是结果，主机侧 pipeline 是原因之一。看 <code>vmstat</code> 是为了判断“GPU 在等谁”。</div>
+</section>
+
+<section class="figure" id="s3">
+<h2>3. 整体心智模型</h2>
+<h3>信息图：vmstat 的整体模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="vmstat 整体模型">
+<rect x="16" y="16" width="1068" height="618" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="58" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">vmstat = 内核计数器的秒级系统体征表</text>
+<rect x="60" y="105" width="180" height="108" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="145" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">procs</text><text x="150" y="174" text-anchor="middle" font-size="14">r: 可运行队列</text><text x="150" y="196" text-anchor="middle" font-size="14">b: 不可中断阻塞</text>
+<rect x="280" y="105" width="180" height="108" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="370" y="145" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">memory</text><text x="370" y="174" text-anchor="middle" font-size="14">free / buff</text><text x="370" y="196" text-anchor="middle" font-size="14">cache / active</text>
+<rect x="500" y="105" width="180" height="108" rx="18" fill="#fee2e2" stroke="#fca5a5"/><text x="590" y="145" text-anchor="middle" font-size="21" font-weight="700" fill="#b91c1c">swap</text><text x="590" y="174" text-anchor="middle" font-size="14">si: swap in</text><text x="590" y="196" text-anchor="middle" font-size="14">so: swap out</text>
+<rect x="720" y="105" width="180" height="108" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="810" y="145" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">io</text><text x="810" y="174" text-anchor="middle" font-size="14">bi: blocks in</text><text x="810" y="196" text-anchor="middle" font-size="14">bo: blocks out</text>
+<rect x="940" y="105" width="110" height="108" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="995" y="145" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">cpu</text><text x="995" y="174" text-anchor="middle" font-size="13">us sy id</text><text x="995" y="196" text-anchor="middle" font-size="13">wa st</text>
+<rect x="125" y="308" width="850" height="176" rx="24" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="350" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">AI 任务视角：GPU step 等待 = 主机侧某个队列变长</text><text x="550" y="392" text-anchor="middle" font-size="16">r 高：CPU run queue 拥堵，dataloader worker 或服务线程抢核</text><text x="550" y="424" text-anchor="middle" font-size="16">b/wa/bi 高：线程在不可中断 IO 等待，常见于数据集、checkpoint、NFS、冷缓存</text><text x="550" y="456" text-anchor="middle" font-size="16">si/so 高：内存压力触发 swap，训练进程可能进入灾难性抖动</text>
+<rect x="300" y="548" width="500" height="52" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="581" text-anchor="middle" font-size="17" font-weight="700">先用 vmstat 定类，再用专用工具定位责任进程和设备</text>
+</svg>
+<div class="caption">vmstat 把多个内核子系统浓缩成一行。对 AI Infra 来说，它是判断“GPU 之前哪段 pipeline 堵住”的入口。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 安装、权限与可用性</h2>
+<p>大多数 Linux 发行版默认提供 <code>vmstat</code>。它通常不需要 root 权限，因为读取的是内核公开统计；但某些容器环境可能因为最小镜像没有安装 <code>procps</code>，或者因为命名空间/cgroup 限制导致看到的是宿主机或容器视角的混合信息。</p>
+<table>
+<tr><th>系统</th><th>安装命令</th><th>说明</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>sudo apt-get update &amp;&amp; sudo apt-get install -y procps</code></td><td><code>vmstat</code> 属于 <code>procps</code>。</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>sudo dnf install -y procps-ng</code></td><td>旧系统可能使用 <code>yum</code>。</td></tr>
+<tr><td>容器镜像</td><td><code>apt-get install procps</code> 或使用基础镜像自带工具</td><td>只在诊断镜像中安装，生产镜像不必强行加入。</td></tr>
+</table>
+<pre><code># 确认版本与路径
+command -v vmstat
+vmstat --version 2&gt;/dev/null || vmstat -V
+
+# 查看帮助
+vmstat --help 2&gt;/dev/null || man vmstat</code></pre>
+<div class="warn"><strong>容器注意：</strong> 在 Kubernetes Pod 内运行 <code>vmstat</code> 时，CPU/内存限制、宿主机统计和 cgroup 统计可能不完全一致。排障容器资源限制时，同时查看 <code>cat /sys/fs/cgroup/*</code>、<code>kubectl top</code> 或节点级监控。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 基本语法与第一批命令</h2>
+<pre><code>vmstat [options] [delay [count]]
+
+# delay: 两次采样之间的秒数
+# count: 输出多少次；不写 count 时持续输出
+# 常用方式：vmstat 1 30</code></pre>
+<table>
+<tr><th>命令</th><th>用途</th></tr>
+<tr><td><code>vmstat</code></td><td>输出一行自系统启动以来的平均摘要。</td></tr>
+<tr><td><code>vmstat 1</code></td><td>每秒持续输出，适合现场观察。</td></tr>
+<tr><td><code>vmstat 1 30</code></td><td>每秒采样 30 次，适合贴到工单或排障记录。</td></tr>
+<tr><td><code>vmstat -S M 1 10</code></td><td>内存字段用 MB 显示，降低换算成本。</td></tr>
+<tr><td><code>vmstat -w 1 10</code></td><td>宽格式输出，字段不容易挤在一起。</td></tr>
+</table>
+<pre><code># 训练过程中记录 60 秒主机状态
+vmstat -w -S M 1 60 | tee vmstat.$(date +%Y%m%d-%H%M%S).log
+
+# 与 GPU 利用率并排观察，两个终端分别运行
+watch -n 1 nvidia-smi
+vmstat -w 1</code></pre>
+<div class="note"><strong>复制建议：</strong> 排障时优先使用 <code>vmstat -w 1 30</code>。宽输出更适合截图和粘贴，1 秒采样能看到训练 step 间歇性抖动。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 输出字段总览</h2>
+<p>典型 <code>vmstat</code> 输出按列分组。不同发行版可能略有差异，但核心字段基本一致。</p>
+<pre><code>procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0  8192M   512M  64.0G    0    0     4    32 1200 3500 28  5 66  1  0</code></pre>
+<table>
+<tr><th>分组</th><th>字段</th><th>一句话解释</th></tr>
+<tr><td>procs</td><td><code>r</code>、<code>b</code></td><td>可运行队列和不可中断阻塞队列。</td></tr>
+<tr><td>memory</td><td><code>swpd</code>、<code>free</code>、<code>buff</code>、<code>cache</code></td><td>swap 使用量、空闲内存、块设备 buffer、页缓存。</td></tr>
+<tr><td>swap</td><td><code>si</code>、<code>so</code></td><td>每秒 swap in/out，非零且持续通常危险。</td></tr>
+<tr><td>io</td><td><code>bi</code>、<code>bo</code></td><td>每秒从块设备读入/写出块数。</td></tr>
+<tr><td>system</td><td><code>in</code>、<code>cs</code></td><td>每秒中断和上下文切换次数。</td></tr>
+<tr><td>cpu</td><td><code>us</code>、<code>sy</code>、<code>id</code>、<code>wa</code>、<code>st</code></td><td>用户态、内核态、空闲、IO 等待、虚拟化被偷走的 CPU 时间。</td></tr>
+</table>
+<div class="success"><strong>读表顺序：</strong> 先看 <code>r/b</code> 判断队列，再看 <code>us/sy/id/wa/st</code> 判断 CPU 时间流向，最后结合 <code>si/so</code>、<code>bi/bo</code>、<code>in/cs</code> 解释原因。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. procs：r 与 b 队列</h2>
+<p><code>r</code> 是正在运行或等待 CPU 的任务数，近似反映 run queue 压力；<code>b</code> 是不可中断睡眠任务数，常见于等待磁盘、网络文件系统或某些内核 IO。AI 训练中，<code>r</code> 高常指 CPU worker 抢核，<code>b</code> 高常指数据/权重/checkpoint IO 卡住。</p>
+<table>
+<tr><th>现象</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>r</code> 长期大于 CPU 逻辑核数</td><td>CPU 供给不足，线程/进程过多，dataloader worker 过量。</td><td><code>mpstat -P ALL 1</code>、<code>pidstat -u -t 1</code>。</td></tr>
+<tr><td><code>b</code> 周期性升高</td><td>训练 step 等待 IO，可能是数据读取、解压、checkpoint。</td><td><code>iostat -xz 1</code>、<code>pidstat -d 1</code>、存储监控。</td></tr>
+<tr><td><code>r</code> 高但 <code>us</code> 不高</td><td>可能有 CPU 限额、steal time 或锁/调度异常。</td><td>看 <code>st</code>、cgroup CPU quota、<code>perf top</code>。</td></tr>
+</table>
+<pre><code># 观察 run queue 是否超过逻辑核数
+nproc
+vmstat -w 1 20
+
+# 找出 CPU 热线程
+pidstat -u -t 1 10
+ps -eLo pid,tid,psr,pcpu,comm --sort=-pcpu | head</code></pre>
+<div class="warn"><strong>不要机械套阈值：</strong> <code>r</code> 短时间高不一定有问题；关键是它是否持续高于可用 CPU、是否伴随吞吐下降或延迟升高。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. memory：free、buff、cache</h2>
+<p>Linux 会积极用空闲内存做页缓存，因此 <code>free</code> 低不等于内存不足。AI 任务读取大数据集时，<code>cache</code> 可能很高，这是正常且有益的；真正危险的是持续 swap、OOM、活跃页回收和训练进程 resident memory 不断上涨。</p>
+<table>
+<tr><th>字段</th><th>含义</th><th>AI 场景解释</th></tr>
+<tr><td><code>swpd</code></td><td>已使用 swap 总量</td><td>非零不一定立刻危险，但持续增长要警惕。</td></tr>
+<tr><td><code>free</code></td><td>完全空闲内存</td><td>Linux 正常运行时可能较低。</td></tr>
+<tr><td><code>buff</code></td><td>块设备 buffer</td><td>通常不是主要关注点。</td></tr>
+<tr><td><code>cache</code></td><td>页缓存</td><td>数据集读取越多越可能升高，有助于后续 epoch。</td></tr>
+</table>
+<pre><code># 更清楚地看可用内存
+free -h
+
+# 观察训练进程内存
+ps -o pid,ppid,rss,vsz,cmd -p "$PID"
+pmap -x "$PID" | tail -n 1
+
+# 看内存压力和 OOM 记录
+dmesg -T | grep -Ei 'out of memory|oom|killed process' | tail</code></pre>
+<div class="note"><strong>判断重点：</strong> 页缓存高通常不是坏事。把注意力放在 <code>si/so</code> 是否持续非零、进程 RSS 是否异常增长、系统日志是否出现 OOM。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. swap：si 与 so</h2>
+<p><code>si</code> 表示每秒从 swap 读回内存，<code>so</code> 表示每秒把内存写到 swap。对 AI 训练而言，持续 swap 往往是严重问题：一次 batch 可能拖慢数十倍，GPU 会长期等待 CPU/内存子系统。</p>
+<div class="grid-3">
+<div class="card"><strong><code>si=0 so=0</code></strong><br>理想状态，至少没有持续 swap 抖动。</div>
+<div class="card"><strong><code>so</code> 持续大于 0</strong><br>内存正在被挤出，可能是 batch、worker、缓存或模型副本过大。</div>
+<div class="card"><strong><code>si</code> 和 <code>so</code> 来回跳</strong><br>系统进入内存颠簸，训练吞吐会非常差。</div>
+</div>
+<pre><code># 观察 swap 使用
+swapon --show
+free -h
+vmstat -w 1 30
+
+# 查找高 RSS 进程
+ps aux --sort=-rss | head -20</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要在不了解业务影响时直接 <code>swapoff -a</code>。这可能触发 OOM kill。先降低并发、停止非关键任务、减少 dataloader worker 或 batch，再规划迁移/重启。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. io：bi 与 bo</h2>
+<p><code>bi</code> 和 <code>bo</code> 是块设备读写速率。它们能提示“是否有 IO 活动”，但不能告诉你哪块盘、哪个挂载点、哪个进程最慢。因此在看到 <code>b</code>、<code>wa</code>、<code>bi/bo</code> 异常后，通常要切到 <code>iostat</code>、<code>pidstat -d</code>、<code>iotop</code> 或存储系统监控。</p>
+<table>
+<tr><th>现象</th><th>常见 AI 原因</th><th>建议验证</th></tr>
+<tr><td><code>bi</code> 高，GPU 低利用</td><td>数据集冷读、远端存储慢、解压前置。</td><td><code>iostat -xz 1</code> 看设备 <code>%util</code>、<code>await</code>。</td></tr>
+<tr><td><code>bo</code> 周期性尖峰</td><td>checkpoint、日志、tensorboard、缓存落盘。</td><td>对齐训练 step 时间点和文件写入。</td></tr>
+<tr><td><code>b</code> 高但 <code>bi/bo</code> 不高</td><td>可能是 NFS/分布式 FS、元数据等待或内核锁。</td><td>看挂载类型、NFS 客户端统计、存储端指标。</td></tr>
+</table>
+<pre><code># 与 vmstat 同时运行，确认是不是设备级 IO 等待
+iostat -xz 1 30
+pidstat -d 1 30
+
+# 粗略观察当前打开数据集文件
+lsof -p "$PID" | grep -E 'dataset|checkpoint|\.pt|\.safetensors' | head</code></pre>
+<div class="warn"><strong>单位提醒：</strong> 不同系统文档对 block 单位说明可能不同，实战中更重要的是趋势和与 <code>iostat</code> 的交叉验证，而不是只盯绝对数字。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. system：in 与 cs</h2>
+<p><code>in</code> 是每秒中断次数，<code>cs</code> 是每秒上下文切换次数。AI 数据流水线中，过多 worker、小文件读取、网络包、线程池抖动、锁竞争或过度并发都可能让 <code>cs</code> 异常升高，CPU 时间花在调度而不是有效计算上。</p>
+<table>
+<tr><th>字段</th><th>含义</th><th>排查方向</th></tr>
+<tr><td><code>in</code> 很高</td><td>中断频繁，可能来自网络、磁盘、定时器、GPU 驱动相关事件。</td><td><code>cat /proc/interrupts</code>、网卡/存储监控。</td></tr>
+<tr><td><code>cs</code> 很高</td><td>线程/进程频繁切换。</td><td><code>pidstat -w -t 1</code>、检查 worker 数、线程池、锁。</td></tr>
+<tr><td><code>sy</code> 与 <code>cs</code> 同升</td><td>内核态开销明显。</td><td>系统调用、网络/IO 路径、容器网络、文件系统。</td></tr>
+</table>
+<pre><code># 找上下文切换高的进程和线程
+pidstat -w -t 1 10
+
+# 看中断分布
+cat /proc/interrupts | head -40
+
+# 查看每个 CPU 的负载分布
+mpstat -P ALL 1 10</code></pre>
+<div class="note"><strong>dataloader 经验：</strong> <code>num_workers</code> 不是越大越好。worker 过多可能让 <code>r</code>、<code>cs</code>、<code>sy</code> 同时升高，反而降低 GPU feed 速度。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. cpu：us、sy、id、wa、st</h2>
+<p>CPU 分组告诉你每个采样窗口里的 CPU 时间花在哪里。AI 排障时尤其关注 <code>wa</code> 和 <code>st</code>：前者说明 CPU 在等 IO，后者说明虚拟化宿主机拿走了本该属于当前虚拟机的 CPU 时间。</p>
+<table>
+<tr><th>字段</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>us</code></td><td>用户态 CPU 时间</td><td>Python 数据处理、预处理、推理前后处理、业务逻辑。</td></tr>
+<tr><td><code>sy</code></td><td>内核态 CPU 时间</td><td>文件系统、网络、驱动、内存管理、系统调用。</td></tr>
+<tr><td><code>id</code></td><td>空闲 CPU 时间</td><td>高 <code>id</code> 且 GPU 低，瓶颈可能不是 CPU 算力。</td></tr>
+<tr><td><code>wa</code></td><td>IO wait</td><td>CPU 等块设备 IO，数据加载和 checkpoint 常见。</td></tr>
+<tr><td><code>st</code></td><td>steal time</td><td>虚拟化或云主机争用，裸金属通常接近 0。</td></tr>
+</table>
+<pre><code># 如果 wa 高，马上切到设备层
+vmstat -w 1 10
+iostat -xz 1 10
+
+# 如果 st 高，记录证据给云平台/虚拟化团队
+vmstat -w 1 60 | tee steal-time.log
+lscpu | grep -Ei 'hypervisor|virtualization'</code></pre>
+<div class="success"><strong>快速判断：</strong> <code>us</code> 高看应用 CPU；<code>sy</code> 高看内核/IO/网络；<code>wa</code> 高看存储；<code>st</code> 高看虚拟化争用；<code>id</code> 高但业务慢则看锁、远端服务、GPU/网络或应用等待。</div>
+</section>
+
+<section class="figure" id="f13">
+<h3>流程图：采样间隔与首行陷阱</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="vmstat 采样流程图">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="395" y="55" width="310" height="68" rx="15" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="97" text-anchor="middle" font-size="22" font-weight="700">执行 vmstat 1 5</text>
+<rect x="85" y="195" width="250" height="92" rx="16" fill="#fee2e2" stroke="#fca5a5"/><text x="210" y="231" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">第 1 行</text><text x="210" y="260" text-anchor="middle" font-size="14">自系统启动以来的平均值</text>
+<rect x="425" y="195" width="250" height="92" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="231" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">第 2 行起</text><text x="550" y="260" text-anchor="middle" font-size="14">最近 1 秒采样窗口</text>
+<rect x="765" y="195" width="250" height="92" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="890" y="231" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">连续趋势</text><text x="890" y="260" text-anchor="middle" font-size="14">看尖峰、周期和持续性</text>
+<rect x="150" y="400" width="800" height="116" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="440" text-anchor="middle" font-size="23" font-weight="700">排障时通常忽略第一行，重点看后续采样</text><text x="550" y="478" text-anchor="middle" font-size="16">1 秒：看训练 step 抖动；5 秒：看平滑趋势；60 秒：看巡检和长期记录</text>
+<rect x="275" y="575" width="550" height="52" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="608" text-anchor="middle" font-size="17" font-weight="700">单行快照只适合提示方向，不能替代时间序列</text>
+<line x1="550" y1="123" x2="210" y2="195" stroke="#94a3b8" stroke-width="4"/><line x1="550" y1="123" x2="550" y2="195" stroke="#94a3b8" stroke-width="4"/><line x1="550" y1="123" x2="890" y2="195" stroke="#94a3b8" stroke-width="4"/><line x1="210" y1="287" x2="360" y2="400" stroke="#94a3b8" stroke-width="4"/><line x1="550" y1="287" x2="550" y2="400" stroke="#94a3b8" stroke-width="4"/><line x1="890" y1="287" x2="740" y2="400" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">不带采样窗口的 <code>vmstat</code> 只是启动以来摘要。诊断线上抖动时，必须看连续采样。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 采样间隔与首行陷阱</h2>
+<p><code>vmstat 1 5</code> 的第一行通常是自系统启动以来的平均值，不代表当前一秒。第二行开始才是每个采样窗口的数据。AI 训练常有明显周期性，例如每 N step 写 checkpoint、每个 epoch 首次冷读数据、每个 batch 数据增强，因此连续采样比单次输出重要得多。</p>
+<table>
+<tr><th>采样方式</th><th>适合场景</th><th>注意事项</th></tr>
+<tr><td><code>vmstat 1 30</code></td><td>交互式排障，观察训练 step、推理 p99 抖动。</td><td>忽略第一行，看后续 29 个窗口。</td></tr>
+<tr><td><code>vmstat 5 60</code></td><td>5 分钟趋势，适合轻量巡检。</td><td>尖峰会被平滑，不适合看短 step。</td></tr>
+<tr><td><code>vmstat 60</code></td><td>长期后台记录。</td><td>需要 logrotate 或显式结束，避免日志无限增长。</td></tr>
+</table>
+<pre><code># 带时间戳记录，便于和训练日志对齐
+while true; do
+  printf '%s ' "$(date '+%F %T')"
+  vmstat -n 1 2 | tail -1
+done | tee vmstat.timeline.log
+
+# 只收 2 分钟，避免无限运行
+timeout 120s vmstat -w 1 | tee vmstat.120s.log</code></pre>
+<div class="warn"><strong>日志实践：</strong> 如果需要长时间采样，使用 <code>timeout</code>、systemd timer、监控系统或 logrotate。不要在生产节点上留下无人管理的无限输出任务。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 训练 dataloader stall 排查</h2>
+<p>dataloader stall 的表象通常是 GPU 利用率周期性掉到低位、每个 batch 间隔变长、吞吐不稳定。<code>vmstat</code> 可以帮你先区分是 CPU worker 不够、worker 太多、IO 等待、内存 swap，还是虚拟化争用。</p>
+<h3>最小排查组合</h3>
+<pre><code># 终端 A：GPU
+watch -n 1 nvidia-smi
+
+# 终端 B：整机体征
+vmstat -w 1 120 | tee vmstat.train.log
+
+# 终端 C：CPU 和 IO 下钻
+pidstat -u -d -w -t 1 120 | tee pidstat.train.log
+iostat -xz 1 120 | tee iostat.train.log</code></pre>
+<table>
+<tr><th>vmstat 模式</th><th>可能根因</th><th>调参方向</th></tr>
+<tr><td><code>r</code> 高、<code>us</code> 高、<code>cs</code> 高</td><td>worker 过多或 CPU 预处理太重。</td><td>降低 <code>num_workers</code>、限制线程池、优化 transform、预处理数据。</td></tr>
+<tr><td><code>b</code> 高、<code>wa</code> 高、<code>bi</code> 高</td><td>数据读取受存储限制。</td><td>本地 NVMe cache、减少小文件、WebDataset/LMDB、提高预取。</td></tr>
+<tr><td><code>si/so</code> 持续非零</td><td>内存不足或 worker 复制数据过多。</td><td>降低 batch、worker、prefetch factor，检查数据集缓存策略。</td></tr>
+<tr><td><code>st</code> 高</td><td>云主机或虚拟化宿主机争用。</td><td>换实例、换宿主机、联系云平台，保留证据。</td></tr>
+</table>
+<div class="success"><strong>训练经验：</strong> 当 GPU 低利用且 <code>id</code> 很高时，不要马上加 worker。先检查是否是远端数据源、锁、队列阻塞、Python 主进程等待或分布式同步。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 推理服务与 GPU 利用率排查</h2>
+<p>在线推理比离线训练更关注延迟和抖动。<code>vmstat</code> 在这里用于判断系统级噪声：CPU run queue、系统调用开销、网络/磁盘中断、上下文切换、IO wait、steal time 是否与 p99/p999 延迟尖峰同时出现。</p>
+<div class="grid-2">
+<div class="card"><strong>CPU 前后处理重</strong><br><code>r</code> 和 <code>us</code> 高，GPU 有空洞。优化 tokenizer、图像预处理、batcher、线程池和 CPU 亲和性。</div>
+<div class="card"><strong>系统调用/网络开销高</strong><br><code>sy</code>、<code>in</code>、<code>cs</code> 高。检查连接数、TLS、网卡中断、容器网络和日志写入。</div>
+<div class="card"><strong>权重/缓存冷启动慢</strong><br><code>bi</code>、<code>b</code>、<code>wa</code> 高。预热模型、预拉权重、本地缓存、减少启动时远端读取。</div>
+<div class="card"><strong>虚拟化噪声</strong><br><code>st</code> 高。对 GPU 推理节点尤其危险，因为 CPU 抖动会影响请求调度和数据搬运。</div>
+</div>
+<pre><code># 请求压测期间同步采集
+vmstat -w 1 180 | tee vmstat.infer.log
+mpstat -P ALL 1 180 | tee mpstat.infer.log
+pidstat -u -w -t -p "$PID" 1 180 | tee pidstat.infer.log
+
+# 与服务日志按时间对齐
+grep 'p99' service.log | tail -20</code></pre>
+<div class="note"><strong>在线服务原则：</strong> <code>vmstat</code> 只能证明“节点同时出现系统压力”。要定位具体请求路径，还需要服务端 tracing、框架 profiler、请求日志和 GPU runtime 指标。</div>
+</section>
+
+<section class="figure" id="f16">
+<h3>用例图：vmstat vs sar/mpstat/iostat/top 怎么选</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="Linux 性能工具选择图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="26" font-weight="700">先定类，再下钻：性能工具选择</text>
+<ellipse cx="160" cy="150" rx="96" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="160" y="157" text-anchor="middle" font-size="17" font-weight="700">卡顿现场</text>
+<rect x="345" y="112" width="210" height="76" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="450" y="143" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">vmstat</text><text x="450" y="168" text-anchor="middle" font-size="14">整机一屏定类</text>
+<rect x="700" y="72" width="250" height="68" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="825" y="114" text-anchor="middle" font-size="17">mpstat：每核 CPU</text>
+<rect x="700" y="165" width="250" height="68" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="825" y="207" text-anchor="middle" font-size="17">iostat：设备 IO</text>
+<rect x="700" y="258" width="250" height="68" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="825" y="300" text-anchor="middle" font-size="17">pidstat：进程/线程</text>
+<rect x="700" y="351" width="250" height="68" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="825" y="393" text-anchor="middle" font-size="17">sar：历史趋势</text>
+<rect x="700" y="444" width="250" height="68" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="825" y="486" text-anchor="middle" font-size="17">top/htop：交互查看</text>
+<rect x="250" y="430" width="300" height="96" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="400" y="466" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">AI 专用补充</text><text x="400" y="494" text-anchor="middle" font-size="14">nvidia-smi / dcgmi / profiler</text>
+<line x1="256" y1="150" x2="345" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="555" y1="150" x2="700" y2="106" stroke="#94a3b8" stroke-width="3"/><line x1="555" y1="150" x2="700" y2="199" stroke="#94a3b8" stroke-width="3"/><line x1="555" y1="150" x2="700" y2="292" stroke="#94a3b8" stroke-width="3"/><line x1="555" y1="150" x2="700" y2="385" stroke="#94a3b8" stroke-width="3"/><line x1="555" y1="150" x2="700" y2="478" stroke="#94a3b8" stroke-width="3"/><path d="M450 188 C430 260, 410 345, 400 430" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">vmstat 是入口，不是终点。看到某类异常后，马上切到对应专用工具验证。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. vmstat vs sar/mpstat/iostat</h2>
+<table>
+<tr><th>工具</th><th>最适合回答的问题</th><th>和 vmstat 的关系</th></tr>
+<tr><td><code>vmstat</code></td><td>整机现在是 CPU、内存、swap、IO、调度还是虚拟化问题？</td><td>第一屏总览。</td></tr>
+<tr><td><code>sar</code></td><td>过去一段时间是否出现过同类问题？</td><td>历史时间序列，适合复盘。</td></tr>
+<tr><td><code>mpstat</code></td><td>CPU 压力是否集中在少数核？是否有软中断/每核不均？</td><td>CPU 下钻。</td></tr>
+<tr><td><code>iostat</code></td><td>哪块设备繁忙？延迟、队列、利用率如何？</td><td>IO 下钻。</td></tr>
+<tr><td><code>pidstat</code></td><td>哪个进程/线程在吃 CPU、IO 或上下文切换？</td><td>责任主体定位。</td></tr>
+<tr><td><code>top/htop</code></td><td>当前最热进程是谁？交互观察。</td><td>现场辅助。</td></tr>
+</table>
+<pre><code># 一个常用排障组合
+vmstat -w 1 30
+mpstat -P ALL 1 30
+iostat -xz 1 30
+pidstat -u -d -w -t 1 30
+
+# 若安装了 sysstat，可看历史
+sar -u 1 5
+sar -b 1 5
+sar -r 1 5</code></pre>
+<div class="success"><strong>工具链心法：</strong> <code>vmstat</code> 定方向，<code>sar</code> 看历史，<code>mpstat</code> 看每核，<code>iostat</code> 看设备，<code>pidstat</code> 找进程，GPU 工具看加速器侧。</div>
+</section>
+
+<section class="figure" id="f17">
+<h3>排障图：从 vmstat 模式到下一步动作</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="vmstat 排障流程图">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="68" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="87" text-anchor="middle" font-size="22" font-weight="700">vmstat 发现异常</text>
+<rect x="70" y="170" width="210" height="86" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="175" y="204" text-anchor="middle" font-size="17" font-weight="700">r 高</text><text x="175" y="232" text-anchor="middle" font-size="14">CPU run queue</text>
+<rect x="320" y="170" width="210" height="86" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="204" text-anchor="middle" font-size="17" font-weight="700">b/wa/bi 高</text><text x="425" y="232" text-anchor="middle" font-size="14">IO 等待</text>
+<rect x="570" y="170" width="210" height="86" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="675" y="204" text-anchor="middle" font-size="17" font-weight="700">si/so 高</text><text x="675" y="232" text-anchor="middle" font-size="14">swap 抖动</text>
+<rect x="820" y="170" width="210" height="86" rx="15" fill="#ede9fe" stroke="#c4b5fd"/><text x="925" y="204" text-anchor="middle" font-size="17" font-weight="700">cs/sy/st 高</text><text x="925" y="232" text-anchor="middle" font-size="14">调度/内核/虚拟化</text>
+<rect x="70" y="350" width="210" height="96" rx="15" fill="#ccfbf1" stroke="#99f6e4"/><text x="175" y="386" text-anchor="middle" font-size="16" font-weight="700">mpstat + pidstat</text><text x="175" y="414" text-anchor="middle" font-size="14">看每核和线程</text>
+<rect x="320" y="350" width="210" height="96" rx="15" fill="#ccfbf1" stroke="#99f6e4"/><text x="425" y="386" text-anchor="middle" font-size="16" font-weight="700">iostat + pidstat -d</text><text x="425" y="414" text-anchor="middle" font-size="14">看设备和进程 IO</text>
+<rect x="570" y="350" width="210" height="96" rx="15" fill="#ccfbf1" stroke="#99f6e4"/><text x="675" y="386" text-anchor="middle" font-size="16" font-weight="700">free + ps + dmesg</text><text x="675" y="414" text-anchor="middle" font-size="14">看内存和 OOM</text>
+<rect x="820" y="350" width="210" height="96" rx="15" fill="#ccfbf1" stroke="#99f6e4"/><text x="925" y="386" text-anchor="middle" font-size="16" font-weight="700">pidstat -w + perf</text><text x="925" y="414" text-anchor="middle" font-size="14">看切换、锁和宿主机</text>
+<rect x="220" y="565" width="660" height="76" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="598" text-anchor="middle" font-size="20" font-weight="700">把 vmstat 时间戳与训练日志、服务延迟、GPU 指标对齐</text><text x="550" y="624" text-anchor="middle" font-size="14">只有同一时间窗口的证据，才能支持根因判断</text>
+<line x1="550" y1="113" x2="175" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="113" x2="425" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="113" x2="675" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="113" x2="925" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="175" y1="256" x2="175" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="256" x2="425" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="675" y1="256" x2="675" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="925" y1="256" x2="925" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="175" y1="446" x2="360" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="446" x2="485" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="675" y1="446" x2="615" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="925" y1="446" x2="740" y2="565" stroke="#94a3b8" stroke-width="3"/>
+</svg>
+<div class="caption">vmstat 的价值是把复杂系统问题分流到正确的下钻路径，避免盲目调 batch、worker 或重启服务。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 故障模式速查</h2>
+<div class="grid-2">
+<div class="card"><strong>CPU 饱和</strong><br><code>r</code> 持续高于可用核数，<code>us</code> 高。检查 dataloader worker、tokenizer、图像增强、OpenMP/MKL 线程数。</div>
+<div class="card"><strong>IO 阻塞</strong><br><code>b</code>、<code>wa</code>、<code>bi</code> 或 <code>bo</code> 同时升高。检查数据集、checkpoint、NFS、对象存储挂载和本地盘。</div>
+<div class="card"><strong>内存颠簸</strong><br><code>si</code>/<code>so</code> 持续非零，吞吐急剧下降。降低 batch/worker，检查缓存和内存泄漏。</div>
+<div class="card"><strong>上下文切换风暴</strong><br><code>cs</code> 异常高，<code>sy</code> 偏高。减少线程/进程，检查锁、队列、日志和小 IO。</div>
+<div class="card"><strong>虚拟化争用</strong><br><code>st</code> 明显升高。云主机/虚拟机被宿主机抢 CPU，需换节点或升级实例。</div>
+<div class="card"><strong>看似空闲但业务慢</strong><br><code>id</code> 高，其他列平稳。查 GPU 同步、分布式通信、远端 RPC、应用锁或限流。</div>
+</div>
+<h3>可复制排障模板</h3>
+<pre><code># 1. 收集整机 2 分钟
+timeout 120s vmstat -w 1 | tee vmstat.$(hostname).log
+
+# 2. 同步收集 CPU、IO、进程
+timeout 120s mpstat -P ALL 1 | tee mpstat.$(hostname).log
+timeout 120s iostat -xz 1 | tee iostat.$(hostname).log
+timeout 120s pidstat -u -d -w -t 1 | tee pidstat.$(hostname).log
+
+# 3. 如果是 GPU 节点，额外收集
+nvidia-smi dmon -s pucvmt -d 1 -c 120 | tee nvidia-dmon.$(hostname).log</code></pre>
+<div class="note"><strong>证据对齐：</strong> 记录主机名、时间、训练 step 或请求时间窗口。没有时间对齐的性能证据很难支持根因判断。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 安全采集与生产注意事项</h2>
+<p><code>vmstat</code> 本身是只读、低开销命令，适合线上运行。但围绕它的排障动作可能有风险：安装工具、长时间采集、清缓存、关闭 swap、重启服务、调整 worker 或迁移任务都可能影响生产。</p>
+<table>
+<tr><th>动作</th><th>风险</th><th>安全做法</th></tr>
+<tr><td>运行 <code>vmstat 1 30</code></td><td>极低</td><td>可以直接执行并保存输出。</td></tr>
+<tr><td>长时间 <code>tee</code> 日志</td><td>日志占盘</td><td>使用 <code>timeout</code>、限制路径、采集后压缩归档。</td></tr>
+<tr><td>安装 <code>procps</code>/<code>sysstat</code></td><td>变更系统包</td><td>优先在诊断容器或维护窗口执行。</td></tr>
+<tr><td>清页缓存</td><td>会改变真实 workload 表现</td><td>只在隔离测试节点上做，生产排障通常不要做。</td></tr>
+<tr><td><code>swapoff</code>、重启、迁移</td><td>可能触发 OOM 或业务中断</td><td>先降载和备份现场，再走变更流程。</td></tr>
+</table>
+<pre><code># 安全采集：限制时长，写入明确文件
+mkdir -p /tmp/perf-capture
+timeout 180s vmstat -w 1 | tee /tmp/perf-capture/vmstat.log
+
+# 不建议在生产排障中随手执行
+# sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+# sudo swapoff -a</code></pre>
+<div class="danger"><strong>安全底线：</strong> <code>vmstat</code> 观察是安全的，但“为了验证猜想而清缓存/关 swap/重启节点”不是安全默认动作。生产上先收证据，再评估影响。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>vmstat(8)</code>，字段定义、采样参数和 <code>procps</code> 版本差异。</li>
+<li>procps-ng 项目文档：<code>vmstat</code>、<code>free</code>、<code>ps</code> 等工具的实现与选项说明。</li>
+<li>sysstat 文档：<code>sar</code>、<code>mpstat</code>、<code>iostat</code>、<code>pidstat</code> 的采样与历史分析。</li>
+<li>Linux 内核文档：procfs、虚拟内存、块层 IO、调度器和 cgroup 资源控制相关说明。</li>
+<li>PyTorch Data Loading 文档：<code>DataLoader</code>、<code>num_workers</code>、prefetch、pinned memory 与多进程数据加载行为。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 <code>r/b</code>、<code>si/so</code>、<code>bi/bo</code>、<code>in/cs</code>、<code>us/sy/id/wa/st</code> 的含义，再练习用 <code>vmstat 1 30</code> 与训练日志、GPU 指标、<code>iostat</code>/<code>pidstat</code> 对齐。</p>
+</section>
+<div class="footer">vmstat 深度教程 · AI Infra 图文版 · 运行队列、内存/swap、IO、系统调度、CPU 时间与训练排障</div>
+</div>
+</body>
+</html>

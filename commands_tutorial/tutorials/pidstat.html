@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>pidstat 深度教程：AI Infra 的进程级 CPU、内存、I/O 与线程排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.metric{font-weight:700;color:#0f766e}.bad{font-weight:700;color:#dc2626}.ok{font-weight:700;color:#16a34a}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>pidstat 深度教程：AI Infra 的进程级 CPU、内存、I/O 与线程排障</h1>
+<p class="sub">这份教程围绕 Linux <code>pidstat</code> 展开，面向训练、推理、数据加载、checkpoint、日志写入和多进程服务排障。它不是参数清单，而是从“按采样窗口读取每个进程/线程的内核计数器差值”这个心智模型出发，讲清楚 <code>-u</code>、<code>-r</code>、<code>-d</code>、<code>-t</code>、<code>-p</code>、<code>-C</code>、采样间隔、进程和线程归因、dataloader 与 checkpoint 瓶颈、sysstat 历史边界、以及与 <code>top</code>、<code>iotop</code>、<code>perf</code>、<code>sar</code> 的配合。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">sysstat</span><span class="chip">per-process</span><span class="chip">CPU</span><span class="chip">Memory</span><span class="chip">I/O</span><span class="chip">Threads</span><span class="chip">dataloader</span><span class="chip">checkpoint</span><span class="chip">训练排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>pidstat</code> 是 sysstat 套件里的进程采样器：它按时间间隔读取进程和线程的 CPU、内存、I/O、上下文切换等计数器，并把“系统压力”归因到具体 PID、命令名或 TID。</div>
+<div class="success"><strong>生产实践：</strong> GPU 利用率下降时，不要只看 <code>top</code> 总览。先用 <code>pidstat -urd -h 1</code> 找出哪个训练进程、dataloader worker、解压进程、日志进程或 checkpoint 写入进程在消耗 CPU、内存或 I/O，再用 <code>-t</code>、<code>iostat</code>、<code>perf</code>、<code>strace</code> 下钻。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">pidstat 是什么</a></li>
+<li><a class="anchor" href="#s2">核心模型：采样窗口、PID 与计数器差值</a></li>
+<li><a class="anchor" href="#s3">安装、版本与权限</a></li>
+<li><a class="anchor" href="#s4">基本语法与第一批命令</a></li>
+<li><a class="anchor" href="#s5">输出字段速读</a></li>
+<li><a class="anchor" href="#s6">CPU 视角：<code>pidstat -u</code></a></li>
+<li><a class="anchor" href="#s7">内存视角：<code>pidstat -r</code></a></li>
+<li><a class="anchor" href="#s8">I/O 视角：<code>pidstat -d</code></a></li>
+<li><a class="anchor" href="#s9">线程视角：<code>pidstat -t</code></a></li>
+<li><a class="anchor" href="#s10">过滤目标：<code>-p</code>、<code>-C</code> 与命令名</a></li>
+<li><a class="anchor" href="#s11">采样策略与证据保存</a></li>
+<li><a class="anchor" href="#s12">AI 训练：dataloader 瓶颈</a></li>
+<li><a class="anchor" href="#s13">AI 训练：checkpoint 与日志写入</a></li>
+<li><a class="anchor" href="#s14">推理服务与多进程服务</a></li>
+<li><a class="anchor" href="#s15">sysstat 历史与 pidstat 的边界</a></li>
+<li><a class="anchor" href="#s16">pidstat vs top/iotop/perf/sar</a></li>
+<li><a class="anchor" href="#s17">容器、cgroup 与 PID 命名空间</a></li>
+<li><a class="anchor" href="#s18">常见故障模式速查</a></li>
+<li><a class="anchor" href="#s19">排障工作流</a></li>
+<li><a class="anchor" href="#s20">练习任务与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. pidstat 是什么</h2>
+<p><code>pidstat</code> 的价值是把全机资源压力映射到进程。<code>mpstat</code> 能告诉你 CPU 是否忙，<code>iostat</code> 能告诉你磁盘是否忙，<code>pidstat</code> 则回答“是谁在忙”。在 AI Infra 场景中，这个“谁”可能是主训练进程、PyTorch DataLoader worker、tokenizer、图片解码进程、checkpoint 保存进程、推理 worker、日志 sidecar 或压缩归档进程。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>按 PID 或线程观察 CPU、内存、I/O、上下文切换、页错误等增量指标，适合低开销持续采样和现场归因。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能直接给出函数级热点、SQL/HTTP 语义、GPU kernel 细节或块设备队列深度。需要和 <code>perf</code>、<code>strace</code>、<code>iostat</code>、GPU 工具组合。</div>
+<div class="card"><strong>它的本质</strong><br>进程级时间序列：在每个采样窗口内，把 CPU 时间、RSS、读写字节、上下文切换等变化归到 PID/TID。</div>
+</div>
+<pre><code># 每 1 秒显示进程 CPU、内存、I/O，横向紧凑输出
+pidstat -urd -h 1
+
+# 对某个训练进程采样 10 次
+pidstat -urd -p 12345 1 10
+
+# 查看所有线程，定位单线程热点
+pidstat -ut -p 12345 1
+
+# 按命令名过滤 Python / torchrun / vllm 相关进程
+pidstat -urd -C 'python|torchrun|vllm' 1</code></pre>
+<div class="warn"><strong>关键边界：</strong> <code>pidstat</code> 是采样工具，不是追踪器。它能告诉你“某 PID 在写很多字节”，但不能直接告诉你“写的是哪个文件”；后者需要 <code>lsof</code>、<code>strace</code>、应用日志或 eBPF 工具。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：pidstat 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="pidstat 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="90" width="205" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="158" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">进程计数器</text><text x="158" y="162" text-anchor="middle" font-size="15">/proc/PID/stat</text><text x="158" y="185" text-anchor="middle" font-size="15">/proc/PID/io</text>
+<rect x="325" y="90" width="205" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="428" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">采样窗口</text><text x="428" y="162" text-anchor="middle" font-size="15">1s / 5s / 60s</text><text x="428" y="185" text-anchor="middle" font-size="15">计算前后差值</text>
+<rect x="595" y="90" width="205" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="698" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">归因维度</text><text x="698" y="162" text-anchor="middle" font-size="15">PID / TID / CMD</text><text x="698" y="185" text-anchor="middle" font-size="15">CPU Mem I/O Ctx</text>
+<rect x="865" y="90" width="180" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="955" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">输出证据</text><text x="955" y="162" text-anchor="middle" font-size="15">表格 / tee</text><text x="955" y="185" text-anchor="middle" font-size="15">时间序列</text>
+<line x1="260" y1="146" x2="325" y2="146" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="530" y1="146" x2="595" y2="146" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="800" y1="146" x2="865" y2="146" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="130" y="330" width="840" height="155" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="370" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">pidstat = 每个 PID/TID 的资源增量 ÷ 采样窗口</text><text x="550" y="410" text-anchor="middle" font-size="16">训练卡顿时，先判断是哪个进程 CPU 高、RSS 增长、读盘慢、写盘多或上下文切换异常</text><text x="550" y="442" text-anchor="middle" font-size="16">再根据进程角色映射到 dataloader、checkpoint、日志、网络、推理 worker 或系统服务</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">pidstat 的核心不是“当前截图”，而是连续采样窗口里的 PID/TID 变化趋势。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与权限</h2>
+<p><code>pidstat</code> 通常由 <code>sysstat</code> 包提供。大多数指标普通用户即可查看自己有权限读取的进程；读取其他用户进程、容器宿主机进程或完整命令行时，可能受 <code>/proc</code> 挂载选项、系统安全策略和容器命名空间限制。</p>
+<table>
+<tr><th>环境</th><th>安装命令</th><th>确认方式</th></tr>
+<tr><td>Ubuntu / Debian</td><td><code>sudo apt-get install sysstat</code></td><td><code>pidstat -V</code></td></tr>
+<tr><td>RHEL / CentOS / Rocky</td><td><code>sudo dnf install sysstat</code> 或 <code>sudo yum install sysstat</code></td><td><code>rpm -q sysstat</code></td></tr>
+<tr><td>SUSE</td><td><code>sudo zypper install sysstat</code></td><td><code>pidstat -V</code></td></tr>
+<tr><td>容器调试镜像</td><td>建议放在 debug 镜像，不强行塞进业务镜像</td><td><code>which pidstat</code></td></tr>
+</table>
+<pre><code># 查看版本和帮助，确认当前发行版支持的选项
+pidstat -V
+pidstat --help 2&gt;&amp;1 | sed -n '1,120p'
+
+# 检查 /proc 是否能读取目标进程
+ls -ld /proc/12345
+test -r /proc/12345/stat &amp;&amp; echo readable</code></pre>
+<div class="note"><strong>版本提醒：</strong> sysstat 不同版本的字段、<code>-h</code>、JSON 输出和帮助文本可能略有差异。生产脚本不要硬编码列号，至少要保存表头，并在目标镜像验证。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 基本语法与第一批命令</h2>
+<pre><code>pidstat [options] [interval [count]]
+
+# interval：采样间隔，单位秒
+# count：采样次数；省略时持续输出
+# -p：指定 PID，ALL 表示所有进程
+# -u/-r/-d/-w/-t：选择 CPU、内存、I/O、上下文切换、线程视角</code></pre>
+<table>
+<tr><th>目标</th><th>命令</th><th>适用场景</th></tr>
+<tr><td>全局巡检</td><td><code>pidstat -urd -h 1</code></td><td>训练或推理异常时先找“谁”在消耗资源。</td></tr>
+<tr><td>指定 PID</td><td><code>pidstat -urd -p 12345 1 30</code></td><td>跟踪一个训练进程或推理 worker。</td></tr>
+<tr><td>所有线程</td><td><code>pidstat -ut -p 12345 1</code></td><td>定位单线程热点、线程池不均衡、GIL 或 C++ worker 异常。</td></tr>
+<tr><td>只看 I/O</td><td><code>pidstat -d -p ALL 1</code></td><td>checkpoint、日志、数据集读取、解压、缓存回填。</td></tr>
+<tr><td>按命令过滤</td><td><code>pidstat -urd -C 'python|java|vllm' 1</code></td><td>多租户节点上只看相关进程。</td></tr>
+</table>
+<div class="warn"><strong>第一条原则：</strong> 不带 <code>interval</code> 的一次性输出通常是自进程启动以来的平均值或瞬时汇总，排障价值有限；现场定位优先使用 <code>1 30</code>、<code>5 60</code> 这类连续采样。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 输出字段速读</h2>
+<p>不同选项会显示不同字段。看 pidstat 时要先确认你正在看的是 CPU、内存、I/O 还是线程级表格，不要把不同表的字段混在一起解释。</p>
+<table>
+<tr><th>字段</th><th>常见来源</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>UID</code></td><td>所有视图</td><td>进程所属用户</td><td>多租户节点上用于区分训练用户、平台服务和 root 进程。</td></tr>
+<tr><td><code>PID</code>/<code>TID</code></td><td>进程/线程视图</td><td>进程 ID / 线程 ID</td><td><code>-t</code> 下看到具体线程，方便映射线程池或 DataLoader worker。</td></tr>
+<tr><td><code>%usr</code>/<code>%system</code></td><td><code>-u</code></td><td>用户态/内核态 CPU 占比</td><td>预处理、tokenizer 多在用户态；文件系统、网络和驱动路径多体现为系统态。</td></tr>
+<tr><td><code>%guest</code>/<code>%wait</code></td><td><code>-u</code></td><td>虚拟化或等待 CPU 相关字段，视版本而定</td><td>云上或 CPU 争用场景需要关注；以本机表头为准。</td></tr>
+<tr><td><code>%CPU</code></td><td><code>-u</code></td><td>进程在采样窗口内消耗的 CPU 百分比</td><td>多核进程可超过 100%，线程视图通常更容易看单核热点。</td></tr>
+<tr><td><code>minflt/s</code>/<code>majflt/s</code></td><td><code>-r</code></td><td>次要/主要页错误速率</td><td><code>majflt/s</code> 高常提示缺页读盘、mmap 数据集或内存压力。</td></tr>
+<tr><td><code>VSZ</code>/<code>RSS</code>/<code>%MEM</code></td><td><code>-r</code></td><td>虚拟内存、常驻内存、内存占比</td><td>看 dataloader 缓存、模型权重、副本、内存泄漏和 OOM 风险。</td></tr>
+<tr><td><code>kB_rd/s</code>/<code>kB_wr/s</code></td><td><code>-d</code></td><td>每秒读写字节</td><td>数据读取、checkpoint、日志、缓存回填的第一归因字段。</td></tr>
+<tr><td><code>kB_ccwr/s</code></td><td><code>-d</code></td><td>被取消的写入速率</td><td>频繁覆盖临时文件或 page cache 写回被取消时可能出现。</td></tr>
+<tr><td><code>cswch/s</code>/<code>nvcswch/s</code></td><td><code>-w</code></td><td>自愿/非自愿上下文切换</td><td>锁竞争、线程过多、调度争用、阻塞 I/O 会改变它们的形态。</td></tr>
+</table>
+<pre><code># 一次采 CPU、内存、I/O 和上下文切换，保存表头
+pidstat -urdw -h 1 10 | tee /tmp/pidstat.$(date +%F-%H%M%S).log</code></pre>
+<div class="note"><strong>读表纪律：</strong> 每次贴证据都保留命令、采样间隔、表头、时间戳、节点名和目标 PID。没有采样窗口的单行截图很难复盘。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. CPU 视角：<code>pidstat -u</code></h2>
+<p><code>-u</code> 用来观察进程 CPU 时间分布。AI 训练中，GPU idle 但 <code>pidstat -u</code> 显示某些 dataloader worker 或 tokenizer CPU 打满，通常说明输入管线跟不上；如果主进程系统态很高，可能是频繁系统调用、I/O、网络或驱动路径。</p>
+<pre><code># 看所有进程 CPU，按持续采样观察趋势
+pidstat -u -p ALL 1
+
+# 看某个训练进程及其线程 CPU
+pidstat -ut -p 12345 1
+
+# 只保留 Python 相关进程
+pidstat -u -C 'python|torchrun' 1 30</code></pre>
+<table>
+<tr><th>现象</th><th>常见解释</th><th>下一步</th></tr>
+<tr><td>单个 PID <code>%CPU</code> 接近 100%</td><td>单线程瓶颈、Python GIL、串行预处理、单 worker 忙</td><td>加 <code>-t</code> 看线程；用 <code>py-spy</code>/<code>perf</code> 看热点。</td></tr>
+<tr><td>多个 dataloader worker 用户态高</td><td>CPU 预处理重、解码/增强重、tokenizer 重</td><td>调 <code>num_workers</code>、缓存、预处理离线化、检查 NUMA 亲和性。</td></tr>
+<tr><td>系统态高</td><td>大量系统调用、文件系统、网络、page cache、驱动路径</td><td>联合 <code>strace -c</code>、<code>iostat</code>、<code>perf top</code>。</td></tr>
+<tr><td>平均 CPU 不高但 GPU 等待</td><td>瓶颈可能是 I/O、锁、RPC、队列或单线程</td><td>看 <code>-d</code>、<code>-w</code>、<code>-t</code> 和应用日志。</td></tr>
+</table>
+<div class="warn"><strong>多核解释：</strong> 进程 <code>%CPU</code> 可能超过 100%，表示它在多个 CPU 上并行消耗时间。不要把 400% 误读为错误；它可能只是 4 个核被充分使用。</div>
+</section>
+
+<section class="figure" id="fig-gpu-flow">
+<h3>核心流程图：从 GPU 低利用到 PID 归因</h3>
+<svg viewBox="0 0 1100 710" width="100%" role="img" aria-label="pidstat GPU低利用排障流程">
+<rect x="20" y="20" width="1060" height="670" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="70" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="88" text-anchor="middle" font-size="23" font-weight="700">GPU 利用率下降</text>
+<polygon points="550,165 730,250 550,335 370,250" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="243" text-anchor="middle" font-size="17" font-weight="700">pidstat 看到谁忙？</text><text x="550" y="270" text-anchor="middle" font-size="14">-u / -r / -d / -w / -t</text>
+<rect x="80" y="220" width="230" height="80" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="195" y="253" text-anchor="middle" font-size="17" font-weight="700">CPU 高</text><text x="195" y="280" text-anchor="middle" font-size="14">预处理 / tokenizer / GIL</text>
+<rect x="790" y="220" width="230" height="80" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="905" y="253" text-anchor="middle" font-size="17" font-weight="700">I/O 高</text><text x="905" y="280" text-anchor="middle" font-size="14">读数据 / checkpoint / 日志</text>
+<rect x="130" y="430" width="230" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="245" y="464" text-anchor="middle" font-size="17" font-weight="700">加 -t 看线程</text><text x="245" y="492" text-anchor="middle" font-size="14">确认单线程还是线程池</text>
+<rect x="435" y="430" width="230" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="464" text-anchor="middle" font-size="17" font-weight="700">看 -r/-w</text><text x="550" y="492" text-anchor="middle" font-size="14">内存缺页 / 调度争用</text>
+<rect x="740" y="430" width="230" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="855" y="464" text-anchor="middle" font-size="17" font-weight="700">联合 iostat</text><text x="855" y="492" text-anchor="middle" font-size="14">设备 await / util / 吞吐</text>
+<rect x="295" y="595" width="510" height="58" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="631" text-anchor="middle" font-size="17" font-weight="700">结论必须落到进程角色：主进程、worker、checkpoint、日志或平台服务</text>
+<line x1="550" y1="115" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="370" y1="250" x2="310" y2="260" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="730" y1="250" x2="790" y2="260" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M195 300 C205 360, 230 390, 245 430" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M550 335 C550 375, 550 400, 550 430" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M905 300 C900 360, 875 395, 855 430" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M245 516 C320 565, 430 585, 500 595" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M550 516 C550 555, 550 575, 550 595" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M855 516 C780 565, 670 585, 600 595" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">GPU 低利用不能直接归因到 CPU 或磁盘；pidstat 的作用是先把压力落到具体 PID/TID。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. 内存视角：<code>pidstat -r</code></h2>
+<p><code>-r</code> 展示页错误、虚拟内存、RSS 和内存占比。AI 任务里，RSS 持续上升可能来自 dataloader 缓存、batch 队列过深、模型副本、token 缓存、内存泄漏或没有释放的 mmap；<code>majflt/s</code> 升高则经常说明进程在等待磁盘把页面调入内存。</p>
+<pre><code># 按进程观察内存、页错误和 RSS
+pidstat -r -p ALL 1
+
+# 观察目标训练进程 5 分钟
+pidstat -r -p 12345 5 60
+
+# 和 free/vmstat 联合判断全机内存压力
+free -h
+vmstat 1 10</code></pre>
+<table>
+<tr><th>指标</th><th>怎么看</th><th>下一步</th></tr>
+<tr><td><code>RSS</code> 持续增长</td><td>常驻内存越来越大</td><td>检查缓存、prefetch、worker 数、对象生命周期和 batch 队列。</td></tr>
+<tr><td><code>majflt/s</code> 升高</td><td>需要从磁盘加载页面</td><td>看 <code>pidstat -d</code>、<code>iostat -xz 1</code>、数据集 mmap 行为。</td></tr>
+<tr><td><code>minflt/s</code> 高但 <code>majflt/s</code> 低</td><td>大量内存映射或匿名页分配，不一定是磁盘瓶颈</td><td>结合 RSS、应用阶段和分配器指标判断。</td></tr>
+<tr><td>多个 worker RSS 相似且高</td><td>每个进程复制了数据或模型状态</td><td>检查 fork/spawn 策略、共享内存、数据缓存和对象复制。</td></tr>
+</table>
+<div class="danger"><strong>OOM 风险：</strong> 看到 RSS 斜率持续上升时，不要等到 OOM Killer 触发才采证。立即保存 <code>pidstat -r</code>、<code>free -h</code>、<code>dmesg -T | tail</code>、应用配置和 batch/prefetch 参数。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. I/O 视角：<code>pidstat -d</code></h2>
+<p><code>-d</code> 是定位“谁在读写磁盘”的入口。它按进程显示读写速率，但不显示具体文件和设备队列。因此它适合先归因到 PID，再用 <code>lsof</code>、<code>strace</code>、<code>iostat</code> 或应用日志确认文件路径和块设备瓶颈。</p>
+<pre><code># 全进程 I/O 采样
+pidstat -d -p ALL 1
+
+# 只看训练相关进程
+pidstat -d -C 'python|torchrun|deepspeed' 1
+
+# 找到高写入 PID 后查看它打开的文件
+lsof -p 12345 | sed -n '1,80p'
+
+# 同时看设备层是否拥塞
+iostat -xz 1</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>验证动作</th></tr>
+<tr><td><code>kB_rd/s</code> 高且 GPU 等待</td><td>在线读取数据集、解压、远端挂载慢、缓存未命中</td><td>看 <code>iostat</code>、数据集路径、page cache、网络存储指标。</td></tr>
+<tr><td><code>kB_wr/s</code> 周期性尖刺</td><td>checkpoint 保存、日志 flush、tensorboard、缓存回填</td><td>对齐训练 step 时间；用 <code>lsof</code> 查写入文件。</td></tr>
+<tr><td>某平台进程 I/O 高</td><td>日志采集、备份、镜像层、监控 sidecar 干扰</td><td>按 UID/CMD 区分业务和平台进程，必要时隔离节点。</td></tr>
+<tr><td>pidstat 写入不高但磁盘忙</td><td>内核写回、其他命名空间、短生命周期进程或设备层拥塞</td><td>提高采样频率，联合 <code>iotop</code>、<code>iostat</code>、eBPF。</td></tr>
+</table>
+<div class="warn"><strong>字段边界：</strong> <code>pidstat -d</code> 的读写字节来自进程 I/O 计数器，可能与块设备真实物理 I/O 不完全相同，因为 page cache、写回合并、压缩、网络文件系统和容器层都会改变路径。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 线程视角：<code>pidstat -t</code></h2>
+<p><code>-t</code> 把进程拆到线程。AI 任务经常表现为“进程平均看不高，但一个线程卡住或打满”：例如 Python 主线程、单个 tokenizer 线程、OpenMP 线程池不均、DataLoader worker 内部单线程解码、推理服务事件循环被阻塞。</p>
+<pre><code># 查看某个进程的线程级 CPU
+pidstat -ut -p 12345 1
+
+# 查看线程级上下文切换
+pidstat -wt -p 12345 1
+
+# 把 TID 映射到线程名
+ps -T -p 12345 -o pid,tid,psr,pcpu,comm,wchan:24</code></pre>
+<table>
+<tr><th>线程现象</th><th>常见解释</th><th>后续工具</th></tr>
+<tr><td>单个 TID 长期接近 100%</td><td>串行热点、GIL、事件循环、单 worker</td><td><code>perf top -p PID</code>、<code>py-spy top --pid PID</code>。</td></tr>
+<tr><td>很多 TID CPU 低但 <code>cswch/s</code> 高</td><td>频繁阻塞、队列等待、锁竞争、I/O 等待</td><td><code>pidstat -w</code>、<code>strace -f -p PID</code>、应用队列指标。</td></tr>
+<tr><td>线程集中在少数 CPU</td><td>亲和性、cgroup cpuset、NUMA 绑定或调度限制</td><td><code>taskset -pc PID</code>、<code>numactl -H</code>、<code>ps -o psr</code>。</td></tr>
+<tr><td>OpenMP/MKL 线程过多</td><td>CPU 过订阅，调度开销大</td><td>检查 <code>OMP_NUM_THREADS</code>、<code>MKL_NUM_THREADS</code>、worker 数。</td></tr>
+</table>
+<div class="success"><strong>线程定位技巧：</strong> 先用 <code>pidstat -ut -p PID 1</code> 找 TID，再用 <code>ps -T</code> 看线程名和 CPU，最后用采样 profiler 看函数热点。不要一上来就跑重型 tracing。</div>
+</section>
+
+<section class="figure" id="fig-resource-dimensions">
+<h3>用例图：进程、线程与资源维度怎么组合</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="pidstat 进程线程资源维度组合">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">同一个 PID，可以从不同资源维度观察</text>
+<rect x="85" y="130" width="230" height="330" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="200" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">-u CPU</text><text x="200" y="220" text-anchor="middle" font-size="15">用户态 / 系统态</text><text x="200" y="252" text-anchor="middle" font-size="15">%CPU / CPU 核</text><text x="200" y="334" text-anchor="middle" font-size="14">谁在算？</text><text x="200" y="360" text-anchor="middle" font-size="14">单线程还是多线程？</text>
+<rect x="335" y="130" width="230" height="330" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="450" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">-r Memory</text><text x="450" y="220" text-anchor="middle" font-size="15">RSS / VSZ</text><text x="450" y="252" text-anchor="middle" font-size="15">minflt / majflt</text><text x="450" y="334" text-anchor="middle" font-size="14">谁在涨内存？</text><text x="450" y="360" text-anchor="middle" font-size="14">是否缺页读盘？</text>
+<rect x="585" y="130" width="230" height="330" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="700" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">-d I/O</text><text x="700" y="220" text-anchor="middle" font-size="15">kB_rd/s</text><text x="700" y="252" text-anchor="middle" font-size="15">kB_wr/s</text><text x="700" y="334" text-anchor="middle" font-size="14">谁在读数据？</text><text x="700" y="360" text-anchor="middle" font-size="14">谁在写 checkpoint？</text>
+<rect x="835" y="130" width="180" height="330" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="925" y="174" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">-t/-w</text><text x="925" y="220" text-anchor="middle" font-size="15">线程</text><text x="925" y="252" text-anchor="middle" font-size="15">上下文切换</text><text x="925" y="334" text-anchor="middle" font-size="14">谁在阻塞？</text><text x="925" y="360" text-anchor="middle" font-size="14">谁在争用？</text>
+<rect x="160" y="520" width="780" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="556" text-anchor="middle" font-size="17">经验：先 -urd 找进程，再 -t/-w 拆线程，最后用专项工具验证根因</text>
+</svg><div class="caption">pidstat 的强项是“同一时间窗口、同一 PID、多个资源维度”的横向对照。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 过滤目标：<code>-p</code>、<code>-C</code> 与命令名</h2>
+<p>生产节点上进程很多，必须先缩小观察目标。<code>-p</code> 精确指定 PID，<code>-p ALL</code> 展示所有进程，<code>-C</code> 按命令名正则匹配。长命令行、参数、容器内外 PID 映射可能影响过滤结果，必要时先用 <code>ps</code> 确认。</p>
+<pre><code># 找到训练相关 PID
+pgrep -af 'torchrun|deepspeed|python.*train'
+
+# 精确观察 PID
+pidstat -urd -p 12345 1 30
+
+# 观察所有进程，但可能输出很多
+pidstat -urd -p ALL 1 5
+
+# 按命令名过滤，适合快速找 Python/vLLM/Ray worker
+pidstat -urd -C 'python|vllm|ray|torchrun' 1</code></pre>
+<div class="grid-2">
+<div class="card"><strong><code>-p PID</code></strong><br>最精确，适合已知目标。训练脚本、推理 worker、日志进程都建议先定位 PID。</div>
+<div class="card"><strong><code>-p ALL</code></strong><br>最全面，但输出噪声大。适合未知现场第一轮扫面。</div>
+<div class="card"><strong><code>-C pattern</code></strong><br>按命令名过滤，适合快速聚焦，但可能漏掉命令名不含关键词的子进程。</div>
+<div class="card"><strong><code>-l</code></strong><br>部分版本支持显示命令行参数。对区分多个训练任务有帮助，但注意敏感参数脱敏。</div>
+</div>
+<div class="warn"><strong>隐私提醒：</strong> <code>-l</code> 或 <code>ps -ef</code> 可能暴露 token、数据路径、租户名和模型名。排障记录外发前要脱敏。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 采样策略与证据保存</h2>
+<p>性能问题往往是时间相关的。采样太短会错过 checkpoint 尖刺，采样太粗会抹平 dataloader 抖动。经验上，交互排障用 1 秒采样，复盘证据用 5 到 10 秒采样并持续覆盖一个完整训练 step 或 checkpoint 周期。</p>
+<table>
+<tr><th>场景</th><th>建议采样</th><th>理由</th></tr>
+<tr><td>现场交互定位</td><td><code>pidstat -urd -h 1</code></td><td>快速看到尖刺和进程切换。</td></tr>
+<tr><td>训练 step 抖动</td><td><code>pidstat -urdw -h 1 300</code></td><td>覆盖多个 step，能和训练日志对齐。</td></tr>
+<tr><td>checkpoint 周期</td><td><code>pidstat -urd -h 5 240</code></td><td>覆盖 20 分钟，避免输出过大。</td></tr>
+<tr><td>低频内存增长</td><td><code>pidstat -r -h 30 120</code></td><td>看 RSS 趋势，不需要秒级。</td></tr>
+<tr><td>归档证据</td><td><code>tee /tmp/pidstat.$(date +%F-%H%M%S).log</code></td><td>保留原始文本和时间线。</td></tr>
+</table>
+<pre><code># 推荐证据包：只写 /tmp，不修改业务文件
+OUT=/tmp/pidstat-case-$(hostname)-$(date +%F-%H%M%S)
+mkdir -p "$OUT"
+pidstat -urdw -h 1 300 | tee "$OUT/pidstat-urdw.txt"
+mpstat -P ALL 1 300 | tee "$OUT/mpstat.txt"
+iostat -xz 1 300 | tee "$OUT/iostat.txt"
+ps -eo pid,ppid,uid,psr,pcpu,pmem,comm,args --sort=-pcpu | head -80 &gt; "$OUT/ps-top.txt"</code></pre>
+<div class="success"><strong>证据对齐：</strong> pidstat 输出必须和训练日志、GPU 利用率、checkpoint 时间、Kubernetes 事件、存储监控处在同一时区和同一时间窗口，否则很容易错配根因。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. AI 训练：dataloader 瓶颈</h2>
+<p>dataloader 瓶颈通常表现为 GPU 周期性等待、step time 抖动、CPU worker 忙或读盘抖动。<code>pidstat</code> 能把这些现象拆成 CPU、I/O、内存和线程几个方向。</p>
+<pre><code># 观察训练进程和 DataLoader worker
+pgrep -af 'python.*train|torchrun|deepspeed'
+pidstat -urdwt -C 'python|torchrun|deepspeed' 1
+
+# 如果 worker 是独立 PID，查看每个 worker 的 I/O 和 RSS
+pidstat -rd -p ALL 1 | grep -E 'python|DataLoader|PID'</code></pre>
+<table>
+<tr><th>pidstat 现象</th><th>dataloader 解释</th><th>优化方向</th></tr>
+<tr><td>worker <code>%usr</code> 高，<code>kB_rd/s</code> 不高</td><td>CPU 预处理、图片解码、tokenization 或数据增强重</td><td>离线预处理、增加/减少 worker、优化 tokenizer、检查 SIMD/库版本。</td></tr>
+<tr><td>worker <code>kB_rd/s</code> 高且 <code>majflt/s</code> 高</td><td>数据集读取或 mmap 缺页导致等待</td><td>本地缓存、预热 page cache、优化 shard、检查网络存储。</td></tr>
+<tr><td>worker RSS 持续增长</td><td>缓存失控、prefetch 过深、对象复制</td><td>调低 <code>prefetch_factor</code>、检查 <code>persistent_workers</code> 和数据缓存。</td></tr>
+<tr><td>线程上下文切换高</td><td>worker 过多、队列/锁竞争、CPU 过订阅</td><td>减少 worker 或线程数，设置 <code>OMP_NUM_THREADS</code>，绑定 NUMA。</td></tr>
+</table>
+<div class="note"><strong>调参不是越大越好：</strong> <code>num_workers</code> 增加可能提升吞吐，也可能引入 CPU 过订阅、内存复制、磁盘随机读放大和上下文切换。用 pidstat 看趋势后再调。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. AI 训练：checkpoint 与日志写入</h2>
+<p>checkpoint 问题通常不是持续高写入，而是周期性尖刺。<code>pidstat -d</code> 可以把写入尖刺归到主训练进程、异步保存线程、日志进程、对象存储客户端或压缩进程。再把尖刺时间与训练 step、GPU 利用率和存储指标对齐，才能判断是否影响训练。</p>
+<pre><code># 采样覆盖完整 checkpoint 周期
+pidstat -d -C 'python|torchrun|deepspeed|wandb|tensorboard' 1 900 | tee /tmp/pidstat-ckpt.log
+
+# 找到高写入 PID 后确认打开文件
+lsof -p 12345 | grep -E 'ckpt|checkpoint|pt|safetensors|log|event'
+
+# 对齐块设备层
+iostat -xz 1 900 | tee /tmp/iostat-ckpt.log</code></pre>
+<div class="grid-2">
+<div class="card"><strong>主进程写入高</strong><br>同步 checkpoint 可能阻塞训练 loop。考虑异步保存、降低保存频率、分片保存或使用更快本地盘。</div>
+<div class="card"><strong>日志进程写入高</strong><br>TensorBoard、wandb、结构化日志或 debug dump 可能放大写入。检查 flush 频率和日志级别。</div>
+<div class="card"><strong>压缩/上传进程 CPU 高</strong><br>checkpoint 后处理可能抢 CPU 或网络。用 <code>pidstat -u</code> 和 <code>sar -n DEV</code> 验证。</div>
+<div class="card"><strong>设备忙但 PID 写入不高</strong><br>可能是内核写回、文件系统 journal、其他容器或存储层拥塞。继续看 <code>iostat</code> 和宿主机视角。</div>
+</div>
+<div class="danger"><strong>不要盲目删除 checkpoint：</strong> 清理旧 checkpoint 属于破坏性操作。排障时只做观察和证据保存；是否删除、移动或改保存策略，应按任务恢复策略和用户要求执行。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 推理服务与多进程服务</h2>
+<p>推理服务常由主进程、worker、tokenizer、HTTP/gRPC 线程、KV cache 管理、日志 sidecar 和监控进程组成。pidstat 适合用来区分“请求慢是业务 worker 忙、tokenizer 忙、I/O 忙，还是平台进程干扰”。</p>
+<pre><code># vLLM / Triton / Python 推理服务巡检
+pidstat -urdwt -C 'vllm|python|triton|uvicorn|gunicorn|ray' 1
+
+# 按 CPU 使用率辅助排序
+ps -eo pid,ppid,psr,pcpu,pmem,comm,args --sort=-pcpu | head -30
+
+# 查看线程在哪些 CPU 上运行
+ps -T -p 12345 -o pid,tid,psr,pcpu,comm,wchan:24 | sort -k4 -nr | head</code></pre>
+<table>
+<tr><th>服务现象</th><th>pidstat 线索</th><th>解释</th></tr>
+<tr><td>P99 延迟升高</td><td>少数 worker <code>%CPU</code> 高</td><td>请求分布不均、单 worker 阻塞、batching 策略不均衡。</td></tr>
+<tr><td>吞吐下降</td><td>tokenizer 进程 CPU 高</td><td>前处理成为瓶颈，GPU 侧并未饱和。</td></tr>
+<tr><td>周期性卡顿</td><td>日志或指标进程 <code>kB_wr/s</code> 尖刺</td><td>同步写日志、指标 flush、采样过细。</td></tr>
+<tr><td>worker RSS 接近限制</td><td><code>RSS</code> 增长或 <code>majflt/s</code> 增加</td><td>KV cache、batch 队列、内存碎片或 cgroup 压力。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>14. sysstat 历史与 pidstat 的边界</h2>
+<p><code>pidstat</code> 属于 sysstat 套件，但这不等于系统默认会长期保存进程级历史。很多发行版启用的 sysstat 历史主要由 <code>sadc</code>/<code>sar</code> 采集系统级 CPU、内存、磁盘、网络等指标；它通常不能在事故后凭空还原某个 PID 在昨晚的 CPU/I/O 时间序列。若需要进程级历史，要在事故前主动采集 pidstat 或接入监控/eBPF/agent。</p>
+<table>
+<tr><th>问题</th><th>答案</th><th>实践建议</th></tr>
+<tr><td>pidstat 能直接读 <code>/var/log/sa/saDD</code> 还原 PID 历史吗？</td><td>通常不能。sar 历史多是系统级，不是完整 PID 历史。</td><td>事故复盘先用 <code>sar</code> 找窗口，再看是否有单独保存的 pidstat 日志。</td></tr>
+<tr><td>sysstat 历史还有价值吗？</td><td>有。它能告诉你事故窗口 CPU、I/O、内存、网络是否异常。</td><td>用 <code>sar -u/-d/-r/-n</code> 定位时间和资源维度，再复现时用 pidstat 归因到进程。</td></tr>
+<tr><td>如何保存进程级历史？</td><td>定时运行 pidstat、业务监控、eBPF agent 或平台可观测性。</td><td>保存表头、采样间隔、节点名和时间戳，控制数据量和隐私。</td></tr>
+</table>
+<pre><code># sar 找系统级事故窗口
+sar -u -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00
+sar -d -p -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00
+
+# 复现期间主动保存进程级证据
+pidstat -urdw -h 1 1800 &gt; /var/log/pidstat-repro.$(date +%F-%H%M%S).log</code></pre>
+<div class="warn"><strong>历史边界：</strong> 如果事故已经过去且没有 pidstat/agent 进程级采样，不能仅凭 sar 精确断言“某个 PID 是根因”。最多能说系统级某维度异常，并列出仍需复现验证的候选进程。</div>
+</section>
+
+<section class="figure" id="fig-tool-compare">
+<h3>对比图：pidstat、top、iotop、perf、sar 怎么选</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="pidstat top iotop perf sar 工具对比">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="27" font-weight="700">同样看性能，入口和粒度不同</text>
+<rect x="70" y="125" width="190" height="360" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="165" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">pidstat</text><text x="165" y="215" text-anchor="middle" font-size="15">进程/线程时间序列</text><text x="165" y="250" text-anchor="middle" font-size="15">CPU / Mem / I/O</text><text x="165" y="340" text-anchor="middle" font-size="14">谁在消耗资源？</text>
+<rect x="280" y="125" width="190" height="360" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="375" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">top</text><text x="375" y="215" text-anchor="middle" font-size="15">交互总览</text><text x="375" y="250" text-anchor="middle" font-size="15">排序和快速观察</text><text x="375" y="340" text-anchor="middle" font-size="14">现在谁排第一？</text>
+<rect x="490" y="125" width="190" height="360" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="585" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">iotop</text><text x="585" y="215" text-anchor="middle" font-size="15">I/O 交互视图</text><text x="585" y="250" text-anchor="middle" font-size="15">读写排序</text><text x="585" y="340" text-anchor="middle" font-size="14">谁在读写磁盘？</text>
+<rect x="700" y="125" width="190" height="360" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="795" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">perf</text><text x="795" y="215" text-anchor="middle" font-size="15">函数/内核热点</text><text x="795" y="250" text-anchor="middle" font-size="15">采样剖析</text><text x="795" y="340" text-anchor="middle" font-size="14">CPU 时间花在哪？</text>
+<rect x="910" y="125" width="140" height="360" rx="20" fill="#fee2e2" stroke="#fca5a5"/><text x="980" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#991b1b">sar</text><text x="980" y="215" text-anchor="middle" font-size="15">系统历史</text><text x="980" y="250" text-anchor="middle" font-size="15">事故窗口</text><text x="980" y="340" text-anchor="middle" font-size="14">何时异常？</text>
+<rect x="160" y="545" width="780" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="581" text-anchor="middle" font-size="17">经验：sar 定时间，pidstat 定进程，perf/strace 定函数或系统调用，iostat 定设备</text>
+</svg><div class="caption">pidstat 是进程级采样入口，不替代交互观察、函数剖析和系统历史。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. pidstat vs top/iotop/perf/sar</h2>
+<table>
+<tr><th>工具</th><th>核心价值</th><th>不适合</th><th>典型命令</th></tr>
+<tr><td><code>pidstat</code></td><td>进程/线程级 CPU、内存、I/O、上下文切换时间序列</td><td>函数级热点、具体文件路径、历史回放</td><td><code>pidstat -urdwt -h 1</code></td></tr>
+<tr><td><code>top</code>/<code>htop</code></td><td>交互式排序和即时观察</td><td>严谨证据保存、细分 I/O 和线程历史</td><td><code>top -H -p PID</code></td></tr>
+<tr><td><code>iotop</code></td><td>交互式 I/O 排名</td><td>无权限环境、长期归档、系统级设备队列解释</td><td><code>sudo iotop -oPa</code></td></tr>
+<tr><td><code>perf</code></td><td>函数级 CPU 热点、内核/用户态采样</td><td>初筛进程、内存 RSS 趋势、I/O 字节归因</td><td><code>perf top -p PID</code></td></tr>
+<tr><td><code>sar</code></td><td>系统级历史和多维指标回放</td><td>事故后精确还原每个进程</td><td><code>sar -u/-d/-r/-n -f saDD</code></td></tr>
+<tr><td><code>iostat</code></td><td>块设备吞吐、await、util、队列</td><td>归因到进程</td><td><code>iostat -xz 1</code></td></tr>
+</table>
+<div class="success"><strong>组合套路：</strong> <code>sar</code> 找历史窗口，<code>mpstat</code> 看 CPU 分布，<code>pidstat</code> 找 PID/TID，<code>iostat</code> 验证设备，<code>perf</code>/<code>strace</code> 解释函数或系统调用。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 容器、cgroup 与 PID 命名空间</h2>
+<p>容器里运行 pidstat 时，看到的 PID、进程集合和资源限制可能与宿主机不同。AI 平台常有 Kubernetes pod、sidecar、runtime shim、GPU operator、日志 agent、存储 CSI 组件；若只在容器内看，很容易漏掉宿主机或同节点其他容器的干扰。</p>
+<pre><code># 容器内查看自己的 PID 命名空间视角
+pidstat -urd -p ALL 1
+cat /proc/1/cgroup
+
+# 宿主机上按容器相关命令粗筛
+ps -eo pid,ppid,uid,pcpu,pmem,comm,args | grep -E 'containerd|python|vllm|kubelet'
+
+# Kubernetes 场景：先从平台命令拿 pod 和容器，再进宿主机确认 PID
+kubectl top pod -A
+kubectl describe pod POD -n NAMESPACE</code></pre>
+<div class="grid-2">
+<div class="card"><strong>PID 映射</strong><br>容器内 PID 123 不一定是宿主机 PID 123。需要通过 runtime、<code>crictl inspect</code>、<code>nsenter</code> 或平台工具映射。</div>
+<div class="card"><strong>CPU 限制</strong><br>进程 <code>%CPU</code> 要结合 cgroup CPU limit/cpuset 解读。容器限 4 核时，400% 可能已经满载。</div>
+<div class="card"><strong>内存限制</strong><br>RSS 接近容器限制比接近宿主机内存更危险。容器 OOM 可能不体现在全机 free 里。</div>
+<div class="card"><strong>I/O 归因</strong><br>容器内进程 I/O 与宿主机块设备 I/O 之间可能隔着 overlayfs、网络盘、CSI 和 page cache。</div>
+</div>
+<div class="warn"><strong>视角声明：</strong> 排障报告里明确写“pidstat 在容器内运行”还是“在宿主机运行”。两个视角输出不一致并不罕见。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 常见故障模式速查</h2>
+<div class="grid-2">
+<div class="card"><strong>GPU 空但 CPU 单进程 100%</strong><br>常见于串行预处理、Python GIL、单 tokenizer、数据增强瓶颈。用 <code>pidstat -ut -p PID 1</code> 拆线程。</div>
+<div class="card"><strong>GPU 周期性掉到 0，写入尖刺</strong><br>常见于同步 checkpoint 或日志 flush。用 <code>pidstat -d</code> 对齐 step 时间。</div>
+<div class="card"><strong>RSS 缓慢上升</strong><br>常见于 dataloader 缓存、prefetch、队列积压、内存泄漏。用 <code>pidstat -r 30</code> 看斜率。</div>
+<div class="card"><strong><code>majflt/s</code> 高</strong><br>常见于 mmap 数据集、内存压力或冷 page cache。联合 <code>iostat</code> 和 <code>vmstat</code>。</div>
+<div class="card"><strong>上下文切换很高</strong><br>常见于线程过多、锁竞争、短任务切换、过度并行。看 <code>pidstat -w -t</code>。</div>
+<div class="card"><strong>pidstat 看不到明显高 PID</strong><br>可能是采样太粗、短生命周期进程、内核线程、宿主机其他容器或设备层瓶颈。提高频率并换宿主机视角。</div>
+<div class="card"><strong>系统态高但用户态不高</strong><br>常见于系统调用、网络栈、文件系统、驱动路径。下一步用 <code>strace -c</code> 或 <code>perf</code>。</div>
+<div class="card"><strong>多 worker 都低但训练慢</strong><br>瓶颈可能在远端服务、队列、GPU 同步、分布式通信或应用锁。结合日志、NCCL、网络指标。</div>
+</div>
+</section>
+
+<section class="figure">
+<h3>排障图：pidstat 结果异常时怎么收敛</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="pidstat 排障与安全流程图">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="400" y="50" width="300" height="72" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="94" text-anchor="middle" font-size="23" font-weight="700">pidstat 看到异常</text>
+<polygon points="550,170 720,255 550,340 380,255" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="247" text-anchor="middle" font-size="17" font-weight="700">异常是否持续可复现？</text><text x="550" y="274" text-anchor="middle" font-size="14">至少覆盖一个业务周期</text>
+<rect x="82" y="215" width="235" height="84" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="200" y="250" text-anchor="middle" font-size="18" font-weight="700">先保存证据</text><text x="200" y="278" text-anchor="middle" font-size="14">延长采样，不急于改配置</text>
+<rect x="785" y="215" width="235" height="84" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="902" y="250" text-anchor="middle" font-size="18" font-weight="700">进入维度验证</text><text x="902" y="278" text-anchor="middle" font-size="14">CPU / Mem / I/O / Thread</text>
+<rect x="95" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="200" y="474" text-anchor="middle" font-size="17" font-weight="700">CPU?</text><text x="200" y="503" text-anchor="middle" font-size="14">-u, -t, perf</text>
+<rect x="335" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="440" y="474" text-anchor="middle" font-size="17" font-weight="700">内存?</text><text x="440" y="503" text-anchor="middle" font-size="14">-r, free, dmesg</text>
+<rect x="575" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="680" y="474" text-anchor="middle" font-size="17" font-weight="700">I/O?</text><text x="680" y="503" text-anchor="middle" font-size="14">-d, iostat, lsof</text>
+<rect x="815" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="920" y="474" text-anchor="middle" font-size="17" font-weight="700">调度?</text><text x="920" y="503" text-anchor="middle" font-size="14">-w, psr, cpuset</text>
+<rect x="235" y="630" width="630" height="58" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="666" text-anchor="middle" font-size="17" font-weight="700" fill="#991b1b">修改参数前先写清证据链：现象、PID、资源维度、业务时间、反证</text>
+<line x1="550" y1="122" x2="550" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="380" y1="255" x2="317" y2="257" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="342" y="239" font-size="14">否</text><line x1="720" y1="255" x2="785" y2="257" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="748" y="239" font-size="14">是</text>
+<path d="M902 299 C810 365, 310 395, 200 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M902 299 C790 370, 545 400, 440 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M902 299 C835 375, 720 402, 680 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M902 299 C918 360, 920 400, 920 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<path d="M200 532 C275 595, 430 618, 490 630" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M440 532 C465 590, 515 610, 535 630" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M680 532 C650 590, 595 612, 575 630" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M920 532 C815 595, 690 618, 610 630" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">pidstat 异常只是起点。可靠结论需要可复现窗口、业务时间对齐、专项工具验证和反证。</div></section>
+
+<section class="section" id="s19">
+<h2>18. 生产排障工作流</h2>
+<p>下面是一套保守、可复盘、低风险的 pidstat 工作流。它只采集和保存证据，不修改业务配置，不杀进程，不清理文件，适合先在事故现场执行。</p>
+<h3>第一步：确认目标和时间</h3>
+<pre><code># 记录节点、时间、负载和目标进程
+date -Is
+hostname -f 2&gt;/dev/null || hostname
+uptime
+pgrep -af 'torchrun|deepspeed|python|vllm|triton'</code></pre>
+<h3>第二步：采集并行证据</h3>
+<pre><code>OUT=/tmp/ai-infra-pidstat-$(hostname)-$(date +%F-%H%M%S)
+mkdir -p "$OUT"
+
+pidstat -urdwt -h 1 300 | tee "$OUT/pidstat.txt" &amp;
+PIDSTAT_PID=$!
+mpstat -P ALL 1 300 | tee "$OUT/mpstat.txt" &amp;
+MPSTAT_PID=$!
+iostat -xz 1 300 | tee "$OUT/iostat.txt" &amp;
+IOSTAT_PID=$!
+
+wait "$PIDSTAT_PID" "$MPSTAT_PID" "$IOSTAT_PID"</code></pre>
+<h3>第三步：形成证据链</h3>
+<table>
+<tr><th>问题</th><th>证据</th><th>不能跳过的反证</th></tr>
+<tr><td>谁消耗 CPU？</td><td><code>pidstat -u/-t</code> 中持续高的 PID/TID</td><td><code>mpstat -P ALL</code> 是否显示 CPU 不均衡或全机饱和。</td></tr>
+<tr><td>谁消耗内存？</td><td><code>pidstat -r</code> 的 RSS 斜率和 <code>majflt/s</code></td><td><code>free</code>、cgroup limit、OOM 日志是否支持。</td></tr>
+<tr><td>谁在读写？</td><td><code>pidstat -d</code> 的读写尖刺</td><td><code>iostat</code> 是否显示设备层拥塞；<code>lsof</code> 是否确认文件。</td></tr>
+<tr><td>是否线程/调度问题？</td><td><code>pidstat -t/-w</code>、<code>ps -T</code></td><td>cpuset、线程数、OpenMP/MKL 环境变量是否一致。</td></tr>
+</table>
+<div class="danger"><strong>安全边界：</strong> 排障命令可以采集证据；杀进程、删数据、改 checkpoint 目录、改 worker 数、调系统参数都属于行为变更。除非任务明确要求，否则先形成证据链再改。</div>
+</section>
+
+<section class="section" id="s20">
+<h2>19. 学习路线与练习任务</h2>
+<h3>第一阶段：会看</h3>
+<ul><li>掌握 <code>pidstat -u 1</code>、<code>pidstat -r 1</code>、<code>pidstat -d 1</code>、<code>pidstat -w 1</code>。</li><li>知道 <code>interval count</code> 是采样窗口，不是简单刷新频率。</li><li>能解释 <code>%usr</code>、<code>%system</code>、<code>RSS</code>、<code>majflt/s</code>、<code>kB_rd/s</code>、<code>kB_wr/s</code>。</li></ul>
+<h3>第二阶段：会归因</h3>
+<ul><li>能用 <code>-p</code>、<code>-C</code> 找目标进程。</li><li>能用 <code>-t</code> 把进程拆到线程。</li><li>能把 pidstat 输出和训练 step、checkpoint、GPU 指标对齐。</li></ul>
+<h3>第三阶段：会联动</h3>
+<ul><li>CPU 根因用 <code>perf</code> 或语言 profiler 下钻。</li><li>I/O 根因用 <code>iostat</code>、<code>lsof</code>、<code>strace</code> 验证。</li><li>历史问题用 <code>sar</code> 定窗口，复现时用 pidstat 定进程。</li></ul>
+<h3>练习</h3>
+<ol><li>启动一个 CPU 密集任务，用 <code>pidstat -u -p PID 1 10</code> 观察。</li><li>复制一个大文件到 <code>/tmp</code>，用 <code>pidstat -d -p ALL 1</code> 找写入进程。</li><li>运行一个 Python 多线程/多进程小程序，用 <code>pidstat -t</code> 对比 PID 和 TID。</li><li>用 <code>pidstat -r</code> 观察一个逐步分配内存的进程 RSS 变化。</li><li>把 <code>pidstat</code>、<code>mpstat</code>、<code>iostat</code> 同时保存 60 秒，并写 5 行以内的结论。</li></ol>
+<pre><code># 练习环境：只使用 /tmp
+mkdir -p /tmp/pidstat-demo
+
+# CPU 练习：启动后台 CPU 消耗进程
+python3 - &lt;&lt;'PY' &amp;
+import time
+end = time.time() + 60
+x = 0
+while time.time() &lt; end:
+    x = (x * 3 + 1) % 1000003
+PY
+DEMO_PID=$!
+pidstat -u -p "$DEMO_PID" 1 5
+wait "$DEMO_PID"
+
+# I/O 练习：写一个临时文件，然后清理
+dd if=/dev/zero of=/tmp/pidstat-demo/blob bs=1M count=256 status=progress
+rm -f /tmp/pidstat-demo/blob</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>sysstat project documentation：<code>pidstat</code>、<code>sar</code>、<code>mpstat</code>、<code>iostat</code>、<code>sadc</code> 的角色和输出含义。</li>
+<li>Linux man-pages：<code>pidstat(1)</code>、<code>proc(5)</code>、<code>top(1)</code>、<code>perf(1)</code>、<code>iostat(1)</code>。</li>
+<li>Linux <code>/proc</code> 文档：<code>/proc/PID/stat</code>、<code>/proc/PID/status</code>、<code>/proc/PID/io</code>、<code>/proc/PID/task</code>。</li>
+<li>AI Infra 排障实践：PyTorch DataLoader 性能、checkpoint 保存策略、page cache 行为、NUMA/CPU 亲和性、容器 cgroup 资源限制。</li>
+<li>性能分析方法：USE 方法、RED 方法、CPU profiling、I/O wait 与设备队列、上下文切换和锁竞争分析。</li>
+</ul><p class="mini">建议阅读顺序：先理解采样窗口和 PID/TID 归因，再掌握 <code>-u/-r/-d/-t/-w</code>，最后把 pidstat 放进 sar、mpstat、iostat、perf、应用日志组成的证据链。</p></section>
+<div class="footer">pidstat 深度教程 · AI Infra 进程级 CPU、内存、I/O、线程采样、dataloader/checkpoint 排障与生产证据链</div>
+</div>
+</body>
+</html>

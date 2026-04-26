@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>/proc/buddyinfo 深度教程：AI Infra 中的 Buddy Allocator、内存碎片与大页排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0%,#e8f7ff 0,#f8fbff 38%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#ffffff 0%,#f7fbff 58%,#eefcf8 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--teal2);color:#0f766e;font-size:13px;font-weight:700;border:1px solid #99f6e4}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#eef2f7;border:1px solid var(--line);font-size:12px;color:#475569}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>/proc/buddyinfo 深度教程：AI Infra 中的 Buddy Allocator、内存碎片与大页排障</h1>
+<p class="sub">这份教程围绕 Linux 伪文件 <code>/proc/buddyinfo</code> 展开。它不是普通“剩余内存”表，而是 buddy allocator 按 NUMA node、zone 和 order 暴露的空闲物理页块分布。通过它可以判断：系统是否还有连续物理内存、2MiB huge page 为什么分配失败、内存碎片是否正在恶化、GPU pinned memory 是否让 compaction 失效，以及应该如何把它和 <code>/proc/meminfo</code>、<code>/proc/vmstat</code>、NUMA 拓扑、THP/hugetlb 指标一起读。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">/proc/buddyinfo</span><span class="chip">Buddy Allocator</span><span class="chip">Orders</span><span class="chip">NUMA Zones</span><span class="chip">Fragmentation</span><span class="chip">Huge Pages</span><span class="chip">Compaction</span><span class="chip">GPU Pinned Memory</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>/proc/buddyinfo</code> 告诉你“每个 NUMA zone 里还有多少个 2<sup>order</sup> 连续页块”；高 order 空了，就算总内存还很多，也可能分不出大页、DMA 连续块或需要高阶页的内核对象。</div>
+<div class="success"><strong>实践原则：</strong> 读取 <code>/proc/buddyinfo</code> 是安全的；但主动 compact、调整 huge page、清 page cache 或重启 GPU/训练任务都可能影响业务。先采样、对齐故障时间线，再做低风险缓解。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">/proc/buddyinfo 是什么</a></li>
+<li><a class="anchor" href="#s2">AI Infra 为什么要看它</a></li>
+<li><a class="anchor" href="#s3">整体心智模型</a></li>
+<li><a class="anchor" href="#s4">读取方式与输出样例</a></li>
+<li><a class="anchor" href="#s5">列解释：Node、zone、order</a></li>
+<li><a class="anchor" href="#s6">Buddy allocator 工作流</a></li>
+<li><a class="anchor" href="#s7">order 与页块大小换算</a></li>
+<li><a class="anchor" href="#s8">如何判断内存碎片</a></li>
+<li><a class="anchor" href="#s9">Huge page 分配失败</a></li>
+<li><a class="anchor" href="#s10">NUMA zones 与本地性</a></li>
+<li><a class="anchor" href="#s11">compaction 与迁移限制</a></li>
+<li><a class="anchor" href="#s12">和 meminfo/vmstat 的关系</a></li>
+<li><a class="anchor" href="#s13">GPU pinned memory 压力</a></li>
+<li><a class="anchor" href="#s14">采样、解析与可视化</a></li>
+<li><a class="anchor" href="#s15">故障排查流程</a></li>
+<li><a class="anchor" href="#s16">生产缓解与安全边界</a></li>
+<li><a class="anchor" href="#s17">容器、Kubernetes 与 Slurm</a></li>
+<li><a class="anchor" href="#s18">速查表、练习与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. /proc/buddyinfo 是什么</h2>
+<p><code>/proc/buddyinfo</code> 是 Linux 内核通过 procfs 暴露的只读伪文件，用来展示 buddy allocator 当前的空闲块数量。buddy allocator 管理物理页框，它把连续页按 2 的幂次组织成不同 order：order 0 是 1 个页，order 1 是 2 个连续页，order 9 在 4KiB 页系统上就是 512 个连续页，也就是 2MiB。</p>
+<div class="grid-3">
+<div class="card"><strong>它能回答</strong><br>每个 NUMA node / zone 还有多少连续物理页块，尤其是高 order 是否枯竭。</div>
+<div class="card"><strong>它不能回答</strong><br>哪个进程直接导致碎片、每页属于谁、未来 compaction 一定能否成功。</div>
+<div class="card"><strong>它的定位</strong><br>不是容量指标，而是连续性指标；它解释“为什么还有空闲内存却分配不到大块”。</div>
+</div>
+<pre><code># 只读查看，安全
+cat /proc/buddyinfo
+
+# 每秒观察高阶块是否下降
+watch -n 1 'cat /proc/buddyinfo'
+
+# 保存排障现场
+ts=$(date +%Y%m%d-%H%M%S)
+cat /proc/buddyinfo &gt; buddyinfo.$ts.txt
+cat /proc/meminfo &gt; meminfo.$ts.txt
+cat /proc/vmstat &gt; vmstat.$ts.txt</code></pre>
+<div class="warn"><strong>关键区别：</strong> <code>free -h</code> 或 <code>MemAvailable</code> 说明“容量还够不够”；<code>/proc/buddyinfo</code> 说明“够不够连续”。AI 节点上这两个问题经常不是同一个答案。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 为什么要看它</h2>
+<p>训练和推理节点通常同时承载大模型权重加载、page cache、dataloader worker、checkpoint、GPU host pinned buffer、RDMA、NCCL、IPC shared memory 和容器调度。总内存看起来还够时，连续物理内存可能已经被长期运行的混合负载切碎，导致 THP 回退、hugetlb 分配失败、DMA 映射压力变大或 compaction 把 CPU 打满。</p>
+<table>
+<tr><th>AI Infra 现象</th><th>buddyinfo 关注点</th><th>常见解释</th></tr>
+<tr><td>2MiB huge page 分配失败</td><td>目标 node/zone 的 order 9 是否接近 0</td><td>高阶连续块不足，或 compaction 无法迁移被 pin / unmovable 页。</td></tr>
+<tr><td>训练跑久后吞吐下降</td><td>高 order 持续下降，compaction 计数上升</td><td>长生命周期对象、pinned memory、page cache 与匿名页混合造成碎片。</td></tr>
+<tr><td>GPU H2D copy 抖动</td><td>Normal zone 高阶块、NUMA 本地 zone 分布</td><td>host buffer 分配跨 NUMA 或触发 direct compaction。</td></tr>
+<tr><td>推理服务 p99 尾延迟尖刺</td><td>分配失败、compact stall 与高阶块恢复情况</td><td>请求路径或后台线程触发内核回收/压缩。</td></tr>
+<tr><td>节点空闲内存多但重启 job 才恢复</td><td>高阶块长期枯竭</td><td>碎片来自不可迁移页，单纯释放 page cache 不一定有效。</td></tr>
+</table>
+<div class="note"><strong>AI Infra 心法：</strong> 当 GPU 利用率低但 CPU、IO、网络都解释不清时，检查内存连续性和 compaction 事件，能发现一类“容量足够但形状不对”的问题。</div>
+</section>
+
+<section class="figure" id="s3">
+<h2>3. 整体心智模型</h2>
+<h3>信息图：从物理页到 /proc/buddyinfo</h3>
+<svg viewBox="0 0 1120 700" width="100%" role="img" aria-label="/proc/buddyinfo 整体模型">
+<rect x="18" y="18" width="1084" height="650" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="560" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">/proc/buddyinfo = NUMA zone 中各 order 空闲连续页块计数</text>
+<rect x="70" y="115" width="270" height="150" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="205" y="154" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">Node 0 / Normal</text>
+<text x="205" y="187" text-anchor="middle" font-size="15">物理页被分组管理</text>
+<text x="205" y="216" text-anchor="middle" font-size="15">order 0,1,2,...</text>
+<text x="205" y="242" text-anchor="middle" font-size="15">每个块必须物理连续</text>
+<rect x="425" y="115" width="270" height="150" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="560" y="154" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">Buddy Lists</text>
+<text x="560" y="187" text-anchor="middle" font-size="15">order 0: 4KiB blocks</text>
+<text x="560" y="216" text-anchor="middle" font-size="15">order 9: 2MiB blocks</text>
+<text x="560" y="242" text-anchor="middle" font-size="15">分裂与合并维护空闲链表</text>
+<rect x="780" y="115" width="270" height="150" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="915" y="154" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">buddyinfo 行</text>
+<text x="915" y="187" text-anchor="middle" font-size="15">Node 0, zone Normal</text>
+<text x="915" y="216" text-anchor="middle" font-size="15">145 80 22 ... 0 0</text>
+<text x="915" y="242" text-anchor="middle" font-size="15">每列是一个 order 的块数</text>
+<line x1="340" y1="190" x2="425" y2="190" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowA)"/>
+<line x1="695" y1="190" x2="780" y2="190" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowA)"/>
+<rect x="95" y="360" width="930" height="150" rx="24" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="560" y="401" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">读法：总量看低阶，连续性看高阶，定位看 node + zone</text>
+<text x="560" y="441" text-anchor="middle" font-size="16">低阶多、高阶少：容量可能还有，但大块连续页不足</text>
+<text x="560" y="472" text-anchor="middle" font-size="16">目标 NUMA node 高阶枯竭：本地 huge page、DMA 或 pinned buffer 更容易失败或变慢</text>
+<rect x="240" y="570" width="640" height="56" rx="14" fill="#ffedd5" stroke="#fdba74"/>
+<text x="560" y="605" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">buddyinfo 是碎片地图，不是进程归因工具</text>
+<defs><marker id="arrowA" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">每一行代表一个 NUMA node 的一个 zone；行尾数字从 order 0 开始，越往右代表越大的连续物理页块。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 读取方式与输出样例</h2>
+<p><code>/proc/buddyinfo</code> 是伪文件，内容由内核实时生成。读取不需要 root，不会修改系统状态。不同机器的 zone 名称和 order 列数可能不同，常见输出如下：</p>
+<pre><code>$ cat /proc/buddyinfo
+Node 0, zone      DMA      1      1      1      0      2      1      1      0      1      1      3
+Node 0, zone    DMA32    870    401    198     78     34     15      7      3      1      0      0
+Node 0, zone   Normal  12543   6420   2201    913    245     71     19      4      1      0      0
+Node 1, zone   Normal   9401   3880   1900    702    180     50     12      3      0      0      0</code></pre>
+<table>
+<tr><th>片段</th><th>含义</th></tr>
+<tr><td><code>Node 0</code></td><td>NUMA 节点编号。多路服务器或多 NUMA 域机器会有多个 Node。</td></tr>
+<tr><td><code>zone Normal</code></td><td>内存 zone。常见有 <code>DMA</code>、<code>DMA32</code>、<code>Normal</code>、<code>Movable</code>，具体取决于架构和内核配置。</td></tr>
+<tr><td>后续数字</td><td>按 order 从 0 到最大 order 排列的空闲块数量。</td></tr>
+</table>
+<pre><code># 给每一列标注 order，便于读样例
+awk '
+/Node/ {
+  printf "%s %s %s ", $1, $2, $3
+  for (i=5; i&lt;=NF; i++) printf "order%-2d=%s ", i-5, $i
+  print ""
+}' /proc/buddyinfo</code></pre>
+<div class="warn"><strong>解析提醒：</strong> 不要假设永远有 11 个 order，也不要假设 zone 名称固定。脚本应从行结构动态解析数字列。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 列解释：Node、zone、order</h2>
+<p>读 <code>/proc/buddyinfo</code> 时要同时看三个维度：NUMA node 决定本地性，zone 决定分配约束，order 决定连续块大小。只看全机总和会掩盖“目标 GPU 所在 node 已碎片化”的问题。</p>
+<table>
+<tr><th>维度</th><th>为什么重要</th><th>AI Infra 示例</th></tr>
+<tr><td>Node</td><td>内存分配通常优先本地 node；跨 node 访问可能更慢。</td><td>GPU0 靠近 Node 0，但 Node 0 order 9 为空，H2D host buffer 或 THP 行为可能不同于 GPU1。</td></tr>
+<tr><td>Zone</td><td>不同 zone 服务不同分配约束；很多普通内核/用户页来自 Normal。</td><td>Normal 高阶块枯竭，比 DMA zone 中还有高阶块更值得关注。</td></tr>
+<tr><td>Order</td><td>order 越高，需要越大的连续物理内存，越容易被碎片影响。</td><td>4KiB 页系统上 order 9 对应 2MiB，是 THP 和 2MiB hugetlb 的关键。</td></tr>
+</table>
+<div class="grid-4">
+<div class="card"><strong>order 0</strong><br>单页分配。数量大说明小块还多，但不代表能分大页。</div>
+<div class="card"><strong>order 1-4</strong><br>小到中等连续块。内核对象、网络和文件系统路径可能使用。</div>
+<div class="card"><strong>order 5-8</strong><br>碎片趋势观察区。持续归零通常说明合并能力下降。</div>
+<div class="card"><strong>order 9+</strong><br>大页与高阶分配关键区。AI 节点上尤其值得采样。</div>
+</div>
+<pre><code># 按 node/zone 汇总 order 9 及以上块数
+awk '
+/Node/ {
+  high=0
+  for (i=14; i&lt;=NF; i++) high += $i
+  printf "%s %s %-8s high_order_blocks=%d\n", $1, $2, $4, high
+}' /proc/buddyinfo</code></pre>
+<div class="note"><strong>定位原则：</strong> 对 GPU 相关问题，先用 <code>nvidia-smi topo -m</code>、<code>lscpu -e</code> 或 <code>numactl --hardware</code> 建立 GPU 到 NUMA node 的映射，再看对应 node 的高阶块。</div>
+</section>
+
+<section class="figure" id="s6">
+<h2>6. Buddy allocator 工作流</h2>
+<h3>流程图：分裂、分配、释放与合并</h3>
+<svg viewBox="0 0 1120 730" width="100%" role="img" aria-label="buddy allocator 分配与合并流程">
+<rect x="18" y="18" width="1084" height="690" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="430" y="48" width="260" height="68" rx="15" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="560" y="90" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">请求 order N 页块</text>
+<polygon points="560,160 730,245 560,330 390,245" fill="#ffedd5" stroke="#fdba74"/>
+<text x="560" y="238" text-anchor="middle" font-size="17" font-weight="700">order N 空闲链表有块？</text>
+<text x="560" y="264" text-anchor="middle" font-size="14">buddy free list</text>
+<rect x="820" y="205" width="210" height="76" rx="14" fill="#dcfce7" stroke="#86efac"/>
+<text x="925" y="249" text-anchor="middle" font-size="18" font-weight="700" fill="#166534">直接返回块</text>
+<rect x="80" y="205" width="230" height="76" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="195" y="238" text-anchor="middle" font-size="17" font-weight="700" fill="#6d28d9">找更高 order</text>
+<text x="195" y="264" text-anchor="middle" font-size="14">N+1, N+2...</text>
+<rect x="80" y="365" width="230" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="195" y="400" text-anchor="middle" font-size="17" font-weight="700" fill="#6d28d9">分裂大块</text>
+<text x="195" y="428" text-anchor="middle" font-size="14">一半返回，一半放回低阶链表</text>
+<rect x="430" y="525" width="260" height="80" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="560" y="558" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">释放时找 buddy</text>
+<text x="560" y="586" text-anchor="middle" font-size="14">相邻且同阶空闲则合并成高阶</text>
+<rect x="795" y="365" width="235" height="88" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="912" y="400" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">找不到可用大块</text>
+<text x="912" y="428" text-anchor="middle" font-size="14">触发回收、compaction 或失败</text>
+<line x1="560" y1="116" x2="560" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/>
+<line x1="730" y1="245" x2="820" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/><text x="765" y="229" font-size="14">有</text>
+<line x1="390" y1="245" x2="310" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/><text x="340" y="229" font-size="14">没有</text>
+<line x1="195" y1="281" x2="195" y2="365" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/>
+<path d="M310 409 C405 430, 466 480, 520 525" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/>
+<path d="M730 330 C795 345, 845 355, 890 365" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/>
+<path d="M690 565 C780 545, 850 495, 905 453" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowB)"/>
+<defs><marker id="arrowB" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">高阶块可以通过释放后合并恢复，也可以通过 compaction 迁移可移动页后创造；被长期 pin 或不可迁移的页会阻断合并。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. order 与页块大小换算</h2>
+<p>buddy allocator 的 order 使用公式：<code>block_size = PAGE_SIZE * 2^order</code>。大多数 x86_64 Linux 使用 4KiB 基础页，因此 order 9 是 2MiB，order 10 是 4MiB。ARM 或特殊内核可能使用 16KiB/64KiB 页，换算必须以实际 <code>getconf PAGE_SIZE</code> 为准。</p>
+<table>
+<tr><th>order</th><th>4KiB 页系统块大小</th><th>典型意义</th></tr>
+<tr><td>0</td><td>4KiB</td><td>普通单页分配。</td></tr>
+<tr><td>1</td><td>8KiB</td><td>两个连续页。</td></tr>
+<tr><td>4</td><td>64KiB</td><td>中等连续块，常用于内核路径。</td></tr>
+<tr><td>8</td><td>1MiB</td><td>接近大页规模，碎片敏感。</td></tr>
+<tr><td>9</td><td>2MiB</td><td>x86_64 THP/2MiB hugetlb 关键 order。</td></tr>
+<tr><td>10</td><td>4MiB</td><td>默认 MAX_ORDER=11 时常见最大 buddy 块。</td></tr>
+</table>
+<pre><code># 查看基础页大小
+getconf PAGE_SIZE
+
+# 打印当前系统每个 order 对应大小
+pagesize=$(getconf PAGE_SIZE)
+awk -v ps="$pagesize" 'BEGIN {
+  for (o=0; o&lt;=10; o++) {
+    bytes = ps * (2 ^ o)
+    if (bytes &gt;= 1048576) printf "order %-2d = %.0f MiB\n", o, bytes/1048576
+    else printf "order %-2d = %.0f KiB\n", o, bytes/1024
+  }
+}'</code></pre>
+<div class="warn"><strong>大页提醒：</strong> 1GiB huge page 通常属于 gigantic page 路径，不是简单看默认 buddyinfo 最右列就能判断。2MiB huge page 才通常对应 4KiB 页系统上的 order 9。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 如何判断内存碎片</h2>
+<p>碎片判断不是看低阶块数量，而是看高阶块是否长期缺失、是否集中在非目标 node/zone、是否伴随 compaction stall 或 THP fallback。一个典型碎片化状态是：order 0 到 order 3 很多，order 8 到 order 10 接近 0，系统还有不少 <code>MemAvailable</code>，但大页分配失败。</p>
+<div class="grid-2">
+<div class="card"><strong>健康倾向</strong><br>各 node 的 Normal zone 中高阶块仍有余量，短期分配后能通过释放/compaction 恢复。</div>
+<div class="card"><strong>碎片倾向</strong><br>低阶块很多，高阶块长期为 0；compaction 扫描多但成功少；THP fault fallback 增长。</div>
+<div class="card"><strong>局部碎片</strong><br>全机看起来还行，但靠近目标 GPU 的 node 高阶块枯竭。</div>
+<div class="card"><strong>不可迁移碎片</strong><br>pinned pages、内核不可迁移页、长期 mlock、RDMA 注册内存让 compaction 难以合并。</div>
+</div>
+<pre><code># 快速看每行低阶和高阶块分布
+awk '
+/Node/ {
+  low=0; high=0
+  for (i=5; i&lt;=8 &amp;&amp; i&lt;=NF; i++) low += $i
+  for (i=13; i&lt;=NF; i++) high += $i
+  printf "%s %s %-8s low_order=%8d high_order=%6d\n", $1, $2, $4, low, high
+}' /proc/buddyinfo
+
+# 看 compaction 和 THP 相关 vmstat 计数
+grep -E 'compact|thp|allocstall|pgscan|pgsteal' /proc/vmstat</code></pre>
+<div class="note"><strong>趋势比快照重要：</strong> 单次 buddyinfo 只能说明当前状态。排障要采样故障前后，看高阶块是否在某个训练阶段、模型加载、checkpoint 或 GPU buffer 注册后明显下降。</div>
+</section>
+
+<section class="figure">
+<h3>对比图：容量足够但 2MiB 连续块不足</h3>
+<svg viewBox="0 0 1120 680" width="100%" role="img" aria-label="huge page 分配失败与内存碎片对比">
+<rect x="18" y="18" width="1084" height="635" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">为什么 MemAvailable 很高，2MiB huge page 仍可能失败？</text>
+<rect x="70" y="120" width="450" height="360" rx="22" fill="#f0fdf4" stroke="#86efac"/>
+<text x="295" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#166534">可合并：连续空闲页</text>
+<g fill="#bbf7d0" stroke="#16a34a">
+<rect x="115" y="210" width="52" height="52" rx="8"/><rect x="173" y="210" width="52" height="52" rx="8"/><rect x="231" y="210" width="52" height="52" rx="8"/><rect x="289" y="210" width="52" height="52" rx="8"/><rect x="347" y="210" width="52" height="52" rx="8"/><rect x="405" y="210" width="52" height="52" rx="8"/>
+<rect x="115" y="268" width="52" height="52" rx="8"/><rect x="173" y="268" width="52" height="52" rx="8"/><rect x="231" y="268" width="52" height="52" rx="8"/><rect x="289" y="268" width="52" height="52" rx="8"/><rect x="347" y="268" width="52" height="52" rx="8"/><rect x="405" y="268" width="52" height="52" rx="8"/>
+</g>
+<text x="295" y="380" text-anchor="middle" font-size="16">buddy 可以合并成高阶块</text>
+<text x="295" y="410" text-anchor="middle" font-size="16">order 9 有余量：THP/hugetlb 更容易成功</text>
+<rect x="600" y="120" width="450" height="360" rx="22" fill="#fef2f2" stroke="#fca5a5"/>
+<text x="825" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">碎片化：空闲页被占用页打断</text>
+<g stroke="#dc2626">
+<rect x="645" y="210" width="52" height="52" rx="8" fill="#fecaca"/><rect x="703" y="210" width="52" height="52" rx="8" fill="#e5e7eb"/><rect x="761" y="210" width="52" height="52" rx="8" fill="#fecaca"/><rect x="819" y="210" width="52" height="52" rx="8" fill="#e5e7eb"/><rect x="877" y="210" width="52" height="52" rx="8" fill="#fecaca"/><rect x="935" y="210" width="52" height="52" rx="8" fill="#e5e7eb"/>
+<rect x="645" y="268" width="52" height="52" rx="8" fill="#e5e7eb"/><rect x="703" y="268" width="52" height="52" rx="8" fill="#fecaca"/><rect x="761" y="268" width="52" height="52" rx="8" fill="#e5e7eb"/><rect x="819" y="268" width="52" height="52" rx="8" fill="#fecaca"/><rect x="877" y="268" width="52" height="52" rx="8" fill="#e5e7eb"/><rect x="935" y="268" width="52" height="52" rx="8" fill="#fecaca"/>
+</g>
+<text x="825" y="380" text-anchor="middle" font-size="16">空闲页总量不低，但缺少连续块</text>
+<text x="825" y="410" text-anchor="middle" font-size="16">order 9 为 0：2MiB 分配可能 fallback 或失败</text>
+<rect x="250" y="540" width="620" height="54" rx="14" fill="#ffedd5" stroke="#fdba74"/>
+<text x="560" y="574" text-anchor="middle" font-size="17" font-weight="700" fill="#c2410c">Huge page 需要连续物理页；普通 4KiB 页只需要零散页也能工作</text>
+</svg>
+<div class="caption">buddyinfo 适合解释“为什么还有内存但没有合适形状的内存”。对 4KiB 页系统，2MiB huge page 通常要关注 order 9。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Huge page 分配失败</h2>
+<p>AI 运行时可能使用 Transparent Huge Pages、显式 hugetlbfs、JVM/数据库式大页、共享内存或某些 DMA/驱动路径。2MiB huge page 分配失败时，常见表现是性能下降、fallback 计数增加，或者预留 hugetlb 页面时失败。</p>
+<table>
+<tr><th>机制</th><th>关注指标</th><th>说明</th></tr>
+<tr><td>Transparent Huge Pages</td><td><code>/sys/kernel/mm/transparent_hugepage/enabled</code>、<code>/proc/vmstat</code> 中 <code>thp_fault_fallback</code></td><td>THP 失败通常回退到 4KiB 页，应用不一定报错，但 TLB miss 和 CPU 开销可能上升。</td></tr>
+<tr><td>2MiB hugetlb</td><td><code>/proc/meminfo</code> 中 <code>HugePages_*</code>、order 9 块</td><td>运行时动态增加 hugepages 需要连续内存，碎片化后更容易失败。</td></tr>
+<tr><td>1GiB huge page</td><td>启动参数、专用 hugepage 配置</td><td>常需要更早预留，不能只靠 buddyinfo 末列判断。</td></tr>
+</table>
+<pre><code># 查看 THP 配置与统计
+cat /sys/kernel/mm/transparent_hugepage/enabled
+grep -E 'thp_fault_alloc|thp_fault_fallback|thp_collapse_alloc|thp_collapse_alloc_failed' /proc/vmstat
+
+# 查看 hugetlb 状态
+grep -E 'Huge|AnonHugePages|ShmemHugePages' /proc/meminfo
+
+# 动态申请 hugepages 前先 dry-run 采样，不要直接改生产节点
+cat /proc/buddyinfo
+grep -E 'HugePages_Total|HugePages_Free|HugePages_Rsvd|Hugepagesize' /proc/meminfo</code></pre>
+<div class="danger"><strong>安全警告：</strong> 不要在繁忙生产节点上直接大幅增加 <code>vm.nr_hugepages</code>。这可能触发 compaction、回收和延迟尖刺，也可能失败。先在维护窗口或隔离节点验证。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. NUMA zones 与本地性</h2>
+<p>多 NUMA 节点服务器上，buddyinfo 的每个 node 都要单独读。全机高阶块足够，不代表目标 GPU 附近的 node 足够。训练进程若绑定在 Node 0 CPU 且 GPU 也靠近 Node 0，但内存策略把大量页分配到 Node 1，可能引入远端内存访问和 PCIe copy 抖动。</p>
+<pre><code># 查看 NUMA 拓扑
+numactl --hardware
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+
+# 查看 GPU 与 CPU/NUMA 的拓扑关系
+nvidia-smi topo -m 2&gt;/dev/null || true
+rocm-smi --showtoponuma 2&gt;/dev/null || true
+
+# 观察每个 node 的 buddyinfo
+cat /proc/buddyinfo</code></pre>
+<table>
+<tr><th>zone</th><th>典型含义</th><th>排障侧重点</th></tr>
+<tr><td><code>DMA</code></td><td>传统低地址 DMA 区，现代大内存服务器通常很小。</td><td>除非驱动或老设备路径需要，一般不是 AI 应用主关注区。</td></tr>
+<tr><td><code>DMA32</code></td><td>32 位 DMA 可访问区域，x86_64 上常见。</td><td>某些设备约束可能相关，但容量有限。</td></tr>
+<tr><td><code>Normal</code></td><td>常规内核和用户页主要来源。</td><td>AI 节点碎片、大页、pinned memory 的核心观察区。</td></tr>
+<tr><td><code>Movable</code></td><td>主要放可迁移页，便于内存热插拔或隔离。</td><td>有助于 compaction，但并非所有机器都有。</td></tr>
+</table>
+<div class="note"><strong>NUMA 原则：</strong> 排查 GPU0 的 host memory 问题时，优先看 GPU0 本地 node 的 Normal zone 高阶块，而不是所有 node 加总。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. compaction 与迁移限制</h2>
+<p>内存 compaction 会把可移动页迁走，试图把零散空闲页合并成高阶连续块。它能缓解碎片，但不是魔法：被 mlock、GUP pin、RDMA 注册、GPU pinned、内核不可迁移对象占用的页，可能无法移动。此时 compaction 扫描很多页但成功率低，高阶块仍恢复不了。</p>
+<table>
+<tr><th>指标</th><th>来源</th><th>如何读</th></tr>
+<tr><td><code>compact_stall</code></td><td><code>/proc/vmstat</code></td><td>分配路径因 compaction 阻塞的次数，增长可能对应延迟尖刺。</td></tr>
+<tr><td><code>compact_success</code>/<code>compact_fail</code></td><td><code>/proc/vmstat</code></td><td>成功/失败趋势。失败持续增长说明碎片或不可迁移页严重。</td></tr>
+<tr><td><code>compact_migrate_scanned</code></td><td><code>/proc/vmstat</code></td><td>扫描可迁移页的工作量，增长快会消耗 CPU。</td></tr>
+<tr><td><code>compact_free_scanned</code></td><td><code>/proc/vmstat</code></td><td>扫描空闲页的工作量。</td></tr>
+</table>
+<pre><code># 对比 compaction 前后计数
+grep '^compact' /proc/vmstat &gt; compact.before
+sleep 60
+grep '^compact' /proc/vmstat &gt; compact.after
+diff -u compact.before compact.after || true
+
+# 手动触发 compaction 前先记录状态；生产节点慎用
+cat /proc/buddyinfo &gt; buddy.before
+grep '^compact' /proc/vmstat &gt; compact.before
+# 维护窗口内才考虑：
+# echo 1 | sudo tee /proc/sys/vm/compact_memory
+cat /proc/buddyinfo &gt; buddy.after</code></pre>
+<div class="danger"><strong>生产警告：</strong> <code>echo 1 &gt; /proc/sys/vm/compact_memory</code> 可能造成 CPU 开销和延迟抖动。它适合诊断或维护窗口，不适合作为高频 cron “修复器”。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 和 meminfo/vmstat 的关系</h2>
+<p><code>/proc/buddyinfo</code> 只告诉你空闲块分布。要解释原因和影响，必须关联 <code>/proc/meminfo</code> 的容量、大页和 slab 信息，以及 <code>/proc/vmstat</code> 的分配、回收、THP、compaction 计数。</p>
+<table>
+<tr><th>文件</th><th>看什么</th><th>用途</th></tr>
+<tr><td><code>/proc/buddyinfo</code></td><td>按 node/zone/order 的空闲块数量</td><td>判断连续物理内存形状。</td></tr>
+<tr><td><code>/proc/meminfo</code></td><td><code>MemAvailable</code>、<code>HugePages_*</code>、<code>AnonHugePages</code>、<code>SReclaimable</code>、<code>Unevictable</code></td><td>判断容量、大页使用、slab、不可回收/不可迁移压力。</td></tr>
+<tr><td><code>/proc/vmstat</code></td><td><code>compact*</code>、<code>thp*</code>、<code>allocstall*</code>、<code>pgscan*</code></td><td>判断是否发生 compaction、THP fallback、内存回收。</td></tr>
+<tr><td><code>vmstat 1</code></td><td><code>si/so</code>、<code>free/cache</code>、<code>wa</code>、<code>r/b</code></td><td>看系统级压力和时间趋势。</td></tr>
+</table>
+<pre><code># 一次性采集内存碎片相关现场
+out="memfrag.$(hostname).$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+cat /proc/buddyinfo &gt; "$out/buddyinfo.txt"
+cat /proc/meminfo &gt; "$out/meminfo.txt"
+cat /proc/vmstat &gt; "$out/vmstat.txt"
+numactl --hardware &gt; "$out/numactl-hardware.txt" 2&gt;&amp;1 || true
+vmstat -w 1 10 &gt; "$out/vmstat-sample.txt"</code></pre>
+<div class="success"><strong>组合读法：</strong> <code>MemAvailable</code> 高 + order 9 为 0 + <code>thp_fault_fallback</code> 增长，指向连续大块不足；<code>compact_fail</code> 增长则说明内核尝试过但没有成功制造足够连续块。</div>
+</section>
+
+<section class="figure">
+<h3>路径图：Pinned pages 如何阻断合并</h3>
+<svg viewBox="0 0 1120 700" width="100%" role="img" aria-label="GPU pinned memory 与内存碎片">
+<rect x="18" y="18" width="1084" height="650" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="560" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">GPU pinned memory：提升传输效率，也可能制造不可迁移碎片</text>
+<rect x="70" y="120" width="245" height="115" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="192" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">训练进程</text>
+<text x="192" y="190" text-anchor="middle" font-size="15">DataLoader / runtime</text>
+<text x="192" y="214" text-anchor="middle" font-size="15">申请 host buffer</text>
+<rect x="430" y="120" width="260" height="115" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="560" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">Pin / register pages</text>
+<text x="560" y="190" text-anchor="middle" font-size="15">cudaHostAlloc / mlock</text>
+<text x="560" y="214" text-anchor="middle" font-size="15">RDMA / GUP pin</text>
+<rect x="805" y="120" width="245" height="115" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="927" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">GPU / NIC DMA</text>
+<text x="927" y="190" text-anchor="middle" font-size="15">更快 host-to-device</text>
+<text x="927" y="214" text-anchor="middle" font-size="15">更低拷贝开销</text>
+<line x1="315" y1="177" x2="430" y2="177" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowC)"/>
+<line x1="690" y1="177" x2="805" y2="177" stroke="#94a3b8" stroke-width="4" marker-end="url(#arrowC)"/>
+<rect x="105" y="335" width="910" height="150" rx="22" fill="#fff7ed" stroke="#fdba74"/>
+<text x="560" y="374" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">副作用：被 pin 的页不能随意迁移</text>
+<text x="560" y="414" text-anchor="middle" font-size="16">compaction 需要移动页来合成高阶块；长期 pin 的页像钉子一样打断连续空间</text>
+<text x="560" y="446" text-anchor="middle" font-size="16">结果可能是 order 9/10 下降、compact_fail 上升、THP fallback 增长、分配路径延迟变大</text>
+<rect x="180" y="555" width="760" height="54" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="560" y="589" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">Pinned memory 不是坏事；问题通常来自过量、长期、跨 NUMA 或泄漏式 pin</text>
+<defs><marker id="arrowC" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">AI 节点上，pinned memory 是性能优化手段，也可能成为碎片和 compaction 失败的重要来源。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. GPU pinned memory 压力</h2>
+<p>PyTorch <code>pin_memory=True</code>、CUDA pinned allocation、NCCL/RDMA、GPUDirect RDMA、数据加载共享内存和用户态驱动注册页，都可能让部分页变得难以迁移。少量短生命周期 pinned buffer 通常没问题；过量、长期、跨 NUMA 或泄漏式 pinned memory 才会让高阶块恢复困难。</p>
+<table>
+<tr><th>线索</th><th>可能含义</th><th>验证方向</th></tr>
+<tr><td><code>Unevictable</code> 或 <code>Mlocked</code> 偏高</td><td>有大量不可回收/锁定页。</td><td><code>grep -E 'Unevictable|Mlocked' /proc/meminfo</code>。</td></tr>
+<tr><td>某 job 启动后 order 9 快速下降</td><td>模型加载、pinned buffer 池或通信库注册内存改变了空闲块形状。</td><td>对齐 job 时间线，采样 buddyinfo。</td></tr>
+<tr><td>compaction 扫描多但失败多</td><td>可移动页不足或被不可迁移页阻断。</td><td><code>grep '^compact' /proc/vmstat</code> 前后 diff。</td></tr>
+<tr><td>只在某几张 GPU 上复现</td><td>NUMA 本地 node 碎片化或 CPU/GPU 拓扑不匹配。</td><td><code>nvidia-smi topo -m</code> + per-node buddyinfo。</td></tr>
+</table>
+<pre><code># PyTorch 场景：先降低 pin 与 worker 做对照实验
+# 原配置可能是 pin_memory=True, num_workers=16, prefetch_factor=4
+# 对照：pin_memory=False 或 num_workers 减半，观察 buddyinfo 和吞吐变化
+
+# 采集不可迁移/锁定内存线索
+grep -E 'Unevictable|Mlocked|AnonHugePages|HugePages' /proc/meminfo
+
+# 按进程看锁定内存字段 VmLck
+grep -H '^VmLck:' /proc/[0-9]*/status 2&gt;/dev/null | sort -k2 -nr | head</code></pre>
+<div class="warn"><strong>实验原则：</strong> 不要直接把 <code>pin_memory</code> 永久关掉作为结论。它可能降低 H2D 传输效率。正确做法是缩小 worker、prefetch、batch、buffer 池大小，并验证吞吐、p99 和碎片趋势。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 采样、解析与可视化</h2>
+<p>buddyinfo 最有价值的用法是按时间采样，和 job 生命周期、GPU 利用率、THP fallback、compaction 计数对齐。下面的脚本只读采样，不改变系统状态，适合作为工单附件或节点健康巡检的一部分。</p>
+<pre><code># 每 5 秒采样一次，持续 10 分钟
+mkdir -p buddy-samples
+for i in $(seq 1 120); do
+  ts=$(date +%s)
+  cat /proc/buddyinfo &gt; "buddy-samples/buddyinfo.$ts"
+  grep -E 'compact|thp|allocstall' /proc/vmstat &gt; "buddy-samples/vmstat.$ts"
+  sleep 5
+done
+
+# 把 buddyinfo 转成 CSV：timestamp,node,zone,order,count
+for f in buddy-samples/buddyinfo.*; do
+  ts=${f##*.}
+  awk -v ts="$ts" '
+  /Node/ {
+    node=$2; gsub(",", "", node)
+    zone=$4
+    for (i=5; i&lt;=NF; i++) {
+      printf "%s,%s,%s,%d,%s\n", ts, node, zone, i-5, $i
+    }
+  }' "$f"
+done &gt; buddyinfo.csv</code></pre>
+<table>
+<tr><th>采样字段</th><th>用途</th></tr>
+<tr><td><code>node,zone,order,count</code></td><td>画每个 node 的高阶块趋势。</td></tr>
+<tr><td><code>compact_success/fail/stall</code></td><td>判断是否用 compaction 试图恢复高阶块。</td></tr>
+<tr><td><code>thp_fault_fallback</code></td><td>判断 THP 是否回退。</td></tr>
+<tr><td>GPU 利用率/H2D copy/p99</td><td>把内存形状变化和业务症状对齐。</td></tr>
+</table>
+<div class="success"><strong>巡检建议：</strong> 记录每个 node 的 order 9+ 块数、compaction fail/success 比例、THP fallback 增量，比只保存一张 <code>free -h</code> 截图有用得多。</div>
+</section>
+
+<section class="figure">
+<h3>安全流程图：从症状到缓解</h3>
+<svg viewBox="0 0 1120 760" width="100%" role="img" aria-label="/proc/buddyinfo 排障流程">
+<rect x="18" y="18" width="1084" height="720" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="430" y="45" width="260" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="560" y="86" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">出现大页/延迟/吞吐问题</text>
+<rect x="80" y="165" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="195" y="201" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">采集只读现场</text>
+<text x="195" y="228" text-anchor="middle" font-size="14">buddyinfo/meminfo/vmstat</text>
+<rect x="445" y="165" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="560" y="201" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">定位 node/zone</text>
+<text x="560" y="228" text-anchor="middle" font-size="14">GPU/CPU/NUMA 拓扑</text>
+<rect x="810" y="165" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="925" y="201" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">看高阶趋势</text>
+<text x="925" y="228" text-anchor="middle" font-size="14">order 8/9/10 是否归零</text>
+<rect x="80" y="340" width="230" height="95" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="195" y="376" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">关联 THP/hugetlb</text>
+<text x="195" y="404" text-anchor="middle" font-size="14">fallback / HugePages</text>
+<rect x="445" y="340" width="230" height="95" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="560" y="376" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">关联 compaction</text>
+<text x="560" y="404" text-anchor="middle" font-size="14">stall / success / fail</text>
+<rect x="810" y="340" width="230" height="95" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="925" y="376" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">关联 pinned memory</text>
+<text x="925" y="404" text-anchor="middle" font-size="14">VmLck / Unevictable / job 配置</text>
+<rect x="190" y="535" width="315" height="92" rx="15" fill="#f0fdf4" stroke="#86efac"/>
+<text x="347" y="570" text-anchor="middle" font-size="18" font-weight="700" fill="#166534">低风险缓解</text>
+<text x="347" y="598" text-anchor="middle" font-size="14">调 worker/pin/batch/NUMA 绑定</text>
+<rect x="615" y="535" width="315" height="92" rx="15" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="772" y="570" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">高风险操作</text>
+<text x="772" y="598" text-anchor="middle" font-size="14">compact/drop cache/restart/调 hugepages</text>
+<line x1="560" y1="111" x2="195" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="111" x2="560" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="111" x2="925" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="195" y1="255" x2="195" y2="340" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="255" x2="560" y2="340" stroke="#94a3b8" stroke-width="3"/>
+<line x1="925" y1="255" x2="925" y2="340" stroke="#94a3b8" stroke-width="3"/>
+<path d="M195 435 C240 485, 290 510, 347 535" fill="none" stroke="#94a3b8" stroke-width="3"/>
+<path d="M560 435 C520 485, 445 510, 382 535" fill="none" stroke="#94a3b8" stroke-width="3"/>
+<path d="M925 435 C880 485, 825 510, 772 535" fill="none" stroke="#94a3b8" stroke-width="3"/>
+<rect x="270" y="675" width="580" height="42" rx="12" fill="#fff7ed" stroke="#fdba74"/>
+<text x="560" y="702" text-anchor="middle" font-size="15" font-weight="700" fill="#c2410c">先证明碎片与业务症状相关，再执行会影响线上延迟的操作</text>
+</svg>
+<div class="caption">排障顺序要从只读证据开始，避免把 compaction、drop caches 或 hugepage 调整当成无成本操作。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 故障排查流程</h2>
+<p>下面是一套适合 AI 节点的排障模板。目标是先确认“是否真的是连续内存问题”，再判断“影响哪个 NUMA node / zone”，最后选择低风险缓解。</p>
+<ol>
+<li>确认症状：THP fallback、hugetlb 申请失败、训练吞吐下降、p99 尖刺、GPU copy 抖动。</li>
+<li>采集只读现场：<code>/proc/buddyinfo</code>、<code>/proc/meminfo</code>、<code>/proc/vmstat</code>、NUMA/GPU 拓扑。</li>
+<li>看目标 node/zone：不要只看全机总量。</li>
+<li>对齐时间线：模型加载、dataloader 启动、checkpoint、通信库初始化、容器迁移。</li>
+<li>判断是否伴随 compaction/THP fallback：看 vmstat 计数增量。</li>
+<li>先做低风险对照实验：降低 worker、pin buffer、prefetch、batch，或调整 NUMA 绑定。</li>
+<li>维护窗口内再考虑主动 compaction、重启 job、重新预留 hugepages 或节点 drain。</li>
+</ol>
+<pre><code># 1. 快速确认高阶块
+cat /proc/buddyinfo
+
+# 2. 关联 THP/compaction
+grep -E 'thp|compact|allocstall' /proc/vmstat
+
+# 3. 关联大页和不可迁移线索
+grep -E 'Huge|Unevictable|Mlocked|Slab|SReclaimable|SUnreclaim' /proc/meminfo
+
+# 4. 关联 NUMA/GPU 拓扑
+numactl --hardware
+nvidia-smi topo -m 2&gt;/dev/null || true</code></pre>
+<div class="success"><strong>判断标准：</strong> 如果目标 node 的 order 9 长期为 0，同时 <code>thp_fault_fallback</code> 或 <code>compact_fail</code> 在故障窗口增长，才有较强证据说明大页/碎片参与了问题。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 生产缓解与安全边界</h2>
+<p>内存碎片问题的缓解分为三类：减少碎片来源、改善分配位置、在合适时机恢复高阶块。优先选择低风险策略；高风险操作必须在维护窗口或可回滚条件下执行。</p>
+<table>
+<tr><th>动作</th><th>风险</th><th>适用场景</th></tr>
+<tr><td>降低 dataloader <code>num_workers</code>、<code>prefetch_factor</code>、pinned buffer 池</td><td>低到中</td><td>pinned memory 过量、worker 过多导致碎片或内存压力。</td></tr>
+<tr><td>绑定 CPU/内存到 GPU 本地 NUMA node</td><td>中</td><td>跨 NUMA 分配导致 copy 抖动或本地 node 压力不均。</td></tr>
+<tr><td>提前预留 hugepages</td><td>中</td><td>服务明确依赖 hugetlb，且启动期有足够连续内存。</td></tr>
+<tr><td>手动触发 compaction</td><td>中到高</td><td>诊断或维护窗口尝试恢复高阶块。</td></tr>
+<tr><td>drop caches</td><td>中到高</td><td>只影响 page cache，不保证解决碎片，还会让后续 IO 变冷。</td></tr>
+<tr><td>重启 job / drain 节点 / 重启节点</td><td>高</td><td>长期不可迁移碎片无法在线恢复，业务允许迁移。</td></tr>
+</table>
+<pre><code># 安全：只读检查
+cat /proc/buddyinfo
+grep -E 'compact|thp' /proc/vmstat
+
+# 谨慎：维护窗口内才考虑手动 compaction
+cat /proc/buddyinfo &gt; before.buddyinfo
+# echo 1 | sudo tee /proc/sys/vm/compact_memory
+cat /proc/buddyinfo &gt; after.buddyinfo
+diff -u before.buddyinfo after.buddyinfo || true
+
+# 高风险：drop caches 不是碎片万能药，且会影响 IO 性能
+# sync
+# echo 3 | sudo tee /proc/sys/vm/drop_caches</code></pre>
+<div class="danger"><strong>不要这样做：</strong> 不要用 cron 高频执行 compact 或 drop caches；不要在没有业务对照的情况下关闭 THP、关闭 pinned memory 或重启节点；不要把全机 buddyinfo 总和当作 NUMA 本地健康度。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 容器、Kubernetes 与 Slurm</h2>
+<p>容器内读取 <code>/proc/buddyinfo</code> 时要小心视角问题。procfs 可能来自宿主机，容器的 cgroup 限制又只允许使用部分 CPU/内存；因此容器内看到的 buddyinfo 不一定等于该容器可分配的连续内存。HPC/Slurm 或 Kubernetes 节点上，最好同时采集作业分配的 CPU/NUMA/GPU 信息。</p>
+<table>
+<tr><th>环境</th><th>注意点</th><th>建议</th></tr>
+<tr><td>Docker/Containerd</td><td>容器可能没有 <code>numactl</code>，procfs 视角可能偏宿主。</td><td>在宿主机或 privileged debug pod 中采集。</td></tr>
+<tr><td>Kubernetes</td><td>CPU Manager、Topology Manager、hugepages resource 会影响 NUMA 本地性。</td><td>看 Pod spec、QoS、资源限制、节点拓扑策略。</td></tr>
+<tr><td>Slurm</td><td><code>--mem-bind</code>、<code>--cpu-bind</code>、GPU 绑定策略影响分配位置。</td><td>保存 <code>scontrol show job</code>、<code>numactl --show</code>、拓扑信息。</td></tr>
+<tr><td>多租户 AI 节点</td><td>其他 job 的 pinned memory 或 page cache 会影响同一 node。</td><td>按节点采样，结合调度系统时间线定位邻居干扰。</td></tr>
+</table>
+<pre><code># 容器内确认 cgroup 与 CPU 集合
+cat /proc/self/status | grep -E 'Cpus_allowed_list|Mems_allowed_list'
+cat /proc/self/cgroup
+
+# Kubernetes hugepages 资源示例排查
+kubectl describe node "$NODE" | grep -A5 -i huge
+kubectl describe pod "$POD" | grep -A20 -i resources
+
+# Slurm 作业中记录绑定策略
+numactl --show
+env | grep -E 'SLURM|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES' | sort</code></pre>
+<div class="warn"><strong>视角提醒：</strong> 如果容器内 buddyinfo 和宿主机采样不一致，优先以宿主机节点级采样为准，再结合 cgroup/调度器解释容器可见资源。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 速查表、练习与参考资料</h2>
+<h3>速查表</h3>
+<table>
+<tr><th>你看到的现象</th><th>优先检查</th><th>可能结论</th></tr>
+<tr><td><code>MemAvailable</code> 高，但 hugepage 失败</td><td>目标 node/zone 的 order 9</td><td>连续 2MiB 块不足。</td></tr>
+<tr><td>order 0 很多，order 9/10 为 0</td><td><code>compact_fail</code>、<code>thp_fault_fallback</code></td><td>碎片化，容量不是主要矛盾。</td></tr>
+<tr><td>某 GPU 相关任务更慢</td><td>GPU-NUMA 映射 + per-node buddyinfo</td><td>本地 node 压力或碎片不均。</td></tr>
+<tr><td>compaction 后高阶块仍不恢复</td><td><code>Unevictable</code>、<code>VmLck</code>、pinned buffer 配置</td><td>不可迁移页可能阻断合并。</td></tr>
+<tr><td>训练启动后高阶块骤降</td><td>模型加载、DataLoader、NCCL/RDMA 初始化阶段</td><td>大块分配、pinned memory 或 page cache 改变空闲块形状。</td></tr>
+</table>
+<h3>练习任务</h3>
+<ol>
+<li>在一台 Linux 机器上运行 <code>cat /proc/buddyinfo</code>，标注每一列对应的 order。</li>
+<li>用 <code>getconf PAGE_SIZE</code> 计算 order 9 在当前系统上的大小。</li>
+<li>写脚本每 5 秒采样一次 order 9+ 块数，并观察一个训练 job 启动前后的变化。</li>
+<li>把 <code>/proc/buddyinfo</code>、<code>/proc/meminfo</code>、<code>/proc/vmstat</code> 放在一起解释一次 THP fallback 增长。</li>
+<li>用 <code>numactl --hardware</code> 和 GPU 拓扑命令判断目标 GPU 的本地 NUMA node。</li>
+</ol>
+<pre><code># 小练习：输出每个 node/zone 的 order9 块数和约等价 2MiB 容量
+awk '
+/Node/ {
+  node=$2; gsub(",", "", node)
+  zone=$4
+  order9 = (NF &gt;= 14 ? $14 : 0)
+  printf "node=%s zone=%s order9_blocks=%d approx_2MiB_capacity=%dMiB\n",
+    node, zone, order9, order9 * 2
+}' /proc/buddyinfo</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux kernel documentation：procfs 中 <code>/proc/buddyinfo</code>、<code>/proc/meminfo</code>、<code>/proc/vmstat</code> 的含义。</li>
+<li>Linux kernel documentation：physical memory、zones、page allocation、compaction、Transparent Huge Pages 与 hugetlb。</li>
+<li>man-pages：<code>proc(5)</code>、<code>numactl(8)</code>、<code>getconf(1)</code>。</li>
+<li>内核源码阅读入口：<code>mm/page_alloc.c</code>、<code>mm/compaction.c</code>、<code>mm/huge_memory.c</code>。</li>
+<li>AI Infra 排障延伸：NUMA 亲和性、GPU topology、DataLoader pinned memory、RDMA/GDRDMA 注册内存、THP 策略与 hugetlb 预留。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 order 换算和 buddy 分裂/合并模型，再学习 NUMA zone、本地性、compaction，最后把它和 THP、hugetlb、GPU pinned memory 的真实故障案例关联起来。</p>
+</section>
+<div class="footer">/proc/buddyinfo 深度教程 · AI Infra 内存碎片、大页、NUMA、compaction 与 GPU pinned memory 排障</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>journalctl 深度教程：从 systemd 日志模型到生产排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>journalctl 深度教程：从 systemd 日志模型到生产排障</h1>
+<p class="sub">这份教程系统讲解 <code>journalctl</code>：它不是传统文本日志查看器，而是 systemd journal 的结构化查询入口。你将学会 journal 的存储与字段模型、按 unit/进程/字段过滤、时间窗口、优先级、实时跟随、按启动轮次查看、JSON 输出、磁盘占用与安全清理、与 <code>tail</code>/<code>grep</code> 的边界，以及服务启动失败、日志缺失、权限不足、磁盘爆满等真实排障路径。</p>
+<div class="chips"><span class="chip">systemd journal</span><span class="chip">结构化字段</span><span class="chip">unit 过滤</span><span class="chip">时间窗口</span><span class="chip">优先级</span><span class="chip">实时跟随</span><span class="chip">启动轮次</span><span class="chip">JSON 输出</span><span class="chip">磁盘清理</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>journalctl</code> 是“带索引的系统日志查询器”：日志不是只按行存在文件里，而是带有 <code>_SYSTEMD_UNIT</code>、<code>_PID</code>、<code>PRIORITY</code>、<code>_BOOT_ID</code>、时间戳等字段的 journal entry。</div>
+<div class="success"><strong>安全原则：</strong> 查询命令默认只读；但 <code>--vacuum-*</code> 会删除已归档 journal 文件。清理前先运行 <code>journalctl --disk-usage</code> 和 <code>journalctl --list-boots</code>，确认你不会删掉仍需排障的历史启动日志。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">journalctl 是什么</a></li><li><a class="anchor" href="#s2">systemd journal 模型</a></li><li><a class="anchor" href="#s3">快速上手与输出控制</a></li><li><a class="anchor" href="#s4">权限、系统日志与用户日志</a></li><li><a class="anchor" href="#s5">字段匹配与过滤语义</a></li><li><a class="anchor" href="#s6">按 unit 和服务排查</a></li><li><a class="anchor" href="#s7">时间过滤</a></li><li><a class="anchor" href="#s8">优先级与严重程度</a></li><li><a class="anchor" href="#s9">实时跟随与最近日志</a></li><li><a class="anchor" href="#s10">按启动轮次查看</a></li><li><a class="anchor" href="#s11">内核、进程、用户与字段查询</a></li><li><a class="anchor" href="#s12">输出格式与 JSON</a></li><li><a class="anchor" href="#s13">光标、分页与自动化脚本</a></li><li><a class="anchor" href="#s14">磁盘占用、持久化与 vacuum</a></li><li><a class="anchor" href="#s15">journalctl vs tail/grep</a></li><li><a class="anchor" href="#s16">常见排障场景</a></li><li><a class="anchor" href="#s17">安全清理与运维清单</a></li><li><a class="anchor" href="#s18">练习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. journalctl 是什么</h2>
+<p><code>journalctl</code> 用来读取 <code>systemd-journald</code> 收集的日志。它可以显示内核、系统服务、用户服务、stdout/stderr、syslog 兼容消息以及其他写入 journal 的结构化日志。</p>
+<div class="grid-3"><div class="card"><strong>它擅长什么</strong><br>按服务、启动轮次、时间、优先级、进程、用户、字段快速定位日志，并保留比纯文本更多的上下文。</div><div class="card"><strong>它不只是 tail</strong><br><code>tail -f /var/log/app.log</code> 只跟一个文本文件；<code>journalctl -fu nginx.service</code> 按 systemd unit 跟随日志，自动合并该 unit 相关来源。</div><div class="card"><strong>它的本质</strong><br>查询 journal entry：每条日志包含消息正文和元数据字段，<code>journalctl</code> 根据字段索引筛选、排序、格式化输出。</div></div>
+<pre><code># 查看当前用户可见的全部 journal，从最早记录开始
+journalctl
+
+# 查看当前启动以来的错误及更严重日志
+journalctl -b -p err
+
+# 查看某个服务最近 100 行并实时跟随
+journalctl -u nginx.service -n 100 -f
+
+# 查看今天的 SSH 服务日志
+journalctl -u ssh.service --since today</code></pre>
+<div class="warn"><strong>环境前提：</strong> <code>journalctl</code> 主要存在于使用 systemd 的 Linux 发行版。macOS、传统 SysV init 系统或容器最小镜像中可能没有完整 journal。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. systemd journal 模型</h2>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="systemd journal 整体模型">
+<rect x="18" y="18" width="1064" height="650" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#1f2937">日志不是普通文本行，而是带字段的 journal entry</text>
+<rect x="50" y="118" width="210" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="155" y="156" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">日志来源</text><text x="155" y="188" text-anchor="middle" font-size="14">systemd unit</text><text x="155" y="211" text-anchor="middle" font-size="14">kernel / syslog / stdout</text>
+<rect x="325" y="118" width="230" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="440" y="156" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">systemd-journald</text><text x="440" y="188" text-anchor="middle" font-size="14">接收、补充元数据</text><text x="440" y="211" text-anchor="middle" font-size="14">写入 journal 文件</text>
+<rect x="625" y="118" width="220" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="735" y="156" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">journal files</text><text x="735" y="188" text-anchor="middle" font-size="14">/run/log/journal</text><text x="735" y="211" text-anchor="middle" font-size="14">/var/log/journal</text>
+<rect x="895" y="118" width="155" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="972" y="156" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">journalctl</text><text x="972" y="188" text-anchor="middle" font-size="14">查询</text><text x="972" y="211" text-anchor="middle" font-size="14">过滤 / 格式化</text>
+<line x1="260" y1="173" x2="325" y2="173" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="555" y1="173" x2="625" y2="173" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="845" y1="173" x2="895" y2="173" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="105" y="330" width="890" height="230" rx="22" fill="#fff" stroke="#cbd5e1"/>
+<text x="550" y="368" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">一条 journal entry 的典型字段</text>
+<text x="170" y="417" font-size="15" font-family="ui-monospace" fill="#1e293b">MESSAGE=Started nginx.service</text>
+<text x="170" y="451" font-size="15" font-family="ui-monospace" fill="#1e293b">_SYSTEMD_UNIT=nginx.service</text>
+<text x="170" y="485" font-size="15" font-family="ui-monospace" fill="#1e293b">PRIORITY=6</text>
+<text x="170" y="519" font-size="15" font-family="ui-monospace" fill="#1e293b">_PID=1234</text>
+<text x="585" y="417" font-size="15" font-family="ui-monospace" fill="#1e293b">_BOOT_ID=...</text>
+<text x="585" y="451" font-size="15" font-family="ui-monospace" fill="#1e293b">__REALTIME_TIMESTAMP=...</text>
+<text x="585" y="485" font-size="15" font-family="ui-monospace" fill="#1e293b">_HOSTNAME=server01</text>
+<text x="585" y="519" font-size="15" font-family="ui-monospace" fill="#1e293b">SYSLOG_IDENTIFIER=nginx</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">核心心智模型：<code>journalctl</code> 不是在某个日志文件里 grep，而是在结构化 journal 中查询字段。</div></section>
+
+<section class="section" id="s3">
+<h2>3. 快速上手与输出控制</h2>
+<p>默认运行 <code>journalctl</code> 会显示调用用户可见的日志，并通常交给分页器查看。实际排障时更常用“限定范围”的查询：限定启动轮次、unit、时间、优先级和行数。</p>
+<table><tr><th>命令</th><th>作用</th><th>常见场景</th></tr><tr><td><code>journalctl -b</code></td><td>当前启动以来的日志</td><td>排查本次启动问题</td></tr><tr><td><code>journalctl -n 50</code></td><td>最后 50 条</td><td>快速查看最近事件</td></tr><tr><td><code>journalctl -r</code></td><td>倒序显示，最新在前</td><td>从最近错误开始看</td></tr><tr><td><code>journalctl --no-pager</code></td><td>不进入分页器</td><td>脚本、复制输出、CI 日志</td></tr><tr><td><code>journalctl -o short-iso</code></td><td>ISO 风格时间</td><td>跨时区协作时减少歧义</td></tr></table>
+<pre><code># 当前启动以来的最近 80 条日志
+journalctl -b -n 80
+
+# 最新日志在前，并禁用分页器
+journalctl -r -n 40 --no-pager
+
+# 显示精确时间，便于和监控告警对齐
+journalctl -b -o short-iso
+
+# 显示 UTC 时间，适合跨地域排障
+journalctl -b --utc -o short-iso</code></pre>
+<div class="note"><strong>实用习惯：</strong> 排障不要先裸跑 <code>journalctl</code> 翻海量日志；先问“哪个服务、哪个时间、哪个启动轮次、什么严重程度”。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 权限、系统日志与用户日志</h2>
+<p>journal 的可见范围受权限控制。普通用户通常只能看自己的用户服务和部分系统日志；查看完整系统日志通常需要 <code>root</code>、<code>sudo</code>，或加入发行版配置的日志读取组。</p>
+<table><tr><th>命令</th><th>含义</th><th>注意点</th></tr><tr><td><code>journalctl --system</code></td><td>查看系统服务和内核日志</td><td>可能需要权限</td></tr><tr><td><code>journalctl --user</code></td><td>查看当前用户的 user manager 日志</td><td>依赖用户 journal 可用</td></tr><tr><td><code>sudo journalctl</code></td><td>以管理员权限查看</td><td>生产环境注意审计和最小权限</td></tr><tr><td><code>groups</code></td><td>查看当前用户组</td><td>某些发行版使用 <code>adm</code> 或 <code>systemd-journal</code> 组授权</td></tr></table>
+<pre><code># 查看自己能看到的范围
+journalctl -n 20
+
+# 查看系统日志，权限不足时再使用 sudo
+journalctl --system -n 20
+sudo journalctl --system -n 20
+
+# 查看当前用户的 systemd 用户服务日志
+journalctl --user -n 50
+journalctl --user -u pipewire.service -n 50</code></pre>
+<div class="warn"><strong>权限现象：</strong> “没有日志”不一定代表服务没写日志，可能只是当前用户看不到。先对比 <code>journalctl -n 5</code> 与 <code>sudo journalctl -n 5</code> 的结果范围。</div>
+</section>
+
+<section class="figure" id="fig-filters">
+<h3>流程图：journalctl 如何叠加过滤条件</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="journalctl 过滤条件流程图">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="48" width="260" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">全部可见 journal</text>
+<rect x="95" y="176" width="210" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="200" y="212" text-anchor="middle" font-size="18" font-weight="700">启动轮次</text><text x="200" y="240" text-anchor="middle" font-size="14">-b / --boot</text>
+<rect x="325" y="176" width="210" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="212" text-anchor="middle" font-size="18" font-weight="700">unit / 字段</text><text x="430" y="240" text-anchor="middle" font-size="14">-u / FIELD=VALUE</text>
+<rect x="565" y="176" width="210" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="212" text-anchor="middle" font-size="18" font-weight="700">时间窗口</text><text x="670" y="240" text-anchor="middle" font-size="14">--since / --until</text>
+<rect x="795" y="176" width="210" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="900" y="212" text-anchor="middle" font-size="18" font-weight="700">优先级</text><text x="900" y="240" text-anchor="middle" font-size="14">-p warning..emerg</text>
+<rect x="160" y="372" width="780" height="125" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="414" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">结果集不断变小：先限定粗范围，再定位具体事件</text><text x="550" y="452" text-anchor="middle" font-size="15">journalctl -b -u nginx.service --since "10 min ago" -p warning</text>
+<rect x="350" y="575" width="400" height="70" rx="15" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="617" text-anchor="middle" font-size="19" font-weight="700">再选择输出格式：短文本 / verbose / JSON</text>
+<line x1="550" y1="116" x2="200" y2="176" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="116" x2="430" y2="176" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="116" x2="670" y2="176" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="116" x2="900" y2="176" stroke="#94a3b8" stroke-width="3"/><line x1="200" y1="266" x2="350" y2="372" stroke="#94a3b8" stroke-width="3"/><line x1="430" y1="266" x2="480" y2="372" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="266" x2="620" y2="372" stroke="#94a3b8" stroke-width="3"/><line x1="900" y1="266" x2="750" y2="372" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="497" x2="550" y2="575" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">过滤思路：启动轮次和时间先缩小范围，unit/字段定位来源，优先级突出异常，最后再决定输出格式。</div></section>
+
+<section class="section" id="s5">
+<h2>5. 字段匹配与过滤语义</h2>
+<p>journal entry 是字段集合。<code>journalctl FIELD=VALUE</code> 可以直接按字段匹配，例如 <code>_PID=1234</code>、<code>_SYSTEMD_UNIT=nginx.service</code>、<code>SYSLOG_IDENTIFIER=sshd</code>。</p>
+<table><tr><th>字段</th><th>含义</th><th>示例</th></tr><tr><td><code>MESSAGE</code></td><td>人类可读的日志正文</td><td><code>MESSAGE=Started OpenSSH server daemon</code></td></tr><tr><td><code>_SYSTEMD_UNIT</code></td><td>systemd 系统 unit</td><td><code>_SYSTEMD_UNIT=nginx.service</code></td></tr><tr><td><code>_SYSTEMD_USER_UNIT</code></td><td>用户级 systemd unit</td><td><code>_SYSTEMD_USER_UNIT=pipewire.service</code></td></tr><tr><td><code>PRIORITY</code></td><td>syslog 严重等级数字</td><td><code>PRIORITY=3</code></td></tr><tr><td><code>_PID</code>/<code>_UID</code></td><td>进程 ID / 用户 ID</td><td><code>_PID=1234</code></td></tr><tr><td><code>_COMM</code>/<code>_EXE</code></td><td>进程名 / 可执行文件路径</td><td><code>_COMM=sshd</code></td></tr><tr><td><code>_BOOT_ID</code></td><td>启动轮次 ID</td><td>通常由 <code>-b</code> 间接使用</td></tr></table>
+<h3>AND 与 OR 语义</h3>
+<p>不同字段的多个匹配通常是 AND；同一个字段的多个匹配通常是 OR。这个规则非常重要。</p>
+<pre><code># unit 是 nginx.service 且优先级字段为 3
+journalctl _SYSTEMD_UNIT=nginx.service PRIORITY=3
+
+# 同一字段多个值：匹配 nginx.service 或 php-fpm.service
+journalctl _SYSTEMD_UNIT=nginx.service _SYSTEMD_UNIT=php-fpm.service
+
+# 查看当前 journal 中出现过哪些字段名
+journalctl -N
+
+# 查看某字段出现过的值，例如有哪些 systemd unit
+journalctl -F _SYSTEMD_UNIT</code></pre>
+<div class="note"><strong>字段查询建议：</strong> 不确定字段名时先用 <code>journalctl -o verbose -n 1</code> 看一条完整 entry，再用 <code>-N</code> 和 <code>-F FIELD</code> 探索可用字段。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 按 unit 和服务排查</h2>
+<p>服务排障时，<code>-u</code>/<code>--unit</code> 是最常用入口。它按 systemd unit 过滤，比 grep 服务名更可靠，因为它使用 journal 元数据，而不是文本包含关系。</p>
+<table><tr><th>命令</th><th>含义</th></tr><tr><td><code>journalctl -u nginx.service</code></td><td>查看 nginx systemd unit 日志</td></tr><tr><td><code>journalctl -u nginx</code></td><td>很多系统会补全为 <code>nginx.service</code>，脚本中建议写完整 unit</td></tr><tr><td><code>journalctl -u nginx.service -b</code></td><td>只看当前启动以来该服务日志</td></tr><tr><td><code>journalctl -u nginx.service -u php-fpm.service</code></td><td>同时看多个相关服务</td></tr><tr><td><code>journalctl --user -u pipewire.service</code></td><td>查看用户级 unit 日志</td></tr></table>
+<pre><code># 服务启动失败：先看状态，再看该 unit 当前启动日志
+systemctl status nginx.service
+journalctl -b -u nginx.service --no-pager
+
+# 只看最近一次尝试附近的日志
+journalctl -u nginx.service --since "15 min ago" -o short-iso
+
+# 多服务联排：反向代理与后端一起看
+journalctl -b -u nginx.service -u php-fpm.service -p notice
+
+# 如果服务模板带实例名，完整写出实例
+journalctl -u 'getty@tty1.service' -b</code></pre>
+<div class="success"><strong>排障顺序：</strong> 对 systemd 服务，优先 <code>systemctl status unit</code> 看状态摘要，再 <code>journalctl -u unit -b</code> 看完整日志。不要先去猜日志文件路径。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 时间过滤</h2>
+<p><code>--since</code>/<code>--until</code> 用来限定时间窗口。它们支持具体时间，也支持相对表达式。生产排障通常从告警时间点向前后扩展窗口。</p>
+<table><tr><th>写法</th><th>含义</th><th>示例</th></tr><tr><td><code>--since today</code></td><td>今天零点以来</td><td><code>journalctl --since today</code></td></tr><tr><td><code>--since yesterday</code></td><td>昨天零点以来</td><td><code>journalctl --since yesterday -p err</code></td></tr><tr><td><code>--since "2026-04-25 09:00"</code></td><td>指定本地时间</td><td><code>journalctl -S "2026-04-25 09:00"</code></td></tr><tr><td><code>--since "30 min ago"</code></td><td>最近 30 分钟</td><td><code>journalctl -S "30 min ago"</code></td></tr><tr><td><code>--until "2026-04-25 10:00"</code></td><td>结束时间</td><td><code>journalctl -S "09:00" -U "10:00"</code></td></tr></table>
+<pre><code># 告警发生在 14:03，先看前后 10 分钟
+journalctl --since "2026-04-25 13:53" --until "2026-04-25 14:13" -o short-iso
+
+# 当前启动中最近 20 分钟的 nginx warning 以上日志
+journalctl -b -u nginx.service --since "20 min ago" -p warning
+
+# 今天所有认证相关日志
+journalctl --since today SYSLOG_IDENTIFIER=sshd
+
+# 使用短选项：-S 等价于 --since，-U 等价于 --until
+journalctl -S "1 hour ago" -U now</code></pre>
+<div class="warn"><strong>时间注意：</strong> 默认按本地时区解释和显示时间。多人跨时区协作时，建议统一使用 <code>--utc -o short-iso</code> 或在记录中明确时区。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 优先级与严重程度</h2>
+<p>journal 兼容 syslog 优先级，数字越小越严重。<code>-p</code> 可以按严重级别过滤，常用于从海量正常日志中突出异常。</p>
+<table><tr><th>数字</th><th>名称</th><th>含义</th><th>常用程度</th></tr><tr><td>0</td><td><code>emerg</code></td><td>系统不可用</td><td>极少但最高优先级</td></tr><tr><td>1</td><td><code>alert</code></td><td>必须立即处理</td><td>严重告警</td></tr><tr><td>2</td><td><code>crit</code></td><td>严重条件</td><td>关键服务失败</td></tr><tr><td>3</td><td><code>err</code></td><td>错误</td><td>最常用异常入口</td></tr><tr><td>4</td><td><code>warning</code></td><td>警告</td><td>排查隐患</td></tr><tr><td>5</td><td><code>notice</code></td><td>重要但正常</td><td>服务状态变化</td></tr><tr><td>6</td><td><code>info</code></td><td>普通信息</td><td>默认常见日志</td></tr><tr><td>7</td><td><code>debug</code></td><td>调试信息</td><td>通常很吵</td></tr></table>
+<pre><code># 当前启动以来所有错误及更严重日志
+journalctl -b -p err
+
+# warning 到 emerg，即 0..4
+journalctl -b -p warning
+
+# 只看 nginx 的错误
+journalctl -b -u nginx.service -p err
+
+# 指定范围：info 到 warning 这种写法用于排除 debug
+journalctl -p info..warning</code></pre>
+<div class="note"><strong>解释细节：</strong> <code>-p err</code> 通常表示显示 <code>err</code> 及更严重级别，而不是只显示数字 3。需要精确字段匹配时可用 <code>PRIORITY=3</code>。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 实时跟随与最近日志</h2>
+<p><code>-f</code>/<code>--follow</code> 类似 <code>tail -f</code>，但它跟随的是 journal 查询结果。配合 <code>-u</code>、<code>-p</code>、<code>--since</code> 可以把实时流限制在需要的范围。</p>
+<pre><code># 跟随某服务，先显示最近 50 条
+journalctl -u nginx.service -n 50 -f
+
+# 只跟随当前启动以来该服务 warning 以上日志
+journalctl -b -u nginx.service -p warning -f
+
+# 跟随所有系统日志，适合刚复现问题时观察
+sudo journalctl -f
+
+# 不想先刷历史，只看新日志
+journalctl -u nginx.service -n 0 -f</code></pre>
+<div class="grid-3"><div class="card"><strong><code>-n</code></strong><br>先显示最近 N 条，默认值通常足够但生产中建议显式写出。</div><div class="card"><strong><code>-f</code></strong><br>持续等待新 entry；用 <span class="kbd">Ctrl</span> + <span class="kbd">C</span> 退出。</div><div class="card"><strong><code>--no-tail</code></strong><br>和 <code>-f</code> 配合时可从查询开头显示，而不是只显示尾部。</div></div>
+<div class="warn"><strong>实时排障提示：</strong> <code>journalctl -f</code> 在繁忙机器上可能非常吵。优先加 <code>-u</code>、<code>SYSLOG_IDENTIFIER=</code>、<code>_PID=</code> 或 <code>-p</code> 限制范围。</div>
+</section>
+
+<section class="figure" id="fig-boots">
+<h3>信息图：启动轮次与时间线</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="journalctl 启动轮次时间线">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">每次启动都有独立的 _BOOT_ID</text>
+<line x1="120" y1="260" x2="980" y2="260" stroke="#94a3b8" stroke-width="6" stroke-linecap="round"/>
+<circle cx="220" cy="260" r="22" fill="#ede9fe" stroke="#7c3aed" stroke-width="3"/><text x="220" y="220" text-anchor="middle" font-size="18" font-weight="700">-3</text><text x="220" y="315" text-anchor="middle" font-size="14">更早启动</text>
+<circle cx="410" cy="260" r="22" fill="#ede9fe" stroke="#7c3aed" stroke-width="3"/><text x="410" y="220" text-anchor="middle" font-size="18" font-weight="700">-2</text><text x="410" y="315" text-anchor="middle" font-size="14">上上次启动</text>
+<circle cx="600" cy="260" r="22" fill="#ffedd5" stroke="#ea580c" stroke-width="3"/><text x="600" y="220" text-anchor="middle" font-size="18" font-weight="700">-1</text><text x="600" y="315" text-anchor="middle" font-size="14">上次启动</text>
+<circle cx="790" cy="260" r="26" fill="#ccfbf1" stroke="#0f766e" stroke-width="4"/><text x="790" y="220" text-anchor="middle" font-size="18" font-weight="700">0</text><text x="790" y="315" text-anchor="middle" font-size="14">当前启动</text>
+<rect x="155" y="405" width="790" height="90" rx="18" fill="#f8fafc" stroke="#cbd5e1"/><text x="550" y="440" text-anchor="middle" font-size="18" font-weight="700">journalctl --list-boots 先列出轮次，再用 -b -1 / -b 0 查询</text><text x="550" y="470" text-anchor="middle" font-size="15">如果没有持久化 journal，重启后的历史启动日志可能不存在。</text>
+</svg><div class="caption">启动轮次让“上次为什么宕机/重启失败”这类问题可查询，而不是只能看当前运行状态。</div></section>
+
+<section class="section" id="s10">
+<h2>10. 按启动轮次查看</h2>
+<p><code>-b</code>/<code>--boot</code> 用来查看某次系统启动中的日志。当前启动是 <code>-b</code> 或 <code>-b 0</code>；上一次启动是 <code>-b -1</code>。这对排查重启、内核 panic、服务启动失败尤其关键。</p>
+<pre><code># 列出可查询的启动轮次
+journalctl --list-boots
+
+# 当前启动
+journalctl -b
+journalctl -b 0
+
+# 上一次启动
+journalctl -b -1
+
+# 上一次启动中的错误
+journalctl -b -1 -p err
+
+# 当前启动的内核日志
+journalctl -k -b</code></pre>
+<table><tr><th>问题</th><th>建议命令</th><th>原因</th></tr><tr><td>机器刚刚异常重启</td><td><code>journalctl -b -1 -p warning</code></td><td>当前启动可能看不到重启前错误</td></tr><tr><td>服务开机启动失败</td><td><code>journalctl -b -u app.service</code></td><td>限定当前启动的该 unit</td></tr><tr><td>内核或驱动异常</td><td><code>journalctl -k -b -1</code></td><td>只看上次启动内核消息</td></tr></table>
+<div class="danger"><strong>历史日志风险：</strong> 如果 <code>journalctl --list-boots</code> 只显示当前启动，可能是 journal 未持久化、已被清理，或权限不足。不要在未确认前执行 vacuum。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 内核、进程、用户与字段查询</h2>
+<p>除了 unit，journalctl 还可以按内核日志、进程名、PID、可执行路径、用户 ID、syslog 标识符等维度查询。字段查询让你能从“服务视角”切换到“进程视角”。</p>
+<table><tr><th>目标</th><th>命令</th><th>说明</th></tr><tr><td>内核日志</td><td><code>journalctl -k</code></td><td>类似 <code>dmesg</code>，但可结合时间、boot、priority</td></tr><tr><td>某 PID</td><td><code>journalctl _PID=1234</code></td><td>进程退出后也可查历史</td></tr><tr><td>某进程名</td><td><code>journalctl _COMM=sshd</code></td><td>按 comm 字段，不等于全文搜索</td></tr><tr><td>syslog 标识符</td><td><code>journalctl -t sshd</code></td><td><code>-t</code> 等价于按 <code>SYSLOG_IDENTIFIER</code> 过滤</td></tr><tr><td>某用户 ID</td><td><code>journalctl _UID=1000</code></td><td>常用于用户服务或会话问题</td></tr></table>
+<pre><code># 查看当前启动内核 warning 以上日志
+journalctl -k -b -p warning
+
+# 查看 sshd 最近一小时日志
+journalctl -t sshd --since "1 hour ago"
+
+# 查看某个 PID 的完整字段，便于理解它来自哪里
+journalctl _PID=1234 -o verbose
+
+# 查看 UID 1000 的用户相关日志
+journalctl _UID=1000 --since today</code></pre>
+<div class="note"><strong>字段与 grep 的区别：</strong> <code>journalctl _COMM=sshd</code> 只匹配进程名字段；<code>journalctl | grep sshd</code> 是文本包含，可能漏掉或误中。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 输出格式与 JSON</h2>
+<p><code>-o</code>/<code>--output</code> 决定 journalctl 如何展示 entry。日常阅读用短格式，字段分析用 <code>verbose</code>，机器处理用 JSON 或 export。</p>
+<table><tr><th>格式</th><th>用途</th><th>示例</th></tr><tr><td><code>short</code></td><td>默认短文本</td><td><code>journalctl -o short</code></td></tr><tr><td><code>short-iso</code></td><td>ISO 风格时间</td><td><code>journalctl -o short-iso</code></td></tr><tr><td><code>short-precise</code></td><td>微秒级时间</td><td><code>journalctl -o short-precise</code></td></tr><tr><td><code>cat</code></td><td>只输出消息正文</td><td><code>journalctl -o cat -u app.service</code></td></tr><tr><td><code>verbose</code></td><td>显示完整字段</td><td><code>journalctl -o verbose -n 1</code></td></tr><tr><td><code>json</code></td><td>每条一行 JSON</td><td><code>journalctl -o json</code></td></tr><tr><td><code>json-pretty</code></td><td>便于人读的 JSON</td><td><code>journalctl -o json-pretty -n 1</code></td></tr><tr><td><code>export</code></td><td>Journal Export Format</td><td>迁移、取证、专用工具处理</td></tr></table>
+<pre><code># 看一条完整 entry 的所有字段
+journalctl -u nginx.service -n 1 -o verbose
+
+# 机器处理：每条日志一行 JSON，限制数量避免输出过大
+journalctl -u nginx.service --since "10 min ago" -o json --no-pager
+
+# 人类阅读 JSON
+journalctl -u nginx.service -n 2 -o json-pretty
+
+# 只输出 MESSAGE，适合和传统文本管道配合
+journalctl -u nginx.service -o cat --since today</code></pre>
+<div class="warn"><strong>JSON 注意：</strong> journal 字段值可能包含二进制或数组式字段；严肃自动化建议用 <code>jq</code> 或 systemd 的 sd-journal API，而不是脆弱的正则解析。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 光标、分页与自动化脚本</h2>
+<p>journal entry 有 cursor，可以标识“读到哪里”。脚本需要增量消费日志时，cursor 比“最后一行文本”可靠得多。交互查看时则要理解分页器和输出数量。</p>
+<table><tr><th>选项</th><th>作用</th><th>使用场景</th></tr><tr><td><code>--show-cursor</code></td><td>显示最后 entry 的 cursor</td><td>记录增量位置</td></tr><tr><td><code>--after-cursor=...</code></td><td>从某 cursor 之后读取</td><td>日志采集脚本</td></tr><tr><td><code>--cursor-file=PATH</code></td><td>读取并更新 cursor 文件</td><td>周期性任务</td></tr><tr><td><code>--no-pager</code></td><td>不使用分页器</td><td>脚本和重定向</td></tr><tr><td><code>--no-hostname</code></td><td>隐藏 hostname</td><td>本机调试时减少噪声</td></tr></table>
+<pre><code># 显示最近 20 条并打印 cursor
+journalctl -u app.service -n 20 --show-cursor
+
+# 周期性增量读取示例：cursor 文件由 journalctl 维护
+journalctl -u app.service \
+  --cursor-file=/var/lib/mycollector/app.cursor \
+  --since "1 hour ago" \
+  -o json --no-pager
+
+# 脚本中避免进入 less
+journalctl -b -p err --no-pager &gt; boot-errors.log</code></pre>
+<div class="note"><strong>脚本建议：</strong> 自动化任务务必限制范围，例如 <code>-u</code>、<code>--since</code>、<code>-n</code> 或 cursor；避免每次全量扫 journal。</div>
+</section>
+
+<section class="figure" id="fig-vacuum">
+<h3>安全图：journal 存储与 vacuum 决策</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="journalctl 磁盘清理安全流程">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="64" text-anchor="middle" font-size="26" font-weight="700">清理 journal 前先判断：空间压力、取证需求、保留窗口</text>
+<rect x="410" y="105" width="280" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="147" text-anchor="middle" font-size="21" font-weight="700">journalctl --disk-usage</text>
+<polygon points="550,225 720,315 550,405 380,315" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="305" text-anchor="middle" font-size="17" font-weight="700">是否必须现在释放空间？</text><text x="550" y="331" text-anchor="middle" font-size="14">磁盘满 / 取证 / 审计</text>
+<rect x="110" y="280" width="220" height="82" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="220" y="314" text-anchor="middle" font-size="18" font-weight="700">否</text><text x="220" y="342" text-anchor="middle" font-size="14">配置保留策略，不急删</text>
+<rect x="770" y="280" width="230" height="82" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="885" y="314" text-anchor="middle" font-size="18" font-weight="700">是</text><text x="885" y="342" text-anchor="middle" font-size="14">先列 boots 和备份关键日志</text>
+<rect x="610" y="470" width="310" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="765" y="504" text-anchor="middle" font-size="17" font-weight="700">journalctl --rotate</text><text x="765" y="532" text-anchor="middle" font-size="14">让活跃文件归档，便于 vacuum</text>
+<rect x="610" y="610" width="310" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="765" y="644" text-anchor="middle" font-size="17" font-weight="700">--vacuum-time / size / files</text><text x="765" y="672" text-anchor="middle" font-size="14">只删除归档 journal 文件</text>
+<rect x="90" y="500" width="330" height="105" rx="16" fill="#f8fafc" stroke="#cbd5e1"/><text x="255" y="536" text-anchor="middle" font-size="17" font-weight="700">长期方案：journald.conf.d</text><text x="255" y="564" text-anchor="middle" font-size="14">SystemMaxUse / MaxRetentionSec</text><text x="255" y="590" text-anchor="middle" font-size="14">用配置替代临时救火</text>
+<line x1="550" y1="173" x2="550" y2="225" stroke="#94a3b8" stroke-width="3"/><line x1="380" y1="315" x2="330" y2="315" stroke="#94a3b8" stroke-width="3" marker-end="url(#v1)"/><line x1="720" y1="315" x2="770" y2="315" stroke="#94a3b8" stroke-width="3" marker-end="url(#v1)"/><path d="M885 362 C880 420, 815 435, 765 470" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#v1)"/><line x1="765" y1="552" x2="765" y2="610" stroke="#94a3b8" stroke-width="3" marker-end="url(#v1)"/><path d="M220 362 C215 430, 240 455, 255 500" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#v1)"/>
+<defs><marker id="v1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">vacuum 是删除操作，不是查看操作。先确认占用和保留需求，再清理归档文件，最后用配置建立长期上限。</div></section>
+
+<section class="section" id="s14">
+<h2>14. 磁盘占用、持久化与 vacuum</h2>
+<p>journal 可以存在内存型路径 <code>/run/log/journal</code>，也可以存在持久化路径 <code>/var/log/journal</code>。是否保留跨重启日志取决于系统配置和目录状态。</p>
+<table><tr><th>主题</th><th>命令或路径</th><th>说明</th></tr><tr><td>查看占用</td><td><code>journalctl --disk-usage</code></td><td>显示 active 和 archived journal 文件占用总量</td></tr><tr><td>运行时日志</td><td><code>/run/log/journal</code></td><td>通常位于内存或临时文件系统，重启后消失</td></tr><tr><td>持久化日志</td><td><code>/var/log/journal</code></td><td>用于跨重启保留历史</td></tr><tr><td>配置</td><td><code>/etc/systemd/journald.conf</code> 与 <code>journald.conf.d</code></td><td>建议用 drop-in 管理本地策略</td></tr><tr><td>临时清理</td><td><code>--vacuum-size</code>/<code>--vacuum-time</code>/<code>--vacuum-files</code></td><td>清理已归档 journal 文件</td></tr></table>
+<h3>安全清理流程</h3>
+<pre><code># 1. 只读检查：当前占用多少
+journalctl --disk-usage
+
+# 2. 只读检查：有哪些启动轮次，确认历史是否仍要保留
+journalctl --list-boots
+
+# 3. 如需保存关键窗口，先导出文本或 JSON
+journalctl -b -1 -p warning --no-pager &gt; previous-boot-warnings.log
+
+# 4. 让当前活跃 journal 文件轮转为归档文件
+sudo journalctl --rotate
+
+# 5. 删除 14 天以前的归档 journal 文件
+sudo journalctl --vacuum-time=14d
+
+# 或者限制归档 journal 总量到 1G 左右
+sudo journalctl --vacuum-size=1G
+
+# 6. 再次确认
+journalctl --disk-usage</code></pre>
+<h3>长期保留策略示例</h3>
+<pre><code># 查看现有配置，不修改
+systemd-analyze cat-config systemd/journald.conf
+
+# 创建 drop-in 前先决定策略；以下只是示例
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/10-retention.conf &lt;&lt;'EOF'
+[Journal]
+SystemMaxUse=2G
+MaxRetentionSec=30day
+EOF
+
+# 重启 journald 使配置生效
+sudo systemctl restart systemd-journald.service</code></pre>
+<div class="danger"><strong>删除边界：</strong> <code>--vacuum-*</code> 主要清理归档 journal 文件；它不会按“某条日志内容”精确删除。合规或取证场景不要临时 vacuum，先走组织保留策略。</div>
+</section>
+
+<section class="figure" id="fig-compare">
+<h3>对比图：journalctl、tail、grep 怎么选</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="journalctl tail grep 对比图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">先判断日志在哪里、是否有结构化字段</text>
+<rect x="80" y="145" width="280" height="350" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="220" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">journalctl</text><text x="220" y="238" text-anchor="middle" font-size="15">systemd 服务</text><text x="220" y="270" text-anchor="middle" font-size="15">按 unit / boot / priority</text><text x="220" y="302" text-anchor="middle" font-size="15">结构化字段和 JSON</text><text x="220" y="365" text-anchor="middle" font-size="15" font-family="ui-monospace">journalctl -u app -b</text>
+<rect x="410" y="145" width="280" height="350" rx="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">tail</text><text x="550" y="238" text-anchor="middle" font-size="15">明确的文本文件</text><text x="550" y="270" text-anchor="middle" font-size="15">只需看文件末尾</text><text x="550" y="302" text-anchor="middle" font-size="15">应用自己写日志</text><text x="550" y="365" text-anchor="middle" font-size="15" font-family="ui-monospace">tail -f app.log</text>
+<rect x="740" y="145" width="280" height="350" rx="22" fill="#ccfbf1" stroke="#99f6e4"/><text x="880" y="190" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">grep / rg</text><text x="880" y="238" text-anchor="middle" font-size="15">全文关键字搜索</text><text x="880" y="270" text-anchor="middle" font-size="15">不知道来源时粗筛</text><text x="880" y="302" text-anchor="middle" font-size="15">文本日志和导出结果</text><text x="880" y="365" text-anchor="middle" font-size="15" font-family="ui-monospace">grep -R "error" /var/log</text>
+<rect x="220" y="545" width="660" height="58" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="581" text-anchor="middle" font-size="17" font-weight="700">systemd 服务优先 journalctl；纯文件日志用 tail；关键词粗搜再回到结构化过滤。</text>
+</svg><div class="caption">不要把 journalctl 当成 tail 的替代品，也不要把 grep 当成结构化查询器。三者各有边界。</div></section>
+
+<section class="section" id="s15">
+<h2>15. journalctl vs tail/grep</h2>
+<table><tr><th>维度</th><th><code>journalctl</code></th><th><code>tail</code></th><th><code>grep</code>/<code>rg</code></th></tr><tr><td>数据源</td><td>systemd journal</td><td>具体文本文件</td><td>文本文件或命令输出</td></tr><tr><td>过滤方式</td><td>字段、unit、boot、时间、优先级</td><td>行数和实时末尾</td><td>文本正则匹配</td></tr><tr><td>上下文</td><td>包含 PID、UID、unit、boot、精确时间等元数据</td><td>取决于文件内容</td><td>只知道文本匹配</td></tr><tr><td>实时</td><td><code>-f</code></td><td><code>-f</code></td><td>通常配管道或文件扫描</td></tr><tr><td>机器输出</td><td>JSON、export、verbose</td><td>原始文本</td><td>原始匹配行</td></tr></table>
+<pre><code># 错误示范：先全量输出再 grep，可能慢且丢失字段语义
+journalctl | grep nginx
+
+# 更好：先按 unit/时间/优先级过滤，再必要时文本搜索
+journalctl -b -u nginx.service --since "1 hour ago" -p warning
+journalctl -b -u nginx.service --since "1 hour ago" -o cat | grep 'upstream'
+
+# 应用明确写到文件时，tail 仍然直接有效
+tail -n 100 -f /var/log/myapp/app.log</code></pre>
+<div class="note"><strong>实践结论：</strong> 对 systemd 管理的服务，先用 <code>journalctl</code> 结构化缩小范围；对应用私有文本日志，再用 <code>tail</code>/<code>grep</code>。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常见排障场景</h2>
+<h3>服务启动失败</h3>
+<pre><code># 看服务摘要
+systemctl status app.service
+
+# 看当前启动该服务的完整日志
+journalctl -b -u app.service --no-pager
+
+# 只看 warning 以上，减少噪声
+journalctl -b -u app.service -p warning</code></pre>
+<h3>机器异常重启或上次启动失败</h3>
+<pre><code># 有哪些历史启动
+journalctl --list-boots
+
+# 上一次启动末尾 200 条
+journalctl -b -1 -n 200 -o short-iso
+
+# 上一次启动的内核错误
+journalctl -k -b -1 -p warning</code></pre>
+<h3>登录失败、SSH 问题</h3>
+<pre><code># 不同发行版 unit 名可能是 ssh.service 或 sshd.service
+journalctl -u ssh.service -u sshd.service --since today
+
+# 按 syslog identifier 查询
+journalctl -t sshd --since "2 hours ago"
+
+# 只看认证失败文本，先结构化过滤再 grep
+journalctl -t sshd --since today -o cat | grep -i 'failed'</code></pre>
+<h3>日志太多、想定位错误尖峰</h3>
+<pre><code># 先看时间窗口内 warning 以上
+journalctl --since "30 min ago" -p warning -o short-iso
+
+# 再按 unit 或进程字段收窄
+journalctl --since "30 min ago" -p warning -o verbose -n 5</code></pre>
+<h3>为什么没有日志</h3>
+<div class="grid-2"><div class="card"><strong>服务没经过 systemd？</strong><br>容器内进程、手工启动进程或应用私有日志可能不进 journal。</div><div class="card"><strong>权限不够？</strong><br>对比普通用户与 <code>sudo journalctl</code>。</div><div class="card"><strong>时间/boot 查错？</strong><br>加 <code>--list-boots</code>、<code>-b</code>、<code>--since</code> 重新限定。</div><div class="card"><strong>journal 未持久化？</strong><br>重启后历史可能在 <code>/run</code> 中消失，检查 <code>/var/log/journal</code> 和 journald 配置。</div></div>
+</section>
+
+<section class="figure" id="fig-troubleshoot">
+<h3>排障流程图：从告警到根因线索</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="journalctl 排障流程图">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="425" y="50" width="250" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="92" text-anchor="middle" font-size="22" font-weight="700">收到告警</text>
+<rect x="90" y="175" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="205" y="211" text-anchor="middle" font-size="18" font-weight="700">确定时间窗口</text><text x="205" y="239" text-anchor="middle" font-size="14">告警前后 10-30 分钟</text>
+<rect x="435" y="175" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="211" text-anchor="middle" font-size="18" font-weight="700">确定对象</text><text x="550" y="239" text-anchor="middle" font-size="14">unit / PID / host / user</text>
+<rect x="780" y="175" width="230" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="895" y="211" text-anchor="middle" font-size="18" font-weight="700">确定启动轮次</text><text x="895" y="239" text-anchor="middle" font-size="14">-b / -b -1</text>
+<rect x="225" y="365" width="650" height="92" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="401" text-anchor="middle" font-size="20" font-weight="700">组合查询</text><text x="550" y="431" text-anchor="middle" font-size="15" font-family="ui-monospace">journalctl -b -u app.service --since "30 min ago" -p warning</text>
+<rect x="95" y="555" width="250" height="90" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="220" y="591" text-anchor="middle" font-size="18" font-weight="700">看 verbose 字段</text><text x="220" y="619" text-anchor="middle" font-size="14">确认 PID、UID、unit</text>
+<rect x="425" y="555" width="250" height="90" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="550" y="591" text-anchor="middle" font-size="18" font-weight="700">跟随复现</text><text x="550" y="619" text-anchor="middle" font-size="14">-f -n 0</text>
+<rect x="755" y="555" width="250" height="90" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="880" y="591" text-anchor="middle" font-size="18" font-weight="700">导出证据</text><text x="880" y="619" text-anchor="middle" font-size="14">--no-pager / JSON</text>
+<line x1="550" y1="118" x2="205" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="118" x2="550" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="118" x2="895" y2="175" stroke="#94a3b8" stroke-width="3"/><line x1="205" y1="265" x2="385" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="265" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="895" y1="265" x2="715" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="457" x2="220" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="457" x2="550" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="457" x2="880" y2="555" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">可复用的排障套路：时间、对象、启动轮次三件事先定下来，再组合查询。</div></section>
+
+<section class="section" id="s17">
+<h2>17. 安全清理与运维清单</h2>
+<p>journalctl 的查询大多安全，但磁盘清理、服务重启、配置变更会影响系统行为。把查看、导出、删除、配置分开执行，能降低误操作风险。</p>
+<h3>只读检查清单</h3>
+<pre><code># 当前可见日志范围
+journalctl -n 20
+
+# 当前启动错误
+journalctl -b -p err --no-pager
+
+# 历史启动是否存在
+journalctl --list-boots
+
+# journal 占用
+journalctl --disk-usage
+
+# journald 配置合成结果
+systemd-analyze cat-config systemd/journald.conf</code></pre>
+<h3>清理前确认清单</h3>
+<ul><li>确认是否有事故取证、审计、合规或回溯需求。</li><li>确认 <code>--list-boots</code> 中哪些历史启动还需要保留。</li><li>先导出关键窗口日志，再执行 vacuum。</li><li>清理后用 <code>journalctl --disk-usage</code> 验证结果。</li><li>频繁磁盘压力应通过 <code>journald.conf.d</code> 保留策略解决，而不是人工反复删除。</li></ul>
+<div class="danger"><strong>不要这样做：</strong> 不要直接删除 <code>/var/log/journal</code> 下的文件来“清空间”。优先使用 <code>journalctl --vacuum-*</code> 和 journald 配置，让 systemd 按 journal 文件状态处理。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 学习路线与练习任务</h2>
+<h3>第一阶段：会查</h3>
+<ul><li>理解 journal entry 是字段化日志。</li><li>掌握 <code>-b</code>、<code>-u</code>、<code>--since</code>、<code>-p</code>、<code>-n</code>、<code>-f</code>。</li><li>能用 <code>--no-pager</code>、<code>-o short-iso</code> 输出便于复制的日志。</li></ul>
+<h3>第二阶段：会定位</h3>
+<ul><li>会用 <code>--list-boots</code> 查上次启动日志。</li><li>会用 <code>-o verbose</code> 找字段，再用 <code>FIELD=VALUE</code> 查询。</li><li>能区分 unit 过滤、进程字段过滤、文本 grep 的不同语义。</li></ul>
+<h3>第三阶段：会运维</h3>
+<ul><li>知道持久化 journal 与运行时 journal 的区别。</li><li>会安全执行 <code>--disk-usage</code>、<code>--rotate</code>、<code>--vacuum-time</code>/<code>--vacuum-size</code>。</li><li>能用 <code>journald.conf.d</code> 建立长期保留策略。</li></ul>
+<h3>练习</h3>
+<ol><li>运行 <code>journalctl -b -n 50 -o short-iso</code>，识别最近日志的时间和来源。</li><li>选择一个正在运行的服务，执行 <code>journalctl -u 服务名 -b -n 100</code>。</li><li>用 <code>journalctl -o verbose -n 1</code> 找出一条日志的 <code>_SYSTEMD_UNIT</code>、<code>_PID</code>、<code>PRIORITY</code>。</li><li>用 <code>journalctl --since "1 hour ago" -p warning</code> 查看最近异常。</li><li>用 <code>journalctl --list-boots</code> 判断系统是否保留历史启动。</li><li>只读运行 <code>journalctl --disk-usage</code>，不要清理，先估算保留策略。</li><li>在测试机上练习 <code>journalctl -f -n 0</code>，同时重启一个无害服务观察日志。</li></ol>
+<pre><code># 一个完整练习：排查 cron 或 ssh 服务最近问题
+journalctl --list-boots
+journalctl -b -u cron.service -u crond.service --since today --no-pager
+journalctl -b -u ssh.service -u sshd.service --since "2 hours ago" -p notice
+journalctl -t sshd -n 20 -o verbose</code></pre>
+</section>
+
+<section class="section">
+<h2>速查表</h2>
+<table><tr><th>目标</th><th>命令</th></tr><tr><td>当前启动所有错误</td><td><code>journalctl -b -p err</code></td></tr><tr><td>某服务当前启动日志</td><td><code>journalctl -b -u name.service</code></td></tr><tr><td>某服务实时跟随</td><td><code>journalctl -u name.service -n 50 -f</code></td></tr><tr><td>上次启动日志</td><td><code>journalctl -b -1</code></td></tr><tr><td>上次启动内核 warning</td><td><code>journalctl -k -b -1 -p warning</code></td></tr><tr><td>最近一小时</td><td><code>journalctl --since "1 hour ago"</code></td></tr><tr><td>查看完整字段</td><td><code>journalctl -o verbose -n 1</code></td></tr><tr><td>JSON 输出</td><td><code>journalctl -o json --no-pager</code></td></tr><tr><td>磁盘占用</td><td><code>journalctl --disk-usage</code></td></tr><tr><td>列出启动轮次</td><td><code>journalctl --list-boots</code></td></tr></table>
+<div class="success"><strong>最小排障公式：</strong> <code>journalctl -b -u 服务名 --since "时间窗口" -p warning -o short-iso</code>。先从这个公式开始，再按需要扩展字段、JSON 或跟随。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li><a href="https://www.freedesktop.org/software/systemd/man/latest/journalctl.html">journalctl(1) 官方手册</a>：命令选项、匹配语义、输出格式、boot、vacuum、cursor 等。</li><li><a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html">systemd.journal-fields(7)</a>：journal entry 字段说明，包括 <code>MESSAGE</code>、<code>_SYSTEMD_UNIT</code>、<code>_PID</code>、<code>__CURSOR</code> 等。</li><li><a href="https://www.freedesktop.org/software/systemd/man/journald.conf.html">journald.conf(5)</a>：<code>Storage=</code>、<code>SystemMaxUse=</code>、<code>MaxRetentionSec=</code> 等持久化和保留策略。</li><li><a href="https://www.freedesktop.org/software/systemd/man/systemd-journald.service.html">systemd-journald.service(8)</a>：journal 文件位置、归档文件、损坏文件后缀和 journald 服务行为。</li></ul><p class="mini">建议阅读顺序：先读 <code>journalctl(1)</code> 的 Description 与 Matches，再读 <code>systemd.journal-fields(7)</code>，最后结合 <code>journald.conf(5)</code> 设计保留策略。</p></section>
+<div class="footer">journalctl 深度教程 · 图文穿插版 · systemd journal 模型、结构化过滤、启动轮次、JSON 输出与生产安全</div>
+</div>
+</body>
+</html>

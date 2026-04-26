@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>du 深度教程：AI Infra 磁盘用量核算、定位与排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>du 深度教程：AI Infra 磁盘用量核算、定位与排障</h1>
+<p class="sub">这份教程面向 AI Infra/Linux 日常运维，围绕 <code>du</code> 讲清楚目录树磁盘用量核算的心智模型：块占用与表观大小、<code>du -sh</code>、深度汇总、排序找大户、跨文件系统边界、稀疏文件陷阱、缓存/数据集/checkpoint/log 清理前的确认，以及 <code>du</code> 与 <code>df</code>、<code>find</code>、<code>ncdu</code> 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">磁盘核算</span><span class="chip">du -sh</span><span class="chip">--max-depth</span><span class="chip">--apparent-size</span><span class="chip">--one-file-system</span><span class="chip">排序定位</span><span class="chip">数据集</span><span class="chip">Checkpoint</span><span class="chip">稀疏文件</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>du</code> 从目录树向下遍历文件，按文件系统实际分配的磁盘块累加大小；它回答“这个路径树实际占了多少磁盘空间”。</div>
+<div class="success"><strong>生产原则：</strong> <code>du</code> 只读、可安全运行，但后续清理是破坏性操作；删除前先定位、排序、抽样确认、检查归属，再用 <code>rm -i</code>、移动到隔离目录或快照回滚策略兜底。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">du 是什么：目录树磁盘用量核算器</a></li>
+<li><a class="anchor" href="#s2">核心模型：遍历、stat、块数、汇总</a></li>
+<li><a class="anchor" href="#s3">最常用命令：du -sh 与单位选择</a></li>
+<li><a class="anchor" href="#s4">目录深度：--max-depth / -d</a></li>
+<li><a class="anchor" href="#s5">排序找大户：du + sort + head</a></li>
+<li><a class="anchor" href="#s6">AI Infra 场景：数据集、checkpoint、日志、缓存</a></li>
+<li><a class="anchor" href="#s7">磁盘占用 vs 表观大小：--apparent-size</a></li>
+<li><a class="anchor" href="#s8">稀疏文件、硬链接与重复统计 caveat</a></li>
+<li><a class="anchor" href="#s9">文件系统边界：--one-file-system / -x</a></li>
+<li><a class="anchor" href="#s10">包含/排除路径：--exclude 与 shell glob</a></li>
+<li><a class="anchor" href="#s11">du vs df：为什么结果不一致</a></li>
+<li><a class="anchor" href="#s12">du vs find/ncdu/ls：工具边界</a></li>
+<li><a class="anchor" href="#s13">权限、性能与大目录扫描策略</a></li>
+<li><a class="anchor" href="#s14">安全清理流程：从定位到删除前确认</a></li>
+<li><a class="anchor" href="#s15">排障：du 慢、报错、数值不符合预期</a></li>
+<li><a class="anchor" href="#s16">常用命令速查</a></li>
+<li><a class="anchor" href="#s17">练习任务与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. du 是什么：目录树磁盘用量核算器</h2>
+<p><code>du</code> 是 disk usage 的缩写。它不是看磁盘分区还剩多少空间，而是核算某个文件或目录树实际消耗了多少磁盘块。AI Infra 中常见问题是“训练节点磁盘满了，谁占用最多？”这时第一反应通常不是 <code>ls -lh</code>，而是从挂载点或工作目录开始用 <code>du</code> 分层缩小范围。</p>
+<div class="grid-3"><div class="card"><strong>它回答</strong><br><code>/data/jobs/exp42</code> 这个目录树累计占用了多少空间？哪一级目录最大？</div><div class="card"><strong>它不回答</strong><br>整个文件系统剩余多少空间、inode 是否耗尽、某个已删除但仍被进程打开的文件是否占空间。</div><div class="card"><strong>AI Infra 高频对象</strong><br>数据集副本、tokenized shards、模型 checkpoint、tensorboard event、wandb/mlflow 缓存、容器层和日志。</div></div>
+<pre><code># 看当前目录总用量
+du -sh .
+
+# 看 /data 下第一层目录各占多少
+du -h --max-depth=1 /data
+
+# 排序找最大目录
+du -h --max-depth=1 /data | sort -h</code></pre>
+<div class="warn"><strong>不要误读：</strong> <code>du</code> 默认显示的是磁盘块占用，不一定等于文件“逻辑长度”；稀疏 checkpoint、压缩文件系统、快照和硬链接都可能让结果看起来反直觉。</div>
+</section>
+
+<section class="figure" id="fig-model">
+<h3>信息图：du 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="du 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="95" width="190" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="135" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">起点路径</text><text x="150" y="165" text-anchor="middle" font-size="15">/data /cache .</text><text x="150" y="188" text-anchor="middle" font-size="15">文件或目录</text>
+<rect x="310" y="95" width="200" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="410" y="135" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">遍历目录树</text><text x="410" y="165" text-anchor="middle" font-size="15">递归读取目录项</text><text x="410" y="188" text-anchor="middle" font-size="15">受权限和挂载影响</text>
+<rect x="575" y="95" width="200" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="675" y="135" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">读取元数据</text><text x="675" y="165" text-anchor="middle" font-size="15">stat blocks</text><text x="675" y="188" text-anchor="middle" font-size="15">块占用 / apparent</text>
+<rect x="840" y="95" width="200" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="940" y="135" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">汇总输出</text><text x="940" y="165" text-anchor="middle" font-size="15">按目录累加</text><text x="940" y="188" text-anchor="middle" font-size="15">-s / depth / sort</text>
+<rect x="145" y="330" width="810" height="175" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="370" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">du = 目录树遍历 + 文件元数据块数 + 层级汇总</text><text x="550" y="412" text-anchor="middle" font-size="16">du -sh /data/models  =  模型目录总磁盘块占用</text><text x="550" y="442" text-anchor="middle" font-size="16">du -h --max-depth=1 /data | sort -h  =  第一层目录从小到大排序</text><text x="550" y="472" text-anchor="middle" font-size="16">du -sh --apparent-size ckpt.pt  =  文件逻辑长度视角</text>
+<line x1="245" y1="147" x2="310" y2="147" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="510" y1="147" x2="575" y2="147" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="775" y1="147" x2="840" y2="147" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">理解 <code>du</code> 的关键是：它沿目录树累加“分配给文件的块”，而不是简单把 <code>ls -l</code> 的字节长度相加。</div></section>
+
+<section class="section" id="s2">
+<h2>2. 核心模型：遍历、stat、块数、汇总</h2>
+<p><code>du</code> 的执行模型可以拆成四步：从起点路径开始，递归遍历目录项；对每个文件读取元数据；取文件系统记录的已分配块数；把子目录结果向父目录累加。这个模型解释了为什么权限、挂载边界、硬链接、稀疏文件和快照会影响结果。</p>
+<table><tr><th>阶段</th><th>du 在做什么</th><th>常见影响因素</th></tr><tr><td>遍历</td><td>读取目录项，进入子目录</td><td>权限不足、目录项过多、远端文件系统慢</td></tr><tr><td>读取元数据</td><td>获取大小、块数、inode、链接等信息</td><td>stat 调用量、FUSE/NFS 响应速度</td></tr><tr><td>核算</td><td>默认按已分配块计入大小</td><td>稀疏文件、压缩、去重、硬链接</td></tr><tr><td>输出</td><td>按目录层级输出或只汇总</td><td><code>-s</code>、<code>-h</code>、<code>--max-depth</code>、排序管道</td></tr></table>
+<pre><code># 心智模型对应到命令：限制范围、控制输出、再排序
+du -xh --max-depth=1 /data 2&gt;/tmp/du.err | sort -hr | head -20</code></pre>
+<div class="note"><strong>核心判断：</strong> 如果你关心“文件系统为什么满”，用默认 <code>du</code> 的块占用口径；如果你关心“这些文件逻辑上有多大”，再加 <code>--apparent-size</code> 交叉验证。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 最常用命令：<code>du -sh</code> 与单位选择</h2>
+<p><code>du -sh PATH</code> 是排查磁盘占用时最常见的入口：<code>-s</code> 汇总总量，<code>-h</code> 用 KiB/MiB/GiB/TiB 等人类可读单位显示。没有 <code>-s</code> 时，<code>du</code> 会输出遍历到的各级目录用量。</p>
+<table><tr><th>命令</th><th>含义</th><th>AI Infra 用法</th></tr><tr><td><code>du -sh .</code></td><td>当前目录总量</td><td>看一个实验目录整体是否异常膨胀</td></tr><tr><td><code>du -sh /data/*</code></td><td>看第一层每个对象总量</td><td>快速比较 datasets、models、runs、logs</td></tr><tr><td><code>du -sk path</code></td><td>以 KiB 输出</td><td>脚本中更稳定，便于数值比较</td></tr><tr><td><code>du -sb path</code></td><td>以字节输出</td><td>GNU 常见；跨平台要确认支持</td></tr></table>
+<pre><code># 训练工作目录整体占用
+du -sh /data/train-runs/exp-042
+
+# 看用户缓存目录
+du -sh ~/.cache ~/.cache/huggingface ~/.cache/torch 2&gt;/dev/null
+
+# 脚本中用固定单位，避免解析 1.5G / 800M
+du -sk /data/datasets/imagenet</code></pre>
+<div class="note"><strong>单位提示：</strong> GNU <code>du -h</code> 通常使用 1024 进制；如果团队报表要求十进制 GB，可确认是否支持 <code>--si</code>。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 目录深度：<code>--max-depth</code> / <code>-d</code></h2>
+<p>AI 训练目录通常层级很深，直接 <code>du -h /data</code> 会输出海量行。深度控制让你像剥洋葱一样定位：先看第一层，再进入最大的目录看下一层。</p>
+<table><tr><th>命令</th><th>作用</th><th>备注</th></tr><tr><td><code>du -h --max-depth=1 /data</code></td><td>显示 /data 及其直接子目录</td><td>GNU 常见写法</td></tr><tr><td><code>du -h -d 1 /data</code></td><td>同样限制深度为 1</td><td>BSD/macOS 常见写法，GNU 也支持</td></tr><tr><td><code>du -h --max-depth=2 runs</code></td><td>显示到第二层</td><td>适合实验/用户/任务三级结构</td></tr><tr><td><code>du -sh runs/*</code></td><td>由 shell 展开第一层</td><td>目录很多时可能触发参数过长</td></tr></table>
+<pre><code># 从挂载点开始定位第一层
+du -h --max-depth=1 /data | sort -h
+
+# 进入最大目录后继续下钻
+du -h --max-depth=1 /data/train-runs | sort -h
+
+# 第二层看用户目录下每个项目
+du -h --max-depth=2 /data/users/alice | sort -h | tail -30</code></pre>
+<div class="success"><strong>定位策略：</strong> 每轮只扩大一个层级，始终用 <code>sort -h | tail</code> 看最大项；不要一开始全盘递归输出再人工翻屏。</div>
+</section>
+
+<section class="figure" id="fig-drilldown">
+<h3>流程图：分层定位磁盘大户</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="du 分层定位流程">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">磁盘告警 /data 90%</text>
+<rect x="95" y="170" width="260" height="85" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="225" y="205" text-anchor="middle" font-size="18" font-weight="700">第一层汇总</text><text x="225" y="232" text-anchor="middle" font-size="14">du -h --max-depth=1 /data</text>
+<rect x="420" y="170" width="260" height="85" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="205" text-anchor="middle" font-size="18" font-weight="700">排序看最大</text><text x="550" y="232" text-anchor="middle" font-size="14">sort -h | tail -20</text>
+<rect x="745" y="170" width="260" height="85" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="875" y="205" text-anchor="middle" font-size="18" font-weight="700">进入大目录</text><text x="875" y="232" text-anchor="middle" font-size="14">datasets / runs / logs</text>
+<polygon points="550,340 735,430 550,520 365,430" fill="#fef2f2" stroke="#fecaca"/><text x="550" y="420" text-anchor="middle" font-size="18" font-weight="700">是否已定位到可处理对象？</text><text x="550" y="448" text-anchor="middle" font-size="14">旧 checkpoint / 中间缓存 / 过期日志</text>
+<rect x="120" y="565" width="280" height="70" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="260" y="607" text-anchor="middle" font-size="18" font-weight="700">继续下钻一层</text>
+<rect x="700" y="565" width="280" height="70" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="840" y="607" text-anchor="middle" font-size="18" font-weight="700">确认归属后清理</text>
+<line x1="550" y1="111" x2="225" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="355" y1="212" x2="420" y2="212" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="680" y1="212" x2="745" y2="212" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="875" y1="255" x2="650" y2="370" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="430" y1="465" x2="310" y2="565" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="352" y="532" font-size="14">否</text><line x1="670" y1="465" x2="790" y2="565" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="743" y="532" font-size="14">是</text>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">用 <code>du</code> 排查磁盘告警时，核心动作是“分层汇总、排序、进入最大项、重复”。</div></section>
+
+<section class="section" id="s5">
+<h2>5. 排序找大户：<code>du</code> + <code>sort</code> + <code>head</code></h2>
+<p><code>du</code> 负责核算，<code>sort -h</code> 负责人类可读单位排序，<code>tail</code> 或 <code>head</code> 负责截取最大/最小项。这个组合是 AI Infra 磁盘排障的基础套路。</p>
+<pre><code># 当前目录第一层，从小到大
+du -h --max-depth=1 . | sort -h
+
+# 只看最大的 20 个目录
+du -h --max-depth=1 /data | sort -h | tail -20
+
+# 反向排序，看最大的在前
+du -h --max-depth=1 /data | sort -hr | head -20
+
+# 固定 KiB 输出，更适合脚本阈值判断
+du -sk /data/* 2&gt;/dev/null | sort -n | tail -20</code></pre>
+<table><tr><th>目标</th><th>推荐命令</th><th>原因</th></tr><tr><td>人手排查</td><td><code>du -h --max-depth=1 PATH | sort -h</code></td><td>可读性好</td></tr><tr><td>脚本报警</td><td><code>du -sk PATH</code></td><td>固定单位，便于比较</td></tr><tr><td>最大 N 个目录</td><td><code>sort -hr | head -N</code></td><td>大项在前</td></tr><tr><td>兼容旧环境</td><td><code>du -k ... | sort -n</code></td><td>不依赖 <code>sort -h</code></td></tr></table>
+<div class="note"><strong>排序注意：</strong> 如果你的系统没有 <code>sort -h</code>，不要对 <code>-h</code> 输出做普通字典序排序；改用 <code>du -k | sort -n</code>。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. AI Infra 场景：数据集、checkpoint、日志、缓存</h2>
+<p>AI Infra 的磁盘增长通常不是单个随机文件，而是某类对象持续累积。用 <code>du</code> 的目标不是“立刻删”，而是把大类对象拆清楚：谁生成、是否还在使用、是否可重建、是否有保留策略。</p>
+<div class="grid-4"><div class="card"><strong>数据集</strong><br>原始压缩包、解压副本、预处理 shard、tokenized cache、重复下载。</div><div class="card"><strong>Checkpoint</strong><br>每 N step 保存、optimizer state、EMA、LoRA adapter、best/latest 软链接。</div><div class="card"><strong>日志</strong><br>tensorboard event、训练 stdout、debug dump、NCCL 日志、core dump。</div><div class="card"><strong>缓存</strong><br>Hugging Face、pip、conda、torch extensions、容器镜像层。</div></div>
+<pre><code># 数据集目录第一层
+du -h --max-depth=1 /data/datasets | sort -hr | head -30
+
+# checkpoint 目录按实验排序
+du -h --max-depth=2 /data/train-runs | sort -hr | head -50
+
+# 常见用户缓存
+du -sh ~/.cache/huggingface ~/.cache/torch ~/.cache/pip ~/.conda 2&gt;/dev/null
+
+# 日志目录定位
+du -h --max-depth=2 /var/log /data/logs 2&gt;/dev/null | sort -hr | head -40</code></pre>
+<div class="danger"><strong>清理边界：</strong> 训练仍在运行时不要直接删除 checkpoint 或日志；先用 <code>lsof +D DIR</code>、作业系统、实验跟踪平台或目录 owner 确认使用状态。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 磁盘占用 vs 表观大小：<code>--apparent-size</code></h2>
+<p>默认 <code>du</code> 统计的是文件实际分配的磁盘块。<code>--apparent-size</code> 统计文件逻辑长度，更接近 <code>ls -l</code> 看到的 size。两者差异常见于稀疏文件、小文件块浪费、压缩/去重文件系统和对象存储挂载。</p>
+<table><tr><th>视角</th><th>命令</th><th>含义</th><th>适用场景</th></tr><tr><td>实际占用</td><td><code>du -sh path</code></td><td>文件系统分配了多少块</td><td>排查磁盘满、容量规划</td></tr><tr><td>表观大小</td><td><code>du -sh --apparent-size path</code></td><td>文件逻辑长度累加</td><td>估算传输量、对象逻辑体积</td></tr><tr><td>文件长度</td><td><code>ls -lh file</code></td><td>单个目录项记录的长度</td><td>查看单文件元数据</td></tr></table>
+<pre><code># 比较 checkpoint 的实际占用和表观大小
+du -sh /data/runs/exp42/checkpoint-10000
+du -sh --apparent-size /data/runs/exp42/checkpoint-10000
+
+# 稀疏文件演示：逻辑上 10G，实际可能很小
+truncate -s 10G sparse.bin
+ls -lh sparse.bin
+du -h sparse.bin
+du -h --apparent-size sparse.bin
+rm sparse.bin</code></pre>
+<div class="warn"><strong>关键 caveat：</strong> 复制稀疏文件时，如果工具不保留 sparse 属性，目标端实际占用可能暴涨；迁移 checkpoint、镜像或虚拟磁盘前要确认复制工具参数。</div>
+</section>
+
+<section class="figure" id="fig-size-views">
+<h3>对比图：块占用、表观大小、df 的不同视角</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="du apparent size df 对比">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="26" font-weight="700">同一个磁盘问题的三种视角</text>
+<rect x="80" y="135" width="280" height="330" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="220" y="180" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">du 默认</text><text x="220" y="225" text-anchor="middle" font-size="16">统计文件分配块</text><text x="220" y="258" text-anchor="middle" font-size="15">目录树向下累加</text><rect x="130" y="305" width="180" height="38" rx="8" fill="#2563eb"/><text x="220" y="331" text-anchor="middle" font-size="15" fill="#fff">du -sh runs</text><text x="220" y="392" text-anchor="middle" font-size="15">回答：这棵目录树</text><text x="220" y="420" text-anchor="middle" font-size="15">占了多少磁盘块？</text>
+<rect x="410" y="135" width="280" height="330" rx="22" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="180" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">apparent-size</text><text x="550" y="225" text-anchor="middle" font-size="16">统计文件逻辑长度</text><text x="550" y="258" text-anchor="middle" font-size="15">可能大于或小于实际块</text><rect x="465" y="305" width="170" height="38" rx="8" fill="#7c3aed"/><text x="550" y="331" text-anchor="middle" font-size="15" fill="#fff">du --apparent-size</text><text x="550" y="392" text-anchor="middle" font-size="15">回答：从逻辑长度看</text><text x="550" y="420" text-anchor="middle" font-size="15">这些文件有多大？</text>
+<rect x="740" y="135" width="280" height="330" rx="22" fill="#ccfbf1" stroke="#99f6e4"/><text x="880" y="180" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">df</text><text x="880" y="225" text-anchor="middle" font-size="16">统计整个文件系统</text><text x="880" y="258" text-anchor="middle" font-size="15">包含元数据和已删打开文件</text><rect x="805" y="305" width="150" height="38" rx="8" fill="#0f766e"/><text x="880" y="331" text-anchor="middle" font-size="15" fill="#fff">df -h /data</text><text x="880" y="392" text-anchor="middle" font-size="15">回答：挂载点总量、</text><text x="880" y="420" text-anchor="middle" font-size="15">已用、可用是多少？</text>
+<rect x="185" y="535" width="730" height="54" rx="12" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="568" text-anchor="middle" font-size="17">du 与 df 不一致时，不一定是谁错了；它们在回答不同问题。</text>
+</svg><div class="caption">排查“磁盘满”先用 <code>df</code> 看分区，再用 <code>du</code> 在挂载点内定位目录树大户。</div></section>
+
+<section class="section" id="s8">
+<h2>8. 稀疏文件、硬链接与重复统计 caveat</h2>
+<p>AI 系统中可能出现稀疏文件、硬链接数据集、共享缓存和快照。它们会让“看起来的大小”和“真实占用”偏离直觉。<code>du</code> 有去重硬链接的默认行为，但不同参数、不同起点和不同文件系统特性会影响结果。</p>
+<table><tr><th>现象</th><th>原因</th><th>排查方式</th></tr><tr><td><code>ls -lh</code> 很大，<code>du -h</code> 很小</td><td>稀疏文件未实际分配全部块</td><td>比较 <code>du</code> 与 <code>du --apparent-size</code></td></tr><tr><td>多个路径看似重复，合计却不翻倍</td><td>硬链接指向同一 inode，<code>du</code> 通常只计一次</td><td><code>ls -li</code> 看 inode 和 link count</td></tr><tr><td>快照目录占用难理解</td><td>CoW/快照共享块，释放策略依赖文件系统</td><td>结合 btrfs/zfs/lvm 工具查看</td></tr><tr><td>对象存储挂载结果奇怪</td><td>FUSE 层可能模拟 stat 信息</td><td>用后端对象清单或云端计量交叉验证</td></tr></table>
+<pre><code># 查看 inode，识别硬链接
+ls -li dataset-a/file.bin dataset-b/file.bin
+
+# du 默认通常不重复计入同一硬链接文件
+du -sh dataset-a dataset-b
+
+# 如果确实要把每个硬链接路径都计入，可查看系统是否支持 -l
+du -sh -l dataset-a dataset-b</code></pre>
+<div class="note"><strong>工程建议：</strong> 对共享数据集、快照和缓存做容量报表时，先定义口径：按路径逻辑大小、按实际块占用，还是按用户/项目 chargeback 规则分摊。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 文件系统边界：<code>--one-file-system</code> / <code>-x</code></h2>
+<p>集群节点常见多个挂载点：本地 NVMe、共享 NFS、对象存储 FUSE、容器 overlay、作业临时盘。默认 <code>du /</code> 可能跨入其他挂载点，导致扫描很慢或统计范围错误。<code>-x</code> 或 <code>--one-file-system</code> 可以限制在起点所在文件系统内。</p>
+<pre><code># 查看挂载点和文件系统
+df -hT / /data /scratch 2&gt;/dev/null
+findmnt /data
+
+# 只统计 /data 所在文件系统，不跨入其他挂载
+du -xh --max-depth=1 /data | sort -h
+
+# 排查根目录时避免跨入 /proc /sys /run /data 等其他文件系统
+sudo du -xh --max-depth=1 / 2&gt;/dev/null | sort -h</code></pre>
+<table><tr><th>场景</th><th>风险</th><th>建议</th></tr><tr><td>根目录排查</td><td>跨入 NFS 或容器挂载，扫描巨大</td><td><code>du -x</code> 并排除虚拟文件系统</td></tr><tr><td>共享存储</td><td>一个节点上扫描影响元数据服务</td><td>限制深度，避开高峰，优先按项目目录查</td></tr><tr><td>容器内排查</td><td>overlay 与宿主机视角不同</td><td>同时看容器内路径和宿主机 overlay 目录</td></tr></table>
+<div class="warn"><strong>边界提醒：</strong> <code>-x</code> 的含义是“不跨越文件系统边界”，不是“不跨目录边界”；先用 <code>df</code> 或 <code>findmnt</code> 确认起点所在挂载。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 包含/排除路径：<code>--exclude</code> 与 shell glob</h2>
+<p>排查时经常需要跳过超大但已知的目录，例如缓存、虚拟环境、对象存储挂载或旧归档。GNU <code>du</code> 支持 <code>--exclude</code>；跨平台脚本要先确认目标系统实现。</p>
+<pre><code># 跳过 .git 和 Python 虚拟环境
+du -h --max-depth=2 --exclude='.git' --exclude='.venv' .
+
+# 只看 checkpoint 目录
+du -sh /data/train-runs/*/checkpoint-* 2&gt;/dev/null
+
+# 用 find 精确选择目录，再交给 du 汇总
+find /data/train-runs -maxdepth 2 -type d -name 'checkpoint-*' -print0 |
+  xargs -0 du -sh 2&gt;/dev/null |
+  sort -h</code></pre>
+<div class="note"><strong>glob 限制：</strong> <code>/data/*</code> 由 shell 展开，目录过多时可能报 “argument list too long”。这时用 <code>find -print0 | xargs -0</code> 更稳。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. <code>du</code> vs <code>df</code>：为什么结果不一致</h2>
+<p><code>df</code> 看文件系统级别的已用/可用空间，<code>du</code> 看路径树内可遍历文件的累计占用。两者不一致非常常见，尤其是日志被删除但进程仍打开、权限导致 <code>du</code> 看不到部分目录、文件系统元数据/保留块、快照或挂载边界混乱。</p>
+<table><tr><th>现象</th><th>可能原因</th><th>下一步</th></tr><tr><td><code>df</code> 很满，<code>du</code> 找不到大目录</td><td>已删除但仍被进程打开的文件、权限不足、隐藏挂载点</td><td><code>sudo lsof +L1</code>，用 <code>sudo du</code>，检查 <code>findmnt</code></td></tr><tr><td><code>du</code> 统计很大，<code>df</code> 变化不明显</td><td>统计路径不在目标文件系统、硬链接/快照/压缩影响</td><td><code>df path</code> 确认挂载点</td></tr><tr><td>删除大文件后空间没释放</td><td>进程仍持有文件句柄，或快照保留块</td><td>重启/关闭相关进程，检查快照</td></tr></table>
+<pre><code># 先确认哪个文件系统满
+df -hT
+
+# 在对应挂载点内分层找大户
+sudo du -xh --max-depth=1 /data 2&gt;/dev/null | sort -h
+
+# 找已删除但仍占空间的文件
+sudo lsof +L1 | sort -k7 -n | tail -20</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要因为 <code>du</code> 暂时没找到大目录就随机删除；先确认 <code>df</code> 的目标挂载点、权限和已删除打开文件。</div>
+</section>
+
+<section class="figure" id="fig-tool-choice">
+<h3>选择图：du、df、find、ncdu、ls 怎么选</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="du df find ncdu ls 工具选择">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="26" font-weight="700">磁盘问题工具选择</text>
+<ellipse cx="150" cy="160" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="167" text-anchor="middle" font-size="17" font-weight="700">磁盘满了吗？</text>
+<ellipse cx="150" cy="315" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="322" text-anchor="middle" font-size="17" font-weight="700">谁占空间？</text>
+<ellipse cx="150" cy="470" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="150" y="477" text-anchor="middle" font-size="17" font-weight="700">找特定文件？</text>
+<rect x="330" y="105" width="240" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="450" y="145" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">df</text><text x="450" y="175" text-anchor="middle" font-size="15">文件系统总量/已用/可用</text>
+<rect x="650" y="105" width="300" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="800" y="145" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">du</text><text x="800" y="175" text-anchor="middle" font-size="15">路径树占用与层级汇总</text>
+<rect x="330" y="260" width="240" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="450" y="300" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">ncdu</text><text x="450" y="330" text-anchor="middle" font-size="15">交互式浏览大目录</text>
+<rect x="650" y="260" width="300" height="105" rx="18" fill="#fef2f2" stroke="#fecaca"/><text x="800" y="300" text-anchor="middle" font-size="22" font-weight="700" fill="#dc2626">find</text><text x="800" y="330" text-anchor="middle" font-size="15">按大小/时间/名称定位文件</text>
+<rect x="490" y="455" width="290" height="85" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="635" y="490" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">ls/stat</text><text x="635" y="518" text-anchor="middle" font-size="15">查看单个文件元数据</text>
+<line x1="245" y1="160" x2="330" y2="158" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="245" y1="315" x2="650" y2="312" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="245" y1="315" x2="330" y2="312" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="245" y1="470" x2="650" y2="338" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="245" y1="470" x2="490" y2="495" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">先用 <code>df</code> 判断哪个文件系统满，再用 <code>du</code> 找目录，用 <code>find</code> 找具体文件，用 <code>ncdu</code> 做交互式浏览。</div></section>
+
+<section class="section" id="s12">
+<h2>12. <code>du</code> vs <code>find</code>/<code>ncdu</code>/<code>ls</code>：工具边界</h2>
+<table><tr><th>工具</th><th>强项</th><th>短板</th><th>AI Infra 用法</th></tr><tr><td><code>du</code></td><td>目录树汇总、容量核算</td><td>不擅长按 mtime/name 精确筛选单文件</td><td>找最大目录、容量报表</td></tr><tr><td><code>find</code></td><td>按大小、时间、名称、类型筛选</td><td>默认不汇总目录树</td><td>找大 checkpoint、旧日志、core dump</td></tr><tr><td><code>ncdu</code></td><td>交互式浏览，体验好</td><td>可能未安装，不适合自动化</td><td>人工排查复杂目录树</td></tr><tr><td><code>df</code></td><td>文件系统容量视角</td><td>不能告诉你目录大户</td><td>告警入口、确认挂载点</td></tr><tr><td><code>ls/stat</code></td><td>单文件元数据</td><td>不递归汇总</td><td>检查 inode、mtime、逻辑大小</td></tr></table>
+<pre><code># 找超过 20G 的单文件，适合 checkpoint / core dump
+find /data -xdev -type f -size +20G -print 2&gt;/dev/null
+
+# 找 14 天前的训练日志，先打印确认，不直接删除
+find /data/logs -type f -name '*.log' -mtime +14 -print
+
+# 如果安装了 ncdu，可在大目录中交互式浏览
+ncdu -x /data</code></pre>
+<div class="success"><strong>组合思路：</strong> <code>du</code> 先定位“哪个目录大”，<code>find</code> 再定位“哪些文件满足清理条件”。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 权限、性能与大目录扫描策略</h2>
+<p><code>du</code> 需要遍历目录项并读取元数据，面对数千万小文件、NFS 元数据瓶颈、对象存储 FUSE 或容器 overlay 时可能很慢。权限不足会导致低估用量并输出 “Permission denied”。</p>
+<div class="grid-3"><div class="card"><strong>权限不足</strong><br>用普通用户看不到其他用户目录时，结果不完整；容量排障可用 <code>sudo du</code>，但要谨慎控制范围。</div><div class="card"><strong>元数据压力</strong><br><code>du</code> 会触发大量 stat/readdir，对共享存储可能造成压力；优先限制深度和路径。</div><div class="card"><strong>脚本自动化</strong><br>用固定单位、超时控制、低频采样；不要每分钟全量扫大型 NFS。</div></div>
+<pre><code># 控制范围，只看一个挂载点第一层
+sudo du -xh --max-depth=1 /data 2&gt;/tmp/du-errors.log | sort -h
+
+# 后台低优先级扫描，降低对训练任务影响
+ionice -c3 nice -n 19 du -xh --max-depth=2 /data &gt; /tmp/du-data.txt 2&gt;/tmp/du-data.err
+
+# 只查项目目录，不扫整个共享存储
+du -h --max-depth=1 /data/projects/team-a | sort -hr | head -30</code></pre>
+<div class="warn"><strong>共享存储提醒：</strong> 在元数据服务紧张时，全量 <code>du</code> 可能影响训练启动和 dataloader；优先使用存储系统 quota/report，或在维护窗口扫描。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 安全清理流程：从定位到删除前确认</h2>
+<p><code>du</code> 本身是只读工具，但它常出现在清理前。安全流程应该把“定位”和“删除”拆开：先证明对象确实大，再证明对象可删除，最后执行可回滚或可审计的清理。</p>
+<h3>推荐流程</h3>
+<pre><code># 1. 确认哪个文件系统满
+df -hT /data
+
+# 2. 分层定位大目录
+du -xh --max-depth=1 /data | sort -hr | head -20
+du -xh --max-depth=1 /data/train-runs | sort -hr | head -20
+
+# 3. 找候选文件，只打印
+find /data/train-runs/exp42 -type f -name '*.pt' -mtime +30 -size +5G -print
+
+# 4. 抽样确认归属和最近访问/修改时间
+ls -lh /data/train-runs/exp42/checkpoint-10000/model.pt
+stat /data/train-runs/exp42/checkpoint-10000/model.pt
+
+# 5. 删除前可先移动到隔离目录，观察一段时间
+mkdir -p /data/.trash-review/exp42
+mv /data/train-runs/exp42/checkpoint-10000 /data/.trash-review/exp42/</code></pre>
+<div class="danger"><strong>不要直接复制粘贴删除：</strong> 把 <code>find ... -delete</code>、<code>rm -rf</code> 放在最后一步；执行前先把同一选择条件用 <code>-print</code> 完整审查。</div>
+<table><tr><th>对象</th><th>删除前必须确认</th><th>更安全替代</th></tr><tr><td>checkpoint</td><td>是否是 latest/best、是否需恢复训练、是否归档</td><td>保留 best/latest，移动旧 step 到隔离区</td></tr><tr><td>数据集 shard</td><td>是否可重建、是否被多个任务共享</td><td>记录来源和生成命令，先降副本数</td></tr><tr><td>日志</td><td>是否仍被进程写入、是否用于审计</td><td>压缩、轮转、保留近期窗口</td></tr><tr><td>缓存</td><td>是否团队共享、重建成本</td><td>用工具自带 prune/clean 命令</td></tr></table>
+</section>
+
+<section class="figure" id="fig-safety">
+<h3>安全图：从告警到清理的守门点</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="du 安全清理流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="70" y="90" width="210" height="80" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="175" y="125" text-anchor="middle" font-size="18" font-weight="700">df 告警</text><text x="175" y="150" text-anchor="middle" font-size="14">确认挂载点</text>
+<rect x="330" y="90" width="210" height="80" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="435" y="125" text-anchor="middle" font-size="18" font-weight="700">du 定位</text><text x="435" y="150" text-anchor="middle" font-size="14">分层排序</text>
+<rect x="590" y="90" width="210" height="80" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="695" y="125" text-anchor="middle" font-size="18" font-weight="700">find 筛选</text><text x="695" y="150" text-anchor="middle" font-size="14">只打印候选</text>
+<rect x="850" y="90" width="180" height="80" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="940" y="125" text-anchor="middle" font-size="18" font-weight="700">人工确认</text><text x="940" y="150" text-anchor="middle" font-size="14">owner / job / SLA</text>
+<polygon points="550,270 755,365 550,460 345,365" fill="#fef2f2" stroke="#fecaca"/><text x="550" y="355" text-anchor="middle" font-size="18" font-weight="700">是否可安全释放？</text><text x="550" y="383" text-anchor="middle" font-size="14">不影响训练、恢复、审计和复现</text>
+<rect x="130" y="555" width="300" height="82" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="280" y="590" text-anchor="middle" font-size="18" font-weight="700">停止：补充信息</text><text x="280" y="617" text-anchor="middle" font-size="14">询问 owner / 检查 lsof / 查作业</text>
+<rect x="670" y="555" width="300" height="82" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="820" y="590" text-anchor="middle" font-size="18" font-weight="700">释放：先可回滚</text><text x="820" y="617" text-anchor="middle" font-size="14">移动隔离 / 快照 / 审计记录</text>
+<line x1="280" y1="130" x2="330" y2="130" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="540" y1="130" x2="590" y2="130" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="800" y1="130" x2="850" y2="130" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="940" y1="170" x2="655" y2="318" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="435" y1="170" x2="505" y2="287" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="430" y1="407" x2="310" y2="555" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="350" y="510" font-size="14">否</text><line x1="670" y1="407" x2="790" y2="555" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="744" y="510" font-size="14">是</text>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">清理事故通常不是 <code>du</code> 造成的，而是把“找到大文件”误当成“可以删除”。</div></section>
+
+<section class="section" id="s15">
+<h2>15. 排障：<code>du</code> 慢、报错、数值不符合预期</h2>
+<div class="grid-2"><div class="card"><strong>慢：目录项太多</strong><br>先限制 <code>--max-depth</code> 和起点；对共享存储用低优先级扫描。</div><div class="card"><strong>慢：跨入远端挂载</strong><br>加 <code>-x</code>，用 <code>findmnt</code> 检查挂载边界。</div><div class="card"><strong>Permission denied</strong><br>普通用户结果可能低估；容量排障用 <code>sudo du</code> 并记录错误日志。</div><div class="card"><strong>结果和 df 不一致</strong><br>检查已删除打开文件、快照、保留块、文件系统元数据和权限。</div><div class="card"><strong>结果和 ls 不一致</strong><br>检查稀疏文件、块大小、压缩/去重和 <code>--apparent-size</code>。</div><div class="card"><strong>排序错乱</strong><br>没有 <code>sort -h</code> 时用 <code>du -k | sort -n</code>。</div></div>
+<h3>排障命令模板</h3>
+<pre><code># 记录错误，避免 stderr 混入排序
+sudo du -xh --max-depth=1 /data 2&gt;/tmp/du.err | sort -hr | head -30
+
+# 验证路径所在文件系统
+df -hT /data/some/path
+findmnt -T /data/some/path
+
+# 查 deleted open files
+sudo lsof +L1 | awk '{print $7, $9}' | sort -n | tail -20
+
+# 对比实际块占用与表观大小
+du -sh big-file
+du -sh --apparent-size big-file</code></pre>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常用命令速查</h2>
+<table><tr><th>目标</th><th>命令</th></tr><tr><td>当前目录总大小</td><td><code>du -sh .</code></td></tr><tr><td>第一层目录大小</td><td><code>du -h --max-depth=1 . | sort -h</code></td></tr><tr><td>最大 20 个目录</td><td><code>du -h --max-depth=1 PATH | sort -hr | head -20</code></td></tr><tr><td>只在当前文件系统内统计</td><td><code>du -xh --max-depth=1 PATH</code></td></tr><tr><td>脚本友好 KiB 输出</td><td><code>du -sk PATH</code></td></tr><tr><td>比较表观大小</td><td><code>du -sh --apparent-size PATH</code></td></tr><tr><td>跳过目录</td><td><code>du -h --exclude='.git' --max-depth=2 .</code></td></tr><tr><td>找大文件</td><td><code>find PATH -xdev -type f -size +10G -print</code></td></tr><tr><td>交互式查看</td><td><code>ncdu -x PATH</code></td></tr><tr><td>df/du 不一致排查</td><td><code>sudo lsof +L1</code></td></tr></table>
+<div class="note"><strong>记忆法：</strong> <code>df</code> 看“盘”，<code>du</code> 看“目录树”，<code>find</code> 找“文件”，<code>ncdu</code> 做“交互浏览”。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 练习任务</h2>
+<h3>基础练习</h3><ol><li>在一个实验目录中分别运行 <code>du -sh .</code> 和 <code>du -h --max-depth=1 . | sort -h</code>，解释每一行含义。</li><li>用 <code>du -sk</code> 写一个脚本片段：当目录超过 500 GiB 时打印告警。</li><li>创建一个稀疏文件，对比 <code>ls -lh</code>、<code>du -h</code> 和 <code>du -h --apparent-size</code>。</li><li>用 <code>df -hT</code> 找到某路径所在文件系统，再用 <code>du -x</code> 限制扫描范围。</li><li>用 <code>find</code> 只打印 30 天前、超过 5 GiB 的 checkpoint 候选，不执行删除。</li></ol>
+<h3>实验目录</h3>
+<pre><code>mkdir -p /tmp/du-demo/{datasets,checkpoints,logs}
+dd if=/dev/zero of=/tmp/du-demo/datasets/shard-001.bin bs=1M count=32
+truncate -s 2G /tmp/du-demo/checkpoints/sparse-ckpt.pt
+printf 'hello\n' &gt; /tmp/du-demo/logs/train.log
+
+du -h --max-depth=2 /tmp/du-demo | sort -h
+du -sh /tmp/du-demo/checkpoints/sparse-ckpt.pt
+du -sh --apparent-size /tmp/du-demo/checkpoints/sparse-ckpt.pt
+
+# 清理练习目录
+rm -rf /tmp/du-demo</code></pre>
+<div class="warn"><strong>练习安全：</strong> 示例只在 <code>/tmp/du-demo</code> 下创建和删除文件；不要把 <code>rm -rf</code> 改成真实数据目录。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>GNU Coreutils Manual：<code>du invocation</code>，包括 <code>--summarize</code>、<code>--human-readable</code>、<code>--max-depth</code>、<code>--apparent-size</code>、<code>--one-file-system</code>、<code>--exclude</code>。</li><li>Linux man-pages：<code>du(1)</code>、<code>df(1)</code>、<code>find(1)</code>、<code>stat(1)</code>、<code>lsof(8)</code>。</li><li>POSIX <code>du</code> specification：可移植选项和默认块单位的标准口径。</li><li>ncdu documentation：交互式磁盘用量浏览和 <code>-x</code> 文件系统边界控制。</li><li>文件系统文档：ext4、XFS、btrfs、ZFS、overlayfs、NFS/FUSE 关于稀疏文件、硬链接、快照、配额和元数据行为的说明。</li></ul><p class="mini">建议阅读顺序：先掌握 <code>du -sh</code> 与分层排序，再理解块占用和 <code>--apparent-size</code>，最后学习 <code>df</code>/<code>find</code>/<code>ncdu</code> 的配合与生产清理流程。</p></section>
+<div class="footer">du 深度教程 · AI Infra 磁盘用量核算、数据集/checkpoint/log 定位、稀疏文件 caveat 与生产安全清理</div>
+</div>
+</body>
+</html>

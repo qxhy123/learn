@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ldd 深度教程：AI Infra 共享库依赖解析与 CUDA 排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--dark:#0f172a;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0%,#dbeafe 0,#f8fbff 32%,transparent 56%),linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#ffffff 0%,#f6fbff 58%,#e8f1ff 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:var(--dark);color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:700}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ldd 深度教程：AI Infra 共享库依赖解析与 CUDA 排障</h1>
+<p class="sub"><code>ldd</code> 用来观察 ELF 可执行文件或共享库在当前机器、当前环境变量下会解析到哪些动态库。AI Infra 场景里，它常用于定位 <code>libcudart.so</code>、<code>libcuda.so.1</code>、<code>libcudnn.so</code>、<code>libnccl.so</code>、MPI、RDMA、Python 扩展和推理引擎的依赖冲突。本教程从动态链接器模型出发，讲清楚 <code>not found</code>、RPATH/RUNPATH、<code>LD_LIBRARY_PATH</code>、容器/宿主驱动边界、安全风险，以及如何把 <code>ldd</code> 与 <code>readelf</code>、<code>objdump</code>、<code>LD_DEBUG</code> 组合成可靠排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">ELF</span><span class="chip">动态链接器</span><span class="chip">CUDA</span><span class="chip">cuDNN</span><span class="chip">NCCL</span><span class="chip">RPATH/RUNPATH</span><span class="chip">LD_LIBRARY_PATH</span><span class="chip">容器排障</span><span class="chip">安全风险</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ldd ./app</code> 不是“查看文件里写死的库列表”这么简单，而是让动态链接器按当前环境模拟装载过程，并把每个 <code>NEEDED</code> 依赖解析到的真实路径打印出来。</div>
+<div class="danger"><strong>安全底线：</strong> 不要对不可信二进制直接运行 <code>ldd</code>。某些实现或特殊 ELF 可能触发代码执行风险；未知样本先用 <code>readelf -d</code>、<code>objdump -p</code>、隔离容器或沙箱分析。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ldd 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：ELF 到真实 .so 路径</a></li>
+<li><a class="anchor" href="#s3">快速开始与输出解读</a></li>
+<li><a class="anchor" href="#s4">AI Infra 为什么经常需要 ldd</a></li>
+<li><a class="anchor" href="#s5">动态链接器搜索顺序</a></li>
+<li><a class="anchor" href="#s6">RPATH、RUNPATH 与 LD_LIBRARY_PATH</a></li>
+<li><a class="anchor" href="#s7">not found 的定位方法</a></li>
+<li><a class="anchor" href="#s8">CUDA 依赖：libcuda 与 libcudart</a></li>
+<li><a class="anchor" href="#s9">cuDNN、NCCL 与版本冲突</a></li>
+<li><a class="anchor" href="#s10">Python 扩展与 PyTorch/TensorRT</a></li>
+<li><a class="anchor" href="#s11">容器、驱动挂载与 ldconfig</a></li>
+<li><a class="anchor" href="#s12">ldd vs readelf vs objdump</a></li>
+<li><a class="anchor" href="#s13">高级选项：-v、-u、-r</a></li>
+<li><a class="anchor" href="#s14">LD_DEBUG 精细追踪</a></li>
+<li><a class="anchor" href="#s15">安全使用 ldd</a></li>
+<li><a class="anchor" href="#s16">排障流程与决策树</a></li>
+<li><a class="anchor" href="#s17">生产修复策略</a></li>
+<li><a class="anchor" href="#s18">检查清单与练习</a></li>
+<li><a class="anchor" href="#refs">参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ldd 是什么</h2>
+<p><code>ldd</code> 的全称通常理解为“list dynamic dependencies”。它面向 ELF 动态链接程序，展示运行该程序时动态链接器会加载哪些共享库，以及这些库最终解析到哪个文件路径。</p>
+<div class="grid-3">
+<div class="card"><strong>它能回答</strong><br>程序会加载哪一个 <code>libnccl.so.2</code>？缺少哪个 <code>.so</code>？容器里到底用了系统 CUDA 还是 Conda 里的 CUDA runtime？</div>
+<div class="card"><strong>它不能回答</strong><br>运行时通过 <code>dlopen()</code> 延迟加载的所有库、插件系统的全部候选路径、ABI 是否完全兼容、符号调用是否一定成功。</div>
+<div class="card"><strong>它的本质</strong><br>使用动态链接器的追踪模式，在“当前环境”下解析 <code>DT_NEEDED</code> 依赖，并输出解析结果。</div>
+</div>
+<pre><code># 查看一个可执行文件的共享库解析
+ldd ./inference_server
+
+# 查看 Python 扩展模块依赖
+ldd $(python - <<'PY'
+import torch, pathlib
+print(next(pathlib.Path(torch.__file__).parent.rglob("*.so")))
+PY
+)
+
+# 查看系统里 ldd 自身来自哪里
+type ldd
+ldd --version 2&gt;/dev/null | head -1</code></pre>
+<div class="warn"><strong>环境敏感：</strong> 同一个二进制，在不同容器、不同 <code>LD_LIBRARY_PATH</code>、不同 <code>/etc/ld.so.cache</code> 下，<code>ldd</code> 输出可能完全不同。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：ldd 如何把 ELF 依赖解析成真实路径</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="ldd 整体模型">
+<rect x="16" y="16" width="1068" height="612" rx="22" fill="#fbfdff" stroke="#d8e0ea"/>
+<text x="550" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#1e3a8a">ELF 动态依赖解析链路</text>
+<rect x="60" y="125" width="205" height="118" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="162" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">ELF 文件</text><text x="162" y="197" text-anchor="middle" font-size="15">可执行文件 / .so</text><text x="162" y="221" text-anchor="middle" font-size="15">含 NEEDED 条目</text>
+<rect x="325" y="125" width="205" height="118" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="427" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">动态链接器</text><text x="427" y="197" text-anchor="middle" font-size="15">ld-linux.so</text><text x="427" y="221" text-anchor="middle" font-size="15">按搜索规则查找</text>
+<rect x="590" y="125" width="205" height="118" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="692" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">搜索来源</text><text x="692" y="197" text-anchor="middle" font-size="15">RPATH / RUNPATH</text><text x="692" y="221" text-anchor="middle" font-size="15">LD_LIBRARY_PATH / cache</text>
+<rect x="855" y="125" width="185" height="118" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="947" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">ldd 输出</text><text x="947" y="197" text-anchor="middle" font-size="15">libx.so =&gt; path</text><text x="947" y="221" text-anchor="middle" font-size="15">或 not found</text>
+<line x1="265" y1="184" x2="325" y2="184" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="530" y1="184" x2="590" y2="184" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="795" y1="184" x2="855" y2="184" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="110" y="360" width="880" height="145" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="398" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">AI Infra 排障重点</text><text x="550" y="436" text-anchor="middle" font-size="16">同名库不等于同一库：libcudnn.so.8、libnccl.so.2、libcuda.so.1 可能来自不同目录</text><text x="550" y="466" text-anchor="middle" font-size="16">ldd 看到的是“当前环境会加载什么”，不是“这台机器上安装了什么”</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">排查依赖问题时，把 <code>ldd</code> 输出看成“动态链接器选择结果”，而不是静态文件清单。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 快速开始与输出解读</h2>
+<p>典型输出由三类行组成：成功解析的共享库、动态链接器自身、特殊虚拟对象。最需要关注的是 <code>=&gt;</code> 后面的路径和 <code>not found</code>。</p>
+<pre><code>$ ldd ./worker
+linux-vdso.so.1 (0x00007ffd...)
+libtorch_cuda.so =&gt; /opt/conda/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so (0x00007f...)
+libcudart.so.12 =&gt; /usr/local/cuda/lib64/libcudart.so.12 (0x00007f...)
+libnccl.so.2 =&gt; /usr/lib/x86_64-linux-gnu/libnccl.so.2 (0x00007f...)
+libcuda.so.1 =&gt; /usr/lib/x86_64-linux-gnu/libcuda.so.1 (0x00007f...)
+libm.so.6 =&gt; /lib/x86_64-linux-gnu/libm.so.6 (0x00007f...)
+/lib64/ld-linux-x86-64.so.2 (0x00007f...)</code></pre>
+<table>
+<tr><th>输出形态</th><th>含义</th><th>排障关注点</th></tr>
+<tr><td><code>libx.so =&gt; /path/libx.so</code></td><td>依赖名解析到了具体文件</td><td>路径是否来自预期镜像、Conda、CUDA toolkit、驱动挂载或系统目录</td></tr>
+<tr><td><code>libx.so =&gt; not found</code></td><td>动态链接器找不到该库</td><td>安装缺失、搜索路径缺失、RPATH/RUNPATH 不生效、容器未挂载</td></tr>
+<tr><td><code>/lib64/ld-linux-...</code></td><td>ELF 解释器/动态链接器</td><td>跨发行版或极简容器里路径可能不匹配</td></tr>
+<tr><td><code>linux-vdso.so.1</code></td><td>内核提供的虚拟动态对象</td><td>通常不是问题根源</td></tr>
+</table>
+<div class="note"><strong>读输出顺序：</strong> 先找 <code>not found</code>，再找 CUDA/cuDNN/NCCL 等关键库路径，最后才看 glibc、libstdc++ 这类基础库版本。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. AI Infra 为什么经常需要 ldd</h2>
+<p>训练和推理栈经常把系统包、Conda、pip wheel、CUDA toolkit、NVIDIA 驱动、容器运行时挂载、RDMA/MPI 库混在一起。报错表面是“库找不到”或“undefined symbol”，根因常是“找到了错误版本”。</p>
+<div class="grid-3">
+<div class="card"><strong>GPU 运行时</strong><br><code>libcuda.so.1</code> 来自宿主驱动，<code>libcudart.so</code> 多来自 toolkit 或 wheel。两者来源不同是正常现象。</div>
+<div class="card"><strong>通信库</strong><br><code>libnccl.so.2</code> 可能来自系统包、容器、Conda 或 PyTorch wheel。混用会造成 hang、性能差或符号错误。</div>
+<div class="card"><strong>推理引擎</strong><br>TensorRT、ONNX Runtime、vLLM、Triton backend 常通过插件和 Python 扩展加载额外 <code>.so</code>，需要结合 <code>ldd</code> 与运行日志。</div>
+</div>
+<pre><code># PyTorch 实际加载库目录常见检查
+python - <<'PY'
+import torch, os
+print("torch:", torch.__version__)
+print("torch file:", torch.__file__)
+print("cuda:", torch.version.cuda)
+print("nccl:", torch.cuda.nccl.version() if torch.cuda.is_available() else "cuda unavailable")
+PY
+
+# 找到某个扩展后再 ldd
+python - <<'PY'
+import pathlib, torch
+for p in pathlib.Path(torch.__file__).parent.rglob("libtorch_cuda.so"):
+    print(p)
+PY</code></pre>
+<div class="warn"><strong>不要只看版本号：</strong> “CUDA 12.1 镜像”不保证每个 Python 扩展都加载同一套 CUDA/NCCL/cuDNN 库；实际路径以 <code>ldd</code> 和运行时日志为准。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 动态链接器搜索顺序</h2>
+<p>当依赖名不包含斜杠时，glibc 动态链接器会按一组规则查找共享库。实际顺序会受 ELF 标签、环境变量、安全执行模式、缓存和系统配置影响。</p>
+<table>
+<tr><th>大致优先级</th><th>来源</th><th>说明</th></tr>
+<tr><td>1</td><td><code>DT_RPATH</code></td><td>仅在没有 <code>DT_RUNPATH</code> 时参与；旧式标签，可能优先于 <code>LD_LIBRARY_PATH</code></td></tr>
+<tr><td>2</td><td><code>LD_LIBRARY_PATH</code></td><td>进程环境变量；调试方便，但生产滥用风险高；安全执行模式下可能被忽略</td></tr>
+<tr><td>3</td><td><code>DT_RUNPATH</code></td><td>新式运行路径；通常只用于直接依赖，不像旧 <code>RPATH</code> 那样传递给子依赖</td></tr>
+<tr><td>4</td><td><code>/etc/ld.so.cache</code></td><td><code>ldconfig</code> 生成的缓存，来自 <code>/etc/ld.so.conf</code> 和片段配置</td></tr>
+<tr><td>5</td><td>默认目录</td><td>如 <code>/lib</code>、<code>/usr/lib</code>、架构相关目录</td></tr>
+</table>
+<pre><code># 查看二进制声明的动态段
+readelf -d ./worker | egrep 'NEEDED|RPATH|RUNPATH|INTERP'
+
+# 查看动态链接器缓存中可见的库
+ldconfig -p | egrep 'libcuda|libcudnn|libnccl'
+
+# 查看当前 shell 会影响 ldd 的变量
+printf '%s\n' "$LD_LIBRARY_PATH"</code></pre>
+<div class="success"><strong>排障原则：</strong> 先确认二进制需要什么，再确认搜索路径按什么顺序生效，最后确认最终命中的文件是不是预期版本。</div>
+</section>
+
+<section class="figure" id="s6">
+<h3>流程图：RPATH、RUNPATH 与 LD_LIBRARY_PATH 的取舍</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="动态库搜索顺序流程图">
+<rect x="18" y="18" width="1064" height="660" rx="22" fill="#fbfdff" stroke="#d8e0ea"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#1e3a8a">动态库搜索路径：谁先命中谁生效</text>
+<rect x="405" y="100" width="290" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="142" text-anchor="middle" font-size="21" font-weight="700">遇到 NEEDED: libnccl.so.2</text>
+<polygon points="550,210 735,292 550,374 365,292" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="286" text-anchor="middle" font-size="17" font-weight="700">ELF 是否有 RPATH 且无 RUNPATH？</text><text x="550" y="312" text-anchor="middle" font-size="14">旧式路径可能先于环境变量</text>
+<rect x="90" y="250" width="230" height="84" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="205" y="285" text-anchor="middle" font-size="18" font-weight="700">先查 RPATH</text><text x="205" y="312" text-anchor="middle" font-size="14">命中即使用</text>
+<rect x="790" y="250" width="230" height="84" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="905" y="285" text-anchor="middle" font-size="18" font-weight="700">查 LD_LIBRARY_PATH</text><text x="905" y="312" text-anchor="middle" font-size="14">调试常用，生产慎用</text>
+<rect x="360" y="445" width="380" height="70" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="487" text-anchor="middle" font-size="18" font-weight="700">再查 RUNPATH、ld.so.cache、默认目录</text>
+<rect x="365" y="575" width="370" height="56" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="609" text-anchor="middle" font-size="17" font-weight="700" fill="#991b1b">都找不到：ldd 显示 not found</text>
+<line x1="550" y1="168" x2="550" y2="210" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="365" y1="292" x2="320" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="335" y="274" font-size="14">是</text><line x1="735" y1="292" x2="790" y2="292" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="760" y="274" font-size="14">否</text><path d="M205 334 C240 405,410 420,475 445" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M905 334 C860 405,690 420,625 445" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="550" y1="515" x2="550" y2="575" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">RUNPATH 更现代也更可控；<code>LD_LIBRARY_PATH</code> 适合临时验证，不适合长期隐藏依赖关系。</div>
+</section>
+
+<section class="section">
+<h2>5. RPATH、RUNPATH 与 LD_LIBRARY_PATH</h2>
+<p>AI Infra 中最常见的冲突是“系统里有一份库，Conda 里有一份库，wheel 里还带一份库”。RPATH/RUNPATH 是二进制内部声明的搜索路径，<code>LD_LIBRARY_PATH</code> 是外部环境覆盖手段。</p>
+<table>
+<tr><th>机制</th><th>优点</th><th>风险</th><th>建议</th></tr>
+<tr><td><code>RPATH</code></td><td>旧系统兼容，能把依赖固定到应用目录</td><td>优先级强，容易压过调试路径；传递语义可能造成意外</td><td>新构建尽量避免旧式 RPATH</td></tr>
+<tr><td><code>RUNPATH</code></td><td>新式标签，更利于环境变量临时覆盖</td><td>只对直接依赖生效，子依赖可能仍找不到</td><td>发布二进制优先使用</td></tr>
+<tr><td><code>LD_LIBRARY_PATH</code></td><td>不用重编译，快速验证路径问题</td><td>污染全局进程，可能让 Python、MPI、NCCL 加载错误库</td><td>仅在单次命令前缀使用，避免写入系统级 profile</td></tr>
+</table>
+<pre><code># 查看 RPATH/RUNPATH
+readelf -d ./worker | egrep 'RPATH|RUNPATH'
+
+# 临时验证某个库目录是否能解决 not found
+LD_LIBRARY_PATH=/opt/nccl/lib:$LD_LIBRARY_PATH ldd ./worker | grep nccl
+
+# 更推荐的单命令作用域：不要永久 export 到所有 shell
+env LD_LIBRARY_PATH=/usr/local/cuda/lib64 ./worker --version</code></pre>
+<div class="danger"><strong>生产警告：</strong> 把 <code>LD_LIBRARY_PATH</code> 写进 <code>/etc/profile</code>、基础镜像或调度器全局环境，可能让无关任务加载错误的 <code>libstdc++</code>、MPI、NCCL 或 CUDA 库。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. <code>not found</code> 的定位方法</h2>
+<p><code>not found</code> 表示动态链接器按当前规则找不到某个 soname。处理时不要盲目复制 <code>.so</code> 到系统目录，而要先确认这个库应该由哪个包、镜像层或挂载提供。</p>
+<pre><code># 1. 找出缺失项
+ldd ./worker | grep 'not found' || true
+
+# 2. 查看二进制声明的 soname
+readelf -d ./worker | grep NEEDED
+
+# 3. 在常见目录搜索候选库
+find /usr /usr/local /opt /opt/conda -name 'libnccl.so*' 2&gt;/dev/null
+
+# 4. 查看缓存是否知道它
+ldconfig -p | grep libnccl || true
+
+# 5. 单命令临时验证路径，不污染全局环境
+env LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH ldd ./worker</code></pre>
+<table>
+<tr><th>缺失库</th><th>常见来源</th><th>AI Infra 处理方向</th></tr>
+<tr><td><code>libcuda.so.1</code></td><td>NVIDIA 宿主驱动或容器运行时挂载</td><td>检查宿主驱动、<code>nvidia-container-runtime</code>、容器设备和驱动库挂载</td></tr>
+<tr><td><code>libcudart.so.X</code></td><td>CUDA toolkit、Conda、pip wheel</td><td>确认应用编译/运行需要的 CUDA major 版本</td></tr>
+<tr><td><code>libcudnn.so.X</code></td><td>cuDNN 包、框架 wheel、容器镜像</td><td>对齐框架支持的 cuDNN major/minor</td></tr>
+<tr><td><code>libnccl.so.2</code></td><td>NCCL 系统包、Conda、PyTorch wheel</td><td>避免系统 NCCL 与 wheel 内置 NCCL 混用</td></tr>
+<tr><td><code>libibverbs.so</code></td><td>RDMA userspace 包</td><td>检查 OFED/RDMA core、容器挂载和插件目录</td></tr>
+</table>
+<div class="warn"><strong>不要乱复制：</strong> 复制单个 <code>.so</code> 可能绕过包管理和 ABI 约束，引入更隐蔽的 <code>undefined symbol</code> 或崩溃。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. CUDA 依赖：<code>libcuda</code> 与 <code>libcudart</code></h2>
+<p><code>libcuda.so.1</code> 是 NVIDIA driver API 库，通常由宿主驱动提供；<code>libcudart.so</code> 是 CUDA runtime，通常由 CUDA toolkit、Conda 或框架 wheel 提供。很多排障误区来自把这两者混为一谈。</p>
+<table>
+<tr><th>库</th><th>来源</th><th>版本关系</th><th>常见错误</th></tr>
+<tr><td><code>libcuda.so.1</code></td><td>宿主 NVIDIA 驱动</td><td>驱动决定可支持的最高 CUDA 能力</td><td>容器中 <code>not found</code>，通常是驱动库未挂载</td></tr>
+<tr><td><code>libcudart.so.11/12</code></td><td>CUDA toolkit 或 wheel</td><td>应用编译期/runtime major 要匹配</td><td>加载了另一个 CUDA 目录下的 runtime</td></tr>
+<tr><td><code>libnvrtc.so</code></td><td>CUDA toolkit 或 wheel</td><td>JIT 编译相关</td><td>Triton、PyTorch extension 编译时报缺失</td></tr>
+<tr><td><code>libcublas.so</code></td><td>CUDA math libs 或 wheel</td><td>常随框架 wheel 打包</td><td>系统库覆盖 wheel 内置库导致符号不匹配</td></tr>
+</table>
+<pre><code># 检查 CUDA 相关解析路径
+ldd ./worker | egrep 'libcuda|libcudart|libnvrtc|libcublas|libcurand'
+
+# 容器里确认驱动是否可见
+nvidia-smi
+ldconfig -p | grep libcuda
+
+# Python 侧对照
+python - <<'PY'
+import torch
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+PY</code></pre>
+<div class="note"><strong>判断逻辑：</strong> <code>libcuda.so.1</code> 缺失优先查宿主驱动/容器运行时；<code>libcudart.so</code> 缺失优先查应用镜像、Conda 环境或 CUDA toolkit。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. cuDNN、NCCL 与版本冲突</h2>
+<p>cuDNN 和 NCCL 通常以稳定 soname 暴露，例如 <code>libcudnn.so.8</code>、<code>libnccl.so.2</code>。soname 相同不代表行为完全一致，minor 版本、构建选项、依赖链和符号集合仍可能不同。</p>
+<pre><code># 看当前程序到底命中了哪份库
+ldd ./worker | egrep 'libcudnn|libnccl'
+
+# 查看候选库文件和链接关系
+find /usr /usr/local /opt/conda -name 'libcudnn.so*' -o -name 'libnccl.so*' 2&gt;/dev/null | sort
+
+# 查看 soname 和依赖
+readelf -d /path/to/libnccl.so.2 | egrep 'SONAME|NEEDED|RPATH|RUNPATH'
+
+# NCCL 运行时日志也要一起看
+NCCL_DEBUG=INFO ./worker 2&gt;&amp;1 | tee nccl.log</code></pre>
+<table>
+<tr><th>现象</th><th>可能根因</th><th>定位动作</th></tr>
+<tr><td><code>undefined symbol</code></td><td>加载到旧库或 ABI 不兼容库</td><td><code>ldd</code> 看路径，<code>nm -D</code>/<code>readelf -Ws</code> 查符号</td></tr>
+<tr><td>NCCL 初始化 hang</td><td>NCCL 与 RDMA/MPI/驱动库组合异常</td><td>对照 <code>ldd</code>、<code>NCCL_DEBUG=INFO</code>、<code>ibv_devinfo</code></td></tr>
+<tr><td>性能显著下降</td><td>加载了非预期 NCCL 或禁用了高速通道</td><td>确认 <code>libnccl.so.2</code> 路径，查看 NCCL 日志中的 NET/Transport</td></tr>
+<tr><td>cuDNN 报算法或符号错误</td><td>框架 wheel 与系统 cuDNN 混用</td><td>隔离 <code>LD_LIBRARY_PATH</code>，优先使用框架期望的库集合</td></tr>
+</table>
+<div class="success"><strong>实践原则：</strong> PyTorch、TensorFlow、TensorRT、NCCL 这类栈尽量保持“同一发布渠道的一组库”一起使用，不要只替换其中一个 <code>.so</code>。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. Python 扩展与 PyTorch/TensorRT</h2>
+<p>Python import 报错时，真正失败的经常不是 <code>.py</code>，而是某个 <code>.so</code> 扩展。先定位扩展文件，再对扩展运行 <code>ldd</code>。</p>
+<pre><code># 找一个包里的扩展模块
+python - <<'PY'
+import pathlib, importlib.util
+import torch
+root = pathlib.Path(torch.__file__).parent
+for p in root.rglob("*.so"):
+    if "cuda" in p.name.lower() or "torch" in p.name.lower():
+        print(p)
+        break
+PY
+
+# 对具体扩展检查依赖
+ldd /opt/conda/lib/python3.10/site-packages/some_pkg/_C.so
+
+# import 失败时保留完整错误
+python -X faulthandler -c 'import some_pkg' 2&gt;&amp;1 | tee import-error.log</code></pre>
+<div class="grid-2">
+<div class="card"><strong>pip wheel 自带库</strong><br>很多 wheel 会把 <code>.so</code> 放在包目录内，并通过 RUNPATH 或加载器逻辑定位。外部 <code>LD_LIBRARY_PATH</code> 可能破坏这个设计。</div>
+<div class="card"><strong>自编译扩展</strong><br>使用 <code>torch.utils.cpp_extension</code>、CMake 或 Bazel 编译时，要确认编译期和运行期看到的 CUDA/NCCL/cuDNN 一致。</div>
+</div>
+<div class="warn"><strong>常见陷阱：</strong> 在 Conda 环境里安装系统级 CUDA/NCCL 后，再全局 export <code>LD_LIBRARY_PATH</code>，可能让本来可用的 PyTorch wheel 加载错误依赖。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 容器、驱动挂载与 ldconfig</h2>
+<p>容器里的 CUDA 应用通常依赖宿主 NVIDIA 驱动库挂载。镜像里可以有 CUDA runtime 和框架库，但不应该把宿主驱动库静态复制进镜像来“修复” <code>libcuda.so.1</code>。</p>
+<pre><code># 容器内检查 GPU 和驱动库可见性
+nvidia-smi
+ldconfig -p | grep libcuda
+ls -l /usr/lib/x86_64-linux-gnu/libcuda.so* 2&gt;/dev/null || true
+
+# 检查程序依赖是否解析到挂载的驱动库
+ldd ./worker | grep libcuda
+
+# 如果改了 /etc/ld.so.conf.d，需要更新缓存
+sudo ldconfig
+ldconfig -p | grep /usr/local/cuda</code></pre>
+<table>
+<tr><th>场景</th><th>正确方向</th><th>避免</th></tr>
+<tr><td>Docker GPU 容器</td><td>使用 NVIDIA Container Toolkit 挂载驱动库和设备</td><td>把宿主 <code>libcuda.so.1</code> 复制进镜像</td></tr>
+<tr><td>Kubernetes</td><td>检查 device plugin、runtimeClass、驱动容器和节点标签</td><td>只在业务容器里改 <code>LD_LIBRARY_PATH</code> 掩盖节点问题</td></tr>
+<tr><td>HPC/Slurm</td><td>确认作业节点的 module、MPI、CUDA、NCCL 一致</td><td>登录节点测试正常就假设计算节点也正常</td></tr>
+</table>
+<div class="note"><strong>容器边界：</strong> <code>ldd</code> 必须在实际运行容器里执行；宿主上的输出不能代表容器里的依赖解析。</div>
+</section>
+
+<section class="figure" id="s12">
+<h3>对比图：ldd、readelf、objdump、LD_DEBUG 各看什么</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="ldd readelf objdump LD_DEBUG 对比">
+<rect x="18" y="18" width="1064" height="620" rx="22" fill="#fbfdff" stroke="#d8e0ea"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700" fill="#1e3a8a">依赖分析工具分工</text>
+<rect x="70" y="120" width="225" height="360" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="182" y="162" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">ldd</text><text x="182" y="205" text-anchor="middle" font-size="15">当前环境解析结果</text><text x="182" y="235" text-anchor="middle" font-size="15">能看到 not found</text><text x="182" y="265" text-anchor="middle" font-size="15">不适合不可信二进制</text><rect x="102" y="340" width="160" height="48" rx="10" fill="#fff"/><text x="182" y="370" text-anchor="middle" font-size="14">运行时视角</text>
+<rect x="325" y="120" width="225" height="360" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="437" y="162" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">readelf</text><text x="437" y="205" text-anchor="middle" font-size="15">读取 ELF 动态段</text><text x="437" y="235" text-anchor="middle" font-size="15">NEEDED/RPATH/RUNPATH</text><text x="437" y="265" text-anchor="middle" font-size="15">不执行目标文件</text><rect x="357" y="340" width="160" height="48" rx="10" fill="#fff"/><text x="437" y="370" text-anchor="middle" font-size="14">静态视角</text>
+<rect x="580" y="120" width="225" height="360" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="692" y="162" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">objdump</text><text x="692" y="205" text-anchor="middle" font-size="15">展示 private headers</text><text x="692" y="235" text-anchor="middle" font-size="15">NEEDED/SONAME</text><text x="692" y="265" text-anchor="middle" font-size="15">脚本兼容性好</text><rect x="612" y="340" width="160" height="48" rx="10" fill="#fff"/><text x="692" y="370" text-anchor="middle" font-size="14">构建元数据</text>
+<rect x="835" y="120" width="195" height="360" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="932" y="162" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">LD_DEBUG</text><text x="932" y="205" text-anchor="middle" font-size="15">追踪每次查找</text><text x="932" y="235" text-anchor="middle" font-size="15">路径命中/失败</text><text x="932" y="265" text-anchor="middle" font-size="15">输出很 noisy</text><rect x="865" y="340" width="135" height="48" rx="10" fill="#fff"/><text x="932" y="370" text-anchor="middle" font-size="14">细粒度追踪</text>
+<rect x="165" y="545" width="770" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="581" text-anchor="middle" font-size="17" font-weight="700">安全优先：未知文件先 readelf/objdump；可信程序再 ldd；复杂路径问题用 LD_DEBUG</text>
+</svg><div class="caption">这四类工具回答的问题不同：静态声明、当前解析结果、完整查找过程，要组合使用。</div>
+</section>
+
+<section class="section">
+<h2>11. <code>ldd</code> vs <code>readelf</code> vs <code>objdump</code></h2>
+<table>
+<tr><th>工具</th><th>是否依赖当前环境</th><th>是否适合不可信样本</th><th>最适合回答</th></tr>
+<tr><td><code>ldd</code></td><td>强依赖</td><td>不适合</td><td>这次运行会加载哪份库？有没有 <code>not found</code>？</td></tr>
+<tr><td><code>readelf -d</code></td><td>弱依赖，只读文件</td><td>适合</td><td>ELF 写了哪些 <code>NEEDED</code>、<code>RPATH</code>、<code>RUNPATH</code>？</td></tr>
+<tr><td><code>objdump -p</code></td><td>弱依赖，只读文件</td><td>适合</td><td>动态段、SONAME、解释器等元数据是什么？</td></tr>
+<tr><td><code>LD_DEBUG=libs</code></td><td>强依赖，会运行程序</td><td>不适合</td><td>动态链接器具体查了哪些目录，在哪里命中？</td></tr>
+</table>
+<pre><code># 静态看依赖声明，适合未知文件
+readelf -d ./worker | egrep 'NEEDED|RPATH|RUNPATH'
+objdump -p ./worker | egrep 'NEEDED|RPATH|RUNPATH'
+
+# 当前环境解析结果，适合可信文件
+ldd ./worker
+
+# 查找过程追踪，适合可信程序的疑难路径问题
+LD_DEBUG=libs ./worker --help 2&gt;ld-debug.log</code></pre>
+<div class="success"><strong>组合套路：</strong> <code>readelf</code> 确认“需要什么”，<code>ldd</code> 确认“找到了什么”，<code>LD_DEBUG</code> 确认“为什么这样找”。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 高级选项：<code>-v</code>、<code>-u</code>、<code>-r</code></h2>
+<p>不同发行版的 <code>ldd</code> 支持选项略有差异，常见 glibc 版本提供版本信息、未使用直接依赖、重定位检查等能力。先看 <code>ldd --help</code> 再写自动化脚本。</p>
+<table>
+<tr><th>选项</th><th>作用</th><th>使用场景</th></tr>
+<tr><td><code>ldd -v</code></td><td>打印更详细的版本需求信息</td><td>排查 <code>GLIBCXX_*</code>、<code>GLIBC_*</code> 版本需求</td></tr>
+<tr><td><code>ldd -u</code></td><td>报告未使用的直接依赖</td><td>瘦身或构建依赖审查，不能简单等同“可以删除”</td></tr>
+<tr><td><code>ldd -r</code></td><td>执行数据和函数重定位检查</td><td>提前暴露部分未解析符号问题</td></tr>
+<tr><td><code>ldd -d</code></td><td>执行数据重定位检查</td><td>比 <code>-r</code> 范围窄，较少用</td></tr>
+</table>
+<pre><code># 版本需求
+ldd -v ./worker | less
+
+# 检查未解析符号，适合可信二进制
+ldd -r ./plugin.so
+
+# 未使用直接依赖仅作为线索，不要自动删除
+ldd -u ./worker</code></pre>
+<div class="warn"><strong>解释谨慎：</strong> <code>ldd -u</code> 可能误导插件式程序；某些库为初始化副作用、弱符号、dlopen 或 ABI 兼容而保留。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. <code>LD_DEBUG</code> 精细追踪</h2>
+<p>当 <code>ldd</code> 只告诉你“最终结果不对”，但你不知道动态链接器为什么选了这个路径时，用 <code>LD_DEBUG=libs</code> 追踪查找过程。它输出很多，建议重定向到文件并用 <code>grep</code> 缩小范围。</p>
+<pre><code># 追踪库查找过程
+LD_DEBUG=libs ./worker --help 2&gt;ld-debug.log
+
+# 只看某个库的查找记录
+grep -n 'libnccl.so' ld-debug.log | head -40
+
+# 常见还可看绑定信息，但输出更大
+LD_DEBUG=libs,bindings ./worker --help 2&gt;ld-debug-bindings.log</code></pre>
+<div class="grid-2">
+<div class="card"><strong>适合场景</strong><br>同名库太多、RUNPATH 不生效、容器和 Conda 互相覆盖、<code>ldconfig</code> 缓存看起来正确但程序仍选错。</div>
+<div class="card"><strong>不适合场景</strong><br>不可信程序、会产生副作用的服务、必须连接生产资源的启动命令。追踪前先找 <code>--help</code>、<code>--version</code> 等低风险入口。</div>
+</div>
+<div class="danger"><strong>副作用提醒：</strong> <code>LD_DEBUG</code> 会运行目标程序。不要用生产入口命令做试验，先选择不会改数据、不会拉起训练任务的参数。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 安全使用 ldd</h2>
+<p><code>ldd</code> 的安全风险来自它通常通过动态链接器的特殊模式处理目标文件，而不是像 <code>readelf</code> 那样纯粹解析字节。对未知来源的 ELF，直接 <code>ldd</code> 是不必要的风险。</p>
+<table>
+<tr><th>目标文件来源</th><th>推荐动作</th><th>原因</th></tr>
+<tr><td>自己构建、可信镜像内程序</td><td>可以使用 <code>ldd</code>，但注意环境变量影响</td><td>需要当前环境解析结果</td></tr>
+<tr><td>第三方下载、工单附件、未知样本</td><td>先用 <code>readelf -d</code>、<code>objdump -p</code></td><td>只读分析，避免触发代码执行</td></tr>
+<tr><td>必须动态分析的未知样本</td><td>隔离 VM/容器、无网络、只读挂载、低权限用户</td><td>把风险限制在沙箱内</td></tr>
+</table>
+<pre><code># 安全优先的未知 ELF 初筛
+file ./unknown
+readelf -h ./unknown
+readelf -d ./unknown 2&gt;/dev/null | egrep 'NEEDED|RPATH|RUNPATH|INTERP'
+objdump -p ./unknown 2&gt;/dev/null | egrep 'NEEDED|RPATH|RUNPATH'
+
+# 可信后再考虑在隔离环境里 ldd
+docker run --rm -it --network none -v "$PWD:/work:ro" ubuntu:22.04 bash</code></pre>
+<div class="danger"><strong>底线：</strong> 不要为了看 <code>not found</code> 对未知二进制直接运行 <code>ldd</code>。静态工具已经能回答“它声明需要什么”。</div>
+</section>
+
+<section class="figure" id="s16">
+<h3>排障决策树：从报错到修复路径</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="ldd 排障决策树">
+<rect x="18" y="18" width="1064" height="720" rx="22" fill="#fbfdff" stroke="#d8e0ea"/>
+<text x="550" y="62" text-anchor="middle" font-size="27" font-weight="700" fill="#1e3a8a">共享库问题排障决策树</text>
+<rect x="410" y="95" width="280" height="70" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="137" text-anchor="middle" font-size="20" font-weight="700" fill="#991b1b">ImportError / not found / undefined symbol</text>
+<polygon points="550,205 725,285 550,365 375,285" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="280" text-anchor="middle" font-size="17" font-weight="700">目标二进制可信？</text><text x="550" y="305" text-anchor="middle" font-size="14">未知样本不要直接 ldd</text>
+<rect x="90" y="245" width="230" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="205" y="280" text-anchor="middle" font-size="18" font-weight="700">否：静态分析</text><text x="205" y="307" text-anchor="middle" font-size="14">readelf / objdump</text>
+<rect x="780" y="245" width="230" height="82" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="895" y="280" text-anchor="middle" font-size="18" font-weight="700">是：运行 ldd</text><text x="895" y="307" text-anchor="middle" font-size="14">记录当前环境</text>
+<rect x="110" y="440" width="250" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="235" y="474" text-anchor="middle" font-size="18" font-weight="700">看到 NEEDED/RUNPATH</text><text x="235" y="501" text-anchor="middle" font-size="14">判断需要哪个包提供</text>
+<rect x="425" y="440" width="250" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="474" text-anchor="middle" font-size="18" font-weight="700">有 not found？</text><text x="550" y="501" text-anchor="middle" font-size="14">补安装/补挂载/补路径</text>
+<rect x="740" y="440" width="250" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="865" y="474" text-anchor="middle" font-size="18" font-weight="700">路径不符合预期？</text><text x="865" y="501" text-anchor="middle" font-size="14">查 RPATH/LD_LIBRARY_PATH</text>
+<rect x="210" y="625" width="680" height="62" rx="14" fill="#fff7ed" stroke="#fdba74"/><text x="550" y="662" text-anchor="middle" font-size="18" font-weight="700" fill="#9a3412">修复后重新 ldd + 最小启动验证 + 记录环境，不要只改到“能跑一次”</text>
+<line x1="550" y1="165" x2="550" y2="205" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="375" y1="285" x2="320" y2="285" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="335" y="267" font-size="14">否</text><line x1="725" y1="285" x2="780" y2="285" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="755" y="267" font-size="14">是</text><path d="M205 327 C205 375,220 405,235 440" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M895 327 C820 390,640 405,560 440" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M895 327 C900 380,880 405,865 440" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="235" y1="526" x2="405" y2="625" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="550" y1="526" x2="550" y2="625" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="865" y1="526" x2="695" y2="625" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">先判断安全边界，再判断缺失还是选错，最后才进入修复。不要把 <code>LD_LIBRARY_PATH</code> 当成唯一答案。</div>
+</section>
+
+<section class="section">
+<h2>15. 排障流程与决策树</h2>
+<p>真实故障通常混合了“缺库”“路径错”“版本错”“运行时 dlopen”“容器挂载错”。建议按固定顺序收集证据，避免在没有证据时反复改环境变量。</p>
+<pre><code># 0. 记录环境，便于复现
+pwd
+uname -a
+cat /etc/os-release | head
+env | egrep 'LD_LIBRARY_PATH|CUDA|NCCL|CONDA|VIRTUAL_ENV' | sort
+
+# 1. 找到真正报错的二进制或 .so
+file ./worker
+readelf -d ./worker | egrep 'NEEDED|RPATH|RUNPATH'
+
+# 2. 可信目标才 ldd
+ldd ./worker | tee ldd.worker.txt
+
+# 3. 如果路径不符合预期，用 LD_DEBUG 追踪
+LD_DEBUG=libs ./worker --help 2&gt;ld-debug.log
+
+# 4. 修复后做最小启动验证
+./worker --version || ./worker --help</code></pre>
+<div class="grid-2">
+<div class="card"><strong>缺库路径</strong><br>先确定提供者：系统包、Conda 包、CUDA toolkit、NVIDIA 驱动挂载、框架 wheel。再决定安装、挂载、RUNPATH 或局部环境变量。</div>
+<div class="card"><strong>选错路径</strong><br>先找覆盖源：旧 RPATH、全局 <code>LD_LIBRARY_PATH</code>、<code>ld.so.cache</code>、Conda 激活脚本、MPI launcher 传入环境。</div>
+</div>
+<div class="success"><strong>完成标准：</strong> 修复后不仅要 <code>ldd</code> 无 <code>not found</code>，还要最小启动成功，并记录关键库路径，方便下次回归。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 生产修复策略</h2>
+<p>依赖修复要可复现、可回滚、可审计。临时 export 可以用于验证假设，但不应该成为长期方案。长期方案应落在镜像构建、包版本锁定、RUNPATH、模块系统或调度器作业环境里。</p>
+<table>
+<tr><th>修复方式</th><th>适合</th><th>风险</th><th>验证</th></tr>
+<tr><td>安装正确包</td><td>系统服务、基础镜像</td><td>升级影响其他程序</td><td><code>ldconfig -p</code>、<code>ldd</code>、回归测试</td></tr>
+<tr><td>重建镜像</td><td>容器化训练/推理</td><td>镜像层里可能残留旧库</td><td>在目标镜像内运行 <code>ldd</code></td></tr>
+<tr><td>设置 RUNPATH</td><td>自发布二进制</td><td>子依赖仍需处理</td><td><code>readelf -d</code> 和干净环境启动</td></tr>
+<tr><td>局部 <code>LD_LIBRARY_PATH</code></td><td>验证假设、临时绕过</td><td>污染依赖解析</td><td>仅单命令使用，记录原因和移除计划</td></tr>
+<tr><td>版本锁定</td><td>Conda/pip/CUDA/NCCL 组合</td><td>锁得过死影响安全升级</td><td>CI 中采集关键 <code>ldd</code> 输出</td></tr>
+</table>
+<pre><code># CI/镜像验收中保存关键依赖路径
+set -euo pipefail
+bin=./worker
+ldd "$bin" | tee /tmp/ldd.txt
+! grep -q 'not found' /tmp/ldd.txt
+grep -E 'libcuda|libcudart|libcudnn|libnccl' /tmp/ldd.txt
+
+# 临时验证可以这样写，但不要永久化
+env LD_LIBRARY_PATH=/opt/vendor/lib:$LD_LIBRARY_PATH "$bin" --version</code></pre>
+<div class="danger"><strong>变更纪律：</strong> 修复共享库问题时不要同时升级驱动、CUDA、NCCL、框架和 MPI。一次只改一个变量，否则无法判断哪个变化真正解决了问题。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 检查清单与练习</h2>
+<h3>上线前检查清单</h3>
+<ul>
+<li>关键二进制或 Python 扩展的 <code>ldd</code> 输出无 <code>not found</code>。</li>
+<li><code>libcuda.so.1</code> 解析到宿主驱动挂载或系统驱动路径，而不是镜像里手工复制的旧文件。</li>
+<li><code>libcudart</code>、<code>libcudnn</code>、<code>libnccl</code> 路径来自预期渠道，未被全局 <code>LD_LIBRARY_PATH</code> 覆盖。</li>
+<li><code>readelf -d</code> 中的 <code>RPATH/RUNPATH</code> 能解释当前解析结果。</li>
+<li>容器内、调度器作业内、交互 shell 内的检查结果一致或差异可解释。</li>
+<li>修复动作写入镜像、包依赖或作业模板，而不是只停留在手工 shell 历史里。</li>
+</ul>
+<h3>练习任务</h3>
+<ol>
+<li>对 <code>/bin/ls</code> 运行 <code>ldd</code>，指出 <code>linux-vdso</code>、动态链接器和普通共享库。</li>
+<li>用 <code>readelf -d</code> 查看一个 Python <code>.so</code> 扩展的 <code>NEEDED</code> 列表。</li>
+<li>临时清空 <code>LD_LIBRARY_PATH</code> 后重新运行 <code>ldd</code>，比较路径是否变化。</li>
+<li>找出环境中的 <code>libcuda.so.1</code>、<code>libcudart.so</code>、<code>libnccl.so.2</code> 分别来自哪里。</li>
+<li>对一个可信小程序使用 <code>LD_DEBUG=libs</code>，观察动态链接器查找目录的顺序。</li>
+</ol>
+<pre><code># 练习：最小安全观察
+ldd /bin/ls
+readelf -d /bin/ls | egrep 'NEEDED|RPATH|RUNPATH|INTERP'
+
+# 比较环境变量影响
+env -u LD_LIBRARY_PATH ldd ./worker &gt;ldd.clean.txt
+ldd ./worker &gt;ldd.current.txt
+diff -u ldd.clean.txt ldd.current.txt || true</code></pre>
+</section>
+
+<section class="refbox" id="refs"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>ldd(1)</code>、<code>ld.so(8)</code>、<code>ldconfig(8)</code>，重点阅读安全说明、搜索路径顺序和环境变量行为。</li>
+<li>GNU C Library Manual：动态链接器、运行时链接、共享库搜索路径和 secure-execution mode。</li>
+<li>System V ABI / ELF 资料：<code>DT_NEEDED</code>、<code>DT_RPATH</code>、<code>DT_RUNPATH</code>、<code>SONAME</code> 等动态段字段。</li>
+<li>NVIDIA CUDA、cuDNN、NCCL 官方安装文档：确认 driver、runtime、library 和容器运行时的职责边界。</li>
+<li>binutils 文档：<code>readelf</code>、<code>objdump</code>、<code>nm</code> 对 ELF 元数据和符号表的分析方法。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解 ELF <code>NEEDED</code> 与动态链接器搜索顺序，再掌握 <code>ldd</code> 输出解释，最后学习 RPATH/RUNPATH、CUDA/NCCL 版本边界和安全替代工具。</p></section>
+<div class="footer">ldd 深度教程 · AI Infra 共享库依赖解析、CUDA/cuDNN/NCCL 冲突、RPATH/RUNPATH 与安全排障</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>sar 深度教程：AI Infra 的历史性能指标与事故复盘</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--slate2);font-size:12px;color:#334155;font-weight:700}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>sar 深度教程：AI Infra 的历史性能指标与事故复盘</h1>
+<p class="sub">这份教程面向 AI Infra、GPU 集群运维、训练平台 SRE 和性能排障工程师。它不是简单罗列 <code>sar</code> 参数，而是从 sysstat 的“后台采样 + 历史二进制档案 + 事后按维度回放”模型出发，讲清楚 CPU、内存、网络、磁盘模式，<code>sar -u/-r/-n/-d</code> 的读法，如何读取 <code>sa</code> 文件，如何还原事故时间线，以及如何理解采样开销、保留周期和 sar 与 vmstat/mpstat/iostat 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">sysstat</span><span class="chip">历史指标</span><span class="chip">CPU</span><span class="chip">内存</span><span class="chip">网络</span><span class="chip">磁盘</span><span class="chip">事故复盘</span><span class="chip">低开销采样</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>sar</code> 是 sysstat 套件里的历史性能回放器：后台 <code>sadc</code> 周期性采样系统指标，写入每日 <code>saXX</code> 文件，排障时再用 <code>sar</code> 按 CPU、内存、网络、磁盘等维度回放某段时间。</div>
+<div class="success"><strong>生产实践：</strong> 对 AI 训练节点，提前启用 sysstat 比事故后临时装工具更重要；<code>sar</code> 不是实时追踪器，而是“低成本黑匣子”，适合回答“昨天 02:13 到底发生了什么”。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">sar 是什么：历史性能黑匣子</a></li>
+<li><a class="anchor" href="#s2">安装与启用 sysstat 采集</a></li>
+<li><a class="anchor" href="#s3">核心模型：sadc 采样、sa 文件、sar 回放</a></li>
+<li><a class="anchor" href="#s4">快速上手：实时采样与历史查询</a></li>
+<li><a class="anchor" href="#s5">CPU 模式：sar -u 与饱和判断</a></li>
+<li><a class="anchor" href="#s6">内存模式：sar -r 与缓存/回收压力</a></li>
+<li><a class="anchor" href="#s7">网络模式：sar -n DEV/TCP/ETCP</a></li>
+<li><a class="anchor" href="#s8">磁盘模式：sar -d 与 I/O 队列</a></li>
+<li><a class="anchor" href="#s9">读取 sa 文件与时间窗口</a></li>
+<li><a class="anchor" href="#s10">事故时间线重建方法</a></li>
+<li><a class="anchor" href="#s11">AI 训练场景的典型读法</a></li>
+<li><a class="anchor" href="#s12">保留周期、采样频率与开销</a></li>
+<li><a class="anchor" href="#s13">sar vs vmstat/mpstat/iostat</a></li>
+<li><a class="anchor" href="#s14">脚本化导出与报表</a></li>
+<li><a class="anchor" href="#s15">安全注意事项与权限边界</a></li>
+<li><a class="anchor" href="#s16">常见问题与排障</a></li>
+<li><a class="anchor" href="#s17">学习路线与练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. sar 是什么：历史性能黑匣子</h2>
+<p><code>sar</code> 是 sysstat 项目中的系统活动报告工具。它可以实时按间隔打印指标，也可以读取历史采样文件。对 AI Infra 来说，后者更关键：训练任务失败、吞吐突然下降、数据加载变慢、RDMA 或 TCP 抖动、磁盘卡顿，很多问题发生时没有人在终端里盯着 <code>top</code>，但如果 sysstat 已经启用，<code>sar</code> 能帮你事后回放。</p>
+<div class="grid-3"><div class="card"><strong>实时视角</strong><br><code>sar -u 1 5</code> 这类命令像轻量监控，每 1 秒打印一次当前 CPU 指标，共 5 次。</div><div class="card"><strong>历史视角</strong><br><code>sar -f /var/log/sa/sa24</code> 从历史二进制文件读取某天的采样，适合复盘。</div><div class="card"><strong>AI Infra 价值</strong><br>把 GPU 监控、训练日志、NCCL 日志、节点事件和主机指标对齐，定位瓶颈在 CPU、内存、网络还是磁盘。</div></div>
+<pre><code># 立刻观察 CPU，1 秒一次，共 5 次
+sar -u 1 5
+
+# 观察内存，2 秒一次，共 10 次
+sar -r 2 10
+
+# 回放今天 sysstat 采集的所有默认报告
+sar
+
+# 回放指定历史文件
+sar -f /var/log/sa/sa24</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>sar</code> 采样粒度通常是分钟级，不适合分析微秒级延迟尖刺或内核函数热点；那类问题应结合 <code>perf</code>、eBPF、应用 tracing 或设备侧遥测。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 安装与启用 sysstat 采集</h2>
+<p>很多发行版安装 <code>sysstat</code> 后不会自动启用历史采集，或者采集频率由 systemd timer / cron 控制。先确认采集链路是否存在，再谈复盘。</p>
+<table><tr><th>发行版</th><th>安装</th><th>常见启用方式</th><th>历史文件位置</th></tr><tr><td>RHEL / CentOS / Rocky / Alma</td><td><code>dnf install sysstat</code> 或 <code>yum install sysstat</code></td><td><code>systemctl enable --now sysstat</code>；旧系统可能使用 <code>/etc/cron.d/sysstat</code></td><td><code>/var/log/sa/saDD</code></td></tr><tr><td>Ubuntu / Debian</td><td><code>apt install sysstat</code></td><td>配置 <code>/etc/default/sysstat</code> 的 <code>ENABLED="true"</code>，再启用 timer 或 cron</td><td><code>/var/log/sysstat/saDD</code></td></tr><tr><td>SUSE</td><td><code>zypper install sysstat</code></td><td>systemd timer 或 cron，路径随版本略有差异</td><td><code>/var/log/sa/saDD</code> 或发行版约定路径</td></tr></table>
+<pre><code># 查看是否安装
+sar -V
+
+# systemd 环境：查看采集 timer/service
+systemctl list-timers | grep -E 'sysstat|sa'
+systemctl status sysstat 2&gt;/dev/null
+
+# cron 环境：查看采集配置
+grep -R "sa1\\|sadc\\|sa2" /etc/cron.d /etc/cron* 2&gt;/dev/null
+
+# 查看历史文件是否在增长
+ls -lh /var/log/sa /var/log/sysstat 2&gt;/dev/null</code></pre>
+<div class="note"><strong>命名习惯：</strong> <code>saDD</code> 通常是二进制采样文件，例如 <code>sa24</code> 表示当月 24 日；有些系统还会生成 <code>sarDD</code> 文本报表。</div>
+</section>
+
+<section class="figure" id="fig-model">
+<h3>信息图：sar 的整体心智模型</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="sar sysstat 采样与回放模型">
+<rect x="16" y="18" width="1068" height="620" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">sysstat = 低开销采样链路 + 历史回放入口</text>
+<rect x="55" y="128" width="205" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="158" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">内核计数器</text><text x="158" y="198" text-anchor="middle" font-size="15">/proc /sys</text><text x="158" y="220" text-anchor="middle" font-size="15">CPU / Mem / Net / Disk</text>
+<rect x="320" y="128" width="205" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="423" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">sadc / sa1</text><text x="423" y="198" text-anchor="middle" font-size="15">后台周期采样</text><text x="423" y="220" text-anchor="middle" font-size="15">timer / cron</text>
+<rect x="585" y="128" width="205" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="688" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">saDD 文件</text><text x="688" y="198" text-anchor="middle" font-size="15">每日二进制档案</text><text x="688" y="220" text-anchor="middle" font-size="15">/var/log/sa</text>
+<rect x="850" y="128" width="205" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="953" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">sar 查询</text><text x="953" y="198" text-anchor="middle" font-size="15">按维度回放</text><text x="953" y="220" text-anchor="middle" font-size="15">-u -r -n -d</text>
+<rect x="130" y="352" width="840" height="175" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="393" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">AI Infra 排障：把“发生过的现象”转成可对齐的时间序列</text><text x="550" y="434" text-anchor="middle" font-size="16">训练日志时间戳 + GPU 利用率 + sar CPU/内存/网络/磁盘 + 节点事件</text><text x="550" y="465" text-anchor="middle" font-size="16">目标不是证明某个指标异常，而是重建瓶颈传播链：数据 → CPU → 内存 → 网络 → 磁盘 → GPU</text>
+<line x1="260" y1="181" x2="320" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="525" y1="181" x2="585" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="790" y1="181" x2="850" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><path d="M953 233 C905 300, 770 335, 690 352" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">理解 sar 的关键是“先采集，后回放”。事故发生后才安装 sysstat，无法补回历史。</div></section>
+
+<section class="section" id="s3">
+<h2>3. 核心模型：sadc 采样、sa 文件、sar 回放</h2>
+<p>sysstat 通常由三层组成：<code>sadc</code> 从系统计数器读取原始数据；<code>sa1</code> 由 cron 或 systemd timer 调用 <code>sadc</code> 写入每日文件；<code>sar</code> 读取当前或历史文件并格式化输出。<code>sa2</code> 则常用于生成每日文本摘要。</p>
+<table><tr><th>组件</th><th>角色</th><th>你通常怎么接触它</th></tr><tr><td><code>sadc</code></td><td>系统活动数据采集器，写二进制记录</td><td>很少直接运行，多由 <code>sa1</code> 调用</td></tr><tr><td><code>sa1</code></td><td>采集脚本包装器</td><td>在 cron/timer 配置里看到</td></tr><tr><td><code>sa2</code></td><td>日报脚本包装器</td><td>生成 <code>sarDD</code> 文本摘要</td></tr><tr><td><code>sar</code></td><td>查询和格式化工具</td><td>日常排障主要入口</td></tr></table>
+<pre><code># 查看 sysstat 版本和功能
+sar -V
+
+# 查看当天默认历史报告
+sar
+
+# 指定间隔实时采样：interval count
+sar -u 1 3
+
+# 指定历史文件回放 CPU
+sar -u -f /var/log/sa/sa24</code></pre>
+<div class="success"><strong>心智模型：</strong> <code>sar</code> 输出多数是“两个采样点之间的平均速率或比例”，不是瞬时值。不要把 10 分钟采样间隔里的平均值误读成尖刺峰值。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 快速上手：实时采样与历史查询</h2>
+<p><code>sar</code> 命令基本结构是：选择报告类型，选择实时采样间隔或历史文件，再选择时间窗口。</p>
+<pre><code># CPU：每 1 秒输出一次，共 5 次
+sar -u 1 5
+
+# 内存：每 2 秒输出一次，共 6 次
+sar -r 2 6
+
+# 网络设备：每 1 秒输出一次，共 5 次
+sar -n DEV 1 5
+
+# 磁盘设备：每 1 秒输出一次，共 5 次
+sar -d 1 5
+
+# 历史文件 + 时间窗口
+sar -u -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00</code></pre>
+<table><tr><th>维度</th><th>常用命令</th><th>适合回答的问题</th></tr><tr><td>CPU</td><td><code>sar -u</code>、<code>sar -P ALL</code></td><td>用户态、系统态、iowait、steal、空闲比例是否异常</td></tr><tr><td>内存</td><td><code>sar -r</code>、<code>sar -B</code>、<code>sar -S</code></td><td>可用内存、缓存、分页、交换是否造成训练抖动</td></tr><tr><td>网络</td><td><code>sar -n DEV</code>、<code>sar -n TCP,ETCP</code></td><td>吞吐、包率、重传、连接错误是否与 NCCL 或数据读取异常同窗</td></tr><tr><td>磁盘</td><td><code>sar -d</code>、<code>sar -b</code></td><td>块设备繁忙度、队列、等待时间是否拖慢 dataloader 或 checkpoint</td></tr></table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. CPU 模式：<code>sar -u</code> 与饱和判断</h2>
+<p><code>sar -u</code> 汇总 CPU 利用率，适合快速判断节点是否被用户态计算、内核态开销、I/O 等待或虚拟化 steal 拖住。AI 节点上，CPU 不只是“辅助资源”：数据解码、增强、压缩、Python dataloader、多进程调度、网络协议栈都可能让 GPU 饥饿。</p>
+<pre><code># 汇总 CPU 历史
+sar -u -f /var/log/sa/sa24 -s 01:30:00 -e 02:30:00
+
+# 每个 CPU 核心
+sar -P ALL -f /var/log/sa/sa24 -s 01:30:00 -e 02:30:00
+
+# 实时看 CPU
+sar -u 1 10</code></pre>
+<table><tr><th>字段</th><th>含义</th><th>AI Infra 解读</th></tr><tr><td><code>%user</code></td><td>用户态 CPU 时间</td><td>训练前处理、Python workers、数据增强、压缩解压可能升高</td></tr><tr><td><code>%system</code></td><td>内核态 CPU 时间</td><td>网络、文件系统、驱动、容器层、页回收可能导致升高</td></tr><tr><td><code>%iowait</code></td><td>CPU 等待块 I/O 的时间</td><td>数据盘、NFS、对象存储缓存、checkpoint 写入可能相关</td></tr><tr><td><code>%steal</code></td><td>虚拟化环境被宿主机抢占的时间</td><td>云上训练节点若出现 steal，可能不是应用自身问题</td></tr><tr><td><code>%idle</code></td><td>空闲比例</td><td>GPU 低利用且 CPU 很空闲时，瓶颈可能在网络、远端存储、框架同步或任务调度</td></tr></table>
+<div class="warn"><strong>读数陷阱：</strong> <code>%iowait</code> 高说明 CPU 在等待 I/O，但不等于磁盘一定满；网络文件系统、远端存储、块层队列、驱动问题都可能表现为等待。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 内存模式：<code>sar -r</code> 与缓存/回收压力</h2>
+<p><code>sar -r</code> 报告内存和缓存状态。AI 训练常见问题包括 dataloader worker 过多、页缓存被 checkpoint 或数据预取冲刷、容器内存限制触发回收、NUMA 不均衡导致局部内存压力。<code>sar -r</code> 可以给出主机级线索。</p>
+<pre><code># 内存历史窗口
+sar -r -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00
+
+# 分页活动：判断回收和 page fault 压力
+sar -B -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00
+
+# swap 使用
+sar -S -f /var/log/sa/sa24 -s 02:00:00 -e 03:00:00</code></pre>
+<table><tr><th>字段</th><th>含义</th><th>排障信号</th></tr><tr><td><code>kbmemfree</code></td><td>空闲内存</td><td>Linux 会用内存做缓存，低空闲不一定是问题</td></tr><tr><td><code>kbavail</code></td><td>估算可用内存</td><td>比 <code>kbmemfree</code> 更适合作为“还能不能分配”的信号</td></tr><tr><td><code>kbcommit</code> / <code>%commit</code></td><td>承诺分配量</td><td>过高时关注 OOM、overcommit、容器限制</td></tr><tr><td><code>kbcached</code></td><td>页缓存</td><td>数据集读取、checkpoint、日志写入会影响缓存行为</td></tr><tr><td><code>pgpgin/s</code>、<code>pgpgout/s</code></td><td>分页输入/输出</td><td>大幅升高可能对应数据加载或写 checkpoint 阶段</td></tr></table>
+<div class="note"><strong>容器注意：</strong> <code>sar</code> 多数指标来自主机视角。Kubernetes/容器内的 cgroup 限额、OOMKilled、memory.high 等需要结合 <code>kubectl describe pod</code>、cgroup 文件或平台监控确认。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 网络模式：<code>sar -n DEV/TCP/ETCP</code></h2>
+<p>网络是分布式训练最常见的外部瓶颈之一。<code>sar -n DEV</code> 看网卡吞吐和包率；<code>sar -n TCP,ETCP</code> 看 TCP 连接、重传和错误。RDMA/IB 指标不完全由 sar 覆盖，但 sar 仍能帮助判断主机侧网络是否同时间异常。</p>
+<pre><code># 网卡吞吐与包率
+sar -n DEV -f /var/log/sa/sa24 -s 10:00:00 -e 11:00:00
+
+# TCP 连接与段统计
+sar -n TCP -f /var/log/sa/sa24 -s 10:00:00 -e 11:00:00
+
+# TCP 错误、重传、reset 等扩展统计
+sar -n ETCP -f /var/log/sa/sa24 -s 10:00:00 -e 11:00:00
+
+# 同时看多个网络类别
+sar -n DEV,TCP,ETCP 1 5</code></pre>
+<table><tr><th>报告</th><th>重点字段</th><th>AI Infra 解读</th></tr><tr><td><code>DEV</code></td><td><code>rxkB/s</code>、<code>txkB/s</code>、<code>rxpck/s</code>、<code>txpck/s</code>、<code>%ifutil</code></td><td>数据集拉取、参数同步、checkpoint 上传是否接近网卡瓶颈</td></tr><tr><td><code>TCP</code></td><td><code>active/s</code>、<code>passive/s</code>、<code>iseg/s</code>、<code>oseg/s</code></td><td>连接建立和 TCP 段收发是否出现突变</td></tr><tr><td><code>ETCP</code></td><td><code>retrans/s</code>、<code>isegerr/s</code>、<code>orsts/s</code></td><td>重传升高常与吞吐下降、训练同步变慢、存储读取抖动相关</td></tr></table>
+<div class="warn"><strong>RDMA 提醒：</strong> <code>sar -n DEV</code> 可能能看到接口吞吐，但不能替代 <code>ibstat</code>、<code>ibv_devinfo</code>、交换机计数器、NCCL 日志和厂商工具。RoCE 场景还要关注 PFC/ECN/丢包与重传。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 磁盘模式：<code>sar -d</code> 与 I/O 队列</h2>
+<p><code>sar -d</code> 查看块设备活动，常用于定位数据加载、日志写入、checkpoint、容器镜像层和本地缓存盘问题。它与 <code>iostat -x</code> 关注点相近，但 <code>sar</code> 的优势在于能读历史。</p>
+<pre><code># 历史磁盘报告
+sar -d -f /var/log/sa/sa24 -s 18:00:00 -e 19:00:00
+
+# 以设备名显示，部分版本支持 -p
+sar -d -p -f /var/log/sa/sa24 -s 18:00:00 -e 19:00:00
+
+# 块 I/O 总览
+sar -b -f /var/log/sa/sa24 -s 18:00:00 -e 19:00:00</code></pre>
+<table><tr><th>字段</th><th>含义</th><th>如何使用</th></tr><tr><td><code>tps</code></td><td>每秒 I/O 请求数</td><td>小文件数据集或日志风暴会让 tps 升高</td></tr><tr><td><code>rkB/s</code>、<code>wkB/s</code></td><td>读写吞吐</td><td>判断是否接近本地盘、网络盘或缓存层吞吐上限</td></tr><tr><td><code>await</code></td><td>平均 I/O 等待时间</td><td>升高通常比单看吞吐更能反映用户感知卡顿</td></tr><tr><td><code>aqu-sz</code></td><td>平均队列长度</td><td>队列堆积时关注盘、文件系统、远端存储或请求模式</td></tr><tr><td><code>%util</code></td><td>设备忙碌比例</td><td>接近 100% 可能表示设备饱和，但多队列 NVMe 上需结合 await 和吞吐解读</td></tr></table>
+<div class="note"><strong>AI 训练典型模式：</strong> GPU 利用率周期性掉零，同时 <code>sar -d</code> 的 <code>await</code> 和 <code>aqu-sz</code> 在 batch 边界升高，通常提示 dataloader 或存储层正在拖慢输入流水线。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 读取 <code>sa</code> 文件与时间窗口</h2>
+<p>历史分析的核心命令是 <code>sar -f FILE</code>。生产上先确认系统的 sysstat 路径和保留周期，然后用 <code>-s</code>、<code>-e</code> 切出事故窗口。不同发行版路径不同，脚本要写得保守。</p>
+<pre><code># 常见历史目录
+ls -lh /var/log/sa/sa* /var/log/sysstat/sa* 2&gt;/dev/null
+
+# 读取指定日期文件：RHEL 系常见
+sar -u -f /var/log/sa/sa24
+
+# 读取指定日期文件：Debian/Ubuntu 常见
+sar -u -f /var/log/sysstat/sa24
+
+# 切时间窗口
+sar -u -f /var/log/sa/sa24 -s 02:10:00 -e 02:40:00
+
+# 只看某个报告的平均值，适合快速扫尾
+sar -r -f /var/log/sa/sa24 -s 02:10:00 -e 02:40:00 | tail -5</code></pre>
+<table><tr><th>参数</th><th>含义</th><th>示例</th></tr><tr><td><code>-f FILE</code></td><td>读取历史二进制文件</td><td><code>sar -n DEV -f /var/log/sa/sa24</code></td></tr><tr><td><code>-s HH:MM:SS</code></td><td>开始时间</td><td><code>-s 01:00:00</code></td></tr><tr><td><code>-e HH:MM:SS</code></td><td>结束时间</td><td><code>-e 02:00:00</code></td></tr><tr><td><code>-o FILE</code></td><td>实时采样时写出二进制文件</td><td><code>sar -u -o /tmp/cpu.sa 1 60</code></td></tr></table>
+<div class="danger"><strong>不要手工编辑 <code>saDD</code>：</strong> 它是二进制采样文件。需要归档就复制，不能用文本编辑器改；跨版本读取失败时优先用同版本 sysstat 或导出文本。</div>
+</section>
+
+<section class="figure" id="fig-timeline">
+<h3>流程图：用 sar 重建事故时间线</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="sar 事故时间线重建流程图">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="65" text-anchor="middle" font-size="27" font-weight="700">从“训练变慢”到“瓶颈证据链”</text>
+<rect x="70" y="120" width="205" height="95" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="173" y="158" text-anchor="middle" font-size="19" font-weight="700" fill="#1d4ed8">1. 锁定时间</text><text x="173" y="187" text-anchor="middle" font-size="14">训练日志 / 告警 / 作业事件</text>
+<rect x="330" y="120" width="205" height="95" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="433" y="158" text-anchor="middle" font-size="19" font-weight="700" fill="#0f766e">2. 读取 sa 文件</text><text x="433" y="187" text-anchor="middle" font-size="14">sar -f saDD -s -e</text>
+<rect x="590" y="120" width="205" height="95" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="693" y="158" text-anchor="middle" font-size="19" font-weight="700" fill="#6d28d9">3. 分维度扫描</text><text x="693" y="187" text-anchor="middle" font-size="14">CPU / Mem / Net / Disk</text>
+<rect x="850" y="120" width="205" height="95" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="953" y="158" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">4. 对齐证据</text><text x="953" y="187" text-anchor="middle" font-size="14">GPU / NCCL / K8s / 存储</text>
+<rect x="95" y="325" width="255" height="95" rx="16" fill="#f0fdf4" stroke="#86efac"/><text x="223" y="363" text-anchor="middle" font-size="18" font-weight="700">CPU 饱和或 iowait?</text><text x="223" y="392" text-anchor="middle" font-size="14">sar -u / -P ALL</text>
+<rect x="425" y="325" width="255" height="95" rx="16" fill="#f0fdf4" stroke="#86efac"/><text x="553" y="363" text-anchor="middle" font-size="18" font-weight="700">网络重传或吞吐异常?</text><text x="553" y="392" text-anchor="middle" font-size="14">sar -n DEV,TCP,ETCP</text>
+<rect x="755" y="325" width="255" height="95" rx="16" fill="#f0fdf4" stroke="#86efac"/><text x="883" y="363" text-anchor="middle" font-size="18" font-weight="700">磁盘等待或队列异常?</text><text x="883" y="392" text-anchor="middle" font-size="14">sar -d / -b</text>
+<rect x="235" y="540" width="630" height="85" rx="18" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="577" text-anchor="middle" font-size="20" font-weight="700" fill="#991b1b">最终输出：带时间戳的假设、证据、反证和下一步验证</text><text x="550" y="605" text-anchor="middle" font-size="14">不要只说“CPU 高”；要说明“02:12-02:18 iowait 与 checkpoint 写入同窗升高”</text>
+<line x1="275" y1="168" x2="330" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="535" y1="168" x2="590" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="795" y1="168" x2="850" y2="168" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M693 215 C600 265, 330 280, 223 325" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M693 215 C660 265, 590 280, 553 325" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M693 215 C780 265, 855 280, 883 325" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<path d="M223 420 C280 495, 400 520, 470 540" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M553 420 L553 540" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M883 420 C820 495, 700 520, 630 540" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">复盘时先固定时间窗口，再扫维度；不要先挑一个喜欢的指标去解释所有现象。</div></section>
+
+<section class="section" id="s10">
+<h2>10. 事故时间线重建方法</h2>
+<p>用 <code>sar</code> 做事故复盘，最重要的是时间对齐。先从训练日志、调度系统、告警系统、GPU 指标里确定异常窗口，再把 CPU、内存、网络、磁盘的 sar 输出切到同一段，最后按因果链组织结论。</p>
+<pre><code># 假设训练日志显示 02:13-02:26 step time 上升
+DAY=/var/log/sa/sa24
+START=02:05:00
+END=02:35:00
+
+sar -u -f "$DAY" -s "$START" -e "$END"
+sar -r -f "$DAY" -s "$START" -e "$END"
+sar -n DEV,TCP,ETCP -f "$DAY" -s "$START" -e "$END"
+sar -d -p -f "$DAY" -s "$START" -e "$END"</code></pre>
+<table><tr><th>复盘问题</th><th>sar 证据</th><th>下一步</th></tr><tr><td>GPU 利用率掉零，step time 增大</td><td><code>sar -u</code> 显示 CPU <code>%iowait</code> 同窗升高</td><td>查看 <code>sar -d</code>、训练 checkpoint、数据盘/网络盘事件</td></tr><tr><td>多机训练 all-reduce 卡顿</td><td><code>sar -n ETCP</code> 重传升高，<code>DEV</code> 吞吐下降</td><td>对齐 NCCL 日志、交换机端口、RoCE/IB 计数器</td></tr><tr><td>dataloader worker 异常慢</td><td><code>sar -u</code> 用户态接近饱和或 <code>sar -r/-B</code> 回收压力升高</td><td>检查 worker 数、CPU affinity、NUMA、文件缓存</td></tr><tr><td>节点短暂不可用</td><td>sar 出现采样缺口或全部指标异常跳变</td><td>结合 <code>journalctl</code>、BMC、内核日志、平台事件</td></tr></table>
+<div class="success"><strong>报告格式建议：</strong> 用“时间段 + 指标变化 + 关联事件 + 可排除项”写结论，例如：<code>02:12-02:18，nvme0n1 await 从 2ms 升至 95ms，GPU 利用率同步下降；CPU idle 仍高，暂不支持 CPU 饱和假设。</code></div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. AI 训练场景的典型读法</h2>
+<p>AI Infra 的 sar 分析通常围绕“GPU 为什么没吃满”展开。<code>sar</code> 不能直接告诉你 GPU 原因，但能快速排除或确认主机侧资源瓶颈。</p>
+<div class="grid-2"><div class="card"><strong>数据加载慢</strong><br>看 <code>sar -d</code> 的 <code>await/aqu-sz/%util</code>，看 <code>sar -n DEV</code> 的入站吞吐，再看 <code>sar -u</code> 是否 CPU 用户态饱和。</div><div class="card"><strong>分布式同步慢</strong><br>看 <code>sar -n DEV,TCP,ETCP</code> 是否吞吐下降或重传升高；RDMA 场景再查 IB/RoCE 专用计数器。</div><div class="card"><strong>checkpoint 卡顿</strong><br>看写盘 <code>wkB/s</code>、<code>await</code>、网络上传吞吐，以及是否与日志、对象存储、NFS 同窗。</div><div class="card"><strong>CPU worker 抢占</strong><br>看 <code>%user</code>、<code>%system</code>、每核 <code>sar -P ALL</code> 是否热点明显，再结合 <code>pidstat</code> 或 profiler 定位进程。</div></div>
+<pre><code># 一段常用的 AI 节点主机侧排障快照
+sar -u 1 5
+sar -P ALL 1 3
+sar -r 1 5
+sar -n DEV,TCP,ETCP 1 5
+sar -d -p 1 5</code></pre>
+<div class="warn"><strong>不要单指标归因：</strong> GPU 利用率低 + <code>sar -u</code> 空闲高，不等于主机没问题；可能是网络阻塞、远端存储慢、进程同步等待、锁竞争或调度暂停。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 保留周期、采样频率与开销</h2>
+<p>sysstat 的优势是低开销，但采样频率和保留周期仍要有策略。频率太低会错过短故障；频率太高会增加磁盘写入和文件体积。AI 集群可以按节点角色分层配置：训练节点保留更长，控制节点和存储网关保留更细。</p>
+<table><tr><th>策略</th><th>优点</th><th>代价</th><th>适合场景</th></tr><tr><td>10 分钟采样，7-14 天保留</td><td>开销极低，默认常见</td><td>短尖刺容易被平均掉</td><td>普通业务节点、基础趋势</td></tr><tr><td>1 分钟采样，14-31 天保留</td><td>复盘能力明显增强</td><td>文件更大，指标更多</td><td>训练节点、存储网关、网络敏感节点</td></tr><tr><td>临时 1 秒采样写 <code>-o</code></td><td>短期细粒度分析</td><td>需要主动启动，文件增长快</td><td>压测、复现、变更验证</td></tr></table>
+<pre><code># 临时采集 CPU 到独立文件：每 1 秒，共 300 秒
+sar -u -o /tmp/cpu-5min.sa 1 300
+
+# 回放临时文件
+sar -u -f /tmp/cpu-5min.sa
+
+# 查看 sysstat 保留配置，路径因发行版不同
+grep -R "HISTORY\\|COMPRESSAFTER\\|SADC_OPTIONS" /etc/sysconfig /etc/default 2&gt;/dev/null
+
+# 查看 sa 文件体积
+du -sh /var/log/sa /var/log/sysstat 2&gt;/dev/null</code></pre>
+<div class="note"><strong>开销判断：</strong> 对大多数服务器，分钟级 sysstat 采样开销很低；真正要评估的是保留天数、指标类别、磁盘写入策略和是否压缩归档。</div>
+</section>
+
+<section class="figure" id="fig-compare">
+<h3>对比图：sar、vmstat、mpstat、iostat 怎么选</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="sar vmstat mpstat iostat 工具对比图">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">同属性能工具，但问题入口不同</text>
+<rect x="80" y="125" width="220" height="350" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="190" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">sar</text><text x="190" y="214" text-anchor="middle" font-size="15">历史回放</text><text x="190" y="246" text-anchor="middle" font-size="15">多维报告</text><text x="190" y="278" text-anchor="middle" font-size="15">事故复盘</text><text x="190" y="350" text-anchor="middle" font-size="14">昨天 02:13</text><text x="190" y="376" text-anchor="middle" font-size="14">节点发生了什么？</text>
+<rect x="330" y="125" width="220" height="350" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="440" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">vmstat</text><text x="440" y="214" text-anchor="middle" font-size="15">实时总览</text><text x="440" y="246" text-anchor="middle" font-size="15">run queue</text><text x="440" y="278" text-anchor="middle" font-size="15">内存/CPU/I/O</text><text x="440" y="350" text-anchor="middle" font-size="14">现在系统</text><text x="440" y="376" text-anchor="middle" font-size="14">整体压力如何？</text>
+<rect x="580" y="125" width="220" height="350" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="690" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">mpstat</text><text x="690" y="214" text-anchor="middle" font-size="15">每 CPU 细节</text><text x="690" y="246" text-anchor="middle" font-size="15">软中断/steal</text><text x="690" y="278" text-anchor="middle" font-size="15">核心不均衡</text><text x="690" y="350" text-anchor="middle" font-size="14">是否某些核</text><text x="690" y="376" text-anchor="middle" font-size="14">被打爆？</text>
+<rect x="830" y="125" width="220" height="350" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="940" y="170" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">iostat</text><text x="940" y="214" text-anchor="middle" font-size="15">磁盘细节</text><text x="940" y="246" text-anchor="middle" font-size="15">await / util</text><text x="940" y="278" text-anchor="middle" font-size="15">吞吐 / 队列</text><text x="940" y="350" text-anchor="middle" font-size="14">块设备是否</text><text x="940" y="376" text-anchor="middle" font-size="14">成为瓶颈？</text>
+<rect x="170" y="535" width="760" height="58" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="571" text-anchor="middle" font-size="17">经验：事后先 sar 定位时间和维度，实时复现再用 vmstat/mpstat/iostat 深挖</text>
+</svg><div class="caption">sar 是历史入口，不是替代所有实时工具；它常用于确定“哪段时间、哪个维度值得深入”。</div></section>
+
+<section class="section" id="s13">
+<h2>13. sar vs vmstat/mpstat/iostat</h2>
+<table><tr><th>工具</th><th>核心价值</th><th>历史能力</th><th>典型命令</th></tr><tr><td><code>sar</code></td><td>多维系统活动报告和历史回放</td><td>强，依赖 sysstat 已启用采集</td><td><code>sar -u/-r/-n DEV/-d -f saDD</code></td></tr><tr><td><code>vmstat</code></td><td>系统整体压力快照：运行队列、内存、swap、I/O、CPU</td><td>弱，通常实时</td><td><code>vmstat 1</code></td></tr><tr><td><code>mpstat</code></td><td>每 CPU 利用率、软中断、核心不均衡</td><td>可实时；与 sysstat 同源但常用于当前观察</td><td><code>mpstat -P ALL 1</code></td></tr><tr><td><code>iostat</code></td><td>磁盘和块设备扩展统计</td><td>弱，通常实时</td><td><code>iostat -xz 1</code></td></tr><tr><td><code>pidstat</code></td><td>进程级 CPU、内存、I/O</td><td>可实时或采集到文件，取决于用法</td><td><code>pidstat -durh 1</code></td></tr></table>
+<div class="success"><strong>组合方式：</strong> 事故后用 <code>sar -f</code> 找历史异常窗口；复现时用 <code>vmstat</code> 看总压，用 <code>mpstat</code> 看 CPU 分布，用 <code>iostat</code> 看磁盘细节，用 <code>pidstat</code> 把压力归到进程。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 脚本化导出与报表</h2>
+<p><code>sar</code> 输出是文本，适合快速管道处理。做正式报表时建议保留原始 <code>sa</code> 文件和命令行，避免只留下二次处理后的片段。部分版本支持 <code>-o</code> 写二进制、<code>-f</code> 读二进制；新版本 sysstat 还可能提供 <code>sadf</code> 用于 CSV/JSON 等格式导出。</p>
+<pre><code># 导出某天 CPU/内存/网络/磁盘关键窗口到文本
+DAY=/var/log/sa/sa24
+START=02:00:00
+END=03:00:00
+OUT=/tmp/sar-incident-$(date +%Y%m%d%H%M%S)
+mkdir -p "$OUT"
+
+sar -u -f "$DAY" -s "$START" -e "$END" &gt; "$OUT/cpu.txt"
+sar -r -f "$DAY" -s "$START" -e "$END" &gt; "$OUT/mem.txt"
+sar -n DEV,TCP,ETCP -f "$DAY" -s "$START" -e "$END" &gt; "$OUT/net.txt"
+sar -d -p -f "$DAY" -s "$START" -e "$END" &gt; "$OUT/disk.txt"
+
+# 如 sadf 可用，可查看它支持的格式
+sadf -h 2&gt;/dev/null | head</code></pre>
+<div class="warn"><strong>报表纪律：</strong> 不要只贴 <code>Average:</code> 行。平均值会掩盖短窗口尖刺；事故复盘至少保留异常前、异常中、恢复后三段原始时间序列。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 安全注意事项与权限边界</h2>
+<p><code>sar</code> 本身以读取和报告为主，风险通常不在“破坏系统”，而在误配置采集、误解指标、暴露主机信息和在高压节点上临时开过细采样。</p>
+<div class="grid-2"><div class="card"><strong>权限</strong><br>普通用户通常可以运行实时 <code>sar</code>，但读取 <code>/var/log/sa</code> 可能受文件权限限制；生产环境按最小权限授权。</div><div class="card"><strong>信息泄露</strong><br>sar 输出可能暴露网卡名、磁盘名、吞吐模式、业务高峰时间；分享到外部前要脱敏。</div><div class="card"><strong>采样配置</strong><br>调整 cron/timer 会影响全机采集频率。先在少量节点验证，再批量 rollout。</div><div class="card"><strong>磁盘占用</strong><br>长保留 + 高频采样会增加日志目录体积。要配置保留周期、压缩和监控。</div></div>
+<pre><code># 修改 sysstat 采样策略前先备份配置
+sudo cp -a /etc/sysconfig/sysstat /etc/sysconfig/sysstat.bak 2&gt;/dev/null || true
+sudo cp -a /etc/default/sysstat /etc/default/sysstat.bak 2&gt;/dev/null || true
+
+# 查看当前日志目录大小，避免盲目加频率
+du -sh /var/log/sa /var/log/sysstat 2&gt;/dev/null
+
+# 变更后确认 timer/cron 状态
+systemctl list-timers | grep -E 'sysstat|sa'</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要在全量训练集群上直接把采样从 10 分钟改成 1 秒。需要细粒度时优先对目标节点临时采样，或通过监控系统做受控采集。</div>
+</section>
+
+<section class="figure" id="fig-troubleshoot">
+<h3>排障图：sar 指标异常时怎么收敛</h3>
+<svg viewBox="0 0 1100 730" width="100%" role="img" aria-label="sar 排障与安全收敛流程图">
+<rect x="20" y="20" width="1060" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="390" y="50" width="320" height="72" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="94" text-anchor="middle" font-size="23" font-weight="700">sar 看到异常</text>
+<polygon points="550,170 710,255 550,340 390,255" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="248" text-anchor="middle" font-size="17" font-weight="700">异常是否与业务时间同窗？</text><text x="550" y="274" text-anchor="middle" font-size="14">训练日志 / 告警 / GPU 指标</text>
+<rect x="90" y="215" width="230" height="82" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="205" y="250" text-anchor="middle" font-size="18" font-weight="700">先不归因</text><text x="205" y="278" text-anchor="middle" font-size="14">扩大窗口或找其他节点对比</text>
+<rect x="780" y="215" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="895" y="250" text-anchor="middle" font-size="18" font-weight="700">进入维度验证</text><text x="895" y="278" text-anchor="middle" font-size="14">CPU / Mem / Net / Disk</text>
+<rect x="105" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="210" y="475" text-anchor="middle" font-size="17" font-weight="700">CPU?</text><text x="210" y="504" text-anchor="middle" font-size="14">sar -u, -P ALL</text>
+<rect x="345" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="450" y="475" text-anchor="middle" font-size="17" font-weight="700">内存?</text><text x="450" y="504" text-anchor="middle" font-size="14">sar -r, -B, -S</text>
+<rect x="585" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="690" y="475" text-anchor="middle" font-size="17" font-weight="700">网络?</text><text x="690" y="504" text-anchor="middle" font-size="14">sar -n DEV,TCP,ETCP</text>
+<rect x="825" y="440" width="210" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="930" y="475" text-anchor="middle" font-size="17" font-weight="700">磁盘?</text><text x="930" y="504" text-anchor="middle" font-size="14">sar -d, -b</text>
+<rect x="255" y="620" width="590" height="58" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="656" text-anchor="middle" font-size="17" font-weight="700" fill="#991b1b">结论必须包含反证：哪些常见原因已被 sar 或其他数据排除？</text>
+<line x1="550" y1="122" x2="550" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="390" y1="255" x2="320" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="344" y="238" font-size="14">否</text><line x1="710" y1="255" x2="780" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="742" y="238" font-size="14">是</text>
+<path d="M895 297 C780 370, 325 385, 210 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M895 297 C765 375, 555 386, 450 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M895 297 C830 375, 730 390, 690 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M895 297 C915 370, 925 395, 930 440" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<path d="M210 532 C270 585, 420 610, 480 620" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M450 532 C475 585, 520 600, 535 620" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M690 532 C660 585, 605 602, 590 620" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><path d="M930 532 C850 590, 715 610, 650 620" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">sar 异常只是线索。可靠结论需要时间同窗、跨维度验证和反证。</div></section>
+
+<section class="section" id="s16">
+<h2>16. 常见问题与排障</h2>
+<div class="grid-2"><div class="card"><strong>问题 1：没有历史文件</strong><br>多半是 sysstat 未启用、timer/cron 未运行，或路径不是你以为的 <code>/var/log/sa</code>。先查 <code>systemctl list-timers</code> 和 <code>/var/log/sysstat</code>。</div><div class="card"><strong>问题 2：命令输出列名和教程不同</strong><br>sysstat 版本、内核版本和发行版会影响字段。以本机 <code>man sar</code> 和输出表头为准。</div><div class="card"><strong>问题 3：时间窗口没有数据</strong><br>检查日期文件是否正确、时区是否一致、采样间隔是否覆盖该窗口、节点是否重启。</div><div class="card"><strong>问题 4：<code>Average:</code> 看起来正常</strong><br>平均值可能掩盖短峰值。查看原始时间行，并缩小 <code>-s/-e</code> 窗口。</div><div class="card"><strong>问题 5：容器内 sar 与平台监控不同</strong><br>sar 多为主机视角；容器限制、cgroup 内存、pod 网络命名空间需要单独核对。</div><div class="card"><strong>问题 6：设备名看不懂</strong><br>尝试 <code>sar -d -p</code> 显示持久设备名；再用 <code>lsblk</code>、<code>udevadm</code> 或云盘映射关系确认。</div></div>
+<h3>排障模板</h3>
+<pre><code># 1. 找历史文件
+find /var/log/sa /var/log/sysstat -maxdepth 1 -type f -name 'sa[0-9][0-9]' -ls 2&gt;/dev/null
+
+# 2. 确认文件能读
+sar -f /var/log/sa/sa24 | head
+
+# 3. 用同一时间窗口查四大维度
+sar -u -f /var/log/sa/sa24 -s 12:00:00 -e 12:30:00
+sar -r -f /var/log/sa/sa24 -s 12:00:00 -e 12:30:00
+sar -n DEV,TCP,ETCP -f /var/log/sa/sa24 -s 12:00:00 -e 12:30:00
+sar -d -p -f /var/log/sa/sa24 -s 12:00:00 -e 12:30:00
+
+# 4. 如果历史粒度太粗，复现时临时细采样
+sar -A -o /tmp/repro.sa 1 300</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 学习路线与练习任务</h2>
+<h3>第一阶段：会查</h3><ul><li>掌握 <code>sar -u 1 5</code>、<code>sar -r 1 5</code>、<code>sar -n DEV 1 5</code>、<code>sar -d 1 5</code>。</li><li>知道 <code>interval count</code> 是实时采样，<code>-f saDD</code> 是历史回放。</li><li>能解释 <code>%user</code>、<code>%system</code>、<code>%iowait</code>、<code>kbavail</code>、<code>rxkB/s</code>、<code>await</code>。</li></ul>
+<h3>第二阶段：会复盘</h3><ul><li>能用 <code>-s</code> 和 <code>-e</code> 切出事故窗口。</li><li>能把训练日志、GPU 指标、NCCL 日志、Kubernetes 事件和 sar 输出按时间对齐。</li><li>能写出包含证据和反证的事故结论。</li></ul>
+<h3>第三阶段：会运营</h3><ul><li>能确认 sysstat 是否在目标节点启用。</li><li>能评估采样频率、保留周期和日志目录空间。</li><li>能在高价值节点上设置合理的历史保留策略，并在复现时临时加细采样。</li></ul>
+<h3>练习</h3><ol><li>在测试节点运行 <code>sar -u 1 5</code>，解释每一列。</li><li>找到本机历史 <code>saDD</code> 文件，读取今天 10 分钟窗口的 CPU、内存、网络和磁盘报告。</li><li>运行一个磁盘读写压测或复制大文件，用 <code>sar -d 1 20</code> 观察 <code>await</code> 和吞吐变化。</li><li>下载或复制大文件，用 <code>sar -n DEV 1 20</code> 观察网卡吞吐。</li><li>把四个维度导出到文本目录，写一段 5 行以内的事故摘要。</li></ol>
+<pre><code># 练习目录：只写 /tmp，不影响业务文件
+mkdir -p /tmp/sar-demo
+
+# 采集一个 60 秒 CPU 文件并回放
+sar -u -o /tmp/sar-demo/cpu.sa 1 60
+sar -u -f /tmp/sar-demo/cpu.sa
+
+# 安全清理练习文件
+rm -f /tmp/sar-demo/cpu.sa</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>sysstat project documentation：<code>sar</code>、<code>sadc</code>、<code>sa1</code>、<code>sa2</code>、<code>sadf</code> 的角色和报告类型。</li><li>Linux man-pages：<code>sar(1)</code>、<code>sadc(8)</code>、<code>sa1(8)</code>、<code>sa2(8)</code>。</li><li>发行版文档：RHEL/Rocky/Alma 的 sysstat service 和 <code>/var/log/sa</code>；Debian/Ubuntu 的 <code>/etc/default/sysstat</code> 与 <code>/var/log/sysstat</code>。</li><li>性能排障实践：USE 方法、RED 方法、Linux block I/O 指标、TCP 重传分析、AI 训练 dataloader 与 checkpoint 性能分析。</li></ul><p class="mini">建议阅读顺序：先理解 sysstat 采样链路，再掌握 <code>sar -u/-r/-n/-d</code>，最后把 sar 输出放进事故时间线，而不是孤立解释单个字段。</p></section>
+<div class="footer">sar 深度教程 · AI Infra 历史指标、sysstat 采样、CPU/内存/网络/磁盘回放与事故复盘</div>
+</div>
+</body>
+</html>

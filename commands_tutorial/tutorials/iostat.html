@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>iostat 深度教程：AI Infra 场景下的块设备吞吐、延迟与饱和诊断</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--slate2);font-size:12px;color:#334155;font-weight:700}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>iostat 深度教程：AI Infra 场景下的块设备吞吐、延迟与饱和诊断</h1>
+<p class="sub">这份教程按 Linux 常用命令 <code>iostat</code> 讲解。它不是字段翻译清单，而是从“内核块层累计每块设备的完成请求、吞吐、等待时间、队列长度和忙碌时间，iostat 按采样窗口换算成速率”这个模型出发，系统解释 <code>iostat -xz 1</code>、<code>%util</code>、<code>await</code>、<code>svctm</code> 的陷阱、<code>r/s</code>/<code>w/s</code>/<code>rkB/s</code>/<code>wkB/s</code>、<code>aqu-sz</code>、NVMe/共享存储、dataloader 瓶颈、checkpoint 写入和与 <code>fio</code>/<code>iotop</code>/<code>pidstat</code> 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">iostat -xz 1</span><span class="chip">await</span><span class="chip">%util</span><span class="chip">aqu-sz</span><span class="chip">NVMe</span><span class="chip">共享存储</span><span class="chip">dataloader</span><span class="chip">checkpoint</span><span class="chip">fio 对照</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>iostat</code> 是块设备的“秒级仪表盘”：它告诉你每块盘在当前采样窗口里完成了多少读写、吞吐多大、请求等了多久、队列堆了多深、设备忙了多久。</div>
+<div class="success"><strong>生产实践：</strong> AI 任务 GPU 利用率下降、step time 抖动或 checkpoint 卡顿时，先跑 <code>iostat -xz 1</code> 连续观察趋势；用 <code>await</code> + <code>aqu-sz</code> + 吞吐/IOPS + <code>%util</code> 联合判断，避免只凭单列下结论。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">iostat 是什么</a></li>
+<li><a class="anchor" href="#s2">AI Infra 为什么需要 iostat</a></li>
+<li><a class="anchor" href="#s3">整体心智模型</a></li>
+<li><a class="anchor" href="#s4">安装、版本与权限</a></li>
+<li><a class="anchor" href="#s5">快速上手：iostat -xz 1</a></li>
+<li><a class="anchor" href="#s6">采样窗口与首行陷阱</a></li>
+<li><a class="anchor" href="#s7">输出字段总览</a></li>
+<li><a class="anchor" href="#s8">吞吐字段：r/s、w/s、rkB/s、wkB/s</a></li>
+<li><a class="anchor" href="#s9">延迟字段：await、r_await、w_await</a></li>
+<li><a class="anchor" href="#s10">队列字段：aqu-sz 与请求堆积</a></li>
+<li><a class="anchor" href="#s11">忙碌字段：%util 的正确读法</a></li>
+<li><a class="anchor" href="#s12">svctm caveats：为什么不要迷信它</a></li>
+<li><a class="anchor" href="#s13">NVMe、多队列与云盘/共享存储</a></li>
+<li><a class="anchor" href="#s14">dataloader 读瓶颈排查</a></li>
+<li><a class="anchor" href="#s15">checkpoint 与写放大排查</a></li>
+<li><a class="anchor" href="#s16">iostat vs fio/iotop/pidstat/sar</a></li>
+<li><a class="anchor" href="#s17">故障模式速查</a></li>
+<li><a class="anchor" href="#s18">安全采集、脚本化与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. iostat 是什么</h2>
+<p><code>iostat</code> 属于 <code>sysstat</code> 套件，用来报告 CPU 摘要和块设备 I/O 统计。日常排障时最常用的是扩展设备模式：<code>iostat -xz 1</code>。它读取内核块层累计计数器，按两次采样之间的差值计算每秒请求数、吞吐、平均等待、平均队列和设备忙碌比例。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>快速判断某块盘、云盘、LVM/dm 设备、RAID、NVMe 命名空间是否出现吞吐、延迟或队列异常。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能直接告诉你哪个 Python worker、哪个文件、哪个 SQL 查询或哪个数据样本造成了 I/O。</div>
+<div class="card"><strong>它的定位</strong><br>设备级实时观测入口：先看设备是否异常，再用进程级、文件级和存储侧工具下钻。</div>
+</div>
+<pre><code># 最常用：扩展字段、隐藏空闲设备、每秒刷新
+iostat -xz 1
+
+# 采样 30 秒并保存证据
+iostat -xz 1 30 | tee iostat.$(date +%Y%m%d-%H%M%S).log
+
+# 显示设备分区；某些发行版支持 -p ALL
+iostat -xzp 1
+iostat -x -p ALL 1 10</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>iostat</code> 是设备视角，不是进程视角。看到 <code>nvme0n1</code> 的 <code>await</code> 高，只说明块设备路径慢；责任可能在 dataloader、文件系统、页缓存、RAID、云盘限流、网络存储或另一个租户。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 为什么需要 iostat</h2>
+<p>AI 训练和推理的卡顿经常被表述为“GPU 利用率低”或“step time 变长”，但 GPU 可能只是在等待输入数据、权重加载、checkpoint 写入、远端存储或容器镜像层。<code>iostat</code> 把这些主机侧 I/O 问题转化成可观察的设备指标。</p>
+<table>
+<tr><th>AI 场景</th><th>iostat 重点</th><th>典型解释</th></tr>
+<tr><td>训练吞吐周期性下降</td><td><code>r/s</code>、<code>rkB/s</code>、<code>await</code>、<code>aqu-sz</code></td><td>dataloader 读数据跟不上，可能是小文件随机读、冷页缓存、压缩解码前置或共享存储抖动。</td></tr>
+<tr><td>保存 checkpoint 卡住</td><td><code>w/s</code>、<code>wkB/s</code>、<code>w_await</code>、<code>%util</code></td><td>写入吞吐达到上限、后台刷脏页、对象存储 FUSE 或网络盘写确认慢。</td></tr>
+<tr><td>多租户节点互相影响</td><td>多设备 <code>await</code> 同时升高</td><td>共享宿主机、共享 SAN/NFS、云盘 burst credit 或同 RAID 组争用。</td></tr>
+<tr><td>GPU 全部低利用但 CPU 空闲</td><td><code>await</code> 高、<code>aqu-sz</code> 高、<code>rkB/s</code> 不高</td><td>不是 CPU 算不动，而是 I/O 延迟高或请求模式太碎。</td></tr>
+</table>
+<div class="note"><strong>AI Infra 心法：</strong> <code>iostat</code> 不直接解释模型性能，它解释“存储路径是否把 GPU 喂饱”。</div>
+</section>
+
+<section class="figure" id="s3">
+<h2>3. 整体心智模型</h2>
+<h3>信息图：iostat 从内核计数器到 AI 任务判断</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="iostat 整体心智模型">
+<rect x="16" y="18" width="1068" height="620" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">iostat = 块层累计计数器的采样窗口差值</text>
+<rect x="55" y="125" width="205" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="158" y="166" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">AI 进程</text><text x="158" y="196" text-anchor="middle" font-size="15">dataloader</text><text x="158" y="218" text-anchor="middle" font-size="15">checkpoint / mmap</text>
+<rect x="320" y="125" width="205" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="423" y="166" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">文件系统</text><text x="423" y="196" text-anchor="middle" font-size="15">page cache</text><text x="423" y="218" text-anchor="middle" font-size="15">ext4 / xfs / nfs</text>
+<rect x="585" y="125" width="205" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="688" y="166" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">块层队列</text><text x="688" y="196" text-anchor="middle" font-size="15">合并 / 调度</text><text x="688" y="218" text-anchor="middle" font-size="15">完成请求计数</text>
+<rect x="850" y="125" width="205" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="953" y="166" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">设备/后端</text><text x="953" y="196" text-anchor="middle" font-size="15">NVMe / dm / EBS</text><text x="953" y="218" text-anchor="middle" font-size="15">NFS / SAN / RAID</text>
+<rect x="135" y="340" width="830" height="170" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="382" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">采样窗口：完成了多少请求？等了多久？队列多深？设备多忙？</text><text x="550" y="424" text-anchor="middle" font-size="16">吞吐/IOPS：r/s w/s rkB/s wkB/s</text><text x="550" y="455" text-anchor="middle" font-size="16">用户感知延迟：await、r_await、w_await，包含排队时间</text><text x="550" y="486" text-anchor="middle" font-size="16">饱和线索：aqu-sz、%util、吞吐上限、IOPS 上限一起看</text>
+<rect x="300" y="560" width="500" height="52" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="593" text-anchor="middle" font-size="17" font-weight="700">iostat 定位设备症状，pidstat/iotop/fio/存储监控定位责任与容量</text>
+<line x1="260" y1="181" x2="320" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="525" y1="181" x2="585" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="790" y1="181" x2="850" y2="181" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><path d="M688 237 C690 285, 635 318, 585 340" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">理解 iostat 的关键是采样窗口：它不是单个 I/O 的 tracing，而是窗口内完成 I/O 的统计平均。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 安装、版本与权限</h2>
+<p><code>iostat</code> 来自 <code>sysstat</code>。普通用户通常可以运行它，因为它读取的是内核公开统计；但容器镜像可能没有安装，或者看到的是宿主机设备名而不是业务熟悉的挂载路径。</p>
+<table>
+<tr><th>系统</th><th>安装命令</th><th>说明</th></tr>
+<tr><td>Ubuntu / Debian</td><td><code>sudo apt-get update &amp;&amp; sudo apt-get install -y sysstat</code></td><td>安装后即可使用 <code>iostat</code>；历史 sar 采集是否启用是另一回事。</td></tr>
+<tr><td>RHEL / CentOS / Rocky</td><td><code>sudo dnf install -y sysstat</code></td><td>旧系统可能使用 <code>yum install sysstat</code>。</td></tr>
+<tr><td>容器/调试镜像</td><td><code>apt-get install sysstat</code> 或平台提供 debug image</td><td>生产应用镜像不一定要内置，临时诊断容器更合适。</td></tr>
+</table>
+<pre><code># 确认版本；不同 sysstat 版本字段名会有差异
+iostat -V
+
+# 找到块设备、挂载点、LVM/dm 关系
+lsblk -o NAME,TYPE,SIZE,MODEL,MOUNTPOINT,FSTYPE
+findmnt
+
+# 查看内核块设备统计原始入口
+cat /proc/diskstats | head</code></pre>
+<div class="warn"><strong>版本注意：</strong> 老版本可能显示 <code>avgqu-sz</code>、<code>avgrq-sz</code>、<code>svctm</code>；新版本更常见 <code>aqu-sz</code>、<code>rareq-sz</code>、<code>wareq-sz</code>，并可能不再显示 <code>svctm</code>。教程重点按现代 sysstat 解释，同时说明兼容字段。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 快速上手：<code>iostat -xz 1</code></h2>
+<p><code>-x</code> 打开扩展统计，<code>-z</code> 隐藏采样期间无活动的设备，<code>1</code> 表示每秒刷新。这个组合是 AI Infra 现场排障的默认入口。</p>
+<pre><code># 现场观察：每秒刷新，持续到 Ctrl-C
+iostat -xz 1
+
+# 记录固定窗口，适合贴到 issue 或事故复盘
+iostat -xz 1 60 &gt; /tmp/iostat.train.log
+
+# 和 GPU 利用率、CPU 队列一起采样
+ts=$(date +%Y%m%d-%H%M%S)
+mkdir -p /tmp/ai-io-debug
+iostat -xz 1 120 &gt; /tmp/ai-io-debug/iostat.$ts.log &
+vmstat -w 1 120 &gt; /tmp/ai-io-debug/vmstat.$ts.log &
+nvidia-smi dmon -s pucvmet -d 1 -c 120 &gt; /tmp/ai-io-debug/gpu.$ts.log &amp;</code></pre>
+<table>
+<tr><th>选项</th><th>含义</th><th>为什么常用</th></tr>
+<tr><td><code>-x</code></td><td>扩展设备字段</td><td>没有 <code>await</code>、<code>aqu-sz</code>、<code>%util</code> 很难诊断饱和。</td></tr>
+<tr><td><code>-z</code></td><td>隐藏无活动设备</td><td>AI 节点常有很多 loop、dm、分区；隐藏空闲项减少噪音。</td></tr>
+<tr><td><code>-d</code></td><td>只显示设备报告</td><td>不关心 iostat 自带 CPU 摘要时可用。</td></tr>
+<tr><td><code>-k</code>/<code>-m</code></td><td>以 KB/s 或 MB/s 显示吞吐</td><td>报告给人看时，MB/s 更直观；脚本分析时保持默认也可以。</td></tr>
+<tr><td><code>-p ALL</code></td><td>显示所有块设备和分区</td><td>排查某个挂载点或分区时有用。</td></tr>
+</table>
+<div class="success"><strong>现场读法：</strong> 先找业务挂载点对应设备，再盯 10 到 60 秒趋势。训练性能问题通常不是单秒尖刺，而是和 step 边界、checkpoint 周期同步的模式。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 采样窗口与首行陷阱</h2>
+<p>不带 <code>-y</code> 时，<code>iostat interval</code> 的第一组报告通常是“自系统启动以来”的平均值，后续才是每个采样间隔的统计。排障实时问题时，不要用首行下结论。</p>
+<pre><code># 首行可能是开机以来平均值，后面才是 1 秒窗口
+iostat -xz 1 5
+
+# 如果版本支持 -y，可跳过首份统计，只显示间隔报告
+iostat -xzy 1 5
+
+# 对齐训练阶段：先启动采样，再触发一次训练/推理请求
+iostat -xzy 1 60 | tee io.window.log</code></pre>
+<div class="grid-3">
+<div class="card"><strong>首行</strong><br>常是系统启动以来平均值，可能把峰值完全抹平，也可能混入旧任务。</div>
+<div class="card"><strong>后续行</strong><br>两次采样之间的真实窗口，最适合和 step time、GPU 利用率、日志时间戳对齐。</div>
+<div class="card"><strong>采样间隔</strong><br>1 秒适合现场观察；5 到 10 秒适合长期记录；太长会抹掉 batch 边界尖刺。</div>
+</div>
+<div class="warn"><strong>报告习惯：</strong> 给别人发 iostat 证据时，至少保留 20 到 60 行，并说明采样间隔、业务阶段、设备对应的挂载点和是否跳过首行。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 输出字段总览</h2>
+<p>不同 sysstat 版本字段名略有变化。下面按常见 <code>iostat -x</code> 输出解释核心字段。</p>
+<pre><code>Device            r/s     w/s   rkB/s   wkB/s  rrqm/s wrqm/s  r_await w_await aqu-sz %util
+nvme0n1        320.0    12.0  524288    4096     0.0    2.0     2.10    8.40   0.82  76.0
+dm-0           318.0    12.0  524000    4096     0.0    0.0     2.30    9.10   0.88  80.0</code></pre>
+<table>
+<tr><th>字段</th><th>核心含义</th><th>AI Infra 常见用途</th></tr>
+<tr><td><code>r/s</code>、<code>w/s</code></td><td>每秒完成的读/写请求数</td><td>判断随机小文件 IOPS、checkpoint 写请求数量。</td></tr>
+<tr><td><code>rkB/s</code>、<code>wkB/s</code></td><td>每秒读/写吞吐</td><td>判断数据集顺序读、权重加载、checkpoint 写带宽。</td></tr>
+<tr><td><code>rrqm/s</code>、<code>wrqm/s</code></td><td>每秒被合并的读/写请求</td><td>请求合并多说明相邻 I/O 较多；现代多队列/上层 dm 场景需谨慎解读。</td></tr>
+<tr><td><code>await</code></td><td>平均 I/O 等待时间，通常包含排队和服务时间</td><td>最接近应用体感的设备侧延迟信号。</td></tr>
+<tr><td><code>aqu-sz</code></td><td>平均队列长度</td><td>队列堆积和设备/后端饱和的重要线索。</td></tr>
+<tr><td><code>%util</code></td><td>设备有 I/O 在处理的时间比例</td><td>单队列设备接近 100% 常提示忙；NVMe/云盘必须结合延迟和吞吐。</td></tr>
+</table>
+<div class="note"><strong>设备映射：</strong> 看到 <code>dm-0</code>、<code>md0</code>、<code>nvme0n1p1</code> 时，要用 <code>lsblk</code>、<code>dmsetup ls --tree</code>、<code>findmnt</code> 把块设备映射回业务目录。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 吞吐字段：<code>r/s</code>、<code>w/s</code>、<code>rkB/s</code>、<code>wkB/s</code></h2>
+<p><code>r/s</code> 和 <code>w/s</code> 是完成请求数，反映 IOPS；<code>rkB/s</code> 和 <code>wkB/s</code> 是数据量，反映带宽。AI 数据管道可能 IOPS 不高但吞吐很大，也可能吞吐不大但 IOPS 很高且延迟很差。</p>
+<table>
+<tr><th>模式</th><th>iostat 表现</th><th>常见 AI 根因</th></tr>
+<tr><td>大文件顺序读</td><td><code>rkB/s</code> 高、<code>r/s</code> 中等、平均请求较大</td><td>WebDataset、tar shard、mmap 权重、连续样本读取。</td></tr>
+<tr><td>小文件随机读</td><td><code>r/s</code> 高、<code>rkB/s</code> 不高、<code>await</code> 容易升高</td><td>图片小文件、metadata 查询、过多 worker 并发打开文件。</td></tr>
+<tr><td>checkpoint 写入</td><td><code>wkB/s</code> 周期性冲高、<code>w_await</code> 升高</td><td>保存模型、optimizer state、日志或 tensorboard 事件。</td></tr>
+<tr><td>页缓存命中</td><td>GPU 低等待但 <code>rkB/s</code> 不高</td><td>数据已经在内存中，瓶颈可能转向 CPU 解码、增强或 Python 调度。</td></tr>
+</table>
+<pre><code># 粗略估算平均读请求大小：rkB/s / r/s
+# 如果 r/s=1000 且 rkB/s=8000，平均约 8 KB/请求，偏小且容易受延迟影响。
+
+# 查看数据集文件形态
+find /data/imagenet/train -type f | head
+find /data/imagenet/train -type f -printf '%s\n' 2&gt;/dev/null | awk '{n++; s+=$1} END {print n, s/n/1024 " KiB avg"}'</code></pre>
+<div class="success"><strong>优化方向：</strong> 小文件随机读瓶颈通常优先考虑数据打包、预取、本地缓存、增加页缓存命中率、减少 worker 抢同一个共享存储，而不是单纯把 batch size 调小。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 延迟字段：<code>await</code>、<code>r_await</code>、<code>w_await</code></h2>
+<p><code>await</code> 是每个 I/O 请求从进入块层队列到完成的平均时间，通常包含排队时间和设备服务时间。现代 sysstat 常拆成 <code>r_await</code>、<code>w_await</code>，便于区分读慢还是写慢。</p>
+<table>
+<tr><th>现象</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>r_await</code> 高，<code>rkB/s</code> 不高</td><td>随机小读、远端存储延迟、metadata 路径慢、队列并发不足或后端抖动。</td><td>看数据文件大小、<code>pidstat -d</code>、NFS/对象存储监控、缓存命中。</td></tr>
+<tr><td><code>w_await</code> 高，<code>wkB/s</code> 周期冲高</td><td>checkpoint、日志、刷脏页、云盘写带宽或 IOPS 限制。</td><td>错峰 checkpoint、分片写入、用本地 NVMe 缓存、调整保存频率。</td></tr>
+<tr><td><code>await</code> 高且 <code>aqu-sz</code> 高</td><td>队列堆积，设备或后端已被压住。</td><td>减少并发、换更高 IOPS/吞吐存储、拆分数据集或本地化。</td></tr>
+<tr><td><code>await</code> 高但 <code>%util</code> 不高</td><td>可能是稀疏慢请求、网络存储尾延迟、设备映射或采样窗口稀释。</td><td>延长采样、看 p99 存储指标、用应用日志对齐。</td></tr>
+</table>
+<div class="warn"><strong>延迟不是 SLA：</strong> <code>await</code> 是完成请求的平均值，不是 p95/p99。尾延迟问题可能被平均值掩盖；共享存储和对象存储尤其要结合服务端延迟分位数。</div>
+</section>
+
+<section class="figure" id="fig-fields">
+<h3>流程图：从 iostat 字段判断读写瓶颈</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="iostat 字段判断流程图">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">iostat -xz 1 看到异常</text>
+<polygon points="550,150 710,232 550,314 390,232" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="226" text-anchor="middle" font-size="17" font-weight="700">await 是否升高？</text><text x="550" y="252" text-anchor="middle" font-size="14">读/写延迟</text>
+<rect x="105" y="195" width="220" height="78" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="215" y="238" text-anchor="middle" font-size="17" font-weight="700">先看吞吐/IOPS</text>
+<rect x="775" y="195" width="220" height="78" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="885" y="226" text-anchor="middle" font-size="17" font-weight="700">继续看 aqu-sz</text><text x="885" y="250" text-anchor="middle" font-size="13">队列是否堆积</text>
+<polygon points="885,340 1015,410 885,480 755,410" fill="#ede9fe" stroke="#c4b5fd"/><text x="885" y="405" text-anchor="middle" font-size="16" font-weight="700">队列高？</text><text x="885" y="430" text-anchor="middle" font-size="13">并发超过承载</text>
+<rect x="560" y="535" width="250" height="78" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="685" y="567" text-anchor="middle" font-size="17" font-weight="700">饱和/限流/后端慢</text><text x="685" y="591" text-anchor="middle" font-size="13">降并发或换存储</text>
+<rect x="875" y="535" width="170" height="78" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="960" y="567" text-anchor="middle" font-size="17" font-weight="700">稀疏慢请求</text><text x="960" y="591" text-anchor="middle" font-size="13">查尾延迟</text>
+<rect x="80" y="370" width="260" height="90" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="210" y="404" text-anchor="middle" font-size="17" font-weight="700">吞吐接近规格？</text><text x="210" y="430" text-anchor="middle" font-size="13">rkB/s/wkB/s vs 盘规格</text>
+<rect x="80" y="535" width="260" height="78" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="210" y="567" text-anchor="middle" font-size="17" font-weight="700">若 GPU 仍慢</text><text x="210" y="591" text-anchor="middle" font-size="13">转查 CPU/网络/框架同步</text>
+<line x1="550" y1="111" x2="550" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="390" y1="232" x2="325" y2="232" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="350" y="215" font-size="14">否</text><line x1="710" y1="232" x2="775" y2="232" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="735" y="215" font-size="14">是</text><line x1="885" y1="273" x2="885" y2="340" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="815" y1="455" x2="720" y2="535" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="760" y="500" font-size="14">是</text><line x1="935" y1="455" x2="960" y2="535" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="955" y="500" font-size="14">否</text><line x1="215" y1="273" x2="210" y2="370" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="210" y1="460" x2="210" y2="535" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">诊断顺序：先看延迟，再看队列，再看吞吐/IOPS 是否接近设备或共享后端规格；不要只看 <code>%util</code>。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 队列字段：<code>aqu-sz</code> 与请求堆积</h2>
+<p><code>aqu-sz</code> 是平均队列长度，老版本可能叫 <code>avgqu-sz</code>。它反映采样窗口里平均有多少 I/O 请求在队列或服务中等待。对 AI 任务来说，<code>aqu-sz</code> 的意义是“应用并发提交的 I/O 是否超过设备/后端消化能力”。</p>
+<table>
+<tr><th>组合</th><th>解读</th><th>处理方向</th></tr>
+<tr><td><code>aqu-sz</code> 高 + <code>await</code> 高</td><td>请求堆积并带来体感延迟，常见于设备饱和或共享后端变慢。</td><td>降低 dataloader 并发、错峰 checkpoint、迁移到本地 NVMe、扩容存储。</td></tr>
+<tr><td><code>aqu-sz</code> 高 + <code>await</code> 可接受</td><td>高并发设备能吞下队列，多队列 NVMe 可能正常。</td><td>结合吞吐、GPU 利用率和应用延迟，不必盲目优化。</td></tr>
+<tr><td><code>aqu-sz</code> 低 + <code>await</code> 高</td><td>稀疏慢 I/O 或尾延迟，平均队列不高但单次慢。</td><td>查远端存储 p99、文件系统 metadata、网络路径、设备错误。</td></tr>
+</table>
+<pre><code># 对齐数据加载 worker 数量观察队列变化
+for workers in 2 4 8 16; do
+  echo "Run benchmark with num_workers=$workers, observe iostat in another terminal"
+done
+
+# 观察单设备队列和延迟趋势
+iostat -xz 1 30 | awk 'NR&lt;=3 || /nvme0n1|dm-0/'</code></pre>
+<div class="note"><strong>经验判断：</strong> <code>aqu-sz</code> 没有跨设备通用阈值。SATA SSD、单块 HDD、本地 NVMe、云盘、多路径 SAN 的健康队列深度完全不同，必须结合设备规格和应用延迟。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 忙碌字段：<code>%util</code> 的正确读法</h2>
+<p><code>%util</code> 表示采样窗口内设备至少有一个 I/O 在处理的时间比例。对单队列、低并发设备，接近 100% 常意味着设备忙满；对 NVMe、多队列 SSD、云盘或 dm/md 聚合设备，<code>%util</code> 可能接近 100% 但仍有吞吐余量，也可能不高但尾延迟很差。</p>
+<table>
+<tr><th>现象</th><th>不要误读为</th><th>更稳妥的判断</th></tr>
+<tr><td><code>%util</code> 100%，<code>await</code> 低，吞吐接近预期</td><td>一定有问题</td><td>设备很忙但服务正常，可能是高效顺序 I/O。</td></tr>
+<tr><td><code>%util</code> 40%，<code>await</code> 高</td><td>设备一定不忙</td><td>可能有远端后端慢请求、采样稀释、云盘限流或队列模型复杂。</td></tr>
+<tr><td><code>%util</code> 高，<code>aqu-sz</code> 高，<code>await</code> 高</td><td>只需要换命令看</td><td>这是强饱和信号，优先减少压力或提高存储能力。</td></tr>
+</table>
+<div class="danger"><strong>核心警告：</strong> <code>%util</code> 不是“磁盘性能使用百分比”。它是忙碌时间比例，不等价于带宽利用率、IOPS 利用率或 NVMe 内部并行度利用率。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. <code>svctm</code> caveats：为什么不要迷信它</h2>
+<p>老版本 <code>iostat</code> 可能显示 <code>svctm</code>，表面含义是平均服务时间。但在现代 Linux 块层、多队列设备、请求合并、设备内部并行和虚拟化/云盘场景下，这个字段很容易误导。很多新版 sysstat 已经不再显示它，或文档明确提示不要信任它。</p>
+<table>
+<tr><th>字段</th><th>看起来像什么</th><th>实际 caveat</th></tr>
+<tr><td><code>svctm</code></td><td>设备处理单个请求的平均服务时间</td><td>并行 I/O、队列合并和采样算法会让它不代表真实设备服务时间。</td></tr>
+<tr><td><code>await</code></td><td>平均等待时间</td><td>更贴近应用体感，但仍是平均值，不是尾延迟。</td></tr>
+<tr><td><code>aqu-sz</code></td><td>平均队列长度</td><td>需要结合设备队列深度、NVMe 多队列和业务并发解释。</td></tr>
+</table>
+<div class="success"><strong>替代读法：</strong> 看到 <code>svctm</code> 时，把它降级为参考；核心判断使用 <code>await</code>/<code>r_await</code>/<code>w_await</code>、<code>aqu-sz</code>、吞吐/IOPS、<code>%util</code>、设备错误日志和存储侧监控。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. NVMe、多队列与云盘/共享存储</h2>
+<p>AI 节点常见本地 NVMe、RAID0 临时盘、云盘、NFS、Lustre、BeeGFS、对象存储 FUSE、SAN 多路径和 dm-crypt/LVM 叠加。<code>iostat</code> 的设备名只是块层入口，后面可能是完全不同的后端。</p>
+<div class="grid-2">
+<div class="card"><strong>本地 NVMe</strong><br>多队列、高并发、低延迟。<code>%util</code> 接近 100% 不一定代表完全饱和，重点看吞吐是否接近规格、<code>await</code> 是否恶化。</div>
+<div class="card"><strong>云盘/EBS/PD</strong><br>常有 IOPS、吞吐、burst credit、实例带宽上限。<code>iostat</code> 只能看到客户端表现，必须结合云监控。</div>
+<div class="card"><strong>NFS/并行文件系统</strong><br>数据可能走网络而非本地块设备。<code>iostat</code> 对客户端缓存盘有用，但不能完整替代服务端和网络指标。</div>
+<div class="card"><strong>dm/md/LVM/RAID</strong><br>上层设备和底层物理盘可能同时显示活动。避免把同一 I/O 在 dm 和 nvme 层重复计算成两份吞吐。</div>
+</div>
+<pre><code># 把业务路径映射到块设备
+df -hT /data
+findmnt /data
+lsblk -o NAME,TYPE,SIZE,MODEL,MOUNTPOINT,FSTYPE
+
+# 查看 NVMe 设备；需要 nvme-cli 时另装
+nvme list 2&gt;/dev/null || true
+
+# dm/LVM 关系
+lsblk -f
+dmsetup ls --tree 2&gt;/dev/null</code></pre>
+<div class="warn"><strong>共享存储提醒：</strong> 如果多个节点同时读同一数据集，单节点 <code>iostat</code> 只能证明“这个客户端慢”。要判断是否后端饱和，需要看存储系统吞吐、元数据服务、网络、服务端 CPU 和其他租户。</div>
+</section>
+
+<section class="figure">
+<h3>对比图：本地 NVMe、云盘与共享存储的读法差异</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="NVMe 云盘 共享存储对比图">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">同样的 iostat 字段，后端不同，结论不同</text>
+<rect x="75" y="130" width="280" height="360" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="215" y="174" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">本地 NVMe</text>
+<text x="215" y="220" text-anchor="middle" font-size="15">多队列 / 高并发</text>
+<text x="215" y="252" text-anchor="middle" font-size="15">%util 高不必然坏</text>
+<text x="215" y="284" text-anchor="middle" font-size="15">看 await 是否恶化</text>
+<text x="215" y="316" text-anchor="middle" font-size="15">看吞吐是否接近规格</text>
+<rect x="410" y="130" width="280" height="360" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="174" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">云盘</text>
+<text x="550" y="220" text-anchor="middle" font-size="15">IOPS / MB/s 配额</text>
+<text x="550" y="252" text-anchor="middle" font-size="15">burst credit / 实例上限</text>
+<text x="550" y="284" text-anchor="middle" font-size="15">iostat 看客户端</text>
+<text x="550" y="316" text-anchor="middle" font-size="15">云监控看后端限流</text>
+<rect x="745" y="130" width="280" height="360" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="885" y="174" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">共享存储</text>
+<text x="885" y="220" text-anchor="middle" font-size="15">NFS / Lustre / BeeGFS</text>
+<text x="885" y="252" text-anchor="middle" font-size="15">metadata 可能是瓶颈</text>
+<text x="885" y="284" text-anchor="middle" font-size="15">网络可能是瓶颈</text>
+<text x="885" y="316" text-anchor="middle" font-size="15">服务端指标必看</text>
+<rect x="200" y="545" width="700" height="52" rx="14" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="578" text-anchor="middle" font-size="17" font-weight="700">先确认设备拓扑，再解释 iostat；否则容易把后端问题误判成本地盘问题</text>
+</svg>
+<div class="caption">AI 集群里“磁盘慢”经常不是同一种慢：本地 NVMe、云盘和共享文件系统的排障证据链不同。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. dataloader 读瓶颈排查</h2>
+<p>dataloader 读瓶颈常见于小文件数据集、远端共享目录、压缩格式、过多 worker、页缓存冷启动、容器 overlayfs 或数据增强与 I/O 混合瓶颈。<code>iostat</code> 可以判断设备侧是否在拖慢输入流水线。</p>
+<table>
+<tr><th>iostat 现象</th><th>训练现象</th><th>可能根因</th><th>下一步</th></tr>
+<tr><td><code>r/s</code> 高、<code>rkB/s</code> 低、<code>r_await</code> 高</td><td>GPU 周期性空转</td><td>小文件随机读或 metadata 压力</td><td>数据打包、缓存到本地、减少随机打开、看 NFS metadata。</td></tr>
+<tr><td><code>rkB/s</code> 高、<code>await</code> 低</td><td>吞吐正常但 CPU 高</td><td>存储没问题，瓶颈可能是解码/增强/Python</td><td><code>pidstat -u -t</code>、<code>mpstat -P ALL</code>、profiler。</td></tr>
+<tr><td><code>await</code> 高、<code>aqu-sz</code> 高，多个节点同时出现</td><td>所有训练 job 变慢</td><td>共享存储后端或网络拥塞</td><td>查存储服务端、交换机、NFS/Lustre 指标。</td></tr>
+<tr><td>首轮慢，第二轮快</td><td>epoch 1 慢，后续快</td><td>页缓存预热效果</td><td>预热缓存、本地缓存、调整数据布局。</td></tr>
+</table>
+<pre><code># 训练时并行采集：设备 + 进程 I/O + CPU
+iostat -xzy 1 120 | tee iostat.dataloader.log
+pidstat -dru -h 1 120 | tee pidstat.dataloader.log
+mpstat -P ALL 1 120 | tee mpstat.dataloader.log
+
+# 查看文件数量和平均大小，小文件数据集尤其危险
+find /data/train -type f | wc -l
+find /data/train -type f -printf '%s\n' 2&gt;/dev/null | awk '{n++; s+=$1} END {print "files=" n, "avg_kib=" s/n/1024}'</code></pre>
+<div class="success"><strong>典型优化：</strong> 把海量小文件转换成 shard/tar/LMDB/Parquet/WebDataset，或者在每个训练节点使用本地 NVMe 缓存，通常比盲目增加 <code>num_workers</code> 更有效。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. checkpoint 与写放大排查</h2>
+<p>大模型 checkpoint 往往包含模型权重、optimizer state、scheduler、随机状态和分布式分片。写入可能在短时间内制造巨大 <code>wkB/s</code> 和 <code>w_await</code>，同时影响 dataloader 读和其他租户。</p>
+<table>
+<tr><th>现象</th><th>解释</th><th>应对</th></tr>
+<tr><td><code>wkB/s</code> 周期性冲高，GPU 同步停顿</td><td>保存 checkpoint 阻塞训练主循环或共享存储写入慢。</td><td>异步保存、降低保存频率、分片 checkpoint、本地落盘后后台上传。</td></tr>
+<tr><td><code>w_await</code> 高，<code>aqu-sz</code> 高</td><td>写队列堆积，设备或后端写能力不足。</td><td>换高写吞吐盘、错峰保存、控制同时保存任务数。</td></tr>
+<tr><td>写入后读延迟变差</td><td>刷脏页、页缓存污染或共享后端争用。</td><td>隔离 checkpoint 盘和数据盘，控制 dirty ratio，使用独立路径。</td></tr>
+<tr><td><code>dm-*</code> 忙但底层盘也忙</td><td>LVM/加密/RAID 层叠加显示。</td><td>避免重复计算，按拓扑看上层逻辑设备和底层物理设备。</td></tr>
+</table>
+<pre><code># 对齐 checkpoint 时间点
+date
+iostat -xzy 1 180 | tee iostat.ckpt.log
+
+# 查当前写入进程
+pidstat -d 1 20
+lsof +D /checkpoints 2&gt;/dev/null | head
+
+# 检查挂载和设备隔离
+df -hT /data /checkpoints
+lsblk -o NAME,TYPE,SIZE,MOUNTPOINT,MODEL</code></pre>
+<div class="warn"><strong>生产提醒：</strong> checkpoint 路径最好和训练数据路径隔离。把高峰写入和高峰读取放到同一共享后端，最容易制造“所有 GPU 都在等存储”的集群级抖动。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. <code>iostat</code> vs <code>fio</code>/<code>iotop</code>/<code>pidstat</code>/<code>sar</code></h2>
+<p><code>iostat</code> 回答“设备发生了什么”，但完整排障还需要回答“谁造成的”“容量上限是多少”“历史什么时候开始异常”。这些问题需要组合工具。</p>
+<table>
+<tr><th>工具</th><th>核心价值</th><th>典型命令</th><th>注意事项</th></tr>
+<tr><td><code>iostat</code></td><td>设备级吞吐、延迟、队列、忙碌度</td><td><code>iostat -xz 1</code></td><td>不能定位到进程或文件。</td></tr>
+<tr><td><code>pidstat -d</code></td><td>进程级读写速率和延迟线索</td><td><code>pidstat -dru -h 1</code></td><td>对线程、短命进程和缓存命中要谨慎。</td></tr>
+<tr><td><code>iotop</code></td><td>交互式进程 I/O 排名</td><td><code>sudo iotop -oPa</code></td><td>常需要 root；容器环境可能受限。</td></tr>
+<tr><td><code>fio</code></td><td>合成基准，测设备/路径容量</td><td><code>fio --name=read --rw=randread ...</code></td><td>可能破坏数据或影响生产，必须安全配置。</td></tr>
+<tr><td><code>sar -d</code></td><td>历史磁盘指标回放</td><td><code>sar -d -f /var/log/sa/sa24</code></td><td>依赖 sysstat 事先采集。</td></tr>
+<tr><td>eBPF/blktrace</td><td>深入块层延迟分布和调用路径</td><td><code>biolatency</code>、<code>biosnoop</code></td><td>需要权限和内核支持，适合疑难问题。</td></tr>
+</table>
+<div class="danger"><strong>fio 安全警告：</strong> 不要在生产挂载点上随手运行写测试。需要基准时，先确认测试文件路径、大小、<code>--direct</code>、<code>--readonly</code> 或 <code>--rw=read</code>，避免覆盖真实数据，并告知可能产生的负载。</div>
+<pre><code># 相对安全的只读 fio 示例：读取一个已存在的大测试文件
+fio --name=seqread --filename=/data/testfile.bin --rw=read --bs=1M --iodepth=32 --numjobs=1 --direct=1 --runtime=60 --time_based --group_reporting --readonly
+
+# 进程级 I/O
+pidstat -dru -h 1 30
+
+# 交互式查看正在产生 I/O 的进程
+sudo iotop -oPa</code></pre>
+</section>
+
+<section class="figure" id="fig-troubleshoot">
+<h3>排障图：从 GPU 低利用到存储根因</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="AI Infra iostat 排障流程图">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="390" y="45" width="320" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">GPU 利用率低 / step 变慢</text>
+<rect x="100" y="165" width="240" height="85" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="220" y="199" text-anchor="middle" font-size="18" font-weight="700">先看主机总压</text><text x="220" y="225" text-anchor="middle" font-size="14">vmstat / mpstat</text>
+<rect x="430" y="165" width="240" height="85" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="199" text-anchor="middle" font-size="18" font-weight="700">看设备 I/O</text><text x="550" y="225" text-anchor="middle" font-size="14">iostat -xz 1</text>
+<rect x="760" y="165" width="240" height="85" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="880" y="199" text-anchor="middle" font-size="18" font-weight="700">看进程责任</text><text x="880" y="225" text-anchor="middle" font-size="14">pidstat / iotop</text>
+<rect x="90" y="330" width="250" height="92" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="215" y="366" text-anchor="middle" font-size="17" font-weight="700">await + aqu-sz 高</text><text x="215" y="394" text-anchor="middle" font-size="14">设备/后端队列堆积</text>
+<rect x="425" y="330" width="250" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="366" text-anchor="middle" font-size="17" font-weight="700">r/s 高 rkB/s 低</text><text x="550" y="394" text-anchor="middle" font-size="14">小文件随机读</text>
+<rect x="760" y="330" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="885" y="366" text-anchor="middle" font-size="17" font-weight="700">wkB/s 周期高</text><text x="885" y="394" text-anchor="middle" font-size="14">checkpoint / 日志写</text>
+<rect x="90" y="505" width="250" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="215" y="541" text-anchor="middle" font-size="17" font-weight="700">降并发或扩容</text><text x="215" y="569" text-anchor="middle" font-size="14">本地缓存 / 更高规格</text>
+<rect x="425" y="505" width="250" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="541" text-anchor="middle" font-size="17" font-weight="700">改数据布局</text><text x="550" y="569" text-anchor="middle" font-size="14">shard / tar / LMDB</text>
+<rect x="760" y="505" width="250" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="885" y="541" text-anchor="middle" font-size="17" font-weight="700">隔离写路径</text><text x="885" y="569" text-anchor="middle" font-size="14">异步保存 / 错峰</text>
+<rect x="250" y="660" width="600" height="52" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="693" text-anchor="middle" font-size="17" font-weight="700">若 iostat 正常，转查 CPU 解码、网络、分布式同步、框架 profiler 和 GPU kernel</text>
+<line x1="550" y1="111" x2="220" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="111" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="111" x2="880" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="250" x2="215" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="250" x2="550" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="250" x2="885" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="215" y1="422" x2="215" y2="505" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="550" y1="422" x2="550" y2="505" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="885" y1="422" x2="885" y2="505" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">存储只是 GPU 低利用的常见原因之一。iostat 正常时，不要继续强行归因到磁盘。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 故障模式速查</h2>
+<div class="grid-2">
+<div class="card"><strong>读延迟高</strong><br><code>r_await</code> 高，GPU 空转。查小文件、远端存储、页缓存冷启动、metadata 服务和网络。</div>
+<div class="card"><strong>写延迟高</strong><br><code>w_await</code> 高，checkpoint 卡顿。查保存频率、写路径隔离、云盘写限额、后台上传。</div>
+<div class="card"><strong>队列堆积</strong><br><code>aqu-sz</code> 高且 <code>await</code> 高。说明并发压力超过设备或后端消化能力。</div>
+<div class="card"><strong>IOPS 高吞吐低</strong><br><code>r/s</code> 高但 <code>rkB/s</code> 低。常见于小文件随机读和 metadata 风暴。</div>
+<div class="card"><strong>吞吐高延迟低</strong><br><code>rkB/s</code>/<code>wkB/s</code> 高但 <code>await</code> 可接受。可能是健康的大块顺序 I/O。</div>
+<div class="card"><strong>%util 高但没症状</strong><br>对 NVMe/多队列设备不必立即恐慌；结合应用延迟、吞吐规格和队列判断。</div>
+<div class="card"><strong>dm 设备和 nvme 都忙</strong><br>同一 I/O 可能在多层显示。用 <code>lsblk</code> 看拓扑，避免重复归因。</div>
+<div class="card"><strong>iostat 正常但训练慢</strong><br>转查 CPU 解码、Python GIL/worker、网络、NCCL 同步、数据增强、GPU kernel 和框架 profiler。</div>
+</div>
+<h3>排障模板</h3>
+<pre><code># 1. 确认业务路径对应设备
+df -hT /data /checkpoints
+findmnt /data /checkpoints
+lsblk -o NAME,TYPE,SIZE,MODEL,MOUNTPOINT
+
+# 2. 采集窗口，跳过首行
+iostat -xzy 1 60 | tee iostat.issue.log
+
+# 3. 同时抓进程和 CPU
+pidstat -dru -h 1 60 | tee pidstat.issue.log
+vmstat -w 1 60 | tee vmstat.issue.log
+
+# 4. 对齐应用日志：step time、dataloader time、checkpoint time
+grep -E 'step|data|checkpoint|save' train.log | tail -100</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 安全采集、脚本化与参考资料</h2>
+<p><code>iostat</code> 本身是只读低开销工具，适合生产采集；真正需要谨慎的是后续压测、清缓存、迁移数据或调整 checkpoint 策略。任何会增加 I/O 压力或修改数据的动作都要先确认范围。</p>
+<table>
+<tr><th>动作</th><th>风险</th><th>安全做法</th></tr>
+<tr><td>运行 <code>iostat -xz 1</code></td><td>很低</td><td>只读采样，可在生产使用。</td></tr>
+<tr><td>运行 <code>fio</code> 写测试</td><td>高</td><td>使用专用测试路径，确认不会覆盖数据，避开生产高峰。</td></tr>
+<tr><td>清理页缓存</td><td>高</td><td>会影响整机缓存和其他租户，生产上通常不要做。</td></tr>
+<tr><td>调整 dataloader worker</td><td>中</td><td>小步实验，记录吞吐、CPU、iostat 和 GPU 利用率。</td></tr>
+<tr><td>迁移 checkpoint 路径</td><td>中</td><td>先验证恢复流程和权限，再改训练配置。</td></tr>
+</table>
+<pre><code># 轻量采集脚本：只读，不改系统状态
+#!/usr/bin/env bash
+set -euo pipefail
+out=${1:-/tmp/iostat-capture}
+mkdir -p "$out"
+ts=$(date +%Y%m%d-%H%M%S)
+{
+  date
+  hostname
+  iostat -V
+  lsblk -o NAME,TYPE,SIZE,MODEL,MOUNTPOINT
+  echo "---- iostat ----"
+  iostat -xzy 1 60
+} | tee "$out/iostat.$ts.log"</code></pre>
+<div class="danger"><strong>不要做：</strong> 不要为了“验证是不是缓存问题”就在共享训练节点上执行 <code>echo 3 &gt; /proc/sys/vm/drop_caches</code>；这会影响同机任务，并可能制造比原问题更大的抖动。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>sysstat 项目文档：<code>iostat(1)</code>、<code>sar(1)</code>、字段定义、采样语义和版本差异。</li>
+<li>Linux kernel block layer 文档：块设备统计、I/O 调度、多队列 blk-mq、<code>/proc/diskstats</code>。</li>
+<li>fio 官方文档：I/O workload 模型、<code>iodepth</code>、<code>direct</code>、read-only 安全参数和结果解释。</li>
+<li>云厂商块存储文档：IOPS、吞吐、burst credit、实例带宽上限、监控指标和限流语义。</li>
+<li>AI 数据管道实践：WebDataset、LMDB、Parquet、mmap、本地 NVMe 缓存、checkpoint 分片和异步保存。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 <code>iostat -xz 1</code> 和采样窗口，再学会把字段分成吞吐、延迟、队列、忙碌四类，最后结合 <code>pidstat</code>、<code>iotop</code>、<code>fio</code>、<code>sar</code> 和存储后端监控建立完整证据链。</p>
+</section>
+<div class="footer">iostat 深度教程 · AI Infra 版 · 块设备吞吐、延迟、队列、饱和、dataloader 与 checkpoint 排障</div>
+</div>
+</body>
+</html>

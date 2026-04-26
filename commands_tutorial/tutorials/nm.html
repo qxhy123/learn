@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>nm 深度教程：AI Infra 中的符号表、ABI 与链接排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>nm 深度教程：AI Infra 中的符号表、ABI 与链接排障</h1>
+<p class="sub">这份教程面向 AI Infra、GPU 平台和机器学习系统工程中的 <code>nm</code> 使用场景。它不会只罗列选项，而是从“目标文件、静态库、共享库里到底暴露了哪些符号”这个核心问题出发，讲清楚：定义/未定义符号、符号类型字母、C++ 名字修饰与 <code>-C</code> 反混淆、CUDA/C++ 扩展符号冲突、静态库归档、动态库导出、ABI 线索、与 <code>readelf</code>/<code>objdump</code>/<code>ldd</code> 的边界，以及生产排障流程。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">符号表</span><span class="chip">Undefined Symbols</span><span class="chip">Demangle -C</span><span class="chip">CUDA Extension</span><span class="chip">C++ ABI</span><span class="chip">Static/Shared Libs</span><span class="chip">PyTorch 扩展</span><span class="chip">链接排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>nm</code> 是“看符号账本”的工具：它告诉你一个 <code>.o</code>、<code>.a</code>、<code>.so</code> 或可执行文件里，哪些函数/变量被定义了，哪些还在等待链接器或动态加载器去解析。</div>
+<div class="success"><strong>最重要原则：</strong> 看到 <code>undefined symbol</code> 不要先猜环境变量；先用 <code>nm -C</code> 确认“谁需要这个符号、谁提供这个符号、名字和 ABI 是否完全一致”，再检查链接顺序、库版本和加载路径。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">nm 是什么，为什么 AI Infra 常用</a></li>
+<li><a class="anchor" href="#s2">核心模型：文件、符号表与链接解析</a></li>
+<li><a class="anchor" href="#s3">安装、版本与输入对象</a></li>
+<li><a class="anchor" href="#s4">基本语法与常用选项</a></li>
+<li><a class="anchor" href="#s5">输出列与符号类型字母</a></li>
+<li><a class="anchor" href="#s6">定义符号、未定义符号与重复定义</a></li>
+<li><a class="anchor" href="#s7">C++ 名字修饰与 demangle -C</a></li>
+<li><a class="anchor" href="#s8">CUDA/C++ 扩展排障</a></li>
+<li><a class="anchor" href="#s9">静态库 .a 与链接顺序</a></li>
+<li><a class="anchor" href="#s10">共享库 .so 与动态符号</a></li>
+<li><a class="anchor" href="#s11">ABI 线索：GLIBCXX、CXXABI、PyTorch ABI</a></li>
+<li><a class="anchor" href="#s12">nm vs readelf vs objdump vs ldd</a></li>
+<li><a class="anchor" href="#s13">AI Infra 常见场景清单</a></li>
+<li><a class="anchor" href="#s14">生产安全与自动化脚本</a></li>
+<li><a class="anchor" href="#s15">排障流程与常见坑</a></li>
+<li><a class="anchor" href="#s16">练习、速查与参考资料</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. nm 是什么，为什么 AI Infra 常用</h2>
+<p><code>nm</code> 读取二进制对象中的符号表，并输出函数、全局变量、弱符号、未定义引用、调试符号等信息。对 AI Infra 来说，它最常用于定位 C++/CUDA/PyTorch 扩展在编译、链接和运行时加载阶段出现的符号问题。</p>
+<div class="grid-3">
+<div class="card"><strong>编译阶段</strong><br>检查 <code>.o</code> 是否真的编出了某个 kernel wrapper、C API 或 C++ 函数。</div>
+<div class="card"><strong>链接阶段</strong><br>定位 <code>undefined reference</code>、重复定义、静态库顺序错误和漏链依赖库。</div>
+<div class="card"><strong>运行时加载</strong><br>排查 Python import 扩展时报 <code>undefined symbol</code>、ABI 不匹配、加载了错误版本 <code>.so</code>。</div>
+</div>
+<pre><code># 查看一个目标文件定义了什么
+nm -C build/attention.o | less
+
+# 只看未解析引用
+nm -C -u build/my_extension.o
+
+# 检查共享库的动态导出符号
+nm -D -C build/libflash_attn_ext.so | grep 'flash_attn'
+
+# 检查静态库里哪个成员提供了符号
+nm -A -C build/libkernels.a | grep 'fused_layer_norm'</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>nm</code> 不是性能分析器，也不告诉你库是否会被动态加载器实际找到。它回答的是“符号表里有什么”；加载路径和依赖解析还要结合 <code>ldd</code>、<code>readelf -d</code>、<code>LD_DEBUG=libs</code>。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：nm 在编译/链接/加载链路中的位置</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="nm 与编译链接加载链路">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="50" y="92" width="190" height="106" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="145" y="130" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">源码</text><text x="145" y="160" text-anchor="middle" font-size="15">.cc / .cu / .c</text><text x="145" y="184" text-anchor="middle" font-size="15">声明与实现</text>
+<rect x="310" y="92" width="190" height="106" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="405" y="130" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">目标文件</text><text x="405" y="160" text-anchor="middle" font-size="15">.o / .obj</text><text x="405" y="184" text-anchor="middle" font-size="15">局部符号表</text>
+<rect x="570" y="92" width="190" height="106" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="665" y="130" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">库/程序</text><text x="665" y="160" text-anchor="middle" font-size="15">.a / .so / exe</text><text x="665" y="184" text-anchor="middle" font-size="15">链接产物</text>
+<rect x="830" y="92" width="190" height="106" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="925" y="130" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">运行加载</text><text x="925" y="160" text-anchor="middle" font-size="15">Python import</text><text x="925" y="184" text-anchor="middle" font-size="15">dlopen / loader</text>
+<rect x="230" y="320" width="640" height="150" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="358" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">nm 读取符号表，帮助回答三个问题</text><text x="550" y="400" text-anchor="middle" font-size="16">1. 当前文件定义了哪些符号？</text><text x="550" y="430" text-anchor="middle" font-size="16">2. 当前文件还缺哪些符号？</text><text x="550" y="460" text-anchor="middle" font-size="16">3. C++/CUDA 符号名和 ABI 是否与预期一致？</text>
+<line x1="240" y1="145" x2="310" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="500" y1="145" x2="570" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="760" y1="145" x2="830" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M405 198 C405 250, 465 285, 520 320" fill="none" stroke="#7c3aed" stroke-width="4" marker-end="url(#a2)"/><path d="M665 198 C665 250, 620 285, 580 320" fill="none" stroke="#0f766e" stroke-width="4" marker-end="url(#a3)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="a2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#7c3aed"/></marker><marker id="a3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#0f766e"/></marker></defs>
+</svg><div class="caption">在 AI Infra 中，<code>nm</code> 常用于“从报错反推二进制事实”：符号是否存在、在哪个文件、以什么名字存在、是否被导出。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与输入对象</h2>
+<p><code>nm</code> 通常来自 GNU binutils；macOS 也有同名工具但输出和选项存在差异。Linux AI 训练/推理环境中，排查 ELF 二进制时通常使用 GNU <code>nm</code>。交叉编译或嵌入式环境会有架构前缀，例如 <code>aarch64-linux-gnu-nm</code>。</p>
+<table><tr><th>输入对象</th><th>是否适合 nm</th><th>AI Infra 例子</th></tr><tr><td><code>.o</code></td><td>很适合</td><td>单个 C++/CUDA 编译单元：<code>attention.o</code>、<code>binding.o</code></td></tr><tr><td><code>.a</code></td><td>很适合</td><td>静态 kernel 库：<code>libcutlass_kernels.a</code></td></tr><tr><td><code>.so</code></td><td>适合，常配 <code>-D</code></td><td>Python 扩展：<code>my_op.cpython-311-x86_64-linux-gnu.so</code></td></tr><tr><td>可执行文件</td><td>适合</td><td>推理服务二进制、benchmark 程序</td></tr><tr><td>被 strip 的文件</td><td>部分适合</td><td>普通符号表可能消失，但动态符号表可能仍可用</td></tr></table>
+<pre><code># 确认工具来源
+which nm
+nm --version
+
+# 判断文件类型
+file build/my_extension.so
+readelf -h build/my_extension.so | sed -n '1,12p'
+
+# 交叉编译产物用匹配架构的 nm
+aarch64-linux-gnu-nm -C build/libedge_infer.a | head</code></pre>
+<div class="note"><strong>实用判断：</strong> 如果 <code>nm libx.so</code> 输出很少或提示 <code>no symbols</code>，不要立刻认为库没有导出；先试 <code>nm -D libx.so</code> 查看动态符号表。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 基本语法与常用选项</h2>
+<pre><code>nm [options] file...
+
+# 最常用组合
+nm -C file.o                 # C++ 符号反混淆
+nm -C -u file.o              # 只看未定义符号
+nm -C --defined-only file.o  # 只看已定义符号
+nm -D -C libx.so             # 查看共享库动态符号表
+nm -A -C libx.a              # 每行带文件名/归档成员名
+nm -S -C --size-sort file.o  # 显示大小并按大小排序</code></pre>
+<table><tr><th>选项</th><th>含义</th><th>什么时候用</th></tr><tr><td><code>-C</code> / <code>--demangle</code></td><td>把 C++ 修饰名还原成人类可读签名</td><td>几乎所有 C++/CUDA/PyTorch 扩展排障都应使用</td></tr><tr><td><code>-u</code> / <code>--undefined-only</code></td><td>只显示未定义符号</td><td>定位缺少哪个库或对象</td></tr><tr><td><code>--defined-only</code></td><td>只显示当前文件定义的符号</td><td>确认库是否提供目标函数</td></tr><tr><td><code>-D</code> / <code>--dynamic</code></td><td>显示动态符号表而不是普通符号表</td><td>检查 <code>.so</code> 对运行时可见的导入/导出</td></tr><tr><td><code>-A</code> / <code>--print-file-name</code></td><td>输出来源文件名</td><td>查多个对象或静态库成员时必须用</td></tr><tr><td><code>-S</code> / <code>--print-size</code></td><td>显示符号大小</td><td>粗略查看大函数/大对象或重复膨胀</td></tr><tr><td><code>--size-sort</code></td><td>按大小排序</td><td>观察 C++ 模板实例化膨胀</td></tr><tr><td><code>-g</code> / <code>--extern-only</code></td><td>只显示外部符号</td><td>忽略局部实现细节，关注链接边界</td></tr></table>
+<div class="success"><strong>推荐默认命令：</strong> 查 C++/CUDA 问题时先用 <code>nm -A -C</code>；查 <code>.so</code> 的运行时导入导出时用 <code>nm -D -A -C</code>。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 输出列与符号类型字母</h2>
+<p><code>nm</code> 的典型输出是“地址、类型、符号名”。未定义符号没有地址，常见类型是 <code>U</code>。大写通常代表全局/外部可见，小写通常代表局部符号；具体含义会受目标格式和平台影响。</p>
+<pre><code>00000000000012b0 T launch_attention(at::Tensor, at::Tensor)
+                 U at::Tensor::data_ptr() const
+0000000000004060 B global_workspace
+0000000000002030 R kernel_name
+0000000000001170 t helper_local(float*)
+0000000000000000 W c10::Error::what() const</code></pre>
+<table><tr><th>类型</th><th>常见含义</th><th>排障解读</th></tr><tr><td><code>T</code>/<code>t</code></td><td>代码段 text 中的函数</td><td><code>T</code> 表示库定义了可链接函数；<code>t</code> 常是局部 helper</td></tr><tr><td><code>U</code></td><td>未定义符号</td><td>当前文件需要别人提供；链接或加载失败时优先看它</td></tr><tr><td><code>B</code>/<code>b</code></td><td>BSS，未初始化数据</td><td>全局 buffer、workspace、静态变量可能在这里</td></tr><tr><td><code>D</code>/<code>d</code></td><td>已初始化数据</td><td>全局配置、注册表、非 const 全局对象</td></tr><tr><td><code>R</code>/<code>r</code></td><td>只读数据</td><td>字符串、常量表、kernel name</td></tr><tr><td><code>W</code>/<code>w</code></td><td>弱符号</td><td>可被强符号覆盖；模板、运行库兼容层里常见</td></tr><tr><td><code>V</code>/<code>v</code></td><td>弱对象符号</td><td>C++ ABI、全局对象兼容场景可能出现</td></tr><tr><td><code>i</code></td><td>间接函数或平台相关符号</td><td>通常需要结合 <code>readelf</code> 判断</td></tr></table>
+<div class="warn"><strong>不要过度解读地址：</strong> 对可重定位 <code>.o</code> 来说，地址通常只是段内偏移；最终运行地址由链接器和加载器决定。</div>
+</section>
+
+<section class="figure" id="s6">
+<h3>流程图：定义、未定义与链接解析</h3>
+<svg viewBox="0 0 1100 710" width="100%" role="img" aria-label="nm 符号解析流程图">
+<rect x="20" y="20" width="1060" height="670" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="85" y="90" width="250" height="130" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="210" y="130" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">binding.o</text><text x="210" y="165" text-anchor="middle" font-size="15">T pybind11 init</text><text x="210" y="192" text-anchor="middle" font-size="15">U launch_kernel</text>
+<rect x="425" y="90" width="250" height="130" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="130" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">kernel.o</text><text x="550" y="165" text-anchor="middle" font-size="15">T launch_kernel</text><text x="550" y="192" text-anchor="middle" font-size="15">U cudaLaunchKernel</text>
+<rect x="765" y="90" width="250" height="130" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="890" y="130" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">libcudart.so</text><text x="890" y="165" text-anchor="middle" font-size="15">T cudaLaunchKernel</text><text x="890" y="192" text-anchor="middle" font-size="15">动态库提供</text>
+<polygon points="550,300 735,390 550,480 365,390" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="378" text-anchor="middle" font-size="18" font-weight="700">链接器能否找到</text><text x="550" y="404" text-anchor="middle" font-size="15">每个 U 对应的 T/W/D？</text>
+<rect x="110" y="555" width="330" height="82" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="275" y="589" text-anchor="middle" font-size="19" font-weight="700" fill="#166534">成功</text><text x="275" y="616" text-anchor="middle" font-size="14">生成 .so / executable</text>
+<rect x="660" y="555" width="330" height="82" rx="16" fill="#fee2e2" stroke="#fecaca"/><text x="825" y="589" text-anchor="middle" font-size="19" font-weight="700" fill="#991b1b">失败</text><text x="825" y="616" text-anchor="middle" font-size="14">undefined reference / undefined symbol</text>
+<line x1="335" y1="155" x2="425" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="675" y1="155" x2="765" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M550 220 C550 250, 550 270, 550 300" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M465 475 C410 515, 340 535, 275 555" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#b2)"/><path d="M635 475 C700 515, 770 535, 825 555" fill="none" stroke="#dc2626" stroke-width="4" marker-end="url(#b3)"/>
+<text x="420" y="522" font-size="15" fill="#166534">全部解析</text><text x="680" y="522" font-size="15" fill="#991b1b">缺失或签名不一致</text>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="b2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker><marker id="b3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#dc2626"/></marker></defs>
+</svg><div class="caption"><code>U</code> 不一定是错误：对象文件和共享库可以包含未定义符号。错误发生在链接器或运行时加载器需要解析它却找不到兼容提供者时。</div></section>
+
+<section class="section">
+<h2>5. 定义符号、未定义符号与重复定义</h2>
+<p>AI Infra 的链接问题常可以归结为三类：缺定义、定义太多、定义存在但名字不一样。<code>nm</code> 的工作是把这三类问题从猜测变成可见事实。</p>
+<div class="grid-3">
+<div class="card"><strong>缺定义</strong><br>某个对象里有 <code>U foo</code>，但参与链接的对象和库里没有 <code>T foo</code>、<code>W foo</code> 或相关数据符号。</div>
+<div class="card"><strong>重复定义</strong><br>多个对象都定义同一个强符号，例如头文件里错误放了非 <code>inline</code> 函数实现。</div>
+<div class="card"><strong>名字不一致</strong><br>C++ 参数、命名空间、<code>extern "C"</code>、宏开关或 ABI 配置不同，导致符号名不匹配。</div>
+</div>
+<pre><code># 谁需要这个符号？
+nm -A -C build/*.o | grep ' U .*launch_fused_attention'
+
+# 谁提供这个符号？
+nm -A -C --defined-only build/*.o build/*.a | grep 'launch_fused_attention'
+
+# 只看一个库是否存在重复强定义
+nm -A -C --defined-only build/*.o | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort | uniq -d
+
+# 查看所有同名定义来源
+nm -A -C --defined-only build/*.o | grep ' fused_layer_norm('</code></pre>
+<div class="danger"><strong>重复定义警告：</strong> 不要靠随便删除对象文件“修好”链接。先定位为何多个编译单元定义同一强符号，再改为 <code>inline</code>、<code>static</code>、匿名命名空间，或移动实现到唯一 <code>.cc</code>/<code>.cu</code>。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. C++ 名字修饰与 demangle <code>-C</code></h2>
+<p>C++ 支持函数重载、命名空间、模板和类方法，链接器不能只用 <code>foo</code> 这样的短名字。因此编译器会把人类可读签名编码成修饰名，例如 <code>_ZN2at6Tensor8data_ptrEv</code>。<code>nm -C</code> 会把它反混淆成更接近源码的签名。</p>
+<table><tr><th>不加 -C</th><th>加 -C 后</th><th>价值</th></tr><tr><td><code>_ZN2at6Tensor8data_ptrIfEEPT_v</code></td><td><code>float* at::Tensor::data_ptr&lt;float&gt;()</code></td><td>看清模板参数和命名空间</td></tr><tr><td><code>_ZN3c105ErrorC1ENS_14SourceLocationESs</code></td><td><code>c10::Error::Error(c10::SourceLocation, std::string)</code></td><td>判断 PyTorch/C++ ABI 相关签名</td></tr><tr><td><code>_Z20launch_fused_softmaxPN2at6TensorES1_</code></td><td><code>launch_fused_softmax(at::Tensor*, at::Tensor*)</code></td><td>确认参数是否与声明一致</td></tr></table>
+<pre><code># 对比原始修饰名与反混淆结果
+nm build/my_extension.o | grep '_ZN2at6Tensor'
+nm -C build/my_extension.o | grep 'at::Tensor'
+
+# c++filt 可单独反混淆一行符号
+echo '_ZN2at6Tensor8data_ptrIfEEPT_v' | c++filt
+
+# 排查 extern "C" 是否生效：C API 通常不应出现 C++ 修饰名
+nm -D build/libplugin.so | grep 'create_plugin'</code></pre>
+<div class="note"><strong>AI Infra 经验：</strong> 如果 Python 扩展报的 <code>undefined symbol</code> 是一串 <code>_ZN...</code>，第一步就是用 <code>c++filt</code> 或 <code>nm -C</code> 看它到底对应哪个 C++ 函数。</div>
+</section>
+
+<section class="figure" id="s8">
+<h3>用例图：CUDA/C++ 扩展符号冲突怎么定位</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="CUDA C++ 扩展符号冲突定位图">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="26" font-weight="700">PyTorch/CUDA 扩展的符号排障路径</text>
+<rect x="70" y="120" width="210" height="90" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="175" y="155" text-anchor="middle" font-size="18" font-weight="700">Python import</text><text x="175" y="183" text-anchor="middle" font-size="14">undefined symbol</text>
+<rect x="370" y="120" width="210" height="90" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="475" y="155" text-anchor="middle" font-size="18" font-weight="700">反混淆符号</text><text x="475" y="183" text-anchor="middle" font-size="14">c++filt / nm -C</text>
+<rect x="670" y="120" width="210" height="90" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="775" y="155" text-anchor="middle" font-size="18" font-weight="700">查需求方</text><text x="775" y="183" text-anchor="middle" font-size="14">nm -D -u extension.so</text>
+<rect x="170" y="315" width="230" height="105" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="285" y="350" text-anchor="middle" font-size="18" font-weight="700">查提供方</text><text x="285" y="378" text-anchor="middle" font-size="14">libtorch / libcudart</text><text x="285" y="402" text-anchor="middle" font-size="14">自研 .so / .a</text>
+<rect x="475" y="315" width="230" height="105" rx="16" fill="#fee2e2" stroke="#fecaca"/><text x="590" y="350" text-anchor="middle" font-size="18" font-weight="700">比对 ABI</text><text x="590" y="378" text-anchor="middle" font-size="14">GLIBCXX / CXXABI</text><text x="590" y="402" text-anchor="middle" font-size="14">_GLIBCXX_USE_CXX11_ABI</text>
+<rect x="780" y="315" width="230" height="105" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="895" y="350" text-anchor="middle" font-size="18" font-weight="700">修复构建</text><text x="895" y="378" text-anchor="middle" font-size="14">链接库/顺序/路径</text><text x="895" y="402" text-anchor="middle" font-size="14">重新编译扩展</text>
+<rect x="260" y="535" width="580" height="78" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="568" text-anchor="middle" font-size="20" font-weight="700" fill="#334155">目标：让 undefined 的完整 C++ 签名，被正确版本的库导出并加载</text><text x="550" y="594" text-anchor="middle" font-size="14">不是只让文件名出现在 LD_LIBRARY_PATH 里</text>
+<line x1="280" y1="165" x2="370" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="580" y1="165" x2="670" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M775 210 C720 260, 410 265, 285 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M775 210 C770 260, 620 275, 590 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M775 210 C850 265, 890 285, 895 315" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="285" y1="420" x2="445" y2="535" stroke="#94a3b8" stroke-width="4"/><line x1="590" y1="420" x2="550" y2="535" stroke="#94a3b8" stroke-width="4"/><line x1="895" y1="420" x2="665" y2="535" stroke="#94a3b8" stroke-width="4"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">CUDA kernel 名本身不一定出现在动态符号表中；更常排查的是 host wrapper、注册函数、PyTorch/C10/ATen 相关 C++ 符号和运行库符号。</div></section>
+
+<section class="section">
+<h2>7. CUDA/C++ 扩展排障</h2>
+<p>PyTorch、TensorFlow、自研 runtime 插件或 Triton/CUDA 混合扩展失败时，报错常来自 Python 的 <code>import</code>、<code>ctypes.CDLL</code>、<code>dlopen</code> 或推理服务加载插件。<code>nm</code> 能把“库版本可能不对”拆成可验证问题。</p>
+<h3>典型错误 1：Python import 报 undefined symbol</h3>
+<pre><code># 例：导入扩展失败时，先把符号反混淆
+python -c 'import my_ext' 2&gt;&amp;1 | tee /tmp/import.err
+grep -o '_Z[^ ]*' /tmp/import.err | c++filt
+
+# 这个扩展到底缺什么？
+nm -D -C -u build/my_ext*.so | sort | less
+
+# 相关依赖库是否导出了它？
+nm -D -C "$(python - <<'PY'
+import torch, os
+print(os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"))
+PY
+)" | grep '目标符号的一部分'</code></pre>
+<h3>典型错误 2：C++ wrapper 没有被导出</h3>
+<pre><code># 检查 Python 扩展是否有 pybind11 初始化符号
+nm -D build/my_ext*.so | grep 'PyInit_'
+
+# 检查自研 C API 是否是未修饰的 C 符号
+nm -D build/libmy_plugin.so | grep -E 'create_plugin|destroy_plugin'
+
+# 如果看到 _Z...create_plugin...，可能忘了 extern "C"
+c++filt _Z13create_pluginv</code></pre>
+<h3>典型错误 3：CUDA runtime 或 driver API 漏链</h3>
+<pre><code># 对象中有 U cudaLaunchKernel，最终 .so 也还缺它
+nm -C -u build/kernel.o | grep cuda
+nm -D -C -u build/my_ext.so | grep cuda
+
+# 再看动态依赖是否包含 libcudart
+readelf -d build/my_ext.so | grep NEEDED
+ldd build/my_ext.so | grep -E 'cuda|cudart|torch'</code></pre>
+<div class="warn"><strong>CUDA 注意：</strong> <code>nm</code> 主要看 host 侧 ELF 符号；device 侧代码、fatbin、PTX/SASS 细节要用 <code>cuobjdump</code>、<code>nvdisasm</code> 或 <code>readelf -S</code> 辅助判断。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 静态库 <code>.a</code> 与链接顺序</h2>
+<p>静态库本质上是一组 <code>.o</code> 的归档。链接器按命令行从左到右扫描静态库，只在当时需要某个符号时才从库里抽取成员。因此“库里明明有符号，链接却失败”经常是链接顺序问题。</p>
+<pre><code># 查看静态库每个成员的符号，-A 会显示 lib.a(member.o)
+nm -A -C build/libkernels.a | grep 'launch_fused_attention'
+
+# 只看这个静态库对外提供什么
+nm -A -C --defined-only build/libkernels.a | less
+
+# 只看这个静态库仍然需要哪些外部符号
+nm -A -C -u build/libkernels.a | sort -u
+
+# 用 ar 看成员列表
+ar t build/libkernels.a | sed -n '1,20p'</code></pre>
+<table><tr><th>现象</th><th>可能原因</th><th>排查命令</th></tr><tr><td><code>undefined reference to launch_x</code></td><td><code>-lkernels</code> 放在使用者之前</td><td><code>nm -A -C libkernels.a | grep launch_x</code></td></tr><tr><td>两个静态库循环依赖</td><td>单次扫描无法解析</td><td>检查双方 <code>U</code> 与 <code>T</code></td></tr><tr><td>库有符号但签名不匹配</td><td>C++ 重载、命名空间、ABI 宏不同</td><td><code>nm -C</code> 对比完整签名</td></tr><tr><td>重复定义</td><td>多个成员包含同一强符号</td><td><code>nm -A --defined-only lib.a | sort</code></td></tr></table>
+<pre><code># 链接顺序示意：使用者在前，提供者在后
+g++ main.o binding.o -Lbuild -lkernels -lcudart -o demo
+
+# 循环依赖可用 group，但不要滥用
+g++ main.o -Wl,--start-group -lA -lB -Wl,--end-group -o demo</code></pre>
+<div class="note"><strong>构建系统提示：</strong> CMake 中应优先用 <code>target_link_libraries</code> 表达目标依赖，而不是手写一长串全局 linker flags；否则静态库顺序问题很难维护。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 共享库 <code>.so</code> 与动态符号</h2>
+<p>共享库通常有普通符号表和动态符号表。普通符号表可能被 <code>strip</code> 删除；动态符号表用于动态链接和 <code>dlopen</code> 解析，通常保留。排查运行时加载问题时，应优先使用 <code>nm -D</code>。</p>
+<pre><code># 查看动态导出和导入
+nm -D -C build/libinference_plugin.so | less
+
+# 只看动态未定义符号：这些需要运行时依赖库提供
+nm -D -C -u build/libinference_plugin.so | sort
+
+# 只看动态导出符号
+nm -D -C --defined-only build/libinference_plugin.so | sort
+
+# 对比普通符号表和动态符号表数量
+nm -C build/libinference_plugin.so | wc -l
+nm -D -C build/libinference_plugin.so | wc -l</code></pre>
+<table><tr><th>问题</th><th>nm 视角</th><th>后续工具</th></tr><tr><td>库没有导出插件入口</td><td><code>nm -D --defined-only</code> 找不到 <code>create_plugin</code></td><td>检查 visibility、链接脚本、<code>extern "C"</code></td></tr><tr><td>运行时缺 PyTorch 符号</td><td><code>nm -D -u</code> 有 <code>at::</code>/<code>c10::</code> 未定义</td><td><code>ldd</code>、<code>readelf -d</code>、Python 环境路径</td></tr><tr><td>本机有多个同名库</td><td>目标库符号存在但加载了别的库</td><td><code>LD_DEBUG=libs</code>、<code>ldd</code>、<code>rpath</code></td></tr><tr><td>符号被隐藏</td><td>普通表有，动态表没有</td><td><code>-fvisibility</code>、导出宏、版本脚本</td></tr></table>
+<div class="danger"><strong>生产警告：</strong> 不要为了“让符号出现”随意关闭所有 visibility 控制。AI 推理插件暴露过多 C++ 符号可能增加 ABI 冲突和 ODR 风险；只导出稳定入口更安全。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. ABI 线索：GLIBCXX、CXXABI、PyTorch ABI</h2>
+<p><code>nm</code> 能看到 C++ 符号的签名线索，但 ABI 问题通常还要结合版本符号、字符串和动态依赖。AI Infra 最常见的是编译器/libstdc++ 版本、<code>_GLIBCXX_USE_CXX11_ABI</code>、PyTorch 编译 ABI、CUDA runtime 版本不一致。</p>
+<div class="grid-2">
+<div class="card"><strong>C++11 ABI 宏</strong><br>同一个接口如果一边用旧 ABI，一边用新 ABI，涉及 <code>std::string</code>/<code>std::list</code> 等类型的符号可能不同。</div>
+<div class="card"><strong>libstdc++ 版本</strong><br>扩展可能需要较新的 <code>GLIBCXX_3.4.xx</code>，但运行环境只提供旧版本，最终 import 失败。</div>
+<div class="card"><strong>PyTorch ABI</strong><br>自定义 C++ 扩展应与安装的 PyTorch 使用相同编译器约束、C++ 标准库 ABI 和 CUDA 组合。</div>
+<div class="card"><strong>符号版本</strong><br><code>nm</code> 可显示部分带版本的动态符号，但版本需求常用 <code>readelf --version-info</code> 更清楚。</div>
+</div>
+<pre><code># 查看扩展引用的 C++ 标准库符号版本
+strings build/my_ext.so | grep -E 'GLIBCXX_|CXXABI_' | sort -V | tail
+
+# 查看动态符号中是否有 std::__cxx11 线索
+nm -D -C build/my_ext.so | grep 'std::__cxx11' | head
+
+# PyTorch 侧 ABI 配置
+python - <<'PY'
+import torch
+print(torch.__version__)
+print(torch._C._GLIBCXX_USE_CXX11_ABI)
+print(torch.version.cuda)
+PY
+
+# 更完整的版本符号检查
+readelf --version-info build/my_ext.so | grep -E 'GLIBCXX|CXXABI' | tail</code></pre>
+<div class="warn"><strong>ABI 判断不要只靠一个命令：</strong> <code>nm -C</code> 看到 <code>std::__cxx11</code> 是重要线索，但最终要结合 PyTorch ABI 配置、编译参数、运行环境 <code>libstdc++.so.6</code> 和版本符号确认。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. <code>nm</code> vs <code>readelf</code> vs <code>objdump</code> vs <code>ldd</code></h2>
+<p>这些工具经常一起出现，但职责不同。高效排障的关键是先问清楚问题属于“符号表内容”“ELF 元数据”“反汇编/重定位细节”还是“运行时加载路径”。</p>
+<table><tr><th>工具</th><th>主要回答</th><th>典型命令</th><th>AI Infra 用法</th></tr><tr><td><code>nm</code></td><td>符号定义、未定义、导出、大小</td><td><code>nm -D -C -u libx.so</code></td><td>查 undefined symbol、C++ 签名、静态库成员</td></tr><tr><td><code>readelf</code></td><td>ELF 头、段、节、动态依赖、版本符号</td><td><code>readelf -d libx.so</code></td><td>查 <code>NEEDED</code>、<code>RPATH</code>、<code>RUNPATH</code>、GLIBCXX 版本</td></tr><tr><td><code>objdump</code></td><td>反汇编、重定位、符号表补充</td><td><code>objdump -T -C libx.so</code></td><td>看 PLT/GOT、版本化动态符号、指令级线索</td></tr><tr><td><code>ldd</code></td><td>当前环境会解析到哪些共享库</td><td><code>ldd libx.so</code></td><td>查加载了哪个 <code>libtorch</code>/<code>libcuda</code>/<code>libstdc++</code></td></tr><tr><td><code>c++filt</code></td><td>单独反混淆 C++ 修饰名</td><td><code>echo _ZN... | c++filt</code></td><td>把报错中的 <code>_Z...</code> 变成人类可读签名</td></tr></table>
+<pre><code># 一套常用组合拳
+nm -D -C -u build/my_ext.so | sort | sed -n '1,80p'
+readelf -d build/my_ext.so | grep -E 'NEEDED|RPATH|RUNPATH'
+ldd build/my_ext.so | grep -E 'torch|cuda|stdc\\+\\+|not found'
+readelf --version-info build/my_ext.so | grep -E 'GLIBCXX|CXXABI' | tail</code></pre>
+<div class="success"><strong>选择规则：</strong> 先用 <code>nm</code> 确认“符号事实”，再用 <code>readelf</code>/<code>ldd</code> 确认“加载事实”。不要用 <code>ldd</code> 代替符号检查，也不要用 <code>nm</code> 代替加载路径检查。</div>
+</section>
+
+<section class="figure" id="s13">
+<h3>对比图：四类二进制排障问题该用什么工具</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="nm readelf objdump ldd 对比图">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">二进制排障工具选择</text>
+<rect x="70" y="125" width="220" height="150" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="180" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">nm</text><text x="180" y="202" text-anchor="middle" font-size="15">符号定义/未定义</text><text x="180" y="230" text-anchor="middle" font-size="15">C++ demangle</text><text x="180" y="258" text-anchor="middle" font-size="15">静态库成员</text>
+<rect x="320" y="125" width="220" height="150" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">readelf</text><text x="430" y="202" text-anchor="middle" font-size="15">ELF 结构</text><text x="430" y="230" text-anchor="middle" font-size="15">NEEDED/RPATH</text><text x="430" y="258" text-anchor="middle" font-size="15">版本符号</text>
+<rect x="570" y="125" width="220" height="150" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="680" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">objdump</text><text x="680" y="202" text-anchor="middle" font-size="15">反汇编</text><text x="680" y="230" text-anchor="middle" font-size="15">重定位细节</text><text x="680" y="258" text-anchor="middle" font-size="15">动态符号补充</text>
+<rect x="820" y="125" width="220" height="150" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="930" y="164" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">ldd</text><text x="930" y="202" text-anchor="middle" font-size="15">当前环境解析</text><text x="930" y="230" text-anchor="middle" font-size="15">not found</text><text x="930" y="258" text-anchor="middle" font-size="15">实际库路径</text>
+<rect x="135" y="390" width="830" height="125" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="430" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">推荐排障顺序</text><text x="550" y="465" text-anchor="middle" font-size="16">报错符号 → c++filt/nm -C → nm -D -u → readelf -d → ldd/LD_DEBUG</text><text x="550" y="494" text-anchor="middle" font-size="15">先确认二进制需要什么，再确认运行环境提供了什么</text>
+<line x1="290" y1="200" x2="320" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="540" y1="200" x2="570" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="790" y1="200" x2="820" y2="200" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">工具边界越清楚，排障越快：<code>nm</code> 看符号表，<code>readelf</code> 看 ELF 元数据，<code>ldd</code> 看当前运行环境解析结果。</div></section>
+
+<section class="section">
+<h2>12. AI Infra 常见场景清单</h2>
+<p>下面这些场景都适合先用 <code>nm</code> 建立事实，再决定是否修改构建脚本、环境变量或部署镜像。</p>
+<div class="grid-2">
+<div class="card"><strong>PyTorch C++ extension import 失败</strong><br><code>nm -D -C -u ext.so</code> 找缺失 ATen/C10 符号；用 <code>c++filt</code> 反混淆报错符号。</div>
+<div class="card"><strong>TensorRT / 推理插件入口缺失</strong><br><code>nm -D --defined-only plugin.so</code> 检查 <code>createInferRuntime_INTERNAL</code>、自研 C API 或插件注册函数。</div>
+<div class="card"><strong>CUDA runtime 漏链</strong><br><code>nm -D -u libx.so | grep cuda</code> 和 <code>readelf -d</code> 联合检查 <code>libcudart</code> 依赖。</div>
+<div class="card"><strong>静态 kernel 库链接失败</strong><br><code>nm -A -C libkernels.a</code> 找归档成员，确认链接顺序和 group。</div>
+<div class="card"><strong>C++ ABI 与 PyTorch 不一致</strong><br><code>nm -C</code> 查 <code>std::__cxx11</code>，再核对 <code>torch._C._GLIBCXX_USE_CXX11_ABI</code>。</div>
+<div class="card"><strong>多版本库冲突</strong><br>目标库符号存在但运行仍失败时，用 <code>ldd</code>/<code>LD_DEBUG=libs</code> 看实际加载路径。</div>
+</div>
+<pre><code># 快速巡检一个扩展的核心信息
+so=build/my_ext.so
+echo "== undefined dynamic symbols =="
+nm -D -C -u "$so" | sort | sed -n '1,80p'
+echo "== exported entrypoints =="
+nm -D -C --defined-only "$so" | grep -E 'PyInit_|create_|register|launch' || true
+echo "== dependencies =="
+readelf -d "$so" | grep NEEDED</code></pre>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 生产安全与自动化脚本</h2>
+<p><code>nm</code> 是只读工具，本身不会修改二进制。但自动化脚本仍要注意输出体积、路径歧义、C++ 符号中的空格、CI 日志泄露和误判。生产巡检建议输出稳定摘要，而不是把几十万行符号完整刷进日志。</p>
+<h3>安全巡检模板</h3>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+so="${1:?usage: check-symbols.sh path/to/lib.so}"
+
+echo "[file]"
+file "$so"
+
+echo "[missing dynamic deps]"
+ldd "$so" | grep 'not found' && exit 1 || true
+
+echo "[undefined dynamic symbols: first 100]"
+nm -D -C -u "$so" | sort | sed -n '1,100p'
+
+echo "[exported entrypoints]"
+nm -D -C --defined-only "$so" | grep -E 'PyInit_|create_|destroy_|register' || true
+
+echo "[version requirements]"
+strings "$so" | grep -E 'GLIBCXX_|CXXABI_' | sort -V | tail -20 || true</code></pre>
+<h3>CI 中检查入口符号</h3>
+<pre><code># 例：要求 Python 扩展导出 PyInit_my_ext
+nm -D build/my_ext*.so | grep -q ' T PyInit_my_ext'
+
+# 例：要求插件导出 C ABI 入口，避免 C++ 名字修饰
+nm -D build/libplugin.so | grep -q ' T create_plugin'
+if nm -D build/libplugin.so | grep -q '_Z.*create_plugin'; then
+  echo "create_plugin appears to be C++ mangled; check extern C" >&2
+  exit 1
+fi</code></pre>
+<div class="warn"><strong>脚本注意：</strong> <code>nm -C</code> 后的 C++ 签名包含空格、逗号、尖括号和括号；不要用简单的 <code>awk '{print $3}'</code> 解析所有情况。需要机器解析时，尽量匹配原始修饰名或使用更明确的规则。</div>
+</section>
+
+<section class="figure" id="s15">
+<h3>排障流程图：undefined symbol 到最终修复</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="nm undefined symbol 排障流程图">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="68" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="550" y="86" text-anchor="middle" font-size="21" font-weight="700" fill="#991b1b">undefined symbol</text>
+<rect x="80" y="165" width="230" height="88" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="195" y="200" text-anchor="middle" font-size="18" font-weight="700">1. 反混淆</text><text x="195" y="228" text-anchor="middle" font-size="14">c++filt / nm -C</text>
+<rect x="435" y="165" width="230" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="200" text-anchor="middle" font-size="18" font-weight="700">2. 找需求方</text><text x="550" y="228" text-anchor="middle" font-size="14">nm -D -u ext.so</text>
+<rect x="790" y="165" width="230" height="88" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="905" y="200" text-anchor="middle" font-size="18" font-weight="700">3. 找提供方</text><text x="905" y="228" text-anchor="middle" font-size="14">nm -D --defined-only</text>
+<polygon points="550,320 735,405 550,490 365,405" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="392" text-anchor="middle" font-size="18" font-weight="700">提供方存在且签名一致？</text><text x="550" y="418" text-anchor="middle" font-size="14">包括 namespace、参数、ABI、版本</text>
+<rect x="90" y="585" width="265" height="90" rx="16" fill="#fee2e2" stroke="#fecaca"/><text x="222" y="620" text-anchor="middle" font-size="18" font-weight="700" fill="#991b1b">不存在</text><text x="222" y="648" text-anchor="middle" font-size="14">补链接库 / 编译缺失源文件</text>
+<rect x="415" y="585" width="270" height="90" rx="16" fill="#fff7ed" stroke="#fdba74"/><text x="550" y="620" text-anchor="middle" font-size="18" font-weight="700" fill="#9a3412">存在但不一致</text><text x="550" y="648" text-anchor="middle" font-size="14">统一 ABI / 头文件 / 编译宏</text>
+<rect x="745" y="585" width="265" height="90" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="877" y="620" text-anchor="middle" font-size="18" font-weight="700" fill="#166534">存在且一致</text><text x="877" y="648" text-anchor="middle" font-size="14">查 ldd / RPATH / LD_LIBRARY_PATH</text>
+<line x1="550" y1="113" x2="195" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="550" y1="113" x2="550" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="550" y1="113" x2="905" y2="165" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/>
+<path d="M195 253 C270 300, 395 310, 470 335" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><line x1="550" y1="253" x2="550" y2="320" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/><path d="M905 253 C830 300, 705 310, 630 335" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#e1)"/>
+<path d="M435 475 C365 525, 280 545, 222 585" fill="none" stroke="#dc2626" stroke-width="4" marker-end="url(#e2)"/><line x1="550" y1="490" x2="550" y2="585" stroke="#ea580c" stroke-width="4" marker-end="url(#e3)"/><path d="M665 475 C735 525, 820 545, 877 585" fill="none" stroke="#16a34a" stroke-width="4" marker-end="url(#e4)"/>
+<defs><marker id="e1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker><marker id="e2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#dc2626"/></marker><marker id="e3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#ea580c"/></marker><marker id="e4" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker></defs>
+</svg><div class="caption">排障不要跳步：先把报错符号翻译成人话，再证明需求方和提供方，最后才处理路径、版本和部署。</div></section>
+
+<section class="section">
+<h2>14. 排障流程与常见坑</h2>
+<h3>推荐排障流程</h3>
+<ol>
+<li>从报错中提取原始符号，使用 <code>c++filt</code> 反混淆。</li>
+<li>用 <code>nm -D -C -u</code> 确认出错 <code>.so</code> 是否确实需要该符号。</li>
+<li>用 <code>nm -D -C --defined-only</code> 在候选依赖库中确认是否提供完全一致的签名。</li>
+<li>如果提供方不存在，修构建依赖或链接顺序；如果存在但签名不同，查 ABI、宏、头文件版本和命名空间。</li>
+<li>如果提供方存在且签名一致，查 <code>readelf -d</code>、<code>ldd</code>、<code>RPATH/RUNPATH</code>、容器镜像内库路径。</li>
+</ol>
+<div class="grid-2">
+<div class="card"><strong>坑 1：忘记 <code>-C</code></strong><br>只看 <code>_ZN...</code> 很容易误判；C++ 问题默认加 <code>-C</code>。</div>
+<div class="card"><strong>坑 2：查 <code>.so</code> 忘记 <code>-D</code></strong><br>运行时可见性主要看动态符号表，不是普通符号表。</div>
+<div class="card"><strong>坑 3：把所有 <code>U</code> 当错误</strong><br>共享库保留未定义动态符号很常见，只要运行时依赖能提供即可。</div>
+<div class="card"><strong>坑 4：只 grep 短名字</strong><br>C++ 重载可能同名不同参；必须看完整签名。</div>
+<div class="card"><strong>坑 5：忽略 <code>extern "C"</code></strong><br>插件入口如果被 C++ 修饰，宿主按 C 名查找会失败。</div>
+<div class="card"><strong>坑 6：忽略 strip</strong><br>被 strip 的库普通符号表可能没有，但动态符号表仍可检查。</div>
+<div class="card"><strong>坑 7：把链接期和加载期混在一起</strong><br><code>undefined reference</code> 是链接器；<code>undefined symbol</code> 常是动态加载器。</div>
+<div class="card"><strong>坑 8：路径里查到的是错库</strong><br>本地有多个 <code>libtorch</code>/<code>libstdc++</code> 时，必须看实际加载路径。</div>
+</div>
+<pre><code># 最小化排障模板
+sym='_ZN2at6Tensor8data_ptrIfEEPT_v'
+echo "$sym" | c++filt
+
+so=build/my_ext.so
+nm -D -C -u "$so" | grep 'data_ptr'
+
+# 假设候选库是 libtorch_cpu.so
+nm -D -C --defined-only /path/to/libtorch_cpu.so | grep 'data_ptr'
+readelf -d "$so" | grep -E 'NEEDED|RPATH|RUNPATH'
+ldd "$so" | grep -E 'torch|stdc\\+\\+|not found'</code></pre>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 练习、速查与参考资料</h2>
+<h3>练习 1：构造一个未定义符号</h3>
+<pre><code>cat &gt; need.cc &lt;&lt'CPP'
+extern int missing_add(int, int);
+int call_missing(int x) { return missing_add(x, 1); }
+CPP
+
+g++ -c need.cc -o need.o
+nm -C need.o
+nm -C -u need.o</code></pre>
+<h3>练习 2：观察 C++ 名字修饰</h3>
+<pre><code>cat &gt; math_ops.cc &lt;&lt'CPP'
+namespace ai {
+int add(int a, int b) { return a + b; }
+extern "C" int c_add(int a, int b) { return add(a, b); }
+}
+CPP
+
+g++ -c math_ops.cc -o math_ops.o
+nm math_ops.o | grep add
+nm -C math_ops.o | grep add</code></pre>
+<h3>常用速查</h3>
+<table><tr><th>目标</th><th>命令</th></tr><tr><td>看 C++ 可读符号</td><td><code>nm -C file.o</code></td></tr><tr><td>看未定义符号</td><td><code>nm -C -u file.o</code></td></tr><tr><td>看共享库运行时动态符号</td><td><code>nm -D -C libx.so</code></td></tr><tr><td>看静态库成员来源</td><td><code>nm -A -C libx.a</code></td></tr><tr><td>只看已定义导出</td><td><code>nm -D -C --defined-only libx.so</code></td></tr><tr><td>按符号大小排序</td><td><code>nm -S -C --size-sort file.o</code></td></tr><tr><td>反混淆单个报错符号</td><td><code>echo '_ZN...' | c++filt</code></td></tr></table>
+<h3>学习路线</h3>
+<ul>
+<li>第一阶段：能读懂 <code>U</code>、<code>T</code>、<code>W</code>、<code>D</code>、<code>B</code>、<code>R</code>，知道 <code>-C</code> 和 <code>-D</code> 的区别。</li>
+<li>第二阶段：能用 <code>nm -A -C</code> 在 <code>.o</code>/<code>.a</code>/<code>.so</code> 中定位需求方和提供方。</li>
+<li>第三阶段：能把 <code>nm</code> 与 <code>readelf</code>、<code>ldd</code>、<code>strings</code>、<code>c++filt</code> 串成完整 ABI/加载排障流程。</li>
+</ul>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul><li>GNU Binutils Manual：<code>nm</code>、<code>objdump</code>、<code>readelf</code> 的选项和输出定义。</li><li>Linux man-pages：<code>nm(1)</code>、<code>ldd(1)</code>、<code>ld.so(8)</code>，用于理解符号表和动态加载器行为。</li><li>System V ABI / ELF 规范：符号表、动态节、重定位、符号绑定与可见性。</li><li>GCC libstdc++ Dual ABI 文档：<code>_GLIBCXX_USE_CXX11_ABI</code>、<code>std::__cxx11</code> 与兼容性线索。</li><li>PyTorch C++/CUDA Extension 文档：扩展编译、ABI 配置、CUDA_HOME、运行时库依赖。</li><li>NVIDIA CUDA Binary Utilities 文档：<code>cuobjdump</code>、<code>nvdisasm</code>，用于补充 device 侧代码检查。</li></ul><p class="mini">建议阅读顺序：先掌握 <code>nm -C</code> 的符号解释，再学习 <code>nm -D</code> 的动态符号表，最后把 <code>readelf -d</code>、<code>ldd</code> 和 ABI 版本检查纳入固定排障模板。</p></section>
+<div class="footer">nm 深度教程 · AI Infra 图文版 · 符号表、C++/CUDA 扩展、ABI、静态/共享库与生产排障</div>
+</div>
+</body>
+</html>

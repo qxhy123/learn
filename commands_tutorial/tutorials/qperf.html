@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>qperf 深度教程：AI Infra 网络延迟、带宽与 RDMA 排障</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#5d697c;--line:#d9e1ec;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>qperf 深度教程：AI Infra 网络延迟、带宽与 RDMA 排障</h1>
+<p class="sub">这份教程围绕 Linux 命令 <code>qperf</code> 展开，面向 GPU 训练集群、RoCE/InfiniBand 网络、存储网络和推理服务排障。它不是单纯罗列测试名，而是从“一个节点常驻 server，另一个节点按测试项发起 client，分别测 TCP/UDP/RDMA 的 latency 与 bandwidth”这个心智模型出发，系统讲清 server/client 工作流、<code>tcp_lat</code>/<code>tcp_bw</code>、<code>udp_lat</code>/<code>udp_bw</code>、RDMA RC/UD 测试、结果解读、CPU/NUMA caveat、分布式训练网络 triage，以及 qperf 与 iperf3、<code>ib_write_bw</code> 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">Latency</span><span class="chip">Bandwidth</span><span class="chip">TCP/UDP</span><span class="chip">RDMA</span><span class="chip">Server/Client</span><span class="chip">NUMA</span><span class="chip">NCCL 排障</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>qperf</code> 是主机间性能探针：server 端等待，client 端指定一个或多个测试项，用相同工具同时观察“延迟”和“带宽”，尤其适合在 IP 网络与 RDMA 网络之间做快速分层定位。</div>
+<div class="success"><strong>最重要原则：</strong> 在共享 AI 集群里先短测、低并发、明确接口和维护窗口；RDMA 测试要确认 HCA、端口、GID/路由和 PFC/ECN 配置，避免把 qperf 输出误读成 NCCL 或 GPUDirect RDMA 的最终结论。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">qperf 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：server、client、测试项</a></li>
+<li><a class="anchor" href="#s3">安装与环境确认</a></li>
+<li><a class="anchor" href="#s4">第一组 TCP 测试</a></li>
+<li><a class="anchor" href="#s5">读懂 latency 与 bandwidth</a></li>
+<li><a class="anchor" href="#s6">常用参数与输出单位</a></li>
+<li><a class="anchor" href="#s7">UDP 测试与丢包风险</a></li>
+<li><a class="anchor" href="#s8">RDMA 测试模式</a></li>
+<li><a class="anchor" href="#s9">绑定 RDMA 设备与端口</a></li>
+<li><a class="anchor" href="#s10">AI Infra 基线矩阵</a></li>
+<li><a class="anchor" href="#s11">解释延迟：平均值、尾部与噪声</a></li>
+<li><a class="anchor" href="#s12">CPU、NUMA 与中断 caveat</a></li>
+<li><a class="anchor" href="#s13">分布式训练网络 triage</a></li>
+<li><a class="anchor" href="#s14">qperf vs iperf3 vs ib_write_bw</a></li>
+<li><a class="anchor" href="#s15">自动化采集与命名规范</a></li>
+<li><a class="anchor" href="#s16">安全边界与生产演练</a></li>
+<li><a class="anchor" href="#s17">常见故障与排障流程</a></li>
+<li><a class="anchor" href="#s18">练习任务与学习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. qperf 是什么</h2>
+<p><code>qperf</code> 用于在两台主机之间测量网络延迟和带宽。它最常见的使用方式是：目标节点运行 <code>qperf</code> 作为 server，发起节点运行 <code>qperf &lt;server&gt; &lt;test&gt; ...</code> 作为 client。与只关注吞吐的工具相比，qperf 的优势是延迟测试很方便，并且许多发行版构建会同时支持 TCP、UDP 和 RDMA 相关测试。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>快速比较节点间 <code>tcp_lat</code>、<code>tcp_bw</code>、<code>udp_lat</code>、<code>udp_bw</code>、RDMA RC/UD 相关 latency/bandwidth，适合网络验收和故障切片。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能直接代表 NCCL collective、真实训练 step time、存储协议、RPC 框架或 GPU Direct RDMA 的完整路径。</div>
+<div class="card"><strong>它的本质</strong><br>一个可重复的两端实验：固定节点、接口、协议、测试项、时长、CPU/NUMA 条件，再把结果与硬件和应用现象对照。</div>
+</div>
+<pre><code># node-b：启动 qperf server，默认监听 19765
+qperf
+
+# node-a：测 TCP 带宽和延迟
+qperf node-b tcp_bw tcp_lat
+
+# 常见 RDMA 快速探针，实际可用测试项取决于构建和硬件
+qperf node-b rc_bw rc_lat
+qperf node-b rc_rdma_write_bw rc_rdma_write_lat</code></pre>
+<div class="warn"><strong>边界提醒：</strong> qperf 结果只对当前参数和路径成立。尤其在多网卡、多路由、多 NUMA、多租户训练集群里，必须写清源/目的 IP、接口、HCA、端口、测试时长和当时负载。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：qperf 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="qperf server client model">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="70" y="105" width="245" height="155" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="192" y="145" text-anchor="middle" font-size="25" font-weight="700" fill="#1d4ed8">Client 节点</text>
+<text x="192" y="180" text-anchor="middle" font-size="15">发起测试项</text>
+<text x="192" y="210" text-anchor="middle" font-size="15">tcp_lat / tcp_bw</text>
+<text x="192" y="240" text-anchor="middle" font-size="15">rc_lat / rc_bw</text>
+<rect x="785" y="105" width="245" height="155" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="908" y="145" text-anchor="middle" font-size="25" font-weight="700" fill="#0f766e">Server 节点</text>
+<text x="908" y="180" text-anchor="middle" font-size="15">运行 qperf</text>
+<text x="908" y="210" text-anchor="middle" font-size="15">默认端口 19765</text>
+<text x="908" y="240" text-anchor="middle" font-size="15">响应多种测试</text>
+<rect x="405" y="115" width="290" height="135" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="154" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">测试数据面</text>
+<text x="550" y="190" text-anchor="middle" font-size="15">TCP / UDP / RDMA</text>
+<text x="550" y="220" text-anchor="middle" font-size="15">Latency + Bandwidth</text>
+<line x1="315" y1="182" x2="405" y2="182" stroke="#94a3b8" stroke-width="5" marker-end="url(#a1)"/>
+<line x1="695" y1="182" x2="785" y2="182" stroke="#94a3b8" stroke-width="5" marker-end="url(#a1)"/>
+<rect x="105" y="360" width="890" height="145" rx="22" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="400" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">结论必须包含上下文</text>
+<text x="550" y="438" text-anchor="middle" font-size="16">node-a → node-b，ens5f0，tcp_lat 约 40 us，tcp_bw 约 92 Gb/sec，60s，低负载</text>
+<text x="550" y="470" text-anchor="middle" font-size="16">mlx5_0:1，rc_rdma_write_bw 达到预期，但 NCCL 仍慢时，应继续查 GPU 拓扑和 NCCL 配置</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">qperf 是“指定测试项的两端探针”。没有测试项、接口、方向和设备上下文，单个数字没有排障价值。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装与环境确认</h2>
+<p>qperf 常见于 RHEL/Rocky/Alma/CentOS、Ubuntu/Debian 的软件仓库，RDMA 测试还依赖 rdma-core、HCA 驱动、内核模块、端口状态和网络配置。AI 集群中先确认你测的是训练网、存储网还是管理网。</p>
+<pre><code># Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y qperf rdma-core
+
+# RHEL / Rocky / Alma / CentOS
+sudo dnf install -y qperf rdma-core
+
+# 确认版本、路径和帮助
+command -v qperf
+qperf --help
+
+# 确认 IP 路由会走哪张网卡
+ip route get 10.10.20.12
+ip -br addr
+ip -br link
+
+# RDMA 环境检查，命令是否存在取决于系统包
+rdma link
+ibv_devices
+ibv_devinfo -v</code></pre>
+<table>
+<tr><th>检查项</th><th>为什么重要</th><th>常见误判</th></tr>
+<tr><td>qperf 版本与构建</td><td>不同发行版编译的测试项和输出格式可能不同</td><td>脚本在一组节点可用，另一组节点没有 RDMA 测试项</td></tr>
+<tr><td>IP 路由</td><td>TCP/UDP 测试走 Linux IP 栈</td><td>误测 1/10Gb 管理网，却拿来判断训练网</td></tr>
+<tr><td>RDMA 设备</td><td>RC/UD/RDMA 测试依赖 verbs 设备和端口状态</td><td>IP 网络正常，但 RDMA port down 或 GID 不对</td></tr>
+<tr><td>防火墙</td><td>server 默认监听 19765</td><td>client 超时，误以为链路性能差</td></tr>
+</table>
+<div class="note"><strong>容器提示：</strong> 容器内 qperf 可能测的是 Pod 网络或受限 RDMA device plugin 暴露的设备。结论要标注 hostNetwork、CNI、veth/overlay、RDMA device plugin 和安全上下文。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 第一组 TCP 测试</h2>
+<p>TCP 是最容易开始的切片：它不要求 RDMA 正常，能快速回答“这两个节点的 IP 数据面是否健康”。建议先测 <code>tcp_lat</code> 和 <code>tcp_bw</code>，再做方向互换和接口绑定。</p>
+<pre><code># node-b：启动 server，默认监听 19765
+qperf
+
+# node-a：一次执行两个测试项
+qperf node-b tcp_lat tcp_bw
+
+# 指定测试时长，减少短测波动
+qperf -t 60 node-b tcp_lat tcp_bw
+
+# 如果主机名可能解析到管理网，直接用训练网 IP
+qperf -t 60 10.10.20.12 tcp_lat tcp_bw</code></pre>
+<div class="grid-3">
+<div class="card"><strong>先通后快</strong><br>先确认 server 端口可达，再讨论带宽是否接近 25G/100G/200G/400G 预期。</div>
+<div class="card"><strong>延迟和带宽分开看</strong><br>低延迟不代表高带宽，高带宽也不代表 tail latency 稳定。</div>
+<div class="card"><strong>双方向都测</strong><br>A 到 B 正常，不代表 B 到 A 正常；路由、ACL、QoS、CPU 和队列都可能方向不对称。</div>
+</div>
+<div class="danger"><strong>生产警告：</strong> <code>tcp_bw</code> 会生成真实网络压力。共享训练网中先约定窗口、节点、接口和持续时间，避免影响正在运行的 NCCL 作业、checkpoint 或在线推理流量。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 读懂 latency 与 bandwidth</h2>
+<p>qperf 的输出会按测试项列出指标。常见单位包括 microseconds、MB/sec、Gb/sec 等，具体取决于版本、测试项和参数。不要只看数值大小，要同时看方向、链路速率、消息大小、CPU 负载和是否有异常错误。</p>
+<pre><code># 示例输出形态，具体字段会随版本和参数变化
+tcp_lat:
+    latency  =  38.2 us
+tcp_bw:
+    bw       =  11.3 GB/sec
+
+# 使用更详细输出，便于看到测试参数
+qperf -v -t 60 node-b tcp_lat tcp_bw</code></pre>
+<table>
+<tr><th>指标</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>latency</code></td><td>一次往返或操作的延迟度量，具体由测试项定义</td><td>对 RPC、参数同步控制面、metadata、tail latency 敏感场景很重要</td></tr>
+<tr><td><code>bw</code></td><td>测试项在给定参数下测得的吞吐</td><td>与端口速率、PCIe、NUMA、CPU、交换机和链路聚合预期对比</td></tr>
+<tr><td>单位</td><td>qperf 可用不同单位输出</td><td>GB/sec 与 Gb/sec 差 8 倍，写报告时必须统一</td></tr>
+<tr><td>测试时长</td><td>短测可能被慢启动、缓存、瞬时调度影响</td><td>基线建议 30 到 120 秒，故障复现可更长</td></tr>
+</table>
+<div class="note"><strong>判断原则：</strong> 延迟异常先怀疑路径、CPU 调度、C-state、IRQ、NUMA、拥塞和交换机队列；带宽异常还要加查 MTU、链路速率、PFC/ECN、HCA counters 和应用是否单流受限。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 常用参数与输出单位</h2>
+<p>qperf 的参数因版本略有差异，但下面这些在常见发行版中很常用。生产脚本要先用 <code>qperf --help</code> 在目标节点确认可用性，再固定参数。</p>
+<table>
+<tr><th>参数</th><th>用途</th><th>例子</th></tr>
+<tr><td><code>-t</code></td><td>设置每个测试项运行时间</td><td><code>qperf -t 60 node-b tcp_bw</code></td></tr>
+<tr><td><code>-v</code></td><td>详细输出，显示更多测试参数</td><td><code>qperf -v node-b tcp_lat</code></td></tr>
+<tr><td><code>-ub</code></td><td>以 bits/sec 体系输出带宽，便于和网卡速率对齐</td><td><code>qperf -ub node-b tcp_bw</code></td></tr>
+<tr><td><code>-i</code></td><td>指定 RDMA 设备和端口，常见形式为 <code>Device:Port</code></td><td><code>qperf -i mlx5_0:1 node-b rc_bw</code></td></tr>
+<tr><td><code>-m</code></td><td>设置或限制消息大小，适合做 message size sweep</td><td><code>qperf -m 1M node-b tcp_bw</code></td></tr>
+<tr><td><code>-oo</code></td><td>向测试项传递选项，具体支持依赖测试项</td><td><code>qperf -oo msg_size:64K node-b tcp_bw</code></td></tr>
+</table>
+<pre><code># 用 bit/s 单位输出，更适合和 100G/200G/400G 端口对比
+qperf -ub -t 60 node-b tcp_bw
+
+# 详细输出，记录测试参数
+qperf -v -ub -t 60 node-b tcp_lat tcp_bw
+
+# RDMA 设备绑定示例
+qperf -i mlx5_0:1 -ub -t 60 node-b rc_bw rc_lat</code></pre>
+<div class="warn"><strong>兼容提醒：</strong> qperf 版本和发行版补丁会影响参数和测试项。自动化前要在每类节点上执行 <code>qperf --help</code> 和一组 smoke test，不要假设所有镜像完全一致。</div>
+</section>
+
+<section class="figure" id="fig-s7">
+<h3>流程图：从 TCP 到 UDP/RDMA 的测试推进</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="qperf workflow">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="50" width="280" height="70" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="93" text-anchor="middle" font-size="22" font-weight="700">启动 qperf server</text>
+<rect x="410" y="160" width="280" height="72" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="203" text-anchor="middle" font-size="21" font-weight="700">先跑 tcp_lat / tcp_bw</text>
+<polygon points="550,275 725,365 550,455 375,365" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="358" text-anchor="middle" font-size="17" font-weight="700">IP 层是否健康？</text>
+<text x="550" y="384" text-anchor="middle" font-size="14">吞吐、延迟、方向、CPU</text>
+<rect x="105" y="325" width="220" height="82" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="215" y="358" text-anchor="middle" font-size="18" font-weight="700">否</text>
+<text x="215" y="384" text-anchor="middle" font-size="13">修路由/MTU/CPU/丢包</text>
+<rect x="775" y="325" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="890" y="358" text-anchor="middle" font-size="18" font-weight="700">是</text>
+<text x="890" y="384" text-anchor="middle" font-size="13">进入 UDP 或 RDMA 切片</text>
+<rect x="680" y="505" width="185" height="82" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="772" y="538" text-anchor="middle" font-size="17" font-weight="700">udp_lat/bw</text>
+<text x="772" y="564" text-anchor="middle" font-size="13">丢包和抖动风险</text>
+<rect x="895" y="505" width="185" height="82" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="987" y="538" text-anchor="middle" font-size="17" font-weight="700">rc/ud/rdma</text>
+<text x="987" y="564" text-anchor="middle" font-size="13">HCA 与 verbs 数据面</text>
+<rect x="130" y="540" width="380" height="88" rx="16" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="320" y="574" text-anchor="middle" font-size="17" font-weight="700">结论要分层</text>
+<text x="320" y="602" text-anchor="middle" font-size="13">IP 正常不等于 RDMA 正常；RDMA 正常不等于 NCCL 正常</text>
+<line x1="550" y1="120" x2="550" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="550" y1="232" x2="550" y2="275" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="375" y1="365" x2="325" y2="365" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="725" y1="365" x2="775" y2="365" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M890 407 C875 455, 820 475, 780 505" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<path d="M910 407 C940 455, 975 470, 985 505" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">不要一上来就跑复杂 RDMA 测试。先用 TCP 排除基础 IP 路径，再按问题进入 UDP/RDMA/NCCL 层。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. UDP 测试与丢包风险</h2>
+<p>UDP 测试适合观察无连接路径、丢包倾向和小包延迟，但它不像 TCP 那样有拥塞控制。高码率 UDP 在共享网络上很容易造成队列拥塞和业务抖动，所以必须从短测和小流量开始。</p>
+<pre><code># 基础 UDP latency 和 bandwidth
+qperf -t 30 node-b udp_lat udp_bw
+
+# 详细输出，记录消息大小等参数
+qperf -v -t 30 node-b udp_lat udp_bw
+
+# 如果需要逐步扫消息大小，先确认当前 qperf 支持的选项写法
+qperf -v -m 64K -t 30 node-b udp_bw</code></pre>
+<table>
+<tr><th>观察点</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td>UDP latency 抖动大</td><td>调度噪声、队列拥塞、CPU C-state、交换机 buffer 或跨 NUMA</td><td>同步看 <code>mpstat</code>、<code>sar -n DEV</code>、交换机 counters</td></tr>
+<tr><td>UDP bandwidth 明显低</td><td>限速、丢包、MTU、socket buffer 或 CPU 限制</td><td>降低消息大小/码率，检查 drops/errors</td></tr>
+<tr><td>TCP 正常，UDP 异常</td><td>队列策略、ACL/QoS 或无拥塞控制下路径不稳</td><td>检查 QoS、PFC/ECN、端口 buffer 和策略</td></tr>
+</table>
+<div class="danger"><strong>UDP 安全警告：</strong> 在生产 RoCE 网络上，高速 UDP 压测可能触发丢包、PFC pause 或交换机队列异常。没有维护窗口时，不要直接把 UDP 测试推到端口线速。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. RDMA 测试模式</h2>
+<p>qperf 的 RDMA 能力取决于系统是否有 verbs 支持、HCA 是否可见、端口是否 active，以及 qperf 包是否启用了对应测试。常见测试名包括可靠连接 RC、非可靠数据报 UD，以及 RDMA read/write/send 相关延迟和带宽测试。</p>
+<table>
+<tr><th>测试项</th><th>大致层面</th><th>适合回答的问题</th></tr>
+<tr><td><code>rc_lat</code> / <code>rc_bw</code></td><td>Reliable Connected Queue Pair</td><td>RC send/receive 路径是否健康，延迟/带宽是否符合预期</td></tr>
+<tr><td><code>ud_lat</code> / <code>ud_bw</code></td><td>Unreliable Datagram</td><td>UD 路径可用性、小包和无连接模式行为</td></tr>
+<tr><td><code>rc_rdma_write_lat</code> / <code>rc_rdma_write_bw</code></td><td>RDMA write</td><td>写数据面是否健康，常用于和 <code>ib_write_bw</code> 对照</td></tr>
+<tr><td><code>rc_rdma_read_lat</code> / <code>rc_rdma_read_bw</code></td><td>RDMA read</td><td>读数据面是否健康，可能受平台和 HCA 行为影响</td></tr>
+<tr><td><code>xrc_*</code> 或其他扩展项</td><td>依赖构建</td><td>只有目标版本明确支持时再纳入基线</td></tr>
+</table>
+<pre><code># node-b：server
+qperf
+
+# node-a：RC 基础测试
+qperf -i mlx5_0:1 -t 60 node-b rc_lat rc_bw
+
+# RDMA write/read 测试
+qperf -i mlx5_0:1 -t 60 node-b rc_rdma_write_lat rc_rdma_write_bw
+qperf -i mlx5_0:1 -t 60 node-b rc_rdma_read_lat rc_rdma_read_bw
+
+# 先查当前构建支持哪些测试项
+qperf --help | less</code></pre>
+<div class="warn"><strong>RDMA 解释边界：</strong> qperf 的 RDMA 测试走 verbs 数据面，但它不等同于 NCCL 实际算法，也不覆盖 GPU 内存、PCIe 拓扑、CUDA 注册缓存、NCCL plugin 和多 rank collective 行为。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 绑定 RDMA 设备与端口</h2>
+<p>AI 节点常有多张 HCA、多端口、多 GID、多网络平面。RDMA 测试如果没有显式绑定设备和端口，可能测到错误的 HCA 或错误网络。qperf 常用 <code>-i Device:Port</code> 指定本地 RDMA 设备端口。</p>
+<pre><code># 查看 RDMA link 与 netdev 对应关系
+rdma link
+ibv_devices
+ibv_devinfo -v
+
+# 找到网卡对应的 PCI 和 NUMA
+readlink /sys/class/net/ens5f0/device
+cat /sys/class/net/ens5f0/device/numa_node
+
+# 指定 mlx5_0 的 1 号端口测试
+qperf -i mlx5_0:1 -v -t 60 node-b rc_lat rc_bw
+
+# 如果同一主机有多张 HCA，分别测试并记录
+qperf -i mlx5_0:1 -ub -t 60 node-b rc_bw
+qperf -i mlx5_1:1 -ub -t 60 node-b rc_bw</code></pre>
+<table>
+<tr><th>要记录</th><th>原因</th></tr>
+<tr><td>HCA 名称与端口</td><td><code>mlx5_0:1</code> 和 <code>mlx5_1:1</code> 可能接到不同交换平面</td></tr>
+<tr><td>对应 netdev</td><td>RoCE 场景下 IP、GID、VLAN、MTU 和 netdev 配置相关</td></tr>
+<tr><td>NUMA 节点</td><td>HCA 与 CPU/GPU 跨 NUMA 会拉高延迟并降低稳定性</td></tr>
+<tr><td>端口状态</td><td>active/down、速率、宽度、link layer 都会影响结果</td></tr>
+</table>
+<div class="success"><strong>实践建议：</strong> 在验收报告里不要写“RDMA qperf 正常”，而要写“<code>mlx5_0:1</code> 到 <code>mlx5_0:1</code>，<code>rc_rdma_write_bw</code>，60s，bit/s 单位，端口 active，MTU/GID 已确认”。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. AI Infra 基线矩阵</h2>
+<p>AI Infra 的网络基线要覆盖同机架、跨机架、同交换平面、跨交换平面、东西向通信和存储访问路径。不要只测一对节点后推断整个集群。</p>
+<table>
+<tr><th>场景</th><th>建议 qperf 测试</th><th>重点指标</th></tr>
+<tr><td>GPU 节点同机架</td><td><code>tcp_lat tcp_bw rc_lat rc_bw</code></td><td>低延迟、接近线速、方向一致</td></tr>
+<tr><td>GPU 节点跨机架</td><td>同机架基线加跨交换域矩阵</td><td>是否存在 spine/leaf 瓶颈或 ECMP 不均</td></tr>
+<tr><td>RoCE 验收</td><td><code>rc_rdma_write_bw</code>、<code>rc_rdma_read_bw</code>、端口 counters</td><td>PFC/ECN、丢包、GID、MTU、HCA 错误</td></tr>
+<tr><td>存储网络</td><td><code>tcp_bw</code> 多对一/一对多，必要时 <code>tcp_lat</code></td><td>聚合吞吐、接收端 CPU、交换机拥塞</td></tr>
+<tr><td>NCCL fallback</td><td>绑定 NCCL socket 接口测 <code>tcp_lat tcp_bw</code></td><td>TCP 路径是否健康，接口是否选对</td></tr>
+</table>
+<pre><code># 示例：最小单对节点基线
+qperf -v -ub -t 60 10.10.20.12 tcp_lat tcp_bw
+qperf -v -ub -t 60 -i mlx5_0:1 10.10.20.12 rc_lat rc_bw
+qperf -v -ub -t 60 -i mlx5_0:1 10.10.20.12 rc_rdma_write_lat rc_rdma_write_bw
+
+# 方向互换：到 node-b 上对 node-a 再跑同一组命令
+qperf -v -ub -t 60 10.10.20.11 tcp_lat tcp_bw</code></pre>
+<div class="note"><strong>趋势优先：</strong> 单次 qperf 结果只能说明当时状态。更有价值的是同一拓扑、同一参数、同一时间窗口下的历史趋势和离群点。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 解释延迟：平均值、尾部与噪声</h2>
+<p>qperf 的 latency 是重要信号，但不能直接等同于真实业务的 p99/p999。训练框架、RPC、存储客户端、NCCL 和内核调度都有自己的批处理、队列、消息大小和并发行为。qperf latency 更适合做“路径是否异常”的探针。</p>
+<div class="grid-2">
+<div class="card"><strong>低平均延迟</strong><br>说明测试条件下路径短且轻载，但不证明高负载下 tail latency 稳定。</div>
+<div class="card"><strong>偶发高延迟</strong><br>可能来自 CPU 调度、软中断、C-state、NUMA 远端访问、交换机拥塞、PFC pause 或后台作业。</div>
+<div class="card"><strong>RDMA latency 异常</strong><br>重点看 HCA counters、端口状态、GID、PFC/ECN、NUMA 和 PCIe 拓扑。</div>
+<div class="card"><strong>TCP latency 异常</strong><br>重点看路由、队列、iptables/eBPF、CPU、socket buffer、MTU 和中间设备。</div>
+</div>
+<pre><code># 延迟测试时同步观察系统噪声
+qperf -v -t 120 node-b tcp_lat
+mpstat -P ALL 1
+pidstat -wt 1
+sar -n DEV,TCP,ETCP 1
+
+# RDMA 场景同步看 counters
+rdma statistic
+ethtool -S ens5f0 | egrep -i 'err|drop|timeout|discard|pause|pfc|ecn|crc'</code></pre>
+<div class="warn"><strong>报告提醒：</strong> 如果业务抱怨 p99 慢，不要只贴 qperf 平均 latency。应补充业务侧分位数、并发度、消息大小、CPU 负载和网络 counters。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. CPU、NUMA 与中断 caveat</h2>
+<p>高速网络测试常被主机侧限制，而不是被线缆或交换机限制。AI 节点的 GPU 训练、数据加载、压缩、日志、监控 agent、容器 runtime 都可能和 qperf 抢 CPU、内存带宽或 PCIe 路径。</p>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>验证方式</th></tr>
+<tr><td>带宽上不去，单核很高</td><td>单线程/软中断/协议栈 CPU 限制</td><td><code>mpstat -P ALL 1</code>、<code>pidstat -t</code></td></tr>
+<tr><td>延迟偶发尖刺</td><td>调度、C-state、IRQ 迁移、后台任务</td><td><code>cyclictest</code>、<code>perf top</code>、CPU 频率状态</td></tr>
+<tr><td>RDMA 带宽低但端口无错</td><td>NUMA 错位、PCIe 限制、内存带宽瓶颈</td><td><code>lstopo</code>、<code>numactl -H</code>、PCIe link status</td></tr>
+<tr><td>多队列不均</td><td>RSS/IRQ affinity/哈希不均</td><td><code>/proc/interrupts</code>、<code>ethtool -l/-x</code></td></tr>
+</table>
+<pre><code># 找 HCA / NIC 所在 NUMA
+cat /sys/class/infiniband/mlx5_0/device/numa_node
+cat /sys/class/net/ens5f0/device/numa_node
+
+# 查看中断是否集中在少数 CPU
+grep -i mlx5 /proc/interrupts
+
+# 测试时同步观察
+mpstat -P ALL 1
+sar -n DEV,EDEV,TCP,ETCP 1
+numactl -H</code></pre>
+<div class="note"><strong>经验判断：</strong> 如果 qperf 测试期间 CPU、软中断或内存带宽已经饱和，先不要调整交换机。主机侧瓶颈会让健康链路看起来像坏链路。</div>
+</section>
+
+<section class="figure" id="fig-s13">
+<h3>三角图：分布式训练网络 triage</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="distributed training triage">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="27" font-weight="700">训练慢：用 qperf 做网络分层，而不是直接下结论</text>
+<polygon points="550,125 240,560 860,560" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
+<circle cx="550" cy="165" r="76" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="156" text-anchor="middle" font-size="19" font-weight="700" fill="#1d4ed8">NCCL / 应用</text>
+<text x="550" y="184" text-anchor="middle" font-size="13">all_reduce_perf / step time</text>
+<circle cx="285" cy="520" r="84" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="285" y="510" text-anchor="middle" font-size="19" font-weight="700" fill="#0f766e">IP 切片</text>
+<text x="285" y="538" text-anchor="middle" font-size="13">qperf tcp_lat/tcp_bw</text>
+<circle cx="815" cy="520" r="84" fill="#ffedd5" stroke="#fdba74"/>
+<text x="815" y="510" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">RDMA 切片</text>
+<text x="815" y="538" text-anchor="middle" font-size="13">qperf rc/rdma + perftest</text>
+<rect x="385" y="330" width="330" height="112" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="365" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">决策逻辑</text>
+<text x="550" y="394" text-anchor="middle" font-size="14">IP 慢：先修路由、MTU、CPU、拥塞</text>
+<text x="550" y="417" text-anchor="middle" font-size="14">RDMA 慢：查 HCA、GID、PFC/ECN、counters</text>
+<text x="550" y="440" text-anchor="middle" font-size="14">两者正常：看 NCCL、GPU 拓扑、消息大小</text>
+<line x1="510" y1="228" x2="330" y2="450" stroke="#94a3b8" stroke-width="4"/>
+<line x1="590" y1="228" x2="770" y2="450" stroke="#94a3b8" stroke-width="4"/>
+<line x1="370" y1="520" x2="730" y2="520" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">qperf 是训练网络 triage 的一层证据。最终仍要用 NCCL tests、业务日志、GPU/PCIe/NUMA 拓扑和交换机 counters 交叉验证。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 分布式训练网络 triage</h2>
+<p>当训练 step time 变慢、NCCL timeout、all-reduce 性能下降或 checkpoint 抖动时，qperf 可用来快速判断是 IP 层、RDMA 层还是应用/NCCL 层继续深入。</p>
+<pre><code># 1. 确认应用可能使用的接口
+ip -br addr
+ip route get 10.10.20.12
+
+# 2. IP 层切片
+qperf -v -ub -t 60 10.10.20.12 tcp_lat tcp_bw
+
+# 3. RDMA 层切片
+qperf -v -ub -t 60 -i mlx5_0:1 10.10.20.12 rc_lat rc_bw
+qperf -v -ub -t 60 -i mlx5_0:1 10.10.20.12 rc_rdma_write_lat rc_rdma_write_bw
+
+# 4. NCCL 对照，确认接口选择和插件行为
+NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=ens5f0 ./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8
+NCCL_DEBUG=INFO NCCL_IB_HCA=mlx5_0 ./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8</code></pre>
+<table>
+<tr><th>组合结果</th><th>解释倾向</th><th>下一步</th></tr>
+<tr><td>TCP qperf 慢，RDMA qperf 也慢</td><td>主机路径、物理链路、交换机拥塞、MTU 或 CPU 基础问题</td><td>先修基础网络和主机 counters</td></tr>
+<tr><td>TCP 正常，RDMA 慢</td><td>HCA、GID、PFC/ECN、RoCE、verbs 或 RDMA 端口问题</td><td>用 perftest、RDMA counters、交换机 counters 深挖</td></tr>
+<tr><td>TCP/RDMA 都正常，NCCL 慢</td><td>NCCL 配置、GPU 拓扑、PCIe、算法、消息大小或 rank 映射</td><td>看 NCCL log、<code>nvidia-smi topo -m</code>、rank placement</td></tr>
+<tr><td>只有跨机架慢</td><td>spine/leaf、ECMP、QoS 或 oversubscription</td><td>做矩阵测试并对齐交换机端口利用率</td></tr>
+</table>
+<div class="warn"><strong>NCCL 提醒：</strong> 临时设置 <code>NCCL_IB_DISABLE=1</code> 或 <code>NCCL_SOCKET_IFNAME</code> 只适合定位，不应作为长期性能修复。长期方案要修正确的网络和拓扑。</div>
+</section>
+
+<section class="figure" id="fig-s14">
+<h3>对比图：qperf、iperf3、ib_write_bw 的边界</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="tool comparison">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="27" font-weight="700">工具不是替代关系，而是不同层的切片</text>
+<rect x="75" y="135" width="280" height="330" rx="22" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="215" y="180" text-anchor="middle" font-size="25" font-weight="700" fill="#1d4ed8">iperf3</text>
+<text x="215" y="220" text-anchor="middle" font-size="15">IP/TCP/UDP 吞吐为主</text>
+<text x="215" y="255" text-anchor="middle" font-size="15">并发流、反向、JSON 友好</text>
+<text x="215" y="290" text-anchor="middle" font-size="15">适合带宽基线和重传观察</text>
+<rect x="410" y="135" width="280" height="330" rx="22" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="180" text-anchor="middle" font-size="25" font-weight="700" fill="#0f766e">qperf</text>
+<text x="550" y="220" text-anchor="middle" font-size="15">Latency + Bandwidth</text>
+<text x="550" y="255" text-anchor="middle" font-size="15">TCP/UDP/RDMA 测试项</text>
+<text x="550" y="290" text-anchor="middle" font-size="15">适合快速分层 triage</text>
+<rect x="745" y="135" width="280" height="330" rx="22" fill="#ffedd5" stroke="#fdba74"/>
+<text x="885" y="180" text-anchor="middle" font-size="25" font-weight="700" fill="#c2410c">ib_write_bw</text>
+<text x="885" y="220" text-anchor="middle" font-size="15">RDMA verbs 数据面</text>
+<text x="885" y="255" text-anchor="middle" font-size="15">HCA/RoCE/IB 验收常用</text>
+<text x="885" y="290" text-anchor="middle" font-size="15">不代表 TCP 或 NCCL 全貌</text>
+<rect x="150" y="525" width="800" height="62" rx="14" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="562" text-anchor="middle" font-size="17">推荐顺序：iperf3/qperf TCP 确认 IP → qperf/perftest 确认 RDMA → nccl-tests 确认 collective</text>
+</svg>
+<div class="caption">qperf 的价值在于横跨 latency/bandwidth 和 TCP/UDP/RDMA，但最终定位仍要使用对应层的专用证据。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. qperf vs iperf3 vs ib_write_bw</h2>
+<p>AI Infra 排障最怕“一个工具证明所有层”。正确做法是按网络栈分层：IP 层、RDMA verbs 层、NCCL collective 层、应用层分别验证。</p>
+<table>
+<tr><th>工具</th><th>测量层面</th><th>优势</th><th>局限</th><th>适合问题</th></tr>
+<tr><td><code>qperf</code></td><td>TCP/UDP/RDMA 多测试项</td><td>同一工具测 latency 和 bandwidth，适合快速分层</td><td>输出和测试项依赖构建，不如 iperf3 JSON 友好</td><td>tcp_lat/tcp_bw、rc_lat/rc_bw、RDMA 快速切片</td></tr>
+<tr><td><code>iperf3</code></td><td>IP/TCP/UDP/SCTP</td><td>带宽测试成熟，支持并发流、反向、JSON</td><td>不直接测 RDMA verbs</td><td>IP 带宽基线、重传、方向差异、自动化巡检</td></tr>
+<tr><td><code>ib_write_bw</code></td><td>RDMA verbs</td><td>接近 HCA/RDMA 数据面，RoCE/IB 验收常用</td><td>不代表 TCP 应用，也不代表 NCCL collective</td><td>HCA、GID、PFC/ECN、RDMA 带宽</td></tr>
+<tr><td><code>nccl-tests</code></td><td>NCCL collective</td><td>最接近训练通信模式</td><td>受 GPU、rank、拓扑、算法、消息大小影响</td><td>最终确认 all-reduce/all-gather 性能</td></tr>
+</table>
+<pre><code># qperf：延迟 + 带宽快速切片
+qperf -v -ub -t 60 node-b tcp_lat tcp_bw rc_lat rc_bw
+
+# iperf3：IP TCP 带宽、并发流和反向
+iperf3 -c node-b -t 60 -O 3 -P 8
+iperf3 -c node-b -t 60 -O 3 -P 8 -R
+
+# ib_write_bw：RDMA write 带宽，参数需按 HCA/GID 环境调整
+ib_write_bw -d mlx5_0 -F
+
+# NCCL tests：最终 collective 对照
+./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8</code></pre>
+<div class="success"><strong>分层结论：</strong> qperf TCP 正常说明 IP 切片健康；qperf RDMA 正常说明 verbs 切片健康；只有 nccl-tests 和真实业务才能证明训练通信路径符合目标。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 自动化采集与命名规范</h2>
+<p>qperf 没有 iperf3 那样统一好用的 JSON 输出习惯，因此自动化时更要保存完整 stdout、命令、版本和环境元数据。对比趋势时，参数必须严格一致。</p>
+<pre><code># server 端建议由调度或 systemd 控制，避免长期遗留
+qperf
+
+# client 端保存输出和上下文
+ts=$(date +%Y%m%d-%H%M%S)
+src=$(hostname -s)
+dst=node-b
+{
+  echo "timestamp=${ts}"
+  echo "src=${src}"
+  echo "dst=${dst}"
+  echo "cmd=qperf -v -ub -t 60 ${dst} tcp_lat tcp_bw"
+  qperf --help | sed -n '1,20p'
+  qperf -v -ub -t 60 "${dst}" tcp_lat tcp_bw
+} &gt; "qperf-${src}-to-${dst}-tcp-${ts}.log"
+
+# RDMA 输出单独命名，记录 HCA
+qperf -v -ub -t 60 -i mlx5_0:1 "${dst}" rc_lat rc_bw \
+  &gt; "qperf-${src}-to-${dst}-mlx5_0p1-rc-${ts}.log"</code></pre>
+<table>
+<tr><th>字段</th><th>建议记录</th></tr>
+<tr><td>节点与拓扑</td><td>源/目的主机、机架、交换域、源/目的 IP、接口名</td></tr>
+<tr><td>命令</td><td>完整 qperf 命令、测试项、时长、单位、消息大小、设备端口</td></tr>
+<tr><td>环境</td><td>是否有训练作业、存储流量、CPU 负载、维护窗口</td></tr>
+<tr><td>网络</td><td>MTU、端口速率、RoCE/IB、GID、PFC/ECN 策略</td></tr>
+<tr><td>结果</td><td>latency、bw、错误信息、主机 counters、交换机 counters 链接</td></tr>
+</table>
+<div class="note"><strong>自动化建议：</strong> 把“验收基线”和“故障临时实验”分开存档。临时调大 message size 或换 HCA 的结果不要混入长期趋势。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 安全边界与生产演练</h2>
+<p>qperf 不会修改文件，但会制造真实网络负载，也可能打开监听端口。共享 AI 集群中的训练网、存储网和推理服务网络经常相互影响，因此测试需要最小化、可追踪、可清理。</p>
+<div class="grid-2">
+<div class="card"><strong>测试前</strong><br>确认窗口、节点、端口、接口、协议、测试项、时长、HCA、预期上限和告警观察人。</div>
+<div class="card"><strong>测试中</strong><br>先 <code>tcp_lat</code> 和短时 <code>tcp_bw</code>，再扩展到 RDMA 和更长时长；同步看 CPU、网卡和交换机。</div>
+<div class="card"><strong>测试后</strong><br>停止 server，保存命令与输出，记录是否影响业务，归档异常 counters。</div>
+<div class="card"><strong>共享环境</strong><br>优先使用隔离节点、低峰期或维护窗口；RDMA/RoCE 压测前确认 PFC/ECN 和交换机 buffer 策略。</div>
+</div>
+<pre><code># 查是否已有 qperf server
+pgrep -a qperf
+ss -ltnp | grep 19765
+
+# 如需终止自己启动的 server，先确认命令行和 PID
+pgrep -a qperf
+kill &lt;pid&gt;
+
+# 测试前后保存 counters 快照
+ethtool -S ens5f0 &gt; ethtool-before.txt
+qperf -v -ub -t 60 node-b tcp_bw
+ethtool -S ens5f0 &gt; ethtool-after.txt
+diff -u ethtool-before.txt ethtool-after.txt | sed -n '1,120p'</code></pre>
+<div class="danger"><strong>清理提醒：</strong> 不要盲目 <code>pkill qperf</code>。在多人环境里，先用 <code>pgrep -a</code> 和端口确认进程归属，避免中断他人的验收或排障。</div>
+</section>
+
+<section class="figure" id="fig-s17">
+<h3>排障图：qperf 异常时怎么查</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="qperf troubleshooting workflow">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="70" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="550" y="88" text-anchor="middle" font-size="22" font-weight="700">qperf 结果异常</text>
+<rect x="60" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="170" y="200" text-anchor="middle" font-size="17" font-weight="700">连不上</text>
+<text x="170" y="228" text-anchor="middle" font-size="13">server / 端口 / 防火墙</text>
+<rect x="315" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="425" y="200" text-anchor="middle" font-size="17" font-weight="700">TCP 慢</text>
+<text x="425" y="228" text-anchor="middle" font-size="13">路由 / MTU / CPU / 丢包</text>
+<rect x="570" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="680" y="200" text-anchor="middle" font-size="17" font-weight="700">RDMA 慢</text>
+<text x="680" y="228" text-anchor="middle" font-size="13">HCA / GID / PFC / counters</text>
+<rect x="825" y="165" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="935" y="200" text-anchor="middle" font-size="17" font-weight="700">波动大</text>
+<text x="935" y="228" text-anchor="middle" font-size="13">拥塞 / 调度 / NUMA / 噪声</text>
+<rect x="80" y="355" width="250" height="112" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="205" y="390" text-anchor="middle" font-size="17" font-weight="700" fill="#1d4ed8">基础确认</text>
+<text x="205" y="418" text-anchor="middle" font-size="13">qperf server、ss、ip route</text>
+<text x="205" y="442" text-anchor="middle" font-size="13">DNS/主机名是否指错网</text>
+<rect x="425" y="355" width="250" height="112" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="390" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">主机侧</text>
+<text x="550" y="418" text-anchor="middle" font-size="13">mpstat、sar、IRQ、NUMA</text>
+<text x="550" y="442" text-anchor="middle" font-size="13">ethtool -S、rdma statistic</text>
+<rect x="770" y="355" width="250" height="112" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="895" y="390" text-anchor="middle" font-size="17" font-weight="700" fill="#c2410c">网络侧</text>
+<text x="895" y="418" text-anchor="middle" font-size="13">MTU、PFC/ECN、交换机 counters</text>
+<text x="895" y="442" text-anchor="middle" font-size="13">ECMP、限速、拥塞域</text>
+<rect x="160" y="575" width="780" height="88" rx="18" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="610" text-anchor="middle" font-size="18" font-weight="700" fill="#334155">重新跑同一参数，和 iperf3 / ib_write_bw / nccl-tests 对照</text>
+<text x="550" y="638" text-anchor="middle" font-size="13">只有复现、分层、对照和 counters 同时成立，才写入故障结论</text>
+<line x1="550" y1="115" x2="170" y2="165" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="115" x2="425" y2="165" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="115" x2="680" y2="165" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="115" x2="935" y2="165" stroke="#94a3b8" stroke-width="4"/>
+<line x1="205" y1="467" x2="390" y2="575" stroke="#94a3b8" stroke-width="4"/>
+<line x1="550" y1="467" x2="550" y2="575" stroke="#94a3b8" stroke-width="4"/>
+<line x1="895" y1="467" x2="710" y2="575" stroke="#94a3b8" stroke-width="4"/>
+</svg>
+<div class="caption">qperf 异常不是结论，而是入口。要把连通性、主机侧、网络侧和上层应用证据串起来。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 常见故障与排障流程</h2>
+<table>
+<tr><th>症状</th><th>常见原因</th><th>排查命令</th></tr>
+<tr><td><code>unable to connect</code>、超时</td><td>server 未启动、端口被拦、防火墙、DNS 指错网、路由不通</td><td><code>ss -ltnp</code>、<code>nc -vz node-b 19765</code>、<code>ip route get</code></td></tr>
+<tr><td><code>tcp_bw</code> 低</td><td>误走管理网、MTU 错配、CPU 限制、丢包、限速、交换机拥塞</td><td><code>ip -br addr</code>、<code>ping -M do</code>、<code>sar -n DEV</code>、<code>ethtool -S</code></td></tr>
+<tr><td><code>rc_bw</code> 或 RDMA write 低</td><td>HCA/端口/GID/PFC/ECN/NUMA/PCIe 问题</td><td><code>rdma link</code>、<code>ibv_devinfo</code>、<code>rdma statistic</code>、<code>perfquery</code></td></tr>
+<tr><td>延迟偶发尖刺</td><td>CPU 调度噪声、C-state、中断迁移、队列拥塞、后台任务</td><td><code>mpstat -P ALL 1</code>、<code>pidstat -wt 1</code>、<code>/proc/interrupts</code></td></tr>
+<tr><td>只有跨机架慢</td><td>ECMP 不均、spine oversubscription、QoS、ACL、链路故障</td><td>矩阵测试、交换机 counters、流量工程视图</td></tr>
+<tr><td>qperf 正常但训练慢</td><td>NCCL、GPU 拓扑、rank placement、数据加载、checkpoint、应用瓶颈</td><td><code>nccl-tests</code>、<code>nvidia-smi topo -m</code>、训练 profiler</td></tr>
+</table>
+<pre><code># 一个紧凑的故障采样包
+hostname -f
+date -Is
+ip -br addr
+ip route get 10.10.20.12
+ss -ltnp | grep 19765 || true
+mpstat -P ALL 1 5
+sar -n DEV,EDEV,TCP,ETCP 1 5
+ethtool -S ens5f0 | egrep -i 'err|drop|crc|discard|timeout|pause|pfc|ecn'
+rdma link
+rdma statistic
+qperf -v -ub -t 60 10.10.20.12 tcp_lat tcp_bw</code></pre>
+<div class="success"><strong>排障节奏：</strong> 先确认路径和端口，再确认 TCP，再确认 RDMA，再确认 NCCL/业务。每一层都保留命令、输出和 counters 快照。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习任务与学习路线</h2>
+<p>学习 qperf 的目标不是背测试项，而是形成“可复现、可分层、能和业务现象对齐”的网络诊断习惯。下面练习可以在测试集群或维护窗口完成。</p>
+<ol>
+<li>在两台节点上分别运行 <code>qperf node-b tcp_lat tcp_bw</code> 和反方向测试，记录方向差异。</li>
+<li>把输出单位统一为 bit/s，比较 <code>qperf -ub tcp_bw</code> 与 <code>iperf3 -P 8</code> 的差异。</li>
+<li>在同一对节点上测试 <code>tcp_lat</code>、<code>rc_lat</code>、<code>rc_rdma_write_lat</code>，解释三者不是同一层延迟。</li>
+<li>用 <code>rdma link</code>、<code>ibv_devinfo</code> 和 <code>qperf -i mlx5_0:1</code> 绑定 HCA，确认没有误测其他端口。</li>
+<li>人为选择同机架、跨机架两组节点，建立最小延迟/带宽矩阵。</li>
+<li>在 qperf 运行期间同步采集 <code>mpstat</code>、<code>sar</code>、<code>ethtool -S</code>，练习把性能数字和 counters 关联。</li>
+<li>当 NCCL tests 慢时，按 TCP qperf、RDMA qperf、<code>ib_write_bw</code>、<code>all_reduce_perf</code> 的顺序写一份分层诊断报告。</li>
+</ol>
+<div class="note"><strong>学习路线：</strong> 先掌握 server/client 和 <code>tcp_lat tcp_bw</code>，再加 UDP 风险意识，然后学习 RDMA 设备绑定，最后把 qperf 放进 NCCL/存储/推理的完整 triage 流程。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<ul>
+<li>qperf manual page：测试项、server/client 模式、常用参数和 RDMA 相关选项。</li>
+<li>Red Hat Enterprise Linux Networking Guide：使用 qperf 测试 RDMA 网络和指定设备端口的示例。</li>
+<li>linux-rdma / rdma-core 工具文档：<code>rdma</code>、<code>ibv_devinfo</code>、verbs 设备和端口检查。</li>
+<li>NVIDIA NCCL 文档与 nccl-tests：用于把 qperf 的网络切片结果和 collective 性能对照。</li>
+<li>iperf3 官方文档：用于 IP 层带宽、并发流、反向测试和 JSON 自动化对照。</li>
+</ul>
+<div class="warn"><strong>版本提醒：</strong> qperf 的测试项和参数支持可能随发行版构建变化。生产脚本以目标机器上的 <code>qperf --help</code> 和 smoke test 为准。</div>
+</section>
+
+<div class="footer">qperf 深度教程 · 面向 AI Infra 的网络延迟、带宽与 RDMA 排障 · 单文件 HTML，无外部依赖</div>
+</div>
+</body>
+</html>

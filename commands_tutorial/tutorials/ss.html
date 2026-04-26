@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ss 深度教程：AI Infra 场景下的 Socket 状态、端口与 TCP 排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ss 深度教程：AI Infra 场景下的 Socket 状态、端口与 TCP 排障</h1>
+<p class="sub">这份教程围绕 Linux 命令 <code>ss</code> 展开。它不是单纯罗列参数，而是从“内核 socket 表如何映射到监听端口、连接状态、收发队列、进程归属和网络命名空间”这个心智模型出发，讲清楚 <code>ss -tnp</code>、监听端口、TCP 状态、队列、容器/namespace、NCCL rendezvous 与分布式训练调试中的实战用法。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">socket 状态</span><span class="chip">ss -tnp</span><span class="chip">监听端口</span><span class="chip">进程归属</span><span class="chip">TCP 队列</span><span class="chip">容器网络</span><span class="chip">NCCL 调试</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ss</code> 是查看 Linux 内核 socket 状态的高效工具；它回答“谁在监听、谁连着谁、连接处于什么状态、队列是否堆积、对应哪个进程”。</div>
+<div class="success"><strong>实践原则：</strong> 先用只读命令定位现象，例如 <code>ss -ltnp</code>、<code>ss -tn state established</code>、<code>ss -tinp</code>；需要进程名或 PID 时再加权限，避免一上来重启服务或清理连接。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ss 是什么，为什么 AI Infra 常用它</a></li>
+<li><a class="anchor" href="#s2">核心模型：socket 表、连接五元组与状态</a></li>
+<li><a class="anchor" href="#s3">基本语法与输出列</a></li>
+<li><a class="anchor" href="#s4">最常用入口：ss -tnp</a></li>
+<li><a class="anchor" href="#s5">查看监听端口与服务暴露面</a></li>
+<li><a class="anchor" href="#s6">进程归属：PID、进程名与权限</a></li>
+<li><a class="anchor" href="#s7">TCP 状态：ESTAB、SYN、TIME-WAIT</a></li>
+<li><a class="anchor" href="#s8">Recv-Q/Send-Q：队列含义与瓶颈判断</a></li>
+<li><a class="anchor" href="#s9">过滤表达式：按端口、IP、状态筛选</a></li>
+<li><a class="anchor" href="#s10">AI 训练节点：rendezvous 与端口冲突</a></li>
+<li><a class="anchor" href="#s11">NCCL 通信与网络接口排障</a></li>
+<li><a class="anchor" href="#s12">容器与网络命名空间</a></li>
+<li><a class="anchor" href="#s13">ss vs netstat/lsof/tcpdump</a></li>
+<li><a class="anchor" href="#s14">生产排障工作流</a></li>
+<li><a class="anchor" href="#s15">安全边界、权限与隐私</a></li>
+<li><a class="anchor" href="#s16">常见坑、速查表与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ss 是什么，为什么 AI Infra 常用它</h2>
+<p><code>ss</code> 来自 iproute2 工具集，用来查看 socket 统计与状态。相比老工具 <code>netstat</code>，它直接面向现代 Linux 内核接口，速度更快，适合在连接数量很多的训练集群、推理服务网关、Ray/Kubernetes 节点和参数服务节点上做现场排查。</p>
+<div class="grid-3">
+<div class="card"><strong>它回答“端口问题”</strong><br>某个端口是否监听？监听在 <code>127.0.0.1</code>、节点 IP，还是 <code>0.0.0.0</code>？是谁占用了 rendezvous 端口？</div>
+<div class="card"><strong>它回答“连接问题”</strong><br>客户端是否连上服务端？连接卡在 <code>SYN-SENT</code> 还是已经 <code>ESTAB</code>？远端是谁？</div>
+<div class="card"><strong>它回答“拥塞问题”</strong><br><code>Recv-Q</code>/<code>Send-Q</code> 是否堆积？TCP 重传、拥塞窗口、RTT 是否异常？</div>
+</div>
+<pre><code># 查看 TCP 连接，数字端口，显示进程
+ss -tnp
+
+# 查看所有 TCP 监听端口及进程
+sudo ss -ltnp
+
+# 查看某个端口是否被占用
+sudo ss -ltnp 'sport = :29500'
+
+# 查看 TCP 扩展信息：rtt、cwnd、retrans 等
+ss -tinp</code></pre>
+<div class="warn"><strong>边界：</strong> <code>ss</code> 展示 socket 状态，不负责抓包内容。要看实际数据包、TLS 握手、NCCL 报文或网络丢包细节，需要配合 <code>tcpdump</code>、<code>ethtool</code>、<code>nstat</code>、交换机遥测和应用日志。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：ss 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="ss 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="65" y="90" width="210" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="170" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">应用进程</text><text x="170" y="162" text-anchor="middle" font-size="15">torchrun / vLLM</text><text x="170" y="186" text-anchor="middle" font-size="15">nginx / kubelet</text>
+<rect x="335" y="90" width="220" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="445" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">内核 socket 表</text><text x="445" y="162" text-anchor="middle" font-size="15">local:port</text><text x="445" y="186" text-anchor="middle" font-size="15">peer:port + state</text>
+<rect x="615" y="90" width="220" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="725" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">ss 查询</text><text x="725" y="162" text-anchor="middle" font-size="15">state / port / pid</text><text x="725" y="186" text-anchor="middle" font-size="15">queue / tcp_info</text>
+<rect x="895" y="90" width="150" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="970" y="130" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">判断</text><text x="970" y="162" text-anchor="middle" font-size="15">谁占端口</text><text x="970" y="186" text-anchor="middle" font-size="15">卡在哪里</text>
+<rect x="95" y="315" width="910" height="165" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="355" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">ss 不是流量生成器，也不是抓包器</text><text x="550" y="397" text-anchor="middle" font-size="16">它读取 socket 元数据：协议、状态、本地地址、远端地址、队列、进程、TCP 扩展信息</text><text x="550" y="430" text-anchor="middle" font-size="16">AI Infra 排障中常用于验证 rendezvous、API 服务、worker 通信、容器端口映射和网络拥塞迹象</text>
+<line x1="275" y1="145" x2="335" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="555" y1="145" x2="615" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="835" y1="145" x2="895" y2="145" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">把 <code>ss</code> 看成“内核 socket 表的查询器”：它将进程、端口、连接状态和 TCP 指标拼到同一张视图里。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 基本语法与输出列</h2>
+<pre><code>ss [options] [ FILTER ]
+
+# 常见选项组合
+-t    TCP
+-u    UDP
+-l    listening，只看监听 socket
+-n    numeric，不解析服务名和主机名
+-p    process，显示进程信息
+-a    all，包含监听和非监听
+-i    internal TCP info，例如 rtt、cwnd、retrans
+-m    memory，显示 socket 内存
+-s    summary，显示统计摘要
+-H    no header，去掉表头，适合脚本处理</code></pre>
+<table>
+<tr><th>列名</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>Netid</code></td><td>协议族，例如 <code>tcp</code>、<code>udp</code>、<code>unix</code></td><td>区分 TCP 控制面、UDP DNS/服务发现、Unix socket 本地 IPC。</td></tr>
+<tr><td><code>State</code></td><td>socket 状态</td><td><code>LISTEN</code> 表示服务端已绑定；<code>ESTAB</code> 表示连接已建立；<code>SYN-SENT</code> 常指连接还没成功。</td></tr>
+<tr><td><code>Recv-Q</code></td><td>接收队列</td><td>已到达但应用尚未读取的数据，或监听 backlog 相关计数。</td></tr>
+<tr><td><code>Send-Q</code></td><td>发送队列</td><td>应用已写入但尚未被对端确认或发送完成的数据。</td></tr>
+<tr><td><code>Local Address:Port</code></td><td>本地绑定地址和端口</td><td><code>127.0.0.1:8000</code> 只本机可达；<code>0.0.0.0:8000</code> 对所有 IPv4 地址监听。</td></tr>
+<tr><td><code>Peer Address:Port</code></td><td>远端地址和端口</td><td>确认 worker、rank、客户端或负载均衡器是否连到预期节点。</td></tr>
+</table>
+<div class="note"><strong>数字优先：</strong> 排障时几乎总是加 <code>-n</code>。不做 DNS 和服务名解析可以避免命令卡住，也避免把 <code>:29500</code> 显示成不熟悉的服务名。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 最常用入口：<code>ss -tnp</code></h2>
+<p><code>ss -tnp</code> 是排查 TCP 连接的第一视图：<code>-t</code> 只看 TCP，<code>-n</code> 数字显示地址和端口，<code>-p</code> 显示拥有该 socket 的进程。它适合回答“这个训练/推理进程到底连了哪些机器”。</p>
+<pre><code># 当前 TCP 连接及进程
+ss -tnp
+
+# 去掉表头后只看已建立连接
+ss -Htnp state established
+
+# 查看 TCP 连接详情，包含 rtt、cwnd、retrans 等
+ss -tinp state established
+
+# 按远端 10.20.30.40 筛选连接
+ss -tnp dst 10.20.30.40</code></pre>
+<div class="grid-3">
+<div class="card"><strong>看 State</strong><br>大量 <code>ESTAB</code> 通常说明连接已建立；大量 <code>SYN-SENT</code> 表示连接请求发出但未成功。</div>
+<div class="card"><strong>看 Peer</strong><br>远端 IP 是否是预期 master、parameter server、gateway、redis 或对象存储地址。</div>
+<div class="card"><strong>看 users</strong><br><code>users:(("python",pid=1234,fd=57))</code> 能把 socket 归因到具体进程和文件描述符。</div>
+</div>
+<div class="warn"><strong>权限提醒：</strong> 普通用户可能看不到其他用户进程的 <code>users</code> 字段。排障节点级服务时使用 <code>sudo ss -tnp</code>，但不要把包含内网地址、用户名、命令行的输出随意贴到公开工单。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 查看监听端口与服务暴露面</h2>
+<p>监听端口决定“谁能连进来”。AI Infra 常见监听端口包括 torchrun rendezvous、Ray head、vLLM/OpenAI 兼容 API、Prometheus exporter、NCCL 相关控制连接、SSH、Kubernetes 组件和服务网格代理。</p>
+<pre><code># 所有 TCP 监听端口，带 PID/进程名
+sudo ss -ltnp
+
+# 所有 UDP 监听 socket，例如 DNS、服务发现、监控 agent
+sudo ss -lunp
+
+# 检查推理服务是否只监听 localhost
+sudo ss -ltnp 'sport = :8000'
+
+# 同时看 IPv4/IPv6 监听
+sudo ss -ltnp | grep -E ':(8000|29500|6379)\b'</code></pre>
+<table>
+<tr><th>监听地址</th><th>含义</th><th>排障判断</th></tr>
+<tr><td><code>127.0.0.1:8000</code></td><td>只接受本机连接</td><td>远端节点连不上是预期现象；需要代理或改 bind 地址。</td></tr>
+<tr><td><code>0.0.0.0:8000</code></td><td>所有 IPv4 地址监听</td><td>服务暴露面较大，需要配合安全组、防火墙、认证。</td></tr>
+<tr><td><code>[::]:8000</code></td><td>IPv6 通配监听</td><td>取决于系统 <code>bindv6only</code>，可能同时覆盖 IPv4 映射。</td></tr>
+<tr><td><code>10.0.1.7:29500</code></td><td>只绑定某个网卡地址</td><td>确认 worker 使用的 master 地址是否同网段可达。</td></tr>
+</table>
+<div class="danger"><strong>生产安全：</strong> <code>0.0.0.0</code> 不是错误，但意味着“所有本机网卡都接受连接”。在多租户训练机、共享跳板机和公网云主机上，必须确认防火墙、认证和访问控制。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 进程归属：PID、进程名与权限</h2>
+<p><code>-p</code> 会显示 socket 对应的进程、PID 和文件描述符。它是定位“端口被谁占用”“连接是谁发起的”的关键。</p>
+<pre><code># 找出占用 29500 的进程
+sudo ss -ltnp 'sport = :29500'
+
+# 示例输出中 users 字段的含义
+# users:(("python",pid=42811,fd=19))
+# 进程名 python，PID 42811，该 socket 对应进程内 fd 19
+
+# 用 PID 继续查看命令行和工作目录
+ps -fp 42811
+readlink -f /proc/42811/cwd
+tr '\0' ' ' &lt; /proc/42811/cmdline; echo</code></pre>
+<div class="grid-2">
+<div class="card"><strong>为什么 PID 可能为空</strong><br>权限不足、socket 属于内核、进程已经退出、命名空间不一致，都会导致 <code>-p</code> 无法显示完整归属。</div>
+<div class="card"><strong>为什么同一端口多个进程</strong><br><code>SO_REUSEPORT</code>、多 worker server、systemd socket activation 或父子进程共享 fd 都可能让多个进程关联同一监听 socket。</div>
+</div>
+<div class="note"><strong>排障顺序：</strong> 先 <code>sudo ss -ltnp 'sport = :PORT'</code> 找 PID，再用 <code>ps</code>/<code>/proc</code>/<code>systemctl status</code> 归因，不要先猜服务名。</div>
+</section>
+
+<section class="figure" id="fig-tcp-state">
+<h3>流程图：TCP 状态如何定位连接卡点</h3>
+<svg viewBox="0 0 1100 710" width="100%" role="img" aria-label="TCP 状态排障流程">
+<rect x="20" y="20" width="1060" height="670" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="55" width="260" height="62" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="94" text-anchor="middle" font-size="21" font-weight="700">ss -tnp 观察连接</text>
+<polygon points="550,160 720,245 550,330 380,245" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="238" text-anchor="middle" font-size="17" font-weight="700">State 是什么？</text><text x="550" y="263" text-anchor="middle" font-size="14">SYN / ESTAB / TIME-WAIT</text>
+<rect x="75" y="210" width="235" height="88" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="192" y="245" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">SYN-SENT</text><text x="192" y="274" text-anchor="middle" font-size="14">路由/防火墙/服务未监听</text>
+<rect x="430" y="410" width="240" height="88" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="445" text-anchor="middle" font-size="18" font-weight="700" fill="#166534">ESTAB</text><text x="550" y="474" text-anchor="middle" font-size="14">连接已建立，看队列/RTT/重传</text>
+<rect x="790" y="210" width="235" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="907" y="245" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">TIME-WAIT</text><text x="907" y="274" text-anchor="middle" font-size="14">短连接 churn 或正常回收</text>
+<rect x="145" y="555" width="810" height="78" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="588" text-anchor="middle" font-size="18" font-weight="700" fill="#334155">状态只能定位层级，不能替代日志和抓包</text><text x="550" y="616" text-anchor="middle" font-size="14">连接失败看监听/路由/ACL；已建立但慢看队列/重传/拥塞；大量短连接看连接池和重试策略</text>
+<line x1="550" y1="117" x2="550" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="380" y1="245" x2="310" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="550" y1="330" x2="550" y2="410" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="720" y1="245" x2="790" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M192 298 C230 420, 365 520, 462 555" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M550 498 C550 525, 550 535, 550 555" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M907 298 C865 420, 730 520, 638 555" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">TCP 状态能快速把问题分层：没连上、连上但慢、还是短连接过多。</div></section>
+
+<section class="section" id="s7">
+<h2>6. TCP 状态：ESTAB、SYN、TIME-WAIT</h2>
+<p>理解 TCP 状态比记参数更重要。AI 训练中的典型问题包括 master 端口未监听、worker 连错地址、容器端口未映射、安全组阻断、短连接风暴和连接队列堆积。</p>
+<table>
+<tr><th>状态</th><th>含义</th><th>常见判断</th></tr>
+<tr><td><code>LISTEN</code></td><td>服务正在监听</td><td>服务端准备接受连接，但不代表客户端一定能跨网络访问。</td></tr>
+<tr><td><code>SYN-SENT</code></td><td>本机发起连接，等待对端响应</td><td>常见于远端未监听、防火墙丢包、路由错误、地址写错。</td></tr>
+<tr><td><code>SYN-RECV</code></td><td>收到连接请求，握手未完成</td><td>大量堆积可能是半连接队列压力、丢包或异常扫描。</td></tr>
+<tr><td><code>ESTAB</code></td><td>连接已建立</td><td>如果业务仍超时，继续看队列、RTT、重传、应用日志。</td></tr>
+<tr><td><code>TIME-WAIT</code></td><td>主动关闭方等待旧包过期</td><td>少量正常；大量可能来自短连接、频繁重试、连接池失效。</td></tr>
+<tr><td><code>CLOSE-WAIT</code></td><td>对端已关闭，本地应用还没 close</td><td>持续增长通常指应用未及时关闭 socket。</td></tr>
+</table>
+<pre><code># 各 TCP 状态概览
+ss -ant | awk 'NR&gt;1 {count[$1]++} END {for (s in count) print s, count[s]}'
+
+# 只看正在连接但未建立的 TCP
+ss -tn state syn-sent
+
+# 只看已建立连接
+ss -tn state established
+
+# 大量 TIME-WAIT 时看本地/远端端口分布
+ss -Htan state time-wait | awk '{print $4, $5}' | sort | uniq -c | sort -nr | head</code></pre>
+<div class="warn"><strong>不要误判：</strong> <code>ESTAB</code> 只说明 TCP 连接建立，不说明应用协议成功、鉴权成功、NCCL bootstrap 成功或 HTTP 请求已返回。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. Recv-Q/Send-Q：队列含义与瓶颈判断</h2>
+<p><code>Recv-Q</code> 和 <code>Send-Q</code> 是 <code>ss</code> 排查“连上但慢”的关键线索。对已建立 TCP 连接，它们大致表示内核接收/发送队列中尚未被应用消费或对端确认的数据；对监听 socket，它们和等待 accept 的连接及 backlog 配置有关。</p>
+<table>
+<tr><th>现象</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>Recv-Q</code> 持续较高</td><td>应用读 socket 慢，事件循环卡住，CPU 饱和，GIL/线程池阻塞</td><td>看进程 CPU、线程栈、应用日志、<code>perf</code>、runtime metrics。</td></tr>
+<tr><td><code>Send-Q</code> 持续较高</td><td>对端读取慢、网络拥塞、丢包重传、发送窗口受限</td><td>看 <code>ss -i</code> 的 rtt/retrans/cwnd，配合 <code>nstat</code>、网卡计数。</td></tr>
+<tr><td>监听 socket 队列接近上限</td><td>应用 accept 慢或连接突发过大</td><td>检查 server worker 数、backlog、负载均衡重试、SYN flood 迹象。</td></tr>
+</table>
+<pre><code># 按发送队列排序，找出疑似阻塞连接
+ss -Htnp state established | awk '{print $3, $4, $5, $6}' | sort -nr | head
+
+# 查看 TCP 连接内部指标
+ss -tinp state established
+
+# 查看 socket 内存，辅助判断缓冲区压力
+ss -tmnp state established</code></pre>
+<div class="note"><strong>读法：</strong> 队列是症状，不是根因。<code>Send-Q</code> 高既可能是网络，也可能是对端应用慢；<code>Recv-Q</code> 高既可能是本进程忙，也可能是上游发送过快。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 过滤表达式：按端口、IP、状态筛选</h2>
+<p><code>ss</code> 支持在选项后追加过滤表达式。相比用 <code>grep</code>，过滤表达式更精确，适合脚本化排障。</p>
+<table>
+<tr><th>过滤目标</th><th>命令</th></tr>
+<tr><td>本地源端口</td><td><code>ss -tnp 'sport = :29500'</code></td></tr>
+<tr><td>远端目标端口</td><td><code>ss -tnp 'dport = :443'</code></td></tr>
+<tr><td>远端 IP</td><td><code>ss -tnp dst 10.1.2.3</code></td></tr>
+<tr><td>本地 IP</td><td><code>ss -tnp src 10.1.2.4</code></td></tr>
+<tr><td>已建立状态</td><td><code>ss -tnp state established</code></td></tr>
+<tr><td>排除监听</td><td><code>ss -tan state connected</code></td></tr>
+</table>
+<pre><code># 查看连向 master rendezvous 端口的 worker
+ss -tnp dst 10.10.0.8 dport = :29500
+
+# 查看本机 8000 端口上的已建立 HTTP/API 连接
+ss -tnp state established 'sport = :8000'
+
+# 组合 awk 做轻量统计：每个远端连接数
+ss -Htn state established | awk '{print $5}' | sed 's/:[0-9]*$//' | sort | uniq -c | sort -nr | head</code></pre>
+<div class="warn"><strong>Shell 引号：</strong> 带括号、比较符或端口表达式时建议整体加单引号，例如 <code>'sport = :29500'</code>，避免被 shell 误解析。</div>
+</section>
+
+<section class="figure" id="fig-rendezvous">
+<h3>信息图：分布式训练 rendezvous 端口检查路径</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="NCCL 和 torchrun rendezvous 检查路径">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">从 rank 0 监听到 worker 建连</text>
+<rect x="70" y="135" width="260" height="120" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="200" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">Rank 0 / Master</text><text x="200" y="210" text-anchor="middle" font-size="15">MASTER_ADDR=10.0.0.8</text><text x="200" y="234" text-anchor="middle" font-size="15">MASTER_PORT=29500</text>
+<rect x="420" y="135" width="260" height="120" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">Worker ranks</text><text x="550" y="210" text-anchor="middle" font-size="15">连接 10.0.0.8:29500</text><text x="550" y="234" text-anchor="middle" font-size="15">建立控制面连接</text>
+<rect x="770" y="135" width="260" height="120" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="900" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">NCCL 通道</text><text x="900" y="210" text-anchor="middle" font-size="15">bootstrap 后协商</text><text x="900" y="234" text-anchor="middle" font-size="15">网卡/端口/拓扑相关</text>
+<rect x="115" y="360" width="870" height="195" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="400" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">ss 检查顺序</text><text x="550" y="438" text-anchor="middle" font-size="16">1. master 上：sudo ss -ltnp 'sport = :29500' 确认监听</text><text x="550" y="470" text-anchor="middle" font-size="16">2. worker 上：ss -tnp dst 10.0.0.8 dport = :29500 确认建连状态</text><text x="550" y="502" text-anchor="middle" font-size="16">3. 两端：ss -tinp 查看 rtt、retrans、cwnd，结合 NCCL_DEBUG 日志</text>
+<line x1="330" y1="195" x2="420" y2="195" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="680" y1="195" x2="770" y2="195" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M200 255 C230 305, 280 330, 350 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M550 255 C550 300, 550 325, 550 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M900 255 C870 305, 820 330, 750 360" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">分布式训练先确认 rendezvous 控制面，再继续看 NCCL 数据通道、网卡选择和链路质量。</div></section>
+
+<section class="section" id="s10">
+<h2>9. AI 训练节点：rendezvous 与端口冲突</h2>
+<p>PyTorch DDP、torchrun、DeepSpeed、Megatron-LM 等训练框架通常需要 rendezvous 地址和端口。最常见故障是 rank 0 没有监听、端口被旧任务占用、worker 使用了容器内不可达地址、或云安全组阻断。</p>
+<pre><code># master/rank0 上确认端口监听
+sudo ss -ltnp 'sport = :29500'
+
+# worker 上确认是否正在连 master
+ss -tnp dst 10.0.0.8 dport = :29500
+
+# 如果卡在 SYN-SENT，先在 master 上确认监听，再查安全组/防火墙/路由
+ss -tn state syn-sent dst 10.0.0.8 dport = :29500
+
+# 查看端口是否被旧训练进程占用
+sudo ss -ltnp | grep ':29500'</code></pre>
+<div class="grid-3">
+<div class="card"><strong>端口冲突</strong><br>旧任务未退出、僵尸 launcher、同节点多个作业复用 <code>MASTER_PORT</code>。</div>
+<div class="card"><strong>地址错误</strong><br>master 广播了 <code>127.0.0.1</code>、容器 IP、错误网卡 IP 或不可路由地址。</div>
+<div class="card"><strong>网络策略</strong><br>Kubernetes NetworkPolicy、云安全组、iptables、主机防火墙或多租户隔离阻断。</div>
+</div>
+<div class="danger"><strong>谨慎处理：</strong> 不要看到端口被占用就直接 <code>kill -9</code>。先用 <code>ps -fp PID</code>、调度系统作业 ID、容器 ID 确认归属，避免误杀其他训练任务。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. NCCL 通信与网络接口排障</h2>
+<p>NCCL 问题经常表现为 bootstrap 卡住、all-reduce 慢、某些 rank 超时或节点间带宽异常。<code>ss</code> 不能替代 NCCL 日志，但可以验证 TCP 控制连接、远端地址、端口分布、队列和重传迹象。</p>
+<pre><code># 开启 NCCL 日志后，先从日志里确认使用的网卡/IP
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
+
+# 查看 python/训练进程建立的 TCP 连接
+sudo ss -tnp | grep -E 'python|torchrun|deepspeed'
+
+# 查看 TCP 内部指标，关注 rtt、retrans、cwnd、send/receive buffer
+sudo ss -tinp | grep -A2 -E 'python|torchrun'
+
+# 按远端节点统计连接，识别是否连到了错误网段
+ss -Htn state established | awk '{print $5}' | sed 's/:[0-9]*$//' | sort | uniq -c | sort -nr</code></pre>
+<table>
+<tr><th>ss 发现</th><th>可能原因</th><th>配套验证</th></tr>
+<tr><td>远端地址在管理网而非 RDMA/训练网</td><td><code>NCCL_SOCKET_IFNAME</code> 未配置或接口优先级不符合预期</td><td><code>ip addr</code>、NCCL INIT/NET 日志、作业环境变量。</td></tr>
+<tr><td><code>retrans</code> 增长，RTT 抖动</td><td>丢包、拥塞、链路错误、交换机队列压力</td><td><code>nstat</code>、<code>ethtool -S</code>、交换机 telemetry、iperf3。</td></tr>
+<tr><td>连接只到部分 rank</td><td>某些节点未启动、地址不可达、端口被策略阻断</td><td>调度系统状态、master/worker 双端 <code>ss</code>、防火墙策略。</td></tr>
+<tr><td>Recv-Q 或 Send-Q 持续高</td><td>应用或对端消费慢、链路拥塞、CPU 抢占</td><td>GPU 利用率、CPU steal、线程状态、NCCL timeout。</td></tr>
+</table>
+<div class="note"><strong>定位边界：</strong> NCCL 也可能使用 RDMA/IB verbs 等路径，<code>ss</code> 主要观察 TCP socket。RDMA 数据面问题还要看 <code>ibstat</code>、<code>ibv_devinfo</code>、NCCL net plugin 日志和厂商工具。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 容器与网络命名空间</h2>
+<p>容器里看到的 socket 表属于容器所在网络命名空间；宿主机看到的是宿主机命名空间。Kubernetes、Docker、containerd、hostNetwork、CNI 和端口映射会改变你应该在哪里运行 <code>ss</code>。</p>
+<pre><code># 容器内查看：只看到该容器网络命名空间中的 socket
+kubectl exec -it pod-name -- ss -ltnp
+
+# 宿主机查看：看到宿主机 namespace 的监听和连接
+sudo ss -ltnp
+
+# Docker 容器：进入容器网络命名空间排查
+docker exec -it container-name ss -tnp
+
+# 通过 PID 进入某进程的网络命名空间
+sudo nsenter -t 12345 -n ss -ltnp</code></pre>
+<table>
+<tr><th>场景</th><th>在哪里看 ss</th><th>原因</th></tr>
+<tr><td>Kubernetes 普通 Pod</td><td>Pod 内或对应 netns</td><td>Pod 有独立网络命名空间，宿主机未必直接显示容器内监听。</td></tr>
+<tr><td><code>hostNetwork: true</code></td><td>宿主机或 Pod 内均可交叉验证</td><td>Pod 共享宿主机网络命名空间，端口冲突更容易影响节点。</td></tr>
+<tr><td>Docker <code>-p 8000:8000</code></td><td>容器内看服务，宿主机看端口映射/代理</td><td>容器监听和宿主机暴露不是同一层含义。</td></tr>
+<tr><td>Service/Ingress 访问失败</td><td>Pod 内、节点、负载均衡器逐层看</td><td><code>ss</code> 只能证明某一层 socket 状态，不能单独证明 Service 规则正确。</td></tr>
+</table>
+<div class="warn"><strong>namespace 陷阱：</strong> “宿主机 <code>ss</code> 看不到端口”不等于容器没有监听；“容器内监听 <code>0.0.0.0</code>”也不等于外部一定可访问。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. ss vs netstat/lsof/tcpdump</h2>
+<p>这些工具互补，不是互相替代。生产排障中先用 <code>ss</code> 快速确定 socket 层事实，再按问题方向选择后续工具。</p>
+<table>
+<tr><th>工具</th><th>最适合回答</th><th>不适合</th></tr>
+<tr><td><code>ss</code></td><td>socket 状态、监听端口、队列、进程、TCP 指标</td><td>查看包内容、应用协议字段、历史趋势。</td></tr>
+<tr><td><code>netstat</code></td><td>传统环境兼容、老脚本</td><td>大连接数场景较慢，现代系统上常不如 <code>ss</code>。</td></tr>
+<tr><td><code>lsof -i</code></td><td>从文件描述符视角看进程打开的网络文件</td><td>大量连接时较慢；不如 <code>ss</code> 适合状态统计。</td></tr>
+<tr><td><code>tcpdump</code></td><td>抓包、握手、重传、协议报文</td><td>不直接告诉你进程归属；需要权限和过滤能力。</td></tr>
+<tr><td><code>conntrack</code></td><td>NAT/连接跟踪表</td><td>不等同于进程 socket；容器网络排障时才常用。</td></tr>
+</table>
+<pre><code># ss：端口和状态
+sudo ss -ltnp 'sport = :8000'
+
+# lsof：从进程文件角度确认
+sudo lsof -nP -iTCP:8000 -sTCP:LISTEN
+
+# tcpdump：确认包是否到达网卡
+sudo tcpdump -ni eth0 tcp port 8000</code></pre>
+<div class="success"><strong>组合策略：</strong> <code>ss</code> 证明“内核 socket 状态”，<code>tcpdump</code> 证明“包是否到达/离开”，应用日志证明“协议和业务是否成功”。三者组合比单工具结论更可靠。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障图：从症状到下一步工具</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="ss 生产排障工作流">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="425" y="50" width="250" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="90" text-anchor="middle" font-size="21" font-weight="700">服务不可达/训练卡住</text>
+<polygon points="550,155 725,240 550,325 375,240" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="232" text-anchor="middle" font-size="17" font-weight="700">监听端口存在？</text><text x="550" y="258" text-anchor="middle" font-size="14">sudo ss -ltnp</text>
+<rect x="85" y="205" width="240" height="82" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="205" y="238" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">没有监听</text><text x="205" y="266" text-anchor="middle" font-size="14">查服务启动/端口配置</text>
+<polygon points="550,375 710,455 550,535 390,455" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="447" text-anchor="middle" font-size="17" font-weight="700">连接已建立？</text><text x="550" y="473" text-anchor="middle" font-size="14">ss -tn state established</text>
+<rect x="780" y="205" width="240" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="900" y="238" text-anchor="middle" font-size="17" font-weight="700" fill="#6d28d9">有监听</text><text x="900" y="266" text-anchor="middle" font-size="14">继续看客户端状态</text>
+<rect x="80" y="415" width="250" height="86" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="205" y="449" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">SYN-SENT / 超时</text><text x="205" y="477" text-anchor="middle" font-size="14">路由/ACL/防火墙/tcpdump</text>
+<rect x="770" y="415" width="250" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="895" y="449" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">ESTAB 但慢</text><text x="895" y="477" text-anchor="middle" font-size="14">队列/RTT/重传/应用日志</text>
+<rect x="245" y="605" width="610" height="54" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="639" text-anchor="middle" font-size="17" font-weight="700" fill="#334155">结论必须来自双端验证：服务端、客户端、容器 namespace、网络设备</text>
+<line x1="550" y1="114" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="375" y1="240" x2="325" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="725" y1="240" x2="780" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="550" y1="325" x2="550" y2="375" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="390" y1="455" x2="330" y2="455" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="710" y1="455" x2="770" y2="455" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M205 501 C260 560, 360 590, 450 605" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M895 501 C840 560, 740 590, 650 605" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">生产排障要从“是否监听”到“是否建连”再到“为什么慢”，不要直接跳到重启或改内核参数。</div></section>
+
+<section class="section" id="s14">
+<h2>13. 生产排障工作流</h2>
+<p>当用户报告“vLLM API 访问慢”“torchrun 卡住”“Ray worker 加不进来”“某节点 all-reduce 超时”时，可以按下面顺序收敛。</p>
+<ol>
+<li><strong>确认服务端监听：</strong> 在目标节点运行 <code>sudo ss -ltnp 'sport = :PORT'</code>，确认地址、端口、PID。</li>
+<li><strong>确认客户端连接状态：</strong> 在发起方运行 <code>ss -tnp dst SERVER_IP dport = :PORT</code>，判断是 <code>ESTAB</code> 还是 <code>SYN-SENT</code>。</li>
+<li><strong>双端对照：</strong> 服务端看 <code>sport = :PORT</code>，客户端看 <code>dport = :PORT</code>，确认看到同一组连接。</li>
+<li><strong>看队列和 TCP 指标：</strong> <code>ss -tinp</code> 观察 <code>rtt</code>、<code>retrans</code>、<code>cwnd</code>、队列。</li>
+<li><strong>进入正确 namespace：</strong> 如果是容器，使用 <code>kubectl exec</code> 或 <code>nsenter -n</code>。</li>
+<li><strong>再选择工具：</strong> 连接没到达用 <code>tcpdump</code>；链路错误看 <code>ethtool -S</code>；协议错误看应用日志。</li>
+</ol>
+<pre><code># 一个可复制的只读排障快照
+date
+hostname -f
+ip -brief addr
+sudo ss -ltnp
+ss -s
+ss -tan | awk 'NR&gt;1 {count[$1]++} END {for (s in count) print s, count[s]}' | sort
+ss -tin state established | head -80</code></pre>
+<div class="success"><strong>记录现场：</strong> 生产问题会随重试和调度迁移消失。先采集只读快照，再改服务、扩容或重启。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 安全边界、权限与隐私</h2>
+<p><code>ss</code> 是只读观察工具，但输出可能包含内网 IP、端口、进程名、用户名、命令行线索和租户信息。AI Infra 常在共享训练集群中运行，排障输出要按敏感信息处理。</p>
+<div class="grid-2">
+<div class="card"><strong>权限最小化</strong><br>普通连接状态可先不用 <code>sudo</code>；只有需要完整 PID/进程归属或系统服务信息时再用 <code>sudo ss -p</code>。</div>
+<div class="card"><strong>输出脱敏</strong><br>对外分享前隐藏公网 IP、内网网段、用户名、作业名、容器 ID 和专有服务端口。</div>
+</div>
+<pre><code># 对外分享前做轻量脱敏示例，只保留端口和状态思路
+ss -Htan | sed -E 's/[0-9]+(\.[0-9]+){3}/X.X.X.X/g' | head
+
+# 避免在公开 issue 中直接贴完整 users 字段
+sudo ss -tnp | head</code></pre>
+<div class="danger"><strong>不要做：</strong> 不要把 <code>sudo ss -tnp</code> 的完整生产输出直接贴到公开聊天、开源 issue 或跨租户工单；它可能暴露服务拓扑和内部地址。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 常见坑、速查表与练习</h2>
+<h3>常见坑</h3>
+<table>
+<tr><th>坑</th><th>正确理解</th></tr>
+<tr><td>只在宿主机看 <code>ss</code></td><td>容器网络命名空间可能不同，必须进入 Pod/container 或目标 netns。</td></tr>
+<tr><td>把 <code>0.0.0.0</code> 当成远端地址</td><td>监听中的 <code>0.0.0.0</code> 表示本机所有 IPv4 地址，不是某个客户端。</td></tr>
+<tr><td>看到 <code>ESTAB</code> 就认为业务正常</td><td>TCP 建立不等于 HTTP/gRPC/NCCL 协议成功。</td></tr>
+<tr><td>忽略 <code>-n</code></td><td>DNS/服务名解析会慢，也会干扰端口判断。</td></tr>
+<tr><td>直接杀占端口进程</td><td>先确认 PID 属于哪个作业、容器、systemd unit 或用户。</td></tr>
+</table>
+<h3>速查表</h3>
+<pre><code># 监听端口
+sudo ss -ltnp
+sudo ss -ltnp 'sport = :29500'
+
+# TCP 连接
+ss -tnp
+ss -tnp state established
+ss -tn state syn-sent
+
+# TCP 质量
+ss -tinp state established
+ss -tmnp state established
+
+# 摘要和统计
+ss -s
+ss -ant | awk 'NR&gt;1 {a[$1]++} END {for (s in a) print s, a[s]}'
+
+# 容器 namespace
+kubectl exec -it POD -- ss -ltnp
+sudo nsenter -t PID -n ss -tnp</code></pre>
+<h3>练习任务</h3>
+<ol>
+<li>启动一个本地 HTTP 服务，分别观察 <code>127.0.0.1:PORT</code> 和 <code>0.0.0.0:PORT</code> 的监听差异。</li>
+<li>用两个终端建立一次 <code>curl</code> 请求，观察客户端和服务端 <code>ss -tnp</code> 输出中的本地/远端地址如何互换。</li>
+<li>在容器内启动服务，分别在容器内和宿主机运行 <code>ss -ltnp</code>，解释两边看到的差异。</li>
+<li>模拟一个 <code>MASTER_PORT</code> 被占用的场景，用 <code>ss</code> 找出 PID，再用 <code>ps</code> 归因。</li>
+</ol>
+<div class="note"><strong>学习路线：</strong> 先熟练 <code>ss -ltnp</code>、<code>ss -tnp</code>、<code>ss -tinp</code>，再学习过滤表达式、namespace 和 TCP 指标。不要先背完整参数表。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<ul>
+<li><code>man ss</code>：本机最准确的选项和过滤表达式说明，注意不同发行版 iproute2 版本可能略有差异。</li>
+<li><code>man 7 tcp</code>：Linux TCP 行为、socket 选项、状态和缓冲区相关说明。</li>
+<li>iproute2 项目文档：<code>ss</code> 属于 iproute2 工具集，现代 Linux 网络排障优先熟悉该工具族。</li>
+<li>PyTorch Distributed 文档：rendezvous、<code>MASTER_ADDR</code>、<code>MASTER_PORT</code>、backend 与启动方式。</li>
+<li>NVIDIA NCCL 文档：<code>NCCL_DEBUG</code>、<code>NCCL_SOCKET_IFNAME</code>、网络插件和多节点通信排障。</li>
+<li>Kubernetes 文档：Pod 网络、hostNetwork、NetworkPolicy、Service 与容器网络命名空间。</li>
+</ul>
+</section>
+
+<div class="footer">AI Infra/Linux 命令教程 · ss · 单文件 HTML · 无外部依赖</div>
+</div>
+</body>
+</html>

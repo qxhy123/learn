@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>lsof 深度教程：AI Infra 中的文件、端口、库与资源占用排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>lsof 深度教程：AI Infra 中的文件、端口、库与资源占用排障</h1>
+<p class="sub"><code>lsof</code> 的名字来自 “list open files”。在 Linux/Unix 里，普通文件、目录、TCP/UDP socket、Unix socket、设备、共享库、被删除但仍占用磁盘的文件、内存映射对象都可以表现为“打开的文件”。这份教程面向 AI Infra 场景：训练进程、推理服务、数据加载器、NCCL/RDMA 网络、GPU 运行时库、checkpoint、日志与容器权限排障。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">打开文件</span><span class="chip">端口排障</span><span class="chip">lsof -p</span><span class="chip">deleted 文件</span><span class="chip">GPU/runtime 库</span><span class="chip">dataset/checkpoint</span><span class="chip">权限边界</span><span class="chip">ss/fuser/strace 对比</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>lsof</code> 是“从进程视角看资源引用”的工具：只要某个进程还握着文件描述符或映射关系，<code>lsof</code> 就能把它暴露出来。</div>
+<div class="success"><strong>生产实践：</strong> 先用无副作用查询定位 PID、FD、端口和路径；需要结束进程、清理文件或卸载挂载点时，先确认影响面，再执行 <code>kill</code>、重启服务或运维变更。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">lsof 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：进程、FD、文件与内核对象</a></li>
+<li><a class="anchor" href="#s3">安装、权限与输出列</a></li>
+<li><a class="anchor" href="#s4">基础查询与常用选项</a></li>
+<li><a class="anchor" href="#s5">按 PID 排查：lsof -p</a></li>
+<li><a class="anchor" href="#s6">端口与网络 socket</a></li>
+<li><a class="anchor" href="#s7">deleted 文件占用磁盘</a></li>
+<li><a class="anchor" href="#s8">数据集、checkpoint 与日志描述符</a></li>
+<li><a class="anchor" href="#s9">GPU、驱动与运行时库</a></li>
+<li><a class="anchor" href="#s10">Unix socket、共享内存与 IPC</a></li>
+<li><a class="anchor" href="#s11">容器、namespace 与权限</a></li>
+<li><a class="anchor" href="#s12">文件描述符上限与泄漏</a></li>
+<li><a class="anchor" href="#s13">挂载点、NFS、对象存储网关与 “busy”</a></li>
+<li><a class="anchor" href="#s14">lsof vs ss/fuser/strace</a></li>
+<li><a class="anchor" href="#s15">AI Infra 排障工作流</a></li>
+<li><a class="anchor" href="#s16">安全注意事项</a></li>
+<li><a class="anchor" href="#s17">常见坑与排障清单</a></li>
+<li><a class="anchor" href="#s18">练习与参考</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. lsof 是什么</h2>
+<p>在 Linux 中，“文件”不只指磁盘上的普通文件。进程打开的 TCP 连接、监听端口、Unix socket、设备节点、共享库、工作目录、根目录、内存映射文件、管道和匿名 inode，都可能以文件描述符或文件引用的形式存在。<code>lsof</code> 把这些引用按进程列出来。</p>
+<div class="grid-3">
+<div class="card"><strong>它回答的问题</strong><br>谁在占用这个端口？谁打开了这个 checkpoint？哪个进程还握着 deleted 日志？训练进程加载了哪个 CUDA/NCCL 库？</div>
+<div class="card"><strong>它不回答的问题</strong><br>它不会告诉你系统调用发生的完整时间线，也不是高性能网络统计器；需要时应配合 <code>strace</code>、<code>ss</code>、<code>perf</code>、日志和应用指标。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>训练/推理服务通常同时持有数据集文件、checkpoint、端口、GPU 设备、运行时库和日志。<code>lsof</code> 能快速建立“PID 到资源”的地图。</div>
+</div>
+<pre><code># 查看某个进程打开了什么
+lsof -p 12345
+
+# 谁监听 8080 端口
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+
+# 谁还占着已删除文件
+lsof +L1
+
+# 谁正在访问某个数据目录
+lsof +D /mnt/datasets/imagenet</code></pre>
+<div class="warn"><strong>心智边界：</strong> <code>lsof</code> 是快照工具。它看到的是查询瞬间的打开状态；高频打开又立即关闭的文件，可能需要 <code>strace</code>、eBPF 或应用日志补充。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：lsof 的整体心智模型</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="lsof 整体模型">
+<rect x="16" y="16" width="1068" height="628" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="26" font-weight="700" fill="#1f2937">lsof = 从进程引用反查打开的内核对象</text>
+<rect x="70" y="120" width="230" height="150" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">进程</text><text x="185" y="194" text-anchor="middle" font-size="15">trainer / server</text><text x="185" y="222" text-anchor="middle" font-size="15">PID、用户、命令</text>
+<rect x="435" y="120" width="230" height="150" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">文件描述符</text><text x="550" y="194" text-anchor="middle" font-size="15">cwd / txt / mem</text><text x="550" y="222" text-anchor="middle" font-size="15">0u / 1w / 23r / 45u</text>
+<rect x="800" y="120" width="230" height="150" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="915" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">内核对象</text><text x="915" y="194" text-anchor="middle" font-size="15">文件 / socket / 设备</text><text x="915" y="222" text-anchor="middle" font-size="15">库 / shm / pipe</text>
+<rect x="95" y="370" width="910" height="125" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="407" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">AI Infra 典型资源图</text><text x="550" y="443" text-anchor="middle" font-size="15">Python 训练进程打开 dataset shards、checkpoint、NCCL socket、CUDA 库、/dev/nvidia*、日志文件</text><text x="550" y="472" text-anchor="middle" font-size="15">lsof 把这些引用放在一张表里，帮助判断“资源为什么删不掉、端口为什么占用、库版本是否正确”。</text>
+<line x1="300" y1="195" x2="435" y2="195" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="665" y1="195" x2="800" y2="195" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">不要把 <code>lsof</code> 当成“列文件”的工具；它更像“进程资源引用表”。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、权限与输出列</h2>
+<p>多数发行版可以从系统包安装 <code>lsof</code>。容器镜像为了精简经常不带它，排障镜像或宿主机工具箱通常需要单独准备。</p>
+<pre><code># Debian/Ubuntu
+sudo apt-get update && sudo apt-get install -y lsof
+
+# RHEL/CentOS/Rocky/Alma
+sudo yum install -y lsof
+# 或
+sudo dnf install -y lsof
+
+# macOS
+sudo lsof -iTCP:8080 -sTCP:LISTEN</code></pre>
+<table>
+<tr><th>列名</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>COMMAND</code></td><td>进程名</td><td><code>python</code>、<code>torchrun</code>、<code>tritonserver</code>、<code>ray</code>、<code>java</code></td></tr>
+<tr><td><code>PID</code>/<code>USER</code></td><td>进程 ID 与用户</td><td>用于定位 worker、launcher、sidecar 或服务账户</td></tr>
+<tr><td><code>FD</code></td><td>文件描述符或特殊引用</td><td><code>cwd</code> 工作目录，<code>txt</code> 可执行文件，<code>mem</code> 映射库，<code>12u</code> 可读写 FD</td></tr>
+<tr><td><code>TYPE</code></td><td>对象类型</td><td><code>REG</code> 普通文件，<code>DIR</code> 目录，<code>IPv4</code>/<code>IPv6</code> 网络，<code>CHR</code> 字符设备，<code>unix</code> Unix socket</td></tr>
+<tr><td><code>DEVICE/SIZE/OFF/NODE</code></td><td>设备、大小、偏移或 inode</td><td>定位磁盘、挂载点、deleted 文件和 inode 级占用</td></tr>
+<tr><td><code>NAME</code></td><td>路径或连接描述</td><td>最常用字段：路径、端口、连接两端、<code>(deleted)</code> 标记</td></tr>
+</table>
+<div class="warn"><strong>权限提醒：</strong> 普通用户通常只能完整看到自己的进程。生产排障经常需要 <code>sudo lsof ...</code>，否则结果可能缺失而不是报错。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 基础查询与常用选项</h2>
+<p>默认 <code>lsof</code> 输出可能非常大。生产上应尽量用 PID、端口、路径、用户或协议缩小范围，并用 <code>-nP</code> 避免 DNS 和服务名解析造成延迟。</p>
+<table>
+<tr><th>命令</th><th>用途</th><th>说明</th></tr>
+<tr><td><code>lsof -p PID</code></td><td>按进程查询</td><td>最适合定位训练/推理进程资源引用</td></tr>
+<tr><td><code>lsof -nP -i</code></td><td>列网络连接</td><td><code>-n</code> 不解析主机名，<code>-P</code> 不解析端口名</td></tr>
+<tr><td><code>lsof /path/file</code></td><td>谁打开了文件</td><td>适合 checkpoint、日志、模型权重</td></tr>
+<tr><td><code>lsof +D /dir</code></td><td>递归查目录</td><td>可能很慢，谨慎用于大数据集目录</td></tr>
+<tr><td><code>lsof -u user</code></td><td>按用户查询</td><td>定位某个训练用户或服务账户</td></tr>
+<tr><td><code>lsof -c name</code></td><td>按命令前缀查询</td><td><code>lsof -c python</code> 可快速看 Python 进程</td></tr>
+<tr><td><code>lsof -a ...</code></td><td>AND 条件</td><td>多个条件默认常有 OR 语义，<code>-a</code> 用于交集过滤</td></tr>
+</table>
+<pre><code># 避免网络解析，生产上推荐默认带上
+sudo lsof -nP -iTCP
+
+# 某用户的 Python 进程打开了什么
+sudo lsof -a -u train -c python
+
+# 某个模型文件是否仍被服务持有
+sudo lsof /models/llama/checkpoint.safetensors
+
+# 某个目录是否被进程占用
+sudo lsof +D /mnt/checkpoints/exp-042</code></pre>
+<div class="note"><strong>性能习惯：</strong> <code>+D</code> 会递归遍历目录树；在包含百万级小文件的数据集目录上可能很重。能用具体文件、PID 或挂载点时，不要先上 <code>+D</code>。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 按 PID 排查：<code>lsof -p</code></h2>
+<p>AI 任务排障最常用入口是先从 <code>ps</code>、<code>nvidia-smi</code>、调度系统或服务管理器拿到 PID，再用 <code>lsof -p</code> 还原它的资源占用。</p>
+<pre><code># 从 nvidia-smi 找到占用 GPU 的 PID 后
+sudo lsof -p 12345
+
+# 只看这个 PID 的网络连接
+sudo lsof -nP -a -p 12345 -i
+
+# 只看普通文件、目录、库映射等非网络资源
+sudo lsof -a -p 12345 | grep -E ' REG | DIR | mem '
+
+# 多个 worker PID
+sudo lsof -p 12345,12346,12347</code></pre>
+<table>
+<tr><th>FD 示例</th><th>含义</th><th>排障价值</th></tr>
+<tr><td><code>cwd</code></td><td>当前工作目录</td><td>目录无法卸载或删除时，检查进程是否还在里面</td></tr>
+<tr><td><code>txt</code></td><td>可执行文件</td><td>确认实际启动的是哪个 Python、server 或二进制</td></tr>
+<tr><td><code>mem</code></td><td>内存映射文件/共享库</td><td>确认加载的 CUDA、cuDNN、NCCL、libtorch 路径</td></tr>
+<tr><td><code>1w</code>/<code>2w</code></td><td>stdout/stderr 写入目标</td><td>找训练日志、容器日志或被删除日志占用</td></tr>
+<tr><td><code>23r</code>/<code>24u</code></td><td>普通 FD 及访问模式</td><td>定位 dataset shard、checkpoint、socket、pipe</td></tr>
+</table>
+<div class="success"><strong>实战建议：</strong> 对长时间训练进程，先保存一份 <code>sudo lsof -nP -p PID &gt; lsof.PID.txt</code>，后续再和异常时快照对比。</div>
+</section>
+
+<section class="figure">
+<h3>流程图：从端口异常到责任进程</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="lsof 端口排障流程">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">端口绑定失败</text>
+<polygon points="550,155 725,240 550,325 375,240" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="234" text-anchor="middle" font-size="17" font-weight="700">端口是否被监听？</text><text x="550" y="260" text-anchor="middle" font-size="14">lsof -nP -iTCP:PORT -sTCP:LISTEN</text>
+<rect x="85" y="205" width="230" height="78" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="200" y="237" text-anchor="middle" font-size="18" font-weight="700">未看到监听</text><text x="200" y="262" text-anchor="middle" font-size="14">检查协议/namespace</text>
+<rect x="785" y="205" width="230" height="78" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="900" y="237" text-anchor="middle" font-size="18" font-weight="700">找到 PID</text><text x="900" y="262" text-anchor="middle" font-size="14">确认命令和用户</text>
+<rect x="110" y="405" width="260" height="84" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="240" y="440" text-anchor="middle" font-size="17" font-weight="700">容器/网络命名空间</text><text x="240" y="466" text-anchor="middle" font-size="14">进入宿主机或目标 ns 查询</text>
+<rect x="420" y="405" width="260" height="84" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="440" text-anchor="middle" font-size="17" font-weight="700">确认是否可替换</text><text x="550" y="466" text-anchor="middle" font-size="14">服务归属、调度器、健康检查</text>
+<rect x="730" y="405" width="260" height="84" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="860" y="440" text-anchor="middle" font-size="17" font-weight="700">释放或改端口</text><text x="860" y="466" text-anchor="middle" font-size="14">优先优雅重启，避免误杀</text>
+<rect x="325" y="565" width="450" height="64" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="550" y="604" text-anchor="middle" font-size="19" font-weight="700">结论：端口是进程资源，不是单独存在的“锁”</text>
+<line x1="550" y1="111" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="375" y1="240" x2="315" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="338" y="222" font-size="14">否</text><line x1="725" y1="240" x2="785" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><text x="752" y="222" font-size="14">是</text><path d="M200 283 C205 340, 220 370, 240 405" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M900 283 C870 350, 860 375, 860 405" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M900 283 C735 360, 650 390, 605 405" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="240" y1="489" x2="425" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="489" x2="550" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="860" y1="489" x2="675" y2="565" stroke="#94a3b8" stroke-width="3"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">端口排障优先使用 <code>-nP</code>，避免 DNS/服务名解析拖慢判断。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 端口与网络 socket</h2>
+<p>训练集群和推理服务常见端口问题包括：服务启动时报 <code>Address already in use</code>、NCCL worker 互联异常、Ray/etcd/Redis/Prometheus 端口冲突、Ingress 或 sidecar 监听预期不一致。</p>
+<pre><code># 谁在监听 8080
+sudo lsof -nP -iTCP:8080 -sTCP:LISTEN
+
+# 查看所有监听中的 TCP 端口
+sudo lsof -nP -iTCP -sTCP:LISTEN
+
+# 查看某个进程的 TCP/UDP 连接
+sudo lsof -nP -a -p 12345 -i
+
+# 查看和某远端 IP 的连接
+sudo lsof -nP -i@10.20.30.40
+
+# UDP 端口，例如某些服务发现、监控或自定义通信
+sudo lsof -nP -iUDP:8125</code></pre>
+<table>
+<tr><th>场景</th><th>命令</th><th>解释</th></tr>
+<tr><td>推理服务端口冲突</td><td><code>lsof -nP -iTCP:8000 -sTCP:LISTEN</code></td><td>找到旧服务、残留 worker 或本地测试进程</td></tr>
+<tr><td>多机训练连接异常</td><td><code>lsof -nP -a -p PID -iTCP</code></td><td>确认 worker 是否建立到 master/peer 的连接</td></tr>
+<tr><td>端口看起来没占用但仍失败</td><td><code>ss -ltnp</code> 与 namespace 检查</td><td>可能是容器网络命名空间、权限或协议族差异</td></tr>
+</table>
+<div class="note"><strong>lsof 与 ss：</strong> <code>lsof</code> 更擅长“端口对应哪个进程和 FD”；<code>ss</code> 更擅长大规模、高性能地看 socket 状态、队列和 TCP 细节。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. deleted 文件占用磁盘</h2>
+<p>Linux 上删除文件只是移除目录项。如果进程仍打开该文件，磁盘空间不会释放，直到最后一个引用关闭。AI 训练中大日志、临时 shard、失败 checkpoint、tensor dump 被删除后仍占空间，是非常常见的磁盘告警原因。</p>
+<pre><code># 找所有 link count 小于 1 的打开文件，常用于 deleted 排查
+sudo lsof +L1
+
+# 只看某个挂载点相关的 deleted 文件
+sudo lsof +L1 /mnt/train
+
+# 结合 grep 看 deleted 标记
+sudo lsof -nP | grep '(deleted)'
+
+# 定位某个 PID 的 deleted 文件
+sudo lsof -p 12345 | grep deleted</code></pre>
+<table>
+<tr><th>现象</th><th>lsof 线索</th><th>处理方式</th></tr>
+<tr><td><code>df -h</code> 显示满，<code>du -sh</code> 找不到大文件</td><td><code>lsof +L1</code> 看到大文件 <code>(deleted)</code></td><td>让进程关闭文件、滚动日志、重启服务或优雅停止任务</td></tr>
+<tr><td>训练日志被 <code>rm</code> 后空间不释放</td><td><code>FD</code> 可能是 <code>1w</code>、<code>2w</code> 或普通写 FD</td><td>重启/重定向日志进程，修正 logrotate 策略</td></tr>
+<tr><td>checkpoint 清理后仍占空间</td><td>训练 worker 仍打开旧 checkpoint 或临时文件</td><td>确认无恢复需求后停止对应 worker</td></tr>
+</table>
+<div class="danger"><strong>不要盲目清空 FD：</strong> 网上常见 <code>&gt; /proc/PID/fd/N</code> 可能破坏进程语义或正在写入的数据。生产上优先让应用关闭文件、触发日志 reopen、或按服务流程重启。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 数据集、checkpoint 与日志描述符</h2>
+<p>数据加载器通常有多个 worker 并行读取 shard；训练任务会周期性写 checkpoint；推理服务会 mmap 模型权重。<code>lsof</code> 能帮助判断“文件是否真的正在被使用”。</p>
+<pre><code># 谁正在读某个数据 shard
+sudo lsof /mnt/datasets/c4/train-000123.jsonl.zst
+
+# 谁打开了某个 checkpoint 目录中的文件
+sudo lsof +D /mnt/checkpoints/run-2026-04-25
+
+# 查看训练进程 stdout/stderr 去向
+sudo lsof -p 12345 | awk '$4 ~ /^[12]/ {print}'
+
+# 查 safetensors/pt/bin 模型文件是否被推理服务持有
+sudo lsof -p 23456 | grep -E '\.(safetensors|pt|bin|onnx)$'</code></pre>
+<div class="grid-3">
+<div class="card"><strong>数据集</strong><br>关注 <code>REG</code> 文件、读取 FD、挂载路径和是否大量 worker 同时打开同一 shard。</div>
+<div class="card"><strong>checkpoint</strong><br>关注写入中的临时文件、<code>.tmp</code>、<code>.part</code>、<code>latest</code> 链接和 deleted 状态。</div>
+<div class="card"><strong>日志</strong><br>关注 <code>1w</code>、<code>2w</code>、应用日志文件与 logrotate 后的 <code>(deleted)</code>。</div>
+</div>
+<div class="warn"><strong>大目录提醒：</strong> 对对象存储挂载、NFS 或 FUSE 数据集目录执行 <code>lsof +D</code> 可能很慢，并给元数据服务制造压力。先缩小到具体文件或 PID。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. GPU、驱动与运行时库</h2>
+<p><code>lsof</code> 不能直接告诉你 GPU 显存占用；那是 <code>nvidia-smi</code>、<code>rocm-smi</code>、DCGM 等工具的职责。但它能回答另一些关键问题：进程打开了哪些 GPU 设备节点？加载了哪个 CUDA/cuDNN/NCCL/libtorch 库？是否仍引用旧版本库或被删除库？</p>
+<pre><code># 查看进程打开的 NVIDIA 设备节点
+sudo lsof -p 12345 | grep -E '/dev/nvidia|/dev/dri'
+
+# 查看 CUDA/NCCL/cuDNN/libtorch 等运行时库映射
+sudo lsof -p 12345 | grep -E 'libcuda|libcudart|libcudnn|libnccl|libtorch'
+
+# 系统中谁打开了 GPU 设备
+sudo lsof /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm 2&gt;/dev/null
+
+# 库文件已升级或删除但进程仍映射旧 inode
+sudo lsof -p 12345 | grep -E 'deleted|libcuda|libnccl'</code></pre>
+<table>
+<tr><th>线索</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>/dev/nvidia0</code>、<code>/dev/nvidiactl</code></td><td>进程和 NVIDIA 驱动设备有引用</td><td>用 <code>nvidia-smi</code> 交叉确认 GPU/PID/显存</td></tr>
+<tr><td><code>mem ... libnccl.so</code></td><td>进程映射了 NCCL 库</td><td>确认路径是否来自预期 conda/env/container image</td></tr>
+<tr><td><code>mem ... (deleted)</code></td><td>库文件更新或删除后，进程仍用旧 inode</td><td>计划滚动重启，避免混用旧运行时</td></tr>
+<tr><td>未看到设备节点</td><td>权限不足、容器隔离或进程未实际触发 GPU 初始化</td><td>检查容器设备挂载、runtime、权限和应用日志</td></tr>
+</table>
+<div class="note"><strong>库版本判断：</strong> <code>ldd</code> 看“新进程可能加载什么”，<code>lsof -p</code> 看“这个运行中的进程已经加载了什么”。二者在滚动升级和热修场景下可能不同。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. Unix socket、共享内存与 IPC</h2>
+<p>分布式训练和推理栈里，进程间通信不仅是 TCP。Python multiprocessing、PyTorch DataLoader、Ray、Docker/containerd、systemd、Prometheus exporter、Unix domain socket、匿名 pipe 和共享内存都可能出现在 <code>lsof</code> 输出里。</p>
+<pre><code># 查看某个 PID 的 Unix socket、pipe、共享内存线索
+sudo lsof -nP -p 12345 | grep -E 'unix|FIFO|PIPE|memfd|/dev/shm|anon_inode'
+
+# 谁打开了 /dev/shm 中的对象
+sudo lsof +D /dev/shm
+
+# 查看 Docker/containerd 相关 socket
+sudo lsof -nP | grep -E 'docker.sock|containerd.sock'
+
+# Ray 或本地控制面 socket
+sudo lsof -nP | grep -E '/tmp/ray|raylet|plasma'</code></pre>
+<table>
+<tr><th>对象</th><th>常见来源</th><th>排查意义</th></tr>
+<tr><td><code>/dev/shm</code></td><td>PyTorch multiprocessing、NCCL、DataLoader、共享缓存</td><td>判断共享内存是否被持有，是否与容器 <code>--shm-size</code> 不足相关</td></tr>
+<tr><td><code>unix</code></td><td>本机进程通信、runtime socket、sidecar</td><td>定位服务控制面、agent 和本地代理连接</td></tr>
+<tr><td><code>FIFO</code>/<code>PIPE</code></td><td>shell 管道、日志收集、进程间流式传输</td><td>判断进程是否阻塞在管道或日志链路</td></tr>
+<tr><td><code>memfd</code>/<code>anon_inode</code></td><td>现代 runtime、eventfd、epoll、匿名内存对象</td><td>提示资源类型，但需要 <code>strace</code>/<code>perf</code>/日志进一步确认行为</td></tr>
+</table>
+<div class="warn"><strong>解释边界：</strong> <code>lsof</code> 能列出 IPC 对象，但不能完整解释协议语义。看到 Unix socket 后，通常还要结合进程命令行、日志和服务拓扑。</div>
+</section>
+
+<section class="figure">
+<h3>用例图：按 AI Infra 问题选择 lsof 查询入口</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="lsof AI Infra 用例选择图">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="25" font-weight="700">问题先分类，再选择最窄的 lsof 入口</text>
+<rect x="70" y="125" width="230" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="163" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">我知道 PID</text><text x="185" y="195" text-anchor="middle" font-size="14">GPU 进程 / worker</text><text x="185" y="218" text-anchor="middle" font-size="14">lsof -p PID</text>
+<rect x="435" y="125" width="230" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="163" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">我知道端口</text><text x="550" y="195" text-anchor="middle" font-size="14">服务启动失败</text><text x="550" y="218" text-anchor="middle" font-size="14">lsof -iTCP:PORT</text>
+<rect x="800" y="125" width="230" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="915" y="163" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">我知道路径</text><text x="915" y="195" text-anchor="middle" font-size="14">模型/日志/数据</text><text x="915" y="218" text-anchor="middle" font-size="14">lsof /path</text>
+<rect x="70" y="365" width="230" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="185" y="403" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">磁盘异常</text><text x="185" y="435" text-anchor="middle" font-size="14">df 满但 du 不满</text><text x="185" y="458" text-anchor="middle" font-size="14">lsof +L1</text>
+<rect x="435" y="365" width="230" height="110" rx="18" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="403" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">库版本异常</text><text x="550" y="435" text-anchor="middle" font-size="14">CUDA/NCCL 混乱</text><text x="550" y="458" text-anchor="middle" font-size="14">lsof -p PID | grep lib</text>
+<rect x="800" y="365" width="230" height="110" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="915" y="403" text-anchor="middle" font-size="18" font-weight="700" fill="#334155">挂载点 busy</text><text x="915" y="435" text-anchor="middle" font-size="14">NFS/FUSE 无法卸载</text><text x="915" y="458" text-anchor="middle" font-size="14">lsof +f -- /mnt/x</text>
+<rect x="250" y="565" width="600" height="62" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="550" y="603" text-anchor="middle" font-size="18" font-weight="700">原则：先窄查，后扩展；先观察，后操作</text>
+<line x1="185" y1="235" x2="185" y2="365" stroke="#94a3b8" stroke-width="3" stroke-dasharray="8 8"/><line x1="550" y1="235" x2="550" y2="365" stroke="#94a3b8" stroke-width="3" stroke-dasharray="8 8"/><line x1="915" y1="235" x2="915" y2="365" stroke="#94a3b8" stroke-width="3" stroke-dasharray="8 8"/>
+</svg>
+<div class="caption">如果你已经知道 PID，<code>lsof -p</code> 通常比全局扫描更快、更安全。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 容器、namespace 与权限</h2>
+<p>容器环境会改变 <code>lsof</code> 的观察视角。你在容器内看到的是容器命名空间内的进程和路径；在宿主机看到的是宿主机 PID、挂载路径和网络 namespace。两边结果可能都正确，但语义不同。</p>
+<pre><code># 宿主机上查看容器进程打开文件
+sudo lsof -p HOST_PID
+
+# 在容器内查看当前命名空间视角
+docker exec -it CONTAINER sh -lc 'lsof -nP -p 1'
+
+# Kubernetes 中进入 Pod 排查
+kubectl exec -it POD -- sh -lc 'lsof -nP -iTCP'
+
+# 普通用户看不到完整结果时
+sudo lsof -nP -p 12345</code></pre>
+<table>
+<tr><th>问题</th><th>典型原因</th><th>处理思路</th></tr>
+<tr><td>容器内看不到宿主机上的 PID</td><td>PID namespace 隔离</td><td>用宿主机 PID 查询，或进入目标 namespace</td></tr>
+<tr><td>路径不一致</td><td>bind mount、overlayfs、容器 rootfs</td><td>同时记录容器内路径和宿主机 mountinfo</td></tr>
+<tr><td>端口宿主机可见但容器内不可见</td><td>网络 namespace、hostNetwork、端口映射</td><td>分别在宿主机和容器内用 <code>lsof</code>/<code>ss</code> 查询</td></tr>
+<tr><td>结果缺失</td><td>权限不足或内核安全策略</td><td>使用 <code>sudo</code>、debug container 或节点级排障工具</td></tr>
+</table>
+<div class="note"><strong>Kubernetes 提醒：</strong> 对 GPU 训练 Pod，最好同时记录 Pod 名、容器 ID、宿主机 PID、GPU UUID 和 <code>lsof -p</code> 快照，避免多层映射混淆。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 文件描述符上限与泄漏</h2>
+<p>长跑训练、数据服务和推理网关可能因为 FD 泄漏逐渐接近 <code>ulimit -n</code>，表现为 “Too many open files”、新连接失败、DataLoader worker 异常或 checkpoint 写入失败。</p>
+<pre><code># 查看某个 PID 当前打开 FD 数量
+sudo lsof -p 12345 | wc -l
+
+# 更接近 FD 数量的内核视角
+sudo ls /proc/12345/fd | wc -l
+
+# 查看进程限制
+cat /proc/12345/limits | grep -i 'open files'
+
+# 简单观察 FD 数量变化
+while true; do date; sudo ls /proc/12345/fd | wc -l; sleep 10; done</code></pre>
+<table>
+<tr><th>线索</th><th>解释</th><th>下一步</th></tr>
+<tr><td>FD 数量单调增长</td><td>可能存在文件/socket 泄漏</td><td>按时间保存 <code>lsof -p</code>，比较新增路径或连接</td></tr>
+<tr><td>大量 dataset shard FD</td><td>DataLoader、缓存策略或文件句柄未关闭</td><td>检查 worker 生命周期、prefetch、IterableDataset 实现</td></tr>
+<tr><td>大量 TCP <code>ESTABLISHED</code>/<code>CLOSE_WAIT</code></td><td>连接管理异常</td><td>配合 <code>ss -tanp</code> 和服务端日志定位</td></tr>
+<tr><td>大量日志或临时文件 FD</td><td>日志轮转或临时文件清理问题</td><td>检查 logrotate、应用 reopen 机制、临时目录策略</td></tr>
+</table>
+<div class="warn"><strong>修复顺序：</strong> 提高 <code>ulimit -n</code> 只能缓解容量问题，不能替代修复泄漏。先判断是正常高并发还是异常增长。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 挂载点、NFS、对象存储网关与 “busy”</h2>
+<p>AI 集群常用 NFS、Lustre、BeeGFS、CephFS、JuiceFS、S3 FUSE 或本地 NVMe RAID。卸载失败、目录删除失败、滚动升级卡住时，<code>lsof</code> 能定位仍在使用挂载点的进程。</p>
+<pre><code># 谁正在使用某个挂载点下的文件
+sudo lsof +f -- /mnt/datasets
+
+# 递归目录查询，适合范围较小的目录
+sudo lsof +D /mnt/datasets/project-a
+
+# 当前工作目录在挂载点内的进程
+sudo lsof | awk '$4 == "cwd" && $9 ~ "^/mnt/datasets" {print}'
+
+# 卸载前先确认影响面
+sudo lsof +f -- /mnt/checkpoints
+mount | grep /mnt/checkpoints</code></pre>
+<div class="danger"><strong>卸载安全：</strong> 不要在未确认进程归属时强制卸载或杀进程。训练任务可能正在写 checkpoint；强制中断可能导致恢复点损坏或长时间重训。</div>
+<div class="note"><strong>网络文件系统提醒：</strong> <code>lsof</code> 查询本身也可能触发元数据访问。大规模目录优先按 PID、具体文件或挂载点查询，避免递归扫描全量数据集。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. <code>lsof</code> vs <code>ss</code>/<code>fuser</code>/<code>strace</code></h2>
+<p>这些工具经常一起出现，但用途不同。正确选择工具可以减少误判。</p>
+<table>
+<tr><th>工具</th><th>核心问题</th><th>优势</th><th>不足</th></tr>
+<tr><td><code>lsof</code></td><td>哪个进程打开了哪些资源？</td><td>统一查看文件、端口、库、设备、deleted 文件</td><td>快照型；高频事件可能错过</td></tr>
+<tr><td><code>ss</code></td><td>socket 当前状态如何？</td><td>网络状态、队列、连接规模更强更快</td><td>不覆盖普通文件、库、日志等资源</td></tr>
+<tr><td><code>fuser</code></td><td>谁正在使用这个文件/端口/挂载点？</td><td>输出简洁，适合脚本和卸载前检查</td><td>上下文少；不如 <code>lsof</code> 表达丰富</td></tr>
+<tr><td><code>strace</code></td><td>进程正在做哪些系统调用？</td><td>时间线和失败 errno 清楚</td><td>侵入性更高，输出大，生产需谨慎</td></tr>
+<tr><td><code>nvidia-smi</code>/<code>rocm-smi</code></td><td>GPU 设备和显存状态如何？</td><td>GPU 专用信息准确</td><td>不告诉你进程打开了哪些文件和库</td></tr>
+</table>
+<pre><code># 端口归属：lsof 或 ss 都能看
+sudo lsof -nP -iTCP:8080 -sTCP:LISTEN
+sudo ss -ltnp 'sport = :8080'
+
+# 挂载点 busy：lsof 给详细列表，fuser 给简洁 PID
+sudo lsof +f -- /mnt/datasets
+sudo fuser -vm /mnt/datasets
+
+# 高频打开/失败：lsof 看不到时间线，用 strace 追踪
+sudo strace -f -e trace=openat,close,connect -p 12345</code></pre>
+<div class="success"><strong>组合原则：</strong> 先用 <code>lsof</code> 建立“谁持有什么”的资源图；网络深挖用 <code>ss</code>；文件/系统调用失败深挖用 <code>strace</code>；GPU 深挖用厂商工具。</div>
+</section>
+
+<section class="figure">
+<h3>排障图：AI Infra 中 lsof 的安全工作流</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="lsof AI Infra 排障安全工作流">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="84" text-anchor="middle" font-size="21" font-weight="700">收到资源异常</text>
+<rect x="95" y="160" width="240" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="215" y="195" text-anchor="middle" font-size="17" font-weight="700">确定入口</text><text x="215" y="222" text-anchor="middle" font-size="14">PID / 端口 / 路径 / 磁盘</text>
+<rect x="430" y="160" width="240" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="195" text-anchor="middle" font-size="17" font-weight="700">最窄 lsof 查询</text><text x="550" y="222" text-anchor="middle" font-size="14">-p、-i、路径、+L1</text>
+<rect x="765" y="160" width="240" height="86" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="885" y="195" text-anchor="middle" font-size="17" font-weight="700">交叉验证</text><text x="885" y="222" text-anchor="middle" font-size="14">ps / ss / df / GPU 工具</text>
+<polygon points="550,315 710,395 550,475 390,395" fill="#fee2e2" stroke="#fca5a5"/><text x="550" y="390" text-anchor="middle" font-size="17" font-weight="700">需要改变系统状态？</text><text x="550" y="415" text-anchor="middle" font-size="14">kill / restart / umount / cleanup</text>
+<rect x="120" y="540" width="300" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="270" y="575" text-anchor="middle" font-size="17" font-weight="700">否：记录证据</text><text x="270" y="602" text-anchor="middle" font-size="14">保存快照，继续观察</text>
+<rect x="680" y="540" width="300" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="830" y="575" text-anchor="middle" font-size="17" font-weight="700">是：走变更流程</text><text x="830" y="602" text-anchor="middle" font-size="14">确认 owner、备份、优雅操作</text>
+<line x1="550" y1="109" x2="215" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="335" y1="203" x2="430" y2="203" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="670" y1="203" x2="765" y2="203" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M885 246 C820 290, 710 320, 635 356" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M390 395 C315 435, 280 485, 270 540" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="330" y="458" font-size="14">否</text><path d="M710 395 C785 435, 820 485, 830 540" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="760" y="458" font-size="14">是</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">lsof 查询本身通常安全；真正有风险的是查询之后的 kill、清理、卸载和服务重启。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. AI Infra 排障工作流</h2>
+<p>下面是可以直接用于值班排障的分支式流程。它假设你已经知道异常类型，但还不知道责任进程或资源引用。</p>
+<h3>端口冲突</h3>
+<pre><code>PORT=8080
+sudo lsof -nP -iTCP:${PORT} -sTCP:LISTEN
+sudo ss -ltnp "sport = :${PORT}"</code></pre>
+<h3>GPU 进程异常</h3>
+<pre><code>PID=12345
+nvidia-smi
+sudo lsof -nP -p ${PID} | tee lsof.${PID}.txt
+grep -E '/dev/nvidia|libcuda|libcudnn|libnccl|libtorch' lsof.${PID}.txt</code></pre>
+<h3>磁盘满但找不到文件</h3>
+<pre><code>df -h
+sudo lsof +L1
+sudo lsof +L1 /mnt/train</code></pre>
+<h3>数据目录无法卸载或清理</h3>
+<pre><code>MNT=/mnt/datasets
+sudo lsof +f -- ${MNT}
+sudo fuser -vm ${MNT}</code></pre>
+<div class="success"><strong>记录模板：</strong> 每次线上排障建议保存：时间、节点名、PID、用户、命令行、<code>lsof</code> 查询命令、关键输出、后续操作和回滚方式。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 安全注意事项</h2>
+<div class="grid-2">
+<div class="card"><strong>不要把查询结果等同于权限授权</strong><br>看到某进程占用端口或文件，不代表可以直接杀掉。先确认 owner、调度系统和服务影响面。</div>
+<div class="card"><strong>谨慎使用递归目录查询</strong><br><code>+D</code> 在大数据集、NFS、FUSE、对象存储挂载上可能很慢，并增加元数据压力。</div>
+<div class="card"><strong>小心输出中的敏感路径</strong><br><code>lsof</code> 可能暴露模型路径、用户目录、临时 token 文件、Unix socket 路径和内部 IP。</div>
+<div class="card"><strong>不要盲目修补 deleted 文件</strong><br>对 <code>/proc/PID/fd/N</code> 写入或截断可能破坏应用状态。优先优雅关闭或重启。</div>
+<div class="card"><strong>权限不足会导致假阴性</strong><br>没有 <code>sudo</code> 时，结果缺失很常见。排障报告中要写明查询权限。</div>
+<div class="card"><strong>容器视角要标清</strong><br>同一个进程在宿主机和容器里 PID、路径、网络 namespace 可能不同。</div>
+</div>
+<pre><code># 安全 dry-run 风格：先观察，不改变系统状态
+sudo lsof -nP -iTCP:8080 -sTCP:LISTEN
+ps -fp PID
+systemctl status SERVICE 2&gt;/dev/null || true
+
+# 需要停止进程时，先确认命令行和归属
+ps -o pid,ppid,user,stat,lstart,cmd -p PID</code></pre>
+<div class="danger"><strong>危险操作必须确认：</strong> <code>kill -9</code>、强制卸载、删除 checkpoint、清空 FD、重启训练服务都可能造成数据损坏或任务失败。<code>lsof</code> 只负责提供证据，不替你做变更决策。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 常见坑与排障清单</h2>
+<table>
+<tr><th>坑</th><th>表现</th><th>处理</th></tr>
+<tr><td>忘记 <code>-nP</code></td><td>查询网络连接很慢</td><td>生产默认使用 <code>lsof -nP ...</code></td></tr>
+<tr><td>没有 <code>sudo</code></td><td>看不到其他用户进程或输出不完整</td><td>用 root/debug 权限重查，并记录权限差异</td></tr>
+<tr><td>误解 <code>+D</code></td><td>大目录查询卡住或压力大</td><td>先按 PID、具体文件、挂载点查询</td></tr>
+<tr><td>容器路径混淆</td><td>宿主机路径和容器路径对不上</td><td>同时记录 container ID、mount、host PID</td></tr>
+<tr><td>把快照当时间线</td><td>短暂打开的文件没被看到</td><td>用 <code>strace</code>、eBPF、应用日志或循环采样补充</td></tr>
+<tr><td>只看端口不看协议</td><td>TCP/UDP 或 IPv4/IPv6 判断错</td><td>明确 <code>-iTCP</code>、<code>-iUDP</code>、<code>-sTCP:LISTEN</code></td></tr>
+<tr><td>库升级后未重启</td><td>进程仍映射旧库或 <code>(deleted)</code> 库</td><td>计划滚动重启，确认新进程加载路径</td></tr>
+</table>
+<h3>排障清单</h3>
+<pre><code># 1. 明确入口
+PID=12345
+PORT=8080
+PATH_TO_CHECK=/mnt/checkpoints/run-001
+
+# 2. 保存快照
+sudo lsof -nP -p ${PID} &gt; lsof.${PID}.$(date +%Y%m%d-%H%M%S).txt
+
+# 3. 查网络
+sudo lsof -nP -a -p ${PID} -i
+
+# 4. 查 deleted
+sudo lsof -p ${PID} | grep deleted || true
+
+# 5. 查运行时库
+sudo lsof -p ${PID} | grep -E 'libcuda|libcudnn|libnccl|libtorch' || true
+
+# 6. 查路径占用
+sudo lsof +f -- ${PATH_TO_CHECK}</code></pre>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习任务</h2>
+<p>以下练习都以观察为主，不要求破坏系统状态。可以在测试机或本地容器中完成。</p>
+<ol>
+<li>启动一个简单 HTTP 服务，用 <code>lsof -nP -iTCP:PORT -sTCP:LISTEN</code> 找到 PID。</li>
+<li>打开一个日志文件持续写入，删除文件后用 <code>lsof +L1</code> 观察 <code>(deleted)</code>。</li>
+<li>对一个 Python 进程执行 <code>lsof -p</code>，区分 <code>cwd</code>、<code>txt</code>、<code>mem</code>、普通数字 FD。</li>
+<li>在容器内外分别查看同一服务端口，记录 PID 和路径差异。</li>
+<li>找一个加载 CUDA/NCCL 的训练进程，确认运行中进程实际映射的库路径。</li>
+<li>比较 <code>lsof -nP -iTCP</code> 与 <code>ss -tanp</code> 的输出差异。</li>
+</ol>
+<pre><code># 本地端口练习
+python3 -m http.server 18080 &
+SERVER_PID=$!
+sudo lsof -nP -iTCP:18080 -sTCP:LISTEN
+kill ${SERVER_PID}
+
+# deleted 文件练习：只在 /tmp 中做
+mkdir -p /tmp/lsof-demo
+sh -c 'while true; do date &gt;&gt; /tmp/lsof-demo/live.log; sleep 1; done' &
+WRITER_PID=$!
+rm /tmp/lsof-demo/live.log
+sudo lsof -p ${WRITER_PID} | grep deleted
+kill ${WRITER_PID}</code></pre>
+<div class="warn"><strong>练习安全：</strong> 上述练习只应在测试环境运行。不要对生产训练进程做删除文件、强制停止或压力型递归查询。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li><code>lsof(8)</code> manual：选项、输出列、文件类型、网络选择器、<code>+L</code>、<code>+D</code>、<code>+f</code> 等说明。</li>
+<li>Linux man-pages：<code>proc(5)</code>、<code>socket(7)</code>、<code>unix(7)</code>、<code>capabilities(7)</code>，用于理解 <code>/proc/PID/fd</code>、socket 和权限模型。</li>
+<li>iproute2 文档与 <code>ss(8)</code> manual：用于网络 socket 状态、监听队列和连接细节排查。</li>
+<li><code>fuser(1)</code> 与 <code>strace(1)</code> manual：分别用于资源使用者快速定位和系统调用时间线追踪。</li>
+<li>NVIDIA/DCGM 或 ROCm 官方工具文档：用于 GPU 设备、显存、驱动和运行时状态的专用排查。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解“一切皆文件”和 FD 模型，再掌握 <code>-p</code>、<code>-i</code>、路径查询、<code>+L1</code>，最后学习容器 namespace、GPU 库映射和跨工具组合。</p></section>
+<div class="footer">lsof 深度教程 · AI Infra 图文穿插版 · 文件描述符、端口、deleted 文件、GPU 运行时库与生产排障</div>
+</div>
+</body>
+</html>

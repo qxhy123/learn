@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>perf 深度教程：AI Infra/Linux CPU 性能剖析实战</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>perf 深度教程：AI Infra/Linux CPU 性能剖析实战</h1>
+<p class="sub">这份教程面向 AI Infra 和 Linux 生产环境，系统讲清 <code>perf</code> 的心智模型与实战路径：用 <code>perf stat</code> 判断 CPU 是否有效做工，用 <code>perf top</code> 现场观察热点，用 <code>perf record/report</code> 采样定位函数级 CPU 消耗，并覆盖 IPC、cycles、cache misses、context switches、Python/native 栈、容器、<code>perf_event_paranoid</code>、采样开销、安全边界、与 <code>py-spy</code>/<code>bpftrace</code> 的选择。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">CPU 热点</span><span class="chip">perf stat</span><span class="chip">perf top</span><span class="chip">perf record/report</span><span class="chip">IPC</span><span class="chip">cache misses</span><span class="chip">Python 栈</span><span class="chip">容器排障</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>perf</code> 是 Linux 内核性能事件观测器：它读取硬件 PMU、软件事件和内核 tracepoint，把“CPU 时间花在哪里、执行效率如何、是否被缓存/调度拖慢”变成可验证数据。</div>
+<div class="success"><strong>最重要原则：</strong> 生产环境先用低风险的 <code>perf stat</code> 做短窗口观测，再小频率采样；避免长时间高频 <code>record</code>，注意权限、隐私、符号文件和容器边界。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">perf 是什么，适合解决什么问题</a></li>
+<li><a class="anchor" href="#s2">AI Infra 中的典型 perf 场景</a></li>
+<li><a class="anchor" href="#s3">安装、版本和权限</a></li>
+<li><a class="anchor" href="#s4">核心心智模型：事件、计数、采样、符号</a></li>
+<li><a class="anchor" href="#s5">perf stat：先判断系统状态</a></li>
+<li><a class="anchor" href="#s6">读懂 cycles、instructions、IPC</a></li>
+<li><a class="anchor" href="#s7">缓存、分支、内存停顿指标</a></li>
+<li><a class="anchor" href="#s8">上下文切换、迁移和调度噪声</a></li>
+<li><a class="anchor" href="#s9">perf top：线上实时热点观察</a></li>
+<li><a class="anchor" href="#s10">perf record/report：离线采样定位</a></li>
+<li><a class="anchor" href="#s11">调用栈、火焰图和符号化</a></li>
+<li><a class="anchor" href="#s12">Python 与 native 栈的 caveats</a></li>
+<li><a class="anchor" href="#s13">容器和 Kubernetes 中使用 perf</a></li>
+<li><a class="anchor" href="#s14">AI 训练/推理服务案例</a></li>
+<li><a class="anchor" href="#s15">perf vs py-spy vs bpftrace</a></li>
+<li><a class="anchor" href="#s16">生产安全、开销和数据治理</a></li>
+<li><a class="anchor" href="#s17">常见错误与排障清单</a></li>
+<li><a class="anchor" href="#s18">参考命令速查与学习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. perf 是什么，适合解决什么问题</h2>
+<p><code>perf</code> 是 Linux 内核自带的性能分析工具族，核心能力来自 <code>perf_events</code> 子系统。它能读取 CPU 硬件计数器、内核软件事件和 tracepoint，并把这些事件按进程、线程、CPU、函数、调用栈维度聚合。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长</strong><br>CPU 热点、低 IPC、cache miss、分支预测失败、上下文切换、内核/用户态栈、native 库瓶颈。</div>
+<div class="card"><strong>它不擅长</strong><br>直接解释业务语义、GPU kernel 细节、Python 对象级内存、分布式链路和数据库内部等待。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>定位 dataloader、tokenizer、pre/postprocess、RPC、压缩、日志、内核网络栈、BLAS/oneDNN/native 扩展热点。</div>
+</div>
+<pre><code># 查看 perf 是否可用
+perf --version
+
+# 看一个命令的整体 CPU 事件
+perf stat -- python train.py --steps 100
+
+# 对正在运行的服务观察 10 秒
+perf stat -p 12345 -- sleep 10
+
+# 采样并离线查看热点
+perf record -F 99 -g -p 12345 -- sleep 30
+perf report</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>perf</code> 看到的是机器级事实，不是完整因果。低 IPC 可能来自内存等待、分支失败、锁竞争、虚拟化噪声或 CPU 降频，需要结合指标和业务上下文解释。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 中的典型 perf 场景</h2>
+<p>AI 系统不只是 GPU。很多吞吐问题发生在 CPU 侧：样本解码、特征处理、tokenization、batch 拼接、压缩、网络收发、日志、RPC 编解码、模型服务前后处理、native 扩展和内核调度。</p>
+<table>
+<tr><th>现象</th><th>perf 观察重点</th><th>常见解释</th></tr>
+<tr><td>GPU 利用率低但 CPU 忙</td><td><code>cycles</code>、<code>instructions</code>、热点函数、context switches</td><td>dataloader/tokenizer/预处理拖慢供给，或线程过多调度抖动。</td></tr>
+<tr><td>推理 p99 抖动</td><td>CPU migrations、context-switches、cache misses、内核栈</td><td>线程迁移、NUMA、锁、日志或网络栈导致尾延迟。</td></tr>
+<tr><td>CPU 使用率高但吞吐不涨</td><td>IPC、branch-misses、cache-misses</td><td>CPU 花时间等待内存、错误分支或执行低效代码。</td></tr>
+<tr><td>Python 服务看不到 native 瓶颈</td><td><code>perf record -g</code> + 符号</td><td>热点在 C/C++ 扩展、OpenMP、BLAS、protobuf、zlib、jemalloc。</td></tr>
+</table>
+<pre><code># 训练进程短窗口总览
+PID=$(pgrep -n -f 'python.*train.py')
+perf stat -d -d -d -p "$PID" -- sleep 15
+
+# 推理服务查看线程级热点，先找线程 ID
+ps -L -p 12345 -o pid,tid,psr,pcpu,comm
+perf top -t 12378</code></pre>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、版本和权限</h2>
+<p><code>perf</code> 通常随 Linux kernel tools 安装，版本最好与运行内核匹配。权限由 <code>/proc/sys/kernel/perf_event_paranoid</code>、<code>kptr_restrict</code>、capability、容器安全策略共同决定。</p>
+<table>
+<tr><th>发行版</th><th>安装示例</th><th>备注</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>sudo apt install linux-tools-common linux-tools-$(uname -r)</code></td><td>内核升级后可能需要安装对应版本。</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>sudo dnf install perf</code></td><td>旧系统可能是 <code>yum install perf</code>。</td></tr>
+<tr><td>Arch</td><td><code>sudo pacman -S perf</code></td><td>包名和内核包相关。</td></tr>
+</table>
+<pre><code># 检查权限
+cat /proc/sys/kernel/perf_event_paranoid
+cat /proc/sys/kernel/kptr_restrict
+
+# 临时降低限制：只在受控测试机或明确授权环境使用
+sudo sysctl kernel.perf_event_paranoid=1
+
+# 更高权限需求的场景可用 capability，但要由平台安全策略批准
+sudo setcap cap_perfmon,cap_sys_ptrace,cap_syslog=ep "$(command -v perf)"</code></pre>
+<div class="danger"><strong>安全注意：</strong> 不要在共享生产主机随意把 <code>perf_event_paranoid</code> 调到 <code>-1</code>。perf 采样可能暴露进程名、路径、符号、调用栈和部分内核地址信息。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 核心心智模型：事件、计数、采样、符号</h2>
+<p>使用 <code>perf</code> 前先区分两种模式：<strong>计数</strong>回答“发生了多少次”，<strong>采样</strong>回答“这些事件大多发生在哪里”。<code>stat</code> 主要计数，<code>top/record/report</code> 主要采样。</p>
+<section class="figure">
+<h3>信息图：perf 从 CPU 事件到热点函数</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="perf 事件模型">
+<rect x="18" y="18" width="1064" height="604" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="55" y="90" width="205" height="116" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="158" y="132" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">CPU / 内核</text><text x="158" y="165" text-anchor="middle" font-size="15">PMU 硬件事件</text><text x="158" y="190" text-anchor="middle" font-size="15">软件事件 / tracepoint</text>
+<rect x="325" y="90" width="205" height="116" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="428" y="132" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">perf_events</text><text x="428" y="165" text-anchor="middle" font-size="15">计数器</text><text x="428" y="190" text-anchor="middle" font-size="15">采样缓冲区</text>
+<rect x="595" y="90" width="205" height="116" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="698" y="132" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">perf 工具</text><text x="698" y="165" text-anchor="middle" font-size="15">stat / top</text><text x="698" y="190" text-anchor="middle" font-size="15">record / report</text>
+<rect x="865" y="90" width="180" height="116" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="955" y="132" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">结论</text><text x="955" y="165" text-anchor="middle" font-size="15">指标异常</text><text x="955" y="190" text-anchor="middle" font-size="15">函数热点</text>
+<line x1="260" y1="148" x2="325" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="530" y1="148" x2="595" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="800" y1="148" x2="865" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<rect x="105" y="330" width="410" height="136" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="310" y="370" text-anchor="middle" font-size="23" font-weight="700">计数：perf stat</text><text x="310" y="408" text-anchor="middle" font-size="16">cycles、instructions、cache-misses</text><text x="310" y="438" text-anchor="middle" font-size="16">适合先判断：是不是 CPU/内存/调度问题</text>
+<rect x="585" y="330" width="410" height="136" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="790" y="370" text-anchor="middle" font-size="23" font-weight="700">采样：top / record</text><text x="790" y="408" text-anchor="middle" font-size="16">按事件周期打断程序并记录 IP/调用栈</text><text x="790" y="438" text-anchor="middle" font-size="16">适合定位：时间到底花在哪些函数</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">先用计数确认问题类型，再用采样定位代码位置，这是 perf 的主流程。</div>
+</section>
+<table>
+<tr><th>概念</th><th>解释</th><th>常见命令</th></tr>
+<tr><td>事件</td><td>CPU cycles、instructions、cache misses、context switches 等。</td><td><code>perf list</code></td></tr>
+<tr><td>计数</td><td>统计窗口内事件总数和派生指标。</td><td><code>perf stat -e cycles,instructions</code></td></tr>
+<tr><td>采样</td><td>事件每发生一段时间或次数后记录一次执行位置。</td><td><code>perf record -F 99 -g</code></td></tr>
+<tr><td>符号</td><td>把地址翻译成函数名、库名、源码行。</td><td><code>perf report --stdio</code></td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. perf stat：先判断系统状态</h2>
+<p><code>perf stat</code> 是生产排障的第一站。它开销低，输出是统计窗口内的整体事实，可以快速判断 CPU 是否忙于执行、等待内存、频繁调度或大量缺页。</p>
+<pre><code># 对命令做一次完整统计
+perf stat -- python preprocess.py --input data.jsonl
+
+# 对进程做 10 秒观测
+perf stat -p 12345 -- sleep 10
+
+# 更详细的通用指标，-d 可重复
+perf stat -d -d -d -p 12345 -- sleep 15
+
+# 指定事件，便于稳定对比
+perf stat -e cycles,instructions,cache-references,cache-misses,context-switches,cpu-migrations,page-faults -p 12345 -- sleep 10</code></pre>
+<table>
+<tr><th>输出项</th><th>怎么看</th><th>AI Infra 解释示例</th></tr>
+<tr><td><code>task-clock</code></td><td>进程实际获得的 CPU 时间，除以墙钟时间约等于平均 CPU 核数。</td><td>10 秒窗口里 task-clock 80s，说明平均使用约 8 个 CPU 核。</td></tr>
+<tr><td><code>cycles</code></td><td>CPU 周期数，受频率、停顿和调度影响。</td><td>CPU 忙但吞吐低，需要结合 IPC 和 miss。</td></tr>
+<tr><td><code>instructions</code></td><td>退休指令数。</td><td>同样请求量下指令数变多，可能引入低效代码路径。</td></tr>
+<tr><td><code>context-switches</code></td><td>上下文切换次数。</td><td>线程池过大、锁等待、I/O 等待或 cgroup 限制。</td></tr>
+</table>
+<div class="success"><strong>对比技巧：</strong> 固定输入、固定窗口、固定 CPU 亲和性或隔离噪声后，对比优化前后的 <code>instructions</code>、<code>IPC</code>、cache miss ratio 和吞吐，避免只看 CPU 使用率。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 读懂 cycles、instructions、IPC</h2>
+<p><strong>IPC</strong> 是 instructions per cycle，即每个 CPU 周期退休多少条指令。它不是越高越好，也不能跨不同 CPU 微架构直接比较，但在同机同负载对比时非常有价值。</p>
+<section class="figure">
+<h3>信息图：IPC 的直觉</h3>
+<svg viewBox="0 0 1100 560" width="100%" role="img" aria-label="IPC 指标解释">
+<rect x="20" y="20" width="1060" height="520" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">IPC = instructions / cycles</text>
+<rect x="90" y="135" width="260" height="260" rx="24" fill="#dcfce7" stroke="#86efac"/><text x="220" y="185" text-anchor="middle" font-size="24" font-weight="700" fill="#166534">较高 IPC</text><text x="220" y="232" text-anchor="middle" font-size="16">流水线更饱满</text><text x="220" y="264" text-anchor="middle" font-size="16">缓存命中较好</text><text x="220" y="296" text-anchor="middle" font-size="16">分支预测较稳定</text><text x="220" y="338" text-anchor="middle" font-size="15">例：向量化数值计算</text>
+<rect x="420" y="135" width="260" height="260" rx="24" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="185" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">较低 IPC</text><text x="550" y="232" text-anchor="middle" font-size="16">等待内存</text><text x="550" y="264" text-anchor="middle" font-size="16">分支失败</text><text x="550" y="296" text-anchor="middle" font-size="16">锁或系统调用</text><text x="550" y="338" text-anchor="middle" font-size="15">例：随机访问 tokenizer</text>
+<rect x="750" y="135" width="260" height="260" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="880" y="185" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">解释规则</text><text x="880" y="232" text-anchor="middle" font-size="16">同机同负载比较</text><text x="880" y="264" text-anchor="middle" font-size="16">结合 miss / branch / cs</text><text x="880" y="296" text-anchor="middle" font-size="16">不要孤立下结论</text><text x="880" y="338" text-anchor="middle" font-size="15">IPC 是线索，不是判决</text>
+<path d="M350 265 L420 265" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><path d="M680 265 L750 265" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">低 IPC 常意味着 CPU 并没有有效执行指令，而是在等待某些资源。</div>
+</section>
+<pre><code># 只看 cycles / instructions / IPC
+perf stat -e cycles,instructions -p 12345 -- sleep 10
+
+# 每秒输出一次，观察抖动
+perf stat -I 1000 -e cycles,instructions -p 12345 -- sleep 10</code></pre>
+<table>
+<tr><th>现象</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td>IPC 明显降低，cache-misses 升高</td><td>内存访问局部性差，可能随机读、hash、解压、对象遍历。</td><td>看热点函数和数据结构，尝试批处理、缓存、向量化。</td></tr>
+<tr><td>IPC 低，context-switches 高</td><td>调度/锁/I/O 等待噪声。</td><td>按线程看，检查线程池、cgroup、锁和阻塞 I/O。</td></tr>
+<tr><td>instructions 增加但 IPC 稳定</td><td>代码路径变长，算法或序列化逻辑变重。</td><td>对比热点和调用次数，做 A/B perf record。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 缓存、分支、内存停顿指标</h2>
+<p>AI 前后处理常包含大量字符串、JSON、protobuf、图像解码、稀疏特征和随机索引访问。此类代码即使 CPU 使用率高，也可能被缓存缺失拖慢。</p>
+<pre><code># 通用缓存和分支事件
+perf stat -e cache-references,cache-misses,branches,branch-misses -p 12345 -- sleep 10
+
+# 进一步查看当前机器支持哪些事件
+perf list | grep -E 'cache|branch|stalled|mem-load' | head -80
+
+# 某些 CPU 支持更细的 top-down 指标
+perf stat -M TopdownL1 -p 12345 -- sleep 10</code></pre>
+<table>
+<tr><th>指标</th><th>解读</th><th>优化方向</th></tr>
+<tr><td><code>cache-misses</code></td><td>缓存未命中。比例高时 CPU 等内存。</td><td>提升局部性、减少对象分散、批量处理、避免随机访问。</td></tr>
+<tr><td><code>branch-misses</code></td><td>分支预测失败。复杂分支、数据相关分支会触发。</td><td>减少热路径条件分支，拆分冷热路径，表驱动或向量化。</td></tr>
+<tr><td><code>stalled-cycles-frontend</code></td><td>前端取指/解码停顿。</td><td>检查代码膨胀、i-cache、间接跳转和符号解释。</td></tr>
+<tr><td><code>stalled-cycles-backend</code></td><td>后端执行/内存等待停顿。</td><td>检查内存、依赖链、缓存 miss 和锁。</td></tr>
+</table>
+<div class="warn"><strong>平台差异：</strong> PMU 事件名、支持矩阵和派生指标随 CPU、内核、虚拟化环境变化。脚本里要检测 <code>perf list</code>，不要假设所有机器都有同名事件。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 上下文切换、迁移和调度噪声</h2>
+<p>AI 服务常使用多线程库：OpenMP、oneDNN、MKL、tokenizer 线程池、RPC worker、Python dataloader worker。线程过多或亲和性不当会造成频繁切换和 CPU 迁移，进而伤害 cache locality 和 p99。</p>
+<pre><code># 看调度相关事件
+perf stat -e context-switches,cpu-migrations,page-faults -p 12345 -- sleep 10
+
+# 线程级 CPU 使用和所在 CPU
+ps -L -p 12345 -o pid,tid,psr,pcpu,stat,comm
+
+# 记录调度事件，适合短窗口
+sudo perf sched record -p 12345 -- sleep 5
+sudo perf sched latency</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>处理思路</th></tr>
+<tr><td>context-switches 很高</td><td>线程池过大、锁竞争、阻塞 I/O、频繁 sleep/wakeup。</td><td>减少线程数、合并任务、检查锁和队列。</td></tr>
+<tr><td>cpu-migrations 很高</td><td>线程在 CPU 间移动，缓存热数据丢失。</td><td>CPU 亲和性、NUMA 绑定、合理 cgroup cpuset。</td></tr>
+<tr><td>page-faults 异常</td><td>内存映射、数据加载、缺页或内存压力。</td><td>预热、减少 mmap 抖动、检查内存和 swap。</td></tr>
+</table>
+<div class="note"><strong>AI 运行时提示：</strong> 同时设置 <code>OMP_NUM_THREADS</code>、<code>MKL_NUM_THREADS</code>、推理框架 intra/inter op 线程数时，要用实际吞吐和 perf 指标验证，默认值不一定适合容器 CPU 配额。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. perf top：线上实时热点观察</h2>
+<p><code>perf top</code> 类似“函数级 top”。它实时采样并显示最热符号，适合在故障现场快速判断热点是在业务代码、Python 解释器、native 库、内核网络栈还是内存分配器。</p>
+<pre><code># 系统级观察，通常需要权限
+sudo perf top
+
+# 限定进程，降低噪声
+sudo perf top -p 12345
+
+# 降低采样频率，减少生产开销
+sudo perf top -F 49 -p 12345
+
+# 只看某个线程
+sudo perf top -t 12378</code></pre>
+<table>
+<tr><th>热点样子</th><th>可能解释</th><th>下一步</th></tr>
+<tr><td><code>PyEval_EvalFrame...</code></td><td>Python 字节码执行占主导。</td><td>考虑 py-spy、cProfile、算法优化或迁移热路径。</td></tr>
+<tr><td><code>memcpy</code>/<code>memmove</code></td><td>大量拷贝。</td><td>检查 batch 拼接、序列化、tensor/array 复制。</td></tr>
+<tr><td><code>malloc</code>/<code>free</code>/<code>jemalloc</code></td><td>分配频繁或碎片。</td><td>对象复用、池化、批处理、检查 allocator。</td></tr>
+<tr><td><code>tcp_*</code>/<code>skb_*</code></td><td>内核网络栈开销。</td><td>结合 bpftrace、网络指标、批量发送和连接复用。</td></tr>
+</table>
+<div class="warn"><strong>使用建议：</strong> <code>perf top</code> 是现场观察工具，不适合长期跑。需要留证据、对比或离线分析时，用 <code>perf record</code>。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. perf record/report：离线采样定位</h2>
+<p><code>perf record</code> 把样本写入 <code>perf.data</code>，<code>perf report</code> 离线查看聚合结果。这是定位 CPU 热点的主力流程。</p>
+<section class="figure">
+<h3>流程图：从安全采样到可行动结论</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="perf record report 工作流">
+<rect x="20" y="20" width="1060" height="640" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="80" y="80" width="210" height="82" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="116" text-anchor="middle" font-size="20" font-weight="700">1. 短窗口 stat</text><text x="185" y="142" text-anchor="middle" font-size="14">确认是否值得采样</text>
+<rect x="350" y="80" width="210" height="82" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="455" y="116" text-anchor="middle" font-size="20" font-weight="700">2. 低频 record</text><text x="455" y="142" text-anchor="middle" font-size="14">-F 49/99，限制时长</text>
+<rect x="620" y="80" width="210" height="82" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="725" y="116" text-anchor="middle" font-size="20" font-weight="700">3. report</text><text x="725" y="142" text-anchor="middle" font-size="14">看 symbol + call graph</text>
+<rect x="430" y="250" width="240" height="86" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="286" text-anchor="middle" font-size="20" font-weight="700">4. 验证假设</text><text x="550" y="312" text-anchor="middle" font-size="14">业务指标 + 对比样本</text>
+<rect x="80" y="455" width="260" height="86" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="210" y="491" text-anchor="middle" font-size="20" font-weight="700">热点明确</text><text x="210" y="517" text-anchor="middle" font-size="14">优化代码/线程/数据布局</text>
+<rect x="430" y="455" width="260" height="86" rx="16" fill="#fef2f2" stroke="#fecaca"/><text x="560" y="491" text-anchor="middle" font-size="20" font-weight="700">符号缺失</text><text x="560" y="517" text-anchor="middle" font-size="14">补 debuginfo / frame pointer</text>
+<rect x="780" y="455" width="240" height="86" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="900" y="491" text-anchor="middle" font-size="20" font-weight="700">噪声过大</text><text x="900" y="517" text-anchor="middle" font-size="14">限定 PID/TID/CPU/窗口</text>
+<line x1="290" y1="121" x2="350" y2="121" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="560" y1="121" x2="620" y2="121" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M725 162 C725 205, 625 223, 580 250" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M550 336 C500 398, 285 410, 210 455" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M550 336 C555 392, 558 420, 560 455" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><path d="M550 336 C640 398, 825 410, 900 455" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">record/report 的关键是受控采样：限定对象、限定频率、限定时长、保留可复现实验条件。</div>
+</section>
+<pre><code># 对进程采样 30 秒，记录调用栈
+sudo perf record -F 99 -g -p 12345 -- sleep 30
+sudo perf report
+
+# 生成文本报告，适合保存到工单
+sudo perf report --stdio --no-children | head -120
+
+# 对一个命令采样
+perf record -F 99 -g -- python preprocess.py --input data.jsonl
+perf report --stdio
+
+# 指定输出文件，避免覆盖
+sudo perf record -o perf.train.data -F 99 -g -p 12345 -- sleep 30
+sudo perf report -i perf.train.data</code></pre>
+<div class="danger"><strong>生产警告：</strong> 不要直接用很高频率长时间采样，例如 <code>-F 9999</code> 跑数小时。先用 <code>-F 49</code> 或 <code>-F 99</code>、10 到 60 秒窗口验证开销和样本质量。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 调用栈、火焰图和符号化</h2>
+<p>没有调用栈时，你只能知道“哪个函数热”；有调用栈时，才能知道“它从哪条路径被调用”。AI Infra 中很多热点来自通用库，调用路径比单个符号更重要。</p>
+<table>
+<tr><th>选项</th><th>含义</th><th>适用场景</th></tr>
+<tr><td><code>-g</code></td><td>记录调用图，默认 unwind 方式由系统决定。</td><td>常规采样。</td></tr>
+<tr><td><code>--call-graph fp</code></td><td>使用 frame pointer 回溯。</td><td>二进制保留 frame pointer 时开销低、质量好。</td></tr>
+<tr><td><code>--call-graph dwarf</code></td><td>使用 DWARF 信息回溯。</td><td>frame pointer 缺失时尝试，但开销更高。</td></tr>
+<tr><td><code>--children</code></td><td>把子调用成本汇总到父节点。</td><td>看调用路径总成本。</td></tr>
+</table>
+<pre><code># frame pointer 栈，通常更稳
+sudo perf record -F 99 --call-graph fp -p 12345 -- sleep 30
+sudo perf report --stdio
+
+# 如果二进制省略 frame pointer，可尝试 DWARF，但要更短窗口
+sudo perf record -F 49 --call-graph dwarf,4096 -p 12345 -- sleep 15
+
+# 导出脚本格式，可交给火焰图工具链
+sudo perf script -i perf.data &gt; out.perf</code></pre>
+<div class="warn"><strong>符号 caveat：</strong> stripped 二进制、JIT、容器内路径不一致、缺少 debuginfo、未保留 frame pointer 都会让报告出现十六进制地址或错误调用栈。优化前先确认样本能被正确解释。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. Python 与 native 栈的 caveats</h2>
+<p><code>perf</code> 采样的是机器执行位置。对 Python 来说，它天然擅长看到解释器和 C/C++ 扩展，却不一定直接显示 Python 源码函数。AI 项目里热点常在 NumPy、PyTorch、tokenizers、protobuf、OpenCV、Pillow、zlib、jemalloc 或自定义 extension。</p>
+<pre><code># Python 进程 native 视角
+sudo perf record -F 99 -g -p "$(pgrep -n -f 'python.*serve.py')" -- sleep 30
+sudo perf report --stdio
+
+# Python 3.12+ 可关注系统是否启用 perf map 支持
+python -X perf -c 'import time; time.sleep(1)'
+
+# 对纯 Python 热点，py-spy 往往更直接
+py-spy top --pid 12345
+py-spy record -o profile.svg --pid 12345 --duration 30</code></pre>
+<table>
+<tr><th>报告看到</th><th>含义</th><th>怎么继续</th></tr>
+<tr><td><code>PyEval_EvalFrameDefault</code></td><td>大量时间在 Python 解释器执行。</td><td>用 py-spy/cProfile 定位 Python 函数，再考虑批量化或 native 化。</td></tr>
+<tr><td><code>libtorch_cpu.so</code>/<code>libmkl</code></td><td>时间在 native 数值库。</td><td>检查线程数、输入形状、算子选择、NUMA 和 BLAS 配置。</td></tr>
+<tr><td><code>tokenizers</code>/<code>regex</code></td><td>文本处理或正则热点。</td><td>批量 tokenize、缓存、减少重复 normalize。</td></tr>
+<tr><td>大量 <code>[unknown]</code></td><td>符号或 unwind 信息缺失。</td><td>补 debuginfo、perf map、frame pointer，缩小采样对象。</td></tr>
+</table>
+<div class="note"><strong>实战规则：</strong> Python 业务逻辑用 py-spy 更快；native CPU 瓶颈、内核、cache/IPC 用 perf 更强。两者经常要一起用。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 容器和 Kubernetes 中使用 perf</h2>
+<p>容器不是独立内核，<code>perf</code> 仍然依赖宿主机内核权限和 perf_events。最稳妥的方式通常是在宿主机或特权 debug 容器中对目标 PID 采样，同时处理 namespace、符号路径和 securityContext。</p>
+<pre><code># 宿主机上找容器进程
+ps aux | grep 'python.*serve.py'
+sudo perf stat -p 12345 -- sleep 10
+
+# 容器内可能需要挂载 perf_event 和放开能力，具体由平台策略控制
+docker run --rm -it --privileged --pid=host ubuntu:24.04 bash
+
+# Kubernetes 临时 debug 容器示意：是否可用取决于集群策略
+kubectl debug node/NODE_NAME -it --image=ubuntu:24.04 --privileged</code></pre>
+<table>
+<tr><th>问题</th><th>症状</th><th>处理</th></tr>
+<tr><td>权限不足</td><td><code>Operation not permitted</code></td><td>检查 <code>perf_event_paranoid</code>、capability、seccomp、privileged。</td></tr>
+<tr><td>PID namespace</td><td>容器内 PID 与宿主机 PID 不一致。</td><td>用宿主机 PID，或 <code>--pid=host</code> debug。</td></tr>
+<tr><td>符号路径</td><td>报告只有地址或找不到库。</td><td>保存容器镜像、rootfs、debuginfo，使用同版本二进制分析。</td></tr>
+<tr><td>cgroup CPU 配额</td><td>CPU 利用率和 task-clock 难解释。</td><td>结合 cgroup quota、cpuset 和 throttling 指标。</td></tr>
+</table>
+<div class="danger"><strong>平台安全：</strong> <code>--privileged</code>、<code>hostPID</code>、放开 seccomp 都是高权限操作。生产集群应通过标准 debug 流程申请，并采样最小时间窗口。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. AI 训练/推理服务案例</h2>
+<p>下面是一个可复用的定位路径：先确认 GPU 等 CPU，接着用 <code>perf stat</code> 判断 CPU 效率，再用 <code>record/report</code> 找具体函数。</p>
+<div class="grid-2">
+<div class="card"><strong>训练 dataloader 吞吐低</strong><br>现象：GPU 利用率周期性掉到 30%，CPU 有几个 worker 很忙。perf 显示 <code>jpeg</code> 解码、<code>memcpy</code> 和 Python pickle 热。处理：增加预解码缓存、减少进程间拷贝、调 batch 拼接逻辑。</div>
+<div class="card"><strong>推理 p99 抖动</strong><br>现象：平均延迟正常，尾延迟高。perf stat 显示 migrations 和 context switches 高，report 显示日志格式化和内核网络栈热点。处理：线程绑定、降低日志热路径、批量发送。</div>
+</div>
+<pre><code># 案例模板：固定窗口收集
+PID=$(pgrep -n -f 'python.*serve.py')
+date
+perf stat -d -d -d -p "$PID" -- sleep 20
+sudo perf record -o perf.$PID.data -F 99 --call-graph fp -p "$PID" -- sleep 30
+sudo perf report -i perf.$PID.data --stdio --no-children | head -160
+
+# 对比优化前后，至少记录业务吞吐和 perf 指标
+printf 'qps=%s p50=%s p99=%s\n' "$QPS" "$P50" "$P99"</code></pre>
+<table>
+<tr><th>优化假设</th><th>perf 证据</th><th>成功标准</th></tr>
+<tr><td>减少 tokenizer 重复工作</td><td>tokenizer 符号样本占比下降，instructions/request 下降。</td><td>同输入下 QPS 上升，CPU 核数不增加。</td></tr>
+<tr><td>降低线程池过度并发</td><td>context-switches 和 migrations 下降。</td><td>p99 改善，吞吐不下降。</td></tr>
+<tr><td>减少数据拷贝</td><td><code>memcpy</code> 样本占比下降。</td><td>CPU 时间下降，端到端延迟下降。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. perf vs py-spy vs bpftrace</h2>
+<p>这些工具不是互相替代，而是观测层次不同。选择工具时先问：我要看 Python 函数、native CPU 热点，还是内核事件和动态追踪？</p>
+<section class="figure">
+<h3>对比图：三类工具的最佳使用区间</h3>
+<svg viewBox="0 0 1100 610" width="100%" role="img" aria-label="perf py-spy bpftrace 对比">
+<rect x="20" y="20" width="1060" height="570" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">选择工具：先选观测层</text>
+<rect x="80" y="135" width="280" height="310" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="220" y="185" text-anchor="middle" font-size="25" font-weight="700" fill="#1d4ed8">perf</text><text x="220" y="232" text-anchor="middle" font-size="16">CPU/PMU/native/内核</text><text x="220" y="268" text-anchor="middle" font-size="15">IPC、cycles、cache misses</text><text x="220" y="300" text-anchor="middle" font-size="15">record/report 调用栈</text><text x="220" y="350" text-anchor="middle" font-size="15">适合：系统级 CPU 瓶颈</text>
+<rect x="410" y="135" width="280" height="310" rx="24" fill="#dcfce7" stroke="#86efac"/><text x="550" y="185" text-anchor="middle" font-size="25" font-weight="700" fill="#166534">py-spy</text><text x="550" y="232" text-anchor="middle" font-size="16">Python 函数采样</text><text x="550" y="268" text-anchor="middle" font-size="15">无需改代码，低侵入</text><text x="550" y="300" text-anchor="middle" font-size="15">直接生成 Python 火焰图</text><text x="550" y="350" text-anchor="middle" font-size="15">适合：纯 Python 热点</text>
+<rect x="740" y="135" width="280" height="310" rx="24" fill="#ffedd5" stroke="#fdba74"/><text x="880" y="185" text-anchor="middle" font-size="25" font-weight="700" fill="#c2410c">bpftrace</text><text x="880" y="232" text-anchor="middle" font-size="16">动态内核/eBPF 追踪</text><text x="880" y="268" text-anchor="middle" font-size="15">系统调用、锁、网络、I/O</text><text x="880" y="300" text-anchor="middle" font-size="15">按条件聚合事件</text><text x="880" y="350" text-anchor="middle" font-size="15">适合：为什么在等</text>
+<rect x="250" y="500" width="600" height="52" rx="12" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="533" text-anchor="middle" font-size="17">常见组合：py-spy 找 Python 路径，perf 找 native/PMU，bpftrace 解释内核等待</text>
+</svg>
+<div class="caption">AI Infra 排障经常需要组合工具，而不是期待单个工具给出完整答案。</div>
+</section>
+<table>
+<tr><th>工具</th><th>强项</th><th>弱项</th><th>优先场景</th></tr>
+<tr><td><code>perf</code></td><td>CPU 硬件事件、native 栈、内核栈、低层热点。</td><td>Python 源码函数不总是直观，权限和符号复杂。</td><td>CPU 高、IPC 低、cache miss、native 扩展。</td></tr>
+<tr><td><code>py-spy</code></td><td>Python 函数采样，使用简单，火焰图直观。</td><td>看不到完整 PMU 指标，native 细节有限。</td><td>Python 业务逻辑慢、GIL/线程状态观察。</td></tr>
+<tr><td><code>bpftrace</code></td><td>动态追踪内核/用户事件，按条件聚合。</td><td>脚本能力要求高，生产安全策略更严格。</td><td>系统调用、网络、I/O、锁、调度等待。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 生产安全、开销和数据治理</h2>
+<p><code>perf</code> 是强观测工具，也有成本和数据风险。生产使用要遵循最小权限、最小范围、最短时间、可审计留痕。</p>
+<section class="figure">
+<h3>安全图：生产 perf 的四道闸</h3>
+<svg viewBox="0 0 1100 610" width="100%" role="img" aria-label="perf 生产安全流程">
+<rect x="20" y="20" width="1060" height="570" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">生产采样前的四道闸</text>
+<rect x="95" y="145" width="190" height="210" rx="22" fill="#dbeafe" stroke="#93c5fd"/><text x="190" y="190" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">权限</text><text x="190" y="238" text-anchor="middle" font-size="15">谁能采样</text><text x="190" y="268" text-anchor="middle" font-size="15">采哪个进程</text><text x="190" y="298" text-anchor="middle" font-size="15">是否需要 sudo</text>
+<rect x="335" y="145" width="190" height="210" rx="22" fill="#dcfce7" stroke="#86efac"/><text x="430" y="190" text-anchor="middle" font-size="21" font-weight="700" fill="#166534">范围</text><text x="430" y="238" text-anchor="middle" font-size="15">限定 PID/TID</text><text x="430" y="268" text-anchor="middle" font-size="15">限定 CPU</text><text x="430" y="298" text-anchor="middle" font-size="15">限定容器</text>
+<rect x="575" y="145" width="190" height="210" rx="22" fill="#ffedd5" stroke="#fdba74"/><text x="670" y="190" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">开销</text><text x="670" y="238" text-anchor="middle" font-size="15">低采样频率</text><text x="670" y="268" text-anchor="middle" font-size="15">短窗口</text><text x="670" y="298" text-anchor="middle" font-size="15">避开高峰</text>
+<rect x="815" y="145" width="190" height="210" rx="22" fill="#fef2f2" stroke="#fecaca"/><text x="910" y="190" text-anchor="middle" font-size="21" font-weight="700" fill="#b91c1c">数据</text><text x="910" y="238" text-anchor="middle" font-size="15">符号/路径敏感</text><text x="910" y="268" text-anchor="middle" font-size="15">报告脱敏</text><text x="910" y="298" text-anchor="middle" font-size="15">按策略留存</text>
+<rect x="260" y="455" width="580" height="62" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="493" text-anchor="middle" font-size="18">默认安全模板：perf stat 10s → record -F 49/99 30s → report 文本脱敏归档</text>
+</svg>
+<div class="caption">生产 perf 的目标是回答一个具体问题，而不是“先抓一堆数据再说”。</div>
+</section>
+<pre><code># 推荐：先计数，再短采样
+perf stat -p 12345 -- sleep 10
+sudo perf record -F 49 --call-graph fp -p 12345 -- sleep 30
+
+# 限定输出并记录元信息
+uname -a &gt; perf.context.txt
+perf --version &gt;&gt; perf.context.txt
+sudo perf report --stdio -i perf.data &gt; perf.report.txt</code></pre>
+<div class="danger"><strong>不要做：</strong> 不要在多租户机器系统级高频采样；不要采不相关租户进程；不要把包含内部路径、函数名、用户参数的报告公开粘贴到外部系统。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 常见错误与排障清单</h2>
+<table>
+<tr><th>错误/现象</th><th>可能原因</th><th>解决办法</th></tr>
+<tr><td><code>No permission to enable cycles event</code></td><td><code>perf_event_paranoid</code> 或 capability 限制。</td><td>查看 sysctl，按平台流程申请权限，或先采自身进程/命令。</td></tr>
+<tr><td><code>perf.data</code> 很大</td><td>采样频率高、窗口长、DWARF 栈大。</td><td>降低 <code>-F</code>、缩短时间、限定 PID/TID、用 frame pointer。</td></tr>
+<tr><td>大量 <code>[unknown]</code></td><td>符号缺失、JIT、容器路径不一致、stripped 二进制。</td><td>安装 debuginfo，保留镜像 rootfs，启用 perf map/frame pointer。</td></tr>
+<tr><td>报告热点全是 <code>perf</code> 或系统噪声</td><td>没有限定目标，系统级采样混入其他负载。</td><td>使用 <code>-p</code>、<code>-t</code>、<code>-C</code> 限定对象。</td></tr>
+<tr><td>IPC 解释不一致</td><td>不同 CPU、频率、输入、容器 quota 或虚拟化影响。</td><td>同机同条件对比，记录上下文，结合业务指标。</td></tr>
+<tr><td><code>cycles</code> 事件不可用</td><td>虚拟机未暴露 PMU，云厂商限制。</td><td>尝试软件事件，换宿主机/实例规格，或使用云平台 profiling。</td></tr>
+</table>
+<pre><code># 常用排障命令
+perf list | head
+cat /proc/sys/kernel/perf_event_paranoid
+cat /proc/sys/kernel/kptr_restrict
+ldd /proc/12345/exe 2&gt;/dev/null || true
+readelf -Ws /path/to/lib.so | head
+
+# 检查机器和负载上下文
+uname -a
+lscpu
+numactl --hardware 2&gt;/dev/null || true
+cat /sys/fs/cgroup/cpu.max 2&gt;/dev/null || true</code></pre>
+<div class="note"><strong>排障顺序：</strong> 先解决权限，再解决目标范围，再解决符号，最后解释指标。顺序反了很容易把噪声当结论。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 参考命令速查与学习路线</h2>
+<div class="grid-3">
+<div class="card"><strong>第一阶段：会看整体</strong><br><code>perf stat</code>、<code>task-clock</code>、<code>IPC</code>、context switches、cache misses。</div>
+<div class="card"><strong>第二阶段：会找热点</strong><br><code>perf top</code>、<code>perf record -g</code>、<code>perf report</code>、符号和调用栈。</div>
+<div class="card"><strong>第三阶段：会解释系统</strong><br>PMU 事件、调度、NUMA、容器、Python/native 栈、与 eBPF 工具组合。</div>
+</div>
+<table>
+<tr><th>目标</th><th>命令</th></tr>
+<tr><td>列出事件</td><td><code>perf list</code></td></tr>
+<tr><td>统计命令</td><td><code>perf stat -- CMD</code></td></tr>
+<tr><td>统计进程</td><td><code>perf stat -p PID -- sleep 10</code></td></tr>
+<tr><td>实时热点</td><td><code>sudo perf top -p PID</code></td></tr>
+<tr><td>采样热点</td><td><code>sudo perf record -F 99 -g -p PID -- sleep 30</code></td></tr>
+<tr><td>查看报告</td><td><code>sudo perf report --stdio</code></td></tr>
+<tr><td>导出脚本</td><td><code>sudo perf script -i perf.data &gt; out.perf</code></td></tr>
+</table>
+<pre><code># 一个保守、可复用的 AI 服务 CPU 排障模板
+PID=$(pgrep -n -f 'python.*serve.py')
+perf stat -d -d -d -p "$PID" -- sleep 15
+sudo perf record -o perf.$PID.data -F 99 --call-graph fp -p "$PID" -- sleep 30
+sudo perf report -i perf.$PID.data --stdio --no-children | head -160</code></pre>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<ul>
+<li><code>man perf</code>、<code>man perf-stat</code>、<code>man perf-record</code>、<code>man perf-report</code>、<code>man perf-top</code>。</li>
+<li>Linux kernel documentation: perf events, perf-security, sysctl kernel perf_event_paranoid。</li>
+<li>Brendan Gregg 的 Linux perf、CPU profiling、flame graph 公开资料。</li>
+<li>Python 官方文档中关于 Python perf profiler 支持、解释器栈与 native profiling 的说明。</li>
+<li>发行版文档：Ubuntu linux-tools、RHEL/CentOS perf、Kubernetes debug container 与安全上下文文档。</li>
+</ul>
+<div class="note"><strong>阅读建议：</strong> 学 perf 不要从 PMU 全量事件表开始。先能稳定回答三个问题：CPU 是否有效做工？热点函数在哪里？采样结论是否可靠？</div>
+</section>
+
+<div class="footer">perf AI Infra/Linux 命令教程 · 单文件 HTML · 适合复制到离线文档或内部知识库</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>rsync 深度教程：从同步模型到安全增量备份</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>rsync 深度教程：从同步模型到安全增量备份</h1>
+<p class="sub">这份教程按 Linux 常用命令 <code>rsync</code> 讲解。它不是选项速查表，而是从“源端、目标端、文件列表、增量传输、删除策略”这个心智模型出发，系统讲清楚：源路径与目标路径、结尾斜杠语义、归档模式、dry-run、删除安全、SSH 传输、包含与排除规则、断点续传、备份策略、与 <code>scp</code>/<code>cp</code> 的边界，以及真实运维中的排障流程。</p>
+<div class="chips"><span class="chip">信息图</span><span class="chip">增量同步</span><span class="chip">源/目标模型</span><span class="chip">结尾斜杠</span><span class="chip">archive mode</span><span class="chip">dry-run</span><span class="chip">--delete 安全</span><span class="chip">SSH</span><span class="chip">include/exclude</span><span class="chip">备份</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>rsync</code> 是“让目标端变得像源端”的同步工具；它先构建文件列表，再只传输必要差异，因此特别适合重复同步、远程部署和增量备份。</div>
+<div class="success"><strong>最重要原则：</strong> 第一次写命令或涉及 <code>--delete</code>、覆盖、批量排除时，先加 <code>-n</code>/<code>--dry-run</code> 和 <code>-i</code>/<code>--itemize-changes</code> 看清楚会发生什么，再执行真实同步。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">rsync 是什么</a></li>
+<li><a class="anchor" href="#s2">核心模型：源端、目标端、文件列表、差异</a></li>
+<li><a class="anchor" href="#s3">基本语法与第一次同步</a></li>
+<li><a class="anchor" href="#s4">源/目标路径与结尾斜杠语义</a></li>
+<li><a class="anchor" href="#s5">归档模式 -a 到底包含什么</a></li>
+<li><a class="anchor" href="#s6">dry-run 与变更明细</a></li>
+<li><a class="anchor" href="#s7">删除安全：--delete 不是清理按钮</a></li>
+<li><a class="anchor" href="#s8">SSH 传输与远程路径</a></li>
+<li><a class="anchor" href="#s9">include/exclude 过滤规则</a></li>
+<li><a class="anchor" href="#s10">断点续传与部分文件</a></li>
+<li><a class="anchor" href="#s11">备份、快照与回滚</a></li>
+<li><a class="anchor" href="#s12">权限、属主、时间戳与链接</a></li>
+<li><a class="anchor" href="#s13">性能、带宽与大目录优化</a></li>
+<li><a class="anchor" href="#s14">rsync vs scp vs cp</a></li>
+<li><a class="anchor" href="#s15">部署与备份的安全工作流</a></li>
+<li><a class="anchor" href="#s16">常见故障与排障</a></li>
+<li><a class="anchor" href="#s17">脚本化、定时任务与日志</a></li>
+<li><a class="anchor" href="#s18">学习路线与练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. rsync 是什么</h2>
+<p><code>rsync</code> 用于在本机目录之间、主机之间、或通过 rsync daemon 同步文件。它的价值不只是“复制文件”，而是“可重复地同步目录状态”：已经相同的文件不会重复传，发生变化的文件只传必要内容，目标端可按规则新增、更新、删除或保留文件。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>增量备份、发布静态文件、同步大目录、保留权限和时间戳、通过 SSH 安全传输、按规则排除缓存和构建产物。</div>
+<div class="card"><strong>它不擅长什么</strong><br>双向冲突合并、数据库热备、对象存储语义、实时同步、跨平台复杂权限映射。需要这些能力时应使用专门工具。</div>
+<div class="card"><strong>它的本质</strong><br>比较源端与目标端，决定哪些文件需要创建、更新、删除或跳过，然后按选项执行。</div>
+</div>
+<pre><code># 本机目录同步：把 src/ 的内容同步到 dst/
+rsync -av src/ dst/
+
+# 远程同步：把本机 public/ 发布到服务器
+rsync -avz public/ deploy@example.com:/var/www/site/
+
+# 先预演，再执行
+rsync -avni src/ dst/
+rsync -avi src/ dst/</code></pre>
+<div class="warn"><strong>关键区别：</strong> <code>rsync</code> 默认不会删除目标端多出来的文件；只有显式使用 <code>--delete</code> 及相关选项时才会让目标目录更严格地镜像源目录。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：rsync 的整体心智模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="rsync 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="90" width="210" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="160" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">源端</text><text x="160" y="165" text-anchor="middle" font-size="15">source</text><text x="160" y="190" text-anchor="middle" font-size="15">真实想复制的内容</text>
+<rect x="320" y="90" width="210" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">文件列表</text><text x="425" y="165" text-anchor="middle" font-size="15">递归扫描</text><text x="425" y="190" text-anchor="middle" font-size="15">应用过滤规则</text>
+<rect x="585" y="90" width="210" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="690" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#0f766e">差异判断</text><text x="690" y="165" text-anchor="middle" font-size="15">大小 / 时间 / 校验</text><text x="690" y="190" text-anchor="middle" font-size="15">决定传或跳过</text>
+<rect x="850" y="90" width="210" height="120" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="955" y="132" text-anchor="middle" font-size="24" font-weight="700" fill="#c2410c">目标端</text><text x="955" y="165" text-anchor="middle" font-size="15">destination</text><text x="955" y="190" text-anchor="middle" font-size="15">被更新的位置</text>
+<rect x="145" y="330" width="810" height="155" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="370" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">rsync = 状态同步 + 增量传输 + 可控删除</text><text x="550" y="412" text-anchor="middle" font-size="16">rsync -av src/ dst/：把 src/ 里面的内容同步到 dst/</text><text x="550" y="444" text-anchor="middle" font-size="16">rsync -av --delete src/ dst/：目标端额外文件也会被删除</text>
+<line x1="265" y1="150" x2="320" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="530" y1="150" x2="585" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="795" y1="150" x2="850" y2="150" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">学习 rsync 时先问四个问题：源是什么、目标是什么、哪些文件进入文件列表、目标端多余文件如何处理。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 基本语法与第一次同步</h2>
+<pre><code>rsync [options] SOURCE... DESTINATION
+
+# SOURCE 可以是本地路径，也可以是 user@host:/path/
+# DESTINATION 可以是本地路径，也可以是 user@host:/path/
+# 常用组合：-a 归档，-v 详细，-n dry-run，-i 显示变更类型</code></pre>
+<table><tr><th>命令</th><th>实际效果</th></tr>
+<tr><td><code>rsync -av src/ dst/</code></td><td>把 <code>src/</code> 里面的内容同步到 <code>dst/</code>，保留常见元数据。</td></tr>
+<tr><td><code>rsync -avn src/ dst/</code></td><td>预演同步，不真正写入目标端。</td></tr>
+<tr><td><code>rsync -avi src/ dst/</code></td><td>执行同步，并显示每个变更项的类型。</td></tr>
+<tr><td><code>rsync -avz src/ user@host:/backup/src/</code></td><td>通过 SSH 传输到远程主机，压缩传输数据。</td></tr>
+</table>
+<h3>最小可验证示例</h3>
+<pre><code>mkdir -p /tmp/rsync-demo/src /tmp/rsync-demo/dst
+printf 'hello\n' &gt; /tmp/rsync-demo/src/a.txt
+
+# 先看会发生什么
+rsync -avni /tmp/rsync-demo/src/ /tmp/rsync-demo/dst/
+
+# 确认后执行
+rsync -avi /tmp/rsync-demo/src/ /tmp/rsync-demo/dst/</code></pre>
+<div class="note"><strong>输出习惯：</strong> 真实工作中推荐把 <code>-a</code>、<code>-n</code>、<code>-i</code> 连起来用：<code>-ani</code> 先看计划，确认后去掉 <code>n</code>。</div>
+</section>
+
+<section class="figure" id="s4">
+<h3>信息图：结尾斜杠决定“复制目录本身”还是“复制目录内容”</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="rsync 结尾斜杠语义">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="26" font-weight="700">SOURCE 末尾的 / 是 rsync 最重要的语义之一</text>
+<rect x="70" y="125" width="455" height="470" rx="22" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="297" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">rsync -a src dst/</text>
+<text x="297" y="203" text-anchor="middle" font-size="16">复制 src 这个目录本身</text>
+<rect x="130" y="250" width="145" height="58" rx="10" fill="#fff" stroke="#93c5fd"/><text x="202" y="286" text-anchor="middle" font-size="16">src/</text>
+<rect x="160" y="335" width="125" height="46" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="222" y="364" text-anchor="middle" font-size="14">a.txt</text>
+<rect x="160" y="395" width="125" height="46" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="222" y="424" text-anchor="middle" font-size="14">img/</text>
+<line x1="290" y1="280" x2="365" y2="280" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<rect x="370" y="250" width="105" height="58" rx="10" fill="#fff" stroke="#93c5fd"/><text x="423" y="286" text-anchor="middle" font-size="16">dst/</text>
+<rect x="390" y="335" width="70" height="46" rx="8" fill="#ccfbf1" stroke="#99f6e4"/><text x="425" y="364" text-anchor="middle" font-size="14">src/</text>
+<text x="297" y="520" text-anchor="middle" font-size="15">结果：dst/src/a.txt</text>
+<rect x="575" y="125" width="455" height="470" rx="22" fill="#ffedd5" stroke="#fdba74"/>
+<text x="802" y="168" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">rsync -a src/ dst/</text>
+<text x="802" y="203" text-anchor="middle" font-size="16">复制 src 里面的内容</text>
+<rect x="635" y="250" width="145" height="58" rx="10" fill="#fff" stroke="#fdba74"/><text x="707" y="286" text-anchor="middle" font-size="16">src/</text>
+<rect x="665" y="335" width="125" height="46" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="727" y="364" text-anchor="middle" font-size="14">a.txt</text>
+<rect x="665" y="395" width="125" height="46" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="727" y="424" text-anchor="middle" font-size="14">img/</text>
+<line x1="800" y1="280" x2="870" y2="280" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<rect x="875" y="250" width="105" height="58" rx="10" fill="#fff" stroke="#fdba74"/><text x="928" y="286" text-anchor="middle" font-size="16">dst/</text>
+<rect x="885" y="335" width="85" height="46" rx="8" fill="#ccfbf1" stroke="#99f6e4"/><text x="927" y="364" text-anchor="middle" font-size="14">a.txt</text>
+<rect x="885" y="395" width="85" height="46" rx="8" fill="#ccfbf1" stroke="#99f6e4"/><text x="927" y="424" text-anchor="middle" font-size="14">img/</text>
+<text x="802" y="520" text-anchor="middle" font-size="15">结果：dst/a.txt</text>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">斜杠只影响源路径的解释；目标路径末尾加不加斜杠通常不是同等风险点。新手最常见事故就是把 <code>src</code> 和 <code>src/</code> 混淆。</div></section>
+
+<section class="section">
+<h2>3. 源/目标路径与结尾斜杠语义</h2>
+<p><code>rsync</code> 的路径语义必须死记一个规则：源路径末尾有 <code>/</code>，表示同步“目录里的内容”；源路径末尾没有 <code>/</code>，表示同步“这个目录本身”。</p>
+<table><tr><th>命令</th><th>源端含义</th><th>目标结果</th></tr>
+<tr><td><code>rsync -a project backup/</code></td><td>复制 <code>project</code> 目录本身</td><td><code>backup/project/...</code></td></tr>
+<tr><td><code>rsync -a project/ backup/</code></td><td>复制 <code>project/</code> 内部内容</td><td><code>backup/...</code></td></tr>
+<tr><td><code>rsync -a file.txt backup/</code></td><td>复制单个文件</td><td><code>backup/file.txt</code></td></tr>
+<tr><td><code>rsync -a file.txt backup/name.txt</code></td><td>复制并改目标文件名</td><td><code>backup/name.txt</code></td></tr>
+</table>
+<pre><code># 推荐先用 tree 或 find 看结构
+find src -maxdepth 2 -print
+
+# 预演两种写法的差异
+rsync -avni src dst/
+rsync -avni src/ dst/</code></pre>
+<div class="danger"><strong>危险组合：</strong> <code>rsync -a --delete empty-dir/ important-dir/</code> 会把目标目录同步成空目录。涉及 <code>--delete</code> 时，结尾斜杠不是小细节，而是安全边界。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 归档模式 <code>-a</code> 到底包含什么</h2>
+<p><code>-a</code> 是 <code>--archive</code>，可理解为“递归同步并尽量保留文件元数据”。它常用于备份和部署，因为它比裸 <code>rsync src/ dst/</code> 更接近复制目录树的真实状态。</p>
+<table><tr><th>等价子选项</th><th>含义</th><th>注意</th></tr>
+<tr><td><code>-r</code></td><td>递归进入目录</td><td>同步目录树必需。</td></tr>
+<tr><td><code>-l</code></td><td>保留符号链接</td><td>链接作为链接复制，而不是跟随到目标文件。</td></tr>
+<tr><td><code>-p</code></td><td>保留权限位</td><td>远程用户需要有相应权限。</td></tr>
+<tr><td><code>-t</code></td><td>保留修改时间</td><td>影响后续增量判断。</td></tr>
+<tr><td><code>-g</code></td><td>保留组</td><td>非 root 用户可能无法完整保留。</td></tr>
+<tr><td><code>-o</code></td><td>保留属主</td><td>通常只有 root 能完整保留。</td></tr>
+<tr><td><code>-D</code></td><td>保留设备文件和特殊文件</td><td>常见于系统备份，普通部署较少关心。</td></tr>
+</table>
+<pre><code># 常见部署：保留时间、权限、链接，并输出详细信息
+rsync -av public/ deploy@example.com:/var/www/site/
+
+# 如果不想保留属主和组，可显式调整
+rsync -av --no-owner --no-group public/ deploy@example.com:/var/www/site/</code></pre>
+<div class="note"><strong>实践建议：</strong> 日常目录同步优先从 <code>-a</code> 起步，再按目标环境去掉不适合的元数据保留项。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. dry-run 与变更明细</h2>
+<p><code>-n</code>/<code>--dry-run</code> 表示只计算和展示计划，不真正改目标端。<code>-i</code>/<code>--itemize-changes</code> 会展示每个文件的变化类型，是理解 rsync 行为的关键诊断工具。</p>
+<pre><code># 最推荐的预演组合
+rsync -avni src/ dst/
+
+# 看统计信息
+rsync -avnih --stats src/ dst/
+
+# 只看哪些文件会变化
+rsync -avni src/ dst/ | sed -n '/^[&gt;&lt;ch.*]/p'</code></pre>
+<table><tr><th>itemize 片段</th><th>大致含义</th><th>解释方式</th></tr>
+<tr><td><code>&gt;f+++++++++</code></td><td>目标端新增普通文件</td><td><code>&gt;</code> 表示发送到目标，<code>f</code> 表示文件。</td></tr>
+<tr><td><code>&gt;f.st......</code></td><td>文件大小或时间变化</td><td>常见于内容更新。</td></tr>
+<tr><td><code>.d..t......</code></td><td>目录时间戳变化</td><td>通常不是内容风险。</td></tr>
+<tr><td><code>*deleting</code></td><td>将删除目标端文件</td><td>只在启用删除类选项时出现，必须重点检查。</td></tr>
+</table>
+<div class="success"><strong>工作习惯：</strong> 把 <code>rsync -avni ...</code> 当成“同步计划审查”，而不是可有可无的预览。</div>
+</section>
+
+<section class="figure" id="s7">
+<h3>安全流程图：涉及 --delete 时必须先预演</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="rsync delete 安全流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="405" y="45" width="290" height="70" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="88" text-anchor="middle" font-size="22" font-weight="700">准备使用 --delete</text>
+<polygon points="550,160 720,245 550,330 380,245" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="238" text-anchor="middle" font-size="17" font-weight="700">源路径和目标路径确认了吗？</text><text x="550" y="264" text-anchor="middle" font-size="14">尤其是源路径末尾 /</text>
+<rect x="115" y="205" width="220" height="80" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="225" y="238" text-anchor="middle" font-size="17" font-weight="700" fill="#b91c1c">停止</text><text x="225" y="264" text-anchor="middle" font-size="14">先检查路径</text>
+<rect x="765" y="205" width="230" height="80" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="880" y="238" text-anchor="middle" font-size="17" font-weight="700">运行 dry-run</text><text x="880" y="264" text-anchor="middle" font-size="14">rsync -avni --delete</text>
+<rect x="750" y="380" width="260" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="880" y="414" text-anchor="middle" font-size="17" font-weight="700">审查 *deleting</text><text x="880" y="442" text-anchor="middle" font-size="14">确认每个删除合理</text>
+<rect x="435" y="530" width="230" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="550" y="564" text-anchor="middle" font-size="17" font-weight="700">去掉 -n 执行</text><text x="550" y="592" text-anchor="middle" font-size="14">保留日志和回滚点</text>
+<line x1="550" y1="115" x2="550" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<line x1="380" y1="245" x2="335" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="350" y="226" font-size="14">否</text>
+<line x1="720" y1="245" x2="765" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><text x="742" y="226" font-size="14">是</text>
+<line x1="880" y1="285" x2="880" y2="380" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<path d="M880 466 C835 520, 720 560, 665 573" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption"><code>--delete</code> 是让目标端更像源端的工具，不是“删除旧垃圾”的万能按钮。源端少了什么，目标端就可能被删什么。</div></section>
+
+<section class="section">
+<h2>6. 删除安全：<code>--delete</code> 不是清理按钮</h2>
+<p>默认情况下，目标端存在但源端不存在的文件会保留。加入 <code>--delete</code> 后，rsync 会删除目标端额外文件，使目标端更接近源端镜像。它非常有用，也非常危险。</p>
+<pre><code># 安全写法：先预演删除
+rsync -avni --delete src/ dst/
+
+# 重点看 *deleting 行；确认后才执行
+rsync -avi --delete src/ dst/</code></pre>
+<table><tr><th>选项</th><th>作用</th><th>适用场景</th></tr>
+<tr><td><code>--delete</code></td><td>删除目标端多余文件</td><td>镜像目录、静态站发布。</td></tr>
+<tr><td><code>--delete-excluded</code></td><td>目标端中被排除规则匹配的文件也删除</td><td>需要严格清理目标端缓存时使用，风险更高。</td></tr>
+<tr><td><code>--max-delete=N</code></td><td>限制最多删除 N 个文件</td><td>为自动任务增加保险丝。</td></tr>
+<tr><td><code>--backup --backup-dir=DIR</code></td><td>删除或覆盖前把旧文件移到备份目录</td><td>需要可回滚同步。</td></tr>
+</table>
+<div class="danger"><strong>生产警告：</strong> 自动化脚本里使用 <code>--delete</code> 时，建议加 <code>--max-delete</code>、日志、告警和备份目录。不要让一个空源目录把目标备份清空。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. SSH 传输与远程路径</h2>
+<p>最常见的远程模式是通过 SSH：<code>user@host:/path/</code>。这时认证、端口、密钥、远程目录权限都由 SSH 和远程系统决定。</p>
+<pre><code># 从本机推送到远程
+rsync -avz public/ deploy@example.com:/var/www/site/
+
+# 从远程拉取到本机
+rsync -avz deploy@example.com:/var/log/nginx/ ./nginx-logs/
+
+# 指定 SSH 端口和密钥
+rsync -avz -e 'ssh -p 2222 -i ~/.ssh/deploy_key' public/ deploy@example.com:/var/www/site/
+
+# 保留远程相对路径结构
+rsync -avR deploy@example.com:/etc/nginx/nginx.conf ./backup/</code></pre>
+<div class="grid-3">
+<div class="card"><strong>推送</strong><br><code>local/ user@host:/remote/</code><br>常用于部署。</div>
+<div class="card"><strong>拉取</strong><br><code>user@host:/remote/ local/</code><br>常用于集中备份。</div>
+<div class="card"><strong>远程到远程</strong><br>不建议初学者直接使用；先同步到中间机或在源端运行命令更可控。</div>
+</div>
+<div class="warn"><strong>权限提醒：</strong> rsync 不能绕过远程用户权限。写入 <code>/var/www</code>、保留属主、保留设备文件等操作，可能需要目标目录授权或 sudo 包装。</div>
+</section>
+
+<section class="figure" id="s9">
+<h3>信息图：include/exclude 过滤规则如何影响文件列表</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="rsync include exclude 过滤模型">
+<rect x="20" y="20" width="1060" height="620" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">过滤规则决定哪些路径进入同步文件列表</text>
+<rect x="70" y="135" width="260" height="380" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="200" y="176" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">源目录</text><text x="200" y="225" text-anchor="middle" font-size="15">app.py</text><text x="200" y="260" text-anchor="middle" font-size="15">static/logo.png</text><text x="200" y="295" text-anchor="middle" font-size="15">node_modules/</text><text x="200" y="330" text-anchor="middle" font-size="15">.git/</text><text x="200" y="365" text-anchor="middle" font-size="15">tmp/cache.db</text>
+<rect x="420" y="135" width="260" height="380" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="176" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">规则从上到下</text><text x="550" y="230" text-anchor="middle" font-size="15">+ */</text><text x="550" y="265" text-anchor="middle" font-size="15">+ *.py</text><text x="550" y="300" text-anchor="middle" font-size="15">+ static/***</text><text x="550" y="335" text-anchor="middle" font-size="15">- node_modules/</text><text x="550" y="370" text-anchor="middle" font-size="15">- .git/</text><text x="550" y="405" text-anchor="middle" font-size="15">- *</text>
+<rect x="770" y="135" width="260" height="380" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="900" y="176" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">文件列表</text><text x="900" y="245" text-anchor="middle" font-size="15">app.py</text><text x="900" y="285" text-anchor="middle" font-size="15">static/logo.png</text><text x="900" y="350" text-anchor="middle" font-size="15">其他路径被排除</text>
+<line x1="330" y1="325" x2="420" y2="325" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="680" y1="325" x2="770" y2="325" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">过滤规则不是事后隐藏输出，而是在构建文件列表时决定遍历和同步范围。目录能否被遍历，常取决于是否先包含 <code>*/</code>。</div></section>
+
+<section class="section">
+<h2>8. include/exclude 过滤规则</h2>
+<p><code>--exclude</code> 用于排除路径，<code>--include</code> 用于重新包含路径。复杂规则按出现顺序匹配，第一条命中的规则通常决定该路径命运。目录遍历尤其重要：如果父目录被排除，里面的文件就没有机会被包含。</p>
+<h3>常见排除</h3>
+<pre><code># 排除缓存、依赖、版本库
+rsync -av \
+  --exclude '.git/' \
+  --exclude 'node_modules/' \
+  --exclude '__pycache__/' \
+  --exclude '*.log' \
+  app/ deploy@example.com:/srv/app/</code></pre>
+<h3>只同步特定类型</h3>
+<pre><code># 只同步目录、Python 文件和 static 下所有内容，最后排除其他
+rsync -avni \
+  --include '*/' \
+  --include '*.py' \
+  --include 'static/***' \
+  --exclude '*' \
+  app/ /tmp/app-preview/</code></pre>
+<table><tr><th>模式</th><th>含义</th><th>备注</th></tr>
+<tr><td><code>*.log</code></td><td>匹配日志文件名</td><td>不带斜杠时可匹配各层文件名。</td></tr>
+<tr><td><code>/build/</code></td><td>匹配传输根目录下的 build 目录</td><td>前导 <code>/</code> 相对同步源根。</td></tr>
+<tr><td><code>cache/</code></td><td>匹配名为 cache 的目录</td><td>末尾 <code>/</code> 表示目录。</td></tr>
+<tr><td><code>static/***</code></td><td>匹配 static 目录及其全部内容</td><td>常用于包含整个子树。</td></tr>
+</table>
+<div class="warn"><strong>过滤排障：</strong> 如果“明明 include 了却没有同步”，先检查父目录是否被允许遍历，通常需要在排除 <code>*</code> 之前加入 <code>--include '*/'</code>。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 断点续传与部分文件</h2>
+<p>大文件传输中断后，默认 rsync 可能会删除临时部分文件。使用 <code>--partial</code> 或 <code>--partial-dir</code> 可以保留未完成片段，下一次同步可复用，减少重传。</p>
+<table><tr><th>选项</th><th>作用</th><th>建议</th></tr>
+<tr><td><code>--partial</code></td><td>保留部分传输文件</td><td>简单直接，但目标目录可能出现不完整文件。</td></tr>
+<tr><td><code>--partial-dir=.rsync-partial</code></td><td>把部分文件放到临时目录</td><td>更整洁，适合脚本和部署。</td></tr>
+<tr><td><code>--append</code></td><td>假设目标文件只是缺少尾部并追加</td><td>仅适合严格确认只追加的文件。</td></tr>
+<tr><td><code>--append-verify</code></td><td>追加后校验已有内容</td><td>比 <code>--append</code> 更安全。</td></tr>
+</table>
+<pre><code># 大文件备份，保留部分传输并显示进度
+rsync -avh --progress --partial-dir=.rsync-partial videos/ backup:/data/videos/
+
+# 网络不稳定时可重复运行同一条命令
+rsync -avh --progress --partial-dir=.rsync-partial videos/ backup:/data/videos/</code></pre>
+<div class="note"><strong>心智模型：</strong> rsync 的“可重复运行”是它的核心优势。失败后通常不要手工清理，先用同一组选项重新运行，让 rsync 自己比较状态。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 备份、快照与回滚</h2>
+<p>同步不是备份的全部。单纯 <code>rsync -a --delete</code> 会让目标端越来越像源端，也会把源端的误删同步过去。真正的备份需要保留历史版本或至少保留被覆盖、被删除的旧文件。</p>
+<h3>覆盖前保留旧文件</h3>
+<pre><code># 先预演：查看覆盖和删除计划
+rsync -avni --delete --backup --backup-dir=../backup-old src/ backup/current/
+
+# 确认后执行：旧文件进入 backup-old
+rsync -avi --delete --backup --backup-dir=../backup-old src/ backup/current/</code></pre>
+<h3>用硬链接构建日期快照</h3>
+<pre><code># 上一个快照作为硬链接基线，未变化文件不重复占用空间
+TODAY=$(date +%F)
+PREV=/backup/snapshots/latest
+DEST=/backup/snapshots/$TODAY
+
+mkdir -p "$DEST"
+rsync -a --delete --link-dest="$PREV" /home/app/data/ "$DEST/"
+ln -sfn "$DEST" /backup/snapshots/latest</code></pre>
+<div class="warn"><strong>快照提醒：</strong> <code>--link-dest</code> 适合文件级快照，但不要在不了解硬链接语义时手工修改旧快照里的文件。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 权限、属主、时间戳与链接</h2>
+<p>rsync 是否“同步成功”，不只看文件内容，还要看权限、属主、组、时间戳、符号链接、硬链接、ACL、扩展属性是否符合目标需求。<code>-a</code> 保留常见元数据，但并不包含所有平台特性。</p>
+<table><tr><th>需求</th><th>常用选项</th><th>说明</th></tr>
+<tr><td>保留普通权限和时间戳</td><td><code>-a</code></td><td>大多数部署和备份的起点。</td></tr>
+<tr><td>不保留属主/组</td><td><code>--no-owner --no-group</code></td><td>远程非 root 部署常用。</td></tr>
+<tr><td>保留硬链接关系</td><td><code>-H</code></td><td>会增加内存和扫描成本。</td></tr>
+<tr><td>保留 ACL</td><td><code>-A</code></td><td>需要两端文件系统和 rsync 支持。</td></tr>
+<tr><td>保留扩展属性</td><td><code>-X</code></td><td>Linux/macOS 行为可能不同。</td></tr>
+<tr><td>跟随符号链接</td><td><code>-L</code></td><td>复制链接指向的真实文件，需谨慎。</td></tr>
+</table>
+<pre><code># Web 部署：通常不需要保留本机用户和组
+rsync -av --no-owner --no-group public/ deploy@example.com:/var/www/site/
+
+# 系统级备份：更完整保留元数据，通常需要 root 权限
+rsync -aHAX --numeric-ids /etc/ backup:/srv/backup/etc/</code></pre>
+<div class="danger"><strong>链接风险：</strong> <code>-L</code> 会跟随符号链接，可能把源目录外的大量内容带入同步范围。除非明确需要，否则部署和备份中优先保留链接本身。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. 性能、带宽与大目录优化</h2>
+<p>rsync 性能由三部分决定：扫描文件列表、比较差异、传输数据。小文件很多时，扫描和元数据开销可能比传输更重；大文件跨网络时，压缩、限速和部分传输更重要。</p>
+<table><tr><th>场景</th><th>选项</th><th>理由</th></tr>
+<tr><td>跨公网传文本</td><td><code>-z</code></td><td>压缩能减少传输量。</td></tr>
+<tr><td>局域网传大媒体</td><td>通常不用 <code>-z</code></td><td>压缩视频收益小，还消耗 CPU。</td></tr>
+<tr><td>限制带宽</td><td><code>--bwlimit=10M</code></td><td>避免影响业务网络。</td></tr>
+<tr><td>显示整体进度</td><td><code>--info=progress2</code></td><td>比每个文件的 <code>--progress</code> 更适合大任务。</td></tr>
+<tr><td>强制校验内容</td><td><code>-c</code></td><td>更准确但更慢，会读取两端文件内容。</td></tr>
+</table>
+<pre><code># 大目录跨网络同步，显示整体进度并限速
+rsync -ah --info=progress2 --bwlimit=20M data/ backup:/data/
+
+# 两端时间戳不可信时，用校验和判断差异
+rsync -avc src/ dst/</code></pre>
+<div class="note"><strong>性能判断：</strong> 如果输出长时间停在 building file list，瓶颈通常是目录遍历和元数据读取，不是网络带宽。</div>
+</section>
+
+<section class="figure" id="s14">
+<h3>用例图：rsync、scp、cp 怎么选</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="rsync scp cp 对比用例图">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<ellipse cx="145" cy="145" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="145" y="152" text-anchor="middle" font-size="18" font-weight="700">本机复制</text>
+<ellipse cx="145" cy="305" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="145" y="312" text-anchor="middle" font-size="18" font-weight="700">远程传单次</text>
+<ellipse cx="145" cy="465" rx="95" ry="42" fill="#dbeafe" stroke="#93c5fd"/><text x="145" y="472" text-anchor="middle" font-size="18" font-weight="700">重复同步</text>
+<rect x="330" y="90" width="680" height="430" rx="20" fill="#f8fafc" stroke="#cbd5e1"/><text x="670" y="130" text-anchor="middle" font-size="24" font-weight="700">工具选择</text>
+<ellipse cx="520" cy="215" rx="150" ry="42" fill="#ede9fe" stroke="#c4b5fd"/><text x="520" y="222" text-anchor="middle" font-size="17">cp：简单本机复制</text>
+<ellipse cx="815" cy="215" rx="150" ry="42" fill="#ffedd5" stroke="#fdba74"/><text x="815" y="222" text-anchor="middle" font-size="17">scp：简单远程复制</text>
+<ellipse cx="670" cy="390" rx="190" ry="46" fill="#ccfbf1" stroke="#99f6e4"/><text x="670" y="397" text-anchor="middle" font-size="17">rsync：重复、增量、可过滤、可删除</text>
+<line x1="240" y1="145" x2="385" y2="215" stroke="#94a3b8" stroke-width="3"/>
+<line x1="240" y1="305" x2="665" y2="215" stroke="#94a3b8" stroke-width="3"/>
+<line x1="240" y1="465" x2="480" y2="390" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">一次性复制用 <code>cp</code> 或 <code>scp</code> 更简单；只要任务变成“重复同步同一批文件”，rsync 的优势就会迅速显现。</div></section>
+
+<section class="section">
+<h2>13. rsync vs scp vs cp</h2>
+<table><tr><th>工具</th><th>优势</th><th>劣势</th><th>适合</th></tr>
+<tr><td><code>cp</code></td><td>本机复制直接、无远程依赖</td><td>不做远程传输，不擅长增量同步和复杂过滤</td><td>一次性本地复制。</td></tr>
+<tr><td><code>scp</code></td><td>远程复制语义简单，SSH 生态成熟</td><td>重复传输时通常不如 rsync 高效，过滤和删除能力弱</td><td>临时传几个文件。</td></tr>
+<tr><td><code>rsync</code></td><td>增量、过滤、保留元数据、dry-run、可删除、可备份</td><td>路径和过滤语义需要学习，错误选项可能影响大量文件</td><td>部署、备份、镜像、大目录同步。</td></tr>
+</table>
+<pre><code># cp：本机一次性复制
+cp -a src/ dst/
+
+# scp：远程一次性复制
+scp archive.tar.gz user@example.com:/tmp/
+
+# rsync：重复同步目录
+rsync -av --delete public/ user@example.com:/var/www/site/</code></pre>
+<div class="success"><strong>选择原则：</strong> 如果你预计同一条复制任务会运行第二次，就优先考虑 rsync。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 部署与备份的安全工作流</h2>
+<p>生产中最可靠的 rsync 流程不是“写对一条神奇命令”，而是把预演、审查、执行、验证、回滚点串成固定流程。</p>
+<h3>静态站部署模板</h3>
+<pre><code># 1. 构建产物
+npm run build
+
+# 2. 预演：注意 --delete 会删除远程多余文件
+rsync -avnih --delete dist/ deploy@example.com:/var/www/site/
+
+# 3. 执行
+rsync -avih --delete dist/ deploy@example.com:/var/www/site/
+
+# 4. 验证远程文件
+ssh deploy@example.com 'find /var/www/site -maxdepth 2 -type f | sort | head'</code></pre>
+<h3>备份模板</h3>
+<pre><code># 1. 预演并限制最大删除数量
+rsync -avnih --delete --max-delete=100 /srv/data/ backup:/backup/data/
+
+# 2. 确认后执行，并记录日志
+rsync -avih --delete --max-delete=100 /srv/data/ backup:/backup/data/ \
+  | tee -a /var/log/rsync-data-backup.log</code></pre>
+<div class="danger"><strong>流程底线：</strong> 自动任务第一次上线前，必须在测试目录跑通 dry-run 和真实执行；不要在首次运行时直接指向生产数据。</div>
+</section>
+
+<section class="figure" id="s16">
+<h3>排障流程图：rsync 失败或结果不对时怎么查</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="rsync 排障流程图">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">rsync 结果不对</text>
+<rect x="70" y="160" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="180" y="196" text-anchor="middle" font-size="18" font-weight="700">路径是否正确？</text><text x="180" y="224" text-anchor="middle" font-size="14">源/目标/结尾斜杠</text>
+<rect x="315" y="160" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="196" text-anchor="middle" font-size="18" font-weight="700">权限是否足够？</text><text x="425" y="224" text-anchor="middle" font-size="14">读源端 / 写目标端</text>
+<rect x="560" y="160" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="196" text-anchor="middle" font-size="18" font-weight="700">过滤是否命中？</text><text x="670" y="224" text-anchor="middle" font-size="14">include/exclude 顺序</text>
+<rect x="805" y="160" width="220" height="90" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="915" y="196" text-anchor="middle" font-size="18" font-weight="700">网络是否稳定？</text><text x="915" y="224" text-anchor="middle" font-size="14">SSH / 端口 / 超时</text>
+<rect x="120" y="355" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="235" y="391" text-anchor="middle" font-size="18" font-weight="700">加 -n -i</text><text x="235" y="419" text-anchor="middle" font-size="14">先看计划</text>
+<rect x="435" y="355" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="391" text-anchor="middle" font-size="18" font-weight="700">加 -vv</text><text x="550" y="419" text-anchor="middle" font-size="14">观察详细日志</text>
+<rect x="750" y="355" width="230" height="92" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="865" y="391" text-anchor="middle" font-size="18" font-weight="700">单文件复现</text><text x="865" y="419" text-anchor="middle" font-size="14">缩小问题范围</text>
+<rect x="300" y="555" width="500" height="74" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="588" text-anchor="middle" font-size="20" font-weight="700">路径 → 权限 → 过滤 → 网络 → 元数据</text><text x="550" y="613" text-anchor="middle" font-size="14">不要在大目录上盲目反复试错</text>
+<line x1="550" y1="111" x2="180" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="425" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="670" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="915" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="180" y1="250" x2="235" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="250" x2="550" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="250" x2="550" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="250" x2="865" y2="355" stroke="#94a3b8" stroke-width="3"/><line x1="235" y1="447" x2="410" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="447" x2="550" y2="555" stroke="#94a3b8" stroke-width="3"/><line x1="865" y1="447" x2="700" y2="555" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">排障顺序固定下来后，大多数 rsync 问题都能快速定位：路径、权限、过滤、网络、元数据。</div></section>
+
+<section class="section">
+<h2>15. 常见故障与排障</h2>
+<div class="grid-2">
+<div class="card"><strong>问题 1：目标端多了一个 src 目录</strong><br>源路径用了 <code>src</code> 而不是 <code>src/</code>。用 dry-run 对比两种写法。</div>
+<div class="card"><strong>问题 2：文件没有被删除</strong><br>默认不会删除目标端额外文件。需要镜像语义时使用 <code>--delete</code>，但必须先 <code>-n -i</code>。</div>
+<div class="card"><strong>问题 3：权限或属主不对</strong><br>远程用户没有权限保留属主/组，考虑 <code>--no-owner --no-group</code> 或调整目标目录权限。</div>
+<div class="card"><strong>问题 4：include 没生效</strong><br>父目录可能被排除了。加入 <code>--include '*/'</code> 并检查规则顺序。</div>
+<div class="card"><strong>问题 5：每次都重复传</strong><br>检查时间戳是否保留、两端时钟、文件系统精度，必要时用 <code>-c</code> 验证。</div>
+<div class="card"><strong>问题 6：大文件中断后重来</strong><br>使用 <code>--partial-dir=.rsync-partial</code> 并重复运行同一条命令。</div>
+<div class="card"><strong>问题 7：SSH 连接失败</strong><br>先单独运行 <code>ssh user@host</code>，再检查 <code>-e 'ssh -p ...'</code>。</div>
+<div class="card"><strong>问题 8：文件名含空格出问题</strong><br>避免自己拼接未引用路径；脚本中变量使用双引号。</div>
+</div>
+<h3>排障模板</h3>
+<pre><code># 1. 先确认 SSH
+ssh deploy@example.com 'pwd; id; ls -ld /var/www/site'
+
+# 2. 单文件 dry-run
+rsync -avni ./public/index.html deploy@example.com:/var/www/site/index.html
+
+# 3. 大目录 dry-run + 明细
+rsync -avnih --delete public/ deploy@example.com:/var/www/site/
+
+# 4. 需要更多日志时
+rsync -avvni public/ deploy@example.com:/var/www/site/</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 脚本化、定时任务与日志</h2>
+<p>自动化 rsync 时，重点不是少写几行命令，而是让失败可见、路径可靠、日志可追踪、删除有保险丝。脚本里应显式设置变量、检查源目录存在、记录退出码。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+SRC="/srv/app/data/"
+DEST="backup@example.com:/backup/app-data/"
+LOG="/var/log/rsync-app-data.log"
+
+if [ ! -d "$SRC" ]; then
+  echo "source not found: $SRC" >&amp;2
+  exit 1
+fi
+
+rsync -avh --delete --max-delete=500 \
+  --partial-dir=.rsync-partial \
+  "$SRC" "$DEST" | tee -a "$LOG"</code></pre>
+<h3>cron 示例</h3>
+<pre><code># 每天 02:30 运行备份脚本
+30 2 * * * /usr/local/bin/backup-app-data.sh &gt;&gt;/var/log/backup-app-data.cron.log 2&gt;&amp;1</code></pre>
+<div class="warn"><strong>自动化提醒：</strong> cron 环境变量很少，脚本里使用绝对路径更稳妥；首次上线前先手动运行，并保留一次 dry-run 日志。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 学习路线与练习任务</h2>
+<h3>第一阶段：会同步</h3>
+<ul><li>理解 <code>SOURCE DESTINATION</code> 位置关系。</li><li>掌握 <code>src</code> 与 <code>src/</code> 的区别。</li><li>熟练使用 <code>-a</code>、<code>-v</code>、<code>-n</code>、<code>-i</code>。</li></ul>
+<h3>第二阶段：会安全使用</h3>
+<ul><li>涉及 <code>--delete</code> 时先 dry-run 并审查 <code>*deleting</code>。</li><li>掌握常见 exclude 规则，知道 include/exclude 的顺序影响。</li><li>知道如何使用 <code>--backup</code>、<code>--backup-dir</code>、<code>--max-delete</code> 做保险。</li></ul>
+<h3>第三阶段：工程化</h3>
+<ul><li>掌握 SSH 传输、密钥、端口和远程权限排障。</li><li>根据文件类型决定是否使用 <code>-z</code>、<code>--partial-dir</code>、<code>--bwlimit</code>。</li><li>能写可重复运行、有日志、有失败退出的备份或部署脚本。</li></ul>
+<h3>练习</h3>
+<ol><li>创建两个临时目录，分别测试 <code>rsync -a src dst/</code> 与 <code>rsync -a src/ dst/</code> 的结果。</li><li>用 <code>rsync -avni</code> 观察新增文件、修改文件、目录时间戳变化的 itemize 输出。</li><li>在目标端创建一个源端不存在的文件，比较有无 <code>--delete</code> 的 dry-run 输出。</li><li>写一组规则，只同步 <code>*.md</code> 和 <code>images/</code>，排除其他文件。</li><li>模拟大文件中断，使用 <code>--partial-dir</code> 继续同步。</li><li>用 <code>--backup --backup-dir</code> 保存被覆盖文件，并练习回滚。</li></ol>
+<pre><code># 练习数据
+rm -rf /tmp/rsync-lab
+mkdir -p /tmp/rsync-lab/src/images /tmp/rsync-lab/dst
+printf 'hello\n' &gt; /tmp/rsync-lab/src/readme.md
+printf 'cache\n' &gt; /tmp/rsync-lab/src/app.log
+printf 'png\n' &gt; /tmp/rsync-lab/src/images/logo.png
+
+# 只同步 Markdown 和 images
+rsync -avni \
+  --include '*/' \
+  --include '*.md' \
+  --include 'images/***' \
+  --exclude '*' \
+  /tmp/rsync-lab/src/ /tmp/rsync-lab/dst/</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>rsync manual page：<code>rsync(1)</code>，重点阅读 archive、delete、filter rules、itemize changes、partial transfer、SSH transport。</li>
+<li>rsync 官方文档与技术报告：了解 rolling checksum、增量传输算法和 daemon 模式。</li>
+<li>OpenSSH manual：<code>ssh(1)</code>、<code>ssh_config(5)</code>，用于理解 <code>-e ssh</code>、密钥、端口和连接复用。</li>
+<li>Linux 文件权限与时间戳资料：理解属主、组、ACL、扩展属性、符号链接和硬链接对同步结果的影响。</li>
+</ul><p class="mini">建议阅读顺序：先掌握源/目标与结尾斜杠，再掌握 <code>-a -n -i</code>，随后学习 <code>--delete</code>、过滤规则、SSH、部分传输和备份回滚。</p></section>
+<div class="footer">rsync 深度教程 · 图文穿插版 · 源/目标模型、结尾斜杠、增量同步、删除安全、SSH、过滤规则与备份实践</div>
+</div>
+</body>
+</html>

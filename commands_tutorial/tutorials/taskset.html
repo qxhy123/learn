@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>taskset 深度教程：AI Infra 中的 CPU 亲和性、线程隔离与性能排障</title>
+<style>
+:root{--bg:#f7f5ef;--card:#fffdf8;--ink:#20231f;--muted:#687064;--line:#ddd6c7;--blue:#1d4ed8;--blue2:#dbeafe;--green:#15803d;--green2:#dcfce7;--orange:#c2410c;--orange2:#ffedd5;--red:#b91c1c;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--olive:#4d7c0f;--olive2:#ecfccb;--slate2:#f1f5f9;--shadow:0 14px 34px rgba(41,37,28,.10)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#fff7d6 0,#f7f5ef 32%,#eef3f0 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#fffdf8 0%,#f7f0d9 55%,#eef7f0 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--olive2);color:#3f6212;font-size:13px;font-weight:700;border:1px solid #bef264}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fffefa;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#eff6ff;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#10151f;color:#e8eef8;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1f2937;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f8fafc;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>taskset 深度教程：AI Infra 中的 CPU 亲和性、线程隔离与性能排障</h1>
+<p class="sub"><code>taskset</code> 是 Linux 上查看和设置 CPU affinity 的工具。对 AI Infra 来说，它不是“让程序更快”的魔法开关，而是把训练进程、DataLoader worker、NCCL/通信/helper 线程、监控 agent 和基准测试负载限制在明确的 CPU 集合里，减少调度抖动、跨 NUMA 访问和控制面抢占。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">CPU affinity</span><span class="chip">mask vs list</span><span class="chip">DataLoader</span><span class="chip">NCCL helper</span><span class="chip">cgroups</span><span class="chip">containers</span><span class="chip">numactl</span><span class="chip">benchmarking</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>taskset</code> 设置的是“这个任务允许在哪些 CPU 上运行”的调度约束；它不会独占 CPU，也不会自动理解 GPU、NUMA 或容器拓扑。</div>
+<div class="success"><strong>实践原则：</strong> 先用 <code>taskset -pc PID</code>、<code>ps -L</code>、<code>lscpu</code> 和容器 cpuset 确认现状，再在小范围压测；不要直接把线上训练任务改到过窄的 CPU 集合。</div>
+</section>
+
+<section class="toc">
+<h2>目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">taskset 是什么</a></li>
+<li><a class="anchor" href="#s2">CPU affinity 心智模型</a></li>
+<li><a class="anchor" href="#s3">安装、权限与环境检查</a></li>
+<li><a class="anchor" href="#s4">基本语法</a></li>
+<li><a class="anchor" href="#s5">mask 与 CPU list</a></li>
+<li><a class="anchor" href="#s6">查看与修改已有进程</a></li>
+<li><a class="anchor" href="#s7">线程、进程与 <code>-a</code></a></li>
+<li><a class="anchor" href="#s8">AI 训练启动模式</a></li>
+<li><a class="anchor" href="#s9">Pinning DataLoader workers</a></li>
+<li><a class="anchor" href="#s10">隔离 NCCL/helper 线程</a></li>
+<li><a class="anchor" href="#s11">cgroups 与容器交互</a></li>
+<li><a class="anchor" href="#s12">taskset vs numactl</a></li>
+<li><a class="anchor" href="#s13">Benchmarking 方法</a></li>
+<li><a class="anchor" href="#s14">线上安全流程</a></li>
+<li><a class="anchor" href="#s15">排障清单</a></li>
+<li><a class="anchor" href="#s16">常见误区</a></li>
+<li><a class="anchor" href="#s17">命令速查</a></li>
+<li><a class="anchor" href="#s18">练习任务</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. taskset 是什么</h2>
+<p><code>taskset</code> 来自 util-linux，用来调用 Linux 的 CPU affinity 相关接口。它可以启动一个带亲和性约束的新命令，也可以查看或修改已有 PID 的亲和性。</p>
+<div class="grid-3">
+<div class="card"><strong>它能做什么</strong><br>限制进程或线程只能在指定 CPU ID 上运行，适合隔离 benchmark、训练 rank、数据加载和后台 helper。</div>
+<div class="card"><strong>它不能做什么</strong><br>不能保证独占 CPU，不能设置内存 NUMA 策略，不能绕过 cgroup/cpuset 限制，也不能替代调度器优先级控制。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>减少 CPU 调度漂移，让 GPU feeder、通信线程和控制面任务有更可预测的 CPU 资源边界。</div>
+</div>
+<pre><code># 启动命令时限制到 CPU 0-7
+taskset -c 0-7 python train.py
+
+# 查看已有进程允许使用的 CPU
+taskset -pc 12345
+
+# 把已有进程改到 CPU 8-15
+taskset -pc 8-15 12345</code></pre>
+<div class="warn"><strong>注意：</strong> CPU affinity 是“允许集合”，不是“绑定后永远正在某个 CPU 上”。在允许集合内，Linux 调度器仍会迁移任务。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. CPU affinity 心智模型</h2>
+<p>每个 Linux task 都有一个 allowed CPU mask。调度器挑选运行 CPU 时，只能从这个 mask 里选。<code>taskset</code> 的核心就是读写这个 mask。</p>
+<table>
+<tr><th>层级</th><th>含义</th><th>AI Infra 例子</th></tr>
+<tr><td>CPU ID</td><td>逻辑 CPU 编号，通常来自 SMT/超线程后的编号</td><td>CPU 0-63 可能是一个双路服务器的逻辑 CPU 集合</td></tr>
+<tr><td>Affinity mask</td><td>允许运行的 CPU 位图</td><td><code>0xff</code> 表示允许 CPU 0-7</td></tr>
+<tr><td>任务 task</td><td>Linux 调度的基本单位，线程也有独立 task ID</td><td>PyTorch 主进程、DataLoader worker、通信线程</td></tr>
+<tr><td>cgroup cpuset</td><td>容器或服务层面的 CPU 上限</td><td>Kubernetes 分配 <code>cpuset.cpus=16-31</code></td></tr>
+</table>
+<div class="note"><strong>有效 CPU 集合：</strong> 最终可用 CPU 通常是 <code>taskset mask ∩ cgroup cpuset ∩ 在线 CPU</code>。如果交集为空，设置会失败。</div>
+</section>
+
+<section class="figure">
+<h3>图 1：taskset 与 Linux 调度器的关系</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="taskset CPU affinity 模型">
+<rect x="18" y="18" width="1064" height="612" rx="20" fill="#fffefa" stroke="#ddd6c7"/>
+<rect x="70" y="88" width="210" height="95" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="175" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">taskset</text><text x="175" y="156" text-anchor="middle" font-size="15">写入 allowed mask</text>
+<rect x="410" y="88" width="280" height="95" rx="18" fill="#ecfccb" stroke="#bef264"/><text x="550" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#4d7c0f">Linux scheduler</text><text x="550" y="156" text-anchor="middle" font-size="15">只在允许 CPU 中调度</text>
+<rect x="820" y="88" width="210" height="95" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="925" y="126" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">CPU cores</text><text x="925" y="156" text-anchor="middle" font-size="15">0 1 2 3 ... N</text>
+<rect x="155" y="310" width="790" height="150" rx="22" fill="#f8fafc" stroke="#cbd5e1"/><text x="550" y="352" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">Affinity 是调度约束，不是资源预留</text><text x="550" y="392" text-anchor="middle" font-size="16">同一 CPU 集合内仍可能有多个进程竞争</text><text x="550" y="424" text-anchor="middle" font-size="16">要独占或隔离，需要 cpuset、systemd、Kubernetes、isolcpus 等配合</text>
+<line x1="280" y1="135" x2="410" y2="135" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="690" y1="135" x2="820" y2="135" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">taskset 改的是任务的 allowed CPU mask；调度器仍负责在允许集合内做实际调度。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、权限与环境检查</h2>
+<p>多数 Linux 发行版默认安装 util-linux。容器镜像可能裁剪掉 <code>taskset</code>，但内核接口仍存在，可以用宿主机或补装工具验证。</p>
+<pre><code># 版本与帮助
+taskset --version
+taskset --help
+
+# 拓扑：CPU、NUMA、线程关系
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+lscpu
+
+# 查看当前 shell 的亲和性
+taskset -pc $$
+
+# 查看 cgroup 限制，cgroup v2 常见路径
+cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true
+cat /sys/fs/cgroup/cpuset.cpus 2>/dev/null || true</code></pre>
+<table>
+<tr><th>操作</th><th>通常权限</th><th>说明</th></tr>
+<tr><td>查看自己的进程</td><td>普通用户</td><td><code>taskset -pc $$</code></td></tr>
+<tr><td>修改自己的进程</td><td>普通用户通常可行</td><td>仍受 cgroup 和在线 CPU 限制</td></tr>
+<tr><td>修改其他用户或系统进程</td><td>需要对应权限或 root</td><td>生产环境必须走变更流程</td></tr>
+<tr><td>突破容器分配 CPU</td><td>不可行</td><td><code>taskset</code> 不能越过 cpuset</td></tr>
+</table>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 基本语法</h2>
+<p><code>taskset</code> 有两类用法：启动新命令，或操作已有 PID。推荐在日常脚本里使用 <code>-c</code> CPU list，因为它比十六进制 mask 更不容易读错。</p>
+<pre><code># 启动新命令：mask 写法
+taskset 0xff python train.py
+
+# 启动新命令：CPU list 写法，更推荐
+taskset -c 0-7 python train.py
+
+# 查看已有 PID
+taskset -p 12345
+taskset -pc 12345
+
+# 修改已有 PID
+taskset -p 0xff 12345
+taskset -pc 0-7 12345</code></pre>
+<table>
+<tr><th>选项</th><th>作用</th><th>常用程度</th></tr>
+<tr><td><code>-c</code>, <code>--cpu-list</code></td><td>使用 <code>0-3,8,10</code> 这种 CPU list，而不是 hex mask</td><td>最高</td></tr>
+<tr><td><code>-p</code>, <code>--pid</code></td><td>查看或修改已有 PID</td><td>最高</td></tr>
+<tr><td><code>-a</code>, <code>--all-tasks</code></td><td>对指定 PID 下所有线程/task 操作</td><td>排障时很重要</td></tr>
+<tr><td><code>mask command</code></td><td>用 hex mask 启动命令</td><td>脚本兼容场景</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. mask 与 CPU list</h2>
+<p>CPU list 是人类友好的表达，hex mask 是内核位图表达。CPU 0 对应最低位，CPU 1 对应第二位，以此类推。</p>
+<table>
+<tr><th>CPU list</th><th>二进制低位</th><th>hex mask</th><th>含义</th></tr>
+<tr><td><code>0</code></td><td><code>0001</code></td><td><code>0x1</code></td><td>只允许 CPU 0</td></tr>
+<tr><td><code>1</code></td><td><code>0010</code></td><td><code>0x2</code></td><td>只允许 CPU 1</td></tr>
+<tr><td><code>0-3</code></td><td><code>1111</code></td><td><code>0xf</code></td><td>允许 CPU 0、1、2、3</td></tr>
+<tr><td><code>0-7</code></td><td><code>11111111</code></td><td><code>0xff</code></td><td>允许 CPU 0 到 7</td></tr>
+<tr><td><code>8-15</code></td><td>高 8 位</td><td><code>0xff00</code></td><td>允许 CPU 8 到 15</td></tr>
+</table>
+<pre><code># 推荐：直接使用 CPU list，避免手算 hex
+taskset -c 0-3,8,10 python preprocess.py
+
+# 如果系统或旧脚本只给 mask，可让 taskset 反查
+taskset -p 0xff $$
+taskset -pc $$</code></pre>
+<div class="warn"><strong>大机器提醒：</strong> 128/256 逻辑 CPU 的服务器上，hex mask 很长且容易写反。AI 集群运维脚本优先用 <code>-c</code>，并从 <code>lscpu -e</code> 生成 CPU list。</div>
+</section>
+
+<section class="figure">
+<h3>图 2：mask 与 list 的转换关系</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="taskset mask 和 CPU list 转换">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fffefa" stroke="#ddd6c7"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">CPU list 更适合人读，mask 更接近内核位图</text>
+<g>
+<rect x="120" y="145" width="95" height="80" rx="12" fill="#dbeafe" stroke="#93c5fd"/><text x="168" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 7</text><text x="168" y="204" text-anchor="middle" font-size="14">bit 7</text>
+<rect x="225" y="145" width="95" height="80" rx="12" fill="#dbeafe" stroke="#93c5fd"/><text x="273" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 6</text><text x="273" y="204" text-anchor="middle" font-size="14">bit 6</text>
+<rect x="330" y="145" width="95" height="80" rx="12" fill="#dbeafe" stroke="#93c5fd"/><text x="378" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 5</text><text x="378" y="204" text-anchor="middle" font-size="14">bit 5</text>
+<rect x="435" y="145" width="95" height="80" rx="12" fill="#dbeafe" stroke="#93c5fd"/><text x="483" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 4</text><text x="483" y="204" text-anchor="middle" font-size="14">bit 4</text>
+<rect x="540" y="145" width="95" height="80" rx="12" fill="#ecfccb" stroke="#bef264"/><text x="588" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 3</text><text x="588" y="204" text-anchor="middle" font-size="14">1</text>
+<rect x="645" y="145" width="95" height="80" rx="12" fill="#ecfccb" stroke="#bef264"/><text x="693" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 2</text><text x="693" y="204" text-anchor="middle" font-size="14">1</text>
+<rect x="750" y="145" width="95" height="80" rx="12" fill="#ecfccb" stroke="#bef264"/><text x="798" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 1</text><text x="798" y="204" text-anchor="middle" font-size="14">1</text>
+<rect x="855" y="145" width="95" height="80" rx="12" fill="#ecfccb" stroke="#bef264"/><text x="903" y="178" text-anchor="middle" font-size="16" font-weight="700">CPU 0</text><text x="903" y="204" text-anchor="middle" font-size="14">1</text>
+</g>
+<rect x="235" y="325" width="630" height="82" rx="16" fill="#f8fafc" stroke="#cbd5e1"/><text x="550" y="357" text-anchor="middle" font-size="22" font-weight="700">list: 0-3  ⇔  binary: 00001111  ⇔  mask: 0xf</text><text x="550" y="386" text-anchor="middle" font-size="15">CPU 0 是最低位；读 mask 时从右往左对应 CPU 编号递增</text>
+<rect x="315" y="480" width="470" height="60" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="517" text-anchor="middle" font-size="17" font-weight="700">生产脚本优先写 taskset -c 0-3，而不是 taskset 0xf</text>
+</svg>
+<div class="caption">只要 CPU 数量变多，hex mask 的可读性会迅速下降；CPU list 更适合团队维护。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 查看与修改已有进程</h2>
+<p>排障时先看现状，再改一个小范围目标。对训练任务尤其要避免在 checkpoint、评估或通信高峰中突然收窄 CPU 集合。</p>
+<pre><code># 找到训练进程
+pgrep -af 'train.py|torchrun|python'
+
+# 查看进程亲和性，-c 输出 CPU list
+taskset -pc 12345
+
+# 预先记录线程列表
+ps -L -p 12345 -o pid,tid,psr,comm
+
+# 修改已有进程到 CPU 16-31
+taskset -pc 16-31 12345
+
+# 修改后再次确认
+taskset -pc 12345
+ps -L -p 12345 -o pid,tid,psr,comm</code></pre>
+<div class="danger"><strong>线上风险：</strong> 修改已有训练进程可能改变 DataLoader、通信线程和 BLAS/OpenMP 线程行为。先在同机测试任务验证吞吐、GPU 利用率和 step time。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 线程、进程与 <code>-a</code></h2>
+<p>Linux 的 affinity 是按 task 记录的，线程也是 task。对多线程程序，<code>taskset -pc PID</code> 不一定覆盖所有线程；需要检查 <code>/proc/PID/task</code> 或使用 <code>-a</code>。</p>
+<table>
+<tr><th>对象</th><th>如何查看</th><th>亲和性注意点</th></tr>
+<tr><td>单进程单线程</td><td><code>taskset -pc PID</code></td><td>最简单</td></tr>
+<tr><td>多线程进程</td><td><code>ps -L -p PID</code></td><td>线程可有不同 affinity</td></tr>
+<tr><td>多进程训练</td><td><code>pgrep -P</code>、<code>pstree -ap</code></td><td>DataLoader worker 是子进程</td></tr>
+<tr><td>torchrun 多 rank</td><td><code>pgrep -af torchrun</code></td><td>每个 rank 应有独立 CPU 规划</td></tr>
+</table>
+<pre><code># 查看所有线程的 TID 和当前运行 CPU
+ps -L -p 12345 -o pid,tid,psr,comm
+
+# 对 PID 下所有 task 查看 affinity
+taskset -apc 12345
+
+# 对 PID 下所有 task 设置 affinity
+taskset -apc 0-15 12345
+
+# 手动查看每个线程
+for t in /proc/12345/task/*; do
+  tid=${t##*/}
+  printf '%s ' "$tid"
+  taskset -pc "$tid"
+done</code></pre>
+<div class="note"><strong>启动继承：</strong> 新子进程和新线程通常继承父任务的 affinity。因此在启动训练前设置，比运行中追着每个 TID 修改更可控。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. AI 训练启动模式</h2>
+<p>训练脚本常见 CPU 消耗来自 Python 主线程、DataLoader worker、tokenizer、图像 decode、通信 helper、日志/监控线程和 BLAS/OpenMP 线程。<code>taskset</code> 的第一步是给每个 GPU rank 划清 CPU 边界。</p>
+<pre><code># 单 GPU：让整个训练进程及后续子进程继承 CPU 0-15
+CUDA_VISIBLE_DEVICES=0 taskset -c 0-15 python train.py --num-workers 8
+
+# 单机 4 GPU：每个 rank 单独启动，CPU 与 GPU 就近规划
+CUDA_VISIBLE_DEVICES=0 taskset -c 0-15  python train.py --rank 0 &
+CUDA_VISIBLE_DEVICES=1 taskset -c 16-31 python train.py --rank 1 &
+CUDA_VISIBLE_DEVICES=2 taskset -c 32-47 python train.py --rank 2 &
+CUDA_VISIBLE_DEVICES=3 taskset -c 48-63 python train.py --rank 3 &
+wait
+
+# torchrun 场景：若一次启动所有 rank，只能给 launcher 及子进程同一上限
+taskset -c 0-63 torchrun --nproc_per_node=4 train.py</code></pre>
+<div class="warn"><strong>torchrun 提醒：</strong> 如果要按 rank 精细划分 CPU，通常需要 wrapper 在每个 rank 内根据 <code>LOCAL_RANK</code> 调用 <code>os.sched_setaffinity</code>，或由作业系统为每个 rank 单独启动进程。</div>
+</section>
+
+<section class="figure">
+<h3>图 3：AI 训练中的 CPU 亲和性规划</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="AI 训练 CPU 亲和性规划">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fffefa" stroke="#ddd6c7"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">每个 GPU rank 配一组就近 CPU，辅助线程不要互相踩踏</text>
+<rect x="80" y="125" width="210" height="470" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">GPU 0 / Rank 0</text><text x="185" y="210" text-anchor="middle" font-size="15">CPU 0-15</text><text x="185" y="250" text-anchor="middle" font-size="15">main thread</text><text x="185" y="285" text-anchor="middle" font-size="15">DataLoader workers</text><text x="185" y="320" text-anchor="middle" font-size="15">decode/tokenize</text><text x="185" y="355" text-anchor="middle" font-size="15">NCCL/helper</text>
+<rect x="325" y="125" width="210" height="470" rx="20" fill="#ecfccb" stroke="#bef264"/><text x="430" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#4d7c0f">GPU 1 / Rank 1</text><text x="430" y="210" text-anchor="middle" font-size="15">CPU 16-31</text><text x="430" y="250" text-anchor="middle" font-size="15">main thread</text><text x="430" y="285" text-anchor="middle" font-size="15">DataLoader workers</text><text x="430" y="320" text-anchor="middle" font-size="15">decode/tokenize</text><text x="430" y="355" text-anchor="middle" font-size="15">NCCL/helper</text>
+<rect x="570" y="125" width="210" height="470" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="675" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">GPU 2 / Rank 2</text><text x="675" y="210" text-anchor="middle" font-size="15">CPU 32-47</text><text x="675" y="250" text-anchor="middle" font-size="15">main thread</text><text x="675" y="285" text-anchor="middle" font-size="15">DataLoader workers</text><text x="675" y="320" text-anchor="middle" font-size="15">decode/tokenize</text><text x="675" y="355" text-anchor="middle" font-size="15">NCCL/helper</text>
+<rect x="815" y="125" width="210" height="470" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="920" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">GPU 3 / Rank 3</text><text x="920" y="210" text-anchor="middle" font-size="15">CPU 48-63</text><text x="920" y="250" text-anchor="middle" font-size="15">main thread</text><text x="920" y="285" text-anchor="middle" font-size="15">DataLoader workers</text><text x="920" y="320" text-anchor="middle" font-size="15">decode/tokenize</text><text x="920" y="355" text-anchor="middle" font-size="15">NCCL/helper</text>
+<rect x="210" y="630" width="680" height="48" rx="12" fill="#f8fafc" stroke="#cbd5e1"/><text x="550" y="661" text-anchor="middle" font-size="16">实际 CPU 分组必须依据 lscpu、NUMA node、PCIe/GPU 拓扑和容器 cpuset 调整</text>
+</svg>
+<div class="caption">这只是示意图。真实服务器上 CPU 编号不一定连续对应 socket/NUMA，需要用 <code>lscpu -e</code> 和 GPU 拓扑确认。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Pinning DataLoader workers</h2>
+<p>PyTorch DataLoader 的 <code>num_workers&gt;0</code> 时通常创建多个 worker 进程。若父训练进程在启动前被 <code>taskset</code> 限制，worker 会继承这个 CPU 集合；若要 worker 内部再细分，需要在 Python 里设置。</p>
+<pre><code># 外层限制：简单、可观测、适合先验分区
+CUDA_VISIBLE_DEVICES=0 taskset -c 0-15 python train.py --num-workers 8
+
+# 运行中确认 DataLoader worker 是否在允许 CPU 内
+parent=12345
+pstree -ap "$parent"
+ps -eLo pid,ppid,tid,psr,comm | awk -v p="$parent" '$2==p || $1==p'</code></pre>
+<h3>在 worker_init_fn 中按 worker_id 细分</h3>
+<pre><code># train.py 片段：Linux only
+import os
+
+CPU_POOLS = [
+    {0, 1}, {2, 3}, {4, 5}, {6, 7},
+    {8, 9}, {10, 11}, {12, 13}, {14, 15},
+]
+
+def worker_init_fn(worker_id):
+    os.sched_setaffinity(0, CPU_POOLS[worker_id % len(CPU_POOLS)])
+
+# DataLoader(..., num_workers=8, worker_init_fn=worker_init_fn)</code></pre>
+<div class="warn"><strong>不要过度 pin：</strong> 数据加载涉及 IO、解码、页缓存和 Python 调度。把每个 worker 钉到单个超线程上，可能比给一小组 CPU 更差。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 隔离 NCCL/helper 线程</h2>
+<p>NCCL、网络栈、存储客户端、监控 agent、日志线程和 Python runtime 都可能消耗 CPU。<code>taskset</code> 只能按 task 设置；如果库内部线程已经创建，单纯改主 PID 未必覆盖所有线程。</p>
+<pre><code># 找到训练进程的线程和当前运行 CPU
+ps -L -p 12345 -o pid,tid,psr,pcpu,comm
+
+# 查看所有 task 的 affinity
+taskset -apc 12345
+
+# 对整个进程线程组设置一个 helper CPU 范围
+taskset -apc 0-15 12345
+
+# 观察通信/系统线程是否抢占数据加载 CPU
+pidstat -t -p 12345 1
+perf stat -p 12345 -- sleep 10</code></pre>
+<div class="note"><strong>更稳的隔离方式：</strong> 对通信、数据加载和控制面有明确隔离需求时，优先在启动前通过作业编排、cgroup cpuset 或 rank wrapper 规划，而不是训练中手动逐线程修改。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. cgroups 与容器交互</h2>
+<p>在 Docker、containerd、Kubernetes、Slurm 或 systemd 管理下，<code>taskset</code> 只能在上层分配的 CPU 集合内继续收窄。它不能把容器外的 CPU “拿进来”。</p>
+<table>
+<tr><th>环境</th><th>CPU 限制来源</th><th>taskset 行为</th></tr>
+<tr><td>Docker <code>--cpuset-cpus=8-15</code></td><td>容器 cpuset</td><td>容器内 <code>taskset -c 0-7</code> 通常无效或实际不可运行</td></tr>
+<tr><td>Kubernetes CPU Manager static</td><td>Guaranteed Pod 独占 CPU 分配</td><td>只能在 Pod cpuset 内细分</td></tr>
+<tr><td>systemd service</td><td><code>AllowedCPUs=</code> 或 cpuset</td><td>服务内 taskset 受 systemd 限制</td></tr>
+<tr><td>Slurm</td><td><code>--cpus-per-task</code>、cgroup 插件</td><td>作业内二次 pin 应匹配 Slurm 分配</td></tr>
+</table>
+<pre><code># 容器内查看有效 cpuset
+cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null
+
+# Docker 示例：先在运行容器时分配 CPU，再在容器内细分
+docker run --cpuset-cpus=16-31 --gpus all IMAGE \
+  taskset -c 16-23 python train.py
+
+# Kubernetes 中更推荐用资源/CPU Manager 做外层隔离，
+# taskset 只做容器内 rank/worker 细分。</code></pre>
+<div class="danger"><strong>编号陷阱：</strong> 容器内看到的 CPU 编号通常仍是宿主机编号，不会自动从 0 重编号。先看 <code>cpuset.cpus.effective</code>，不要假设容器内 CPU 是 <code>0-N</code>。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. taskset vs numactl</h2>
+<p><code>taskset</code> 管 CPU affinity；<code>numactl</code> 还可以管内存分配策略。AI 训练中，如果 CPU 和 GPU/网卡跨 NUMA，单独 taskset 可能仍然让内存分配落在不理想的节点。</p>
+<table>
+<tr><th>工具</th><th>控制对象</th><th>适合场景</th><th>限制</th></tr>
+<tr><td><code>taskset</code></td><td>CPU allowed mask</td><td>快速限制进程/线程运行 CPU</td><td>不控制内存 NUMA 策略</td></tr>
+<tr><td><code>numactl --physcpubind</code></td><td>CPU 绑定</td><td>按 NUMA 节点绑定 CPU</td><td>仍需理解拓扑</td></tr>
+<tr><td><code>numactl --membind</code></td><td>内存节点</td><td>减少跨 NUMA 内存访问</td><td>内存不足时可能失败或变慢</td></tr>
+<tr><td>cgroup cpuset</td><td>进程组 CPU/内存节点边界</td><td>服务化、容器化、作业调度</td><td>配置复杂，通常由平台管理</td></tr>
+</table>
+<pre><code># 只限制 CPU
+taskset -c 0-31 python train.py
+
+# 同时限制 CPU 和内存 NUMA 节点
+numactl --physcpubind=0-31 --membind=0 python train.py
+
+# 查看 CPU 与 NUMA 节点关系
+lscpu -e=CPU,CORE,SOCKET,NODE
+numactl --hardware</code></pre>
+<div class="success"><strong>选择建议：</strong> 临时排障和简单 pin 用 <code>taskset</code>；需要 CPU+内存 locality 时用 <code>numactl</code>；需要长期资源边界时用 cgroup/调度平台。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. Benchmarking 方法</h2>
+<p>CPU 亲和性调优必须用可重复 benchmark 证明。不要只看一次 step time；应同时观察 GPU 利用率、DataLoader 等待、CPU 上下文切换、NUMA miss 和通信耗时。</p>
+<h3>推荐流程</h3>
+<pre><code># 1. 记录拓扑和环境
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE &gt; lscpu.before.txt
+nvidia-smi topo -m &gt; topo.before.txt 2&gt;/dev/null || true
+taskset -pc $$ &gt; affinity.before.txt
+
+# 2. baseline：不额外 taskset
+/usr/bin/time -v python train.py --steps 200 2&gt; baseline.time
+
+# 3. candidate：限制到规划 CPU
+/usr/bin/time -v taskset -c 0-15 python train.py --steps 200 2&gt; taskset.time
+
+# 4. 观察线程、CPU 迁移和上下文切换
+pidstat -dur -h 1
+vmstat 1</code></pre>
+<table>
+<tr><th>指标</th><th>好信号</th><th>坏信号</th></tr>
+<tr><td>step time p50/p95</td><td>均值下降且尾延迟更稳</td><td>p95 变差，说明 CPU 太窄或抢占严重</td></tr>
+<tr><td>GPU util</td><td>更稳定接近目标区间</td><td>周期性掉到低位，可能数据加载饿 GPU</td></tr>
+<tr><td>context switches</td><td>自愿/非自愿切换减少</td><td>非自愿切换升高，CPU 集合竞争</td></tr>
+<tr><td>CPU migrations</td><td>迁移减少</td><td>仍频繁迁移，线程未被覆盖或 cgroup 干扰</td></tr>
+</table>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 线上安全流程</h2>
+<p>亲和性变更是性能变更，也可能是稳定性变更。尤其在共享 GPU 节点上，错误 pinning 会让训练任务、监控 agent 和系统服务互相争抢。</p>
+<ol>
+<li>收集拓扑：<code>lscpu -e</code>、GPU 拓扑、cgroup cpuset、当前 affinity。</li>
+<li>确认目标：降低 step time 抖动、隔离 DataLoader、隔离通信线程，还是复现 benchmark。</li>
+<li>dry-run：先只查看 PID、线程和 cpuset，不修改。</li>
+<li>小范围测试：单机、单 rank、短步数、可回滚。</li>
+<li>灰度：逐步扩大到更多 rank 或节点。</li>
+<li>回滚：记录原始 CPU list，保留一键恢复命令。</li>
+</ol>
+<pre><code># 修改前记录
+pid=12345
+taskset -apc "$pid" | tee affinity.before.txt
+ps -L -p "$pid" -o pid,tid,psr,pcpu,comm | tee threads.before.txt
+
+# 变更
+taskset -apc 0-15 "$pid"
+
+# 回滚：把 before 文件中的 CPU list 手动确认后再执行
+taskset -apc 0-63 "$pid"</code></pre>
+<div class="danger"><strong>不要把回滚也自动化到不可审查：</strong> 如果原始亲和性来自 cgroup 或调度器，盲目回滚到 <code>0-63</code> 可能越界失败或破坏平台策略。</div>
+</section>
+
+<section class="figure">
+<h3>图 4：taskset 排障与安全决策流程</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="taskset 排障与安全流程">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fffefa" stroke="#ddd6c7"/>
+<rect x="420" y="50" width="260" height="64" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="89" text-anchor="middle" font-size="22" font-weight="700">性能抖动/CPU 争抢</text>
+<polygon points="550,155 710,235 550,315 390,235" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="229" text-anchor="middle" font-size="17" font-weight="700">是否知道有效 cpuset？</text><text x="550" y="253" text-anchor="middle" font-size="14">cgroup / container / scheduler</text>
+<rect x="95" y="205" width="230" height="70" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="210" y="246" text-anchor="middle" font-size="17" font-weight="700" fill="#991b1b">先不要修改</text>
+<rect x="780" y="205" width="230" height="70" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="895" y="246" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">记录现状</text>
+<rect x="95" y="380" width="230" height="82" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="210" y="415" text-anchor="middle" font-size="17" font-weight="700">查 cpuset 和拓扑</text><text x="210" y="442" text-anchor="middle" font-size="14">lscpu / cgroup / Slurm</text>
+<rect x="435" y="380" width="230" height="82" rx="14" fill="#ecfccb" stroke="#bef264"/><text x="550" y="415" text-anchor="middle" font-size="17" font-weight="700">小范围压测</text><text x="550" y="442" text-anchor="middle" font-size="14">baseline vs candidate</text>
+<rect x="775" y="380" width="230" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="890" y="415" text-anchor="middle" font-size="17" font-weight="700">灰度发布</text><text x="890" y="442" text-anchor="middle" font-size="14">保留回滚命令</text>
+<rect x="320" y="585" width="460" height="78" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="619" text-anchor="middle" font-size="20" font-weight="700">验证 step time、GPU util、线程 CPU、上下文切换</text><text x="550" y="646" text-anchor="middle" font-size="14">没有指标改善就撤销，不要保留迷信配置</text>
+<line x1="550" y1="114" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="390" y1="235" x2="325" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="355" y="218" font-size="14">否</text><line x1="710" y1="235" x2="780" y2="240" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><text x="744" y="218" font-size="14">是</text><line x1="210" y1="275" x2="210" y2="380" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><path d="M895 275 C860 345, 650 350, 580 380" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="210" y1="462" x2="430" y2="585" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="550" y1="462" x2="550" y2="585" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="890" y1="462" x2="670" y2="585" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">taskset 调优必须先界定有效 cpuset，再做小范围对照测试；否则很容易把性能问题变成稳定性问题。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 排障清单</h2>
+<div class="grid-2">
+<div class="card"><strong>设置失败：Invalid argument</strong><br>CPU ID 不在线、不在 cgroup cpuset 内，或 mask/list 写错。先看 <code>lscpu -e</code> 和 <code>cpuset.cpus.effective</code>。</div>
+<div class="card"><strong>设置成功但性能没变</strong><br>真正耗 CPU 的是子进程或其他线程。检查 <code>ps -L</code>、<code>pstree</code>、<code>taskset -apc</code>。</div>
+<div class="card"><strong>GPU 利用率下降</strong><br>CPU 集合过窄，DataLoader/解码/tokenize 供不上。增加 CPU 或减少 <code>num_workers</code> 对照。</div>
+<div class="card"><strong>尾延迟变差</strong><br>多个 rank/helper 被放进同一小 CPU 集合，出现争抢和上下文切换。</div>
+<div class="card"><strong>容器内 CPU 编号困惑</strong><br>容器通常保留宿主机 CPU 编号。不要假设 <code>0-7</code> 就是容器分配的 CPU。</div>
+<div class="card"><strong>跨 NUMA 仍然慢</strong><br><code>taskset</code> 不管内存节点。用 <code>numactl --hardware</code> 和 <code>numastat</code> 继续分析。</div>
+</div>
+<pre><code># 一组实用排障命令
+pid=12345
+taskset -apc "$pid"
+ps -L -p "$pid" -o pid,tid,psr,pcpu,stat,comm
+cat /proc/"$pid"/status | grep -E 'Cpus_allowed|Mems_allowed'
+cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+pidstat -t -p "$pid" 1</code></pre>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常见误区</h2>
+<table>
+<tr><th>误区</th><th>为什么错</th><th>更好的做法</th></tr>
+<tr><td>taskset 后 CPU 被独占</td><td>affinity 只是允许集合，其他任务仍可运行到这些 CPU</td><td>需要独占时用 cgroup cpuset、Kubernetes CPU Manager 或系统级隔离</td></tr>
+<tr><td>CPU list 越窄越快</td><td>过窄会让 DataLoader、NCCL helper 和 Python 线程争抢</td><td>以 step time 和 GPU util 对照验证</td></tr>
+<tr><td>只改主 PID 就覆盖所有线程</td><td>线程是独立 task，可能有不同 affinity</td><td>用 <code>taskset -apc</code> 或启动前规划继承</td></tr>
+<tr><td>容器内可以 taskset 到任意 CPU</td><td>受 cgroup cpuset 限制</td><td>先查看 <code>cpuset.cpus.effective</code></td></tr>
+<tr><td>taskset 等价于 numactl</td><td>taskset 不控制内存节点</td><td>跨 NUMA 问题用 <code>numactl</code> 或 cpuset mems</td></tr>
+</table>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 命令速查</h2>
+<table>
+<tr><th>目标</th><th>命令</th></tr>
+<tr><td>查看当前 shell affinity</td><td><code>taskset -pc $$</code></td></tr>
+<tr><td>用 CPU list 启动命令</td><td><code>taskset -c 0-15 python train.py</code></td></tr>
+<tr><td>用 hex mask 启动命令</td><td><code>taskset 0xffff python train.py</code></td></tr>
+<tr><td>查看已有 PID</td><td><code>taskset -pc PID</code></td></tr>
+<tr><td>修改已有 PID</td><td><code>taskset -pc 16-31 PID</code></td></tr>
+<tr><td>查看 PID 下所有线程</td><td><code>taskset -apc PID</code></td></tr>
+<tr><td>设置 PID 下所有线程</td><td><code>taskset -apc 0-15 PID</code></td></tr>
+<tr><td>看线程当前运行 CPU</td><td><code>ps -L -p PID -o pid,tid,psr,pcpu,comm</code></td></tr>
+<tr><td>看进程允许 CPU</td><td><code>grep Cpus_allowed_list /proc/PID/status</code></td></tr>
+<tr><td>看容器有效 cpuset</td><td><code>cat /sys/fs/cgroup/cpuset.cpus.effective</code></td></tr>
+</table>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 练习任务</h2>
+<ol>
+<li>用 <code>taskset -pc $$</code> 查看当前 shell 的 CPU list。</li>
+<li>用 <code>lscpu -e=CPU,CORE,SOCKET,NODE</code> 找出同一 NUMA node 的 CPU。</li>
+<li>启动一个 CPU 压测命令，并分别限制到 <code>0</code>、<code>0-1</code>、<code>0-3</code> 对比耗时。</li>
+<li>启动一个 Python 多进程 DataLoader demo，观察 worker 是否继承父进程 affinity。</li>
+<li>在容器内查看 <code>cpuset.cpus.effective</code>，验证 taskset 不能越过容器 CPU 集合。</li>
+<li>对比 <code>taskset -c</code> 与 <code>numactl --physcpubind</code> 的输出和行为。</li>
+</ol>
+<pre><code># 简单 CPU 对照练习，不修改系统状态
+cat &gt; /tmp/cpu-demo.py &lt;&lt'PY'
+import time
+s = time.time()
+x = 0
+for i in range(80_000_000):
+    x += i % 7
+print(x, round(time.time() - s, 3))
+PY
+
+/usr/bin/time -f 'no taskset %e sec' python /tmp/cpu-demo.py
+/usr/bin/time -f 'cpu0 %e sec' taskset -c 0 python /tmp/cpu-demo.py
+/usr/bin/time -f 'cpu0-3 %e sec' taskset -c 0-3 python /tmp/cpu-demo.py</code></pre>
+<div class="note"><strong>练习解读：</strong> 单线程 Python 代码不一定从更多 CPU 获益；这个练习的重点是观察亲和性、调度和测量方法，而不是追求最快数字。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+<ul>
+<li>util-linux <code>taskset(1)</code> 手册：命令语法、<code>-p</code>、<code>-c</code>、<code>-a</code> 与 mask/list 说明。</li>
+<li>Linux <code>sched_setaffinity(2)</code> / <code>sched_getaffinity(2)</code>：CPU affinity 的内核接口语义。</li>
+<li>Linux cgroup v2 cpuset 文档：<code>cpuset.cpus</code>、<code>cpuset.cpus.effective</code> 与容器/服务限制。</li>
+<li>PyTorch DataLoader 文档：<code>num_workers</code>、worker 进程与 <code>worker_init_fn</code>。</li>
+<li>NVIDIA NCCL 文档：通信线程、网络传输与拓扑相关调优背景。</li>
+<li><code>numactl(8)</code> 手册：CPU 绑定和内存 NUMA 策略。</li>
+</ul>
+<p class="mini">建议阅读顺序：先理解 affinity mask，再看 cgroup cpuset，最后结合 GPU/NUMA 拓扑设计 rank、DataLoader 和 helper 线程的 CPU 分配策略。</p>
+</section>
+<div class="footer">taskset 深度教程 · AI Infra CPU affinity、DataLoader pinning、NCCL/helper 隔离、容器 cgroup 与 NUMA 调优</div>
+</div>
+</body>
+</html>

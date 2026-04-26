@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ncdu 深度教程：AI Infra 磁盘用量交互式排查</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 8px;background:#f8fafc;font-size:12px;color:#475569}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>ncdu 深度教程：AI Infra 磁盘用量交互式排查</h1>
+<p class="sub">这份教程按 AI Infra 的真实场景讲解 <code>ncdu</code>：训练节点磁盘打满、共享数据集膨胀、checkpoint 按实验堆积、日志目录无限增长、容器缓存占满系统盘、远程无图形环境需要离线分析。重点不是背选项，而是建立“先扫描成目录树，再交互式下钻定位大户，最后用只读/确认/导出流程安全处置”的工作模型。</p>
+<div class="chips"><span class="chip">交互式磁盘分析</span><span class="chip">AI 数据集</span><span class="chip">Checkpoint</span><span class="chip">日志清理</span><span class="chip">排除路径</span><span class="chip">远程节点</span><span class="chip">导出/导入</span><span class="chip">删除安全</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>ncdu</code> 是带 TUI 的 <code>du</code>：它先递归扫描目录用量，生成可排序、可下钻的目录树，让你快速看见“是谁吃掉了磁盘”。</div>
+<div class="success"><strong>最重要原则：</strong> 在生产训练机和共享存储上先用 <code>ncdu -r</code> 只读模式或导出快照分析；需要删除时先确认路径、所属任务、是否有软链接/挂载点，再用版本化清理脚本或明确确认执行。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">ncdu 是什么</a></li>
+<li><a class="anchor" href="#s2">AI Infra 为什么需要 ncdu</a></li>
+<li><a class="anchor" href="#s3">核心模型：扫描、索引、浏览、处置</a></li>
+<li><a class="anchor" href="#s4">安装与版本检查</a></li>
+<li><a class="anchor" href="#s5">第一次扫描和界面键位</a></li>
+<li><a class="anchor" href="#s6">扫描大数据集目录</a></li>
+<li><a class="anchor" href="#s7">Checkpoint 与实验输出排查</a></li>
+<li><a class="anchor" href="#s8">日志目录和临时文件定位</a></li>
+<li><a class="anchor" href="#s9">排除路径与限定文件系统</a></li>
+<li><a class="anchor" href="#s10">删除安全与只读模式</a></li>
+<li><a class="anchor" href="#s11">远程与 Headless 用法</a></li>
+<li><a class="anchor" href="#s12">导出/导入扫描结果</a></li>
+<li><a class="anchor" href="#s13">ncdu vs du/find/ls</a></li>
+<li><a class="anchor" href="#s14">性能、权限与并发影响</a></li>
+<li><a class="anchor" href="#s15">典型 AI Infra Runbook</a></li>
+<li><a class="anchor" href="#s16">常见坑与排障</a></li>
+<li><a class="anchor" href="#s17">练习任务</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. ncdu 是什么</h2>
+<p><code>ncdu</code> 全称常被理解为 NCurses Disk Usage。它用终端字符界面展示目录占用，适合在 SSH、跳板机、训练节点、容器和没有桌面的服务器上快速定位磁盘大户。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>在一个目录树里交互式下钻、按大小排序、看每个目录/文件占比，并快速决定后续清理对象。</div>
+<div class="card"><strong>它不擅长什么</strong><br>实时监控、按时间范围自动清理、跨主机聚合统计、判断文件能不能删。这些需要监控、策略和业务上下文。</div>
+<div class="card"><strong>它的本质</strong><br>递归扫描文件系统元数据和大小信息，再在 TUI 中浏览扫描结果。</div>
+</div>
+<pre><code># 扫描当前目录
+ncdu .
+
+# 扫描数据集根目录
+ncdu /data/datasets
+
+# 只读浏览，禁用 ncdu 内置删除
+ncdu -r /data/checkpoints
+
+# 不跨文件系统，避免从 / 扫到 /mnt、/proc、/run 等挂载点
+ncdu -x /</code></pre>
+<div class="warn"><strong>权限提醒：</strong> <code>ncdu</code> 只能准确统计当前用户有权限访问的路径。遇到 Permission denied 时，结果可能低估；是否使用 <code>sudo</code> 要按机器治理规则决定。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. AI Infra 为什么需要 ncdu</h2>
+<p>AI 工作负载的磁盘增长通常不是单个大文件，而是“数据集 + 预处理缓存 + checkpoint + tensorboard/event 日志 + 容器层 + 临时 shard”的组合。传统 <code>df -h</code> 只能告诉你磁盘满了，不能告诉你是哪条实验线、哪个用户、哪个缓存目录在增长。</p>
+<table>
+<tr><th>场景</th><th>常见症状</th><th>ncdu 的价值</th></tr>
+<tr><td>数据集镜像</td><td><code>/data</code> 或共享 NAS 用量持续上涨</td><td>下钻到数据集、版本、预处理产物，区分原始数据和派生缓存</td></tr>
+<tr><td>模型 checkpoint</td><td>训练正常但保存失败，报 No space left on device</td><td>按实验目录排序，快速发现重复保存、过密保存、未清理失败实验</td></tr>
+<tr><td>日志目录</td><td>系统盘或任务盘被 <code>*.log</code>、event 文件填满</td><td>定位大日志目录，再用 <code>find</code> 按时间和文件名安全处理</td></tr>
+<tr><td>容器/缓存</td><td><code>/var/lib/docker</code>、pip/conda/cache 暴涨</td><td>判断是镜像层、容器写层、包缓存还是临时构建产物</td></tr>
+<tr><td>多用户训练节点</td><td>不知道谁的目录占用最大</td><td>按 <code>/home</code>、<code>/workspace</code>、<code>/scratch</code> 下钻到项目和用户维度</td></tr>
+</table>
+<div class="note"><strong>工作边界：</strong> <code>ncdu</code> 帮你“定位空间在哪里”，但不能替你判断“是否可以删除”。生产清理要结合任务状态、数据血缘、保留策略和负责人确认。</div>
+</section>
+
+<section class="figure" id="s3">
+<h3>信息图：ncdu 的整体心智模型</h3>
+<svg viewBox="0 0 1100 660" width="100%" role="img" aria-label="ncdu 整体模型">
+<rect x="16" y="16" width="1068" height="628" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="55" y="92" width="200" height="112" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="155" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">选择根目录</text><text x="155" y="164" text-anchor="middle" font-size="15">/data /home /</text><text x="155" y="187" text-anchor="middle" font-size="15">加 -x / exclude</text>
+<rect x="315" y="92" width="200" height="112" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="415" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">递归扫描</text><text x="415" y="164" text-anchor="middle" font-size="15">stat / 汇总大小</text><text x="415" y="187" text-anchor="middle" font-size="15">构建目录树</text>
+<rect x="575" y="92" width="200" height="112" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="675" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">交互浏览</text><text x="675" y="164" text-anchor="middle" font-size="15">排序 / 下钻 / 返回</text><text x="675" y="187" text-anchor="middle" font-size="15">看占比和路径</text>
+<rect x="835" y="92" width="200" height="112" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="935" y="132" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">安全处置</text><text x="935" y="164" text-anchor="middle" font-size="15">确认后删除</text><text x="935" y="187" text-anchor="middle" font-size="15">或导出快照</text>
+<rect x="145" y="335" width="810" height="145" rx="20" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="374" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">ncdu = 扫描快照 + 目录树浏览器</text><text x="550" y="414" text-anchor="middle" font-size="16">df 发现磁盘满了；ncdu 定位哪个目录占用；find/rm/归档脚本执行清理。</text><text x="550" y="446" text-anchor="middle" font-size="16">对 AI Infra：从节点、挂载点、用户、实验、checkpoint、日志逐层缩小范围。</text>
+<line x1="255" y1="148" x2="315" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="515" y1="148" x2="575" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="775" y1="148" x2="835" y2="148" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">先选范围，再扫描，再下钻，最后安全处置。范围选错会让扫描慢、结果乱，甚至误扫网络盘和系统伪文件系统。</div></section>
+
+<section class="section" id="s4">
+<h2>3. 安装与版本检查</h2>
+<p><code>ncdu</code> 通常在 Linux 发行版仓库中可直接安装。AI Infra 环境里常见的是 Ubuntu/Debian、RHEL/CentOS/Rocky、容器镜像和 macOS 本地调试机。</p>
+<table>
+<tr><th>环境</th><th>安装命令</th><th>备注</th></tr>
+<tr><td>Ubuntu/Debian</td><td><code>sudo apt-get update &amp;&amp; sudo apt-get install -y ncdu</code></td><td>训练节点上按组织包管理规范执行</td></tr>
+<tr><td>RHEL/CentOS/Rocky</td><td><code>sudo dnf install -y ncdu</code></td><td>老系统可能用 <code>yum</code> 或需要 EPEL</td></tr>
+<tr><td>Alpine 容器</td><td><code>apk add --no-cache ncdu</code></td><td>适合临时排查容器内目录</td></tr>
+<tr><td>macOS</td><td><code>brew install ncdu</code></td><td>本地分析导出的扫描文件时方便</td></tr>
+</table>
+<pre><code># 确认版本和路径
+command -v ncdu
+ncdu --version
+
+# 查看帮助，确认当前版本支持的选项
+ncdu --help | sed -n '1,80p'</code></pre>
+<div class="warn"><strong>版本提醒：</strong> <code>ncdu</code> 1.x 与 2.x 在界面和部分选项上可能存在差异。教程中的 <code>-x</code>、<code>-r</code>、<code>--exclude</code>、<code>-o</code>、<code>-f</code> 是常见能力；生产脚本先用 <code>ncdu --help</code> 在目标机器确认。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 第一次扫描和界面键位</h2>
+<p>最小用法是给 <code>ncdu</code> 一个目录。扫描完成后进入交互界面，常用动作是上下移动、回车进入目录、左键或 <span class="kbd">h</span> 返回、按大小排序、查看帮助、退出。</p>
+<pre><code># 在当前项目中试用
+ncdu .
+
+# 扫描用户目录
+ncdu "$HOME"
+
+# 扫描根目录但不要跨文件系统
+sudo ncdu -x /</code></pre>
+<table>
+<tr><th>键位</th><th>作用</th><th>AI Infra 场景</th></tr>
+<tr><td><span class="kbd">↑</span>/<span class="kbd">↓</span> 或 <span class="kbd">j</span>/<span class="kbd">k</span></td><td>移动选择</td><td>浏览目录列表，优先看最大项</td></tr>
+<tr><td><span class="kbd">Enter</span>/<span class="kbd">→</span></td><td>进入目录</td><td>从 <code>/data</code> 下钻到具体数据集或实验</td></tr>
+<tr><td><span class="kbd">←</span>/<span class="kbd">h</span></td><td>返回上级</td><td>在多个候选目录之间切换</td></tr>
+<tr><td><span class="kbd">?</span></td><td>查看内置帮助</td><td>确认当前版本支持的键位</td></tr>
+<tr><td><span class="kbd">d</span></td><td>删除选中项，通常会确认</td><td>仅在确认安全时使用；生产建议先 <code>-r</code></td></tr>
+<tr><td><span class="kbd">q</span></td><td>退出</td><td>结束分析</td></tr>
+</table>
+<div class="note"><strong>界面读法：</strong> 顶层显示最大目录时，不要马上删除。先进入该目录，继续下钻到“可解释、可归属、可处置”的层级，例如 <code>run-2026-04-25/checkpoints/epoch_120</code>。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 扫描大数据集目录</h2>
+<p>AI 数据目录常包含原始数据、解压副本、tokenized 缓存、shard、中间特征、索引文件和临时下载残留。<code>ncdu</code> 的价值是把“感觉很大”变成“哪个版本、哪个阶段、哪个子目录最大”。</p>
+<pre><code># 只读扫描数据集根目录
+ncdu -r /data/datasets
+
+# 扫描单个项目数据目录
+ncdu -r /data/datasets/vision/imagenet-derived
+
+# 避免跨到其他挂载点，尤其是 /data 下有 bind mount 时
+ncdu -rx /data</code></pre>
+<div class="grid-3">
+<div class="card"><strong>原始数据</strong><br>例如 <code>raw/</code>、<code>download/</code>、<code>archives/</code>。通常不能随意删，要看是否有上游备份。</div>
+<div class="card"><strong>派生缓存</strong><br>例如 <code>tokenized/</code>、<code>features/</code>、<code>preprocessed/</code>。可再生，但再生成成本可能很高。</div>
+<div class="card"><strong>临时残留</strong><br>例如 <code>tmp/</code>、<code>.partial</code>、失败下载、重复解压。通常是优先清理候选。</div>
+</div>
+<h3>配合 find 做二次确认</h3>
+<pre><code># 先用 ncdu 找到大目录，再用 find 看近期是否还在写入
+find /data/datasets/myset -maxdepth 3 -type f -mtime -2 -printf '%TY-%Tm-%Td %TH:%TM %p\n' | head
+
+# 查看最大文件，避免误删正在使用的大 shard
+find /data/datasets/myset -type f -printf '%s %p\n' | sort -nr | head -20</code></pre>
+<div class="warn"><strong>共享数据提醒：</strong> 数据集目录经常被多个训练任务复用。即使 <code>ncdu</code> 显示某个目录很大，也要确认 owner、引用关系、数据目录约定和保留策略。</div>
+</section>
+
+<section class="figure" id="fig-checkpoint-workflow">
+<h3>流程图：从磁盘告警到 checkpoint 清理</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="checkpoint 清理工作流">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="66" rx="14" fill="#fee2e2" stroke="#fecaca"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">磁盘告警 / 保存失败</text>
+<rect x="75" y="165" width="230" height="82" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="190" y="198" text-anchor="middle" font-size="18" font-weight="700">确认挂载点</text><text x="190" y="225" text-anchor="middle" font-size="14">df -h / lsblk</text>
+<rect x="435" y="165" width="230" height="82" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="198" text-anchor="middle" font-size="18" font-weight="700">只读 ncdu 下钻</text><text x="550" y="225" text-anchor="middle" font-size="14">ncdu -rx /data</text>
+<rect x="795" y="165" width="230" height="82" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="910" y="198" text-anchor="middle" font-size="18" font-weight="700">确认任务状态</text><text x="910" y="225" text-anchor="middle" font-size="14">训练中 / 已结束</text>
+<polygon points="550,310 720,390 550,470 380,390" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="384" text-anchor="middle" font-size="17" font-weight="700">是否可删除？</text><text x="550" y="410" text-anchor="middle" font-size="14">owner / 策略 / 最近访问</text>
+<rect x="95" y="535" width="260" height="82" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="225" y="568" text-anchor="middle" font-size="18" font-weight="700">不可删：归档/扩容</text><text x="225" y="595" text-anchor="middle" font-size="14">迁移到冷存储或加容量</text>
+<rect x="745" y="535" width="260" height="82" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="875" y="568" text-anchor="middle" font-size="18" font-weight="700">可删：脚本化清理</text><text x="875" y="595" text-anchor="middle" font-size="14">先 dry-run，再执行</text>
+<line x1="550" y1="111" x2="190" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="550" y2="165" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="910" y2="165" stroke="#94a3b8" stroke-width="3"/>
+<line x1="190" y1="247" x2="430" y2="340" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="247" x2="550" y2="310" stroke="#94a3b8" stroke-width="3"/><line x1="910" y1="247" x2="670" y2="340" stroke="#94a3b8" stroke-width="3"/>
+<line x1="420" y1="425" x2="300" y2="535" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><text x="345" y="490" font-size="14">否</text><line x1="680" y1="425" x2="800" y2="535" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><text x="748" y="490" font-size="14">是</text>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">ncdu 是定位工具，不是审批工具。checkpoint 删除必须经过任务状态和保留策略确认。</div></section>
+
+<section class="section" id="s7">
+<h2>6. Checkpoint 与实验输出排查</h2>
+<p>Checkpoint 目录通常是 AI Infra 最常见的空间黑洞：同一实验保存过密、多个 seed 重复输出、失败任务留下完整权重、评估产物复制模型、对象存储同步失败导致本地堆积。</p>
+<pre><code># 从实验根目录只读下钻
+ncdu -r /data/checkpoints
+
+# 限定到一个团队或项目
+ncdu -r /data/checkpoints/nlp-foundation
+
+# 找出最近仍在写入的 checkpoint，避免误清正在训练的 run
+find /data/checkpoints/nlp-foundation -type f -mtime -1 -printf '%TY-%Tm-%Td %TH:%TM %p\n' | head -50</code></pre>
+<h3>推荐清理策略</h3>
+<table>
+<tr><th>对象</th><th>风险</th><th>建议</th></tr>
+<tr><td>最后一个 checkpoint</td><td>高</td><td>通常保留，除非实验已明确废弃</td></tr>
+<tr><td>中间 epoch 大量权重</td><td>中</td><td>按策略保留最后 N 个、最佳 N 个、关键里程碑</td></tr>
+<tr><td>失败实验完整目录</td><td>中</td><td>确认无复现实验价值后删除或归档</td></tr>
+<tr><td>重复复制的 <code>best.pt</code>/<code>latest.pt</code></td><td>中</td><td>确认硬链接/软链接/真实副本后处理</td></tr>
+<tr><td>评估临时输出</td><td>低到中</td><td>优先清理，但保留指标和配置</td></tr>
+</table>
+<pre><code># dry-run：列出 30 天前的中间 checkpoint，不删除
+find /data/checkpoints/myproj -type f \
+  -name 'epoch_*.pt' -mtime +30 -print
+
+# 执行前二次确认：抽样查看路径
+find /data/checkpoints/myproj -type f \
+  -name 'epoch_*.pt' -mtime +30 -print | sed -n '1,20p'</code></pre>
+<div class="danger"><strong>删除警告：</strong> 不要只凭文件名删除 <code>*.pt</code>、<code>*.safetensors</code> 或 <code>*.ckpt</code>。先确认实验状态、是否已上传、是否有追溯要求，以及是否被下游评估或蒸馏任务引用。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. 日志目录和临时文件定位</h2>
+<p>日志膨胀经常发生在长训练、分布式任务、debug 级别过高、重复重试和 TensorBoard event 文件堆积时。<code>ncdu</code> 能快速定位哪个 run 的日志最大，然后用 <code>find</code> 按时间、文件名和大小做安全处理。</p>
+<pre><code># 扫描常见日志根目录
+ncdu -r /data/logs
+ncdu -r /var/log
+ncdu -r /workspace/runs
+
+# 扫描 TensorBoard/event 输出
+ncdu -r /data/experiments/tensorboard</code></pre>
+<table>
+<tr><th>目录/文件</th><th>可能原因</th><th>处理建议</th></tr>
+<tr><td><code>events.out.tfevents.*</code></td><td>训练指标、histogram、embedding 写入过多</td><td>保留近期或关键实验，压缩/归档历史</td></tr>
+<tr><td><code>stdout.log</code>/<code>stderr.log</code></td><td>每步打印、debug 日志过多</td><td>先确认任务已结束，再截断或归档</td></tr>
+<tr><td><code>wandb/</code>/<code>mlruns/</code></td><td>离线缓存未同步或未清理</td><td>确认同步状态后清理缓存</td></tr>
+<tr><td><code>tmp/</code>/<code>.cache/</code></td><td>预处理或下载中断</td><td>按最近修改时间和 owner 判断</td></tr>
+</table>
+<pre><code># dry-run：列出 14 天前的大日志
+find /data/logs -type f -name '*.log' -mtime +14 -size +100M -print
+
+# dry-run：查看大于 1G 的 event 文件
+find /data/experiments -type f -name 'events.out.tfevents.*' -size +1G -print
+
+# 安全截断前先确认：只对已结束任务的日志执行
+# : &gt; /data/logs/finished-run/stdout.log</code></pre>
+<div class="warn"><strong>截断提醒：</strong> 对正在运行的进程日志直接删除，空间可能不会立刻释放，因为文件描述符仍被进程持有。需要看 <code>lsof +L1</code> 或重启/让进程重新打开日志。</div>
+</section>
+
+<section class="figure" id="fig-scan-scope">
+<h3>用例图：扫描范围、排除路径和挂载点</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="扫描范围和排除路径">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="72" text-anchor="middle" font-size="26" font-weight="700">扫描范围决定 ncdu 的速度和准确性</text>
+<rect x="70" y="135" width="260" height="360" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="200" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">推荐</text><text x="200" y="222" text-anchor="middle" font-size="16">ncdu -rx /data</text><text x="200" y="255" text-anchor="middle" font-size="16">--exclude cache</text><text x="200" y="288" text-anchor="middle" font-size="16">--exclude-from file</text><text x="200" y="338" text-anchor="middle" font-size="15">范围小、意图清楚</text><text x="200" y="366" text-anchor="middle" font-size="15">不跨挂载点</text><text x="200" y="394" text-anchor="middle" font-size="15">可重复执行</text>
+<rect x="420" y="135" width="260" height="360" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">谨慎</text><text x="550" y="222" text-anchor="middle" font-size="16">sudo ncdu /</text><text x="550" y="255" text-anchor="middle" font-size="16">扫描 NFS 根</text><text x="550" y="288" text-anchor="middle" font-size="16">扫描海量小文件</text><text x="550" y="338" text-anchor="middle" font-size="15">可能很慢</text><text x="550" y="366" text-anchor="middle" font-size="15">可能影响元数据服务</text><text x="550" y="394" text-anchor="middle" font-size="15">结果受权限影响</text>
+<rect x="770" y="135" width="260" height="360" rx="20" fill="#fee2e2" stroke="#fecaca"/><text x="900" y="178" text-anchor="middle" font-size="22" font-weight="700" fill="#b91c1c">避免</text><text x="900" y="222" text-anchor="middle" font-size="16">误扫 /proc /sys</text><text x="900" y="255" text-anchor="middle" font-size="16">误扫远端挂载</text><text x="900" y="288" text-anchor="middle" font-size="16">在高峰期全盘扫</text><text x="900" y="338" text-anchor="middle" font-size="15">噪声大</text><text x="900" y="366" text-anchor="middle" font-size="15">耗时长</text><text x="900" y="394" text-anchor="middle" font-size="15">可能干扰业务</text>
+<rect x="245" y="545" width="610" height="54" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="579" text-anchor="middle" font-size="17">经验法则：先扫最可能的挂载点，再逐步扩大；不要一开始就 sudo ncdu /。</text>
+</svg><div class="caption">AI 训练节点常有本地 NVMe、共享 NAS、对象存储挂载和容器伪文件系统。先限定范围，结果才可解释。</div></section>
+
+<section class="section" id="s9">
+<h2>8. 排除路径与限定文件系统</h2>
+<p>大目录扫描的第一优化不是“让 ncdu 更快”，而是“不扫描不该扫描的东西”。常见手段是 <code>-x</code> 限定单一文件系统，以及 <code>--exclude</code> 或 <code>--exclude-from</code> 排除已知无关路径。</p>
+<pre><code># 不跨文件系统：扫描 / 时尤其重要
+sudo ncdu -x /
+
+# 只读 + 不跨文件系统：适合生产排查
+sudo ncdu -rx /data
+
+# 排除常见缓存和临时目录
+ncdu -r /workspace \
+  --exclude '.git' \
+  --exclude '__pycache__' \
+  --exclude '.cache' \
+  --exclude 'tmp'</code></pre>
+<h3>用排除文件管理团队规则</h3>
+<pre><code>cat &gt; /tmp/ncdu-excludes.txt &lt;&lt'EOF'
+.git
+__pycache__
+*.pyc
+.ipynb_checkpoints
+node_modules
+tmp
+EOF
+
+ncdu -r --exclude-from /tmp/ncdu-excludes.txt /workspace/myproj</code></pre>
+<table>
+<tr><th>选项</th><th>作用</th><th>使用建议</th></tr>
+<tr><td><code>-x</code></td><td>不跨越文件系统边界</td><td>扫 <code>/</code>、<code>/data</code>、容器宿主机时优先考虑</td></tr>
+<tr><td><code>--exclude PATTERN</code></td><td>排除匹配模式的文件或目录</td><td>适合少量规则；模式语义以当前版本帮助为准</td></tr>
+<tr><td><code>--exclude-from FILE</code></td><td>从文件读取排除规则</td><td>适合团队共享规则和可重复扫描</td></tr>
+<tr><td><code>-r</code></td><td>只读模式</td><td>生产、共享目录和远程快照分析优先使用</td></tr>
+</table>
+<div class="warn"><strong>排除提醒：</strong> 排除规则会让统计结果“不含被排除部分”。报告磁盘占用时要说明扫描命令，否则别人可能把结果误解为完整用量。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. 删除安全与只读模式</h2>
+<p><code>ncdu</code> 可以在界面中删除选中项，但在 AI Infra 生产环境里，直接在 TUI 里按 <span class="kbd">d</span> 清理通常不是最可审计的方式。更稳妥的流程是：用 <code>ncdu -r</code> 定位，复制路径，用 <code>find</code> 或清理脚本 dry-run，确认后执行。</p>
+<pre><code># 推荐：只读分析，不允许 ncdu 内置删除
+ncdu -r /data/checkpoints
+
+# dry-run：列出候选文件
+find /data/checkpoints/myrun -type f -name 'epoch_*.pt' -mtime +30 -print
+
+# dry-run：看候选总大小
+find /data/checkpoints/myrun -type f -name 'epoch_*.pt' -mtime +30 -printf '%s\n' \
+  | awk '{s += $1} END {printf "%.2f GiB\n", s/1024/1024/1024}'
+
+# 执行删除前建议先把候选列表保存下来
+find /data/checkpoints/myrun -type f -name 'epoch_*.pt' -mtime +30 -print \
+  &gt; /tmp/delete-candidates.txt</code></pre>
+<div class="danger"><strong>生产删除底线：</strong> 不要在不理解路径含义时删除；不要删除正在运行任务的输出；不要在共享数据集根目录试错；不要用通配符直接 <code>rm -rf</code> 未审查列表。</div>
+<h3>删除前检查清单</h3>
+<div class="grid-2">
+<div class="card"><strong>路径归属</strong><br>目录属于哪个用户、项目、任务、实验？是否有 issue、工单或保留策略？</div>
+<div class="card"><strong>任务状态</strong><br>训练是否仍在写入？调度系统里任务是否 Running？日志是否还在增长？</div>
+<div class="card"><strong>数据血缘</strong><br>是否是原始数据、可再生缓存、最终模型、评估结果或临时文件？</div>
+<div class="card"><strong>恢复能力</strong><br>是否已上传对象存储？是否有备份？删除后重新生成成本多大？</div>
+</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. 远程与 Headless 用法</h2>
+<p><code>ncdu</code> 的优势之一是只需要终端，不需要图形界面。你可以直接 SSH 到节点运行，也可以在远程节点导出扫描结果，再在本地或跳板机导入浏览。</p>
+<pre><code># 直接 SSH 到训练节点交互式排查
+ssh gpu-node-01
+ncdu -r /data
+
+# 如果网络不稳定，用 tmux/screen 包住交互会话
+tmux new -s disk-debug
+ncdu -r /data/checkpoints</code></pre>
+<h3>远程导出、本地导入</h3>
+<pre><code># 在远程执行扫描并把结果写回本地文件
+ssh gpu-node-01 'ncdu -0xo- /data/checkpoints' &gt; gpu-node-01-checkpoints.ncdu
+
+# 本地或跳板机导入浏览
+ncdu -f gpu-node-01-checkpoints.ncdu
+
+# 数据很大时压缩传输
+ssh gpu-node-01 'ncdu -0xo- /data/checkpoints' | gzip &gt; gpu-node-01-checkpoints.ncdu.gz
+gzip -dc gpu-node-01-checkpoints.ncdu.gz | ncdu -f-</code></pre>
+<div class="note"><strong>Headless 心法：</strong> 远程机器负责扫描，本地机器负责浏览。这样可以避免长时间占用 SSH 交互，也方便把快照附到排障记录里。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 导出/导入扫描结果</h2>
+<p>导出/导入适合三类场景：扫描耗时很长、需要离线分析、需要把磁盘快照交给其他人复核。导出的文件是某一时刻的快照，不会随磁盘变化自动更新。</p>
+<pre><code># 导出到文件
+ncdu -o /tmp/data-scan.ncdu /data
+
+# 从文件导入浏览
+ncdu -f /tmp/data-scan.ncdu
+
+# 输出到 stdout，适合管道和 ssh
+ncdu -0xo- /data &gt; /tmp/data-scan.ncdu
+
+# 从 stdin 导入
+cat /tmp/data-scan.ncdu | ncdu -f-</code></pre>
+<table>
+<tr><th>方式</th><th>优点</th><th>注意事项</th></tr>
+<tr><td><code>ncdu -o file dir</code></td><td>简单直观，适合本机保存</td><td>文件可能包含路径结构，按内部信息规范保存</td></tr>
+<tr><td><code>ncdu -0xo- dir</code></td><td>适合脚本、SSH、压缩管道</td><td><code>-0</code> 常用于非交互/无进度输出场景，先确认版本支持</td></tr>
+<tr><td><code>ncdu -f file</code></td><td>无需重新扫描即可浏览</td><td>看到的是快照，不代表当前实时状态</td></tr>
+</table>
+<div class="success"><strong>协作建议：</strong> 排障记录中保存 <code>df -h</code>、<code>mount</code>、<code>ncdu</code> 扫描命令和导出文件路径，后续复盘时能还原当时判断依据。</div>
+</section>
+
+<section class="figure" id="fig-tool-comparison">
+<h3>对比图：ncdu、du、find、ls 怎么分工</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="ncdu du find ls 对比">
+<rect x="20" y="20" width="1060" height="610" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">磁盘排查工具不是互相替代，而是分层配合</text>
+<rect x="70" y="125" width="220" height="355" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="180" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">df</text><text x="180" y="215" text-anchor="middle" font-size="15">看挂载点是否满</text><text x="180" y="245" text-anchor="middle" font-size="15">回答：哪块盘满？</text><text x="180" y="320" text-anchor="middle" font-size="14">df -h</text>
+<rect x="320" y="125" width="220" height="355" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="430" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">du</text><text x="430" y="215" text-anchor="middle" font-size="15">批量统计目录大小</text><text x="430" y="245" text-anchor="middle" font-size="15">回答：每层多大？</text><text x="430" y="320" text-anchor="middle" font-size="14">du -h --max-depth=1</text>
+<rect x="570" y="125" width="220" height="355" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="680" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">ncdu</text><text x="680" y="215" text-anchor="middle" font-size="15">交互式下钻排序</text><text x="680" y="245" text-anchor="middle" font-size="15">回答：谁最该看？</text><text x="680" y="320" text-anchor="middle" font-size="14">ncdu -r /data</text>
+<rect x="820" y="125" width="220" height="355" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="930" y="170" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">find</text><text x="930" y="215" text-anchor="middle" font-size="15">按条件列出文件</text><text x="930" y="245" text-anchor="middle" font-size="15">回答：哪些可清？</text><text x="930" y="320" text-anchor="middle" font-size="14">find ... -mtime +30</text>
+<line x1="290" y1="300" x2="320" y2="300" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="540" y1="300" x2="570" y2="300" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="790" y1="300" x2="820" y2="300" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<rect x="270" y="535" width="560" height="54" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="569" text-anchor="middle" font-size="17">常用链路：df 发现问题 → ncdu 定位目录 → find 生成候选 → 脚本确认清理。</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">ncdu 最适合“探索式定位”；真正批量删除和审计仍建议交给可复现的 shell 命令或清理脚本。</div></section>
+
+<section class="section" id="s13">
+<h2>12. ncdu vs du/find/ls</h2>
+<table>
+<tr><th>工具</th><th>优势</th><th>劣势</th><th>最佳用途</th></tr>
+<tr><td><code>df -h</code></td><td>极快，看文件系统总体用量</td><td>不知道哪个目录占用</td><td>告警第一步，确认满的是哪块盘</td></tr>
+<tr><td><code>du</code></td><td>脚本友好，适合生成文本报告</td><td>交互探索不方便，层级切换慢</td><td>定期报表、浅层目录统计</td></tr>
+<tr><td><code>ncdu</code></td><td>交互式、排序、下钻快</td><td>扫描是快照，不是实时监控；TUI 删除不易审计</td><td>人工排障、定位空间大户</td></tr>
+<tr><td><code>find</code></td><td>按时间、大小、名字、类型精确筛选</td><td>不适合自由探索目录树</td><td>生成清理候选列表和执行批处理</td></tr>
+<tr><td><code>ls</code></td><td>查看单目录文件属性方便</td><td>不递归汇总目录真实占用</td><td>查看 ncdu 定位后的具体文件</td></tr>
+</table>
+<pre><code># du：快速看一层目录大小
+du -h --max-depth=1 /data 2&gt;/dev/null | sort -h
+
+# ncdu：交互式定位最大子树
+ncdu -r /data
+
+# find：生成可审计候选列表
+find /data/checkpoints -type f -name 'epoch_*.pt' -mtime +30 -print</code></pre>
+<div class="note"><strong>选择标准：</strong> 如果你已经知道要找“30 天前的 checkpoint”，用 <code>find</code>；如果你还不知道空间在哪，用 <code>ncdu</code>。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 性能、权限与并发影响</h2>
+<p><code>ncdu</code> 扫描会遍历目录树并读取元数据。对本地 NVMe 通常很快；对 NFS、Lustre、CephFS、海量小文件目录或对象存储挂载，扫描可能给元数据服务带来压力。</p>
+<div class="grid-3">
+<div class="card"><strong>海量小文件</strong><br>瓶颈常在元数据，不在吞吐。避免高峰期扫全量目录。</div>
+<div class="card"><strong>权限不足</strong><br>会漏统计无法进入的目录。排查系统盘时可能需要管理员配合。</div>
+<div class="card"><strong>目录变化</strong><br>扫描期间训练仍在写入，结果只是近似快照。需要结合时间戳和任务状态判断。</div>
+</div>
+<pre><code># 先确认挂载类型和目录边界
+df -hT /data
+findmnt /data
+
+# 网络文件系统上优先缩小范围
+ncdu -r /data/checkpoints/team-a
+
+# 高峰期避免全局扫描，必要时导出给离线分析
+ncdu -0x -o /tmp/team-a-scan.ncdu /data/checkpoints/team-a</code></pre>
+<table>
+<tr><th>风险</th><th>表现</th><th>缓解</th></tr>
+<tr><td>扫描太慢</td><td>长时间停在 scanning</td><td>缩小根目录、加排除规则、避开共享 FS 高峰</td></tr>
+<tr><td>结果偏小</td><td>有权限错误或隐藏挂载</td><td>记录错误，必要时用具备权限的账号重新扫</td></tr>
+<tr><td>空间未释放</td><td>删除后 <code>df</code> 不变</td><td>检查打开的已删除文件、快照、回收站、配额</td></tr>
+<tr><td>误扫挂载点</td><td>扫描范围异常大</td><td>使用 <code>-x</code>，先查看 <code>findmnt</code></td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 典型 AI Infra Runbook</h2>
+<p>下面是一个从告警到处置的可复制流程。它刻意把“定位”和“删除”分开，方便审计和复盘。</p>
+<h3>场景 A：训练节点系统盘满</h3>
+<pre><code># 1. 确认满的是哪块盘
+df -hT
+
+# 2. 不跨文件系统扫描系统盘
+sudo ncdu -rx /
+
+# 3. 常见候选：容器层、日志、包缓存
+sudo ncdu -r /var/lib/docker
+sudo ncdu -r /var/log
+ncdu -r "$HOME/.cache"</code></pre>
+<h3>场景 B：checkpoint 挂载点满</h3>
+<pre><code># 1. 看挂载点和用量
+df -hT /data/checkpoints
+
+# 2. 只读扫描团队目录
+ncdu -r /data/checkpoints/team-a
+
+# 3. 生成候选，不直接删除
+find /data/checkpoints/team-a -type f -name 'epoch_*.pt' -mtime +30 -print \
+  &gt; /tmp/team-a-old-checkpoints.txt</code></pre>
+<h3>场景 C：共享数据集异常膨胀</h3>
+<pre><code># 1. 先扫项目级，不扫整个共享存储
+ncdu -r /data/datasets/project-x
+
+# 2. 找派生缓存和临时目录
+find /data/datasets/project-x -maxdepth 4 -type d \
+  \( -name 'tmp' -o -name 'cache' -o -name 'preprocessed' \) -print
+
+# 3. 只列候选，交给 owner 确认
+find /data/datasets/project-x -type f -name '*.partial' -print</code></pre>
+<div class="success"><strong>Runbook 输出物：</strong> 每次清理最好留下扫描命令、候选列表、确认人、执行命令、释放空间前后的 <code>df -h</code>。这比“我在 ncdu 里删了一些东西”更可维护。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>安全排障图：ncdu 结果不符合预期时怎么查</h3>
+<svg viewBox="0 0 1100 730" width="100%" role="img" aria-label="ncdu 排障和安全流程">
+<rect x="20" y="20" width="1060" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="420" y="45" width="260" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">ncdu 结果异常</text>
+<rect x="70" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="180" y="195" text-anchor="middle" font-size="18" font-weight="700">范围是否正确？</text><text x="180" y="223" text-anchor="middle" font-size="14">根目录 / -x / exclude</text>
+<rect x="315" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="195" text-anchor="middle" font-size="18" font-weight="700">权限是否足够？</text><text x="425" y="223" text-anchor="middle" font-size="14">Permission denied</text>
+<rect x="560" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="195" text-anchor="middle" font-size="18" font-weight="700">文件是否仍打开？</text><text x="670" y="223" text-anchor="middle" font-size="14">删除后空间不释放</text>
+<rect x="805" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="915" y="195" text-anchor="middle" font-size="18" font-weight="700">快照/配额影响？</text><text x="915" y="223" text-anchor="middle" font-size="14">ZFS/LVM/FS quota</text>
+<rect x="105" y="365" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="230" y="399" text-anchor="middle" font-size="18" font-weight="700">用 df/findmnt 校验</text><text x="230" y="428" text-anchor="middle" font-size="14">确认挂载点和类型</text>
+<rect x="425" y="365" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="399" text-anchor="middle" font-size="18" font-weight="700">重扫小范围</text><text x="550" y="428" text-anchor="middle" font-size="14">减少权限和并发噪声</text>
+<rect x="745" y="365" width="250" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="870" y="399" text-anchor="middle" font-size="18" font-weight="700">检查 lsof +L1</text><text x="870" y="428" text-anchor="middle" font-size="14">定位已删除仍打开文件</text>
+<rect x="300" y="565" width="500" height="78" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="598" text-anchor="middle" font-size="20" font-weight="700">先证明“哪里占用”，再证明“能否释放”</text><text x="550" y="623" text-anchor="middle" font-size="14">ncdu 是目录视角；df 是文件系统视角；两者不一致时要查打开文件、快照和配额。</text>
+<line x1="550" y1="111" x2="180" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="425" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="670" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="915" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="180" y1="252" x2="230" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="252" x2="550" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="252" x2="870" y2="365" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="252" x2="870" y2="365" stroke="#94a3b8" stroke-width="3"/>
+<line x1="230" y1="455" x2="410" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="455" x2="550" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="870" y1="455" x2="690" y2="565" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">删除后空间没变不一定是 ncdu 错了，常见原因是文件仍被进程打开、文件系统快照保留、配额统计延迟或删错挂载点。</div></section>
+
+<section class="section" id="s16">
+<h2>15. 常见坑与排障</h2>
+<div class="grid-2">
+<div class="card"><strong>坑 1：直接扫 <code>/</code> 且不加 <code>-x</code></strong><br>可能跨到远程挂载、容器目录或伪文件系统。优先 <code>ncdu -x /</code>。</div>
+<div class="card"><strong>坑 2：把 ncdu 快照当实时监控</strong><br>扫描后目录继续增长，界面不会自动代表最新状态。需要重新扫描或配合监控。</div>
+<div class="card"><strong>坑 3：权限不足导致低估</strong><br>普通用户无法进入的目录不会完整统计。记录权限错误，必要时让管理员扫描。</div>
+<div class="card"><strong>坑 4：TUI 里误删</strong><br>生产环境用 <code>-r</code>，把删除动作交给 dry-run 后的脚本。</div>
+<div class="card"><strong>坑 5：删除文件但 <code>df</code> 不降</strong><br>进程仍打开已删除文件、文件系统快照、配额延迟都可能导致空间未释放。</div>
+<div class="card"><strong>坑 6：软链接和挂载点误判</strong><br>目录树里的路径不一定等于物理归属。先用 <code>findmnt</code>、<code>ls -l</code>、<code>readlink</code> 确认。</div>
+<div class="card"><strong>坑 7：网络文件系统高峰期全量扫</strong><br>元数据压力可能影响训练。缩小范围或在低峰扫描。</div>
+<div class="card"><strong>坑 8：只看最大目录，不看业务含义</strong><br>最大的目录可能是关键数据集，不是清理对象。要下钻到可归属层级。</div>
+</div>
+<h3>排障命令模板</h3>
+<pre><code># 确认文件系统视角
+df -hT /data
+findmnt /data
+
+# 确认目录视角
+du -h --max-depth=1 /data 2&gt;/dev/null | sort -h
+ncdu -r /data
+
+# 删除后空间未释放：查已删除但仍打开的文件
+sudo lsof +L1 | sed -n '1,40p'
+
+# 查某目录最近是否还在写
+find /data/checkpoints/myrun -type f -mmin -60 -printf '%TY-%Tm-%Td %TH:%TM %p\n' | head</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 学习路线与练习任务</h2>
+<h3>第一阶段：会定位</h3>
+<ul>
+<li>用 <code>df -h</code> 确认满的是哪个挂载点。</li>
+<li>用 <code>ncdu -r</code> 在只读模式中浏览目录树。</li>
+<li>练习进入、返回、排序、查看帮助和退出。</li>
+</ul>
+<h3>第二阶段：会控范围</h3>
+<ul>
+<li>理解 <code>-x</code> 的作用，避免误扫其他挂载点。</li>
+<li>使用 <code>--exclude</code> 和 <code>--exclude-from</code> 排除无关缓存。</li>
+<li>在网络文件系统上优先扫描项目级目录，而不是全局根目录。</li>
+</ul>
+<h3>第三阶段：会安全处置</h3>
+<ul>
+<li>把 <code>ncdu</code> 定位结果转成 <code>find</code> dry-run 候选列表。</li>
+<li>计算候选总大小，确认释放空间是否足够。</li>
+<li>保留扫描命令、候选列表、确认记录和执行前后的 <code>df -h</code>。</li>
+</ul>
+<h3>本地练习</h3>
+<pre><code># 准备练习目录
+mkdir -p /tmp/ncdu-demo/{raw,cache,logs,checkpoints}
+dd if=/dev/zero of=/tmp/ncdu-demo/raw/data.bin bs=1M count=32
+dd if=/dev/zero of=/tmp/ncdu-demo/cache/features.bin bs=1M count=64
+dd if=/dev/zero of=/tmp/ncdu-demo/checkpoints/epoch_001.pt bs=1M count=16
+printf 'hello\n' &gt; /tmp/ncdu-demo/logs/train.log
+
+# 只读浏览
+ncdu -r /tmp/ncdu-demo
+
+# 导出再导入
+ncdu -o /tmp/ncdu-demo.ncdu /tmp/ncdu-demo
+ncdu -f /tmp/ncdu-demo.ncdu
+
+# 清理练习目录前先确认路径，再交互式确认删除
+find /tmp/ncdu-demo -maxdepth 2 -type f -print
+rm -ri /tmp/ncdu-demo /tmp/ncdu-demo.ncdu</code></pre>
+<div class="warn"><strong>练习提醒：</strong> <code>dd</code> 会真实占用磁盘空间。示例使用 <code>/tmp</code> 和较小文件，执行前仍要确认本机剩余空间。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>ncdu 官方文档与 <code>ncdu --help</code>：选项、键位、导出/导入格式和版本差异。</li>
+<li>Linux man-pages：<code>du(1)</code>、<code>df(1)</code>、<code>find(1)</code>、<code>lsof(8)</code>，用于配合定位和清理。</li>
+<li>发行版手册：Ubuntu/Debian、RHEL/Rocky、Alpine 的包管理与系统目录规范。</li>
+<li>团队内部数据保留策略：checkpoint 保留数量、日志归档周期、数据集 owner、共享存储清理审批流程。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握扫描快照和交互浏览模型，再学习 <code>-r</code>、<code>-x</code>、排除规则和导出/导入，最后把 ncdu 放进可审计的 AI Infra 清理 Runbook。</p></section>
+<div class="footer">ncdu 深度教程 · AI Infra 磁盘排查 · 数据集、checkpoint、日志、远程快照与删除安全</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>dmesg 深度教程：AI Infra 节点的内核日志、OOM、GPU XID 与硬件错误排障</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>dmesg 深度教程：AI Infra 节点的内核日志、OOM、GPU XID 与硬件错误排障</h1>
+<p class="sub">这份教程围绕 Linux 命令 <code>dmesg</code> 展开，面向 AI Infra、GPU 集群、训练节点和高性能存储/网络环境。它从“内核 ring buffer 是什么”开始，讲清楚 <code>dmesg -T -w</code> 实时观察、权限限制、journald 关系、OOM、NVIDIA GPU XID、PCIe/AER、NVMe/块设备错误、驱动加载，以及节点故障排查时如何把 <code>dmesg</code> 与 <code>journalctl</code>、<code>nvidia-smi</code>、<code>nvme</code>、<code>lspci</code> 和 Kubernetes 事件串起来。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">kernel ring buffer</span><span class="chip">dmesg -T -w</span><span class="chip">OOM</span><span class="chip">GPU XID</span><span class="chip">PCIe/AER</span><span class="chip">NVMe</span><span class="chip">driver load</span><span class="chip">journald</span><span class="chip">生产排障</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>dmesg</code> 读取内核日志缓冲区，告诉你“内核最近看到了什么”：硬件枚举、驱动加载、内存回收、进程被 OOM kill、GPU/PCIe/NVMe 错误、网络和文件系统异常。</div>
+<div class="success"><strong>生产实践：</strong> 排障优先使用只读命令，例如 <code>dmesg -T</code>、<code>dmesg -T -w</code>、<code>journalctl -k</code>；不要随手执行 <code>dmesg -C</code> 清空缓冲区，也不要为了方便永久放宽 <code>kernel.dmesg_restrict</code>。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">dmesg 是什么</a></li>
+<li><a class="anchor" href="#s2">内核 ring buffer 心智模型</a></li>
+<li><a class="anchor" href="#s3">基本语法与常用选项</a></li>
+<li><a class="anchor" href="#s4">时间戳：-T、-w 与 --time-format</a></li>
+<li><a class="anchor" href="#s5">日志级别、设施与筛选</a></li>
+<li><a class="anchor" href="#s6">权限：dmesg_restrict 与 sudo</a></li>
+<li><a class="anchor" href="#s7">dmesg 与 journald 的关系</a></li>
+<li><a class="anchor" href="#s8">dmesg vs journalctl 怎么选</a></li>
+<li><a class="anchor" href="#s9">AI Infra 排障总览</a></li>
+<li><a class="anchor" href="#s10">OOM 与内存压力</a></li>
+<li><a class="anchor" href="#s11">GPU XID 与 NVRM 错误</a></li>
+<li><a class="anchor" href="#s12">PCIe/AER 与链路错误</a></li>
+<li><a class="anchor" href="#s13">NVMe 与块设备错误</a></li>
+<li><a class="anchor" href="#s14">驱动加载、模块与固件</a></li>
+<li><a class="anchor" href="#s15">容器与 Kubernetes 节点视角</a></li>
+<li><a class="anchor" href="#s16">实时观察与事件复现</a></li>
+<li><a class="anchor" href="#s17">安全取证与脱敏</a></li>
+<li><a class="anchor" href="#s18">排障 Playbook 与速查表</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. dmesg 是什么</h2>
+<p><code>dmesg</code> 是读取和控制 kernel ring buffer 的工具。它最常见的用途是看内核启动、硬件枚举、驱动加载和运行时错误。对 AI Infra 来说，它经常是排查“节点为什么挂了、GPU 为什么掉了、训练为什么被杀、NVMe 为什么抖动”的第一现场。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>发现内核级事件：OOM kill、GPU XID、PCIe AER、NVMe timeout、I/O error、驱动 probe 失败、固件加载失败。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能替代应用日志、训练框架日志、Kubernetes 事件或持久化审计日志。ring buffer 容量有限，旧消息会被覆盖。</div>
+<div class="card"><strong>它的本质</strong><br>读取内核维护的循环日志缓冲区；输出可以来自当前缓冲区，也可以通过 <code>-w</code> 持续等待新消息。</div>
+</div>
+<pre><code># 查看内核消息，使用人类可读时间
+dmesg -T | less
+
+# 只看最新 100 行
+dmesg -T | tail -100
+
+# 实时追踪新内核消息，常用于复现故障时观察
+sudo dmesg -T -w
+
+# 只看错误及以上级别
+sudo dmesg -T --level=err,crit,alert,emerg</code></pre>
+<div class="warn"><strong>重要限制：</strong> <code>dmesg -T</code> 的墙钟时间是根据当前系统时间换算的，系统 suspend/resume 或时间被调整时可能不完全精确；需要严格时间线时同时看 <code>journalctl -k --since ...</code>。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：从硬件/内核事件到 dmesg 输出</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="dmesg 和 kernel ring buffer 整体模型">
+<rect x="14" y="14" width="1072" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<rect x="60" y="82" width="190" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="155" y="122" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">硬件/驱动</text><text x="155" y="154" text-anchor="middle" font-size="14">GPU · PCIe · NVMe</text><text x="155" y="178" text-anchor="middle" font-size="14">NIC · CPU · Memory</text>
+<rect x="315" y="82" width="205" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="418" y="122" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">内核 printk</text><text x="418" y="154" text-anchor="middle" font-size="14">KERN_ERR / WARN</text><text x="418" y="178" text-anchor="middle" font-size="14">驱动和子系统写入</text>
+<rect x="585" y="82" width="215" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="693" y="122" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">ring buffer</text><text x="693" y="154" text-anchor="middle" font-size="14">循环覆盖</text><text x="693" y="178" text-anchor="middle" font-size="14">内存中，不等于永久保存</text>
+<rect x="865" y="82" width="175" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="953" y="122" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">dmesg</text><text x="953" y="154" text-anchor="middle" font-size="14">读取 / 过滤 / 跟随</text><text x="953" y="178" text-anchor="middle" font-size="14">-T · -w · --level</text>
+<rect x="122" y="332" width="856" height="155" rx="22" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="370" text-anchor="middle" font-size="25" font-weight="700" fill="#334155">AI Infra 场景中的含义</text><text x="550" y="412" text-anchor="middle" font-size="16">训练进程被 OOM kill、GPU 报 XID、PCIe 链路纠错、NVMe timeout 都可能先出现在内核日志里</text><text x="550" y="445" text-anchor="middle" font-size="16">如果 ring buffer 被覆盖，转向 journalctl -k、节点日志采集系统或厂商 bug report</text>
+<line x1="250" y1="137" x2="315" y2="137" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="520" y1="137" x2="585" y2="137" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="800" y1="137" x2="865" y2="137" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">内核消息先进入 ring buffer；<code>dmesg</code> 只是读取这个缓冲区。缓冲区会循环覆盖，因此事故发生后应尽快采集。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 基本语法与常用选项</h2>
+<pre><code>dmesg [options]
+
+# 推荐起步组合
+dmesg -T | less
+dmesg -T | grep -Ei 'oom|killed process|xid|nvrm|aer|pcie|nvme|i/o error|timeout'
+sudo dmesg -T --level=err,warn
+sudo dmesg -T -w</code></pre>
+<table>
+<tr><th>选项</th><th>用途</th><th>AI Infra 典型场景</th></tr>
+<tr><td><code>-T</code></td><td>显示人类可读时间</td><td>把 XID/OOM 与训练日志时间对齐</td></tr>
+<tr><td><code>-w</code></td><td>等待并持续输出新消息</td><td>复现 GPU reset、NVMe timeout、驱动加载失败</td></tr>
+<tr><td><code>--level=...</code></td><td>按日志级别过滤</td><td>先缩小到 <code>err,warn,crit</code></td></tr>
+<tr><td><code>-H</code></td><td>增强可读输出，通常会分页</td><td>交互式查看长日志</td></tr>
+<tr><td><code>-k</code></td><td>显示内核消息</td><td>现代 util-linux 下默认通常就是内核消息</td></tr>
+<tr><td><code>-c</code></td><td>读取后清空 ring buffer</td><td>不建议生产随手使用</td></tr>
+<tr><td><code>-C</code></td><td>仅清空 ring buffer</td><td>会破坏现场，除非实验环境明确需要</td></tr>
+</table>
+<div class="danger"><strong>不要把 <code>-c</code>/<code>-C</code> 当成普通查看命令：</strong> 它们会清空当前缓冲区，可能让后续取证丢失现场。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 时间戳：<code>-T</code>、<code>-w</code> 与 <code>--time-format</code></h2>
+<p>原始 <code>dmesg</code> 时间通常是“从内核启动以来的秒数”，例如 <code>[12345.678901]</code>。<code>-T</code> 会把它换算成墙钟时间，便于与训练框架、调度器和监控系统对齐。</p>
+<pre><code># 墙钟时间，适合人工排障
+dmesg -T | tail -50
+
+# ISO 风格时间，适合粘贴到工单或机器处理
+dmesg --time-format=iso | tail -50
+
+# 实时追踪：复现故障时另开一个终端
+sudo dmesg -T -w
+
+# 只追踪新错误，减少噪声
+sudo dmesg -T -w --level=err,warn,crit,alert,emerg</code></pre>
+<div class="grid-2">
+<div class="card"><strong><code>-T</code> 适合人读</strong><br>快速判断“XID 是否发生在训练 loss 爆炸之前”“OOM 是否对应某次 batch size 调整”。</div>
+<div class="card"><strong><code>--time-format=iso</code> 适合证据</strong><br>输出更容易被日志系统、工单系统和脚本解析。</div>
+</div>
+<div class="warn"><strong>时间线建议：</strong> 对重大故障同时保存 <code>date -Is</code>、<code>uptime -s</code>、<code>dmesg --time-format=iso</code>、<code>journalctl -k --since</code>，避免只依赖单一时间源。</div>
+</section>
+
+<section class="figure">
+<h3>流程图：用 <code>dmesg -T -w</code> 复现并捕获故障</h3>
+<svg viewBox="0 0 1100 690" width="100%" role="img" aria-label="dmesg -T -w 实时排障流程图">
+<rect x="20" y="20" width="1060" height="650" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="70" y="86" width="230" height="78" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="185" y="119" text-anchor="middle" font-size="18" font-weight="700">1. 记录基线</text><text x="185" y="145" text-anchor="middle" font-size="14">date / uptime / kernel</text>
+<rect x="435" y="86" width="230" height="78" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="119" text-anchor="middle" font-size="18" font-weight="700">2. 开启观察</text><text x="550" y="145" text-anchor="middle" font-size="14">sudo dmesg -T -w</text>
+<rect x="800" y="86" width="230" height="78" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="915" y="119" text-anchor="middle" font-size="18" font-weight="700">3. 复现动作</text><text x="915" y="145" text-anchor="middle" font-size="14">训练 / 压测 / 插拔</text>
+<polygon points="550,244 715,325 550,406 385,325" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="319" text-anchor="middle" font-size="17" font-weight="700">是否出现内核事件？</text><text x="550" y="345" text-anchor="middle" font-size="14">OOM · XID · AER · NVMe</text>
+<rect x="138" y="470" width="255" height="82" rx="14" fill="#fef2f2" stroke="#fecaca"/><text x="266" y="504" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">有事件</text><text x="266" y="530" text-anchor="middle" font-size="14">保存日志并串联上下文</text>
+<rect x="707" y="470" width="255" height="82" rx="14" fill="#f0fdf4" stroke="#bbf7d0"/><text x="835" y="504" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">无事件</text><text x="835" y="530" text-anchor="middle" font-size="14">转查应用、调度器、硬件监控</text>
+<rect x="315" y="590" width="470" height="54" rx="13" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="623" text-anchor="middle" font-size="17">最终证据：dmesg + journalctl -k + 应用日志 + 设备工具输出</text>
+<line x1="300" y1="125" x2="435" y2="125" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="665" y1="125" x2="800" y2="125" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="915" y1="164" x2="645" y2="269" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="455" y1="375" x2="320" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="645" y1="375" x2="780" y2="470" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="266" y1="552" x2="430" y2="590" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="835" y1="552" x2="670" y2="590" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption"><code>dmesg -T -w</code> 的价值在于“事件发生时正在看”。复现窗口内的新消息比事后翻全量日志更容易定位因果。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. 日志级别、设施与筛选</h2>
+<p>内核消息有级别，例如 <code>emerg</code>、<code>alert</code>、<code>crit</code>、<code>err</code>、<code>warn</code>、<code>notice</code>、<code>info</code>、<code>debug</code>。AI Infra 排障通常先看 <code>err</code> 和 <code>warn</code>，再回到完整上下文。</p>
+<pre><code># 先看严重问题
+sudo dmesg -T --level=err,crit,alert,emerg
+
+# 包含 warn，能看到 AER corrected error、驱动警告等
+sudo dmesg -T --level=warn,err,crit,alert,emerg
+
+# grep 常见 AI Infra 关键词
+dmesg -T | grep -Ei 'oom|out of memory|killed process|xid|nvrm|gpu|pcie|aer|nvme|blk_update_request|i/o error|timeout|reset|firmware'
+
+# 保留前后文，避免只看单行误判
+dmesg -T | grep -Ei -C 5 'xid|oom|nvme|aer'</code></pre>
+<table>
+<tr><th>关键词</th><th>常见含义</th><th>下一步</th></tr>
+<tr><td><code>Out of memory</code>, <code>Killed process</code></td><td>内核 OOM killer 介入</td><td>查 cgroup、进程 RSS、作业资源限制</td></tr>
+<tr><td><code>NVRM</code>, <code>Xid</code></td><td>NVIDIA 驱动报告 GPU 异常</td><td>查 XID 编号、GPU 拓扑、温度、电源、驱动版本</td></tr>
+<tr><td><code>AER</code>, <code>PCIe Bus Error</code></td><td>PCIe 高级错误报告</td><td>查槽位、链路速率、可纠正/不可纠正错误</td></tr>
+<tr><td><code>nvme</code>, <code>I/O error</code>, <code>timeout</code></td><td>NVMe 或块层异常</td><td>查 SMART、错误日志、固件、温度和队列超时</td></tr>
+</table>
+</section>
+
+<section class="section" id="s6">
+<h2>5. 权限：<code>dmesg_restrict</code> 与 <code>sudo</code></h2>
+<p>很多生产发行版会限制普通用户读取 <code>dmesg</code>，因为内核日志可能包含地址、设备拓扑、命令行参数、硬件序列号等敏感信息。限制通常由 <code>kernel.dmesg_restrict</code> 控制。</p>
+<pre><code># 查看当前限制，1 表示普通用户通常不能读 dmesg
+sysctl kernel.dmesg_restrict
+cat /proc/sys/kernel/dmesg_restrict
+
+# 如果普通用户失败，使用 sudo 读取
+sudo dmesg -T | tail -100
+
+# 仅在临时实验环境中、经过授权后才考虑放宽；默认不要执行
+# sudo sysctl kernel.dmesg_restrict=0
+
+# 生产上更建议通过 sudoers、日志采集或 journalctl 权限分组控制访问</code></pre>
+<div class="danger"><strong>权限安全：</strong> 不要为了让训练用户方便排障而永久关闭 <code>dmesg_restrict</code>。更稳妥的做法是给 SRE/平台组受控读取权限，或把内核日志采集到受权限保护的日志系统。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. dmesg 与 journald 的关系</h2>
+<p><code>dmesg</code> 读取当前内核 ring buffer；<code>systemd-journald</code> 通常会从内核日志源收集消息并持久化或半持久化保存。两者经常内容相似，但语义不同。</p>
+<div class="grid-2">
+<div class="card"><strong><code>dmesg</code></strong><br>直接、快速、当前缓冲区视角。适合事故现场、复现时实时跟随、无 systemd 的环境。</div>
+<div class="card"><strong><code>journalctl -k</code></strong><br>日志数据库视角。适合跨时间范围检索、按 boot 过滤、关联 unit、导出和持久化审计。</div>
+</div>
+<pre><code># 当前 boot 的内核日志
+journalctl -k -b
+
+# 上一次 boot 的内核日志，适合查重启前 panic、硬件错误
+journalctl -k -b -1
+
+# 从指定时间开始看内核日志
+journalctl -k --since "2026-04-25 10:00:00"
+
+# 实时跟随内核日志，类似 dmesg -w 但走 journal
+journalctl -k -f</code></pre>
+<div class="note"><strong>定位顺序：</strong> 新鲜现场用 <code>dmesg -T</code> 快速看；需要历史、上一次启动、严格时间范围或持久证据时用 <code>journalctl -k</code>。</div>
+</section>
+
+<section class="figure" id="s8">
+<h3>对比图：dmesg vs journalctl -k</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="dmesg 与 journalctl 对比图">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">同样看内核日志，但问题不同</text>
+<rect x="90" y="125" width="420" height="330" rx="24" fill="#dbeafe" stroke="#93c5fd"/><text x="300" y="175" text-anchor="middle" font-size="26" font-weight="700" fill="#1d4ed8">dmesg</text><text x="300" y="220" text-anchor="middle" font-size="16">当前 ring buffer</text><text x="300" y="258" text-anchor="middle" font-size="16">轻量、直接、适合现场</text><text x="300" y="296" text-anchor="middle" font-size="16">常用：dmesg -T -w</text><text x="300" y="334" text-anchor="middle" font-size="16">风险：容量有限，会被覆盖</text><text x="300" y="372" text-anchor="middle" font-size="16">可能受 dmesg_restrict 限制</text>
+<rect x="590" y="125" width="420" height="330" rx="24" fill="#ede9fe" stroke="#c4b5fd"/><text x="800" y="175" text-anchor="middle" font-size="26" font-weight="700" fill="#6d28d9">journalctl -k</text><text x="800" y="220" text-anchor="middle" font-size="16">journald 收集后的内核日志</text><text x="800" y="258" text-anchor="middle" font-size="16">适合历史检索和按 boot 过滤</text><text x="800" y="296" text-anchor="middle" font-size="16">常用：journalctl -k -b -1</text><text x="800" y="334" text-anchor="middle" font-size="16">依赖 journald 配置和保留策略</text><text x="800" y="372" text-anchor="middle" font-size="16">能与其他系统日志统一时间线</text>
+<rect x="255" y="515" width="590" height="54" rx="13" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="549" text-anchor="middle" font-size="17">结论：现场看 dmesg，历史和证据链看 journalctl -k；重大事故两者都保存</text>
+</svg><div class="caption">不要把 <code>dmesg</code> 和 <code>journalctl -k</code> 对立起来。它们是同一类内核事件的两个观测面。</div>
+</section>
+
+<section class="section">
+<h2>7. dmesg vs journalctl 怎么选</h2>
+<table>
+<tr><th>问题</th><th>优先命令</th><th>原因</th></tr>
+<tr><td>刚复现 GPU XID，想实时看新消息</td><td><code>sudo dmesg -T -w</code></td><td>延迟低，直接观察 ring buffer 新增内容</td></tr>
+<tr><td>节点昨晚自动重启，想查重启前内核错误</td><td><code>journalctl -k -b -1</code></td><td><code>dmesg</code> 只看当前 boot，历史要靠 journal 或集中日志</td></tr>
+<tr><td>需要按时间窗口对齐训练失败</td><td><code>journalctl -k --since ... --until ...</code></td><td>时间过滤更可靠，可和系统日志统一查询</td></tr>
+<tr><td>救援环境、极简系统或 journald 不可用</td><td><code>dmesg</code></td><td>依赖少，内核缓冲区可直接读</td></tr>
+<tr><td>要把内核日志附到工单</td><td>两者都取</td><td>当前现场和持久日志互相校验</td></tr>
+</table>
+<pre><code># 重大故障建议一次性采集
+hostnamectl
+uname -a
+date -Is
+uptime -s
+sudo dmesg --time-format=iso &gt; dmesg.iso.txt
+journalctl -k -b --no-pager &gt; journal-k-current-boot.txt
+journalctl -k -b -1 --no-pager &gt; journal-k-previous-boot.txt 2&gt;/dev/null || true</code></pre>
+</section>
+
+<section class="section" id="s9">
+<h2>8. AI Infra 排障总览</h2>
+<p>AI 节点上的问题经常跨越应用、容器、驱动、内核和硬件。<code>dmesg</code> 负责回答：“内核是否在同一时间报告了异常？”</p>
+<div class="grid-4">
+<div class="card"><strong>内存</strong><br>OOM kill、page allocation failure、NUMA/THP 相关告警。</div>
+<div class="card"><strong>GPU</strong><br>NVRM XID、GPU fallen off the bus、驱动 probe/reset。</div>
+<div class="card"><strong>PCIe</strong><br>AER corrected/uncorrected、链路降速、设备消失。</div>
+<div class="card"><strong>存储</strong><br>NVMe timeout、I/O error、reset controller、filesystem error。</div>
+</div>
+<pre><code># 一条高信噪比的 AI Infra 初筛命令
+sudo dmesg -T | grep -Ei \
+'oom|out of memory|killed process|nvrm|xid|gpu has fallen off|pcie|aer|nvme|i/o error|blk|timeout|reset|firmware|segfault'
+
+# 结合设备和驱动状态
+nvidia-smi -q -x &gt; nvidia-smi-q.xml
+lspci -tv
+lsmod | grep -E 'nvidia|nvme|mlx|ib_'
+uname -a</code></pre>
+<div class="success"><strong>判断原则：</strong> 如果应用日志只说 “CUDA error” 或 “NCCL timeout”，而 <code>dmesg</code> 同时出现 XID/AER/NVMe timeout，排障重心应上移到节点和硬件链路。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. OOM 与内存压力</h2>
+<p>当系统或 cgroup 内存不足时，内核可能触发 OOM killer，选择一个进程杀掉。训练任务表现为进程突然退出、容器被杀、Python 只看到 <code>Killed</code>，而 <code>dmesg</code> 里能看到更完整的原因。</p>
+<pre><code># 查 OOM 相关内核消息
+sudo dmesg -T | grep -Ei 'out of memory|oom-killer|killed process|memory cgroup'
+
+# systemd/journal 视角
+journalctl -k -b | grep -Ei 'out of memory|oom-killer|killed process|memory cgroup'
+
+# Kubernetes 节点上再关联容器状态
+kubectl describe pod &lt;pod&gt; -n &lt;ns&gt; | grep -Ei 'oom|killed|reason|exit code' -C 3
+kubectl top pod -n &lt;ns&gt;</code></pre>
+<table>
+<tr><th>dmesg 线索</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td><code>invoked oom-killer</code></td><td>内核开始 OOM 选择流程</td><td>看触发进程、gfp mask、节点内存状态</td></tr>
+<tr><td><code>Killed process 12345 (python)</code></td><td>某训练进程被杀</td><td>关联作业 ID、容器 ID、GPU 使用和 batch size</td></tr>
+<tr><td><code>Memory cgroup out of memory</code></td><td>容器/cgroup 达到限制</td><td>调整 pod limit/request 或应用内存策略</td></tr>
+<tr><td><code>page allocation failure</code></td><td>内核分配高阶页失败，不一定是总内存耗尽</td><td>查碎片、驱动分配、hugepage/THP 设置</td></tr>
+</table>
+<div class="warn"><strong>不要只看 free 内存：</strong> OOM 可能来自 cgroup limit、NUMA 局部压力、不可回收内核内存或高阶连续页分配失败。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. GPU XID 与 NVRM 错误</h2>
+<p>NVIDIA 驱动常用 <code>NVRM: Xid</code> 报告 GPU 异常。XID 是错误编号，不同编号含义不同，可能涉及应用非法访问、驱动问题、ECC、PCIe、供电、温度或硬件故障。<code>dmesg</code> 能告诉你 XID 发生时间、GPU PCI 地址和上下文。</p>
+<pre><code># 查 NVIDIA 内核驱动消息
+sudo dmesg -T | grep -Ei 'nvrm|xid|gpu has fallen off|rm_init_adapter|nvidia'
+
+# 实时观察 XID
+sudo dmesg -T -w | grep --line-buffered -Ei 'nvrm|xid|gpu'
+
+# 关联 GPU 状态
+nvidia-smi
+nvidia-smi -q -d ERROR,ECC,TEMPERATURE,POWER,CLOCK,PCIE
+nvidia-smi topo -m</code></pre>
+<table>
+<tr><th>现象</th><th>dmesg 线索</th><th>排查方向</th></tr>
+<tr><td>训练报 CUDA unknown error</td><td><code>NVRM: Xid ...</code></td><td>查 XID 编号、驱动/CUDA 版本、应用栈和复现输入</td></tr>
+<tr><td>GPU 从系统消失</td><td><code>GPU has fallen off the bus</code></td><td>重点看 PCIe/AER、供电、温度、主板槽位</td></tr>
+<tr><td>驱动加载失败</td><td><code>RmInitAdapter failed</code></td><td>查 Secure Boot、内核模块版本、固件、设备权限</td></tr>
+<tr><td>多卡通信失败</td><td>XID 与 NCCL timeout 同时出现</td><td>先处理底层 GPU/PCIe 错误，再看 NCCL 参数</td></tr>
+</table>
+<div class="note"><strong>证据链：</strong> XID 不能只贴一行。至少保留 XID 前后 50 行、<code>nvidia-smi -q</code>、驱动版本、内核版本、GPU 型号、PCI 地址和作业时间线。</div>
+</section>
+
+<section class="figure">
+<h3>用例图：AI 节点 dmesg 关键词到排查路径</h3>
+<svg viewBox="0 0 1100 670" width="100%" role="img" aria-label="AI Infra dmesg 关键词排查路径">
+<rect x="20" y="20" width="1060" height="630" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="25" font-weight="700">dmesg 关键词不是结论，而是下一跳</text>
+<rect x="425" y="105" width="250" height="70" rx="15" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="147" text-anchor="middle" font-size="20" font-weight="700">内核日志事件</text>
+<rect x="70" y="255" width="210" height="88" rx="14" fill="#fef2f2" stroke="#fecaca"/><text x="175" y="291" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">OOM</text><text x="175" y="319" text-anchor="middle" font-size="14">cgroup / RSS / batch</text>
+<rect x="320" y="255" width="210" height="88" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="425" y="291" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">XID / NVRM</text><text x="425" y="319" text-anchor="middle" font-size="14">GPU / driver / app</text>
+<rect x="570" y="255" width="210" height="88" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="675" y="291" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">PCIe / AER</text><text x="675" y="319" text-anchor="middle" font-size="14">链路 / 槽位 / 拓扑</text>
+<rect x="820" y="255" width="210" height="88" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="925" y="291" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">NVMe / I/O</text><text x="925" y="319" text-anchor="middle" font-size="14">盘 / 队列 / 固件</text>
+<rect x="92" y="465" width="916" height="88" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="500" text-anchor="middle" font-size="19" font-weight="700">关联工具</text><text x="550" y="528" text-anchor="middle" font-size="15">journalctl -k · nvidia-smi · lspci -vv · nvme smart-log/error-log · kubectl describe · 监控曲线</text>
+<line x1="500" y1="175" x2="190" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="530" y1="175" x2="425" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="570" y1="175" x2="675" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="600" y1="175" x2="910" y2="255" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="175" y1="343" x2="280" y2="465" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="425" y1="343" x2="460" y2="465" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="675" y1="343" x2="640" y2="465" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="925" y1="343" x2="820" y2="465" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">在 AI Infra 中，<code>dmesg</code> 常负责指路：它指出内核看到的故障类型，再由设备工具和调度器日志补全因果链。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. PCIe/AER 与链路错误</h2>
+<p>PCIe AER（Advanced Error Reporting）会报告链路层、事务层等错误。可纠正错误不一定立刻导致业务失败，但如果数量持续上升，可能预示槽位、线缆、retimer、主板、供电或设备稳定性问题。不可纠正错误更需要立刻关注。</p>
+<pre><code># 查 PCIe/AER 相关内核消息
+sudo dmesg -T | grep -Ei 'pcie|aer|pci bus error|uncorrected|corrected|fatal|non-fatal'
+
+# 查看设备拓扑和具体 BDF
+lspci -tv
+lspci -vv -s 0000:65:00.0
+
+# 关联 GPU BDF
+nvidia-smi --query-gpu=index,pci.bus_id,name --format=csv</code></pre>
+<table>
+<tr><th>AER 线索</th><th>风险解释</th><th>建议动作</th></tr>
+<tr><td><code>Corrected error</code></td><td>硬件纠错成功，短期可能无感</td><td>观察频率；与 GPU/NVMe timeout 关联判断</td></tr>
+<tr><td><code>Uncorrected (Non-Fatal)</code></td><td>事务失败但系统可继续</td><td>检查链路、固件、驱动，考虑迁移作业</td></tr>
+<tr><td><code>Uncorrected (Fatal)</code></td><td>可能导致设备不可用或系统崩溃</td><td>隔离节点，保留日志，硬件介入</td></tr>
+<tr><td><code>BadTLP</code>, <code>BadDLLP</code></td><td>链路层传输异常</td><td>重点看链路质量、槽位、线缆、retimer</td></tr>
+</table>
+<div class="warn"><strong>不要孤立解读 AER：</strong> 少量 corrected error 可能由平台噪声导致；如果同时出现 GPU XID、NVMe reset、链路降速或业务 timeout，优先按硬件链路问题处理。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. NVMe 与块设备错误</h2>
+<p>训练数据读取、checkpoint 写入和本地缓存高度依赖 NVMe。<code>dmesg</code> 中的 <code>nvme timeout</code>、<code>I/O error</code>、<code>reset controller</code>、文件系统错误，通常比上层框架的 “DataLoader hang” 更接近根因。</p>
+<pre><code># 查 NVMe 和块层错误
+sudo dmesg -T | grep -Ei 'nvme|blk_update_request|buffer i/o error|i/o error|ext4|xfs|reset controller|timeout'
+
+# 设备健康信息
+sudo nvme list
+sudo nvme smart-log /dev/nvme0
+sudo nvme error-log /dev/nvme0
+
+# 关联块设备和挂载点
+lsblk -o NAME,MODEL,SERIAL,SIZE,TYPE,MOUNTPOINTS
+findmnt</code></pre>
+<table>
+<tr><th>dmesg 线索</th><th>常见影响</th><th>下一步</th></tr>
+<tr><td><code>nvme timeout</code></td><td>I/O 延迟飙升，训练读取卡住</td><td>查温度、固件、队列深度、PCIe/AER</td></tr>
+<tr><td><code>reset controller</code></td><td>控制器重置，短时 I/O 中断</td><td>确认是否和业务错误同一时间</td></tr>
+<tr><td><code>I/O error</code></td><td>读写失败，可能损坏文件或 checkpoint</td><td>迁移作业，检查 SMART/error-log，考虑下线设备</td></tr>
+<tr><td><code>EXT4-fs error</code>, <code>XFS</code></td><td>文件系统层检测异常</td><td>只读保护、备份、维护窗口内 fsck/修复</td></tr>
+</table>
+<div class="danger"><strong>数据安全：</strong> 文件系统错误出现后不要盲目继续压测或修复。先保留证据、确认备份和业务影响，再在维护窗口执行破坏性修复命令。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. 驱动加载、模块与固件</h2>
+<p>AI 节点常依赖 NVIDIA、RDMA、NVMe、BPF、文件系统等内核模块。驱动加载失败时，应用层通常只看到设备不可见或初始化失败；<code>dmesg</code> 会显示模块签名、符号不匹配、固件缺失、probe 失败等线索。</p>
+<pre><code># 查看最近驱动/固件相关消息
+sudo dmesg -T | grep -Ei 'module|firmware|nvidia|mlx|ib_|nvme|probe|failed|taint|secure boot'
+
+# 模块是否加载
+lsmod | grep -E 'nvidia|nvme|mlx5|ib_core'
+
+# 模块元信息
+modinfo nvidia 2&gt;/dev/null | head -40
+modinfo mlx5_core 2&gt;/dev/null | head -40
+
+# 仅查看，不执行加载/卸载
+modprobe --show-depends nvidia 2&gt;/dev/null | head</code></pre>
+<table>
+<tr><th>线索</th><th>可能原因</th><th>处理方向</th></tr>
+<tr><td><code>firmware: failed to load</code></td><td>固件文件缺失或版本不匹配</td><td>确认发行版固件包、驱动版本、initramfs</td></tr>
+<tr><td><code>module verification failed</code></td><td>模块签名或 Secure Boot 问题</td><td>确认 Secure Boot 策略和 DKMS 签名</td></tr>
+<tr><td><code>Unknown symbol</code></td><td>模块与当前内核 ABI 不匹配</td><td>重装匹配版本驱动，检查 DKMS 构建日志</td></tr>
+<tr><td><code>probe failed</code></td><td>设备初始化失败</td><td>结合 PCI BDF、固件、IOMMU、资源冲突排查</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 容器与 Kubernetes 节点视角</h2>
+<p><code>dmesg</code> 是节点级视角，不是容器内部日志。容器中的进程触发 OOM、GPU fault 或 I/O 错误时，内核消息仍发生在宿主机。Kubernetes 中排障要把 pod、container、node、kernel 四层对齐。</p>
+<pre><code># 先定位 pod 所在节点
+kubectl get pod &lt;pod&gt; -n &lt;ns&gt; -o wide
+
+# 在对应节点上查看内核日志
+sudo dmesg -T | grep -Ei 'oom|killed process|nvrm|xid|nvme|aer'
+
+# K8s 事件和容器退出原因
+kubectl describe pod &lt;pod&gt; -n &lt;ns&gt;
+kubectl get events -n &lt;ns&gt; --sort-by=.lastTimestamp
+
+# 如果运行时可用，关联容器
+sudo crictl ps -a | grep &lt;pod-name&gt;
+sudo crictl inspect &lt;container-id&gt; | grep -Ei 'pid|oom|exitCode' -C 3</code></pre>
+<div class="note"><strong>常见误区：</strong> 在容器里执行 <code>dmesg</code> 可能没有权限，也可能不是你想要的完整节点视角。生产排障应到宿主机或节点日志系统查看。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 实时观察与事件复现</h2>
+<p>当故障可复现时，<code>dmesg -T -w</code> 是最高效的观察方式。建议把实时内核日志、应用日志和设备状态分三个终端并排观察。</p>
+<pre><code># 终端 1：内核事件
+sudo dmesg -T -w
+
+# 终端 2：只看高风险关键词
+sudo dmesg -T -w | grep --line-buffered -Ei 'oom|killed process|xid|nvrm|aer|nvme|i/o error|timeout|reset'
+
+# 终端 3：GPU 状态采样
+watch -n 1 nvidia-smi
+
+# 记录到文件，便于复盘
+sudo sh -c 'dmesg --time-format=iso -w &gt;&gt; /var/tmp/dmesg-watch.log'</code></pre>
+<div class="warn"><strong>记录文件注意：</strong> 长时间 <code>-w</code> 可能产生大文件。生产上应设置轮转或使用日志采集系统，不要无限写满根分区。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 安全取证与脱敏</h2>
+<p>内核日志可能包含主机名、内核命令行、设备序列号、PCI 拓扑、MAC 地址、IP、容器 ID、路径和进程参数。给厂商或外部团队前应先确认共享范围。</p>
+<pre><code># 只读采集，适合附到内部工单
+mkdir -p /tmp/node-evidence
+date -Is &gt; /tmp/node-evidence/collected-at.txt
+hostnamectl &gt; /tmp/node-evidence/hostnamectl.txt
+uname -a &gt; /tmp/node-evidence/uname.txt
+sudo dmesg --time-format=iso &gt; /tmp/node-evidence/dmesg.iso.txt
+journalctl -k -b --no-pager &gt; /tmp/node-evidence/journal-k.txt
+
+# 粗略脱敏示例：先输出到新文件，不覆盖原始证据
+sed -E 's/([0-9a-f]{2}:){5}[0-9a-f]{2}/&lt;MAC&gt;/Ig; s/([0-9]{1,3}\.){3}[0-9]{1,3}/&lt;IP&gt;/g' \
+  /tmp/node-evidence/dmesg.iso.txt &gt; /tmp/node-evidence/dmesg.redacted.txt</code></pre>
+<div class="danger"><strong>证据原则：</strong> 保留一份原始日志在受控位置，再生成脱敏副本对外共享。不要直接修改原始证据文件。</div>
+</section>
+
+<section class="figure">
+<h3>安全图：排障时哪些 dmesg 操作该避免</h3>
+<svg viewBox="0 0 1100 700" width="100%" role="img" aria-label="dmesg 安全排障流程图">
+<rect x="20" y="20" width="1060" height="660" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">生产排障安全边界</text>
+<rect x="90" y="130" width="280" height="105" rx="16" fill="#dcfce7" stroke="#86efac"/><text x="230" y="170" text-anchor="middle" font-size="20" font-weight="700" fill="#15803d">推荐：只读查看</text><text x="230" y="200" text-anchor="middle" font-size="14">dmesg -T</text><text x="230" y="222" text-anchor="middle" font-size="14">journalctl -k</text>
+<rect x="410" y="130" width="280" height="105" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="170" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">谨慎：持续采集</text><text x="550" y="200" text-anchor="middle" font-size="14">dmesg -w 写文件需轮转</text><text x="550" y="222" text-anchor="middle" font-size="14">避免填满磁盘</text>
+<rect x="730" y="130" width="280" height="105" rx="16" fill="#fee2e2" stroke="#fecaca"/><text x="870" y="170" text-anchor="middle" font-size="20" font-weight="700" fill="#b91c1c">避免：破坏现场</text><text x="870" y="200" text-anchor="middle" font-size="14">dmesg -C / -c</text><text x="870" y="222" text-anchor="middle" font-size="14">未授权改 sysctl</text>
+<rect x="160" y="330" width="780" height="92" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="366" text-anchor="middle" font-size="19" font-weight="700">对外共享前：确认敏感信息</text><text x="550" y="394" text-anchor="middle" font-size="15">主机名 · IP/MAC · 序列号 · PCI 拓扑 · 容器 ID · 内核命令行 · 文件路径</text>
+<rect x="252" y="515" width="596" height="70" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="545" text-anchor="middle" font-size="18" font-weight="700">正确顺序</text><text x="550" y="570" text-anchor="middle" font-size="14">只读采集原始证据 → 复制副本 → 脱敏 → 共享 → 保留校验和</text>
+<line x1="230" y1="235" x2="430" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="550" y1="235" x2="550" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="870" y1="235" x2="670" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="550" y1="422" x2="550" y2="515" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">大多数 <code>dmesg</code> 排障都是只读的；危险主要来自清空缓冲区、无限制写日志、随意放宽权限和未脱敏共享。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 排障 Playbook 与速查表</h2>
+<h3>推荐排障顺序</h3>
+<ol>
+<li>记录节点、时间和上下文：<code>hostnamectl</code>、<code>date -Is</code>、<code>uptime -s</code>、作业 ID、pod 名称、GPU 编号。</li>
+<li>快速看最近内核错误：<code>sudo dmesg -T | tail -200</code> 和关键词 grep。</li>
+<li>如果故障可复现，开启 <code>sudo dmesg -T -w</code> 后再触发动作。</li>
+<li>按类型分流：OOM 查 cgroup/内存；XID 查 GPU/驱动；AER 查 PCIe；NVMe 查盘和文件系统。</li>
+<li>用 <code>journalctl -k</code> 补历史，用设备工具补状态，用应用日志补业务影响。</li>
+<li>保留原始证据；对外共享只给脱敏副本。</li>
+</ol>
+<h3>一页速查</h3>
+<table>
+<tr><th>目标</th><th>命令</th></tr>
+<tr><td>查看当前内核日志</td><td><code>dmesg -T | less</code></td></tr>
+<tr><td>实时观察</td><td><code>sudo dmesg -T -w</code></td></tr>
+<tr><td>只看严重级别</td><td><code>sudo dmesg -T --level=err,crit,alert,emerg</code></td></tr>
+<tr><td>查 OOM</td><td><code>sudo dmesg -T | grep -Ei 'oom|out of memory|killed process|memory cgroup'</code></td></tr>
+<tr><td>查 GPU XID</td><td><code>sudo dmesg -T | grep -Ei 'nvrm|xid|gpu has fallen off'</code></td></tr>
+<tr><td>查 PCIe/AER</td><td><code>sudo dmesg -T | grep -Ei 'pcie|aer|pci bus error|uncorrected|corrected'</code></td></tr>
+<tr><td>查 NVMe/I/O</td><td><code>sudo dmesg -T | grep -Ei 'nvme|i/o error|timeout|reset controller|blk'</code></td></tr>
+<tr><td>看当前 boot 内核日志</td><td><code>journalctl -k -b</code></td></tr>
+<tr><td>看上一次 boot</td><td><code>journalctl -k -b -1</code></td></tr>
+<tr><td>查看权限限制</td><td><code>sysctl kernel.dmesg_restrict</code></td></tr>
+</table>
+<h3>最小证据包</h3>
+<pre><code># 建议在事故后尽快执行，全部为只读采集
+out="/tmp/dmesg-evidence-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+date -Is | tee "$out/date.txt"
+hostnamectl &gt; "$out/hostnamectl.txt"
+uname -a &gt; "$out/uname.txt"
+uptime -s &gt; "$out/uptime-start.txt"
+sudo dmesg --time-format=iso &gt; "$out/dmesg.iso.txt"
+journalctl -k -b --no-pager &gt; "$out/journal-k-current.txt"
+nvidia-smi -q &gt; "$out/nvidia-smi-q.txt" 2&gt;/dev/null || true
+nvme list &gt; "$out/nvme-list.txt" 2&gt;/dev/null || true
+lspci -vv &gt; "$out/lspci-vv.txt" 2&gt;/dev/null || true
+tar -C /tmp -czf "$out.tar.gz" "$(basename "$out")"</code></pre>
+</section>
+
+<section class="section">
+<h2>18. 常见误判与经验规则</h2>
+<div class="grid-2">
+<div class="card"><strong>误判 1：只看到应用 CUDA error 就重启训练</strong><br>先查同一时间是否有 XID、AER 或 GPU fallen off bus。否则会把硬件/驱动问题误判成应用偶发。</div>
+<div class="card"><strong>误判 2：OOM 一定是整机内存不足</strong><br>很多训练失败来自 cgroup limit 或容器内存限制，整机 <code>free</code> 可能仍有余量。</div>
+<div class="card"><strong>误判 3：AER corrected error 完全无害</strong><br>单次 corrected 不一定危险，持续增长且伴随 timeout/XID 时应按链路稳定性问题处理。</div>
+<div class="card"><strong>误判 4：dmesg 没有日志就说明内核没问题</strong><br>ring buffer 可能已覆盖，或者 journald 中仍有历史；还要查 <code>journalctl -k -b -1</code> 和集中日志。</div>
+<div class="card"><strong>误判 5：普通用户读不了 dmesg 是系统坏了</strong><br>这通常是安全策略。用授权方式读取，而不是永久关闭限制。</div>
+<div class="card"><strong>误判 6：清空 dmesg 后更干净</strong><br>事故现场清空缓冲区会破坏证据。实验环境也应明确记录清空时间。</div>
+</div>
+<div class="success"><strong>经验规则：</strong> 如果 <code>dmesg</code> 在业务失败时间点有硬件/驱动级错误，先解决内核和设备层；如果没有，再深入应用、网络、存储服务和调度层。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>Linux man-pages：<code>dmesg(1)</code>，包含 <code>-T</code>、<code>-w</code>、<code>--level</code>、<code>--time-format</code>、<code>-C</code> 等选项说明。</li>
+<li>Linux kernel documentation：<code>printk</code>、内核日志级别、kernel parameters、panic 和 OOM killer 相关文档。</li>
+<li>systemd 文档：<code>journalctl(1)</code>、<code>systemd-journald.service(8)</code>、内核日志收集与持久化配置。</li>
+<li>NVIDIA 官方文档：XID error 编号解释、GPU driver troubleshooting、<code>nvidia-bug-report.sh</code> 采集建议。</li>
+<li>PCI-SIG / Linux PCI 文档：AER、PCIe 错误类型、设备 BDF 与拓扑排查。</li>
+<li>NVMe 规范与 <code>nvme-cli</code> 文档：SMART log、error log、controller reset、timeout 排障。</li>
+</ul><p class="mini">建议阅读顺序：先掌握 kernel ring buffer 与 <code>dmesg -T -w</code>，再学习 journald 关系，最后按 OOM、GPU XID、PCIe/AER、NVMe 和驱动加载建立自己的节点排障清单。</p></section>
+<div class="footer">dmesg 深度教程 · AI Infra 内核日志、OOM、GPU XID、PCIe/AER、NVMe、驱动加载与生产排障</div>
+</div>
+</body>
+</html>

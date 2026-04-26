@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>rdma 深度教程：AI Infra RDMA 设备、链路、资源与 NCCL 排障</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#5d697c;--line:#d9e1ec;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>rdma 深度教程：AI Infra RDMA 设备、链路、资源与 NCCL 排障</h1>
+<p class="sub">这份教程围绕 Linux/iproute2 命令 <code>rdma</code> 展开，面向 GPU 训练集群、RoCE/InfiniBand 网络、Kubernetes 容器和 NCCL 通信排障。它不是“如何调交换机”的厂商手册，而是从“内核 RDMA netlink 视图如何暴露设备、端口、资源、统计和事件”这个心智模型出发，系统讲清 <code>rdma dev</code>、<code>rdma link</code>、<code>rdma resource</code>、<code>rdma statistic</code>、<code>rdma monitor</code>，以及它们如何与 <code>ibstat</code>、<code>ibv_devinfo</code>、<code>mlxlink</code>、<code>qperf</code>、<code>nccl-tests</code> 配合定位 AI Infra 网络问题。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">RDMA Netlink</span><span class="chip">RoCE / IB</span><span class="chip">rdma link</span><span class="chip">rdma dev</span><span class="chip">rdma resource</span><span class="chip">QP / CQ / MR</span><span class="chip">Containers</span><span class="chip">NCCL Readiness</span><span class="chip">Troubleshooting</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>rdma</code> 是 iproute2 里的 RDMA 控制面观察工具：它通过 RDMA netlink 从内核读取 HCA、端口、队列对、完成队列、内存区域、统计计数器和设备事件，帮助你判断“RDMA 栈是否在内核眼里真的可用”。</div>
+<div class="success"><strong>最重要原则：</strong> 默认先只读排查：<code>show</code>、<code>-j</code>、<code>-d</code>、<code>monitor</code>。涉及改名、迁移 netns、统计绑定、删除软 RDMA 设备等操作前，先记录现场、确认维护窗口，并明确这会影响正在运行的训练、存储或推理作业。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">rdma 是什么</a></li>
+<li><a class="anchor" href="#s2">整体模型：netlink 视图</a></li>
+<li><a class="anchor" href="#s3">安装、版本与权限</a></li>
+<li><a class="anchor" href="#s4">命令对象与输出模式</a></li>
+<li><a class="anchor" href="#s5">rdma dev：设备视图</a></li>
+<li><a class="anchor" href="#s6">rdma link：端口与 netdev 映射</a></li>
+<li><a class="anchor" href="#s7">RoCE 与 InfiniBand 状态判读</a></li>
+<li><a class="anchor" href="#s8">rdma resource：QP/CQ/MR/PD/CM ID</a></li>
+<li><a class="anchor" href="#s9">连接与进程诊断</a></li>
+<li><a class="anchor" href="#s10">rdma statistic 与计数器</a></li>
+<li><a class="anchor" href="#s11">rdma monitor：事件流</a></li>
+<li><a class="anchor" href="#s12">命名空间与容器</a></li>
+<li><a class="anchor" href="#s13">NCCL/RDMA readiness 清单</a></li>
+<li><a class="anchor" href="#s14">rdma vs ibstat/ibv_devinfo/mlxlink</a></li>
+<li><a class="anchor" href="#s15">自动化采集与 JSON</a></li>
+<li><a class="anchor" href="#s16">安全边界与变更操作</a></li>
+<li><a class="anchor" href="#s17">常见故障与排障流程</a></li>
+<li><a class="anchor" href="#s18">练习任务与学习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. rdma 是什么</h2>
+<p><code>rdma</code> 是 iproute2 套件的一部分，地位类似 <code>ip</code>、<code>ss</code>、<code>tc</code>。它不是 RDMA 性能压测工具，也不是交换机配置工具；它的核心价值是把 Linux 内核 RDMA 子系统中的对象以命令行形式展示出来。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>查看 RDMA 设备、端口 link、netdev 绑定、资源对象、统计计数器、设备事件，以及与进程、PID、QP 类型相关的资源分布。</div>
+<div class="card"><strong>它不擅长什么</strong><br>不能替代 <code>ib_write_bw</code>、<code>qperf</code>、<code>nccl-tests</code> 做性能结论；不能直接读取交换机 PFC/ECN 配置；不能保证 GPU Direct RDMA 已经可用。</div>
+<div class="card"><strong>AI Infra 心智模型</strong><br><code>rdma</code> 回答“内核 RDMA 栈看到什么”；压测工具回答“这条路径跑得怎样”；NCCL 日志回答“应用实际选择了哪条通信路径”。</div>
+</div>
+<pre><code># 快速确认系统是否看见 RDMA 设备和端口
+rdma dev
+rdma link
+
+# 详细输出，适合现场记录
+rdma -d dev show
+rdma -d link show
+
+# JSON 输出，适合自动化采集
+rdma -j -p link show
+rdma -j -p resource show</code></pre>
+<div class="warn"><strong>排障边界：</strong> 如果 <code>rdma dev</code> 为空，优先检查驱动、内核模块、PCIe 设备和容器设备透传；如果 <code>rdma dev</code> 正常但应用失败，再继续查 link、GID、QP、CM ID、路由、PFC/ECN、NCCL 参数和进程权限。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：rdma 命令看到的内核 RDMA netlink 视图</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="rdma netlink model">
+<rect x="18" y="18" width="1064" height="644" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="28" font-weight="700" fill="#172033">rdma = 用户态命令 + RDMA netlink + 内核 RDMA 对象</text>
+<rect x="70" y="120" width="240" height="120" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="190" y="160" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">用户态</text>
+<text x="190" y="193" text-anchor="middle" font-size="15">rdma -j -d link show</text>
+<text x="190" y="218" text-anchor="middle" font-size="15">脚本 / SRE / 作业诊断</text>
+<rect x="430" y="120" width="240" height="120" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="160" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">RDMA Netlink</text>
+<text x="550" y="193" text-anchor="middle" font-size="15">内核查询通道</text>
+<text x="550" y="218" text-anchor="middle" font-size="15">对象、统计、事件</text>
+<rect x="790" y="120" width="240" height="120" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="910" y="160" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">内核 RDMA 栈</text>
+<text x="910" y="193" text-anchor="middle" font-size="15">ib_core / mlx5_ib / rxe</text>
+<text x="910" y="218" text-anchor="middle" font-size="15">verbs / CM / uverbs</text>
+<line x1="310" y1="180" x2="430" y2="180" stroke="#94a3b8" stroke-width="5" marker-end="url(#a1)"/>
+<line x1="670" y1="180" x2="790" y2="180" stroke="#94a3b8" stroke-width="5" marker-end="url(#a1)"/>
+<rect x="80" y="335" width="190" height="110" rx="16" fill="#fff" stroke="#cbd5e1"/>
+<text x="175" y="374" text-anchor="middle" font-size="20" font-weight="700">dev</text>
+<text x="175" y="405" text-anchor="middle" font-size="14">HCA / RDMA device</text>
+<rect x="325" y="335" width="190" height="110" rx="16" fill="#fff" stroke="#cbd5e1"/>
+<text x="420" y="374" text-anchor="middle" font-size="20" font-weight="700">link</text>
+<text x="420" y="405" text-anchor="middle" font-size="14">端口 / netdev / state</text>
+<rect x="570" y="335" width="190" height="110" rx="16" fill="#fff" stroke="#cbd5e1"/>
+<text x="665" y="374" text-anchor="middle" font-size="20" font-weight="700">resource</text>
+<text x="665" y="405" text-anchor="middle" font-size="14">QP / CQ / MR / PD</text>
+<rect x="815" y="335" width="190" height="110" rx="16" fill="#fff" stroke="#cbd5e1"/>
+<text x="910" y="374" text-anchor="middle" font-size="20" font-weight="700">statistic</text>
+<text x="910" y="405" text-anchor="middle" font-size="14">端口与对象计数器</text>
+<rect x="190" y="510" width="720" height="74" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="542" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">排障结论要分层</text>
+<text x="550" y="568" text-anchor="middle" font-size="14">rdma 证明内核对象存在，不证明应用一定选择 RDMA，也不证明网络无拥塞。</text>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">把 <code>rdma</code> 当成“内核 RDMA 对象浏览器”：它非常适合定位设备、端口、资源和统计，但最终性能还要用应用与压测工具闭环。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与权限</h2>
+<p><code>rdma</code> 通常由 iproute2 包提供；RDMA 用户态库、驱动和诊断命令通常来自 <code>rdma-core</code>、厂商 OFED 或发行版内核包。多数 <code>show</code> 操作普通用户可读，但详细资源、统计绑定、netns 迁移、设备创建删除等操作可能需要 root 或额外 capability。</p>
+<pre><code># Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y iproute2 rdma-core
+
+# RHEL / Rocky / Alma / CentOS
+sudo dnf install -y iproute rdma-core
+
+# 版本与帮助
+rdma -V
+rdma help
+rdma dev help
+rdma link help
+rdma resource help
+rdma statistic help
+
+# 同时确认内核与用户态 RDMA 组件
+uname -r
+lsmod | egrep 'ib_core|ib_uverbs|rdma_cm|mlx5_ib|irdma|bnxt_re|rxe' || true
+ls -l /dev/infiniband 2&gt;/dev/null || true</code></pre>
+<table>
+<tr><th>组件</th><th>作用</th><th>排障意义</th></tr>
+<tr><td><code>iproute2</code></td><td>提供 <code>rdma</code> 命令</td><td>版本决定支持哪些对象、过滤器和 JSON 字段</td></tr>
+<tr><td><code>rdma-core</code></td><td>提供 libibverbs、librdmacm、ibv 工具</td><td>应用和工具访问 verbs 的基础</td></tr>
+<tr><td>内核驱动</td><td>例如 <code>mlx5_ib</code>、<code>irdma</code>、<code>bnxt_re</code></td><td><code>rdma dev</code> 是否能看到硬件设备</td></tr>
+<tr><td><code>/dev/infiniband</code></td><td>用户态 verbs 设备节点</td><td>容器、权限、cgroup、device plugin 问题常在这里暴露</td></tr>
+</table>
+<div class="note"><strong>版本现实：</strong> <code>rdma</code> 的对象模型来自 iproute2 与内核能力组合。不同发行版、内核、厂商驱动可能输出字段不同，自动化脚本应优先解析 JSON 并容忍缺字段。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 命令对象与输出模式</h2>
+<p><code>rdma</code> 的顶层语法是 <code>rdma [OPTIONS] OBJECT { COMMAND | help }</code>。AI Infra 排障中最常用对象是 <code>dev</code>、<code>link</code>、<code>resource</code>、<code>statistic</code> 和 <code>monitor</code>。</p>
+<table>
+<tr><th>对象</th><th>看什么</th><th>典型命令</th></tr>
+<tr><td><code>dev</code></td><td>RDMA 设备级信息，类似 HCA inventory</td><td><code>rdma -d dev show</code></td></tr>
+<tr><td><code>link</code></td><td>端口、state、physical state、netdev 映射</td><td><code>rdma -d link show</code></td></tr>
+<tr><td><code>resource</code></td><td>QP、CQ、MR、PD、SRQ、CM ID、context 等资源</td><td><code>rdma -d resource show</code></td></tr>
+<tr><td><code>statistic</code></td><td>默认硬件计数器、对象计数器、QP/MR counter</td><td><code>rdma statistic show link mlx5_0/1</code></td></tr>
+<tr><td><code>monitor</code></td><td>设备注册、注销、netdev attach/detach 等事件</td><td><code>rdma monitor</code></td></tr>
+</table>
+<pre><code># 输出模式
+rdma dev show              # 人类可读
+rdma -d dev show           # details，更多字段
+rdma -o link show          # oneline，便于 grep
+rdma -j link show          # JSON，便于 jq
+rdma -j -p link show       # pretty JSON，便于人工审阅
+
+# 只看某个设备或端口
+rdma dev show mlx5_0
+rdma link show mlx5_0/1
+rdma resource show mlx5_0/1</code></pre>
+<div class="success"><strong>采集建议：</strong> 事故现场优先采 <code>rdma -j -p dev/link/resource/statistic</code>，再用 <code>ip -j addr/link/route</code>、<code>ethtool</code>、<code>devlink</code>、厂商工具补齐上下文。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>4. rdma dev：设备视图</h2>
+<p><code>rdma dev</code> 展示系统内 RDMA 设备。对 Mellanox/NVIDIA ConnectX 常见名字是 <code>mlx5_0</code>、<code>mlx5_1</code>；软 RoCE 可能是 <code>rxe0</code>；不同厂商会有自己的设备名。设备名不是 Linux 网卡名，必须通过 <code>rdma link</code> 或 sysfs 关联到 netdev。</p>
+<pre><code># 列出所有 RDMA 设备
+rdma dev
+rdma -d dev show
+
+# 查看单个设备
+rdma -d dev show mlx5_0
+
+# 用 JSON 保存 inventory
+rdma -j -p dev show &gt; rdma-dev.$(hostname).json</code></pre>
+<table>
+<tr><th>你关心的字段</th><th>含义</th><th>AI Infra 判断</th></tr>
+<tr><td><code>dev</code> / 设备名</td><td>内核 RDMA 设备标识</td><td>后续 <code>mlx5_0/1</code>、<code>rdma resource</code>、qperf 绑定都会用到</td></tr>
+<tr><td>node type / transport</td><td>设备类型与传输能力</td><td>区分 IB、RoCE、iWARP、soft-RoCE 的第一层线索</td></tr>
+<tr><td>fw / driver 信息</td><td>详细输出中可能出现固件或驱动字段</td><td>用于和节点基线、厂商兼容矩阵对比</td></tr>
+<tr><td>netns</td><td>设备所在网络命名空间</td><td>容器/租户隔离场景中非常关键</td></tr>
+</table>
+<div class="warn"><strong>不要混淆：</strong> <code>mlx5_0</code> 是 RDMA device，<code>ens5f0np0</code> 是 netdev，<code>0000:ca:00.0</code> 是 PCI BDF。三者要通过 <code>rdma link</code>、<code>ethtool -i</code>、<code>readlink /sys/class/infiniband/mlx5_0/device</code> 串起来。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>5. rdma link：端口与 netdev 映射</h2>
+<p><code>rdma link</code> 是 AI Infra 排障中最常用的入口。它把 RDMA 设备端口与 Linux netdev、link state、physical state 关联起来。RoCE 场景中，<code>netdev</code> 映射尤其重要，因为 NCCL、UCX、MPI、存储客户端常要同时满足 IP 路由和 RDMA verbs。</p>
+<pre><code># 全部 RDMA link
+rdma link
+rdma -d link show
+
+# 查看指定设备端口
+rdma -d link show mlx5_0/1
+
+# 配合 IP 路由确认会走哪张网卡
+ip route get 10.32.8.17
+ip -br addr show dev ens5f0np0
+ethtool ens5f0np0 | egrep 'Speed|Duplex|Link detected'</code></pre>
+<table>
+<tr><th>字段</th><th>含义</th><th>常见问题</th></tr>
+<tr><td><code>link mlx5_0/1</code></td><td>RDMA 设备的端口索引</td><td>多端口卡、双 rail 集群容易选错端口</td></tr>
+<tr><td><code>state ACTIVE</code></td><td>RDMA 端口逻辑可用</td><td>不是 ACTIVE 时，应用 verbs 通常不可用</td></tr>
+<tr><td><code>physical_state LINK_UP</code></td><td>物理链路层状态</td><td>link up 但 state down 常见于 IB 管理、GID 或配置问题</td></tr>
+<tr><td><code>netdev ens5f0np0</code></td><td>关联 Linux 网络接口</td><td>RoCE/NCCL 常因 IP 路由选错 netdev 而慢或失败</td></tr>
+</table>
+<div class="note"><strong>实战判断：</strong> 对 RoCE，<code>rdma link</code> 正常只是第一步；还要确认 <code>ip addr</code>、<code>ip route get</code>、MTU、PFC/ECN、DSCP/PCP、交换机端口和 GID index 是否一致。</div>
+</section>
+
+<section class="figure" id="fig-s7">
+<h3>流程图：从设备到 RoCE/IB 可用状态的判读</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="rdma device link workflow">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="280" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="90" text-anchor="middle" font-size="22" font-weight="700">rdma dev 是否有设备？</text>
+<polygon points="550,155 735,245 550,335 365,245" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="238" text-anchor="middle" font-size="17" font-weight="700">驱动与设备节点正常？</text>
+<text x="550" y="264" text-anchor="middle" font-size="14">PCIe / module / /dev/infiniband</text>
+<rect x="88" y="205" width="235" height="88" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="205" y="238" text-anchor="middle" font-size="18" font-weight="700">否</text>
+<text x="205" y="264" text-anchor="middle" font-size="13">查 lspci、驱动、firmware、容器透传</text>
+<rect x="790" y="205" width="235" height="88" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="908" y="238" text-anchor="middle" font-size="18" font-weight="700">是</text>
+<text x="908" y="264" text-anchor="middle" font-size="13">继续看 rdma link</text>
+<polygon points="908,355 1040,430 908,505 776,430" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="908" y="424" text-anchor="middle" font-size="16" font-weight="700">state ACTIVE？</text>
+<text x="908" y="448" text-anchor="middle" font-size="13">physical_state LINK_UP？</text>
+<rect x="590" y="392" width="160" height="76" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="670" y="423" text-anchor="middle" font-size="16" font-weight="700">否</text>
+<text x="670" y="448" text-anchor="middle" font-size="13">查链路/IB SM/GID</text>
+<rect x="800" y="560" width="215" height="76" rx="14" fill="#dcfce7" stroke="#86efac"/>
+<text x="908" y="591" text-anchor="middle" font-size="16" font-weight="700">是</text>
+<text x="908" y="616" text-anchor="middle" font-size="13">进入资源、统计、应用验证</text>
+<rect x="95" y="520" width="390" height="90" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="290" y="554" text-anchor="middle" font-size="17" font-weight="700">RoCE 还要继续证明 IP 路径一致</text>
+<text x="290" y="582" text-anchor="middle" font-size="13">ip route get、MTU、PFC/ECN、GID、NCCL_SOCKET_IFNAME</text>
+<line x1="550" y1="116" x2="550" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="365" y1="245" x2="323" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="735" y1="245" x2="790" y2="245" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="908" y1="293" x2="908" y2="355" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="776" y1="430" x2="750" y2="430" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<line x1="908" y1="505" x2="908" y2="560" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">设备存在、端口 ACTIVE、物理链路 LINK_UP 是 RDMA readiness 的前置条件；RoCE 还必须证明 IP/队列/无损配置走的是同一条训练网路径。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>6. RoCE 与 InfiniBand 状态判读</h2>
+<p>同样是 RDMA，InfiniBand 与 RoCE 的排障侧重点不同。InfiniBand 依赖 IB fabric、Subnet Manager、LID、PKey 等；RoCE 依赖以太网 netdev、IP 路由、VLAN、MTU、PFC/ECN、DSCP/PCP、GID index 等。<code>rdma</code> 不会替你解释全部网络设计，但它能给出内核端口和资源是否成立的证据。</p>
+<table>
+<tr><th>维度</th><th>InfiniBand</th><th>RoCE v2</th></tr>
+<tr><td>链路基础</td><td>IB fabric，通常有 Subnet Manager</td><td>Ethernet/IP fabric，通常跨三层网络</td></tr>
+<tr><td>关键状态</td><td><code>state ACTIVE</code>、LID、SM、PKey</td><td><code>state ACTIVE</code>、netdev、IP、GID、MTU、QoS</td></tr>
+<tr><td>常见验证</td><td><code>ibstat</code>、<code>ibv_devinfo</code>、<code>ib_write_bw</code></td><td><code>rdma link</code>、<code>ip route get</code>、<code>show_gids</code>、<code>qperf</code></td></tr>
+<tr><td>AI 集群故障</td><td>SM/fabric、端口降速、分区、线缆/光模块</td><td>选错网卡、PFC pause storm、ECN 不一致、GID index 错、交换机队列拥塞</td></tr>
+</table>
+<pre><code># RoCE：把 RDMA link 与 netdev/IP 路由串起来
+rdma -d link show
+ip -br addr
+ip route get 10.42.7.19
+cat /sys/class/infiniband/mlx5_0/ports/1/gid_attrs/types/* 2&gt;/dev/null
+cat /sys/class/infiniband/mlx5_0/ports/1/gids/* 2&gt;/dev/null
+
+# IB：通常还需要 IB 专用工具补充 LID/SM/fabric 信息
+ibstat
+ibv_devinfo -v
+ib_write_bw -d mlx5_0 -i 1 peer-host</code></pre>
+<div class="warn"><strong>RoCE 误区：</strong> <code>ping</code> 通、TCP 带宽高，并不等于 RoCE 无损队列、GID 和 NCCL RDMA 都正确；<code>rdma link ACTIVE</code> 也不等于交换机 PFC/ECN 没有问题。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>7. rdma resource：QP/CQ/MR/PD/CM ID</h2>
+<p><code>rdma resource</code> 展示内核追踪到的 RDMA 资源。它非常适合回答：“哪个进程打开了多少 RDMA context？”“是否存在大量 QP/CQ/MR 泄漏？”“某个端口上有没有应用实际创建 RDMA 连接？”</p>
+<pre><code># 总览：所有设备上的资源摘要
+rdma resource show
+rdma -d resource show
+
+# 只看某个设备或端口
+rdma resource show mlx5_0
+rdma resource show mlx5_0/1
+
+# 细分对象
+rdma res show ctx
+rdma res show qp
+rdma res show cq
+rdma res show mr
+rdma res show pd
+rdma res show cm_id
+
+# 过滤某个 link 或 PID，具体支持随版本变化
+rdma res show qp link mlx5_0/1
+rdma res show qp pid 12345
+rdma res show cm_id link mlx5_0/1</code></pre>
+<table>
+<tr><th>资源</th><th>表示什么</th><th>排障价值</th></tr>
+<tr><td><code>ctx</code></td><td>用户态进程打开的 RDMA device context</td><td>判断作业是否真的进入 verbs 路径</td></tr>
+<tr><td><code>qp</code></td><td>Queue Pair，RDMA 通信的核心对象</td><td>看 QP 类型、状态、所属 PID、端口，定位连接是否建立</td></tr>
+<tr><td><code>cq</code></td><td>Completion Queue</td><td>大量 CQ 可能对应高并发连接或资源泄漏</td></tr>
+<tr><td><code>mr</code></td><td>Memory Region，注册内存区域</td><td>训练作业内存注册异常、ODP/pinning 问题可从数量变化找线索</td></tr>
+<tr><td><code>pd</code></td><td>Protection Domain</td><td>资源归属与隔离线索</td></tr>
+<tr><td><code>cm_id</code></td><td>RDMA CM 连接管理对象</td><td>librdmacm、RoCE 连接建立问题的重要证据</td></tr>
+</table>
+<div class="note"><strong>AI Infra 用法：</strong> 运行 NCCL、UCX、MPI 或存储客户端前后各采一次 <code>rdma -j -p res show</code>，对比 QP/CQ/MR/CM ID 数量和 PID 归属，能快速判断应用是否触达 RDMA 子系统。</div>
+</section>
+
+<section class="figure" id="fig-s9">
+<h3>信息图：从进程到 RDMA 连接对象的排障链</h3>
+<svg viewBox="0 0 1100 680" width="100%" role="img" aria-label="rdma resources relationship">
+<rect x="18" y="18" width="1064" height="644" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="66" text-anchor="middle" font-size="27" font-weight="700">应用进程是否真的创建了 RDMA 对象？</text>
+<rect x="70" y="130" width="210" height="105" rx="18" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="175" y="169" text-anchor="middle" font-size="21" font-weight="700" fill="#1d4ed8">AI 作业进程</text>
+<text x="175" y="200" text-anchor="middle" font-size="14">NCCL / UCX / MPI</text>
+<rect x="340" y="130" width="210" height="105" rx="18" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="445" y="169" text-anchor="middle" font-size="21" font-weight="700" fill="#6d28d9">verbs context</text>
+<text x="445" y="200" text-anchor="middle" font-size="14">rdma res show ctx</text>
+<rect x="610" y="130" width="210" height="105" rx="18" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="715" y="169" text-anchor="middle" font-size="21" font-weight="700" fill="#0f766e">QP / CQ / MR</text>
+<text x="715" y="200" text-anchor="middle" font-size="14">队列与注册内存</text>
+<rect x="880" y="130" width="160" height="105" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="960" y="169" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">端口</text>
+<text x="960" y="200" text-anchor="middle" font-size="14">mlx5_0/1</text>
+<line x1="280" y1="182" x2="340" y2="182" stroke="#94a3b8" stroke-width="5" marker-end="url(#c1)"/>
+<line x1="550" y1="182" x2="610" y2="182" stroke="#94a3b8" stroke-width="5" marker-end="url(#c1)"/>
+<line x1="820" y1="182" x2="880" y2="182" stroke="#94a3b8" stroke-width="5" marker-end="url(#c1)"/>
+<rect x="90" y="345" width="270" height="92" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="225" y="378" text-anchor="middle" font-size="17" font-weight="700">只有 TCP fallback</text>
+<text x="225" y="405" text-anchor="middle" font-size="13">ctx/QP 不增长，NCCL 日志显示 Socket</text>
+<rect x="415" y="345" width="270" height="92" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="550" y="378" text-anchor="middle" font-size="17" font-weight="700">连接建立失败</text>
+<text x="550" y="405" text-anchor="middle" font-size="13">cm_id/QP 短暂出现后消失，查 GID/路由/ACL</text>
+<rect x="740" y="345" width="270" height="92" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="875" y="378" text-anchor="middle" font-size="17" font-weight="700">资源泄漏或耗尽</text>
+<text x="875" y="405" text-anchor="middle" font-size="13">QP/CQ/MR 持续上升，作业结束后不释放</text>
+<rect x="190" y="520" width="720" height="74" rx="16" fill="#dcfce7" stroke="#86efac"/>
+<text x="550" y="552" text-anchor="middle" font-size="18" font-weight="700" fill="#166534">关键证据：PID + link + QP state + MR/CQ 数量变化</text>
+<text x="550" y="578" text-anchor="middle" font-size="14">用前后快照证明应用实际是否进入 RDMA，而不是只看环境变量或启动参数。</text>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">资源视图把“应用现象”连接到“内核对象”。NCCL 慢时，先证明它是否创建了 RDMA context/QP，再讨论网络性能。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>8. 连接与进程诊断</h2>
+<p>RDMA 连接问题经常表现为应用层超时、NCCL hang、UCX endpoint error、NVMe-oF connect 失败或存储客户端断连。<code>rdma resource</code> 能从 PID 和对象角度补齐证据。</p>
+<pre><code># 找到训练或测试进程
+pgrep -af 'nccl|all_reduce|ucx|mpi|ib_write|qperf'
+
+# 看该 PID 是否持有 RDMA 资源
+PID=12345
+rdma res show ctx pid "$PID"
+rdma res show qp pid "$PID"
+rdma res show cq pid "$PID"
+rdma res show mr pid "$PID"
+rdma res show cm_id pid "$PID"
+
+# 看特定端口上是否有连接资源
+rdma res show qp link mlx5_0/1
+rdma res show cm_id link mlx5_0/1
+
+# 结合进程文件描述符与设备节点
+ls -l /proc/"$PID"/fd 2&gt;/dev/null | grep infiniband || true
+cat /proc/"$PID"/status | egrep 'Name|State|Pid|Cpus_allowed_list|Mems_allowed_list'</code></pre>
+<table>
+<tr><th>现象</th><th><code>rdma resource</code> 线索</th><th>下一步</th></tr>
+<tr><td>应用声称使用 RDMA，但性能像 TCP</td><td>没有 ctx/QP，或只看到控制面少量对象</td><td>查 NCCL/UCX 环境变量、容器设备、权限、fallback 日志</td></tr>
+<tr><td>连接建立阶段 hang</td><td>cm_id 有变化但 QP 未进入预期状态</td><td>查 GID index、IP 路由、防火墙、ARP/ND、交换机 ACL</td></tr>
+<tr><td>运行一段时间后失败</td><td>QP/CQ/MR 数量异常增长或频繁重建</td><td>查应用重试、HCA syndrome、dmesg、端口 counters</td></tr>
+<tr><td>单节点异常</td><td>同一作业 PID 在坏节点资源分布不同</td><td>对比好/坏节点的 dev/link/resource/statistic 快照</td></tr>
+</table>
+<div class="warn"><strong>权限提示：</strong> 某些发行版需要 root 才能看完整 PID、进程名和对象详情。容器内看到的 PID/netns 也可能和宿主机不同，必要时从宿主机同一时间采集。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>9. rdma statistic 与计数器</h2>
+<p><code>rdma statistic</code> 用于查询 RDMA 和驱动暴露的计数器。不同驱动支持的计数器差异很大；它适合做趋势和对比，不适合脱离基线孤立解读。</p>
+<pre><code># 默认硬件计数器
+rdma statistic show
+rdma statistic show link mlx5_0/1
+
+# QP 计数器，具体模式和过滤器依赖内核/驱动
+rdma statistic qp show
+rdma statistic qp show link mlx5_0/1
+rdma statistic qp show link mlx5_0/1 pid 12345
+rdma statistic qp show link mlx5_0/1 qp-type RC
+
+# 查看支持的统计模式
+rdma statistic qp mode
+rdma statistic mode supported link mlx5_0/1</code></pre>
+<table>
+<tr><th>计数器用法</th><th>适合回答</th><th>注意事项</th></tr>
+<tr><td>跑测试前后采样</td><td>某段测试是否让特定端口计数增长</td><td>不要只采一次；需要差值</td></tr>
+<tr><td>好坏节点对比</td><td>坏节点是否有异常错误或重试趋势</td><td>字段名可能随驱动变化，先建立基线</td></tr>
+<tr><td>按 PID/QP 类型过滤</td><td>某个进程或 RC/UD QP 是否异常</td><td>过滤器支持取决于版本和硬件</td></tr>
+<tr><td>结合 ethtool/devlink</td><td>把 RDMA 计数与以太网链路错误、pause、丢包对齐</td><td>RoCE 排障不能只看 RDMA 计数</td></tr>
+</table>
+<div class="note"><strong>基线方法：</strong> 对每类节点建立空闲、单流压测、多机 NCCL、生产作业四类计数器快照。没有基线时，很多“非零计数器”无法判断是正常噪声还是故障。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>10. rdma monitor：事件流</h2>
+<p><code>rdma monitor</code> 监听 RDMA netlink 事件，适合排查设备热插拔、驱动重载、netdev attach/detach、容器或命名空间操作导致的瞬态变化。它不是性能 profiler，而是事件时间线。</p>
+<pre><code># 终端 1：监听事件
+sudo rdma monitor
+
+# 终端 2：执行只读操作或观察作业启动
+rdma link
+rdma dev
+
+# 事故期间可以带时间戳保存
+sudo sh -c 'rdma monitor | ts "%Y-%m-%d %H:%M:%S" &gt;&gt; /var/log/rdma-monitor.log'</code></pre>
+<div class="grid-3">
+<div class="card"><strong>适合场景</strong><br>节点上报偶发 RDMA device disappeared、Pod 启动后设备不可见、驱动重载、网卡 reset、容器 netns 切换。</div>
+<div class="card"><strong>不适合场景</strong><br>分析微秒级延迟、交换机队列拥塞、NCCL collective 算法选择。</div>
+<div class="card"><strong>结合工具</strong><br><code>dmesg -Tw</code>、<code>journalctl -k -f</code>、<code>udevadm monitor</code>、<code>devlink monitor</code>、厂商 health reporter。</div>
+</div>
+<div class="warn"><strong>现场技巧：</strong> 对偶发问题，先把 <code>rdma monitor</code>、<code>dmesg -Tw</code>、<code>journalctl -k -f</code> 同时带时间戳记录，再复现应用错误。没有时间线很难判断是应用先失败还是设备先掉线。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>11. 命名空间与容器</h2>
+<p>RDMA 与普通网卡一样会遇到命名空间问题，但更容易被忽略：容器可能能看到 IP 接口，却看不到 <code>/dev/infiniband</code>；也可能看到设备节点，但 RDMA device 仍在宿主机 netns；或者 Kubernetes RDMA device plugin 只分配了部分设备。</p>
+<pre><code># 宿主机：查看 RDMA 设备和 netns 线索
+rdma -d dev show
+rdma -d link show
+ip netns list
+
+# 将 RDMA 设备迁移到已存在的 netns，属于变更操作，先确认无人使用
+ip netns add rdma-test
+rdma dev set mlx5_0 netns rdma-test
+ip netns exec rdma-test rdma dev
+ip netns exec rdma-test rdma link
+
+# 容器内：确认设备节点、rdma 视图和 IP 路径
+ls -l /dev/infiniband
+rdma dev
+rdma link
+ip route get 10.32.8.17</code></pre>
+<table>
+<tr><th>容器现象</th><th>可能原因</th><th>验证命令</th></tr>
+<tr><td><code>/dev/infiniband</code> 不存在</td><td>device plugin、runtime、cgroup device 未暴露</td><td><code>ls -l /dev/infiniband</code></td></tr>
+<tr><td><code>rdma dev</code> 为空</td><td>RDMA device 未进入该 netns 或权限不足</td><td><code>rdma -d dev show</code></td></tr>
+<tr><td>RDMA 可见但连接失败</td><td>Pod IP/CNI 路由与 RoCE netdev 不一致</td><td><code>ip route get peer</code>、<code>rdma link</code></td></tr>
+<tr><td>NCCL fallback 到 socket</td><td>环境变量、netdev 选择、插件分配、GID index 错误</td><td>NCCL 日志 + <code>rdma res show qp pid</code></td></tr>
+</table>
+<div class="danger"><strong>生产警告：</strong> <code>rdma dev set ... netns ...</code> 会改变设备可见位置，可能影响宿主机或其他容器中的作业。共享 GPU 节点上不要临时手工迁移生产 HCA，除非你明确知道调度器和 device plugin 的期望状态。</div>
+</section>
+
+<section class="figure" id="fig-s13">
+<h3>对照图：NCCL/RDMA readiness 的分层检查</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="nccl rdma readiness">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="68" text-anchor="middle" font-size="27" font-weight="700">NCCL 慢或 hang：不要跳过分层证据</text>
+<rect x="90" y="120" width="920" height="76" rx="16" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="151" text-anchor="middle" font-size="19" font-weight="700" fill="#1d4ed8">第 1 层：设备存在</text>
+<text x="550" y="176" text-anchor="middle" font-size="14">rdma dev、/dev/infiniband、ibv_devices、驱动与固件一致</text>
+<rect x="90" y="220" width="920" height="76" rx="16" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="251" text-anchor="middle" font-size="19" font-weight="700" fill="#6d28d9">第 2 层：端口与路径正确</text>
+<text x="550" y="276" text-anchor="middle" font-size="14">rdma link ACTIVE、netdev/IP 路由、MTU、GID index、RoCE QoS</text>
+<rect x="90" y="320" width="920" height="76" rx="16" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="550" y="351" text-anchor="middle" font-size="19" font-weight="700" fill="#0f766e">第 3 层：应用真的创建 RDMA 资源</text>
+<text x="550" y="376" text-anchor="middle" font-size="14">rdma res show ctx/qp/mr pid，NCCL_DEBUG=INFO，UCX/NCCL net plugin 日志</text>
+<rect x="90" y="420" width="920" height="76" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="451" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">第 4 层：压测与业务闭环</text>
+<text x="550" y="476" text-anchor="middle" font-size="14">ib_write_bw/qperf、nccl-tests、真实训练 step time、端口 counters 前后差值</text>
+<rect x="160" y="550" width="780" height="82" rx="18" fill="#fef2f2" stroke="#fca5a5"/>
+<text x="550" y="582" text-anchor="middle" font-size="18" font-weight="700" fill="#991b1b">常见误判</text>
+<text x="550" y="608" text-anchor="middle" font-size="14">“rdma link ACTIVE” 只能证明端口可用；不能证明 NCCL 使用了它，也不能证明交换机无拥塞。</text>
+</svg>
+<div class="caption">NCCL/RDMA readiness 必须同时覆盖设备、端口、应用资源和性能闭环。缺一层证据，结论都容易误导。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>12. NCCL/RDMA readiness 清单</h2>
+<p>分布式训练排障中，<code>rdma</code> 最适合放在 readiness 和故障现场采集脚本中。下面是一套保守、只读、可复制的检查流程。</p>
+<pre><code># 1. 节点 RDMA inventory
+hostname -f
+rdma -j -p dev show
+rdma -j -p link show
+ls -l /dev/infiniband
+
+# 2. RoCE 路由与 netdev 选择
+PEER=10.32.8.17
+ip route get "$PEER"
+ip -br addr
+rdma -d link show
+
+# 3. 启动 NCCL 测试时打开日志
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
+# 按实际训练网接口填写，避免误选管理网
+export NCCL_SOCKET_IFNAME=ens5f0np0
+
+# 4. 测试期间观察该 PID 的 RDMA 对象
+PID=$(pgrep -n all_reduce_perf)
+sudo rdma res show ctx pid "$PID"
+sudo rdma res show qp pid "$PID"
+sudo rdma res show mr pid "$PID"
+
+# 5. 测试前后采集统计差值
+rdma -j -p statistic show link mlx5_0/1 &gt; before.json
+# run nccl-tests ...
+rdma -j -p statistic show link mlx5_0/1 &gt; after.json</code></pre>
+<div class="grid-4">
+<div class="card"><strong>设备</strong><br><code>rdma dev</code> 非空，驱动/固件与基线一致。</div>
+<div class="card"><strong>端口</strong><br><code>rdma link</code> 显示目标端口 ACTIVE，netdev 对应训练网。</div>
+<div class="card"><strong>应用</strong><br>进程有 ctx/QP/MR 资源，日志显示 RDMA/IB plugin 路径。</div>
+<div class="card"><strong>性能</strong><br>端口计数增长、压测达标、真实 step time 与预期一致。</div>
+</div>
+<div class="note"><strong>环境变量提醒：</strong> NCCL 的可用变量会随版本和插件变化。不要只靠变量名判断是否生效；以 NCCL 日志、<code>rdma resource</code>、压测和 counters 作为证据链。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>13. rdma vs ibstat/ibv_devinfo/mlxlink</h2>
+<p>RDMA 排障没有单一万能命令。<code>rdma</code> 的优势是内核 netlink 对象和 JSON 自动化；IB verbs 和厂商工具则提供更底层或更硬件相关的信息。</p>
+<table>
+<tr><th>工具</th><th>主要视角</th><th>适合问题</th><th>不能替代</th></tr>
+<tr><td><code>rdma</code></td><td>Linux 内核 RDMA netlink：dev/link/resource/statistic/monitor</td><td>设备、端口、资源、PID、netns、JSON 采集</td><td>交换机配置、线缆眼图、真实 NCCL 性能</td></tr>
+<tr><td><code>ibstat</code></td><td>IB 设备/端口状态，常用于 IB fabric</td><td>IB link state、physical state、rate、LID 等</td><td>进程资源、QP/MR/PID 归属</td></tr>
+<tr><td><code>ibv_devinfo</code></td><td>verbs 设备能力与端口属性</td><td>HCA capability、max_qp、max_mr、port attr</td><td>netdev/IP 路由、资源实时归属</td></tr>
+<tr><td><code>mlxlink</code></td><td>NVIDIA/Mellanox 链路物理层与模块信息</td><td>速率、FEC、lane、模块、物理错误</td><td>非 mlx 设备、内核资源对象</td></tr>
+<tr><td><code>ib_write_bw</code></td><td>verbs 性能压测</td><td>点到点 RDMA 带宽/延迟验证</td><td>设备 inventory、应用是否使用 RDMA</td></tr>
+<tr><td><code>qperf</code></td><td>TCP/UDP/RDMA 主机间快速探针</td><td>IP 与 RDMA 分层性能对比</td><td>交换机/设备底层 counters</td></tr>
+</table>
+<pre><code># 建议的组合采集
+rdma -d link show
+rdma -d resource show
+ibstat
+ibv_devinfo -v
+ethtool -i ens5f0np0
+ethtool ens5f0np0
+mlxlink -d /dev/mst/mt4129_pciconf0 -m 2&gt;/dev/null || true</code></pre>
+<div class="success"><strong>工具选择：</strong> 先用 <code>rdma</code> 建立内核对象证据，再根据问题方向选择 <code>ibv_devinfo</code> 看能力、<code>mlxlink</code> 看物理层、<code>qperf/ib_write_bw/nccl-tests</code> 看数据面。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>14. 自动化采集与 JSON</h2>
+<p><code>-j -p</code> 是 <code>rdma</code> 在生产排障中的关键能力。相比解析人类可读输出，JSON 更适合写巡检、基线对比和事故快照。</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+out="rdma-snapshot.$(hostname -s).$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+
+rdma -j -p dev show &gt; "$out/rdma-dev.json"
+rdma -j -p link show &gt; "$out/rdma-link.json"
+rdma -j -p resource show &gt; "$out/rdma-resource.json"
+rdma -j -p statistic show &gt; "$out/rdma-statistic.json" || true
+ip -j addr show &gt; "$out/ip-addr.json"
+ip -j route show table all &gt; "$out/ip-route.json"
+ls -l /dev/infiniband &gt; "$out/dev-infiniband.txt" 2&gt;&amp;1 || true
+uname -a &gt; "$out/uname.txt"
+
+tar -czf "$out.tar.gz" "$out"</code></pre>
+<table>
+<tr><th>自动化目标</th><th>建议做法</th><th>避免什么</th></tr>
+<tr><td>巡检</td><td>只读采集 dev/link/statistic，和黄金节点对比字段与数量</td><td>巡检脚本自动修复设备状态</td></tr>
+<tr><td>事故快照</td><td>在应用启动前、运行中、失败后各采一次</td><td>只保留失败后的单点输出</td></tr>
+<tr><td>CI/准入</td><td>检查设备数量、端口 ACTIVE、netdev 匹配、容器设备可见</td><td>把压测跑满训练网作为每次准入</td></tr>
+<tr><td>对比分析</td><td>按 host/slot/rail/port 命名，和拓扑数据库关联</td><td>只记录 <code>mlx5_0</code>，不记录 PCI BDF 和 netdev</td></tr>
+</table>
+<div class="note"><strong>脚本鲁棒性：</strong> JSON 字段随版本变化，脚本应校验“必要事实”而不是依赖完整结构。例如：设备数、link ACTIVE、netdev 名、端口索引、资源是否增长。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>15. 安全边界与变更操作</h2>
+<p>大多数教程只展示 <code>show</code>，但 <code>rdma</code> 也能执行变更，例如设备改名、迁移 netns、添加/删除软 RDMA 设备、统计 counter 绑定等。这些操作可能影响运行中的应用，AI 集群中应按变更处理。</p>
+<pre><code># 安全：只读确认
+rdma -d dev show mlx5_0
+rdma -d link show mlx5_0/1
+rdma -d resource show mlx5_0/1
+
+# 变更前：确认没有生产进程持有资源
+rdma res show qp link mlx5_0/1
+rdma res show ctx
+fuser -v /dev/infiniband/uverbs0 2&gt;/dev/null || true
+
+# 变更示例：迁移 netns，仅在测试节点或维护窗口执行
+ip netns add rdma-lab
+rdma dev set mlx5_0 netns rdma-lab
+
+# 变更示例：修改设备名，可能影响脚本和服务配置
+rdma dev set mlx5_0 name train_rail0</code></pre>
+<div class="danger"><strong>不要在生产作业中途做：</strong> 改名、netns 迁移、删除软 RDMA 设备、重载驱动、修改 QoS、关闭端口、更新固件。这些都可能导致 NCCL、NVMe-oF、NFS/RDMA、存储客户端或推理服务连接中断。</div>
+<div class="success"><strong>变更守则：</strong> 先保存 <code>rdma -j -p dev/link/resource/statistic</code>、<code>ip -j</code>、<code>ethtool</code>、<code>dmesg</code> 快照；确认无资源持有；在维护窗口执行；变更后跑最小 smoke test，再恢复生产调度。</div>
+</section>
+
+<section class="figure" id="fig-s17">
+<h3>排障图：RDMA/NCCL 常见问题的安全诊断路径</h3>
+<svg viewBox="0 0 1100 760" width="100%" role="img" aria-label="rdma troubleshooting workflow">
+<rect x="20" y="20" width="1060" height="720" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="395" y="50" width="310" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="550" y="91" text-anchor="middle" font-size="22" font-weight="700">NCCL / RDMA 异常</text>
+<polygon points="550,160 735,250 550,340 365,250" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="243" text-anchor="middle" font-size="17" font-weight="700">rdma dev 有设备？</text>
+<text x="550" y="269" text-anchor="middle" font-size="14">/dev/infiniband 可见？</text>
+<rect x="85" y="205" width="230" height="90" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="200" y="238" text-anchor="middle" font-size="17" font-weight="700">否</text>
+<text x="200" y="264" text-anchor="middle" font-size="13">驱动、模块、容器设备、权限</text>
+<rect x="790" y="205" width="230" height="90" rx="14" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="905" y="238" text-anchor="middle" font-size="17" font-weight="700">是</text>
+<text x="905" y="264" text-anchor="middle" font-size="13">继续看端口与路径</text>
+<polygon points="905,355 1045,430 905,505 765,430" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="905" y="423" text-anchor="middle" font-size="16" font-weight="700">link ACTIVE 且路由正确？</text>
+<text x="905" y="448" text-anchor="middle" font-size="13">netdev/IP/GID/MTU</text>
+<rect x="560" y="390" width="175" height="80" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="648" y="422" text-anchor="middle" font-size="16" font-weight="700">否</text>
+<text x="648" y="447" text-anchor="middle" font-size="13">查线缆、SM、PFC/ECN、路由</text>
+<polygon points="905,560 1045,635 905,710 765,635" fill="#dcfce7" stroke="#86efac"/>
+<text x="905" y="628" text-anchor="middle" font-size="16" font-weight="700">进程有 QP/MR？</text>
+<text x="905" y="653" text-anchor="middle" font-size="13">rdma res show ... pid</text>
+<rect x="470" y="595" width="255" height="80" rx="14" fill="#fee2e2" stroke="#fca5a5"/>
+<text x="598" y="627" text-anchor="middle" font-size="16" font-weight="700">否</text>
+<text x="598" y="652" text-anchor="middle" font-size="13">查 NCCL fallback、插件、环境变量</text>
+<rect x="90" y="555" width="285" height="100" rx="16" fill="#eef2f7" stroke="#cbd5e1"/>
+<text x="232" y="590" text-anchor="middle" font-size="17" font-weight="700">有资源但仍慢</text>
+<text x="232" y="618" text-anchor="middle" font-size="13">跑 ib_write_bw/qperf/nccl-tests</text>
+<text x="232" y="642" text-anchor="middle" font-size="13">看 statistic 差值与交换机 counters</text>
+<line x1="550" y1="118" x2="550" y2="160" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="365" y1="250" x2="315" y2="250" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="735" y1="250" x2="790" y2="250" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="905" y1="295" x2="905" y2="355" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="765" y1="430" x2="735" y2="430" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="905" y1="505" x2="905" y2="560" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<line x1="765" y1="635" x2="725" y2="635" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<path d="M765 635 C610 705, 410 690, 300 655" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">从最便宜、最安全、最确定的只读证据开始：设备、端口、路径、进程资源、计数器，再进入压测和网络设备侧排查。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>16. 常见故障与排障流程</h2>
+<table>
+<tr><th>故障现象</th><th>rdma 证据</th><th>优先排查</th></tr>
+<tr><td><code>rdma dev</code> 为空</td><td>无 RDMA 设备</td><td>PCIe 是否识别、驱动模块、firmware、Secure Boot、容器透传、<code>/dev/infiniband</code></td></tr>
+<tr><td><code>rdma link</code> state 不是 ACTIVE</td><td>端口未就绪</td><td>线缆/光模块、端口 admin state、IB SM、交换机端口、GID/PKey、驱动日志</td></tr>
+<tr><td>RoCE ping 通但 RDMA 失败</td><td>link 正常但 CM/QP 建立失败</td><td>GID index、VLAN、MTU、PFC/ECN、ACL、防火墙、ARP/ND、路由回程</td></tr>
+<tr><td>NCCL 走 socket fallback</td><td>进程无 QP/MR 或资源很少</td><td>环境变量、NCCL net plugin、容器设备、权限、接口选择、日志</td></tr>
+<tr><td>训练中途 hang</td><td>QP 频繁重建、统计异常、monitor 事件</td><td>dmesg、HCA health、交换机 pause/ECN、链路 flap、作业重试</td></tr>
+<tr><td>一台节点拖慢全局</td><td>好坏节点 resource/statistic/link 差异</td><td>拓扑、PCIe NUMA、端口降速、固件版本、网卡温度、交换机端口</td></tr>
+</table>
+<pre><code># 好坏节点对比模板
+for h in good-node bad-node; do
+  ssh "$h" '
+    hostname -f
+    rdma -d dev show
+    rdma -d link show
+    rdma -d resource show
+    rdma statistic show || true
+    ip -br addr
+    ip route get 10.32.8.17 || true
+  ' &gt; "$h.rdma.txt"
+done
+diff -u good-node.rdma.txt bad-node.rdma.txt || true</code></pre>
+<div class="note"><strong>排障经验：</strong> AI 集群的 RDMA 问题常常不是单点错误，而是“一个 rail 选错、一个端口降速、一个 GID 不一致、一个交换机队列拥塞”叠加。用结构化快照减少猜测。</div>
+</section>
+
+<section class="section" id="s18">
+<h2>17. 练习任务与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>练习 1：建立节点 inventory</strong><br>在两台训练节点上采集 <code>rdma -j -p dev/link</code>、<code>ip -j addr/route</code>，画出 RDMA device、netdev、PCI BDF、NUMA node、训练网 IP 的对应关系。</div>
+<div class="card"><strong>练习 2：观察应用资源</strong><br>运行 <code>ib_write_bw</code>、<code>qperf rc_bw</code> 或 <code>nccl-tests</code>，在运行前后对比 <code>rdma res show ctx/qp/mr</code>，确认资源增长与 PID 对应。</div>
+<div class="card"><strong>练习 3：构造只读 readiness 脚本</strong><br>写一个不改变系统状态的脚本，输出设备数量、ACTIVE 端口、netdev 映射、训练网路由和 <code>/dev/infiniband</code> 权限。</div>
+<div class="card"><strong>练习 4：好坏节点对比</strong><br>选择一台性能正常节点和一台异常节点，采集相同命令，找出设备、端口、资源、统计、IP 路由、驱动版本中的差异。</div>
+</div>
+<h3>推荐学习顺序</h3>
+<ol>
+<li>先掌握 <code>rdma dev</code> 与 <code>rdma link</code>，能把 RDMA 设备映射到 netdev、PCIe 和物理端口。</li>
+<li>再学习 <code>rdma resource</code>，理解 QP、CQ、MR、PD、CM ID 如何证明应用进入 RDMA 路径。</li>
+<li>随后引入 <code>rdma statistic</code> 与前后差值，建立好坏节点和空闲/压测/生产基线。</li>
+<li>最后把 <code>rdma</code> 与 <code>ibv_devinfo</code>、<code>ibstat</code>、<code>mlxlink</code>、<code>qperf</code>、<code>ib_write_bw</code>、<code>nccl-tests</code> 串成完整证据链。</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<ul>
+<li><a href="https://man7.org/linux/man-pages/man8/rdma.8.html">rdma(8) Linux manual page</a>：顶层语法、对象与通用选项。</li>
+<li><a href="https://www.man7.org/linux/man-pages/man8/rdma-dev.8.html">rdma-dev(8) Linux manual page</a>：RDMA device 查看、改名、netns、软设备相关命令。</li>
+<li><a href="https://www.man7.org/linux/man-pages/man8/rdma-link.8.html">rdma-link(8) Linux manual page</a>：RDMA link 与端口状态查看。</li>
+<li><a href="https://man7.org/linux/man-pages/man8/rdma-resource.8.html">rdma-resource(8) Linux manual page</a>：QP、CQ、MR、PD、SRQ、CM ID 等资源对象。</li>
+<li><a href="https://man7.org/linux/man-pages/man8/rdma-statistic.8.html">rdma-statistic(8) Linux manual page</a>：RDMA counters、QP/MR statistics 与过滤器。</li>
+<li><a href="https://www.man7.org/linux/man-pages/man8/rdma-monitor.8.html">rdma-monitor(8) Linux manual page</a>：RDMA device 与 netdev 事件监听。</li>
+<li><a href="https://man7.org/linux/man-pages/man7/rdma_cm.7.html">rdma_cm(7) Linux manual page</a>：RDMA Communication Manager 概念。</li>
+</ul>
+<div class="note"><strong>阅读建议：</strong> man page 说明命令能力；真实 AI Infra 排障还需要结合厂商固件/驱动文档、交换机 QoS 配置、NCCL/UCX 日志和现场拓扑。</div>
+</section>
+
+<div class="footer">rdma 深度教程 · 面向 AI Infra 的 Linux RDMA 设备、资源与 NCCL 排障 · 单文件 HTML，无外部依赖</div>
+</div>
+</body>
+</html>

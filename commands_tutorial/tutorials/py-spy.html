@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>py-spy 深度教程：AI Infra 现场 Python 训练任务采样剖析</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>py-spy 深度教程：AI Infra 现场 Python 训练任务采样剖析</h1>
+<p class="sub">这份教程面向 AI Infra、训练平台、SRE 和模型工程团队，讲清楚如何用 <code>py-spy</code> 在不修改业务代码、不重启训练任务的情况下观察 Python 进程：实时 <code>top</code>、单次 <code>dump --pid</code>、采样录制 flamegraph、GIL 与线程视角、原生扩展栈、容器和 Kubernetes 权限、开销控制，以及它和 <code>perf</code>、<code>strace</code>、<code>cProfile</code> 的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">Live Profiling</span><span class="chip">py-spy top</span><span class="chip">dump --pid</span><span class="chip">Flamegraph</span><span class="chip">GIL</span><span class="chip">DDP/DataLoader</span><span class="chip">ptrace</span><span class="chip">生产安全</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>py-spy</code> 是一个进程外 Python 采样剖析器：它从目标 CPython 进程读取线程和栈信息，按采样频率统计“时间主要花在哪些 Python 调用栈上”。</div>
+<div class="success"><strong>生产实践：</strong> 先用 <code>py-spy dump --pid</code> 做低成本快照，再用 <code>py-spy top --pid</code> 观察趋势，最后只在需要证据沉淀时短时 <code>record --duration</code> 生成 flamegraph；容器和多租户环境必须先确认权限与安全边界。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">py-spy 是什么，解决什么问题</a></li>
+<li><a class="anchor" href="#s2">整体模型：进程外采样剖析</a></li>
+<li><a class="anchor" href="#s3">安装、版本与基础自检</a></li>
+<li><a class="anchor" href="#s4">找到训练进程 PID</a></li>
+<li><a class="anchor" href="#s5">AI 训练现场排查流程</a></li>
+<li><a class="anchor" href="#s6"><code>py-spy top</code> 实时观察</a></li>
+<li><a class="anchor" href="#s7"><code>dump --pid</code> 快照诊断</a></li>
+<li><a class="anchor" href="#s8"><code>record</code> 与 flamegraph</a></li>
+<li><a class="anchor" href="#s9">读懂火焰图</a></li>
+<li><a class="anchor" href="#s10">GIL、线程与 DataLoader</a></li>
+<li><a class="anchor" href="#s11">多进程、DDP 与 subprocesses</a></li>
+<li><a class="anchor" href="#s12">原生扩展、CUDA 与符号 caveat</a></li>
+<li><a class="anchor" href="#s13">权限、ptrace、Docker、Kubernetes</a></li>
+<li><a class="anchor" href="#s14">开销、采样率与生产安全</a></li>
+<li><a class="anchor" href="#s15">py-spy vs perf/strace/cProfile</a></li>
+<li><a class="anchor" href="#s16">常见故障与排障树</a></li>
+<li><a class="anchor" href="#s17">实战模板与报告格式</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. py-spy 是什么，解决什么问题</h2>
+<p><code>py-spy</code> 的价值在于“现场观察”：训练任务已经在跑，GPU 利用率突然掉到 20%，DataLoader 卡住，某个 rank 不前进，或者线上推理进程 CPU 飙高，但你不想改代码、不想打开 profiler、不想重启服务。此时 <code>py-spy</code> 可以附着到现有 CPython 进程，采样每个 Python 线程的调用栈，并把样本汇总成实时 top、快照 dump 或 flamegraph。</p>
+<div class="grid-3">
+<div class="card"><strong>擅长</strong><br>Python 层 CPU 热点、训练循环卡顿、DataLoader 队列等待、锁竞争、GIL 线索、推理服务 handler 热点。</div>
+<div class="card"><strong>不擅长</strong><br>GPU kernel 内部耗时、NCCL 内部细节、系统调用时序、内核态 CPU 栈、内存泄漏根因。</div>
+<div class="card"><strong>核心优势</strong><br>进程外运行，不需要 import，不需要 decorator，通常可以对正在运行的生产 Python 进程使用。</div>
+</div>
+<pre><code># 三个最常用入口
+py-spy top --pid 12345
+py-spy dump --pid 12345
+py-spy record -o train.svg --pid 12345 --duration 60</code></pre>
+<div class="warn"><strong>AI Infra 视角：</strong> <code>py-spy</code> 看到的是 Python 解释器栈和部分原生扩展栈。GPU 忙不忙、kernel 为什么慢，仍需配合 <code>nvidia-smi</code>、Nsight Systems、PyTorch profiler、DCGM 或平台监控。</div>
+</section>
+
+<section class="figure" id="s2">
+<h3>信息图：py-spy 的进程外采样模型</h3>
+<svg viewBox="0 0 1100 650" width="100%" role="img" aria-label="py-spy 进程外采样模型">
+<rect x="18" y="18" width="1064" height="610" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="550" y="62" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">py-spy = 进程外读取 CPython 栈 + 周期性采样 + 汇总可视化</text>
+<rect x="55" y="130" width="250" height="170" rx="20" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="180" y="172" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">训练进程</text>
+<text x="180" y="205" text-anchor="middle" font-size="15">python train.py</text>
+<text x="180" y="232" text-anchor="middle" font-size="15">PyTorch / Transformers</text>
+<text x="180" y="259" text-anchor="middle" font-size="15">线程、rank、DataLoader</text>
+<rect x="425" y="110" width="250" height="210" rx="20" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="550" y="152" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">py-spy</text>
+<text x="550" y="188" text-anchor="middle" font-size="15">读取目标进程内存</text>
+<text x="550" y="216" text-anchor="middle" font-size="15">解析 PyFrameObject</text>
+<text x="550" y="244" text-anchor="middle" font-size="15">按 --rate 周期采样</text>
+<text x="550" y="272" text-anchor="middle" font-size="15">可选 --gil / --threads / --native</text>
+<rect x="795" y="130" width="250" height="170" rx="20" fill="#ccfbf1" stroke="#99f6e4"/>
+<text x="920" y="172" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">输出</text>
+<text x="920" y="205" text-anchor="middle" font-size="15">top 实时列表</text>
+<text x="920" y="232" text-anchor="middle" font-size="15">dump 线程快照</text>
+<text x="920" y="259" text-anchor="middle" font-size="15">record 火焰图</text>
+<rect x="170" y="405" width="760" height="118" rx="18" fill="#ffedd5" stroke="#fdba74"/>
+<text x="550" y="444" text-anchor="middle" font-size="21" font-weight="700" fill="#c2410c">采样剖析回答的是“样本主要落在哪些栈上”</text>
+<text x="550" y="478" text-anchor="middle" font-size="15">宽的函数通常表示更多采样命中，不等同于单次调用耗时或严格调用顺序</text>
+<line x1="305" y1="215" x2="425" y2="215" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="675" y1="215" x2="795" y2="215" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">py-spy 不把 profiler 代码注入训练进程，因此适合现场排查；但它仍受操作系统权限、符号信息和采样误差影响。</div></section>
+
+<section class="section" id="s3">
+<h2>2. 安装、版本与基础自检</h2>
+<p>在训练节点上优先使用平台镜像内预装版本，避免临时安装污染环境。若必须安装，可以用 PyPI、Homebrew、GitHub release 或 Rust/Cargo。构建源码版本在 Linux 上通常需要 <code>libunwind</code>。</p>
+<pre><code># 常见安装方式，按你的平台规范选择一种
+python -m pip install --user py-spy
+brew install py-spy
+cargo install py-spy
+
+# 基础自检
+py-spy --version
+py-spy --help
+py-spy record --help
+py-spy top --help
+py-spy dump --help</code></pre>
+<table><tr><th>检查项</th><th>为什么重要</th><th>命令</th></tr>
+<tr><td>版本</td><td>不同版本的输出格式和选项可能略有差异</td><td><code>py-spy --version</code></td></tr>
+<tr><td>平台</td><td>原生扩展栈、权限模型和符号解析受平台影响</td><td><code>uname -a</code></td></tr>
+<tr><td>Python 发行版</td><td>符号、debug info、容器路径都会影响解析质量</td><td><code>python -VV</code></td></tr>
+<tr><td>权限</td><td>attach 到既有 PID 通常需要 ptrace 权限</td><td><code>cat /proc/sys/kernel/yama/ptrace_scope</code></td></tr>
+</table>
+<div class="note"><strong>版本策略：</strong> 教程命令使用 <code>record</code>、<code>top</code>、<code>dump</code> 这些稳定入口；细节选项以目标机器上的 <code>py-spy &lt;subcommand&gt; --help</code> 为准。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>3. 找到训练进程 PID</h2>
+<p>AI 训练任务常常由 <code>torchrun</code>、<code>accelerate</code>、Ray、Slurm、Kubernetes 或平台 launcher 启动。先确认你附着的是哪个 rank、哪个 worker、哪个容器内 PID，而不是误抓 scheduler、shell 或日志 sidecar。</p>
+<pre><code># 本机查找 Python 训练进程
+pgrep -af 'python|torchrun|accelerate|train.py'
+ps -eo pid,ppid,stat,pcpu,pmem,cmd --sort=-pcpu | head -30
+
+# 查看某个 PID 的命令行和父子关系
+PID=12345
+tr '\0' ' ' &lt; /proc/$PID/cmdline; echo
+pstree -aps $PID 2&gt;/dev/null || ps -o pid,ppid,cmd -p $PID
+
+# GPU 视角辅助定位
+nvidia-smi pmon -c 1
+nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv</code></pre>
+<div class="grid-2">
+<div class="card"><strong>单机单进程</strong><br>通常一个 <code>python train.py</code> PID，直接 <code>py-spy top --pid $PID</code>。</div>
+<div class="card"><strong>torchrun/DDP</strong><br>每个 rank 是独立 Python 进程。需要分别观察异常 rank，或用 <code>--subprocesses</code> 从 launcher 跟踪子进程。</div>
+<div class="card"><strong>DataLoader workers</strong><br><code>num_workers&gt;0</code> 时有子进程。卡顿可能发生在 worker，也可能发生在主进程等待队列。</div>
+<div class="card"><strong>Kubernetes</strong><br>容器内 PID 与宿主机 PID namespace 可能不同。进入目标容器或使用合适的 debug/ephemeral container。</div>
+</div>
+</section>
+
+<section class="figure" id="s5">
+<h3>流程图：AI 训练任务现场排查顺序</h3>
+<svg viewBox="0 0 1100 720" width="100%" role="img" aria-label="AI 训练任务 py-spy 排查流程">
+<rect x="20" y="20" width="1060" height="680" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="50" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="91" text-anchor="middle" font-size="22" font-weight="700">训练变慢或卡住</text>
+<rect x="80" y="170" width="230" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="195" y="205" text-anchor="middle" font-size="18" font-weight="700">确认现象</text><text x="195" y="233" text-anchor="middle" font-size="14">GPU/CPU/日志/rank</text>
+<rect x="435" y="170" width="230" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="550" y="205" text-anchor="middle" font-size="18" font-weight="700">dump 快照</text><text x="550" y="233" text-anchor="middle" font-size="14">线程当前卡在哪里</text>
+<rect x="790" y="170" width="230" height="86" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="905" y="205" text-anchor="middle" font-size="18" font-weight="700">top 观察</text><text x="905" y="233" text-anchor="middle" font-size="14">热点是否稳定</text>
+<polygon points="550,325 715,410 550,495 385,410" fill="#ffedd5" stroke="#fdba74"/><text x="550" y="404" text-anchor="middle" font-size="17" font-weight="700">需要证据沉淀？</text><text x="550" y="430" text-anchor="middle" font-size="14">复盘 / PR / 工单</text>
+<rect x="140" y="555" width="260" height="78" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="270" y="590" text-anchor="middle" font-size="18" font-weight="700">短时 record</text><text x="270" y="616" text-anchor="middle" font-size="14">60s flamegraph</text>
+<rect x="700" y="555" width="260" height="78" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="830" y="590" text-anchor="middle" font-size="18" font-weight="700">转用专项工具</text><text x="830" y="616" text-anchor="middle" font-size="14">Nsight / perf / strace</text>
+<line x1="550" y1="116" x2="195" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="116" x2="550" y2="170" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="116" x2="905" y2="170" stroke="#94a3b8" stroke-width="3"/>
+<path d="M195 256 C260 315, 355 345, 430 380" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M550 256 L550 325" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M905 256 C835 315, 745 345, 670 380" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<path d="M430 455 C360 500, 310 520, 270 555" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/><path d="M670 455 C735 500, 785 520, 830 555" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">不要一上来录长时间 profile。现场先用快照和实时视图判断方向，再决定是否生成火焰图或切换到 GPU/系统级工具。</div></section>
+
+<section class="section" id="s6">
+<h2>4. <code>py-spy top</code> 实时观察</h2>
+<p><code>top</code> 类似 Unix <code>top</code>：持续刷新函数占比、活动线程、GIL 信息等。它适合回答“当前是不是一直卡在同一段 Python 代码”“CPU 热点是否稳定”“某个 rank 是否在等待队列或锁”。</p>
+<pre><code># 附着到已有进程
+PID=12345
+sudo py-spy top --pid $PID
+
+# 降低采样频率，减少现场扰动
+sudo py-spy top --pid $PID --rate 50
+
+# 显示线程 ID，便于和日志、gdb、/proc 对齐
+sudo py-spy top --pid $PID --threads
+
+# 只看持有 GIL 的线程样本
+sudo py-spy top --pid $PID --gil
+
+# 从 py-spy 启动目标程序，通常比 attach 现有 PID 权限要求低
+py-spy top -- python train.py --config configs/debug.yaml</code></pre>
+<table><tr><th>观察点</th><th>可能含义</th><th>下一步</th></tr>
+<tr><td>热点在 <code>__getitem__</code> / transform</td><td>数据预处理 CPU 成为瓶颈</td><td>调 DataLoader worker、缓存、向量化、I/O 预取</td></tr>
+<tr><td>热点在 logging / json / tokenizer</td><td>训练 loop 周边逻辑吞噬 CPU</td><td>降低日志频率，预 tokenize，批处理编码</td></tr>
+<tr><td>大部分在 queue/get/wait</td><td>主进程等待数据、锁或子进程</td><td>dump 主进程和 worker，检查 worker 是否异常</td></tr>
+<tr><td>%GIL 很高且多线程争用</td><td>Python 多线程没有并行执行 CPU 代码</td><td>改多进程、释放 GIL 的库、减少 Python 热循环</td></tr>
+</table>
+<div class="note"><strong>读数原则：</strong> <code>top</code> 是实时采样视图，不是精确计时器。短暂抖动不要过度解读，稳定重复出现的栈才值得优化。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>5. <code>dump --pid</code> 快照诊断</h2>
+<p><code>dump</code> 打印当前每个 Python 线程的调用栈，特别适合“卡住了但不知道卡在哪里”的场景。它不是统计热点，而是某一瞬间的线程快照。</p>
+<pre><code># 最小快照
+sudo py-spy dump --pid 12345
+
+# 带线程 ID，便于对齐平台日志
+sudo py-spy dump --pid 12345 --threads
+
+# 打印局部变量。谨慎：可能泄露路径、token、样本内容或密钥
+sudo py-spy dump --pid 12345 --locals
+
+# 快速保存现场证据
+TS=$(date +%Y%m%d-%H%M%S)
+sudo py-spy dump --pid 12345 --threads &gt; pyspy-dump-$TS.txt</code></pre>
+<div class="danger"><strong><code>--locals</code> 安全警告：</strong> 局部变量可能包含训练样本、用户数据、访问 token、路径、环境配置或模型输入。只在受控环境使用，输出文件按敏感日志处理。</div>
+<div class="grid-2">
+<div class="card"><strong>看到 <code>threading.Condition.wait</code></strong><br>可能是主线程等待 DataLoader、queue、日志 flush 或后台线程。</div>
+<div class="card"><strong>看到 <code>multiprocessing/queues.py</code></strong><br>检查 worker 是否还活着、共享内存是否不足、数据读取是否阻塞。</div>
+<div class="card"><strong>看到 tokenizer / PIL / json</strong><br>CPU 预处理热点，常见于 NLP、图像增强或数据解析。</div>
+<div class="card"><strong>看到训练 step 之外的框架栈</strong><br>可能是 callback、checkpoint、metric、eval 或 logging 周期触发。</div>
+</div>
+</section>
+
+<section class="section" id="s8">
+<h2>6. <code>record</code> 与 flamegraph</h2>
+<p><code>record</code> 会在一段时间内采样并写入文件，默认常用于生成 SVG flamegraph。它适合沉淀证据、做优化前后对比，或发给团队一起阅读。</p>
+<pre><code># 对已有训练进程录制 60 秒火焰图
+PID=12345
+sudo py-spy record -o train-rank0.svg --pid $PID --duration 60 --rate 100
+
+# 输出 speedscope 格式，便于在 speedscope.app 或内部工具查看
+sudo py-spy record -o train-rank0.json --format speedscope --pid $PID --duration 60
+
+# 只记录持有 GIL 的样本
+sudo py-spy record -o gil.svg --pid $PID --duration 30 --gil
+
+# 记录线程 ID，分析多线程时更清楚
+sudo py-spy record -o threads.svg --pid $PID --duration 60 --threads
+
+# 从 py-spy 启动任务并录制
+py-spy record -o startup.svg -- python train.py --epochs 1 --dry-run</code></pre>
+<table><tr><th>参数</th><th>作用</th><th>AI Infra 建议</th></tr>
+<tr><td><code>--duration</code></td><td>限制录制时长</td><td>生产先录 30 到 120 秒，避免无界运行</td></tr>
+<tr><td><code>--rate</code></td><td>采样频率</td><td>默认通常够用；现场排查可降到 50 或更低</td></tr>
+<tr><td><code>--format</code></td><td>选择输出格式</td><td>SVG 便于分享，speedscope 便于交互分析</td></tr>
+<tr><td><code>--subprocesses</code></td><td>跟踪子 Python 进程</td><td>适合 launcher、DataLoader、gunicorn、multiprocessing</td></tr>
+<tr><td><code>--native</code></td><td>包含 C/C++/Cython 原生栈</td><td>需要平台支持和符号；结果不完整时不要强行推断</td></tr>
+</table>
+<div class="warn"><strong>录制边界：</strong> flamegraph 展示采样占比，不是 trace timeline。想看 GPU kernel 时间线、CUDA stream、NCCL collective，请用 Nsight Systems 或 PyTorch profiler。</div>
+</section>
+
+<section class="figure" id="s9">
+<h3>信息图：如何读 py-spy 火焰图</h3>
+<svg viewBox="0 0 1100 640" width="100%" role="img" aria-label="py-spy 火焰图阅读方法">
+<rect x="20" y="20" width="1060" height="600" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">火焰图读法：宽度是采样占比，纵向是调用栈</text>
+<rect x="120" y="505" width="860" height="54" fill="#7c2d12" opacity=".9"/><text x="550" y="538" text-anchor="middle" font-size="15" fill="#fff">train.py:main → Trainer.train</text>
+<rect x="160" y="440" width="360" height="54" fill="#ea580c"/><text x="340" y="473" text-anchor="middle" font-size="15" fill="#fff">DataLoader.__next__</text>
+<rect x="520" y="440" width="250" height="54" fill="#f97316"/><text x="645" y="473" text-anchor="middle" font-size="15" fill="#fff">model.forward</text>
+<rect x="770" y="440" width="170" height="54" fill="#fb923c"/><text x="855" y="473" text-anchor="middle" font-size="15" fill="#fff">logging</text>
+<rect x="180" y="375" width="190" height="54" fill="#2563eb"/><text x="275" y="408" text-anchor="middle" font-size="15" fill="#fff">dataset.__getitem__</text>
+<rect x="370" y="375" width="130" height="54" fill="#3b82f6"/><text x="435" y="408" text-anchor="middle" font-size="14" fill="#fff">queue.get</text>
+<rect x="540" y="375" width="110" height="54" fill="#16a34a"/><text x="595" y="408" text-anchor="middle" font-size="14" fill="#fff">forward</text>
+<rect x="650" y="375" width="100" height="54" fill="#22c55e"/><text x="700" y="408" text-anchor="middle" font-size="14" fill="#fff">loss</text>
+<rect x="190" y="310" width="115" height="54" fill="#7c3aed"/><text x="247" y="343" text-anchor="middle" font-size="14" fill="#fff">PIL.decode</text>
+<rect x="305" y="310" width="60" height="54" fill="#8b5cf6"/><text x="335" y="343" text-anchor="middle" font-size="12" fill="#fff">aug</text>
+<rect x="820" y="310" width="90" height="54" fill="#dc2626"/><text x="865" y="343" text-anchor="middle" font-size="13" fill="#fff">json.dumps</text>
+<rect x="105" y="135" width="270" height="85" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="240" y="170" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">横向越宽</text><text x="240" y="198" text-anchor="middle" font-size="14">样本越多，越值得先看</text>
+<rect x="415" y="135" width="270" height="85" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="170" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">纵向越高</text><text x="550" y="198" text-anchor="middle" font-size="14">调用链越深，不代表更慢</text>
+<rect x="725" y="135" width="270" height="85" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="860" y="170" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">看重复模式</text><text x="860" y="198" text-anchor="middle" font-size="14">对比 rank、版本和优化前后</text>
+</svg><div class="caption">优化优先级通常看“宽且可控”的栈：比如数据预处理、tokenizer、日志、Python 循环；窄而偶发的栈不一定值得改。</div></section>
+
+<section class="section">
+<h2>7. 读懂火焰图</h2>
+<p>火焰图不是调用时序图。横向宽度代表采样占比，纵向代表调用关系。一个函数很宽，说明采样时经常看到它在栈上；它可能是自己慢，也可能是它下面的子调用慢。</p>
+<table><tr><th>看到的形态</th><th>常见解释</th><th>行动</th></tr>
+<tr><td>大块集中在 dataset/transform</td><td>CPU 预处理压住训练吞吐</td><td>缓存、并行 worker、减少 Python 逻辑、使用高效库</td></tr>
+<tr><td>主线程宽在 queue/wait</td><td>主训练 loop 等数据或后台任务</td><td>同时抓 worker；检查 worker 死锁、I/O、共享内存</td></tr>
+<tr><td>logging/checkpoint 很宽</td><td>观测或保存频率过高</td><td>降低频率、异步化、只在 rank0 执行</td></tr>
+<tr><td>Python 栈很薄但 GPU 低</td><td>瓶颈可能在 native、I/O、系统调用或外部服务</td><td>切到 <code>--native</code>、<code>strace</code>、<code>perf</code> 或 Nsight</td></tr>
+</table>
+<pre><code># 优化前后对比建议
+sudo py-spy record -o before.svg --pid $PID --duration 60
+# 修改配置或发布修复后
+sudo py-spy record -o after.svg --pid $PID --duration 60
+
+# 对比时记录上下文
+python -VV
+py-spy --version
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv</code></pre>
+</section>
+
+<section class="section" id="s10">
+<h2>8. GIL、线程与 DataLoader</h2>
+<p><code>py-spy top</code> 会展示 GIL 相关信息；<code>--gil</code> 可以只包含持有 GIL 的样本。对 AI 工作负载来说，GIL 视角能帮助区分“Python 线程争用”和“原生库释放 GIL 后在外部运行”。</p>
+<pre><code># 看当前 GIL 相关占比
+sudo py-spy top --pid $PID
+
+# 只采持有 GIL 的栈，排查 Python CPU 热循环
+sudo py-spy record -o gil-only.svg --pid $PID --duration 45 --gil
+
+# 线程视图，结合 dump 判断哪个线程在等锁或队列
+sudo py-spy dump --pid $PID --threads</code></pre>
+<div class="grid-3">
+<div class="card"><strong>多线程 CPU 预处理</strong><br>如果大量 Python 代码争 GIL，多线程不一定提升吞吐。</div>
+<div class="card"><strong>NumPy/PyTorch 原生算子</strong><br>很多原生代码会释放 GIL；<code>--gil</code> 可能看不到这部分活跃工作。</div>
+<div class="card"><strong>DataLoader workers</strong><br>PyTorch 多 worker 通常是多进程。主进程等待时，要继续看 worker 进程。</div>
+</div>
+<div class="warn"><strong>GIL caveat：</strong> 只看 <code>--gil</code> 可能漏掉释放 GIL 后仍在运行的原生扩展。怀疑 C/C++/Cython、tokenizer、OpenCV、Pillow、NumPy、PyTorch native 时，结合 <code>--native</code> 或系统级 profiler。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>9. 多进程、DDP 与 subprocesses</h2>
+<p>DDP、DataLoader、Ray worker、gunicorn worker 都可能让“一个训练作业”变成多个 Python 进程。不要只 profile launcher；要确认被采样的是实际消耗 CPU 或卡住的 rank/worker。</p>
+<pre><code># 从 torchrun 父进程跟踪子 Python 进程
+sudo py-spy record -o ddp.svg --pid $LAUNCHER_PID --subprocesses --duration 60
+
+# 分 rank 分别记录，便于比较异常 rank
+for pid in $(pgrep -f 'train.py'); do
+  echo "recording $pid"
+  sudo py-spy record -o "rank-$pid.svg" --pid "$pid" --duration 30
+done
+
+# DataLoader worker 排查：先看进程树，再对可疑 worker dump
+pstree -aps $MAIN_PID
+sudo py-spy dump --pid $WORKER_PID --threads</code></pre>
+<table><tr><th>场景</th><th>建议抓谁</th><th>判断标准</th></tr>
+<tr><td>某个 rank step 慢</td><td>慢 rank 的 Python 进程</td><td>对比正常 rank 的 flamegraph</td></tr>
+<tr><td>全部 rank GPU 利用率低</td><td>rank0、任一慢 rank、DataLoader worker</td><td>看是否共同等待数据、日志或 barrier</td></tr>
+<tr><td>launcher 卡住</td><td>launcher + <code>--subprocesses</code></td><td>确认子进程是否还在运行或等待</td></tr>
+<tr><td>推理服务多 worker</td><td>高 CPU 或高延迟 worker</td><td>按 PID 与端口、日志 request id 对齐</td></tr>
+</table>
+</section>
+
+<section class="section" id="s12">
+<h2>10. 原生扩展、CUDA 与符号 caveat</h2>
+<p><code>--native</code> 可以尝试把 C/C++/Cython 栈纳入 profile。它对 Python 扩展热点很有价值，比如 tokenizers、OpenCV、Pillow、NumPy、Cython 数据处理、部分 PyTorch native 路径。但原生栈质量高度依赖平台、架构、符号和编译选项。</p>
+<pre><code># 捕获原生扩展栈
+sudo py-spy record -o native.svg --pid $PID --duration 60 --native
+
+# top 中查看原生热点
+sudo py-spy top --pid $PID --native
+
+# 如果只看到地址或 unknown，检查符号和二进制
+readelf -Ws /path/to/extension.so | head
+file /path/to/extension.so</code></pre>
+<div class="grid-2">
+<div class="card"><strong>CUDA 异步性</strong><br>Python 发起 CUDA kernel 后可能很快返回；实际 GPU 时间不一定体现在 Python 栈宽度上。</div>
+<div class="card"><strong>NCCL/通信等待</strong><br>py-spy 可能只看到 Python 调用或等待点，通信内部 timeline 需要 NCCL 日志或 Nsight。</div>
+<div class="card"><strong>符号缺失</strong><br>没有符号时，原生栈可能显示地址、unknown 或过于粗糙的函数名。</div>
+<div class="card"><strong>Cython 行号</strong><br>要映射到 <code>.pyx</code> 行号，通常需要生成的 C/C++ 文件和符号配合。</div>
+</div>
+<div class="note"><strong>工具组合：</strong> Python 热点先用 <code>py-spy</code>；CPU native 热点用 <code>perf</code>；GPU timeline 用 Nsight Systems；PyTorch operator 级别可用 PyTorch profiler。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>11. 权限、ptrace、Docker、Kubernetes</h2>
+<p><code>py-spy</code> 需要读取另一个进程的内存。Linux 上 attach 到非子进程通常受 ptrace/Yama 限制；Docker 和 Kubernetes 默认也常缺少 <code>SYS_PTRACE</code> 能力。权限问题不是 py-spy 命令写错，而是安全边界在生效。</p>
+<pre><code># Linux 主机：查看 ptrace 策略
+cat /proc/sys/kernel/yama/ptrace_scope
+
+# 常见 attach 方式
+sudo py-spy top --pid $PID
+sudo py-spy dump --pid $PID
+
+# 如果 py-spy 启动目标进程，通常不需要 attach 现有非子进程
+py-spy record -o startup.svg -- python train.py</code></pre>
+<table><tr><th>环境</th><th>症状</th><th>处理方式</th></tr>
+<tr><td>Linux 裸机</td><td><code>Permission denied</code></td><td>用 <code>sudo</code>，或按安全策略调整 <code>kernel.yama.ptrace_scope</code></td></tr>
+<tr><td>Docker</td><td>root 仍失败</td><td>启动容器时加入 <code>--cap-add SYS_PTRACE</code>，必要时检查 seccomp profile</td></tr>
+<tr><td>Kubernetes</td><td>Pod 内无法读取目标进程</td><td>容器安全上下文增加 <code>SYS_PTRACE</code>，或使用授权的 ephemeral debug container</td></tr>
+<tr><td>macOS</td><td>系统 Python 或受保护进程失败</td><td>System Integrity Protection 可能阻止读取；使用非系统 Python 或受控环境</td></tr>
+</table>
+<pre><code># Docker 示例：启动时授予能力
+docker run --cap-add SYS_PTRACE --security-opt seccomp=unconfined ...
+
+# docker-compose 片段
+services:
+  trainer:
+    cap_add:
+      - SYS_PTRACE
+
+# Kubernetes 容器 securityContext 片段
+securityContext:
+  capabilities:
+    add:
+      - SYS_PTRACE</code></pre>
+<div class="danger"><strong>安全提醒：</strong> <code>SYS_PTRACE</code> 允许读取进程内存，可能暴露模型输入、密钥、环境变量或用户数据。多租户集群不要随意给业务 Pod 长期开启该能力；优先使用短生命周期调试容器和审批流程。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>12. 开销、采样率与生产安全</h2>
+<p>py-spy 的开销通常很低，因为它在目标进程外运行；但“低开销”不等于“零影响”。采样需要读取目标进程状态，某些模式可能短暂停顿目标进程；高采样率、长时间录制、原生栈解析、子进程跟踪都会增加扰动。</p>
+<pre><code># 保守生产模板：低采样率、短时长、明确输出路径
+TS=$(date +%Y%m%d-%H%M%S)
+sudo py-spy record \
+  --pid $PID \
+  --duration 60 \
+  --rate 50 \
+  -o "/tmp/pyspy-$PID-$TS.svg"
+
+# 尝试避免暂停目标进程，但可能增加采样错误或部分栈
+sudo py-spy record --pid $PID --duration 60 --nonblocking -o nonblocking.svg</code></pre>
+<table><tr><th>控制项</th><th>更安全的选择</th><th>代价</th></tr>
+<tr><td>采样率</td><td><code>--rate 50</code> 或更低</td><td>细粒度热点可能不明显</td></tr>
+<tr><td>录制时长</td><td><code>--duration 30/60/120</code></td><td>不能覆盖很长周期事件</td></tr>
+<tr><td>本地变量</td><td>默认不要 <code>--locals</code></td><td>少了变量上下文</td></tr>
+<tr><td>原生栈</td><td>先不加 <code>--native</code></td><td>看不到 C/C++/Cython 细节</td></tr>
+<tr><td>暂停行为</td><td>高敏感任务可试 <code>--nonblocking</code></td><td>可能出现采样错误或不完整栈</td></tr>
+</table>
+<div class="success"><strong>上线窗口建议：</strong> 在低峰或单个异常实例先抓；记录 PID、rank、镜像、commit、采样率、时长、GPU 利用率和时间段，避免 profile 文件脱离上下文后无法解释。</div>
+</section>
+
+<section class="figure" id="s15">
+<h3>选择图：py-spy、perf、strace、cProfile 怎么选</h3>
+<svg viewBox="0 0 1100 670" width="100%" role="img" aria-label="py-spy 与 perf strace cProfile 选择图">
+<rect x="20" y="20" width="1060" height="630" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="550" y="70" text-anchor="middle" font-size="26" font-weight="700">先问你要看哪一层</text>
+<rect x="80" y="130" width="220" height="390" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="190" y="175" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">Python 栈</text><text x="190" y="222" text-anchor="middle" font-size="16">py-spy</text><text x="190" y="254" text-anchor="middle" font-size="14">无需改代码</text><text x="190" y="282" text-anchor="middle" font-size="14">适合运行中进程</text><text x="190" y="310" text-anchor="middle" font-size="14">top / dump / flamegraph</text>
+<rect x="330" y="130" width="220" height="390" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="440" y="175" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">CPU/native</text><text x="440" y="222" text-anchor="middle" font-size="16">perf</text><text x="440" y="254" text-anchor="middle" font-size="14">内核与用户态</text><text x="440" y="282" text-anchor="middle" font-size="14">C/C++/系统热点</text><text x="440" y="310" text-anchor="middle" font-size="14">需要符号更好</text>
+<rect x="580" y="130" width="220" height="390" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="690" y="175" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">系统调用</text><text x="690" y="222" text-anchor="middle" font-size="16">strace</text><text x="690" y="254" text-anchor="middle" font-size="14">文件/网络/锁等待</text><text x="690" y="282" text-anchor="middle" font-size="14">能看 syscall</text><text x="690" y="310" text-anchor="middle" font-size="14">扰动可能更明显</text>
+<rect x="830" y="130" width="220" height="390" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="940" y="175" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">代码内精确</text><text x="940" y="222" text-anchor="middle" font-size="16">cProfile</text><text x="940" y="254" text-anchor="middle" font-size="14">函数调用计数</text><text x="940" y="282" text-anchor="middle" font-size="14">需要改启动方式</text><text x="940" y="310" text-anchor="middle" font-size="14">开销和语义不同</text>
+<rect x="235" y="565" width="630" height="48" rx="12" fill="#eef2f7" stroke="#cbd5e1"/><text x="550" y="596" text-anchor="middle" font-size="16">Python 现场先 py-spy；系统调用看 strace；CPU native 看 perf；可控复现再 cProfile/PyTorch profiler</text>
+</svg><div class="caption">工具不是互斥的。py-spy 常用于第一现场定位方向，再把问题交给更低层或更精确的 profiler。</div></section>
+
+<section class="section">
+<h2>13. py-spy vs perf/strace/cProfile</h2>
+<table><tr><th>工具</th><th>回答的问题</th><th>优势</th><th>局限</th></tr>
+<tr><td><code>py-spy</code></td><td>Python 进程现在卡在哪些 Python 栈上</td><td>进程外、可 attach、适合生产现场</td><td>不是 GPU timeline，不是 syscall trace</td></tr>
+<tr><td><code>perf</code></td><td>CPU 周期、内核/用户态 native 热点</td><td>系统级强，适合 C/C++/内核</td><td>Python 符号和解释器栈需额外处理</td></tr>
+<tr><td><code>strace</code></td><td>进程在做哪些系统调用</td><td>I/O、网络、文件、futex 等等待非常直观</td><td>不是 CPU profiler，可能明显影响高频 syscall 程序</td></tr>
+<tr><td><code>cProfile</code></td><td>可控运行中的 Python 函数调用次数和累计耗时</td><td>精确到函数调用统计，适合本地复现</td><td>需要代码/启动介入，不适合已经运行的生产任务</td></tr>
+<tr><td>PyTorch profiler</td><td>PyTorch operator、CPU/GPU 活动、timeline</td><td>训练框架语义最强</td><td>需要在代码中配置 profile window，开销更高</td></tr>
+</table>
+<pre><code># 组合排查示例
+sudo py-spy dump --pid $PID --threads
+sudo py-spy record -o py.svg --pid $PID --duration 60
+sudo strace -tt -T -p $PID -f -o strace.txt
+sudo perf top -p $PID</code></pre>
+<div class="warn"><strong>不要混淆：</strong> py-spy flamegraph 宽，不代表某个 syscall 慢；strace 中某个 <code>futex</code> 等待长，也不代表 Python 热点函数自身 CPU 高。不同工具的语义要分开解释。</div>
+</section>
+
+<section class="figure" id="s16">
+<h3>排障树：py-spy 报错或结果看不懂时</h3>
+<svg viewBox="0 0 1100 740" width="100%" role="img" aria-label="py-spy 排障树">
+<rect x="20" y="20" width="1060" height="700" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="280" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="550" y="86" text-anchor="middle" font-size="22" font-weight="700">py-spy 不符合预期</text>
+<rect x="70" y="160" width="220" height="92" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="180" y="195" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">Permission denied</text><text x="180" y="224" text-anchor="middle" font-size="14">ptrace / sudo / capability</text>
+<rect x="315" y="160" width="220" height="92" rx="14" fill="#ffedd5" stroke="#fdba74"/><text x="425" y="195" text-anchor="middle" font-size="18" font-weight="700" fill="#c2410c">没有有用栈</text><text x="425" y="224" text-anchor="middle" font-size="14">PID 错 / 符号 / idle</text>
+<rect x="560" y="160" width="220" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="670" y="195" text-anchor="middle" font-size="18" font-weight="700" fill="#6d28d9">火焰图很薄</text><text x="670" y="224" text-anchor="middle" font-size="14">native/GPU/I/O 瓶颈</text>
+<rect x="805" y="160" width="220" height="92" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="915" y="195" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">结果抖动</text><text x="915" y="224" text-anchor="middle" font-size="14">采样太短 / 事件偶发</text>
+<rect x="92" y="350" width="178" height="86" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="181" y="383" text-anchor="middle" font-size="16" font-weight="700">检查 sudo</text><text x="181" y="410" text-anchor="middle" font-size="13">SYS_PTRACE</text>
+<rect x="336" y="350" width="178" height="86" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="425" y="383" text-anchor="middle" font-size="16" font-weight="700">确认 PID</text><text x="425" y="410" text-anchor="middle" font-size="13">cmdline / pstree</text>
+<rect x="581" y="350" width="178" height="86" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="670" y="383" text-anchor="middle" font-size="16" font-weight="700">换工具层级</text><text x="670" y="410" text-anchor="middle" font-size="13">native / strace / Nsight</text>
+<rect x="826" y="350" width="178" height="86" rx="14" fill="#f8fafc" stroke="#cbd5e1"/><text x="915" y="383" text-anchor="middle" font-size="16" font-weight="700">延长采样</text><text x="915" y="410" text-anchor="middle" font-size="13">多次对比</text>
+<rect x="260" y="565" width="580" height="82" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="550" y="598" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">先证明采样对象正确，再解释 profile 内容</text><text x="550" y="624" text-anchor="middle" font-size="14">PID、权限、采样窗口、工具语义是四个最常见误区</text>
+<line x1="550" y1="111" x2="180" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="425" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="670" y2="160" stroke="#94a3b8" stroke-width="3"/><line x1="550" y1="111" x2="915" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="180" y1="252" x2="181" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="252" x2="425" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="252" x2="670" y2="350" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="252" x2="915" y2="350" stroke="#94a3b8" stroke-width="3"/>
+<line x1="181" y1="436" x2="405" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="425" y1="436" x2="500" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="670" y1="436" x2="600" y2="565" stroke="#94a3b8" stroke-width="3"/><line x1="915" y1="436" x2="700" y2="565" stroke="#94a3b8" stroke-width="3"/>
+</svg><div class="caption">大多数 py-spy 问题不是“命令不可用”，而是目标 PID、权限、采样窗口或工具层级没有对齐。</div></section>
+
+<section class="section">
+<h2>14. 常见故障与排障</h2>
+<div class="grid-2">
+<div class="card"><strong>Permission denied</strong><br>用 <code>sudo</code> 重试；容器检查 <code>SYS_PTRACE</code>；Kubernetes 检查 securityContext 或 debug container profile。</div>
+<div class="card"><strong>top 看起来没有变化</strong><br>确认 PID 是训练 worker 而非 launcher；降低过滤条件，不要一开始就加 <code>--gil</code>。</div>
+<div class="card"><strong>火焰图只有等待</strong><br>这可能是真相：主进程在等数据、通信或锁。继续 dump worker/rank，并用 <code>strace</code> 看等待类型。</div>
+<div class="card"><strong>看不到 GPU 慢在哪里</strong><br>py-spy 不是 GPU profiler。使用 Nsight Systems、PyTorch profiler、DCGM、NCCL_DEBUG。</div>
+<div class="card"><strong>native 栈是地址或 unknown</strong><br>缺少符号、平台不支持或二进制被 strip。不要从 unknown 栈过度推断。</div>
+<div class="card"><strong>采样结果每次不同</strong><br>窗口太短或 workload 周期性强。按 step 周期录制，多次对比，并记录训练阶段。</div>
+<div class="card"><strong><code>--locals</code> 输出太大或敏感</strong><br>停止使用，删除或加密处理输出文件，改用不含 locals 的 dump。</div>
+<div class="card"><strong>attach 导致任务敏感抖动</strong><br>降低 <code>--rate</code>，缩短 <code>--duration</code>，尝试 <code>--nonblocking</code>，或在副本环境复现。</div>
+</div>
+<h3>最小排障命令组</h3>
+<pre><code>PID=12345
+tr '\0' ' ' &lt; /proc/$PID/cmdline; echo
+ps -o pid,ppid,stat,pcpu,pmem,cmd -p $PID
+sudo py-spy dump --pid $PID --threads | head -120
+sudo py-spy top --pid $PID --rate 50
+sudo py-spy record --pid $PID --duration 45 --rate 50 -o /tmp/pyspy-$PID.svg</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>15. 实战模板与报告格式</h2>
+<p>一次有价值的 py-spy 排查不只是生成 SVG，而是把证据放进训练上下文：哪个任务、哪个 rank、什么时间、什么症状、采样多久、看到什么、排除了什么、下一步用什么工具验证。</p>
+<pre><code># 生产友好的采样脚本片段
+#!/usr/bin/env bash
+set -euo pipefail
+
+PID="${1:?usage: $0 PID}"
+OUT_DIR="${OUT_DIR:-/tmp/pyspy}"
+mkdir -p "$OUT_DIR"
+
+TS="$(date +%Y%m%d-%H%M%S)"
+BASE="$OUT_DIR/pyspy-$PID-$TS"
+
+tr '\0' ' ' &lt; "/proc/$PID/cmdline" &gt; "$BASE.cmdline.txt"
+ps -o pid,ppid,stat,pcpu,pmem,etime,cmd -p "$PID" &gt; "$BASE.ps.txt"
+sudo py-spy dump --pid "$PID" --threads &gt; "$BASE.dump.txt"
+sudo py-spy record --pid "$PID" --duration 60 --rate 50 -o "$BASE.svg"
+
+echo "wrote $BASE.*"</code></pre>
+<h3>报告模板</h3>
+<table><tr><th>字段</th><th>示例</th></tr>
+<tr><td>现象</td><td>训练 step time 从 1.2s 增至 4.8s，GPU util 30%</td></tr>
+<tr><td>对象</td><td>job=llm-pretrain-0425，rank=3，pid=12345，image=xxx</td></tr>
+<tr><td>采样</td><td><code>py-spy record --duration 60 --rate 50</code></td></tr>
+<tr><td>发现</td><td>主进程 70% 样本在 <code>DataLoader.__next__</code> / <code>queue.get</code></td></tr>
+<tr><td>解释</td><td>主训练 loop 等数据；继续 dump worker 发现图片解码热点</td></tr>
+<tr><td>下一步</td><td>增加 worker、缓存解码结果、对比优化前后 flamegraph</td></tr>
+</table>
+<div class="success"><strong>结论标准：</strong> 好的 profile 结论要能转化成下一步动作：改配置、改代码、换工具、抓更低层证据，或明确排除某条假设。</div>
+</section>
+
+<section class="section">
+<h2>16. 学习路线与练习任务</h2>
+<h3>第一阶段：会安全观察</h3>
+<ul><li>会找到正确 PID，并确认它是目标 Python 进程。</li><li>会使用 <code>dump --pid</code> 保存线程快照。</li><li>会用 <code>top --pid</code> 观察稳定热点，而不是解读瞬时噪声。</li></ul>
+<h3>第二阶段：会沉淀证据</h3>
+<ul><li>会用 <code>record --duration</code> 生成短时 flamegraph。</li><li>会比较 rank 之间、优化前后、不同训练阶段的 profile。</li><li>会记录采样率、时长、版本、PID、GPU 指标和代码 commit。</li></ul>
+<h3>第三阶段：会判断边界</h3>
+<ul><li>知道什么时候加 <code>--gil</code>、<code>--threads</code>、<code>--native</code>、<code>--subprocesses</code>。</li><li>知道 py-spy 不能替代 GPU profiler、system call tracer 或框架 profiler。</li><li>知道权限能力的安全含义，尤其是 <code>SYS_PTRACE</code> 和 <code>--locals</code>。</li></ul>
+<h3>练习</h3>
+<ol><li>写一个 CPU 忙循环 Python 脚本，用 <code>py-spy top</code> 观察热点函数。</li><li>写一个 <code>time.sleep</code> 或 queue wait 脚本，用 <code>dump</code> 观察等待栈。</li><li>录制 30 秒 flamegraph，解释最宽的 3 个栈。</li><li>用 <code>--threads</code> 对比多线程脚本的输出。</li><li>在测试容器中验证缺少和添加 <code>SYS_PTRACE</code> 时的行为。</li><li>对 PyTorch DataLoader 示例分别 profile 主进程和 worker。</li></ol>
+<pre><code># 练习用最小 CPU 脚本
+cat &gt; /tmp/pyspy-demo.py &lt;&lt'PY'
+import time
+
+def hot_loop():
+    x = 0
+    for i in range(20_000_000):
+        x += i % 7
+    return x
+
+while True:
+    hot_loop()
+    time.sleep(0.2)
+PY
+
+python /tmp/pyspy-demo.py &
+PID=$!
+py-spy top --pid $PID --rate 50
+py-spy record --pid $PID --duration 20 -o /tmp/pyspy-demo.svg
+kill $PID</code></pre>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2><ul>
+<li>py-spy GitHub README：<a href="https://github.com/benfred/py-spy">https://github.com/benfred/py-spy</a></li>
+<li>py-spy README on docs.rs：<a href="https://docs.rs/crate/py-spy/latest/source/README.md">https://docs.rs/crate/py-spy/latest/source/README.md</a></li>
+<li>Linux <code>process_vm_readv(2)</code> 与 ptrace/Yama 安全模型：<a href="https://man7.org/linux/man-pages/man2/process_vm_readv.2.html">https://man7.org/linux/man-pages/man2/process_vm_readv.2.html</a></li>
+<li>Docker seccomp 与 Linux capabilities 文档：<a href="https://docs.docker.com/engine/security/seccomp/">https://docs.docker.com/engine/security/seccomp/</a></li>
+<li>Kubernetes Security Context：<a href="https://kubernetes.io/docs/tasks/configure-pod-container/security-context/">https://kubernetes.io/docs/tasks/configure-pod-container/security-context/</a></li>
+<li>Brendan Gregg Flame Graphs：<a href="https://www.brendangregg.com/flamegraphs.html">https://www.brendangregg.com/flamegraphs.html</a></li>
+</ul><p class="mini">建议阅读顺序：先掌握进程外采样模型，再熟悉 <code>top</code>、<code>dump</code>、<code>record</code> 三个入口；最后学习权限、GIL、原生扩展和工具边界。</p></section>
+<div class="footer">py-spy 深度教程 · AI Infra 现场剖析版 · live Python training profiling、GIL/thread、flamegraph、ptrace 与生产安全</div>
+</div>
+</body>
+</html>

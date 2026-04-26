@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>numactl 深度教程：AI Infra 中的 NUMA 亲和性、内存策略与 GPU 本地性</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 18% 0%,#e8f3ff 0,#f7fafc 34%,#f5f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px;background:linear-gradient(135deg,#ffffff 0%,#f7fbff 58%,#eefcf8 100%)}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--teal2);color:#0f766e;font-size:13px;font-weight:700;border:1px solid #99f6e4}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>numactl 深度教程：AI Infra 中的 NUMA 亲和性、内存策略与 GPU 本地性</h1>
+<p class="sub">这份教程面向训练、推理、数据加载和性能排障场景，系统讲清楚 <code>numactl</code> 如何查看 NUMA 拓扑、绑定 CPU 节点、限制或偏好内存节点、理解 GPU 与 CPU/内存的物理距离，并解释它与 <code>taskset</code>、容器 cpuset/cgroup、DataLoader worker、线程库和基准测试之间的边界。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">NUMA topology</span><span class="chip">--hardware</span><span class="chip">--cpunodebind</span><span class="chip">--membind</span><span class="chip">GPU locality</span><span class="chip">DataLoader</span><span class="chip">containers</span><span class="chip">benchmarking</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>numactl</code> 是“进程启动时的 NUMA 策略控制器”：它告诉 Linux 调度器和内存分配器，这个进程应该主要在哪些 NUMA 节点上跑、从哪些 NUMA 节点分配内存。</div>
+<div class="success"><strong>实践原则：</strong> 先用 <code>numactl --hardware</code>、<code>lscpu</code>、<code>nvidia-smi topo -m</code> 看清拓扑，再绑定；不要在不了解容器 cpuset、GPU PCIe/NVLink 拓扑、线程数和数据加载路径时盲目加 <code>--membind</code>。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">numactl 解决什么问题</a></li>
+<li><a class="anchor" href="#s2">NUMA 心智模型</a></li>
+<li><a class="anchor" href="#s3">安装、版本与基本命令</a></li>
+<li><a class="anchor" href="#s4">用 --hardware 读取拓扑</a></li>
+<li><a class="anchor" href="#s5">用 --show 验证当前策略</a></li>
+<li><a class="anchor" href="#s6">CPU 绑定：--cpunodebind 与 --physcpubind</a></li>
+<li><a class="anchor" href="#s7">内存策略：--membind、--preferred、--interleave</a></li>
+<li><a class="anchor" href="#s8">AI 训练与推理的启动流程</a></li>
+<li><a class="anchor" href="#s9">GPU locality：CPU、内存与 GPU 的距离</a></li>
+<li><a class="anchor" href="#s10">DataLoader、worker 与线程库</a></li>
+<li><a class="anchor" href="#s11">benchmarking 常见陷阱</a></li>
+<li><a class="anchor" href="#s12">containers、cpuset 与 cgroups</a></li>
+<li><a class="anchor" href="#s13">numactl vs taskset</a></li>
+<li><a class="anchor" href="#s14">systemd、Slurm 与 Kubernetes 场景</a></li>
+<li><a class="anchor" href="#s15">排障：性能变慢、OOM、绑定失效</a></li>
+<li><a class="anchor" href="#s16">生产配方与反模式</a></li>
+<li><a class="anchor" href="#s17">速查表与学习路线</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. numactl 解决什么问题</h2>
+<p>现代双路或多路服务器通常不是“所有 CPU 访问所有内存都一样快”。每个 CPU socket 附近有本地内存控制器，访问本地内存快，跨 socket 访问远端内存慢。GPU 也通常挂在某个 PCIe root complex 下，离某些 CPU/NUMA 节点更近。</p>
+<div class="grid-3">
+<div class="card"><strong>它能控制</strong><br>进程可运行在哪些 NUMA 节点或 CPU 核上，以及内存分配优先来自哪些 NUMA 节点。</div>
+<div class="card"><strong>它不能控制</strong><br>GPU kernel 调度、CUDA stream、NVLink 路由、PCIe 带宽上限、应用内部线程池策略。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>减少远端内存访问、降低 DataLoader 抖动、让 CPU 预处理靠近目标 GPU、让基准测试更可复现。</div>
+</div>
+<pre><code># 查看机器 NUMA 拓扑
+numactl --hardware
+
+# 在 NUMA node 0 的 CPU 上运行，并尽量从 node 0 分配内存
+numactl --cpunodebind=0 --membind=0 python train.py
+
+# 只查看当前 shell 的默认 NUMA 策略
+numactl --show</code></pre>
+<div class="warn"><strong>边界提醒：</strong> <code>numactl</code> 是启动时施加策略的工具。它不能把已经启动的复杂服务“完全无损地重新 NUMA 绑定”，也不能绕过容器或作业系统已经限制的 cpuset。</div>
+</section>
+
+<section class="figure" id="s2">
+<h2>2. NUMA 心智模型</h2>
+<h3>信息图：AI 服务器中的 NUMA 与 GPU 本地性</h3>
+<svg viewBox="0 0 1120 700" width="100%" role="img" aria-label="NUMA 与 GPU 本地性整体模型">
+<rect x="18" y="18" width="1084" height="650" rx="20" fill="#f8fbff" stroke="#d9e1ec"/>
+<text x="560" y="64" text-anchor="middle" font-size="28" font-weight="700" fill="#1f2937">NUMA = CPU socket、本地内存、I/O 设备之间的距离模型</text>
+<rect x="70" y="120" width="430" height="360" rx="24" fill="#dbeafe" stroke="#93c5fd"/>
+<text x="285" y="158" text-anchor="middle" font-size="24" font-weight="700" fill="#1d4ed8">NUMA node 0</text>
+<rect x="110" y="190" width="145" height="86" rx="16" fill="#ffffff" stroke="#bfdbfe"/><text x="182" y="225" text-anchor="middle" font-size="17" font-weight="700">CPU cores</text><text x="182" y="250" text-anchor="middle" font-size="14">0-31</text>
+<rect x="315" y="190" width="145" height="86" rx="16" fill="#ffffff" stroke="#bfdbfe"/><text x="388" y="225" text-anchor="middle" font-size="17" font-weight="700">Local DRAM</text><text x="388" y="250" text-anchor="middle" font-size="14">256 GB</text>
+<rect x="185" y="330" width="200" height="86" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="285" y="365" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">GPU0 / GPU1</text><text x="285" y="390" text-anchor="middle" font-size="14">PCIe local</text>
+<rect x="620" y="120" width="430" height="360" rx="24" fill="#ede9fe" stroke="#c4b5fd"/>
+<text x="835" y="158" text-anchor="middle" font-size="24" font-weight="700" fill="#6d28d9">NUMA node 1</text>
+<rect x="660" y="190" width="145" height="86" rx="16" fill="#ffffff" stroke="#ddd6fe"/><text x="732" y="225" text-anchor="middle" font-size="17" font-weight="700">CPU cores</text><text x="732" y="250" text-anchor="middle" font-size="14">32-63</text>
+<rect x="865" y="190" width="145" height="86" rx="16" fill="#ffffff" stroke="#ddd6fe"/><text x="938" y="225" text-anchor="middle" font-size="17" font-weight="700">Local DRAM</text><text x="938" y="250" text-anchor="middle" font-size="14">256 GB</text>
+<rect x="735" y="330" width="200" height="86" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="835" y="365" text-anchor="middle" font-size="17" font-weight="700" fill="#0f766e">GPU2 / GPU3</text><text x="835" y="390" text-anchor="middle" font-size="14">PCIe local</text>
+<path d="M500 300 C550 250, 570 250, 620 300" fill="none" stroke="#94a3b8" stroke-width="6"/>
+<text x="560" y="256" text-anchor="middle" font-size="14" fill="#475569">UPI / Infinity Fabric</text>
+<rect x="190" y="535" width="740" height="78" rx="16" fill="#ffedd5" stroke="#fdba74"/>
+<text x="560" y="568" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">目标：让 CPU 预处理线程、host memory、目标 GPU 尽量在同一侧</text>
+<text x="560" y="595" text-anchor="middle" font-size="14" fill="#7c2d12">跨 NUMA 访问不是错误，但会带来额外延迟、带宽竞争和 benchmark 抖动</text>
+</svg>
+<div class="caption">在 AI 工作负载中，NUMA 亲和性常影响数据输入、CPU 预处理、host-to-device copy 和多进程推理服务的尾延迟。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 安装、版本与基本命令</h2>
+<p><code>numactl</code> 通常由 Linux 发行版的 <code>numactl</code> 包提供。生产镜像里如果没有它，先确认基础镜像是否允许安装诊断工具，或者在宿主机侧完成拓扑探测。</p>
+<table>
+<tr><th>系统</th><th>安装命令</th><th>说明</th></tr>
+<tr><td>Ubuntu / Debian</td><td><code>sudo apt-get install numactl</code></td><td>包含 <code>numactl</code> 与常用 NUMA 库工具。</td></tr>
+<tr><td>RHEL / Rocky / Alma</td><td><code>sudo dnf install numactl</code></td><td>老系统可能使用 <code>yum</code>。</td></tr>
+<tr><td>SUSE</td><td><code>sudo zypper install numactl</code></td><td>HPC 环境常已预装。</td></tr>
+<tr><td>容器</td><td>在镜像内安装或从宿主机探测</td><td>容器内看到的 CPU/内存集合可能已被 cgroup 限制。</td></tr>
+</table>
+<pre><code># 查看版本与帮助
+numactl --version
+numactl --help
+
+# 查看 NUMA 拓扑
+numactl --hardware
+
+# 查看当前 shell 的策略
+numactl --show
+
+# 为一个命令设置策略
+numactl --cpunodebind=0 --membind=0 command arg1 arg2</code></pre>
+<div class="note"><strong>读法提醒：</strong> <code>numactl</code> 的节点编号是 NUMA node 编号，不是 GPU 编号，也不是 socket 物理标签；必须通过拓扑命令建立映射。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 用 <code>--hardware</code> 读取拓扑</h2>
+<p><code>numactl --hardware</code> 是第一条应该运行的命令。它展示可用 NUMA 节点、每个节点包含哪些 CPU、节点内存大小、空闲内存，以及节点间距离矩阵。</p>
+<pre><code>$ numactl --hardware
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 ... 31
+node 0 size: 257652 MB
+node 0 free: 188430 MB
+node 1 cpus: 32 33 34 35 ... 63
+node 1 size: 257914 MB
+node 1 free: 201002 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10</code></pre>
+<table>
+<tr><th>字段</th><th>含义</th><th>AI Infra 解读</th></tr>
+<tr><td><code>available</code></td><td>当前可见 NUMA 节点集合</td><td>容器或作业系统可能只暴露子集。</td></tr>
+<tr><td><code>node N cpus</code></td><td>该节点包含的逻辑 CPU</td><td>用于选择 DataLoader worker、CPU 预处理线程和服务进程亲和性。</td></tr>
+<tr><td><code>node N size/free</code></td><td>该节点总内存与空闲内存</td><td><code>--membind</code> 前要确认容量，否则容易分配失败或 OOM。</td></tr>
+<tr><td><code>distances</code></td><td>节点间访问成本，数值越小越近</td><td>本地通常为 10，跨 socket 更高；不是绝对延迟，只是相对距离。</td></tr>
+</table>
+<pre><code># 结合 lscpu 看 socket、core、thread 映射
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+
+# 更详细的拓扑可用 hwloc/lstopo，但不是 numactl 必需项
+lstopo-no-graphics 2&gt;/dev/null | head</code></pre>
+<div class="warn"><strong>常见误读：</strong> <code>node 0 free</code> 只是当前空闲量，不等于应用运行期间一直可用；训练作业启动时，缓存、其他容器和 page cache 都可能改变局部内存压力。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 用 <code>--show</code> 验证当前策略</h2>
+<p><code>numactl --show</code> 显示当前进程的 NUMA 策略、CPU 绑定和内存绑定。它适合在脚本开头打印一次，作为实验记录的一部分。</p>
+<pre><code>$ numactl --show
+policy: default
+preferred node: current
+physcpubind: 0 1 2 3 4 5 6 7
+cpubind: 0
+nodebind: 0
+membind: 0 1</code></pre>
+<pre><code># 在绑定环境中检查策略
+numactl --cpunodebind=0 --membind=0 bash -lc '
+  echo "NUMA policy:"
+  numactl --show
+  echo "Python sees CPUs:"
+  python -c "import os; print(len(os.sched_getaffinity(0)), sorted(os.sched_getaffinity(0))[:8])"
+'</code></pre>
+<div class="note"><strong>验证习惯：</strong> 不要只看启动命令。用 <code>numactl --show</code>、<code>taskset -pc $$</code>、<code>/proc/$$/status</code> 和应用日志一起确认最终生效的 CPU 集合。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. CPU 绑定：<code>--cpunodebind</code> 与 <code>--physcpubind</code></h2>
+<p>CPU 绑定有两种常见粒度：按 NUMA 节点绑定，或按具体逻辑 CPU 绑定。AI Infra 通常先按节点绑定，只有在需要精细隔离 worker、网络线程、推理实例时再按 CPU 列表绑定。</p>
+<table>
+<tr><th>选项</th><th>粒度</th><th>适合场景</th><th>示例</th></tr>
+<tr><td><code>--cpunodebind=0</code></td><td>NUMA 节点</td><td>让进程只在 node 0 的 CPU 上运行。</td><td><code>numactl -N 0 python serve.py</code></td></tr>
+<tr><td><code>--physcpubind=0-15</code></td><td>逻辑 CPU 列表</td><td>精确隔离核心、保留部分核心给系统或其他服务。</td><td><code>numactl -C 0-15 python worker.py</code></td></tr>
+<tr><td><code>--localalloc</code></td><td>内存策略</td><td>内存跟随运行 CPU 的本地节点分配。</td><td><code>numactl -N 0 -l command</code></td></tr>
+</table>
+<pre><code># 让推理服务只跑在 NUMA node 0 的 CPU 上
+numactl --cpunodebind=0 python serve.py --model /models/llm
+
+# 更精细：只允许逻辑 CPU 0-15
+numactl --physcpubind=0-15 python preprocess.py
+
+# 结合环境变量限制线程库，避免绑定 16 核却开 64 个线程
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
+numactl --physcpubind=0-15 --membind=0 python benchmark.py</code></pre>
+<div class="warn"><strong>超线程提醒：</strong> 逻辑 CPU 不等于物理核心。绑定前用 <code>lscpu -e</code> 看清 <code>CORE</code>、<code>SOCKET</code>、<code>NODE</code>，否则可能把两个繁忙线程放到同一个物理核心的 sibling 上。</div>
+</section>
+
+<section class="figure" id="fig-policy-flow">
+<h3>流程图：选择 CPU 与内存策略</h3>
+<svg viewBox="0 0 1120 740" width="100%" role="img" aria-label="numactl CPU 与内存策略选择流程">
+<rect x="20" y="20" width="1080" height="690" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="48" width="300" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="560" y="90" text-anchor="middle" font-size="22" font-weight="700">准备启动 AI 进程</text>
+<polygon points="560,155 730,235 560,315 390,235" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="229" text-anchor="middle" font-size="17" font-weight="700">目标 GPU 在哪侧？</text><text x="560" y="254" text-anchor="middle" font-size="14">nvidia-smi topo / PCIe NUMA</text>
+<rect x="105" y="200" width="235" height="70" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="222" y="242" text-anchor="middle" font-size="18" font-weight="700">选 node 0</text>
+<rect x="780" y="200" width="235" height="70" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="897" y="242" text-anchor="middle" font-size="18" font-weight="700">选 node 1</text>
+<polygon points="560,355 720,430 560,505 400,430" fill="#ccfbf1" stroke="#99f6e4"/><text x="560" y="424" text-anchor="middle" font-size="17" font-weight="700">内存是否必须本地？</text><text x="560" y="449" text-anchor="middle" font-size="14">容量足够？是否允许 fallback？</text>
+<rect x="155" y="535" width="275" height="86" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="292" y="570" text-anchor="middle" font-size="17" font-weight="700">严格本地</text><text x="292" y="596" text-anchor="middle" font-size="14">--cpunodebind=N --membind=N</text>
+<rect x="690" y="535" width="275" height="86" rx="14" fill="#eef2f7" stroke="#cbd5e1"/><text x="827" y="570" text-anchor="middle" font-size="17" font-weight="700">允许弹性</text><text x="827" y="596" text-anchor="middle" font-size="14">--preferred=N 或 --localalloc</text>
+<line x1="560" y1="116" x2="560" y2="155" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="390" y1="235" x2="340" y2="235" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<line x1="730" y1="235" x2="780" y2="235" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M222 270 C260 330, 415 340, 490 372" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M897 270 C850 330, 705 340, 630 372" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M430 470 C380 500, 335 515, 292 535" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<path d="M690 470 C735 500, 780 515, 827 535" fill="none" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg>
+<div class="caption">策略选择不是“永远 membind”。严格本地能减少远端访问，但也会降低内存弹性，内存不足时更容易失败。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 内存策略：<code>--membind</code>、<code>--preferred</code>、<code>--interleave</code></h2>
+<p>CPU 亲和性决定线程在哪里运行，内存策略决定匿名页和 mmap 页面倾向从哪里分配。AI 任务中，模型权重加载、tokenizer/feature cache、DataLoader pinned memory 和 CPU 侧 batch buffer 都可能受影响。</p>
+<table>
+<tr><th>策略</th><th>含义</th><th>优点</th><th>风险</th></tr>
+<tr><td><code>--membind=0</code></td><td>只允许从 node 0 分配内存</td><td>局部性强，结果清晰。</td><td>node 0 内存不足时容易分配失败或触发 OOM。</td></tr>
+<tr><td><code>--preferred=0</code></td><td>优先从 node 0 分配，不足时可退到其他节点</td><td>比 strict bind 更弹性。</td><td>实际远端比例需要监控确认。</td></tr>
+<tr><td><code>--interleave=0,1</code></td><td>在多个节点间交错分配页</td><td>适合跨节点均摊带宽或避免单节点内存热点。</td><td>降低本地性，不适合强 GPU 本地输入路径。</td></tr>
+<tr><td><code>--localalloc</code></td><td>按当前运行 CPU 所在节点分配</td><td>适合多线程跟随调度。</td><td>如果线程迁移，局部性可能变复杂。</td></tr>
+</table>
+<pre><code># 严格绑定：CPU 和内存都在 node 0
+numactl --cpunodebind=0 --membind=0 python train.py
+
+# 更弹性的本地优先策略
+numactl --cpunodebind=0 --preferred=0 python infer.py
+
+# 大内存 CPU-only 预处理，跨两个节点交错分配
+numactl --cpunodebind=0,1 --interleave=0,1 python build_dataset_cache.py
+
+# 内存跟随本地 CPU
+numactl --cpunodebind=0 --localalloc python dataloader_bench.py</code></pre>
+<div class="danger"><strong><code>--membind</code> 警告：</strong> 不要把它当作默认优化开关。先确认目标节点内存容量、page cache、容器 memory limit 和模型加载峰值；否则“优化”可能变成 OOM 或加载失败。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. AI 训练与推理的启动流程</h2>
+<p>实用流程是先探测拓扑，再选择 GPU，再绑定靠近该 GPU 的 CPU/内存节点，最后记录策略和性能指标。以下例子假设 GPU0/GPU1 靠近 node 0，GPU2/GPU3 靠近 node 1。</p>
+<pre><code># 1. 记录拓扑
+numactl --hardware
+nvidia-smi topo -m
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+
+# 2. 单 GPU 推理：让 CPU 预处理靠近 GPU0
+CUDA_VISIBLE_DEVICES=0 \
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
+numactl --cpunodebind=0 --preferred=0 \
+python serve.py --model /models/resnet50 --batch-size 64
+
+# 3. 单机多进程：每个进程靠近自己的 GPU
+CUDA_VISIBLE_DEVICES=0 numactl -N 0 -m 0 python worker.py --rank 0 &
+CUDA_VISIBLE_DEVICES=1 numactl -N 0 -m 0 python worker.py --rank 1 &
+CUDA_VISIBLE_DEVICES=2 numactl -N 1 -m 1 python worker.py --rank 2 &
+CUDA_VISIBLE_DEVICES=3 numactl -N 1 -m 1 python worker.py --rank 3 &
+wait</code></pre>
+<div class="grid-2">
+<div class="card"><strong>训练</strong><br>关注 DataLoader、CPU augmentation、host-to-device copy、分布式进程与 GPU 映射是否一致。</div>
+<div class="card"><strong>推理</strong><br>关注尾延迟、tokenizer 线程、batcher、网络线程、CPU fallback op、KV cache 预处理与服务进程隔离。</div>
+</div>
+<div class="note"><strong>记录建议：</strong> 每次 benchmark 日志里保留 <code>numactl --hardware</code>、<code>numactl --show</code>、<code>nvidia-smi topo -m</code>、线程环境变量和容器 CPU/memory limit。</div>
+</section>
+
+<section class="figure" id="fig-gpu-locality">
+<h3>用例图：GPU locality 绑定策略</h3>
+<svg viewBox="0 0 1120 690" width="100%" role="img" aria-label="GPU locality 绑定策略">
+<rect x="20" y="20" width="1080" height="640" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="62" text-anchor="middle" font-size="27" font-weight="700">让数据路径少跨 NUMA 边界</text>
+<rect x="70" y="110" width="440" height="420" rx="22" fill="#eef2ff" stroke="#c4b5fd"/>
+<text x="290" y="148" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">错误示例：跨侧喂 GPU</text>
+<rect x="125" y="200" width="150" height="68" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="200" y="241" text-anchor="middle" font-size="16" font-weight="700">CPU node 1</text>
+<rect x="310" y="200" width="150" height="68" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="385" y="241" text-anchor="middle" font-size="16" font-weight="700">DRAM node 1</text>
+<rect x="205" y="380" width="170" height="78" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="290" y="413" text-anchor="middle" font-size="16" font-weight="700">GPU0</text><text x="290" y="438" text-anchor="middle" font-size="13">PCIe local to node 0</text>
+<path d="M200 268 C210 320, 245 345, 280 380" fill="none" stroke="#dc2626" stroke-width="5" stroke-dasharray="9 7" marker-end="url(#g1)"/>
+<path d="M385 268 C380 325, 340 350, 300 380" fill="none" stroke="#dc2626" stroke-width="5" stroke-dasharray="9 7" marker-end="url(#g1)"/>
+<text x="290" y="504" text-anchor="middle" font-size="14" fill="#991b1b">跨 socket：更高延迟与带宽竞争</text>
+<rect x="610" y="110" width="440" height="420" rx="22" fill="#ecfdf5" stroke="#86efac"/>
+<text x="830" y="148" text-anchor="middle" font-size="23" font-weight="700" fill="#15803d">推荐示例：同侧喂 GPU</text>
+<rect x="665" y="200" width="150" height="68" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="740" y="241" text-anchor="middle" font-size="16" font-weight="700">CPU node 0</text>
+<rect x="850" y="200" width="150" height="68" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="925" y="241" text-anchor="middle" font-size="16" font-weight="700">DRAM node 0</text>
+<rect x="745" y="380" width="170" height="78" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="830" y="413" text-anchor="middle" font-size="16" font-weight="700">GPU0</text><text x="830" y="438" text-anchor="middle" font-size="13">PCIe local to node 0</text>
+<path d="M740 268 C750 320, 785 345, 820 380" fill="none" stroke="#16a34a" stroke-width="5" marker-end="url(#g2)"/>
+<path d="M925 268 C920 325, 880 350, 840 380" fill="none" stroke="#16a34a" stroke-width="5" marker-end="url(#g2)"/>
+<text x="830" y="504" text-anchor="middle" font-size="14" fill="#166534">本地路径：更稳定的 copy 与预处理延迟</text>
+<defs>
+<marker id="g1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#dc2626"/></marker>
+<marker id="g2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#16a34a"/></marker>
+</defs>
+</svg>
+<div class="caption">GPU locality 的目标不是让 GPU “属于”某个 NUMA node，而是让 CPU 侧数据生产和 host memory 尽量靠近 GPU 的 PCIe/NVLink 入口。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. GPU locality：CPU、内存与 GPU 的距离</h2>
+<p><code>numactl</code> 不认识 CUDA 设备编号。你需要用 GPU 拓扑工具把 GPU 编号映射到 CPU/NUMA 节点，然后再选择 <code>--cpunodebind</code> 和内存策略。</p>
+<pre><code># NVIDIA GPU 拓扑：看 GPU 之间、GPU 与 CPU affinity 的关系
+nvidia-smi topo -m
+
+# 常见输出中可能有 CPU Affinity / NUMA Affinity 列
+# GPU0    X    NV4  SYS  SYS  0-31   0
+# GPU1   NV4    X   SYS  SYS  0-31   0
+# GPU2   SYS  SYS    X   NV4  32-63  1
+# GPU3   SYS  SYS   NV4   X   32-63  1
+
+# 从 PCI 设备查看 NUMA 节点，0000:81:00.0 需替换成真实 GPU bus id
+cat /sys/bus/pci/devices/0000:81:00.0/numa_node</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>处理方式</th></tr>
+<tr><td>GPU 利用率周期性掉到很低</td><td>DataLoader 或 CPU 预处理跨 NUMA，数据供给不稳。</td><td>绑定 worker 到靠近 GPU 的节点，检查 <code>num_workers</code> 与线程数。</td></tr>
+<tr><td>H2D copy 时间抖动</td><td>host buffer 来自远端节点或 page cache 压力不均。</td><td>尝试 <code>--preferred</code> 或 <code>--membind</code>，并记录 pinned memory 设置。</td></tr>
+<tr><td>多 GPU 单机性能不均</td><td>rank 到 GPU 到 NUMA 节点映射错位。</td><td>固定 <code>CUDA_VISIBLE_DEVICES</code>、rank、numactl 策略，逐 rank 打印。</td></tr>
+</table>
+<div class="warn"><strong>MIG 提醒：</strong> MIG 实例共享同一物理 GPU 的 PCIe/NUMA 位置。不要把 MIG 设备编号误解成新的物理 locality。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. DataLoader、worker 与线程库</h2>
+<p>PyTorch、TensorFlow、JAX 等框架会启动多进程或多线程数据加载、CPU kernel、BLAS/OpenMP 线程。<code>numactl</code> 只限制进程可见的 CPU/内存策略，应用内部还需要合理设置 worker 数、线程数和进程布局。</p>
+<pre><code># PyTorch 单 GPU 训练示例：绑定 CPU/内存并控制线程库
+CUDA_VISIBLE_DEVICES=0 \
+OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 NUMEXPR_NUM_THREADS=8 \
+numactl --cpunodebind=0 --preferred=0 \
+python train.py \
+  --num-workers 8 \
+  --pin-memory true \
+  --prefetch-factor 2
+
+# 在程序中打印每个 DataLoader worker 的 CPU affinity，便于确认继承关系
+python - &lt;&lt'PY'
+import os
+print("main affinity:", sorted(os.sched_getaffinity(0))[:16], "count=", len(os.sched_getaffinity(0)))
+PY</code></pre>
+<div class="grid-3">
+<div class="card"><strong><code>num_workers</code></strong><br>不是越大越好。过多 worker 会争抢 CPU、内存带宽和文件系统。</div>
+<div class="card"><strong><code>pin_memory</code></strong><br>可加速 H2D copy，但 pinned host memory 仍来自 NUMA 内存策略影响的节点。</div>
+<div class="card"><strong>OpenMP/MKL</strong><br>绑定 8 核却开 64 线程会造成上下文切换和 cache 抖动。</div>
+</div>
+<div class="note"><strong>经验顺序：</strong> 先固定 GPU 与 NUMA node，再调 <code>num_workers</code>，最后调 <code>OMP_NUM_THREADS</code>、batch size 和 prefetch。不要同时改所有变量。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. benchmarking 常见陷阱</h2>
+<p>NUMA 优化经常被误判，因为 benchmark 本身不稳定。必须控制冷启动、page cache、数据路径、线程数、GPU warmup 和并发干扰。</p>
+<table>
+<tr><th>陷阱</th><th>为什么会误导</th><th>建议</th></tr>
+<tr><td>只跑一次</td><td>首次加载模型、JIT、page fault 和缓存状态不同。</td><td>区分 warmup 与测量段，报告均值、P95、P99。</td></tr>
+<tr><td>只看吞吐</td><td>推理服务更关心尾延迟和抖动。</td><td>同时记录 latency histogram、CPU usage、GPU utilization。</td></tr>
+<tr><td>没固定线程数</td><td>线程库自动选择可能每次不同，且不尊重预期核心数。</td><td>固定 <code>OMP_NUM_THREADS</code>、<code>MKL_NUM_THREADS</code>。</td></tr>
+<tr><td>忽略容器 cpuset</td><td>容器内 node 编号可见，但 CPU 实际被限制。</td><td>记录 <code>/sys/fs/cgroup</code> CPU 与 memory 限制。</td></tr>
+<tr><td>把 <code>--membind</code> 当万能优化</td><td>严格绑定可能导致局部 OOM 或更频繁 reclaim。</td><td>对比 default、preferred、membind、interleave。</td></tr>
+</table>
+<pre><code># 一个可复现实验骨架
+for policy in default preferred membind interleave; do
+  echo "== $policy =="
+  case "$policy" in
+    default)    cmd="python bench.py" ;;
+    preferred)  cmd="numactl -N 0 --preferred=0 python bench.py" ;;
+    membind)    cmd="numactl -N 0 -m 0 python bench.py" ;;
+    interleave) cmd="numactl -N 0,1 -i 0,1 python bench.py" ;;
+  esac
+  OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 bash -lc "$cmd"
+done</code></pre>
+<div class="success"><strong>判断标准：</strong> 好的 NUMA 策略应该在多次运行中稳定改善目标指标，而不是只在某一次 benchmark 中提高平均吞吐。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. containers、cpuset 与 cgroups</h2>
+<p>在容器里使用 <code>numactl</code> 时，先理解两层约束：容器运行时或 Kubernetes/Slurm 可能已经通过 cgroup 限制了可用 CPU 和内存节点；<code>numactl</code> 只能在这个集合内再施加策略。</p>
+<pre><code># Docker：显式给 CPU 和内存节点
+docker run --rm --gpus '"device=0"' \
+  --cpuset-cpus=0-31 \
+  --cpuset-mems=0 \
+  image:tag \
+  numactl --show
+
+# 容器内查看可用 CPU
+grep Cpus_allowed_list /proc/self/status
+grep Mems_allowed_list /proc/self/status
+
+# cgroup v2 常见位置，具体路径随运行时不同
+cat /sys/fs/cgroup/cpuset.cpus.effective 2&gt;/dev/null
+cat /sys/fs/cgroup/cpuset.mems.effective 2&gt;/dev/null</code></pre>
+<table>
+<tr><th>场景</th><th>numactl 表现</th><th>解释</th></tr>
+<tr><td>容器只允许 CPU 0-15</td><td><code>--cpunodebind=1</code> 可能失败或没有预期效果</td><td>node 1 的 CPU 不在 cpuset 中。</td></tr>
+<tr><td>只允许 mem node 0</td><td><code>--membind=1</code> 不可用</td><td>cgroup 的 mems_allowed 更高优先级。</td></tr>
+<tr><td>Kubernetes CPU request/limit 未绑核</td><td>进程可能在更多 CPU 间迁移</td><td>需要 CPU Manager static policy 或运行时 cpuset 配置。</td></tr>
+</table>
+<div class="danger"><strong>容器警告：</strong> 不要只在容器内看 <code>numactl --hardware</code> 就下结论。必须同时看 <code>Cpus_allowed_list</code>、<code>Mems_allowed_list</code> 和调度系统分配。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. <code>numactl</code> vs <code>taskset</code></h2>
+<p><code>taskset</code> 控制 CPU affinity，<code>numactl</code> 控制 CPU affinity 与 NUMA 内存策略。两者有重叠，但不是等价工具。</p>
+<table>
+<tr><th>维度</th><th><code>taskset</code></th><th><code>numactl</code></th></tr>
+<tr><td>CPU 绑定</td><td>强项，按 CPU mask/list。</td><td>支持按 NUMA node 或物理 CPU 列表。</td></tr>
+<tr><td>内存策略</td><td>不支持。</td><td>支持 membind、preferred、interleave、localalloc。</td></tr>
+<tr><td>NUMA 拓扑查看</td><td>不支持。</td><td><code>--hardware</code> 可查看节点、内存和距离。</td></tr>
+<tr><td>适合场景</td><td>简单 CPU pinning、调试单进程。</td><td>AI/HPC 中 CPU 与内存本地性一起控制。</td></tr>
+</table>
+<pre><code># taskset：只限制 CPU，不改变内存策略
+taskset -c 0-15 python infer.py
+
+# numactl：限制 CPU，同时设置内存偏好
+numactl --physcpubind=0-15 --preferred=0 python infer.py
+
+# 两者不建议混着写，除非你明确知道最终 affinity 的覆盖关系
+taskset -c 0-15 numactl --show</code></pre>
+<div class="note"><strong>选择规则：</strong> 只想临时限制 CPU 用 <code>taskset</code>；只要讨论远端内存、GPU locality 或 NUMA node，就用 <code>numactl</code>。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. systemd、Slurm 与 Kubernetes 场景</h2>
+<p>生产环境里，<code>numactl</code> 常不是唯一的资源控制层。systemd、Slurm、Kubernetes、Docker 和云平台都可能先限制资源，再由 <code>numactl</code> 细化策略。</p>
+<h3>systemd 服务</h3>
+<pre><code># /etc/systemd/system/infer-node0.service
+[Service]
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=OMP_NUM_THREADS=16
+ExecStart=/usr/bin/numactl --cpunodebind=0 --preferred=0 /opt/venv/bin/python /srv/infer.py
+Restart=always</code></pre>
+<h3>Slurm 作业</h3>
+<pre><code># 让 Slurm 分配资源，再在每个 rank 内做清晰映射
+srun --gres=gpu:1 --cpus-per-task=16 \
+  bash -lc 'numactl --show; numactl -N 0 --preferred=0 python train.py'</code></pre>
+<h3>Kubernetes</h3>
+<pre><code># Kubernetes 中更推荐通过 CPU Manager / Topology Manager 获得拓扑一致分配
+# 容器 entrypoint 再使用 numactl 做进程级策略：
+numactl --cpunodebind=0 --preferred=0 python serve.py</code></pre>
+<div class="warn"><strong>优先级提醒：</strong> 调度系统的资源分配是外层约束。<code>numactl</code> 不能申请调度器没有给你的 CPU、memory node 或 GPU。</div>
+</section>
+
+<section class="figure" id="fig-troubleshooting">
+<h3>排障流程图：numactl 生效但性能仍不对</h3>
+<svg viewBox="0 0 1120 760" width="100%" role="img" aria-label="numactl 排障流程图">
+<rect x="20" y="20" width="1080" height="710" rx="18" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="410" y="45" width="300" height="66" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="560" y="86" text-anchor="middle" font-size="22" font-weight="700">性能差或绑定疑似失效</text>
+<rect x="70" y="160" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="185" y="196" text-anchor="middle" font-size="18" font-weight="700">策略是否真的生效？</text><text x="185" y="224" text-anchor="middle" font-size="14">numactl --show / proc</text>
+<rect x="325" y="160" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="440" y="196" text-anchor="middle" font-size="18" font-weight="700">容器是否限制？</text><text x="440" y="224" text-anchor="middle" font-size="14">cpuset.cpus / mems</text>
+<rect x="580" y="160" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="695" y="196" text-anchor="middle" font-size="18" font-weight="700">GPU 映射正确？</text><text x="695" y="224" text-anchor="middle" font-size="14">topo -m / CUDA_VISIBLE_DEVICES</text>
+<rect x="835" y="160" width="230" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="950" y="196" text-anchor="middle" font-size="18" font-weight="700">线程是否过量？</text><text x="950" y="224" text-anchor="middle" font-size="14">OMP / MKL / workers</text>
+<rect x="150" y="350" width="260" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="280" y="384" text-anchor="middle" font-size="18" font-weight="700">检查内存分布</text><text x="280" y="411" text-anchor="middle" font-size="14">numastat -p PID</text>
+<rect x="430" y="350" width="260" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="560" y="384" text-anchor="middle" font-size="18" font-weight="700">检查 CPU 迁移</text><text x="560" y="411" text-anchor="middle" font-size="14">pidstat / perf / taskset</text>
+<rect x="710" y="350" width="260" height="86" rx="14" fill="#ccfbf1" stroke="#99f6e4"/><text x="840" y="384" text-anchor="middle" font-size="18" font-weight="700">检查数据路径</text><text x="840" y="411" text-anchor="middle" font-size="14">storage / network / H2D</text>
+<rect x="300" y="555" width="520" height="82" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="590" text-anchor="middle" font-size="20" font-weight="700">一次只改变一个变量，比较 default / preferred / membind</text><text x="560" y="617" text-anchor="middle" font-size="14">如果瓶颈在 GPU kernel 或 I/O，NUMA 绑定不会神奇修复</text>
+<line x1="560" y1="111" x2="185" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="111" x2="440" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="111" x2="695" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="111" x2="950" y2="160" stroke="#94a3b8" stroke-width="3"/>
+<line x1="185" y1="252" x2="280" y2="350" stroke="#94a3b8" stroke-width="3"/>
+<line x1="440" y1="252" x2="560" y2="350" stroke="#94a3b8" stroke-width="3"/>
+<line x1="695" y1="252" x2="840" y2="350" stroke="#94a3b8" stroke-width="3"/>
+<line x1="950" y1="252" x2="840" y2="350" stroke="#94a3b8" stroke-width="3"/>
+<line x1="280" y1="436" x2="410" y2="555" stroke="#94a3b8" stroke-width="3"/>
+<line x1="560" y1="436" x2="560" y2="555" stroke="#94a3b8" stroke-width="3"/>
+<line x1="840" y1="436" x2="710" y2="555" stroke="#94a3b8" stroke-width="3"/>
+</svg>
+<div class="caption">排障核心：先证明策略生效，再证明瓶颈确实与 NUMA 有关。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 排障：性能变慢、OOM、绑定失效</h2>
+<div class="grid-2">
+<div class="card"><strong>问题 1：<code>--membind</code> 后 OOM</strong><br>目标节点内存不足、容器 memory limit 太小、模型加载峰值超过单节点容量。改用 <code>--preferred</code> 或扩大 mem node 集合。</div>
+<div class="card"><strong>问题 2：绑定后 CPU 仍跨节点</strong><br>外层 cpuset、systemd/Slurm 配置、应用子进程重新设置 affinity。检查 <code>/proc/PID/status</code>。</div>
+<div class="card"><strong>问题 3：性能没有改善</strong><br>瓶颈可能在 GPU kernel、网络、存储、Python GIL、batching 或线程过量，不在 NUMA。</div>
+<div class="card"><strong>问题 4：容器里 node 编号困惑</strong><br>容器可见节点和宿主拓扑可能被过滤。以 <code>Cpus_allowed_list</code> 与 <code>Mems_allowed_list</code> 为准。</div>
+<div class="card"><strong>问题 5：DataLoader worker 抖动</strong><br>worker 数太大、线程库抢核、远端内存、数据集 I/O 路径慢都会造成 GPU 饥饿。</div>
+<div class="card"><strong>问题 6：rank/GPU 映射错</strong><br><code>CUDA_VISIBLE_DEVICES</code> 改变了进程内 GPU 编号。日志里打印 bus id、rank 和 NUMA node。</div>
+</div>
+<h3>排障命令模板</h3>
+<pre><code># 查看进程 CPU 和内存允许集合
+pid=12345
+grep -E 'Cpus_allowed_list|Mems_allowed_list' /proc/$pid/status
+
+# 查看进程内存实际分布
+numastat -p $pid
+
+# 查看线程在哪些 CPU 上跑
+ps -L -o pid,tid,psr,comm -p $pid | head -30
+
+# 看 CPU 迁移和利用率
+pidstat -t -p $pid 1
+
+# 在进程内部确认 Python 看到的 affinity
+python -c 'import os; print(sorted(os.sched_getaffinity(0)))'</code></pre>
+<div class="note"><strong>解释 <code>numastat -p</code>：</strong> 如果进程大部分内存在远端节点，说明内存策略、初始化时机、线程迁移或 page cache 路径需要继续检查。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 生产配方与反模式</h2>
+<h3>配方 A：单 GPU 推理服务</h3>
+<pre><code># GPU0 靠近 node 0；使用 preferred 保留内存弹性
+CUDA_VISIBLE_DEVICES=0 \
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 \
+numactl --cpunodebind=0 --preferred=0 \
+python serve.py --host 0.0.0.0 --port 8000</code></pre>
+<h3>配方 B：双 socket 四 GPU 单机训练</h3>
+<pre><code># 按 GPU locality 启动四个 rank
+CUDA_VISIBLE_DEVICES=0 numactl -N 0 --preferred=0 python train.py --rank 0 &
+CUDA_VISIBLE_DEVICES=1 numactl -N 0 --preferred=0 python train.py --rank 1 &
+CUDA_VISIBLE_DEVICES=2 numactl -N 1 --preferred=1 python train.py --rank 2 &
+CUDA_VISIBLE_DEVICES=3 numactl -N 1 --preferred=1 python train.py --rank 3 &
+wait</code></pre>
+<h3>配方 C：CPU-only 特征预处理</h3>
+<pre><code># 大内存、吞吐优先，可对比 interleave 与 localalloc
+numactl --interleave=0,1 python build_features.py
+numactl --cpunodebind=0,1 --localalloc python build_features.py</code></pre>
+<h3>反模式</h3>
+<ul>
+<li>在所有命令前机械添加 <code>numactl -m 0 -N 0</code>，不看拓扑和内存容量。</li>
+<li>绑定了 8 个 CPU，却让 DataLoader、OpenMP、MKL 总共开出几十到上百线程。</li>
+<li>只绑定 CPU，不确认 host memory 和 GPU PCIe locality。</li>
+<li>在 Kubernetes 中忽略 CPU Manager / Topology Manager，只靠容器 entrypoint 里的 <code>numactl</code>。</li>
+<li>拿一次冷启动 benchmark 结果证明 NUMA 优化有效。</li>
+</ul>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 速查表与学习路线</h2>
+<table>
+<tr><th>目标</th><th>命令</th><th>说明</th></tr>
+<tr><td>看拓扑</td><td><code>numactl --hardware</code></td><td>节点、CPU、内存、距离矩阵。</td></tr>
+<tr><td>看当前策略</td><td><code>numactl --show</code></td><td>适合写入 benchmark 日志。</td></tr>
+<tr><td>按节点绑 CPU</td><td><code>numactl --cpunodebind=0 command</code></td><td>短写 <code>-N 0</code>。</td></tr>
+<tr><td>按 CPU 绑核</td><td><code>numactl --physcpubind=0-15 command</code></td><td>短写 <code>-C 0-15</code>。</td></tr>
+<tr><td>严格内存绑定</td><td><code>numactl --membind=0 command</code></td><td>短写 <code>-m 0</code>，容量不足风险高。</td></tr>
+<tr><td>本地优先</td><td><code>numactl --preferred=0 command</code></td><td>更弹性，适合生产初始策略。</td></tr>
+<tr><td>交错分配</td><td><code>numactl --interleave=0,1 command</code></td><td>短写 <code>-i 0,1</code>，适合对比实验。</td></tr>
+<tr><td>看进程分布</td><td><code>numastat -p PID</code></td><td>确认内存实际落在哪些节点。</td></tr>
+</table>
+<h3>学习路线</h3>
+<ol>
+<li>先在一台双路机器上运行 <code>numactl --hardware</code>，读懂 CPU 列表和距离矩阵。</li>
+<li>用 <code>lscpu -e</code> 建立 CPU、core、socket、node 的映射。</li>
+<li>用 <code>nvidia-smi topo -m</code> 建立 GPU 到 NUMA node 的映射。</li>
+<li>对同一 benchmark 对比 default、<code>--preferred</code>、<code>--membind</code>、<code>--interleave</code>。</li>
+<li>在真实训练或推理服务中同时记录吞吐、P99、GPU 利用率、CPU 利用率和 <code>numastat -p</code>。</li>
+</ol>
+<div class="success"><strong>最终心智模型：</strong> NUMA 优化是“让计算、数据和设备更近”的工程手段，不是单个命令开关。先画清拓扑，再做可复现实验。</div>
+</section>
+
+<section class="refbox"><h2>参考资料与延伸阅读</h2>
+<ul>
+<li>Linux man-pages：<code>numactl(8)</code>、<code>numa(7)</code>，包含 CPU node binding、memory policy、relative node notation 与进程策略说明。</li>
+<li>Linux kernel documentation：NUMA memory policy、cpuset cgroup 与 scheduler affinity 相关文档。</li>
+<li>NVIDIA System Management Interface 文档：<code>nvidia-smi topo -m</code>、GPU 拓扑、CPU/NUMA affinity 字段。</li>
+<li>hwloc 文档：用于理解复杂服务器的 CPU、NUMA、PCIe、GPU 拓扑关系。</li>
+<li>PyTorch Performance Tuning Guide：DataLoader、pinned memory、CPU threading、NUMA 与多进程训练相关实践。</li>
+</ul>
+<p class="mini">建议阅读顺序：先掌握 NUMA 拓扑和 <code>numactl --hardware</code>，再学习 CPU/内存策略，最后结合 GPU locality、容器 cpuset 和 benchmark 方法论。</p>
+</section>
+<div class="footer">numactl 深度教程 · AI Infra 图文版 · NUMA 拓扑、CPU/内存绑定、GPU locality、DataLoader、容器与排障</div>
+</div>
+</body>
+</html>

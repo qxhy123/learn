@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>mlxlink 深度教程：AI Infra 中的 Mellanox/NVIDIA 链路健康诊断</title>
+<style>
+:root{--bg:#f6f8fb;--card:#fff;--ink:#1f2937;--muted:#5f6b7a;--line:#d8e0ea;--blue:#2563eb;--blue2:#dbeafe;--green:#16a34a;--green2:#dcfce7;--orange:#ea580c;--orange2:#ffedd5;--purple:#7c3aed;--purple2:#ede9fe;--red:#dc2626;--red2:#fee2e2;--teal:#0f766e;--teal2:#ccfbf1;--slate2:#eef2f7;--shadow:0 12px 32px rgba(15,23,42,.08)}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.78}.page{width:min(1180px,calc(100vw - 32px));margin:24px auto 56px}.hero,.toc,.section,.figure,.refbox{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:22px}.hero{padding:30px}.section,.toc,.refbox{padding:24px 28px}.figure{padding:18px 18px 12px}h1,h2,h3,h4{line-height:1.25}h1{margin:0 0 8px;font-size:34px}h2{margin:0 0 16px;font-size:26px}h3{margin:24px 0 12px;font-size:20px}h4{margin:16px 0 10px;font-size:17px}p{margin:10px 0}.sub{color:var(--muted);font-size:15px}.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.chip{padding:6px 10px;border-radius:999px;background:var(--blue2);color:#1d4ed8;font-size:13px;font-weight:700;border:1px solid #bfdbfe}.toc ol{columns:2;gap:36px;margin:0;padding-left:18px}.toc li{margin:6px 0}.anchor{color:inherit;text-decoration:none}.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:#fbfdff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}.caption{color:var(--muted);font-size:14px;margin-top:6px}.note,.warn,.success,.danger{padding:12px 14px;border-radius:10px;margin:14px 0}.note{background:#f8fafc;border-left:5px solid var(--blue)}.warn{background:#fff7ed;border-left:5px solid var(--orange)}.success{background:#f0fdf4;border-left:5px solid var(--green)}.danger{background:#fef2f2;border-left:5px solid var(--red)}pre{background:#0f172a;color:#e5edf9;padding:14px 16px;border-radius:14px;overflow:auto;border:1px solid #1e293b;font-size:13px;line-height:1.65}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}table{width:100%;border-collapse:collapse;margin:10px 0 16px;font-size:14px}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top}th{background:#f7fbff;text-align:left}ul,ol{margin-top:8px}.mini{color:var(--muted);font-size:13px}.footer{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 32px}.kbd{background:#111827;color:#fff;border-radius:6px;padding:2px 6px;font-size:12px;font-family:ui-monospace,monospace}svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif}@media(max-width:920px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}.toc ol{columns:1}h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="page">
+<section class="hero">
+<h1>mlxlink 深度教程：AI Infra 中的 Mellanox/NVIDIA 链路健康诊断</h1>
+<p class="sub">这份教程面向 GPU 训练集群、RoCE/InfiniBand fabric、NVIDIA/Mellanox ConnectX 网卡、BlueField DPU、Quantum/Spectrum 交换设备和高速线缆模块排障。重点不是背参数，而是建立“设备定位 → 端口物理层 → 速率/FEC/模块 → 误码计数 → PCIe/IB/Ethernet 交叉验证 → NCCL 证据链”的心智模型，讲清楚 <code>mlxlink</code> 如何帮助定位链路降速、FEC 不匹配、端口 down、模块异常、lane 误码、PCIe 问题和多节点训练通信抖动。</p>
+<div class="chips"><span class="chip">AI Infra</span><span class="chip">Mellanox/NVIDIA</span><span class="chip">mlxlink</span><span class="chip">ConnectX</span><span class="chip">RoCE/IB</span><span class="chip">FEC</span><span class="chip">链路计数器</span><span class="chip">线缆模块</span><span class="chip">NCCL 排障</span><span class="chip">只读优先</span></div>
+<div class="note"><strong>一句话理解：</strong> <code>mlxlink</code> 是 NVIDIA Firmware Tools/MFT 里的低层链路诊断工具：它从 Mellanox/NVIDIA 设备视角读取端口、物理链路、FEC、模块和误码线索，补足 <code>ethtool</code>、<code>ibstat</code>、<code>rdma</code> 看不到或不够细的物理层证据。</div>
+<div class="success"><strong>最重要原则：</strong> 生产排障先跑只读查询，例如 <code>mlxlink -d &lt;device&gt;</code>、<code>-c</code>、<code>-m</code>、<code>--show_fec</code>；不要在业务链路上直接改 FEC、做 PRBS test mode、disable port 或修改模块/寄存器，除非进入维护窗口且有回滚方案。</div>
+</section>
+
+<section class="toc"><h2>目录</h2><ol>
+<li><a class="anchor" href="#s1">mlxlink 是什么</a></li>
+<li><a class="anchor" href="#s2">安装、权限与设备路径</a></li>
+<li><a class="anchor" href="#s3">第一条安全命令</a></li>
+<li><a class="anchor" href="#s4">输出字段怎么读</a></li>
+<li><a class="anchor" href="#s5">端口、lane 与分叉口</a></li>
+<li><a class="anchor" href="#s6">速率、宽度与降速</a></li>
+<li><a class="anchor" href="#s7">FEC：模式、能力与风险</a></li>
+<li><a class="anchor" href="#s8">Counters、BER 与误码趋势</a></li>
+<li><a class="anchor" href="#s9">线缆与光模块线索</a></li>
+<li><a class="anchor" href="#s10">PCIe 链路诊断</a></li>
+<li><a class="anchor" href="#s11">IB、RoCE 与 Ethernet 场景</a></li>
+<li><a class="anchor" href="#s12">NCCL fabric 问题定位</a></li>
+<li><a class="anchor" href="#s13">mlxlink vs ethtool/ibstat/rdma</a></li>
+<li><a class="anchor" href="#s14">只读生产工作流</a></li>
+<li><a class="anchor" href="#s15">典型故障剧本</a></li>
+<li><a class="anchor" href="#s16">常见坑与安全边界</a></li>
+<li><a class="anchor" href="#s17">练习与上线清单</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. mlxlink 是什么</h2>
+<p><code>mlxlink</code> 属于 NVIDIA/Mellanox Firmware Tools（MFT）工具集，面向 Mellanox/NVIDIA 设备的低层链路查询和诊断。它常用于 ConnectX 网卡、BlueField DPU、InfiniBand/Ethernet 交换设备的端口健康检查，读取链路状态、速率、FEC、物理计数器、模块信息和 PCIe 相关信息。</p>
+<div class="grid-3">
+<div class="card"><strong>它擅长什么</strong><br>定位物理链路问题：端口 down、协商失败、降速、FEC 不匹配、模块异常、BER/误码、lane 级线索。</div>
+<div class="card"><strong>它不替代什么</strong><br>不替代 <code>ip</code>/<code>ethtool</code> 的 Linux netdev 视角，不替代 <code>ibstat</code>/<code>ibv_devinfo</code> 的 RDMA/IB 视角，也不替代真实带宽压测。</div>
+<div class="card"><strong>AI Infra 价值</strong><br>当 NCCL、RDMA、RoCE 或多节点训练出现掉速、超时、重传时，<code>mlxlink</code> 能把问题下钻到物理端口和线缆模块层。</div>
+</div>
+<pre><code># 典型只读查询：设备路径按现场替换
+mlxlink -d /dev/mst/mt4129_pciconf0
+mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+mlxlink -d 0000:41:00.0 -c
+mlxlink -d 0000:41:00.0 -m
+mlxlink -d 0000:41:00.0 --show_fec</code></pre>
+<div class="warn"><strong>命名提醒：</strong> <code>mlxlink</code> 操作的是 Mellanox/NVIDIA 设备或端口，不是普通 Linux 网卡名本身。<code>ens5f0np0</code>、<code>ib0</code>、<code>mlx5_0</code>、PCI BDF、<code>/dev/mst/*</code> 之间需要先建立映射。</div>
+</section>
+
+<section class="figure" id="fig-overview">
+<h3>信息图：AI Infra 中 mlxlink 的位置</h3>
+<svg viewBox="0 0 1120 690" width="100%" role="img" aria-label="mlxlink 在 AI Infra 链路诊断中的位置">
+<rect x="20" y="20" width="1080" height="650" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="70" text-anchor="middle" font-size="28" font-weight="700">从训练故障下钻到物理链路</text>
+<rect x="70" y="120" width="210" height="110" rx="18" fill="#dbeafe" stroke="#93c5fd"/><text x="175" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#1d4ed8">应用层</text><text x="175" y="190" text-anchor="middle" font-size="15">NCCL / MPI / RDMA</text><text x="175" y="214" text-anchor="middle" font-size="15">超时、掉速、重试</text>
+<rect x="330" y="120" width="210" height="110" rx="18" fill="#ede9fe" stroke="#c4b5fd"/><text x="435" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#6d28d9">OS/RDMA</text><text x="435" y="190" text-anchor="middle" font-size="15">ip / rdma / ibstat</text><text x="435" y="214" text-anchor="middle" font-size="15">接口、GID、端口状态</text>
+<rect x="590" y="120" width="210" height="110" rx="18" fill="#ccfbf1" stroke="#99f6e4"/><text x="695" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#0f766e">设备链路</text><text x="695" y="190" text-anchor="middle" font-size="15">mlxlink</text><text x="695" y="214" text-anchor="middle" font-size="15">速率/FEC/计数器</text>
+<rect x="850" y="120" width="210" height="110" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="955" y="158" text-anchor="middle" font-size="22" font-weight="700" fill="#c2410c">物理介质</text><text x="955" y="190" text-anchor="middle" font-size="15">线缆/光模块/交换机</text><text x="955" y="214" text-anchor="middle" font-size="15">lane、温度、功率</text>
+<rect x="125" y="330" width="870" height="175" rx="24" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="374" text-anchor="middle" font-size="24" font-weight="700" fill="#334155">核心判断链</text><text x="560" y="415" text-anchor="middle" font-size="16">NCCL 慢或超时，不等于 GPU 算力问题；先确认网络路径和物理链路证据</text><text x="560" y="448" text-anchor="middle" font-size="16">mlxlink 负责回答：端口是否真正 up？协商到什么速率？FEC 是否匹配？计数器是否增长？模块是否异常？</text><text x="560" y="481" text-anchor="middle" font-size="16">最后把它和 ethtool、ibstat、rdma、交换机遥测、NCCL 日志合并成证据链</text>
+<line x1="280" y1="175" x2="330" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="540" y1="175" x2="590" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="800" y1="175" x2="850" y2="175" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/><line x1="695" y1="230" x2="695" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#a1)"/>
+<defs><marker id="a1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">mlxlink 位于 OS/RDMA 和物理介质之间，适合把“训练通信慢”拆成可验证的链路事实。</div>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 安装、权限与设备路径</h2>
+<p><code>mlxlink</code> 通常随 NVIDIA/Mellanox MFT 安装。不同发行版、OFED/MLNX_OFED、DOCA、厂商镜像和云平台镜像的打包方式不同；生产节点上应以团队基线镜像和变更流程为准。</p>
+<pre><code># 确认工具是否存在
+command -v mlxlink
+mlxlink --help | head -40
+
+# MFT 常见设备发现流程
+sudo mst start
+mst status -v
+ls -l /dev/mst/ 2&gt;/dev/null
+
+# 不使用 mst 时，也常见直接按 PCI BDF 查询
+lspci -D | grep -Ei 'Mellanox|NVIDIA|ConnectX|BlueField'
+mlxlink -d 0000:41:00.0</code></pre>
+<table>
+<tr><th>对象</th><th>例子</th><th>用途</th></tr>
+<tr><td>MST 设备</td><td><code>/dev/mst/mt4129_pciconf0</code></td><td>MFT 传统路径，适合稳定定位设备和交换机/适配器诊断。</td></tr>
+<tr><td>PCI BDF</td><td><code>0000:41:00.0</code></td><td>和 <code>lspci</code>、<code>ethtool -i</code>、<code>nvidia-smi topo</code> 交叉映射。</td></tr>
+<tr><td>Linux netdev</td><td><code>ens5f0np0</code></td><td><code>mlxlink</code> 通常不直接以它为核心对象，但可用它反查 PCI 设备。</td></tr>
+<tr><td>RDMA 设备</td><td><code>mlx5_0</code></td><td>用 <code>ibdev2netdev</code>、<code>rdma link</code> 映射到端口和 netdev。</td></tr>
+</table>
+<div class="note"><strong>权限现实：</strong> 读取硬件链路信息通常需要 root 或具备相应设备节点权限。容器内排障要确认是否暴露 <code>/dev/mst</code>、PCI 设备、RDMA 设备和必要 capabilities。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 第一条安全命令</h2>
+<p>刚接触 <code>mlxlink</code> 时，先做只读快照。不要一开始就改 FEC、跑 PRBS、写寄存器或 disable port。你的第一目标是收集“当前事实”，而不是立即修复。</p>
+<pre><code># 单端口适配器或默认端口查询
+sudo mlxlink -d /dev/mst/mt4129_pciconf0
+
+# 多端口设备显式指定端口
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 2
+
+# 一次收集更多只读线索：链路、计数器、模块、FEC 能力
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec</code></pre>
+<div class="grid-3">
+<div class="card"><strong>先看状态</strong><br>Link State、Physical State、Speed、Width、FEC、Loopback、Auto Negotiation。</div>
+<div class="card"><strong>再看质量</strong><br>Physical Counters、BER、corrected/uncorrected 相关计数、link down 计数。</div>
+<div class="card"><strong>最后看介质</strong><br>Cable/module 类型、长度、温度、电压、TX/RX 光功率、vendor 线索。</div>
+</div>
+<div class="success"><strong>采集建议：</strong> 把输出保存到工单或 incident 目录，并记录时间、主机、端口、对端交换机端口、作业 ID、NCCL 日志片段。单条命令输出脱离时间线，诊断价值会下降。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 输出字段怎么读</h2>
+<p>不同 MFT 版本、设备代际和端口类型会让输出字段略有差异。读输出时不要机械匹配某个字段名，而要按“状态、协商、质量、模块、上下文”五类整理。</p>
+<table>
+<tr><th>字段类别</th><th>常见含义</th><th>异常解读</th></tr>
+<tr><td>Link/Physical State</td><td>链路是否 up、物理层是否训练成功。</td><td>Down/Polling/Disabled 说明要查线缆、模块、对端、端口配置或硬件。</td></tr>
+<tr><td>Speed/Rate/Width</td><td>协商后的速率、lane 宽度、端口模式。</td><td>低于预期可能是模块不支持、对端配置、分叉口、FEC/AN 或线缆质量问题。</td></tr>
+<tr><td>FEC</td><td>当前使用的 Forward Error Correction 模式和能力。</td><td>两端 FEC 能力/策略不匹配会导致 link down、降速或大量 corrected error。</td></tr>
+<tr><td>Counters/BER</td><td>物理层错误、BER 估计、link down 计数等。</td><td>持续增长比单次非零更重要；要间隔采样看趋势。</td></tr>
+<tr><td>Module/Cable</td><td>模块类型、vendor、长度、温度、电压、光功率。</td><td>unknown、unsupported、温度异常、RX power 异常常指向介质或对端。</td></tr>
+</table>
+<pre><code># 用时间戳保存快照，便于比较
+host=$(hostname -s)
+dev=/dev/mst/mt4129_pciconf0
+port=1
+ts=$(date +%Y%m%d-%H%M%S)
+sudo mlxlink -d "$dev" -p "$port" -c -m --show_fec | tee "mlxlink-${host}-p${port}-${ts}.txt"</code></pre>
+<div class="warn"><strong>不要过度解读单点：</strong> 某些 corrected error 或历史 link down 可能来自上线、维护或链路训练阶段。判断线上问题时，更重视“作业运行窗口内是否持续增长”。</div>
+</section>
+
+<section class="figure" id="fig-port-map">
+<h3>流程图：从设备到端口、lane、对端</h3>
+<svg viewBox="0 0 1120 720" width="100%" role="img" aria-label="mlxlink 设备端口定位流程">
+<rect x="20" y="20" width="1080" height="680" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="70" text-anchor="middle" font-size="27" font-weight="700">先定位正确设备，再解释链路输出</text>
+<rect x="80" y="125" width="220" height="92" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="190" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">Linux netdev</text><text x="190" y="190" text-anchor="middle" font-size="14">ens5f0np0 / eth0</text>
+<rect x="450" y="125" width="220" height="92" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="560" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">PCI / MST</text><text x="560" y="190" text-anchor="middle" font-size="14">0000:41:00.0 / /dev/mst</text>
+<rect x="820" y="125" width="220" height="92" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="930" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">RDMA 设备</text><text x="930" y="190" text-anchor="middle" font-size="14">mlx5_0 port 1</text>
+<rect x="180" y="330" width="210" height="90" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="285" y="365" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">mlxlink -d</text><text x="285" y="394" text-anchor="middle" font-size="14">选择设备</text>
+<rect x="455" y="330" width="210" height="90" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="365" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">-p port</text><text x="560" y="394" text-anchor="middle" font-size="14">选择物理端口</text>
+<rect x="730" y="330" width="210" height="90" rx="16" fill="#ffedd5" stroke="#fdba74"/><text x="835" y="365" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">lane / split</text><text x="835" y="394" text-anchor="middle" font-size="14">解释分叉和 lane</text>
+<rect x="210" y="540" width="700" height="82" rx="18" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="575" text-anchor="middle" font-size="20" font-weight="700" fill="#334155">把本端端口与对端交换机端口、线缆标签、机柜布线表一起核对</text><text x="560" y="605" text-anchor="middle" font-size="14">否则很容易在错误端口上读到“正常”输出</text>
+<line x1="300" y1="171" x2="450" y2="171" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="670" y1="171" x2="820" y2="171" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="560" y1="217" x2="285" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="560" y1="217" x2="560" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="560" y1="217" x2="835" y2="330" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="285" y1="420" x2="410" y2="540" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="560" y1="420" x2="560" y2="540" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/><line x1="835" y1="420" x2="710" y2="540" stroke="#94a3b8" stroke-width="4" marker-end="url(#b1)"/>
+<defs><marker id="b1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">AI 集群排障中，端口映射错误非常常见。先证明自己读的是正确 HCA、正确物理端口、正确对端。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 端口、lane 与分叉口</h2>
+<p>高速端口常由多条 lane 组成，交换机侧还可能做 breakout/split，例如一个 400G 端口拆成多个 100G/200G 逻辑端口。<code>mlxlink</code> 输出中的端口号、label port、split port 和 lane 需要结合设备型号与交换机配置解释。</p>
+<pre><code># 适配器常见：逐个端口读
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 2
+
+# 交换机或复杂端口场景：通常必须显式 -p
+sudo mlxlink -d /dev/mst/mt53100_pciconf0 -p 17
+
+# 用系统工具辅助映射
+ibdev2netdev
+rdma link show
+ethtool -i ens5f0np0
+readlink -f /sys/class/net/ens5f0np0/device</code></pre>
+<table>
+<tr><th>概念</th><th>解释</th><th>排障意义</th></tr>
+<tr><td>Physical port</td><td>设备上的物理端口。</td><td>决定你查询哪根线、哪个对端口。</td></tr>
+<tr><td>Lane</td><td>高速端口内部的电/光通道。</td><td>单 lane 异常可能导致高 BER、FEC 压力或降速。</td></tr>
+<tr><td>Split/breakout</td><td>一个高速端口拆成多个逻辑端口。</td><td>端口编号和线缆标签容易错配。</td></tr>
+<tr><td>Label port</td><td>设备面板或系统展示的端口标签。</td><td>交换机侧定位对端时很关键。</td></tr>
+</table>
+<div class="note"><strong>经验法则：</strong> 排障记录中同时写下 Linux netdev、RDMA device、PCI BDF、MST device、mlxlink port、交换机端口和线缆标签，后续协作成本会低很多。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 速率、宽度与降速</h2>
+<p>链路 up 不等于达到了期望能力。AI 训练集群中，单个端口从 400G 降到 200G、100G 或 lane 数不足，可能只在大规模 all-reduce 时体现为吞吐降低、tail latency 增大或 NCCL timeout。</p>
+<pre><code># 本端物理速率
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+
+# Linux netdev 视角交叉验证
+ethtool ens5f0np0 | egrep 'Speed|Duplex|Auto-negotiation|Link detected|FEC'
+
+# RDMA/IB 视角交叉验证
+ibstat
+ibv_devinfo -v | egrep 'hca_id|port:|state:|phys_state:|rate:|link_layer:|active_mtu'
+rdma link show</code></pre>
+<table>
+<tr><th>现象</th><th>常见原因</th><th>下一步</th></tr>
+<tr><td>Link up 但速率低</td><td>模块不支持目标速率、对端端口配置低、breakout 配置错误、线缆质量不足。</td><td>查模块能力、对端配置、交换机端口状态、FEC 能力。</td></tr>
+<tr><td>链路反复 flap</td><td>线缆/模块不稳定、对端端口重启、温度、电源、FEC/AN 不匹配。</td><td>间隔采样 link down counter，查交换机日志和模块温度/功率。</td></tr>
+<tr><td>单方向吞吐异常</td><td>某 lane 质量差、RX/TX 光功率异常、PFC/ECN/队列问题。</td><td>结合 <code>mlxlink -c -m</code>、<code>ethtool -S</code>、交换机计数器。</td></tr>
+</table>
+<div class="warn"><strong>速率解读：</strong> 不同端口模式下“速率”和“lane 宽度”的显示方式可能不同。不要只看一个数字，要确认目标拓扑设计、设备能力和对端配置。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. FEC：模式、能力与风险</h2>
+<p>FEC（Forward Error Correction）用于在高速链路上纠正一定范围内的误码。越高速、越长距离、越复杂的介质，FEC 越关键。<code>mlxlink</code> 可以显示 FEC 状态和能力，也支持配置 FEC，但配置属于变更操作，生产默认不应直接执行。</p>
+<pre><code># 只读：查看 FEC 能力/状态
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 --show_fec
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+
+# 只读：和 Linux 侧对照
+ethtool --show-fec ens5f0np0 2&gt;/dev/null || ethtool ens5f0np0 | grep -i fec</code></pre>
+<table>
+<tr><th>FEC 模式</th><th>常见含义</th><th>使用提醒</th></tr>
+<tr><td>Auto</td><td>由设备和对端协商或按策略选择。</td><td>默认最安全，但两端实现/策略不一致时仍需核对。</td></tr>
+<tr><td>No-FEC</td><td>不使用 FEC。</td><td>高速链路上风险高；误码环境下可能导致业务不稳定。</td></tr>
+<tr><td>FireCode / BASER</td><td>较早或特定速率下常见的 FEC 类型。</td><td>是否可用取决于端口速率、设备代际和对端。</td></tr>
+<tr><td>RS-FEC / LL-RS-FEC</td><td>高速以太网常见强纠错模式及低延迟变体。</td><td>要结合交换机、模块和目标速率统一规划。</td></tr>
+</table>
+<pre><code># 变更示例：不要在生产链路上直接运行
+# 仅在维护窗口、已确认对端策略、具备回滚方案时考虑
+# sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 --fec RS
+# sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 --fec AU</code></pre>
+<div class="danger"><strong>变更警告：</strong> FEC 配置不匹配可能导致链路 down 或业务抖动。AI 训练集群里，一条链路抖动可能放大为整个 job 失败；不要把 FEC 变更当成普通查询命令。</div>
+</section>
+
+<section class="figure" id="fig-counters">
+<h3>诊断图：Counters 与 BER 的判断顺序</h3>
+<svg viewBox="0 0 1120 700" width="100%" role="img" aria-label="mlxlink counters 和 BER 诊断图">
+<rect x="20" y="20" width="1080" height="660" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="70" text-anchor="middle" font-size="27" font-weight="700">计数器不是看“有没有”，而是看“是否持续增长”</text>
+<rect x="95" y="125" width="250" height="95" rx="16" fill="#dbeafe" stroke="#93c5fd"/><text x="220" y="162" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">采样 T0</text><text x="220" y="193" text-anchor="middle" font-size="14">mlxlink -c 保存基线</text>
+<rect x="435" y="125" width="250" height="95" rx="16" fill="#ede9fe" stroke="#c4b5fd"/><text x="560" y="162" text-anchor="middle" font-size="20" font-weight="700" fill="#6d28d9">等待窗口</text><text x="560" y="193" text-anchor="middle" font-size="14">训练 job / 流量压测 / 5-10 分钟</text>
+<rect x="775" y="125" width="250" height="95" rx="16" fill="#ccfbf1" stroke="#99f6e4"/><text x="900" y="162" text-anchor="middle" font-size="20" font-weight="700" fill="#0f766e">采样 T1</text><text x="900" y="193" text-anchor="middle" font-size="14">比较 delta</text>
+<rect x="115" y="340" width="260" height="120" rx="18" fill="#dcfce7" stroke="#86efac"/><text x="245" y="378" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">稳定</text><text x="245" y="410" text-anchor="middle" font-size="14">无增长或仅历史值</text><text x="245" y="436" text-anchor="middle" font-size="14">继续查上层协议/拥塞</text>
+<rect x="430" y="340" width="260" height="120" rx="18" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="378" text-anchor="middle" font-size="19" font-weight="700" fill="#c2410c">corrected 增长</text><text x="560" y="410" text-anchor="middle" font-size="14">FEC 正在救链路</text><text x="560" y="436" text-anchor="middle" font-size="14">查模块、FEC、光功率、lane</text>
+<rect x="745" y="340" width="260" height="120" rx="18" fill="#fee2e2" stroke="#fca5a5"/><text x="875" y="378" text-anchor="middle" font-size="19" font-weight="700" fill="#b91c1c">uncorrected/flap</text><text x="875" y="410" text-anchor="middle" font-size="14">业务风险高</text><text x="875" y="436" text-anchor="middle" font-size="14">隔离端口或维护窗口处理</text>
+<rect x="225" y="555" width="670" height="74" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="589" text-anchor="middle" font-size="19" font-weight="700">把 mlxlink 计数器 delta 与 ethtool -S、交换机端口计数器、NCCL 日志时间线对齐</text><text x="560" y="615" text-anchor="middle" font-size="14">只有同一时间窗口内的证据链才适合做故障归因</text>
+<line x1="345" y1="172" x2="435" y2="172" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="685" y1="172" x2="775" y2="172" stroke="#94a3b8" stroke-width="4" marker-end="url(#c1)"/><line x1="900" y1="220" x2="245" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><line x1="900" y1="220" x2="560" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><line x1="900" y1="220" x2="875" y2="340" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><line x1="245" y1="460" x2="420" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><line x1="560" y1="460" x2="560" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/><line x1="875" y1="460" x2="700" y2="555" stroke="#94a3b8" stroke-width="3" marker-end="url(#c1)"/>
+<defs><marker id="c1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">误码诊断要看趋势：T0/T1 delta、业务窗口、对端计数器和日志时间线，比单次快照更可靠。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. Counters、BER 与误码趋势</h2>
+<p><code>-c</code> 或 <code>--show_counters</code> 用于显示物理计数器和 BER 相关信息。不同设备代际展示项不同，但排障方法一致：保存基线、等待有流量的窗口、再次采样、比较变化。</p>
+<pre><code># 只读采样
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c
+
+# 间隔采样示例：不要只看一次
+dev=/dev/mst/mt4129_pciconf0
+port=1
+sudo mlxlink -d "$dev" -p "$port" -c | tee mlxlink-counters-t0.txt
+sleep 300
+sudo mlxlink -d "$dev" -p "$port" -c | tee mlxlink-counters-t1.txt
+diff -u mlxlink-counters-t0.txt mlxlink-counters-t1.txt || true</code></pre>
+<table>
+<tr><th>线索</th><th>可能含义</th><th>处理方向</th></tr>
+<tr><td>BER 偏高或恶化</td><td>介质质量、光功率、端口硬件、对端或环境问题。</td><td>换线/模块、查对端、降低速率验证、检查温度和弯折半径。</td></tr>
+<tr><td>Corrected 增长</td><td>FEC 正在纠错，短期业务可能未失败但有隐患。</td><td>看增长速率和是否集中在某端口/lane。</td></tr>
+<tr><td>Uncorrected 增长</td><td>错误超过纠错能力，业务风险明显。</td><td>建议隔离、维护窗口更换介质或切换路径。</td></tr>
+<tr><td>Link down counter 增长</td><td>链路 flap 或被重置。</td><td>对齐交换机日志、主机 dmesg、作业失败时间。</td></tr>
+</table>
+<div class="note"><strong>基线管理：</strong> 大规模集群可以把关键端口的 <code>mlxlink -c</code> 输出纳入节点验收和故障前后对比，但长期监控更适合交给交换机遥测、DCGM/Prometheus、ethtool exporter 或自研采集器。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 线缆与光模块线索</h2>
+<p><code>-m</code> 或模块相关查询可以显示线缆/模块信息。对 AI 集群而言，模块信息经常能解释“为什么只有某一排机柜、某一批节点、某一类端口异常”。</p>
+<pre><code># 只读查看模块/线缆信息
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -m
+
+# Linux 侧补充模块 EEPROM 信息
+ethtool -m ens5f0np0 2&gt;/dev/null | head -80
+
+# 对端交换机侧也要查看同一根线的模块读数
+# 示例伪命令，按交换机 NOS 替换
+# show interfaces ethernet 1/17 transceiver details</code></pre>
+<table>
+<tr><th>模块线索</th><th>关注点</th><th>解释</th></tr>
+<tr><td>Vendor/Part/Revision</td><td>是否在兼容清单中。</td><td>非认证模块不一定不能用，但排障时要提高怀疑权重。</td></tr>
+<tr><td>Cable type/Length</td><td>DAC/AOC/光模块、长度。</td><td>超过设计距离或混用规格会造成训练失败或误码。</td></tr>
+<tr><td>Temperature/Voltage</td><td>是否接近告警阈值。</td><td>高温会放大误码，尤其在高密度机柜中。</td></tr>
+<tr><td>TX/RX power</td><td>双端光功率是否合理。</td><td>一端低通常指向光纤、模块、清洁度或对端发射问题。</td></tr>
+</table>
+<div class="warn"><strong>介质排障原则：</strong> 换线/换模块是有效验证手段，但要记录原始位置、序列号、对端和更换时间；否则容易把可复现问题变成无法追踪的漂移问题。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. PCIe 链路诊断</h2>
+<p>NCCL 或 RDMA 性能异常不总是网络线缆问题。网卡/DPU 到主机的 PCIe 链路如果降速、降宽、错误重试或 NUMA 放置不合理，也会表现为吞吐不足。<code>mlxlink</code> 在部分设备和版本中支持通过 PCIe port type 查看 PCIe counters；同时应结合 <code>lspci</code> 和拓扑工具。</p>
+<pre><code># mlxlink PCIe counters：具体支持取决于设备和 MFT 版本
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 --port_type PCIE -c
+
+# PCIe 链路宽度/速率
+lspci -s 41:00.0 -vv | egrep 'LnkCap|LnkSta|AER|UESta|CESta'
+
+# 设备到 NUMA/GPU 的拓扑
+lstopo --no-io 2&gt;/dev/null | head
+nvidia-smi topo -m 2&gt;/dev/null || true
+cat /sys/bus/pci/devices/0000:41:00.0/numa_node</code></pre>
+<table>
+<tr><th>现象</th><th>可能原因</th><th>验证</th></tr>
+<tr><td>NIC 速率正常但吞吐低</td><td>PCIe x16 变 x8/x4、Gen5 变 Gen4/Gen3、NUMA 跨 socket。</td><td><code>lspci -vv</code>、BIOS、插槽布局、<code>nvidia-smi topo -m</code>。</td></tr>
+<tr><td>偶发 DMA/RDMA 错误</td><td>PCIe AER、固件/驱动、主板或 riser 问题。</td><td><code>dmesg</code>、AER counters、BMC SEL、厂商诊断。</td></tr>
+<tr><td>多卡训练某几张 GPU 慢</td><td>GPU-NIC 不在同一 NUMA/PCIe root complex。</td><td>拓扑矩阵、rank placement、NCCL topology dump。</td></tr>
+</table>
+<div class="note"><strong>边界：</strong> <code>mlxlink</code> 能提供设备侧 PCIe 线索，但完整 PCIe 排障还需要 BIOS、主板、riser、BMC、内核日志和厂商硬件支持一起参与。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. IB、RoCE 与 Ethernet 场景</h2>
+<p><code>mlxlink</code> 更接近物理链路层；InfiniBand、RoCE 和普通 Ethernet 的上层配置仍要用对应工具验证。AI Infra 中常见错误是“mlxlink 正常”就认定网络正常，忽略了 GID index、P_Key、MTU、PFC/ECN、路由或防火墙。</p>
+<pre><code># InfiniBand/RDMA 侧
+ibstat
+ibv_devinfo -v
+rdma link show
+rdma resource show
+
+# RoCE/Ethernet 侧
+ip -br link
+ip -br addr
+ethtool ens5f0np0
+ethtool -S ens5f0np0 | egrep -i 'err|drop|crc|fec|timeout|pause|pfc|ecn|discard'
+
+# GID 与 NCCL/RDMA 常见交叉点
+show_gids 2&gt;/dev/null || true
+cat /sys/class/infiniband/mlx5_0/ports/1/gid_attrs/types/* 2&gt;/dev/null</code></pre>
+<table>
+<tr><th>场景</th><th>mlxlink 负责</th><th>还必须验证</th></tr>
+<tr><td>InfiniBand</td><td>物理端口、速率、FEC、误码、模块。</td><td>SM/LID、P_Key、IB rate、fabric 路由、<code>ibdiagnet</code>。</td></tr>
+<tr><td>RoCE v2</td><td>以太物理链路质量。</td><td>IP、VLAN、MTU、PFC/ECN、GID index、DSCP/TC、交换机 QoS。</td></tr>
+<tr><td>普通 Ethernet</td><td>链路训练、模块、FEC、物理错误。</td><td>netdev up、队列、offload、bond/LACP、路由和 ACL。</td></tr>
+</table>
+<div class="success"><strong>工具组合：</strong> 物理层用 <code>mlxlink</code>，Linux netdev 用 <code>ip</code>/<code>ethtool</code>，RDMA verbs 用 <code>ibv_devinfo</code>/<code>rdma</code>，IB fabric 用 <code>ibstat</code>/<code>ibdiagnet</code>，真实性能用 perftest、qperf、iperf3 或 nccl-tests。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. NCCL fabric 问题定位</h2>
+<p>NCCL 报错或 all-reduce 掉速时，不要只盯 GPU。多节点训练通信路径通常跨越 GPU、PCIe、NIC、线缆、交换机、RoCE/IB 配置和进程绑核。<code>mlxlink</code> 在这个链条中负责物理层证据。</p>
+<pre><code># 训练作业侧：打开必要日志
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+
+# 记录 NCCL 选择了哪些 HCA/接口
+env | grep -E 'NCCL|CUDA_VISIBLE_DEVICES|SLURM|OMPI' | sort
+
+# 节点侧：把 NCCL 时间窗口内的链路状态保存下来
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec
+ethtool -S ens5f0np0 | egrep -i 'err|drop|crc|fec|pause|pfc|ecn'
+ibv_devinfo -v | egrep 'hca_id|port:|state:|rate:|link_layer|active_mtu'</code></pre>
+<table>
+<tr><th>NCCL 现象</th><th>mlxlink 关注点</th><th>非 mlxlink 关注点</th></tr>
+<tr><td><code>NET/IB</code> 初始化慢或失败</td><td>端口是否 up、速率是否符合、是否 link flap。</td><td>GID index、HCA 选择、权限、容器 RDMA 设备暴露。</td></tr>
+<tr><td>大规模时才 timeout</td><td>误码/FEC 计数是否在作业窗口增长。</td><td>PFC/ECN、拥塞、交换机 buffer、路由 ECMP、CPU 绑核。</td></tr>
+<tr><td>单节点/单机柜慢</td><td>该范围端口是否降速、模块批次是否相同。</td><td>拓扑放置、作业 rank 映射、GPU-NIC locality。</td></tr>
+</table>
+<div class="note"><strong>证据链模板：</strong> “NCCL 日志 14:03:21 timeout” + “同窗口端口 17 corrected/uncorrected 增长” + “交换机对端 CRC/FEC 增长” + “模块 RX power 低” 比“mlxlink 有一些 error”更能支撑处置决策。</div>
+</section>
+
+<section class="figure" id="fig-compare">
+<h3>对比图：mlxlink、ethtool、ibstat、rdma 怎么选</h3>
+<svg viewBox="0 0 1120 680" width="100%" role="img" aria-label="mlxlink 与其他网络诊断工具对比">
+<rect x="20" y="20" width="1080" height="640" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<text x="560" y="70" text-anchor="middle" font-size="27" font-weight="700">同一条链路，不同工具看不同层</text>
+<rect x="100" y="130" width="205" height="330" rx="20" fill="#dbeafe" stroke="#93c5fd"/><text x="203" y="172" text-anchor="middle" font-size="23" font-weight="700" fill="#1d4ed8">ethtool</text><text x="203" y="220" text-anchor="middle" font-size="15">Linux netdev</text><text x="203" y="250" text-anchor="middle" font-size="15">driver/firmware</text><text x="203" y="280" text-anchor="middle" font-size="15">offload/ring/channel</text><text x="203" y="310" text-anchor="middle" font-size="15">netdev counters</text><text x="203" y="360" text-anchor="middle" font-size="14">接口级排障</text>
+<rect x="340" y="130" width="205" height="330" rx="20" fill="#ede9fe" stroke="#c4b5fd"/><text x="443" y="172" text-anchor="middle" font-size="23" font-weight="700" fill="#6d28d9">ibstat</text><text x="443" y="220" text-anchor="middle" font-size="15">IB/CA 摘要</text><text x="443" y="250" text-anchor="middle" font-size="15">state/phys state</text><text x="443" y="280" text-anchor="middle" font-size="15">rate/link layer</text><text x="443" y="310" text-anchor="middle" font-size="15">快速巡检</text><text x="443" y="360" text-anchor="middle" font-size="14">IB/RDMA 端口状态</text>
+<rect x="580" y="130" width="205" height="330" rx="20" fill="#ccfbf1" stroke="#99f6e4"/><text x="683" y="172" text-anchor="middle" font-size="23" font-weight="700" fill="#0f766e">rdma</text><text x="683" y="220" text-anchor="middle" font-size="15">内核 RDMA netlink</text><text x="683" y="250" text-anchor="middle" font-size="15">link/resource</text><text x="683" y="280" text-anchor="middle" font-size="15">设备映射</text><text x="683" y="310" text-anchor="middle" font-size="15">命名空间线索</text><text x="683" y="360" text-anchor="middle" font-size="14">RDMA 资源视角</text>
+<rect x="820" y="130" width="205" height="330" rx="20" fill="#ffedd5" stroke="#fdba74"/><text x="923" y="172" text-anchor="middle" font-size="23" font-weight="700" fill="#c2410c">mlxlink</text><text x="923" y="220" text-anchor="middle" font-size="15">设备物理链路</text><text x="923" y="250" text-anchor="middle" font-size="15">FEC / BER</text><text x="923" y="280" text-anchor="middle" font-size="15">模块/线缆</text><text x="923" y="310" text-anchor="middle" font-size="15">lane/port 线索</text><text x="923" y="360" text-anchor="middle" font-size="14">物理层归因</text>
+<rect x="180" y="530" width="760" height="70" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="563" text-anchor="middle" font-size="19" font-weight="700">正确做法：并排采集，而不是选一个“万能工具”</text><text x="560" y="590" text-anchor="middle" font-size="14">netdev 正常、RDMA 正常、mlxlink 正常，才更有信心排除主机链路问题</text>
+</svg><div class="caption">mlxlink 是物理链路专家，但不是完整网络栈诊断的替代品。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. mlxlink vs ethtool/ibstat/rdma</h2>
+<table>
+<tr><th>问题</th><th>优先工具</th><th>为什么</th></tr>
+<tr><td>Linux 网卡是否 up、驱动/固件版本、队列/offload</td><td><code>ip</code>、<code>ethtool</code></td><td>它们是 netdev 和驱动视角。</td></tr>
+<tr><td>IB 端口 state、phys state、rate 快速检查</td><td><code>ibstat</code></td><td>输出简洁，适合 IB/RDMA 巡检。</td></tr>
+<tr><td>RDMA link/resource、netns 相关视角</td><td><code>rdma</code></td><td>来自内核 RDMA netlink。</td></tr>
+<tr><td>FEC、BER、模块、lane、物理计数器</td><td><code>mlxlink</code></td><td>更接近 NVIDIA/Mellanox 设备物理层。</td></tr>
+<tr><td>端到端真实性能</td><td><code>ib_write_bw</code>、<code>qperf</code>、<code>iperf3</code>、<code>nccl-tests</code></td><td>链路健康不等于业务吞吐达标。</td></tr>
+</table>
+<pre><code># 一组常用交叉验证命令
+ip -br link
+ethtool ens5f0np0
+ethtool -S ens5f0np0 | egrep -i 'err|drop|crc|fec|pause|pfc|discard'
+ibstat
+rdma link show
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec</code></pre>
+<div class="success"><strong>分层原则：</strong> 如果 <code>mlxlink</code> 显示物理层异常，优先处理物理链路；如果 <code>mlxlink</code> 干净但 NCCL 仍异常，继续查 RoCE QoS、IB fabric、路由、NUMA、CPU 绑核、容器和作业拓扑。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 安全只读生产工作流</h2>
+<p>生产环境中，<code>mlxlink</code> 的默认姿势应该是只读采集和交叉验证。需要改配置时，把它纳入网络变更流程，而不是 incident 中的即兴命令。</p>
+<pre><code># 1. 建立映射
+hostname -f
+lspci -D | grep -Ei 'Mellanox|NVIDIA|ConnectX|BlueField'
+ibdev2netdev
+rdma link show
+
+# 2. 只读采集本端
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec
+ethtool ens5f0np0
+ethtool -S ens5f0np0 | egrep -i 'err|drop|crc|fec|pause|pfc|ecn|discard'
+
+# 3. 采集对端和时间线
+dmesg -T | egrep -i 'mlx5|pcie|aer|link|rdma' | tail -100
+journalctl -k --since '30 minutes ago' | egrep -i 'mlx5|pcie|aer|link|rdma'
+
+# 4. 有流量时重复采样，比较 delta
+sleep 300
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c</code></pre>
+<div class="grid-2">
+<div class="card"><strong>只读白名单</strong><br><code>mlxlink -d ...</code>、<code>-c</code>、<code>-m</code>、<code>--show_fec</code>、帮助和版本查询通常适合先跑。</div>
+<div class="card"><strong>变更红区</strong><br><code>--fec</code> 覆盖、PRBS/test mode、disable port、写寄存器、模块写操作应走维护窗口。</div>
+<div class="card"><strong>证据保存</strong><br>输出要带时间戳、主机名、端口、对端、作业 ID，方便后续 RCA。</div>
+<div class="card"><strong>回滚意识</strong><br>如果必须改 FEC 或端口配置，先记录当前值、对端值和恢复命令。</div>
+</div>
+<div class="danger"><strong>生产禁忌：</strong> 不要对承载训练作业的端口执行测试模式或强制配置，尤其不要在不清楚对端配置时“试一下”。高速 fabric 的错误配置会影响整个作业队列。</div>
+</section>
+
+<section class="figure" id="fig-troubleshoot">
+<h3>排障流程图：从 NCCL timeout 到硬件处置</h3>
+<svg viewBox="0 0 1120 760" width="100%" role="img" aria-label="mlxlink 安全排障流程图">
+<rect x="20" y="20" width="1080" height="720" rx="20" fill="#fbfdff" stroke="#d9e1ec"/>
+<rect x="430" y="50" width="260" height="68" rx="14" fill="#dbeafe" stroke="#93c5fd"/><text x="560" y="92" text-anchor="middle" font-size="22" font-weight="700">NCCL 慢/超时</text>
+<rect x="105" y="170" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="230" y="205" text-anchor="middle" font-size="18" font-weight="700">确认接口选择</text><text x="230" y="234" text-anchor="middle" font-size="14">NCCL 日志/HCA/GID</text>
+<rect x="435" y="170" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="560" y="205" text-anchor="middle" font-size="18" font-weight="700">只读链路采集</text><text x="560" y="234" text-anchor="middle" font-size="14">mlxlink -c -m --show_fec</text>
+<rect x="765" y="170" width="250" height="92" rx="14" fill="#ede9fe" stroke="#c4b5fd"/><text x="890" y="205" text-anchor="middle" font-size="18" font-weight="700">对端交叉验证</text><text x="890" y="234" text-anchor="middle" font-size="14">交换机/ethtool/rdma</text>
+<polygon points="560,335 715,420 560,505 405,420" fill="#ffedd5" stroke="#fdba74"/><text x="560" y="414" text-anchor="middle" font-size="17" font-weight="700">物理计数器</text><text x="560" y="439" text-anchor="middle" font-size="14">是否持续增长？</text>
+<rect x="105" y="385" width="230" height="92" rx="14" fill="#dcfce7" stroke="#86efac"/><text x="220" y="421" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">否</text><text x="220" y="449" text-anchor="middle" font-size="14">转查拥塞/配置/拓扑</text>
+<rect x="785" y="385" width="230" height="92" rx="14" fill="#fee2e2" stroke="#fca5a5"/><text x="900" y="421" text-anchor="middle" font-size="18" font-weight="700" fill="#b91c1c">是</text><text x="900" y="449" text-anchor="middle" font-size="14">隔离、换线/模块、RMA</text>
+<rect x="210" y="610" width="700" height="72" rx="16" fill="#eef2f7" stroke="#cbd5e1"/><text x="560" y="642" text-anchor="middle" font-size="19" font-weight="700">任何变更前：维护窗口、对端确认、回滚命令、业务迁移</text><text x="560" y="668" text-anchor="middle" font-size="14">先证明，再处置；先隔离，再实验</text>
+<line x1="560" y1="118" x2="230" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="560" y1="118" x2="560" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="560" y1="118" x2="890" y2="170" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="560" y1="262" x2="560" y2="335" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="405" y1="420" x2="335" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="715" y1="420" x2="785" y2="420" stroke="#94a3b8" stroke-width="4" marker-end="url(#d1)"/><line x1="220" y1="477" x2="410" y2="610" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/><line x1="900" y1="477" x2="710" y2="610" stroke="#94a3b8" stroke-width="3" marker-end="url(#d1)"/>
+<defs><marker id="d1" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#94a3b8"/></marker></defs>
+</svg><div class="caption">安全排障的核心是把物理异常和业务时间线对齐，并在变更前完成隔离、对端确认和回滚准备。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 典型故障剧本</h2>
+<h3>剧本 A：端口 Down 或一直 Polling</h3>
+<pre><code>sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -m --show_fec
+ethtool ens5f0np0
+dmesg -T | egrep -i 'mlx5|link|module|firmware|pcie' | tail -80</code></pre>
+<p>优先查线缆是否插对、模块是否识别、对端端口是否启用、端口模式是否匹配、FEC/auto-negotiation 是否一致、breakout 配置是否正确。</p>
+<h3>剧本 B：Link Up 但 NCCL 掉速</h3>
+<pre><code>sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec
+ethtool -S ens5f0np0 | egrep -i 'err|drop|crc|fec|pause|pfc|ecn|discard'
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH ./your_nccl_test</code></pre>
+<p>如果物理计数器不增长，继续查 RoCE QoS、拥塞、GPU-NIC 拓扑、CPU 绑核、容器 device mapping 和 NCCL HCA 选择。</p>
+<h3>剧本 C：某一批节点频繁 flap</h3>
+<pre><code># 每台节点保存相同格式输出，便于横向比较
+for p in 1 2; do
+  sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p "$p" -c -m --show_fec \
+    | tee "mlxlink-$(hostname -s)-p${p}.txt"
+done</code></pre>
+<p>按机柜、线缆批次、模块 PN、交换机端口组、温度和布线半径聚类。批量问题通常不是单个命令能解释的，而是供应链、布线或交换机策略一致性问题。</p>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 常见坑与安全边界</h2>
+<div class="grid-2">
+<div class="card"><strong>坑 1：查错端口</strong><br>没有建立 netdev、RDMA device、PCI、MST、交换机端口映射，导致读到无关端口。</div>
+<div class="card"><strong>坑 2：把历史 error 当现行故障</strong><br>没有 T0/T1 delta 和业务时间线，单次非零计数不能直接归因。</div>
+<div class="card"><strong>坑 3：只看本端</strong><br>链路是双端系统，本端正常不代表对端交换机、模块和光功率正常。</div>
+<div class="card"><strong>坑 4：忽略 FEC</strong><br>速率 up 但 FEC 不合理，可能在高流量下变成 corrected error 风暴。</div>
+<div class="card"><strong>坑 5：容器内视角不完整</strong><br>容器可能没有 <code>/dev/mst</code>、RDMA device、内核日志或真实 PCI 拓扑。</div>
+<div class="card"><strong>坑 6：把 mlxlink 当性能测试</strong><br>它提供链路证据，不证明应用端到端吞吐达标。</div>
+<div class="card"><strong>坑 7：排障时改配置</strong><br>强制 FEC、test mode、disable port 都可能造成业务中断。</div>
+<div class="card"><strong>坑 8：忽略版本差异</strong><br>MFT、固件、驱动、设备代际不同，字段和能力会变化。</div>
+</div>
+<div class="danger"><strong>高风险命令边界：</strong> PRBS/test mode、port disable、FEC override、寄存器写入、模块写入、固件更新都不属于“看一眼”的诊断动作。没有维护窗口和回滚方案时，不应执行。</div>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 练习与上线清单</h2>
+<h3>练习任务</h3>
+<ol>
+<li>在测试节点上用 <code>lspci</code>、<code>mst status -v</code>、<code>ibdev2netdev</code> 建立一张端口映射表。</li>
+<li>对同一端口分别运行 <code>mlxlink</code>、<code>ethtool</code>、<code>ibstat</code>、<code>rdma link</code>，比较它们的视角差异。</li>
+<li>用 <code>mlxlink -c</code> 做 T0/T1 采样，理解哪些字段会随流量变化。</li>
+<li>用 <code>mlxlink -m</code> 和 <code>ethtool -m</code> 对比模块信息，并记录 vendor、PN、长度、温度、光功率。</li>
+<li>在 nccl-tests 或 perftest 前后采集链路输出，把业务性能和物理计数器放到同一时间线。</li>
+</ol>
+<h3>上线/验收清单</h3>
+<table>
+<tr><th>检查项</th><th>通过标准</th><th>证据</th></tr>
+<tr><td>端口映射</td><td>主机、PCI、MST、netdev、RDMA、交换机端口一致。</td><td>映射表、布线表、命令输出。</td></tr>
+<tr><td>链路速率</td><td>达到设计速率和宽度，无异常降速。</td><td><code>mlxlink</code>、<code>ethtool</code>、<code>ibstat</code>。</td></tr>
+<tr><td>FEC</td><td>两端策略符合设计，未出现不匹配。</td><td><code>--show_fec</code>、交换机配置。</td></tr>
+<tr><td>物理计数器</td><td>压测窗口内无异常增长。</td><td>T0/T1 <code>mlxlink -c</code>、交换机计数器。</td></tr>
+<tr><td>模块与布线</td><td>模块被识别，温度/功率合理，型号符合基线。</td><td><code>mlxlink -m</code>、<code>ethtool -m</code>、资产记录。</td></tr>
+<tr><td>业务压测</td><td>perftest/nccl-tests 达到集群基线。</td><td>压测结果和日志。</td></tr>
+</table>
+<pre><code># 只读验收包示例
+out="link-audit-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+lspci -D | grep -Ei 'Mellanox|NVIDIA|ConnectX|BlueField' | tee "$out/lspci.txt"
+ibdev2netdev 2&gt;&amp;1 | tee "$out/ibdev2netdev.txt"
+rdma link show 2&gt;&amp;1 | tee "$out/rdma-link.txt"
+sudo mlxlink -d /dev/mst/mt4129_pciconf0 -p 1 -c -m --show_fec | tee "$out/mlxlink-p1.txt"</code></pre>
+</section>
+
+<section class="refbox" id="refs"><h2>参考资料与延伸阅读</h2><ul>
+<li>NVIDIA Docs：<a href="https://docs.nvidia.com/networking/display/mftv4350/mlxlink-utility">mlxlink Utility</a>，用于核对 <code>-c</code>/<code>--show_counters</code>、<code>-m</code>、<code>--show_fec</code>、FEC、端口和 PCIe counters 等能力。</li>
+<li>NVIDIA Docs：<a href="https://docs.nvidia.com/networking/display/MFT/User%2BManual">NVIDIA Firmware Tools (MFT) User Manual</a>，理解 MFT、MST 设备和工具集上下文。</li>
+<li>Linux kernel docs：<a href="https://docs.kernel.org/networking/device_drivers/ethernet/mellanox/mlx5/counters.html">Mellanox mlx5 ethtool counters</a>，用于把 <code>mlxlink</code> 物理计数器与 <code>ethtool -S</code> 计数器交叉验证。</li>
+<li>NVIDIA NCCL 文档：网络选择、<code>NCCL_DEBUG</code>、<code>NCCL_IB_HCA</code>、<code>NCCL_IB_GID_INDEX</code>、RoCE/IB 调试环境变量。</li>
+<li>Linux man-pages 与 RDMA Core 文档：<code>ethtool(8)</code>、<code>rdma(8)</code>、<code>ibstat</code>、<code>ibv_devinfo</code>、perftest，用于分层验证。</li>
+</ul><p class="mini">建议阅读顺序：先掌握设备/端口映射，再学 <code>mlxlink</code> 链路、FEC、计数器、模块输出，最后把它放入 NCCL/RDMA/交换机/PCIe 的完整证据链。</p></section>
+<div class="footer">mlxlink 深度教程 · AI Infra 链路健康、FEC、误码、模块、PCIe/RDMA/NCCL 排障与生产安全</div>
+</div>
+</body>
+</html>
