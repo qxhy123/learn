@@ -4,6 +4,79 @@
 
 > **关联章节**：本章与 [第10章](./10-memory-checkpointing-and-recovery.md) 的 checkpoint、[第10b章](./10b-alignment-and-post-training.md) 的后训练流程、[第12章](../part4-data-and-storage/12-artifacts-and-checkpoints.md) 的制品管理、[第14章](../part5-serving-infra/14-online-inference-architecture.md) 的推理架构、[第17章](../part5-serving-infra/17-multitenancy-and-cost.md) 的多租户成本控制密切相关。adapter 既是训练产物，也是服务期的一等制品。
 
+## 1. 第一性原理拆解 + 学习大纲
+
+### 拆 — 不可化简的问题
+
+剥掉 LoRA、QLoRA、PEFT、Multi-LoRA、FTaaS 这些名字后，本章面对的不可化简问题只有一个：**一个已经很大的 base model 不能为了每个业务、每个租户、每次实验都完整复制、完整训练、完整部署，但业务又确实需要快速改变它在某个任务上的行为。** 这同时是训练问题、制品问题和服务问题。训练侧的问题是：如果每个需求都全量更新几十亿到几千亿参数，显存、GPU 时间、checkpoint 存储和排队时延都会把平台压垮。制品侧的问题是：如果训练结果只是某个目录里的小文件，没有记录它依赖的 base model、tokenizer、chat template、target modules 和评测结果，它就不能被安全复现、审计、回滚或上线。服务侧的问题是：如果每个 adapter 都独立部署一套 base model，成本会回到“每个需求复制一份大模型”；如果所有 adapter 都动态挂载到同一个 serving pool，又会带来显存预算、缓存淘汰、路由隔离和版本兼容问题。
+
+所以 fine-tuning 不能只被理解成“规模更小的训练”，Multi-LoRA 也不能只被理解成“把多个 LoRA 文件挂上去”。平台真正要交付的是一条闭环：业务提交数据和目标，系统选择允许的 base model 与模板，调度短训练任务，生成 adapter，做评测与兼容性门禁，把 adapter 注册成可治理制品，再让线上服务按租户、版本、实验桶和权限选择它。任何一环缺失，都会把风险推到下一环：训练不记录 base hash，服务就可能加载到错误权重；registry 不记录模板，线上输出就可能因为 prompt 契约变化而漂移；serving 不做 cache budget，热点 adapter 和 KV cache 就会在流量高峰互相挤爆。
+
+### 推 — 从这个问题如何推导出每个机制
+
+既然不能为每个任务完整训练一份模型，就会推导出参数高效微调（Parameter-Efficient Fine-Tuning）：冻结 base model，只训练一小组增量参数。LoRA 把大矩阵更新拆成低秩矩阵 \(BA\)，把“更新整个权重空间”变成“学习一个任务相关方向”；QLoRA 再把训练期 base model 量化，换取更低显存门槛。既然训练产物不再是完整模型，而是依附于 base 的 adapter，就会推导出 adapter registry：它不能只保存文件路径，还要保存 base model digest、tokenizer、chat template、adapter schema、训练代码、数据版本、评测报告和权限边界。既然业务需要自助提交大量短任务，就会推导出 FTaaS 控制面：API、配额、准入、状态机、调度、失败重试、评测门禁、制品注册和发布事件必须被串成一个可观测流程。
+
+既然服务期不能为每个 adapter 复制 base model，就会推导出 Multi-LoRA Serving：base 权重常驻并共享，adapter 按请求、租户或版本动态选择。共享 base 节省的是固定成本，但 adapter 热层、KV cache、临时 buffer 和碎片化会形成新的显存账本，因此必须把 `base 常驻`、`热点 adapter`、`峰值 KV cache`、`安全余量` 分开预算。既然 adapter 可以动态加载，就会推导出缓存分层：GPU 显存是 hot 层，CPU 内存或本地 NVMe 是 warm 层，对象存储和 registry 是 cold 层；LRU、预加载、租户权重和灰度优先级共同决定哪些 adapter 留在热层。既然 adapter 与 base 权重空间强绑定，就会推导出版本兼容性门禁：base hash、tokenizer、模板、target modules、serving engine adapter 格式只要有一个不匹配，就不能默认上线。最后，既然不同 adapter 会影响路由、batching 和线上行为，就会推导出 A/B、shadow、canary、按 adapter 维度观测和快速回滚。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((Fine-Tuning 与 Multi-Adapter))
+    不可完整复制大模型
+      参数高效微调
+        LoRA
+        QLoRA
+        rank 与 target_modules
+      短作业资源池
+        准入控制
+        显存估算
+        失败重试
+    产物依附 base
+      Adapter Registry
+        base_model_hash
+        tokenizer_version
+        chat_template_version
+        eval_report
+      版本兼容门禁
+        shape 校验
+        schema 校验
+        engine 支持
+    需要低成本服务
+      Multi-LoRA Serving
+        共享 base model
+        动态挂载 adapter
+        adapter 路由
+      显存预算
+        base 常驻
+        热点 adapter
+        KV cache
+        安全余量
+    需要可运营上线
+      FTaaS Pipeline
+        数据快照
+        训练
+        评测
+        注册
+        热加载
+        灰度回滚
+      多租户治理
+        配额
+        权限
+        审计
+        成本归因
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么 fine-tuning 的平台目标不是“把 pretraining 缩小”，而是缩短从数据到线上 adapter 的反馈回路？
+2. LoRA、QLoRA 分别改变了训练显存、制品大小和服务部署形态里的哪一部分成本？
+3. 为什么 adapter 必须绑定 base model hash、tokenizer、chat template 和 target modules，而不能只登记一个文件地址？
+4. 一个 FTaaS pipeline 从数据快照到 production 灰度至少需要哪些状态、门禁和失败处理？
+5. Multi-LoRA Serving 的显存为什么要同时预算 base 权重、热点 adapter、KV cache 和安全余量？
+6. base model 升级时，为什么“shape 能加载”不等于“语义兼容”，平台应该如何灰度和回滚？
+7. 当一个租户的 adapter 变成短时热点时，路由、batching、缓存淘汰和配额分别会受到什么影响？
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -194,24 +267,26 @@ $$
 
 一个更完整的端到端视角是：
 
-```text
-[1] 数据快照 / 数据清洗
-      ↓
-[2] 选择 base model、模板、训练参数
-      ↓
-[3] 提交 FTaaS 任务并做准入控制
-      ↓
-[4] 执行训练，产出 checkpoint / 最终 adapter
-      ↓
-[5] 自动评测、安全检查、兼容性校验
-      ↓
-[6] 注册到 adapter registry
-      ↓
-[7] 触发 Multi-LoRA 服务热加载
-      ↓
-[8] staging / canary / production 灰度发布
-      ↓
-[9] 线上观测、A/B、回滚、下线
+```mermaid
+flowchart TD
+  A[数据快照 / 数据清洗] --> B[选择 base model / tokenizer / template]
+  B --> C[提交 FTaaS 任务]
+  C --> D{准入控制}
+  D -- 配额 / 显存 / 权限通过 --> E[训练执行]
+  D -- 拒绝 --> R[返回可解释原因]
+  E --> F[冻结 adapter / config / dataset version]
+  F --> G[自动评测]
+  G --> H{质量与安全门禁}
+  H -- 通过 --> I[兼容性校验]
+  H -- 未通过 --> J[registered: non_deployable]
+  I --> K{base / tokenizer / schema / engine 匹配}
+  K -- 通过 --> L[Adapter Registry]
+  K -- 未通过 --> M[load_blocked]
+  L --> N[通知 serving pool 预加载]
+  N --> O{热加载成功}
+  O -- 成功 --> P[staging / shadow / canary / production]
+  O -- 失败 --> Q[load_failed + 保持旧路由]
+  P --> S[线上观测 / A/B / 回滚 / 下线]
 ```
 
 每一步都对应不同的平台责任：
@@ -225,6 +300,8 @@ $$
 | 注册 | 制品元数据 | 版本绑定、状态管理、审计 | adapter record |
 | 热加载 | serving pool、路由信息 | 可观测、可回退、不重启 | loaded adapter |
 | 发布 | 灰度策略、SLO、告警规则 | 可回滚、权限正确、流量可控 | online version |
+
+更完整的 FTaaS pipeline 还要把“谁能推进状态”说清楚。训练 worker 只能声明训练产物已冻结，不能直接把 adapter 标成可上线；评测 worker 只能给出离线门禁结果，不能绕过 registry；serving loader 只能汇报加载结果，不能改写 adapter 元数据；发布系统只能切流量，不能偷偷替换 base model。这个边界看起来繁琐，但它避免了一个常见事故：某个训练脚本因为拥有对象存储写权限，就把未经评测的新 adapter 覆盖到线上路径。
 
 平台里经常要明确区分三种“成功”：
 
@@ -332,6 +409,8 @@ FTaaS 调度器和 pretraining 调度器看的维度并不一样：
 - 成功率
 - 用户拿到第一个可用版本的时间
 
+**工程边界**：FTaaS 控制面不应该承诺“任何训练脚本都能原样托管”。平台应先约束可支持的 base model 列表、adapter 格式、数据输入协议、最大样本量、最大训练时长、checkpoint 频率和评测门禁。超出边界的研究型任务可以走离线训练队列，但不应复用自动上线 pipeline。
+
 ### 10c.4 Multi-LoRA Serving
 
 训练完成后的 adapter，往往不会单独起一套 base model 服务，而是挂载到共享实例上。
@@ -432,6 +511,17 @@ $$
 \text{GPU 总容量} \ge \text{base 常驻} + \text{热点 adapter 常驻} + \text{峰值 KV cache} + \text{安全余量}
 $$
 
+一个更适合做 admission control 的预算表如下。数字是粗略量级，真实值会随模型结构、序列长度、dtype、serving engine、并发调度和 allocator 碎片变化而变化。
+
+| 预算项 | 估算口径 | 7B BF16 示例 | 13B BF16 示例 | 工程动作 |
+|--------|----------|--------------|---------------|----------|
+| Base 权重常驻 | 参数量 × dtype bytes | ~14 GB | ~26 GB | 每个 serving replica 必须预留，不能被 adapter 挤占 |
+| 单个 LoRA adapter | target modules 参数增量 × dtype bytes | rank 16 常见几十到数百 MB | rank 16 常见百 MB 级 | 注册时写入精确文件大小和加载后显存增量 |
+| 热点 adapter 池 | hot_adapter_count × adapter_size | 32 × 120 MB = 3.8 GB | 32 × 180 MB = 5.8 GB | 设置每副本 hot 层上限，超过则驱逐或拒绝预加载 |
+| KV cache | 并发 × 层数 × hidden × context × dtype 相关 | 32 个中等上下文请求可能数 GB | 长上下文下可能先于 adapter 吃满显存 | 与 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) 的 batching 策略联动 |
+| 临时 buffer / CUDA graph / workspace | engine 运行时开销 | 1-4 GB 常见 | 2-6 GB 常见 | 压测得到，不用纸面公式替代 |
+| 碎片与安全余量 | 总容量的 10%-20% 起 | 40 GB 卡至少留 4 GB 级 | 80 GB 卡至少留 8 GB 级 | admission control 按硬阈值执行 |
+
 举个直觉化的例子：如果某个 base model 常驻后占掉 16 GB，单个 adapter 平均 150 MB，GPU 上常驻 48 个热点 adapter 就要再吃掉约 7.2 GB；如果同时有 32 个并发请求，每个请求平均需要 200 MB KV cache，又是 6.4 GB。这样即使不算框架额外开销、碎片化、临时 buffer，总量也已经接近 30 GB。放在 40 GB 卡上看似还有空间，但只要上下文长度上升、某些请求更大、或者 loader 需要短时双拷贝，OOM 风险就会迅速上来。
 
 这也是为什么 adapter 数量上限从来不只是一个“文件数”问题，而通常同时受三类约束决定：
@@ -448,6 +538,8 @@ $$
 很多系统会再叠加 **预加载（preload）** 机制：在新版本灰度开始前、已知大客户流量高峰前，或者发现某个 adapter 命中率持续抬升时，提前把它从 warm 层搬到 GPU 热层，降低第一批请求的冷启动抖动。
 
 所以 Multi-LoRA 显存管理的本质不是一个静态容量公式，而是一套持续平衡机制：共享 base 节省固定成本，adapter 热层控制增量成本，KV cache 吞吐决定并发成本，而热加载、热卸载、LRU 和预加载共同决定这套系统在真实流量下是否稳定。
+
+**工程边界**：显存预算不能只在部署时算一次。registry 应保存 adapter 的静态大小，loader 应上报加载后真实增量，serving pool 应周期性上报 hot adapter 数、KV cache 峰值、eviction 次数和 OOM 近失事件。若 `base + hot adapter + p95 KV cache + safety margin` 超过副本容量的硬阈值，应拒绝新 adapter 预加载或降低并发，而不是等待 CUDA OOM。
 
 ### 10c.5 合并部署和动态挂载是两种不同策略
 
@@ -498,6 +590,52 @@ registry 在注册或加载前，应该优先校验 hash 是否精确匹配；�
 这样平台就可以做灰度升级和流量分割：一部分租户继续走旧 base，另一部分租户或实验桶切到新 base；同一个业务也可以先在 shadow / canary 流量上验证 `adapter-v2`，观察效果后再扩大比例。
 这种分流策略的价值在于，升级 base model 不是只切一份大权重，而是切换一整套与之绑定的 adapter 生态。
 只有把新旧 base 并存、adapter 重训、路由分流和回滚预案一起设计，版本升级才不会变成一次高风险的整池替换。
+
+#### 10c.5a.1 兼容性矩阵
+
+adapter 与 base 的兼容性可以按“能否加载”和“是否可信”分层判断。平台最容易犯的错，是只检查 shape 和 key 是否存在，却忽略 tokenizer、模板和后训练语义空间已经变化。
+
+| 变化项 | 典型例子 | 加载层面 | 语义层面 | 平台默认动作 |
+|--------|----------|----------|----------|--------------|
+| base checkpoint digest 变化 | `base-v1` 重新上传但标签不变 | 可能能加载 | 高风险 | 阻断自动发布，要求重训或完整验收 |
+| tokenizer 变化 | 新增 special token、改变 BOS/EOS | 可能能启动 | 高风险 | 阻断，要求 adapter 重新评测 |
+| chat template 变化 | system/user/assistant 包装格式改变 | 能加载 | 高风险 | 阻断 production，允许 shadow 验证 |
+| target modules 变化 | `q_proj/v_proj` 改名或层数不同 | 常直接失败 | 不可信 | 注册阶段拒绝 |
+| LoRA rank / alpha 变化 | rank 8 与 rank 64 混用 | 取决于 schema | 行为不同 | 作为不同 adapter schema 管理 |
+| serving engine 变化 | vLLM、TRT-LLM、LoRAX 支持差异 | 可能失败 | 需压测 | 进入 engine 兼容矩阵 |
+| base 做了对齐后训练 | SFT/RLHF/DPO 后的新权重 | 可能能加载 | 高风险 | 新旧 base 并存，adapter 分批重训 |
+
+一个实用规则是：**只要 base 权重、输入契约或 adapter schema 任一项变化，就不能把旧 adapter 当作自动兼容。** 如果业务强烈希望复用，平台也应把它放进 `compatibility_review` 或 `shadow_only` 状态，而不是直接设为 `deployable`。
+
+#### 10c.5a.2 元数据契约示例
+
+registry 中的 adapter record 可以采用类似下面的契约。字段名不重要，关键是把“能在哪个环境里运行”从口头约定变成机器可校验的事实。
+
+```yaml
+adapter_id: tenant-a/summarizer-lora
+adapter_version: 2026-05-03.4
+base_model_id: llama-3.1-8b-instruct
+base_model_digest: sha256:...
+tokenizer_digest: sha256:...
+chat_template_version: chatml-v3
+adapter_format: peft-lora-safetensors
+adapter_schema:
+  rank: 16
+  alpha: 32
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+training:
+  dataset_version: ds-2026-05-01-cleaned
+  trainer_image_digest: sha256:...
+  seed: 42
+evaluation:
+  report_id: eval-98231
+  status: passed
+serving:
+  allowed_engines: [vllm-0.8-lora]
+  status: deployable
+```
+
+**工程边界**：兼容性校验只能证明“允许进入下一步”，不能证明“线上效果一定好”。它应该挡住确定性不匹配和高风险漂移，但仍需要离线评测、shadow、canary 和按 adapter 维度的线上指标来覆盖语义退化。
 
 ### 10c.6 Adapter Registry、兼容性约束与 A/B 测试
 
@@ -645,3 +783,8 @@ fine-tuning 和 multi-adapter 系统要观测的，不只是 GPU 利用率。
 12. 如果平台要做 base model 灰度升级，为什么更稳妥的方式是让新旧 base 并存，而不是直接原地替换？请说明流量分割和回滚策略。
 13. 设计一个 adapter A/B 测试流程，说明离线评测、shadow、canary、扩量和回滚各自的作用。
 14. 当 registry 里积累了数千个 adapter 后，你会如何设计 adapter 清理策略？请同时考虑审计留存、热度分布、租户权限和对象存储成本。
+15. 画出一个从 FTaaS 提交到 production 灰度的 pipeline，并标出哪些状态只能由训练 worker、评测 worker、registry、serving loader 或发布系统推进。
+16. 给定 80 GB GPU、base 常驻 32 GB、每个 adapter 加载后 180 MB、p95 KV cache 预算 22 GB、运行时 workspace 4 GB、安全余量 10 GB，最多允许多少个 adapter 常驻 hot 层？如果要把 hot 层从 60 个提高到 90 个，需要牺牲哪几项预算？
+17. 请设计一个 adapter registry 的最小元数据 schema，要求能支持 base hash 校验、tokenizer/template 校验、engine 兼容性校验、评测门禁和租户权限。
+18. 一个旧 adapter 在新 base 上 shape 校验通过，但 shadow 评测发现输出风格和拒答率明显漂移。请解释为什么这不是 loader bug，并给出重训、验收、路由和回滚方案。
+19. 某个大客户活动开始后，一个平时很冷的 adapter 突然成为热点，导致 GPU hot 层频繁驱逐其他 adapter。请设计一个同时考虑预加载、租户优先级、LRU 保护窗口和 admission control 的处理策略。

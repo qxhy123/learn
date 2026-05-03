@@ -4,6 +4,68 @@
 
 > **关联章节**：本章讨论的 checkpoint、模型包和回滚链路，与 [第10章](../part3-training-infra/10-memory-checkpointing-and-recovery.md) 的训练恢复机制直接相连；恢复能否成功，取决于制品是否被平台正确登记和保留。
 
+## 1. 第一性原理拆解 + 学习大纲
+
+### 拆 — 不可化简的问题
+
+剥离 MLflow、W&B、S3、Model Registry、checkpoint manager 这些工具名之后，本章要解决的不可化简问题只有一个：训练和发布会产生很多文件，但平台真正需要管理的不是“文件存在”，而是“某个结果是否有完整证据链，能否恢复、验证、发布、回滚和审计”。文件系统只能回答路径下有没有字节；训练系统关心 step、rank、optimizer state、随机数状态；发布系统关心权重、tokenizer、推理配置、镜像和评测报告是否属于同一个版本。一个 70B checkpoint 可能有数百 GB 到数 TB；一次回滚可能必须在 5 分钟内定位上一个 production 模型包。如果只把结果按日期扔进 bucket，平台看似保存了所有文件，实际却无法证明哪个版本完整、哪个版本通过门禁、哪个版本可以恢复。制品管理的第一性问题不是容量，而是把离散输出变成可查询、可判定、可流转的平台对象。
+
+### 推 — 从这个问题如何推导出每个机制
+
+如果结果需要证明来源，就必然需要元数据：代码 revision、数据集版本、配置、job id、step、评测报告和镜像 digest 要绑定到同一个 artifact 版本。如果结果需要恢复，就必然要区分 checkpoint 和模型包：checkpoint 保存 optimizer、scheduler、随机数状态和分片布局，模型包保存部署所需权重、tokenizer、模型签名和推理配置。如果结果需要自动发布，就必然需要生命周期状态：`draft`、`validated`、`staging`、`production`、`deprecated` 不只是标签，而是发布、权限和清理系统共同消费的控制面字段。
+
+如果结果需要跨系统流转，就必然需要 registry 或 metadata plane。对象存储适合保存大对象，但它不知道某个目录是否代表完整版本；CI/CD 不天然知道哪个 checkpoint 通过评测；Serving 平台不应靠人工表格判断 tokenizer 是否匹配。因此 registry 把“字节”提升成“对象”，提供索引、关联、状态、权限和审计。底层存储解决另一层问题：POSIX FS 适合临时 staging；并行文件系统适合集群共享的大 checkpoint；对象存储适合归档和分发。故障后恢复可信，还要依赖 manifest、校验和、临时文件、原子 rename、父目录 `fsync`、对象存储 immutable key、评测门禁和回滚候选选择。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((制品与 checkpoint 管理))
+    不可化简问题
+      文件存在
+      版本可用
+      证据链
+    训练输出
+      checkpoint
+        参数和优化器状态
+        step 和 RNG
+      模型包
+        权重和 tokenizer
+        serving config
+    平台对象化
+      metadata
+      lifecycle state
+      registry
+        索引
+        关联
+        审计
+    存储后端
+      POSIX FS
+        fsync
+        rename
+        atomicity
+      并行文件系统
+        stripe
+        元数据瓶颈
+      对象存储
+        immutable object
+        manifest 发布
+    工程结果
+      可恢复
+      可发布
+      可回滚
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么“文件已上传”仍不等于模型版本可发布？
+2. checkpoint 和模型包分别服务于哪个系统目标，为什么不能混用？
+3. 一个 artifact 版本至少需要哪些元数据，才能串起训练、评测、部署和回滚？
+4. 生命周期状态为什么属于平台控制面，而不是人工备注？
+5. POSIX FS、并行文件系统和对象存储的哪些语义差异会破坏恢复可靠性？
+6. 为什么 manifest、校验和和状态门禁能把“文件集合”提升为“可判定版本”？
+7. 清理 checkpoint 和模型包时，为什么不能只按文件年龄删除？
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -143,6 +205,16 @@ artifact:
 | Artifact Registry / Metadata Plane（MLflow、W&B 等） | 自带版本、状态、实验关联 | 本身通常仍要依赖对象存储或共享存储承载大文件 | 需要审计与门禁的团队 |
 
 平台上常见的组合是：大文件放对象存储，元数据和生命周期状态放 registry。这样既保留了弹性容量，也能让发布系统直接消费“哪个版本可用”的控制面信息。
+
+#### 12.7.1 checkpoint 的文件系统选型边界
+
+Checkpoint 写入比普通制品上传更接近文件系统语义问题，底层差异可参考 [§0c 文件系统与存储内核](../part0-foundations-of-systems/0c-filesystems-and-storage-internals.md)。POSIX FS 适合写临时文件、`fsync(file)`、同目录 `rename()` 成正式文件，再 `fsync(parent dir)`；工程边界是 `write()` 成功不等于落盘，`rename()` 成功不等于父目录已持久化，跨挂载点 rename 也不是原子替换。并行文件系统适合多 rank 写 10GB-100GB 级 shard，通过 stripe 聚合带宽，但小文件、频繁 `stat/open`、单目录并发会打 MDS。对象存储适合归档和跨地域保留，但 S3/OSS 不是 POSIX：没有本地 `fsync`，`rename` 往往是 copy+delete，`LIST prefix` 不能当事务边界；可靠协议应改成 immutable key + manifest。
+
+| 后端 | 适合放什么 | 关键语义 | 工程边界 |
+|------|------------|----------|----------|
+| 本地 POSIX FS | 临时 staging、单节点 checkpoint | `fsync`、同 FS `rename` 原子可见 | 节点丢失会丢本地副本，需异步归档 |
+| 并行 FS | 多节点共享 checkpoint、大 shard | stripe 聚合带宽、POSIX 路径语义 | MDS 和小文件是上限，需压测目录并发 |
+| 对象存储 | 长期归档、发布分发、跨区域保留 | PUT 完成、multipart、manifest | 非 POSIX，不能依赖 rename/fsync/list 事务 |
 
 ### 12.8 制品与 CI/CD 的集成
 

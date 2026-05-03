@@ -4,6 +4,83 @@
 
 > **关联章节**：本章建立在 [第10章](./10-memory-checkpointing-and-recovery.md) 的 checkpoint 与恢复机制之上，也和 [第10c章](./10c-finetuning-and-multi-adapter.md) 的微调形态、[第14章](../part5-serving-infra/14-online-inference-architecture.md) 的推理系统强相关。对齐训练经常同时消耗训练资源和推理资源。
 
+## 1. 第一性原理拆解 + 学习大纲
+
+### 拆 — 不可化简的问题
+
+剥掉 PPO、DPO、GRPO、RLHF、Reward Model 这些名字，本章真正要解决的不可化简问题是：**一个预训练模型已经学会了语言分布，但它还不知道在具体产品场景里什么回答更应该被偏好、什么边界必须遵守、什么行为虽然概率高却不能交付；平台必须把这些外部偏好稳定地转化为模型参数变化，并且保证这个转化过程可复现、可评测、可恢复、可扩容。** 预训练只要求模型继续压低 token prediction loss，目标函数来自语料本身；后训练的目标函数却来自人、规则、judge、业务策略和安全约束。它们不是自然存在于语料里的单一数值，而是一组会漂移、会冲突、会被模型利用漏洞的外部信号。
+
+这就带来一个基础设施层面的本质差异：pretraining 的系统中心是一个连续训练 loop，alignment 的系统中心是一个闭环控制系统。这个闭环里至少有四类状态同时存在：policy model 负责生成候选行为，reference model 负责约束它不要离原始能力太远，reward model 或规则系统负责把行为映射成偏好信号，critic/value 或组内 baseline 负责把稀疏反馈变成可更新的梯度。每一类状态都可能有独立版本、独立显存峰值、独立吞吐瓶颈和独立失败模式。工程上最容易犯的错误，是把对齐训练想象成"换一个 loss 的 SFT"。如果这样做，rollout 阶段会把训练卡闲置，RM 打分会拖慢 step，reference 版本漂移会让 KL 曲线不可解释，checkpoint 恢复后 policy、critic、rollout buffer 不一致会让训练继续跑但结论失真。
+
+因此，本章不是算法排行榜，而是后训练基础设施的建模课。你要学会把"模型怎样更符合偏好"拆成数据、推理、训练、评测、checkpoint、服务化部署六个互相约束的问题：数据决定偏好信号是否可信，推理决定 rollout 是否跟得上训练，训练决定参数如何更新，评测决定更新是否真的改善行为，checkpoint 决定失败后能否回到同一组状态，部署选型决定 RM/ref/rollout 是共置还是独立服务。只要其中一个环节没有版本化和可观测性，对齐结果就很难解释。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从"外部偏好如何变成参数变化"出发，可以自然推导出本章每个机制。第一步是 SFT：如果我们有高质量示范回答，就先用监督学习把 base model 拉到可指令跟随的区域，这降低后续偏好优化的探索成本。第二步是偏好数据：单个标准答案不足以表达"更好"，所以需要同一 prompt 下的 chosen/rejected、打分、critique 或规则验证结果。第三步是 DPO：如果偏好对已经离线存在，那么最省系统复杂度的做法，是直接比较 policy 对 chosen/rejected 的 logprob，并用 reference model 作为锚点；这解释了为什么 DPO 像 SFT，却必须严守 tokenizer、chat template、截断策略和 reference 版本一致性。
+
+如果偏好信号必须来自当前 policy 生成的新样本，就推导到 PPO/GRPO。PPO 需要 rollout，因为模型需要在线试错；需要 Reward Model，因为人类不可能在训练内环实时打分；需要 reference model，因为只追 reward 会导致模型跑偏；需要 critic/value model，因为单条 response 的 reward 太稀疏，需要估计 advantage 来稳定更新。于是 PPO 必然变成多模型协调系统，而不是单模型训练脚本。GRPO 则从 critic 的成本继续推导：如果同一 prompt 可以生成一组 response，并且 reward 能在组内比较，那么组均值可以充当 baseline，critic 就可以被移除；代价是 rollout 样本数上升，推理引擎吞吐变得更关键。
+
+再往下推，就是 RM 部署、显存账本和 checkpoint 一致性。RM 如果写在训练脚本里，任何超时都会阻塞策略更新；如果服务化，就必须有批处理、版本路由、限流、重试和指标。PPO 显存账本必须列出 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer，因为这些组件虽然不一定同时峰值，却会在阶段切换、权重同步、checkpoint 保存时形成短暂 OOM。checkpoint 也不能只保存 policy 权重，而要把 policy、critic、reference artifact、RM artifact、rollout buffer、KL controller、rng、数据游标写进同一份 manifest；否则恢复出来的是一组目录，而不是同一个训练状态。最后，评测必须进入训练内环，因为 loss 或 reward 上升不代表行为改善，win-rate、长度分布、安全拒答、格式遵循和 judge 版本才决定一个 checkpoint 是否值得继续训练或进入发布门禁。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((对齐训练与后训练基础设施))
+    不可化简问题
+      外部偏好如何变成参数变化
+      行为约束如何稳定复现
+      多模型状态如何保持一致
+    数据与目标
+      SFT示范数据
+      chosen_rejected偏好对
+      规则奖励与LLM_judge
+      安全与工具使用样本
+    机制推导
+      DPO
+        离线偏好优化
+        policy加reference
+        数据质量与模板一致性
+      PPO
+        在线rollout
+        Reward_Model打分
+        Reference_KL约束
+        Critic_Value估计
+      GRPO
+        组内相对奖励
+        去掉critic
+        更高rollout吞吐
+    基础设施压力
+      显存账本
+        policy_ref_reward_value
+        optimizer_activation
+        KV_Cache_rollout_buffer
+      RM服务化
+        批处理
+        版本路由
+        断路器
+      Checkpoint事务
+        manifest
+        多模型hash
+        KL_controller
+        rng和数据游标
+    工程边界
+      小团队先SFT_DPO
+      规则奖励优先GRPO
+      软偏好大算力才PPO
+      按峰值加20到30百分比余量
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么 post-training 不是"预训练后再训一下"，而是一条包含数据、训练、推理、评测和发布门禁的闭环管线？
+2. 为什么 alignment training 不能等同于 RLHF，SFT、DPO、GRPO、PPO 分别解决偏好塑形里的哪一层问题？
+3. 给定 LLaMA-7B 和 8×H100 80GB，怎样把 PPO 的 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer 分项列成显存账本？
+4. 为什么 DPO 更容易平台化，但仍然需要严格保证 reference model、tokenizer、chat template、数据版本和评测口径一致？
+5. 什么情况下应该把 Reward Model 和训练节点共置，什么情况下应该把 RM 做成独立推理服务或共享推理池？
+6. GRPO 去掉 critic 后省掉了哪些状态，又为什么会把压力转移到大 batch rollout 和 reward 可靠性上？
+7. 一个可恢复的 PPO checkpoint manifest 至少要记录哪些模型、控制器、随机数、数据游标和评测版本，才能避免"恢复后还能跑但结果不可解释"？
+
 ## 学习目标
 
 完成本章学习后，你将能够：

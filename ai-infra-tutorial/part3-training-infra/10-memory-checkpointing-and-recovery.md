@@ -6,38 +6,101 @@
 
 ---
 
-## 学习目标
+## 1. 第一性原理拆解 + 学习大纲
 
-完成本章学习后，你将能够：
+### 拆 — 不可化简的问题
 
-1. 理解训练显存主要消耗在哪里，并能做粗粒度估算
-2. 区分参数、梯度、优化器状态、激活、临时缓冲区的作用
-3. 理解激活重计算、混合精度、状态切分等常见优化思路的本质
-4. 理解 checkpoint 为什么是训练系统的基础设施，而不是“顺手存一下权重”
-5. 学会设计 checkpoint 保存频率、保留策略和恢复策略
-6. 能识别“节省显存”“增加通信”“增加复杂度”三者之间的取舍
-7. 理解大规模训练中的 NCCL hang、慢节点（straggler）、抢占与弹性训练约束
-8. 能从平台视角设计一套最低可用的训练容错与恢复方案
+剥掉 activation checkpointing、ZeRO、FSDP、NCCL、TorchElastic、SafeTensors 这些工具名以后，本章只剩下一个不可化简的问题：**一次训练是一个长时间运行的状态转移过程，而它依赖的显存、网络、存储、节点和调度系统都不是无限、稳定、同步的资源；我们怎样在这些资源会耗尽、会变慢、会失联、会写坏的现实里，让状态仍然正确地向前推进？** 这比“模型能不能放进显存”更基础。模型参数只是状态的一部分，训练还同时携带梯度、优化器动量、scheduler、随机数、数据进度、并行分片布局和临时通信 buffer。推理阶段通常只要把权重放好并完成一次前向；训练阶段则要保留足够多的历史信息，以便反向传播能计算梯度、优化器能按正确轨迹更新、恢复后还能解释 loss 曲线为什么连续或为什么跳变。
 
----
+很多人第一次做大模型训练时，会把问题理解成三个孤立问题：模型能不能放进显存，代码能不能跑起来，训练能不能继续。但工程现实里它们会连在一起：显存不够，于是引入激活重计算或状态切分；状态被切分后，checkpoint 不再是一个 `model.pt` 文件；checkpoint 变复杂后，恢复逻辑、存储后端、清理策略也必须跟着升级；作业规模变大以后，失败从“偶发事故”变成“系统常态”。所以本章不是单独讲“省显存技巧”，也不是单独讲“断点续训”，而是把两件事放到同一个平台工程视角下看：如何让训练在资源受限、故障频发、同步点很多的条件下，仍然能稳定推进。
 
-## 本章导读
+这个不可化简问题还有一个容易被低估的维度：同步训练的进度不是由平均节点决定，而是由最慢的 rank 和最晚完成的 collective 决定。一台机器数据加载慢 10%，所有 GPU 都可能在通信点等它；一次 checkpoint 只有 127 个 rank 写完、1 个 rank 写坏，整版状态就不能被当成可恢复版本；一个 worker 被抢占后，如果 world size、global batch、数据 shard 和学习率规则没有被重新定义，所谓“自动恢复”就可能只是把错误更快地重复一遍。因此，本章讨论的内存优化、checkpoint、NCCL hang、straggler detection、elastic training 和 pre-flight validation，本质上都是围绕同一件事：把训练状态从脆弱的单次运行，变成可以度量、可以切分、可以校验、可以恢复的系统过程。
 
-很多人第一次做大模型训练时，会把问题理解成：
+### 推 — 从这个问题如何推导出每个机制
 
-- **模型能不能放进显存**
-- **代码能不能跑起来**
-- **训练能不能继续**
+从“状态太大”出发，首先会推出显存估算。参数、梯度、优化器状态、激活和临时 buffer 必须分开看，因为它们的增长规律不同：7B 模型 BF16 权重约 14GB，但 Adam 下每个参数还可能对应 BF16 梯度和 FP32 一阶、二阶矩，参数相关状态可接近 12 bytes/param；激活则随 batch size、sequence length、hidden size、层数增长，长上下文训练时经常比参数更先成为瓶颈。既然显存有限，就会自然推出两类交换：激活重计算用额外计算换显存，状态切分用额外通信和更复杂的状态布局换单卡容量。它们并不是“优化开关”，而是把瓶颈从内存侧转移到计算侧、通信侧和恢复复杂度侧。
 
-但工程现实通常不是这三个问题分开出现，而是它们会连在一起：
+从“状态会丢失或损坏”出发，会推出 checkpoint。真正的 checkpoint 不是权重导出，而是训练状态版本化：要保存模型、优化器、scheduler、step、RNG、sampler、并行布局和 metadata；要用 manifest 判断 shard 是否齐全；要用临时目录、校验和原子提交避免半成品被误读；要把 `latest`、`best`、milestone 分开，因为恢复、评测和发布的语义不同。保存频率也不是固定经验值，而是由可接受进度损失、单次保存停顿、存储带宽、故障概率共同决定。异步 checkpoint 进一步把阻塞改成后台 I/O，但它会消耗 CPU 内存、本地盘和文件系统带宽，因此必须有在飞任务上限和失败状态机。
 
-- 显存不够，于是引入激活重计算或状态切分
-- 状态被切分后，checkpoint 不再是“一个 `model.pt` 文件”
-- checkpoint 变复杂后，恢复逻辑、存储后端、清理策略也必须跟着升级
-- 当作业规模增大后，失败从“偶发事故”变成“系统常态”
+从“同步训练会被最慢一环拖住”出发，会推出 NCCL hang 排查、straggler detection 和 pre-flight validation。NCCL hang 表面是所有 rank 卡住，根因可能是某个 rank 没进入 collective、某条链路 flap、某张 GPU Xid、某个 dataloader 卡在远端读取，或者编排器已经驱逐了 worker。排查必须按 GPU/主机、网络、数据/存储、框架、编排分层收敛。Straggler detection 则要求把 per-rank step time、data time、comm wait、checkpoint 写盘长尾做成指标，而不是只看 job 级 tokens/sec。Pre-flight validation 是把坏卡、坏链路、坏版本组合拦在训练开始前，用几十分钟 smoke test 换掉数小时甚至数天的无效训练。
 
-所以，本章不是单独讲“省显存技巧”，也不是单独讲“断点续训”，而是把两件事放到同一个工程视角下来看：
-**如何让训练在资源受限、故障频发的现实条件下，仍然能稳定推进。**
+从“节点数量会变化”出发，会推出 elastic training。弹性训练不是简单重试，而是在 `min:max` worker 范围内接受 worker group 重建、缩容、扩容和从 checkpoint 恢复。它要求 checkpoint 能描述 world size、分片布局、sampler 进度和训练配置；要求恢复后明确 global batch、学习率规则、数据 shard 是否变化；也要求监控把吞吐变化解释为弹性事件，而不是误报成性能退化。最后，从“硬件算力口径容易被误解”出发，会推出 FP8 训练管线和 HFU/MFU 整合：低精度能提高 Tensor Core 理论吞吐，但如果 scale 管理、amax 统计、cast 边界、通信精度和 loss stability 没处理好，看到的 HFU 可能只是口径漂亮，训练质量和端到端效率并没有改善。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((训练状态如何在有限且会失败的系统里前进))
+    状态太大
+      参数
+        BF16权重
+        梯度
+        Adam状态
+      激活
+        Batch
+        Sequence
+        Hidden
+        Layers
+      临时Buffer
+        Kernel workspace
+        NCCL buffer
+        Fragmentation
+      推导机制
+        激活重计算
+        ZeRO和FSDP
+        Offload
+        FP8训练
+    状态会丢
+      Checkpoint
+        Model
+        Optimizer
+        Scheduler
+        RNG
+        Sampler
+        Parallel layout
+      版本化
+        Manifest
+        Atomic commit
+        Latest
+        Best
+      恢复语义
+        True resume
+        Warm start
+    同步会被拖慢
+      NCCL Hang
+        Rank未进入collective
+        网络链路异常
+        GPU或驱动异常
+      Straggler
+        Per-rank step time
+        Data time
+        Comm wait
+      Pre-flight
+        nccl-tests
+        GPU健康
+        存储写入
+        版本矩阵
+    节点会变化
+      Elastic Training
+        Min max workers
+        World size变化
+        Global batch调整
+        Sampler重建
+      工程边界
+        训练语义不能漂移
+        半成品不能恢复
+        坏节点先隔离
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么训练显存不能只按模型权重估算？参数、梯度、优化器、激活和临时 buffer 分别按什么规律增长？
+2. 激活重计算、状态切分、offload 和 FP8 分别把瓶颈从哪里转移到哪里？什么时候它们会得不偿失？
+3. 一个可 true resume 的 checkpoint 至少要包含哪些状态？为什么只保存权重更接近 warm start？
+4. 为什么分布式 checkpoint 必须有 manifest、metadata、原子提交和版本指针？半成品 checkpoint 会造成什么事故？
+5. NCCL hang 出现时，如何区分“某个 rank 没进 collective”和“collective / 网络本身卡死”？
+6. Straggler detection 为什么要看 per-rank 分布而不是只看平均吞吐？慢 5%-10% 的单节点如何拖慢整个同步训练？
+7. Elastic training 在 world size 变化后必须重新确认哪些训练语义？global batch、LR、sampler 和分片布局如何影响恢复正确性？
 
 ---
 
@@ -974,6 +1037,33 @@ $$
 
 NCCL hang 难排的地方在于：表面上看是“所有 rank 都卡住”，但真实世界里往往是某一个 rank 没有按时进入 collective，剩余 rank 只是被动等待。因此 on-call 不应该只盯 `NCCL_DEBUG=INFO`，而是按“训练栈分层”去收敛范围。
 
+```mermaid
+flowchart TD
+    A[发现训练无进展或 watchdog timeout] --> B{所有 rank 都有心跳吗}
+    B -- 否 --> C[定位失联 rank 和所在节点]
+    C --> D{编排器是否驱逐或重启容器}
+    D -- 是 --> E[按抢占或节点失联处理 从最近 COMMITTED checkpoint 恢复]
+    D -- 否 --> F[检查 GPU Xid ECC dmesg 进程状态]
+    F --> G{硬件健康异常吗}
+    G -- 是 --> H[隔离节点 终止挂起作业 恢复训练]
+    G -- 否 --> I[采集 py-spy 或 native backtrace]
+    B -- 是 --> J[对齐最后成功 step collective 名称和 rank 日志]
+    J --> K{可疑 rank 是否未进入 collective}
+    K -- 是 --> L[看 dataloader I/O 样本解码 checkpoint 写盘]
+    K -- 否 --> M[运行同拓扑 nccl-tests 和最小 all-reduce]
+    M --> N{通信 benchmark 异常吗}
+    N -- 是 --> O[升级网络或拓扑 排查 HCA 交换机 MTU ECN]
+    N -- 否 --> P[回看框架时序 版本组合 CUDA/NCCL/driver]
+    I --> Q{调用栈卡在数据或存储吗}
+    Q -- 是 --> L
+    Q -- 否 --> M
+    L --> R{同 step 或同样本可复现吗}
+    R -- 是 --> S[停止自动重试 转数据或代码排障]
+    R -- 否 --> E
+    O --> T[修复后先跑 pre-flight 再放回训练池]
+    P --> U[锁定或回退版本 用最小复现确认]
+```
+
 | 排查层次 | 先看哪些指标 / 证据 | 常见工具 / 动作 | 何时可以判定这一层有问题 |
 |----------|---------------------|-----------------|--------------------------|
 | GPU / 主机层 | GPU Xid、ECC error、温度、降频、PCIe/NVLink 带宽、进程是否还在跑 | `nvidia-smi -q`、主机监控、GPU 健康告警 | 某张卡 ECC/Xid 异常持续增长，或该 rank 所在主机 GPU 利用率异常掉到 0 |
@@ -1119,7 +1209,34 @@ worker 变了以后：
 
 ---
 
-### 10.12 工程建议
+### 10.12 FP8 训练管线与 HFU 整合
+
+FP8 训练的第一性目的不是“把所有张量都变成 8 bit”，而是在 H100/H200/GB200 这类支持 FP8 Tensor Core 的硬件上，让矩阵乘主路径以更高吞吐运行，同时把训练稳定性损失限制在可控范围内。工程上通常会保留一部分高精度状态：权重主副本、优化器状态、梯度归约、loss scale 或 amax 统计不一定都用 FP8；FP8 更多用于 GEMM 输入、激活、权重的计算副本和部分通信前后的 cast 边界。也就是说，FP8 是一条训练管线，不是一个 dtype 开关。
+
+一个简化的 FP8 管线可以按 step 拆成 5 段：第一，读取 BF16/FP32 主权重并根据历史 amax 计算 scale；第二，把参与 GEMM 的激活和权重 cast 到 E4M3 或 E5M2；第三，用 FP8 Tensor Core 完成 forward / backward 的主要矩阵乘；第四，把梯度按策略保留在 BF16/FP32 或通信前做受控压缩；第五，用高精度优化器状态更新主权重，并刷新下一步使用的 scale / amax window。这里的关键风险是 scale 过大导致 underflow，scale 过小导致 overflow，或者不同 rank 的 amax/scale 统计不同步，最终让 loss 曲线出现难以解释的尖峰。
+
+| 管线位置 | 常见精度 | 关注指标 | 工程边界 |
+|----------|----------|----------|----------|
+| 主权重 / optimizer state | BF16 / FP32 | loss 连续性、更新范数、溢出次数 | 不建议为了省显存直接把 Adam 一阶 / 二阶矩降到 FP8 |
+| GEMM 输入副本 | FP8 E4M3 / E5M2 | Tensor Core 利用率、amax 分布、cast 开销 | 只有大 GEMM 足够多时收益明显，小算子 cast 可能抵消收益 |
+| 梯度与通信 | BF16 为主，部分场景压缩 | all-reduce 时间、梯度范数、数值偏差 | 通信压缩必须验证收敛，不应只看带宽下降 |
+| Scale / amax 统计 | FP32 metadata | overflow / underflow、跨 rank 一致性 | 多并行维度下要明确 scale 同步范围 |
+| Checkpoint | 主权重 + scale metadata + optimizer state | resume 后 loss 是否跳变 | checkpoint 不能只存 FP8 计算副本，否则恢复语义不完整 |
+
+HFU（Hardware FLOPs Utilization）适合用来观察“硬件峰值算力被用掉多少”，但它在 FP8 场景中特别容易被误读。若分母使用 FP8 Tensor Core peak，HFU 会比 BF16 口径更难看；若仍用 BF16 peak，数值又会被人为抬高。因此平台指标必须同时记录 dtype、硬件峰值口径、模型理论 FLOPs、端到端 step time、通信与 checkpoint 时间。一个可落地的看板至少应分开展示：model FLOPs utilization、FP8 Tensor Core HFU、tokens/sec、data/compute/comm/checkpoint time 占比，以及 loss stability 指标。只有当 tokens/sec 提升、loss 曲线稳定、checkpoint 可恢复、通信和 cast 开销没有吞掉收益时，FP8 才算真正改善训练效率。
+
+| 判断问题 | 推荐阈值 / 证据 | 下一步动作 |
+|----------|-----------------|------------|
+| HFU 变高但 tokens/sec 没变 | compute time 降了，但 comm / data / checkpoint 占比上升 | 先优化端到端瓶颈，不继续调 FP8 scale |
+| tokens/sec 提升但 loss 尖峰 | overflow、amax 长尾、梯度范数异常 | 缩小 scale window 或回退部分模块到 BF16 |
+| 单卡快，多卡收益差 | all-reduce 时间占比增加，scale metadata 同步频繁 | 检查通信精度、bucket、并行拓扑 |
+| resume 后 loss 跳变 | checkpoint 缺少 scale / RNG / optimizer metadata | 修正 checkpoint schema 后重新验证恢复 |
+
+**工程边界**：FP8 不适合在没有稳定 BF16 baseline 的情况下直接上百卡规模试跑；不适合只凭一次短 benchmark 宣称收益；不适合把 checkpoint 缩成 FP8 权重副本来节省存储。更稳的推进顺序是：单机数百 step 验证 loss 和 amax 分布，单节点多卡验证通信和 scale 同步，小规模多节点验证 HFU 口径与恢复，再进入正式长训练。
+
+---
+
+### 10.13 工程建议
 
 - 先决定恢复目标，再决定 checkpoint 内容和格式
 - 只要用了状态分片，就尽量避免把 checkpoint 退化成单文件思维
@@ -1127,7 +1244,7 @@ worker 变了以后：
 - 清理策略必须自动化，否则成本一定失控
 - 对 100+ GPU 作业，默认假设会遇到慢节点和抢占，而不是把它们当作例外
 
-#### 10.12.1 一个最低可用训练恢复方案
+#### 10.13.1 一个最低可用训练恢复方案
 
 如果你现在要从零搭一套“够用但不夸张”的训练恢复方案，可以先做到这几个点：
 
@@ -1161,7 +1278,7 @@ worker 变了以后：
 
 这已经能覆盖很多真实训练任务。
 
-#### 10.12.2 一个很实用的故障分层思维
+#### 10.13.2 一个很实用的故障分层思维
 
 排障时可以先按“层”来看，而不是一上来就盯某个错误码：
 
@@ -1176,7 +1293,7 @@ worker 变了以后：
 
 这样排障路径会比“看见 hang 就一直翻 NCCL 日志”更清楚。
 
-#### 10.12.3 三个高频反模式
+#### 10.13.3 三个高频反模式
 
 **反模式 1：只存模型权重，却把它叫 resume**
 
