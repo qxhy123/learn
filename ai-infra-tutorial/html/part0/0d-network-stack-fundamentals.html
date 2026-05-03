@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d 章 · 网络协议栈基础 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d 章 · 网络协议栈基础</h1>
+<p class="sub">从“跨机器、跨 NIC、跨 GPU 的字节怎样以正确语义和可控尾延迟进入计算路径”出发，建立 Linux 网络、TCP/IP、socket、offload、RDMA、GPUDirect RDMA 与 NCCL 之间的工程因果链。</p>
+<div class="chips"><span class="chip">TCP/IP</span><span class="chip">Linux Socket</span><span class="chip">MTU</span><span class="chip">RDMA</span><span class="chip">RoCE v2</span><span class="chip">NCCL</span><span class="chip">GPUDirect RDMA</span></div>
+<div class="note"><strong>不可化简的问题：</strong>程序只能读写内存和文件描述符，但分布式训练需要把远端进程、远端 NIC、远端 GPU 里的字节，按正确顺序、可控延迟和可恢复语义送到本地计算路径。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：网络协议栈</a></li>
+<li><a class="anchor" href="#s2">OSI 模型到 Linux 协议栈</a></li>
+<li><a class="anchor" href="#s3">TCP：握手、窗口与拥塞控制</a></li>
+<li><a class="anchor" href="#s4">IP 路由、subnet、MTU 与 jumbo frame</a></li>
+<li><a class="anchor" href="#s5">socket、epoll 与 io_uring</a></li>
+<li><a class="anchor" href="#s6">网卡 offload</a></li>
+<li><a class="anchor" href="#s7">RDMA verbs、RoCE v2 与 InfiniBand</a></li>
+<li><a class="anchor" href="#s8">GPUDirect RDMA</a></li>
+<li><a class="anchor" href="#s9">NCCL 与协议栈关系</a></li>
+<li><a class="anchor" href="#s10">Worked example：AllReduce 慢一半</a></li>
+<li><a class="anchor" href="#s11">练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：网络协议栈</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>AI 平台里的网络不是一个单一组件。控制面通常还在使用 TCP、HTTP、gRPC、Kubernetes API、对象存储 API；训练数据面才会在集群里尽量走 RDMA、NCCL、GPUDirect RDMA。工程师如果只记“RDMA 很快”或“MTU 要开 9000”，很容易在故障现场漏掉真正瓶颈：一次 AllReduce 慢，可能是 ECN 没开，也可能是网卡队列 RSS 打散不均、MTU 不一致、PCIe 拓扑绕远、TCP control plane 抖动导致 rank rendezvous 慢。本章从协议栈的第一性问题出发，把 Linux 网络、TCP/IP、socket、offload、RDMA、NCCL 的关系放到同一张工程地图上。</p>
+<p>网络协议栈要解决的不可化简问题是：一台机器里的程序只会读写内存和文件描述符，但训练任务需要把另一台机器、另一张 GPU、另一个进程里的字节，按正确顺序、可控延迟、可恢复语义送到本地计算路径上。中间隔着网卡、交换机、光模块、路由、内核、驱动、队列、拥塞、丢包、重传、权限和地址空间。所有术语都可以先拿掉，只剩三个硬约束：第一，链路是共享资源，任意两个发送者都可能在交换机出口相遇，必须有排队、丢弃或退避；第二，CPU、内存、PCIe、NIC、GPU 都有各自的数据移动边界，少一次拷贝就是少一次带宽竞争；第三，分布式训练的通信不是“偶尔发消息”，而是在每个 step 周期性制造大流量，任何 1% 的尾延迟都会被 64、512、4096 张 GPU 放大。</p>
+<p>从这个问题看，协议栈不是教科书里的七层名词表，而是一组在不同边界上付出代价、换取语义的机制。TCP 给字节流顺序、重传和拥塞控制，但它一般经过内核 socket 路径，适合 control plane、参数服务小消息、API 调用和跨机协调。IP 给寻址、路由、分片边界和子网隔离，但不会保证交付。以太网和 NIC 负责把包变成帧和电/光信号，同时用 offload 把 CPU 做不动的分段、校验、聚合、散列下推到硬件。RDMA 则换了一个问题表述：如果两端进程已经预注册内存、预建队列、预授权访问，能不能让 NIC 直接搬运远端内存，绕过对端 CPU 和内核拷贝？GPUDirect RDMA 再进一步问：既然训练数据最终在 GPU HBM 里，能不能让 NIC 直接读写 GPU 显存，连 host memory staging 都省掉？</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>先从最普通的发送开始：应用调用 <code>send()</code>，内核需要知道发给谁，所以需要 IP 地址、subnet、路由表和 ARP/ND；数据大于链路帧，就要按 MTU 切分，否则交换机无法转发；多个进程同时发包，内核必须提供 socket 抽象，让每条连接有缓冲区、状态机和错误语义。连接跨越不可靠网络，于是 TCP 需要三次握手确认双方初始序列号，需要窗口控制限制未确认数据，需要 CUBIC/BBR 这类拥塞控制算法在吞吐和排队之间做选择。训练任务里的长流 AllReduce 与服务里的短连接完全不同：长流关心稳定带宽和拥塞公平，短连接更容易被握手、慢启动、队列延迟、DNS 和负载均衡支配。</p>
+<p>当连接数和 QPS 上来，control plane 不能每个 socket 一个线程阻塞等待，于是出现 <code>epoll</code> 这样的 readiness notification；当系统调用和拷贝成本成为瓶颈，<code>io_uring</code> 把提交队列和完成队列搬到共享 ring，减少 syscall 往返。再往下，CPU 对每个包做 TCP segmentation、checksum、receive coalescing 会浪费核心，于是 NIC 提供 TSO/GSO、LRO/GRO、RSS/RPS 等 offload。offload 的边界也很清楚：它能省 CPU，但错误配置会隐藏真实包大小、破坏抓包直觉，或者让单队列被打满。训练节点还必须把队列、IRQ affinity、NUMA 和 PCIe 拓扑一起看；否则看似网络带宽足够，实际数据在跨 socket 路径上被内存控制器和 PCIe switch 消耗。</p>
+<p>数据面继续推导：大规模训练的 AllReduce 每个 step 要搬 GB 级梯度，TCP 的可靠字节流语义太重，CPU 拷贝和内核路径也太贵。RDMA verbs 把通信变成 QP、CQ、WR、WC：应用把 work request 放进 send/recv queue，NIC 执行后在 completion queue 放 completion。RoCE v2 把 RDMA 封装在 UDP/IP 上，能跑在以太网和 L3 网络里，但依赖 PFC/ECN/DCQCN 等数据中心无损或近无损配置；InfiniBand 则是专用网络体系，拥塞和管理模型更完整但生态和布线成本不同。NCCL 并不替代协议栈，它是在 GPU 集合通信层选择 ring/tree/CollNet/NVLS 等算法，再通过 libfabric、UCX、verbs、driver、NIC 把字节送出去。因此，排查 AllReduce 不能只问“网络通不通”，而要问：NCCL 选了什么 transport，GDRDMA 是否启用，RDMA fabric 是否有 ECN/PFC/MTU 问题，NIC 与 GPU 的拓扑是否匹配，control plane 是否已经在启动阶段抖动。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((网络协议栈))
+    不可化简问题
+      跨机器搬字节
+      共享链路拥塞
+      CPU-NIC-GPU边界
+    TCP-IP
+      地址与路由
+      三次握手
+      窗口与拥塞控制
+      长流和短连接
+    Linux IO
+      socket
+      epoll
+      io_uring
+      offload
+    RDMA
+      QP和CQ
+      WR和WC
+      RoCEv2
+      InfiniBand
+    AI影响
+      AllReduce吞吐
+      rank同步尾延迟
+      GPUDirectRDMA
+      NCCL协议选择</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 control plane 继续使用 TCP，而训练 data plane 会尽量绕开传统内核网络路径？</li>
+<li>OSI 七层模型与 Linux 实际收发包路径之间有什么差异？</li>
+<li>TCP 的三次握手、窗口、拥塞控制分别在解决什么不同问题？</li>
+<li>为什么 MTU 1500 与 jumbo frame 9000 会影响大流量 AllReduce 的 CPU 和交换机开销？</li>
+<li><code>epoll</code>、<code>io_uring</code>、网卡 offload 分别减少的是哪一种成本？</li>
+<li>RDMA verbs 里的 QP、CQ、WR、WC 如何对应一次真正的数据传输？</li>
+<li>NCCL、libfabric/UCX、verbs、driver、NIC 之间如何分工，故障排查时应该从哪一层切入？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. OSI 模型到实际 Linux 协议栈分层</h2>
+<p>OSI 模型适合建立词汇表，但 Linux 排查更需要路径感。应用看到的是 socket fd；内核看到的是 <code>struct sock</code>、skb、qdisc、路由表、邻居表和网卡驱动；NIC 看到的是 DMA descriptor、queue、interrupt/MSI-X 和硬件 offload；交换机看到的是以太帧、VLAN、ECN、PFC、队列和 buffer。</p>
+<pre class="mermaid">flowchart TB
+  app[应用: PyTorch/NCCL/gRPC] --> libc[libc 或 runtime]
+  libc --> sys[syscall: send recv poll]
+  sys --> sock[Linux socket/TCP/UDP]
+  sock --> ip[IP route/netfilter/qdisc]
+  ip --> drv[NIC driver + DMA ring]
+  drv --> nic[NIC: queues/offload/RDMA engine]
+  nic --> sw[ToR/Spine switch]
+  sw --> peer[远端主机或GPU节点]</pre>
+<div class="warn"><strong>工程边界：</strong>OSI 的“会话层、表示层”在 AI Infra 里通常被 TLS、HTTP/2、gRPC、protobuf、NCCL bootstrap 等库吸收；不要拿 OSI 层号判断性能责任。</div>
+<table>
+<tr><th>观察对象</th><th>真实系统对象</th><th>常见排查入口</th></tr>
+<tr><td>应用层连接</td><td>socket fd、RPC channel、NCCL communicator</td><td><code>ss</code>、应用日志、NCCL debug</td></tr>
+<tr><td>内核协议栈</td><td>TCP/UDP、skb、qdisc、route、neighbor</td><td><code>ip route</code>、<code>ip neigh</code>、<code>tc</code>、<code>sar</code></td></tr>
+<tr><td>网卡路径</td><td>DMA ring、queue、IRQ、offload、RDMA engine</td><td><code>ethtool -k</code>、<code>ethtool -S</code>、<code>/proc/interrupts</code></td></tr>
+<tr><td>交换网络</td><td>ToR/Spine、ECMP、PFC、ECN、buffer</td><td>交换机 telemetry、端口 counter、队列丢弃与 ECN mark</td></tr>
+</table>
+<p>抓包看到 TCP retransmission，不代表应用层一定错；NCCL 报 timeout，也不代表 verbs 一定错，可能是路由、PFC、ECN、MTU 或某个 rank 的 CPU stalled。建立路径感的目的，是在症状出现时快速缩小责任边界，而不是背诵层号。</p>
+</section>
+
+<section class="section" id="s3">
+<h2>3. TCP：三次握手、拥塞控制、窗口、AI 长流 vs 短连接</h2>
+<p>TCP 提供可靠有序字节流。三次握手确认双方可达、协商初始序列号，并避免旧连接残留包污染新连接。窗口有两类：receive window 保护接收端 buffer，congestion window 保护网络。CUBIC 以丢包为核心信号，适合传统高带宽长延迟网络；BBR 估计瓶颈带宽和 RTT，试图把 inflight 数据控制在带宽时延积附近，但在某些共享队列里会与基于丢包的流产生公平性问题。</p>
+<pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: SYN seq=x
+  S->>C: SYN-ACK seq=y ack=x+1
+  C->>S: ACK ack=y+1
+  C->>S: Data bytes
+  S->>C: ACK + receive window</pre>
+<table>
+<tr><th>机制</th><th>解决的问题</th><th>AI Infra 中的信号</th></tr>
+<tr><td>三次握手</td><td>确认双向可达、协商初始序列号、防旧包污染</td><td>短连接 P99、连接池命中率、<code>SYN-SENT</code>/<code>TIME_WAIT</code></td></tr>
+<tr><td>receive window</td><td>保护接收端 buffer，不让发送方压垮接收方</td><td><code>ss -tin</code> 中 rcv space、应用消费慢</td></tr>
+<tr><td>congestion window</td><td>保护共享网络，不让发送方把队列打爆</td><td>RTT、cwnd、重传率、交换机队列</td></tr>
+<tr><td>拥塞控制</td><td>在吞吐、公平性、排队延迟之间取舍</td><td>dataset 拉取长流、checkpoint 上传、对象存储吞吐</td></tr>
+</table>
+<p>AI 场景要区分长流和短连接。训练 AllReduce、checkpoint upload、dataset shard 拉取会形成长流，瓶颈多在吞吐、队列、拥塞控制和 MTU；推理服务的 control request、scheduler RPC、metadata lookup 更像短连接或短流，握手、TLS、慢启动、连接池、尾延迟更关键。工程上，长流看 <code>ss -tin</code>、<code>sar -n TCP,ETCP</code>、重传率、RTT、cwnd；短流看连接复用、<code>TIME_WAIT</code>、DNS、负载均衡、P99。</p>
+<div class="note"><strong>工程边界：</strong>不要把 TCP 调优当成 RDMA 训练的主手段。TCP 常用于 bootstrap、控制、日志、对象存储和服务请求；真正的 GPU 梯度数据若走 NCCL RDMA，瓶颈会转向 RoCE/IB、verbs、PCIe 和 GPU 同步。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. IP 路由、subnet、MTU、jumbo frame 对训练吞吐影响</h2>
+<p>IP 层决定包往哪里走。单机看 <code>ip addr</code>、<code>ip route</code>、<code>ip neigh</code>；集群看 subnet 规划、ECMP、BGP/静态路由、VLAN/VXLAN、ToR 到 spine 的 oversubscription。训练网络常希望 GPU 节点的 RDMA NIC 在专用 subnet，避免与管理流量、存储流量混在同一个拥塞域。</p>
+<p>MTU 是单个二层帧可承载的最大 payload。以太网常见 MTU 1500，jumbo frame 常设 9000。对 1 GiB 梯度块，1500 MTU 需要约 715k 个包，9000 MTU 约 119k 个包；包数少意味着更少的 header、队列操作、中断、交换机查表和 NIC descriptor 压力。RoCE v2 对 MTU 一致性更敏感：任一路径 MTU 不一致都可能导致吞吐下降或连接异常。</p>
+<pre class="mermaid">flowchart LR
+  grad[1 GiB gradient chunk] --> m1500[MTU 1500: ~715k packets]
+  grad --> m9000[MTU 9000: ~119k packets]
+  m1500 --> cost1[更多包头/descriptor/队列压力]
+  m9000 --> cost2[更低每字节包处理成本]</pre>
+<div class="warn"><strong>工程边界：</strong>jumbo frame 必须端到端一致，包括 NIC、bond、VLAN、交换机端口、overlay。云上很多虚拟网络不允许随意设置 9000；跨公网更不能假设 jumbo 可用。</div>
+<pre><code>ip addr
+ip route
+ip neigh
+ip -d link show ens5f0
+ping -M do -s 8972 &lt;peer&gt;</code></pre>
+<table>
+<tr><th>配置项</th><th>错误表现</th><th>验证方式</th></tr>
+<tr><td>subnet 与路由</td><td>流量绕远、ECMP 不均、管理流量与训练流量互相挤压</td><td><code>ip route get</code>、traceroute、交换机 flow telemetry</td></tr>
+<tr><td>MTU</td><td>包数过多、吞吐低、RoCE 连接异常</td><td><code>ip -d link</code>、<code>ping -M do -s 8972</code></td></tr>
+<tr><td>VLAN/overlay</td><td>端到端 MTU 被中间封装吃掉</td><td>逐跳检查端口 MTU 与 overlay MTU</td></tr>
+<tr><td>oversubscription</td><td>多节点同时训练时 P99 抖动</td><td>ToR/Spine 队列、buffer、discard、ECN mark</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. socket / epoll / io_uring（control plane 用）</h2>
+<p><code>socket</code> 是 Linux 给应用的网络端点抽象。阻塞 socket 简单但扩展性差；一个推理网关要同时管理 10000 条连接时，thread-per-connection 会把内存和调度开销放大。<code>epoll</code> 把“哪些 fd 可读写”的通知集中起来，适合 control plane 的高并发 RPC、日志 agent、metadata 服务。<code>io_uring</code> 用 submission queue 和 completion queue 降低 syscall 和上下文切换成本，对高 QPS 网络和存储 IO 都有价值。</p>
+<pre class="mermaid">flowchart LR
+  user[用户态事件循环] --> sq[io_uring SQ]
+  sq --> kernel[内核提交批处理]
+  kernel --> nic[NIC或文件系统]
+  nic --> cq[io_uring CQ]
+  cq --> user
+  user --> ep[epoll: readiness模型]
+  ep --> fd[多个socket fd]</pre>
+<table>
+<tr><th>模型</th><th>适合场景</th><th>主要成本</th><th>AI Infra 判断</th></tr>
+<tr><td>阻塞 socket</td><td>低并发工具、简单脚本、一次性控制命令</td><td>线程等待、上下文切换</td><td>不适合高并发推理网关</td></tr>
+<tr><td><code>epoll</code></td><td>大量连接、每连接低吞吐、事件驱动服务</td><td>应用状态机复杂度</td><td>control plane 常用基线</td></tr>
+<tr><td><code>io_uring</code></td><td>高 QPS 网络与存储 IO、批量提交完成</td><td>内核/驱动/框架支持差异</td><td>收益需要压测验证</td></tr>
+</table>
+<div class="note"><strong>工程边界：</strong>这些机制主要优化 control plane 或普通 TCP/UDP IO，不会自动让 NCCL AllReduce 变快。对于 Python 服务，GIL、序列化、TLS、业务逻辑常比 syscall 更早成为瓶颈。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 网卡 offload（GSO/TSO/LRO/RSS/RPS）</h2>
+<p>网卡 offload 的目标是把每包重复工作从 CPU 移走。GSO 是 Linux 在较晚阶段把大 skb 分段，TSO 是 NIC 做 TCP segmentation；GRO/LRO 把接收侧多个包合并成更大的单元，减少协议栈处理次数；checksum offload 让 NIC 计算校验和；RSS 根据五元组 hash 把流分散到多个 receive queue；RPS 在软件层把包分发到不同 CPU。</p>
+<table>
+<tr><th>机制</th><th>方向</th><th>省掉的成本</th><th>AI Infra 注意点</th></tr>
+<tr><td>TSO/GSO</td><td>发送</td><td>TCP 分段 CPU 成本</td><td>抓包可能看到大包，不等于线上 MTU 真大</td></tr>
+<tr><td>GRO/LRO</td><td>接收</td><td>per-packet 协议栈开销</td><td>LRO 可能影响转发和精确测量</td></tr>
+<tr><td>RSS</td><td>接收</td><td>单队列瓶颈</td><td>hash key、队列数、IRQ affinity 要匹配 NUMA</td></tr>
+<tr><td>RPS</td><td>接收</td><td>软件分散 CPU 处理</td><td>会增加跨 CPU cache traffic</td></tr>
+</table>
+<pre><code>ethtool -k eth0
+ethtool -S eth0
+cat /proc/interrupts | grep -E 'mlx|eth|ens'
+lscpu | grep NUMA
+numactl -H</code></pre>
+<div class="warn"><strong>工程边界：</strong>offload 不是越多越好。训练节点要关注 NIC 与 GPU 是否在同一 NUMA/PCIe root complex，否则 offload 省下的 CPU 可能被跨 NUMA 内存访问吃掉。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. RDMA verbs、RoCE v2 vs InfiniBand、零拷贝原理</h2>
+<p>RDMA 的核心是把“远端通信”变成“NIC 执行内存操作”。应用先注册 memory region，得到 lkey/rkey；创建 queue pair（QP），里面有 send queue 和 receive queue；提交 work request（WR），NIC 执行 RDMA Write、RDMA Read、Send/Recv 或 atomic；完成后在 completion queue（CQ）产生 work completion（WC）。可靠连接 RC 模式常用于训练通信。</p>
+<pre class="mermaid">flowchart LR
+  app[应用/NCCL transport] --> mr[注册MR: pin pages + lkey/rkey]
+  app --> qp[创建QP: SQ/RQ]
+  qp --> wr[Post WR]
+  wr --> nic[NIC RDMA engine]
+  nic --> remote[远端MR]
+  nic --> cq[CQ产生WC]
+  cq --> app</pre>
+<table>
+<tr><th>项</th><th>RoCE v2</th><th>InfiniBand</th></tr>
+<tr><td>承载</td><td>UDP/IP over Ethernet</td><td>IB 专用链路与子网管理</td></tr>
+<tr><td>路由</td><td>可 L3 路由，适配以太网数据中心</td><td>IB fabric，常用 subnet manager</td></tr>
+<tr><td>拥塞</td><td>依赖 PFC/ECN/DCQCN 配置</td><td>原生 IB 拥塞与信用机制更完整</td></tr>
+<tr><td>成本与生态</td><td>易复用以太网交换机，但配置复杂</td><td>性能稳定，专用设备和运维体系</td></tr>
+<tr><td>常见风险</td><td>PFC storm、ECN 阈值、MTU 不一致</td><td>SM、LID、分区、专用运维门槛</td></tr>
+</table>
+<p>零拷贝不是没有任何数据移动，而是避免 CPU 在用户态 buffer、内核 buffer、socket buffer 之间反复复制。RDMA 要求内存注册和 pinning，这会消耗 IOMMU、页表和 NIC cache 资源；频繁注册小 buffer 反而慢，所以通信库通常做 memory registration cache。</p>
+<div class="danger"><strong>排查提醒：</strong>RDMA 把快路径交给硬件，也把错误从“应用异常”变成“QP error、CQE syndrome、fabric counter”。排查必须会看 <code>ibv_devinfo</code>、<code>rdma link</code>、<code>perfquery</code>、<code>ibstat</code>、<code>ethtool -S</code> 和 NCCL debug 日志。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. GPUDirect RDMA：GPU 到 NIC 的路径</h2>
+<p>没有 GPUDirect RDMA 时，GPU 数据跨机发送常需要 GPU HBM → host pinned memory → NIC → 网络 → 远端 host pinned memory → 远端 GPU HBM。每一步都占用 PCIe、CPU memory controller 和同步开销。GPUDirect RDMA 允许 NIC 直接 DMA 读写 GPU memory，CPU 主要负责建立映射、注册内存、提交 work request，不在数据路径上搬字节。</p>
+<pre class="mermaid">flowchart LR
+  subgraph Slow[传统路径]
+    g1[GPU HBM] --> h1[Host pinned memory]
+    h1 --> n1[NIC]
+  end
+  n1 --> net[Network]
+  net --> n2[NIC]
+  subgraph Fast[GPUDirect RDMA路径]
+    n2 --> g2[Remote GPU HBM]
+  end
+  cpu[CPU: setup/control only] -.-> n2
+  cpu -.-> g2</pre>
+<table>
+<tr><th>依赖项</th><th>为什么重要</th><th>常用验证</th></tr>
+<tr><td>GPU/NIC/driver/CUDA</td><td>决定是否支持 peer memory 和 DMA 映射</td><td><code>nvidia-smi</code>、driver 版本、CUDA 版本</td></tr>
+<tr><td><code>nvidia-peermem</code></td><td>让 NIC 能访问 GPU memory 映射</td><td><code>lsmod | grep nvidia_peermem</code></td></tr>
+<tr><td>PCIe topology</td><td>跨 socket 或绕远会吞掉理论收益</td><td><code>nvidia-smi topo -m</code>、<code>lspci -tv</code></td></tr>
+<tr><td>NCCL transport</td><td>确认没有 fallback 到 socket</td><td><code>NCCL_DEBUG=INFO</code>、查 <code>NET/IB</code> 与 <code>GDRDMA</code></td></tr>
+</table>
+<div class="success"><strong>工程原则：</strong>开启 GPUDirect RDMA 后还要验证 NCCL 是否真的选了 <code>NET/IB</code> 路径，而不是 fallback 到 socket；理论 bypass CPU memory 不等于拓扑和驱动一定给出最短路径。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 集合通信库与协议栈关系：NCCL → libfabric / verbs → driver</h2>
+<p>集合通信库负责把 AllReduce、Broadcast、AllGather、ReduceScatter 这类 collective 拆成拓扑感知的数据流。NCCL 会选择 ring、tree、CollNet、NVLS 等算法，决定 GPU 之间如何分块、流水、同步。底层 transport 可以是 NVLink/NVSwitch、PCIe P2P、shared memory、socket、IB/RoCE。libfabric、UCX 或 verbs 提供更接近硬件的通信抽象；driver 与 NIC firmware 最终把 WR 变成 DMA 和网络包。</p>
+<pre class="mermaid">flowchart TB
+  dl[PyTorch Distributed / Megatron / DeepSpeed] --> nccl[NCCL collectives]
+  nccl --> algo[Ring/Tree/CollNet/NVLS]
+  nccl --> transport[Transport选择]
+  transport --> nvlink[NVLink/NVSwitch]
+  transport --> shm[SHM/PCIe P2P]
+  transport --> net[NET: Socket or IB]
+  net --> lib[UCX/libfabric/verbs]
+  lib --> drv[Kernel driver + firmware]
+  drv --> nic[NIC + switch fabric]</pre>
+<pre><code>export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+export NCCL_IB_HCA=mlx5_0,mlx5_1
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_GID_INDEX=3
+export NCCL_NET_GDR_LEVEL=2</code></pre>
+<div class="note"><strong>排查入口：</strong>NCCL 报错时先看它选择了什么路径。不要只看 GPU utilization；通信慢可能体现为 GPU 等待、step time 拉长、SM 利用率下降，但根因在 fabric。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Worked example：8 节点 64-GPU AllReduce 慢一半</h2>
+<p>背景：一个 8 节点训练池，每节点 8 张 H100、8 张 400GbE RoCE v2 NIC，理论上单 rail 单向带宽约 50 GB/s。团队跑 64-GPU LLaMA 预训练，模型计算段稳定，但每个 step 从 1.8 s 变成 3.4 s。<code>nvidia-smi dmon</code> 看到 GPU SM 利用率在 backward 后掉到 20%-35%，NCCL 日志里 AllReduce 阶段耗时接近翻倍。单机 8-GPU benchmark 正常，所以怀疑跨节点网络。</p>
+<h3>先确认 NCCL 不是 socket fallback</h3>
+<pre><code>export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+torchrun --nnodes=8 --nproc_per_node=8 train.py 2&gt;&amp;1 | tee nccl.log
+grep -E "NET/IB|NET/Socket|GDRDMA|GID" nccl.log</code></pre>
+<p>日志显示 <code>NET/IB</code>、<code>GDRDMA</code> 均启用，说明没有退回 TCP socket。第二步跑基准，把模型因素拿掉：</p>
+<pre><code>/opt/nccl-tests/build/all_reduce_perf -b 64M -e 8G -f 2 -g 8
+ib_write_bw -d mlx5_0 -x 3 &lt;peer_ip&gt;</code></pre>
+<p>同机 NCCL bus bandwidth 可到 320-350 GB/s，跨 8 节点只有预期的一半左右；<code>ib_write_bw</code> 单连接偶尔能冲高，多连接后 P99 延迟明显抖动。第三步看端口与队列计数：</p>
+<pre><code>ethtool -S ens5f0 | egrep "ecn|pause|discard|timeout|rx_prio|tx_prio"
+ip -d link show ens5f0
+ping -M do -s 8972 10.20.3.17</code></pre>
+<p>这里出现两个关键线索：<code>ip link</code> 显示 MTU 1500；<code>ping -M do -s 8972</code> 返回 <code>Message too long</code> 或无响应；交换机侧 telemetry 显示 RoCE lossless 队列没有 ECN mark，PFC pause 帧却在拥塞时上升。也就是说，训练流量以 1500 MTU 产生大量小包，交换机出口队列更容易堆积；同时 ECN 没启用，DCQCN 收不到早期拥塞信号，只能等到 PFC 或丢包/超时后才退让。</p>
+<table>
+<tr><th>候选根因</th><th>证据</th><th>结论</th></tr>
+<tr><td>PCIe 拓扑问题</td><td>单节点或单 NIC peer-to-peer 未明显变慢</td><td>暂不支持</td></tr>
+<tr><td>NCCL 算法选错</td><td>日志 ring/tree 拓扑正常，不同消息大小曲线主要跨节点变差</td><td>不是主因</td></tr>
+<tr><td>socket fallback</td><td>日志出现 <code>NET/IB</code> 与 <code>GDRDMA</code></td><td>排除</td></tr>
+<tr><td>fabric 配置问题</td><td>跨节点慢、多流更慢、PFC pause 上升、ECN mark 为 0、MTU 1500</td><td>主因</td></tr>
+</table>
+<p>处理方案分两部分。节点侧把训练网卡、VLAN、bond 全部设为 MTU 9000，并持久化到 NetworkManager 或 netplan；交换机侧为 RoCE priority 开 ECN/WRED，设置合适 threshold，并确认 PFC 只对 RoCE lossless priority 生效而不是全局 pause。变更后逐跳验证：</p>
+<pre><code>ip link set ens5f0 mtu 9000
+ping -M do -s 8972 10.20.3.17
+for h in node{01..08}; do ssh $h "ip -br link | grep ens5f0"; done
+NCCL_DEBUG=INFO /opt/nccl-tests/build/all_reduce_perf -b 64M -e 8G -f 2 -g 8</code></pre>
+<div class="success"><strong>沉淀为 pre-flight：</strong>新节点入池前必须检查 MTU 端到端、RoCE GID index、PFC/ECN priority、NCCL <code>NET/IB</code> 与 <code>GDRDMA</code> 日志、<code>nccl-tests</code> 基线。训练网络的问题不能只靠“链路 up”验收。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>练习 0d-1（基础）</strong><br>画出一次 <code>send()</code> 到网卡发包的路径，标出用户态、syscall、TCP/IP、qdisc、driver、NIC queue、交换机，并说明每一层可能引入的排队。</div>
+<div class="card"><strong>练习 0d-2（基础）</strong><br>从初始序列号、双向可达性、旧包残留三个角度解释三次握手为什么不是两次。</div>
+<div class="card"><strong>练习 0d-3（基础）</strong><br>分别估算 1 GiB 数据在 MTU 1500 和 MTU 9000 下需要多少个包，忽略 header 后再讨论真实场景为什么会更复杂。</div>
+<div class="card"><strong>练习 0d-4（基础）</strong><br>给出一个接收端慢、一个网络拥塞的例子，并说明 receive window 与 congestion window 分别如何表现。</div>
+<div class="card"><strong>练习 0d-5（基础）</strong><br>列出 5 个常用网络排查命令，至少包含 <code>ss</code>、<code>ip</code>、<code>ethtool</code>、<code>ping -M do</code>、<code>tcpdump</code> 或 RDMA 工具中的一种。</div>
+<div class="card"><strong>练习 0d-6（基础）</strong><br>解释 RSS 为什么会影响多核收包性能，说明五元组 hash、receive queue、IRQ affinity、NUMA 之间的关系。</div>
+<div class="card"><strong>练习 0d-7（进阶）</strong><br>从拥塞信号、队列占用、公平性、长流吞吐四个维度比较 CUBIC 与 BBR，并说明 AI dataset 拉取场景更关心什么。</div>
+<div class="card"><strong>练习 0d-8（进阶）</strong><br>使用 MR、QP、WR、CQ、WC、rkey/lkey 这些术语串起一次 RDMA Write 的完整生命周期。</div>
+<div class="card"><strong>练习 0d-9（进阶）</strong><br>分析 RoCE v2 为什么需要 ECN/PFC，分别说明无损、近无损、拥塞提前反馈的作用，以及 PFC storm 的风险。</div>
+<div class="card"><strong>练习 0d-10（进阶）</strong><br>判断 NCCL 是否 fallback 到 socket：给出需要打开的环境变量、日志关键词、以及 fallback 后性能曲线通常会怎样变化。</div>
+<div class="card"><strong>练习 0d-11（设计）</strong><br>设计 32 节点训练网络验收清单，包含 MTU、subnet、GID index、ECN/PFC、<code>nccl-tests</code>、拓扑、告警指标和回滚条件。</div>
+<div class="card"><strong>练习 0d-12（设计）</strong><br>为推理服务 control plane 选择 IO 模型：在 20000 长连接、每连接低吞吐、P99 &lt; 50 ms 的前提下，比较 thread-per-connection、epoll、io_uring。</div>
+<div class="card"><strong>练习 0d-13（设计）</strong><br>给定每节点 8 GPU、8 NIC、双 socket，写出如何用 <code>nvidia-smi topo -m</code>、NUMA 信息和 NCCL 变量约束 GPU 与 NIC 亲和放置。</div>
+</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先用本章建立“应用 socket → Linux 协议栈 → NIC queue/offload → RDMA verbs → NCCL transport → GPU 通信等待”的路径感；再进入 <a href="../part1/02-compute-storage-network.html">第 2 章</a>理解算力、存储与网络如何共同限制 AI 系统上限。阅读训练并行章节前，建议回看本章的 MTU、RoCE、GPUDirect RDMA 和 NCCL 排查路径。</p>
+<p><strong>延伸阅读：</strong>W. Richard Stevens, <em>TCP/IP Illustrated, Volume 1</em>；Linux kernel networking、<code>io_uring</code>、TCP congestion control、NAPI、RPS/RFS 文档；NVIDIA NCCL User Guide；NVIDIA GPUDirect RDMA 文档；Mellanox/NVIDIA RDMA Aware Networks Programming User Manual；IETF RFC 9293、RFC 3168、RFC 9000；InfiniBand Architecture Specification；<code>man 7 socket</code>、<code>man 7 tcp</code>、<code>man 7 epoll</code>、<code>man 2 io_uring_setup</code>。</p>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 第 0d 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

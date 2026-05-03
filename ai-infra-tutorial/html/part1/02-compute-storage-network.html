@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 2 章 · 算力、存储与网络 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=02" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 2 章 · 算力、存储与网络</h1>
+<p class="sub">从“端到端结果必须穿过一条有限资源链路”出发，把 GPU、CPU、内存、存储、H2D、网络同步、队列和尾延迟放进同一个物理约束模型。</p>
+<div class="chips"><span class="chip">GPU 利用率</span><span class="chip">数据供给</span><span class="chip">H2D</span><span class="chip">AllReduce</span><span class="chip">KV Cache</span><span class="chip">p99</span></div>
+<div class="note"><strong>不可化简的问题：</strong>一个 AI 任务要把输入变成输出，必须取数、搬运、计算、同步、保存或返回；只要其中一段供给速度低于后续消费速度，整个系统就被最慢链路决定。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：资源链路</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">总图：AI 系统不是只有模型</a></li>
+<li><a class="anchor" href="#s4">算力、存储、网络是一条链路</a></li>
+<li><a class="anchor" href="#s5">算力的三层含义</a></li>
+<li><a class="anchor" href="#s6">存储为什么经常被低估</a></li>
+<li><a class="anchor" href="#s7">网络为什么不只是把包发过去</a></li>
+<li><a class="anchor" href="#s8">木桶效应与关键路径</a></li>
+<li><a class="anchor" href="#s9">定量分析框架</a></li>
+<li><a class="anchor" href="#s10">训练场景中的典型瓶颈</a></li>
+<li><a class="anchor" href="#s11">推理场景中的典型瓶颈</a></li>
+<li><a class="anchor" href="#s12">资源瓶颈排查方法</a></li>
+<li><a class="anchor" href="#s13">训练与推理的资源差异</a></li>
+<li><a class="anchor" href="#s14">工程案例</a></li>
+<li><a class="anchor" href="#s15">常见误区与优化原则</a></li>
+<li><a class="anchor" href="#s16">实战检查清单</a></li>
+<li><a class="anchor" href="#s17">核心记忆卡片</a></li>
+<li><a class="anchor" href="#s18">小结、练习与参考答案</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：为什么算力、存储与网络必须一起看</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>很多 AI 系统问题看起来发生在模型层，真正的瓶颈却早已在算力、存储和网络之间决定了上限。成熟的 AI 工程分析，不是先问“模型还能不能再优化”，而是先问：数据有没有按时送到？算力有没有被喂饱？通信有没有拖住整体？系统有没有被最慢的一段卡死？</p>
+<p>把所有术语先拿掉，只保留不可化简的问题：一个 AI 任务要把输入数据变成输出结果，必然要经历“取数、搬运、计算、同步、保存或返回”这些物理动作。每个动作都占用一种有限资源：存储负责把字节交出来，CPU 和内存负责解码、拼 batch、调度和缓存，PCIe / NVLink 负责把数据送到设备，GPU 负责高密度矩阵计算，网络负责跨机器同步或跨服务调用。只要其中一段供给速度低于后续消费速度，后续资源就会等待；只要其中一段尾延迟变大，端到端体验就会被拉长。这个问题不能被“更大模型”“更强 GPU”“更多机器”单独解决，因为系统吞吐不是某个部件的最大值，而是依赖链路上可持续供给能力的最小值。</p>
+<p>因此，本章的核心不是背诵“算力、存储、网络”三个名词，而是建立一个资源守恒视角：计算不会凭空发生，GPU 每算一次都需要权重、激活和输入数据已经在正确的显存位置；分布式训练每推进一步都需要各 rank 的梯度或参数状态达到一致；在线推理每返回一个 token 都要经过队列、模型服务、下游服务和客户端连接。所谓“GPU 利用率低”，本质上是昂贵计算单元处在等待状态；所谓“扩卡收益差”，本质上是新增计算能力被通信、同步、慢节点或调度开销吃掉；所谓“p99 很差”，本质上是某些请求走到了更慢的存储、网络或队列路径。先把这些物理约束看清楚，后面的机制才有意义。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“端到端结果必须穿过一条有限资源链路”出发，可以自然推出本章的每个机制。第一，既然 GPU 是高吞吐但高成本资源，就必须区分理论算力、可利用算力和系统级有效算力：规格表上的 TFLOPS 只是上限，真实吞吐还要乘以 utilization 和 scaling efficiency。于是我们需要理解 batch size、算子形状、显存带宽、kernel launch、CPU 调度和多卡同步如何让 GPU 被喂饱或饿住。</p>
+<p>第二，既然计算前必须有数据，就必须讨论存储层级和读取模式。容量只回答“放不放得下”，不能回答“能否稳定按 1GB/s、10GB/s 或更高速度供给”。大量小文件会把吞吐问题变成元数据问题；远端对象存储会把读取问题变成网络往返和尾延迟问题；checkpoint 会把训练推进问题变成写入带宽、fsync 语义、分片合并和恢复时间问题。所以本章会把数据加载、数据打包、热冷分层、本地 NVMe 缓存、checkpoint 写回放在同一条链路里看。</p>
+<p>第三，既然训练和推理都要搬运数据，就必须讨论 CPU 内存到 GPU 显存之间的 Host-to-Device 路径。样本从磁盘进入 Page Cache，再进入用户态 buffer，经过解码、增强、batch 拼接，最后通过 pinned memory 和 DMA 进入 GPU；NUMA 拓扑又会决定 CPU、内存、GPU、NIC 之间是不是走了本地路径。如果 pinned memory 没开、batch 太碎、worker 绑错 NUMA node，即使存储和 GPU 都很强，H2D 仍然可能成为关键路径。</p>
+<p>第四，既然多卡和多机任务需要共同推进，就必须讨论网络。数据并行需要 AllReduce，张量并行需要高频中间结果通信，Pipeline 并行需要 stage 之间传激活，MoE 需要 all-to-all token dispatch。在线推理虽然不一定做梯度同步，但会跨网关、路由、向量库、reranker、数据库、外部工具和日志系统；每个服务的 p99 都可能叠加成用户感知的卡顿。于是“网络”不只是带宽，还包括延迟、抖动、拓扑、重试、超时、拥塞和尾延迟放大。</p>
+<p>第五，既然所有资源都可能重叠工作，也可能互相等待，就需要关键路径和木桶效应。训练 step 不能只看 forward / backward，要拆成 load、preprocess、h2d、forward、backward、sync、update、checkpoint；推理请求不能只看模型执行，要拆成 queue、tokenize、prefill、decode、postprocess、downstream、return。只有把时间拆开，才能判断优化 tokenizer 省 2ms 是否值得，或者减少 AllReduce 50ms 是否比换更强 GPU 更有效。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((AI 系统资源链路))
+    不可化简问题
+      输入必须被取出
+      数据必须被搬运
+      计算必须被执行
+      状态必须被同步
+      结果必须被保存或返回
+    算力
+      理论 TFLOPS
+      可利用算力
+        batch size
+        算子形状
+        显存带宽
+        kernel launch
+      系统有效算力
+        utilization
+        scaling efficiency
+        慢 rank
+    存储
+      读取模式
+        小文件
+        shard
+        顺序读
+      Page Cache
+        cache hit
+        cache miss
+      checkpoint
+        分片写入
+        异步上传
+    数据搬运
+      CPU 内存
+      pinned memory
+      H2D
+      NUMA
+        GPU pinning
+        NIC affinity
+    网络
+      分布式训练
+        AllReduce
+        all-to-all
+        拓扑
+      在线推理
+        网关
+        下游服务
+        p99
+    工程判断
+      关键路径
+      木桶效应
+      端到端 trace</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>当 GPU utilization 只有 30% 时，如何判断它是在等数据、等 H2D、等通信，还是 batch / kernel 本身太小？</li>
+<li>为什么“存储容量足够”不能说明训练数据供给足够，应该额外检查哪些吞吐、延迟和读取模式指标？</li>
+<li>一个训练 step 为什么要拆成 load、preprocess、h2d、forward、backward、sync、update、checkpoint？</li>
+<li>Page Cache、pinned memory 和 NUMA 为什么会影响数据从磁盘到 GPU 的稳定性？</li>
+<li>为什么单卡快、多卡不一定线性加速，新增 GPU 可能被哪些通信或同步成本抵消？</li>
+<li>在线推理中为什么平均延迟正常但 p99 很差仍然是严重问题？</li>
+<li>面对一个慢系统，如何用“关键路径 + 木桶效应”决定先优化哪一段？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<div class="grid-2">
+<div class="card"><strong>资源边界</strong><br>区分算力、存储、网络在 AI 系统中的职责边界，并理解它们为什么不是平行名词。</div>
+<div class="card"><strong>链路拆解</strong><br>把训练 step 和推理请求拆成可观测的时间段，用关键路径判断优化优先级。</div>
+<div class="card"><strong>瓶颈识别</strong><br>识别 GPU 利用率低、step time 抖动、扩卡收益差、TTFT 高、p99 高背后的资源原因。</div>
+<div class="card"><strong>工程习惯</strong><br>建立“先看资源，再看模型；先拆链路，再谈优化”的排查习惯。</div>
+</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 先建立一个总图：AI 系统不是只有模型</h2>
+<p>很多初学者理解 AI 系统时，会把注意力集中在模型本身：</p>
+<pre><code>输入 -> 模型 -> 输出</code></pre>
+<p>但在真实工程里，模型只是系统链路中的一段。更真实的视角是：</p>
+<pre><code>数据 / 请求
+   ↓
+存储系统
+   ↓
+CPU / 内存 / 数据预处理
+   ↓
+GPU 显存
+   ↓
+GPU 计算
+   ↓
+网络通信 / 下游服务
+   ↓
+结果写回 / 响应返回</code></pre>
+<pre class="mermaid">flowchart LR
+  A[数据或请求] --> B[存储与对象服务]
+  B --> C[CPU 解码/预处理/Tokenize]
+  C --> D[Host 内存与 Page Cache]
+  D --> E[H2D: PCIe/NVLink]
+  E --> F[GPU 显存]
+  F --> G[GPU 计算]
+  G --> H{是否跨设备/服务}
+  H -->|训练| I[AllReduce/参数同步]
+  H -->|推理| J[向量库/工具/数据库]
+  I --> K[Checkpoint 或下一 step]
+  J --> L[流式返回/日志/Trace]</pre>
+<div class="warn"><strong>工程提醒：</strong>模型越大、数据越多、并发越高，系统问题就越不像单纯的模型问题，而越像资源调度、数据供给和尾延迟治理问题。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 算力、存储、网络不是平行名词，而是一条链路</h2>
+<p>以训练为例，一个 batch 的最简路径通常是：</p>
+<pre><code>存储 -> CPU 内存 -> 数据解码 / 预处理 -> GPU 显存 -> 前向计算 -> 反向计算 -> 梯度同步 -> 参数更新 -> checkpoint 写回</code></pre>
+<p>以推理为例，一次请求的最简路径通常是：</p>
+<pre><code>入口请求 -> 网关 -> 路由 -> 队列 -> tokenizer -> 模型加载 / 缓存 -> GPU prefill -> GPU decode -> 后处理 -> 响应返回</code></pre>
+<p>如果是 RAG 应用，推理链路还会更长：</p>
+<pre><code>用户问题 -> 网关 -> query rewrite -> embedding 模型 -> 向量检索 -> 文档召回 -> rerank -> prompt 拼接 -> LLM 推理 -> 输出流式返回</code></pre>
+<div class="note"><strong>第一判断：</strong>系统吞吐近似受 <code>min(计算吞吐上限, 存储供给上限, 网络供给上限)</code> 约束。它不是严格数学模型，但非常适合作为工程排查入口。</div>
+<table>
+<tr><th>概念</th><th>含义</th><th>AI 系统中的例子</th></tr>
+<tr><td>总工作量</td><td>整个系统所有模块加起来做了多少事情</td><td>数据读取、解码、前向、反向、同步、写 checkpoint</td></tr>
+<tr><td>关键路径</td><td>决定一次任务完成时间的最长依赖链</td><td>GPU 等数据、AllReduce 等最慢机器、请求排队等待</td></tr>
+</table>
+<p>优化系统时，不能只看某个局部模块有没有变快，而要看它是否在关键路径上。一次推理总延迟 200ms，如果 tokenizer 只有 3ms，把它优化到 1ms 只能省 2ms；如果 GPU decode 或下游检索各占几十毫秒，优先级通常更高。</p>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 算力在 AI 系统里到底意味着什么</h2>
+<h3>第一层：芯片理论计算能力</h3>
+<table>
+<tr><th>指标</th><th>含义</th><th>常见场景</th></tr>
+<tr><td>FLOPS</td><td>每秒浮点运算次数</td><td>通用计算能力描述</td></tr>
+<tr><td>TFLOPS</td><td>每秒万亿次浮点运算</td><td>GPU 规格表常见指标</td></tr>
+<tr><td>Tensor Core 吞吐</td><td>专门执行矩阵乘的硬件单元吞吐</td><td>深度学习训练 / 推理</td></tr>
+<tr><td>INT8 / FP16 / BF16 / FP8 吞吐</td><td>不同数值精度下的计算能力</td><td>推理量化、混合精度训练</td></tr>
+</table>
+<h3>第二层：可利用计算能力</h3>
+<p>真实任务能否把芯片吃满，取决于 batch 是否足够大、张量形状是否适合硬件、算子是否高效、内存访问是否连续、数据是否及时送到设备、CPU 是否成为调度瓶颈。</p>
+<div class="note"><strong>常见现象：</strong><code>GPU 理论很强，但利用率只有 20% - 40%</code>。这时不要立刻判断 GPU 不行，更可能是 GPU 没有被喂饱。</div>
+<h3>第三层：系统级有效算力</h3>
+<pre><code>有效算力 = 理论算力 × 利用率 × 扩展效率</code></pre>
+<table>
+<tr><th>表现</th><th>真正含义</th><th>典型处理方向</th></tr>
+<tr><td>单卡跑不动</td><td>设备本身计算或显存不够</td><td>换更强 GPU、混合精度、模型压缩、ZeRO、offload</td></tr>
+<tr><td>GPU 利用率低</td><td>设备没有被喂饱</td><td>优化 dataloader、增大 batch、缓存数据、融合算子</td></tr>
+<tr><td>扩卡收益差</td><td>设备之间协同效率差</td><td>优化通信、调整并行策略、减少同步频率、改善网络拓扑</td></tr>
+</table>
+<h3>计算密集型、访存密集型与通信密集型</h3>
+<table>
+<tr><th>类型</th><th>主要瓶颈</th><th>例子</th></tr>
+<tr><td>计算密集型</td><td>矩阵乘法速度</td><td>Transformer 中的大型 GEMM</td></tr>
+<tr><td>访存密集型</td><td>显存带宽 / cache 命中</td><td>LayerNorm、embedding lookup、部分小 batch 推理</td></tr>
+<tr><td>通信密集型</td><td>网络带宽和延迟</td><td>分布式 AllReduce、参数切分、MoE 路由</td></tr>
+</table>
+<p>一个直觉指标是 <code>计算强度 = 计算量 / 数据搬运量</code>。计算强度高，通常更容易吃满算力；计算强度低，就容易被内存带宽限制。</p>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 存储为什么经常被低估</h2>
+<p>AI 工程师很容易直觉性地盯着 GPU，但存储问题常常才是第一瓶颈。因为数据要先到，训练和推理才有东西可算。</p>
+<table>
+<tr><th>层次</th><th>典型介质</th><th>特征</th><th>常见用途</th></tr>
+<tr><td>冷存储</td><td>对象存储、数据湖、归档存储</td><td>容量大、便宜、延迟高</td><td>原始数据、历史 checkpoint、离线归档</td></tr>
+<tr><td>热存储</td><td>本地 SSD、NVMe、并行文件系统</td><td>吞吐高、延迟较低、成本较高</td><td>训练缓存、局部热点模型、临时数据集</td></tr>
+<tr><td>主存</td><td>DRAM</td><td>延迟低、容量有限</td><td>dataloader、预处理、中间缓存</td></tr>
+<tr><td>显存</td><td>HBM / GDDR</td><td>带宽极高、容量昂贵</td><td>权重、激活、梯度、KV Cache</td></tr>
+<tr><td>分布式缓存</td><td>Redis、Memcached、Feature Store 缓存</td><td>访问快、需要一致性策略</td><td>在线特征、热文档、路由元数据</td></tr>
+</table>
+<h3>读取模式比容量更关键</h3>
+<p>对象存储很便宜，不代表训练时直接读就足够。训练还要看吞吐、延迟、小文件数量、随机读取、解压解码、多机并发读取、checkpoint 写入是否干扰读取。</p>
+<p>大量小文件会把读取问题变成元数据问题。训练数据经常被打包成 WebDataset tar shards、TFRecord、Parquet、LMDB、Arrow 或自定义二进制 shard，目标是减少随机访问，把细碎 IO 变成更适合训练的顺序读取和批量读取。</p>
+<h3>数据加载链路</h3>
+<pre><code>远端存储 / 本地磁盘
+  -> 文件读取
+  -> 解压
+  -> 解码
+  -> 数据增强
+  -> batch 拼接
+  -> pinned memory
+  -> Host-to-Device 复制
+  -> GPU 显存</code></pre>
+<table>
+<tr><th>瓶颈点</th><th>表现</th><th>可能原因</th></tr>
+<tr><td>文件读取慢</td><td>dataloader 等待</td><td>远程存储延迟高、小文件太多</td></tr>
+<tr><td>CPU 解码慢</td><td>CPU 使用率高，GPU 等待</td><td>图片 / 视频解码过重</td></tr>
+<tr><td>数据增强慢</td><td>worker 忙不过来</td><td>augment 太复杂，worker 数不足</td></tr>
+<tr><td>H2D 慢</td><td>GPU 计算前等待</td><td>pinned memory 未使用，batch 太碎</td></tr>
+<tr><td>cache 不命中</td><td>step time 抖动</td><td>热数据没有缓存，远端存储波动</td></tr>
+</table>
+<h3>Page Cache / NUMA 如何影响数据到 GPU</h3>
+<p>训练数据从文件系统读出时，通常先经过 Linux Page Cache。热数据命中时 <code>t_load</code> 会下降；内存不足、checkpoint 写入产生大量脏页回写、数据集工作集远大于可用内存时，Page Cache 会频繁失效，表现为 step time 抖动、IO wait 升高或 major page fault 增加。完整机制可继续阅读 <a href="../part0/0b-memory-virtual-memory-and-io.html">§0b</a>。</p>
+<table>
+<tr><th>机制</th><th>影响点</th><th>典型症状</th><th>工程边界</th></tr>
+<tr><td>Page Cache</td><td><code>t_load</code>、重复读取、checkpoint 写回干扰</td><td>epoch 初慢后快、周期性 IO 抖动</td><td>适合热数据；不能把它当稳定缓存</td></tr>
+<tr><td>pinned memory</td><td><code>t_h2d</code>、异步 H2D 重叠</td><td>GPU compute 前等待、H2D copy 时间高</td><td>过量 pin 会挤压 Page Cache</td></tr>
+<tr><td>NUMA affinity</td><td>CPU 预处理、H2D、GPU / NIC 路径</td><td>同型号节点吞吐差异、跨 socket 带宽下降</td><td>需要结合拓扑绑定</td></tr>
+</table>
+<div class="warn"><strong>边界提醒：</strong><code>pin_memory=True</code> 只是让 Host 内存适合 DMA 和异步复制，不自动保证 dataloader worker、内存分配、GPU、NIC 都在正确 NUMA 路径上。</div>
+<h3>checkpoint 也是存储问题</h3>
+<p>大模型 checkpoint 可能包含模型权重、optimizer state、scheduler state、dataloader state、random seed、分布式 rank 状态和 ZeRO / FSDP 分片状态。文件可能达到几十 GB 到几百 GB。常见优化是异步 checkpoint、分片 checkpoint、先写本地 NVMe 再后台上传对象存储、降低保存频率、只保存必要状态或使用增量 checkpoint。</p>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 网络为什么不只是“把包发过去”</h2>
+<p>在 AI 系统里，网络至少影响三类事情：训练数据读取、分布式训练通信、在线推理调用链路。因此，网络既可能影响训练吞吐，也可能影响线上尾延迟。</p>
+<table>
+<tr><th>并行方式</th><th>网络通信内容</th><th>通信压力</th></tr>
+<tr><td>数据并行</td><td>梯度 AllReduce</td><td>和模型参数 / 梯度规模相关</td></tr>
+<tr><td>张量并行</td><td>中间激活 / partial result</td><td>高频、低延迟要求高</td></tr>
+<tr><td>Pipeline 并行</td><td>stage 之间传激活</td><td>与 micro-batch 和层切分相关</td></tr>
+<tr><td>ZeRO / FSDP</td><td>参数、梯度、optimizer state 分片通信</td><td>通信复杂度高</td></tr>
+<tr><td>MoE</td><td>token 路由到不同 expert</td><td>all-to-all 通信压力大</td></tr>
+</table>
+<pre class="mermaid">sequenceDiagram
+  participant R0 as Rank 0
+  participant R1 as Rank 1
+  participant R2 as Rank 2
+  participant FS as Checkpoint/Storage
+  R0->>R0: load + forward + backward
+  R1->>R1: load + forward + backward
+  R2->>R2: load + forward + backward
+  R0-->>R1: gradient shard / AllReduce
+  R1-->>R2: gradient shard / AllReduce
+  R2-->>R0: gradient shard / AllReduce
+  R0->>R0: optimizer update
+  R1->>R1: optimizer update
+  R2->>R2: optimizer update
+  R0->>FS: checkpoint shard
+  R1->>FS: checkpoint shard
+  R2->>FS: checkpoint shard</pre>
+<p>在线推理经常不是只有一次模型调用。LLM 应用可能经过客户端、API 网关、鉴权、限流、prompt 组装、模型服务、向量库、reranker、工具调用、数据库、日志系统和流式响应。一个下游服务平均 20ms 不一定可怕，可怕的是 p99 可能是 500ms，并且会被重试和串联调用放大。</p>
+<div class="danger"><strong>严重风险：</strong>没有超时、熔断和降级的 RAG / Agent 链路，少数慢依赖会把整体 p99 拉到不可接受的范围，甚至通过重试放大负载。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 三类资源如何形成“木桶效应”</h2>
+<p>现实中的 AI 系统瓶颈通常长这样：GPU 算力强但数据加载慢；模型放得下显存但多机同步太慢；在线推理单实例很快但扩容慢、冷启动重；checkpoint 写入太慢导致训练周期性卡顿；KV Cache 占满显存导致并发上不去；网络 p99 抖动导致整体服务 p99 被放大。</p>
+<pre><code>算力桶板很高
+存储桶板中等
+网络桶板较低
+=> 系统出水速度仍然取决于最短那块板</code></pre>
+<table>
+<tr><th>问题</th><th>说明</th></tr>
+<tr><td>GPU 是否在等数据？</td><td>如果是，先查存储和 dataloader。</td></tr>
+<tr><td>GPU 是否在等通信？</td><td>如果是，先查 AllReduce、拓扑、并行策略。</td></tr>
+<tr><td>请求是否在排队？</td><td>如果是，先查容量、并发、batching、限流。</td></tr>
+<tr><td>延迟是否集中在下游？</td><td>如果是，先查向量库、数据库、工具调用。</td></tr>
+<tr><td>p99 是否远高于 p50？</td><td>如果是，先查抖动、重试、热点、GC、冷启动。</td></tr>
+</table>
+<table>
+<tr><th>阶段</th><th>常见瓶颈</th><th>说明</th></tr>
+<tr><td>数据准备</td><td>存储、CPU、ETL</td><td>数据清洗、格式转换、去重、切分</td></tr>
+<tr><td>预训练</td><td>GPU、网络、checkpoint</td><td>大规模并行、长时间训练、容错</td></tr>
+<tr><td>微调</td><td>显存、数据加载</td><td>数据量较小但实验频繁</td></tr>
+<tr><td>离线评测</td><td>调度、存储、推理吞吐</td><td>大量模型版本和数据集组合</td></tr>
+<tr><td>在线推理</td><td>显存、KV Cache、尾延迟</td><td>并发、流式输出、SLA</td></tr>
+<tr><td>RAG 应用</td><td>向量库、rerank、网络</td><td>多服务链路叠加</td></tr>
+<tr><td>Agent 应用</td><td>工具调用、外部 API</td><td>不确定性和长链路放大</td></tr>
+</table>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 一个简单的定量分析框架</h2>
+<p>面对训练或推理吞吐问题时，先问四个量：每个样本 / 请求大约需要多少计算？需要搬多少数据？每秒能提供多少带宽？链路里哪一段最容易抖动？</p>
+<h3>训练 step 拆解</h3>
+<pre><code>step time ≈ t_load + t_preprocess + t_h2d + t_forward + t_backward + t_sync + t_update + t_checkpoint</code></pre>
+<table>
+<tr><th>符号</th><th>含义</th><th>常见瓶颈</th></tr>
+<tr><td><code>t_load</code></td><td>从存储读取数据</td><td>远程 IO、小文件、元数据</td></tr>
+<tr><td><code>t_preprocess</code></td><td>解码、清洗、增强</td><td>CPU 不够、worker 不够</td></tr>
+<tr><td><code>t_h2d</code></td><td>CPU 到 GPU 拷贝</td><td>PCIe、pinned memory、batch 太碎</td></tr>
+<tr><td><code>t_forward</code></td><td>前向计算</td><td>GPU 算力、算子效率</td></tr>
+<tr><td><code>t_backward</code></td><td>反向计算</td><td>显存、重计算、梯度规模</td></tr>
+<tr><td><code>t_sync</code></td><td>梯度 / 参数同步</td><td>网络、拓扑、并行策略</td></tr>
+<tr><td><code>t_update</code></td><td>optimizer 更新</td><td>optimizer state、显存带宽</td></tr>
+<tr><td><code>t_checkpoint</code></td><td>保存状态</td><td>存储写入、分片合并</td></tr>
+</table>
+<h3>推理延迟拆解</h3>
+<pre><code>request latency ≈ t_queue + t_tokenize + t_prefill + t_decode + t_postprocess + t_downstream + t_return</code></pre>
+<table>
+<tr><th>符号</th><th>含义</th><th>说明</th></tr>
+<tr><td><code>t_queue</code></td><td>排队时间</td><td>并发高时显著增加</td></tr>
+<tr><td><code>t_tokenize</code></td><td>分词时间</td><td>prompt 很长时不可忽视</td></tr>
+<tr><td><code>t_prefill</code></td><td>处理输入 prompt</td><td>与输入 token 数相关</td></tr>
+<tr><td><code>t_decode</code></td><td>逐 token 生成</td><td>与输出 token 数相关</td></tr>
+<tr><td><code>t_downstream</code></td><td>下游调用</td><td>向量库、数据库、工具、外部 API</td></tr>
+<tr><td><code>t_return</code></td><td>返回给客户端</td><td>网络、流式传输、客户端连接</td></tr>
+</table>
+<div class="note"><strong>LLM 推理关键指标：</strong>TTFT 决定用户多久看到模型开始回答，TPOT 决定模型输出是否流畅。</div>
+<h3>带宽与显存估算</h3>
+<pre><code>4MB × batch size 256 = 1024MB ≈ 1GB
+目标 step time 500ms => 至少需要 2GB/s 稳定数据供给</code></pre>
+<pre><code>训练显存 ≈ 参数 + 梯度 + optimizer state + 激活 + 临时 buffer
+推理显存 ≈ 模型权重 + KV Cache + 临时 buffer</code></pre>
+<p>有时模型能加载进显存，但并发一高就 OOM。这不是模型加载问题，而是 KV Cache 和运行时状态随上下文长度、并发数一起增长。</p>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 训练场景中的典型瓶颈</h2>
+<h3>GPU 利用率锯齿化</h3>
+<p>表现为 GPU 利用率一会儿 90%，一会儿 10%，step time 忽快忽慢。常见原因包括 dataloader worker 不足、数据在远程对象存储上、小文件太多、CPU 解码或数据增强太慢、batch 构造复杂、没有预取、H2D 没有和计算重叠。</p>
+<h3>单卡很快，多卡变慢</h3>
+<p>表现为 1 卡正常，8 卡没有明显加速，16 卡以后速度反而下降。常见原因包括 AllReduce 通信太重、batch size 切得太小、多机网络带宽不足、节点间拓扑差异大、慢卡或慢节点拖住整体、checkpoint 多 rank 写入冲突。</p>
+<h3>checkpoint 导致周期性卡顿</h3>
+<p>表现为每隔 N step 训练突然卡住几十秒甚至几分钟。排查时分别记录 checkpoint 前后耗时、本地写入和远端上传耗时；优化方向包括降低保存频率、异步保存、分片 checkpoint、避免所有 rank 同时写同一个元数据热点。</p>
+<pre class="mermaid">flowchart TD
+  A[训练变慢] --> B{GPU 利用率低?}
+  B -->|是| C[查 load/preprocess/H2D/batch]
+  B -->|否| D{单卡快多卡慢?}
+  D -->|是| E[查 AllReduce/拓扑/慢 rank]
+  D -->|否| F{周期性卡顿?}
+  F -->|是| G[查 checkpoint/日志/GC/定时任务]
+  F -->|否| H[做端到端 profile]
+  C --> I[小文件打包/本地缓存/预取/pinned memory]
+  E --> J[NCCL 配置/通信重叠/并行策略]
+  G --> K[异步或分片 checkpoint]</pre>
+<div class="success"><strong>训练排查顺序：</strong>先看 GPU utilization 曲线是否周期性掉下去，再看 CPU、dataloader 等待、存储吞吐、H2D 时间、通信时间和每个 rank 的耗时差异。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 推理场景中的典型瓶颈</h2>
+<h3>首 token 慢</h3>
+<p>用户提交问题后很久才看到第一个 token，但开始输出后速度还可以。常见原因是请求排队、prompt 太长、prefill 时间长、模型冷启动、tokenizer 或 prompt 拼接慢、RAG 检索 / rerank 慢、上游网关或鉴权慢。</p>
+<h3>输出 token 慢</h3>
+<p>第一个 token 不慢，但后续一个字一个字慢慢出来。常见原因是 decode 阶段算力不足、batch 调度不合理、KV Cache 压力大、显存带宽瓶颈、输出太长、量化或 kernel 实现不佳。</p>
+<h3>并发一高就 OOM</h3>
+<p>单请求正常，并发高时显存爆掉。常见原因是 KV Cache 随并发和上下文增长、batch 太大、没有限制 max context length、长短请求混排、没有显存池化或分页管理。</p>
+<h3>平均延迟正常，p99 很差</h3>
+<p>大多数请求很快，但少数请求极慢。常见原因包括下游服务偶发抖动、冷启动、缓存击穿、大 prompt 或超长输出、网络重试、GC 或资源争抢、长请求阻塞短请求。</p>
+<table>
+<tr><th>现象</th><th>优先检查</th><th>典型优化</th></tr>
+<tr><td>TTFT 高</td><td>queue、tokenize、prefill、RAG</td><td>控制 prompt、缓存上下文、并行 RAG、减少冷启动</td></tr>
+<tr><td>TPOT 高</td><td>decode、batch、KV Cache、显存带宽</td><td>continuous batching、量化、KV 管理、限制输出长度</td></tr>
+<tr><td>并发 OOM</td><td>KV Cache、上下文长度、batch 上限</td><td>paged attention、长短请求分级、并发上限</td></tr>
+<tr><td>p99 差</td><td>慢依赖、冷启动、缓存击穿、重试</td><td>超时、熔断、降级、端到端 trace</td></tr>
+</table>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 资源瓶颈排查方法：从现象到原因</h2>
+<p>工程排查最怕直接猜。正确顺序应该是：</p>
+<pre><code>观察现象 -> 拆解链路 -> 采集指标 -> 定位瓶颈 -> 小步验证 -> 再做优化</code></pre>
+<table>
+<tr><th>资源</th><th>关键指标</th><th>说明</th></tr>
+<tr><td>GPU</td><td>utilization、memory used、SM occupancy、显存带宽</td><td>判断是否吃满、是否 OOM</td></tr>
+<tr><td>CPU</td><td>utilization、load average、上下文切换</td><td>判断预处理和调度压力</td></tr>
+<tr><td>内存</td><td>used、cache、page fault</td><td>判断是否频繁换页或缓存不足</td></tr>
+<tr><td>存储</td><td>read/write throughput、IOPS、latency</td><td>判断数据读取和 checkpoint</td></tr>
+<tr><td>网络</td><td>bandwidth、packet loss、RTT、p99 latency</td><td>判断通信和下游调用</td></tr>
+<tr><td>服务</td><td>QPS、并发、队列长度、p50/p99</td><td>判断线上容量和尾延迟</td></tr>
+<tr><td>训练</td><td>step time、tokens/s、samples/s、loss scale</td><td>判断训练效率和稳定性</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[系统慢] --> B{GPU 利用率低?}
+  B -->|是| C[数据加载 / CPU 预处理 / H2D / batch size]
+  B -->|否| D{单卡快多卡慢?}
+  D -->|是| E[通信 / 同步 / 拓扑 / 慢节点]
+  D -->|否| F{延迟主要在排队?}
+  F -->|是| G[容量 / 并发 / batching / 扩容 / 限流]
+  F -->|否| H{p99 远高于 p50?}
+  H -->|是| I[抖动 / 冷启动 / 缓存击穿 / 长请求 / 下游服务]
+  H -->|否| J{周期性卡顿?}
+  J -->|是| K[checkpoint / 日志 / GC / 定时任务]
+  J -->|否| L[端到端 trace 和 profile]</pre>
+<div class="warn"><strong>不要一上来就重写：</strong>换 GPU、改模型、改并行策略、重写服务都可能有效，但没有找到真正瓶颈时，很容易做无用功。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 训练与推理的资源差异</h2>
+<table>
+<tr><th>对比项</th><th>训练</th><th>推理</th></tr>
+<tr><td>目标</td><td>高吞吐、稳定训练、成本可控</td><td>低延迟、高并发、稳定 SLA</td></tr>
+<tr><td>主要输入</td><td>大规模训练数据</td><td>在线请求、prompt、上下文</td></tr>
+<tr><td>算力压力</td><td>前向 + 反向 + optimizer</td><td>prefill + decode</td></tr>
+<tr><td>显存压力</td><td>参数、梯度、激活、optimizer state</td><td>权重、KV Cache、batch runtime state</td></tr>
+<tr><td>存储压力</td><td>数据集读取、checkpoint 保存</td><td>模型加载、缓存、RAG 文档读取</td></tr>
+<tr><td>网络压力</td><td>多卡 / 多机同步</td><td>网关、下游服务、流式返回</td></tr>
+<tr><td>典型指标</td><td>samples/s、tokens/s、step time、MFU</td><td>QPS、TTFT、TPOT、p99、错误率</td></tr>
+<tr><td>常见优化</td><td>混合精度、并行策略、数据缓存</td><td>batching、量化、KV Cache、限流降级</td></tr>
+</table>
+<p>训练通常是离线任务，核心目标是在给定成本下尽快完成训练；推理面对在线用户，不只关注吞吐，还必须关注首 token 时间、每 token 生成速度、p95 / p99 尾延迟、高并发稳定性和异常请求隔离。</p>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 工程案例</h2>
+<h3>为什么 GPU 很强，训练还是慢？</h3>
+<p>某团队用 8 张 GPU 训练图像模型，GPU 利用率只有 35% 左右。监控显示 GPU utilization 周期性从 90% 掉到 10%，CPU utilization 接近 100%，step time 波动很大，存储读取是大量小文件随机读取。</p>
+<pre><code>对象存储 -> 小图片读取 -> CPU 解码 -> 数据增强 -> batch -> GPU</code></pre>
+<p>真正瓶颈不是 GPU，而是小文件远程读取、CPU 解码和数据增强。团队把小文件打包成 shard，将热数据缓存到本地 NVMe，增加 dataloader worker，简化部分 CPU 数据增强，使用 pinned memory 并开启预取，最终 GPU 利用率和 step time 稳定性明显改善。</p>
+<h3>为什么 RAG 应用平均很快，但用户仍然觉得卡？</h3>
+<p>某 RAG 问答系统平均响应时间只有 1.2 秒，但用户反馈经常卡住。进一步看指标：</p>
+<pre><code>p50: 1.0s
+p90: 2.5s
+p99: 12s</code></pre>
+<p>链路拆解后发现少数文档从远程存储加载非常慢：</p>
+<pre><code>用户问题
+  -> embedding: 80ms
+  -> 向量检索: 120ms
+  -> 文档加载: 50ms - 8s 不等
+  -> rerank: 200ms
+  -> LLM: 700ms - 2s</code></pre>
+<p>优化方向是给文档加载增加缓存、设置远程存储超时、对慢文档降级、给检索链路做 trace、单独监控 p99、将热门文档放到热存储。</p>
+<div class="success"><strong>案例结论：</strong>GPU 慢不一定是 GPU 的问题；平均延迟好不代表用户体验好。系统慢，先看链路最短板和尾延迟来源。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 常见误区与优化原则</h2>
+<div class="grid-2">
+<div class="card"><strong>误区：GPU 利用率低，就是 GPU 不行</strong><br>正确问法：GPU 是在计算，还是在等待？如果在等待，它等的是数据、通信，还是队列？</div>
+<div class="card"><strong>误区：对象存储够大，就足够做训练存储</strong><br>正确问法：数据是大文件顺序读，还是小文件随机读？多机并发读是否稳定？</div>
+<div class="card"><strong>误区：网络只影响分布式训练</strong><br>正确问法：请求链路跨了多少服务？每个服务的 p99 是多少？有没有重试和超时放大？</div>
+<div class="card"><strong>误区：平均延迟低，用户体验就好</strong><br>正确问法：慢请求来自哪里？是长 prompt、长输出、冷启动、下游抖动，还是排队？</div>
+<div class="card"><strong>误区：扩卡一定能提升训练速度</strong><br>正确问法：新增 GPU 带来的计算收益，是否大于新增通信代价？</div>
+<div class="card"><strong>误区：显存能放下模型，就能支撑高并发</strong><br>正确问法：模型权重占多少？KV Cache 在目标并发和上下文长度下占多少？</div>
+</div>
+<h3>资源优化的基本原则</h3>
+<ol>
+<li>先定位瓶颈，再优化；没有测量，就没有优化。</li>
+<li>优先补短板，不要继续抬高已经足够高的桶板。</li>
+<li>让资源重叠工作：CPU 预处理下一批，GPU 计算当前 batch，网络异步同步，后台写 checkpoint。</li>
+<li>把随机访问变成大块、顺序、批量、可预取的访问。</li>
+<li>控制尾延迟：超时、熔断、降级、缓存、限流、长短请求隔离、热点预加载。</li>
+<li>把成本当成资源指标：单位 token 成本、单位样本训练成本、单位 QPS 成本、失败重跑成本、存储和网络成本。</li>
+</ol>
+<div class="danger"><strong>成本风险：</strong>一个更快但贵很多的方案，不一定是更好的方案；AI Infra 优化必须同时看效果、延迟、稳定性和成本。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 实战检查清单</h2>
+<h3>训练任务检查清单</h3>
+<pre><code>[ ] GPU 利用率是否稳定？
+[ ] step time 是否稳定？
+[ ] dataloader 是否成为瓶颈？
+[ ] CPU 是否满载？
+[ ] 数据是否在远程存储？
+[ ] 是否存在大量小文件？
+[ ] 是否使用本地缓存？
+[ ] H2D 拷贝是否慢？
+[ ] 单卡和多卡性能差距是否合理？
+[ ] 通信时间占比是否过高？
+[ ] checkpoint 是否造成周期性卡顿？
+[ ] 是否有慢节点或慢 rank？</code></pre>
+<h3>推理服务检查清单</h3>
+<pre><code>[ ] 慢的是首 token，还是后续 token？
+[ ] 请求是否在队列里等待？
+[ ] prompt 是否过长？
+[ ] 输出是否过长？
+[ ] GPU 显存是否被 KV Cache 占满？
+[ ] batch 调度是否合理？
+[ ] 是否有冷启动？
+[ ] RAG / 工具 / 数据库调用是否慢？
+[ ] p99 是否远高于 p50？
+[ ] 是否有超时、熔断、降级？
+[ ] 长请求是否拖累短请求？
+[ ] 是否有缓存击穿或热点问题？</code></pre>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 本章核心记忆卡片</h2>
+<div class="grid-3">
+<div class="card"><strong>吞吐由最短板决定</strong><br><code>系统吞吐 ≈ min(计算上限, 存储上限, 网络上限)</code></div>
+<div class="card"><strong>GPU 慢不一定是 GPU 的问题</strong><br>GPU 利用率低说明 GPU 没在持续计算，原因可能是数据、CPU、H2D、通信或队列。</div>
+<div class="card"><strong>训练 step 要拆开看</strong><br><code>load + preprocess + h2d + forward + backward + sync + update + checkpoint</code></div>
+<div class="card"><strong>推理延迟分两段看</strong><br>TTFT 是多久开始回答，TPOT 是回答过程是否流畅。</div>
+<div class="card"><strong>扩卡收益不是线性的</strong><br>扩卡是否值得，取决于新增计算收益是否大于新增通信代价。</div>
+<div class="card"><strong>在线系统看 p99</strong><br>用户体验常常由 p95 / p99 决定，而不是平均值。</div>
+</div>
+</section>
+
+<section class="section" id="s18">
+<h2>18. 小结、练习与参考答案</h2>
+<table>
+<tr><th>资源</th><th>在 AI 系统中的主要职责</th><th>常见瓶颈表现</th><th>典型优化方向</th></tr>
+<tr><td>算力</td><td>承担训练和推理执行</td><td>GPU 不饱和、扩卡收益差、decode 慢</td><td>增大 batch、算子优化、混合精度、并行策略、推理引擎优化</td></tr>
+<tr><td>存储</td><td>承担数据、模型、checkpoint 供给</td><td>数据加载慢、checkpoint 抖动、小文件随机读</td><td>数据打包、本地缓存、异步 checkpoint、热冷分层</td></tr>
+<tr><td>网络</td><td>承担同步、访问和跨服务调用</td><td>AllReduce 慢、尾延迟高、下游服务抖动</td><td>拓扑优化、通信重叠、超时降级、链路 trace</td></tr>
+<tr><td>显存</td><td>承担权重、激活、KV Cache</td><td>OOM、并发上不去、上下文受限</td><td>量化、分页 KV Cache、并行切分、限制上下文</td></tr>
+<tr><td>CPU / 内存</td><td>承担调度、预处理、缓存</td><td>数据增强慢、tokenizer 慢、worker 忙</td><td>多 worker、预取、缓存、异步化</td></tr>
+</table>
+<div class="note"><strong>本章最重要的思想：</strong>AI 系统不是模型孤岛，而是一条资源链路。算力、存储、网络共同决定上限。优化前先拆链路，拆完再找最短板。</div>
+<h3>练习题</h3>
+<ol>
+<li>为什么说 AI 系统吞吐通常由最慢的一段决定？请用水管或木桶模型解释。</li>
+<li>对象存储、SSD、主存、显存分别适合放什么类型的数据？</li>
+<li>为什么网络既会影响训练吞吐，也会影响线上推理时延？</li>
+<li>请把一个训练 step 拆成至少 8 个时间段，并说明每段可能的瓶颈。</li>
+<li>为什么 GPU 利用率低不一定说明 GPU 性能差？</li>
+<li>什么是 TTFT？什么是 TPOT？它们分别影响用户的什么体验？</li>
+<li>一个推理服务 p50 为 800ms，p99 为 9s。你会如何排查？</li>
+<li>某 LLM 服务模型权重可以放进显存，但并发升高后 OOM。请分析可能原因。</li>
+</ol>
+<h3>参考答案要点</h3>
+<ul>
+<li>吞吐由最慢的一段决定，因为后续阶段必须等待前面阶段提供输入，整体吞吐无法超过最慢阶段的稳定供给能力。</li>
+<li>对象存储适合原始数据和归档；SSD / NVMe 适合训练热数据和临时缓存；主存适合 dataloader 队列和中间缓存；显存适合权重、激活、梯度和 KV Cache。</li>
+<li>网络在训练中负责数据读取、梯度同步、参数广播、分布式 checkpoint；在推理中负责网关、模型服务、向量库、数据库、工具调用和流式响应。</li>
+<li>训练 step 可拆成 load、preprocess、h2d、forward、backward、sync、update、checkpoint。</li>
+<li>GPU 利用率低说明 GPU 没有持续计算，原因可能是数据加载慢、CPU 预处理慢、H2D 慢、通信等待、队列等待、batch 太小或算子调度低效。</li>
+<li>TTFT 是首 token 时间，决定用户多久看到模型开始响应；TPOT 是每个输出 token 的生成时间，决定输出是否流畅。</li>
+</ul>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<h3>参考资料</h3>
+<ul>
+<li><a href="../part0/0b-memory-virtual-memory-and-io.html">§0b · 内存、虚拟内存与 IO</a>：理解 Page Cache、换页、IO wait、NUMA 与数据搬运。</li>
+<li><a href="../part0/0c-filesystems-and-storage-internals.html">§0c · 文件系统与存储内核</a>：理解小文件、元数据、写回、fsync 与 checkpoint 写入。</li>
+<li><a href="../part0/0d-network-stack-fundamentals.html">§0d · 网络协议栈基础</a>：理解 RTT、丢包、重试、拥塞和尾延迟。</li>
+</ul>
+<h3>学习路线</h3>
+<ol>
+<li>先把本章的训练 step 和推理请求拆解公式背熟，用它们作为排查模板。</li>
+<li>回到 <a href="../part0/0b-memory-virtual-memory-and-io.html">§0b</a> 理解 Page Cache、虚拟内存、IO 与 NUMA 的底层机制。</li>
+<li>继续学习 <a href="../part2/04-gpu-and-accelerators.html">第 4 章</a>、<a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 和 <a href="../part2/06-cuda-runtime-and-kernels.html">第 6 章</a>，把 GPU、互联和 CUDA 执行模型补齐。</li>
+<li>进入训练章节时，用本章框架理解数据并行、模型并行、checkpoint 与恢复。</li>
+<li>进入推理章节时，用 TTFT、TPOT、KV Cache、batching 和 p99 重新审视在线服务。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>GPU 架构与 Tensor Core 基础。</li>
+<li>CUDA kernel、算子融合与显存带宽。</li>
+<li>数据并行、张量并行、Pipeline 并行、ZeRO / FSDP。</li>
+<li>NCCL、AllReduce 与分布式训练通信。</li>
+<li>大模型推理系统：continuous batching、paged attention、KV Cache。</li>
+<li>RAG 系统的检索链路与尾延迟治理。</li>
+<li>AI Infra 中的 metrics、logs、traces、profiling 与容量规划。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

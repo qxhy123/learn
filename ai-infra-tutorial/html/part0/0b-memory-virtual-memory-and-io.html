@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0b 章 · 内存、虚拟内存与 IO — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0b 章 · 内存、虚拟内存与 IO</h1>
+<p class="sub">从“连续私有地址空间如何映射到分散共享硬件资源”出发，建立虚拟内存、页缓存、NUMA、系统调用、PCIe、DMA 与 GPU 数据通路之间的第一性因果链。</p>
+<div class="chips"><span class="chip">虚拟内存</span><span class="chip">Page Cache</span><span class="chip">NUMA</span><span class="chip">PCIe</span><span class="chip">DMA</span><span class="chip">Pinned Memory</span></div>
+<div class="note"><strong>不可化简的问题：</strong>程序看到的是连续、私有、可随意分配的地址空间，硬件拥有的却是分散、共享、有限、分层且速度差异巨大的物理资源；系统必须在正确性、隔离、吞吐、延迟和可回收性之间做动态映射。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：内存、虚拟内存与 IO</a></li>
+<li><a class="anchor" href="#s2">物理 / 虚拟内存 / 页表 / TLB</a></li>
+<li><a class="anchor" href="#s3">Page Cache / 脏页回写 / vm.dirty_ratio</a></li>
+<li><a class="anchor" href="#s4">Huge Pages：THP vs explicit</a></li>
+<li><a class="anchor" href="#s5">NUMA：node 亲和、numactl、GPU pinning</a></li>
+<li><a class="anchor" href="#s6">用户态 / 内核态 / syscall：context switch、io_uring / epoll</a></li>
+<li><a class="anchor" href="#s7">PCIe：lane / 代际、topology、GPU↔NIC↔CPU 路径</a></li>
+<li><a class="anchor" href="#s8">DMA、page-locked memory、cudaMemcpyAsync</a></li>
+<li><a class="anchor" href="#s9">Worked example：H2D 带宽上不去</a></li>
+<li><a class="anchor" href="#s10">练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：内存、虚拟内存与 IO</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>AI 系统里的训练与推理并不是“GPU 在算”这么简单。GPU 每秒可以消耗数百 GB 甚至数 TB 的数据，但数据必须先从磁盘、Page Cache、用户态缓冲区、CPU 内存、PCIe/NVLink、网卡或别的 GPU 走到它能访问的位置。不可化简的问题是：程序看到的是连续、私有、可随意分配的地址空间，硬件拥有的却是分散、共享、有限、分层且速度差异巨大的物理资源；系统必须在正确性、隔离、吞吐、延迟和可回收性之间做动态映射。</p>
+<p>如果没有虚拟内存，每个进程都要知道真实物理地址，进程之间无法可靠隔离，<code>mmap</code> 大模型权重、fork DataLoader worker、共享内存队列都会变成危险操作。如果没有 Page Cache，每次读 dataset shard 都必须真的打到磁盘，训练吞吐会被 NVMe 或网络存储抖动拖住。如果没有 DMA 和 pinned memory，GPU 拷贝必须让 CPU 逐字节搬运，<code>cudaMemcpyAsync</code> 也无法真正异步。如果不理解 NUMA，8 张 GPU 的机器上可能出现“GPU0 绑定在 socket0，DataLoader 却在 socket1 分配内存”的反直觉慢路径。内存与 IO 的核心不是背术语，而是判断每一个 byte 的所有权、位置、迁移路径和阻塞点。</p>
+<p>这也是为什么 AI Infra 里的很多性能问题不能只看单个指标。RSS 很高不一定代表每个进程都独占了同样多的物理内存，可能是 copy-on-write、共享映射或 Page Cache 的统计口径；第二轮数据读取变快不一定是模型优化，可能是 Page Cache 命中；<code>non_blocking=True</code> 不一定说明 H2D 拷贝已经异步，host buffer 是否 pinned 才是前提；PCIe 4.0 x16 的理论带宽不等于实际吞吐，NUMA 位置、copy engine、IOMMU、batch 大小和并发 stream 都会把理论路径变成真实路径。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>第一步，进程需要一个稳定的地址幻觉，于是有虚拟内存；虚拟地址要落到物理页，于是有页表；页表查询太慢，于是有 TLB；TLB miss 会把一次普通 load 变成页表遍历甚至 page fault。第二步，磁盘与网络存储比 DRAM 慢几个数量级，于是内核把文件页缓存到内存里形成 Page Cache；写入不能每次同步落盘，于是有脏页、后台回写和 <code>vm.dirty_ratio</code>，但这也让 checkpoint 写入出现“前面很快，最后突然卡住”的行为。第三步，4 KiB 页在大数组、PyTorch allocator arena、embedding table 上会制造大量页表项和 TLB 压力，于是有 Transparent Huge Pages（THP）和显式 HugeTLB；前者自动但可能引入延迟尖峰，后者可控但需要预留。</p>
+<p>第四步，现代服务器不是一块均匀内存，而是多个 NUMA node：每个 CPU socket 连接自己的 DRAM、PCIe root complex、GPU 和 NIC。远端内存访问可能多 30-80 ns，跨 socket PCIe 路径也会降低 H2D 或 RDMA 吞吐，因此要理解 <code>numactl</code>、CPU affinity、GPU locality 与 DataLoader worker 的关系。第五步，应用做 IO 必须进入内核态，syscall 与 context switch 有固定成本；高并发连接需要 <code>epoll</code>，高吞吐异步文件或网络 IO 可以用 <code>io_uring</code> 降低提交和完成路径的开销。第六步，设备之间真正搬数据靠 PCIe、DMA 和 IOMMU：lane 数、PCIe 代际、拓扑、ACS、switch、root complex 决定了 GPU、NIC、CPU 内存之间的可达性和瓶颈。最后，CUDA 的 pinned memory 把用户页锁住，使 DMA 能稳定访问；<code>cudaMemcpyAsync</code> 只有在 pinned host buffer 与 stream 配合时才有机会与计算重叠。</p>
+<p>这些机制合在一起，形成 AI Infra 排障时最重要的反问：数据此刻在哪里，谁拥有它，下一跳要穿过哪个边界，哪个环节会阻塞，完成语义是否真的成立。虚拟内存负责让进程以为自己拥有连续空间；Page Cache 负责把慢速文件页转化成可复用内存页；NUMA 负责提醒你“内存也有距离”；syscall、<code>epoll</code>、<code>io_uring</code> 负责描述用户态和内核态的交互成本；PCIe、DMA、pinned memory 负责把 CPU 侧数据变成设备可直接搬运的数据路径。因此，本章不是把内核概念孤立罗列，而是把每个概念放回训练吞吐、checkpoint 尾延迟、推理 IO、GPU H2D 和 RDMA 拓扑这些 AI workload 中验证。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((内存、虚拟内存与 IO))
+    地址幻觉与隔离
+      虚拟内存
+      页表
+      TLB
+      page fault
+    文件数据复用
+      Page
+      Page Cache
+      脏页回写
+      vm.dirty_ratio
+    大内存效率
+      THP
+      HugeTLB
+      PyTorch arena
+      DataLoader 大数组
+    物理位置
+      NUMA node
+      CPU affinity
+      GPU locality
+      NIC locality
+    内核边界
+      syscall
+      context switch
+      epoll
+      io_uring
+    设备数据路径
+      PCIe topology
+      DMA
+      pinned memory
+      cudaMemcpyAsync</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么进程看到的连续地址并不等于连续物理内存？TLB miss 会如何影响 AI workload？</li>
+<li>Dataset 读取“第二轮更快”通常是 Page Cache 还是模型变快？如何验证？</li>
+<li><code>vm.dirty_ratio</code> 为什么会影响 checkpoint 的尾延迟，而不是只影响磁盘工具？</li>
+<li>THP 与显式 HugeTLB 分别适合哪些大内存场景？什么时候会带来延迟尖峰？</li>
+<li>为什么同一张 GPU 的 H2D 带宽会因为 CPU core、NUMA node、pinned memory 设置不同而变化？</li>
+<li><code>epoll</code>、<code>io_uring</code>、普通 blocking syscall 分别解决什么 IO 成本？</li>
+<li>看到 PCIe topology 图时，如何判断 GPU、NIC、CPU 内存之间的数据路径是否绕远？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 物理 / 虚拟内存 / 页表 / TLB</h2>
+<p>物理内存是 DRAM 上真实存在的页框（page frame），虚拟内存是进程看到的地址空间。Linux 常用 4 KiB page，把虚拟页号通过多级页表映射到物理页框。x86-64 常见 4 级或 5 级页表；一次 TLB miss 可能触发硬件 page walk，访问多级页表，代价从几 ns 的 L1 hit 放大到数十到数百 ns。若页不存在，还会进入内核处理 minor/major page fault：minor fault 只建立映射，major fault 需要从磁盘或远端存储取页。</p>
+<pre class="mermaid">flowchart LR
+  VA[用户态虚拟地址] --> TLB{TLB hit?}
+  TLB -- yes --> PA[物理地址]
+  TLB -- no --> PT[多级页表遍历]
+  PT --> Present{页在内存?}
+  Present -- yes --> Fill[填充 TLB]
+  Fill --> PA
+  Present -- no --> Fault[page fault 进入内核]
+  Fault --> IO[读文件/交换区或分配新页]
+  IO --> Fill</pre>
+<p>AI 场景里，<code>mmap</code> safetensors、NumPy memmap、dataset index、shared memory queue 都依赖这个机制。<code>fork</code> DataLoader worker 后的 copy-on-write 也靠页表标记实现：父子进程先共享物理页，写入时才复制。工程边界是：虚拟内存让“大地址空间”可用，但不保证“物理内存足够”；RSS、PSS、page fault、TLB miss 要分开看，不能只看 Python 对象大小。</p>
+<div class="warn"><strong>边界提醒：</strong>RSS 是进程视角，Page Cache 是内核缓存视角，PSS 更接近共享页分摊后的成本视角；排查 OOM 或内存膨胀时不要把三者混成一个数。</div>
+<table>
+<tr><th>事件</th><th>发生条件</th><th>AI Infra 解读</th></tr>
+<tr><td>TLB hit</td><td>虚拟页到物理页的映射已经在 TLB 中</td><td>普通 load/store 走快路径，常见于局部性好的 tensor 或索引访问</td></tr>
+<tr><td>TLB miss</td><td>映射不在 TLB 中，需要 page walk</td><td>大 embedding table、稀疏访问、大量 4 KiB 页可能放大地址翻译成本</td></tr>
+<tr><td>minor fault</td><td>页已在内存，只需建立映射或处理 COW</td><td><code>fork</code> worker、<code>mmap</code> 首次触碰常见</td></tr>
+<tr><td>major fault</td><td>需要从磁盘、交换区或远端存储取页</td><td>可能造成 dataset 读取尖峰或模型权重 mmap 冷启动变慢</td></tr>
+</table>
+</section>
+
+<section class="section" id="s3">
+<h2>3. Page / Page Cache / 脏页回写 / <code>vm.dirty_ratio</code></h2>
+<p>Page Cache 是 Linux 用空闲内存缓存文件内容的机制。第一次读 dataset shard 可能被 NVMe、NFS、对象存储网关限制；第二次读如果命中 Page Cache，会接近内存速度。<code>free</code> 里看到的 <code>buff/cache</code> 不是浪费，而是可回收缓存。写文件时，<code>write()</code> 通常只是把用户数据拷到 Page Cache 并标记 dirty，后台线程再回写到存储；<code>fsync()</code>、内存压力或 dirty page 超阈值会迫使同步等待。</p>
+<pre class="mermaid">sequenceDiagram
+  participant App as 训练进程
+  participant Kernel as Linux kernel
+  participant Cache as Page Cache
+  participant Disk as NVMe/FS
+  App->>Kernel: read(file)
+  Kernel->>Cache: 查找页
+  alt cache hit
+    Cache-->>App: 拷贝到用户缓冲区
+  else cache miss
+    Kernel->>Disk: 提交块 IO
+    Disk-->>Cache: 填充页
+    Cache-->>App: 返回数据
+  end
+  App->>Kernel: write(checkpoint)
+  Kernel->>Cache: 标记 dirty
+  Kernel-->>App: 先返回
+  Cache->>Disk: 后台回写或 fsync 等待</pre>
+<p>关键参数包括 <code>vm.dirty_ratio</code>、<code>vm.dirty_background_ratio</code>、<code>vm.dirty_bytes</code>、<code>vm.dirty_background_bytes</code>。例如 512 GiB 内存机器上 <code>dirty_ratio=20</code> 允许约 102 GiB 脏页，checkpoint 前半段可能以 DRAM 速度返回，随后突然被回写限速。</p>
+<div class="note"><strong>验证思路：</strong>如果 dataset 第二轮读取明显更快，先观察 <code>sar -B</code>、<code>vmtouch</code>、<code>perf stat</code>、<code>iostat</code> 或 drop cache 前后的差异，再判断是不是 Page Cache 命中，而不是训练代码真的变快。</div>
+<div class="danger"><strong>持久化风险：</strong>Page Cache 适合复用读和顺序写缓冲，但不能当作持久化完成信号；需要恢复语义时必须理解 <code>fsync()</code>、临时文件、rename 原子性和文件系统行为，详见 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c</a>。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. Huge Pages：THP vs explicit</h2>
+<p>4 KiB page 对小对象友好，但对几十 GB tensor、embedding table、DataLoader 预取数组会带来页表膨胀。2 MiB huge page 能把 512 个 4 KiB 页合并为一个页表项，降低 TLB miss 和 page walk。Transparent Huge Pages（THP）由内核自动尝试合并，配置常见为 <code>always</code>、<code>madvise</code>、<code>never</code>；显式 HugeTLB 需要预留 huge page 池，通过 <code>hugetlbfs</code> 或应用参数使用。</p>
+<table>
+<tr><th>机制</th><th>优点</th><th>风险</th><th>AI 场景</th></tr>
+<tr><td>THP <code>always</code></td><td>无需改应用，可能降低 TLB miss</td><td>compaction 带来延迟尖峰</td><td>离线训练可尝试</td></tr>
+<tr><td>THP <code>madvise</code></td><td>应用标记后才使用</td><td>依赖 allocator 支持</td><td>大数组、arena 更可控</td></tr>
+<tr><td>HugeTLB</td><td>预留、确定性强</td><td>配额固定，碎片与运维复杂</td><td>数据库、通信缓冲、低延迟服务</td></tr>
+</table>
+<p>PyTorch CPU allocator、Jemalloc arena、NumPy 大数组是否真正落在 huge page 上，需要结合 <code>/proc/&lt;pid&gt;/smaps</code> 的 <code>AnonHugePages</code>、<code>perf stat -e dTLB-load-misses</code> 判断。</p>
+<div class="warn"><strong>工程边界：</strong>Huge Pages 解决的是地址转换压力，不解决内存带宽不足；如果瓶颈是 PCIe、磁盘或 Python GIL，开启 THP 不会神奇变快。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. NUMA：node 亲和、<code>numactl</code>、GPU pinning</h2>
+<p>NUMA（Non-Uniform Memory Access）表示 CPU 访问本地 DRAM 与远端 socket DRAM 的延迟、带宽不同。双路服务器常见布局是 socket0 连接一组 PCIe root ports、GPU、NIC，socket1 连接另一组。Linux 默认 first-touch：哪个 CPU core 首次写页，页就倾向分配在哪个 NUMA node。DataLoader worker 若跑在 node1，却给挂在 node0 的 GPU 准备 batch，会让 H2D 经过 UPI/QPI 跨 socket。</p>
+<pre class="mermaid">flowchart TB
+  subgraph N0[NUMA node0 / socket0]
+    C0[CPU cores 0-63]
+    M0[DRAM node0]
+    R0[PCIe root complex]
+    G0[GPU0-GPU3]
+    NIC0[NIC0]
+  end
+  subgraph N1[NUMA node1 / socket1]
+    C1[CPU cores 64-127]
+    M1[DRAM node1]
+    R1[PCIe root complex]
+    G1[GPU4-GPU7]
+    NIC1[NIC1]
+  end
+  M1 -. remote memory .-> R0
+  R0 --> G0
+  R0 --> NIC0</pre>
+<p>常用命令：<code>numactl -H</code> 看 node，<code>lscpu -e=CPU,NODE</code> 看 core 归属，<code>nvidia-smi topo -m</code> 看 GPU/NIC/CPU 距离，<code>numactl --cpunodebind=0 --membind=0 python train.py</code> 固定分配。</p>
+<table>
+<tr><th>命令</th><th>回答的问题</th><th>典型用途</th></tr>
+<tr><td><code>numactl -H</code></td><td>机器有哪些 NUMA node，各自有多少内存</td><td>确定训练 rank 可以绑定的内存域</td></tr>
+<tr><td><code>lscpu -e=CPU,NODE</code></td><td>CPU core 属于哪个 node</td><td>给 DataLoader worker 和通信线程分配 CPU set</td></tr>
+<tr><td><code>nvidia-smi topo -m</code></td><td>GPU、NIC、CPU 之间的拓扑距离</td><td>判断 GPU↔NIC 是否适合 GPUDirect RDMA</td></tr>
+<tr><td><code>numastat -p &lt;pid&gt;</code></td><td>进程内存实际分布在哪些 node</td><td>验证 first-touch 是否把 batch 放错 socket</td></tr>
+</table>
+<div class="success"><strong>亲和原则：</strong>先按 GPU locality 分组，再把 rank、DataLoader worker、pinned pool、CPU core 和 memory node 一起约束，最后用 profiling 验证。亲和不是越紧越好，控制线程、通信线程和预处理线程争同一批 core 会互相干扰。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 用户态 / 内核态 / syscall：context switch、<code>io_uring</code> / <code>epoll</code></h2>
+<p>用户态不能直接操作磁盘、网卡、页表和调度器，必须通过 syscall 进入内核态。一次 syscall 本身通常是百 ns 到数 us 量级；若阻塞 IO、调度切换、cache/TLB 污染叠加，尾延迟会更高。AI 平台 control plane 的 HTTP/gRPC、模型服务的 socket、dataset server、日志采集都受 syscall 模型影响。</p>
+<p><code>epoll</code> 解决的是大量 fd 的 readiness 通知：一个线程可以等待成千上万个连接，适合网络服务。<code>io_uring</code> 通过 submission queue / completion queue 让应用批量提交 IO，减少 syscall 次数，并支持更统一的异步文件与网络路径。普通 blocking IO 简单但线程多；<code>epoll</code> 适合事件驱动网络；<code>io_uring</code> 适合需要批量、异步、低开销提交的高吞吐路径。</p>
+<pre class="mermaid">flowchart LR
+  App[用户态事件循环] --> SQ[io_uring SQ]
+  SQ --> Kernel[内核消费 SQE]
+  Kernel --> Device[文件/网络设备]
+  Device --> Kernel
+  Kernel --> CQ[完成写入 CQE]
+  CQ --> App
+  App -. 少量 syscall 批量提交/收割 .- Kernel</pre>
+<table>
+<tr><th>模型</th><th>解决的问题</th><th>适合场景</th><th>不适合信号</th></tr>
+<tr><td>blocking thread pool</td><td>用线程隐藏阻塞</td><td>低并发、逻辑简单、成熟库优先</td><td>线程数暴涨、上下文切换高、尾延迟抖动</td></tr>
+<tr><td><code>epoll</code></td><td>大量 fd readiness 通知</td><td>HTTP/gRPC、网关、长连接服务</td><td>主要瓶颈是文件读取吞吐或 buffer copy</td></tr>
+<tr><td><code>io_uring</code></td><td>批量提交和完成，降低 syscall 路径开销</td><td>高吞吐 dataset service、异步文件/网络数据面</td><td>文件系统、驱动、buffer 生命周期或 direct IO 对齐无法配合</td></tr>
+</table>
+<div class="warn"><strong>边界提醒：</strong><code>io_uring</code> 不是自动加速器。控制面优先用成熟 runtime；数据面再评估 <code>io_uring</code>、SPDK、RDMA 或专用 dataset service。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. PCIe：lane / 代际、topology、GPU↔NIC↔CPU 路径</h2>
+<p>PCIe 用 lane 聚合带宽，常见 GPU 是 x16，NIC 可能是 x16 或 x8。理论单向带宽如下：</p>
+<table>
+<tr><th>代际</th><th>x8 单向</th><th>x16 单向</th><th>常见意义</th></tr>
+<tr><td>PCIe 3.0</td><td>~7.9 GB/s</td><td>~15.8 GB/s</td><td>老平台 GPU H2D 易受限</td></tr>
+<tr><td>PCIe 4.0</td><td>~15.8 GB/s</td><td>~31.5 GB/s</td><td>A100 PCIe 常见</td></tr>
+<tr><td>PCIe 5.0</td><td>~31.5 GB/s</td><td>~63.0 GB/s</td><td>H100/H200、400G/800G NIC</td></tr>
+<tr><td>PCIe 6.0</td><td>~64 GB/s</td><td>~128 GB/s</td><td>新平台，注意生态成熟度</td></tr>
+</table>
+<p>延迟通常不是 GB/s 表能解释的：跨 PCIe switch、跨 root complex、跨 CPU socket、IOMMU 映射都会增加路径成本。<code>nvidia-smi topo -m</code> 中 <code>PIX</code>、<code>PXB</code>、<code>PHB</code>、<code>SYS</code> 表示不同距离；<code>SYS</code> 常意味着跨 NUMA 或 socket。GPU↔NIC 的 RDMA 若不在同一 root complex 下，可能绕 CPU interconnect，AllReduce 带宽打折。</p>
+<pre class="mermaid">flowchart LR
+  GPU[GPU HBM] <-->|PCIe/NVLink| RC[PCIe root complex]
+  NIC[NIC] <-->|PCIe| RC
+  RC <-->|memory controller| DRAM[CPU DRAM]
+  DRAM <-->|UPI/Infinity Fabric| Remote[远端 socket DRAM]
+  GPU -. GPUDirect RDMA 可绕过 CPU DRAM .-> NIC</pre>
+<div class="note"><strong>读拓扑的重点：</strong>PCIe 表格只给理论上限。实际 H2D 还受 pinned memory、NUMA、batch size、copy engine、并发 stream、IOMMU 和电源状态影响；网络训练还要叠加 NCCL 拓扑选择。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. DMA、page-locked memory、<code>cudaMemcpyAsync</code></h2>
+<p>DMA（Direct Memory Access）允许设备在 CPU 不逐字节参与的情况下读写内存。问题是虚拟页可能被换出或迁移，设备不能在传输中途发现物理地址变了，所以 CUDA 的 pinned/page-locked memory 会把 host buffer 锁在物理内存里，并建立设备可用的映射。PyTorch <code>DataLoader(pin_memory=True)</code> 会把 batch 放入 pinned host memory，使 H2D 拷贝更接近 PCIe 上限。</p>
+<p><code>cudaMemcpyAsync</code> 的“Async”有前提：host buffer 要 pinned，拷贝要在 CUDA stream 上提交，后续 kernel 与 copy engine 有可重叠空间。如果 pageable memory 被传入，runtime 可能先拷到临时 pinned staging buffer，调用点仍会同步一段时间。</p>
+<pre class="mermaid">flowchart LR
+  DL[DataLoader worker] --> Host[Host batch buffer]
+  Host --> Pin{Pinned?}
+  Pin -- no --> Stage[Runtime staging copy]
+  Stage --> DMA[DMA copy engine]
+  Pin -- yes --> DMA
+  DMA --> PCIE[PCIe / NVLink path]
+  PCIE --> HBM[GPU HBM]
+  Kernel[CUDA kernel stream] -. 可重叠 .- DMA</pre>
+<div class="danger"><strong>资源风险：</strong>pinned memory 不可无限开；锁页会降低系统可回收内存，过量会影响 Page Cache 和其他进程。训练服务通常要限制 prefetch factor、worker 数、batch 大小和 pinned 池容量。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Worked example：H2D 带宽上不去</h2>
+<p>某 8×A100 PCIe 4.0 机器，理论每张卡 x16 H2D 单向上限约 31.5 GB/s。训练团队报告 GPU utilization 只有 55%-65%，step time 1.42 s，其中 forward/backward 约 0.95 s，剩余时间散在 batch 准备和 H2D。代码里每 step 把约 6.4 GiB token、mask、label 从 CPU 拷到 GPU，按理论上限 H2D 应接近 0.20-0.25 s；实测 <code>torch.cuda.Event</code> 包住 <code>.to(device, non_blocking=True)</code> 后，单卡 H2D 约 0.62 s，折算只有 10.3 GB/s。</p>
+<h3>第一步：验证是否真的异步</h3>
+<pre><code class="language-bash">python - &lt;&lt;'PY'
+print(loader.pin_memory, loader.num_workers, loader.prefetch_factor)
+PY</code></pre>
+<p>发现 <code>pin_memory=False</code>，虽然训练代码写了 <code>non_blocking=True</code>，但 pageable host memory 让 CUDA runtime 先做 staging copy。把 DataLoader 改为 <code>pin_memory=True</code> 后，H2D 从 0.62 s 降到 0.36 s，带宽约 17.8 GB/s，仍明显低于 PCIe 4.0 x16 的合理区间。此时说明第一个瓶颈成立但不是全部。</p>
+<h3>第二步：看拓扑和 NUMA</h3>
+<pre><code class="language-bash">nvidia-smi topo -m
+numactl -H
+lscpu -e=CPU,NODE | head
+ps -L -o pid,tid,psr,comm -p $(pgrep -f train.py | head -1)</code></pre>
+<p>拓扑显示 GPU0-GPU3 靠近 NUMA node0，GPU4-GPU7 靠近 node1；但进程由调度器随机跑，DataLoader worker 大多落在 node1，rank0-rank3 绑定 GPU0-GPU3。再用 <code>numastat -p &lt;pid&gt;</code> 看到 rank0 的匿名内存约 72% 在 node1。由于 Linux first-touch，worker 在 node1 解码和 collate batch 时首次写入页，pinned 后这些页仍在 node1；GPU0 从 node0 PCIe root complex 拉取 host memory，需要跨 socket interconnect，H2D 带宽被压到 18 GB/s 左右。</p>
+<h3>第三步：按 locality 重启</h3>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=0,1,2,3 numactl --cpunodebind=0 --membind=0 \
+  torchrun --nproc_per_node=4 train.py --pin-memory true</code></pre>
+<p>对 rank4-rank7 使用 node1，或在 launcher 中按 GPU id 设置 CPU set。复测后，单卡 H2D 为 0.24-0.28 s，折算 23-27 GB/s；step time 从 1.42 s 降到 1.09 s，GPU utilization 提升到 82%-88%。剩余差距来自 batch size 不总是足够大、copy 与 kernel 重叠不完全、PCIe switch 上多卡并发共享上行带宽。</p>
+<pre class="mermaid">flowchart TB
+  Slow[H2D 0.62s / 10.3 GB/s] --> Async{真的异步?}
+  Async -- pageable host memory --> Pin[启用 pin_memory]
+  Pin --> Mid[H2D 0.36s / 17.8 GB/s]
+  Mid --> Topo{NUMA 与 GPU locality?}
+  Topo -- worker first-touch 在远端 node --> Bind[绑定 rank / worker / memory node]
+  Bind --> Fast[H2D 0.24-0.28s / 23-27 GB/s]
+  Fast --> Left[剩余：batch 大小、copy 重叠、switch 共享上行]</pre>
+<div class="success"><strong>推理链总结：</strong><code>non_blocking=True</code> 只是 API 意图，不保证异步；必须先有 pinned host memory。pinned memory 只保证页不迁移，不保证页在正确 NUMA node；first-touch 决定物理位置。PCIe 理论带宽只在“本地 NUMA + pinned + 足够大块 + copy engine 有空间”时接近。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>练习 1（基础）：虚拟地址翻译</strong><br>解释一次用户态 load 从虚拟地址到物理地址可能经历的路径，并说明 TLB hit、TLB miss、minor page fault、major page fault 的差异。</div>
+<div class="card"><strong>练习 2（基础）：Page Cache 判断</strong><br>设计 3 条 Linux 命令，判断 dataset 第二轮读取变快是否来自 Page Cache，而不是训练代码优化。</div>
+<div class="card"><strong>练习 3（基础）：dirty page 估算</strong><br>一台 256 GiB 内存机器，<code>vm.dirty_ratio=20</code>。粗略估算最多允许多少 GiB 脏页，并说明这对 80 GiB checkpoint 写入有什么影响。</div>
+<div class="card"><strong>练习 4（基础）：THP 观察</strong><br>给出查看 THP 当前策略、某进程 <code>AnonHugePages</code>、TLB miss 的命令。</div>
+<div class="card"><strong>练习 5（基础）：NUMA locality</strong><br>用 <code>numactl -H</code>、<code>lscpu</code>、<code>nvidia-smi topo -m</code> 判断 GPU2 更适合绑定哪个 NUMA node。</div>
+<div class="card"><strong>练习 6（基础）：PCIe 带宽</strong><br>PCIe 4.0 x16 单向理论约 31.5 GB/s。若 8 GiB H2D 用时 0.50 s，折算带宽是多少？可能有哪些原因？</div>
+<div class="card"><strong>练习 7（进阶）：fork 与 copy-on-write</strong><br>解释 DataLoader worker 使用 <code>fork</code> 后，父进程大对象何时会共享、何时会复制。为什么“读共享、写复制”仍可能造成 RSS 误判？</div>
+<div class="card"><strong>练习 8（进阶）：<code>io_uring</code> 适用性</strong><br>为 dataset service 判断是否值得引入 <code>io_uring</code>：列出至少 4 个前提条件和 3 个不适合的信号。</div>
+<div class="card"><strong>练习 9（进阶）：Pinned memory 副作用</strong><br>说明 pinned memory 如何提高 H2D，同时列出过量 pinned memory 对 Page Cache、系统回收、其他租户的影响。</div>
+<div class="card"><strong>练习 10（进阶）：Topology 推理</strong><br>假设 GPU 与 NIC 在 <code>nvidia-smi topo -m</code> 中显示 <code>SYS</code>，推断 GPUDirect RDMA 可能遇到什么问题，并给出排查命令。</div>
+<div class="card"><strong>练习 11（设计）：8 GPU DataLoader 亲和方案</strong><br>为双路 8 GPU 机器设计 rank、CPU core、NUMA memory、DataLoader worker 的绑定策略，说明如何避免跨 socket H2D。</div>
+<div class="card"><strong>练习 12（设计）：Checkpoint 写入策略</strong><br>设计一个 400 GiB checkpoint 写入方案，要求说明 Page Cache、dirty ratio、临时文件、rename、fsync 的取舍。</div>
+<div class="card"><strong>练习 13（设计）：低延迟推理 IO</strong><br>为一个在线推理服务设计网络 IO 模型：blocking thread pool、<code>epoll</code>、<code>io_uring</code> 三选一或组合，并说明为什么。</div>
+</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用虚拟内存、页表、TLB、page fault 建立“地址不是物理位置”的基本模型。</li>
+<li>再把文件 IO 放入 Page Cache 与 dirty writeback，理解 dataset 复用读和 checkpoint 尾延迟。</li>
+<li>随后学习 THP/HugeTLB 与 NUMA，把“大内存效率”和“内存距离”纳入性能判断。</li>
+<li>最后串起 syscall、<code>epoll</code>、<code>io_uring</code>、PCIe、DMA、pinned memory，形成 GPU 数据通路排障框架。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Linux kernel documentation: <code>Documentation/admin-guide/mm/</code>，尤其是 HugeTLB、THP、NUMA memory policy、dirty page writeback。</li>
+<li>Intel 64 and IA-32 Architectures Optimization Reference Manual：TLB、page walk、NUMA 与内存层级优化。</li>
+<li>AMD64 Architecture Programmer's Manual：虚拟内存、页表、IOMMU 与系统架构背景。</li>
+<li>NVIDIA CUDA C Programming Guide：Pinned memory、asynchronous copy、streams、copy engine。</li>
+<li>NVIDIA GPUDirect RDMA documentation：GPU、NIC、PCIe topology 与 peer-to-peer 约束。</li>
+<li>Brendan Gregg, <em>Systems Performance</em>：内存、文件系统、IO、CPU profiling 的工程方法。</li>
+<li>man pages: <code>mmap(2)</code>、<code>madvise(2)</code>、<code>mlock(2)</code>、<code>io_uring_setup(2)</code>、<code>epoll(7)</code>、<code>numactl(8)</code>。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 第 0b 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
