@@ -1,49 +1,74 @@
 # 第4章：GPU 与加速器
 
-> 理解 GPU 的最好方式，不是死记硬件参数，而是先回答：为什么这类设备特别适合 AI 工作负载，它又在哪些条件下会"不像你想得那么快"。
-
 > **关联章节**：本章内容与 [第5章](./05-memory-interconnect-io.md) 的带宽 / 互联链路，以及 [第6章](./06-cuda-runtime-and-kernels.md) 的 kernel 执行效率密切相关。硬件参数只有落到实际搬运和执行路径里，才有工程意义。再往后，[第8章](../part3-training-infra/08-data-parallel.md) 的扩展效率和 [第15章](../part4-inference-infra/15-batching-scheduling-and-kv-cache.md) 的 KV Cache 预算都会回过头来用本章的四个维度（算力/显存/带宽/互联）。
 
-## 学习目标
+## 1. 第一性原理拆解 + 学习大纲
 
-完成本章学习后，你将能够：
+### 拆 — 不可化简的问题
 
-1. 从并行计算角度理解 GPU 与 CPU 的差异
-2. 看懂 AI 场景里常见的硬件指标：显存、带宽、吞吐、互联
-3. 理解训练与推理为什么会偏好不同设备形态
-4. 用"算得动、放得下、喂得满、连得快"评估硬件是否合适
-5. 避免把 GPU 采购或选型简化成"谁 TFLOPS 高就选谁"
-6. 读懂 NVIDIA 官方 datasheet 中 dense / sparse / FP8 / FP4 等不同口径的数字
-7. 用 arithmetic intensity 和 roofline 模型判断瓶颈更可能在算力还是带宽
+理解 GPU 的最好方式，不是死记硬件参数，而是先回答：为什么这类设备特别适合 AI 工作负载，它又在哪些条件下会"不像你想得那么快"。把所有品牌名、SKU、Tensor Core、NVLink、HBM 这些术语先拿掉，GPU 章真正面对的不可化简问题只有一个：**一个模型步骤需要在很短时间内对大量规则数据做同构运算，但每个物理器件的计算单元、存储容量、读写带宽和互联距离都是有限的，平台工程师必须判断这些限制哪一个先成为瓶颈**。
 
----
+这句话比"GPU 比 CPU 快"更接近本章核心。CPU 的强项是少量线程、复杂控制流、低延迟响应和操作系统控制面；GPU 的强项是把同一类指令摊给海量线程，以吞吐换延迟。Transformer 里的 GEMM、attention、归约和逐元素运算之所以适合 GPU，不是因为它们叫 AI 算子，而是因为它们有大量相似的数据元素和稳定的张量形状。反过来，小 batch、动态 shape、强分支、频繁 host-device 往返、碎 tensor、跨卡通信密集的任务，即使放在昂贵 GPU 上，也可能只能吃到峰值算力的很小一部分。
 
-## 本章导读
+第一次做 AI 基础设施选型的团队，最常踩的坑是把"选 GPU"当成"挑显卡"：看 MLPerf 榜单，比 TFLOPS，挑吞吐最高的那张。这个思路在消费显卡时代还凑合，但对数据中心 AI 负载会有几个严重漏洞：峰值算力和可达吞吐常差 3-10 倍；显存和 HBM 带宽往往比算力更先顶爆；互联决定 8 卡节点到底是 8 卡同时干活，还是 8 卡互相等待；同一代产品又有 PCIe、SXM、不同显存容量、不同功耗墙和不同 datasheet 口径。平台工程师需要拆出的不是"哪张卡最快"，而是四个更硬的问题：算得动吗，放得下吗，喂得满吗，连得快吗。
 
-第一次做 AI 基础设施选型的团队，最常踩的坑是把"选 GPU"当成"挑显卡"：
+### 推 — 从这个问题如何推导出每个机制
 
-- 去看 MLPerf 榜单
-- 比一比 TFLOPS
-- 挑吞吐最高的那张
+从这个不可化简问题往下推，GPU 的每个机制都不是孤立名词。首先，单个通用核心无法在可接受时间内完成数万亿次矩阵乘法，所以硬件必须堆出大量并行执行单元；因为深度学习核心计算大多是矩阵和张量运算，所以又出现专门服务低精度矩阵乘法的 Tensor Core，并逐步支持 TF32、BF16、FP8、FP4 等口径。接着，算力只有在数据持续供应时才有意义，显存容量决定权重、激活、梯度、优化器状态和 KV Cache 能不能放下，HBM 带宽决定这些数据能不能按 kernel 消费速度被读写。于是同样 70B 模型，训练时要看 6-16x 参数量的状态预算，推理时要看权重加 KV Cache；prefill 更像 compute-bound，decode 更像 memory-bound。
 
-这个思路在消费显卡时代还凑合，但对数据中心 AI 负载会有几个严重漏洞：
+再往下推，单卡不够时必须切到多卡：数据并行要同步梯度，张量并行要交换 activation，流水并行要传递 microbatch，专家并行要做 token dispatch。跨 GPU 的距离立刻变成系统问题。PCIe 能连，但带宽和延迟不适合高频模型切分；NVLink 把 GPU-GPU 路径做成高带宽链路；NVSwitch 把多条 NVLink 组成交换网络，让 8 卡 HGX 节点里任意 GPU 都能以近似一致的路径通信；GB200/NVL72 进一步把这个边界从主板扩到整机柜，让 72 块 Blackwell GPU 位于一个 rack-scale NVLink domain 内。到了这里，GPU 不再是一张卡，而是计算、HBM、NVLink、NVSwitch、CPU、NIC、供电和液冷共同组成的 scale-up 系统。
 
-- **峰值算力和可达吞吐常差 3-10 倍**（H100 BF16 峰值 989 TFLOPS，但 FlashAttention-2 原版只能跑到 35%，FlashAttention-3 才能到 75-85%）
-- **显存/带宽往往比算力更先顶爆**（长上下文 LLM、大 batch 训练都是这样）
-- **互联决定了"8 卡节点"到底是 8 卡同时干活，还是 8 卡串行干活**（NVLink 和 PCIe 的差距可以到 20 倍）
-- **整代产品有多种 SKU**（A100 40GB/80GB、PCIe/SXM、H100/H200/B200/B300），datasheet 上一个数字常对应不同口径
+最后，所有机制都要回到工程边界。算力指标必须统一 dense/sparse、per-GPU/system-level、FP16/BF16/FP8/FP4 口径；显存预算必须给运行时 buffer 和碎片留余量；带宽判断必须区分 HBM、PCIe、NVLink、InfiniBand/RoCE；互联拓扑必须和并行策略、作业调度、故障域绑定。读完本章，你应该能把硬件参数翻译成平台决策：哪些任务放 H200 更值，哪些任务用 L40S 更划算，什么时候该买 8 卡 SXM 节点，什么时候该等待 NVL72 这类 rack-scale 系统，什么时候非 NVIDIA 方案的省钱会被软件适配成本吃掉。
 
-本章的判断框架是：
+### 绘 — 因果链路
 
-```text
-看 GPU 的四件事
-  ├── 算得动吗？   (算力 × 真实利用率)
-  ├── 放得下吗？   (显存容量)
-  ├── 喂得满吗？   (HBM 带宽)
-  └── 连得快吗？   (NVLink / PCIe / RDMA)
+```mermaid
+mindmap
+  root((GPU 与加速器))
+    不可化简问题
+      大量规则计算
+      有限算力
+      有限显存
+      有限带宽
+      有限互联距离
+    单卡机制
+      SM 并行
+      Tensor Core
+      HBM 容量
+      HBM 带宽
+      低精度 FP8 FP4
+    多卡机制
+      PCIe
+      NVLink
+      NVSwitch
+      RDMA
+      拓扑感知调度
+    AI 场景
+      训练
+        梯度同步
+        激活重算
+        长时间稳定吞吐
+      推理
+        KV Cache
+        Prefill Decode 分离
+        tokens per second per dollar
+    工程判断
+      算得动
+      放得下
+      喂得满
+      连得快
+      口径统一
 ```
 
-这四件事必须一起看。只看其中一个挑卡，大概率会选到"标称数字漂亮但对你的负载不对路"的型号。
+### 导 — 读完本章你应该能回答
+
+1. 为什么 GPU 适合稠密张量计算，但不保证任何 AI 任务都会接近峰值吞吐？
+2. 面对一个模型和 SLO，如何用"算得动、放得下、喂得满、连得快"拆出最可能的硬件瓶颈？
+3. 为什么 LLM prefill 和 decode 对 GPU 的偏好不同，decode 为什么经常受 HBM 带宽而不是 TFLOPS 限制？
+4. 读 NVIDIA datasheet 时，如何区分 dense / sparse、per-GPU / system-level、FP16 / BF16 / FP8 / FP4 等口径？
+5. NVLink、NVSwitch、PCIe、RDMA 分别解决哪一段数据路径问题，为什么它们不能互相简单替代？
+6. HGX H100/H200、GB200/NVL72 这类系统形态对平台调度、故障域、并行策略和供电散热有什么工程边界？
+7. 什么时候应该接受异构 GPU 池或非 NVIDIA 加速器，什么时候软件生态成本会压过硬件采购折扣？
 
 ## 正文内容
 
@@ -135,6 +160,95 @@ LLM decode 阶段（见 [第15章](../part4-inference-infra/15-batching-scheduli
 - 高速 KV / activation 交换
 
 所以同样是 8 卡节点，拓扑不同，训练体验可能差很多。
+
+#### 4.2.4.1 NVSwitch：把"多条直连线"变成"节点内交换网络"
+
+NVLink 解决的是 GPU-GPU 之间的高速链路问题，但只靠点到点直连会遇到一个组合爆炸：8 张 GPU 如果要任意两两全带宽互通，需要大量链路和复杂布线；如果只做 ring 或 mesh，某些 GPU 对之间要经过多跳，中间 GPU 还会承担转发压力。NVSwitch 的第一性原理很简单：**把 GPU 之间的通信从"谁和谁直接连"改成"每张 GPU 接入交换平面，由交换芯片完成转发"**。
+
+在 HGX H100 8-GPU 这类节点里，每张 H100 SXM 通过多条 NVLink 接到 4 颗 NVSwitch；每颗 NVSwitch 同时连接全部 8 张 GPU 的一部分链路。逻辑上看，任意 GPU 到任意 GPU 都能走 NVSwitch fabric，而不是先经过 CPU、PCIe root complex 或其他 GPU。NVIDIA 对 HGX H100 8-GPU 的公开口径是每 GPU 最高约 900 GB/s 双向 NVLink 带宽；这个数字是 per-GPU 聚合口径，不是某两张 GPU 之间单向 900 GB/s。H200 SXM 继承 Hopper 平台形态，核心差异更多在 HBM3e 容量和带宽，节点内 NVLink/NVSwitch 的平台判断方式基本相同。
+
+```mermaid
+flowchart TB
+  subgraph HGX["HGX H100/H200 8-GPU NVSwitch fabric"]
+    direction TB
+    subgraph SwitchPlane["NVSwitch plane"]
+      S0["NVSwitch 0"]
+      S1["NVSwitch 1"]
+      S2["NVSwitch 2"]
+      S3["NVSwitch 3"]
+    end
+    subgraph GPUs["8x SXM GPUs"]
+      G0["GPU0"]
+      G1["GPU1"]
+      G2["GPU2"]
+      G3["GPU3"]
+      G4["GPU4"]
+      G5["GPU5"]
+      G6["GPU6"]
+      G7["GPU7"]
+    end
+    G0 --- S0
+    G0 --- S1
+    G0 --- S2
+    G0 --- S3
+    G1 --- S0
+    G1 --- S1
+    G1 --- S2
+    G1 --- S3
+    G2 --- S0
+    G2 --- S1
+    G2 --- S2
+    G2 --- S3
+    G3 --- S0
+    G3 --- S1
+    G3 --- S2
+    G3 --- S3
+    G4 --- S0
+    G4 --- S1
+    G4 --- S2
+    G4 --- S3
+    G5 --- S0
+    G5 --- S1
+    G5 --- S2
+    G5 --- S3
+    G6 --- S0
+    G6 --- S1
+    G6 --- S2
+    G6 --- S3
+    G7 --- S0
+    G7 --- S1
+    G7 --- S2
+    G7 --- S3
+  end
+  CPU["CPU / PCIe / NIC"] -. control and host IO .- GPUs
+```
+
+平台工程师看 NVSwitch，重点不是背交换芯片代号，而是判断通信模式是否能吃到这个 fabric。典型收益来自节点内 tensor parallel、activation 交换、FSDP/ZeRO 局部 reduce-scatter、MoE expert dispatch，以及多 GPU 推理里的 hidden state 同步。典型吃不到收益的情况也很明确：数据预处理卡在 CPU；模型跨节点做 TP，瓶颈落到 InfiniBand/RoCE；或者作业落到 PCIe-only、双 GPU 桥接、不同 NUMA 域的混合拓扑。工程边界是：**NVSwitch 只解决节点内 GPU fabric，不解决跨节点网络、CPU 内存带宽、存储读取、kernel 低效和并行策略错误**。
+
+#### 4.2.4.2 HGX H100/H200 baseboard：物理布局如何影响调度直觉
+
+HGX 不是"8 张显卡插在主板上"，而是一块面向 OEM 服务器集成的 GPU baseboard。H100/H200 8-GPU SXM baseboard 的直觉可以这样记：8 个 SXM GPU 模块围绕中间的 NVSwitch 平面布置，底板负责提供高密度 NVLink 走线、供电、管理信号和到服务器 CPU/PCIe/NIC 的连接路径；CPU、内存、NIC、NVMe、风冷/液冷部件通常由整机厂在外层系统里完成。也就是说，HGX baseboard 给你的是一个强 scale-up GPU 岛，服务器整机再把这个岛接到 host 和 scale-out 网络。
+
+从平台视角，HGX 的物理布局会转化为 4 类工程约束。第一是故障域：8 张 GPU、NVSwitch、供电和散热耦合很强，GPU Xid 错误、NVLink lane 降级或 switch 异常可能影响整个 8 卡作业；调度系统需要能 drain 节点。第二是作业粒度：8 卡 HGX 适合 1/2/4/8 卡节点内切分，但多个小作业混布会争抢 HBM 带宽、PCIe host path、CPU cores 和 NIC；MIG 能隔离小推理任务，但不能把 NVSwitch fabric 变成无限资源。第三是拓扑可见性：`nvidia-smi topo -m`、NCCL topology dump、DCGM field、Kubernetes device plugin 标签，都应纳入 pre-flight validation。第四是设施边界：H100/H200 SXM 的 700W 级 TDP、8 卡节点的数 kW 功耗、风道/液冷和机柜供电，会限制机房可部署密度。
+
+| 形态 | 逻辑规模 | 典型互联 | 平台适配重点 | 工程边界 |
+|------|----------|----------|--------------|----------|
+| 8x PCIe GPU 服务器 | 8 GPU，但常依赖 PCIe switch / root complex | PCIe 为主，少量 NVLink bridge 取决于卡型 | 成本、通用性、推理副本密度 | 不适合高频 TP；GPU 对之间带宽不均匀 |
+| HGX H100 8-GPU | 单节点 8 GPU scale-up island | 4x NVSwitch + 每 GPU 约 900 GB/s 双向 NVLink 聚合 | 大模型训练、节点内 TP/PP、NCCL collectives | 仍需 IB/RoCE 做跨节点；故障常以整节点处理 |
+| HGX H200 8-GPU | 单节点 8 GPU，显存更大 | 与 Hopper HGX 平台判断类似 | 长上下文、显存敏感训练/推理 | 算力不比 H100 翻倍，收益主要来自 HBM 容量/带宽 |
+| GB200 NVL72 | 单机柜 72 GPU NVLink domain | NVLink Switch System，rack-scale fabric | 万亿参数推理、MoE、rack 内大 TP/EP | 供电液冷、分区、运维和采购门槛显著提高 |
+
+这张表的关键不是说某个形态绝对更好，而是提醒平台工程师把"节点"定义清楚。对 A100/H100 时代，很多系统默认一个 8 卡服务器是基本调度单元；到 GB200/NVL72 时代，一个机柜内部的 72 张 GPU 可能才是一个高带宽 scale-up 域。调度器、队列、配额和作业模板如果还只理解单机 8 卡，会让用户在并行策略上做错假设。
+
+#### 4.2.4.3 GB200/NVL72：把 scale-up 边界从主板推到机柜
+
+GB200 NVL72 是 Blackwell 代更激进的系统形态：一个液冷机柜里包含 36 个 Grace CPU 和 72 个 Blackwell GPU，核心构件是 GB200 Grace Blackwell Superchip，即 1 个 Grace CPU 通过 NVLink-C2C 连接 2 个 Blackwell GPU。多个 compute tray 通过 NVLink Switch System 连接，形成 72-GPU NVLink domain；NVIDIA 公开规格给出的 rack-level NVLink 带宽约 130 TB/s，HBM 总容量约 13.4 TB，HBM 总带宽约 576 TB/s。这里的关键词是 rack-level：它不是把 9 台 8 卡服务器用 InfiniBand 接起来，而是把机柜内部做成一个更大的低延迟 GPU fabric。
+
+这种架构对应的 workload 很明确。第一类是万亿参数级别推理，长上下文和高并发下，单个请求或一组请求需要跨很多 GPU 切分权重和 KV Cache；rack 内 NVLink domain 可以减少跨 IB 的 TP 通信。第二类是 MoE，token dispatch 和 expert combine 对 GPU-GPU 带宽更敏感，rack 内大域能让 expert placement 更灵活。第三类是大规模训练的局部通信，把高频张量并行、专家并行放在 rack 内，把较低频的数据并行同步交给跨 rack IB/RoCE。
+
+但 NVL72 不是"把任何程序自动加速 30 倍"。工程边界至少有 6 条。第一，软件必须理解 NVLink multi-node domain，包括 NCCL、CUDA、驱动、fabric manager、分区管理和作业编排；旧的单机拓扑假设会失效。第二，调度单位更贵，错误 placement 的机会成本更高，平台需要按 NVLink domain、partition、compute tray、故障状态表达资源。第三，rack-scale 液冷、供电、维护窗口和备件策略进入平台工程范围。第四，跨 rack 仍需要 InfiniBand 或 Spectrum-X 这类 scale-out 网络，NVL72 只把最热通信留在 rack 内。第五，推理收益依赖请求形状和并行方式；如果瓶颈是 tokenizer、HTTP batching、KV eviction 或存储加载，NVL72 的 fabric 不会救你。第六，一个 rack 是巨大的故障域和资本开销单元，适合有稳定大模型负载的平台，不适合需求还在探索期的小团队。
+
+因此，HGX H100/H200 和 GB200/NVL72 的本质差异不是"Hopper vs Blackwell"这么简单，而是 scale-up 边界不同：HGX 把 8 张 GPU 组成节点内岛；NVL72 把 72 张 GPU 组成机柜内域。平台工程师要把模型并行策略、通信热路径、调度单元、设施能力和预算周期对齐。
 
 #### 4.2a 主流 GPU 横向对比
 

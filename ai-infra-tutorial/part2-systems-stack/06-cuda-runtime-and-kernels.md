@@ -4,6 +4,73 @@
 
 > **关联章节**：本章内容与 [第5章](./05-memory-interconnect-io.md) 的搬运链路、[第4章](./04-gpu-and-accelerators.md) 的硬件上限直接相连。运行时优化的目标，是把硬件能力尽量接近真实可用吞吐。后续的 [第15章](../part4-inference-infra/15-batching-scheduling-and-kv-cache.md) 批处理调度、[第16章](../part4-inference-infra/16-quantization-compilation-and-engines.md) 编译优化，本质上都依赖本章讨论的 kernel launch、stream 和融合机制。
 
+## 1. 第一性原理拆解 + 学习大纲
+
+### 拆 — 不可化简的问题
+
+剥离 CUDA、PyTorch、kernel、stream、Graph 这些名字，本章真正要解决的不可化简问题是：**一台 GPU 有大量并行计算单元和很高的显存带宽，但它不能自己理解模型，也不能自己决定下一步执行什么；AI 系统必须把上层的张量表达，分解成设备能执行的命令流，并让这些命令在有限的调度、内存、寄存器和同步约束下持续喂满硬件**。这件事之所以难，不是因为 API 多，而是因为两类时间尺度天然不匹配：CPU / runtime 发起一次 kernel 可能要 20-200 μs，而一个小算子本身可能只执行 5-20 μs；GPU 内部一个 warp 的指令切换以 cycle 计，而一次 HBM 访问可能要数百 cycle。只要命令供应、数据供应或线程驻留任一环节断掉，峰值 TFLOPS 就只存在于规格表里。
+
+原本的导言说"AI 工程师不一定要手写很多 kernel，但必须知道框架调用到底是怎样落到设备执行上的"，它对应的不是好奇心，而是工程责任边界。训练或推理慢，表面现象可能都是 GPU 利用率低：有时是 Python 和 dispatcher 把图切成了几千个小 kernel；有时是 stream 依赖让 H2D 拷贝和计算串行；有时是一次 `.item()` 把异步队列强制拉平；有时是某个自定义 kernel 因 register pressure 太高，occupancy 掉到很低，还把临时变量 spill 到 local memory。平台工程师不需要代替库作者重写 GEMM，但必须能判断"慢在发命令、排队、同步、访存、寄存器，还是算子实现"。本章就是把这条从 `model(x)` 到 SM execution 的链路拆开，让你能把一个黑箱 profile 还原成可行动的瓶颈假设。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从"GPU 不能自己决定干什么"出发，第一层机制必然是 runtime 和 driver：上层框架必须把张量操作变成 kernel launch，把参数、grid、block、stream 和依赖关系提交给设备。由于 launch 有固定成本，第二层机制必然是减少 launch 次数：算子融合把多个小算子合成一个 kernel，CUDA Graph 把重复的 launch 序列捕获成可回放的 DAG，编译器把稳定 shape 下的 eager 调用变成更少的设备命令。这里的因果不是"Graph 很高级所以要学"，而是"当每个小 kernel 的执行时间小于 launch 开销时，CPU 发命令会成为系统瓶颈"。
+
+从"GPU 同时处理多条命令和多块数据"出发，stream 必然存在。没有 stream，所有拷贝、计算、通信都像单队列排队，H2D 预取、NCCL allreduce 和反向计算就无法重叠。stream 带来异步性，也带来同步语义；因此 event、隐式同步点、默认 stream 行为就变成工程边界。一个 `print(loss.item())` 看起来只是日志，实际可能把 CPU 阻塞到 GPU 完成前面所有工作；一个错误的 event 依赖可能让多 stream 重新退化成串行。
+
+从"设备内部资源有限"出发，SM、warp、register、shared memory 和 occupancy 必然进入视野。kernel 被分成 block，block 被调度到 SM；SM 用 warp scheduler 在多个 warp 之间切换，以隐藏访存延迟。每个线程需要 register 保存中间值，每个 block 可能需要 shared memory；这些资源越多，同一 SM 能驻留的 block / warp 越少。若单线程临时变量过多，编译器会产生 register spill，把本该在寄存器里的值放到 local memory，而 local memory 实际落在显存路径上，代价远高于寄存器访问。于是你会看到一个反直觉结论：更复杂的 fused kernel 不一定更快，融合降低了 launch 和 HBM 中间写回，但也可能增加 register pressure，降低 occupancy，甚至因 spill 变慢。工程优化的目标不是追一个单指标，而是在 launch overhead、访存次数、occupancy、寄存器使用和库成熟度之间找可验证的平衡。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((CUDA runtime 与 kernel 执行))
+    不可化简问题
+      GPU不会理解模型
+      CPU必须提交命令
+      设备资源有限
+      异步队列需要依赖
+    从model到设备
+      Python调用
+      Framework dispatcher
+      CUDA runtime API
+      Driver
+      GPU scheduler
+      SM execution
+    Launch成本
+      小kernel太多
+      CPU发命令跟不上
+      算子融合
+      CUDA Graph
+      torch.compile
+    Stream与同步
+      H2D和计算重叠
+      NCCL通信重叠
+      event依赖
+      item和cpu隐式同步
+    SM内部约束
+      Block调度到SM
+      Warp scheduler
+      Register pressure
+      Occupancy
+      Spill到local memory
+    工程判断
+      nsys看时间线
+      ncu看kernel
+      优先成熟库
+      边界是端到端吞吐
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么一个 forward 里的 3000 个小 kernel 可能比 300 个较大的 fused kernel 更慢，即使总 FLOPs 没变？
+2. 从 `model(x)` 到 SM execution，中间至少经过哪些层，每一层常见的固定开销和排障工具是什么？
+3. 为什么 CUDA stream 能让拷贝、计算和通信重叠，而一个隐式同步点又如何把它们重新变成串行？
+4. CUDA Graph 解决的是哪一类 CPU / runtime 开销？为什么动态 shape、动态地址或复杂依赖会削弱它的收益？
+5. 一个 kernel 的 occupancy 很高但 Tensor Core utilization 很低时，你为什么不能简单说"GPU 已经跑满"？
+6. register pressure 如何限制 SM 上的活跃 warp？register spill 到 local memory 为什么可能让 fused kernel 反而变慢？
+7. 面对一次端到端性能退化，你如何判断该从框架图、runtime 时间线、stream 同步、成熟库版本，还是 kernel 级 `ncu` 指标开始查？
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -294,9 +361,11 @@ FlashAttention 系列是近年最典型的"算法 + 硬件协同设计"案例，
 
 这也说明：**对标准算子，依赖库的更新比自己优化实在得多**。除非你有特别定制的需求（自定义 mask、特殊 attention 变体），否则跟着 FlashAttention / cuDNN 的版本走就行。
 
-### 6.5 Warp 与内存合并简述
+### 6.5 SM 调度、Warp 与 Register Spill
 
-warp 可以粗略理解成 GPU 中一起执行的一小组线程（NVIDIA GPU 上是 32 个）。平台工程师不需要记住所有硬件细节，但需要知道两件事：
+一个 kernel launch 进入设备后，不是"整个 kernel 一次性占用 GPU"。更准确的过程是：grid 被拆成许多 thread block，GPU scheduler 把 block 分配到不同 SM；每个 block 内部的线程再按 warp 执行，NVIDIA GPU 上一个 warp 通常是 32 个线程。SM 内部有 warp scheduler，它会在多个已驻留的 warp 之间切换：某个 warp 在等 HBM、shared memory 或依赖指令时，scheduler 尽量切到另一个可执行 warp。这个机制的目标很朴素：用更多可运行 warp 隐藏单个 warp 的等待时间。
+
+warp 可以粗略理解成 GPU 中一起执行的一小组线程。平台工程师不需要记住所有硬件细节，但需要知道两件事：
 
 1. 如果同一 warp 里的线程走完全不同的分支，就会出现分支发散（warp divergence），执行效率下降
 2. 如果同一 warp 访问的地址连续、规整，更容易形成 coalesced memory access，显存访问效率更高
@@ -306,10 +375,37 @@ warp 可以粗略理解成 GPU 中一起执行的一小组线程（NVIDIA GPU �
 - 线程怎么排布
 - 数据怎么布局
 - 访存是否连续
+- 每个线程占用多少 register
+- 每个 block 占用多少 shared memory
 
-从平台视角看，这也是为什么碎 tensor、小 batch、频繁 gather/scatter 往往更难跑满硬件。
+#### 6.5.1 Register pressure、Occupancy 与 Spill
 
-#### 6.5.1 Occupancy：另一个常被误解的指标
+SM 的资源是硬边界：每个 SM 的 register file、shared memory、最大 block 数和最大 warp 数都有上限。一个 kernel 如果每个线程使用 32 个 register，和每个线程使用 128 个 register，能同时驻留在同一个 SM 上的 warp 数可能差很多。这种"单线程需要太多寄存器，导致 SM 上能同时容纳的 warp 变少"的问题，通常叫 register pressure。
+
+occupancy 指的是 SM 上活跃 warp 数占理论最大 warp 数的比例。它的作用是帮助判断资源是否限制了并发驻留，但它不是最终目标：
+
+| 现象 | 可能含义 | 该看什么 |
+|------|----------|----------|
+| occupancy 低 | register / shared memory / block size 限制驻留 | `ncu` 的 registers per thread、shared memory、active warps |
+| occupancy 高但 kernel 慢 | 活跃 warp 多，但都在等内存或分支发散严重 | memory throughput、warp stall reason、branch efficiency |
+| occupancy 中等但吞吐高 | 少量 warp 已经能喂满 Tensor Core 或访存流水 | Tensor Core utilization、kernel time |
+
+当 register pressure 高到编译器无法把所有临时变量都放进寄存器时，会发生 register spill：部分变量被放到 local memory。这里的 "local" 很容易误导，它不是 SM 内部的低延迟存储，而是每个线程私有的地址空间，通常走 L1/L2/HBM 路径。寄存器访问可以近似看成单 cycle 级别，spill 后一次加载 / 写回可能变成几十到数百 cycle，且会增加额外显存流量。对 fused kernel 尤其要小心：融合减少了 launch 和中间 tensor 回写，但也会延长变量生命周期，增加 register pressure；当 spill 明显出现时，融合收益可能被 local memory 流量吃掉。
+
+一个工程化判断边界：
+
+| 优化动作 | 可能收益 | 风险边界 |
+|----------|----------|----------|
+| 融合多个 elementwise op | 减少 launch 和 HBM 中间读写 | register 增多，block 驻留下降 |
+| 增大 tile / unroll | 提高数据复用和 Tensor Core 喂数效率 | register / shared memory 增多，可能 spill |
+| 限制 register 数 | 提高 occupancy | 编译器被迫 spill，单 warp 更慢 |
+| 追求高 occupancy | 更容易隐藏访存延迟 | 不保证 Tensor Core 利用率或端到端更快 |
+
+实战里不要只看一个指标。若 `ncu` 显示 `registers per thread` 很高、`local memory load/store` 不为零、warp stall 里有大量 memory dependency，同时 kernel time 变长，就要怀疑 spill。处理顺序通常是：先确认是否能换成熟库或更新 kernel 后端；再看是否能拆掉过度融合、缩小 tile、减少 unroll、降低临时变量生命周期；最后才考虑用编译参数强行限制 register。强制限制 register 是有代价的，它可能把"寄存器不够"直接变成"spill 更多"。
+
+**工程边界**：平台侧通常不需要手写 PTX 去微调每个 register，但需要能读懂 `ncu` 里的 `registers per thread`、occupancy、local memory traffic 和 stall reason。对训练 / 推理系统，最终验收不是 occupancy 从 45% 到 75%，而是端到端 step time、TPOT / ITL、GPU 时间线空洞和成本是否改善。对于 GEMM、attention、norm 这类成熟路径，优先升级 cuBLASLt、FlashAttention、Triton / Inductor 后端；只有在自定义 mask、特殊布局或新算子确实没有成熟实现时，才把 register pressure 当成 kernel 开发问题下钻。
+
+#### 6.5.2 Occupancy：另一个常被误解的指标
 
 `ncu` 会报 occupancy（SM 里活跃 warp 占最大 warp 数的比例）。很多人看到低 occupancy 就认为"GPU 没跑满"，其实是误解：
 

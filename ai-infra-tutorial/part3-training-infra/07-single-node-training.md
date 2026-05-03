@@ -4,6 +4,83 @@
 
 > **关联章节**：本章是 [第8章](./08-data-parallel.md) 扩展效率分析的基线，也直接依赖 [第5章](../part2-systems-stack/05-memory-interconnect-io.md) 的数据供给链路。没有单机基线，就很难解释多卡结果到底是“扩得好”还是“噪声更多”。
 
+## 1. 第一性原理拆解：为什么单机训练是训练系统的最小闭环
+
+### 拆 — 不可化简的问题
+
+剥掉 PyTorch、DDP、FSDP、AMP、Nsight 这些名字之后，单机训练要解决的不可化简问题其实只有一个：**如何让一台有限的机器，按可解释、可复现、可度量的方式，把数据转化成一次次参数更新。** 这台机器不是一个抽象的“GPU”，而是一组有边界的物理资源：CPU 负责读取、解码、拼 batch 和发起 kernel；主机内存负责缓存数据和承接 pinned memory；PCIe 或 NVLink 路径负责把数据送到设备；GPU HBM 放权重、梯度、优化器状态、activation 和临时 buffer；Tensor Core 负责真正的矩阵计算；本地盘或远端存储还会在 checkpoint、dataset shard、日志写入时插入额外扰动。训练脚本只是把这些资源串起来的调度程序。
+
+因此，本章不是“单卡怎么跑一个 demo”，而是建立后续所有训练基础设施的测量原点。单机阶段最宝贵的地方在于变量还少：没有跨机网络，没有大规模 collective，没有队列调度造成的拓扑差异，也没有多租户干扰。如果在这个最小闭环里，step time、显存峰值、tokens/s、loss 曲线、checkpoint 耗时都无法解释，那么到了 [第8章](./08-data-parallel.md) 的数据并行和 [第9章](./09-model-pipeline-parallel.md) 的模型并行，问题会被复制到更多设备上，排障成本会按卡数和节点数放大。单机基线的价值不是“规模小”，而是它让你第一次能把训练系统当作一条完整因果链来观察：输入有没有连续到达，计算有没有吃满硬件，显存预算是否闭合，指标是否在描述真实进展。
+
+这个不可化简问题还包含一个容易被忽略的约束：训练不是一次前向计算，而是持续数千、数万甚至数百万个 step 的闭环。一个 step 的延迟高并不可怕，可怕的是你不知道高在哪里；一次 OOM 也不可怕，可怕的是你无法判断它来自参数、梯度、优化器状态、activation、碎片还是临时通信 buffer。平台工程师需要的不是背诵“调大 num_workers”“打开 AMP”“用更大 batch”，而是能把每个动作映射到资源账本和时间账本：它减少了哪一项，增加了哪一项，是否只是把瓶颈从 HBM 挪到了输入链路，或者从计算挪到了 checkpoint 写入。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从“数据要持续变成参数更新”出发，第一件必然出现的机制是 step 拆解。因为训练慢不是一个可操作的诊断，必须把它拆成 `load`、`preprocess`、`h2d`、`forward`、`backward`、`optim`、`checkpoint` 和 `logging`。拆开之后，dataloader、pinned memory、prefetch、stream overlap 才有意义：它们并不是孤立技巧，而是在缩短或隐藏输入阶段，让 GPU 计算阶段不要等数据。
+
+第二件必然出现的机制是显存预算。权重只是模型训练账本里的第一行。训练需要梯度来更新参数，需要 AdamW 的 `m/v` 和可能存在的 FP32 master weight，需要为反向保留 activation，还需要 CUDA allocator、NCCL、framework runtime 的临时空间。于是 micro-batch、sequence length、activation checkpointing、optimizer 选择、mixed precision 都从同一个问题里被推导出来：在有限 HBM 里，哪些张量必须保存，哪些可以重算，哪些可以降精度，哪些必须分片。
+
+第三件必然出现的机制是精度策略。FP32 稳但贵，BF16/FP16 能让 Tensor Core 更有效，也能降低参数、梯度和 activation 的字节数。AMP 的本质不是“自动加速开关”，而是在数值稳定性、吞吐和显存之间给每类算子选择合适的数据格式。BF16 通常少受 loss scaling 困扰；FP16 更依赖 GradScaler 和溢出检查；某些 reduction、normalization、optimizer update 仍需要更高精度。平台侧要记录的不只是“开了 AMP”，而是具体 dtype、是否保留 master weight、loss scaling 策略、哪些算子被 autocast。
+
+第四件必然出现的机制是效率指标。GPU utilization 只回答设备是不是忙，不能回答忙在有效模型计算、重算、等待、拷贝还是低效 kernel。MFU（Model FLOPs Utilization）把“理论上一次训练 step 应该完成的模型 FLOPs”除以硬件峰值，用来衡量有效训练进展；HFU（Hardware FLOPs Utilization）看硬件实际执行了多少 FLOPs，activation checkpointing 这类重算会提高 HFU，却不提高每个 token 的有效训练进展。于是单机基线必须同时记录 tokens/s、step time、显存峰值、MFU/HFU 和 profiling 证据，否则高 utilization 可能只是一个漂亮但误导的表面数字。
+
+第五件必然出现的机制是基线实验。所有优化都需要对照组，所以必须固定数据切片、随机种子、sequence length、micro-batch、gradient accumulation、precision、checkpoint 频率和 profiler 采样窗口。单变量改变才有诊断价值：调 `num_workers` 是在验证输入供给，调 micro-batch 是在验证 HBM 与 Tensor Core 饱和度，开 activation checkpointing 是在用算力换显存，改 checkpoint 频率是在验证持久化写入对稳态 step 的干扰。单机训练因此成为后续分布式训练的校准尺，而不是临时过渡阶段。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((单机训练最小闭环))
+    不可化简问题
+      数据持续变成参数更新
+      有限CPU内存HBM算力
+      每个step必须可解释
+    时间账本
+      load
+      preprocess
+      H2D
+      forward
+      backward
+      optimizer
+      checkpoint
+      overlap与同步点
+    显存账本
+      params
+      grads
+      optimizer_state
+      activations
+      fragmentation
+      temporary_buffers
+    推导出的机制
+      dataloader_prefetch
+      pinned_memory
+      micro_batch
+      gradient_accumulation
+      mixed_precision_AMP
+      activation_checkpointing
+    效率指标
+      GPU_utilization
+      tokens_per_second
+      MFU
+      HFU
+      step_time_P50_P95
+    工程边界
+      单机基线先固定
+      单变量试验
+      profiler证据
+      再进入数据并行和模型并行
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 拿到一个训练作业时，如何把“训练慢”拆成可测量的 step 时间账本？
+2. 为什么 7B 模型的 BF16 权重约 `14 GB`，但朴素训练仍然放不进一张 `80 GB` GPU？
+3. micro-batch、gradient accumulation 和 effective batch 分别改变显存、吞吐和优化行为中的哪一部分？
+4. AMP 为什么既可能提升吞吐、降低显存，也可能引入数值稳定性和算子覆盖边界？
+5. GPU utilization、MFU、HFU 三个指标分别回答什么问题，为什么高 utilization 不能证明训练高效？
+6. 当 step time 抖动时，如何区分数据供给、H2D、kernel、checkpoint 和 logging 的影响？
+7. 一个最低可用的单机基线实验，必须固定和记录哪些变量，才能服务后续多卡扩展分析？
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -186,7 +263,9 @@ $$
 
 #### 7.4.1 Mixed Precision 对显存和速度的影响
 
-自动混合精度（AMP）的常见做法是：
+自动混合精度（AMP, Automatic Mixed Precision）的目标不是简单地“把所有张量变成半精度”，而是把训练 step 里不同数值敏感度的部分分层处理：矩阵乘、卷积、attention projection 这类 Tensor Core 友好的大算子尽量用 BF16 / FP16；loss、部分 reduction、normalization、optimizer update 等更容易受精度影响的路径保留 FP32 或更保守的累积方式。平台侧看 AMP，应该把它理解成一个工程策略：用更少字节和更高 Tensor Core 吞吐换取同等训练进展，同时守住数值稳定性边界。
+
+AMP 的常见做法是：
 
 - 主权重仍保留 FP32 副本，保证更新稳定
 - 前向 / 反向中的大量计算用 FP16 或 BF16 执行
@@ -201,6 +280,32 @@ $$
 
 - **BF16**：指数范围更大，通常比 FP16 更稳
 - **FP16**：更依赖 loss scaling 和算子实现细节
+
+在 PyTorch 里，一个最小训练 step 通常长这样：
+
+```python
+scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+
+for batch in loader:
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = model(batch).loss
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+```
+
+如果使用 BF16，很多训练栈会关闭 `GradScaler`，因为 BF16 的指数范围接近 FP32，溢出/下溢风险比 FP16 小；如果使用 FP16，则需要观察 scaler 是否频繁回退、loss 是否出现 `nan`、梯度范数是否异常。对平台基线记录来说，“AMP on”这个字段不够，应至少记录 `dtype=bf16/fp16`、是否有 FP32 master weight、是否启用 loss scaling、是否有 activation checkpointing、是否使用 fused optimizer。
+
+| 精度策略 | 参数/激活字节 | Tensor Core 友好度 | 数值稳定性 | 工程边界 |
+|----------|---------------|--------------------|------------|----------|
+| FP32 | `4 bytes` | 通常较差 | 最稳 | 显存和吞吐成本高，适合 debug 或少数敏感算子 |
+| FP16 AMP | `2 bytes` | 高 | 依赖 loss scaling | 需要监控 overflow、`nan`、scaler 回退频率 |
+| BF16 AMP | `2 bytes` | 高 | 通常更稳 | 需要硬件支持，老卡吞吐可能不理想 |
+| FP8 / 低精度训练 | `1 byte` 级 | 很高 | 策略复杂 | 超出本章单机基线范围，通常要配合框架和校准策略 |
+
+AMP 的工程边界是：它不能修复数据供给瓶颈，也不能让过小 micro-batch 自动吃满 GPU；它降低的是张量字节数并提升部分算子的峰值效率。如果 step time 主要耗在 dataloader、H2D、checkpoint 或 CPU 同步点，打开 AMP 后 MFU 可能只小幅变化。相反，如果原本是大矩阵计算占主导，BF16/FP16 通常会同时降低显存峰值、提升 tokens/s，并允许把 micro-batch 往上调一档。
 
 #### 7.4.2 典型模型显存实例
 
@@ -376,6 +481,31 @@ $$
 **是什么 batch、什么序列长度、什么 optimizer、什么精度、有没有 checkpointing。**
 只有把这些边界一起记录，显存预算和 step time 预估才真正可复用。
 
+把上面的估算翻译成真实训练步骤，可以得到一条更适合排障的推理链：
+
+| 训练步骤 | 主要资源动作 | 期望观察 | 异常时优先检查 |
+|----------|--------------|----------|----------------|
+| 读取 batch | CPU worker 从 shard 读取并 tokenize / collate | data time 低于 GPU compute time，P95 不剧烈抖动 | 远端存储、本地缓存、`num_workers`、CPU NUMA |
+| H2D 搬运 | batch 从 host pinned memory 进入 GPU | H2D 与上一个 step 的计算部分重叠 | `pin_memory`、non_blocking copy、隐式同步 |
+| 前向 | BF16 matmul / attention / MLP 执行并保存 activation | GPU kernel 连续，显存按 micro-batch 上升 | micro-batch 太小、算子碎片、sequence length 过长 |
+| 反向 | 读 activation、算梯度，可能触发重算 | checkpointing 开启时 compute time 上升但显存下降 | 重算过多、梯度 `nan`、autocast 覆盖不一致 |
+| 梯度规约 | ZeRO/FSDP 场景 reduce-scatter / all-gather | 通信与反向尽量 overlap | NCCL 等待、bucket 太小、NVLink 拓扑问题 |
+| optimizer step | AdamW 更新 FP32 master、`m/v`、BF16 权重 | 周期稳定，显存无持续泄漏 | fused optimizer、allocator 碎片、状态是否分片 |
+| checkpoint / logging | 周期性写权重、状态和指标 | 只在固定 step 出现可解释尖峰 | 文件系统吞吐、异步保存、保存频率 |
+
+这条链路有两个常见结论。第一，如果 `8 x H100 + ZeRO-2` 的显存只有 `35 GB` 左右但 step time 很差，问题大概率已经不是“放不下”，而是输入、通信 overlap 或 kernel 形态。第二，如果 `2 x H100 + ZeRO-1` 勉强跑在 `76-80 GB`，任何 dataloader 预取、临时 buffer、长序列抖动、checkpoint 保存都可能把作业推到 OOM，因此它不适合作为稳定平台默认配置。
+
+吞吐估算也要同时看 `tokens/s` 和 step 粒度。以上配置每个 optimizer step 是 `524,288 tokens`，如果 `gradient_accumulation=4`，每个 micro-step 约处理 `131,072 tokens`。因此：
+
+| 观测对象 | 计算方式 | 示例值 | 用途 |
+|----------|----------|--------|------|
+| micro-step tokens | `8 GPUs x 4 seq x 4096` | `131,072` | 判断单次前后向是否吃满 GPU |
+| optimizer-step tokens | `micro-step tokens x 4 accum` | `524,288` | 对齐 loss update 和 MFU 口径 |
+| optimizer-step 吞吐 | `524,288 / step_time` | `6s -> 87k tokens/s` | 与同机型历史基线对比 |
+| 每 GPU 吞吐 | `total tokens/s / 8` | `约 10.9k tokens/s/GPU` | 查单卡退化和拓扑不均衡 |
+
+工程边界必须写进实验记录：这些 FLOPs 估算没有包含 tokenizer、数据增强、checkpoint 写入，也没有把 attention 在长序列下的二次复杂度完全展开；`6 x params x tokens` 是 decoder-only 训练的粗略模型 FLOPs 口径，适合算 MFU 和做同配置横向比较，不适合替代 profiler。真正的平台判断应把显存表、tokens/s、MFU/HFU、P50/P95 step time、Nsight 或 `torch.profiler` 时间线放在同一份基线报告里。
+
 ### 7.5 单机训练最常见的几类瓶颈
 
 #### （1）数据加载瓶颈
@@ -462,11 +592,22 @@ $$
 \text{MFU} = \frac{\text{model FLOPs per step} / t_{\text{step}}}{\text{peak device FLOPS} \times N_{\text{devices}}}
 $$
 
-| 指标 | 在回答什么问题 | 容易被什么误导 |
-|------|----------------|----------------|
-| GPU utilization | GPU 是否长期在忙 | SM 忙于等待、拷贝或低效 kernel 时也可能很高 |
-| MFU | 有效模型计算占理论峰值多少 | 不包含激活重计算等“额外 FLOPs” |
-| HFU | 硬件实际执行 FLOPs 占理论峰值多少 | 开了重计算时可能高于 MFU |
+HFU 的分子换成硬件实际执行的 FLOPs：
+
+$$
+\text{HFU} = \frac{\text{actual hardware FLOPs per step} / t_{\text{step}}}{\text{peak device FLOPS} \times N_{\text{devices}}}
+$$
+
+这两个指标的关键差异在“什么算有效”。MFU 只把模型训练本身需要的理论 FLOPs 算进分子，常用近似是 decoder-only 模型 `6 x params x tokens`。它回答的是：当前系统把多少硬件峰值转化成了有效 token 训练进展。HFU 则更接近 profiler 里的硬件执行量，activation checkpointing、重复计算、某些 fused / unfused kernel 的额外操作都可能进入 HFU。也就是说，HFU 高不一定代表训练进展更快；它可能只是硬件在为省显存做更多重算。
+
+| 指标 | 在回答什么问题 | 分子口径 | 容易被什么误导 |
+|------|----------------|----------|----------------|
+| GPU utilization | GPU 是否长期在忙 | 采样窗口内 GPU 是否有活动 | SM 忙于等待、拷贝或低效 kernel 时也可能很高 |
+| tokens/s | 训练进度是否变快 | 单位时间处理 token 数 | batch、sequence length、accumulation 口径不一致时不可比 |
+| MFU | 有效模型计算占理论峰值多少 | 模型 FLOPs / step time | 不包含激活重计算等“额外 FLOPs” |
+| HFU | 硬件实际执行 FLOPs 占理论峰值多少 | 实际硬件 FLOPs / step time | 开了重计算时可能高于 MFU，但有效进展没同比增加 |
+
+可以用一个小例子建立直觉：同样是 `8 x H100` 训练 7B，假设不开 activation checkpointing 时 step time 是 `6s`，MFU 约 `46%`。如果为了省显存打开 checkpointing，硬件每步多执行 `25%` 重算 FLOPs，step time 增加到 `7s`。这时 MFU 会因为有效模型 FLOPs 不变、时间变长而降到约 `39%`；HFU 的分子却包含重算，可能仍接近或高于原来的读数。平台侧如果只看 HFU 或 utilization，可能会误判“硬件更忙所以更好”；但从训练进度看，tokens/s 下降了。
 
 一个典型误判是：
 
@@ -491,6 +632,18 @@ $$
 | 接近 60% 以上 | 往往已经做了大量 overlap 和通信优化 |
 
 例如前面 `7.4.4` 的 7B 算例里，如果 `8 x H100` 上一个 optimizer step 约 `6 s`，对应 MFU 约 `46%`，属于单机较健康区间；如果同样配置跑到 `12 s`，MFU 会掉到约 `23%`，这时就不能再只看 utilization，而应直接去查数据、通信和额外停顿。
+
+诊断时可以按下面的组合读数反推问题：
+
+| 组合读数 | 更可能的解释 | 下一步动作 |
+|----------|--------------|------------|
+| utilization 低，MFU 低，data time 高 | GPU 被输入链路饿住 | 查 dataloader、storage、H2D overlap |
+| utilization 高，MFU 低，HFU 也低 | GPU 忙但 kernel 效率差 | 查 micro-batch、算子融合、Tensor Core dtype |
+| utilization 高，MFU 低，HFU 较高 | 额外计算多，常见于重算 | 查 activation checkpointing、重复 forward、profiler FLOPs |
+| MFU 正常但 P95 step 抖动 | 稳态计算健康，周期性干扰明显 | 查 checkpoint、eval、日志、数据 shard 切换 |
+| tokens/s 高但 loss 更新慢 | gradient accumulation 口径被忽略 | 区分 micro-step 和 optimizer step |
+
+工程边界是：MFU/HFU 都依赖 FLOPs 口径，不能脱离模型结构、精度峰值和 step 定义使用。H100 的 BF16 dense 峰值、FP8 峰值、是否使用 sparsity 峰值不是同一个分母；单机单卡、单机 8 卡、多机集群也不能混用同一条经验线。平台基线里建议固定写法：`model FLOPs = 6 x params x optimizer_step_tokens`，`peak FLOPS = device BF16 dense peak x GPU count`，同时记录 activation checkpointing 是否开启。这样同一团队内部的 MFU 才能横向比较，跨论文或跨厂商数字则只能做数量级参考。
 
 ### 7.7 为什么单机基线极其重要
 

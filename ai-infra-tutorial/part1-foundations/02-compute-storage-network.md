@@ -1,6 +1,92 @@
 # 第2章：算力、存储与网络
 
-> 很多 AI 系统问题看起来发生在模型层，真正的瓶颈却早已在算力、存储和网络之间决定了上限。真正成熟的 AI 工程分析，不是先问“模型还能不能再优化”，而是先问：**数据有没有按时送到？算力有没有被喂饱？通信有没有拖住整体？系统有没有被最慢的一段卡死？**
+## 1. 第一性原理拆解：为什么算力、存储与网络必须一起看
+
+### 拆 — 不可化简的问题
+
+很多 AI 系统问题看起来发生在模型层，真正的瓶颈却早已在算力、存储和网络之间决定了上限。真正成熟的 AI 工程分析，不是先问“模型还能不能再优化”，而是先问：**数据有没有按时送到？算力有没有被喂饱？通信有没有拖住整体？系统有没有被最慢的一段卡死？**
+
+把所有术语先拿掉，只保留不可化简的问题：一个 AI 任务要把输入数据变成输出结果，必然要经历“取数、搬运、计算、同步、保存或返回”这些物理动作。每个动作都占用一种有限资源：存储负责把字节交出来，CPU 和内存负责解码、拼 batch、调度和缓存，PCIe / NVLink 负责把数据送到设备，GPU 负责高密度矩阵计算，网络负责跨机器同步或跨服务调用。只要其中一段供给速度低于后续消费速度，后续资源就会等待；只要其中一段尾延迟变大，端到端体验就会被拉长。这个问题不能被“更大模型”“更强 GPU”“更多机器”单独解决，因为系统吞吐不是某个部件的最大值，而是依赖链路上可持续供给能力的最小值。
+
+因此，本章的核心不是背诵“算力、存储、网络”三个名词，而是建立一个资源守恒视角：计算不会凭空发生，GPU 每算一次都需要权重、激活和输入数据已经在正确的显存位置；分布式训练每推进一步都需要各 rank 的梯度或参数状态达到一致；在线推理每返回一个 token 都要经过队列、模型服务、下游服务和客户端连接。所谓“GPU 利用率低”，本质上是昂贵计算单元处在等待状态；所谓“扩卡收益差”，本质上是新增计算能力被通信、同步、慢节点或调度开销吃掉；所谓“p99 很差”，本质上是某些请求走到了更慢的存储、网络或队列路径。先把这些物理约束看清楚，后面的机制才有意义。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从“端到端结果必须穿过一条有限资源链路”出发，可以自然推出本章的每个机制。第一，既然 GPU 是高吞吐但高成本资源，就必须区分理论算力、可利用算力和系统级有效算力：规格表上的 TFLOPS 只是上限，真实吞吐还要乘以 utilization 和 scaling efficiency。于是我们需要理解 batch size、算子形状、显存带宽、kernel launch、CPU 调度和多卡同步如何让 GPU 被喂饱或饿住。
+
+第二，既然计算前必须有数据，就必须讨论存储层级和读取模式。容量只回答“放不放得下”，不能回答“能否稳定按 1GB/s、10GB/s 或更高速度供给”。大量小文件会把吞吐问题变成元数据问题；远端对象存储会把读取问题变成网络往返和尾延迟问题；checkpoint 会把训练推进问题变成写入带宽、fsync 语义、分片合并和恢复时间问题。所以本章会把数据加载、数据打包、热冷分层、本地 NVMe 缓存、checkpoint 写回放在同一条链路里看。
+
+第三，既然训练和推理都要搬运数据，就必须讨论 CPU 内存到 GPU 显存之间的 Host-to-Device（H2D）路径。样本从磁盘进入 Page Cache，再进入用户态 buffer，经过解码、增强、batch 拼接，最后通过 pinned memory 和 DMA 进入 GPU；NUMA 拓扑又会决定 CPU、内存、GPU、NIC 之间是不是走了本地路径。如果 pinned memory 没开、batch 太碎、worker 绑错 NUMA node，即使存储和 GPU 都很强，H2D 仍然可能成为关键路径。
+
+第四，既然多卡和多机任务需要共同推进，就必须讨论网络。数据并行需要 AllReduce，张量并行需要高频中间结果通信，Pipeline 并行需要 stage 之间传激活，MoE 需要 all-to-all token dispatch。在线推理虽然不一定做梯度同步，但会跨网关、路由、向量库、reranker、数据库、外部工具和日志系统；每个服务的 p99 都可能叠加成用户感知的卡顿。于是“网络”不只是带宽，还包括延迟、抖动、拓扑、重试、超时、拥塞和尾延迟放大。
+
+第五，既然所有资源都可能重叠工作，也可能互相等待，就需要关键路径和木桶效应。训练 step 不能只看 forward / backward，要拆成 load、preprocess、h2d、forward、backward、sync、update、checkpoint；推理请求不能只看模型执行，要拆成 queue、tokenize、prefill、decode、postprocess、downstream、return。只有把时间拆开，才能判断优化 tokenizer 省 2ms 是否值得，或者减少 AllReduce 50ms 是否比换更强 GPU 更有效。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((AI 系统资源链路))
+    不可化简问题
+      输入必须被取出
+      数据必须被搬运
+      计算必须被执行
+      状态必须被同步
+      结果必须被保存或返回
+    算力
+      理论 TFLOPS
+      可利用算力
+        batch size
+        算子形状
+        显存带宽
+        kernel launch
+      系统有效算力
+        utilization
+        scaling efficiency
+        慢 rank
+    存储
+      读取模式
+        小文件
+        shard
+        顺序读
+      Page Cache
+        cache hit
+        cache miss
+        脏页回写
+      checkpoint
+        分片写入
+        异步上传
+    数据搬运
+      CPU 内存
+      pinned memory
+      H2D
+      NUMA
+        GPU pinning
+        NIC affinity
+    网络
+      分布式训练
+        AllReduce
+        all-to-all
+        拓扑
+      在线推理
+        网关
+        下游服务
+        p99
+    工程判断
+      关键路径
+      木桶效应
+      端到端 trace
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 当 GPU utilization 只有 30% 时，如何判断它是在等数据、等 H2D、等通信，还是 batch / kernel 本身太小？
+2. 为什么“存储容量足够”不能说明训练数据供给足够，应该额外检查哪些吞吐、延迟和读取模式指标？
+3. 一个训练 step 为什么要拆成 load、preprocess、h2d、forward、backward、sync、update、checkpoint，而不是只看 GPU compute time？
+4. Page Cache、pinned memory 和 NUMA 为什么会影响数据从磁盘到 GPU 的稳定性？
+5. 为什么单卡快、多卡不一定线性加速，新增 GPU 可能被哪些通信或同步成本抵消？
+6. 在线推理中为什么平均延迟正常但 p99 很差仍然是严重问题，网络和下游服务如何放大尾延迟？
+7. 面对一个慢系统，如何用“关键路径 + 木桶效应”决定先优化存储、CPU、H2D、GPU、网络还是队列？
 
 ---
 
@@ -348,7 +434,19 @@ AI 训练对存储的要求通常包括：
 | H2D 慢 | GPU 计算前等待 | pinned memory 未使用，batch 太碎 |
 | cache 不命中 | step time 抖动 | 热数据没有缓存，远端存储波动 |
 
-### 2.3.4 checkpoint 也是存储问题
+### 2.3.4 Page Cache / NUMA 如何影响数据到 GPU
+
+这里先做一个浅引用，完整机制见 [§0b](../part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md)。训练数据从文件系统读出时，通常不是每次都直接从磁盘进用户态，而是先经过 Linux Page Cache。第一次读取 shard 可能受远端存储、磁盘和文件系统限制；如果热数据仍在 Page Cache，后续 epoch 或相邻 worker 可能直接从内存命中，`t_load` 会明显下降。反过来，如果机器内存不足、checkpoint 写入产生大量脏页回写，或数据集工作集远大于可用内存，Page Cache 会频繁失效，表现为 step time 抖动、`cache` 指标下降、major page fault 或 IO wait 升高。
+
+NUMA 的问题更隐蔽。多 socket 机器上，CPU core、DRAM、PCIe root complex、GPU、NIC 并不是等距连接。如果 dataloader worker 在 socket 0 上运行，却把 batch 分配到 socket 1 的内存，再拷到挂在 socket 0 PCIe root complex 下的 GPU，H2D 路径会多一次跨 socket 访问，带宽和延迟都可能变差。`pin_memory=True` 只是让 Host 内存变成 page-locked，方便 DMA 和 `cudaMemcpyAsync`；它不自动保证 NUMA 亲和正确。工程上要把 dataloader worker、CPU affinity、内存分配、GPU pinning、NIC affinity 一起看，尤其是 GPU Direct Storage、RDMA 数据路径或多 GPU 多 NIC 训练节点。
+
+| 机制 | 影响点 | 典型症状 | 工程边界 |
+|---|---|---|---|
+| Page Cache | `t_load`、数据重复读取、checkpoint 写回干扰 | epoch 初慢后快、周期性 IO 抖动 | 适合热数据和重复读取；数据集远大于内存时不能把它当稳定缓存 |
+| pinned memory | `t_h2d`、异步 H2D 重叠 | GPU compute 前等待、H2D copy 时间高 | 会占用不可换出的 Host 内存；过量 pin 会挤压 Page Cache |
+| NUMA affinity | CPU 预处理、H2D、GPU / NIC 路径 | 同型号节点吞吐差异、跨 socket 带宽下降 | 需要结合拓扑绑定；不是简单增加 worker 就能解决 |
+
+### 2.3.5 checkpoint 也是存储问题
 
 训练大模型时，checkpoint 不只是“保存一下模型”。它可能包括：
 
