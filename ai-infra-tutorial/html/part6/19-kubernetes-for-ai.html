@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 19 章 · Kubernetes for AI — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=19" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 19 章 · Kubernetes for AI</h1>
+<p class="sub">从“异质机器、异质 AI 作业和多租户约束如何被声明、调度、恢复和解释”出发，理解 Kubernetes 在 AI 平台中应承担的 runtime plane 边界，以及上层控制面必须补齐的训练、推理、队列和治理语义。</p>
+<div class="chips"><span class="chip">Kubernetes</span><span class="chip">GPU Scheduling</span><span class="chip">CRD / Operator</span><span class="chip">Gang Scheduling</span><span class="chip">Volcano</span><span class="chip">Kueue</span></div>
+<div class="note"><strong>不可化简的问题：</strong>平台必须把“某个 AI 工作负载应以什么身份、用哪些资源、在哪些机器、按什么生命周期运行”表达清楚，并在失败、抢占、版本变化时持续逼近这个声明。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：Kubernetes for AI</a></li>
+<li><a class="anchor" href="#s2">学习目标与定位</a></li>
+<li><a class="anchor" href="#s3">Kubernetes 是底座，不是完整 AI 平台</a></li>
+<li><a class="anchor" href="#s4">AI 场景常见对象</a></li>
+<li><a class="anchor" href="#s5">训练 Job 与在线推理 Deployment 草图</a></li>
+<li><a class="anchor" href="#s6">GPU 在 K8s 里不是普通资源</a></li>
+<li><a class="anchor" href="#s7">Volcano / Kueue 的内部调度算法</a></li>
+<li><a class="anchor" href="#s8">拓扑感知调度、亲和与反亲和</a></li>
+<li><a class="anchor" href="#s9">分布式训练在 K8s 上的编排</a></li>
+<li><a class="anchor" href="#s10">存储和网络在 K8s 中如何体现</a></li>
+<li><a class="anchor" href="#s11">Kubernetes 的边界与工程建议</a></li>
+<li><a class="anchor" href="#s12">工具、小结与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：Kubernetes for AI</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>Kubernetes 是 AI 平台最常见的运行底座，但它解决的是“通用编排问题”，不是全部 AI 语义问题。把所有工具名拿掉，本章不可化简的问题是：一批异质机器上有 CPU、内存、GPU、磁盘、网卡、驱动、容器运行时和故障边界；一批任务有训练、推理、评测、批处理、服务化、发布、数据访问和多租户约束；平台必须把“某个工作负载应以什么身份、用哪些资源、在哪些机器、按什么生命周期运行”表达清楚，并在失败、抢占、版本变化时持续逼近这个声明。</p>
+<p>这个问题不能只靠 SSH 脚本解决。脚本描述“现在执行什么命令”，很难表达“期望系统最终是什么状态”。它也不能只靠单机进程管理解决，因为 AI 作业经常跨节点：8 卡训练可能要求同一节点内 NVLink，64 卡训练要求多个节点同时可用，在线推理还要经过 Service、readiness、HPA 和灰度发布。它更不能只靠 Kubernetes 原生对象全部解决，因为原生调度器主要理解 Pod 级资源请求，不天然理解模型版本、数据集血缘、checkpoint 一致性、KV Cache 压力、队列公平性和训练 worker 必须同时启动的语义。</p>
+<p>因此，本章不是背 Pod、Job、Deployment、CRD 的定义，而是建立边界：Kubernetes 负责把容器化工作负载变成可声明、可调度、可恢复、可观察的运行对象；AI 平台控制面负责把训练、推理、评测、发布和成本治理翻译成 Kubernetes 能执行的对象组合。边界混淆后，要么用户被迫手写复杂 YAML，要么平台把 K8s 当黑盒，直到 GPU 空转、Pod Pending、RDMA 拓扑错配、checkpoint 丢失时才发现缺少可解释的控制面。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“声明期望状态”出发，先推导出 Pod：它把容器、卷、网络 namespace 和资源请求绑定成最小调度单元。训练、评测和批处理要“运行到完成”，所以需要 Job；在线推理要长期存在、滚动升级和副本维持，所以需要 Deployment；多 worker 训练和模型服务无法只靠通用对象表达，所以需要 CRD / Operator，把 TorchJob、InferenceService 等高层语义翻译成 Pod、Service、ConfigMap 和 Secret。</p>
+<p>从“资源不是同质数字”继续推导，会出现 GPU device plugin、节点标签、taint/toleration、affinity/anti-affinity 和拓扑感知调度。CPU / 内存可按数量粗略切分，但 GPU 型号、显存、MIG、NVLink、PCIe、NUMA、RDMA、本地 NVMe 都会改变性能。一个 8 卡训练 Pod 放在 8 张无 NVLink 的卡上可能能启动但吞吐下降；一个跨 8 节点的 AllReduce 作业如果跨机架，通信时间可能从总时长的 20% 变成 50% 以上。于是调度不再只是“找够卡”，而是“找对形状、邻接关系和队列时机”。</p>
+<p>从“多租户资源竞争”再推导，会出现队列、配额、优先级和 gang scheduling。原生调度器逐个绑定 Pod，却不保证 32 个训练 worker 同时拿到资源；部分 worker 启动会占住 GPU，剩余 worker Pending，整个训练不前进。Volcano、Kueue 因此把“作业整体是否可运行”放在 Pod 绑定之前，先做准入、队列公平、资源预留或 PodGroup 检查。最后，从“运行不等于正确运行”推导出 K8s 边界：它负责怎么运行，不能证明数据集正确、模型已通过评测、发布符合策略、成本归因合理。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Kubernetes for AI))
+    不可化简问题
+      异质机器
+        GPU型号
+        NVLink和PCIe
+        RDMA和本地盘
+      异质任务
+        训练
+        推理
+        评测
+        批处理
+      多租户竞争
+        队列
+        配额
+        优先级
+    机制推导
+      声明期望状态
+        Pod
+        Job
+        Deployment
+      高层AI语义
+        CRD
+        Operator
+        TrainingJob
+        InferenceService
+      GPU不是普通资源
+        DevicePlugin
+        节点标签
+        拓扑感知调度
+        Affinity
+      整体作业准入
+        GangScheduling
+        Volcano
+        Kueue
+    工程边界
+      K8s负责怎么运行
+      平台负责是否该运行
+      观测负责运行得怎样</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 Kubernetes 更适合作为 AI runtime plane，而不是完整 AI platform？</li>
+<li>Pod、Job、Deployment、CRD / Operator 分别解决了哪类不可化简的运行问题？</li>
+<li>GPU 为什么不能只按 <code>nvidia.com/gpu: 8</code> 这种数量资源来理解？</li>
+<li>分布式训练为什么需要 gang scheduling 或队列准入，而不是简单创建多个 Pod？</li>
+<li>拓扑感知调度、节点亲和、Pod 反亲和分别在防止哪类性能或可靠性问题？</li>
+<li>Volcano / Kueue 能补上哪些原生 K8s 调度缺口，又不能替平台控制面解决什么？</li>
+<li>当一个 AI 作业运行失败或性能异常时，哪些问题应归因于 Kubernetes，哪些应归因于上层 AI 语义？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与定位</h2>
+<p>完成本章学习后，你将能够理解 Kubernetes 在 AI 平台中的合适定位，区分 Pod、Job、Deployment、CRD / Operator 在 AI 场景中的用途，理解 GPU 调度、存储挂载、网络与设备插件如何进入 K8s 运行模型，识别 Kubernetes 能解决什么、不能解决什么，并能为训练和推理任务写出最小 K8s 表达草图。</p>
+<div class="note"><strong>关联章节：</strong>如果你还不熟悉镜像、运行时和 GPU 设备是怎样接进容器的，建议先看 <a href="18-containers-and-runtime.html">第 18 章</a>。第 18 章解释的是执行路径，本章解释的是这些路径如何被 Kubernetes 组织起来。</div>
+<div class="success"><strong>核心判断：</strong>Kubernetes 是运行状态机，不是 AI 业务语义层。平台越成熟，越应该让用户提交“训练任务、模型服务、评测任务”，而不是让用户手写每一个底层 Pod。</div>
+<pre><code>AI control plane
+  - 训练语义、模型版本、评测门禁、成本治理
+  - 翻译成 Kubernetes 对象组合
+        ↓
+Kubernetes runtime plane
+  - Pod / Job / Deployment / Service / Secret / ConfigMap
+  - 调度、重启、健康检查、滚动发布</code></pre>
+</section>
+
+<section class="section" id="s3">
+<h2>3. Kubernetes 是底座，不是完整 AI 平台</h2>
+<p>Kubernetes 擅长运行容器、声明资源、服务发现、滚动发布、健康检查和基础伸缩。但它不直接解决数据集版本、实验追踪、模型评测、发布门禁和 KV Cache 调度。</p>
+<table><tr><th>能力</th><th>Kubernetes 原生擅长什么</th><th>AI 平台还要补什么</th></tr>
+<tr><td>运行</td><td>把容器放到节点上，维护期望副本数</td><td>训练入口、模型加载、分布式 rendezvous、镜像基线</td></tr>
+<tr><td>资源</td><td>CPU、内存、扩展资源请求与限制</td><td>GPU 型号、MIG、NVLink、RDMA、本地盘、队列配额</td></tr>
+<tr><td>服务</td><td>Service、Ingress、readiness、滚动升级</td><td>模型版本路由、灰度门禁、token 限流、KV Cache 压力感知</td></tr>
+<tr><td>恢复</td><td>Pod 重启、Job 重试、节点故障迁移</td><td>checkpoint 一致性、训练恢复点、推理权重预热</td></tr>
+<tr><td>治理</td><td>Namespace、RBAC、ResourceQuota</td><td>租户预算、成本归因、数据权限、发布审批</td></tr>
+</table>
+<pre class="mermaid">flowchart TB
+  U[用户提交 AI 意图] --> CP[AI Control Plane]
+  CP --> V[校验: 镜像/数据/评测/预算]
+  V --> T[翻译高层语义]
+  T --> K[Kubernetes Runtime Plane]
+  K --> P[Pod / Job / Deployment]
+  K --> S[Service / Secret / ConfigMap]
+  K --> Q[Scheduler / Queue / Device Plugin]
+  P --> O[观测与事件]
+  O --> CP
+  CP --> G[发布、回滚、降级、成本动作]</pre>
+<div class="warn"><strong>边界提醒：</strong>把 K8s 当完整 AI 平台，会让上层语义散落在 YAML、脚本和人工流程里；把 K8s 当黑盒，又会让 Pod Pending、GPU 空转和调度错配无法解释。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. AI 场景常见对象</h2>
+<p>AI 平台里的 Kubernetes 对象不是孤立知识点，而是由工作负载生命周期推导出来的：短生命周期任务用 Job，长期服务用 Deployment，高层训练和 serving 语义用 CRD / Operator。</p>
+<div class="grid-2">
+<div class="card"><h3>Pod</h3><p>最小运行单元，适合单个训练 worker 或单个推理实例。它绑定容器、卷、网络 namespace 和资源请求。</p></div>
+<div class="card"><h3>Job</h3><p>适合训练任务、评测任务和批处理任务。目标是运行到完成，并提供重试、完成状态和日志归因。</p></div>
+<div class="card"><h3>Deployment</h3><p>适合在线推理服务、网关和辅助服务。目标是长期存在、滚动升级、维持副本数并配合 readiness / liveness。</p></div>
+<div class="card"><h3>CRD / Operator</h3><p>适合更高层的训练或 serving 语义，包括多 worker 协调、生命周期管理和底层对象生成。</p></div>
+</div>
+<table><tr><th>对象</th><th>AI 场景典型用途</th><th>不适合直接承担的语义</th></tr>
+<tr><td>Pod</td><td>单个 worker / serving 实例</td><td>模型是否通过评测、训练整体是否可启动</td></tr>
+<tr><td>Job</td><td>训练、评测、批处理</td><td>跨队列公平性、模型注册、发布审批</td></tr>
+<tr><td>Deployment</td><td>在线推理与长期运行服务</td><td>KV Cache 全局调度、按模型版本的质量门禁</td></tr>
+<tr><td>CRD / Operator</td><td>训练和 serving 的高层语义封装</td><td>组织级预算、业务价值判断、数据合规审批</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 训练 Job 与在线推理 Deployment 草图</h2>
+<p>一个最小训练 Job 可以表达镜像、命令、GPU 数量和重启策略。真实平台通常还会补 PVC / 对象存储挂载、环境变量、调度约束、节点选择、日志采集和失败重试策略。</p>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-reranker
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: ai-train:cuda12.4
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+          command: ["python", "train.py"]
+          args: ["--config", "configs/reranker.yaml"]</code></pre>
+<p>一个在线推理 Deployment 更看重副本数、readiness / liveness、灰度策略和扩缩容联动。它表达的是“长期维持若干个可服务副本”，不是“把一次训练跑完”。</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-serving
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: server
+          image: llm-serving:latest
+          resources:
+            limits:
+              nvidia.com/gpu: 1</code></pre>
+<div class="danger"><strong>生产风险：</strong>只写 <code>nvidia.com/gpu: 1</code> 不等于一个可上线推理服务。没有 readiness、权重预热、版本路由、限流和回滚策略，Deployment 只能证明 Pod 在运行，不能证明服务可承载真实流量。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. GPU 在 K8s 里不是普通资源</h2>
+<p>Kubernetes 原生很擅长 CPU / 内存，但 GPU 有额外复杂性：型号不同、显存差异大、多卡任务需要 gang scheduling，某些节点还有本地 NVMe、RDMA、NVLink 等附加特征。因此实际平台常常需要 device plugin、节点标签、拓扑感知调度和更高层队列系统。</p>
+<p>这正是 <a href="18-containers-and-runtime.html">第 18 章</a> 里“镜像 → runtime → GPU”链路被平台化之后的样子：K8s 本身不替你消化复杂性，只是把复杂性暴露成可编排对象。</p>
+<table><tr><th>扩展 / 机制</th><th>主要作用</th><th>什么时候最有价值</th><th>工程边界</th></tr>
+<tr><td>GPU Device Plugin</td><td>把 GPU 注册给 K8s，让 Pod 声明 <code>nvidia.com/gpu</code></td><td>所有 GPU 集群的基础前提</td><td>只暴露资源，不理解训练拓扑</td></tr>
+<tr><td>NVIDIA GPU Operator</td><td>管理驱动、container toolkit、device plugin、DCGM</td><td>GPU 节点需要统一基线</td><td>不替代容量规划和故障治理</td></tr>
+<tr><td>Node Feature Discovery</td><td>自动打节点硬件标签</td><td>GPU 型号、NUMA、网卡、本地盘差异明显</td><td>标签质量决定调度质量</td></tr>
+<tr><td>Topology-aware scheduling</td><td>结合标签、NUMA、PCIe、NVLink、机架做放置</td><td>多卡训练和 RDMA 集群</td><td>只能降低错配概率，不能修复坏网络</td></tr>
+<tr><td>Volcano</td><td>队列、PodGroup、gang scheduling、优先级</td><td>批训练和多租户抢占明显</td><td>偏调度执行层，不是实验平台</td></tr>
+<tr><td>Kueue</td><td>LocalQueue / ClusterQueue / ResourceFlavor 准入</td><td>多团队共享资源池，强调队列和配额</td><td>负责准入，不负责模型语义</td></tr>
+</table>
+<div class="note"><strong>关键边界：</strong>这些扩展能让 K8s 更像 AI 运行底座，但仍然不替代模型评测、发布门禁和成本治理控制面。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. Volcano / Kueue 的内部调度算法</h2>
+<p>分布式训练不能只靠“开多个 Pod”。例如一个 16 worker 作业每个 Pod 要 4 张 H100，总需求是 64 GPU；如果原生调度器先绑定了 12 个 Pod，剩余 4 个 Pod Pending，已绑定的 48 张 GPU 会空等 rendezvous。批调度层要先回答“整个作业是否值得进入运行态”，再让 Pod 逐个落点。</p>
+<pre class="mermaid">flowchart TD
+  A[用户提交训练任务] --> B[Operator 生成 Job/PodGroup 或 JobSet]
+  B --> C{队列准入}
+  C -->|资源不足| D[保持 Pending 或排队]
+  C -->|资源足够| E[计算可用节点和 ResourceFlavor]
+  E --> F{Gang 条件满足?}
+  F -->|否| D
+  F -->|是| G[按优先级/公平性选择作业]
+  G --> H[过滤节点: GPU/标签/亲和/污点]
+  H --> I[评分节点: 拓扑/碎片/负载]
+  I --> J[绑定 Pod 并启动 rendezvous]</pre>
+<p>Volcano 的核心抽象是 Queue、PodGroup 和调度 plugin。流程通常是：按队列权重、优先级或公平策略选候选作业，用 <code>minAvailable</code> 判断 PodGroup 是否满足 gang 条件；满足后进入 allocate / backfill / preempt。过滤阶段检查资源、taint/toleration、node affinity；评分阶段考虑 binpack、NUMA、GPU 拓扑或自定义 plugin。它适合整体性很强的训练、HPC 和批处理：要么一组 Pod 足量启动，要么不要占住稀缺 GPU。</p>
+<p>Kueue 更偏“准入控制”。用户把 Job、JobSet、MPIJob、RayJob 放入 LocalQueue，LocalQueue 指向 ClusterQueue；ClusterQueue 绑定 ResourceFlavor，例如 <code>h100-nvlink</code>、<code>a100-pcie</code>、<code>l40s-infer</code>，每个 flavor 有 quota。Kueue 判断 workload 是否可 admit：如果额度、flavor、优先级和 borrowing / preemption 规则满足，就标记准入，再由底层 Job controller 和默认调度器创建 Pod。</p>
+<table><tr><th>维度</th><th>Volcano</th><th>Kueue</th></tr>
+<tr><td>核心问题</td><td>运行时批调度和 gang scheduling</td><td>队列准入、配额和 ResourceFlavor</td></tr>
+<tr><td>关键对象</td><td>Queue、PodGroup、Job、Scheduler Plugin</td><td>LocalQueue、ClusterQueue、Workload、ResourceFlavor</td></tr>
+<tr><td>典型算法点</td><td><code>minAvailable</code>、优先级、preempt、backfill、binpack</td><td>quota、borrowing、preemption、flavor assignment</td></tr>
+<tr><td>更适合</td><td>强 gang 训练、HPC、批任务混部</td><td>多团队资源池、JobSet / Ray / Training Operator 准入</td></tr>
+<tr><td>工程边界</td><td>能决定“怎么调度这组 Pod”</td><td>能决定“是否允许这组 Pod 开始”</td></tr>
+</table>
+<div class="warn"><strong>工程边界：</strong>Volcano / Kueue 不知道 checkpoint 是否可恢复，也不知道 64 GPU 作业的通信拓扑是否满足你的 MFU 目标。平台仍要在提交前做资源画像、镜像校验、数据路径校验和容量预估。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 拓扑感知调度、亲和与反亲和</h2>
+<p>拓扑感知调度的目标是避免把可运行误判为可高效运行。K8s 可见信号通常来自节点标签和设备插件：<code>gpu.nvidia.com/model=H100</code>、<code>topology.kubernetes.io/zone=az-a</code>、<code>node.kubernetes.io/instance-type=p5.48xlarge</code>。平台还会补自定义标签，例如 <code>ai.local/nvlink-domain=hgx-01</code>、<code>ai.local/rdma-rail=rail-a</code>、<code>ai.local/local-nvme=true</code>。</p>
+<pre><code class="language-yaml">affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: gpu.nvidia.com/model
+              operator: In
+              values: ["H100"]
+            - key: ai.local/nvlink-domain
+              operator: Exists
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 80
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: llm-serving
+          topologyKey: kubernetes.io/hostname</code></pre>
+<p>训练常用强 node affinity：必须是 H100、必须有 RDMA、必须在同一可用区，必要时要求同一 NVLink domain。推理更常用 pod anti-affinity 和 topology spread：同一模型副本不要全压在一台机器或机架上，避免单点故障；但也不能过度打散，否则权重冷启动和本地缓存复用会变差。</p>
+<table><tr><th>机制</th><th>典型 AI 用法</th><th>代价</th></tr>
+<tr><td><code>nodeSelector</code></td><td>固定到 <code>gpu=H100</code> 的节点池</td><td>只能精确匹配，表达力弱</td></tr>
+<tr><td>required <code>nodeAffinity</code></td><td>训练必须有 H100 + RDMA + 本地 NVMe</td><td>条件过严会让 Pod 长期 Pending</td></tr>
+<tr><td>preferred <code>nodeAffinity</code></td><td>优先 H200，不够时退到 H100</td><td>性能可能不稳定，需要应用可接受降级</td></tr>
+<tr><td><code>podAffinity</code></td><td>参数服务器或缓存 sidecar 靠近 worker</td><td>容易造成热点和资源碎片</td></tr>
+<tr><td><code>podAntiAffinity</code></td><td>推理副本跨 hostname / zone 分散</td><td>可能降低缓存命中和部署速度</td></tr>
+<tr><td>topology spread</td><td>控制副本在 zone / rack / node 上均衡</td><td>需要准确 topology label</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+  A[AI workload shape] --> B{训练还是推理}
+  B -->|训练| C[强约束: GPU型号/RDMA/NVLink/同AZ]
+  B -->|推理| D[分散约束: hostname/zone/rack]
+  C --> E[减少通信损耗]
+  D --> F[降低故障域相关性]
+  E --> G{标签是否真实}
+  F --> G
+  G -->|真实| H[调度器可做合理放置]
+  G -->|缺失或错误| I[可运行但低效或不可靠]</pre>
+<div class="success"><strong>实践规则：</strong>8 卡以内单机训练可先用节点池 + GPU 型号标签；64 GPU 以上训练应把机架、rail、RDMA、NVSwitch domain 纳入准入和评分；在线推理优先保证跨故障域分散，再用预热和本地权重缓存抵消启动成本。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 分布式训练在 K8s 上的编排</h2>
+<p>平台工程上更稳的做法不是让用户自己拼 Pod，而是让用户提交“训练任务”，再由 Operator 或控制面翻译成底层对象。这样平台可以统一注入镜像、环境变量、服务账号、数据路径、日志采集、checkpoint 策略、队列和拓扑约束。</p>
+<table><tr><th>关键需求</th><th>为什么需要</th><th>K8s 常见实现</th></tr>
+<tr><td>Gang Scheduling</td><td>所有 worker 一起拿到资源，避免部分启动、部分等待</td><td>Volcano PodGroup；或 Kueue 配合 JobSet / 队列准入</td></tr>
+<tr><td>训练 Operator</td><td>把 <code>master/worker</code>、失败重试、环境注入做成高层语义</td><td>Kubeflow Training Operator、TorchJob、MPIJob</td></tr>
+<tr><td>稳定 rank</td><td>每个 Pod 有稳定索引，便于 rendezvous 和日志归因</td><td><code>completionMode: Indexed</code>、StatefulSet、JobSet</td></tr>
+<tr><td>拓扑约束</td><td>减少跨机架、跨 rail、跨 NUMA 的通信损耗</td><td>node affinity、topology spread、scheduler plugin</td></tr>
+</table>
+<pre class="mermaid">sequenceDiagram
+  participant User as User / Platform API
+  participant OP as Training Operator
+  participant Queue as Queue Layer
+  participant K8s as Kubernetes
+  participant Pods as Worker Pods
+  User->>OP: submit TrainingJob
+  OP->>OP: validate image/data/checkpoint policy
+  OP->>Queue: create workload / PodGroup
+  Queue-->>OP: admitted with flavor and quota
+  OP->>K8s: create indexed Jobs / Services / Secrets
+  K8s->>Pods: schedule and start workers
+  Pods->>Pods: rendezvous and train
+  Pods-->>OP: status, metrics, exit code
+  OP-->>User: running / succeeded / failed with reason</pre>
+<div class="note"><strong>可解释性要求：</strong>训练失败时，平台应该能区分是镜像拉取失败、队列未准入、节点资源不足、Pod 已启动但 rendezvous 失败，还是训练代码本身崩溃。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 存储和网络在 K8s 中如何体现</h2>
+<p>训练通常需要数据集读取、checkpoint 输出和模型仓库访问，这会体现为 PVC、对象存储 sidecar / SDK、本地盘缓存。训练和推理都依赖网络，但关注点不同：训练更关注带宽和节点间通信稳定性，推理更关注服务链路延迟和入口流量治理。</p>
+<div class="grid-2">
+<div class="card"><h3>存储路径</h3><ul><li>数据集读取：对象存储、并行文件系统、PVC、本地缓存</li><li>checkpoint 输出：一致性、吞吐、恢复点管理</li><li>模型仓库访问：权重下载、预热、版本绑定</li></ul></div>
+<div class="card"><h3>网络路径</h3><ul><li>训练：AllReduce、RDMA、跨机架带宽、rendezvous</li><li>推理：Service、Ingress、Gateway、负载均衡、超时</li><li>观测：metrics、logs、traces 与事件流</li></ul></div>
+</div>
+<table><tr><th>场景</th><th>K8s 表达</th><th>AI 平台关注点</th></tr>
+<tr><td>训练读数据</td><td>PVC、CSI、对象存储凭证</td><td>小文件放大、吞吐抖动、数据版本绑定</td></tr>
+<tr><td>checkpoint</td><td>Volume mount、Job 生命周期、重试策略</td><td>写入原子性、恢复点选择、跨节点可见性</td></tr>
+<tr><td>权重加载</td><td>Init container、本地盘、镜像层、对象存储</td><td>冷启动时间、缓存命中、版本一致性</td></tr>
+<tr><td>训练通信</td><td>Pod 网络、hostNetwork、RDMA device plugin</td><td>带宽、延迟、rail 绑定、拓扑错配</td></tr>
+<tr><td>在线入口</td><td>Service、Ingress、Gateway、HPA</td><td>P99、灰度、限流、超时和降级</td></tr>
+</table>
+<div class="warn"><strong>常见误判：</strong>Pod 状态 Running 不代表数据路径和通信路径健康。训练吞吐低可能是对象存储小文件、CPU 解码、RDMA 未生效或跨机架通信造成的。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. Kubernetes 的边界与工程建议</h2>
+<p>K8s 不知道你的模型是否已通过评测、你的数据集版本是否正确、你的 KV Cache 是否会爆显存、你的多租户配额是否合理。因此，K8s 解决的是“怎么运行”，而不是“为什么运行、是否该运行、运行得好不好”。</p>
+<table><tr><th>机制</th><th>解决什么</th><th>解决不了什么</th></tr>
+<tr><td>RBAC</td><td>控制谁能看、改、删 namespace 内对象</td><td>不理解模型版本、数据权限、发布门禁</td></tr>
+<tr><td>ResourceQuota</td><td>给 namespace 设 CPU / 内存 / GPU 上限</td><td>不能表达跨队列公平性和业务优先级</td></tr>
+<tr><td>PriorityClass</td><td>给 Pod 调度和抢占排序</td><td>不能判断业务价值和成本预算</td></tr>
+<tr><td>HPA</td><td>按指标调副本数</td><td>不能天然理解 token 形状、KV Cache 或权重加载成本</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A{AI 作业异常} --> B{Pod 是否被调度}
+  B -->|否| C[查 quota / queue / nodeSelector / taint / capacity]
+  B -->|是| D{容器是否 Ready}
+  D -->|否| E[查镜像 / 启动命令 / 权重加载 / 探针]
+  D -->|是| F{性能或质量是否异常}
+  F -->|性能异常| G[查 GPU 利用率 / 数据路径 / 网络拓扑 / batch]
+  F -->|质量异常| H[查模型版本 / 数据版本 / prompt / 评测门禁]
+  F -->|成本异常| I[查 token 分布 / 副本空转 / 租户策略]
+  C --> J[归因到 K8s 或调度策略]
+  E --> J
+  G --> K[归因到平台控制面或系统路径]
+  H --> K
+  I --> K</pre>
+<div class="success"><strong>工程建议：</strong>用 Kubernetes 承接通用运行语义，把训练 / 推理 / 发布 / 评测的 AI 语义放在更高层控制面；对 GPU 任务强制加入节点标签、资源画像与调度约束，不要把所有 AI 问题都强行塞回原生 K8s 资源对象。</div>
+<div class="danger"><strong>严重风险：</strong>如果平台只暴露原生 YAML，用户会把数据版本、模型版本、发布审批和预算规则写进脚本或注释里。事故发生时，K8s 只能告诉你 Pod 发生了什么，不能告诉你这次运行是否本该发生。</div>
+<p>namespace 级别的 RBAC 和配额更像“治理底板”，真正的多租户策略仍要继续上收到平台控制面。后续 <a href="20-queues-quotas-and-autoscaling.html">第 20 章</a> 会继续讨论配额、队列与自动扩缩容机制。</p>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 工具、小结与练习</h2>
+<h3>本章涉及的常见工具</h3>
+<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>GPU 节点基线</td><td>NVIDIA GPU Operator</td><td>统一管理驱动、device plugin 与监控组件</td></tr>
+<tr><td>批任务调度</td><td>Volcano、Kueue</td><td>常用于 gang scheduling 和队列治理</td></tr>
+<tr><td>分布式训练编排</td><td>Kubeflow Training Operator、TorchJob</td><td>把训练 job 抽象成高层语义</td></tr>
+<tr><td>模型服务编排</td><td>KServe</td><td>在 K8s 上封装模型服务部署和扩缩容</td></tr>
+</table>
+<h3>本章小结</h3>
+<table><tr><th>对象</th><th>AI 场景典型用途</th></tr>
+<tr><td>Pod</td><td>单个 worker / serving 实例</td></tr>
+<tr><td>Job</td><td>训练、评测、批处理</td></tr>
+<tr><td>Deployment</td><td>在线推理与长期运行服务</td></tr>
+<tr><td>CRD / Operator</td><td>训练和 serving 的高层语义封装</td></tr>
+</table>
+<div class="note"><strong>一句话小结：</strong>Kubernetes 把容器化 AI 工作负载组织成可声明、可调度、可恢复、可观察的对象；AI 平台要把模型、数据、评测、发布、成本和多租户约束翻译成这些对象，并解释运行结果。</div>
+<h3>练习题</h3>
+<ol>
+<li>为什么说 Kubernetes 是 AI 平台底座，而不是 AI 平台本身？</li>
+<li>训练任务和推理服务分别更适合哪些 K8s 对象？</li>
+<li>GPU 为什么在 K8s 里不能被简单当成“另一个 CPU”？</li>
+<li>请写出一个需要额外调度语义的 AI 场景，说明为什么原生资源对象不够。</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><h3>学习路线</h3><ol><li>先用 <a href="18-containers-and-runtime.html">第 18 章</a> 理解镜像、运行时和 GPU 设备链路。</li><li>再用本章把 Pod、Job、Deployment、CRD、Device Plugin、Volcano 和 Kueue 串成 runtime plane。</li><li>继续阅读 <a href="20-queues-quotas-and-autoscaling.html">第 20 章</a>，把队列、配额和扩缩容提升到平台治理层。</li></ol></div>
+<div class="card"><h3>延伸阅读</h3><ul><li>Kubernetes 官方文档：Pods、Jobs、Deployments、Scheduling、Device Plugins。</li><li>NVIDIA GPU Operator 与 DCGM Exporter 文档。</li><li>Volcano、Kueue、Kubeflow Training Operator、KServe 项目文档。</li><li>面向大规模训练的 topology-aware scheduling、gang scheduling 和 JobSet 设计资料。</li></ul></div>
+</div>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

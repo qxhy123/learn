@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 23 章 · 安全、隔离与治理 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=23" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 23 章 · 安全、隔离与治理</h1>
+<p class="sub">从“高价值资产、可执行产物、外部输入和多租户资源如何在同一条自动化流水线中保持边界”出发，推导身份、密钥、模型准入、供应链、租户隔离和治理闭环。</p>
+<div class="chips"><span class="chip">安全边界</span><span class="chip">多租户隔离</span><span class="chip">Secrets 管理</span><span class="chip">供应链安全</span><span class="chip">模型准入</span><span class="chip">治理闭环</span></div>
+<div class="note"><strong>不可化简的问题：</strong>AI 平台把数据、模型、镜像、Prompt、RAG 语料、日志和 GPU 资源放进同一条自动化链路后，任何边界被绕过，都可能从一次请求扩大成数据泄漏、模型泄漏、算力滥用或供应链污染。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：安全、隔离与治理</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">正文内容</a></li>
+<li><a class="anchor" href="#s4">本章小结</a></li>
+<li><a class="anchor" href="#s5">练习题</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：安全、隔离与治理</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 Kubernetes、Vault、cosign、Trivy、OPA、SafeTensors 这些工具名以后，本章真正要解决的不可化简问题是：<strong>AI 平台把高价值资产、可执行产物、外部输入和多租户资源放进同一条自动化流水线里，任何一个边界被绕过，损失都可能从一次请求扩大成数据泄漏、模型泄漏、算力滥用或供应链污染。</strong>传统 Web 服务的安全边界通常围绕 API、数据库和用户会话展开；AI 平台多出训练数据、RAG 语料、embedding 索引、模型权重、checkpoint、prompt 模板、Notebook 环境、训练镜像、推理镜像和日志样本。它们既是“数据”，又常常驱动“执行”：模型文件会被加载，Notebook 会拉取密钥，RAG 检索结果会影响工具调用，缓存结果可能跨租户复用，镜像层和 Python 依赖会在生产 Pod 里运行。</p>
+<p>因此本章开头的判断是：AI 平台的风险从来不只在“服务会不会挂”，还在“数据、模型、权限、成本和审计是否会一起失控”。安全回答“什么不能被未授权访问或篡改”；隔离回答“故障和越权能否停在边界内”；治理回答“规则能否被平台自动执行、度量、追溯和修正”。这三个问题不能拆开处理。只有安全规则，没有运行时隔离，攻击面会穿透到共享资源；只有隔离，没有审计和成本归因，平台无法判断谁越界、谁滥用、谁需要被限流；只有治理文档，没有准入控制、策略执行和证据链，规则会逐渐变成靠人工记忆维持的流程。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“资产流动必须可控”出发，首先必然推出<strong>身份与最小权限</strong>。训练任务、在线服务、评测流水线、数据处理 Job 和 Notebook 不能共享一个万能账号，因为共享账号让审计失效，也让单点泄露变成全平台泄露。于是需要服务身份、租户身份、短生命周期凭证、RBAC / ABAC、按数据集和模型仓库粒度授权。继续往下推，凭证本身变成高价值资产，所以需要 <strong>Secrets 管理</strong>：Secret 不能进代码、不能进镜像、不能进长期明文环境变量；它应按身份、租户、用途和 TTL 在运行时注入。</p>
+<p>从“模型和 checkpoint 既是资产也是可执行输入”出发，必然推出<strong>模型安全</strong>。如果平台允许任何人把外部 <code>.pt</code>、<code>.bin</code>、<code>.ckpt</code> 权重直接 <code>torch.load</code> 到共享训练或推理环境，边界就已经被突破，因为 Python <code>pickle</code> 的目标是恢复对象，不是验证安全数据格式。于是需要模型准入、格式约束、哈希校验、签名、隔离转换、SafeTensors 默认化，以及加载阶段的低权限沙箱。RAG 和 Agent 又把外部文本接入模型决策，因此权限检查必须进入检索、上下文拼装、缓存 key、工具调用和日志脱敏链路。</p>
+<p>从“生产运行的是构建产物而不是源码意图”出发，必然推出<strong>供应链安全</strong>。镜像、Python 依赖、CUDA 库、模型权重和评测数据都可能被篡改或漂移；如果部署系统只认 tag，不验证签名和 provenance，就无法区分官方构建、开发者本地构建和恶意上传。于是需要依赖锁定、SBOM、Trivy 扫描、cosign 签名、SLSA provenance、准入控制和例外流程。最后，从“多租户共享昂贵资源”出发，必然推出<strong>资源与故障隔离</strong>：GPU 配额、队列优先级、限流、预算、租户标签、日志隔离、索引隔离和故障域划分，都是为了让单个团队的实验、错误配置或滥用行为不拖垮公共平台。治理闭环则把这些机制串起来：规则定义、平台执行、指标与审计、异常发现、策略调整。没有闭环，安全规则会逐渐变成不可验证的口头约定。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((AI 平台安全、隔离与治理))
+    不可化简的问题
+      高价值资产流动
+      可执行产物进入生产
+      多租户共享资源
+    必然机制
+      身份与最小权限
+        RBAC 和 ABAC
+        审计日志
+      Secrets 管理
+        运行时注入
+        轮换与撤销
+      模型安全
+        SafeTensors 默认格式
+        哈希与签名
+      供应链安全
+        Trivy 扫描
+        cosign 签名
+        SLSA provenance
+      隔离与治理
+        租户边界
+        配额和限流
+        策略准入
+        闭环修正
+    AI 场景影响
+      RAG 权限越界
+      模型泄漏
+      镜像污染
+      成本失控
+      审计断链</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 AI 平台不能只用“API 鉴权 + 数据库权限”来定义安全边界？</li>
+<li>一个 Secret 从创建、注入、使用、轮换到撤销，平台至少要记录和限制哪些东西？</li>
+<li>为什么未知来源的 <code>pickle</code> / PyTorch 原生权重不能直接进入共享训练或生产推理环境？</li>
+<li>SafeTensors 解决的是哪一类安全问题，它不能替你解决哪些模型安全问题？</li>
+<li>cosign、Trivy 和 SLSA provenance 分别控制供应链里的哪一个风险点？</li>
+<li>RAG 缓存、向量索引和工具调用为什么必须带租户、权限和版本边界？</li>
+<li>如何判断一条治理规则已经进入平台闭环，而不是只停留在流程文档里？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<p>完成本章学习后，你将能够从平台视角识别 AI 工作负载中的安全边界，并把权限、隔离、审计和成本治理落到可执行机制上。</p>
+<div class="grid-2">
+<div class="card"><strong>边界识别</strong><br>识别 AI 平台中的主要安全边界，理解数据、模型、镜像、密钥和租户隔离的不同风险。</div>
+<div class="card"><strong>平台治理</strong><br>设计最小权限、审计和治理规则，并判断治理是否已经进入平台执行层。</div>
+</div>
+<ul>
+<li>识别 AI 平台中的主要安全边界。</li>
+<li>理解数据、模型、镜像、密钥和租户隔离的不同风险。</li>
+<li>设计最小权限、审计和治理规则。</li>
+<li>理解为什么治理必须进入平台，而不是停留在文档。</li>
+<li>用平台视角看待权限、合规和成本控制。</li>
+</ul>
+<div class="warn"><strong>边界提醒：</strong>安全机制的目标不是把平台流程变慢，而是让高风险动作默认可验证、可阻断、可回溯。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 正文内容</h2>
+
+<h3>23.1 AI 平台的攻击面比普通服务更宽</h3>
+<p>一个普通在线服务的关键安全面通常集中在 API 接口、数据库和用户认证。AI 平台则往往还包括训练数据、模型权重、checkpoint、镜像和依赖供应链、向量索引、prompt 模板、日志中的用户输入与模型输出。</p>
+<div class="note">哪怕服务本身没有宕机，平台也可能在数据泄漏、权限越界或供应链污染上出问题。</div>
+<table>
+<tr><th>资产或入口</th><th>普通服务常见边界</th><th>AI 平台额外风险</th><th>平台控制点</th></tr>
+<tr><td>数据</td><td>数据库读写权限</td><td>训练集、RAG 语料、评测集和日志样本可能包含隐私或内部知识</td><td>数据集授权、血缘、脱敏、日志 redaction</td></tr>
+<tr><td>模型</td><td>服务二进制或配置</td><td>权重和 checkpoint 既是知识资产，也可能触发不安全加载路径</td><td>模型准入、格式约束、签名、下载审计</td></tr>
+<tr><td>运行环境</td><td>镜像、依赖、系统库</td><td>Notebook 镜像、CUDA 依赖、Python 包和本地构建可能进入生产</td><td>锁文件、扫描、签名、provenance</td></tr>
+<tr><td>多租户资源</td><td>服务配额</td><td>GPU、KV Cache、向量索引和成本预算可能被单租户拖垮</td><td>配额、限流、预算、故障域隔离</td></tr>
+</table>
+
+<h3>23.2 数据与模型都是敏感资产</h3>
+<p>训练集可能包含隐私或内部知识；日志可能意外记录原始用户内容；RAG 文档可能包含权限边界明显的内部资料。模型权重本身可能是核心知识资产，某些模型输出也会受 prompt 或检索内容影响，间接泄漏敏感信息。</p>
+<p>因此权限设计不能只盯“谁能访问 API”，还要管谁能读训练数据、谁能下载模型、谁能构建索引、谁能看到完整日志。</p>
+
+<h4>23.2.1 模型安全威胁</h4>
+<p>平台不只是在保护“服务接口”，还在保护模型文件、训练数据和推理链路本身。下面这些威胁在 AI 平台里很常见，而且很多都发生在“加载模型”或“接入外部内容”这种容易被忽视的环节。</p>
+<table>
+<tr><th>威胁</th><th>典型方式</th><th>平台侧防护思路</th><th>检查项</th><th>失败条件</th></tr>
+<tr><td><code>pickle</code> 反序列化攻击</td><td>直接对未知来源权重执行 <code>torch.load</code>，加载 <code>.pt</code>、<code>.bin</code>、<code>.ckpt</code> 时触发任意代码执行</td><td>默认禁用不受信任的 pickle 权重；优先使用 SafeTensors；把权重转换放到无网络、低权限的隔离环境</td><td>模型仓库是否允许未审核的 pickle 文件进入生产；是否存在独立的格式转换沙箱</td><td>生产或共享训练环境可以直接 <code>torch.load</code> 外部下载的权重</td></tr>
+<tr><td>模型中毒（data poisoning）</td><td>恶意样本混入训练集、增量反馈集或 RAG 语料</td><td>数据源分级、训练集审计、关键任务回归评测、标注链路留痕</td><td>训练前是否有数据来源标签和抽样复核；上线前是否有安全回归集</td><td>训练数据来源不明，或语料变更后没有回归评测就上线</td></tr>
+<tr><td>模型提取（model extraction）</td><td>通过 API 批量探测和蒸馏输出行为</td><td>强鉴权、按租户限流、异常调用检测、输出策略限制、水印或蜜罐样本</td><td>是否对高频、系统化 probing 做告警；是否区分内部与外部配额</td><td>单个调用方可长期高频采样而不触发限流或审计</td></tr>
+<tr><td>Prompt 注入</td><td>用户输入或检索文档诱导模型泄露系统提示词、越权调用工具</td><td>输入分层、检索内容净化、工具调用白名单、输出审查、上下文隔离</td><td>工具调用是否经过平台授权层；检索片段是否带来源和信任级别</td><td>模型可直接按外部文档指令调用高权限工具，或泄露系统提示词</td></tr>
+</table>
+<div class="danger"><strong>默认拒绝：</strong>对平台来说，重点不是承诺彻底消灭风险，而是把高风险路径做成默认拒绝、默认隔离、默认审计。</div>
+
+<h4>23.2.1.1 为什么 <code>torch.load</code> 风险高，SafeTensors 为什么更适合默认化</h4>
+<p><code>torch.load</code> 底层依赖 Python <code>pickle</code>。<code>pickle</code> 的设计目标是恢复 Python 对象，不是安全传输格式，所以加载未知来源文件时，本质上是在执行对方提供的反序列化逻辑。</p>
+<table>
+<tr><th>格式</th><th>典型加载方式</th><th>安全特征</th><th>平台建议</th></tr>
+<tr><td>Pickle / PyTorch 原生权重</td><td><code>torch.load(...)</code></td><td>可在反序列化时执行任意代码，不适合作为不受信任输入</td><td>仅允许来自受信任构建链路；默认不直接进入生产推理</td></tr>
+<tr><td>SafeTensors</td><td>safetensors loader</td><td>只描述张量数据，不执行 Python 对象反序列化逻辑</td><td>作为平台默认权重交换格式，更适合签名、校验和复现</td></tr>
+</table>
+<div class="success"><strong>实用原则：</strong>外部来源权重先验不可信，先转换、再扫描、再准入，而不是先加载再说。</div>
+<ul>
+<li>SafeTensors 只收窄“加载权重时执行任意 Python 代码”的风险，不保证模型没有后门、没有训练数据泄漏，也不保证输出安全。</li>
+<li>内部 checkpoint 可以保留 PyTorch 原生格式用于恢复训练，但必须限制读取范围，并把恢复环境和外部模型导入环境分开。</li>
+<li>外部模型进入平台时，最小准入链路应包括来源登记、哈希记录、格式检查、隔离转换、基础评测和责任人确认；不应允许 notebook 直接把任意权重挂进生产模型仓库。</li>
+</ul>
+
+<pre class="mermaid">flowchart LR
+  A[外部模型或 checkpoint] --> B[来源登记]
+  B --> C[哈希记录与格式检查]
+  C --> D{是否为安全默认格式?}
+  D -- 否 --> E[无网络低权限沙箱转换]
+  D -- 是 --> F[基础扫描与签名校验]
+  E --> F
+  F --> G[离线评测与安全回归]
+  G --> H{准入通过?}
+  H -- 否 --> I[拒绝入库并记录责任人]
+  H -- 是 --> J[模型仓库登记版本]
+  J --> K[训练或推理按最小权限加载]</pre>
+
+<h4>23.2.2 Secrets 管理</h4>
+<p>AI 平台里的 secrets 往往比普通服务更多，因为训练、评测、拉取模型、访问数据库、调用外部大模型和对象存储都可能需要凭据，而且很多作业还是短生命周期 Pod。</p>
+<div class="danger"><strong>Secrets 管理硬边界：</strong>Secrets 不入镜像、不入代码、不入环境变量明文。</div>
+<p>环境变量在很多团队里看起来方便，但它经常通过 <code>kubectl describe</code>、错误栈、调试页面、进程转储和日志系统扩散出去。更稳妥的做法是运行时按任务注入，尽量走文件挂载、sidecar 渲染或短时凭证。</p>
+<table>
+<tr><th>Secret 类型</th><th>AI 场景举例</th><th>推荐注入方式</th><th>检查项</th><th>失败条件</th></tr>
+<tr><td>模型下载 Token</td><td>HuggingFace Token、私有模型仓库凭证</td><td>Vault 动态注入、云 Secret Manager 临时读取、按 Pod 挂载文件</td><td>任务结束后是否自动回收；是否限制到特定仓库/模型</td><td>Token 被写入基础镜像、公共 notebook 模板或共享环境变量</td></tr>
+<tr><td>外部 API Key</td><td>OpenAI / Anthropic / 第三方 OCR 或检索 API Key</td><td>Vault、云 Secret Manager、K8s Secret + External Secrets Operator 同步到运行时</td><td>是否按租户/应用隔离；是否支持轮换和审计</td><td>多个团队共享一个长期 API Key，或 Key 出现在日志与报错里</td></tr>
+<tr><td>数据库 / 向量库凭证</td><td>Postgres、MySQL、Milvus、pgvector、Redis</td><td>Vault 动态账号、短时密码、最小权限 DB 账户</td><td>是否区分读写权限；是否和租户边界一致</td><td>所有服务共享 root 账号，或凭证写死在 Helm values / notebook</td></tr>
+</table>
+<table>
+<tr><th>注入方式</th><th>适合场景</th><th>优点</th><th>使用时的注意点</th></tr>
+<tr><td>Vault</td><td>高价值凭据、需要动态账号或短时令牌的任务</td><td>支持轮换、审计、动态凭证，适合数据库和高敏 API Key</td><td>需要把租户、角色和 TTL 设计清楚，避免“接了 Vault 但还是发长期 token”</td></tr>
+<tr><td>K8s Secret + External Secrets Operator</td><td>已有云 Secret Manager，希望同步到 Pod 运行时</td><td>易于和 Kubernetes 工作负载集成，便于统一声明式管理</td><td>只解决同步，不自动等于“最小权限”；仍要限制谁能读 Secret</td></tr>
+<tr><td>云 Secret Manager</td><td>使用云上托管数据库、对象存储和推理服务</td><td>和 IAM 集成好，适合按服务身份拉取</td><td>不要因为“云上托管”就把 Secret 明文写进环境变量</td></tr>
+</table>
+<table>
+<tr><th>常见事故</th><th>发生方式</th><th>平台侧预防</th><th>失败条件</th></tr>
+<tr><td>Secret 泄露到日志</td><td>应用启动打印环境变量、异常栈回显请求头、调试日志输出连接串</td><td>日志脱敏、启动脚本禁止 <code>env</code> 输出、敏感字段统一 redact</td><td>日志系统或 APM 中可直接搜索到 API Key / Token / DSN</td></tr>
+<tr><td>Secret 硬编码到 notebook 后推到 git</td><td>为了图快把 Key 写进 <code>.ipynb</code>、<code>.py</code> 或示例配置</td><td>预提交扫描、仓库 secret scanning、最小示例不带真实凭据</td><td>代码仓库中存在真实 Token，或历史提交可恢复出密钥</td></tr>
+<tr><td>Secret 打进镜像</td><td>在 Dockerfile <code>ARG</code> / <code>ENV</code>、构建缓存或基础镜像中固化凭据</td><td>构建阶段禁用真实 Secret，改为运行时注入；镜像扫描检查敏感字串</td><td>镜像层或构建缓存里能提取出凭据</td></tr>
+</table>
+<table>
+<tr><th>检查项</th><th>合格标准</th><th>失败条件</th></tr>
+<tr><td>Secret 来源</td><td>所有生产凭据来自 Vault、External Secrets Operator 背后的 Secret Manager，或云 Secret Manager</td><td>任何生产凭据来自代码仓库、镜像、Helm values 明文或 notebook</td></tr>
+<tr><td>Secret 生命周期</td><td>高价值凭据有轮换周期，短作业优先使用短时凭证</td><td>凭据长期有效且无轮换记录</td></tr>
+<tr><td>Secret 暴露面</td><td>Secret 不以明文环境变量在共享运行时长期暴露</td><td>多个 Pod、多人共享 shell、调试页面可直接看到明文</td></tr>
+<tr><td>Secret 审计</td><td>能追踪谁在什么时间读取了哪个 Secret</td><td>无法定位读取行为，泄露后无法回溯</td></tr>
+</table>
+<div class="warn"><strong>工程边界：</strong>K8s Secret 是 Kubernetes 对 Secret 的存储与分发机制，不等于完整 Secret 管理系统；如果 etcd 加密、RBAC、审计和轮换缺失，它只是在集群内换了一个存放位置。</div>
+<ul>
+<li>环境变量不是绝对禁止，但不适合作为高价值长期凭据的默认通道。短生命周期、低权限、单 Pod 使用的 token 可以临时用环境变量承载，但必须配合日志脱敏和 TTL。</li>
+<li>训练 Job 只应拿到访问当前数据集、当前模型仓库和当前对象前缀的最小权限；跨租户聚合、账单、审计由平台服务代办。</li>
+</ul>
+
+<h3>23.3 供应链安全不能忽略</h3>
+<p>AI 平台往往依赖大量镜像、Python 包和系统库。常见问题包括使用来源不明的基础镜像、依赖版本漂移、镜像里带有明文密钥、开发环境镜像直接进入生产。这些问题很少在功能测试阶段暴露，但会在生产期持续增加风险。</p>
+<h4>23.3.1 供应链安全加固</h4>
+<p>供应链加固的目标不是把流程变重，而是让关键产物能被追溯、验证和复现。对 AI 平台来说，供应链不只包括镜像和 Python 包，也包括模型权重、checkpoint、基础数据处理镜像和 notebook 依赖。</p>
+<table>
+<tr><th>控制点</th><th>最小做法</th><th>检查项</th><th>失败条件</th></tr>
+<tr><td>镜像签名验证</td><td>使用 <code>cosign</code> 对基础镜像和业务镜像签名，并在部署前校验签名</td><td>集群准入或 CI 是否阻止未签名镜像进入生产</td><td>任意来源的镜像只要 tag 对得上就能部署</td></tr>
+<tr><td>依赖锁定</td><td>使用 <code>requirements.lock</code>、<code>poetry.lock</code>、<code>uv.lock</code>、constraints 文件等锁定解析结果</td><td>构建是否严格按锁文件安装；升级是否走审阅流程</td><td><code>pip install -r requirements.txt</code> 每次解析结果可能不同</td></tr>
+<tr><td>漏洞扫描</td><td>在 CI 和镜像入库阶段运行 Trivy，对基础镜像和依赖做扫描</td><td>是否对 Critical/High 漏洞设置阻断阈值</td><td>漏洞扫描只出报告不阻断，或扫描结果无人处理</td></tr>
+<tr><td>构建 provenance</td><td>采用 SLSA 思路记录构建来源、构建器、输入和产物 provenance</td><td>是否能回答“这个镜像/权重由谁、用什么源码、在什么流水线构建”</td><td>产物来源不明，无法区分官方构建与手工上传</td></tr>
+<tr><td>模型与权重准入</td><td>把模型文件也纳入签名、哈希校验、来源登记</td><td>下载的 checkpoint 是否记录来源和摘要；是否默认偏向 SafeTensors</td><td>权重来源不明，或外部模型可绕过准入直接进入训练/推理集群</td></tr>
+</table>
+<table>
+<tr><th>交付门槛</th><th>通过条件</th><th>不通过条件</th></tr>
+<tr><td>镜像来源</td><td>基础镜像来自批准仓库，业务镜像有 <code>cosign</code> 签名且验证通过</td><td>镜像无签名、签名无效，或基础镜像来源不明</td></tr>
+<tr><td>依赖可复现</td><td>依赖由锁文件固定，构建脚本不会在线自由解析新版本</td><td>构建时允许自动漂移到未经审阅的新依赖</td></tr>
+<tr><td>漏洞基线</td><td>Trivy 扫描结果在允许阈值内，例外项有明确豁免记录</td><td>存在未豁免的 Critical 漏洞仍继续发布</td></tr>
+<tr><td>构建可追溯</td><td>产物带有 provenance，能映射到源码提交和 CI 任务</td><td>线上产物无法映射到具体构建记录</td></tr>
+</table>
+<p>SLSA 可以理解成“供应链成熟度框架”：它不替你做签名或扫描，但要求你把产物来源、构建过程和防篡改能力逐步标准化。很多团队一开始不需要追求高等级，但至少要做到“来源可追溯、构建可证明、产物可验证”。</p>
+<p>一个常被忽视的点是：模型权重文件本身也是供应链的一部分。如果权重或 checkpoint 仍然依赖 <code>pickle</code> 反序列化，就可能在加载阶段执行恶意代码；这也是为什么越来越多平台偏向 SafeTensors 这类更窄、更可验证的格式。checkpoint 格式与恢复链路可对照 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>。</p>
+<pre class="mermaid">flowchart LR
+  A[源码 / Dockerfile / 依赖锁文件] --> B[CI 构建]
+  B --> C[生成 SBOM]
+  C --> D[Trivy 扫描镜像与依赖]
+  D --> E{漏洞阈值通过?}
+  E -- 否 --> F[阻断发布并记录豁免申请]
+  E -- 是 --> G[cosign 签名镜像与模型产物]
+  G --> H[生成 SLSA provenance]
+  H --> I[推送制品仓库 / 模型仓库]
+  I --> J[集群准入验证签名和 provenance]
+  J --> K[部署训练 / 推理工作负载]</pre>
+<div class="note">Trivy 暴露已知漏洞和配置风险；cosign 让产物在部署前可验证“确实由可信身份签过”；SLSA provenance 描述“由哪个源码、哪个构建器、哪个流水线输入生成”。三者不能互相替代。</div>
+<div class="warn"><strong>工程边界：</strong>第一阶段目标不是追求最高 SLSA 等级，而是做到生产产物不可手工绕过、可验证、可追溯。先把未签名镜像、未登记模型和无锁文件依赖挡在生产外。</div>
+
+<h3>23.4 隔离不是只有“命名空间隔离”</h3>
+<p>AI 平台里的隔离至少有四层。很多平台只做了第一层，后面三层依然靠约定维持，这通常是不够的。</p>
+<table>
+<tr><th>隔离层</th><th>回答的问题</th><th>典型机制</th><th>缺失后的后果</th></tr>
+<tr><td>身份隔离</td><td>谁能提交任务、访问模型、调用服务</td><td>服务账号、RBAC / ABAC、短时凭证、审计日志</td><td>共享账号导致越权和审计断链</td></tr>
+<tr><td>资源隔离</td><td>谁最多能占多少 GPU、显存和队列容量</td><td>队列、配额、优先级、限流、预算</td><td>单租户刷爆公共资源或成本失控</td></tr>
+<tr><td>数据隔离</td><td>谁能访问哪些数据集、索引、日志</td><td>数据集 ACL、文档级权限、索引分区、日志脱敏</td><td>RAG、缓存或日志查询发生跨租户泄漏</td></tr>
+<tr><td>故障隔离</td><td>一个租户或模型故障是否会拖垮全平台</td><td>故障域、限流、熔断、独立队列、降级策略</td><td>低优先级实验拖慢高优先级生产服务</td></tr>
+</table>
+<pre class="mermaid">flowchart TB
+  A[租户请求 / 训练任务 / Notebook] --> B[身份边界]
+  B --> C{是否具备最小权限?}
+  C -- 否 --> D[拒绝并审计]
+  C -- 是 --> E[资源边界]
+  E --> F{配额和预算是否足够?}
+  F -- 否 --> G[排队 / 限流 / 降级]
+  F -- 是 --> H[数据边界]
+  H --> I{数据集/索引/日志是否授权?}
+  I -- 否 --> D
+  I -- 是 --> J[故障边界]
+  J --> K[独立运行域与观测]
+  K --> L[指标、成本、审计回写治理系统]</pre>
+
+<h3>23.5 一个最小治理清单</h3>
+<p>治理要变成平台默认规则，而不是“大家记得遵守”。下面这段配置不是某个具体产品的完整 schema，而是把治理要求压缩成可检查的最小边界。</p>
+<pre><code class="language-yaml">governance:
+  identity:
+    least_privilege: true
+    short_lived_credentials: true
+  artifacts:
+    model_download_audit: true
+    image_scan_required: true
+  serving:
+    tenant_rate_limit: true
+    prompt_log_redaction: true
+  cost:
+    team_label_required: true
+    monthly_budget_alert: true</code></pre>
+<div class="success"><strong>治理落地标准：</strong>规则必须能被 CI、准入控制、网关、调度器、观测系统或账单系统自动执行；否则它只是流程建议。</div>
+
+<h3>23.6 RAG 和多租户场景的特别风险</h3>
+<p>RAG 特别容易出现用户检索到了本不该访问的文档、缓存复用了不该共享的结果、向量索引版本和权限规则不同步等问题。这些问题和 <a href="../part4/13-feature-vector-and-cache.html">第 13 章</a> 的向量索引、缓存设计直接相连：检索快不代表权限就对，cache hit 更不能绕过租户和文档级别授权。</p>
+<p>多租户平台的常见问题包括：一个租户刷爆推理资源，低优先级实验拖慢高优先级服务，成本无法归因导致治理无从下手。</p>
+<pre class="mermaid">sequenceDiagram
+  participant U as 用户 / 租户
+  participant G as 模型网关
+  participant R as RAG 检索层
+  participant C as 缓存
+  participant V as 向量索引
+  participant A as 授权服务
+  U->>G: 请求带租户、用户、模型版本
+  G->>A: 校验服务与数据权限
+  A-->>G: 返回可访问数据范围
+  G->>C: 使用 tenant + user + policy + index_version 作为缓存边界
+  alt 缓存命中且权限版本匹配
+    C-->>G: 返回已授权上下文
+  else 未命中或权限版本不匹配
+    G->>R: 带授权范围检索
+    R->>V: 只查可访问分区/文档
+    V-->>R: 返回候选片段
+    R->>A: 文档级二次校验
+    A-->>R: 过滤结果
+    R-->>G: 返回授权上下文
+  end
+  G-->>U: 生成回答并写入脱敏日志</pre>
+<div class="danger"><strong>RAG 权限红线：</strong>缓存 key、向量索引分区、检索过滤、上下文拼装和工具调用都必须携带租户、权限和版本边界；任何一步省略都会把“命中更快”变成“越权更快”。</div>
+
+<h3>23.7 治理必须形成闭环</h3>
+<p>治理不是加几条审批流就结束，它需要闭环：</p>
+<pre><code>规则定义 -&gt; 平台执行 -&gt; 指标与审计 -&gt; 异常发现 -&gt; 策略调整</code></pre>
+<p>如果缺少“平台执行”和“审计证据”，治理最终仍会变成人工流程。</p>
+<pre class="mermaid">flowchart LR
+  A[规则定义] --> B[平台执行]
+  B --> C[指标与审计]
+  C --> D[异常发现]
+  D --> E[策略调整]
+  E --> A
+  B --> F[CI / 准入控制 / 网关 / 调度器]
+  C --> G[日志 / Trace / 成本 / 安全事件]
+  D --> H[告警 / 复盘 / 例外到期]
+  E --> I[阈值、配额、权限、准入策略更新]</pre>
+
+<h3>23.8 常见误区</h3>
+<div class="grid-3">
+<div class="card"><strong>误区一：内网系统就不需要细粒度权限</strong><br>不对。内网平台同样会面临误操作、过度权限和供应链问题。</div>
+<div class="card"><strong>误区二：安全会伤害效率，所以应尽量后置</strong><br>不对。后置安全通常意味着以后要用更高成本返工。</div>
+<div class="card"><strong>误区三：治理等于审批</strong><br>不对。审批只是治理的一部分，真正关键的是规则是否能被执行和审计。</div>
+</div>
+
+<h3>23.9 工程建议</h3>
+<ul>
+<li>默认最小权限，而不是默认放开。</li>
+<li>默认记录关键动作审计信息。</li>
+<li>对模型、索引、镜像、prompt 模板都建立版本和责任归属。</li>
+<li>把成本标签、权限标签、租户标签纳入平台元数据。</li>
+</ul>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>Secret 注入</td><td>Vault、External Secrets Operator</td><td>适合把外部 Secret Manager 接到运行时</td></tr>
+<tr><td>镜像与依赖扫描</td><td>Trivy、pip-audit</td><td>用于提前暴露基础镜像和 Python 依赖风险</td></tr>
+<tr><td>签名与 provenance</td><td>cosign、SLSA provenance</td><td>用于校验产物来源和构建责任</td></tr>
+<tr><td>策略执行</td><td>OPA Gatekeeper、Kyverno</td><td>适合把“非 root、必须签名、必须带标签”等规则做成默认策略</td></tr>
+</table>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 本章小结</h2>
+<table>
+<tr><th>主题</th><th>核心结论</th></tr>
+<tr><td>安全边界</td><td>AI 平台的攻击面覆盖数据、模型、镜像、服务、日志。</td></tr>
+<tr><td>隔离</td><td>需要同时考虑身份、资源、数据和故障四层。</td></tr>
+<tr><td>治理</td><td>必须进入平台默认机制，而不是只写在文档里。</td></tr>
+</table>
+<div class="note">本章的主线可以压缩成一句话：把高价值资产和可执行产物放入自动化平台后，安全、隔离和治理必须成为平台默认行为，而不是事后补充的流程文档。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 练习题</h2>
+<ol>
+<li>为什么 AI 平台的安全面比普通在线服务更宽？</li>
+<li>RAG 系统为什么特别容易出现权限越界问题？</li>
+<li>请写出一个最小治理配置中必须包含的 4 类规则。</li>
+<li>举一个“治理停留在文档里”最终会失败的场景。</li>
+<li>如果模型权重文件使用 <code>pickle</code> 序列化，存在什么安全风险？SafeTensors 为什么更适合进入平台默认格式？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先从 §1 建立安全、隔离、治理三者的因果关系。</li>
+<li>再阅读 §23.2，理解模型权重、RAG 语料、日志和 Secret 为什么都是敏感资产。</li>
+<li>随后阅读 §23.3，把镜像、依赖、模型权重和 checkpoint 纳入统一供应链视角。</li>
+<li>最后用 §23.4-§23.7 检查自己的平台是否具备多租户隔离和治理闭环。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li><a href="../part4/13-feature-vector-and-cache.html">第 13 章 · 特征、向量与缓存</a>：理解 RAG 索引、缓存和权限边界的关系。</li>
+<li><a href="../part5/17-multitenancy-and-cost.html">第 17 章 · 多租户与成本治理</a>：把租户隔离和成本归因接到推理平台。</li>
+<li><a href="../part6/19-kubernetes-for-ai.html">第 19 章 · Kubernetes for AI</a>：理解 Kubernetes 中身份、命名空间、准入控制和调度边界。</li>
+<li><a href="../part7/22-evaluation-release-and-incident.html">第 22 章 · 评测、发布与故障处理</a>：把安全准入、发布门禁和事故响应串起来。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

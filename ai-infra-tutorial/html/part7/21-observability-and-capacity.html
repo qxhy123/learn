@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 21 章 · 可观测性与容量规划 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=21" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 21 章 · 可观测性与容量规划</h1>
+<p class="sub">从“昂贵资源、随机负载和不完全可预测的模型行为如何在变坏之前被解释”出发，把 metrics、logs、traces、采样、cardinality、SLO、错误预算、容量和成本归因连成一套决策证据面。</p>
+<div class="chips"><span class="chip">Observability</span><span class="chip">SLI / SLO</span><span class="chip">Capacity Planning</span><span class="chip">Cardinality</span><span class="chip">Sampling</span><span class="chip">Cost Attribution</span></div>
+<div class="note"><strong>不可化简的问题：</strong>AI 系统把 GPU、队列、token、检索、模型版本和质量风险压缩成一次响应；平台必须在用户体验、可靠性预算和成本余量被烧光前，知道哪里偏离、为什么偏离、下一步该扩容、回滚、限流还是降级。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：可观测性与容量规划</a></li>
+<li><a class="anchor" href="#s2">学习目标与关联章节</a></li>
+<li><a class="anchor" href="#s3">可观测性不只是监控面板</a></li>
+<li><a class="anchor" href="#s4">三种主要观测信号</a></li>
+<li><a class="anchor" href="#s5">采样策略与 Cardinality 治理</a></li>
+<li><a class="anchor" href="#s6">AI 系统应该看哪些指标</a></li>
+<li><a class="anchor" href="#s7">GPU 监控指标详解</a></li>
+<li><a class="anchor" href="#s8">最小 SLI / SLO 框架</a></li>
+<li><a class="anchor" href="#s9">错误预算 burn-down</a></li>
+<li><a class="anchor" href="#s10">容量规划</a></li>
+<li><a class="anchor" href="#s11">常见可观测性误区</a></li>
+<li><a class="anchor" href="#s12">建议的最小 dashboard</a></li>
+<li><a class="anchor" href="#s13">成本归因</a></li>
+<li><a class="anchor" href="#s14">常见工具、小结与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：可观测性与容量规划</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>把 Prometheus、Grafana、OpenTelemetry、Jaeger、DCGM、SLO 这些工具名先拿掉，本章的不可化简问题只有一个：AI 系统把昂贵资源、随机负载和不完全可预测的模型行为压缩成用户看到的一次响应，工程师必须在响应变坏之前知道哪里偏离、为什么偏离、会烧掉多少可靠性和成本余量。训练会被一个慢 worker 拖住整组 GPU，推理会被少量超长 prompt 撑满 KV Cache，RAG 会因为检索抖动让 LLM 看起来“变慢”，灰度会因为质量退化但延迟正常而误判成功。它们的共同点不是“缺监控面板”，而是系统内部状态不能被单个指标直接观察。</p>
+<p>可观测性不是把所有事件全量存下来。全量存储会撞上三个硬边界：tokens/s、requests/s、训练 step 事件和 GPU 指标形成吞吐压力；tenant、model_version、adapter_id、trace_id、job_id 等维度组合制造 cardinality 爆炸；日志、trace、指标的存储和查询本身也会消耗预算。容量规划也不是简单问“需要几张 GPU”，而是把流量分布、token 长度、SLO、错误预算、发布窗口、故障冗余和成本归因放进同一张账本。看不见的系统会变成靠运气维护的系统；看得见但不能解释成本和风险的系统，也不算真正可观测。</p>
+<p>这个问题之所以不可再拆，是因为 AI 服务的失败会同时发生在资源层、链路层、模型层和经济层。HTTP <code>200</code> 可能只是请求成功返回，不代表答案有依据；GPU utilization 很高可能只是队列被挤满，不代表用户体验正常；P95 达标也不说明 P99、长上下文租户或新模型灰度没有在烧预算。真正的观测系统要把“发生了什么”“为什么发生”“接下来怎么办”连接起来，而不是把不同团队的 dashboard 放在一起。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>如果系统状态不能直接观察，第一步必然是选择信号。Metrics 用低成本聚合回答“趋势是否异常”，Logs 用结构化字段回答“这次请求发生了什么”，Traces 用跨服务上下文回答“时间花在链路哪一段”。三类信号要靠 <code>request_id</code>、<code>trace_id</code>、<code>tenant_id</code>、<code>model_version</code>、<code>job_id</code> 关联，否则只有 GPU utilization，看不出 queue wait；只有错误日志，看不出 SLO burn；只有 trace，看不出容量趋势。</p>
+<p>信号一旦被采集，就会推导出采样和 cardinality 治理。全量 trace 最有解释力，但成本不可控；head-based sampling 成本稳定，却可能错过慢请求；tail-based sampling 能保留错误和尾延迟，却要求 Collector 缓冲完整链路。维度越细，定位越快，但把 <code>user_id</code>、<code>prompt_hash</code>、<code>trace_id</code> 放进 metrics label 会让时间序列按请求级爆炸。因此必须提前定义哪些字段允许做 metrics label，哪些只能进入日志或 trace attribute，哪些必须 hash、截断或脱敏。</p>
+<p>当信号可以解释当前状态后，下一步是把状态变成决策边界。SLI/SLO 把“好请求”的定义写清楚，错误预算把可靠性余量量化，burn-down 暴露预算消耗速度。AI 服务还必须同时看质量和成本：99.99% 可用、P95 达标，但 grounded rate 下降或 cost_per_1k_tokens 翻倍，业务仍然失败。容量规划把边界反推成资源需求；成本归因把总账拆回 tenant、model、region、endpoint、job。于是本章的机制链条自然出现：先定义可解释信号，再控制信号规模，再把信号变成 SLO 和预算，最后把预算、容量和成本连接到控制面动作。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((可观测性与容量规划))
+    不可见状态
+      Metrics
+        趋势
+        告警
+        容量曲线
+      Logs
+        单次请求
+        结构化字段
+        审计证据
+      Traces
+        跨服务上下文
+        尾延迟归因
+        发布窗口证据
+    数据规模边界
+      Sampling
+        HeadBased
+        TailBased
+        Adaptive
+      Cardinality治理
+        低基数Label
+        高基数Attribute
+        请求唯一ID只做关联
+    决策边界
+      SLI和SLO
+      错误预算
+      BurnDown
+      发布和回滚
+    容量与经济边界
+      GPU需求
+      Token分布
+      冗余余量
+      成本归因
+      优化动作</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>P99 延迟升高且 GPU utilization 很高时，如何区分“模型计算慢”“队列排队长”和“上游链路慢”？</li>
+<li>为什么 metrics label 不能随意加入 <code>user_id</code>、<code>prompt_hash</code>、<code>trace_id</code>？</li>
+<li>head-based sampling 和 tail-based sampling 分别会错过什么证据？</li>
+<li>一个 AI 服务的 SLO 为什么不能只有 availability 和 latency，还要包含质量与成本指标？</li>
+<li>错误预算 burn-down 如何影响发布、扩容、回滚和限流决策？</li>
+<li>如何用 QPS、平均 token、单 GPU tokens/s 和目标利用率做第一版 GPU 容量估算？</li>
+<li>成本归因为什么必须绑定 tenant、model_version、endpoint、region 等维度？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与关联章节</h2>
+<p>完成本章后，你应该能把 AI 系统的观测信号组织成诊断证据链，能设计最小 SLI/SLO，能解释错误预算如何约束发布和扩容，能用流量、token 分布和 GPU 吞吐做第一版容量估算，并能把平台总成本归因到租户、模型、链路和请求形态。</p>
+<div class="note"><strong>关联章节：</strong>本章提供灰度、回滚和事故响应所依赖的证据面。如果没有这些信号，<a href="22-evaluation-release-and-incident.html">第 22 章</a> 的发布门禁和事故决策就会失去依据；配额和成本控制还会继续连接 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 与 <a href="../part6/20-queues-quotas-and-autoscaling.html">第 20 章</a>。</div>
+<div class="grid-3">
+<div class="card"><strong>诊断</strong><br>用 metrics、logs、traces 关联出“哪里慢、谁受影响、哪个版本引入”。</div>
+<div class="card"><strong>决策</strong><br>用 SLO、错误预算和质量/成本指标决定发布、回滚、限流和扩容。</div>
+<div class="card"><strong>规划</strong><br>用 token、QPS、利用率、冗余和成本归因反推容量与预算。</div>
+</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 可观测性不只是监控面板</h2>
+<p>一个成熟的可观测系统至少能回答三类问题：发生了什么，为什么发生，接下来怎么办。第一类问题定位异常对象，例如哪个指标、哪个租户、哪个模型、哪个区域或哪个 job 异常。第二类问题解释因果，例如是上游流量变化、资源饱和、调度问题、检索抖动、模型版本变更还是 prompt 变化。第三类问题把诊断变成动作：扩容、回滚、限流、降级、冻结发布还是继续观察。</p>
+<table><tr><th>问题</th><th>观测系统要给出的证据</th><th>可能的控制面动作</th></tr><tr><td>发生了什么</td><td>异常指标、受影响租户、模型版本、endpoint、region</td><td>标记事故、拉高采样、通知 owner</td></tr><tr><td>为什么发生</td><td>trace 分段耗时、队列长度、GPU 水位、日志错误码、发布事件</td><td>回滚、切流、重启副本、隔离依赖</td></tr><tr><td>接下来怎么办</td><td>SLO burn rate、容量余量、成本预算、质量采样结果</td><td>扩容、限流、降级、冻结发布、恢复放量</td></tr></table>
+<div class="success"><strong>核心判断：</strong>可观测性不是“把指标都采上来”，而是让系统证据足够支持诊断和决策。不能支持动作的面板，只是昂贵的可视化。</div>
+<pre class="mermaid">flowchart LR
+  A[用户体验变差] --> B{证据是否可关联}
+  B -- 否 --> C[只能猜测: 模型慢/网络慢/流量大]
+  B -- 是 --> D[定位影响范围]
+  D --> E[解释根因]
+  E --> F{动作边界}
+  F --> G[扩容]
+  F --> H[回滚]
+  F --> I[限流]
+  F --> J[降级]
+  F --> K[继续观察]</pre>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 三种主要观测信号</h2>
+<h3>Metrics</h3>
+<p>Metrics 适合回答当前系统是否偏离正常范围、趋势是上升还是下降、是否应该触发告警或扩容。典型指标包括 GPU 利用率、显存占用、queue wait time、tokens/s、P95/P99 latency、请求错误率、cache hit ratio。</p>
+<h3>Logs</h3>
+<p>Logs 适合回答这次失败到底是哪一步出错，哪个模型版本在服务这个请求，某次作业为什么退出。日志的关键不是多，而是可关联，至少应包含 <code>request_id</code>、<code>trace_id</code>、<code>model_version</code>、<code>tenant_id</code>、<code>job_id</code> 等字段。</p>
+<h3>Traces</h3>
+<p>Traces 在 AI 系统中尤其适合多段链路。RAG 请求常见路径是：</p>
+<pre><code>网关 -> 鉴权 -> embedding -> 向量检索 -> rerank -> LLM -> 安全过滤</code></pre>
+<p>如果没有 trace，很多尾延迟问题会被粗暴归到“模型太慢”，而真正慢的可能是检索、rerank、权限服务、对象存储回源或安全过滤。</p>
+<table><tr><th>信号</th><th>最适合回答</th><th>不适合承担</th><th>AI Infra 关键字段</th></tr><tr><td>Metrics</td><td>趋势、告警、SLO、容量</td><td>解释单次请求完整细节</td><td><code>tenant_tier</code>、<code>model_family</code>、<code>endpoint</code>、<code>region</code></td></tr><tr><td>Logs</td><td>单次失败、结构化事件、审计</td><td>高精度分位数和容量曲线</td><td><code>request_id</code>、<code>tenant_id</code>、<code>model_version</code>、<code>job_id</code></td></tr><tr><td>Traces</td><td>跨服务时序、尾延迟归因</td><td>直接计算真实错误率或账单</td><td><code>trace_id</code>、span name、span attribute、exemplar</td></tr></table>
+<pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant G as Gateway
+  participant E as Embedding
+  participant V as VectorDB
+  participant R as Rerank
+  participant L as LLM
+  participant S as Safety
+  C->>G: request_id / tenant_id
+  G->>E: trace context
+  E->>V: vector search span
+  V-->>R: candidates
+  R-->>L: ranked context
+  L-->>S: generated answer
+  S-->>C: response + metrics + logs</pre>
+<div class="note"><strong>延伸阅读：</strong>本章更关注 AI 系统里的可观测性职责与容量规划。如果要系统理解 OpenTelemetry 的三种信号、Collector、上下文传播和生产治理，可继续阅读项目外的 OpenTelemetry 教程。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 采样策略与 Cardinality 治理</h2>
+<p>AI 链路常常又长、又贵、又高基数。一次 RAG 请求可能经过 gateway、auth、embedding、vector search、rerank、LLM prefill、decode、安全过滤和计费。全量留痕最理想，但在高吞吐线上系统里通常不可持续。</p>
+<table><tr><th>策略</th><th>决策时机</th><th>适合场景</th><th>代价 / 风险</th></tr><tr><td>Head-based sampling</td><td>请求入口处决定</td><td>高吞吐稳定路径、成本敏感服务</td><td>成本可预测，但可能漏掉慢请求和偶发错误</td></tr><tr><td>Tail-based sampling</td><td>链路结束或超时后决定</td><td>错误请求、P99 慢请求、关键发布窗口</td><td>诊断价值高，但 Collector 内存、CPU 和网络成本更高</td></tr><tr><td>Adaptive sampling</td><td>按租户、endpoint、错误率动态调整</td><td>流量峰谷明显或多租户平台</td><td>规则复杂，统计口径会变化</td></tr><tr><td>Log sampling / 分级</td><td>按事件级别和字段保留</td><td>高频 INFO、低频 WARN/ERROR、审计日志</td><td>缺少 <code>trace_id</code> 时仍难关联</td></tr></table>
+<p>平台实践里更常见的是：入口默认 1%-5% head-based trace；<code>5xx</code>、超时、P99 以上请求和新模型灰度流量进入 tail-based 保留；审计、安全、计费日志不采样但做字段裁剪。</p>
+<div class="warn"><strong>工程边界：</strong>采样不能作为财务、审计和安全证据的唯一来源；采样 trace 不能直接计算真实错误率或延迟分位数，真实 SLI 应来自请求计数器和 latency histogram。tail-based Collector 必须有内存、队列和降级上限。</div>
+<h3>Cardinality 治理</h3>
+<p>Cardinality 指标签或字段可能出现多少不同取值。常见错误是把“定位时有用的字段”全部放进 metrics label。Metrics 通常按标签组合生成时间序列，序列数近似等于各维度取值数量的乘积。</p>
+<table><tr><th>指标设计</th><th>维度取值示例</th><th>风险</th></tr><tr><td><code>llm_request_latency{tenant,model,endpoint}</code></td><td>200 × 20 × 30 = 120,000 序列</td><td>需要容量评估</td></tr><tr><td>再加入 <code>status_code,region</code></td><td>× 6 × 5 = 3,600,000 序列</td><td>存储和查询压力明显上升</td></tr><tr><td>再加入 <code>user_id</code></td><td>× 1,000,000 users</td><td>请求级爆炸</td></tr><tr><td>再加入 <code>trace_id</code></td><td>每请求近似唯一</td><td>metrics 退化成昂贵日志系统</td></tr></table>
+<div class="danger"><strong>高基数风险：</strong>告警和容量面板应基于低基数、稳定口径的指标；事故排查再通过 exemplars、trace_id 和日志下钻。新增 metrics label 应评审取值数、增长和保留周期。</div>
+<pre class="mermaid">flowchart TD
+  F[新增观测字段] --> Q{是否需要聚合告警或容量趋势}
+  Q -- 是 --> L{取值是否低且稳定}
+  L -- 是 --> M[metrics label]
+  L -- 否 --> A[log/trace attribute]
+  Q -- 否 --> A
+  A --> P{是否包含隐私或敏感内容}
+  P -- 是 --> H[hash / truncate / redact]
+  P -- 否 --> S[按保留周期存储]
+  M --> R[评审时间序列数量和保留周期]</pre>
+</section>
+
+<section class="section" id="s6">
+<h2>6. AI 系统应该看哪些指标</h2>
+<p>AI Infra 的指标体系至少要覆盖资源面、任务面、服务面、业务/质量面和成本面。最后一层很关键：AI 服务即使资源和延迟都正常，也可能因为模型行为退化而业务失败。</p>
+<table><tr><th>层面</th><th>典型指标</th><th>回答的问题</th></tr><tr><td>资源面</td><td>GPU utilization、GPU memory used、CPU/memory、network tx/rx、disk/object storage throughput</td><td>资源是否饱和，瓶颈是否在硬件或底层 IO</td></tr><tr><td>任务面</td><td>step time、dataloader time、all-reduce time、queue length、pending jobs、checkpoint duration</td><td>训练和批任务是否被数据、通信、调度或 checkpoint 拖慢</td></tr><tr><td>服务面</td><td>requests/s、tokens/s、active sequences、prefill latency、decode throughput、cache hit ratio</td><td>推理路径的并发、排队、吞吐和缓存是否健康</td></tr><tr><td>业务 / 质量面</td><td>离线评测指标、线上反馈分数、召回/重排质量、人工审核通过率</td><td>模型行为是否仍然满足业务目标</td></tr><tr><td>成本面</td><td>cost/request、cost/1k tokens、idle GPU cost、trace/log ingestion cost</td><td>单位经济性是否失控，预算是否被烧穿</td></tr></table>
+<div class="note"><strong>指标关联：</strong>P99 升高时只看 latency 没有意义。要同时关联 queue wait、active sequences、batch tokens、KV cache 水位、检索耗时、模型版本、region 和发布事件。</div>
+<pre class="mermaid">flowchart LR
+  R[资源面] --> S[服务面]
+  T[任务面] --> S
+  S --> U[用户体验]
+  Q[质量面] --> U
+  C[成本面] --> D[决策边界]
+  U --> D
+  D --> A[扩容/回滚/限流/降级]</pre>
+</section>
+
+<section class="section" id="s7">
+<h2>7. GPU 监控指标详解</h2>
+<p>GPU 监控最容易被误用的地方，是把“GPU 忙”直接等同于“系统健康”。不同指标回答的是不同问题。</p>
+<table><tr><th>指标</th><th>它回答什么</th><th>常见误读</th><th>更适合从哪里拿</th></tr><tr><td>GPU Utilization</td><td>SM 是否在忙、设备是否有持续计算</td><td>高利用率就一定代表吞吐高</td><td><code>nvidia-smi</code> 快速排障，DCGM Exporter 长期采集</td></tr><tr><td>GPU Memory Utilization</td><td>显存是否接近容量上限</td><td>显存高就一定表示计算充分</td><td><code>nvidia-smi</code>、DCGM</td></tr><tr><td>SM Occupancy</td><td>单个 kernel 对 SM 资源的填充效率</td><td>低 occupancy 就一定是坏事</td><td>Profiler、Nsight，更适合性能分析</td></tr><tr><td>PCIe / NVLink throughput</td><td>主机、GPU 或 GPU 间传输是否成为瓶颈</td><td>带宽低就一定说明网络没问题</td><td>DCGM、Nsight Systems</td></tr><tr><td>ECC / XID / throttling</td><td>硬件错误、降频和驱动异常</td><td>只在任务失败后才看</td><td>DCGM、驱动日志、节点事件</td></tr></table>
+<p><code>nvidia-smi</code> 适合登录节点后快速判断“设备现在发生了什么”；DCGM Exporter 更适合把 GPU 指标长期送进 Prometheus/Grafana，让 <a href="22-evaluation-release-and-incident.html">第 22 章</a> 的灰度和回滚规则有稳定证据源。</p>
+<div class="warn"><strong>边界提醒：</strong>GPU utilization 高可能表示模型计算充分，也可能表示请求已经在队列里等待过久。必须和 queue wait、goodput、tokens/s、P99 以及错误预算一起看。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 最小 SLI / SLO 框架</h2>
+<p>例如，一个问答服务可以定义：</p>
+<pre><code>slis:
+  availability_ratio: successful_requests / total_requests
+  p95_latency_ms: observed end-to-end p95 latency
+  answer_grounded_rate: grounded_answers / sampled_answers
+  cost_per_1k_tokens_usd: total_cost_usd / (processed_tokens / 1000)
+slo:
+  availability_ratio: ">= 99.9%"
+  p95_latency_ms: "<= 2500"
+  answer_grounded_rate: ">= 0.90"
+  cost_per_1k_tokens_usd: "<= 0.35"</code></pre>
+<p>这个例子体现出 AI 系统和普通服务的差异：不仅有可用性和延迟，还有质量与成本目标。如果只有系统 SLO 没有质量 SLO，平台很容易把“快速返回错误答案”误当成成功。</p>
+<table><tr><th>SLI 类型</th><th>示例</th><th>为什么 AI 服务需要它</th></tr><tr><td>可用性</td><td>successful_requests / total_requests</td><td>判断基础服务是否能响应</td></tr><tr><td>延迟</td><td>p95 / p99 end-to-end latency</td><td>约束用户等待和尾延迟</td></tr><tr><td>质量</td><td>grounded rate、拒答率、安全违规率</td><td>避免把错误答案当成功请求</td></tr><tr><td>成本</td><td>cost/request、cost/1k tokens</td><td>防止新版本用成本换表面质量或延迟</td></tr></table>
+<div class="success"><strong>实践建议：</strong>模型发布的 gate 不应只看系统 SLI。新模型、Prompt、检索参数或 agent 工具链都应同时检查质量和成本 SLO。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 错误预算 burn-down</h2>
+<p>SLO 的价值不在于写出 “99.9%”，而在于把可靠性余量变成可执行规则。30 天 availability SLO 为 99.9% 时，错误预算是 0.1%，约 43.2 分钟不可用时间。如果 6 小时内因新模型版本不可用 12 分钟，就烧掉 27.8% 月预算。</p>
+<table><tr><th>信号</th><th>含义</th><th>典型动作</th></tr><tr><td>30 天预算剩余 &lt; 25%</td><td>本月余量不足</td><td>冻结非必要发布</td></tr><tr><td>6 小时 burn rate &gt; 2x</td><td>预算消耗过快</td><td>降低灰度比例</td></tr><tr><td>1 小时 burn rate &gt; 10x</td><td>快速事故</td><td>回滚、限流或降级</td></tr><tr><td>质量 SLO burn-down</td><td>grounded rate 等下降</td><td>暂停模型/Prompt 发布</td></tr><tr><td>成本 SLO burn-down</td><td>cost_per_1k_tokens 超预算</td><td>收紧上下文、启用缓存或配额</td></tr></table>
+<p>AI 服务还要把预算扩展到质量与成本：灰度可能没有 <code>5xx</code>，但 grounded rate 从 0.92 降到 0.84；agent 发布可能成功率不变，但工具调用次数翻倍。</p>
+<div class="danger"><strong>工程边界：</strong>错误预算不能替代事故判断。低流量服务需要最小样本数门槛；质量 SLO 依赖采样评测；成本 burn-down 受账单延迟影响。预算规则要和 <a href="22-evaluation-release-and-incident.html">第 22 章</a> 的灰度、回滚和事故流程绑定。</div>
+<pre class="mermaid">flowchart TD
+  S[SLO窗口] --> B[计算错误预算]
+  B --> R[burn rate]
+  R --> L{消耗速度}
+  L -- 正常 --> O[继续观察]
+  L -- 中等 --> C[降低灰度/暂停发布]
+  L -- 快速 --> X[回滚/限流/降级]
+  R --> Q{质量或成本也在burn吗}
+  Q -- 是 --> P[模型/Prompt/上下文策略介入]
+  Q -- 否 --> O</pre>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 容量规划</h2>
+<p>容量规划的核心问题是：给定目标流量、目标延迟和模型特性，需要多少资源以及多少余量？一个常见近似方法是，假设某模型单 GPU 的稳定吞吐约为 <code>R</code> tokens/s，请求平均 token 总量为 <code>T_avg</code>，目标 QPS 为 <code>Q</code>，则所需 GPU 数量近似为：</p>
+<pre><code>gpus_required ≈ (Q × T_avg) / (R × target_utilization)</code></pre>
+<p>例如平均每请求 1200 token，目标 20 QPS，单 GPU 稳定输出 12000 tokens/s，目标利用率不超过 70%，则：</p>
+<pre><code>20 × 1200 / (12000 × 0.7) ≈ 2.86</code></pre>
+<p>即至少需要 3 张 GPU，而且这还没算冗余和峰值抖动。这个近似只适合先做数量级判断。对 LLM serving，尤其是长 prompt、RAG、多峰长度分布和 agent 场景，更稳妥的做法是把 prefill 与 decode 分开建模，因为两者受算力、显存和并发约束的方式并不相同。</p>
+<table><tr><th>场景</th><th>典型值</th><th>说明</th></tr><tr><td>交互式 LLM 服务稳态 GPU 利用率目标</td><td>55%-75%</td><td>留出尾延迟和突发余量，避免把系统压到极限</td></tr><tr><td>交互式服务稳态显存水位</td><td>70%-85%</td><td>过高会让长上下文或 batch 波动更容易触发 OOM</td></tr><tr><td>默认 Trace 采样比例</td><td>1%-10%</td><td>常见于高吞吐线上路径，事故期通常临时拉高</td></tr><tr><td>关键发布窗口额外容量余量</td><td>20%-30%</td><td>给灰度、单节点故障和临时回滚留空间</td></tr></table>
+<div class="warn"><strong>为什么要留余量：</strong>如果容量设计到刚好够平均流量，一旦上下文长度上升、冷门大请求集中到来、某个副本故障或上游检索抖动造成排队，P95/P99 很快就会失控。</div>
+<pre class="mermaid">flowchart LR
+  Q[目标QPS] --> D[Token分布]
+  D --> P[Prefill需求]
+  D --> K[KV Cache占用]
+  D --> O[Decode需求]
+  P --> G[GPU数量估算]
+  O --> G
+  K --> G
+  G --> U[目标利用率]
+  U --> H[冗余和发布余量]
+  H --> C[容量与预算方案]</pre>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 常见可观测性误区</h2>
+<div class="grid-3">
+<div class="card"><strong>GPU 利用率高就说明系统健康</strong><br>不对。可能队列很长，用户已经在排队等待；也可能高优请求被低优长请求拖住。</div>
+<div class="card"><strong>指标很多就说明可观测</strong><br>不对。没有 request_id、tenant_id、model_version 关联，很多指标没有解释力。</div>
+<div class="card"><strong>容量规划只看平均流量</strong><br>不对。AI 业务对长度分布、峰值突发、故障余量和发布窗口都很敏感。</div>
+</div>
+<table><tr><th>误区</th><th>为什么危险</th><th>更可靠的做法</th></tr><tr><td>只看 HTTP 状态码</td><td><code>200</code> 不代表答案正确、有依据或安全</td><td>加入质量采样、grounded rate、安全违规率</td></tr><tr><td>把 trace 当 SLI</td><td>采样 trace 不能代表真实全量分位数</td><td>SLI 来自计数器和 histogram，trace 用于下钻</td></tr><tr><td>把所有字段做 label</td><td>cardinality 爆炸，查询和存储成本不可控</td><td>低基数 label，高基数 attribute，请求唯一 ID 只做关联</td></tr><tr><td>按平均 token 规划容量</td><td>长尾请求决定 KV cache、排队和 P99</td><td>按长度 bucket、峰值、故障和发布余量规划</td></tr></table>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 建议的最小 dashboard</h2>
+<p>一个 LLM/RAG 服务最小可用面板至少可以包含八类数据。如果这些数据能按 tenant、model_version、region 维度切开，诊断效率会高很多。</p>
+<ol>
+<li>请求量与 token 量</li>
+<li>P50 / P95 / P99 延迟</li>
+<li>queue wait time</li>
+<li>GPU 利用率与显存占用</li>
+<li>active sequences / batch tokens</li>
+<li>cache hit ratio</li>
+<li>成本 / 请求或成本 / 1k tokens</li>
+<li>关键质量指标</li>
+</ol>
+<div class="success"><strong>最小面板原则：</strong>面板首页不追求字段多，而要让 oncall 在 60 秒内判断影响范围、是否烧预算、是否需要回滚或扩容。</div>
+<pre class="mermaid">flowchart TD
+  D[Dashboard首页] --> A[Traffic: requests和tokens]
+  D --> B[Latency: p50/p95/p99和queue wait]
+  D --> C[GPU: utilization和memory]
+  D --> E[Engine: active sequences/batch tokens/cache hit]
+  D --> F[Quality: grounded rate/feedback/safety]
+  D --> G[Cost: cost per request/1k tokens]
+  A --> X[按tenant/model/version/region切分]
+  B --> X
+  C --> X
+  F --> X
+  G --> X</pre>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 成本归因</h2>
+<p>容量规划最后必须落到成本归因，否则团队只知道“GPU 很贵”，不知道该优化谁、限制谁、迁移谁。AI 平台成本至少应拆成 GPU 计算、CPU/内存控制面、网络、存储与对象请求、观测数据自身成本。推理服务还应按 prompt tokens、output tokens、KV cache、batch 等待、空闲副本拆分。</p>
+<table><tr><th>归因维度</th><th>适合回答的问题</th><th>注意事项</th></tr><tr><td><code>tenant_id</code> / <code>team</code></td><td>哪个团队消耗最多预算</td><td>避免进入高频 metrics label</td></tr><tr><td><code>model_family</code> / <code>model_version</code></td><td>哪个模型版本成本异常</td><td>高基数版本放离线明细</td></tr><tr><td><code>endpoint</code> / <code>workflow</code></td><td>哪条业务链路最贵</td><td>RAG、agent、chat 分开看</td></tr><tr><td><code>region</code> / <code>cluster</code></td><td>是否受地域和碎片影响</td><td>结合 GPU 型号和折扣</td></tr><tr><td><code>request_shape</code></td><td>长 prompt、长输出是否失控</td><td>用 bucket，不用原始输入</td></tr></table>
+<p>成本指标可以从 <code>gpu_seconds * gpu_price_per_second</code>、<code>prompt_tokens * input_price + output_tokens * output_price</code> 推导出 <code>cost_per_1k_tokens</code> 和 <code>idle_gpu_cost</code>。成本归因要连接工程动作：某 tenant 的长上下文请求占 60% 成本，就设置 context bucket 配额；某模型版本 cost_per_1k_tokens 上升 35%，就检查 speculative decoding、prefix cache、batch 参数和输出长度。</p>
+<table><tr><th>成本信号</th><th>可能根因</th><th>工程动作</th></tr><tr><td><code>cost_per_1k_tokens</code> 上升</td><td>输出变长、cache hit 下降、batch 参数变化</td><td>限制 max tokens、恢复 cache、重调度 batch</td></tr><tr><td><code>idle_gpu_cost</code> 上升</td><td>保底池过大、低峰副本回收慢</td><td>缩小 warm pool、分时策略、合并部署</td></tr><tr><td>某 workflow 成本异常</td><td>检索过多、rerank 变慢、工具调用重试</td><td>压缩候选集、加缓存、限制重试</td></tr><tr><td>观测数据成本异常</td><td>trace/log 采样过高、高基数字段失控</td><td>下调采样、字段裁剪、保留周期分层</td></tr></table>
+<div class="warn"><strong>工程边界：</strong>在线成本通常是估算，不等于云账单或财务结算；归因维度必须和 cardinality 治理一致，高基数字段进入离线明细或账单流水，不进入 Prometheus 热路径；共享成本需要明确分摊规则。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 常见工具、小结与练习</h2>
+<h3>本章涉及的常见工具</h3>
+<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr><tr><td>GPU 指标采集</td><td>DCGM Exporter、<code>nvidia-smi</code></td><td>前者适合长期监控，后者适合现场排障</td></tr><tr><td>统一埋点与 Trace</td><td>OpenTelemetry、OTel Collector</td><td>适合把 metrics / logs / traces 串成统一上下文</td></tr><tr><td>面板与告警</td><td>Prometheus、Grafana、Alertmanager</td><td>用于 SLI/SLO、容量和灰度告警</td></tr><tr><td>链路追踪</td><td>Jaeger、Tempo</td><td>适合定位多段链路尾延迟</td></tr></table>
+<h3>本章小结</h3>
+<table><tr><th>主题</th><th>关键点</th></tr><tr><td>可观测性</td><td>不只是“看到异常”，还要能解释与决策</td></tr><tr><td>指标体系</td><td>要覆盖资源、任务、服务、质量、成本五层</td></tr><tr><td>SLO</td><td>AI 服务不能只有延迟和可用性，还应包含质量目标</td></tr><tr><td>容量规划</td><td>必须把流量、token 分布、GPU 吞吐和冗余一起考虑</td></tr></table>
+<h3>练习题</h3>
+<ol>
+<li>为什么 GPU 利用率高不一定代表用户体验好？</li>
+<li>设计一个推理服务的最小指标面板。</li>
+<li>容量规划时为什么要考虑故障冗余？</li>
+<li>如果平均流量稳定，但 P99 延迟突然恶化，你会优先看哪些指标关联？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先用 §3-§5 建立三信号和规模治理模型，再用 §8-§10 把 SLO、错误预算和容量估算连起来，最后用 §13 把容量问题落到成本归因与工程动作。</div>
+<div class="card"><strong>延伸阅读</strong><br>继续阅读 <a href="22-evaluation-release-and-incident.html">第 22 章</a>，把本章的观测信号用于评测、灰度、回滚和事故处理；结合 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 理解多租户成本治理；结合 <a href="../part6/20-queues-quotas-and-autoscaling.html">第 20 章</a> 理解队列、配额与自动扩缩容。</div>
+</div>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

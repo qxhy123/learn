@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 20 章 · 队列、配额与自动扩缩容 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=20" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 20 章 · 队列、配额与自动扩缩容</h1>
+<p class="sub">从“有限、离散、异构且启动慢的 GPU 资源如何在多租户竞争中被持续、可解释地分配”出发，把队列、配额、优先级、抢占、GPU 形状治理和 autoscaling 串成一套平台控制面。</p>
+<div class="chips"><span class="chip">Queue</span><span class="chip">Quota</span><span class="chip">Priority</span><span class="chip">Preemption</span><span class="chip">DRF</span><span class="chip">Autoscaling</span><span class="chip">MIG / MPS</span></div>
+<div class="note"><strong>不可化简的问题：</strong>当 GPU 稀缺、形状离散、租户价值不同、扩容又有冷启动时，平台如何让正确的工作负载先拿到正确的资源，并且让用户理解为什么是这个结果？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：队列、配额与自动扩缩容</a></li>
+<li><a class="anchor" href="#s2">学习目标与关联章节</a></li>
+<li><a class="anchor" href="#s3">为什么 AI 平台更依赖队列</a></li>
+<li><a class="anchor" href="#s4">队列、配额、优先级与抢占</a></li>
+<li><a class="anchor" href="#s5">排队视角与等待时间</a></li>
+<li><a class="anchor" href="#s6">配额价值与 DRF 公平调度</a></li>
+<li><a class="anchor" href="#s7">抢占不是万能按钮</a></li>
+<li><a class="anchor" href="#s8">自动扩缩容的边界</a></li>
+<li><a class="anchor" href="#s9">GPU 资源碎片化</a></li>
+<li><a class="anchor" href="#s10">GPU 虚拟化：整卡、MIG、MPS 与 Time-Slicing</a></li>
+<li><a class="anchor" href="#s11">调度与配额策略组合</a></li>
+<li><a class="anchor" href="#s12">Autoscaling 触发框架</a></li>
+<li><a class="anchor" href="#s13">常见故障模式</a></li>
+<li><a class="anchor" href="#s14">常见工具</a></li>
+<li><a class="anchor" href="#s15">本章小结与练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：队列、配额与自动扩缩容</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 Kubernetes、Volcano、Kueue、HPA、KEDA、MIG、MPS 和 GPU Operator 这些工具名之后，本章要解决的不可化简问题只有一个：有限、离散、异构、启动慢的计算资源，如何在多租户同时竞争时，被持续分配给正确的工作负载，并且让用户知道为什么是这个结果。AI 平台里的 GPU 不是普通 CPU core。它昂贵、数量有限、卡型不同、显存不同、拓扑不同；训练任务常常需要 4 卡或 8 卡一起到位，推理服务又常常需要副本常驻、权重预热和稳定延迟。资源不是一桶可以随便舀的水，而是一组带形状的零件：一张 H100 80GB、一个 <code>3g.40gb</code> MIG slice、一台 8 卡 NVLink 节点、一个已加载 70B 权重的热副本，它们在调度器眼里并不等价。</p>
+<p>这就带来三个硬约束。第一，需求到达是随机的，资源释放是离散的。平均 GPU utilization 为 60% 不代表用户马上能拿到 8 张相邻 GPU，因为空闲卡可能分散在不同节点、不同卡型或不同 MIG profile 中。第二，公平不是自然发生的。没有配额，强势团队会长期占住稀缺资源；配额过硬，资源又会被锁在暂时不用的队列里。第三，弹性不是瞬时发生的。在线推理扩一个副本，可能要经历调度、镜像拉取、权重加载、KV cache 预热和 readiness；离线训练扩容更麻烦，因为一个正在跑的 64 卡作业通常不能随便插入 8 张新卡。队列、配额、抢占、GPU 切分和 autoscaling，本质上都是在这些硬约束之间做可解释的取舍。</p>
+<p>从平台体验看，这个问题还包含一个经常被低估的维度：解释性。用户看到的只是任务 Pending、服务扩不起来、线上 P99 变差、低优先级作业被中断，但平台内部的真实原因可能是配额耗尽、优先级不够、拓扑形状不完整、MIG profile 不匹配、冷启动仍在进行、指标触发处于 cooldown，或者高优任务正在回收借用配额。一个成熟平台不能只给出“调度失败”或“资源不足”的泛化错误，而要把排队规则、配额边界、抢占条件和扩容状态产品化表达。否则，即使调度器算法是正确的，用户也会把它感知成随机、偏袒和不可控。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>既然资源稀缺且请求会同时到达，平台首先需要队列：把“谁先等待、等待多久、按什么规则进入候选集”显式化。先来先服务会让大租户或长作业占住集群，所以必须引入配额：给团队、业务线或环境一个可审计的上限和保底。配额解决“谁最多能占多少”，但生产推理和实验训练不能完全同权，于是出现优先级。如果低优先级任务已经占满资源，高优先级任务仍然只能等待，所以还需要抢占。抢占不是按钮，而是一份恢复契约：只有任务能 checkpoint、能重入队、能解释损失，抢占才是工程机制；没有恢复契约的抢占，只是把资源压力转化成重复计算和用户抱怨。</p>
+<p>再往下推，GPU 资源不是单一维度。一个任务可能吃 8 GPU、256 vCPU 和 1TB 内存，另一个任务只吃 1 GPU 但占 80GB 显存。只按 GPU 数或作业数谈公平会失真，所以需要 DRF（Dominant Resource Fairness）这类多资源公平思想：看每个队列在自己最紧张资源上的占比。资源的离散形状又会推导出碎片化治理：调度器不仅要算剩余数量，还要保留整节点、同卡型、同 MIG profile、同拓扑的可运行形状。为了提高小模型和开发任务的可获得性，平台会进一步引入整卡、MIG、MPS、Time-Slicing 等共享方式。最后，当排队指标或在线延迟持续恶化时，平台才会触发自动扩缩容，但扩容只能补未来容量，不能立即消除冷启动、配额僵硬、拓扑碎片和模型加载这些现实成本。</p>
+<p>因此，本章所有机制可以按一条因果链理解：队列负责把竞争显式化，配额负责给竞争设边界，优先级负责表达业务价值，抢占负责在边界冲突时执行纠偏，DRF 负责避免多资源公平失真，GPU 形状治理负责避免“账面有卡但不可运行”，autoscaling 负责在未来容量不足时增加供给。它们不是互相替代的功能，而是控制面的不同层次。只做 HPA 不做队列，扩容慢时仍然会排队；只做配额不做借用，低峰资源会闲置；只做优先级不做抢占，高优任务仍可能被低优任务卡住；只看 GPU utilization 不看资源形状，就会误判容量。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((队列 配额 弹性))
+    不可化简的问题
+      有限资源
+        GPU昂贵
+        卡型显存不同
+        多卡拓扑离散
+      随机需求
+        在线请求高峰
+        离线作业批量提交
+      多租户竞争
+        强势租户垄断
+        关键业务保底
+      弹性有延迟
+        镜像拉取
+        权重加载
+        KVCache预热
+    必然机制
+      队列
+        等待顺序
+        queue_wait
+      配额
+        保底
+        上限
+        借用
+      优先级与抢占
+        生产任务优先
+        checkpoint恢复
+        审计解释
+      多资源公平
+        DRF
+        GPU_CPU_内存
+        dominant_share
+      GPU形状治理
+        MIG
+        MPS
+        Time_Slicing
+        碎片化
+      自动扩缩容
+        队列指标
+        冷启动
+        cooldown
+    AI场景影响
+      在线推理
+        P95_P99延迟
+        热副本
+      离线训练
+        gang_scheduling
+        多卡一次性到位
+        可恢复抢占
+      平台体验
+        为什么Pending
+        为什么被抢占
+        为什么扩容没变快</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 AI 平台不能只用“谁先提交谁先跑”的 FIFO 队列？</li>
+<li>当配额、优先级和抢占同时存在时，平台应该按什么顺序解释一次调度决策？</li>
+<li>为什么平均 GPU utilization 不足以判断集群是否真的有可调度容量？</li>
+<li>MIG、MPS、Time-Slicing 分别把共享问题放在硬件层、驱动层还是调度层，它们各自牺牲了什么？</li>
+<li>给定 GPU、CPU、内存三类资源占用，如何用 DRF 判断哪个队列更“占便宜”？</li>
+<li>为什么在线推理 autoscaling 常看 queue wait、active sequences 和 token throughput，而不是只看 CPU 使用率？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与关联章节</h2>
+<p>完成本章学习后，你应该能把“资源不够”拆成队列、配额、优先级、抢占、GPU 形状、冷启动和指标触发这些可操作问题；能解释为什么某个任务 Pending、为什么某个副本扩不起来、为什么某次抢占是合理或不合理的；也能为在线推理与离线训练分别设计 autoscaling 边界。</p>
+<div class="note"><strong>关联章节：</strong>本章里的队列和配额，是 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 多租户与成本治理的执行层。第 17 章回答“为什么要管”，本章回答“平台具体怎么管”。GPU 暴露方式和运行时边界见 <a href="18-containers-and-runtime.html">第 18 章</a>，Kubernetes 调度资源与控制面基础见 <a href="19-kubernetes-for-ai.html">第 19 章</a>。</div>
+<pre class="mermaid">flowchart LR
+  A[多租户成本规则] --> B[Queue与Quota]
+  B --> C[Priority与Preemption]
+  C --> D[GPU形状治理]
+  D --> E[Autoscaling策略]
+  E --> F[平台可解释体验]
+  A -.关联.-> P17[第17章 多租户与成本]
+  D -.依赖.-> P18[第18章 容器与运行时]
+  E -.依赖.-> P19[第19章 Kubernetes for AI]</pre>
+<div class="success"><strong>核心判断：</strong>队列、配额和 autoscaling 不是三套独立功能，而是一条资源控制链：先让竞争排得起来，再让边界管得住，最后让未来容量能补上。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 为什么 AI 平台比普通服务更依赖队列</h2>
+<p>普通 Web 服务里，很多请求只占用 CPU 和少量内存，请求结束就释放。而 AI 平台里的许多任务具有不同特征：占用 GPU 这类离散而昂贵的资源，任务持续时间可能很长，多卡任务必须一次性拿到完整资源形状，任务之间优先级差异很大。因此，AI 平台不能只依赖“谁先来谁先跑”，而必须明确谁可以排队等待、谁必须保底、谁可以被抢占、谁在高峰期应该被限流。</p>
+<div class="grid-2">
+<div class="card"><strong>在线推理</strong><br>用户请求持续到达，模型副本需要常驻，扩容涉及调度、权重加载、预热和 readiness。排队时间会直接进入 P95 / P99 延迟。</div>
+<div class="card"><strong>离线训练</strong><br>训练任务生命周期长，多卡 gang 一次性到位，失败恢复依赖 checkpoint。排队不只是等待，也影响实验迭代速度和 GPU 预算。</div>
+</div>
+<table>
+<tr><th>工作负载</th><th>普通服务常见资源形态</th><th>AI 平台资源形态</th><th>为什么需要队列</th></tr>
+<tr><td>短请求服务</td><td>CPU / 内存可细粒度复用</td><td>推理副本占用 GPU 与显存</td><td>请求高峰会转化成 queue wait 与 tail latency</td></tr>
+<tr><td>批处理任务</td><td>可拆分、可重试、资源相对通用</td><td>训练可能需要同卡型、多卡、同拓扑</td><td>必须等待完整可运行形状，而不是任意空闲卡</td></tr>
+<tr><td>实验任务</td><td>通常容忍延迟</td><td>可能抢占高端 GPU 或本地 SSD</td><td>需要低优先级队列和可抢占策略</td></tr>
+</table>
+<div class="warn"><strong>边界提醒：</strong>队列不是附属功能，而是平台公平性和效率的核心机制。没有队列，用户只会看到“随机 Pending”；没有解释，队列越复杂越像黑盒。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 队列、配额、优先级与抢占</h2>
+<p>这四件事经常一起出现，但逻辑上不同。队列回答任务按照什么顺序等待和被调度；配额回答某个团队或租户最多能占多少资源；优先级回答资源紧张时谁先执行；抢占回答高优先级任务来了，是否可以中断低优先级任务。没有配额的高优先级系统会被强势租户垄断；没有抢占的优先级系统在高峰期往往形同虚设。</p>
+<table>
+<tr><th>概念</th><th>回答的问题</th><th>常见平台对象</th><th>设计失败时的症状</th></tr>
+<tr><td>队列</td><td>谁在等待、按什么顺序进入候选集</td><td>Queue、ClusterQueue、PodGroup、JobQueue</td><td>Pending 原因不可解释，长作业或大租户挤压其他人</td></tr>
+<tr><td>配额</td><td>谁最多能占多少，谁至少有保底</td><td>ResourceQuota、Queue quota、部门预算</td><td>太松导致垄断，太硬导致闲置不能借用</td></tr>
+<tr><td>优先级</td><td>资源冲突时谁先被满足</td><td>PriorityClass、SLA class、业务等级</td><td>实验流量压住生产流量，或者低优队列长期饥饿</td></tr>
+<tr><td>抢占</td><td>是否允许高优任务中断低优任务</td><td>PreemptionPolicy、drain、checkpoint 恢复</td><td>没有恢复契约时，抢占变成重复成本和投诉</td></tr>
+</table>
+<pre><code>queues:
+  prod-online:
+    gpu_quota: 64
+    priority: 100
+  research-train:
+    gpu_quota: 128
+    priority: 50
+  batch-lowprio:
+    gpu_quota: 32
+    priority: 10
+    preemptible: true</code></pre>
+<pre class="mermaid">sequenceDiagram
+  participant U as 用户提交作业
+  participant Q as 队列控制面
+  participant S as 调度器
+  participant R as 资源池
+  participant A as 审计与解释
+  U->>Q: 提交 8xH100 训练任务
+  Q->>Q: 检查队列状态与配额
+  Q->>S: 进入候选集
+  S->>R: 检查卡型/显存/拓扑形状
+  alt 资源形状完整
+    R-->>S: 可运行
+    S-->>U: 调度成功
+  else 配额不足或形状不完整
+    S->>A: 记录 Pending 原因
+    A-->>U: 返回等待位置/缺口/可选动作
+  end</pre>
+<div class="note"><strong>解释顺序：</strong>一次调度失败最好按“租户是否有资格 → 配额是否允许 → 优先级是否足够 → 资源形状是否完整 → 是否可抢占或等待扩容”逐层解释。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 一个简单的排队视角</h2>
+<p>如果系统单位时间到达任务数为 <code>lambda</code>，单位时间服务能力为 <code>mu</code>，那么当 <code>lambda &lt; mu</code> 时队列通常可控；当 <code>lambda</code> 接近 <code>mu</code> 时等待时间会急剧增加；当 <code>lambda &gt; mu</code> 时系统必然积压。这就是为什么平台不能只看平均利用率。即使平均利用率看起来正常，短时间高峰也可能造成严重排队。</p>
+<div class="grid-3">
+<div class="card"><strong>低负载</strong><br><code>lambda</code> 远小于 <code>mu</code>，排队主要来自冷启动、配额或资源形状不匹配。</div>
+<div class="card"><strong>临界区</strong><br><code>lambda</code> 接近 <code>mu</code>，微小流量尖峰也会放大等待时间。</div>
+<div class="card"><strong>过载</strong><br><code>lambda</code> 大于 <code>mu</code>，没有限流、降级或扩容时积压必然增长。</div>
+</div>
+<pre class="mermaid">flowchart TD
+  A[需求到达 lambda] --> C{lambda 与 mu 的关系}
+  B[服务能力 mu] --> C
+  C -- lambda 小于 mu --> D[队列可控]
+  C -- lambda 接近 mu --> E[等待时间陡增]
+  C -- lambda 大于 mu --> F[积压持续增长]
+  E --> G[在线推理 P95/P99 恶化]
+  E --> H[离线训练 Pending 增加]
+  F --> I[限流 降级 扩容 抢占]
+</pre>
+<p>对在线推理而言，这会表现为 queue wait time 上升、P95 / P99 延迟恶化。对离线训练而言，这会表现为作业长时间 Pending，用户抱怨“平台有卡但我任务跑不起来”。</p>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 配额的真正价值与 DRF 公平调度</h2>
+<p>很多人把配额理解成“限制使用”。更准确地说，配额在做三件事：防止强势租户垄断资源，给关键业务保底，为预算和容量规划提供边界。配额设计不好，平台会在两种极端之间摇摆：太松时资源被吃光，太死时资源闲着也借不出来。因此很多成熟平台还会加入“保底 + 可借用”的策略。</p>
+<div class="success"><strong>工程原则：</strong>配额最好同时表达 reserved、limit 和 borrow 三个语义。reserved 保证关键队列最低容量，limit 防止强势租户吃光全局，borrow 让低峰闲置资源能临时被使用。</div>
+<p>为什么“只看优先级”不够？因为 AI 平台不是单资源系统。一个队列可能主要吃 GPU，另一个队列可能主要吃 CPU / 内存。只按优先级或作业数排序，很容易把某一类资源长期挤爆。DRF 关注的是：谁占用了自己最稀缺的那类资源最多。这样定义公平，比“谁先来”或“谁权重大”更适合多资源集群。</p>
+<table>
+<tr><th>机制</th><th>更适合解决什么</th><th>主要短板</th></tr>
+<tr><td>简单优先级</td><td>明确保核心业务先跑</td><td>难处理多资源公平</td></tr>
+<tr><td>纯配额上限</td><td>防止单租户吃光资源</td><td>闲置资源借用不灵活</td></tr>
+<tr><td>DRF</td><td>同时考虑 GPU、CPU、内存等多资源公平</td><td>实现和解释成本更高</td></tr>
+</table>
+<p>假设一个资源池有 100 张 GPU、1000 vCPU、2000GB 内存，三个队列当前占用如下：</p>
+<table>
+<tr><th>队列</th><th>GPU 占用</th><th>CPU 占用</th><th>内存占用</th><th>GPU share</th><th>CPU share</th><th>内存 share</th><th>Dominant share</th></tr>
+<tr><td>A：在线推理</td><td>20</td><td>120</td><td>300GB</td><td>20%</td><td>12%</td><td>15%</td><td>20%</td></tr>
+<tr><td>B：训练实验</td><td>35</td><td>180</td><td>400GB</td><td>35%</td><td>18%</td><td>20%</td><td>35%</td></tr>
+<tr><td>C：数据处理</td><td>5</td><td>420</td><td>600GB</td><td>5%</td><td>42%</td><td>30%</td><td>42%</td></tr>
+</table>
+<p>如果下一个可运行任务来自 A 和 C，简单 GPU 公平会认为 C 只用了 5 张 GPU，应该优先给 C；但 DRF 会看到 C 的 dominant share 是 CPU 的 42%，已经最高。此时更公平的选择可能是先给 A 或 B，而不是继续让 C 扩大 CPU 占用。这个例子说明：AI 平台里的“不公平”不一定表现为 GPU 被吃光，也可能表现为 CPU、内存、NIC、PVC 或本地 SSD 被某类任务先吃光。</p>
+<div class="warn"><strong>工程边界：</strong>DRF 的前提是资源可计量且需求可信。GPU、CPU、内存容易计量，网络带宽、本地 SSD IOPS、KV cache 峰值很难准确声明；一旦用户低报 request，DRF 会奖励“写小 request、实际 burst”的负载。</div>
+<pre class="mermaid">flowchart TD
+  A[候选任务进入调度] --> B[PriorityClass 过滤关键任务]
+  B --> C[Queue quota 检查租户边界]
+  C --> D[DRF 计算多资源公平顺序]
+  D --> E[Gang scheduling 检查完整资源形状]
+  E --> F{是否可运行}
+  F -- 是 --> G[绑定节点并启动]
+  F -- 否 --> H[记录 Pending 原因并等待]</pre>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 抢占不是万能按钮</h2>
+<p>抢占可以显著改善高优先级任务的响应，但它必须与任务特性绑定。推理服务通常不适合粗暴抢占，因为中断服务实例会直接影响用户请求，更常见的是限流、重新路由、优先保障核心租户。训练任务更有可能被抢占，但前提是有可恢复 checkpoint、平台知道如何重新入队、用户清楚任务被抢占的规则。没有恢复机制的抢占，只是在制造重复成本。</p>
+<table>
+<tr><th>对象</th><th>是否适合抢占</th><th>推荐动作</th><th>风险</th></tr>
+<tr><td>核心在线推理副本</td><td>通常不适合</td><td>保留池、限流、路由切换、优先级队列</td><td>直接中断会放大用户可见错误</td></tr>
+<tr><td>低优批推理</td><td>适合</td><td>可重试队列、幂等输出、预算限流</td><td>重复计算和队列回填</td></tr>
+<tr><td>长训练任务</td><td>有条件适合</td><td>周期性 checkpoint、重入队、损失审计</td><td>checkpoint 太稀疏会浪费大量 GPU 小时</td></tr>
+<tr><td>开发实验任务</td><td>适合</td><td>低优先级、Time-Slicing、可抢占池</td><td>用户体验不稳定，需要清晰预期</td></tr>
+</table>
+<div class="danger"><strong>严重风险：</strong>不要把抢占当成容量规划的替代品。抢占只能重新分配已有容量，不能解决长期供给不足；没有 checkpoint 和审计的抢占还会让平台失去信任。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 自动扩缩容的边界</h2>
+<h3>在线推理</h3>
+<p>自动扩缩容适合流量波动明显、模型副本可快速启动、有清晰延迟或队列指标的服务。但它的难点在于模型很大、冷启动慢、显存预热成本高、token 长度变化剧烈。因此，在线推理的 autoscaling 通常不能只看 CPU 使用率，而要看 queue length、queue wait time、active sequences、GPU / 显存水位和 token throughput。</p>
+<h3>离线训练</h3>
+<p>训练任务的 autoscaling 更受限制，因为一个作业可能要求固定卡数，多卡任务对拓扑敏感，扩出来的新节点可能来不及参与当前作业。所以训练场景更常见的是“集群层扩容”，而不是服务式的细粒度 HPA。</p>
+<table>
+<tr><th>场景</th><th>适合的扩缩容粒度</th><th>主要指标</th><th>关键限制</th></tr>
+<tr><td>交互式在线推理</td><td>服务副本 / 热池</td><td>queue wait、P99、active sequences、token throughput</td><td>冷启动和 KV cache 预热</td></tr>
+<tr><td>批量离线推理</td><td>队列 worker / GPU 池</td><td>backlog、deadline miss、GPU 利用率</td><td>输出幂等与重试成本</td></tr>
+<tr><td>多机训练</td><td>集群节点池</td><td>pending jobs、gang 可满足率、队列等待</td><td>作业固定卡数和拓扑约束</td></tr>
+</table>
+<div class="warn"><strong>边界提醒：</strong>扩容只能补未来容量，不能让正在冷启动的副本立刻承接流量，也不能把碎片化的 GPU 自动拼成完整 8 卡节点。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. GPU 资源碎片化</h2>
+<p>平台工程里更准确的说法是：账面有容量，不等于调度器手里有可用形状。最典型的情况是：集群看起来还有很多空闲 GPU，但这些资源被切散到不同节点、不同卡型、不同显存规格、不同 MIG slice，或者被各个队列的硬配额锁住，结果需要 8 卡训练、80GB 显存推理、固定 MIG profile 的任务都拿不到真正可运行的资源。</p>
+<p>看一个具体例子：集群有 4 台 8xH100 80GB 节点，总计 32 张 GPU。当前空闲 10 张，账面空闲率 31.25%。但节点分布如下：</p>
+<table>
+<tr><th>节点</th><th>空闲 GPU</th><th>已占用形状</th><th>对 8 卡训练是否可用</th></tr>
+<tr><td>node-a</td><td>3</td><td>5 张被在线推理副本长期占用</td><td>不可用，缺 5 张同节点 GPU</td></tr>
+<tr><td>node-b</td><td>2</td><td>6 张被低优先级训练占用</td><td>不可用，缺 6 张同节点 GPU</td></tr>
+<tr><td>node-c</td><td>4</td><td>4 张被切成 MIG <code>1g.10gb</code></td><td>不可用，profile 和整卡语义不匹配</td></tr>
+<tr><td>node-d</td><td>1</td><td>7 张被实验任务占用</td><td>不可用，缺 7 张同节点 GPU</td></tr>
+</table>
+<p>一个需要 <code>8 x H100 80GB + NVLink</code> 的训练作业会 Pending，虽然监控面板显示还有 10 张 GPU 空着。调度器不是不会数数，而是这些 GPU 无法拼成作业要求的形状。</p>
+<table>
+<tr><th>碎片来源</th><th>平台上会看到什么现象</th><th>为什么会浪费可用资源</th></tr>
+<tr><td>不同 GPU 型号混部</td><td>A100、H100、L40S 都有空闲，但作业仍 Pending</td><td>作业镜像、算子、吞吐预期往往绑定卡型</td></tr>
+<tr><td>显存大小不一致</td><td>40GB 卡空着，80GB 需求作业排队</td><td>约束首先是显存，不是 GPU 数量</td></tr>
+<tr><td>MIG slice 粒度固定</td><td>还剩很多 <code>1g.10gb</code>，但 <code>3g.40gb</code> 服务扩不起来</td><td>错误切片会制造二次碎片</td></tr>
+<tr><td>长短任务混排</td><td>短推理作业频繁插队，长训练作业一直等完整拓扑</td><td>长作业需要连续且稳定的资源窗口</td></tr>
+<tr><td>队列 quota 过硬</td><td>某队列空着 GPU，另一队列排爆</td><td>资源被锁在暂时不用的边界里</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+  A[账面空闲 10 GPU] --> B{能否形成目标形状}
+  B -- 同节点8卡不足 --> C[8卡训练 Pending]
+  B -- MIG profile不匹配 --> D[大显存推理扩不起来]
+  B -- 卡型显存不一致 --> E[SKU 不可替代]
+  B -- quota锁住空闲 --> F[跨队列不能借用]
+  C --> G[关键指标: 可用8卡节点数]
+  D --> H[关键指标: 可用MIG profile数]
+  E --> I[关键指标: SKU级空闲容量]
+  F --> J[关键指标: borrowable quota]</pre>
+<div class="note"><strong>工程边界：</strong>碎片化不可能被完全消除。过度 compact 会造成热点；过度预留会降低利用率；频繁迁移会放大 checkpoint、镜像拉取和缓存失效成本。平台要优化的是“关键形状的可获得性”，而不是只追求总 GPU 空闲数。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. GPU 虚拟化：整卡、MIG、MPS 与 Time-Slicing</h2>
+<p>当平台开始面对“小模型很多、租户很多、整卡经常浪费”的局面，就会讨论 GPU 切分。但切分提高的是利用率，不一定提高稳定性，因此要和 <a href="18-containers-and-runtime.html">第 18 章</a> 的运行时暴露、<a href="19-kubernetes-for-ai.html">第 19 章</a> 的调度资源一起看。四种常见方式的差别，不在于“能不能共享”，而在于共享发生在硬件层、驱动层还是调度层。</p>
+<table>
+<tr><th>方式</th><th>工作方式</th><th>隔离程度</th><th>更适合什么场景</th><th>不适合什么场景</th></tr>
+<tr><td>整卡调度</td><td>一个工作负载独占整张卡</td><td>最强</td><td>多卡训练、大上下文推理、强 SLA 在线服务</td><td>小模型常驻导致整卡长期低利用</td></tr>
+<tr><td>MIG</td><td>硬件级切分 GPU，显存和部分计算资源按 profile 固定分配</td><td>强</td><td>多租户小模型推理、需要保底的共享集群</td><td>动态负载变化很大、需要灵活伸缩显存形状</td></tr>
+<tr><td>MPS</td><td>多进程共享同一 GPU 上下文，提升并发提交效率</td><td>弱</td><td>同团队轻量推理、实验型多进程任务</td><td>跨租户隔离、强故障域隔离、严格性能承诺</td></tr>
+<tr><td>Time-Slicing / Sharing</td><td>调度器或 device plugin 以时间片方式让多个 workload 轮流使用 GPU</td><td>很弱</td><td>开发环境、教学环境、低优先级批处理</td><td>延迟敏感服务、长时间高负载训练</td></tr>
+</table>
+<table>
+<tr><th>判断条件</th><th>更适合的方式</th></tr>
+<tr><td>任务需要稳定吞吐、显存峰值高、故障不能互相影响</td><td>整卡或 MIG</td></tr>
+<tr><td>希望把一张高端卡分给多个固定小服务，并且要配额化管理</td><td>MIG</td></tr>
+<tr><td>同一团队的多个轻量进程想共享同一张卡，提高提交并发</td><td>MPS</td></tr>
+<tr><td>只是为了让更多人先启动任务，容忍明显性能抖动</td><td>Time-Slicing / Sharing</td></tr>
+</table>
+<pre><code>version: v1
+flags:
+  migStrategy: mixed</code></pre>
+<div class="warn"><strong>不要误用：</strong>MIG 不是动态弹性万能解。它把一张卡变成多个固定 SKU，如果 profile 设计错了，平台只是把整卡碎片化换成 MIG profile 碎片化。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 调度与配额策略：公平性和利用率的拉扯</h2>
+<p>当 GPU 已经被拆成多个 SKU，调度策略就决定了平台是在追求“更满”，还是追求“更公平”，还是在尽量保护关键业务。实践里通常不是单一算法取胜，而是组合拳。</p>
+<table>
+<tr><th>策略</th><th>平台收益</th><th>代价</th><th>失败条件</th></tr>
+<tr><td>Bin packing / compact scheduling</td><td>把小任务塞进少量节点，保留完整拓扑给 4 卡 / 8 卡大任务</td><td>局部热点更明显，单节点故障影响更集中</td><td>不区分卡型、显存和拓扑，只做数量打包</td></tr>
+<tr><td>Gang scheduling</td><td>保证多卡训练一次性拿齐资源，避免半启动半等待</td><td>等待时间可能更长，调度器更复杂</td><td>没有提前预留或紧凑摆放，大作业会长期饥饿</td></tr>
+<tr><td>Priority + preemption</td><td>关键在线服务或紧急训练可以快速拿到资源</td><td>被抢占任务需要 checkpoint / 重试能力</td><td>没有恢复机制时，抢占只会放大浪费</td></tr>
+<tr><td>Borrowing quota</td><td>闲时把保底配额借给别的队列，提高总体利用率</td><td>回收时要处理驱逐、延迟上升和借用争议</td><td>缺少回收规则或冷却时间</td></tr>
+<tr><td>DRF 倾向的公平调度</td><td>在 GPU、CPU、内存并存时更公平</td><td>可解释性差，实现更重</td><td>业务优先级远比资源公平更重要时会过于机械</td></tr>
+</table>
+<p>一个常见的平台工程做法是：用 bin packing 和按卡型 / MIG profile 拆池来压低碎片；用 gang scheduling 保护多卡训练的最小可运行形状；用 priority / preemption 给关键业务开快车道，但只对可恢复任务生效；用保底 + 可借用 quota 平衡公平性和利用率；用 DRF 思路做多资源公平校正，而不是单独依赖它。</p>
+<div class="success"><strong>优化目标：</strong>平台工程师真正要优化的不是“GPU 利用率”这一个数字，而是关键队列等待时间、大任务完整形状可获得性、闲置容量可借用性这三个指标的组合。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 一个 autoscaling 触发框架</h2>
+<pre><code>scale_out_if:
+  queue_wait_p95_ms: "&gt; 200"
+  gpu_utilization: "&gt; 75%"
+  pending_requests: "&gt; 100"
+scale_in_if:
+  queue_wait_p95_ms: "&lt; 20"
+  gpu_utilization: "&lt; 35%"
+  cooldown_minutes: 10</code></pre>
+<p>这类规则的重点不是语法，而是扩容触发不应只依赖单个指标，缩容要有冷却时间，长短请求混杂时需要更细的分层策略。</p>
+<table>
+<tr><th>场景</th><th>典型值</th><th>说明</th></tr>
+<tr><td>已有热副本的在线扩容反应时间</td><td>10-30 秒</td><td>主要消耗在调度和 readiness，而不是权重加载</td></tr>
+<tr><td>大模型冷启动后新副本真正可接流量</td><td>1-5 分钟</td><td>常包含镜像拉取、权重加载、显存预热和 engine 初始化</td></tr>
+<tr><td>交互式推理队列等待告警阈值</td><td>P95 50-200 ms</td><td>超过后用户通常已明显感知排队</td></tr>
+<tr><td>离线训练队列等待 SLO</td><td>5-30 分钟</td><td>取决于队列等级和业务优先级，而不是统一常数</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  M[指标采集] --> Q[queue_wait_p95]
+  M --> G[gpu_utilization]
+  M --> P[pending_requests]
+  M --> T[token_throughput]
+  Q --> D{扩容条件同时满足?}
+  G --> D
+  P --> D
+  T --> D
+  D -- 是 --> O[Scale out]
+  D -- 否 --> W[继续观测]
+  O --> C[冷启动与readiness]
+  C --> R[新副本接流量]
+  R --> S{缩容条件与cooldown满足?}
+  S -- 是 --> I[Scale in]
+  S -- 否 --> W</pre>
+<div class="note"><strong>参考数量级：</strong>这些值仅用于建立直觉，实际阈值会受模型大小、镜像体积、权重缓存、集群基线和用户延迟预算影响。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 常见故障模式</h2>
+<h3>模式一：平台整体利用率不低，但关键任务一直排队</h3>
+<p>问题可能在配额分配僵硬、大量资源被低优先级长任务占住、多卡拓扑碎片化。此时不要只看总 GPU utilization，而要看可用 8 卡节点数、关键队列 pending time、可借用配额和低优任务可抢占比例。</p>
+<h3>模式二：自动扩容触发了，但用户体验没改善</h3>
+<p>问题可能是冷启动太慢、扩出的节点拿不到模型和热 cache、真正瓶颈不在副本数，而在检索或上游依赖。此时要把扩容事件、readiness 时间、模型加载时间和请求 trace 连起来看。</p>
+<h3>模式三：平台解释不清为什么某任务被抢占</h3>
+<p>问题通常是调度规则不透明、审计日志不足、配额与优先级设计没有产品化表达。抢占事件必须包含触发者、被抢占者、优先级差异、配额状态、恢复路径和预计损失。</p>
+<table>
+<tr><th>故障现象</th><th>优先检查</th><th>纠偏动作</th></tr>
+<tr><td>“有卡但跑不起来”</td><td>卡型、显存、拓扑、MIG profile、gang 可满足率</td><td>拆 SKU、保留完整节点、compact 低优任务</td></tr>
+<tr><td>P99 高但 GPU 不满</td><td>queue wait、KV cache、active sequences、检索依赖</td><td>分层队列、限制长上下文、扩热副本</td></tr>
+<tr><td>高优任务仍等待</td><td>抢占策略、checkpoint 能力、borrow quota 回收</td><td>启用可恢复抢占，明确回收冷却时间</td></tr>
+<tr><td>缩容后立刻反弹</td><td>cooldown、预测窗口、冷启动时间</td><td>延长 cooldown，区分热池和冷池容量</td></tr>
+</table>
+<div class="danger"><strong>排障底线：</strong>不要用“资源不足”结束诊断。AI 平台的资源不足必须继续拆成数量不足、形状不足、配额不足、优先级不足、冷启动不足或指标误判。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 本章涉及的常见工具</h2>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>队列与公平调度</td><td>Volcano、Kueue</td><td>常用于批任务排队、配额和 gang scheduling</td></tr>
+<tr><td>GPU 切分与资源暴露</td><td>NVIDIA GPU Operator、k8s-device-plugin</td><td>常用于暴露 MIG 资源、配置 time-slicing 策略</td></tr>
+<tr><td>在线自动扩缩容</td><td>Kubernetes HPA、KEDA</td><td>适合接 CPU、队列或自定义指标触发</td></tr>
+<tr><td>指标驱动扩缩容</td><td>Prometheus Adapter、Metrics Server</td><td>把 queue wait、GPU 水位等指标喂给扩缩容策略</td></tr>
+<tr><td>资源可视化</td><td>Grafana、调度事件日志</td><td>用于解释“为什么这个任务还在排队”</td></tr>
+</table>
+<div class="warn"><strong>工具边界：</strong>Volcano、Kueue、HPA 或 KEDA 不会自动替你定义公平性。工具执行的是平台政策，政策本身仍然要由配额、优先级、抢占和成本治理共同定义。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 本章小结与练习</h2>
+<table>
+<tr><th>机制</th><th>目标</th><th>典型风险</th></tr>
+<tr><td>队列</td><td>有序分配稀缺资源</td><td>排队规则不透明引发体验问题</td></tr>
+<tr><td>配额</td><td>防止垄断，支撑容量规划</td><td>过硬导致闲置，过松导致抢占失控</td></tr>
+<tr><td>优先级 / 抢占</td><td>保障核心任务</td><td>没有恢复机制时会制造浪费</td></tr>
+<tr><td>自动扩缩容</td><td>在成本与弹性之间平衡</td><td>冷启动和错误指标会让策略失效</td></tr>
+</table>
+<h3>练习题</h3>
+<ol>
+<li>为什么 AI 任务比普通 Web 服务更依赖队列治理？</li>
+<li>如果推理服务冷启动很慢，自动扩容策略应如何调整？</li>
+<li>配额和优先级冲突时，平台应该如何解释决策？</li>
+<li>为什么训练场景下的 autoscaling 往往不如推理场景直接？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用队列视角理解等待时间：把在线推理的 queue wait 和离线训练的 pending time 统一看成稀缺资源竞争的外显指标。</li>
+<li>再学习配额、优先级和抢占：重点不是字段含义，而是它们如何共同解释一次调度决策。</li>
+<li>接着学习 GPU 形状治理：把整卡、MIG、MPS、Time-Slicing 与卡型、显存、拓扑、gang scheduling 放在一起判断。</li>
+<li>最后设计 autoscaling：明确触发指标、冷启动时间、cooldown、热池容量和缩容风险。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Kubernetes 文档：ResourceQuota、PriorityClass、Pod priority and preemption、Horizontal Pod Autoscaling。</li>
+<li>Volcano 与 Kueue 文档：队列、PodGroup、ClusterQueue、gang scheduling 与资源借用。</li>
+<li>NVIDIA GPU Operator 与 device plugin 文档：MIG strategy、GPU sharing、time-slicing 资源暴露。</li>
+<li>Dominant Resource Fairness 论文：理解多资源公平为什么不能只看 GPU 数量。</li>
+<li><a href="../part5/17-multitenancy-and-cost.html">第 17 章</a>：把本章的执行层规则接回多租户、成本归因和平台治理。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
