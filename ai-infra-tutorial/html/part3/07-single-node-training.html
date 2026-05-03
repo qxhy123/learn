@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 7 章 · 单机训练系统 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=07" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 7 章 · 单机训练系统</h1>
+<p class="sub">从“一台有限机器如何持续、可解释地把数据变成参数更新”出发，建立训练 step、数据供给、显存预算、精度策略、效率指标和可复现实验之间的因果链。</p>
+<div class="chips"><span class="chip">单机训练</span><span class="chip">Step Time</span><span class="chip">显存预算</span><span class="chip">AMP</span><span class="chip">MFU/HFU</span><span class="chip">Profiling</span></div>
+<div class="note"><strong>不可化简的问题：</strong>如何让一台由 CPU、内存、存储、PCIe/NVLink、GPU HBM 和 Tensor Core 组成的有限机器，按可解释、可复现、可度量的方式，把数据转化成一次次参数更新？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：单机训练最小闭环</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">本章导读</a></li>
+<li><a class="anchor" href="#s4">训练 step 与数据供给</a></li>
+<li><a class="anchor" href="#s5">显存预算、AMP 与 batch 策略</a></li>
+<li><a class="anchor" href="#s6">7B Worked Example</a></li>
+<li><a class="anchor" href="#s7">瓶颈、profiling 与效率指标</a></li>
+<li><a class="anchor" href="#s8">单机基线实验与工程建议</a></li>
+<li><a class="anchor" href="#s9">本章小结与练习题</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：为什么单机训练是训练系统的最小闭环</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 PyTorch、DDP、FSDP、AMP、Nsight 这些名字之后，单机训练要解决的不可化简问题其实只有一个：<strong>如何让一台有限的机器，按可解释、可复现、可度量的方式，把数据转化成一次次参数更新。</strong>这台机器不是一个抽象的“GPU”，而是一组有边界的物理资源：CPU 负责读取、解码、拼 batch 和发起 kernel；主机内存负责缓存数据和承接 pinned memory；PCIe 或 NVLink 路径负责把数据送到设备；GPU HBM 放权重、梯度、优化器状态、activation 和临时 buffer；Tensor Core 负责真正的矩阵计算；本地盘或远端存储还会在 checkpoint、dataset shard、日志写入时插入额外扰动。训练脚本只是把这些资源串起来的调度程序。</p>
+<p>因此，本章不是“单卡怎么跑一个 demo”，而是建立后续所有训练基础设施的测量原点。单机阶段最宝贵的地方在于变量还少：没有跨机网络，没有大规模 collective，没有队列调度造成的拓扑差异，也没有多租户干扰。如果在这个最小闭环里，step time、显存峰值、tokens/s、loss 曲线、checkpoint 耗时都无法解释，那么到了 <a href="../part3/08-data-parallel.html">第 8 章</a> 的数据并行和 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 的模型并行，问题会被复制到更多设备上，排障成本会按卡数和节点数放大。单机基线的价值不是“规模小”，而是它让你第一次能把训练系统当作一条完整因果链来观察：输入有没有连续到达，计算有没有吃满硬件，显存预算是否闭合，指标是否在描述真实进展。</p>
+<p>这个不可化简问题还包含一个容易被忽略的约束：训练不是一次前向计算，而是持续数千、数万甚至数百万个 step 的闭环。一个 step 的延迟高并不可怕，可怕的是你不知道高在哪里；一次 OOM 也不可怕，可怕的是你无法判断它来自参数、梯度、优化器状态、activation、碎片还是临时通信 buffer。平台工程师需要的不是背诵“调大 num_workers”“打开 AMP”“用更大 batch”，而是能把每个动作映射到资源账本和时间账本：它减少了哪一项，增加了哪一项，是否只是把瓶颈从 HBM 挪到了输入链路，或者从计算挪到了 checkpoint 写入。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“数据要持续变成参数更新”出发，第一件必然出现的机制是 step 拆解。因为训练慢不是一个可操作的诊断，必须把它拆成 <code>load</code>、<code>preprocess</code>、<code>h2d</code>、<code>forward</code>、<code>backward</code>、<code>optim</code>、<code>checkpoint</code> 和 <code>logging</code>。拆开之后，dataloader、pinned memory、prefetch、stream overlap 才有意义：它们并不是孤立技巧，而是在缩短或隐藏输入阶段，让 GPU 计算阶段不要等数据。</p>
+<p>第二件必然出现的机制是显存预算。权重只是模型训练账本里的第一行。训练需要梯度来更新参数，需要 AdamW 的 <code>m/v</code> 和可能存在的 FP32 master weight，需要为反向保留 activation，还需要 CUDA allocator、NCCL、framework runtime 的临时空间。于是 micro-batch、sequence length、activation checkpointing、optimizer 选择、mixed precision 都从同一个问题里被推导出来：在有限 HBM 里，哪些张量必须保存，哪些可以重算，哪些可以降精度，哪些必须分片。</p>
+<p>第三件必然出现的机制是精度策略。FP32 稳但贵，BF16/FP16 能让 Tensor Core 更有效，也能降低参数、梯度和 activation 的字节数。AMP 的本质不是“自动加速开关”，而是在数值稳定性、吞吐和显存之间给每类算子选择合适的数据格式。BF16 通常少受 loss scaling 困扰；FP16 更依赖 GradScaler 和溢出检查；某些 reduction、normalization、optimizer update 仍需要更高精度。平台侧要记录的不只是“开了 AMP”，而是具体 dtype、是否保留 master weight、loss scaling 策略、哪些算子被 autocast。</p>
+<p>第四件必然出现的机制是效率指标。GPU utilization 只回答设备是不是忙，不能回答忙在有效模型计算、重算、等待、拷贝还是低效 kernel。MFU 把“理论上一次训练 step 应该完成的模型 FLOPs”除以硬件峰值，用来衡量有效训练进展；HFU 看硬件实际执行了多少 FLOPs，activation checkpointing 这类重算会提高 HFU，却不提高每个 token 的有效训练进展。于是单机基线必须同时记录 tokens/s、step time、显存峰值、MFU/HFU 和 profiling 证据，否则高 utilization 可能只是一个漂亮但误导的表面数字。</p>
+<p>第五件必然出现的机制是基线实验。所有优化都需要对照组，所以必须固定数据切片、随机种子、sequence length、micro-batch、gradient accumulation、precision、checkpoint 频率和 profiler 采样窗口。单变量改变才有诊断价值：调 <code>num_workers</code> 是在验证输入供给，调 micro-batch 是在验证 HBM 与 Tensor Core 饱和度，开 activation checkpointing 是在用算力换显存，改 checkpoint 频率是在验证持久化写入对稳态 step 的干扰。单机训练因此成为后续分布式训练的校准尺，而不是临时过渡阶段。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((单机训练最小闭环))
+    不可化简问题
+      数据持续变成参数更新
+      有限CPU内存HBM算力
+      每个step必须可解释
+    时间账本
+      load
+      preprocess
+      H2D
+      forward
+      backward
+      optimizer
+      checkpoint
+      overlap与同步点
+    显存账本
+      params
+      grads
+      optimizer_state
+      activations
+      fragmentation
+      temporary_buffers
+    推导出的机制
+      dataloader_prefetch
+      pinned_memory
+      micro_batch
+      gradient_accumulation
+      mixed_precision_AMP
+      activation_checkpointing
+    效率指标
+      GPU_utilization
+      tokens_per_second
+      MFU
+      HFU
+      step_time_P50_P95
+    工程边界
+      单机基线先固定
+      单变量试验
+      profiler证据
+      再进入数据并行和模型并行</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>拿到一个训练作业时，如何把“训练慢”拆成可测量的 step 时间账本？</li>
+<li>为什么 7B 模型的 BF16 权重约 <code>14 GB</code>，但朴素训练仍然放不进一张 <code>80 GB</code> GPU？</li>
+<li>micro-batch、gradient accumulation 和 effective batch 分别改变显存、吞吐和优化行为中的哪一部分？</li>
+<li>AMP 为什么既可能提升吞吐、降低显存，也可能引入数值稳定性和算子覆盖边界？</li>
+<li>GPU utilization、MFU、HFU 三个指标分别回答什么问题，为什么高 utilization 不能证明训练高效？</li>
+<li>当 step time 抖动时，如何区分数据供给、H2D、kernel、checkpoint 和 logging 的影响？</li>
+<li>一个最低可用的单机基线实验，必须固定和记录哪些变量，才能服务后续多卡扩展分析？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<p>完成本章学习后，你应该能够理解单机训练任务的完整时间结构，知道 dataloader、前向、反向、优化器分别处在什么位置；能分析 GPU 利用率低的单机原因，理解显存预算和 batch size 的关系；能区分 GPU utilization、MFU 和 HFU，理解 micro-batch、梯度累积和有效 batch 的区别，并设计一个最低可用的单机基线实验。</p>
+<div class="grid-3">
+<div class="card"><strong>时间账本</strong><br>把 step 拆成输入、搬运、计算、优化、checkpoint 和 logging。</div>
+<div class="card"><strong>显存账本</strong><br>把参数、梯度、优化器状态、activation、碎片和临时 buffer 分开估算。</div>
+<div class="card"><strong>实验账本</strong><br>固定变量、记录指标、单变量变更，给多卡扩展建立对照组。</div>
+</div>
+<div class="success"><strong>学习目标的核心：</strong>不是记住某个经验 batch 或 worker 数，而是让每次训练结果都能回到资源、时间和指标三张账本上解释。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 本章导读</h2>
+<p>很多人会把“单机训练”理解成写训练脚本时的临时调试阶段、上分布式前随便跑一下的过渡步骤，或者只要 loss 在降就算完成。但工程现实恰恰相反。单机训练是你第一次能把整个训练系统当作一台完整机器来看清楚的时候：数据从哪里来，CPU 和 GPU 怎么接力，时间到底花在输入、计算还是同步，显存为什么会在某个 batch 突然爆掉，某次“优化”到底是让吞吐真的变高，还是只是让曲线更好看。</p>
+<pre><code>输入链路是否顺
+  -&gt; 单步时间结构是否清楚
+  -&gt; 显存预算是否可解释
+  -&gt; 指标是否可信
+  -&gt; 基线是否可复现</code></pre>
+<p>如果这些问题在单机阶段就讲不清，到了 <a href="../part3/08-data-parallel.html">第 8 章</a>、<a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 和 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>，问题只会变得更贵、更难定位。</p>
+<div class="warn"><strong>工程边界：</strong>单机训练不是“小规模所以不重要”，而是“变量少所以最适合作为诊断基线”。没有单机基线，多卡结果很难判断是扩展收益还是噪声叠加。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 训练 step 与数据供给</h2>
+<h3>7.1 单机训练是所有复杂系统的最小原型</h3>
+<p>很多团队一开始就急着上多卡、多机、调度平台，但如果单机训练本身都不稳定、不高效，那么问题只会在更大规模下被放大。单机训练至少应该回答：数据是否能稳定供给，GPU 是否被喂饱，step time 是否稳定，loss 是否正常下降，checkpoint 是否能按预期写出。如果这些基础问题都还没解决，分布式只会让排障更难。</p>
+<h3>7.2 一个 step 到底包含哪些阶段</h3>
+<p>单机训练的一个 step 通常可以拆成：</p>
+<pre><code>t_step = t_load + t_preprocess + t_h2d + t_forward + t_backward + t_optim</code></pre>
+<p>实际工程里有时还需要加上 <code>t_checkpoint</code>、<code>t_eval</code> 和 <code>t_logging</code>。这条式子把“训练慢”从一个模糊描述拆成了可测量的几段。</p>
+<p>真实系统里，step 时间不一定是完全串行相加。可以先把它压缩成两大块：</p>
+<pre><code>t_input = t_load + t_preprocess + t_h2d
+t_gpu   = t_forward + t_backward + t_optim
+t_step ≈ max(t_input, t_gpu) + t_unoverlapped</code></pre>
+<pre class="mermaid">gantt
+  title 单机训练 step 时间线：串行与重叠
+  dateFormat X
+  axisFormat %s
+  section 低效串行
+  load/preprocess     :a1, 0, 2
+  H2D                 :a2, after a1, 1
+  forward/backward    :a3, after a2, 4
+  optimizer           :a4, after a3, 1
+  section 健康重叠
+  step k GPU compute  :b1, 0, 4
+  step k+1 input      :b2, 1, 3
+  unavoidable sync    :b3, 4, 1</pre>
+<div class="note"><strong>调优顺序：</strong>如果 <code>t_input</code> 明显大于 <code>t_gpu</code>，优先看数据链路；如果两者已经充分重叠，再继续加 dataloader worker，收益可能很小。</div>
+<h3>7.3 数据供给链路</h3>
+<p>GPU 前面通常有一条更长的供给链：远端数据源 → 本地缓存 → dataloader → CPU 预处理 → H2D 拷贝 → GPU 执行。如果这条链路中的任意一段慢，就会看到 GPU 利用率上下剧烈波动、dataloader worker 长时间繁忙、step time 不稳定、CPU 使用率高但 GPU 没吃满。</p>
+<table>
+<tr><th>旋钮</th><th>在解决什么</th><th>常见副作用</th></tr>
+<tr><td><code>num_workers</code></td><td>让 CPU 解码、切分、拼接更并行</td><td>过多时会带来上下文切换、内存压力和 I/O 抢占</td></tr>
+<tr><td><code>pin_memory</code></td><td>让 H2D 拷贝更顺畅</td><td>会增加主机内存占用</td></tr>
+<tr><td><code>prefetch_factor</code></td><td>让 worker 提前准备更多 batch，减少抖动</td><td>会占用更多 CPU / 内存缓存</td></tr>
+<tr><td><code>persistent_workers</code></td><td>避免每轮 epoch 反复拉起 worker</td><td>长生命周期 worker 更难调试</td></tr>
+<tr><td>本地缓存 / shard 预热</td><td>减少远端存储读取延迟</td><td>增加磁盘占用和缓存管理复杂度</td></tr>
+</table>
+<div class="danger"><strong>常见误区：</strong>dataloader 慢不等于把 <code>num_workers</code> 一路调大。先确认瓶颈在远端读取、CPU 预处理还是 H2D，再选择对应旋钮。</div>
+<pre class="mermaid">flowchart LR
+  A[远端数据源] --> B[本地缓存/Shard]
+  B --> C[Dataloader Workers]
+  C --> D[CPU Decode/Tokenize/Collate]
+  D --> E[Pinned Memory]
+  E --> F[H2D Copy]
+  F --> G[GPU Forward/Backward]
+  C -.prefetch.-> D
+  E -.non_blocking.-> F
+  F -.overlap.-> G</pre>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 显存预算、AMP 与 batch 策略</h2>
+<h3>7.4 显存预算要怎么算</h3>
+<p>一个简单但很实用的显存预算式子是：</p>
+<pre><code>M_total ≈ M_params + M_grads + M_optim + M_activations + M_fragmentation</code></pre>
+<p>为什么同一模型有时能放下、有时 OOM？原因常常不只是参数数量，而是 batch size 改了、序列长度变了、激活多了、mixed precision 关闭了，或者运行时出现内存碎片。</p>
+<pre class="mermaid">flowchart TD
+  A[HBM 总预算] --> B[参数 params]
+  A --> C[梯度 grads]
+  A --> D[优化器状态 optim]
+  A --> E[激活 activations]
+  A --> F[碎片和临时 buffer]
+  E --> G[micro-batch]
+  E --> H[sequence length]
+  E --> I[activation checkpointing]
+  D --> J[AdamW m/v]
+  D --> K[FP32 master weight]
+  F --> L[allocator/runtime/NCCL]</pre>
+<h3>7.4.1 Mixed Precision 对显存和速度的影响</h3>
+<p>AMP 的目标不是简单地“把所有张量变成半精度”，而是把训练 step 里不同数值敏感度的部分分层处理：矩阵乘、卷积、attention projection 这类 Tensor Core 友好的大算子尽量用 BF16 / FP16；loss、部分 reduction、normalization、optimizer update 等更容易受精度影响的路径保留 FP32 或更保守的累积方式。</p>
+<pre><code class="language-python">scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+
+for batch in loader:
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = model(batch).loss
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)</code></pre>
+<table>
+<tr><th>精度策略</th><th>参数/激活字节</th><th>Tensor Core 友好度</th><th>数值稳定性</th><th>工程边界</th></tr>
+<tr><td>FP32</td><td><code>4 bytes</code></td><td>通常较差</td><td>最稳</td><td>显存和吞吐成本高，适合 debug 或少数敏感算子</td></tr>
+<tr><td>FP16 AMP</td><td><code>2 bytes</code></td><td>高</td><td>依赖 loss scaling</td><td>需要监控 overflow、<code>nan</code>、scaler 回退频率</td></tr>
+<tr><td>BF16 AMP</td><td><code>2 bytes</code></td><td>高</td><td>通常更稳</td><td>需要硬件支持，老卡吞吐可能不理想</td></tr>
+<tr><td>FP8 / 低精度训练</td><td><code>1 byte</code> 级</td><td>很高</td><td>策略复杂</td><td>超出本章单机基线范围，通常要配合框架和校准策略</td></tr>
+</table>
+<div class="warn"><strong>AMP 边界：</strong>AMP 不能修复数据供给瓶颈，也不能让过小 micro-batch 自动吃满 GPU；它降低的是张量字节数并提升部分算子的峰值效率。</div>
+<h3>7.4.2 典型模型显存实例</h3>
+<table>
+<tr><th>模型</th><th>参数显存 FP32</th><th>参数显存 BF16 / FP16</th><th>Adam 状态显存</th><th>典型激活显存估算</th><th>工程含义</th></tr>
+<tr><td>LLaMA 7B</td><td>约 28 GB</td><td>约 14 GB</td><td>约 56 GB</td><td>约 6-10 GB</td><td>推理容易单卡，训练时梯度和优化器很快把显存吃满</td></tr>
+<tr><td>LLaMA 13B</td><td>约 52 GB</td><td>约 26 GB</td><td>约 104 GB</td><td>约 12-20 GB</td><td>单卡训练通常需要 AMP、重计算或切分</td></tr>
+<tr><td>LLaMA 70B</td><td>约 280 GB</td><td>约 140 GB</td><td>约 560 GB</td><td>约 60-100 GB</td><td>必然进入多卡并行和状态分片</td></tr>
+</table>
+<div class="note"><strong>参考数量级：</strong>AMP 相对 FP32 常见可节省约 30%-50% 显存；7B 级模型 BF16 参数本体约 14 GB，但 Adam 状态约 <code>8 bytes / param</code>，若保留 FP32 master weight 还要更高。</div>
+<h3>7.4.3 batch size、micro-batch 与梯度累积</h3>
+<p>很多单机训练的问题，表面上是在问“batch 能开多大”，实际上是在混淆三个不同概念：micro-batch 是一次前向 / 反向真正送进设备的 batch；gradient accumulation 是积累多少个 micro-batch 再做一次优化器更新；effective batch 是真正影响优化行为的总 batch。</p>
+<pre><code>B_effective = B_micro x N_accum</code></pre>
+<table>
+<tr><th>调大什么</th><th>更直接影响什么</th><th>常见代价</th></tr>
+<tr><td><code>micro-batch</code></td><td>GPU 利用率、单次前后向吞吐</td><td>激活显存迅速上升，最容易 OOM</td></tr>
+<tr><td><code>gradient accumulation</code></td><td>有效 batch，不必立即增加显存</td><td>每次参数更新更慢，单次 optimizer step 间隔更长</td></tr>
+<tr><td><code>sequence length</code></td><td>单样本上下文能力</td><td>激活和 attention 开销上升非常快</td></tr>
+</table>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Worked Example：LLaMA-7B 单机训练资源规划</h2>
+<p>下面用一个平台侧经常会遇到的配置，把前面的公式真正算一遍。目标不是追求“唯一正确答案”，而是建立一套拿到新模型后就能快速估预算、判可行性、找第一瓶颈的流程。</p>
+<table>
+<tr><th>项目</th><th>假设值</th><th>为什么这样选</th></tr>
+<tr><td>模型规模</td><td><code>7B params</code></td><td>代表常见的 LLaMA-7B 量级</td></tr>
+<tr><td>层数 / hidden size</td><td><code>32 layers</code> / <code>4096 hidden</code></td><td>方便估 activation 数量级</td></tr>
+<tr><td>精度</td><td><code>BF16</code></td><td>H100 上最常见，也比 FP16 更稳</td></tr>
+<tr><td>优化器</td><td><code>AdamW + FP32 master weight</code></td><td>平台默认最常见，也最占显存</td></tr>
+<tr><td>序列长度</td><td><code>4096</code> tokens</td><td>已能看出长上下文对显存和 step time 的压力</td></tr>
+<tr><td>micro-batch</td><td><code>4 seq / GPU</code></td><td>单机吞吐和显存之间的常见折中</td></tr>
+<tr><td>gradient accumulation</td><td><code>4</code></td><td>让有效 batch 不必直接顶满显存</td></tr>
+<tr><td>目标机器</td><td><code>8 x H100-80GB, NVLink</code></td><td>典型单机训练节点</td></tr>
+</table>
+<p>先看和 batch 无关、几乎“跑起来就必须付”的静态显存：</p>
+<table>
+<tr><th>组成</th><th>计算</th><th>结果</th><th>工程解释</th></tr>
+<tr><td>参数</td><td><code>7B x 2 bytes</code></td><td><code>14 GB</code></td><td>BF16 权重本体</td></tr>
+<tr><td>梯度</td><td><code>7B x 2 bytes</code></td><td><code>14 GB</code></td><td>反向后需要保留到优化器更新</td></tr>
+<tr><td>AdamW optimizer state</td><td><code>7B x 12 bytes</code></td><td><code>84 GB</code></td><td><code>FP32 master + m + v</code>，训练和推理差异最大的来源</td></tr>
+<tr><td>静态小计</td><td><code>14 + 14 + 84</code></td><td><code>112 GB</code></td><td>还没算 activation、临时 buffer、碎片</td></tr>
+</table>
+<div class="danger"><strong>关键结论：</strong>“7B 参数”只说明推理权重大约是 <code>14 GB</code>，并不说明训练能放进一张 <code>80 GB</code> 卡。朴素单卡或 DDP 复制思路下，每张卡都要持有静态状态，显存已经不闭合。</div>
+<p>activation 只用 hidden state 下界做一个估算：</p>
+<pre><code>M_act_floor ≈ L x B_micro x S x H x 2 bytes
+32 x 4 x 4096 x 4096 x 2 ≈ 4.3 GB</code></pre>
+<table>
+<tr><th>activation 口径</th><th>估算值</th><th>解释</th></tr>
+<tr><td>hidden-state floor</td><td><code>约 4.3 GB / GPU</code></td><td>只保留最基础的层输入</td></tr>
+<tr><td>不开 activation checkpointing</td><td><code>约 12-18 GB / GPU</code></td><td>通常是 floor 的 <code>3x-4x</code>，实现差异很大</td></tr>
+<tr><td>开 activation checkpointing</td><td><code>约 6-10 GB / GPU</code></td><td>用更多重算换更低显存</td></tr>
+</table>
+<table>
+<tr><th>方案</th><th>每卡显存近似</th><th>是否可行</th><th>第一瓶颈通常是什么</th></tr>
+<tr><td><code>1 x H100-80GB</code>，无状态分片</td><td><code>112 GB + 12-18 GB</code></td><td>不可行</td><td>HBM 容量直接不够</td></tr>
+<tr><td><code>8 x H100</code>，纯 DDP 复制</td><td>每卡仍是 <code>112 GB + 12-18 GB</code></td><td>不可行</td><td>卡数增加了，但每卡仍保留整份状态</td></tr>
+<tr><td><code>2 x H100</code>，ZeRO-1</td><td><code>14 + 14 + 42 + 6-10 = 76-80 GB</code></td><td>很紧</td><td>activation 一抖就 OOM，几乎没有碎片余量</td></tr>
+<tr><td><code>2 x H100</code>，FSDP / ZeRO-3</td><td><code>7 + 7 + 42 + 6-10 = 62-66 GB</code></td><td>可行</td><td>all-gather / reduce-scatter 开始明显进入 step time</td></tr>
+<tr><td><code>8 x H100</code>，ZeRO-2</td><td><code>14 + 1.75 + 10.5 + 6-10 = 32.25-36.25 GB</code></td><td>很稳</td><td>从“能不能放下”转向“通信和数据能不能喂满”</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[7B 训练预算] --> B{静态状态是否闭合}
+  B -->|单卡/纯DDP 112GB+| C[不可行: HBM 不够]
+  B -->|状态分片| D{activation 是否有余量}
+  D -->|2卡 ZeRO-1 76-80GB| E[很紧: 容易 OOM]
+  D -->|FSDP/ZeRO-3| F[可行但通信进入 step time]
+  D -->|8卡 ZeRO-2| G[显存稳: 查数据和通信吞吐]
+  G --> H[tokens/s + MFU + profiler 证据]</pre>
+<p>在 <code>8 x H100 + ZeRO-2</code> 方案上，按 <code>8 GPUs x 4 seq x 4 accum x 4096</code> 计算，一个 optimizer step 覆盖 <code>524,288 tokens</code>。对 7B decoder-only 模型，常见训练 FLOPs 估算是 <code>6 x params x tokens</code>，约为 <code>22 PFLOPs / optimizer step</code>。</p>
+<table>
+<tr><th>假设的 optimizer step time</th><th>对应吞吐</th><th>近似 MFU</th><th>读数含义</th></tr>
+<tr><td><code>6 s</code></td><td><code>约 87k tokens/s</code></td><td><code>约 46%</code></td><td>单机 <code>8</code> 卡、NVLink 健康区间</td></tr>
+<tr><td><code>8 s</code></td><td><code>约 65k tokens/s</code></td><td><code>约 35%</code></td><td>系统在跑，但 overlap 和输入供给还有明显损失</td></tr>
+<tr><td><code>12 s</code></td><td><code>约 44k tokens/s</code></td><td><code>约 23%</code></td><td>要优先查 dataloader、通信等待、checkpoint 干扰</td></tr>
+</table>
+<table>
+<tr><th>训练步骤</th><th>主要资源动作</th><th>期望观察</th><th>异常时优先检查</th></tr>
+<tr><td>读取 batch</td><td>CPU worker 从 shard 读取并 tokenize / collate</td><td>data time 低于 GPU compute time，P95 不剧烈抖动</td><td>远端存储、本地缓存、<code>num_workers</code>、CPU NUMA</td></tr>
+<tr><td>H2D 搬运</td><td>batch 从 host pinned memory 进入 GPU</td><td>H2D 与上一个 step 的计算部分重叠</td><td><code>pin_memory</code>、non_blocking copy、隐式同步</td></tr>
+<tr><td>前向 / 反向</td><td>BF16 matmul、attention、MLP、梯度计算</td><td>GPU kernel 连续，显存按 micro-batch 上升</td><td>micro-batch 太小、算子碎片、sequence length 过长、梯度 <code>nan</code></td></tr>
+<tr><td>梯度规约</td><td>ZeRO/FSDP reduce-scatter / all-gather</td><td>通信与反向尽量 overlap</td><td>NCCL 等待、bucket 太小、NVLink 拓扑问题</td></tr>
+<tr><td>optimizer / checkpoint</td><td>更新状态并周期性写权重、状态和指标</td><td>周期稳定，固定 step 出现可解释尖峰</td><td>fused optimizer、allocator 碎片、文件系统吞吐、保存频率</td></tr>
+</table>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 瓶颈、profiling 与效率指标</h2>
+<h3>7.5 单机训练最常见的几类瓶颈</h3>
+<table>
+<tr><th>瓶颈类型</th><th>典型症状</th><th>第一动作</th></tr>
+<tr><td>数据加载瓶颈</td><td>GPU 周期性空转，dataloader 时间占比高，调大 worker 后吞吐改善明显</td><td>看 dataloader 时间、CPU 使用率、远端读取和 H2D overlap</td></tr>
+<tr><td>显存瓶颈</td><td>batch 很小，稍微拉长序列就 OOM，激活重计算一开速度变慢但任务能跑</td><td>看显存峰值，区分参数状态、activation、碎片和临时 buffer</td></tr>
+<tr><td>算子执行瓶颈</td><td>GPU 利用率长期高，调大 batch 仍提升有限，profiler 显示少数 kernel 占主导</td><td>查 micro-batch、dtype、算子融合、Tensor Core 命中和单 kernel 详情</td></tr>
+<tr><td>日志 / checkpoint 干扰</td><td>每隔固定时间 step time 抖动，保存 checkpoint 后训练中断明显</td><td>对照保存、eval、logging 周期，评估异步写入和频率</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[训练变慢] --> B{Step time 稳定吗}
+  B -->|不稳定| C{是否固定周期}
+  C -->|是| D[查 checkpoint/eval/logging]
+  C -->|否| E[查数据 shard/远端存储/CPU 抖动]
+  B -->|稳定偏慢| F{GPU 忙吗}
+  F -->|不忙| G[查 dataloader/H2D/同步点]
+  F -->|很忙| H{MFU 是否低}
+  H -->|低| I[查 kernel 形态/小 batch/重算]
+  H -->|正常| J[记录为基线或查业务口径]</pre>
+<h3>7.6 一个最低限度的单机排障顺序</h3>
+<ol>
+<li>看 step time 是否稳定。</li>
+<li>看 GPU 利用率与显存占用。</li>
+<li>看 dataloader / CPU / I/O。</li>
+<li>看 batch size 和序列长度变化。</li>
+<li>看 checkpoint / eval / logging 是否插入额外停顿。</li>
+</ol>
+<div class="success"><strong>排障顺序：</strong>先判断是不是供给链问题，再判断是不是纯计算问题。这样能避免一上来就钻进单个 kernel，而忽略了 GPU 其实在等数据。</div>
+<table>
+<tr><th>工具</th><th>看什么</th><th>何时用</th><th>常见输出</th></tr>
+<tr><td><code>nvidia-smi</code> / <code>nvidia-smi dmon</code></td><td>利用率、显存、功耗、温度</td><td>先判断是不是明显空转或 OOM 临界</td><td>终端实时数据</td></tr>
+<tr><td><code>torch.profiler</code></td><td>step 内算子、CPU/GPU 时间分布</td><td>从 PyTorch 层拆前向 / 反向 / dataloader</td><td>Chrome trace / TensorBoard</td></tr>
+<tr><td>Nsight Systems (<code>nsys</code>)</td><td>kernel、stream、H2D、同步是否重叠</td><td>怀疑 pipeline 串行、拷贝阻塞、CPU 等待</td><td>系统级时间线</td></tr>
+<tr><td>Nsight Compute (<code>ncu</code>)</td><td>单个慢 kernel 的 occupancy、访存效率</td><td>已定位到个别 kernel 很慢时</td><td>kernel 报告</td></tr>
+<tr><td><code>torch.cuda.memory_summary()</code></td><td>分配峰值、保留量、碎片线索</td><td>OOM、显存涨不回去、怀疑碎片</td><td>文本报告</td></tr>
+</table>
+<h3>7.6b MFU、HFU 和 GPU Utilization 不是一回事</h3>
+<pre><code>MFU = (model FLOPs per step / t_step) / (peak device FLOPS x N_devices)
+HFU = (actual hardware FLOPs per step / t_step) / (peak device FLOPS x N_devices)</code></pre>
+<table>
+<tr><th>指标</th><th>在回答什么问题</th><th>分子口径</th><th>容易被什么误导</th></tr>
+<tr><td>GPU utilization</td><td>GPU 是否长期在忙</td><td>采样窗口内 GPU 是否有活动</td><td>SM 忙于等待、拷贝或低效 kernel 时也可能很高</td></tr>
+<tr><td>tokens/s</td><td>训练进度是否变快</td><td>单位时间处理 token 数</td><td>batch、sequence length、accumulation 口径不一致时不可比</td></tr>
+<tr><td>MFU</td><td>有效模型计算占理论峰值多少</td><td>模型 FLOPs / step time</td><td>不包含激活重计算等“额外 FLOPs”</td></tr>
+<tr><td>HFU</td><td>硬件实际执行 FLOPs 占理论峰值多少</td><td>实际硬件 FLOPs / step time</td><td>开了重计算时可能高于 MFU，但有效进展没同比增加</td></tr>
+</table>
+<table>
+<tr><th>组合读数</th><th>更可能的解释</th><th>下一步动作</th></tr>
+<tr><td>utilization 低，MFU 低，data time 高</td><td>GPU 被输入链路饿住</td><td>查 dataloader、storage、H2D overlap</td></tr>
+<tr><td>utilization 高，MFU 低，HFU 也低</td><td>GPU 忙但 kernel 效率差</td><td>查 micro-batch、算子融合、Tensor Core dtype</td></tr>
+<tr><td>utilization 高，MFU 低，HFU 较高</td><td>额外计算多，常见于重算</td><td>查 activation checkpointing、重复 forward、profiler FLOPs</td></tr>
+<tr><td>MFU 正常但 P95 step 抖动</td><td>稳态计算健康，周期性干扰明显</td><td>查 checkpoint、eval、日志、数据 shard 切换</td></tr>
+<tr><td>tokens/s 高但 loss 更新慢</td><td>gradient accumulation 口径被忽略</td><td>区分 micro-step 和 optimizer step</td></tr>
+</table>
+<div class="warn"><strong>指标边界：</strong>MFU/HFU 都依赖 FLOPs 口径，不能脱离模型结构、精度峰值和 step 定义使用。团队内部应固定口径，跨论文或跨厂商数字只能做数量级参考。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 单机基线实验与工程建议</h2>
+<h3>7.7 为什么单机基线极其重要</h3>
+<p>平台工程里有一个很实用的原则：如果单机 1 卡的性能和稳定性没有基线，任何多卡、多机数据都很难解释。你至少应该知道单机单卡 step time、吞吐、显存占用，以及它们在不同 batch 下的变化趋势。只有这样，当你开始做 <a href="../part3/08-data-parallel.html#s4">第 8 章 §8.4</a> 的扩展效率分析时，才知道哪里是真扩展，哪里只是引入了更多噪声。</p>
+<h3>7.7.1 一个最低可用的单机基线实验</h3>
+<table>
+<tr><th>阶段</th><th>建议动作</th><th>目的</th></tr>
+<tr><td>固定输入</td><td>固定数据切片、随机种子、序列长度、精度和优化器</td><td>避免每次结果不可比</td></tr>
+<tr><td>预热</td><td>先跑一小段 warmup，再开始记正式数据</td><td>去掉首次编译、缓存和 autotune 扰动</td></tr>
+<tr><td>稳态采样</td><td>连续记录一段稳定 step 的 P50 / P95 step time</td><td>避免只看单个幸运 step</td></tr>
+<tr><td>记录关键指标</td><td>samples/s 或 tokens/s、显存峰值、data time 占比、utilization</td><td>给后续优化留对照组</td></tr>
+<tr><td>单变量试验</td><td>每次只改一个变量，如 batch、worker、precision</td><td>避免不知道是哪个改动生效</td></tr>
+</table>
+<p>最小记录表通常至少包含模型名和配置、数据切片版本、micro-batch / sequence length、precision、平均 step time、吞吐、最大显存占用，以及是否开 checkpointing、梯度累积、重计算等备注。</p>
+<pre class="mermaid">flowchart LR
+  A[固定数据切片/种子/配置] --> B[Warmup]
+  B --> C[稳态采样]
+  C --> D[记录 P50/P95 step time]
+  D --> E[记录 tokens/s 与显存峰值]
+  E --> F[单变量试验]
+  F --> G[写入单机基线报告]
+  G --> H[服务第8章扩展效率分析]</pre>
+<h3>7.8 工程建议</h3>
+<ul>
+<li>先固定数据集切片、随机种子和 batch，再记录单机基线。</li>
+<li>单机阶段就把 profiler 跑通，不要等到多卡出问题再补。</li>
+<li>显存一旦接近上限，就同时检查参数、激活和优化器，不要只盯模型大小。</li>
+<li>每次改数据管道、精度策略或 checkpoint 频率，都应重测单机基线。</li>
+</ul>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>启动单机训练</td><td><code>torchrun --nproc_per_node=1 train.py</code></td><td>建立后续多卡对照基线</td></tr>
+<tr><td>显存巡检</td><td><code>nvidia-smi</code>、<code>torch.cuda.memory_summary()</code></td><td>快速定位 OOM 和碎片问题</td></tr>
+<tr><td>Step 分析</td><td><code>torch.profiler</code>、Nsight Systems</td><td>看数据供给和计算是否重叠</td></tr>
+<tr><td>混合精度</td><td><code>torch.cuda.amp.autocast</code>、<code>GradScaler</code></td><td>BF16 更稳，FP16 更依赖 loss scaling</td></tr>
+</table>
+<div class="success"><strong>基线判断：</strong>只有把变量、指标和 profiler 证据留下来，单机基线才不是“我记得上次好像更快”，而是一份之后可以拿来和多卡、多机对照的证据。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 本章小结与练习题</h2>
+<table>
+<tr><th>主题</th><th>关键点</th></tr>
+<tr><td>单机训练价值</td><td>是所有训练系统优化的基线</td></tr>
+<tr><td>step 结构</td><td>数据、搬运、前向、反向、优化器共同决定总时间</td></tr>
+<tr><td>时间线理解</td><td>真实 step 常是输入与计算部分重叠，而不是完全串行</td></tr>
+<tr><td>显存预算</td><td>不只看参数量，还要看梯度、优化器和激活</td></tr>
+<tr><td>Batch 策略</td><td>micro-batch 决定显存压力，梯度累积决定有效 batch</td></tr>
+<tr><td>Profiling</td><td>先看 step 结构，再看系统时间线，最后才钻到单 kernel</td></tr>
+<tr><td>效率指标</td><td>utilization 说明是否忙，MFU / HFU 才更接近“忙得是否有效”</td></tr>
+<tr><td>排障顺序</td><td>先看供给链，再看计算本身</td></tr>
+</table>
+<h3>练习题</h3>
+<ol>
+<li>为什么说多机训练前必须先掌握单机训练基线？</li>
+<li>写出一个训练 step 的时间拆解式，并说明哪一项最容易被忽视。</li>
+<li>如果 GPU 利用率周期性掉到很低，你会优先怀疑什么？</li>
+<li>以 LLaMA 13B 为例，为什么只看参数显存会低估真实训练显存？</li>
+<li>为什么 <code>nvidia-smi</code> 看起来很忙，不代表 MFU 一定高？</li>
+</ol>
+<div class="note"><strong>自测标准：</strong>如果你能把每道题都回答成“变量、资源项、指标、证据”的组合，而不是只给一个经验建议，就说明本章的单机基线视角已经建立起来。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先用本章建立单机 step、显存和指标基线；再进入 <a href="../part3/08-data-parallel.html">第 8 章</a> 分析数据并行扩展效率；随后阅读 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 和 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>，把模型并行、状态分片、重计算和 checkpoint 放回同一张资源账本。</p>
+<p><strong>延伸阅读：</strong>建议回看 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的内存、互联与 IO，因为单机训练的 H2D、NVLink、存储抖动和 checkpoint 写入都直接依赖那条数据供给链路。</p>
+<p><strong>实践路线：</strong>先跑一个固定数据切片的单卡基线，记录 step time、tokens/s、显存峰值和 profiler；再分别改变 <code>num_workers</code>、micro-batch、precision、activation checkpointing 和 checkpoint 频率，形成团队内部可复用的基线表。</p>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 第 7 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 10b 章 · 对齐训练与后训练基础设施 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=10b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 10b 章 · 对齐训练与后训练基础设施</h1>
+<p class="sub">从“外部偏好如何稳定变成模型参数变化”出发，把 SFT、DPO、PPO、GRPO、Reward Model、rollout、checkpoint、评测门禁和数据闭环组织成一套可复现、可恢复、可扩容的后训练系统。</p>
+<div class="chips"><span class="chip">Post-training</span><span class="chip">Alignment</span><span class="chip">RLHF / PPO</span><span class="chip">DPO / GRPO</span><span class="chip">Reward Model</span><span class="chip">Checkpoint</span><span class="chip">Eval Gate</span></div>
+<div class="note"><strong>不可化简的问题：</strong>预训练模型已经学会语言分布后，平台怎样把人类偏好、业务规则、安全边界和 judge 信号稳定地转化为模型行为变化，并保证每一次变化都可解释、可复现、可回滚？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：后训练闭环</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">正文内容</a></li>
+<li><a class="anchor" href="#s4">本章小结</a></li>
+<li><a class="anchor" href="#s5">练习题</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：对齐训练与后训练基础设施</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 PPO、DPO、GRPO、RLHF、Reward Model 这些名字，本章真正要解决的不可化简问题是：一个预训练模型已经学会了语言分布，但它还不知道在具体产品场景里什么回答更应该被偏好、什么边界必须遵守、什么行为虽然概率高却不能交付；平台必须把这些外部偏好稳定地转化为模型参数变化，并且保证这个转化过程可复现、可评测、可恢复、可扩容。预训练只要求模型继续压低 token prediction loss，目标函数来自语料本身；后训练的目标函数却来自人、规则、judge、业务策略和安全约束。它们不是自然存在于语料里的单一数值，而是一组会漂移、会冲突、会被模型利用漏洞的外部信号。</p>
+<p>这就带来一个基础设施层面的本质差异：pretraining 的系统中心是一个连续训练 loop，alignment 的系统中心是一个闭环控制系统。这个闭环里至少有四类状态同时存在：policy model 负责生成候选行为，reference model 负责约束它不要离原始能力太远，reward model 或规则系统负责把行为映射成偏好信号，critic/value 或组内 baseline 负责把稀疏反馈变成可更新的梯度。每一类状态都可能有独立版本、独立显存峰值、独立吞吐瓶颈和独立失败模式。</p>
+<p>工程上最容易犯的错误，是把对齐训练想象成“换一个 loss 的 SFT”。如果这样做，rollout 阶段会把训练卡闲置，RM 打分会拖慢 step，reference 版本漂移会让 KL 曲线不可解释，checkpoint 恢复后 policy、critic、rollout buffer 不一致会让训练继续跑但结论失真。因此，本章不是算法排行榜，而是后训练基础设施的建模课。你要学会把“模型怎样更符合偏好”拆成数据、推理、训练、评测、checkpoint、服务化部署六个互相约束的问题：数据决定偏好信号是否可信，推理决定 rollout 是否跟得上训练，训练决定参数如何更新，评测决定更新是否真的改善行为，checkpoint 决定失败后能否回到同一组状态，部署选型决定 RM/ref/rollout 是共置还是独立服务。只要其中一个环节没有版本化和可观测性，对齐结果就很难解释。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“外部偏好如何变成参数变化”出发，可以自然推导出本章每个机制。第一步是 SFT：如果我们有高质量示范回答，就先用监督学习把 base model 拉到可指令跟随的区域，这降低后续偏好优化的探索成本。第二步是偏好数据：单个标准答案不足以表达“更好”，所以需要同一 prompt 下的 chosen/rejected、打分、critique 或规则验证结果。第三步是 DPO：如果偏好对已经离线存在，那么最省系统复杂度的做法，是直接比较 policy 对 chosen/rejected 的 logprob，并用 reference model 作为锚点；这解释了为什么 DPO 像 SFT，却必须严守 tokenizer、chat template、截断策略和 reference 版本一致性。</p>
+<p>如果偏好信号必须来自当前 policy 生成的新样本，就推导到 PPO/GRPO。PPO 需要 rollout，因为模型需要在线试错；需要 Reward Model，因为人类不可能在训练内环实时打分；需要 reference model，因为只追 reward 会导致模型跑偏；需要 critic/value model，因为单条 response 的 reward 太稀疏，需要估计 advantage 来稳定更新。于是 PPO 必然变成多模型协调系统，而不是单模型训练脚本。GRPO 则从 critic 的成本继续推导：如果同一 prompt 可以生成一组 response，并且 reward 能在组内比较，那么组均值可以充当 baseline，critic 就可以被移除；代价是 rollout 样本数上升，推理引擎吞吐变得更关键。</p>
+<p>再往下推，就是 RM 部署、显存账本和 checkpoint 一致性。RM 如果写在训练脚本里，任何超时都会阻塞策略更新；如果服务化，就必须有批处理、版本路由、限流、重试和指标。PPO 显存账本必须列出 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer，因为这些组件虽然不一定同时峰值，却会在阶段切换、权重同步、checkpoint 保存时形成短暂 OOM。checkpoint 也不能只保存 policy 权重，而要把 policy、critic、reference artifact、RM artifact、rollout buffer、KL controller、rng、数据游标写进同一份 manifest；否则恢复出来的是一组目录，而不是同一个训练状态。最后，评测必须进入训练内环，因为 loss 或 reward 上升不代表行为改善，win-rate、长度分布、安全拒答、格式遵循和 judge 版本才决定一个 checkpoint 是否值得继续训练或进入发布门禁。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((对齐训练与后训练基础设施))
+    不可化简问题
+      外部偏好如何变成参数变化
+      行为约束如何稳定复现
+      多模型状态如何保持一致
+    数据与目标
+      SFT示范数据
+      chosen_rejected偏好对
+      规则奖励与LLM_judge
+      安全与工具使用样本
+    机制推导
+      DPO
+        离线偏好优化
+        policy加reference
+        数据质量与模板一致性
+      PPO
+        在线rollout
+        Reward_Model打分
+        Reference_KL约束
+        Critic_Value估计
+      GRPO
+        组内相对奖励
+        去掉critic
+        更高rollout吞吐
+    基础设施压力
+      显存账本
+        policy_ref_reward_value
+        optimizer_activation
+        KV_Cache_rollout_buffer
+      RM服务化
+        批处理
+        版本路由
+        断路器
+      Checkpoint事务
+        manifest
+        多模型hash
+        KL_controller
+        rng和数据游标</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 post-training 不是“预训练后再训一下”，而是一条包含数据、训练、推理、评测和发布门禁的闭环管线？</li>
+<li>为什么 alignment training 不能等同于 RLHF，SFT、DPO、GRPO、PPO 分别解决偏好塑形里的哪一层问题？</li>
+<li>给定 LLaMA-7B 和 8×H100 80GB，怎样把 PPO 的 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer 分项列成显存账本？</li>
+<li>为什么 DPO 更容易平台化，但仍然需要严格保证 reference model、tokenizer、chat template、数据版本和评测口径一致？</li>
+<li>什么情况下应该把 Reward Model 和训练节点共置，什么情况下应该把 RM 做成独立推理服务或共享推理池？</li>
+<li>GRPO 去掉 critic 后省掉了哪些状态，又为什么会把压力转移到大 batch rollout 和 reward 可靠性上？</li>
+<li>一个可恢复的 PPO checkpoint manifest 至少要记录哪些模型、控制器、随机数、数据游标和评测版本？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<p>完成本章学习后，你将能够区分 pretraining、post-training、alignment training 三者的关系；理解 SFT、偏好优化、安全/工具使用整形、评测门禁这些后训练阶段；看懂 PPO / RLHF 里的多模型协调关系；区分 PPO、DPO、GRPO 在资源形态上的差异；识别 RLHF 系统里的典型性能瓶颈；设计更适合后训练的实验管理与 checkpoint 策略；并为不同规模的团队选择合适的对齐路线。</p>
+<div class="warn"><strong>边界提醒：</strong>本章关注基础设施形态，不把 PPO、DPO、GRPO 当成算法优劣排行榜。平台设计的核心是让数据、训练、推理、评测和恢复闭环稳定，而不是追逐单个 loss 名字。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 正文内容</h2>
+<h3>10b.1 先分清 Pretraining、Post-Training 与 Alignment Training</h3>
+<p>很多人第一次接触这一块时，最容易把三个词混成一个。Pretraining 是让模型在大规模通用数据上学会语言、代码或多模态分布；Post-training 是在 base model 预训练完成之后，用更贴近产品目标的数据和目标函数继续塑形；Alignment training 是 post-training 里的一个重要子集，重点让模型行为更接近人类、系统或产品希望它遵守的偏好与约束。</p>
+<pre><code>pretraining
+  └── post-training
+        ├── instruction tuning / SFT
+        ├── alignment training  (DPO / PPO / GRPO / RLAIF / Constitutional AI ...)
+        ├── tool-use / agent tuning
+        ├── safety / refusal shaping
+        └── domain adaptation / distillation</code></pre>
+<table>
+<tr><th>维度</th><th>Pretraining</th><th>Post-training</th><th>Alignment training</th></tr>
+<tr><td>核心问题</td><td>模型会什么</td><td>模型怎样更可用</td><td>模型怎样更符合偏好和约束</td></tr>
+<tr><td>常见数据</td><td>海量通用语料、代码、多模态数据</td><td>指令样本、偏好对、工具轨迹、安全样本</td><td>偏好数据、规则反馈、拒答 / 安全数据</td></tr>
+<tr><td>常见目标</td><td>学表示、学通用能力</td><td>提升任务可用性与产品形态</td><td>提升 helpfulness、truthfulness、harmlessness、风格一致性</td></tr>
+<tr><td>资源特征</td><td>大吞吐、长作业、强通信</td><td>数据更小但 loop 更多</td><td>训练 + 推理 + 评测更强耦合</td></tr>
+</table>
+<div class="note"><strong>实用判断：</strong>pretraining 更像“把能力写进参数”，post-training 更像“把能力组织成可交付行为”，alignment training 则是在其中明确约束“应该怎样做、不应该怎样做”。</div>
+
+<h3>10b.2 一个典型的后训练 Pipeline 长什么样</h3>
+<p>后训练不是一个单一算法名，更像一条工艺链。一次完整的模型发布，往往是 1 次 SFT + 3 到 5 次偏好优化 + 多轮 safety 补丁 + 十几次评测。</p>
+<pre class="mermaid">flowchart TD
+  A[base pretrained model] --> B[SFT / instruction tuning]
+  B --> C[preference data construction]
+  C --> D[preference optimization: DPO / PPO / GRPO / RLAIF]
+  D --> E[safety / refusal / tool-use shaping]
+  E --> F[eval / red-team / release gate]
+  F --> G[release candidate]
+  F -->|失败样本回流| C</pre>
+<table>
+<tr><th>阶段</th><th>常见输入</th><th>主要目标</th><th>更像哪类基础设施</th></tr>
+<tr><td>SFT / instruction tuning</td><td>prompt-response 演示数据</td><td>先学会按指令回答、输出格式更稳定</td><td>离线训练 job</td></tr>
+<tr><td>偏好数据构建</td><td>chosen / rejected、打分、critique、AI feedback</td><td>给“什么更好”提供监督信号</td><td>数据平台 + 标注 / judge 流水线</td></tr>
+<tr><td>偏好优化</td><td>DPO、PPO、GRPO 等训练流程</td><td>让模型行为向偏好分布靠近</td><td>训练 + 推理混合系统</td></tr>
+<tr><td>安全 / 工具使用整形</td><td>refusal 样本、工具轨迹、策略规则</td><td>让模型学会边界、调用方式和失败处理</td><td>训练 + 策略控制面</td></tr>
+<tr><td>评测与放行</td><td>benchmark、红队数据、人工 / LLM judge</td><td>判断版本是否可上线</td><td>评测平台 + 发布门禁</td></tr>
+</table>
+<p>Llama 3 等公开案例说明，生产级 post-training 不是“选一个最火算法”的问题，而是多阶段工艺组合的问题。平台要能跑多种不同形态的训练 job，在同一个实验框架下对比；数据平台要支持模型生成、模型打分、人工校验的半自动流水线；评测系统要能在 checkpoint 粒度自动触发，而不是等训练完才评。</p>
+<table>
+<tr><th>训练形态</th><th>7B 模型代价</th><th>70B 模型代价</th><th>数据准备成本</th></tr>
+<tr><td>SFT（单卡 / 小集群）</td><td>$50 - $500</td><td>$500 - $5K</td><td>示范数据标注 $5K - $50K</td></tr>
+<tr><td>DPO</td><td>$200 - $500</td><td>$2K - $5K</td><td>偏好对标注 $10K - $100K</td></tr>
+<tr><td>PPO（全量 RLHF）</td><td>$2K - $5K</td><td>$20K - $50K</td><td>偏好 + RM 数据 $50K - $500K</td></tr>
+<tr><td>GRPO（规则奖励）</td><td>$1K - $5K</td><td>$10K - $30K</td><td>可低至 $0（规则生成）</td></tr>
+</table>
+<div class="success"><strong>产品价值判断：</strong>post-training 通常只占整个训练预算的一小部分，但它对最终产品体验的影响很大；它虽然相对便宜，但单位算力的产品价值很高。</div>
+
+<h3>10b.3 为什么对齐训练是一个独立的基础设施问题</h3>
+<p>Pretraining 的主路径通常是一个模型、持续前向 / 反向 / 更新，关注吞吐、扩展效率和 checkpoint。对齐训练经常同时包含生成 rollout、计算偏好或 reward、做策略更新、维护多个模型状态。平台面对的不再是“一个训练 job”，而是“推理子系统 + 训练子系统 + 评测回路”的组合。</p>
+<table>
+<tr><th>维度</th><th>Pretraining / SFT</th><th>对齐训练</th></tr>
+<tr><td>模型数量</td><td>通常 1 个主模型</td><td>2-4 个模型并存</td></tr>
+<tr><td>主资源形态</td><td>连续训练</td><td>推理与训练交替</td></tr>
+<tr><td>关键瓶颈</td><td>吞吐、通信、显存</td><td>显存峰值、rollout 吞吐、实验稳定性</td></tr>
+<tr><td>通信模式</td><td>主要是 gradient all-reduce</td><td>还要 policy → rollout engine 同步权重</td></tr>
+<tr><td>失败模式</td><td>OOM、通信挂</td><td>以上全部 + reward hacking、KL 发散</td></tr>
+<tr><td>checkpoint</td><td>主要保存模型与优化器</td><td>还要保存 policy / critic / 偏好训练状态</td></tr>
+</table>
+<pre class="mermaid">sequenceDiagram
+  participant O as Orchestrator
+  participant P as Policy Rollout Engine
+  participant R as Reward Model
+  participant Ref as Reference Model
+  participant T as Trainer
+  participant C as Checkpoint Store
+  O->>P: sync latest policy weights
+  P->>P: generate responses with KV Cache
+  P->>R: score prompt+response batch
+  P->>Ref: compute reference logprob / KL baseline
+  R-->>O: rewards
+  Ref-->>O: ref logprobs
+  O->>T: assemble rollout batch
+  T->>T: PPO / GRPO update
+  T->>C: write multi-model checkpoint manifest</pre>
+<div class="warn"><strong>效率黑洞：</strong>RLHF 训练时间中常有大量时间花在 sample generation / rollout 上。把 rollout 提速，通常比只优化反向传播更能改善总 step time。</div>
+
+<h3>10b.4 RLHF / PPO 的基础设施形态</h3>
+<p>如果采用经典 RLHF 路线，一个常见顺序是 SFT model → preference collection → reward model training → PPO against reward + KL to reference model。一次 PPO 训练循环大致可以拆成 <code>t_step ≈ t_rollout + t_ref + t_reward + t_update + t_checkpoint</code>。其中前半段更像推理，后半段才是训练。</p>
+<table>
+<tr><th>模型</th><th>是否训练</th><th>在做什么</th><th>主要资源压力</th><th>可否替换</th></tr>
+<tr><td>Policy model</td><td>是</td><td>生成 response、参与 PPO 更新</td><td>参数、梯度、优化器、KV Cache</td><td>核心，不可替换</td></tr>
+<tr><td>Reference model</td><td>否</td><td>提供 KL 约束基线</td><td>只读权重、前向显存</td><td>可与 policy 共享权重（LoRA 场景）</td></tr>
+<tr><td>Reward model</td><td>否</td><td>给 rollout 打分</td><td>高频推理吞吐</td><td>可替换为规则 / judge LLM</td></tr>
+<tr><td>Critic / Value model</td><td>是</td><td>估计 value，参与更新</td><td>参数、梯度、优化器</td><td>GRPO 中被组内相对奖励替代</td></tr>
+</table>
+<p>PPO 必须单独做显存预算，因为它不是“一个 7B 模型训练”，而是同一轮里要同时管理 policy、reference、reward、critic 和 rollout KV Cache。以 LLaMA-7B 级 policy、bf16 权重、Adam 全量训练、8×H100 80GB 单节点为例：7B bf16 权重约 14GB；全量 Adam 训练通常按“参数 + 梯度 + optimizer state”约 12 bytes/param 估算，即单个可训练 7B 模型约 84GB，不含激活、通信 bucket 和碎片。</p>
+<table>
+<tr><th>组件</th><th>单模型/阶段估算</th><th>是否常驻</th><th>8×H100 上的工程含义</th></tr>
+<tr><td>Policy 参数 + 梯度 + optimizer</td><td>~84GB</td><td>update 阶段常驻</td><td>可用 ZeRO/FSDP 切到 8 卡，但还要加激活和通信缓冲</td></tr>
+<tr><td>Reference model bf16 权重</td><td>~14GB</td><td>通常常驻或可重载</td><td>只前向，用于 KL；运行时仍要有可访问权重</td></tr>
+<tr><td>Reward model bf16 权重</td><td>~14GB</td><td>rollout 后打分阶段常驻或远端服务</td><td>共置吃训练节点显存；独立部署吃网络和服务治理</td></tr>
+<tr><td>Critic 参数 + 梯度 + optimizer</td><td>~84GB</td><td>update 阶段常驻</td><td>PPO 的第二个可训练模型，是 GRPO 最主要省掉的部分</td></tr>
+<tr><td>Policy/critic 训练激活</td><td>~20-80GB</td><td>update 阶段峰值</td><td>取决于 micro-batch、seq len、checkpointing</td></tr>
+<tr><td>Rollout KV Cache</td><td>~10-60GB</td><td>rollout 阶段峰值</td><td>与并发序列数、层数、hidden size、生成长度线性相关</td></tr>
+<tr><td>通信 / allocator / runtime buffer</td><td>~20-50GB</td><td>阶段切换时明显</td><td>NCCL、FSDP/ZeRO、CUDA graph、推理引擎预分配都会吃余量</td></tr>
+</table>
+<table>
+<tr><th>方案</th><th>显存利用率</th><th>扩展性</th><th>实现复杂度</th><th>推荐场景</th></tr>
+<tr><td>同机共置</td><td>低（峰值挤）</td><td>差</td><td>低</td><td>单实验原型</td></tr>
+<tr><td>训推分离</td><td>中</td><td>好</td><td>中</td><td>生产 PPO 平台</td></tr>
+<tr><td>Hybrid Engine</td><td>高</td><td>好</td><td>高</td><td>追求极致效率的团队</td></tr>
+</table>
+<table>
+<tr><th>故障模式</th><th>现象</th><th>根因</th><th>平台应提供</th></tr>
+<tr><td>Reward hacking</td><td>reward 飙升但人眼看质量下降</td><td>RM 有漏洞，模型学到“刷分姿势”</td><td>在线 win-rate、多样本抽检</td></tr>
+<tr><td>KL 发散</td><td>KL 越训越大，模型跑偏</td><td>KL 系数太小或 reward 太强</td><td>KL 实时监控、自动回滚</td></tr>
+<tr><td>Loss 震荡</td><td>训练曲线剧烈抖动</td><td>learning rate 大、batch 小</td><td>自动早停、ckpt 对比</td></tr>
+<tr><td>输出退化</td><td>长度崩塌、重复、空输出</td><td>advantage 估计不稳、reward 畸形</td><td>rollout 样本抽样展示</td></tr>
+<tr><td>Critic 学不动</td><td>value loss 长期不降</td><td>value function 难估</td><td>考虑切 GRPO</td></tr>
+</table>
+<div class="danger"><strong>严重风险：</strong>8×H100 总显存够，不代表可以把四个模型无脑共置。PPO 的 OOM 常发生在 rollout、update、checkpoint、权重同步这些阶段切换的几秒钟峰值里。</div>
+
+<h3>10b.5 DPO / GRPO 等方法为什么更容易平台化</h3>
+<p>PPO 是训推混合系统，DPO 更像离线训练，GRPO 介于两者之间。选错方法的代价不只是效果差，还包括错误采购 GPU、错误建设 RM 服务、错误设计 checkpoint 格式。基础设施团队的目标不是证明某个算法先进，而是在当前数据、算力和评测成熟度下，选一条能稳定迭代的路线。</p>
+<table>
+<tr><th>方法</th><th>在线 rollout</th><th>需 reward model 打分</th><th>需 critic</th><th>需 reference</th><th>基础设施复杂度</th></tr>
+<tr><td>PPO / RLHF</td><td>需要</td><td>通常需要</td><td>需要</td><td>需要</td><td>★★★★★</td></tr>
+<tr><td>GRPO</td><td>需要</td><td>可由规则或组内相对奖励替代</td><td>不需要</td><td>需要</td><td>★★★</td></tr>
+<tr><td>RLOO / REINFORCE++</td><td>需要</td><td>需要</td><td>不需要</td><td>需要</td><td>★★★</td></tr>
+<tr><td>DPO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>需要</td><td>★★</td></tr>
+<tr><td>ORPO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>不需要</td><td>★</td></tr>
+<tr><td>KTO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>需要</td><td>★★</td></tr>
+</table>
+<h4>DPO：偏好优化的离线化</h4>
+<p>DPO 把“在线试错”变成“离线监督”，直接消费已经准备好的偏好对，把 chosen 和 rejected 的相对概率拉开。对基础设施团队来说，这意味着少了 rollout 服务、RM 在线打分、critic checkpoint、权重同步这几类最容易出故障的环节。</p>
+<pre><code>{
+  "prompt": "...",
+  "chosen": "...",
+  "rejected": "...",
+  "metadata": {
+    "source": "human|llm_judge|rule",
+    "judge_model": "optional",
+    "quality_score": 0.93
+  }
+}</code></pre>
+<p>DPO 的训练器像 SFT，但数据校验和评测要求更接近对齐训练。工程上要保证 policy 和 reference 使用同一 tokenizer、同一截断策略、同一 chat template；训练日志里除了 loss，还要看 chosen/rejected reward margin、隐式 KL、长度分布和 win-rate。</p>
+<h4>GRPO：砍掉 critic 的 PPO</h4>
+<p>GRPO 的核心观察是：如果同一个 prompt 采样一组 response，并且 reward 可以在组内比较，那么组均值可以充当 baseline，不必额外训练一个 critic。这会省掉一份模型权重、梯度、optimizer、checkpoint 和 value loss 监控，但会把压力转移到大 batch rollout 和 reward 可靠性上。</p>
+<table>
+<tr><th>维度</th><th>PPO</th><th>GRPO</th><th>差异</th></tr>
+<tr><td>Critic 模型</td><td>需要（和 policy 同大小）</td><td>不需要</td><td>显存明显下降</td></tr>
+<tr><td>Critic 优化器</td><td>需要</td><td>不需要</td><td>checkpoint 和恢复更简单</td></tr>
+<tr><td>每 prompt 采样数</td><td>1-4</td><td>16-64</td><td>rollout 开销上升</td></tr>
+<tr><td>典型适用任务</td><td>软偏好、helpfulness、写作质量</td><td>数学、代码、结构化答案</td><td>取决于 reward 是否可验证</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A{你有什么数据?}
+  A -->|只有示范数据| B[SFT]
+  A -->|有 chosen/rejected 偏好对| C{数据量与平台成熟度}
+  C -->|想快速落地| D[DPO]
+  C -->|只有单点好坏反馈| E[KTO / ORPO]
+  A -->|有可验证 reward| F[GRPO / DAPO]
+  A -->|有学习型 RM + 大算力| G[PPO]
+  D --> H[先闭合数据-训练-评测]
+  F --> I[投资 rollout 引擎]
+  G --> J[建设训推调度和多模型 checkpoint]</pre>
+<div class="success"><strong>实战路径：</strong>即便最终想上 PPO，也应该先用 DPO 跑通整条数据-训练-评测链路。DPO 花的成本更低，却能暴露数据 schema、评测指标、实验管理、checkpoint 流程中的大部分工程问题。</div>
+
+<h3>10b.6 Reward Model 本质上是推理子系统</h3>
+<p>Reward Model 经常被算法论文写成一个函数 <code>reward(x, y)</code>，但在平台里它是一个会排队、会超时、会吃显存、会产生版本漂移的在线推理服务。只要 PPO 训练内环依赖 RM 分数，RM 的吞吐和稳定性就会直接决定训练 step time；RM 的版本和 prompt template 也会直接决定 reward 曲线是否可比较。</p>
+<table>
+<tr><th>维度</th><th>线上推理服务</th><th>RM 打分服务</th></tr>
+<tr><td>请求模式</td><td>长时间稀疏到达</td><td>训练步内集中突发</td></tr>
+<tr><td>首 token 延迟</td><td>关键</td><td>不关心（不生成）</td></tr>
+<tr><td>吞吐</td><td>重要</td><td>决定训练 step 时长</td></tr>
+<tr><td>可用性</td><td>5 个 9</td><td>训练期可用即可</td></tr>
+<tr><td>失败处理</td><td>必须降级</td><td>可重试甚至丢弃样本</td></tr>
+</table>
+<table>
+<tr><th>部署方式</th><th>决策条件</th><th>优点</th><th>代价</th><th>更适合什么场景</th></tr>
+<tr><td>和训练节点共置</td><td>RM 较小、训练节点峰值后仍有 20%-30% 显存余量、rollout batch 不大</td><td>路径短，少一次网络跳转</td><td>抢显存，故障耦合</td><td>小规模实验、LoRA PPO、单节点验证</td></tr>
+<tr><td>独立 RM 服务</td><td>RM 较大、多个作业共享、训练节点显存紧</td><td>训练显存更稳，便于扩容</td><td>多一跳网络与服务治理</td><td>稳定 PPO 平台、多个实验并行</td></tr>
+<tr><td>共享推理池部署</td><td>RM 和 judge/ref 共用 vLLM/SGLang 池</td><td>GPU 利用率高，可按队列调度</td><td>多租户隔离复杂，队列延迟波动</td><td>中大型平台</td></tr>
+<tr><td>批量异步打分</td><td>rollout batch 很大，step 可容忍 buffer 延迟</td><td>吞吐高，成本更好控</td><td>step 延迟更难预测</td><td>大批量 rollout、离线 RLAIF</td></tr>
+</table>
+<p>一个简单规则是：如果 RM 权重 + peak KV Cache + update 激活之后，训练节点剩余显存低于 20%，就不要共置；如果 RM 的目标吞吐超过单训练节点本地推理能力，或者多个 PPO 作业会复用同一个 RM，也应独立部署。</p>
+<table>
+<tr><th>打分模式</th><th>工作方式</th><th>优点</th><th>风险</th><th>适合场景</th></tr>
+<tr><td>全量打分</td><td>rollout 一整批生成完后，一次性提交给 RM</td><td>实现简单，batch 大，GPU 吞吐高</td><td>step 尾延迟由最慢样本决定；队列突发明显</td><td>小中批量 PPO、同步训练 loop</td></tr>
+<tr><td>流式打分</td><td>每个 response 或小 micro-batch 生成完就提交 RM</td><td>隐藏 RM 延迟，减少训练等待</td><td>orchestration 更复杂；需要样本 id、幂等写入、乱序聚合</td><td>大 rollout、长 response、训推分离平台</td></tr>
+</table>
+
+<h3>10b.7 实验管理的额外复杂度</h3>
+<p>对齐训练的难点通常不止算力，更在于可解释性更差、变量更多。同样的训练脚本跑两次，结果都可能有几个百分点的差异。平台必须把“训练健康”和“行为健康”同时监控，否则等到人工评测才发现问题时，已经浪费了大量 rollout 和 GPU 时间。</p>
+<table>
+<tr><th>复杂度来源</th><th>为什么麻烦</th><th>平台应提供什么</th></tr>
+<tr><td>超参更多</td><td>KL 系数、rollout 长度、mini-batch、reward scaling、group size 都会影响稳定性</td><td>结构化实验配置与追踪</td></tr>
+<tr><td>训练更不稳</td><td>reward hacking、KL 发散、loss 震荡更常见</td><td>更密的指标采集和早停规则</td></tr>
+<tr><td>状态更多</td><td>policy、critic、optimizer、sampler 状态都要保存</td><td>更完整的 checkpoint 模板</td></tr>
+<tr><td>数据链更长</td><td>演示数据、偏好对、judge 结果、红队样本都要版本化</td><td>数据 lineage 与标注元数据管理</td></tr>
+<tr><td>评测更复杂</td><td>不能只看 loss，还要看偏好评测和人工 / LLM judge</td><td>离线评测流水线</td></tr>
+</table>
+<div class="grid-2">
+<div class="card"><strong>训练侧指标</strong><br>policy loss、value loss、KL divergence、reward 均值/方差/直方图、advantage 分布、gradient norm、learning rate。</div>
+<div class="card"><strong>Rollout 侧指标</strong><br>响应长度分布、tokens/sec、停止原因分布、重复率、n-gram 多样性。</div>
+<div class="card"><strong>评测侧指标</strong><br>win-rate vs reference、能力基准、安全评测通过率、格式遵循率。</div>
+<div class="card"><strong>系统侧指标</strong><br>GPU 利用率、各阶段耗时占比、checkpoint 保存时长、失败重试次数。</div>
+</div>
+<h4>Checkpoint 比预训练更复杂</h4>
+<p>PPO checkpoint 应该被当作“多模型事务”。恢复对象不再是一个模型，而是一组必须版本一致的状态机。如果 policy 回到 step 12000，但 critic 是 step 11800，rollout buffer 来自旧 policy，KL controller 又重置了，训练曲线可能立刻漂移，甚至 reward/KL 指标都无法解释。</p>
+<pre class="mermaid">flowchart LR
+  A[checkpoint manifest] --> B[policy weights + optimizer + scheduler]
+  A --> C[critic weights + optimizer + scheduler]
+  A --> D[reference artifact hash]
+  A --> E[reward model artifact hash]
+  A --> F[rollout policy id + sample ids]
+  A --> G[KL controller + reward normalization]
+  A --> H[rng states + data cursor]
+  A --> I[eval suite + judge version]
+  B --> J{restore validation}
+  C --> J
+  D --> J
+  E --> J
+  F --> J
+  G --> J
+  H --> J
+  I --> J
+  J -->|一致| K[resume training]
+  J -->|不一致| L[fail fast / discard stale rollout]</pre>
+<table>
+<tr><th>状态类别</th><th>必须保存什么</th><th>一致性风险</th><th>恢复校验</th></tr>
+<tr><td>Policy 状态</td><td>权重、optimizer、scheduler、global step</td><td>权重和 optimizer step 不匹配</td><td>校验 config hash、optimizer step、权重 shard 完整性</td></tr>
+<tr><td>Critic 状态</td><td>权重、optimizer、scheduler、value head 配置</td><td>critic 落后 policy 让 advantage 失真</td><td>要求 policy_step == critic_step，或显式记录可接受偏移</td></tr>
+<tr><td>Reference/RM 状态</td><td>model id、artifact hash、tokenizer/chat template</td><td>ref/RM 版本漂移让 KL 或 reward 不可比</td><td>从 registry 拉同 hash，不允许 latest</td></tr>
+<tr><td>Rollout 状态</td><td>prompt cursor、sample id、policy version、生成参数、可选 buffer</td><td>旧 policy rollout 混入新 policy update</td><td>rollout 必须绑定 policy checkpoint id</td></tr>
+<tr><td>控制器状态</td><td>KL coef、reward normalization、rng、data cursor</td><td>恢复后 KL 系数重置，训练行为突变</td><td>training_state.json 必须记录并打印</td></tr>
+<tr><td>评测状态</td><td>eval suite version、judge model id、上次通过门禁的 ckpt</td><td>无法判断恢复后模型是否退化</td><td>恢复后触发 quick-eval 对齐基线</td></tr>
+</table>
+<pre><code>checkpoint-step-12000/
+├── policy/
+│   ├── model.safetensors
+│   ├── optimizer.pt
+│   └── scheduler.pt
+├── critic/
+│   ├── model.safetensors
+│   ├── optimizer.pt
+│   └── scheduler.pt
+├── refs/
+│   ├── reference_model_id.txt
+│   └── reward_model_id.txt
+├── training_state.json
+├── rollout_buffer.pt
+└── metadata.json</code></pre>
+<div class="danger"><strong>恢复风险：</strong>不要只保存 policy 权重。忘记 KL controller、rng、rollout policy id 或 RM/ref artifact hash，会造成“恢复后还能跑，但结果不可解释”。</div>
+<h4>LLM-as-judge 自动评估 loop</h4>
+<pre class="mermaid">flowchart TD
+  A[checkpoint produced] --> B[quick sample: fixed prompt set + fresh prompt set]
+  B --> C[candidate/reference 双模型生成]
+  C --> D[LLM-as-judge 成对打分]
+  D --> E[聚合 win-rate / 长度 / 格式 / 安全 / 拒答]
+  E --> F{门禁判断}
+  F -->|通过| G[写入 tracker 和 checkpoint manifest]
+  F -->|失败| H[暂停 / 回滚 / 调 KL / 缩短 rollout]
+  H --> I[失败样本回流 error analysis]
+  I --> J[下一轮偏好数据构建]</pre>
+<p>LLM-as-judge 不是人工评测的替代品，而是训练内环的早期预警器。工程上要记录 judge model 版本、prompt 模板、采样温度、评测集 hash 和 rubric 版本，否则 win-rate 的历史曲线不可比。</p>
+
+<h3>10b.8 数据与评测管线：被低估的基础设施</h3>
+<p>对齐训练里最贵的失败往往不是训练失败，而是训练“成功”后发现偏好方向错了。GPU 可以重跑，脏数据和错误评测带来的结论污染却会进入下一轮数据构建、超参选择和发布判断。平台必须把数据版本、样本来源、judge 结果、红队反馈和模型 checkpoint 绑定起来，才能解释一次效果回退到底来自算法、数据还是评测。</p>
+<pre class="mermaid">flowchart TD
+  A[prompt pool] --> B[response sampling]
+  B --> C[annotation / AI judge]
+  C --> D[quality filtering]
+  D --> E[versioning & dedup]
+  E --> F[training use: DPO / PPO / GRPO]
+  F --> G[feedback / error analysis]
+  G --> A</pre>
+<table>
+<tr><th>类型</th><th>频率</th><th>目的</th><th>工具</th></tr>
+<tr><td>训练内环评测</td><td>每 N 步</td><td>看训练是否健康、早停</td><td>小 benchmark、LLM judge win-rate</td></tr>
+<tr><td>发布门禁评测</td><td>候选 ckpt 出来后</td><td>决定能否上线</td><td>完整 benchmark 套件、红队、人工 eval</td></tr>
+</table>
+<p>训练内环评测要快，哪怕粗；发布门禁要全，哪怕慢。两者用同一套节奏是常见错误：要么训练监控跟不上节奏，要么发布决策过于草率。</p>
+
+<h3>10b.9 工程建议</h3>
+<div class="grid-2">
+<div class="card"><strong>架构层面</strong><br>先把 post-training 总管线和 alignment 具体阶段分开建模；先用 SFT / DPO 跑通数据、评测和 artifact 流程；把 rollout、RM、reference 都抽象成独立服务；PPO 按峰值 1.3x 留冗余。</div>
+<div class="card"><strong>训练选型</strong><br>先验证 SFT 数据流程，再 DPO，再 PPO/GRPO；小团队或规则奖励优先 GRPO；软奖励 + 大算力再考虑 PPO；任何对齐训练都要配 SFT 数据做 KL 锚点。</div>
+<div class="card"><strong>监控与可观测</strong><br>rollout、RM 打分、策略更新应拆成可观测的三个阶段；KL、reward 均值、响应长度是三个最关键的健康指标；多 seed 是必需的。</div>
+<div class="card"><strong>数据与评测</strong><br>偏好数据集像代码一样版本化；训练内环评测要快，发布评测要全；把 RM 当作推理服务运营；为 reward hacking 准备早期预警。</div>
+</div>
+<table>
+<tr><th>反模式</th><th>典型表现</th><th>后果</th><th>正确做法</th></tr>
+<tr><td>把 PPO 当 SFT 跑</td><td>用同一套 SFT 平台直接起 PPO</td><td>OOM、rollout 卡死</td><td>单独设计对齐作业类型</td></tr>
+<tr><td>忽略 rollout 吞吐</td><td>训练卡强、推理引擎弱</td><td>训练卡空等</td><td>先上 vLLM 之类的推理引擎</td></tr>
+<tr><td>RM 和训练耦合</td><td>RM 写在训练脚本里</td><td>RM 挂训练死</td><td>独立服务 + 断路器</td></tr>
+<tr><td>不记数据版本</td><td>训完发现效果回退找不到原因</td><td>无法排查</td><td>数据版本强制绑定</td></tr>
+<tr><td>只看 loss</td><td>训练曲线好看但模型变差</td><td>reward hacking</td><td>加 win-rate、响应长度监控</td></tr>
+<tr><td>单次实验下结论</td><td>A 配置跑一次比 B 好 0.5 分</td><td>噪声当信号</td><td>至少 3 seed</td></tr>
+</table>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>SFT / DPO 训练</td><td>TRL、LLaMA-Factory、Axolotl</td><td>Hugging Face 生态入口较常见</td></tr>
+<tr><td>分布式 RLHF</td><td>OpenRLHF、Verl、RLHFuse、Ray</td><td>更适合多角色协调</td></tr>
+<tr><td>DeepSpeed 对齐训练</td><td>DeepSpeed-Chat</td><td>适合已有 DeepSpeed 栈的团队</td></tr>
+<tr><td>Reward Model 推理</td><td>vLLM、TGI、SGLang、自建批处理服务</td><td>重点是吞吐与批处理</td></tr>
+<tr><td>Rollout 引擎</td><td>vLLM、SGLang、TensorRT-LLM</td><td>RLHF 时间常花在这里，不可忽视</td></tr>
+<tr><td>GRPO 实现</td><td>TRL（GRPOTrainer）、OpenRLHF、Verl</td><td>DeepSeek-R1 路线</td></tr>
+<tr><td>评测追踪</td><td>Weights & Biases、MLflow、Aim</td><td>方便比较 reward、KL、win-rate</td></tr>
+<tr><td>LLM judge 框架</td><td>LLM-as-a-judge pipelines、AlpacaEval、MT-Bench</td><td>自动化偏好评测</td></tr>
+</table>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 本章小结</h2>
+<table>
+<tr><th>主题</th><th>关键点</th></tr>
+<tr><td>Post-training</td><td>是 pretraining 之后的一整条塑形管线，不是单个算法名</td></tr>
+<tr><td>Alignment training</td><td>是 post-training 的重要子集，重点解决行为是否符合偏好与约束</td></tr>
+<tr><td>PPO 资源形态</td><td>同时包含推理、打分、更新三条路径，4 个模型并存</td></tr>
+<tr><td>DPO</td><td>只需 policy + reference，最容易平台化</td></tr>
+<tr><td>GRPO</td><td>砍掉 critic，用大 batch rollout 换显存，适合规则奖励场景</td></tr>
+<tr><td>Reward Model</td><td>本质上是训练内环里的推理子系统，吞吐决定训练速度</td></tr>
+<tr><td>Rollout 瓶颈</td><td>是优化重点，不能被当成训练脚本里的附属函数</td></tr>
+<tr><td>实验管理</td><td>checkpoint、评测和数据 lineage 复杂度都明显高于 pretraining</td></tr>
+<tr><td>数据质量</td><td>最终效果高度依赖偏好数据质量，不只是算法</td></tr>
+<tr><td>评测节奏</td><td>训练内环快而粗、发布门禁慢而全，不能混</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 练习题</h2>
+<h3>基础题</h3>
+<ol>
+<li>post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？</li>
+<li>为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。</li>
+<li>用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？</li>
+<li>DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？</li>
+<li>Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。</li>
+<li>如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？</li>
+</ol>
+<h3>进阶题</h3>
+<ol start="7">
+<li>假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。</li>
+<li>某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。</li>
+<li>GRPO 相比 PPO 省下了 critic，但代价是每个 prompt 要采样 16-64 个 response。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？</li>
+<li>你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？</li>
+<li>KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？</li>
+<li>rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？</li>
+<li>对同一批 rollout，选择全量打分和流式打分分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？</li>
+</ol>
+<h3>开放题</h3>
+<ol start="14">
+<li>你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。</li>
+<li>设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？</li>
+<li>设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。</li>
+<li>某团队声称他们“用 DPO 完全替代了 PPO，效果一样还更省钱”。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复机制；再用本章理解 post-training 闭环；随后阅读 <a href="../part3/10c-finetuning-and-multi-adapter.html">第 10c 章</a> 的 fine-tuning 与多 Adapter 服务；最后结合 <a href="../part5/14-online-inference-architecture.html">第 14 章</a> 理解 RM、judge、rollout engine 的推理服务化。</div>
+<div class="card"><strong>延伸阅读</strong><br>建议对照阅读 RLHF/PPO、DPO、GRPO、OpenRLHF、Verl、TRL、vLLM/SGLang 的官方文档或论文，重点不是背算法公式，而是比较它们的模型数量、rollout 形态、显存账本、checkpoint 状态和评测门禁。</div>
+</div>
+<div class="note"><strong>关联章节：</strong>本章建立在 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复机制之上，也和 <a href="../part3/10c-finetuning-and-multi-adapter.html">第 10c 章</a> 的微调形态、<a href="../part5/14-online-inference-architecture.html">第 14 章</a> 的推理系统强相关。对齐训练经常同时消耗训练资源和推理资源。</div>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

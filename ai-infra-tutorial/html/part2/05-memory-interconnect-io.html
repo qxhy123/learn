@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 5 章 · 内存、互联与 IO — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=05" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 5 章 · 内存、互联与 IO</h1>
+<p class="sub">从“字节必须在不同距离、容量、价格和语义的介质之间移动”出发，理解 AI 系统为什么常常不是算得慢，而是数据没有稳定、低抖动地抵达正确位置。</p>
+<div class="chips"><span class="chip">HBM / DRAM</span><span class="chip">PCIe / NVLink</span><span class="chip">RDMA</span><span class="chip">并行文件系统</span><span class="chip">Job Placement</span><span class="chip">IO 瓶颈</span></div>
+<div class="note"><strong>不可化简的问题：</strong>计算只能发生在具体器件上，而数据、状态和结果分散在不同距离、容量、价格和一致性语义的介质里；系统必须决定每一份字节在哪里、下一步去哪里、是否真的必须搬。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：内存、互联与 IO</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">数据怎么走</a></li>
+<li><a class="anchor" href="#s4">数据驻留层级</a></li>
+<li><a class="anchor" href="#s5">PCIe、NVLink、RDMA</a></li>
+<li><a class="anchor" href="#s6">训练 step 时间拆解</a></li>
+<li><a class="anchor" href="#s7">减少搬运</a></li>
+<li><a class="anchor" href="#s8">RDMA、RoCE 与 TCP</a></li>
+<li><a class="anchor" href="#s9">集群网络拓扑与 Job Placement</a></li>
+<li><a class="anchor" href="#s10">并行文件系统热层</a></li>
+<li><a class="anchor" href="#s11">IO 瓶颈表现</a></li>
+<li><a class="anchor" href="#s12">常见误区</a></li>
+<li><a class="anchor" href="#s13">本章小结</a></li>
+<li><a class="anchor" href="#s14">练习题</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：内存、互联与 IO</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>把 HBM、DRAM、PCIe、NVLink、RDMA、NVMe、对象存储这些名字都拿掉，本章只剩下一个不可化简的问题：计算只能发生在某个具体器件上，而数据、状态和结果却分散在不同距离、容量、价格和一致性语义的介质里。AI 系统不是一台“会算的机器”，而是一条持续把数据推到计算单元、把中间状态留在合适位置、把结果可靠写回的搬运链路。单个矩阵乘法可以很快，但训练 step 要等待样本、权重、激活、梯度和 checkpoint；单个 token 的 decode 可以很快，但在线推理要等待权重加载、KV Cache 更新和远端检索。只要任何一段链路不能稳定供给，GPU 就会空转；只要任何一段链路被错误放大，扩卡就会把瓶颈复制成更大的瓶颈。</p>
+<p>这个问题来自物理约束。离计算越近的存储通常越快、越贵、容量越小：HBM 带宽可到 TB/s 级，但单卡容量有限；DRAM 更大，但要经 PCIe 才能进入 GPU；NVMe 可以放训练样本，但访问延迟和并发模式不是内存语义；对象存储容量弹性最好，却不能假装成低延迟 POSIX 文件系统。互联也一样：单机 GPU-GPU 可以走 NVLink / NVSwitch，跨节点就要经过 NIC、交换机和网络协议；PCIe 代际、NUMA 亲和、网卡 rail、交换机 oversubscription 都会把“理论算力”改写成“实际 step time”。所以本章不是背介质名字，而是判断每一份字节在哪里、下一步去哪里、途中经过哪些共享瓶颈、是否真的必须搬。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“字节必须移动”出发，第一步必然得到内存层级。系统不可能同时拥有无限容量、无限带宽、零延迟和低成本，所以需要 HBM 放权重、激活和 KV Cache，DRAM 放 dataloader、预处理和主机缓存，NVMe / 并行文件系统放热数据与 checkpoint，对象存储放冷数据和长期制品。层级存在之后，就会出现缓存与预热：热点样本靠本地 NVMe 或共享热层减少远端读取，模型权重常驻显存或热加载，checkpoint 在恢复时间和写入抖动之间取平衡。层级也带来语义差异：<code>fsync</code>、page cache、对象存储列表一致性和分片上传，不是存储细节，而是训练恢复、数据可见性和成本边界。</p>
+<p>第二步必然得到互联。HBM 内的数据只对本 GPU 便宜；一旦跨设备，就要选择 PCIe、NVLink、NVSwitch 或 RDMA。PCIe 连接 CPU、GPU、NIC、NVMe，但受 lane 数、代际、根复合体和 NUMA 影响；NVLink / NVSwitch 解决单机多 GPU 高频同步，支撑张量并行和大模型分片；RDMA / RoCE / InfiniBand 解决跨节点数据面，让 GPU 间通信尽量少经过 CPU 拷贝。互联存在之后，就会出现拓扑问题：8 卡节点内链路很快，不代表 64 节点 AllReduce 很快；单张 400G NIC 很快，不代表多 rail 会均匀使用；交换机端口够用，不代表 job placement 不会把流量压到同一条 spine 或同一个 Dragonfly global link。</p>
+<p>第三步必然得到调度与边界。平台不能只调“几张 GPU”，还要调 GPU 离哪些 NIC 近、属于哪个 leaf、rail、pod、Dragonfly group、共享哪个文件系统热层。数据并行希望跨节点带宽稳定，张量并行更怕 GPU-GPU 延迟，pipeline parallelism 对相邻 stage 的放置敏感，checkpoint 会同时冲击文件系统和网络。工程优化通常落到三类动作：减少搬运次数，例如缓存、分片、压缩、设备侧保留；提高有效带宽，例如 pinned memory、NUMA 绑定、多 rail 均衡、RDMA；重叠搬运与计算，例如 async H2D、prefetch、分阶段 checkpoint。读本章时要不断把机制翻译成这三个动作。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((内存 互联 IO))
+    不可化简的问题
+      计算只在具体器件上发生
+      数据分散在不同距离
+      状态必须可靠保留和移动
+    内存与存储层级
+      HBM
+        权重
+        激活
+        KV Cache
+      DRAM
+        DataLoader
+        预处理
+        主机缓存
+      NVMe 与并行文件系统
+        热数据
+        checkpoint
+        共享模型缓存
+      对象存储
+        冷数据
+        长期归档
+    互联机制
+      PCIe
+        H2D D2H
+        GPU NIC NVMe
+        NUMA 亲和
+      NVLink 与 NVSwitch
+        单机多 GPU
+        Tensor Parallel
+        激活交换
+      RDMA RoCE InfiniBand
+        跨节点同步
+        AllReduce
+        分布式 checkpoint
+    集群拓扑
+      Fat-tree
+        等价路径
+        成本高
+      Rail-optimized
+        GPU NIC 对齐
+        需要 rank placement
+      DragonFly+
+        group locality
+        全局链路稀缺
+    AI 场景影响
+      step time
+      GPU 利用率
+      扩展效率
+      恢复时间
+      推理尾延迟</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>给定一个训练 step，你能否把 <code>load -&gt; H2D -&gt; compute -&gt; sync -&gt; checkpoint</code> 拆成数据驻留位置和搬运路径？</li>
+<li>为什么 HBM、DRAM、NVMe、并行文件系统、对象存储不能只按“容量大小”排序，而必须同时看延迟、带宽和语义？</li>
+<li>什么时候 PCIe 是瓶颈，什么时候 NVLink / NVSwitch 是瓶颈，什么时候跨节点 RDMA fabric 才是瓶颈？</li>
+<li>为什么 8 卡单机跑得好，不代表 64 卡、256 卡训练一定线性扩展？</li>
+<li>Fat-tree、Rail-optimized、DragonFly+ 三类拓扑分别把成本、带宽均匀性和调度复杂度放在了什么位置？</li>
+<li>对一个新作业，你会如何判断它应该优先做数据缓存、H2D 重叠、多 rail placement，还是 checkpoint 写入削峰？</li>
+<li>当 GPU 利用率锯齿化、NCCL timeout 或 checkpoint 抖动出现时，你能否提出一条从训练指标回溯到存储、PCIe、NIC、交换机的排查链？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<div class="grid-3">
+<div class="card"><strong>层级判断</strong><br>理解 HBM、DRAM、NVMe、并行文件系统和对象存储在 AI 系统里的分工。</div>
+<div class="card"><strong>互联判断</strong><br>理解 PCIe、NVLink、RDMA 为什么决定单机与多机扩展上限。</div>
+<div class="card"><strong>排障判断</strong><br>用“数据搬运链路”解释 GPU 利用率低、step time 波动和推理尾延迟。</div>
+</div>
+<div class="note"><strong>关联章节：</strong>本章与 <a href="../part2/04-gpu-and-accelerators.html">第 4 章</a> 的硬件选型、<a href="../part3/08-data-parallel.html">第 8 章</a> 的通信扩展效率密切相关。很多“GPU 不够快”的问题，最后都能追到搬运链路。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. AI 系统的真实问题通常是“数据怎么走”</h2>
+<p>以训练为例，数据通常会经历：</p>
+<pre><code>对象存储 / 文件系统
+  -&gt; 本地磁盘缓存
+  -&gt; CPU 内存
+  -&gt; GPU 显存
+  -&gt; 计算</code></pre>
+<p>以 LLM 推理为例，状态通常会经历：</p>
+<pre><code>模型权重
+  -&gt; 主机内存
+  -&gt; GPU 显存
+  -&gt; KV Cache 更新
+  -&gt; 输出 token</code></pre>
+<p>这意味着 AI 系统的性能，往往不是“一个阶段算得多快”，而是“整条搬运链路有没有形成稳定供给”。</p>
+<pre class="mermaid">flowchart LR
+  A[对象存储或共享文件系统] --> B[本地 NVMe 热缓存]
+  B --> C[CPU DRAM / DataLoader]
+  C -->|H2D| D[GPU HBM]
+  D --> E[Compute Kernel]
+  E --> F[梯度 / 激活 / KV Cache]
+  F -->|同步或写回| G[NVLink / RDMA / Checkpoint]
+  G --> H[恢复、扩展效率、尾延迟]</pre>
+<div class="success"><strong>工程直觉：</strong>先画出字节移动路径，再看算子优化；否则很容易把 GPU 空转误判成计算性能不足。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 一张最重要的层次图</h2>
+<p>可以把 AI 系统的数据驻留层级粗略理解成：</p>
+<table>
+<tr><th>层级</th><th>典型介质</th><th>容量</th><th>延迟</th><th>带宽</th><th>典型用途</th></tr>
+<tr><td>远端持久层</td><td>对象存储、冷数据仓</td><td>大</td><td>高</td><td>中</td><td>原始数据、长期归档、跨集群共享</td></tr>
+<tr><td>共享热存储</td><td>并行文件系统、训练集群共享文件层</td><td>中大</td><td>中</td><td>中高</td><td>训练热数据、checkpoint 热层、集群共享模型缓存</td></tr>
+<tr><td>本地磁盘</td><td>NVMe / SSD</td><td>中</td><td>中低</td><td>高</td><td>训练缓存、热点模型、shuffle 临时数据</td></tr>
+<tr><td>主存</td><td>DRAM</td><td>中</td><td>低</td><td>很高</td><td>dataloader、预处理、中间缓存</td></tr>
+<tr><td>显存</td><td>HBM / GDDR</td><td>小</td><td>更低</td><td>极高</td><td>权重、激活、KV Cache</td></tr>
+</table>
+<p>理解这张表有两个工程意义：容量越大的层，往往越慢；越靠近计算设备，容量越贵也越稀缺。所以平台设计经常是在“容量大但慢”和“容量小但快”之间做分层。</p>
+<div class="warn"><strong>边界提醒：</strong>不要把对象存储、文件系统、NVMe、DRAM 和 HBM 只看成容量不同的盘。它们的延迟、并发模式、一致性语义和失败语义不同，错误抽象会直接变成训练恢复和性能问题。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. PCIe、NVLink、RDMA 到底在解决什么</h2>
+<p>PCIe 是 CPU、GPU、NIC、NVMe 之间最常见的通道，决定 H2D / D2H 拷贝速度，也会影响多 GPU 通过主机转发时的带宽。NVLink / NVSwitch 主要用于 GPU 与 GPU 间高速通信，对多卡训练、张量并行和大模型分片推理非常重要。RDMA / 高速网卡面向多机训练或远端高速访问，目标是降低 CPU 参与和数据复制开销。</p>
+<table>
+<tr><th>互联</th><th>典型带宽</th><th>常见范围</th><th>更影响哪些场景</th></tr>
+<tr><td>PCIe 3.0 x16</td><td>16 GB/s</td><td>CPU &lt;-&gt; GPU</td><td>旧机器 H2D / D2H、数据回传</td></tr>
+<tr><td>PCIe 4.0 x16</td><td>32 GB/s</td><td>CPU &lt;-&gt; GPU</td><td>大量训练节点的基础链路</td></tr>
+<tr><td>PCIe 5.0 x16</td><td>64 GB/s</td><td>CPU &lt;-&gt; GPU</td><td>新一代主机侧高带宽拷贝</td></tr>
+<tr><td>NVLink 3</td><td>600 GB/s</td><td>GPU &lt;-&gt; GPU</td><td>A100 代 8 卡训练、张量并行</td></tr>
+<tr><td>NVLink 4</td><td>900 GB/s</td><td>GPU &lt;-&gt; GPU</td><td>H100 / H200 代高频同步</td></tr>
+<tr><td>InfiniBand NDR</td><td>400 Gb/s（约 50 GB/s）</td><td>机器 &lt;-&gt; 机器</td><td>多机数据并行、分布式 checkpoint</td></tr>
+</table>
+<p class="mini">注：PCIe 数字常用 <code>x16</code> 单向口径，NVLink 常用单 GPU 聚合双向口径，InfiniBand 常用端口线速口径。口径不同，但足以建立数量级直觉。</p>
+<table>
+<tr><th>场景</th><th>典型值</th><th>说明</th></tr>
+<tr><td>1 GB H2D 拷贝走 PCIe 4.0 x16</td><td>理论下限约 31 ms</td><td>实际还会受 pinned memory、NUMA 和调度影响</td></tr>
+<tr><td>1 GB GPU-GPU 传输走 NVLink 4</td><td>理论下限约 1-2 ms</td><td>更适合频繁激活 / 梯度交换</td></tr>
+<tr><td>10 GB 数据跨机走 NDR 400G</td><td>理论下限约 0.2 s</td><td>真正训练中还会叠加协议和同步开销</td></tr>
+<tr><td>跨节点以太网未做 RDMA 优化</td><td>常见比 IB 慢一截</td><td>会直接体现在 <a href="../part3/08-data-parallel.html">第 8 章</a> 的扩展效率上</td></tr>
+</table>
+<div class="note"><strong>数量级只用于定位：</strong>看到带宽数字时先问口径和路径：是单向、双向、聚合、线速、还是应用有效吞吐。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 一个简单的时间拆解</h2>
+<p>如果一个训练 step 的时间可以写成：</p>
+<pre><code>t_step = t_load + t_h2d + t_compute + t_sync</code></pre>
+<p>那么优化往往有三种路径：减少数据量，提高带宽，重叠执行。它们覆盖了大量性能优化的本质。</p>
+<table>
+<tr><th>优化方向</th><th>典型动作</th><th>对应瓶颈</th></tr>
+<tr><td>减少数据量</td><td>压缩、缓存、量化、更好的文件格式、减少重复状态</td><td>远端读取、H2D、同步、checkpoint</td></tr>
+<tr><td>提高带宽</td><td>更快互联、更高吞吐存储、pinned memory、多 rail、RDMA</td><td>PCIe、NIC、文件系统、跨节点 fabric</td></tr>
+<tr><td>重叠执行</td><td>async H2D、prefetch、流水式 checkpoint、后台归档</td><td>串行等待、step time 抖动、冷启动</td></tr>
+</table>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 为什么“减少搬运”经常比“优化计算”更划算</h2>
+<p>很多任务的痛点不是计算量太大，而是数据格式碎片化、小文件过多、频繁跨总线搬运、热点状态频繁回写、远端依赖调用过多。一个非常重要的工程直觉是：任何不必要的数据复制、跨设备同步和远端访问，都会在规模化时被放大。</p>
+<div class="danger"><strong>严重风险：</strong>如果小文件、同步拷贝、远端读取和频繁 checkpoint 已经在 8 卡作业中制造抖动，扩到 64 卡通常不会“摊薄”问题，而是让最慢 rank 决定所有 rank 的等待时间。</div>
+<p>优秀系统设计会优先考虑：数据是否能预热到更近的层；状态是否能留在设备端；是否能批量搬运，减少小块传输；是否能减少往返次数。</p>
+</section>
+
+<section class="section" id="s8">
+<h2>8. RDMA、RoCE 与 TCP 怎么选</h2>
+<p>对平台工程来说，三者不是“谁先进就用谁”，而是网络目标、预算和运维能力的平衡。</p>
+<table>
+<tr><th>方案</th><th>带宽 / 延迟</th><th>成本</th><th>部署复杂度</th><th>适用场景</th></tr>
+<tr><td>InfiniBand RDMA</td><td>最高 / 最低</td><td>高</td><td>中高</td><td>大规模多机训练、强同步集群</td></tr>
+<tr><td>RoCE v2</td><td>高 / 低</td><td>中</td><td>高</td><td>需要以太网承载 RDMA，但团队能调 PFC / ECN</td></tr>
+<tr><td>TCP over Ethernet</td><td>中 / 较高</td><td>低</td><td>低</td><td>小规模训练、控制面、对性能不极端敏感的业务</td></tr>
+</table>
+<div class="success"><strong>快速判断：</strong>极致训练效率优先看 InfiniBand RDMA；已有强以太网基础设施可评估 RoCE，但必须接受调参成本；规模不大、以稳为先时，TCP 仍然是便宜的默认值。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 集群网络拓扑与 Job Placement</h2>
+<p>到了 32、64、256 卡规模后，扩展上限不只由单块网卡决定，还由网络组织方式和 rank placement 决定。单机内 GPU 之间优先走 NVLink / NVSwitch；跨节点时，数据通常从 GPU 经 PCIe 到 NIC，再进入 InfiniBand 或 RoCE fabric。NCCL 会把 AllReduce 拆成单机内 reduce、跨节点 exchange、单机内 broadcast；跨节点阶段一旦走到慢 rail、跨 pod 或拥塞链路，整轮同步都会被最慢 rank 拖住。</p>
+<pre class="mermaid">flowchart LR
+  subgraph N0[Node 0]
+    G00[GPU0] --- S0[NVSwitch]
+    G01[GPU1] --- S0
+    G00 -->|PCIe locality| NIC00[NIC0]
+    G01 -->|PCIe locality| NIC01[NIC1]
+  end
+  subgraph N1[Node 1]
+    G10[GPU0] --- S1[NVSwitch]
+    G11[GPU1] --- S1
+    G10 --> NIC10[NIC0]
+    G11 --> NIC11[NIC1]
+  end
+  NIC00 --> R0[Rail 0 / Leaf 0]
+  NIC10 --> R0
+  NIC01 --> R1[Rail 1 / Leaf 1]
+  NIC11 --> R1
+  R0 --> SP[Spine or Global Links]
+  R1 --> SP</pre>
+<table>
+<tr><th>拓扑</th><th>典型组织方式</th><th>收益</th><th>代价</th><th>适合的 Job Placement</th><th>主要失败模式</th></tr>
+<tr><td>Fat-tree / Clos</td><td>Node 接 Leaf，Leaf 上联多层 Spine</td><td>bisection bandwidth 更均衡，多租户调度简单</td><td>端口、光模块、布线和 spine 层成本高</td><td>尽量把作业放进同一 pod；跨 pod 时让 rank 均匀分布</td><td>oversubscription、ECMP 哈希不均、spine 热点</td></tr>
+<tr><td>Rail-optimized</td><td>每个 GPU 或 GPU 组绑定一张 NIC；同编号 NIC 进入同一 rail</td><td>GPU-NIC 对应清晰，多 rail 可并行承载 NCCL 流量</td><td>调度器和 NCCL 拓扑文件必须理解 rail</td><td><code>rank i</code> 靠近 <code>GPU i/NIC i/rail i</code></td><td>NUMA 错配、rail 拥塞、ring/tree 未均匀使用 rail</td></tr>
+<tr><td>DragonFly+</td><td>group 内部高带宽互联，group 间用 global links 连接</td><td>用较少全局链路支撑数千到上万卡规模</td><td>调度、故障隔离、拥塞控制复杂</td><td>先在同 group 内满足作业；跨 group 时按边界切分</td><td>global link 热点、跨 group 流量比例过高、作业碎片化</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[收到训练作业: GPU 数 / 并行策略 / 预计通信量] --> B{单节点能否容纳高频通信组?}
+  B -->|能| C[TP / PP 相邻 rank 放入同一 NVSwitch 域]
+  B -->|不能| D[按 pod 或 group 切分通信组]
+  C --> E{是否跨节点?}
+  D --> E
+  E -->|否| F[检查 NUMA / PCIe / 本地 NVMe 亲和]
+  E -->|是| G{拓扑类型}
+  G --> H[Fat-tree: 优先同 pod, 避免 oversubscription]
+  G --> I[Rail: GPU-NIC-rail 编号对齐]
+  G --> J[DragonFly+: 优先同 group, 限制 global link 流量]
+  H --> K[生成 rank map 与 NCCL topo hint]
+  I --> K
+  J --> K
+  K --> L[运行 pre-flight: all_reduce_perf / ib_write_bw / step smoke test]</pre>
+<p>粗略判断：如果 <code>t_sync / t_step</code> 超过 20%-30%，或扩卡后吞吐低于理想线性的 70%，调度器就不能只看 GPU 空闲数；它需要把 leaf、rail、pod、DragonFly group、NIC 速率、PCIe locality 纳入资源模型。</p>
+<div class="warn"><strong>工程边界：</strong>拓扑感知调度不能替代网络容量规划。如果 Fat-tree 本身是 3:1 oversubscription，大作业同时跨 pod 运行时不可能靠 rank map 变成无阻塞网络。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 并行文件系统：训练热层，不是对象存储替代品</h2>
+<p>对象存储适合冷数据和长期保留，但训练现场经常需要一个更靠近计算层的“热层”。VFS、inode、dentry、page cache、journal、extent、<code>fsync</code> 会直接影响 checkpoint 写入和 dataset 读取；细节见 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c 文件系统与存储内核</a>。本章只关心一个判断：训练主路径需要低抖动吞吐和可恢复语义，对象存储需要容量弹性和跨区域持久化，二者不能简单互相替代。</p>
+<p>热层通常承接 dataloader 的并发随机读取、大批 checkpoint 的并发写入、多节点共享同一份热点数据。Lustre、GPFS / Spectrum Scale、BeeGFS、WekaFS 的设计差异很大，但在 AI 平台视角下，先比较吞吐、元数据能力、小文件表现、快照 / 一致性和运维成本即可。</p>
+<table>
+<tr><th>系统</th><th>核心语义</th><th>优势</th><th>风险</th><th>更适合什么场景</th></tr>
+<tr><td>Lustre</td><td>POSIX 并行文件系统，MDS + OSS/OST，常用 stripe</td><td>大文件顺序吞吐强，HPC 生态成熟</td><td>小文件和元数据热点需要治理，stripe 参数要按 workload 调</td><td>大规模训练集读取、顺序 checkpoint 写入</td></tr>
+<tr><td>GPFS / Spectrum Scale</td><td>POSIX 并行文件系统，企业级集群管理</td><td>一致性和配额能力较强，企业运维工具完整</td><td>成本和管理复杂度较高</td><td>企业训练平台、共享数据湖热层</td></tr>
+<tr><td>BeeGFS</td><td>POSIX 并行文件系统，部署相对灵活</td><td>性价比和扩展性较好</td><td>超大规模治理依赖团队经验</td><td>中大型训练集群、研发集群共享热层</td></tr>
+<tr><td>WekaFS</td><td>高性能分布式文件系统，偏低延迟和混合 IO</td><td>随机 IO 与 checkpoint 热层体验好</td><td>商业成本、容量层联动需评估</td><td>混合训练、频繁 checkpoint、模型热加载</td></tr>
+<tr><td>对象存储</td><td>HTTP object API，非 POSIX 路径语义</td><td>容量弹性、归档、跨区域复制、成本优势</td><td>小文件随机读、rename、强一致目录语义和低延迟不匹配</td><td>冷数据、历史 checkpoint、模型发布包</td></tr>
+</table>
+<table>
+<tr><th>层级</th><th>放什么</th><th>为什么</th></tr>
+<tr><td>并行文件系统 / 本地 NVMe</td><td>当前训练集、最近 checkpoint、热点样本</td><td>吞吐高、恢复快</td></tr>
+<tr><td>对象存储</td><td>原始数据、历史 checkpoint、模型发布包</td><td>成本低、容量大、便于归档</td></tr>
+</table>
+<div class="note"><strong>常见模式：</strong>对象存储为真源，文件系统为热副本；数据准备任务把 shard 同步到并行文件系统或本地 NVMe，训练只读热层，checkpoint 先写热层并校验，再异步归档到对象存储。</div>
+<div class="danger"><strong>工程边界：</strong>并行文件系统不是无限快的共享磁盘。单目录百万级小文件、所有 worker 同时 <code>stat</code> 同一目录、所有作业在整点写 checkpoint、把对象存储 FUSE mount 当成本地盘用，都会把热层拖成新的瓶颈。这一点会直接影响 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 频率设计。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. IO 瓶颈的典型表现</h2>
+<div class="grid-3">
+<div class="card"><strong>训练场景</strong><br>GPU 利用率锯齿化，dataloader worker 很忙，step time 波动大，checkpoint 写入时出现明显抖动。</div>
+<div class="card"><strong>推理场景</strong><br>模型冷启动慢，请求延迟受模型加载和缓存未命中影响，RAG 检索后还要远程拉取元数据造成尾延迟。</div>
+<div class="card"><strong>多机场景</strong><br>扩卡后吞吐提升远不如预期，跨节点同步比例升高，某一台机器成为木桶短板。</div>
+</div>
+<pre class="mermaid">flowchart TD
+  A[症状: GPU 利用率锯齿 / step time 抖动 / NCCL timeout] --> B{发生在哪一段?}
+  B --> C[load: 数据集读取 / 小文件 / 解码 / page cache]
+  B --> D[H2D: pinned memory / NUMA / PCIe root]
+  B --> E[sync: NVLink / NIC / rail / switch]
+  B --> F[checkpoint: fsync / stripe / 对象归档]
+  C --> G[看 dataloader queue、iostat、文件系统元数据指标]
+  D --> H[看 nvidia-smi topo、PCIe 带宽、CPU 亲和]
+  E --> I[看 NCCL trace、端口丢包、ECN/PFC、rail 利用率]
+  F --> J[看写入延迟、fsync、归档队列、容量水位]
+  G --> K[把瓶颈映射回数据驻留与搬运路径]
+  H --> K
+  I --> K
+  J --> K</pre>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 常见误区</h2>
+<h3>误区一：显存不够就一定是模型太大</h3>
+<p>不一定。也可能是 batch 太大、激活保留太多、KV Cache 回收策略差、数据在设备侧重复保留。</p>
+<h3>误区二：IO 问题只是数据读取慢</h3>
+<p>不对。主机到设备拷贝、checkpoint 回写、远端依赖访问也都属于 IO 链路。</p>
+<h3>误区三：只要上更快硬件，搬运问题就会消失</h3>
+<p>不对。如果链路层级和访问模式不合理，再快硬件也会被错误使用方式浪费。</p>
+<div class="warn"><strong>排障偏差：</strong>只盯 GPU utilization 或单次 benchmark 数字，很容易忽略共享瓶颈。AI Infra 排障必须把训练指标、存储指标、PCIe / NUMA、NIC 和交换机指标放到同一条时间线。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 本章小结</h2>
+<table>
+<tr><th>主题</th><th>关键点</th></tr>
+<tr><td>内存层级</td><td>越靠近计算层越快，但容量越稀缺</td></tr>
+<tr><td>互联</td><td>PCIe、NVLink、RDMA 分别负责不同范围的数据搬运</td></tr>
+<tr><td>集群拓扑</td><td>放置策略和网络分层会决定多机训练的扩展上限</td></tr>
+<tr><td>存储热层</td><td>并行文件系统 / NVMe 更适合作为训练与 checkpoint 的热层</td></tr>
+<tr><td>性能优化本质</td><td>很多优化不是减少计算，而是减少搬运或重叠搬运</td></tr>
+<tr><td>瓶颈识别</td><td>训练抖动、扩卡失效、冷启动慢都可能是 IO / 互联问题</td></tr>
+</table>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 练习题</h2>
+<ol>
+<li>为什么很多 AI 系统优化要从“数据怎么走”开始，而不是从“算子怎么写”开始？</li>
+<li>PCIe、NVLink、RDMA 分别更影响哪些场景？</li>
+<li>如果你的集群要从单机 8 卡扩到 4 个节点，你会优先比较哪些互联数字？</li>
+<li>什么时候你会接受 TCP，而不是继续为 RoCE / RDMA 增加运维复杂度？</li>
+<li>为什么“并行文件系统做热层、对象存储做冷层”通常比只靠对象存储更适合训练集群？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用本章 §3-§6 画出单个训练 step 的数据驻留和搬运路径。</li>
+<li>再结合 §9 判断通信图如何映射到物理拓扑，尤其是 NVSwitch 域、NIC、rail、leaf、pod 和 group。</li>
+<li>最后用 §10-§12 建立存储热层、checkpoint 和排障时间线，回到 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 设计恢复策略。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li><a href="../part2/04-gpu-and-accelerators.html">第 4 章 · GPU 与加速器</a>：理解 GPU 内部带宽、显存和加速器选型。</li>
+<li><a href="../part3/08-data-parallel.html">第 8 章 · 数据并行</a>：理解 AllReduce、同步开销与扩展效率。</li>
+<li><a href="../part0/0c-filesystems-and-storage-internals.html">§0c · 文件系统与存储内核</a>：理解 VFS、page cache、journal、extent 与 <code>fsync</code> 对训练 IO 的影响。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

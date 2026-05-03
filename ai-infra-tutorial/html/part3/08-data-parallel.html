@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 8 章 · 数据并行 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=08" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 8 章 · 数据并行</h1>
+<p class="sub">从“复制计算者提高样本吞吐，但每一步又必须恢复同一组参数”出发，理解数据切分、模型复制、AllReduce、通信重叠、扩展效率、global batch、FSDP/ZeRO 边界和跨节点排障之间的因果关系。</p>
+<div class="chips"><span class="chip">Data Parallel</span><span class="chip">DDP</span><span class="chip">AllReduce</span><span class="chip">NCCL</span><span class="chip">Scaling Efficiency</span><span class="chip">FSDP / ZeRO</span></div>
+<div class="note"><strong>不可化简的问题：</strong>单个加速器的样本吞吐有限，复制模型副本可以并行处理更多样本；但只要训练语义要求全局一致的梯度更新，所有副本就必须在每个 step 重新达成一致。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：数据并行</a></li>
+<li><a class="anchor" href="#s2">学习目标与导读</a></li>
+<li><a class="anchor" href="#s3">数据并行的核心思想</a></li>
+<li><a class="anchor" href="#s4">一个 step 的时间分解</a></li>
+<li><a class="anchor" href="#s5">AllReduce 为什么会成为瓶颈</a></li>
+<li><a class="anchor" href="#s6">扩展效率怎么理解</a></li>
+<li><a class="anchor" href="#s7">为什么大 batch 不是免费午餐</a></li>
+<li><a class="anchor" href="#s8">梯度压缩与通信优化</a></li>
+<li><a class="anchor" href="#s9">NCCL 调优要点</a></li>
+<li><a class="anchor" href="#s10">工程实践中的关键点</a></li>
+<li><a class="anchor" href="#s11">数据并行的边界：FSDP / ZeRO</a></li>
+<li><a class="anchor" href="#s12">什么时候不该优先做数据并行</a></li>
+<li><a class="anchor" href="#s13">本章小结与练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：数据并行</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 DDP、NCCL、ZeRO、bucket 这些工具名之后，本章面对的不可化简问题只有一个：训练一个模型需要反复用大量样本估计同一组参数的更新方向，而单个加速器在单位时间内能处理的样本数有限；如果复制计算者来提高样本吞吐，就必须付出让所有复制者重新达成一致的代价。数据并行不是“把脚本复制到多张卡上”这么简单，它是在两个物理事实之间做交换：一边是 GPU 对不同样本的前向和反向天然可并行，另一边是参数更新必须基于同一个全局梯度，否则每张卡很快就会训练成不同模型。只要训练算法仍然假设同步 SGD / Adam 这类全局一致的更新语义，同步梯度就不是可选优化，而是保持数学含义的必要步骤。</p>
+<p>这也是很多团队第一次真正面对“通信现实”的地方。单机阶段的主要矛盾通常是算子是否高效、显存是否够、DataLoader 是否稳定；一旦进入数据并行，step 时间里多了一段不做模型计算却必须完成的工作：把每张卡上的梯度聚合，再把聚合结果发回所有卡。卡数越多，样本吞吐潜力越高，但同步路径也越长；模型越大，梯度字节数越大；跨节点越多，网络带宽、延迟、拥塞、拓扑和慢节点都会进入训练主循环。更麻烦的是，扩卡还会改变 batch 语义：固定 per-device batch 会放大 global batch，固定 global batch 又会压小每卡计算量，使通信占比上升。因此，本章真正要建立的不是“会启动多卡训练”，而是能回答：复制多少计算者以后，额外同步代价是否仍然低于新增算力收益？</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“复制计算者提升吞吐，但必须保持参数一致”出发，第一个必然机制是数据切分和模型复制：每个 rank 拿不同 batch 分片，保留同一份模型，独立完成 forward / backward。第二个机制是梯度聚合：本地梯度只是局部样本的估计，必须通过 AllReduce 变成全局平均梯度；ring、tree、double binary tree 等算法本质上都是在不同消息大小、设备数和拓扑下，平衡带宽利用率与启动延迟。第三个机制是通信与计算重叠：如果等所有层反向结束后再同步全部梯度，GPU 会在 step 尾部纯等网络；于是 DDP 会把梯度组织成 bucket，让较早产生的梯度先开始 AllReduce，目标是把通信藏进 backward 时间里，只留下尽量短的 tail。</p>
+<p>接着会推导出扩展效率这个指标。单看 8 卡吞吐没有意义，必须和 1 卡基线相比，判断新增卡数带来的吞吐是否接近线性；还要区分 strong scaling 和 weak scaling，因为前者固定任务总量，后者固定每卡工作量，回答的是两个不同问题。再往下会出现 batch 定义和梯度累积：为了让每卡算得足够久、摊薄同步成本，你可能想增大 per-device batch；但优化算法看到的是 global batch，过大可能影响收敛，于是梯度累积、LR scaling、warmup 都进入系统设计边界。通信成为瓶颈后，又会推导出 bucket 调参、混合精度通信、梯度压缩：先减少碎消息和尾部等待，再考虑用 BF16/FP16、quantization、sparsification 或 PowerSGD 减少传输字节，但这些近似会把系统问题重新带回收敛风险。最后，当“每张卡保留完整模型、梯度、优化器状态”这个前提不再成立，就会推导出 FSDP / ZeRO：它们仍属于数据并行家族，但把原来冗余保存的训练状态切分，从“同步梯度”扩展到“按需聚合参数和状态”。所以本章的逻辑链不是工具罗列，而是：吞吐不足导致复制，复制导致一致性，同步导致通信，通信导致 overlap / 压缩 / 拓扑调优，内存冗余导致 sharding。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((数据并行))
+    不可化简问题
+      单卡样本吞吐有限
+      参数更新需要全局一致
+      复制计算者会引入同步代价
+    基本机制
+      模型复制
+      数据切分
+      本地 forward/backward
+      梯度 AllReduce
+    通信现实
+      梯度字节数
+      Ring/Tree 算法
+      NVLink/IB/Ethernet 拓扑
+      慢 rank 木桶效应
+    工程优化
+      Bucket
+      通信计算重叠
+      BF16/FP16 通信
+      Quantization
+      Sparsification
+      PowerSGD
+    实验判断
+      Strong scaling
+      Weak scaling
+      tokens/sec
+      MFU
+      per-rank skew
+    边界
+      Global batch 改变收敛
+      单卡内存不减少
+      DDP 放不下转 FSDP/ZeRO
+      网络太差不适合跨节点 DP</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>如果每张卡已经能独立算梯度，为什么同步 AllReduce 仍然是同步数据并行的必要步骤，而不是一个可选优化？</li>
+<li>给定模型参数量、梯度精度、卡数和有效带宽，你能否心算一次 ring AllReduce 的通信时间量级？</li>
+<li>为什么 strong scaling 和 weak scaling 得到的扩展效率不能直接放在一张图里比较？</li>
+<li>当 profiler 显示 step 尾部有明显 NCCL tail 时，你会优先检查 bucket、拓扑、慢 rank 还是 batch，并说明理由？</li>
+<li>为什么增大 global batch 可能提升系统吞吐，却同时破坏优化稳定性？</li>
+<li>梯度压缩什么时候能解决真实瓶颈，什么时候只是把网络问题换成收敛和排障问题？</li>
+<li>经典 DDP 为什么不能缓解单卡训练状态内存，FSDP / ZeRO 又是从哪个冗余假设推导出来的？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与导读</h2>
+<p>完成本章学习后，你应该能理解数据并行的基本工作方式，认识 AllReduce 与梯度同步开销，分析扩展效率下降的原因，用定量方式判断“加卡是否值得”，并区分单机数据并行和多机数据并行在拓扑、延迟和排障复杂度上的差异。</p>
+<div class="grid-2">
+<div class="card"><strong>你会学到的系统问题</strong><br>global batch、per-device batch、梯度累积、bucket、NCCL tail、per-rank skew、MFU 和通信占比如何一起决定扩展收益。</div>
+<div class="card"><strong>你会建立的边界判断</strong><br>什么时候 DDP 足够，什么时候要 FSDP / ZeRO，什么时候应先修单卡基线、数据链路、checkpoint 或网络，而不是继续加卡。</div>
+</div>
+<div class="note"><strong>关联章节：</strong>本章以 <a href="../part3/07-single-node-training.html">第 7 章</a> 的单机基线为前提，也会直接影响 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 频率和恢复策略；<a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 讨论的模型并行常与数据并行组合成 2D / 3D 并行。</div>
+<pre><code>单机基线是否稳定
+  ├── 同步成本占比多少
+  ├── 通信和计算能否重叠
+  ├── 扩卡后 batch 定义是否变了
+  ├── 单卡是否还能放下模型
+  └── 扩展效率下降到底是算法问题、数据问题还是网络问题</code></pre>
+<div class="warn"><strong>导读提醒：</strong>“多卡训练跑起来”不等于“规模化训练做好了”。没有单卡基线、吞吐口径、batch 定义和通信证据，扩展效率数字很容易被误读。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 数据并行的核心思想</h2>
+<p>在数据并行中，每张卡持有一份完整模型，但处理不同的数据分片。一个 step 的基本流程是：各卡各自前向和反向，得到本地梯度，通过通信把梯度聚合，然后各卡更新到相同参数。用更抽象的话说，数据并行做的是：复制模型，切分数据，同步梯度。</p>
+<pre class="mermaid">flowchart LR
+  A[全局 batch] --> B[Sampler 切分]
+  B --> R0[Rank 0: 模型副本 + 数据分片]
+  B --> R1[Rank 1: 模型副本 + 数据分片]
+  B --> Rn[Rank N: 模型副本 + 数据分片]
+  R0 --> G0[本地梯度]
+  R1 --> G1[本地梯度]
+  Rn --> Gn[本地梯度]
+  G0 --> AR[AllReduce 平均梯度]
+  G1 --> AR
+  Gn --> AR
+  AR --> U0[各 rank 执行相同 optimizer.step]
+  U0 --> M[参数重新一致]</pre>
+<p>它的优势是模型逻辑改动小、框架支持成熟、调试链路短，是大多数训练集群的第一种并行方式。它的代价是通信成本会随着规模上升越来越明显，内存不会自动变多，每卡一份完整参数、梯度和优化器状态，存在大量冗余。</p>
+<h3>DDP 在做什么，不在做什么</h3>
+<table><tr><th>DDP 做的事</th><th>DDP 没做的事</th></tr>
+<tr><td>每个 rank 保留一份完整模型副本</td><td>让模型本体跨卡切分后放入显存</td></tr>
+<tr><td>每个 rank 处理不同数据分片</td><td>解决 DataLoader 本来就跟不上的问题</td></tr>
+<tr><td>在反向传播过程中同步梯度</td><td>减少完整优化器状态的每卡冗余</td></tr>
+<tr><td>让参数在每个 step 后重新一致</td><td>解决序列长度导致的激活 OOM</td></tr></table>
+<h3>一个容易忽略的事实：DDP 下每卡内存不会下降</h3>
+<table><tr><th>组成</th><th>占用</th><th>说明</th></tr>
+<tr><td>模型权重（bf16）</td><td>2 GB</td><td>1B 参数 × 2 字节</td></tr>
+<tr><td>梯度（bf16）</td><td>2 GB</td><td>和权重同大小</td></tr>
+<tr><td>优化器状态</td><td>12 GB</td><td>Adam 下 fp32 主权重 + m + v</td></tr>
+<tr><td>前向激活</td><td>视 batch 和 seq len</td><td>常常 5-30 GB</td></tr>
+<tr><td>框架额外</td><td>1-3 GB</td><td>临时 buffer、NCCL、allocator 碎片</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>约 20-50 GB</strong></td><td>每张卡都是完整副本</td></tr></table>
+<div class="danger"><strong>关键边界：</strong>经典 DDP 擅长的是“同一个模型已经能在单卡稳定训练，如何通过复制副本提升样本吞吐”。如果模型或训练状态单卡放不下，继续加 DDP 卡不会解决问题。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 一个 step 的时间分解</h2>
+<p>数据并行下，一个 step 可以粗略写成：</p>
+<pre><code>t_step = t_forward + t_backward + t_allreduce + t_optim</code></pre>
+<p>如果 <code>t_allreduce</code> 占比越来越高，说明作业已经进入通信主导区间。这时要问梯度量有多大、网络拓扑怎样、通信能否和计算重叠，以及继续扩卡是否仍然值得。</p>
+<h3>真正影响体验的是重叠得怎么样</h3>
+<p>真实 DDP step 往往不是先 backward 完再统一 allreduce，而是在反向传播逐层产生梯度时，DDP 把梯度放进 bucket，一些 bucket 一边生成一边开始通信。更接近工程现实的近似是：</p>
+<pre><code>t_step ≈ t_forward + max(t_backward, t_allreduce_overlap) + t_tail + t_optim</code></pre>
+<pre class="mermaid">gantt
+  title DDP step 时间线：健康 overlap 与明显 tail
+  dateFormat X
+  axisFormat %L
+  section 健康 step
+  forward                 :0, 120
+  backward                :120, 360
+  overlapped allreduce    :180, 330
+  optim                   :360, 400
+  section 不健康 step
+  forward                 :0, 120
+  backward                :120, 360
+  late allreduce tail     :360, 520
+  optim                   :520, 560</pre>
+<div class="warn"><strong>Profiler 读法：</strong>如果 step 尾部有长 NCCL tail，平均 GPU utilization 往往看不出来；必须看时间线、per-rank step time 和 AllReduce 与 backward 的重叠区间。</div>
+<h3>一个简单的通信占比心算</h3>
+<pre><code>通信时间 ≈ gradient_bytes × 2 × (N-1) / N / bandwidth
+计算时间 ≈ FLOPs / (GPU_peak × 利用率)
+通信占比 ≈ 通信时间 / (计算时间 + 通信时间)</code></pre>
+<p>举例：7B 模型的 bf16 梯度约 14 GB，8 卡 NVLink 节点内有效带宽约 300 GB/s，通信时间约 <code>14 × 2 × 7/8 / 300 ≈ 0.08 秒</code>。如果换到跨节点 InfiniBand 且有效带宽约 25 GB/s，同样通信约 1 秒，overlap 不到位就会直接拖垮 step。</p>
+</section>
+
+<section class="section" id="s5">
+<h2>5. AllReduce 为什么会成为瓶颈</h2>
+<p>AllReduce 的本质是把多个设备上的梯度聚合，并把聚合结果再分发回去。在一个粗略的 ring all-reduce 模型里，每个参与者大约要传输：</p>
+<pre><code>传输量 ≈ 2 × (N - 1) / N × gradient_bytes</code></pre>
+<p>梯度越大，通信越贵；设备越多，协调越复杂；网络越慢，扩卡收益越差。所以数据并行不是“卡越多越快”，而是“卡越多越依赖通信栈”。</p>
+<h3>Ring 和 Tree：NCCL 为什么会选不同算法</h3>
+<table><tr><th>算法</th><th>特点</th><th>更适合</th></tr>
+<tr><td>Ring AllReduce</td><td>带宽利用率高，延迟随 N 线性增长</td><td>大消息、小 N</td></tr>
+<tr><td>Tree AllReduce</td><td>延迟随 log(N) 增长，带宽利用率稍差</td><td>小消息、大 N</td></tr>
+<tr><td>Double Binary Tree</td><td>在带宽与延迟之间折中</td><td>大规模集群常见</td></tr></table>
+<div class="note"><strong>为什么 bucket 有价值：</strong>小梯度不一定比大梯度同步快，因为小消息下 latency 和 collective 启动开销可能超过数据传输。把碎梯度合成 bucket，通常比一个个发更快。</div>
+<h3>单机 8 卡和多机 8 卡不是一个量级</h3>
+<table><tr><th>维度</th><th>单机多卡</th><th>多机多卡</th></tr>
+<tr><td>主要链路</td><td>NVLink / NVSwitch / PCIe</td><td>InfiniBand / RoCE / Ethernet + 机内链路</td></tr>
+<tr><td>典型有效带宽</td><td>200-400 GB/s</td><td>20-40 GB/s（IB 200Gbps 量级）</td></tr>
+<tr><td>延迟量级</td><td>微秒级</td><td>几十微秒到毫秒</td></tr>
+<tr><td>排障复杂度</td><td>机内拓扑、驱动、NUMA</td><td>NIC、交换机、路由、拥塞、网卡绑定</td></tr>
+<tr><td>失败域</td><td>一台挂全挂</td><td>一台慢全都慢，一条链抖动全部抖</td></tr></table>
+<pre class="mermaid">flowchart TB
+  subgraph NodeA[节点 A]
+    A0[GPU0] --- A1[GPU1]
+    A1 --- A2[GPU2]
+    A2 --- A3[GPU3]
+    A3 --- NIC_A[NIC]
+  end
+  subgraph NodeB[节点 B]
+    NIC_B[NIC] --- B0[GPU0]
+    B0 --- B1[GPU1]
+    B1 --- B2[GPU2]
+    B2 --- B3[GPU3]
+  end
+  NIC_A == IB / RoCE / Ethernet == NIC_B
+  C[分层通信策略] --> D[节点内先聚合]
+  D --> E[跨节点通信]
+  E --> F[节点内再分发]</pre>
+<div class="success"><strong>平台视角：</strong>不一定要自己实现分层 AllReduce，但必须知道瓶颈不只是“梯度有多大”，而是“梯度要跨什么路径传”。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 扩展效率怎么理解</h2>
+<p>一个常见指标是扩展效率：</p>
+<pre><code>scaling efficiency = T_N / (N × T_1)</code></pre>
+<p>其中 <code>T_1</code> 是单卡吞吐，<code>T_N</code> 是 N 卡吞吐。如果效率接近 1，说明扩卡较健康；如果效率快速下滑，通常说明通信开销过大、数据供给跟不上、per-device batch 太小，或节点异构导致木桶效应。这里的 <code>T_1</code> 最好来自 <a href="../part3/07-single-node-training.html">第 7 章</a> 已经稳定的单机基线，否则指标会失真。</p>
+<h3>强扩展和弱扩展不要混着看</h3>
+<table><tr><th>实验方式</th><th>固定什么</th><th>更适合回答什么问题</th><th>常见陷阱</th></tr>
+<tr><td>强扩展 strong scaling</td><td>global batch 和任务总量</td><td>同一个任务能否更快做完</td><td>每卡 batch 变小，通信占比上升</td></tr>
+<tr><td>弱扩展 weak scaling</td><td>per-device batch</td><td>加卡后吞吐能否线性增长</td><td>global batch 变大，优化行为也会变</td></tr></table>
+<h3>看 tokens/sec 比看 steps/sec 更稳</h3>
+<table><tr><th>指标</th><th>含义</th><th>为什么更稳</th></tr>
+<tr><td>tokens/sec</td><td>每秒处理的 token 数</td><td>和 step 定义解耦</td></tr>
+<tr><td>samples/sec</td><td>每秒处理的样本数</td><td>适合非文本任务或样本长度稳定场景</td></tr>
+<tr><td>TFLOPS/GPU</td><td>每卡实际算力利用</td><td>直接反映计算饱满度</td></tr>
+<tr><td>MFU</td><td>实际 FLOPs / 理论峰值</td><td>跨硬件对比更可靠</td></tr></table>
+<div class="warn"><strong>指标口径：</strong>“8 卡 90% scaling efficiency”本身还不够，必须追问 global batch 是否变了、每卡 batch 是否太小、数据链路是否仍然稳定。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 为什么大 batch 不是免费午餐</h2>
+<p>为了提高数据并行效率，很多人会想到增大 batch。大 batch 往往能减少同步相对占比，但也会改变优化行为、收敛路径、学习率策略和显存压力。因此平台和算法团队需要协作，而不是简单地“为了扩卡效率把 batch 无限做大”。</p>
+<h3>global batch 到底怎么算</h3>
+<pre><code>B_global = B_per-device × N_devices × N_accum</code></pre>
+<ul>
+<li>扩卡后如果保持 <code>B_per-device</code> 不变，<code>B_global</code> 会随设备数线性变大。</li>
+<li>如果想保持 <code>B_global</code> 不变，就必须缩小 <code>B_per-device</code> 或减少累积。</li>
+<li><code>B_per-device</code> 太小，会让单卡计算不饱满、通信占比变大。</li>
+</ul>
+<h3>梯度累积：想要大 batch 又没那么多卡</h3>
+<p>梯度累积的本质是用时间换空间：把一个大 batch 拆成若干 micro-batch，分多次前向/反向但不立刻更新，最后再一次性 <code>optimizer.step()</code>。</p>
+<pre><code class="language-python">for i, batch in enumerate(loader):
+    is_accum_step = (i + 1) % accum_steps != 0
+    ctx = model.no_sync() if is_accum_step else nullcontext()
+    with ctx:
+        loss = model(batch) / accum_steps
+        loss.backward()
+    if not is_accum_step:
+        optimizer.step()
+        optimizer.zero_grad()</code></pre>
+<div class="danger"><strong>常见翻车：</strong>忘了 <code>no_sync()</code> 包装累积阶段的反向，结果每个 micro-batch 都触发 AllReduce，8 卡 accum_steps=4 下每 step 做了 4 次同步，吞吐可能比不用累积还低。</div>
+<h3>LR scaling 规则</h3>
+<table><tr><th>规则</th><th>含义</th><th>何时使用</th></tr>
+<tr><td>Linear scaling</td><td><code>lr_new = lr_base × (B_new / B_base)</code></td><td>中等 batch 扩展</td></tr>
+<tr><td>Square-root scaling</td><td><code>lr_new = lr_base × sqrt(B_new / B_base)</code></td><td>更保守，大 batch 下更常用</td></tr>
+<tr><td>Warmup 变长</td><td>大 batch 初期更不稳定</td><td>扩卡后 loss 早期抖动明显</td></tr></table>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 梯度压缩与通信优化</h2>
+<p>当通信开始主导 step 时间时，常见优化主要有三类：梯度压缩减少传输字节数，混合精度通信用更低精度传梯度或 bucket，Gradient Bucketing 把梯度按桶组织并尽早启动通信。</p>
+<table><tr><th>手段</th><th>在解决什么</th><th>适用条件</th><th>常见代价</th></tr>
+<tr><td>梯度压缩</td><td>减少传输字节数</td><td>网络较慢、模型大、收敛可重新验证</td><td>可能影响收敛稳定性，排障复杂</td></tr>
+<tr><td>混合精度通信</td><td>用 FP16 / BF16 传梯度或桶</td><td>训练已稳定、框架支持成熟</td><td>精度和数值排查更复杂</td></tr>
+<tr><td>Gradient Bucketing</td><td>让梯度一准备好就尽早通信</td><td>反向传播较长、希望 overlap</td><td>桶大小不合适会适得其反</td></tr></table>
+<h3>梯度压缩：省带宽不是免费的</h3>
+<table><tr><th>方法</th><th>基本思想</th><th>典型带宽收益</th><th>收敛风险</th><th>工程边界</th></tr>
+<tr><td>Quantization</td><td>梯度从 FP32/BF16 压到更低 bit</td><td>2x-32x</td><td>量化噪声，训练早期更敏感</td><td>优先从 BF16/FP16 通信开始</td></tr>
+<tr><td>Sparsification</td><td>只传 Top-K 或超过阈值的梯度</td><td>5x-100x</td><td>梯度方向偏差和索引开销</td><td>需要 error feedback buffer</td></tr>
+<tr><td>PowerSGD</td><td>对二维梯度矩阵做低秩近似</td><td>4x-50x</td><td>rank 太小会拖慢或破坏收敛</td><td>必须做同 token 数 A/B</td></tr></table>
+<div class="note"><strong>压缩比不等于 step 加速比：</strong>如果原本通信已经被 backward overlap 掩盖，或者 step 里还有 DataLoader、checkpoint、慢 rank 抖动，压缩带来的端到端收益可能只有几个百分点。</div>
+<h3>为什么 bucket 大小会影响扩展效率</h3>
+<table><tr><th>bucket 倾向</th><th>好处</th><th>代价</th></tr>
+<tr><td>更小</td><td>更早启动通信，更容易和反向重叠</td><td>通信调用更碎，latency 开销更明显</td></tr>
+<tr><td>更大</td><td>更容易吃满带宽，调用次数更少</td><td>启动通信更晚，尾部等待更长</td></tr></table>
+<pre class="mermaid">flowchart TD
+  A[发现 step 变慢] --> B{NCCL tail 明显吗}
+  B -->|否| C[先看 DataLoader / checkpoint / kernel / 慢 rank]
+  B -->|是| D{消息碎还是尾部大}
+  D -->|小消息多| E[调大 bucket 或减少 collective 次数]
+  D -->|尾部大| F[调小关键 bucket / 检查梯度生成顺序]
+  E --> G[验证 overlap 和 tokens/sec]
+  F --> G
+  G --> H{通信仍是主瓶颈}
+  H -->|是| I[尝试 BF16/FP16 comm hook]
+  H -->|否| J[保留配置并记录实验元数据]
+  I --> K[再评估 PowerSGD / quantization / sparsification]</pre>
+<h3>DDP 常见优化开关</h3>
+<table><tr><th>参数 / 开关</th><th>作用</th><th>适用场景</th></tr>
+<tr><td><code>bucket_cap_mb</code></td><td>控制 bucket 大小</td><td>最基本的调优旋钮</td></tr>
+<tr><td><code>gradient_as_bucket_view=True</code></td><td>让梯度直接指向 bucket 内存，省一次 copy</td><td>大多数 DDP 任务</td></tr>
+<tr><td><code>static_graph=True</code></td><td>声明计算图每步一致，允许更激进优化</td><td>模型结构固定时</td></tr>
+<tr><td><code>find_unused_parameters=True</code></td><td>容忍部分参数不参与反向</td><td>有动态分支，但有性能代价</td></tr>
+<tr><td>DDP comm hooks</td><td>自定义梯度通信逻辑</td><td>通信瓶颈已被 profiler 证明时</td></tr></table>
+<div class="warn"><strong>调优顺序：</strong>不要一开始就追求激进压缩；先把 bucket、overlap 和拓扑利用率做好，压缩应被当成通信已被证明为主瓶颈后的近似算法变更。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. NCCL 调优要点</h2>
+<p>NCCL 很少是“装好就结束”的组件。出现扩展效率异常时，至少要检查通信初始化、网卡路径、GPU / NIC 拓扑、collective 算法、跨节点链路和每个 rank 的健康度。</p>
+<table><tr><th>项目</th><th>作用</th><th>常见用途</th></tr>
+<tr><td><code>NCCL_DEBUG=INFO</code></td><td>打印通信初始化和错误信息</td><td>首次排障、确认拓扑和超时位置</td></tr>
+<tr><td><code>NCCL_DEBUG_SUBSYS=ALL</code></td><td>更细粒度子系统日志</td><td>深度排障</td></tr>
+<tr><td><code>NCCL_IB_DISABLE=1</code></td><td>禁用 InfiniBand 路径</td><td>隔离 IB / RoCE 相关问题</td></tr>
+<tr><td><code>NCCL_SOCKET_IFNAME=eth0</code></td><td>指定网卡接口</td><td>避免走错网卡或管理网</td></tr>
+<tr><td><code>NCCL_P2P_DISABLE=1</code></td><td>禁用 GPU P2P</td><td>排查 NVLink / PCIe 问题</td></tr>
+<tr><td><code>NCCL_ALGO=Ring/Tree</code></td><td>强制算法选择</td><td>实验用，生产一般让 NCCL 自选</td></tr>
+<tr><td><code>nvidia-smi topo -m</code></td><td>查看 GPU / NIC 拓扑</td><td>判断通信路径是否符合预期</td></tr></table>
+<h3>常见故障信号</h3>
+<table><tr><th>信号</th><th>更可能的问题</th><th>第一检查动作</th></tr>
+<tr><td>初始化阶段 hang</td><td>网卡接口、rank 配置、端口或拓扑异常</td><td>看 <code>NCCL_DEBUG=INFO</code> 和网卡绑定</td></tr>
+<tr><td>只有跨节点效率明显掉</td><td>交换网络、NIC 或跨机链路瓶颈</td><td>区分机内和机间通信占比</td></tr>
+<tr><td>某个 rank 总比别的慢</td><td>慢节点、NUMA、CPU 绑核或热降频</td><td>看 per-rank step time 和节点健康度</td></tr>
+<tr><td>偶发 timeout</td><td>网络抖动、IB / RoCE、驱动栈问题</td><td>对齐日志与网络事件时间点</td></tr>
+<tr><td>step 末尾总卡一大段</td><td>通信 overlap 不足，bucket 或拓扑不理想</td><td>看 profiler 时间线里的通信尾巴</td></tr>
+<tr><td>第一个 step 特别慢</td><td>NCCL 初始化、cuBLAS 预热、buffer 分配</td><td>不要把 step 0 算进平均</td></tr></table>
+<div class="danger"><strong>排障原则：</strong>不要把所有慢都归结成“网络不好”。很多时候是某个 rank 先慢了，网络 collective 只是把这个慢同步放大给所有人看见。</div>
+<h3>典型案例：跨节点从 90% 掉到 60%</h3>
+<ol>
+<li>先区分机内机外通信：单节点 8 卡仍有 92% 效率，说明问题在跨节点。</li>
+<li>看 NCCL log：发现 NCCL 选了 Ring 算法，跨节点走 IB。</li>
+<li>跑 <code>nccl-tests</code>：2 节点 <code>all_reduce_perf</code> 带宽只有 IB 理论值的 40%。</li>
+<li>检查 NIC：<code>ibstat</code> 显示一个节点的 NIC 链路速率配置错了。</li>
+<li>修复后：效率恢复到 88%。</li>
+</ol>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 工程实践中的关键点</h2>
+<div class="grid-3">
+<div class="card"><strong>每卡 batch 足够大</strong><br>per-device batch 太小会让通信占比过高；如果单次 forward 不足 50 ms，要警惕同步成本。</div>
+<div class="card"><strong>重叠通信与计算</strong><br>静态图和合理 bucket 是 DDP overlap 的前提。</div>
+<div class="card"><strong>关注 NCCL 与拓扑</strong><br>扩卡前用 <code>nccl-tests</code> 打基础数据，避免训练时才发现链路不健康。</div>
+<div class="card"><strong>避免节点异构</strong><br>同步训练里一个慢节点会拖垮整个组。</div>
+<div class="card"><strong>丢掉预热步</strong><br>NCCL 初始化、cuDNN 预热、内存分配会污染前几步。</div>
+<div class="card"><strong>报告实验上下文</strong><br>没有上下文的吞吐数字无法复现、对比和追溯。</div>
+</div>
+<h3>最低可用扩展实验</h3>
+<table><tr><th>维度</th><th>建议</th></tr>
+<tr><td>卡数</td><td>1 / 2 / 4 / 8，必要时再加跨节点 16</td></tr>
+<tr><td>固定条件</td><td>同一模型、同一数据切片、同一精度、同一优化器</td></tr>
+<tr><td>必记指标</td><td>吞吐、step time P50 / P95、allreduce 占比、显存峰值</td></tr>
+<tr><td>补充指标</td><td>data time 占比、per-rank skew、GPU utilization、MFU</td></tr></table>
+<pre><code>[基础信息]
+- 模型：名称、参数量、架构
+- 硬件：GPU 型号、互联类型、节点数
+- 软件：PyTorch / NCCL / CUDA 版本
+- 精度：bf16 / fp16 / fp32
+- 优化器：Adam / AdamW / 其他
+
+[性能指标]
+- step time P50 / P95
+- tokens/sec 或 samples/sec
+- MFU
+- 通信占比
+- 显存峰值
+- per-rank skew</code></pre>
+<h3>本章涉及的常见工具</h3>
+<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>多卡启动</td><td><code>torchrun --nproc_per_node=8 train.py</code></td><td>PyTorch 数据并行入口</td></tr>
+<tr><td>通信排障</td><td><code>NCCL_DEBUG=INFO</code>、<code>TORCH_DISTRIBUTED_DEBUG=DETAIL</code></td><td>确认路径和错误位置</td></tr>
+<tr><td>拓扑检查</td><td><code>nvidia-smi topo -m</code>、<code>ibstat</code></td><td>看 GPU、NIC、交换网络</td></tr>
+<tr><td>通信基准</td><td><code>nccl-tests</code></td><td>真实训练前验证通信栈</td></tr>
+<tr><td>性能剖析</td><td>PyTorch Profiler、Nsight Systems</td><td>看时间线、通信尾巴和 kernel 重叠</td></tr>
+<tr><td>多机启动</td><td><code>torchrun --nnodes=N --node_rank=R ...</code>、Slurm、Kubernetes</td><td>按环境选择入口</td></tr></table>
+<div class="success"><strong>实验判断：</strong>2 到 4 卡健康、8 卡掉速，多半是通信或 dataloader；单机 8 卡好、一跨节点下滑，几乎确定要先看网络；单卡 MFU 已经低，先别扩卡。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 数据并行的边界：什么时候需要 FSDP / ZeRO</h2>
+<p>经典 DDP 有一个硬约束：模型、梯度和优化器状态必须能塞进一张卡。当这个前提不成立时，要么上模型并行（见 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a>），要么把数据并行升级成 FSDP / ZeRO。</p>
+<p>FSDP 和 ZeRO 的核心观察是：DDP 下每张卡都存一份完整权重、梯度、优化器状态，其中存在大量冗余；如果把这些状态切分到不同卡上，只在需要时临时聚合，就能大幅省内存。</p>
+<table><tr><th>阶段</th><th>切分什么</th><th>内存节省</th><th>通信开销</th><th>对应 FSDP</th></tr>
+<tr><td>ZeRO-0</td><td>不切</td><td>无</td><td>基线</td><td>DDP / NO_SHARD</td></tr>
+<tr><td>ZeRO-1</td><td>优化器状态</td><td>约 4x（Adam 下）</td><td>约等于 DDP</td><td>—</td></tr>
+<tr><td>ZeRO-2</td><td>优化器状态 + 梯度</td><td>约 8x</td><td>约等于 DDP</td><td>SHARD_GRAD_OP</td></tr>
+<tr><td>ZeRO-3</td><td>优化器状态 + 梯度 + 参数</td><td>随 N 线性下降</td><td>约 1.5x DDP</td><td>FULL_SHARD</td></tr></table>
+<pre class="mermaid">flowchart LR
+  A[DDP: 每卡完整参数/梯度/优化器] --> B[ZeRO-1: 切优化器状态]
+  B --> C[ZeRO-2: 再切梯度]
+  C --> D[ZeRO-3 / FSDP FULL_SHARD: 再切参数]
+  D --> E[forward/backward 时按需 all-gather 参数]
+  E --> F[内存下降，通信和 checkpoint 复杂度上升]</pre>
+<h3>DDP、FSDP、ZeRO 的选择</h3>
+<table><tr><th>场景</th><th>推荐</th><th>理由</th></tr>
+<tr><td>模型 + 训练状态能放下单卡</td><td>DDP</td><td>最简单，吞吐最高</td></tr>
+<tr><td>模型能放下但优化器状态顶不住</td><td>ZeRO-2 / FSDP SHARD_GRAD_OP</td><td>通信和 DDP 相当，内存显著节省</td></tr>
+<tr><td>模型本身放不下单卡</td><td>ZeRO-3 / FSDP FULL_SHARD</td><td>参数也切分，内存随 N 下降</td></tr>
+<tr><td>超大模型（100B+）</td><td>ZeRO-3 + TP + PP</td><td>单一策略不够，要组合</td></tr>
+<tr><td>模型不大但 batch 想开很大</td><td>DDP + 梯度累积</td><td>不为“新技术”付额外复杂度</td></tr></table>
+<div class="warn"><strong>FSDP 不是免费加内存：</strong>checkpoint 变复杂、wrap policy 很关键、第一个 step 更慢、forward/backward 需要额外 all-gather，调试也比 DDP 难。上线前必须有分片 checkpoint 的保存恢复流程。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 什么时候不该优先做数据并行</h2>
+<p>以下情况继续做数据并行，可能只是把本来就没解决的问题放大：单卡训练还没稳定，模型根本放不下单卡，数据读取已经是第一瓶颈，网络条件很差，per-device batch 已经小到喂不饱单卡，或 checkpoint / 评测 stall 频繁。</p>
+<table><tr><th>反模式</th><th>典型表现</th><th>后果</th><th>正确做法</th></tr>
+<tr><td>单卡没调好就扩</td><td>单卡 MFU 20%，直接上 8 卡</td><td>问题被放大</td><td>先把单卡调到可接受水平</td></tr>
+<tr><td>为扩卡无限放大 batch</td><td>只追求扩展效率，不管收敛</td><td>模型训不收敛或精度掉</td><td>和算法团队同步 LR scaling</td></tr>
+<tr><td>跨节点用普通以太网</td><td>25 GbE 集群训 10B+ 模型</td><td>通信占比过高</td><td>换 IB 或换并行策略</td></tr>
+<tr><td>忘了 <code>no_sync()</code></td><td>梯度累积下每 micro-batch 都同步</td><td>通信多了 N 倍</td><td>正确包装 accum 阶段</td></tr>
+<tr><td>把第一个 step 算进平均</td><td>报告吞吐“不稳”</td><td>误判为框架 bug</td><td>丢掉前 N 步</td></tr>
+<tr><td>模型放不下却坚持 DDP</td><td>不断 OOM retry</td><td>训练根本跑不起来</td><td>切 FSDP 或上 TP</td></tr>
+<tr><td>只看 GPU utilization</td><td>“卡利用率 95%”</td><td>可能主要在 memcpy 或等待</td><td>看 MFU 和 tokens/sec</td></tr></table>
+<div class="danger"><strong>严重风险：</strong>当通信停顿和 checkpoint 写盘停顿叠加时，step 抖动、超时和恢复成本会一起放大。checkpoint 策略需要跟随并行策略调整，不能沿用单卡默认值。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 本章小结与练习</h2>
+<h3>小结</h3>
+<table><tr><th>主题</th><th>关键点</th></tr>
+<tr><td>数据并行本质</td><td>复制模型，切分数据，同步梯度</td></tr>
+<tr><td>主要瓶颈</td><td>AllReduce、拓扑质量与通信重叠能力</td></tr>
+<tr><td>扩展效率</td><td>判断“加卡是否值得”的关键指标</td></tr>
+<tr><td>Batch 定义</td><td>global batch、per-device batch、梯度累积必须分清</td></tr>
+<tr><td>扩展实验</td><td>区分强扩展和弱扩展，不能只看单个吞吐数字</td></tr>
+<tr><td>适用边界</td><td>模型放得下单卡、单卡基线稳定时最适合</td></tr>
+<tr><td>通信优化</td><td>bucket、overlap 先调好，再考虑梯度压缩</td></tr>
+<tr><td>内存边界</td><td>DDP 放不下时，FSDP/ZeRO 是自然延伸</td></tr>
+<tr><td>故障诊断</td><td>先分清单机/多机、通信/计算、均匀/不均</td></tr></table>
+<h3>基础题</h3>
+<ol>
+<li>为什么数据并行扩展到多机后收益常常变差？</li>
+<li>ring all-reduce 中，梯度量和设备数如何影响通信成本？</li>
+<li>扩展效率下降时，你会优先从哪三类因素排查？</li>
+<li>如果一个作业已经通信占比很高，checkpoint 策略为什么也要跟着改？</li>
+<li>强扩展和弱扩展的区别是什么？为什么混用会导致误判？</li>
+</ol>
+<h3>进阶题</h3>
+<ol start="6">
+<li>一个 7B 模型在 bf16 + Adam 下做 DDP 训练，估算每卡至少需要多少显存（不含激活）？如果单卡只有 40 GB，你会怎么做？</li>
+<li>8 卡 DDP 训练里 GPU utilization 是 95%，但 MFU 只有 18%。这两个数字能同时成立吗？可能原因是什么？</li>
+<li>一个作业跑到第 500 步突然某个 rank 比其他慢 30%，导致整体吞吐下降。你会怎么定位？</li>
+<li>为什么 DDP 默认的 <code>bucket_cap_mb=25MB</code> 不是万能的？什么场景要调大，什么场景要调小？</li>
+<li>画一张图说明 ZeRO-1、ZeRO-2、ZeRO-3 分别在 DDP 基础上切分了什么，并解释 ZeRO-3 相比 DDP 通信量为什么增加。</li>
+</ol>
+<div class="note"><strong>开放题方向：</strong>如果团队有 4 台 8 卡 A100 服务器并通过 100 GbE 互联，要训练 13B 模型，你需要先验证通信栈、单卡 MFU、显存预算、FSDP/ZeRO 可行性和 checkpoint 恢复流程，再决定并行策略。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先回看 <a href="../part3/07-single-node-training.html">第 7 章</a>，确认单机训练的计算、显存、数据加载和 profiler 基线；再用本章方法做 1 / 2 / 4 / 8 卡扩展实验；当 DDP 触达显存边界时，进入 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 学习模型并行与流水并行，并结合 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 重新设计 checkpoint 和恢复策略。</p>
+<p><strong>延伸阅读：</strong>PyTorch DistributedDataParallel、PyTorch FSDP、DeepSpeed ZeRO、NCCL collective communication、nccl-tests、Nsight Systems、PyTorch Profiler、Megatron-LM 的 2D / 3D 并行实践。</p>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 第 8 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

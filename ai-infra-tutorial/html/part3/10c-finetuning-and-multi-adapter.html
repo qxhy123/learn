@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 10c 章 · Fine-Tuning 基础设施与多 Adapter 服务 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=10c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 10c 章 · Fine-Tuning 基础设施与多 Adapter 服务</h1>
+<p class="sub">从“不能为每个业务完整复制大模型，但又必须快速改变模型行为”出发，建立微调任务、adapter 制品、版本兼容、共享推理池和多租户治理之间的因果链。</p>
+<div class="chips"><span class="chip">Fine-Tuning</span><span class="chip">LoRA / QLoRA</span><span class="chip">FTaaS</span><span class="chip">Adapter Registry</span><span class="chip">Multi-LoRA Serving</span><span class="chip">A/B 测试</span></div>
+<div class="note"><strong>不可化简的问题：</strong>一个已经很大的 base model 不能为了每个业务、每个租户、每次实验都完整复制、完整训练、完整部署，但业务又确实需要快速改变它在某个任务上的行为。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解</a></li>
+<li><a class="anchor" href="#s2">学习目标与导读</a></li>
+<li><a class="anchor" href="#s3">为什么 fine-tuning 需要独立讲</a></li>
+<li><a class="anchor" href="#s4">全量微调、LoRA、QLoRA</a></li>
+<li><a class="anchor" href="#s5">FTaaS 控制面与 pipeline</a></li>
+<li><a class="anchor" href="#s6">Multi-LoRA Serving</a></li>
+<li><a class="anchor" href="#s7">合并部署、动态挂载与兼容性</a></li>
+<li><a class="anchor" href="#s8">Adapter Registry 与 A/B 测试</a></li>
+<li><a class="anchor" href="#s9">观测、容量与失败模式</a></li>
+<li><a class="anchor" href="#s10">工程建议、小结与练习</a></li>
+</ol></section>
+
+<div class="note">本章与 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint、<a href="../part3/10b-alignment-and-post-training.html">第 10b 章</a> 的后训练流程、<a href="../part4/12-artifacts-and-checkpoints.html">第 12 章</a> 的制品管理、<a href="../part5/14-online-inference-architecture.html">第 14 章</a> 的推理架构、<a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的多租户成本控制密切相关。adapter 既是训练产物，也是服务期的一等制品。</div>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：Fine-Tuning 基础设施与多 Adapter 服务</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 LoRA、QLoRA、PEFT、Multi-LoRA、FTaaS 这些名字后，本章面对的不可化简问题只有一个：一个已经很大的 base model 不能为了每个业务、每个租户、每次实验都完整复制、完整训练、完整部署，但业务又确实需要快速改变它在某个任务上的行为。这同时是训练问题、制品问题和服务问题。训练侧的问题是：如果每个需求都全量更新几十亿到几千亿参数，显存、GPU 时间、checkpoint 存储和排队时延都会把平台压垮。制品侧的问题是：如果训练结果只是某个目录里的小文件，没有记录它依赖的 base model、tokenizer、chat template、target modules 和评测结果，它就不能被安全复现、审计、回滚或上线。服务侧的问题是：如果每个 adapter 都独立部署一套 base model，成本会回到“每个需求复制一份大模型”；如果所有 adapter 都动态挂载到同一个 serving pool，又会带来显存预算、缓存淘汰、路由隔离和版本兼容问题。</p>
+<p>因此 fine-tuning 不能只被理解成“规模更小的训练”，Multi-LoRA 也不能只被理解成“把多个 LoRA 文件挂上去”。平台真正要交付的是一条闭环：业务提交数据和目标，系统选择允许的 base model 与模板，调度短训练任务，生成 adapter，做评测与兼容性门禁，把 adapter 注册成可治理制品，再让线上服务按租户、版本、实验桶和权限选择它。任何一环缺失，都会把风险推到下一环：训练不记录 base hash，服务就可能加载到错误权重；registry 不记录模板，线上输出就可能因为 prompt 契约变化而漂移；serving 不做 cache budget，热点 adapter 和 KV cache 就会在流量高峰互相挤爆。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>既然不能为每个任务完整训练一份模型，就会推导出参数高效微调：冻结 base model，只训练一小组增量参数。LoRA 把大矩阵更新拆成低秩矩阵 <code>BA</code>，把“更新整个权重空间”变成“学习一个任务相关方向”；QLoRA 再把训练期 base model 量化，换取更低显存门槛。既然训练产物不再是完整模型，而是依附于 base 的 adapter，就会推导出 adapter registry：它不能只保存文件路径，还要保存 base model digest、tokenizer、chat template、adapter schema、训练代码、数据版本、评测报告和权限边界。既然业务需要自助提交大量短任务，就会推导出 FTaaS 控制面：API、配额、准入、状态机、调度、失败重试、评测门禁、制品注册和发布事件必须被串成一个可观测流程。</p>
+<p>既然服务期不能为每个 adapter 复制 base model，就会推导出 Multi-LoRA Serving：base 权重常驻并共享，adapter 按请求、租户或版本动态选择。共享 base 节省的是固定成本，但 adapter 热层、KV cache、临时 buffer 和碎片化会形成新的显存账本，因此必须把 <code>base 常驻</code>、<code>热点 adapter</code>、<code>峰值 KV cache</code>、<code>安全余量</code> 分开预算。既然 adapter 可以动态加载，就会推导出缓存分层：GPU 显存是 hot 层，CPU 内存或本地 NVMe 是 warm 层，对象存储和 registry 是 cold 层；LRU、预加载、租户权重和灰度优先级共同决定哪些 adapter 留在热层。既然 adapter 与 base 权重空间强绑定，就会推导出版本兼容性门禁：base hash、tokenizer、模板、target modules、serving engine adapter 格式只要有一个不匹配，就不能默认上线。最后，既然不同 adapter 会影响路由、batching 和线上行为，就会推导出 A/B、shadow、canary、按 adapter 维度观测和快速回滚。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Fine-Tuning 与 Multi-Adapter))
+    不可完整复制大模型
+      参数高效微调
+        LoRA
+        QLoRA
+        rank 与 target_modules
+      短作业资源池
+        准入控制
+        显存估算
+        失败重试
+    产物依附 base
+      Adapter Registry
+        base_model_hash
+        tokenizer_version
+        chat_template_version
+        eval_report
+      版本兼容门禁
+        shape 校验
+        schema 校验
+        engine 支持
+    需要低成本服务
+      Multi-LoRA Serving
+        共享 base model
+        动态挂载 adapter
+        adapter 路由
+      显存预算
+        base 常驻
+        热点 adapter
+        KV cache
+        安全余量
+    需要可运营上线
+      FTaaS Pipeline
+        数据快照
+        训练
+        评测
+        注册
+        热加载
+        灰度回滚
+      多租户治理
+        配额
+        权限
+        审计
+        成本归因</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 fine-tuning 的平台目标不是“把 pretraining 缩小”，而是缩短从数据到线上 adapter 的反馈回路？</li>
+<li>LoRA、QLoRA 分别改变了训练显存、制品大小和服务部署形态里的哪一部分成本？</li>
+<li>为什么 adapter 必须绑定 base model hash、tokenizer、chat template 和 target modules，而不能只登记一个文件地址？</li>
+<li>一个 FTaaS pipeline 从数据快照到 production 灰度至少需要哪些状态、门禁和失败处理？</li>
+<li>Multi-LoRA Serving 的显存为什么要同时预算 base 权重、热点 adapter、KV cache 和安全余量？</li>
+<li>base model 升级时，为什么“shape 能加载”不等于“语义兼容”，平台应该如何灰度和回滚？</li>
+<li>当一个租户的 adapter 变成短时热点时，路由、batching、缓存淘汰和配额分别会受到什么影响？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与导读</h2>
+<p>生产环境里最常见的训练，不是从头预训练，而是围绕一个已有 base model 做大量小而快的微调任务。本章把训练、制品和服务连成同一条链路，而不是把“LoRA 怎么训”和“线上怎么挂 adapter”拆成两套孤立系统。</p>
+<div class="grid-2">
+<div class="card"><strong>你将能解释</strong><br>为什么 fine-tuning 需要独立于 pretraining 讨论，为什么 LoRA/QLoRA 会改变平台资源形态，以及 FTaaS 控制面为什么必须管理状态、配额、评测和 registry。</div>
+<div class="card"><strong>你将能设计</strong><br>从数据快照到 adapter 上线的 pipeline，Multi-LoRA 的缓存和显存预算，adapter 的版本兼容校验，以及 shadow / canary / A/B / rollback 流程。</div>
+</div>
+<pre><code>数据快照
+  -> 训练作业
+  -> adapter 制品
+  -> 评测与注册
+  -> 多 adapter 路由
+  -> 线上灰度 / 回滚</code></pre>
+<div class="success"><strong>主线判断：</strong>fine-tuning 和 multi-adapter serving 不应被拆成“两套彼此无关的系统”。训练阶段的 base、模板和元数据，直接决定服务阶段能否安全热加载和治理。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 为什么 fine-tuning 需要独立讲</h2>
+<p>把 fine-tuning 当成“缩小版 pretraining”通常会误导平台设计。两者最关键的差异不是“参数少了一点”，而是目标函数、作业节奏、交付物和服务方式都变了。</p>
+<table><tr><th>维度</th><th>全量预训练 / 全量微调</th><th>参数高效微调</th></tr><tr><td>核心目标</td><td>学通用能力或重写整个模型</td><td>在固定 base model 上做定向增强</td></tr><tr><td>训练参数</td><td>大部分甚至全部参数</td><td>少量 adapter 参数</td></tr><tr><td>任务时长</td><td>天到周</td><td>分钟到小时</td></tr><tr><td>作业形态</td><td>少量长作业</td><td>大量短作业</td></tr><tr><td>交付物</td><td>checkpoint / 完整模型包</td><td>adapter + 元数据</td></tr><tr><td>平台重点</td><td>吞吐、扩展效率、恢复</td><td>多租户、低成本、快速交付</td></tr><tr><td>服务形态</td><td>独立部署一套模型</td><td>共享 base model + 动态挂载 adapter</td></tr></table>
+<p>pretraining 更像研发主线工程，fine-tuning 更像平台化产品能力。它通常天然走向多团队共享同一组 base model、多个租户高频提交微调任务、每次训练只改极小一部分参数、训练完成后很快进入评测、灰度和上线。</p>
+<div class="warn"><strong>资源池边界：</strong>如果把长 pretraining 作业和短 fine-tuning 作业强行塞进同一队列，长作业会压住短作业，短作业会打碎大作业的容量规划，调度器也很难同时优化吞吐和首个可用版本返回速度。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 全量微调、LoRA、QLoRA 到底在交换什么</h2>
+<p>LoRA 的核心思想是冻结 base model，只训练插入到特定层中的低秩矩阵。QLoRA 则进一步把 base model 量化到更低比特表示，以进一步降低训练显存。LoRA 不是“把大模型变小”，而是只训练一小块可控增量。</p>
+<pre><code>若 W 属于 R^(d_out x d_in)
+LoRA 把更新写成:
+  ΔW = B A
+
+A 属于 R^(r x d_in)
+B 属于 R^(d_out x r)
+新增参数量约为:
+  r(d_in + d_out)
+而不是:
+  d_out x d_in</code></pre>
+<table><tr><th>方案</th><th>Base model 形态</th><th>训练成本</th><th>服务期形态</th><th>是否适合 Multi-Adapter</th><th>常见风险</th></tr><tr><td>全量微调</td><td>全精度可训练</td><td>最高</td><td>常常变成一个新完整模型</td><td>较差</td><td>制品大、发布慢、难共享</td></tr><tr><td>LoRA</td><td>Base 冻结，adapter 可训练</td><td>低很多</td><td>可合并，也可动态挂载</td><td>很适合</td><td>adapter 数量膨胀、版本管理复杂</td></tr><tr><td>QLoRA</td><td>Base 量化 + adapter 可训练</td><td>更低</td><td>训练更省，但服务仍需考虑兼容引擎</td><td>适合，但约束更多</td><td>训练与服务环境不一致、精度波动</td></tr></table>
+<table><tr><th>7B 级模型场景</th><th>粗略显存量级</th><th>工程含义</th></tr><tr><td>全量微调</td><td>常见 35-50 GB 起</td><td>往往逼近高端训练卡</td></tr><tr><td>LoRA</td><td>常见十几到二十多 GB</td><td>单卡中高端 GPU 就可覆盖很多任务</td></tr><tr><td>QLoRA</td><td>常见可进一步下降到十几 GB 内外</td><td>更适合成本敏感平台</td></tr></table>
+<div class="note"><strong>基础设施参数：</strong><code>rank</code> 更像“单个 adapter 的容量旋钮”，<code>target_modules</code> 更像“这个 adapter 侵入模型多少位置”。它们会影响训练显存、吞吐、adapter 文件大小、服务加载时延和多 adapter 共存时的缓存压力。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. FTaaS 控制面与端到端 pipeline</h2>
+<p>平台里的 fine-tuning 不应被抽象成“跑完一个 <code>train.py</code> 就结束”。在生产环境里，FTaaS 更像一个围绕 adapter 生命周期构建的小型控制面，它负责把一次训练请求安全地推进到“可被线上服务加载”的状态。</p>
+<pre class="mermaid">flowchart TD
+  A[数据快照 / 数据清洗] --> B[选择 base model / tokenizer / template]
+  B --> C[提交 FTaaS 任务]
+  C --> D{准入控制}
+  D -- 配额 / 显存 / 权限通过 --> E[训练执行]
+  D -- 拒绝 --> R[返回可解释原因]
+  E --> F[冻结 adapter / config / dataset version]
+  F --> G[自动评测]
+  G --> H{质量与安全门禁}
+  H -- 通过 --> I[兼容性校验]
+  H -- 未通过 --> J[registered: non_deployable]
+  I --> K{base / tokenizer / schema / engine 匹配}
+  K -- 通过 --> L[Adapter Registry]
+  K -- 未通过 --> M[load_blocked]
+  L --> N[通知 serving pool 预加载]
+  N --> O{热加载成功}
+  O -- 成功 --> P[staging / shadow / canary / production]
+  O -- 失败 --> Q[load_failed + 保持旧路由]
+  P --> S[线上观测 / A/B / 回滚 / 下线]</pre>
+<table><tr><th>阶段</th><th>主要输入</th><th>平台要保证什么</th><th>典型输出</th></tr><tr><td>数据快照</td><td>训练样本、清洗规则</td><td>数据可追踪、可复现</td><td>dataset version</td></tr><tr><td>训练提交</td><td>base model、超参、租户信息</td><td>鉴权、配额、资源估算</td><td>training job</td></tr><tr><td>训练执行</td><td>GPU、checkpoint 存储</td><td>稳定运行、失败恢复</td><td>adapter / checkpoint</td></tr><tr><td>自动评测</td><td>基准集、判分器、门禁规则</td><td>不让“训练成功但效果退化”的版本进入上线</td><td>eval report</td></tr><tr><td>注册</td><td>制品元数据</td><td>版本绑定、状态管理、审计</td><td>adapter record</td></tr><tr><td>热加载</td><td>serving pool、路由信息</td><td>可观测、可回退、不重启</td><td>loaded adapter</td></tr><tr><td>发布</td><td>灰度策略、SLO、告警规则</td><td>可回滚、权限正确、流量可控</td><td>online version</td></tr></table>
+<p>平台里经常要明确区分三种“成功”：训练成功是 job 没挂并产出了 adapter；评测成功是 adapter 达到了离线门槛并通过兼容性检查；发布成功是 adapter 被正确加载，并在真实流量里表现稳定。这三者不是同义词。</p>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> submitted
+  submitted --> admitted
+  admitted --> staging_data
+  staging_data --> running
+  running --> evaluating
+  evaluating --> registered
+  registered --> loading
+  loading --> deployable
+  running --> failed
+  running --> cancelled
+  running --> retrying
+  retrying --> running
+  evaluating --> rejected
+  loading --> load_failed
+  deployable --> deprecated
+</pre>
+<div class="danger"><strong>严重风险：</strong>训练 worker 只能声明训练产物已冻结，不能直接把 adapter 标成可上线；评测 worker 只能给出离线门禁结果，不能绕过 registry；serving loader 只能汇报加载结果，不能改写 adapter 元数据。</div>
+<table><tr><th>调度维度</th><th>为什么重要</th></tr><tr><td>预计显存</td><td>决定能否落到某个 GPU 档位</td></tr><tr><td>base model 本地性</td><td>减少重复下载和冷启动时间</td></tr><tr><td>checkpoint / 数据位置</td><td>影响作业启动耗时</td></tr><tr><td>租户配额与优先级</td><td>防止一个团队把短作业池打满</td></tr><tr><td>是否可抢占</td><td>决定能否放到更便宜资源上</td></tr><tr><td>任务时长预估</td><td>帮助调度器减少碎片和排队抖动</td></tr></table>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Multi-LoRA Serving</h2>
+<p>训练完成后的 adapter，往往不会单独起一套 base model 服务，而是挂载到共享实例上。核心思想是 base model 权重只保留一份，多个 adapter 共用同一组推理副本，adapter 按请求、租户、会话或版本动态选择。</p>
+<pre class="mermaid">flowchart LR
+  A[request] --> B[gateway / auth]
+  B --> C[router tenant/task/version]
+  C --> D[model pool: shared base model]
+  D --> E[adapter loader/cache]
+  E --> F[inference]
+  G[Adapter Registry] --> E
+  H[Hot GPU cache] <--> E
+  I[Warm CPU/NVMe] <--> E
+  J[Cold object storage] <--> I</pre>
+<table><tr><th>组成部分</th><th>在服务期做什么</th><th>资源关注点</th></tr><tr><td>Base model</td><td>共享主权重</td><td>大头显存、预热成本</td></tr><tr><td>Adapter</td><td>叠加到请求路径</td><td>增量显存、切换延迟</td></tr><tr><td>Router</td><td>按 tenant / task / version 选 adapter</td><td>路由正确性和隔离</td></tr><tr><td>Loader</td><td>热加载 / 热卸载 adapter</td><td>不重启、低抖动</td></tr></table>
+<p>Multi-LoRA Serving 的关键收益是 base model 不需要为每个小任务复制一份，新 adapter 上线不必重新部署整套模型，多个业务实验可以共享 warm pool，灰度和回滚粒度可以细到 adapter 版本。这也是它常常和 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的多租户治理绑在一起讲的原因。</p>
+<div class="warn"><strong>不是免费午餐：</strong>adapter 越多，缓存淘汰、热加载失败回滚、权限控制、跨 adapter batching、热点租户挤占 cache 等问题越明显。平台要默认认为跨 adapter 的批处理通常更难做。</div>
+<table><tr><th>层级</th><th>典型位置</th><th>作用</th></tr><tr><td>Hot</td><td>GPU 显存</td><td>当前高频 adapter，追求最低切换延迟</td></tr><tr><td>Warm</td><td>CPU 内存或本地 NVMe</td><td>避免每次都回对象存储拉取</td></tr><tr><td>Cold</td><td>对象存储 / registry</td><td>作为真实来源与长期归档</td></tr></table>
+<h3>Multi-LoRA 显存管理</h3>
+<p>从显存账本看，Multi-LoRA Serving 的核心不是“adapter 很小，所以问题不大”，而是要把共享成本、增量成本和并发成本分开核算。</p>
+<pre><code>总显存 ≈ base_model_size
+       + N × adapter_size
+       + concurrent_requests × kv_cache_per_request
+       + workspace
+       + safety_margin</code></pre>
+<table><tr><th>预算项</th><th>估算口径</th><th>7B BF16 示例</th><th>工程动作</th></tr><tr><td>Base 权重常驻</td><td>参数量 × dtype bytes</td><td>约 14 GB</td><td>每个 replica 必须预留，不能被 adapter 挤占</td></tr><tr><td>单个 LoRA adapter</td><td>target modules 参数增量 × dtype bytes</td><td>rank 16 常见几十到数百 MB</td><td>注册时写入精确文件大小和加载后显存增量</td></tr><tr><td>热点 adapter 池</td><td>hot_adapter_count × adapter_size</td><td>32 × 120 MB = 3.8 GB</td><td>设置每副本 hot 层上限，超过则驱逐或拒绝预加载</td></tr><tr><td>KV cache</td><td>并发 × context × dtype 相关</td><td>32 个中等上下文请求可能数 GB</td><td>与 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的 batching 策略联动</td></tr><tr><td>workspace / 碎片 / 安全余量</td><td>压测得到</td><td>常见总容量 10%-20% 起</td><td>admission control 按硬阈值执行</td></tr></table>
+<pre class="mermaid">flowchart TD
+  A[GPU 总容量] --> B[base 常驻]
+  A --> C[热点 adapter 常驻]
+  A --> D[峰值 KV cache]
+  A --> E[workspace / CUDA graph]
+  A --> F[碎片与安全余量]
+  C --> G{hot 层接近阈值?}
+  G -- 是 --> H[LRU / 权重驱逐]
+  G -- 否 --> I[允许预加载]
+  D --> J{p95 KV 超预算?}
+  J -- 是 --> K[降并发 / 拒绝新 adapter / 调整 batching]
+  H --> L[保持 base 与稳定路由]
+  I --> L
+  K --> L</pre>
+<div class="success"><strong>工程边界：</strong>显存预算不能只在部署时算一次。registry 应保存 adapter 静态大小，loader 应上报加载后真实增量，serving pool 应周期性上报 hot adapter 数、KV cache 峰值、eviction 次数和 OOM 近失事件。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 合并部署、动态挂载与版本兼容性</h2>
+<p>很多团队在 adapter 上线时，会在两条路之间选择：把 adapter 合并进权重后导出独立模型版本，或者让 base model 常驻并按需动态挂载 adapter。LoRA 是训练形态，Multi-LoRA 是服务形态；两者常一起出现，但不是强绑定。</p>
+<table><tr><th>路径</th><th>做法</th><th>优点</th><th>代价</th><th>更适合</th></tr><tr><td>合并部署（merge）</td><td>把 adapter 合并进权重，再导出独立模型版本</td><td>推理路径简单、单模型性能更稳定</td><td>失去热切换能力，制品变大</td><td>单租户、固定版本、吞吐优先</td></tr><tr><td>动态挂载（side-load）</td><td>base model 常驻，adapter 按需加载</td><td>多租户友好、热上线快、成本低</td><td>缓存、路由、权限更复杂</td><td>多版本并存、频繁实验、平台化服务</td></tr></table>
+<p>adapter 与 base 的兼容性不能只看 shape。LoRA 的本质是对特定 base 权重空间做低秩增量拟合，训练出来的矩阵不是抽象地绑定在“某个 7B 模型品类”上，而是绑定在某一版具体 base 权重上。只要 base model 升级了 checkpoint、替换了 tokenizer、调整了 chat template，甚至只是做了看似温和的后训练，adapter 对应的最优增量方向都可能已经变化。</p>
+<table><tr><th>变化项</th><th>典型例子</th><th>加载层面</th><th>语义层面</th><th>平台默认动作</th></tr><tr><td>base checkpoint digest 变化</td><td><code>base-v1</code> 重新上传但标签不变</td><td>可能能加载</td><td>高风险</td><td>阻断自动发布，要求重训或完整验收</td></tr><tr><td>tokenizer 变化</td><td>新增 special token、改变 BOS/EOS</td><td>可能能启动</td><td>高风险</td><td>阻断，要求 adapter 重新评测</td></tr><tr><td>chat template 变化</td><td>system/user/assistant 包装格式改变</td><td>能加载</td><td>高风险</td><td>阻断 production，允许 shadow 验证</td></tr><tr><td>target modules 变化</td><td><code>q_proj/v_proj</code> 改名或层数不同</td><td>常直接失败</td><td>不可信</td><td>注册阶段拒绝</td></tr><tr><td>serving engine 变化</td><td>vLLM、TRT-LLM、LoRAX 支持差异</td><td>可能失败</td><td>需压测</td><td>进入 engine 兼容矩阵</td></tr><tr><td>base 做了对齐后训练</td><td>SFT/RLHF/DPO 后的新权重</td><td>可能能加载</td><td>高风险</td><td>新旧 base 并存，adapter 分批重训</td></tr></table>
+<pre><code>adapter_id: tenant-a/summarizer-lora
+adapter_version: 2026-05-03.4
+base_model_id: llama-3.1-8b-instruct
+base_model_digest: sha256:...
+tokenizer_digest: sha256:...
+chat_template_version: chatml-v3
+adapter_format: peft-lora-safetensors
+adapter_schema:
+  rank: 16
+  alpha: 32
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+training:
+  dataset_version: ds-2026-05-01-cleaned
+  trainer_image_digest: sha256:...
+  seed: 42
+evaluation:
+  report_id: eval-98231
+  status: passed
+serving:
+  allowed_engines: [vllm-0.8-lora]
+  status: deployable</code></pre>
+<div class="danger"><strong>兼容性底线：</strong>只要 base 权重、输入契约或 adapter schema 任一项变化，就不能把旧 adapter 当作自动兼容。如果业务强烈希望复用，也应进入 <code>compatibility_review</code> 或 <code>shadow_only</code> 状态，而不是直接设为 <code>deployable</code>。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. Adapter Registry、兼容性约束与 A/B 测试</h2>
+<p>adapter 不能只当一个小文件看待，它必须和运行它所需的上下文一起管理。registry 里登记的不是“一个 <code>.safetensors</code> 文件”，而应该是“这个 adapter 能在哪个 base model、哪种模板、哪种服务引擎上被谁以什么状态使用”。</p>
+<table><tr><th>要管理的对象</th><th>为什么重要</th></tr><tr><td>Base model 版本</td><td>base 一变，adapter 可能立刻失效</td></tr><tr><td>Tokenizer / chat template</td><td>输入格式变了，行为可能明显漂移</td></tr><tr><td>Adapter 格式与目标模块</td><td>层名、shape、target modules 不匹配会直接加载失败</td></tr><tr><td>训练配置与数据版本</td><td>没有元数据就难以复现</td></tr><tr><td>评测结果</td><td>方便做上线门禁和回归判断</td></tr><tr><td>租户与权限信息</td><td>防止路由到不该访问的 adapter</td></tr></table>
+<pre class="mermaid">flowchart TD
+  A[adapter candidate] --> B{base_model_id 与 digest 匹配?}
+  B -- 否 --> X[blocked: base_mismatch]
+  B -- 是 --> C{tokenizer / template 允许?}
+  C -- 否 --> Y[shadow_only 或 rejected]
+  C -- 是 --> D{target modules / schema 可加载?}
+  D -- 否 --> Z[registration rejected]
+  D -- 是 --> E{离线评测通过?}
+  E -- 否 --> F[registered: non_deployable]
+  E -- 是 --> G{tenant 有发布权限?}
+  G -- 否 --> H[permission_rejected]
+  G -- 是 --> I[deployable candidate]
+  I --> J[shadow]
+  J --> K[canary]
+  K --> L[production]
+  K --> M[rollback]</pre>
+<table><tr><th>阶段</th><th>目的</th></tr><tr><td>离线评测</td><td>先挡住明显退化版本</td></tr><tr><td>Shadow / Replay</td><td>看真实流量下的输出差异，不影响用户</td></tr><tr><td>Canary</td><td>小流量真实放量，观察错误率和延迟</td></tr><tr><td>扩量</td><td>逐步从 5% / 10% 提升到更高比例</td></tr><tr><td>全量 / 回滚</td><td>达标则放量，不达标立刻回滚</td></tr></table>
+<div class="note"><strong>A/B 设计重点：</strong>adapter 维度的实验不仅要看质量指标，还要看 TTFT、tokens/s、cache hit、load latency、route miss 和 permission reject。某个 adapter 质量更好但让缓存抖动严重，也可能不适合直接放量。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 观测指标、容量规划与典型失败模式</h2>
+<p>fine-tuning 和 multi-adapter 系统要观测的，不只是 GPU 利用率。训练侧关心作业周转和制品质量，服务侧关心加载延迟、缓存稳定、路由正确和按 adapter 维度的线上行为。</p>
+<div class="grid-2">
+<div class="card"><strong>训练侧指标</strong><br>作业等待时间、作业成功率 / 重试率、tokens/s 或 samples/s、单作业显存峰值、checkpoint / artifact 上传耗时、eval pass rate。</div>
+<div class="card"><strong>服务侧指标</strong><br>adapter load latency P50/P95、adapter cache hit rate、route miss / permission reject、TTFT / tokens per second、OOM / eviction rate、按 adapter 维度的错误率。</div>
+</div>
+<table><tr><th>失败模式</th><th>典型表现</th><th>更根本的问题</th></tr><tr><td>Base model 不匹配</td><td>adapter 加载失败或效果异常</td><td>版本绑定不严</td></tr><tr><td>Tokenizer / template 变化</td><td>线上输出风格突变</td><td>输入契约未被登记</td></tr><tr><td>target modules 不匹配</td><td>启动时报 shape / key 错误</td><td>训练与服务环境不一致</td></tr><tr><td>热点 adapter 频繁被淘汰</td><td>延迟剧烈波动</td><td>cache 策略没有考虑热度分布</td></tr><tr><td>训练成功但 registry 元数据缺失</td><td>无法上线或无法回滚</td><td>制品流转链路不完整</td></tr><tr><td>路由越权</td><td>请求拿到错误 adapter</td><td>多租户隔离没进入控制面</td></tr></table>
+<div class="warn"><strong>排障视角：</strong>adapter 系统的问题，很少只是“模型训练得好不好”，更多是“训练、制品、路由、缓存、权限有没有被当成同一条链路设计”。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 工程建议、小结与练习</h2>
+<h3>工程建议</h3>
+<ul>
+<li>资源队列上明确区分“全量训练”和“fine-tuning”任务。</li>
+<li>adapter 作为一等制品进入 registry，而不是只存训练输出目录。</li>
+<li>在训练完成和允许发布之间插入兼容性校验与离线评测。</li>
+<li>先把 base model、tokenizer、template 的版本绑定做严，再谈 Multi-LoRA Serving。</li>
+<li>在生产前压测 adapter 热加载 / 热卸载延迟，而不只是看单次训练是否成功。</li>
+<li>对高并发场景，优先设计 adapter 缓存与淘汰策略，而不是只关注单次训练成本。</li>
+<li>让多租户配额、权限和路由进入控制面，否则 adapter 服务很容易变成“能跑但不可治理”。</li>
+</ul>
+<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr><tr><td>参数高效微调</td><td>PEFT</td><td>Hugging Face 生态的统一入口</td></tr><tr><td>量化微调</td><td>bitsandbytes、QLoRA</td><td>常用于降低单卡显存要求</td></tr><tr><td>高效 LoRA 训练</td><td>Unsloth</td><td>面向更快的单机 / 单卡 LoRA 训练</td></tr><tr><td>Multi-LoRA Serving</td><td>vLLM Multi-LoRA、LoRAX</td><td>关注热加载与共享 base model</td></tr><tr><td>制品管理</td><td>MLflow、Weights &amp; Biases、自建 registry</td><td>关键是版本绑定和可追踪性</td></tr></table>
+<h3>本章小结</h3>
+<table><tr><th>主题</th><th>关键点</th></tr><tr><td>Fine-tuning 本质</td><td>高频、短任务、多租户，与 pretraining 完全不同</td></tr><tr><td>LoRA / QLoRA</td><td>通过冻结或量化 base model 显著降低训练成本</td></tr><tr><td>FTaaS</td><td>重点是队列、配额、状态机、制品管理，而不是极限扩展效率</td></tr><tr><td>Multi-LoRA Serving</td><td>通过共享 base model 降成本，但会引入缓存、路由和权限复杂度</td></tr><tr><td>兼容性约束</td><td>adapter 必须和 base model、tokenizer、模板、评测结果一起管理</td></tr><tr><td>观测重点</td><td>训练看周转与成功率，服务看加载延迟、缓存命中和路由正确性</td></tr></table>
+<h3>练习题</h3>
+<ol>
+<li>为什么 fine-tuning 任务不应该和 pretraining 任务共用同一资源队列？</li>
+<li>LoRA 和 QLoRA 的平台意义分别是什么？它们分别改变了训练侧和服务侧的哪些成本结构？</li>
+<li>为什么 adapter 是“一等制品”，而不是训练脚本顺手导出的一个小文件？</li>
+<li>画出一个 FTaaS 的任务状态机，并解释为什么 <code>training succeeded</code>、<code>evaluation passed</code>、<code>deployable</code> 必须是三个不同状态。</li>
+<li>基于公式 <code>总显存 ≈ base_model_size + N × adapter_size + concurrent_requests × kv_cache_per_request</code>，说明只盯 adapter 文件大小为什么会低估显存风险。</li>
+<li>为什么 base model 升级后，已有 LoRA adapter 往往需要重新训练或重新验收？</li>
+<li>设计一个 adapter A/B 测试流程，说明离线评测、shadow、canary、扩量和回滚各自的作用。</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复，再结合 <a href="../part3/10b-alignment-and-post-training.html">第 10b 章</a> 的后训练流程理解 SFT/RLHF/DPO 的平台共性，然后进入本章的 LoRA/QLoRA、FTaaS、adapter registry 和 Multi-LoRA serving，最后延伸到 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 与 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 看推理期缓存、调度和成本治理。</div>
+<div class="card"><strong>延伸阅读</strong><br>PEFT / LoRA / QLoRA 论文与实现，vLLM Multi-LoRA、LoRAX、Hugging Face PEFT、bitsandbytes、Unsloth、MLflow/W&amp;B artifact 管理，以及自建 adapter registry 的 schema、状态机、热加载和回滚设计。</div>
+</div>
+<p class="mini">实践时优先把“训练任务状态、adapter 元数据契约、serving 缓存预算、发布门禁、回滚路径”写成同一份设计文档。adapter 不是一个小文件，而是平台契约的一部分。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程 · 第 10c 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 9 章 · 模型并行与流水并行 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=09" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 9 章 · 模型并行与流水并行</h1>
+<p class="sub">当一个训练 step 的状态、计算和激活超过单设备容量时，系统必须把模型、层、序列和训练状态拆成可通信、可调度、可恢复的分布式结构。</p>
+<div class="chips"><span class="chip">Tensor Parallelism</span><span class="chip">Pipeline Parallelism</span><span class="chip">ZeRO / FSDP</span><span class="chip">SP / CP</span><span class="chip">3D Parallel</span><span class="chip">Checkpoint Shards</span></div>
+<div class="note"><strong>不可化简的问题：</strong>一个训练 step 需要保存和计算的状态超过单个物理设备的容量与带宽时，怎样拆分状态、计算和通信，并让数学结果、性能画像和恢复流程仍然可解释？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解</a></li>
+<li><a class="anchor" href="#s2">为什么数据并行不够</a></li>
+<li><a class="anchor" href="#s3">张量并行</a></li>
+<li><a class="anchor" href="#s4">流水并行</a></li>
+<li><a class="anchor" href="#s5">Pipeline Bubble</a></li>
+<li><a class="anchor" href="#s6">混合并行</a></li>
+<li><a class="anchor" href="#s7">ZeRO 与 FSDP</a></li>
+<li><a class="anchor" href="#s8">Interleaved 与 Zero Bubble</a></li>
+<li><a class="anchor" href="#s9">Sequence / Context Parallelism</a></li>
+<li><a class="anchor" href="#s10">并行策略决策树</a></li>
+<li><a class="anchor" href="#s11">典型配置实例</a></li>
+<li><a class="anchor" href="#s12">落地第一版方案</a></li>
+<li><a class="anchor" href="#s13">框架对照表</a></li>
+<li><a class="anchor" href="#s14">工程建议与工具</a></li>
+<li><a class="anchor" href="#s15">常见误区、小结与练习</a></li>
+</ol></section>
+
+<div class="note">当模型已经大到单卡放不下时，问题就从“怎么复制模型”变成了“怎么拆模型”。本章与 <a href="../part3/08-data-parallel.html">第 8 章</a> 的数据并行、<a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的状态切分与 checkpoint 设计强相关。</div>
+
+<section class="section" id="s1"><h2>1. 第一性原理拆解：为什么会有模型并行与流水并行</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 Data Parallelism、Tensor Parallelism、Pipeline Parallelism、ZeRO、FSDP、Sequence Parallelism、Context Parallelism 这些术语，本章真正面对的不可化简问题只有一个：一个训练 step 需要保存和计算的状态超过了单个物理设备的容量与带宽，系统必须把状态、计算和通信同时拆开，并且拆完之后仍然保持数学等价和工程可恢复。数据并行在 <a href="../part3/08-data-parallel.html">第 8 章</a> 中解决的是“同一个模型副本如何吃更多样本”，它默认每张 GPU 都能放下完整参数、梯度、优化器状态和必要激活。一旦 7B、70B、405B 模型叠加 BF16 参数、FP32 master weights、Adam 一阶二阶动量、activation checkpointing、长上下文 attention workspace 后超过单卡或单节点容量，复制模型就从扩展手段变成了障碍。</p>
+<p>这个问题不能只用“显存不够”概括。显存只是第一层硬约束；第二层是计算单元是否闲置，第三层是 GPU 之间的链路能否承受同步，第四层是 checkpoint、恢复、故障定位是否还能解释清楚。一个策略如果让模型能放下，但每层都跨慢速网络 AllReduce，吞吐可能比小规模训练还差；另一个策略如果利用率很高，但 checkpoint 无法在 rank 重排后恢复，就不适合平台化运行。模型并行的本质不是“把模型分到多张卡”，而是在容量、带宽、延迟、调度复杂度和恢复复杂度之间做约束求解。</p>
+<p>因此，本章的学习目标不是记住某个框架参数怎么写，而是建立工程决策直觉：什么时候先用纯 DP，什么时候把层内矩阵切成 TP，什么时候按层段切成 PP，什么时候用 ZeRO / FSDP 切训练状态，什么时候因为序列长度太长而叠加 SP / CP，以及什么时候不应该继续叠加并行维度。读这一章时要一直追问：我切掉的是哪一种重复？新引入的是哪一种通信？这个通信发生在节点内还是跨节点？它会不会改变 checkpoint 的组织方式？当一个 rank 掉线或恢复时，系统还能不能知道每个 shard 属于谁？</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“单卡装不下完整训练副本”出发，第一种直接推导是状态分片。参数、梯度、优化器状态存在大量副本，ZeRO / FSDP 就是把这些重复状态切开，让每张卡只保存一部分；但它没有自动切开单层 GEMM 的计算，也没有自动降低 attention 对超长序列的压力。于是第二种推导是张量并行：如果某一层的权重矩阵或 attention projection 太大，就沿 hidden dimension、head 或矩阵行列把单层计算拆给多张 GPU。TP 的收益是降低单层参数和计算峰值，代价是每层都可能出现 <code>AllReduce</code>、<code>AllGather</code> 或 <code>ReduceScatter</code>，所以它天然应该优先放在 NVLink / NVSwitch 这类节点内高速互联里。</p>
+<p>如果单层通过 TP 能放下，但整个网络层数太多、单节点仍然无法承载完整模型，就会推导出流水并行：把 Transformer 层段切成多个 stage，不同 micro-batch 像工厂流水线一样依次通过 stage。PP 解决的是“整网太深、整模太大”，但它引入 pipeline bubble，因为流水线填充和排空阶段总有设备暂时没有活干。micro-batch 数 <code>m</code> 越少、stage 数 <code>p</code> 越多，bubble 越明显，因此 PP 必然引出 1F1B、Interleaved Pipeline、Zero Bubble 等调度优化。它们不是新的容量机制，而是在容量已经被 PP 解决后，进一步减少空闲槽。</p>
+<p>当模型能放下后，还要解决吞吐扩展，这自然回到数据并行：把已经由 TP / PP / ZeRO 组成的“一个模型副本”复制多份，每份吃不同 batch，再同步梯度。大规模训练常见的 <code>DP x PP x TP</code> 不是为了炫技，而是因为三个维度分别切样本、层段和层内计算。长上下文又会推导出另一个分支：TP 主要切 hidden，PP 主要切 layers，ZeRO 主要切训练状态；当 context 从 8K 拉到 128K+，真正爆掉的可能是 token 维度上的激活、KV 和 attention workspace。Sequence Parallelism 在 TP 组内切非 attention 路径的 sequence 激活，Context Parallelism 切 attention 所需的 context / KV 流动。二者的共同点是补“序列维度”的短板，不是替代 DP / TP / PP。</p>
+<p>工程上，机制推导的顺序也给出选型顺序：先问完整训练形态单卡能否放下；不能，再问单节点高速互联内能否通过 TP 或 FSDP 放下；还不能，再问模型是否适合按层切 PP；最后再根据长上下文、吞吐目标和 checkpoint 约束叠加 SP / CP / DP。边界很明确：每增加一个并行维度，rank 拓扑、通信域、日志归因、性能画像、checkpoint shard 数量都会变复杂。平台工程师的任务不是默认选择最复杂的组合，而是找到能满足容量和吞吐目标的最小复杂度组合。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((模型并行与流水并行))
+    不可化简问题
+      单卡容量有限
+      互联带宽有限
+      调度空闲不可忽略
+      checkpoint 必须可恢复
+    先判断能否复制
+      单卡可放下
+        Data Parallelism
+        梯度同步
+      单卡放不下
+        状态冗余
+          ZeRO
+          FSDP
+        单层过大
+          Tensor Parallelism
+          节点内高速互联
+        整网过深
+          Pipeline Parallelism
+          micro-batch
+          pipeline bubble
+    利用率优化
+      1F1B
+      Interleaved Pipeline
+      Zero Bubble
+    长上下文压力
+      非 attention 激活
+        Sequence Parallelism
+      attention 和 KV
+        Context Parallelism
+    工程边界
+      通信域增加
+      拓扑绑定增强
+      checkpoint shard 化
+      排障成本上升</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol><li>当一个模型“单卡放不下”时，如何区分是参数、优化器状态、激活、attention workspace 还是序列长度导致的容量问题？</li><li>为什么 TP 通常优先限制在单节点 NVLink / NVSwitch 内，而 DP 可以更自然地跨节点扩展？</li><li>PP 的 pipeline bubble 从哪里来？为什么 stage 数变多不一定让训练更快？</li><li>ZeRO / FSDP 和 TP / PP 为什么是互补关系，而不是互相替代？</li><li>给定 8、64、512 张 GPU，如何从模型大小、上下文长度、micro-batch 和拓扑推导第一版并行配置？</li><li>SP 和 CP 分别切 sequence 的哪一部分？为什么 128K+ context 不能只靠 ZeRO 解决？</li><li>并行维度叠加后，checkpoint、恢复和故障定位会发生哪些结构性变化？</li></ol>
+</section>
+
+<section class="section" id="s2"><h2>2. 为什么数据并行不够了</h2>
+<p>数据并行默认每张卡都要装下一份完整模型。当模型已经放不进单卡时，就必须改思路：不是复制模型，而是把模型切开。典型触发条件包括参数规模过大、中间激活太大、序列长度太长、单卡显存无法容纳目标训练形态。</p>
+<div class="grid-2">
+<div class="card"><strong>数据并行的假设</strong><br>每个 rank 保存完整参数、梯度、优化器状态和必要激活；扩展方式是复制模型副本并增加样本吞吐。</div>
+<div class="card"><strong>模型并行的触发</strong><br>完整副本已经无法放入单卡或单节点，扩展方式必须转向状态、层、张量或序列维度的切分。</div>
+</div>
+<table><tr><th>压力来源</th><th>症状</th><th>优先考虑</th></tr><tr><td>参数 / 梯度 / 优化器状态</td><td>空 batch 也接近 OOM</td><td>ZeRO / FSDP</td></tr><tr><td>单层 GEMM / attention projection</td><td>某些层峰值特别高</td><td>Tensor Parallelism</td></tr><tr><td>整网层数 / 激活</td><td>单节点仍无法承载完整网络</td><td>Pipeline Parallelism</td></tr><tr><td>超长 context / KV</td><td>sequence 拉长后显存和时间急剧上升</td><td>SP / CP</td></tr></table>
+<div class="warn"><strong>边界提醒：</strong>“能启动”不等于“适合纯 DP”。如果必须靠极小 micro-batch 才能放下，GPU 利用率和全局 batch 约束可能已经要求重新评估并行策略。</div>
+</section>
+
+<section class="section" id="s3"><h2>3. 张量并行：切层内部的计算</h2>
+<p>张量并行的思路是把同一层里的矩阵计算切到多张卡上。例如，一个大矩阵乘法可以按列或按行分片，让多张卡共同完成。它能解决单层参数太大问题，对超大线性层特别有效；代价是通信频繁、对互联带宽和延迟敏感、实现与调试复杂。也就是说，张量并行把一部分“显存问题”换成了“通信问题”。</p>
+<pre class="mermaid">flowchart LR
+  X[输入激活 X] --> A[列切 Linear: W1 shards]
+  A --> G1[AllGather 或局部拼接]
+  G1 --> F[激活函数 / Attention]
+  F --> B[行切 Linear: W2 shards]
+  B --> R[AllReduce / ReduceScatter]
+  R --> Y[输出激活 Y]
+</pre>
+<table><tr><th>切分方式</th><th>常见对象</th><th>通信直觉</th><th>工程要求</th></tr><tr><td>列并行</td><td>MLP 上投影、QKV 投影</td><td>输出分片，后续可能需要 gather</td><td>hidden/head 数可整除 TP size</td></tr><tr><td>行并行</td><td>MLP 下投影、输出投影</td><td>部分和需要 AllReduce</td><td>高带宽、低延迟互联</td></tr><tr><td>Attention head 切分</td><td>多头注意力</td><td>按 head 分摊计算</td><td>head 数可整除，kernel 支持良好</td></tr></table>
+<div class="success"><strong>经验规则：</strong>TP 组大小通常优先选 2、4、8，并尽量限制在同一 NVLink / NVSwitch 域内；跨节点 TP 是高阶优化，不应作为默认起点。</div>
+</section>
+
+<section class="section" id="s4"><h2>4. 流水并行：按层切模型</h2>
+<p>流水并行把模型的不同层段放到不同设备，让不同 micro-batch 像流水线一样流过这些阶段。</p>
+<pre><code>Stage 1 -> Stage 2 -> Stage 3 -> Stage 4</code></pre>
+<p>它的优点是层次切分更符合 Transformer 结构，每张卡只承担部分层；难点是会出现 pipeline bubble，micro-batch 调度更复杂，前后阶段可能负载不均。Embedding、loss head、MoE router 或局部层结构差异，都可能让某个 stage 成为全局 step time 的瓶颈。</p>
+<pre class="mermaid">sequenceDiagram
+  participant S1 as Stage 1
+  participant S2 as Stage 2
+  participant S3 as Stage 3
+  participant S4 as Stage 4
+  S1->>S2: micro-batch 1 forward
+  S1->>S2: micro-batch 2 forward
+  S2->>S3: micro-batch 1 forward
+  S3->>S4: micro-batch 1 forward
+  S4-->>S3: micro-batch 1 backward
+  S3-->>S2: micro-batch 1 backward
+  S2-->>S1: micro-batch 1 backward
+</pre>
+<div class="note"><strong>流水线视角：</strong>PP 不是把一个 batch 一次性塞进所有 stage，而是把 batch 切成多个 micro-batch，让 stage 在时间轴上交错工作。</div>
+</section>
+
+<section class="section" id="s5"><h2>5. 什么是 Pipeline Bubble</h2>
+<p>在流水并行中，前几个 step 里后续 stage 还没工作，结束阶段里前面 stage 又可能空闲，这些空闲区间就是 bubble。一个常见近似理解是：</p>
+<pre><code>pipeline utilization ≈ m / (m + p - 1)</code></pre>
+<p>其中 <code>m</code> 是 micro-batch 数，<code>p</code> 是 pipeline stage 数。这个式子的直觉很重要：micro-batch 太少，bubble 占比高；stage 太多，流水线填满更慢。所以流水并行并不是“切得越细越好”。</p>
+<table><tr><th>stage 数 p</th><th>micro-batch 数 m</th><th>近似利用率</th><th>判断</th></tr><tr><td>4</td><td>16</td><td>84.2%</td><td>通常可接受，仍需看负载均衡</td></tr><tr><td>8</td><td>8</td><td>53.3%</td><td>bubble 很明显，需优化调度或减少 stage</td></tr><tr><td>8</td><td>32</td><td>82.1%</td><td>更容易填满，但显存和 batch 约束更重</td></tr></table>
+<div class="danger"><strong>严重风险：</strong>为了降低 bubble 盲目增加 micro-batch，可能破坏全局 batch、梯度累积、激活显存和收敛假设。流水线调度必须和训练数学约束一起设计。</div>
+</section>
+
+<section class="section" id="s6"><h2>6. 为什么大模型训练通常是混合并行</h2>
+<p>现实中，超大模型训练很少只用一种并行方式，更常见的是组合：数据并行做样本吞吐扩展，张量并行解决单层过大，流水并行解决整体层数过多，参数 / 状态切分进一步降低显存压力。这意味着平台需要处理的不只是某一种策略，而是不同组之间的 rank 组织、不同通信域、不同 checkpoint 方式和不同恢复逻辑。</p>
+<pre class="mermaid">flowchart TB
+  subgraph ReplicaA[逻辑模型副本 A]
+    A1[PP stage 0\nTP ranks 0-7] --> A2[PP stage 1\nTP ranks 8-15] --> A3[PP stage 2\nTP ranks 16-23] --> A4[PP stage 3\nTP ranks 24-31]
+  end
+  subgraph ReplicaB[逻辑模型副本 B]
+    B1[PP stage 0\nTP ranks 32-39] --> B2[PP stage 1\nTP ranks 40-47] --> B3[PP stage 2\nTP ranks 48-55] --> B4[PP stage 3\nTP ranks 56-63]
+  end
+  A1 -. DP gradient sync .- B1
+  A2 -. DP gradient sync .- B2
+  A3 -. DP gradient sync .- B3
+  A4 -. DP gradient sync .- B4
+</pre>
+<div class="warn"><strong>平台关注点：</strong><code>TP x PP x DP = GPU 总数</code> 只是算术成立；真正落地还要把 TP 放进高速互联域，把 PP stage 放在稳定拓扑上，并让 DP 同步路径可预测。</div>
+</section>
+
+<section class="section" id="s7"><h2>7. ZeRO 系列与 FSDP</h2>
+<p>ZeRO 的核心思想不是“换一种模型并行”，而是把训练状态按不同粒度分片，减少每卡持有的冗余状态。</p>
+<table><tr><th>方案</th><th>主要分片什么</th><th>典型收益</th><th>主要代价</th></tr><tr><td>ZeRO Stage 1</td><td>Optimizer state</td><td>先降优化器显存</td><td>实现简单，但参数和梯度仍全量保留</td></tr><tr><td>ZeRO Stage 2</td><td>Optimizer state + Gradients</td><td>进一步降梯度占用</td><td>通信更多，反向路径更复杂</td></tr><tr><td>ZeRO Stage 3</td><td>Optimizer state + Gradients + Parameters</td><td>最大幅度降低单卡状态占用</td><td>通信、checkpoint、恢复都更复杂</td></tr><tr><td>PyTorch FSDP</td><td>常被视作官方 ZeRO-3 风格实现</td><td>PyTorch 原生集成较好</td><td>仍需认真处理 shard、state dict 和恢复流程</td></tr></table>
+<p>工程上最重要的判断是：ZeRO / FSDP 与 TP / PP 是互补关系，不是替代关系。当模型既放不下单卡，又不想把所有层硬切给 TP / PP 时，ZeRO / FSDP 往往是第一补充手段。但一旦进入状态分片，checkpoint 就不能再按“单文件全量模型”思路设计，通常要转向 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章 §10.6</a> 的分布式 checkpoint 方案。</p>
+<div class="note"><strong>状态分片直觉：</strong>ZeRO / FSDP 降低的是每卡“持有多少训练状态”，不自动解决单层计算峰值、pipeline bubble 或超长 context attention 的序列压力。</div>
+</section>
+
+<section class="section" id="s8"><h2>8. Interleaved Pipeline 与 Zero Bubble 简述</h2>
+<p>传统 1F1B 已经能降低部分 bubble，但 stage 负载仍可能不均。进一步优化时，常见两个方向：Interleaved Pipeline 让一个设备承担多个更细的虚拟 stage，降低空闲比例；Zero Bubble 系列思路尽量把前向、反向和权重更新空隙压到更低。</p>
+<table><tr><th>思路</th><th>在解决什么</th><th>工程代价</th></tr><tr><td>Interleaved Pipeline</td><td>让一个设备承担多个更细的 stage，降低空闲比例</td><td>调度更复杂，stage 划分更难</td></tr><tr><td>Zero Bubble 系列思路</td><td>尽量把前向、反向和权重更新空隙压到更低</td><td>依赖更复杂的调度与实现细节</td></tr></table>
+<p>Interleaved Pipeline 可以理解成“把原来每张卡只放一个大 stage，改成每张卡放多个更细的小 stage，再交错执行”。它解决的本质问题是传统 stage 太粗，导致 bubble 比例和负载不均同时存在。Zero Bubble 的目标更激进，它会把 backward 中的输入梯度、权重梯度、权重更新等步骤拆成更细的 micro-op，然后重新编排，让原本会闲着的 stage 去做能够提前执行的工作。</p>
+<pre class="mermaid">flowchart LR
+  A[GPipe: 先全 forward 再 backward] --> B[1F1B: forward/backward 交替]
+  B --> C[Interleaved: 每设备多个虚拟 stage]
+  C --> D[Zero Bubble: 拆分 B/W micro-op 填充空闲槽]
+  D --> E[更高利用率\n更高调度和排障成本]
+</pre>
+<div class="success"><strong>平台判断：</strong>当训练团队开始讨论 Interleaved 或 Zero Bubble，通常说明传统流水线利用率已经成为明确瓶颈；平台侧至少要能观测 bubble、stage time 和 straggler。</div>
+</section>
+
+<section class="section" id="s9"><h2>9. Sequence Parallelism 与 Context Parallelism</h2>
+<p>当上下文长度从 4K、8K 拉到 32K、128K 甚至更长时，只靠 TP / PP / ZeRO 往往还不够，因为激活和 attention 的 KV 开销会随着序列长度迅速放大。</p>
+<table><tr><th>技术</th><th>切分什么</th><th>主要在解决什么</th><th>更依赖什么</th><th>常见通信</th></tr><tr><td>Tensor Parallelism</td><td>隐藏维度 / 权重矩阵</td><td>单层参数或计算过大</td><td>NVLink / NVSwitch</td><td>每层 AllReduce</td></tr><tr><td>Sequence Parallelism</td><td>序列维度中的非 attention 部分</td><td>降低 LayerNorm、Dropout 等激活占用</td><td>通常要配合 TP</td><td>AllGather / ReduceScatter</td></tr><tr><td>Context Parallelism</td><td>attention 的序列维度</td><td>让长上下文 attention / KV 不必全压在单卡</td><td>高速 GPU-GPU 或跨节点互联</td><td>环形 KV 传递 / All-to-All</td></tr></table>
+<p>Megatron-LM 风格的 SP 首先要解决一个容易被忽略的问题：即便已经做了 TP，激活也不一定真的被切小。TP 主要切权重矩阵和隐藏维度上的 GEMM；但 LayerNorm、Dropout、Residual Add 这类按 token 做的操作，很多实现里仍然会在 TP 组内每张卡各自保留完整序列激活。SP 的做法是在 TP 组内部再按 sequence 维度切一刀，每张卡只保留自己那段 token 的非 attention 激活。</p>
+<p>CP 则是另一个层级的问题：当上下文来到 128K、256K 甚至更高时，attention 本身就已经大到不能再把整条序列塞进单卡。它把 context 维度切到多张卡，每张卡只持有一段 token / context block，并通过跨卡通信逐段交换或重排 K/V。Ring Attention 更像“Q 留在本地，K/V 沿环逐跳传递”；Ulysses 一类方案更像先把 token / head 的布局重新分发，再运行 attention kernel。</p>
+<pre class="mermaid">flowchart TD
+  A[长上下文训练压力] --> B[非 attention 激活重复]
+  A --> C[attention / KV / workspace 过大]
+  B --> D[SP: TP 组内切 sequence 激活]
+  D --> E[AllGather / ReduceScatter]
+  C --> F[CP: 切 context block]
+  F --> G[Ring KV 或 All-to-All 重排]
+  E --> H[更低单卡激活峰值\n更复杂通信]
+  G --> H
+</pre>
+<div class="warn"><strong>不要混淆：</strong>SP/CP 是补“序列维度显存”短板，不是替代 DP/TP/PP。没有长序列压力时，盲目开启 CP 可能只是在增加通信成本。</div>
+</section>
+
+<section class="section" id="s10"><h2>10. 并行策略选型决策树</h2>
+<p>下面给一个面向工程落地的简化决策树。输入不是“模型参数量”一个数，而是目标训练形态的完整账本：参数、梯度、optimizer state、master weights、micro-batch、sequence length、activation checkpointing、attention workspace、KV、总 GPU 数、每节点 GPU 数、HBM 容量、互联拓扑、checkpoint 格式和恢复 SLA。</p>
+<pre class="mermaid">flowchart TD
+  A[给定模型、batch、sequence、精度、GPU 拓扑] --> B{单卡能放下完整训练副本?}
+  B -- 是 --> C[优先纯 DP]
+  C --> C1[检查全局 batch、梯度同步、checkpoint 简化]
+  B -- 否 --> D{主要是状态冗余过大?}
+  D -- 是 --> E[ZeRO-3 或 FSDP + DP]
+  E --> E1{单层计算峰值仍过大?}
+  E1 -- 是 --> F[加少量 TP]
+  E1 -- 否 --> G[保持状态分片方案]
+  D -- 否 --> H{单层权重或 GEMM 峰值过大?}
+  H -- 是 --> I[TP 优先放在单节点 NVLink/NVSwitch 内]
+  I --> J{一个 TP 组能承载完整模型?}
+  J -- 是 --> K[TP + DP]
+  J -- 否 --> L[TP + PP + DP]
+  H -- 否 --> M{整网层数/激活导致单节点放不下?}
+  M -- 是 --> N[PP + DP, 必要时叠加 TP]
+  M -- 否 --> O[回到显存账本, 优先调 batch/checkpointing]
+  L --> P{micro-batch 足以填流水线?}
+  N --> P
+  P -- 否 --> Q[降低 PP stage 或使用 Interleaved/Zero Bubble]
+  P -- 是 --> R[验证 stage 负载均衡]
+  G --> S{context >= 128K 或 attention/KV 成为主瓶颈?}
+  K --> S
+  L --> S
+  R --> S
+  S -- 是 --> T[叠加 CP, TP 组内可同时启用 SP]
+  S -- 否 --> U[冻结第一版并行拓扑]
+  T --> V[重新评估序列维度通信和 checkpoint shard]
+  U --> W[压测吞吐、显存峰值、恢复流程]
+  V --> W</pre>
+<table><tr><th>分支</th><th>首选方案</th><th>工程边界</th></tr><tr><td>单卡放得下</td><td>纯 DP</td><td>不要过早引入 TP / PP 的额外通信和调度复杂度</td></tr><tr><td>状态冗余是主因</td><td>ZeRO-3 / FSDP + DP</td><td>checkpoint 变成 shard 化 state dict，恢复链路先设计</td></tr><tr><td>单层太大</td><td>TP 节点内 + DP 跨节点</td><td>TP size 要整除 hidden / head，并尽量不跨慢速网络</td></tr><tr><td>单节点仍放不下</td><td>TP + PP + DP</td><td>确认 micro-batch 足够、层切分均衡、首尾 stage 不拖慢</td></tr><tr><td>超长上下文</td><td>在原组合上叠加 SP / CP</td><td>需要专门 attention 实现和序列维度通信预算</td></tr></table>
+<div class="note"><strong>参考数量级：</strong>TP 组大小常见 2-8 卡，PP stage 常见 2-8 段，DP 组大小取决于吞吐和全局 batch，CP 组大小常从 2-4 起步并用于 128K+ context。</div>
+</section>
+
+<section class="section" id="s11"><h2>11. 典型配置实例表</h2>
+<p>下面的组合不是唯一答案，但它们能帮助把决策树落到真实规模上。</p>
+<table><tr><th>模型 / 场景</th><th>集群</th><th>TP</th><th>PP</th><th>DP</th><th>ZeRO / FSDP</th><th>SP / CP</th><th>第一版配置理由</th><th>工程边界</th></tr><tr><td>7B baseline pretrain / SFT</td><td>8 x H100 单节点</td><td>1</td><td>1</td><td>8</td><td>可选 FSDP</td><td>-</td><td>7B BF16 参数约 14GB，单卡通常能通过 BF16、activation checkpointing、合理 micro-batch 放下。</td><td>若 optimizer state + 激活仍吃紧，先试 FSDP / ZeRO-2/3，不要过早引入 TP / PP。</td></tr><tr><td>13B-34B 单节点多卡</td><td>8 x H100 或 A100 80G</td><td>2-4</td><td>1</td><td>2-4</td><td>可选</td><td>SP 可选</td><td>单层和激活开始变重，但通常仍希望把 TP 限在节点内。</td><td>TP 需要 hidden size、attention head 数能被整除；小 batch 下通信可能吃掉收益。</td></tr><tr><td>70B 常规上下文训练</td><td>64 x H100</td><td>8</td><td>4</td><td>2</td><td>可选 ZeRO-1/2</td><td>SP 可选</td><td>TP=8 放在单节点高速互联内，PP=4 分摊层段，DP=2 形成两个逻辑副本。</td><td><code>TP x PP x DP = 64</code> 必须严格匹配 rank 编排；PP stage 不均会拖慢全局 step。</td></tr><tr><td>70B + 128K context</td><td>128 x H100</td><td>8</td><td>2</td><td>4</td><td>可选</td><td>SP + CP=2</td><td>128K attention / KV / workspace 会把单卡显存顶满，需要序列维度切分。</td><td>CP 需要专门 attention 实现和高速互联；失败时常表现为吞吐骤降。</td></tr><tr><td>405B dense 模型</td><td>512 x H100</td><td>8</td><td>8</td><td>8</td><td>可选 ZeRO-1/2</td><td>SP 可选</td><td>进入必须 3D 并行的量级：TP 切层内，PP 切层段，DP 保留吞吐。</td><td>调参重点变成 MFU、bubble、straggler、checkpoint 时间和拓扑感知 placement。</td></tr><tr><td>MoE 模型</td><td>128-512 x H100</td><td>EP/TP 混合</td><td>2-8</td><td>4-16</td><td>常用</td><td>视 context 而定</td><td>MoE 会引入 Expert Parallelism，每 token 只激活少数专家。</td><td>需额外处理 token dispatch、load balance、all-to-all 热点。</td></tr></table>
+<div class="success"><strong>配置表的读法：</strong><code>TP / PP / DP / CP</code> 是乘法或组关系，<code>ZeRO / FSDP</code> 更像叠加的状态分片层；同一个模型会因精度、activation checkpointing、micro-batch、大词表和 MoE 改变配置。</div>
+</section>
+
+<section class="section" id="s12"><h2>12. 如何把决策树落地成第一版方案</h2>
+<p>如果不想一开始就精确求最优解，可以按下面的顺序落地：</p>
+<ol><li>先判断单卡能不能放下完整训练副本；能放下就从纯 DP 起步。</li><li>放不下时，优先看单节点 NVLink / NVSwitch 内能否通过 TP 装下。</li><li>单节点还不够，再决定是走 <code>TP + PP + DP</code>，还是走 <code>ZeRO-3 / FSDP + DP</code>。</li><li>如果 context 已经到 128K+，把 CP 当成额外维度，而不是最后临时补救。</li></ol>
+<p>真实选择还要继续检查设备互联、软件栈支持、团队调试能力、checkpoint 与恢复复杂度。TP 和 CP 都高度依赖拓扑；Megatron-LM、DeepSpeed、FSDP 的能力边界不同；越复杂的混合并行越依赖经验；并行维度一多，恢复链路会一起变复杂。</p>
+<pre class="mermaid">flowchart LR
+  A[显存账本] --> B[拓扑账本]
+  B --> C[并行拓扑]
+  C --> D[小规模验证]
+  D --> E[吞吐 / MFU / bubble 压测]
+  E --> F[checkpoint 保存与恢复演练]
+  F --> G[放大到目标规模]
+</pre>
+</section>
+
+<section class="section" id="s13"><h2>13. 框架对照表</h2>
+<table><tr><th>框架</th><th>主要定位</th><th>更适合什么场景</th></tr><tr><td>DeepSpeed</td><td>ZeRO 全系列、训练工程化能力强</td><td>大规模分片训练、复杂优化器状态管理</td></tr><tr><td>PyTorch FSDP</td><td>官方原生 ZeRO-3 风格实现</td><td>希望尽量留在 PyTorch 主生态</td></tr><tr><td>Megatron-LM</td><td>TP + PP + 混合并行成熟</td><td>超大 Transformer 训练</td></tr><tr><td>ColossalAI</td><td>并行策略较丰富</td><td>想在多种并行手段间做组合试验</td></tr><tr><td>DeepSpeed Ulysses / Ring Attention 实现</td><td>更关注 Context Parallelism</td><td>长上下文训练</td></tr></table>
+<div class="warn"><strong>框架不是免检项：</strong>选了框架以后仍要验证 rank mapping、collective 域、checkpoint 格式、恢复流程和性能观测字段是否满足平台要求。</div>
+</section>
+
+<section class="section" id="s14"><h2>14. 工程建议与常见工具</h2>
+<ul><li>先用单机和小规模配置验证切分逻辑，再放大规模。</li><li>任何并行策略都要同时考虑训练路径和 checkpoint / 恢复路径。</li><li>当 TP / PP 已经很重时，再叠加 ZeRO / FSDP 前要先确认通信预算。</li><li>决策时不要只问“能不能跑”，要问“出故障后能不能恢复”。</li></ul>
+<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr><tr><td>ZeRO 分片训练</td><td>DeepSpeed</td><td>ZeRO Stage 1/2/3 是最常见入口</td></tr><tr><td>原生状态分片</td><td>PyTorch FSDP</td><td>更贴近官方生态，便于与 PyTorch 配套</td></tr><tr><td>TP / PP 训练</td><td>Megatron-LM</td><td>大模型并行训练的常用参考实现</td></tr><tr><td>Sequence / Context Parallelism</td><td>Megatron-LM、DeepSpeed Ulysses</td><td>适合长上下文训练和激活降压</td></tr><tr><td>并行组合实验</td><td>ColossalAI</td><td>适合快速试不同并行编排</td></tr></table>
+<div class="note"><strong>观测建议：</strong>至少同时记录 step time、各 collective 时间、stage time、bubble、MFU、显存峰值、checkpoint 保存时间和恢复结果，否则很难解释并行策略是否真的有效。</div>
+</section>
+
+<section class="section" id="s15"><h2>15. 常见误区、小结与练习</h2>
+<h3>常见误区</h3>
+<div class="grid-2">
+<div class="card"><strong>模型并行只是“分到多张卡”</strong><br>不对。它重塑了通信模式、同步点和故障处理逻辑。</div>
+<div class="card"><strong>流水线切得越细越高效</strong><br>不对。切得太细会增加 bubble 和调度复杂度。</div>
+<div class="card"><strong>张量并行只要显存够就行</strong><br>不对。它对互联和通信延迟极其敏感。</div>
+<div class="card"><strong>上了 ZeRO / FSDP 就不需要模型并行</strong><br>不对。状态分片无法替代所有层级切分需求。</div>
+</div>
+<h3>本章小结</h3>
+<table><tr><th>并行方式</th><th>解决的问题</th><th>主要代价</th></tr><tr><td>张量并行</td><td>单层参数或计算过大</td><td>高频通信</td></tr><tr><td>流水并行</td><td>整体模型太深、单卡放不下</td><td>bubble 与调度复杂度</td></tr><tr><td>ZeRO / FSDP</td><td>冗余状态过重</td><td>通信、checkpoint 与恢复更复杂</td></tr><tr><td>Sequence / Context Parallelism</td><td>长上下文激活或 KV 过大</td><td>序列维度通信更重</td></tr><tr><td>混合并行</td><td>同时解决吞吐与显存问题</td><td>系统复杂度最高</td></tr></table>
+<h3>练习题</h3>
+<ol><li>为什么数据并行无法解决“模型放不下单卡”的问题？</li><li>请解释张量并行和流水并行分别在“切什么”。</li><li>ZeRO Stage 1/2/3 的区别是什么？为什么它和 TP / PP 是互补关系？</li><li>如果模型已经用了 TP 和 PP，checkpoint 设计为什么还要跟着调整？</li><li>为什么 128K+ 上下文训练通常要开始讨论 Context Parallelism？</li></ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part3/08-data-parallel.html">第 8 章</a> 的 DP / collective / 通信停顿，再理解本章的 TP、PP、ZeRO/FSDP、SP/CP，最后进入 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 看 checkpoint、恢复和状态切分如何随并行拓扑变化。</div>
+<div class="card"><strong>延伸阅读</strong><br>Megatron-LM 的 tensor/pipeline/sequence parallel 设计、DeepSpeed ZeRO 与 Ulysses、PyTorch FSDP 文档、Ring Attention / long-context training 相关论文，以及 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的互联与 IO 基础。</div>
+</div>
+<p class="mini">实践时优先把“显存账本、通信账本、拓扑账本、checkpoint 账本”写成同一份设计文档。并行策略不是模型参数，而是平台契约。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程 · 第 9 章</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
