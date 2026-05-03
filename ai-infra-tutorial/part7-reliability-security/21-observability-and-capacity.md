@@ -4,19 +4,58 @@
 
 > **关联章节**：本章提供灰度、回滚和事故响应所依赖的证据面。如果没有这些信号，[第22章](./22-evaluation-release-and-incident.md) 的发布门禁和事故决策就会失去依据。
 
-## 学习目标
+## 1. 第一性原理拆解 + 学习大纲
 
-完成本章学习后，你将能够：
+### 拆 — 不可化简的问题
 
-1. 区分 metrics、logs、traces 在 AI 系统中的不同职责
-2. 设计覆盖资源、任务、模型质量和业务目标的观测体系
-3. 用容量模型把流量、SLA、模型大小和 GPU 数量联系起来
-4. 理解为什么“监控很多”不等于“定位很快”
-5. 识别 AI 系统中最常见的容量规划误区
+把 Prometheus、Grafana、OpenTelemetry、Jaeger、DCGM、SLO 这些工具名拿掉，本章的不可化简问题只有一个：AI 系统把昂贵资源、随机负载和不完全可预测的模型行为压缩成用户看到的一次响应，工程师必须在响应变坏之前知道哪里偏离、为什么偏离、会烧掉多少可靠性和成本余量。训练会被一个慢 worker 拖住整组 GPU，推理会被少量超长 prompt 撑满 KV Cache，RAG 会因为检索抖动让 LLM 看起来“变慢”，灰度会因为质量退化但延迟正常而误判成功。它们的共同点不是“缺监控面板”，而是系统内部状态不能被单个指标直接观察。
 
----
+可观测性不是把所有事件全量存下来。全量存储会撞上三个硬边界：tokens/s、requests/s、训练 step 事件和 GPU 指标形成吞吐压力；tenant、model_version、adapter_id、trace_id、job_id 等维度组合制造 cardinality 爆炸；日志、trace、指标的存储和查询本身也会消耗预算。容量规划也不是简单问“需要几张 GPU”，而是把流量分布、token 长度、SLO、错误预算、发布窗口、故障冗余和成本归因放进同一张账本。看不见的系统会变成靠运气维护的系统；看得见但不能解释成本和风险的系统，也不算真正可观测。
 
-## 正文内容
+### 推 — 从这个问题如何推导出每个机制
+
+如果系统状态不能直接观察，第一步必然是选择信号。Metrics 用低成本聚合回答“趋势是否异常”，Logs 用结构化字段回答“这次请求发生了什么”，Traces 用跨服务上下文回答“时间花在链路哪一段”。三类信号要靠 request_id、trace_id、tenant_id、model_version、job_id 关联，否则只有 GPU utilization，看不出 queue wait；只有错误日志，看不出 SLO burn；只有 trace，看不出容量趋势。
+
+信号一旦被采集，就会推导出采样和 cardinality 治理。全量 trace 最有解释力，但成本不可控；head-based sampling 成本稳定，却可能错过慢请求；tail-based sampling 能保留错误和尾延迟，却要求 Collector 缓冲完整链路。维度越细，定位越快，但把 user_id、prompt_hash、trace_id 放进 metrics label 会让时间序列按请求级爆炸。因此必须提前定义哪些字段允许做 metrics label，哪些只能进入日志或 trace attribute，哪些必须 hash、截断或脱敏。
+
+当信号可以解释当前状态后，下一步是把状态变成决策边界。SLI/SLO 把“好请求”的定义写清楚，错误预算把可靠性余量量化，burn-down 暴露预算消耗速度。AI 服务还必须同时看质量和成本：99.99% 可用、P95 达标，但 grounded rate 下降或 cost_per_1k_tokens 翻倍，业务仍然失败。容量规划把边界反推成资源需求；成本归因把总账拆回 tenant、model、region、endpoint、job。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((可观测性与容量规划))
+    不可见状态
+      Metrics
+        趋势与告警
+      Logs
+        单次失败
+      Traces
+        尾延迟归因
+    数据规模边界
+      HeadSampling
+      TailSampling
+      Cardinality治理
+    决策边界
+      SLI和SLO
+      错误预算
+      容量规划
+    经济边界
+      成本归因
+      优化动作
+```
+
+### 导 — 读完本章你应该能回答
+
+1. P99 延迟升高且 GPU utilization 很高时，如何区分“模型计算慢”“队列排队长”和“上游链路慢”？
+2. 为什么 metrics label 不能随意加入 `user_id`、`prompt_hash`、`trace_id`？
+3. head-based sampling 和 tail-based sampling 分别会错过什么证据？
+4. 一个 AI 服务的 SLO 为什么不能只有 availability 和 latency，还要包含质量与成本指标？
+5. 错误预算 burn-down 如何影响发布、扩容、回滚和限流决策？
+6. 如何用 QPS、平均 token、单 GPU tokens/s 和目标利用率做第一版 GPU 容量估算？
+7. 成本归因为什么必须绑定 tenant、model_version、endpoint、region 等维度？
+
+## 2. 正文内容
 
 ### 21.1 可观测性不只是监控面板
 
@@ -77,15 +116,33 @@
 
 #### 21.2.4 日志与 Trace 采样策略
 
-为什么这件事要提前设计？因为 AI 链路常常又长、又贵、又高基数。全量留痕当然最理想，但在高吞吐线上系统里通常不可持续。
+AI 链路常常又长、又贵、又高基数。一次 RAG 请求可能经过 gateway、auth、embedding、vector search、rerank、LLM prefill、decode、安全过滤和计费。全量留痕最理想，但在高吞吐线上系统里通常不可持续。
 
-| 策略 | 更适合什么场景 | 代价 / 风险 |
-|------|----------------|-------------|
-| Head-based sampling | 请求刚进入系统时就决定是否采样；实现简单、成本稳定 | 容易错过真正慢的尾请求 |
-| Tail-based sampling | 先看完整链路结果，再保留慢请求或错误请求 | 成本更高，需要更强的 Collector / 存储能力 |
-| 日志分级 | 把 `INFO / WARN / ERROR` 与租户、模型版本结合 | 如果字段设计差，后续仍然难关联 |
+| 策略 | 决策时机 | 适合场景 | 代价 / 风险 |
+|------|------------|----------|-------------|
+| Head-based sampling | 请求入口处决定 | 高吞吐稳定路径、成本敏感服务 | 成本可预测，但可能漏掉慢请求和偶发错误 |
+| Tail-based sampling | 链路结束或超时后决定 | 错误请求、P99 慢请求、关键发布窗口 | 诊断价值高，但 Collector 内存、CPU 和网络成本更高 |
+| Adaptive sampling | 按租户、endpoint、错误率动态调整 | 流量峰谷明显或多租户平台 | 规则复杂，统计口径会变化 |
+| Log sampling / 分级 | 按事件级别和字段保留 | 高频 INFO、低频 WARN/ERROR、审计日志 | 缺少 `trace_id` 时仍难关联 |
 
-平台实践里更常见的是：平时用较低比例 head-based sampling 控成本，事故窗口或高风险租户临时切高采样，并保留结构化错误日志。
+平台实践里更常见的是：入口默认 1%-5% head-based trace；`5xx`、超时、P99 以上请求和新模型灰度流量进入 tail-based 保留；审计、安全、计费日志不采样但做字段裁剪。
+
+**工程边界**：采样不能作为财务、审计和安全证据的唯一来源；采样 trace 不能直接计算真实错误率或延迟分位数，真实 SLI 应来自请求计数器和 latency histogram。tail-based Collector 必须有内存、队列和降级上限。
+
+#### 21.2.5 Cardinality 治理：维度不是越细越好
+
+Cardinality 指标签或字段可能出现多少不同取值。常见错误是把“定位时有用的字段”全部放进 metrics label。Metrics 通常按标签组合生成时间序列，序列数近似等于各维度取值数量的乘积。
+
+| 指标设计 | 维度取值示例 | 风险 |
+|----------|--------------|------|
+| `llm_request_latency{tenant,model,endpoint}` | 200 × 20 × 30 = 120,000 序列 | 需要容量评估 |
+| 再加入 `status_code,region` | × 6 × 5 = 3,600,000 序列 | 存储和查询压力明显上升 |
+| 再加入 `user_id` | × 1,000,000 users | 请求级爆炸 |
+| 再加入 `trace_id` | 每请求近似唯一 | metrics 退化成昂贵日志系统 |
+
+治理原则是分层：低基数字段放在 metrics label，如 `tenant_tier`、`model_family`、`endpoint`、`region`、`status_class`；中高基数字段放在 logs/traces attribute，如 `tenant_id`、`model_version`、`adapter_id`、`job_id`；请求唯一字段如 `request_id`、`trace_id` 只用于关联。
+
+**工程边界**：告警和容量面板应基于低基数、稳定口径的指标；事故排查再通过 exemplars、trace_id 和日志下钻。新增 metrics label 应评审取值数、增长和保留周期。
 
 ### 21.3 AI 系统应该看哪些指标
 
@@ -160,6 +217,22 @@ slo:
 - 还有质量与成本目标
 
 如果只有系统 SLO 没有质量 SLO，平台很容易把“快速返回错误答案”误当成成功。
+
+### 21.4.1 错误预算 burn-down
+
+SLO 的价值不在于写出 “99.9%”，而在于把可靠性余量变成可执行规则。30 天 availability SLO 为 99.9% 时，错误预算是 0.1%，约 43.2 分钟不可用时间。如果 6 小时内因新模型版本不可用 12 分钟，就烧掉 27.8% 月预算。
+
+| 信号 | 含义 | 典型动作 |
+|------|------|----------|
+| 30 天预算剩余 < 25% | 本月余量不足 | 冻结非必要发布 |
+| 6 小时 burn rate > 2x | 预算消耗过快 | 降低灰度比例 |
+| 1 小时 burn rate > 10x | 快速事故 | 回滚、限流或降级 |
+| 质量 SLO burn-down | grounded rate 等下降 | 暂停模型/Prompt 发布 |
+| 成本 SLO burn-down | cost_per_1k_tokens 超预算 | 收紧上下文、启用缓存或配额 |
+
+AI 服务还要把预算扩展到质量与成本：灰度可能没有 `5xx`，但 grounded rate 从 0.92 降到 0.84；agent 发布可能成功率不变，但工具调用次数翻倍。
+
+**工程边界**：错误预算不能替代事故判断。低流量服务需要最小样本数门槛；质量 SLO 依赖采样评测；成本 burn-down 受账单延迟影响。预算规则要和 [第22章](./22-evaluation-release-and-incident.md) 的灰度、回滚和事故流程绑定。
 
 ### 21.5 容量规划：把流量和资源联系起来
 
@@ -237,6 +310,22 @@ P95 / P99 很快就会失控。
 8. 关键质量指标
 
 如果这 8 类数据能按 tenant、model_version、region 维度切开，诊断效率会高很多。
+
+### 21.8 成本归因：把平台总账拆回工程动作
+
+容量规划最后必须落到成本归因，否则团队只知道“GPU 很贵”，不知道该优化谁、限制谁、迁移谁。AI 平台成本至少应拆成 GPU 计算、CPU/内存控制面、网络、存储与对象请求、观测数据自身成本。推理服务还应按 prompt tokens、output tokens、KV cache、batch 等待、空闲副本拆分。
+
+| 归因维度 | 适合回答的问题 | 注意事项 |
+|----------|----------------|----------|
+| `tenant_id` / `team` | 哪个团队消耗最多预算 | 避免进入高频 metrics label |
+| `model_family` / `model_version` | 哪个模型版本成本异常 | 高基数版本放离线明细 |
+| `endpoint` / `workflow` | 哪条业务链路最贵 | RAG、agent、chat 分开看 |
+| `region` / `cluster` | 是否受地域和碎片影响 | 结合 GPU 型号和折扣 |
+| `request_shape` | 长 prompt、长输出是否失控 | 用 bucket，不用原始输入 |
+
+成本指标可以从 `gpu_seconds * gpu_price_per_second`、`prompt_tokens * input_price + output_tokens * output_price` 推导出 `cost_per_1k_tokens` 和 `idle_gpu_cost`。成本归因要连接工程动作：某 tenant 的长上下文请求占 60% 成本，就设置 context bucket 配额；某模型版本 cost_per_1k_tokens 上升 35%，就检查 speculative decoding、prefix cache、batch 参数和输出长度。
+
+**工程边界**：在线成本通常是估算，不等于云账单或财务结算；归因维度必须和 cardinality 治理一致，高基数字段进入离线明细或账单流水，不进入 Prometheus 热路径；共享成本需要明确分摊规则。
 
 ## 本章涉及的常见工具
 
