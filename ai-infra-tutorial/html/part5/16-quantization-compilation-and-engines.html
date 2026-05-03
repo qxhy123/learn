@@ -1,0 +1,1648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 16 章 · 量化、编译与推理引擎 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=16" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 16 章 · 量化、编译与推理引擎</h1>
+<p class="sub">从“一个训练好的函数如何在有限显存、有限带宽、有限算力和可控质量风险下反复服务线上请求”出发，建立模型表示、执行计划和运行时组织之间的因果链。</p>
+<div class="chips"><span class="chip">Quantization</span><span class="chip">Compilation</span><span class="chip">Inference Engine</span><span class="chip">KV Cache</span><span class="chip">Shape Contract</span><span class="chip">vLLM / TensorRT-LLM</span></div>
+<div class="note"><strong>不可化简的问题：</strong>推理优化不是“把模型变快”这个单点目标，而是在显存、带宽、算力、延迟预算和质量风险之间找到可发布、可观测、可回滚的系统解。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解</a></li>
+<li><a class="anchor" href="#s2">本章导读</a></li>
+<li><a class="anchor" href="#s3">正文内容</a></li>
+<li><a class="anchor" href="#s4">本章小结</a></li>
+<li><a class="anchor" href="#s5">练习题</a></li>
+<li><a class="anchor" href="#s6">系统视角闭环</a></li>
+</ol></section>
+
+<div class="note">本章的量化和引擎选择，与 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的 KV Cache 显存压力密切相关；引擎最终要通过 <a href="../part5/14-online-inference-architecture.html">第 14 章</a> 的路由和副本架构落地；量化带来的质量风险又会进入 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的发布和回滚流程。</div>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：量化、编译与推理引擎</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>推理优化的不可化简问题不是"怎样把模型变快"，而是：一个已经训练好的函数，要在有限显存、有限带宽、有限算力、有限延迟预算和可控质量风险下，被反复执行成线上服务。训练阶段可以用更长时间换更好参数，推理阶段却不同：每个请求都带着
+SLA、成本和排队压力进入系统。用户感受到的是 TTFT、ITL、P95/P99
+延迟和回答质量；平台看到的是 GPU HBM 是否被权重和 KV Cache 塞满，Tensor
+Core 是否有足够饱和度，调度器是否能把不同长度请求拼成有效
+batch，发布系统是否能在质量回退时快速回滚。</p>
+<p>剥离所有工具名之后，本章只处理三类物理约束。第一，数字表示有成本。7B
+模型用 BF16 权重大约 14GB，70B 大约 140GB；如果再叠加长上下文 KV
+Cache，显存容量会比算力更早成为瓶颈。第二，同一个数学图有很多执行方式。Transformer
+里的 LayerNorm、GEMM、Attention、RoPE 和采样可以被通用框架逐个 kernel
+执行，也可以被编译器重排、融合、专门化，差异体现在 HBM 往返次数、kernel
+launch 次数和 shape 假设上。第三，线上请求不是离线 batch。真实流量有长短
+prompt、不同输出长度、prefix 复用、多租户隔离和扩缩容，运行时必须管理
+batch、KV Cache、队列和副本。</p>
+<p>因此，量化、编译、推理引擎不是三组互不相干的技巧，而是一条从"模型如何被表示"到"执行计划如何生成"再到"请求如何被运行时组织"的链路。很多团队第一次做推理优化会陷入单点最优：听说
+INT4 省显存就直接量化，听说 TensorRT-LLM 快就换引擎，听说
+<code>torch.compile</code>
+能加速就打开。单点做法容易翻车，是因为它没有回答更底层的问题：瓶颈到底是权重带宽、KV
+容量、prefill 算力、调度空洞，还是发布链无法承受新制品的复杂度。</p>
+<h3 id="推--从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从"数字表示有成本"出发，首先会推导出量化。权重从 BF16 压到 INT8 或
+INT4，可以减少权重显存与 HBM 读取；KV Cache 从 BF16 压到
+FP8/INT8/INT4，可以让长上下文服务容纳更高并发；激活量化则试图降低中间张量和算子输入输出的带宽压力。但低精度不是免费压缩，scale、zero
+point、per-channel、outlier 和校准集分布都会影响误差。于是
+PTQ、QAT、GPTQ、AWQ、SmoothQuant
+等方法出现，本质是在不同成本下回答同一个问题：低精度表示怎样尽量保留高精度函数的行为。</p>
+<p>从"同一个数学图有很多执行方式"出发，会推导出编译与图优化。通用 eager
+执行足够灵活，但每个算子单独启动 kernel，很多中间结果必须写回
+HBM。编译器会做算子融合、常量折叠、内存布局选择、kernel autotune 和静态
+shape 专门化，让硬件少搬数据、多做有效计算。代价是执行计划带有前提：GPU
+型号、CUDA/TensorRT 版本、batch 范围、sequence length
+范围、输入模态规格。超出这些前提，轻则重新编译或回退慢路径，重则直接失败。因此编译产物不是普通模型文件，而是带
+shape contract 的制品。</p>
+<p>从"线上请求不是离线 batch"出发，会推导出推理引擎。训练框架能跑
+forward，不等于能稳定服务高并发 LLM。在线系统需要 continuous
+batching、PagedAttention、prefix cache、chunked prefill、speculative
+decoding、张量并行、指标导出、OpenAI-compatible
+API、灰度和回滚语义。vLLM、TensorRT-LLM、SGLang、TGI、ONNX
+Runtime、llama.cpp 和 Triton Inference Server 的差异，不只是"谁
+benchmark 快"，而是它们选择了不同的运行时假设：动态调度还是静态
+engine，通用模型迭代还是固定 NVIDIA 集群极致压榨，标准文本生成还是复杂
+agent / tool-use 编排。</p>
+<p>把这三层合在一起，本章的学习目标就变成一个工程推理题：先定位瓶颈，再选择量化对象和精度；再确认硬件和引擎是否有真实
+kernel 支持；再决定是否引入编译产物以及如何治理 shape
+contract；最后用真实流量分布验证
+TTFT、ITL、goodput、显存、质量回退和运维复杂度。优化链路任何一段断开，局部收益都可能变成系统风险。</p>
+<h3 id="绘--因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((量化 编译 推理引擎))
+    不可化简的问题
+      有限显存
+        权重占用
+        KV Cache 占用
+      有限带宽
+        Decode 读权重
+        Attention 读写 KV
+      有限算力
+        Prefill GEMM
+        Attention kernel
+      线上请求波动
+        长短输入混合
+        多租户并发
+    表示层 Representation
+      权重量化
+        INT8
+        INT4
+        GPTQ
+        AWQ
+      激活量化
+        SmoothQuant
+        W8A8
+      KV Cache 量化
+        FP8
+        INT8
+        INT4
+      校准
+        代表性样本
+        scale zero point
+        outlier
+    编译层 Compilation
+      算子融合
+      Kernel 选择
+      静态 shape
+      硬件特定 plan
+      shape contract
+    运行时 Runtime
+      Continuous batching
+      PagedAttention
+      Prefix cache
+      Chunked prefill
+      副本和路由
+    工程输出
+      TTFT ITL P95
+      Goodput
+      单位 token 成本
+      质量回退
+      发布回滚</pre>
+<h3 id="导--读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>一个服务的瓶颈是权重带宽、KV Cache 容量、prefill
+算力还是调度空洞时，量化收益分别会怎样变化？</li>
+<li>为什么 BF16、FP8、INT8、INT4
+不是简单的"越低越好"，而是质量、硬件、kernel
+和校准数据共同决定的阶梯？</li>
+<li>为什么 PTQ 必须做校准，且校准集和评测集不能混用？</li>
+<li>一个 TensorRT-LLM engine、AOT compile artifact 或专用 kernel plan
+需要记录哪些 shape contract 元数据？</li>
+<li>vLLM、TensorRT-LLM 和 SGLang
+的核心运行时假设分别是什么，为什么它们适合的组织和流量不同？</li>
+<li>当 benchmark 显示某引擎快 2x
+时，你要补哪些实验才能判断它是否真的能降低生产单位 token 成本？</li>
+<li>量化、编译和引擎迁移分别会给发布、观测、排障和回滚带来哪些新边界？</li>
+</ol>
+<hr />
+</section>
+<section class="section" id="s2">
+<h2>2. 2. 本章导读</h2>
+<div class="warn"><strong>边界提醒：</strong>本章所有性能判断都必须回到真实流量分布；只看单请求、单 batch 或单 benchmark，无法判断生产单位 token 成本。</div>
+<p>很多团队第一次做推理优化时，会陷入"单点最优"的陷阱：</p>
+<ul>
+<li>"听说 INT4 量化能降一半显存，我们上"</li>
+<li>"听说 TensorRT-LLM 快 2x，换引擎"</li>
+<li>"听说 torch.compile 能加速 30%，开着"</li>
+</ul>
+<p>这些想法都不错，但单独拿出来做决策往往会翻车。真正决定推理服务成败的，是模型表示层、编译
+/
+优化层、运行时层能不能配合：量化要说明对象、方法、校准数据和硬件支持；编译要说明
+shape contract、kernel 路径和回退方式；引擎要说明批处理、KV
+Cache、发布、观测与回滚语义。</p>
+<p>本章的判断框架是：</p>
+<ul>
+<li><strong>量化不只是"开关"</strong>，它有对象（权重/激活/KV）、方法（PTQ/QAT/GPTQ/AWQ/...）、硬件支持要求</li>
+<li><strong>编译不是"一次搞定"</strong>，它产出的是带前提假设的制品，shape
+超出假设就会退化</li>
+<li><strong>引擎选型不只是
+benchmark</strong>，它还决定了你平台的发布、回滚、排障方式</li>
+</ul>
+</section>
+<section class="section" id="s3">
+<h2>3. 3. 正文内容</h2>
+<div class="note"><strong>主线判断：</strong>量化改变模型的数值表示，编译改变执行计划，引擎改变请求组织方式。三者必须一起进入发布、观测和回滚链路。</div>
+<h3 id="161-推理优化到底在优化什么">16.1 推理优化到底在优化什么</h3>
+<p>线上推理系统的目标通常不是单一的"更快"，而是同时优化：</p>
+<ul>
+<li>更低延迟</li>
+<li>更高吞吐</li>
+<li>更低显存占用</li>
+<li>更低单位请求成本</li>
+<li>更稳定的可运维性</li>
+</ul>
+<p>这意味着量化、编译和引擎选择都应该被放进同一个框架里看，而不是孤立比较
+benchmark。</p>
+<h4 id="1611-四种快并不是一回事">16.1.1 四种"快"并不是一回事</h4>
+<p>一个容易被混淆的事实：<strong>推理优化的"加速"可能来自完全不同的机制，它们不会简单叠加</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>"快"的类型</th>
+<th>机制</th>
+<th>典型收益</th>
+<th>谁适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权重加载快</td>
+<td>mmap、量化减小文件</td>
+<td>冷启动 -50%</td>
+<td>频繁扩缩容场景</td>
+</tr>
+<tr>
+<td>单 kernel 快</td>
+<td>FlashAttention、fused GEMM、低精度</td>
+<td>单步 forward -20%~50%</td>
+<td>所有场景</td>
+</tr>
+<tr>
+<td>单请求 decode 快</td>
+<td>speculative decoding、小模型草稿</td>
+<td>TPOT -30%~60%</td>
+<td>低并发、长输出</td>
+</tr>
+<tr>
+<td>吞吐快</td>
+<td>continuous batching、PagedAttention、prefix cache</td>
+<td>QPS 10-24x</td>
+<td>高并发服务</td>
+</tr>
+</tbody>
+</table>
+<p>"我把 kernel 提速 30%，为什么 QPS 没涨？"—— 因为 GPU 本来不是被
+kernel 拖住的，而是被调度器 / KV
+管理拖住的。优化前先问：<strong>瓶颈在哪一层？</strong>
+否则多半会花时间在不是瓶颈的地方。</p>
+<h3 id="162-量化在解决什么">16.2 量化在解决什么</h3>
+<p>量化的核心是把高精度浮点表示压缩到低精度表示。
+一个常见的简化表达是：</p>
+<p><span class="math display">$$
+x_q = \text{round}\left(\frac{x}{s}\right) + z
+$$</span></p>
+<p>其中：</p>
+<ul>
+<li><code>s</code> 是 scale</li>
+<li><code>z</code> 是 zero point</li>
+</ul>
+<p>量化的工程收益通常包括：</p>
+<ul>
+<li>更低的显存占用</li>
+<li>更小的带宽压力</li>
+<li>更高的吞吐</li>
+</ul>
+<p>但代价也很现实：</p>
+<ul>
+<li>精度可能退化</li>
+<li>校准过程复杂</li>
+<li>某些模型结构更难量化</li>
+<li>不同硬件对不同量化方案支持不一样</li>
+</ul>
+<p>所以量化不只是"开一个开关"，而是模型、硬件和引擎三者共同决定的结果。</p>
+<h4 id="1621-量化对不同瓶颈的收益是不一样的">16.2.1
+量化对不同瓶颈的收益是不一样的</h4>
+<p>一个经常被忽略的细节：<strong>权重量化是否提速，取决于服务本来是不是
+memory-bound 的</strong>。</p>
+<ul>
+<li><strong>Memory-bound（decode 为主）</strong>：把 fp16 权重换成
+int4，显存带宽占用减半，decode 速度几乎翻倍</li>
+<li><strong>Compute-bound（prefill
+长上下文为主）</strong>：权重量化帮助不大，因为瓶颈是算力不是访存</li>
+<li><strong>Memory-capacity-bound（放不下）</strong>：量化直接把模型塞进更便宜的卡</li>
+</ul>
+<p>所以"量化能加速多少"没有统一答案。一个 7B 模型服务在 A100 上跑单请求
+decode（memory-bound），int4 常常能快 1.8-2x；同一个模型在高并发
+prefill（compute-bound）下，int4 可能只快
+10%，甚至因为反量化开销而略慢。</p>
+<h3 id="163-常见量化方案对照">16.3 常见量化方案对照</h3>
+<p>从平台视角看，量化方案至少要同时回答四个问题：何时量化、量化到什么精度、需要什么校准数据、目标引擎是否支持。</p>
+<table>
+<thead>
+<tr>
+<th>方案 / 档位</th>
+<th>核心特点</th>
+<th>代表方法</th>
+<th>常见适用场景</th>
+<th>典型风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PTQ</td>
+<td>训练后量化，不改训练流程</td>
+<td>GPTQ、AWQ、SmoothQuant</td>
+<td>已有模型上线加速</td>
+<td>对校准集和模型分布敏感</td>
+</tr>
+<tr>
+<td>QAT</td>
+<td>训练中感知量化</td>
+<td>QAT、Fake Quant 流程</td>
+<td>对质量回退极敏感的任务</td>
+<td>训练成本更高，流程更重</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>低于 BF16、精度仍较高</td>
+<td>Hopper FP8、Transformer Engine</td>
+<td>新硬件上的训练或推理优化</td>
+<td>硬件与库支持要求高</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>平衡显存与精度</td>
+<td>SmoothQuant、TensorRT INT8</td>
+<td>通用推理加速</td>
+<td>某些层精度回退明显</td>
+</tr>
+<tr>
+<td>INT4 / NF4</td>
+<td>极致压缩</td>
+<td>GPTQ、AWQ、bitsandbytes NF4</td>
+<td>单卡部署、低成本 serving</td>
+<td>质量损失和兼容性压力更大</td>
+</tr>
+</tbody>
+</table>
+<p>一个实用判断是：如果目标是快速降低部署门槛，通常先看
+PTQ；如果目标是稳定保留质量并长期运营，再考虑更重的 QAT
+或硬件原生低精度方案。</p>
+<p>如果要在同一精度档里继续细分，方法级差异通常也值得单独看：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>核心机制（一句话）</th>
+<th>与同精度方法的关键差异</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPTQ</td>
+<td>逐层重建量化误差最小化</td>
+<td>精度通常略优，但校准更慢</td>
+</tr>
+<tr>
+<td>AWQ</td>
+<td>保护重要权重通道</td>
+<td>推理路径常更快，部分模型精度可能略低于 GPTQ</td>
+</tr>
+<tr>
+<td>SmoothQuant</td>
+<td>把激活量化难度转移到权重侧</td>
+<td>专注 W8A8 / INT8 路径，更适合 INT8 部署</td>
+</tr>
+<tr>
+<td>GGUF（k-quants）</td>
+<td>llama.cpp 系列自有格式，多档位</td>
+<td>主要用于 CPU / 边缘，不用于 GPU serving</td>
+</tr>
+<tr>
+<td>NF4</td>
+<td>4-bit 非均匀量化，保留更多动态范围</td>
+<td>bitsandbytes QLoRA 训练时常用</td>
+</tr>
+</tbody>
+</table>
+<h4 id="1631-量化方案怎么选一个工程决策表">16.3.1
+量化方案怎么选：一个工程决策表</h4>
+<p>真正做选型时，团队先别问"最新的量化论文是什么"，而要先把四个约束钉死：<strong>精度能退多少、硬件原生支持什么、目标是压
+TTFT
+还是压单位成本、有没有可信的校准数据</strong>。下面这张表是一个从约束直接走到方案的实用路径。</p>
+<table>
+<thead>
+<tr>
+<th>决策起点</th>
+<th>更推荐的精度 / 方法</th>
+<th>为什么</th>
+<th>工程边界</th>
+<th>失败条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>质量回退几乎不可接受，且模型已经能装下 GPU</td>
+<td>FP16 / BF16</td>
+<td>风险最低，排障最直接</td>
+<td>成本高，但最容易做基线与回滚</td>
+<td>如果显存已经被权重或 KV Cache 压满，这条路通常根本跑不起来</td>
+</tr>
+<tr>
+<td>有 H100/H200/B200 这类原生 FP8
+路线，目标是在尽量保精度的前提下提吞吐</td>
+<td>FP8</td>
+<td>比 INT8 / INT4 更接近高精度路径，通常更容易守住质量</td>
+<td>依赖新硬件、特定库和引擎支持</td>
+<td>卡型不是 Hopper/Blackwell，或者引擎只是"能加载"却没有原生 FP8
+kernel，就容易退化成伪收益</td>
+</tr>
+<tr>
+<td>主要目标是通用在线
+serving，加速和稳定性都要，且能拿到代表性校准集</td>
+<td>INT8（如 SmoothQuant、TensorRT INT8）</td>
+<td>压缩和质量之间更平衡，部署面广</td>
+<td>更适合 W8A8 / W8A16 这类温和方案</td>
+<td>校准集分布失真时，INT8
+往往先在激活敏感层上出问题，离线分数看着正常、线上对话质量抖动</td>
+</tr>
+<tr>
+<td>模型必须塞进更小显卡，或 decode 明显 memory-bound，需要极致压缩</td>
+<td>INT4 weights-only（GPTQ / AWQ）</td>
+<td>对权重显存和带宽收益最大，最常见于低成本 serving</td>
+<td>更适合 decode 主导、W4A16 路径成熟的模型族</td>
+<td>如果瓶颈其实是 prefill 算力、不是权重带宽，INT4
+收益会很有限，甚至被反量化开销吃掉</td>
+</tr>
+<tr>
+<td>同样是 INT4，但你更看重通用性、模型覆盖面和保精度</td>
+<td>GPTQ</td>
+<td>逐层重建误差，通常在复杂模型上更稳</td>
+<td>校准与离线量化时间更长</td>
+<td>校准窗口太小或线上 prompt 形态变化快时，重建出的误差模型会失真</td>
+</tr>
+<tr>
+<td>同样是 INT4，但你更看重吞吐、部署路径和小中型模型的工程效率</td>
+<td>AWQ</td>
+<td>保护重要通道，很多 serving 引擎路径更顺</td>
+<td>需要确认目标模型和目标引擎都对 AWQ 路径成熟</td>
+<td>某些模型上精度可能不如 GPTQ，特别是长尾语言 / 代码 / 推理任务</td>
+</tr>
+<tr>
+<td>这是训练或 LoRA 微调，而不是线上推理</td>
+<td>NF4 / QLoRA</td>
+<td>训练显存收益很好，生态成熟</td>
+<td>主要是训练格式，不是标准 GPU serving 终态</td>
+<td>直接把 NF4
+训练格式当生产推理格式，往往会卡在引擎支持或吞吐表现上</td>
+</tr>
+<tr>
+<td>愿意付出训练或蒸馏成本，且质量目标严格</td>
+<td>QAT 或更重的混合精度方案</td>
+<td>量化感知训练通常最能守住质量</td>
+<td>流程长、成本高，适合长期运营模型</td>
+<td>如果模型和数据还在频繁迭代，QAT 的维护成本会高到抵消收益</td>
+</tr>
+</tbody>
+</table>
+<p>把这张表压缩成一个顺序更容易记的决策树：</p>
+<pre class="mermaid">flowchart TD
+  A[开始: 先定位目标] --> B{质量回退容忍度}
+  B -->|几乎不能退化| C[FP16 / BF16 baseline]
+  C --> D{H100/H200/B200 且引擎有原生 FP8 kernel?}
+  D -->|是| E[评估 FP8]
+  D -->|否| F[保留 BF16 并优化引擎/批处理]
+  B -->|可接受小幅退化| G{有代表性校准集?}
+  G -->|是| H[INT8: SmoothQuant / TensorRT INT8 / W8A8]
+  G -->|否| I[不要盲量化: 先补校准数据或停在 BF16/FP8]
+  B -->|必须极致压缩| J{主要瓶颈是什么?}
+  J -->|权重显存或 decode 带宽| K[INT4 weights-only: GPTQ / AWQ]
+  J -->|长上下文 KV 容量| L[优先 KV Cache FP8/INT8/INT4]
+  J -->|prefill compute-bound| M[先看 FP8/INT8 kernel 和编译优化]
+  K --> N{更看重什么?}
+  N -->|保精度与覆盖面| O[GPTQ]
+  N -->|吞吐与部署路径| P[AWQ]
+  A --> Q{这是训练/微调吗?}
+  Q -->|是| R[NF4 / QLoRA 或 QAT]
+  Q -->|否| B</pre>
+<p>一个经验法则：<strong>FP16/BF16、FP8、INT8、INT4
+不是线性升级关系，而是"质量风险更高，压缩能力更强，工程前置条件也更苛刻"的阶梯。</strong></p>
+<h4 id="1632-硬件对量化精度的支持矩阵">16.3.2
+硬件对量化精度的支持矩阵</h4>
+<p><strong>一个残酷的事实</strong>：精度再好的量化方法，硬件不原生支持也白搭（只能做"伪量化"，反量化后再算，反而更慢）。</p>
+<table>
+<thead>
+<tr>
+<th>精度</th>
+<th>Ampere (A100)</th>
+<th>Hopper (H100)</th>
+<th>Ada (L40S)</th>
+<th>Blackwell (B200)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP16/BF16</td>
+<td>✓ 原生</td>
+<td>✓ 原生</td>
+<td>✓ 原生</td>
+<td>✓ 原生</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>✓ 原生（Tensor Core）</td>
+<td>✓ 原生</td>
+<td>✓ 原生</td>
+<td>✓ 原生</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>✗ 无原生支持</td>
+<td>✓ 原生</td>
+<td>✓ 原生（部分）</td>
+<td>✓ 原生</td>
+</tr>
+<tr>
+<td>INT4（W4A16）</td>
+<td>部分（weights-only）</td>
+<td>部分</td>
+<td>部分</td>
+<td>支持更广</td>
+</tr>
+<tr>
+<td>MXFP8 / NVFP4</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✓</td>
+</tr>
+</tbody>
+</table>
+<p>这张表的意思：你手里的卡决定了你能上什么精度。比如 A100 不支持
+FP8，想上 FP8 要等到 H100；B200 引入的 MXFP8/NVFP4
+则是面向未来的路线。</p>
+<p>对平台决策者：<strong>量化方案要和硬件采购路线对齐</strong>，否则"明年换
+H100，今年先上 FP8"这种表述往往落不了地。</p>
+<h3 id="164-校准calibration过程说明">16.4
+校准（Calibration）过程说明</h3>
+<p>PTQ
+的关键步骤不是"跑一次脚本"，而是让量化器见到一组能够代表真实推理分布的样本，用来估计激活范围、scale、zero
+point 和 outlier
+行为。换句话说，校准是在回答："这个模型在线上最常见的数值范围是什么，哪些通道最容易被截断，哪些层必须保留更多动态范围？"</p>
+<p>没有这一步，很多低精度路径只能用非常保守的默认范围，结果往往是两头都不讨好：显存是省了，但某些层被量化得过猛，回答质量在长上下文、多语言、代码生成这些高动态范围场景里突然掉下来。校准的价值不在于把平均指标抬高一点，而在于让量化器知道<strong>真实线上分布</strong>，避免最坏样本把模型打穿。</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>平台上要关心的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>校准样本来源</td>
+<td>是否覆盖真实 prompt 长度、语言分布和业务场景</td>
+</tr>
+<tr>
+<td>样本规模</td>
+<td>通常先用 128-1024 条代表性样本建立基线，过小容易失真</td>
+</tr>
+<tr>
+<td>per-tensor vs per-channel</td>
+<td>前者简单、开销低；后者精度通常更稳</td>
+</tr>
+<tr>
+<td>静态 vs 动态校准</td>
+<td>静态更易优化，动态更灵活但运行时更复杂</td>
+</tr>
+</tbody>
+</table>
+<p>如果校准集和线上分布差太远，量化结果就可能在离线 benchmark
+好看、线上真实流量掉点明显。</p>
+<h4 id="1641-校准要怎么做决策">16.4.1 校准要怎么做决策</h4>
+<table>
+<thead>
+<tr>
+<th>选择点</th>
+<th>推荐默认值</th>
+<th>什么时候升级</th>
+<th>工程边界</th>
+<th>失败条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>校准样本规模</td>
+<td>128-1024 条分层样本</td>
+<td>任务分布很散、多语言或多模态时再扩容</td>
+<td>先拿能代表真实流量的样本，比盲目堆数量更重要</td>
+<td>只拿几十条 demo prompt，scale 估计会非常不稳</td>
+</tr>
+<tr>
+<td>采样方式</td>
+<td>从线上日志脱敏抽样，按语言 / 长度 / 任务分层</td>
+<td>新业务刚上线、线上样本不足时，用离线数据补齐但要标记来源</td>
+<td>采样分层要能复现，最好保留 hash 和版本</td>
+<td>校准集和生产流量完全不同，离线效果会严重乐观</td>
+</tr>
+<tr>
+<td>per-tensor vs per-channel</td>
+<td>INT8 默认先看 per-channel，简单基线可先用 per-tensor</td>
+<td>对 outlier 很敏感的层，per-channel 更稳</td>
+<td>per-channel 精度通常更好，但实现和存储更复杂</td>
+<td>只因实现省事一律用 per-tensor，常会把少数大通道拉坏</td>
+</tr>
+<tr>
+<td>静态 vs 动态校准</td>
+<td>先做静态校准，拿到稳定基线</td>
+<td>输入分布跨度极大，且运行时明确支持动态量化时再考虑动态</td>
+<td>静态最利于编译和复现</td>
+<td>动态校准如果运行时支持不成熟，排障会明显变难</td>
+</tr>
+<tr>
+<td>校准后验收</td>
+<td>离线指标 + 业务回归集 + 小流量影子发布</td>
+<td>风险高的模型再补人工评审和长尾集</td>
+<td>评测集必须和校准集不重叠</td>
+<td>只看 benchmark 平均分，不看线上长尾失败样本</td>
+</tr>
+</tbody>
+</table>
+<p>校准不是独立步骤，它直接决定你能不能安全地下探到 INT8 /
+INT4。没有代表性校准集时，最稳妥的工程判断通常不是"硬上更保守的量化参数"，而是<strong>先停在
+FP16/BF16 或 FP8，等数据准备好再继续压缩</strong>。</p>
+<h4 id="1642-一个真实翻车校准集的陷阱">16.4.2
+一个真实翻车：校准集的陷阱</h4>
+<p>一个不少团队踩过的坑：</p>
+<ol type="1">
+<li>用英文维基百科做校准，量化 7B 模型</li>
+<li>离线 benchmark（MMLU / HumanEval）基本不掉</li>
+<li>上线后中文用户投诉激增，回答质量明显下降</li>
+<li>排查发现：校准集里中文不足 1%，中文激活的动态范围没被覆盖，量化
+scale 对中文 token 是次优的</li>
+</ol>
+<p>教训：<strong>校准集的分布必须匹配真实流量</strong>。对多语言、多模态、多领域服务，这意味着：</p>
+<ul>
+<li>从线上日志采样（注意脱敏）</li>
+<li>按语言 / 领域 / 长度做分层抽样</li>
+<li>保留校准集的版本 hash，以便复现</li>
+<li>量化后要用和校准集<strong>不重叠</strong>的数据做评测</li>
+</ul>
+<h3 id="165-不只是权重激活与-kv-cache-也可能成为量化对象">16.5
+不只是权重：激活与 KV Cache 也可能成为量化对象</h3>
+<p>很多团队一提量化，只想到权重量化。但在线 serving
+里，真正吃掉资源的通常至少有三类对象：</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>主要收益</th>
+<th>典型限制</th>
+<th>更常见的判断方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权重</td>
+<td>降显存、降带宽</td>
+<td>质量回退、引擎兼容性</td>
+<td>模型能否在目标显卡上稳定装下</td>
+</tr>
+<tr>
+<td>激活</td>
+<td>降中间张量开销、提吞吐</td>
+<td>校准更难，运行时路径更复杂</td>
+<td>prefill 是否明显受激活带宽限制</td>
+</tr>
+<tr>
+<td>KV Cache</td>
+<td>降长上下文显存占用</td>
+<td>可能影响长程注意力质量，需引擎支持</td>
+<td>长上下文服务是否先被 KV 占满</td>
+</tr>
+</tbody>
+</table>
+<p>这也是为什么"模型已经 INT4"并不等于"服务成本已经优化完"。
+如果瓶颈其实在 <a
+href="../part5/15-batching-scheduling-and-kv-cache.html">第15章</a> 讨论的 KV
+Cache，那么只压权重通常不够。</p>
+<h4 id="1651-w--a--kv-量化的命名惯例">16.5.1 W / A / KV
+量化的命名惯例</h4>
+<p>行业里的命名常以 "W_A_KV" 的形式出现：</p>
+<table>
+<thead>
+<tr>
+<th>命名</th>
+<th>含义</th>
+<th>典型场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>W16A16</td>
+<td>原始 bf16/fp16，不量化</td>
+<td>baseline</td>
+</tr>
+<tr>
+<td>W8A16</td>
+<td>权重 int8，激活 bf16</td>
+<td>温和压缩，多数 GPU 支持</td>
+</tr>
+<tr>
+<td>W4A16</td>
+<td>权重 int4，激活 bf16</td>
+<td>主流的 GPTQ/AWQ 路径</td>
+</tr>
+<tr>
+<td>W8A8</td>
+<td>权重激活都 int8</td>
+<td>SmoothQuant 典型，H100 也跑 FP8 等价路径</td>
+</tr>
+<tr>
+<td>W4A8</td>
+<td>权重 int4，激活 int8</td>
+<td>进阶，吞吐更高但难度也更大</td>
+</tr>
+<tr>
+<td>KV8 / KV4</td>
+<td>KV Cache 单独量化到 int8 / int4</td>
+<td>长上下文服务必看</td>
+</tr>
+</tbody>
+</table>
+<p>组合可以是 <code>W4A16 + KV8</code>，意思是权重 int4、激活 bf16、KV
+Cache int8。实际配置通常是这种组合，不是单一精度。</p>
+<h4 id="1652-kv-cache-量化长上下文服务的关键旋钮">16.5.2 KV Cache
+量化：长上下文服务的关键旋钮</h4>
+<p>如果你的服务支持 32K+ 上下文，KV Cache
+量化的收益通常比权重量化更大。</p>
+<p>一个数量级感受：Llama 3 70B、128K 上下文、B=1 的 KV Cache 在 bf16
+下约 40 GB；量化到 int8 后约 20 GB，int4 后约 10
+GB。<strong>这直接决定了你在同等显存下能跑多高的并发</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>KV 精度</th>
+<th>显存节省</th>
+<th>质量影响</th>
+<th>引擎支持</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bf16</td>
+<td>baseline</td>
+<td>无</td>
+<td>所有</td>
+</tr>
+<tr>
+<td>fp8</td>
+<td>2x</td>
+<td>极小</td>
+<td>vLLM、TensorRT-LLM</td>
+</tr>
+<tr>
+<td>int8</td>
+<td>2x</td>
+<td>小</td>
+<td>vLLM、TensorRT-LLM</td>
+</tr>
+<tr>
+<td>int4</td>
+<td>4x</td>
+<td>中等（长程注意力受影响）</td>
+<td>vLLM 部分</td>
+</tr>
+</tbody>
+</table>
+<p><strong>一个实战经验</strong>：KV Cache
+量化几乎没有"自由午餐"吞吐（因为 KV Cache
+不是计算瓶颈，是容量瓶颈），但它能让你<strong>塞进去更大的 batch
+或更长的上下文</strong>，间接换来吞吐。</p>
+<h3 id="166-编译优化在解决什么">16.6 编译优化在解决什么</h3>
+<p>编译和图优化关注的是：
+如何把"模型表达"转换成"更适合硬件执行的计划"。</p>
+<p>常见优化包括：</p>
+<ul>
+<li>算子融合</li>
+<li>内存布局优化</li>
+<li>kernel 选择</li>
+<li>常量折叠</li>
+<li>静态 shape 优化</li>
+</ul>
+<div class="note"><strong>编译优化的本质：</strong>尽量减少无效开销，让设备做更多有价值的计算。</div>
+<h4 id="1661-几种常见优化的直观理解">16.6.1 几种常见优化的直观理解</h4>
+<p><strong>算子融合（Operator
+Fusion）</strong>：把多个连续算子合并成一个
+kernel，减少启动开销和显存往返。</p>
+<pre class="text"><code>未融合:  LayerNorm → Linear → GELU → Linear
+        每个算子各起一个 kernel，中间结果都要写回 HBM
+
+融合后:  [ LayerNorm + Linear + GELU + Linear ]
+        一个 kernel，中间结果留在寄存器 / shared memory</code></pre>
+<p>典型收益：对 transformer block 的 MLP 部分做 fused kernel，能减少
+30-50% 的显存带宽。FlashAttention 本质就是把整个 attention 计算融成一个
+kernel。</p>
+<p><strong>常量折叠</strong>：把训练时恒定但推理时不变的部分提前算好。比如
+position embeddings、rotary embeddings 的查找表。</p>
+<p><strong>内存布局优化</strong>：让 tensor 的物理排列匹配计算 kernel
+的访问模式。比如 attention 需要的 K/V 在内存里是按 head
+分开还是交错，直接影响带宽利用率。</p>
+<p><strong>静态 shape 优化</strong>：如果编译器知道 batch、seq len
+的确切值，可以选择专门优化的 kernel 而不是"通用万能" kernel。代价是一旦
+shape 变了就得重新编译或回退。</p>
+<h3 id="167-主流推理引擎对照">16.7 主流推理引擎对照</h3>
+<p>引擎选择本质上是在性能、兼容性和平台整合度之间取舍。</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>核心特性</th>
+<th>常见量化支持</th>
+<th>多 GPU 支持</th>
+<th>更适合的场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>连续批处理、PagedAttention、prefix cache、chunked prefill</td>
+<td>AWQ、GPTQ、FP8、MXFP8/MXFP4、NVFP4、INT8、INT4、GGUF、compressed-tensors、ModelOpt、TorchAO
+等</td>
+<td>支持</td>
+<td>LLM 在线生成与共享 GPU 服务</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>NVIDIA 深度优化、编译后执行计划</td>
+<td>FP8、INT8、部分 INT4，KV cache 路径优化较强</td>
+<td>强</td>
+<td>NVIDIA 集群上的高性能服务</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>RadixAttention、prefix-aware scheduling、结构化生成</td>
+<td>依赖底层后端</td>
+<td>支持</td>
+<td>需要生成、工具调用与结构化解码编排</td>
+</tr>
+<tr>
+<td>TGI</td>
+<td>Hugging Face 系，生态集成度高</td>
+<td>GPTQ、AWQ、EETQ 等</td>
+<td>支持</td>
+<td>快速部署 HF 模型、中等并发</td>
+</tr>
+<tr>
+<td>ONNX Runtime</td>
+<td>跨硬件、生态广</td>
+<td>INT8 为主，也支持部分低精度扩展</td>
+<td>可支持</td>
+<td>需要兼顾部署广度的推理服务</td>
+</tr>
+<tr>
+<td>llama.cpp</td>
+<td>CPU / 边缘设备友好</td>
+<td>GGUF 量化家族</td>
+<td>有限</td>
+<td>本地部署、边缘、实验环境</td>
+</tr>
+<tr>
+<td>Triton Inference Server</td>
+<td>多后端统一托管</td>
+<td>依赖后端实现</td>
+<td>支持</td>
+<td>多模型、多框架统一平台</td>
+</tr>
+</tbody>
+</table>
+<p>选择时不要只问"谁最快"，还要问：当前发布链、观测链和排障工具能否接受这个引擎的运行时语义。</p>
+<p>量化支持矩阵会随版本、硬件和后端路径快速变化。像 vLLM、SGLang
+这类项目，表里信息更适合作为"常见能力方向"，上线前仍应回到官方 support
+matrix 和当前 release note 做二次确认。</p>
+<h4 id="1671-vllm--tensorrt-llm--sglang--tgi-怎么选">16.7.1 vLLM /
+TensorRT-LLM / SGLang / TGI 怎么选</h4>
+<p>如果你的问题是"今天要把在线 LLM
+服务跑起来，该先评估哪个引擎"，先看下面这张表，而不是先看极限
+benchmark。</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>开发效率</th>
+<th>峰值吞吐潜力</th>
+<th>硬件绑定</th>
+<th>动态图 / 静态图倾向</th>
+<th>长上下文 / 批处理 / KV Cache</th>
+<th>更适合的场景</th>
+<th>典型边界</th>
+<th>失败条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>高，默认就是很多团队的第一站</td>
+<td>高，尤其是在线生成和共享 GPU</td>
+<td>低到中，主战场是 NVIDIA，但工程语义相对通用</td>
+<td>偏动态运行时，保留较强灵活性</td>
+<td>PagedAttention、continuous batching、prefix cache、chunked prefill
+都很成熟</td>
+<td>通用 LLM API 服务、模型快速迭代、多租户共享 GPU</td>
+<td>绝对性能不一定是全场第一，但平台接入和演进成本低</td>
+<td>如果你要极致压榨单一 NVIDIA 集群，且愿意接受更重编译链，vLLM
+往往不是终点</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>中，建链和 artifact 管理都更重</td>
+<td>很高，尤其在 NVIDIA 固定机型上</td>
+<td>高，强绑定 NVIDIA GPU / CUDA / TensorRT 版本</td>
+<td>偏静态图和编译产物驱动</td>
+<td>KV Cache、batch plan、低精度 kernel 很强，但更依赖 shape
+contract</td>
+<td>固定机型的大规模 NVIDIA 集群、追求单位 GPU 产能</td>
+<td>需要更严格的版本、shape、engine artifact 治理</td>
+<td>流量 shape
+波动大、模型频繁迭代、团队不想维护编译制品时，很容易被运维复杂度反噬</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>中到高，适合把生成编排与 serving 放一起</td>
+<td>高，特别是带复杂 prompt 编排、结构化生成时</td>
+<td>中，性能常取决于底层后端</td>
+<td>运行时编排灵活，静态约束比 TensorRT-LLM 轻</td>
+<td>在 prefix-aware
+scheduling、复杂生成控制上有优势，长上下文能力取决于底层后端</td>
+<td>agent、tool-use、结构化输出、多轮复杂 prompt pipeline</td>
+<td>如果底层执行栈选型不稳，整体行为会更像"组合系统"而不是单引擎</td>
+<td>团队若只需要一个朴素 OpenAI-compatible LLM 服务，SGLang
+往往增加了不必要的系统复杂度</td>
+</tr>
+<tr>
+<td>TGI</td>
+<td>高，HF 生态接入顺手</td>
+<td>中到高，取决于模型和量化路径</td>
+<td>中，通常跟随 Transformers / HF 生态</td>
+<td>偏动态，工程体验友好</td>
+<td>批处理和 KV 能力够用，但在极端吞吐与长上下文上通常不如 vLLM /
+TensorRT-LLM 激进</td>
+<td>快速托管 Hugging Face 模型、统一 HF 运维体验</td>
+<td>容易上手，但不是所有场景都做到最优</td>
+<td>如果目标是超长上下文、高密度批处理或最新量化路径，TGI
+可能跟进不够快</td>
+</tr>
+</tbody>
+</table>
+<p>一个简单的默认顺序是：</p>
+<table>
+<thead>
+<tr>
+<th>如果你的主要约束是...</th>
+<th>默认起点</th>
+<th>什么时候切换</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>开发效率、模型快速迭代、通用在线生成</td>
+<td>vLLM</td>
+<td>证明 NVIDIA 固定集群上的单位成本还能再降很多时，再评估
+TensorRT-LLM</td>
+</tr>
+<tr>
+<td>单一 NVIDIA 平台、极致吞吐、能接受编译与 artifact 治理</td>
+<td>TensorRT-LLM</td>
+<td>当模型和 shape 变化太快，重新编译成本高过收益时，回退 vLLM</td>
+</tr>
+<tr>
+<td>agent / tool-use / 结构化生成 / prompt 编排复杂</td>
+<td>SGLang</td>
+<td>当复杂编排需求下降，只剩标准文本生成时，可简化回 vLLM 或 TGI</td>
+</tr>
+<tr>
+<td>团队已经深度使用 Hugging Face 生态，追求快速托管</td>
+<td>TGI</td>
+<td>当长上下文、KV Cache 或量化能力成为瓶颈时，再迁到 vLLM 或
+TensorRT-LLM</td>
+</tr>
+</tbody>
+</table>
+<h4 id="1672-推理引擎选型决策树">16.7.2 推理引擎选型决策树</h4>
+<pre class="mermaid">flowchart TD
+  A[开始: 明确 serving 场景] --> B{是否是通用 decoder-only LLM 在线生成?}
+  B -->|是| C[vLLM 作为默认基线]
+  C --> D{是否固定 NVIDIA 集群且极致压单位 token 成本?}
+  D -->|是| E[TensorRT-LLM: 编译制品 + 静态契约]
+  D -->|否| F[继续 vLLM: 动态调度 + 快速迭代]
+  B -->|否| G{生成逻辑是否包含 agent/tool-use/结构化输出编排?}
+  G -->|是| H[SGLang: prefix-aware scheduling + 编排语义]
+  G -->|否| I{团队是否深度绑定 Hugging Face 生态?}
+  I -->|是| J[TGI: 快速托管 HF 模型]
+  I -->|否| K{目标环境是什么?}
+  K -->|CPU/边缘/本地| L[llama.cpp / Ollama]
+  K -->|多框架混部平台| M[Triton Inference Server]
+  K -->|跨硬件兼容| N[ONNX Runtime]
+  K -->|专用硬件或研究栈| O[按硬件 SDK / TVM / XLA 评估]
+  E --> P{shape、CUDA、engine artifact 能否治理?}
+  P -->|能| Q[进入生产压测]
+  P -->|不能| R[回退 vLLM 或 TGI]
+  H --> S{底层后端和观测链是否稳定?}
+  S -->|能| Q
+  S -->|不能| C</pre>
+<p><strong>一个行业观察</strong>：2024-2025
+年的推理引擎格局正在快速收敛到 vLLM 为核心的开源生态。TensorRT-LLM
+在绝对性能上仍领先，但 vLLM
+在功能覆盖（量化方案、新硬件支持、调度优化）和社区活跃度上遥遥领先。对大多数团队，<strong>先上
+vLLM、特殊场景再评估 TensorRT-LLM</strong> 是稳妥路径。</p>
+<h4 id="1673-vllm--tensorrt-llm--sglang-内部机制对比">16.7.3 vLLM /
+TensorRT-LLM / SGLang 内部机制对比</h4>
+<p>三者的差异不只是 API 名字不同，而是它们把"请求进入 GPU
+前要做哪些决定"放在了不同位置。vLLM 把重点放在运行时调度：请求到达后进入
+scheduler，prefill 和 decode 可以被 continuous batching 动态混排，KV
+Cache 被切成 block 并通过 PagedAttention 间接寻址，prefix cache 和
+chunked prefill 让长 prompt 不必一次性占满全部
+batch。这个设计适合真实线上流量，因为请求长度波动、输出长度不可预知、模型版本迭代快。工程边界是：vLLM
+保留了较强动态性，绝对峰值性能不一定压到每块 NVIDIA GPU
+的极限；当模型、shape、硬件都固定时，动态调度的灵活性可能变成额外开销。</p>
+<p>TensorRT-LLM 的重心在编译与计划。模型先被构造成 TensorRT-LLM
+network，再按 GPU 型号、精度、tensor parallel、max batch、max sequence
+length 等参数生成 engine。运行时执行的是高度优化过的
+plan，kernel、memory layout、KV Cache 策略和低精度路径可以更贴近 NVIDIA
+硬件。它适合固定机型、固定模型族、流量 shape
+可被分桶的大规模集群。工程边界是：engine artifact 要和
+GPU、CUDA、TensorRT-LLM 版本、shape range
+绑定；模型一改、上下文长度一变、硬件池一混，就可能重新 build 或增加多份
+artifact，发布链和回滚链必须能承受。</p>
+<p>SGLang 的重心在生成程序和 prefix 复用。它不仅把单次 completion
+当作请求，还把多轮对话、工具调用、结构化输出、分支采样、约束解码等模式视作可调度的生成图。RadixAttention
+/ prefix-aware scheduling 的核心价值，是把共享 prompt
+前缀显式纳入缓存和调度决策；当 agent workflow 里大量请求共享 system
+prompt、工具描述、few-shot 示例时，它能减少重复
+prefill。工程边界是：SGLang 更像"编排层 +
+执行后端"的组合系统，性能和稳定性同时取决于调度器、后端
+kernel、约束解码实现和业务生成程序写法；如果只是标准 OpenAI-compatible
+chat completion，它的额外语义可能并不划算。</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>vLLM</th>
+<th>TensorRT-LLM</th>
+<th>SGLang</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>核心优化位置</td>
+<td>运行时 scheduler、PagedAttention、KV block 管理</td>
+<td>编译期 engine、硬件专用 kernel、静态 plan</td>
+<td>生成程序调度、prefix 复用、结构化解码</td>
+</tr>
+<tr>
+<td>请求形态假设</td>
+<td>长短请求混合、动态 batch、模型快速迭代</td>
+<td>shape 可分桶、机型固定、追求峰值吞吐</td>
+<td>多轮、工具调用、共享前缀、复杂控制流</td>
+</tr>
+<tr>
+<td>KV Cache 机制</td>
+<td>block/page 化管理，便于碎片治理和换入换出</td>
+<td>engine 内部计划化管理，依赖 build 参数</td>
+<td>prefix-aware cache，强调共享前缀命中</td>
+</tr>
+<tr>
+<td>量化路径</td>
+<td>覆盖广，适合快速验证多种 PTQ 格式</td>
+<td>NVIDIA 低精度路径强，FP8/INT8/部分 INT4 更贴近硬件</td>
+<td>取决于底层后端和模型路径</td>
+</tr>
+<tr>
+<td>发布复杂度</td>
+<td>中等，模型 artifact 相对直接</td>
+<td>高，需要治理 engine artifact 和 shape contract</td>
+<td>中到高，需要同时治理生成程序和后端</td>
+</tr>
+<tr>
+<td>最容易踩的边界</td>
+<td>极致峰值性能不一定最优</td>
+<td>流量 shape 和硬件版本变化会放大维护成本</td>
+<td>简单服务场景可能引入过多系统复杂度</td>
+</tr>
+</tbody>
+</table>
+<h3 id="168-为什么推理引擎会存在">16.8 为什么推理引擎会存在</h3>
+<p>如果直接用通用训练框架做线上推理，常常会遇到：</p>
+<ul>
+<li>模型加载效率一般</li>
+<li>并发管理不强</li>
+<li>批处理策略有限</li>
+<li>KV Cache 管理不足</li>
+<li>多模型与多租户治理困难</li>
+</ul>
+<p>于是专门的推理引擎会承担：</p>
+<ul>
+<li>模型加载</li>
+<li>batch 管理</li>
+<li>cache 管理</li>
+<li>kernel / plan 选择</li>
+<li>设备与副本调度</li>
+</ul>
+<p>也就是说，引擎不只是"跑得快"，还是"把线上运行时语义补齐"。</p>
+<h4 id="1681-引擎内置了哪些别人要重写一遍的能力">16.8.1
+引擎内置了哪些"别人要重写一遍"的能力</h4>
+<p>把"直接用 Transformers" 和 "用 vLLM" 做对比：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>Transformers 裸跑</th>
+<th>vLLM</th>
+<th>自己实现要花多久</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连续批处理</td>
+<td>无</td>
+<td>有</td>
+<td>数月</td>
+</tr>
+<tr>
+<td>PagedAttention</td>
+<td>无</td>
+<td>有</td>
+<td>数月 + 大量测试</td>
+</tr>
+<tr>
+<td>Prefix cache</td>
+<td>无</td>
+<td>有</td>
+<td>数周</td>
+</tr>
+<tr>
+<td>Chunked prefill</td>
+<td>无</td>
+<td>有</td>
+<td>数周</td>
+</tr>
+<tr>
+<td>多种量化</td>
+<td>部分</td>
+<td>全</td>
+<td>数月</td>
+</tr>
+<tr>
+<td>张量并行</td>
+<td>有限</td>
+<td>全</td>
+<td>数周</td>
+</tr>
+<tr>
+<td>Speculative decoding</td>
+<td>无</td>
+<td>有</td>
+<td>数周</td>
+</tr>
+<tr>
+<td>OpenAI 兼容 API</td>
+<td>无</td>
+<td>有</td>
+<td>几天</td>
+</tr>
+<tr>
+<td>Prometheus metrics</td>
+<td>无</td>
+<td>有</td>
+<td>几天</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这张表的意思</strong>：推理引擎不是"加速库"，它是一个把近十年工程经验固化下来的运行时。自己重写这些能力的性价比极低，除非你的业务场景真的特殊到开源引擎不能支持。</p>
+<h3 id="169-编译器生态简述">16.9 编译器生态简述</h3>
+<p>编译器并不是只有一个名字，背后代表的是不同硬件路线和图优化策略。</p>
+<table>
+<thead>
+<tr>
+<th>编译器 / 路线</th>
+<th>定位</th>
+<th>优势</th>
+<th>注意点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TorchInductor</td>
+<td>PyTorch 2.x 默认编译路径</td>
+<td>与 PyTorch 集成自然，适合渐进优化</td>
+<td>动态 shape 场景仍需验证稳定性</td>
+</tr>
+<tr>
+<td>TensorRT</td>
+<td>NVIDIA 专用高性能编译器</td>
+<td>对 NVIDIA GPU 的 kernel 与量化优化强</td>
+<td>平台绑定较深</td>
+</tr>
+<tr>
+<td>TVM</td>
+<td>跨平台编译生态</td>
+<td>适合研究自定义硬件与算子调优</td>
+<td>接入和维护成本较高</td>
+</tr>
+<tr>
+<td>XLA</td>
+<td>TPU 为主，也覆盖部分 GPU 路径</td>
+<td>静态图优化能力强</td>
+<td>对模型与运行时约束更敏感</td>
+</tr>
+<tr>
+<td>MLIR</td>
+<td>基础设施，不是端到端编译器</td>
+<td>很多新编译器都基于 MLIR</td>
+<td>直接用意义不大</td>
+</tr>
+</tbody>
+</table>
+<p>平台选型时更稳妥的顺序通常是：先看现有框架默认编译路径够不够，再决定是否引入更专用的编译器栈。</p>
+<h4 id="1691-torchcompile-在-llm-serving-里怎么用">16.9.1 torch.compile
+在 LLM serving 里怎么用</h4>
+<p><code>torch.compile</code>（基于 TorchInductor）在 PyTorch 2.0+
+下几乎"无成本开启"。vLLM V1 已经内置 <code>torch.compile</code>
+路径，能做自动 kernel 生成和图级变换。</p>
+<p>典型使用方式：</p>
+<ul>
+<li><strong>vLLM / SGLang 默认就会对模型图做
+compile</strong>，你不需要手动写</li>
+<li>自己写 serving 代码时，可以
+<code>model = torch.compile(model, mode="max-autotune")</code></li>
+<li>首次 forward 会很慢（编译耗时），之后会稳定加速</li>
+</ul>
+<p>常见的"不值得"场景：</p>
+<ul>
+<li>模型刚迭代、shape 变化频繁 —— 每次都重新编译反而慢</li>
+<li>调试期 —— compile 后的 trace 不直观</li>
+<li>小模型、低并发 —— 收益不显著</li>
+</ul>
+<h3 id="1610-编译产物其实是一份-shape-contract">16.10 编译产物其实是一份
+shape contract</h3>
+<p>很多编译问题不是"算子错了"，而是运行时请求形状超出了编译时假设。</p>
+<table>
+<thead>
+<tr>
+<th>契约项</th>
+<th>如果没管住会怎样</th>
+<th>平台上应如何治理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最大输入长度</td>
+<td>超出后回退到慢路径，甚至直接失败</td>
+<td>把 max sequence length 写入发布元数据</td>
+</tr>
+<tr>
+<td>Batch shape</td>
+<td>benchmark 很快，线上混合流量却抖动</td>
+<td>分层压测不同 batch / length 档位</td>
+</tr>
+<tr>
+<td>模态输入规格</td>
+<td>多模态请求触发未编译路径</td>
+<td>把分辨率、patch 数、音频帧长也纳入契约</td>
+</tr>
+<tr>
+<td>硬件 / 驱动版本</td>
+<td>同一 plan 在不同节点表现不一致</td>
+<td>编译产物和节点镜像版本绑定发布</td>
+</tr>
+</tbody>
+</table>
+<p>所以编译产物更像"带硬件前提的执行计划包"，而不是普通模型文件。</p>
+<h4 id="16101-tensorrt-引擎文件一个典型的-shape-contract-例子">16.10.1
+TensorRT 引擎文件：一个典型的 shape contract 例子</h4>
+<p>TensorRT 编译的 <code>.engine</code> 文件是个很好的反面教材：</p>
+<ul>
+<li>它和<strong>GPU 型号</strong>绑定（A100 上编译的不能跑在 H100
+上，反之亦然）</li>
+<li>它和 <strong>TensorRT 版本</strong>绑定（10.0 编译的不保证能跑在
+10.1 的 runtime）</li>
+<li>它和 <strong>CUDA
+版本</strong>、<strong>驱动版本</strong>有弱绑定</li>
+<li>它有<strong>最小/最大 batch size、seq len</strong>
+的编译时设定，超出范围要么 fallback 要么报错</li>
+</ul>
+<p>所以生产上管理 TensorRT engine 的正确姿势：</p>
+<pre class="text"><code>artifact_id: my-model-v3-trtllm-h100-cuda12.4-trt10.0-bsz1-256-seq1-32768.engine
+metadata.json:
+  model_version: my-model-v3
+  engine: tensorrt-llm
+  engine_version: 10.0.0
+  cuda: 12.4
+  gpu: H100-80GB
+  batch_range: [1, 256]
+  seq_range: [1, 32768]
+  precision: fp8
+  build_time: 2026-01-15T...
+  source_ckpt: s3://.../my-model-v3.safetensors</code></pre>
+<p>没有这种元数据，engine
+文件就是一个"只有编译它的那台机器能跑"的黑盒。<strong>任何编译型推理方案（TensorRT、XLA、AOT
+inductor）都要配套做 artifact
+治理</strong>，否则发布和回滚迟早出事。</p>
+<h3 id="1611-为什么同一模型在不同引擎上差异很大">16.11
+为什么同一模型在不同引擎上差异很大</h3>
+<p>同样的模型，在不同引擎上的表现差异常见于：</p>
+<ul>
+<li>量化支持程度不同</li>
+<li>batch 策略不同</li>
+<li>KV Cache 管理不同</li>
+<li>编译优化路径不同</li>
+<li>shape 限制不同</li>
+<li>多 GPU 支持不同</li>
+</ul>
+<p>因此，选择引擎时不能只看一张 benchmark 表，而要问：</p>
+<ul>
+<li>模型族是否匹配</li>
+<li>运维复杂度能否接受</li>
+<li>调试是否方便</li>
+<li>发布与回滚是否容易</li>
+</ul>
+<h4 id="16111-benchmark-数字背后的常见误导">16.11.1 Benchmark
+数字背后的常见误导</h4>
+<p>一些"XX 比 YY 快 3x"的 benchmark 要当心：</p>
+<table>
+<thead>
+<tr>
+<th>常见猫腻</th>
+<th>实际含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"峰值吞吐 3x"</td>
+<td>可能在特定 batch 下是 3x，实际线上流量下只有 1.2x</td>
+</tr>
+<tr>
+<td>"TTFT 低 50%"</td>
+<td>可能关了 prefix cache / 开了静态 batch 对比</td>
+</tr>
+<tr>
+<td>"8 并发快 2x"</td>
+<td>16 并发下可能反超</td>
+</tr>
+<tr>
+<td>"单机吞吐 SOTA"</td>
+<td>跨节点可能完全不一样</td>
+</tr>
+<tr>
+<td>"比 baseline 快 N%"</td>
+<td>baseline 可能是未优化的原生 Transformers，不代表主流</td>
+</tr>
+</tbody>
+</table>
+<p><strong>评估引擎性能的正确方式</strong>：</p>
+<ol type="1">
+<li>用自己的模型（不是 demo 的 Llama-2-7B-chat）</li>
+<li>用自己的流量分布（输入 / 输出长度、并发模式）</li>
+<li>对比真实生产引擎（vLLM 最新版，不是某论文的 baseline）</li>
+<li>报告分位数（P50/P95/P99），不是只有 mean</li>
+<li>报告 goodput，不是只有 throughput</li>
+</ol>
+<h3 id="1612-多模态与-encoder-decoder-模型为什么更难统一">16.12 多模态与
+encoder-decoder 模型为什么更难统一</h3>
+<p>很多引擎对 decoder-only LLM 支持最好，但一旦进入多模态或
+encoder-decoder，运行时假设会明显变化。</p>
+<table>
+<thead>
+<tr>
+<th>模型类型</th>
+<th>额外复杂度</th>
+<th>对引擎的要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Decoder-only LLM</td>
+<td>主要关注 prefill / decode 与 KV Cache</td>
+<td>连续批处理、分页缓存、长上下文支持</td>
+</tr>
+<tr>
+<td>Encoder-decoder</td>
+<td>编码与生成分两段，状态传递更复杂</td>
+<td>要能同时优化 encoder 和 decoder 路径</td>
+</tr>
+<tr>
+<td>多模态生成</td>
+<td>图像 / 音频 encoder、跨模态对齐、视觉 token 展开</td>
+<td>要支持多阶段图、更多 shape 变化与缓存键治理</td>
+</tr>
+</tbody>
+</table>
+<p>这也是为什么多模态服务常常不能直接复用"文本 LLM 的最佳 benchmark
+配置"。</p>
+<h3 id="1613-一个现实中的决策表">16.13 一个现实中的决策表</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>可能优势</th>
+<th>常见代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>保持高精度</td>
+<td>风险低、质量稳</td>
+<td>显存和成本高</td>
+</tr>
+<tr>
+<td>量化</td>
+<td>吞吐更高、成本更低</td>
+<td>质量风险、校准复杂</td>
+</tr>
+<tr>
+<td>强编译优化</td>
+<td>速度更好</td>
+<td>shape 约束更强、调试更难</td>
+</tr>
+<tr>
+<td>专用引擎</td>
+<td>更强批处理和缓存</td>
+<td>接入复杂、迁移成本高</td>
+</tr>
+</tbody>
+</table>
+<p>这张表的核心提醒是：
+<strong>更快的方案通常伴随更强的约束和更高的运维要求。</strong></p>
+<h3 id="1614-工程上怎么评估是否值得">16.14 工程上怎么评估是否值得</h3>
+<p>可以从四个维度看：</p>
+<ol type="1">
+<li><strong>性能收益</strong>：延迟、吞吐、显存</li>
+<li><strong>质量风险</strong>：精度退化是否可接受</li>
+<li><strong>运维复杂度</strong>：排障、升级、回滚是否更难</li>
+<li><strong>平台兼容性</strong>：是否能接入当前发布和观测流程</li>
+</ol>
+<p>如果吞吐提高了，但：</p>
+<ul>
+<li>问题排查更难</li>
+<li>灰度更复杂</li>
+<li>回滚更难</li>
+<li>质量波动难监控</li>
+</ul>
+<p>那么这个优化未必真的值。</p>
+<h4 id="16141-一个量化上线的标准流程">16.14.1
+一个量化上线的标准流程</h4>
+<p>给团队一个可照搬的量化上线模板：</p>
+<pre class="text"><code>[1] 瓶颈分析
+    - 目前服务的瓶颈是显存容量、显存带宽，还是算力？
+    - 决定量化对象：权重 / KV / 激活
+
+[2] 方法选型
+    - 根据硬件支持决定精度档位（FP8 需要 H100+，INT4 更通用）
+    - 根据质量容忍度决定方法（GPTQ 偏精度，AWQ 偏速度）
+
+[3] 校准
+    - 从线上日志抽样（脱敏）作为校准集，规模 128-1024
+    - 保存校准集 hash、来源、时间
+
+[4] 离线评测
+    - 跑一组 benchmark（MMLU、HumanEval、业务专属指标）
+    - 跑质量回归集（和校准集不重叠）
+    - 报告量化前后的对比，含置信区间
+
+[5] 影子部署
+    - 新模型和旧模型并行服务
+    - 线上流量镜像给新模型，不返回结果
+    - 收集指标对比 1-2 周
+
+[6] 灰度发布
+    - 1% -&gt; 10% -&gt; 50% -&gt; 100%
+    - 每档观察 24 小时以上
+    - 关键告警阈值: goodput 下降 &gt; 2% 立刻回滚
+
+[7] 持续监控
+    - 保留回滚路径至少 2 周
+    - 对比旧版长期质量指标
+    - 记录校准集版本，便于未来复现</code></pre>
+<p>跳过其中任何一步，上线出问题的概率都会大幅上升。</p>
+<h3 id="1615-工程建议">16.15 工程建议</h3>
+<ul>
+<li>先明确瓶颈在权重、带宽还是 KV Cache，再决定量化对象（详见 <a
+href="../part5/15-batching-scheduling-and-kv-cache.html">第15章</a>）</li>
+<li>PTQ 项目必须保留校准集来源与版本信息，否则问题难以复现</li>
+<li>量化方案要和硬件路线对齐 —— 手上没 H100 就别规划 FP8</li>
+<li>编译产物必须带上 shape contract、硬件前提和回退路径说明</li>
+<li>引擎和编译器选型要同时评估发布、观测和回滚成本</li>
+<li>多模态和 encoder-decoder
+模型要单独验证引擎支持面，不要沿用纯文本结论</li>
+<li>benchmark 至少同时看吞吐、首 token 延迟、显存占用和质量回退</li>
+<li>组合量化（W4A16+KV8）通常比单一精度更实用</li>
+</ul>
+<h4 id="本章涉及的常见工具">本章涉及的常见工具</h4>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>常见工具 / 命令</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权重量化</td>
+<td>bitsandbytes、AutoGPTQ、AutoAWQ、llm-compressor</td>
+<td>适合快速验证 PTQ 路径</td>
+</tr>
+<tr>
+<td>KV / 激活量化</td>
+<td>TensorRT-LLM、ModelOpt、vLLM 内置</td>
+<td>更适合在专用引擎内验证端到端收益</td>
+</tr>
+<tr>
+<td>编译优化</td>
+<td><code>torch.compile</code>、TensorRT、ONNX Runtime、XLA</td>
+<td>分别代表 PyTorch、NVIDIA、跨平台路线</td>
+</tr>
+<tr>
+<td>推理引擎</td>
+<td>vLLM、TensorRT-LLM、SGLang、TGI、llama.cpp</td>
+<td>面向不同硬件和服务目标</td>
+</tr>
+<tr>
+<td>模型导出</td>
+<td><code>torch.onnx.export</code>、<code>trtllm-build</code>、<code>trtexec</code></td>
+<td>用于跨引擎验证和编译产物生成</td>
+</tr>
+<tr>
+<td>质量评测</td>
+<td>lm-eval-harness、AlpacaEval、MT-Bench</td>
+<td>量化前后回归对比必备</td>
+</tr>
+</tbody>
+</table>
+<h3 id="1616-常见误区">16.16 常见误区</h3>
+<h4 id="误区一量化一定稳赚不赔">误区一：量化一定稳赚不赔</h4>
+<p>不对。收益和风险都与模型、数据分布和硬件绑定。</p>
+<h4
+id="误区二编译优化是纯技术问题与平台无关">误区二：编译优化是纯技术问题，与平台无关</h4>
+<p>不对。编译产物、版本兼容、调试方式和发布流程都会受影响。</p>
+<h4 id="误区三只要-benchmark-快就应该换推理引擎">误区三：只要 benchmark
+快，就应该换推理引擎</h4>
+<p>不对。线上系统还要考虑运维和治理。</p>
+<h4
+id="误区四权重量化了服务成本就优化完了">误区四：权重量化了，服务成本就优化完了</h4>
+<p>不对。长上下文场景下 KV Cache 才是主要瓶颈，只压权重不够。</p>
+<h4
+id="误区五离线评测没掉点就可以上线">误区五：离线评测没掉点，就可以上线</h4>
+<p>不对。校准集和评测集都可能和线上分布不一致。要做影子部署和灰度。</p>
+<h4
+id="误区六新硬件的新精度一定更好">误区六：新硬件的新精度一定更好</h4>
+<p>不对。FP8、NVFP4
+等新精度需要成熟的软件栈配合，早期版本可能有各种坑。生产上落后官方支持半年到一年是合理的。</p>
+<hr />
+</section>
+<section class="section" id="s4">
+<h2>4. 本章小结</h2>
+<div class="success"><strong>落地原则：</strong>先用高精度基线建立质量、延迟和成本账本，再逐步引入低精度、编译和引擎迁移；每一步都要保留可回滚制品。</div>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>主要目标</th>
+<th>关键代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>量化</td>
+<td>减少显存与计算成本</td>
+<td>可能影响质量</td>
+</tr>
+<tr>
+<td>编译优化</td>
+<td>提升执行效率</td>
+<td>可能限制形状和调试性</td>
+</tr>
+<tr>
+<td>推理引擎</td>
+<td>提供线上执行、批处理和缓存能力</td>
+<td>接入和运维复杂度上升</td>
+</tr>
+<tr>
+<td>量化对象分层</td>
+<td>权重 / 激活 / KV 各自解决不同瓶颈</td>
+<td>组合策略比单一精度更值得</td>
+</tr>
+<tr>
+<td>平台视角</td>
+<td>量化对象、shape contract 和引擎支持面必须一起评估</td>
+<td>局部最优不一定带来系统最优</td>
+</tr>
+</tbody>
+</table>
+<hr />
+</section>
+<section class="section" id="s5">
+<h2>5. 练习题</h2>
+<div class="danger"><strong>上线红线：</strong>校准集、评测集和影子流量不能混为一谈；如果三者边界不清，量化质量回退很难被定位和复现。</div>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>为什么量化收益常常和模型类型、硬件类型绑定？</li>
+<li>编译优化和量化分别更偏向解决什么问题？</li>
+<li>推理引擎和框架直接推理各自适合什么场景？</li>
+<li>如果吞吐提高了但排障更困难，是否一定值得？为什么？</li>
+<li>PTQ 和 QAT 在平台接入流程上最大的区别是什么？</li>
+<li>为什么权重量化后，KV Cache 仍可能是长上下文服务的主瓶颈？</li>
+<li>为什么编译产物应该被当成一份带 shape contract 的制品来管理？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="8" type="1">
+<li>一个 7B 模型在 A100 上做 decode（batch=1），是 memory-bound 还是
+compute-bound？量化成 int4 预期能加速多少？如果 batch 开到 64 呢？</li>
+<li>你的服务要支持 128K 长上下文，硬件是 H100 80GB。给出一个量化组合（W
+/ A / KV 精度），并解释为什么这个组合合理。</li>
+<li>TensorRT engine 文件的 shape contract
+具体包含哪些维度？发布时这些信息应该如何管理？</li>
+<li>你的团队想从 vLLM 换到 TensorRT-LLM
+追求极致性能。列出换之前需要评估的至少 5 个非性能因素。</li>
+<li>为什么 "benchmark 报告 XX 比 YY 快 3x"
+这种结论常常难以直接复用？设计一个严谨的引擎对比测试方案。</li>
+</ol>
+<h3 id="开放题">开放题</h3>
+<ol start="13" type="1">
+<li>你的服务目前是 bf16 Llama 3 70B，QPS 100，P99 TTFT 2s，P99 TPOT
+80ms。领导要求成本降
+40%。基于本章内容，给出至少三套不同的优化路径，说明各自的收益、风险、运维代价。</li>
+<li>某算法同事声称用一个新的 INT4 方法，精度损失比 GPTQ 还小，并给出了
+MMLU 分数对比。作为平台方，你会问哪些问题决定要不要推动上线？</li>
+</ol>
+</section>
+<section class="section" id="s6">
+<h2>6. 系统视角：从表示到运行时的闭环</h2>
+<p>把本章内容压成平台视角，关键不是“选择一个最快选项”，而是让每个优化动作都有可验证输入、可发布制品和可观测输出。</p>
+<pre class="mermaid">flowchart LR
+  A[真实流量画像] --> B[瓶颈定位]
+  B --> C{主要瓶颈}
+  C -->|权重容量或带宽| D[权重量化]
+  C -->|长上下文显存| E[KV Cache 量化]
+  C -->|prefill 算力| F[低精度 kernel / 编译]
+  C -->|调度空洞| G[推理引擎与 batching]
+  D --> H[制品注册]
+  E --> H
+  F --> H
+  G --> H
+  H --> I[影子发布]
+  I --> J[灰度]
+  J --> K[TTFT / ITL / goodput / 质量 / 成本]
+  K --> B</pre>
+<div class="warn"><strong>排障提醒：</strong>如果优化后指标变差，先按“表示层、编译层、运行时层、发布层”拆证据，不要只从引擎日志里找原因。</div>
+<table><tr><th>证据层</th><th>必须记录</th><th>用于回答</th></tr><tr><td>表示层</td><td>精度、scale、校准集 hash、量化方法</td><td>质量是否因低精度退化</td></tr><tr><td>编译层</td><td>GPU、CUDA、engine 版本、shape range</td><td>是否命中预期 kernel 或回退慢路径</td></tr><tr><td>运行时层</td><td>batch、KV 使用、队列、prefix cache 命中</td><td>收益是否被调度和缓存抵消</td></tr><tr><td>发布层</td><td>流量桶、版本、回滚目标、告警阈值</td><td>是否能安全放量和止损</td></tr></table>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先用 <a href="../part5/14-online-inference-architecture.html">第 14 章</a> 建立在线推理服务的副本、路由和发布模型；再回到 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 理解 batching 与 KV Cache；最后用本章判断量化、编译和推理引擎如何进入同一条优化链路。</div>
+<div class="card"><strong>延伸阅读</strong><br>建议结合 vLLM、TensorRT-LLM、SGLang、ONNX Runtime、TorchInductor、NVIDIA TensorRT / ModelOpt、AutoGPTQ、AutoAWQ、SmoothQuant 等官方文档和 release note，逐项核对当前版本的量化格式、kernel 支持、KV Cache 选项和 shape 限制。</div>
+</div>
+<div class="note"><strong>实践建议：</strong>把每次优化记录成实验卡片：模型版本、硬件、引擎、精度、编译参数、流量分布、质量指标、TTFT、ITL、goodput、显存峰值、单位 token 成本和回滚路径。</div>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

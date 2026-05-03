@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11 章 · 数据管道 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 11 章 · 数据管道</h1>
+<p class="sub">从“模型只能消费稳定样本语义，而现实数据天然分散、变化、脏乱且受权限约束”出发，推导数据分层、质量门禁、shard 读取、版本元数据、回流和时间语义如何共同决定训练吞吐与线上质量。</p>
+<div class="chips"><span class="chip">数据管道</span><span class="chip">Dataset Version</span><span class="chip">Shard 读取</span><span class="chip">质量门禁</span><span class="chip">回流闭环</span><span class="chip">Point-in-Time</span></div>
+<div class="note"><strong>不可化简的问题：</strong>现实世界给系统的是来源分散、质量不齐、持续变化、权限复杂的原始数据；模型需要的却是在固定时间内到达 GPU、能被复现、能被审计、能被回放的样本字节流。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：数据管道</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">数据管道不是目录结构</a></li>
+<li><a class="anchor" href="#s4">四层结构</a></li>
+<li><a class="anchor" href="#s5">训练管道和推理管道</a></li>
+<li><a class="anchor" href="#s6">通用数据流</a></li>
+<li><a class="anchor" href="#s7">吞吐、质量与一致性三角</a></li>
+<li><a class="anchor" href="#s8">为什么会被误判成模型问题</a></li>
+<li><a class="anchor" href="#s9">质量验证插入位置</a></li>
+<li><a class="anchor" href="#s10">Dataset Shard 大规模读取</a></li>
+<li><a class="anchor" href="#s11">最低限度元数据表</a></li>
+<li><a class="anchor" href="#s12">批流一体、回填与时间语义</a></li>
+<li><a class="anchor" href="#s13">工程建议与常见工具</a></li>
+<li><a class="anchor" href="#s14">本章小结</a></li>
+<li><a class="anchor" href="#s15">练习题</a></li>
+<li><a class="anchor" href="#s16">参考资料与学习路线</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：数据管道</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>在很多 AI 系统里，模型性能的上限往往先被数据管道决定，而不是被模型结构决定。把 Airflow、Spark、Ray Data、WebDataset、Iceberg、Delta Lake 这些名字先拿掉，数据管道要解决的不可化简问题只有一个：模型只能消费被组织成特定样本语义的字节流，而现实世界给平台的是来源分散、质量不齐、时间不断变化、权限边界复杂、存储形态不同的原始数据。训练 step 不关心这些复杂性，它只要求每个 batch 在固定时间内到达 GPU；评测不关心清洗脚本多复杂，它只要求同一个 dataset version 能被复现；线上推理不关心离线任务多庞大，它只要求特征、文档、反馈和索引在延迟预算内保持足够一致。</p>
+<p>因此，数据管道不是“把文件放到存储里”，也不是“把表跑成另一张表”。它本质上是在有限时间、有限 IO、有限人工标注和有限一致性语义下，把不稳定的数据世界压缩成模型可消费、可审计、可回放的输入序列。这个问题有四个无法绕开的物理和工程约束。第一，数据量增长通常快于单机存储和单进程解析能力，必须分层、分片、并行读取。第二，数据质量不是一个布尔值，而是 schema、去重、脱敏、标签、分布、时间边界共同形成的置信度。第三，训练、评测、回流和在线特征共享部分来源，却需要不同延迟、吞吐和一致性目标。第四，数据一旦进入训练结果，就会变成模型行为的一部分；如果版本、切分、清洗规则和回填窗口不可追踪，后续 loss 波动、线上退化、GPU 空转都很容易被误判成模型或算力问题。</p>
+<div class="note"><strong>关联章节：</strong>本章是 <a href="../part3/07-single-node-training.html">第 7 章</a> 单机训练基线的上游前提；如果 GPU 利用率异常，先确认不是数据读取、分片、解码或缓存出了问题。</div>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“原始数据不能直接喂给模型”出发，第一步必然是分层。原始层保留可追溯输入，避免清洗错误后无法回放；清洗层把格式、权限、脏数据、重复样本和脱敏要求固化为规则；样本层把通用数据变成具体任务可训练的 <code>train / valid / test</code> shard；回流层把线上反馈、人工审核和漂移信号重新接入系统。没有分层，任何一次规则变更都会把来源、处理和样本语义搅在一起，平台只能靠脚本作者的记忆运转。</p>
+<p>从“模型需要稳定 batch”出发，分片、序列化、缓存和预取必然出现。千万小文件会把 <code>open/stat/list</code> 和元数据服务打满，所以训练侧要把小样本聚合成 64MB 到 1GB 级 shard；GPU 不等解析线程，所以 DataLoader、worker pool、prefetch queue 和本地 cache 要把远端存储的不确定性吸收掉；随机性不能完全依赖远端随机读，所以通常采用 shard 级 shuffle 加 shard 内顺序读，在统计随机性和存储吞吐之间折中。这里的存储边界要和 <a href="../part0/0c-filesystems-and-storage-internals.html">第 0c 章：文件系统与存储内核</a> 联动理解：Page Cache、对象存储 <code>LIST</code>、并行文件系统 stripe、顺序/随机 IO 形状都会改变训练吞吐。</p>
+<p>从“训练结果必须可解释”出发，元数据和版本管理必然出现。一个 dataset version 不能只是一串路径，它至少要记录来源时间范围、清洗规则版本、切分策略、样本数量、schema、生成任务、校验摘要和发布时间。否则“同一模型今天效果比上周差”无法归因：可能是源数据变了，可能是去重阈值变了，可能是 valid 集泄漏了未来信息，也可能只是 shard 读取顺序导致样本分布在前 1,000 step 里变了。</p>
+<p>从“线上系统会持续产生新数据”出发，批流一体、回填和时间语义必然出现。离线训练通常能接受小时级或天级延迟，在线特征和 RAG 索引却要面对分钟级甚至秒级更新；event time 和 processing time 一旦混用，离线评测会看到线上当时看不到的信息，形成 point-in-time 泄漏。于是管道需要迟到窗口、幂等回填、快照、增量重建和回流质量门禁。读完本章时，你应该能把一个“GPU 利用率低”或“线上质量下降”的表面症状，拆成数据来源、质量门禁、样本构造、shard 读取、缓存、时间语义和版本发布这几条可排查链路。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((数据管道))
+    不可化简问题
+      原始数据不能直接训练
+      GPU 需要稳定 batch
+      训练结果必须可复现
+      线上反馈持续变化
+    分层机制
+      原始层
+      清洗层
+      样本层
+      回流层
+    吞吐机制
+      分片 shard
+      序列化格式
+      预取队列
+      本地缓存
+      shard shuffle
+    质量机制
+      schema 检查
+      去重脱敏
+      分布监控
+      异常样本检测
+    存储边界
+      Page Cache
+      顺序读取
+      随机读取
+      对象存储 LIST
+      并行文件系统 stripe
+    时间与版本
+      dataset_version
+      split_policy
+      event time
+      backfill
+      point-in-time correctness
+    AI 影响
+      GPU 利用率
+      loss 波动
+      离线线上一致性
+      回流闭环</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么数据管道的核心不是存储目录，而是把不稳定原始数据变成可复现样本语义？</li>
+<li>原始层、清洗层、样本层、回流层分别保存什么状态，缺少任一层会让哪些问题不可追踪？</li>
+<li>为什么训练读取通常选择“大 shard 内顺序读 + shard 间 shuffle”，而不是直接随机读海量小文件？</li>
+<li>数据质量验证应该插在管道哪些位置，为什么不能只在训练前做一次总检查？</li>
+<li>dataset version 至少要记录哪些元数据，才能支持复现、回滚和效果归因？</li>
+<li>event time、processing time、late data 和 backfill 如何影响在线特征与离线训练的一致性？</li>
+<li>当 GPU 利用率下降或线上质量退化时，如何区分模型问题、数据质量问题和数据读取吞吐问题？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<p>完成本章学习后，你将能够：</p>
+<div class="grid-2">
+<div class="card"><strong>识别职责边界</strong><br>区分采集、清洗、切分、分片、缓存、回流和在线特征的不同目标。</div>
+<div class="card"><strong>设计可复现数据流</strong><br>用分层、版本、元数据和质量门禁让数据问题可追踪、可重放、可回滚。</div>
+<div class="card"><strong>判断吞吐瓶颈</strong><br>从 shard 大小、读取顺序、Page Cache、对象存储请求和解码 CPU 成本定位 GPU 喂数问题。</div>
+<div class="card"><strong>避免错误归因</strong><br>把 loss 波动、线上退化和 GPU 利用率下降拆回数据质量、读取吞吐和模型本身三类问题。</div>
+</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 数据管道不是“把文件放到存储里”</h2>
+<p>很多项目在早期把“数据管道”理解成一个目录结构：</p>
+<pre><code>data/
+  train/
+  valid/
+  test/</code></pre>
+<p>这在小实验中勉强可用，但在平台阶段远远不够。真正的数据管道至少要回答：数据从哪里来，如何清洗、去重、切分，如何生成训练样本，如何为不同模型或任务构造不同视图，如何回流线上反馈，以及如何保证版本可追踪。</p>
+<div class="warn"><strong>边界提醒：</strong>目录结构只能表达“文件放在哪里”，不能表达“样本如何生成、谁批准、从哪个时间窗口来、经过哪些规则、能否在事故后重放”。</div>
+<p>如果这些问题不清晰，后续很多现象都无法解释：为什么同一模型今天效果比上周差，为什么训练吞吐突然下降，为什么线上结果和离线评测对不上。</p>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 数据管道的四层结构</h2>
+<p>一个更稳妥的思路，是把数据管道按层拆开：</p>
+<table>
+<tr><th>层次</th><th>主要任务</th><th>典型产物</th><th>缺失后的风险</th></tr>
+<tr><td>原始层</td><td>接入原始日志、文档、标签、行为流</td><td>raw files / event logs</td><td>清洗错误后无法回放，来源争议无法审计</td></tr>
+<tr><td>清洗层</td><td>去重、校验、脱敏、格式统一</td><td>cleaned dataset</td><td>脏数据和权限问题进入训练样本</td></tr>
+<tr><td>样本层</td><td>构造训练样本、负采样、切分</td><td>train / valid / test shards</td><td>训练集与评测集语义不清，泄漏难发现</td></tr>
+<tr><td>回流层</td><td>汇总线上反馈、人工审核结果、漂移信号</td><td>feedback dataset</td><td>线上变化不能稳定反哺训练和评测</td></tr>
+</table>
+<p>这种分层的价值是原始数据可追溯、清洗逻辑可复现、样本生成规则可解释、回流路径可闭环。没有分层时，数据管道往往会演变成一堆“谁也不敢动的脚本”。</p>
+<pre class="mermaid">flowchart LR
+  A[原始层<br/>raw logs, docs, labels] --> B[清洗层<br/>schema, dedupe, privacy]
+  B --> C[样本层<br/>split, sampling, shard]
+  C --> D[训练读取<br/>DataLoader, cache, prefetch]
+  D --> E[模型输出]
+  E --> F[线上反馈<br/>user signals, audit]
+  F --> G[回流层<br/>feedback dataset]
+  G --> B
+  B --> H[评测集版本]
+  C --> I[模型注册元数据]
+  classDef main fill:#dbeafe,stroke:#93c5fd,color:#1e3a8a
+  classDef gate fill:#dcfce7,stroke:#86efac,color:#166534
+  class A,B,C,D,E,F,G main
+  class H,I gate</pre>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 训练管道和推理管道的差别</h2>
+<p>训练数据管道更关注大批量吞吐、离线清洗、分片与 shuffle、数据版本稳定性；推理或在线特征管道更关注低延迟、数据一致性、权限、热点缓存和降级策略。这两类管道虽然都叫“数据管道”，但目标函数不同。</p>
+<table>
+<tr><th>场景</th><th>首要目标</th><th>典型工程动作</th><th>常见失败模式</th></tr>
+<tr><td>训练</td><td>吞吐、规模、可复现</td><td>离线清洗、重分片、manifest 发布、跨 shard shuffle</td><td>GPU 等数据、valid 泄漏、冷读热读混测</td></tr>
+<tr><td>推理/在线特征</td><td>时延、一致性、稳定性</td><td>缓存、增量更新、权限过滤、降级、点时间读取</td><td>线上读到旧值、索引延迟、离线看见未来信息</td></tr>
+</table>
+<div class="danger"><strong>严重风险：</strong>把训练侧“慢但可重算”的思路搬到在线系统，会打爆延迟预算；把在线侧“尽快可见”的思路搬到离线评测，可能引入 point-in-time 泄漏。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 一个通用的数据流</h2>
+<p>一个较完整的 AI 数据流可以写成：</p>
+<pre><code>原始数据
+  -&gt; 清洗 / 去重 / 脱敏
+  -&gt; 切分 / 标注 / 样本化
+  -&gt; 分片 / 序列化 / 存储
+  -&gt; 训练读取
+  -&gt; 模型输出
+  -&gt; 线上反馈 / 人工审核
+  -&gt; 回流</code></pre>
+<p>这条链里最常被忽视的是“中间层状态”：哪个清洗版本生成了当前数据，哪个切分规则生成了当前评测集，哪个时间点之后的线上反馈还没回流。如果这些中间状态不保留，后续很难做复现和归因。</p>
+<pre class="mermaid">sequenceDiagram
+  participant Source as 数据源
+  participant Clean as 清洗任务
+  participant Sample as 样本生成
+  participant Store as Shard/Manifest
+  participant Train as 训练任务
+  participant Eval as 评测/注册
+  Source->>Clean: 原始日志、文档、标签
+  Clean->>Clean: schema、去重、脱敏
+  Clean->>Sample: cleaned dataset + ruleset
+  Sample->>Store: train/valid/test shards
+  Store->>Train: manifest + immutable shard list
+  Train->>Eval: checkpoint + dataset_version
+  Eval-->>Store: 记录版本、摘要、质量报告</pre>
+<div class="success"><strong>最佳实践：</strong>把 manifest 当作 dataset version 的发布入口，让训练 worker 读取固定列表，而不是启动时扫描远端目录。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 数据吞吐、数据质量与一致性的三角关系</h2>
+<p>数据管道通常同时面对三类压力。吞吐要求样本尽快到达 GPU，推理要求特征尽快到达模型服务；质量要求清洗、校验、脱敏、标注一致性都投入成本；一致性要求明确线上是否允许读稍旧缓存、训练数据是否允许延迟聚合、文档更新后索引是否立即重建。所以，数据管道不是简单 ETL，而是在三角关系中做工程取舍。</p>
+<div class="grid-3">
+<div class="card"><strong>吞吐</strong><br>大 shard、顺序读、预取和缓存提升供给速度，但可能牺牲细粒度随机性。</div>
+<div class="card"><strong>质量</strong><br>更严格的校验提升可信度，但会增加处理延迟和人工成本。</div>
+<div class="card"><strong>一致性</strong><br>更强的一致性降低线上/离线偏差，但会限制缓存、异步和增量重建策略。</div>
+</div>
+<div class="warn"><strong>取舍原则：</strong>训练集可以慢一点但必须可复现；在线特征可以读缓存但必须明确新鲜度和降级语义；评测集宁可小一点，也不能混入未来信息。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 为什么数据问题常常被误判成模型问题</h2>
+<p>训练 loss 波动可能是样本切分变化，不一定是模型结构问题；线上质量下降可能是回流断裂，不一定是模型退化；GPU 利用率下降可能是数据格式碎片化，不一定是算子效率问题。这说明数据管道需要自己的观测面，而不是等模型指标退化后再被动发现。</p>
+<table>
+<tr><th>表面现象</th><th>常见误判</th><th>需要先查的数据证据</th></tr>
+<tr><td>训练 loss 在前 1,000 step 波动</td><td>学习率、初始化或模型结构问题</td><td>split_policy、shard 顺序、样本长度分布、valid 泄漏</td></tr>
+<tr><td>GPU 利用率下降</td><td>算子慢或 GPU 故障</td><td>DataLoader queue depth、解码耗时、远端 GET 尾延迟、Page Cache 命中</td></tr>
+<tr><td>线上质量下降</td><td>模型退化</td><td>回流窗口、Prompt/索引版本、文档更新延迟、权限过滤规则</td></tr>
+</table>
+<div class="note"><strong>排查视角：</strong>先把“模型输入是否真的一样”回答清楚，再比较模型结构、训练参数和硬件利用率。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 数据质量验证应该插在哪一层</h2>
+<p>平台视角下，数据质量验证不是上线前一次性检查，而是贯穿清洗层、样本层和回流层的常驻门禁。</p>
+<table>
+<tr><th>验证类型</th><th>常见检查</th><th>适合插入的位置</th><th>主要目的</th></tr>
+<tr><td>Schema 检查</td><td>字段是否缺失、类型是否变化、主键是否重复</td><td>原始层进入清洗层时</td><td>尽早拦截格式错误</td></tr>
+<tr><td>统计分布监控</td><td>长度分布、类别占比、标签比例、空值率</td><td>清洗完成后、样本生成后</td><td>发现数据漂移和批次异常</td></tr>
+<tr><td>异常样本检测</td><td>极端长度、乱码、脏标签、重复样本</td><td>样本层出片前</td><td>降低训练污染和评测偏差</td></tr>
+<tr><td>回流质量校验</td><td>反馈时间戳、用户标识、去重状态</td><td>回流层入库前</td><td>避免线上噪声直接反哺训练</td></tr>
+</table>
+<p>如果把校验都堆到训练前最后一步，问题虽然也能发现，但代价已经变成整条链路回滚。更稳妥的做法是在每层设置轻量门禁，让错误尽可能在靠近源头的位置暴露。</p>
+<pre class="mermaid">flowchart TD
+  R[原始层] --> G1{Schema 门禁}
+  G1 -->|通过| C[清洗层]
+  G1 -->|失败| Q1[隔离批次并告警]
+  C --> G2{分布/漂移门禁}
+  G2 -->|通过| S[样本层]
+  G2 -->|失败| Q2[停止发布 dataset version]
+  S --> G3{异常样本门禁}
+  G3 -->|通过| M[发布 manifest]
+  G3 -->|失败| Q3[重跑样本生成]
+  F[线上反馈] --> G4{回流质量门禁}
+  G4 -->|通过| R
+  G4 -->|失败| Q4[人工审核或丢弃噪声]</pre>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Dataset Shard 的大规模读取模式</h2>
+<p>训练侧常见的读取问题，不是“文件能不能打开”，而是“GPU 能否持续吃到样本”。这要和 <a href="../part0/0c-filesystems-and-storage-internals.html">第 0c 章：文件系统与存储内核</a> 一起理解：dataset shard 的大小、读取顺序、Page Cache、对象存储 <code>LIST</code> 语义、并行文件系统 stripe，都会改变同一批样本到达 GPU 的稳定性。</p>
+<table>
+<tr><th>模式</th><th>优势</th><th>代价</th><th>适用场景</th></tr>
+<tr><td>顺序读取</td><td>吞吐高，适合大文件预取</td><td>随机性弱，容易形成热点</td><td>预分片后的大规模训练集</td></tr>
+<tr><td>随机读取</td><td>shuffle 更充分，易做细粒度采样</td><td>小文件多时 IOPS 压力大</td><td>中小规模实验、重采样任务</td></tr>
+<tr><td>流式读取</td><td>本地落盘需求低，便于跨对象存储扩展</td><td>依赖稳定网络与预读窗口</td><td>TB 级训练集、弹性训练集群</td></tr>
+</table>
+<p>工程上常见做法是：离线阶段先把小样本打包成较大的 shard，训练阶段尽量顺序读 shard 内部数据，再配合跨 shard shuffle。经验边界是单个 shard 通常落在 64MB 到 1GB；文本 token shard、tar shard、Parquet row group 都可以按这个量级起步。低于 16MB 时，<code>open/stat</code>、对象存储请求数、TLS/HTTP 开销和调度开销会变得显著；高于 2GB 时，失败重试、负载均衡、worker 间切分和局部 shuffle 的灵活性会下降。真正的目标不是追求某个固定大小，而是让一个 shard 足够大，使存储看到连续流；又足够小，使 100 到 10,000 个 worker 可以均匀分摊。</p>
+<table>
+<tr><th>边界</th><th>建议起点</th><th>失效信号</th></tr>
+<tr><td>shard 大小</td><td>64MB-1GB</td><td>小于 16MB 时请求/元数据开销高；大于 2GB 时重试和均衡变差</td></tr>
+<tr><td>读取顺序</td><td>shard 内顺序读，shard 间 shuffle</td><td>完全随机读导致 IOPS/MDS 饱和</td></tr>
+<tr><td>Page Cache</td><td>本地 cache 可复用热数据</td><td>冷热读混测导致吞吐判断失真</td></tr>
+<tr><td>对象存储</td><td>用 manifest 发布版本，worker 读固定列表</td><td>依赖 <code>LIST prefix</code> 发现完整数据集</td></tr>
+<tr><td>并行文件系统</td><td>大 shard 设置合理 stripe</td><td>小文件、大目录、默认 stripe 打爆 MDS</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+  A[千万小样本] --> B[离线重分片]
+  B --> C[64MB-1GB shard]
+  C --> D[manifest 发布]
+  D --> E[worker 读取固定列表]
+  E --> F[shard 内顺序读]
+  E --> G[shard 间 shuffle]
+  F --> H[prefetch queue]
+  G --> H
+  H --> I[GPU batch]
+  J[对象存储 LIST / MDS / Page Cache / 解码 CPU] -.影响.-> E
+  J -.影响.-> H</pre>
+<div class="success"><strong>工程边界：</strong>平台应分别压测冷读、热读、单 worker、全 worker、对象存储 GET/list、并行文件系统 <code>open/stat</code> 和 shard 内解码 CPU 成本，再判断是否真的是训练算子问题。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 一个最低限度的数据管道元数据表</h2>
+<p>哪怕没有大平台，也建议至少记录：</p>
+<pre><code>dataset_version: support-v3
+source_range: 2026-03-01..2026-03-31
+cleaning_ruleset: clean-r7
+split_policy: by_user_hash_v2
+sample_count:
+  train: 18_400_000
+  valid: 920_000
+  test: 920_000
+generated_at: 2026-04-10T08:00:00Z</code></pre>
+<table>
+<tr><th>字段</th><th>回答的问题</th><th>事故中的用途</th></tr>
+<tr><td><code>dataset_version</code></td><td>当前训练/评测究竟使用哪份数据</td><td>回滚、对比、审计</td></tr>
+<tr><td><code>source_range</code></td><td>数据来自哪个时间范围</td><td>排查时间窗口和回填影响</td></tr>
+<tr><td><code>cleaning_ruleset</code></td><td>经过哪套清洗、脱敏、去重规则</td><td>定位规则变更导致的质量波动</td></tr>
+<tr><td><code>split_policy</code></td><td>训练/验证/测试如何切分</td><td>排查泄漏和评测集变化</td></tr>
+<tr><td><code>sample_count</code></td><td>各 split 的样本规模</td><td>发现异常缺失或重复生成</td></tr>
+<tr><td><code>generated_at</code></td><td>版本何时发布</td><td>关联训练任务、模型制品和线上发布</td></tr>
+</table>
+<div class="note"><strong>关键判断：</strong>这份元数据的意义在于让“数据到底是什么”变成可回答的问题，而不是把数据定义藏在路径名和脚本参数里。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 批流一体、回填与时间语义</h2>
+<p>很多平台在离线训练和在线特征之间，真正踩坑的不是 ETL 本身，而是“时间语义没有统一”。尤其在在线特征和检索系统里，如果时间边界没定义清楚，到了 <a href="13-feature-vector-and-cache.html">第 13 章</a> 的特征缓存与索引层，问题只会更难排查。</p>
+<table>
+<tr><th>问题</th><th>如果没处理好会怎样</th><th>平台上常见做法</th></tr>
+<tr><td>Event time vs processing time 混用</td><td>离线统计和线上读取对不上</td><td>明确以事件时间为主，处理时间只用于运维观测</td></tr>
+<tr><td>Late data 迟到</td><td>回填后训练集和线上特征定义漂移</td><td>设迟到窗口，允许增量修补或批量回放</td></tr>
+<tr><td>Backfill 不可重放</td><td>修一次数据就生成一套新口径</td><td>回填任务幂等化，保留输入快照与任务版本</td></tr>
+<tr><td>Point-in-time 不正确</td><td>训练看到了“未来信息”</td><td>样本构造时按样本时间截断特征与标签</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  E[Event Time<br/>事件发生时间] --> W[迟到窗口]
+  P[Processing Time<br/>系统处理时间] --> O[运维观测]
+  W --> B[幂等 Backfill]
+  B --> S[快照/增量重建]
+  S --> T{Point-in-Time 检查}
+  T -->|通过| D[训练/评测样本]
+  T -->|失败| X[拒绝发布版本]
+  O -.只用于监控延迟.-> B</pre>
+<div class="danger"><strong>严重风险：</strong>point-in-time 不正确会让离线指标虚高，因为训练样本看到了线上当时还不存在的特征、标签或文档。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 工程建议与常见工具</h2>
+<ul>
+<li>数据管道必须和版本管理一起设计。</li>
+<li>训练集、评测集、线上反馈流要分层管理。</li>
+<li>让“数据问题”有可观测信号，而不是只在模型指标退化时被动发现。</li>
+<li>尽量让回流路径结构化，而不是靠日志抓取拼接。</li>
+<li>在平台规模扩大前，就先固定数据命名、切分和元数据规范。</li>
+<li>回填任务要可重放、可审计，并明确时间语义。</li>
+</ul>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>批式数据编排</td><td>Airflow、Dagster</td><td>适合管理多阶段离线数据流与重跑</td></tr>
+<tr><td>分布式数据处理</td><td>Spark、Ray Data</td><td>用于清洗、聚合、重分片</td></tr>
+<tr><td>流式样本格式</td><td>WebDataset、MosaicML Streaming</td><td>适合大规模训练时稳定喂数</td></tr>
+<tr><td>表格式数据治理</td><td>Apache Iceberg、Delta Lake</td><td>适合保留 schema 演进与快照</td></tr>
+</table>
+<div class="warn"><strong>不要先选工具：</strong>先定义数据层次、版本语义、质量门禁和读取目标，再判断 Airflow、Spark、Ray Data 或流式数据集格式分别解决哪一段问题。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 本章小结</h2>
+<table>
+<tr><th>主题</th><th>要点</th></tr>
+<tr><td>数据管道</td><td>决定模型输入、版本和回流的组织方式</td></tr>
+<tr><td>训练 vs 推理</td><td>吞吐型与低延迟型数据管道侧重点不同</td></tr>
+<tr><td>核心取舍</td><td>吞吐、质量、一致性常常互相牵制</td></tr>
+<tr><td>主要风险</td><td>版本缺失、清洗不透明、回流断裂、时间语义混乱</td></tr>
+<tr><td>新增视角</td><td>质量门禁、读取模式与时间语义会一起影响训练稳定性</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 练习题</h2>
+<ol>
+<li>为什么数据管道问题常常会被误判成模型问题？</li>
+<li>训练和在线特征管道在目标上有什么根本差异？</li>
+<li>设计一个包含回流环节的数据流图。</li>
+<li>为什么“先让数据能用”不等于“数据管道已经设计好”？</li>
+<li>如果对象存储里的训练样本有数十亿条，你会优先选择顺序读取、随机读取还是流式读取？为什么？</li>
+<li>请为一个文本训练管道设计最小的数据质量验证表，至少包含 3 类检查。</li>
+<li>为什么在线特征系统特别需要 point-in-time correctness？</li>
+</ol>
+</section>
+
+<section class="refbox" id="s16">
+<h2>16. 参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先把本章的数据分层、版本、质量门禁和 shard 读取模型掌握清楚，再回看 <a href="../part3/07-single-node-training.html">第 7 章</a> 的 DataLoader 和单机训练吞吐；随后结合 <a href="../part0/0c-filesystems-and-storage-internals.html">第 0c 章</a> 理解 Page Cache、对象存储、并行文件系统和小文件问题；最后进入 <a href="13-feature-vector-and-cache.html">第 13 章</a>，把离线数据、在线特征、向量索引和缓存一致性连起来。</p>
+<p><strong>延伸阅读：</strong>关注 Apache Iceberg / Delta Lake 的快照与 schema 演进、WebDataset 与 Mosaic StreamingDataset 的 shard/streaming 设计、Great Expectations / Deequ 这类数据质量门禁工具，以及流处理系统中的 event time、watermark、late data 和 backfill 语义。</p>
+<p><strong>实践建议：</strong>拿一个真实训练任务做一次数据侧审计：列出输入来源、清洗规则、split 策略、manifest、shard 大小、读取方式、缓存命中、质量检查、dataset version 和回流窗口。只要其中任一项回答不上来，就先补元数据和观测，再谈模型调参。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

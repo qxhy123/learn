@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 14 章 · 在线推理架构 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=14" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 14 章 · 在线推理架构</h1>
+<p class="sub">从“请求不可预测、计算昂贵、状态沉重、用户等待有上限”出发，推导在线推理系统为什么必须围绕入口、路由、副本池、缓存、尾延迟、冷启动、降级和质量观测组织。</p>
+<div class="chips"><span class="chip">Online Serving</span><span class="chip">LLM Router</span><span class="chip">TTFT / TPOT</span><span class="chip">KV Cache</span><span class="chip">Goodput</span><span class="chip">降级控制面</span></div>
+<div class="note"><strong>不可化简的问题：</strong>在请求形态不可预测、GPU 计算昂贵、模型状态沉重、用户等待时间有限的条件下，怎样让每一次调用都尽量在承诺时间内交付有用结果？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：在线推理架构</a></li>
+<li><a class="anchor" href="#s2">在线推理到底在处理什么</a></li>
+<li><a class="anchor" href="#s3">一次请求的时间拆解</a></li>
+<li><a class="anchor" href="#s4">网关、路由和模型副本</a></li>
+<li><a class="anchor" href="#s5">尾延迟而不是平均延迟</a></li>
+<li><a class="anchor" href="#s6">与传统 Web 服务的不同</a></li>
+<li><a class="anchor" href="#s7">最小在线推理架构</a></li>
+<li><a class="anchor" href="#s8">Prefill / Decode 解耦</a></li>
+<li><a class="anchor" href="#s9">多模态 serving</a></li>
+<li><a class="anchor" href="#s10">模型服务框架对照</a></li>
+<li><a class="anchor" href="#s11">冷启动与预热</a></li>
+<li><a class="anchor" href="#s12">熔断与降级</a></li>
+<li><a class="anchor" href="#s13">工程建议</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：在线推理架构</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>在线推理架构要解决的不可化简问题，不是“如何把模型挂到一个 HTTP 端口后面”，而是：在请求不可预测、计算昂贵、状态沉重、用户等待有上限的条件下，怎样让每一次调用都尽量在承诺的时间内交付有用结果。第一次做模型服务的团队，最容易把在线推理理解成“带 GPU 的 Flask 服务”：写一个接口接 HTTP 请求，把模型 load 到显存，前向跑一次返回结果。这个心智模型在 demo 上完全够用，因为 demo 里的请求少、输入短、没有灰度、没有租户、没有下游依赖，也不需要解释为什么某个用户等了 12 秒。但生产系统的物理现实更硬：一个 70B 模型的单个副本可能占用多张 GPU；一次长 prompt prefill 会吞掉大量算力；decode 阶段会把 KV Cache 留在显存里；RAG 链路还会调用 embedding、向量库、rerank、安全过滤和工具服务。于是“模型推理”只是一条请求链路中的一段，服务是否可用取决于这条链路里最慢、最抖、最不可控的那几跳。</p>
+<p>从第一性原理看，在线推理比传统 Web 服务难，不是因为入口协议特殊，而是因为它把四类约束叠在了一起。第一是成本约束：GPU 秒很贵，副本不是可以随便复制的廉价进程，扩容会带来显存、权重加载、warm pool 和缓存命中率的代价。第二是时间约束：用户不关心平均值，只关心自己这一次是否卡住；聊天场景的 TTFT 可能要压到 500 ms 内，TPOT 超过 150 ms/token 就会明显卡顿。第三是状态约束：KV Cache、prefix cache、会话亲和、模型版本和预热状态都决定了“同一个请求路由到不同副本”会有不同成本。第四是质量约束：HTTP 200 只能说明系统返回了字节，不能说明回答正确、安全、相关或可用。因此本章的核心不是记住某个 serving 框架，而是建立一种拆链路的直觉：一次请求的时间去哪了，尾延迟由哪一跳主导，哪些状态必须亲和，哪些失败必须在控制面里有自动动作。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>如果不可化简的问题是“按时交付有用结果”，第一个必然机制就是请求生命周期拆解。只有把端到端时间拆成 <code>queue / preprocess / model / downstream / postprocess</code>，再把 LLM 的 <code>model</code> 拆成 <code>prefill / decode</code>，平台才知道该扩 GPU、限流、优化检索、改 tokenizer，还是调整 batch。第二个必然机制是入口与路由分层。网关负责鉴权、限流、租户识别和基础日志；路由层负责模型版本、长短上下文、优先级、灰度、prefix-aware 亲和和 SLO-aware 选择副本。二者分离，是因为“谁可以进来”和“进来后去哪一个副本最合适”是两个不同问题。</p>
+<p>第三个必然机制是副本池与缓存治理。模型副本不是无状态 worker：它有权重、CUDA context、allocator、KV Cache、prefix cache 和 warmup 状态。Round-robin 在普通 Web 服务里可能足够，在 LLM serving 里却可能摧毁 prefix cache 命中率，让同一 system prompt 的请求反复 prefill。第四个必然机制是尾延迟治理。输入长度可以差 100 倍，输出长度也可能被 <code>max_tokens</code> 顶满；如果只看平均延迟，最慢 1% 用户会被隐藏。于是指标必须从 QPS 扩展到 P50/P95/P99、TTFT、TPOT、ITL、E2EL 和 goodput。Goodput 的意义是把 SLO 纳入吞吐：超时完成的 token 不再被当作有价值的产出。</p>
+<p>第五个必然机制是资源形态分离。Prefill 更偏 compute-bound，decode 更偏 memory-bandwidth-bound，还会长期占用 KV Cache。长上下文和短请求混在同一池里时，长 prefill 会把短请求的首 token 和后续 token 都拖慢，所以会推导出 chunked prefill、长短分流，甚至 prefill/decode disaggregation。第六个必然机制是冷启动、熔断和降级控制面。权重加载、运行时初始化、CUDA graph 捕获、缓存预热都需要时间，副本 ready 不等于可以立即接流量；下游抖动或 GPU 池饱和时，也不能靠人工临时决定是否关闭 rerank、切小模型、截短上下文或返回 429。这些策略必须是可配置、可观测、可演练的规则。最后，质量观测必然独立存在，因为模型可能“健康地生成垃圾”：系统指标、链路 trace、输出评测、灰度发布和回滚门禁要一起构成在线推理的运营闭环。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((在线推理架构))
+    不可化简问题
+      按时交付
+      有用结果
+      GPU 成本高
+      请求形态不规则
+    请求时间拆解
+      Queue
+      Preprocess
+      Model
+        Prefill
+        Decode
+      Downstream
+      Postprocess
+    路由与副本
+      Gateway
+      Router
+      Replica Pool
+      Prefix-aware
+      SLO-aware
+    延迟与吞吐
+      TTFT
+      TPOT
+      ITL
+      P99
+      Goodput
+    控制面
+      冷启动
+      熔断
+      降级
+      回滚
+      质量观测</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>当 RAG 或 Agent 服务端到端变慢时，如何把延迟拆成 queue、preprocess、model、downstream、postprocess？</li>
+<li>为什么网关、路由层和模型副本池不能混成一个组件？</li>
+<li>TTFT、TPOT、ITL、E2EL、goodput 分别约束什么用户体验或平台目标？</li>
+<li>为什么 LLM 副本不是普通无状态 worker？</li>
+<li>长 prompt prefill 拖慢短请求 decode 时，应先看哪些信号？</li>
+<li>冷启动、熔断、降级、回滚为什么必须写进控制面规则？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 在线推理到底在处理什么</h2>
+<p>一个在线推理系统最常见的工作流是：</p>
+<pre><code>客户端请求
+  -&gt; 网关
+  -&gt; 路由与鉴权
+  -&gt; 预处理
+  -&gt; 模型执行
+  -&gt; 后处理
+  -&gt; 返回结果</code></pre>
+<p>如果是 RAG 或多模型组合，这条链会继续延长：</p>
+<pre><code>客户端
+  -&gt; API 网关
+  -&gt; 意图识别 / 路由
+  -&gt; embedding
+  -&gt; 向量检索
+  -&gt; 重排
+  -&gt; LLM 生成
+  -&gt; 安全过滤
+  -&gt; 返回</code></pre>
+<div class="warn"><strong>常见误解：</strong>“模型执行时间”通常只是总延迟的一部分。平台工程里最危险的做法，是把模型执行时间误当成整个服务延迟。</div>
+<table>
+<tr><th>链路段</th><th>典型耗时</th><th>工程含义</th></tr>
+<tr><td>网关 + 鉴权</td><td>约 5 ms</td><td>通常不是均值大头，但会进入端到端 P99</td></tr>
+<tr><td>Embedding 调用</td><td>约 80 ms</td><td>RAG 场景的独立依赖，需要单独埋点</td></tr>
+<tr><td>向量检索</td><td>约 40 ms</td><td>索引、过滤条件和租户隔离会改变尾延迟</td></tr>
+<tr><td>重排模型</td><td>约 120 ms</td><td>可成为降级开关，不能和主模型混为一谈</td></tr>
+<tr><td>LLM prefill</td><td>约 300 ms</td><td>受输入 token、prefix cache 和 batch 策略影响</td></tr>
+<tr><td>LLM decode</td><td>约 900 ms</td><td>常是总耗时大头，也最受输出长度影响</td></tr>
+<tr><td>安全过滤 + 后处理</td><td>约 55 ms</td><td>影响质量和合规，不能随意省略</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+  C[Client] --> G[API Gateway]
+  G --> R[Intent / LLM Router]
+  R --> E[Embedding]
+  E --> V[Vector DB]
+  V --> K[Rerank]
+  K --> L[LLM Replica]
+  L --> S[Safety Filter]
+  S --> O[Response]
+  R -. metrics .-> M[Metrics / Traces]
+  L -. tokens .-> M
+  V -. latency .-> M</pre>
+<p>这张链路图给出两个工程启示：LLM 确实常占大头，但不是全部；尾延迟的组成可能和平均延迟完全不同。平均 1500 ms 的服务，P99 可能是 8000 ms，而且多出来的 6500 ms 不一定在 LLM，而可能在 embedding 抖动、向量库扫全表，或者某个租户的长 prompt 把 decode 拖慢了。</p>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 一次请求的时间拆解</h2>
+<p>可以用一个非常实用的式子来理解：</p>
+<pre><code>t_request = t_queue + t_preprocess + t_model + t_downstream + t_postprocess
+t_model   = t_prefill + t_decode</code></pre>
+<p>这个拆解的工程意义很直接：如果 <code>t_queue</code> 高，问题可能在扩容、队列或批处理；如果 <code>t_downstream</code> 高，问题可能在检索、特征或向量库；如果 <code>t_model</code> 高，才更可能是模型执行本身、显存或 batch 策略。</p>
+<table>
+<tr><th>指标</th><th>全称</th><th>含义</th><th>典型目标</th></tr>
+<tr><td>TTFT</td><td>Time to First Token</td><td>请求到第一个 token 返回的时间</td><td>聊天场景 &lt; 500 ms，代码补全 &lt; 100 ms</td></tr>
+<tr><td>TPOT</td><td>Time per Output Token</td><td>除第一个 token 外，平均每个 token 耗时</td><td>&lt; 100 ms 流畅，&gt; 150 ms 明显卡顿</td></tr>
+<tr><td>ITL</td><td>Inter-Token Latency</td><td>两个相邻 token 之间的时间间隔</td><td>用于抓局部抖动</td></tr>
+<tr><td>E2EL</td><td>End-to-End Latency</td><td>从请求到最后一个 token 完成</td><td>由用例决定</td></tr>
+<tr><td>TTLT</td><td>Time to Last Token</td><td>同 E2EL</td><td>有些文档用 TTLT 区分于 TPOT</td></tr>
+</table>
+<div class="note"><strong>读速直觉：</strong>人类阅读速度约 250 词/分钟，按 1.3 token/词换算约 5 token/秒，也就是约 200 ms/token。TPOT 做到 100 ms 以下，用户通常会感觉输出足够流畅。</div>
+<p>传统 QPS/TPS 在 LLM 服务里有缺陷：它把超时请求也算进去了。一个系统每秒完成 1000 个请求，但如果其中 400 个已经超过客户端超时，真正有价值的只有 600 个。Goodput 把 SLO 纳入计算：</p>
+<pre><code>Goodput = 满足所有 SLO 的请求数 / 总请求数 * 吞吐</code></pre>
+<div class="success"><strong>容量判断：</strong>扩容决策不要只看 QPS 曲线，要看 goodput 曲线。加大 batch 可能提高完成量，却让更多请求超出 TTFT 或 TPOT SLO。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 网关、路由和模型副本各自解决什么问题</h2>
+<div class="grid-3">
+<div class="card"><strong>网关</strong><br>统一入口，负责鉴权、限流、基础路由、请求日志和租户识别。租户标记会进入下游 chargeback，详见 <a href="17-multitenancy-and-cost.html">第 17 章</a>。</div>
+<div class="card"><strong>路由层</strong><br>负责模型版本、灰度、长短上下文分流、高低优先级分流、prefix-aware 路由和 SLO-aware 副本选择。</div>
+<div class="card"><strong>模型副本</strong><br>真正加载模型权重并执行推理。副本数量、预热方式、缓存策略和设备选择直接决定吞吐与尾延迟。</div>
+</div>
+<p>Prefix-aware 路由是一个常被忽略的优化点：把带相同 system prompt 的请求尽量送到同一副本。现代 serving 引擎支持 prefix cache，已经 prefill 过的 prefix 会留在 KV Cache 中，后续带相同 prefix 的请求可以跳过这部分 prefill。这个收益只有在路由让“对的请求进对的副本”时才能拿到。</p>
+<pre class="mermaid">flowchart TD
+  G[API Gateway<br/>auth / rate limit / tenant] --> R[LLM Router]
+  R -->|prod traffic| A[Pool A<br/>stable version]
+  R -->|canary 5%| B[Pool B<br/>new version]
+  R -->|shadow| C[Shadow Pool<br/>offline eval]
+  R -->|same prefix hash| A
+  A --> KA[(KV / Prefix Cache)]
+  B --> KB[(KV / Prefix Cache)]
+  C --> KC[(Eval Logs)]
+  A --> O[Streaming Response]
+  B --> O</pre>
+<div class="warn"><strong>路由边界：</strong>简单 round-robin 在 LLM serving 中上限很低。它可能均衡了请求数，却摧毁 prefix cache 命中率、打散会话状态，并把长上下文请求混入短请求池。</div>
+<p>更进一步的策略是基于预测延迟选择副本。简单的 queue depth、memory pressure 都是代理指标，不直接告诉你“这个副本能不能按时完成这个请求”。大多数平台不一定要立刻上 ML 路由，但要知道传统负载均衡器无法同时兼顾 TTFT、TPOT、prefix hit 和租户优先级。</p>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 为什么在线推理的核心不是平均延迟，而是尾延迟</h2>
+<p>用户不会感知“平均一次请求很快”，用户感知的是偶发慢请求、高峰期超时、首次请求冷启动和某些路径特别慢。一个请求依赖多个下游时，总尾延迟往往由最慢的那一跳决定。因此模型服务里的很多设计目标不是把平均值做低，而是控制尾部风险。</p>
+<pre><code>P50:    150 ms
+P90:    350 ms
+P95:    800 ms
+P99:   3500 ms
+P99.9: 15000 ms</code></pre>
+<p>P99 是 P50 的 23 倍，在 LLM 服务里很常见，因为输入长度差异可以轻易达到 100 倍。报告指标要带分位数，不要只有平均；P99 不是偶然噪声，它对应真实的最慢 1% 用户；P99.9 在大流量服务里也要看，因为每天 1000 万请求的服务，P99.9 的长尾就是 1 万个用户。</p>
+<table>
+<tr><th>尾延迟来源</th><th>典型触发</th><th>诊断方法</th></tr>
+<tr><td>冷启动</td><td>新副本拉起时接到第一批流量</td><td>看请求 timestamp 是否和副本 ready 时间接近</td></tr>
+<tr><td>长 prompt prefill</td><td>某个请求 prompt 特别长</td><td>按输入 token 数分桶看延迟</td></tr>
+<tr><td>长 decode</td><td>输出被顶满 <code>max_tokens</code></td><td>按输出 token 数分桶看延迟</td></tr>
+<tr><td>下游抖动</td><td>向量库、检索、rerank 偶发慢</td><td>把每一跳的延迟单独埋点</td></tr>
+<tr><td>队列堆积</td><td>瞬时 QPS 尖峰</td><td>看 queue time 和 concurrency</td></tr>
+<tr><td>Noisy neighbor</td><td>共享 GPU 的其他租户占满 decode 槽</td><td>按租户分桶看 P99</td></tr>
+</table>
+<div class="danger"><strong>反模式：</strong>遇到 P99 问题，先去优化模型推理内核。通常更有效的第一步，是按长度、租户、版本、依赖路径分桶，先判断是所有请求都慢，还是某一类请求很慢。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 在线推理与传统 Web 服务的不同</h2>
+<p>AI 推理服务与传统 Web 服务有共同的入口、日志、限流和发布问题，但它多了几类特别难的约束：计算更重、输入更不规则、缓存更复杂、质量观测更难、发布更重。</p>
+<table>
+<tr><th>维度</th><th>传统 Web 服务</th><th>LLM 推理服务</th></tr>
+<tr><td>单请求资源</td><td>CPU 毫秒级</td><td>GPU 秒级</td></tr>
+<tr><td>请求同质性</td><td>高</td><td>极低，输入输出长度可有 100x 差异</td></tr>
+<tr><td>状态</td><td>大多无状态</td><td>KV Cache、prefix cache、sessions</td></tr>
+<tr><td>冷启动</td><td>&lt; 1 秒</td><td>10 秒到数分钟</td></tr>
+<tr><td>发布滚动</td><td>秒级</td><td>分钟级</td></tr>
+<tr><td>质量闭环</td><td>HTTP 状态码通常足够</td><td>输出内容要单独评估</td></tr>
+<tr><td>副本成本</td><td>几美元/副本/天</td><td>几十到上千美元/副本/天</td></tr>
+</table>
+<div class="note"><strong>核心差异：</strong>传统服务通常可以把副本视为便宜、无状态、快速滚动的进程；LLM 副本则是昂贵、有状态、冷启动重、发布慢的资源容器。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 一个最小在线推理架构</h2>
+<p>对一个中等复杂度模型服务，至少要把以下边界建出来：</p>
+<pre><code>Client
+  -&gt; API Gateway        (鉴权、限流、日志)
+  -&gt; Auth / Rate Limit
+  -&gt; Router             (版本路由、长短路由、prefix 亲和)
+  -&gt; Model Service Replica Pool
+  -&gt; Feature / Retrieval Dependencies
+  -&gt; Metrics / Logs / Traces
+  -&gt; Release / Rollback Control</code></pre>
+<pre class="mermaid">flowchart TB
+  Client --> Edge[Edge / CDN / WAF]
+  Edge --> Gateway[API Gateway<br/>auth / rate limit / tenant tag]
+  Gateway --> Router[LLM Router<br/>version / length class / prefix-aware / SLO-aware]
+  Router --> Prod[Pool A<br/>prod]
+  Router --> Canary[Pool B<br/>canary]
+  Router --> Shadow[Shadow<br/>offline eval]
+  Prod --> Dep[Dependencies<br/>Vector DB / Rerank / Feature Store / Tools]
+  Canary --> Dep
+  Prod --> Obs[Observability & Control<br/>metrics / traces / evals / budget / release gate]
+  Canary --> Obs
+  Shadow --> Obs
+  Dep --> Obs</pre>
+<p>这张架构图背后的工程含义是：router 和 gateway 要分离；多个 pool 要并存；依赖和主模型要分层；可观测性和控制面是一等公民。推理不是单进程问题，发布不是替换模型文件问题，观测也不是只看 QPS。</p>
+</section>
+
+<section class="section" id="s8">
+<h2>8. Prefill / Decode 解耦架构</h2>
+<p>当长上下文 prefill 和持续 decode 同时落在同一副本池时，常见结果是 prefill 抢走大量算力，decode token 级调度被拉长，短请求被长上下文请求拖慢。根因是两者计算特征不同：prefill 更偏 compute-bound，decode 更偏 memory-bandwidth-bound，并长期占用 KV Cache。</p>
+<table>
+<tr><th>阶段</th><th>瓶颈类型</th><th>好的硬件特征</th></tr>
+<tr><td>Prefill</td><td>compute-bound，算力密集</td><td>高 FLOPS、高带宽</td></tr>
+<tr><td>Decode</td><td>memory-bandwidth-bound，访存密集</td><td>高 HBM 带宽、大显存</td></tr>
+</table>
+<pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant R as Router
+  participant P as Prefill Pool
+  participant K as KV Store / Transfer
+  participant D as Decode Pool
+  C->>R: request with long prompt
+  R->>P: schedule prefill
+  P->>K: write KV state
+  K->>D: handoff KV
+  D-->>C: stream decoded tokens
+  R-->>R: adjust routing by TTFT / TPOT</pre>
+<table>
+<tr><th>维度</th><th>一体化副本</th><th>Prefill / Decode 解耦</th></tr>
+<tr><td>优势</td><td>实现简单，状态本地化</td><td>资源池可独立扩缩，长 prompt 更不容易拖垮 decode</td></tr>
+<tr><td>代价</td><td>难针对两类负载分别调优</td><td>需要 KV 传输、状态一致性与更复杂路由</td></tr>
+<tr><td>更适合</td><td>中小规模、请求形态较稳定</td><td>长上下文、高并发、请求长度差异极大</td></tr>
+</table>
+<div class="success"><strong>选型建议：</strong>先试 chunked prefill，再考虑完整解耦。chunked prefill 不把 prefill 和 decode 拆到不同机器，而是在同一次 forward 里把大 prefill 切成小块，和 decode token 混在一起跑。</div>
+<p>完整解耦通常取决于三个信号：<code>t_prefill</code> 是否显著挤压 decode token 吞吐；长上下文流量是否和短请求共享同一资源池；平台是否有能力管理远端 KV 状态与跨池排障。相关方案包括 DistServe、Mooncake、Splitwise，它们共同回答的是如何把 prefill 的高算力路径和 decode 的高显存路径拆开，同时控制 KV handoff 代价。</p>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 多模态 serving 为什么更像组合服务</h2>
+<p>多模态请求不是简单“把图片也喂给 LLM”，它通常会在链路里新增编码器、预处理和更大的前缀状态。图像 resize、patch 化、音频分帧、OCR、视觉编码器版本和跨模态对齐，都会进入容量、缓存和发布边界。</p>
+<table>
+<tr><th>维度</th><th>纯文本 LLM</th><th>多模态模型</th></tr>
+<tr><td>预处理</td><td>tokenizer 为主</td><td>图像 resize、patch 化、音频分帧、OCR 等</td></tr>
+<tr><td>Prefill 成本</td><td>主要由 token 长度决定</td><td>还受视觉 token、音频帧数影响</td></tr>
+<tr><td>缓存键</td><td>prompt 模板、tokenizer 版本</td><td>还要包含图像预处理、视觉编码器版本</td></tr>
+<tr><td>运行时瓶颈</td><td>decode、KV Cache 常更突出</td><td>prefill、带宽、跨模态对齐常更突出</td></tr>
+</table>
+<div class="warn"><strong>缓存边界：</strong>如果多模态预处理、视觉编码器版本和 tokenizer 版本没有纳入缓存键，prefix cache、检索 cache 和模型版本很容易同时失效。</div>
+<p>常见架构选择是编码器与生成器分开扩缩，对大图和长音频单独限流，并把预处理版本纳入缓存与发布元数据。多模态 serving 更像组合服务，而不是单个模型 API。</p>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 模型服务框架对照</h2>
+<p>不同 serving 框架的差别，不只是吞吐 benchmark，而是它们把哪些运行时问题内置到了平台层。</p>
+<table>
+<tr><th>框架</th><th>核心定位</th><th>优势</th><th>更适合的场景</th></tr>
+<tr><td>vLLM</td><td>面向 LLM 的高吞吐服务</td><td>continuous batching、PagedAttention、prefix cache、chunked prefill 成熟</td><td>大模型在线生成服务</td></tr>
+<tr><td>SGLang</td><td>面向复杂生成的 serving 引擎</td><td>RadixAttention、结构化生成、工具调用编排</td><td>Agent、tool-use、结构化输出</td></tr>
+<tr><td>TensorRT-LLM</td><td>NVIDIA 深度优化引擎</td><td>对 NVIDIA GPU、量化和 kernel 优化支持强</td><td>追求极致性能的 NVIDIA 环境</td></tr>
+<tr><td>TGI</td><td>Hugging Face 系推理服务</td><td>集成度高，生态广</td><td>快速部署 HF 模型</td></tr>
+<tr><td>Triton Inference Server</td><td>通用多模型服务框架</td><td>多后端统一接入，适合混合模型栈</td><td>CV/NLP/LLM 混部平台</td></tr>
+<tr><td>KServe</td><td>Kubernetes 原生模型服务</td><td>与 K8s 控制面、灰度和 autoscaling 集成自然</td><td>平台化、多团队托管</td></tr>
+<tr><td>Ollama</td><td>本地轻量模型运行时</td><td>接入简单</td><td>本地开发、演示、边缘验证</td></tr>
+</table>
+<pre><code>请求是 LLM 为主吗？
+├── 否：Triton 或 KServe
+└── 是
+    ├── 需要 tool-use / agent / 结构化输出：SGLang
+    ├── NVIDIA 硬件 + 极致性能 + 接受重运维：TensorRT-LLM
+    ├── 平衡且活跃的生态：vLLM
+    └── 本地开发 / 边缘：Ollama / llama.cpp</code></pre>
+<div class="note"><strong>选型原则：</strong>先问是追求极限吞吐，还是追求统一托管能力；两者很少能同时做到最优。并发模式也会改变 benchmark 结论。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 冷启动与预热</h2>
+<p>推理服务的冷启动通常不是单一步骤，而是三段叠加：权重加载、运行时初始化、首次执行优化。权重要从对象存储或本地盘搬到进程和显存；CUDA context、allocator、依赖连接要初始化；CUDA graph、kernel autotune 和缓存路径也可能在首次执行时触发。</p>
+<table>
+<tr><th>场景</th><th>典型值</th><th>说明</th></tr>
+<tr><td>API 网关与鉴权</td><td>1-10 ms</td><td>通常远低于模型执行，但会影响整体 P99</td></tr>
+<tr><td>向量检索 / 特征依赖</td><td>10-80 ms</td><td>RAG 场景里常成为次要尾延迟来源</td></tr>
+<tr><td>已预热 LLM 首 token 延迟</td><td>50-300 ms</td><td>与模型规模、batch 和 prompt 长度强相关</td></tr>
+<tr><td>7B-13B 模型冷启动</td><td>10-60 s</td><td>主要受权重加载和 runtime 初始化影响</td></tr>
+<tr><td>70B 级模型冷启动</td><td>30-180 s</td><td>多 GPU 协调和权重搬运更重</td></tr>
+</table>
+<table>
+<tr><th>手段</th><th>能省多少</th><th>代价</th></tr>
+<tr><td>权重分层预拉取，镜像或本地 NVMe 缓存</td><td>10-60 秒</td><td>机器本地盘空间</td></tr>
+<tr><td>safetensors 直接 mmap</td><td>5-30 秒</td><td>几乎无代价</td></tr>
+<tr><td>CUDA graph 预捕获</td><td>1-5 秒</td><td>开发工作量</td></tr>
+<tr><td>prefill warmup</td><td>1-10 秒，首批请求受益</td><td>几秒副本不可用时间</td></tr>
+<tr><td>副本保活 / warm pool</td><td>几乎归零</td><td>空转成本，详见 <a href="17-multitenancy-and-cost.html">第 17 章</a></td></tr>
+<tr><td>用更快的对象存储</td><td>30-50%</td><td>存储成本</td></tr>
+</table>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> PullWeights
+  PullWeights --> InitRuntime
+  InitRuntime --> HealthCheck
+  HealthCheck --> WarmupShortPrompt
+  WarmupShortPrompt --> WarmupLongPrompt
+  WarmupLongPrompt --> CaptureGraphs
+  CaptureGraphs --> CanaryTraffic
+  CanaryTraffic --> Serving
+  Serving --> Draining
+  Draining --> [*]</pre>
+<div class="success"><strong>预热流程：</strong>health check 通过后，先发送短 prompt、长 prompt 和多种 batch size 的预热请求，观察 TTFT/TPOT 进入稳态，再以小比例接入正式流量。</div>
+<div class="danger"><strong>容量风险：</strong>冷启动时间应作为 SLO 的一部分，而不是出问题时再看。副本起得越慢，就越要保留更多 warm 容量，成本也越高。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 熔断与降级</h2>
+<p>当下游依赖抖动或模型池接近饱和时，在线推理不能只靠“多加副本”兜底，还要有明确的保护动作。</p>
+<table>
+<tr><th>机制</th><th>作用</th><th>常见触发条件</th></tr>
+<tr><td>熔断器</td><td>暂停访问异常下游，避免放大故障</td><td>检索服务错误率升高、超时持续上升</td></tr>
+<tr><td>排队上限</td><td>防止请求无限堆积</td><td>队列长度、排队时长超过阈值</td></tr>
+<tr><td>降级响应</td><td>返回简化结果或切换低成本模型</td><td>GPU 池饱和、关键依赖不可用</td></tr>
+<tr><td>超时回退</td><td>保护整体 SLA</td><td>非核心后处理或检索链路超时</td></tr>
+<tr><td>Admission control</td><td>拒绝无法按 SLO 完成的请求</td><td>预测延迟超过 SLO</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[Incoming Request] --> B{Predicted latency within SLO?}
+  B -- yes --> C{Dependencies healthy?}
+  B -- no --> L[Admission control<br/>429 or retry-after]
+  C -- yes --> D[Full pipeline]
+  C -- no --> E{Can degrade?}
+  E -- close rerank --> F[Skip rerank]
+  E -- smaller model --> G[Fallback model]
+  E -- shorter context --> H[Truncate context]
+  E -- no --> I[503 / cached template]
+  F --> J[Observe quality impact]
+  G --> J
+  H --> J
+  I --> J</pre>
+<p>降级不是一个动作，而是一组可选择的行为。按破坏性从小到大：关闭非核心增强，切小模型，截短上下文，减少 <code>max_tokens</code>，返回缓存或模板回复，最后拒绝请求。</p>
+<div class="warn"><strong>演练要求：</strong>降级策略要定期演练。如果线上从来没真正触发过降级，它在事故时多半不会按预期工作。</div>
+<p>在多租户环境下，这些策略还会和优先级耦合在一起。高优先级流量通常拥有更高的排队预算和更晚的降级阈值；相关治理逻辑会在 <a href="17-multitenancy-and-cost.html">第 17 章</a> 展开。</p>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 工程建议</h2>
+<ul>
+<li>用请求时间拆解定位瓶颈，不要先假设模型执行最慢。</li>
+<li>路由策略要显式区分模型版本、上下文长度和租户优先级。</li>
+<li>尽量做 prefix-aware 路由，不要让 prefix cache 白费。</li>
+<li>当 <code>t_prefill</code> 与 <code>t_decode</code> 的资源特征明显分化时，先试 chunked prefill，再考虑完整解耦。</li>
+<li>冷启动要作为容量模型的一部分，而不是仅在故障时考虑。</li>
+<li>多模态请求要把预处理、编码器和生成器一起纳入容量与缓存设计。</li>
+<li>熔断、排队上限和降级策略要写入控制面，而不是靠人工临时切换。</li>
+<li>指标要看分位数 P50/P95/P99，不要只看平均。</li>
+<li>goodput 比 QPS 更诚实，因为它考虑了 SLO。</li>
+</ul>
+<div class="note"><strong>章节连接：</strong>本章解释在线推理的系统边界；批处理和 KV Cache 的细节见 <a href="15-batching-scheduling-and-kv-cache.html">第 15 章</a>，量化与引擎选择见 <a href="16-quantization-compilation-and-engines.html">第 16 章</a>，多租户与成本治理见 <a href="17-multitenancy-and-cost.html">第 17 章</a>。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card">
+<h3>学习路线</h3>
+<ol>
+<li>先把一次请求拆成 queue、preprocess、model、downstream、postprocess。</li>
+<li>再把 LLM model time 拆成 prefill、decode，并建立 TTFT、TPOT、ITL、E2EL、goodput 的指标习惯。</li>
+<li>然后画出 gateway、router、replica pool、dependency、observability/control 的边界。</li>
+<li>最后用冷启动、降级、灰度和回滚规则检查控制面是否完整。</li>
+</ol>
+</div>
+<div class="card">
+<h3>延伸阅读</h3>
+<ul>
+<li>vLLM：PagedAttention、continuous batching、prefix cache、chunked prefill。</li>
+<li>SGLang：RadixAttention、结构化生成和 agent serving。</li>
+<li>NVIDIA TensorRT-LLM 与 Triton Inference Server：高性能推理和多后端托管。</li>
+<li>KServe：Kubernetes 原生模型服务、灰度和 autoscaling。</li>
+<li>DistServe、Mooncake、Splitwise：Prefill / Decode 解耦方向的代表性系统。</li>
+</ul>
+</div>
+</div>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

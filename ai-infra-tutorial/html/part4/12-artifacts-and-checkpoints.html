@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 12 章 · 制品、模型与检查点管理 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=12" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 12 章 · 制品、模型与检查点管理</h1>
+<p class="sub">从“训练和发布产生的离散文件如何变成可恢复、可验证、可发布、可回滚、可审计的平台对象”出发，拆清 checkpoint、模型包、元数据、生命周期状态、registry、存储后端和 CI/CD 之间的因果关系。</p>
+<div class="chips"><span class="chip">Artifact</span><span class="chip">Checkpoint</span><span class="chip">Model Registry</span><span class="chip">Manifest</span><span class="chip">生命周期状态</span><span class="chip">回滚</span><span class="chip">对象存储</span></div>
+<div class="note"><strong>不可化简的问题：</strong>文件系统只能证明路径下有字节；AI 平台必须证明某个训练或发布结果有完整证据链，并且能被恢复、验证、发布、回滚和审计。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：从文件到平台对象</a></li>
+<li><a class="anchor" href="#s2">学习目标与核心判断</a></li>
+<li><a class="anchor" href="#s3">什么算制品</a></li>
+<li><a class="anchor" href="#s4">Checkpoint 和模型包的边界</a></li>
+<li><a class="anchor" href="#s5">最小版本元数据</a></li>
+<li><a class="anchor" href="#s6">生命周期状态</a></li>
+<li><a class="anchor" href="#s7">Registry 的真正价值</a></li>
+<li><a class="anchor" href="#s8">文件都在但无法回滚</a></li>
+<li><a class="anchor" href="#s9">存储后端怎么选</a></li>
+<li><a class="anchor" href="#s10">Checkpoint 文件系统语义</a></li>
+<li><a class="anchor" href="#s11">制品与 CI/CD 集成</a></li>
+<li><a class="anchor" href="#s12">工程建议与常见工具</a></li>
+<li><a class="anchor" href="#s13">最低限度的制品分层</a></li>
+<li><a class="anchor" href="#s14">小结与练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：从文件到平台对象</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 MLflow、Weights &amp; Biases、S3、Model Registry、checkpoint manager 这些工具名之后，本章要解决的不可化简问题只有一个：训练和发布会产生很多文件，但平台真正需要管理的不是“文件存在”，而是“某个结果是否有完整证据链，能否恢复、验证、发布、回滚和审计”。文件系统只能回答路径下有没有字节；对象存储只能告诉你某个 key 是否存在；训练框架只能在局部上下文里知道某些 tensor、optimizer state 和 step 是否被写出。可是生产系统关心的是另一类问题：这个模型版本从哪份数据、哪段代码、哪个镜像、哪个训练任务而来？它的 checkpoint 能否 true resume？它的模型包是否包含 tokenizer、推理配置、签名和评测报告？它是否通过门禁，是否允许进入 staging，是否可以被生产流量路由，是否能在事故中作为回滚候选？</p>
+<p>这个问题之所以不可再拆，是因为 AI 系统的输出天然是离散的、多副本的、跨系统流转的。一次训练可能每隔一小时写出 checkpoint，每个 checkpoint 又由多个 rank、多个 shard、多个 metadata 文件组成；一次发布可能需要权重、tokenizer、vocab、config、镜像 digest、部署 manifest、评测报告、安全扫描结果和审批记录同时匹配。一个 70B checkpoint 可以达到数百 GB 到数 TB；一次线上事故可能要求平台在 5 分钟内定位上一个 production 模型包并确认它和配置、tokenizer、镜像、评测报告彼此兼容。如果只是把结果按日期扔进 bucket，团队看似保存了所有文件，实际上无法证明哪个版本完整、哪个版本通过门禁、哪个版本可以恢复，甚至无法证明线上跑的模型是不是训练报告里说的那一版。</p>
+<p>因此，制品管理的第一性问题不是容量，而是判定性。容量回答“放不放得下”，判定性回答“这个版本是不是一个可用对象”。平台需要把一堆离散文件提升为可查询、可比较、可流转、可治理的 artifact。这个 artifact 不只是路径集合，而是带有元数据、状态、血缘、校验、权限、审计和生命周期的控制面对象。只有当平台能基于这些对象自动触发评测、发布、回滚和清理时，训练输出才真正进入工程系统。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>如果结果需要证明来源，就必然需要元数据。代码 revision、数据集版本、训练 job id、配置、step、rank 分片、镜像 digest、评测报告、安全扫描结果和审批记录必须绑定到同一个 artifact 版本，否则训练、评测和部署之间只能靠人工猜测。没有元数据时，“当前线上跑的是哪个版本”会退化成查目录名；“它比上一版好在哪里”会退化成翻聊天记录；“能否回滚”会退化成临时下载一批旧文件试运行。</p>
+<p>如果结果需要恢复，就必然要区分 checkpoint 和模型包。Checkpoint 面向训练恢复，必须保存模型参数、优化器状态、scheduler、当前 step、随机数状态、sampler 进度和并行分片布局；模型包面向部署，必须保存可加载权重、tokenizer、模型签名、推理配置、依赖环境和版本元数据。把两者混用会同时伤害训练和发布：恢复时发现缺 optimizer 或 RNG 状态，部署时发现包过大、依赖过重、包含训练态私有结构，甚至 serving runtime 无法加载。</p>
+<p>如果结果需要自动发布，就必然需要生命周期状态。<code>draft</code>、<code>validated</code>、<code>staging</code>、<code>production</code>、<code>deprecated</code> 不只是标签，而是发布系统、权限系统、路由系统、审计系统和清理系统共同消费的控制面字段。一个版本从 <code>draft</code> 进入 <code>validated</code>，意味着它通过了固定评测和一致性检查；进入 <code>production</code>，意味着流量路由和审计记录已经落地；进入 <code>deprecated</code>，意味着它不能再被新流量选中，但可能仍要保留一段时间用于回滚和复盘。</p>
+<p>如果结果需要跨系统流转，就必然需要 registry 或 metadata plane。对象存储适合保存大对象，但它不知道某个目录是否代表完整版本；CI/CD 不天然知道哪个 checkpoint 通过评测；Serving 平台不应靠人工表格判断 tokenizer 是否匹配。Registry 把“字节”提升成“对象”，提供索引、关联、状态、权限和审计。底层存储解决另一层问题：POSIX FS 适合临时 staging；并行文件系统适合集群共享的大 checkpoint；对象存储适合归档和分发。故障后恢复可信，还要依赖 manifest、校验和、临时文件、原子 rename、父目录 <code>fsync</code>、对象存储 immutable key、评测门禁和回滚候选选择。整章的机制因此都从同一件事推出：平台必须把训练输出从“文件集合”变成“有判定边界的版本对象”。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((制品与 checkpoint 管理))
+    不可化简问题
+      文件存在
+      版本可用
+      证据链
+    训练输出
+      checkpoint
+        参数和优化器状态
+        step 和 RNG
+        sampler 和分片布局
+      模型包
+        权重和 tokenizer
+        serving config
+        依赖镜像
+    平台对象化
+      metadata
+      lifecycle state
+      registry
+        索引
+        关联
+        审计
+    存储后端
+      POSIX FS
+        fsync
+        rename
+        atomicity
+      并行文件系统
+        stripe
+        元数据瓶颈
+      对象存储
+        immutable object
+        manifest 发布
+    工程结果
+      可恢复
+      可发布
+      可回滚
+      可审计</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么“文件已上传”仍不等于模型版本可发布？</li>
+<li>checkpoint 和模型包分别服务于哪个系统目标，为什么不能混用？</li>
+<li>一个 artifact 版本至少需要哪些元数据，才能串起训练、评测、部署和回滚？</li>
+<li>生命周期状态为什么属于平台控制面，而不是人工备注？</li>
+<li>POSIX FS、并行文件系统和对象存储的哪些语义差异会破坏恢复可靠性？</li>
+<li>为什么 manifest、校验和和状态门禁能把“文件集合”提升为“可判定版本”？</li>
+<li>清理 checkpoint 和模型包时，为什么不能只按文件年龄删除？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与核心判断</h2>
+<p>模型训练不是只产生一个最终权重文件；真正需要平台管理的，是一整组能证明结果来源、支持恢复并支撑发布决策的工件。完成本章学习后，你应该能够区分 checkpoint、模型包、评测报告、配置和日志等不同制品，理解为什么工件管理是训练和发布之间的桥梁，并设计一套可追踪的模型版本与状态管理方式。</p>
+<div class="note"><strong>关联章节：</strong>本章讨论的 checkpoint、模型包和回滚链路，与 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>的训练恢复机制直接相连；恢复能否成功，取决于制品是否被平台正确登记和保留。</div>
+<div class="grid-3">
+<div class="card"><strong>训练侧</strong><br>关注 step、rank、optimizer state、RNG、sampler、并行布局，以及 checkpoint 是否完整可恢复。</div>
+<div class="card"><strong>发布侧</strong><br>关注权重、tokenizer、推理配置、镜像、评测报告和审批记录是否属于同一个版本。</div>
+<div class="card"><strong>平台侧</strong><br>关注索引、状态、权限、审计、清理和回滚候选选择是否能自动执行。</div>
+</div>
+<div class="warn"><strong>核心判断：</strong>模型“可下载”不等于模型“可发布”；checkpoint“存在”不等于 checkpoint“可恢复”。平台必须让这些判断从人工经验变成系统字段和门禁规则。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 什么算制品</h2>
+<p>AI 平台中的制品通常包括 checkpoint、最终模型包、tokenizer / vocab、评测报告、训练配置、实验日志、embedding 索引、推理镜像与部署清单。它们共同构成了“模型是怎么来的、现在能不能上线、失败后能不能恢复”的证据链。</p>
+<table>
+<tr><th>制品</th><th>主要消费者</th><th>回答的问题</th></tr>
+<tr><td>Checkpoint</td><td>训练平台、恢复逻辑</td><td>训练能否从某个 step 正确继续？</td></tr>
+<tr><td>模型包</td><td>Serving 平台、发布系统</td><td>模型能否被加载、路由和回滚？</td></tr>
+<tr><td>Tokenizer / vocab</td><td>训练、评测、推理</td><td>输入输出切分是否和权重匹配？</td></tr>
+<tr><td>评测报告</td><td>发布门禁、模型治理</td><td>版本是否比 baseline 更好且满足安全要求？</td></tr>
+<tr><td>训练配置与日志</td><td>复现、排障、审计</td><td>版本从什么配置和环境产生？</td></tr>
+<tr><td>镜像与部署清单</td><td>CI/CD、Serving 编排</td><td>运行环境和发布拓扑是否可复现？</td></tr>
+</table>
+<p>如果这些制品只是散落在对象存储里，那么平台就很难回答线上跑的是哪个版本、它对应哪次训练、它是否通过评测，以及出故障后该回滚到哪一个版本。</p>
+<pre class="mermaid">flowchart LR
+    A[训练任务] --> B[Checkpoint]
+    A --> C[训练配置和日志]
+    A --> D[评测候选]
+    D --> E[评测报告]
+    B --> F[模型包构建]
+    C --> F
+    E --> G[Registry版本对象]
+    F --> G
+    G --> H[Staging发布]
+    H --> I[Production]
+    I --> J[回滚候选]</pre>
+</section>
+
+<section class="section" id="s4">
+<h2>4. Checkpoint 和模型包的边界</h2>
+<p>Checkpoint 面向训练恢复，往往包含模型参数、优化器状态、scheduler 状态、当前 step / epoch、随机数状态、sampler 进度和并行分片布局。模型包面向部署，通常更关注可加载权重、推理配置、tokenizer、模型签名、版本元数据和依赖环境。</p>
+<table>
+<tr><th>对象</th><th>目标</th><th>典型内容</th><th>混用后的问题</th></tr>
+<tr><td>Checkpoint</td><td>训练恢复</td><td>参数、优化器、scheduler、step、RNG、sampler、shard layout</td><td>拿去部署时包过大、依赖训练框架内部结构、serving 无法加载</td></tr>
+<tr><td>模型包</td><td>部署与回滚</td><td>权重、tokenizer、config、签名、镜像 digest、评测与发布元数据</td><td>拿去恢复时缺 optimizer、RNG、数据进度，loss 曲线不可解释</td></tr>
+</table>
+<div class="success"><strong>设计原则：</strong>成熟平台会把“训练恢复资产”和“部署资产”视为相关但不同的对象：它们共享血缘和版本关系，但生命周期、保存频率、权限、清理策略和消费者都不同。</div>
+<pre class="mermaid">flowchart TB
+    A[训练状态] --> B[Checkpoint]
+    A --> C[模型导出]
+    B --> D[恢复训练]
+    B --> E[评测候选选择]
+    C --> F[模型包]
+    E --> F
+    F --> G[Serving加载]
+    F --> H[灰度发布]
+    F --> I[生产回滚]
+    B -. 不直接作为生产包 .-> G</pre>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 最小版本元数据</h2>
+<p>一个可运营的 artifact 版本至少要把模型名、版本、数据集版本、代码 revision、训练任务、评测报告、镜像和状态绑定在一起。没有这类元数据时，你无法可靠回答当前线上跑的是哪个版本、它对应哪次训练、它是否通过评测，以及它能否快速回滚。</p>
+<pre><code class="language-yaml">artifact:
+  model_name: reranker
+  model_version: 2026-04-10-rc1
+  dataset_version: support-v3
+  code_revision: abc1234
+  training_job: train-20260410-001
+  eval_report: eval-20260410-001.json
+  image: serving-reranker:2026-04-10-rc1
+  status: staging</code></pre>
+<table>
+<tr><th>字段</th><th>为什么需要</th><th>缺失风险</th></tr>
+<tr><td><code>dataset_version</code></td><td>证明训练输入来源</td><td>效果变化无法解释，复现困难</td></tr>
+<tr><td><code>code_revision</code></td><td>绑定训练代码与导出逻辑</td><td>同名权重可能来自不同实现</td></tr>
+<tr><td><code>training_job</code></td><td>串起日志、指标、checkpoint 和审批</td><td>排障时只能靠人工查找</td></tr>
+<tr><td><code>eval_report</code></td><td>支撑发布门禁与 baseline 对比</td><td>上线变成未验证发布</td></tr>
+<tr><td><code>image</code></td><td>锁定推理运行环境</td><td>权重正确但 runtime 不兼容</td></tr>
+<tr><td><code>status</code></td><td>作为控制面状态</td><td>发布、清理、回滚规则无法自动化</td></tr>
+</table>
+<div class="note"><strong>最小而不是随意：</strong>元数据字段不需要一开始就覆盖所有治理需求，但必须足以跨越训练、评测、部署和回滚四个系统边界。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 生命周期状态</h2>
+<p>一个模型版本至少可以有 <code>draft</code>、<code>validated</code>、<code>staging</code>、<code>production</code>、<code>deprecated</code>。这些状态不是形式化文档，而是平台控制面的一部分。它们直接影响谁能发布、哪个版本能被流量路由、哪个版本能被回滚选中、哪些工件可以清理。</p>
+<pre class="mermaid">stateDiagram-v2
+    [*] --> draft: 训练或导出完成
+    draft --> validated: 离线评测通过
+    draft --> deprecated: 评测失败或人工废弃
+    validated --> staging: 发布门禁通过
+    staging --> production: 灰度放量完成
+    staging --> deprecated: 灰度失败
+    production --> deprecated: 新版本替换且保留窗口结束
+    deprecated --> [*]</pre>
+<table>
+<tr><th>状态</th><th>允许动作</th><th>禁止动作</th></tr>
+<tr><td><code>draft</code></td><td>补充 metadata、触发评测、删除临时失败版本</td><td>直接接生产流量</td></tr>
+<tr><td><code>validated</code></td><td>进入 staging、生成发布候选</td><td>绕过镜像和配置一致性检查</td></tr>
+<tr><td><code>staging</code></td><td>灰度、压测、回滚演练</td><td>被清理系统删除</td></tr>
+<tr><td><code>production</code></td><td>接生产流量、作为回滚基线</td><td>无审计修改关键文件</td></tr>
+<tr><td><code>deprecated</code></td><td>保留审计、在窗口后归档或清理</td><td>成为新发布候选</td></tr>
+</table>
+<div class="danger"><strong>严重风险：</strong>把生命周期状态写在人工表格里，等于让发布系统、路由系统和清理系统各自猜测真相。事故时最容易出现“旧版本被清掉了”或“未评测版本被路由了”。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. Registry 的真正价值</h2>
+<p>很多人会问：“对象存储里已经有文件了，为什么还需要 registry 或管理系统？”原因在于管理系统解决的不只是“放文件”，而是索引、关联、状态、权限和审计。也就是说，制品管理系统的价值是让“文件”变成“平台对象”。</p>
+<div class="grid-3">
+<div class="card"><strong>索引</strong><br>按模型、版本、状态、训练任务、数据集和评测结果快速查找。</div>
+<div class="card"><strong>关联</strong><br>把训练、评测、部署、反馈、回滚和审计串成证据链。</div>
+<div class="card"><strong>状态</strong><br>让发布系统消费 <code>validated</code>、<code>staging</code>、<code>production</code> 等控制面字段。</div>
+<div class="card"><strong>权限</strong><br>控制谁能读、谁能发、谁能改状态、谁能删除长期保留版本。</div>
+<div class="card"><strong>审计</strong><br>记录谁在什么时候把哪个版本推进到哪个状态。</div>
+<div class="card"><strong>清理</strong><br>基于状态、引用和保留策略清理，而不是只按文件年龄删除。</div>
+</div>
+<pre class="mermaid">flowchart LR
+    A[对象存储中的字节] --> B[Manifest与校验和]
+    B --> C[Registry版本对象]
+    D[训练元数据] --> C
+    E[评测报告] --> C
+    F[镜像和部署清单] --> C
+    C --> G[发布系统]
+    C --> H[回滚系统]
+    C --> I[审计系统]
+    C --> J[清理系统]</pre>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 文件都在但无法回滚</h2>
+<p>这类事故通常来自 checkpoint 和模型包命名不一致、线上版本没有记录对应评测结果、镜像版本和模型版本脱节、回滚时发现 tokenizer 或配置文件不匹配。它说明一个重要事实：回滚不是“把旧文件拷回来”，而是让一整组彼此兼容的制品重新组成一个可运行系统。</p>
+<div class="danger"><strong>失败模式：</strong>如果 production 只记录了 <code>s3://models/reranker/latest/</code>，而不是不可变版本、manifest、镜像 digest 和评测报告，那么 <code>latest</code> 被覆盖后，所谓“回滚”可能回到一个从未评测过的组合。</div>
+<table>
+<tr><th>表面现象</th><th>真实缺口</th><th>平台修复</th></tr>
+<tr><td>旧权重还在 bucket</td><td>不知道对应 tokenizer 和 config</td><td>模型包 manifest 绑定全部运行资产</td></tr>
+<tr><td>有 checkpoint</td><td>缺 optimizer / RNG / sampler，不能 true resume</td><td>checkpoint schema 和校验规则</td></tr>
+<tr><td>评测报告存在</td><td>没有绑定模型 digest 和数据版本</td><td>评测报告引用不可变 artifact id</td></tr>
+<tr><td>镜像可以拉取</td><td>镜像与权重版本脱节</td><td>发布候选绑定 image digest</td></tr>
+<tr><td>目录名看似是旧版</td><td>目录可被覆盖或半写入</td><td>immutable key + manifest 提交</td></tr>
+</table>
+<div class="success"><strong>回滚候选选择：</strong>优先选择最近一个 <code>production</code> 或通过灰度的 <code>validated</code> 版本，并要求模型包、tokenizer、config、镜像、评测报告和审批记录全部可校验。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 存储后端怎么选</h2>
+<p>制品管理首先是对象治理，其次才是“放在哪里”。更稳妥的理解是：底层存储和上层 registry / metadata plane 是两层不同能力，前者负责放大文件，后者负责版本、状态和审计。</p>
+<table>
+<tr><th>层</th><th>优势</th><th>局限</th><th>适用规模</th></tr>
+<tr><td>本地 NFS / NAS</td><td>接入简单，训练集群共享方便</td><td>跨地域差、扩容与审计能力弱</td><td>小团队、单机房</td></tr>
+<tr><td>对象存储（S3 / GCS / MinIO）</td><td>容量弹性大，适合 checkpoint 和模型包归档</td><td>目录语义弱，需额外做索引和状态管理</td><td>中大规模平台</td></tr>
+<tr><td>Artifact Registry / Metadata Plane（MLflow、W&amp;B 等）</td><td>自带版本、状态、实验关联</td><td>本身通常仍要依赖对象存储或共享存储承载大文件</td><td>需要审计与门禁的团队</td></tr>
+</table>
+<p>平台上常见的组合是：大文件放对象存储，元数据和生命周期状态放 registry。这样既保留了弹性容量，也能让发布系统直接消费“哪个版本可用”的控制面信息。</p>
+<pre class="mermaid">flowchart TB
+    A[训练集群本地或并行FS] -->|快速写入checkpoint| B[临时staging区]
+    B -->|校验通过| C[对象存储归档]
+    C -->|immutable URI和checksum| D[Registry]
+    D --> E[评测系统]
+    D --> F[Serving平台]
+    D --> G[清理与保留策略]
+    E -->|状态更新| D
+    F -->|发布记录| D</pre>
+<div class="warn"><strong>边界提醒：</strong>不要让 serving 平台直接扫描对象存储目录选择模型。它应该消费 registry 中经过门禁的版本对象，否则会把目录命名、上传顺序和人工约定当成发布协议。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Checkpoint 文件系统语义</h2>
+<p>Checkpoint 写入比普通制品上传更接近文件系统语义问题，底层差异可参考 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c 文件系统与存储内核</a>。POSIX FS 适合写临时文件、<code>fsync(file)</code>、同目录 <code>rename()</code> 成正式文件，再 <code>fsync(parent dir)</code>；工程边界是 <code>write()</code> 成功不等于落盘，<code>rename()</code> 成功不等于父目录已持久化，跨挂载点 rename 也不是原子替换。</p>
+<p>并行文件系统适合多 rank 写 10GB-100GB 级 shard，通过 stripe 聚合带宽，但小文件、频繁 <code>stat/open</code>、单目录并发会打 MDS。对象存储适合归档和跨地域保留，但 S3/OSS 不是 POSIX：没有本地 <code>fsync</code>，<code>rename</code> 往往是 copy+delete，<code>LIST prefix</code> 不能当事务边界；可靠协议应改成 immutable key + manifest。</p>
+<table>
+<tr><th>后端</th><th>适合放什么</th><th>关键语义</th><th>工程边界</th></tr>
+<tr><td>本地 POSIX FS</td><td>临时 staging、单节点 checkpoint</td><td><code>fsync</code>、同 FS <code>rename</code> 原子可见</td><td>节点丢失会丢本地副本，需异步归档</td></tr>
+<tr><td>并行 FS</td><td>多节点共享 checkpoint、大 shard</td><td>stripe 聚合带宽、POSIX 路径语义</td><td>MDS 和小文件是上限，需压测目录并发</td></tr>
+<tr><td>对象存储</td><td>长期归档、发布分发、跨区域保留</td><td>PUT 完成、multipart、manifest</td><td>非 POSIX，不能依赖 rename/fsync/list 事务</td></tr>
+</table>
+<pre class="mermaid">sequenceDiagram
+    participant R as Rank/Writer
+    participant S as Staging FS
+    participant O as Object Store
+    participant M as Registry
+    R->>S: 写临时 shard
+    R->>S: fsync(file) 并 rename
+    R->>S: fsync(parent dir)
+    R->>O: 上传 immutable shard key
+    R->>O: 上传 manifest 和 checksum
+    O->>M: 登记 manifest URI
+    M->>M: 校验齐全后标记 committed</pre>
+<div class="note"><strong>提交协议：</strong>不要把“最后一个文件出现”当作完成信号。可靠做法是先写不可变 shard，再发布 manifest，由 registry 校验后推进状态。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 制品与 CI/CD 集成</h2>
+<p>制品真正发挥作用，是在训练结束后继续沿着评测、审批和发布链路流动，而不是停留在某个 bucket 目录中。从平台工程角度看，关键不是自动化步骤多，而是状态流转要稳定。</p>
+<pre><code>训练完成
+  -&gt; 注册 checkpoint / 模型包
+  -&gt; 触发离线评测
+  -&gt; 写入版本状态与报告
+  -&gt; 发布系统读取 validated 版本
+  -&gt; 灰度 / 全量 / 回滚</code></pre>
+<table>
+<tr><th>阶段</th><th>平台动作</th><th>产出</th></tr>
+<tr><td>训练结束</td><td>上传制品并登记元数据</td><td>可查询版本</td></tr>
+<tr><td>自动评测</td><td>运行基准集、生成报告</td><td><code>validated</code> 候选</td></tr>
+<tr><td>发布门禁</td><td>检查签名、配置、镜像一致性</td><td><code>staging</code> 或拒绝</td></tr>
+<tr><td>正式发布</td><td>流量切换与留痕</td><td><code>production</code> 版本</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+    A[训练完成] --> B[注册制品]
+    B --> C[离线评测]
+    C --> D{门禁通过?}
+    D -- 否 --> E[保持draft或deprecated]
+    D -- 是 --> F[validated]
+    F --> G[staging部署]
+    G --> H{灰度健康?}
+    H -- 否 --> I[回滚或废弃]
+    H -- 是 --> J[production]
+    J --> K[审计与保留]</pre>
+<div class="warn"><strong>工程边界：</strong>如果 CI/CD 不认识制品状态，训练、评测、发布就仍然是三套松散流程；一旦出故障，排障和回滚会重新退回手工比对文件名。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 工程建议与常见工具</h2>
+<ul>
+<li>训练输出路径、评测结果、模型注册必须可关联。</li>
+<li>Checkpoint 保存策略要和恢复流程一起设计。</li>
+<li>模型“可下载”不等于模型“可发布”。</li>
+<li>老工件必须有清理和归档规则。</li>
+<li>发布系统应直接消费工件状态，而不是靠人工表格同步。</li>
+</ul>
+<table>
+<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
+<tr><td>模型与实验注册</td><td>MLflow Model Registry、Weights &amp; Biases Artifacts</td><td>管理版本、状态和关联关系</td></tr>
+<tr><td>大文件与对象存储同步</td><td><code>aws s3 cp/sync</code>、<code>mc cp</code></td><td>适合 checkpoint / 模型包上传归档</td></tr>
+<tr><td>制品打包</td><td>Hugging Face Hub、<code>safetensors</code></td><td>适合发布可加载模型资产</td></tr>
+<tr><td>流水线编排</td><td>GitHub Actions、Argo Workflows</td><td>用于训练完成后的评测与状态流转</td></tr>
+</table>
+<div class="success"><strong>落地顺序：</strong>先统一不可变版本 ID、manifest、关键 metadata 和状态字段；再接入自动评测、灰度发布、审计和清理。没有稳定对象模型时，工具越多，证据链反而越分散。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 最低限度的制品分层</h2>
+<p>即使没有复杂平台，也建议至少区分 checkpoint、模型包、评测报告、配置和部署清单。这能显著减少后续恢复、审计和回滚时的混乱。</p>
+<pre><code>artifacts/
+  checkpoints/
+  model-packages/
+  eval-reports/
+  configs/
+  deployment-manifests/</code></pre>
+<table>
+<tr><th>目录</th><th>最低要求</th><th>后续演进</th></tr>
+<tr><td><code>checkpoints/</code></td><td>包含 step、manifest、shard 校验和</td><td>接入 checkpoint manager 和保留策略</td></tr>
+<tr><td><code>model-packages/</code></td><td>绑定权重、tokenizer、config、签名</td><td>接入 model registry 和 serving 平台</td></tr>
+<tr><td><code>eval-reports/</code></td><td>引用不可变模型版本和评测集版本</td><td>成为发布门禁输入</td></tr>
+<tr><td><code>configs/</code></td><td>保留训练和推理配置快照</td><td>纳入审计与差异比较</td></tr>
+<tr><td><code>deployment-manifests/</code></td><td>记录镜像、资源、路由和环境</td><td>接入灰度与回滚自动化</td></tr>
+</table>
+<div class="note"><strong>小团队策略：</strong>没有 registry 时，也至少用不可变目录名、manifest、checksum、状态文件和变更记录模拟控制面；不要让 <code>latest</code> 成为唯一事实来源。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 小结与练习</h2>
+<table>
+<tr><th>工件</th><th>主要用途</th><th>关键问题</th></tr>
+<tr><td>Checkpoint</td><td>训练恢复</td><td>是否包含足够状态</td></tr>
+<tr><td>模型包</td><td>部署与回滚</td><td>是否与配置、tokenizer 匹配</td></tr>
+<tr><td>评测报告</td><td>发布门禁</td><td>是否与模型版本绑定</td></tr>
+<tr><td>配置 / 日志</td><td>复现与排障</td><td>是否可追踪、可查询</td></tr>
+<tr><td>平台补充</td><td>存储后端与状态流转同样属于制品治理范围</td><td>是否能支撑自动发布与审计</td></tr>
+</table>
+<h3>练习题</h3>
+<ol>
+<li>为什么 checkpoint 不适合直接当生产模型包？</li>
+<li>一个模型版本的最小元数据应该包含哪些字段？</li>
+<li>为什么模型状态管理必须进入平台控制面？</li>
+<li>举一个“文件都在但无法回滚”的失败案例。</li>
+<li>如果团队同时用对象存储和 registry，各自应该保存什么信息？</li>
+<li>请画出一个“训练结束到正式发布”的最小制品流转链路。</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先回到 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>确认 checkpoint 的恢复语义，再结合本章建立 artifact、manifest、registry 和 lifecycle state 的对象模型，最后进入后续数据与存储章节，把特征、向量、缓存和发布链路串起来。</p>
+<p><strong>延伸阅读：</strong>建议阅读 MLflow Model Registry、Weights &amp; Biases Artifacts、Hugging Face Hub、SafeTensors、S3 multipart upload 与对象不可变版本相关文档；同时复习 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c 文件系统与存储内核</a>中关于 <code>fsync</code>、<code>rename</code>、目录持久化和对象存储语义差异的内容。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

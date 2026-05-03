@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 17 章 · 多租户与成本治理 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=17" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 17 章 · 多租户与成本治理</h1>
+<p class="sub">从“有限且昂贵的 GPU 时间如何在多个会互相影响、价值不同、风险不同的请求之间分配”出发，把配额、优先级、隔离、计费、预算和控制面动作串成一套可执行的平台治理模型。</p>
+<div class="chips"><span class="chip">Multi-tenancy</span><span class="chip">Quota</span><span class="chip">Chargeback</span><span class="chip">TCO</span><span class="chip">Goodput</span><span class="chip">Noisy Neighbor</span></div>
+<div class="note"><strong>不可化简的问题：</strong>GPU 时间既昂贵又有限，请求成本又高度不均匀；共享推理平台必须让每个租户知道自己能用多少、为什么被限流、钱花在哪里，以及超出边界时系统会怎样纠偏。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：多租户与成本治理</a></li>
+<li><a class="anchor" href="#s2">学习目标与导读</a></li>
+<li><a class="anchor" href="#s3">为什么推理系统会走向多租户</a></li>
+<li><a class="anchor" href="#s4">多租户真正管理的对象</a></li>
+<li><a class="anchor" href="#s5">单位请求成本与成本放大器</a></li>
+<li><a class="anchor" href="#s6">Cloud、On-Prem 与 Spot 的 TCO 判断</a></li>
+<li><a class="anchor" href="#s7">GPU utilization 高不等于有效产出高</a></li>
+<li><a class="anchor" href="#s8">公平性、配额与优先级策略</a></li>
+<li><a class="anchor" href="#s9">Chargeback 与成本归因</a></li>
+<li><a class="anchor" href="#s10">Noisy Neighbor 与隔离</a></li>
+<li><a class="anchor" href="#s11">把成本规则变成控制面动作</a></li>
+<li><a class="anchor" href="#s12">工程建议、误区与小结</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：多租户与成本治理</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>把 Kubernetes namespace、GPU 调度器、预算看板、FinOps 名词和云厂商折扣先拿掉，多租户与成本治理要解决的不可化简问题只有一个：有限且昂贵的 GPU 时间，必须在多个会互相影响、价值不同、风险不同的请求之间分配，并且分配结果要能被解释、约束和纠偏。GPU 不是一个抽象的“弹性资源”，它是每秒都在折旧或计费的物理设备；一次 LLM 请求也不是一个均匀的 HTTP 调用，而是输入 token 的 prefill、输出 token 的 decode、KV Cache 显存占用、下游检索、rerank、安全检查、日志采样和可能的重试共同组成的资源轨迹。只要多个团队、多个模型版本、多个 SLA 档位进入同一个资源池，就必然出现四个事实：资源在时间上有波峰波谷，按峰值隔离会贵，按平均共享会抖；请求的成本差异极大，1K prompt 和 32K prompt 对算力、显存、排队和缓存亲和性的压力不是线性可替代的；业务价值不同，核心生产流量和一次临时批评测不应在高峰期拥有相同抢占权；账单如果不能归因到租户、版本和具体行为，就不会改变任何人的使用方式。</p>
+<p>因此，本章不是在讲“怎么给每个团队分一个 namespace”，也不是在讲“月底如何导出一张报表”。它要回答的是：当一个共享推理平台被真实组织使用时，如何让每个租户知道自己能用多少、超用会发生什么、为什么被限流、为什么账单变贵、什么时候应该用 Cloud、On-Prem 或 Spot，以及什么指标能证明 GPU 时间确实转化成了有价值的 token。推理系统真正进入平台阶段的标志，往往不是 QPS 上去了，而是多个团队、多个模型、多个优先级同时进入同一个资源池后，系统还能保持可解释和可控。第一性原理地看，阶段 4 的困难不在服务能不能跑，而在平台必须把技术约束、业务优先级和经济激励合成一套可执行规则。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“昂贵 GPU 时间要被多人共享”出发，首先会推出 quota。没有配额，每个租户都会按自己的峰值和局部最优申请资源，最后共享池退化成谁先占谁赢。仅有 quota 还不够，因为空闲资源如果不能借用，整体利用率会很差，所以需要 reserved + burst：保底容量保证可预测性，burst 容量利用空闲水位。只要允许 burst，就会遇到高峰争用，于是需要 priority 和 preemption：线上核心流量能压过实验流量，低优任务可被抢占、降级或排队。再继续往下推，会出现 isolation。隔离不是越强越好，而是成本与稳定性的交换：独占池、MIG、专用 warm pool 能降低 noisy neighbor 风险，但会增加 idle tax；完全混部能提高平均利用率，却可能让长上下文租户拖垮其他租户的 P99。因此平台必须把资源池分层：核心业务强隔离，中等业务共享池，实验和离线流量进入可抢占池。</p>
+<p>成本治理也不是外接报表，而是从共享资源必然推导出来的控制能力。GPU-hour 是最容易采集的成本单位，但它无法解释为什么同样一万次请求，有的租户贵十倍；所以要拆到输入 token、输出 token、KV Cache GB·s、下游依赖调用、warm pool 分摊和隔离溢价。这个拆解导出 chargeback：不是为了财务惩罚租户，而是让租户看见长输出、低 cache hit、过度保留容量和高 SLA 要求如何变成钱。chargeback 一旦存在，就会反过来影响行为，所以计费模型本身也是平台政策。最后，“便宜”本身也要拆开。Cloud 按需便宜在风险低和弹性强，On-Prem 便宜在长期高利用率下的 GPU-hour 摊销，Spot / Preemptible 便宜在可中断任务能接受回滚。它们不是三种单价，而是三种风险分配方式。类似地，GPU utilization 也不是最终目标：SM Active 高只能说明设备忙，MFU、useful tokens / GPU-hour 和 goodput 才能说明这份忙是否转化成有效产出。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((多租户与成本治理))
+    不可化简问题
+      GPU时间昂贵且有限
+      请求成本差异巨大
+      租户价值和SLA不同
+      账单必须改变行为
+    资源分配机制
+      Quota
+        GPU卡数
+        token速率
+        并发请求
+        月度预算
+      Reserved加Burst
+        保底容量
+        空闲借用
+        高峰回收
+      Priority和Preemption
+        高优先级流量
+        低优任务抢占
+        自动降级
+    隔离与共享
+      独占池
+      共享池
+      Spot池
+      NoisyNeighbor检测
+    成本模型
+      GPU_hour
+      输入token
+      输出token
+      KVCache_GB_s
+      下游依赖
+      IdleTax
+    指标判断
+      GPUUtilization
+      MFU
+      UsefulTokensPerGPUHour
+      Goodput</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>如果一个推理平台只有 GPU 利用率和总账单两个指标，为什么它无法做真正的成本治理？</li>
+<li>reserved、burst、priority、preemption 分别解决哪个不可化简的问题，边界在哪里？</li>
+<li>为什么 Cloud vs On-Prem 的结论不能只比较单张 H100 的小时单价，而要看利用率曲线、承诺周期和运维能力？</li>
+<li>Spot / Preemptible 适合承接哪些推理或训练负载，为什么不应直接放在线上主路径？</li>
+<li>GPU utilization、MFU、useful tokens / GPU-hour、goodput 四个指标分别在回答什么问题？</li>
+<li>一个合理的 chargeback 模型应该如何拆分 GPU-hour、token、KV Cache、下游依赖和隔离溢价？</li>
+<li>当某个租户成为 noisy neighbor 时，平台应该如何用配额、路由、隔离和账单规则共同纠偏？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标与导读</h2>
+<p>完成本章学习后，你应该能理解推理系统为什么天然会走向多租户，认识配额、优先级、隔离、成本归因的作用，学会从单位请求成本角度分析服务设计，并能区分 GPU utilization、MFU、useful tokens per GPU-hour 和 goodput。</p>
+<div class="note"><strong>关联章节：</strong>配额、优先级和成本规则需要依附于 <a href="14-online-inference-architecture.html">第 14 章</a> 的路由与副本架构；批处理和 KV Cache 策略来自 <a href="15-batching-scheduling-and-kv-cache.html">第 15 章</a>；量化和引擎选择会影响单位成本下限，见 <a href="16-quantization-compilation-and-engines.html">第 16 章</a>。</div>
+<pre><code>[阶段 1] 一个模型 + 一个团队
+         "能跑就行"
+               ↓
+[阶段 2] 多个模型 + 一个团队
+         "不同模型装不同镜像，手动切"
+               ↓
+[阶段 3] 多个模型 + 多个团队
+         "A 团队把 GPU 占满了，B 团队跑不了实验"
+               ↓
+[阶段 4] 多模型 + 多团队 + 多优先级 + 多 SLA
+         "谁先用，谁能抢，谁付钱，出了事谁负责"</code></pre>
+<div class="success"><strong>核心判断：</strong>不能回答“谁能用多少、谁先用、互相影响多大、谁付多少钱、系统如何改变行为”这五个问题的平台，GPU 再多也会持续又贵又紧张。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 为什么推理系统会走向多租户</h2>
+<p>刚开始时，很多模型服务是单租户的：一个模型、一组副本、一个团队维护。但只要模型数量增加，就会自然出现多模型共享 GPU、不同团队共享集群、同一模型不同版本同时在线、不同用户群体有不同 SLA。此时问题不再只是“跑得动”，而是谁先用资源、谁可以抢占、谁为成本负责、谁的请求可以被限流或降级。</p>
+<div class="grid-3">
+<div class="card"><strong>静态资源分配撑不住</strong><br>A 团队高峰期不够用，B 团队低峰期空转；按峰值切分会把账单固定在高位。</div>
+<div class="card"><strong>共享池没有优先级</strong><br>实验流量可能压住线上核心流量，没有规则驱动的优先级就只能靠人工协调。</div>
+<div class="card"><strong>成本无法归因</strong><br>月底只有总账单，无法追溯哪次流量尖峰、哪个模型版本或哪类请求特征导致成本上升。</div>
+</div>
+<pre class="mermaid">flowchart LR
+  A[单租户模型服务] --> B[多模型同池]
+  B --> C[多团队共享]
+  C --> D[多优先级与多SLA]
+  D --> E{平台必须回答}
+  E --> Q[Quota: 谁能用多少]
+  E --> P[Priority: 谁先用]
+  E --> I[Isolation: 影响多大]
+  E --> Cb[Chargeback: 谁付钱]
+  E --> Act[Control-plane: 如何纠偏]</pre>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 多租户真正管理的对象</h2>
+<p>多租户不是简单“每个团队一个 namespace”。真正需要管理的是资源边界、优先级、隔离、成本归因和发布边界。这意味着多租户本质上是一组规则，不只是资源切片。</p>
+<table><tr><th>维度</th><th>强隔离（各自独立集群）</th><th>强共享（混部）</th></tr><tr><td>利用率</td><td>低，每个池按峰值留冗余</td><td>高，波峰波谷互补</td></tr><tr><td>可预测性</td><td>高，互不干扰</td><td>低，有 noisy neighbor 风险</td></tr><tr><td>成本</td><td>高，冗余多</td><td>低，复用好</td></tr><tr><td>安全</td><td>高</td><td>需要额外机制</td></tr><tr><td>运维</td><td>多套基础设施</td><td>一套但更复杂</td></tr></table>
+<p>成熟平台通常不是全隔离或全共享，而是分层：核心业务和高优租户用专用保留池，中等业务进入共享主池加配额，实验、离线、低优流量进入 Spot 或 preemptible 池。</p>
+<div class="warn"><strong>边界提醒：</strong>隔离是稳定性的价格。把所有租户合成一个共享池可能提高平均利用率，但也可能把少量长上下文请求、cache miss 或低优批任务的影响扩散到关键业务。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 单位请求成本与成本放大器</h2>
+<p>一个粗略但实用的成本模型是：单请求成本约等于实例每秒成本乘以请求占用时间，再除以有效请求数。对于 LLM，常常需要进一步拆成输入 token、输出 token、KV Cache、下游依赖和冗余成本。</p>
+<pre><code>GPU 固定成本 = GPU 数 × 小时单价 × 运行小时
+有效 token 单价 = GPU 固定成本 / useful tokens
+单请求成本 = prefill 成本 + decode 成本 + KV Cache 成本 + 下游成本 + 冗余成本
+租户账单 = 请求成本求和 + 保底容量分摊 + SLA / 隔离溢价</code></pre>
+<table><tr><th>成本项</th><th>粗略单价</th><th>用量</th><th>请求成本</th></tr><tr><td>Prefill 输入 token</td><td>$0.30 / 1M tokens</td><td>4K</td><td>$0.0012</td></tr><tr><td>Decode 输出 token</td><td>$1.20 / 1M tokens</td><td>1K</td><td>$0.0012</td></tr><tr><td>KV Cache 占用</td><td>$0.00002 / GB·s</td><td>8 GB × 6s</td><td>$0.0010</td></tr><tr><td>检索 / rerank / 日志</td><td>固定估算</td><td>1 次</td><td>$0.0020</td></tr><tr><td>SLA / idle 分摊</td><td>请求侧加成 20%</td><td>-</td><td>$0.0011</td></tr><tr><td><strong>单请求合计</strong></td><td>-</td><td>-</td><td><strong>约 $0.0065</strong></td></tr></table>
+<table><tr><th>放大器</th><th>为什么会贵</th><th>平台上的典型动作</th></tr><tr><td>长上下文 prefill</td><td>占用大量算力和带宽，且未必能被 cache 命中</td><td>把长上下文单独分层计费或限流</td></tr><tr><td>长输出 decode</td><td>decode 槽位被持续占用，压低共享池吞吐</td><td>对 max output length 做档位治理</td></tr><tr><td>Warm pool / 空转副本</td><td>为 SLA 保留容量，低峰期没有有效产出</td><td>用时段策略、共享池或延迟回收控制 idle tax</td></tr><tr><td>低命中缓存</td><td>重复跑 embedding、检索、prefix 计算</td><td>持续跟踪 cache hit、prefix hit、重复请求比</td></tr><tr><td>下游依赖</td><td>检索、OCR、rerank、工具调用都会计入单次成本</td><td>把全链路依赖费用并入 chargeback</td></tr></table>
+<div class="danger"><strong>不要线性外推：</strong>prompt 从 2K 扩到 32K，prefill 时间、KV Cache 占用和排队影响可能远超 token 数的线性增长。容量规划必须做分档压测。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Cloud、On-Prem 与 Spot 的 TCO 判断</h2>
+<p>Cloud、On-Prem 和 Spot 不是单价表里的三个数字，而是三种风险分配方式。Cloud 按需把容量风险交给云厂商，On-Prem 把长期利用率风险留给自己，Spot / Preemptible 用供应不稳定换折扣。</p>
+<table><tr><th>场景</th><th>Cloud 按需</th><th>Cloud 预留</th><th>On-Prem</th><th>推荐判断</th></tr><tr><td>新业务探索，流量每周变化 2-3 倍</td><td>成本高但风险低</td><td>容易承诺过早</td><td>采购风险高</td><td>先 Cloud 按需</td></tr><tr><td>稳定线上池，预计 12 个月都在 60%+</td><td>单价偏高</td><td>折扣和弹性平衡</td><td>需要机房能力</td><td>Cloud 预留优先</td></tr><tr><td>长期百卡级，70%+ 使用 3 年</td><td>长期成本偏高</td><td>可作为过渡</td><td>摊销后有优势</td><td>进入 On-Prem TCO 论证</td></tr><tr><td>季节性高峰，平时低谷明显</td><td>高峰能扛，低谷可关</td><td>承诺容量可能浪费</td><td>低谷折旧浪费</td><td>Cloud 按需 + Spot</td></tr><tr><td>数据不能出本地机房</td><td>受区域和合规限制</td><td>同左</td><td>控制力强</td><td>On-Prem 或专有云</td></tr></table>
+<table><tr><th>Spot 风险</th><th>典型表现</th><th>缓解策略</th><th>工程边界</th></tr><tr><td>实例被回收</td><td>机器在通知后消失</td><td>checkpoint、drain、双池路由</td><td>没有 checkpoint 的任务不应上 Spot</td></tr><tr><td>容量不可得</td><td>某区域或机型突然拿不到卡</td><td>多 AZ、多实例族、保底池兜底</td><td>模型必须支持多机型镜像和性能校准</td></tr><tr><td>冷启动放大</td><td>节点频繁进出，模型反复加载</td><td>镜像预拉取、权重本地缓存</td><td>大模型加载超过分钟级时收益会被吃掉</td></tr><tr><td>抢占风暴</td><td>同一池子大量实例同时消失</td><td>按池限额、分散采购、限速迁移</td><td>Spot 占比过高会把平台变成不稳定系统</td></tr></table>
+<pre class="mermaid">flowchart TD
+  R[容量需求] --> U{长期利用率}
+  U -- 低于50%或波动大 --> C[Cloud按需]
+  U -- 50%-75%且较确定 --> RI[Cloud Reserved / Committed]
+  U -- 70%+且持续2-4年 --> TCO[On-Prem TCO论证]
+  C --> S{是否有可中断任务}
+  RI --> S
+  TCO --> S
+  S -- 有 --> SP[Spot/Preemptible承接低优任务]
+  S -- 无 --> OD[保底池维持SLA]
+  SP --> G[以goodput和失败率验证真实节省]
+  OD --> G</pre>
+<div class="warn"><strong>工程边界：</strong>TCO 表只能支持容量决策，不能替代压测。On-Prem 的每 GPU-hour 看起来低，不代表单位 token 成本一定低；Cloud 也不能只看按需价，GPU 缺货、跨区流量、镜像拉取和存储快照都会改变实际成本。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. GPU utilization 高不等于有效产出高</h2>
+<p>很多团队看到 DCGM 或 <code>nvidia-smi</code> 面板上的 SM Active 接近 90%，就以为 GPU 已经被充分利用。这个判断经常过于乐观。GPU 可以一直在跑 kernel，但这些 kernel 可能受访存、同步、碎片化 batch、无效重算或低价值流量限制，没有把理论 FLOPs 转化成有效模型计算。</p>
+<table><tr><th>指标</th><th>粗略定义</th><th>回答的问题</th><th>它不能回答什么</th></tr><tr><td>GPU utilization / SM Active</td><td>GPU 上有多少时间至少有 kernel 在跑</td><td>设备忙不忙</td><td>工作是否接近理论峰值、是否有业务价值</td></tr><tr><td>MFU</td><td>实际模型有效 FLOPs / GPU 理论峰值 FLOPs</td><td>模型计算是否高效</td><td>token 是否有用、SLO 是否满足</td></tr><tr><td>HFU</td><td>硬件实际执行 FLOPs / 理论峰值</td><td>算术单元是否充分使用</td><td>重算、padding、无效请求是否有价值</td></tr><tr><td>useful tokens / GPU-hour</td><td>满足质量与策略要求的 token / GPU 小时</td><td>每张卡最终产出了多少有效 token</td><td>单个租户的尾延迟和公平性</td></tr><tr><td>goodput</td><td>在 SLO 内完成的有效请求或 token</td><td>产出是否既有效又准时</td><td>资源是否被长期过载</td></tr></table>
+<pre><code>MFU ≈ model_flops_per_token × generated_or_processed_tokens_per_second
+      / GPU_peak_flops
+
+例如:
+MFU ≈ 140 TFLOPs/token × 2500 tokens/s / 989000 TFLOPs/s ≈ 35%</code></pre>
+<div class="success"><strong>面板建议：</strong>至少同时摆 GPU utilization、MFU、useful tokens / GPU-hour、goodput。单看任何一个指标都会被代理目标误导。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 公平性、配额与优先级策略</h2>
+<p>多租户调度不是简单数学最优，而是平台政策问题。极度追求利用率，会让低优长请求霸占资源、高优短请求等待变长；极度追求公平，又会让资源空着不敢借给别人，整体单位成本升高。</p>
+<table><tr><th>公平模型</th><th>规则</th><th>优点</th><th>缺点</th></tr><tr><td>Strict quota</td><td>每个租户固定份额，超出直接拒</td><td>可预测、公平</td><td>空闲资源浪费</td></tr><tr><td>Weighted fair</td><td>按权重分配，可借用空闲</td><td>利用率好</td><td>抢占逻辑复杂</td></tr><tr><td>Priority-only</td><td>高优先级完全优先</td><td>实现简单</td><td>低优容易饿死</td></tr><tr><td>Reserved + burst</td><td>每人保底 + 超用限制</td><td>平衡</td><td>参数调优难</td></tr><tr><td>Market-based</td><td>内部计价，租户按钱竞价</td><td>经济激励强</td><td>组织成熟度要求高</td></tr></table>
+<table><tr><th>配额维度</th><th>控制什么</th><th>适用场景</th></tr><tr><td>GPU 卡数</td><td>副本容量上限</td><td>容量规划</td></tr><tr><td>QPS / RPM</td><td>每分钟请求数</td><td>防突发</td></tr><tr><td>输入 token / 分钟</td><td>长上下文流量控制</td><td>prefill 密集型租户</td></tr><tr><td>输出 token / 分钟</td><td>decode 占用</td><td>长输出租户</td></tr><tr><td>并发请求数</td><td>单租户最多 inflight</td><td>防占满 decode 槽位</td></tr><tr><td>预算</td><td>成本上限</td><td>超出触发降级</td></tr><tr><td>模型白名单</td><td>允许访问的模型</td><td>灰度控制</td></tr></table>
+<pre><code>tenant_policies:
+  core_product:
+    priority: high
+    reserved_gpu: 8
+    burst_gpu: 16
+    max_input_tokens_per_request: 32768
+    max_output_tokens_per_request: 4096
+    rate_limit_rpm: 1000
+    degrade_threshold_pct: 95
+
+  experiments:
+    priority: low
+    reserved_gpu: 0
+    burst_gpu: 4
+    max_input_tokens_per_request: 4096
+    max_output_tokens_per_request: 1024
+    rate_limit_rpm: 60
+    preemptible: true</code></pre>
+<pre class="mermaid">sequenceDiagram
+  participant Client as Tenant Request
+  participant GW as Gateway
+  participant Budget as Budget Service
+  participant Router as Router
+  participant Pool as GPU Pools
+  Client->>GW: request with tenant tag
+  GW->>GW: rate limit and token length check
+  GW->>Budget: monthly budget check
+  Budget-->>GW: allowed / degrade / reject
+  GW->>Router: route with priority and policy
+  Router->>Pool: reserved pool first
+  Pool-->>Router: capacity result
+  Router-->>Client: serve / preempt low priority / 429</pre>
+<div class="note"><strong>关键点：</strong>配额检查必须在进入模型副本之前完成。如果到了 GPU 才发现超配额，算力已经花掉了。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Chargeback 与成本归因</h2>
+<p>成本治理如果只停留在“本月 GPU 花了多少钱”，平台就无法推动租户优化行为。更实用的做法，是把成本拆到租户、业务线、请求特征和模型版本。chargeback 的目的不是财务记账，而是让租户看到自己的长上下文、低命中率、低利用率行为如何变成真实成本。</p>
+<table><tr><th>成本项</th><th>计量单位</th><th>归因来源</th><th>行为激励</th></tr><tr><td>保底容量</td><td>GPU·hour</td><td>调度器 reserved allocation</td><td>少申请长期闲置 GPU</td></tr><tr><td>共享计算</td><td>input / output token</td><td>网关 + 推理服务埋点</td><td>压缩 prompt、控制输出</td></tr><tr><td>KV Cache</td><td>GB·s 或 block·s</td><td>引擎侧 KV block 统计</td><td>控制上下文和并发</td></tr><tr><td>Warm pool</td><td>idle GPU·hour</td><td>副本管理器</td><td>明确低延迟的价格</td></tr><tr><td>下游依赖</td><td>request、GB、QPS、存储量</td><td>embedding / vector DB / rerank 埋点</td><td>减少无效检索和重复调用</td></tr><tr><td>隔离溢价</td><td>百分比加成</td><td>独占池 vs 共享池成本差</td><td>让稳定性诉求显性化</td></tr></table>
+<pre><code>tenant_bill =
+  reserved_gpu_hours × reserved_rate
++ input_tokens_M × input_rate
++ output_tokens_M × output_rate
++ kv_gb_seconds × kv_rate
++ downstream_calls × downstream_rate
++ idle_tax_share
++ isolation_premium</code></pre>
+<table><tr><th>模型</th><th>计费方式</th><th>会激励租户做什么</th><th>潜在问题</th></tr><tr><td>按 GPU-小时</td><td>租了多少 GPU × 多少小时</td><td>尽量少申请、多复用</td><td>不鼓励优化模型本身</td></tr><tr><td>按请求数</td><td>每次调用固定费用</td><td>减少无效调用、合并请求</td><td>忽略请求大小差异</td></tr><tr><td>按输入 token</td><td>每个输入 token 计费</td><td>压缩 prompt、复用 system prompt</td><td>不反映 decode 成本</td></tr><tr><td>按输出 token</td><td>每个输出 token 计费</td><td>控制 max_tokens</td><td>不反映长上下文 prefill</td></tr><tr><td>GPU-小时 + token 混合</td><td>保底容量按 GPU-小时，burst 按 token</td><td>稳定业务付 GPU-小时，波动业务付 token</td><td>模型复杂</td></tr></table>
+<div class="warn"><strong>工程边界：</strong>chargeback 的精度不能超过埋点精度。没有稳定的 tenant tag、request id、model version、token count、cache hit、downstream trace，就不要宣称能精确到每个团队每个功能的真实成本。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Noisy Neighbor 与隔离</h2>
+<p>多租户共享 GPU 时，常见麻烦不是某个租户完全把服务打挂，而是它持续把别人的尾延迟拉高。有效信号通常不是平均延迟，而是某个租户到来后，其他租户的 P95/P99 是否突变。</p>
+<table><tr><th>干扰模式</th><th>典型表现</th><th>常见隔离手段</th></tr><tr><td>长请求占满 decode 槽位</td><td>高优先级短请求 P99 恶化</td><td>时分调度、优先级抢占</td></tr><tr><td>大上下文请求吃满显存</td><td>其他租户 admission 失败</td><td>显存配额、上下文长度分层</td></tr><tr><td>热租户持续冲高流量</td><td>整体队列抖动</td><td>独占池、限流、空分隔离</td></tr><tr><td>新租户 prefix cache miss</td><td>整体 cache 命中率下降</td><td>prefix-aware 路由隔离</td></tr></table>
+<pre><code>对每个租户 T，每 5 分钟计算：
+  ΔP99(T) = P99 latency of other tenants WITH T's traffic
+           - P99 latency of other tenants WITHOUT T's traffic
+
+如果某租户持续 ΔP99 > threshold:
+  → 标记为 noisy neighbor candidate
+  → 分析长 prompt 占比、并发数、cache hit、版本变更
+  → 动作：降级、独占池、加配额硬顶、按成本加价</code></pre>
+<div class="danger"><strong>治理风险：</strong>LLM 服务里的租户分布通常更极端，Top 1% 租户可能占 40%-60% GPU 用量。对大户和小户一刀切，往往对大户太松、对小户太紧。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 把成本规则变成控制面动作</h2>
+<p>如果成本治理只停留在看板，它就无法反过来改变平台行为。更实用的做法是把预算、SLA 和容量策略直接接进控制面，让成本治理从解释账单变成提前塑造账单。</p>
+<table><tr><th>控制动作</th><th>作用</th><th>典型触发条件</th></tr><tr><td>长上下文单独路由</td><td>避免少量超长请求拖垮共享池</td><td>输入长度超过某个档位</td></tr><tr><td>租户预算阈值</td><td>预算逼近时自动降级模型或降低 burst</td><td>日 / 周 / 月预算到达阈值</td></tr><tr><td>Cache 观测联动</td><td>命中率下滑时优先查模板变化与热键失效</td><td>命中率突然下降、成本突然上升</td></tr><tr><td>Warm pool 分层</td><td>只为高 SLA 租户保留热副本</td><td>高优租户需要稳定首 token 延迟</td></tr><tr><td>Preemptible 池</td><td>让实验流量承接空闲容量</td><td>低优任务允许被抢占</td></tr><tr><td>自动切小模型</td><td>预算紧或容量紧时切量化版</td><td>预算 > 80%、GPU 池 > 90%</td></tr></table>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Normal
+  Normal: main model 70B\nwarm pool 10 replicas
+  Normal --> BudgetWarning: monthly budget >= 80%
+  BudgetWarning: low priority -> 13B\nwarm pool 8 replicas\nnotify tenant
+  BudgetWarning --> BudgetCritical: monthly budget >= 95%
+  BudgetCritical: all eligible -> 13B\nwarm pool 5 replicas\nreject non-budget requests
+  BudgetCritical --> BudgetExceeded: monthly budget >= 100%
+  BudgetExceeded: experiments -> 429\ncore -> smaller model\nhuman review
+  BudgetWarning --> Normal: budget reset or approved increase
+  BudgetCritical --> Normal: approved increase
+  BudgetExceeded --> Normal: new cycle or override</pre>
+<p>多租户里的发布与回滚还会多出额外复杂度：不同租户对新版本容忍度不同，回滚成本对大户不均等，新老版本单位成本不同，多版本并存期间容量可能翻倍。多版本并存是多租户平台的隐形税，必须限制并存时长并按版本拆账。</p>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 工程建议、误区与小结</h2>
+<h3>工程建议</h3>
+<ul>
+<li>配额、优先级和限流策略要能被路由层与调度层直接执行。</li>
+<li>分层资源池：核心业务独占，中等业务共享，实验流量进入 Spot 或 preemptible 池。</li>
+<li>成本归因至少覆盖 GPU 时间、token、KV Cache 和关键下游调用。</li>
+<li>按租户、请求特征、模型版本和时间段都要能切分，不能只有总账单。</li>
+<li>不要只追求平均利用率，要把关键租户的尾延迟预算一起纳入治理目标。</li>
+<li>TCO 评估要每季度复查，随规模变化调整 Cloud / On-Prem / Spot 组合。</li>
+</ul>
+<h3>常见误区</h3>
+<table><tr><th>误区</th><th>更准确的判断</th></tr><tr><td>多租户就是资源切分</td><td>真正困难的是优先级、回滚、限流和成本归因</td></tr><tr><td>单位请求成本只和模型大小有关</td><td>上下文长度、batch、利用率、缓存命中率都直接影响成本</td></tr><tr><td>只要利用率高，平台就运营得好</td><td>高利用率可能牺牲关键业务延迟和公平性</td></tr><tr><td>Cloud 一定比 On-Prem 贵</td><td>TCO 取决于利用率曲线、承诺周期和运维能力</td></tr><tr><td>Spot 应该全上</td><td>生产主路径不能承受被收走的供应风险</td></tr><tr><td>Chargeback 只是财务工作</td><td>它是政策设计，会诱导不同的租户行为</td></tr></table>
+<div class="success"><strong>本章小结：</strong>多租户治理的核心不是把 GPU 切开，而是把资源、优先级、隔离、成本和控制面动作连成闭环。平台要追的不是“GPU 很忙”，而是满足业务约束的单位有效产出成本更低。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<p><strong>学习路线：</strong>先回看 <a href="14-online-inference-architecture.html">第 14 章</a> 的网关、路由和副本架构，再结合 <a href="15-batching-scheduling-and-kv-cache.html">第 15 章</a> 理解 batching 与 KV Cache 如何放大或缓解成本，最后用 <a href="16-quantization-compilation-and-engines.html">第 16 章</a> 的量化、编译和引擎选择评估单位 token 成本下限。</p>
+<p><strong>延伸阅读：</strong>关注 Kubernetes ResourceQuota、KServe / Ray Serve 的多租户服务能力，Kubecost / OpenCost 的集群成本归因，NVIDIA DCGM 与 MIG 的 GPU 观测和隔离能力，以及云厂商关于 Reserved / Committed Use / Spot 的定价与抢占语义。</p>
+<p><strong>实践清单：</strong>为一个真实租户设计 reserved + burst 配额、token 分档、预算阈值和降级策略；用压测数据比较长上下文、长输出和 warm pool 对 cost / 1M useful tokens 的影响；把一次 RAG 请求的 Gateway、Embedding、Vector DB、Rerank、LLM、Safety 和 Logging 成本串成同一个 request id。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
