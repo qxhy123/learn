@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 24 章 · 构建一个 AI 平台 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=24" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 24 章 · 构建一个 AI 平台</h1>
+<p class="sub">从“有限资源上的多类 AI 工作负载如何形成可解释、可重复、可治理的交付闭环”出发，把资源、训练、评测、制品、推理、观测、成本和安全重新组装成平台蓝图。</p>
+<div class="chips"><span class="chip">平台蓝图</span><span class="chip">端到端闭环</span><span class="chip">任务级 API</span><span class="chip">队列与配额</span><span class="chip">发布治理</span><span class="chip">Capstone</span></div>
+<div class="note"><strong>不可化简的问题：</strong>组织里有多类用户、多种 AI 工作负载和有限 GPU / 存储 / 网络资源，它们持续变化，但业务仍要求模型从数据到训练、评测、发布、观测、回滚形成可解释、可重复、可治理的交付闭环。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：构建一个 AI 平台</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">先定义平台要解决什么</a></li>
+<li><a class="anchor" href="#s4">中型团队的最小平台蓝图</a></li>
+<li><a class="anchor" href="#s5">平台 API 设计原则</a></li>
+<li><a class="anchor" href="#s6">把前面章节映射到平台组件</a></li>
+<li><a class="anchor" href="#s7">设计顺序与最小闭环</a></li>
+<li><a class="anchor" href="#s8">平台设计中的关键取舍</a></li>
+<li><a class="anchor" href="#s9">平台能力分层</a></li>
+<li><a class="anchor" href="#s10">平台最容易失败的地方</a></li>
+<li><a class="anchor" href="#s11">演进路线图与多集群</a></li>
+<li><a class="anchor" href="#s12">结课后的两种能力</a></li>
+<li><a class="anchor" href="#s13">本章小结与练习题</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：构建一个 AI 平台</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 Kubernetes、model registry、feature store、gateway、queue、observability 这些名字以后，AI 平台要解决的不可化简问题只有一个：组织里有多种 AI 工作负载、多类用户和有限资源，它们都在持续变化，但业务仍然要求模型从数据到训练、评测、发布、观测、回滚形成可解释、可重复、可治理的交付闭环。所谓平台，不是把工具堆在一起，也不是给每个团队发一个统一入口页，而是把人、代码、数据、模型、资源、请求、风险放进同一套因果链路里，让每一次训练为什么排队、每一个模型为什么能上线、每一次故障为什么能回滚、每一笔 GPU 成本为什么属于某个租户，都有证据可查。</p>
+<p>这也是本章和前面章节的关系：前面每章都在解决一个局部瓶颈，例如 GPU 显存、通信拓扑、checkpoint 恢复、推理 batching、租户隔离、可观测性和安全治理；本章要做的是把这些局部机制重新组合成平台级判断。平台工程师面对的不是“该不该用某个组件”，而是“在当前组织规模、模型类型、资源预算和风险边界下，哪些约束必须被产品化，哪些灵活性应该留给用户”。如果这个问题没有先拆清楚，平台很容易变成两种失败形态：要么只是 UI 包装，底层数据版本、模型版本、评测结果和发布记录互相断裂；要么过早大一统，把研究、微调、RAG、在线推理这些差异很大的工作负载强行塞进同一种流程，最后既不敏捷，也不可治理。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“有限资源上的可治理交付闭环”出发，平台机制会自然出现。首先，资源是有限的，所以必须有资源池、队列、配额、优先级和抢占规则，否则训练任务、批处理任务和在线服务会彼此挤占，SLA 只能靠人工协调。其次，用户真正想提交的不是 Pod，而是训练、评测、发布、推理服务这类任务，所以平台需要任务级 API，把底层容器、镜像、节点选择、存储挂载、网络策略翻译成可审计的工作流。再次，模型输出能不能被信任，取决于输入证据链是否完整，因此需要数据版本、代码版本、实验追踪、checkpoint、模型 registry 和评测门禁，把“这个模型从哪里来”回答清楚。</p>
+<p>继续往后推，模型上线之后风险会从“能不能训练出来”转成“能不能稳定服务业务”。因此平台必须包含推理网关、灰度、回滚、SLO、日志、指标、trace、质量采样和成本归因；没有这些，训练平台再强，也无法解释线上延迟上升、命中率下降或成本突增。再往组织层面推，多团队共享平台必然带来差异：研究团队要灵活，业务团队要稳定，平台团队要可维护，安全团队要审计。于是平台边界不能只靠统一组件，而要靠统一证据、统一控制点和分层抽象：资源层保证可调度，运行层保证可执行，工作流层保证可追踪，运营层保证可治理。</p>
+<p>工程边界也由此确定：中型团队的第一版平台不应追求全自动、全场景、全自研，而应先把一条端到端链路打通，例如训练 Job → checkpoint → registry → 评测 → staging → 灰度 → 回滚 → 反馈，再围绕这条链路逐步扩展。平台成熟的标志也不是功能列表更长，而是关键动作可以被解释：谁提交了任务、用了哪份数据、跑在哪个资源池、生成了哪个制品、通过了什么评测、为什么被允许发布、线上出了问题该回滚到哪里、成本属于哪个业务单元。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((构建 AI 平台))
+    不可化简的问题
+      有限资源
+      多类工作负载
+      多租户协作
+      可解释交付闭环
+    资源必须被经营
+      GPU CPU 存储 网络
+      队列 配额 优先级
+      抢占与隔离
+      利用率 vs SLA
+    任务必须被抽象
+      训练任务
+      评测运行
+      推理服务
+      发布变更
+      平台 API
+    证据链必须完整
+      数据版本
+      代码版本
+      checkpoint
+      模型 registry
+      评测门禁
+    线上风险必须闭环
+      灰度
+      回滚
+      可观测性
+      成本归因
+      审计
+    平台必须可演进
+      最小闭环
+      分层能力
+      统一边界
+      保留业务差异</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>如果不提任何具体工具名，一个 AI 平台最小要保证哪条端到端闭环成立？</li>
+<li>为什么平台 API 应该面向训练、评测、发布和推理任务，而不是直接暴露底层 Pod、PVC 和节点选择？</li>
+<li>在中型团队里，哪些边界必须统一，哪些细节应该允许业务或研究团队保留差异？</li>
+<li>当 GPU 利用率、在线 SLA、研发交付速度和合规审计发生冲突时，平台应该按什么顺序显式取舍？</li>
+<li>一个模型从训练到上线需要留下哪些证据，才能支持复现、回滚、审计和成本归因？</li>
+<li>为什么“只做 UI”或“只重训练”都不能构成真正的平台能力？</li>
+<li>如果只能建设第一版平台，你会选择哪一个最小闭环作为起点，如何判断它已经可用？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<p>完成本章学习后，你应该能把前 23 章的资源、运行时、训练、数据、推理、可靠性和治理知识重新组合成一个平台方案，而不是只罗列组件。</p>
+<div class="grid-2">
+<div class="card"><strong>系统设计能力</strong><br>围绕业务目标、团队规模、资源约束和风险边界，设计一个可落地的中型 AI 平台蓝图。</div>
+<div class="card"><strong>平台取舍能力</strong><br>解释统一性与灵活性、利用率与 SLA、建设速度与长期治理之间的冲突，并给出明确取舍。</div>
+</div>
+<ul>
+<li>把训练、数据、推理、平台、治理串成完整蓝图。</li>
+<li>围绕目标业务、团队规模与资源约束做系统设计。</li>
+<li>识别平台设计中的关键取舍：统一性 vs 灵活性、利用率 vs SLA、建设速度 vs 长期治理。</li>
+<li>形成从需求 → 架构 → 运行规则 → 风险控制的表达能力。</li>
+<li>设计一个适合中型团队的 AI 平台最小闭环。</li>
+</ul>
+<div class="note"><strong>结课视角：</strong>真正理解 AI Infra 的标志，不是记住多少组件名，而是能把资源、训练、推理、治理重新组装成一个可解释、可落地、可演进的系统。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 先定义平台要解决什么</h2>
+<p>平台设计最容易犯的错误，是一开始就讨论组件：要不要上 Kubernetes，要不要自建 model registry，要不要接向量数据库，要不要做统一网关。这些问题都重要，但它们是第二层问题。第一层问题应该是平台到底服务谁、哪类工作负载最关键、哪种约束最敏感、当前组织最痛的瓶颈在哪里。</p>
+<table>
+<tr><th>问题</th><th>为什么先问</th><th>会影响的设计</th></tr>
+<tr><td>平台主要服务训练、推理，还是两者兼有？</td><td>训练看吞吐、恢复和排队；推理看延迟、SLA 和流量治理。</td><td>资源池划分、队列规则、服务模板、观测指标。</td></tr>
+<tr><td>主要租户是谁？</td><td>算法团队、业务团队、平台团队和外部客户对灵活性、稳定性、审计的要求不同。</td><td>身份模型、API 抽象、权限边界、支持流程。</td></tr>
+<tr><td>最敏感的是延迟、成本、交付速度还是合规性？</td><td>不同目标会把同一套技术选型推向不同方向。</td><td>抢占策略、灰度规则、预算阈值、发布门禁。</td></tr>
+<tr><td>现在最痛的是排队、部署、回滚、观测还是账单？</td><td>第一版平台应该优先闭合真实痛点，不应追求全功能清单。</td><td>MVP 范围、里程碑、平台产品顺序。</td></tr>
+</table>
+<div class="warn"><strong>边界提醒：</strong>如果这些约束没有先写清楚，平台设计很容易变成名词堆砌，最后每个组件都“有”，但没有一条链路能解释模型如何可靠上线。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 中型团队的最小 AI 平台蓝图</h2>
+<p>你可以把一个中型团队的 AI 平台抽象为一条端到端交付链路。开发者入口不是门户本身，而是任务进入平台的控制面；数据、训练、实验、制品、评测、发布、推理和观测必须在证据链上相互连接。</p>
+<pre><code>开发者入口
+  -&gt; 数据与特征管理
+  -&gt; 训练任务提交
+  -&gt; 实验追踪与制品管理
+  -&gt; 评测与发布门禁
+  -&gt; 在线推理网关
+  -&gt; 可观测性 / 审计 / 成本面板</code></pre>
+<p>背后的基础设施包括 GPU / CPU / 存储 / 网络资源池、容器与运行时、队列配额优先级与抢占规则、对象存储与模型仓库、索引存储、推理引擎与服务路由，以及监控、日志、trace、质量评测与审计系统。关键在于：这些不是平铺组件，而是一条端到端交付链路。</p>
+<pre class="mermaid">flowchart LR
+  A[开发者入口] --> B[数据与特征管理]
+  B --> C[训练任务提交]
+  C --> D[实验追踪与 checkpoint]
+  D --> E[模型 registry]
+  E --> F[评测与发布门禁]
+  F --> G[staging 与灰度]
+  G --> H[在线推理网关]
+  H --> I[观测 审计 成本]
+  I --> B
+  R[资源池 GPU CPU 存储 网络] --> C
+  R --> H
+  Q[队列 配额 优先级 抢占] --> C
+  Q --> H</pre>
+<div class="success"><strong>最小平台判断：</strong>第一版不需要覆盖所有模型形态，但必须至少让一条高价值链路从训练到上线可追踪、可恢复、可回滚、可审计。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 平台 API 设计原则</h2>
+<p>平台 API 值得单独讲，因为很多平台一开始把底层资源对象直接暴露给用户，结果用户学会的是“怎么申请 GPU Pod”，而不是“怎么提交训练、评测、发布任务”。健康的平台 API 应屏蔽节点选择、调度插件、Pod 模板这些底层细节，同时保留可审计、可回滚、可配额的控制点。</p>
+<table>
+<tr><th>更好的 API 入口</th><th>不够好的 API 入口</th><th>背后的平台原则</th></tr>
+<tr><td>提交训练任务</td><td>直接申请一组裸 Pod</td><td>用户面向任务，平台面向资源翻译。</td></tr>
+<tr><td>创建评测运行</td><td>让用户自己拼 Job、PVC、环境变量</td><td>把标准工作流做成产品接口。</td></tr>
+<tr><td>发布模型版本</td><td>让用户手工改 Deployment 和路由</td><td>隐藏调度细节，保留治理钩子。</td></tr>
+</table>
+<table>
+<tr><th>API 层级</th><th>用户看到的对象</th><th>平台内部翻译</th><th>必须留下的证据</th></tr>
+<tr><td>训练</td><td>TrainJob、数据版本、镜像版本、资源档位</td><td>队列、GPU 节点、Pod、存储挂载、分布式启动</td><td>提交人、租户、代码版本、数据版本、资源用量、checkpoint。</td></tr>
+<tr><td>评测</td><td>EvaluationRun、baseline、评测集、门禁策略</td><td>批处理 Job、指标采集、报告生成、审批钩子</td><td>模型版本、评测集版本、指标、阈值、审批结果。</td></tr>
+<tr><td>发布</td><td>ModelRelease、目标环境、灰度比例</td><td>路由、Deployment、网关、流量分配、回滚点</td><td>发布人、准入结果、灰度记录、线上指标、回滚记录。</td></tr>
+</table>
+<div class="note"><strong>控制面原则：</strong>平台 API 不是把 Kubernetes 换个名字暴露出去，而是把组织认可的训练、评测、发布和推理规则固化成可执行边界。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 把前面章节映射到平台组件</h2>
+<p>本章不是新知识点堆叠，而是把 <a href="../part6/18-containers-and-runtime.html">第 18 章</a> 到 <a href="../part7/23-security-isolation-and-governance.html">第 23 章</a> 收束成一个平台蓝图，同时回收前面所有基础能力。</p>
+<table>
+<tr><th>能力来源</th><th>平台组件含义</th></tr>
+<tr><td>第 1-3 章</td><td>资源与链路边界：知道系统到底在解决什么。</td></tr>
+<tr><td>第 4-6 章</td><td>硬件与运行时底座：知道算力、互联、内存为什么会成为上限。</td></tr>
+<tr><td>第 7-10c 章</td><td>训练、后训练与微调基础设施：知道训练任务、同步、恢复、对齐与 adapter 服务如何设计。</td></tr>
+<tr><td>第 11-13 章</td><td>数据与制品：知道数据、模型、embedding、cache 如何管理。</td></tr>
+<tr><td>第 14-17 章</td><td>推理服务与多租户：知道延迟、吞吐、显存、成本如何平衡。</td></tr>
+<tr><td>第 18-20 章</td><td>平台编排：知道容器、Kubernetes、队列、配额、autoscaling 如何协同。</td></tr>
+<tr><td>第 21-23 章</td><td>治理与可靠性：知道观测、发布、审计、安全和 incident 如何闭环。</td></tr>
+</table>
+<pre class="mermaid">flowchart TB
+  A[业务目标与链路边界&lt;br/&gt;第1-3章] --> B[资源与运行时底座&lt;br/&gt;第4-6章]
+  B --> C[训练 后训练 微调&lt;br/&gt;第7-10c章]
+  C --> D[数据 制品 向量 缓存&lt;br/&gt;第11-13章]
+  D --> E[推理 多租户 成本&lt;br/&gt;第14-17章]
+  E --> F[容器 K8s 队列 配额&lt;br/&gt;第18-20章]
+  F --> G[观测 发布 安全 治理&lt;br/&gt;第21-23章]
+  G --> H[统一 AI 平台交付面]
+  H --> A</pre>
+<div class="success"><strong>核心判断：</strong>AI 平台不是一个新工具，而是把多个系统能力收束成统一交付面。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 设计顺序与最小闭环</h2>
+<p>一个实用设计顺序是：先明确业务目标，再画核心链路，随后找最稀缺资源，定义任务调度规则，最后把发布、回滚、观测和账单接上。这个顺序背后的原则是先保证平台能形成闭环，再追求高级自动化。</p>
+<ol>
+<li><strong>业务目标：</strong>要支持哪些模型和工作流。</li>
+<li><strong>核心链路：</strong>数据怎么流，请求怎么流。</li>
+<li><strong>最稀缺资源：</strong>GPU、网络、存储、工程人力哪个最紧张。</li>
+<li><strong>任务调度规则：</strong>谁优先，谁保底，谁可抢占。</li>
+<li><strong>发布与回滚：</strong>模型如何上、如何下、如何止损。</li>
+<li><strong>观测与账单：</strong>谁看得到，谁解释得清。</li>
+</ol>
+<pre class="mermaid">sequenceDiagram
+  participant U as 用户
+  participant P as 平台控制面
+  participant Q as 队列与资源池
+  participant T as 训练任务
+  participant R as Registry
+  participant E as 评测门禁
+  participant G as 推理网关
+  participant O as 观测与成本
+  U->>P: 提交 TrainJob 和数据版本
+  P->>Q: 资源准入与排队
+  Q->>T: 分配 GPU 并启动任务
+  T->>R: 写入 checkpoint 与模型版本
+  R->>E: 触发评测运行
+  E->>P: 返回门禁结果
+  P->>G: staging / 灰度发布
+  G->>O: 上报延迟 质量 token 成本
+  O->>P: 放量 回滚 或反馈再训练</pre>
+<table>
+<tr><th>闭环步骤</th><th>平台必须保证</th><th>失败信号</th></tr>
+<tr><td>用户提交训练 Job</td><td>身份、租户、资源申请、数据版本明确。</td><td>任务能跑，但没人知道谁提交、用了哪份数据。</td></tr>
+<tr><td>训练运行与 checkpoint</td><td>日志、指标、失败恢复、制品写入统一系统。</td><td>任务失败后只能人工翻机器和临时目录。</td></tr>
+<tr><td>模型进入 registry</td><td>权重、tokenizer、配置、代码、数据和评测元数据绑定。</td><td>只有一个文件名，无法解释模型来源。</td></tr>
+<tr><td>评测与发布门禁</td><td>与 baseline 对比，记录质量、延迟、安全和成本结果。</td><td>上线靠口头确认或临时 notebook 截图。</td></tr>
+<tr><td>灰度、观测、回滚</td><td>流量可控，指标可见，回滚点明确。</td><td>线上异常后不知道该降级、回滚还是扩容。</td></tr>
+</table>
+<div class="warn"><strong>MVP 边界：</strong>最小闭环不等于简陋脚本。它可以功能少，但关键证据不能断：数据、代码、模型、评测、发布、线上指标和成本要能串起来。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 平台设计中的关键取舍</h2>
+<p>平台设计不是把所有“最佳实践”同时打开。每个组织都要面对统一性、灵活性、利用率、SLA、建设速度和长期治理之间的冲突。成熟的平台设计会把这些冲突显式化，而不是隐藏在默认参数里。</p>
+<table>
+<tr><th>取舍</th><th>偏向左侧的收益</th><th>偏向右侧的收益</th><th>中型团队建议</th></tr>
+<tr><td>统一性 vs 灵活性</td><td>统一镜像、Job 模板和 registry 提升治理。</td><td>研究和业务团队能快速试新模型、新依赖、新链路。</td><td>统一关键边界：身份、数据版本、模型 registry、评测门禁、发布记录；保留实现细节弹性。</td></tr>
+<tr><td>利用率 vs SLA</td><td>GPU 压得更满，单位成本更低。</td><td>在线服务有余量，训练排队更可预测。</td><td>按工作负载分层经营：在线保底，训练可抢占，批处理填谷。</td></tr>
+<tr><td>建设速度 vs 长期复杂度</td><td>快速解决当前痛点。</td><td>减少后期迁移、权限混乱和证据断链。</td><td>围绕最痛问题建设最小闭环，避免全场景大一统，也避免完全无规范。</td></tr>
+</table>
+<div class="danger"><strong>严重风险：</strong>如果平台把所有 GPU 都压满当作唯一目标，在线推理的 p99、突发容量和故障恢复会被牺牲；如果完全不管利用率，平台成本会很快失控。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 平台能力分层</h2>
+<p>你可以把平台能力分成四层：资源层、运行层、工作流层、运营层。这个分层的好处是，需求进入平台时可以先判断它到底是在补资源问题、运行问题、工作流问题，还是运营治理问题。</p>
+<table>
+<tr><th>层级</th><th>核心能力</th><th>典型问题</th><th>平台产物</th></tr>
+<tr><td>第 0 层：资源层</td><td>GPU / CPU / 存储 / 网络，节点池，拓扑，镜像基线。</td><td>资源是否足够，拓扑是否适合训练，存储是否拖慢吞吐。</td><td>资源池、节点标签、容量规划、基础镜像。</td></tr>
+<tr><td>第 1 层：运行层</td><td>容器运行时，训练任务抽象，推理服务模板，队列与配额。</td><td>任务如何启动、排队、隔离、重试和抢占。</td><td>TrainJob、InferenceService、队列策略、配额规则。</td></tr>
+<tr><td>第 2 层：工作流层</td><td>数据版本、实验追踪、模型 registry、评测门禁、发布与回滚。</td><td>模型从哪里来，是否值得上线，出了问题回到哪里。</td><td>数据集版本、模型版本、评测报告、Release 记录。</td></tr>
+<tr><td>第 3 层：运营层</td><td>可观测性、审计、成本归因、SLA / SLO、incident response。</td><td>平台是否能解释质量、延迟、故障、安全和成本。</td><td>SLO 面板、审计日志、账单面板、事故复盘。</td></tr>
+</table>
+<pre class="mermaid">flowchart TB
+  L3[第 3 层 运营层&lt;br/&gt;观测 审计 成本 SLO Incident]
+  L2[第 2 层 工作流层&lt;br/&gt;数据版本 实验追踪 Registry 评测 发布回滚]
+  L1[第 1 层 运行层&lt;br/&gt;容器 训练任务 推理模板 队列配额]
+  L0[第 0 层 资源层&lt;br/&gt;GPU CPU 存储 网络 节点池 拓扑]
+  L0 --> L1 --> L2 --> L3
+  L3 --> C[平台治理闭环]
+  C --> L1
+  C --> L2</pre>
+<div class="note"><strong>排查提示：</strong>一个“训练慢”的需求可能落在资源层，也可能落在运行层或工作流层；不要在没定位层级前直接换调度器或重写平台。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 平台最容易失败的地方</h2>
+<p>平台失败通常不是因为缺少某个热门组件，而是因为端到端证据链、发布运营能力或业务差异被忽视。</p>
+<div class="grid-3">
+<div class="card"><strong>只做 UI，不做底层证据链</strong><br>界面很漂亮，但模型版本、数据版本、评测结果、回滚路径都不连通。这种平台很快会沦为另一个入口页。</div>
+<div class="card"><strong>只重训练，不重发布和观测</strong><br>训练能力很强，但上线和运营能力弱。模型很多，真正稳定跑在线上的很少，每次发布都像人工冒险。</div>
+<div class="card"><strong>只追求统一，不尊重业务差异</strong><br>推荐、RAG、分类、生成服务对延迟、批处理、缓存、隔离的要求差异很大。平台应统一边界和治理规则，而不是强迫所有工作负载使用同一套最优解。</div>
+</div>
+<table>
+<tr><th>失败形态</th><th>早期信号</th><th>修正方向</th></tr>
+<tr><td>UI 包装型平台</td><td>页面能提交任务，但数据、模型、评测、发布记录互不关联。</td><td>先补证据链和 registry 元数据，而不是继续扩页面。</td></tr>
+<tr><td>训练孤岛型平台</td><td>训练任务很多，线上发布仍靠手工脚本和临时审批。</td><td>把评测门禁、staging、灰度、回滚接入训练产物。</td></tr>
+<tr><td>一刀切型平台</td><td>研究团队绕过平台，业务团队抱怨流程太重。</td><td>统一身份、制品、评测、审计，放开模型实现和局部流程差异。</td></tr>
+</table>
+<div class="warn"><strong>平台产品判断：</strong>用户绕过平台不一定是用户不规范，也可能说明平台抽象没有覆盖真实任务，或者把底层复杂度转嫁给了用户。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 演进路线图与多集群</h2>
+<p>一条务实路线通常分成四个阶段：规范化、闭环化、平台化、高阶化。核心不是越快越好，而是每一阶段都能解决真实问题，并为下一阶段留下可演进的接口和证据。</p>
+<table>
+<tr><th>阶段</th><th>重点建设</th><th>完成标志</th></tr>
+<tr><td>阶段一：规范化</td><td>统一训练 Job 入口、统一镜像基线、统一模型与数据命名。</td><td>任务和制品不再靠个人约定命名，能基本追踪来源。</td></tr>
+<tr><td>阶段二：闭环化</td><td>实验追踪、registry、发布门禁、监控与回滚。</td><td>一个模型能从训练到灰度再到回滚形成完整记录。</td></tr>
+<tr><td>阶段三：平台化</td><td>队列、配额、租户隔离、服务模板、成本归因、incident 流程。</td><td>多团队共享资源时，平台能解释优先级、成本和故障边界。</td></tr>
+<tr><td>阶段四：高阶化</td><td>多地域、RAG / 向量基础设施、智能调度、自动容量与质量优化。</td><td>平台能跨集群经营容量，并围绕质量、成本和 SLA 自动优化。</td></tr>
+</table>
+<p>当平台规模继续扩大，单集群设计会逐步碰到边界：不同区域的时延、数据主权、容量池差异和故障域都会开始主导架构。</p>
+<table>
+<tr><th>挑战</th><th>为什么会出现</th><th>平台侧常见处理</th></tr>
+<tr><td>统一调度视图</td><td>资源分散在多个集群，单集群队列不再够用。</td><td>做上层全局控制面，底层按集群执行。</td></tr>
+<tr><td>数据就近与合规</td><td>数据、模型和索引跨区复制成本高，还可能受合规约束。</td><td>按区域放置数据和模型副本，尽量本地训练 / 本地服务。</td></tr>
+<tr><td>Checkpoint / 制品跨区同步</td><td>大模型 checkpoint 太大，跨区同步慢且贵。</td><td>区分热恢复副本与冷备副本，减少全量同步频率。</td></tr>
+</table>
+<pre class="mermaid">flowchart TB
+  C[全局平台控制面&lt;br/&gt;身份 配额 策略 Registry 索引] --> A[区域 A 集群]
+  C --> B[区域 B 集群]
+  C --> D[区域 C 集群]
+  A --> A1[本地数据副本]
+  A --> A2[训练与推理资源池]
+  B --> B1[本地模型副本]
+  B --> B2[在线服务故障域]
+  D --> D1[冷备 checkpoint]
+  D --> D2[批处理容量池]
+  A -.元数据与审计.-> C
+  B -.元数据与审计.-> C
+  D -.元数据与审计.-> C</pre>
+<div class="success"><strong>多集群原则：</strong>这类平台通常不追求“所有集群像一个集群一样透明”，而是追求统一入口、局部自治、跨区故障可解释。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 结课后的两种能力</h2>
+<p>学完本教程后，你应该形成两种核心能力：诊断能力和架构能力。诊断能力让你看到训练或推理问题时，能判断是算力问题、存储问题、网络问题还是调度问题，是资源不足、资源浪费还是规则设计出了问题。架构能力让你面对一个 AI 业务需求时，能从资源、链路、平台、治理、风险这些维度组织方案，而不是只会堆组件名。</p>
+<div class="grid-2">
+<div class="card"><strong>诊断能力</strong><br>把表面症状映射到资源、运行、工作流和运营层级，快速判断下一步应该查 GPU、数据、通信、调度、推理网关、评测还是治理证据。</div>
+<div class="card"><strong>架构能力</strong><br>把业务目标翻译成平台边界，明确资源经营方式、任务抽象、发布门禁、观测指标、成本归因和安全审计。</div>
+</div>
+<table>
+<tr><th>看到的问题</th><th>诊断视角</th><th>架构视角</th></tr>
+<tr><td>GPU 利用率低</td><td>数据加载、CPU 预处理、通信等待、batch 策略、队列规则。</td><td>是否需要分层资源池、数据缓存、训练模板和容量面板。</td></tr>
+<tr><td>线上 p99 抖动</td><td>KV Cache、batching、下游检索、节点抢占、网关限流。</td><td>是否需要在线保底资源、灰度策略、SLO 和降级规则。</td></tr>
+<tr><td>模型质量回退</td><td>数据版本、Prompt、检索索引、模型版本、评测集覆盖。</td><td>是否需要评测门禁、registry 元数据和线上质量采样。</td></tr>
+<tr><td>账单不可解释</td><td>租户标签、token 统计、GPU 小时、对象存储、向量库成本。</td><td>是否需要配额、成本归因、预算告警和资源回收。</td></tr>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 本章小结与练习题</h2>
+<p>构建 AI 平台的核心不是组件清单，而是让组织在有限资源、多租户、多工作负载和持续变化的模型链路中，仍然能解释每一次训练、发布、故障、回滚和成本。</p>
+<table>
+<tr><th>维度</th><th>关键问题</th></tr>
+<tr><td>目标</td><td>平台到底服务谁、解决什么痛点。</td></tr>
+<tr><td>资源</td><td>稀缺资源是什么，如何组织。</td></tr>
+<tr><td>工作流</td><td>从数据到训练到发布到推理是否闭环。</td></tr>
+<tr><td>治理</td><td>是否可观测、可回滚、可审计、可归因。</td></tr>
+<tr><td>演进</td><td>是不是围绕真实瓶颈逐步建设。</td></tr>
+</table>
+<h3>练习题</h3>
+<ol>
+<li>为一个 3 个团队共享 GPU 的平台画出高层架构图。</li>
+<li>如果你的业务以在线推理为主，平台设计的优先级应如何调整？</li>
+<li>试用本教程的框架分析一个你熟悉的 AI 系统。</li>
+<li>请为一个中型团队写出 AI 平台的三阶段建设路线图。</li>
+</ol>
+<div class="note"><strong>练习要求：</strong>不要只画组件框图。每个方案都要说明任务如何提交、资源如何准入、模型如何评测、发布如何回滚、成本如何归因。</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先复盘 <a href="../part6/18-containers-and-runtime.html">第 18 章</a>、<a href="../part6/19-kubernetes-for-ai.html">第 19 章</a>、<a href="../part6/20-queues-quotas-and-autoscaling.html">第 20 章</a>，确认平台运行层如何承载 AI 工作负载。</li>
+<li>再回看 <a href="../part7/21-observability-and-capacity.html">第 21 章</a>、<a href="../part7/22-evaluation-release-and-incident.html">第 22 章</a>、<a href="../part7/23-security-isolation-and-governance.html">第 23 章</a>，把观测、发布、安全和治理放进闭环。</li>
+<li>最后选择一个真实业务链路，按“训练 Job → checkpoint → registry → 评测 → staging → 灰度 → 回滚 → 反馈”画出最小平台方案。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Kubernetes、Volcano / Kueue、Ray、Kubeflow、MLflow、W&amp;B、Feast、vLLM、Triton Inference Server 等工具的官方文档，可分别对应平台运行、队列、训练、追踪、特征、推理执行层。</li>
+<li>云厂商 AI 平台架构白皮书，可用于对照托管平台如何处理身份、制品、训练、评测、推理和成本归因。</li>
+<li>SRE、平台工程、MLOps / LLMOps 的工程实践资料，可用于补充 SLO、incident、发布治理和平台产品化方法。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

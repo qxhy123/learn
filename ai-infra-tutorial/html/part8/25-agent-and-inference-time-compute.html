@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 25 章 · AI Agent 与推理时计算基础设施 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=25" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 25 章 · AI Agent 与推理时计算基础设施</h1>
+<p class="sub">从“用户任务不再等于一次模型前向”出发，把 agent session 拆成可调度、可计费、可隔离、可观测、可停止的 step，并解释推理时多花算力何时值得。</p>
+<div class="chips"><span class="chip">Agent Runtime</span><span class="chip">Inference-time Compute</span><span class="chip">预算 Envelope</span><span class="chip">Tool Sandbox</span><span class="chip">Step Trace</span></div>
+<div class="note"><strong>不可化简的问题：</strong>一次用户任务会持续消耗 GPU、KV Cache、工具池、网络连接、credential、trace 存储和租户预算；平台怎样把这段路径不确定的计算过程重新变成可治理对象？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：Agent 与推理时计算</a></li>
+<li><a class="anchor" href="#s2">学习目标</a></li>
+<li><a class="anchor" href="#s3">从基础设施视角看 Agent 和 Thinking Model</a></li>
+<li><a class="anchor" href="#s4">从 QPS 到 Session 的并发模型</a></li>
+<li><a class="anchor" href="#s5">推理时计算的 4 种工程模式</a></li>
+<li><a class="anchor" href="#s6">推理预算工程实现</a></li>
+<li><a class="anchor" href="#s7">Agent / 推理服务集成</a></li>
+<li><a class="anchor" href="#s8">长会话状态、上下文压缩与流式中间结果</a></li>
+<li><a class="anchor" href="#s9">一个最小 agent loop</a></li>
+<li><a class="anchor" href="#s10">Planner、Executor、Verifier 为什么要分开</a></li>
+<li><a class="anchor" href="#s11">Tool use 与 retrieval 会怎样改写 serving</a></li>
+<li><a class="anchor" href="#s12">Tool use 的信任边界必须先于优化存在</a></li>
+<li><a class="anchor" href="#s13">预算、停止条件与回退策略</a></li>
+<li><a class="anchor" href="#s14">什么时候 inference-time compute 真值得</a></li>
+<li><a class="anchor" href="#s15">成本与 SLA 怎样一起治理</a></li>
+<li><a class="anchor" href="#s16">工程建议与小结</a></li>
+<li><a class="anchor" href="#s17">练习题</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：Agent 与推理时计算</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>把 Agent、tool use、thinking model、inference-time compute 这些名字都拿掉，本章只剩一个不可化简的问题：一次用户任务不再等于一次模型前向，而是一段会持续消耗资源、改变外部状态、并在不确定路径上寻找可接受结果的计算过程；平台怎样让这段过程可调度、可计费、可隔离、可观测、可停止？传统在线推理的基础抽象是 request。request 有输入 token、输出 token、队列等待、prefill、decode、streaming 和结束，容量估算可以粗略落在 <code>QPS x latency</code> 或 <code>concurrency x tokens/s</code> 上，成本也可以近似按 input/output token 计价。但 agent 任务的真实单位更接近 session：用户提出一个目标，系统先规划，再调用检索、工具或代码执行环境，拿到观察结果后继续推理，必要时生成多个候选、做验证、重试、压缩上下文，最后才给出答案。这个过程可能只用 2 次模型调用，也可能走到 8 步、20 次工具请求、几十秒 wall-clock 时间。</p>
+<p>基础设施的难点不是“模型能不能调用工具”，而是每一步都可能占用 GPU、KV Cache、工具池、网络连接、credential、trace 存储和租户预算。因此，本章的第一性问题不是“如何写一个 agent prompt”，而是“如何把开放式计算过程重新变成工程系统能治理的对象”。如果没有预算，agent 会把一次难题扩展成无上限搜索；如果没有停止条件，失败会表现成循环、超时或账单失控；如果没有信任边界，工具调用会把提示注入、越权访问和副作用带进生产链路；如果没有 step trace，平台只能看到最后失败，却无法知道预算花在 planning、retrieval、verifier 还是重试上。Agent 基础设施的核心，是把“多想几步”翻译成明确的资源合同：最多多少 reasoning tokens、多少 GPU-second、多少模型调用、多少工具 wall time、哪些工具可用、何时降级、如何结算。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“开放式计算必须可治理”出发，几个机制几乎是被迫出现的。首先，request 抽象不够用，所以要引入 session、step 和 state。session 表示一次用户目标的生命周期，step 表示可计费、可观测、可取消的最小运行单元，state 表示上下文、工具结果、摘要、KV 复用线索和预算余额。没有这三层，平台无法回答“这次任务现在卡在哪里”“还能不能继续”“继续会花多少钱”。其次，推理时计算不能只理解为 thinking tokens。额外算力可能花在模型内部的隐式推理，也可能花在多候选采样、树搜索、verifier 复核、retrieval、代码解释器、浏览器和外部 API。它们共同目标都是用更多 inference-time compute 换更高任务成功率，但资源形态不同：token 型压力主要放大 decode；分支型压力放大并发与峰值 GPU；工具型压力放大 wall-clock、恢复 prefill 和外部依赖；验证型压力则引入额外队列和反压。</p>
+<p>第三，成本模型从 token 计费扩展到预算 envelope。一次 agent session 进入运行时前，控制面要根据租户、任务类型、SLA、风险等级生成预算：总 token、reasoning token、GPU-second、模型调用次数、工具调用次数、工具 wall time、session TTL、最大步骤数。每一步开始前做 reservation，执行中流式扣减，结束后 settle，失败时记录原因。预算耗尽也不能随机断流，而要按“停止扩展分支、降低候选数、截断隐式推理、压缩上下文或切小模型、返回 partial result 或人工接管”的顺序降级。第四，Agent runtime 和推理服务必须分工。vLLM、TRT-LLM、SGLang 这类 serving engine 负责单次模型调用的 batching、prefill、decode、KV block、prefix cache；Agent runtime 负责任务拆分、工具执行、状态管理、预算扣减、安全边界和 step trace。把整个 session 塞进一个超长请求会破坏调度效率，也会让工具等待期间 GPU 无法高效复用。第五，工具调用要求先定义信任边界，再谈优化。检索、浏览器、代码执行、数据库、工单系统和写操作 API 会把外部世界接入推理循环，必须明确工具白名单、参数 schema、沙箱、scoped credentials、egress 限制、审批门、幂等 retry key 和审计日志。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Agent 与推理时计算))
+    不可化简的问题
+      用户任务不是一次前向
+      路径不确定
+      资源必须可治理
+      工具会改变外部状态
+    运行时抽象
+      Session
+        生命周期
+        TTL
+        状态恢复
+      Step
+        可计费
+        可取消
+        可观测
+      State
+        上下文
+        工具结果
+        摘要记忆
+        预算余额
+    推理时计算四模式
+      隐式推理预算
+      多候选与搜索
+      验证与反思
+      工具增强执行
+    基础设施机制
+      预算 envelope
+      Step trace
+      Prefix cache
+      KV 生命周期
+      Tool sandbox
+      Queue isolation
+    工程结果
+      成本可控
+      SLA 可解释
+      失败可回放
+      租户可隔离</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 agent 的容量规划不能只用 <code>QPS x request latency</code>，而要转向 session、step、模型调用次数和工具等待时间？</li>
+<li><code>thinking tokens</code>、多候选采样、verifier、tool use 分别把压力施加到哪些资源上？</li>
+<li>一个生产级 agent runtime 至少需要哪些预算字段？这些预算应该在哪些服务里执行？</li>
+<li>为什么长 session 不应该直接映射成 serving engine 里的一个超长请求？</li>
+<li>工具调用型 agent 的 trust boundary 应该先定义哪些内容？</li>
+<li>当预算耗尽或 verifier 连续失败时，怎样设计有序降级？</li>
+<li>如何判断一个任务是否值得多花 2-5 倍推理时计算？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 学习目标</h2>
+<div class="grid-2">
+<div class="card"><strong>概念边界</strong><br>区分 agent、tool use、thinking model 和 inference-time compute。</div>
+<div class="card"><strong>架构影响</strong><br>理解为什么“多想几步”会改变 serving 架构、并发模型和成本模型。</div>
+<div class="card"><strong>运行时设计</strong><br>设计一个最小可运营的 agent loop，包含状态、预算、停止条件与回退路径。</div>
+<div class="card"><strong>经营判断</strong><br>判断什么时候值得把更多算力放到推理时，而不是训练时或人工流程中。</div>
+</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 从基础设施视角看 Agent 和 Thinking Model</h2>
+<p>如果已经理解 <a href="../part5/14-online-inference-architecture.html">第 14 章</a> 到 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的推理系统设计，Agent 和 Thinking Model 会从三个方向打破假设：会话持续时间、token 消耗可预测性、并发模型。</p>
+<table><tr><th>被打破的假设</th><th>传统在线推理的近似</th><th>Agent / Thinking Model 下的新现实</th><th>基础设施含义</th></tr><tr><td>会话持续时间</td><td>请求通常在一次生成内结束</td><td>一个任务可能持续数十秒到数分钟，中间多次挂起、恢复、调用工具</td><td>需要 session state、step trace、显式关闭和空闲回收</td></tr><tr><td>token 消耗可预测性</td><td>输出长度大致可由 <code>max_tokens</code> 控制</td><td>隐式推理、候选采样、验证和上下文回注会让 token 与 GPU 时间同时波动</td><td>需要预算 envelope、动态降级和按步骤记账</td></tr><tr><td>并发模型</td><td>容量主要看 QPS、batch size、单请求延迟</td><td>容量取决于并发 session、每个 session 的模型调用次数和工具等待时间</td><td>调度器要同时管理 GPU 队列、工具池和长上下文缓存</td></tr></table>
+<div class="note">本章不重复介绍 Agent 的概念，而是关注它进入服务化系统后带来的运行时治理问题：怎样把一段多步、不确定、会调用外部环境的计算过程，映射回可以调度、计费、隔离和观测的基础设施对象。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 从 QPS 到 Session 的并发模型</h2>
+<p>传统推理系统常把压力近似成：</p>
+<pre><code>QPS x request latency</code></pre>
+<p>但 agent 更接近：</p>
+<pre><code>concurrent sessions x session duration x model calls per session</code></pre>
+<p>因为一个用户任务可能持续数十秒到数分钟，并在中途多次挂起、恢复、调用工具和继续思考。平台如果还只按短请求 QPS 估容量，就会低估会话态、KV 生命周期和工具执行池的占用。</p>
+<pre><code>active_gpu_work = concurrent_sessions
+                x avg_model_calls_per_session
+                x avg_gpu_seconds_per_call
+                / avg_session_wall_time
+
+tool_pool_concurrency = concurrent_sessions
+                      x avg_tool_calls_per_session
+                      x avg_tool_wall_time
+                      / avg_session_wall_time</code></pre>
+<pre class="mermaid">flowchart LR
+  U[用户目标] --> S[Agent Session]
+  S --> P[Planner step]
+  P --> M1[模型调用: plan]
+  P --> T[工具或检索等待]
+  T --> E[Executor step]
+  E --> M2[模型调用: observe]
+  E --> V[Verifier step]
+  V -->|通过| F[Finalizer]
+  V -->|失败且有预算| P
+  F --> A[最终答案]
+  S -. 持续占用 .-> ST[(State / Trace / Budget)]
+  M1 -. 短时占用 .-> G[(GPU / KV Cache)]
+  M2 -. 短时占用 .-> G
+  T -. 占用 .-> TP[(Tool Pool)]</pre>
+<div class="warn"><strong>工程边界：</strong>session 并发不是 GPU 并发。一个 10,000 并发 session 的系统，如果每个 session 平均只有 15% 时间在模型 decode，GPU 活跃并发可能远低于 10,000；但 metadata store、trace pipeline、tool worker 和 KV/prefix cache 的压力可能先到瓶颈。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 推理时计算的 4 种工程模式</h2>
+<p>训练时算力是为了把能力写进参数；推理时算力是为了在具体问题上多做搜索、采样、验证、复核或外部动作。<code>thinking tokens</code> 只是其中一种表现形式。更通用的定义是：任何在推理阶段为了提高任务成功率而主动消耗额外计算的技术。</p>
+<pre><code>t_answer ≈ Σ_i (t_model_i + t_search_i + t_tool_i + t_verify_i)</code></pre>
+<table><tr><th>模式</th><th>典型技术</th><th>主要收益</th><th>主要成本</th><th>调度影响</th><th>预算控制</th></tr><tr><td>隐式推理预算</td><td>Chain-of-Thought、thinking tokens、deliberation</td><td>难题上提高单路径质量</td><td>reasoning tokens、decode 时间、长尾输出</td><td>单请求 decode 变长，batch 内尾部拖慢</td><td><code>max_reasoning_tokens</code>、按 token 流式扣减、接近阈值触发 finalizer</td></tr><tr><td>多候选与搜索</td><td>Best-of-N、self-consistency、beam/tree search</td><td>用多路径提高命中率，适合数学、代码、规划</td><td>候选数近似 <code>N</code> 倍，树搜索可能随深度膨胀</td><td>并行分支制造 GPU burst，串行分支制造尾延迟</td><td><code>max_candidates</code>、<code>max_branch_depth</code>、分支优先级、早停</td></tr><tr><td>验证与反思</td><td>verifier-guided generation、critic、rerank、unit test</td><td>把“生成答案”改成“生成 + 判断”</td><td>verifier 模型调用、测试执行、失败重试</td><td>生成队列和验证队列互相反压</td><td><code>max_verify_rounds</code>、独立 verifier 队列、失败阈值</td></tr><tr><td>工具增强执行</td><td>Retrieval、browser、code interpreter、DB/API call</td><td>接入外部事实、执行动作、降低模型记忆压力</td><td>tool wall time、回注 token、权限与审计成本</td><td>GPU 工作被工具等待打断，恢复时可能重新 prefill</td><td><code>max_tool_calls</code>、<code>max_tool_wall_time</code>、工具白名单、结果大小上限</td></tr></table>
+<div class="warn"><strong>工程边界：</strong>thinking tokens 可由模型或 API 暴露，也可能是隐藏计费项；Best-of-N 能并行加速但会抬高瞬时 GPU 峰值；verifier 如果和主模型共用队列，可能在高失败率时反压所有请求；工具增强执行的最大风险往往不是 token，而是权限、超时和不可幂等副作用。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 推理预算工程实现</h2>
+<p>agent 成本模型不能只看平均 tokens，通常要同时支持三类计费口径：token、GPU-second、session / task。工程上应把预算管理放在控制面，而不是只写在 prompt 里。</p>
+<table><tr><th>计费模型</th><th>适用场景</th><th>优点</th><th>风险</th></tr><tr><td>input + output + reasoning token</td><td>API 型模型服务、简单 chat、thinking model</td><td>易理解，和传统 serving 兼容</td><td>难表达工具等待、搜索分支和 GPU 空转</td></tr><tr><td>GPU-second</td><td>自建推理集群、高成本 search / verifier 任务</td><td>贴近真实资源消耗，适合容量治理</td><td>需要准确归因到 request、tenant 和 session</td></tr><tr><td>session / task</td><td>长任务 agent、企业套餐、异步工作流</td><td>对用户更稳定，方便设置任务级 SLA</td><td>如果内部预算缺失，平台可能承担长尾成本</td></tr></table>
+<pre class="mermaid">sequenceDiagram
+  participant C as Client
+  participant CP as Control Plane
+  participant Q as Quota/Billing
+  participant R as Agent Runtime
+  participant G as Model Gateway
+  participant T as Tool Runner
+  C->>CP: submit task
+  CP->>Q: classify + quote
+  Q-->>CP: budget envelope
+  CP->>R: start session with budget
+  R->>Q: reserve step quota
+  R->>G: model call
+  G-->>Q: stream token/GPU usage
+  R->>T: tool call with timeout
+  T-->>Q: report wall time
+  R->>Q: settle step
+  R->>R: decide continue / degrade / stop
+  R-->>C: final or partial result</pre>
+<table><tr><th>预算字段</th><th>执行位置</th><th>工程实现</th><th>超预算时的降级策略</th></tr><tr><td><code>max_reasoning_tokens</code></td><td>模型网关 / decoder</td><td>hidden 或 visible reasoning token 流式计数，接近阈值触发 stop sequence 或 finalizer</td><td>截断隐式推理，要求基于当前中间状态给出最短可用答案</td></tr><tr><td><code>max_output_tokens</code></td><td>模型网关</td><td>与传统 serving 一致，限制最终可见输出</td><td>改用摘要式输出，附上“不完整”状态</td></tr><tr><td><code>per_step_gpu_second_budget</code></td><td>scheduler</td><td>记录 prefill、decode、verifier、rerank 的 GPU 时间，按 step 归因</td><td>停止扩展新分支，切小模型 summarizer</td></tr><tr><td><code>max_model_calls_per_session</code></td><td>agent runtime</td><td>对 planner、executor、verifier、finalizer 调用做 step counter</td><td>跳过下一轮反思，直接 final answer 或人工接管</td></tr><tr><td><code>max_tool_wall_time</code></td><td>tool runner</td><td>每次调用设置 timeout、取消令牌和幂等 retry key</td><td>返回工具不可用的可解释失败，禁止无限重试</td></tr><tr><td><code>max_context_tokens</code></td><td>agent runtime / gateway</td><td>控制历史、工具结果、摘要和检索片段总量</td><td>触发 summarization、state extraction 或丢弃低价值观察</td></tr><tr><td><code>tenant_budget_remaining</code></td><td>billing / quota 服务</td><td>每步前 reservation，完成后 settle，失败要释放未用额度</td><td>降级到低预算策略、切小模型、拒绝非关键工具调用</td></tr></table>
+<div class="success"><strong>推荐降级顺序：</strong>停止新增搜索分支 → 降低候选数和 verifier 轮数 → 截断隐式推理 → 压缩上下文或切小模型 → partial result / 人工接管。</div>
+<div class="danger"><strong>预算不能依赖模型自觉：</strong>prompt 可以提示模型节省步骤，但真正的上限必须由 gateway、scheduler、tool runner 和 quota 服务强制执行。跨服务 reservation 要处理并发扣减和失败释放。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. Agent / 推理服务集成</h2>
+<p>Agent session 不是 vLLM / TRT-LLM / SGLang 里的一个超长请求。更常见的映射是：<code>agent session → model call 1: plan → tool call / retrieval → model call 2: observe + continue → verifier call → model call 3: final answer</code>。长 session 等于多次推理调用加 context 管理。</p>
+<table><tr><th>集成点</th><th>Agent runtime 负责</th><th>推理服务负责</th><th>关键风险</th></tr><tr><td>请求拆分</td><td>把一次任务拆成 planner / executor / verifier / finalizer 多次调用</td><td>对每次调用做 batching、prefill、decode、streaming</td><td>拆分过细会增加 prefill 成本和调度开销</td></tr><tr><td>Context 管理</td><td>决定保留原文、摘要、工具结果还是结构化状态</td><td>承载本次请求的 prompt 和 KV</td><td>回注过多会让上下文线性膨胀</td></tr><tr><td>Prefix caching</td><td>标记可复用的 system prompt、工具说明、策略前缀</td><td>复用相同前缀的 KV / prefix cache</td><td>前缀失配会让 cache 命中率下降</td></tr><tr><td>KV Cache 生命周期</td><td>按 session close、idle timeout、priority 管理缓存保留意图</td><td>分配、驱逐和复用 KV block</td><td>长 session 占住 KV 会挤压短请求吞吐</td></tr><tr><td>Queue isolation</td><td>给 planner、finalizer、verifier、summarizer 标注优先级</td><td>在不同队列或优先级中调度 decode</td><td>verifier 风暴可能拖慢高优用户请求</td></tr><tr><td>Tool calling 执行环境</td><td>在沙箱中执行工具，设置超时、权限、网络和文件边界，并把结果回注给下一轮模型</td><td>不直接执行工具，只接收回注后的 prompt</td><td>工具结果未过滤会扩大提示注入和数据泄露风险</td></tr></table>
+<pre class="mermaid">flowchart TB
+  AR[Agent Runtime<br/>流程 状态 预算 Trace] --> MG[Model Gateway<br/>鉴权 限流 token 计数]
+  MG --> SE[Serving Engine<br/>vLLM / TRT-LLM / SGLang]
+  SE --> KV[(KV Blocks / Prefix Cache)]
+  AR --> TR[Tool Runner<br/>sandbox timeout credential]
+  AR --> QS[Quota Service<br/>reservation / settlement]
+  AR --> TS[Trace Pipeline<br/>step event / audit]
+  TR --> EXT[Retrieval / Browser / Code / API]
+  SE -. batching prefill decode .-> GPU[(GPU Pool)]
+  QS -. budget policy .-> AR
+  TS -. replay evidence .-> OPS[Observability]</pre>
+<div class="note">这也是它与 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> KV Cache 的直接关系：长 context 不只是 prompt 变长，还会让 KV Cache 变成 session 级资源。平台需要 prefix caching 降低重复 prefill，需要 KV 生命周期管理避免长会话挤占共享池。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 长会话状态、上下文压缩与流式中间结果</h2>
+<p>agent 系统里，context window 不再只是“一段越来越长的聊天记录”，而是一份要持续被治理的运行时状态。</p>
+<table><tr><th>问题</th><th>平台要回答什么</th><th>常见做法</th></tr><tr><td>会话状态保留多久</td><td>KV / memory 是秒级、分钟级还是任务级</td><td>分层 TTL、显式 session close、空闲回收</td></tr><tr><td>上下文何时截断</td><td>哪些历史必须保留，哪些可以丢弃</td><td>基于窗口上限做 truncation</td></tr><tr><td>上下文何时压缩</td><td>历史太长时是否转摘要或结构化记忆</td><td>summarize / distill / state extraction</td></tr><tr><td>中间结果如何返回</td><td>是只回最终答案，还是流式返回步骤进度</td><td>streaming token + step event + final bundle</td></tr></table>
+<div class="warn"><strong>工程边界：</strong>摘要不是无损压缩。审计、复现、计费依赖原始 step trace；下一轮模型调用可以只用摘要或结构化状态。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 一个最小 agent loop</h2>
+<p>一个最小但可运营的 agent loop，通常至少包含 planner、tool / retrieval / executor、verifier、stop or continue、final answer。每一步都要可解释。</p>
+<pre><code>user request
+  -> planner
+  -> tool / retrieval / executor
+  -> verifier
+  -> stop or continue
+  -> final answer</code></pre>
+<table><tr><th>环节</th><th>主要职责</th><th>平台关注点</th></tr><tr><td>Planner</td><td>决定先做什么</td><td>是否有最大步数与任务边界</td></tr><tr><td>Executor</td><td>调工具、跑检索、写中间结果</td><td>超时、权限、幂等性</td></tr><tr><td>Verifier</td><td>判断结果是否可接受</td><td>是否会无限循环、是否能给出失败理由</td></tr><tr><td>Finalizer</td><td>组织最终输出</td><td>是否保留审计轨迹与引用来源</td></tr></table>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Plan
+  Plan --> ReserveBudget
+  ReserveBudget --> ExecuteModel
+  ExecuteModel --> CallTool: need tool
+  ExecuteModel --> Verify: no tool
+  CallTool --> Observe
+  Observe --> Verify
+  Verify --> Plan: fail and budget remains
+  Verify --> Finalize: pass
+  Verify --> Degrade: fail or budget low
+  Degrade --> Finalize
+  Finalize --> [*]</pre>
+</section>
+
+<section class="section" id="s10">
+<h2>10. Planner、Executor、Verifier 为什么要分开</h2>
+<p>把三者混在一个 prompt 里当然可以跑，但平台很难治理。分开不意味着一定要三模型三服务，重点是运行时语义上要能区分三类动作。</p>
+<table><tr><th>角色</th><th>如果职责不清会怎样</th><th>分开后的平台收益</th></tr><tr><td>Planner</td><td>一边规划一边执行，步骤不可审计</td><td>易限制最大步数与工具白名单</td></tr><tr><td>Executor</td><td>工具调用和答案生成混在一起</td><td>易做超时、重试、幂等与权限控制</td></tr><tr><td>Verifier</td><td>失败时继续盲试</td><td>易设置 stop condition 与人工接管</td></tr></table>
+</section>
+
+<section class="section" id="s11">
+<h2>11. Tool use 与 retrieval 会怎样改写 serving</h2>
+<p>一旦引入工具和检索，在线推理链路会从“单模型调用”变成“多跳依赖图”。Agent 不是给模型多接几个 API，而是把“工作流执行”放进了推理面。</p>
+<table><tr><th>新增对象</th><th>平台含义</th><th>对应章节</th></tr><tr><td>Retrieval</td><td>召回、缓存、权限过滤进入主链路</td><td><a href="../part4/13-feature-vector-and-cache.html">第 13 章</a></td></tr><tr><td>Tool API</td><td>外部服务变成推理步骤的一部分</td><td><a href="../part5/14-online-inference-architecture.html">第 14 章</a></td></tr><tr><td>Budget policy</td><td>预算和租户规则直接影响能走几步</td><td><a href="../part5/17-multitenancy-and-cost.html">第 17 章</a></td></tr><tr><td>Trace / audit</td><td>需要记录每一步用了什么信息和工具</td><td><a href="../part7/21-observability-and-capacity.html">第 21 章</a></td></tr></table>
+</section>
+
+<section class="section" id="s12">
+<h2>12. Tool use 的信任边界必须先于优化存在</h2>
+<p>很多团队做 agent 时，先补预算、trace 和 retry，却把真正危险的边界留到最后。这个顺序是反的。对工具调用型 agent 来说，最低限度的控制至少包括：</p>
+<table><tr><th>控制项</th><th>平台要回答什么</th><th>失效后会怎样</th></tr><tr><td>工具白名单</td><td>哪类任务可调用哪些工具</td><td>模型可能调用高风险或无关工具</td></tr><tr><td>隔离执行环境</td><td>代码、命令、浏览器是否跑在沙箱内</td><td>单次任务故障会污染宿主或其他会话</td></tr><tr><td>Scoped credentials</td><td>每步拿到的 token 是否只够当前动作使用</td><td>工具泄露会扩大成租户级事故</td></tr><tr><td>Egress 限制</td><td>能访问哪些网络、文件、设备</td><td>过度联网或读写会绕过业务边界</td></tr><tr><td>Approval gate</td><td>改状态动作是否需要显式批准</td><td>模型可能在无确认下执行破坏性操作</td></tr></table>
+<div class="danger"><strong>严重风险：</strong>只读工具和写工具必须分级。所有有副作用的工具都应该具备审批、幂等 key、回滚方案和审计事件。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 预算、停止条件与回退策略</h2>
+<p>agent 系统最容易失控的地方，不是模型不会思考，而是它会一直思考。</p>
+<table><tr><th>控制项</th><th>常见上限</th><th>为什么重要</th></tr><tr><td>最大步骤数</td><td>例如 4-8 步</td><td>防止无限循环和尾延迟失控</td></tr><tr><td>最大工具调用数</td><td>例如 2-5 次</td><td>防止外部依赖账单失控</td></tr><tr><td>最大 token 预算</td><td>输入 + reasoning + 输出合并计</td><td>防止长上下文任务吞掉共享池</td></tr><tr><td>最大 wall-clock 时间</td><td>例如 5-20 秒</td><td>防止单请求拖垮高优流量</td></tr><tr><td>回退路径</td><td>超预算后切单次回答或人工接管</td><td>把失败做成可预期行为</td></tr></table>
+<div class="success">这些上限应由控制面执行；reservation、settlement 与降级流程要能在每个 step 产生可解释事件，而不是只在最终答案里留下“失败”。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 什么时候 inference-time compute 真值得</h2>
+<p>不是所有任务都值得把更多算力放在推理时。实用判断：如果多花 2-3 倍推理成本，不能带来明显更高成功率或更少人工返工，就不值得。</p>
+<table><tr><th>任务类型</th><th>更可能值得</th><th>原因</th></tr><tr><td>数学、代码、规划</td><td>是</td><td>额外搜索和验证能显著提升成功率</td></tr><tr><td>实时问答 / 检索增强</td><td>视情况</td><td>tool use 通常有收益，但步数不宜太多</td></tr><tr><td>低价值、高 QPS 文本生成</td><td>否</td><td>成本放大快于质量收益</td></tr><tr><td>强 SLA 在线客服</td><td>通常谨慎</td><td>多步链路容易放大尾延迟</td></tr></table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 成本与 SLA 怎样一起治理</h2>
+<p>agent 系统的治理重点不是“平均成本”，而是把高价值请求和低价值请求区分开。治理对象从“请求”扩展成了“请求中的一串步骤”。</p>
+<table><tr><th>治理动作</th><th>目标</th><th>常见做法</th></tr><tr><td>分级服务</td><td>把高价值任务允许更多步骤</td><td>关键租户走高预算策略，普通租户走快路径</td></tr><tr><td>两段式回答</td><td>先给快速草答，再决定是否继续搜索</td><td>先满足交互感知，再异步补强</td></tr><tr><td>Step-level timeout</td><td>控制单步卡死风险</td><td>每次工具调用与 verifier 都有独立超时</td></tr><tr><td>Budget-aware routing</td><td>把复杂任务送到更贵但更强的策略</td><td>结合租户、任务类型、剩余预算决定</td></tr></table>
+<div class="warn"><strong>SLA 边界：</strong>SLA 不应只写最终延迟。agent 还需要定义 first token latency、step event 间隔、最终完成时间和异步补偿时间。</div>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 工程建议与小结</h2>
+<ul>
+<li>先定义任务成功率，再决定是否引入更多 inference-time compute。</li>
+<li>Agent loop 必须有最大步数、最大预算和明确回退路径。</li>
+<li>Tool use、retrieval 和 verifier 都要进入 trace，不要只记录最终答案。</li>
+<li>有副作用的工具必须放在白名单、沙箱、scoped credential 和审批门之后。</li>
+<li>对高价值任务和高 QPS 任务使用不同策略，不要让所有请求都走最重路径。</li>
+<li>把 agent 成本拆成模型 cost、工具 cost、人工接管 cost 三部分，才能真正做经营决策。</li>
+</ul>
+<table><tr><th>主题</th><th>关键点</th></tr><tr><td>Agent 本质</td><td>一段带规划、执行、验证和停止条件的推理流程</td></tr><tr><td>Inference-time compute</td><td>用更多推理时算力换更高任务成功率，工程上可拆为隐式推理、多候选搜索、验证反思、工具增强执行 4 种模式</td></tr><tr><td>平台难点</td><td>多步状态、预算控制、工具依赖、成本放大、权限边界</td></tr><tr><td>是否值得</td><td>取决于任务价值、成功率提升、人工返工减少和 SLA 约束</td></tr><tr><td>治理重点</td><td>把预算、回退、trace、tool policy 和 quota 做成控制面能力</td></tr></table>
+</section>
+
+<section class="section" id="s17">
+<h2>17. 练习题</h2>
+<ol>
+<li>从基础设施视角看，Agent 和 Thinking Model 分别会怎样改变会话持续时间、token 消耗可预测性和并发模型？</li>
+<li>给定 1,000 个并发 agent session、平均每个 session 6 次模型调用、每次调用平均 1.5 秒 GPU 时间，估算总 GPU-second 需求，并说明还缺哪些容量假设。</li>
+<li>为什么 agent 容量规划不能只用 <code>QPS x request latency</code>？请和传统在线推理调度做对比。</li>
+<li>隐式推理预算、多候选与搜索、验证与反思、工具增强执行分别会把成本放大到哪里？</li>
+<li>如果一个请求允许 <code>max_reasoning_tokens=8,000</code>，但租户剩余预算只够 4,000 个 reasoning tokens，你会如何设计截断和降级策略？</li>
+<li>请为一个“数学求解 agent”设计最大步数、最大工具调用数、<code>per_request_gpu_second_budget</code> 和回退策略。</li>
+<li>为什么 verifier-guided generation 需要把生成队列和验证队列分开限流？</li>
+<li>Agent session 如何映射到 vLLM / TRT-LLM / SGLang 请求？为什么长 session 不应该直接等同于一个超长推理请求？</li>
+<li>Tool calling 沙箱至少应该限制哪些资源？请说明超时、权限、网络和文件边界各自防止什么风险。</li>
+<li>如果 Best-of-N 从 1 提高到 8，平均成功率从 62% 提高到 78%，但 P95 延迟从 3 秒变成 11 秒，你会怎样决定是否对所有租户开启？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料与学习路线</h2>
+<div class="grid-2">
+<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part4/13-feature-vector-and-cache.html">第 13 章</a> 的检索与缓存，再回到 <a href="../part5/14-online-inference-architecture.html">第 14 章</a>、<a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a>、<a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 理解模型网关、KV Cache、批处理与成本治理，最后用本章把它们合成 agent runtime。</div>
+<div class="card"><strong>延伸阅读</strong><br>建议继续阅读 vLLM / TRT-LLM / SGLang 的 serving engine 文档、OpenTelemetry trace 建模、Kubernetes 多租户与配额治理、沙箱执行环境、幂等 API 设计和工作流引擎的取消/恢复语义。</div>
+</div>
+<p class="mini">本章的核心不是 prompt 技巧，而是把开放式推理过程变成有资源合同、有状态机、有信任边界、有审计证据的生产系统。</p>
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">© AI Infra 教程 · Agent 与推理时计算基础设施</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
