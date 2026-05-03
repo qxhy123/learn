@@ -112,6 +112,8 @@ ai-infra-tutorial/
 
 ### 2.5 共同要求
 
+> 注意：本节列出的"开篇第一性原理拆解 + 学习大纲"段落要求同时适用于 Part 1-8 全部 25 章（详见 §3.0）；其余条款（Worked example、12-14 道练习、深度参考阅读列表等）仅适用于 Part 0 新增章节。
+
 每章必须含：
 
 - **开篇"第一性原理拆解 + 学习大纲"段落（不少于 800 字）**。这一段不是"工程师为什么要学"的动员宣传，而是把本章的所有概念用第一性原理拆开重组：
@@ -128,6 +130,17 @@ ai-infra-tutorial/
 ## 3. 现有章节扩写清单
 
 合并 `SPEC.md` 17 WUs 与用户新增清单后的最终扩写表。每条标 **【SPEC】** / **【新】** / **【合】**。
+
+### 3.0 全章统一新增项（Part 1-8 全部 25 章 + Part 0 全部 4 章 = 全 29 章共同适用）
+
+**所有章节都必须新增（或重写）"开篇第一性原理拆解 + 学习大纲"段落**，规格与 §2.5 完全一致（不少于 800 字 / 拆-推-绘-导四段 / 含 mermaid mindmap + 5-7 个第一性问题 checklist）。
+
+- 对原本仅有简短导言的现有章节：**前置**该段落作为新 §1，原导言保留为新 §2 或并入新 §1 的"拆"小节
+- 对 §3 标记"无大改"的 Ch 1, 2, 3, 14, 18, 24：**也需要新增此开篇段落**，因此都需要分配 Batch 1 agent
+- 这条要求使 Batch 1 agent 数量从 24 增到 29（每章独立 agent，不再有 ch11-12 合并）
+
+最终 Batch 1 = 4 (Part 0) + 25 (Ch 1-25 全部) = **29 个 agent**。
+
 
 ### Part 1
 - **Ch 2** 算力存储网络：补 Page Cache / NUMA 浅引用并指向 §0b（~300）【新】
@@ -207,13 +220,36 @@ ai-infra-tutorial/
     <nav class="topnav"></nav>
     <section class="hero">
       <h1>第 0a 章 · CPU 微架构</h1>
-      <p class="sub">为什么 AI 平台工程师必须懂流水线、Cache 层级与 MESI 协议</p>
+      <p class="sub">从"CPU 是有限物理器件"出发，第一性原理推导流水线、缓存与一致性协议为何必然存在</p>
       <div class="chips"><span class="chip">CPU</span></div>
-      <div class="note"><strong>一句话理解：</strong>...</div>
-      <div class="success"><strong>最重要原则：</strong>...</div>
+      <div class="note"><strong>不可化简的问题：</strong>单条指令完成不了的事情如何用并行/缓存/预测逼近物理极限？</div>
+      <div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
     </section>
     <section class="toc">本章目录</section>
-    <section class="section" id="s1">...</section>
+    <!-- §1 必为"第一性原理拆解 + 学习大纲"段落，含 800+ 字 + 思维导图 + 5-7 问题 checklist -->
+    <section class="section" id="s1">
+      <h2>1. 第一性原理拆解：为什么会有 CPU 微架构</h2>
+      <h3>拆 — 不可化简的问题</h3>
+      <p>...</p>
+      <h3>推 — 从这个问题如何推导出每个机制</h3>
+      <p>...</p>
+      <h3>绘 — 因果链路</h3>
+      <pre class="mermaid">mindmap
+  root((CPU 微架构))
+    单指令带宽不足
+      流水线
+      乱序执行
+      分支预测
+      SIMD
+    内存远慢于 CPU
+      多级 Cache
+      Cache line
+      MESI
+      伪共享
+  </pre>
+      <h3>导 — 读完本章你应该能回答</h3>
+      <ol><li>问题 1...</li><li>问题 2...</li>...</ol>
+    </section>
     <pre class="mermaid">flowchart LR ...</pre>
     <section class="section" id="s2">...</section>
     <section class="refbox">参考资料</section>
@@ -251,7 +287,7 @@ ai-infra-tutorial/
 
 **Conversion Spec**（完整版本独立写入 `docs/conversion-spec.md`，由 Batch 3 产出）包含：
 
-A. **必须出现的结构元素**：head（charset / viewport / title / link assets）、iframe sidebar、main.page、hero（h1+sub+chips+至少一个 callout）、本章 toc、N 个 section[id=sN]、refbox、footer、末尾三个 script。
+A. **必须出现的结构元素**：head（charset / viewport / title / link assets）、iframe sidebar、main.page、hero（h1 + sub 用第一性原理框架表达本章主旨 + chips + "不可化简的问题" note callout + "本章学习地图：拆→推→绘→导" success callout）、本章 toc、`section#s1` 必为"第一性原理拆解 + 学习大纲"段落（含 4 个三级标题"拆/推/绘/导" + 1 张 mermaid mindmap + 5-7 个第一性问题 checklist），N 个后续 section[id=sN]、refbox、footer、末尾三个 script。
 
 B. **风格 token**：`.card`、`.grid-2/.grid-3/.grid-4`、`.note/.warn/.success/.danger` 四色 callout、原生表格、`<pre><code>`、`.kbd .chip .mini .caption`。
 
@@ -259,7 +295,7 @@ C. **mermaid 用法**：包成 `<pre class="mermaid">`，每章 4-8 个，覆盖
 
 D. **手工 SVG 用法**：mermaid 表达力不够时（菱形决策、四象限、视觉隐喻图），按 `nm.html` 风格嵌入 `<section class="figure">`。
 
-E. **内容质量底线**：hero 必须有"一句话理解"+"最重要原则"两个 callout、≥1 个 mermaid 或手工 SVG、≥3 个表格、≥5 个 callout、refbox 含"学习路线"+"延伸阅读"。
+E. **内容质量底线**：hero 必须有"不可化简的问题"note + "本章学习地图"success 两个 callout；§1 必为第一性原理拆解段落（≥800 字 + mindmap + checklist）；全章 ≥4 个 mermaid 或手工 SVG（含开篇 mindmap）；≥3 个表格；≥5 个 callout；refbox 含"学习路线"+"延伸阅读"。
 
 F. **跨章引用**：markdown 跨章链接翻译成 `<a href="../partN/<n>-<slug>.html">`，章内 §N.X 翻译成 `<a href="#sN">`。
 
@@ -276,11 +312,11 @@ F. **跨章引用**：markdown 跨章链接翻译成 `<a href="../partN/<n>-<slu
 
 ### 5.1 五个批次
 
-**Batch 1：内容补完（24 个 subagent 并行）**
+**Batch 1：内容补完（29 个 subagent 并行）**
 
 - Part 0 4 章新写：`agent-0a` `agent-0b` `agent-0c` `agent-0d`
-- 现有章节扩写按 §3 清单合并打包，每章一个 agent：`agent-ch4` `agent-ch5` `agent-ch6` `agent-ch7` `agent-ch8` `agent-ch9` `agent-ch10` `agent-ch10b` `agent-ch10c` `agent-ch11-12`（Ch 11 和 Ch 12 都是小补丁，合并到一个 agent）`agent-ch13` `agent-ch15` `agent-ch16` `agent-ch17` `agent-ch19` `agent-ch20` `agent-ch21` `agent-ch22` `agent-ch23` `agent-ch25`
-- Ch 1, 2, 3, 14, 18, 24 在 §3 标记"无大改"或仅 ~300 字浅引用调整，由 Ch 2 浅引用 agent 顺便处理或不动；不单独派 Batch 1 agent
+- Ch 1-25 全部 25 章每章一个 agent：`agent-ch1` `agent-ch2` `agent-ch3` `agent-ch4` `agent-ch5` `agent-ch6` `agent-ch7` `agent-ch8` `agent-ch9` `agent-ch10` `agent-ch10b` `agent-ch10c` `agent-ch11` `agent-ch12` `agent-ch13` `agent-ch14` `agent-ch15` `agent-ch16` `agent-ch17` `agent-ch18` `agent-ch19` `agent-ch20` `agent-ch21` `agent-ch22` `agent-ch23` `agent-ch24` `agent-ch25`
+- 每个 agent 至少负责"第一性原理开篇重写"（按 §3.0），扩写量大的章节（如 §3 列出的）同时负责扩写
 
 **Batch 2：附录 + README 同步**（依赖 Batch 1）
 
@@ -343,8 +379,10 @@ F. **跨章引用**：markdown 跨章链接翻译成 `<a href="../partN/<n>-<slu
 
 | 项 | 数量 | 估算 |
 |---|---|---|
-| Part 0 全新章节 | 4 章 | ~14K 行 markdown |
-| 现有章节扩写 | 22 章 | ~32K 行 markdown |
-| HTML 章节文件 | ~32 个 | 平均 800-1500 行 HTML/章 |
+| Part 0 全新章节（含第一性原理开篇） | 4 章 | ~14K 行 markdown |
+| 现有 25 章第一性原理开篇新写 | 25 章 × ~1K | ~25K 行 markdown |
+| 现有章节内容扩写（§3 列出 22 处） | 22 处 | ~32K 行 markdown |
+| HTML 章节文件 | 31 个 + 4 附录 = 35 | 平均 1000-2000 行 HTML/章 |
 | HTML 框架文件 | 6 个 | ~1500 行总计 |
-| **总并行 subagent** | **62 个** | 分 5 批次（Batch 1: 24, Batch 2: 2, Batch 3: 1, Batch 4: 35, Batch 5: 主线 agent） |
+| **markdown 新增总量** | — | **~71K 行** |
+| **总并行 subagent** | **67 个** | 分 5 批次（Batch 1: 29, Batch 2: 2, Batch 3: 1, Batch 4: 35, Batch 5: 主线 agent） |
