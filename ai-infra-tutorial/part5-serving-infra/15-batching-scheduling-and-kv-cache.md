@@ -4,6 +4,84 @@
 
 > **关联章节**：本章的 KV Cache 与调度策略，会直接影响 [第16章](16-quantization-compilation-and-engines.md) 的量化与引擎选型；如果显存预算判断错了，再好的推理引擎也很难稳定运行。调度策略最终要通过 [第14章](14-online-inference-architecture.md) 的路由和副本组织落到真实流量上。
 
+## 1. 第一性原理拆解：请求、状态与有限 GPU
+
+### 拆 — 不可化简的问题
+
+剥掉 vLLM、TensorRT-LLM、PagedAttention、DistServe、Mooncake 这些名字，本章面对的不可化简问题只有一个：**大量到达时间、输入长度、输出长度和优先级都不同的请求，要共享少量昂贵 GPU；每个请求还会在生成过程中制造持续增长的状态。** 在线推理不是一次矩阵乘法，而是一条长时间占用资源的工作流。用户输入的 prompt 先触发 prefill，系统要把已有上下文一次性读入模型并生成第一批 KV；之后 decode 每次只前进一步，但每一步都要读取模型权重和历史 KV。于是一个请求不只是"算一次"，而是"先大块算，再反复小步算，并持续占显存"。
+
+这和离线训练的直觉不同。训练中一个 global batch 的形状相对固定，吞吐目标可以压过单个样本延迟；在线服务中，一个 128 token 的短问答和一个 32K token 的长文档请求可能同时进入同一副本。若调度器把它们当成相同任务，短请求会被长 prefill 拖住，decode step 会被大 prompt 阻塞，KV Cache 会被少量长上下文占满，最终表现为 TTFT、ITL、TPOT 和 P99 同时恶化。GPU 利用率看起来很高，也可能只是忙在低价值的重算、搬运和排队上。
+
+因此，本章不是在介绍某个框架的参数，而是在回答一个资源组织问题：**如何把一批不规则请求切成适合 GPU 执行的计算单元，同时让每个请求的 KV 状态可分配、可迁移、可复用、可回收，并且让延迟指标仍然可控。** 批处理解决"单请求浪费 GPU"；continuous batching 解决"一批请求长短不同"；KV Cache 解决"历史上下文不能反复重算"；PagedAttention 解决"KV 状态不能靠连续大块显存管理"；chunked prefill 和 P/D 解耦解决"prefill 与 decode 资源形态冲突"；speculative decoding 解决"decode 每步只产一个 token 的串行性"。它们都不是孤立技巧，而是同一个物理约束被一层层逼出来的结果。
+
+### 推 — 从这个问题如何推导出每个机制
+
+第一步推导 batching。GPU 的强项是大矩阵和高并行度，单请求 decode 往往 batch=1、算子很小、HBM 反复读权重，SM 会空等。于是系统必须把时间上接近的请求合并，让一次 forward 里有更多 token 和序列，摊薄 kernel launch、调度和权重读取成本。但固定 batch 会遇到第二个问题：LLM 输出长度未知，短请求结束后槽位空着，长请求继续拖住整批。于是 continuous batching 成为必然：每个 decode iteration 重新组 batch，完成的请求释放槽位，新请求补进来。
+
+第二步推导 prefill / decode 分离。LLM 请求不是均匀计算。Prefill 处理整段 prompt，通常更接近 compute-bound；decode 每次只生成一个 token，更容易受 HBM 带宽、KV Cache、调度粒度和活跃序列数限制。如果把 32K prompt prefill 和大量短请求 decode 放在同一条队列，长 prefill 会把 decode 的 ITL 拉长。轻量解法是 chunked prefill，把长 prompt 切成 512 或 1024 token 的小片，夹在 decode step 之间执行；重型解法是 Prefill-Decode Disaggregated，把 prefill pool 和 decode pool 拆开，分别扩缩容，但要承担 KV handoff、双队列背压和失败恢复。
+
+第三步推导 KV Cache。自回归生成中，第 N+1 个 token 需要看前 N 个 token。如果每一步都重算全历史，计算量会随上下文长度爆炸；所以必须缓存每层 attention 的 K/V。KV Cache 把重复计算换成显存占用，问题从"算不动"转成"放不下、管不好"。在 70B、长上下文、高并发场景，KV 显存可能比权重更先成为 admission 上限。连续分配又会带来碎片和过度预留，于是 PagedAttention 把 KV 切成固定 block，用 block table 映射逻辑上下文和物理显存；同样的 block 机制又自然支持 prefix cache，让相同 system prompt、few-shot 模板和 RAG 前缀复用 KV。
+
+第四步推导指标。平均吞吐或平均 GPU utilization 不足以判断服务是否好。用户先感知 TTFT，再感知 token 是否稳定吐出；对流式输出，ITL（Inter-Token Latency）往往比总耗时更贴近体验；对平台，goodput 比 raw throughput 更重要，因为违反 SLO 的 token 不应算作有效容量。调度器的目标也因此不是"永远最大 batch"，而是在显存、吞吐、TTFT、ITL/TPOT、公平性和成本之间找到稳定工作点。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((LLM Serving 调度))
+    不规则请求共享昂贵 GPU
+      单请求浪费
+        batching
+        dynamic batching
+      输出长度未知
+        continuous batching
+        iteration-level scheduling
+      队列等待污染延迟
+        admission control
+        fair scheduling
+    请求分成两个资源形态
+      prefill
+        compute-bound
+        TTFT
+        chunked prefill
+      decode
+        memory-bound
+        ITL
+        TPOT
+      prefill/decode 冲突
+        DistServe
+        Mooncake
+        KV handoff
+    历史状态持续增长
+      KV Cache
+        显存预算
+        长上下文
+      PagedAttention
+        block table
+        碎片控制
+      Prefix cache
+        KV 复用
+        prefix-aware routing
+    串行生成限制
+      speculative decoding
+        draft model
+        verify
+        accepted tokens
+      工程边界
+        高并发可能反效果
+        指标必须分阶段观测
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么 LLM 在线推理不能只按 QPS 做容量规划，而必须拆成 input tokens/s、output tokens/s 和活跃 KV 并发？
+2. 为什么 continuous batching 能显著提高吞吐，但仍然可能把 TTFT 或 ITL 做坏？
+3. 给定层数、KV heads、head_dim、上下文长度和 TP 度数，如何估算每请求 KV Cache 显存，并判断 admission 上限？
+4. 为什么 prefill 与 decode 的资源特征不同，chunked prefill 和 Prefill-Decode Disaggregated 分别在解决哪一层冲突？
+5. PagedAttention 为什么像操作系统分页，它降低的是哪几类显存浪费，又带来哪些调度复杂度？
+6. Speculative decoding 为什么能减少目标模型 decode 步数，为什么在高并发场景下可能不加速？
+7. 线上排障时，TTFT、ITL、TPOT、prefix cache hit rate、KV block utilization 和 preemption count 分别指向哪些问题？
+
 ## 学习目标
 
 完成本章学习后，你将能够：
@@ -198,7 +276,7 @@ $$
 | 70B, TP=2, 中 prompt（8K）, B=32 | 70 GB/卡 | ~20 GB/卡 | 权重仍是大头 |
 | 70B, TP=2, 长 prompt（32K）, B=16 | 70 GB/卡 | ~40 GB/卡 | 接近 1:1 |
 | 70B, TP=2, 超长（128K）, B=1 | 70 GB/卡 | ~40 GB/卡 | 1:1 |
-| 70B, TP=2, 超长（128K）, B=8 | 70 GB/卡 | **~320 GB/卡** ❌ | KV 爆，根本装不下 |
+| 70B, TP=2, 超长（128K）, B=8 | 70 GB/卡 | **~320 GB/卡，不可行** | KV 爆，根本装不下 |
 
 这个"权重越大的模型 KV Cache 越贵"规律意味着：
 
@@ -551,7 +629,43 @@ arrival
 
 如果你在行业文章或开源方案里看到 `DistServe`、`Mooncake`、`Splitwise` 这类名字，可以把它们先归到同一类问题域里理解：都是在探索 prefill / decode 解耦、KV 远端传输和双池调度的不同工程折中。
 
-#### 15.6.1 KV Handoff：解耦架构里最被低估的难点
+#### 15.6.1 DistServe / Mooncake 类架构的共同骨架
+
+DistServe 的核心思想可以概括为"goodput-oriented disaggregation"：把 prefill worker 和 decode worker 分开建模，按 TTFT 与 TPOT 两个目标分别放置和扩缩。Mooncake 更强调 KV-centric serving：把 KV Cache 当作一等状态来管理，围绕 KV placement、transfer、reuse 和 cache locality 做调度。两者实现路径不同，但在平台视角里都落到同一个架构骨架：
+
+```mermaid
+flowchart LR
+  C[Client / Gateway] --> R[Router<br/>prefix-aware + SLO-aware]
+  R --> PA[Prefill admission<br/>input tokens backlog]
+  PA --> P1[Prefill pool<br/>compute-heavy GPUs]
+  PA --> P2[Long-context prefill pool]
+  P1 --> K[KV metadata service<br/>block ids / prefix hash / owner]
+  P2 --> K
+  P1 --> T[KV handoff<br/>NVLink / RDMA / shared storage]
+  P2 --> T
+  T --> DA[Decode admission<br/>active seqs + KV budget]
+  DA --> D1[Decode pool<br/>HBM-heavy GPUs]
+  DA --> D2[Priority decode pool]
+  D1 --> S[Streaming tokens]
+  D2 --> S
+  S --> C
+  D1 --> K
+  D2 --> K
+```
+
+| 组件 | DistServe 视角 | Mooncake 视角 | 工程边界 |
+|------|----------------|---------------|----------|
+| Router | 按 SLO、长度和池容量选 prefill/decode 路径 | 尽量把相同 prefix 和 KV locality 路由到可复用位置 | 路由随机会让 prefix cache 和 KV locality 同时失效 |
+| Prefill pool | 主要消化 input tokens/s，保护 TTFT | 产生可复用 KV，并把 KV 注册为可调度对象 | 长 prompt 需要 admission 和 chunking，否则仍会打爆队列 |
+| KV handoff | prefill 完成后把 KV 交给 decode | KV 是核心数据面，需要 placement 与传输优化 | 跨机传输慢于收益时，解耦会变成负优化 |
+| Decode pool | 按 active sequences、TPOT/ITL 和 HBM 规划 | 选择已有 KV 或最近 KV 的 worker 做 decode | decode 池常由 output tokens/s 主导，不一定随 prefill 同比例扩容 |
+| Metadata | 记录请求状态、KV owner、失败恢复 | 记录 block、prefix hash、引用计数与 eviction | metadata 不一致会导致重复计算、泄漏或错误复用 |
+
+一个生产实现通常还会加三层保护：第一，prefill queue 和 decode queue 都有独立限流，不能让 prefill 产生的 KV 中间态无限堆积；第二，KV handoff 必须有超时、重试和幂等标识，避免"prefill 成功但 decode 没接住"的半完成请求泄漏显存；第三，decode admission 必须按剩余输出预算、tenant 优先级和 block 可用量共同决策，而不是简单 FIFO。
+
+**工程边界**：P/D 解耦首先是 SLO 隔离与弹性扩缩方案，其次才可能是降本方案。若流量主要是短 prompt、短输出，或者副本内 chunked prefill 已经能把 TTFT/ITL 压住，解耦增加的网络、metadata 和故障恢复复杂度通常不划算。若业务是 16K-128K 长上下文、RAG 模板高度复用、prefill 尖峰与 decode 长尾明显错峰，解耦才更可能体现价值。
+
+#### 15.6.2 KV Handoff：解耦架构里最被低估的难点
 
 P/D 解耦的宣传点通常是"吞吐提升 2-4x"。但工程上，**KV handoff（把 prefill 产生的 KV 从 A 机器送到 B 机器）是这个架构的核心难点**。
 
@@ -570,6 +684,20 @@ P/D 解耦的宣传点通常是"吞吐提升 2-4x"。但工程上，**KV handoff
 - **同机解耦**：prefill 和 decode 在同一机器的不同 GPU（走 NVLink），传输便宜但资源弹性变差
 - **局部解耦**：只把特别长的 prompt 送去独立 prefill 池，短 prompt 还是一体化
 - **KV 复用**：用 prefix cache 让很多请求根本不需要 handoff
+
+#### 15.6.3 ITL 指标：为什么 decode 不能只看 TPOT
+
+TTFT（Time To First Token）衡量用户等多久看到第一个 token，TPOT（Time Per Output Token）常用总 decode 时间除以输出 token 数，ITL（Inter-Token Latency）则看流式输出中相邻 token 之间的真实间隔。TPOT 是平均账，ITL 是体验账：一个请求平均 40 ms/token，但中间出现 3 次 800 ms 卡顿，TPOT 可能仍然合格，用户却会明显感到输出停顿。
+
+| 指标 | 计算口径 | 主要受什么影响 | 典型告警信号 | 调度动作 |
+|------|----------|----------------|--------------|----------|
+| TTFT P99 | arrival 到第一个 token | prefill queue、prompt 长度、prefix hit、chunked prefill | 长 prompt 租户进入后整体首 token 变慢 | prefill 分桶、prefix-aware routing、提高 prefill pool |
+| ITL P50/P99 | 相邻 streaming token 时间差 | decode step latency、active seqs、preemption、KV miss | 输出时快时慢，流式体验抖动 | 降低 `max_num_seqs`、限制长输出、拆 decode 池 |
+| TPOT P99 | decode 总时长 / output tokens | 平均 decode 能力、batch 工作点 | 总体生成慢但不一定有明显卡顿 | 调整 batch、引擎、量化和 speculative decoding |
+| E2E latency | arrival 到最终 token | TTFT + output length x TPOT | 长输出请求尾延迟大 | 按输出长度 admission，设置 max tokens 和排队上限 |
+| Goodput | 满足 SLO 的 tokens/s 或 req/s | 以上全部 | throughput 高但 SLO 失败率高 | 以 SLO 约束做 autoscaling，而不是只看 GPU 利用率 |
+
+ITL 的采集要在服务端 streaming flush 点打点，而不是只在模型 worker 内部打点。否则网络缓冲、gateway backpressure、client 断连重试和 HTTP/2 flush 策略都会被漏掉。实践中建议同时记录 `itl_ms_bucket{model,tenant,prompt_len_bucket,output_len_bucket,pool}`，再和 `decode_step_ms`、`num_running_seqs`、`kv_cache_usage`、`preemption_total` 关联。若 `decode_step_ms` 稳定但 ITL 抖，问题更可能在网关或流式传输；若二者同步抖，问题更可能在调度器或 KV 状态。
 
 ### 15.7 PagedAttention 在解决什么
 
@@ -720,6 +848,26 @@ vLLM V1、TensorRT-LLM、SGLang 都已经默认开启或推荐开启 chunked pre
 
 Speculative decoding 的核心思路是：先让一个更小、更快的草稿模型生成候选 token，再由目标大模型批量验证；验证通过的部分直接接受，不通过的部分再回退重算。
 
+```mermaid
+sequenceDiagram
+  participant S as Scheduler
+  participant D as Draft model / Head
+  participant T as Target model
+  participant C as Client
+  S->>D: generate k candidate tokens
+  D-->>S: draft tokens t1..tk
+  S->>T: verify candidates in one target forward
+  T-->>S: accept prefix length a
+  alt a > 0
+    S-->>C: stream accepted tokens
+  else reject first token
+    S->>T: sample one target token
+    T-->>S: fallback token
+    S-->>C: stream fallback token
+  end
+  S->>S: update KV and schedule next step
+```
+
 | 收益 | 条件 | 限制 |
 |------|------|------|
 | 降低目标模型 decode 步数 | 草稿模型足够快，且与目标模型分布接近 | 双模型协同更复杂 |
@@ -749,6 +897,8 @@ Speculative decoding 的核心思路是：先让一个更小、更快的草稿�
 - **高并发、已经填满 batch**：收益小甚至反效果（GPU 已经满了，再塞更多计算只是排队）
 
 所以投机解码不是"全场景加速器"，它是**给低并发或长输出场景的特效药**。
+
+**工程边界**：上线 speculative decoding 前要先压测 accepted tokens/step，而不是只看论文里的加速倍数。若 draft 每步预测 4 个 token，但平均只接受 1.2 个，同时目标模型验证 forward 让 batch token 数翻倍，decode pool 的 goodput 可能下降。生产上至少要观测 `draft_latency_ms`、`verify_latency_ms`、`acceptance_rate`、`accepted_tokens_per_step`、`fallback_rate` 和 ITL P99；并按场景开关，例如代码补全、结构化 JSON、长文本续写可打开，短问答、高并发聊天可关闭或只对低负载时段启用。使用独立 draft model 时还要考虑权重显存、版本一致性和发布回滚；使用 Medusa/EAGLE 这类模型内方法时，要确认推理引擎、量化路径和 KV layout 都支持对应 head 或 hidden-state 预测。
 
 ### 15.10 MoE 模型的调度特殊性
 

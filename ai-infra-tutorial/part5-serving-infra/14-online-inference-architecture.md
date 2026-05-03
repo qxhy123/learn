@@ -4,47 +4,87 @@
 
 > **关联章节**：本章的路由、流量分层和副本组织，是 [第17章](17-multitenancy-and-cost.md) 多租户治理的执行基础；租户策略最终都要落到在线推理链路里。批处理和 KV Cache 的细节在 [第15章](15-batching-scheduling-and-kv-cache.md)，量化与引擎的选择在 [第16章](16-quantization-compilation-and-engines.md)。
 
-## 学习目标
+## 1. 第一性原理拆解 + 学习大纲
 
-完成本章学习后，你将能够：
+### 拆 — 不可化简的问题
 
-1. 理解在线推理请求的完整生命周期
-2. 区分网关、路由、模型副本、依赖服务在链路中的职责
-3. 认识尾延迟为什么是推理系统的核心问题
-4. 学会用分层方式分析在线推理架构与 prefill/decode 解耦条件
-5. 识别模型服务与传统 Web 服务的关键差异
-6. 读懂 TTFT、TPOT、ITL、goodput 这些 LLM 专属指标
-7. 把冷启动、熔断、降级写成可控制面执行的策略，而不是运维口头约定
+在线推理架构要解决的不可化简问题，不是"如何把模型挂到一个 HTTP 端口后面"，而是：**在请求不可预测、计算昂贵、状态沉重、用户等待有上限的条件下，怎样让每一次调用都尽量在承诺的时间内交付有用结果**。第一次做模型服务的团队，最容易把在线推理理解成"带 GPU 的 Flask 服务"：写一个接口接 HTTP 请求，把模型 load 到显存，前向跑一次返回结果。这个心智模型在 demo 上完全够用，因为 demo 里的请求少、输入短、没有灰度、没有租户、没有下游依赖，也不需要解释为什么某个用户等了 12 秒。但生产系统的物理现实更硬：一个 70B 模型的单个副本可能占用多张 GPU；一次长 prompt prefill 会吞掉大量算力；decode 阶段会把 KV Cache 留在显存里；RAG 链路还会调用 embedding、向量库、rerank、安全过滤和工具服务。于是"模型推理"只是一条请求链路中的一段，服务是否可用取决于这条链路里最慢、最抖、最不可控的那几跳。
 
----
+从第一性原理看，在线推理比传统 Web 服务难，不是因为它的入口协议特殊，而是因为它把四类约束叠在了一起。第一，**成本约束**：GPU 秒很贵，副本不是可以随便复制的廉价进程，扩容会带来显存、权重加载、warm pool 和缓存命中率的代价。第二，**时间约束**：用户不关心平均值，只关心自己这一次是否卡住；聊天场景的 TTFT 可能要压到 500 ms 内，TPOT 超过 150 ms/token 就会明显卡顿。第三，**状态约束**：KV Cache、prefix cache、会话亲和、模型版本和预热状态都决定了"同一个请求路由到不同副本"会有不同成本。第四，**质量约束**：HTTP 200 只能说明系统返回了字节，不能说明回答正确、安全、相关或可用。因此本章的核心不是记住某个 serving 框架，而是建立一种拆链路的直觉：一次请求的时间去哪了，尾延迟由哪一跳主导，哪些状态必须亲和，哪些失败必须在控制面里有自动动作。
 
-## 本章导读
+### 推 — 从这个问题如何推导出每个机制
 
-第一次做模型服务的团队，最容易把在线推理理解成"带 GPU 的 Flask 服务"：
+如果不可化简的问题是"按时交付有用结果"，第一个必然机制就是**请求生命周期拆解**。只有把端到端时间拆成 `queue / preprocess / model / downstream / postprocess`，再把 LLM 的 `model` 拆成 `prefill / decode`，平台才知道该扩 GPU、限流、优化检索、改 tokenizer，还是调整 batch。第二个必然机制是**入口与路由分层**。网关负责鉴权、限流、租户识别和基础日志；路由层负责模型版本、长短上下文、优先级、灰度、prefix-aware 亲和和 SLO-aware 选择副本。二者分离，是因为"谁可以进来"和"进来后去哪一个副本最合适"是两个不同问题。
 
-- 写一个接口接 HTTP 请求
-- 把模型 load 到显存
-- 前向跑一次返回结果
+第三个必然机制是**副本池与缓存治理**。模型副本不是无状态 worker：它有权重、CUDA context、allocator、KV Cache、prefix cache 和 warmup 状态。Round-robin 在普通 Web 服务里可能足够，在 LLM serving 里却可能摧毁 prefix cache 命中率，让同一 system prompt 的请求反复 prefill。第四个必然机制是**尾延迟治理**。输入长度可以差 100 倍，输出长度也可能被 `max_tokens` 顶满；如果只看平均延迟，最慢 1% 用户会被隐藏。于是指标必须从 QPS 扩展到 P50/P95/P99、TTFT、TPOT、ITL、E2EL 和 goodput。Goodput 的意义是把 SLO 纳入吞吐：超时完成的 token 不再被当作有价值的产出。
 
-这个心智模型在 demo 上完全够用，但一旦进入生产，问题会从四个方向同时来：
+第五个必然机制是**资源形态分离**。Prefill 更偏 compute-bound，decode 更偏 memory-bandwidth-bound，还会长期占用 KV Cache。长上下文和短请求混在同一池里时，长 prefill 会把短请求的首 token 和后续 token 都拖慢，所以会推导出 chunked prefill、长短分流，甚至 prefill/decode disaggregation。第六个必然机制是**冷启动、熔断和降级控制面**。权重加载、运行时初始化、CUDA graph 捕获、缓存预热都需要时间，副本 ready 不等于可以立即接流量；下游抖动或 GPU 池饱和时，也不能靠人工临时决定是否关闭 rerank、切小模型、截短上下文或返回 429。这些策略必须是可配置、可观测、可演练的规则。最后，**质量观测**必然独立存在，因为模型可能"健康地生成垃圾"：系统指标、链路 trace、输出评测、灰度发布和回滚门禁要一起构成在线推理的运营闭环。
 
-- **请求链路变长**：RAG、多模型组合、工具调用会让模型执行只占总延迟的一小部分
-- **状态变重**：KV Cache、prefix cache、权重缓存都会影响一次请求的行为
-- **负载不规则**：同一个模型的两个请求可能差 100 倍耗时
-- **质量要独立观测**：服务稳定 ≠ 模型输出可用
+### 绘 — 因果链路
 
-本章建立的判断框架是：
-
-```text
-一次请求的时间去哪了
-  ├── queue / preprocess / model / downstream / postprocess 各占多少
-  ├── 尾延迟由哪一跳主导
-  ├── prefill 和 decode 是不是在抢同一资源池
-  ├── 冷启动和 warm pool 策略是否和流量形态匹配
-  └── 熔断、降级、回滚是规则驱动还是人肉驱动
+```mermaid
+mindmap
+  root((在线推理架构))
+    不可化简问题
+      按时交付
+      有用结果
+      GPU 成本高
+      请求形态不规则
+    请求时间拆解
+      Queue
+        扩容
+        Admission control
+      Preprocess
+        Tokenizer
+        多模态预处理
+      Model
+        Prefill
+        Decode
+      Downstream
+        Embedding
+        Vector DB
+        Rerank
+      Postprocess
+        安全过滤
+        格式化
+    路由与副本
+      Gateway
+        鉴权
+        限流
+        租户识别
+      Router
+        版本灰度
+        长短分流
+        Prefix-aware
+        SLO-aware
+      Replica Pool
+        权重加载
+        KV Cache
+        Warmup
+    延迟与吞吐
+      TTFT
+      TPOT
+      ITL
+      P99
+      Goodput
+    控制面
+      冷启动
+      熔断
+      降级
+      回滚
+      质量观测
 ```
 
-如果这些问题没有先看清楚，"给模型加副本"往往不能解决线上问题，只是把问题摊到更多机器上而已。
+### 导 — 读完本章你应该能回答
+
+1. 当一个 RAG 或 Agent 服务端到端变慢时，你能否把延迟拆成 queue、preprocess、model、downstream、postprocess，并判断哪一段最可能主导 P99？
+2. 为什么网关、路由层和模型副本池不能混成一个组件？哪些策略应该放在 gateway，哪些策略必须放在 LLM router？
+3. 为什么 LLM 服务不能只看 QPS 和平均延迟？TTFT、TPOT、ITL、E2EL、goodput 分别在约束什么用户体验或平台目标？
+4. 为什么同一个模型副本不是普通无状态 worker？KV Cache、prefix cache、warmup 状态和版本灰度会怎样改变路由策略？
+5. 当长 prompt prefill 拖慢短请求 decode 时，你会先考虑 chunked prefill、长短分流，还是完整 prefill/decode 解耦？判断信号是什么？
+6. 冷启动、熔断、降级、回滚为什么必须写进控制面规则，而不能依赖人工操作？你会为每个动作设置哪些触发指标和退出条件？
+
+---
 
 ## 正文内容
 

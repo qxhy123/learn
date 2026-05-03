@@ -4,21 +4,94 @@
 
 > **关联章节**：本章的量化和引擎选择，与 [第15章](15-batching-scheduling-and-kv-cache.md) 的 KV Cache 显存压力密切相关；权重量化能缓解权重占用，但不一定自动解决长上下文缓存问题。引擎最终要通过 [第14章](14-online-inference-architecture.md) 的路由和副本架构落地；量化带来的质量风险又会进入 [第17章](17-multitenancy-and-cost.md) 的发布和回滚流程。
 
-## 学习目标
+## 1. 第一性原理拆解 + 学习大纲
 
-完成本章学习后，你将能够：
+### 拆 — 不可化简的问题
 
-1. 理解量化和编译优化分别解决什么问题
-2. 认识常见推理引擎的定位
-3. 知道为什么同一模型在不同引擎上的表现可能不同
-4. 学会从系统角度评估优化收益
-5. 理解"更快"与"更难运维"之间的权衡
-6. 区分权重量化、激活量化、KV Cache 量化的不同作用
-7. 把编译产物当作带 shape contract 的制品来管理，而不是普通模型文件
+推理优化的不可化简问题不是"怎样把模型变快"，而是：一个已经训练好的函数，要在有限显存、有限带宽、有限算力、有限延迟预算和可控质量风险下，被反复执行成线上服务。训练阶段可以用更长时间换更好参数，推理阶段却不同：每个请求都带着 SLA、成本和排队压力进入系统。用户感受到的是 TTFT、ITL、P95/P99 延迟和回答质量；平台看到的是 GPU HBM 是否被权重和 KV Cache 塞满，Tensor Core 是否有足够饱和度，调度器是否能把不同长度请求拼成有效 batch，发布系统是否能在质量回退时快速回滚。
+
+剥离所有工具名之后，本章只处理三类物理约束。第一，数字表示有成本。7B 模型用 BF16 权重大约 14GB，70B 大约 140GB；如果再叠加长上下文 KV Cache，显存容量会比算力更早成为瓶颈。第二，同一个数学图有很多执行方式。Transformer 里的 LayerNorm、GEMM、Attention、RoPE 和采样可以被通用框架逐个 kernel 执行，也可以被编译器重排、融合、专门化，差异体现在 HBM 往返次数、kernel launch 次数和 shape 假设上。第三，线上请求不是离线 batch。真实流量有长短 prompt、不同输出长度、prefix 复用、多租户隔离和扩缩容，运行时必须管理 batch、KV Cache、队列和副本。
+
+因此，量化、编译、推理引擎不是三组互不相干的技巧，而是一条从"模型如何被表示"到"执行计划如何生成"再到"请求如何被运行时组织"的链路。很多团队第一次做推理优化会陷入单点最优：听说 INT4 省显存就直接量化，听说 TensorRT-LLM 快就换引擎，听说 `torch.compile` 能加速就打开。单点做法容易翻车，是因为它没有回答更底层的问题：瓶颈到底是权重带宽、KV 容量、prefill 算力、调度空洞，还是发布链无法承受新制品的复杂度。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从"数字表示有成本"出发，首先会推导出量化。权重从 BF16 压到 INT8 或 INT4，可以减少权重显存与 HBM 读取；KV Cache 从 BF16 压到 FP8/INT8/INT4，可以让长上下文服务容纳更高并发；激活量化则试图降低中间张量和算子输入输出的带宽压力。但低精度不是免费压缩，scale、zero point、per-channel、outlier 和校准集分布都会影响误差。于是 PTQ、QAT、GPTQ、AWQ、SmoothQuant 等方法出现，本质是在不同成本下回答同一个问题：低精度表示怎样尽量保留高精度函数的行为。
+
+从"同一个数学图有很多执行方式"出发，会推导出编译与图优化。通用 eager 执行足够灵活，但每个算子单独启动 kernel，很多中间结果必须写回 HBM。编译器会做算子融合、常量折叠、内存布局选择、kernel autotune 和静态 shape 专门化，让硬件少搬数据、多做有效计算。代价是执行计划带有前提：GPU 型号、CUDA/TensorRT 版本、batch 范围、sequence length 范围、输入模态规格。超出这些前提，轻则重新编译或回退慢路径，重则直接失败。因此编译产物不是普通模型文件，而是带 shape contract 的制品。
+
+从"线上请求不是离线 batch"出发，会推导出推理引擎。训练框架能跑 forward，不等于能稳定服务高并发 LLM。在线系统需要 continuous batching、PagedAttention、prefix cache、chunked prefill、speculative decoding、张量并行、指标导出、OpenAI-compatible API、灰度和回滚语义。vLLM、TensorRT-LLM、SGLang、TGI、ONNX Runtime、llama.cpp 和 Triton Inference Server 的差异，不只是"谁 benchmark 快"，而是它们选择了不同的运行时假设：动态调度还是静态 engine，通用模型迭代还是固定 NVIDIA 集群极致压榨，标准文本生成还是复杂 agent / tool-use 编排。
+
+把这三层合在一起，本章的学习目标就变成一个工程推理题：先定位瓶颈，再选择量化对象和精度；再确认硬件和引擎是否有真实 kernel 支持；再决定是否引入编译产物以及如何治理 shape contract；最后用真实流量分布验证 TTFT、ITL、goodput、显存、质量回退和运维复杂度。优化链路任何一段断开，局部收益都可能变成系统风险。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((量化 编译 推理引擎))
+    不可化简的问题
+      有限显存
+        权重占用
+        KV Cache 占用
+      有限带宽
+        Decode 读权重
+        Attention 读写 KV
+      有限算力
+        Prefill GEMM
+        Attention kernel
+      线上请求波动
+        长短输入混合
+        多租户并发
+    表示层 Representation
+      权重量化
+        INT8
+        INT4
+        GPTQ
+        AWQ
+      激活量化
+        SmoothQuant
+        W8A8
+      KV Cache 量化
+        FP8
+        INT8
+        INT4
+      校准
+        代表性样本
+        scale zero point
+        outlier
+    编译层 Compilation
+      算子融合
+      Kernel 选择
+      静态 shape
+      硬件特定 plan
+      shape contract
+    运行时 Runtime
+      Continuous batching
+      PagedAttention
+      Prefix cache
+      Chunked prefill
+      副本和路由
+    工程输出
+      TTFT ITL P95
+      Goodput
+      单位 token 成本
+      质量回退
+      发布回滚
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 一个服务的瓶颈是权重带宽、KV Cache 容量、prefill 算力还是调度空洞时，量化收益分别会怎样变化？
+2. 为什么 BF16、FP8、INT8、INT4 不是简单的"越低越好"，而是质量、硬件、kernel 和校准数据共同决定的阶梯？
+3. 为什么 PTQ 必须做校准，且校准集和评测集不能混用？
+4. 一个 TensorRT-LLM engine、AOT compile artifact 或专用 kernel plan 需要记录哪些 shape contract 元数据？
+5. vLLM、TensorRT-LLM 和 SGLang 的核心运行时假设分别是什么，为什么它们适合的组织和流量不同？
+6. 当 benchmark 显示某引擎快 2x 时，你要补哪些实验才能判断它是否真的能降低生产单位 token 成本？
+7. 量化、编译和引擎迁移分别会给发布、观测、排障和回滚带来哪些新边界？
 
 ---
 
-## 本章导读
+## 2. 本章导读
 
 很多团队第一次做推理优化时，会陷入"单点最优"的陷阱：
 
@@ -26,26 +99,7 @@
 - "听说 TensorRT-LLM 快 2x，换引擎"
 - "听说 torch.compile 能加速 30%，开着"
 
-这些想法都不错，但单独拿出来做决策往往会翻车。真正决定推理服务成败的，是这三个层次能不能配合：
-
-```text
-模型表示层 (Representation)
-  ├── 用什么精度？bf16 / fp8 / int8 / int4 / 混合？
-  ├── 哪些部分量化？权重 / 激活 / KV Cache？
-  └── 量化方法？PTQ / QAT / 校准怎么做？
-       │
-       ▼
-编译 / 优化层 (Compilation)
-  ├── 算子融合、kernel 选择
-  ├── 图优化、静态 shape 假设
-  └── 硬件特定代码生成
-       │
-       ▼
-运行时层 (Runtime)
-  ├── 批处理、调度（见第15章）
-  ├── KV Cache 管理、分页
-  └── 副本、路由、发布（见第14章）
-```
+这些想法都不错，但单独拿出来做决策往往会翻车。真正决定推理服务成败的，是模型表示层、编译 / 优化层、运行时层能不能配合：量化要说明对象、方法、校准数据和硬件支持；编译要说明 shape contract、kernel 路径和回退方式；引擎要说明批处理、KV Cache、发布、观测与回滚语义。
 
 本章的判断框架是：
 
@@ -53,7 +107,7 @@
 - **编译不是"一次搞定"**，它产出的是带前提假设的制品，shape 超出假设就会退化
 - **引擎选型不只是 benchmark**，它还决定了你平台的发布、回滚、排障方式
 
-## 正文内容
+## 3. 正文内容
 
 ### 16.1 推理优化到底在优化什么
 
@@ -158,25 +212,28 @@ $$
 | 这是训练或 LoRA 微调，而不是线上推理 | NF4 / QLoRA | 训练显存收益很好，生态成熟 | 主要是训练格式，不是标准 GPU serving 终态 | 直接把 NF4 训练格式当生产推理格式，往往会卡在引擎支持或吞吐表现上 |
 | 愿意付出训练或蒸馏成本，且质量目标严格 | QAT 或更重的混合精度方案 | 量化感知训练通常最能守住质量 | 流程长、成本高，适合长期运营模型 | 如果模型和数据还在频繁迭代，QAT 的维护成本会高到抵消收益 |
 
-把这张表压缩成一个顺序更容易记：
+把这张表压缩成一个顺序更容易记的决策树：
 
-```text
-先问质量容忍度
-├── 几乎不能退化：FP16/BF16；有 H100+ 再看 FP8
-├── 可接受小幅退化：INT8
-└── 必须极致压缩：INT4
-     ├── 推理部署：GPTQ / AWQ
-     └── 训练微调：NF4 / QLoRA
-
-再问硬件与瓶颈
-├── H100+/原生 FP8：优先评估 FP8
-├── decode memory-bound：INT4 更可能兑现收益
-├── prefill compute-bound：先看 FP8 / INT8 / kernel 优化
-└── 长上下文被 KV 压垮：优先加 KV Cache 量化，而不是只压权重
-
-最后问校准数据
-├── 有代表性校准集：PTQ 可做
-└── 没有代表性校准集：宁可保守精度，也不要盲上 INT8 / INT4
+```mermaid
+flowchart TD
+  A[开始: 先定位目标] --> B{质量回退容忍度}
+  B -->|几乎不能退化| C[FP16 / BF16 baseline]
+  C --> D{H100/H200/B200 且引擎有原生 FP8 kernel?}
+  D -->|是| E[评估 FP8]
+  D -->|否| F[保留 BF16 并优化引擎/批处理]
+  B -->|可接受小幅退化| G{有代表性校准集?}
+  G -->|是| H[INT8: SmoothQuant / TensorRT INT8 / W8A8]
+  G -->|否| I[不要盲量化: 先补校准数据或停在 BF16/FP8]
+  B -->|必须极致压缩| J{主要瓶颈是什么?}
+  J -->|权重显存或 decode 带宽| K[INT4 weights-only: GPTQ / AWQ]
+  J -->|长上下文 KV 容量| L[优先 KV Cache FP8/INT8/INT4]
+  J -->|prefill compute-bound| M[先看 FP8/INT8 kernel 和编译优化]
+  K --> N{更看重什么?}
+  N -->|保精度与覆盖面| O[GPTQ]
+  N -->|吞吐与部署路径| P[AWQ]
+  A --> Q{这是训练/微调吗?}
+  Q -->|是| R[NF4 / QLoRA 或 QAT]
+  Q -->|否| B
 ```
 
 一个经验法则：**FP16/BF16、FP8、INT8、INT4 不是线性升级关系，而是"质量风险更高，压缩能力更强，工程前置条件也更苛刻"的阶梯。**
@@ -358,27 +415,50 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 | agent / tool-use / 结构化生成 / prompt 编排复杂 | SGLang | 当复杂编排需求下降，只剩标准文本生成时，可简化回 vLLM 或 TGI |
 | 团队已经深度使用 Hugging Face 生态，追求快速托管 | TGI | 当长上下文、KV Cache 或量化能力成为瓶颈时，再迁到 vLLM 或 TensorRT-LLM |
 
-#### 16.7.2 一个典型的选型决策
+#### 16.7.2 推理引擎选型决策树
 
-```text
-场景是什么？
-├── 先问是不是通用 LLM 在线服务
-│   └── 是：vLLM 作为默认基线
-├── 再问是否是固定的 NVIDIA 集群，且要压极致吞吐
-│   └── 是：TensorRT-LLM
-├── 再问生成逻辑是否复杂到需要 agent / tool-use / 结构化编排
-│   └── 是：SGLang
-├── 再问是否已经深度绑定 Hugging Face 生态，优先交付速度
-│   └── 是：TGI
-├── 如果是 CPU / 边缘 / 本地开发
-│   └── llama.cpp / Ollama
-├── 如果是多框架混部平台
-│   └── Triton Inference Server
-└── 如果要跨硬件兼容
-    └── ONNX Runtime
+```mermaid
+flowchart TD
+  A[开始: 明确 serving 场景] --> B{是否是通用 decoder-only LLM 在线生成?}
+  B -->|是| C[vLLM 作为默认基线]
+  C --> D{是否固定 NVIDIA 集群且极致压单位 token 成本?}
+  D -->|是| E[TensorRT-LLM: 编译制品 + 静态契约]
+  D -->|否| F[继续 vLLM: 动态调度 + 快速迭代]
+  B -->|否| G{生成逻辑是否包含 agent/tool-use/结构化输出编排?}
+  G -->|是| H[SGLang: prefix-aware scheduling + 编排语义]
+  G -->|否| I{团队是否深度绑定 Hugging Face 生态?}
+  I -->|是| J[TGI: 快速托管 HF 模型]
+  I -->|否| K{目标环境是什么?}
+  K -->|CPU/边缘/本地| L[llama.cpp / Ollama]
+  K -->|多框架混部平台| M[Triton Inference Server]
+  K -->|跨硬件兼容| N[ONNX Runtime]
+  K -->|专用硬件或研究栈| O[按硬件 SDK / TVM / XLA 评估]
+  E --> P{shape、CUDA、engine artifact 能否治理?}
+  P -->|能| Q[进入生产压测]
+  P -->|不能| R[回退 vLLM 或 TGI]
+  H --> S{底层后端和观测链是否稳定?}
+  S -->|能| Q
+  S -->|不能| C
 ```
 
 **一个行业观察**：2024-2025 年的推理引擎格局正在快速收敛到 vLLM 为核心的开源生态。TensorRT-LLM 在绝对性能上仍领先，但 vLLM 在功能覆盖（量化方案、新硬件支持、调度优化）和社区活跃度上遥遥领先。对大多数团队，**先上 vLLM、特殊场景再评估 TensorRT-LLM** 是稳妥路径。
+
+#### 16.7.3 vLLM / TensorRT-LLM / SGLang 内部机制对比
+
+三者的差异不只是 API 名字不同，而是它们把"请求进入 GPU 前要做哪些决定"放在了不同位置。vLLM 把重点放在运行时调度：请求到达后进入 scheduler，prefill 和 decode 可以被 continuous batching 动态混排，KV Cache 被切成 block 并通过 PagedAttention 间接寻址，prefix cache 和 chunked prefill 让长 prompt 不必一次性占满全部 batch。这个设计适合真实线上流量，因为请求长度波动、输出长度不可预知、模型版本迭代快。工程边界是：vLLM 保留了较强动态性，绝对峰值性能不一定压到每块 NVIDIA GPU 的极限；当模型、shape、硬件都固定时，动态调度的灵活性可能变成额外开销。
+
+TensorRT-LLM 的重心在编译与计划。模型先被构造成 TensorRT-LLM network，再按 GPU 型号、精度、tensor parallel、max batch、max sequence length 等参数生成 engine。运行时执行的是高度优化过的 plan，kernel、memory layout、KV Cache 策略和低精度路径可以更贴近 NVIDIA 硬件。它适合固定机型、固定模型族、流量 shape 可被分桶的大规模集群。工程边界是：engine artifact 要和 GPU、CUDA、TensorRT-LLM 版本、shape range 绑定；模型一改、上下文长度一变、硬件池一混，就可能重新 build 或增加多份 artifact，发布链和回滚链必须能承受。
+
+SGLang 的重心在生成程序和 prefix 复用。它不仅把单次 completion 当作请求，还把多轮对话、工具调用、结构化输出、分支采样、约束解码等模式视作可调度的生成图。RadixAttention / prefix-aware scheduling 的核心价值，是把共享 prompt 前缀显式纳入缓存和调度决策；当 agent workflow 里大量请求共享 system prompt、工具描述、few-shot 示例时，它能减少重复 prefill。工程边界是：SGLang 更像"编排层 + 执行后端"的组合系统，性能和稳定性同时取决于调度器、后端 kernel、约束解码实现和业务生成程序写法；如果只是标准 OpenAI-compatible chat completion，它的额外语义可能并不划算。
+
+| 维度 | vLLM | TensorRT-LLM | SGLang |
+|------|------|---------------|--------|
+| 核心优化位置 | 运行时 scheduler、PagedAttention、KV block 管理 | 编译期 engine、硬件专用 kernel、静态 plan | 生成程序调度、prefix 复用、结构化解码 |
+| 请求形态假设 | 长短请求混合、动态 batch、模型快速迭代 | shape 可分桶、机型固定、追求峰值吞吐 | 多轮、工具调用、共享前缀、复杂控制流 |
+| KV Cache 机制 | block/page 化管理，便于碎片治理和换入换出 | engine 内部计划化管理，依赖 build 参数 | prefix-aware cache，强调共享前缀命中 |
+| 量化路径 | 覆盖广，适合快速验证多种 PTQ 格式 | NVIDIA 低精度路径强，FP8/INT8/部分 INT4 更贴近硬件 | 取决于底层后端和模型路径 |
+| 发布复杂度 | 中等，模型 artifact 相对直接 | 高，需要治理 engine artifact 和 shape contract | 中到高，需要同时治理生成程序和后端 |
+| 最容易踩的边界 | 极致峰值性能不一定最优 | 流量 shape 和硬件版本变化会放大维护成本 | 简单服务场景可能引入过多系统复杂度 |
 
 ### 16.8 为什么推理引擎会存在
 
