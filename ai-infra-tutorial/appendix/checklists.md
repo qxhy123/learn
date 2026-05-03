@@ -67,6 +67,54 @@
 - 冷启动、预热和扩缩容过程是否单独测过
 - 连续运行 30 分钟以上后指标是否仍然稳定
 
+## CPU 性能排查清单
+
+- 是否先区分瓶颈在 GPU 计算、CPU 主机侧、数据加载、网络等待还是存储等待
+- 是否用 `perf stat` 记录 cycles、instructions、IPC/CPI、branch-misses、cache-misses、context-switches
+- 是否用 `perf record/report` 或 VTune 找到 DataLoader、tokenizer、preprocessing、网关或序列化热点
+- 是否检查热点循环是否被 SIMD 向量化，编译器报告里是否存在 alias、分支或非连续内存访问阻止向量化
+- 是否检查线程数增加后吞吐是否线性增长，还是出现 lock contention、false sharing 或调度开销
+- 是否用 `perf c2c`、cache miss 指标或 padding 实验验证伪共享，而不是只凭感觉增加 worker
+- 是否检查 L1/L2/L3 miss、working set 大小和 cache line 访问模式
+- 是否检查 NUMA locality：CPU core、内存、GPU、NIC 是否在同一 socket 或合理拓扑下
+- 是否把 page fault、TLB miss、THP/HugeTLB 状态纳入大内存任务排查
+- 是否记录优化前后的固定输入、固定线程数、固定 CPU 频率和可复现实验命令
+
+## 文件系统选型清单
+
+- workload 是 checkpoint 大文件写、dataset 顺序读、小文件随机读、向量索引读写，还是归档冷存
+- 关键目标是吞吐、IOPS、尾延迟、崩溃一致性、快照、压缩、成本还是 POSIX 语义
+- 是否明确 `write()`、`fsync()`、rename、manifest、对象存储 multipart 的一致性边界
+- Page Cache 是期望的加速层，还是会污染 benchmark 或挤压训练进程内存
+- ext4 的 journal、XFS 的并发元数据路径、ZFS 的 COW/ARC/快照是否匹配当前读写模式
+- 并行文件系统是否正确设置 stripe，MDS 是否会被小文件、目录列表或频繁 stat 打爆
+- 对象存储是否只承担归档和 shard 分发，还是被错误当成本地 POSIX 文件系统使用
+- 是否用 `fio`、`ior`、`mdtest`、真实 shard 读取和真实 checkpoint 写入分别验收
+- 是否为 checkpoint 发布设计临时文件、完整性校验、manifest 原子切换和失败清理
+- 是否规划冷热分层：本地 NVMe / 并行 FS / 对象存储之间的数据生命周期和回收策略
+
+## 网络配置健康检查清单
+
+- 所有训练节点的 NIC 速率、duplex、MTU、offload、RSS 队列数是否一致
+- RoCE / IB 链路是否无错误计数增长，`ibstat`、`perfquery`、交换机端口状态是否健康
+- MTU 是否端到端一致；启用 jumbo frame 时，主机、交换机、路由和容器网络是否同时支持
+- RoCE v2 是否配置 ECN/PFC，并验证没有 PFC storm、丢包或拥塞标记异常
+- GPU、NIC、CPU socket 的拓扑是否匹配，跨 socket GPU-to-NIC 路径是否被调度器避开
+- `ib_write_bw`、`ib_read_bw`、`iperf3` 是否能达到单链路预期带宽和延迟
+- `nccl-tests` 是否覆盖单机、多机、不同消息大小、不同节点组合和不同 rail
+- NCCL 日志是否显示使用预期的 IB/RDMA path，而不是 fallback 到 socket
+- TCP control plane 是否检查重传、SYN backlog、连接数、epoll/io_uring 事件循环延迟
+- 是否有链路故障、交换机拥塞、ECN 标记、PFC pause、NCCL hang 的统一告警和 runbook
+
+## Mermaid / 文档构建检查清单
+
+- 每章 mermaid 代码块是否使用受支持的图类型和语法
+- mindmap、flowchart、sequenceDiagram、stateDiagram 在 HTML 浅色主题下是否可读
+- 图表是否过宽、文字是否溢出移动端或 sidebar 布局
+- 离线 mermaid bundle 是否随 HTML 站点一起分发，避免生产浏览依赖外网 CDN
+- 构建脚本是否能在 mermaid 渲染失败时给出文件名和代码块位置
+- 修改章节顺序后，sidebar、prev/next、附录链接是否同步
+
 ## 常见排障入口
 
 ### 训练太慢

@@ -10,6 +10,25 @@
 | 分布式训练 | PyTorch DDP、FSDP、DeepSpeed、Megatron-LM | 多卡 / 多机训练、状态切分、并行策略 |
 | 加速库 | CUDA、cuDNN、NCCL、Triton | GPU 计算、通信与算子优化 |
 
+## CPU 与主机侧性能分析
+
+| 类别 | 常见示例 | 主要作用 |
+|------|----------|----------|
+| CPU 采样分析 | `perf record`、`perf report`、`perf top` | 找到 DataLoader、tokenizer、preprocessing 或服务网关里的 CPU 热点 |
+| CPU 计数器统计 | `perf stat`、Intel VTune、AMD uProf | 观察 IPC/CPI、branch-misses、cache-misses、cycles、instructions 等硬件事件 |
+| Cache / 伪共享分析 | `perf c2c`、`perf mem`、VTune Memory Access | 定位 cache line 竞争、NUMA 远端访问和 false sharing |
+| 编译器向量化报告 | `-Rpass=loop-vectorize`、`-fopt-info-vec`、LLVM-MCA | 判断 SIMD 是否生效，以及循环为何未被自动向量化 |
+| NUMA 观察与绑定 | `numactl`、`numastat`、`lscpu`、`hwloc-ls` | 检查 CPU core、内存、GPU、NIC 是否跨 NUMA 访问 |
+
+## 内存、IO 与 PCIe 观察
+
+| 类别 | 常见示例 | 主要作用 |
+|------|----------|----------|
+| 内存状态 | `free`、`vmstat`、`sar -B`、`/proc/meminfo` | 观察 Page Cache、脏页、换页、page fault 和内存压力 |
+| Huge Page / TLB | `/proc/meminfo`、`perf stat -e dTLB-load-misses`、`turbostat` | 判断 THP/HugeTLB 是否生效，以及 TLB miss 是否成为瓶颈 |
+| PCIe 拓扑 | `lspci -tv`、`nvidia-smi topo -m`、`hwloc-ls` | 识别 GPU、NIC、NVMe 与 CPU socket 的连接关系 |
+| GPU 拷贝链路 | `nvidia-smi dmon`、Nsight Systems、CUDA profiler | 验证 H2D/D2H、pinned memory、copy/compute overlap 是否符合预期 |
+
 ## 对齐训练与偏好优化
 
 | 类别 | 常见示例 | 主要作用 |
@@ -33,6 +52,17 @@
 | 实验追踪 | MLflow、Weights & Biases、ClearML | 记录配置、指标、工件和运行上下文 |
 | 模型仓库 | MLflow Model Registry、Hugging Face Hub、自建 registry | 管理模型版本、状态和元数据 |
 | 特征管理 | Feast、自建 feature store | 训练和线上特征一致性 |
+
+## 文件系统与存储压测
+
+| 类别 | 常见示例 | 主要作用 |
+|------|----------|----------|
+| 块设备与系统 IO | `iostat`、`pidstat -d`、`sar -d`、`blktrace` | 观察磁盘利用率、队列深度、await、吞吐和进程级 IO |
+| 通用 IO 压测 | `fio`、`dd`、`diskspd` | 构造顺序/随机、读/写、direct/buffered、不同 block size 的基准 |
+| 文件系统基准 | `fsbench`、`mdtest`、`ior` | 测试小文件元数据、大文件吞吐、并行文件系统 stripe 等场景 |
+| 文件系统观察 | `df`、`du`、`stat`、`filefrag`、`xfs_info`、`zpool iostat` | 查看容量、extent、XFS/ZFS 状态、碎片和池级吞吐 |
+| 对象存储压测 | `s5cmd`、`aws s3`、`rclone`、自建 multipart benchmark | 验证对象存储 list、get、put、multipart、并发和尾延迟 |
+| 并行文件系统工具 | Lustre `lfs`、GPFS `mmlsfs` / `mmdiag`、BeeGFS `beegfs-ctl` | 查看 stripe、MDS/OSS 状态、客户端挂载和服务端健康 |
 
 ## 调度与平台
 
@@ -83,6 +113,17 @@
 | Trace | OpenTelemetry、Jaeger | 跨服务链路追踪 |
 | 成本与审计 | 云账单系统、自建 cost attribution、审计日志 | 成本归因、权限审计 |
 
+## 网络、RDMA 与链路验收
+
+| 类别 | 常见示例 | 主要作用 |
+|------|----------|----------|
+| TCP / socket 观察 | `ss`、`ip route`、`nstat`、`tcpdump`、`iperf3` | 排查连接状态、重传、路由、MTU、吞吐和包级异常 |
+| 网卡配置 | `ethtool`、`ip link`、`tc` | 查看速率、offload、队列、RSS、MTU、ECN/PFC 相关配置 |
+| RDMA 设备状态 | `ibstat`、`ibv_devinfo`、`rdma link`、`rdma resource` | 查看 HCA、端口、GID、QP/CQ 和 RDMA 资源 |
+| RDMA 性能测试 | `ib_write_bw`、`ib_read_bw`、`ib_send_bw`、`perftest` | 验证 RDMA 带宽、延迟、消息大小和双向性能 |
+| InfiniBand / RoCE 管理 | `iblinkinfo`、`ibnetdiscover`、`perfquery`、`mlxlink` | 检查链路错误、速率、拓扑、PFC/ECN、交换机端口状态 |
+| NCCL 网络验证 | `nccl-tests`、`NCCL_DEBUG=INFO`、`NCCL_TOPO_DUMP_FILE` | 验证 AllReduce 性能、识别 socket fallback、查看 NCCL 拓扑选择 |
+
 ## 安全工具与合规
 
 | 类别 | 常见示例 | 主要作用 |
@@ -100,6 +141,15 @@
 | 向量数据库 | Milvus、Weaviate、Qdrant、pgvector | 向量索引、检索与过滤 |
 | 文档处理 | 自建 ETL、Unstructured、解析器集合 | 文档清洗、切分、元数据抽取 |
 | 评测与反馈 | 自建评测集、人工审核、LLM-as-judge 工作流 | 检索与生成质量评估 |
+
+## 文档、图表与 Mermaid 渲染
+
+| 类别 | 常见示例 | 主要作用 |
+|------|----------|----------|
+| Mermaid 渲染 | Mermaid CLI、`@mermaid-js/mermaid-cli`、markdown preview | 把正文中的 flowchart、sequenceDiagram、stateDiagram、mindmap 渲染为图 |
+| Markdown 静态站点 | MkDocs、Docusaurus、VitePress、自建转换脚本 | 把教程 markdown 组织为可浏览站点 |
+| 图表回归检查 | Playwright screenshot、HTML build smoke test | 检查 mermaid 图是否渲染、是否溢出、是否在浅色主题下可读 |
+| 代码块与链接检查 | markdownlint、lychee、自建 `rg` 检查 | 发现标题、链接、代码块 fence、相对路径和附录引用错误 |
 
 ## 版本线 / 关键里程碑速记
 

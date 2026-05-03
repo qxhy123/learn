@@ -66,72 +66,81 @@
 
 - [前言：如何使用本教程](./00-preface.md)
 
+### 第零部分：体系结构基础
+
+| 章节 | 标题 | 主要内容 | 工程重点 |
+|------|------|----------|----------|
+| 第0a章 | [CPU 微架构](./part0-foundations-of-systems/0a-cpu-microarchitecture.md) | 流水线、乱序执行、分支预测、SIMD、Cache/MESI、伪共享与 DataLoader Worked Example | 识别 host-side bottleneck |
+| 第0b章 | [内存、虚拟内存与 IO](./part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md) | 页表/TLB、Page Cache、Huge Pages、NUMA、syscall/io_uring、PCIe、DMA 与 H2D Worked Example | 理解内存与 IO 路径 |
+| 第0c章 | [文件系统与存储内核](./part0-foundations-of-systems/0c-filesystems-and-storage-internals.md) | VFS、inode/dentry、ext4/XFS/ZFS、fsync/O_DIRECT、对象存储、并行文件系统与 checkpoint Worked Example | 判断存储语义和吞吐边界 |
+| 第0d章 | [网络协议栈基础](./part0-foundations-of-systems/0d-network-stack-fundamentals.md) | TCP/IP、MTU、socket/epoll/io_uring、offload、RDMA verbs、GPUDirect RDMA 与 AllReduce Worked Example | 拆分 control plane 与 data plane |
+
 ### 第一部分：AI Infra 基础认知
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第1章 | [什么是 AI Infra](./part1-foundations/01-what-is-ai-infra.md) | AI 系统全景图、角色分工、核心对象 | 建立全局认知 |
-| 第2章 | [算力、存储与网络](./part1-foundations/02-compute-storage-network.md) | CPU/GPU/内存/磁盘/网络的职责与瓶颈 | 识别资源短板 |
-| 第3章 | [从模型实验到生产系统](./part1-foundations/03-from-model-to-production.md) | 从 notebook 到线上服务的演进路径 | 理解系统链路 |
+| 第1章 | [什么是 AI Infra](./part1-foundations/01-what-is-ai-infra.md) | AI 系统全景图、角色分工、核心对象、第一性原理学习地图 | 建立全局认知 |
+| 第2章 | [算力、存储与网络](./part1-foundations/02-compute-storage-network.md) | CPU/GPU/内存/磁盘/网络的职责与瓶颈，Page Cache/NUMA 浅引用并指向 Part 0 | 识别资源短板 |
+| 第3章 | [从模型实验到生产系统](./part1-foundations/03-from-model-to-production.md) | 从 notebook 到线上服务的演进路径、平台化边界与生产链路推导 | 理解系统链路 |
 
 ### 第二部分：硬件与系统栈
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第4章 | [GPU 与加速器](./part2-systems-stack/04-gpu-and-accelerators.md) | GPU 架构、吞吐思维、常见加速器 | 理解并行计算基础 |
-| 第5章 | [内存、互联与 IO](./part2-systems-stack/05-memory-interconnect-io.md) | HBM、PCIe、NVLink、RDMA、对象存储 IO | 理解“为什么慢” |
-| 第6章 | [CUDA、运行时与算子执行](./part2-systems-stack/06-cuda-runtime-and-kernels.md) | CUDA 栈、Kernel、库与编译链路 | 软件栈分层认知 |
+| 第4章 | [GPU 与加速器](./part2-systems-stack/04-gpu-and-accelerators.md) | GPU 架构、吞吐思维、NVSwitch、HGX H100/H200、GB200/NVL72 与推理阶段瓶颈 | 理解并行计算基础 |
+| 第5章 | [内存、互联与 IO](./part2-systems-stack/05-memory-interconnect-io.md) | HBM、PCIe、NVLink、RDMA、对象存储 IO、集群网络拓扑与 Job Placement | 理解“为什么慢” |
+| 第6章 | [CUDA、运行时与算子执行](./part2-systems-stack/06-cuda-runtime-and-kernels.md) | CUDA 栈、Kernel、库与编译链路、SM 调度、warp 与 register spill | 软件栈分层认知 |
 
 ### 第三部分：训练基础设施
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第7章 | [单机训练系统](./part3-training-infra/07-single-node-training.md) | 训练循环、Profiler、数据管道与显存 | 单机性能基线 |
-| 第8章 | [数据并行](./part3-training-infra/08-data-parallel.md) | AllReduce、同步点、NCCL、吞吐扩展 | 规模化第一步 |
-| 第9章 | [模型并行与流水并行](./part3-training-infra/09-model-pipeline-parallel.md) | 张量并行、流水并行、并行策略组合 | 超大模型训练 |
-| 第10章 | [内存优化、检查点与恢复](./part3-training-infra/10-memory-checkpointing-and-recovery.md) | 激活重计算、ZeRO、Checkpoint、容灾 | 稳定完成训练 |
-| 第10b章 | [对齐训练与后训练基础设施](./part3-training-infra/10b-alignment-and-post-training.md) | RLHF、DPO、PPO 的多模型协调、显存与调度 | 理解后训练的独特资源模式 |
-| 第10c章 | [Fine-Tuning 基础设施与多 Adapter 服务](./part3-training-infra/10c-finetuning-and-multi-adapter.md) | LoRA、QLoRA、FTaaS、Multi-LoRA serving | 微调与 adapter 的平台化 |
+| 第7章 | [单机训练系统](./part3-training-infra/07-single-node-training.md) | 训练循环、Profiler、数据管道与显存、LLaMA-7B Worked Example、MFU/HFU 与 AMP | 单机性能基线 |
+| 第8章 | [数据并行](./part3-training-infra/08-data-parallel.md) | AllReduce、同步点、NCCL、吞吐扩展、梯度压缩与 PowerSGD | 规模化第一步 |
+| 第9章 | [模型并行与流水并行](./part3-training-infra/09-model-pipeline-parallel.md) | TP/PP/EP、SP/CP、Interleaved/Zero Bubble、并行策略决策树与配置实例 | 超大模型训练 |
+| 第10章 | [内存优化、检查点与恢复](./part3-training-infra/10-memory-checkpointing-and-recovery.md) | 激活重计算、ZeRO、Checkpoint、NCCL Hang 排查、Straggler、Elastic Training、FP8 | 稳定完成训练 |
+| 第10b章 | [对齐训练与后训练基础设施](./part3-training-infra/10b-alignment-and-post-training.md) | RLHF、DPO、PPO/GRPO、RM 部署、PPO Worked Example 与多模型 checkpoint 一致性 | 理解后训练的独特资源模式 |
+| 第10c章 | [Fine-Tuning 基础设施与多 Adapter 服务](./part3-training-infra/10c-finetuning-and-multi-adapter.md) | LoRA、QLoRA、Multi-LoRA 显存预算、Adapter/Base 兼容与 FTaaS pipeline | 微调与 adapter 的平台化 |
 
 ### 第四部分：数据与存储基础设施
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第11章 | [数据管道](./part4-data-and-storage/11-data-pipeline.md) | 采集、清洗、切分、分片、流式读取 | 数据吞吐与一致性 |
-| 第12章 | [制品、模型与检查点管理](./part4-data-and-storage/12-artifacts-and-checkpoints.md) | Model Registry、Checkpoint、版本治理 | 训练资产管理 |
-| 第13章 | [特征、向量与缓存](./part4-data-and-storage/13-feature-vector-and-cache.md) | Feature Store、Embedding、向量索引、缓存层 | 在线数据访问 |
+| 第11章 | [数据管道](./part4-data-and-storage/11-data-pipeline.md) | 采集、清洗、切分、分片、流式读取、dataset shard 与 Part 0 存储路径联动 | 数据吞吐与一致性 |
+| 第12章 | [制品、模型与检查点管理](./part4-data-and-storage/12-artifacts-and-checkpoints.md) | Model Registry、Checkpoint、版本治理、checkpoint 文件系统选型 | 训练资产管理 |
+| 第13章 | [特征、向量与缓存](./part4-data-and-storage/13-feature-vector-and-cache.md) | Feature Store、Embedding、向量索引、ANN、RAG Chunking、增量重建、Prefix Caching | 在线数据访问 |
 
 ### 第五部分：推理与服务基础设施
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第14章 | [在线推理架构](./part5-serving-infra/14-online-inference-architecture.md) | 网关、路由、服务、模型副本 | 线上推理主链路 |
-| 第15章 | [批处理、调度与 KV Cache](./part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | Dynamic Batching、Prefill/Decode、PagedAttention | 提升吞吐与稳定性 |
-| 第16章 | [量化、编译与推理引擎](./part5-serving-infra/16-quantization-compilation-and-engines.md) | TRT-LLM、vLLM、ONNX Runtime、量化 | 降低延迟与成本 |
-| 第17章 | [多租户与成本治理](./part5-serving-infra/17-multitenancy-and-cost.md) | 配额、SLA、冷热分层、成本分摊 | 服务化经营能力 |
+| 第14章 | [在线推理架构](./part5-serving-infra/14-online-inference-architecture.md) | 网关、路由、服务、模型副本、推理控制面与数据面拆解 | 线上推理主链路 |
+| 第15章 | [批处理、调度与 KV Cache](./part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | Dynamic Batching、Prefill/Decode、PagedAttention、70B 容量规划 Worked Example、PD 分离、Speculative Decoding、ITL | 提升吞吐与稳定性 |
+| 第16章 | [量化、编译与推理引擎](./part5-serving-infra/16-quantization-compilation-and-engines.md) | TRT-LLM、vLLM、SGLang、ONNX Runtime、量化/引擎选型决策树与校准 | 降低延迟与成本 |
+| 第17章 | [多租户与成本治理](./part5-serving-infra/17-multitenancy-and-cost.md) | 配额、SLA、冷热分层、Cloud vs On-Prem TCO、Spot、MFU vs Utilization、Chargeback | 服务化经营能力 |
 
 ### 第六部分：平台与编排
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第18章 | [容器与运行时](./part6-platform-and-orchestration/18-containers-and-runtime.md) | 镜像、Runtime、设备插件、构建发布 | 可复制的运行环境 |
-| 第19章 | [Kubernetes for AI](./part6-platform-and-orchestration/19-kubernetes-for-ai.md) | Pod、Job、Operator、GPU 调度 | 平台化基础 |
-| 第20章 | [队列、配额与自动扩缩容](./part6-platform-and-orchestration/20-queues-quotas-and-autoscaling.md) | 队列系统、优先级、弹性伸缩、抢占 | 资源治理 |
+| 第18章 | [容器与运行时](./part6-platform-and-orchestration/18-containers-and-runtime.md) | 镜像、Runtime、设备插件、构建发布、运行环境的不可变边界 | 可复制的运行环境 |
+| 第19章 | [Kubernetes for AI](./part6-platform-and-orchestration/19-kubernetes-for-ai.md) | Pod、Job、Operator、GPU 调度、Volcano/Kueue、拓扑感知、亲和/反亲和 | 平台化基础 |
+| 第20章 | [队列、配额与自动扩缩容](./part6-platform-and-orchestration/20-queues-quotas-and-autoscaling.md) | 队列系统、优先级、MIG/MPS/Time-Slicing、GPU 碎片化、DRF、公平调度与弹性伸缩 | 资源治理 |
 
 ### 第七部分：稳定性、安全与治理
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第21章 | [可观测性与容量规划](./part7-reliability-security/21-observability-and-capacity.md) | Metrics、Logs、Traces、容量建模 | 看清系统状态 |
-| 第22章 | [评测、发布与故障处理](./part7-reliability-security/22-evaluation-release-and-incident.md) | 离线评测、灰度、回滚、值班、复盘 | 线上可靠交付 |
-| 第23章 | [安全、隔离与治理](./part7-reliability-security/23-security-isolation-and-governance.md) | 权限、密钥、租户隔离、合规、审计 | 降低平台风险 |
+| 第21章 | [可观测性与容量规划](./part7-reliability-security/21-observability-and-capacity.md) | Metrics、Logs、Traces、采样策略、cardinality 治理、错误预算 burn-down、成本归因 | 看清系统状态 |
+| 第22章 | [评测、发布与故障处理](./part7-reliability-security/22-evaluation-release-and-incident.md) | 离线评测、A/B、灰度、质量采样、Prompt/配置变更、回滚与复盘 | 线上可靠交付 |
+| 第23章 | [安全、隔离与治理](./part7-reliability-security/23-security-isolation-and-governance.md) | 权限、Secrets、租户隔离、pickle/SafeTensors、cosign/Trivy/SLSA、合规审计 | 降低平台风险 |
 
 ### 第八部分：高阶主题与完整项目
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第24章 | [构建一个 AI 平台](./part8-advanced-and-capstone/24-build-an-ai-platform.md) | 训练、评测、制品、部署、推理、观测的端到端蓝图 | 形成系统设计能力 |
-| 第25章 | [AI Agent 与推理时计算基础设施](./part8-advanced-and-capstone/25-agent-and-inference-time-compute.md) | Agent 状态管理、thinking model、推理预算 | 新范式下的推理系统设计 |
+| 第24章 | [构建一个 AI 平台](./part8-advanced-and-capstone/24-build-an-ai-platform.md) | 训练、评测、制品、部署、推理、观测的端到端蓝图与平台边界推导 | 形成系统设计能力 |
+| 第25章 | [AI Agent 与推理时计算基础设施](./part8-advanced-and-capstone/25-agent-and-inference-time-compute.md) | Agent 状态管理、thinking tokens 四模式、推理预算工程与推理服务集成 | 新范式下的推理系统设计 |
 
 ### 附录
 
@@ -180,27 +189,33 @@
 
 ### 路径一：工程师快速入门（2-3 周）
 
-1. 学习第 1-3 章，建立 AI 系统全景图
+1. 可先选读 Part 0 的 0b、0d，再学习第 1-3 章，建立 AI 系统全景图
 2. 学习第 14-17 章与第 25 章，理解线上推理链路与 agent 推理新范式
 3. 学习第 21-23 章，理解稳定性、安全与成本
 
 ### 路径二：训练平台路线（4-6 周）
 
-1. 学习第 1-6 章，建立硬件与系统栈认知
+1. 先完成 Part 0，再学习第 1-6 章，建立硬件与系统栈认知
 2. 重点学习第 7-10 章，并继续完成第 10b、10c 章，掌握训练、后训练与微调基础设施
 3. 补充第 11-12 章与第 18-20 章，形成平台理解
 
 ### 路径三：推理平台路线（4-5 周）
 
-1. 先完成第 2、4、5、6 章，理解硬件和运行时约束
+1. 先完成 Part 0 的 0a、0b、0d，再完成第 2、4、5、6 章，理解硬件和运行时约束
 2. 重点学习第 14-17 章，再补第 25 章，理解服务链路、调度、成本与 agent 运行形态
 3. 再学习第 21-23 章，补齐监控、评测和治理
 
 ### 路径四：完整 AI 平台路线（6-8 周）
 
-1. 按章节顺序完整学习第 1-25 章，包括新增/扩充的第 10b、10c 和第 25 章
+1. 按章节顺序完整学习 Part 0 与第 1-25 章，包括新增/扩充的第 10b、10c 和第 25 章
 2. 每章完成练习题与设计清单
 3. 最后以第 24-25 章为蓝图，尝试画出自己的 AI 平台架构图
+
+### 路径五：体系结构深度路径（Part 0 + Part 2 + Part 3）
+
+1. 完整学习 Part 0，建立 CPU、内存、文件系统与网络协议栈的机制地图
+2. 接着学习第 4-6 章，把 GPU、互联、IO、CUDA runtime 与底层系统约束连起来
+3. 最后学习第 7-10c 章，用单机训练、数据并行、模型并行、Checkpoint 与后训练案例检验体系结构判断
 
 ---
 
@@ -228,6 +243,7 @@
 2. **能权衡**：知道某个优化是在拿什么换什么，例如吞吐换时延、显存换计算、平台复杂度换多租户治理
 3. **能设计**：能够给出一套不是只堆组件名的 AI 平台方案
 4. **能估算**：给定一个模型和集群，能在 10 分钟内估算出训练/推理的资源需求
+5. **能推导**：能从第一性原理推导每个机制为什么存在、解决什么不可化简的问题、边界在哪里
 
 如果你只会说出很多工具名字，但说不清为什么这里需要它、它的边界是什么，那说明还没真正进入 AI Infra 的思维方式。
 
@@ -236,8 +252,10 @@
 ## 教程特色
 
 - **系统视角**：从 GPU 到网关，从训练到推理，覆盖一条完整链路
+- **第一性原理思维框架**：每章用“拆、推、绘、导”把机制从不可化简的问题中推出来
 - **工程导向**：每章都强调瓶颈、故障、权衡与治理
 - **尽量定量**：在适合的地方加入容量估算、通信体量、显存预算、吞吐关系
+- **多文件 HTML 版本**：除 Markdown 源文档外，提供适合浏览和分发的多文件静态 HTML 版本
 - **适合中文学习者**：尽量把术语翻译清楚，把链路讲完整
 - **与仓库教程互补**：不重复讲模型算法，重点讲基础设施和系统设计
 

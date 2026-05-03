@@ -4725,6 +4725,232 @@ session
 
 ---
 
+## Part 0：体系结构基础新增练习参考答案
+
+> 本节补齐 Batch 1 中 Part 0 四章新增练习题。题号与正文中的 `0a-*`、`0b-*`、`0c-*`、`0d-*` 对应，答案以判题要点为主。
+
+### 0a CPU 微架构
+
+**0a-1：CPI 估算**
+
+理想 5 段流水线稳定后 CPI 接近 1，但真实 CPI 要加上 stall。估算时可写成 `CPI = 1 + 分支停顿 + cache miss 停顿 + 数据依赖停顿 + 结构冲突停顿`。如果 20% 指令访存、L1 miss 率 5%、miss penalty 30 cycles，仅 cache 项就约 `0.2 x 0.05 x 30 = 0.3` CPI。
+
+**0a-2：识别冒险**
+
+RAW 是后一条读前一条尚未写回的值；WAR/WAW 多见于乱序机器里的名字依赖；控制冒险来自分支路径未知；结构冒险来自多个指令争同一硬件资源。答案应说明具体依赖、会造成什么等待，以及 forwarding、stall、renaming 或预测分别能缓解哪一类。
+
+**0a-3：假依赖**
+
+假依赖不是数据语义必须等待，而是多个逻辑变量复用了同一个寄存器名。Register renaming 把架构寄存器映射到不同物理寄存器，消除 WAR/WAW，使 CPU 可以让无关指令并行执行。
+
+**0a-4：ROB 的必要性**
+
+ROB 让指令可以乱序执行、顺序提交。没有 ROB，异常、分支回滚和精确状态会很难保证；有 ROB 后，错误路径结果可以丢弃，正确路径结果按程序顺序变成可见状态。
+
+**0a-5：BTB 与方向预测**
+
+方向预测回答“分支走不走”，BTB 回答“跳到哪里”。方向预测对了但 BTB miss，取指仍可能停顿；BTB 有目标但方向错，流水线会取错路径并在分支解析后 flush。
+
+**0a-6：Cold path**
+
+AI 服务的异常分支、低频 tokenizer 规则、罕见 schema、工具调用错误路径常常缺少分支历史和 i-cache 热度。冷路径第一次触发时可能同时遇到分支误预测、指令 cache miss、数据 cache miss 和动态加载开销，所以尾延迟会比平均值敏感。
+
+**0a-7：向量宽度**
+
+SIMD 理论加速约等于一次能处理的元素数，例如 AVX2 256-bit 可同时处理 8 个 int32 或 4 个 double。但真实收益受内存带宽、对齐、分支、尾部处理、gather/scatter 和 decode/encode 逻辑限制。
+
+**0a-8：Tokenizer SIMD**
+
+适合 SIMD 化的 tokenizer 热点通常有连续字节扫描、ASCII 分类、查表、delimiter 搜索等特征。不适合的情况包括复杂 Unicode 状态机、频繁分支、随机访问、短字符串占多数。应先用 profiling 找热点，再用向量化报告和 benchmark 验证。
+
+**0a-9：Cache line 浪费**
+
+如果每次只读 8B，但硬件搬运 64B cache line，空间局部性差时有效带宽只有 1/8。结构体数组中只访问少数字段时，SoA 往往比 AoS 更容易提高 cache line 利用率。
+
+**0a-10：关联度冲突**
+
+多个热点地址若映射到同一 cache set，即使总 working set 小于 cache 容量，也可能反复驱逐。判断方式包括改变数组 stride、padding、对齐或数据布局后 miss 率明显变化。
+
+**0a-11：MESI 状态转移**
+
+单核独占写入通常从 E 到 M；其他核读取该 line 后变成 S；某核要写共享 line 时，需要让其他副本 Invalid。频繁跨核写同一 line 会造成 invalidation storm，这就是伪共享的硬件根源。
+
+**0a-12：Counter 布局**
+
+多 worker counter 应让每个线程写独立 cache line，例如按 64B 或更保守的硬件 destructive interference size padding。最终汇总时再读所有 counter，避免每次更新都让其他 core 的 cache line 失效。
+
+**0a-13：完整排查 Runbook**
+
+先固定数据、batch、worker 数和 CPU 频率，记录吞吐与 p95/p99；用 `perf stat` 看 IPC、cache miss、branch miss、context switch；用 `perf record` 找热点；用 `perf c2c` 查伪共享；再做 worker 数、NUMA 绑定、padding、预取和 tokenizer SIMD 的对照实验。结论必须来自 A/B 数字，而不是单次观察。
+
+**0a-14：Tokenizer Host Bottleneck**
+
+如果 GPU 计算很快但 step 间隔被 tokenizer 卡住，应拆 input pipeline：读取、解压、tokenize、collate、H2D。优化路径包括离线预 tokenization、批量 tokenizer、SIMD/多进程、减少 Python GIL 热点、NUMA 绑定、pinned memory 和 overlap。最终看 GPU idle time 是否下降，而不只看 tokenizer microbenchmark。
+
+### 0b 内存、虚拟内存与 IO
+
+**0b-1：虚拟地址翻译**
+
+CPU 先用虚拟地址查 TLB；命中后直接得到物理页框，未命中则走页表遍历。连续虚拟地址不保证物理连续，大数组随机访问可能同时放大 cache miss 和 TLB miss。
+
+**0b-2：Page Cache 判断**
+
+第二轮 dataset 更快通常是 Page Cache 命中。可通过 drop caches 前后对比、观察 `cached`/`buff/cache`、`vmtouch`、`mincore`、磁盘 `iostat` 和进程吞吐验证。不能把第二轮速度当作冷启动存储吞吐。
+
+**0b-3：Dirty page 估算**
+
+脏页阈值约为可回写内存乘以 `vm.dirty_ratio` 或 `dirty_bytes`。checkpoint 写入先进入 Page Cache 时，短时间看似很快，但达到阈值后会被 writeback 节流，尾延迟突然升高。
+
+**0b-4：THP 观察**
+
+检查 `/sys/kernel/mm/transparent_hugepage/enabled`、`/proc/meminfo` 中 AnonHugePages，以及 `perf` 的 TLB miss。THP 可降低 TLB 压力，但 page collapse、split 或 compaction 可能制造延迟尖峰；低延迟服务需谨慎。
+
+**0b-5：NUMA locality**
+
+应让 DataLoader worker、内存分配、GPU 所属 PCIe root complex 尽量落在同一 NUMA node。可用 `numactl --hardware`、`nvidia-smi topo -m`、`numastat` 验证；跨 socket 会降低 H2D 和内存读取吞吐。
+
+**0b-6：PCIe 带宽**
+
+PCIe 带宽由代际和 lane 数决定，例如 x16 约等于 x8 的两倍。估算时要扣除编码和协议开销，并检查是否因拓扑、共享 switch、BIOS 配置或设备降速实际跑在较低 lane/速率。
+
+**0b-7：fork 与 copy-on-write**
+
+fork 后父子进程先共享物理页，任一方写入才复制。它节省启动内存，但 DataLoader worker 若修改大对象，会触发大量 COW，导致内存暴涨和 page fault。
+
+**0b-8：`io_uring` 适用性**
+
+`io_uring` 适合大量异步文件或 socket IO、需要减少 syscall/上下文切换的场景。若瓶颈在磁盘本身、应用 CPU 处理、对象存储尾延迟或同步语义，换 `io_uring` 不会自动解决。
+
+**0b-9：Pinned memory 副作用**
+
+Pinned memory 能提高异步 H2D 拷贝效率，但过多 page-locked 内存会挤压可回收内存、影响 Page Cache 和系统调度。应设置上限，并观察内存压力、H2D 带宽和训练吞吐。
+
+**0b-10：Topology 推理**
+
+看 GPU、NIC、NVMe 分别挂在哪个 CPU root complex 下。理想路径是 GPU 和 NIC/NVMe 在同一 socket 或同一 PCIe switch 附近；跨 UPI/QPI 的路径会增加延迟、降低带宽，并影响 RDMA/GPUDirect。
+
+**0b-11：8 GPU DataLoader 亲和方案**
+
+按 GPU 拓扑把 worker 绑定到同 NUMA node 的 CPU core，数据预取 buffer 在本地内存分配，启用合理的 `pin_memory`，避免所有 worker 抢同一磁盘或同一锁。每张卡应有独立或均衡的数据队列，并记录每卡 input wait。
+
+**0b-12：Checkpoint 写入策略**
+
+大 checkpoint 可采用分片写临时文件、并发写入、校验、`fsync` 文件和目录、最后原子 rename/manifest 切换。要限制脏页堆积，避免训练进程在 writeback 阶段被长时间阻塞。
+
+**0b-13：低延迟推理 IO**
+
+低延迟控制面优先减少阻塞 syscall、连接抖动和内存分配；socket 可用 epoll/io_uring，权重和配置应预加载或 mmap 后预热。不要让首次请求承担 page fault、模型加载、TLS 建连和动态编译成本。
+
+### 0c 文件系统与存储内核
+
+**0c-基础1：VFS 路径**
+
+一次文件读取大致经过路径解析、dentry/inode、权限检查、Page Cache 命中判断、文件系统方法、block layer、设备驱动。VFS 提供统一抽象，具体 ext4/XFS/ZFS 决定底层元数据和数据布局。
+
+**0c-基础2：write 成功的含义**
+
+`write()` 成功通常只表示数据已进入内核缓冲或提交给底层路径，不等于持久落盘。崩溃一致性需要 `fsync`、目录同步、rename 协议和校验/manifest 配合。
+
+**0c-基础3：ext4 journal**
+
+ext4 journal 主要保护元数据一致性；不同模式对数据是否进入 journal 有差异。它能提升崩溃恢复确定性，但 checkpoint 大文件频繁提交可能带来额外写放大和尾延迟。
+
+**0c-基础4：XFS 适配**
+
+XFS 擅长大文件、并发写和大目录场景，B+tree 元数据结构适合扩展。AI checkpoint 和大 shard 写入常适合 XFS，但小文件极多时仍需关注目录、inode 和元数据压力。
+
+**0c-基础5：对象存储语义**
+
+对象存储适合不可变 shard、checkpoint 归档和大规模分发，但不是 POSIX 文件系统。目录、append、rename、fsync、权限和一致性语义都不同，应用应使用 manifest 和分片上传协议。
+
+**0c-基础6：IOPS 换算**
+
+小随机 IO 吞吐约等于 `IOPS x block_size`。例如 50k IOPS、4KB 随机读约 200MB/s；同一设备顺序读可能有数 GB/s，所以小文件训练很容易被 IOPS 而不是带宽限制。
+
+**0c-进阶1：Page Cache 误判**
+
+若 benchmark 第二次明显更快，且磁盘 `iostat` 读吞吐下降、Page Cache 增加，说明测到的是内存缓存。应分别测 cold cache、warm cache 和真实训练混合负载。
+
+**0c-进阶2：`O_DIRECT` 取舍**
+
+`O_DIRECT` 可减少 Page Cache 污染和双份拷贝，但要求对齐，可能降低小 IO 合并能力。它也不自动等价于持久化，仍需考虑 flush、barrier、fsync 或设备缓存策略。
+
+**0c-进阶3：小文件瓶颈**
+
+大量小文件会放大 open/stat/list、inode、目录锁和 MDS 压力。解决方向包括 shard/tar/webdataset、合并索引、预取、减少目录列表、并行文件系统 MDS 扩容或本地缓存。
+
+**0c-进阶4：ZFS dataset 仓库**
+
+ZFS 适合需要快照、校验、压缩和可回滚 dataset 的场景。代价是 COW 写放大、ARC 内存占用和 sync 写策略复杂；训练热路径需验证尾延迟和内存竞争。
+
+**0c-设计1：Checkpoint 发布协议**
+
+推荐写入 `tmp/step-id/rank-*`，每个分片写完校验并 fsync，生成 manifest，fsync 目录，最后用原子 rename 或提交 manifest 标记可见。恢复只读取完整 manifest 指向的分片，清理未完成临时目录。
+
+**0c-设计2：混合存储架构**
+
+本地 NVMe 做热缓存和临时 spill，并行 FS 做训练热层和 checkpoint 最新 N 份，对象存储做归档和跨集群分发。控制面负责生命周期、校验、预热和回收，避免用户手工搬文件。
+
+**0c-设计3：Stripe 策略**
+
+大 checkpoint 分片应按 rank 数、OSS 数和目标吞吐设置 stripe，避免所有 rank 写同一 OST 或同一目录热点。小文件不应盲目加大 stripe，应先减少文件数或优化 MDS 压力。
+
+### 0d 网络协议栈基础
+
+**0d-1：`send()` 到发包路径**
+
+典型路径是用户态 buffer、syscall、socket buffer、TCP/IP 协议栈、qdisc、网卡驱动、DMA ring、NIC 发包。若启用 offload，分段、校验和等部分工作可下推到 NIC。
+
+**0d-2：三次握手为什么不是两次**
+
+三次握手让双方都确认自己发送和接收能力可用，并同步初始序列号。两次无法让服务端确认客户端已收到服务端的 SYN-ACK，也更难处理旧连接报文干扰。
+
+**0d-3：MTU 对包数影响**
+
+同样 1GB 数据，MTU 1500 会产生远多于 MTU 9000 的包数。包数越多，CPU 中断/轮询、协议栈处理、交换机转发和队列管理开销越高；但 jumbo frame 必须端到端一致。
+
+**0d-4：Receive window 与 congestion window**
+
+Receive window 是接收端还能收多少，防止把接收端 buffer 打爆；congestion window 是发送端根据网络拥塞估计能发多少，防止把网络路径打爆。吞吐受二者较小者限制。
+
+**0d-5：5 个网络排查命令**
+
+可列 `ip addr/route`、`ss -tinp`、`ethtool -S`、`tcpdump`、`ping`/`tracepath`、`iperf3`、`nstat`、`ibstat`、`ib_write_bw`。答案应说明每个命令看链路、路由、连接、包、吞吐或 RDMA 哪一层。
+
+**0d-6：RSS 影响多核收包**
+
+RSS 把不同 flow 分配到多个 RX queue，再由不同 CPU core 处理。未配置好时，所有流量集中到单队列/单 core，会出现单核软中断打满但总 CPU 和网卡带宽未满。
+
+**0d-7：CUBIC 与 BBR**
+
+CUBIC 主要按丢包和窗口增长行为调节，适合传统互联网默认场景；BBR 估计瓶颈带宽和 RTT，可能改善高带宽时延积链路。选择时要看公平性、队列延迟、丢包模型和与网络设备策略的兼容。
+
+**0d-8：RDMA Write 生命周期**
+
+应用注册内存，建立 QP，提交 RDMA Write WR 到 send queue，HCA 通过 DMA 读取本地内存并经网络写入远端注册内存，完成后在 CQ 产生 WC。数据路径绕过远端 CPU，但控制面仍需建连、权限和内存注册。
+
+**0d-9：RoCE v2 为什么需要 ECN/PFC**
+
+RoCE 对丢包敏感，丢包会造成性能急剧下降。PFC 用 pause 降低特定优先级丢包，ECN 用拥塞标记促使端侧降速；二者配置不当会导致 pause storm、拥塞扩散或吞吐不稳。
+
+**0d-10：判断 NCCL fallback 到 socket**
+
+看 `NCCL_DEBUG=INFO` 日志中的 NET/IB、NET/Socket、GID、HCA 选择和拓扑；用 `nccl-tests` 对比预期 RDMA 带宽。若带宽接近 TCP、日志显示 Socket 或找不到 IB device，通常是 fallback。
+
+**0d-11：32 节点训练网络验收清单**
+
+至少覆盖链路速率、MTU、ECN/PFC、无错误计数、GPU-NIC 拓扑、单链路 RDMA bw/lat、跨 rack all-reduce、NCCL 多消息大小、故障告警和交换机拥塞指标。验收要覆盖不同节点组合，而不是只测两台。
+
+**0d-12：推理服务 control plane IO 模型**
+
+低到中等并发可用成熟 HTTP server + epoll；高并发、长连接、流式响应可关注事件循环 backpressure 和 flush 延迟；`io_uring` 只有在 syscall/上下文切换成为明确瓶颈时才值得引入。
+
+**0d-13：GPU 与 NIC 亲和放置**
+
+调度时优先让 GPU 使用同 socket、同 PCIe switch 或拓扑最近的 NIC，并让 CPU worker 绑定到相同 NUMA node。多 rail 集群应让每张 GPU 走预期 rail，避免跨 socket 绕路和 rail 不均衡。
+
+---
+
 ## 结束语
 
 如果你发现自己开始能用“资源、链路、平台、治理”四个维度来回答这些题，而不是只记住一串工具名，那么这套教程的目标就达到了。
