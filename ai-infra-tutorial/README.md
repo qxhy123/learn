@@ -261,6 +261,24 @@
 
 ---
 
+## HTML 版本
+
+本教程同时提供静态 HTML 版本（位于 `html/` 目录），适合离线浏览与分发：
+
+```bash
+cd html && python3 -m http.server 8000
+# 浏览器访问 http://localhost:8000/index.html
+```
+
+HTML 版本特点：
+
+- 浅色 paper 风格，每章独立文件
+- 左侧 sidebar 可视化全 31 章导航
+- mermaid 图表 + 手工 SVG 流程图
+- 所有内容与 Markdown 版本同步
+
+---
+
 ## 许可证
 
 本项目采用 MIT 许可证开源。
