@@ -840,7 +840,7 @@ if len(rolling) > 5:
 
 - Lustre 官方文档：Striping 配置和 checkpoint 最佳实践
 - AWS S3 multipart upload 文档：part size、并发、错误处理
-- [§0c3 fsync、Direct IO 与 Checkpoint 语义](../part0-foundations-of-systems/0c-filesystems-and-storage-internals.md)：本教程的存储语义基础
+- [§0c3 fsync、Direct IO 与 Checkpoint 语义](../part0-foundations-of-systems/0c3-storage-semantics-fsync-direct-io-and-checkpoints.md)：本教程的存储语义基础
 
 ### 工程博客
 

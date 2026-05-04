@@ -2,7 +2,7 @@
 
 > 训练出的模型权重只是字节流；只有当这些字节被平台登记、版本化、状态化、血缘化、可分发、可回滚，服务才能找到它、信任它、治理它。Model Registry 不是 MLflow 的一个 Tab，而是 AI Infra 的控制平面核心。
 
-> **关联章节**：本章与 [第 12 章](./12-artifacts-and-checkpoints.md) 的 checkpoint / 制品体系直接衔接；与 [第 10b 章 RLHF 多模型](../part3-training-infra/10b-rlhf.md)、[第 10c 章 Multi-LoRA](../part3-training-infra/10c-multi-lora.md)、[第 16a 章 vLLM Multi-LoRA serving](../part5-serving-infra/16a-vllm-internals.md) 形成完整的"训练 → 注册 → 服务"闭环。
+> **关联章节**：本章与 [第 12 章](./12-artifacts-and-checkpoints.md) 的 checkpoint / 制品体系直接衔接；与 [第 10b 章 Alignment 与后训练](../part3-training-infra/10b-alignment-and-post-training.md)、[第 10c 章 Finetuning 与 Multi-Adapter](../part3-training-infra/10c-finetuning-and-multi-adapter.md)、[第 16a 章 vLLM Multi-LoRA serving](../part5-serving-infra/16a-vllm-internals.md) 形成完整的"训练 → 注册 → 服务"闭环。
 
 ---
 

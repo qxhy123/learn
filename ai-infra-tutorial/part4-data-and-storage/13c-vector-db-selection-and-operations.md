@@ -36,7 +36,7 @@
 
 从"性能瓶颈多样"推出**metadata filter 的多种实现策略**。pre-filter 先按 metadata 缩小候选集再做向量搜索，适合高选择性过滤（过滤后候选 < 1%）但召回率有风险；post-filter 先做向量搜索再过滤，适合低选择性过滤（过滤后候选 > 10%）；blocked filter 把 metadata bitmap 与向量搜索并行，Qdrant 和 Weaviate 的实现接近这一策略，在中等选择性下性能最稳定。
 
-从"业务增长不可预测"推出**容量规划公式**。内存需求 = 向量维度 × 字节数 × 向量数量 × (1 + HNSW overhead ratio)；磁盘需求 = 向量文件 + metadata + WAL + 索引结构 + compaction 余量；QPS 容量 = 单副本 QPS × 副本数 × 查询并行度 / 平均 filter 选择率。这些公式提供估算框架，实际数字需要用真实数据压测校准。
+从"业务增长不可预测"推出**容量规划公式**。内存需求必须拆成 raw vector storage、graph adjacency、level metadata、payload/filter index 和 allocator overhead；原始向量是否留在内存，还取决于实现、量化和 mmap 策略。磁盘需求 = 向量文件 + metadata + WAL + 索引结构 + compaction 余量；QPS 容量 = 单副本 QPS × 副本数 × 查询并行度 / 平均 filter 选择率。这些公式提供估算框架，实际数字需要用真实数据压测校准。
 
 从"运维事件不可避免"推出**备份、升级、迁移机制**。snapshot 备份是向量库的基础运维能力，但不同产品的 snapshot 粒度（collection vs cluster）和恢复时间差异很大。embedding model 变更触发的 reindex 是最复杂的迁移场景，需要双索引灰度、流量切换和回滚窗口。跨版本升级在 Milvus 这类系统中历史上是高风险操作，新版本的数据格式变化可能导致旧数据不可读。
 
@@ -166,6 +166,8 @@ mindmap
 ## 13c.3 六维选型矩阵
 
 选型矩阵需要跨 10 个维度评估。以下是针对主流向量库的系统对比：
+
+> **版本口径（2026-05）**：下表用于说明工程选型维度，不是长期有效的产品排名。向量库的 metadata filter、hybrid search、多租户、托管能力、license 和成本模型变化很快；生产选型前需要按当前版本复核官方文档，并把复核日期、测试数据集和压测命令写入 `BenchmarkProtocol`。
 
 | 维度 | FAISS/Chroma | pgvector | Milvus | Qdrant | Weaviate | Pinecone | ES/OpenSearch |
 |------|-------------|---------|--------|--------|----------|----------|--------------|
@@ -756,7 +758,7 @@ nodes:
     count: 8
     spec: 32 vCPU, 256GB RAM
     # 每节点负责约 12.5M 向量段
-    # 内存：12.5M × 1536 × 4B × 1.5(HNSW) = 115GB，余量 256-115 = 141GB
+    # 内存：raw vectors 约 77GB + graph/metadata/payload/filter index；需按构建结果校准，不能固定乘 HNSW 1.5
   
   data_node:    # 数据写入节点
     count: 2
