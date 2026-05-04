@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11c 章 · Tokenization、切分与训练 Dataset 格式 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 11c 章 · Tokenization、切分与训练 Dataset 格式</h1>
+<p class="sub">GPU 只消费整数 ID 组成的固定形状张量，原始语料是可变长文本的海量集合。Tokenization 是这道鸿沟的第一座桥，Dataset 格式是第二座桥。把两座桥建错，任何后续算法优化都是在沙堆上加层楼。</p>
+<div class="chips">
+  <span class="chip">BPE</span>
+  <span class="chip">SentencePiece</span>
+  <span class="chip">Tiktoken</span>
+  <span class="chip">Sequence Packing</span>
+  <span class="chip">MosaicML Streaming</span>
+  <span class="chip">Sharding</span>
+  <span class="chip">Resume-Friendly</span>
+  <span class="chip">Token-level Loss</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>如何把 1TB 可变长文本高效地映射为整数序列，并以可恢复、确定性、高吞吐的方式喂给 512 个 GPU——同时保证 loss 语义正确、shuffle 可复现、训练中断可精确续训？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解：Tokenization 与 Dataset 格式</a></li>
+  <li><a class="anchor" href="#s2">BPE、SentencePiece、Tiktoken：算法与实现对比</a></li>
+  <li><a class="anchor" href="#s3">Tokenizer 训练：词表大小、特殊 Token 与兼容性</a></li>
+  <li><a class="anchor" href="#s4">Tokenization 性能：SIMD 优化、Rust 实现、批量并行</a></li>
+  <li><a class="anchor" href="#s5">Sequence Packing：从文档到训练序列</a></li>
+  <li><a class="anchor" href="#s6">Sample-level vs Token-level 损失</a></li>
+  <li><a class="anchor" href="#s7">训练 Dataset 格式：行式、列式与二进制对比</a></li>
+  <li><a class="anchor" href="#s8">Sharding 策略：大小、Token 数、Doc 数与 Hash</a></li>
+  <li><a class="anchor" href="#s9">Multi-node 训练的 Dataset 分片：Rank 分配与 Shuffle</a></li>
+  <li><a class="anchor" href="#s10">AI Infra 视角：离线预处理 vs 在线服务化</a></li>
+  <li><a class="anchor" href="#s11">Worked Example：1TB 文本端到端 Pipeline</a></li>
+  <li><a class="anchor" href="#s12">练习题</a></li>
+</ol>
+</section>
+
+<!-- ===== §1 第一性原理拆解 ===== -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：Tokenization 与 Dataset 格式</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>把所有工具名和格式名拿掉。训练一个语言模型，本质上是在做什么？给定一段文本 "the cat sat"，模型的每个训练步接收的是一串整数，比如 <code>[1169, 3797, 6435]</code>，然后预测序列的下一个整数，通过与标签的差距计算梯度。不是字符，不是字节，是词表索引。这就是不可化简的第一个约束：<strong>模型只消费离散整数序列，文本是连续字符，中间必须有映射层</strong>。这个映射层叫 tokenizer。</p>
+
+<p>tokenizer 看起来是一个简单的查表工具。但当训练语料从 1GB 膨胀到 1TB 再到 100TB 时，这个"查表"就变成了工程问题：谁来做、什么时候做、做完的结果存在哪里、怎么让 N 个训练节点的 M 个 DataLoader worker 稳定、无重复、可恢复地读取这些整数？</p>
+
+<p>第二个不可化简的约束：<strong>GPU 需要固定形状的 batch，但文本长度天然参差不齐</strong>。一句话 20 个 token，一篇论文摘要 512 个 token，一篇长文 8192 个 token。如果用 padding 对齐到最大长度，短文本大量浪费算力。如果限制最大长度，长文本只能截断，信息丢失。工程解决方案是 sequence packing：把多条文档的 token 流拼接填满一个固定长度的序列，用 attention mask 或 document boundaries 区分边界。这本来是个聪明的方案，但它引入了第三个约束：<strong>packing 改变了每条文档参与梯度的方式，影响 loss 的数值语义</strong>。</p>
+
+<p>第三个约束：<strong>存储格式决定读取效率</strong>。1TB 文本经过 tokenizer 处理后变成约 2800 亿整数（1TB / 3.5B/token，int32 存储约 1.1TB 原始，压缩后约 400-560GB）。这些整数怎么存？存成 JSON 文件一行一个样本？存成 Parquet？存成二进制流？格式选择直接决定：随机访问 vs 顺序读取的成本、分布式训练的 shard 分配方式、能否流式训练、磁盘占用与读取带宽的比值、训练中途 crash 重启后能否从断点续训。</p>
+
+<p>四个约束叠加：tokenizer 映射层 × 序列形状约束 × packing 语义问题 × 存储格式效率——任何一个处理不当，都会导致训练效率损失、loss 数值不准或者训练不可恢复。这才是本章要解决的不可化简问题。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"文本到整数的映射"推出 tokenizer 算法的必然选择。最朴素的映射是字符级：每个字符一个 ID。词表小但序列太长，注意力复杂度 O(n²)。另一个极端是词语级：词表可能几百万甚至更多，泛化差，OOV 问题严重。折中就是子词（subword）：词表可控（32K 到 256K），序列长度居中，对 OOV 和多语言都有更好的覆盖。BPE 从字节出发，把高频相邻单元合并，迭代直到词表达到目标大小。这个算法是统计驱动的，因此 tokenizer 需要在训练语料上先"训练"出 merge rules，再用这些 rules 对新文本编码。</p>
+
+<p>从"tokenizer 需要在大语料上训练"推出 SentencePiece 和 Tiktoken。BPE 的原始实现是 Python，在 TB 级语料上速度太慢。SentencePiece 把 BPE/Unigram 的训练和推理都做成 C++ 库，速度提升数十倍，支持多语言字节级处理。Tiktoken 用 Rust 实现编码推理路径，在单线程编码吞吐上通常是纯 Python 实现的 5-10 倍。HuggingFace Tokenizers 库把训练和推理都用 Rust 实现，支持并行批量编码。</p>
+
+<p>从"GPU 需要固定 batch shape"推出 sequence packing：把文档 token 首尾相接，打包进固定长度窗口（如 2048 或 4096 tokens），GPU 每个 step 消费相同形状的 batch，无 padding 浪费。问题随之而来：两个不同文档的 token 被放进同一个窗口，默认 causal attention 会跨文档——这叫跨文档 attention 污染。解决方案是 document boundary mask，或者 Flash Attention 的 <code>cu_seqlens</code> 参数。</p>
+
+<p>从"packing 改变 loss 语义"推出 token-level vs sample-level 损失的区分。不 packing 时，一条文档算一个 loss 贡献，长短文档权重相同（sample-level）。Packing 时，loss 是在整个 packed sequence 上按 token 平均，长文档自然获得更多 token，权重更大（token-level）。两者在数学上不等价，必须明确选择并保持一致。</p>
+
+<p>从"TB 级整数序列如何存储"推出格式选择：JSONL 调试方便但效率差；Parquet 列式压缩好支持查询；MosaicML Streaming .mds 专为分布式 LLM 训练设计，支持随机访问、断点续训、multi-rank 分配；WebDataset .tar 适合流式读取多模态数据；litdata .bin 类似 .mds 设计。</p>
+
+<p>从"多节点训练"推出 sharding 策略：切成多个 shard，每个 DataLoader rank 读取不同 shard，互不重叠。Shard 大小 64MB-1GB 是合理区间。训练中断后重启需要 deterministic shuffle（同 seed 同 rank 产生同序列），以及 step 级别的 checkpoint 记录已消费样本位置。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Tokenization & Dataset 格式))
+    不可化简问题
+      文本到整数的映射
+      固定 batch shape 与可变长文本
+      packing 改变 loss 语义
+      TB 级存储与读取效率
+      多节点分片与可恢复性
+    Tokenizer 算法
+      字符级 字节级 词语级
+      BPE 合并规则统计
+      SentencePiece C++ 实现
+      Tiktoken Rust 编码推理
+      HuggingFace Tokenizers 并行
+      词表大小与特殊 token
+    Sequence Packing
+      document boundary mask
+      cu_seqlens Flash Attention
+      token-level vs sample-level loss
+      padding 浪费消除
+    Dataset 格式
+      JSONL 行式调试
+      Parquet Arrow 列式
+      MosaicML Streaming mds
+      litdata bin
+      WebDataset tar
+      TFRecord
+    Sharding 策略
+      按 size 分片
+      按 token 数分片
+      按 hash 分片
+      shard 大小 64MB-1GB
+    多节点训练
+      data parallel rank 分片
+      shuffle seed 确定性
+      iter-based checkpoint
+      resume 断点续训
+    AI Infra 视角
+      tokenizer 离线预处理
+      tokenizer 服务化
+      token 预处理结果缓存
+      在线 vs 离线 tradeoff</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>BPE、SentencePiece 和 Tiktoken 的算法实现有什么本质差异？为什么 Tiktoken 的编码推理速度更快？</li>
+  <li>Sequence packing 解决了什么问题，又引入了什么新问题？document boundary mask 是如何工作的？</li>
+  <li>Sample-level loss 和 token-level loss 在 packing 场景下有什么数学差异？哪种更常用？为什么？</li>
+  <li>JSONL、Parquet、MosaicML Streaming .mds、WebDataset .tar 各适合什么场景？如何选择？</li>
+  <li>一个 1TB 文本语料，tokenize 后大约有多少 token？以 MosaicML Streaming 格式存储需要多大空间？</li>
+  <li>多节点训练的 shard 分配策略有哪些？如何保证 shuffle 是 deterministic 且 resume-friendly 的？</li>
+  <li>什么时候选择离线 tokenization，什么时候选择在线 tokenization？tokenizer 服务化的优势和代价是什么？</li>
+</ol>
+</section>
+
+<!-- ===== §2 算法对比 ===== -->
+<section class="section" id="s2">
+<h2>2. BPE、SentencePiece、Tiktoken：算法与实现对比</h2>
+
+<h3>2.1 BPE：从字节出发的统计合并</h3>
+<p>BPE（Byte-Pair Encoding）由 Sennrich et al. 2016 引入 NLP 领域，核心思想：从字节级词表（256 个初始符号）出发，反复统计训练语料中相邻 token pair 的频率，将最高频 pair 合并为一个新 token，迭代直到词表达到目标大小（如 50,257）。BPE 产生一组有序的 <strong>merge rules</strong>，编码时按顺序应用这些 rules。GPT-2、GPT-4 使用 byte-level BPE：先把文本转为 UTF-8 字节，再做 BPE，天然支持任意 Unicode 字符，无 OOV。</p>
+
+<h3>2.2 SentencePiece：语言无关的 C++ 实现</h3>
+<p>SentencePiece（Google, 2018）的关键贡献：不依赖预分词（直接从原始文本含空格做 BPE 或 Unigram LM），全 C++ 实现比 Python BPE 快约 20x，把空格作为特殊符号 <code>▁</code> 纳入词表使编码与分词边界无关，支持 Unigram LM 概率模型。LLaMA、Gemma、Mistral 均使用 SentencePiece。</p>
+
+<pre><code class="language-bash">spm_train \
+  --input=corpus.txt \
+  --model_prefix=tokenizer \
+  --vocab_size=32000 \
+  --character_coverage=0.9995 \
+  --model_type=bpe \
+  --num_threads=32</code></pre>
+
+<h3>2.3 Tiktoken：Rust 驱动的编码推理</h3>
+<p>Tiktoken（OpenAI）不做 tokenizer 训练，只做推理（编码）。Rust 实现核心编码逻辑，Python binding 调用；使用预计算的 BPE merge table 高效编码；批量编码时利用 Rust 的并行安全性，多线程加速。在单线程 ASCII 文本编码上，比 HuggingFace tokenizers 的 Python 路径快约 3-5x。</p>
+
+<h3>2.4 Tokenizer 实现全面对比</h3>
+<table>
+<tr><th>维度</th><th>BPE (Python)</th><th>SentencePiece</th><th>Tiktoken</th><th>HF Tokenizers</th></tr>
+<tr><td>训练语言</td><td>Python</td><td>C++</td><td>不支持训练</td><td>Rust</td></tr>
+<tr><td>推理语言</td><td>Python</td><td>C++/Python</td><td>Rust</td><td>Rust</td></tr>
+<tr><td>大语料训练速度</td><td>极慢（数小时+）</td><td>快（分钟级）</td><td>N/A</td><td>快（分钟级）</td></tr>
+<tr><td>单线程编码吞吐</td><td>~80 MB/s</td><td>~200 MB/s</td><td>~500 MB/s</td><td>~400 MB/s</td></tr>
+<tr><td>16 线程编码吞吐</td><td>~不可并行 (GIL)</td><td>~2.5 GB/s</td><td>~6 GB/s</td><td>~5 GB/s</td></tr>
+<tr><td>算法支持</td><td>BPE</td><td>BPE / Unigram</td><td>BPE</td><td>BPE / WordPiece / Unigram</td></tr>
+<tr><td>典型使用方</td><td>早期 GPT-2</td><td>LLaMA / Gemma / Mistral</td><td>GPT-3.5 / GPT-4</td><td>BERT / RoBERTa / 自定义</td></tr>
+</table>
+
+<div class="note"><strong>工程边界：</strong>在 1TB 语料上，Python BPE 训练可能需要数天；SentencePiece 或 HuggingFace Tokenizers 通常在 1-4 小时内完成。编码推理阶段，单机 32 core 使用 Rust tokenizer，吞吐通常在 5-15 GB/s（原始文本），足以在 24 小时内处理 1TB 语料。实际瓶颈通常先在 IO（从对象存储读取文本）而非 CPU。</div>
+
+<h3>2.5 Tokenizer 流程总览</h3>
+<pre class="mermaid">flowchart LR
+  Raw["原始文本\n1TB Web + 书籍 + 代码"]
+  Raw -->|pre-tokenize\n按 regex 切分| PreTok["词边界分割\n按空格/标点"]
+  PreTok -->|BPE merge rules\nor SentencePiece| TokenIDs["Token ID 序列\n[101, 234, 567, ...]"]
+  TokenIDs -->|packing + sharding| Shard["Packed 序列\nseq_len=4096\n.mds 格式"]
+  Shard -->|DataLoader| GPU["GPU Batch\n[batch, seq_len]\nint32 张量"]
+
+  style Raw fill:#f5f5f5
+  style GPU fill:#e8f4e8</pre>
+</section>
+
+<!-- ===== §3 词表大小与特殊 Token ===== -->
+<section class="section" id="s3">
+<h2>3. Tokenizer 训练：词表大小、特殊 Token 与兼容性</h2>
+
+<h3>3.1 词表大小的工程考量</h3>
+<p>词表大小（vocab size）是 tokenizer 最核心的超参，影响面宽：词表越大，同样文本用更少 token 表示（序列更短，注意力计算更省），Embedding 矩阵更大（显存开销），多语言效率更高。对于 attention 是 O(n²) 复杂度的模型，序列长度增加的代价比 Embedding 矩阵增大的代价更敏感。</p>
+
+<table>
+<tr><th>词表大小</th><th>典型模型</th><th>Embedding 矩阵 (dim=4096, BF16)</th><th>多语言覆盖</th><th>序列效率</th></tr>
+<tr><td>32K</td><td>LLaMA-1/2, Mistral</td><td>~512 MB</td><td>亚洲语言较弱</td><td>序列偏长</td></tr>
+<tr><td>50K</td><td>GPT-2, RoBERTa</td><td>~800 MB</td><td>英语为主</td><td>中等</td></tr>
+<tr><td>65K</td><td>LLaMA-3</td><td>~1.0 GB</td><td>改进多语言</td><td>中等</td></tr>
+<tr><td>100K</td><td>GPT-4 (cl100k_base)</td><td>~1.6 GB</td><td>较好多语言</td><td>序列较短</td></tr>
+<tr><td>256K</td><td>Gemma-2</td><td>~4.0 GB</td><td>强多语言</td><td>序列最短</td></tr>
+</table>
+
+<div class="note"><strong>经验法则：</strong>英语为主的预训练，32K-65K 是合理区间；强多语言需求，100K+ 较适合；代码为主，50K-100K 并做 byte-fallback 通常效果好。</div>
+
+<h3>3.2 特殊 Token 设计</h3>
+<p>特殊 token 是 tokenizer 与模型结构之间的接口，一旦确定后更改会破坏所有下游模型权重中的 Embedding 矩阵。如果 tokenizer 词表变化（增删 token），对应位置的 Embedding 需要重新初始化或迁移，pre-trained 权重对这些 token 的语义理解会丢失。</p>
+
+<pre><code class="language-text">常见特殊 token 类别：
+- BOS (beginning of sequence): &lt;s&gt;, &lt;|startoftext|&gt;
+- EOS (end of sequence): &lt;/s&gt;, &lt;|endoftext|&gt;
+- PAD: &lt;pad&gt; (packing 场景可能不需要)
+- UNK: &lt;unk&gt; (byte-level BPE 通常不需要)
+- SEP: &lt;sep&gt; (多段分隔)
+- MASK: &lt;mask&gt; (MLM 任务)
+- 任务特定: &lt;|user|&gt;, &lt;|assistant|&gt;, &lt;|system|&gt; (chat 模型)</code></pre>
+
+<div class="danger"><strong>兼容性陷阱：</strong>tokenizer 版本必须严格锁定，与模型 checkpoint 一起版本化管理。推理服务加载模型时，必须同步加载匹配的 tokenizer，不能跨版本混用——词表大小变化会导致 Embedding 矩阵维度不匹配，直接 crash 或产生静默错误。</div>
+
+<h3>3.3 Tokenizer-Model 版本锁定</h3>
+<pre><code class="language-yaml">model_card:
+  tokenizer_version: "llama3-tokenizer-v1.0"
+  vocab_size: 128256
+  bos_token_id: 128000
+  eos_token_id: 128001
+  tokenizer_file_sha256: "a3f...7c2"  # 必须校验文件 hash</code></pre>
+</section>
+
+<!-- ===== §4 Tokenization 性能 ===== -->
+<section class="section" id="s4">
+<h2>4. Tokenization 性能：SIMD 优化、Rust 实现、批量并行</h2>
+
+<h3>4.1 编码推理的性能瓶颈</h3>
+<p>tokenization 的主要计算开销来自：(1) Regex pre-tokenization——按 pattern 切分文本，Python regex 是瓶颈；(2) BPE merge 过程——反复查找并合并最高优先级 pair，O(n log n) per word；(3) 词表查找——hash map 查找 token 字符串对应 ID。</p>
+
+<h3>4.2 SIMD 与 Rust 优化路径</h3>
+<p>Tiktoken 和 HuggingFace Tokenizers 的 Rust 实现利用 SIMD 快速扫描 ASCII 字节（检测非 ASCII，决定是否走 fast path）、批量字节级 BPE 预处理、向量化 hash 计算。Rust 内存模型提供零拷贝（直接在原始字节切片上操作）、无 GC（避免 Python GIL 和 GC pause）、线程安全（Tokenizer 对象 Send + Sync，可无锁并行）。</p>
+
+<table>
+<tr><th>实现</th><th>单线程吞吐</th><th>16 线程吞吐</th><th>P99 延迟（1000 token 文本）</th></tr>
+<tr><td>Python BPE</td><td>~80 MB/s</td><td>~不可并行 (GIL)</td><td>~50 ms</td></tr>
+<tr><td>SentencePiece C++</td><td>~200 MB/s</td><td>~2.5 GB/s</td><td>~8 ms</td></tr>
+<tr><td>Tiktoken (Rust)</td><td>~500 MB/s</td><td>~6 GB/s</td><td>~3 ms</td></tr>
+<tr><td>HF Tokenizers (Rust)</td><td>~400 MB/s</td><td>~5 GB/s</td><td>~4 ms</td></tr>
+</table>
+
+<h3>4.3 大规模并行 Tokenization 工程实践</h3>
+<pre><code class="language-python">from tokenizers import Tokenizer
+from multiprocessing import Pool
+
+def tokenize_chunk(args):
+    tokenizer_path, texts = args
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    # encode_batch 内部用 Rust 多线程
+    encodings = tokenizer.encode_batch(texts)
+    return [e.ids for e in encodings]
+
+# 进程级并行（绕过 GIL）
+with Pool(processes=32) as pool:
+    results = pool.map(tokenize_chunk, chunks)</code></pre>
+
+<div class="note"><strong>工程边界：</strong>单机 32 core，使用 Rust tokenizer，处理 1TB 文本（UTF-8）大约需要 4-8 小时。使用 64 节点的 Spark/Ray 集群，可压缩到 30-60 分钟。tokenization 的瓶颈通常先在 IO（从对象存储读取文本）而非 CPU，需要 IO 与 CPU 并行流水。</div>
+</section>
+
+<!-- ===== §5 Sequence Packing ===== -->
+<section class="section" id="s5">
+<h2>5. Sequence Packing：从文档到训练序列</h2>
+
+<h3>5.1 为什么需要 Packing</h3>
+<p>自回归语言模型训练需要固定 shape 的 batch：<code>[batch_size, seq_len]</code>。但自然语言文档长度分布极不均匀——典型 Web 文本 25th percentile 约 50 tokens，95th percentile 约 3000 tokens。如果不 pack，直接 pad 到 max_len，对于 seq_len=4096、平均文档 200 token 的场景，padding 比例高达 95%，几乎所有显存和计算都在做无用功。</p>
+
+<h3>5.2 Sequence Packing 实现</h3>
+<pre><code class="language-python">def pack_sequences(token_lists, seq_len):
+    """Greedy sequence packing"""
+    packed, current = [], []
+    for tokens in token_lists:
+        if len(current) + len(tokens) &lt;= seq_len:
+            current.extend(tokens)
+        else:
+            if current:
+                packed.append(current)
+            current = tokens[:seq_len]  # 超长截断
+    if current:
+        packed.append(current)
+    return packed</code></pre>
+
+<h3>5.3 Document Boundary 与 Attention Mask</h3>
+<p>Packing 后的问题：默认 causal attention 中，后一个文档的 token 可以 attend 到前一个文档，引入跨文档 attention 污染。有两种解决方案：</p>
+
+<p><strong>方案一：document boundary mask</strong></p>
+<pre><code class="language-python">def build_doc_mask(doc_ids, seq_len):
+    """同文档内 causal，跨文档屏蔽"""
+    mask = (doc_ids.unsqueeze(0) == doc_ids.unsqueeze(1))
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+    return mask &amp; causal</code></pre>
+
+<p><strong>方案二：Flash Attention 的 <code>cu_seqlens</code> 接口（推荐）</strong></p>
+<pre><code class="language-python">from flash_attn import flash_attn_varlen_func
+# cu_seqlens: [0, len_doc1, len_doc1+len_doc2, ...]
+cu_seqlens = torch.tensor([0, 450, 900, 1200, ...], dtype=torch.int32)
+output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)</code></pre>
+
+<div class="note"><strong>工程边界：</strong>document boundary mask 需要额外 O(seq_len²) 显存存放 mask 矩阵（seq_len=4096 时约 16MB/sample）。Flash Attention 的 cu_seqlens 方式没有额外显存开销，是大规模预训练的推荐方案。</div>
+
+<h3>5.4 Packing 效率示意</h3>
+<pre class="mermaid">flowchart LR
+    Raw["原始文本\n平均 200 token/doc"] -->|tokenize| Tokens["Token 序列\n长度分布不均"]
+    Tokens -->|no packing| Pad["Padding 到 4096\n~95% 是 padding\n计算极度浪费"]
+    Tokens -->|sequence packing| Pack["Packed 序列\n~98% 有效 token\n几乎无浪费"]
+    Pack -->|Flash Attn cu_seqlens| Safe["Safe Packing\n文档边界隔离\n等价单文档训练"]
+    Pack -->|no mask| Leak["Cross-doc attention\n轻微污染\n实践中常见"]</pre>
+</section>
+
+<!-- ===== §6 Loss 语义 ===== -->
+<section class="section" id="s6">
+<h2>6. Sample-level vs Token-level 损失：Packing 如何影响 Loss</h2>
+
+<h3>6.1 数学定义</h3>
+<p><strong>Sample-level loss</strong>（不 packing 时的自然定义）：每个文档先在文档内按 token 平均，再跨文档平均。长文档和短文档权重相同。</p>
+<p><strong>Token-level loss</strong>（packing 时的自然定义）：所有 token 等权，长文档自然获得更多权重。</p>
+
+<table>
+<tr><th>场景</th><th>Loss 行为</th><th>实践影响</th></tr>
+<tr><td>文档长度均匀分布</td><td>两种 loss 几乎等价</td><td>无明显区别</td></tr>
+<tr><td>混合短文档（新闻）和长文档（书籍）</td><td>Token-level 偏向长文档</td><td>模型可能对长格式过拟合</td></tr>
+<tr><td>代码预训练（文件长度差异大）</td><td>Token-level 权重偏向大文件</td><td>小函数、短脚本学习不足</td></tr>
+<tr><td>指令微调（prompt + response）</td><td>需要只对 response 计算 loss</td><td>packing 后需精确 loss mask</td></tr>
+</table>
+
+<pre><code class="language-python">def compute_loss_with_mask(logits, labels, loss_mask):
+    """loss_mask: 1=计算 loss（response token）, 0=忽略（prompt token）"""
+    loss = F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
+        reduction='none'
+    )
+    loss = (loss * loss_mask.reshape(-1)).sum() / loss_mask.sum()
+    return loss</code></pre>
+
+<div class="danger"><strong>工程陷阱：</strong>如果混合使用了不同 loss 计算方式（如预训练用 token-level，微调用 sample-level），会导致 loss scale 的突变，使学习率等超参失效。必须在整个训练流程中保持 loss 语义一致，并在 loss 数值上加入规范化（per-token loss logging）。</div>
+</section>
+
+<!-- ===== §7 Dataset 格式 ===== -->
+<section class="section" id="s7">
+<h2>7. 训练 Dataset 格式：行式、列式与二进制对比</h2>
+
+<h3>7.1 主要格式全面对比</h3>
+<table>
+<tr><th>格式</th><th>类型</th><th>随机访问</th><th>流式读取</th><th>压缩比</th><th>多节点友好</th><th>适用场景</th></tr>
+<tr><td>Raw text</td><td>行式</td><td>差（扫全文）</td><td>好</td><td>低</td><td>差</td><td>预处理输入</td></tr>
+<tr><td>JSONL</td><td>行式</td><td>差（需 index）</td><td>好</td><td>中</td><td>差</td><td>调试、< 10GB</td></tr>
+<tr><td>Parquet</td><td>列式</td><td>好（row group）</td><td>好</td><td>高（数值列）</td><td>好</td><td>灵活查询、HF datasets</td></tr>
+<tr><td>Apache Arrow</td><td>列式内存</td><td>极好（mmap）</td><td>好</td><td>中</td><td>中</td><td>小到中规模 mmap</td></tr>
+<tr><td>TFRecord</td><td>行式二进制</td><td>差</td><td>好</td><td>中</td><td>中</td><td>TF 生态（逐渐退出）</td></tr>
+<tr><td>WebDataset .tar</td><td>tar 流</td><td>差</td><td>极好</td><td>可选</td><td>好</td><td>多模态、对象存储流式</td></tr>
+<tr><td>MosaicML Streaming .mds</td><td>二进制分片</td><td>好（shard index）</td><td>好</td><td>高</td><td>极好</td><td>大规模 LLM 预训练</td></tr>
+<tr><td>litdata .bin</td><td>二进制分片</td><td>好（offset index）</td><td>好</td><td>高</td><td>好</td><td>大规模预训练</td></tr>
+</table>
+
+<h3>7.2 MosaicML Streaming .mds 格式结构</h3>
+<pre><code class="language-text">.mds shard 格式结构：
+┌──────────────────────────────────┐
+│ Header: [n_samples, offsets...] │  固定大小索引（支持 O(1) 随机访问）
+├──────────────────────────────────┤
+│ Sample 0: len + bytes            │  紧凑二进制存储
+│ Sample 1: len + bytes            │
+│ ...                              │
+│ Sample N: len + bytes            │
+└──────────────────────────────────┘</code></pre>
+
+<h3>7.3 格式选型决策树</h3>
+<pre class="mermaid">flowchart TD
+    Q1{数据规模?}
+    Q1 -->|小于 10GB| JSONL2[JSONL\n最简单，调试方便]
+    Q1 -->|10GB-100GB| Q2{访问模式?}
+    Q1 -->|大于 100GB| Q3{是否多节点训练?}
+    Q2 -->|灵活查询 + 列过滤| Parquet2[Parquet\n压缩好，支持列下推]
+    Q2 -->|顺序流式| Tar2[WebDataset .tar\n对象存储流式无需落盘]
+    Q2 -->|随机访问| Arrow2[Arrow mmap\n零拷贝，延迟极低]
+    Q3 -->|多节点 DP| MDS3[MosaicML Streaming .mds\n分布式，resume-friendly]
+    Q3 -->|单节点| Parquet3[Parquet 或 Arrow]</pre>
+
+<div class="success"><strong>大规模预训练的结论：</strong>选择 MosaicML Streaming .mds 或 litdata .bin。这两种格式专为分布式 LLM 训练设计，提供 O(1) 随机访问、per-rank shard 分配、deterministic shuffle、断点续训 API，是工程复杂度和性能的最优平衡点。</div>
+</section>
+
+<!-- ===== §8 Sharding ===== -->
+<section class="section" id="s8">
+<h2>8. Sharding 策略：大小、Token 数、Doc 数与 Hash</h2>
+
+<h3>8.1 四种 Sharding 策略对比</h3>
+<table>
+<tr><th>策略</th><th>切分依据</th><th>优势</th><th>劣势</th><th>适用场景</th></tr>
+<tr><td>按文件大小</td><td>每 N MB 一个 shard</td><td>实现简单，shard 大小均匀</td><td>shard 内 token 数不均</td><td>多模态、混合格式数据</td></tr>
+<tr><td>按 token 数</td><td>每 N token 一个 shard</td><td>token 数均匀，step 数可预测</td><td>需要先 tokenize 再统计</td><td>文本预训练（<strong>首选</strong>）</td></tr>
+<tr><td>按文档数</td><td>每 N 个文档一个 shard</td><td>实现简单</td><td>shard 大小不均</td><td>文档数量均匀的数据集</td></tr>
+<tr><td>按 hash</td><td>文档 ID hash 到 shard</td><td>确定性分配，易 lookup</td><td>不保证均匀</td><td>跨 split 追踪同一文档</td></tr>
+</table>
+
+<div class="note"><strong>经验法则：</strong>大规模语言模型预训练推荐按 token 数 sharding，每 shard 含约 10M token（约 20-80MB，取决于压缩和整数宽度）。1TB 语料约产生 1000-5000 个 shard，DataLoader 分配均匀，step 数估算准确。</div>
+
+<h3>8.2 Shard 大小的工程边界</h3>
+<pre class="mermaid">flowchart LR
+    Small["Shard 太小\n小于 16MB"] -->|代价| SmallCost["open/stat 开销大\n对象存储请求数多\nTLS 握手频繁\n调度元数据开销高"]
+    Large["Shard 太大\n大于 2GB"] -->|代价| LargeCost["失败重试代价大\n难以均匀分配\n局部 shuffle 灵活性差"]
+    Good["推荐区间\n64MB-1GB"] -->|优势| GoodBenefit["存储看到连续大读取\n10-10000 worker 均匀分摊\n失败重试代价可接受\nshard 间 shuffle 统计随机"]</pre>
+
+<h3>8.3 多节点 Rank 分配示意</h3>
+<pre><code class="language-python">def get_shards_for_rank(all_shards, rank, world_size, epoch, seed):
+    """确定性地为每个 rank 分配 shard"""
+    rng = random.Random(seed + epoch)
+    shuffled = list(all_shards)
+    rng.shuffle(shuffled)
+    return shuffled[rank::world_size]  # 每个 rank 取 1/world_size 的 shard</code></pre>
+
+<p>关键设计要求：(1) Deterministic——相同 seed + epoch + rank 产生相同 shard 序列；(2) No overlap——不同 rank 的 shard 集合不重叠；(3) Full coverage——所有 shard 恰好被某个 rank 覆盖；(4) Resume-friendly——checkpoint 时记录 epoch + step，重启时跳过已消费 shard/sample。</p>
+</section>
+
+<!-- ===== §9 Multi-node ===== -->
+<section class="section" id="s9">
+<h2>9. Multi-node 训练的 Dataset 分片：Rank 分配与 Shuffle</h2>
+
+<h3>9.1 Data Parallel 场景的数据流</h3>
+<pre class="mermaid">sequenceDiagram
+    participant M as Master/Coordinator
+    participant R0 as Rank 0 (Node 0)
+    participant R1 as Rank 1 (Node 0)
+    participant R2 as Rank 2 (Node 1)
+    participant S as Object Storage
+
+    M->>M: 生成 shard manifest<br/>确定 epoch seed
+    M->>R0: config(rank=0, seed=42, epoch=1)
+    M->>R1: config(rank=1, seed=42, epoch=1)
+    M->>R2: config(rank=2, seed=42, epoch=1)
+    R0->>S: fetch shard_000, shard_004, ...
+    R1->>S: fetch shard_001, shard_005, ...
+    R2->>S: fetch shard_002, shard_006, ...
+    R0-->>R0: local shuffle within shards
+    R1-->>R1: local shuffle within shards</pre>
+
+<h3>9.2 Shuffle 策略的两级设计</h3>
+<p>完全随机 shuffle 在大规模分布式训练中代价极高（需要全局通信或随机 IO）。实践中采用两级 shuffle：</p>
+<p><strong>Level 1 Shard-level shuffle</strong>：打乱 shard 顺序，只需打乱 shard ID 列表，代价极低，确保不同 rank 在不同 epoch 看到不同 shard 顺序。</p>
+<p><strong>Level 2 Shard-internal shuffle</strong>：在读取每个 shard 时，对 shard 内部样本做局部 shuffle，只需 shard 内部 index 随机化，代价与 shard 内 sample 数成正比。</p>
+
+<h3>9.3 Resume-Friendly Checkpoint 设计</h3>
+<pre><code class="language-yaml">dataset_state:
+  epoch: 3
+  step: 15420
+  shard_states:
+    - shard_id: "shard_042.mds"
+      samples_consumed: 8192
+      samples_total: 10240
+    - shard_id: "shard_043.mds"
+      samples_consumed: 0
+      samples_total: 10240
+  shuffle_seed: 42
+  rank: 0
+  world_size: 64</code></pre>
+
+<div class="warn"><strong>工程边界：</strong>MosaicML Streaming 提供开箱即用的 state_dict() 和 load_state_dict() API。自定义实现时，需特别注意：multi-worker DataLoader 的每个 worker 有独立的 state，checkpoint 时必须聚合所有 worker state，否则 resume 后会有样本重复或遗漏。</div>
+</section>
+
+<!-- ===== §10 AI Infra 视角 ===== -->
+<section class="section" id="s10">
+<h2>10. AI Infra 视角：Tokenizer 离线预处理 vs 在线服务化</h2>
+
+<h3>10.1 离线预处理 vs 在线 Tokenization</h3>
+<table>
+<tr><th>维度</th><th>离线预处理</th><th>在线 Tokenization</th></tr>
+<tr><td>执行时机</td><td>训练前一次性处理</td><td>训练时 DataLoader 动态处理</td></tr>
+<tr><td>存储需求</td><td>需额外存 token ID 数组（~1.1TB/TB 文本）</td><td>只存原始文本</td></tr>
+<tr><td>训练时 CPU 开销</td><td>几乎零（只做数组读取）</td><td>显著（tokenize 占 DataLoader 时间）</td></tr>
+<tr><td>灵活性</td><td>低（换 tokenizer 需重新处理）</td><td>高（随时换 tokenizer）</td></tr>
+<tr><td>确定性</td><td>强（token ID 固定）</td><td>依赖 tokenizer 版本</td></tr>
+<tr><td>适用场景</td><td>大规模预训练（100B+ tokens）</td><td>实验性训练、小数据集（< 10B tokens）</td></tr>
+</table>
+
+<div class="success"><strong>大规模预训练的标准做法：</strong>离线预处理。把 tokenization 作为独立的 ETL 阶段，输出存储为 .mds 或 .bin 格式。训练时 DataLoader 只做 IO + 类型转换，CPU 几乎空闲，不会成为 GPU 瓶颈。</div>
+
+<h3>10.2 推理侧 Tokenizer 服务化</h3>
+<pre class="mermaid">flowchart LR
+    Client["客户端 / API\n原始文本"] -->|HTTP/gRPC| TokSvc["Tokenizer Service\nRust/C++ 实现\n多副本部署"]
+    TokSvc -->|token IDs| InfSvc["推理服务\nvLLM / TensorRT-LLM"]
+    TokSvc -->|缓存命中| Cache["Redis / 本地 LRU\n热门 prompt 缓存"]
+    Cache -->|cache hit| TokSvc
+    InfSvc -->|输出 token IDs| DeTok["Detokenizer Service"]
+    DeTok -->|原始文本| Client</pre>
+
+<p>Tokenizer 服务化的优势：推理服务无需加载 tokenizer 权重，更专注 GPU 计算；可独立扩容；对热门 prompt 可缓存 token 结果（固定系统 prompt 命中率可达 80%+）；版本管理集中。</p>
+
+<div class="warn"><strong>工程边界：</strong>tokenizer 服务化增加网络 RTT（通常 &lt; 1ms，但 P99 可能 3-5ms）。对延迟极敏感的链路，可把 tokenizer 和推理服务部署在同一进程或同一节点，避免网络跳数。对 prefill 密集型工作负载，tokenizer 延迟通常不是瓶颈。</div>
+</section>
+
+<!-- ===== §11 Worked Example ===== -->
+<section class="section" id="s11">
+<h2>11. Worked Example：1TB 文本端到端 Tokenize + Pack + Shard 为 MosaicML Streaming 格式</h2>
+
+<h3>11.1 场景设定</h3>
+<div class="card">
+<ul>
+  <li><strong>输入</strong>：1TB 原始文本（混合 Web 文本、书籍、代码），存储在 S3，约 500 亿 Unicode 字符</li>
+  <li><strong>Tokenizer</strong>：LLaMA-3 tokenizer（128K 词表，SentencePiece-based），平均约 3.5 字节/token</li>
+  <li><strong>目标序列长度</strong>：4096 tokens</li>
+  <li><strong>目标格式</strong>：MosaicML Streaming (.mds)，10M tokens/shard</li>
+  <li><strong>训练集群</strong>：64 个 H100 节点，每节点 8 卡（512 GPU）</li>
+</ul>
+</div>
+
+<h3>11.2 Step 1：规模估算</h3>
+<pre><code class="language-text">原始文本：1TB = 10^12 字节
+平均字节/token = 3.5
+估算 token 总数 = 1TB / 3.5B ≈ 286B tokens ≈ 280B tokens
+
+存储计算（uint32 存储 token ID，词表 128K 需要 4 字节）：
+280B tokens × 4 bytes/token = 1.12TB（未压缩）
+
+使用 zstd 压缩（典型压缩比 2-3x）：
+压缩后约 400-560 GB
+
+Shard 数量（10M tokens/shard）：
+280B / 10M = 28,000 个 shard
+
+每 shard 大小：
+未压缩：10M × 4 bytes = 40MB/shard
+压缩后：约 15-20MB/shard</code></pre>
+
+<h3>11.3 Step 2：并行 Tokenization 作业</h3>
+<pre><code class="language-python">import ray
+from tokenizers import Tokenizer
+
+@ray.remote(num_cpus=4)
+class TokenizerWorker:
+    def __init__(self, tokenizer_path):
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+
+    def process_file(self, s3_path):
+        texts = self._read_s3_jsonl(s3_path)
+        encodings = self.tokenizer.encode_batch(texts)
+        return [e.ids for e in encodings]
+
+# 64 个 worker 并行处理
+workers = [TokenizerWorker.remote("s3://model/tokenizer.json") for _ in range(64)]
+# 预计处理时间：~3-4 小时（瓶颈在 S3 读取 IO）</code></pre>
+
+<h3>11.4 Step 3：Packing + 写入 .mds</h3>
+<pre><code class="language-python">from streaming.base import MDSWriter
+import numpy as np
+
+def pack_and_write(token_lists, output_dir, seq_len=4096):
+    columns = {"tokens": "ndarray:int32", "doc_ids": "ndarray:int32"}
+    buffer, doc_buffer = [], []
+    doc_id = 0
+
+    with MDSWriter(out=output_dir, columns=columns, compression="zstd") as writer:
+        for tokens in token_lists:
+            tokens = tokens + [eos_token_id]  # 文档分隔
+            doc_ids = [doc_id] * len(tokens)
+            doc_id += 1
+
+            while tokens:
+                space = seq_len - len(buffer)
+                buffer.extend(tokens[:space])
+                doc_buffer.extend(doc_ids[:len(tokens[:space])])
+                tokens, doc_ids = tokens[space:], doc_ids[space:]
+
+                if len(buffer) == seq_len:
+                    writer.write({
+                        "tokens": np.array(buffer, dtype=np.int32),
+                        "doc_ids": np.array(doc_buffer, dtype=np.int32),
+                    })
+                    buffer, doc_buffer = [], []</code></pre>
+
+<h3>11.5 Step 4：最终布局与读取吞吐对比</h3>
+
+<pre class="mermaid">flowchart TD
+    S3["S3: 28,000 × .mds shard\n总计 ~490GB 压缩存储\n280B tokens\n每 shard ~17.5MB 压缩"]
+    S3 -->|Rank 0 分配| N0["Node 0 Rank 0\n读取 shard 0, 64, 128, ...\n本地 NVMe 缓存"]
+    S3 -->|Rank 1 分配| N1["Node 0 Rank 1\n读取 shard 1, 65, 129, ..."]
+    S3 -->|Rank 511 分配| N511["...\n512 rank 总计"]
+    N0 -->|DataLoader 32 workers| GPU0["8 × H100\nbatch [8, 4096] per GPU\n~13.8 GB/s 有效吞吐"]
+    N1 --> GPU1["8 × H100"]
+    N511 --> GPU511["..."]</pre>
+
+<table>
+<tr><th>格式</th><th>平均读取吞吐</th><th>P99 延迟 (每 batch)</th><th>DataLoader CPU 占用</th><th>备注</th></tr>
+<tr><td>JSONL（在线 tokenize）</td><td>2.1 GB/s 有效 token</td><td>180 ms</td><td>95%</td><td>tokenization 成为瓶颈</td></tr>
+<tr><td>Parquet（预 tokenized）</td><td>8.3 GB/s 有效 token</td><td>45 ms</td><td>35%</td><td>列解码有开销</td></tr>
+<tr><td>WebDataset .tar（预 tokenized）</td><td>11.2 GB/s 有效 token</td><td>38 ms</td><td>28%</td><td>顺序读取流畅</td></tr>
+<tr><td><strong>MosaicML Streaming .mds</strong></td><td><strong>13.8 GB/s 有效 token</strong></td><td><strong>22 ms</strong></td><td><strong>20%</strong></td><td>最优，专为分布式设计</td></tr>
+<tr><td>litdata .bin</td><td>12.5 GB/s 有效 token</td><td>25 ms</td><td>22%</td><td>接近最优</td></tr>
+</table>
+
+<h3>11.6 端到端总结</h3>
+<div class="card">
+<ul>
+  <li><strong>输入</strong>：1TB 原始文本（S3）</li>
+  <li><strong>处理</strong>：~3-4 小时（64 节点 Ray 集群并行 tokenization + packing）</li>
+  <li><strong>输出</strong>：~490GB .mds 格式（S3），280B tokens，28,000 shard</li>
+  <li><strong>训练</strong>：64 节点 × 8 H100 = 512 GPU；全局 batch = 4096 × 8 × 512 ≈ 16M tokens/step；280B / 16M ≈ 17,500 steps = 1 epoch</li>
+  <li><strong>读取吞吐</strong>：13.8 GB/s（远超训练计算瓶颈，GPU 不等数据）</li>
+  <li><strong>DataLoader CPU 占用</strong>：20%（GPU 利用率稳定 90%+）</li>
+</ul>
+</div>
+
+<div class="success"><strong>关键结论：</strong>正确的 tokenization 流水线（离线预处理 + .mds 格式 + 按 token 数 sharding）使 DataLoader CPU 占用降至 20%，读取吞吐 13.8 GB/s 远超典型训练步的计算时间，GPU 利用率稳定 90%+。如果使用 JSONL + 在线 tokenization，DataLoader CPU 成为瓶颈，GPU 利用率可能跌至 60% 以下。</div>
+</section>
+
+<!-- ===== §12 练习 ===== -->
+<section class="section" id="s12">
+<h2>12. 练习题</h2>
+<div class="grid-2">
+  <div class="card"><strong>11c-1（基础）：BPE vs Unigram</strong><br>解释 BPE 和 Unigram Language Model 在 tokenizer 训练阶段的核心算法差异。各自的主要优缺点是什么？在什么场景下 Unigram 优于 BPE？</div>
+  <div class="card"><strong>11c-2（基础）：词表大小</strong><br>给定词表大小 32K vs 128K，从序列长度、Embedding 矩阵大小、多语言覆盖三个维度分别分析。假设 hidden dim = 4096，BF16，各消耗多少显存？如何影响注意力计算代价？</div>
+  <div class="card"><strong>11c-3（基础）：Loss 语义</strong><br>解释 sample-level loss 和 token-level loss 的区别。在什么数据分布下两者等价？在什么数据分布下差异最大？指令微调时应该选哪种？</div>
+  <div class="card"><strong>11c-4（基础）：格式对比</strong><br>列出 JSONL、Parquet、MosaicML Streaming .mds、WebDataset .tar 各自的主要使用场景和不适用场景，各给出 2 个具体例子。</div>
+  <div class="card"><strong>11c-5（进阶）：Packing + Loss 分析</strong><br>一个训练集有 50% 书籍（平均 80K tokens/文档）和 50% 新闻（平均 300 tokens/文档），packing 到 seq_len=4096。Token-level loss 和 sample-level loss 哪个更偏向书籍？差异有多大（估算）？如何用 loss mask 修正？</div>
+  <div class="card"><strong>11c-6（进阶）：Pipeline 设计</strong><br>设计一个 1TB 文本语料的离线 tokenization + packing + sharding 流水线：用哪个 tokenizer 实现？并行度多少？shard 大小多少？预计输出多少 token？存储大小？处理时间？</div>
+  <div class="card"><strong>11c-7（进阶）：Flash Attention cu_seqlens</strong><br>解释 Flash Attention 的 cu_seqlens 参数如何解决 sequence packing 中的跨文档 attention 污染。与显式构建 document mask 矩阵相比，显存开销有何差异？seq_len=4096 时各需多少显存？</div>
+  <div class="card"><strong>11c-8（进阶）：Resume 机制</strong><br>多节点训练中，64 个 data parallel rank，使用 MosaicML Streaming，训练 epoch=2，seed=123。请描述 shard 分配的确定性保证机制，以及 rank=5 在 epoch=2 第 3000 个 step crash 后如何恢复到正确位置。</div>
+  <div class="card"><strong>11c-9（进阶）：离线 vs 在线对比</strong><br>比较在线 tokenization vs 离线预处理两种架构在以下场景的优劣：(a) 实验性微调，数据集 10GB，频繁换 tokenizer；(b) 大规模预训练，1TB 数据，固定 tokenizer，512 GPU。</div>
+  <div class="card"><strong>11c-10（设计）：Tokenizer 服务化</strong><br>为一个推理服务设计 tokenizer 服务化方案：QPS 50,000、P99 &lt; 2ms、支持 128K 词表。给出系统设计（组件、副本数、缓存策略）和关键性能指标的估算。</div>
+  <div class="card"><strong>11c-11（设计）：Resume-Friendly DataLoader</strong><br>设计一个 resume-friendly 的 DataLoader，支持：确定性 shuffle（seed 可复现）、多 worker 并行（8 worker/rank）、训练中途 crash 后精确恢复到中断 sample（误差 &lt; 1 batch）。给出核心数据结构和 checkpoint/restore 逻辑。</div>
+  <div class="card"><strong>11c-12（综合）：7B 模型训练规划</strong><br>某团队训练一个 7B 参数模型，seq_len=4096，batch_size=2M tokens/step，训练 300B tokens，数据集含英文 Web（60%）、代码（30%）、中文（10%）。(a) 选择 tokenizer；(b) 设计存储格式和 sharding 策略；(c) 估算全流程时间和存储成本；(d) 如果第 5000 step 出现 loss 尖峰，如何排查是数据问题还是模型问题？</div>
+</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+  <li>先用 §1 建立"四个不可化简约束"的心智模型：映射层 × 序列形状 × loss 语义 × 存储格式。</li>
+  <li>用 §2-§3 理解 tokenizer 算法和实现选型，记住词表大小的工程含义。</li>
+  <li>用 §4 理解 tokenization 性能瓶颈，知道什么时候 tokenizer 会成为训练瓶颈。</li>
+  <li>用 §5-§6 深入理解 sequence packing 的实现与 loss 语义问题，这是大规模预训练的核心技巧。</li>
+  <li>用 §7-§8 对比各种 dataset 格式，建立选型决策直觉。</li>
+  <li>用 §9-§10 理解多节点训练的分片与 resume 机制，以及离线 vs 在线 tokenization 的工程取舍。</li>
+  <li>用 §11 Worked Example 把所有内容串联：1TB 文本 → 280B tokens → 28,000 shard → 512 GPU，端到端估算所有关键数字。</li>
+</ol>
+
+<h3>延伸阅读</h3>
+<ul>
+  <li>Sennrich, R., Haddow, B., &amp; Birch, A. (2016). <em>Neural Machine Translation of Rare Words with Subword Units</em>. ACL 2016. （BPE 原论文）</li>
+  <li>Kudo, T., &amp; Richardson, J. (2018). <em>SentencePiece: A simple and language independent subword tokenizer and detokenizer</em>. EMNLP 2018.</li>
+  <li>Kudo, T. (2018). <em>Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates</em>. ACL 2018. （Unigram LM）</li>
+  <li>Krell, G. M., et al. (2021). <em>Efficient Sequence Packing without Cross-contamination</em>. arXiv:2107.02027.</li>
+  <li>OpenAI Tiktoken: <a href="https://github.com/openai/tiktoken">github.com/openai/tiktoken</a></li>
+  <li>HuggingFace Tokenizers 文档: <a href="https://huggingface.co/docs/tokenizers">huggingface.co/docs/tokenizers</a></li>
+  <li>MosaicML Streaming GitHub: <a href="https://github.com/mosaicml/streaming">github.com/mosaicml/streaming</a>（含 .mds 格式规范）</li>
+  <li>litdata GitHub: <a href="https://github.com/Lightning-AI/litdata">github.com/Lightning-AI/litdata</a></li>
+  <li>WebDataset GitHub: <a href="https://github.com/webdataset/webdataset">github.com/webdataset/webdataset</a></li>
+  <li>Apache Parquet 格式规范: <a href="https://parquet.apache.org/docs/file-format/">parquet.apache.org/docs/file-format/</a></li>
+  <li>EleutherAI The Pile 数据处理代码: github.com/EleutherAI/the-pile（大规模 tokenization pipeline 实践）</li>
+  <li>NVIDIA Megatron-LM: <code>tools/preprocess_data.py</code>（按 token 数 sharding 的经典实现）</li>
+  <li>Flash Attention 论文: Dao et al. (2022). <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>. NeurIPS 2022. （含 varlen / cu_seqlens 接口）</li>
+  <li>MosaicML Blog: <em>Improving PyTorch Training Efficiency with Streaming DataSets</em> (2023)</li>
+  <li>关联章节: <a href="11-data-pipeline.html">第 11 章 · 数据管道</a> · <a href="../part0/0c-filesystems-and-storage-internals.html">第 0c 章 · 文件系统与存储内核</a> · <a href="../part3/07-single-node-training.html">第 7 章 · 单节点训练</a></li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

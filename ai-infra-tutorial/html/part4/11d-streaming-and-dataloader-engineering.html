@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11d 章 · 流式读取与 DataLoader 工程化 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11d" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 11d 章 · 流式读取与 DataLoader 工程化</h1>
+<p class="sub">GPU 不能等数据——从这一句话出发，推导 worker IPC 模型、prefetch 流水线、pin_memory、bucket batching、WebDataset/Streaming/litdata、S3 远端 cache、resume 断点续训到性能诊断的完整工程链路。</p>
+<div class="chips">
+  <span class="chip">DataLoader</span>
+  <span class="chip">prefetch_factor</span>
+  <span class="chip">pin_memory</span>
+  <span class="chip">WebDataset</span>
+  <span class="chip">bucket batching</span>
+  <span class="chip">false sharing</span>
+  <span class="chip">GPU idle</span>
+  <span class="chip">流式读取</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>GPU 每个 training step 消耗 batch 的时间是固定的；DataLoader 必须在这段时间内备好下一个 batch 并完成 H2D 传输。在有限 CPU 核数、有限 IO 带宽、有限主存带宽三重约束下，如何让 GPU 永远不等？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）；Worked Example 展示 LLaMA-7B 调优的完整步骤与 GPU 利用率变化表。</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a href="#s1">第一性原理拆解：DataLoader 工程化</a></li>
+  <li><a href="#s2">DataLoader 的不可化简问题：GPU 不能等数据</a></li>
+  <li><a href="#s3">PyTorch DataLoader 内部实现：worker 进程模型与 IPC 队列</a></li>
+  <li><a href="#s4">IterableDataset vs MapDataset：工程取舍</a></li>
+  <li><a href="#s5">num_workers 调优：CPU 数、内存带宽、进程膨胀</a></li>
+  <li><a href="#s6">pin_memory + non_blocking H2D copy</a></li>
+  <li><a href="#s7">collate_fn 工程化：dynamic batching、padded sequence、bucket batching</a></li>
+  <li><a href="#s8">流式 Dataset：WebDataset、MosaicML Streaming、litdata</a></li>
+  <li><a href="#s9">远端 Dataset：S3 + 本地 Cache、Partial Download</a></li>
+  <li><a href="#s10">大规模训练 DataLoader：Sharded Read 与 Cross-Shard Sample</a></li>
+  <li><a href="#s11">Resume-Friendly DataLoader</a></li>
+  <li><a href="#s12">与 Ray Data / DALI / 推理 DataLoader 的对比</a></li>
+  <li><a href="#s13">性能诊断：GPU Idle 周期与 Host-Side Bottleneck</a></li>
+  <li><a href="#s14">Worked Example：LLaMA-7B DataLoader 从瓶颈到非瓶颈</a></li>
+  <li><a href="#s15">工程建议与常见陷阱</a></li>
+  <li><a href="#s16">练习题</a></li>
+  <li><a href="#s17">参考资料与学习路线</a></li>
+</ol>
+</section>
+
+<!-- §1 第一性原理拆解 -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：DataLoader 工程化</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>把 prefetch_factor、pin_memory、WebDataset、DALI 这些名字先拿掉，DataLoader 工程化要解决的不可化简问题只有一个：<strong>GPU 不能等数据</strong>。</p>
+<p>这句话比听起来更严苛。现代 A100/H100 能在 1-5ms 内完成一个 batch 的前向+后向计算；如果下一个 batch 在这段时间内没有出现在 GPU 显存里，GPU 就空转（SM utilization 下降）。GPU 空转不是简单的"慢一点"——它是固定成本的浪费：租用一张 H100 每小时数美元，每个 idle 周期都在消耗真实金钱却没有产出梯度。</p>
+<p>让 GPU 始终有"满足条件的下一个 batch"，听起来只是"快点把数据送过来"，但实际上是在有限 CPU 核数、有限 IO 带宽、有限主存带宽这三个物理约束下，协调以下五个不同时间尺度的动作：<strong>磁盘读取、CPU 解码/预处理、IPC 传输、H2D 搬运</strong>以及<strong>GPU 计算</strong>。任何一个环节成为瓶颈，GPU 都会等。</p>
+<p>不可化简性来自三个层面。第一，<strong>存储的不确定性</strong>：对象存储的 GET 延迟从毫秒到数十秒均有可能；本地 NVMe 的队列深度超限时延迟也会爆炸。第二，<strong>CPU 资源是有限共享资源</strong>：DataLoader worker 要和训练主进程、NCCL 线程、日志进程竞争 CPU 时间和 LLC。增加 worker 会提升解码并发，但超过物理核数后会引入调度开销和 cache 竞争（包括 <a href="../part0/0a7-false-sharing.html">§0a-7</a> 所述的伪共享问题）。第三，<strong>内存带宽是真实瓶颈</strong>：DDR5 有峰值带宽上限，多 worker 高并发 decode + pin_memory 拷贝都在竞争同一条内存总线。</p>
+<p>DataLoader 工程化不是"设置几个参数让代码跑起来"，而是在一个多级流水线的约束下，找到让 GPU 永远不等、CPU 和 IO 刚好不溢出的参数组合。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"GPU 不能等数据"推出<strong>预取（prefetch）</strong>的必然性：DataLoader 必须在 GPU 消耗当前 batch 的同时，提前解码好下一个 batch，存放在内存缓冲区中。PyTorch 用 <code>prefetch_factor</code> 控制每个 worker 预先在队列里缓冲几个 batch——默认值 2 表示队列里始终保有 2×num_workers 个 batch。</p>
+<p>从"预取需要并发"推出<strong>多进程 worker 模型</strong>：解码是 CPU 密集型的，用线程在 Python 里会被 GIL 锁死，所以 PyTorch DataLoader 用 <code>multiprocessing.Process</code>（fork 或 spawn）创建 worker，每个 worker 拥有独立的 Python 解释器和内存空间，通过 IPC 队列把解码好的样本传给主进程。</p>
+<p>从"IPC 传输有代价"推出 <strong>pin_memory 和 non_blocking H2D</strong>：主进程从 worker 收到张量后，如果内存是普通可分页内存，CUDA 在 H2D 传输前必须先把数据拷贝到固定内存（pinned memory），增加一次 CPU 内存拷贝。提前申请 pinned memory 让 CUDA 可以直接 DMA 传输，配合 <code>non_blocking=True</code> 让 H2D 传输在 CUDA stream 上异步执行。</p>
+<p>从"顺序读比随机读快"推出 <strong>IterableDataset vs MapDataset 的取舍</strong>；从"worker 的 tokenizer 会进程膨胀"推出 <code>persistent_workers</code> 的必要性；从"大量样本变长"推出 <strong>bucket batching</strong>；从"训练数据远超单机存储"推出<strong>流式 dataset（WebDataset/Streaming/litdata）</strong>；从"训练中断后应该能恢复"推出 <strong>resume-friendly DataLoader</strong>。每一个机制都是从同一个不可化简问题因果推导出来的，不是无端出现的配置项。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((DataLoader 工程化))
+    不可化简问题
+      GPU 不能等数据
+      存储延迟不确定
+      CPU IO 资源有限共享
+      多级流水线协调
+    预取机制
+      prefetch_factor
+      worker IPC 队列
+      主进程 prefetch buffer
+      CUDA stream pipeline
+    worker 模型
+      multiprocessing fork spawn
+      IPC 共享内存
+      persistent_workers
+      tokenizer 进程膨胀
+    H2D 优化
+      pin_memory
+      non_blocking copy
+      PCIe 带宽上限
+      CUDA stream 异步
+    数据集类型
+      MapDataset 随机访问
+      IterableDataset 顺序流
+      shuffle buffer 近似随机
+      shard 级 shuffle
+    collate 工程化
+      dynamic batching
+      bucket batching
+      padding 策略
+    流式框架
+      WebDataset tar shard
+      MosaicML Streaming
+      litdata
+    性能诊断
+      GPU idle 周期
+      host-side bottleneck
+      IO wait
+      CPU saturate
+      False Sharing 关联</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>GPU 在一个 training step 里有几个可能等待的环节？哪些属于 DataLoader 的职责、哪些属于模型代码的职责？</li>
+  <li>PyTorch DataLoader 的 worker 进程如何通过 IPC 把样本送到主进程？<code>prefetch_factor</code> 实际控制的是哪段缓冲区的大小？</li>
+  <li><code>num_workers</code> 超过物理核数后为什么吞吐会下降？tokenizer 的进程膨胀为什么让这个问题更严重？</li>
+  <li><code>pin_memory=True</code> + <code>non_blocking=True</code> 组合为什么能降低 H2D 延迟？什么情况下它反而会引发问题？</li>
+  <li>IterableDataset 的 shuffle buffer 在统计意义上和 MapDataset 的全局 shuffle 有什么差距？大规模训练时如何折中？</li>
+  <li>WebDataset、MosaicML Streaming、litdata 各自的 reader 实现有什么核心差异？你应该在什么场景下选择哪个？</li>
+  <li>训练 LLaMA-7B 时，DataLoader 从瓶颈到非瓶颈需要经历哪些调优步骤？每步对 GPU 利用率有多大改善？</li>
+</ol>
+</section>
+
+<!-- §2 不可化简问题 -->
+<section class="section" id="s2">
+<h2>2. DataLoader 的不可化简问题：GPU 不能等数据</h2>
+
+<p>GPU 的算力和时间是稀缺资源。在一次典型的 LLaMA-7B BF16 训练中：每个 training step 的 GPU 计算时间约 80-200ms；如果 DataLoader 无法在这段时间内备好下一个 batch，GPU SM 会降到 0% 利用率。GPU idle 往往不是"偶尔等一下"，而是<strong>周期性等待</strong>——每当 DataLoader 的流水线在某个环节超时，整个训练就以 GPU 计算时间 + idle 时间为周期运行。</p>
+
+<pre class="mermaid">sequenceDiagram
+    participant GPU as GPU
+    participant CUDA as CUDA Stream
+    participant CPU as CPU 主进程
+    participant Worker as DataLoader Workers
+
+    Note over Worker: 预取 batch N+1, N+2
+    GPU->>GPU: 计算 batch N（80ms）
+    CPU->>CUDA: H2D batch N+1（non-blocking）
+    Worker->>CPU: IPC 传送 batch N+2 解码结果
+    GPU->>GPU: 计算 batch N+1（80ms，无等待）
+    CPU->>CUDA: H2D batch N+2
+    Note over GPU,Worker: 理想状态：GPU 零等待
+
+    Note over Worker: IO/解码慢时
+    GPU->>GPU: 计算 batch N
+    GPU->>GPU: IDLE（等待 batch N+1）
+    Worker-->>CPU: batch N+1 解码完成（延迟）
+    CPU->>CUDA: H2D batch N+1
+    GPU->>GPU: 计算 batch N+1（有 idle gap）</pre>
+
+<table>
+<tr><th>导致 GPU idle 的层次</th><th>典型原因</th><th>诊断信号</th></tr>
+<tr><td>存储 IO 层</td><td>对象存储 GET 尾延迟、NVMe 队列满</td><td><code>iostat</code> IO wait、DataLoader queue depth 为 0</td></tr>
+<tr><td>CPU 解码层</td><td>JPEG 解码、tokenization CPU 密集</td><td>CPU 利用率 100%、<code>perf stat</code> IPC 低</td></tr>
+<tr><td>IPC 传输层</td><td>worker→主进程共享内存传输竞争</td><td><code>vmstat</code> 高 si/so、IPC 队列满</td></tr>
+<tr><td>H2D 传输层</td><td>PCIe 带宽饱和、pageable memory 中间拷贝</td><td><code>nvidia-smi dmon</code> PCIe TX 带宽饱和</td></tr>
+<tr><td>Collate 层</td><td>复杂 collate_fn 的 Python 开销</td><td>CPU 主进程 100%、worker 空闲</td></tr>
+</table>
+
+<div class="note"><strong>关键直觉：</strong>DataLoader 调优的本质是识别五层流水线中哪一层最慢，让该层的吞吐至少等于 GPU 计算所需的 batch/s，然后用 prefetch 把剩余的时间不确定性吸收掉。</div>
+</section>
+
+<!-- §3 PyTorch DataLoader 内部实现 -->
+<section class="section" id="s3">
+<h2>3. PyTorch DataLoader 内部实现：worker 进程模型与 IPC 队列</h2>
+
+<h3>Worker 进程架构</h3>
+<p>PyTorch DataLoader 在 <code>num_workers > 0</code> 时启动 N 个独立的 worker 进程，每个 worker 有完整的 Python 解释器实例（因此不受 GIL 限制）。主进程通过 <code>index_queue</code> 分发 sample index，worker 解码后通过共享内存（<code>/dev/shm</code>）把张量句柄传回 <code>worker_result_queue</code>。</p>
+
+<pre class="mermaid">flowchart LR
+    subgraph 主进程
+        MainLoop[训练循环] --> PrefetchBuf[Prefetch Buffer]
+        PrefetchBuf --> CUDA[CUDA H2D]
+        IndexQ[Index Queue] --> W1
+        IndexQ --> W2
+        IndexQ --> WN
+    end
+    subgraph Worker1
+        W1[Worker 1\ngetitem] --> DataQ[Result Queue]
+    end
+    subgraph Worker2
+        W2[Worker 2\ngetitem] --> DataQ
+    end
+    subgraph WorkerN
+        WN[Worker N\ngetitem] --> DataQ
+    end
+    DataQ --> PrefetchBuf</pre>
+
+<div class="note"><strong>prefetch_factor 的实际含义：</strong>总 prefetch 数 = <code>num_workers × prefetch_factor</code> 个 batch 同时在飞行中（in-flight）。<code>prefetch_factor=4, num_workers=8</code> → 最多 32 个 batch 同时在解码或等待传输。内存占用 = 32 × batch_size × 样本大小。</div>
+
+<table>
+<tr><th>参数</th><th>行为</th><th>适用场景</th></tr>
+<tr><td><code>persistent_workers=False</code>（默认）</td><td>每 epoch 开始时 fork/spawn 新进程</td><td>小型实验，初始化开销可接受</td></tr>
+<tr><td><code>persistent_workers=True</code></td><td>worker 在 epoch 间保持存活</td><td>NLP 任务有重型 tokenizer</td></tr>
+</table>
+
+<h3>fork vs spawn 的选择</h3>
+<table>
+<tr><th>模式</th><th>启动速度</th><th>内存占用</th><th>安全性</th><th>适用场景</th></tr>
+<tr><td><code>fork</code></td><td>快（~10ms）</td><td>低（COW）</td><td>不安全（CUDA 上下文会被复制）</td><td>纯 CPU worker、无 CUDA 初始化</td></tr>
+<tr><td><code>spawn</code></td><td>慢（~500ms-2s）</td><td>高（重新导入模块）</td><td>安全</td><td>有 CUDA、Windows、tokenizer 有全局状态</td></tr>
+<tr><td><code>forkserver</code></td><td>中</td><td>中</td><td>较安全</td><td>大型 Python 环境</td></tr>
+</table>
+
+<div class="danger"><strong>严重陷阱：</strong>在主进程初始化 CUDA（如调用 <code>torch.cuda.is_available()</code>）后使用 fork，会导致 worker 进程中 CUDA 上下文损坏，产生难以调试的 segfault。确保在 DataLoader 实例化前不触碰 CUDA API，或改用 <code>multiprocessing_context="spawn"</code>。</div>
+
+<h3>tokenizer 进程膨胀</h3>
+<p>当 <code>num_workers=16</code> 且每个 worker 加载一个 HuggingFace tokenizer 时：每个 tokenizer 实例占用约 200-400MB（词表 + BPE merge rules）；16 workers → 额外消耗 3.2-6.4GB 主存。<code>persistent_workers=False</code> 时，每 epoch 这些内存要被分配和释放一次，产生大量 GC 压力和 <code>/dev/shm</code> 清理开销。</p>
+</section>
+
+<!-- §4 IterableDataset vs MapDataset -->
+<section class="section" id="s4">
+<h2>4. IterableDataset vs MapDataset：工程取舍</h2>
+
+<table>
+<tr><th>维度</th><th>MapDataset</th><th>IterableDataset</th></tr>
+<tr><td>访问语义</td><td>随机访问（支持任意 index）</td><td>顺序流（只支持 next）</td></tr>
+<tr><td>shuffle 方式</td><td>全局 index 打乱（完美随机）</td><td>shuffle buffer（近似随机）</td></tr>
+<tr><td>适合的存储形态</td><td>本地文件、内存映射</td><td>对象存储、网络流、shard 文件</td></tr>
+<tr><td>worker 分片方式</td><td>按 index 分片，主进程分发</td><td>每个 worker 订阅不同 shard</td></tr>
+<tr><td>resume 难度</td><td>保存 sampler index 即可</td><td>需保存 shard index + shard 内 offset</td></tr>
+<tr><td>典型框架</td><td>PyTorch 默认 Dataset</td><td>WebDataset、Streaming、litdata</td></tr>
+<tr><td>主要缺点</td><td>海量小文件时 IO 效率差</td><td>shuffle 质量受 buffer 大小限制</td></tr>
+</table>
+
+<div class="note"><strong>Shuffle Buffer 的统计含义：</strong>有效随机性 ≈ min(buffer_size, total_dataset_size) 个样本的排列数。在 1T token 级别的预训练中，完美全局 shuffle 需要数 TB 内存，工程上通常用"shard 级 shuffle + shard 内顺序读 + 小 shuffle buffer"的三级近似，牺牲少量统计随机性换取实际可行的 IO 效率。</div>
+
+<p><strong>shuffle buffer 的推荐取值：</strong><code>buffer_size=1000</code>（接近随机，NLP 通常够用）、<code>buffer_size=10000</code>（接近全局随机，dataset > 1M 时是近似）、<code>buffer_size=100000</code>（接近 MapDataset，内存开销 ≈ 100K × 平均样本大小）。</p>
+</section>
+
+<!-- §5 num_workers 调优 -->
+<section class="section" id="s5">
+<h2>5. num_workers 调优：CPU 数、内存带宽、进程膨胀</h2>
+
+<h3>调优决策树</h3>
+<pre class="mermaid">flowchart TD
+    Start[开始调优 num_workers] --> Q1{GPU util < 80%?}
+    Q1 -->|否| Done[DataLoader 非瓶颈\n关注模型优化]
+    Q1 -->|是| Q2{CPU 利用率 100%?}
+    Q2 -->|否| Q3{IO wait > 20%?}
+    Q3 -->|是| IOBound[IO 瓶颈\n增大 shard\n本地 NVMe cache]
+    Q3 -->|否| Q4{主进程 CPU 100%?}
+    Q4 -->|是| CollateBound[Collate 瓶颈\n优化 collate_fn]
+    Q4 -->|否| Diagnose[检查 prefetch_factor\n和 IPC 队列深度]
+    Q2 -->|是| Q5{worker 数 < 物理核数?}
+    Q5 -->|是| IncWorker[增加 num_workers\n直到 CPU 刚好不满]
+    Q5 -->|否| Q6{内存是否充足?}
+    Q6 -->|否| MemBound[减少 worker\n或 prefetch_factor]
+    Q6 -->|是| FalseShare[perf c2c 检查 HITM\n见 §0a-7]</pre>
+
+<table>
+<tr><th>场景</th><th>推荐 num_workers 起点</th><th>上界</th><th>备注</th></tr>
+<tr><td>图像任务（JPEG 解码）</td><td>物理核数 / 卡数</td><td>物理核数</td><td>解码 CPU 密集，可吃满</td></tr>
+<tr><td>NLP 任务（tokenization）</td><td>4-8</td><td>16</td><td>tokenizer 进程膨胀，超 16 内存压力大</td></tr>
+<tr><td>流式 WebDataset</td><td>4-8</td><td>16</td><td>IO 受限，增 worker 收益递减早</td></tr>
+<tr><td>本地 NVMe + 轻预处理</td><td>物理核数 / 2</td><td>物理核数</td><td>磁盘带宽通常先饱和</td></tr>
+<tr><td>对象存储（S3）</td><td>8-16</td><td>32</td><td>网络 IO 密集，worker 可以多些</td></tr>
+</table>
+
+<h3>与 §0a-7 伪共享的关联</h3>
+<p>DataLoader 的 worker stats 数组是伪共享的经典反例（见 <a href="../part0/0a7-false-sharing.html">§0a-7.10</a> 事故 1）。在 PyTorch 内部或自定义监控代码中，若维护 <code>std::vector&lt;WorkerStats&gt;</code> 紧凑数组记录各 worker 的统计信息，当 <code>num_workers=16</code> 且跨 NUMA socket 时：</p>
+<ul>
+  <li>16 个 worker 的 stats 分布在约 6-8 条 cache line（每个 <code>WorkerStats</code> 16-24B）</li>
+  <li>每个 worker 高频写自己的统计字段 → cache line 在核心间反复 invalidate</li>
+  <li>最终表现：16 worker 吞吐反而低于 8 worker</li>
+</ul>
+<div class="warn"><strong>修复：</strong>对任何 worker 粒度的统计结构加 <code>alignas(64)</code>，并用 thread-local 累加 + 周期性 flush（每 64 样本 flush 一次）降低 atomic 写频率。完整分析见 <a href="../part0/0a7-false-sharing.html">§0a-7</a>。</div>
+</section>
+
+<!-- §6 pin_memory -->
+<section class="section" id="s6">
+<h2>6. pin_memory + non_blocking H2D copy</h2>
+
+<pre class="mermaid">flowchart LR
+    subgraph 无pin_memory
+        A1[worker 解码\n普通内存] --> A2[主进程 collate\n普通内存] --> A3[CUDA 内部\n临时 pin 拷贝] --> A4[PCIe DMA 传输] --> A5[GPU 显存]
+    end
+    subgraph 有pin_memory
+        B1[worker 解码\n普通内存] --> B2[主进程 collate\npinned memory] --> B3[PCIe DMA\n直接传输] --> B4[GPU 显存]
+        B3 -->|non_blocking=True| B5[CPU 立即返回\n继续下一步]
+    end</pre>
+
+<table>
+<tr><th>配置</th><th>H2D 流程</th><th>中间拷贝</th><th>CPU 阻塞</th><th>适用场景</th></tr>
+<tr><td>默认（无 pin_memory）</td><td>可分页内存 → 临时 pin → DMA</td><td>有</td><td>有</td><td>简单实验</td></tr>
+<tr><td><code>pin_memory=True</code></td><td>pinned 内存 → 直接 DMA</td><td>无</td><td>有（默认）</td><td>大多数训练任务</td></tr>
+<tr><td><code>pin_memory=True + non_blocking=True</code></td><td>pinned 内存 → 异步 DMA</td><td>无</td><td>无</td><td>生产级训练，GPU/CPU 流水线</td></tr>
+</table>
+
+<pre><code class="language-python"># 正确用法：non_blocking + 同 CUDA stream 上的 kernel 自动等待
+for batch in dataloader:
+    inputs = batch['input_ids'].cuda(non_blocking=True)
+    labels = batch['labels'].cuda(non_blocking=True)
+    # 同 stream 上的后续 kernel 会自动等待 DMA 完成
+    loss = model(inputs, labels=labels).loss
+
+# 常见陷阱：non_blocking 后立即在 CPU 访问
+x = tensor.cuda(non_blocking=True)
+print(x.cpu())  # 强制同步，丧失 non_blocking 优势</code></pre>
+
+<div class="warn"><strong>工程边界：</strong>pinned memory 是不可换出的物理内存，过度分配会增加 OS 内存压力。建议仅对 DataLoader 的输出张量使用 pin_memory；每张 H100 卡建议预留 2-4GB 给 pinned memory 缓冲区。</div>
+</section>
+
+<!-- §7 collate_fn 工程化 -->
+<section class="section" id="s7">
+<h2>7. collate_fn 工程化：dynamic batching、padded sequence、bucket batching</h2>
+
+<p>对于文本训练，序列长度分布通常呈长尾分布。Naive padding 到 batch 内最大长度会导致计算浪费（Attention 是 O(L²)）和内存浪费（padding token 占显存但不贡献梯度）。</p>
+
+<table>
+<tr><th>batching 策略</th><th>padding 比例</th><th>吞吐（相对 naive）</th><th>复杂度</th><th>适用场景</th></tr>
+<tr><td>Naive padding（到最长）</td><td>30-60%</td><td>基准</td><td>低</td><td>实验、序列长度均匀</td></tr>
+<tr><td>Bucket batching（固定桶）</td><td>10-20%</td><td>+20-40%</td><td>中</td><td>生产 NLP 训练</td></tr>
+<tr><td>Dynamic batching（按 token 数）</td><td>5-10%</td><td>+30-50%</td><td>高</td><td>LLM 预训练</td></tr>
+<tr><td>Packing（无 padding）</td><td>&lt;2%</td><td>+50-80%</td><td>很高</td><td>极致优化，需 attention mask</td></tr>
+</table>
+
+<pre><code class="language-python">def bucket_batch_sampler(dataset, batch_size, bucket_boundaries):
+    """按长度分桶，同桶内组 batch，最小化 padding"""
+    lengths = [len(dataset[i]['input_ids']) for i in range(len(dataset))]
+    buckets = defaultdict(list)
+    for idx, length in enumerate(lengths):
+        bucket = bisect_right(bucket_boundaries, length)
+        buckets[bucket].append(idx)
+    for bucket_indices in buckets.values():
+        random.shuffle(bucket_indices)
+        for i in range(0, len(bucket_indices), batch_size):
+            yield bucket_indices[i:i+batch_size]</code></pre>
+
+<div class="success"><strong>Dynamic batching 最佳实践：</strong>按 max_tokens_per_batch 控制每个 batch 的总 token 数，允许 batch size 变化。LLM 预训练通常在 dynamic batching 外层再加 gradient accumulation 来稳定有效 batch size。</div>
+</section>
+
+<!-- §8 流式 Dataset -->
+<section class="section" id="s8">
+<h2>8. 流式 Dataset：WebDataset、MosaicML Streaming、litdata</h2>
+
+<table>
+<tr><th>维度</th><th>WebDataset</th><th>MosaicML Streaming</th><th>litdata</th></tr>
+<tr><td>核心格式</td><td><code>.tar</code>（tar shard）</td><td><code>.mds</code>（自定义 binary）</td><td>自定义 chunked binary</td></tr>
+<tr><td>Shuffle 实现</td><td>shard-level + 内部 buffer</td><td>全局 shuffle（跨 shard index 随机化）</td><td>epoch-level shuffle + local buffer</td></tr>
+<tr><td>远端存储支持</td><td>S3/GCS/HTTP（fsspec）</td><td>S3/GCS/Azure/本地</td><td>S3/GCS/本地</td></tr>
+<tr><td>Resume 支持</td><td>弱（需记录 shard 位置）</td><td>强（内建 epoch+sample offset）</td><td>强（checkpoint 即可）</td></tr>
+<tr><td>多机 worker 分片</td><td>手动配置 shard 分配</td><td>内建（按 worker 数自动分片）</td><td>内建</td></tr>
+<tr><td>典型用户</td><td>学术界、中小规模</td><td>大规模工业预训练</td><td>PyTorch Lightning 生态</td></tr>
+</table>
+
+<h3>MosaicML Streaming 的全局 shuffle 实现</h3>
+<pre class="mermaid">flowchart LR
+    subgraph 离线准备
+        D[原始数据] --> Convert[转换为 .mds 格式]
+        Convert --> ShardFiles[shard_00000.mds\nshard_00001.mds ...]
+        ShardFiles --> Index[index.json\n全局样本 metadata]
+    end
+    subgraph 训练时
+        Index --> ShuffleEngine[Shuffle Engine\n按 epoch+seed 生成\n全局随机 permutation]
+        ShuffleEngine --> WorkerAssign[按 num_workers 分配\n每个 worker 的 sample list]
+        WorkerAssign --> LocalCache[下载对应 shard\n到本地 /tmp/cache]
+        LocalCache --> Decode[解码 + prefetch]
+    end</pre>
+
+<div class="note"><strong>选型建议：</strong>学术实验或中小规模（< 1TB）用 WebDataset；工业级大规模预训练（需要精确全局 shuffle 和 resume）用 MosaicML Streaming；PyTorch Lightning 生态用 litdata。</div>
+</section>
+
+<!-- §9 远端 Dataset -->
+<section class="section" id="s9">
+<h2>9. 远端 Dataset：S3/对象存储 + 本地 Cache、Partial Download</h2>
+
+<pre class="mermaid">flowchart TB
+    subgraph 远端存储
+        S3[S3 对象存储\nTB 级数据]
+    end
+    subgraph 本地节点
+        Cache[本地 NVMe Cache\n约10%数据量]
+        PrefetchBuf[内存 Prefetch Buffer\n2-4 个 shard]
+        Workers[DataLoader Workers]
+    end
+    subgraph GPU
+        VRAM[GPU 显存]
+    end
+    S3 -->|异步 prefetch 下一批 shard| Cache
+    Cache -->|顺序读| PrefetchBuf
+    PrefetchBuf -->|解码 + collate| Workers
+    Workers -->|pin_memory + H2D| VRAM</pre>
+
+<table>
+<tr><th>策略</th><th>延迟</th><th>带宽效率</th><th>实现复杂度</th><th>适用场景</th></tr>
+<tr><td>全量下载 shard</td><td>高（等下载完才读）</td><td>高</td><td>低</td><td>本地存储充足时</td></tr>
+<tr><td>Partial download + streaming</td><td>低（边下边读）</td><td>中</td><td>中</td><td>本地磁盘有限</td></tr>
+<tr><td>Prefetch 下一批 shard</td><td>中（异步预下载）</td><td>高</td><td>中</td><td>最常见生产方案</td></tr>
+<tr><td>完全内存 streaming</td><td>极低</td><td>中</td><td>高</td><td>超大带宽节点</td></tr>
+</table>
+
+<div class="success"><strong>本地 Cache 大小建议：</strong>推荐 cache size = max(2 × 单次训练遍历的 IO 量, 最热 shard 的总大小)。至少预留 10-20GB 本地 cache（约 10-20 个 1GB shard）。cache 目录需要定期清理，避免占满磁盘影响训练日志和 checkpoint 写入。</div>
+</section>
+
+<!-- §10 大规模训练 DataLoader -->
+<section class="section" id="s10">
+<h2>10. 大规模训练 DataLoader：Sharded Read 与 Cross-Shard Sample</h2>
+
+<p>在 DDP 训练中，每个 rank 需要读取不重叠的数据。标准做法是使用 <code>DistributedSampler</code>（MapDataset）或在 IterableDataset 中手动实现 shard 分片。</p>
+
+<pre><code class="language-python"># PyTorch DDP 标准做法
+from torch.utils.data.distributed import DistributedSampler
+sampler = DistributedSampler(dataset, num_replicas=world_size,
+                             rank=local_rank, shuffle=True, seed=42)
+dataloader = DataLoader(dataset, sampler=sampler, batch_size=32)
+
+# WebDataset 多机分片
+dataset = wds.WebDataset(shard_urls,
+    nodesplitter=wds.split_by_node,       # 按 dist.get_rank() 分片
+    workerssplitter=wds.split_by_worker    # 按 worker_id 进一步分
+)</code></pre>
+
+<h3>大规模训练 Shuffle 三级近似</h3>
+<table>
+<tr><th>层级</th><th>实现方式</th><th>随机性</th><th>IO 效率</th></tr>
+<tr><td>第一级：shard 列表 shuffle</td><td>每 epoch 随机排列 shard 顺序</td><td>低（shard 内顺序固定）</td><td>极高（顺序读）</td></tr>
+<tr><td>第二级：shard 内 shuffle</td><td>shard 内部样本随机排列</td><td>中</td><td>高</td></tr>
+<tr><td>第三级：内存 shuffle buffer</td><td>buffer_size=1000-10000</td><td>高（近似全局）</td><td>中（内存开销）</td></tr>
+</table>
+
+<div class="note"><strong>Cross-shard sample：</strong>同时打开多个 shard（k=4），从多个 shard 交叉采样，打破 shard 边界的样本相关性。适用于数据在 shard 内有强时序相关性（如同一天爬取的文档在同一 shard）的场景。</div>
+</section>
+
+<!-- §11 Resume-Friendly DataLoader -->
+<section class="section" id="s11">
+<h2>11. Resume-Friendly DataLoader</h2>
+
+<p>训练中断后，标准 PyTorch DataLoader 只能从 epoch 开头重新开始。对于大规模训练（epoch 需要数小时到数天），这意味着重新消费已经见过的样本（浪费算力，改变数据分布），且无法复现精确相同的训练轨迹。</p>
+
+<table>
+<tr><th>状态项</th><th>MapDataset</th><th>IterableDataset</th></tr>
+<tr><td>Sampler 状态</td><td>已消费的 index 列表</td><td>当前 shard index + shard 内 offset</td></tr>
+<tr><td>Shuffle seed</td><td>epoch + step seed</td><td>epoch + shard shuffle seed</td></tr>
+<tr><td>Worker 状态</td><td>prefetch queue 位置</td><td>每个 worker 的 shard 游标</td></tr>
+</table>
+
+<pre><code class="language-python"># PyTorch 2.3+ StatefulDataLoader（实验性）
+from torch.utils.data import StatefulDataLoader
+
+dataloader = StatefulDataLoader(dataset, batch_size=32, num_workers=4)
+
+# 保存状态（与 checkpoint 一起保存）
+state = dataloader.state_dict()
+torch.save(state, "dataloader_state.pt")
+
+# 恢复状态后从断点继续，而不是从 epoch 头开始
+dataloader.load_state_dict(torch.load("dataloader_state.pt"))</code></pre>
+
+<div class="warn"><strong>前提条件：</strong>Resume 要真正有效，dataset 的 <code>__iter__</code> 必须实现 <code>__getstate__</code> 和 <code>__setstate__</code>。WebDataset 已原生支持；自定义 IterableDataset 需要手动实现。</div>
+</section>
+
+<!-- §12 与其他框架的对比 -->
+<section class="section" id="s12">
+<h2>12. 与 Ray Data / NVIDIA DALI / 推理 DataLoader 的对比</h2>
+
+<table>
+<tr><th>框架</th><th>定位</th><th>优势</th><th>局限</th><th>适用场景</th></tr>
+<tr><td>PyTorch DataLoader</td><td>通用训练数据加载</td><td>灵活、生态好</td><td>多机协调弱、resume 基础</td><td>大多数训练任务</td></tr>
+<tr><td>Ray Data</td><td>分布式数据处理流水线</td><td>跨节点弹性、与 Ray Train 集成</td><td>额外学习成本、overhead</td><td>大规模分布式、复杂预处理</td></tr>
+<tr><td>NVIDIA DALI</td><td>GPU 加速数据预处理</td><td>解码/增强在 GPU 上，绕过 CPU 瓶颈</td><td>仅 NVIDIA、支持算子有限</td><td>图像/视频，CPU decode 是瓶颈</td></tr>
+<tr><td>TensorRT 推理 DataLoader</td><td>推理批处理</td><td>dynamic shape 感知、低延迟</td><td>仅推理</td><td>LLM/CV 推理服务</td></tr>
+</table>
+
+<h3>训练 DataLoader vs 推理 Batching vs 评测 DataLoader</h3>
+<table>
+<tr><th>维度</th><th>训练 DataLoader</th><th>推理 Batching</th><th>评测 DataLoader</th></tr>
+<tr><td>首要目标</td><td>最大吞吐，GPU 零等待</td><td>最小延迟，P99 &lt; SLA</td><td>可复现，结果精确</td></tr>
+<tr><td>Shuffle</td><td>必须，影响模型质量</td><td>不需要</td><td>不需要（固定顺序）</td></tr>
+<tr><td>Batch size</td><td>固定或 dynamic（最大化 GPU）</td><td>动态（continuous batching）</td><td>固定（保证一致性）</td></tr>
+<tr><td>Resume</td><td>需要</td><td>不需要</td><td>可能需要（大规模评测）</td></tr>
+<tr><td>数据来源</td><td>离线 shard，吞吐导向</td><td>在线请求，延迟导向</td><td>固定评测集，复现性导向</td></tr>
+</table>
+
+<div class="danger"><strong>评测 DataLoader 的严格要求：</strong>评测时必须固定所有随机性（<code>shuffle=False</code>、<code>drop_last=False</code>、固定 seed），且不同机器 / 不同 num_workers 的结果必须完全一致。建议用独立函数构建评测 DataLoader，避免共享训练配置。</div>
+</section>
+
+<!-- §13 性能诊断 -->
+<section class="section" id="s13">
+<h2>13. 性能诊断：GPU Idle 周期与 Host-Side Bottleneck 定位</h2>
+
+<pre class="mermaid">flowchart TD
+    Symptom[GPU util < 80%] --> L1{PCIe TX 带宽\n接近上限?}
+    L1 -->|是| H2DBound[H2D 瓶颈\n优化 pin_memory\n检查 batch size]
+    L1 -->|否| L2{CPU 哪个进程最高?}
+    L2 -->|DataLoader worker| L3{IO wait > 20%?}
+    L3 -->|是| IOBound[IO 瓶颈\n增大 shard / 本地 cache]
+    L3 -->|否| L4{perf stat IPC < 1.0?}
+    L4 -->|是| L5{perf c2c HITM 集中?}
+    L5 -->|是| FalseShare[伪共享\nalignas 64 见 §0a-7]
+    L5 -->|否| CPUBound[CPU decode 瓶颈\n增加 worker 或 DALI]
+    L4 -->|否| CollateOrIPC[Collate/IPC 瓶颈\n优化 collate_fn]
+    L2 -->|训练主进程| MainBound[主进程 CPU 瓶颈\n优化 collate_fn]</pre>
+
+<table>
+<tr><th>诊断信号</th><th>含义</th><th>对应瓶颈</th><th>推荐行动</th></tr>
+<tr><td>GPU util 周期性 &lt;80%，PCIe TX 高</td><td>H2D 带宽饱和</td><td>H2D 传输</td><td>减小 batch size 或优化模型</td></tr>
+<tr><td>GPU util 周期性 &lt;80%，PCIe TX 低</td><td>DataLoader 未备好 batch</td><td>CPU/IO</td><td>增加 workers、prefetch_factor</td></tr>
+<tr><td>CPU worker 100%，IO wait &lt;5%</td><td>CPU decode 瓶颈</td><td>CPU 解码</td><td>增加 worker 或用 DALI</td></tr>
+<tr><td>CPU worker 100%，IO wait &gt;20%</td><td>磁盘/网络 IO 瓶颈</td><td>存储 IO</td><td>增大 shard、本地 cache</td></tr>
+<tr><td>CPU worker 100%，perf c2c HITM 高</td><td>伪共享</td><td>Worker stats 布局</td><td>alignas(64) + thread-local</td></tr>
+<tr><td>主进程 CPU 100%，worker 空闲</td><td>Collate 瓶颈</td><td>collate_fn</td><td>简化 collate 或移至 worker</td></tr>
+<tr><td>DataLoader wait time 均匀偏高</td><td>prefetch 不足</td><td>预取配置</td><td>增大 prefetch_factor</td></tr>
+<tr><td>DataLoader wait time 偶发尖峰</td><td>IO 尾延迟</td><td>存储抖动</td><td>本地 cache + retry</td></tr>
+</table>
+
+<pre><code class="language-bash"># 1. GPU 侧：每秒采样 GPU util、内存、PCIe 带宽
+nvidia-smi dmon -s pucmt -d 1 -c 60
+
+# 2. CPU 侧：看 DataLoader worker 的 CPU 占用
+pidstat -t -p $(pgrep -f "python.*train") 1 30
+
+# 3. IO 侧：看磁盘 IO wait 和吞吐
+iostat -x 1 30
+
+# 4. 伪共享检测：perf c2c
+perf c2c record -ag -- sleep 30
+perf c2c report --stdio | head -60</code></pre>
+</section>
+
+<!-- §14 Worked Example -->
+<section class="section" id="s14">
+<h2>14. Worked Example：训练 LLaMA-7B 时把 DataLoader 从瓶颈调到非瓶颈</h2>
+
+<h3>场景描述</h3>
+<p>单节点 8×A100 80GB，本地 NVMe（7 GB/s），训练数据约 1TB token（WebDataset tar shard，每个 shard 约 500MB，共 2000 个 shard），LLaMA-7B BF16，sequence length 2048，micro batch size 2（每卡），global batch size 16×2048 tokens。</p>
+
+<p><strong>初始配置：</strong><code>num_workers=2, prefetch_factor=2, pin_memory=False, persistent_workers=False</code></p>
+
+<h3>调优过程与 GPU 利用率变化</h3>
+<table>
+<tr><th>调优步骤</th><th>变更内容</th><th>GPU util avg</th><th>GPU util min</th><th>DataLoader wait (ms/step)</th><th>备注</th></tr>
+<tr><td>Step 0：基线</td><td>num_workers=2, 无 pin_memory</td><td>45%</td><td>12%</td><td>280</td><td>GPU 大量等待 DataLoader</td></tr>
+<tr><td>Step 1：增加 workers</td><td>num_workers=8</td><td>68%</td><td>35%</td><td>95</td><td>大幅改善，IO 尚未成瓶颈</td></tr>
+<tr><td>Step 2：pin_memory</td><td>pin_memory=True + non_blocking</td><td>74%</td><td>42%</td><td>75</td><td>H2D 延迟降低</td></tr>
+<tr><td>Step 3：persistent_workers</td><td>persistent_workers=True</td><td>76%</td><td>45%</td><td>68</td><td>epoch 边界 overhead 消除</td></tr>
+<tr><td>Step 4：prefetch_factor</td><td>prefetch_factor=4</td><td>80%</td><td>55%</td><td>45</td><td>缓冲区更深，IO 抖动吸收</td></tr>
+<tr><td>Step 5：shuffle buffer</td><td>shuffle(buffer_size=5000)</td><td>80%</td><td>55%</td><td>45</td><td>shuffle 对吞吐无影响</td></tr>
+<tr><td>Step 6：本地 NVMe cache</td><td>预缓存 20GB shard 到本地</td><td>88%</td><td>72%</td><td>18</td><td>IO 稳定性大幅提升</td></tr>
+<tr><td>Step 7：bucket batching</td><td>按序列长度分桶</td><td>91%</td><td>78%</td><td>18</td><td>减少 padding，有效计算提升</td></tr>
+<tr><td>Step 8：num_workers 精调</td><td>8 → 12（刚好不超 CPU 上限）</td><td>93%</td><td>82%</td><td>12</td><td>最终优化点</td></tr>
+<tr><td><strong>最终状态</strong></td><td>所有优化组合</td><td><strong>93%</strong></td><td><strong>82%</strong></td><td><strong>12</strong></td><td>DataLoader 不再是瓶颈</td></tr>
+</table>
+
+<h3>Step 0 → Step 1 的诊断过程</h3>
+<pre><code class="language-python"># 在训练脚本里加简单计时
+import time
+last_end = time.time()
+for i, batch in enumerate(dataloader):
+    load_time = time.time() - last_end  # DataLoader 等待时间
+    # ... train step ...
+    compute_time = time.time() - (last_end + load_time)
+    last_end = time.time()
+
+# 输出：avg load_time = 280ms，avg compute_time = 220ms
+# → DataLoader 时间 > compute 时间，明确是 DataLoader 瓶颈</code></pre>
+
+<h3>Step 6 的 NVMe cache 实现思路</h3>
+<pre><code class="language-python">class CachedWebDataset:
+    """把 S3 shard 预下载到本地 NVMe cache，DataLoader 读本地"""
+    def __init__(self, remote_shards, local_cache_dir, cache_size_gb=20):
+        self.cache_dir = local_cache_dir
+        self.max_bytes = cache_size_gb * 1024**3
+        # 异步线程预下载下 2 批 shard
+        self._prefetch_thread = threading.Thread(target=self._prefetch_loop)
+        self._prefetch_thread.start()
+
+    def _prefetch_loop(self):
+        for shard_url in self._upcoming_shards():
+            local_path = os.path.join(self.cache_dir, os.path.basename(shard_url))
+            if not os.path.exists(local_path):
+                download_s3(shard_url, local_path)  # 顺序下载
+            self._evict_lru_if_needed()              # LRU 淘汰</code></pre>
+
+<h3>Step 7 的 bucket batching 效果量化</h3>
+<div class="success">
+<strong>效果量化：</strong><br>
+调优前：avg 序列长度 1024，padding 比例 42%，有效 tokens/step = 2048×2048×0.58 = 2.4M tokens<br>
+调优后：bucket 内 avg padding 11%，有效 tokens/step = 2048×2048×0.89 = 3.7M tokens<br>
+→ 有效计算量提升 54%，直接反映在 GPU MFU（Model FLOP Utilization）上
+</div>
+
+<h3>最终配置</h3>
+<pre><code class="language-python">dataset = (
+    wds.WebDataset(shard_urls, shardshuffle=True,
+                   nodesplitter=wds.split_by_node,
+                   workerssplitter=wds.split_by_worker)
+    .shuffle(5000)
+    .decode("torch")
+    .map(tokenize)
+)
+
+dataloader = DataLoader(
+    dataset,
+    batch_size=2,
+    num_workers=12,
+    prefetch_factor=4,
+    pin_memory=True,
+    persistent_workers=True,
+    collate_fn=bucket_collate_fn,  # 按 token 数 dynamic batching
+)
+
+for batch in dataloader:
+    input_ids = batch['input_ids'].cuda(non_blocking=True)
+    labels = batch['labels'].cuda(non_blocking=True)
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        loss = model(input_ids, labels=labels).loss
+    loss.backward()
+    optimizer.step()</code></pre>
+
+<div class="note"><strong>关键教训：</strong>DataLoader 调优是"先诊断瓶颈在哪一层，再用对应工具修"的过程，不是把所有参数调到最大。每次只改一个变量，用 GPU util 和 DataLoader wait time 两个指标同步确认效果。过度增加 workers 或 prefetch_factor 会引发内存压力和伪共享，反而让吞吐下降。</div>
+</section>
+
+<!-- §15 工程建议与陷阱 -->
+<section class="section" id="s15">
+<h2>15. 工程建议与常见陷阱</h2>
+
+<div class="warn"><strong>陷阱 1：num_workers 越大越好。</strong>超过物理核数 / 任务 GPU 数后，worker 调度开销、cache 竞争和伪共享会让吞吐下降。推荐从"物理核数 / GPU 数量"开始测，逐步增加直到 GPU 不再 idle 或 CPU 打满。</div>
+
+<div class="warn"><strong>陷阱 2：在 DataLoader 之外做 H2D。</strong><code>batch.to(device)</code> 默认是同步的，会阻塞 CPU 主循环。应始终使用 <code>.cuda(non_blocking=True)</code> + <code>pin_memory=True</code> 组合。</div>
+
+<div class="warn"><strong>陷阱 3：epoch 级别的 shuffle 不够。</strong>对于有强时序相关性的数据（如爬取日期相近的文档），shard 级 shuffle 不足以打乱；需要在 shard 内部也做 shuffle 或使用 MosaicML Streaming 的全局 shuffle。</div>
+
+<div class="danger"><strong>陷阱 4：在主进程初始化 CUDA 后使用 fork。</strong>会导致 worker 中 CUDA 状态损坏。检查 import 顺序，避免在 DataLoader 实例化前调用任何 CUDA API，或改用 <code>multiprocessing_context="spawn"</code>。</div>
+
+<div class="warn"><strong>陷阱 5：collate_fn 在主进程执行的代价。</strong>如果 collate_fn 很重（如在 collate 中做 tokenization），主进程 CPU 会成为瓶颈。解决方案：把 tokenization 移到 <code>Dataset.__getitem__</code>（在 worker 中执行）。</div>
+
+<div class="danger"><strong>陷阱 6：评测时使用训练用的 DataLoader。</strong>评测需要 <code>shuffle=False</code>、<code>drop_last=False</code>、固定 seed，与训练配置完全不同。建议用独立函数构建评测 DataLoader，避免共享训练配置。</div>
+
+<pre><code class="language-python">def benchmark_dataloader(dataloader, n_batches=50):
+    """在训练前快速诊断 DataLoader 吞吐"""
+    import time
+    times = []
+    for i, batch in enumerate(dataloader):
+        if i == 0:
+            start = time.time()
+            continue
+        times.append(time.time() - start)
+        start = time.time()
+        if i >= n_batches: break
+    avg_ms = sum(times) / len(times) * 1000
+    print(f"DataLoader avg: {avg_ms:.1f}ms/batch")
+    print(f"DataLoader throughput: {1000/avg_ms:.1f} batches/s")</code></pre>
+</section>
+
+<!-- §16 练习题 -->
+<section class="section" id="s16">
+<h2>16. 练习题</h2>
+<div class="grid-2">
+  <div class="card"><strong>11d-1（基础）：prefetch_factor 内存计算</strong><br>配置：<code>num_workers=8, prefetch_factor=4, batch_size=32</code>，每个样本是 224×224×3 float32 图像。计算理论上 DataLoader prefetch 缓冲区占用的主存大小（MB）。如果主存只有 64GB，这个配置是否有风险？</div>
+
+  <div class="card"><strong>11d-2（基础）：fork vs spawn 选择</strong><br>以下代码在 fork 模式下为什么会报错？<br><code>device = torch.device('cuda:0')<br>dataloader = DataLoader(dataset, num_workers=4)</code><br>给出原因和修复方案。</div>
+
+  <div class="card"><strong>11d-3（基础）：pin_memory 原理</strong><br>解释为什么 <code>pin_memory=True</code> 能加速 H2D 传输。在什么系统条件下（内存大小、NUMA 配置），pin_memory 可能反而降低性能？</div>
+
+  <div class="card"><strong>11d-4（进阶）：num_workers 调优实验</strong><br>设计一个实验，在以下三种存储配置下分别测量最优 num_workers：(a) 本地 NVMe SSD，(b) NFS 网络存储，(c) S3 对象存储。每种配置你预期的最优 num_workers 是多少？理由是什么？</div>
+
+  <div class="card"><strong>11d-5（进阶）：bucket batching 实现</strong><br>为 LLaMA 训练实现一个 bucket sampler，要求：按序列长度分 5 个桶（0-64, 64-128, 128-256, 256-512, 512+），同桶内随机组 batch，不同桶间按比例混合。给出关键代码片段。</div>
+
+  <div class="card"><strong>11d-6（进阶）：WebDataset vs MosaicML Streaming 选型</strong><br>判断哪个框架更合适：(a) 学术实验，数据 100GB，本地存储；(b) 工业预训练，数据 10TB，S3，8 节点 64 GPU，需要精确全局 shuffle 和 resume；(c) 快速原型，数据格式多样（JSON/JPEG/parquet 混合）。</div>
+
+  <div class="card"><strong>11d-7（进阶）：false sharing 在 DataLoader 中的诊断</strong><br>某 16-worker DataLoader 在 8-worker 时吞吐 8000 samples/s，在 16-worker 时反降到 6500 samples/s，CPU 利用率高但 IO wait 低。给出完整诊断步骤（至少 5 步），含工具和判读标准。确认是伪共享后给出修复方案。</div>
+
+  <div class="card"><strong>11d-8（进阶）：S3 远端数据集设计</strong><br>设计一个生产级的 S3 数据集 class，要求：① shard 级别本地 NVMe cache（LRU 淘汰）；② 异步预下载下一批 shard；③ 支持 resume（保存 shard index + offset）。给出类的接口设计和关键实现思路。</div>
+
+  <div class="card"><strong>11d-9（设计）：多机 DataLoader 架构</strong><br>设计一个 32 节点、每节点 8 卡的 DDP 训练 DataLoader 架构。数据量 100TB，存储在 S3。要求：各 rank 读取不重叠数据、每节点有本地 cache、支持 resume、支持多 epoch 不同 shuffle 顺序。列出关键参数选择。</div>
+
+  <div class="card"><strong>11d-10（设计）：DataLoader 健康监控系统</strong><br>设计一个监控系统，能实时检测：① DataLoader wait time 超过 GPU compute time 的 20%；② 某个 worker 处理时间明显高于其他 worker；③ Prefetch buffer 经常为空；④ 内存使用接近上限。给出监控指标定义和告警阈值。</div>
+
+  <div class="card"><strong>11d-11（开放）：评测 DataLoader 的严格要求</strong><br>模型评测系统要求在不同机器（4 卡 vs 8 卡）、不同 num_workers（4 vs 8）下得到完全相同的评测结果。列出至少 5 个可能导致结果不一致的 DataLoader 配置项，并给出使结果一致的参数设置。</div>
+
+  <div class="card"><strong>11d-12（开放）：AI Infra 视角的 DataLoader 差异</strong><br>从 AI Infra 平台视角，训练 DataLoader、推理 Batching Engine（如 vLLM continuous batching）和评测 DataLoader 的设计目标完全不同。为这三种场景各写一段不超过 200 字的"设计原则"，重点区分在 shuffle、batch size、延迟要求、resume、数据来源五个维度上的差异。</div>
+</div>
+</section>
+
+<!-- §17 参考资料 -->
+<section class="refbox" id="s17">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+  <li>从 §1 建立"GPU 不能等数据"的第一性原理，理解五层流水线的物理约束。</li>
+  <li>读 §2 和 §3 理解 PyTorch DataLoader 的 worker 进程模型和 IPC 机制（这是所有调参的物理基础）。</li>
+  <li>读 §5 的决策树，用于日常调优 num_workers（记住：超过物理核数后反向曲线是 §0a-7 伪共享的经典表现）。</li>
+  <li>读 §14 Worked Example，完整跑一遍"基线 → 诊断 → 逐步调优 → 复测"的闭环。</li>
+  <li>根据实际存储环境（本地/S3/HDFS）选择 §8 中对应的流式框架。</li>
+  <li>把 §13 的诊断决策树贴在值班 wiki，遇到 GPU idle 问题时照图排查。</li>
+</ol>
+
+<h3>延伸阅读</h3>
+<ul>
+  <li>PyTorch 官方文档，<em>torch.utils.data.DataLoader</em>，重点阅读 multiprocessing worker 和 pin_memory 部分：https://pytorch.org/docs/stable/data.html</li>
+  <li>PyTorch 源码 <code>torch/utils/data/_utils/worker.py</code> 和 <code>fetch.py</code>：IPC 队列和 prefetch 实现细节。</li>
+  <li>Greg Brockman et al., <em>WebDataset</em>，https://github.com/webdataset/webdataset</li>
+  <li>MosaicML, <em>Streaming Documentation</em>，https://docs.mosaicml.com/projects/streaming</li>
+  <li>Lightning AI, <em>litdata</em>，https://github.com/Lightning-AI/litdata</li>
+  <li>NVIDIA DALI 文档，https://docs.nvidia.com/deeplearning/dali/user-guide/docs/</li>
+  <li>Ulrich Drepper, <em>What Every Programmer Should Know About Memory</em>，§6：多核 cache 一致性对数据结构布局的影响（本章 §0a-7 伪共享的理论基础）。</li>
+  <li>PyTorch RFC，<em>StatefulDataLoader</em>，https://github.com/pytorch/pytorch/issues/101646</li>
+  <li>Shen Li et al., <em>PyTorch Distributed: Experiences on Accelerating Data Parallel Training</em>，MLSys 2020</li>
+  <li>Brendan Gregg, <em>Systems Performance: Enterprise and the Cloud</em>, 2nd ed., Chapter 8（文件系统）</li>
+  <li>本教程 <a href="../part0/0a7-false-sharing.html">§0a-7 伪共享</a>：DataLoader worker stats 数组伪共享的完整案例分析。</li>
+  <li>本教程 <a href="../part0/0a8-cpu-worked-example.html">§0a-8</a>：CPU 端到端排障，包含 DataLoader 16 worker 反降的完整剧本。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

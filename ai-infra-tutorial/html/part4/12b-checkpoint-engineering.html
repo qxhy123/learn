@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 12b 章 · Checkpoint 工程化 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=12b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 12b 章 · Checkpoint 工程化</h1>
+<p class="sub">从故障率反推 checkpoint 频率，从分布式分片解剖 DCP 内部机制，从存储语义差异推导出 POSIX vs S3 的原子提交协议——把"保存模型"这件看似简单的事，变成可量化、可验证、可自动恢复的平台能力。</p>
+<div class="chips">
+  <span class="chip">DCP</span>
+  <span class="chip">Sharded Checkpoint</span>
+  <span class="chip">异步 Checkpoint</span>
+  <span class="chip">原子提交</span>
+  <span class="chip">Manifest</span>
+  <span class="chip">Retention 策略</span>
+  <span class="chip">175B Worked Example</span>
+  <span class="chip">故障率建模</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>训练任务故障一定会发生；恢复时间和数据安全直接决定训练成本，而 checkpoint 的保存代价又与训练吞吐相互博弈。如何在这两个成本之间找到可量化的最优解？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）——从故障率出发，推导出 DCP、异步保存、原子提交、retention 策略的必然性，最终以 175B/512×H100 端到端 worked example 收尾。</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解：Checkpoint 工程化</a></li>
+  <li><a class="anchor" href="#s2">Checkpoint 的层级结构</a></li>
+  <li><a class="anchor" href="#s3">同步 vs 异步 Checkpoint</a></li>
+  <li><a class="anchor" href="#s4">DCP 原理：Planner、Writer、Reader、Metadata</a></li>
+  <li><a class="anchor" href="#s5">TorchSnapshot、DCP、Megatron-LM 对比</a></li>
+  <li><a class="anchor" href="#s6">Checkpoint 元数据设计</a></li>
+  <li><a class="anchor" href="#s7">原子提交：POSIX vs 对象存储</a></li>
+  <li><a class="anchor" href="#s8">Checkpoint 频率决策模型</a></li>
+  <li><a class="anchor" href="#s9">Retention 策略</a></li>
+  <li><a class="anchor" href="#s10">Selective Checkpoint 与 LoRA Delta</a></li>
+  <li><a class="anchor" href="#s11">大模型 Checkpoint 实践：100B+ 规模</a></li>
+  <li><a class="anchor" href="#s12">Resume 策略</a></li>
+  <li><a class="anchor" href="#s13">与 Model Registry 集成</a></li>
+  <li><a class="anchor" href="#s14">Worked Example：175B / 512×H100 端到端流水线</a></li>
+  <li><a class="anchor" href="#s15">本章小结与练习</a></li>
+  <li><a class="anchor" href="#sref">深度参考阅读</a></li>
+</ol>
+</section>
+
+<!-- §1 第一性原理拆解 -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：Checkpoint 工程化</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 PyTorch DCP、FSDP、DeepSpeed、TorchSnapshot、Lustre、S3 multipart 这些工具名之后，Checkpoint 工程化要解决的不可化简问题是：<strong>训练任务故障一定会发生，恢复时间和数据安全直接决定训练成本，而保存和恢复的代价又与训练吞吐相互博弈。</strong></p>
+<p>"一定发生"不是夸张。一台 H100 的年度平均故障间隔（MTBF）大约 1–3 年，但一个 512 卡集群在时间维度上的"期望故障间隔"按卡数反比压缩，达到每几天一次的量级。加上调度器抢占、NCCL hang、存储断联、Xid 错误、驱动崩溃，任何超过数天的训练任务都必须假设"中途一定会断"。断了之后，损失的进度等于最后一次 checkpoint 到故障点之间的 token 数，这不是"几步训练"，而是真实的 GPU 小时数和云计算费用。一个 512 卡 H100 集群每小时算力成本约 $25,000–$40,000，直接等于一小时 checkpoint 频率对应的"最坏进度损失"的货币价值。</p>
+<p>同时，保存 checkpoint 本身也有代价：同步保存期间所有 GPU 空转，异步保存会占用 CPU 和本地盘带宽。175B 模型在 512 卡上，每次同步 checkpoint 可能需要 5–15 分钟的等待，相当于每小时吞吐损失 8–25%。因此 checkpoint 频率、保存延迟、存储后端、异步实现之间存在一个必须显式建模的博弈，而不是靠经验值随手设一个"每 1000 步"。</p>
+<p>这个问题还有第二层不可化简：分布式训练的 checkpoint 不是"一个文件"，而是 N×rank 的分片状态集合，包含模型参数分片、优化器状态分片、RNG 状态、sampler 进度、scheduler 状态、并行布局 metadata。这些必须全部对齐、全部校验、整体原子提交，才算一个"可恢复版本"。任何一个 rank 的分片缺失、损坏或版本不对齐，整个 checkpoint 都无法 true resume。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"保存有代价 + 故障一定发生"推出<strong>频率决策模型</strong>：最优 checkpoint 间隔 T* 是在进度损失期望值和保存开销之间取极小值，与集群故障率（λ）、单次保存延迟（t_save）和保存期间吞吐损失（η）共同决定。</p>
+<p>从"保存期间 GPU 空转"推出<strong>异步 checkpoint</strong>：把状态复制到 CPU 内存后立即恢复训练，后台在 CPU 上执行序列化和写盘。这把 GPU 阻塞时间从"序列化+写盘"压缩为仅"内存 copy"（~10–30 秒），代价是 CPU 内存必须额外保留一份训练状态。</p>
+<p>从"N 卡分片状态"推出<strong>sharded checkpoint</strong>：每个 rank 独立保存自己持有的分片，不 gather 到 rank 0，不存全量权重。这使写入带宽线性扩展（N 个 rank 并发写），避免 rank 0 成为瓶颈，但恢复时如果 rank 数发生变化（扩容/缩容/换卡），必须能重新 reshard——这是 DCP 设计中最复杂的部分。</p>
+<p>从"半成品 checkpoint 比没有 checkpoint 更危险"推出<strong>manifest + 原子提交</strong>：先写到 tmp 目录，所有 rank 写完后，rank 0 写 manifest，最后执行 rename（POSIX）或 finalize（S3 multipart），使整版 checkpoint 原子对外可见。</p>
+<p>从"rank 数可能变化"推出<strong>DCP 的 planner/writer/reader 设计</strong>：Planner 负责决定哪些 tensor 由哪些 rank 写/读，解耦物理 rank 布局和逻辑 state；storage_writer/storage_reader 负责把 planner 决策翻译成实际 I/O；metadata 记录每个分片的 key、shape、dtype、offset，使恢复时不依赖原始 rank 数。</p>
+<p>从"保留多少 checkpoint"推出<strong>retention 策略</strong>：训练过程中保留 rolling N 个最近、K 个 milestone，以及 best（按验证集 loss）。三类用途不同：rolling 用于快速恢复、milestone 用于消融实验和复现、best 用于最终发布。删除老 checkpoint 时必须查 registry 状态，防止删除仍被引用的版本。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Checkpoint 工程化))
+    不可化简问题
+      故障一定发生
+        集群 MTBF
+        故障率 × 卡数
+      进度损失 = 算力成本
+        GPU 小时
+        云计算费用
+      保存本身有代价
+        GPU 空转
+        带宽占用
+    层级结构
+      Framework 层
+        PyTorch state_dict
+        optimizer.state_dict
+        RNG state
+      Distributed 层
+        FSDP / DeepSpeed
+        sharded shard
+        planner / writer
+      Storage 层
+        本地 POSIX
+        并行 FS
+        对象存储
+    工程机制
+      异步 checkpoint
+        CPU 内存 copy
+        后台序列化
+        写盘 / 上传
+      Sharded checkpoint
+        per-rank 分片
+        metadata 解耦
+        reshard
+      原子提交
+        tmp dir
+        manifest
+        rename / finalize
+      Integrity check
+        checksum
+        shard 齐全验证
+    频率与保留
+      频率决策
+        故障率 λ
+        保存延迟 t_save
+        吞吐损失 η
+      Retention 策略
+        rolling N
+        milestone K
+        best
+    与平台集成
+      Registry 对接
+        版本标记
+        生命周期
+      Eval 门禁
+        验证集 loss
+        基准集
+      Resume 策略
+        from-last
+        from-best
+        from-step</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>为什么 checkpoint 频率不应该是固定经验值？集群故障率、保存延迟和吞吐损失如何共同决定最优间隔？</li>
+  <li>同步 checkpoint 的 GPU idle 代价怎么计算？异步 checkpoint（DCP async）把哪段延迟移出了关键路径？</li>
+  <li>DCP 的 planner、storage_writer、storage_reader、metadata 各自负责什么？为什么它能支持 rank 数变化时的 reshard？</li>
+  <li>一个 shard 级 checkpoint 的 manifest 至少要包含哪些字段才能保证 integrity？</li>
+  <li>对象存储的 checkpoint 原子提交协议与 POSIX rename 有什么本质区别？</li>
+  <li>175B 模型在 512 卡上做 sharded checkpoint，一次 save 的磁盘占用、写入带宽、上传时间和对吞吐的影响分别是多少？</li>
+  <li>Rolling、milestone、best 三类 checkpoint 的保留策略分别服务于什么用途？什么时候绝对不能删？</li>
+</ol>
+</section>
+
+<!-- §2 层级结构 -->
+<section class="section" id="s2">
+<h2>2. Checkpoint 的层级结构</h2>
+<p>大模型 checkpoint 工程化的第一步是弄清楚"checkpoint"在不同层次的含义。</p>
+
+<h3>2.1 Framework 层：PyTorch state_dict</h3>
+<p>最基础的 checkpoint 单元是 PyTorch 的 <code>state_dict</code>，包含模型参数、optimizer 状态、scheduler、RNG 状态、sampler 进度、step、tokens seen、tokenizer hash 和 code commit。</p>
+
+<div class="warn"><strong>只保存模型权重不是 checkpoint：</strong>如果 <code>optimizer.state_dict()</code> 缺失，恢复后 Adam 的一阶和二阶矩归零，相当于重新热身，loss 曲线出现明显跳变。这是 warm start，不是 true resume，在成本上与重新训练无本质区别。</div>
+
+<h3>2.2 Distributed 层：全量 vs 分片</h3>
+<p>分布式训练下每个 rank 只持有参数的一个分片（FSDP sharding、ZeRO Stage-2/3），不存在"完整的 state_dict"。</p>
+
+<table>
+  <thead>
+    <tr><th>方式</th><th>写入并发</th><th>单 rank 写入量（175B BF16）</th><th>rank 数变化支持</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>全量（rank 0 gather）</td><td>1</td><td>~1.05 TB</td><td>支持（但 rank 0 瓶颈）</td></tr>
+    <tr><td>Sharded（per rank）</td><td>N=512</td><td>~2.1 GB</td><td>需 reshard</td></tr>
+    <tr><td>Hybrid（per node）</td><td>节点数=64</td><td>~16 GB/node</td><td>部分支持</td></tr>
+  </tbody>
+</table>
+
+<h3>2.3 Storage 层：POSIX vs 并行 FS vs 对象存储</h3>
+<p>三种后端的语义差异决定了写入协议完全不同（详见 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c 文件系统</a>）：</p>
+
+<table>
+  <thead>
+    <tr><th>存储后端</th><th>适合场景</th><th>原子性保证</th><th>checkpoint 协议</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>本地 POSIX（ext4/xfs）</td><td>单节点、临时 staging</td><td><code>rename()</code> 同 FS 原子</td><td>write to tmp → fsync → rename → fsync(parent)</td></tr>
+    <tr><td>并行 FS（Lustre/GPFS）</td><td>多 rank 共享写、集群 NAS</td><td>POSIX rename 语义</td><td>同 POSIX，注意 MDS 元数据并发</td></tr>
+    <tr><td>对象存储（S3/GCS/OSS）</td><td>长期归档、跨地域</td><td>multipart + finalize</td><td>multipart upload → manifest PUT → marker key</td></tr>
+  </tbody>
+</table>
+
+<div class="danger"><strong>S3 没有 rename：</strong>S3 的"rename"是 copy + delete，不是原子操作。把 POSIX checkpoint 协议直接移植到 S3 会出现 tmp 目录 key 存在但 manifest 未写入的中间状态。正确协议：所有分片 multipart upload 完成 → 写 manifest JSON（含所有分片 key、checksum、size）→ 写 <code>checkpoint_latest</code> marker key 指向该版本。</div>
+</section>
+
+<!-- §3 同步 vs 异步 -->
+<section class="section" id="s3">
+<h2>3. 同步 vs 异步 Checkpoint</h2>
+
+<h3>3.1 同步保存的代价</h3>
+<p>同步 checkpoint 流程：all-reduce/step 完成 → 所有 rank 停下来 → 序列化 state_dict → 写盘 → 所有 rank 确认写完 → 继续训练。</p>
+<p>GPU idle 时间 = 序列化时间 + I/O 时间。175B BF16 参数 ~350 GB，FP32 Adam 状态 ~700 GB，共 ~1.05 TB。若 Lustre per-rank 写带宽约 2 GB/s，512 rank 并发，per-rank 写入量 ~2.1 GB，纯 I/O 约 1 秒，但序列化（safetensors 编码）和等待最慢 rank 的尾延迟往往让实际阻塞超过 60–300 秒。</p>
+
+<h3>3.2 异步 Checkpoint：DCP Async 模式</h3>
+<pre class="mermaid">sequenceDiagram
+    participant T as 训练线程
+    participant C as CPU 内存 (pinned)
+    participant W as 后台写线程
+    participant S as 存储后端
+
+    T->>C: copy tensors to CPU pinned memory (~20s)
+    Note over T,C: GPU 立即恢复训练
+    T-->>T: 继续 forward / backward
+    C->>W: 触发后台写任务
+    W->>S: serialize + write shards
+    W->>S: write manifest
+    Note over W,S: 与训练完全并行执行</pre>
+
+<table>
+  <thead>
+    <tr><th>方式</th><th>GPU 阻塞时间</th><th>CPU 内存额外占用</th><th>实现复杂度</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>同步（blocking）</td><td>序列化 + I/O（1–10 分钟）</td><td>无</td><td>低</td></tr>
+    <tr><td>异步（DCP async）</td><td>仅 CPU copy（10–30 秒）</td><td>1 份训练状态</td><td>中</td></tr>
+    <tr><td>异步 + 压缩</td><td>仅 CPU copy</td><td>压缩后约 50%</td><td>高</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>异步 checkpoint 的 OOM 风险：</strong>async copy 会在 CPU 内存中持有训练状态的完整副本。175B BF16 + FP32 Adam ~1.05 TB，若节点 CPU DRAM 小于此量级，async 模式会 OOM。需评估节点 CPU DRAM 容量（通常 512 GB–2 TB/节点）并限制并行 checkpoint 任务数（通常上限 1–2 个）。</div>
+
+<div class="warn"><strong>越大的集群越需要异步 checkpoint：</strong>1024 卡同步 checkpoint 每小时损失吞吐可达 38%，有效训练时间只有 62%。异步 checkpoint 是大规模训练的基础设施要求，不是可选优化。</div>
+</section>
+
+<!-- §4 DCP 原理 -->
+<section class="section" id="s4">
+<h2>4. DCP 原理：Planner、Writer、Reader、Metadata</h2>
+<p>PyTorch Distributed Checkpoint（<code>torch.distributed.checkpoint</code>，简称 DCP）是 PyTorch 2.x 推荐的分布式 checkpoint 方案，核心设计在于将"哪些数据由谁写/读"（planner）与"数据怎么写到存储"（writer/reader）解耦。</p>
+
+<h3>4.1 DCP 架构</h3>
+<pre class="mermaid">flowchart TD
+    A[训练状态\nstate_dict] --> B[SavePlanner\n拆解 WriteItem 列表]
+    B --> C[StorageWriter\n并发写分片]
+    C --> D[(存储后端\nLustre / S3)]
+    D --> E[metadata.json\n逻辑 key → 物理 offset]
+
+    F[(存储后端)] --> G[StorageReader\n按需 seek 读取]
+    G --> H[LoadPlanner\n分配 tensor 到新 rank]
+    H --> I[训练状态\n恢复完毕]
+
+    subgraph 保存路径
+        A --> B --> C --> D
+    end
+    subgraph 恢复路径
+        F --> G --> H --> I
+    end</pre>
+
+<h3>4.2 Planner 的逻辑 key 解耦设计</h3>
+<p><code>SavePlanner</code> 把 <code>state_dict</code> 中的每个 tensor 拆解成 <code>WriteItem</code> 列表，每个 item 包含：tensor 逻辑 key（不依赖 rank）、storage key（物理文件/prefix）、写入的字节范围（offset + length）、tensor metadata（shape、dtype、stride）。</p>
+<p><strong>关键：逻辑 key 与物理 rank 解耦。</strong>同一个逻辑参数（如 <code>transformer.layer.0.attn.weight</code>）在不同 rank 数配置下可以有不同的物理分片，但 planner 记录的是逻辑 key 和 byte range，不记录"rank N 写了哪些"。这是 DCP 能支持 reshard 的根本原因。</p>
+
+<h3>4.3 Reshard：rank 数变化时的处理</h3>
+<pre class="mermaid">flowchart LR
+    subgraph 原始 512 rank
+        direction TB
+        R1[rank 0 shard A]
+        R2[rank 1 shard B]
+        R3[... ...]
+        R512[rank 511 shard ZZ]
+    end
+    subgraph metadata.json
+        M[key → offset → length\n与 rank 无关]
+    end
+    subgraph 恢复 256 rank
+        direction TB
+        N1[新 rank 0\n加载 shard A+C+...]
+        N2[新 rank 1\n加载 shard B+D+...]
+    end
+    R1 --> M
+    R512 --> M
+    M --> N1
+    M --> N2</pre>
+
+<div class="warn"><strong>Reshard 的边界条件：</strong>Tensor Parallel 和 Pipeline Parallel 的分片布局不是 DCP 内置的，需要 planner 的自定义 <code>transform_state_dict</code> 钩子处理。如果 TP size 或 PP size 同时改变，还需要额外的参数重组逻辑，不是 DCP 开箱即用能处理的。</div>
+
+<h3>4.4 metadata.json 结构示例</h3>
+<pre><code>{
+  "format": "pytorch_dcp",
+  "version": "1.0",
+  "storage_data": {
+    "transformer.layer.0.attn.weight": [
+      {
+        "storage_key": "0.pt",
+        "offset": 0,
+        "length": 524288,
+        "properties": {
+          "dtype": "bfloat16",
+          "shape": [4096, 1024],
+          "stride": [1024, 1]
+        }
+      }
+    ]
+  },
+  "planner_data": {
+    "pytorch_version": "2.3.0",
+    "dp_size": 512,
+    "tp_size": 8,
+    "pp_size": 4
+  }
+}</code></pre>
+</section>
+
+<!-- §5 框架对比 -->
+<section class="section" id="s5">
+<h2>5. TorchSnapshot、DCP、Megatron-LM Checkpoint 对比</h2>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>PyTorch DCP</th><th>TorchSnapshot</th><th>Megatron-LM ckpt</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>维护方</td><td>PyTorch 官方</td><td>Meta（已归档）</td><td>NVIDIA</td></tr>
+    <tr><td>主要模式</td><td>Sharded per-rank</td><td>Sharded per-rank</td><td>Sharded per-rank + global</td></tr>
+    <tr><td>Async 支持</td><td>内置 async API</td><td>内置 async</td><td>外部实现</td></tr>
+    <tr><td>Reshard 支持</td><td>原生支持</td><td>原生支持</td><td>手动，需 merge+split 脚本</td></tr>
+    <tr><td>metadata 格式</td><td>JSON，逻辑 key</td><td>JSON，逻辑 key</td><td>目录结构 + tracker file</td></tr>
+    <tr><td>存储后端抽象</td><td>StorageWriter 接口</td><td>存储插件</td><td>写死 POSIX / S3 路径</td></tr>
+    <tr><td>原子提交</td><td>依赖 writer 实现</td><td>内置 finalize</td><td>tmp dir + rename</td></tr>
+    <tr><td>与 FSDP 集成</td><td>原生</td><td>需适配</td><td>不适用（MP only）</td></tr>
+    <tr><td>推荐场景</td><td>PyTorch 生态大模型</td><td>迁移到 DCP</td><td>Megatron-Core 训练</td></tr>
+    <tr><td>当前状态</td><td>活跃开发</td><td>已停止维护</td><td>活跃开发</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>TorchSnapshot 已归档：</strong>Meta 将 TorchSnapshot 的功能合并到 PyTorch DCP，新项目不建议使用 TorchSnapshot。迁移路径是替换 <code>snapshot.save/restore</code> 为 <code>dist_cp.save/load</code>，planner 语义基本兼容。</div>
+</section>
+
+<!-- §6 元数据设计 -->
+<section class="section" id="s6">
+<h2>6. Checkpoint 元数据设计</h2>
+<p>一个完整的 checkpoint 元数据不只是 step 和版本号，而是把"恢复时需要的所有判断条件"全部记录：</p>
+
+<pre><code># checkpoint_manifest.yaml
+version: "1.0"
+format: "pytorch_dcp"
+checkpoint_id: "ckpt-step-52000-20260503-142530"
+step: 52000
+tokens_seen: 2_184_320_000_000    # 2.18T tokens
+wall_time_s: 187200               # 52 小时训练时间
+created_at: "2026-05-03T14:25:30Z"
+
+model:
+  arch: "llama3-175b"
+  tp_size: 8
+  pp_size: 4
+  dp_size: 16     # 8×4×16 = 512 rank
+
+training:
+  global_batch_size: 4096
+  seq_len: 8192
+  lr: 2.4e-5
+  code_commit: "a3803d5c33e862adf"
+  config_hash: "sha256:b7f3e9a2..."
+
+data:
+  dataset_version: "pile-v3-dedup"
+  tokenizer_hash: "sha256:c4d1f8b9..."
+  shard_index: 52000
+
+shards:
+  total: 512
+  files:
+    - key: "rank_0000.pt"
+      size_bytes: 2147483648
+      sha256: "a1b2c3d4..."
+  metadata_key: "metadata.json"
+
+eval:
+  val_loss: 2.1834
+  ppl: 8.87
+
+tags: ["rolling"]
+status: "committed"</code></pre>
+
+<table>
+  <thead>
+    <tr><th>字段</th><th>用途</th><th>缺失后果</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>step</code> / <code>tokens_seen</code></td><td>恢复训练进度</td><td>不知道从哪继续，可能重复训练</td></tr>
+    <tr><td><code>tokenizer_hash</code></td><td>验证 tokenizer 版本一致性</td><td>tokenizer 更新后恢复出词汇错位</td></tr>
+    <tr><td><code>code_commit</code></td><td>复现和排障</td><td>无法确定哪个代码版本产生此 ckpt</td></tr>
+    <tr><td><code>tp_size/pp_size/dp_size</code></td><td>reshard 决策</td><td>无法判断是否需要 reshard</td></tr>
+    <tr><td><code>shard_index</code></td><td>data sampler 状态</td><td>恢复后重复数据或跳过数据</td></tr>
+    <tr><td><code>sha256</code> per shard</td><td>integrity check</td><td>无法检测位翻转或部分写失败</td></tr>
+    <tr><td><code>val_loss</code></td><td>best checkpoint 选择</td><td>无法自动选 best 用于发布</td></tr>
+    <tr><td><code>status</code></td><td>原子提交状态</td><td>无法区分完整版本和半成品</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- §7 原子提交 -->
+<section class="section" id="s7">
+<h2>7. 原子提交：POSIX vs 对象存储</h2>
+
+<h3>7.1 POSIX 原子提交协议</h3>
+<pre class="mermaid">sequenceDiagram
+    participant R as 所有 Rank
+    participant T as ckpt_tmp_step52000/
+    participant F as ckpt_step52000/
+    participant P as parent dir
+
+    R->>T: 写 rank_N.pt 到 tmp 目录
+    R->>T: fsync(rank_N.pt)
+    Note over R: barrier：等所有 rank 写完
+    R->>T: rank 0 写 manifest.yaml
+    R->>T: fsync(manifest.yaml)
+    R->>F: rename(tmp → 正式目录)
+    R->>P: fsync(parent dir)
+    Note over F: 整版 checkpoint 原子对外可见
+    R->>F: 更新 latest 软链接
+    R->>F: fsync(软链接所在目录)</pre>
+
+<p>关键点：(1) <code>rename()</code> 在同一文件系统内是原子操作（POSIX 保证）；(2) 必须 <code>fsync(parent dir)</code> 才能保证目录项在断电后持久化；(3) 跨挂载点 rename 不是原子操作，不能跨 NFS 挂载做 checkpoint。</p>
+
+<h3>7.2 对象存储原子提交协议</h3>
+<pre class="mermaid">sequenceDiagram
+    participant R as 所有 Rank
+    participant S as S3 Bucket
+    participant M as Manifest Key
+
+    R->>S: multipart upload rank_N.pt (每 part 100–200 MB)
+    R->>S: complete_multipart_upload（服务端原子）
+    Note over R: barrier：等所有 rank upload 完成
+    R->>M: rank 0 PUT manifest.json（含所有分片 key + sha256）
+    R->>S: rank 0 PUT ckpt_latest = "step52000"
+    Note over S: marker key 写入后，版本对外可见</pre>
+
+<div class="success"><strong>S3 版本化可防止覆盖：</strong>开启 S3 Bucket versioning 后，即使 manifest 被意外覆盖，旧版本仍可恢复。建议在 checkpoint bucket 上开启 versioning 并设置 Object Lock，防止误删。</div>
+
+<div class="danger"><strong>LIST prefix 不是事务边界：</strong>不要用 <code>s3 ls s3://bucket/ckpt_step52000/</code> 判断 checkpoint 是否完整，LIST 看到的文件可能来自多个并发写入操作的混合状态。必须用 manifest 的存在性和内容作为完整性判断。</div>
+</section>
+
+<!-- §8 频率决策 -->
+<section class="section" id="s8">
+<h2>8. Checkpoint 频率决策模型</h2>
+
+<h3>8.1 从故障率反推最优频率</h3>
+<p>设 λ = 集群故障率（次/小时），T = checkpoint 间隔（小时），t_save = 每次 checkpoint 耗时（小时）。期望进度损失成本：</p>
+<pre><code>E[loss] = λ × C × T²/2</code></pre>
+<p>对 T 求导取极小值，近似最优间隔：</p>
+<pre><code>T* = sqrt(2 × t_save / λ)</code></pre>
+
+<table>
+  <thead>
+    <tr><th>场景</th><th>λ（次/小时）</th><th>t_save（分钟）</th><th>T*（分钟）</th><th>吞吐损失</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>512 卡 H100（同步）</td><td>0.2</td><td>10</td><td>44</td><td>~23%</td></tr>
+    <tr><td>512 卡 H100（异步）</td><td>0.2</td><td>0.5</td><td>10</td><td>~5%</td></tr>
+    <tr><td>1024 卡 H100（同步）</td><td>0.4</td><td>15</td><td>39</td><td>~38%</td></tr>
+    <tr><td>1024 卡 H100（异步）</td><td>0.4</td><td>0.5</td><td>5</td><td>~10%</td></tr>
+  </tbody>
+</table>
+
+<h3>8.2 频率决策表</h3>
+<table>
+  <thead>
+    <tr><th>训练规模</th><th>模型大小</th><th>建议间隔</th><th>建议模式</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>&lt;64 卡</td><td>&lt;7B</td><td>每 1000 步或 30 分钟</td><td>同步</td><td>故障率低，影响可接受</td></tr>
+    <tr><td>64–256 卡</td><td>7B–70B</td><td>每 500 步或 20 分钟</td><td>异步</td><td>故障率上升</td></tr>
+    <tr><td>256–1024 卡</td><td>70B–175B</td><td>每 200 步或 10 分钟</td><td>异步 + 并行上传</td><td>需精确建模 T*</td></tr>
+    <tr><td>&gt;1024 卡</td><td>&gt;175B</td><td>每 100 步或 5 分钟</td><td>异步 + 内存映射</td><td>吞吐影响需持续监控</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- §9 Retention -->
+<section class="section" id="s9">
+<h2>9. Retention 策略</h2>
+
+<pre class="mermaid">flowchart TD
+    CK[新 checkpoint 写入] --> R[Rolling 保留\n最近 N 个]
+    CK --> M[Milestone 保留\n固定 step 快照]
+    CK --> B[Best 保留\n最低 val loss]
+
+    R --> DEL1[超出 N 个时\n删除最老 rolling ckpt]
+    M --> ARCH1[永久保留\n可归档到冷存储]
+    B --> DEL2[新 best 出现\n降级旧 best]
+
+    DEL1 --> CHK[检查 Registry\n是否被引用]
+    CHK --> SKIP[仍在引用\n跳过删除]
+    CHK --> EXEC[无引用\n执行删除]</pre>
+
+<table>
+  <thead>
+    <tr><th>保留类型</th><th>数量</th><th>触发删除条件</th><th>绝对不删条件</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Rolling</td><td>最近 3–5 个</td><td>超出数量</td><td>仍有 eval job 引用</td></tr>
+    <tr><td>Milestone</td><td>固定 step 快照（100K/200K/...）</td><td>不自动删除</td><td>永久保留</td></tr>
+    <tr><td>Best</td><td>1–3 个</td><td>新 best 出现</td><td>已发布到 production</td></tr>
+  </tbody>
+</table>
+
+<div class="danger"><strong>不要按文件年龄删除 checkpoint：</strong>age-based 删除会同时误删 milestone 和 best checkpoint。必须按类型 + registry 引用状态做决策，否则可能删掉唯一能恢复的版本。</div>
+
+<h3>9.1 磁盘估算（175B 示例）</h3>
+<p>175B BF16（~350 GB）+ FP32 Adam（~700 GB）= ~1.05 TB/ckpt。保留最近 5 个 rolling + 5 个 milestone + 1 个 best = 11 个，磁盘占用：<code>11 × 1.05 TB ≈ 11.55 TB</code>（仅 checkpoint，不含日志和 eval 结果）。</p>
+</section>
+
+<!-- §10 Selective Checkpoint -->
+<section class="section" id="s10">
+<h2>10. Selective Checkpoint 与 LoRA Delta</h2>
+
+<table>
+  <thead>
+    <tr><th>类型</th><th>保存内容</th><th>大小（175B）</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Full checkpoint</td><td>所有参数 + optimizer + RNG</td><td>~1.05 TB</td><td>True resume</td></tr>
+    <tr><td>权重 only</td><td>仅模型参数（BF16）</td><td>~350 GB</td><td>推理 / 评测</td></tr>
+    <tr><td>LoRA delta</td><td>仅 LoRA 参数（A/B 矩阵）</td><td>~50–500 MB</td><td>SFT/RLHF 快速保存</td></tr>
+    <tr><td>Activation checkpoint</td><td>中间激活（不持久化）</td><td>取决于 recompute 策略</td><td>节省显存</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>LoRA delta checkpoint 注意事项：</strong>保存 LoRA delta 时，必须同时记录 base model 版本 hash，否则 delta 和 base 不对应，恢复后权重损坏。RLHF 多模型 checkpoint 场景（Policy + Reward + Reference 模型同时训练）需要在 manifest 中记录所有模型的 step 对应关系，保证三个模型状态一致。</div>
+</section>
+
+<!-- §11 大模型实践 -->
+<section class="section" id="s11">
+<h2>11. 大模型 Checkpoint 实践：100B+ 规模</h2>
+
+<h3>11.1 并行上传设计</h3>
+<p>175B 模型在 512 卡上，每次 checkpoint 后向 S3 上传约 1.05 TB：每个 rank 独立上传自己的分片（~2.1 GB/rank），512 rank 并发上传，每个 rank 并发 4 个 multipart part，有效并发 2048 个 upload stream。若 S3 带宽约 50 GB/s，上传时间约 21 秒（理论），加上序列化和 manifest 写入，实际约 30–60 秒。</p>
+
+<div class="success"><strong>并行上传的工程关键：</strong>(1) 每个 rank 上传自己的分片，不让 rank 0 聚合；(2) 使用 multipart upload，每 part 100–200 MB，允许失败重传；(3) upload 失败后有重试队列，不是整版 checkpoint 重新开始；(4) manifest 只在所有分片 upload 成功后才写入。</div>
+
+<h3>11.2 网络带宽与时间估算</h3>
+<table>
+  <thead>
+    <tr><th>操作</th><th>数据量（175B FP16+FP32 Adam）</th><th>理想时间（50 GB/s）</th><th>实际时间</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>同步写 Lustre（512 rank 并发）</td><td>1.05 TB</td><td>~21 s</td><td>60–300 s</td></tr>
+    <tr><td>异步写 Lustre（CPU copy）</td><td>GPU 阻塞仅 copy</td><td>10–30 s（GPU block）</td><td>后台继续 60–300 s</td></tr>
+    <tr><td>上传 S3（512 rank 并发）</td><td>1.05 TB</td><td>~21 s</td><td>30–60 s</td></tr>
+    <tr><td>Integrity check（sha256）</td><td>per rank ~2.1 GB</td><td>per rank ~2 s</td><td>并发，整体 5–10 s</td></tr>
+  </tbody>
+</table>
+
+<h3>11.3 文件系统选型对 Checkpoint 的影响</h3>
+<table>
+  <thead>
+    <tr><th>文件系统</th><th>Checkpoint 写入性能</th><th>元数据开销</th><th>推荐角色</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ext4/xfs（本地 NVMe）</td><td>高（3–7 GB/s/node）</td><td>低</td><td>异步 checkpoint 的 CPU-side staging</td></tr>
+    <tr><td>Lustre</td><td>高（聚合 100s GB/s）</td><td>MDS 是瓶颈</td><td>集群共享 checkpoint 主存储</td></tr>
+    <tr><td>GPFS/Spectrum Scale</td><td>高，小文件更优</td><td>低</td><td>替代 Lustre 的企业选择</td></tr>
+    <tr><td>NFS</td><td>低（~1 GB/s）</td><td>高</td><td>不推荐大规模 checkpoint</td></tr>
+    <tr><td>S3/GCS</td><td>中（弹性）</td><td>无 POSIX</td><td>长期归档，不做训练时主存储</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- §12 Resume 策略 -->
+<section class="section" id="s12">
+<h2>12. Resume 策略</h2>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>从哪个 checkpoint 恢复</th><th>适用场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>from-last</td><td>最新提交的 checkpoint</td><td>故障后自动恢复（最常见）</td></tr>
+    <tr><td>from-best</td><td>val loss 最低的 checkpoint</td><td>过拟合后回退</td></tr>
+    <tr><td>from-step N</td><td>指定 step 的 checkpoint</td><td>消融实验、分支训练</td></tr>
+    <tr><td>from-scratch</td><td>不加载 checkpoint</td><td>重新训练</td></tr>
+  </tbody>
+</table>
+
+<div class="warn"><strong>resume 后必须验证训练语义：</strong>恢复后的前几个 step，应检查 loss 是否平滑衔接（不出现突变）、global step 是否正确、学习率是否按 scheduler 继续（不从头 warmup）、data sampler 是否从正确位置继续（不重复或跳过）。这些检查应该是自动化脚本，而不是人工目测 loss 曲线。</div>
+</section>
+
+<!-- §13 与 Registry 集成 -->
+<section class="section" id="s13">
+<h2>13. 与 Model Registry 集成</h2>
+<pre class="mermaid">flowchart LR
+    A[checkpoint 写入完成\nmanifest committed] --> B[注册到 Registry\n含 step / val_loss / metadata]
+    B --> C{触发评测 job\n验证集 ppl / 基准集}
+    C --> |通过| D[状态: validated\n标记为候选]
+    C --> |失败| E[状态: failed\n保留但不升级]
+    D --> F{发布门禁\n人工审批或自动}
+    F --> |通过| G[状态: staging\n灰度流量]
+    G --> H[状态: production\n全量]
+    H --> |需回滚| B</pre>
+
+<div class="success"><strong>checkpoint 转模型包：</strong><code>validated</code> 状态的 checkpoint 可以被转换为"模型包"：提取纯权重（BF16，去掉 optimizer state），打包 tokenizer、config、推理适配层，发布到 serving registry。转换不应直接修改 checkpoint 本身，而是派生出一个独立的 model package artifact。详见 <a href="12-artifacts-and-checkpoints.html">第 12 章 · 制品管理</a>。</div>
+</section>
+
+<!-- §14 Worked Example -->
+<section class="section" id="s14">
+<h2>14. Worked Example：175B / 512×H100 端到端 Checkpoint 流水线</h2>
+
+<h3>14.1 场景设定</h3>
+<table>
+  <thead>
+    <tr><th>参数</th><th>值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>模型</td><td>175B LLaMA-3 变体，BF16 权重</td></tr>
+    <tr><td>集群</td><td>512 × H100-80GB，64 节点 × 8 卡</td></tr>
+    <tr><td>并行配置</td><td>TP=8, PP=4, DP=16</td></tr>
+    <tr><td>BF16 权重大小</td><td>175B × 2 bytes = 350 GB</td></tr>
+    <tr><td>FP32 Adam 状态</td><td>175B × 4 bytes = 700 GB（一阶+二阶矩）</td></tr>
+    <tr><td>总 checkpoint 大小</td><td>~1.05 TB</td></tr>
+    <tr><td>训练速度</td><td>~3,500 tokens/s/GPU × 512 = 1,792,000 tokens/s</td></tr>
+    <tr><td>checkpoint 频率</td><td>每 60 分钟（约 6.4B tokens）</td></tr>
+    <tr><td>故障率 λ</td><td>~0.2 次/小时（512 卡集群经验值）</td></tr>
+  </tbody>
+</table>
+
+<h3>14.2 端到端流程</h3>
+
+<p><strong>Step 1：触发异步 checkpoint</strong>（training step 完成后）</p>
+<pre><code># 每 N step 或每 T 秒触发
+if should_checkpoint(step, last_ckpt_time):
+    # GPU 阻塞：把所有 tensor copy 到 CPU pinned memory
+    cpu_state = copy_to_cpu(model, optimizer, scheduler)  # ~20s
+    # 启动后台任务，训练立即恢复
+    ckpt_future = async_ckpt_pool.submit(
+        save_checkpoint,
+        cpu_state,
+        step=step,
+        tokens_seen=tokens_seen,
+    )
+    training_resumes()  # GPU 立即继续</code></pre>
+<p>GPU 阻塞时间：约 20–30 秒（CPU pinned memory copy，带宽约 30–50 GB/s）。</p>
+
+<p><strong>Step 2：后台序列化 + 写 Lustre</strong></p>
+<p>DCP SavePlanner 把 state_dict 拆成 512 个 WriteItem，每个 rank 写约 2.1 GB 到 <code>ckpt_tmp_step52000/rank_XXXX.pt</code>，Lustre stripe count=64，有效写带宽约 2 GB/s/rank，序列化+写盘约 60–120 秒（与训练并行）。</p>
+
+<p><strong>Step 3：Barrier + Manifest + POSIX rename</strong></p>
+<pre><code>dist.barrier()  # 所有 rank 写完后 barrier
+if rank == 0:
+    manifest = compute_manifest(ckpt_tmp_dir)  # 计算所有分片 sha256
+    write_manifest(manifest, f"ckpt_tmp_step{step}/manifest.yaml")
+    fsync(manifest_file)
+    os.rename(f"ckpt_tmp_step{step}", f"ckpt_step{step}")
+    fsync(parent_dir)
+    update_symlink("latest", f"ckpt_step{step}")</code></pre>
+
+<p><strong>Step 4：并行上传 S3（Lustre → S3 归档）</strong></p>
+<p>512 rank 并发启动 S3 multipart upload，每个分片约 2.1 GB，分成 21 个 100 MB part。有效上传带宽：64 节点 × 25 Gbps ≈ 200 GB/s，上传时间约 5.25 秒（理论），实际约 20–40 秒。上传完成后 rank 0 写 S3 manifest + marker key。</p>
+
+<p><strong>Step 5：Integrity Check</strong></p>
+<pre><code># 每个 rank 验证自己的分片
+local_sha256 = sha256(f"ckpt_step{step}/rank_{rank:04d}.pt")
+assert local_sha256 == manifest["shards"][rank]["sha256"]
+
+# rank 0 验证所有 S3 分片 ETag
+if rank == 0:
+    for shard in manifest["shards"]:
+        verify_s3_etag(shard["key"], shard["md5"])</code></pre>
+
+<p><strong>Step 6：更新 Registry + 触发 Eval</strong></p>
+<pre><code>if rank == 0:
+    registry.register(
+        checkpoint_id=f"ckpt-step-{step}",
+        step=step,
+        tokens_seen=tokens_seen,
+        val_loss=eval_result.loss,
+        manifest_s3_path=f"s3://ckpt-bucket/ckpt_step{step}/manifest.yaml",
+        status="committed",
+        tags=["rolling"],
+    )
+    eval_queue.submit(checkpoint_id=f"ckpt-step-{step}")</code></pre>
+
+<p><strong>Step 7：Retention 清理</strong></p>
+<pre><code>rolling = registry.list(tags=["rolling"], sort="step")
+if len(rolling) > 5:
+    oldest = rolling[0]
+    if not registry.is_referenced(oldest.checkpoint_id):
+        delete_checkpoint(oldest)
+        registry.mark_deleted(oldest.checkpoint_id)</code></pre>
+
+<h3>14.3 汇总数字</h3>
+<table>
+  <thead>
+    <tr><th>指标</th><th>数值</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>每次 checkpoint 磁盘占用</td><td>~1.05 TB</td><td>Lustre 上临时 + 正式</td></tr>
+    <tr><td>S3 归档大小</td><td>~1.05 TB</td><td>含 manifest，不压缩</td></tr>
+    <tr><td>Rolling 保留（5个）磁盘</td><td>~5.25 TB</td><td>Lustre</td></tr>
+    <tr><td>GPU 阻塞时间（异步）</td><td>20–30 秒</td><td>CPU copy</td></tr>
+    <tr><td>后台写盘时间（Lustre）</td><td>60–120 秒</td><td>与训练并行</td></tr>
+    <tr><td>S3 上传时间</td><td>20–40 秒</td><td>与训练并行</td></tr>
+    <tr><td>对训练吞吐影响（异步）</td><td>~0.5–1.5%/小时</td><td>仅 GPU block 时间</td></tr>
+    <tr><td>对训练吞吐影响（同步）</td><td>~5–25%/小时</td><td>序列化+写盘全阻塞</td></tr>
+  </tbody>
+</table>
+
+<div class="success"><strong>核心收益量化：</strong>异步 checkpoint 将吞吐损失从 5–25% 压缩到 0.5–1.5%。在 512 卡 H100 集群（约 $30,000/小时），每次训练节省数千美元 GPU 成本，是大规模训练中 ROI 最高的工程优化之一。</div>
+</section>
+
+<!-- §15 小结与练习 -->
+<section class="section" id="s15">
+<h2>15. 本章小结与练习</h2>
+
+<h3>15.1 本章小结</h3>
+<table>
+  <thead>
+    <tr><th>机制</th><th>解决的问题</th><th>关键工程边界</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Sharded checkpoint</td><td>避免 rank 0 带宽瓶颈</td><td>rank 数变化需 reshard</td></tr>
+    <tr><td>异步 checkpoint（DCP）</td><td>消除 GPU idle</td><td>CPU 内存需额外 1 份训练状态</td></tr>
+    <tr><td>Manifest + 原子提交</td><td>防止半成品 checkpoint</td><td>S3 不能用 rename，需 multipart + marker</td></tr>
+    <tr><td>Integrity check</td><td>检测位翻转和部分写失败</td><td>sha256 计算本身有 CPU 开销</td></tr>
+    <tr><td>频率决策模型</td><td>量化最优 checkpoint 间隔</td><td>需持续监控实际故障率</td></tr>
+    <tr><td>Retention 策略</td><td>控制存储成本，保留关键版本</td><td>必须查 registry 引用状态</td></tr>
+    <tr><td>Registry 集成</td><td>checkpoint → eval → 发布</td><td>eval 必须异步，不能阻塞训练</td></tr>
+  </tbody>
+</table>
+
+<h3>15.2 练习题</h3>
+
+<div class="card">
+<p><strong>12b-1</strong>　一个 70B 模型在 256 卡 H100 上训练，集群平均故障率 0.15 次/小时，异步 checkpoint 的 GPU 阻塞时间 15 秒，忽略其他开销。用 T* = sqrt(2 × t_save / λ) 计算最优 checkpoint 间隔。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-2</strong>　解释为什么 DCP 的 planner 设计能支持 rank 数变化时的 reshard，而 Megatron-LM 的传统 checkpoint 需要额外脚本处理同样的问题。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-3</strong>　设计一个 S3 multipart checkpoint 的原子提交协议：当 rank 5 的 upload 在 part 7/21 失败时，系统应该怎么处理？写出错误恢复流程。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-4</strong>　一个团队把 checkpoint 保存到 S3，用 <code>s3 ls s3://bucket/ckpt_step52000/</code> 来判断 checkpoint 是否完整。列出这个做法的至少 3 个风险。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-5</strong>　解释 <code>tokenizer_hash</code> 字段在 checkpoint manifest 中的作用。举一个 tokenizer 版本不一致导致恢复失败的具体场景。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-6</strong>　一个 175B 模型每小时 checkpoint 一次，同步模式写盘需要 8 分钟。计算这 8 分钟对每小时训练吞吐的影响百分比。如果换成异步模式（GPU block 25 秒），影响变为多少？</p>
+</div>
+
+<div class="card">
+<p><strong>12b-7</strong>　设计 rolling + milestone + best 三类 retention 策略的具体参数：(1) 每次 checkpoint 1.05 TB，总 Lustre 容量 50 TB，最多能保留多少个 rolling？(2) milestone 应该设在哪些 step？(3) 如果 best checkpoint 同时也是 rolling 最新的，清理时怎么处理？</p>
+</div>
+
+<div class="card">
+<p><strong>12b-8</strong>　解释为什么 LoRA delta checkpoint 必须在 manifest 中记录 base model 版本 hash。如果 base model 在 LoRA 训练期间被更新了，恢复时会发生什么？</p>
+</div>
+
+<div class="card">
+<p><strong>12b-9</strong>　比较 PyTorch DCP 的 <code>FileSystemWriter</code> 和一个假想的 <code>S3Writer</code> 在原子提交语义上的实现差异。哪些 DCP 接口需要 S3Writer 实现？</p>
+</div>
+
+<div class="card">
+<p><strong>12b-10</strong>　一个团队把 RLHF 的 Policy、Reward、Reference 三个模型的 checkpoint 分别保存，但没有在 manifest 中记录三者的 step 对应关系。描述一个因此导致的恢复失败场景，并设计修复方案。</p>
+</div>
+
+<div class="card">
+<p><strong>12b-11</strong>　为一个 512 卡 H100 集群设计 checkpoint 监控仪表盘的最小指标集：应该监控哪些数值，设置什么告警阈值？</p>
+</div>
+
+<div class="card">
+<p><strong>12b-12</strong>　解释 T* = sqrt(2 × t_save / λ) 公式的推导假设。在哪些真实场景下这个公式会明显低估或高估最优间隔？给出 2 个具体反例。</p>
+</div>
+</section>
+
+<!-- §ref 参考资料 -->
+<section class="refbox" id="sref">
+<h2>深度参考阅读</h2>
+
+<h3>学习路线</h3>
+<p>本章是 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章 · 内存优化与 Checkpoint 基础</a> 的工程化深挖，建议先完成第 10 章再阅读本章。本章与 <a href="12-artifacts-and-checkpoints.html">第 12 章 · 制品管理</a> 直接衔接，理解 checkpoint 是 artifact registry 的核心 artifact 类型。存储语义基础见 <a href="../part0/0c-filesystems-and-storage-internals.html">§0c 文件系统与存储内核</a>。</p>
+
+<h3>PyTorch 官方文档与源码</h3>
+<ul>
+  <li>PyTorch DCP 官方文档：<code>torch.distributed.checkpoint</code> API reference（PyTorch &gt;= 2.1）</li>
+  <li>PyTorch DCP 设计文档：Distributed Checkpoint (DCP) RFC（github.com/pytorch/pytorch/issues/88378）</li>
+  <li>FSDP + DCP 集成示例：<code>torch/distributed/fsdp/_shard_utils.py</code></li>
+</ul>
+
+<h3>框架实现</h3>
+<ul>
+  <li>Megatron-LM checkpoint 实现：<code>megatron/checkpointing.py</code>（NVIDIA GitHub）</li>
+  <li>DeepSpeed ZeRO checkpoint：<code>deepspeed/runtime/zero/stage_1_and_2.py</code> 中的 <code>save_checkpoint</code> 实现</li>
+  <li>TorchSnapshot（Meta，已归档）：github.com/facebookresearch/torchsnapshot</li>
+</ul>
+
+<h3>论文与技术报告</h3>
+<ul>
+  <li><strong>Gemini 训练技术报告</strong>（2024）：Google 在 TPU Pod 上的大规模 checkpoint 和故障恢复</li>
+  <li><strong>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</strong>（Shoeybi et al., 2019）：checkpoint 分片策略</li>
+  <li><strong>PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</strong>（Meta, 2023）：FSDP + DCP 实际使用经验</li>
+  <li><strong>PaLM: Scaling Language Modeling with Pathways</strong>（2022）：大规模训练故障率和恢复策略数据</li>
+</ul>
+
+<h3>工程博客</h3>
+<ul>
+  <li>Meta Engineering：「How Meta trains large language models at scale」（2023）</li>
+  <li>EleutherAI：「GPT-NeoX-20B: An Open-Source Autoregressive Language Model」（checkpoint 策略部分）</li>
+  <li>Weights &amp; Biases 博客：「Checkpoint Management at Scale」</li>
+  <li>HuggingFace 博客：「Large-scale model training with PyTorch FSDP」</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+
+<footer class="footer">
+  <p>AI Infra 教程 · 第 12b 章 · Checkpoint 工程化</p>
+</footer>
+</main>
+
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

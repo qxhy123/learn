@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 12c 章 · 制品版本治理与发布门禁 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=12c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 12c 章 · 制品版本治理与发布门禁</h1>
+<p class="sub">模型发布不是"把文件推上去"，而是一条从训练完成到线上流量的证明链——证明这个版本足够安全、足够正确、足够兼容，并且出了问题可以在 5 分钟内找到上一个确定可用的版本。版本治理是把离散的模型文件变成可追溯、可回滚、可审计的平台对象的工程基础设施。</p>
+<div class="chips">
+  <span class="chip">Immutable Artifact</span>
+  <span class="chip">Promotion Gate</span>
+  <span class="chip">SemVer vs Hash</span>
+  <span class="chip">4-eyes Rule</span>
+  <span class="chip">Kill Switch</span>
+  <span class="chip">Deprecation</span>
+  <span class="chip">GitOps</span>
+  <span class="chip">统计显著性</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>模型的线上版本必须可追溯、可回滚、可审计，任何错误的 promotion 都会污染线上服务并影响真实用户——而且这种污染通常在 A/B 数据积累到统计显著性之前，对运维系统完全不可见。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解：制品版本治理与发布门禁</a></li>
+  <li><a class="anchor" href="#s2">版本号策略：为什么这个问题没有唯一答案</a></li>
+  <li><a class="anchor" href="#s3">Promotion 状态机：模型版本的生命周期</a></li>
+  <li><a class="anchor" href="#s4">多层评测门禁体系</a></li>
+  <li><a class="anchor" href="#s5">兼容性门禁：最容易被忽视的一类</a></li>
+  <li><a class="anchor" href="#s6">性能门禁：防止 Regression</a></li>
+  <li><a class="anchor" href="#s7">安全门禁</a></li>
+  <li><a class="anchor" href="#s8">自动化 Release Pipeline</a></li>
+  <li><a class="anchor" href="#s9">审批流：谁有权力把模型推到 Production</a></li>
+  <li><a class="anchor" href="#s10">发布预算与 Kill Switch</a></li>
+  <li><a class="anchor" href="#s11">与 Ch 22 灰度发布的协同</a></li>
+  <li><a class="anchor" href="#s12">模型 Deprecation：版本退休流程</a></li>
+  <li><a class="anchor" href="#s13">Worked Example：Staging → Production 端到端演练</a></li>
+  <li><a class="anchor" href="#s14">练习</a></li>
+</ol>
+</section>
+
+<!-- ===== §1 ===== -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：制品版本治理与发布门禁</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 GitOps、ArgoCD、MLflow、SemVer、SBOM、4-eyes approval 这些词之后，本章要解决的不可化简问题只有一个：<strong>模型的线上版本必须可追溯、可回滚、可审计，任何错误的 promotion 都会污染线上服务并影响真实用户</strong>。</p>
+<p>先定位问题的严重性。普通软件的发布失败通常是"接口报 500"或"构建失败"，发现成本低，自动回滚代价也低。模型的发布失败经常是"接口返回 200，但回答质量退化了 8%"，或者"新 tokenizer 对某类输入的处理方式悄然改变，下游 parsing 逻辑出现边界错误"。这类故障在 A/B 实验数据积累到足够的统计显著性之前，通常是不可见的——但它已经在影响真实用户。更危险的是，如果发布流程允许手工覆盖元数据或跳过评测报告，团队可能在根本不知道"线上跑的是什么"的情况下继续操作。</p>
+<p>从这个核心问题展开，会推出四个第一性约束：<strong>不可变性</strong>（一旦发布就不能就地修改，修复必须是新版本）、<strong>完整性</strong>（发布单元包含权重、tokenizer、配置、评测报告、签名的绑定整体）、<strong>门禁驱动</strong>（promotion 每步由机器可执行的门禁条件控制，失败自动阻断）、<strong>可回滚性</strong>（任意时刻可在 5 分钟内回到上一个确认可用版本）。这四个约束相互依赖：没有不可变性，版本号就不可信；没有完整性，回滚就是残缺的；没有门禁，不可变性只是仪式；没有可回滚性，整个治理体系只是纸面上的保证。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"不可变性"必然推导出<strong>版本号策略</strong>：版本号必须能唯一且确定地标识一个制品的内容状态。这就引发 SemVer vs date-based vs hash-based vs 业务对齐版本之间的设计权衡。哈希天然保证内容不可变但对人类不友好；SemVer 表达兼容性契约但模型"兼容"定义比 API 更模糊；日期版本可读但不表达语义破坏。</p>
+<p>从"完整性"必然推导出<strong>发布单元（Release Bundle）</strong>的概念：registry 必须把所有组成部分绑定为一个原子对象。这进一步推出<strong>兼容性门禁</strong>：必须自动校验新版本的 tokenizer、API schema、input/output shape 是否与上一个生产版本后向兼容。一个常见陷阱是：tokenizer 词表文件哈希没变，但 normalizer 配置变了，导致某些 Unicode 输入的 tokenize 结果不同——这种变化不会触发接口层面的 schema 变更检查，但会造成下游静默错误。</p>
+<p>从"门禁驱动"必然推导出<strong>多层评测门禁</strong>：离线评测（核心指标、回归样本、safety 测试）、在线采样（灰度期间 LLM-as-judge、人工抽检）、业务指标（任务完成率、满意度信号）。每层门禁有固定阈值，低于阈值自动阻断。还推出<strong>统计显著性要求</strong>：两版本指标差异必须超过最小可检测效果量（MDE），否则"通过"可能只是噪声。从"可回滚性"必然推导出<strong>promotion 状态机</strong>，使回滚成为显式的状态转换事件，而不是手工操作文件。从"审计"必然推导出<strong>审批流</strong>和<strong>不可删除的审计日志</strong>。从"出了问题"必然推导出<strong>发布预算与 kill switch</strong>：超过错误预算阈值自动回滚，不等待人工决策。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((制品版本治理与发布门禁))
+    不可化简约束
+      不可变性
+        版本号唯一标识内容
+        修复等于新版本
+      完整性
+        发布单元 Bundle
+        组件绑定
+      门禁驱动
+        机器可执行
+        自动阻断
+      可回滚性
+        5分钟回退
+        整体回滚
+    版本号策略
+      SemVer 兼容契约
+      date-based 可读
+      hash-based 内容保证
+      业务对齐版本
+    Promotion 状态机
+      draft
+      validated
+      staging
+      canary
+      production
+      deprecated
+    多层评测门禁
+      离线门禁
+        核心指标
+        回归集
+        safety 测试
+        统计显著性
+      在线门禁
+        灰度采样
+        LLM-as-judge
+        人工抽检
+      业务门禁
+        任务完成率
+        用户满意度
+    兼容性门禁
+      tokenizer 兼容
+      API schema
+      output shape
+      preprocessor
+    性能门禁
+      throughput
+      latency P99
+      memory footprint
+    安全门禁
+      恶意 prompt
+      PII 泄漏
+      harmful output rate
+    审批流
+      单人审批
+      4-eyes rule
+      审计日志不可删除
+    发布预算
+      错误预算
+      回滚阈值
+      kill switch
+    Deprecation
+      依赖追踪
+      迁移期
+      sunset 时间线</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>为什么模型 artifact 一旦发布就不能就地修改？如果需要紧急修复，正确的操作是什么？</li>
+  <li>SemVer、date-based、hash-based 版本号各自的优劣是什么？在 AI Infra 场景下如何组合使用？</li>
+  <li>从 staging 到 production 的 promotion 链路上，至少需要哪几类门禁，每类门禁检查什么？</li>
+  <li>兼容性门禁为什么必须覆盖 tokenizer、API schema 和 output shape？哪一项被忽略最容易导致隐性故障？</li>
+  <li>统计显著性在评测门禁中扮演什么角色？如何避免"通过了但只是噪声"？</li>
+  <li>审批流的"4-eyes rule"解决什么问题，什么场景下单人审批就足够？</li>
+  <li>模型 deprecation 的"依赖追踪"包含哪些维度？如何保证下游系统有足够的迁移时间？</li>
+</ol>
+</section>
+
+<!-- ===== §2 ===== -->
+<section class="section" id="s2">
+<h2>2. 版本号策略：为什么这个问题没有唯一答案</h2>
+<p>模型版本号的设计必须服务于两个相互矛盾的目标：<strong>人类可读</strong>（让工程师、PM、安全团队能快速判断版本关系）和<strong>机器可验证</strong>（让 CI/CD、registry、serving platform 能用版本号做自动化决策）。</p>
+
+<table>
+  <tr>
+    <th>策略</th><th>示例</th><th>优势</th><th>劣势</th><th>推荐场景</th>
+  </tr>
+  <tr>
+    <td><strong>SemVer</strong></td>
+    <td><code>2.1.0</code>, <code>3.0.0-rc1</code></td>
+    <td>表达兼容性契约，MAJOR=破坏性变更</td>
+    <td>"兼容"对模型输出语义比对 API 更难定义</td>
+    <td>对外暴露 API 的模型服务</td>
+  </tr>
+  <tr>
+    <td><strong>Date-based</strong></td>
+    <td><code>2026-05-03</code>, <code>20260503-r2</code></td>
+    <td>可读性强，自然表达时间顺序</td>
+    <td>不表达兼容性，同一天可能有多个版本</td>
+    <td>快速迭代的内部模型</td>
+  </tr>
+  <tr>
+    <td><strong>Hash-based</strong></td>
+    <td><code>sha256:a3f2c8...</code></td>
+    <td>内容可验证，天然不可变</td>
+    <td>对人类完全不可读</td>
+    <td>供应链安全场景，通常与其他策略叠加</td>
+  </tr>
+  <tr>
+    <td><strong>业务对齐版本</strong></td>
+    <td><code>gpt-4o-2025-05</code>, <code>reranker-v3</code></td>
+    <td>对产品和业务最友好</td>
+    <td>技术细节不透明，容易产生"v3 改了什么"的混乱</td>
+    <td>对外发布的产品模型</td>
+  </tr>
+</table>
+
+<div class="success"><strong>推荐组合：</strong>业务版本号 + 内部 date-based + 内容 SHA256 三层组合。例如：对外叫 <code>reranker-v3</code>，内部注册为 <code>reranker-2026-05-03-rc1</code>，artifact 存储时用 <code>sha256:a3f2c...</code> 做内容完整性锚定。三层各司其职，互不干扰。</div>
+
+<div class="warn"><strong>关键原则：</strong>版本号一旦发布，禁止重用（no tag reuse）。如果 <code>2026-05-03-rc1</code> 因评测失败被废弃，下一次发布必须用新版本号（如 <code>2026-05-03-rc2</code>），即使内容改动极小。版本号是追溯链条的锚点，重用会让整个审计体系失效。</div>
+
+<h3>2.1 版本号与不可变制品的关系</h3>
+<p>不可变制品（Immutable Artifact）原则是版本号策略的执行保障：</p>
+<ul>
+  <li><strong>对象存储层</strong>：模型文件写入包含版本号或哈希的路径，禁用覆盖 API</li>
+  <li><strong>Registry 层</strong>：版本记录一旦写入不能删除或修改，只能标记为 <code>deprecated</code></li>
+  <li><strong>Serving 层</strong>：严格通过版本号引用模型，禁止"latest"指针指向变化的内容</li>
+</ul>
+<pre><code># 正确做法：内容哈希锚定
+artifact:
+  uri: s3://models/reranker/2026-05-03-rc1/model.safetensors
+  sha256: a3f2c8d1e9b4f7a6c2d0e5f8b3a1c4d7e9f2b5a8c1d4e7f0b3a6c9d2e5f8b1
+  immutable: true
+
+# 错误做法：指向 mutable 路径
+artifact:
+  uri: s3://models/reranker/latest/model.safetensors  # "latest" 随时可能变化</code></pre>
+</section>
+
+<!-- ===== §3 ===== -->
+<section class="section" id="s3">
+<h2>3. Promotion 状态机：模型版本的生命周期</h2>
+<p>模型版本从诞生到退休，经历一条有明确转换条件的状态链路。每个状态代表该版本被允许做的事、接收的流量，以及触发的后续动作。</p>
+
+<pre class="mermaid">stateDiagram-v2
+    [*] --> draft : 训练完成，注册模型包
+    draft --> validated : 离线评测全部通过
+    draft --> rejected : 任意门禁失败
+    validated --> staging : 兼容性+性能门禁通过
+    staging --> canary : 人工审批+staging 观测期通过
+    canary --> production : 灰度观测期通过+在线门禁通过
+    canary --> staging : 在线指标退化，自动回滚
+    production --> deprecated : 新版本上线，启动 sunset 流程
+    rejected --> [*] : 废弃，归档
+    deprecated --> [*] : 依赖清零后下线</pre>
+
+<table>
+  <tr>
+    <th>状态</th><th>含义</th><th>允许流量</th><th>转换触发条件</th>
+  </tr>
+  <tr>
+    <td><code>draft</code></td>
+    <td>已注册，未评测</td>
+    <td>无</td>
+    <td>训练完成后自动创建</td>
+  </tr>
+  <tr>
+    <td><code>validated</code></td>
+    <td>离线评测通过</td>
+    <td>无（仅内部测试）</td>
+    <td>离线门禁全部通过</td>
+  </tr>
+  <tr>
+    <td><code>staging</code></td>
+    <td>兼容性和性能已验证</td>
+    <td>仅内部测试流量</td>
+    <td>兼容性门禁 + 性能门禁通过</td>
+  </tr>
+  <tr>
+    <td><code>canary</code></td>
+    <td>小比例生产流量验证</td>
+    <td>1%—20% 生产流量</td>
+    <td>人工审批 + staging 观测期通过</td>
+  </tr>
+  <tr>
+    <td><code>production</code></td>
+    <td>全量生产流量</td>
+    <td>100%（或分租户满载）</td>
+    <td>在线门禁通过 + 正式审批</td>
+  </tr>
+  <tr>
+    <td><code>deprecated</code></td>
+    <td>新版本已上线，开始 sunset</td>
+    <td>无（旧请求继续至迁移完成）</td>
+    <td>新版本 production + deprecation 流程启动</td>
+  </tr>
+  <tr>
+    <td><code>rejected</code></td>
+    <td>评测或门禁失败</td>
+    <td>无</td>
+    <td>任意必过门禁失败</td>
+  </tr>
+</table>
+
+<div class="note"><strong>状态流转必须有审计日志：</strong>每次状态变更都应记录操作者（人工或自动化）、时间戳、触发原因、关联门禁报告 ID。这是事后追溯"谁在什么时候、凭什么把这个版本推到 production"的唯一证据。</div>
+</section>
+
+<!-- ===== §4 ===== -->
+<section class="section" id="s4">
+<h2>4. 多层评测门禁体系</h2>
+<p>评测门禁分三层，每层回答不同问题，覆盖不同时间窗口。任意层失败都会阻断 promotion，且不允许人工 override（安全门禁绝对不允许）。</p>
+
+<pre class="mermaid">flowchart TD
+    A[新版本注册] --> B[离线评测门禁]
+    B -->|通过| C[兼容性+性能门禁]
+    B -->|失败| X1[自动拒绝 rejected]
+    C -->|通过| D[staging 观测]
+    C -->|失败| X2[自动拒绝 rejected]
+    D -->|审批通过| E[canary 发布]
+    E --> F[在线评测门禁]
+    F -->|通过| G[业务门禁]
+    F -->|失败| Y1[自动回滚 staging]
+    G -->|通过| H[production promotion]
+    G -->|失败| Y2[暂停放量，人工介入]
+    H --> I[production 持续监控]
+    I -->|SLO 破坏| Z[kill switch 回滚]</pre>
+
+<h3>4.1 第一层：离线评测门禁</h3>
+<p>在 canary 之前必须完成，覆盖以下检查项：</p>
+
+<table>
+  <tr>
+    <th>门禁项</th><th>必过指标</th><th>对比基准</th><th>统计要求</th>
+  </tr>
+  <tr>
+    <td>核心任务指标</td>
+    <td>ROUGE、BLEU、EM、F1 等（依任务定）</td>
+    <td>上一个 production 版本</td>
+    <td>不低于 baseline 的 (1 − δ)，δ ≤ 2%；差异超过 MDE</td>
+  </tr>
+  <tr>
+    <td>回归集</td>
+    <td>已知 bad case 集合的错误率 ≤ 阈值</td>
+    <td>固定的 bad case 集</td>
+    <td>不允许新增已知类型错误</td>
+  </tr>
+  <tr>
+    <td>Safety 测试</td>
+    <td>有害输出率 ≤ 0.1%，PII 泄漏 = 0</td>
+    <td>最严格的 safety baseline</td>
+    <td>不能低于 baseline，零容忍 PII</td>
+  </tr>
+  <tr>
+    <td>成本测试</td>
+    <td>平均输出 token 数、推理时长</td>
+    <td>上一个版本</td>
+    <td>成本 regression ≤ 5%</td>
+  </tr>
+</table>
+
+<div class="note"><strong>统计显著性：</strong>若两版本指标差异小于最小可检测效果量（MDE = 0.5σ），认为差异不显著，视为通过（避免因噪声拒绝等效版本）。若差异超过 MDE 且低于阈值，则阻断。评测报告必须包含置信区间和样本量。</div>
+
+<h3>4.2 第二层：在线评测门禁（Canary 阶段）</h3>
+
+<table>
+  <tr>
+    <th>信号类型</th><th>具体指标</th><th>采集方式</th><th>告警阈值</th>
+  </tr>
+  <tr>
+    <td>硬性质量信号</td>
+    <td>错误率、超时率、OOM 率</td>
+    <td>metrics + log</td>
+    <td>超过 baseline 的 2× 触发告警</td>
+  </tr>
+  <tr>
+    <td>软性质量信号</td>
+    <td>LLM-as-judge 质量分、人工抽检通过率</td>
+    <td>随机采样 + judge model</td>
+    <td>低于 baseline 的 95% 触发暂停</td>
+  </tr>
+  <tr>
+    <td>安全信号</td>
+    <td>有害输出率、越权输出率</td>
+    <td>安全过滤层 metrics</td>
+    <td>任何 &gt; 0.1% 立即回滚</td>
+  </tr>
+  <tr>
+    <td>成本信号</td>
+    <td>每请求 token 消耗、推理延迟</td>
+    <td>tracing</td>
+    <td>成本上升 &gt; 10% 触发评审</td>
+  </tr>
+</table>
+
+<div class="warn"><strong>按切片观察：</strong>在线采样必须按租户、场景、输入长度分桶，不能只看整体平均。整体平均可能掩盖某类用户严重受损的情况——长 prompt 用户的输出质量退化，可能被大量短 prompt 用户的正常结果平均掉。</div>
+
+<h3>4.3 第三层：业务门禁</h3>
+
+<table>
+  <tr>
+    <th>门禁项</th><th>指标来源</th><th>通过条件</th>
+  </tr>
+  <tr>
+    <td>任务完成率</td>
+    <td>产品埋点</td>
+    <td>≥ 上一版本 98%</td>
+  </tr>
+  <tr>
+    <td>用户满意度信号</td>
+    <td>thumbs up/down、重试率</td>
+    <td>不明显退化（统计显著性检验）</td>
+  </tr>
+  <tr>
+    <td>SLA 达成率</td>
+    <td>P99 latency</td>
+    <td>≤ SLA 阈值（如 ≤ 2s）</td>
+  </tr>
+  <tr>
+    <td>下游依赖稳定性</td>
+    <td>依赖服务错误率</td>
+    <td>无新增下游错误</td>
+  </tr>
+</table>
+</section>
+
+<!-- ===== §5 ===== -->
+<section class="section" id="s5">
+<h2>5. 兼容性门禁：最容易被忽视的一类</h2>
+<p>兼容性问题通常不会产生 500 错误，而是产生"静默错误"：输出格式变了但没有 exception，tokenizer 边界行为变了但解码结果只在极少数输入上出错。这类故障往往在影响用户数天后才被发现。</p>
+
+<pre class="mermaid">flowchart LR
+    subgraph 兼容性检查项
+        A[Tokenizer 兼容性] --> A1[词表版本一致\n特殊 token 映射不变\nbos/eos/pad 不变]
+        B[API Schema 兼容性] --> B1[请求响应字段不缺失\n枚举值不缩减\n可选字段有默认值]
+        C[Output Shape 兼容性] --> C1[logits 维度\nembedding 维度\n结构化输出格式]
+        D[Preprocessor 兼容性] --> D1[图像归一化参数\n文本截断策略\n特殊字符处理]
+    end</pre>
+
+<table>
+  <tr>
+    <th>兼容性维度</th><th>检查方法</th><th>失败后果</th><th>严重程度</th>
+  </tr>
+  <tr>
+    <td>Tokenizer 词表</td>
+    <td>比对 tokenizer 配置哈希，对同一组样本做 encode-decode roundtrip</td>
+    <td>下游 parsing 错误、embedding 不匹配</td>
+    <td><strong>严重</strong></td>
+  </tr>
+  <tr>
+    <td>特殊 token 映射</td>
+    <td>校验 bos、eos、pad、sep 的 ID 是否与上一版本一致</td>
+    <td>序列截断错误、对话格式错乱</td>
+    <td><strong>严重</strong></td>
+  </tr>
+  <tr>
+    <td>API 请求 schema</td>
+    <td>OpenAPI diff，检查字段删除、类型变更、枚举缩减</td>
+    <td>调用方 400 错误</td>
+    <td><strong>严重</strong></td>
+  </tr>
+  <tr>
+    <td>API 响应 schema</td>
+    <td>对同一组测试输入比对输出格式，检查字段结构</td>
+    <td>调用方解析失败</td>
+    <td>中等</td>
+  </tr>
+  <tr>
+    <td>Embedding 维度</td>
+    <td>数值检查输出 tensor shape</td>
+    <td>下游向量库 insert 失败</td>
+    <td><strong>严重</strong></td>
+  </tr>
+  <tr>
+    <td>Output shape（生成模型）</td>
+    <td>对边界输入（最大长度、特殊格式）做端到端测试</td>
+    <td>截断、格式错误</td>
+    <td>中等</td>
+  </tr>
+</table>
+
+<div class="danger"><strong>工程边界：</strong>兼容性检查不能只靠"schema 看起来没变"，必须用真实样本做端到端验证。一个常见陷阱是：tokenizer 的词表文件哈希没变，但 normalizer 配置变了，导致某些 Unicode 输入的 tokenize 结果不同。这种变化不会被 schema diff 工具发现，只能通过端到端 roundtrip 测试发现。</div>
+</section>
+
+<!-- ===== §6 ===== -->
+<section class="section" id="s6">
+<h2>6. 性能门禁：防止 Throughput 和 Latency Regression</h2>
+<p>性能门禁的目标不是"越快越好"，而是"不能比上一个版本差"。模型量化、架构调整、服务框架升级之后，性能可能因为各种原因出现隐性 regression。</p>
+
+<table>
+  <tr>
+    <th>性能门禁项</th><th>检查方法</th><th>Regression 阈值</th><th>触发行动</th>
+  </tr>
+  <tr>
+    <td>Throughput (tokens/s)</td>
+    <td>固定 batch 大小下的 token 生成速率</td>
+    <td>低于上一版本 95%</td>
+    <td>阻断 promotion</td>
+  </tr>
+  <tr>
+    <td>Latency P50/P99</td>
+    <td>固定请求集的端到端推理延迟</td>
+    <td>P99 超过上一版本 110%</td>
+    <td>阻断 promotion</td>
+  </tr>
+  <tr>
+    <td>Memory Footprint</td>
+    <td>固定 batch 下的峰值显存占用</td>
+    <td>超过上一版本 105%</td>
+    <td>告警 + 人工评审</td>
+  </tr>
+  <tr>
+    <td>Time-to-First-Token (TTFT)</td>
+    <td>streaming 场景下首 token 延迟</td>
+    <td>超过上一版本 115%</td>
+    <td>告警</td>
+  </tr>
+  <tr>
+    <td>KV Cache 命中率</td>
+    <td>相同 prefix 请求集下的缓存命中率</td>
+    <td>低于上一版本 90%</td>
+    <td>告警</td>
+  </tr>
+</table>
+
+<div class="note"><strong>性能测试基准固定化：</strong>性能门禁的测试集（请求分布、batch 大小、序列长度分布）必须是固定的、版本化的，不能每次测试都用不同输入，否则比较没有意义。测试集本身应该作为 artifact 被 registry 管理。</div>
+</section>
+
+<!-- ===== §7 ===== -->
+<section class="section" id="s7">
+<h2>7. 安全门禁</h2>
+<p>安全门禁保证新版本不会引入或放宽对有害内容的生成限制。安全门禁失败时，不允许任何人工 override。</p>
+
+<table>
+  <tr>
+    <th>安全检查项</th><th>测试集</th><th>通过条件</th><th>失败处置</th>
+  </tr>
+  <tr>
+    <td>恶意 prompt 拒绝率</td>
+    <td>固定的 red-team 测试集（越狱、角色扮演、间接注入）</td>
+    <td>拒绝率 ≥ 上一版本 × 98%</td>
+    <td><strong>立即阻断，无豁免</strong></td>
+  </tr>
+  <tr>
+    <td>PII 泄漏率</td>
+    <td>包含 PII 数据的测试集</td>
+    <td>泄漏率 = 0（零容忍）</td>
+    <td><strong>立即阻断</strong></td>
+  </tr>
+  <tr>
+    <td>有害输出率</td>
+    <td>人工标注的有害内容分类集</td>
+    <td>≤ 0.1%</td>
+    <td><strong>立即阻断</strong></td>
+  </tr>
+  <tr>
+    <td>越权输出率</td>
+    <td>权限边界测试集（跨租户、跨角色）</td>
+    <td>= 0</td>
+    <td><strong>立即阻断</strong></td>
+  </tr>
+  <tr>
+    <td>Prompt Injection 防御</td>
+    <td>结构化 injection 攻击集</td>
+    <td>防御率 ≥ 上一版本</td>
+    <td>阻断</td>
+  </tr>
+</table>
+
+<div class="danger"><strong>安全门禁必须独立执行：</strong>安全测试集不能与普通评测集合并，不能因为"整体质量够好"而豁免安全门禁失败。安全门禁失败时，不允许任何人工覆盖（override）——无论情况多紧急，均无例外。</div>
+</section>
+
+<!-- ===== §8 ===== -->
+<section class="section" id="s8">
+<h2>8. 自动化 Release Pipeline</h2>
+<p>一个典型的 release pipeline 把所有门禁串联成可自动执行的工作流，确保人工操作只在关键决策点（审批）介入，其余全部机器执行并留存记录。</p>
+
+<pre class="mermaid">sequenceDiagram
+    participant Train as 训练系统
+    participant Registry as Model Registry
+    participant Eval as 评测系统
+    participant Gate as 门禁引擎
+    participant Approval as 审批系统
+    participant CD as CD 系统 ArgoCD
+    participant Serving as Serving 平台
+
+    Train->>Registry: 注册模型包 (status=draft)
+    Registry->>Eval: 触发离线评测 job
+    Eval->>Gate: 提交评测报告
+    Gate->>Gate: 执行离线门禁检查
+    Gate->>Registry: 更新 status=validated 或 rejected
+    Registry->>Gate: 触发兼容性+性能门禁
+    Gate->>Registry: 更新 status=staging
+    Registry->>Approval: 发起人工审批请求
+    Approval->>Registry: 审批通过 记录审批人+时间
+    Registry->>CD: 触发 canary deployment
+    CD->>Serving: 路由 1% 流量到新版本
+    Serving->>Gate: 持续上报在线指标
+    Gate->>Gate: 执行在线门禁检查
+    Gate->>CD: 指令放量 5% 20% 100%
+    CD->>Serving: 更新流量权重
+    Registry->>Registry: 更新 status=production</pre>
+
+<h3>8.1 常用实现方案对比</h3>
+<table>
+  <tr>
+    <th>方案</th><th>适合规模</th><th>优势</th><th>局限</th>
+  </tr>
+  <tr>
+    <td>GitOps + ArgoCD</td>
+    <td>中大规模，服务化程度高</td>
+    <td>声明式、可回滚、git history = 审计日志</td>
+    <td>模型特有的门禁需要定制化 webhook</td>
+  </tr>
+  <tr>
+    <td>Argo Workflows</td>
+    <td>中大规模，计算密集型评测</td>
+    <td>DAG 编排灵活，天然支持评测 job</td>
+    <td>配置复杂，学习成本高</td>
+  </tr>
+  <tr>
+    <td>GitHub Actions + 自研 Gate</td>
+    <td>小中规模，快速起步</td>
+    <td>接入成本低</td>
+    <td>并发和状态管理依赖自研</td>
+  </tr>
+  <tr>
+    <td>自研 release 系统</td>
+    <td>超大规模，高度定制化</td>
+    <td>与内部 registry、评测平台深度集成</td>
+    <td>维护成本高</td>
+  </tr>
+</table>
+</section>
+
+<!-- ===== §9 ===== -->
+<section class="section" id="s9">
+<h2>9. 审批流：谁有权力把模型推到 Production</h2>
+
+<pre class="mermaid">flowchart TD
+    A[promotion 申请] --> B{风险等级}
+    B -->|低风险 patch\n指标无破坏性变化| C[单人审批\n任意 senior engineer]
+    B -->|中风险 minor\n有指标变化但在容差内| D[双人审批\nEM + tech lead]
+    B -->|高风险 major\n接口变更或安全策略变更| E[4-eyes rule\n至少 2 人独立审批\n含安全团队]
+    B -->|紧急热修复| F[紧急审批流\n1 人审批\n24h 内补报告]
+    C --> G[记录审批人+时间戳+审批时版本报告快照]
+    D --> G
+    E --> G
+    F --> G
+    G --> H[promotion 执行]</pre>
+
+<table>
+  <tr>
+    <th>审批模式</th><th>适用场景</th><th>要求</th><th>风险</th>
+  </tr>
+  <tr>
+    <td>单人审批</td>
+    <td>低风险变更，patch 级别</td>
+    <td>审批人必须看完评测报告</td>
+    <td>审批人可能有偏见或疏忽</td>
+  </tr>
+  <tr>
+    <td>双人审批</td>
+    <td>中风险变更</td>
+    <td>两人独立查看，意见一致才通过</td>
+    <td>审批效率降低</td>
+  </tr>
+  <tr>
+    <td>4-eyes rule</td>
+    <td>高风险变更</td>
+    <td>任意两人不能来自同一团队</td>
+    <td>审批周期长，需提前规划</td>
+  </tr>
+  <tr>
+    <td>紧急审批流</td>
+    <td>生产故障紧急修复</td>
+    <td>单人可通过，但必须在 24h 内补充完整文档</td>
+    <td>滥用风险，必须有审计告警</td>
+  </tr>
+</table>
+
+<div class="note"><strong>审计不可删除：</strong>审批记录必须写入不可删除的审计日志，包含：审批人、审批时间、版本号、关联评测报告 ID、审批意见。这些记录不仅用于内部追溯，也是安全合规和外部审计的基础。审计日志本身应该有完整性保证（如哈希链或签名）。</div>
+</section>
+
+<!-- ===== §10 ===== -->
+<section class="section" id="s10">
+<h2>10. 发布预算与 Kill Switch</h2>
+
+<h3>10.1 错误预算与回滚阈值</h3>
+<pre><code>release_budget:
+  version: reranker-2026-05-03-rc1
+  production_slo:
+    error_rate_threshold: 0.5%      # 超过此值自动触发告警
+    p99_latency_threshold: 2000ms   # 超过此值自动触发告警
+    quality_score_min: 0.85         # LLM-as-judge 分数下限
+  auto_rollback_trigger:
+    error_rate: 2%                  # 超过此值自动回滚，不等人工
+    p99_latency: 5000ms             # 超过此值自动回滚
+    harmful_output_rate: 0.1%       # 超过此值立即回滚
+  kill_switch:
+    enabled: true
+    target_version: reranker-2026-04-20-prod
+    execution_time_sla: 30s         # 必须在 30s 内完成流量切换</code></pre>
+
+<h3>10.2 Kill Switch 执行流程</h3>
+<pre class="mermaid">flowchart LR
+    A[production 监控] --> B{指标超阈值?}
+    B -->|自动触发| C[kill switch 执行]
+    B -->|人工触发| C
+    C --> D[流量立即切回上一版本]
+    D --> E[新版本状态变为 staging]
+    E --> F[发送告警+创建 incident ticket]
+    F --> G[保留现场快照\n评测报告 metrics traces]</pre>
+
+<div class="success"><strong>Kill Switch 设计原则：</strong>
+  <ul>
+    <li>独立于正常 CD 流程，CD 故障时仍可执行</li>
+    <li>单命令执行，运维工程师点击一个按钮即可触发</li>
+    <li>执行时间 SLA：流量 100% 切离新版本 ≤ 30s</li>
+    <li>触发后自动通知 on-call 工程师和相关负责人</li>
+    <li>回滚目标版本必须在 promotion 之前确认存在且可服务</li>
+  </ul>
+</div>
+</section>
+
+<!-- ===== §11 ===== -->
+<section class="section" id="s11">
+<h2>11. 与 Ch 22 灰度发布的协同</h2>
+<p>本章（12c）和<a href="../part7/22-evaluation-release-and-incident.html">第 22 章</a>分别负责 release pipeline 的不同层面，必须配合但不能混淆。</p>
+
+<table>
+  <tr>
+    <th>维度</th><th>本章（12c）负责</th><th>第 22 章负责</th>
+  </tr>
+  <tr>
+    <td>关注点</td>
+    <td>Release-time governance：版本合法性、门禁通过、审批、不可变性</td>
+    <td>Traffic shaping：流量切分比例、观测信号、放量节奏</td>
+  </tr>
+  <tr>
+    <td>时间窗口</td>
+    <td>Promotion 之前（pre-flight checks）+ 状态机管理</td>
+    <td>Canary 期间（in-flight monitoring）</td>
+  </tr>
+  <tr>
+    <td>核心问题</td>
+    <td>"这个版本有资格进入 production 流量"</td>
+    <td>"这个版本在真实流量下是否表现正常"</td>
+  </tr>
+  <tr>
+    <td>失败处理</td>
+    <td>阻断 promotion，版本状态回到 staging/rejected</td>
+    <td>暂停放量或自动回滚，通知 on-call</td>
+  </tr>
+  <tr>
+    <td>产出</td>
+    <td>经过审批的 production promotion 事件</td>
+    <td>灰度观测报告、放量决策</td>
+  </tr>
+</table>
+
+<div class="note"><strong>协同接口：</strong>12c 的 promotion 状态机是 Ch 22 灰度发布的前提——只有 <code>staging</code> 状态的版本才能进入 canary 流量；在线观测结果回流到 12c 的门禁系统，决定是否继续放量或回滚。两者通过 Model Registry 的状态字段和事件总线解耦通信。</div>
+</section>
+
+<!-- ===== §12 ===== -->
+<section class="section" id="s12">
+<h2>12. 模型 Deprecation：版本退休流程</h2>
+
+<pre class="mermaid">gantt
+    title 模型版本 Deprecation 时间线
+    dateFormat  YYYY-MM-DD
+    section 新版本
+    新版本 canary           :2026-05-01, 7d
+    新版本 production       :2026-05-08, 30d
+    section 旧版本
+    deprecated 通知发出     :milestone, 2026-05-08, 0d
+    旧版本迁移期            :2026-05-08, 60d
+    旧版本只读模式          :2026-07-08, 14d
+    旧版本下线              :milestone, 2026-07-22, 0d
+    section 依赖扫描
+    扫描下游依赖            :2026-05-08, 3d
+    发送迁移通知            :2026-05-11, 1d
+    依赖清零确认            :2026-07-20, 2d</pre>
+
+<h3>12.1 Deprecation 流程步骤</h3>
+<div class="card">
+<ol>
+  <li><strong>依赖扫描</strong>：扫描所有引用当前 production 版本的系统（API 调用方、实验 baseline、评测集 reference、serving route）</li>
+  <li><strong>发布 deprecation 通知</strong>：包含下线时间、新版本迁移指南、联系人</li>
+  <li><strong>迁移期</strong>（通常 30—90 天）：旧版本继续服务，新版本并行运行</li>
+  <li><strong>只读模式</strong>（下线前 14 天）：旧版本禁止新增流量路由，仅服务已有流量</li>
+  <li><strong>依赖清零确认</strong>：确认所有依赖已迁移到新版本</li>
+  <li><strong>下线</strong>：旧版本标记 <code>retired</code>，artifact 进入归档（长期保留，但不可路由流量）</li>
+</ol>
+</div>
+
+<div class="success"><strong>归档 ≠ 删除：</strong>已 deprecated 的模型版本 artifact 必须继续保留在对象存储中，保留期限按合规要求决定（通常 1—3 年）。归档版本仍然可以用于审计、法律取证和历史评测对比，但不能路由生产流量。</div>
+</section>
+
+<!-- ===== §13 ===== -->
+<section class="section" id="s13">
+<h2>13. Worked Example：Staging → Production 端到端演练</h2>
+
+<div class="note"><strong>场景设定：</strong>模型 <code>reranker</code> 向量召回重排模型。当前 production：<code>reranker-2026-04-20-prod</code>。候选版本：<code>reranker-2026-05-03-rc1</code>（训练集更新 + 轻微架构调整）。团队：3 名工程师，1 名 EM，1 名安全工程师。</div>
+
+<h3>13.1 阶段 0：训练完成，注册 draft</h3>
+<pre><code>model-registry register \
+  --name reranker \
+  --version 2026-05-03-rc1 \
+  --artifact-uri s3://ml-models/reranker/2026-05-03-rc1/ \
+  --sha256 a3f2c8d1e9b4f7a6c2d0e5f8b3a1c4d7e9f2b5a8c1d4e7f0b3a6c9d2e5f8b1 \
+  --training-job train-20260503-007 \
+  --code-revision abc1234 \
+  --dataset-version support-v4 \
+  --status draft</code></pre>
+<p><strong>结果</strong>：版本注册成功，状态 <code>draft</code>，触发离线评测 job。</p>
+
+<h3>13.2 阶段 1：离线评测门禁（约 2 小时）</h3>
+<table>
+  <tr><th>门禁项</th><th>结果</th><th>说明</th></tr>
+  <tr><td>NDCG@10 vs baseline</td><td><strong>通过</strong></td><td>0.742 vs 0.731, +1.5%，MDE 检验显著</td></tr>
+  <tr><td>MRR@5 vs baseline</td><td><strong>通过</strong></td><td>0.681 vs 0.674, +1.0%</td></tr>
+  <tr><td>回归集错误率</td><td><strong>通过</strong></td><td>2.1% vs 2.3%，优于 baseline</td></tr>
+  <tr><td>Safety：有害输出率</td><td><strong>通过</strong></td><td>0.03%，低于 0.1% 阈值</td></tr>
+  <tr><td>Safety：PII 泄漏</td><td><strong>通过</strong></td><td>0，零泄漏</td></tr>
+  <tr><td>推理成本</td><td><strong>警告</strong></td><td>token 消耗 +3%，在 5% 容差内，记录警告</td></tr>
+</table>
+<p><strong>结果</strong>：全部必过门禁通过，状态更新为 <code>validated</code>，附推理成本警告。</p>
+
+<h3>13.3 阶段 2：兼容性 + 性能门禁</h3>
+<pre><code># 自动触发兼容性检查
+compatibility-check \
+  --new reranker-2026-05-03-rc1 \
+  --baseline reranker-2026-04-20-prod
+
+# [PASS] tokenizer vocab hash: 匹配
+# [PASS] special tokens (bos/eos/pad): 匹配
+# [PASS] API schema: 无 breaking change
+# [PASS] embedding dim: 768 → 768
+
+# 自动触发性能基准测试
+perf-benchmark --model reranker-2026-05-03-rc1 \
+  --baseline reranker-2026-04-20-prod \
+  --batch-size 32 --seq-len 512
+
+# [PASS] throughput: 4820 tok/s vs 4760 tok/s (+1.3%)
+# [PASS] p99 latency: 187ms vs 182ms (+2.7%, 阈值 10%)
+# [PASS] peak memory: 14.2GB vs 14.1GB (+0.7%, 阈值 5%)</code></pre>
+<p><strong>结果</strong>：所有兼容性和性能门禁通过，状态更新为 <code>staging</code>。</p>
+
+<h3>13.4 阶段 3：人工审批（Staging → Canary）</h3>
+<p>系统发送审批请求给 tech lead。审批人查看评测报告摘要、兼容性结果、性能基准对比、推理成本警告（确认可接受）。审批通过，记录写入审计日志：</p>
+<pre><code>{
+  "event": "promotion_approval",
+  "version": "reranker-2026-05-03-rc1",
+  "from_status": "staging",
+  "to_status": "canary",
+  "approver": "alice@example.com",
+  "timestamp": "2026-05-03T14:32:17Z",
+  "eval_report_id": "eval-20260503-007",
+  "notes": "成本轻微上升在可接受范围内，canary 阶段持续监控"
+}</code></pre>
+
+<h3>13.5 阶段 4：Canary 发布（1% 流量，观测 4 小时）</h3>
+<table>
+  <tr><th>在线指标</th><th>新版本 (1%)</th><th>baseline (99%)</th><th>状态</th></tr>
+  <tr><td>错误率</td><td>0.08%</td><td>0.09%</td><td>正常</td></tr>
+  <tr><td>P99 latency</td><td>195ms</td><td>189ms</td><td>正常（在容差内）</td></tr>
+  <tr><td>LLM-as-judge 质量分</td><td>0.88</td><td>0.86</td><td>正常（轻微提升）</td></tr>
+  <tr><td>有害输出率</td><td>0%</td><td>0%</td><td>正常</td></tr>
+</table>
+<p><strong>结果</strong>：在线门禁全部通过，放量至 5%、20%，各观测 2 小时，指标稳定。</p>
+
+<h3>13.6 阶段 5：Production Promotion（正式双人审批）</h3>
+<p>EM 和 tech lead 独立查看 canary 观测报告，均批准。状态更新为 <code>production</code>，旧版本状态更新为 <code>deprecated</code>，发送迁移通知，30 天后自动下线。</p>
+
+<h3>13.7 假设失败场景：阶段 2 兼容性门禁失败</h3>
+<pre><code>[FAIL] special tokens: pad_token_id 变更 (0 → 1)</code></pre>
+<div class="warn"><strong>系统自动动作：</strong>
+  <ol>
+    <li>版本状态更新为 <code>rejected</code></li>
+    <li>发送告警给模型团队，附详细 diff</li>
+    <li>创建 bug ticket，关联版本号和失败报告</li>
+    <li>阻断所有后续 promotion 步骤</li>
+  </ol>
+  修复后必须注册新版本 <code>reranker-2026-05-03-rc2</code>，从阶段 0 重新走全部流程。不能复用被 <code>rejected</code> 的版本号。
+</div>
+
+<h3>13.8 每个 Gate 的通过/失败决策标准汇总</h3>
+<table>
+  <tr><th>Gate</th><th>通过条件</th><th>失败后行动</th><th>可否人工 override</th></tr>
+  <tr><td>离线评测</td><td>核心指标、回归集、safety 全通过</td><td>→ rejected</td><td>否（safety 绝对不可）</td></tr>
+  <tr><td>兼容性</td><td>tokenizer/schema/shape 全兼容</td><td>→ rejected</td><td>否</td></tr>
+  <tr><td>性能</td><td>throughput/latency/memory 无 regression</td><td>→ rejected</td><td>技术类可人工评审</td></tr>
+  <tr><td>人工审批</td><td>符合风险等级的审批人数批准</td><td>等待</td><td>本质上就是人工</td></tr>
+  <tr><td>在线门禁</td><td>硬性/软性/安全/成本指标全在阈值内</td><td>→ staging 回滚</td><td>否（安全指标绝对不可）</td></tr>
+  <tr><td>业务门禁</td><td>任务完成率、SLA 达成</td><td>暂停放量</td><td>可，需记录原因</td></tr>
+</table>
+</section>
+
+<!-- ===== §14 ===== -->
+<section class="section" id="s14">
+<h2>14. 练习</h2>
+<div class="grid-2">
+
+<div class="card"><strong>12c-1（基础）：不可变性原则</strong><br>解释为什么模型 artifact 一旦发布就不能就地修改。如果团队发现一个刚发布的模型有一个小 bug，正确的处理流程是什么？版本号如何变化？新版本需要重新过哪些门禁？</div>
+
+<div class="card"><strong>12c-2（基础）：版本号策略</strong><br>对比 SemVer、date-based、hash-based 三种版本号策略，分别说明各自最适合的场景。在 AI Infra 实践中，为什么通常需要组合使用而不是选一种？给出一个具体的三层组合方案。</div>
+
+<div class="card"><strong>12c-3（基础）：Promotion 状态机</strong><br>画出模型版本的 promotion 状态机，标注每个状态转换的触发条件。为什么 canary 状态的回滚目标是 staging 而不是 rejected？canary 阶段的版本处于 staging 和 production 之间，如果此时 kill switch 触发，应该回滚到哪个版本？</div>
+
+<div class="card"><strong>12c-4（进阶）：Tokenizer 兼容性</strong><br>设计一个 tokenizer 兼容性检查方案，需要覆盖哪些具体检查项？哪种兼容性失败最容易被忽视但后果最严重？给出一个具体的失败案例（如 normalizer 配置变更导致 Unicode 处理差异）。</div>
+
+<div class="card"><strong>12c-5（进阶）：统计显著性</strong><br>离线评测门禁中的"统计显著性"要求是什么意思？如果两个版本的 NDCG@10 差异为 0.3%，但样本量只有 100，该如何判断是否通过？给出计算最小可检测效果量（MDE）的框架。</div>
+
+<div class="card"><strong>12c-6（进阶）：审批流设计</strong><br>对比单人审批、双人审批和 4-eyes rule 三种审批模式。在什么情况下紧急审批流是合理的？如何防止紧急审批流被滥用（至少给出 3 种控制机制）？</div>
+
+<div class="card"><strong>12c-7（进阶）：Kill Switch</strong><br>设计一个 kill switch 机制，要求：触发条件（自动 + 人工）、执行时间 SLA（如何保证 30s 内完成）、自动通知链路、执行后版本状态如何恢复。如果 CD 系统本身故障，kill switch 如何仍然可用？</div>
+
+<div class="card"><strong>12c-8（进阶）：按切片观察</strong><br>在线评测门禁中，为什么必须按切片（租户、场景、输入长度）观察，而不是只看整体平均值？给出一个具体的例子说明平均值掩盖了问题的情况（如某类长 prompt 用户质量退化但被短 prompt 均值稀释）。</div>
+
+<div class="card"><strong>12c-9（设计）：多模型并发 Release</strong><br>设计一个完整的 release pipeline，支持：(a) 多个模型并发发布不相互干扰；(b) 支持紧急热修复快速通道；(c) 所有门禁结果可查询和回放；(d) 支持按租户粒度的 canary。给出架构设计和关键模块说明。</div>
+
+<div class="card"><strong>12c-10（设计）：Deprecation 系统</strong><br>设计一个模型 deprecation 系统，需要：自动扫描下游依赖、生成迁移通知、跟踪迁移进度、在依赖清零后自动触发下线。给出系统架构和关键 API 设计。依赖扫描需要覆盖哪些维度（API 调用方、实验 baseline、评测集 reference 等）？</div>
+
+<div class="card"><strong>12c-11（综合）：事故复盘与流程改进</strong><br>假设你的团队刚发生一次事故：一个新版本 promotion 到 production 后，某类用户的输出质量显著退化，但整体 error rate 正常，事故持续 4 小时才被发现。请设计补救方案：(a) 哪个门禁应该能拦住？(b) 如何修补发布流程？(c) 如何更新评测集？</div>
+
+<div class="card"><strong>12c-12（开放）：全自动发布的边界</strong><br>你的团队正在考虑用自动化门禁完全替代人工审批（全自动发布）。请分析优缺点，说明哪些场景可以安全地去掉人工审批，哪些场景人工审批是不可替代的，并给出你的推荐方案（包括哪些类别的变更仍然需要人工节点）。</div>
+
+</div>
+</section>
+
+<!-- ===== refbox ===== -->
+<section class="refbox">
+<h2>参考资料</h2>
+
+<h3>学习路线</h3>
+<ol>
+  <li>从 §1 建立四个第一性约束（不可变、完整、门禁驱动、可回滚），这是整章的逻辑基础</li>
+  <li>阅读 §2 理解版本号策略，结合团队实际场景选择组合方式</li>
+  <li>阅读 §3 掌握 promotion 状态机——这是整个 release governance 的骨架</li>
+  <li>按顺序阅读 §4—§7，每层门禁都理解其"检查什么"和"失败后做什么"</li>
+  <li>阅读 §8—§10 了解自动化 pipeline、审批流、发布预算的实现选型</li>
+  <li>阅读 §13 Worked Example，把前面所有概念在一个端到端场景中串联</li>
+  <li>做练习 12c-9 到 12c-12，从设计题中检验理解深度</li>
+</ol>
+
+<h3>延伸阅读</h3>
+
+<p><strong>制品与版本管理</strong></p>
+<ul>
+  <li>Google, <em>Site Reliability Engineering</em>, Chapter 8 (Release Engineering)</li>
+  <li>Martin Fowler, <em>Continuous Delivery</em>, Chapters 10-11 (Artifact Management)</li>
+  <li>OCI Artifacts Specification — <a href="https://specs.opencontainers.org/artifacts/">specs.opencontainers.org</a></li>
+  <li>Sigstore / Cosign 项目文档 — 供应链签名与 SBOM</li>
+</ul>
+
+<p><strong>模型发布与 MLOps</strong></p>
+<ul>
+  <li>Google, <em>Practitioners Guide to MLOps</em> (2021) — ML release pipeline 全景</li>
+  <li>Sculley et al., "Hidden Technical Debt in Machine Learning Systems" (NIPS 2015) — 模型 governance 核心论文</li>
+  <li>MLflow Model Registry 文档 — lifecycle states 和 transition API</li>
+  <li>Weights &amp; Biases Artifacts 文档 — lineage 和 dependency tracking</li>
+  <li>Hugging Face Model Hub 文档 — Model Card 和版本管理实践</li>
+</ul>
+
+<p><strong>评测与门禁</strong></p>
+<ul>
+  <li>Ribeiro et al., "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList" (ACL 2020)</li>
+  <li>OpenAI, "Practices for Governing Agentic AI Systems" (2024) — safety governance 框架</li>
+  <li>HELM (Holistic Evaluation of Language Models) 文档 — 多维度评测框架</li>
+</ul>
+
+<p><strong>GitOps 与 CD 系统</strong></p>
+<ul>
+  <li>Weaveworks, <em>GitOps: Operations by Pull Request</em> — GitOps 原始论文</li>
+  <li>ArgoCD 官方文档 — release pipeline 实践</li>
+  <li>Argo Workflows 官方文档 — ML pipeline 编排</li>
+</ul>
+
+<p><strong>安全与合规</strong></p>
+<ul>
+  <li>NIST AI RMF (AI Risk Management Framework, 2023) — AI 系统 governance 框架</li>
+  <li>EU AI Act 技术文档 — 高风险 AI 系统的发布要求</li>
+  <li>MITRE ATLAS — ML 攻击矩阵，对应 safety 门禁设计</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

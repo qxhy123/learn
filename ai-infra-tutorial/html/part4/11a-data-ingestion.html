@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11a 章 · 数据采集与摄入 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11a" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 11a 章 · 数据采集与摄入</h1>
+<p class="sub">从"数据产生速度不均匀、格式是活的、合规边界复杂、消费语义异构"这四个不可化简的物理和工程约束出发，推导出队列缓冲、schema 注册、CDC、摄入 SLA、PII 合规、多租户隔离和死信队列每一个机制的必然性，建立从原始信号到可审计字节流的完整工程直觉。</p>
+<div class="chips">
+  <span class="chip">Kafka</span>
+  <span class="chip">CDC / Debezium</span>
+  <span class="chip">Schema Registry</span>
+  <span class="chip">Exactly-once</span>
+  <span class="chip">PII / GDPR</span>
+  <span class="chip">Dead Letter Queue</span>
+  <span class="chip">多租户摄入</span>
+  <span class="chip">事件驱动</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>现实世界产生数据的速度、格式、来源和边界条件，与 AI 系统消费数据所需的语义、结构、一致性和可追溯性之间，存在一条不可消除的鸿沟。数据不会自动"变得可用"，每一个字节在进入存储之前，都要经过隐式或显式的决策：什么时候采集、采多少、用什么格式、怎么排序、如何处理失败、谁对质量负责。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）；本章是 <a href="../part4/11-data-pipeline.html">第 11 章数据管道</a>的上游入口，与 <a href="../part4/13-feature-vector-and-cache.html">第 13 章特征缓存</a>在线侧对接。</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：数据采集与摄入</a></li>
+<li><a class="anchor" href="#s2">数据源类型全景</a></li>
+<li><a class="anchor" href="#s3">摄入模式：批、流与中间地带</a></li>
+<li><a class="anchor" href="#s4">消息队列与中间件选型</a></li>
+<li><a class="anchor" href="#s5">对象存储事件驱动摄入</a></li>
+<li><a class="anchor" href="#s6">CDC：变更数据捕获</a></li>
+<li><a class="anchor" href="#s7">Schema 演进与 Schema Registry</a></li>
+<li><a class="anchor" href="#s8">摄入 SLA 的五个维度</a></li>
+<li><a class="anchor" href="#s9">数据合规：PII、GDPR 与跨境合规</a></li>
+<li><a class="anchor" href="#s10">多租户摄入：隔离、限流与计量</a></li>
+<li><a class="anchor" href="#s11">错误处理与死信队列</a></li>
+<li><a class="anchor" href="#s12">AI Infra 视角：三条不同的摄入路径</a></li>
+<li><a class="anchor" href="#s13">Worked Example：每天 10TB 日志 + 1 亿 API 调用的多租户摄入管道</a></li>
+<li><a class="anchor" href="#s14">练习</a></li>
+<li><a class="anchor" href="#s15">参考资料</a></li>
+</ol>
+</section>
+
+<!-- §1 第一性原理 -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：数据采集与摄入</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>把 Kafka、Debezium、Avro、Lambda、Flink 这些名字先拿掉，数据摄入要解决的不可化简问题只有一个：现实世界产生数据的速度、格式、来源和边界条件，与 AI 系统消费数据所需的语义、结构、一致性和可追溯性之间，存在一条不可消除的鸿沟。数据不会自动"变得可用"，每一个字节在进入存储之前，都要经过隐式或显式的决策：什么时候采集、采多少、用什么格式、怎么排序、如何处理失败、谁对质量负责。</p>
+
+<p>这个问题有四个无法绕开的物理和工程约束。第一，数据产生的速度和模式高度不均匀。电商大促时 API 调用量是平时的 100 倍；深夜用户行为日志量远低于白天；CDC 在数据库批量导入时瞬间涌出百万条变更事件。任何摄入系统都必须在这种不均匀性下保持可用，既不能因为峰值丢数据，也不能因为等峰值过去而让训练数据饥渴。</p>
+
+<p>第二，数据格式和 schema 是活的，不是固定的。上游业务系统会在不通知下游的情况下新增字段、废弃枚举值、改变日期格式。如果摄入系统没有 schema 版本管理机制，某一天的一个业务迭代就会让整条训练链路静默失效——数据"进来了"，但字段含义已经变了，模型在不知情的情况下被喂了语义错误的输入。</p>
+
+<p>第三，数据来源的权限边界、合规要求和地理位置各不相同。用户行为日志含有 PII（Personally Identifiable Information），必须在摄入时识别和标记，不能原封不动落盘后再处理；GDPR 的删除权要求系统能追踪某条用户数据流过了哪些存储节点，并能在规定时间内完成物理删除或不可逆匿名化；跨境数据传输要遵循各国数据本地化法规，不能因为"数据流向训练集群"就绕过这些约束。</p>
+
+<p>第四，不同 AI 工作负载对摄入语义的要求截然不同。离线训练需要的是高吞吐、历史完整性和可回放的批量数据；推理日志收集需要低延迟、顺序性和去重；评测数据集需要精确的时间截止（point-in-time）保证，不能混入"未来信息"；合成数据和第三方采购数据需要来源溯源和许可证管理。把训练摄入的设计直接套到推理日志收集，或者反过来，都会产生严重的资源浪费或数据质量问题。</p>
+
+<p>因此，数据摄入不是"把文件搬进 S3"，也不是"在 Kafka 里发一条消息"。它本质上是在峰谷不均、格式演进、合规约束和异构消费需求共同存在的条件下，设计一个可以长期运转、可以被审计、可以在出错时被精确回放的数据入口体系。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"数据产生速度不均匀"出发，队列和缓冲层必然出现。生产者和消费者解耦，消费者可以按自己的速度处理；峰值流量被队列吸收，不会直接击穿下游存储。Kafka、Pulsar、Kinesis、RabbitMQ 这些消息队列中间件的存在，都是同一个根因的不同工程实现。队列的容量、保留策略、分区方式和消费者组语义，都是这条推导链上的工程参数。</p>
+
+<p>从"格式是活的"出发，schema 注册和版本兼容性机制必然出现。只记录数据本身不够，还必须记录"这条数据是用哪个 schema 版本序列化的"。Avro、Protobuf 加上 Confluent Schema Registry 这类 schema 服务，都是在回答"如何让读者和写者能用不同的 schema 版本互操作"这个问题。Backward compatibility（旧读者能读新数据）和 Forward compatibility（新读者能读旧数据）是这里必须做的工程决策，不是可选项。</p>
+
+<p>从"不同工作负载要求不同语义"出发，批摄入和流摄入的分离必然出现。批摄入适合历史数据回填、大文件导入、计划性 ETL；流摄入适合事件驱动、低延迟更新、CDC 传播。从"来源包括数据库变更"出发，CDC 机制必然出现——数据库的 binlog 或 WAL 记录了每一条变更，CDC 工具把这些变更发布到消息队列。从"合规要求数据可追踪和可删除"出发，PII 标记、数据血缘和删除令牌机制必然出现。从"摄入会失败"出发，死信队列（DLQ）必然出现。从"多个租户共用同一套摄入基础设施"出发，限流、隔离、配额和计量必然出现。每个机制都是从不可化简的约束推导出来的必然存在，不是工程师的额外创造。</p>
+
+<div class="note"><strong>核心排障直觉：</strong>当下游模型效果退化或训练吞吐下降时，先问"数据进来了多少、进来的是什么、丢了没有、格式变了没有"，而不是先看模型结构或算力资源。摄入层的静默失效比显式报错更危险。</div>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((数据摄入))
+    不可化简问题
+      数据产生不均匀
+      格式/schema 是活的
+      合规边界复杂
+      消费语义异构
+    来源类型
+      日志与事件
+      数据库 CDC
+      API 抓取
+      用户上传
+      第三方供应商
+      合成数据
+      推理日志
+    摄入模式
+      批摄入 Batch
+      微批 Micro-batch
+      流摄入 Streaming
+      事件驱动
+    队列与缓冲
+      Kafka
+      Pulsar
+      Kinesis
+      RabbitMQ
+      Pub/Sub
+    Schema 治理
+      Avro Protobuf
+      Schema Registry
+      向后/向前兼容
+    CDC 机制
+      Binlog / WAL
+      Debezium Maxwell
+      Flink CDC
+    合规与安全
+      PII 标记
+      GDPR 删除权
+      跨境合规
+      数据血缘
+    错误处理
+      DLQ 死信队列
+      重试策略
+      幂等性
+    多租户
+      限流
+      配额
+      隔离
+      计量
+    AI 摄入路径
+      训练数据摄入
+      推理日志收集
+      评测数据集</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>批摄入、微批、流摄入、事件驱动四种模式分别适合什么场景，选型的决定因素是什么？</li>
+<li>Kafka、Pulsar、Kinesis、RabbitMQ 在 AI Infra 数据摄入中的选型差异体现在哪些维度？</li>
+<li>CDC 与直接 API 抓取相比，在延迟、侵入性、数据完整性上各有什么取舍？</li>
+<li>Avro + Schema Registry 如何保证 schema 演进时生产者和消费者之间的兼容性？</li>
+<li>摄入 SLA 的吞吐、延迟、顺序、exactly-once 和幂等性五个维度如何相互制约？</li>
+<li>PII 标记和 GDPR 删除权在摄入系统中需要哪些具体的工程机制才能实现？</li>
+<li>训练数据集、推理日志、评测数据在摄入路径上有哪些本质差异？</li>
+<li>死信队列的正确使用方式是什么，什么时候应该触发人工介入？</li>
+</ol>
+
+<h3>学习 checklist</h3>
+<ul>
+<li>能为一个新数据源选择批摄入、微批还是流摄入，并说明选型依据</li>
+<li>能画出 Kafka 分区策略和消费者组的关系图，并解释对顺序性的影响</li>
+<li>能解释 Avro + Schema Registry 的 BACKWARD/FORWARD 兼容模式的含义</li>
+<li>能列出摄入系统 GDPR 合规需要的最少工程机制</li>
+<li>能为一个多租户摄入系统设计限流和配额方案</li>
+<li>能说出 DLQ 的 3 种触发场景和 DLQ 的 SLA 应该如何定义</li>
+<li>能区分训练数据摄入和推理日志摄入在延迟/采样/去重上的核心差异</li>
+</ul>
+</section>
+
+<!-- §2 数据源类型 -->
+<section class="section" id="s2">
+<h2>2. 数据源类型全景</h2>
+<p>AI Infra 平台面对的数据来源远比想象中复杂。把来源按产生方式分类，才能为每类来源选择最合适的摄入策略。</p>
+
+<table>
+<tr><th>来源类型</th><th>产生特征</th><th>典型体积</th><th>主要挑战</th><th>AI Infra 用途</th></tr>
+<tr><td>应用日志</td><td>半结构化、高频、持续写入</td><td>100GB-10TB/天</td><td>格式不规则、重复、乱序</td><td>行为建模、异常检测训练</td></tr>
+<tr><td>用户事件流</td><td>事件驱动、突发性强</td><td>10M-1B 条/天</td><td>峰谷比大、去重复杂</td><td>推荐系统、序列建模</td></tr>
+<tr><td>数据库 CDC</td><td>精确变更、有序、有 schema</td><td>1MB-100GB/天</td><td>需要解析 binlog、锁依赖</td><td>特征实时更新、数据湖同步</td></tr>
+<tr><td>API 抓取</td><td>拉式、按计划或事件触发</td><td>不定</td><td>限流、失败重试、分页</td><td>第三方数据增强</td></tr>
+<tr><td>用户上传</td><td>主动、异步、格式多样</td><td>不定</td><td>病毒扫描、格式校验、权限</td><td>多模态训练、RLHF 标注</td></tr>
+<tr><td>第三方供应商</td><td>批量、定期交付、许可证管理</td><td>GB-TB 级</td><td>格式协商、版本追踪、合规</td><td>语料扩充、预训练数据</td></tr>
+<tr><td>合成数据</td><td>计算生成、可控分布</td><td>按需</td><td>生成成本、分布漂移、水印</td><td>数据增强、小样本补充</td></tr>
+<tr><td>推理日志</td><td>高频、低延迟要求</td><td>10B-100B 条/天（含采样）</td><td>采样策略、隐私、存储成本</td><td>模型监控、回流训练</td></tr>
+</table>
+
+<div class="warn"><strong>合成数据不等于免费数据：</strong>生成合成数据的计算成本可能超过采集真实数据，且合成数据的分布偏差（distribution shift）如果没有被监控，会静默地降低训练效果。合成数据必须和真实数据的分布做持续对比，不能因为"我们自己生成的"就跳过质量验收。</div>
+
+<h3>来源接入决策框架</h3>
+<p>数据源的选择往往不由工程师决定，但数据源的接入策略必须由工程师决定。三个关键问题：</p>
+<ol>
+<li><strong>推还是拉？</strong>推模式下生产者主动发送，摄入系统必须随时可用；拉模式下延迟更高但生产者压力更小。</li>
+<li><strong>是否有原生顺序保证？</strong>数据库 CDC 有全局顺序（单分区内）；用户事件流通常只有近似顺序；日志文件多节点聚合后顺序可能打乱。</li>
+<li><strong>量和速率是否可预测？</strong>可预测则批摄入更高效；不可预测则流摄入和队列缓冲必不可少。</li>
+</ol>
+</section>
+
+<!-- §3 摄入模式 -->
+<section class="section" id="s3">
+<h2>3. 摄入模式：批、流与中间地带</h2>
+
+<table>
+<tr><th>模式</th><th>触发方式</th><th>典型延迟</th><th>典型吞吐</th><th>复杂度</th><th>适用场景</th></tr>
+<tr><td>批摄入（Batch）</td><td>定时或手动</td><td>小时-天</td><td>极高（PB 级可行）</td><td>低</td><td>历史数据回填、定期 ETL、大文件导入</td></tr>
+<tr><td>微批（Micro-batch）</td><td>定时（秒-分钟级）</td><td>秒-分钟</td><td>高</td><td>中</td><td>接近实时的训练数据更新、日志聚合</td></tr>
+<tr><td>流摄入（Streaming）</td><td>事件触发</td><td>毫秒-秒</td><td>中（受队列限制）</td><td>高</td><td>推理日志实时收集、特征实时更新</td></tr>
+<tr><td>事件驱动（Event-driven）</td><td>外部事件（S3 上传、DB 变更）</td><td>毫秒-秒</td><td>中</td><td>高</td><td>CDC、对象存储触发处理、Webhook</td></tr>
+</table>
+
+<pre class="mermaid">flowchart LR
+  subgraph Batch[批摄入]
+    B1[定时调度器] --> B2[批量读取源]
+    B2 --> B3[批处理引擎\nSpark/Beam]
+    B3 --> B4[目标存储]
+  end
+  subgraph Stream[流摄入]
+    S1[事件产生者] --> S2[消息队列\nKafka/Kinesis]
+    S2 --> S3[流处理引擎\nFlink/Spark SS]
+    S3 --> S4[目标存储]
+  end
+  subgraph Micro[微批]
+    M1[累积缓冲区] -->|每 N 秒| M2[触发处理]
+    M2 --> M3[目标存储]
+  end</pre>
+
+<div class="warn"><strong>微批的隐性代价：</strong>把 10 秒的数据当作一个批次处理，每 10 秒产生一次小文件写入，对 S3 等对象存储产生大量小文件。小文件问题会让后续 Spark/Athena 查询变慢，也会增加文件 LIST 成本。选择微批时必须明确：小文件合并（compaction）策略是什么？是用 Iceberg 的自动 compaction，还是单独的 Spark 任务？</div>
+
+<h3>批 vs 流的本质取舍</h3>
+<p>批摄入的优势不只是简单：它意味着全局排序、完整性保证和更高效的压缩。当你把一天的数据一次性写入时，可以按主键排序、全局去重、做跨行统计。流摄入放弃了这些"批次内全局视图"，换来了低延迟。这不是优劣之分，而是工程取舍——先确定延迟 SLA，再倒推摄入模式。</p>
+</section>
+
+<!-- §4 消息队列选型 -->
+<section class="section" id="s4">
+<h2>4. 消息队列与中间件选型</h2>
+<p>消息队列是摄入系统的核心解耦层。选错队列会在吞吐、延迟、运维、成本和语义正确性上付出长期代价。</p>
+
+<table>
+<tr><th>维度</th><th>Kafka</th><th>Pulsar</th><th>RabbitMQ</th><th>Amazon Kinesis</th><th>Google Pub/Sub</th></tr>
+<tr><td>消息保留</td><td>日志式、可配保留天数</td><td>日志式分层存储</td><td>默认消费即删</td><td>可配 1-365 天</td><td>确认前保留</td></tr>
+<tr><td>吞吐峰值</td><td>极高（>1M msg/s/节点）</td><td>极高（>1M msg/s）</td><td>中（~100K msg/s）</td><td>高（按 shard 扩展）</td><td>高（托管扩展）</td></tr>
+<tr><td>延迟</td><td>低（&lt;10ms）</td><td>极低（&lt;5ms）</td><td>极低（&lt;1ms）</td><td>中（70-200ms）</td><td>中（100-200ms）</td></tr>
+<tr><td>顺序保证</td><td>分区内有序</td><td>分区内有序</td><td>队列内有序</td><td>分片内有序</td><td>无顺序保证</td></tr>
+<tr><td>exactly-once</td><td>需配置（幂等生产者+事务）</td><td>原生支持</td><td>需业务幂等</td><td>至少一次</td><td>至少一次</td></tr>
+<tr><td>多租户隔离</td><td>手动（topic/ACL）</td><td>原生（namespace/tenant）</td><td>vhost</td><td>账号/流隔离</td><td>项目/topic 隔离</td></tr>
+<tr><td>运维复杂度</td><td>中（KRaft 模式去除 ZK）</td><td>高（Bookkeeper+ZK）</td><td>低</td><td>低（托管）</td><td>低（托管）</td></tr>
+</table>
+
+<pre class="mermaid">flowchart TD
+  Start[需要消息队列] --> Q1{是否需要极低延迟\n&lt;1ms?}
+  Q1 -->|是| RMQ[RabbitMQ\n任务分发、低延迟消费]
+  Q1 -->|否| Q2{是否在 AWS/GCP 生态?}
+  Q2 -->|AWS| KIN[Kinesis\n托管、弹性伸缩]
+  Q2 -->|GCP| PUBSUB[Pub/Sub\n托管、全球分发]
+  Q2 -->|自建/多云| Q3{是否需要多租户\nnamespace 隔离?}
+  Q3 -->|是| PULSAR[Pulsar\n原生多租户、分层存储]
+  Q3 -->|否| KAFKA[Kafka\n高吞吐、生态最成熟]</pre>
+
+<div class="success"><strong>对于大多数 AI Infra 团队：</strong>Kafka 是第一选择。理由：生态成熟（Kafka Connect 有 200+ connectors）、社区活跃、与 Flink/Spark 深度集成。只有当你有明确的多租户命名空间需求或分层冷热存储需求时，才考虑 Pulsar。</div>
+
+<h3>Kafka 分区策略与 AI Infra</h3>
+<p>Kafka 的 topic 分成多个 partition，同一 partition 内消息有序。对 AI Infra 场景：</p>
+<ul>
+<li><strong>训练日志摄入</strong>：按 <code>experiment_id</code> 分区，保证同一实验的日志落在同一分区，方便后续按实验聚合。</li>
+<li><strong>用户事件</strong>：按 <code>user_id</code> hash 分区，保证同一用户的事件有序，支持序列建模。</li>
+<li><strong>推理日志</strong>：按 <code>model_id</code> 分区，方便按模型版本聚合监控数据。</li>
+</ul>
+</section>
+
+<!-- §5 对象存储事件驱动 -->
+<section class="section" id="s5">
+<h2>5. 对象存储事件驱动摄入</h2>
+<p>当数据以文件形式落在 S3/GCS/Azure Blob 时，事件驱动摄入模式比轮询更高效：文件上传即触发处理，无需定时扫描目录。</p>
+
+<pre class="mermaid">sequenceDiagram
+  participant UP as 上传方
+  participant S3 as S3 Bucket
+  participant EVB as EventBridge
+  participant SQS as SQS Queue
+  participant LAM as Lambda / ECS Task
+  participant DST as 目标存储（数据湖）
+
+  UP->>S3: PUT object (raw/user-logs/2026-05-03/batch_001.parquet)
+  S3->>EVB: s3:ObjectCreated 事件
+  EVB->>SQS: 路由到摄入队列（按规则过滤）
+  SQS->>LAM: 触发处理函数
+  LAM->>S3: 读取文件
+  LAM->>LAM: 验证 schema / PII 扫描 / 格式转换
+  LAM->>DST: 写入 Iceberg / Parquet
+  LAM->>SQS: 消息 ACK（删除）
+  Note over SQS: 失败时消息可见性超时重新入队<br/>超过最大重试次数进 DLQ</pre>
+
+<div class="warn"><strong>S3 事件不保证恰好一次：</strong>S3 ObjectCreated 事件是 at-least-once 语义。如果同一文件被覆盖写，Lambda 可能被调用两次。摄入函数必须实现幂等性：用文件的 ETag 或 S3 VersionId 作为去重键，写入前检查元数据表中是否已有处理记录。</div>
+
+<h3>EventBridge 规则示例</h3>
+<pre><code>{
+  "source": ["aws.s3"],
+  "detail-type": ["Object Created"],
+  "detail": {
+    "bucket": { "name": ["ai-infra-data-lake"] },
+    "object": {
+      "key": [{ "prefix": "raw/user-logs/" }],
+      "size": [{ "numeric": [">", 1024] }]
+    }
+  }
+}</code></pre>
+</section>
+
+<!-- §6 CDC -->
+<section class="section" id="s6">
+<h2>6. CDC：变更数据捕获</h2>
+<p>CDC（Change Data Capture）读取数据库的 WAL（Write-Ahead Log）或 binlog，把每条 INSERT/UPDATE/DELETE 转换成结构化事件，发布到消息队列。与轮询数据库相比，CDC 无需扫全表、延迟更低、对数据库性能影响更小。</p>
+
+<table>
+<tr><th>工具</th><th>数据库支持</th><th>延迟</th><th>输出格式</th><th>运维复杂度</th><th>特点</th></tr>
+<tr><td>Debezium</td><td>MySQL、PG、Oracle、MongoDB、SQL Server</td><td>毫秒级</td><td>JSON/Avro（Kafka）</td><td>中</td><td>生态最成熟，Kafka Connect 插件</td></tr>
+<tr><td>Maxwell</td><td>MySQL（binlog）</td><td>毫秒级</td><td>JSON（Kafka/Kinesis）</td><td>低</td><td>轻量，MySQL 专项</td></tr>
+<tr><td>Flink CDC</td><td>MySQL、PG、Oracle、TiDB</td><td>毫秒级</td><td>Flink Table</td><td>高</td><td>直接在 Flink 作业内消费</td></tr>
+<tr><td>Snowflake Stream</td><td>Snowflake（内部）</td><td>秒级</td><td>Snowflake Table</td><td>低（托管）</td><td>仅 Snowflake 内部使用</td></tr>
+<tr><td>AWS DMS</td><td>多种</td><td>秒级</td><td>S3/Kinesis/RDS</td><td>低（托管）</td><td>适合 AWS 生态迁移</td></tr>
+</table>
+
+<pre class="mermaid">flowchart LR
+  DB[(MySQL\n生产数据库)] -->|binlog| DEB[Debezium\nConnect Worker]
+  DEB -->|Avro 事件| KAFKA[Kafka Topic\ndb.orders.changes]
+  KAFKA -->|消费| FL[Flink 流处理]
+  FL -->|聚合/转换| ICE[(Iceberg 数据湖)]
+  FL -->|实时特征| REDIS[(Redis 特征缓存)]
+  KAFKA -->|批量消费| LAKE[Parquet 落盘]</pre>
+
+<div class="note"><strong>Debezium 事件结构：</strong>每个事件包含操作类型（op: c/u/d）、变更前后的完整记录（before/after）、来源信息（db/table/binlog position）。<code>op=u</code> 的事件中，<code>before</code> 字段需要数据库开启 <code>binlog_row_image=FULL</code>（MySQL）或 <code>REPLICA IDENTITY FULL</code>（PostgreSQL），否则旧值不可见。这是需要在设计阶段与 DBA 确认的基础设施配置。</div>
+</section>
+
+<!-- §7 Schema 演进 -->
+<section class="section" id="s7">
+<h2>7. Schema 演进与 Schema Registry</h2>
+<p>Schema 是摄入系统的隐式契约。生产者和消费者用同一套 schema 理解数据，但随着业务迭代，schema 必然演进。没有 Schema Registry 的系统，schema 升级就是一场高风险赌博。</p>
+
+<table>
+<tr><th>维度</th><th>Avro</th><th>Protobuf</th></tr>
+<tr><td>Schema 随消息携带</td><td>支持（引用 registry ID）</td><td>不支持（消费者需编译时 .proto）</td></tr>
+<tr><td>序列化大小</td><td>二进制紧凑</td><td>二进制更紧凑（无字段名）</td></tr>
+<tr><td>动态 schema 读取</td><td>支持（无需编译）</td><td>需要 .proto 文件</td></tr>
+<tr><td>Schema Registry 集成</td><td>天然（Confluent 首选）</td><td>支持但较少见</td></tr>
+<tr><td>AI 框架生态</td><td>Kafka 生态常用</td><td>gRPC 服务、TF 生态</td></tr>
+</table>
+
+<pre class="mermaid">flowchart TD
+  NEW[新 Schema 版本] --> Q1{兼容性模式}
+  Q1 -->|BACKWARD| B["旧消费者可读新数据\n（新增字段须有默认值）"]
+  Q1 -->|FORWARD| F["新消费者可读旧数据\n（新字段在旧数据中无值）"]
+  Q1 -->|FULL| FULL["双向兼容\n（只能新增有默认值字段）"]
+  Q1 -->|NONE| NONE["不检查\n（不推荐生产使用）"]
+  B --> AI_B["适合训练数据摄入\n消费者慢于生产者演进"]
+  F --> AI_F["适合推理服务读取\n消费者比生产者新"]
+  FULL --> AI_FULL["适合关键业务 schema\n不接受任何兼容性风险"]</pre>
+
+<div class="danger"><strong>静默数据质量事故的高危模式：</strong>在没有 Schema Registry 的情况下，生产者 schema 升级是一个静默炸弹。某天生产者删掉了一个字段，消费者（通常是训练脚本）继续运行，但从那个字段读到的全是 None 或默认值，模型效果悄悄下降。没有监控、没有告警。Schema Registry 的强制注册和兼容性检查是防止这类事故的最低基础设施。</div>
+</section>
+
+<!-- §8 摄入 SLA -->
+<section class="section" id="s8">
+<h2>8. 摄入 SLA 的五个维度</h2>
+
+<table>
+<tr><th>SLA 维度</th><th>定义</th><th>典型目标</th><th>权衡因素</th><th>监控指标</th></tr>
+<tr><td>吞吐（Throughput）</td><td>单位时间内可摄入的数据量</td><td>10TB/天、1M 条/秒</td><td>增加吞吐通常增加延迟和成本</td><td>消费者 lag、写入速率</td></tr>
+<tr><td>延迟（Latency）</td><td>从数据产生到可供消费的时间</td><td>P99 &lt; 5s（流摄入）</td><td>低延迟要求更多资源和更复杂架构</td><td>end-to-end 延迟分布</td></tr>
+<tr><td>顺序（Ordering）</td><td>消息到达顺序是否与产生顺序一致</td><td>分区内有序</td><td>全局有序极难扩展</td><td>乱序率、时间戳漂移</td></tr>
+<tr><td>Exactly-once</td><td>每条消息恰好被处理一次</td><td>金融/审计场景必须</td><td>显著增加系统复杂度</td><td>重复率、丢失率</td></tr>
+<tr><td>幂等性（Idempotency）</td><td>重复摄入同一数据不产生副作用</td><td>所有摄入场景推荐</td><td>需要额外的去重存储</td><td>DLQ 消息量</td></tr>
+</table>
+
+<h3>Exactly-once 的实现代价</h3>
+<p>在 Kafka 中实现 exactly-once 需要：(1) 生产者开启幂等模式 <code>enable.idempotence=true</code>；(2) 生产者使用事务 <code>transactional.id</code>；(3) 消费者隔离级别设为 <code>read_committed</code>；(4) 下游写入与 offset 提交在同一个事务内。这 4 步加在一起，会将吞吐降低 20-40%，延迟提升 50-100%。</p>
+
+<div class="success"><strong>实用建议：</strong>对于大多数 AI 训练数据摄入，<strong>at-least-once + 幂等消费端</strong>是更实用的选择。幂等摄入的最简单实现：用内容哈希（xxHash）或业务主键作为去重键，写入时先 <code>INSERT ... ON CONFLICT DO NOTHING</code>，让数据库做重复检测。比在消息队列层实现 exactly-once 便宜得多。</div>
+</section>
+
+<!-- §9 合规 -->
+<section class="section" id="s9">
+<h2>9. 数据合规：PII、GDPR 与跨境合规</h2>
+<p>合规不是法务部门的事，是摄入系统的工程约束。在摄入时不做合规处理，就是把合规债务留给未来，且代价会指数增长。</p>
+
+<h3>PII 识别与标记</h3>
+<p>PII（Personally Identifiable Information）必须在数据进入存储之前识别和标记，不能事后补救。常见 PII 类型：直接标识符（姓名、身份证号、手机号、邮箱、IP 地址、设备 ID）、间接标识符（出生年份 + 性别 + 邮编的组合可唯一标识个人）、敏感属性（健康状况、宗教、政治观点）。</p>
+
+<pre class="mermaid">flowchart LR
+  RAW[原始数据] --> SCAN[PII 扫描\nDLP 服务/正则规则/NER 模型]
+  SCAN --> LABEL[字段级 PII 标记\n+ 血缘记录]
+  LABEL --> Q1{处理策略}
+  Q1 -->|必须保留原始值| ENCRYPT[加密存储\n访问控制 + 审计日志]
+  Q1 -->|可以脱敏| ANON[假名化/泛化\n手机号→hash]
+  Q1 -->|不需要| DROP[删除字段\n不落盘]
+  ENCRYPT --> VAULT[密钥管理服务\nKMS/Vault]
+  ANON --> TRAIN[可用于训练]</pre>
+
+<h3>GDPR 删除权（Right to be Forgotten）</h3>
+<p>GDPR 第 17 条要求在收到删除请求后 30 天内完成。对摄入系统的含义：</p>
+<ol>
+<li><strong>数据血缘追踪</strong>：每条数据必须能追溯到哪个用户 ID，流经哪些系统。</li>
+<li><strong>Tombstone 机制</strong>：在 Kafka 发布 <code>user_id → null</code> 的 tombstone 消息，触发下游系统清理。</li>
+<li><strong>训练集的处理</strong>：如果用户数据已进入训练集，需要从训练集删除并重新训练，或用机器遗忘（Machine Unlearning）技术处理。</li>
+<li><strong>日志的处理</strong>：含有该 user_id 的原始日志需在规定时间内完成匿名化或物理删除。</li>
+</ol>
+
+<div class="danger"><strong>GDPR 删除是最难的工程问题之一：</strong>数据已被复制到多个地方——对象存储、消息队列、缓存、备份、训练集、模型权重。没有端到端数据血缘，删除请求无法被完整执行。面临的罚款上限是全球营业额的 4%。摄入时的 PII 标记和血缘记录是后续删除的前提条件，不是可选的。</div>
+
+<h3>跨境合规</h3>
+<p>不同国家/地区对数据跨境传输有不同要求：欧盟 GDPR 要求数据保持在 EEA 内或传输到有充分性决定的国家；中国 PIPL 要求数据本地化存储；俄罗斯联邦法律要求俄罗斯公民数据在俄境内处理。摄入系统需要：在 ingestion 入口记录数据来源地理位置、为不同地区配置不同的存储后端、不允许数据在未授权的情况下跨区域复制。</p>
+</section>
+
+<!-- §10 多租户 -->
+<section class="section" id="s10">
+<h2>10. 多租户摄入：隔离、限流与计量</h2>
+
+<table>
+<tr><th>隔离层</th><th>Kafka 实现</th><th>隔离效果</th><th>成本</th></tr>
+<tr><td>Topic 隔离</td><td>每个租户独立 topic</td><td>逻辑隔离，资源共享</td><td>低</td></tr>
+<tr><td>Consumer Group 隔离</td><td>每个租户独立 consumer group</td><td>消费进度隔离</td><td>低</td></tr>
+<tr><td>Kafka Cluster 隔离</td><td>每个租户独立 cluster</td><td>完全隔离，运维翻倍</td><td>极高</td></tr>
+<tr><td>Namespace 隔离（Pulsar）</td><td>Pulsar 原生 tenant/namespace</td><td>资源配额 + ACL + 隔离</td><td>中</td></tr>
+</table>
+
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Normal : 租户流量正常
+  Normal --> Warning : 超过配额 80%
+  Normal --> Throttled : 超过限流阈值
+  Warning --> Throttled : 超过配额 100%
+  Throttled --> Normal : 流量回落阈值以下
+  Throttled --> Blocked : 持续超额 > 5min
+  Blocked --> Normal : 人工介入/配额升级
+
+  note right of Throttled
+    返回 429 Too Many Requests
+    或降速接收（背压）
+  end note</pre>
+
+<h3>限流实现的三个层次</h3>
+<ol>
+<li><strong>生产者侧限流</strong>：在 Kafka Producer 配置 <code>max.block.ms</code> 和 <code>buffer.memory</code>，超出时阻塞或抛错。</li>
+<li><strong>网关侧限流</strong>：在摄入 API 网关（Kong、Envoy）配置 Token Bucket 或 Sliding Window 限流。</li>
+<li><strong>消费者侧配额</strong>：为每个租户的消费者 group 配置 <code>fetch.max.bytes</code>，控制消费速率。</li>
+</ol>
+
+<div class="note"><strong>计量是运营的基础：</strong>多租户场景下，计量数据是成本分摊和容量规划的基础。必须追踪：按租户的摄入字节数、消息条数、端到端延迟 P50/P99、消费者 lag。消费者 lag 超阈值必须告警——它是摄入系统最重要的健康指标。</div>
+</section>
+
+<!-- §11 DLQ -->
+<section class="section" id="s11">
+<h2>11. 错误处理与死信队列</h2>
+<p>摄入失败是常态，不是异常。每条消息都有可能因为 schema 不兼容、下游写入超时、内容校验失败或资源限制而无法被正常处理。</p>
+
+<table>
+<tr><th>失败类型</th><th>重试策略</th><th>最终处理</th></tr>
+<tr><td>瞬态网络错误</td><td>指数退避重试（3-5 次）</td><td>超次数进 DLQ</td></tr>
+<tr><td>Schema 不兼容</td><td>不重试（重试无效）</td><td>立即进 DLQ + 告警</td></tr>
+<tr><td>下游存储不可用</td><td>指数退避 + 限次重试</td><td>暂停消费，等恢复</td></tr>
+<tr><td>内容校验失败（PII 未脱敏）</td><td>不重试</td><td>进 DLQ + 人工审核</td></tr>
+<tr><td>消息过大</td><td>不重试</td><td>进 DLQ + 拆分逻辑</td></tr>
+</table>
+
+<pre class="mermaid">flowchart LR
+  QUEUE[主队列\nKafka Topic] --> CONS[消费者\nIngestion Worker]
+  CONS --> Q1{处理成功?}
+  Q1 -->|是| DEST[目标存储]
+  Q1 -->|否，可重试| RETRY[重试队列\n指数退避]
+  RETRY --> CONS
+  Q1 -->|否，不可重试| DLQ[死信队列\nDLQ Topic]
+  RETRY --> Q2{超过重试次数?}
+  Q2 -->|是| DLQ
+  DLQ --> ALERT[告警 + 监控]
+  DLQ --> HUMAN[人工审核]
+  HUMAN --> Q3{可以修复?}
+  Q3 -->|是| REPLAY[重放到主队列]
+  Q3 -->|否| ARCHIVE[归档 + 记录根因]</pre>
+
+<div class="warn"><strong>DLQ 不是垃圾桶：</strong>DLQ 消息必须有 SLA——多长时间内必须被处理或归档？谁收到告警？谁有权限重放？没有 SLA 的 DLQ 最终会积累成 TB 级的"等待排查"数据，在某次峰值时拖垮系统，且出现 DLQ 堆积时业务方完全不知情。</div>
+</section>
+
+<!-- §12 AI 摄入路径 -->
+<section class="section" id="s12">
+<h2>12. AI Infra 视角：三条不同的摄入路径</h2>
+<p>同一套数据摄入基础设施，在 AI Infra 场景下服务三类截然不同的消费者。这三条路径在延迟、吞吐、顺序、保留期和合规要求上各有不同，不可混用设计。</p>
+
+<table>
+<tr><th>维度</th><th>训练数据摄入</th><th>推理日志摄入</th><th>评测数据摄入</th></tr>
+<tr><td>延迟要求</td><td>小时级可接受</td><td>秒级（实时监控需要）</td><td>按需（可离线）</td></tr>
+<tr><td>吞吐要求</td><td>极高（TB 级批量）</td><td>高（实时流量）</td><td>低（批量交付）</td></tr>
+<tr><td>顺序要求</td><td>无（训练不依赖顺序）</td><td>中（同 session 内有序）</td><td>高（时间截止精确）</td></tr>
+<tr><td>保留期</td><td>长期（版本化永久保留）</td><td>中（通常 30-90 天）</td><td>永久（评测可复现性）</td></tr>
+<tr><td>PII 处理</td><td>脱敏后才可用于训练</td><td>匿名化或假名化</td><td>严格脱敏 + 访问控制</td></tr>
+<tr><td>去重要求</td><td>全局去重（避免数据泄漏）</td><td>幂等（避免重复计费）</td><td>严格（不重复样本）</td></tr>
+<tr><td>版本化</td><td>必须（dataset_version）</td><td>通常不需要</td><td>必须（evaluation_version）</td></tr>
+</table>
+
+<h3>训练数据摄入路径</h3>
+<pre class="mermaid">flowchart LR
+  SRC1[应用日志] --> KAFKA[Kafka 缓冲层]
+  SRC2[DB CDC] --> KAFKA
+  SRC3[第三方数据] --> S3RAW[S3 Raw 区]
+  KAFKA --> BATCH[批量消费\n每小时一次]
+  BATCH --> PARQUET[Parquet Shard\n64MB-1GB]
+  PARQUET --> CLEAN[清洗层\nSpark/Ray]
+  CLEAN --> SAMPLE[样本层\n训练/验证/测试]
+  S3RAW --> CLEAN</pre>
+
+<div class="warn"><strong>推理日志采样是不可逆决策：</strong>一旦某条日志被丢弃，就无法在事后恢复。如果某个模型问题只在特定条件下触发（长尾输入），而这些条件恰好被采样率过滤掉，问题可能永远无法被发现。初期宁可多采样，存储成本远低于线上质量问题的代价。推荐策略：整体随机采样 5-10%、模型低置信度输出全量保留、用户主动反馈全量保留、所有错误全量保留。</div>
+</section>
+
+<!-- §13 Worked Example -->
+<section class="section" id="s13">
+<h2>13. Worked Example：每天 10TB 用户日志 + 1 亿 API 调用记录的多租户摄入管道</h2>
+
+<h3>场景描述</h3>
+<p>某 AI SaaS 平台，服务 50 个企业租户，每天产生：</p>
+<ul>
+<li>用户行为日志：10TB（JSON 格式，约 500 亿条记录）</li>
+<li>API 调用记录：1 亿条（含请求/响应元数据，平均 1KB/条）</li>
+<li>推理结果日志：2 亿条（按 5% 采样率，原始 40 亿条）</li>
+</ul>
+<p>需求：训练数据每小时更新（延迟 &lt; 1 小时）；推理监控实时（P99 延迟 &lt; 30 秒）；50 个租户互相隔离；满足 GDPR 合规；支持 72 小时内完成 GDPR 删除请求。</p>
+
+<h3>整体架构</h3>
+<pre class="mermaid">flowchart TB
+  subgraph Sources[数据来源]
+    LOG[用户行为日志\n各租户 agent]
+    API[API 网关\n调用记录]
+    INF[推理服务\n结果日志 5% 采样]
+  end
+
+  subgraph Ingestion[摄入层]
+    GW[摄入网关\n限流 + 认证 + 租户路由]
+    KAFKA1[Kafka 行为日志 Topic\n按 tenant_id 分区]
+    KAFKA2[Kafka API 记录 Topic\n按 tenant_id 分区]
+    KAFKA3[Kafka 推理日志 Topic\n按 model_id 分区]
+    DLQ[DLQ Topic\n错误隔离]
+  end
+
+  subgraph Processing[处理层]
+    FLINK[Flink 流处理\n实时 PII 脱敏 + 路由]
+    BATCH[批量消费\nSpark 每小时]
+  end
+
+  subgraph Storage[存储层]
+    RAW[S3 Raw 区\n加密，含 PII]
+    CLEAN[S3 Clean 区\n脱敏，可训练]
+    MONITOR[ClickHouse\n推理监控]
+    META[元数据服务\n数据血缘]
+  end
+
+  LOG --> GW
+  API --> GW
+  INF --> GW
+  GW --> KAFKA1
+  GW --> KAFKA2
+  GW --> KAFKA3
+  KAFKA1 --> FLINK
+  KAFKA2 --> FLINK
+  KAFKA3 --> FLINK
+  FLINK --> RAW
+  FLINK --> CLEAN
+  FLINK --> MONITOR
+  FLINK --> DLQ
+  RAW --> BATCH
+  BATCH --> CLEAN
+  FLINK --> META
+  BATCH --> META</pre>
+
+<h3>容量规划</h3>
+<table>
+<tr><th>资源</th><th>估算</th><th>参数基础</th></tr>
+<tr><td>Kafka 分区数</td><td>50 租户 × 3 topic × 10 分区 = 1,500 分区</td><td>每分区峰值 20MB/s</td></tr>
+<tr><td>Kafka 存储</td><td>10TB/天 × 7 天保留 = 70TB</td><td>不含副本（3 副本则 ×3）</td></tr>
+<tr><td>Kafka 节点数</td><td>15 节点（每节点 ~100MB/s 有效写入）</td><td>10TB/天 ÷ 86400s ≈ 116MB/s 平均，峰值 10x</td></tr>
+<tr><td>Flink TaskManager</td><td>20 节点（每节点 8 核 32G）</td><td>实时 PII 扫描 + 路由，峰值吞吐 ~5x 平均</td></tr>
+<tr><td>DLQ 保留期</td><td>30 天</td><td>人工审核 SLA</td></tr>
+<tr><td>PII 扫描 QPS</td><td>约 60,000 条/秒</td><td>500 亿/天 ÷ 86400s</td></tr>
+</table>
+
+<h3>租户限流配置示例</h3>
+<pre><code>tenant_quota:
+  default:
+    ingest_rate: 100MB/s
+    message_rate: 100000 msg/s
+    daily_volume: 500GB
+  enterprise:
+    ingest_rate: 500MB/s
+    message_rate: 500000 msg/s
+    daily_volume: 5TB
+  premium:
+    ingest_rate: 2GB/s
+    message_rate: 2000000 msg/s
+    daily_volume: 50TB</code></pre>
+
+<h3>GDPR 删除流程（72 小时 SLA）</h3>
+<p>当收到用户 <code>user_id=12345</code> 的删除请求时：</p>
+<ol>
+<li>查询元数据服务，获取该用户数据流经的所有系统（Kafka topic、S3 路径、下游存储）</li>
+<li>在 Kafka 发布 tombstone：<code>key=user_12345, value=null</code></li>
+<li>Flink 消费 tombstone，标记该 user_id 的所有下游记录为"待删除"</li>
+<li>S3 Raw 区：用 Athena 查询找到含该 user_id 的 Parquet 文件，重写文件删除对应行</li>
+<li>S3 Clean 区：同样操作</li>
+<li>训练集：检查 dataset_version 元数据，确认该用户是否进入任何训练集；如进入，触发数据集重建</li>
+<li>完成后更新删除确认记录，记录操作审计日志</li>
+</ol>
+
+<div class="success"><strong>关键设计决策：</strong>这个架构的核心是"摄入时标记，删除时追踪"。PII 标记在数据进入系统时完成，元数据服务在每次数据移动时记录血缘。这使得 GDPR 删除可以被系统化执行，而不是靠人工搜索每个系统。</div>
+
+<h3>工程边界</h3>
+<ul>
+<li>日志量超过 100TB/天时，Flink 的实时 PII 扫描延迟成为瓶颈，需换成异步扫描 + 临时隔离存储模式。</li>
+<li>租户数超过 500 时，Kafka topic/分区数管理变得复杂，应考虑 Pulsar 的原生多租户命名空间。</li>
+<li>GDPR 删除的 S3 文件重写成本是 O(文件大小)，不是 O(删除行数)。当文件很大时，整体删除成本极高。建议在 S3 层按 user_id 分桶存储，使重写范围可控。</li>
+<li>Flink checkpoint 间隔建议 60 秒（不超过 5 分钟），保证故障恢复时摄入延迟在可接受范围内。</li>
+</ul>
+</section>
+
+<!-- §14 练习 -->
+<section class="section" id="s14">
+<h2>14. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>11a-1（基础）：摄入模式选型</strong><br>解释批摄入和流摄入的本质区别，各举一个适合 AI Infra 的具体场景，说明为什么这两个场景不能互换摄入模式。</div>
+<div class="card"><strong>11a-2（基础）：消息保留语义</strong><br>Kafka 和 RabbitMQ 在消息保留策略上有什么本质不同？这个差异对 AI 训练数据的历史回放能力有什么影响？</div>
+<div class="card"><strong>11a-3（基础）：CDC 的优势</strong><br>什么是 CDC？Debezium 读取 MySQL binlog 和直接轮询数据库表相比，在延迟、数据库压力和数据完整性上各有什么优势？</div>
+<div class="card"><strong>11a-4（基础）：Schema 兼容性</strong><br>Avro Schema Registry 的 BACKWARD 兼容模式具体保证什么？举一个生产者新增字段后，旧消费者能继续工作的例子。</div>
+<div class="card"><strong>11a-5（基础）：DLQ 使用规范</strong><br>死信队列（DLQ）的正确使用方式是什么？列举 3 种应该进 DLQ 的失败类型和 2 种不应该进 DLQ 而应该直接重试的失败类型。</div>
+<div class="card"><strong>11a-6（进阶）：Kafka 分区设计</strong><br>在每天 10TB 用户日志的摄入系统中，如何设计 Kafka 的分区策略，使得既能保证同一用户的事件有序，又能保证 50 个租户之间的隔离性？给出 topic 设计方案和分区 key 选择理由。</div>
+<div class="card"><strong>11a-7（进阶）：事件驱动幂等性</strong><br>S3 + EventBridge + Lambda 的事件驱动摄入模式中，如何保证幂等性？Lambda 函数的哪些设计决策与幂等性直接相关？</div>
+<div class="card"><strong>11a-8（进阶）：GDPR 删除的工程代价</strong><br>GDPR 删除权在 AI 训练数据管道中的工程挑战是什么？如果某用户的数据已经进入了上个月的训练集，有哪些处理方案？各方案的代价是什么？</div>
+<div class="card"><strong>11a-9（进阶）：限流算法选型</strong><br>多租户限流中，Token Bucket 算法和 Sliding Window 算法各有什么特点？在 AI Infra 摄入场景中，哪种更适合应对用户上传的突发大文件？给出选型理由。</div>
+<div class="card"><strong>11a-10（设计）：推理日志采样策略</strong><br>设计一个推理日志采样策略：(a) 整体采样率 5%；(b) 模型置信度 &lt; 0.6 的样本全量保留；(c) 用户主动反馈全量保留；(d) 每个用户每天最多保留 100 条。写出实现这个策略的 Flink 算子逻辑（伪代码）。</div>
+<div class="card"><strong>11a-11（设计）：摄入监控仪表盘</strong><br>为本章 Worked Example 的多租户摄入系统设计监控仪表盘，要求：列出 8 个核心指标（名称 + 采集方式 + 告警阈值），给出 2 条 PromQL 告警规则草稿。</div>
+<div class="card"><strong>11a-12（设计）：第三方数据接入规范</strong><br>某 AI 平台需要从 5 个第三方数据供应商定期采购数据。设计一个第三方数据摄入标准化方案，包括：接入格式要求、许可证元数据记录、数据溯源标记、质量验收门禁和后续更新的版本追踪机制。</div>
+</div>
+</section>
+
+<!-- §15 参考资料 -->
+<section class="refbox" id="s15">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用 §1 把"四个不可化简约束"建立心智，理解每个机制为什么必然存在。</li>
+<li>用 §2-§3 建立数据源全景图和摄入模式选型直觉——先选模式再选工具。</li>
+<li>用 §4 的消息队列选型表做具体技术决策，结合 §5 的对象存储事件驱动和 §6 的 CDC 覆盖三大摄入入口。</li>
+<li>用 §7 理解 schema 演进的工程意义，建立"schema 不受控 = 静默数据质量事故"的直觉。</li>
+<li>用 §8-§11 把 SLA、合规、多租户、错误处理建立成工程清单，而不是事后的 checklist。</li>
+<li>用 §12 理解 AI 场景下三条不同摄入路径的设计差异。</li>
+<li>用 §13 Worked Example 把上述所有知识串起来，做容量规划和架构决策的完整演练。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>. 第 10-11 章是摄入模式选型的最佳系统论述，必读。</li>
+<li>Neha Narkhede 等, <em>Kafka: The Definitive Guide</em>, 2nd ed. Kafka 生产实践权威指南。</li>
+<li>Jay Kreps, "The Log: What every software engineer should know about real-time data's unifying abstraction". LinkedIn Engineering blog，数据摄入哲学基础。</li>
+<li>Jay Kreps 等, "Kafka: a Distributed Messaging System for Log Processing", NetDB 2011. Kafka 设计原始论文。</li>
+<li>Confluent Schema Registry 文档（docs.confluent.io）。schema 兼容性模式的权威说明。</li>
+<li>Debezium 官方文档（debezium.io）。CDC connector 配置和 binlog 解析细节。</li>
+<li>OpenLineage 规范（openlineage.io）。数据血缘标准，支持 Flink/Spark 原生集成。</li>
+<li>Netflix Tech Blog: "Keystone Real-time Stream Processing Platform". Kafka 超大规模运营经验。</li>
+<li>GDPR 第 17 条（Right to Erasure）及欧洲数据保护委员会（EDPB）技术指引。</li>
+<li>Apache Pulsar 文档，multi-tenancy 章节（pulsar.apache.org）。原生多租户命名空间设计。</li>
+<li>Microsoft Presidio（github.com/microsoft/presidio）. 开源 PII 识别工具，支持私有化部署。</li>
+<li><a href="../part4/11-data-pipeline.html">第 11 章：数据管道</a>——摄入进来的数据如何分层清洗、切分和样本化。</li>
+<li><a href="../part4/13-feature-vector-and-cache.html">第 13 章：特征向量与缓存</a>——推理侧的实时特征摄入和缓存一致性。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

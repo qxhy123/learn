@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 13e 章 · Embedding 工程与缓存层 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=13e" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 13e 章 · Embedding 工程与缓存层</h1>
+<p class="sub">从"语义相似性是多系统的共享假设"出发，推导出 embedding 模型选型、维度量化、Matryoshka 截断、ColBERT 多向量、Semantic Cache、KV Prefix Cache、版本治理与 Reindex 决策的完整因果链。</p>
+<div class="chips">
+  <span class="chip">Embedding 模型</span>
+  <span class="chip">Matryoshka</span>
+  <span class="chip">ColBERT</span>
+  <span class="chip">量化</span>
+  <span class="chip">Semantic Cache</span>
+  <span class="chip">KV Prefix Cache</span>
+  <span class="chip">Reindex</span>
+  <span class="chip">Drift Detection</span>
+  <span class="chip">TEI</span>
+  <span class="chip">MNR Loss</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>Embedding 是 RAG、推荐、风控、语义搜索等多个系统的共享坐标系。选错模型或没维护好版本，所有下游检索、分类、聚类全部失效；缓存设计错误，命中率越高，过期与越权风险越大。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解 + 学习大纲</a></li>
+  <li><a class="anchor" href="#s2">Embedding 模型分类与主流选型</a></li>
+  <li><a class="anchor" href="#s3">维度、精度与成本的三角权衡</a></li>
+  <li><a class="anchor" href="#s4">Matryoshka Embedding：可截断的向量空间</a></li>
+  <li><a class="anchor" href="#s5">Multi-vector 表示：ColBERT 与 Late Interaction</a></li>
+  <li><a class="anchor" href="#s6">Embedding 服务化：从单机推理到生产 Serving</a></li>
+  <li><a class="anchor" href="#s7">Embedding 微调：对比学习与领域适应</a></li>
+  <li><a class="anchor" href="#s8">Embedding 缓存与 Semantic Cache</a></li>
+  <li><a class="anchor" href="#s9">KV Prefix Cache：与 Ch 15、Ch 16b 的衔接</a></li>
+  <li><a class="anchor" href="#s10">Drift Detection 与 Reindex 决策</a></li>
+  <li><a class="anchor" href="#s11">Embedding 服务架构：全链路视图</a></li>
+  <li><a class="anchor" href="#s12">Worked Example：电商搜索从 v1 到 v3 的演进</a></li>
+  <li><a class="anchor" href="#s13">与 AI Infra 其他系统的关系</a></li>
+  <li><a class="anchor" href="#s14">工程检查清单</a></li>
+  <li><a class="anchor" href="#s15">练习题</a></li>
+  <li><a class="anchor" href="#s16">深度参考阅读</a></li>
+</ol>
+</section>
+
+<div class="warn">本章的 Semantic Cache 和 KV Prefix Cache 涉及多租户数据隔离，与 <a href="../part7/23-security-isolation-and-governance.html">第 23 章</a> 安全治理直接相关；缓存层如果跨租户共享，会把检索系统变成数据泄露面。</div>
+
+<!-- ===== §1 第一性原理拆解 ===== -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解 + 学习大纲</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>剥离 "text-embedding-3-large"、"ColBERT"、"Matryoshka"、"GPTCache"、"Semantic Cache" 这些工具和名词之后，本章真正面对的是一个不可化简的基础设施问题：<strong>AI 系统里所有需要"找相似"的任务——RAG、推荐召回、语义搜索、意图分类、风控判别——都共享同一个底层假设：两个语义相近的对象在向量空间里也彼此靠近。</strong>这个假设能否成立，完全取决于你选了哪个 embedding 模型、用在哪个领域、是否经过微调、是否和索引保持同一个版本。</p>
+
+<p>这个问题为什么不可化简？因为 embedding 是多个系统的"共享坐标系"。换一个模型，所有旧向量的含义就全变了；不重建索引就复用，相当于在不同投影仪的画面上叠加不同坐标系的点——表面上看不出异常，实际上召回质量会悄悄崩塌，而且没有显式报错。线上指标下滑会被归咎于"用户搜索习惯变化"或者"模型回答质量下降"，排查困难度极高。</p>
+
+<p>问题的第二层难点在于维度与成本的权衡。高维 embedding（1536/3072 维）表达力更强，但存储、ANN 检索延迟、量化损失、索引内存都随维度增长。低维（128/256）速度快、成本低，但细粒度语义可能丢失。平台需要在精度、成本、延迟三者之间找到可持续的工作点，而不是默认用最高维度。</p>
+
+<p>第三层难点是缓存。RAG 系统里有至少四类缓存：Embedding Cache（减少重复编码）、Semantic Cache（找到语义相似的历史 query 直接复用 LLM 回答）、Output Cache（完整 prompt-response 哈希命中），加上 LLM serving 层的 KV Prefix Cache。四种缓存各自命中条件不同、失效策略不同、权限风险不同。把它们混为一谈，或者把命中率最高的缓存策略不加甄别地部署，很快会出现权限越界、过期数据被持续服务的严重问题。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p><strong>从"需要语义相似"推出 embedding 模型选型。</strong>不同任务需要不同的语义空间：通用语义比较不一定适合专业领域；中文文档检索需要支持多语言或中文特化模型；图文混合场景需要多模态 embedding。MTEB Benchmark 是选型的起点，但 benchmark 是通用数据集；如果你的语料是医疗合规文件，benchmark 上排名第三的模型也许比第一名更合适。</p>
+
+<p><strong>从"向量质量依赖模型"推出版本控制。</strong>Embedding 模型版本 + tokenizer 版本 + 预处理规则三者共同定义一个向量空间。任何一个变化都意味着旧索引不再可比，必须全量重建。这是一个不能妥协的边界：用不同模型版本产生的向量做 ANN 检索，等价于把苹果和橙子放在同一个坐标系里比距离。</p>
+
+<p><strong>从"维度 vs 成本"推出 Matryoshka Embedding 和量化。</strong>Matryoshka Representation Learning（MRL）训练出的 embedding 可以截断到更低维度（如 1536→256），截断后的子向量仍然保持语义一致性。这让平台可以在索引层用低维快速粗筛，在 rerank 层用高维精排，一个模型服务两种精度需求，无需维护两套索引。量化（fp32→fp16→int8→binary）进一步压缩存储和计算，但每一步都有精度代价，需要用 recall@K 测量并设定可接受下限。</p>
+
+<p><strong>从"单向量不够"推出 Multi-vector 表示（ColBERT）。</strong>传统 embedding 把整段文本压缩成一个向量，会丢失 token 级别的细粒度信息。ColBERT 的 Late Interaction 方案：query 和 document 分别产生 token 级向量矩阵，检索时用 MaxSim 做交叉打分，保留更细粒度的语义匹配信号。代价是存储和计算都比单向量大，适合对召回精度要求最高的场景。</p>
+
+<p><strong>从"embedding 计算有成本"推出 embedding 服务化。</strong>批量 embedding 的 GPU 利用率比单条高得多；TEI（Text Embeddings Inference）、Ray Serve 等方案把 embedding 模型抽象为独立微服务，支持动态 batch、多副本、滚动更新。</p>
+
+<p><strong>从"相同 query 不必重算"推出 Embedding Cache 和 Semantic Cache。</strong>Embedding Cache 缓存向量本身，key 含模型版本；Semantic Cache 更进一步，如果新 query 的 embedding 和历史 query 相似度超过阈值，直接返回历史 LLM 回答。难点在阈值设定：太低会把不同问题的答案混为一谈，太高则命中率接近 Exact Match Cache。</p>
+
+<p><strong>从"公共前缀不必重算 KV"推出 KV Prefix Cache。</strong>LLM serving 层的 Prefix Cache 在本章意义上是"embedding 上游的状态缓存"：system prompt、文档模板等静态前缀的 KV 可以复用，与 <a href="../part5/15-batching-scheduling-and-kv-cache.html">Ch 15</a> 的 PagedAttention 和 <a href="../part5/16b-sglang-radix-attention.html">Ch 16b</a> 的 RadixAttention 深度结合。</p>
+
+<p><strong>从"模型和分布都会漂移"推出 Drift Detection 和 Reindex 决策。</strong>Query 分布漂移和 document 分布漂移都会悄悄降低召回质量。平台需要定期测量 golden queries 的 recall@K，监控 query embedding 分布变化，有阈值触发 reindex 或模型升级评估。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((Embedding 工程与缓存层))
+    不可化简问题
+      语义相似性是共享假设
+      embedding 版本一变全部失效
+      维度与成本的三角权衡
+      缓存越激进风险越高
+    Embedding 模型选型
+      通用 vs 任务特定
+      单语言 vs 多语言
+      文本 vs 多模态
+      MTEB + 领域评测
+      主流模型
+        OpenAI text-embedding-3
+        Cohere Voyage
+        BGE E5 GTE
+        Jina Nomic
+        Sentence-Transformers
+    维度与表示
+      高维 1536 / 3072
+      低维 128 / 256 / 768
+      Matryoshka 可截断
+      量化 fp32/fp16/int8/binary
+      Multi-vector ColBERT
+        token 级向量矩阵
+        Late Interaction MaxSim
+    Embedding 服务化
+      TEI Text Embeddings Inference
+      Ray Serve
+      批量 vs 实时
+      CPU vs GPU 推理
+      微调
+        对比学习
+        Triplet Loss
+        MNR Loss
+    缓存层级
+      Embedding Cache
+        key 含模型版本
+      Semantic Cache
+        相似度阈值
+        GPTCache Redis Vector
+      Output Cache
+        Exact Match
+      KV Prefix Cache
+        静态前缀 KV
+        Ch15 Ch16b
+    版本与漂移
+      Reindex 决策
+        换模型必须全量
+      Drift Detection
+        query 分布漂移
+        document 分布漂移
+      Golden Queries 回归</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>为什么 embedding 模型选型不能只看 MTEB 排名，需要在自己的领域数据上评测？换模型之后为什么必须全量重建索引而不能做增量修补？</li>
+  <li>Matryoshka Embedding 的截断机制在工程上解决了什么问题？量化从 fp32 到 binary 各步骤分别损失什么，如何用 recall@K 设定可接受下限？</li>
+  <li>ColBERT 的 Late Interaction 相比单向量 bi-encoder 在召回精度和存储/计算成本上分别做了哪些取舍？什么场景值得引入？</li>
+  <li>Embedding Cache、Semantic Cache、Output Cache、KV Prefix Cache 四种缓存分别命中什么条件，失效策略有何不同，各自的越权风险在哪里？</li>
+  <li>Semantic Cache 的相似度阈值该如何设定？阈值过低和过高分别导致什么工程问题？</li>
+  <li>Embedding 微调（对比学习、Triplet Loss、MNR Loss）在什么场景下有收益，ROI 如何评估？</li>
+  <li>如何设计一套 embedding 版本治理流程，使得模型升级时能做到双索引灰度、golden query 回归、滚动切流和可回滚？</li>
+</ol>
+</section>
+
+<!-- ===== §2 Embedding 模型分类与主流选型 ===== -->
+<section class="section" id="s2">
+<h2>2. Embedding 模型分类与主流选型</h2>
+
+<h3>通用 vs 任务特定 vs 多语言 vs 多模态</h3>
+<p>Embedding 模型不是一个统一类别，而是一个按任务需求分层的生态。选型的第一步是搞清楚业务需要的是哪类语义表示：</p>
+
+<table>
+<thead><tr><th>类别</th><th>代表模型</th><th>适用场景</th><th>局限</th></tr></thead>
+<tbody>
+<tr><td>通用语义</td><td>OpenAI text-embedding-3-large、Cohere embed-v3、Voyage-3</td><td>文档检索、RAG、通用语义搜索</td><td>专业领域（医疗、法律、代码）可能被领域特化模型超越</td></tr>
+<tr><td>领域特化</td><td>BioLinkBERT、Legal-BERT、CodeBERT 系列</td><td>生物医学文献、合规文档、代码搜索</td><td>迁移性差，换场景重新评估</td></tr>
+<tr><td>多语言</td><td>BGE-M3、mE5、Jina Embeddings v3（89 语言）</td><td>多语种混合文档、跨语言检索</td><td>英文精度通常稍低于英文特化模型</td></tr>
+<tr><td>中文特化</td><td>BGE-large-zh、GTE-Qwen、text2vec-large-chinese</td><td>中文 RAG、中文电商搜索</td><td>英文能力弱</td></tr>
+<tr><td>多模态</td><td>CLIP、Jina CLIP v2、E5-Mistral（长文本）</td><td>图文混合检索、视觉问答预处理</td><td>模型更大，serving 成本高</td></tr>
+<tr><td>高效小模型</td><td>nomic-embed-text-v1.5、all-MiniLM-L6-v2</td><td>低延迟场景、边缘推理、原型开发</td><td>精度低于大模型</td></tr>
+</tbody>
+</table>
+
+<div class="warn"><strong>工程边界：</strong>MTEB Leaderboard 是选型的起点，不是终点。商业模型（OpenAI、Cohere、Voyage）有 API 依赖和数据隐私风险；开源模型（BGE、E5、GTE、Nomic）自托管更可控但需要运维。先在 1000–5000 条自有标注 query-document 对上评测 recall@1/5/10，再做最终选型。</div>
+
+<h3>主流模型性能对比</h3>
+<table>
+<thead><tr><th>模型</th><th>维度</th><th>MTEB 均分（参考）</th><th>最大 token</th><th>开源/API</th><th>Matryoshka</th><th>多语言</th></tr></thead>
+<tbody>
+<tr><td>OpenAI text-embedding-3-large</td><td>3072（可截断到 256）</td><td>~64.6</td><td>8191</td><td>API</td><td>是</td><td>是</td></tr>
+<tr><td>OpenAI text-embedding-3-small</td><td>1536（可截断到 512）</td><td>~62.3</td><td>8191</td><td>API</td><td>是</td><td>是</td></tr>
+<tr><td>Cohere embed-v3-english</td><td>1024</td><td>~64.5</td><td>512</td><td>API</td><td>否</td><td>否</td></tr>
+<tr><td>Voyage-3-large</td><td>1024</td><td>~67.4</td><td>32000</td><td>API</td><td>否</td><td>是</td></tr>
+<tr><td>BGE-M3</td><td>1024</td><td>~64.3</td><td>8192</td><td>开源</td><td>否</td><td>是（100+）</td></tr>
+<tr><td>E5-mistral-7b-instruct</td><td>4096</td><td>~66.6</td><td>32768</td><td>开源</td><td>否</td><td>否</td></tr>
+<tr><td>GTE-Qwen2-7B-instruct</td><td>3584</td><td>~67.5</td><td>32768</td><td>开源</td><td>否</td><td>是</td></tr>
+<tr><td>nomic-embed-text-v1.5</td><td>768（可截断到 64）</td><td>~62.4</td><td>8192</td><td>开源</td><td>是</td><td>否</td></tr>
+<tr><td>Jina Embeddings v3</td><td>1024</td><td>~63.9</td><td>8192</td><td>开源/API</td><td>是</td><td>是（89）</td></tr>
+<tr><td>all-MiniLM-L6-v2</td><td>384</td><td>~56.3</td><td>512</td><td>开源</td><td>否</td><td>否</td></tr>
+</tbody>
+</table>
+<div class="note">MTEB 分数每年随新模型发布持续更新，以上数值供参考，以实际评测为准。</div>
+</section>
+
+<!-- ===== §3 维度、精度与成本 ===== -->
+<section class="section" id="s3">
+<h2>3. 维度、精度与成本的三角权衡</h2>
+
+<table>
+<thead><tr><th>维度</th><th>每向量存储（fp32）</th><th>ANN 索引内存（100 万向量，HNSW）</th><th>精排精度（参考）</th><th>典型用途</th></tr></thead>
+<tbody>
+<tr><td>128</td><td>0.5 KB</td><td>~0.8 GB</td><td>较低</td><td>大规模粗召回第一层</td></tr>
+<tr><td>256</td><td>1 KB</td><td>~1.5 GB</td><td>中低</td><td>Matryoshka 截断后的快速检索</td></tr>
+<tr><td>384</td><td>1.5 KB</td><td>~2.2 GB</td><td>中</td><td>all-MiniLM、原型系统</td></tr>
+<tr><td>768</td><td>3 KB</td><td>~4.5 GB</td><td>中高</td><td>生产 RAG 常见基线</td></tr>
+<tr><td>1024</td><td>4 KB</td><td>~6 GB</td><td>高</td><td>BGE-M3、Cohere、Voyage 默认</td></tr>
+<tr><td>1536</td><td>6 KB</td><td>~9 GB</td><td>高</td><td>OpenAI text-embedding-3-small 默认</td></tr>
+<tr><td>3072</td><td>12 KB</td><td>~18 GB</td><td>很高</td><td>精度要求极高场景</td></tr>
+<tr><td>4096</td><td>16 KB</td><td>~24 GB</td><td>很高</td><td>E5-mistral-7B 默认</td></tr>
+</tbody>
+</table>
+
+<pre class="mermaid">flowchart LR
+    A[业务精度要求] --> B{是否可接受截断?}
+    B -- 是 --> C[使用 Matryoshka 模型\n高维索引 + 低维粗筛]
+    B -- 否 --> D[固定维度评测]
+    C --> E{存储/延迟预算}
+    D --> E
+    E -- 宽松 --> F[768~1024 维 fp32/fp16]
+    E -- 中等 --> G[384~768 维 + int8 量化]
+    E -- 紧张 --> H[256 维 + binary 量化\n需 rerank 补偿精度]
+    F --> I[测量 recall@K + P95 延迟]
+    G --> I
+    H --> I
+    I --> J{达标?}
+    J -- 是 --> K[上线]
+    J -- 否 --> L[升维 或 换模型 或 加 rerank]</pre>
+
+<h3>量化：从 fp32 到 binary 的精度-成本折中</h3>
+<table>
+<thead><tr><th>量化级别</th><th>每维度位数</th><th>存储压缩比（vs fp32）</th><th>速度提升（参考）</th><th>Recall 损失（参考）</th><th>适用条件</th></tr></thead>
+<tbody>
+<tr><td>fp32</td><td>32 bit</td><td>1x</td><td>1x</td><td>0%</td><td>精度要求最高，存储充裕</td></tr>
+<tr><td>fp16/bf16</td><td>16 bit</td><td>2x</td><td>1–1.5x</td><td>&lt;0.5%</td><td>推荐生产默认，几乎无精度损失</td></tr>
+<tr><td>int8</td><td>8 bit</td><td>4x</td><td>1.5–3x</td><td>1–3%</td><td>大规模索引，recall@K &gt; 90% 可接受</td></tr>
+<tr><td>binary</td><td>1 bit</td><td>32x</td><td>5–15x</td><td>5–15%（需 rerank）</td><td>超大规模粗筛，必须配合精排</td></tr>
+</tbody>
+</table>
+<div class="warn"><strong>工程边界：</strong>量化后必须在你自己的 query 集上测 recall@K，不能只依赖论文数据。binary 量化通常结合粗筛 + 精排（用原始 fp32 向量对 top-N 候选重新打分）来弥补精度损失。量化版本要和原始版本一起写入索引元数据。</div>
+</section>
+
+<!-- ===== §4 Matryoshka ===== -->
+<section class="section" id="s4">
+<h2>4. Matryoshka Embedding：可截断的向量空间</h2>
+
+<p>Matryoshka Representation Learning（MRL，Kusupati 等 2022）是当前最实用的维度弹性方案。核心思想：在训练时让模型同时优化多个维度截断的 embedding 质量（如 32/64/128/256/512/1536），使得截断后的前 D 维子向量仍然是高质量的语义表示。</p>
+
+<pre class="mermaid">flowchart TD
+    A[原始文本] --> B[MRL 模型编码\n输出 1536 维]
+    B --> C[完整 1536 维\n存入原始索引]
+    B --> D[截断到 256 维\n存入粗筛索引]
+    D --> E[ANN 粗筛\n候选 top-200 快速返回]
+    E --> F[用 1536 维原始向量\n对 top-200 精排]
+    F --> G[最终 top-K 结果]
+    C --> F</pre>
+
+<table>
+<thead><tr><th>截断维度</th><th>MTEB 均分（参考）</th><th>vs 3072 维损失</th><th>存储压缩比</th></tr></thead>
+<tbody>
+<tr><td>3072（原始）</td><td>~64.6</td><td>0%</td><td>1x</td></tr>
+<tr><td>1536</td><td>~64.1</td><td>~0.8%</td><td>2x</td></tr>
+<tr><td>512</td><td>~63.3</td><td>~2%</td><td>6x</td></tr>
+<tr><td>256</td><td>~62.0</td><td>~4%</td><td>12x</td></tr>
+<tr><td>64</td><td>~57.8</td><td>~10%</td><td>48x</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>工程价值：</strong>两阶段检索（低维粗筛 + 高维精排）用一个模型实现，无需训练两个独立模型，也无需维护两套完全不同的向量空间。适合规模在百万到十亿级向量、对存储和延迟敏感的生产系统。</div>
+</section>
+
+<!-- ===== §5 ColBERT ===== -->
+<section class="section" id="s5">
+<h2>5. Multi-vector 表示：ColBERT 与 Late Interaction</h2>
+
+<p>传统 bi-encoder 把整段文本压缩成一个向量，会丢失 token 级别的匹配信号。ColBERT（Khattab &amp; Zaharia，2020）把 query 和 document 各自编码成 token 级向量矩阵，打分时用 <strong>MaxSim</strong>：对 query 的每个 token，找 document 所有 token 向量中与它最相似的那个取最大值，再对所有 query token 的 MaxSim 求和。</p>
+
+<pre class="mermaid">sequenceDiagram
+    participant Q as Query (m tokens)
+    participant D as Document (n tokens)
+    participant S as Scorer
+    Q->>Q: 编码 → m×d 矩阵
+    D->>D: 编码 → n×d 矩阵
+    Q->>S: q1, q2, ..., qm
+    D->>S: d1, d2, ..., dn
+    S->>S: MaxSim(qi) = max_j sim(qi, dj)
+    S->>S: Score = sum_i MaxSim(qi)
+    S-->>Q: 最终相关性分数</pre>
+
+<table>
+<thead><tr><th>对比维度</th><th>Bi-Encoder（单向量）</th><th>ColBERT（多向量 Late Interaction）</th></tr></thead>
+<tbody>
+<tr><td>查询编码</td><td>1 个向量</td><td>m 个 token 向量</td></tr>
+<tr><td>文档编码</td><td>1 个向量</td><td>n 个 token 向量</td></tr>
+<tr><td>检索时计算量</td><td>极低（向量点积）</td><td>中等（MaxSim 矩阵乘法）</td></tr>
+<tr><td>存储开销</td><td>1x</td><td>n×（文档平均长度）</td></tr>
+<tr><td>召回精度</td><td>中高</td><td>高（细粒度匹配）</td></tr>
+<tr><td>适用规模</td><td>亿级以上</td><td>千万级以内（或需专用 index）</td></tr>
+<tr><td>代表实现</td><td>FAISS + 任意 bi-encoder</td><td>RAGatouille、PLAID、ColBERT-v2</td></tr>
+</tbody>
+</table>
+
+<div class="note"><strong>工程边界：</strong>ColBERT 的存储开销和检索计算量都显著高于单向量方案，但在精度要求极高的法律文档检索、学术论文检索等场景有明显优势。规模超过 1 亿向量时，需要 PLAID 等专用压缩索引来控制存储。</div>
+</section>
+
+<!-- ===== §6 Embedding 服务化 ===== -->
+<section class="section" id="s6">
+<h2>6. Embedding 服务化：从单机推理到生产 Serving</h2>
+
+<table>
+<thead><tr><th>场景</th><th>推荐方案</th><th>典型配置</th><th>每秒向量数（参考）</th></tr></thead>
+<tbody>
+<tr><td>低 QPS 原型（&lt;100 req/s）</td><td>CPU 推理（ONNX）</td><td>8–16 核 CPU</td><td>100–500 向量/s</td></tr>
+<tr><td>中等 QPS（100–1000 req/s）</td><td>GPU 推理 + 动态 batching</td><td>T4 / A10G</td><td>5000–20000 向量/s</td></tr>
+<tr><td>高 QPS（&gt;1000 req/s）</td><td>多副本 GPU + TEI</td><td>A100 集群</td><td>50000+ 向量/s</td></tr>
+<tr><td>批量离线索引构建</td><td>大 batch GPU</td><td>A100 80G</td><td>100000+ 向量/s</td></tr>
+</tbody>
+</table>
+
+<pre class="mermaid">flowchart TD
+    Client[Client / RAG Pipeline] --> LB[负载均衡]
+    LB --> TEI1[TEI 副本 1\nGPU 0]
+    LB --> TEI2[TEI 副本 2\nGPU 1]
+    LB --> TEI3[TEI 副本 3\nGPU 2]
+    TEI1 --> ECache[Embedding Cache\nRedis / Valkey]
+    TEI2 --> ECache
+    TEI3 --> ECache
+    ECache --> VDB[向量数据库]</pre>
+
+<div class="warn"><strong>工程边界：</strong>Embedding 服务的扩容指标是向量/秒（或 token/秒），不是 req/s，因为不同长度文本的计算量差异很大。P99 延迟要分 short/medium/long 三类输入分别测。升级 embedding 模型时，新模型必须先上线并行运行，旧索引继续服务，直到新索引完全构建并通过回归测试后再切流。</div>
+</section>
+
+<!-- ===== §7 Embedding 微调 ===== -->
+<section class="section" id="s7">
+<h2>7. Embedding 微调：对比学习与领域适应</h2>
+
+<h3>什么时候值得微调</h3>
+<table>
+<thead><tr><th>信号</th><th>建议</th></tr></thead>
+<tbody>
+<tr><td>自有标注 query-positive-negative 对 &lt; 500</td><td>先用通用模型 + 更好的 chunking 和 rerank</td></tr>
+<tr><td>领域词汇大量 OOV 或被通用模型误解</td><td>值得做领域适应微调</td></tr>
+<tr><td>MTEB top 模型在自有测试集上 recall@5 &lt; 70%</td><td>考虑微调</td></tr>
+<tr><td>训练数据 &gt; 5000 query-document 对</td><td>微调 ROI 通常为正</td></tr>
+</tbody>
+</table>
+
+<h3>对比学习损失函数对比</h3>
+<p><strong>Triplet Loss</strong>：每个样本是 (anchor, positive, negative) 三元组，训练使 anchor-positive 距离小于 anchor-negative 距离加 margin。</p>
+<pre><code>L = max(0, d(a,p) - d(a,n) + margin)</code></pre>
+<p>缺点：需要显式负样本构造，困难负样本（hard negative）选择对效果影响极大。</p>
+
+<p><strong>Multiple Negatives Ranking Loss（MNR Loss）</strong>：在一个 batch 里，把同批次其他 query 的 positive 当作当前 query 的 negative（in-batch negatives）。计算效率高，不需要显式构造负样本，是当前 Sentence-Transformers 微调最常用的损失函数。</p>
+<pre><code>L = -log( exp(sim(q,d+)) / sum_j exp(sim(q,d_j)) )</code></pre>
+
+<div class="success"><strong>工程边界：</strong>微调不改变模型架构，只改变权重；微调后产生的 embedding 与原模型不同，必须全量重建索引。微调完成后在保留测试集上用 recall@1/5/10、MRR、NDCG@10 全面评测，再决定是否替换生产模型。</div>
+</section>
+
+<!-- ===== §8 缓存层 ===== -->
+<section class="section" id="s8">
+<h2>8. Embedding 缓存与 Semantic Cache</h2>
+
+<h3>四类应用层缓存对比</h3>
+<table>
+<thead><tr><th>缓存类型</th><th>缓存什么</th><th>Key 设计</th><th>命中条件</th><th>失效触发</th><th>越权风险</th></tr></thead>
+<tbody>
+<tr><td>Embedding Cache</td><td>query/doc 的向量</td><td>hash(text + model_version + preprocess_version)</td><td>完全相同的输入+模型</td><td>模型版本升级、预处理规则变更</td><td>低</td></tr>
+<tr><td>Semantic Cache</td><td>LLM 的完整回答</td><td>向量相似度 &ge; 阈值的历史 query</td><td>语义相近的 query</td><td>底层文档更新、时效性内容</td><td>中（需按 tenant 隔离）</td></tr>
+<tr><td>Output Cache</td><td>完整 prompt-response 对</td><td>hash(full_prompt) 或 hash(user_id + query)</td><td>完全相同的 prompt</td><td>文档更新、用户上下文变化</td><td>高（必须按 user/tenant 隔离）</td></tr>
+<tr><td>KV Prefix Cache</td><td>LLM 的前缀 KV 状态</td><td>prefix token hash + 模型版本</td><td>静态前缀完全相同</td><td>前缀内容变化、模型版本升级</td><td>极高（必须按租户/权限隔离）</td></tr>
+</tbody>
+</table>
+
+<h3>Semantic Cache 深入：阈值设定与失效策略</h3>
+<pre class="mermaid">flowchart TD
+    Q[新 Query] --> QE[Embedding 编码]
+    QE --> VS[向量相似度搜索\n查 Semantic Cache]
+    VS --> TH{余弦相似度\n大于阈值?}
+    TH -- 是 --> CV[验证候选答案\n是否仍有效]
+    TH -- 否 --> RAG[走完整 RAG + LLM 流程]
+    CV --> Fresh{答案是否已过期?}
+    Fresh -- 否 --> HIT[命中返回缓存答案]
+    Fresh -- 是 --> RAG
+    RAG --> Store[存储新的 query-answer 对]
+    Store --> RES[返回结果]
+    HIT --> RES</pre>
+
+<div class="danger"><strong>多租户 Semantic Cache 风险：</strong>不同租户的 Semantic Cache 必须严格隔离。即使两个租户问了语义相似的问题，底层文档集不同，答案可能完全不同。跨租户共享 Semantic Cache 会造成数据泄露。</div>
+
+<div class="note"><strong>时效性内容处理：</strong>对于带时间性的 query（"今天的 XX"、"最新的 XX"），即使语义相似度极高，也不能命中 Semantic Cache，需要在 key 设计或过滤规则里加入时效性判断。</div>
+</section>
+
+<!-- ===== §9 KV Prefix Cache ===== -->
+<section class="section" id="s9">
+<h2>9. KV Prefix Cache：与 Ch 15、Ch 16b 的衔接</h2>
+
+<table>
+<thead><tr><th>前缀内容</th><th>是否适合 Prefix Cache</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>纯静态 system prompt + 工具 schema</td><td>最适合</td><td>内容完全固定，命中率高</td></tr>
+<tr><td>system prompt + few-shot 例子</td><td>适合</td><td>少量变化，大部分可命中</td></tr>
+<tr><td>system prompt + 检索结果（RAG）</td><td>慎用</td><td>检索结果因 query 而异，前缀几乎每次不同</td></tr>
+<tr><td>system prompt + 用户历史对话</td><td>不适合跨用户共享</td><td>必须按 user 隔离</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>与 SGLang RadixAttention 的关系：</strong>SGLang 的 RadixAttention（见 <a href="../part5/16b-sglang-radix-attention.html">Ch 16b</a>）用 Radix Tree 对 token 序列进行最长公共前缀匹配，自动识别可复用的 KV 块。Semantic Cache 命中可以在进入 LLM 之前就返回，完全绕过 KV Prefix Cache；两者是互补而非重叠的关系。如果 RAG 召回结果在多个 query 中高度相似（如检索同一段文档），RadixAttention 可以复用这段文档对应的 KV 状态。</div>
+</section>
+
+<!-- ===== §10 Drift Detection & Reindex ===== -->
+<section class="section" id="s10">
+<h2>10. Drift Detection 与 Reindex 决策</h2>
+
+<div class="note"><strong>核心原则：</strong>换 embedding 模型必然 reindex；同一模型升级需要评估，评估标准是新旧模型在相同输入上的向量空间是否兼容。</div>
+
+<pre class="mermaid">flowchart TD
+    T[触发 Reindex 评估] --> A{是否更换 embedding 模型?}
+    A -- 是 --> R[全量 Reindex\n双索引灰度]
+    A -- 否 --> B{是否更新了 tokenizer 或预处理规则?}
+    B -- 是 --> R
+    B -- 否 --> C{新模型版本是否只是权重微更新\n且官方声明向量兼容?}
+    C -- 是 --> D[抽样评测\n500 条 golden queries]
+    C -- 否 --> R
+    D --> E{recall@K 变化大于阈值?}
+    E -- 是 --> R
+    E -- 否 --> F[保持现有索引\n记录评测结果]
+    R --> G[构建新索引\nblue/green 部署]
+    G --> H[golden queries 全量回归]
+    H --> I{达标?}
+    I -- 是 --> J[按比例切流\n保留旧索引 7-14 天]
+    I -- 否 --> K[保留旧索引\n修正问题]</pre>
+
+<h3>Drift Detection：监控 Query 和 Document 分布漂移</h3>
+<table>
+<thead><tr><th>监控维度</th><th>方法</th><th>告警阈值（参考）</th></tr></thead>
+<tbody>
+<tr><td>Query embedding 分布漂移</td><td>每日计算新 query 嵌入均值，与基线余弦距离</td><td>距离 &gt; 0.05 触发评估</td></tr>
+<tr><td>高 OOV 率 query</td><td>统计 tokenizer OOV token 比例</td><td>OOV &gt; 5% 触发评估</td></tr>
+<tr><td>召回率下降</td><td>每日跑 golden queries，计算 recall@5</td><td>下降 &gt; 3% 触发告警</td></tr>
+<tr><td>文档分布漂移</td><td>新入库文档 embedding 与现有索引均值距离</td><td>距离 &gt; 0.1 触发评估</td></tr>
+<tr><td>用户反馈信号</td><td>搜索点击率（CTR）、答案采纳率下降</td><td>下降 &gt; 10% 触发评估</td></tr>
+</tbody>
+</table>
+<div class="warn"><strong>工程边界：</strong>Drift detection 不能只依赖离线指标，必须有在线反馈回路。对于无法收集显式用户反馈的内部系统，可用隐式信号（重复搜索率、会话放弃率）替代。</div>
+</section>
+
+<!-- ===== §11 全链路架构 ===== -->
+<section class="section" id="s11">
+<h2>11. Embedding 服务架构：全链路视图</h2>
+
+<pre class="mermaid">flowchart TD
+    subgraph Ingestion["索引构建管道"]
+        Doc[文档入库] --> Parse[解析/清洗]
+        Parse --> Chunk[Chunking\n版本化配置]
+        Chunk --> EmbModel[Embedding 模型\n版本 v2.1]
+        EmbModel --> ECache[Embedding Cache\nRedis 去重]
+        ECache --> VDB[(向量数据库\n双索引 blue/green)]
+    end
+
+    subgraph Serving["在线查询服务"]
+        Q[用户 Query] --> QNorm[Query 归一化/改写]
+        QNorm --> QEmb[Query Embedding\nTEI 服务]
+        QEmb --> SCacheCheck{Semantic Cache\n命中?}
+        SCacheCheck -- 命中 --> Ret[返回缓存答案]
+        SCacheCheck -- 未命中 --> ANN[ANN 检索\n向量数据库]
+        ANN --> BM25[BM25 关键词检索]
+        BM25 --> Merge[RRF 合并]
+        Merge --> Rerank[Cross-encoder Rerank]
+        Rerank --> Prompt[Prompt 组装]
+        Prompt --> PCache{KV Prefix Cache\n命中?}
+        PCache -- 命中 --> LLMDec[LLM Decode 续写]
+        PCache -- 未命中 --> LLMFull[LLM Prefill + Decode]
+        LLMDec --> Ans[返回答案]
+        LLMFull --> SCacheStore[存入 Semantic Cache]
+        SCacheStore --> Ans
+    end
+
+    subgraph Monitor["监控与治理"]
+        GoldenQ[Golden Queries 定期跑] --> RecallMetric[Recall@K 监控]
+        DriftDet[Drift Detection] --> ReindexTrigger[触发 Reindex 评估]
+    end</pre>
+</section>
+
+<!-- ===== §12 Worked Example ===== -->
+<section class="section" id="s12">
+<h2>12. Worked Example：电商搜索从 v1 到 v3 的演进</h2>
+
+<div class="note"><strong>场景背景：</strong>某电商平台商品搜索系统，SKU 数量 800 万，日均查询 1000 万次，P99 延迟要求 &lt; 200ms，高峰期 QPS 约 3000。</div>
+
+<h3>v1：纯 BM25 关键词检索</h3>
+<p><strong>架构</strong>：Elasticsearch BM25 → top-20 → 规则排序</p>
+
+<table>
+<thead><tr><th>指标</th><th>v1 数值</th></tr></thead>
+<tbody>
+<tr><td>P50 延迟</td><td>25ms</td></tr>
+<tr><td>P99 延迟</td><td>85ms</td></tr>
+<tr><td>精确关键词 recall@10</td><td>91%</td></tr>
+<tr><td>语义/同义词 recall@10</td><td>43%</td></tr>
+<tr><td>"冬季羽绒服"→"防寒保暖外套"召回</td><td>12%</td></tr>
+<tr><td>每日 API 成本</td><td>~$0</td></tr>
+<tr><td>索引大小</td><td>40 GB</td></tr>
+</tbody>
+</table>
+<p><strong>问题：</strong>用户用口语、近义词、长尾描述搜索时，召回极差。"手机保护套"无法匹配"手机壳"；"显示器 144帧"无法匹配"144Hz 电竞屏"。</p>
+
+<h3>v2：加入 Dense Embedding 检索</h3>
+<p><strong>架构</strong>：BM25 + BGE-M3 Dense Retrieval → RRF 合并 → Cross-encoder Rerank → top-10</p>
+
+<div class="card">
+<strong>关键决策：</strong>
+<ul>
+  <li>选用 BGE-M3（多语言，1024 维，中文效果好）</li>
+  <li>向量量化到 fp16（存储压缩 50%，几乎无精度损失）</li>
+  <li>部署 TEI（2 × A10G），批量 embedding 800 万 SKU 耗时约 3 小时</li>
+  <li>Qdrant 作为向量库（支持过滤、支持增量写入）</li>
+</ul>
+</div>
+
+<table>
+<thead><tr><th>指标</th><th>v1</th><th>v2</th></tr></thead>
+<tbody>
+<tr><td>P50 延迟</td><td>25ms</td><td>68ms</td></tr>
+<tr><td>P99 延迟</td><td>85ms</td><td>145ms</td></tr>
+<tr><td>精确关键词 recall@10</td><td>91%</td><td>89%（RRF 略有折损）</td></tr>
+<tr><td>语义/同义词 recall@10</td><td>43%</td><td>79%</td></tr>
+<tr><td>同义词匹配提升</td><td>—</td><td>+36pp</td></tr>
+<tr><td>每日 GPU 推理成本</td><td>$0</td><td>~$200</td></tr>
+<tr><td>向量索引大小</td><td>0</td><td>38 GB（fp16，800 万向量）</td></tr>
+</tbody>
+</table>
+
+<p><strong>v2 遗留问题：</strong>P99 延迟从 85ms 升到 145ms，接近 200ms 预算上限；热词重复 embedding（"Nike 运动鞋"每天被检索 5 万次）；没有利用缓存减少成本。</p>
+
+<h3>v3：加入 Semantic Cache + Output Cache + Reranking 优化</h3>
+
+<div class="card">
+<strong>新增组件：</strong>
+<ol>
+  <li><strong>Query Embedding Cache</strong>（Redis，TTL 24h）：热词缓存命中 85%，embedding 服务 QPS 降低 85%</li>
+  <li><strong>Semantic Cache</strong>（Qdrant 向量库，阈值 0.92）：对"相同意图"的重复 query 直接返回缓存搜索结果列表</li>
+  <li><strong>Output Cache</strong>（Redis，TTL 4h）：对精确相同 query（带 user context）直接返回完整回答</li>
+  <li><strong>Cross-encoder Rerank 优化</strong>：候选从 top-50 压缩到 top-10，提升精排质量</li>
+</ol>
+</div>
+
+<table>
+<thead><tr><th>指标</th><th>v2</th><th>v3</th></tr></thead>
+<tbody>
+<tr><td>P50 延迟（Semantic Cache 命中路径）</td><td>68ms</td><td>28ms</td></tr>
+<tr><td>P99 延迟</td><td>145ms</td><td>95ms</td></tr>
+<tr><td>Semantic Cache 命中率</td><td>0%</td><td>52%</td></tr>
+<tr><td>Query Embedding Cache 命中率</td><td>0%</td><td>85%</td></tr>
+<tr><td>Output Cache 命中率</td><td>0%</td><td>31%（改进后 47%）</td></tr>
+<tr><td>语义/同义词 recall@10</td><td>79%</td><td>83%（Rerank 优化）</td></tr>
+<tr><td>每日 GPU 成本</td><td>~$200</td><td>~$60（缓存减少 70% 推理）</td></tr>
+</tbody>
+</table>
+
+<h3>v3 工程教训</h3>
+<div class="warn">
+<ol>
+  <li>Semantic Cache 阈值比预期难设定，最终用了 3 周 A/B 测试确定 0.92。初始阈值 0.88 导致 2% 的 query 返回错误答案。</li>
+  <li>多租户（不同品类店铺）必须隔离 Semantic Cache，否则 A 店铺的促销答案会泄露给 B 店铺的 query。</li>
+  <li>Output Cache 命中率 31% 低于预期（预期 50%），因为查询个性化（用户历史）导致 cache key 过于细粒度。后来改为只缓存纯商品类 query，命中率升到 47%。</li>
+  <li>Query Embedding Cache 的 TTL 设为 24h 是因为 embedding 模型不频繁更新；模型升级时需主动 flush 全部缓存，否则旧向量会导致召回退化。</li>
+</ol>
+</div>
+</section>
+
+<!-- ===== §13 与 AI Infra 其他系统的关系 ===== -->
+<section class="section" id="s13">
+<h2>13. 与 AI Infra 其他系统的关系</h2>
+
+<div class="success"><strong>Embedding 是多系统的共享基础设施。</strong>以下是 embedding 在不同业务系统中的角色：</div>
+
+<table>
+<thead><tr><th>业务系统</th><th>Embedding 的角色</th><th>版本更新影响</th></tr></thead>
+<tbody>
+<tr><td>RAG 问答</td><td>文档检索向量 + query 编码</td><td>模型升级 → 全量 reindex → 召回质量变化</td></tr>
+<tr><td>推荐系统</td><td>Item/User 向量召回</td><td>模型升级 → 需重新训练推荐模型对齐新空间</td></tr>
+<tr><td>语义搜索</td><td>商品/内容向量检索</td><td>同 RAG</td></tr>
+<tr><td>风控系统</td><td>异常行为 embedding 聚类</td><td>空间变化 → 聚类边界需重新标定</td></tr>
+<tr><td>安全审核</td><td>有害内容 embedding 分类</td><td>分类器需重新训练</td></tr>
+<tr><td>多模态检索</td><td>图文对齐向量</td><td>图文 embedding 模型必须联动升级</td></tr>
+</tbody>
+</table>
+
+<div class="danger"><strong>核心风险：</strong>如果平台对 embedding 模型的版本管理不够严格，各系统可能在不知情的情况下同时使用不同版本的 embedding，导致系统间召回结果不一致、行为难以解释。一次不经意的模型"热更新"可以让 6 个依赖系统同时静默退化。</div>
+</section>
+
+<!-- ===== §14 工程检查清单 ===== -->
+<section class="section" id="s14">
+<h2>14. 工程检查清单</h2>
+
+<div class="card">
+<strong>Embedding 模型选型与评测</strong>
+<ul>
+  <li>在自有领域数据（≥1000 query-doc 对）上评测 recall@1/5/10</li>
+  <li>测量 P95/P99 embedding 延迟（分 short/medium/long 输入）</li>
+  <li>明确维度和量化方案，测量 recall 损失是否可接受</li>
+  <li>确认是否支持 Matryoshka 截断（如需两阶段检索）</li>
+</ul>
+</div>
+
+<div class="card">
+<strong>版本与索引治理</strong>
+<ul>
+  <li>索引元数据包含：embedding_model_version、tokenizer_version、preprocess_version、build_time、chunk_policy</li>
+  <li>模型升级前先评估是否需要全量 reindex</li>
+  <li>全量 reindex 采用双索引（blue/green）灰度切流</li>
+  <li>保留旧索引至少 7 天备用回滚</li>
+</ul>
+</div>
+
+<div class="card">
+<strong>缓存设计</strong>
+<ul>
+  <li>Embedding Cache key 包含模型版本和预处理版本</li>
+  <li>Semantic Cache 阈值经 A/B 测试验证，对时效性 query 做例外处理</li>
+  <li>Output Cache 按 user/tenant 隔离</li>
+  <li>KV Prefix Cache key 不跨租户共享</li>
+</ul>
+</div>
+
+<div class="card">
+<strong>监控与漂移检测</strong>
+<ul>
+  <li>Golden queries 集（≥100 条）每日自动跑，alert on recall 下降</li>
+  <li>Embedding 分布漂移监控（每日计算距离基线）</li>
+  <li>Query OOV 率监控</li>
+</ul>
+</div>
+</section>
+
+<!-- ===== §15 练习题 ===== -->
+<section class="section" id="s15">
+<h2>15. 练习题</h2>
+<ol>
+  <li><strong>13e-1</strong>：选择两个不同的 embedding 模型（如 BGE-M3 和 all-MiniLM-L6-v2），在同一批 100 条 query-document 对上计算 recall@5，比较结果，并解释为什么 MTEB 排名较高的模型在你的测试集上不一定更好。</li>
+  <li><strong>13e-2</strong>：一家公司有一个 500 万文档的向量索引，使用 1536 维 fp32 存储。请计算：（a）总存储大小；（b）如果改用 fp16 和 int8 分别节省多少；（c）如果用 Matryoshka 截断到 512 维 + fp16，节省多少，recall 预期损失多少？</li>
+  <li><strong>13e-3</strong>：解释 Matryoshka Embedding 的训练目标与普通 embedding 训练的区别，以及为什么截断后的子向量仍能保持语义一致性。</li>
+  <li><strong>13e-4</strong>：设计一个 Semantic Cache 的阈值选择实验。你会用什么数据、什么指标来判断阈值从 0.88 调到 0.92 是否合理？如何处理时效性 query？</li>
+  <li><strong>13e-5</strong>：ColBERT 的 MaxSim 打分机制如何在 token 级别捕捉 query-document 的细粒度匹配？为什么它比单向量内积在长文档检索上通常更准确？举例说明一个单向量会失效但 ColBERT 可以正确匹配的 case。</li>
+  <li><strong>13e-6</strong>：公司的 embedding 模型从 BGE-M3 升级到 GTE-Qwen2-7B。写出完整的升级计划，包括：评测阶段、双索引构建、灰度切流、监控指标、回滚条件。</li>
+  <li><strong>13e-7</strong>：对比 MNR Loss 和 Triplet Loss 在 embedding 微调中的优缺点。如果你只有 2000 条 (query, positive_document) 对，没有显式负样本标注，应该用哪种 loss？为什么？</li>
+  <li><strong>13e-8</strong>：解释为什么 Output Cache 按 user/tenant 隔离是安全要求而不只是功能要求。如果一个企业知识库的 Semantic Cache 跨租户共享，最坏情况下会发生什么？</li>
+  <li><strong>13e-9</strong>：一个电商搜索系统的 Query Embedding Cache TTL 设置为 7 天，但 embedding 模型每 3 天会有小版本更新。描述这种配置下会出现的问题，以及正确的 cache key 设计应该如何避免。</li>
+  <li><strong>13e-10</strong>：解释 KV Prefix Cache 和 Semantic Cache 在架构位置上的区别：为什么 Semantic Cache 命中可以完全绕过 LLM 调用，而 KV Prefix Cache 命中仍然需要进入 LLM 做 decode？</li>
+  <li><strong>13e-11</strong>：设计一个 embedding drift detection 方案。你会用什么指标判断当前 embedding 模型已经无法满足 query 分布的需要？监控频率如何设定？告警阈值如何校准？</li>
+  <li><strong>13e-12</strong>：在 Worked Example 的 v3 架构中，Semantic Cache 命中率 52% 意味着什么？如果你想把命中率提升到 70%，可以调整哪些参数？提升命中率的代价是什么？</li>
+</ol>
+</section>
+
+<!-- ===== §16 参考阅读 ===== -->
+<section class="refbox" id="s16">
+<h2>深度参考阅读</h2>
+
+<h3>学习路线</h3>
+<ol>
+  <li>先读 <a href="13-feature-vector-and-cache.html">第 13 章</a> 建立特征/embedding/向量索引的基础框架</li>
+  <li>本章（13e）深入 embedding 工程细节与缓存层设计</li>
+  <li>读 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 理解 KV Cache 的 serving 层实现</li>
+  <li>读 <a href="../part5/16b-sglang-radix-attention.html">第 16b 章</a> 了解 RadixAttention 如何做 Prefix Cache 自动化</li>
+  <li>读 <a href="../part7/23-security-isolation-and-governance.html">第 23 章</a> 补全缓存层的安全隔离设计</li>
+</ol>
+
+<h3>延伸阅读</h3>
+<ul>
+  <li>Muennighoff et al., <em>"MTEB: Massive Text Embedding Benchmark"</em>（2022）— embedding 评测权威基准</li>
+  <li>Kusupati et al., <em>"Matryoshka Representation Learning"</em>（NeurIPS 2022）— MRL 原论文</li>
+  <li>Khattab &amp; Zaharia, <em>"ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT"</em>（SIGIR 2020）— ColBERT 原论文</li>
+  <li>Santhanam et al., <em>"ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction"</em>（NAACL 2022）— ColBERT v2 与 PLAID</li>
+  <li>Xiao et al., <em>"C-Pack: Packaged Resources To Advance General Chinese Embedding"</em>（BGE，2023）— 中文 embedding 与微调方法</li>
+  <li>Wang et al., <em>"Text Embeddings by Weakly-Supervised Contrastive Pre-training"</em>（E5，2022）— 弱监督对比学习 embedding</li>
+  <li>Bang et al., <em>"GPTCache: A Data or Cache for Large Language Models"</em>（2023）— Semantic Cache 实现参考</li>
+  <li>Jégou et al., <em>"Product Quantization for Nearest Neighbor Search"</em>（TPAMI 2011）— PQ 量化经典论文</li>
+  <li>Malkov &amp; Yashunin, <em>"Efficient and Robust Approximate Nearest Neighbor Search Using HNSW"</em>（TPAMI 2020）— HNSW 论文</li>
+  <li>Sentence-Transformers 文档：Multiple Negatives Ranking Loss — MNR Loss 工程实现参考</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">
+  <p>AI Infra 教程 · 第 13e 章 · Embedding 工程与缓存层</p>
+</footer>
+</main>
+
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

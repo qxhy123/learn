@@ -114,8 +114,23 @@ const TUTORIAL = [
       },
       {
         "id": "0d3",
-        "title": "第 0d3 章 · RDMA、RoCE/IB 与 GPUDirect",
+        "title": "第 0d3 章 · RDMA、RoCE/IB 与 GPUDirect 导览",
         "path": "part0/0d3-rdma-roce-infiniband-and-gpudirect.html"
+      },
+      {
+        "id": "0d3a",
+        "title": "第 0d3a 章 · RDMA Verbs、内存注册与队列模型",
+        "path": "part0/0d3a-rdma-verbs-memory-registration-and-queues.html"
+      },
+      {
+        "id": "0d3b",
+        "title": "第 0d3b 章 · RoCE/InfiniBand、无损网络与拥塞控制",
+        "path": "part0/0d3b-roce-infiniband-lossless-fabric-and-congestion.html"
+      },
+      {
+        "id": "0d3c",
+        "title": "第 0d3c 章 · GPUDirect RDMA、GPU/NIC 拓扑与诊断",
+        "path": "part0/0d3c-gpudirect-rdma-gpu-nic-topology-and-diagnostics.html"
       },
       {
         "id": "0d4",
@@ -264,18 +279,88 @@ const TUTORIAL = [
     "chapters": [
       {
         "id": "11",
-        "title": "第 11 章 · 数据管道",
+        "title": "第 11 章 · 数据管道总览",
         "path": "part4/11-data-pipeline.html"
       },
       {
+        "id": "11a",
+        "title": "第 11a 章 · 数据采集与摄入",
+        "path": "part4/11a-data-ingestion.html"
+      },
+      {
+        "id": "11b",
+        "title": "第 11b 章 · 数据清洗、去重与质量治理",
+        "path": "part4/11b-data-cleaning-dedup-quality.html"
+      },
+      {
+        "id": "11c",
+        "title": "第 11c 章 · Tokenization、切分与训练 Dataset 格式",
+        "path": "part4/11c-tokenization-and-dataset-formats.html"
+      },
+      {
+        "id": "11d",
+        "title": "第 11d 章 · 流式读取与 DataLoader 工程化",
+        "path": "part4/11d-streaming-and-dataloader-engineering.html"
+      },
+      {
+        "id": "11e",
+        "title": "第 11e 章 · 数据版本、血缘与谱系",
+        "path": "part4/11e-data-versioning-and-lineage.html"
+      },
+      {
         "id": "12",
-        "title": "第 12 章 · 制品、模型与检查点管理",
+        "title": "第 12 章 · 制品、模型与检查点管理总览",
         "path": "part4/12-artifacts-and-checkpoints.html"
       },
       {
+        "id": "12a",
+        "title": "第 12a 章 · Model Registry 体系",
+        "path": "part4/12a-model-registry.html"
+      },
+      {
+        "id": "12b",
+        "title": "第 12b 章 · Checkpoint 工程化",
+        "path": "part4/12b-checkpoint-engineering.html"
+      },
+      {
+        "id": "12c",
+        "title": "第 12c 章 · 制品版本治理与发布门禁",
+        "path": "part4/12c-release-governance.html"
+      },
+      {
+        "id": "12d",
+        "title": "第 12d 章 · 制品供应链与签名",
+        "path": "part4/12d-supply-chain-and-signing.html"
+      },
+      {
         "id": "13",
-        "title": "第 13 章 · 特征、向量与缓存",
+        "title": "第 13 章 · 特征、向量与缓存总览",
         "path": "part4/13-feature-vector-and-cache.html"
+      },
+      {
+        "id": "13a",
+        "title": "第 13a 章 · Feature Store 体系",
+        "path": "part4/13a-feature-store.html"
+      },
+      {
+        "id": "13b",
+        "title": "第 13b 章 · 向量索引算法",
+        "path": "part4/13b-vector-index-algorithms.html"
+      },
+      {
+        "id": "13c",
+        "title": "第 13c 章 · 向量数据库选型与运维",
+        "path": "part4/13c-vector-db-selection-and-operations.html"
+      },
+      {
+        "id": "13d",
+        "title": "第 13d 章 · RAG 工程化",
+        "path": "part4/13d-rag-engineering.html"
+      },
+      {
+        "id": "13e",
+        "title": "第 13e 章 · Embedding 工程与缓存层",
+        "path": "part4/13e-embedding-and-cache-layer.html"
       }
     ]
   },
@@ -323,14 +408,74 @@ const TUTORIAL = [
         "path": "part6/18-containers-and-runtime.html"
       },
       {
+        "id": "18a",
+        "title": "第 18a 章 · AI 镜像与 CUDA 兼容矩阵",
+        "path": "part6/18a-ai-images-and-cuda-compatibility.html"
+      },
+      {
+        "id": "18b",
+        "title": "第 18b 章 · 容器运行时与设备注入",
+        "path": "part6/18b-container-runtime-and-device-injection.html"
+      },
+      {
+        "id": "18c",
+        "title": "第 18c 章 · 制品供应链与镜像治理",
+        "path": "part6/18c-artifact-supply-chain-and-image-governance.html"
+      },
+      {
+        "id": "18d",
+        "title": "第 18d 章 · 运行时故障排除",
+        "path": "part6/18d-runtime-troubleshooting.html"
+      },
+      {
         "id": "19",
         "title": "第 19 章 · Kubernetes for AI",
         "path": "part6/19-kubernetes-for-ai.html"
       },
       {
+        "id": "19a",
+        "title": "第 19a 章 · AI 工作负载对象建模",
+        "path": "part6/19a-kubernetes-ai-workloads.html"
+      },
+      {
+        "id": "19b",
+        "title": "第 19b 章 · GPU 调度与拓扑感知",
+        "path": "part6/19b-gpu-scheduling-and-topology.html"
+      },
+      {
+        "id": "19c",
+        "title": "第 19c 章 · AI CRD 与 Operator",
+        "path": "part6/19c-ai-crd-and-operators.html"
+      },
+      {
+        "id": "19d",
+        "title": "第 19d 章 · Kubernetes AI 排障 SOP",
+        "path": "part6/19d-kubernetes-ai-troubleshooting.html"
+      },
+      {
         "id": "20",
         "title": "第 20 章 · 队列、配额与自动扩缩容",
         "path": "part6/20-queues-quotas-and-autoscaling.html"
+      },
+      {
+        "id": "20a",
+        "title": "第 20a 章 · 队列、配额、优先级与公平调度",
+        "path": "part6/20a-queues-quotas-priority-and-fairness.html"
+      },
+      {
+        "id": "20b",
+        "title": "第 20b 章 · GPU 资源切分与共享",
+        "path": "part6/20b-gpu-partitioning-and-sharing.html"
+      },
+      {
+        "id": "20c",
+        "title": "第 20c 章 · 推理 Autoscaling",
+        "path": "part6/20c-inference-autoscaling.html"
+      },
+      {
+        "id": "20d",
+        "title": "第 20d 章 · 容量与排障 SOP",
+        "path": "part6/20d-capacity-and-troubleshooting-sop.html"
       }
     ]
   },

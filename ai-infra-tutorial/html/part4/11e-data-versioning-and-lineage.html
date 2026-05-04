@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11e 章 · 数据版本、血缘与谱系 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11e" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 11e 章 · 数据版本、血缘与谱系</h1>
+<p class="sub">从"数据可变而训练必须可复现"的根本矛盾出发，推导 Content-Addressable Storage、三种版本化模式、血缘 DAG、Time Travel、Schema Evolution 和 GDPR 合规传播如何共同构成 AI 平台的数据可信基础设施。</p>
+<div class="chips">
+  <span class="chip">Dataset Versioning</span>
+  <span class="chip">CAS / Merkle Tree</span>
+  <span class="chip">Iceberg / Delta Lake</span>
+  <span class="chip">OpenLineage</span>
+  <span class="chip">lakeFS</span>
+  <span class="chip">DVC</span>
+  <span class="chip">Time Travel</span>
+  <span class="chip">GDPR 合规</span>
+  <span class="chip">Lineage DAG</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>模型生产事故无法复现的根本原因，往往不是代码 bug，而是数据版本没有被固定——原始数据路径下的内容被静默覆盖，使得"同一个训练 run"在不同时间点实际上看到了完全不同的数据。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。从不可化简问题出发，依次推导 CAS 原理、三种版本模式、血缘追踪体系、Time Travel 机制、Schema Evolution 策略，最终以 RAG 系统全链路 Worked Example 收尾。</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解：数据版本、血缘与谱系</a></li>
+  <li><a class="anchor" href="#s2">为什么数据版本是生产事故的根本原因</a></li>
+  <li><a class="anchor" href="#s3">Content-Addressable Storage：版本的物理基础</a></li>
+  <li><a class="anchor" href="#s4">三种主流数据版本化模式</a></li>
+  <li><a class="anchor" href="#s5">Lineage Tracking：从数据到模型的完整血缘</a></li>
+  <li><a class="anchor" href="#s6">训练任务血缘：强绑定的完整链路</a></li>
+  <li><a class="anchor" href="#s7">Snapshot 与 Time Travel：重现训练时的数据视图</a></li>
+  <li><a class="anchor" href="#s8">Schema Evolution：向前兼容与向后兼容</a></li>
+  <li><a class="anchor" href="#s9">大数据 Lakehouse 架构：S3 + Iceberg + 元数据服务</a></li>
+  <li><a class="anchor" href="#s10">数据合规与可追溯性：GDPR 和审计要求</a></li>
+  <li><a class="anchor" href="#s11">与 Model Registry 的协同</a></li>
+  <li><a class="anchor" href="#s12">反模式：版本管理的常见错误</a></li>
+  <li><a class="anchor" href="#s13">Worked Example：RAG 系统与微调模型的全链路版本管理</a></li>
+  <li><a class="anchor" href="#s14">工程建议与反模式总结</a></li>
+  <li><a class="anchor" href="#s15">练习题</a></li>
+  <li><a class="anchor" href="#s16">深度参考阅读</a></li>
+</ol>
+</section>
+
+<!-- ===================== §1 第一性原理 ===================== -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：数据版本、血缘与谱系</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>把 DVC、lakeFS、Iceberg、Delta Lake、OpenLineage 这些工具名全部拿掉，数据版本管理要解决的不可化简问题只有一个：<strong>数据是随时间变化的，而模型训练的结果必须可以在任意未来时间点被完整复现。</strong></p>
+<p>这句话比看起来更难实现。它意味着：第一，数据本身是可变的（mutable）。文档会被更新，标签会被修正，用户行为日志会持续追加，GDPR 删除请求会让部分样本从历史数据中消失。没有任何机制可以阻止数据随时间变化；唯一能做的是在数据变化之前给它拍快照，并让快照永远可被访问。</p>
+<p>第二，训练是依赖精确数据视图的。同一个数据集在不同时间点，因为清洗规则版本不同、去重阈值不同、标注者不同、分片策略不同、时间边界不同，会产生截然不同的训练效果。如果你无法精确重现"训练 run-0314 看到的那批数据"，你就无法重现 run-0314 的 loss 曲线，也无法判断今天的 run-0421 是真的更好还是只是数据分布不同导致的假象。</p>
+<p>第三，血缘（lineage）不是锦上添花，而是归因的最低配置。当一个模型在生产中出现质量退化时，可能的原因包括：数据版本被静默更新、上游数据源 schema 变化未被捕获、某个清洗规则的边界条件在新数据分布下开始错误触发、训练 run 使用了一个"看起来名字相同但其实是上周数据"的数据集。如果没有血缘追踪，这些原因在事故发生之后都不可区分，工程师只能靠经验猜测和二分法排查，平均修复时间（MTTR）以天计。</p>
+<p>第四，合规是系统性约束，不是可选功能。GDPR 要求能够追踪某个用户的数据流入了哪些训练集、这些训练集生成了哪些模型，并在删除请求到达时能够传播删除影响。如果数据版本和血缘系统不支持"影响传播"查询，合规团队就无法完成这个任务，公司就会面临监管风险。</p>
+<p>因此，数据版本管理的不可化简问题不是"给文件加个时间戳"，而是：在数据持续变化、训练需要精确复现、血缘必须可查询、合规必须可传播的四重约束下，如何设计一个让每次训练 run 都能精确指向一个不可变数据视图的系统。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"数据可变，训练需要不可变视图"出发，Content-Addressable Storage（CAS）必然出现。如果用路径标识数据（<code>s3://bucket/data/train/</code>），路径下的内容随时可以被覆盖，版本就无法固定。如果改用 blob 的 SHA-256 哈希作为标识符，同样的内容永远得到同样的 hash，hash 就天然是内容的版本号，也天然实现了去重（相同 hash = 相同内容，不需要存两份）。把 blob hash 组织成 Merkle Tree，整棵树的根 hash 就代表整个数据集的精确版本。这是 DVC、git-lfs、以及所有版本化存储系统的基础。</p>
+<p>从"Merkle Tree 太细粒度，不适合数百 GB 到 TB 级数据集"出发，三种粒度的版本控制模式必然出现。file-level 版本（DVC/git-lfs）在小到中型数据集上可用，但每次修改都需要重新计算全量 hash，对 TB 级数据不现实。commit-level 版本（lakeFS/Project Nessie）把"一个 commit 对应一个数据状态"的 git 语义复制到数据湖，一个 commit 可以原子性地包含数百 GB 数据的变更。table format 版本（Iceberg/Delta Lake/Hudi）在表格式数据上实现 snapshot + time travel，让每个 snapshot id 都是一个精确、不可变、可查询的数据视图。</p>
+<p>从"版本之间的衍生关系需要被记录"出发，lineage tracking 必然出现。一个 cleaned_dataset_v3 不仅需要知道"它是什么"，还需要知道"它从 raw_data_2026-Q1 经过 cleaning_rule_v7 生成而来"，更需要知道"它的下游是哪些 training_run 和哪些 model_checkpoint"。这种 DAG 结构的依赖关系，就是血缘图（lineage graph）。OpenLineage 提供了统一的血缘事件格式；Marquez、Unity Catalog、Atlas 是收集和查询这些血缘的平台。</p>
+<p>从"合规需要影响传播"出发，端到端血缘的可查性变成了系统性需求。一个 GDPR 删除请求触达时，系统必须能回答：user_id=X 的数据出现在哪些 dataset 版本中？这些 dataset 版本被哪些 training_run 使用？这些 training_run 产生了哪些 checkpoint 并部署为哪些线上模型？如果这条链路无法被自动查询，合规成本将随规模线性增长，最终不可维护。</p>
+<p>从"训练和数据之间的绑定需要从协议层面保证"出发，强制版本绑定（version pinning）和反模式检测必然成为平台规范。用 <code>latest</code> 指针指向训练数据、用文件修改时间（mtime）推断版本、用 S3 路径前缀当作版本标识，都是会在生产中制造无法复现灾难的反模式。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((数据版本与血缘))
+    不可化简问题
+      数据可变 vs 训练需复现
+      血缘不可查 → 事故无法归因
+      合规需影响传播
+      版本未固定 → 结果不可信
+    内容寻址存储 CAS
+      SHA-256 blob hash
+      Merkle Tree 根 hash
+      自动去重
+      不可变内容标识
+    三种版本模式
+      file-level DVC git-lfs
+      commit-level lakeFS Nessie
+      table format Iceberg Delta Hudi
+    血缘系统
+      OpenLineage 事件格式
+      Marquez 元数据服务
+      Unity Catalog
+      Apache Atlas
+    训练任务绑定
+      dataset_version to run_id
+      run_id to checkpoint_id
+      checkpoint_id to eval_result
+      eval_result to deployed_model
+    合规与治理
+      审计日志
+      访问 ACL
+      GDPR 删除传播
+      数据主权边界
+    反模式
+      latest 指针
+      mtime 推断版本
+      路径当版本
+      无 schema 演进策略
+    Snapshot 与 Time Travel
+      Iceberg snapshot id
+      Delta Lake history
+      Point-in-time 重现</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>为什么用文件路径或"latest"指针标识训练数据是生产事故的根源？Content-Addressable Storage 如何从根本上解决这个问题？</li>
+  <li>DVC、lakeFS、Iceberg 三种数据版本化方案分别在什么数据规模、数据类型和团队规模下是最合适的选择？</li>
+  <li>血缘图（lineage DAG）的最小必要结构是什么？一个 training_run 需要记录哪些血缘边才能支持完整的事故归因？</li>
+  <li>Iceberg 的 snapshot 机制和 Delta Lake 的 transaction log 在实现细节上有什么本质差异？各自的 time travel 查询如何执行？</li>
+  <li>GDPR"被遗忘权"删除请求到达时，数据版本系统需要执行哪些步骤？哪些步骤可以自动化，哪些需要人工决策？</li>
+  <li>Schema evolution 的 backward compatible 和 forward compatible 在 AI 训练场景下分别意味着什么风险？</li>
+  <li>如何设计一个 RAG 系统的文档索引版本管理，使得每次重新生成索引都能精确对应某个文档版本快照？</li>
+</ol>
+</section>
+
+<!-- ===================== §2 生产事故根因 ===================== -->
+<section class="section" id="s2">
+<h2>2. 为什么数据版本是生产事故的根本原因</h2>
+
+<h3>不可复现的事故剧本</h3>
+<p>某推荐系统线上模型质量出现 3% 的 NDCG 退化。工程师排查两周后确认：模型代码未变（有 git commit hash 证明），训练超参未变（有 mlflow 日志证明），但训练数据的"路径"对应的内容，在训练 run 结束后被上游数据工程师静默覆盖了（修复了去重 bug），导致无法复现原始训练数据视图。</p>
+<p>这个剧本在 AI 平台上高频发生，根本原因是：<strong>大多数团队对模型版本化（用 git hash 固定代码）的严格程度，远高于对数据版本化的严格程度。</strong></p>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>常见实践</th><th>问题</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>代码</td><td>git commit hash，不可变</td><td>无问题</td></tr>
+    <tr><td>超参</td><td>mlflow / wandb 日志</td><td>通常可重现</td></tr>
+    <tr><td>训练数据</td><td><code>s3://bucket/data/train/</code> 路径</td><td>内容随时可被覆盖</td></tr>
+    <tr><td>评测数据</td><td>同上</td><td>同上，且 valid set 常被污染</td></tr>
+    <tr><td>数据处理脚本</td><td>有时在 git，有时是临时脚本</td><td>版本不固定</td></tr>
+  </tbody>
+</table>
+
+<div class="danger"><strong>反模式警告：</strong>用 S3 路径当数据版本，等价于用"文件名"当代码版本，然后随时覆盖文件内容。这在软件工程里是不可接受的，在 AI 数据工程里同样不可接受。</div>
+
+<h3>三大根因</h3>
+<p><strong>根因一：数据的可变性（Mutability）。</strong>文件系统和对象存储默认允许覆盖写。一个路径指向的内容随时可以被覆盖，而不留下任何版本记录。</p>
+<p><strong>根因二：版本意识的缺失。</strong>数据工程师在修复数据问题时，习惯"原地更新"而非"发布新版本"。这种习惯在小团队小数据集时无害，但在平台规模下会传播到所有下游训练 run。</p>
+<p><strong>根因三：版本粒度的错误。</strong>即使有版本意识，很多团队用"文件夹 + 日期后缀"管理版本（<code>data/train_2026-03-01/</code>），这既无法保证内容不变（日期文件夹里的文件仍然可以被修改），也无法支持精确的血缘查询。</p>
+
+<div class="note"><strong>工程边界：</strong>一个正确的数据版本标识符必须满足：（1）唯一标识内容（不仅仅是时间或路径）；（2）不可变，一旦发布不允许修改；（3）可寻址，任意时刻都能根据版本号重新访问到对应内容。</div>
+</section>
+
+<!-- ===================== §3 CAS ===================== -->
+<section class="section" id="s3">
+<h2>3. Content-Addressable Storage（CAS）：版本的物理基础</h2>
+
+<h3>核心机制</h3>
+<p>Content-Addressable Storage 的核心思想：<strong>内容的 hash 值就是内容的地址（和版本）。</strong>这个设计自动保证了三个性质：（1）不可变性：同一个 hash 永远指向同一个内容；（2）去重：相同内容只需存储一次；（3）可验证性：读出内容后重新计算 hash，可检测静默损坏（silent corruption）。</p>
+
+<pre><code>文件内容 → SHA-256 哈希 → "0a3f7c..." → 作为存储 key
+                                        ↓
+                           读取时用同样的 key → 得到同样的内容</code></pre>
+
+<h3>Merkle Tree：把 CAS 扩展到数据集</h3>
+<p>单个文件的 SHA-256 hash 解决了单文件的版本问题。整个数据集包含数十万个文件，需要 Merkle Tree。Merkle Tree 的关键性质：任何一个叶子节点（文件）的变化，会向上传播到根 hash，使根 hash 改变。因此根 hash 变了 → 数据集一定变了；根 hash 没变 → 数据集一定没变。</p>
+
+<pre class="mermaid">graph TB
+    RootHash["根 Hash（代表整个数据集版本）"]
+    DirA["目录 A 的 Hash"]
+    DirB["目录 B 的 Hash"]
+    FileA1["file_0001.parquet Hash"]
+    FileA2["file_0002.parquet Hash"]
+    FileB1["file_0003.parquet Hash"]
+    FileB2["file_0004.parquet Hash"]
+
+    RootHash --> DirA
+    RootHash --> DirB
+    DirA --> FileA1
+    DirA --> FileA2
+    DirB --> FileB1
+    DirB --> FileB2</pre>
+
+<h3>去重的工程价值</h3>
+<table>
+  <thead>
+    <tr><th>场景</th><th>没有 CAS 去重</th><th>有 CAS 去重</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>数据集版本迭代</td><td>每个版本完整拷贝，存储成本 O(N×V)</td><td>增量存储 delta，成本 O(N + delta)</td></tr>
+    <tr><td>多任务共享数据</td><td>相同原始数据在不同任务目录各存一份</td><td>相同 hash 只存一份，不同版本的元数据指向同一 blob</td></tr>
+    <tr><td>数据集回滚</td><td>需要重建历史数据</td><td>直接切换到旧版本的根 hash，无需数据迁移</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>工程边界：</strong>SHA-256 在现代 CPU 上的速度约为 2-4 GB/s（软件实现）。对于训练时的批量写入，这个开销通常可以接受。但对于流式数据或超高频更新（每秒数千次写入），需要评估 hash 计算是否成为瓶颈。</div>
+</section>
+
+<!-- ===================== §4 三种版本模式 ===================== -->
+<section class="section" id="s4">
+<h2>4. 三种主流数据版本化模式</h2>
+
+<pre class="mermaid">graph LR
+    subgraph FileLevelDVC ["File-Level（DVC / git-lfs）"]
+        F1["代码仓库记录 .dvc 指针文件"]
+        F2["实际数据存在对象存储或本地缓存"]
+        F3["git commit 固定 .dvc 文件版本"]
+    end
+
+    subgraph CommitLevel ["Commit-Level（lakeFS / Nessie）"]
+        C1["数据仓库有 branch / commit 概念"]
+        C2["Commit 原子性覆盖大量文件变更"]
+        C3["支持 merge / diff / revert"]
+    end
+
+    subgraph TableFormat ["Table-Format（Iceberg / Delta / Hudi）"]
+        T1["表有 snapshot 序列"]
+        T2["每个 snapshot 指向不可变数据文件集合"]
+        T3["Time Travel 直接查询历史 snapshot"]
+    end</pre>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>File-Level（DVC）</th><th>Commit-Level（lakeFS）</th><th>Table-Format（Iceberg/Delta）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>版本粒度</td><td>单文件或目录</td><td>整个数据湖的 commit</td><td>单张表的 snapshot</td></tr>
+    <tr><td>数据规模适用</td><td>&lt;100GB</td><td>100GB - PB</td><td>100GB - PB</td></tr>
+    <tr><td>数据类型</td><td>任意（文件）</td><td>任意（文件）</td><td>结构化/半结构化</td></tr>
+    <tr><td>Git 语义</td><td>有（通过 .dvc 文件）</td><td>有（branch/merge/PR）</td><td>无，但有 snapshot 序列</td></tr>
+    <tr><td>Time Travel</td><td>无（需手动回滚）</td><td>有（commit hash）</td><td>有（snapshot id / timestamp）</td></tr>
+    <tr><td>Schema 演进</td><td>无内置支持</td><td>无内置支持</td><td>内置支持（backward/forward）</td></tr>
+    <tr><td>查询引擎集成</td><td>无</td><td>有（S3 兼容 API）</td><td>有（Spark/Trino/Flink/DuckDB）</td></tr>
+    <tr><td>适用场景</td><td>ML 实验文件、模型权重、中小型数据集</td><td>多团队协作数据湖、数据分支开发</td><td>生产 lakehouse、特征存储、分析查询</td></tr>
+  </tbody>
+</table>
+
+<h3>模式一：DVC 使用示例</h3>
+<pre><code># 将数据集纳入 DVC 管理
+dvc add data/train_v3/
+git add data/train_v3.dvc .gitignore
+git commit -m "Add train_v3 dataset"
+
+# 切换到历史版本
+git checkout &lt;commit_hash&gt;
+dvc checkout  # 自动拉取对应版本的数据</code></pre>
+
+<div class="note"><strong>工程边界：</strong>DVC 在 &lt;100GB 单版本、&lt;1TB 总存储（含历史版本）的场景工作良好。超过这个规模，每次 <code>dvc push/pull</code> 的网络传输成本和本地存储需求会成为瓶颈。</div>
+
+<h3>模式二：lakeFS git 语义示例</h3>
+<pre><code># 创建数据开发分支
+lakectl branch create lakefs://repo/feature/new-cleaning-rules \
+  --source lakefs://repo/main
+
+# 对比分支差异
+lakectl diff lakefs://repo/main lakefs://repo/feature/new-cleaning-rules
+
+# 合并到主干
+lakectl merge lakefs://repo/feature/new-cleaning-rules lakefs://repo/main</code></pre>
+
+<h3>模式三：Iceberg Time Travel 示例</h3>
+<pre><code>-- 查询某个 snapshot 时的数据视图
+SELECT * FROM training_data
+FOR SYSTEM_VERSION AS OF 5432109876;  -- snapshot id
+
+-- 查询某个时间点的数据视图
+SELECT * FROM training_data
+FOR SYSTEM_TIME AS OF '2026-03-14 12:00:00';
+
+-- 查看 snapshot 历史
+SELECT * FROM training_data.snapshots;</code></pre>
+</section>
+
+<!-- ===================== §5 Lineage Tracking ===================== -->
+<section class="section" id="s5">
+<h2>5. Lineage Tracking：从数据到模型的完整血缘</h2>
+
+<h3>血缘的最小必要结构</h3>
+
+<pre class="mermaid">flowchart TD
+    RawData["原始数据源\nraw_data_2026-Q1\nsnapshot_id=abc123"]
+    CleanedData["清洗后数据集\ncleaned_v7\nhash=def456"]
+    TrainSplit["训练切分\ntrain_split_v2\ncount=18.4M samples"]
+    TrainRun["训练 Run\nrun_id=run-0314\ngpu=8×H100"]
+    Checkpoint["模型 Checkpoint\nckpt-step-50000\nloss=1.234"]
+    EvalResult["评测结果\neval-0314\nNDCG=0.412"]
+    DeployedModel["线上模型\nprod-model-v3\nserving since 2026-03-15"]
+
+    RawData -- "cleaning_rule_v7\ngit:a1b2c3" --> CleanedData
+    CleanedData -- "split_policy_v2\nby_user_hash" --> TrainSplit
+    TrainSplit -- "job_config:lr=1e-4\nbatch=2048" --> TrainRun
+    TrainRun -- "checkpoint at step 50000" --> Checkpoint
+    Checkpoint -- "eval_dataset=bench_v2" --> EvalResult
+    EvalResult -- "manual approval\n2026-03-15" --> DeployedModel</pre>
+
+<div class="success"><strong>最佳实践：</strong>每条血缘边上的元数据称为 provenance metadata，是归因的关键。缺少这些元数据，血缘图就只是节点列表，而不是可查询的因果链。</div>
+
+<h3>OpenLineage 血缘事件格式</h3>
+<pre><code>{
+  "eventType": "COMPLETE",
+  "eventTime": "2026-03-14T12:00:00Z",
+  "run": {
+    "runId": "run-0314-uuid",
+    "facets": {
+      "jobConfig": {
+        "learning_rate": 1e-4,
+        "batch_size": 2048
+      }
+    }
+  },
+  "inputs": [{
+    "namespace": "s3://ml-data",
+    "name": "train_split_v2",
+    "facets": {
+      "datasetVersion": {"version": "def456"}
+    }
+  }],
+  "outputs": [{
+    "namespace": "s3://ml-models",
+    "name": "ckpt-step-50000",
+    "facets": {
+      "datasetVersion": {"version": "ghi789"}
+    }
+  }]
+}</code></pre>
+
+<h3>血缘平台选型</h3>
+<table>
+  <thead>
+    <tr><th>平台</th><th>定位</th><th>核心能力</th><th>适用规模</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Marquez</td><td>OpenLineage 参考实现，轻量</td><td>血缘图存储与查询 API</td><td>中小团队，开源自部署</td></tr>
+    <tr><td>OpenMetadata</td><td>全功能数据治理平台</td><td>血缘 + 数据目录 + 质量</td><td>中大型团队</td></tr>
+    <tr><td>Unity Catalog（Databricks）</td><td>Lakehouse 统一治理</td><td>血缘 + 访问控制 + Delta Lake 集成</td><td>Databricks 生态</td></tr>
+    <tr><td>Apache Atlas</td><td>Hadoop/云原生生态</td><td>血缘 + 分类 + 标签 + 政策</td><td>大型企业，Hadoop 生态</td></tr>
+    <tr><td>DataHub（LinkedIn）</td><td>元数据搜索与发现</td><td>全链路血缘 + 数据目录</td><td>大型团队，多数据源</td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>工程边界：</strong>血缘平台的引入会给每个数据处理 job 增加约 50-200ms 的 OpenLineage 事件发送延迟。对于批处理 job，这个开销可以接受；对于流处理或在线特征计算，需要评估是否使用异步发送。</div>
+</section>
+
+<!-- ===================== §6 训练任务血缘 ===================== -->
+<section class="section" id="s6">
+<h2>6. 训练任务血缘：强绑定的完整链路</h2>
+
+<h3>AI Infra 视角的血缘完整性要求</h3>
+<p>从 AI Infra 工程视角，以下绑定关系必须是强绑定（hard binding），而不是软记录（soft logging）：</p>
+<pre><code>dataset_version → training_run → checkpoint → eval_result → deployed_model</code></pre>
+
+<p>"强绑定"的含义：（1）不能在训练启动后修改 dataset_version；（2）checkpoint 必须记录生成它的 training_run；（3）eval_result 必须记录使用的 checkpoint 版本和 eval_dataset 版本；（4）deployed_model 必须指向具体的 checkpoint，不允许"latest"指针。</p>
+
+<h3>训练 Run 元数据最小规范</h3>
+<pre><code>run_id: run-0314-a1b2c3
+started_at: 2026-03-14T08:00:00Z
+finished_at: 2026-03-14T20:00:00Z
+status: COMPLETE
+
+# 强绑定：训练数据
+dataset:
+  name: train_split_recommendation_v2
+  version: def456abc789  # 不可变 hash，不允许是路径或 "latest"
+  snapshot_id: 5432109876  # Iceberg snapshot id
+  record_count: 18_400_000
+
+# 强绑定：代码和配置
+code:
+  git_commit: a1b2c3d4e5f6
+  config_hash: 9f8e7d6c5b4a
+
+# 强绑定：训练环境
+environment:
+  framework: pytorch-2.2.0
+  cuda: 12.2
+  nodes: 4
+  gpus_per_node: 8
+  gpu_type: H100-SXM5-80GB
+
+# 输出：checkpoints
+checkpoints:
+  - step: 50000
+    path: s3://models/ckpt-step-50000/
+    hash: ck50000hash</code></pre>
+
+<div class="danger"><strong>反模式警告：</strong>不允许在 dataset 字段填写 <code>s3://ml-data/train/latest/</code> 或 <code>s3://ml-data/train/2026-03-14/</code>。路径可以随时改变内容，只有内容 hash 才能真正固定版本。</div>
+</section>
+
+<!-- ===================== §7 Time Travel ===================== -->
+<section class="section" id="s7">
+<h2>7. Snapshot 与 Time Travel：重现训练时的数据视图</h2>
+
+<h3>Iceberg 元数据三层结构</h3>
+
+<pre class="mermaid">graph LR
+    Catalog["Catalog\n表的当前指针"]
+    MetaFile2["metadata-v2.json\nsnapshot-2 当前版本"]
+    MetaFile1["metadata-v1.json\nsnapshot-1 历史版本"]
+    ManifestList2["manifest-list-2.avro"]
+    ManifestList1["manifest-list-1.avro"]
+    Manifest1["manifest-1.avro\n文件列表 共享"]
+    Manifest2["manifest-2.avro\n新增文件"]
+    D1["data-0001.parquet\n不可变"]
+    D2["data-0002.parquet\n不可变"]
+    D3["data-0003.parquet\n新增"]
+
+    Catalog --> MetaFile2
+    MetaFile2 --> ManifestList2
+    MetaFile1 --> ManifestList1
+    ManifestList1 --> Manifest1
+    ManifestList2 --> Manifest1
+    ManifestList2 --> Manifest2
+    Manifest1 --> D1
+    Manifest1 --> D2
+    Manifest2 --> D3</pre>
+
+<div class="note"><strong>为什么三层元数据结构优于"直接在 metadata 中列出所有文件"：</strong>Manifest 共享机制使得两个 snapshot 可以共享同一批未变化的文件列表，不需要在每个 snapshot 中重复记录。这使得 snapshot 切换的开销是 O(变化文件数)，而不是 O(总文件数)。对于 1000 万个文件、每次只变化 1000 个文件的表，这意味着 10,000 倍的元数据读取加速。</div>
+
+<h3>Iceberg vs Delta Lake vs Hudi 核心对比</h3>
+<table>
+  <thead>
+    <tr><th>维度</th><th>Iceberg</th><th>Delta Lake</th><th>Hudi</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>元数据格式</td><td>JSON + Avro manifest</td><td>JSON transaction log</td><td>Parquet + avro timeline</td></tr>
+    <tr><td>Catalog 依赖</td><td>需要独立 Catalog 服务</td><td>无强依赖</td><td>无强依赖</td></tr>
+    <tr><td>Time Travel</td><td>snapshot id / timestamp</td><td>version / timestamp</td><td>instant time</td></tr>
+    <tr><td>流式写入</td><td>支持（Flink/Spark）</td><td>支持（Spark Streaming）</td><td>原生优化，最强</td></tr>
+    <tr><td>批量查询性能</td><td>最强（manifest 裁剪）</td><td>强（Z-Order）</td><td>中（视模式而定）</td></tr>
+    <tr><td>Row-level update</td><td>v2 支持（Equality delete）</td><td>支持（MERGE INTO）</td><td>原生（MoR 模式）</td></tr>
+    <tr><td>AI 训练场景推荐</td><td>优先（快照语义最清晰）</td><td>次选（Databricks 生态）</td><td>流式特征更新场景</td></tr>
+  </tbody>
+</table>
+
+<div class="warn"><strong>工程边界：</strong>Iceberg snapshot 的元数据开销约为每 1000 个数据文件产生 1 个 manifest 文件（约 50-200KB）。一张有 100 万个 parquet 文件的大表，snapshot 元数据约为 50-200GB，需要为元数据层规划独立存储和缓存。应定期执行 <code>REWRITE MANIFESTS</code> 和 <code>EXPIRE SNAPSHOTS</code> 防止元数据膨胀。</div>
+</section>
+
+<!-- ===================== §8 Schema Evolution ===================== -->
+<section class="section" id="s8">
+<h2>8. Schema Evolution：向前兼容与向后兼容</h2>
+
+<pre class="mermaid">flowchart LR
+    OldSchema["旧 Schema\nuser_id, item_id, label\n3 列"]
+    NewSchema["新 Schema\nuser_id, item_id, label, context\n4 列"]
+    OldModel["训练在旧 Schema 上的模型\n不接受 context 列"]
+    NewModel["训练在新 Schema 上的模型\n需要 context 列"]
+    OldData["旧版本数据\n无 context 列"]
+    NewData["新版本数据\n有 context 列"]
+
+    OldSchema --> OldModel
+    NewSchema --> NewModel
+    OldData -->|"backward compat: 新模型能读旧数据？"| NewModel
+    NewData -->|"forward compat: 旧模型能读新数据？"| OldModel</pre>
+
+<table>
+  <thead>
+    <tr><th>操作</th><th>Backward Compat</th><th>Forward Compat</th><th>AI 训练风险</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>新增可选列</td><td>是</td><td>是</td><td>低（旧模型忽略新列）</td></tr>
+    <tr><td>新增必填列</td><td>否</td><td>是</td><td>中（旧数据该列为 null，需处理缺失）</td></tr>
+    <tr><td>删除列</td><td>是</td><td>否</td><td>高（新 schema 无该列，旧模型崩溃）</td></tr>
+    <tr><td>修改列类型（扩展 int→long）</td><td>是</td><td>否</td><td>中（精度变化）</td></tr>
+    <tr><td>修改列类型（缩减）</td><td>否</td><td>是</td><td>高（数据截断）</td></tr>
+    <tr><td>重命名列</td><td>否</td><td>否</td><td>极高（静默语义错误）</td></tr>
+  </tbody>
+</table>
+
+<div class="danger"><strong>最危险的 Schema 变化：</strong>在 AI 训练场景中，最危险的 schema 变化是重命名列（如把 <code>click_label</code> 改为 <code>purchase_label</code>），因为这不会引发解析错误，但会导致模型学习到错误的标签语义，且这种错误通常只在线上出现质量下降后才被发现。建立 Schema Registry 和变更评审机制是防止这类错误的最低配置。</div>
+</section>
+
+<!-- ===================== §9 Lakehouse 架构 ===================== -->
+<section class="section" id="s9">
+<h2>9. 大数据 Lakehouse 架构：S3 + Iceberg + 元数据服务</h2>
+
+<pre class="mermaid">graph TB
+    subgraph Clients ["数据消费方"]
+        TrainJob["训练 Job\nSpark / Ray"]
+        QueryEngine["分析查询\nTrino / Athena"]
+        FeatureStore["特征存储"]
+    end
+
+    subgraph MetaLayer ["元数据层"]
+        Catalog["Iceberg Catalog\nGlue / Hive / Nessie / REST"]
+        LineageDB["血缘数据库\nMarquez / Atlas"]
+        SchemaReg["Schema Registry"]
+    end
+
+    subgraph StorageLayer ["存储层（S3 / GCS / ADLS）"]
+        DataFiles["Parquet 数据文件\n不可变，按 snapshot 组织"]
+        ManifestFiles["Iceberg Manifest\nAvro，列出文件集合"]
+        MetaFiles["Iceberg Metadata\nJSON，snapshot 历史"]
+    end
+
+    subgraph ComputeLayer ["计算层"]
+        SparkCluster["Spark 集群\nEMR / Dataproc"]
+        FlinkCluster["Flink 集群\n实时摄取"]
+    end
+
+    TrainJob --> Catalog
+    QueryEngine --> Catalog
+    FeatureStore --> Catalog
+    Catalog --> MetaFiles
+    MetaFiles --> ManifestFiles
+    ManifestFiles --> DataFiles
+    SparkCluster --> LineageDB
+    FlinkCluster --> LineageDB</pre>
+
+<div class="note"><strong>冷启动开销：</strong>训练 Job 启动时需要读取 manifest 列表来确定数据文件集合。一张有 100 万个 parquet 文件的表，其 manifest 列表可能有 1000 个 manifest 文件，读取这些 manifest 是训练 Job 的冷启动开销（通常 30-120 秒）。生产环境应将 Iceberg REST Catalog 部署在训练集群附近，并配置 manifest 缓存以减少这个开销。</div>
+</section>
+
+<!-- ===================== §10 合规 ===================== -->
+<section class="section" id="s10">
+<h2>10. 数据合规与可追溯性：GDPR 和审计要求</h2>
+
+<h3>GDPR 删除请求的传播链路</h3>
+
+<pre class="mermaid">flowchart TD
+    Request["GDPR 删除请求\nuser_id=12345"]
+    Discovery["1. 影响范围发现\n查询血缘图：user_id 出现在哪些 dataset 版本"]
+    DatasetList["受影响 Dataset 版本列表\ntrain_v3, train_v4, eval_bench_v2"]
+    ModelList["受影响模型列表\nmodel_ckpt_0314, model_prod_v3"]
+    DataDelete["2. 数据删除\nIceberg Row-level delete 或重新物化新 snapshot"]
+    ModelRetrain["3. 模型评估\n是否需要 retrain？数据占比评估 + 法务决策"]
+    AuditLog["4. 审计日志\n记录删除操作、时间、操作者、影响范围"]
+    Confirm["5. 确认通知\n向用户/监管方提供删除确认证明"]
+
+    Request --> Discovery
+    Discovery --> DatasetList
+    Discovery --> ModelList
+    DatasetList --> DataDelete
+    ModelList --> ModelRetrain
+    DataDelete --> AuditLog
+    ModelRetrain --> AuditLog
+    AuditLog --> Confirm</pre>
+
+<h3>合规检查清单</h3>
+<table>
+  <thead>
+    <tr><th>检查项</th><th>技术实现</th><th>GDPR 条款</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>数据主体识别</td><td>每条数据携带可追溯 user_id（加密或假名化）</td><td>Art.4</td></tr>
+    <tr><td>同意记录</td><td>同意事件写入不可变日志，与数据版本绑定</td><td>Art.7</td></tr>
+    <tr><td>访问控制</td><td>数据集级别 ACL，基于角色的访问（RBAC）</td><td>Art.32</td></tr>
+    <tr><td>数据目录</td><td>所有数据集在元数据系统中注册，有数据负责人</td><td>Art.30</td></tr>
+    <tr><td>删除能力</td><td>Row-level delete 或重新物化，有审计日志</td><td>Art.17</td></tr>
+    <tr><td>数据最小化</td><td>训练集中只保留必要字段，不保留原始 PII</td><td>Art.5</td></tr>
+    <tr><td>跨境传输</td><td>数据存储位置在元数据中标注，有传输协议记录</td><td>Art.44</td></tr>
+    <tr><td>模型影响评估</td><td>血缘图支持查询"删除 X 条样本影响哪些模型"</td><td>监管最佳实践</td></tr>
+  </tbody>
+</table>
+
+<div class="success"><strong>工程建议：</strong>GDPR 合规应从设计阶段引入 privacy-by-design 原则。最简单的方法是：从训练数据进入系统开始就用假名化 ID，并建立 ID 映射表（仅合规团队可访问），使删除操作只需要在 ID 映射表中删除记录，而不需要重新物化整个数据集。</div>
+</section>
+
+<!-- ===================== §11 Model Registry 协同 ===================== -->
+<section class="section" id="s11">
+<h2>11. 与 Model Registry 的协同</h2>
+<p>Model Registry（详见 <a href="12-artifacts-and-checkpoints.html">第 12 章</a>）是数据版本体系的下游消费方。两个系统必须通过强绑定的版本 ID 相互引用：</p>
+
+<table>
+  <thead>
+    <tr><th>数据版本系统记录</th><th>Model Registry 记录</th><th>绑定方式</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>dataset_version: def456</td><td>training_run: run-0314</td><td>run 元数据中记录 dataset_version</td></tr>
+    <tr><td>training_run: run-0314</td><td>checkpoint: ckpt-50000</td><td>checkpoint 元数据中记录 run_id</td></tr>
+    <tr><td>checkpoint: ckpt-50000</td><td>model_version: prod-v3</td><td>model 元数据中记录 checkpoint_id</td></tr>
+    <tr><td>model_version: prod-v3</td><td>eval_result: eval-0314</td><td>eval 元数据中记录 model_version + eval_dataset_version</td></tr>
+  </tbody>
+</table>
+
+<div class="danger"><strong>反模式：</strong>在 Model Registry 中注册一个模型，但 <code>source_run_id</code> 为空，或者 <code>source_run_id</code> 对应的 run 元数据中 <code>dataset_version</code> 字段为"未记录"。这种情况意味着该模型的来源数据无法追溯，合规团队无法完成 GDPR 影响评估。</div>
+</section>
+
+<!-- ===================== §12 反模式 ===================== -->
+<section class="section" id="s12">
+<h2>12. 反模式：版本管理的常见错误</h2>
+
+<div class="danger"><strong>反模式一：用 "latest" 指针</strong><br>
+<code>train_data = load_dataset("s3://ml-data/train/latest/")</code><br>
+<code>latest/</code> 指向的内容随时可能改变。今天运行的训练 run 和昨天运行的使用了相同的"路径"，但实际上看到了不同的数据。正确做法：传入 snapshot_id 或 version_hash。</div>
+
+<div class="danger"><strong>反模式二：用 mtime 推断版本</strong><br>
+<code>if [ $(stat -c %Y data/train.parquet) -gt $LAST_TRAIN_TIME ]</code><br>
+mtime 在文件系统挂载、rsync 同步、时区变更后都可能不可靠，且只告诉你文件"什么时候变了"，不告诉你"变成了什么"。</div>
+
+<div class="danger"><strong>反模式三：用路径前缀当版本</strong><br>
+<code>data_path = f"s3://ml-data/train/{version}/"</code>（version = "2026-03"）<br>
+整个月内路径下的文件都可以被修改，3 月 1 日和 3 月 31 日运行的训练看到的数据可能完全不同。</div>
+
+<div class="danger"><strong>反模式四：忽略 Schema 变更</strong><br>
+上游新增了一个列，下游代码因为 Parquet 列存储特性不报错，静默忽略了新列。如果新列携带重要特征信息，模型性能损失不会立即显现，只在线上出现质量下降后才被发现。建立 Schema Registry 强制校验是防止这类错误的最低配置。</div>
+</section>
+
+<!-- ===================== §13 Worked Example ===================== -->
+<section class="section" id="s13">
+<h2>13. Worked Example：RAG 系统与微调模型的全链路版本管理</h2>
+
+<h3>场景描述</h3>
+<p>一个企业级 RAG 系统包含两条数据链路：（1）文档索引链路：企业内部文档 → 清洗 → 分块 → 向量化 → 向量数据库索引；（2）模型微调链路：用户 Q&amp;A 历史 → 清洗 → 微调数据集 → 微调 Embedding 模型 + LLM。</p>
+
+<h3>文档索引版本血缘</h3>
+<pre class="mermaid">flowchart TD
+    DocSource["企业文档源\nConfluence / SharePoint\n每日增量同步"]
+    RawSnapshot["原始文档快照\nlakeFS commit: abc123\n2026-03-14 23:59:59"]
+    CleanedDocs["清洗后文档\nDVC hash: def456\n去HTML/去重/去噪"]
+    Chunks["文档分块\nDVC hash: ghi789\n512 token chunks\n共 2.4M chunks"]
+    EmbVectors["Embedding 向量\nDVC hash: jkl012\n2.4M × 3072 dim"]
+    VecIndex["向量索引\nindex_version: v2026-03-15\nFAISS HNSW m=16"]
+    RAGService["RAG 服务\n使用 index_version=v2026-03-15"]
+
+    DocSource -- "lakeFS commit\ndaily at 00:00" --> RawSnapshot
+    RawSnapshot -- "cleaning_pipeline_v3\ngit: a1b2c3" --> CleanedDocs
+    CleanedDocs -- "chunking_config_v2\noverlap=50_tokens" --> Chunks
+    Chunks -- "embedding_model: text-embedding-3-large\nbatch_size=512" --> EmbVectors
+    EmbVectors -- "index_config: HNSW_m16_efC200" --> VecIndex
+    VecIndex --> RAGService</pre>
+
+<h3>增量更新：只处理变化部分</h3>
+<pre><code># 对比两个 lakeFS commit 的差异，只对变化文档重新处理
+lakectl diff \
+  lakefs://rag-docs/main@2026-03-13T23:59:59Z \
+  lakefs://rag-docs/main@2026-03-14T23:59:59Z
+
+# 输出：仅有变化的文档列表
+# Modified: docs/product/manual_v2.pdf
+# Added: docs/hr/policy_2026.docx
+# Deleted: docs/legacy/old_api.md</code></pre>
+
+<h3>索引版本元数据</h3>
+<pre><code>index_version: v2026-03-15
+created_at: 2026-03-15T06:00:00Z
+
+provenance:
+  raw_snapshot: abc123         # lakeFS commit hash
+  cleaned_docs_hash: def456    # DVC hash
+  chunks_hash: ghi789          # DVC hash
+  embedding_vectors_hash: jkl012
+  embedding_model: text-embedding-3-large
+  embedding_model_version: 2024-10-21
+
+statistics:
+  total_documents: 45_230
+  total_chunks: 2_400_000
+  changed_documents: 127       # 相比上个版本
+  added_documents: 23
+  deleted_documents: 8</code></pre>
+
+<h3>微调数据集血缘</h3>
+<pre class="mermaid">flowchart TD
+    QALogs["用户 Q&A 日志\nKafka → S3\n用户 ID 假名化"]
+    FilteredLogs["过滤后的交互日志\nIceberg snapshot: 5432109876\n人工评分 ≥ 4/5 的对话"]
+    SFTDataset["SFT 微调数据集\nDVC hash: mno345\ninstruction / input / output\n共 89,234 条"]
+    ValSplit["验证集\nDVC hash: pqr678\n8,923 条"]
+    FinetuneRun["微调 Run\nrun_id: ft-run-0315\nbase: Llama-3-8B\nlr=2e-5, epochs=3"]
+    FTCheckpoint["微调 Checkpoint\nckpt: ft-ckpt-ep3\nval_loss=0.89"]
+    EvalResult["评测结果\neval-ft-0315\nRAG Q&A 准确率: 76.3%"]
+    ProdModel["生产模型\nprod-rag-llm-v2\n部署于 2026-03-16"]
+
+    QALogs -- "filter: rating >= 4\nGDPR: 用户 ID 假名化" --> FilteredLogs
+    FilteredLogs -- "format_template_v1\ntrain_val_split=0.9" --> SFTDataset
+    SFTDataset --> ValSplit
+    SFTDataset -- "ft_config: lr=2e-5\nbatch=64" --> FinetuneRun
+    ValSplit --> FinetuneRun
+    FinetuneRun --> FTCheckpoint
+    FTCheckpoint -- "eval_dataset: rag_bench_v3" --> EvalResult
+    EvalResult -- "人工审核通过" --> ProdModel</pre>
+
+<h3>GDPR 影响分析查询</h3>
+<pre><code>def gdpr_impact_analysis(user_id: str):
+    pseudonym = lookup_pseudonym(user_id)  # 仅合规团队有权限
+
+    # 查询该用户数据出现的所有 Iceberg snapshot
+    affected_snapshots = spark.sql(f"""
+        SELECT snapshot_id, table_name, COUNT(*) as records
+        FROM data_lineage_catalog
+        WHERE contains_user_id = '{pseudonym}'
+        GROUP BY snapshot_id, table_name
+    """).collect()
+
+    # 查询这些 snapshot 被哪些 training_run 使用
+    affected_runs = query_lineage_graph(affected_snapshots)
+
+    # 查询这些 run 产生的 checkpoint 和部署的模型
+    affected_models = query_downstream_models(affected_runs)
+
+    return {
+        "affected_datasets": affected_snapshots,
+        "affected_training_runs": affected_runs,
+        "affected_deployed_models": affected_models,
+        "recommendation": "需要法务评估是否触发模型重训"
+                          if len(affected_models) > 0 else "仅需数据删除"
+    }</code></pre>
+
+<div class="success"><strong>全链路可视化价值：</strong>上面两条血缘链路合并后，工程师在 Marquez 控制台可以看到从原始文档/Q&amp;A 日志 → 索引版本/微调模型 → RAG 服务的完整 DAG。当 RAG 质量退化时，可以在 10 分钟内定位是索引版本问题还是微调模型问题，显著降低 MTTR。</div>
+</section>
+
+<!-- ===================== §14 工程建议 ===================== -->
+<section class="section" id="s14">
+<h2>14. 工程建议与版本化优先级</h2>
+
+<table>
+  <thead>
+    <tr><th>团队规模</th><th>推荐方案</th><th>最小投入</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1-5 人</td><td>DVC + git，数据存 S3</td><td>DVC 安装 + S3 存储</td></tr>
+    <tr><td>5-20 人</td><td>lakeFS 或 Iceberg + Glue Catalog</td><td>1 台 lakeFS 实例或 AWS Glue</td></tr>
+    <tr><td>20-100 人</td><td>Iceberg + Nessie + Marquez</td><td>独立元数据服务 + 血缘平台</td></tr>
+    <tr><td>100+ 人</td><td>Unity Catalog 或 DataHub + Iceberg</td><td>全功能数据治理平台</td></tr>
+  </tbody>
+</table>
+
+<h3>版本化的最低配置（三条必须满足）</h3>
+<ol>
+  <li><strong>训练 Run 启动时，数据版本 ID 必须被固定并写入 Run 元数据</strong>（不允许使用路径或 latest）</li>
+  <li><strong>同一训练 Run 不允许中途切换数据集版本</strong>（即使上游数据更新了）</li>
+  <li><strong>数据版本 ID 和 git commit hash 必须一起出现在 Run 元数据中</strong>（确保代码和数据的双版本锁定）</li>
+</ol>
+
+<div class="success"><strong>最终工程底线：</strong>如果你只能做一件事，就做这一件：在训练启动时计算训练数据目录的 SHA-256，写入 mlflow/wandb 的 run 元数据。哪怕没有完整的版本管理系统，这一步骤也能让"数据是否发生过变化"变成可回答的问题。</div>
+
+<h3>本章小结</h3>
+<table>
+  <thead>
+    <tr><th>主题</th><th>要点</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>不可化简问题</td><td>数据可变，训练需精确复现 → 必须有不可变的版本快照机制</td></tr>
+    <tr><td>CAS 原理</td><td>SHA-256 hash 自动实现内容标识、去重、不可变性</td></tr>
+    <tr><td>三种版本模式</td><td>file-level（DVC）/ commit-level（lakeFS）/ table-format（Iceberg/Delta）</td></tr>
+    <tr><td>血缘追踪</td><td>OpenLineage 事件 → Marquez/Atlas 存储 → 支持 GDPR 影响传播查询</td></tr>
+    <tr><td>训练任务绑定</td><td>dataset_version → run_id → checkpoint_id → eval_result → deployed_model</td></tr>
+    <tr><td>Time Travel</td><td>Iceberg snapshot id / Delta Lake version 支持重现历史数据视图</td></tr>
+    <tr><td>Schema Evolution</td><td>向后/向前兼容的选择直接影响模型训练的稳定性</td></tr>
+    <tr><td>合规</td><td>GDPR 删除请求需要数据版本系统支持"影响传播"查询</td></tr>
+    <tr><td>反模式</td><td>latest 指针、mtime 推断、路径当版本是三大最常见错误</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ===================== §15 练习题 ===================== -->
+<section class="section" id="s15">
+<h2>15. 练习题</h2>
+<ol>
+  <li><strong>11e-1</strong>：列举三个在实际 AI 项目中"数据版本未固定"导致无法复现训练结果的具体场景，说明每个场景的根本原因和预防方法。</li>
+  <li><strong>11e-2</strong>：用 SHA-256 内容哈希解释：为什么 CAS 能同时实现去重和不可变性？在 2 亿个 1KB 文件的数据集上，CAS 去重能节省多少存储空间（假设重复率 30%）？</li>
+  <li><strong>11e-3</strong>：比较 DVC、lakeFS、Apache Iceberg 三种方案在以下场景中的适用性：（a）个人实验室的 10GB 图像数据集；（b）多团队协作的 10TB 文本语料库；（c）生产环境每小时更新的 100TB 用户行为数据。</li>
+  <li><strong>11e-4</strong>：画出一个完整的 training lineage DAG，包含原始数据源、3 个数据处理步骤、1 个训练 run、2 个 checkpoint、1 个评测结果和 1 个部署的模型。标注每条边上需要记录的 provenance metadata。</li>
+  <li><strong>11e-5</strong>：使用 Apache Iceberg 的 SQL 语法，写出以下查询：（a）查看某张表最近 10 个 snapshot 的历史；（b）比较两个 snapshot 之间的数据差异；（c）将表回滚到 7 天前的 snapshot。</li>
+  <li><strong>11e-6</strong>：设计一个 Schema Evolution 策略，使一个推荐系统的训练数据表能够安全地：（a）新增 embedding 向量列；（b）将 click_label 列从 INT 改为 FLOAT；（c）删除已废弃的 deprecated_feature 列。哪些变更需要特别警惕？</li>
+  <li><strong>11e-7</strong>：一个 GDPR 删除请求到达，要求删除 user_id=X 的所有数据。系统中有 Iceberg 表 A（包含该用户 2000 条行为数据）、训练数据集版本 v3（基于表 A 的 snapshot）、以及用该数据集训练的线上模型 prod-v5。描述完整的处理步骤，重点说明哪些步骤可以自动化，哪些需要人工决策。</li>
+  <li><strong>11e-8</strong>：解释 Iceberg 的 manifest list → manifest → data files 三层元数据结构。为什么这种结构比"直接在 metadata 文件中列出所有数据文件"更有利于大规模训练场景？</li>
+  <li><strong>11e-9</strong>：对比 Iceberg 和 Delta Lake 在 time travel 实现上的核心差异：（a）元数据格式；（b）Catalog 依赖；（c）time travel 查询的执行计划。哪种方案在 AI 训练场景下更容易集成？</li>
+  <li><strong>11e-10</strong>：设计一个 RAG 系统的文档版本管理方案，要求：每次文档源更新后只对变化部分重新处理；每个索引版本能够精确追溯到对应的文档快照、分块配置、Embedding 模型版本；当 RAG 质量退化时能够在 30 分钟内完成原因归因。</li>
+  <li><strong>11e-11</strong>：解释为什么"用文件夹日期命名"是一种不充分的数据版本化方案。提出一种最小化改进方案，使其满足"版本不可变"和"内容可验证"两个要求，同时不引入任何额外工具。</li>
+  <li><strong>11e-12</strong>：一个训练平台规定所有训练 Job 必须通过 OpenLineage 上报血缘事件。设计一个 <code>TrainingJobWrapper</code> 类，自动在 Job 启动时发送 <code>START</code> 事件（包含 dataset_version 和 code_version），在 Job 完成时发送 <code>COMPLETE</code> 事件（包含 checkpoint_path 和 final_metrics）。</li>
+</ol>
+</section>
+
+<!-- ===================== §16 参考资料 ===================== -->
+<section class="refbox" id="s16">
+<h2>深度参考阅读</h2>
+
+<h3>核心论文与规范</h3>
+<ul>
+  <li><strong>Apache Iceberg 规范</strong>：<a href="https://iceberg.apache.org/spec/" target="_blank">https://iceberg.apache.org/spec/</a> — 表格式版本化的权威规范，Snapshot、Manifest、Schema Evolution 的实现细节。</li>
+  <li><strong>Delta Lake 论文</strong>：Armbrust et al., "Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores," <em>VLDB 2020</em> — Delta Lake 的事务日志（DeltaLog）设计，与 Iceberg 的核心差异。</li>
+  <li><strong>Apache Hudi 论文</strong>：Sivaram et al., "The Apache Hudi Lake Platform," <em>VLDB 2023</em> — 流批一体场景下的 Hudi 实现，Copy-on-Write vs Merge-on-Read 模式。</li>
+  <li><strong>OpenLineage 规范</strong>：<a href="https://openlineage.io/spec/" target="_blank">https://openlineage.io/spec/</a> — 血缘事件格式标准，Run/Job/Dataset facets 的完整定义。</li>
+  <li><strong>Lakehouse 架构论文</strong>：Zaharia et al., "Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics," <em>CIDR 2021</em></li>
+</ul>
+
+<h3>工具文档</h3>
+<ul>
+  <li><strong>DVC</strong>：<a href="https://dvc.org/doc" target="_blank">https://dvc.org/doc</a> — File-level 数据版本化，与 git 的集成模式。</li>
+  <li><strong>lakeFS 架构</strong>：<a href="https://docs.lakefs.io/understand/architecture.html" target="_blank">https://docs.lakefs.io/understand/architecture.html</a> — 对象存储上的 git 语义实现。</li>
+  <li><strong>Project Nessie</strong>：<a href="https://projectnessie.org/" target="_blank">https://projectnessie.org/</a> — Iceberg Catalog 的 git-like 分支管理。</li>
+  <li><strong>Marquez</strong>：<a href="https://marquezproject.ai/" target="_blank">https://marquezproject.ai/</a> — OpenLineage 参考实现，血缘图存储和查询。</li>
+  <li><strong>Unity Catalog</strong>：<a href="https://docs.databricks.com/en/data-governance/unity-catalog/" target="_blank">https://docs.databricks.com/en/data-governance/unity-catalog/</a> — Databricks 统一数据治理平台。</li>
+  <li><strong>HuggingFace Datasets Versioning</strong>：<a href="https://huggingface.co/docs/datasets" target="_blank">https://huggingface.co/docs/datasets</a> — HuggingFace Hub 的 dataset 版本管理。</li>
+</ul>
+
+<h3>延伸阅读</h3>
+<ul>
+  <li>Kleppmann, M. <em>Designing Data-Intensive Applications</em>, O'Reilly, 2017 — 第 11 章（Stream Processing）对理解数据一致性和版本语义有重要参考价值。</li>
+  <li><strong>ML Metadata（MLMD）</strong>：<a href="https://www.tensorflow.org/tfx/guide/mlmd" target="_blank">https://www.tensorflow.org/tfx/guide/mlmd</a> — TFX 生态的 ML 元数据存储，涵盖 dataset → run → model 的完整血缘。</li>
+  <li><strong>Apache Atlas</strong>：<a href="https://atlas.apache.org/" target="_blank">https://atlas.apache.org/</a> — 企业级数据治理和元数据管理平台。</li>
+</ul>
+
+<h3>学习路线</h3>
+<ol>
+  <li><strong>入门</strong>：理解 DVC 的基本用法，把一个本地 ML 实验的数据纳入 DVC 管理（1 天）</li>
+  <li><strong>进阶</strong>：在 Iceberg 表上实践 Time Travel 查询，理解 snapshot 元数据结构（2 天）</li>
+  <li><strong>工程</strong>：部署 lakeFS 或 Nessie，实践数据分支开发和 PR Review 流程（3 天）</li>
+  <li><strong>平台</strong>：集成 OpenLineage + Marquez，实现训练任务的自动血缘上报（1 周）</li>
+  <li><strong>合规</strong>：设计 GDPR 影响传播查询，在血缘图上实现删除影响范围分析（1 周）</li>
+</ol>
+
+<div class="note"><strong>关联章节：</strong>
+  <a href="11-data-pipeline.html">第 11 章：数据管道</a>（本章前置：数据分层、质量门禁、时间语义） |
+  <a href="12-artifacts-and-checkpoints.html">第 12 章：制品与 Checkpoint</a>（本章下游：模型注册与版本协同） |
+  <a href="13-feature-vector-and-cache.html">第 13 章：特征、向量与缓存</a>（特征存储的版本化挑战）
+</div>
+</section>
+
+<nav class="bottomnav"></nav>
+
+<footer class="footer">
+  <p>AI Infra 教程 · 第 11e 章 · 数据版本、血缘与谱系</p>
+</footer>
+
+</main>
+
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

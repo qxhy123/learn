@@ -114,9 +114,23 @@
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第11章 | [数据管道](./part4-data-and-storage/11-data-pipeline.md) | 采集、清洗、切分、分片、流式读取、dataset shard 与 Part 0 存储路径联动 | 数据吞吐与一致性 |
-| 第12章 | [制品、模型与检查点管理](./part4-data-and-storage/12-artifacts-and-checkpoints.md) | Model Registry、Checkpoint、版本治理、checkpoint 文件系统选型 | 训练资产管理 |
-| 第13章 | [特征、向量与缓存](./part4-data-and-storage/13-feature-vector-and-cache.md) | Feature Store、Embedding、向量索引、ANN、RAG Chunking、增量重建、Prefix Caching | 在线数据访问 |
+| 第11章 | [数据管道总览](./part4-data-and-storage/11-data-pipeline.md) | 第一性原理推导链 + 5 章导览 + 角色阅读路径 | 入口章 |
+| 第11a章 | [数据采集与摄入](./part4-data-and-storage/11a-data-ingestion.md) | 数据源类型、批/流模式、Kafka/Pulsar/Kinesis、CDC、Schema Registry、SLA、多租户、DLQ | 摄入主链路 |
+| 第11b章 | [数据清洗、去重与质量治理](./part4-data-and-storage/11b-data-cleaning-dedup-quality.md) | NFKC、boilerplate、CCNet/FineWeb-EDU、MinHash+LSH、质量六维、漂移检测、反模式 | LLM 训练数据治理 |
+| 第11c章 | [Tokenization、切分与训练 Dataset 格式](./part4-data-and-storage/11c-tokenization-and-dataset-formats.md) | BPE/SentencePiece/Tiktoken、词表选择、sequence packing、parquet/arrow/WebDataset/MosaicML 格式 | 训练数据准备 |
+| 第11d章 | [流式读取与 DataLoader 工程化](./part4-data-and-storage/11d-streaming-and-dataloader-engineering.md) | PyTorch DataLoader 内部、worker IPC、num_workers/prefetch/pin_memory 调优、远程数据集、resume | GPU 不能等数据 |
+| 第11e章 | [数据版本、血缘与谱系](./part4-data-and-storage/11e-data-versioning-and-lineage.md) | DVC/lakeFS/Iceberg/Delta、CAS/Merkle、OpenLineage、time travel、GDPR 合规 | 训练复现性 |
+| 第12章 | [制品、模型与检查点管理总览](./part4-data-and-storage/12-artifacts-and-checkpoints.md) | 第一性原理推导链 + 4 章导览 | 入口章 |
+| 第12a章 | [Model Registry 体系](./part4-data-and-storage/12a-model-registry.md) | 核心实体、metadata schema、Stage 状态机、MLflow/W&B/HF Hub 对比、大模型分发、LoRA registry | 服务发现与治理 |
+| 第12b章 | [Checkpoint 工程化](./part4-data-and-storage/12b-checkpoint-engineering.md) | Sharded、async DCP、TorchSnapshot vs Megatron、manifest 原子提交、175B Worked Example | 训练故障恢复 |
+| 第12c章 | [制品版本治理与发布门禁](./part4-data-and-storage/12c-release-governance.md) | semver、immutable artifact、staging→canary→production、评测/性能/兼容/安全门禁、审批流、deprecation | release 治理 |
+| 第12d章 | [制品供应链与签名](./part4-data-and-storage/12d-supply-chain-and-signing.md) | Sigstore/cosign、SLSA L1-L4、SBOM、SafeTensors、admission webhook、attestation chain | 供应链安全 |
+| 第13章 | [特征、向量与缓存总览](./part4-data-and-storage/13-feature-vector-and-cache.md) | 第一性原理推导链 + 5 章导览 | 入口章 |
+| 第13a章 | [Feature Store 体系](./part4-data-and-storage/13a-feature-store.md) | online/offline parity、point-in-time correctness、Feast/Tecton、materialization、Embedding as feature | 训练-推理一致性 |
+| 第13b章 | [向量索引算法](./part4-data-and-storage/13b-vector-index-algorithms.md) | HNSW、IVF、PQ/OPQ、ScaNN、DiskANN、召回-延迟-内存权衡、GPU vs CPU、ColBERT 多向量 | ANN 算法选型 |
+| 第13c章 | [向量数据库选型与运维](./part4-data-and-storage/13c-vector-db-selection-and-operations.md) | Milvus/Qdrant/Pinecone/pgvector、sharding/replication、hybrid search、容量规划、监控备份升级 | 生产化向量库 |
+| 第13d章 | [RAG 工程化](./part4-data-and-storage/13d-rag-engineering.md) | chunking 策略、hybrid retrieval、reranking、citation、Ragas eval、与 SGLang RadixAttention 协同 | RAG 系统设计 |
+| 第13e章 | [Embedding 工程与缓存层](./part4-data-and-storage/13e-embedding-and-cache-layer.md) | embedding 模型选型、Matryoshka、量化、TEI 服务化、semantic cache、output cache、KV prefix cache | embedding 全生命周期 |
 
 ### 第五部分：推理与服务基础设施
 
