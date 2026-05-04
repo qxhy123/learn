@@ -1,6 +1,8 @@
-# 第 0a 章 · CPU 微架构
+# 第 0a 章 · CPU 微架构总览
 
-CPU 微架构不是"背 Intel/AMD 名词"。对 AI Infra 工程师来说，它回答的是：为什么 GPU 很忙时，训练仍会被 DataLoader、tokenizer、日志聚合、RPC 调度、采样器、压缩和解码前处理这些 host-side 代码拖住。本章用第一性原理把流水线、乱序执行、分支预测、SIMD、Cache、MESI 和伪共享串成一条排障链路。
+CPU 微架构不是"背 Intel/AMD 名词"。对 AI Infra 工程师来说，它回答的是：为什么 GPU 很忙时，训练仍会被 DataLoader、tokenizer、日志聚合、RPC 调度、采样器、压缩和解码前处理这些 host-side 代码拖住。
+
+本章是 **Part 0a 系列的总览章**。它用第一性原理把 CPU 微架构的全部机制串成一张推导图，并指引你按需进入 0a-1 至 0a-8 八个独立深挖章。如果你只关心一个具体话题（比如"为什么 worker 加倍反而慢"），可以直接跳到对应深挖章；如果你要建立完整心智模型，按 0a-1 → 0a-8 顺序阅读即可。
 
 ## 0a.1 第一性原理拆解 + 学习大纲
 
@@ -16,9 +18,9 @@ CPU 是有限的物理器件。它不能让一条指令在零时间内完成，�
 
 ### 推 — 从这个问题如何推导出每个机制
 
-从"单条指令存在延迟"推出流水线；从"流水线会遇到依赖"推出冒险检测、forwarding 和 stall；从"程序中存在可重排的独立指令"推出乱序执行；从"寄存器名字会制造不必要的读写冲突"推出 register renaming；从"乱序执行必须看起来像顺序执行"推出 ROB。接着，从"下一条指令地址不总是顺序地址"推出分支预测和 BTB；从"标量执行浪费数据并行机会"推出 SIMD；从"内存比执行单元慢很多"推出 L1/L2/L3 Cache；从"多核各有私有缓存"推出 MESI；从"一致性以 cache line 为粒度"推出伪共享。
+从"单条指令存在延迟"推出流水线（详见 [0a-1](0a1-pipeline.md)）；从"流水线会遇到依赖"推出冒险检测、forwarding 和 stall；从"程序中存在可重排的独立指令"推出乱序执行（详见 [0a-2](0a2-out-of-order-execution.md)）；从"寄存器名字会制造不必要的读写冲突"推出 register renaming；从"乱序执行必须看起来像顺序执行"推出 ROB。接着，从"下一条指令地址不总是顺序地址"推出分支预测和 BTB（详见 [0a-3](0a3-branch-prediction.md)）；从"标量执行浪费数据并行机会"推出 SIMD（详见 [0a-4](0a4-simd.md)）；从"内存比执行单元慢很多"推出 L1/L2/L3 Cache（详见 [0a-5](0a5-cache-hierarchy.md)）；从"多核各有私有缓存"推出 MESI（详见 [0a-6](0a6-mesi-coherence.md)）；从"一致性以 cache line 为粒度"推出伪共享（详见 [0a-7](0a7-false-sharing.md)）。
 
-AI Infra 的推导链还要多一层：GPU kernel 性能再好，也需要 CPU 准备数据、调度请求、执行控制面逻辑。DataLoader worker 解码图片、tokenizer 把字符串转 token、推理服务把请求拼 batch、训练框架做 rendezvous 和 checkpoint 元数据，这些都吃 CPU 微架构。如果 CPU 端的 cold path 被误预测拖慢，或者 16 个 worker 抢同一 cache line，GPU 会表现为 intermittently idle。此时增加 worker、增加线程池、把 pod CPU request 调高，不一定解决问题，甚至会让 L3 和 coherence 竞争更严重。正确的工程动作来自机制推导：先问热点在哪，再问瓶颈属于 pipeline、branch、SIMD、cache、coherence 中哪一类。
+AI Infra 的推导链还要多一层：GPU kernel 性能再好，也需要 CPU 准备数据、调度请求、执行控制面逻辑。DataLoader worker 解码图片、tokenizer 把字符串转 token、推理服务把请求拼 batch、训练框架做 rendezvous 和 checkpoint 元数据，这些都吃 CPU 微架构。如果 CPU 端的 cold path 被误预测拖慢，或者 16 个 worker 抢同一 cache line，GPU 会表现为 intermittently idle。此时增加 worker、增加线程池、把 pod CPU request 调高，不一定解决问题，甚至会让 L3 和 coherence 竞争更严重。正确的工程动作来自机制推导：先问热点在哪，再问瓶颈属于 pipeline、branch、SIMD、cache、coherence 中哪一类（详见综合 worked example [0a-8](0a8-cpu-worked-example.md)）。
 
 ### 绘 — 因果链路
 
@@ -27,34 +29,39 @@ mindmap
   root((CPU 微架构))
     有限物理延迟
       单指令不能瞬时完成
-        流水线
+        流水线 0a-1
         停顿与冒险
         CPI 推算
       独立指令可重叠
-        OoO
+        OoO 0a-2
         Register Renaming
         ROB
       控制流未来未知
-        BTB
+        BTB 0a-3
         分支预测器
         误预测代价
       数据并行可批量处理
-        SSE
-        AVX
-        AVX-512
+        SIMD 0a-4
+        SSE AVX AVX-512
+        ARM NEON SVE
       内存远慢于核心
-        L1 L2 L3
+        Cache 层级 0a-5
         Cache Line 64B
-        关联度
+        关联度 替换
       多核缓存需一致
-        MESI
+        MESI 0a-6
         Coherence Traffic
-        False Sharing
+        UPI Infinity Fabric
+      物理粒度 vs 语义粒度
+        伪共享 0a-7
+        padding alignas
+        per-thread aggregate
     AI Infra 影响
       DataLoader
       Tokenizer
       Decode Preprocessing
       Host-side Bottleneck
+      综合排障 0a-8
 ```
 
 ### 导 — 读完本章你应该能回答
@@ -67,289 +74,69 @@ mindmap
 6. MESI 如何保证多核缓存一致，为什么一致性流量会在多 socket 机器上放大？
 7. 如何从 `perf stat` 和 `perf c2c` 的现象推断 false sharing，而不是盲目加 worker？
 
-## 0a.2 流水线：5 段、停顿、冒险与 CPI
+## 0a.2 八个深挖章节导览
 
-经典 5 段流水线把一条指令拆成 IF（取指）、ID（译码/读寄存器）、EX（执行/地址计算）、MEM（访存）、WB（写回）。理想情况下，每个 cycle 都有一条指令完成，CPI 接近 1；但单条指令的 latency 并没有消失，只是多条指令的不同阶段被重叠。
+| 章节 | 标题 | 核心主题 | 何时优先读 |
+|---|---|---|---|
+| [0a-1](0a1-pipeline.md) | 流水线（Pipeline） | 5 段经典流水、深流水、冒险与 forwarding、CPI/IPC 推算、host-side 代码的真实 IPC | DataLoader / tokenizer / 控制面代码 IPC 偏低，想理解为什么 |
+| [0a-2](0a2-out-of-order-execution.md) | 乱序执行、Register Renaming 与 ROB | OoO 引擎结构、ROB 容量、LSQ、退役吞吐、为什么指针追逐让 OoO 失效 | 想从 perf 里 ROB stall / backend bound 信号反推根因 |
+| [0a-3](0a3-branch-prediction.md) | 分支预测 | BTB / RAS、2-bit 饱和计数器、GShare、TAGE、误预测代价、cold path 治理 | 推理服务 P99 抖动、长尾输入触发慢路径 |
+| [0a-4](0a4-simd.md) | SIMD：SSE / AVX / AVX-512 | ISA 演进、AVX-512 频率降级、自动向量化、intrinsics、对齐惩罚、host-side preprocessing 收益表 | 决定是否手写 SIMD、tokenizer 加速可行性评估 |
+| [0a-5](0a5-cache-hierarchy.md) | Cache 层级 | L1/L2/L3 延迟带宽、cache line 64B、关联度、替换策略、LLC slice、prefetcher | 数组 stride / NHWC 选型、worker 数量与 LLC 容量关系 |
+| [0a-6](0a6-mesi-coherence.md) | MESI 一致性协议 | 四状态机、snoop vs directory、MOESI/MESIF、跨 socket UPI 流量 | 多线程 atomic 计数器吞吐崩盘、跨 socket 性能异常 |
+| [0a-7](0a7-false-sharing.md) | 伪共享（False Sharing） | 物理粒度 vs 语义粒度、检测与修复、padding/alignas、per-thread + reduce | 加 worker 反而变慢、metric counter 写争用 |
+| [0a-8](0a8-cpu-worked-example.md) | 综合 Worked Example：端到端排障 | Top-Down 方法论、三个完整剧本、工具栈对照、SOP、反模式速查 | 想要把 0a-1 ~ 0a-7 知识落到一份 on-call runbook |
 
-```mermaid
-flowchart LR
-  I1[指令 i] --> IF1[IF] --> ID1[ID] --> EX1[EX] --> MEM1[MEM] --> WB1[WB]
-  I2[指令 i+1] --> IF2[IF] --> ID2[ID] --> EX2[EX] --> MEM2[MEM] --> WB2[WB]
-  I3[指令 i+2] --> IF3[IF] --> ID3[ID] --> EX3[EX] --> MEM3[MEM] --> WB3[WB]
-```
-
-冒险（hazard）有三类。数据冒险：后一条指令需要前一条结果，例如 load 后立刻使用。控制冒险：分支方向未确定，取指不知道下一条地址。结构冒险：两个阶段争同一个硬件资源。硬件可用 forwarding 减少等待，但 load-use、cache miss、除法等长延迟仍会产生 bubble。
-
-粗算 CPI 可用：
-
-```text
-CPI = base_CPI + stall_cycles_per_instruction
-    = 1.0 + load_use_rate * penalty
-          + branch_miss_rate * branch_penalty
-          + cache_miss_rate * miss_penalty
-```
-
-例如每 1000 条指令有 80 次 load-use stall，每次 1 cycle；40 次分支误预测，每次 15 cycle；10 次 L2 miss，每次 12 cycle，则 CPI 约 `1 + 80/1000 + 600/1000 + 120/1000 = 1.80`。工程边界是：这个模型只适合一阶估算。现代 CPU 是 superscalar、OoO、多级预测、多级 cache，真实 CPI 会被重叠执行隐藏一部分，但估算能帮助你判断"分支"和"cache"谁更值得先查。
-
-### 练习 0a-1（基础）：CPI 估算
-
-某 tokenizer 热点每 1000 条指令有 30 次分支误预测，每次 17 cycle；20 次 L2 miss，每次 14 cycle；base CPI 为 0.9。估算 CPI，并说明先优化分支还是访存。
-
-### 练习 0a-2（基础）：识别冒险
-
-给出 `load r1, [p]; add r2, r1, 1; cmp r2, 0; jne L`，标注可能出现的数据冒险和控制冒险。
-
-## 0a.3 乱序执行、Register Renaming 与 ROB
-
-流水线只解决"阶段重叠"，乱序执行解决"等待时别闲着"。当一条 load 因 cache miss 等待时，后面不依赖它的加法、比较、地址计算可以先执行。硬件通常把复杂指令译成 micro-op，进入 reservation station / scheduler，操作数就绪且执行单元可用时发射。
-
-寄存器重命名解决假依赖。`r1 = a+b; ...; r1 = c+d` 在程序文本里都写 `r1`，但第二次写并不依赖第一次写；硬件把架构寄存器映射到更多物理寄存器，消除 WAR/WAW 这类名字冲突。ROB 则记录每条已发射但未提交的指令，让结果可以乱序完成、顺序提交。如果 speculative path 错了，ROB 能丢弃未提交结果，恢复精确异常状态。
+## 0a.3 阅读路径建议
 
 ```mermaid
-flowchart LR
-  Decode[Decode / uop] --> Rename[Register Renaming]
-  Rename --> Dispatch[Dispatch]
-  Dispatch --> RS[Reservation Station]
-  RS --> EX[Execution Units]
-  EX --> ROB[Reorder Buffer]
-  ROB --> Commit[In-order Commit]
-  BranchMiss[Branch Miss] --> Flush[Flush Younger uops]
-  Flush --> Rename
+flowchart TD
+  Start[确定你的目标] --> Q1{是想全面建立<br/>CPU 微架构心智模型,<br/>还是只解决一个具体问题?}
+  Q1 -->|全面| Path1[按 0a-1 → 0a-8 顺序读]
+  Q1 -->|具体| Q2{问题属于哪一类?}
+  Q2 -->|host-side 代码 IPC 低| P2A[读 0a-1 + 0a-2,<br/>再回看 0a-5 cache]
+  Q2 -->|推理 P99 抖动 / cold path| P2B[读 0a-3,<br/>必要时跳到 0a-8 剧本二]
+  Q2 -->|tokenizer/preprocessing 慢| P2C[读 0a-4,<br/>再回看 0a-5 + 0a-1]
+  Q2 -->|加 worker 反而慢| P2D[直接读 0a-7,<br/>结合 0a-6 / 0a-5]
+  Q2 -->|跨 socket 性能塌方| P2E[读 0a-6 + 0a-5,<br/>再看 0a-8 剧本三]
+  Q2 -->|想做仪表盘/runbook| P2F[直接读 0a-8,<br/>按需回看前序章节]
 ```
 
-工程边界：OoO 喜欢"有很多独立工作"的代码，不喜欢长依赖链、不规则 pointer chasing 和频繁同步。DataLoader 中的 image decode、checksum、轻量 transform 往往有可并行空间；而 Python 层对象遍历、链表式 JSON 结构、跨线程原子计数可能让 OoO 难以隐藏延迟。遇到 CPU 热点时，不要只看 core utilization，要结合 IPC、stalled-cycles、cache miss 和 lock/contention 指标。
-
-### 练习 0a-3（基础）：假依赖
-
-解释 RAW、WAR、WAW 中哪些是真依赖，哪些可通过 register renaming 缓解。
-
-### 练习 0a-4（进阶）：ROB 的必要性
-
-如果 CPU 允许乱序完成但没有 ROB，异常、分支回滚和调试可见状态会遇到什么问题？
-
-## 0a.4 分支预测：BTB、预测器类型、误预测代价
-
-分支预测分两件事：是否跳，以及跳到哪里。BTB 缓存历史跳转目标，让取指单元不用等 EX 阶段才知道目标地址；方向预测器根据历史模式预测 taken/not-taken。简单预测器可以是一位/两位饱和计数器；更复杂的会结合局部历史、全局历史、间接分支目标和返回地址栈（Return Address Stack）。
-
-```mermaid
-sequenceDiagram
-  participant FE as Frontend
-  participant BTB as BTB/Direction Predictor
-  participant EX as Execute
-  participant ROB as ROB
-  FE->>BTB: 当前 PC 查询
-  BTB-->>FE: 预测方向和目标
-  FE->>FE: 沿预测路径取指
-  EX->>EX: 计算真实方向
-  EX-->>ROB: 正确则继续
-  EX-->>ROB: 错误则 flush younger uops
-```
-
-误预测代价来自已取指、译码、发射甚至执行的 speculative work 被清空，前端还要从正确地址重新填充流水线。现代核心上，代价常见为十几个到几十个 cycle，取决于流水线深度和前端状态。
-
-AI 场景里，cold path 的问题经常被低估。推理服务中 99% 请求走正常 decode path，但 1% 请求触发超长 prompt、特殊 tokenizer fallback、schema 校验错误、动态 LoRA 路由或异常日志，这些路径不常见，预测器没有稳定历史；同时它们通常伴随不规则内存访问，导致 branch miss 与 cache miss 叠加。优化边界是：不要为了消除所有分支把代码写到不可维护。优先处理热循环里的高频不可预测分支，例如 byte-level tokenizer 的字符分类、UTF-8 检查、采样 top-k 过滤，而不是低频错误处理。
-
-### 练习 0a-5（基础）：BTB 与方向预测
-
-说明 BTB 和方向预测器分别存什么信息。为什么只有方向预测还不够？
-
-### 练习 0a-6（进阶）：Cold path
-
-设计一个实验，比较推理服务正常请求和异常 schema 请求的 branch-misses 差异。写出你会采集的 `perf` 指标。
-
-## 0a.5 SIMD：SSE、AVX、AVX-512 与向量化判断
-
-SIMD（Single Instruction, Multiple Data）用一条指令处理多个元素。SSE 常见 128-bit，AVX/AVX2 常见 256-bit，AVX-512 为 512-bit。以 int8 数据为例，128-bit 可一次处理 16 个 byte，256-bit 为 32 个，512-bit 为 64 个。AI Infra 的 CPU 侧并不训练大矩阵，但大量 preprocessing 正好是 SIMD 擅长的"同一操作扫连续数组"。
-
-适合 SIMD 的条件：
-
-| 判断项 | 适合 | 不适合 |
+| 角色 | 推荐路径 | 估算时间 |
 |---|---|---|
-| 数据布局 | 连续数组、SoA | 指针链、对象数组 |
-| 控制流 | 每个元素同一逻辑 | 每个元素大量不同分支 |
-| 数据类型 | int8/int16/fp32 批处理 | 复杂变长对象 |
-| 边界处理 | 可批量处理主循环，尾部标量 | 每步都要跨对象检查 |
-| 收益来源 | 减少指令数、利用宽寄存器 | 被 cache miss 或锁主导 |
+| 训练平台工程师 | 全顺序阅读 0a-1 → 0a-8 | 8-10 小时（含练习） |
+| 推理 / serving 工程师 | 0a-3 → 0a-5 → 0a-7 → 0a-8 | 4-5 小时 |
+| 算法工程师（关心 host 性能） | 0a-1 → 0a-4 → 0a-5 → 0a-8（剧本部分） | 4 小时 |
+| SRE / on-call | 直接 0a-8，按报警类型回看对应章 | 2 小时打底，按需 |
+| 编译器 / 框架开发 | 0a-1 → 0a-2 → 0a-4 → 0a-5 → 0a-6 | 7 小时 |
 
-tokenizer 例子：扫描 UTF-8 字节流时，可以用 SIMD 批量判断 ASCII、空白符、标点候选，再把少量异常字节交给标量 fallback。decode preprocessing 例子：对 logits 后处理中的 mask、temperature scaling 前的简单过滤、batch 内长度数组计算，也可能受益于向量化。但若热点在 BPE merge 的哈希查找、Python 对象分配或跨线程队列，SIMD 化收益会被内存和解释器开销吞掉。
+> [!NOTE]
+> **本总览章不重复深挖内容**：流水线公式、MESI 状态机、perf 命令完整序列等都在对应深挖章里。这里只保留第一性原理推导链 + 章节导航。
 
-工程边界：AVX-512 可能触发频率下降，不同云实例和 BIOS 策略差异明显；容器内也未必暴露相同 ISA。生产代码要有 runtime dispatch，例如检测 `avx2`、`avx512bw` 后选择实现，并保留标量路径。
+> [!TIP]
+> **读完所有 8 章后应能独立完成的事**：拿到一份 `perf stat` 输出，能在 5 分钟内判断瓶颈属于 Front-End Bound、Back-End Bound、Bad Speculation 还是 Retiring；并对照 0a-8 §0a-8.5 的 Top-Down 决策树给出下一步排查动作。
 
-### 练习 0a-7（基础）：向量宽度
+## 0a.4 与 Part 0 其他章的关系
 
-AVX2 256-bit 处理 uint8 数组时，一条向量最多覆盖多少元素？如果数组长度是 100，主循环和尾部各处理多少？
+CPU 微架构是 Part 0 的第一根基。它向后串联：
 
-### 练习 0a-8（进阶）：Tokenizer SIMD
+- [0b 内存、虚拟内存与 IO](0b-memory-virtual-memory-and-io.md)：从 cache miss 自然过渡到 TLB miss、page cache、NUMA、PCIe DMA。0a-5 + 0b 联读最直接。
+- [0c 文件系统与存储内核](0c-filesystems-and-storage-internals.md)：checkpoint 写入、dataset 读取的 page cache 路径。
+- [0d 网络协议栈基础](0d-network-stack-fundamentals.md)：网络收发涉及内核态切换、softirq、CPU 亲和，与 0a-6/0a-7 一致性主题相关。
 
-为 ASCII 空白符检测设计一个 SIMD 主循环和标量 fallback 的边界条件列表。
+CPU 微架构同时是 Part 1-8 全部章节的隐式底座。例如：
 
-## 0a.6 Cache 层级：容量、带宽、延迟、Cache Line 与关联度
+- Ch 7 单机训练的 MFU 计算依赖你能在 host 端把 CPU 不变成瓶颈
+- Ch 8 数据并行的 NCCL 集合通信，host 端调度同样吃 CPU 微架构
+- Ch 15 推理 batching 调度循环和 KV Cache 管理常见的 false sharing 在 0a-7 / 0a-8 详细讨论
+- Ch 21 可观测性章节使用的 `perf` / DCGM 等工具，许多指标的物理含义在 0a 系列里建立
 
-Cache 的目标是用小而快的 SRAM 缓冲大而慢的内存。典型服务器 CPU 每核有私有 L1D/L1I 和 L2，多个核心共享 L3。不同代际差异很大，下表只给工程估算量级：
+## 深度参考阅读（总览级）
 
-| 层级 | 常见容量 | 共享范围 | 延迟量级 | 工程含义 |
-|---|---:|---|---:|---|
-| L1D | 32-64KB/核 | 单核私有 | ~4 cycles | 热循环工作集应尽量小 |
-| L2 | 512KB-2MB/核 | 单核私有 | ~10-20 cycles | 中等数组、decode buffer |
-| L3/LLC | 数十到数百 MB/socket | 多核共享 | ~35-80 cycles | worker 间竞争明显 |
-| DRAM | GB-TB | socket/node | ~80-150ns | NUMA 和带宽成为瓶颈 |
+- John L. Hennessy & David A. Patterson, *Computer Architecture: A Quantitative Approach*, 6th edition. 体系结构权威教科书，涵盖 ILP / Memory hierarchy / 多核一致性的完整量化分析。
+- Randal E. Bryant & David R. O'Hallaron, *Computer Systems: A Programmer's Perspective (CSAPP)*, 3rd edition. 程序员视角的 CPU 微架构、Cache、并发与一致性，与本系列读法最契合。
+- Agner Fog, *The Microarchitecture of Intel, AMD and VIA CPUs*. 逐代微架构细节，是优化指令选择和理解 perf 计数器最实用的参考。
+- Intel® 64 and IA-32 Architectures Optimization Reference Manual. 官方优化手册，与 perf 指标对应最准。
+- Brendan Gregg, *Systems Performance: Enterprise and the Cloud*, 2nd edition. 把 CPU 微架构知识嵌入到生产系统排障方法论的标杆。
 
-Cache line 常见 64B。即使只读 1 byte，硬件也会把所在 line 拉入 cache；顺序扫描因此高效，随机访问则浪费带宽。关联度（associativity）决定一个内存块可放入某组的几个位置。关联度太低会出现 conflict miss：工作集容量不大，但地址映射冲突导致反复驱逐。
-
-```mermaid
-flowchart TB
-  Core0[Core 0] --> L1A[L1D 32-64KB]
-  Core0 --> L2A[L2 0.5-2MB]
-  Core1[Core 1] --> L1B[L1D 32-64KB]
-  Core1 --> L2B[L2 0.5-2MB]
-  L2A --> L3[L3 / LLC Shared]
-  L2B --> L3
-  L3 --> DRAM[DRAM / NUMA Node]
-```
-
-AI 数据路径的边界：DataLoader worker 过多时，每个 worker 的 decode buffer、shuffle index、Python runtime 元数据会挤 L3；tokenizer 如果按 request 分散处理小字符串，可能前端开销和 cache miss 都高；把样本按长度 bucket、减少对象层级、批量处理连续 buffer，通常比盲目加线程更有效。
-
-### 练习 0a-9（基础）：Cache line 浪费
-
-随机读取 1 亿个 byte，且每次落在不同 64B cache line 上。估算从内存实际搬运了多少字节，和有效读取相比放大多少倍。
-
-### 练习 0a-10（进阶）：关联度冲突
-
-解释为什么一个只有 64KB 的热点数组仍可能在 32KB L1D 中表现很差。提示：考虑 set mapping 和访问步长。
-
-## 0a.7 MESI 协议：四状态、一致性流量与多 Socket
-
-多核各有私有 cache。如果 Core 0 修改了地址 X，Core 1 不能继续读旧值。MESI 用 cache line 粒度维护状态：
-
-| 状态 | 含义 |
-|---|---|
-| Modified | 本核有最新值，内存可能是旧值，其他核无有效副本 |
-| Exclusive | 本核独占且未修改，内存也是最新 |
-| Shared | 多核可读，内存最新 |
-| Invalid | 本核副本无效 |
-
-```mermaid
-stateDiagram-v2
-  [*] --> Invalid
-  Invalid --> Exclusive: Read miss, no sharer
-  Invalid --> Shared: Read miss, other sharer exists
-  Exclusive --> Modified: Local write
-  Shared --> Modified: Local write / invalidate others
-  Modified --> Shared: Remote read / write back or forward
-  Shared --> Invalid: Remote write
-  Modified --> Invalid: Remote write ownership
-```
-
-当多个核心读同一只读参数表，Shared 状态成本较低；当多个核心轮流写同一 line，line ownership 会在核心间反复迁移。多 socket 更贵，因为一致性消息要跨 UPI/Infinity Fabric 等 socket 互连，延迟和带宽都比片内差。训练节点上，CPU 侧的采样器、DataLoader、日志计数器、队列头尾指针如果被多个 socket 的线程频繁写，会让 GPU 等数据时出现周期性抖动。
-
-工程边界：MESI 保证的是硬件 cache coherence，不等价于语言层的 data race 安全。C++ 仍需要 atomic 和 memory order；Python 多进程 shared memory 也要考虑同步语义。排查时要区分 lock contention、true sharing 和 false sharing。
-
-### 练习 0a-11（进阶）：MESI 状态转移
-
-两个核心先后读同一地址，然后 Core 0 写该地址。描述这条 cache line 在两个核心上的 MESI 状态变化。
-
-## 0a.8 伪共享：DataLoader Worker Counter 实例
-
-伪共享发生在"逻辑上不同、物理上同一 cache line"。例如 16 个 DataLoader worker 各自更新 `worker_stats[i].num_samples`，每个 counter 8B，连续数组中 8 个 counter 正好落在一条 64B line。worker 0 写 counter 0 会让包含 counter 1-7 的 line 在其他核心失效；worker 1 写 counter 1 又把 ownership 拉过去。它们没有共享变量，却共享了 cache line。
-
-```mermaid
-flowchart LR
-  subgraph Line[64B Cache Line]
-    C0[counter0 8B]
-    C1[counter1 8B]
-    C2[counter2 8B]
-    C3[counter3 8B]
-    C4[counter4 8B]
-    C5[counter5 8B]
-    C6[counter6 8B]
-    C7[counter7 8B]
-  end
-  W0[Worker 0 write] --> C0
-  W1[Worker 1 write] --> C1
-  W2[Worker 2 write] --> C2
-  W0 -. invalidate .-> W1
-  W1 -. ownership transfer .-> W2
-```
-
-解决方式是 padding/alignment：让每个高频写 counter 独占一条 cache line，或改为 per-thread local counter，周期性汇总。C++ 可用 `alignas(64)`，Rust 可用 cache-padded 类型，Python 多进程可避免把高频写指标放在紧凑 shared array 中。也可以降低写频率，例如每处理 128 个 sample 才更新一次共享指标。
-
-工程边界：padding 会增加内存占用，适合高频写、小对象、跨核心更新的场景；对只读表、低频指标、已经被锁开销主导的路径，padding 不是第一优先级。先用 profiler 证明 line bouncing，再改布局。
-
-### 练习 0a-12（设计）：Counter 布局
-
-为 32 个 worker 设计一个统计结构，要求每个 worker 高频写自己的 `samples`、`bytes`、`errors`，每秒汇总一次。说明内存布局和同步策略。
-
-## 0a.9 Worked Example：DataLoader 8 Worker 到 16 Worker 反而变慢
-
-现象：一台 8 卡训练节点，双 socket，64 个物理核心，数据在本地 NVMe，单卡 H100。训练 ResNet-like 图像模型时，`num_workers=8` 的吞吐是 6,400 samples/s，GPU utilization 在 91%-95%；把 `num_workers=16` 后吞吐降到 5,300 samples/s，GPU utilization 周期性掉到 65%，但 `iostat` 显示 NVMe 带宽只有 2.1GB/s，远低于设备上限，网络也无异常。直觉上 worker 变多不该变慢，所以排查从 CPU 侧开始。
-
-第一步确认是否真的卡在 host side：
-
-```bash
-nvidia-smi dmon -s pucm
-pidstat -t -p $(pgrep -f train.py) 1
-perf stat -a -e cycles,instructions,branches,branch-misses,cache-references,cache-misses \
-  -- sleep 30
-```
-
-结果：8 worker 时全机 IPC 约 1.35，cache-miss-rate 约 8%，branch-miss-rate 约 3%；16 worker 时 IPC 降到 0.72，cache-miss-rate 升到 22%，branch-miss-rate 只有 4%。这说明主要问题不像分支预测，而像缓存/一致性。`pidstat` 显示 16 个 worker 分散在两个 socket 上，CPU 利用率很高但 batch ready queue 经常为空，训练主进程在等数据。
-
-第二步查 cache line bouncing：
-
-```bash
-perf c2c record -ag -- python train.py --num-workers 16
-perf c2c report --stdio | head -80
-perf top -g --sort comm,dso,symbol
-```
-
-`perf c2c` 报告里，HITM（Hit Modified）集中在一个 shared memory 区域，符号对应 `WorkerStats::processed_samples` 和 `WorkerStats::processed_bytes`。代码里统计结构类似：
-
-```cpp
-struct WorkerStats {
-  std::atomic<uint64_t> processed_samples;
-  std::atomic<uint64_t> processed_bytes;
-};
-std::vector<WorkerStats> stats(num_workers);
-```
-
-每个 `WorkerStats` 16B，4 个 worker 的统计落在同一条 64B cache line。16 worker 分布到更多核心甚至跨 socket 后，每处理一个 sample 都更新两个 atomic，导致同一批 cache line 在核心间反复迁移。8 worker 时争用还有限，16 worker 时 coherence traffic 放大，L3 和 socket 互连被无效化消息占用，worker 虽然更多，但有效 decode 工作更少。
-
-第三步做最小修复而不是重写 DataLoader：
-
-```cpp
-struct alignas(64) WorkerStats {
-  std::atomic<uint64_t> processed_samples;
-  std::atomic<uint64_t> processed_bytes;
-  char pad[64 - 16];
-};
-static_assert(sizeof(WorkerStats) == 64);
-```
-
-同时把更新频率从每个 sample 一次改成每 64 个 sample 累加到本地变量后 flush 一次。复测：16 worker 吞吐从 5,300 samples/s 回到 7,100 samples/s，IPC 提升到 1.18，cache-miss-rate 降到 11%，`perf c2c` 的 HITM 热点消失。再把 worker 绑到靠近 NVMe/GPU 所在 NUMA node 的核心：
-
-```bash
-numactl --cpunodebind=0 --membind=0 python train.py --num-workers 16
-```
-
-吞吐进一步到 7,350 samples/s，但 24 worker 只到 7,380 samples/s，并且 p99 batch ready latency 变差。因此最终配置选择 16 worker、padded stats、每 64 sample 汇总、NUMA 亲和固定。推理链是：GPU idle 不是 GPU 问题；磁盘未满说明不是 IO 带宽；branch miss 未显著升高排除主要控制流问题；cache miss 和 HITM 暴涨指向 coherence；结构体布局验证 false sharing；padding 与降频更新降低 line ownership transfer；NUMA 绑定减少跨 socket 成本。这个例子也说明，CPU 微架构知识的价值不是背术语，而是在"多加线程变慢"时能把现象压缩成可验证假设。
-
-### 练习 0a-13（设计）：完整排查 Runbook
-
-把上面的 worked example 改写成一页值班 runbook：触发条件、采集命令、判断阈值、可能结论和回滚方案。
-
-### 练习 0a-14（设计）：Tokenizer Host Bottleneck
-
-某 LLM 推理服务 GPU decode 很快，但 CPU tokenizer 让端到端 p99 增加 20ms。设计一个优化方案，至少覆盖分支预测、SIMD、cache locality、线程数和 fallback path。
-
-## 深度参考阅读
-
-1. John L. Hennessy, David A. Patterson, *Computer Architecture: A Quantitative Approach*.
-2. Intel, *Intel 64 and IA-32 Architectures Optimization Reference Manual*.
-3. AMD, *Software Optimization Guide for AMD EPYC Processors*.
-4. Agner Fog, *The microarchitecture of Intel, AMD and VIA CPUs*；以及 instruction tables。
-5. Ulrich Drepper, *What Every Programmer Should Know About Memory*.
-6. Brendan Gregg, *Systems Performance*；重点阅读 CPU profiling、cache、perf 章节。
-7. Linux `perf` 文档：`perf stat`、`perf record`、`perf c2c`、`perf mem`。
-8. LLVM Auto-Vectorization 文档与 `-Rpass=loop-vectorize` / `-fopt-info-vec` 相关编译器报告。
-9. Facebook/Meta folly `CacheLocality`、Rust `crossbeam_utils::CachePadded` 等工程实现。
-10. PyTorch DataLoader、tokenizers、vLLM preprocessing 相关源码，用本章模型阅读热点路径。
+> 各深挖章节末尾还有面向具体主题的进一步深读列表。本总览只列共用的 5 本基础参考。

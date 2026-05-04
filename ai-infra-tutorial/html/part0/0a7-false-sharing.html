@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0a-7 章 · 伪共享 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0a7" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0a-7 章 · 伪共享（False Sharing）</h1>
+<p class="sub">从“硬件以 cache line（64B）为粒度维护一致性，而程序员以单变量为粒度思考共享”这一不可化简的粒度差出发，建立 false sharing 的物理机理、检测信号与修复套路，落到 DataLoader、metric counter、multi-LoRA inference 等真实事故的完整排障链路。</p>
+<div class="chips"><span class="chip">False Sharing</span><span class="chip">Cache Line</span><span class="chip">MESI</span><span class="chip">perf c2c</span><span class="chip">HITM</span><span class="chip">alignas(64)</span><span class="chip">NUMA</span><span class="chip">DataLoader</span></div>
+<div class="note"><strong>不可化简的问题：</strong>当“共享语义”以单变量为粒度、而硬件一致性以 cache line 为粒度时，这条粒度差能在多核并行下放大成多大的真实代价，又应如何在不破坏内存效率的前提下消除？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：伪共享</a></li>
+<li><a class="anchor" href="#s2">物理机理：cache line 粒度 vs 程序员的语义粒度</a></li>
+<li><a class="anchor" href="#s3">真共享 vs 伪共享 vs data race</a></li>
+<li><a class="anchor" href="#s4">经典数据结构反例</a></li>
+<li><a class="anchor" href="#s5">检测：perf c2c、HITM 信号、throughput 曲线</a></li>
+<li><a class="anchor" href="#s6">修复：alignas(64) padding 与按 line 切分</a></li>
+<li><a class="anchor" href="#s7">高级修复：write combining、批量更新、thread-local 累加</a></li>
+<li><a class="anchor" href="#s8">NUMA 与伪共享叠加</a></li>
+<li><a class="anchor" href="#s9">容器/cgroup 场景的意外伪共享</a></li>
+<li><a class="anchor" href="#s10">AI Infra 视角：DataLoader / metric / multi-LoRA 真实事故</a></li>
+<li><a class="anchor" href="#s11">工程操作 SOP</a></li>
+<li><a class="anchor" href="#s12">Worked Example：Multi-LoRA per-adapter counter</a></li>
+<li><a class="anchor" href="#s13">练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：伪共享</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>伪共享要回答的不是“什么是 cache line”，也不是“加 padding 就好”。它要回答的不可化简问题是：当程序员关心的“共享语义”以单变量为粒度，而硬件维护一致性以 cache line（典型 64B）为粒度时，这条粒度差能在多核并行下放大成多大的真实代价，又应该如何在不破坏内存效率的前提下消除？</p>
+<p>这条问题不可化简的原因有三层。第一，硬件不可能把一致性维护粒度做到字节级——目录开销、流量开销、tag SRAM 开销都会爆炸；64B（部分 ARM 为 128B）是芯片设计权衡的结果，不是软件能改的参数。第二，程序员不可能事先知道哪些变量会被分到哪条 cache line——结构体字段顺序、<code>std::vector&lt;T&gt;</code> 的连续布局、Python <code>array.array</code> 的 stride、shared memory 段的对齐方式，都会把“逻辑上独立的状态”压在同一条 line 上。第三，伪共享的代价不是常数：单核独占时为零，多核同片内时几个 cycle，跨 socket 时跳到上百 ns，叠加 NUMA 远端访问会再放大。这意味着同一段代码在 8c 开发机和 64c 双路生产机上的行为完全不同——开发环境根本测不出来。</p>
+<p>更隐蔽的是它和 data race 不同。data race 会触发 sanitizer，atomic 写也能保证语义正确；但 atomic 不解决 cache line 在核心间反复迁移的问题——反而因为 atomic 的 RMW 必然要拿到 Modified 状态，恰好把伪共享代价放到最大。所以这是一个“程序正确、编译器无法警告、ASan/TSan 也不报”的性能 Bug，只能靠对粒度差的物理直觉 + 针对性的硬件 profiling 才能识别。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“硬件以 cache line 为粒度维护一致性”推出：任何写操作都必须先把整条 line 拉成 Modified 状态，远端核心持有的副本被 invalidate；从“多核高频写不同变量但同一 line”推出 line ownership 的反复迁移（cache line bouncing）；从“迁移路径经过 L3 甚至跨 socket 互连”推出代价随拓扑距离非线性放大。</p>
+<p>从“找不出锁、找不出共享变量”推出需要新的诊断信号：传统 <code>perf stat</code> 看到的是 cache-misses 升高、IPC 下降，但无法定位到具体 line；于是 Intel 引入 HITM（Hit Modified）事件，<code>perf c2c</code> 把它聚合到地址、符号、源行级别。从“代价集中在少数 hot line”推出修复策略：要么把每个高频写者放到独立 line（padding/<code>alignas(64)</code>），要么把高频写聚合成低频写（thread-local + 周期 reduce），要么改变共享语义本身（消除“必须每次都更新全局”的假设）。</p>
+<p>从“NUMA 让远端 line 取回成本数倍于本地”推出：NUMA 与伪共享叠加时，padding 的收益会被进一步放大；从“容器/cgroup 限制 CPU set 但不限制 line 共享”推出 pod 间也可能因 noisy neighbor 出现伪共享类问题；从“AI 训练/推理的 DataLoader、metric counter、batch slot 都是高频写小对象”推出这类 bug 在 AI 平台是高发场景，而非教科书示例。</p>
+<div class="note"><strong>排障翻译：</strong>“加线程吞吐反降”不是玄学，而是 cache line 在核心间反复迁移的可观测现象；只要有 <code>perf c2c</code> 的 HITM 数据，就能从 IPC 下降一路追到具体源行的字段。</div>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((伪共享))
+    粒度差 (语义 vs 物理)
+      硬件 cache line 64B
+      程序变量字节级
+      MESI 必须按 line invalidate
+    代价放大
+      同片内 ~30-50 cycles
+      跨 socket ~100-300 cycles
+      NUMA 远端再 2-5x
+      atomic RMW 强制 Modified
+    检测信号
+      perf c2c HITM
+      cache-misses up + IPC down
+      throughput vs cores 反向曲线
+      pidstat 高 CPU 低进展
+    修复
+      alignas 64 padding
+      cacheline_aligned_in_smp
+      per-thread local + reduce
+      write combining
+      改共享语义
+    AI Infra 反例
+      DataLoader stats array
+      metric counter 紧凑布局
+      ring buffer head/tail 同 line
+      multi-LoRA per-adapter counter
+      batch slot 状态位
+    叠加场景
+      跨 NUMA
+      容器 CPU 错绑
+      Python multiprocessing shared array</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>伪共享、真共享、data race 三者在硬件层和语义层分别是什么关系？为什么 atomic 能修 data race 但不能修伪共享？</li>
+<li>64B cache line 是怎么把“我只写 8B”放大成“整条 line 在核心间反复迁移”的？跨 socket 时代价为什么再放大 5-10 倍？</li>
+<li><code>perf c2c</code> 看到 HITM 集中在某地址时，怎么从地址追到具体源行和具体结构体字段？</li>
+<li><code>alignas(64)</code>、<code>__cacheline_aligned_in_smp</code>、Rust <code>CachePadded</code>、folly <code>cacheline_aligned</code> 之间有什么区别？什么时候 padding 会变成“治病也加病”？</li>
+<li>thread-local 累加 + 周期 reduce 是如何把高频写“聚合掉”的？这种修复对内存占用、读取实时性的代价是什么？</li>
+<li>为什么把 16 个 DataLoader worker 的 stats 放在 <code>std::vector&lt;WorkerStats&gt;</code> 里在 8c 开发机看不出问题，但在双路 64c 训练节点上吞吐反而下降？</li>
+<li>一个值班工程师在收到“加线程吞吐反降”的告警后，应该按什么顺序采集哪些指标，才能在 30 分钟内定位到伪共享而不是错怪 GPU？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 物理机理：cache line 粒度 vs 程序员的语义粒度</h2>
+<p>回到硬件本身。一条 64B cache line 在 MESI 协议下只能整体处于 M/E/S/I 之一。当 Core 0 要写这条 line 上的任何 1 bit，它都必须先把状态升级到 Modified；升级动作要求广播 invalidate，让其他持有 Shared 副本的核心把自己的副本标记为 Invalid。其他核心下一次访问这条 line（哪怕只是读不同字节）时，必须从持有 Modified 的核心把整条 line 取回（cache-to-cache transfer），转入 Shared 或 Modified 状态。</p>
+<p>这个机制对“真共享”是合理的：多个核心确实在协作维护同一份数据。但对“伪共享”来说就是纯粹的浪费——两个核心写的是 line 上互不相干的两个 8B counter，硬件却必须把整条 line 在它们之间反复搬。每次搬运的代价：</p>
+<table>
+<tr><th>拓扑距离</th><th>典型代价（cycles）</th><th>折算 ns（@3GHz）</th><th>主要来源</th></tr>
+<tr><td>同核 L1</td><td>~4</td><td>~1.3</td><td>命中本核 L1，零迁移</td></tr>
+<tr><td>同 socket 跨核 L2/L3</td><td>~30-80</td><td>~10-26</td><td>L3 转发 + 目录查询</td></tr>
+<tr><td>跨 socket</td><td>~150-400</td><td>~50-130</td><td>UPI/IF 互连 + 远端 cache 查询</td></tr>
+<tr><td>跨 NUMA + 远端被驱逐</td><td>~300-800+</td><td>~100-260+</td><td>互连 + 可能回 DRAM</td></tr>
+</table>
+<p>注意：原子 RMW（如 <code>lock xadd</code>、<code>compare_exchange</code>）必然把 line 拉到 Modified 状态。所以 <code>std::atomic&lt;uint64_t&gt;</code> 数组的伪共享，等价于“每次自增都强制 cache line ownership 转移”——是最坏情况。普通非原子写在某些 store buffer + invalidation queue 优化下还能批量化，atomic 则没有这个优化空间。</p>
+<pre class="mermaid">flowchart LR
+  subgraph Line64B["64B cache line"]
+    A["counter[0] (Core 0 写)"]
+    B["counter[1] (Core 1 写)"]
+    C["counter[2] (Core 2 写)"]
+    D["...其余 5 个 counter"]
+  end
+  C0[Core 0] -->|"lock xadd"| A
+  C1[Core 1] -->|"lock xadd"| B
+  C2[Core 2] -->|"lock xadd"| C
+  C0 -. invalidate .-> C1
+  C1 -. invalidate .-> C2
+  C2 -. invalidate .-> C0</pre>
+<div class="note"><strong>关键直觉：</strong>硬件不知道“counter[0] 和 counter[1] 是不同变量”，它只看到“同一条 line 上的字节被多个核心写”。语义层的“独立”在物理层是“共享”——这就是 false sharing 的“false”。</div>
+<div class="warn"><strong>工程边界：</strong>cache line 大小不是可移植的常数。x86 通常 64B，部分 ARM（如 Apple M1/M2 P-core）是 128B，IBM POWER 是 128B。<code>std::hardware_destructive_interference_size</code> 在 C++17 里给出了平台值，但 GCC 长期对此有 ABI 警告；最稳妥的写法仍是手写 <code>alignas(64)</code> 配合编译期 <code>static_assert(sizeof(T) % 64 == 0)</code>。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. 真共享 vs 伪共享 vs data race：三个常被混淆的概念</h2>
+<p>值班和 code review 时，这三个概念经常被混着用。它们的区别在硬件层、语义层、修复手段三个维度上都不同：</p>
+<table>
+<tr><th>维度</th><th>真共享（True Sharing）</th><th>伪共享（False Sharing）</th><th>Data Race</th></tr>
+<tr><td>物理层</td><td>多核读写同一变量同一 line</td><td>多核读写不同变量、同一 line</td><td>多核无序读写同一变量</td></tr>
+<tr><td>语义层</td><td>程序确实需要共享状态</td><td>程序不需要共享，是布局意外</td><td>程序对顺序/原子性有错误假设</td></tr>
+<tr><td>编译器/静态分析</td><td>通常合理，不会警告</td><td>不会警告</td><td>TSan / clang -fsanitize=thread 可检</td></tr>
+<tr><td>性能现象</td><td>line bouncing，本身是设计代价</td><td>line bouncing，纯浪费</td><td>偶发数据损坏，未必慢</td></tr>
+<tr><td>正确性</td><td>正确（前提是同步对）</td><td>正确</td><td>错误</td></tr>
+<tr><td>主要修复</td><td>减少共享频率、批处理、分片</td><td>padding / 对齐 / per-thread 累加</td><td>加锁 / atomic / memory order</td></tr>
+<tr><td>atomic 的作用</td><td>必要</td><td>无效甚至更糟</td><td>必要</td></tr>
+</table>
+<div class="danger"><strong>常见混淆 1：</strong>把伪共享当 data race 修——给紧凑布局的 counter 数组加 <code>std::atomic</code>，结果 throughput 不升反降，因为 atomic 让伪共享代价从“批量 invalidate”变成“每次必 Modified 转移”。正确做法是先做 padding 再决定要不要 atomic。</div>
+<div class="warn"><strong>常见混淆 2：</strong>把真共享当伪共享修——给一个 ref count 加 padding 没意义，因为多核就是要竞争同一个 64-bit 计数器；这种情况要么用分片计数（per-CPU counter + 周期 sum），要么减少 ref count 操作频率，padding 不解决问题。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. 经典数据结构反例：thread-local stats、ring buffer、原子计数器</h2>
+<p>下面三类结构在 AI Infra 代码里出现频率最高，每一类都有“看起来很合理”的写法实际上构成伪共享。</p>
+<h3>反例 1：thread-local stats 写共享数组</h3>
+<pre><code class="language-cpp">struct WorkerStats {
+  uint64_t samples;
+  uint64_t bytes;
+  uint64_t errors;
+};
+std::vector&lt;WorkerStats&gt; stats(num_workers);  // 每个 24B，连续布局
+// worker i 的循环中：
+stats[i].samples++;  // 看似 thread-local，实际多个 worker 的 stats 落同一 line</code></pre>
+<p>24B 对象 → 一条 64B line 能装 2-3 个 worker 的 stats。8 worker 时分布在 3-4 条 line，16 worker 时分布在 6-8 条 line。每个 worker 每个 sample 都写自己的 <code>samples</code>，触发整条 line invalidate 邻居。</p>
+<h3>反例 2：ring buffer 的 head 和 tail 在同一 line</h3>
+<pre><code class="language-cpp">struct RingBuffer {
+  std::atomic&lt;size_t&gt; head;  // 生产者写
+  std::atomic&lt;size_t&gt; tail;  // 消费者写
+  T* data;
+};</code></pre>
+<p><code>head</code> 和 <code>tail</code> 各 8B，紧挨着放，必然在同一 64B line。生产者写 head 让消费者持有的 line 失效；消费者写 tail 又让生产者的 line 失效。一条无锁 SPSC queue 的所有性能优势全部被这两个字段抵消。Linux kernel 的 <code>kfifo</code>、folly 的 <code>ProducerConsumerQueue</code> 都显式给 head 和 tail 各自 padding 到独立 line。</p>
+<h3>反例 3：原子计数器分布</h3>
+<pre><code class="language-cpp">std::array&lt;std::atomic&lt;uint64_t&gt;, 64&gt; per_cpu_counters;  // 每个 8B</code></pre>
+<p>64 个 counter × 8B = 512B，正好占 8 条 line。如果意图是“每个 CPU 写自己的索引”，但调度让多个线程映射到相邻索引，就会出现“以为分片了实际还在同一 line”。典型修复是 <code>std::array&lt;CachePadded&lt;std::atomic&lt;uint64_t&gt;&gt;, 64&gt;</code>，每个 counter 独占一条 line，总占用 4KB——内存换吞吐。</p>
+<table>
+<tr><th>反例</th><th>表面意图</th><th>实际后果</th><th>最小修复</th></tr>
+<tr><td>stats 数组</td><td>每 worker 一份独立计数</td><td>多 worker 共享 line</td><td>结构体 <code>alignas(64)</code> + 尾部 padding</td></tr>
+<tr><td>ring buffer head/tail</td><td>无锁 SPSC</td><td>生产/消费侧互相 invalidate</td><td>head 和 tail 各 padding 到独立 line</td></tr>
+<tr><td>per-CPU 原子计数</td><td>分片消除竞争</td><td>相邻索引共享 line</td><td><code>CachePadded&lt;atomic&lt;T&gt;&gt;</code></td></tr>
+<tr><td>metric counter map</td><td>紧凑指标聚合</td><td>hot key 与 cold key 同 line</td><td>hot key 独立 padding，cold key 紧凑</td></tr>
+<tr><td>batch slot 状态位</td><td>bitmap 节省内存</td><td>多 worker 写不同 bit 同 line</td><td>状态位扩成 cache line 对齐结构</td></tr>
+</table>
+</section>
+
+<section class="section" id="s5">
+<h2>5. 检测：perf c2c、HITM 信号、throughput vs cores 曲线</h2>
+<p>伪共享没有专属的“是/否”指标，必须从多个信号交叉确认。最直接的硬件信号是 HITM（Hit Modified）——本核访问 line 时命中，但发现该 line 在远端核心处于 Modified 状态，必须先把数据从远端取回。HITM 数量大且集中在少数地址，几乎一定是真/伪共享。</p>
+<h3>工具 1：<code>perf c2c</code>（cache-to-cache 分析）</h3>
+<pre><code class="language-bash"># 录制 30 秒，含调用栈
+perf c2c record -F 4000 -ag -- sleep 30
+# 报告：按 HITM 排序，关注 LLC Misses to Remote Cache (HITM)
+perf c2c report --stdio | less
+# 关键列：
+#   Total records / Local-Hitm / Remote-Hitm / data address / cacheline / symbol / offset</code></pre>
+<p>报告里要看的字段：</p>
+<ul>
+<li><code>Cacheline</code>：物理 cache line 地址，同一 line 上多个 offset 都有 HITM 就是伪共享强信号。</li>
+<li><code>Tot-Hitm</code> 占比：单条 line 占全机 HITM 5%+ 就值得深挖。</li>
+<li><code>Symbol + Offset</code>：定位到具体结构体字段；offset 在 0-63 内分布说明同 line 多字段竞争。</li>
+<li><code>Node</code>：跨 NUMA node 的 HITM 比同 node 贵 3-10 倍。</li>
+</ul>
+<h3>工具 2：<code>perf stat</code> 的间接信号</h3>
+<pre><code class="language-bash">perf stat -a -e cycles,instructions,cache-references,cache-misses,\
+mem_load_l3_miss_retired.remote_hitm,\
+mem_inst_retired.lock_loads -- sleep 30</code></pre>
+<p>看：<code>remote_hitm</code> 数量（直接信号）、<code>lock_loads</code>（atomic RMW 频率）、<code>cache-misses / cache-references</code>（伪共享时通常 &gt; 20%）、IPC（伪共享下常 &lt; 1.0）。</p>
+<h3>工具 3：throughput vs cores 曲线</h3>
+<p>最便宜的“不打 perf 也能看”的信号：固定 workload，把并发线程数从 1 扫到 32 或 64，画 throughput 曲线。</p>
+<pre class="mermaid">flowchart LR
+  start[发现性能问题] --> q1{加线程吞吐<br>是否上升?}
+  q1 -->|线性上升| ok[没有伪共享]
+  q1 -->|很快平台| q2{CPU 利用率<br>是否高?}
+  q2 -->|低| io[IO/锁/外部依赖]
+  q2 -->|高 IPC 低| q3{perf c2c HITM<br>是否集中?}
+  q3 -->|是| fs[伪共享 / 真共享]
+  q3 -->|否| q4{branch-misses<br>是否高?}
+  q4 -->|是| br[分支预测问题]
+  q4 -->|否| other[其他后端 stall]
+  fs --> q5{符号是否同一<br>变量?}
+  q5 -->|是| true_share[真共享:减频/分片]
+  q5 -->|否| false_share[伪共享:padding]</pre>
+<table>
+<tr><th>检测信号</th><th>来源</th><th>伪共享典型值</th><th>解读</th></tr>
+<tr><td>Remote HITM</td><td><code>perf c2c</code></td><td>单 line &gt; 全机 5%</td><td>强信号，定位到结构体</td></tr>
+<tr><td>cache-miss-rate</td><td><code>perf stat</code></td><td>&gt; 20% 且 IPC &lt; 1.0</td><td>弱信号，需配合 c2c</td></tr>
+<tr><td><code>lock_loads</code></td><td><code>perf stat</code></td><td>与 sample 数同数量级</td><td>atomic 热点，常伴随伪共享</td></tr>
+<tr><td>throughput vs cores</td><td>benchmark</td><td>N 线程后反向下降</td><td>强信号，最容易复现</td></tr>
+<tr><td>pidstat CPU%</td><td><code>pidstat -t</code></td><td>高 CPU + 低 progress</td><td>不直接，需排除其他原因</td></tr>
+<tr><td><code>numastat</code></td><td>NUMA 工具</td><td>remote 访问比例高</td><td>叠加 NUMA 时放大</td></tr>
+</table>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 修复：alignas(64) padding、cacheline_aligned_in_smp、按 cache line 切分</h2>
+<p>定位到 hot line 后，最小修复有三种思路。</p>
+<h3>思路 1：结构体 <code>alignas</code> + 尾部 padding（C++）</h3>
+<p>Before：</p>
+<pre><code class="language-cpp">struct WorkerStats {
+  std::atomic&lt;uint64_t&gt; samples;   // 8B
+  std::atomic&lt;uint64_t&gt; bytes;     // 8B
+};                                  // sizeof = 16，4 个落同一 line
+std::vector&lt;WorkerStats&gt; stats(N);</code></pre>
+<p>After：</p>
+<pre><code class="language-cpp">struct alignas(64) WorkerStats {
+  std::atomic&lt;uint64_t&gt; samples;
+  std::atomic&lt;uint64_t&gt; bytes;
+  char _pad[64 - 2 * sizeof(std::atomic&lt;uint64_t&gt;)];
+};
+static_assert(sizeof(WorkerStats) == 64);
+static_assert(alignof(WorkerStats) == 64);
+std::vector&lt;WorkerStats&gt; stats(N);  // 每个独占 64B</code></pre>
+<p>注意：<code>std::vector&lt;T&gt;</code> 的分配器在 C++17 之前不保证 over-aligned 类型对齐；C++17 起 <code>std::vector</code> 会用对齐感知的 allocator。要在更老的代码里用，要么用 <code>aligned_alloc</code> 自己管，要么用 <code>boost::alignment::aligned_allocator</code>。</p>
+<h3>思路 2：Linux kernel <code>____cacheline_aligned_in_smp</code></h3>
+<pre><code class="language-c">struct worker_stats {
+    atomic64_t samples;
+    atomic64_t bytes;
+} ____cacheline_aligned_in_smp;</code></pre>
+<p><code>____cacheline_aligned_in_smp</code> 在 SMP 内核下展开为 <code>__attribute__((aligned(SMP_CACHE_BYTES)))</code>，UP 内核下为 no-op，省单核场景的内存。kernel 的 per-CPU 变量天然解决伪共享（每个 CPU 一份），但跨 CPU 共享的统计结构仍要显式对齐。</p>
+<h3>思路 3：按 cache line 切分布局</h3>
+<p>不改结构体，改容器。Before 用 <code>std::vector&lt;Counter&gt;</code> 紧凑数组，After 用“二级数组”：每个 worker 一个独立分配的 64B-aligned 块。Rust 用 <code>crossbeam_utils::CachePadded&lt;T&gt;</code>：</p>
+<pre><code class="language-rust">use crossbeam_utils::CachePadded;
+let counters: Vec&lt;CachePadded&lt;AtomicU64&gt;&gt; =
+    (0..n).map(|_| CachePadded::new(AtomicU64::new(0))).collect();</code></pre>
+<table>
+<tr><th>平台/语言</th><th>推荐写法</th><th>备注</th></tr>
+<tr><td>C++17+</td><td><code>alignas(64)</code> + 尾部 <code>char[]</code> padding + <code>static_assert</code></td><td><code>hardware_destructive_interference_size</code> 有 ABI 警告</td></tr>
+<tr><td>Linux kernel</td><td><code>____cacheline_aligned_in_smp</code> 或 <code>DEFINE_PER_CPU</code></td><td>per-CPU 是更优解</td></tr>
+<tr><td>Rust</td><td><code>crossbeam_utils::CachePadded&lt;T&gt;</code></td><td>自动处理平台差异</td></tr>
+<tr><td>Java</td><td><code>@Contended</code>（JDK 8+，需 <code>-XX:-RestrictContended</code>）</td><td>JVM 自动 padding</td></tr>
+<tr><td>Go</td><td>手动 padding 字段，或 <code>runtime.LockOSThread</code> + per-G 数据</td><td>没有标准 attribute</td></tr>
+<tr><td>Python</td><td>不要把高频写指标放在 <code>multiprocessing.Array</code> 紧凑布局；改用 <code>Manager</code> 对象或独立 <code>Value</code></td><td>GIL 让单进程内伪共享不显著，多进程才严重</td></tr>
+</table>
+<div class="warn"><strong>工程边界：</strong>padding 把 16B 撑成 64B 是 4 倍内存放大；如果你有 100 万个对象都加 padding，会从 16MB 变 64MB。padding 只对“高频写、跨核竞争”的小对象划算；对只读、低频写、大对象（已经远超 line）都不要无脑加。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 高级修复：write combining、批量更新、thread-local 累加 + 周期 reduce</h2>
+<p>padding 解决的是“同 line 不同核”，但有些场景同 line 也只有一个核写，伪共享不是主因——主因是写本身太频繁。这时要从“减少写”的方向修。</p>
+<h3>手法 1：thread-local 累加 + 周期 reduce</h3>
+<pre><code class="language-cpp">thread_local uint64_t local_samples = 0;
+thread_local uint64_t local_bytes = 0;
+
+void on_sample(size_t bytes) {
+    ++local_samples;
+    local_bytes += bytes;
+    if ((local_samples &amp; 0x3F) == 0) {  // 每 64 次 flush 一次
+        global_stats.samples.fetch_add(64, std::memory_order_relaxed);
+        global_stats.bytes.fetch_add(local_bytes, std::memory_order_relaxed);
+        local_bytes = 0;
+    }
+}</code></pre>
+<p>代价：监控指标延迟最多 64 个 sample；线程退出时要 flush 残余。收益：全局 atomic 写频率降低 64 倍，cache line 迁移频率随之下降。reduce 周期的选择依据：监控的可观测延迟容忍度 vs 写竞争代价；通常 32-256 之间，配合 metric scrape interval 选。</p>
+<h3>手法 2：write combining buffer</h3>
+<p>把多个相邻字段的小写合并成一次写。例如多个 status flag 改成一个 <code>uint64_t</code> bitmap，一次原子 OR 写入。CPU 的 store buffer 本身就有 write combining，但前提是写 pattern 友好（同一 line、连续地址、无 fence）。AI Infra 中的 metric exporter、log shipper 都可以用 ring buffer + 批量 commit 的形式而不是逐条原子写。</p>
+<h3>手法 3：分片计数（sharded counter）</h3>
+<pre><code class="language-cpp">struct ShardedCounter {
+    static constexpr size_t N_SHARDS = 64;
+    alignas(64) std::atomic&lt;uint64_t&gt; shards[N_SHARDS];
+
+    void inc() {
+        size_t idx = current_cpu() &amp; (N_SHARDS - 1);
+        shards[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t sum() const {
+        uint64_t s = 0;
+        for (auto&amp; sh : shards) s += sh.load(std::memory_order_relaxed);
+        return s;
+    }
+};</code></pre>
+<p>读 O(N)、写 O(1)；适合写多读少的场景（监控指标、请求计数）。Linux kernel 的 <code>percpu_counter</code>、folly 的 <code>QuantileEstimator</code> 都是这个套路。</p>
+<h3>手法 4：改变共享语义</h3>
+<div class="success"><strong>最彻底的修复：</strong>问“为什么必须共享”。例如多 worker 的进度统计是否一定要写到全局结构？能不能让每个 worker 把自己的进度写到本地文件/独立 metric stream，由聚合器拉取？AI Infra 中的 distributed training 的 step counter、loss 累加，许多都不需要每步全局可见，只需要 epoch 边界 reduce。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. NUMA 与伪共享叠加：跨 socket coherence 让代价放大 5-10x</h2>
+<p>NUMA 系统下，每个 socket 有自己的 memory controller 和本地 DRAM；跨 socket 访问要走 UPI（Intel）或 Infinity Fabric（AMD），延迟 2-3x，带宽下降。伪共享叠加 NUMA 的代价机制：</p>
+<ol>
+<li>line 在 socket A 的 Core 0 处于 Modified；</li>
+<li>socket B 的 Core 8 要写同 line，发起 RFO（Read For Ownership）；</li>
+<li>请求经 UPI 到 socket A，socket A 的目录/snoop filter 找到 Core 0；</li>
+<li>Core 0 把 line 数据通过 UPI 回传给 socket B，自己降级为 Invalid；</li>
+<li>Core 8 拿到 line 升级为 Modified；</li>
+<li>下次 Core 0 再写时，整个流程反向重复。</li>
+</ol>
+<pre class="mermaid">sequenceDiagram
+  participant C0 as Socket A / Core 0
+  participant DA as Socket A Directory
+  participant UPI as UPI Link
+  participant DB as Socket B Directory
+  participant C8 as Socket B / Core 8
+  C0->>C0: write line X (M state)
+  C8->>DB: write line X, RFO
+  DB->>UPI: forward RFO
+  UPI->>DA: cross-socket request
+  DA->>C0: snoop, request line
+  C0->>DA: writeback line, set Invalid
+  DA->>UPI: line data
+  UPI->>DB: line data
+  DB->>C8: deliver line (M state)
+  Note over C0,C8: 同步往返，~150-400 cycle</pre>
+<table>
+<tr><th>场景</th><th>单次 line 迁移代价</th><th>1 万次/秒的总代价</th></tr>
+<tr><td>同核</td><td>~4 cycles</td><td>几乎为零</td></tr>
+<tr><td>同 socket 跨核</td><td>~50 cycles</td><td>~0.17 ms/s（可忽略）</td></tr>
+<tr><td>跨 socket</td><td>~250 cycles</td><td>~0.83 ms/s（开始可见）</td></tr>
+<tr><td>跨 socket + 远端 line evicted</td><td>~600 cycles</td><td>~2.0 ms/s（明显）</td></tr>
+</table>
+<p>把“1 万次/秒”换成 DataLoader 真实场景的“1 亿次/秒”（16 worker × 千万 sample/s × 几个 counter），跨 socket 伪共享能吃掉数百毫秒到数秒的 wall time，足以让 GPU 周期性 idle。</p>
+<div class="success"><strong>修复优先级：</strong>(1) 先 padding（消除伪共享本身）；(2) 再 NUMA 亲和（<code>numactl --cpunodebind=0 --membind=0</code> 或 <code>taskset</code> 把 worker 钉到同 socket）；(3) 最后考虑双副本（每个 socket 一份本地结构，跨 socket 周期同步）。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 容器/cgroup 场景：CPU pinning 错误也能制造意外的伪共享</h2>
+<p>容器化让伪共享多了一个隐藏入口：cgroup <code>cpuset</code> 错配。常见错误：</p>
+<ul>
+<li><strong>错误 1：CPU set 跨 socket 但内存只绑一个 node</strong>。pod 的 worker 运行在 socket A 和 socket B 的核上，但 <code>mems_allowed</code> 只允许 node 0；socket B 的 worker 每次访问 stats（位于 node 0）都跨 NUMA，叠加伪共享代价爆炸。</li>
+<li><strong>错误 2：CPU set 不连续</strong>。例如 K8s 给 pod 分配了 0,1,2,3,32,33,34,35（跨 socket），但代码假设 <code>worker_id</code> 直接当 CPU index，padding 也没用——因为不同 worker 的 stats 仍然在同 socket 的不同核上构成伪共享，且部分 worker 跨 socket。</li>
+<li><strong>错误 3：CPU 限制是分数</strong>（如 <code>cpus: "2.5"</code>），调度器在多个核间漂移；线程上一秒在 core 4，下一秒在 core 12，cache 反复 cold start，伪共享 + cache cold 双重打击。</li>
+<li><strong>错误 4：noisy neighbor</strong>。同一物理机上的另一个 pod 占用了相邻核，间接竞争 L3；虽然不直接造成伪共享，但放大了已有伪共享的代价。</li>
+</ul>
+<p>排查清单：</p>
+<pre><code class="language-bash"># 看 pod 的 cpuset
+cat /sys/fs/cgroup/cpuset.cpus
+cat /sys/fs/cgroup/cpuset.mems
+# 确认 NUMA 分布
+numactl --hardware
+# 看进程实际跑在哪些核
+ps -eLo pid,tid,psr,comm | grep &lt;process&gt;
+# 看 NUMA 内存分配
+numastat -p &lt;pid&gt;</code></pre>
+<table>
+<tr><th>容器配置错误</th><th>对伪共享的影响</th><th>修复</th></tr>
+<tr><td>cpuset 跨 socket</td><td>伪共享代价 5-10x 放大</td><td>限制单 socket，或显式 NUMA-aware 代码</td></tr>
+<tr><td>mems 与 cpus 不一致</td><td>远端 DRAM 访问叠加</td><td><code>cpuset.mems</code> 与 <code>cpuset.cpus</code> 同 node</td></tr>
+<tr><td>CPU 分数限制</td><td>漂移导致 cache cold</td><td>用整数 CPU + <code>cpuManagerPolicy: static</code></td></tr>
+<tr><td>Hyper-Thread 同核分给不同 pod</td><td>伪共享在 SMT 内更严重</td><td><code>cpuset</code> 按物理核（成对）分配</td></tr>
+</table>
+</section>
+
+<section class="section" id="s10">
+<h2>10. AI Infra 视角：DataLoader / metric / multi-LoRA 真实事故</h2>
+<p>下面三个事故来自 AI Infra 工程经验，都是把上面的机理摁到具体场景的产物。</p>
+<div class="grid-3">
+<div class="card"><strong>事故 1：DataLoader stats</strong><br>8 worker 6400 s/s，16 worker 反降到 5300。根因：<code>std::vector&lt;WorkerStats&gt;</code> 紧凑布局，4 个 worker 同 line。修复：<code>alignas(64)</code> + 每 64 sample 批量 flush + NUMA 亲和。最终 16 worker 7350 s/s。</div>
+<div class="card"><strong>事故 2：metric counter map</strong><br>推理服务全局 <code>std::array&lt;atomic&lt;u64&gt;, 256&gt;</code>，热 op 0-7 同 line。<code>perf c2c</code> 直接定位到数组首地址。修复：热 key <code>CachePadded</code>，冷 key 紧凑。QPS +18%, p99 -22%。</div>
+<div class="card"><strong>事故 3：Multi-LoRA counter</strong><br>32 adapter 紧凑数组，32 路并发只比 8 路高 1.5x。<code>perf c2c</code> HITM 31%。修复：<code>alignas(64)</code> + thread-local 累加。throughput +30%（详见 §12）。</div>
+</div>
+<table>
+<tr><th>事故</th><th>共享数据</th><th>触发条件</th><th>修复</th><th>收益</th></tr>
+<tr><td>DataLoader stats</td><td><code>WorkerStats[]</code></td><td>worker 数 &gt; line 容量</td><td>padding + 批量 flush + NUMA</td><td>+38% throughput</td></tr>
+<tr><td>metric counter map</td><td><code>atomic&lt;u64&gt;[256]</code></td><td>高频 op 紧邻</td><td>热 key padding</td><td>+18% QPS, -22% p99</td></tr>
+<tr><td>Multi-LoRA counter</td><td><code>AdapterStats[]</code></td><td>多路并发推理</td><td>padding + thread-local</td><td>+30% throughput</td></tr>
+</table>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 工程操作 SOP：从“线程数加倍但吞吐下降”到“改对齐复测”</h2>
+<p>值班可贴的一页 SOP：</p>
+<h3>触发条件</h3>
+<p>满足任一即进入此 SOP：</p>
+<ul>
+<li>加 worker / 加并发后吞吐不升反降；</li>
+<li>CPU 利用率高（&gt; 80% 全核），但业务进展慢；</li>
+<li>p99 在并发提升后显著恶化，且无 IO/网络异常；</li>
+<li>GPU utilization 周期性 &lt; 70%，但磁盘和网络都未饱和。</li>
+</ul>
+<h3>采集（30 分钟内完成）</h3>
+<pre><code class="language-bash"># 1. 排除 GPU 侧
+nvidia-smi dmon -s pucm -c 60 &gt; nvidia.txt &amp;
+# 2. CPU 总览
+perf stat -a -e cycles,instructions,cache-references,cache-misses,branches,branch-misses sleep 30 2&gt; stat.txt
+# 3. 线程分布
+pidstat -t -p $(pgrep -f &lt;process&gt;) 1 30 &gt; pidstat.txt &amp;
+# 4. 关键：c2c
+perf c2c record -F 4000 -ag -o c2c.data -- sleep 30
+perf c2c report -i c2c.data --stdio &gt; c2c.txt
+# 5. NUMA
+numastat -p $(pgrep -f &lt;process&gt;) &gt; numa.txt</code></pre>
+<h3>判断（依次）</h3>
+<pre class="mermaid">flowchart TB
+  step1["IPC &lt; 1.0?"] -->|否| nonfs["非伪共享方向"]
+  step1 -->|是| step2["cache-miss-rate &gt; 20%?"]
+  step2 -->|否| nonfs
+  step2 -->|是| step3["perf c2c 单 line<br>HITM &gt; 5%?"]
+  step3 -->|否| nonfs
+  step3 -->|是| step4["定位 symbol+offset"]
+  step4 --> step5["看源码:<br>同结构体不同字段?"]
+  step5 -->|是| confirmed["确认伪共享"]
+  step5 -->|否| true_share["真共享:换分片"]
+  confirmed --> fix["alignas(64) + 批量 flush"]
+  fix --> verify["复测 throughput<br>+ perf c2c"]</pre>
+<h3>修复 + 验证</h3>
+<ol>
+<li>找到 hot 结构体，加 <code>alignas(64)</code> 和尾部 padding，加 <code>static_assert(sizeof(T) == 64)</code>。</li>
+<li>如果是高频原子写，加 thread-local 累加（周期 32-256）。</li>
+<li>如果跨 socket，叠加 <code>numactl --cpunodebind=N --membind=N</code>。</li>
+<li>复测：throughput vs cores 曲线、<code>perf c2c</code> HITM 应消失或降到原值 &lt; 10%、IPC 回升至 &gt; 1.5。</li>
+<li>把修改和复测数据写入 PR description，避免后续重构者无意中删 padding。</li>
+</ol>
+<div class="warn"><strong>回滚条件：</strong>修改后内存占用增长 &gt; 100MB 且 throughput 提升 &lt; 10% → 回滚 padding，改用 thread-local 方案；修改后单线程性能下降 → 检查是否引入了不必要的 atomic 或 fence；修改后无变化 → 重新 c2c，可能 hot line 不止一个，或瓶颈已转移。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. Worked Example：Multi-LoRA Inference 的 per-adapter Counter</h2>
+<p><strong>场景：</strong>Multi-LoRA inference server，base model 7B，32 个动态加载的 LoRA adapter，每路请求随机命中某个 adapter。需要按 adapter 上报 <code>request_count</code>、<code>token_count</code>、<code>latency_sum</code> 用于 billing 和监控。32 路并发推理。</p>
+<p><strong>初始实现：</strong></p>
+<pre><code class="language-cpp">struct AdapterStats {
+    std::atomic&lt;uint64_t&gt; req_count;
+    std::atomic&lt;uint64_t&gt; tok_count;
+    std::atomic&lt;uint64_t&gt; latency_sum_ns;
+};
+std::array&lt;AdapterStats, 32&gt; adapter_stats;  // 32 * 24B = 768B = 12 lines</code></pre>
+<p>每个 <code>AdapterStats</code> 24B，2-3 个 adapter 落同一 line。32 路并发请求随机命中 adapter，每完成一个 token 都更新 3 个 atomic。</p>
+<p><strong>现象：</strong></p>
+<table>
+<tr><th>指标</th><th>1 并发</th><th>8 并发</th><th>16 并发</th><th>32 并发</th></tr>
+<tr><td>Throughput (tok/s)</td><td>80</td><td>580</td><td>920</td><td>1180</td></tr>
+<tr><td>理想线性</td><td>80</td><td>640</td><td>1280</td><td>2560</td></tr>
+<tr><td>效率</td><td>100%</td><td>91%</td><td>72%</td><td>46%</td></tr>
+</table>
+<p>32 并发的效率掉到 46%，和理想差 1380 tok/s。<code>perf c2c</code> 报告：<code>adapter_stats</code> 数组首地址周围 12 条 line 的 HITM 占全机 31%；其中前 4 条 line 单条 HITM &gt; 5%。</p>
+<p><strong>修复：</strong></p>
+<pre><code class="language-cpp">struct alignas(64) AdapterStats {
+    std::atomic&lt;uint64_t&gt; req_count;
+    std::atomic&lt;uint64_t&gt; tok_count;
+    std::atomic&lt;uint64_t&gt; latency_sum_ns;
+    char _pad[64 - 3 * sizeof(std::atomic&lt;uint64_t&gt;)];
+};
+static_assert(sizeof(AdapterStats) == 64);
+std::array&lt;AdapterStats, 32&gt; adapter_stats;  // 32 * 64B = 2KB = 32 lines
+
+// 每个推理线程本地累加，每 64 token flush 一次
+thread_local std::array&lt;LocalStats, 32&gt; local_stats;
+void on_token(int adapter_id, uint64_t latency_ns) {
+    auto&amp; l = local_stats[adapter_id];
+    ++l.tok;
+    l.lat_sum += latency_ns;
+    if ((l.tok &amp; 0x3F) == 0) {
+        adapter_stats[adapter_id].tok_count.fetch_add(64, std::memory_order_relaxed);
+        adapter_stats[adapter_id].latency_sum_ns.fetch_add(l.lat_sum, std::memory_order_relaxed);
+        l.lat_sum = 0;
+    }
+}</code></pre>
+<p><strong>复测：</strong></p>
+<table>
+<tr><th>指标</th><th>1 并发</th><th>8 并发</th><th>16 并发</th><th>32 并发</th></tr>
+<tr><td>Throughput (tok/s)</td><td>80</td><td>620</td><td>1180</td><td>1540</td></tr>
+<tr><td>效率</td><td>100%</td><td>97%</td><td>92%</td><td>60%</td></tr>
+<tr><td>相对原始提升</td><td>0%</td><td>+7%</td><td>+28%</td><td>+30.5%</td></tr>
+</table>
+<p>32 并发 throughput 提升 30.5%，p99 latency 从 88ms 降到 71ms。<code>perf c2c</code> 报告 <code>adapter_stats</code> HITM 占比从 31% 降到 3%。内存占用：从 768B 涨到 2KB，可忽略。监控延迟：最多滞后 64 token（在 80 tok/s/路下约 0.8s），监控接受。</p>
+<div class="success"><strong>关键复盘：</strong>原始代码完全正确，没有 race；profiler 看 CPU 时报告的也只是“atomic 操作热”。如果不知道伪共享，会试图用更宽的 atomic、更复杂的无锁数据结构、甚至 sharding，反而越改越复杂。识别出“语义粒度（单个 adapter）vs 物理粒度（cache line）”这一层不匹配后，最小修复就是 <code>alignas(64)</code> + 一行 thread-local 累加。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>练习 0a-7-1（基础）：cache line 容量计算</strong><br>某 64B cache line，要存放 <code>struct Stat { uint32_t a; uint64_t b; uint16_t c; };</code>。计算结构体实际大小（含 padding）和一条 line 能装几个 Stat。如果 4 个线程各操作连续数组中的一个 Stat，是否构成伪共享？</div>
+<div class="card"><strong>练习 0a-7-2（基础）：真共享 vs 伪共享判别</strong><br>判断每种情况属于真共享、伪共享、还是 data race：(a) 8 线程同时 <code>++</code> 一个全局 <code>atomic&lt;int&gt;</code>；(b) 8 线程各 <code>++</code> 数组 <code>int counts[8]</code> 不同下标，无 atomic；(c) 8 线程各 <code>++</code> 数组 <code>atomic&lt;int&gt; counts[8]</code> 不同下标；(d) 1 生产者写 head，1 消费者写 tail，head/tail 紧邻。</div>
+<div class="card"><strong>练习 0a-7-3（基础）：HITM 阈值</strong><br><code>perf c2c</code> 显示某 line Local-HITM 8%，Remote-HITM 12%，3 个 offset (0, 16, 40) 都有 HITM，符号都是 <code>WorkerStats::*</code>。给出初步诊断和接下来 3 步动作。</div>
+<div class="card"><strong>练习 0a-7-4（进阶）：padding vs thread-local 选型</strong><br>设计 multi-tenant 推理服务，1000 tenant 各 3 个 counter，写 ~10 万次/秒，读 ~1 次/秒。给出至少两种实现方案，比较内存、吞吐、监控延迟。</div>
+<div class="card"><strong>练习 0a-7-5（进阶）：NUMA 叠加</strong><br>双路 64c，16 worker 平均分两 socket，跨 socket 伪共享，每秒 5 万次迁移。估算总 wall time 浪费。</div>
+<div class="card"><strong>练习 0a-7-6（进阶）：Ring buffer head/tail padding</strong><br>为 SPSC lock-free ring buffer 设计内存布局，要求 head 和 tail 不在同 line。给出 C++ 结构体定义并 <code>static_assert</code> 校验。</div>
+<div class="card"><strong>练习 0a-7-7（进阶）：检测脚本</strong><br>写脚本（伪代码）从 <code>perf c2c report --stdio</code> 提取 HITM 占比 &gt; 5% 的 line 和符号源行。说明用到哪些 perf 字段。</div>
+<div class="card"><strong>练习 0a-7-8（设计）：DataLoader 重构</strong><br>16 worker 吞吐 80% 理想值，<code>DataLoaderStats</code> HITM 22%。给出完整修复：结构体改造、批量 flush、NUMA 亲和、监控对齐、回滚条件。</div>
+<div class="card"><strong>练习 0a-7-9（设计）：容器内伪共享 SOP</strong><br>K8s pod 在节点 A 是节点 B 上的 60%。怀疑 cpuset + 伪共享叠加。设计排查步骤清单（≤ 10 步），覆盖 cgroup、NUMA、c2c、节点拓扑对比。</div>
+<div class="card"><strong>练习 0a-7-10（设计）：multi-LoRA counter 完整实现</strong><br>实现 §12 的完整 multi-LoRA counter：动态注册/注销、写无锁 cache-line aligned、监控 1Hz 一致性快照，并给出测试方法证明无伪共享。</div>
+</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用 §1 的因果链建立总图：粒度差 → 代价放大 → 检测信号 → 修复 → AI Infra 反例。</li>
+<li>用 §2-§3 把“为什么硬件无法看到语义”和“为什么 atomic 修不了伪共享”讲清楚。</li>
+<li>用 §4-§7 建立从“反例识别”到“修复手段”的工程闭环。</li>
+<li>用 §8-§9 理解 NUMA 和容器场景的代价放大与隐藏入口。</li>
+<li>最后用 §10-§12 把方法落到 AI Infra 真实事故，并把 §11 SOP 贴到值班 wiki。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Ulrich Drepper, <em>What Every Programmer Should Know About Memory</em>，§3.3 / §6.3 是伪共享和 cache coherence 的经典讲解。</li>
+<li>Brendan Gregg, <em>Systems Performance</em>，第 6 章 CPU 与第 7 章 Memory，重点看 PMC 和 c2c 章节。</li>
+<li>Intel, <em>Intel 64 and IA-32 Architectures Optimization Reference Manual</em>，搜索 "false sharing" 和 "HITM"。</li>
+<li>AMD, <em>Software Optimization Guide for AMD EPYC Processors</em>，关于 Infinity Fabric 一致性流量的章节。</li>
+<li>Linux kernel <code>Documentation/core-api/cachetlb.rst</code>、<code>include/linux/cache.h</code>：<code>____cacheline_aligned_in_smp</code> 与 per-CPU 实现。</li>
+<li>Linux <code>perf</code> 文档：<code>perf c2c</code>、<code>perf mem</code>、<code>tools/perf/Documentation/perf-c2c.txt</code>。</li>
+<li>Folly <code>folly/concurrency/CacheLocality.h</code>、<code>folly/synchronization/Hazptr.h</code>：工业级 padding 和分片实现。</li>
+<li>Rust <code>crossbeam_utils::CachePadded</code>：跨平台 cache line padding。</li>
+<li>Java <code>@Contended</code> 注解与 JEP 142：JVM 层伪共享缓解。</li>
+<li>Martin Thompson, <em>Mechanical Sympathy</em> 系列博客与 LMAX Disruptor 源码：高频交易场景的 false sharing 处理范式。</li>
+<li>PyTorch <code>torch/csrc/distributed/c10d/</code> 和 vLLM <code>vllm/engine/</code> 中的 metric/counter 实现，作为 AI Infra 真实代码的阅读样本。</li>
+<li>Joe Mario, <em>perf c2c: A new tool for false sharing detection</em>（Red Hat 博客）：<code>perf c2c</code> 字段的权威解读。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

@@ -1,0 +1,1142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0b2 章 · Page Cache、脏页回写与 Huge Pages — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0b2" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0b2 章 · Page Cache、脏页回写与 Huge Pages</h1>
+<p class="sub">拆解 Page Cache、dirty page、fsync、vm.dirty_ratio、THP 和 HugeTLB 如何影响数据读取与 checkpoint 尾延迟。</p>
+<div class="chips"><span class="chip">Page Cache</span><span class="chip">Dirty Page</span><span class="chip">fsync</span><span class="chip">THP</span><span class="chip">HugeTLB</span><span class="chip">Checkpoint</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#page-cache空闲内存不是浪费">2. Page Cache：空闲内存不是浪费</a></li><li><a class="anchor" href="#dataset-读取案例第二轮-epoch-变快">3. Dataset 读取案例：第二轮 epoch 变快</a></li><li><a class="anchor" href="#多作业污染-page-cache不是谁读得多谁就该赢">4. 多作业污染 Page Cache：不是谁读得多谁就该赢</a></li><li><a class="anchor" href="#脏页回写write-快不等于落盘快">5. 脏页回写：write() 快不等于落盘快</a></li><li><a class="anchor" href="#checkpoint-写入语义临时文件fsyncrename">6. Checkpoint 写入语义：临时文件、fsync、rename</a></li><li><a class="anchor" href="#huge-pages降低地址转换压力">7. Huge Pages：降低地址转换压力</a></li><li><a class="anchor" href="#worked-examplecheckpoint-后半段突然卡住">8. Worked Example：checkpoint 后半段突然卡住</a></li><li><a class="anchor" href="#worked-examplethp-打开后-serving-p99-变差">9. Worked Example：THP 打开后 serving p99 变差</a></li><li><a class="anchor" href="#观测-sop读慢写卡大页抖">10. 观测 SOP：读慢、写卡、大页抖</a></li><li><a class="anchor" href="#checklist">11. Checklist</a></li><li><a class="anchor" href="#练习">12. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="0b-memory-virtual-memory-and-io.html">第 0b 章</a> 的 Page Cache
+与大页拆分篇。虚拟地址、page fault 和 TLB 基础见 <a
+href="0b1-virtual-memory-page-tables-and-tlb.html">0b1</a>，文件系统内部机制见
+<a
+href="0c-filesystems-and-storage-internals.html">0c</a>，NUMA、PCIe、DMA
+与 pinned memory 见 <a
+href="0b3-numa-pcie-dma-and-pinned-memory.html">0b3</a>。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>磁盘、网络文件系统和对象存储远慢于 DRAM，但训练和推理会反复读取
+dataset shard、模型权重、tokenizer、索引、embedding table、feature cache
+和 checkpoint。不可化简的问题是：</p>
+<p><strong>内核必须用 DRAM
+缓存文件数据来吸收慢存储的延迟，同时又要把写入安全地回写到持久介质；这套机制提升平均吞吐，但会制造缓存命中假象、dirty
+page 尾延迟、回写抖动和恢复语义陷阱。</strong></p>
+<p>大页问题来自另一侧：4 KiB page 对通用系统友好，但大数组、大 mmap
+文件、CPU embedding、KV cache 索引和 serving arena 会产生大量页表项和
+TLB miss。Huge Pages 能减少地址转换成本，但 THP 的自动合并、拆分和内存
+compaction 也可能带来延迟尖峰。</p>
+<h3 id="推-从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从“读文件可能重复”推出 Page Cache；从“顺序读可以提前猜”推出
+readahead；从“多个作业共享同一台机器”推出 Page Cache
+污染与回收；从“写入不能每次同步落盘”推出 dirty page
+和后台回写；从“恢复逻辑不能看到半成品”推出
+<code>fsync()</code>、<code>rename()</code> 和 manifest
+协议；从“大内存映射导致 TLB 压力”推出 THP、HugeTLB 和 allocator
+策略。</p>
+<h3 id="绘-因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">sequenceDiagram
+  participant App as 训练/推理进程
+  participant Kernel as Linux kernel
+  participant Cache as Page Cache
+  participant Store as NVMe/NFS/并行文件系统
+  App->>Kernel: read(dataset shard)
+  Kernel->>Cache: 查文件页
+  alt cache hit
+    Cache-->>App: DRAM 速度返回
+  else cache miss
+    Kernel->>Store: 提交读 IO
+    Store-->>Cache: 填充文件页
+    Cache-->>App: 返回给进程
+  end
+  App->>Kernel: write(checkpoint shard)
+  Kernel->>Cache: 标记 dirty
+  Kernel-->>App: write 可先返回
+  Cache->>Store: flusher 后台回写
+  App->>Kernel: fsync(manifest/shard)
+  Kernel->>Store: 等待必要数据与元数据持久化</pre>
+<h3 id="导-读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>为什么 dataset 第二轮读取变快通常是 Page Cache，而不是模型或
+DataLoader 变快？</li>
+<li>Page Cache、应用级缓存、对象存储客户端缓存分别解决什么问题？</li>
+<li><code>write()</code> 返回和数据真正持久化有什么区别？</li>
+<li><code>vm.dirty_ratio</code> 为什么会让 checkpoint
+前半段很快、后半段突然卡住？</li>
+<li>checkpoint 为什么需要临时文件、manifest、<code>rename()</code>
+和父目录 <code>fsync()</code>？</li>
+<li>THP <code>always</code>、<code>madvise</code>、<code>never</code> 和
+HugeTLB 分别适合什么场景？</li>
+<li>Huge Pages 解决 TLB 压力，不解决哪些内存和 IO 问题？</li>
+</ol>
+<h2 id="page-cache空闲内存不是浪费">2. Page Cache：空闲内存不是浪费</h2>
+<p>Linux 会用空闲 DRAM 缓存文件页。<code>free -h</code> 里
+<code>buff/cache</code> 不是浪费，而是可回收缓存。训练读取 dataset
+时，第一轮可能受 NVMe、NFS、并行文件系统或对象存储 gateway
+限制；第二轮如果命中 Page Cache，会接近内存速度。</p>
+<p>关键点是：Page Cache 缓存的是“文件内容对应的页”，不是 Python
+object、样本解码结果、token tensor 或 GPU tensor。它能让“再读同一个文件
+byte range”变快，但不能替代 dataset index、样本级 cache、tokenization
+cache 或业务版本控制。</p>
+<table>
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 38%" />
+<col style="width: 38%" />
+</colgroup>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因</th>
+<th>验证方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第二轮 epoch 明显更快</td>
+<td>Page Cache 命中</td>
+<td>对比 drop cache 前后吞吐、看 major fault 和存储读带宽</td>
+</tr>
+<tr>
+<td>首次模型加载慢，重启进程后快</td>
+<td>权重文件仍在 Page Cache</td>
+<td><code>vmtouch</code> / <code>mincore</code> / 读带宽对比</td>
+</tr>
+<tr>
+<td>多作业互相影响读性能</td>
+<td>Page Cache 被污染或被内存压力回收</td>
+<td><code>sar -B</code>、<code>pgscan/pgsteal</code>、<code>Active(file)</code>/<code>Inactive(file)</code></td>
+</tr>
+<tr>
+<td>synthetic data 很快，真实数据慢</td>
+<td>synthetic 绕过了文件 IO 路径</td>
+<td>切真实 dataset profile，并记录存储与 page fault</td>
+</tr>
+<tr>
+<td><code>mmap</code> 数据集第一次访问卡顿</td>
+<td>page fault 触发按需读入</td>
+<td><code>perf stat</code> 看 major fault，<code>sar -B</code> 看
+fault/reclaim</td>
+</tr>
+</tbody>
+</table>
+<p>常用观察：</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">vmstat</span> 1</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-B</span> 1</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-r</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> 1</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/meminfo <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;Cached|Dirty|Writeback|Active\(file\)|Inactive\(file\)&#39;</span></span></code></pre></div>
+<h3 id="文件页匿名页和-buffercache-术语">2.1 文件页、匿名页和
+buffer/cache 术语</h3>
+<p>Linux 内存大致可以先分成两类：</p>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 25%" />
+<col style="width: 35%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>类型</th>
+<th>典型来源</th>
+<th>是否容易回收</th>
+<th>AI 场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anonymous page</td>
+<td>heap、stack、匿名 mmap</td>
+<td>需要 swap 或释放进程内存</td>
+<td>Python 对象、CPU tensor、allocator arena</td>
+</tr>
+<tr>
+<td>File-backed page</td>
+<td>文件 <code>read()</code> 或 <code>mmap</code></td>
+<td>干净页可直接丢弃，脏页需先回写</td>
+<td>dataset shard、权重文件、checkpoint</td>
+</tr>
+<tr>
+<td>Slab / kernel memory</td>
+<td>inode、dentry、网络、驱动结构</td>
+<td>依类型而定</td>
+<td>大量小文件会放大 inode/dentry cache</td>
+</tr>
+<tr>
+<td>Page table</td>
+<td>地址转换结构</td>
+<td>随映射规模增长</td>
+<td>大 mmap、大进程地址空间</td>
+</tr>
+</tbody>
+</table>
+<p><code>buffer cache</code> 和 <code>page cache</code> 在现代 Linux
+里经常被一起讨论。你在 <code>free -h</code> 看到的
+<code>buff/cache</code> 不是一个单独的应用缓存池，而是包含文件页、block
+buffer、部分 slab 等可回收内存。排障时不要只看 <code>free</code>
+列，要看
+<code>available</code>、<code>Cached</code>、<code>Active(file)</code>、<code>Inactive(file)</code>、<code>Dirty</code>
+和 <code>Writeback</code>。</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MemAvailable|Cached|Buffers|Active\(file\)|Inactive\(file\)|SReclaimable|Dirty|Writeback&#39;</span> /proc/meminfo</span></code></pre></div>
+<p>判断方向：</p>
+<ul>
+<li><code>Cached</code> 很高、存储读带宽很低、第二轮快：大概率 Page
+Cache 命中；</li>
+<li><code>Active(file)</code> 高、<code>Inactive(file)</code>
+快速下降：文件页正在被访问或回收；</li>
+<li><code>SReclaimable</code> 很高：可能是
+inode/dentry/slab，而不是纯文件数据；</li>
+<li><code>Dirty</code> 和 <code>Writeback</code>
+高：写路径正在积压，读变慢可能是存储队列被回写占满。</li>
+</ul>
+<h3 id="read-路径cache-hitcache-miss-与-readahead">2.2
+<code>read()</code> 路径：cache hit、cache miss 与 readahead</h3>
+<p>一次普通 <code>read(fd, buf, len)</code> 可以拆成：</p>
+<pre class="text"><code>用户态 read()
+  -&gt; 内核按文件 offset 找 Page Cache
+  -&gt; 命中: copy_to_user()
+  -&gt; 未命中: 提交 block/filesystem IO
+  -&gt; IO 完成后填充 Page Cache
+  -&gt; copy_to_user()</code></pre>
+<p>顺序读时，内核会做
+readahead：当它发现进程按顺序访问文件，就提前把后续页读进 Page
+Cache。训练读取 tar shard、Parquet row group、WebDataset
+shard、safetensors 权重文件时，如果访问模式足够顺序，readahead
+可以把存储吞吐打满；如果样本访问随机、文件很碎、压缩块很小或多个 worker
+交错 seek，readahead 效果会下降。</p>
+<p>可调和可观测工具：</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--getra</span> /dev/nvme0n1</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-o</span> NAME,RA,SIZE,TYPE,MOUNTPOINT</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/read_ahead_kb</span></code></pre></div>
+<p>应用可以给内核提示：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_RANDOM<span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_WILLNEED<span class="op">);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span></code></pre></div>
+<p>这些提示不是强制命令。<code>SEQUENTIAL</code> 和
+<code>WILLNEED</code> 帮助预读；<code>RANDOM</code>
+可以避免错误预读；<code>DONTNEED</code> 常用于大顺序扫描结束后降低 Page
+Cache 污染。平台层做 dataset reader 时，应该让访问模式和 fadvise
+策略一致：顺序 shard 用顺序提示，随机小文件不要假装顺序流。</p>
+<h3 id="mmap-路径page-fault-不是异常而是加载机制">2.3 <code>mmap</code>
+路径：page fault 不是异常，而是加载机制</h3>
+<p><code>mmap</code>
+文件后，进程拿到的是一段虚拟地址范围。第一次访问某个尚未在内存里的文件页时，CPU
+触发 page fault，内核再把对应文件页读进 Page
+Cache，并把虚拟地址映射到物理页。这里的 page fault 是正常加载路径。</p>
+<pre class="text"><code>mmap(file)
+  -&gt; 只建立虚拟地址范围
+访问 addr
+  -&gt; page fault
+  -&gt; 查 Page Cache / 提交 IO
+  -&gt; 建 PTE
+  -&gt; 指令重试</code></pre>
+<p>适合 <code>mmap</code> 的场景：</p>
+<ul>
+<li>大文件随机读，应用希望由内核按需加载；</li>
+<li>权重文件或索引文件有固定布局；</li>
+<li>多进程共享同一文件映射，减少重复拷贝；</li>
+<li>读取代码能处理访问时延，而不是把所有延迟堆到 <code>mmap()</code>
+调用处。</li>
+</ul>
+<p>不适合盲目 <code>mmap</code> 的场景：</p>
+<ul>
+<li>访问模式高度随机且工作集远大于内存，major fault 会成为主瓶颈；</li>
+<li>延迟敏感服务在请求路径第一次触碰冷页；</li>
+<li>网络文件系统上 page fault 延迟不稳定；</li>
+<li>需要精确控制 IO 并发、重试、超时和 backpressure。</li>
+</ul>
+<p>观察 <code>mmap</code> 冷页：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> page-faults,minor-faults,major-faults <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 10</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-B</span> 1</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Rss|Pss|Shared_Clean|Private_Clean|Referenced&#39;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<p>major fault 代表需要从存储读取；minor fault
+通常代表页已经在内存中，只需要建立映射或处理 COW。二者差别直接影响
+dataset reader 和 serving warmup 的解释。</p>
+<h3 id="page-cache-回收inactiveactiverefault">2.4 Page Cache
+回收：inactive、active、refault</h3>
+<p>Page Cache 不是无限缓存。内核会把文件页放在 active/inactive LRU
+类似结构中，内存压力来时优先回收不常用的干净 file page。脏 file page
+不能直接丢弃，必须先进入 writeback。</p>
+<p>简化模型：</p>
+<pre class="text"><code>冷文件页 -&gt; Inactive(file)
+重复访问 -&gt; Active(file)
+内存压力 -&gt; scan inactive
+干净页 -&gt; reclaim
+脏页 -&gt; writeback 后 reclaim
+刚被回收又被访问 -&gt; refault</code></pre>
+<p>排查多作业互相污染 Page Cache 时，重点看：</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pgscan|pgsteal|workingset_refault|workingset_activate|pgmajfault&#39;</span> /proc/vmstat</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-B</span> 1</span></code></pre></div>
+<p>如果 <code>workingset_refault_file</code> 或 major fault
+增长明显，同时存储读带宽升高，说明工作集可能大于可用 Page
+Cache，或者另一个作业正在把你的热文件页挤掉。此时盲目增加 DataLoader
+worker 可能更糟，因为更多并发只会制造更多随机读和缓存竞争。</p>
+<h3 id="page-cache-与-direct-io-的边界">2.5 Page Cache 与 direct IO
+的边界</h3>
+<p>Buffered IO 经过 Page Cache；direct IO 试图绕过 Page
+Cache，直接在用户 buffer 和存储之间传输。数据库、部分 checkpoint writer
+或高性能存储客户端可能使用 <code>O_DIRECT</code>，避免污染 Page Cache
+或减少一次拷贝。</p>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>模式</th>
+<th>优点</th>
+<th>成本</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Buffered IO</td>
+<td>简单、自动缓存、readahead/writeback</td>
+<td>可能污染缓存，写入延迟被推迟</td>
+<td>dataset 顺序读、普通权重加载</td>
+</tr>
+<tr>
+<td>Direct IO</td>
+<td>减少缓存污染，延迟更贴近真实存储</td>
+<td>对齐要求、应用要管理缓存和并发</td>
+<td>数据库、特定 checkpoint、benchmark</td>
+</tr>
+<tr>
+<td><code>mmap</code></td>
+<td>按需加载，多进程共享自然</td>
+<td>page fault 延迟隐蔽</td>
+<td>大索引、权重映射、只读共享数据</td>
+</tr>
+</tbody>
+</table>
+<p>排查时要先确认路径。否则你可能用 Page Cache 的假设解释一个 direct IO
+程序，或者用 direct IO benchmark 评估 buffered dataset reader。</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-f</span> <span class="at">-e</span> trace=openat,read,pread64,mmap,fcntl <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lsof</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">head</span></span></code></pre></div>
+<h2 id="dataset-读取案例第二轮-epoch-变快">3. Dataset 读取案例：第二轮
+epoch 变快</h2>
+<p>现象：一个图像训练任务第一轮 epoch 需要 42 分钟，第二轮只要 18
+分钟。团队以为是 DataLoader worker warmup 或模型 kernel autotune，但 GPU
+利用率第一轮低、第二轮高。</p>
+<p>验证步骤：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/meminfo <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;Cached|Active\(file\)|Inactive\(file\)&#39;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> major-faults,minor-faults <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span></code></pre></div>
+<p>典型结果：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>第一轮</th>
+<th>第二轮</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>存储读带宽</td>
+<td>3.5 GiB/s</td>
+<td>200 MiB/s</td>
+<td>第二轮大部分命中 Page Cache</td>
+</tr>
+<tr>
+<td>major faults</td>
+<td>持续增长</td>
+<td>接近 0</td>
+<td>冷文件页已经在内存</td>
+</tr>
+<tr>
+<td><code>Cached</code></td>
+<td>持续上升</td>
+<td>稳定高位</td>
+<td>dataset shard 被缓存</td>
+</tr>
+<tr>
+<td>GPU 利用率</td>
+<td>55%</td>
+<td>92%</td>
+<td>第一轮被 IO 喂数限制</td>
+</tr>
+</tbody>
+</table>
+<p>更严谨的对比需要控制变量。单机实验可以在测试环境执行：</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 3 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/sys/vm/drop_caches</span></code></pre></div>
+<p>不要在生产训练机随便 drop
+cache，这会影响同机所有作业。更好的方式是用新机器、隔离 cgroup、不同
+dataset 副本或冷启动窗口做对比。</p>
+<p>工程结论：</p>
+<ul>
+<li>如果第二轮快来自 Page Cache，不能把它当成真实冷启动吞吐；</li>
+<li>benchmark 应分别报告 cold-cache 和 warm-cache；</li>
+<li>dataset 存储容量规划要按 cold-cache 能力设计；</li>
+<li>多租户机器需要控制 cache 污染，尤其是大顺序扫描任务；</li>
+<li>serving warmup 要显式预热权重和索引，不能依赖“碰巧还在 Page
+Cache”。</li>
+</ul>
+<h2 id="多作业污染-page-cache不是谁读得多谁就该赢">4. 多作业污染 Page
+Cache：不是谁读得多谁就该赢</h2>
+<p>Page Cache
+是全机资源。两个训练作业在同一台机器上运行时，一个大顺序扫描可能把另一个作业的热
+shard 或权重文件挤掉。症状经常表现为“明明数据在本地 NVMe，偶尔 batch
+latency 还是很高”。</p>
+<p>排查路径：</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MemAvailable|Cached|Active\(file\)|Inactive\(file\)&#39;</span> /proc/meminfo</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pgscan|pgsteal|workingset_refault|pgmajfault&#39;</span> /proc/vmstat</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-d</span> <span class="at">-r</span> 1</span></code></pre></div>
+<p>判断：</p>
+<ul>
+<li><code>pgscan</code>、<code>pgsteal</code>
+增长快：内核正在回收页；</li>
+<li><code>workingset_refault_file</code>
+增长快：刚回收的文件页又被访问，说明缓存工作集被挤压；</li>
+<li><code>iostat</code> 读带宽和 <code>await</code>
+同时升高：回收到冷页后重新读存储；</li>
+<li>某个 job <code>pidstat -d</code> 读 IO 明显高于其他
+job：可能是污染源。</li>
+</ul>
+<p>治理手段：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>手段</th>
+<th>作用</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据分片本地化</td>
+<td>减少跨 job 读取同一盘</td>
+<td>需要调度器知道数据位置</td>
+</tr>
+<tr>
+<td>顺序扫描后 <code>POSIX_FADV_DONTNEED</code></td>
+<td>降低一次性扫描污染</td>
+<td>只适合不会马上复用的数据</td>
+</tr>
+<tr>
+<td>限制并发 worker</td>
+<td>降低随机读和缓存 churn</td>
+<td>需要和 GPU 利用率一起调</td>
+</tr>
+<tr>
+<td>per-job cache 目录</td>
+<td>把业务缓存从 Page Cache 策略中分离</td>
+<td>仍然占用底层文件页</td>
+</tr>
+<tr>
+<td>冷热分层</td>
+<td>热索引/小文件放本地 NVMe</td>
+<td>需要版本和淘汰策略</td>
+</tr>
+</tbody>
+</table>
+<p>不要把 Page Cache
+当成租户隔离机制。它缺少作业级命中率、优先级和硬配额语义。平台要做稳定性，应该在调度、数据布局、应用
+cache 和存储 QoS 上共同处理。</p>
+<h2 id="脏页回写write-快不等于落盘快">5. 脏页回写：<code>write()</code>
+快不等于落盘快</h2>
+<p><code>write()</code> 通常把用户数据拷到 Page Cache 并标记
+dirty，然后返回。后台 flusher 线程再把 dirty page
+回写到存储。<code>fsync()</code>、<code>fdatasync()</code>、文件关闭、内存压力、dirty
+超阈值都可能触发等待。</p>
+<p>写路径简化如下：</p>
+<pre class="text"><code>write(fd, buf)
+  -&gt; copy_from_user 到 Page Cache
+  -&gt; 标记 page dirty
+  -&gt; 返回给应用
+
+后台:
+  dirty page 到达阈值或过期
+  -&gt; flusher 提交 writeback
+  -&gt; 存储完成
+  -&gt; page 从 Dirty 变为 clean
+
+fsync(fd):
+  -&gt; 等待该文件必要 dirty data 和元数据落盘
+  -&gt; 返回后应用才有持久化语义</code></pre>
+<p>关键参数：</p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>工程建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vm.dirty_background_ratio</code></td>
+<td>后台开始回写的内存比例</td>
+<td>大内存机器上比例可能过大</td>
+</tr>
+<tr>
+<td><code>vm.dirty_ratio</code></td>
+<td>进程可能被强制同步回写的上限</td>
+<td>checkpoint 机器建议用 bytes 更可控</td>
+</tr>
+<tr>
+<td><code>vm.dirty_background_bytes</code></td>
+<td>用字节指定后台阈值</td>
+<td>适合固定平台基线</td>
+</tr>
+<tr>
+<td><code>vm.dirty_bytes</code></td>
+<td>用字节指定强制阈值</td>
+<td>控制最坏 dirty 积压</td>
+</tr>
+<tr>
+<td><code>dirty_expire_centisecs</code></td>
+<td>脏页多久后应被写回</td>
+<td>太大可能制造长尾，太小会增加写放大</td>
+</tr>
+<tr>
+<td><code>dirty_writeback_centisecs</code></td>
+<td>flusher 周期</td>
+<td>影响后台回写节奏</td>
+</tr>
+</tbody>
+</table>
+<p>例子：512 GiB 内存机器上，<code>dirty_ratio=20</code> 理论允许约 102
+GiB 脏页。一个 80 GiB checkpoint 可能先以 DRAM
+速度写入，看起来非常快；当 dirty 接近阈值或 <code>fsync()</code>
+到来时，进程突然等待真实存储吞吐。</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_expire_centisecs vm.dirty_writeback_centisecs</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n1</span> <span class="st">&quot;grep -E &#39;Dirty|Writeback&#39; /proc/meminfo&quot;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span></code></pre></div>
+<h3 id="dirty-page-生命周期">5.1 dirty page 生命周期</h3>
+<p>一个 checkpoint shard 从应用 buffer
+到持久介质，至少经历这些状态：</p>
+<pre class="text"><code>用户态 buffer
+  -&gt; Page Cache dirty page
+  -&gt; writeback in-flight
+  -&gt; storage volatile cache / device queue
+  -&gt; persistent media</code></pre>
+<p>其中每一段都可能让“看起来写完”和“真的可恢复”产生差异：</p>
+<ul>
+<li><code>write()</code>
+返回：只说明内核接收了数据，通常不代表持久化；</li>
+<li><code>close()</code> 返回：不等于可靠 checkpoint
+协议，错误处理也容易被忽略；</li>
+<li><code>fsync()</code>
+返回：针对文件数据和必要元数据提供更强语义；</li>
+<li><code>rename()</code>
+原子：保证目录项切换原子，不保证新文件内容已经落盘；</li>
+<li>父目录 <code>fsync()</code>：保证 rename
+这个目录项更新在崩溃后可见。</li>
+</ul>
+<p>这部分文件系统细节会在 0c 展开。本章要记住的是：dirty writeback 决定
+checkpoint 的尾延迟，<code>fsync</code> 决定恢复语义是否可信。</p>
+<h3 id="balance_dirty_pages为什么应用会突然被-throttle">5.2
+<code>balance_dirty_pages</code>：为什么应用会突然被 throttle</h3>
+<p>当 dirty page 积压超过阈值，内核不能继续让进程无限把 DRAM
+填成脏页。<code>balance_dirty_pages</code>
+会让正在写的进程放慢，等待后台 writeback
+追上。于是日志里常见这样的形态：</p>
+<pre class="text"><code>0-70 GiB: write() 很快，吞吐像内存
+70-90 GiB: Dirty 接近阈值
+90 GiB 后: 训练进程被 throttle，吞吐掉到真实存储速度
+fsync(): 再等待剩余 dirty/writeback</code></pre>
+<p>这不是“最后几个文件更慢”，而是前面把债务记在 Page
+Cache，后面集中还。</p>
+<p>观测：</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;nr_dirty|nr_writeback|nr_writeback_temp|pgpgout|pgmajfault&#39;</span> /proc/vmstat</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n1</span> <span class="st">&quot;grep -E &#39;Dirty|Writeback|WritebackTmp&#39; /proc/meminfo&quot;</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span></code></pre></div>
+<p>如果你看到 <code>Dirty</code> 快速上涨、<code>Writeback</code>
+持续不低、磁盘 <code>util</code> 接近 100%、<code>await</code>
+升高，说明回写已经变成系统瓶颈。此时继续提高 checkpoint
+并发只会扩大积压。</p>
+<h3 id="ratio-与-bytes大内存机器上不要只用比例">5.3 ratio 与
+bytes：大内存机器上不要只用比例</h3>
+<p><code>dirty_ratio=20</code> 在 64 GiB 机器上约 12.8 GiB，在 1 TiB
+机器上约 204 GiB。比例参数在大内存训练节点上会把 dirty
+积压放得太大，导致回写长尾和故障恢复窗口都变长。</p>
+<p>更可控的做法是用 bytes：</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl vm.dirty_background_bytes=<span class="va">$((</span><span class="dv">8</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="va">))</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl vm.dirty_bytes=<span class="va">$((</span><span class="dv">24</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="va">))</span></span></code></pre></div>
+<p>这不是通用推荐值，只是说明量级。合理值要根据存储吞吐、checkpoint
+大小、允许的 step time 尖刺和同机作业数量决定。一个实用估算：</p>
+<pre class="text"><code>允许回写尾延迟 &lt;= dirty_bytes / 稳态写吞吐</code></pre>
+<p>如果节点实际稳定写吞吐是 3 GiB/s，而你允许 checkpoint 尾部最多多等 8
+秒，那么 dirty 上限不应远高于 24
+GiB。否则延迟债务必然在某个时间点出现。</p>
+<h3 id="容器与-cgroup看起来是同一个内核账却不总是直观">5.4 容器与
+cgroup：看起来是同一个内核，账却不总是直观</h3>
+<p>容器共享宿主机 Page Cache 和 writeback
+机制。即使进程在容器里，文件页仍然属于宿主机内核管理；不同
+cgroup、不同内核版本和不同文件系统上的 memory/writeback
+记账细节会影响你看到的指标。</p>
+<p>排障时同时看容器和宿主机：</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/memory.current</span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/memory.stat <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;file|anon|inactive_file|active_file|dirty|writeback&#39;</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/meminfo <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;Cached|Dirty|Writeback&#39;</span></span></code></pre></div>
+<p>常见误判：</p>
+<ul>
+<li>容器内 <code>free -h</code> 看起来还有内存，但 cgroup
+<code>memory.max</code> 已经接近；</li>
+<li>宿主机 Page Cache 被其他 job 挤压，单个容器指标看不出污染源；</li>
+<li>checkpoint 写入让宿主机 <code>Dirty</code>
+升高，影响同机读任务；</li>
+<li>容器 memory limit 太紧，导致 file cache 无法形成稳定工作集。</li>
+</ul>
+<p>平台层要把宿主机指标、cgroup
+指标和作业指标放在同一张时间线上，否则很容易把全机回写抖动误判成单个训练脚本问题。</p>
+<h2 id="checkpoint-写入语义临时文件fsyncrename">6. Checkpoint
+写入语义：临时文件、<code>fsync</code>、<code>rename</code></h2>
+<p>正确 checkpoint
+不只是“写完几个文件”。恢复逻辑不能看到半成品，也不能把某个 rank 的新
+shard 和另一个 rank 的旧 shard 混在一起。常见协议：</p>
+<pre class="text"><code>for each rank:
+  write checkpoint.step.tmp/rank-00023.tmp
+  fsync(rank shard)
+  rename rank-00023.tmp -&gt; rank-00023.bin
+
+coordinator:
+  write manifest.step.tmp
+  fsync(manifest.step.tmp)
+  rename manifest.step.tmp -&gt; manifest.step.json
+  fsync(checkpoint directory)
+  update latest.tmp
+  fsync(latest.tmp)
+  rename latest.tmp -&gt; latest
+  fsync(checkpoint directory)</code></pre>
+<p>manifest 至少应该包含：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>step / global_step</td>
+<td>恢复点身份</td>
+</tr>
+<tr>
+<td>rank 数量和 shard 列表</td>
+<td>防止缺 shard</td>
+</tr>
+<tr>
+<td>每个 shard 的 size / checksum</td>
+<td>防止截断或混入旧文件</td>
+</tr>
+<tr>
+<td>模型、优化器、scheduler 版本</td>
+<td>防止代码和状态不匹配</td>
+</tr>
+<tr>
+<td>写入完成时间和 producer id</td>
+<td>排查多 job 覆盖</td>
+</tr>
+</tbody>
+</table>
+<h3 id="为什么只写-latest-不够">6.1 为什么只写 <code>latest</code>
+不够</h3>
+<p>很多系统会用 <code>latest</code> 指向最新 checkpoint。如果多个 rank
+同时写，或者 coordinator 在 rank 完成前更新
+<code>latest</code>，恢复进程可能读到半成品。</p>
+<p>危险协议：</p>
+<pre class="text"><code>rank0 写 shard
+rank1 写 shard
+rank2 还没写完
+latest -&gt; step-1000
+恢复进程看到 latest，开始读取 step-1000</code></pre>
+<p>安全协议要让 <code>latest</code> 只指向已经通过 manifest 校验的
+step。恢复逻辑也不能只相信目录名，要读取 manifest 并校验 shard
+数量、大小、checksum 和训练配置。</p>
+<h3 id="崩溃矩阵">6.2 崩溃矩阵</h3>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 52%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th>崩溃点</th>
+<th>目录里可能看到什么</th>
+<th>恢复策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>shard tmp 写到一半</td>
+<td><code>rank-00001.tmp</code></td>
+<td>忽略 tmp，清理或后台 GC</td>
+</tr>
+<tr>
+<td>shard 已 rename，manifest 未提交</td>
+<td>完整 shard，但无 manifest</td>
+<td>不作为可恢复 checkpoint</td>
+</tr>
+<tr>
+<td>manifest tmp 写完但未 rename</td>
+<td><code>manifest.step.tmp</code></td>
+<td>忽略 tmp</td>
+</tr>
+<tr>
+<td>manifest rename 后父目录未 fsync</td>
+<td>崩溃后目录项可能丢失</td>
+<td>使用上一个完成 checkpoint</td>
+</tr>
+<tr>
+<td>latest 更新前崩溃</td>
+<td>新 step 存在但 latest 指旧 step</td>
+<td>可由扫描器补录，但在线恢复用 latest</td>
+</tr>
+<tr>
+<td>latest 更新后崩溃</td>
+<td>latest 指向新 manifest</td>
+<td>校验 manifest 后恢复</td>
+</tr>
+</tbody>
+</table>
+<p>核心原则：恢复路径只消费“已提交
+manifest”，不从临时文件和目录猜测状态。</p>
+<h3 id="checkpoint-storm所有-job-同时写就是集群级抖动">6.3 checkpoint
+storm：所有 job 同时写就是集群级抖动</h3>
+<p>如果 200 个训练 job 都每 30 分钟
+checkpoint，一旦它们从同一调度周期启动，就会形成 checkpoint storm。单机
+dirty page、共享文件系统 metadata server、对象存储
+gateway、网络链路都会同时被打满。</p>
+<p>缓解手段：</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 50%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>手段</th>
+<th>解决的问题</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>checkpoint jitter</td>
+<td>避免整点同时写</td>
+<td>恢复点间隔不再完全一致</td>
+</tr>
+<tr>
+<td>token bucket</td>
+<td>控制集群同时写入量</td>
+<td>需要平台调度器参与</td>
+</tr>
+<tr>
+<td>分 rank 限速</td>
+<td>避免单 job 打满节点 IO</td>
+<td>checkpoint wall time 可能变长但更稳定</td>
+</tr>
+<tr>
+<td>本地落盘后异步归档</td>
+<td>把训练阻塞从远端存储解耦</td>
+<td>本地盘容量和故障域要设计</td>
+</tr>
+<tr>
+<td>分层保留策略</td>
+<td>减少长期 checkpoint 数量</td>
+<td>恢复点选择变少</td>
+</tr>
+</tbody>
+</table>
+<p>对训练平台来说，稳定的 45 秒 checkpoint 往往比偶尔 15 秒、偶尔 5
+分钟更好，因为它让调度、SLO 和故障恢复都可预测。</p>
+<h2 id="huge-pages降低地址转换压力">7. Huge Pages：降低地址转换压力</h2>
+<p>4 KiB page 面对几十 GB 大数组会产生大量页表项。2 MiB huge page
+可以减少 TLB miss 和 page walk。这里要和 0b1 的 TLB 基础衔接：Huge Pages
+不让内存访问“跳过 DRAM”，它只减少虚拟地址到物理地址转换的开销。</p>
+<table>
+<thead>
+<tr>
+<th>page size</th>
+<th>覆盖 1 GiB 内存需要的页数</th>
+<th>典型影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4 KiB</td>
+<td>262144</td>
+<td>页表大，TLB 覆盖范围小</td>
+</tr>
+<tr>
+<td>2 MiB</td>
+<td>512</td>
+<td>TLB 覆盖范围大幅增加</td>
+</tr>
+<tr>
+<td>1 GiB</td>
+<td>1</td>
+<td>极低页表压力，但分配和预留更苛刻</td>
+</tr>
+</tbody>
+</table>
+<p>观察：</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;AnonHugePages|ShmemPmdMapped|FilePmdMapped&#39;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> dTLB-loads,dTLB-load-misses <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 10</span></code></pre></div>
+<h3 id="thp自动大页不是免费午餐">7.1 THP：自动大页不是免费午餐</h3>
+<p>Transparent Huge Pages 会尝试把合适的 4 KiB 页合并成 2 MiB 页，或者在
+fault 时直接分配 huge page。常见模式：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>模式</th>
+<th>含义</th>
+<th>适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>always</code></td>
+<td>尽量自动使用 THP</td>
+<td>离线训练、批处理、大吞吐服务可测试</td>
+</tr>
+<tr>
+<td><code>madvise</code></td>
+<td>只有应用标记区域才使用 THP</td>
+<td>allocator 可控的大数组、arena</td>
+</tr>
+<tr>
+<td><code>never</code></td>
+<td>禁用 THP</td>
+<td>严格低延迟服务、内存碎片敏感环境</td>
+</tr>
+</tbody>
+</table>
+<p><code>defrag</code> 控制 THP 分配时是否做内存整理。内存 compaction
+可能让单次分配或 page fault 等待更久，从而制造 p99/p999 延迟尖刺。</p>
+<div class="sourceCode" id="cb26"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/khugepaged/pages_collapsed</span></code></pre></div>
+<p><code>khugepaged</code> 是后台扫描并合并 huge page
+的线程。它能提升长期吞吐，但扫描、合并和拆分也会消耗 CPU。排障时要把 THP
+状态变化和请求延迟放在同一时间线看。</p>
+<h3 id="madvisemadv_hugepage把策略交给应用标记">7.2
+<code>madvise(MADV_HUGEPAGE)</code>：把策略交给应用标记</h3>
+<p><code>madvise</code>
+模式常用于折中：系统默认不激进合并，应用只对明确的大连续内存区域请求
+THP。</p>
+<div class="sourceCode" id="cb27"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>p <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> length<span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>               MAP_PRIVATE <span class="op">|</span> MAP_ANONYMOUS<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>p<span class="op">,</span> length<span class="op">,</span> MADV_HUGEPAGE<span class="op">);</span></span></code></pre></div>
+<p>适合标记的区域：</p>
+<ul>
+<li>大 batch 预处理 buffer；</li>
+<li>CPU 侧 embedding table 或 feature table；</li>
+<li>serving 进程长期存在的大 arena；</li>
+<li>大只读索引或模型辅助结构；</li>
+<li>确认访问局部性好、生命周期长的匿名内存。</li>
+</ul>
+<p>不适合标记的区域：</p>
+<ul>
+<li>大量短生命周期小对象；</li>
+<li>内存布局碎片化严重的 heap；</li>
+<li>请求路径临时 buffer；</li>
+<li>工作集经常被回收或 split 的区域。</li>
+</ul>
+<p>Python/ML 框架通常不会让你直接对每个 tensor 调
+<code>madvise</code>，但 allocator、runtime、C++ extension
+或服务框架可以在大 arena 层做这件事。是否值得做，要用 TLB miss 和 p99
+latency 证明。</p>
+<h3 id="hugetlb预留带来确定性也带来容量约束">7.3
+HugeTLB：预留带来确定性，也带来容量约束</h3>
+<p>HugeTLB 是显式预留的大页池。它比 THP
+更确定，因为页面预先保留，不依赖运行时
+compaction；代价是运维复杂，预留过多会减少普通内存。</p>
+<p>查看和配置：</p>
+<div class="sourceCode" id="cb28"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-i</span> huge /proc/meminfo</span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.nr_hugepages</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="kw">|</span> <span class="fu">grep</span> hugetlbfs</span></code></pre></div>
+<p>典型使用方式：</p>
+<div class="sourceCode" id="cb29"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl vm.nr_hugepages=4096</span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/huge</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-t</span> hugetlbfs none /mnt/huge</span></code></pre></div>
+<p>4096 个 2 MiB huge page 约等于 8 GiB。这个池子不是普通 Page Cache
+可以随便借用的内存，预留太多会让系统在普通分配、文件缓存和容器调度上更紧张。</p>
+<p>适合 HugeTLB 的场景：</p>
+<ul>
+<li>数据库 buffer pool；</li>
+<li>低延迟服务的长期大内存 arena；</li>
+<li>DPDK/RDMA 等明确要求 pinned/hugepage 的用户态 IO；</li>
+<li>少数通信缓冲或共享内存区域；</li>
+<li>能接受固定容量规划的 CPU 侧大数组。</li>
+</ul>
+<p>不适合 HugeTLB 的场景：</p>
+<ul>
+<li>动态大小、不确定生命周期的普通训练张量；</li>
+<li>依赖 Page Cache 的 dataset 读取；</li>
+<li>GPU HBM 内部访问；</li>
+<li>内存紧张且作业频繁变化的多租户节点。</li>
+</ul>
+<h3 id="huge-pages-的收益如何证明">7.4 Huge Pages 的收益如何证明</h3>
+<p>不要因为“模型很大”就打开 huge page。要先证明瓶颈在地址转换，而不是
+IO、内存带宽、锁竞争、Python overhead 或 GPU 同步。</p>
+<p>测量路径：</p>
+<div class="sourceCode" id="cb30"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> cycles,instructions,dTLB-loads,dTLB-load-misses,dtlb_load_misses.walk_completed <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;AnonHugePages|FilePmdMapped|ShmemPmdMapped|THPeligible&#39;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<p>如果启用 huge page 后：</p>
+<ul>
+<li>dTLB miss rate 明显下降；</li>
+<li>CPU cycles 或请求 p99 下降；</li>
+<li><code>AnonHugePages</code> 上升；</li>
+<li>没有新增 compaction 延迟尖刺；</li>
+</ul>
+<p>才说明它对你的 workload 有意义。若只看到 <code>AnonHugePages</code>
+增加，但吞吐和延迟没变，说明原瓶颈不在 TLB。</p>
+<h2 id="worked-examplecheckpoint-后半段突然卡住">8. Worked
+Example：checkpoint 后半段突然卡住</h2>
+<p>现象：8 卡训练每 30 分钟写一次 120 GiB checkpoint。日志显示前 70 GiB
+写入只用 8 秒，后 50 GiB 卡了 55 秒，期间所有 rank 等待 checkpoint
+完成，GPU 利用率掉到 0。</p>
+<p>排查：</p>
+<div class="sourceCode" id="cb31"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n1</span> <span class="st">&quot;grep -E &#39;Dirty|Writeback&#39; /proc/meminfo&quot;</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes</span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;nr_dirty|nr_writeback|pgpgout&#39;</span> /proc/vmstat</span></code></pre></div>
+<p>发现：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>现象</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Dirty</code></td>
+<td>从 5 GiB 快速涨到 90 GiB</td>
+<td>前半段只是写入 Page Cache</td>
+</tr>
+<tr>
+<td><code>Writeback</code></td>
+<td>长时间保持高位</td>
+<td>flusher 正在追赶</td>
+</tr>
+<tr>
+<td>NVMe / 文件系统吞吐</td>
+<td>稳态 2.2 GiB/s</td>
+<td>真实落盘能力低于瞬时写入</td>
+</tr>
+<tr>
+<td>GPU 利用率</td>
+<td>checkpoint 期间掉到 0</td>
+<td>所有 rank 被同步点阻塞</td>
+</tr>
+</tbody>
+</table>
+<p>前半段快只是写入 Page Cache，不是真实落盘。后半段卡住是 dirty 阈值和
+<code>fsync()</code> 把延迟债务集中暴露。</p>
+<p>修复：</p>
+<ol type="1">
+<li>每 rank 写独立 shard，减少锁和单文件扩展争用；</li>
+<li><code>vm.dirty_background_bytes</code> 设到 8
+GiB，<code>vm.dirty_bytes</code> 设到 24 GiB；</li>
+<li>checkpoint writer 做并发限制，避免 8 个 rank 同时打满同一设备；</li>
+<li>使用
+<code>tmp -&gt; fsync -&gt; rename -&gt; manifest -&gt; fsync dir -&gt; latest</code>
+协议；</li>
+<li>本地 NVMe 完成后后台归档到对象存储；</li>
+<li>集群层给 checkpoint 加 jitter，避免多 job 同时写。</li>
+</ol>
+<p>验收：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>修复前</th>
+<th>修复后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>checkpoint wall time</td>
+<td>63 秒</td>
+<td>31 秒</td>
+</tr>
+<tr>
+<td>最大 Dirty</td>
+<td>90 GiB</td>
+<td>24 GiB</td>
+</tr>
+<tr>
+<td>step time p99</td>
+<td>高且不稳定</td>
+<td>可预测</td>
+</tr>
+<tr>
+<td>恢复校验</td>
+<td>依赖目录扫描</td>
+<td>依赖 manifest checksum</td>
+</tr>
+</tbody>
+</table>
+<h2 id="worked-examplethp-打开后-serving-p99-变差">9. Worked
+Example：THP 打开后 serving p99 变差</h2>
+<p>现象：CPU serving 服务加载 80 GiB embedding 和若干索引后，开启 THP
+<code>always</code>，平均吞吐提升 4%，但 p99 从 35 ms 增加到 120
+ms，偶尔出现 500 ms 尖刺。</p>
+<p>排查：</p>
+<div class="sourceCode" id="cb32"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;compact|thp|pgscan&#39;</span> /proc/vmstat</span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> dTLB-loads,dTLB-load-misses <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;AnonHugePages|THPeligible&#39;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<p>判断：</p>
+<ul>
+<li>dTLB miss 确实下降，说明 THP 有收益；</li>
+<li>p99 尖刺和 compaction / huge page fault 时间相关；</li>
+<li>服务请求路径会触碰新分配的大内存区域；</li>
+<li><code>always</code> 策略过于激进。</li>
+</ul>
+<p>修复：</p>
+<ul>
+<li>把系统 THP 调成 <code>madvise</code>；</li>
+<li>服务启动阶段预分配并触碰大 arena；</li>
+<li>只对长期大数组 <code>MADV_HUGEPAGE</code>；</li>
+<li>请求路径避免首次触碰冷页；</li>
+<li>如果仍需确定性，评估 HugeTLB 预留，但限制容量。</li>
+</ul>
+<p>工程结论：THP
+是吞吐和尾延迟的权衡。训练批处理可以更积极，在线服务要用 p99/p999
+证明策略。</p>
+<h2 id="观测-sop读慢写卡大页抖">10. 观测 SOP：读慢、写卡、大页抖</h2>
+<p>遇到“数据读取慢”：</p>
+<pre class="text"><code>1. 看存储读带宽和 await
+2. 看 major faults 是否增长
+3. 看 Cached / Active(file) / Inactive(file)
+4. 看是否有其他 job 引发 pgscan/pgsteal/refault
+5. 区分 cold-cache benchmark 和 warm-cache benchmark</code></pre>
+<p>遇到“checkpoint 后半段卡住”：</p>
+<pre class="text"><code>1. 看 Dirty / Writeback 是否快速上涨
+2. 看 dirty_ratio 是否在大内存机器上过大
+3. 看 iostat util/await 是否打满
+4. 看 fsync 等待点和 manifest 提交点
+5. 降低 dirty bytes、限并发、错峰、异步归档</code></pre>
+<p>遇到“THP 后延迟抖”：</p>
+<pre class="text"><code>1. 看 THP enabled/defrag/khugepaged
+2. 看 dTLB miss 是否真下降
+3. 看 compaction 和 page fault 是否对应 p99
+4. 从 always 改 madvise，启动期预热大 arena
+5. 必要时用 HugeTLB 换确定性</code></pre>
+<h2 id="checklist">11. Checklist</h2>
+<ul class="task-list">
+<li><label><input
+type="checkbox" />是否区分读缓存命中和真实存储吞吐？</label></li>
+<li><label><input type="checkbox" />benchmark 是否分别报告 cold-cache 与
+warm-cache？</label></li>
+<li><label><input type="checkbox" />是否监控
+<code>Dirty</code>、<code>Writeback</code>、<code>pgmajfault</code>、<code>workingset_refault_file</code>？</label></li>
+<li><label><input type="checkbox" />checkpoint 是否有原子提交协议和
+manifest 校验？</label></li>
+<li><label><input
+type="checkbox" />是否用字节阈值而不是比例阈值控制大内存机器上的 dirty
+page？</label></li>
+<li><label><input type="checkbox" />多 job checkpoint 是否有
+jitter、限速或 token bucket？</label></li>
+<li><label><input type="checkbox" />Page Cache
+污染是否用调度、数据布局和 fadvise 共同治理？</label></li>
+<li><label><input type="checkbox" />THP
+策略是否符合低延迟或离线训练目标？</label></li>
+<li><label><input type="checkbox" />是否用 <code>perf</code> 验证 TLB
+miss，而不是盲目开 huge page？</label></li>
+<li><label><input type="checkbox" />HugeTLB 预留是否纳入普通内存、Page
+Cache 和容器容量规划？</label></li>
+</ul>
+<h2 id="练习">12. 练习</h2>
+<ol type="1">
+<li>设计 5 条命令判断 dataset 第二轮读取变快是否来自 Page
+Cache，并说明每条命令能排除什么误判。</li>
+<li>一台 256 GiB 内存机器 <code>vm.dirty_ratio=20</code>，估算 dirty
+上限，并解释对 80 GiB checkpoint 的影响。</li>
+<li>把 <code>dirty_ratio</code> 改成 <code>dirty_bytes</code>
+的规划题：存储稳定写吞吐 4 GiB/s，允许额外回写等待不超过 10 秒，给出
+dirty 上限建议。</li>
+<li>写出一个多 rank checkpoint
+原子提交协议，要求恢复路径不能看到半成品。</li>
+<li>设计一个 checkpoint storm 缓解方案，包含 job
+侧、节点侧和集群侧手段。</li>
+<li>给出查看 THP 当前策略、某进程 <code>AnonHugePages</code>、TLB
+miss、compaction 指标的命令。</li>
+<li>说明 Page Cache、应用级 cache 和对象存储 cache 的差别。</li>
+<li>给一个场景说明为什么 THP 提升平均吞吐，却可能恶化 p99。</li>
+<li>判断 direct IO benchmark 为什么不能直接代表 buffered dataset reader
+的性能。</li>
+<li>为一个 100 GiB mmap 索引服务设计启动预热和 p99 验收流程。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

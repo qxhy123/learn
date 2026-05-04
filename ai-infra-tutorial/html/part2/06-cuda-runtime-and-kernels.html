@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>第 6 章 · CUDA、运行时与算子执行 — AI Infra 教程</title>
+<title>第 6 章 · CUDA、运行时与算子执行导览 — AI Infra 教程</title>
 <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body class="has-sidebar">
@@ -11,424 +11,124 @@
 <main class="page">
 <nav class="topnav"></nav>
 <section class="hero">
-<h1>第 6 章 · CUDA、运行时与算子执行</h1>
-<p class="sub">从“上层张量表达如何被转成 GPU 可执行命令流”出发，理解 runtime、kernel launch、stream、CUDA Graph、成熟算子库和 SM 内部资源约束之间的因果关系。</p>
-<div class="chips"><span class="chip">CUDA Runtime</span><span class="chip">Kernel Launch</span><span class="chip">Stream</span><span class="chip">CUDA Graph</span><span class="chip">算子融合</span><span class="chip">Nsight</span></div>
-<div class="note"><strong>不可化简的问题：</strong>GPU 有大量并行计算单元和很高显存带宽，但它不能自己理解模型；AI 系统必须把 <code>model(x)</code> 分解成设备命令流，并在调度、内存、寄存器和同步约束下持续喂满硬件。</div>
-<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+<h1>第 6 章 · CUDA、运行时与算子执行导览</h1>
+<p class="sub">原第 6 章已拆成 06a-06d：dispatch/launch、stream/Graph、算子库/SM 资源、profiling SOP 分别独立展开。</p>
+<div class="chips"><span class="chip">CUDA</span><span class="chip">Runtime</span><span class="chip">Kernel Launch</span><span class="chip">Stream</span><span class="chip">Fusion</span><span class="chip">Profiling</span></div>
 </section>
-
-<section class="toc">
-<h2>本章目录</h2>
-<ol>
-<li><a class="anchor" href="#s1">第一性原理拆解：CUDA runtime 与 kernel 执行</a></li>
-<li><a class="anchor" href="#s2">学习目标与本章导读</a></li>
-<li><a class="anchor" href="#s3">从 model(x) 到 GPU 执行</a></li>
-<li><a class="anchor" href="#s4">为什么 kernel launch 不是免费</a></li>
-<li><a class="anchor" href="#s5">Stream、同步点与 CUDA Graph</a></li>
-<li><a class="anchor" href="#s6">高质量库与 FlashAttention</a></li>
-<li><a class="anchor" href="#s7">SM 调度、Warp 与 Register Spill</a></li>
-<li><a class="anchor" href="#s8">运行时与编译器边界</a></li>
-<li><a class="anchor" href="#s9">Profiling 与排障思路</a></li>
-<li><a class="anchor" href="#s10">工程建议与工具速查</a></li>
-<li><a class="anchor" href="#s11">本章小结</a></li>
-<li><a class="anchor" href="#s12">练习题</a></li>
-</ol>
-</section>
-
-<section class="section" id="s1">
-<h2>1. 第一性原理拆解：CUDA runtime 与 kernel 执行</h2>
-<h3>拆 — 不可化简的问题</h3>
-<p>剥离 CUDA、PyTorch、kernel、stream、Graph 这些名字，本章真正要解决的不可化简问题是：一台 GPU 有大量并行计算单元和很高的显存带宽，但它不能自己理解模型，也不能自己决定下一步执行什么；AI 系统必须把上层的张量表达，分解成设备能执行的命令流，并让这些命令在有限的调度、内存、寄存器和同步约束下持续喂满硬件。这件事之所以难，不是因为 API 多，而是因为两类时间尺度天然不匹配：CPU / runtime 发起一次 kernel 可能要 20-200 μs，而一个小算子本身可能只执行 5-20 μs；GPU 内部一个 warp 的指令切换以 cycle 计，而一次 HBM 访问可能要数百 cycle。只要命令供应、数据供应或线程驻留任一环节断掉，峰值 TFLOPS 就只存在于规格表里。</p>
-<p>“AI 工程师不一定要手写很多 kernel，但必须知道框架调用到底是怎样落到设备执行上的”，这句话对应的不是好奇心，而是工程责任边界。训练或推理慢，表面现象可能都是 GPU 利用率低：有时是 Python 和 dispatcher 把图切成了几千个小 kernel；有时是 stream 依赖让 H2D 拷贝和计算串行；有时是一次 <code>.item()</code> 把异步队列强制拉平；有时是某个自定义 kernel 因 register pressure 太高，occupancy 掉到很低，还把临时变量 spill 到 local memory。平台工程师不需要代替库作者重写 GEMM，但必须能判断“慢在发命令、排队、同步、访存、寄存器，还是算子实现”。本章就是把这条从 <code>model(x)</code> 到 SM execution 的链路拆开，让你能把一个黑箱 profile 还原成可行动的瓶颈假设。</p>
-<h3>推 — 从这个问题如何推导出每个机制</h3>
-<p>从“GPU 不能自己决定干什么”出发，第一层机制必然是 runtime 和 driver：上层框架必须把张量操作变成 kernel launch，把参数、grid、block、stream 和依赖关系提交给设备。由于 launch 有固定成本，第二层机制必然是减少 launch 次数：算子融合把多个小算子合成一个 kernel，CUDA Graph 把重复的 launch 序列捕获成可回放的 DAG，编译器把稳定 shape 下的 eager 调用变成更少的设备命令。这里的因果不是“Graph 很高级所以要学”，而是“当每个小 kernel 的执行时间小于 launch 开销时，CPU 发命令会成为系统瓶颈”。</p>
-<p>从“GPU 同时处理多条命令和多块数据”出发，stream 必然存在。没有 stream，所有拷贝、计算、通信都像单队列排队，H2D 预取、NCCL allreduce 和反向计算就无法重叠。stream 带来异步性，也带来同步语义；因此 event、隐式同步点、默认 stream 行为就变成工程边界。一个 <code>print(loss.item())</code> 看起来只是日志，实际可能把 CPU 阻塞到 GPU 完成前面所有工作；一个错误的 event 依赖可能让多 stream 重新退化成串行。</p>
-<p>从“设备内部资源有限”出发，SM、warp、register、shared memory 和 occupancy 必然进入视野。kernel 被分成 block，block 被调度到 SM；SM 用 warp scheduler 在多个 warp 之间切换，以隐藏访存延迟。每个线程需要 register 保存中间值，每个 block 可能需要 shared memory；这些资源越多，同一 SM 能驻留的 block / warp 越少。若单线程临时变量过多，编译器会产生 register spill，把本该在寄存器里的值放到 local memory，而 local memory 实际落在显存路径上，代价远高于寄存器访问。于是你会看到一个反直觉结论：更复杂的 fused kernel 不一定更快，融合降低了 launch 和 HBM 中间写回，但也可能增加 register pressure，降低 occupancy，甚至因 spill 变慢。工程优化的目标不是追一个单指标，而是在 launch overhead、访存次数、occupancy、寄存器使用和库成熟度之间找可验证的平衡。</p>
-<h3>绘 — 因果链路</h3>
-<pre class="mermaid">mindmap
-  root((CUDA runtime 与 kernel 执行))
-    不可化简问题
-      GPU不会理解模型
-      CPU必须提交命令
-      设备资源有限
-      异步队列需要依赖
-    从model到设备
-      Python调用
-      Framework dispatcher
-      CUDA runtime API
-      Driver
-      GPU scheduler
-      SM execution
-    Launch成本
-      小kernel太多
-      CPU发命令跟不上
-      算子融合
-      CUDA Graph
-      torch.compile
-    Stream与同步
-      H2D和计算重叠
-      NCCL通信重叠
-      event依赖
-      item和cpu隐式同步
-    SM内部约束
-      Block调度到SM
-      Warp scheduler
-      Register pressure
-      Occupancy
-      Spill到local memory
-    工程判断
-      nsys看时间线
-      ncu看kernel
-      优先成熟库
-      边界是端到端吞吐</pre>
-<h3>导 — 读完本章你应该能回答</h3>
-<ol>
-<li>为什么一个 forward 里的 3000 个小 kernel 可能比 300 个较大的 fused kernel 更慢，即使总 FLOPs 没变？</li>
-<li>从 <code>model(x)</code> 到 SM execution，中间至少经过哪些层，每一层常见的固定开销和排障工具是什么？</li>
-<li>为什么 CUDA stream 能让拷贝、计算和通信重叠，而一个隐式同步点又如何把它们重新变成串行？</li>
-<li>CUDA Graph 解决的是哪一类 CPU / runtime 开销？为什么动态 shape、动态地址或复杂依赖会削弱它的收益？</li>
-<li>一个 kernel 的 occupancy 很高但 Tensor Core utilization 很低时，你为什么不能简单说“GPU 已经跑满”？</li>
-<li>register pressure 如何限制 SM 上的活跃 warp？register spill 到 local memory 为什么可能让 fused kernel 反而变慢？</li>
-<li>面对一次端到端性能退化，你如何判断该从框架图、runtime 时间线、stream 同步、成熟库版本，还是 kernel 级 <code>ncu</code> 指标开始查？</li>
-</ol>
-</section>
-
-<section class="section" id="s2">
-<h2>2. 学习目标与本章导读</h2>
-<p>完成本章学习后，你将能够理解 AI 框架、CUDA runtime、kernel 和硬件之间的调用关系，认识 kernel launch、stream、同步点对性能的影响，理解为什么“很多小 kernel”常常意味着低效，知道库、编译器和自定义算子在 AI 系统中的角色，并建立“问题到底出在框架、运行时还是设备”的排障意识。</p>
-<div class="grid-3">
-<div class="card"><strong>执行链路</strong><br>从 Python 调用一路追到 CUDA runtime、driver、GPU scheduler 和 SM execution。</div>
-<div class="card"><strong>运行时瓶颈</strong><br>识别 launch 稀疏、stream 串行、隐式同步和 CUDA Graph 适用边界。</div>
-<div class="card"><strong>工具视角</strong><br>读懂 Nsight Systems 时间线，知道何时再进入 <code>ncu</code> 看 kernel 级指标。</div>
-</div>
-<div class="note"><strong>关联章节：</strong>本章与 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的搬运链路、<a href="../part2/04-gpu-and-accelerators.html">第 4 章</a> 的硬件上限直接相连。后续 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的批处理调度、<a href="../part5/16-quantization-compilation-and-engines.html">第 16 章</a> 的编译优化，都依赖 kernel launch、stream 和融合机制。</div>
-<p>很多团队第一次看性能 profile 时会有一个共同感受：本以为 GPU 一直在忙，打开时间线发现大片空白。Kernel 之间可能有 100-500 μs 的间隙，H2D 拷贝和计算是串行的，一个 step 里 40% 时间 GPU 在等 CPU 发命令。这些问题的共同源头是：GPU 不能自己决定干什么，它在等 CPU 告诉它下一步做什么。</p>
-<pre><code>从 model(x) 到 GPU 执行，中间有至少 6 层
-  ├── Python 调用
-  ├── Framework dispatcher (C++)
-  ├── CUDA runtime API
-  ├── CUDA driver
-  ├── GPU scheduler
-  └── SM execution
-
-任何一层慢，整体都慢</code></pre>
-</section>
-
-<section class="section" id="s3">
-<h2>3. 从 <code>model(x)</code> 到 GPU 执行</h2>
-<p>一个看起来简单的框架调用，背后通常经历 Python / Framework API、Graph / Eager dispatch、CUDA runtime、Kernel launch、GPU scheduler / SM execution。这里面每一层都可能影响最终性能：Python 层可能引入额外调度和对象开销，框架层可能把计算拆成很多小算子，runtime 层要负责 launch 和同步，设备层最终受寄存器、shared memory、warp 调度影响。</p>
-<pre class="mermaid">sequenceDiagram
-  participant User as Python / model(x)
-  participant FW as Framework dispatcher
-  participant RT as CUDA runtime
-  participant DR as CUDA driver
-  participant GPU as GPU scheduler
-  participant SM as SM execution
-  User->>FW: Tensor op / module forward
-  FW->>FW: Eager dispatch or compiled graph
-  FW->>RT: cudaLaunchKernel(params, stream)
-  RT->>DR: submit command buffer
-  DR->>GPU: enqueue work
-  GPU->>SM: assign thread blocks
-  SM-->>GPU: kernel complete
-  GPU-->>RT: event / completion state</pre>
-<h3>每一层的典型开销</h3>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#为什么要拆分第-6-章">1. 为什么要拆分第 6 章</a></li><li><a class="anchor" href="#拆分后的阅读路径">2. 拆分后的阅读路径</a></li><li><a class="anchor" href="#总框架从模型调用到-sm-执行">3. 总框架：从模型调用到 SM 执行</a></li><li><a class="anchor" href="#和相邻章节的关系">4. 和相邻章节的关系</a></li><li><a class="anchor" href="#快速自测">5. 快速自测</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>本章已拆分为独立子章</strong>：原来的第 6 章同时覆盖
+framework dispatch、kernel launch、stream、CUDA Graph、算子库、SM
+资源、profiling 和排障 SOP，单页内容过宽。现在第 6
+章保留为导览章，详细内容拆到 06a-06d。</p>
+</blockquote>
+<h2 id="为什么要拆分第-6-章">1. 为什么要拆分第 6 章</h2>
+<p>AI 工程师不一定要手写很多
+kernel，但必须知道框架调用怎样落到设备执行上。这里面至少有四类问题：</p>
+<ul>
+<li><code>model(x)</code> 经过 Python、framework dispatcher、ATen、CUDA
+runtime、driver 和 kernel launch，每一层都有固定开销；</li>
+<li>stream、event、隐式同步、H2D/compute/NCCL overlap 和 CUDA Graph
+决定命令队列是否真正异步；</li>
+<li>cuBLAS、cuDNN、FlashAttention、Triton、CUTLASS 和 fused kernel
+决定常见算子是否吃到硬件路径；</li>
+<li>nsys、ncu、torch.profiler 和性能回归测试决定团队能否把“GPU
+利用率低”拆成可验证的瓶颈。</li>
+</ul>
+<p>这些问题都属于“运行时与算子执行”，但排查入口不同。拆开以后，每个子章可以服务一个具体工程动作：减少
+launch、修同步、换 kernel、做 profile。</p>
+<h2 id="拆分后的阅读路径">2. 拆分后的阅读路径</h2>
 <table>
-<tr><th>层</th><th>一次调用的典型开销</th><th>主要优化手段</th></tr>
-<tr><td>Python 解释</td><td>几 μs - 几十 μs</td><td>JIT、编译、减少 Python 层逻辑</td></tr>
-<tr><td>Framework dispatch</td><td>几 μs</td><td><code>torch.compile</code>、Fused op</td></tr>
-<tr><td>Caching allocator</td><td>&lt; 1 μs</td><td>预分配、复用 buffer</td></tr>
-<tr><td>CUDA runtime</td><td>5-20 μs</td><td>CUDA Graph、减少 launch 次数</td></tr>
-<tr><td>CUDA driver</td><td>2-10 μs</td><td>减少 launch、稳定图结构</td></tr>
-<tr><td>Kernel 实际执行</td><td>视算子 10 μs - 数十 ms</td><td>算子融合、更好的 kernel</td></tr>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 18%" />
+<col style="width: 62%" />
+</colgroup>
+<thead>
+<tr>
+<th>子章</th>
+<th>主题</th>
+<th>你应该在什么时候读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="06a-framework-dispatch-runtime-and-kernel-launch.html">06a
+Framework Dispatch、Runtime 与 Kernel Launch</a></td>
+<td>Python/API、framework dispatcher、ATen、CUDA runtime/driver、kernel
+launch 固定开销、eager vs compiled</td>
+<td>你看到一个 step 里小 kernel 很多、CPU launch 跟不上、B200/H100
+加速比低</td>
+</tr>
+<tr>
+<td><a href="06b-streams-synchronization-and-cuda-graphs.html">06b
+Stream、同步与 CUDA Graph</a></td>
+<td>stream、event、默认 stream、隐式同步、H2D/compute/NCCL overlap、CUDA
+Graph capture/replay</td>
+<td>你看到拷贝和计算串行、<code>.item()</code> 导致同步、Graph
+开启后收益不稳定</td>
+</tr>
+<tr>
+<td><a
+href="06c-kernel-libraries-fusion-and-sm-resource-limits.html">06c
+算子库、融合与 SM 资源边界</a></td>
+<td>cuBLAS/cuDNN/CUTLASS/FlashAttention/Triton、fusion、SM/block/warp、occupancy、register
+pressure、spill</td>
+<td>你要判断该换库、开融合、写 Triton，还是某个 fused kernel
+反而变慢</td>
+</tr>
+<tr>
+<td><a href="06d-profiling-debugging-and-performance-sop.html">06d
+Profiling、Debugging 与性能排障 SOP</a></td>
+<td>nsys、ncu、torch.profiler、CUDA_LAUNCH_BLOCKING、时间线读法、宏观到微观、性能回归测试</td>
+<td>你要建立团队排障流程，或把一次性能退化定位到具体层级</td>
+</tr>
+</tbody>
 </table>
-<div class="warn"><strong>关键观察：</strong>一次 kernel launch 的固定开销累计约 20-200 μs。如果 kernel 本身只跑 10 μs，大部分时间就在 launch，而不是计算。GPU 越快，launch 占比反而越容易升高。</div>
-</section>
-
-<section class="section" id="s4">
-<h2>4. 为什么 kernel launch 不是免费</h2>
-<p>每次 kernel launch 都有固定成本。若把一次本可融合的计算拆成大量小 kernel，常见后果是 launch overhead 占比升高、中间结果频繁回写显存、stream 上同步点增加。这也是现代框架和推理引擎都在做算子融合、graph capture 和编译优化的原因。</p>
-<h3>一个直观算式</h3>
-<pre><code>理想执行时间 = N × K
-实际执行时间 ≈ N × max(L, K)   (CPU 和 GPU 按瓶颈者算)
-
-launch 占比 = max(0, L - K) / max(L, K)</code></pre>
-<p>一个例子：某模型一个 forward 有 5000 个 kernel，平均每个 kernel 10 μs，launch 开销 20 μs。理想时间是 50 ms，实际可能接近 100 ms；如果算子融合把 kernel 数降到 500 个、每个 100 μs，实际又可能回到 50 ms。这解释了 FlashAttention、fused MLP、fused RMSNorm 的加速比为什么可以到 2-3 倍：不是算得更少，而是 launch 和同步得更少。</p>
-<h3>算子融合的层次</h3>
-<table>
-<tr><th>融合层次</th><th>例子</th><th>由谁做</th></tr>
-<tr><td>手写 fused kernel</td><td>FlashAttention、RMSNorm + 残差、fused QKV projection</td><td>研究员 / 库作者</td></tr>
-<tr><td>编译器级融合</td><td>TorchInductor、XLA 的 elementwise fusion</td><td>编译器</td></tr>
-<tr><td>图级优化</td><td>TensorRT 引擎的算子合并</td><td>推理编译器</td></tr>
-<tr><td>Graph capture</td><td>CUDA Graph 把一串 kernel 变成一次可回放提交</td><td>运行时</td></tr>
-</table>
+<h2 id="总框架从模型调用到-sm-执行">3. 总框架：从模型调用到 SM 执行</h2>
 <pre class="mermaid">flowchart LR
-  A[许多小算子] --> B[许多 kernel launch]
-  B --> C[CPU/runtime 固定开销放大]
-  B --> D[中间结果反复写回 HBM]
-  C --> E[GPU 时间线出现空洞]
-  D --> E
-  E --> F{优化方向}
-  F --> G[算子融合]
-  F --> H[CUDA Graph]
-  F --> I[torch.compile / TensorRT]
-  G --> J[更少 launch 与 HBM 往返]
-  H --> K[重复 DAG 低开销回放]
-  I --> L[稳定 shape 下自动融合]</pre>
-<div class="success"><strong>工程含义：</strong>日常开发先试 <code>torch.compile(mode="reduce-overhead")</code>；推理生产优先使用 vLLM、TensorRT-LLM 等内置融合和 Graph 的引擎；追求极致吞吐时再评估手写或定制 fused kernel。</div>
-</section>
+  A[model(x)] --> B[Python / Framework API]
+  B --> C[Dispatcher / ATen / Graph]
+  C --> D[CUDA Runtime / Driver]
+  D --> E[Kernel Launch / Stream Queue]
+  E --> F[GPU Scheduler]
+  F --> G[SM / Warp / Tensor Core / HBM]
 
-<section class="section" id="s5">
-<h2>5. Stream、同步点与 CUDA Graph</h2>
-<p>默认情况下，很多人把 GPU 当作“发命令就自动快”。但真正重要的是命令是否落在同一个 stream，是否被隐式同步打断，数据拷贝和计算能否重叠。尤其当 H2D / D2H 已经受 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的 PCIe 或 NVLink 链路限制时，同步点会让“本可重叠的搬运”重新变成串行。</p>
-<h3>常见隐式同步点</h3>
-<table>
-<tr><th>代码</th><th>隐式同步</th><th>修正</th></tr>
-<tr><td><code>tensor.item()</code></td><td>强制把 GPU 数值搬回 CPU</td><td>只在真正需要时调用</td></tr>
-<tr><td><code>print(loss)</code></td><td><code>loss</code> 是 GPU 标量时会等待</td><td>累积后再 print，或用 async logger</td></tr>
-<tr><td><code>tensor.cpu()</code></td><td>D2H 完整同步</td><td>用 pinned memory + <code>non_blocking=True</code></td></tr>
-<tr><td><code>torch.cuda.synchronize()</code></td><td>显式全同步</td><td>只用于 benchmark，生产慎用</td></tr>
-<tr><td><code>if tensor &gt; 0:</code></td><td>隐含一次 <code>.item()</code></td><td>改成 tensor 级比较</td></tr>
-<tr><td><code>tensor.numpy()</code></td><td>D2H 同步</td><td>延后到真正需要 CPU 时</td></tr>
-<tr><td><code>assert tensor.sum() &gt; 0</code></td><td>同步 + 比较</td><td>生产代码去掉或改成异步检查</td></tr>
-</table>
-<div class="danger"><strong>生产风险：</strong>每 step 调用 <code>print(loss.item())</code> 常能吃掉 5-10% 吞吐；它不是“日志小问题”，而是把异步 GPU 队列拉平的同步点。</div>
-<h3>CUDA Graph 与 Stream 优化</h3>
-<table>
-<tr><th>手段</th><th>主要解决什么</th><th>更适合什么场景</th><th>常见限制</th></tr>
-<tr><td>CUDA Graph</td><td>减少重复 launch 的 CPU 开销</td><td>形状稳定、迭代重复的训练 step / 推理批次</td><td>动态 shape、多分支控制流、部分调试工具兼容性差</td></tr>
-<tr><td>多 Stream</td><td>让计算与拷贝、不同 kernel 尽量重叠</td><td>H2D 预取、通信与计算 overlap、流水式推理</td><td>需要显式管理依赖，否则容易引入隐式同步</td></tr>
-</table>
-<pre class="mermaid">flowchart TB
-  subgraph Capture[CUDA Graph Capture]
-    A[固定输入/输出 tensor 地址] --> B[记录 kernel launch DAG]
-    B --> C[生成 graph 对象]
-  end
-  subgraph Replay[Replay 阶段]
-    D[每个 step 更新静态 buffer] --> E[一次回放整个 DAG]
-    E --> F[绕过重复 Python/dispatcher/runtime launch]
-  end
-  Capture --> Replay
-  G{收益边界} --> H[大量短 kernel: 高收益]
-  G --> I[少量大 kernel: 收益小]
-  G --> J[动态 shape/地址: 捕获成本上升]
-  G --> K[复杂多 stream: 依赖可能改变]</pre>
-<h3>Stream 的典型用法</h3>
-<pre><code class="language-python"># 在 side stream 上做 H2D，主 stream 跑计算
-next_batch_stream = torch.cuda.Stream()
-with torch.cuda.stream(next_batch_stream):
-    next_batch = next_batch.cuda(non_blocking=True)
-
-# 主 stream 继续跑 current_batch 的计算</code></pre>
-<p>通信与计算重叠也是 stream 的典型应用：NCCL 默认会用独立 stream，DDP 的 bucket + allreduce 之所以能重叠 backward，就是把 allreduce 放在不同 stream。推理服务中，SGLang 等引擎也会给请求分配 stream，让多个请求在同一 GPU 上并发推进。</p>
-<div class="warn"><strong>边界提醒：</strong>多 stream 用错反而更慢。最典型的问题是没有正确的 event 同步，导致 stream 之间产生隐式依赖或数据竞争。</div>
-</section>
-
-<section class="section" id="s6">
-<h2>6. 高质量库与 FlashAttention</h2>
-<p>对于 GEMM、卷积、layernorm、attention 等常见操作，高质量库往往已经对 kernel 选择、数据布局、内存访问模式和 Tensor Core 路径做过大量优化。成熟库不是抽象概念，而是具体的工程资产。</p>
-<table>
-<tr><th>库 / 项目</th><th>主要负责什么</th><th>常见使用位置</th></tr>
-<tr><td>cuBLAS / cuBLASLt</td><td>高性能矩阵乘法、GEMM 变体</td><td>Linear、MLP、Attention 内部 matmul</td></tr>
-<tr><td>cuDNN</td><td>卷积、归一化、部分 attention / fused op 后端</td><td>CNN、RNN、部分 Transformer 后端</td></tr>
-<tr><td>CUTLASS</td><td>自定义 GEMM / epilogue 的模板化积木</td><td>自研 fused kernel、定制数据布局</td></tr>
-<tr><td>FlashAttention</td><td>IO-aware attention 优化</td><td>长上下文 attention、推理和训练加速</td></tr>
-<tr><td>FlashInfer</td><td>推理优化算子库</td><td>vLLM、SGLang 的 attention 后端</td></tr>
-<tr><td>Triton</td><td>Python 写 CUDA kernel 的 DSL</td><td>社区大量自定义 kernel</td></tr>
-<tr><td>CuTeDSL</td><td>Blackwell 优化抽象</td><td>FlashAttention-4 等新一代库</td></tr>
-</table>
-<div class="success"><strong>默认原则：</strong>先确认是不是调用方式、图形状或数据布局有问题，再考虑是否需要自定义算子。对标准算子，升级成熟库通常比自研优化更稳。</div>
-<h3>FlashAttention 的演进</h3>
-<p>FlashAttention 系列是“算法 + 硬件协同设计”的典型案例。FlashAttention-1 的核心思想是 IO-aware，用 tiling 让 attention 在 SRAM 内完成，避免往 HBM 写中间的 N×N 矩阵。FlashAttention-2 优化 warp 划分并 parallelize over sequence。FlashAttention-3 针对 Hopper 架构，利用 WGMMA、TMA、warp specialization 等特性提高 H100 上的利用率。FlashAttention-4 则继续面向 Blackwell 新特性优化。</p>
-<table>
-<tr><th>版本</th><th>核心优化</th><th>平台启示</th></tr>
-<tr><td>FlashAttention-1</td><td>IO-aware tiling，避免 N×N 中间矩阵写回 HBM</td><td>同样的数学公式，访存路径不同，性能可能差数倍</td></tr>
-<tr><td>FlashAttention-2</td><td>优化 warp 划分，按 sequence 并行</td><td>算法实现需要匹配硬件代际</td></tr>
-<tr><td>FlashAttention-3</td><td>利用 Hopper 的 WGMMA、TMA、warp specialization</td><td>H100 上还停在旧 attention 后端就是浪费硬件</td></tr>
-<tr><td>FlashAttention-4</td><td>面向 Blackwell 的新一代优化抽象</td><td>跨硬件升级时要同步升级 kernel 库</td></tr>
-</table>
-</section>
-
-<section class="section" id="s7">
-<h2>7. SM 调度、Warp 与 Register Spill</h2>
-<p>一个 kernel launch 进入设备后，不是“整个 kernel 一次性占用 GPU”。更准确的过程是：grid 被拆成许多 thread block，GPU scheduler 把 block 分配到不同 SM；每个 block 内部的线程再按 warp 执行，NVIDIA GPU 上一个 warp 通常是 32 个线程。SM 内部有 warp scheduler，它会在多个已驻留的 warp 之间切换：某个 warp 在等 HBM、shared memory 或依赖指令时，scheduler 尽量切到另一个可执行 warp。这个机制的目标很朴素：用更多可运行 warp 隐藏单个 warp 的等待时间。</p>
-<pre class="mermaid">flowchart TB
-  A[Kernel launch] --> B[Grid]
-  B --> C[Thread blocks]
-  C --> D[GPU scheduler]
-  D --> E[SM 0]
-  D --> F[SM 1]
-  D --> G[SM N]
-  E --> H[Resident blocks]
-  H --> I[Warps]
-  I --> J[Warp scheduler]
-  J --> K{等待原因}
-  K --> L[HBM / L2 latency]
-  K --> M[指令依赖]
-  K --> N[分支发散]
-  K --> O[Shared memory 冲突]
-  J --> P[切换到可执行 warp 隐藏等待]</pre>
-<p>warp 可以粗略理解成 GPU 中一起执行的一小组线程。平台工程师不需要记住所有硬件细节，但需要知道两件事：如果同一 warp 里的线程走完全不同的分支，就会出现分支发散；如果同一 warp 访问的地址连续、规整，更容易形成 coalesced memory access。真正的差异常常不在数学公式，而在线程怎么排布、数据怎么布局、访存是否连续、每个线程占用多少 register、每个 block 占用多少 shared memory。</p>
-<h3>Register pressure、Occupancy 与 Spill</h3>
-<p>SM 的资源是硬边界：每个 SM 的 register file、shared memory、最大 block 数和最大 warp 数都有上限。一个 kernel 如果每个线程使用 32 个 register，和每个线程使用 128 个 register，能同时驻留在同一个 SM 上的 warp 数可能差很多。这种“单线程需要太多寄存器，导致 SM 上能同时容纳的 warp 变少”的问题，通常叫 register pressure。</p>
-<table>
-<tr><th>现象</th><th>可能含义</th><th>该看什么</th></tr>
-<tr><td>occupancy 低</td><td>register / shared memory / block size 限制驻留</td><td><code>ncu</code> 的 registers per thread、shared memory、active warps</td></tr>
-<tr><td>occupancy 高但 kernel 慢</td><td>活跃 warp 多，但都在等内存或分支发散严重</td><td>memory throughput、warp stall reason、branch efficiency</td></tr>
-<tr><td>occupancy 中等但吞吐高</td><td>少量 warp 已经能喂满 Tensor Core 或访存流水</td><td>Tensor Core utilization、kernel time</td></tr>
-</table>
-<p>当 register pressure 高到编译器无法把所有临时变量都放进寄存器时，会发生 register spill：部分变量被放到 local memory。这里的 “local” 很容易误导，它不是 SM 内部的低延迟存储，而是每个线程私有的地址空间，通常走 L1/L2/HBM 路径。对 fused kernel 尤其要小心：融合减少了 launch 和中间 tensor 回写，但也会延长变量生命周期，增加 register pressure；当 spill 明显出现时，融合收益可能被 local memory 流量吃掉。</p>
-<table>
-<tr><th>优化动作</th><th>可能收益</th><th>风险边界</th></tr>
-<tr><td>融合多个 elementwise op</td><td>减少 launch 和 HBM 中间读写</td><td>register 增多，block 驻留下降</td></tr>
-<tr><td>增大 tile / unroll</td><td>提高数据复用和 Tensor Core 喂数效率</td><td>register / shared memory 增多，可能 spill</td></tr>
-<tr><td>限制 register 数</td><td>提高 occupancy</td><td>编译器被迫 spill，单 warp 更慢</td></tr>
-<tr><td>追求高 occupancy</td><td>更容易隐藏访存延迟</td><td>不保证 Tensor Core 利用率或端到端更快</td></tr>
-</table>
-<div class="warn"><strong>诊断边界：</strong>occupancy 是诊断指标，不是目标。最终验收不是 occupancy 从 45% 到 75%，而是端到端 step time、TPOT / ITL、GPU 时间线空洞和成本是否改善。</div>
-</section>
-
-<section class="section" id="s8">
-<h2>8. 运行时与编译器边界</h2>
-<p>运行时更关注 kernel launch、stream 管理、内存申请与释放、同步语义。编译器或图优化更关注算子融合、常量折叠、内存复用、shape 特化。如果你在做平台排障，知道问题大概属于哪一层，能节省大量时间。</p>
-<h3>PyTorch 的执行模式演进</h3>
-<table>
-<tr><th>模式</th><th>特点</th><th>问题 / 收益</th></tr>
-<tr><td>Eager</td><td>一条一条执行，灵活、调试友好</td><td>每算子都过 dispatcher、Python 层开销大</td></tr>
-<tr><td>TorchScript</td><td>静态编译，一次 trace</td><td>限制多，生态已退潮</td></tr>
-<tr><td><code>torch.compile</code> (PyTorch 2.x)</td><td>基于 TorchDynamo + TorchInductor 的 JIT</td><td>自动融合、支持 CUDA Graph，推荐方式</td></tr>
-<tr><td><code>torch.compile</code> + <code>mode="reduce-overhead"</code></td><td>自动启用 CUDA Graph</td><td>对推理和小 batch 训练特别有效</td></tr>
-<tr><td><code>torch.compile</code> + <code>mode="max-autotune"</code></td><td>更激进搜索最优 kernel</td><td>首次编译慢，长期运行值</td></tr>
-</table>
-<div class="note"><strong>实战判断：</strong>原型期用 eager 方便调试；稳定训练先试 <code>torch.compile(model)</code>；推理服务优先使用 vLLM / TensorRT-LLM 的内置优化。</div>
-</section>
-
-<section class="section" id="s9">
-<h2>9. Profiling 与排障思路</h2>
-<p>一个有经验的工程师调性能问题时，通常从宏观到微观：先粗测几个 step 的平均时间和 GPU 利用率，再看一个 step 里每毫秒在干什么，然后确定问题属于 launch 稀疏、H2D 串行、某个 kernel 很慢，还是通信尾巴。只有确认是 kernel 级问题后，才用 <code>ncu</code> 深入。</p>
-<pre class="mermaid">flowchart TB
-  A[性能退化] --> B[粗测 step time / GPU 利用率]
-  B --> C[nsys 看时间线]
-  C --> D{时间线形态}
-  D --> E[launch 稀疏]
-  D --> F[H2D 与计算阶梯串行]
-  D --> G[单个 kernel 很慢]
-  D --> H[NCCL 或同步尾巴]
-  E --> I[融合 / CUDA Graph / torch.compile]
-  F --> J[pinned memory / non_blocking / stream event]
-  G --> K[ncu --set full 下钻 kernel]
-  H --> L[NCCL bucket / overlap / 拓扑]
-  I --> M[复测端到端]
-  J --> M
-  K --> M
-  L --> M</pre>
-<h3>Nsight Systems 时间线读法</h3>
-<pre><code>CUDA API (CPU 侧的 launch 调用)    ↓
-─────────────────────────────────────────
-CUDA HW (GPU 实际执行的 kernel)    ↓
-─────────────────────────────────────────
-NCCL (通信 kernel 在哪个 stream)    ↓</code></pre>
-<table>
-<tr><th>模式</th><th>视觉特征</th><th>意义</th></tr>
-<tr><td>稀疏的点</td><td>CUDA HW 行上大量空隙</td><td>Launch 跟不上，小 kernel 多</td></tr>
-<tr><td>阶梯</td><td>H2D 和 kernel 轮流出现</td><td>没有重叠，stream 用错</td></tr>
-<tr><td>尾巴</td><td>某个 kernel 之后 GPU 空着一大段</td><td>通信 / 同步未重叠</td></tr>
-<tr><td>平直一片</td><td>CUDA HW 连续没间隙</td><td>健康</td></tr>
-<tr><td>block 抖动</td><td>周期性卡 100-500 ms</td><td>GC / logger / checkpoint</td></tr>
-</table>
-<div class="success"><strong>排障原则：</strong>先看哪一类问题，再挑一个具体例子深入。直接上 <code>ncu</code> 看某个 kernel，很容易在不重要的地方浪费时间。</div>
-</section>
-
-<section class="section" id="s10">
-<h2>10. 工程建议与工具速查</h2>
+  C --> H[06a Dispatch 与 Launch]
+  E --> I[06b Stream 与 Graph]
+  G --> J[06c Kernel 与资源边界]
+  B --> K[06d Profiling SOP]
+  D --> K
+  E --> K
+  G --> K</pre>
+<p>第 6 章的核心不是背 CUDA
+API，而是建立一个判断：<strong>性能问题到底出在发命令、排队同步、算子实现、设备资源，还是观测方法本身。</strong></p>
+<h2 id="和相邻章节的关系">4. 和相邻章节的关系</h2>
 <ul>
-<li>当 GPU 利用率低且 kernel 很碎时，优先怀疑图分裂和 launch 开销。</li>
-<li>当数据拷贝与计算无法重叠时，优先检查同步点和 stream 使用。</li>
-<li>当同一模型在不同引擎表现差异大时，优先检查执行计划和 kernel 选择。</li>
-<li>不要轻易把“框架慢”当成结论，先确认慢在 Python、图、runtime 还是设备。</li>
-<li><code>torch.compile</code> 几乎是默认推荐，除非你有明确理由不开。</li>
-<li>跨硬件代际升级时，同步升级 kernel 库，例如 FlashAttention、cuDNN。</li>
-<li>Profile 从宏观到微观：<code>nsys</code> → <code>torch.profiler</code> → <code>ncu</code>。</li>
-<li>生产代码里移除 <code>.item()</code>、<code>print(loss)</code>、<code>assert tensor.sum() &gt; 0</code> 这类隐式同步。</li>
-<li>Occupancy 是诊断指标，不是优化目标。</li>
+<li>第 4 章讲 GPU 的执行模型、显存和互联硬件上限；第 6c 会把这些上限落到
+kernel 实现和 SM 资源。</li>
+<li>第 5 章讲数据搬运；第 6b 会解释 H2D、NCCL 和 compute 怎样通过 stream
+overlap。</li>
+<li>第 15-16 章讲推理调度、量化、编译和引擎；它们依赖第 6 章的
+launch、Graph、fusion 和 profiling 基础。</li>
+<li>第 21 章讲可观测性与容量；第 6d 聚焦单机/单 step
+的性能证据采集。</li>
 </ul>
-<h3>本章涉及的常见工具</h3>
-<table>
-<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
-<tr><td>系统级时间线</td><td><code>nsys profile python train.py</code></td><td>看 launch、stream、H2D 和同步点是否重叠</td></tr>
-<tr><td>kernel 级分析</td><td><code>ncu --set full python train.py</code></td><td>看访存、occupancy、warp 效率</td></tr>
-<tr><td>框架侧热点</td><td><code>torch.profiler</code></td><td>适合从 PyTorch 调度和算子视角下钻</td></tr>
-<tr><td>强制暴露同步问题</td><td><code>CUDA_LAUNCH_BLOCKING=1</code></td><td>便于排障，但会显著拖慢程序</td></tr>
-<tr><td>自动编译</td><td><code>torch.compile(model, mode="reduce-overhead")</code></td><td>默认包含 CUDA Graph</td></tr>
-<tr><td>手动 CUDA Graph</td><td><code>torch.cuda.CUDAGraph()</code>、<code>make_graphed_callables</code></td><td>需要小心管理静态 buffer</td></tr>
-<tr><td>内存监控</td><td><code>torch.cuda.memory_summary()</code>、<code>memory_profiler</code></td><td>定位 OOM 和碎片</td></tr>
-</table>
-</section>
-
-<section class="section" id="s11">
-<h2>11. 本章小结</h2>
-<table>
-<tr><th>层</th><th>主要职责</th><th>常见优化</th></tr>
-<tr><td>Python / 框架层</td><td>组织算子、图和张量语义</td><td><code>torch.compile</code>、避免 <code>.item()</code></td></tr>
-<tr><td>Runtime 层</td><td>launch、stream、同步、内存管理</td><td>CUDA Graph、多 stream、pinned memory</td></tr>
-<tr><td>Kernel 层</td><td>真正执行数值计算</td><td>用高质量库，例如 FlashAttention、cuBLAS</td></tr>
-<tr><td>硬件层</td><td>决定最终吞吐、带宽和并行效率</td><td>参考 <a href="../part2/04-gpu-and-accelerators.html">第 4 章</a></td></tr>
-</table>
-<div class="note"><strong>核心判断能力：</strong>一个 kernel 为什么慢，要区分 compute-bound 还是 memory-bound；一次 step 为什么慢，要区分 launch 稀疏、同步串行、搬运瓶颈，还是确实算太多；一个优化该加在哪，要判断属于算子库、运行时还是编译器。</div>
-</section>
-
-<section class="section" id="s12">
-<h2>12. 练习题</h2>
-<h3>基础题</h3>
-<ol>
-<li>为什么大量小 kernel 往往会降低整体效率？</li>
-<li>同步点为什么会破坏计算与拷贝重叠？</li>
-<li>在什么情况下应优先调用成熟库而不是自己拼很多算子？</li>
-<li>如果你发现 attention kernel 很快，但整体 step 仍然不快，你会继续检查哪一层？</li>
+<h2 id="快速自测">5. 快速自测</h2>
+<ol type="1">
+<li>一个 forward 有 5000 个 10 μs 小 kernel，为什么新 GPU
+可能加速不明显？</li>
+<li><code>print(loss.item())</code>
+为什么可能让异步时间线变成串行？</li>
+<li>一个 fused kernel 比拆开更慢，可能和 register pressure、shared
+memory、spill 有什么关系？</li>
+<li>看到 Nsight Systems 里 CUDA HW 行大量空白，你会先查
+launch、H2D、NCCL 还是 kernel？</li>
+<li>为什么 <code>occupancy</code> 是诊断指标，而不是最终优化目标？</li>
 </ol>
-<h3>进阶题</h3>
-<ol start="5">
-<li>用 §4 的算式：一个 forward 有 3000 个 kernel，平均执行时间 15 μs，launch 开销 25 μs。理想时间多少？实际时间多少？如果 kernel 数降到 300、平均 150 μs 呢？</li>
-<li>列出 §5 表格中至少 5 种隐式同步，说明各自出现在训练代码的什么地方。</li>
-<li>FlashAttention-2 和 FlashAttention-3 的差距主要来自哪些 Hopper 专属特性？为什么不是简单的算法优化？</li>
-<li>CUDA Graph 在什么情况下反而让性能变差？列出至少 3 种。</li>
-<li>一个训练时间线显示：每 step 结束后 GPU 有 80 ms 空闲，然后继续下一 step。这个 80 ms 最可能是什么？</li>
-<li>某团队把 PyTorch 从 eager 切到 <code>torch.compile</code> 后，首 step 慢了 30 秒，但稳态每 step 快 15%。这个权衡合理吗？什么情况下会不合理？</li>
-</ol>
-<h3>开放题</h3>
-<ol start="11">
-<li>设计一个简单的性能回归测试：每次 PR 合入前自动跑，能发现什么级别的性能退化？需要哪些指标？</li>
-<li>你的团队一直用 eager 模式跑训练。某同事建议“把所有模型都用 <code>torch.compile</code> 包起来”。作为平台方，你会怎么评估这个建议？需要考虑哪些风险？</li>
-<li>一个性能问题从哪一层开始排查，往往决定排查效率。你会怎么建立团队的性能排障 SOP，让新同事也能快速定位？</li>
-</ol>
-</section>
 
-<section class="refbox">
-<h2>参考资料与学习路线</h2>
-<div class="grid-2">
-<div class="card">
-<h3>学习路线</h3>
-<ol>
-<li>先用 <code>nsys</code> 看一次训练或推理 step 的时间线，区分 CPU launch、GPU kernel、H2D/D2H 和 NCCL。</li>
-<li>再改一个同步点，例如移除每 step 的 <code>.item()</code>，观察端到端吞吐变化。</li>
-<li>对稳定 shape 的小 batch 负载尝试 <code>torch.compile(mode="reduce-overhead")</code> 或引擎内置 CUDA Graph。</li>
-<li>最后才选择一个真正慢的 kernel 用 <code>ncu</code> 看 registers、occupancy、local memory traffic 和 stall reason。</li>
-</ol>
-</div>
-<div class="card">
-<h3>延伸阅读</h3>
-<ul>
-<li>NVIDIA CUDA C++ Programming Guide：runtime、stream、event、occupancy 的权威语义。</li>
-<li>NVIDIA Nsight Systems / Nsight Compute 文档：时间线与 kernel 指标解释。</li>
-<li>PyTorch 2.x <code>torch.compile</code> 与 CUDA Graph 相关文档：理解 eager 到 compiled mode 的边界。</li>
-<li>FlashAttention 系列论文与实现说明：理解 IO-aware attention 与硬件代际优化。</li>
-<li>CUTLASS / Triton 文档：理解自定义 fused kernel 的工程成本和资源约束。</li>
-</ul>
-</div>
-</div>
 </section>
-
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
 </main>

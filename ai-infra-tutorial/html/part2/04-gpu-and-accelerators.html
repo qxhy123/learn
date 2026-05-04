@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>第 4 章 · GPU 与加速器 — AI Infra 教程</title>
+<title>第 4 章 · GPU 与加速器导览 — AI Infra 教程</title>
 <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body class="has-sidebar">
@@ -11,279 +11,135 @@
 <main class="page">
 <nav class="topnav"></nav>
 <section class="hero">
-<h1>第 4 章 · GPU 与加速器</h1>
-<p class="sub">从“海量规则张量计算必须在有限算力、显存、带宽和互联距离内完成”出发，把 GPU 参数翻译成平台选型、并行策略、推理预算和异构治理的工程判断。</p>
-<div class="chips"><span class="chip">GPU</span><span class="chip">Tensor Core</span><span class="chip">HBM</span><span class="chip">NVLink</span><span class="chip">NVSwitch</span><span class="chip">MIG</span><span class="chip">异构加速器</span></div>
-<div class="note"><strong>不可化简的问题：</strong>一个模型步骤需要在很短时间内对大量规则数据做同构运算，但每个物理器件的计算单元、存储容量、读写带宽和互联距离都是有限的，平台工程师必须判断哪一个限制先成为瓶颈。</div>
-<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+<h1>第 4 章 · GPU 与加速器导览</h1>
+<p class="sub">原第 4 章已拆成 04a-04d：执行模型、显存带宽、互联系统、选型治理分别独立展开。</p>
+<div class="chips"><span class="chip">GPU</span><span class="chip">章节导览</span><span class="chip">执行模型</span><span class="chip">HBM</span><span class="chip">NVLink</span><span class="chip">选型治理</span></div>
 </section>
-<section class="toc"><h2>本章目录</h2><ol>
-<li><a class="anchor" href="#s1">第一性原理拆解：GPU 与加速器</a></li>
-<li><a class="anchor" href="#s2">正文内容</a></li>
-<li><a class="anchor" href="#s3">本章小结</a></li>
-<li><a class="anchor" href="#s4">练习题</a></li>
-</ol></section>
-
-<section class="section" id="s1">
-<h2>1. 第一性原理拆解：GPU 与加速器</h2>
-<div class="note"><strong>关联章节：</strong>本章内容与 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的带宽 / 互联链路，以及 <a href="../part2/06-cuda-runtime-and-kernels.html">第 6 章</a> 的 kernel 执行效率密切相关。再往后，<a href="../part3/08-data-parallel.html">第 8 章</a> 的扩展效率和 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的 KV Cache 预算都会回过头来使用本章的四个维度：算力、显存、带宽、互联。</div>
-<h3>拆 — 不可化简的问题</h3>
-<p>理解 GPU 的最好方式，不是死记硬件参数，而是先回答：为什么这类设备特别适合 AI 工作负载，它又在哪些条件下会“不像你想得那么快”。把所有品牌名、SKU、Tensor Core、NVLink、HBM 这些术语先拿掉，GPU 章真正面对的不可化简问题只有一个：一个模型步骤需要在很短时间内对大量规则数据做同构运算，但每个物理器件的计算单元、存储容量、读写带宽和互联距离都是有限的，平台工程师必须判断这些限制哪一个先成为瓶颈。</p>
-<p>这句话比“GPU 比 CPU 快”更接近本章核心。CPU 的强项是少量线程、复杂控制流、低延迟响应和操作系统控制面；GPU 的强项是把同一类指令摊给海量线程，以吞吐换延迟。Transformer 里的 GEMM、attention、归约和逐元素运算之所以适合 GPU，不是因为它们叫 AI 算子，而是因为它们有大量相似的数据元素和稳定的张量形状。反过来，小 batch、动态 shape、强分支、频繁 host-device 往返、碎 tensor、跨卡通信密集的任务，即使放在昂贵 GPU 上，也可能只能吃到峰值算力的很小一部分。</p>
-<p>第一次做 AI 基础设施选型的团队，最常踩的坑是把“选 GPU”当成“挑显卡”：看 MLPerf 榜单，比 TFLOPS，挑吞吐最高的那张。这个思路在消费显卡时代还凑合，但对数据中心 AI 负载会有几个严重漏洞：峰值算力和可达吞吐常差 3-10 倍；显存和 HBM 带宽往往比算力更先顶爆；互联决定 8 卡节点到底是 8 卡同时干活，还是 8 卡互相等待；同一代产品又有 PCIe、SXM、不同显存容量、不同功耗墙和不同 datasheet 口径。平台工程师需要拆出的不是“哪张卡最快”，而是四个更硬的问题：算得动吗，放得下吗，喂得满吗，连得快吗。</p>
-<h3>推 — 从这个问题如何推导出每个机制</h3>
-<p>从这个不可化简问题往下推，GPU 的每个机制都不是孤立名词。首先，单个通用核心无法在可接受时间内完成数万亿次矩阵乘法，所以硬件必须堆出大量并行执行单元；因为深度学习核心计算大多是矩阵和张量运算，所以又出现专门服务低精度矩阵乘法的 Tensor Core，并逐步支持 TF32、BF16、FP8、FP4 等口径。接着，算力只有在数据持续供应时才有意义，显存容量决定权重、激活、梯度、优化器状态和 KV Cache 能不能放下，HBM 带宽决定这些数据能不能按 kernel 消费速度被读写。于是同样 70B 模型，训练时要看 6-16x 参数量的状态预算，推理时要看权重加 KV Cache；prefill 更像 compute-bound，decode 更像 memory-bound。</p>
-<p>再往下推，单卡不够时必须切到多卡：数据并行要同步梯度，张量并行要交换 activation，流水并行要传递 microbatch，专家并行要做 token dispatch。跨 GPU 的距离立刻变成系统问题。PCIe 能连，但带宽和延迟不适合高频模型切分；NVLink 把 GPU-GPU 路径做成高带宽链路；NVSwitch 把多条 NVLink 组成交换网络，让 8 卡 HGX 节点里任意 GPU 都能以近似一致的路径通信；GB200/NVL72 进一步把这个边界从主板扩到整机柜，让 72 块 Blackwell GPU 位于一个 rack-scale NVLink domain 内。到了这里，GPU 不再是一张卡，而是计算、HBM、NVLink、NVSwitch、CPU、NIC、供电和液冷共同组成的 scale-up 系统。</p>
-<p>最后，所有机制都要回到工程边界。算力指标必须统一 dense/sparse、per-GPU/system-level、FP16/BF16/FP8/FP4 口径；显存预算必须给运行时 buffer 和碎片留余量；带宽判断必须区分 HBM、PCIe、NVLink、InfiniBand/RoCE；互联拓扑必须和并行策略、作业调度、故障域绑定。读完本章，你应该能把硬件参数翻译成平台决策：哪些任务放 H200 更值，哪些任务用 L40S 更划算，什么时候该买 8 卡 SXM 节点，什么时候该等待 NVL72 这类 rack-scale 系统，什么时候非 NVIDIA 方案的省钱会被软件适配成本吃掉。</p>
-<h3>绘 — 因果链路</h3>
-<pre class="mermaid">mindmap
-  root((GPU 与加速器))
-    不可化简问题
-      大量规则计算
-      有限算力
-      有限显存
-      有限带宽
-      有限互联距离
-    单卡机制
-      SM 并行
-      Tensor Core
-      HBM 容量
-      HBM 带宽
-      低精度 FP8 FP4
-    多卡机制
-      PCIe
-      NVLink
-      NVSwitch
-      RDMA
-      拓扑感知调度
-    AI 场景
-      训练
-        梯度同步
-        激活重算
-        长时间稳定吞吐
-      推理
-        KV Cache
-        Prefill Decode 分离
-        tokens per second per dollar
-    工程判断
-      算得动
-      放得下
-      喂得满
-      连得快
-      口径统一</pre>
-<h3>导 — 读完本章你应该能回答</h3>
-<ol>
-<li>为什么 GPU 适合稠密张量计算，但不保证任何 AI 任务都会接近峰值吞吐？</li>
-<li>面对一个模型和 SLO，如何用“算得动、放得下、喂得满、连得快”拆出最可能的硬件瓶颈？</li>
-<li>为什么 LLM prefill 和 decode 对 GPU 的偏好不同，decode 为什么经常受 HBM 带宽而不是 TFLOPS 限制？</li>
-<li>读 NVIDIA datasheet 时，如何区分 dense / sparse、per-GPU / system-level、FP16 / BF16 / FP8 / FP4 等口径？</li>
-<li>NVLink、NVSwitch、PCIe、RDMA 分别解决哪一段数据路径问题，为什么它们不能互相简单替代？</li>
-<li>HGX H100/H200、GB200/NVL72 这类系统形态对平台调度、故障域、并行策略和供电散热有什么工程边界？</li>
-<li>什么时候应该接受异构 GPU 池或非 NVIDIA 加速器，什么时候软件生态成本会压过硬件采购折扣？</li>
-</ol>
-</section>
-
-<section class="section" id="s2">
-<h2>2. 正文内容</h2>
-<h3>4.1 为什么 AI 工作负载天然偏爱 GPU</h3>
-<p>深度学习中的核心计算大多可以归结为矩阵乘法、张量变换、归约和逐元素运算。这类计算有一个共同点：可并行度高，且数据形状较规则。GPU 恰好擅长这种高吞吐、规律性强的数值计算。</p>
-<p>而 CPU 更擅长控制流复杂的任务、小规模低延迟逻辑、操作系统和服务控制面。所以在 AI 系统里常见分工是：CPU 负责数据预处理、调度、服务控制逻辑；GPU 负责模型主计算路径。</p>
-<table><tr><th>设备</th><th>峰值 bf16 吞吐</th><th>一次 GEMM 的相对速度</th></tr><tr><td>Intel Xeon Platinum 8480+（AMX）</td><td>~30 TFLOPS（BF16 / AMX）</td><td>1x（基线）</td></tr><tr><td>NVIDIA A100 80GB SXM</td><td>~312 TFLOPS</td><td>~10x</td></tr><tr><td>NVIDIA H100 SXM</td><td>~989 TFLOPS</td><td>~33x</td></tr><tr><td>NVIDIA B200</td><td>~2250 TFLOPS（dense）</td><td>~75x</td></tr></table>
-<div class="warn"><strong>边界提醒：</strong>这个差距只有当负载形状匹配时才能兑现。小 batch、动态 shape、强分支控制的负载，GPU 优势会迅速缩水到 2-5x。</div>
-
-<h3>4.2 看 GPU 先看四件事</h3>
-<div class="grid-4">
-<div class="card"><strong>算力</strong><br>决定理论计算上限，但只在计算真正成为瓶颈时才最重要。</div>
-<div class="card"><strong>显存</strong><br>决定模型、batch、激活、优化器状态和 KV Cache 能否放下。</div>
-<div class="card"><strong>带宽</strong><br>决定 HBM、PCIe、NVLink 等路径能否持续供给 kernel。</div>
-<div class="card"><strong>互联</strong><br>决定多 GPU 是否适合梯度同步、模型切分和 activation 交换。</div>
-</div>
-<table><tr><th>算力口径</th><th>含义</th><th>常见用途</th></tr><tr><td>FP32（CUDA cores）</td><td>通用 32-bit 浮点</td><td>科学计算、少数老模型</td></tr><tr><td>TF32（Tensor Core）</td><td>NVIDIA 自定义 19-bit 浮点</td><td>传统训练加速</td></tr><tr><td>FP16 / BF16 Tensor Core dense</td><td>真实可达吞吐的基准</td><td>现代训练主力</td></tr><tr><td>FP16 / BF16 Tensor Core sparse</td><td>启用 2:4 稀疏后的峰值</td><td>宣传材料常用，实际不一定能用上</td></tr><tr><td>FP8 / FP6 / FP4</td><td>新一代精度，需硬件原生支持</td><td>Hopper 后推理和 LLM 训练</td></tr></table>
-<p>显存决定模型能不能放下、batch 能不能做大、KV Cache 能不能撑住并发。一个粗略预算是：</p>
-<pre><code>训练显存 ≈ 权重 + 梯度 + 优化器状态 + 激活 + 框架碎片
-          ≈ 16x 参数量（bf16 + Adam）+ 激活
-
-推理显存 ≈ 权重 + KV Cache × 并发 + 运行时 buffer
-          ≈ 2x 参数量（bf16）+ 长上下文 × 并发</code></pre>
-<div class="danger"><strong>采购风险：</strong>以 Llama 3 70B 为例，训练时仅 state 就要约 560 GB，推理时权重约 140 GB，再加 KV Cache。不看清预算就采购，很容易买到“装不下目标模型”的卡。</div>
-<p>LLM decode 阶段是典型 memory-bound：每生成一个 token 都要把整个权重读一遍。7B 模型 bf16 大小约 14 GB，在 3.35 TB/s 带宽的 H100 上理论下限约 4 ms/token；换到 8 TB/s 的 B200，可以降到约 2 ms/token。这个差距和算力没关系，纯带宽决定。</p>
-
-<h4>NVSwitch：把“多条直连线”变成“节点内交换网络”</h4>
-<p>NVLink 解决 GPU-GPU 之间的高速链路问题，但只靠点到点直连会遇到组合爆炸。NVSwitch 的第一性原理很简单：把 GPU 之间的通信从“谁和谁直接连”改成“每张 GPU 接入交换平面，由交换芯片完成转发”。</p>
-<pre class="mermaid">flowchart TB
-  subgraph HGX["HGX H100/H200 8-GPU NVSwitch fabric"]
-    direction TB
-    subgraph SwitchPlane["NVSwitch plane"]
-      S0["NVSwitch 0"]
-      S1["NVSwitch 1"]
-      S2["NVSwitch 2"]
-      S3["NVSwitch 3"]
-    end
-    subgraph GPUs["8x SXM GPUs"]
-      G0["GPU0"]
-      G1["GPU1"]
-      G2["GPU2"]
-      G3["GPU3"]
-      G4["GPU4"]
-      G5["GPU5"]
-      G6["GPU6"]
-      G7["GPU7"]
-    end
-    G0 --- S0
-    G0 --- S1
-    G0 --- S2
-    G0 --- S3
-    G1 --- S0
-    G1 --- S1
-    G1 --- S2
-    G1 --- S3
-    G2 --- S0
-    G2 --- S1
-    G2 --- S2
-    G2 --- S3
-    G3 --- S0
-    G3 --- S1
-    G3 --- S2
-    G3 --- S3
-    G4 --- S0
-    G4 --- S1
-    G4 --- S2
-    G4 --- S3
-    G5 --- S0
-    G5 --- S1
-    G5 --- S2
-    G5 --- S3
-    G6 --- S0
-    G6 --- S1
-    G6 --- S2
-    G6 --- S3
-    G7 --- S0
-    G7 --- S1
-    G7 --- S2
-    G7 --- S3
-  end
-  CPU["CPU / PCIe / NIC"] -. control and host IO .- GPUs</pre>
-<p>平台工程师看 NVSwitch，重点不是背交换芯片代号，而是判断通信模式是否能吃到这个 fabric。典型收益来自节点内 tensor parallel、activation 交换、FSDP/ZeRO 局部 reduce-scatter、MoE expert dispatch，以及多 GPU 推理里的 hidden state 同步。典型吃不到收益的情况也很明确：数据预处理卡在 CPU；模型跨节点做 TP，瓶颈落到 InfiniBand/RoCE；或者作业落到 PCIe-only、双 GPU 桥接、不同 NUMA 域的混合拓扑。</p>
-<div class="warn"><strong>工程边界：</strong>NVSwitch 只解决节点内 GPU fabric，不解决跨节点网络、CPU 内存带宽、存储读取、kernel 低效和并行策略错误。</div>
-
-<h4>HGX H100/H200 与 GB200/NVL72</h4>
-<p>HGX 不是“8 张显卡插在主板上”，而是一块面向 OEM 服务器集成的 GPU baseboard。8 个 SXM GPU 模块围绕中间的 NVSwitch 平面布置，底板提供高密度 NVLink 走线、供电、管理信号和到服务器 CPU/PCIe/NIC 的连接路径。GB200 NVL72 则把 scale-up 边界从主板推到机柜：一个液冷机柜里包含 36 个 Grace CPU 和 72 个 Blackwell GPU，形成 72-GPU NVLink domain。</p>
-<table><tr><th>形态</th><th>逻辑规模</th><th>典型互联</th><th>平台适配重点</th><th>工程边界</th></tr><tr><td>8x PCIe GPU 服务器</td><td>8 GPU，但常依赖 PCIe switch / root complex</td><td>PCIe 为主，少量 NVLink bridge 取决于卡型</td><td>成本、通用性、推理副本密度</td><td>不适合高频 TP；GPU 对之间带宽不均匀</td></tr><tr><td>HGX H100 8-GPU</td><td>单节点 8 GPU scale-up island</td><td>4x NVSwitch + 每 GPU 约 900 GB/s 双向 NVLink 聚合</td><td>大模型训练、节点内 TP/PP、NCCL collectives</td><td>仍需 IB/RoCE 做跨节点；故障常以整节点处理</td></tr><tr><td>HGX H200 8-GPU</td><td>单节点 8 GPU，显存更大</td><td>与 Hopper HGX 平台判断类似</td><td>长上下文、显存敏感训练/推理</td><td>算力不比 H100 翻倍，收益主要来自 HBM 容量/带宽</td></tr><tr><td>GB200 NVL72</td><td>单机柜 72 GPU NVLink domain</td><td>NVLink Switch System，rack-scale fabric</td><td>万亿参数推理、MoE、rack 内大 TP/EP</td><td>供电液冷、分区、运维和采购门槛显著提高</td></tr></table>
-<pre class="mermaid">flowchart LR
-  A["8 卡 HGX 节点"] --> B["节点内 TP / PP / FSDP 局部通信"]
-  B --> C["跨节点 DP / checkpoint / 数据读取"]
-  D["GB200 NVL72 机柜"] --> E["Rack-scale NVLink domain"]
-  E --> F["更大的 TP / EP / MoE placement 空间"]
-  C --> G["IB / RoCE scale-out 网络"]
-  F --> G</pre>
-
-<h4>主流 GPU 横向对比</h4>
-<table><tr><th>设备</th><th>FP16 / BF16 理论算力</th><th>HBM 容量</th><th>HBM 带宽</th><th>NVLink 带宽</th><th>典型功耗</th><th>更常见定位</th></tr><tr><td>A100 40GB PCIe</td><td>约 312 TFLOPS</td><td>40 GB</td><td>约 1.6 TB/s</td><td>通常依赖 PCIe；部分双卡桥接场景可到约 600 GB/s</td><td>250-300 W</td><td>成熟推理、成本敏感训练原型</td></tr><tr><td>A100 80GB SXM</td><td>约 312 TFLOPS</td><td>80 GB</td><td>约 2.0 TB/s</td><td>最高约 600 GB/s</td><td>400 W</td><td>显存更敏感的训练</td></tr><tr><td>H100 SXM</td><td>约 989 TFLOPS</td><td>80 GB</td><td>约 3.35 TB/s</td><td>最高约 900 GB/s</td><td>700 W</td><td>主流大模型训练</td></tr><tr><td>H200 SXM</td><td>约 989 TFLOPS</td><td>141 GB</td><td>约 4.8 TB/s</td><td>最高约 900 GB/s</td><td>700 W</td><td>长上下文、显存敏感训练</td></tr><tr><td>B200 SXM</td><td>约 2250 TFLOPS（dense）</td><td>180-192 GB</td><td>约 7.7-8 TB/s</td><td>约 1.8 TB/s</td><td>1000 W</td><td>新一代训练、大模型推理</td></tr></table>
-<table><tr><th>场景</th><th>典型值</th><th>说明</th></tr><tr><td>单卡 HBM 容量</td><td>40-192 GB</td><td>决定单卡可承载的模型、激活和 KV Cache 上限</td></tr><tr><td>单卡 HBM 带宽</td><td>1.6-8.0 TB/s</td><td>很多 attention / gather 场景首先受这里限制</td></tr><tr><td>8 卡节点总显存</td><td>320 GB-1.5 TB</td><td>是训练并行规划的第一道约束</td></tr><tr><td>GPU-GPU 高速互联</td><td>600-1800 GB/s</td><td>对张量并行、流水并行和高效 AllReduce 很关键</td></tr></table>
-<table><tr><th>陷阱</th><th>典型表述</th><th>该怎么读</th></tr><tr><td>Sparse 峰值</td><td>“FP16 Tensor Core: 1978 TFLOPS”</td><td>实际是 2:4 sparse 的峰值，dense 只有一半</td></tr><tr><td>系统级 vs 单卡</td><td>“72 PFLOPS FP8 compute”</td><td>可能是 8 卡 DGX 加起来的，单卡只有 1/8</td></tr><tr><td>FP4 “revolutionary”</td><td>“40 PFLOPS FP4”</td><td>是否真能用上取决于模型、量化方法和软件栈成熟度</td></tr><tr><td>NVLink 带宽口径</td><td>“900 GB/s”</td><td>通常是 per-GPU 双向聚合，不是两张卡之间的单向</td></tr><tr><td>功耗 vs TDP</td><td>“700W”</td><td>TDP 是可配置上限，实际长期运行功耗常是 80-90% TDP</td></tr></table>
-<div class="success"><strong>实战心法：</strong>同时查官方 datasheet、第三方 benchmark（MLPerf / Artificial Analysis / GenAI-Perf）和开源生态实测。三者交叉印证，才不容易被单一数字误导。</div>
-
-<h3>4.3 一个简单但实用的判断框架</h3>
-<p>GPU 选型可以简化成四个问题：算得动吗，算力是否足够支撑目标吞吐；放得下吗，显存是否足以容纳模型、激活、优化器状态或 KV Cache；喂得满吗，数据与内存带宽是否支持持续高效执行；连得快吗，多卡 / 多机之间互联是否支撑目标并行策略。</p>
-<pre class="mermaid">flowchart TD
-  Q["目标模型 + SLO + 预算"] --> C["算得动吗？"]
-  C --> M["放得下吗？"]
-  M --> B["喂得满吗？"]
-  B --> I["连得快吗？"]
-  I --> P["选择卡型 / 节点形态 / 并行策略"]
-  C -. 否 .-> C1["降低精度、增大 batch、换更高算力卡"]
-  M -. 否 .-> M1["更多显存、TP/FSDP、量化、缩短上下文"]
-  B -. 否 .-> B1["提高 HBM 带宽、优化 kernel、减少搬运"]
-  I -. 否 .-> I1["改拓扑、缩小 TP、改 DP/PP/EP placement"]</pre>
-<p>例如部署 Llama 3 70B 做在线推理：权重约 140 GB，decode 多数时候 memory-bound；若目标 TPOT 小于 50 ms，每 token 需要把权重读一遍。2×H100 80GB 显存紧张，2×H200 SXM 或 1×B200 更合适。TP=2 下每 token 要做 all-reduce，节点内 NVLink 通常够用，跨节点 IB 才更容易成为问题。</p>
-
-<h3>4.4 训练和推理需要的硬件并不相同</h3>
-<table><tr><th>维度</th><th>训练优先</th><th>推理优先</th></tr><tr><td>核心指标</td><td>TFLOPS × 利用率</td><td>tokens/sec/$</td></tr><tr><td>显存</td><td>权重 + 梯度 + 优化器 + 激活，通常 6-16x 参数量</td><td>权重 + KV Cache，通常 2-4x 参数量</td></tr><tr><td>精度</td><td>BF16 为主，FP8 开始普及</td><td>越来越低，INT8/FP8/INT4 常见</td></tr><tr><td>互联</td><td>关键：all-reduce 频繁</td><td>次要：少量 TP，跨副本无需</td></tr><tr><td>稳定性</td><td>数周连续运行，硬件故障率敏感</td><td>分钟级滚动，冷启动更关键</td></tr><tr><td>典型卡</td><td>H100/H200 SXM、B200</td><td>L40S、A100、H100、部分用 B200 做大模型</td></tr><tr><td>节点形态</td><td>8 卡 SXM，高速互联</td><td>单卡或 2/4 卡 PCIe 更经济</td></tr></table>
-<p>同构路线的优点是采购简单、调度灵活、空闲时段可以互借；缺点是推理端付了训练端的溢价。异构路线的优点是推理成本可以压到 1/2-1/3；缺点是运维两套镜像、调度要打标签、跨池调配复杂。规模小于 50 卡时通常优先同构，50-500 卡可同构加少量推理专用，500+ 卡则更应认真做异构分池。</p>
-
-<h3>4.5 算力不是唯一瓶颈：Arithmetic Intensity 直觉</h3>
-<p>一个常见近似判断是：如果一个工作负载每搬运 1 字节数据能做很多次计算，那么它更可能受计算限制；反之更可能受带宽限制。常写成 <code>AI = Ops / Bytes moved</code>。大矩阵乘法通常更接近算力瓶颈，小 batch、碎 tensor、频繁 gather/scatter 更容易受带宽限制。</p>
-<pre class="mermaid">flowchart LR
-  A["低 Arithmetic Intensity"] --> B["Memory-bound"]
-  B --> C["优化 HBM 带宽、访存合并、cache、减少搬运"]
-  D["高 Arithmetic Intensity"] --> E["Compute-bound"]
-  E --> F["优化 Tensor Core 利用率、tile、并行度"]
-  G["Machine balance = 峰值算力 / 带宽"] --> B
-  G --> E</pre>
-<table><tr><th>算子 / 场景</th><th>AI 大致量级（ops/byte）</th><th>更接近</th></tr><tr><td>Large GEMM（大 batch、大隐层）</td><td>100-500</td><td>Compute-bound</td></tr><tr><td>Attention prefill（长序列）</td><td>30-100</td><td>混合，看序列长度</td></tr><tr><td>Attention decode（1 个 token）</td><td>&lt; 10</td><td>Memory-bound</td></tr><tr><td>LayerNorm / RMSNorm</td><td>~2</td><td>Memory-bound</td></tr><tr><td>Element-wise（GELU / add）</td><td>1-2</td><td>Memory-bound</td></tr><tr><td>Embedding lookup</td><td>&lt; 1</td><td>Memory-bound</td></tr><tr><td>All-reduce（DDP 梯度）</td><td>N/A（纯通信）</td><td>Network-bound</td></tr></table>
-<table><tr><th>设备</th><th>峰值 BF16</th><th>HBM 带宽</th><th>Machine balance</th></tr><tr><td>A100 80GB</td><td>312 TF</td><td>2.0 TB/s</td><td>~156 ops/byte</td></tr><tr><td>H100 SXM</td><td>989 TF</td><td>3.35 TB/s</td><td>~295 ops/byte</td></tr><tr><td>H200 SXM</td><td>989 TF</td><td>4.8 TB/s</td><td>~206 ops/byte</td></tr><tr><td>B200 SXM</td><td>2250 TF（dense）</td><td>8.0 TB/s</td><td>~280 ops/byte</td></tr></table>
-<div class="note"><strong>关键观察：</strong>Transformer 的瓶颈会随 batch 和序列长度变化。Prefill 时更可能 compute-bound，decode 时更可能 memory-bound，所以“一个模型在这张卡上跑多快”没有单一答案，必须按阶段分开看。</div>
-
-<h3>4.6 设备异构为什么会放大平台复杂度</h3>
-<p>现实中的平台往往不只有一种卡：不同代际卡混跑、显存大小不同、互联结构不同、部分节点有本地 NVMe 而部分没有。这会导致调度要更细粒度打标签，镜像和依赖兼容性更难维护，用户需要知道哪些队列适合什么任务。因此，硬件异构不仅是资源问题，也是抽象问题。</p>
-<table><tr><th>平台</th><th>典型定位</th><th>优势</th><th>主要生态约束</th></tr><tr><td>AMD MI300X</td><td>大显存训练 / 推理</td><td>192 GB HBM，适合显存敏感场景</td><td>依赖 ROCm 生态，部分 CUDA 专属库迁移成本高</td></tr><tr><td>AMD MI325X / MI350</td><td>新一代，对标 B200</td><td>HBM 进一步升到 256-288 GB</td><td>生态追赶中，新硬件支持要踩坑</td></tr><tr><td>Google TPU v5 / v6</td><td>Pod 级训练</td><td>XLA 编译和大规模集群整合较成熟</td><td>主要在 Google Cloud 生态内发挥优势</td></tr><tr><td>Intel Gaudi 3</td><td>成本导向训练 / 推理</td><td>以太网互联思路明确，适合标准化部署</td><td>软件栈和社区成熟度仍弱于 CUDA</td></tr><tr><td>华为昇腾 910B / 910C</td><td>区域化训练 / 推理平台</td><td>本土化供应链和政企场景适配较强</td><td>依赖 CANN / MindSpore / 适配层，跨生态迁移要单独评估</td></tr><tr><td>AWS Trainium / Inferentia</td><td>AWS 自家芯片</td><td>在 AWS 内部 TCO 友好</td><td>绑定 AWS 生态，迁出成本高</td></tr></table>
-<div class="warn"><strong>隐性成本：</strong>非 NVIDIA 加速器的采购价可能便宜 30-50%，但训练脚本、推理引擎、kernel 生态、驱动和调度集成的移植成本可以轻易抵消。</div>
-
-<h3>4.7 MIG 与 GPU 虚拟化</h3>
-<table><tr><th>方式</th><th>隔离强度</th><th>性能开销</th><th>适用场景</th></tr><tr><td>MIG（Multi-Instance GPU）</td><td>硬件级，显存和 SM 都隔离</td><td>~0%</td><td>A100 / H100 / B200 做多租户或小任务并发</td></tr><tr><td>MPS（Multi-Process Service）</td><td>软件级，共享 SM</td><td>低</td><td>同一租户多进程</td></tr><tr><td>Time-slicing</td><td>最弱，时间片轮转</td><td>视切换频率</td><td>开发环境，非生产</td></tr></table>
-<p>MIG 的典型用法是把一张 H100 切成 7 份，给 7 个互相独立的小模型服务。这样可以让 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 讨论的多租户问题在硬件层面获得更强隔离。</p>
-<div class="danger"><strong>常见误解：</strong>MIG 不是“把一张卡当 7 张用，吞吐不变”。切分后每个 slice 的显存带宽也被按比例分配，所以 MIG 适合“很多小任务各自流畅”，不适合“一个任务跑得快”。</div>
-
-<h3>4.8 工程建议</h3>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#为什么要拆分第-4-章">1. 为什么要拆分第 4 章</a></li><li><a class="anchor" href="#拆分后的阅读路径">2. 拆分后的阅读路径</a></li><li><a class="anchor" href="#四个总问题仍然不变">3. 四个总问题仍然不变</a></li><li><a class="anchor" href="#和后续章节的关系">4. 和后续章节的关系</a></li><li><a class="anchor" href="#快速自测">5. 快速自测</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>本章已拆分为独立子章</strong>：原来的 GPU
+与加速器内容过于集中，容易把执行模型、显存带宽、互联系统、选型治理混在一起。现在第
+4 章保留为导览章，详细内容拆到
+04a-04d。读完导览后，按你的目标负载进入对应子章。</p>
+</blockquote>
+<h2 id="为什么要拆分第-4-章">1. 为什么要拆分第 4 章</h2>
+<p>GPU 不是一个单一知识点。平台工程师说“GPU
+不够快”时，可能指的是完全不同的问题：</p>
 <ul>
-<li>训练集群优先关注互联和显存，再看单卡峰值算力。</li>
-<li>推理集群优先关注单位成本吞吐、显存与冷启动行为。</li>
-<li>读 datasheet 时统一 dense / sparse / per-GPU / system-level 口径。</li>
-<li>不要让研究型实验和关键线上服务完全共享同一设备池。</li>
-<li>选型时先写出目标负载形状：seq len、batch、并发、SLO，再看设备参数。</li>
-<li>代际升级若你的负载是 memory-bound，收益可能比看 TFLOPS 更明显。</li>
-<li>非 NVIDIA 方案算 TCO 要把软件适配人力算进去，而不只是采购价。</li>
-<li>小任务高并发场景，MIG 能比多买几张便宜卡更优。</li>
+<li>kernel 没有把 SM 和 Tensor Core 喂满；</li>
+<li>模型权重、激活、优化器状态或 KV Cache 放不下；</li>
+<li>HBM 带宽、PCIe、NVLink、网络或存储搬运成为瓶颈；</li>
+<li>多卡拓扑和并行策略不匹配；</li>
+<li>采购时混用了 dense / sparse、单卡 / 系统级、FP16 / FP8 / FP4 等
+datasheet 口径；</li>
+<li>调度器无法表达 MIG、异构 GPU、非 NVIDIA 加速器和不同故障域。</li>
 </ul>
-<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr><tr><td>硬件信息</td><td><code>nvidia-smi</code>、<code>nvidia-smi topo -m</code>、<code>rocm-smi</code></td><td>看卡型号、拓扑、功耗</td></tr><tr><td>算力与带宽基准</td><td><code>nccl-tests</code>、<code>stream</code> benchmark、<code>gemm_bench</code></td><td>验证是否能达到标称值的合理比例</td></tr><tr><td>MLPerf / 第三方 benchmark</td><td>MLPerf Training / Inference 榜单</td><td>真实负载下的对比</td></tr><tr><td>显存和带宽分析</td><td><code>ncu</code>（见 <a href="../part2/06-cuda-runtime-and-kernels.html">第 6 章</a>）</td><td>看单个 kernel 是 memory-bound 还是 compute-bound</td></tr><tr><td>MIG 管理</td><td><code>nvidia-smi mig</code>、NVIDIA GPU Operator</td><td>在 k8s 上切分 GPU</td></tr></table>
-</section>
+<p>这些问题共享“GPU”这个名字，但排查工具、系统边界和工程决策都不同。把它们塞在同一章里，会导致内容看起来像参数百科，而不是可操作的判断路径。</p>
+<h2 id="拆分后的阅读路径">2. 拆分后的阅读路径</h2>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 18%" />
+<col style="width: 62%" />
+</colgroup>
+<thead>
+<tr>
+<th>子章</th>
+<th>主题</th>
+<th>你应该在什么时候读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="04a-gpu-execution-model-and-tensor-cores.html">04a GPU
+执行模型与 Tensor Core</a></td>
+<td>SM、SIMT、warp、occupancy、Tensor Core、低精度算力口径</td>
+<td>你想理解为什么同样 TFLOPS 实测差很多，或为什么 kernel 没吃满
+GPU</td>
+</tr>
+<tr>
+<td><a href="04b-hbm-memory-and-roofline.html">04b HBM、显存预算与
+Roofline</a></td>
+<td>HBM、显存容量、训练/推理状态预算、KV Cache、arithmetic
+intensity、machine balance</td>
+<td>你要判断模型能不能放下、decode 为什么慢、换 H200/B200
+是否有收益</td>
+</tr>
+<tr>
+<td><a href="04c-gpu-interconnect-and-systems.html">04c GPU
+互联与系统形态</a></td>
+<td>PCIe、NVLink、NVSwitch、HGX、GB200
+NVL72、scale-up/scale-out、拓扑调度</td>
+<td>你要做多卡训练、张量并行、MoE、集群调度或大节点采购</td>
+</tr>
+<tr>
+<td><a
+href="04d-gpu-selection-virtualization-and-heterogeneous-accelerators.html">04d
+GPU 选型、虚拟化与异构加速器</a></td>
+<td>选型框架、训练 vs 推理、datasheet 阅读、MIG/MPS、异构池、非 NVIDIA
+生态成本</td>
+<td>你要做采购、资源池规划、多租户切分或评估 AMD/TPU/Gaudi/昇腾</td>
+</tr>
+</tbody>
+</table>
+<h2 id="四个总问题仍然不变">3. 四个总问题仍然不变</h2>
+<p>拆分以后，第 4 章仍然围绕同一个判断框架：</p>
+<ol type="1">
+<li><p><strong>算得动吗？</strong><br />
+算子形状是否能把 SM、Tensor Core 和低精度路径用起来。</p></li>
+<li><p><strong>放得下吗？</strong><br />
+权重、激活、梯度、优化器状态、KV Cache 和运行时 buffer
+是否能装进显存。</p></li>
+<li><p><strong>喂得满吗？</strong><br />
+HBM、PCIe、NVLink、NIC、CPU 数据预处理和存储是否能持续供给
+GPU。</p></li>
+<li><p><strong>连得快吗？</strong><br />
+多 GPU /
+多节点互联是否匹配数据并行、张量并行、流水并行和专家并行的通信图。</p></li>
+</ol>
+<pre class="mermaid">flowchart LR
+  Workload[目标负载] --> Shape[算子形状与 batch]
+  Workload --> State[模型状态与 KV Cache]
+  Workload --> Comm[并行通信图]
+  Workload --> SLO[吞吐 / 延迟 / 成本目标]
 
-<section class="section" id="s3">
-<h2>3. 本章小结</h2>
-<table><tr><th>维度</th><th>关键问题</th></tr><tr><td>算力</td><td>算子吞吐是否够高</td></tr><tr><td>显存</td><td>模型、激活、KV Cache 是否放得下</td></tr><tr><td>带宽</td><td>数据搬运是否会成为关键瓶颈</td></tr><tr><td>互联</td><td>多卡 / 多机是否适合目标并行策略</td></tr><tr><td>异构治理</td><td>混卡场景要靠标签、镜像和调度来隔离复杂度</td></tr><tr><td>Datasheet 阅读</td><td>口径统一（dense/sparse/per-GPU/system），交叉印证</td></tr></table>
-<div class="success"><strong>最终判断：</strong>选 GPU 不是挑最大 TFLOPS，而是把目标模型、序列长度、batch、并发、SLO、并行策略和预算落到“算得动、放得下、喂得满、连得快”四个问题上。</div>
-</section>
+  Shape --> A[04a 执行模型]
+  State --> B[04b 显存与带宽]
+  Comm --> C[04c 互联与系统]
+  SLO --> D[04d 选型与治理]
 
-<section class="section" id="s4">
-<h2>4. 练习题</h2>
-<h3>基础题</h3>
-<ol>
-<li>为什么 GPU 选型不能只看峰值算力？</li>
-<li>训练和推理在硬件诉求上最大的差异是什么？</li>
-<li>用“算得动、放得下、喂得满、连得快”分析一个你熟悉的模型场景。</li>
-<li>如果你的平台同时有 A100 80G 和 H200，哪些任务更适合优先放到 H200？</li>
-</ol>
-<h3>进阶题</h3>
-<ol start="5">
-<li>某 datasheet 标称“FP16 Tensor Core 1978 TFLOPS”。真实可达吞吐是多少？为什么？</li>
-<li>你要在 H100 80GB 上部署 Llama 3 70B 做推理。按 §4.3.1 的四个问题分析：能做吗？如果不能，最少要几张？</li>
-<li>为什么同一个模型从 A100 换到 H100，memory-bound 的阶段可能变多？用 machine balance 解释。</li>
-<li>某负载在 A100 上 SM 利用率 95%，换到 H100 只有 40%。列出至少 3 种可能的原因。</li>
-<li>一张 H100 通过 MIG 切成 7 份，每份服务一个 7B 小模型。相比直接买 7 张 L40S，优劣分别是什么？</li>
-</ol>
-<h3>开放题</h3>
-<ol start="10">
-<li>你的团队要组建一个约 200 卡规模的混合训推集群。从本章角度，你会怎么规划卡型组合？需要哪些前期 benchmark？</li>
-<li>某供应商说他们的非 NVIDIA 加速器“性价比比 H100 高 50%”。作为平台工程方，你会问哪些问题来判断这个数字的可信度？</li>
-<li>如何向财务团队解释“我们需要换 H200，不只是因为新”？用本章的数据和论据组织一份说服材料大纲。</li>
-</ol>
-</section>
-
-<section class="refbox">
-<h2>参考资料与学习路线</h2>
-<h3>学习路线</h3>
-<ol>
-<li>先用本章四问建立硬件选型框架：算力、显存、带宽、互联。</li>
-<li>继续读 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a>，把 HBM、PCIe、NVLink、IB/RoCE 和存储路径连起来。</li>
-<li>再读 <a href="../part2/06-cuda-runtime-and-kernels.html">第 6 章</a>，理解 kernel 为什么没有吃满硬件。</li>
-<li>训练方向接 <a href="../part3/08-data-parallel.html">第 8 章</a>；推理方向接 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 与 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a>。</li>
-</ol>
-<h3>延伸阅读</h3>
+  A --> Decision[GPU 平台决策]
+  B --> Decision
+  C --> Decision
+  D --> Decision</pre>
+<h2 id="和后续章节的关系">4. 和后续章节的关系</h2>
 <ul>
-<li>NVIDIA 数据中心 GPU datasheet、HGX H100/H200、GB200 NVL72、NVLink / NVSwitch 公开资料。</li>
-<li>MLPerf Training / Inference、GenAI-Perf、Artificial Analysis 等 benchmark。</li>
-<li>NCCL tests、DCGM、NVIDIA GPU Operator、ROCm 文档与各推理引擎的硬件支持矩阵。</li>
+<li>第 5 章会继续展开内存、互联与 IO，把
+HBM、DRAM、PCIe、NVMe、对象存储和 RDMA 放到完整数据搬运链路里。</li>
+<li>第 6 章会进入 CUDA runtime、stream、kernel launch、profiling
+和算子执行效率。</li>
+<li>第 8-10 章会把多 GPU 硬件约束带入数据并行、模型并行、checkpoint
+和恢复。</li>
+<li>第 15-17 章会把显存、KV
+Cache、推理引擎、批处理和多租户成本连起来。</li>
 </ul>
+<p>因此，第 4 章拆分后的目标不是讲完所有 GPU
+细节，而是建立硬件判断的骨架：<strong>看到一个训练或推理负载，能先判断瓶颈属于执行、容量、带宽、互联还是治理，再进入对应章节深入。</strong></p>
+<h2 id="快速自测">5. 快速自测</h2>
+<ol type="1">
+<li>一个 H100 服务 7B 模型 decode 阶段 SM 利用率只有 5%，这一定是 GPU
+没调好吗？你会先读 04a 还是 04b？</li>
+<li>70B 模型推理权重能放下，但长上下文并发一上来就
+OOM，问题属于算力、显存、带宽还是互联？</li>
+<li>8 卡 H100 节点内 TP 很快，跨两个节点 TP 延迟暴涨，为什么不能只看单卡
+TFLOPS？</li>
+<li>采购页写 “FP8 72 PFLOPS”，你需要问它是单卡、8 卡系统还是 rack-level
+口径？</li>
+<li>把一张 H100 切成 MIG
+后，为什么它适合多个小服务，而不适合让一个大服务更快？</li>
+</ol>
+
 </section>
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>

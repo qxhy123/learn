@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0b1 章 · 虚拟内存、页表、TLB 与 Page Fault — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0b1" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0b1 章 · 虚拟内存、页表、TLB 与 Page Fault</h1>
+<p class="sub">解释虚拟地址、物理页、页表、TLB、minor/major fault、mmap、fork/COW 和 RSS/PSS 如何影响 AI 进程。</p>
+<div class="chips"><span class="chip">Virtual Address</span><span class="chip">Page Table</span><span class="chip">TLB</span><span class="chip">Page Fault</span><span class="chip">mmap</span><span class="chip">COW</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#虚拟内存地址空间是幻觉但这个幻觉很有用">2.
+虚拟内存：地址空间是幻觉，但这个幻觉很有用</a></li><li><a class="anchor" href="#页表与-tlb普通-load-背后的隐藏成本">3. 页表与 TLB：普通 load
+背后的隐藏成本</a></li><li><a class="anchor" href="#page-fault不是所有-fault-都是错误">4. Page Fault：不是所有 fault
+都是错误</a></li><li><a class="anchor" href="#mmap把文件变成地址空间">5. mmap：把文件变成地址空间</a></li><li><a class="anchor" href="#fork-与-copy-on-writedataloader-的隐形内存账">6. fork 与
+Copy-on-Write：DataLoader 的隐形内存账</a></li><li><a class="anchor" href="#内存指标判读vmsrsspssuss">7.
+内存指标判读：VMS、RSS、PSS、USS</a></li><li><a class="anchor" href="#worked-examplemmap-权重冷启动-p99-尖刺">8. Worked Example：mmap
+权重冷启动 p99 尖刺</a></li><li><a class="anchor" href="#worked-exampledataloader-worker-rss-看起来爆炸">9. Worked
+Example：DataLoader worker RSS 看起来爆炸</a></li><li><a class="anchor" href="#排障-sop">10. 排障 SOP</a></li><li><a class="anchor" href="#checklist">11. Checklist</a></li><li><a class="anchor" href="#练习">12. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="0b-memory-virtual-memory-and-io.html">第 0b 章</a>
+的虚拟内存拆分篇。Page Cache 与 dirty writeback 见 <a
+href="0b2-page-cache-writeback-and-huge-pages.html">0b2</a>，NUMA / PCIe
+/ pinned memory 见 <a
+href="0b3-numa-pcie-dma-and-pinned-memory.html">0b3</a>。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>AI
+程序看到的是一个很大的、连续的、私有的地址空间，但机器真实拥有的是有限
+DRAM、分散物理页、共享缓存、设备地址窗口和文件后端。不可化简的问题是：<strong>操作系统必须让每个进程相信自己独占一片连续内存，同时又要把这些虚拟地址动态映射到真实物理页、文件页或设备映射，并在隔离、性能和可回收性之间保持正确。</strong></p>
+<p>如果没有虚拟内存，多个训练进程不能安全共存，<code>mmap</code>
+大模型权重不能按需映射，DataLoader <code>fork</code> 后不能通过
+copy-on-write 共享父进程对象，CUDA / RDMA 也无法把用户态 buffer
+稳定地注册给设备。虚拟内存提供了强抽象，但它也引入代价：TLB miss、page
+walk、minor fault、major fault、COW 复制、RSS
+误判和地址空间碎片都会出现在 AI workload 的性能现场。</p>
+<h3 id="推-从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从“进程需要私有地址空间”推出虚拟地址；从“虚拟地址要访问真实
+DRAM”推出页表；从“每次 load 都查页表太慢”推出
+TLB；从“页可能还没映射或不在内存”推出 page
+fault；从“文件可以像内存一样访问”推出 <code>mmap</code>；从“fork
+后复制整个父进程太贵”推出 copy-on-write。</p>
+<p>这些机制互相牵制。<code>mmap</code> safetensors
+可以让模型权重按页加载，但第一次访问会产生 page fault；DataLoader
+<code>fork</code> 可以共享父进程只读对象，但 worker 写入会触发 COW；TLB
+可以缓存地址翻译，但 4 KiB 页面对几十 GB tensor 会产生大量页表项和 TLB
+压力。</p>
+<h3 id="绘-因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">flowchart LR
+  VA[用户态虚拟地址] --> TLB{TLB hit?}
+  TLB -- yes --> PA[物理地址]
+  TLB -- no --> PT[多级页表遍历]
+  PT --> Present{页已映射并在内存?}
+  Present -- yes --> Fill[填充 TLB]
+  Fill --> PA
+  Present -- no --> Fault[page fault 进入内核]
+  Fault --> Kind{fault 类型}
+  Kind --> Minor[minor: 建映射/分配页]
+  Kind --> Major[major: 从磁盘/文件后端读页]
+  Kind --> COW[COW: 复制私有页]
+  Minor --> Fill
+  Major --> Fill
+  COW --> Fill</pre>
+<h3 id="导-读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>虚拟地址、物理地址、页表、TLB、page fault 分别解决什么问题？</li>
+<li>TLB hit、TLB miss、minor fault、major fault
+的延迟量级为什么差很多？</li>
+<li><code>mmap</code>
+模型权重为什么能降低启动峰值内存，却可能把冷启动延迟推迟到首次访问？</li>
+<li>DataLoader <code>fork</code> 后哪些页会共享，哪些写入会触发
+COW？</li>
+<li>RSS、PSS、VMS
+为什么不能混用？为什么“看起来占了很多内存”未必代表真实独占？</li>
+</ol>
+<h2 id="虚拟内存地址空间是幻觉但这个幻觉很有用">2.
+虚拟内存：地址空间是幻觉，但这个幻觉很有用</h2>
+<p>每个 Linux 进程都有自己的虚拟地址空间。用户程序里看到的指针，例如
+<code>0x7f...</code>，不是 DRAM 上的真实地址，而是虚拟地址。CPU
+访问内存时，MMU 会把虚拟地址翻译成物理地址。</p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>含义</th>
+<th>AI 场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>虚拟地址</td>
+<td>进程看到的地址</td>
+<td>Python 对象、tensor storage、mmap 文件</td>
+</tr>
+<tr>
+<td>物理页框</td>
+<td>DRAM 中真实 4 KiB 页框</td>
+<td>RSS 真正落在内存的部分</td>
+</tr>
+<tr>
+<td>页表</td>
+<td>虚拟页到物理页的映射</td>
+<td>大进程有大量页表内存</td>
+</tr>
+<tr>
+<td>VMA</td>
+<td>一段连续虚拟地址区域</td>
+<td>heap、stack、mmap 权重、shared memory</td>
+</tr>
+<tr>
+<td>MMU</td>
+<td>硬件地址翻译单元</td>
+<td>每次 load/store 都依赖它</td>
+</tr>
+</tbody>
+</table>
+<p>虚拟内存带来四个关键能力：</p>
+<ul>
+<li><strong>隔离</strong>：一个训练进程不能随便写另一个进程的内存。</li>
+<li><strong>稀疏地址空间</strong>：进程可以拥有很大的虚拟地址范围，不必一次分配物理内存。</li>
+<li><strong>文件映射</strong>：<code>mmap</code>
+可以把文件映射到地址空间，用 load 指令触发读取。</li>
+<li><strong>共享与
+COW</strong>：多个进程可以共享同一物理页，写入时再复制。</li>
+</ul>
+<p>工程边界：虚拟地址连续不等于物理页连续。一个 20 GiB tensor
+在虚拟地址上连续，但底层可能由大量 4 KiB 物理页组成；设备 DMA、TLB、NUMA
+locality 都会受真实物理布局影响。</p>
+<h3 id="一个进程地址空间里通常有什么">2.1
+一个进程地址空间里通常有什么</h3>
+<p>用 <code>cat /proc/&lt;pid&gt;/maps</code>
+可以看到进程的虚拟内存区域。一个训练进程通常包含：</p>
+<table>
+<colgroup>
+<col style="width: 24%" />
+<col style="width: 40%" />
+<col style="width: 36%" />
+</colgroup>
+<thead>
+<tr>
+<th>区域</th>
+<th>常见来源</th>
+<th>AI 场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>text / rodata</td>
+<td>Python 解释器、动态库、CUDA/cuDNN/NCCL so</td>
+<td>代码段和只读数据，多个进程可共享</td>
+</tr>
+<tr>
+<td>heap</td>
+<td>glibc / jemalloc / Python allocator</td>
+<td>Python 对象、metadata、临时 buffer</td>
+</tr>
+<tr>
+<td>stack</td>
+<td>每个线程的栈</td>
+<td>DataLoader worker、RPC 线程、runtime 线程</td>
+</tr>
+<tr>
+<td>anonymous mmap</td>
+<td>大块匿名内存</td>
+<td>PyTorch CPU tensor、allocator arena、shared queue</td>
+</tr>
+<tr>
+<td>file-backed mmap</td>
+<td>文件映射</td>
+<td>safetensors、NumPy memmap、dataset index</td>
+</tr>
+<tr>
+<td>shared memory</td>
+<td><code>/dev/shm</code>、POSIX shm</td>
+<td>DataLoader IPC、进程间队列</td>
+</tr>
+<tr>
+<td>device mapping</td>
+<td>driver 映射区域</td>
+<td>CUDA driver、NIC、GPU BAR、注册内存</td>
+</tr>
+</tbody>
+</table>
+<p>示例命令：</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/maps <span class="kw">|</span> <span class="fu">head</span> <span class="at">-40</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pmap</span> <span class="at">-x</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-k3</span> <span class="at">-n</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-20</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<p><code>maps</code> 告诉你“地址空间里有哪些区域”；<code>smaps</code>
+告诉你这些区域实际占了多少
+RSS、PSS、Private、Shared。排查内存时要把二者结合：一个 140 GB 的 mmap
+权重文件可能让 VMS 很大，但如果只访问了少量页，RSS
+不一定大；反过来，一个看似不大的 Python dict 可能分散在大量小页上，fork
+后很容易 COW。</p>
+<h3 id="物理页文件页匿名页共享页">2.2
+物理页、文件页、匿名页、共享页</h3>
+<p>Linux 的页不只一种。理解页的来源，比只看“用了多少内存”更有价值。</p>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 13%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>页类型</th>
+<th>后端</th>
+<th>典型字段</th>
+<th>回收方式</th>
+<th>AI 场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anonymous page</td>
+<td>无文件后端</td>
+<td><code>RssAnon</code></td>
+<td>可 swap 或丢弃后重建取决于场景</td>
+<td>Python heap、CPU tensor</td>
+</tr>
+<tr>
+<td>File-backed page</td>
+<td>文件</td>
+<td><code>RssFile</code></td>
+<td>干净页可直接丢弃，需要时重读文件</td>
+<td>mmap 权重、dataset shard</td>
+</tr>
+<tr>
+<td>Shared memory page</td>
+<td>tmpfs/shm</td>
+<td><code>RssShmem</code></td>
+<td>取决于 tmpfs/shm 生命周期</td>
+<td>DataLoader queue、IPC</td>
+</tr>
+<tr>
+<td>Private dirty page</td>
+<td>进程私有且被写过</td>
+<td><code>Private_Dirty</code></td>
+<td>不能直接丢弃</td>
+<td>COW 后的 worker 私有页</td>
+</tr>
+<tr>
+<td>Shared clean page</td>
+<td>多进程共享且未写</td>
+<td><code>Shared_Clean</code></td>
+<td>可丢弃或共享</td>
+<td>动态库、只读 mmap</td>
+</tr>
+</tbody>
+</table>
+<p>这解释了一个常见误判：<code>nvidia-smi</code> 之外的 CPU
+内存看起来很大，不一定都是“泄漏”。如果大部分是 <code>RssFile</code> 或
+<code>Shared_Clean</code>，它可能是可回收文件缓存或共享映射；如果
+<code>Private_Dirty</code> 持续增长，就更像真实独占内存增长。</p>
+<h2 id="页表与-tlb普通-load-背后的隐藏成本">3. 页表与 TLB：普通 load
+背后的隐藏成本</h2>
+<p>Linux 常用 4 KiB
+page。虚拟地址被拆成虚拟页号和页内偏移，页表记录虚拟页号到物理页框的映射。x86-64
+常见 4 级或 5 级页表，TLB miss 时硬件 page walker 可能访问多级页表。</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>大致含义</th>
+<th>性能影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TLB hit</td>
+<td>地址翻译在 TLB 里</td>
+<td>很快，通常不是瓶颈</td>
+</tr>
+<tr>
+<td>TLB miss + 页表在 cache</td>
+<td>需要 page walk</td>
+<td>数十 ns 级</td>
+</tr>
+<tr>
+<td>TLB miss + 页表不在 cache</td>
+<td>page walk 还要访问内存</td>
+<td>可到百 ns 级</td>
+</tr>
+<tr>
+<td>minor fault</td>
+<td>页存在或可分配，但还没建映射</td>
+<td>进入内核，微秒级常见</td>
+</tr>
+<tr>
+<td>major fault</td>
+<td>需要从磁盘/远端后端读页</td>
+<td>可到 ms 级或更高</td>
+</tr>
+</tbody>
+</table>
+<p>AI workload 里常见 TLB 压力来源：</p>
+<ul>
+<li>大 embedding table 随机访问；</li>
+<li>巨大 NumPy / PyTorch CPU tensor；</li>
+<li>大规模 dataset index 或 memmap；</li>
+<li>多进程 DataLoader 共享大量 VMA；</li>
+<li>小页导致页表项数量膨胀。</li>
+</ul>
+<p>观察命令：</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> dTLB-loads,dTLB-load-misses,iTLB-load-misses <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 10</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;VmSize|VmRSS|VmPTE|RssAnon|RssFile|RssShmem&#39;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/status</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<p><code>VmPTE</code>
+可以提醒你页表本身的内存开销。一个很大的进程，即使业务 tensor
+没有增长，也可能因为映射数量和页表增长消耗更多内核内存。</p>
+<h3 id="以-4-kib-页理解地址拆分">3.1 以 4 KiB 页理解地址拆分</h3>
+<p>以 4 KiB 页为例，页内偏移占 12 bit。一个虚拟地址可以粗略拆成：</p>
+<pre class="text"><code>virtual address = virtual page number + page offset
+page offset     = 低 12 bit
+VPN             = 高位，用于查页表</code></pre>
+<p>页表项不只保存物理页框号，还保存权限和状态：</p>
+<table>
+<thead>
+<tr>
+<th>页表项信息</th>
+<th>作用</th>
+<th>工程含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>present</td>
+<td>页是否当前可访问</td>
+<td>不 present 会触发 page fault</td>
+</tr>
+<tr>
+<td>read/write</td>
+<td>是否可写</td>
+<td>COW 会先标只读，写入时 fault</td>
+</tr>
+<tr>
+<td>user/supervisor</td>
+<td>用户态是否可访问</td>
+<td>隔离内核内存</td>
+</tr>
+<tr>
+<td>dirty</td>
+<td>页是否被写过</td>
+<td>回写和 COW 诊断相关</td>
+</tr>
+<tr>
+<td>accessed</td>
+<td>页是否被访问过</td>
+<td>回收算法参考</td>
+</tr>
+<tr>
+<td>executable / NX</td>
+<td>是否可执行</td>
+<td>安全隔离</td>
+</tr>
+<tr>
+<td>physical frame number</td>
+<td>物理页框号</td>
+<td>真正访问 DRAM 的位置</td>
+</tr>
+</tbody>
+</table>
+<p>当你看到“写入触发 page
+fault”时，不一定是页不存在；也可能是页表项被故意标成只读，用于 COW
+或保护。</p>
+<h3 id="多级页表为什么存在">3.2 多级页表为什么存在</h3>
+<p>如果每个进程都为整个 48-bit 或 57-bit
+虚拟地址空间准备一张平铺页表，页表会巨大到不可接受。多级页表让没有使用的地址范围不占下级页表。</p>
+<pre class="mermaid">flowchart LR
+  VA[虚拟地址高位] --> L4[PML4 / PGD]
+  L4 --> L3[PUD]
+  L3 --> L2[PMD]
+  L2 --> L1[PTE]
+  L1 --> PFN[物理页框]
+  VA2[低 12 bit] --> Off[页内偏移]
+  PFN --> PA[物理地址]
+  Off --> PA</pre>
+<p>这套结构节省内存，但 TLB miss 时要访问多级页表。如果页表项本身不在
+cache 中，page walk
+会触发多次内存访问。对大数组随机访问来说，实际慢点可能不是数据本身，而是地址翻译和页表访问。</p>
+<h3 id="tlb-层级与-shootdown">3.3 TLB 层级与 shootdown</h3>
+<p>现代 CPU 通常有多级 TLB，例如 L1 dTLB、L2/STLB。TLB
+是每核或每组核心的硬件缓存。TLB 命中时地址翻译很快；TLB miss 才需要 page
+walk。</p>
+<p>还有一个容易忽略的成本：TLB
+shootdown。当内核修改某个进程的页表映射，例如
+<code>munmap</code>、权限变化、COW、内存回收，其他 CPU 核上可能缓存了旧
+TLB 项，内核需要让它们失效。多线程、多进程、大量 mmap/munmap
+的程序会看到 shootdown 开销。</p>
+<p>观察线索：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> dTLB-load-misses,dTLB-store-misses,dtlb_load_misses.walk_completed <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 10</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> tlb:tlb_flush <span class="at">-a</span> <span class="at">--</span> sleep 10  <span class="co"># 事件名依内核而异</span></span></code></pre></div>
+<p>不同平台事件名不同，<code>perf list | grep -i tlb</code>
+先确认可用事件。</p>
+<h3 id="什么时候-tlb-是真瓶颈">3.4 什么时候 TLB 是真瓶颈</h3>
+<p>TLB miss 高不一定就是主要瓶颈，要结合 workload：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>是否容易 TLB-bound</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>大 batch 连续 GEMM</td>
+<td>通常不明显</td>
+<td>数据访问连续，GPU 侧为主</td>
+</tr>
+<tr>
+<td>CPU embedding / feature lookup</td>
+<td>容易</td>
+<td>大表随机访问，页跨度大</td>
+</tr>
+<tr>
+<td>巨大 Python object graph</td>
+<td>容易</td>
+<td>小对象分散，cache/TLB 都差</td>
+</tr>
+<tr>
+<td>NumPy memmap 随机采样</td>
+<td>容易</td>
+<td>文件页随机 fault + TLB miss</td>
+</tr>
+<tr>
+<td>顺序读取大 shard</td>
+<td>不一定</td>
+<td>readahead 和 Page Cache 可缓解</td>
+</tr>
+</tbody>
+</table>
+<p>优化方向：</p>
+<ul>
+<li>用连续数组替代 Python object graph；</li>
+<li>用 columnar / binary 格式替代大量小对象；</li>
+<li>对大数组评估 Huge Pages，详见 0b2；</li>
+<li>减少随机访问跨度；</li>
+<li>分批处理，让访问局部性更强。</li>
+</ul>
+<h2 id="page-fault不是所有-fault-都是错误">4. Page Fault：不是所有 fault
+都是错误</h2>
+<p>Page fault
+只是“当前访问的虚拟页无法直接完成翻译”。它可能是正常机制，也可能是性能问题。</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 23%" />
+<col style="width: 38%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>类型</th>
+<th>发生原因</th>
+<th>是否需要磁盘 IO</th>
+<th>常见场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Minor fault</td>
+<td>页已在内存或需要新分配，只是没建映射</td>
+<td>否</td>
+<td>首次触碰匿名页、COW 分配</td>
+</tr>
+<tr>
+<td>Major fault</td>
+<td>页不在内存，需要从文件/磁盘读入</td>
+<td>是</td>
+<td>mmap 大文件首次访问、内存压力后重读</td>
+</tr>
+<tr>
+<td>COW fault</td>
+<td>共享只读页被写入，需要复制</td>
+<td>否，但要分配/拷贝</td>
+<td>fork 后 worker 修改父进程对象</td>
+</tr>
+<tr>
+<td>Protection fault</td>
+<td>权限不允许</td>
+<td>不一定</td>
+<td>写只读映射、越界 bug</td>
+</tr>
+</tbody>
+</table>
+<p>查看进程 fault：</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-r</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> 1</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> page-faults,minor-faults,major-faults <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/stat</span></code></pre></div>
+<p>训练启动慢时，如果 major fault 很高，可能是 mmap 权重或 dataset index
+正在从文件系统拉页；如果 minor fault 很高，可能是大数组首次 touch、COW
+或 allocator arena 初始化。</p>
+<h3 id="minor-fault-的几种常见来源">4.1 Minor fault 的几种常见来源</h3>
+<p>Minor fault
+不读磁盘，但仍要进内核，数量多时也会影响启动和尾延迟。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>来源</th>
+<th>解释</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>demand-zero page</td>
+<td>首次写匿名页，内核分配清零页</td>
+<td>初始化大 CPU tensor</td>
+</tr>
+<tr>
+<td>file page 已在 Page Cache</td>
+<td>文件页已在内存，只需建立映射</td>
+<td>mmap 权重第二次启动</td>
+</tr>
+<tr>
+<td>COW</td>
+<td>写共享页，复制私有页</td>
+<td>fork worker 修改父对象</td>
+</tr>
+<tr>
+<td>stack growth</td>
+<td>线程栈按需增长</td>
+<td>大量线程或深递归</td>
+</tr>
+<tr>
+<td>lazy allocation</td>
+<td>allocator 申请虚拟地址但未触碰物理页</td>
+<td><code>malloc</code> 后首次写入</td>
+</tr>
+</tbody>
+</table>
+<h3 id="major-fault-的几种常见来源">4.2 Major fault 的几种常见来源</h3>
+<p>Major fault 需要等待 IO，因此更容易造成明显延迟。</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>解释</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mmap 文件首次访问</td>
+<td>文件页不在 Page Cache</td>
+<td>首次加载 safetensors</td>
+</tr>
+<tr>
+<td>内存压力后重读</td>
+<td>文件页被回收</td>
+<td>多租户节点上权重被挤出</td>
+</tr>
+<tr>
+<td>swap in</td>
+<td>匿名页被换出</td>
+<td>CPU 内存压力严重</td>
+</tr>
+<tr>
+<td>远端 FS / FUSE 后端</td>
+<td>fault 触发远端读取</td>
+<td>对象存储 FUSE mount</td>
+</tr>
+</tbody>
+</table>
+<p>AI 线上推理要特别警惕 major fault：请求路径中一次 major fault
+就可能把 p99 拉高几个数量级。生产服务应在接流量前 warmup
+权重页、tokenizer、索引和关键 mmap 区域。</p>
+<h3 id="fault-观测容易踩的坑">4.3 Fault 观测容易踩的坑</h3>
+<ul>
+<li><code>perf stat page-faults</code> 包含 minor +
+major，先拆开看。</li>
+<li><code>pidstat -r</code> 中 <code>minflt/s</code>
+很高不一定是坏事，启动期首次 touch 会很高。</li>
+<li>容器里看到的内存指标可能经过 cgroup 限制，宿主机 Page Cache
+压力也要看。</li>
+<li>macOS / Linux / WSL 行为不同，本教程默认 Linux。</li>
+<li>mmap 文件的 IO 可能体现在 page fault 上，而不是显式
+<code>read()</code> syscall 上。</li>
+</ul>
+<p>建议记录：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-r</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> 1</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> minor-faults,major-faults,page-faults <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pgfault|pgmajfault&#39;</span> /sys/fs/cgroup/<span class="op">&lt;</span>group<span class="op">&gt;</span>/memory.stat <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span></code></pre></div>
+<h2 id="mmap把文件变成地址空间">5. mmap：把文件变成地址空间</h2>
+<p><code>mmap</code>
+让文件内容映射到进程地址空间。访问映射区时，如果页不在内存，内核会把对应文件页读入
+Page Cache 并建立映射。</p>
+<pre class="mermaid">sequenceDiagram
+  participant App as 用户进程
+  participant MM as 内存管理
+  participant Cache as Page Cache
+  participant FS as 文件系统
+  App->>MM: mmap(model.safetensors)
+  MM-->>App: 返回虚拟地址范围
+  App->>MM: 首次读取某页
+  MM->>Cache: 查文件页
+  alt cache hit
+    Cache-->>MM: 返回页
+  else cache miss
+    Cache->>FS: 读取文件块
+    FS-->>Cache: 填充页
+  end
+  MM-->>App: 建立页表映射后继续执行</pre>
+<p>优点：</p>
+<ul>
+<li>不必一次把整个文件读进用户态 buffer；</li>
+<li>多进程可以共享同一文件页；</li>
+<li>OS 可以按需加载和回收；</li>
+<li>权重文件、dataset index、NumPy memmap 都能受益。</li>
+</ul>
+<p>风险：</p>
+<ul>
+<li>首次访问延迟变成 page fault，可能污染在线冷启动；</li>
+<li>随机访问大文件会触发大量小读；</li>
+<li>内存压力下页被回收，后续访问再次 major fault；</li>
+<li>映射不等于 pin，设备 DMA 仍需要注册/锁页。</li>
+</ul>
+<h3 id="mmap-权重加载的两种策略">5.1 mmap 权重加载的两种策略</h3>
+<p>大模型权重加载常见两种策略：</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优点</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager read</td>
+<td>启动时显式读完整权重到用户态 buffer</td>
+<td>延迟集中在启动期，接流量后更稳定</td>
+<td>启动峰值内存高，拷贝多</td>
+</tr>
+<tr>
+<td>mmap lazy</td>
+<td>映射文件，访问时按页 fault</td>
+<td>启动初始 RSS 低，多进程共享方便</td>
+<td>首次访问延迟分散到请求或 warmup</td>
+</tr>
+</tbody>
+</table>
+<p>生产推理通常不希望第一个真实用户请求承担 major fault。即使用
+mmap，也应做 warmup：</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 粗暴预热文件页，适合离线验证，不等于应用访问全部路径</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">vmtouch</span> <span class="at">-t</span> model.safetensors</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 没有 vmtouch 时可顺序读一遍</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=model.safetensors of=/dev/null bs=64M status=progress</span></code></pre></div>
+<p>应用内更可靠：按模型实际访问路径做一次 dummy forward / prefill /
+decode，让权重、kernel、CUDA Graph、allocator 都进入稳态。</p>
+<h3 id="mmap-与-page-cache-的关系">5.2 mmap 与 Page Cache 的关系</h3>
+<p>mmap 文件页通常通过 Page Cache 管理。多个进程 mmap
+同一个只读权重文件时，可以共享相同物理文件页。这是模型服务多 worker
+的重要优化。</p>
+<p>但共享成立有条件：</p>
+<ul>
+<li>映射同一个文件内容；</li>
+<li>页是 clean file-backed；</li>
+<li>没有写入触发私有副本；</li>
+<li>文件没有被替换成另一个 inode；</li>
+<li>容器 / mount namespace 没让路径指向不同后端。</li>
+</ul>
+<p>发布模型时要小心“覆盖写原文件”。更稳的方式是内容哈希路径 +
+原子切换引用：</p>
+<pre class="text"><code>models/
+  sha256-abc.../model.safetensors
+  sha256-def.../model.safetensors
+  current -&gt; sha256-def...</code></pre>
+<p>这样旧进程继续持有旧 inode，新进程加载新 inode，避免 mmap
+文件被原地修改。</p>
+<h3 id="mmap-不等于零拷贝到-gpu">5.3 mmap 不等于零拷贝到 GPU</h3>
+<p>mmap 只是让 CPU 进程以地址访问文件页。把权重放到 GPU HBM 仍然需要 H2D
+或 GDS 等路径。普通路径通常是：</p>
+<pre class="text"><code>file page in Page Cache
+  -&gt; CPU addressable memory
+  -&gt; cudaMemcpy / framework loader
+  -&gt; GPU HBM</code></pre>
+<p>如果目标是减少 CPU bounce buffer 或走更直接的数据路径，要进入 0b3 /
+第 5b 的 DMA、pinned memory、GDS 讨论。不要把 mmap 和 GPU zero-copy
+混为一谈。</p>
+<h2 id="fork-与-copy-on-writedataloader-的隐形内存账">6. fork 与
+Copy-on-Write：DataLoader 的隐形内存账</h2>
+<p>Linux <code>fork()</code>
+后，子进程不会立刻复制父进程所有物理页。父子进程先共享同一批物理页，页表被标记为只读；任一方写入时触发
+COW fault，内核复制一份私有页。</p>
+<pre class="mermaid">flowchart LR
+  P[父进程: dataset index] --> Page[共享物理页]
+  W1[worker 1] --> Page
+  W2[worker 2] --> Page
+  W1 -- 写入共享对象 --> COW1[复制私有页]
+  W2 -- 只读 --> Page</pre>
+<p>DataLoader 场景：</p>
+<ul>
+<li>父进程加载巨大 Python list / dict，fork worker
+后只读，初始看似省内存；</li>
+<li>worker 如果修改对象、打乱列表、缓存字段，可能触发 COW；</li>
+<li>Python 小对象分散在许多页上，改一个引用计数也可能导致整页复制；</li>
+<li>RSS 会把共享页在每个进程里都计入，看起来“总 RSS 爆炸”，PSS
+更接近按比例分摊。</li>
+</ul>
+<p>观察：</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">smem</span> <span class="at">-p</span> <span class="at">-P</span> <span class="st">&#39;python|train&#39;</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;Rss|Pss|Private|Shared&#39;</span></span></code></pre></div>
+<p>工程建议：</p>
+<ul>
+<li>大型 dataset metadata 尽量用不可变、连续、mmap 友好的格式；</li>
+<li>worker 内避免修改父进程大对象；</li>
+<li>Linux 上评估 <code>fork</code> vs <code>spawn</code>
+的内存/启动权衡；</li>
+<li>用 PSS 而不是简单 RSS 评估共享内存。</li>
+</ul>
+<h3 id="python-引用计数也可能破坏共享">6.1 Python
+引用计数也可能破坏共享</h3>
+<p>CPython
+对象有引用计数。某些看似“只读遍历”的操作，也可能更新对象头的引用计数或触发缓存字段变化，从而让所在页变
+dirty。一个页是 4 KiB，页里可能塞了很多小对象；改动一个对象头，整页对该
+worker 变成私有页。</p>
+<p>因此，大型 metadata 不适合用嵌套 Python list/dict 长期驻留在父进程再
+fork。更适合：</p>
+<ul>
+<li>NumPy array / Arrow / memory-mapped binary；</li>
+<li>只读字符串池和 offset table；</li>
+<li>dataset manifest 文件；</li>
+<li>worker 内按 shard 加载局部 metadata；</li>
+<li><code>spawn</code> 模式下显式初始化，避免 COW 误判。</li>
+</ul>
+<h3 id="forkspawnforkserver-的取舍">6.2 fork、spawn、forkserver
+的取舍</h3>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 18%" />
+<col style="width: 31%" />
+</colgroup>
+<thead>
+<tr>
+<th>启动方式</th>
+<th>优点</th>
+<th>风险</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fork</td>
+<td>启动快，初始共享父进程页</td>
+<td>COW 隐蔽，和 CUDA runtime 混用有风险</td>
+<td>Linux DataLoader，父对象只读且未初始化 CUDA</td>
+</tr>
+<tr>
+<td>spawn</td>
+<td>子进程重新导入和初始化</td>
+<td>启动慢，占用更显式</td>
+<td>跨平台、CUDA 安全性更好</td>
+</tr>
+<tr>
+<td>forkserver</td>
+<td>通过干净 server fork</td>
+<td>配置复杂</td>
+<td>避免从复杂父进程 fork</td>
+</tr>
+</tbody>
+</table>
+<p>PyTorch 场景里，不建议在已经初始化 CUDA context 后随意 fork
+worker。DataLoader 的 worker 通常处理 CPU 数据路径，GPU 工作留在主进程或
+rank 进程。</p>
+<h3 id="cow-实验判断-worker-是否复制了父对象">6.3 COW 实验：判断 worker
+是否复制了父对象</h3>
+<p>可以做一个简化实验：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os, time, multiprocessing <span class="im">as</span> mp</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>big <span class="op">=</span> <span class="bu">bytearray</span>(<span class="dv">4</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)  <span class="co"># 4 GiB</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> worker(write):</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> write:</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">0</span>, <span class="bu">len</span>(big), <span class="dv">4096</span>):</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>            big[i] <span class="op">=</span> <span class="dv">1</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    time.sleep(<span class="dv">300</span>)</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    p <span class="op">=</span> mp.Process(target<span class="op">=</span>worker, args<span class="op">=</span>(<span class="va">False</span>,))</span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    p.start()</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;parent&quot;</span>, os.getpid(), <span class="st">&quot;child&quot;</span>, p.pid)</span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>    time.sleep(<span class="dv">300</span>)</span></code></pre></div>
+<p>先观察只读 worker 的 PSS/RSS，再把 <code>write=True</code>。你会看到
+RSS 表面可能都很大，但 PSS 和 Private_Dirty 才能反映真实复制。</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>parent<span class="op">&gt;</span>/smaps_rollup</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>child<span class="op">&gt;</span>/smaps_rollup</span></code></pre></div>
+<h3 id="dataloader-设计建议">6.4 DataLoader 设计建议</h3>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 42%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>问题</th>
+<th>低质量做法</th>
+<th>更稳做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>巨大样本列表</td>
+<td>父进程 Python list 存所有路径和 metadata</td>
+<td>manifest + mmap offset table</td>
+</tr>
+<tr>
+<td>worker 修改状态</td>
+<td>worker 写父对象缓存字段</td>
+<td>worker 本地 cache 或只读结构</td>
+</tr>
+<tr>
+<td>随机读取小文件</td>
+<td>每个 worker 大量 open/stat</td>
+<td>shard + offset</td>
+</tr>
+<tr>
+<td>内存观测</td>
+<td>累加所有 worker RSS</td>
+<td>看 PSS、Private_Dirty、cgroup</td>
+</tr>
+<tr>
+<td>CUDA 初始化</td>
+<td>父进程 init CUDA 后 fork</td>
+<td>rank 进程中初始化，worker 只做 CPU</td>
+</tr>
+</tbody>
+</table>
+<h2 id="内存指标判读vmsrsspssuss">7.
+内存指标判读：VMS、RSS、PSS、USS</h2>
+<table>
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 23%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>什么时候有用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VMS / VmSize</td>
+<td>虚拟地址空间大小</td>
+<td>看 mmap / address reservation，不代表实际占用</td>
+</tr>
+<tr>
+<td>RSS / VmRSS</td>
+<td>当前驻留物理内存总量</td>
+<td>看进程工作集，但会重复计算共享页</td>
+</tr>
+<tr>
+<td>PSS</td>
+<td>按共享比例分摊后的 RSS</td>
+<td>多进程共享权重/DataLoader 时更真实</td>
+</tr>
+<tr>
+<td>USS / Private</td>
+<td>进程独占内存</td>
+<td>判断真实泄漏</td>
+</tr>
+<tr>
+<td>RssFile</td>
+<td>file-backed 驻留页</td>
+<td>mmap 权重、Page Cache 映射</td>
+</tr>
+<tr>
+<td>RssAnon</td>
+<td>匿名驻留页</td>
+<td>heap、tensor、COW 私有页</td>
+</tr>
+<tr>
+<td>VmPTE</td>
+<td>页表占用</td>
+<td>大 VMA / 小页映射压力</td>
+</tr>
+</tbody>
+</table>
+<p>排查顺序：</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/status <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;VmSize|VmRSS|VmPTE|RssAnon|RssFile|RssShmem&#39;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">smem</span> <span class="at">-p</span> <span class="at">-P</span> <span class="st">&#39;python|train&#39;</span></span></code></pre></div>
+<p>容器环境还要看 cgroup：</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/<span class="op">&lt;</span>group<span class="op">&gt;</span>/memory.current</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/<span class="op">&lt;</span>group<span class="op">&gt;</span>/memory.stat <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;anon|file|kernel_stack|pagetables|pgfault|pgmajfault&#39;</span></span></code></pre></div>
+<p>常见结论：</p>
+<ul>
+<li>VMS 大、RSS 小：可能只是 mmap 或地址预留；</li>
+<li>RSS 大、PSS 小：大量共享页，不一定是泄漏；</li>
+<li>Private_Dirty 持续涨：更像真实独占增长；</li>
+<li>RssFile 大：可能是 mmap 权重或文件页；</li>
+<li>VmPTE 大：页表开销值得关注，可能需要 huge page / 减少 VMA。</li>
+</ul>
+<h2 id="worked-examplemmap-权重冷启动-p99-尖刺">8. Worked Example：mmap
+权重冷启动 p99 尖刺</h2>
+<p>现象：一个推理服务使用 mmap 加载 70B
+权重。进程启动很快，健康检查通过，但第一批线上请求 p99 高达 8
+秒，之后稳定在 500 ms。GPU 时间线显示首请求前 CPU 侧等待明显，GPU
+并没有持续计算。</p>
+<p>假设：</p>
+<ol type="1">
+<li>权重 mmap 后没有实际触碰；</li>
+<li>首请求触发大量 major fault；</li>
+<li>Page Cache 首次填充慢；</li>
+<li>后续请求命中 Page Cache，所以恢复正常。</li>
+</ol>
+<p>验证：</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-r</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> 1</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> minor-faults,major-faults,page-faults <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -- sleep 30</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/smaps_rollup <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;RssFile|RssAnon|Pss|Private&#39;</span></span></code></pre></div>
+<p>压测首请求期间看到 <code>majflt/s</code> 飙升，<code>RssFile</code>
+快速增长。说明问题不是模型算法突然慢，而是 mmap 文件页首次 fault。</p>
+<p>修复：</p>
+<ul>
+<li>发布后、接流量前执行 dummy prefill/decode；</li>
+<li>预热权重文件页；</li>
+<li>对关键索引和 tokenizer 做应用级 warmup；</li>
+<li>readiness probe 只在 warmup 完成后通过；</li>
+<li>多副本滚动发布时限制并发 warmup，避免打爆文件系统。</li>
+</ul>
+<p>验收：</p>
+<ul>
+<li>首请求 major fault 接近 0；</li>
+<li><code>RssFile</code> 在接流量前达到预期；</li>
+<li>p99 首轮和稳态差距缩小；</li>
+<li>文件系统读吞吐没有因所有副本同时 warmup 出现尖刺。</li>
+</ul>
+<h2 id="worked-exampledataloader-worker-rss-看起来爆炸">9. Worked
+Example：DataLoader worker RSS 看起来爆炸</h2>
+<p>现象：父进程加载 12 GiB dataset metadata，启动 16 个 fork worker
+后，<code>ps</code> 显示每个 worker RSS 都接近 12 GiB，团队以为内存要
+192 GiB。</p>
+<p>验证：</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">smem</span> <span class="at">-p</span> <span class="at">-P</span> <span class="st">&#39;train.py&#39;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>worker<span class="op">&gt;</span>/smaps_rollup <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;Rss|Pss|Shared|Private&#39;</span></span></code></pre></div>
+<p>发现初始 PSS 每个 worker 只有约 800 MiB，大部分是
+<code>Shared_Clean</code>。这说明 RSS 重复计算共享页。运行 30
+分钟后，PSS 增长到每 worker 4 GiB，<code>Private_Dirty</code>
+增长明显。检查代码发现 worker 会向 metadata 对象写入 decode cache，触发
+COW。</p>
+<p>修复：</p>
+<ul>
+<li>metadata 改为只读 mmap offset table；</li>
+<li>worker cache 改成本地小 LRU，不写父对象；</li>
+<li>大对象从 Python dict 改为 Arrow/NumPy memmap；</li>
+<li>监控 PSS 和 Private_Dirty，而不是简单 RSS。</li>
+</ul>
+<p>结果：每 worker PSS 稳定在 1 GiB 内，节点不再 OOM。</p>
+<h2 id="排障-sop">10. 排障 SOP</h2>
+<pre class="mermaid">flowchart TD
+  A[内存异常或启动慢] --> B{是容量问题还是延迟问题?}
+  B -->|容量| C[看 VMS/RSS/PSS/Private_Dirty]
+  B -->|延迟| D[看 minor/major fault 和 mmap 首次访问]
+  C --> E{共享页多吗?}
+  E -->|是| F[用 PSS 评估, 检查 COW]
+  E -->|否| G[查 Private_Dirty / RssAnon 增长]
+  D --> H{major fault 高吗?}
+  H -->|是| I[预热 mmap / Page Cache / 检查远端 FS]
+  H -->|否| J[查 minor fault / 首次 touch / COW]
+  F --> K[优化 metadata 格式和 worker 写入]
+  G --> L[查泄漏/allocator/缓存无界]
+  I --> M[接流量前 warmup]
+  J --> N[减少首次 touch 或改初始化时机]</pre>
+<p>最小命令组：</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="va">pid</span><span class="op">=&lt;</span>pid<span class="op">&gt;</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="va">$pid</span>/status <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;VmSize|VmRSS|VmPTE|RssAnon|RssFile|RssShmem&#39;</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="va">$pid</span>/smaps_rollup</span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-r</span> <span class="at">-p</span> <span class="va">$pid</span> 1</span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> minor-faults,major-faults,dTLB-load-misses <span class="at">-p</span> <span class="va">$pid</span> <span class="at">--</span> sleep 30</span></code></pre></div>
+<h2 id="checklist">11. Checklist</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" />是否区分了
+VMS、RSS、PSS、RssFile、RssAnon？</label></li>
+<li><label><input type="checkbox" />mmap
+权重首次访问是否会造成在线冷启动尖刺？</label></li>
+<li><label><input type="checkbox" />DataLoader worker 是否触发了大量
+COW？</label></li>
+<li><label><input type="checkbox" />是否用 <code>perf</code> 或
+<code>pidstat</code> 看过 minor/major fault？</label></li>
+<li><label><input type="checkbox" />大 CPU tensor / index 是否存在 TLB
+miss 压力？</label></li>
+<li><label><input type="checkbox" />是否需要 huge page 优化应放到 0b2
+再判断？</label></li>
+<li><label><input type="checkbox" />是否看过 <code>VmPTE</code>
+判断页表本身开销？</label></li>
+<li><label><input type="checkbox" />是否区分 file-backed mmap 与
+anonymous heap？</label></li>
+<li><label><input type="checkbox" />生产服务是否在 readiness 前完成 mmap
+warmup？</label></li>
+<li><label><input type="checkbox" />多 worker 内存是否用 PSS 而不是 RSS
+评估？</label></li>
+</ul>
+<h2 id="练习">12. 练习</h2>
+<ol type="1">
+<li>解释一次用户态 load 从虚拟地址到物理地址可能经历的路径。</li>
+<li>区分 TLB hit、TLB miss、minor fault、major fault。</li>
+<li>设计 3 条命令判断 mmap 权重冷启动是否受 major fault 影响。</li>
+<li>解释 DataLoader fork 后“读共享、写复制”为何会造成 RSS 误判。</li>
+<li>给出一个适合 mmap 的 dataset index 格式设计，并说明它为什么比 Python
+dict 更适合多 worker。</li>
+<li>用 <code>smaps_rollup</code> 判断一个进程的 20 GiB RSS 中有多少是
+file-backed、anonymous、shared、private。</li>
+<li>设计一个模型服务发布流程，要求 mmap 权重不会把首个用户请求变成 major
+fault。</li>
+<li>解释为什么 <code>VmSize=200GB</code> 不代表进程真的占用了 200GB
+DRAM。</li>
+<li>说明 COW fault 和 protection fault 的共同点与区别。</li>
+<li>为 DataLoader metadata 设计一套“fork 友好”的只读数据结构。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

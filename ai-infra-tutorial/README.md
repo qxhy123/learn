@@ -70,7 +70,15 @@
 
 | 章节 | 标题 | 主要内容 | 工程重点 |
 |------|------|----------|----------|
-| 第0a章 | [CPU 微架构](./part0-foundations-of-systems/0a-cpu-microarchitecture.md) | 流水线、乱序执行、分支预测、SIMD、Cache/MESI、伪共享与 DataLoader Worked Example | 识别 host-side bottleneck |
+| 第0a章 | [CPU 微架构总览](./part0-foundations-of-systems/0a-cpu-microarchitecture.md) | 第一性原理推导链 + 8 章导览 + 角色阅读路径 | 入口章 / 学习路径选择 |
+| 第0a-1章 | [流水线（Pipeline）](./part0-foundations-of-systems/0a1-pipeline.md) | 5 段经典流水、深流水、冒险与 forwarding、CPI/IPC 推算、host-side 真实 IPC | 深挖 ILP 第一层 |
+| 第0a-2章 | [乱序执行、Register Renaming 与 ROB](./part0-foundations-of-systems/0a2-out-of-order-execution.md) | OoO 引擎结构、ROB 容量、LSQ、退役吞吐、指针追逐为何让 OoO 失效 | 理解 backend bound |
+| 第0a-3章 | [分支预测](./part0-foundations-of-systems/0a3-branch-prediction.md) | BTB / RAS、2-bit 饱和、GShare、TAGE、误预测代价、cold path 治理 | P99 抖动诊断 |
+| 第0a-4章 | [SIMD：SSE / AVX / AVX-512](./part0-foundations-of-systems/0a4-simd.md) | ISA 演进、AVX-512 频率降级、自动向量化、intrinsics、对齐惩罚 | tokenizer 加速决策 |
+| 第0a-5章 | [Cache 层级](./part0-foundations-of-systems/0a5-cache-hierarchy.md) | L1/L2/L3 延迟带宽、cache line 64B、关联度、替换策略、LLC slice、prefetcher | 数组 stride / worker 数选型 |
+| 第0a-6章 | [MESI 一致性协议](./part0-foundations-of-systems/0a6-mesi-coherence.md) | 四状态机、snoop vs directory、MOESI/MESIF、跨 socket UPI 流量 | 多线程 atomic 崩盘排查 |
+| 第0a-7章 | [伪共享（False Sharing）](./part0-foundations-of-systems/0a7-false-sharing.md) | 物理粒度 vs 语义粒度、检测与修复、padding/alignas、per-thread + reduce | 加 worker 反而变慢诊断 |
+| 第0a-8章 | [CPU 综合排障 Worked Example](./part0-foundations-of-systems/0a8-cpu-worked-example.md) | Top-Down 方法论、三个完整剧本、工具栈对照、SOP、反模式速查 | on-call runbook 模板 |
 | 第0b章 | [内存、虚拟内存与 IO](./part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md) | 页表/TLB、Page Cache、Huge Pages、NUMA、syscall/io_uring、PCIe、DMA 与 H2D Worked Example | 理解内存与 IO 路径 |
 | 第0c章 | [文件系统与存储内核](./part0-foundations-of-systems/0c-filesystems-and-storage-internals.md) | VFS、inode/dentry、ext4/XFS/ZFS、fsync/O_DIRECT、对象存储、并行文件系统与 checkpoint Worked Example | 判断存储语义和吞吐边界 |
 | 第0d章 | [网络协议栈基础](./part0-foundations-of-systems/0d-network-stack-fundamentals.md) | TCP/IP、MTU、socket/epoll/io_uring、offload、RDMA verbs、GPUDirect RDMA 与 AllReduce Worked Example | 拆分 control plane 与 data plane |

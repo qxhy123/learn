@@ -1,0 +1,490 @@
+# 第 0a-3 章 · 分支预测
+
+分支预测是 0a 章「流水线 → 乱序执行 → 分支预测」推导链的第三环。流水线和乱序执行都假设取指单元能持续给出"下一条指令地址"，可一旦遇到 `if/else`、`while`、虚函数、`switch`、间接跳转或函数返回，下一条指令的地址就不再是 PC+4。分支预测器（Branch Predictor）就是用来在分支真值还没算出来时给出"猜测"，让前端不要停。本章把它从"静态/动态/2-bit"几个名词，深入到 GShare、PShare、Perceptron、TAGE、ITTAGE 的演化路线，并把它对接到推理服务 cold path、tokenizer fallback 和 dynamic batching 的实际工程问题。
+
+## 0a-3.1 第一性原理拆解 + 学习大纲
+
+### 拆 — 不可化简的问题
+
+CPU 流水线在物理上是几十个工位的传送带。当指令 i 还在 EX 阶段计算 `cmp r1, r2; jne L` 的真值时，IF（取指）阶段已经在装载指令 i+10、i+11、i+12。如果硬件等到 EX 真值出来才决定取指地址，从 IF 到 EX 之间所有 cycle 的"工位"就只能空转，浪费等于流水线深度。这是不可化简的：电信号、晶体管开关、寄存器 latch 都需要时间，"先取指再判断"在物理上根本不成立。
+
+于是有限晶体管面对一个根本矛盾：**它需要在分支真值未知时立即决定下一条 PC**。完全等待意味着流水线深度等于浪费成本；瞎猜意味着大概率打回。出路只有一条：**用历史信息估计未来分支行为**。这就是分支预测器存在的全部理由。它不是 Intel 的"市场技巧"，而是任何深流水线 + 高频率芯片要继续提升 IPC 时的物理必然。一旦你接受了这一点，BTB（缓存目标地址）、方向预测器（taken/not-taken）、RAS（return address stack）、TAGE（tag-based geometric history）就都是从同一个不可化简问题派生的不同工具。
+
+第二个不可化简的事实是：**真实程序的分支不是随机的**。`for (int i = 0; i < n; i++)` 末尾的回跳几乎总 taken；`if (ptr == nullptr)` 几乎总 not-taken；虚函数的 vtable 调用在一段时间内目标地址固定。如果分支真随机，预测器准确率最多 50%，存在没有意义。但 SPEC、real workload 和 LLM serving 的统计都表明，热路径分支可预测性常 >95%。所以预测器要做的事可被精确刻画：**用尽可能少的 bit 容量、尽可能短的查表延迟，捕捉历史模式**。容量与延迟是物理约束，模式覆盖能力是统计目标。
+
+第三个不可化简的事实是：**误预测必须能被恢复**。猜错时已经被 speculatively 执行的 micro-op 不能污染架构状态。所以 ROB（reorder buffer）和分支检查点（branch checkpoint）必须存在，让"猜错"可以 rollback。误预测代价 = pipeline 深度 + 前端重填延迟，常见 15-25 cycle，等价于丢掉几十条 in-flight 指令。这把"准确率"翻译成可量化的 CPI 增量：每 1000 指令多 10 次错预测、每次 20 cycle，就是 +0.20 CPI。
+
+### 推 — 从这个问题如何推导出每个机制
+
+从"取指必须立即给地址"推出**预测必须 in-cycle 完成**，所以预测表必须做成快速 SRAM、用 PC 哈希直接索引；从"分支可能跳到任意地址"推出 **BTB 必须缓存目标地址**，否则即使知道 taken 也不知道往哪取；从"函数返回的目标由 call 决定"推出 **RAS 是专用栈结构**，比通用 BTB 准；从"局部循环模式短"推出 **2-bit 饱和计数器**，比 1-bit 抗瞬时扰动；从"不同分支可能因相邻历史相关"推出 **全局历史**（Global History Register）；从"同一分支自身有规律"推出 **局部历史**（Per-PC History）；两者各有短板，于是有 **hybrid（GShare + PShare）**；继续往前，"短历史和长历史最佳长度因分支而异"推出 **TAGE 的几何历史 + tag 匹配**，让长短历史并存且按可信度选用；间接分支（虚函数、`switch`、jump table）目标多变，推出 **ITTAGE**（Indirect Target TAGE）。
+
+从 AI Infra 角度推导，**LLM 推理服务的 batch 维度引入了大量数据驱动的分支**：input length 的判断、padding/不 padding 的分支、KV cache 命中与否、JSON 字段缺失走 fallback、tokenizer 遇到 unknown byte 走 BPE merge fallback、采样器在 top-k=1 vs nucleus 之间切换。这些分支的"模式"由请求分布决定，不由代码结构决定。当流量分布漂移（凌晨长 prompt 多、白天短对话多），预测器的训练集突然变了，cold start 阶段的 branch miss 会暴涨，p99 latency 抖动。这条推导链直接告诉你：**分支预测不只是 CPU 内部话题，它是推理服务流量曲线和延迟曲线之间的一个隐藏耦合**。
+
+### 绘 — 因果链路
+
+```mermaid
+mindmap
+  root((分支预测))
+    不可化简事实
+      取指必须立即给地址
+        BTB 缓存目标
+        RAS 专用返回栈
+      分支非随机
+        2-bit 饱和计数器
+        Global History
+        Local History
+        TAGE 多历史长度
+      误预测必须可恢复
+        ROB 检查点
+        15-25 cycle penalty
+    预测器演化
+      静态预测
+        BTFNT
+      1-bit
+      2-bit Smith
+      GShare PShare
+      Perceptron
+      TAGE ITTAGE
+    AI Infra 触发点
+      cold path
+        schema fallback
+        tokenizer unknown byte
+      短循环不收敛
+        变长输入
+        padding 分支
+      间接分支
+        sampler 策略切换
+        op dispatch
+      流量分布漂移
+        长短 prompt 切换
+```
+
+### 导 — 读完本章你应该能回答
+
+1. 为什么分支预测器必须 in-cycle 给出预测，而不能等 EX 真值？
+2. BTB 与方向预测器分别解决什么问题？为什么两者都不可省略，且 RAS 不能用通用 BTB 替代？
+3. 1-bit 与 2-bit 饱和计数器的差异在哪？为什么后者抗噪能力更强？
+4. GShare 与 PShare 的索引方式分别是什么？为什么会出现 aliasing，TAGE 是如何缓解的？
+5. 为什么 TAGE 在过去十几年成为高端核心的事实标准？它的"几何历史长度"为什么必要？
+6. 一次分支误预测的 15-25 cycle 是怎么来的？如何用 `perf stat` 推算分支误预测对端到端 latency 的贡献？
+7. 推理服务 cold path（schema fallback、超长 prompt、罕见 token）为什么特别容易触发分支误预测？
+8. `__builtin_expect` 和 `[[likely]]/[[unlikely]]` 影响的是什么？什么场景下其实没必要？
+
+## 0a-3.2 为什么必须预测：流水线深度 × 分支密度的代价矩阵
+
+把"分支预测错一次浪费多少"量化。设流水线深度（front-end + back-end）为 P cycle，分支密度为 b（每条指令中分支占比），错预测率为 m，每次错预测的恢复 penalty 为 P_miss（约等于 in-flight 指令的清空时间）。则 CPI 中由分支误预测贡献的部分约为：
+
+```text
+ΔCPI_branch ≈ b * m * P_miss
+```
+
+实际 SPECint、LLM tokenizer、JSON parser 这类代码 b 常在 0.15-0.25（每 4-7 条指令一个分支）。如果 m=5%、P_miss=18 cycle，则 ΔCPI ≈ 0.20×0.05×18 = 0.18。base CPI 1.0 时，整体 CPI 上升 18%，等价于吞吐降 15%。这不是抽象数字：tokenizer 是 LLM 推理 host-side 的主要 CPU 热点之一，p99 多 100us 在动态 batching 调度里足以错过下一个 SM 调度窗口。
+
+| 流水线深度 P | 分支密度 b | 错预测率 m | ΔCPI | 解读 |
+|---:|---:|---:|---:|---|
+| 12 | 0.20 | 2% | 0.05 | 健康热路径 |
+| 18 | 0.20 | 5% | 0.18 | 一般热路径 |
+| 18 | 0.25 | 8% | 0.36 | tokenizer cold path |
+| 25 | 0.25 | 10% | 0.63 | JSON 解析 + schema fallback |
+| 25 | 0.30 | 15% | 1.13 | 极端 cold path，几乎所有 cycle 都在 recover |
+
+> **工程边界：** 这个公式是粗估。superscalar、SMT、speculative window 会部分 hide 部分 amplify。它的价值是让你在做一阶判断时知道"branch miss 是不是数量级上能解释 10ms 增量"。
+
+## 0a-3.3 BTB 与 RAS 的角色
+
+方向预测（direction predictor）只回答 taken / not-taken。但即使知道 taken，CPU 也得知道目标 PC 才能取指。所以前端有两个并行查询：
+
+1. **方向预测器**：taken / not-taken（1-bit/2-bit/TAGE 等）
+2. **BTB（Branch Target Buffer）**：给定 PC，缓存上次跳转目标地址
+
+BTB 的本质是一个直接映射或组关联缓存，索引来自 PC，命中给目标地址。BTB miss 时（首次见到的分支、被替换出去的分支），即使方向预测正确，也得等 EX 算出真实目标，造成所谓 BTB miss penalty。BTB 容量在现代核心常为几 K 项，和 L1I 一起决定"前端能维持多大的 hot code 工作集"。
+
+但函数返回（`ret`）是个特例。`call f` 后接 `ret`，跳回 caller；同一个 `f` 可能被很多地方调用，下一次返回目标就变了。如果用通用 BTB 缓存"上次 ret 跳到哪"，调用模式一变就错。**RAS（Return Address Stack）** 是专用结构：每次 `call` 把返回地址 push，每次 `ret` pop。只要 call/return 配对正确，RAS 几乎 100% 命中。
+
+```mermaid
+flowchart LR
+  PC[当前 PC] --> Dir[方向预测器]
+  PC --> BTB[BTB 查目标]
+  PC --> RAS[RAS 返回地址]
+  Dir --> Sel{合并}
+  BTB --> Sel
+  RAS --> Sel
+  Sel --> Fetch[下一周期取指地址]
+  Fetch --> IF[IF 阶段继续填充]
+```
+
+| 结构 | 用途 | 容量量级 | 误判后果 |
+|---|---|---:|---|
+| 方向预测器 | taken / not-taken | KB 级 history table | 错则 flush |
+| BTB | 直接/条件分支目标 | 数千项 | miss 则 stall 至 EX |
+| RAS | 函数返回目标 | 16-32 项栈 | 深递归或异常 unwind 会破坏 |
+| ITTAGE/Indirect Predictor | 间接跳转 | 数千项 + tag | 虚函数 / switch / dispatch 错则 flush |
+
+> **AI Infra 注意：** Python 解释器是大量 indirect dispatch 的代码，CFFI/CPython 的 bytecode dispatch 主循环、PyTorch 的 op dispatcher、Triton kernel autotune 都是 indirect predictor 压力的来源。RAS 在异常 unwind、setjmp/longjmp、coroutine 切换时会被破坏，这是 async tokenizer pipeline 偶尔抖动的微观原因之一。
+
+## 0a-3.4 静态预测：默认 not-taken / BTFNT
+
+最简单的预测策略不需要任何运行时表，编译期或硬件默认规则：
+
+- **Always not-taken**：所有分支都猜不跳。简单但准确率约 50%，已不实用。
+- **Always taken**：所有分支都猜跳。略好于 not-taken（很多循环回跳是 taken），但仍差。
+- **BTFNT（Backward-Taken, Forward-Not-Taken）**：往低地址跳的分支猜 taken（典型循环回跳），往高地址跳的分支猜 not-taken（典型 if 跳过 then 块）。这条规则在没有动态预测器时准确率约 65-80%，是早期 RISC（MIPS、SPARC 早期）和嵌入式核心的常见策略。
+
+静态预测在现代高端核心里仍有作用：**当动态预测器对该 PC 还没有训练样本时（first encounter）的 fallback**。GCC/Clang 的 `__builtin_expect` 也会在编译期影响代码布局，让"likely 分支"成为 fall-through，这等价于把 BTFNT 的优势直接编进二进制。
+
+```c
+if (__builtin_expect(rare_error_condition, 0)) {
+    handle_error();  // 编译器把这块挪到函数末尾，cold
+}
+fast_path();  // 默认 fall-through，hot
+```
+
+> **工程边界：** `__builtin_expect` / `[[likely]]` 真正影响的是**代码布局**和**指令缓存局部性**，不是直接控制硬件预测器。硬件动态预测器一旦稳定后，hint 的边际收益接近零。它真正有用的场景是：(1) 极少进入的错误处理路径，避免污染 I-cache hot region；(2) 编译器无法静态判断的极不平衡分支。日常业务代码乱加 `[[likely]]` 反而会误导维护者。
+
+## 0a-3.5 1-bit 与 2-bit 饱和计数器
+
+最早的动态预测器对每个分支记一个 1-bit 状态：上次 taken 就猜 taken，否则猜 not-taken。问题：进入循环和退出循环各错一次。例如循环执行 100 次，第 100 次退出循环时分支真值变化，1-bit 立刻翻转；下次进入循环第 1 次又翻回去。每个循环错 2 次。
+
+**2-bit Smith 饱和计数器** 引入"惯性"：4 个状态 strongly-taken / weakly-taken / weakly-not-taken / strongly-not-taken，每错一次只移动一格。strongly 状态需要连续两次错才翻转，瞬时扰动不会拉走预测。这把退出循环的代价从 2 次减到 1 次。
+
+```mermaid
+stateDiagram-v2
+  [*] --> WNT
+  ST: Strongly Taken (11)
+  WT: Weakly Taken (10)
+  WNT: Weakly Not-Taken (01)
+  SNT: Strongly Not-Taken (00)
+  ST --> ST: taken
+  ST --> WT: not-taken
+  WT --> ST: taken
+  WT --> WNT: not-taken
+  WNT --> WT: taken
+  WNT --> SNT: not-taken
+  SNT --> WNT: taken
+  SNT --> SNT: not-taken
+```
+
+预测规则：高位 bit 是预测方向（1=taken, 0=not-taken）。状态机里只有"翻越中线"才会改变预测。
+
+| 预测器 | bit/分支 | 适合 | 短板 |
+|---|---:|---|---|
+| 1-bit | 1 | 极简硬件 | 循环每轮错 2 次 |
+| 2-bit | 2 | 通用循环 | 模式型分支（TNTNTN…）准确率仍低 |
+| 2-bit + History | 2+k | 短模式 | 全局相关分支无法捕捉 |
+
+> **工程直觉：** 2-bit 饱和计数器对"绝大多数 taken / 绝大多数 not-taken"的分支接近完美，对"taken/not-taken 各半但有规律"的分支无能为力。这就是为什么后续要引入 history。
+
+## 0a-3.6 全局历史与局部历史预测器（GShare、PShare）
+
+**GShare**（Global Share）：维护一个全局历史寄存器 GHR，记录最近 N 个分支的 taken/not-taken。预测时用 `(PC XOR GHR)` 索引一张 2-bit 计数器表（PHT, Pattern History Table）。直觉：相邻分支之间存在相关性，例如先判 `if (x > 0)`，再判 `if (y > 0)`，两者条件可能高度相关。GHR 把上下文编码进索引。
+
+**PShare / 局部历史**：每个分支 PC 维护自己的"历史模式"。例如某循环每 8 次 taken 1 次 not-taken，局部历史能学到这个周期。结构上是 PHT 索引 = `(PC, per-PC history)`。
+
+| 预测器 | 索引 | 擅长 | 弱点 |
+|---|---|---|---|
+| Bimodal (2-bit) | PC | 偏向极强的分支 | 模式分支 |
+| GShare | PC XOR GHR | 跨分支相关性 | 不相关分支互相 alias |
+| PShare | PC + per-PC history | 单分支自身周期 | 表项多、训练慢 |
+| Tournament | 元预测器选 GShare/PShare | 综合 | 面积成本高 |
+
+**Aliasing（别名）问题**：不同 (PC, history) 组合 hash 到同一个 PHT 项，互相覆盖，导致误学。GShare 的所有分支都共享一张 PHT，aliasing 在表小或历史长时尤其严重。Tournament 预测器（McFarling）用一个元预测器选用 GShare 还是 PShare，部分缓解；但更根本的解法是 TAGE。
+
+> **AI Infra 联想：** 推理服务在长尾输入触发 `if (input_len > MAX_NORMAL)` 这条分支时，GHR 中前面几个分支的状态是"正常 batch 流"，对这条 cold path 完全没参考价值，反而把它的 PHT 项 aliasing 到 hot path 项上，互相污染。
+
+## 0a-3.7 现代预测器：Perceptron、TAGE、ITTAGE
+
+**Perceptron 预测器（Daniel Jiménez, 2001）**：把分支预测看成线性分类问题。对每个分支 PC 维护一组权重 w_0, w_1, …, w_n，输入是历史 GHR 的 ±1 编码，预测 = `sign(w_0 + Σ w_i * h_i)`。训练用感知器更新规则。优点：可以利用很长的历史，且权重小。缺点：线性可分前提下才好，对 XOR-like 模式仍弱。AMD 部分核心采用过 Perceptron 系列。
+
+**TAGE（TAgged GEometric history length，André Seznec 2006）** 是过去十几年高端核心的事实标准。核心思想：
+
+1. **几何历史长度**：维护多张 PHT，每张用不同长度的历史索引，长度按几何级数（如 4、10、25、64、160 cycle）。
+2. **Tag 匹配**：每个表项带一个 tag，命中时才使用；多表都命中时，用历史最长的那张。
+3. **基础表（base predictor）**：所有表都 miss 时退化到 bimodal。
+4. **更新策略**：预测正确不更新长表，错误时按 useful counter 决定是否分配新 entry。
+
+为什么 TAGE 主导？因为它**自适应历史长度**：循环型分支用短历史就够，复杂相关分支用长历史，而 TAGE 不需要程序员或编译器告诉它该用多长，硬件在线学习。准确率在 SPEC 上接近上限（>97%），并且对 cold path 有相对优雅的退化（fall back 到 base）。
+
+```mermaid
+flowchart LR
+  PC[PC + GHR] --> T0[Base Bimodal]
+  PC --> T1[T1 hist=4]
+  PC --> T2[T2 hist=10]
+  PC --> T3[T3 hist=25]
+  PC --> T4[T4 hist=64]
+  PC --> T5[T5 hist=160]
+  T1 --> Match{Tag 匹配?}
+  T2 --> Match
+  T3 --> Match
+  T4 --> Match
+  T5 --> Match
+  Match -->|选最长命中| Pred[预测方向]
+  T0 --> Pred
+```
+
+**ITTAGE**：把同一思路用到间接分支目标预测上。条件分支只需要 1 bit（taken/not），间接分支需要预测一个完整目标地址。ITTAGE 在多张 tagged table 中存目标地址，几何历史选择。这对虚函数、解释器 dispatch、`switch` jump table、动态语言 op dispatch 极重要。Intel Sunny Cove 之后、AMD Zen 3 之后的间接分支精度都依赖 ITTAGE 类设计。
+
+| 预测器 | 适合的分支类型 | 历史长度 | 难点 |
+|---|---|---:|---|
+| Bimodal | 强偏向 | 0 | 模式分支无能 |
+| GShare | 跨分支相关 | 中等 | aliasing |
+| Perceptron | 长历史线性可分 | 长 | XOR 模式 |
+| TAGE | 几乎所有条件分支 | 自适应 4-160 | 实现复杂 |
+| ITTAGE | 间接跳转 | 自适应 | 表容量 vs 准确率权衡 |
+
+> **AI Infra 视角：** PyTorch 的 op dispatch、TorchScript 解释执行、HuggingFace tokenizer 的 trie 遍历、vLLM 的 sampler dispatch，都是 indirect-heavy 路径。TAGE/ITTAGE 表的容量决定了"系统在多大代码热集上能保持低 branch miss"，超出热集就会退化。
+
+## 0a-3.8 误预测代价：Recovery、front-end stall、典型 15-25 cycle
+
+误预测发生时，CPU 必须：
+
+1. **检测**：EX 阶段算出真值，与预测比较，发现错。
+2. **squash**：丢弃 ROB 中所有 younger 的 micro-op，回滚 register rename map 到 checkpoint。
+3. **redirect**：把正确目标 PC 送回前端。
+4. **refill**：前端 IF/ID 重新走预测、L1I 取指、decode。
+
+每一步都消耗 cycle。Skylake 类核心约 15-17 cycle，更深流水线的 Sunny Cove/Golden Cove 约 17-20 cycle，AMD Zen 系列 17-19 cycle。如果 L1I miss 叠加，前端 refill 还要再加几十 cycle。
+
+```mermaid
+sequenceDiagram
+  participant FE as Frontend (IF/ID)
+  participant BPU as 分支预测器
+  participant EX as 执行单元
+  participant ROB as ROB / Rename
+  FE->>BPU: PC -> 预测方向+目标
+  BPU-->>FE: taken, target=L
+  FE->>FE: 沿 L 取指 (i+1..i+N)
+  EX->>EX: 真值 = not-taken
+  EX->>ROB: 报告误预测 (i 已 retired)
+  ROB->>FE: squash i+1..i+N, 回滚 rename
+  ROB->>FE: redirect PC = fallthrough
+  FE->>FE: refill IF/ID/decode (15-25 cycle)
+```
+
+
+用 `perf stat` 量化：
+
+```bash
+perf stat -e cycles,instructions,branches,branch-misses,\
+  cpu/event=0xc5,umask=0x4,name=br_misp_retired/ \
+  ./tokenizer_benchmark
+```
+
+关注三个指标：
+- `branch-miss-rate = branch-misses / branches`
+- `branch-MPKI = branch-misses / instructions × 1000`
+- 与 `cycles` 的相关性
+
+阈值经验（host-side AI 代码）：
+- MPKI < 5：健康
+- MPKI 5-10：值得查热点
+- MPKI > 15：cold path 或 indirect-heavy，需要重构
+
+```bash
+perf record -e branch-misses -c 10000 -- ./service
+perf report --sort symbol,dso
+```
+
+把高 branch miss 的函数定位到源代码行。
+
+> **诊断陷阱：** branch-misses 高不一定是分支预测器"不行"，可能是上游错误（错代码路径走多了、cold path 被流量放大）。先看 `perf top` 哪些 symbol 占 branch-miss 大头，再决定是改算法、加缓存还是用 hint。
+
+## 0a-3.9 AI Infra 视角：cold path 与短循环的预测困境
+
+LLM 推理服务的 host-side 路径里，分支预测的"敌人"集中在四个场景：
+
+1. **Input length 分支**：`if (seq_len <= 128) fast_kernel() else slow_kernel()`。流量分布稳定时 TAGE 能学好；但 burst traffic（如某 Prompt 模板突然刷上来）会让历史失效几百 ms。
+2. **JSON 解析与 schema fallback**：99% 请求 schema 合法，1% 缺字段走 fallback。fallback path 在 PHT 中没有稳定 entry，分支密度高（每个字段一次校验），cold 一次就是几百 cycle。
+3. **Tokenizer fallback**：BPE merge 主路径在已知词表上 hot；遇到 unknown byte、CJK 罕用字、emoji ZWJ 序列时进入 byte-level fallback，触发不同的循环结构和分支。HuggingFace `tokenizers` Rust 实现的热路径 IPC 可达 2.5+，但 fallback 时常掉到 1.0 以下。
+4. **动态 batch padding**：不同请求长度凑到同 batch，padding mask 的 if 分支密度极高。某些实现把 padding 判断写在 element-wise loop 里，每次循环都分支，TAGE 对"周期性 mask"有学习能力，但若 mask 模式由请求拼装动态变化（每个 batch mask 都不同），TAGE 也学不到稳定模式。
+
+| 场景 | 触发条件 | 主要受影响指标 | 缓解策略 |
+|---|---|---|---|
+| Cold input length 分支 | 流量分布漂移 | branch-miss、p99 | 按长度 bucket、warmup |
+| Schema fallback | 错误请求、版本变更 | branch-miss、IPC | fast path 与 slow path 物理隔离 |
+| Tokenizer unknown byte | 多语言、emoji、噪声 | tokenizer 单 token latency | 预归一化、UTF-8 SIMD 检查 |
+| Padding mask 分支 | 变长 batch | element-wise loop CPI | 用 SIMD mask 操作消除分支 |
+
+> **设计原则：** 把 fast path 和 slow path 在源码层分离成两个函数，hot 函数只处理 normal case，cold 函数处理 fallback。这样 hot 函数的 BTB/PHT entry 不被 cold path 污染，I-cache 局部性也更好。这是"消除 branch"以外更鲁棒的策略——它消除的是 cold path 对 hot path 预测器的污染。
+
+## 0a-3.10 工程操作：perf 阈值与编译器提示
+
+**perf 测量基本命令：**
+
+```bash
+# 全机维度
+perf stat -a -e cycles,instructions,branches,branch-misses sleep 30
+
+# 进程维度
+perf stat -p $(pgrep -f vllm) -e branches,branch-misses,instructions \
+  --interval-print 1000 sleep 30
+
+# 函数级定位
+perf record -e branch-misses -c 50000 -g -- python serve.py
+perf report --stdio --sort symbol,dso | head -50
+
+# Skylake/Icelake 顶级架构事件
+perf stat -e topdown-fe-bound,topdown-be-bound,topdown-bad-spec,topdown-retiring \
+  -- ./benchmark
+```
+
+`topdown-bad-spec` 直接告诉你"周期里多少花在 speculation 错误的清理"，是分支预测健康度的最直接指标。
+
+**编译器 hint：**
+
+```c
+// GCC / Clang
+if (__builtin_expect(cond, 1)) { hot(); } else { cold(); }
+
+// C++20
+if (cond) [[likely]] { hot(); } else [[unlikely]] { cold(); }
+
+// 函数级 cold/hot attribute
+__attribute__((cold)) void error_handler(void);
+__attribute__((hot))  void inner_loop(void);
+```
+
+效果不是改预测器，而是：(1) 改 basic block 排序让 hot 路径 fall-through；(2) 把 cold 函数挪到 `.text.cold` section，减少 I-cache pollution；(3) 暗示寄存器分配偏向 hot path。
+
+| 操作 | 效果 | 何时用 | 何时别用 |
+|---|---|---|---|
+| `[[likely]]` / `__builtin_expect` | 影响代码布局 | 极不平衡分支、错误路径 | 一般业务分支 |
+| `__attribute__((cold))` | 函数挪到 cold section | error handler、debug 路径 | 主流程函数 |
+| PGO（Profile-Guided Optimization） | 用 profile 自动布局 | 长期稳定 workload | 行为快速变化的代码 |
+| AutoFDO / BOLT | 基于 perf samples 重排 | 已上线服务 | 缺乏稳定 profile 的早期开发 |
+
+> **优先级：** PGO/BOLT 在大规模服务上的收益常比手写 hint 大一个数量级。Google、Meta 内部把 BOLT 用在 search、ads、tokenizer 库上，分支预测和 I-cache 命中率改善是主要来源之一。手写 hint 的价值在错误路径分流，不应作为常规优化手段。
+
+## 0a-3.11 Worked Example：长尾输入触发 cold path 误预测
+
+**现象：** 一个 vLLM-like 推理服务，平时 p50 latency 80ms、p99 220ms。某天上线了一个新业务，发送的 prompt 中混入了大量包含特殊 Unicode 序列（数学符号、罕见 CJK、emoji ZWJ）的请求。p50 几乎不变，p99 突然涨到 480ms，但 GPU utilization 还是 88%。NVIDIA Nsight 看不到异常，nvidia-smi 也无报警。
+
+**第一步定位：** 怀疑 host-side。
+
+```bash
+perf stat -a -e cycles,instructions,branches,branch-misses,\
+  topdown-bad-spec,topdown-fe-bound -- sleep 60
+```
+
+发现 `topdown-bad-spec` 占比从 2% 涨到 11%，`branch-misses/branches` 从 1.8% 涨到 6.3%，全局 IPC 从 1.6 降到 0.95。结论：分支预测健康度恶化。
+
+**第二步定位到函数：**
+
+```bash
+perf record -e branch-misses -c 30000 -g -- python serve.py &
+sleep 60 && kill %1
+perf report --stdio --sort symbol,dso | head -40
+```
+
+热点集中在 `tokenizers::pre_tokenizers::byte_level::process` 和 `tokenizers::models::bpe::merge_unknown`。两个函数的代码路径：
+
+```rust
+// 简化伪代码
+fn process(&self, text: &str) -> Vec<Token> {
+    for ch in text.chars() {
+        if ch.is_ascii() {                   // hot 分支
+            self.handle_ascii(ch);
+        } else if is_known_cjk(ch) {         // 中等
+            self.handle_cjk(ch);
+        } else if is_emoji_zwj_sequence(ch) {// cold
+            self.handle_emoji_seq(ch);
+        } else {
+            self.handle_byte_fallback(ch);   // 极 cold
+        }
+    }
+}
+```
+
+正常流量下 ASCII 占 95%+，TAGE 把第一个 if 学得几乎完美。新流量来了之后，第一个 if 错预测率从 0.5% 涨到 22%（因为大量字符不再是 ASCII），后续 elseif 链也跟着错。每个字符 4 个分支，错预测 2 个，每个 18 cycle，单个 token 多 36 cycle，长 prompt 累计 几 ms。在动态 batch 调度里，几 ms 足以错过下一个 SM 调度窗口。
+
+**第三步修复：** 把 fast path 和 slow path 物理分离。
+
+```rust
+fn process(&self, text: &str) -> Vec<Token> {
+    if text.is_ascii() {
+        return self.process_ascii_fast(text);   // SIMD 扫整段，无 per-char 分支
+    }
+    self.process_general_slow(text)             // cold 函数，独立 BTB/PHT 工作集
+}
+```
+
+`process_ascii_fast` 用 AVX2 一次扫 32 字节做空白/标点/字母分类，主循环 0 个 per-char 分支；`process_general_slow` 处理 Unicode，里面的 if-else 链不会污染 fast path 的预测器表项，因为它在不同的代码地址。
+
+**复测：**
+- p99 从 480ms 回到 240ms（仍略高于原 220ms，因为 cold path 本身不快，但不再拖累整体）
+- branch-miss-rate 从 6.3% 回到 2.4%
+- topdown-bad-spec 从 11% 回到 3%
+- IPC 从 0.95 回到 1.45
+
+**推理链复盘：** GPU 不忙说明 host 慢；topdown-bad-spec 暴涨说明分支预测；perf record 定位到 tokenizer；源码看出 hot/cold 分支共用一个 PHT 工作集；流量分布漂移让 cold 路径污染 hot 路径预测；分离函数 + SIMD fast path 恢复预测器训练效果。
+
+```mermaid
+flowchart TD
+  A[现象: p99 480ms, GPU 88%] --> B{nvidia-smi 异常?}
+  B -- 否 --> C[perf stat -e topdown-bad-spec]
+  C --> D{bad-spec > 5%?}
+  D -- 是 --> E[perf record -e branch-misses -g]
+  E --> F[定位到 tokenizer hot func]
+  F --> G[源码: hot/cold 分支共表]
+  G --> H[拆 fast/slow path + SIMD]
+  H --> I[复测: bad-spec 3%, p99 240ms]
+  D -- 否 --> J[查 fe-bound / be-bound]
+```
+
+
+> **抽象教训：** 当 cold path 流量不可控（用户内容驱动）时，hot path 必须在物理代码层面与 cold path 隔离。这不是"消除 branch"问题，是"保护 BTB/PHT/I-cache 工作集"问题。
+
+## 练习
+
+### 练习 0a-3-1（基础）：CPI 估算
+
+某 host 推理热点 base CPI = 0.9，分支密度 0.22，分支错预测率 4.5%，每次 18 cycle。算 ΔCPI 与总 CPI，并说明若错预测率涨到 9%，总 CPI 变化多少。
+
+### 练习 0a-3-2（基础）：BTB vs RAS
+
+为什么 RAS 不能用通用 BTB 替代？给一个调用模式让你能直观看到通用 BTB 在 ret 上失败而 RAS 成功。
+
+### 练习 0a-3-3（基础）：1-bit vs 2-bit
+
+某循环执行 8 次后退出。1-bit 计数器在循环开始和结束各错几次？2-bit 计数器呢？画状态变迁。
+
+### 练习 0a-3-4（基础）：BTFNT 准确率
+
+给一段含 5 个分支的伪代码（包含循环回跳和 if 跳过），手算 BTFNT 准确率。
+
+### 练习 0a-3-5（进阶）：GShare aliasing
+
+GHR 长度 8 bit，PHT 大小 1024 项。两个不同 PC、不同分支 hash 到同一 PHT 项的概率多大？设计一个 workload 让 aliasing 严重影响准确率。
+
+### 练习 0a-3-6（进阶）：TAGE 几何历史
+
+为什么 TAGE 用几何级数（4, 10, 25, 64, 160）而不是等差（10, 20, 30, 40, 50）选历史长度？提示：考虑覆盖范围 vs 表项分配效率。
+
+### 练习 0a-3-7（进阶）：perf 量化
+
+写一段 `perf stat` 命令，分别统计正常流量和异常 schema 流量下 tokenizer 的 branch-MPKI、IPC、topdown-bad-spec。说明你判断"是否值得拆 fast/slow path"的阈值。
+
+### 练习 0a-3-8（设计）：Tokenizer 重构
+
+设计一个 tokenizer 主循环，要求：(1) ASCII fast path 用 SIMD 扫整块；(2) 非 ASCII 进入独立 cold 函数；(3) cold 函数内部仍可被 trace 但不污染 fast path 预测器。给伪代码 + 函数布局。
+
+### 练习 0a-3-9（设计）：cold path 隔离
+
+某 JSON RPC server 的 schema 校验函数，正常请求 99% 命中 6 个固定字段，1% 触发 dynamic schema fallback。写一个改造方案，把 cold path 函数标 `__attribute__((cold))`，并说明为什么这有助于 I-cache。
+
+### 练习 0a-3-10（设计）：Padding mask 去分支
+
+给一段含 padding mask 的逐元素 attention bias 生成代码（每元素 if mask else 0），改写成无分支的 SIMD blendv 实现。说明从 branch-miss 角度的预期改善。
+
+## 深度参考阅读
+
+1. André Seznec, *A 256 Kbits L-TAGE branch predictor*, JILP 2007.
+2. André Seznec, *A new case for the TAGE branch predictor*, MICRO 2011.
+3. Daniel A. Jiménez, Calvin Lin, *Dynamic Branch Prediction with Perceptrons*, HPCA 2001.
+4. Scott McFarling, *Combining Branch Predictors*, WRL TN-36, 1993（GShare 与 tournament 来源）。
+5. Intel, *Intel 64 and IA-32 Architectures Optimization Reference Manual*，front-end / branch prediction 章节。
+6. AMD, *Software Optimization Guide for AMD EPYC Processors*，branch prediction events 章节。
+7. Agner Fog, *The microarchitecture of Intel, AMD and VIA CPUs*，各代 BPU 微架构表。
+8. Brendan Gregg, *Systems Performance*，perf 相关章节，特别是 PMU 事件用法。
+9. Linux `perf` 文档与 `pmu-tools` (Andi Kleen) topdown 工具链。
+10. LLVM BOLT、Google AutoFDO、Meta Propeller 等 profile-guided code layout 论文与开源实现。
+11. HuggingFace `tokenizers` (Rust)、vLLM tokenizer/sampler 路径源码，用本章模型阅读 hot/cold 分支结构。

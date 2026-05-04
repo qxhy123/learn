@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0a-6 章 · MESI 协议 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0a6" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0a-6 章 · MESI 一致性协议</h1>
+<p class="sub">从“私有 cache + 共享内存”的本质冲突出发，把 MESI 状态机、snoop 与 directory、MOESI/MESIF 变种、跨 socket 一致性流量代价串成一条 AI Infra 排障链路。</p>
+<div class="chips"><span class="chip">Cache Coherence</span><span class="chip">MESI</span><span class="chip">MOESI</span><span class="chip">MESIF</span><span class="chip">Snoop vs Directory</span><span class="chip">UPI / Infinity Fabric</span><span class="chip">perf c2c</span><span class="chip">NUMA</span></div>
+<div class="note"><strong>不可化简的问题：</strong>在物理上“内存有多份副本”的前提下，怎么让软件继续看到“内存只有一份”的抽象，且代价（带宽、延迟、晶体管）可承受？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：MESI 一致性</a></li>
+<li><a class="anchor" href="#s2">为什么多核需要一致性：私有 cache + 共享内存的本质冲突</a></li>
+<li><a class="anchor" href="#s3">MESI 四状态详解</a></li>
+<li><a class="anchor" href="#s4">MESI 状态转换的完整状态机</a></li>
+<li><a class="anchor" href="#s5">Snoop 总线 vs Directory-based</a></li>
+<li><a class="anchor" href="#s6">变种：MOESI 与 MESIF 的动机</a></li>
+<li><a class="anchor" href="#s7">一致性流量构成：RFO、Invalidate、HITM</a></li>
+<li><a class="anchor" href="#s8">跨 Socket 影响：UPI / Infinity Fabric</a></li>
+<li><a class="anchor" href="#s9">Memory Order vs Cache Coherence</a></li>
+<li><a class="anchor" href="#s10">AI Infra 视角：哪里藏着 coherence 成本</a></li>
+<li><a class="anchor" href="#s11">工程操作：perf c2c 与 intel-pcm</a></li>
+<li><a class="anchor" href="#s12">Worked Example：训练 metric aggregator 在 32 核上崩盘</a></li>
+<li><a class="anchor" href="#s13">练习</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：MESI 一致性</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>多核 CPU 给每个 core 都配私有 cache（L1D、L2，部分平台还有私有 L3 slice），是为了让每条 load/store 不必每次都跑 30-100ns 去 DRAM。但软件模型仍然假设“内存只有一份”——一个变量 <code>x</code> 在所有线程眼里应该有一致的语义。这两件事必然冲突：如果 Core 0 的 L1 里有 <code>x=5</code> 的副本，Core 1 又把 <code>x</code> 改成 7 写进自己的 L1，那么 Core 0 下次读 <code>x</code> 看见什么？如果它读到旧的 5，软件世界的“共享内存”就是骗局；如果硬件每次都强制写回 DRAM 并广播失效，私有 cache 就失去意义。</p>
+<p>所以不可化简的问题是：在物理上“内存有多份副本”的前提下，怎么让软件继续看到“内存只有一份”的抽象，且代价（带宽、延迟、晶体管）可承受？这个问题不能靠“取消 cache”或“取消共享”绕开——前者会把 CPU 带回 DRAM 时代，后者会让操作系统、运行时、消息队列、原子计数全部失效。它必须由硬件协议来解决，而且必须在 cache line 这个粒度上解决（更细则元数据爆炸，更粗则带宽爆炸）。MESI 就是这个问题的最小可行解：用 4 个状态记录“我手上这条 line 是不是最新、是不是别人也有”，用一组 bus 消息（read、read-for-ownership、invalidate、writeback）维护这些状态在所有 core 之间的不变式。</p>
+<p>但 MESI 只是答案家族里的一个代表。它的工程含义在不同场景里会被放大或缩小：单 socket 8 核的桌面机，coherence 几乎免费；双 socket 64 核的训练节点，跨 socket invalidate 一次几百 ns；4 socket 的大型推理机，加上 directory 协议和 NUMA，写共享变量可能比读 DRAM 还慢。MOESI 加入 Owned 状态减少 writeback，MESIF 加入 Forward 状态减少同一 socket 内多路读的总线广播。这些变种不是“更高级的 MESI”，而是针对不同互连拓扑（snoop bus vs ring vs mesh vs directory）做的局部优化。</p>
+<p>第二层不可化简的问题：cache coherence 不等于 memory ordering。MESI 保证“任意时刻，所有 core 对同一 line 的视图最终一致”，但它不规定“不同地址的写顺序在不同 core 看来是否一致”。x86-TSO 在硬件层加额外约束，让 store 不会被 reorder 到 load 之前（除了 store buffer 那一类例外）；ARM weak memory model 则把更多 ordering 责任丢给软件用 barrier/acquire-release 显式表达。AI Infra 工程师如果只懂 MESI 不懂 ordering，会写出“在 x86 上能跑、迁到 ARM Graviton 上偶发数据错乱”的代码。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从“私有 cache 必然有多份副本”推出需要状态标记每份副本的有效性 → 推出 Invalid 状态。从“想避免每次写都广播”推出需要区分“我独占”和“大家共享” → 推出 Exclusive 与 Shared。从“想避免每次读都回 DRAM”推出 dirty 数据要能在 cache 里保留并由 cache 提供服务 → 推出 Modified。从“状态在事件下要确定地迁移”推出状态机；从“事件需要在 core 之间传播”推出 snoop bus 或 directory。</p>
+<p>接着，从“snoop bus 在 core 数变多时广播流量爆炸”推出 directory-based protocol（每条 line 维护 sharer 列表，由 home node 仲裁），这就是现代多 socket、Mesh-on-die、CCX 里的常见做法。从“Modified 数据被远程读时立即写回 DRAM 浪费带宽”推出 MOESI 的 Owned：让“脏但被多核读”的 line 由某个 owner 直接 forward，不立即落 DRAM。从“Shared 状态下多核同时 miss 时多个 cache 同时回应造成总线竞争”推出 MESIF 的 Forward：在所有 sharer 中指定一个唯一 forwarder。</p>
+<p>再往下，从“coherence 以 cache line 为粒度”推出 false sharing；从“跨 socket 一致性消息走 UPI/Infinity Fabric”推出 NUMA-aware 编程；从“coherence 只保证 per-line 一致”推出 memory ordering 仍需软件 barrier。AI Infra 推导链额外一层：训练 worker 多线程共享 metric counter、推理服务 connection pool 的 ref-count、调度器 work-stealing 队列的 head/tail 指针——这些路径如果每个 op 都触发 RFO，coherence 流量会和有用工作 1:1 增长，扩容反而变慢。</p>
+<div class="note"><strong>排障翻译：</strong>“多加线程吞吐反降”不是玄学。如果 IPC 下降、HITM 暴涨、UPI utilization 升高，几乎一定是 coherence 流量打死了有用工作，根因在 §0a-6.10 的几类共享变量里找。</div>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((MESI 一致性))
+    本质冲突
+      私有 cache 多副本
+      软件单一视图
+      cache line 粒度
+    四状态
+      Modified 独占且脏
+      Exclusive 独占且干净
+      Shared 多核可读
+      Invalid 无效
+    协议事件
+      Read 请求
+      Read for Ownership
+      Invalidate
+      Writeback
+      HITM
+    传播机制
+      Snoop Bus 早期
+      Snoop Filter
+      Directory 现代
+      Home Node
+    变种
+      MOESI Owned
+      MESIF Forward
+      Dragon
+    跨 Socket
+      UPI Intel
+      Infinity Fabric AMD
+      NUMA 距离
+      跨 socket 延迟放大
+    ordering 不同
+      x86-TSO
+      ARM RC
+      barrier 与 fence
+    AI Infra 影响
+      训练 metric counter
+      推理 connection pool
+      调度队列 head tail
+      false sharing 复习
+    工程工具
+      perf c2c
+      intel-pcm
+      perf stat coherence</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>为什么 cache coherence 是“私有 cache + 共享内存”模型必须解决的不可化简问题，而不能由编译器或软件库解决？</li>
+<li>MESI 四个状态的语义边界在哪里，Exclusive 和 Modified、Shared 和 Exclusive 的本质差别是什么？</li>
+<li>当一个变量从“只有 Core 0 读写”变成“Core 0 写、Core 1-31 都读”，cache line 会经历哪些状态转移和总线事件？</li>
+<li>snoop-based 和 directory-based 协议在带宽、延迟、可扩展性上的取舍是什么？为什么现代多 socket 一定走 directory？</li>
+<li>MOESI 的 Owned 和 MESIF 的 Forward 各自解决 MESI 的什么具体痛点？</li>
+<li>跨 socket 写一个 cache line 的代价大约是几个 ns 量级？为什么训练节点的 metric aggregator 在 32 核以上经常吞吐崩盘？</li>
+<li>如何用 <code>perf c2c</code> 定位 HITM 热点，再用 <code>intel-pcm</code> 验证 UPI 流量？</li>
+<li>为什么“修好了 false sharing”不等于“修好了所有 coherence 问题”，剩余路径里还可能藏着什么？</li>
+</ol>
+</section>
+
+<section class="section" id="s2">
+<h2>2. 为什么多核需要一致性：私有 cache + 共享内存的本质冲突</h2>
+<p>考虑最朴素的两核场景：Core 0 和 Core 1 各自有 32KB L1D，共享一块 DRAM。程序里有一个全局变量 <code>int x = 0</code>。Core 0 执行 <code>x = 5</code>，Core 1 几个 cycle 后执行 <code>int y = x</code>。软件期望 <code>y == 5</code>（在适当的同步下），因为程序员相信“内存只有一份”。</p>
+<p>但硬件实际发生了什么？Core 0 的 store 大概率只命中自己的 L1，写入 store buffer，然后异步刷到 L1 cache line。如果没有任何 coherence 机制，Core 1 的 load 会从自己的 L1 找——找不到再到 L2、L3、最终 DRAM。即使最终回 DRAM，Core 0 那条 dirty line 可能还没 writeback，Core 1 读到的仍是 0。如果硬件强制 Core 0 每次 store 都同步写回 DRAM 再让 Core 1 重新拉，等于关闭了 cache，单次 store 从 1 cycle 变成 100ns，性能塌方。</p>
+<div class="note"><strong>承重墙：</strong>cache coherence 不是性能优化、不是高级特性，而是“私有 cache + 共享内存”语义的承重墙。任何允许多核私有 cache 的架构，都必须在硬件层维护某种 coherence 协议，否则共享内存编程模型直接破产。</div>
+<p>工程上还有第二层动机：很多并发原语依赖于“原子读-改-写”的可见性。例如 <code>lock cmpxchg</code> 的语义是“如果当前值等于 expected 就替换为 new”，如果两个 core 的 cache 里都有这条 line 的 stale 副本，cmpxchg 的“原子性”将无意义。MESI 协议保证 RMW 指令在执行期间持有该 line 的 Modified 状态（独占且脏），从而让原子语义在硬件上成立。</p>
+<table>
+<tr><th>不一致带来的故障类型</th><th>示例场景</th><th>软件层观察</th></tr>
+<tr><td>Stale read</td><td>Core 1 读到 Core 0 已改写但未传播的旧值</td><td>计数器对不上、状态机错位</td></tr>
+<tr><td>Lost update</td><td>两个 core 同时 RMW 同一变量，一边的修改丢失</td><td>引用计数泄漏、deadlock 或 double-free</td></tr>
+<tr><td>Torn read</td><td>多 byte 写在 line 边界被部分传播</td><td>8B 计数器读到高 4B 新、低 4B 旧</td></tr>
+<tr><td>原子性破裂</td><td>cmpxchg 在 stale 副本上“成功”</td><td>lock 互斥失效、并发数据结构损坏</td></tr>
+</table>
+<div class="warn"><strong>不要混淆层次：</strong>硬件 coherence 不替代语言层的同步。MESI 保证“line 视图最终一致”，但不保证“不同 line 的写顺序在所有 core 看来一致”。后者是 memory ordering 的范畴，由 fence/barrier/acquire-release 控制（详见 §9）。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. MESI 四状态详解</h2>
+<p>MESI 给每条 cache line 分配一个 2-bit 状态字段。四种状态在“独占 vs 共享”和“干净 vs 脏”两个维度上正交。</p>
+<table>
+<tr><th>状态</th><th>缩写</th><th>独占性</th><th>与 DRAM 关系</th><th>其他核副本</th><th>典型来源</th></tr>
+<tr><td>Modified</td><td>M</td><td>本核独占</td><td>DRAM 是旧值</td><td>无（其他核必为 I）</td><td>本核执行 store 命中 E，或拿到 RFO 后写入</td></tr>
+<tr><td>Exclusive</td><td>E</td><td>本核独占</td><td>DRAM 与 cache 一致</td><td>无</td><td>本核 read miss，且 snoop 显示无其他 sharer</td></tr>
+<tr><td>Shared</td><td>S</td><td>多核共享</td><td>DRAM 一致（MESI 严格定义下）</td><td>至少一个其他核为 S</td><td>多核 read miss 同一 line</td></tr>
+<tr><td>Invalid</td><td>I</td><td>无效</td><td>无关系</td><td>任意</td><td>初始状态、被远程 invalidate、被驱逐</td></tr>
+</table>
+<p>几个容易混的边界：</p>
+<ul>
+<li><strong>E 与 M 的差别</strong>：都独占，但 E 表示“我还没改过”，DRAM 仍是最新；M 表示“我改过”，DRAM 已陈旧。E → M 不需要发任何总线消息（因为本核已独占），所以 E 是“快速 store”的关键状态。如果 read miss 时直接进入 S，后续每个 store 都要发 invalidate；进入 E 则可以静默升级为 M。</li>
+<li><strong>E 与 S 的差别</strong>：都干净，但 E 独占、S 多核共享。从 I 加载时的关键判断是“snoop 时有没有其他 cache 已有此 line”——没有进 E、有则进 S。这个判断由 cache controller 在 read 总线事务上观察响应得出。</li>
+<li><strong>S 在严格 MESI 下“DRAM 是最新”</strong>：因为 MESI 没有 Owned 状态，任何 dirty line 在被多核读取时必须先 writeback 再变 S，让 DRAM 成为权威源。MOESI 的 Owned 状态正是放松这一约束（见 §6）。</li>
+<li><strong>I 不只是“没数据”</strong>：也包括“数据被远程 invalidate”。被 invalidate 的 line 通常仍占着 cache 槽位，直到被驱逐或重新加载。</li>
+</ul>
+<div class="success"><strong>记忆法：</strong>把“独占性”和“干净度”作为两个独立维度去记 MESI，比死背状态名好。M=独占+脏，E=独占+净，S=共享+净，I=无效。MOESI 的 O 则是“共享+脏”，补全了第四个组合。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. MESI 状态转换的完整状态机</h2>
+<p>下面是包含本地操作（local read/write）和远程总线事件（remote read/write）触发的完整状态机。Local 表示本核 CPU 发出的请求，Remote 表示其他核发出的请求被本核 snoop 到。</p>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Invalid
+
+  Invalid --> Exclusive: Local Read miss / no other sharer (snoop clean)
+  Invalid --> Shared: Local Read miss / other sharer exists
+  Invalid --> Modified: Local Write miss / RFO (Read for Ownership)
+
+  Exclusive --> Modified: Local Write (silent upgrade, no bus msg)
+  Exclusive --> Shared: Remote Read (snoop hit, supply data)
+  Exclusive --> Invalid: Remote Write / RFO from other core
+
+  Shared --> Modified: Local Write / send Invalidate to others
+  Shared --> Invalid: Remote Write / RFO from other core
+  Shared --> Shared: Remote Read (no state change)
+
+  Modified --> Shared: Remote Read (writeback or forward, demote to S)
+  Modified --> Invalid: Remote Write / RFO (writeback then invalidate)
+  Modified --> Modified: Local Read or Local Write (stay M)
+
+  Exclusive --> Exclusive: Local Read (stay E)
+  Shared --> Shared: Local Read (stay S)</pre>
+<p>把上图中的 transition 按“触发者 / 触发事件”展开成查表，便于排障时快速对照。</p>
+<table>
+<tr><th>当前状态</th><th>触发</th><th>下一状态</th><th>总线事件</th><th>备注</th></tr>
+<tr><td>I</td><td>Local Read</td><td>E</td><td>BusRd, snoop clean</td><td>无其他 sharer</td></tr>
+<tr><td>I</td><td>Local Read</td><td>S</td><td>BusRd, snoop shared</td><td>至少一个 sharer</td></tr>
+<tr><td>I</td><td>Local Write</td><td>M</td><td>BusRdX (RFO)</td><td>拿到独占所有权</td></tr>
+<tr><td>E</td><td>Local Read</td><td>E</td><td>无</td><td>本核独占可静默</td></tr>
+<tr><td>E</td><td>Local Write</td><td>M</td><td>无</td><td>关键加速点：E→M 静默</td></tr>
+<tr><td>E</td><td>Remote Read</td><td>S</td><td>snoop response, supply data</td><td>由本核响应避免回 DRAM</td></tr>
+<tr><td>E</td><td>Remote Write</td><td>I</td><td>snoop, invalidate</td><td>让出所有权</td></tr>
+<tr><td>S</td><td>Local Read</td><td>S</td><td>无</td><td>多核可读</td></tr>
+<tr><td>S</td><td>Local Write</td><td>M</td><td>BusUpgr (invalidate others)</td><td>不需要重新拉数据</td></tr>
+<tr><td>S</td><td>Remote Read</td><td>S</td><td>snoop, 由 forwarder 或 DRAM 供数</td><td>MESIF 在此处指定唯一 forwarder</td></tr>
+<tr><td>S</td><td>Remote Write</td><td>I</td><td>snoop, invalidate</td><td>失去副本</td></tr>
+<tr><td>M</td><td>Local Read</td><td>M</td><td>无</td><td>独占且脏</td></tr>
+<tr><td>M</td><td>Local Write</td><td>M</td><td>无</td><td>独占且脏</td></tr>
+<tr><td>M</td><td>Remote Read</td><td>S</td><td>writeback + supply (HITM)</td><td>经典的 cache-to-cache transfer</td></tr>
+<tr><td>M</td><td>Remote Write</td><td>I</td><td>writeback + invalidate</td><td>让出脏数据再放弃</td></tr>
+</table>
+<div class="note"><strong>抽象消息名：</strong>上表里出现的 BusRd / BusRdX / BusUpgr / Invalidate 是抽象总线消息名。Intel 实际用 Snoop 协议（QPI/UPI 上的 Home/Source Snoop 等子模式），AMD 用 MOESI + Probe。名字不同但语义对应。</p></div>
+<div class="warn"><strong>静默升级：</strong>E → M 是无总线消息的“静默升级”。这意味着如果一段代码先 read 一个全局变量、再 write，相比“先 write”少一次 RFO。但这只在 read miss 时进入 E（无其他 sharer）才成立——一旦其他核也 read 过它就退化为 S，第一次 write 就要 BusUpgr 把所有 sharer 失效掉。所以“全局只读配置”和“全局偶尔写指标”在 coherence 上是两种完全不同的负载。</div>
+<div class="warn"><strong>工程边界：</strong>真实硬件比上图复杂得多：有 store buffer、write combining buffer、prefetcher、speculative load、L2/L3 inclusive vs non-inclusive 策略，每一项都会让某些 transition 走特殊快路径或慢路径。本章状态机用来建立“原理直觉”和“排障 mental model”——在解读 <code>perf c2c</code> 输出或 NUMA topology 影响时够用，但不要拿它去推断单条指令的精确周期。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. Snoop 总线 vs Directory-based</h2>
+<p>MESI 是状态机，但状态机要在 N 个 core 之间一致，必须有一种事件传播机制。两条主流路线。</p>
+<div class="grid-2">
+<div class="card"><strong>Snoop-based</strong><br>所有 cache 共享一条总线（或一组虚拟总线），任何 core 发出的 BusRd/BusRdX/Invalidate 被所有其他 core 监听。每个 cache controller 看到事件后查自己的状态，必要时响应（提供数据、降级、失效）。<br><br><em>优点：</em>实现简单，单 socket 8-16 核以下延迟低。<br><em>缺点：</em>广播流量随 core 数线性甚至更糟增长，总线带宽很快成瓶颈。<br><em>典型平台：</em>Pentium D、Core 2 Quad、早期 Opteron。</div>
+<div class="card"><strong>Directory-based</strong><br>每条 cache line 由一个 home node（通常按地址 hash 或 NUMA 归属决定）维护一个目录条目，记录“哪些 core 持有此 line、状态是什么”。任何请求先发给 home node，home node 查目录决定是否需要 forward 给某个 owner、向哪些 sharer 发 invalidate。<br><br><em>优点：</em>不广播，可扩展到几十几百核。<br><em>缺点：</em>多一跳延迟，目录元数据本身占面积和带宽。<br><em>典型平台：</em>Intel Skylake-SP+ Mesh、AMD EPYC、ARM Neoverse 大型 SoC。</div>
+</div>
+<table>
+<tr><th>维度</th><th>Snoop-based</th><th>Directory-based</th></tr>
+<tr><td>广播策略</td><td>所有事件全网广播</td><td>点对点 + home 仲裁</td></tr>
+<tr><td>可扩展核数</td><td>4-16 核</td><td>数十-数百核</td></tr>
+<tr><td>单次 invalidate 延迟</td><td>低（一跳）</td><td>高（多跳）</td></tr>
+<tr><td>总带宽消耗</td><td>O(N) ~ O(N²)</td><td>可控，约 O(sharer 数)</td></tr>
+<tr><td>元数据开销</td><td>低</td><td>每 line 一条目录条目</td></tr>
+<tr><td>典型平台</td><td>旧多核 desktop、单 socket SMP</td><td>多 socket 服务器、Mesh-on-die</td></tr>
+<tr><td>AI Infra 现实</td><td>几乎不存在</td><td>训练/推理服务器全是这一类</td></tr>
+</table>
+<p>许多现代实现还会用 <strong>snoop filter</strong>：在 home agent 旁加一个滤波器，记录哪些 line“明显没有 sharer”，避免不必要的 snoop。这是 snoop 与 directory 的折中。Intel 的 HA（Home Agent）和 CHA（Caching/Home Agent，Skylake-SP 起合并）就承担这个角色。</p>
+<pre class="mermaid">flowchart LR
+  subgraph Snoop[Snoop-based 早期多核]
+    SC1[Core 1 Cache] -.广播.-> SBus((Bus))
+    SC2[Core 2 Cache] -.广播.-> SBus
+    SC3[Core 3 Cache] -.广播.-> SBus
+    SBus -.广播.-> SC1
+    SBus -.广播.-> SC2
+    SBus -.广播.-> SC3
+  end
+  subgraph Dir[Directory-based 现代服务器]
+    DC1[Core 1 Cache] -->|请求| DH[Home Agent + 目录]
+    DC2[Core 2 Cache] -->|请求| DH
+    DC3[Core 3 Cache] -->|请求| DH
+    DH -->|定向 forward| DC1
+    DH -->|定向 invalidate| DC2
+  end</pre>
+<div class="note"><strong>从 AI Infra 视角：</strong>区分“snoop vs directory”的实操价值在于：directory 协议下，跨 socket 的写代价比单 socket 内高得多，因为消息至少要走一次 socket 互连（UPI/IF）+ home 仲裁。这直接决定了“一个高频写共享变量到底贵不贵”。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. 变种：MOESI 与 MESIF 的动机</h2>
+<p>MESI 在某些场景下做无用功：</p>
+<ol>
+<li>Modified line 被另一核 read 时，必须 writeback 到 DRAM 后才能降级为 Shared。但如果其他核接下来还会 read（典型的 producer-consumer），先写 DRAM 再读 DRAM 是浪费——cache-to-cache forward 就够了。</li>
+<li>同一条 Shared line 被 N 个核持有，新的 read miss 出现时，N 个 cache 同时收到 snoop，都可以提供数据，谁来响应？多个响应造成总线/网络竞争。</li>
+</ol>
+<h3>MOESI（AMD Opteron 起广泛使用）</h3>
+<p>在 MESI 上加一个 <strong>Owned</strong> 状态。语义是“本核持有最新值，DRAM 是旧值，但允许其他核以 Shared 状态共享我”。当 M 状态的 line 被 remote read 时，不必 writeback，直接 forward 给请求方并把自己降为 O，其他核为 S。Owned 拥有“提供数据并维护一致性”的责任，DRAM 仍是脏状态，直到 Owned 被驱逐才 writeback。</p>
+<table>
+<tr><th>MESI vs MOESI 行为差异</th><th>MESI</th><th>MOESI</th></tr>
+<tr><td>M line 被 remote read</td><td>writeback + 降为 S</td><td>直接 forward + 降为 O，免一次 DRAM 写</td></tr>
+<tr><td>Producer-consumer 流量</td><td>每次 producer 写完都要 writeback</td><td>producer 持有 O，连续 forward 给 consumer</td></tr>
+<tr><td>writeback 带宽占用</td><td>高</td><td>低</td></tr>
+<tr><td>协议复杂度</td><td>简单</td><td>多一个状态 + Owner 选举</td></tr>
+</table>
+<h3>MESIF（Intel Nehalem 起在 QPI/UPI 平台使用）</h3>
+<p>在 MESI 上加一个 <strong>Forward</strong> 状态。语义是“我是 Shared，但我是被指定的 forwarder——多核 read miss 时由我响应，其他 S 状态的 cache 保持沉默”。Forward 解决的是“多个 sharer 同时响应”的总线争抢，本质是 Shared 的子集（“特殊的 S”）。</p>
+<table>
+<tr><th>MESIF 关键场景</th><th>没有 F</th><th>有 F</th></tr>
+<tr><td>多核读同一只读表</td><td>多个 S cache 同时尝试响应，总线仲裁</td><td>唯一 F cache 响应，其余 S 沉默</td></tr>
+<tr><td>数据脏 vs 净</td><td>F 是干净的（DRAM 也是最新）</td><td>同左</td></tr>
+<tr><td>与 MOESI 关系</td><td>解决不同问题，可正交叠加（理论上 MOESIF）</td><td>实际平台一般只挑一个</td></tr>
+</table>
+<div class="note"><strong>动机正交：</strong>MOESI 解决“M → S 时的 writeback 浪费”，MESIF 解决“S 多 sharer 时的响应竞争”。两者动机正交，但工业上 Intel 选 MESIF + 高带宽互连，AMD 选 MOESI + Infinity Fabric，路径不同。</div>
+<div class="warn"><strong>对软件透明，但对 perf 不透明：</strong>从软件视角看，MOESI 和 MESIF 对 API、ordering、原子语义都是透明的，你不会在 C++/Rust 代码里看到“Owned”或“Forward”。但它们决定了同样的访问模式在 Intel 和 AMD 平台上的实际 coherence 流量差异，导致 perf 数据不能跨平台直接对比。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 一致性流量构成：RFO、Invalidate、HITM</h2>
+<p><code>perf c2c</code>、<code>intel-pcm</code>、Linux PMU 事件名经常出现下面几个术语，理解它们直接对应到 §4 的状态机。</p>
+<table>
+<tr><th>事件</th><th>全名</th><th>触发情境</th><th>状态机对应</th><th>代价量级</th></tr>
+<tr><td><strong>RFO</strong></td><td>Read for Ownership</td><td>core 想写一条不在 M/E 状态的 line</td><td>I → M（带 BusRdX）</td><td>跨 socket 时 100-300ns</td></tr>
+<tr><td><strong>Invalidate</strong></td><td>Invalidate broadcast</td><td>core 想从 S 升 M，需把其他 sharer 失效</td><td>S → M（带 BusUpgr）</td><td>snoop 路径 + ack 等待</td></tr>
+<tr><td><strong>HITM</strong></td><td>Hit Modified</td><td>snoop 时发现另一核以 M 持有</td><td>M → S 或 M → I + 数据 forward</td><td>最贵，跨 socket 可达 200-500ns</td></tr>
+<tr><td><strong>HITM (clean)</strong></td><td>Hit Exclusive/Forward</td><td>snoop 命中 E 或 F，无需 writeback</td><td>E/F 提供数据</td><td>比 HITM 便宜，但比 L2 hit 贵</td></tr>
+<tr><td><strong>Writeback</strong></td><td>M line eviction</td><td>M line 被驱逐或被 demote</td><td>M → I（落 DRAM）</td><td>DRAM 写带宽</td></tr>
+</table>
+<p>几个 AI Infra 视角的解读：</p>
+<ul>
+<li><strong>写共享 = RFO。</strong>任何一次“写一个被多核读到 cache 里的变量”都意味着至少一次 RFO + N 次 invalidate ack。即使你用 <code>std::atomic</code> 写、即使你只写 1 个 byte，硬件也按整条 64B line 算。</li>
+<li><strong>HITM 是 false sharing 的特征事件。</strong><code>perf c2c report</code> 的 “HITM” 列是定位 false sharing 的金标准。如果某条 cache line 的 HITM 计数远高于其他，几乎一定是热点。</li>
+<li><strong>Writeback 不一定坏。</strong>它只是把 dirty 数据落回 DRAM，本身不阻塞别人。但如果 writeback 频率高到吃满 DRAM 写带宽，会反过来阻塞其他读路径。</li>
+<li><strong>跨 socket 的 RFO/Invalidate/HITM 全部走 UPI/IF。</strong>这是为什么“同一段代码在单 socket 跑得好、双 socket 跑崩”的硬件原因。</li>
+</ul>
+<div class="danger"><strong>原子操作贵在哪：</strong>很多人把“原子操作慢”归咎于“原子指令本身贵”，其实 <code>lock add</code>、<code>xadd</code>、<code>cmpxchg</code> 在无争用时只比普通指令慢一点点。真正贵的是“争用时被迫做 RFO 和等 invalidate ack”，本质是 coherence 流量，而不是指令本身。</div>
+<pre class="mermaid">sequenceDiagram
+  autonumber
+  participant C1 as Core 1 (写)
+  participant H as Home Agent (Directory)
+  participant C2 as Core 2 (持 S)
+  participant C3 as Core 3 (持 S)
+  participant DRAM
+  C1->>H: RFO (BusRdX) for line A
+  H->>C2: Invalidate line A
+  H->>C3: Invalidate line A
+  C2-->>H: Inv-Ack
+  C3-->>H: Inv-Ack
+  H-->>C1: Grant + 数据 (forward 或 from DRAM)
+  Note over C1,DRAM: C1 进入 M 状态, C2 C3 进入 I 状态
+  C1->>C1: 实际执行 store</pre>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 跨 Socket 影响：UPI / Infinity Fabric</h2>
+<p>单 socket 内 coherence 走 ring/mesh on-die 互连，延迟通常在 10-30ns 量级，带宽极高。跨 socket 走 UPI（Intel）或 Infinity Fabric / xGMI（AMD）。</p>
+<table>
+<tr><th>互连</th><th>厂商</th><th>单链路带宽（典型）</th><th>跨 socket 延迟（典型）</th><th>用于</th></tr>
+<tr><td>UPI 1.0/2.0/3.0</td><td>Intel</td><td>10.4-16+ GT/s × 多 lane</td><td>80-150ns（含 home 仲裁）</td><td>双/四 socket Xeon</td></tr>
+<tr><td>Infinity Fabric (Inter-socket)</td><td>AMD EPYC</td><td>18-36 GT/s</td><td>100-200ns</td><td>双 socket EPYC</td></tr>
+<tr><td>xGMI</td><td>AMD MI 系列 GPU 互连</td><td>数百 GB/s 总带宽</td><td>GPU 间</td><td>不在 CPU coherence 范围</td></tr>
+<tr><td>CXL.cache</td><td>多厂商新协议</td><td>PCIe Gen5/6 速率</td><td>待定（早期 ~150-300ns）</td><td>设备-CPU 一致性</td></tr>
+</table>
+<p>跨 socket 一次 HITM 事务粗略要走：“请求 core → 本 socket home → UPI → 远 socket home → 远 socket owner → 数据返回”，多跳累计延迟可达 200-500ns。比同 socket L3 hit（30-80ns）贵一个数量级。</p>
+<table>
+<tr><th>操作</th><th>单 socket L3 hit</th><th>同 socket 跨核 HITM</th><th>跨 socket HITM</th></tr>
+<tr><td>延迟量级</td><td>30-80ns</td><td>50-100ns</td><td>200-500ns</td></tr>
+<tr><td>带宽消耗</td><td>片内 mesh</td><td>片内 mesh</td><td>占 UPI/IF 带宽</td></tr>
+<tr><td>并发可扩展性</td><td>高</td><td>中</td><td>低，UPI 易饱和</td></tr>
+</table>
+<p><code>intel-pcm</code>（pcm-numa、pcm-memory）能直接看 UPI 流量分解。当 UPI utilization 持续超过 50%，且 HITM 集中在跨 socket 路径，几乎确定是跨 socket coherence 问题。</p>
+<div class="note"><strong>训练/推理服务器视角：</strong>现代多卡服务器普遍是 2 socket 或更多。如果一个共享变量被两个 socket 上的线程频繁写，相当于每次写都在 UPI 上跑一个完整握手。线程数从 16 加到 32（跨 socket）可能让吞吐反而下降——这就是 §12 worked example 的根因之一。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Memory Order vs Cache Coherence</h2>
+<p>这是最容易被混淆的两件事。Cache coherence 和 memory ordering 都是“多核共享内存正确性”的支柱，但解决不同问题。</p>
+<table>
+<tr><th>维度</th><th>Cache Coherence</th><th>Memory Ordering</th></tr>
+<tr><td>解决什么</td><td>同一地址的多份副本最终一致</td><td>不同地址的访问顺序在不同 core 上一致</td></tr>
+<tr><td>协议主体</td><td>MESI/MOESI/MESIF 等硬件协议</td><td>x86-TSO / ARM RC / RISC-V RVWMO 等内存模型</td></tr>
+<tr><td>谁负责</td><td>完全硬件</td><td>硬件 + 编译器 + 软件 barrier 共同</td></tr>
+<tr><td>典型故障</td><td>stale read、lost update</td><td>reorder 看见的“诡异”写顺序、初始化未发布</td></tr>
+<tr><td>不解决另一个的问题</td><td>不规定多地址顺序</td><td>不规定单地址副本一致性</td></tr>
+</table>
+<div class="grid-2">
+<div class="card"><strong>x86-TSO</strong>（Total Store Order，Intel/AMD x86）<br><br>所有 store 在所有 core 看来有相同的全局顺序，唯一例外是本核的 store 可能被本核自己的 load 跨越（store buffer forwarding）。所以 x86 上几乎不需要显式 barrier，除了 <code>MFENCE</code> 用于 store-load 顺序。这就是为什么很多 x86 代码看起来“没加 barrier 也能跑”。</div>
+<div class="card"><strong>ARM/RISC-V Weak Memory Model</strong>（Release Consistency 类）<br><br>硬件不保证不同地址的访问顺序，store 在不同 core 看来可能呈现不同顺序。需要 <code>dmb</code>、<code>acquire</code>/<code>release</code> 等显式 barrier。这意味着同一段无锁数据结构代码，在 x86 上对、在 ARM Graviton 上可能数据竞争。</div>
+</div>
+<div class="danger"><strong>跨平台迁移陷阱：</strong>把代码从 x86 训练机迁到 ARM Neoverse 推理机时，原本“看起来没问题”的无锁队列、ref-count、单例 init 路径会突然出问题。MESI 在两边都正确工作，但 memory ordering 不同。修复办法是用 C++ <code>std::atomic</code> 的 <code>memory_order_acquire/release</code> 显式表达，让编译器在 ARM 上自动插 barrier。</div>
+<p>C++/Rust/Java 的 atomic 内存序模型（relaxed / acquire / release / acq_rel / seq_cst）就是把“对程序员承诺的 ordering”和“硬件实现的 ordering”解耦。relaxed 只要求 coherence（MESI 给的），seq_cst 要求最强 ordering（x86 几乎免费、ARM 需要全 barrier）。AI Infra 工程师在写跨平台基础库时务必区分。</p>
+</section>
+
+<section class="section" id="s10">
+<h2>10. AI Infra 视角：哪里藏着 coherence 成本</h2>
+<p>把状态机和工具链落到真实负载，下面几个场景是高频踩坑点。</p>
+<table>
+<tr><th>场景</th><th>高频写变量</th><th>coherence 风险</th><th>优化方向</th></tr>
+<tr><td>训练 metric aggregator</td><td>total_samples / total_loss</td><td>M 状态在 N 核间反复迁移</td><td>thread-local + 周期 reduce</td></tr>
+<tr><td>推理 connection pool</td><td>free list head</td><td>RFO + 跨 socket UPI</td><td>per-CPU pool / sharding</td></tr>
+<tr><td>work-stealing 队列</td><td>deque head/tail</td><td>同 line 时 false sharing</td><td>head/tail padding</td></tr>
+<tr><td>KV cache 元数据</td><td>block free list</td><td>多请求线程争用</td><td>批量预留 + 局部状态</td></tr>
+<tr><td>全局日志 ring</td><td>write head</td><td>所有线程 RFO 同一 line</td><td>per-thread ring + merge</td></tr>
+</table>
+<div class="grid-2">
+<div class="card"><strong>训练 worker 共享 metric counter</strong><br>最经典的反模式：每个 batch 处理完都更新一个全局 <code>total_samples</code>、<code>total_loss</code>、<code>total_tokens</code> 的 atomic。32 个 worker × 每秒上千次更新 = 每秒数万次 RFO，全部在一条 cache line 上。修法：thread-local accumulator + 周期性 reduce（见 §12）。</div>
+<div class="card"><strong>推理服务的 connection / object pool</strong><br>pool 的 free list head 指针、ref-count、stats 经常被几十几百个线程高频读写。head 指针每次 push/pop 都触发 RFO。修法：per-CPU 子池、work-stealing、或减少 pool 操作频率（更长 lease）。</div>
+<div class="card"><strong>调度器 work-stealing 队列</strong><br>Tokio/folly/Java ForkJoin 等都有 deque per worker。理想情况下大部分 push/pop 在本核 deque 上（不引发 coherence），只有 steal 时才跨核。但如果 deque 的 head 和 tail 在同一 cache line，且本核 push tail、其他核 steal head，会产生 false sharing。修法：head 和 tail 各自 padding 到独立 cache line。</div>
+<div class="card"><strong>多 worker 共享 KV cache 元数据</strong><br>vLLM 等系统的 PagedAttention 把 KV cache 切块管理，元数据（block table、free list）如果被请求处理线程频繁读写，又是高频 coherence 路径。一般通过批量 reservation + per-request 局部状态降低争用。</div>
+<div class="card"><strong>日志/trace 的全局 ring buffer 写指针</strong><br>所有线程往同一个 ring buffer 写，head 指针每次 advance 都 RFO。生产环境一般用 per-thread ring + 异步合并，或 lock-free 多生产者结构（每个生产者预留 slot）。</div>
+<div class="card"><strong>Python GIL 下的“假并发”</strong><br>CPython 的 GIL 让 Python bytecode 实际单核执行，coherence 通常不是 Python 层瓶颈。但 C 扩展（NumPy、PyTorch、tokenizers）释放 GIL 后多线程跑 C 代码时，上面所有问题都可能出现。</div>
+</div>
+<div class="success"><strong>识别 coherence 热点的通用思路：</strong>找出“被很多线程高频写、且不可避免共享”的变量，问能不能改成 per-thread/per-CPU + 异步合并。如果不能（如真正的全局原子计数），考虑降低写频率（采样、批量）。</div>
+<pre class="mermaid">flowchart LR
+  subgraph Sym[症状]
+    S1[加 worker 但吞吐不增甚至下降]
+    S2[atomic 操作高 cycle / IPC 低]
+    S3[跨 socket 部署性能塌方]
+  end
+  subgraph Sig[Coherence 信号]
+    G1[perf c2c HITM 集中在少数 line]
+    G2[intel-pcm UPI 流量持续高位]
+    G3[L2/LLC miss 不高但 backend bound 高]
+  end
+  subgraph Fix[修复方向]
+    F1[per-thread per-CPU 累加 + 周期 reduce]
+    F2[变量 padding 到独立 cache line]
+    F3[NUMA-aware sharding 避免跨 socket]
+    F4[降低写频率 采样 批量]
+  end
+  S1 --> G1 --> F1
+  S2 --> G1 --> F2
+  S3 --> G2 --> F3
+  S1 --> G3 --> F4</pre>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 工程操作：perf c2c 与 intel-pcm</h2>
+<h3>perf c2c：找 HITM 热点</h3>
+<p><code>perf c2c</code> 是 Linux perf 的 cache-to-cache 子命令，专门用来找 false sharing 和真共享热点。</p>
+<pre><code class="language-bash"># 录制（root 权限或 perf_event_paranoid 调整）
+sudo perf c2c record -ag -- sleep 30
+# 等价：perf c2c record -ag -- ./your_workload
+
+# 报告（stdio 模式便于在终端查看）
+sudo perf c2c report --stdio | less
+
+# 也可以分线程/CPU 看
+sudo perf c2c report -NN -c pid,iaddr --stdio</code></pre>
+<p>输出重点字段：</p>
+<table>
+<tr><th>字段</th><th>含义</th><th>排障关注点</th></tr>
+<tr><td>Total records</td><td>该 line 的总采样数</td><td>越高越热</td></tr>
+<tr><td>LLC Load HITM</td><td>LLC 命中 + 来源是 Modified（HITM 事件）</td><td>false sharing 的核心指标</td></tr>
+<tr><td>Local HITM</td><td>同 socket HITM</td><td>同 socket false sharing</td></tr>
+<tr><td>Remote HITM</td><td>跨 socket HITM</td><td>跨 socket coherence 风险</td></tr>
+<tr><td>Cacheline</td><td>line 物理地址</td><td>用于和符号对应</td></tr>
+<tr><td>Tot offset</td><td>line 内偏移分布</td><td>多个不同 offset 同 line 高频 → false sharing</td></tr>
+<tr><td>Symbol / Object</td><td>函数/数据符号</td><td>定位代码</td></tr>
+</table>
+<p>判断 false sharing 的典型形态：同一条 cacheline 在多个不同 offset 上都有高 HITM 计数，且这些 offset 对应的符号是逻辑上独立的变量（不是同一个对象的不同字段被共享）。</p>
+<h3>intel-pcm：看 UPI 与跨 socket 流量</h3>
+<pre><code class="language-bash"># 看 NUMA 间内存流量
+sudo pcm-numa.x 1
+
+# 看 UPI 链路 utilization
+sudo pcm.x 1
+
+# 看具体内存控制器带宽
+sudo pcm-memory.x 1</code></pre>
+<p>关注：UPI utilization 持续 &gt; 30% 提示有显著跨 socket 流量；&gt; 50% 接近饱和；UPI 上的 data vs non-data（snoop/coherence）流量比例失衡（non-data 占大头）则强烈暗示 coherence 主导，而非真正的数据移动。</p>
+<table>
+<tr><th>工具</th><th>主要用途</th><th>输出关键</th></tr>
+<tr><td>perf c2c</td><td>cache line 级 HITM 定位</td><td>Cacheline、HITM 计数、Symbol</td></tr>
+<tr><td>perf stat -e cache-references,cache-misses,LLC-load-misses</td><td>总体 cache 行为</td><td>miss rate、绝对量</td></tr>
+<tr><td>intel-pcm pcm.x</td><td>socket 级 UPI、L3、energy</td><td>UPI util、L3 miss/s</td></tr>
+<tr><td>pcm-numa.x</td><td>NUMA 间流量</td><td>local vs remote 访问比例</td></tr>
+<tr><td>pcm-memory.x</td><td>内存控制器带宽</td><td>读/写 GB/s</td></tr>
+<tr><td>numastat -p $PID</td><td>进程 NUMA 内存分布</td><td>local/remote miss 数</td></tr>
+</table>
+<div class="warn"><strong>采集开销：</strong><code>perf c2c</code> 本身有采样开销，长时间录制会显著放大目标程序的 latency。生产环境通常用 30-60 秒短窗口、限定 CPU 集合录制。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. Worked Example：训练 metric aggregator 在 32 核上崩盘</h2>
+<h3>现象</h3>
+<p>某训练框架在 8 核小机器上实现的 metric 聚合：</p>
+<pre><code class="language-cpp">struct GlobalMetrics {
+  std::atomic&lt;uint64_t&gt; total_samples{0};
+  std::atomic&lt;uint64_t&gt; total_tokens{0};
+  std::atomic&lt;uint64_t&gt; total_loss_x1000{0};
+};
+GlobalMetrics g_metrics;
+
+// 每个 worker 在每个 batch 末尾调用
+void on_batch_done(uint64_t samples, uint64_t tokens, double loss) {
+  g_metrics.total_samples.fetch_add(samples, std::memory_order_relaxed);
+  g_metrics.total_tokens.fetch_add(tokens, std::memory_order_relaxed);
+  g_metrics.total_loss_x1000.fetch_add(uint64_t(loss * 1000),
+                                       std::memory_order_relaxed);
+}</code></pre>
+<p>8 核单 socket 跑得好好的。迁到双 socket 32 物理核（每 socket 16 核）的训练节点，并发 worker 数从 8 提到 32 后：吞吐不仅没线性增长，反而比 8 worker 时下降 30%。GPU utilization 从 92% 掉到 65%，<code>nvidia-smi</code> 显示周期性 idle。</p>
+<h3>第一步：确认 host-side 瓶颈</h3>
+<pre><code class="language-bash">nvidia-smi dmon -s pucm
+pidstat -t -p $(pgrep -f train.py) 1
+perf stat -a -e cycles,instructions,branches,branch-misses,\
+cache-references,cache-misses,LLC-load-misses,LLC-store-misses -- sleep 30</code></pre>
+<p>8 worker：IPC 1.4，cache miss rate 7%。32 worker：IPC 0.55，cache miss rate 28%，LLC-store-misses 暴涨。明显是 cache/coherence 而不是分支或 IO。</p>
+<h3>第二步：用 perf c2c 定位</h3>
+<pre><code class="language-bash">sudo perf c2c record -ag -- sleep 30
+sudo perf c2c report --stdio | head -100</code></pre>
+<p>报告显示一条 cacheline 占了全机 HITM 的 80% 以上，offset 0/8/16 三个位置都有高 HITM 计数，对应符号是 <code>g_metrics.total_samples</code>、<code>g_metrics.total_tokens</code>、<code>g_metrics.total_loss_x1000</code>——三个 atomic 加起来 24B，全部落在同一条 64B cache line 上。32 个 worker 跨两个 socket 高频 fetch_add，每次都触发 RFO + 跨 socket UPI 握手。</p>
+<h3>第三步：用 intel-pcm 验证</h3>
+<pre><code class="language-bash">sudo pcm.x 1</code></pre>
+<p>UPI utilization 在 worker 启动后从 5% 飙到 60%，且 non-data 流量占大头。确认是跨 socket coherence 主导。</p>
+<h3>修复：thread-local accumulator + 周期 reduce</h3>
+<pre><code class="language-cpp">struct alignas(64) LocalMetrics {
+  uint64_t samples{0};
+  uint64_t tokens{0};
+  uint64_t loss_x1000{0};
+  char pad[64 - 24];
+};
+thread_local LocalMetrics t_metrics;
+
+struct alignas(64) GlobalMetrics {
+  std::atomic&lt;uint64_t&gt; total_samples{0};
+  std::atomic&lt;uint64_t&gt; total_tokens{0};
+  std::atomic&lt;uint64_t&gt; total_loss_x1000{0};
+};
+GlobalMetrics g_metrics;
+
+constexpr uint64_t FLUSH_EVERY = 64;  // 每 64 个 batch 才 flush 一次
+thread_local uint64_t batch_count = 0;
+
+void on_batch_done(uint64_t samples, uint64_t tokens, double loss) {
+  t_metrics.samples += samples;
+  t_metrics.tokens += tokens;
+  t_metrics.loss_x1000 += uint64_t(loss * 1000);
+  if (++batch_count &gt;= FLUSH_EVERY) {
+    g_metrics.total_samples.fetch_add(t_metrics.samples,
+                                      std::memory_order_relaxed);
+    g_metrics.total_tokens.fetch_add(t_metrics.tokens,
+                                     std::memory_order_relaxed);
+    g_metrics.total_loss_x1000.fetch_add(t_metrics.loss_x1000,
+                                         std::memory_order_relaxed);
+    t_metrics = {};
+    batch_count = 0;
+  }
+}</code></pre>
+<p>复测：32 worker 吞吐恢复并超过 8 worker 1.8 倍，IPC 回到 1.25，UPI utilization 降到 8%，<code>perf c2c</code> HITM 热点消失。</p>
+<div class="success"><strong>三个改动协同：</strong>thread-local 让 99% 的写不出本核 cache、padding 防止 LocalMetrics 自己内部 false sharing、降频 flush 让全局 atomic 的 RFO 频率降两个数量级。任何一项单独做都不够。</div>
+<div class="note"><strong>降级方案：</strong>如果不能改代码（如第三方库），降级方案是把高频写线程绑到同一 socket（<code>numactl --cpunodebind=0</code>）减少跨 socket UPI 流量。这能把 100% 损失收回 60-70%，但不如代码层修复彻底。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>练习 0a-6-1（基础）：状态语义</strong><br>判断下列说法对错并解释：(a) Exclusive 状态下，DRAM 与 cache 一致；(b) Shared 状态下可能 DRAM 是旧的；(c) Modified 状态被 remote read 后必须 writeback 到 DRAM；(d) Invalid 状态意味着该 line 已被驱逐。</div>
+<div class="card"><strong>练习 0a-6-2（基础）：状态机推演</strong><br>初始所有 cache 都为 I。事件序列：(1) Core 0 read X，(2) Core 1 read X，(3) Core 0 write X，(4) Core 2 read X。给出每一步后 X 在三个 core 上的 MESI 状态。</div>
+<div class="card"><strong>练习 0a-6-3（基础）：RFO 计数</strong><br>一个变量 Y 已在 Core 0/1/2 的 cache 中处于 S 状态。Core 0 执行 <code>Y = 5</code>。这一次 store 触发了多少条 invalidate 消息？最终 Y 在四个 core（含 Core 3）上的状态？</div>
+<div class="card"><strong>练习 0a-6-4（进阶）：MOESI 优势量化</strong><br>在 producer-consumer 场景（Core 0 持续写 X，Core 1 持续读 X），分别用 MESI 和 MOESI 描述每轮“写-读”循环涉及的总线消息和 DRAM 访问次数。说明 MOESI 节省了什么。</div>
+<div class="card"><strong>练习 0a-6-5（进阶）：MESIF 适用场景</strong><br>设计一个 8 核场景，使 MESIF 比 MESI 明显更快。描述变量、访问模式、为什么 Forward 状态减少了总线竞争。</div>
+<div class="card"><strong>练习 0a-6-6（进阶）：跨 socket 代价估算</strong><br>给定：单 socket L3 hit 60ns，跨 socket UPI 单跳 100ns，home agent 仲裁 30ns。估算一次“跨 socket HITM”的端到端延迟。如果一个全局 atomic counter 被两个 socket 上各 16 个线程以平均 10us 间隔更新，估算每秒 coherence 事件数和 UPI 流量量级。</div>
+<div class="card"><strong>练习 0a-6-7（进阶）：perf c2c 解读</strong><br><code>perf c2c report</code> 输出某条 cacheline 的 LLC Load HITM = 12000，Local HITM = 2000，Remote HITM = 10000，offset 分布在 0/16/32/48 四处，对应符号是同一个 struct 的四个独立字段。这是真共享还是 false sharing？修复方向？</div>
+<div class="card"><strong>练习 0a-6-8（设计）：高频指标聚合</strong><br>为一个 64 worker 的推理服务设计 metric 聚合系统，要求：每个请求结束时记录 latency / status / model_id 三项；每秒导出一次到 Prometheus；尾延迟 p99 &lt; 50us 不受指标系统影响。给出数据结构、聚合策略、跨 socket 考虑。</div>
+<div class="card"><strong>练习 0a-6-9（设计）：跨平台无锁队列</strong><br>设计一个 SPSC（单生产单消费）lock-free 队列，需要在 x86 和 ARM Graviton 上都正确。说明：(a) cache line 布局如何避免 false sharing；(b) head/tail 指针的内存序选择；(c) 在两个平台上分别会插入哪些硬件 barrier。</div>
+<div class="card"><strong>练习 0a-6-10（设计）：runbook</strong><br>把 §12 的 worked example 浓缩成一页值班 runbook。包含：触发条件（吞吐/GPU util 阈值）、采集命令、判读阈值（IPC/HITM/UPI util 多少算异常）、可能根因分类（false sharing / 真共享 / NUMA 错配 / 跨 socket）、修复方向矩阵、回滚策略。</div>
+</div>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用 §1 的因果链建立总图：本质冲突 → 四状态 → 状态机 → 传播机制 → 变种 → 跨 socket → ordering。</li>
+<li>用 §2-§4 把 MESI 当作"私有 cache + 共享内存"的承重墙吃透，能默写状态机。</li>
+<li>用 §5-§6 理解 snoop vs directory、MOESI vs MESIF 的取舍，知道现代服务器走哪一条。</li>
+<li>用 §7-§8 把抽象状态机翻译成 perf 事件名（RFO/HITM/Writeback）和跨 socket 延迟数字。</li>
+<li>用 §9 区分 coherence 与 ordering，避免跨平台陷阱。</li>
+<li>用 §10-§12 把知识落到 AI Infra 真实负载，掌握 perf c2c + intel-pcm 排障流程。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>John L. Hennessy, David A. Patterson, <em>Computer Architecture: A Quantitative Approach</em>，Chapter 5 (Thread-Level Parallelism)。</li>
+<li>David E. Culler, Jaswinder Pal Singh, <em>Parallel Computer Architecture: A Hardware/Software Approach</em>，特别是 snoop 与 directory 协议章节。</li>
+<li>Sorin, Hill, Wood, <em>A Primer on Memory Consistency and Cache Coherence</em>（Synthesis Lectures），最权威的 MESI/MOESI/memory model 综合教材。</li>
+<li>Intel, <em>Intel 64 and IA-32 Architectures Software Developer's Manual</em> Vol 3A，Chapter 11 (Memory Cache Control)；Vol 3A Chapter 8 (Multiple-Processor Management)。</li>
+<li>AMD, <em>AMD64 Architecture Programmer's Manual</em> Vol 2，Chapter 7 (Memory System) 与 MOESI 详述。</li>
+<li>Paul E. McKenney, <em>Is Parallel Programming Hard, And, If So, What Can You Do About It?</em>（perfbook），从 Linux kernel 视角讲 coherence 与 ordering。</li>
+<li>Ulrich Drepper, <em>What Every Programmer Should Know About Memory</em>，section 3.3 (Cache Coherency Protocols)。</li>
+<li>Linux <code>perf c2c</code> 文档与源码：<code>tools/perf/Documentation/perf-c2c.txt</code>。</li>
+<li>Intel PCM 仓库：<a href="https://github.com/intel/pcm">https://github.com/intel/pcm</a>，pcm-numa、pcm-memory 用法。</li>
+<li>Russ Cox, <em>Hardware Memory Models</em> 与 <em>Programming Language Memory Models</em> 系列博客，跨架构 ordering 入门。</li>
+<li>Herb Sutter, <em>atomic Weapons: The C++ Memory Model and Modern Hardware</em>（CppCon 演讲），C++ 视角的 atomic 与 ordering。</li>
+<li>CXL Consortium, <em>CXL Specification 3.0/3.1</em>，CXL.cache 一致性扩展，理解 device-CPU coherence 未来。</li>
+</ul>
+<h3>相关章节</h3>
+<ul>
+<li><a href="0a-cpu-microarchitecture.html">第 0a 章 · CPU 微架构</a>：本章是 §0a.7-§0a.8 的深入展开。</li>
+<li><a href="0b-memory-virtual-memory-and-io.html">第 0b 章 · 内存、虚拟内存与 IO</a>：NUMA 与内存带宽相关背景。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

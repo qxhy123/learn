@@ -4,13 +4,73 @@ const TUTORIAL = [
     "chapters": [
       {
         "id": "0a",
-        "title": "第 0a 章 · CPU 微架构",
+        "title": "第 0a 章 · CPU 微架构总览",
         "path": "part0/0a-cpu-microarchitecture.html"
       },
       {
+        "id": "0a1",
+        "title": "第 0a-1 章 · 流水线（Pipeline）",
+        "path": "part0/0a1-pipeline.html"
+      },
+      {
+        "id": "0a2",
+        "title": "第 0a-2 章 · 乱序执行、Register Renaming 与 ROB",
+        "path": "part0/0a2-out-of-order-execution.html"
+      },
+      {
+        "id": "0a3",
+        "title": "第 0a-3 章 · 分支预测",
+        "path": "part0/0a3-branch-prediction.html"
+      },
+      {
+        "id": "0a4",
+        "title": "第 0a-4 章 · SIMD：SSE、AVX、AVX-512",
+        "path": "part0/0a4-simd.html"
+      },
+      {
+        "id": "0a5",
+        "title": "第 0a-5 章 · Cache 层级",
+        "path": "part0/0a5-cache-hierarchy.html"
+      },
+      {
+        "id": "0a6",
+        "title": "第 0a-6 章 · MESI 一致性协议",
+        "path": "part0/0a6-mesi-coherence.html"
+      },
+      {
+        "id": "0a7",
+        "title": "第 0a-7 章 · 伪共享（False Sharing）",
+        "path": "part0/0a7-false-sharing.html"
+      },
+      {
+        "id": "0a8",
+        "title": "第 0a-8 章 · CPU 综合排障 Worked Example",
+        "path": "part0/0a8-cpu-worked-example.html"
+      },
+      {
         "id": "0b",
-        "title": "第 0b 章 · 内存、虚拟内存与 IO",
+        "title": "第 0b 章 · 内存、虚拟内存与 IO 导览",
         "path": "part0/0b-memory-virtual-memory-and-io.html"
+      },
+      {
+        "id": "0b1",
+        "title": "第 0b1 章 · 虚拟内存、页表、TLB 与 Page Fault",
+        "path": "part0/0b1-virtual-memory-page-tables-and-tlb.html"
+      },
+      {
+        "id": "0b2",
+        "title": "第 0b2 章 · Page Cache、脏页回写与 Huge Pages",
+        "path": "part0/0b2-page-cache-writeback-and-huge-pages.html"
+      },
+      {
+        "id": "0b3",
+        "title": "第 0b3 章 · NUMA、PCIe、DMA 与 Pinned Memory",
+        "path": "part0/0b3-numa-pcie-dma-and-pinned-memory.html"
+      },
+      {
+        "id": "0b4",
+        "title": "第 0b4 章 · Syscall、Epoll、io_uring 与 IO 服务模型",
+        "path": "part0/0b4-syscall-epoll-io-uring-and-service-io.html"
       },
       {
         "id": "0c",
@@ -49,18 +109,78 @@ const TUTORIAL = [
     "chapters": [
       {
         "id": "04",
-        "title": "第 4 章 · GPU 与加速器",
+        "title": "第 4 章 · GPU 与加速器导览",
         "path": "part2/04-gpu-and-accelerators.html"
       },
       {
+        "id": "04a",
+        "title": "第 4a 章 · GPU 执行模型与 Tensor Core",
+        "path": "part2/04a-gpu-execution-model-and-tensor-cores.html"
+      },
+      {
+        "id": "04b",
+        "title": "第 4b 章 · HBM、显存预算与 Roofline",
+        "path": "part2/04b-hbm-memory-and-roofline.html"
+      },
+      {
+        "id": "04c",
+        "title": "第 4c 章 · GPU 互联与系统形态",
+        "path": "part2/04c-gpu-interconnect-and-systems.html"
+      },
+      {
+        "id": "04d",
+        "title": "第 4d 章 · GPU 选型、虚拟化与异构加速器",
+        "path": "part2/04d-gpu-selection-virtualization-and-heterogeneous-accelerators.html"
+      },
+      {
         "id": "05",
-        "title": "第 5 章 · 内存、互联与 IO",
+        "title": "第 5 章 · 内存、互联与 IO 导览",
         "path": "part2/05-memory-interconnect-io.html"
       },
       {
+        "id": "05a",
+        "title": "第 5a 章 · 内存与存储层级、数据驻留",
+        "path": "part2/05a-memory-storage-hierarchy-and-data-residency.html"
+      },
+      {
+        "id": "05b",
+        "title": "第 5b 章 · Host-Device IO、PCIe、NUMA 与重叠",
+        "path": "part2/05b-host-device-io-pcie-numa-and-overlap.html"
+      },
+      {
+        "id": "05c",
+        "title": "第 5c 章 · RDMA、Collective 与集群拓扑",
+        "path": "part2/05c-rdma-collectives-and-cluster-topology.html"
+      },
+      {
+        "id": "05d",
+        "title": "第 5d 章 · 训练存储、Checkpoint 与 IO 诊断",
+        "path": "part2/05d-training-storage-checkpoint-and-io-diagnostics.html"
+      },
+      {
         "id": "06",
-        "title": "第 6 章 · CUDA、运行时与算子执行",
+        "title": "第 6 章 · CUDA、运行时与算子执行导览",
         "path": "part2/06-cuda-runtime-and-kernels.html"
+      },
+      {
+        "id": "06a",
+        "title": "第 6a 章 · Framework Dispatch、Runtime 与 Kernel Launch",
+        "path": "part2/06a-framework-dispatch-runtime-and-kernel-launch.html"
+      },
+      {
+        "id": "06b",
+        "title": "第 6b 章 · Stream、同步与 CUDA Graph",
+        "path": "part2/06b-streams-synchronization-and-cuda-graphs.html"
+      },
+      {
+        "id": "06c",
+        "title": "第 6c 章 · 算子库、融合与 SM 资源边界",
+        "path": "part2/06c-kernel-libraries-fusion-and-sm-resource-limits.html"
+      },
+      {
+        "id": "06d",
+        "title": "第 6d 章 · Profiling、Debugging 与性能排障 SOP",
+        "path": "part2/06d-profiling-debugging-and-performance-sop.html"
       }
     ]
   },
