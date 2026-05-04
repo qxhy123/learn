@@ -365,7 +365,10 @@ RRF_score(d) = Σ 1 / (k + rank_i(d))
   - float16: 2 字节/维
   - int8 量化: 1 字节/维
 
-HNSW 额外内存 ≈ 向量原始内存 × 1.4-2.0 (取决于 M 参数)
+HNSW 内存 = 原始向量存储 + 图邻接 + level metadata + payload/filter index + allocator overhead
+  - 原始向量是否在内存中保留，取决于实现、量化和 mmap 策略
+  - 图邻接粗估可按 `N × M × id_width × layer_factor` 起步，再用真实构建结果校准
+  - 不要把"图额外内存比例"和"总内存比例"混用
 IVF 额外内存 ≈ 向量原始内存 × 0.1-0.3 (聚类中心)
 PQ 压缩后内存 ≈ 向量原始内存 × (code_size / dim)
 
@@ -375,10 +378,10 @@ PQ 压缩后内存 ≈ 向量原始内存 × (code_size / dim)
 **示例：100M 文档，每文档 1536 维 float32 向量**
 ```
 向量原始内存 = 1536 × 4 × 100,000,000 = 614 GB
-HNSW M=16 索引额外 ≈ 614 × 1.5 = 921 GB
-总内存需求 ≈ (614 + 921) × 1.3 ≈ 2000 GB = 2 TB
+HNSW 图邻接和元数据：需按实现实测；若按 full-in-memory 粗估，总内存通常会超过 1 TB
+总内存需求 = raw vectors + graph/metadata + payload/filter index + safety margin
 
-→ 需要约 16 台 128GB 内存服务器，或使用 DiskANN (磁盘索引) 大幅降低内存
+→ 单机 128GB/256GB 内存不适合承载这个口径的 HNSW；应选择分片、量化、DiskANN、IVFPQ，或把原始向量 mmap 到 SSD 并重新压测召回和 P99。
 ```
 
 ### QPS 容量规划
@@ -411,7 +414,7 @@ flowchart TD
   A[确定文档数量和增长率] --> B[选择 embedding 模型\n确定向量维度]
   B --> C[计算向量原始内存]
   C --> D{选择索引类型}
-  D -->|HNSW| E[原始内存 × 1.5-2.0]
+  D -->|HNSW| E[raw vectors + graph/metadata\n按实现实测]
   D -->|IVF-PQ| F[原始内存 × 0.3-0.5\n+ SSD 存储]
   D -->|DiskANN| G[10-20% 内存\n+ NVMe SSD]
   E --> H[目标 QPS 压测]
