@@ -873,6 +873,49 @@ step 0 ────── step 500 ────── step 1000 ──── ste
 | 评测追踪 | Weights & Biases、MLflow、Aim | 方便比较 reward、KL、win-rate |
 | LLM judge 框架 | LLM-as-a-judge pipelines、AlpacaEval、MT-Bench | 自动化偏好评测 |
 
+### 10b.10 Checkpoint 多模型一致性
+
+§10b.7.2 已经列出 PPO checkpoint 必须覆盖的状态类别，但还缺一个关键工程问题：这些状态如何作为**一个事务**被原子地写出和恢复。PPO/RLHF 训练中需要同时持久化 policy / reference / RM / critic 四类模型 + 各自的 optimizer 状态 + RNG 种子 + iteration counter，这套多 artifact checkpoint 的核心难点就是**原子提交**。
+
+- **风险**：写完 policy 后节点 OOM，写到 critic 时崩溃，恢复时 policy 是 step 12000 而 critic 仍是 step 11800 → advantage 估计失真，KL 曲线错位，训练继续跑但分布发散。
+- **必要性**：和单模型 SFT 不同，PPO 的四个模型相互引用（policy 推 → reward → critic 评估 → policy 更新），任何一个 artifact 旧版本都会污染整套训练状态。Reference 旧版本会让 KL 锚点漂移，RM 旧版本会让 reward 不可比，critic 旧版本会让 value loss 误导更新方向。
+
+#### 工程实现
+
+1. **写入侧采用临时目录 + rename**：所有 artifact 先写到 `checkpoint-step-12000.tmp/`，全部 fsync 成功后再 `os.rename` 整体提交为 `checkpoint-step-12000/`。如果用对象存储，则用 multipart upload + finalize 语义；阶段性 part 不会被 reader 看到。
+2. **manifest 文件**：每个 step 写一个 `checkpoint-manifest.json`，列出 4 个 artifact 的 path、size、sha256、训练 step、KL 系数、tokenizer hash、reference/RM artifact id 和 rollout policy id。manifest 必须最后一个写入，扮演事务 commit 的角色。
+3. **恢复侧先校验后加载**：先读 manifest，校验 4 个 artifact 都存在、size 匹配、sha256 一致；任意一项不通过即 fail fast，禁止"先 load 一部分再决定"。
+4. **失败回滚**：启动时先扫描 checkpoint 根目录，发现 `*.tmp` 临时目录或 manifest 缺失/损坏的 step，整组丢弃并回退到上一个完整 commit；写入崩溃留下的孤儿目录由后台清理任务处理。
+
+```mermaid
+sequenceDiagram
+  participant Boot as 启动器
+  participant FS as Checkpoint Store
+  participant V as 校验器
+  participant L as 多模型 Loader
+  participant T as Trainer
+  Boot->>FS: 扫描最新 checkpoint-step-N
+  FS-->>Boot: 候选目录列表 + manifest
+  Boot->>V: 读取 checkpoint-manifest.json
+  V->>FS: 列出 policy/critic/ref/RM artifact
+  FS-->>V: size + sha256
+  V->>V: 校验 artifact 完整性 + step 一致性 + tokenizer hash
+  alt 校验失败
+    V-->>Boot: fail fast，回退到上一个完整 commit
+    Boot->>FS: 标记当前目录为孤儿，清理 *.tmp
+  else 校验通过
+    V-->>L: 通过校验
+    L->>FS: 按 manifest 顺序 load policy → critic → ref → RM
+    L->>L: 恢复 KL controller / RNG / data cursor
+    L-->>T: 资源就绪
+    T->>T: 触发 quick-eval 对齐恢复点行为
+  end
+```
+
+#### 与 Ch 12 的差异
+
+[第 12 章](../part4-data-and-storage/12-artifacts-and-checkpoints.md) 的"制品 / Checkpoint 管理"讲的是**单模型版本治理**——不同实验、不同发布候选之间的血缘、审计、灰度和回收。本节讲的是**同一训练任务内多模型同 step 的原子性**——同一次 PPO 实验里，policy / critic / reference / RM 四份 artifact 必须以同一个 step 的同一组状态被打包和恢复。前者关注跨实验治理，后者关注单实验内一致性。两个层面都需要，但失败模式和工程手段不同：跨实验治理失败的典型现象是"找不到上线了哪个版本"；单实验一致性失败的典型现象是"训练能继续跑但 reward / KL / advantage 不再对应同一组模型状态"。
+
 ---
 
 ## 本章小结
@@ -894,28 +937,73 @@ step 0 ────── step 500 ────── step 1000 ──── ste
 
 ## 练习题
 
-### 基础题
+> 练习编号采用 `练习 10b-N（基础/进阶/设计）` 形式，N 与 [附录 A 答案集](../appendix/answers.md#第10b章对齐训练与后训练基础设施) 中条目一一对应。基础题对应原"基础题"、进阶题对应原"进阶题"、设计题对应原"开放题"。
 
-1. post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？
-2. 为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。
-3. 用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？
-4. DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？
-5. Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。
-6. 如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？
+### 练习 10b-1（基础）
 
-### 进阶题
+post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？
 
-7. 假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。
-8. 某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。
-9. GRPO 相比 PPO 省下了 critic，但代价是"每个 prompt 要采样 16-64 个 response"。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？反过来什么情况下不划算？
-10. 你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？
-11. KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？
-12. rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？
-13. 对同一批 rollout，选择"全量打分"和"流式打分"分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？
+### 练习 10b-2（基础）
 
-### 开放题
+为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。
 
-14. 你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。
-15. 设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？
-16. 设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。
+### 练习 10b-3（基础）
+
+用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？
+
+### 练习 10b-4（基础）
+
+DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？
+
+### 练习 10b-5（基础）
+
+Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。
+
+### 练习 10b-6（基础）
+
+如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？
+
+### 练习 10b-7（进阶）
+
+假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。
+
+### 练习 10b-8（进阶）
+
+某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。
+
+### 练习 10b-9（进阶）
+
+GRPO 相比 PPO 省下了 critic，但代价是"每个 prompt 要采样 16-64 个 response"。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？反过来什么情况下不划算？
+
+### 练习 10b-10（进阶）
+
+你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？
+
+### 练习 10b-11（进阶）
+
+KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？
+
+### 练习 10b-12（进阶）
+
+rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？
+
+### 练习 10b-13（进阶）
+
+对同一批 rollout，选择"全量打分"和"流式打分"分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？
+
+### 练习 10b-14（设计）
+
+你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。
+
+### 练习 10b-15（设计）
+
+设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？结合 §10b.10 的 Checkpoint 多模型一致性讨论给出 manifest 字段、原子提交流程与失败回滚步骤。
+
+### 练习 10b-16（设计）
+
+设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。
+
+### 练习 10b-17（设计）
+
+某团队声称他们"用 DPO 完全替代了 PPO，效果一样还更省钱"。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？
 17. 某团队声称他们"用 DPO 完全替代了 PPO，效果一样还更省钱"。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？

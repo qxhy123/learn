@@ -304,6 +304,25 @@ NCCL_DEBUG=INFO /opt/nccl-tests/build/all_reduce_perf -b 64M -e 8G -f 2 -g 8
 
 给定每节点 8 GPU、8 NIC、双 socket，写出如何用 `nvidia-smi topo -m`、NUMA 信息和 NCCL 变量约束通信路径。
 
+### 练习 0d-14（设计）：AI 训练集群网络配置交付清单
+
+为一个新建 32 节点 RoCE v2 训练集群编写一份"网络配置交付清单"。要求覆盖以下 8 个维度，每项给出：
+
+1. NIC 固件 / driver 版本
+2. PFC（Priority Flow Control）
+3. ECN（Explicit Congestion Notification）+ DCQCN 阈值
+4. MTU（NIC / VLAN / overlay）
+5. RoCE QoS（DSCP / 802.1p priority 映射）
+6. `NCCL_TOPO_FILE`
+7. InfiniBand `sm_priority`（即使是 RoCE 也对应 RDMA CM 优先策略，可注明 N/A 与替代）
+8. libfabric provider 选型（verbs / efa / cxi / shm）
+
+每个维度填写：
+
+| 维度 | 检查命令 | 期望值 / 配置目标 | 错误时的影响 | 责任角色 |
+
+最后要求给出"上线前 7 天"、"上线当天"、"上线后 30 天"三个时间窗的验收节奏，说明哪些项是 hard gate（不通过不上线）哪些是 soft gate（可带 caveat 上线 + 后续整改）。
+
 ## 深度参考阅读
 
 - W. Richard Stevens, *TCP/IP Illustrated, Volume 1: The Protocols*.

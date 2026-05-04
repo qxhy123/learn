@@ -81,6 +81,7 @@ mindmap
 4. MIG、MPS、Time-Slicing 分别把共享问题放在硬件层、驱动层还是调度层，它们各自牺牲了什么？
 5. 给定 GPU、CPU、内存三类资源占用，如何用 DRF 判断哪个队列更“占便宜”？
 6. 为什么在线推理 autoscaling 常看 queue wait、active sequences 和 token throughput，而不是只看 CPU 使用率？
+7. 为什么 GPU 资源的"可弹性"比 CPU 难得多，根本原因究竟在硬件层、驱动层、调度层还是模型权重层？当一个团队抱怨"集群里明明还有空闲 GPU，为什么我的副本扩不起来"，你会按什么顺序排查这条弹性链路上的瓶颈？
 
 ## 2. 正文内容
 

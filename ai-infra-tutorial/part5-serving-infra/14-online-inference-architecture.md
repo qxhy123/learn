@@ -83,6 +83,7 @@ mindmap
 4. 为什么同一个模型副本不是普通无状态 worker？KV Cache、prefix cache、warmup 状态和版本灰度会怎样改变路由策略？
 5. 当长 prompt prefill 拖慢短请求 decode 时，你会先考虑 chunked prefill、长短分流，还是完整 prefill/decode 解耦？判断信号是什么？
 6. 冷启动、熔断、降级、回滚为什么必须写进控制面规则，而不能依赖人工操作？你会为每个动作设置哪些触发指标和退出条件？
+7. 为什么有了网关和路由层把请求分发到副本之后，模型服务进程内仍然必须再做一层 batching、prefill/decode 调度和 KV Cache 管理？这层"看不见的内层调度"和外层路由是如何隐性耦合的——当你单独优化任意一层时，可能在另一层制造哪些副作用？
 
 ---
 

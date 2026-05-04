@@ -233,57 +233,68 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 numactl --cpunodebind=0 --membind=0 \
 
 ## 练习
 
-### 练习 1（基础）：虚拟地址翻译
+### 练习 0b-1（基础）：虚拟地址翻译
 
 解释一次用户态 load 从虚拟地址到物理地址可能经历的路径，并说明 TLB hit、TLB miss、minor page fault、major page fault 的差异。
 
-### 练习 2（基础）：Page Cache 判断
+### 练习 0b-2（基础）：Page Cache 判断
 
 设计 3 条 Linux 命令，判断 dataset 第二轮读取变快是否来自 Page Cache，而不是训练代码优化。
 
-### 练习 3（基础）：dirty page 估算
+### 练习 0b-3（基础）：dirty page 估算
 
 一台 256 GiB 内存机器，`vm.dirty_ratio=20`。粗略估算最多允许多少 GiB 脏页，并说明这对 80 GiB checkpoint 写入有什么影响。
 
-### 练习 4（基础）：THP 观察
+### 练习 0b-4（基础）：THP 观察
 
 给出查看 THP 当前策略、某进程 `AnonHugePages`、TLB miss 的命令。
 
-### 练习 5（基础）：NUMA locality
+### 练习 0b-5（基础）：NUMA locality
 
 用 `numactl -H`、`lscpu`、`nvidia-smi topo -m` 判断 GPU2 更适合绑定哪个 NUMA node。
 
-### 练习 6（基础）：PCIe 带宽
+### 练习 0b-6（基础）：PCIe 带宽
 
 PCIe 4.0 x16 单向理论约 31.5 GB/s。若 8 GiB H2D 用时 0.50 s，折算带宽是多少？可能有哪些原因？
 
-### 练习 7（进阶）：fork 与 copy-on-write
+### 练习 0b-7（进阶）：fork 与 copy-on-write
 
 解释 DataLoader worker 使用 `fork` 后，父进程大对象何时会共享、何时会复制。为什么“读共享、写复制”仍可能造成 RSS 误判？
 
-### 练习 8（进阶）：`io_uring` 适用性
+### 练习 0b-8（进阶）：`io_uring` 适用性
 
 为 dataset service 判断是否值得引入 `io_uring`：列出至少 4 个前提条件和 3 个不适合的信号。
 
-### 练习 9（进阶）：Pinned memory 副作用
+### 练习 0b-9（进阶）：Pinned memory 副作用
 
 说明 pinned memory 如何提高 H2D，同时列出过量 pinned memory 对 Page Cache、系统回收、其他租户的影响。
 
-### 练习 10（进阶）：Topology 推理
+### 练习 0b-10（进阶）：Topology 推理
 
 假设 GPU 与 NIC 在 `nvidia-smi topo -m` 中显示 `SYS`，推断 GPUDirect RDMA 可能遇到什么问题，并给出排查命令。
 
-### 练习 11（设计）：8 GPU DataLoader 亲和方案
+### 练习 0b-11（设计）：8 GPU DataLoader 亲和方案
 
 为双路 8 GPU 机器设计 rank、CPU core、NUMA memory、DataLoader worker 的绑定策略，说明如何避免跨 socket H2D。
 
-### 练习 12（设计）：Checkpoint 写入策略
+### 练习 0b-12（设计）：Checkpoint 写入策略
 
 设计一个 400 GiB checkpoint 写入方案，要求说明 Page Cache、dirty ratio、临时文件、rename、fsync 的取舍。
 
-### 练习 13（设计）：低延迟推理 IO
+### 练习 0b-13（设计）：低延迟推理 IO
 
 为一个在线推理服务设计网络 IO 模型：blocking thread pool、`epoll`、`io_uring` 三选一或组合，并说明为什么。
+
+### 练习 0b-14（设计）：训练机房 NUMA 与 PCIe 拓扑健康检查 SOP
+
+为一支负责 8×H100、双路 CPU、双 NIC rail 训练节点的运维团队，编写一份"NUMA 与 PCIe 拓扑健康检查 SOP"。要求至少给出 8 项检查点，每项必须包括：
+
+- 检查命令（带具体参数）
+- 期望值或健康阈值
+- 异常时的 root cause 候选清单
+- 修复路径（含临时缓解和最终修复两步）
+
+至少覆盖：NUMA node 数与平衡、CPU/GPU/NIC 距离矩阵（`nvidia-smi topo -m`）、PCIe 代际/lane 实际协商速率、ACS / IOMMU 配置、`nvidia-peermem` 是否加载、pinned memory 与 dirty ratio 配额、first-touch 在 worker 上的实测分布、跨 socket 流量监控指标。最后给出一份"日常 / 周度 / 月度"分级巡检建议表。
 
 ## 深度参考阅读
 

@@ -1262,7 +1262,9 @@ checkpoint_policy:
 
 ## 第10b章：对齐训练与后训练基础设施
 
-### 第1题：post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？
+> **编号映射说明**：本节练习已于 2026-05 改用 `练习 10b-N（基础/进阶/设计）` 形式，与正文练习题一一对应。原"第 1 题 ... 第 17 题"对应当前 `练习 10b-1 ... 练习 10b-17`。基础题 = 10b-1 至 10b-6，进阶题 = 10b-7 至 10b-13，设计题 = 10b-14 至 10b-17。
+
+### 练习 10b-1（基础）：post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？
 
 **思路**
 
@@ -1293,7 +1295,7 @@ pretraining
 
 - 如果把 post-training 直接缩成“PPO / DPO”，会漏掉大量真实工程环节。
 
-### 第2题：为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。
+### 练习 10b-2（基础）：为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。
 
 **思路**
 
@@ -1318,7 +1320,7 @@ PPO 和 pretraining 至少有三类关键差异：
 
 - 训练卡很强但 rollout 很慢时，PPO 一样会整体跑不动。
 
-### 第3题：用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？
+### 练习 10b-3（基础）：用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？
 
 **思路**
 
@@ -1345,7 +1347,7 @@ PPO 和 pretraining 至少有三类关键差异：
 
 - 这就是为什么全量 PPO 很容易先被显存而不是算力卡住。
 
-### 第4题：DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？
+### 练习 10b-4（基础）：DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？
 
 **思路**
 
@@ -1367,7 +1369,7 @@ PPO 和 pretraining 至少有三类关键差异：
 
 - prompt 模板和采样参数也应进 lineage，否则偏好对质量很难排查。
 
-### 第5题：Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。
+### 练习 10b-5（基础）：Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。
 
 **思路**
 
@@ -1395,7 +1397,7 @@ PPO 和 pretraining 至少有三类关键差异：
 
 - RLHF 里的 RM 往往不是“一个小模块”，而是训练内环里的推理子系统。
 
-### 第6题：如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？
+### 练习 10b-6（基础）：如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？
 
 **思路**
 
@@ -1417,7 +1419,7 @@ PPO 和 pretraining 至少有三类关键差异：
 
 - rollout buffer 如果无法完整恢复，至少要能从明确边界安全重采样。
 
-### 第7题：假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。
+### 练习 10b-7（进阶）：假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。
 
 **思路**
 
@@ -1451,7 +1453,7 @@ KV Cache ~10-60 GB
 
 - 显存预算一定要做到“按角色、按阶段、按卡”三层。
 
-### 第8题：某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。
+### 练习 10b-8（进阶）：某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。
 
 **思路**
 
@@ -1484,7 +1486,7 @@ KV Cache ~10-60 GB
 
 - 很多团队的现实路线是 `SFT -> DPO -> 再决定是否值得补 PPO / GRPO`。
 
-### 第9题：GRPO 相比 PPO 省下了 critic，但代价是"每个 prompt 要采样 16-64 个 response"。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？反过来什么情况下不划算？
+### 练习 10b-9（进阶）：GRPO 相比 PPO 省下了 critic，但代价是"每个 prompt 要采样 16-64 个 response"。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？反过来什么情况下不划算？
 
 **思路**
 
@@ -1510,7 +1512,7 @@ GRPO 更划算的场景：
 
 - GRPO 省掉的是 critic，不是 rollout 账单。
 
-### 第10题：你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？
+### 练习 10b-10（进阶）：你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？
 
 **思路**
 
@@ -1534,7 +1536,7 @@ GRPO 更划算的场景：
 
 - 单看 reward 曲线就放行，是后训练里最常见的误判之一。
 
-### 第11题：KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？
+### 练习 10b-11（进阶）：KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？
 
 **思路**
 
@@ -1572,7 +1574,7 @@ KL 系数过小时：
 
 - KL controller 最好和 checkpoint 一起保存，否则恢复后行为会突然变样。
 
-### 第12题：rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？
+### 练习 10b-12（进阶）：rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？
 
 **思路**
 
@@ -1597,7 +1599,7 @@ KL 系数过小时：
 
 - rollout 变长时，先出问题的往往是 KV Cache 和临时缓冲，不一定是权重。
 
-### 第13题：对同一批 rollout，选择"全量打分"和"流式打分"分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？
+### 练习 10b-13（进阶）：对同一批 rollout，选择"全量打分"和"流式打分"分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？
 
 **思路**
 
@@ -1616,7 +1618,7 @@ KL 系数过小时：
 
 - RM 一旦跨机部署，流式方案通常更容易和背压机制配合。
 
-### 第14题：你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。
+### 练习 10b-14（设计）：你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。
 
 **思路**
 
@@ -1645,7 +1647,7 @@ KL 系数过小时：
 
 - 对 4 张 A100 来说，最大的风险通常不是算法落后，而是基础设施复杂度先把自己拖垮。
 
-### 第15题：设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？
+### 练习 10b-15（设计）：设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？
 
 **思路**
 
@@ -1689,7 +1691,7 @@ ckpt/
 
 - `reference` 一旦版本漂移，训练语义也会漂。
 
-### 第16题：设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。
+### 练习 10b-16（设计）：设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。
 
 **思路**
 
@@ -1723,7 +1725,7 @@ checkpoint 产出
 
 - judge 本身也是模型，必须像生产依赖一样治理版本漂移。
 
-### 第17题：某团队声称他们"用 DPO 完全替代了 PPO，效果一样还更省钱"。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？
+### 练习 10b-17（设计）：某团队声称他们"用 DPO 完全替代了 PPO，效果一样还更省钱"。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？
 
 **思路**
 
@@ -4841,59 +4843,110 @@ Pinned memory 能提高异步 H2D 拷贝效率，但过多 page-locked 内存会
 
 低延迟控制面优先减少阻塞 syscall、连接抖动和内存分配；socket 可用 epoll/io_uring，权重和配置应预加载或 mmap 后预热。不要让首次请求承担 page fault、模型加载、TLS 建连和动态编译成本。
 
+**0b-14：训练机房 NUMA 与 PCIe 拓扑健康检查 SOP**
+
+下面是 8 项必检点，每项给出"检查命令 / 期望值 / root cause / 修复路径"。修复路径都按"临时缓解 + 最终修复"两步给出。
+
+| # | 检查项 | 检查命令 | 期望值 | 异常 root cause | 临时缓解 → 最终修复 |
+|---|---|---|---|---|---|
+| 1 | NUMA node 拓扑 | `numactl -H`；`lscpu \| grep NUMA` | 双路机器看到 2 nodes，每 node 内存均衡（差 ≤ 2 GB） | BIOS 关闭 NUMA / 单内存通道故障 | 临时：避免单 socket 调度；最终：BIOS 打开 NUMA + 工单换内存条 |
+| 2 | GPU/NIC 距离矩阵 | `nvidia-smi topo -m` | GPU↔NIC 同 socket 显示 PIX/PXB；不应出现 SYS | NIC 装错 PCIe 槽 / 双 socket 不对称 | 临时：调整 NCCL `NCCL_IB_HCA` 强制走近端 NIC；最终：硬件团队换槽位 |
+| 3 | PCIe 协商速率 | `lspci -vvv -s <bdf> \| grep LnkSta` | Gen4/Gen5 x16 与 LnkCap 一致 | 退化为 Gen3 或 x8（cable / 主板老化 / 电源） | 临时：标记节点为低优 + 摘 RDMA；最终：换 riser / 板卡 |
+| 4 | ACS / IOMMU | `lspci -vvv \| grep -i acsctl`；`dmesg \| grep -i iommu` | 同一 root 下 GPU/NIC ACS 关闭，便于 P2P；IOMMU 在 passthrough 模式 | 默认 ACS 开启阻断 P2P；IOMMU strict 模式拖慢 DMA | 临时：内核参数 `pcie_acs_override=downstream,multifunction`；最终：BIOS + grub 持久化，并加 boot e2e 测 |
+| 5 | nvidia-peermem | `lsmod \| grep nvidia_peermem` | 模块已加载 | driver 升级后未自动加载 / dkms 失败 | 临时：`modprobe nvidia_peermem`；最终：写入 `/etc/modules-load.d/`，加入镜像 baseline |
+| 6 | pinned 内存与 dirty ratio 配额 | `sysctl vm.dirty_ratio vm.dirty_background_ratio`；`cat /proc/meminfo \| grep -E "Mlocked\|Dirty"` | dirty_ratio 10、background 5；pinned ≤ 总内存 25% | 默认 20/10 + checkpoint 突发 → 写回风暴；pinned 过多挤压 Page Cache | 临时：`sysctl -w vm.dirty_bytes=...`；最终：节点初始化模板里固化阈值 + Prometheus 告警 |
+| 7 | first-touch 实测分布 | 训练时 `numastat -p $(pgrep train.py)` | 每 rank 的本地 node ratio ≥ 90% | DataLoader worker 没绑定 / launcher 漂移 | 临时：`numactl --cpunodebind=N --membind=N` 包住 rank；最终：launcher 自动按 GPU id 计算 NUMA set |
+| 8 | 跨 socket 流量监控 | `pcm.x`/`turbostat` 看 UPI utilization；`perf stat -e uncore_imc/cas_count_read/` | UPI 占用 < 30% | DataLoader/通信线程跨 socket 抢内存 | 临时：手工迁线程；最终：把跨 socket UPI 占用纳入 SLI，超阈值告警 |
+
+**分级巡检建议表：**
+
+| 频次 | 检查项 |
+|---|---|
+| 每日（自动） | #5 nvidia-peermem 是否加载、#3 LnkSta 速率、#7 numastat 抽样 |
+| 每周（半自动） | #2 distance 矩阵 diff、#6 pinned/dirty 阈值、#8 UPI 占用基线 |
+| 每月（人工） | #1 NUMA 内存均衡、#4 ACS / IOMMU 全节点抽查、固件/驱动版本审计 |
+
+判分要点：能写出"临时 + 最终"两步、给出可执行命令、并把 #2 / #4 / #5 这三项识别为最容易导致 GPUDirect RDMA 失效的根因即可拿满分。
+
 ### 0c 文件系统与存储内核
 
-**0c-基础1：VFS 路径**
+**0c-1：VFS 路径**
 
 一次文件读取大致经过路径解析、dentry/inode、权限检查、Page Cache 命中判断、文件系统方法、block layer、设备驱动。VFS 提供统一抽象，具体 ext4/XFS/ZFS 决定底层元数据和数据布局。
 
-**0c-基础2：write 成功的含义**
+**0c-2：write 成功的含义**
 
 `write()` 成功通常只表示数据已进入内核缓冲或提交给底层路径，不等于持久落盘。崩溃一致性需要 `fsync`、目录同步、rename 协议和校验/manifest 配合。
 
-**0c-基础3：ext4 journal**
+**0c-3：ext4 journal**
 
 ext4 journal 主要保护元数据一致性；不同模式对数据是否进入 journal 有差异。它能提升崩溃恢复确定性，但 checkpoint 大文件频繁提交可能带来额外写放大和尾延迟。
 
-**0c-基础4：XFS 适配**
+**0c-4：XFS 适配**
 
 XFS 擅长大文件、并发写和大目录场景，B+tree 元数据结构适合扩展。AI checkpoint 和大 shard 写入常适合 XFS，但小文件极多时仍需关注目录、inode 和元数据压力。
 
-**0c-基础5：对象存储语义**
+**0c-5：对象存储语义**
 
 对象存储适合不可变 shard、checkpoint 归档和大规模分发，但不是 POSIX 文件系统。目录、append、rename、fsync、权限和一致性语义都不同，应用应使用 manifest 和分片上传协议。
 
-**0c-基础6：IOPS 换算**
+**0c-6：IOPS 换算**
 
 小随机 IO 吞吐约等于 `IOPS x block_size`。例如 50k IOPS、4KB 随机读约 200MB/s；同一设备顺序读可能有数 GB/s，所以小文件训练很容易被 IOPS 而不是带宽限制。
 
-**0c-进阶1：Page Cache 误判**
+**0c-7：Page Cache 误判**
 
 若 benchmark 第二次明显更快，且磁盘 `iostat` 读吞吐下降、Page Cache 增加，说明测到的是内存缓存。应分别测 cold cache、warm cache 和真实训练混合负载。
 
-**0c-进阶2：`O_DIRECT` 取舍**
+**0c-8：`O_DIRECT` 取舍**
 
 `O_DIRECT` 可减少 Page Cache 污染和双份拷贝，但要求对齐，可能降低小 IO 合并能力。它也不自动等价于持久化，仍需考虑 flush、barrier、fsync 或设备缓存策略。
 
-**0c-进阶3：小文件瓶颈**
+**0c-9：小文件瓶颈**
 
 大量小文件会放大 open/stat/list、inode、目录锁和 MDS 压力。解决方向包括 shard/tar/webdataset、合并索引、预取、减少目录列表、并行文件系统 MDS 扩容或本地缓存。
 
-**0c-进阶4：ZFS dataset 仓库**
+**0c-10：ZFS dataset 仓库**
 
 ZFS 适合需要快照、校验、压缩和可回滚 dataset 的场景。代价是 COW 写放大、ARC 内存占用和 sync 写策略复杂；训练热路径需验证尾延迟和内存竞争。
 
-**0c-设计1：Checkpoint 发布协议**
+**0c-11：Checkpoint 发布协议**
 
 推荐写入 `tmp/step-id/rank-*`，每个分片写完校验并 fsync，生成 manifest，fsync 目录，最后用原子 rename 或提交 manifest 标记可见。恢复只读取完整 manifest 指向的分片，清理未完成临时目录。
 
-**0c-设计2：混合存储架构**
+**0c-12：混合存储架构**
 
 本地 NVMe 做热缓存和临时 spill，并行 FS 做训练热层和 checkpoint 最新 N 份，对象存储做归档和跨集群分发。控制面负责生命周期、校验、预热和回收，避免用户手工搬文件。
 
-**0c-设计3：Stripe 策略**
+**0c-13：Stripe 策略**
 
 大 checkpoint 分片应按 rank 数、OSS 数和目标吞吐设置 stripe，避免所有 rank 写同一 OST 或同一目录热点。小文件不应盲目加大 stripe，应先减少文件数或优化 MDS 压力。
+
+**0c-14：200TB checkpoint 仓库文件系统选型**
+
+按题目给出的 6 维权重（吞吐 0.25 / 尾延迟 0.10 / 一致性 0.20 / 快照 0.15 / 容量成本 0.20 / 运维 0.10）对五个候选打分（1-5 分），并给出加权总分：
+
+| 维度（权重） | ext4 | XFS | ZFS | Lustre | WekaFS |
+|---|---:|---:|---:|---:|---:|
+| 持续吞吐（0.25） | 2 单机受限 | 3 单机较好 | 3 CoW 写放大 | 5 stripe 易扩 | 5 NVMe 全闪 |
+| 尾延迟（0.10） | 4 简单可控 | 4 同上 | 2 ARC/sync 抖动 | 3 MDS 偶发抖动 | 4 设计低延迟 |
+| 一致性（0.20） | 3 journal | 3 journal | 5 CoW + checksum | 4 分布式锁 | 4 强一致 |
+| 快照/版本（0.15） | 1 需 LVM | 1 需 LVM | 5 内建 | 3 依赖产品 | 4 内建 snap |
+| 容量成本（0.20） | 5 最便宜 | 5 同上 | 4 需大内存 | 2 HPC 硬件 | 1 商用 NVMe 贵 |
+| 运维复杂度（0.10） | 5 最简单 | 4 简单 | 3 需 ZFS 经验 | 1 需 HPC 专人 | 2 厂商支持必备 |
+| **加权总分** | **3.05** | **3.30** | **3.65** | **3.50** | **3.70** |
+
+加权决策：WekaFS（3.70）与 ZFS（3.65）最高，但 WekaFS 在"容量成本 0.20"和"运维 0.10"两个高权重项被压低；考虑团队"不能新招 HPC 专人"的硬约束，**最终推荐 ZFS（单池 raidz2，配 SLOG + L2ARC）做主仓库**，理由：(a) 一致性 + 内建快照覆盖了 0.35 的总权重；(b) 写放大可通过 `recordsize=1M`、关闭 `atime`、`compression=zstd-3`、`sync=standard` 调优；(c) 14 天滚动窗口正好契合 ZFS snapshot；(d) 团队不需要 HPC 经验。建议分层架构：
+
+- **L0 训练节点本地 NVMe（XFS）**：写临时 checkpoint，30 分钟后 rsync/zfs send 到 L1。
+- **L1 ZFS 主仓库（200TB raidz2）**：保留最新 14 天 + 每日 snapshot；对外通过 NFS/RDMA 暴露给恢复任务。
+- **L2 对象存储归档**：保留每周一份 + 关键模型里程碑，做跨 region 副本。
+
+**会换选的三种条件：**
+
+1. **单 checkpoint 体积翻倍（→ 100GB+/rank、聚合吞吐 ≥ 25 GB/s）**：换 **WekaFS** 或 **Lustre**；ZFS 单池吞吐瓶颈会让 step 间隔超出预算。
+2. **加入"GPU 直挂 RDMA 读取"需求**：换 **WekaFS**（原生支持 GPUDirect Storage）或 Lustre + DAOS；ZFS 的 ARC 路径无法绕过 host memory。
+3. **TCO 上限砍半到 $0.025/GB·月**：换 **XFS + 对象存储分层**（XFS 做最近 3 天热层，其余全部归档到 S3 IA / Glacier），放弃内建快照换成 manifest + immutable key 协议。
 
 ### 0d 网络协议栈基础
 
@@ -4948,6 +5001,31 @@ RoCE 对丢包敏感，丢包会造成性能急剧下降。PFC 用 pause 降低�
 **0d-13：GPU 与 NIC 亲和放置**
 
 调度时优先让 GPU 使用同 socket、同 PCIe switch 或拓扑最近的 NIC，并让 CPU worker 绑定到相同 NUMA node。多 rail 集群应让每张 GPU 走预期 rail，避免跨 socket 绕路和 rail 不均衡。
+
+**0d-14：AI 训练集群网络配置交付清单**
+
+下面是 8 个维度的交付清单，每项均覆盖"检查命令 / 期望值 / 错误时影响 / 责任角色"四列。
+
+| 维度 | 检查命令 | 期望值 / 配置目标 | 错误时的影响 | 责任角色 |
+|---|---|---|---|---|
+| 1. NIC 固件 / driver | `ethtool -i ens5f0`；`ofed_info -s` | 与厂商 LLM training reference matrix 一致；MOFED 5.8+ / firmware 与 H100 RDMA 推荐版本对齐 | RDMA QP 创建失败、CQE syndrome 异常、driver crash | 系统/网络组 |
+| 2. PFC | `mlnx_qos -i ens5f0`；交换机 `show priority-flow-control` | 仅在 RoCE priority（如 3）启用 PFC；其他 priority 关闭，端到端一致 | 全局 pause storm；非 RoCE 流被反压；HOL blocking 拖垮控制面 | 网络组 |
+| 3. ECN + DCQCN | `mlnx_qos -i ens5f0 --trust dscp`；交换机 `show qos red-thresholds` | ECN 在 RoCE priority 启用；WRED min/max ≈ 150KB / 1.5MB（按 buffer 调）；DCQCN 默认参数 | DCQCN 收不到拥塞信号 → 只能等 PFC 触发；尾延迟暴涨 | 网络组 + 训练平台 |
+| 4. MTU | `ip -d link show ens5f0`；`ping -M do -s 8972 <peer>` | NIC 9000、VLAN/bond 9000、overlay 头部预留后 ≥ 8950 | RoCE 大包分片 → 吞吐折半；连接频繁断开 | 网络组 |
+| 5. RoCE QoS（DSCP/802.1p） | `cma_roce_tos -d mlx5_0`；交换机 `show qos dscp-mapping` | DSCP 26 → priority 3 → traffic class 3；端到端映射一致 | RoCE 流量与存储 / 控制流共用同一队列，相互踩踏 | 网络组 |
+| 6. `NCCL_TOPO_FILE` | `cat $NCCL_TOPO_FILE`；NCCL 启动日志 `Topology` 段 | XML 描述 GPU/NIC/NVLink/PCIe 真实拓扑；NCCL 选 ring/tree 与拓扑匹配 | NCCL 选错 transport 或绕远 → AllReduce 慢 30%-50% | 训练平台 |
+| 7. IB `sm_priority`（或 RDMA CM） | InfiniBand：`ibstat`；`smpquery`；RoCE 替代：`rdma link show`、`rdma resource show` | IB：每子网仅一台 active SM、priority 一致；RoCE：N/A，但需配 RDMA CM GID index 和路由权重一致 | 多 SM 抢主→ fabric 抖动；GID index 选错 → RoCE handshake 失败 | 网络组（HPC 团队） |
+| 8. libfabric provider | `fi_info -p verbs`；`fi_info -p efa` | 训练用 verbs（RoCE/IB）；AWS EFA 节点用 efa；同节点不混用 shm 之外的多 provider | provider mismatch → NCCL fallback socket，带宽掉到 1/10 | 训练平台 |
+
+**三段验收节奏：**
+
+| 时间窗 | 验收项 | hard / soft gate |
+|---|---|---|
+| 上线前 7 天 | 1. 固件版本 audit；2. 全节点 MTU 端到端 ping；4. PFC/ECN 配置；6. `NCCL_TOPO_FILE` 与 `nvidia-smi topo -m` 一致 | 全部 **hard gate** — 任一不通过禁止入池 |
+| 上线当天 | nccl-tests AllReduce/AllGather 跨全部节点；`ib_write_bw` pair-wise；libfabric provider check；冷启动后 NCCL_DEBUG=INFO 抽样 | nccl-tests bus bandwidth ≥ 期望 80% 为 **hard gate**；其余 soft gate（带 caveat 上线 + 24h 内整改） |
+| 上线后 30 天 | DCQCN/ECN mark 趋势；PFC pause 帧速率；RoCE 重传计数；NCCL p99 step time；交换机 buffer occupancy | **soft gate**：进入持续观测仪表盘；若任一指标连续 3 天恶化 → 触发 incident review |
+
+判分要点：必须 (a) 区分 hard / soft gate（不能全部 hard，否则永远上不了线）、(b) 把 #2/#3/#4 三项识别为 RoCE 训练最常见故障来源、(c) 给出可执行的 `mlnx_qos` 与交换机侧命令、(d) 在 IB sm_priority 一项里识别"RoCE 集群无 SM"并给出 RDMA CM 替代验证方法。
 
 ---
 
