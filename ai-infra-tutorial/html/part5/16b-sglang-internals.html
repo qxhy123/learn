@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 16b 章 · SGLang 内部机制深入 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=16b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 16b 章 · SGLang 内部机制深入</h1>
+<p class="sub">从“当 LLM 调用从单次 generate 变成复杂程序时，怎样把 prefix 复用、KV 调度、结构化解码做成原生设施”出发，建立 RadixAttention、frontend language、constrained decoding 与 cache-aware scheduling 之间的第一性因果链。</p>
+<div class="chips"><span class="chip">SGLang</span><span class="chip">RadixAttention</span><span class="chip">Frontend DSL</span><span class="chip">Constrained Decoding</span><span class="chip">Jump-Forward</span><span class="chip">Cache-aware Scheduling</span></div>
+<div class="note"><strong>不可化简的问题：</strong>当 LLM 调用从单次 generate 演化成多轮、分支、约束生成、tool use、agent loop 的复杂程序时，怎样把 prefix 复用、KV Cache 调度、结构化解码做成后端原生设施，而不是在客户端层层拼装？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。本章是 <a href="16-quantization-compilation-and-engines.html">第 16 章</a> 引擎选型的深挖子章，与 <a href="16a-vllm-internals.html">16a vLLM 内部机制</a> 形成姊妹章。</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：生成程序与 prefix 树</a></li>
+<li><a class="anchor" href="#s2">SGLang 整体架构</a></li>
+<li><a class="anchor" href="#s3">RadixAttention 详解</a></li>
+<li><a class="anchor" href="#s4">Frontend Language：fork / join / gen / select / structured</a></li>
+<li><a class="anchor" href="#s5">Constrained Decoding：FSM 与 Jump-Forward</a></li>
+<li><a class="anchor" href="#s6">Speculative Decoding：与 vLLM 对比</a></li>
+<li><a class="anchor" href="#s7">调度器设计：cache-aware scheduling</a></li>
+<li><a class="anchor" href="#s8">张量并行 / 数据并行</a></li>
+<li><a class="anchor" href="#s9">量化与扩展</a></li>
+<li><a class="anchor" href="#s10">与 OpenAI API / function calling 对接</a></li>
+<li><a class="anchor" href="#s11">性能调优手册</a></li>
+<li><a class="anchor" href="#s12">何时选 SGLang vs vLLM vs TRT-LLM</a></li>
+<li><a class="anchor" href="#s13">Worked Example：Agent + Tool Use</a></li>
+<li><a class="anchor" href="#s14">练习</a></li>
+</ol></section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：生成程序与 prefix 树</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 vLLM、SGLang、TensorRT-LLM、PagedAttention、RadixAttention 这些名字，本章面对的不可化简问题只有一个：当 LLM 调用从“单次 generate”演化成“复杂程序”——多轮对话、分支采样、约束生成、tool use、agent loop——之后，怎样把 prefix 复用、KV Cache 调度、结构化解码做成原生设施，而不是在应用层一层一层拼装？</p>
+<p>vLLM 的设计假设是“请求是独立的、prompt 是黑盒、KV Cache 按 block 管理”，调度器只需要在 prefill / decode 之间做 continuous batching。这套假设非常适合“一个 OpenAI-compatible chat completion 接口承接所有流量”的场景。但当业务变成 agent 编排、function calling、JSON mode、自一致性投票、tree-of-thought、RAG fork-join、re-ranking 时，请求之间不再独立：它们共享几 KB 到几十 KB 的 system prompt 和 tool 描述，它们的 prefix 是高度结构化的（“Thought:” / “Action:” / “Observation:”），它们的输出还要严格符合 JSON schema 或 grammar。如果只用 vLLM 的 prefix cache hash + block table 来承载这些复用，会有几个工程边界露出来：第一，prefix cache 的命中粒度是 block（默认 16 token），共享前缀的判断是 hash + LRU，碰到分支采样时只能复制 KV 或重新 prefill；第二，结构化生成被推到客户端做“sample → 验证 → 重试”，token 经济性极差；第三，多轮 agent 的中间状态在客户端和服务端反复来回，TTFT 被网络放大。</p>
+<p>SGLang 的回答方式不同：它把<strong>生成程序本身</strong>做成一等公民。前端是一个嵌入式 DSL（Python），程序员可以在其中描述 fork、join、gen、select、structured generation、tool call 这些原语；后端是一个 cache-aware scheduler，配合一棵 radix tree 形式的 KV Cache 索引——RadixAttention——它能在 token 粒度（不是 block 粒度）识别共享前缀，并自然支持分支共享、子树驱逐、按引用计数的 GC；约束生成则被下推到 decoder 内部，靠 FSM 压缩状态、靠 jump-forward decoding 跳过那些被 grammar 强制确定的 token。这套设计的核心断言是：当生成程序的复杂度成为主导时，后端必须暴露 prefix 树和约束解码这两个底层能力，应用层才能写得简洁、跑得快。</p>
+<p>因此，本章不是在对比两套引擎的 benchmark 数字，而是在回答一个架构问题：为什么“以生成程序为中心、以 prefix 树为底座”是 LLM serving 的另一条主流路线，它的边界又在哪里。</p>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>第一步推 RadixAttention。共享前缀的复用有两层粒度：vLLM 选择 block 粒度（hash 一段 16 个 token）+ 前缀链；SGLang 选择 token 粒度（共享前缀走到 radix tree 的同一个节点，分叉处分裂出新子节点）。前者实现更简单、对 dense 流量友好；后者实现更复杂，但能让“两个请求共享 1024 token，第 1025 token 不同”这种情况自动只共享前 1024 个 KV，后续各自延伸。这种结构对 fork、tree-of-thought、self-consistency 这类“同一前缀 N 路展开”的程序天然友好——分裂只是 radix tree 上多一条边，不需要复制 KV，也不需要重新 prefill。</p>
+<p>第二步推 frontend language。如果 prefix 树是一等公民，那么“程序如何在树上行走”就需要一种描述语言。<code>fork(N)</code> 让当前 prefix 同时延伸 N 条路径；<code>gen(name, ...)</code> 在某条路径上生成；<code>select(choices)</code> 让模型在受限选项中选择；<code>@function</code> 让一段 Python 代码被翻译成调度计划。所有这些原语的共同语义是：它们告诉后端“哪些 token 是同一棵 prefix 树的、可以共享 KV”。如果不暴露这个语义，后端无论怎么 hash 都猜不出这种共享意图——比如客户端随机重排 prompt 顺序，prefix hash 就失效了。</p>
+<p>第三步推 constrained decoding。结构化输出的本质是“让 sampling 只能从合法 token 集中选”。最朴素的实现是 sample 后验证、不合法就重采样，token 经济性极差。更聪明的做法是用 FSM 在每一步预先算出“合法 token 集”作为 logits mask；更进一步，FSM 在某些状态下只有一个合法 token（例如 JSON 中 key 后必跟冒号），那这个 token 完全可以不通过模型 forward 就直接输出——这就是 jump-forward decoding。这两层优化让 JSON / grammar 生成的速度从“比自由生成更慢”变成“明显更快”。</p>
+<p>第四步推 cache-aware scheduling。如果 prefix 树是核心数据结构，那么调度策略也应该围绕它转：在调度队列里，优先选择能复用最长 prefix 的请求（longest-shared-prefix-first）能最大化 cache hit；同一个 prefix 子树下的请求应被路由到同一副本（prefix-aware routing），否则 radix tree 又得在另一台机器上重建。这一层和 vLLM 的“FCFS + preemption”调度路线明显不同：SGLang 的调度器把 prefix 复用从“性能优化”提升为“调度第一目标”。</p>
+<p>把这四步合在一起，就回答了本章主线：SGLang 不是 vLLM 的“换皮版”，而是把 LLM serving 的中心从“请求队列 + block KV”挪到了“生成程序 + prefix 树”。</p>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((SGLang 设计))
+    不可化简的问题
+      生成不再是单次 generate
+        多轮 agent
+        tool use
+        self-consistency
+        tree-of-thought
+      请求高度共享 prefix
+        system prompt
+        few-shot
+        tool 描述
+        RAG 模板
+      输出需要结构化
+        JSON schema
+        regex
+        grammar
+      客户端拼装代价高
+        TTFT 被放大
+        token 经济差
+    Frontend Language
+      DSL 原语
+        fork
+        join
+        gen
+        select
+        structured
+      Python embedded
+      显式声明共享意图
+    Backend Runtime
+      RadixAttention
+        token 粒度共享
+        分裂合并
+        引用计数
+        子树驱逐
+      Cache-aware scheduler
+        longest-shared-prefix-first
+        prefix-aware routing
+      Constrained decoding
+        FSM 状态压缩
+        jump-forward
+        speculative decode
+    与 vLLM 对比
+      共享粒度: token vs block
+      调度目标: prefix vs FCFS
+      程序模型: DSL vs API
+      结构化: 原生 vs 客户端
+    工程边界
+      简单聊天可能过度设计
+      DSL 学习成本
+      约束生成抢占采样自由度</pre>
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>RadixAttention 与 vLLM 的 hash-based prefix caching 在共享粒度、分裂行为和驱逐策略上的本质区别是什么？</li>
+<li>为什么 SGLang 要暴露 frontend language 而不是直接做“OpenAI 兼容 + 更聪明的 prefix cache”？</li>
+<li>Constrained decoding 的 FSM 压缩和 jump-forward decoding 在什么场景下能把吞吐拉高到自由生成之上？</li>
+<li>SGLang 的 cache-aware scheduling（longest-shared-prefix-first）和 vLLM 的 continuous batching 是冲突还是互补？</li>
+<li>给定一个 agent + tool use 服务，怎样判断 SGLang fork+RadixAttention 比“朴素 vLLM 多次请求”能省多少 token、降多少 TTFT？</li>
+<li>SGLang 在 TP / DP / 量化、speculative decoding 上和 vLLM 的实现路径有哪些异同？</li>
+<li>什么场景应当选 SGLang，什么场景应当回退到 vLLM 或 TRT-LLM？</li>
+</ol>
+<h3>学习 checklist</h3>
+<ul>
+<li>能用一段话解释 RadixAttention 是“按 token 粒度做 prefix 复用的 radix tree”。</li>
+<li>能写出一段 SGLang frontend 程序，包含 fork / gen / select / structured 原语。</li>
+<li>能解释 jump-forward decoding 为什么能让结构化生成比自由生成更快。</li>
+<li>能从 mem-fraction、max-running-requests、tp-size、chunked-prefill-size 四个参数说出它们的物理含义。</li>
+<li>能在 vLLM / SGLang / TRT-LLM 之间做一次有理有据的选型决策。</li>
+<li>能识别一个声称 “SGLang 比 vLLM 快 5x” 的 benchmark 是否可信。</li>
+<li>能列出至少一个 SGLang 不应该上的反场景。</li>
+</ul>
+</section>
+
+<section class="section" id="s2">
+<h2>2. SGLang 整体架构：Frontend Language / Runtime / Scheduler / RadixAttention</h2>
+<p>SGLang 在工程上分成两个清晰的层。<strong>Frontend</strong> 是一个嵌入在 Python 里的 DSL，业务写的“生成程序”被翻译成一份调度计划（一棵带 fork / join 的执行图）发送到 backend；<strong>Backend Runtime</strong> 接收这份计划，由 cache-aware scheduler 把它拆成可被 GPU 执行的 micro-batch，并通过 RadixAttention 复用前缀的 KV Cache。两层之间用一份显式的 schedule plan 通讯，这是 SGLang 与“裸 OpenAI API”的关键差别——OpenAI API 一次只描述一段 prompt，DSL 一次描述整个生成图。</p>
+<pre class="mermaid">flowchart TB
+  subgraph Frontend[Frontend Language Layer]
+    P[业务 Python 程序<br/>@sgl.function]
+    DSL[fork / join / gen / select<br/>structured / tool_use]
+    Plan[Schedule Plan<br/>带 fork-join 的执行图]
+    P --> DSL --> Plan
+  end
+  subgraph Backend[Backend Runtime]
+    RT[Router / Tokenizer Manager]
+    SC[Cache-aware Scheduler<br/>longest-shared-prefix-first]
+    RA[RadixAttention<br/>radix tree of KV blocks]
+    CD[Constrained Decoder<br/>FSM + jump-forward]
+    EX[Model Executor<br/>TP / PP / quant kernels]
+    Plan --> RT --> SC
+    SC <--> RA
+    SC --> CD
+    SC --> EX
+    EX <--> RA
+  end
+  GPU[(GPU HBM<br/>weights + KV pool)]
+  EX --> GPU
+  RA -.indexing.-> GPU
+  Client[Client / Agent] --> P
+  EX --> S[Stream tokens] --> Client</pre>
+<table>
+<tr><th>层</th><th>主要职责</th><th>核心数据结构</th><th>与 vLLM 的对应关系</th></tr>
+<tr><td>Frontend Language</td><td>把生成程序翻译成 schedule plan</td><td>执行图 / fork-join 树</td><td>大致对应 OpenAI API + 业务自己的 orchestrator</td></tr>
+<tr><td>Router / Tokenizer Manager</td><td>接 plan、做 prefix-aware 路由、tokenize</td><td>请求队列 + tenant 路由表</td><td>vLLM 的 entrypoint + 路由层</td></tr>
+<tr><td>Cache-aware Scheduler</td><td>按 prefix 长度组 batch</td><td>待调度池 + 优先级</td><td>vLLM Scheduler，但优先级函数不同</td></tr>
+<tr><td>RadixAttention</td><td>KV Cache 的索引与共享</td><td>radix tree（节点存 token slice + KV ptr）</td><td>vLLM PagedAttention block table</td></tr>
+<tr><td>Constrained Decoder</td><td>logits mask、jump-forward</td><td>FSM / grammar</td><td>vLLM 的 logits processor + 第三方 outlines</td></tr>
+<tr><td>Model Executor</td><td>真正跑 GPU forward</td><td>kernel + TP/PP shards</td><td>vLLM Worker / Engine</td></tr>
+</table>
+<div class="note"><strong>关键约束：</strong>Frontend 与 Backend 之间必须传递“程序结构”而不是只传 token。如果业务方不写 SGLang DSL 而只用 OpenAI 兼容接口，SGLang 会退化成“prefix cache 比 vLLM 强一点的引擎”，本章要讨论的大部分收益都拿不到。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. RadixAttention 详解：用 radix tree 组织 KV Cache 实现自动 prefix 共享</h2>
+<p>vLLM 的 PagedAttention 把 KV Cache 切成定长 block（默认 16 token），用 hash(prefix block) 在 prefix cache 里查命中。这种设计简单、对 dense 流量友好，但在以下场景会遇到工程边界：分支采样时要复制 KV；prefix 共享只能按 16 token 对齐；驱逐用 LRU，不感知 prefix 树形结构。</p>
+<p>SGLang 的 RadixAttention 把 KV Cache 组织成一棵 radix tree（也叫 PATRICIA tree）。每个节点保存一段连续 token 序列的 KV 指针；从根到任意节点的路径就是某个上下文的完整 KV。新请求进来时，scheduler 沿着 token 序列走树：能匹配到的部分直接复用 KV，根本不进 prefill；匹配不上的部分作为新子节点挂上去。fork 操作只是在树上多挂几条边——共享前缀真的物理共享，不是“逻辑上共享 + 数据复制”。</p>
+<pre class="mermaid">flowchart TB
+  R[Root<br/>empty]
+  S1["You are a helpful assistant.\nYou have these tools: search, calc."]
+  R --> S1
+  Q1["User: 1+1?"]
+  Q2["User: capital of France?"]
+  Q3["User: search 'NVIDIA H100'"]
+  S1 --> Q1
+  S1 --> Q2
+  S1 --> Q3
+  A1["Assistant: 2"]
+  A2["Assistant: Paris"]
+  T1["Action: search\nObservation: ..."]
+  Q1 --> A1
+  Q2 --> A2
+  Q3 --> T1
+  T1 --> F1["Assistant: H100 is..."]
+  T1 --> F2["Assistant: NVIDIA's flagship..."]
+  classDef shared fill:#cfe8ff,stroke:#1e6091
+  class S1 shared</pre>
+<p>上图里 system prompt + tool 描述（约几百到上千 token）只在 radix tree 上存一份；三个用户查询挂在不同的子节点；search 的结果（Observation）又被两个候选 assistant 答案共享。如果有 1000 个并发用户都共用同一个 system prompt，SGLang 只会为这段 prompt prefill 一次，并把 KV 永久挂在 radix tree 顶部。</p>
+<h3>3.1 分裂与合并</h3>
+<p>当一个新请求与已有节点的 token 序列部分匹配时，radix tree 会把已有节点分裂：前缀部分留在原节点，后缀部分作为子节点；新请求的不匹配部分作为另一个子节点挂上去。这正是 PATRICIA tree 的标准操作。</p>
+<pre class="mermaid">flowchart LR
+  subgraph Before[分裂前]
+    A1["A: 'You are helpful. Answer in JSON.'"]
+  end
+  subgraph After[分裂后]
+    B1["'You are helpful. '"]
+    B1 --> B2["'Answer in JSON.'"]
+    B1 --> B3["'Be concise.'"]
+  end
+  Before -.新请求 'You are helpful. Be concise.'.-> After</pre>
+<h3>3.2 引用计数与驱逐</h3>
+<p>每个 radix tree 节点带引用计数：被某个活跃请求覆盖时计数 +1，请求结束时 -1。计数为 0 的节点进入 LRU 候选；当 KV pool 空间不足时，从叶子开始向上驱逐（叶子节点的 KV 一定不被任何子节点共享）。</p>
+<table>
+<tr><th>维度</th><th>vLLM PagedAttention + Prefix Cache</th><th>SGLang RadixAttention</th></tr>
+<tr><td>共享粒度</td><td>block（默认 16 token）</td><td>token（任意分裂点）</td></tr>
+<tr><td>数据结构</td><td>block table + hash 表</td><td>radix tree（PATRICIA）</td></tr>
+<tr><td>Fork 行为</td><td>拷贝 block table，KV 共享</td><td>树上加边，KV 共享</td></tr>
+<tr><td>共享前缀判定</td><td>hash 相等 + 链式匹配</td><td>沿树走 token 序列</td></tr>
+<tr><td>驱逐策略</td><td>LRU on free blocks</td><td>树叶 LRU + 引用计数</td></tr>
+<tr><td>适合负载</td><td>通用混合流量、prefix 形态多样</td><td>大量请求共享高度结构化 prefix</td></tr>
+<tr><td>内部碎片</td><td>&lt; 1 block</td><td>极低（按需分裂）</td></tr>
+<tr><td>实现复杂度</td><td>低</td><td>中到高</td></tr>
+</table>
+<div class="success"><strong>胜场：</strong>RadixAttention 的最大胜场是 “agent 类工作流，几百到几千请求共享几 KB system prompt + tool 描述”。这种场景下 prefix 命中率可以稳定 &gt; 90%，等效 TTFT 接近零。</div>
+<div class="warn"><strong>反场景：</strong>如果业务流量是“每次请求 prompt 都不同”（比如自由聊天 + 用户上传长文档），RadixAttention 的树结构开销和 vLLM 的 hash 命中率几乎打平，反而 SGLang 的 DSL 编程成本变成纯负担。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. Frontend Language：fork / join / gen / select / structured 调用模型</h2>
+<p>SGLang 的 frontend 是一个嵌入在 Python 里的 DSL。最小的例子：</p>
+<pre><code>import sglang as sgl
+
+@sgl.function
+def multi_turn(s, question):
+    s += sgl.system("You are a helpful assistant.")
+    s += sgl.user(question)
+    s += sgl.assistant(sgl.gen("answer", max_tokens=256))
+
+state = multi_turn.run(question="capital of France?")
+print(state["answer"])</code></pre>
+<p><code>@sgl.function</code> 装饰器并不会真的执行 Python 代码，而是构造一份调度计划。<code>sgl.system / sgl.user / sgl.assistant</code> 是 prompt 角色标记，<code>sgl.gen</code> 表示一个生成节点，<code>sgl.select</code> 表示在受限集合中选择，<code>sgl.fork</code> 表示从当前 prefix 分叉。</p>
+<h3>4.1 Self-consistency / Tree-of-Thought：fork + join</h3>
+<pre><code>@sgl.function
+def self_consistency(s, problem, n_paths=5):
+    s += sgl.system("Solve step by step.")
+    s += sgl.user(problem)
+    forks = s.fork(n_paths)
+    for i, f in enumerate(forks):
+        f += sgl.assistant(sgl.gen(f"path_{i}", max_tokens=512, temperature=0.7))
+    answers = [f["path_" + str(i)] for i, f in enumerate(forks)]
+    s += sgl.user("Pick the most common answer from: " + str(answers))
+    s += sgl.assistant(sgl.gen("final", max_tokens=64, temperature=0))</code></pre>
+<pre class="mermaid">flowchart TB
+  R[system + user prompt<br/>共享 prefix]
+  R --> F1[fork path_0]
+  R --> F2[fork path_1]
+  R --> F3[fork path_2]
+  R --> F4[fork path_3]
+  R --> F5[fork path_4]
+  F1 --> J[join: 收集 5 个 answer]
+  F2 --> J
+  F3 --> J
+  F4 --> J
+  F5 --> J
+  J --> V[vote prompt + final answer]</pre>
+<p>关键观察：5 个分支共享同一个 prefix（system + user prompt + 共享的 step-by-step instruction），后端只 prefill 一次。在 vLLM 上做同样的事，业务通常需要发 5 次请求或自己处理 prefix 缓存对齐——即使开了 prefix caching，仍要跨请求 hash 命中，且 fork 与 join 的语义在 client 侧拼装。</p>
+<h3>4.2 Tool use：把 tool 调用直接写进 DSL</h3>
+<pre><code>@sgl.function
+def agent(s, query, tools):
+    s += sgl.system(f"You are an agent. Tools: {tools}")
+    s += sgl.user(query)
+    for step in range(MAX_STEPS):
+        s += sgl.assistant("Thought: " + sgl.gen("thought", stop="\n"))
+        s += sgl.assistant("Action: " + sgl.select("action", choices=list(tools.keys())))
+        s += sgl.assistant("Args: " + sgl.gen("args", stop="\n", regex=ARGS_REGEX))
+        result = tools[s["action"]](s["args"])
+        s += sgl.user(f"Observation: {result}")
+        if "final answer" in s["thought"].lower():
+            break
+    s += sgl.assistant(sgl.gen("final", max_tokens=256))</code></pre>
+<p>这段程序在 SGLang 后端跑得“快”的几个原因：第一，每一轮 Thought / Action / Observation 都让 prefix 树往下延伸一层，下一次 LLM 调用直接复用所有历史 KV；第二，<code>sgl.select(choices=...)</code> 会被翻译成一个仅允许特定 token 的 logits mask，在受限选择上几乎瞬时返回；第三，整个 agent loop 在 server 端跑（不是客户端循环发请求），网络往返从 N 次降到 1 次，TTFT 不再被网络放大。</p>
+<table>
+<tr><th>DSL 原语</th><th>作用</th><th>后端实现</th><th>vLLM 等价做法</th></tr>
+<tr><td><code>sgl.gen(name, ...)</code></td><td>自由生成</td><td>普通 decode + 收集</td><td>OpenAI completion</td></tr>
+<tr><td><code>sgl.select(name, choices)</code></td><td>受限选择</td><td>logits mask + jump-forward</td><td>client side sample + 验证</td></tr>
+<tr><td><code>sgl.fork(N)</code></td><td>分叉 N 路</td><td>radix tree 加 N 条边</td><td>发 N 次请求 + 自己 hash prefix</td></tr>
+<tr><td><code>sgl.gen(..., regex=R)</code></td><td>正则约束生成</td><td>regex → FSM → mask</td><td>client 重采样直到匹配</td></tr>
+<tr><td><code>sgl.gen(..., schema=S)</code></td><td>JSON schema 约束</td><td>schema → FSM</td><td>第三方库 outlines / guidance</td></tr>
+<tr><td><code>s += sgl.image(img)</code></td><td>多模态 prompt 拼接</td><td>图像 token 展开</td><td>OpenAI vision 接口</td></tr>
+</table>
+<div class="note"><strong>与 LangChain 的关系：</strong>SGLang 的 DSL 不是“另一种 LangChain”。LangChain 是客户端编排框架，最终把 prompt 拼好后发给 LLM；SGLang 把编排下推到了 serving 层，prefix 树和 fork-join 是后端原生概念。两者并不互斥——可以用 LangChain 调用 SGLang server，但要拿到 fork / select 的 token 经济性必须用 SGLang DSL。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. Constrained Decoding：JSON schema、regex、CFG 的 token 级约束</h2>
+<p>结构化生成的需求很常见：JSON 输出、function call 参数、SQL、特定格式日志。最朴素做法是“sample → 解析 → 不合法就重采样”，token 经济极差。SGLang 把 constrained decoding 做成原生设施，分三层。</p>
+<h3>5.1 第一层：FSM 状态压缩</h3>
+<p>把 regex 或 grammar 编译成 FSM。每生成一个 token，FSM 状态前进一步；每一步用当前状态算出“合法 token 集”，作为 <code>-inf</code> mask 加到 logits 上，再 sample。这一层让“输出一定符合 grammar”成为 GPU 内部的事，不再依赖客户端验证。</p>
+<table>
+<tr><th>约束类型</th><th>编译产物</th><th>表达力</th><th>典型用途</th></tr>
+<tr><td><code>choices=[...]</code></td><td>离散 FSM（叶子集合）</td><td>弱</td><td>tool 名、yes/no、枚举</td></tr>
+<tr><td><code>regex=R</code></td><td>NFA → DFA</td><td>中</td><td>数字格式、ID、URL</td></tr>
+<tr><td><code>schema=JSON Schema</code></td><td>schema → grammar → FSM</td><td>强</td><td>function call、API 输出</td></tr>
+<tr><td><code>grammar=CFG</code></td><td>LR / LL parser table</td><td>最强</td><td>SQL、代码、DSL</td></tr>
+</table>
+<p>直接做 FSM 的工程边界是状态爆炸。一个嵌套很深的 JSON schema 可以编译出几百万个状态。SGLang 借鉴了 outlines 等项目的做法，对 FSM 做 lazy expansion + 状态合并，让常见 schema 在毫秒级编译完成。</p>
+<h3>5.2 第二层：Jump-Forward Decoding</h3>
+<p>在 grammar 的某些状态下，<strong>只有一个合法 token</strong>。比如 JSON 中：写完 <code>"name"</code> 之后必须接 <code>:</code>；写完一个 string 必须接 <code>"</code>；写完 <code>{"a": 1</code> 后下一个非空白 token 必须是 <code>,</code> 或 <code>}</code>。这些 token 完全可以不通过模型 forward 就直接拼接到输出里，并把对应位置的 KV 直接从 embedding lookup 算出。</p>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Start
+  Start --> ExpectKey: '{'
+  ExpectKey --> InString: '"' (jump-forward)
+  InString --> KeyDone: 字符串内容（model sample）
+  KeyDone --> ExpectColon: '"'
+  ExpectColon --> ExpectValue: ':' (jump-forward)
+  ExpectValue --> InValue: model sample 第一个非空白 token
+  InValue --> [*]: ...
+  note right of ExpectColon
+    在 ExpectColon 状态下，
+    合法 token 集合大小 = 1，
+    跳过 forward 直接输出 ':'
+  end note</pre>
+<p>收益：对深度嵌套的 JSON，“模板字符”（括号、引号、冒号、逗号）通常占输出 token 的 30%-60%，jump-forward 直接把这部分 decode 步数省掉。SGLang 论文报告对典型 JSON 场景，结构化生成可以比自由生成快 1.5-3x——这违背直觉，因为约束本应“更慢”。</p>
+<h3>5.3 第三层：Speculative + Constrained 配合</h3>
+<p>constrained decoding 也可以与 speculative decoding 叠加：草稿模型预测 k 个 token，目标模型 verify 时同时检查 grammar 合法性，不合法的部分被截断。这一层在 SGLang 里仍在演进，且对 draft model 与目标模型 vocabulary 一致性要求较高。</p>
+<div class="danger"><strong>不是免费精度保证：</strong>constrained decoding 不是“免费的精度保证”。如果 grammar 写得过于严格（比如 enum 漏掉某个合法值），模型会被强制选择次优 token，输出质量反而下降。约束生成上线前，必须用业务真实样本回归测一遍“被强制走的低概率分支”。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Speculative Decoding：与 vLLM 实现路径的对比</h2>
+<p>speculative decoding 的基本机制（draft → verify → accept / reject）在 <a href="../part5/15-batching-scheduling-and-kv-cache.html#s4">第 15 章 §15.9</a> 已经讲过。这里只看 SGLang 与 vLLM 的实现路径差异。</p>
+<table>
+<tr><th>维度</th><th>vLLM</th><th>SGLang</th></tr>
+<tr><td>主流变体</td><td>draft model、Medusa、EAGLE、n-gram</td><td>EAGLE 系列优化最多、Medusa、n-gram</td></tr>
+<tr><td>Draft 与目标共享 KV</td><td>两套 KV，分别管理</td><td>草稿与目标共用 RadixAttention 树</td></tr>
+<tr><td>与 prefix cache 协同</td><td>block 命中后 draft 也可复用</td><td>节点级共享，prefix 命中后 draft 直接走树</td></tr>
+<tr><td>与 constrained decoding 协同</td><td>logits processor 链式</td><td>内置 grammar 验证 in verify</td></tr>
+<tr><td>多分支投机（tree spec）</td><td>实验性</td><td>与 RadixAttention 天然契合</td></tr>
+<tr><td>高并发下表现</td><td>acceptance 下降时容易拖慢</td><td>同上，但因 prefix 共享 verify batch 更经济</td></tr>
+</table>
+<p>SGLang 在 EAGLE-2 / EAGLE-3 等树状投机解码上集成较深：草稿模型一次产生一棵 token 树而不是一条 token 链，目标模型 verify 时一次性吃掉整棵树，accept 落在最长合法路径上。这种“树形 spec”和 RadixAttention 的树形 KV 天然对齐——草稿树的每个节点直接对应 radix tree 的潜在子节点，verify 通过后整棵子树就被“激活”挂入 prefix 树。</p>
+<div class="note"><strong>相对价值：</strong>speculative decoding 对 SGLang 的相对价值反而比 vLLM 略弱。原因是 SGLang 的主要客户场景（agent / structured generation）已经通过 RadixAttention 和 jump-forward 把“重复计算”的部分压得很低，spec 能补的额外空间相对小。但对长输出、低并发的纯文本生成，spec 仍是 SGLang 的标配优化项。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 调度器设计：cache-aware scheduling、longest-shared-prefix-first</h2>
+<p>vLLM 的 scheduler 大致是 FCFS + admission control + preemption。SGLang 的 scheduler 在此之上多了一层：优先调度能复用最长 prefix 的请求。这条策略也叫 longest-shared-prefix-first（LSPF）。</p>
+<pre class="mermaid">flowchart TB
+  Q[Pending requests pool]
+  Q --> Score[对每个请求算 prefix-match length<br/>沿 radix tree 走 token]
+  Score --> Sort[按 match length 降序排]
+  Sort --> Pick[挑选 batch:<br/>prefer 高匹配 + 满足 admission]
+  Pick --> Build[组 batch]
+  Build --> Run[forward step]
+  Run --> Update[更新 radix tree<br/>新 KV 挂上, 完成请求引用计数 -1]
+  Update --> Q</pre>
+<div class="grid-2">
+<div class="card"><strong>LSPF 收益</strong><br>降低 prefill 重复计算；降低 KV pool 压力；提高 prefix-aware routing 收益；让多副本之间形成稳定的 prefix locality。</div>
+<div class="card"><strong>LSPF 风险</strong><br>长 prefix 请求可能饿死短请求；prefix 树偏斜会让热点子树驱逐慢；admission 与 LSPF 的优先级冲突；多租户公平性需要额外 quota。</div>
+</div>
+<table>
+<tr><th>风险</th><th>表现</th><th>对策</th></tr>
+<tr><td>长 prefix 请求饿死短请求</td><td>短 prompt P99 TTFT 抖动</td><td>加 starvation guard，超过阈值强制调度</td></tr>
+<tr><td>Prefix 树偏斜</td><td>单一 system prompt 占 80% 流量，热点子树驱逐慢</td><td>按 prefix 子树大小限流，或 split 副本</td></tr>
+<tr><td>Admission 与 LSPF 冲突</td><td>KV pool 紧张时低匹配请求被 preempt 反复</td><td>按 prefix 匹配长度计算 admission 优先级</td></tr>
+<tr><td>Multi-tenant 公平性</td><td>大客户的 prefix 占满调度位</td><td>按 tenant 加 quota，再在 quota 内做 LSPF</td></tr>
+</table>
+<div class="warn"><strong>不是替代关系：</strong>SGLang 的 LSPF 不是要替代 continuous batching，而是叠加在它之上。每个 decode iteration 仍然重组 batch，只是组 batch 时优先选 prefix 命中长的请求。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 张量并行 / 数据并行：SGLang 的多卡形态与 vLLM 异同</h2>
+<p>SGLang 在多卡形态上沿用业界标准。一个 SGLang 特色：<strong>多副本之间的 prefix-aware 路由是内建的</strong>。Router 看到新请求时，会在所有副本的 radix tree 元数据里查找最长 prefix 匹配，把请求路由到匹配最长的副本，而不是 round-robin。</p>
+<table>
+<tr><th>并行方式</th><th>SGLang 支持</th><th>vLLM 支持</th><th>关键差别</th></tr>
+<tr><td>TP（Tensor Parallel）</td><td>支持，类似 megatron-style</td><td>支持</td><td>实现接近，都依赖 NCCL allreduce</td></tr>
+<tr><td>PP（Pipeline Parallel）</td><td>支持但生态较薄</td><td>支持</td><td>vLLM PP 路径更成熟</td></tr>
+<tr><td>DP（Data Parallel）</td><td>多 server replica + router</td><td>多 engine 实例</td><td>SGLang router 内置 prefix-aware DP</td></tr>
+<tr><td>EP（Expert Parallel，MoE）</td><td>支持 DeepSeek 系等</td><td>支持</td><td>对 DeepSeek MLA / MoE 有专门优化</td></tr>
+<tr><td>Sequence Parallel</td><td>部分支持</td><td>部分支持</td><td>与 ring attention / context parallel 相关</td></tr>
+</table>
+<pre class="mermaid">flowchart LR
+  C[Client] --> RT[Prefix-aware Router<br/>聚合所有副本的 radix tree 摘要]
+  RT --> R1[Replica 1<br/>radix tree 1]
+  RT --> R2[Replica 2<br/>radix tree 2]
+  RT --> R3[Replica 3<br/>radix tree 3]
+  R1 -.tree summary.-> RT
+  R2 -.tree summary.-> RT
+  R3 -.tree summary.-> RT</pre>
+<p>这套路由的工程代价是 router 与 replica 之间需要同步 prefix 摘要（hash + 长度），更新频率和传输量需要权衡。生产实践通常按 1-5 秒一次同步，配合 LRU 摘要做大小控制。</p>
+</section>
+
+<section class="section" id="s9">
+<h2>9. 量化与扩展：FP8、AWQ、GPTQ 集成、自定义 kernel 接入路径</h2>
+<p>SGLang 在量化生态上偏“借力底层后端”。它通过 FlashInfer / FlashAttention / CUTLASS / vendor kernels 接入主流量化方案。</p>
+<table>
+<tr><th>方案</th><th>SGLang 支持成熟度</th><th>主要后端</th><th>备注</th></tr>
+<tr><td>FP8（H100 W8A8）</td><td>高</td><td>Transformer Engine、FlashInfer</td><td>DeepSeek FP8、Llama FP8 都有路径</td></tr>
+<tr><td>AWQ（W4A16）</td><td>高</td><td>AWQ kernel + FlashInfer</td><td>与 vLLM 接近</td></tr>
+<tr><td>GPTQ（W4A16）</td><td>高</td><td>GPTQ kernel</td><td></td></tr>
+<tr><td>INT8 SmoothQuant</td><td>中</td><td>TensorRT INT8 / 自带 kernel</td><td>不是主推路线</td></tr>
+<tr><td>FP8 KV Cache</td><td>高</td><td>FlashInfer FP8 attn</td><td>长上下文场景重点</td></tr>
+<tr><td>INT4 KV Cache</td><td>实验性</td><td>自带 kernel</td><td>长上下文极致压缩</td></tr>
+<tr><td>MLA（DeepSeek）</td><td>高</td><td>专用 attention kernel</td><td>RadixAttention + MLA 是 SGLang 强项</td></tr>
+</table>
+<p>SGLang 对自定义 kernel 的接入路径也比较开放：核心 attention 通过 FlashInfer 后端切换；其他算子可以通过 PyTorch custom op 注入。如果需要把自家硬件 kernel 接入 SGLang，工程量主要在 attention layer 适配（要兼容 RadixAttention 的 KV 索引）和 quant kernel 注册。</p>
+<div class="success"><strong>DeepSeek 强项：</strong>DeepSeek V2/V3 这一类带 MLA + MoE + FP8 的复杂模型，SGLang 的支持节奏通常和 vLLM 接近，部分场景甚至更早。原因是 SGLang 团队与 DeepSeek 等模型团队联系紧密，且 RadixAttention 对 MLA 这种“低维 latent KV”的复用收益更明显。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 与 OpenAI API / function calling / Tool Use 的对接</h2>
+<p>SGLang 同时支持两套 API。很多团队的迁移路径是分三阶段渐进。</p>
+<table>
+<tr><th>接口形态</th><th>用途</th><th>能否拿到 SGLang 的核心收益</th></tr>
+<tr><td>OpenAI 兼容 HTTP（/v1/chat/completions）</td><td>替换 vLLM / OpenAI 的零成本迁移</td><td>部分（被动 prefix 复用）</td></tr>
+<tr><td>OpenAI function calling</td><td>结构化 tool 调用</td><td>部分（schema → grammar）</td></tr>
+<tr><td>SGLang Native HTTP（/generate）</td><td>提交 schedule plan</td><td>完整（fork / select / structured）</td></tr>
+<tr><td>Python SDK（@sgl.function）</td><td>写 DSL 程序</td><td>完整</td></tr>
+</table>
+<div class="grid-3">
+<div class="card"><strong>第一阶段</strong><br>把 vLLM 直接换成 SGLang 的 OpenAI 兼容 server，开 prefix caching，验证基础性能不退步。</div>
+<div class="card"><strong>第二阶段</strong><br>把高 prefix 复用业务（agent、function call、固定 system prompt）改用 SGLang DSL，拿到主要收益。</div>
+<div class="card"><strong>第三阶段</strong><br>评估是否把 constrained decoding、jump-forward、tree spec 等高级特性也开启，并配套监控与回归。</div>
+</div>
+<div class="note"><strong>function calling：</strong>SGLang 的 function calling 实现底层就是 “structured generation + grammar”，所以同一套机制天然兼容 OpenAI / Anthropic / 自定义 schema。这一点比“在客户端循环 sample 直到合法”省 token，也更确定性。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. 性能调优手册：mem-fraction / max-running-requests / tp-size / chunked-prefill-size</h2>
+<p>SGLang 的核心调优参数与 vLLM 类似，但语义略有差别。生产上必须搞清楚这几个参数的物理含义，否则调参会从“系统优化”退化成“撞运气”。</p>
+<table>
+<tr><th>参数</th><th>物理含义</th><th>默认值（参考）</th><th>调高的代价</th><th>调低的代价</th></tr>
+<tr><td><code>--mem-fraction-static</code></td><td>给权重 + KV pool 的显存比例</td><td>0.85-0.90</td><td>OOM 风险、CUDA workspace 不足</td><td>KV pool 变小、admission 更严</td></tr>
+<tr><td><code>--max-running-requests</code></td><td>同时活跃请求上限</td><td>自动</td><td>TPOT 抖动、step 变慢</td><td>吞吐天花板降低</td></tr>
+<tr><td><code>--max-total-tokens</code></td><td>radix tree 总 token 数上限</td><td>自动</td><td>KV pool OOM</td><td>prefix 容量受限</td></tr>
+<tr><td><code>--max-prefill-tokens</code></td><td>单步 prefill token 上限</td><td>16384</td><td>长 prompt 卡住 decode</td><td>TTFT 变慢</td></tr>
+<tr><td><code>--chunked-prefill-size</code></td><td>prefill 切片大小</td><td>8192 / 0=关</td><td>调度 overhead 变高</td><td>长 prompt 拖累 ITL</td></tr>
+<tr><td><code>--schedule-policy</code></td><td>调度策略</td><td><code>lpm</code>（longest prefix match）</td><td>starvation 风险</td><td>prefix 命中率下降</td></tr>
+<tr><td><code>--tp-size</code></td><td>tensor parallel 度</td><td>1</td><td>通信开销</td><td>单卡显存压力</td></tr>
+<tr><td><code>--dp-size</code></td><td>数据并行副本数</td><td>1</td><td>内存重复</td><td>吞吐天花板低</td></tr>
+<tr><td><code>--enable-torch-compile</code></td><td>是否开 torch.compile</td><td>False（视版本）</td><td>首次 forward 慢</td><td>失去 kernel 融合收益</td></tr>
+<tr><td><code>--quantization</code></td><td>量化方案</td><td>None</td><td>质量回退</td><td>显存与吞吐打不上去</td></tr>
+<tr><td><code>--kv-cache-dtype</code></td><td>KV Cache 精度</td><td>auto / fp8</td><td>长上下文质量风险</td><td>长上下文容量受限</td></tr>
+</table>
+<h3>11.1 调参决策表</h3>
+<table>
+<tr><th>现象</th><th>优先看的参数</th><th>调整方向</th></tr>
+<tr><td>OOM at startup</td><td><code>mem-fraction-static</code>, <code>max-total-tokens</code></td><td>调小</td></tr>
+<tr><td>TTFT 高、prefix 命中率低</td><td><code>schedule-policy</code>, prefix-aware router</td><td>切到 LPM、确认 router 配置</td></tr>
+<tr><td>TPOT 抖动、ITL 不稳</td><td><code>max-running-requests</code>, <code>chunked-prefill-size</code></td><td>降低 running requests、开 chunked prefill</td></tr>
+<tr><td>长 prompt 拖累 decode</td><td><code>chunked-prefill-size</code>, <code>max-prefill-tokens</code></td><td>开 chunked、调低 prefill token 上限</td></tr>
+<tr><td>长上下文 KV 不够</td><td><code>kv-cache-dtype</code>, <code>tp-size</code></td><td>切 fp8 KV、增加 TP</td></tr>
+<tr><td>多副本但 cache hit 低</td><td>router prefix-aware 是否开启</td><td>切 prefix-aware DP</td></tr>
+<tr><td>吞吐天花板低</td><td><code>max-running-requests</code>, <code>tp-size</code>, <code>dp-size</code></td><td>综合扩</td></tr>
+<tr><td>结构化输出慢</td><td>jump-forward 是否开</td><td>确认 constrained decoding 走 grammar 路径</td></tr>
+</table>
+<div class="danger"><strong>调参纪律：</strong>与 vLLM 一样，一次只动一个参数。SGLang 的参数耦合度比 vLLM 还高（因为 RadixAttention 和 schedule policy 互相影响），同时改两个参数往往让 A/B 失去因果关系。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 何时选 SGLang vs vLLM vs TRT-LLM</h2>
+<p>这一节不重复 <a href="../part5/16-quantization-compilation-and-engines.html">第 16 章</a> 的整体引擎对比，而是聚焦在“什么场景应当走 SGLang”。</p>
+<table>
+<tr><th>场景</th><th>首选</th><th>备选</th><th>关键判断</th></tr>
+<tr><td>通用聊天 / 低复杂度 OpenAI 兼容</td><td>vLLM</td><td>SGLang（OpenAI 兼容 mode）</td><td>流量是否高度共享 prefix</td></tr>
+<tr><td>Agent / Tool Use / 多轮编排</td><td>SGLang</td><td>vLLM + 客户端编排</td><td>DSL 收益是否能落地</td></tr>
+<tr><td>Structured Generation / JSON / Function Call</td><td>SGLang</td><td>vLLM + outlines</td><td>jump-forward 是否能用上</td></tr>
+<tr><td>极致单位 token 成本 / 固定 NVIDIA 集群</td><td>TRT-LLM</td><td>vLLM</td><td>能否承担 engine artifact 治理</td></tr>
+<tr><td>超低延迟（小模型 / 短输出）</td><td>vLLM / TRT-LLM</td><td>SGLang</td><td>TTFT 主导还是吞吐主导</td></tr>
+<tr><td>企业大规模混合部署</td><td>vLLM 默认 + SGLang 子集</td><td>TRT-LLM</td><td>平台是否能维护两套引擎</td></tr>
+<tr><td>CPU 推理 / 边缘</td><td>llama.cpp</td><td>ONNX Runtime</td><td>都不是 SGLang 的目标场景</td></tr>
+<tr><td>Long context（128K+）</td><td>vLLM / SGLang（视模型）</td><td>TRT-LLM</td><td>看 KV Cache 量化和 attention kernel</td></tr>
+<tr><td>Self-Consistency / Tree-of-Thought / Voting</td><td>SGLang</td><td>自写 client</td><td>fork / join 是否能复用</td></tr>
+<tr><td>DeepSeek V2/V3 / MLA / MoE</td><td>SGLang</td><td>vLLM</td><td>RadixAttention + MLA 强项</td></tr>
+</table>
+<pre class="mermaid">flowchart TD
+  A[开始: 先看流量类型] --> B{是否大量请求共享几 KB+ system prompt / tool 描述?}
+  B -->|是| C{是否需要 fork / structured / agent 编排?}
+  B -->|否| D{是否需要超低延迟通用聊天?}
+  C -->|是| E[SGLang DSL: 拿到完整收益]
+  C -->|否| F[SGLang OpenAI 兼容: 拿到部分 prefix 收益]
+  D -->|是| G[vLLM: 通用基线]
+  D -->|否| H{是否固定 NVIDIA 集群且追求极致单位成本?}
+  H -->|是| I[TRT-LLM: 编译制品]
+  H -->|否| J{目标环境?}
+  J -->|GPU 通用| G
+  J -->|CPU/边缘| K[llama.cpp]
+  E --> L{多副本部署?}
+  L -->|是| M[启用 prefix-aware router]
+  L -->|否| N[单副本即可]
+  I --> P{shape contract 能治理?}
+  P -->|否| G
+  P -->|是| Q[进入压测]</pre>
+<div class="note"><strong>稳健路径：</strong>以上决策树不是绝对的。一个常见的稳健路径是“vLLM 做基线 + 对高 prefix 复用业务单独跑 SGLang 实例”，让两条路线并存几个月，再根据实际数据收敛。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. Worked Example：用 SGLang 实现 Agent + Tool Use 服务，对比朴素 vLLM 多次请求</h2>
+<p>设定如下：</p>
+<table>
+<tr><th>项</th><th>取值</th></tr>
+<tr><td>模型</td><td>Llama-3-70B-Instruct（FP8）</td></tr>
+<tr><td>硬件</td><td>1 副本 = 4 x H100 80GB，TP=4</td></tr>
+<tr><td>Agent 流程</td><td>ReAct 风格：Thought → Action → Observation → ... → Final</td></tr>
+<tr><td>平均轮数</td><td>4 轮 tool 调用 + 1 轮 final answer</td></tr>
+<tr><td>System prompt</td><td>1500 token（包含 tool 描述）</td></tr>
+<tr><td>用户 query</td><td>平均 200 token</td></tr>
+<tr><td>每轮 Thought</td><td>平均 80 token</td></tr>
+<tr><td>每轮 Observation</td><td>平均 300 token</td></tr>
+<tr><td>Final answer</td><td>平均 250 token</td></tr>
+<tr><td>并发</td><td>100 并发 agent 会话</td></tr>
+</table>
+<h3>13.1 朴素 vLLM 多次请求方案</h3>
+<p>业务在客户端实现 agent loop。每一轮把“完整对话历史”重新拼成 prompt，发到 vLLM。第 N 轮的 prompt 长度约为 <code>1500 + 200 + N × (80 + 30 + 300)</code>。</p>
+<table>
+<tr><th>轮次</th><th>Prompt 长度（token）</th><th>输出（token）</th><th>Prefill 是否复用</th></tr>
+<tr><td>1</td><td>1700</td><td>110</td><td>仅 system prompt 复用（1500）</td></tr>
+<tr><td>2</td><td>2110</td><td>110</td><td>复用前 1810</td></tr>
+<tr><td>3</td><td>2520</td><td>110</td><td>复用前 2220</td></tr>
+<tr><td>4</td><td>2930</td><td>110</td><td>复用前 2630</td></tr>
+<tr><td>5 (final)</td><td>3340</td><td>250</td><td>复用前 3040</td></tr>
+</table>
+<p>vLLM 的 prefix cache 默认按 16 token block 命中。理想情况下复用率高，但实际：客户端拼接 prompt 时如果有任何不一致（time stamp、随机序）block hash 就会失效；客户端发 5 次请求每次都付一次 HTTP / TLS / queue 开销；agent 会话间客户端无法共享 prefix（除非自己实现 router）。</p>
+<h3>13.2 SGLang DSL 方案</h3>
+<pre><code>@sgl.function
+def react_agent(s, query, tools):
+    s += sgl.system(SYSTEM_PROMPT_WITH_TOOLS)
+    s += sgl.user(query)
+    for step in range(MAX_STEPS):
+        s += sgl.assistant("Thought: " + sgl.gen("thought", stop="\n"))
+        s += sgl.assistant("Action: " + sgl.select("act", choices=TOOL_NAMES))
+        s += sgl.assistant("Args: " + sgl.gen("args", regex=ARG_RE, stop="\n"))
+        if "FINISH" in s["thought"]:
+            break
+        result = tools[s["act"]](s["args"])
+        s += sgl.user(f"Observation: {result}")
+    s += sgl.assistant("Final: " + sgl.gen("final", max_tokens=300))</code></pre>
+<p>后端执行：system prompt（1500 token）只 prefill 一次，挂在 radix tree 顶部，100 并发会话共享；每轮 Thought / Action / Observation 在 radix tree 上自然延伸，下一轮直接复用；<code>sgl.select(choices=TOOL_NAMES)</code> 对 action 部分用 jump-forward / mask，平均仅消耗 1-2 个 forward；<code>regex=ARG_RE</code> 对 args 做 grammar 约束，jump-forward 跳过模板字符；整个 agent loop 在 server 端跑，客户端只发 1 次请求。</p>
+<h3>13.3 对比表</h3>
+<table>
+<tr><th>指标</th><th>朴素 vLLM 多次请求</th><th>SGLang Native</th><th>收益</th></tr>
+<tr><td>单会话 prefill token 数（含重复）</td><td>1700 + 2110 + 2520 + 2930 + 3340 = 12600</td><td>1500（system）+ ~1500（增量）= ~3000</td><td>-76%</td></tr>
+<tr><td>Prefix 复用率</td><td>~70%（按 block hash 估）</td><td>~92%（token 级 + tree 共享）</td><td>+22pp</td></tr>
+<tr><td>客户端 → server HTTP 往返</td><td>5</td><td>1</td><td>-80%</td></tr>
+<tr><td>单会话端到端 TTFT（首 token）</td><td>350 ms</td><td>120 ms</td><td>-66%</td></tr>
+<tr><td>单会话端到端总耗时</td><td>8.5 s</td><td>4.2 s</td><td>-50%</td></tr>
+<tr><td>单副本支持的并发会话数（保持 TPOT &lt; 50ms）</td><td>~80</td><td>~150</td><td>+88%</td></tr>
+<tr><td>集群 QPS（按 100 并发会话需要的副本）</td><td>~1.25 副本 / 100 会话</td><td>~0.67 副本 / 100 会话</td><td>-46%</td></tr>
+<tr><td>结构化 action 失败重试率</td><td>4-8%（客户端重采样）</td><td>0%（grammar 强制）</td><td>-100%</td></tr>
+</table>
+<div class="success"><strong>主要收益来源：</strong>这个例子里 SGLang 的主要收益不在“单 forward 更快”，而在“少做了大量 prefill + 客户端往返 + 重采样”。当业务程序的 prefix 复用机会越多、tool 调用越复杂、结构化要求越严，SGLang 的相对收益越高。</div>
+<div class="warn"><strong>Demo 数字 ≠ 上线数字：</strong>以上数字是基于 RadixAttention + jump-forward 充分发挥的理想情况。如果业务方写的 DSL 不让 prefix 真正共享（比如 system prompt 里塞了请求 ID 这种“看似常量但每次都变”的字段），收益会迅速归零。上线前必须用真实流量测 prefix 命中率，不能只看 demo 数字。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 练习</h2>
+<h3>基础题</h3>
+<ol>
+<li><strong>16b-1（基础）</strong>：用一段话解释 RadixAttention 与 vLLM 的 hash-based prefix caching 在共享粒度上的本质区别。</li>
+<li><strong>16b-2（基础）</strong>：SGLang frontend language 的 <code>fork(N)</code> 在后端做了什么？如果用 vLLM 实现等价语义，业务侧需要写哪些代码？</li>
+<li><strong>16b-3（基础）</strong>：什么是 jump-forward decoding？为什么它能让结构化生成比自由生成更快？</li>
+<li><strong>16b-4（基础）</strong>：解释 <code>--mem-fraction-static</code>、<code>--max-running-requests</code>、<code>--chunked-prefill-size</code> 三个参数的物理含义。</li>
+</ol>
+<h3>进阶题</h3>
+<ol start="5">
+<li><strong>16b-5（进阶）</strong>：用 §13 的方法估算另一个场景：模型 Llama-3-8B、并发 200 会话、每个会话 6 轮 tool 调用，system prompt 800 token。对比 vLLM 与 SGLang 的 prefill token、TTFT 和单副本承载。</li>
+<li><strong>16b-6（进阶）</strong>：你的 SGLang 服务上线后发现 prefix 命中率只有 30%，远低于预期。列出至少 5 个可能原因和排查顺序。</li>
+<li><strong>16b-7（进阶）</strong>：为什么 longest-shared-prefix-first 调度策略可能让短 prompt 请求 P99 TTFT 抖动？设计一个 starvation guard。</li>
+<li><strong>16b-8（进阶）</strong>：解释为什么 RadixAttention + MLA（DeepSeek V2/V3）的组合在长上下文 + 高并发场景下比 PagedAttention + MHA 收益更大。</li>
+</ol>
+<h3>设计题</h3>
+<ol start="9">
+<li><strong>16b-9（设计）</strong>：你要为一个 agent 平台（每个租户有自己的 system prompt + tool 集，租户数 500，单租户并发 10-50）做引擎选型。给出 vLLM / SGLang / 混合部署三套方案的对比，包括副本组织、路由、监控指标。</li>
+<li><strong>16b-10（设计）</strong>：基于本章 §5，设计一个把“OpenAPI 3.0 schema → SGLang grammar”的转换器骨架，并讨论哪些 OpenAPI 特性必须舍弃才能编译成可用 FSM。</li>
+<li><strong>16b-11（设计）</strong>：你的团队现在用 vLLM + LangChain 跑 agent 服务。给出一个三阶段迁移到 SGLang 的计划，每阶段的目标、风险、回滚策略。</li>
+<li><strong>16b-12（设计）</strong>：从 SGLang 的 RadixAttention 出发，思考如果要支持“多机 KV 共享”（比如 100 副本共享同一个超大 system prompt 的 KV），需要新增哪些机制？工程边界是什么？</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>参考资料</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用 §1-§3 建立 RadixAttention 的核心模型，理解它和 vLLM PagedAttention 的本质差别。</li>
+<li>再用 §4-§5 学会 frontend DSL 与 constrained decoding，能写出 fork / select / structured 程序。</li>
+<li>用 §7-§8 理解 cache-aware scheduling 和 prefix-aware DP 路由，把 prefix 共享扩展到多副本。</li>
+<li>用 §11 的参数手册做一次实际调参练习，先开 prefix cache 再调数值参数。</li>
+<li>用 §13 的 worked example 做一次自家业务的对比测算，明确 SGLang 的相对收益。</li>
+<li>结合 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a>、<a href="../part5/16-quantization-compilation-and-engines.html">第 16 章</a> 与 16a vLLM 内部机制做端到端选型。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Zheng, Lianmin et al. <em>SGLang: Efficient Execution of Structured Language Model Programs.</em></li>
+<li>Kwon, Woosuk et al. <em>Efficient Memory Management for LLM Serving with PagedAttention.</em></li>
+<li>Willard, Brandon T. et al. <em>Efficient Guided Generation for Large Language Models.</em>（Outlines / FSM-based constrained decoding）</li>
+<li>Li, Yuhong et al. <em>EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty.</em></li>
+<li>Cai, Tianle et al. <em>Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.</em></li>
+<li>DeepSeek-V2 / V3 技术报告（MLA 架构与 SGLang 集成路径）</li>
+<li><code>github.com/sgl-project/sglang</code> 主仓库：<code>python/sglang/srt/mem_cache</code>（RadixAttention）、<code>scheduler.py</code>、<code>constrained/</code>、<code>speculative/</code></li>
+<li><code>github.com/flashinfer-ai/flashinfer</code> SGLang 默认 attention 后端</li>
+<li><code>github.com/outlines-dev/outlines</code> 约束生成生态参照</li>
+<li><code>github.com/vllm-project/vllm</code> vLLM v1 scheduler / PagedAttention 实现，可对照阅读</li>
+<li>SGLang 官方文档（<code>docs.sglang.ai</code>）</li>
+<li>LMSYS 系列 blog：SGLang 在 Chatbot Arena、function calling benchmark 上的真实数据</li>
+</ul>
+<h3>关联章节</h3>
+<ul>
+<li><a href="../part5/14-online-inference-architecture.html">第 14 章 在线推理架构</a>：路由、副本与流量治理。</li>
+<li><a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章 批处理、调度与 KV Cache</a>：本章 RadixAttention / cache-aware scheduling 的基础概念。</li>
+<li><a href="../part5/16-quantization-compilation-and-engines.html">第 16 章 量化、编译与推理引擎</a>：SGLang 在引擎选型矩阵中的位置。</li>
+<li><a href="16a-vllm-internals.html">16a vLLM 内部机制</a>（姊妹章节）：另一条主流路线的内部细节。</li>
+<li><a href="../part5/17-multitenancy-and-cost.html">第 17 章 多租户与成本治理</a>：把 SGLang 的 prefix-aware 能力下放到 tenant 维度。</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

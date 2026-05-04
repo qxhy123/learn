@@ -74,13 +74,53 @@ const TUTORIAL = [
       },
       {
         "id": "0c",
-        "title": "第 0c 章 · 文件系统与存储内核",
+        "title": "第 0c 章 · 文件系统与存储内核导览",
         "path": "part0/0c-filesystems-and-storage-internals.html"
       },
       {
+        "id": "0c1",
+        "title": "第 0c1 章 · VFS、inode/dentry 与 Block Layer",
+        "path": "part0/0c1-vfs-inode-dentry-and-block-layer.html"
+      },
+      {
+        "id": "0c2",
+        "title": "第 0c2 章 · ext4、XFS、ZFS 与本地文件系统选择",
+        "path": "part0/0c2-local-filesystems-ext4-xfs-zfs.html"
+      },
+      {
+        "id": "0c3",
+        "title": "第 0c3 章 · fsync、Direct IO 与 Checkpoint 语义",
+        "path": "part0/0c3-storage-semantics-fsync-direct-io-and-checkpoints.html"
+      },
+      {
+        "id": "0c4",
+        "title": "第 0c4 章 · 对象存储、并行文件系统与 Dataset IO",
+        "path": "part0/0c4-object-storage-parallel-filesystems-and-dataset-io.html"
+      },
+      {
         "id": "0d",
-        "title": "第 0d 章 · 网络协议栈基础",
+        "title": "第 0d 章 · 网络协议栈基础导览",
         "path": "part0/0d-network-stack-fundamentals.html"
+      },
+      {
+        "id": "0d1",
+        "title": "第 0d1 章 · Linux 网络栈、TCP 与 MTU",
+        "path": "part0/0d1-linux-network-stack-tcp-and-mtu.html"
+      },
+      {
+        "id": "0d2",
+        "title": "第 0d2 章 · NIC Offload、队列与服务网络 IO",
+        "path": "part0/0d2-nic-offload-queues-and-service-network-io.html"
+      },
+      {
+        "id": "0d3",
+        "title": "第 0d3 章 · RDMA、RoCE/IB 与 GPUDirect",
+        "path": "part0/0d3-rdma-roce-infiniband-and-gpudirect.html"
+      },
+      {
+        "id": "0d4",
+        "title": "第 0d4 章 · NCCL Collective 与网络诊断",
+        "path": "part0/0d4-nccl-collectives-and-network-diagnostics.html"
       }
     ]
   },
@@ -256,6 +296,16 @@ const TUTORIAL = [
         "id": "16",
         "title": "第 16 章 · 量化、编译与推理引擎",
         "path": "part5/16-quantization-compilation-and-engines.html"
+      },
+      {
+        "id": "16a",
+        "title": "第 16a 章 · vLLM 内部机制深入",
+        "path": "part5/16a-vllm-internals.html"
+      },
+      {
+        "id": "16b",
+        "title": "第 16b 章 · SGLang 内部机制深入",
+        "path": "part5/16b-sglang-internals.html"
       },
       {
         "id": "17",

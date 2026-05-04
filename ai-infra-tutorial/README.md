@@ -125,6 +125,8 @@
 | 第14章 | [在线推理架构](./part5-serving-infra/14-online-inference-architecture.md) | 网关、路由、服务、模型副本、推理控制面与数据面拆解 | 线上推理主链路 |
 | 第15章 | [批处理、调度与 KV Cache](./part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | Dynamic Batching、Prefill/Decode、PagedAttention、70B 容量规划 Worked Example、PD 分离、Speculative Decoding、ITL | 提升吞吐与稳定性 |
 | 第16章 | [量化、编译与推理引擎](./part5-serving-infra/16-quantization-compilation-and-engines.md) | TRT-LLM、vLLM、SGLang、ONNX Runtime、量化/引擎选型决策树与校准 | 降低延迟与成本 |
+| 第16a章 | [vLLM 内部机制深入](./part5-serving-infra/16a-vllm-internals.md) | Engine/Scheduler/Worker/Block Manager、PagedAttention 实现、Continuous Batching 调度循环、Prefix Caching、Chunked Prefill、Speculative、TP/PP/EP、Multi-LoRA、量化集成、V1 重构、调优手册 | vLLM 工程师视角 |
+| 第16b章 | [SGLang 内部机制深入](./part5-serving-infra/16b-sglang-internals.md) | Frontend Language、RadixAttention 实现、Constrained Decoding、Speculative、Cache-aware 调度、与 vLLM/TRT-LLM 选型决策、Agent + Tool Use Worked Example | 复杂结构化 / Agent serving |
 | 第17章 | [多租户与成本治理](./part5-serving-infra/17-multitenancy-and-cost.md) | 配额、SLA、冷热分层、Cloud vs On-Prem TCO、Spot、MFU vs Utilization、Chargeback | 服务化经营能力 |
 
 ### 第六部分：平台与编排
