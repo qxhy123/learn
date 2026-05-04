@@ -197,6 +197,21 @@
 
 ---
 
+## J. 跨章节工程契约
+
+| 术语 | 简要解释 |
+|------|----------|
+| EvidenceBundle | 一次诊断或发布判断所需的最小证据包，包含 symptom、scope、workload、version、evidence、hypothesis、action、retest 和 rollback。 |
+| CapacityLedger | 跨训练、推理、RAG、平台和成本治理复用的容量账本，记录 workload shape、硬件、利用率、goodput、存储、网络、缓存、队列、成本和 headroom。 |
+| ReleaseUnit | 一次可审计发布的最小单元，绑定模型、tokenizer、prompt、adapter、engine、image、router、index、cache、eval gate 和 rollback target。 |
+| StateManifest | 描述数据集、checkpoint、模型版本、索引、缓存或 agent session 的状态清单，至少包含 immutable id、alias、lineage、schema version、owner、status、timestamp 和 validation result。 |
+| RestoreLevel | 描述恢复语义的等级，包括 true resume、same-shape restore、reshard restore、model-only warm start、serving conversion 和 rollback。 |
+| CacheKeyContract | 缓存复用必须满足的键空间约束，至少绑定 tenant、ACL/auth scope、model/version、prompt/template、index、tool schema、adapter/base 和 runtime 口径。 |
+| TenantBudget | 租户级预算与降级策略对象，记录 token、GPU-second、cache、warm pool、storage、egress、queue priority 和 soft landing 动作。 |
+| BenchmarkProtocol | 性能数字的复现协议，记录 hardware、software version、model、input distribution、warmup、cache state、command、metric definition、confidence window 和 counterfactual。 |
+
+---
+
 ## 使用建议
 
 阅读正文时，如果遇到术语含义不清，优先回到本表查找大致定义；如果需要更深入理解，再回到对应章节阅读上下文。建议按章节涉及的子领域定位到对应分组（A–I），而不是全表线性查找。

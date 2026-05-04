@@ -1,5 +1,18 @@
 # 附录C：上线与排障检查清单
 
+## 通用证据字段
+
+任何上线、排障、容量、发布或安全检查项都应尽量落到以下字段，而不是只回答"是否完成"：
+
+| 字段 | 必填性 | 示例 |
+|------|--------|------|
+| owner | 必填 | training-platform、serving-sre、security-reviewer |
+| phase | 必填 | preflight、canary、production、incident、rollback |
+| evidence | 必填 | dashboard link、manifest id、command output、audit event |
+| threshold | 条件必填 | P99 < 200ms、GPU ECC error = 0、Recall@10 >= 0.92 |
+| action | 必填 | proceed、block、rollback、degrade、page owner |
+| retest | 条件必填 | rerun benchmark、replay golden queries、restart canary window |
+
 ## 训练任务上线前检查
 
 - 数据快照是否固定，是否可回溯
@@ -8,6 +21,7 @@
 - Checkpoint 保存频率是否与恢复目标一致
 - 指标、日志、告警是否已接入
 - 失败重试策略是否会导致重复写入或资源泄漏
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 大规模训练作业预检清单
 
@@ -18,6 +32,7 @@
 - Checkpoint 写入路径是否可用、空间是否充足
 - Elastic training 的 rendezvous 配置是否正确
 - 慢节点检测和自动替换机制是否就绪
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 推理服务上线前检查
 
@@ -28,6 +43,7 @@
 - 批处理、缓存、并发策略是否验证过
 - 是否有金丝雀、灰度、回滚路径
 - 是否有业务质量监控，而不只是系统指标
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## Agent / Tool Use 上线前检查
 
@@ -38,6 +54,7 @@
 - 有副作用动作是否具备 approval gate 或人工接管路径
 - step trace、工具调用日志、失败原因是否可审计
 - 超预算后的回退路径是否验证过
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 成本与治理检查
 
@@ -46,6 +63,7 @@
 - 长时间空闲实例是否有回收策略
 - 敏感数据与模型权重是否做权限隔离
 - 是否记录了关键运维与发布操作的审计日志
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 安全上线检查清单
 
@@ -57,6 +75,7 @@
 - 日志、trace、错误返回里是否避免输出敏感数据
 - 模型、索引、prompt 和配置是否都具备版本与责任归属
 - 回滚路径是否同样满足权限和安全规则
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 性能压测检查清单
 
@@ -66,6 +85,7 @@
 - 压测期间是否出现 OOM、CUDA error 或 GPU reset
 - 冷启动、预热和扩缩容过程是否单独测过
 - 连续运行 30 分钟以上后指标是否仍然稳定
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## CPU 性能排查清单
 
@@ -79,6 +99,7 @@
 - 是否检查 NUMA locality：CPU core、内存、GPU、NIC 是否在同一 socket 或合理拓扑下
 - 是否把 page fault、TLB miss、THP/HugeTLB 状态纳入大内存任务排查
 - 是否记录优化前后的固定输入、固定线程数、固定 CPU 频率和可复现实验命令
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 文件系统选型清单
 
@@ -92,6 +113,7 @@
 - 是否用 `fio`、`ior`、`mdtest`、真实 shard 读取和真实 checkpoint 写入分别验收
 - 是否为 checkpoint 发布设计临时文件、完整性校验、manifest 原子切换和失败清理
 - 是否规划冷热分层：本地 NVMe / 并行 FS / 对象存储之间的数据生命周期和回收策略
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 网络配置健康检查清单
 
@@ -105,6 +127,7 @@
 - NCCL 日志是否显示使用预期的 IB/RDMA path，而不是 fallback 到 socket
 - TCP control plane 是否检查重传、SYN backlog、连接数、epoll/io_uring 事件循环延迟
 - 是否有链路故障、交换机拥塞、ECN 标记、PFC pause、NCCL hang 的统一告警和 runbook
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## Mermaid / 文档构建检查清单
 
@@ -114,6 +137,7 @@
 - 离线 mermaid bundle 是否随 HTML 站点一起分发，避免生产浏览依赖外网 CDN
 - 构建脚本是否能在 mermaid 渲染失败时给出文件名和代码块位置
 - 修改章节顺序后，sidebar、prev/next、附录链接是否同步
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ## 常见排障入口
 
@@ -122,15 +146,18 @@
 - 先看 GPU 利用率，再看数据加载与网络等待
 - 区分是单机瓶颈还是分布式通信瓶颈
 - 先定位瓶颈层，再决定是否需要优化代码
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ### 推理延迟飙升
 
 - 看请求量变化、批处理策略和缓存命中率
 - 看是否发生频繁扩缩容或模型重新加载
 - 看下游依赖是否拖慢整个链路
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
 
 ### 成本异常升高
 
 - 看是否存在资源闲置、过度副本、错误实例规格
 - 看是否缺少配额与自动回收
 - 看是否把离线任务错误地放到高价在线集群
+- 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
