@@ -2,7 +2,7 @@
 
 > 训练出的模型权重只是字节流；只有当这些字节被平台登记、版本化、状态化、血缘化、可分发、可回滚，服务才能找到它、信任它、治理它。Model Registry 不是 MLflow 的一个 Tab，而是 AI Infra 的控制平面核心。
 
-> **关联章节**：本章与 [第 12 章](./12-artifacts-and-checkpoints.md) 的 checkpoint / 制品体系直接衔接；与 [第 10b 章 RLHF 多模型](../part3-training-infra/10b-rlhf.md)、[第 10c 章 Multi-LoRA](../part3-training-infra/10c-multi-lora.md)、[第 16a 章 vLLM Multi-LoRA serving](../part6-inference-and-serving/16a-vllm-multi-lora.md) 形成完整的"训练 → 注册 → 服务"闭环。
+> **关联章节**：本章与 [第 12 章](./12-artifacts-and-checkpoints.md) 的 checkpoint / 制品体系直接衔接；与 [第 10b 章 RLHF 多模型](../part3-training-infra/10b-rlhf.md)、[第 10c 章 Multi-LoRA](../part3-training-infra/10c-multi-lora.md)、[第 16a 章 vLLM Multi-LoRA serving](../part5-serving-infra/16a-vllm-internals.md) 形成完整的"训练 → 注册 → 服务"闭环。
 
 ---
 
@@ -292,6 +292,8 @@ stateDiagram-v2
 
 ## 12a.5 主流 Registry 对比
 
+> **版本口径（2026-05）**：下表是工程选型口径，不是长期有效的产品排名。托管服务 API、LoRA 支持、企业审计、on-prem 能力和价格会变化；落地前需要按当前版本重新核对官方文档，并把核对日期写入 `BenchmarkProtocol` 或发布决策记录。
+
 | Registry | 定位 | 优势 | 劣势 | 大模型（100GB+）支持 | LoRA 支持 | 自建友好度 |
 |----------|------|------|------|---------------------|-----------|------------|
 | **MLflow Model Registry** | 开源，实验 + 模型管理一体 | 轻量，易集成 CI/CD，API 简单 | 分发能力弱，无 CDN，Stage 概念简化 | 勉强（需自配 S3 backend）| 无原生支持 | 高 |
@@ -473,7 +475,7 @@ flowchart TD
     Check4 -- 是 --> OK["注册成功，stage=staging"]
 ```
 
-> **vLLM Multi-LoRA 集成**：vLLM 的 Multi-LoRA serving（见 [第 16a 章](../part6-inference-and-serving/16a-vllm-multi-lora.md)）在加载 adapter 时从 Registry 获取 `base_model_name` 和 adapter 的 `storage_uri`，自动选择已加载的 base model 引擎实例，无需用户手动指定 base model 路径。
+> **vLLM Multi-LoRA 集成**：vLLM 的 Multi-LoRA serving（见 [第 16a 章](../part5-serving-infra/16a-vllm-internals.md)）在加载 adapter 时从 Registry 获取 `base_model_name` 和 adapter 的 `storage_uri`，自动选择已加载的 base model 引擎实例，无需用户手动指定 base model 路径。
 
 ---
 
@@ -776,7 +778,7 @@ async def load_lora_adapter(adapter_model_name: str, alias: str = "production"):
     engine.load_lora(adapter_path, base_name)
 ```
 
-> **vLLM Multi-LoRA 场景**：单 vLLM 引擎可同时服务一个 base model 和多个 LoRA adapter。Registry 的 Alias API 统一管理所有 adapter 的当前 production 版本，vLLM 只需在请求时指定 `lora_name`，Registry-aware loader 负责版本解析和缓存管理。详见 [第 16a 章](../part6-inference-and-serving/16a-vllm-multi-lora.md)。
+> **vLLM Multi-LoRA 场景**：单 vLLM 引擎可同时服务一个 base model 和多个 LoRA adapter。Registry 的 Alias API 统一管理所有 adapter 的当前 production 版本，vLLM 只需在请求时指定 `lora_name`，Registry-aware loader 负责版本解析和缓存管理。详见 [第 16a 章](../part5-serving-infra/16a-vllm-internals.md)。
 
 ---
 

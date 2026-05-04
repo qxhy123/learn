@@ -164,6 +164,8 @@ flowchart TD
 
 ### 12d.3.1 主流签名工具对比
 
+> **版本口径（2026-05）**：Sigstore/cosign、Rekor、SLSA、GitHub attestation、Kyverno、OPA Gatekeeper、Trivy 和 HuggingFace Hub 的能力会随版本变化。本文示例用于说明工程机制，生产落地前必须记录工具版本、策略版本、验证命令和失败处理策略。
+
 | 工具 | 设计目标 | 密钥管理 | 透明日志 | AI 制品适用性 |
 |---|---|---|---|---|
 | GPG | 通用文件/代码签名 | 长期私钥，Web of Trust | 无 | 低：密钥分发复杂，无自动化集成 |

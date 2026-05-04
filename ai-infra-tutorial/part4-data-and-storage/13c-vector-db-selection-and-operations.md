@@ -2,7 +2,7 @@
 
 > 向量数据库已经是 RAG 系统、推荐召回、语义搜索的核心基础设施。选错或运维失当，业务停摆的速度比关系型数据库快得多，因为没有任何应用层降级能替代向量召回。
 
-> **关联章节**：本章的分布式架构和 SLA 设计与 [第16a章 vLLM 推理](../part5-serving-infra/16a-vllm-inference.md) 和 [第16b章 SGLang](../part5-serving-infra/16b-sglang.md) 协同；向量库的 ACL 与多租户问题与 [第23章安全治理](../part7-reliability-security/23-security-isolation-and-governance.md) 直接相关。
+> **关联章节**：本章的分布式架构和 SLA 设计与 [第16a章 vLLM 推理](../part5-serving-infra/16a-vllm-internals.md) 和 [第16b章 SGLang](../part5-serving-infra/16b-sglang-internals.md) 协同；向量库的 ACL 与多租户问题与 [第23章安全治理](../part7-reliability-security/23-security-isolation-and-governance.md) 直接相关。
 
 ---
 
@@ -969,5 +969,5 @@ def search_with_acl(query_embedding, user_dept_id, user_groups, top_k=10):
 ### 关联章节
 
 - [第 13 章 · 特征、向量与缓存](./13-feature-vector-and-cache.md)：ANN 索引原理、chunking 策略、缓存层设计
-- [第 16a 章 · vLLM 推理](../part5-serving-infra/16a-vllm-inference.md)：与向量库的集成和延迟预算分配
+- [第 16a 章 · vLLM 推理](../part5-serving-infra/16a-vllm-internals.md)：与向量库的集成和延迟预算分配
 - [第 23 章 · 安全隔离与治理](../part7-reliability-security/23-security-isolation-and-governance.md)：多租户 ACL 与数据隔离
