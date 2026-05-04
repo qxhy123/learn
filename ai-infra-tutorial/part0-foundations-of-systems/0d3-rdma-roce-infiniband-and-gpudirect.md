@@ -6,13 +6,11 @@
 
 **RDMA** 是一种“让网卡直接读写本机或远端已授权内存”的通信机制。普通 socket 把网络抽象成内核管理的 fd：应用 `send()`，数据进入内核 socket buffer，经过 TCP/IP，再由对端内核交给对端应用。RDMA 的思路是：应用先把内存注册给网卡，拿到访问 key，然后把“读哪里、写哪里、完成后怎么通知”提交给 NIC。NIC 通过 DMA 执行数据搬运，CPU 不再逐包处理 payload。
 
-所以 RDMA 主要回答：**应用如何把内存、安全权限和异步队列交给 NIC？**  
-它的关键词是 MR、lkey/rkey、QP、CQ、WR、WC、Send/Recv、RDMA Write、RDMA Read、Atomic。
+所以 RDMA 主要回答：**应用如何把内存、安全权限和异步队列交给 NIC？** 它的关键词是 MR、lkey/rkey、QP、CQ、WR、WC、Send/Recv、RDMA Write、RDMA Read、Atomic。
 
 **RoCE / InfiniBand** 不是另一个 RDMA API，而是 RDMA packet 跑在什么网络 fabric 上的问题。InfiniBand 是专用 RDMA fabric，有自己的链路层、Subnet Manager、LID、PKey、SL/VL 和管理工具。RoCE 是 RDMA over Ethernet，RoCE v2 把 RDMA 封装在 UDP/IP 上，跑在以太网和 L3 网络中。
 
-所以 RoCE/IB 主要回答：**RDMA packet 如何跨交换机、链路、优先级、拥塞和路由到达对端？**  
-它的关键词是 GID/GID index、LID、PKey、MTU、PFC、ECN、CNP、DCQCN、ECMP、SM、link width/speed。
+所以 RoCE/IB 主要回答：**RDMA packet 如何跨交换机、链路、优先级、拥塞和路由到达对端？** 它的关键词是 GID/GID index、LID、PKey、MTU、PFC、ECN、CNP、DCQCN、ECMP、SM、link width/speed。
 
 **GPUDirect RDMA** 是 RDMA 的目标内存从 host DRAM 扩展到 GPU HBM。没有 GPUDirect RDMA 时，跨节点 GPU 通信常要走：
 
@@ -26,8 +24,7 @@ GPU HBM -> host pinned memory -> NIC -> network -> peer NIC -> host pinned memor
 GPU HBM <-> NIC RDMA engine <-> network <-> peer NIC <-> peer GPU HBM
 ```
 
-所以 GPUDirect RDMA 主要回答：**NIC 能不能绕过 host staging，直接 DMA 读写 GPU 显存？**  
-它的关键词是 `nvidia_peermem`、BAR/BAR1、PCIe P2P、IOMMU/ACS/ATS、GPU/NIC locality、CUDA buffer、NCCL/UCX/MPI fallback。
+所以 GPUDirect RDMA 主要回答：**NIC 能不能绕过 host staging，直接 DMA 读写 GPU 显存？** 它的关键词是 `nvidia_peermem`、BAR/BAR1、PCIe P2P、IOMMU/ACS/ATS、GPU/NIC locality、CUDA buffer、NCCL/UCX/MPI fallback。
 
 三者的层次关系：
 
