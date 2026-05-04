@@ -225,7 +225,7 @@ sequenceDiagram
 - 必须有"在飞 checkpoint 数"上限（通常 1–2），防止 CPU 内存堆积
 - 若训练速度快于 checkpoint 写入，系统需要反压（block 直到上一个 checkpoint 完成）
 
-> **[note] 异步 checkpoint 的 OOM 风险**：async copy 会在 CPU 内存中持有训练状态的完整副本。175B full training checkpoint 主体约 1.75 TB（不含 FP32 master weights），若 CPU 内存小于这个量级，async 模式会 OOM。实际工程中需要评估节点 CPU DRAM 容量（通常 512 GB–2 TB/节点）并限制并行 checkpoint 任务数。
+> **[note] 异步 checkpoint 的 OOM 风险**：async copy 会在 CPU 内存中持有本 rank 负责的训练状态副本，而不是把 1.75 TB 全局 checkpoint 聚合到单节点。以 512 rank 均匀分片估算，每 rank 约 3.4 GB；若每节点 8 rank，则单节点额外 CPU DRAM 约 27 GB，再乘以在飞 checkpoint 数、序列化 buffer、Python 对象和压缩临时空间。未分片保存、rank 0 聚合或保存 FP32 master weights 时，内存口径会显著放大。实际工程中需要按 per-rank/per-node `StateManifest` 评估 CPU DRAM，并限制并行 checkpoint 任务数。
 
 | 方式 | GPU 阻塞时间 | CPU 内存额外占用 | 实现复杂度 |
 |------|------------|----------------|----------|
@@ -585,7 +585,7 @@ flowchart TD
 - 512 rank 并发上传，每个 rank 并发 4 个 multipart part
 - 有效并发：512 × 4 = 2048 个并发 upload stream
 - 若 S3 带宽上限约 50 GB/s（企业级），上传时间约 35 秒（理论）
-- 加上序列化和 manifest 写入，实际约 30–60 秒
+- 加上序列化和 manifest 写入，实际约 40–70 秒
 
 > **[success] 并行上传的工程关键**：（1）每个 rank 上传自己的分片，不让 rank 0 聚合；（2）使用 multipart upload，每 part 100–200 MB，允许失败重传；（3）upload 失败后要有重试队列，而不是整版 checkpoint 重新开始；（4）manifest 只在所有分片 upload 成功后才写入。
 
@@ -595,7 +595,7 @@ flowchart TD
 |------|---------------------------|--------------------|------------------|
 | 同步写 Lustre（512 rank 并发） | 1.75 TB | ~35 s | 60–300 s |
 | 异步写 Lustre（CPU copy） | GPU 阻塞仅 copy | 10–30 s（GPU block） | 后台继续 60–300 s |
-| 上传 S3（512 rank 并发） | 1.75 TB | ~35 s | 30–60 s |
+| 上传 S3（512 rank 并发） | 1.75 TB | ~35 s | 40–70 s |
 | Integrity check（sha256） | 3.4 GB/rank（512 rank 均匀分片） | per rank ~2 s | 并发，整体 5–10 s |
 
 ### 文件系统选型对 Checkpoint 的影响
@@ -682,7 +682,7 @@ if should_checkpoint(step, last_ckpt_time):
     training_resumes()  # GPU 立即继续
 ```
 
-GPU 阻塞时间：约 20–30 秒（CPU memory copy，pinned memory 带宽约 30–50 GB/s）
+GPU 阻塞时间：约 20–30 秒（每 rank 复制约 3.4 GB 分片到 CPU staging buffer；30–50 GB/s 是单机 pinned memory 带宽上限，实际受框架调度、CPU NUMA、allocator 和并发 rank 影响，不等同于 1.75 TB 全局状态经单通道复制）
 
 **Step 2：后台序列化 + 写 Lustre**
 
@@ -763,7 +763,7 @@ if len(rolling) > 5:
 | 每次 checkpoint 磁盘占用 | ~1.75 TB | Lustre 上临时 + 正式，不含 FP32 master weights |
 | S3 归档大小 | ~1.75 TB | 含 manifest，不压缩，不含 FP32 master weights |
 | Rolling 保留（5个）磁盘 | ~8.75 TB | Lustre，不含 FP32 master weights |
-| GPU 阻塞时间（异步） | 20–30 秒 | CPU copy |
+| GPU 阻塞时间（异步） | 20–30 秒 | per-rank CPU copy，非单进程复制 1.75 TB |
 | 后台写盘时间（Lustre） | 60–120 秒 | 与训练并行 |
 | S3 上传时间 | 20–40 秒 | 与训练并行 |
 | 对训练吞吐影响 | ~0.5–1.5%/小时 | 仅 GPU block 时间 |
