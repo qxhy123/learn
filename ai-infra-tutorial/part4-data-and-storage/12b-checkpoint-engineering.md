@@ -188,11 +188,13 @@ mindmap
 allreduce/step 完成 → 所有 rank 停下来 → 序列化 state_dict → 写盘 → 所有 rank 确认写完 → 继续训练
 ```
 
-GPU idle 时间 = 序列化时间 + I/O 时间。175B 模型 BF16 参数 ~350 GB，Adam 状态 ~700 GB，共 ~1.05 TB（FP32 optimizer state）。若 Lustre 写带宽 per-rank 约 2 GB/s，512 rank 并发，则写入时间约：
+> **数值口径（示例，不是通用常数）**：本节 175B 示例按 BF16 参数 2 bytes/param、Adam 一阶矩 FP32 4 bytes/param、Adam 二阶矩 FP32 4 bytes/param 估算，因此 full training checkpoint 的主要张量约为 `175B × (2 + 4 + 4) bytes ≈ 1.75 TB`。如果实现不保存 FP32 master weights，则没有额外 master copy；如果保存 FP32 master weights，还需再加 `175B × 4 bytes ≈ 700 GB`。下文所有时间估算都必须标注使用哪个状态集合。
+
+GPU idle 时间 = 序列化时间 + I/O 时间。175B 模型 BF16 参数约 350 GB，Adam 一阶矩约 700 GB，Adam 二阶矩约 700 GB，full training checkpoint 主体约 1.75 TB（不含 FP32 master weights、RNG、scheduler、sampler 和 manifest 元数据）。若 Lustre 写带宽 per-rank 约 2 GB/s，512 rank 并发，则写入时间约：
 
 ```
-per-rank 写入量 = 1.05 TB / 512 ≈ 2.1 GB
-写入时间 ≈ 2.1 GB / 2 GB·s⁻¹ ≈ 1.05 s（纯 I/O）
+per-rank 写入量 = 1.75 TB / 512 ≈ 3.4 GB
+写入时间 ≈ 3.4 GB / 2 GB·s⁻¹ ≈ 1.7 s（纯 I/O）
 ```
 
 但序列化（CPU pickle / safetensors 编码）和等待最慢 rank 的尾延迟往往让实际阻塞超过 60–300 秒。每小时一次 checkpoint 意味着 1–5% 的吞吐损失。
@@ -223,7 +225,7 @@ sequenceDiagram
 - 必须有"在飞 checkpoint 数"上限（通常 1–2），防止 CPU 内存堆积
 - 若训练速度快于 checkpoint 写入，系统需要反压（block 直到上一个 checkpoint 完成）
 
-> **[note] 异步 checkpoint 的 OOM 风险**：async copy 会在 CPU 内存中持有训练状态的完整副本。175B 模型 BF16 + FP32 Adam ~1.05 TB，若 CPU 内存小于这个量级，async 模式会 OOM。实际工程中需要评估节点 CPU DRAM 容量（通常 512 GB–2 TB/节点）并限制并行 checkpoint 任务数。
+> **[note] 异步 checkpoint 的 OOM 风险**：async copy 会在 CPU 内存中持有训练状态的完整副本。175B full training checkpoint 主体约 1.75 TB（不含 FP32 master weights），若 CPU 内存小于这个量级，async 模式会 OOM。实际工程中需要评估节点 CPU DRAM 容量（通常 512 GB–2 TB/节点）并限制并行 checkpoint 任务数。
 
 | 方式 | GPU 阻塞时间 | CPU 内存额外占用 | 实现复杂度 |
 |------|------------|----------------|----------|
@@ -550,11 +552,11 @@ flowchart TD
 
 ### Ring 保留的磁盘估算
 
-175B BF16（~350 GB）+ FP32 Adam（~700 GB）= ~1.05 TB/ckpt
+175B BF16 参数（~350 GB）+ Adam 一阶矩（~700 GB）+ Adam 二阶矩（~700 GB）= ~1.75 TB/ckpt（不含 FP32 master weights）
 
 每小时一次，保留最近 5 个 + 5 个 milestone + 1 个 best = 11 个
 
-磁盘占用：`11 × 1.05 TB ≈ 11.55 TB`（仅 checkpoint，不含日志和 eval 结果）
+磁盘占用：`11 × 1.75 TB ≈ 19.25 TB`（仅 checkpoint，不含日志和 eval 结果）
 
 ---
 
@@ -564,7 +566,7 @@ flowchart TD
 
 | 类型 | 保存内容 | 大小 | 用途 |
 |------|---------|------|------|
-| Full checkpoint | 所有参数 + optimizer + RNG | ~1.05 TB（175B） | True resume |
+| Full checkpoint | 所有参数 + optimizer + RNG | ~1.75 TB（175B，不含 FP32 master weights）或 ~2.45 TB（含 FP32 master weights） | True resume |
 | 权重 only | 仅模型参数（BF16） | ~350 GB | 推理 / 评测 |
 | LoRA delta | 仅 LoRA 参数（A/B 矩阵） | ~50–500 MB | SFT/RLHF 快速保存 |
 | Activation checkpoint | 中间激活（不是训练 ckpt） | 取决于 recompute 策略 | 节省显存（非持久化） |
@@ -577,24 +579,24 @@ flowchart TD
 
 ### 并行上传设计
 
-对于 175B 模型在 512 卡上，每次 checkpoint 后向 S3 上传约 1.05 TB：
+对于 175B 模型在 512 卡上，每次 full training checkpoint 后向 S3 上传约 1.75 TB（不含 FP32 master weights）：
 
-- 每个 rank 独立上传自己的分片（~2.1 GB/rank）
+- 每个 rank 独立上传自己的分片（~3.4 GB/rank）
 - 512 rank 并发上传，每个 rank 并发 4 个 multipart part
 - 有效并发：512 × 4 = 2048 个并发 upload stream
-- 若 S3 带宽上限约 50 GB/s（企业级），上传时间约 21 秒
+- 若 S3 带宽上限约 50 GB/s（企业级），上传时间约 35 秒（理论）
 - 加上序列化和 manifest 写入，实际约 30–60 秒
 
 > **[success] 并行上传的工程关键**：（1）每个 rank 上传自己的分片，不让 rank 0 聚合；（2）使用 multipart upload，每 part 100–200 MB，允许失败重传；（3）upload 失败后要有重试队列，而不是整版 checkpoint 重新开始；（4）manifest 只在所有分片 upload 成功后才写入。
 
 ### 网络带宽规划
 
-| 操作 | 数据量（175B FP16+FP32 Adam） | 理想时间（50 GB/s） | 实际时间（含开销） |
+| 操作 | 数据量（175B BF16+Adam 一阶矩+Adam 二阶矩） | 理想时间（50 GB/s） | 实际时间（含开销） |
 |------|---------------------------|--------------------|------------------|
-| 同步写 Lustre（512 rank 并发） | 1.05 TB | ~21 s | 60–300 s |
+| 同步写 Lustre（512 rank 并发） | 1.75 TB | ~35 s | 60–300 s |
 | 异步写 Lustre（CPU copy） | GPU 阻塞仅 copy | 10–30 s（GPU block） | 后台继续 60–300 s |
-| 上传 S3（512 rank 并发） | 1.05 TB | ~21 s | 30–60 s |
-| Integrity check（sha256） | 1.05 TB per rank | per rank ~2 s | 并发，整体 5–10 s |
+| 上传 S3（512 rank 并发） | 1.75 TB | ~35 s | 30–60 s |
+| Integrity check（sha256） | 3.4 GB/rank（512 rank 均匀分片） | per rank ~2 s | 并发，整体 5–10 s |
 
 ### 文件系统选型对 Checkpoint 的影响
 
@@ -653,8 +655,9 @@ flowchart LR
 | 集群 | 512 × H100-80GB，64 节点 × 8 卡 |
 | 并行配置 | TP=8, PP=4, DP=16 |
 | 总参数量 | 175B × 2 bytes = 350 GB（BF16） |
-| Adam 状态 | 175B × 4 bytes = 700 GB（FP32 一阶+二阶矩） |
-| 总 checkpoint 大小 | ~1.05 TB |
+| Adam 一阶矩 | 175B × 4 bytes = 700 GB（FP32） |
+| Adam 二阶矩 | 175B × 4 bytes = 700 GB（FP32） |
+| 总 checkpoint 大小 | ~1.75 TB（不含 FP32 master weights）或 ~2.45 TB（含 FP32 master weights） |
 | 训练速度 | ~3,500 tokens/s/GPU × 512 = 1,792,000 tokens/s |
 | checkpoint 频率 | 每 60 分钟（约 6.4B tokens） |
 | 目标 | 故障后最多丢失 1 小时进度 |
@@ -684,7 +687,7 @@ GPU 阻塞时间：约 20–30 秒（CPU memory copy，pinned memory 带宽约 3
 **Step 2：后台序列化 + 写 Lustre**
 
 - DCP SavePlanner 把 state_dict 拆成 512 个 WriteItem
-- 每个 rank 写约 2.1 GB 到 Lustre `ckpt_tmp_step52000/rank_XXXX.pt`
+- 每个 rank 写约 3.4 GB 到 Lustre `ckpt_tmp_step52000/rank_XXXX.pt`
 - 序列化（safetensors 格式）+ 写盘约 60–120 秒
 - Lustre stripe count = 64（每文件分布到 64 个 OST），有效写带宽约 2 GB/s/rank
 
@@ -706,9 +709,9 @@ if rank == 0:
 **Step 4：并行上传 S3（Lustre → S3 归档）**
 
 - 512 rank 并发启动 S3 multipart upload
-- 每个分片约 2.1 GB，分成 21 个 100 MB part
+- 每个分片约 3.4 GB，分成 34 个 100 MB part
 - 有效上传带宽：假设每节点出口 25 Gbps × 64 节点 = 1600 Gbps ≈ 200 GB/s
-- 上传时间：1.05 TB / 200 GB/s ≈ 5.25 秒（理论），实际约 20–40 秒
+- 上传时间：1.75 TB / 200 GB/s ≈ 8.75 秒（理论），实际约 20–40 秒
 - 上传完成后 rank 0 写 S3 manifest + marker key
 
 **Step 5：Integrity Check**
@@ -757,9 +760,9 @@ if len(rolling) > 5:
 
 | 指标 | 数值 | 说明 |
 |------|-----|------|
-| 每次 checkpoint 磁盘占用 | ~1.05 TB | Lustre 上临时 + 正式 |
-| S3 归档大小 | ~1.05 TB | 含 manifest，不压缩 |
-| Rolling 保留（5个）磁盘 | ~5.25 TB | Lustre |
+| 每次 checkpoint 磁盘占用 | ~1.75 TB | Lustre 上临时 + 正式，不含 FP32 master weights |
+| S3 归档大小 | ~1.75 TB | 含 manifest，不压缩，不含 FP32 master weights |
+| Rolling 保留（5个）磁盘 | ~8.75 TB | Lustre，不含 FP32 master weights |
 | GPU 阻塞时间（异步） | 20–30 秒 | CPU copy |
 | 后台写盘时间（Lustre） | 60–120 秒 | 与训练并行 |
 | S3 上传时间 | 20–40 秒 | 与训练并行 |
@@ -798,7 +801,7 @@ if len(rolling) > 5:
 
 **12b-6** 一个 175B 模型每小时 checkpoint 一次，同步模式写盘需要 8 分钟。计算这 8 分钟对每小时训练吞吐的影响百分比。如果换成异步模式（GPU block 25 秒），影响变为多少？
 
-**12b-7** 设计 rolling + milestone + best 三类 retention 策略的具体参数：(1) 每次 checkpoint 1.05 TB，总 Lustre 容量 50 TB，最多能保留多少个 rolling？ (2) milestone 应该设在哪些 step？(3) 如果 best checkpoint 同时也是 rolling 最新的，清理时怎么处理？
+**12b-7** 设计 rolling + milestone + best 三类 retention 策略的具体参数：(1) 每次 full training checkpoint 1.75 TB（不含 FP32 master weights），总 Lustre 容量 50 TB，最多能保留多少个 rolling？ (2) milestone 应该设在哪些 step？(3) 如果 best checkpoint 同时也是 rolling 最新的，清理时怎么处理？
 
 **12b-8** 解释为什么 LoRA delta checkpoint 必须在 manifest 中记录 base model 版本 hash。如果 base model 在 LoRA 训练期间被更新了，恢复时会发生什么？
 
