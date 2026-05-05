@@ -117,6 +117,7 @@
 | 第10章 | [内存优化、检查点与恢复](./part3-training-infra/10-memory-checkpointing-and-recovery.md) | 激活重计算、ZeRO、Checkpoint、NCCL Hang 排查、Straggler、Elastic Training、FP8 | 稳定完成训练 |
 | 第10b章 | [对齐训练与后训练基础设施](./part3-training-infra/10b-alignment-and-post-training.md) | RLHF、DPO、PPO/GRPO、RM 部署、PPO Worked Example 与多模型 checkpoint 一致性 | 理解后训练的独特资源模式 |
 | 第10c章 | [Fine-Tuning 基础设施与多 Adapter 服务](./part3-training-infra/10c-finetuning-and-multi-adapter.md) | LoRA、QLoRA、Multi-LoRA 显存预算、Adapter/Base 兼容与 FTaaS pipeline | 微调与 adapter 的平台化 |
+| 第09e章 | [MoE 训练基础设施](./part3-training-infra/09e-moe-training-infrastructure.md) | EP、All-to-All、gate routing、aux load-balance loss、capacity factor、token drop、MoE checkpoint、5 维并行（DeepSeek-V3 风格）| 2024-2025 主流 MoE 训练 |
 
 ### 第四部分：数据与存储基础设施
 
@@ -128,6 +129,7 @@
 | 第11c章 | [Tokenization、切分与训练 Dataset 格式](./part4-data-and-storage/11c-tokenization-and-dataset-formats.md) | BPE/SentencePiece/Tiktoken、词表选择、sequence packing、parquet/arrow/WebDataset/MosaicML 格式 | 训练数据准备 |
 | 第11d章 | [流式读取与 DataLoader 工程化](./part4-data-and-storage/11d-streaming-and-dataloader-engineering.md) | PyTorch DataLoader 内部、worker IPC、num_workers/prefetch/pin_memory 调优、远程数据集、resume | GPU 不能等数据 |
 | 第11e章 | [数据版本、血缘与谱系](./part4-data-and-storage/11e-data-versioning-and-lineage.md) | DVC/lakeFS/Iceberg/Delta、CAS/Merkle、OpenLineage、time travel、GDPR 合规 | 训练复现性 |
+| 第11f章 | [数据飞轮与持续学习闭环](./part4-data-and-storage/11f-data-flywheel-online-learning.md) | 推理日志回流 → 漂移检测 → 增量训练 → 评测 → 灰度；反馈污染、judge bias、客服 LLM 8 周飞轮 Worked Example | LLM 产品化核心 |
 | 第12章 | [制品、模型与检查点管理总览](./part4-data-and-storage/12-artifacts-and-checkpoints.md) | 第一性原理推导链 + 4 章导览 | 入口章 |
 | 第12a章 | [Model Registry 体系](./part4-data-and-storage/12a-model-registry.md) | 核心实体、metadata schema、Stage 状态机、MLflow/W&B/HF Hub 对比、大模型分发、LoRA registry | 服务发现与治理 |
 | 第12b章 | [Checkpoint 工程化](./part4-data-and-storage/12b-checkpoint-engineering.md) | Sharded、async DCP、TorchSnapshot vs Megatron、manifest 原子提交、175B Worked Example | 训练故障恢复 |
@@ -149,6 +151,7 @@
 | 第16章 | [量化、编译与推理引擎](./part5-serving-infra/16-quantization-compilation-and-engines.md) | TRT-LLM、vLLM、SGLang、ONNX Runtime、量化/引擎选型决策树与校准 | 降低延迟与成本 |
 | 第16a章 | [vLLM 内部机制深入](./part5-serving-infra/16a-vllm-internals.md) | Engine/Scheduler/Worker/Block Manager、PagedAttention 实现、Continuous Batching 调度循环、Prefix Caching、Chunked Prefill、Speculative、TP/PP/EP、Multi-LoRA、量化集成、V1 重构、调优手册 | vLLM 工程师视角 |
 | 第16b章 | [SGLang 内部机制深入](./part5-serving-infra/16b-sglang-internals.md) | Frontend Language、RadixAttention 实现、Constrained Decoding、Speculative、Cache-aware 调度、与 vLLM/TRT-LLM 选型决策、Agent + Tool Use Worked Example | 复杂结构化 / Agent serving |
+| 第16c章 | [TensorRT-LLM 内部机制深入](./part5-serving-infra/16c-trt-llm-internals.md) | Engine 编译、Plugin 架构、Inflight Batching、KvCacheConfig、量化路径（AWQ/GPTQ/FP8/FP4 + ModelOpt）、Hopper/Blackwell 优化、Triton 集成、LLaMA-70B build & deploy Worked Example | NVIDIA 集群 LLM serving |
 | 第17章 | [多租户与成本治理](./part5-serving-infra/17-multitenancy-and-cost.md) | 配额、SLA、冷热分层、Cloud vs On-Prem TCO、Spot、MFU vs Utilization、Chargeback | 服务化经营能力 |
 
 ### 第六部分：平台与编排

@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 11f 章 · 数据飞轮与持续学习闭环 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=11f" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+  <h1>第 11f 章 · 数据飞轮与持续学习闭环</h1>
+  <p class="sub">把推理日志、用户反馈、漂移检测、增量训练、评测门禁和灰度发布连成自我强化的反馈闭环——让模型每运行一天，就离用户需求更近一分。</p>
+  <div class="chips">
+    <span class="chip">数据飞轮</span>
+    <span class="chip">持续学习</span>
+    <span class="chip">DPO/KTO</span>
+    <span class="chip">漂移检测</span>
+    <span class="chip">LoRA 增量</span>
+    <span class="chip">LLM-as-judge</span>
+    <span class="chip">灾难性遗忘</span>
+    <span class="chip">多租户飞轮</span>
+  </div>
+  <div class="note"><strong>不可化简的问题：</strong>LLM 上线后会随时间漂移，用户日志蕴含丰富训练信号，持续学习是 LLM 产品的核心竞争力——如何设计一个"日志回流 → 漂移检测 → 增量训练 → 评测 → 灰度发布"的工程闭环，让它既能自我强化，又能在反馈污染或遗忘失控时安全降级？</div>
+  <div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+</section>
+
+<section class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a class="anchor" href="#s1">第一性原理拆解：数据飞轮与持续学习</a></li>
+    <li><a class="anchor" href="#s2">数据飞轮整体架构</a></li>
+    <li><a class="anchor" href="#s3">推理日志回流</a></li>
+    <li><a class="anchor" href="#s4">信号转化为标注数据</a></li>
+    <li><a class="anchor" href="#s5">数据漂移检测</a></li>
+    <li><a class="anchor" href="#s6">增量训练 vs 完全重训</a></li>
+    <li><a class="anchor" href="#s7">自动评测 + 灰度发布联动</a></li>
+    <li><a class="anchor" href="#s8">飞轮的失败模式</a></li>
+    <li><a class="anchor" href="#s9">多租户飞轮治理</a></li>
+    <li><a class="anchor" href="#s10">飞轮观测看板</a></li>
+    <li><a class="anchor" href="#s11">与传统 ML 持续学习的差异</a></li>
+    <li><a class="anchor" href="#s12">Worked Example：客服 LLM Agent 的 8 周飞轮</a></li>
+    <li><a class="anchor" href="#s13">练习题</a></li>
+    <li><a class="anchor" href="#refbox">深度参考阅读</a></li>
+  </ol>
+</section>
+
+<!-- §1 第一性原理 -->
+<section class="section" id="s1">
+  <h2>1. 第一性原理拆解：数据飞轮与持续学习</h2>
+
+  <h3>拆 — 不可化简的问题</h3>
+  <p>把 RLHF、DPO、LoRA、Evidently、Arize、Continual Learning 这些名字先拿掉，本章要解决的不可化简问题只有一个：<strong>LLM 产品上线不是终点，而是起点——模型会随时间漂移，用户需求会持续演化，而每一次用户交互本身就是宝贵的训练信号；如果没有系统性的机制把这些信号转化成模型能力，产品就会被后来者快速赶超，最终被用户抛弃</strong>。</p>
+
+  <p>这个问题有四个无法绕开的物理和工程约束。</p>
+
+  <p><strong>约束一：模型会随时间漂移，但漂移无法即时察觉。</strong> 上线的 LLM 是在某个历史语料集上训练的快照，而现实世界持续变化：政策法规更新、产品功能迭代、用户提问风格演化、知识截止日期带来的知识缺口越来越大。这种漂移不会在一夜间爆发，而是以每周 0.1% 质量下滑的方式静默积累，直到某天突然变成用户投诉风暴。传统的离线评测无法发现漂移——因为评测集本身也是历史快照，无法捕捉"现实世界今天提出的新类型问题"。</p>
+
+  <p><strong>约束二：推理日志是高密度信号，但提取成本高昂。</strong> 每一次用户交互都包含丰富信息：用户问了什么（query 分布）、模型如何回答（completion 质量）、用户满意吗（反馈信号）。每天数十万次对话，如果能提取出其中哪怕 1% 的高质量训练样本，积累一个月就是一个有意义的数据集。但"把日志变成训练数据"不是简单地复制粘贴——需要 PII 脱敏、质量过滤、标注、格式转换，每个步骤都有工程代价和质量风险。</p>
+
+  <p><strong>约束三：增量训练会引入灾难性遗忘，必须有精确的质量门控。</strong> 用新数据微调模型，往往会让模型"忘记"旧能力——专注于新数据分布后，在历史测试集上的表现退化。如果没有严格的评测门禁（包括通用能力基准 + 业务 Golden Set + 安全评测），一次糟糕的增量训练就会悄然上线，导致比漂移更严重的质量崩坏。</p>
+
+  <p><strong>约束四：反馈污染和 judge 偏置会让飞轮走偏。</strong> 用户反馈不是纯净信号——有垃圾用户、对抗用户、batch 点赞刷分，也有 LLM-as-judge 系统自身的偏置（偏好长答案、偏好特定风格）。如果飞轮的输入被污染，模型会越来越偏离真实用户需求，反而陷入"越飞越偏"的负循环。</p>
+
+  <p>从这四个约束出发，一个可靠的数据飞轮必须同时解决五个子问题：<strong>如何高效采集和清洗推理日志</strong>（第 3 节）；<strong>如何把原始日志转化为高质量标注数据</strong>（第 4 节）；<strong>如何系统性地检测漂移</strong>（第 5 节）；<strong>如何选择合适的增量训练策略并防止遗忘</strong>（第 6 节）；<strong>如何与评测和灰度发布系统联动，确保每次更新安全可控</strong>（第 7 节）。</p>
+
+  <p>这五个子问题之间不是简单的线性关系，而是形成一个闭环：增量训练的输出是新模型，新模型上线后产生新的推理日志，这些日志又进入下一轮的漂移检测和训练信号提取。飞轮的转速（更新频率）、质量（每轮改善幅度）和稳定性（不因污染或遗忘而崩溃）必须同时被工程化地管理。这就是本章的核心——把数据飞轮从"听起来很好"的概念变成"可以落地、可以监控、可以在出错时被快速恢复"的工程实体。</p>
+
+  <h3>推 — 从这个问题如何推导出每个机制</h3>
+  <p>从"模型会随时间漂移"出发，<strong>漂移检测系统</strong>必然出现。仅靠人工感知漂移会失之迟缓；必须用统计方法（KS 检验、Jensen-Shannon 散度）持续比较当前 query 分布与历史分布，用 embedding 聚类发现新兴话题，用监控指标捕捉 concept drift（同一类问题的"正确答案"变化）。</p>
+  <p>从"推理日志是宝贵信号"出发，<strong>结构化日志记录</strong>和<strong>采样策略</strong>必然出现。并非所有推理结果都值得保留，但采样策略必须保证不丢失罕见场景；同时，PII 脱敏必须在日志进入存储前完成，不能事后处理。</p>
+  <p>从"把日志变成训练数据"出发，<strong>标注流水线</strong>（含 LLM-as-judge 自动标注）和<strong>偏好数据格式</strong>（DPO/KTO）必然出现。人工标注成本高但质量最好；隐式信号成本低但噪声大；LLM-as-judge 是两者之间的折中，但必须持续校准 judge 的偏置。</p>
+  <p>从"增量训练会引入遗忘"出发，<strong>训练策略选型</strong>（LoRA 增量、SFT 增量、DPO、Continual Pretraining）和<strong>防遗忘机制</strong>（rehearsal、EWC）必然出现。LoRA 仅更新低秩适配器，对 base model 破坏最小，是大多数场景的首选；但 LoRA 无法修复 base model 的深层知识缺陷，此时才需要代价更高的 full fine-tune 或 continual pretraining。</p>
+  <p>从"反馈可能被污染"出发，<strong>数据质量监控</strong>和<strong>异常检测</strong>必然出现。飞轮必须有"对抗内部腐化"的机制：周期性校验 judge 质量、检查训练集分布是否异常、在发现污染时能快速隔离并回滚。</p>
+
+  <h3>绘 — 因果链路</h3>
+  <pre class="mermaid">mindmap
+  root((数据飞轮与持续学习))
+    第一性约束
+      模型随时间漂移
+      日志是高密度信号
+      增量训练引入遗忘
+      反馈污染导致走偏
+    飞轮五环节
+      采集推理日志
+      信号转化标注
+      漂移检测
+      增量训练
+      评测+灰度发布
+    日志回流
+      字段设计
+      PII 脱敏
+      采样策略
+      存储成本
+    信号转化
+      隐式信号
+      显式信号
+      LLM-as-judge
+      DPO/KTO 格式
+    漂移检测
+      Population Drift
+      Concept Drift
+      Feature Drift
+      Evidently/Arize
+    增量训练
+      LoRA 增量
+      SFT 增量
+      DPO 增量
+      Continual Pretraining
+      灾难性遗忘防护
+    评测联动
+      MMLU GSM8K HumanEval
+      业务 Golden Set
+      12c 发布门禁
+      Ch22 灰度
+    失败模式
+      反馈污染
+      Judge Bias 累积
+      数据同质化
+      频繁灰度抖动
+    多租户飞轮
+      per-tenant LoRA
+      共享 base 隔离
+      联邦飞轮</pre>
+
+  <h3>导 — 读完本章你应该能回答</h3>
+  <ol>
+    <li>为什么 LLM 产品上线后会随时间漂移？漂移有哪三种类型，各自如何检测？</li>
+    <li>推理日志必须记录哪些字段，PII 脱敏、采样策略和存储成本三者如何权衡？</li>
+    <li>隐式信号和显式信号各有哪些，LLM-as-judge 方案在成本、质量和一致性上的取舍是什么？</li>
+    <li>DPO 和 KTO 偏好数据格式各自适合什么场景？如何从用户行为日志构建偏好对？</li>
+    <li>LoRA 增量、SFT 增量和 Continual Pretraining 三种增量训练策略如何选择，触发条件是什么？</li>
+    <li>飞轮的失败模式有哪些，反馈污染事件如何被发现和处置？</li>
+    <li>多租户飞轮的三种架构各自的隔离保证和数据安全边界是什么？</li>
+  </ol>
+
+  <h3>学习 checklist</h3>
+  <ul>
+    <li>能描述数据飞轮五环节及每个环节的核心工程问题</li>
+    <li>能设计推理日志的字段 schema，并说明 PII 脱敏的时机选择</li>
+    <li>能区分三种漂移类型，并为每种给出具体检测方法</li>
+    <li>能解释 DPO 偏好数据格式，并给出从用户行为日志构建偏好对的流程</li>
+    <li>能为具体业务场景选择增量训练策略，并说明灾难性遗忘防护机制</li>
+    <li>能识别飞轮运行中的至少 4 种失败模式，并说明对应的防护手段</li>
+    <li>能设计飞轮观测看板的核心指标集</li>
+  </ul>
+</section>
+
+<!-- §2 整体架构 -->
+<section class="section" id="s2">
+  <h2>2. 数据飞轮整体架构</h2>
+  <p>数据飞轮的五个核心环节形成一个闭合回路，每个环节的输出是下一个环节的输入。</p>
+
+  <pre class="mermaid">flowchart LR
+  subgraph 采集
+    A1[推理服务] -->|结构化日志| A2[日志摄入\nKafka/Flink]
+    A2 -->|PII 脱敏| A3[日志存储\nS3/GCS]
+  end
+
+  subgraph 标注
+    B1[隐式信号提取\nthumb/retry/edit] --> B3[标注数据集]
+    B2[LLM-as-judge\n自动标注] --> B3
+    B3 -->|DPO/KTO 格式| B4[训练就绪数据集]
+  end
+
+  subgraph 检测
+    C1[query 分布监控] --> C3{漂移阈值?}
+    C2[质量指标趋势] --> C3
+    C3 -->|超阈值| C4[触发训练]
+    C3 -->|正常| C5[继续监控]
+  end
+
+  subgraph 训练
+    D1[LoRA / SFT / DPO] --> D2[新版本模型]
+    D2 -->|rehearsal 防遗忘| D3[验证通过]
+  end
+
+  subgraph 发布
+    E1[离线评测门禁] --> E2[staging]
+    E2 --> E3[canary 1%]
+    E3 -->|质量/成本监控| E4[全量 production]
+    E4 -->|rollback 触发| E5[自动回滚]
+  end
+
+  A3 --> B1
+  A3 --> B2
+  B4 --> C1
+  C4 --> D1
+  D3 --> E1
+  E4 -->|新日志| A1</pre>
+
+  <h3>五大环节对比</h3>
+  <table>
+    <thead><tr><th>环节</th><th>核心问题</th><th>主要工具/机制</th><th>典型延迟</th></tr></thead>
+    <tbody>
+      <tr><td>采集（Collect）</td><td>采什么、多少、如何脱敏</td><td>Kafka、Flink、DLP 脱敏、采样器</td><td>毫秒-秒</td></tr>
+      <tr><td>标注（Annotate）</td><td>如何把日志转化为训练信号</td><td>LLM-as-judge、用户行为分析、人工标注</td><td>小时-天</td></tr>
+      <tr><td>检测（Detect）</td><td>何时需要更新模型</td><td>KS 检验、embedding 聚类、Evidently AI</td><td>实时-小时</td></tr>
+      <tr><td>训练（Train）</td><td>用什么策略训练、如何防遗忘</td><td>LoRA、DPO、EWC、rehearsal</td><td>小时-天</td></tr>
+      <tr><td>发布（Deploy）</td><td>如何安全地把新模型推上线</td><td>评测门禁、canary 灰度、自动回滚</td><td>小时</td></tr>
+    </tbody>
+  </table>
+
+  <h3>四类反馈信号（按质量从高到低）</h3>
+  <table>
+    <thead><tr><th>信号类型</th><th>来源</th><th>质量</th><th>获取成本</th><th>规模</th></tr></thead>
+    <tbody>
+      <tr><td>专家审核</td><td>领域专家人工标注</td><td>最高</td><td>极高</td><td>小（百-千条）</td></tr>
+      <tr><td>客服二次修改</td><td>客服/运营修改 AI 回复</td><td>高</td><td>高</td><td>中（千-万条）</td></tr>
+      <tr><td>用户显式反馈</td><td>thumb up/down、表单评分</td><td>中高</td><td>低</td><td>中大（万-十万条）</td></tr>
+      <tr><td>用户隐式行为</td><td>retry、停留时长、编辑后内容</td><td>中</td><td>极低</td><td>极大（百万+条）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note"><strong>信号量 ≠ 信号质量。</strong>隐式信号规模最大，但噪声也最大。"用户没有 retry"不等于"用户满意"——可能只是用户放弃了。构建标注数据集时，必须优先使用高质量信号，用隐式信号做数量补充，而不是反过来。</div>
+</section>
+
+<!-- §3 推理日志回流 -->
+<section class="section" id="s3">
+  <h2>3. 推理日志回流</h2>
+
+  <h3>必须记录的字段</h3>
+  <p>推理日志不只是"请求和响应"，还需要记录足够多的上下文以支持后续的质量分析、漂移检测和训练数据提取。</p>
+
+  <pre><code>{
+  "log_id": "req-20260503-a1b2c3",
+  "timestamp": "2026-05-03T08:23:14.512Z",
+  "model_version": "assistant-v3.2-lora-w12",
+  "tenant_id": "tenant_42",
+  "session_id": "sess-xyz789",
+  "user_id_hash": "sha256:3f4a...",
+  "prompt": "[SYSTEM] ...\n[USER] 如何申请退款？",
+  "completion": "您好，退款申请可以通过以下步骤...",
+  "tool_calls": [{"name": "search_kb", "args": {...}, "result": "..."}],
+  "retrieval_chunks": [{"doc_id": "kb-refund-001", "score": 0.91}],
+  "input_tokens": 342,
+  "output_tokens": 187,
+  "latency_ms": 1240,
+  "cost_usd": 0.0024,
+  "user_feedback": null,
+  "finish_reason": "stop",
+  "sampling_reason": "random_5pct"
+}</code></pre>
+
+  <table>
+    <thead><tr><th>字段</th><th>用途</th><th>存储建议</th></tr></thead>
+    <tbody>
+      <tr><td><code>model_version</code></td><td>按版本聚合分析漂移；回滚时对比不同版本质量</td><td>必须</td></tr>
+      <tr><td><code>tool_calls</code></td><td>分析工具调用失败率；生成 Agent 训练数据</td><td>强烈建议</td></tr>
+      <tr><td><code>retrieval_chunks</code></td><td>RAG 系统的检索质量分析；发现 retrieval 漂移</td><td>RAG 场景必须</td></tr>
+      <tr><td><code>user_feedback</code></td><td>直接训练信号来源；最高价值字段</td><td>必须，延迟回填</td></tr>
+      <tr><td><code>cost_usd</code></td><td>成本回归检测；cost per quality unit 计算</td><td>建议</td></tr>
+      <tr><td><code>sampling_reason</code></td><td>反偏差分析；知道某条日志被保留的原因</td><td>必须</td></tr>
+    </tbody>
+  </table>
+
+  <div class="danger"><strong>推理日志几乎必然含有 PII。</strong>用户在 prompt 中输入的姓名、身份证、联系方式、医疗信息等，必须在日志写入持久存储之前完成脱敏，不能原样落盘后再处理。原样落盘的日志一旦被访问或泄漏，构成 GDPR 违规。</div>
+
+  <h3>PII 脱敏分层策略</h3>
+  <pre class="mermaid">flowchart LR
+  RAW[原始推理日志] --> SCAN[DLP 扫描\nPresidio / AWS Macie]
+  SCAN --> Q1{PII 敏感度}
+  Q1 -->|高敏感\n身份证/手机/医疗| DROP[字段删除或\n替换为占位符 REDACTED]
+  Q1 -->|中敏感\n邮箱/IP/设备ID| HASH[单向哈希\nSHA256 + 盐]
+  Q1 -->|低敏感\n城市/年龄段| KEEP[保留但打标记]
+  DROP --> STORE[脱敏后存储]
+  HASH --> STORE
+  KEEP --> STORE</pre>
+
+  <h3>采样策略设计</h3>
+  <table>
+    <thead><tr><th>采样类型</th><th>触发条件</th><th>采样率</th><th>目的</th></tr></thead>
+    <tbody>
+      <tr><td>随机基线采样</td><td>所有请求</td><td>3-10%</td><td>分布监控基准</td></tr>
+      <tr><td>低置信度采样</td><td>模型生成概率 &lt; 阈值</td><td>50-100%</td><td>捕捉模型弱点</td></tr>
+      <tr><td>用户负反馈</td><td>thumb down / retry</td><td>100%</td><td>直接训练信号</td></tr>
+      <tr><td>长输入采样</td><td>输入 &gt; P95 长度</td><td>30%</td><td>覆盖长尾场景</td></tr>
+      <tr><td>新 query 类型</td><td>embedding 距离 &gt; 阈值</td><td>80%</td><td>捕捉新兴话题</td></tr>
+      <tr><td>工具调用失败</td><td>工具返回错误</td><td>100%</td><td>Agent 改进</td></tr>
+    </tbody>
+  </table>
+
+  <div class="warn"><strong>采样率初期宁高勿低。</strong>一旦某类日志被丢弃，就无法事后恢复。线上质量问题的代价远高于存储成本。建议前 3 个月全量保留，再根据存储成本和数据分析结果逐步降低采样率。</div>
+</section>
+
+<!-- §4 信号转化 -->
+<section class="section" id="s4">
+  <h2>4. 信号转化为标注数据</h2>
+
+  <h3>隐式信号提取</h3>
+  <table>
+    <thead><tr><th>行为信号</th><th>解释</th><th>标注转化方式</th><th>噪声来源</th></tr></thead>
+    <tbody>
+      <tr><td>Thumb Up</td><td>用户明确满意</td><td>正样本；chosen in DPO pair</td><td>礼貌性点赞、群体效应</td></tr>
+      <tr><td>Thumb Down</td><td>用户明确不满意</td><td>负样本；rejected in DPO pair</td><td>误触、网络错误</td></tr>
+      <tr><td>Retry（重新生成）</td><td>用户认为回答不好</td><td>弱负信号</td><td>好奇心重新试、测试模型</td></tr>
+      <tr><td>停留时长 &gt; P90</td><td>用户阅读了完整回答</td><td>弱正信号</td><td>用户离开未关闭</td></tr>
+      <tr><td>用户编辑后发送</td><td>用户修改了 AI 生成内容</td><td>高质量：(original, edited) 对</td><td>编辑可能只是语气调整</td></tr>
+      <tr><td>会话继续（follow-up）</td><td>用户在同一会话继续提问</td><td>弱正信号（上下文满足）</td><td>澄清性追问</td></tr>
+      <tr><td>快速关闭（&lt;5s）</td><td>用户未阅读即关闭</td><td>弱负信号</td><td>误触、看完不需要回复</td></tr>
+    </tbody>
+  </table>
+
+  <h3>客服标注路径</h3>
+  <pre class="mermaid">flowchart TD
+  A[AI 生成回复] --> B{客服是否修改?}
+  B -->|未修改，直接发出| C[弱正样本]
+  B -->|修改后发出| D{修改幅度?}
+  D -->|轻微修改| E[语气调整\n标记为风格偏好数据]
+  D -->|重大修改（事实、逻辑）| F[高价值训练对\noriginal vs edited]
+  B -->|丢弃，重新手写| G[强负样本\nAI 完全不适用]</pre>
+
+  <h3>LLM-as-Judge 半自动标注</h3>
+  <p>使用更强的 LLM（如 Claude Opus、GPT-4o）对推理日志进行质量评估，批量生成伪标注。</p>
+
+  <div class="danger"><strong>LLM-as-judge 存在系统性偏置，不校准不可用于生产飞轮。</strong>常见偏置：（1）长度偏置：judge 偏好更长的回答，即使内容更差；（2）风格偏置：judge 偏好与自身风格接近的输出；（3）位置偏置：A/B 对比时，判断结果受呈现顺序影响。未经校准的 judge 会导致训练数据系统性地偏向某一方向，让模型越来越像 judge，而不是越来越像用户期望的样子。</div>
+
+  <table>
+    <thead><tr><th>步骤</th><th>操作</th><th>验证指标</th></tr></thead>
+    <tbody>
+      <tr><td>1. 构建校准集</td><td>人工标注 200-500 条，覆盖各质量档位</td><td>Kappa 一致性 &gt; 0.7</td></tr>
+      <tr><td>2. 校准 judge</td><td>在校准集上运行 judge，计算与人工标注的一致性</td><td>Pearson r &gt; 0.75</td></tr>
+      <tr><td>3. 去除偏置</td><td>Swap A/B 顺序取均值；显式指令压制长度偏置</td><td>顺序敏感性 &lt; 5%</td></tr>
+      <tr><td>4. 周期重校准</td><td>每月或 judge 模型更新时重新校准</td><td>一致性保持 &gt; 0.75</td></tr>
+      <tr><td>5. 人工抽检</td><td>每批 judge 输出随机抽取 5% 人工复核</td><td>抽检通过率 &gt; 90%</td></tr>
+    </tbody>
+  </table>
+
+  <h3>DPO / KTO 偏好数据格式</h3>
+  <div class="grid-2">
+    <div class="card">
+      <h4>DPO 偏好对格式</h4>
+      <pre><code>{
+  "prompt": "如何优化 RAG 检索质量？",
+  "chosen": "RAG 检索质量优化可以从三个维度...",
+  "rejected": "你可以试试调整参数...",
+  "source": "llm_judge_v2.3",
+  "chosen_score": 4.2,
+  "rejected_score": 2.1
+}</code></pre>
+      <p>需要同一 prompt 下的 chosen/rejected 对。适合有充分 A/B 比较数据的场景。</p>
+    </div>
+    <div class="card">
+      <h4>KTO 单样本格式</h4>
+      <pre><code>{
+  "prompt": "如何优化 RAG 检索质量？",
+  "completion": "你可以试试调整参数...",
+  "label": false,
+  "source": "user_thumb_down"
+}</code></pre>
+      <p>仅需单条记录 + 好/坏标签。适合只有 thumb down 而无对应 chosen 版本的场景。</p>
+    </div>
+  </div>
+
+  <div class="note"><strong>KTO 更适合真实业务场景。</strong>DPO 需要对同一 prompt 构建 chosen/rejected 对，但实际中用户 thumb down 的 completion 很少有对应的 chosen 版本。KTO 仅需单条记录（completion + 好/坏标签），更易从真实日志中构建。</div>
+</section>
+
+<!-- §5 漂移检测 -->
+<section class="section" id="s5">
+  <h2>5. 数据漂移检测</h2>
+
+  <h3>三种漂移类型</h3>
+  <table>
+    <thead><tr><th>漂移类型</th><th>定义</th><th>典型表现</th><th>检测方法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Population Drift</strong></td><td>query 的输入分布发生变化</td><td>新话题/新功能带来从未出现过的 query 类型</td><td>Embedding 聚类 + KS 检验</td></tr>
+      <tr><td><strong>Concept Drift</strong></td><td>同样 query 的"正确答案"发生变化</td><td>政策更新后，旧答案变成错误答案</td><td>业务 Golden Set 定期重评</td></tr>
+      <tr><td><strong>Feature Drift</strong></td><td>上下文特征分布变化</td><td>用户平均输入长度变化；工具调用频率变化</td><td>特征统计分布监控</td></tr>
+    </tbody>
+  </table>
+
+  <h3>漂移检测决策树</h3>
+  <pre class="mermaid">flowchart TD
+  A[每日漂移检测触发] --> B[计算 query embedding 分布]
+  B --> C{KS 检验 p-value 小于 0.05?}
+  C -->|否| D[distribution drift: 轻微\n仅记录]
+  C -->|是| E{新兴 cluster 占比大于 10%?}
+  E -->|否| F[distribution drift: 中等\n触发数据补充]
+  E -->|是| G[distribution drift: 严重\n触发立即训练]
+
+  A --> H[重评 Golden Set]
+  H --> I{Golden Set 准确率下降大于 3%?}
+  I -->|否| J[concept drift: 可接受]
+  I -->|是| K{与上次评测相差大于 2 周?}
+  K -->|否| L[concept drift: 异常\n检查评测集是否过期]
+  K -->|是| M[concept drift: 真实\n触发训练 + 更新 Golden Set]
+
+  A --> N[特征分布监控]
+  N --> O{P95 输入长度变化大于 30%?}
+  O -->|是| P[feature drift: 需检查模型\n长文本处理能力]</pre>
+
+  <h3>漂移检测工具选型</h3>
+  <table>
+    <thead><tr><th>工具</th><th>适合场景</th><th>优势</th><th>局限</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Evidently AI</strong></td><td>开源、快速接入</td><td>丰富的开箱即用报告；支持 LLM 评估</td><td>大规模场景需自行扩展</td></tr>
+      <tr><td><strong>Arize Phoenix</strong></td><td>LLM 专用漂移检测</td><td>embedding 漂移可视化强；支持 span 追踪</td><td>商业工具，成本较高</td></tr>
+      <tr><td><strong>自建 + Prometheus</strong></td><td>完全自定义控制</td><td>灵活性最高；与内部监控体系统一</td><td>开发成本高</td></tr>
+      <tr><td><strong>WhyLogs</strong></td><td>统计特征漂移</td><td>轻量；流式处理支持好</td><td>LLM 特定场景支持弱</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note"><strong>漂移阈值是业务决策，不是技术参数。</strong>KS 检验 p-value &lt; 0.05 是统计意义上的显著漂移，但不代表需要立即重训。是否触发训练还取决于：业务场景的质量容忍度、训练成本、当前 drift score 的绝对值。工程团队需要和业务团队共同制定"触发训练的漂移阈值"，而不是用统计显著性直接驱动系统动作。</div>
+</section>
+
+<!-- §6 增量训练 -->
+<section class="section" id="s6">
+  <h2>6. 增量训练 vs 完全重训</h2>
+
+  <h3>训练策略对比</h3>
+  <table>
+    <thead><tr><th>策略</th><th>训练对象</th><th>适用场景</th><th>遗忘风险</th><th>成本</th><th>恢复旧能力难度</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LoRA 增量</strong></td><td>低秩适配器（冻结 base）</td><td>风格/任务特化；快速响应漂移</td><td>极低</td><td>极低（~5-10% base 训练成本）</td><td>容易（加载旧 LoRA）</td></tr>
+      <tr><td><strong>SFT 增量</strong></td><td>全量参数或部分层</td><td>知识更新；能力扩展</td><td>中等</td><td>中</td><td>需要重训或 merge 回滚</td></tr>
+      <tr><td><strong>DPO 增量</strong></td><td>在 SFT 基础上偏好对齐</td><td>行为对齐；减少有害输出</td><td>低</td><td>低-中</td><td>回退到 SFT 版本</td></tr>
+      <tr><td><strong>Continual Pretraining</strong></td><td>Base model 全量</td><td>大规模知识注入；领域适配</td><td>高（需要专门防护）</td><td>极高</td><td>困难</td></tr>
+    </tbody>
+  </table>
+
+  <h3>灾难性遗忘防护机制</h3>
+  <div class="grid-3">
+    <div class="card">
+      <h4>Rehearsal（回放）</h4>
+      <p>在新数据中混入 10-30% 的旧数据样本（从历史训练集采样），让模型在学习新知识的同时保持对旧知识的记忆。计算成本低，效果可靠，是最常用的方法。</p>
+    </div>
+    <div class="card">
+      <h4>EWC（弹性权重巩固）</h4>
+      <p>通过 Fisher 信息矩阵识别对旧任务重要的参数，在训练新任务时对这些参数施加额外的正则化约束，防止其被大幅更新。计算成本较高，但对特定参数的保护更精准。</p>
+    </div>
+    <div class="card">
+      <h4>LoRA-only 更新</h4>
+      <p>冻结 base model 全量参数，只训练 LoRA adapter。这是最强的遗忘防护，因为 base model 的知识完全不变，新能力通过 adapter 叠加。代价是表达能力受限。</p>
+    </div>
+  </div>
+
+  <h3>训练触发条件流程</h3>
+  <pre class="mermaid">flowchart TD
+  Start[每日监控检查] --> A{漂移 Score 超过阈值?}
+  A -->|是| T1[基于漂移触发]
+  A -->|否| B{数据积累超过目标量?}
+  B -->|是| T2[基于数据量触发]
+  B -->|否| C{距上次训练超过时间窗口?}
+  C -->|是| T3[基于时间触发]
+  C -->|否| D{业务事件触发?\n如产品重大更新}
+  D -->|是| T4[事件触发]
+  D -->|否| E[继续监控]
+
+  T1 --> F[确认数据量充足\n大于 1K DPO 对 / 大于 5K SFT 样本]
+  T2 --> F
+  T3 --> F
+  T4 --> F
+  F -->|充足| G[启动增量训练]
+  F -->|不足| H[等待更多数据\n或扩大采样率]</pre>
+
+  <div class="note"><strong>训练触发需要多条件 AND。</strong>单一条件（如"距上次训练超过 7 天"）不足以触发训练——还需要确认数据量充足、数据质量通过验收、当前系统负载允许。频繁但数据不足的训练，比适时但充分准备的训练更危险。</div>
+</section>
+
+<!-- §7 评测+灰度联动 -->
+<section class="section" id="s7">
+  <h2>7. 自动评测 + 灰度发布联动</h2>
+
+  <h3>与 §12c 发布门禁的串联</h3>
+  <p>增量训练完成后，必须经过与完整发布等效的评测门禁——不能因为是"小改动"而降低门槛。</p>
+
+  <pre class="mermaid">sequenceDiagram
+  participant TRN as 增量训练系统
+  participant REG as Model Registry
+  participant EVAL as 评测系统
+  participant GATE as 门禁引擎
+  participant CD as 灰度发布
+
+  TRN->>REG: 注册新 LoRA adapter (status=draft)
+  REG->>EVAL: 触发评测 job
+  EVAL->>EVAL: MMLU / GSM8K / HumanEval
+  EVAL->>EVAL: 业务 Golden Set
+  EVAL->>EVAL: 灾难性遗忘检测（旧评测集）
+  EVAL->>GATE: 提交评测报告
+  GATE->>GATE: 所有指标不低于 baseline?
+  GATE->>REG: status=validated / rejected
+  REG->>CD: 触发 canary (1% 流量)
+  CD->>CD: 质量监控 + 成本监控 (4h)
+  CD->>REG: canary 通过 → 全量放量</pre>
+
+  <h3>增量训练特有的评测项</h3>
+  <table>
+    <thead><tr><th>评测项</th><th>目的</th><th>通过条件</th></tr></thead>
+    <tbody>
+      <tr><td>历史 Golden Set 回归</td><td>检测灾难性遗忘</td><td>不低于 base 版本 98%</td></tr>
+      <tr><td>旧漂移场景准确率</td><td>验证新训练改善了目标场景</td><td>高于 base 版本 ≥ 2%（或统计显著）</td></tr>
+      <tr><td>对抗样本防御率</td><td>确认新数据未引入安全漏洞</td><td>≥ base 版本</td></tr>
+      <tr><td>cost per token 变化</td><td>LoRA 额外推理成本</td><td>≤ 3% overhead</td></tr>
+    </tbody>
+  </table>
+
+  <h3>自动 Rollback 配置</h3>
+  <pre><code>auto_rollback_rules:
+  hard:  # 任一条件即触发立即回滚
+    - metric: harmful_output_rate
+      threshold: ">0.1%"
+    - metric: error_rate
+      threshold: ">2x_baseline"
+    - metric: golden_set_accuracy
+      threshold: "<95%_baseline"
+  soft:  # 需要人工确认
+    - metric: quality_score_p50
+      threshold: "<98%_baseline"
+      window: "30min"
+      action: pause_rollout + alert
+    - metric: cost_per_request
+      threshold: ">110%_baseline"
+      window: "1h"
+      action: alert + review</code></pre>
+
+  <div class="danger"><strong>不要因为"是增量训练"而跳过安全评测。</strong>增量训练污染事件的典型形态是：一批脏数据进入 DPO 训练集 → 模型在特定 pattern 下开始输出不安全内容 → 由于基准指标变化不大，标准评测未发现 → 数周后通过用户投诉才暴露。安全评测必须是增量训练门禁的必过项，零容忍任何降低。</div>
+</section>
+
+<!-- §8 失败模式 -->
+<section class="section" id="s8">
+  <h2>8. 飞轮的失败模式</h2>
+
+  <pre class="mermaid">mindmap
+  root((飞轮失败模式))
+    数据污染
+      垃圾用户反馈
+      对抗性 thumb 刷分
+      bot 流量污染
+      脏数据进训练集
+    Judge 偏置累积
+      长度偏置
+      风格偏置
+      自我增强循环
+      模型越来越像 Judge
+    数据同质化
+      大模型生成训小模型
+      偏见放大
+      模型能力趋同
+      创造性丧失
+    系统性问题
+      飞轮过快频繁抖动
+      遗忘防护失效
+      成本失控
+      评测集过拟合</pre>
+
+  <table>
+    <thead><tr><th>失败模式</th><th>根因</th><th>早期症状</th><th>防护手段</th></tr></thead>
+    <tbody>
+      <tr><td><strong>反馈污染</strong></td><td>spam/对抗用户刷分</td><td>某类 query 的正向反馈率异常高（&gt;2σ）</td><td>异常检测（统计+行为模式）；用户可信度评分</td></tr>
+      <tr><td><strong>Judge Bias 累积</strong></td><td>LLM-as-judge 未校准</td><td>模型输出越来越冗长；评分和人工评估偏差增大</td><td>定期人工校准；多 judge 交叉验证</td></tr>
+      <tr><td><strong>数据同质化</strong></td><td>用大模型生成数据训小模型</td><td>模型回答风格趋同；创造性和多样性下降</td><td>限制合成数据比例（&lt;30%）；多样性指标监控</td></tr>
+      <tr><td><strong>飞轮过快抖动</strong></td><td>训练频率高于评测速度</td><td>版本频繁切换；用户体验不稳定</td><td>最小训练间隔；强制评测通过后才放量</td></tr>
+      <tr><td><strong>评测集过拟合</strong></td><td>Golden Set 未随漂移更新</td><td>Golden Set 高分但线上质量持续下降</td><td>定期轮换 Golden Set；盲测集制度</td></tr>
+    </tbody>
+  </table>
+
+  <div class="danger"><strong>反馈污染是飞轮最危险的失败模式，因为它会自我增强。</strong>受污染的训练数据 → 模型在该方向偏移 → 模型输出更多用户"满意"的偏移内容 → 产生更多正向反馈 → 下一轮训练进一步偏移。在发现污染之前，飞轮会持续加速朝错误方向转。早期检测的关键指标：某类 query 的 thumb up 率突然大幅上升（&gt;2σ），或特定用户群的反馈模式与历史极度不一致。</div>
+
+  <div class="danger"><strong>LLM-as-judge 偏置累积是慢性失败模式，比污染更难发现。</strong>模型每轮训练后输出风格向 judge 靠拢，judge 对"自己风格"的输出给更高分，下轮训练进一步靠拢——这个正反馈回路会让模型在 judge 评分持续提升的同时，对真实用户的帮助越来越少。防护手段：每季度用"人类偏好研究"校验 judge 评分与人类偏好的相关性，相关性下降 &gt;10% 则暂停飞轮。</div>
+</section>
+
+<!-- §9 多租户飞轮 -->
+<section class="section" id="s9">
+  <h2>9. 多租户飞轮治理</h2>
+
+  <h3>三种多租户飞轮架构</h3>
+  <table>
+    <thead><tr><th>架构</th><th>数据共享</th><th>模型共享</th><th>适合场景</th><th>数据隔离保证</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Per-Tenant LoRA 飞轮</strong></td><td>无（各租户独立）</td><td>共享 base，独立 adapter</td><td>租户数据差异大；高隐私要求</td><td>最强（训练数据物理隔离）</td></tr>
+      <tr><td><strong>共享 Base 飞轮</strong></td><td>汇总训练（脱敏后）</td><td>共享 base + 共享飞轮</td><td>租户数据差异小；成本优先</td><td>中等（需脱敏+差分隐私）</td></tr>
+      <tr><td><strong>联邦飞轮</strong></td><td>无（梯度聚合）</td><td>共享全局模型；本地数据不离境</td><td>数据本地化法规；跨客户协同</td><td>最强（原始数据不离本地）</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Per-Tenant LoRA 飞轮架构</h3>
+  <pre class="mermaid">flowchart LR
+  subgraph TenantA [租户 A]
+    A1[日志 A] --> A2[LoRA Adapter A\n飞轮独立运行]
+  end
+  subgraph TenantB [租户 B]
+    B1[日志 B] --> B2[LoRA Adapter B\n飞轮独立运行]
+  end
+  subgraph Shared [共享层]
+    BASE[Base LLM\n冻结，不参与租户飞轮] --> SERVE[Multi-LoRA 推理服务]
+    A2 --> SERVE
+    B2 --> SERVE
+  end</pre>
+
+  <div class="danger"><strong>共享 Base 飞轮必须有严格的数据隔离，否则租户 A 的数据会影响租户 B 的体验。</strong>常见隐患：（1）数据脱敏不充分，商业机密信息泄漏到共享训练集；（2）某一租户数据量极大，主导了训练方向，导致其他租户效果退化；（3）数据混合后无法追溯"哪个版本的哪次训练用了哪个租户的数据"。对于有竞争关系的租户，必须使用 Per-Tenant LoRA 飞轮，不允许数据混合。</div>
+</section>
+
+<!-- §10 观测看板 -->
+<section class="section" id="s10">
+  <h2>10. 飞轮观测看板</h2>
+
+  <table>
+    <thead><tr><th>指标名称</th><th>定义</th><th>采集频率</th><th>健康值</th><th>告警阈值</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Drift Score</strong></td><td>当前 query 分布与基线的 JS 散度</td><td>每小时</td><td>&lt; 0.05</td><td>&gt; 0.15</td></tr>
+      <tr><td><strong>Label Rate</strong></td><td>有效标注数据生成速率（条/天）</td><td>每日</td><td>按计划目标</td><td>&lt; 目标 50%</td></tr>
+      <tr><td><strong>Judge Calibration Score</strong></td><td>judge 与人工评估的 Kappa 一致性</td><td>每月</td><td>&gt; 0.75</td><td>&lt; 0.65</td></tr>
+      <tr><td><strong>Training Frequency</strong></td><td>增量训练触发频率（次/月）</td><td>每月</td><td>按计划</td><td>&gt; 4次/月</td></tr>
+      <tr><td><strong>Eval Pass Rate</strong></td><td>增量训练后评测门禁通过率</td><td>每次训练</td><td>&gt; 85%</td><td>&lt; 70%</td></tr>
+      <tr><td><strong>Canary Success Rate</strong></td><td>canary 放量成功（未回滚）的比率</td><td>每次发布</td><td>&gt; 90%</td><td>&lt; 75%</td></tr>
+      <tr><td><strong>Cost Per Quality Unit</strong></td><td>每单位质量提升的美元成本</td><td>每月</td><td>下降趋势</td><td>连续 2 月上升</td></tr>
+      <tr><td><strong>User Preference Curve</strong></td><td>用户 thumb up 率趋势</td><td>每周</td><td>上升或平稳</td><td>连续 3 周下降</td></tr>
+      <tr><td><strong>Forgetting Index</strong></td><td>历史基准测试准确率变化</td><td>每次训练</td><td>≥ 98% baseline</td><td>&lt; 95% baseline</td></tr>
+      <tr><td><strong>Feedback Anomaly Rate</strong></td><td>异常反馈（可能污染）占比</td><td>每日</td><td>&lt; 1%</td><td>&gt; 3%</td></tr>
+    </tbody>
+  </table>
+
+  <div class="success"><strong>最重要的单一指标是 Cost Per Quality Unit（CPQU）。</strong>它把训练成本、评测成本、推理成本和质量改善综合反映为一个数字，直接回答"飞轮是否在创造价值"。如果 CPQU 持续上升，说明飞轮效率在下降，需要排查是数据质量下降、遗忘问题还是评测集过拟合。</div>
+</section>
+
+<!-- §11 与传统 ML 持续学习的差异 -->
+<section class="section" id="s11">
+  <h2>11. 与传统 ML 持续学习的差异</h2>
+
+  <table>
+    <thead><tr><th>维度</th><th>传统 ML 持续学习</th><th>LLM 飞轮</th></tr></thead>
+    <tbody>
+      <tr><td><strong>训练成本</strong></td><td>通常几十至几千美元</td><td>每轮 LoRA 训练 $500-$5000；full SFT $10K+</td></tr>
+      <tr><td><strong>评测成本</strong></td><td>通常秒-分钟级自动评测</td><td>LLM-as-judge 每批 $20-200；人工抽检额外成本</td></tr>
+      <tr><td><strong>"标签"定义</strong></td><td>明确（分类标签、回归值）</td><td>模糊（"更好"是主观的）；需要偏好建模</td></tr>
+      <tr><td><strong>遗忘保护</strong></td><td>通常不需要</td><td>必须显式处理灾难性遗忘</td></tr>
+      <tr><td><strong>Judge 循环风险</strong></td><td>不存在</td><td>存在：模型 → judge → 训练数据 → 模型</td></tr>
+      <tr><td><strong>数据合规复杂度</strong></td><td>通常较简单</td><td>极高：用户对话数据、GDPR、数据隔离</td></tr>
+      <tr><td><strong>Reasoning Model 挑战</strong></td><td>不适用</td><td>o-series 等推理模型的 CoT 数据生成成本极高</td></tr>
+      <tr><td><strong>Token 成本</strong></td><td>不适用</td><td>每次评测和 judge 都消耗 token，成本可观</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note"><strong>Reasoning Model 的飞轮更昂贵，但回报也更高。</strong>对于 o-series 类型的推理模型，每条训练数据的生成成本远高于普通 LLM（因为需要完整的 CoT 推理链），但经过飞轮训练后在推理任务上的提升也更显著。实践中，reasoning model 的飞轮通常采用更长的更新周期（月级）和更高的数据质量门槛，而不是追求高频更新。</div>
+</section>
+
+<!-- §12 Worked Example -->
+<section class="section" id="s12">
+  <h2>12. Worked Example：客服 LLM Agent 的 8 周飞轮</h2>
+
+  <h3>业务背景</h3>
+  <p>某电商平台的智能客服 Agent，每天处理 100K 会话。上线初期（第 0 周）的核心问题：退款流程类问题处理准确率 73%（内部 Golden Set 评测），用户 thumb down 率 18%，客服二次介入率 12%。目标：8 周内把准确率提升到 85%+，thumb down 率降到 10% 以下。</p>
+
+  <h3>飞轮配置</h3>
+  <pre><code>flywheel_config:
+  log_collection:
+    sampling_rate: 10%
+    full_sample_on: [thumb_down, tool_fail, confidence_low]
+    pii_scrubbing: presidio
+  annotation:
+    llm_judge: claude-opus-4
+    judge_calibration: monthly
+    human_review_rate: 5%
+  training:
+    strategy: dpo_lora
+    trigger: weekly
+    min_dpo_pairs: 2000
+    rehearsal_ratio: 20%
+  evaluation:
+    benchmarks: [mmlu, gsm8k, golden_set, safety]
+    forgetting_threshold: 98%
+  deployment:
+    canary_traffic: 5%
+    canary_duration: 6h
+    auto_rollback: true</code></pre>
+
+  <h3>8 周质量变化</h3>
+  <table>
+    <thead><tr><th>周次</th><th>Golden Set 准确率</th><th>Thumb Down 率</th><th>Retry 率</th><th>客服介入率</th><th>事件</th></tr></thead>
+    <tbody>
+      <tr><td>Week 0</td><td>73%</td><td>18%</td><td>14%</td><td>12%</td><td>基线</td></tr>
+      <tr><td>Week 1</td><td>75% (+2%)</td><td>16%</td><td>12%</td><td>11%</td><td>第一轮 DPO：退款流程偏好对</td></tr>
+      <tr><td>Week 2</td><td>77% (+2%)</td><td>15%</td><td>11%</td><td>10%</td><td>补充工具调用失败日志</td></tr>
+      <tr><td>Week 3</td><td>79% (+2%)</td><td>14%</td><td>10%</td><td>9%</td><td>增加客服修改对作为训练数据</td></tr>
+      <tr><td>Week 4</td><td>81% (+2%)</td><td>12%</td><td>9%</td><td>8%</td><td>Concept drift：新退货政策更新</td></tr>
+      <tr><td><strong>Week 5</strong></td><td><strong>78% (-3%)</strong></td><td><strong>15%</strong></td><td><strong>12%</strong></td><td><strong>10%</strong></td><td><strong>⚠ 飞轮污染事件</strong></td></tr>
+      <tr><td>Week 6</td><td>83% (+5%)</td><td>11%</td><td>8%</td><td>7%</td><td>污染清除 + 重训</td></tr>
+      <tr><td>Week 7</td><td>85% (+2%)</td><td>10%</td><td>7%</td><td>6%</td><td>全量发布新版本</td></tr>
+      <tr><td>Week 8</td><td>86% (+1%)</td><td>10%</td><td>7%</td><td>6%</td><td>飞轮进入稳态</td></tr>
+    </tbody>
+  </table>
+
+  <h3>成本变化（CPQU 分析）</h3>
+  <table>
+    <thead><tr><th>周次</th><th>训练成本（$）</th><th>Judge 成本（$）</th><th>总成本（$）</th><th>质量提升（%）</th><th>CPQU（$/质量点）</th></tr></thead>
+    <tbody>
+      <tr><td>Week 1</td><td>800</td><td>120</td><td>920</td><td>+2%</td><td>460</td></tr>
+      <tr><td>Week 3</td><td>750</td><td>110</td><td>860</td><td>+2%</td><td>430</td></tr>
+      <tr><td>Week 6</td><td>1200</td><td>180</td><td>1380</td><td>+5%</td><td><strong>276（最优）</strong></td></tr>
+      <tr><td>Week 8</td><td>600</td><td>90</td><td>690</td><td>+1%</td><td>690</td></tr>
+    </tbody>
+  </table>
+
+  <h3>第 5 周污染事件复盘</h3>
+
+  <div class="warn"><strong>事件经过：</strong>第 5 周训练完成后，canary 发布（5% 流量），6 小时内未触发自动 rollback 阈值，但人工巡检时发现：Golden Set 准确率下降 3%，特别是"价格异议"类问题的回答开始出现"无条件同意用户价格判断"的倾向。</div>
+
+  <h4>根因链路</h4>
+  <pre class="mermaid">flowchart TD
+  A[第 4 周末\n约 500 个机器人账号集中 thumb up\n针对 AI 同意降价类回复] --> B[异常反馈通过采样进入\n第 5 周 DPO 候选池]
+  B --> C[Judge 未发现问题\n存在未校准的顺从偏置\njudge 对顺从回答打分偏高]
+  C --> D[污染数据进入训练\n模型在价格类问题上行为异常]
+  D --> E[人工抽检（5% 随机）\n在 canary 阶段触发]
+  E --> F[发现 3 条异常顺从回复\n触发深入排查]</pre>
+
+  <h4>处置流程</h4>
+  <ol>
+    <li>立即回滚 canary，恢复上一版本（Week 4 模型）</li>
+    <li>隔离可疑日志：异常 thumb up 批次 → 标记为 suspect</li>
+    <li>分析 500 个账号的行为模式 → 确认机器人特征（高度相似、时间集中）</li>
+    <li>从训练集中删除所有来源于这批账号的标注数据</li>
+    <li>修复 judge 校准：增加"过度顺从"为负面标注样本</li>
+    <li>重新训练（第 6 周），质量跳升 5%（高质量替代 + 更好的 judge 校准）</li>
+  </ol>
+
+  <h4>事后加入的防护配置</h4>
+  <pre><code>anti_pollution:
+  user_trust_score:
+    min_account_age_days: 30
+    min_session_count: 5
+    max_feedback_rate_per_day: 50
+  anomaly_detection:
+    thumb_up_spike_sigma: 2.0
+    cluster_feedback_window: 24h
+  mandatory_human_check:
+    for_categories: [pricing, refund_policy]</code></pre>
+
+  <h4>关键经验</h4>
+  <ol>
+    <li><strong>canary 时间窗口 6 小时不足以发现行为类问题</strong>——质量指标回归需要更长观测期（12-24h）；</li>
+    <li><strong>人工抽检是最后防线</strong>——自动化评测未能发现的污染，被 5% 抽检发现；</li>
+    <li><strong>Judge 校准的顺从偏置是系统性盲点</strong>——必须在校准集中显式包含"顺从但错误"的负例；</li>
+    <li><strong>污染后重训往往有"蓬勃反弹"效应</strong>——高质量替代数据 + 更好的 judge 校准，使第 6 周 +5% 远超正常训练轮次。</li>
+  </ol>
+</section>
+
+<!-- §13 练习题 -->
+<section class="section" id="s13">
+  <h2>13. 练习题</h2>
+
+  <p><strong>11f-1（基础）</strong>：解释 LLM 产品上线后为什么会出现"模型漂移"？列举三种不同类型的漂移（Population/Concept/Feature Drift），并各给一个电商客服场景的具体例子。</p>
+
+  <p><strong>11f-2（基础）</strong>：设计推理日志的必要字段 schema，至少包含 8 个字段。对于每个字段，说明它用于飞轮的哪个环节（漂移检测/标注提取/成本监控/安全审计）。</p>
+
+  <p><strong>11f-3（基础）</strong>：对比 DPO 和 KTO 两种偏好数据格式：各自需要什么原始信号？在什么情况下 KTO 比 DPO 更实用？给出从"用户 thumb down 日志"构建 KTO 训练集的完整流程。</p>
+
+  <p><strong>11f-4（基础）</strong>：什么是 LLM-as-judge 的"长度偏置"和"顺从偏置"？各给出一个具体例子，并说明如何在 judge prompt 设计中缓解这两种偏置。</p>
+
+  <p><strong>11f-5（进阶）</strong>：设计一个漂移检测系统，要求：(a) 能检测 population drift；(b) 能检测 concept drift；(c) 能区分"新兴 query 类型"和"query 语言风格变化"。给出每种检测的具体方法和告警阈值。</p>
+
+  <p><strong>11f-6（进阶）</strong>：对比 LoRA 增量训练、DPO 增量训练和 Continual Pretraining 三种策略：(a) 各自适合什么样的漂移类型？(b) 在"用户开始大量询问最新政策"这个场景下，应该选择哪种策略？理由是什么？</p>
+
+  <p><strong>11f-7（进阶）</strong>：解释"灾难性遗忘"在 LLM 增量训练中的具体表现。rehearsal（数据回放）和 EWC 两种防遗忘方法各有什么优缺点？你会如何选择？</p>
+
+  <p><strong>11f-8（进阶）</strong>：在 §8 中列出了五种飞轮失败模式。对于"Judge Bias 累积"这种失败模式：(a) 设计一个早期检测指标体系；(b) 如果已经检测到 judge 与人类偏好的 Pearson 相关性从 0.85 下降到 0.70，应该采取哪些补救措施？</p>
+
+  <p><strong>11f-9（进阶）</strong>：设计一个多租户飞轮的数据隔离方案，满足：(a) 租户 A 和租户 B 是直接竞争对手；(b) 系统使用共享 base model；(c) 需要遵守 GDPR。说明选择哪种多租户架构，以及关键的隔离边界在哪里。</p>
+
+  <p><strong>11f-10（设计）</strong>：为一个每天 100K 会话的客服 LLM 设计完整的采样策略，要求：(a) 控制总采样率在 8% 以内；(b) 确保长尾场景被覆盖；(c) 优先保留高价值训练信号。给出各采样规则的优先级和分配比例。</p>
+
+  <p><strong>11f-11（设计）</strong>：设计飞轮观测看板，包含：(a) 10 个核心指标（名称+定义+采集频率+告警阈值）；(b) 说明如何从这 10 个指标判断飞轮是否"健康运转"；(c) 给出一个"飞轮走偏"的典型指标组合（哪些指标异常，哪些看起来正常）。</p>
+
+  <p><strong>11f-12（综合）</strong>：某 AI 写作助手的飞轮在运行 3 个月后出现以下现象：judge 评分持续升高，但用户 thumb down 率也在同步上升。请分析：(a) 这是什么失败模式？(b) 根因最可能在哪里？(c) 如何在不停止飞轮的情况下进行修复？(d) 事后如何调整飞轮配置防止复发？</p>
+</section>
+
+<!-- 参考阅读 -->
+<section class="refbox" id="refbox">
+  <h2>深度参考阅读</h2>
+
+  <h3>学习路线</h3>
+  <ol>
+    <li>从 §1 建立第一性认知：LLM 会漂移 + 日志是信号 + 遗忘是风险 + 污染会走偏</li>
+    <li>阅读 §2-§4 掌握采集和标注，先从推理日志字段设计开始</li>
+    <li>阅读 §5 理解漂移检测，联动 Evidently AI 文档</li>
+    <li>阅读 §6 理解增量训练策略选型，联动 PEFT 文档</li>
+    <li>阅读 §7 理解如何与 <a href="../part4/12c-release-governance.html">§12c</a> 和 <a href="../part7/22-evaluation-release-and-incident.html">Ch22</a> 协同</li>
+    <li>阅读 §8-§9 建立风险意识</li>
+    <li>通过 §12 Worked Example 把所有概念在一个完整场景中串联</li>
+    <li>做练习 11f-10 到 11f-12，从设计题检验理解深度</li>
+  </ol>
+
+  <h3>数据飞轮与持续学习</h3>
+  <ul>
+    <li>Rafael Rafailov et al., <em>"Direct Preference Optimization: Your Language Model is Secretly a Reward Model"</em> (NeurIPS 2023). DPO 原始论文。</li>
+    <li>Kawin Ethayarajh et al., <em>"KTO: Model Alignment as Prospect Theoretic Optimization"</em> (ICML 2024). KTO 原始论文，适合只有单向信号时使用。</li>
+    <li>Deepmind, <em>"Scaling Laws for Reward Model Overoptimization"</em> (2022). 描述 judge/reward model 过拟合和 judge bias 累积的实证研究。</li>
+    <li>Lillian Weng, <em>"Prompt Engineering"</em> (lilian's blog, 2023). 包含 RLHF、DPO、KTO 等对齐方法的详细解析。</li>
+  </ul>
+
+  <h3>漂移检测与监控</h3>
+  <ul>
+    <li>Evidently AI 官方博客 (evidentlyai.com/blog). 包含大量 LLM 漂移检测的实践案例。</li>
+    <li>Arize AI, <em>"LLM Observability Guide"</em> (2024). LLM 专用可观测性和漂移检测的工程指南。</li>
+    <li>Gama et al., <em>"A Survey on Concept Drift Adaptation"</em> (ACM Computing Surveys 2014). 传统 ML concept drift 的系统综述。</li>
+  </ul>
+
+  <h3>持续学习与遗忘防护</h3>
+  <ul>
+    <li>James Kirkpatrick et al., <em>"Overcoming catastrophic forgetting in neural networks"</em> (PNAS 2017). EWC 原始论文。</li>
+    <li>Hugging Face PEFT 文档 (huggingface.co/docs/peft). LoRA、IA³、Prefix Tuning 等 PEFT 方法的权威实现文档。</li>
+    <li>Sebastian Raschka, <em>"Practical Tips for Finetuning LLMs Using LoRA"</em> (2023). LoRA 微调的实战经验总结。</li>
+  </ul>
+
+  <h3>LLM 评测与 judge 方法论</h3>
+  <ul>
+    <li>Lianmin Zheng et al., <em>"Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"</em> (NeurIPS 2023). LLM-as-judge 方法论与偏置分析。</li>
+    <li>Yann Dubois et al., <em>"AlpacaFarm: A Simulation Framework for Methods that Learn from Human Feedback"</em> (NeurIPS 2023). 人工反馈的仿真研究，分析信号噪声和偏置。</li>
+    <li>EleutherAI, <em>lm-evaluation-harness</em> (github.com/EleutherAI). 标准评测套件，支持 MMLU、GSM8K、HumanEval 等。</li>
+  </ul>
+
+  <h3>工程博客与案例</h3>
+  <ul>
+    <li>Anthropic Engineering Blog, <em>"Constitutional AI"</em> (2022). 通过 AI 反馈改进 AI 的飞轮实践。</li>
+    <li>OpenAI, <em>"Aligning language models to follow instructions"</em> (InstructGPT, 2022). 基于 RLHF 的飞轮实践案例。</li>
+    <li>Netflix Tech Blog, <em>"ML Platform: Enabling Responsible Real-Time ML"</em>. 持续学习与数据飞轮的 MLOps 工程实践。</li>
+    <li>Chip Huyen, <em>Designing Machine Learning Systems</em>. 第 8-9 章，面向 ML 工程师的持续学习和数据管道设计。</li>
+  </ul>
+</section>
+
+<nav class="bottomnav"></nav>
+
+<footer class="footer">
+  <p>AI Infra 教程 · Part 4 数据管道 · 第 11f 章</p>
+  <p>关联章节：
+    <a href="11a-data-ingestion.html">§11a 数据采集与摄入</a> ·
+    <a href="11e-data-versioning-and-lineage.html">§11e 数据版本与血缘</a> ·
+    <a href="12c-release-governance.html">§12c 发布门禁</a> ·
+    <a href="../part7/22-evaluation-release-and-incident.html">§22 灰度发布与评测</a>
+  </p>
+</footer>
+</main>
+
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

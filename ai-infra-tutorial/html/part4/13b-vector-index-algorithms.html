@@ -20,9 +20,11 @@
   <span class="chip">DiskANN</span>
   <span class="chip">Product Quantization</span>
   <span class="chip">ScaNN</span>
+  <span class="chip">SQ-HNSW</span>
   <span class="chip">维度诅咒</span>
   <span class="chip">Recall@K</span>
   <span class="chip">ANN 搜索</span>
+  <span class="chip">ANN Benchmark</span>
   <span class="chip">GPU 索引</span>
   <span class="chip">Hybrid Search</span>
 </div>
@@ -49,7 +51,9 @@
   <li><a class="anchor" href="#s14">索引训练与重建策略</a></li>
   <li><a class="anchor" href="#s15">性能指标与监控</a></li>
   <li><a class="anchor" href="#s16">Worked Example：100M 768d 向量库索引选型</a></li>
-  <li><a class="anchor" href="#s17">练习</a></li>
+  <li><a class="anchor" href="#s17">SQ-HNSW 与量化感知索引</a></li>
+  <li><a class="anchor" href="#s18">ANN 算法三维权衡实测基准</a></li>
+  <li><a class="anchor" href="#s19">练习</a></li>
 </ol>
 </section>
 
@@ -817,9 +821,126 @@ memory_gb: 38.4
 </table>
 </section>
 
-<!-- ===== §17 练习 ===== -->
+<!-- ===== §17 SQ-HNSW ===== -->
 <section class="section" id="s17">
-<h2>17. 练习</h2>
+<h2>17. SQ-HNSW 与量化感知索引</h2>
+
+<h3>为什么纯 HNSW 在十亿级场景难以承受</h3>
+<p>HNSW 在召回率和延迟上是目前最优的内存索引，但它有一个根本性的内存瓶颈：所有原始向量必须保留在内存中（用于精确距离计算）。在大规模场景下：</p>
+
+<table>
+  <tr>
+    <th>向量规模</th><th>维度</th><th>精度</th><th>原始向量内存</th>
+  </tr>
+  <tr><td>100M</td><td>768d</td><td>float32</td><td>307 GB</td></tr>
+  <tr><td>1B</td><td>768d</td><td>float32</td><td>3.07 <strong>TB</strong></td></tr>
+  <tr><td>1B</td><td>1536d</td><td>float32</td><td>6.14 <strong>TB</strong></td></tr>
+</table>
+
+<p>1B 768 维 float32 向量需要约 3 TB 内存——这对单机来说完全不可承受，即使是 H100（80 GB 显存）也只能放约 2600 万个 768 维向量。HNSW 的图邻接结构还需要额外内存：M=32 时每个节点约 256 字节，10 亿节点额外需要 256 GB——这在已经 3 TB 的原始向量之外。</p>
+
+<div class="warn"><strong>根本矛盾：</strong>HNSW 的高召回依赖精确距离计算，精确距离计算依赖原始 float32 向量留在内存，而 float32 原始向量在十亿级规模下几乎不可能全部装入内存。量化感知索引就是解决这个矛盾的工程路径。</div>
+
+<h3>SQ-HNSW：标量量化 + HNSW 图结构</h3>
+<p>SQ-HNSW 在 HNSW 图结构不变的前提下，把存储在内存中的原始向量替换为 int8 标量量化版本。标量量化的原理：对每个维度找到训练集的最小值 min_i 和最大值 max_i，将 float32 值线性映射到 [0, 255]（int8）：</p>
+<pre><code>int8_value = round((float32_value - min_i) / (max_i - min_i) × 255)</code></pre>
+
+<table>
+  <tr>
+    <th>方案</th><th>每向量存储（768d）</th><th>相对 float32 压缩比</th><th>召回精度损失</th>
+  </tr>
+  <tr><td>float32 HNSW</td><td>3072 字节</td><td>1x</td><td>0%</td></tr>
+  <tr><td>float16 HNSW</td><td>1536 字节</td><td>2x</td><td>&lt; 0.5%</td></tr>
+  <tr><td><strong>SQ int8 HNSW</strong></td><td><strong>768 字节</strong></td><td><strong>4x</strong></td><td><strong>&lt; 1%</strong></td></tr>
+  <tr><td>SQ int4 HNSW</td><td>384 字节</td><td>8x</td><td>1-3%</td></tr>
+</table>
+
+<p>对于 1B × 768d 的库：float32 HNSW 需要 3 TB（不可行）→ SQ int8 HNSW 需要 <strong>768 GB</strong>（可用高内存 CPU 服务器或 HBM 分片 GPU 集群）→ SQ int4 HNSW 需要 384 GB（高内存服务器可行）。量化误差相比 PQ 小得多（SQ 在每个维度独立量化，信息损失最小），但压缩比也远低于 PQ（4x vs 96x）。SQ 的设计点在"低精度损失、中等压缩"。</p>
+
+<h3>Rescoring HNSW：量化候选 + 精确精排</h3>
+
+<pre class="mermaid">flowchart LR
+  Q[查询向量 float32] --> G[HNSW 图导航\n使用 int8/PQ 压缩向量计算近似距离]
+  G --> CAND[候选集 top-200\n全部使用压缩向量得到]
+  CAND --> RS{Rescoring}
+  RS --> |从磁盘/内存加载原始 float32 向量| EXACT[精确重排序\ntop-200 → top-10]
+  EXACT --> RES[最终结果 top-10]</pre>
+
+<p>核心思路：HNSW 图导航阶段走量化向量（int8 或 PQ），速度快，内存小，但距离是近似的。Rescoring 阶段从候选集（top-100 到 top-500）中，用原始 float32 向量做精确距离计算，重新排序取 top-K。只要真正的 top-K 在候选集里（召回不漏），精排可以纠正顺序。</p>
+
+<div class="success"><strong>Rescoring 的实测效果：</strong>量化（int8 SQ）+ Rescoring vs 纯 float32 HNSW：召回率损失 &lt; 1%（Recall@10 从 0.97 → 0.965）；内存降低 4x（SQ int8）；查询加速 5-10x（int8 SIMD 计算更快 + 内存 cache 命中率更高）。</div>
+
+<div class="warn"><strong>工程边界：</strong>Rescoring 需要保留原始 float32 向量用于精排（通常存在 SSD 上，按需加载）。如果 Rescoring 候选集太大（如 top-500），SSD 随机读的延迟会显著增加。通常 top-100 到 top-200 是 Rescoring 候选集大小的合理上限。</div>
+
+<h3>主流向量库的量化支持现状</h3>
+
+<table>
+  <tr>
+    <th>向量库</th><th>SQ 支持</th><th>量化类型</th><th>Rescoring</th><th>备注</th>
+  </tr>
+  <tr><td><strong>Qdrant</strong></td><td>是（默认启用）</td><td>int8 SQ、binary</td><td>是</td><td>SQ 量化是 Qdrant 最推荐的内存优化方案</td></tr>
+  <tr><td><strong>Milvus</strong></td><td>是</td><td>SQ8（int8）、PQ</td><td>是</td><td>支持 HNSW + SQ8 组合</td></tr>
+  <tr><td><strong>pgvector 0.7+</strong></td><td>是</td><td>int2（halfvec）、binary</td><td>部分</td><td>halfvec 只压缩到 float16</td></tr>
+  <tr><td><strong>FAISS</strong></td><td>是</td><td>SQ（int8/int4）、PQ</td><td>需手工实现</td><td>IndexHNSWFlat + SQ 量化后 flat index Rescore</td></tr>
+  <tr><td><strong>Weaviate</strong></td><td>是</td><td>SQ、PQ、BQ（binary）</td><td>是</td><td>量化功能在 1.23+ 版本成熟</td></tr>
+</table>
+</section>
+
+<!-- ===== §18 ANN Benchmark ===== -->
+<section class="section" id="s18">
+<h2>18. ANN 算法三维权衡实测基准</h2>
+
+<div class="note"><strong>基准说明：</strong>以下数据基于公开 ANN Benchmarks（ann-benchmarks.com）、各算法原始论文和 Qdrant/Milvus 官方测试报告，单机环境（32 核 CPU，无 GPU，NVMe SSD）。以 SIFT-1M（1M × 128d）为参考，并推断到 100M × 768d 场景。实际性能高度依赖硬件、库版本、参数调优和数据分布，生产部署前必须在自有数据集上测试。</div>
+
+<h3>SIFT-1M 基准（1M × 128d，recall@10=0.95 时）</h3>
+
+<table>
+  <tr>
+    <th>算法</th><th>QPS</th><th>内存（GB / 1M 向量）</th><th>构建时长</th><th>备注</th>
+  </tr>
+  <tr><td>HNSW M=16</td><td>~8,000</td><td>~0.7（float32）</td><td>~3 分钟</td><td>低内存版，召回达标快</td></tr>
+  <tr><td>HNSW M=32</td><td>~6,000</td><td>~1.2（float32）</td><td>~6 分钟</td><td>标准平衡配置</td></tr>
+  <tr><td>HNSW M=64</td><td>~4,000</td><td>~2.4（float32）</td><td>~15 分钟</td><td>高召回配置</td></tr>
+  <tr><td><strong>SQ-HNSW（int8）M=32</strong></td><td><strong>~10,000</strong></td><td><strong>~0.35（int8）</strong></td><td>~7 分钟</td><td><strong>4x 内存节省，QPS 更高（SIMD）</strong></td></tr>
+  <tr><td>IVFPQ nprobe=32</td><td>~5,000</td><td>~0.04（PQ 码）</td><td>~5 分钟</td><td>极低内存，召回稍低</td></tr>
+  <tr><td>IVFPQ nprobe=128</td><td>~1,500</td><td>~0.04</td><td>~5 分钟</td><td>提高召回但 QPS 大降</td></tr>
+  <tr><td>ScaNN</td><td>~15,000</td><td>~0.1</td><td>~10 分钟</td><td>SIMD 高度优化，GCP 最优</td></tr>
+  <tr><td>DiskANN M=32</td><td>~2,000</td><td>~0.04（PQ in RAM）</td><td>~8 分钟</td><td>SSD 随机 IO 限制 QPS</td></tr>
+</table>
+
+<h3>100M × 768d 换算估算（recall@10 ≈ 0.95）</h3>
+
+<table>
+  <tr>
+    <th>算法</th><th>QPS（估算）</th><th>内存（GB）</th><th>构建时长（估算）</th><th>注意事项</th>
+  </tr>
+  <tr><td>HNSW M=32，float32</td><td>500-1000</td><td>307（原始）+ 30+（图）</td><td>3-5 小时</td><td>307 GB 原始向量不含图结构；单机 256 GB RAM 不安全</td></tr>
+  <tr><td><strong>SQ-HNSW int8 M=32</strong></td><td><strong>800-1500</strong></td><td><strong>~80（int8 向量）</strong></td><td>3.5-6 小时</td><td><strong>4x 压缩后可放入 256 GB 服务器，召回损失 &lt; 1%</strong></td></tr>
+  <tr><td>IVFPQ nlist=16384，nprobe=64，M=32</td><td>1000-3000</td><td>~3.5</td><td>1-2 小时</td><td>内存极省，适合高 QPS 低内存场景</td></tr>
+  <tr><td>DiskANN M=32</td><td>300-600</td><td>~3.2（PQ 码）</td><td>2-4 小时</td><td>NVMe SSD 存精确向量，IO 是瓶颈</td></tr>
+  <tr><td>ScaNN（SIMD 优化）</td><td>2000-5000</td><td>~10</td><td>2-3 小时</td><td>需要 Google ScaNN 库或 Vertex AI</td></tr>
+</table>
+
+<h3>算法选型决策路径（基于三维权衡）</h3>
+
+<table>
+  <tr>
+    <th>约束条件</th><th>推荐算法</th><th>理由</th>
+  </tr>
+  <tr><td>内存充足（&gt; 400 GB），延迟极敏感（&lt; 5ms P99）</td><td>HNSW float32 M=32-64</td><td>最高召回 + 最低延迟，内存够就用</td></tr>
+  <tr><td>内存受限（&lt; 100 GB），可接受 8ms P99</td><td><strong>SQ-HNSW int8 + Rescore</strong></td><td>4x 内存节省，召回损失 &lt; 1%，QPS 更高</td></tr>
+  <tr><td>超大规模（&gt; 500M 向量），内存极度受限</td><td>DiskANN + SQ-HNSW 分片</td><td>DiskANN 内存只需 PQ 码，SSD 存精确向量</td></tr>
+  <tr><td>极高 QPS（&gt; 5000 QPS），可接受 93% 召回</td><td>IVFPQ nlist=16384，nprobe=32-64</td><td>最小内存，最高吞吐</td></tr>
+  <tr><td>GCP 生态，高吞吐批量召回</td><td>ScaNN / Vertex AI Vector Search</td><td>SIMD 优化最充分，生态集成最好</td></tr>
+  <tr><td><strong>100M 768d，256 GB RAM 服务器（典型配置）</strong></td><td><strong>SQ-HNSW int8</strong></td><td>4x 压缩后约 80 GB，fit in RAM，召回接近 float32</td></tr>
+</table>
+
+<div class="success"><strong>核心结论：</strong>SQ-HNSW int8 是 100M-1B 规模、内存预算有限场景下"HNSW 性能"和"IVFPQ 内存效率"之间最好的折衷点——不需要昂贵的 SSD 随机读（DiskANN），也不牺牲 10%+ 的召回率（IVFPQ），同时 int8 SIMD 计算比 float32 更快，QPS 通常还高于 float32 HNSW。</div>
+</section>
+
+<!-- ===== §19 练习 ===== -->
+<section class="section" id="s19">
+<h2>19. 练习</h2>
 <div class="grid-2">
 
 <div class="card"><strong>13b-1</strong><br>解释维度诅咒（Curse of Dimensionality）的核心机制：为什么在 768 维空间中，KD-tree 的搜索效率接近暴力 O(N) 扫描？请用超球体体积分布来解释。</div>
@@ -846,6 +967,10 @@ memory_gb: 38.4
 
 <div class="card"><strong>13b-12</strong><br>设计一个 10 亿 768d 向量的搜索系统，要求：P99 &lt; 30ms，Recall@10 ≥ 90%，可用内存 128GB，有 4 台 NVMe SSD 服务器（每台 8TB NVMe SSD）。请给出索引算法选型、关键参数范围和分片策略。</div>
 
+<div class="card"><strong>13b-13</strong><br>解释 SQ int8 量化（标量量化）和 PQ（乘积量化）在以下三个维度的本质差异：(1) 压缩比；(2) 量化误差；(3) 距离计算方式。在什么场景下应该选 SQ 而不是 PQ？</div>
+
+<div class="card"><strong>13b-14</strong><br>Rescoring HNSW（量化做导航 + 精确向量精排）的"召回损失 &lt; 1%"这个结论依赖什么假设？如果原始向量存在 SSD 而非 RAM，Rescoring 的延迟会如何变化？推导 NVMe SSD 场景下 top-200 Rescoring 的额外延迟。</div>
+
 </div>
 </section>
 
@@ -862,7 +987,9 @@ memory_gb: 38.4
   <li>阅读 §6–§7 理解 PQ/OPQ/SQ 量化如何与 IVF 组合，形成 IVFPQ 等大规模标准方案</li>
   <li>阅读 §9 DiskANN 了解磁盘索引路径，阅读 §10 GPU 索引了解加速条件</li>
   <li>阅读 §16 Worked Example，在具体场景中做完整的选型决策演练</li>
-  <li>做 13b-1 到 13b-12 的练习题，重点做 13b-7（SSD 延迟推导）和 13b-12（十亿级系统设计）</li>
+  <li>阅读 §17 SQ-HNSW 了解量化感知索引的工程原理（Rescoring 机制）</li>
+  <li>阅读 §18 ANN Benchmark 理解算法在三维权衡上的实测数量级差异</li>
+  <li>做 13b-1 到 13b-14 的练习题，重点做 13b-7（SSD 延迟推导）、13b-12（十亿级系统设计）和 13b-14（Rescoring 延迟推导）</li>
 </ol>
 
 <h3>延伸阅读</h3>
@@ -890,6 +1017,14 @@ memory_gb: 38.4
   <li>Santhanam et al., "ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction", <em>NAACL</em> 2022. <a href="https://arxiv.org/abs/2112.01488">arXiv:2112.01488</a></li>
   <li>Fu et al., "Fast Approximate Nearest Neighbor Search With The Navigating Spreading-out Graph"（NSG）, <em>VLDB</em> 2019.</li>
   <li>Wang et al., "Milvus: A Purpose-Built Vector Data Management System", <em>SIGMOD</em> 2021. <a href="https://arxiv.org/abs/2010.11305">arXiv:2010.11305</a></li>
+  <li>Aumuller, Martin et al., "ANN-Benchmarks: A Benchmarking Tool for Approximate Nearest Neighbor Algorithms", <em>Information Systems</em> 2020. <a href="https://arxiv.org/abs/1807.05614">arXiv:1807.05614</a></li>
+</ul>
+
+<p><strong>SQ-HNSW 与量化索引</strong></p>
+<ul>
+  <li><a href="https://qdrant.tech/documentation/guides/quantization/">Qdrant 官方文档 "Quantization"</a> — Scalar Quantization + Rescore 设计与工程实践</li>
+  <li><a href="https://weaviate.io/developers/weaviate/configuration/pq-compression">Weaviate PQ/SQ 压缩文档</a> — Product Quantization、Scalar Quantization、Binary Quantization 对比</li>
+  <li>Milvus 官方文档 "Index with Quantization" — HNSW + SQ8 组合配置指南</li>
 </ul>
 </section>
 

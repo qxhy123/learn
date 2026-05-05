@@ -342,10 +342,16 @@ P95 / P99 很快就会失控。
 
 | 主题 | 关键点 |
 |------|--------|
-| 可观测性 | 不只是“看到异常”，还要能解释与决策 |
+| 可观测性 | 不只是”看到异常”，还要能解释与决策 |
 | 指标体系 | 要覆盖资源、任务、服务、质量、成本五层 |
 | SLO | AI 服务不能只有延迟和可用性，还应包含质量目标 |
 | 容量规划 | 必须把流量、token 分布、GPU 吞吐和冗余一起考虑 |
+| LLM 指标 | TTFT / TPOT / Goodput 是 LLM 专属核心 SLI，缺一不可 |
+| DCGM | `GPU_UTIL` 有误导性，应以 `PIPE_TENSOR_ACTIVE` 为核心 LLM 效率指标 |
+| OTel LLM | gen_ai.* 规范统一 LLM trace；`gen_ai.prompt` 默认不采集（PII 风险） |
+| 成本可观测性 | Reasoning token 隐性成本、Showback/Chargeback 需独立基础设施 |
+| Profiler | torch.profiler schedule 控制 overhead；ncu `--set full` 禁用于生产 |
+| Spot 中断 | 通知提前量极短（GCP 30s），必须预置检测守护进程和紧急 checkpoint |
 
 ## 练习题
 
@@ -353,3 +359,661 @@ P95 / P99 很快就会失控。
 2. 设计一个推理服务的最小指标面板。
 3. 容量规划时为什么要考虑故障冗余？
 4. 如果平均流量稳定，但 P99 延迟突然恶化，你会优先看哪些指标关联？
+5. TTFT P99 突然从 800ms 升至 3s，应该按什么顺序排查（queue wait、prefill GPU、网络、prefix cache 命中率）？
+6. 为什么 `DCGM_FI_DEV_GPU_UTIL` 不能作为 LLM 推理效率的主要判断依据？应该用哪个指标替代？
+7. Reasoning model 的 thinking tokens 为什么会造成成本盲区？如何在可观测性系统中正确捕捉？
+8. 在 Spot GPU 集群上运行 LLM 推理，GCP 30 秒中断通知意味着什么？如何设计容错架构？
+
+---
+
+## §21.6 LLM 特有指标体系
+
+> LLM 推理服务的失败模式和传统微服务不同：HTTP 200 返回了，但用户已经等了 4 秒才看到第一个字；tokens/s 的吞吐看起来很高，却有 15% 的请求因超时被放弃；GPU 利用率 85%，但实际上一半时间在排队。必须用 LLM 专属指标体系才能准确刻画这些失败模式。
+
+### 21.6.1 TTFT：Time To First Token
+
+**定义**：从请求进入系统到用户看到第一个生成 token 的端到端耗时，单位通常为毫秒。TTFT 覆盖三段延迟之和：网络 + 排队等待（admission queue wait）+ prefill 计算。
+
+$$\text{TTFT} = T_{\text{network-in}} + T_{\text{queue}} + T_{\text{prefill}}$$
+
+**典型 SLO**：
+
+| 场景 | P50 目标 | P99 目标 | 说明 |
+|------|----------|----------|------|
+| 交互式对话（chat） | < 300 ms | < 2 s | 超过 2 s 用户感知明显等待 |
+| Copilot / IDE 补全 | < 200 ms | < 800 ms | 键入停顿后补全必须足够快 |
+| 后台批量处理 | < 5 s | < 30 s | 非交互，侧重吞吐而非延迟 |
+| RAG 问答 | < 500 ms | < 3 s | 含检索耗时，P99 更难控制 |
+
+**影响因素**：
+
+- **Prefill GPU 算力**：prompt 越长，prefill FLOP 越多，TTFT 越高；A100 vs H100 的 BF16 吞吐差距在此场景直接体现
+- **Admission queue 等待**：当并发请求数超过 KV Cache 容量时，新请求需等待槽位释放；`queue_wait_time` 指标是 TTFT 升高的最直接先行信号
+- **网络往返**：客户端到负载均衡器到 engine 的 TCP/gRPC 建连时间，在多 AZ、跨国部署场景不可忽略
+- **Prefix cache 命中率**：system prompt 命中 prefix cache 时，prefill 阶段被大幅跳过，TTFT 可从秒级降至百毫秒级
+
+> **告警规则示例（PromQL）**：
+> ```promql
+> histogram_quantile(0.99, 
+>   sum(rate(llm_ttft_seconds_bucket[5m])) by (le, model, endpoint)
+> ) > 2.0
+> ```
+
+> **注意**：TTFT 的 P99 对长尾请求极其敏感。单个超长 prompt 在 prefill 阶段会阻塞同一 worker 的其他请求的 TTFT。Chunked prefill 和 P/D 解耦（见[第 15 章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)）是减少 TTFT 长尾的主要手段。
+
+### 21.6.2 TPOT：Time Per Output Token（Inter-Token Latency）
+
+**定义**：每生成一个 output token 的平均耗时，即相邻两个 token 之间的时间间隔，等同于 ITL（Inter-Token Latency）。单位为毫秒/token。
+
+$$\text{TPOT} = \frac{T_{\text{decode-total}}}{N_{\text{output-tokens}}}$$
+
+**物理含义**：Decode 阶段是 memory-bandwidth-bound，TPOT 的下界由以下决定：
+
+$$\text{TPOT}_{\min} \approx \frac{2 \times P_{\text{params}} \times \text{bytes\_per\_param}}{B_{\text{HBM}} \times N_{\text{GPU}}}$$
+
+其中 $P_{\text{params}}$ 是模型参数量，$B_{\text{HBM}}$ 是 HBM 带宽（如 H100 SXM 为 3.35 TB/s）。70B 模型在单 H100 上理论最低 TPOT 约为 40ms/token。
+
+**典型 SLO**：
+
+| 场景 | P99 目标 | 说明 |
+|------|----------|------|
+| 交互式流式输出 | < 50 ms/token | 约 20 token/s，接近人类阅读速度 |
+| 代码生成 | < 30 ms/token | 用户关注代码完整性，流速要快 |
+| 高并发推理 | < 100 ms/token | 并发越高，batch 越大，TPOT 受 HBM 带宽限制上升 |
+
+> **告警规则示例**：
+> ```promql
+> histogram_quantile(0.99,
+>   sum(rate(llm_tpot_ms_bucket[5m])) by (le, model)
+> ) > 50
+> ```
+
+> **TPOT vs ITL 的术语澄清**：在大多数工程实践中，TPOT 和 ITL（Inter-Token Latency）指同一物理量（相邻 token 间隔）。部分文献中"ITL"另有定义，表示请求的 inter-arrival time（请求到达间隔），与吞吐分析有关。本章以 **TPOT = 每 output token 耗时**，**inter-arrival time = 请求到达间隔** 区分。
+
+### 21.6.3 Goodput vs Throughput：区分有效吞吐
+
+**Throughput**（原始吞吐）：系统单位时间内完成的 tokens 数量（包括超时、失败或违反 SLO 的请求）。
+
+**Goodput**（有效吞吐）：仅统计成功完成且满足 SLO 的请求所产生的 tokens：
+
+$$\text{goodput} = \text{throughput} \times \text{success\_rate} \times \text{slo\_compliance\_rate}$$
+
+> **为什么区分很重要**：一个系统在高负载时，原始 throughput 看起来很高，但如果 30% 的请求因为 TTFT 超时被客户端放弃、或者被 admission control 拒绝，这些 tokens 消耗了 GPU 算力但没有产生业务价值。Goodput 才是应该用来做容量规划和成本核算的分母。
+
+> **告警示例**：如果 `goodput / throughput < 0.85`，说明至少 15% 算力在无效工作上，需要检查超时策略、admission control 和 SLO 设置。
+
+### 21.6.4 其他 LLM 专属指标
+
+| 指标 | 物理含义 | 典型 SLO / 参考值 | 采集方式 |
+|------|----------|-------------------|----------|
+| **TTL（Total Time per request）** | 端到端完整耗时：从请求发出到最后一个 token 返回。`TTL = TTFT + TPOT × N_output` | P99 < 30s（对话）；P99 < 120s（长文档） | client-side / gateway histogram |
+| **TPS（tokens per second）** | 系统级吞吐，包含 prefill + decode token 总量 / 时间 | 取决于模型和 GPU 配置，用于容量规划 | engine metrics |
+| **TPM（tokens per minute）** | TPS × 60；常用于 API 限速和计费 | 按 tenant/model 配额设置 | 聚合计数器 |
+| **TPOT P99 / P999** | 用于捕捉 decode stutter（卡顿），区别于均值 | P999 < 200 ms/token（交互式） | histogram |
+| **Queue depth** | 等待进入 engine 的请求数 | 持续 > 50 需告警 | engine / proxy metrics |
+| **KV Cache utilization** | 已用 KV block / 总 KV block | 持续 > 90% 需扩容或限流 | engine metrics |
+| **Prefix cache hit rate** | 命中 prefix cache 的 token 比例 | 对话/RAG 场景目标 > 40% | engine metrics |
+| **Preemption count** | 因显存不足被抢占（暂停）的请求数 | 持续 > 0 需关注 KV 容量 | engine metrics |
+
+```mermaid
+flowchart LR
+  subgraph 用户视角
+    A[发送请求] --> B[TTFT]
+    B --> C[TPOT x N_output]
+    C --> D[TTL 总耗时]
+  end
+  subgraph 系统视角
+    E[Throughput token/s] --> F{goodput?}
+    F -- 失败/超时 --> G[无效消耗]
+    F -- 满足SLO --> H[有效吞吐 Goodput]
+  end
+  D --> E
+```
+
+> **SLO 设计建议**：对话服务至少定义 TTFT P99 和 TPOT P99 两个 SLI；高并发批量推理重点看 TPS 和 Goodput；成本核算永远用 TPM 而非 TPS（TPM 和账单对齐）。
+
+---
+
+## §21.7 DCGM Exporter 详细指标映射
+
+DCGM（Data Center GPU Manager）是 NVIDIA 官方的 GPU 监控和管理框架，比 `nvidia-smi` 提供更高频、更细粒度的流式指标，适合送入 Prometheus 做长期监控和告警。
+
+> **DCGM vs nvidia-smi 的本质差异**：`nvidia-smi` 是采样式读取（默认 1s 粒度），可能错过毫秒级的 kernel 活动；DCGM 以 100ms-1s 可配置频率流式采集，并支持 Profiling API（需要 CUDA Profiling Overhead）。在生产集群中，DCGM Exporter 是 GPU 监控的标准选择。
+
+### 21.7.1 核心指标含义与误用风险
+
+| DCGM 指标 | 物理含义 | 典型用途 | 常见误用 |
+|-----------|----------|----------|----------|
+| `DCGM_FI_DEV_GPU_UTIL` | SM 在采样窗口内"有 kernel 在执行"的时间占比 | 判断设备是否被使用 | 误用为"GPU 算力被充分利用" |
+| `DCGM_FI_DEV_FB_USED` | 已使用显存（MB） | 显存容量规划、OOM 预警 | — |
+| `DCGM_FI_DEV_FB_FREE` | 剩余可用显存（MB） | 触发 admission 限流 | — |
+| `DCGM_FI_PROF_DRAM_ACTIVE` | HBM 总线活跃周期占比（0-1） | 真实内存带宽利用率 | 与 GPU_UTIL 混淆 |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Tensor Core 执行周期占比（0-1） | 矩阵乘法实际利用率 | 被忽视，是 LLM 性能的核心指标 |
+| `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink 总带宽（MB/s） | 多 GPU 通信瓶颈排查 | — |
+| `DCGM_FI_DEV_XID_ERRORS` | 硬件 XID 错误计数 | 硬件故障检测 | 只在任务失败后才看 |
+| `DCGM_FI_PROF_SM_ACTIVE` | 至少有 1 个 warp 活跃的 SM 周期占比 | 并行度分析 | — |
+| `DCGM_FI_PROF_SM_OCCUPANCY` | 活跃 warp 数 / SM 最大支持 warp 数 | Kernel 填充效率 | — |
+
+> **DANGER — `DCGM_FI_DEV_GPU_UTIL` 的严重误用**：`GPU_UTIL` 的定义是"该采样窗口内，是否有至少一个 kernel 在执行"，并不区分 SM 中活跃 warp 的数量。一张 GPU 上只有 1% 的 SM 在跑 1 个 warp，`GPU_UTIL` 也会报告 100%。LLM decode 阶段（batch=1 时）常出现 GPU_UTIL 接近 100% 但 Tensor Core 利用率不足 30% 的情况。**以 GPU_UTIL 作为性能瓶颈的唯一判断依据，会导致错误的扩容和优化决策。**
+
+> **推荐用 `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` 作为 LLM 计算效率的核心指标。** 该值 < 30% 说明矩阵乘法严重不足，通常意味着 batch size 太小（decode memory-bound）或调度器效率低下。
+
+### 21.7.2 XID 错误：危险信号分类
+
+| XID 错误码 | 含义 | 危险级别 | 处理建议 |
+|-----------|------|----------|----------|
+| XID 31 | GPU 内存错误（ECC multi-bit） | 高危 | 立即将 GPU 踢出集群，联系厂商 |
+| XID 74 | NVLINK 错误 | 高危 | 检查 NVLink 连接，隔离节点 |
+| XID 79 | GPU 内存页面退休（行退休） | 中危 | 监控频率，超过阈值下线节点 |
+| XID 92 | 高带宽内存崩溃 | 高危 | 立即停止使用，RMA |
+| XID 48 | DBE（双位 ECC 错误） | 高危 | 同 XID 31 |
+| XID 13 | 图形引擎异常 | 中危 | 重启 GPU 进程，持续则下线 |
+
+### 21.7.3 完整 PromQL 示例
+
+**跨集群 GPU Tensor Core 利用率看板**：
+
+```promql
+# Tensor Core 利用率（按 GPU 节点）
+avg by (instance, gpu) (
+  DCGM_FI_PROF_PIPE_TENSOR_ACTIVE
+)
+
+# 显存使用率（已用 / 总量）
+DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)
+
+# HBM 带宽利用率
+avg by (cluster, instance) (
+  DCGM_FI_PROF_DRAM_ACTIVE
+)
+```
+
+**XID 异常告警规则**（Alertmanager 格式）：
+
+```yaml
+groups:
+  - name: gpu-hardware-alerts
+    rules:
+      - alert: GpuXidCritical
+        expr: |
+          increase(DCGM_FI_DEV_XID_ERRORS{xid=~"31|74|79|92|48"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU XID 严重错误: {{ $labels.instance }} GPU {{ $labels.gpu }}"
+          description: "XID {{ $labels.xid }} 错误发生，节点可能需要下线。"
+
+      - alert: GpuTensorCoreUnderutilized
+        expr: |
+          avg by (instance, gpu) (DCGM_FI_PROF_PIPE_TENSOR_ACTIVE) < 0.20
+          AND avg by (instance, gpu) (DCGM_FI_DEV_GPU_UTIL) > 0.70
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU 计算利用率异常：GPU_UTIL 高但 Tensor Core 低"
+          description: "GPU_UTIL 可能有误导性，实际 Tensor Core 利用率仅 {{ $value | humanizePercentage }}。"
+```
+
+```mermaid
+flowchart TD
+  A[DCGM Exporter] --> B[Prometheus]
+  B --> C{指标类型}
+  C --> D[DEV_GPU_UTIL\n设备有 kernel 执行]
+  C --> E[PROF_PIPE_TENSOR_ACTIVE\nTensor Core 真实利用率]
+  C --> F[PROF_DRAM_ACTIVE\nHBM 带宽利用率]
+  C --> G[DEV_XID_ERRORS\n硬件错误计数]
+  D --> H[⚠️ 误用：不代表计算充分]
+  E --> I[✅ LLM 性能核心指标]
+  F --> J[诊断 decode memory-bound]
+  G --> K[立即告警 XID31/74/79]
+```
+
+> **nvidia-smi 的定位**：在节点上快速判断"现在发生了什么"，适合临时排障。DCGM Exporter 是集群级长期监控的标准，两者不冲突但各有边界：nvidia-smi 是采样快照，DCGM 是流式连续数据。
+
+---
+
+## §21.8 OpenTelemetry LLM Trace 规范
+
+OpenTelemetry 社区在 2024 年开始为生成式 AI 场景制定 `gen_ai.*` 语义约定（semantic convention），目标是让不同 LLM 框架（vLLM、LangChain、LlamaIndex、Bedrock SDK 等）产生结构一致、可互操作的 trace 数据。
+
+### 21.8.1 gen_ai.* 语义约定核心字段
+
+| Attribute | 类型 | 含义 | 是否敏感 |
+|-----------|------|------|----------|
+| `gen_ai.system` | string | LLM 提供商（openai / anthropic / vllm / ...） | 否 |
+| `gen_ai.request.model` | string | 请求的模型 ID | 否 |
+| `gen_ai.request.max_tokens` | int | 请求的最大 token 数 | 否 |
+| `gen_ai.request.temperature` | float | 采样温度 | 否 |
+| `gen_ai.usage.prompt_tokens` | int | 实际消耗的 prompt token 数 | 否 |
+| `gen_ai.usage.completion_tokens` | int | 实际生成的 completion token 数 | 否 |
+| `gen_ai.response.finish_reason` | string | stop / length / content_filter / tool_calls | 否 |
+| `gen_ai.response.id` | string | 模型返回的响应 ID | 否 |
+| `gen_ai.prompt` | string | **完整 prompt 内容** | **高度敏感** |
+| `gen_ai.completion` | string | **完整 completion 内容** | **高度敏感** |
+
+> **关于 `gen_ai.prompt` 和 `gen_ai.completion`**：这两个字段在规范中标记为 opt-in，**默认不采集**。生产环境中强烈建议不启用，或仅在严格的 PII 脱敏流水线后存储。
+
+### 21.8.2 Span 父子关系与多 Agent 嵌套
+
+一个完整 LLM 请求的 span 层次示例：
+
+```text
+[root] POST /v1/chat/completions (gateway span)
+  ├── [auth] token validation
+  ├── [router] model selection + load balance
+  │     └── [engine] LLM inference (vllm span)
+  │           ├── [prefill] prompt processing
+  │           └── [decode] token generation
+  └── [safety] output filtering
+```
+
+Multi-agent 场景（与第 25 章联动）的 span 嵌套：
+
+```text
+[root] agent orchestrator
+  ├── [tool_call] web_search
+  │     └── [llm] query reformulation
+  ├── [tool_call] code_interpreter
+  │     └── [llm] code generation
+  └── [llm] final synthesis
+        ├── [retrieval] RAG context fetch
+        └── [llm_engine] inference
+```
+
+```mermaid
+sequenceDiagram
+  participant O as Orchestrator
+  participant T1 as Tool: Search
+  participant T2 as Tool: Code
+  participant L as LLM Engine
+  O->>T1: tool_call span (parent: root)
+  T1->>L: llm span (parent: tool_call)
+  L-->>T1: completion
+  T1-->>O: result
+  O->>T2: tool_call span (parent: root)
+  T2->>L: llm span (parent: tool_call)
+  L-->>T2: code
+  T2-->>O: result
+  O->>L: final synthesis span
+  L-->>O: response
+```
+
+### 21.8.3 PII 脱敏策略
+
+> **必须脱敏的字段**：`gen_ai.prompt` 和 `gen_ai.completion` 中可能包含用户输入的任意文本，常见 PII 风险包括：手机号码、电子邮件地址、身份证号、银行卡号、姓名 + 地址组合、医疗信息。
+
+| 脱敏方法 | 适用场景 | 代价 |
+|----------|----------|------|
+| Regex 匹配替换 | 结构化 PII（手机、邮箱、身份证） | 低延迟，漏报率较高 |
+| NER 模型脱敏 | 非结构化文本中的姓名、地址、组织 | 精度更高，需要额外推理资源 |
+| 字段 Hash | 用于去重或关联，不需要明文 | 不可逆，无法调试原始内容 |
+| 截断保留 | 只保留前 N 个字符（如前 50 字） | 保留调试可见性，降低 PII 风险 |
+| 字段置空 | 最严格，不存储任何 prompt/completion | 零 PII 风险，丧失调试能力 |
+
+实践建议：生产链路中，`gen_ai.prompt` 和 `gen_ai.completion` 默认不写入 trace（置空）；Debug 模式下可开启截断保留；审计需求使用独立加密存储，与 trace 系统分离。
+
+### 21.8.4 采样策略与 Cardinality 治理
+
+**采样策略选择**：
+
+```mermaid
+flowchart TD
+  A[新 LLM 请求] --> B{是否异常请求}
+  B -- 5xx / timeout / SLO违反 --> C[tail-based: 必采]
+  B -- 否 --> D{是否灰度流量}
+  D -- 是 --> E[head-based 100% 采样]
+  D -- 否 --> F[head-based 1%-5% 采样]
+  C --> G[送入 Trace Backend]
+  E --> G
+  F --> G
+```
+
+**Cardinality 治理原则**：`user_id`、`session_id`、`request_id` 这类高基数字段应放在 span attribute，**绝对不能**放入 metrics label。正确做法：
+
+```python
+# ✅ 正确：高基数字段放 span attribute
+span.set_attribute("gen_ai.request.model", model_id)  # 低基数
+span.set_attribute("user.id", user_id)                # 高基数，仅在 span
+span.set_attribute("gen_ai.usage.prompt_tokens", 1024)
+
+# ❌ 错误：user_id 作为 metrics label
+counter.add(1, {"model": model_id, "user_id": user_id})  # Cardinality 爆炸
+```
+
+> **Tail-based sampling 的核心价值**：异常请求（超时、错误、P99 以上慢请求）无法被 head-based 采样可靠捕捉。Tail-based Collector 在请求完成后根据 latency、status_code、SLO 违反情况决定是否保留完整链路，适合 LLM 服务的尾延迟排查。
+
+---
+
+## §21.9 成本可观测性（Cost Observability）
+
+传统 SRE 体系很少把成本列为核心可观测维度，但 LLM 服务中，成本是和延迟、可用性同等重要的第一公民：一次 agent 工具循环失控可以消耗数百美元；reasoning model 的隐藏 token 成本可以让账单翻 3-5 倍；某个 tenant 的上下文长度从 2K 涨到 64K 会让该 tenant 的成本暴增 10 倍以上。
+
+### 21.9.1 单位成本模型
+
+LLM 服务成本应从三个层次分析：
+
+| 成本层次 | 计算公式 | 用途 |
+|----------|----------|------|
+| **per-GPU-hour** | `gpu_count × hours × gpu_price/hr` | 基础设施成本规划 |
+| **per-request** | `cost_per_1k_prompt × prompt_tokens/1000 + cost_per_1k_completion × completion_tokens/1000` | 请求级成本归因 |
+| **per-token（分 prompt/completion）** | prompt: ~$0.5-3/M tokens；completion: ~$1.5-15/M tokens | API 计费和内部 chargeback |
+
+> **Prompt token 和 Completion token 的成本差异**：Completion（output）token 的成本通常是 Prompt（input）token 的 3-5 倍，因为 output 需要逐 token decode 而 input 可以批量 prefill。内部成本归因必须分开统计，否则长 prompt + 短输出的请求会被高估，短 prompt + 长输出的请求会被低估。
+
+### 21.9.2 Reasoning Model 成本陷阱
+
+> **DANGER — Reasoning Token 的隐性成本**：Claude 3.7 Sonnet thinking、OpenAI o1/o3、DeepSeek-R1 等 reasoning model 会在生成最终答案前，先内部产生大量"思考 token"（thinking/reasoning tokens）。这些 token 通常在 API 响应中不可见（或折叠显示），但会计入实际计算成本和 token 消耗。
+
+典型风险场景：
+- 用 reasoning model 处理简单问题：thinking tokens 可能是最终答案的 10 倍，但用户只看到简短回答
+- 不限制 `max_thinking_tokens` 导致单请求成本失控
+- 监控只看 `completion_tokens` 而忽略 `thinking_tokens`，成本归因严重低估
+
+**必须采集的 reasoning model 指标**：
+
+```python
+span.set_attribute("gen_ai.usage.prompt_tokens", prompt_tokens)
+span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
+span.set_attribute("gen_ai.usage.thinking_tokens", thinking_tokens)  # 新增！
+span.set_attribute("gen_ai.cost.total_usd", 
+    prompt_tokens/1e6 * PROMPT_PRICE + 
+    (completion_tokens + thinking_tokens)/1e6 * OUTPUT_PRICE)
+```
+
+### 21.9.3 归因维度与 Showback vs Chargeback
+
+**成本归因维度**：
+
+| 维度 | 示例 | 适合回答 |
+|------|------|----------|
+| `tenant_id` / `team` | team-search, team-content | 哪个团队烧钱最多 |
+| `model_id` | gpt-4o, claude-3-5-sonnet | 哪个模型成本异常 |
+| `adapter_id` | lora-v2-finance | LoRA adapter 的增量成本 |
+| `endpoint` / `workflow` | /chat, /summarize, /agent | 哪条业务链路最贵 |
+| `request_shape_bucket` | short/medium/long/xl | 长请求对成本的贡献比例 |
+
+**Showback vs Chargeback**：
+
+| 模式 | 定义 | 适用场景 |
+|------|------|----------|
+| **Showback** | 展示各团队/租户的成本消耗，但不实际扣费 | 成本意识建设阶段，平台内部团队 |
+| **Chargeback** | 按实际用量向团队/BU 实际扣费或转移 | 成熟的多租户平台，有明确的 cost center |
+
+**实现架构**：
+
+```mermaid
+flowchart LR
+  A[LLM Engine 日志\n含 token 用量] --> B[Fluentd / Kafka]
+  B --> C[离线 ETL\n每小时聚合]
+  C --> D[数据仓库\nBigQuery / Snowflake]
+  D --> E{报表需求}
+  E --> F[BI 看板\nGrafana / Superset / Looker]
+  E --> G[Showback 邮件\n月度成本报告]
+  E --> H[Chargeback API\n计费系统对接]
+```
+
+### 21.9.4 成本异常告警
+
+```promql
+# cost_per_1k_tokens 同比涨幅超过 20%
+(
+  sum(rate(llm_cost_total_usd[1h])) by (model, endpoint)
+  / sum(rate(llm_tokens_total[1h])) by (model, endpoint) * 1000
+) 
+/ (
+  sum(rate(llm_cost_total_usd[1h] offset 7d)) by (model, endpoint)
+  / sum(rate(llm_tokens_total[1h] offset 7d)) by (model, endpoint) * 1000
+) > 1.20
+
+# 单 tenant 单天成本突增（绝对值告警）
+sum(increase(llm_cost_total_usd{tenant_tier="standard"}[1d])) by (tenant_id) > 500
+```
+
+**推荐工具**：
+
+| 工具 | 定位 | 适合场景 |
+|------|------|----------|
+| Helicone | LLM 可观测性 SaaS，含成本追踪 | 快速接入，外部 API 场景 |
+| Vantage | 云成本管理，支持 GPU 归因 | 多云、混合云成本优化 |
+| CloudHealth | 企业云治理平台 | 大型组织 FinOps 流程 |
+| 自建（Kafka + DWH + Grafana） | 完全控制，成本归因最细 | 有工程能力的内部平台 |
+
+---
+
+## §21.10 PyTorch Profiler 与 Nsight 工程集成
+
+GPU 级性能问题（如 Tensor Core 利用率低、HBM 带宽瓶颈、kernel 调度延迟）无法靠 DCGM 指标完全定位，需要 profiler 提供 kernel 级别的详细时序信息。
+
+### 21.10.1 PyTorch Profiler 完整可运行示例
+
+```python
+import torch
+import torch.profiler
+
+# 生产环境推荐的 profiler 配置
+def profile_llm_inference(model, inputs, output_dir="./profiler_traces"):
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=10,      # 前 10 step 不采集（等系统稳定）
+            warmup=5,     # 第 11-15 step 采集但不记录（warmup profiler 本身）
+            active=20,    # 第 16-35 step 正式采集
+            repeat=1,     # 只做一轮
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+        record_shapes=True,   # 记录张量形状（有一定 overhead）
+        with_stack=False,     # 生产环境关闭调用栈（显著降低 overhead）
+        with_flops=True,      # 估算 FLOP 数
+        profile_memory=False, # 显存分析有较大 overhead，按需开启
+    ) as prof:
+        for step, batch in enumerate(dataloader):
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            prof.step()  # 必须调用，驱动 schedule 状态机
+
+    # 打印 top-k kernel 热点
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total",
+        row_limit=20
+    ))
+
+    # 导出 Chrome trace（可用 chrome://tracing 或 Perfetto UI 查看）
+    prof.export_chrome_trace(f"{output_dir}/trace.json")
+```
+
+**schedule 物理含义**：
+
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| `wait=10` | 10 步 | profiler 存在但不记录，让系统进入稳态（JIT 编译完成、CUDA graph 预热） |
+| `warmup=5` | 5 步 | profiler 开始追踪但丢弃数据，减少 profiler 自身启动 overhead 对数据的污染 |
+| `active=20` | 20 步 | 正式记录的 step 数，需覆盖足够多的批次以捕获统计规律 |
+| `repeat=1` | 1 轮 | 完成一个 wait+warmup+active 周期后停止 |
+
+> **生产 overhead 控制原则**：
+> - `with_stack=False`：关闭 Python 调用栈采集（开启时 overhead 可达 2-5x）
+> - `profile_memory=False`：显存 profiling 会显著增加采集频率，仅在排查 OOM 时开启
+> - `record_shapes=True` 的 overhead 较小（< 10%），通常可接受
+> - 使用 `schedule` 而不是全程开启 profiler：只采集稳态的 20-50 个 step 即可
+
+> **Tail sampling 接入**：在生产中，可以通过监控 TPOT P999 或 XID 错误，在触发告警时动态开启短时 profiling，避免常态化的 overhead。
+
+### 21.10.2 Nsight Systems 和 Nsight Compute
+
+**nsys（Nsight Systems）**：系统级时序视图，适合看 CPU/GPU 协同、kernel 调度、NVLink 通信。
+
+```bash
+# 基本 inference profiling（30 秒采集窗口）
+nsys profile \
+  --trace cuda,nvtx,osrt \
+  --sample cpu \
+  --output /tmp/llm-inference \
+  --duration 30 \
+  python inference_server.py
+
+# 多 GPU 训练（含 NCCL 通信 trace）
+nsys profile \
+  --trace cuda,nvtx,nccl,ucx \
+  --output /tmp/train-profile \
+  --capture-range cudaProfilerApi \
+  torchrun --nproc_per_node=8 train.py
+```
+
+**ncu（Nsight Compute）**：kernel 级深度分析，适合优化单个 kernel 的 Tensor Core 利用率、DRAM 效率、warp 级瓶颈。
+
+```bash
+# 快速扫描（overhead ~2-5x，适合非生产环境）
+ncu --set default \
+  --target-processes all \
+  --output /tmp/kernel-profile \
+  python run_single_inference.py
+
+# 全量分析（overhead 5-50x，仅用于离线分析）
+ncu --set full \
+  --kernel-name "attention_kernel" \
+  --output /tmp/attention-full \
+  python run_single_inference.py
+```
+
+> **DANGER — ncu `--set full` 的 overhead 警告**：`--set full` 会采集所有可用的硬件计数器，需要多次重放 kernel，overhead 通常为 **5-50 倍**正常运行时间。**绝对不能在生产服务上使用 `--set full`**。正确的工作流：在隔离的测试节点上，用相同模型和代表性输入运行单次推理脚本，再用 ncu 分析。
+
+```mermaid
+flowchart LR
+  A[生产告警\nTPOT P99 升高] --> B{是否有 DCGM 数据}
+  B -- 是 --> C{Tensor Core 低 / DRAM 高}
+  C -- 是 --> D[初步定位: memory-bound\n可能 batch size 太小]
+  C -- 否 --> E[初步定位: compute-bound\n或调度问题]
+  D --> F[测试节点: nsys profile\n系统级时序]
+  E --> F
+  F --> G{是否需要 kernel 级分析}
+  G -- 是 --> H[测试节点: ncu --set default\n5x overhead 可接受]
+  G -- 否 --> I[优化调度参数/batch size]
+  H --> J[ncu 报告: 针对性优化]
+```
+
+---
+
+## §21.11 Spot / Preemptible GPU 中断处理
+
+Spot / Preemptible GPU 实例通常比按需（on-demand）实例便宜 60-90%，但随时可能被云平台回收。对于训练任务，中断意味着当前 checkpoint 以来的计算全部丢失；对于推理服务，中断意味着服务下线。可观测性系统必须能感知中断事件并触发自动响应。
+
+### 21.11.1 云厂商中断通知机制
+
+| 云厂商 | 实例类型 | 通知方式 | 通知提前量 | 注意事项 |
+|--------|----------|----------|------------|----------|
+| AWS | Spot Instance | EC2 Instance Metadata（IMDS）`/latest/meta-data/spot/termination-time` + CloudWatch Events | **2 分钟** | 轮询 IMDS 每 5 秒一次；也可订阅 EventBridge |
+| GCP | Preemptible VM | ACPI G2 soft-off 信号 + metadata server | **30 秒** | 通过 `shutdown-script` 捕捉；极短，必须预先 checkpoint |
+| Azure | Spot VM | Scheduled Events API：`/metadata/scheduledevents` | **30 秒**（驱逐）/ **5 分钟**（维护） | 轮询 metadata 每 10 秒；类型为 `Preempt` 时触发 |
+
+> **GCP 30 秒的严峻挑战**：30 秒内完成 checkpoint 对大模型几乎不可能（70B 模型 checkpoint 通常需要数分钟）。GCP 场景下，必须使用更频繁的异步 checkpoint 策略（如每 10-15 分钟一次），并接受最多 15 分钟的计算损失。
+
+### 21.11.2 中断响应链
+
+```mermaid
+flowchart TD
+  A[云平台发出中断通知] --> B[Spot Interrupt Handler\n守护进程检测到通知]
+  B --> C[标记节点为 draining]
+  C --> D{服务类型}
+  D -- 推理服务 --> E[停止接受新请求\nDrain existing]
+  D -- 训练任务 --> F[触发 Emergency Checkpoint\n保存当前状态]
+  E --> G[通知负载均衡器\n移除该节点]
+  F --> H[Checkpoint 写入对象存储\nS3 / GCS / ADLS]
+  G --> I[流量迁移完成\n节点安全关闭]
+  H --> J[发送完成信号\n节点安全关闭]
+  I --> K[Karpenter / CA 检测节点消失\n触发新节点申请]
+  J --> K
+  K --> L[新节点启动\n从 Checkpoint 恢复]
+```
+
+**中断检测守护进程示例（Python）**：
+
+```python
+import time
+import requests
+import subprocess
+
+IMDS_SPOT_URL = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+POLL_INTERVAL = 5  # 秒
+
+def check_spot_interruption():
+    """AWS Spot 2 分钟通知检测"""
+    try:
+        resp = requests.get(IMDS_SPOT_URL, timeout=1)
+        if resp.status_code == 200:
+            return True  # 收到中断通知
+    except requests.exceptions.RequestException:
+        pass
+    return False
+
+def handle_interruption():
+    """中断响应：drain + checkpoint"""
+    # 1. 通知负载均衡器停止发送新请求
+    subprocess.run(["kubectl", "label", "node", "$NODE_NAME", 
+                    "spot-interruption=true"])
+    # 2. 触发紧急 checkpoint
+    subprocess.run(["kill", "-USR1", str(get_training_pid())])
+    # 3. 等待 checkpoint 完成（最多 90 秒）
+    time.sleep(90)
+
+if __name__ == "__main__":
+    while True:
+        if check_spot_interruption():
+            handle_interruption()
+            break
+        time.sleep(POLL_INTERVAL)
+```
+
+### 21.11.3 与 Karpenter / Cluster Autoscaler 协同
+
+| 工具 | Spot 中断处理机制 | 配置要点 |
+|------|-------------------|----------|
+| **Karpenter** | 通过 AWS Node Termination Handler 或原生 Spot 事件感知；自动将被中断节点标记为 draining，触发 pod 迁移 | `consolidationPolicy: WhenEmpty`；配置多个 Instance Family 提高 Spot 可用性 |
+| **Cluster Autoscaler** | 监测节点进入 NotReady；结合 Node Termination Handler 提前 drain | 设置 `--balance-similar-node-groups=true`；Spot 节点组独立配置 |
+| **Node Termination Handler** | 专门处理 Spot 中断事件的 DaemonSet；订阅 IMDS / EventBridge / Metadata | 生产必备，配合任意 CA 使用 |
+
+### 21.11.4 训练任务的 Spot 容错策略
+
+与[第 10 章](../part4-training-systems/10-elastic-training-and-fault-tolerance.md)的 Elastic Training 机制配合：
+
+- **Checkpoint 频率**：Spot 环境建议每 10-15 分钟 checkpoint 一次，比普通环境（30-60 分钟）更频繁
+- **异步 checkpoint**：训练继续进行的同时，后台线程将 checkpoint 写入对象存储，避免 checkpoint 期间的算力停顿
+- **多节点冗余**：使用 `N+2` 节点（允许 2 个节点同时被中断而不中断训练）
+- **Spot + On-demand 混合**：关键 coordinator 节点使用 on-demand，计算 worker 使用 Spot
+
+```mermaid
+flowchart LR
+  subgraph On-demand
+    C[Coordinator\n参数服务器]
+  end
+  subgraph Spot Workers
+    W1[Worker 1]
+    W2[Worker 2]
+    W3[Worker 3]
+    W4[Worker 4 - 被中断]
+  end
+  C --> W1
+  C --> W2
+  C --> W3
+  C --> W4
+  W4 --> E[中断\n自动剔除]
+  E --> R[Elastic Training\n剩余 Worker 继续]
+```
+
+### 21.11.5 推理服务的 Spot 策略
+
+| 策略 | 实现方式 | 保护效果 |
+|------|----------|----------|
+| **Multi-AZ 副本部署** | 在 3 个 AZ 各部署至少 1 个副本，使用 `topologySpreadConstraints` | 单 AZ Spot 批量回收不影响服务 |
+| **流量自动迁移** | ALB / Envoy 配合健康检查；Spot 节点 drain 时自动摘除 | 中断期间对用户无感知（需要 2 分钟通知 > 连接耗尽时间） |
+| **Spot + On-demand 混合** | Spot 承担 70% 流量，on-demand 保底 30%；Spot 全部被回收时 on-demand 顶上 | 成本降低，有兜底 |
+| **流式响应中断处理** | 检测到 Spot 中断时，标记进行中的流式响应为"不完整"，返回 partial response | 避免用户收到截断但无报错的响应 |
+
+> **推理服务 Spot 成本收益**：对于无状态的推理服务（不依赖本地 KV Cache 持久化），Spot 策略收益最大。前缀缓存（Prefix Cache）场景需要注意：节点被中断时缓存丢失，会导致短时间内 TTFT 上升（cache cold start），需要在告警中区分。

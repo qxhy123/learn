@@ -355,6 +355,492 @@ agent 系统的治理重点不是“平均成本”，而是把高价值请求�
 - 对高价值任务和高 QPS 任务使用不同策略，不要让所有请求都走最重路径
 - 把 agent 成本拆成模型 cost、工具 cost、人工接管 cost 三部分，才能真正做经营决策
 
+### 25.15 Agent 架构模式对比
+
+Agent 架构不是"prompt 写法"的差异，而是任务分解方式、控制流位置和状态传递策略的根本差异。把架构选错，后续无论怎么调预算或 trace 都难以弥补。工程上有 4 种主流模式，各有适用边界。
+
+#### ReAct：Thought → Action → Observation 循环
+
+ReAct（Reason + Act）把推理和行动交织在单模型单上下文中：每一步先生成 Thought（分析当前状态），再生成 Action（调用工具或进行计算），最后把工具返回值作为 Observation 追加到 context，下一轮继续。这种架构实现最简单，适合步骤间依赖性强、工具调用数量少（通常 3-8 步）且上下文可以线性积累的任务。
+
+**工程缺点**：全部状态都在同一个 context 里滚动，context 越来越长；工具失败时没有结构化回退路径，只能依赖模型"下一步自己意识到失败"；多 step 错误在 context 中累积后模型容易迷失方向。适合对话式问答、简单的 retrieval + reasoning 场景。
+
+#### Plan-Execute：先规划后执行，含 Reflexion 自我批评
+
+Plan-Execute 将任务分两阶段：先让模型一次性输出完整计划（步骤列表或 DAG），再按计划逐步执行。Reflexion 在此基础上引入第三个环节：执行结束后，让模型对结果写 self-critique，把批评结果写入长期记忆，作为下一轮 plan 的输入。
+
+**工程优点**：计划是结构化的，平台可以在执行前做安全审查（工具白名单、步骤上限、副作用检查）；执行步骤可以并行化；失败时可以回退到 plan 而不是重跑所有 step。**工程缺点**：初始 plan 质量决定上限，规划失败的回代价很高；Reflexion 引入额外模型调用，成本较 ReAct 高 30-60%。适合代码修复、研究报告、工单处理等有明确阶段划分的任务。
+
+#### Multi-Agent：hierarchical / debate / swarm
+
+Multi-Agent 不是"更多 AI"，而是通过分工降低单个 agent 上下文复杂度。有三种形态：
+
+- **Hierarchical**：Orchestrator agent 接任务，分发给多个 sub-agent，每个 sub-agent 只关注自己的子问题，结果回汇给 orchestrator 做综合。适合任务可分解且子任务间耦合低的场景（如批量文档分析）。
+- **Debate**：多个 agent 对同一问题各自产出答案，通过多轮辩论或投票收敛到更可信结果。适合高不确定性或需要多视角核查的任务（如法律条款解读、医疗辅助诊断）。
+- **Swarm**：去中心化多 agent，每个 agent 只感知局部状态，通过规则或 emergent behavior 协作。适合探索性任务，实现最复杂，生产落地最谨慎。
+
+**工程挑战**：multi-agent 系统的状态管理、消息路由、资源隔离和 trace 复杂度均成倍上升；单个 sub-agent 的失败会通过消息传播影响其他 agent；成本审计需要跨 agent 归因。
+
+#### 框架映射
+
+| 框架 | 主要模式 | 核心机制 | 适合场景 |
+|------|----------|----------|----------|
+| LangGraph | Plan-Execute + ReAct 混合 | 有状态图（节点 = step，边 = 条件跳转），支持持久化检查点 | 复杂多步、需要人工审批或中断恢复的 agent |
+| AutoGen | Multi-Agent（hierarchical / debate） | GroupChat + ConversableAgent，消息驱动异步协作 | 多角色协作、代码生成与验证 |
+| CrewAI | Multi-Agent（hierarchical，role-based） | Crew + Agent + Task，内置角色和工具注册 | 内容生产、营销自动化、结构化工作流 |
+| OpenAI Swarm | Multi-Agent（去中心化 handoff） | 轻量 handoff 机制，agent 间直接传递 context | 教学/实验场景，生产需二次加固 |
+
+#### 决策矩阵
+
+| 场景 | 推荐架构 | 原因 |
+|------|----------|------|
+| 用户自然语言问答 + 工具调用 | ReAct | 步骤少、可线性积累，实现成本低 |
+| 代码生成 + 测试验证 | Plan-Execute + Reflexion | 计划可审查，失败有回退，自我批评改善迭代质量 |
+| 批量文档摘要 | Hierarchical Multi-Agent | 文档间独立，sub-agent 并行处理后聚合 |
+| 法律或医疗高风险决策 | Debate Multi-Agent | 多视角降低单模型幻觉风险 |
+| 长时研究任务（> 10 分钟） | Plan-Execute + LangGraph 检查点 | 支持中断恢复、人工审批门 |
+| 高 QPS 简单任务（< 3 步） | 单模型 + function calling | 架构越重成本越高，简单任务不需要 orchestrator |
+
+```mermaid
+flowchart LR
+  subgraph ReAct
+    RT[Thought] --> RA[Action] --> RO[Observation] --> RT
+  end
+  subgraph PlanExecute["Plan-Execute + Reflexion"]
+    PE_P[Plan] --> PE_E[Execute] --> PE_V[Verify] --> PE_R[Reflect]
+    PE_R -->|写入长期记忆| PE_P
+  end
+  subgraph Hierarchical
+    HO[Orchestrator] --> HS1[Sub-Agent 1]
+    HO --> HS2[Sub-Agent 2]
+    HO --> HS3[Sub-Agent 3]
+    HS1 --> HR[聚合结果]
+    HS2 --> HR
+    HS3 --> HR
+  end
+  subgraph Debate
+    DA[Agent A] --> DC{投票/评分}
+    DB[Agent B] --> DC
+    DC -->|收敛| DF[最终答案]
+  end
+```
+
+> **工程建议**：先用 ReAct 跑通原型，再根据失败模式判断是否需要更复杂架构。架构升级的代价是成本、延迟和调试复杂度全部上升，升级决策应建立在实测失败率数据上，而不是预期。
+
+> **工程边界**：Multi-Agent 系统的 trace 链路会横跨多个 agent，确保每个 agent_id 都被记入同一个 root trace_id，否则后续成本归因和失败定位将极为困难。
+
+---
+
+### 25.16 Agent Observability 与 Trace Schema
+
+没有 trace 的 agent 是黑盒。一次 agent session 失败后，如果只能看到"最终答案是错的"，平台无法区分是规划阶段出错、工具返回脏数据、verifier 判断有误还是预算不足被截断。本节定义一套生产可用的 trace schema 并讨论 observability 平台选型。
+
+#### Trace Schema 字段规范
+
+每个 step 应产生一条 trace 记录，字段如下：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `trace_id` | string (UUID) | 整个 session 的唯一标识，从 root request 传递到所有子步骤 |
+| `step_id` | string | 本步骤唯一 ID，格式建议 `{trace_id}_{step_index}` |
+| `parent_id` | string \| null | 父步骤 ID，顶层 step 为 null；构成树形结构 |
+| `agent_id` | string | 执行本步骤的 agent 标识（multi-agent 场景中标识不同角色） |
+| `step_type` | enum | plan / execute / tool_call / verify / reflect / finalize |
+| `tool_name` | string \| null | 被调用工具名，非工具步骤为 null |
+| `tool_args` | object \| null | 工具入参，需做 PII 脱敏再存储 |
+| `tool_result` | object \| null | 工具返回值，大型结果应截断并存摘要 |
+| `tokens_in` | int | 本步骤模型输入 token 数 |
+| `tokens_out` | int | 本步骤模型输出 token 数 |
+| `reasoning_tokens` | int | thinking/reasoning 阶段消耗的 token（如有） |
+| `latency_ms` | int | 本步骤 wall-clock 时间（毫秒） |
+| `cost_usd` | float | 本步骤估算成本（美元），便于 session 级汇总 |
+| `outcome` | enum | success / tool_error / timeout / budget_exceeded / halted |
+| `error_class` | string \| null | 失败类型，如 `ToolTimeoutError` / `SqlSyntaxError` / `PermissionDenied` |
+| `model_id` | string | 调用的模型版本，便于多模型路由场景归因 |
+| `tenant_id` | string | 租户标识，用于成本归因和访问控制 |
+| `timestamp` | ISO8601 | 步骤开始时间 |
+
+> **PII 脱敏**：`tool_args` 和 `tool_result` 在写入 trace store 前，必须过一遍 PII 检测管道，对手机号、邮件、身份证号、密码字段做掩码或 hash。不要把原始 SQL 查询结果（可能含用户数据行）直接存入 trace。
+
+> **Trace 大小控制**：工具返回值超过 10 KB 时，存储截断版本（前 500 字符 + size_bytes 元信息），完整数据只写 primary 存储（如 S3）并记录引用 URL。
+
+#### OpenTelemetry 与 gen_ai.* namespace
+
+OpenTelemetry Semantic Conventions 定义了 `gen_ai.*` 命名空间用于 LLM 可观测性：
+
+- `gen_ai.system`：模型提供商（openai / anthropic / bedrock）
+- `gen_ai.request.model`：请求模型 ID
+- `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`：token 消耗
+- `gen_ai.agent.id`：agent 标识（社区扩展提案）
+- `gen_ai.tool.name` / `gen_ai.tool.call.id`：工具调用标识
+
+Agent span 的父子关系应映射到 OTel span parent：同一 session 的所有 step span 挂在同一个 root trace 下，跨 agent 调用通过 `traceparent` HTTP header 传递 trace context。
+
+#### 主流可观测性平台
+
+| 平台 | 定位 | 优势 | 局限 |
+|------|------|------|------|
+| Langfuse | 开源 LLM 可观测性 | 原生支持 trace / span / observation 三层、cost 归因、eval 评分 | 社区版功能完整，需自托管 |
+| LangSmith | LangChain 官方平台 | 深度集成 LangChain / LangGraph，trace 结构无缝 | 商业付费，与 LangChain 强耦合 |
+| Weights & Biases Traces | MLOps 平台扩展 | 与训练实验、模型版本一体化管理 | trace 深度略逊于专业 LLM 平台 |
+| Helicone | 轻量 proxy + 可观测性 | 无代码接入，proxy 层自动截获所有 OpenAI 调用 | 深度 agent trace 需额外 SDK |
+| Arize Phoenix | 开源 ML 可观测性 | 强大的 embedding drift 和 eval 框架，支持 span 查询 | agent trace 支持相对较新 |
+
+#### Agent Eval Framework
+
+| Benchmark | 测试重点 | 评分方式 | 适用性 |
+|-----------|----------|----------|--------|
+| GAIA | 通用 agent 任务（搜索、计算、多跳推理） | 人工标注答案精确匹配 | 衡量通用 agent 能力上限 |
+| SWE-bench（含 Verified subset） | GitHub issue 修复（真实代码库） | 单元测试通过率 | 衡量代码 agent 实用性，Verified subset 减少 false positive |
+| AgentBench | 8 类 agent 任务（OS / DB / web / game） | 任务完成率 | 多维度评估 agent 适应性 |
+| τ-bench | 工具调用可靠性（真实 API 场景） | 工具调用成功率 + 参数正确率 | 聚焦工具使用质量 |
+| WebArena | 浏览器 web 操作 | 任务完成率 | 衡量 web agent 实用性 |
+| OSWorld | 桌面 OS 操作 | 截图验证完成状态 | 最接近真实用户操作场景 |
+
+```mermaid
+flowchart TD
+  R[Root Span: session_id] --> S1[Step 1: plan<br/>tokens_in=512 latency=340ms]
+  R --> S2[Step 2: tool_call=text_to_sql<br/>tokens_in=1024 latency=89ms]
+  R --> S3[Step 3: tool_call=execute_sql<br/>latency=1200ms outcome=success]
+  R --> S4[Step 4: finalize<br/>tokens_out=280 cost=$0.0042]
+  S2 -. PII脱敏 .-> TS[(Trace Store)]
+  S3 -. 截断result .-> TS
+  TS --> OPS[Langfuse / Arize Phoenix]
+  OPS --> EVAL[Eval / Cost Dashboard]
+```
+
+> **Eval 闭环**：生产 trace 是最好的 eval 数据集。把真实失败 trace（outcome=tool_error 或 budget_exceeded）自动采样入 eval 集，用 judge model 对结果打分，形成"生产 → trace → eval → 改进"的闭环，比单纯跑 benchmark 更能反映业务实际质量。
+
+---
+
+### 25.17 Tool Sandbox 工程实现
+
+工具调用是 agent 触碰真实世界的地方，也是最高风险的地方。"在沙箱里执行"不是一个开关，而是一组需要逐层设计的隔离机制。
+
+#### 隔离方案矩阵
+
+| 方案 | 隔离强度 | 启动延迟 | 适用场景 | 主要风险 |
+|------|----------|----------|----------|----------|
+| subprocess（直接） | 无 | <5ms | 开发调试 | 完全不隔离，不可用于生产 |
+| Docker container | 中 | 100-500ms（已有镜像） | 通用代码执行 | 容器逃逸风险，需配合 seccomp |
+| gVisor（runsc） | 高 | 150-600ms | 安全要求高的代码执行 | 部分系统调用不兼容，性能约 30% 损失 |
+| Firecracker microVM | 极高 | 100-200ms（提前预热） | 金融、医疗等高合规场景 | 需 KVM，配置复杂度高 |
+| Wasmtime / WASM | 高（沙箱语言级） | <10ms | 轻量函数执行、插件系统 | 语言支持有限，不能跑任意 Python |
+| E2B（云服务） | 高（托管） | 300-1000ms | 快速落地不想自建 | 外部依赖，成本随并发线性增长 |
+| Modal（云服务） | 高（托管） | 200-800ms | GPU 密集型工具执行 | 同上 |
+
+#### seccomp Profile
+
+生产环境的代码执行容器应限制以下系统调用（Docker `--security-opt seccomp=policy.json`）：
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    {
+      "names": ["read","write","open","close","stat","fstat","lstat","poll",
+                "mmap","mprotect","munmap","brk","rt_sigaction","rt_sigprocmask",
+                "ioctl","pread64","pwrite64","readv","writev","access","pipe",
+                "select","sched_yield","mremap","msync","dup","dup2","getpid",
+                "socket","connect","accept","sendto","recvfrom","sendmsg","recvmsg",
+                "shutdown","getsockname","getpeername","socketpair","setsockopt",
+                "getsockopt","clone","fork","vfork","execve","exit","wait4",
+                "getcwd","chdir","rename","mkdir","rmdir","unlink","readlink",
+                "chmod","chown","getuid","getgid","getgroups","setuid","setgid",
+                "utime","futex","nanosleep","clock_gettime","exit_group","epoll_ctl",
+                "epoll_wait","openat","newfstatat","readlinkat"],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+```
+
+**明确禁止**：`ptrace`（进程追踪）、`kexec_load`（内核替换）、`create_module`（内核模块）、`mount`（文件系统挂载）、`pivot_root`（根切换）、`syslog`（内核日志）。
+
+#### Network Isolation
+
+- **禁止所有外网**：适合纯计算类工具（数学、数据处理），Docker `--network none`
+- **白名单出站**：只允许访问预定义的内部服务（数据库、向量库），通过 iptables/ebpf 规则实现
+- **完全隔离 + 代理**：所有出站请求必须经过 egress proxy，proxy 做域名白名单、流量审计和速率限制
+
+#### File System Overlay
+
+```text
+/
+├── base/        # 只读基础镜像层（包含 Python 运行时、依赖库）
+├── workspace/   # tmpfs，执行期间的工作目录，容器退出后自动清理
+│   └── code/    # 用户代码写入这里
+└── output/      # tmpfs，执行结果输出（大小上限 50MB）
+```
+
+用户代码不能读写 `base/` 以外的路径。通过 Linux bind mount + overlayfs 实现：base 层只读，workspace 层是 tmpfs（内存），执行完后整个 tmpfs 被丢弃，不留磁盘痕迹。
+
+#### 超时信号链
+
+```text
+SIGTERM  →  等待 30s  →  SIGKILL  →  等待 5s  →  强制清理容器/VM
+```
+
+实现要点：发送 SIGTERM 后等待进程优雅退出（给正在写磁盘的进程机会 flush）；如果 30s 内未退出，发送 SIGKILL；SIGKILL 5s 后还未退出则强制销毁容器，清理 tmpfs 和网络 namespace。整个超时链必须有独立的看门狗进程，不能让被执行代码自己管理超时。
+
+#### 完整 Dockerfile 示例
+
+```dockerfile
+FROM python:3.12-slim AS base
+
+# 安装基础依赖，不装 curl/wget/git 等网络工具
+RUN pip install --no-cache-dir numpy pandas scipy scikit-learn \
+    && rm -rf /root/.cache
+
+# 创建非特权用户
+RUN useradd -m -u 1000 -s /bin/bash sandbox
+
+FROM base AS runtime
+USER sandbox
+WORKDIR /workspace
+
+# 只读绑定 base 层依赖
+# workspace 在运行时通过 tmpfs 挂载
+ENTRYPOINT ["python", "-u", "/runner/execute.py"]
+```
+
+运行命令（配合 seccomp + 网络隔离）：
+
+```bash
+docker run \
+  --rm \
+  --user 1000 \
+  --network none \
+  --memory 512m \
+  --cpus 1 \
+  --read-only \
+  --tmpfs /workspace:size=100m,mode=1777 \
+  --tmpfs /tmp:size=50m \
+  --security-opt seccomp=/etc/docker/seccomp/code-exec.json \
+  --security-opt no-new-privileges \
+  --pids-limit 64 \
+  code-sandbox:latest
+```
+
+> **工程建议**：E2B 和 Modal 等托管沙箱服务可以显著降低自建复杂度，适合早期产品。当执行量超过 10 万次/天或合规要求不允许数据出境时，再考虑自建 Firecracker 或 gVisor 方案。
+
+> **工程边界**：沙箱超时不能只靠 Python 的 `signal.alarm`，被执行代码可以捕获 SIGALRM 或调用 `signal.signal(signal.SIGALRM, signal.SIG_IGN)` 绕过。超时必须由容器外层的 orchestrator 发送 SIGKILL 来强制终止。
+
+```mermaid
+flowchart LR
+  AR[Agent Runtime] -->|提交代码 + 超时| TR[Tool Runner]
+  TR -->|docker run --network none --memory 512m| SB[Sandbox Container]
+  SB --> CE[Code Execution<br/>非特权用户 1000]
+  CE --> OF[Output tmpfs]
+  OF -->|读取结果| TR
+  TR -->|SIGTERM 30s → SIGKILL 5s| SB
+  TR --> QS[Quota: 记录 wall_time + exit_code]
+  TR -->|结果 + 元信息| AR
+  SB -.禁止.-> NET[外网]
+  SB -.禁止.-> FS[宿主文件系统]
+```
+
+---
+
+### 25.18 Long-term Memory 与状态持久化
+
+Agent 的记忆不是一个选项，而是决定它能解决哪类任务的基础能力。没有记忆，每次对话都从零开始；记忆设计错误，会导致状态泄露、成本失控或恢复失败。本节按时间维度分层讨论。
+
+#### 三层记忆架构
+
+**短期记忆（秒级到分钟级）**：就是 context window 内的内容——对话历史、工具调用结果、中间推理步骤。主要受 `max_context_tokens` 约束，超出后触发 truncation 或 summarization。这一层完全在内存里，KV cache 是其在 GPU 侧的物化形式。不需要持久化，session 结束即释放。
+
+**中期记忆（分钟到天级）**：跨 step 的 session 状态，存于 Redis 或 SQLite：
+
+| 存储 | TTL 建议 | 适用内容 |
+|------|----------|----------|
+| Redis（内存） | 30min - 2h | 活跃 session 的 pending tool calls、partial output、预算余额 |
+| Redis（持久化） | 1 - 7 day | 用户短期偏好、最近使用工具、跨 session 上下文摘要 |
+| SQLite / PostgreSQL | 7 - 90 day | 审计日志、成本记录、任务结果存档 |
+
+**长期记忆（永久或大 TTL）**：语义可检索的知识，分三类：
+
+- **向量库**：对历史 session 摘要、工具调用结果、用户偏好做 embedding，语义相似度检索。代表方案：Qdrant、Weaviate、Pinecone。适合"类似的问题过去怎么解决的"查询。
+- **知识图谱**：结构化关系存储，支持多跳推理（如"用户 A 负责项目 B，项目 B 使用数据库 C"）。代表方案：Neo4j、FalkorDB。适合有明确实体和关系的领域。
+- **Episodic Memory**：按时间序列存储完整 episode（一次 agent 运行的完整 trace），支持"上次我问过类似问题，当时 agent 是怎么做的"的精确回放。
+
+#### 主流 Memory 方案
+
+| 方案 | 定位 | 核心机制 | 适用规模 |
+|------|------|----------|----------|
+| MemGPT / Letta | 自管理记忆的 agent OS | 把 LLM 上下文当 RAM，外部存储当磁盘，模型自决定何时 page in/out | 研究和复杂长任务 agent |
+| mem0 | 轻量 memory API | 自动提取 fact/preference 写入向量库，检索时按语义召回 | 快速接入，生产推荐 |
+| Zep | 对话 memory 平台 | 结构化 session memory + 图实体提取 + 时间衰减 | 对话助手、CRM 类场景 |
+| Cognee | 知识图谱 + 向量混合 | 把文档、对话解析为图关系，查询时图遍历 + 向量混合召回 | 知识密集型 agent |
+
+#### 状态持久化协议
+
+**必须持久化的内容**：
+
+- `pending_tool_calls`：agent 已规划但尚未执行的工具调用列表（防止 crash 后重复规划）
+- `partial_output`：已生成的部分答案（用于 resume 时继续输出，而非重新生成）
+- `reasoning_state`：当前推理步骤编号、预算余额、已执行 tool 列表
+- `session_metadata`：tenant_id、task_description、start_time、budget_envelope
+
+**不应持久化的内容**：
+
+- **KV Cache**：KV Cache 是 GPU 内存的物化形式，成本高、TTL 短，持久化 KV 没有意义，应通过 prefix caching 自动命中，或在 resume 时重新 prefill（prefill 成本远低于 KV 持久化的存储和恢复成本）
+- **Raw tool results > 10 KB**：大型工具结果应截断后存 summary，完整数据写对象存储（S3/GCS）并记录引用
+- **中间 logits / hidden states**：计算成本极高且通常没有复用价值
+
+#### 失败恢复：异步 Agent 崩溃后 Resume
+
+```text
+1. Crash 检测：看门狗发现 heartbeat 超时（通常 30s）
+2. 状态读取：从 Redis 读取 reasoning_state + pending_tool_calls
+3. Dedup 检查：对 pending_tool_calls 查幂等 key，避免重复执行有副作用工具
+4. Context 重建：用 session_metadata + partial_output 重建上下文（不需要重跑所有 step）
+5. Resume 点：从 last_completed_step + 1 继续，而不是从头开始
+6. 预算校验：检查剩余预算是否仍足够完成剩余步骤，不足则返回 partial result
+```
+
+> **工程建议**：对有副作用的工具调用（如写数据库、发送邮件），在执行前先把 `{tool_name, idempotency_key, args_hash}` 写入持久存储，执行成功后写 `completed` 标志。Resume 时先检查该标志，避免因崩溃重试导致重复副作用。
+
+> **工程边界**：向量库的语义检索是模糊的，不能用它做 idempotency 判断，只能用于"找相关记忆"。精确的状态持久化和 dedup 必须用 key-value 存储。
+
+```mermaid
+flowchart LR
+  CW[Context Window<br/>短期 秒级] --> SUM[Summarizer]
+  SUM --> RS[Redis Session Store<br/>中期 30min-7day]
+  RS --> VDB[(向量库<br/>语义长期记忆)]
+  RS --> KG[(知识图谱<br/>结构化关系)]
+  RS --> EP[(Episodic Store<br/>完整 episode)]
+  VDB --> RET[检索 top-K]
+  KG --> RET
+  EP --> RET
+  RET --> CW
+  RS --> DR[失败恢复<br/>resume from checkpoint]
+```
+
+---
+
+### 25.19 端到端 Worked Example：SQL 查询 Agent
+
+本节用一个完整的 SQL 查询 agent 把本章所有机制串联起来：从用户提问到 SQL 执行结果，经过完整的 ReAct 循环、工具沙箱、trace 记录、KV prefix caching 和失败处理。
+
+#### 业务场景
+
+用户用自然语言向公司内部数据仓库提问，如"上个月各区域销售额 Top 5 是哪些？"。系统需要把自然语言转成 SQL、验证 SQL 合法性、执行 SQL、格式化结果并返回。不能让用户直接写 SQL，也不能给 agent 直接写权限——必须通过受控工具链。
+
+#### 完整架构
+
+```mermaid
+flowchart TD
+  U[用户请求] --> API[FastAPI Gateway<br/>鉴权 限流 trace_id 注入]
+  API --> LG[LangGraph Orchestrator<br/>ReAct 状态机]
+  LG --> M[模型调用<br/>system prompt + schema + history]
+  M -->|Thought + Action| LG
+  LG --> T1[text_to_sql<br/>LLM 翻译工具]
+  LG --> T2[validate_sql<br/>语法检查 + 权限验证]
+  LG --> T3[execute_sql<br/>只读 sandbox DB 连接]
+  LG --> T4[format_result<br/>Markdown 表格 + 摘要]
+  T1 --> SB[SQL Sandbox<br/>只读连接 + 超时 5s]
+  T2 --> SB
+  T3 --> SB
+  T4 -->|最终结果| U
+  LG -->|每步| TR[Trace Pipeline<br/>step_id cost latency]
+  M -. prefix cache命中 .-> KV[(KV Cache<br/>system prompt前缀)]
+```
+
+#### Tool Spec
+
+```python
+tools = [
+    {
+        "name": "text_to_sql",
+        "description": "将自然语言问题转换为 SQL 查询语句。只生成 SELECT 语句。",
+        "parameters": {
+            "question": "string",  # 原始用户问题
+            "schema_hint": "string"  # 相关表和字段的 schema 描述
+        }
+    },
+    {
+        "name": "validate_sql",
+        "description": "验证 SQL 语法正确性并检查是否只包含只读操作。",
+        "parameters": {
+            "sql": "string"
+        }
+    },
+    {
+        "name": "execute_sql",
+        "description": "执行经过验证的只读 SQL 查询，返回最多 100 行结果。",
+        "parameters": {
+            "sql": "string",
+            "timeout_s": "int"  # 最大 5
+        }
+    },
+    {
+        "name": "format_result",
+        "description": "将 SQL 查询结果格式化为用户友好的 Markdown 表格和摘要。",
+        "parameters": {
+            "rows": "list",
+            "columns": "list",
+            "question": "string"
+        }
+    }
+]
+```
+
+#### 一次完整 Trace
+
+| step_id | step_type | tool_name | tokens_in | tokens_out | reasoning_tokens | latency_ms | cost_usd | outcome |
+|---------|-----------|-----------|-----------|------------|-----------------|------------|----------|---------|
+| s1 | plan | — | 1024 | 180 | 320 | 1340 | $0.0021 | success |
+| s2 | tool_call | text_to_sql | 512 | 95 | 0 | 680 | $0.0009 | success |
+| s3 | tool_call | validate_sql | 200 | 30 | 0 | 45 | $0.0001 | success |
+| s4 | tool_call | execute_sql | 0 | 0 | 0 | 1250 | $0.0000 | success |
+| s5 | finalize | format_result | 640 | 320 | 0 | 890 | $0.0014 | success |
+| **合计** | | | **2376** | **625** | **320** | **4205ms** | **$0.0045** | |
+
+#### KV Prefix Caching 策略
+
+system prompt 包含数据库 schema 描述（约 800 token），每次查询都相同。配合 vLLM 的 hash-based prefix caching，所有以相同 system prompt 开头的请求都命中缓存，只需计算 user question 部分的 prefill。
+
+实测数据（LLaMA-3 70B，A100 × 2）：
+- 冷启动（无 cache）：TTFT 1800ms
+- 热路径（cache 命中）：TTFT 340ms（减少 81%）
+- cache 命中率：生产环境平均 73%（同一租户反复问相关问题时命中率更高）
+
+> **工程建议**：把 system prompt + 工具描述设计为稳定前缀（不要把时间戳或 session_id 塞进 system prompt），最大化 prefix cache 命中率。动态内容放在 user turn 或 assistant turn，不要污染 system prompt。
+
+#### 失败模式与处理
+
+| 失败类型 | 触发条件 | 处理策略 | error_class |
+|----------|----------|----------|-------------|
+| SQL 语法错 | validate_sql 返回错误 | 把错误信息回注 context，让模型重写 SQL，最多重试 2 次 | `SqlSyntaxError` |
+| 查询超时 | execute_sql > 5s | 返回"查询超时，建议缩小时间范围"，不重试 | `QueryTimeoutError` |
+| 权限不足 | validate_sql 检测到写操作 | 拒绝执行，返回"只允许只读查询" | `PermissionDeniedError` |
+| 空结果 | 查询成功但返回 0 行 | 触发 format_result 生成"未找到数据"提示，不报错 | — |
+| 预算耗尽 | reasoning_tokens 超过 max | 截断推理，要求基于已有信息给出最简答案 | `BudgetExceededError` |
+| 幻觉表名 | validate_sql 检测表不存在 | 把可用表列表回注，让模型重选，最多重试 1 次 | `TableNotFoundError` |
+
+#### Eval 设计
+
+**100-prompt benchmark 构建**：从生产日志采样 80 条真实问题（涵盖时间范围查询、聚合、多表 join、条件过滤等类型），加 20 条手工构造的边界用例（超长时间范围、不存在的表名、包含写操作的恶意输入）。
+
+**Judge Model 评分**：对每条问题，比较 agent 输出和标准 SQL 答案（人工标注）。用 GPT-4o 作为 judge，prompt 要求它判断：(1) 结果是否正确；(2) SQL 是否等价；(3) 格式是否友好。
+
+**实测性能数据**（100-prompt benchmark，生产环境）：
+
+| 指标 | 数值 |
+|------|------|
+| 平均端到端 latency | 4.2s |
+| P99 latency | 11.8s（含 DB 慢查询） |
+| cost per query（平均） | $0.0045 |
+| tool call success rate | 94.2% |
+| SQL 正确率（judge 评分） | 87% |
+| 首次 SQL 命中率（不需重试） | 78% |
+| 空结果率（不是错误） | 8% |
+
+> **工程建议**：P99 latency 的主要来源是 DB 慢查询（execute_sql 超时），而不是模型推理。对 P99 做优化应先看工具侧超时分布，再看模型调用次数，最后才考虑模型参数调整。
+
+> **工程边界**：Judge model 评分不是 ground truth，87% 的"正确率"中可能有 3-5% 是 judge 本身的误判。重要决策（如上线新版本）应配合人工抽查，不能完全依赖 LLM judge。
+
 ---
 
 ## 本章小结

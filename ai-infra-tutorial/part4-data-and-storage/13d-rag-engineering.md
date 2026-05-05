@@ -773,6 +773,307 @@ kubectl delete qdrant-collection qdrant-v1
 
 ---
 
+## 13d.14 Graph RAG：知识图谱驱动的关系推理
+
+### 为什么普通 RAG 在关系查询上力不从心
+
+普通 RAG 的检索单位是 chunk——一段连续文本的语义向量。这对"某技术的原理是什么"这类知识型查询非常有效，但对涉及实体间关系跳转的查询几乎无解：
+
+- "X 部门下属哪些员工，其中谁负责 Y 项目？"
+- "A 公司的法人是谁，该法人是否在其他被列入失信名单的公司任职？"
+- "产品 P 依赖哪些第三方库，这些库中有哪些已知 CVE？"
+
+这类查询需要多跳推理（multi-hop reasoning）——从实体 A 出发，经过关系边，到达实体 B，再经过另一条边到达实体 C。普通 RAG 的向量检索只能找"和 query 语义相似的文本片段"，无法沿关系边跳跃。即使把 top-50 chunk 全部检索出来，chunk 里的关系信息也是分散、无结构的，LLM 很难从中可靠地完成多跳推理。
+
+> **不可化简的问题**：知识图谱提供了关系的显式结构；没有这种结构，多跳推理只能靠 LLM 在非结构化文本里"猜测"路径，幻觉率极高。
+
+### Graph RAG 的基本思路
+
+Graph RAG 把知识库处理成两个层次：
+
+1. **知识图谱构建**：用 LLM 从文档中抽取实体和关系，构建图数据库（节点 = 实体，边 = 关系，属性 = 元数据）。
+2. **图驱动检索**：查询时先识别 query 中的关键实体，再在图上做遍历/路径搜索，把遍历到的节点和边转化为 context，交给 LLM 生成答案。
+
+```mermaid
+flowchart LR
+  subgraph "Ingestion（离线，代价高）"
+    D[原始文档] --> LP[LLM 实体+关系抽取]
+    LP --> G[(知识图谱\n节点/边/属性)]
+    LP --> CS[社区检测 Leiden]
+    CS --> CM[社区摘要]
+    CM --> G
+  end
+  subgraph "Query（在线）"
+    Q[用户 Query] --> EL[实体识别 / 关键词提取]
+    EL --> GT[图遍历 / Cypher / PageRank]
+    GT --> G
+    G --> CTX[Context 组装\n节点+边+社区摘要]
+    CTX --> LLM[LLM 生成答案]
+  end
+```
+
+### 主流 Graph RAG 方案对比
+
+| 方案 | 核心机制 | 检索策略 | 全局摘要 | 适合场景 | 工程成熟度 |
+|------|---------|---------|---------|---------|-----------|
+| **Microsoft GraphRAG** | LLM 抽实体+关系，Leiden 算法社区检测，多层 community summary | 局部（实体图遍历）+ 全局（社区摘要） | 是，支持"整体概括"类查询 | 大型语料，需要全局洞察 | 高（开源，Azure 集成） |
+| **LightRAG** | 双层检索：low-level 实体精确匹配 + high-level 概念语义匹配 | 双层融合 | 部分 | 中等语料，延迟要求中等 | 中（开源） |
+| **HippoRAG** | 海马体启发，PPR（Personalized PageRank）多跳路径 | 图随机游走 | 否 | 多跳推理密集 | 中（学术实现） |
+| **Neo4j GraphRAG** | 成熟图数据库 + Cypher 查询语言 + LLM 生成 Cypher | Cypher 精确查询 + 向量相似 | 否（依赖查询结构） | 结构化企业知识，有图数据库基础 | 高（生产级） |
+| **普通 RAG + 关系扩展** | 在 chunk 元数据里存实体 ID，检索后做一跳关系扩展 | 向量检索 + 元数据 join | 否 | 简单关系，迁移成本低 | 高 |
+
+#### Microsoft GraphRAG 详解
+
+GraphRAG 是目前最完整的 Graph RAG 框架，核心流程分三层：
+
+1. **实体与关系抽取**：LLM 扫描所有 chunk，提取 `(实体, 关系类型, 实体)` 三元组，同时为每个实体生成描述。
+2. **社区检测（Leiden 算法）**：对实体图做层级社区检测，将紧密连接的实体聚为社区（Community）。Leiden 算法比 Louvain 在大图上收敛更快、社区边界更准确。
+3. **多层社区摘要**：对每个社区用 LLM 生成摘要（leaf → intermediate → root），摘要本身也被索引为可检索节点，支持"全局总结型"查询（如"整个数据集里最重要的主题是什么"）。
+
+> **工程边界**：GraphRAG 的构建成本极高——抽取一个 100 万 token 语料库的实体和关系，加上社区摘要，通常需要调用 GPT-4 级别 LLM 数千次，成本是普通 chunking+embed 流程的 50-200 倍。适合静态知识库，不适合每日更新的文档流。
+
+#### LightRAG 双层检索
+
+LightRAG 的创新在于把检索分为两个层次：
+
+- **Low-level（实体精确层）**：精确匹配 query 中出现的实体名称，直接从图中拉取与这些实体相关的节点和边。
+- **High-level（概念语义层）**：用 embedding 检索与 query 语义相近的概念节点（而非精确实体名），支持同义词、近似表达。
+
+两层结果融合后送给 LLM，兼顾了精确性和模糊匹配能力。
+
+### 何时选 Graph RAG vs 普通 RAG
+
+| 因素 | 倾向 Graph RAG | 倾向普通 RAG |
+|------|--------------|------------|
+| 查询类型 | 多跳关系（"X 下属 Y，Y 负责 Z"） | 知识型问答（"X 的原理是什么"） |
+| 实体密度 | 高（人物/公司/产品/法条密集） | 低（叙述性文档） |
+| 全局总结需求 | 高（"整个知识库最重要的主题"） | 低（局部检索即可） |
+| 知识更新频率 | 低（月级或更慢） | 高（日级或更快） |
+| 工程预算 | 充足（可接受 50-200x 构建成本） | 受限（快速上线） |
+| 数据规模 | 中等（能被 LLM 抽取完整图结构） | 任意（超大规模也可以） |
+
+> **工程边界**：Graph RAG 最大的陷阱是"构建之后以为万事大吉"。知识图谱本质上是一个快照——文档更新后，图不会自动更新。每次文档增量，都需要重新抽取受影响部分的实体关系并更新图，这个维护管道比普通的增量 embed 复杂 5-10 倍。
+
+### 工程代价与选型决策
+
+| 维度 | 普通 RAG | Graph RAG（GraphRAG） |
+|------|---------|---------------------|
+| 构建时间（100 万 token） | 30 分钟（embed） | 8-24 小时（LLM 抽取 + 图构建） |
+| 构建成本（LLM 调用） | 极低（embed API） | 高（GPT-4 数千次调用）|
+| 检索延迟 | 低（10-50ms） | 中高（100-500ms，图遍历 + 摘要检索）|
+| 多跳推理质量 | 差 | 优 |
+| 全局总结质量 | 差 | 优（GraphRAG community summary） |
+| 知识更新频率支持 | 高（增量 embed） | 低（图维护复杂） |
+| 推荐使用 Neo4j GraphRAG 的场景 | — | 有现成图数据库基础，知识稳定 |
+
+---
+
+## 13d.15 Hierarchical Chunking：父子块与句子窗口
+
+### 为什么需要分层 Chunking
+
+普通 chunking 面临两个相互对立的需求：
+
+- **检索精度**：chunk 越小，embedding 越精准，向量空间中的语义聚焦越好，检索到的 chunk 越可能直接命中正确信息。
+- **上下文完整性**：LLM 需要足够多的上下文才能给出准确答案——光给一句话往往语境不完整。
+
+分层 Chunking 的核心思想：**用细粒度 chunk 做检索，用粗粒度 chunk 提供上下文**。检索和生成的粒度分离，各自优化。
+
+### Parent-Child Chunk
+
+```mermaid
+flowchart TD
+  subgraph "Ingestion"
+    D[原始文档] --> PC[按段落切 Parent Chunk\n约 800-1500 token]
+    PC --> CC[每个 Parent 切成 Child Chunk\n约 150-300 token]
+    CC --> IDX[Child Chunk 建向量索引]
+    CC --> MAP[维护 Child→Parent 映射]
+  end
+  subgraph "Query"
+    Q[用户 Query] --> VEC[向量检索 Child Chunks top-K]
+    VEC --> MAP2[查找对应 Parent Chunks]
+    MAP2 --> CTX[组装 Parent Chunks 为上下文]
+    CTX --> LLM[LLM 生成答案]
+  end
+```
+
+**核心机制**：
+- **索引层**：只有 Child Chunk 被 embed 并写入向量索引（粒度细，检索精度高）。
+- **检索层**：用 query 检索 Child Chunks，得到 top-K 命中。
+- **上下文层**：根据命中的 Child Chunks，回溯到对应的 Parent Chunk，把 Parent 的完整文本送给 LLM（上下文丰富）。
+- **去重**：多个来自同一 Parent 的 Child Chunks 命中时，只保留一份 Parent，避免重复。
+
+**实现**：LangChain `ParentDocumentRetriever`（内置 Child→Parent 映射存储）。
+
+### Document-Level 两阶段检索
+
+Document-level retrieval 先在文档粒度做粗筛，再在段落粒度做精检。适合文档间差异大、但文档内部比较均质的场景（如技术报告、合同文档）：
+
+| 阶段 | 粒度 | 方法 | 目的 |
+|------|------|------|------|
+| 阶段一（粗筛） | 文档级 embedding（BM25 或整篇摘要） | ANN 或 BM25 召回 top-M 个文档 | 排除无关文档，减少精检范围 |
+| 阶段二（精检） | 段落级 chunk | 在 top-M 文档内做 ANN 检索 | 精确定位最相关段落 |
+
+两阶段在候选文档数 M 较大时有显著效率优势：精检只在相关文档集合内搜索，避免全库噪声。
+
+### Sentence Window Retrieval
+
+每个独立句子作为检索单位（embedding 精度最高），但上下文提供前后 N 个句子的完整窗口。
+
+```mermaid
+flowchart LR
+  S1[句子 1] --> IDX
+  S2[句子 2] --> IDX
+  S3[句子 3 命中] --> IDX
+  S4[句子 4] --> IDX
+  S5[句子 5] --> IDX
+  IDX[(向量索引)] --> R[检索命中: 句子 3]
+  R --> W[扩展窗口\n句子 1-5 完整上下文]
+  W --> LLM[LLM 生成]
+```
+
+**适用**：文档段落很长、关键信息密度分散、需要精确定位的场景（如法律条文、技术规范）。
+
+**实现**：LlamaIndex `SentenceWindowNodeParser`（自动维护句子与前后 N 句的映射）。
+
+### AutoMerging Retrieval
+
+LlamaIndex 的 `AutoMergingRetriever` 是 Parent-Child 的增强版：如果某个 Parent Chunk 下有足够比例（如 > 50%）的 Child Chunks 被命中，自动用 Parent 替换所有 Child，避免碎片化上下文。
+
+### 分层 Chunking 决策表
+
+| 文档类型 | 推荐策略 | 理由 |
+|---------|---------|------|
+| 长报告 / 白皮书（章节明确） | Parent-Child（章节为 Parent，段落为 Child） | 章节内部信息相关性高，Parent 能提供完整论述 |
+| 法律条文 / 技术规范（条款密集） | Sentence Window（窗口 N=3-5） | 每条款都是独立检索单位，上下文靠相邻条款补充 |
+| 技术手册 / API 文档 | 两阶段（文档 → 函数/参数段落） | 先定位相关文档，再精检具体参数说明 |
+| 对话记录 / 会议纪要 | Parent-Child（对话段为 Parent，单句为 Child） | 单句语境不完整，需要完整对话段作答 |
+| 代码 + 注释混排文档 | Code-Aware + Parent-Child（函数为 Parent，注释块为 Child） | 代码语义由函数整体决定 |
+| 新闻 / 博客（短文） | Fixed-size 或 Recursive，无需分层 | 文档本身粒度已经合适 |
+
+> **工程边界**：分层 Chunking 增加了存储成本（需要同时存 Child 索引和 Parent 文档存储）和检索步骤（Child 检索 + Parent 回溯）。在文档总量小（< 10 万文档）或延迟极度敏感的场景，普通单层 Chunking 的 simplicity 优先。
+
+---
+
+## 13d.16 多模态 RAG：图像、表格与跨模态检索
+
+### 为什么 RAG 需要多模态
+
+企业文档从来不是纯文本的。一份技术手册可能包含：
+
+- 系统架构图（流程图 / 拓扑图）
+- 性能对比表格
+- 仪表盘截图
+- 公式推导图
+- 产品外观图
+
+纯文本 RAG 对这些内容的处理策略通常是：要么完全忽略图像、要么用 OCR 把表格变成质量参差不齐的文本。结果是：当用户问"图 3 里的系统架构是什么"或"第 5 页的性能表格对比了哪些指标"时，系统完全无法回答。
+
+### 多模态 Embedding 模型对比
+
+| 模型 | 支持模态 | 向量维度 | 优势 | 边界 |
+|------|---------|---------|------|------|
+| **CLIP（OpenAI）** | 图像 + 文本 | 512/768 | 开源，成熟，zero-shot 图文匹配 | 训练数据以英文自然图像为主，工程图/表格效果差 |
+| **SigLIP（Google）** | 图像 + 文本 | 384/1152 | sigmoid 损失，批量效率更高，少样本性能好 | 与 CLIP 生态不完全兼容 |
+| **Jina CLIP v2** | 图像 + 文本 | 1024 | 支持多语言，文档图像专门优化 | 较新，社区资源少 |
+| **Cohere Embed v3 Multimodal** | 图像 + 文本 | 1024 | 闭源 API，文档专门训练，表格效果好 | 数据出境，按 token 计费 |
+| **ColPali** | PDF 页面视觉 + 文本 | 128 per token（multi-vector） | 把 PDF 整页视觉化 embed，完整保留排版信息 | 存储成本高（每页数百向量） |
+| **Voyage Multimodal 3** | 图像 + 文本 | 1024 | 专为 RAG 设计，文档图表效果佳 | 闭源 API |
+| **Nomic Embed Vision** | 图像 + 文本 | 768 | 开源，与 Nomic 文本 embedding 共享空间 | 图表理解能力一般 |
+
+### PDF 中表格和图表的处理策略
+
+PDF 是最常见的企业文档格式，也是多模态 RAG 的核心挑战。表格、图表、流程图和截图需要不同的处理策略：
+
+| 内容类型 | 推荐处理方式 | 检索方式 | 注意事项 |
+|---------|------------|---------|---------|
+| 数字密集表格（财务报表、规格对比） | OCR + 转换为 Markdown 表格 | 文本向量索引 | Markdown 格式保留行列结构，比纯文本更易检索 |
+| 简单文字表格 | OCR + 文本化 | 文本向量索引 | 普通 OCR 即可 |
+| 流程图 / 系统架构图 | 视觉 embedding（CLIP/ColPali）+ 图片存储 | 图像向量索引 | 必要时配合 LLM 生成图表描述文本，双路索引 |
+| 折线图 / 柱状图 | LLM 视觉描述（GPT-4V / LLaVA） + 文本 | 文本向量索引 | 描述质量取决于 VLM 能力 |
+| 产品外观图 / 截图 | 视觉 embedding | 图像向量索引 | 需要多模态查询接口 |
+| 混合布局（文字 + 图表同页） | ColPali 整页 embed | 多向量索引 | 最完整，但存储和延迟代价高 |
+
+### 多模态 RAG Pipeline
+
+```mermaid
+flowchart TD
+  subgraph "Ingestion"
+    PDF[PDF / 图文文档] --> PARSE[文档解析\nPyMuPDF / pdfplumber]
+    PARSE --> TXT[文本 Chunk\n正常文本段落]
+    PARSE --> TAB[表格检测\n→ Markdown]
+    PARSE --> IMG[图像抽取\n图表/截图/流程图]
+    TXT --> TEMB[文本 Embedding\nbge / e5]
+    TAB --> TEMB
+    IMG --> VLM{图像类型判断}
+    VLM -->|架构图/截图| VEMB[视觉 Embedding\nCLIP / ColPali]
+    VLM -->|数据图表| DESC[VLM 描述生成\nGPT-4V / LLaVA]
+    DESC --> TEMB
+    TEMB --> TIDX[(文本向量索引)]
+    VEMB --> VIDX[(图像向量索引)]
+  end
+  subgraph "Query"
+    Q[用户 Query] --> QT{Query 类型}
+    QT -->|纯文本查询| TRET[文本检索]
+    QT -->|图像相关查询| VRET[视觉检索]
+    QT -->|混合| BOTH[双路检索 + 融合]
+    TRET --> TIDX
+    VRET --> VIDX
+    BOTH --> TIDX
+    BOTH --> VIDX
+    TIDX --> MERGE[结果融合 RRF]
+    VIDX --> MERGE
+    MERGE --> RERANK[多模态 Reranker]
+    RERANK --> VLM2[多模态 LLM 生成\n文本+图像上下文]
+  end
+```
+
+### 视觉问答中的 RAG 部署架构
+
+多模态 RAG 需要分离部署视觉 encoder 和语言模型：
+
+```mermaid
+flowchart LR
+  subgraph "Embedding 服务（CPU/小 GPU）"
+    CE[CLIP/ColPali Encoder\n图像 → 向量]
+    TE[文本 Encoder\nbge-m3 → 向量]
+  end
+  subgraph "向量库"
+    VI[(图像向量索引\nQdrant)]
+    TI[(文本向量索引\nQdrant)]
+  end
+  subgraph "推理服务（大 GPU）"
+    VLM3[多模态 LLM\nLLaVA-1.6 / Qwen-VL\nvLLM multi-modal 部署]
+  end
+  Q2[用户 Query + 可选图像] --> CE & TE
+  CE --> VI
+  TE --> TI
+  VI --> CTX[Context 组装\n文本 + 图像 bytes]
+  TI --> CTX
+  CTX --> VLM3
+  VLM3 --> ANS[答案 + Citation]
+```
+
+**关键工程点**：
+- vLLM 从 0.4+ 版本支持多模态输入（图像 bytes 直接传入 messages），不需要额外转换。
+- 图像 context 的 token 成本远高于文本（1024×1024 图像约等于 1000-2000 token）。建议对图像 context 做预算限制，每次最多注入 3-5 张图像。
+- 视觉 encoder（CLIP/ColPali）推理成本相对低，可以用 CPU 或小 GPU（A10G × 1）单独部署，与 LLM 推理服务解耦。
+
+### 多模态 Reranking
+
+跨模态 Reranker 评估文本 query 与图像 chunk 的相关性：
+
+| 方法 | 原理 | 延迟 | 适用 |
+|------|------|------|------|
+| CLIP 相似度 | 文本 query 与图像向量的余弦相似度 | 极低（已有向量） | 粗筛，快速但精度有限 |
+| VLM 评分（LLaVA / GPT-4V） | 将 query 和图像都输入 VLM，输出相关性评分 | 高（300-2000ms）| 精排，精度高但成本高 |
+| BLIP-2 / InstructBLIP | 专门训练的图文匹配模型 | 中（50-200ms） | 平衡选择 |
+| ColPali MaxSim | token 级别延迟交互，类似 ColBERT | 中 | PDF 页面与查询匹配 |
+
+> **工程建议**：多模态 reranking 的成本很高，建议只对图像类型的 chunk 做 VLM reranking，文本类 chunk 仍走普通 cross-encoder。对图像做粗筛（CLIP score > 0.25）后再送 VLM 精排，能节省 60-80% 的 VLM 调用。
+
+---
+
 ## 练习
 
 **13d-1（基础）**：解释为什么 chunk size 太小（< 100 token）和太大（> 1000 token）分别会损害 RAG 质量。各给出一个具体场景举例。
@@ -798,6 +1099,12 @@ kubectl delete qdrant-collection qdrant-v1
 **13d-11（设计）**：为 RAG 系统设计一个最小可运行的 eval CI pipeline，要求：每次合并到 main 分支时自动运行；用 Ragas 计算 context_recall 和 faithfulness；当指标低于阈值时阻止合并；报告包含与上次合并的指标对比。给出 pipeline 配置骨架（GitHub Actions 或等价工具）。
 
 **13d-12（开放）**：在你接触过的或文献中的 RAG 系统里，找到一个"反直觉的失败案例"：某个看起来应该有效的优化（比如加更多 chunk、用更强的 embedding 模型、加 query 改写）实际上让系统变得更差。分析可能的原因。
+
+**13d-13（基础）**：Graph RAG 的构建成本比普通 RAG 高 50-200 倍。给出三个场景，分别判断 Graph RAG 是否"值得"，并说明判断依据。
+
+**13d-14（进阶）**：Parent-Child Chunk 和 Sentence Window 都是"分层 Chunking"的实现，但机制不同。比较两种方法在以下场景的适用性：(1) 法律合同文档（每条款都有独立法律意义）；(2) 学术论文（有摘要、引言、方法、实验等结构）。
+
+**13d-15（设计）**：为一个企业技术手册 RAG 系统设计多模态处理方案，文档包含大量系统架构图（流程图/拓扑图）和性能对比表格。给出：(1) 图像和表格的分类处理策略；(2) 索引设计（文本索引 + 图像索引的分离或统一）；(3) 多模态 Reranking 方案；(4) 预估每种处理路径的 token 成本。
 
 ---
 
@@ -840,9 +1147,31 @@ kubectl delete qdrant-collection qdrant-v1
 - LangChain `MultiQueryRetriever`, `EnsembleRetriever`, `ContextualCompressionRetriever` 源码
 - LlamaIndex `RouterRetriever`, `AutoMergingRetriever`, `SentenceWindowNodeParser` 源码
 
+### Graph RAG
+
+- Edge, Darren et al. "From Local to Global: A Graph RAG Approach to Query-Focused Summarization." arXiv 2404.16130. （Microsoft GraphRAG 原始论文）
+- Guo, Zirui et al. "LightRAG: Simple and Fast Retrieval-Augmented Generation." arXiv 2410.05779.
+- Gutierrez, Bernal Jiménez et al. "HippoRAG: Neurobiologically Inspired Long-Term Memory for Large Language Models." NeurIPS 2024.
+- Neo4j GraphRAG 官方文档：[neo4j.com/docs/neo4j-graphrag-python](https://neo4j.com/docs/neo4j-graphrag-python/)
+
+### Hierarchical Chunking
+
+- LangChain `ParentDocumentRetriever` 源码与文档
+- LlamaIndex `AutoMergingRetriever`、`SentenceWindowNodeParser` 源码
+- LlamaIndex Blog: "Hierarchical Retrieval" 系列文章
+
+### 多模态 RAG
+
+- Faysse, Manuel et al. "ColPali: Efficient Document Retrieval with Vision Language Models." arXiv 2407.01449.
+- Radford, Alec et al. "Learning Transferable Visual Models From Natural Language Supervision." ICML 2021. （CLIP 原始论文）
+- Zhai, Xiaohua et al. "Sigmoid Loss for Language Image Pre-Training." ICCV 2023. （SigLIP）
+- Cohere Embed v3 Multimodal 技术报告
+- Voyage Multimodal 3 官方文档
+
 ### 关联章节
 
 - [第 13 章 特征、向量与缓存](13-feature-vector-and-cache.md)：向量索引、ANN、chunking、缓存基础
+- [第 13b 章 向量索引算法](13b-vector-index-algorithms.md)：SQ-HNSW、量化索引、ANN benchmark
 - [第 11e 章 数据版本与血缘](11e-data-versioning-and-lineage.md)：增量更新、版本管理基础
 - [第 16b 章 SGLang 内部机制](../part5-serving-infra/16b-sglang-internals.md)：RadixAttention prefix 复用与 RAG 协同
 - [第 23 章 安全隔离与治理](../part7-reliability-security/23-security-isolation-and-governance.md)：权限边界、multi-tenant 安全

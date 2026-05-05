@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 09e 章 · MoE 训练基础设施 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=09e" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>第 09e 章 · MoE 训练基础设施</h1>
+<p class="sub">2024-2025 大模型训练已经从 dense 走向 MoE。本章把 Expert Parallelism、All-to-All 通信、router load balance、capacity / drop、checkpoint reshape、5 维并行组合放在同一张 MoE 训练责任图里，把它当作 dense 训练之上独立的子学科来工程化。</p>
+<div class="chips"><span class="chip">MoE</span><span class="chip">Expert Parallelism</span><span class="chip">All-to-All</span><span class="chip">DeepSeek-V3</span><span class="chip">Mixtral</span><span class="chip">DeepEP</span><span class="chip">Loss-Free Balancing</span><span class="chip">Capacity Factor</span></div>
+<div class="note"><strong>不可化简的问题：</strong>怎样让模型的"参数容量"增长，但"每 token 的 FLOPs"不成比例增长，同时 step time、显存、collective、checkpoint 和故障域都还能在生产规模下收敛？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。本章是 <a href="09-model-pipeline-parallel.html">§9</a> 5 维并行的第六维 EP 的专题。</div>
+</section>
+
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：MoE 训练为什么是独立子学科</a></li>
+<li><a class="anchor" href="#s2">MoE 架构基础：从 dense FFN 到 DeepSeek-V3</a></li>
+<li><a class="anchor" href="#s3">Expert Parallelism (EP)：把 expert 切到不同 GPU</a></li>
+<li><a class="anchor" href="#s4">All-to-All 通信：MoE 的真正瓶颈</a></li>
+<li><a class="anchor" href="#s5">Gate Routing：让 router 学会公平分配</a></li>
+<li><a class="anchor" href="#s6">Capacity Factor 与 Token Drop</a></li>
+<li><a class="anchor" href="#s7">通信 / 计算 Overlap：DeepEP 风格</a></li>
+<li><a class="anchor" href="#s8">MoE Checkpoint：Expert 维度的 Reshape</a></li>
+<li><a class="anchor" href="#s9">MoE 训练特有失败模式</a></li>
+<li><a class="anchor" href="#s10">MoE vs Dense 工程对比</a></li>
+<li><a class="anchor" href="#s11">MoE + 其他并行的 5 维组合</a></li>
+<li><a class="anchor" href="#s12">推理时的 MoE</a></li>
+<li><a class="anchor" href="#s13">Worked Example：DeepSeek-V3 风格完整账本</a></li>
+<li><a class="anchor" href="#s14">工程边界总结</a></li>
+<li><a class="anchor" href="#s15">练习</a></li>
+<li><a class="anchor" href="#s16">深度参考阅读</a></li>
+</ol>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：MoE 训练为什么是独立子学科</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>MoE 训练要解决的不可化简问题，可以浓缩成一句话：<strong>怎样让模型的"参数容量"增长，但"每 token 的 FLOPs"不成比例增长，同时 step time、显存、collective、checkpoint 和故障域都还能在生产规模下收敛？</strong></p>
+<p>dense 模型把"参数 = 容量 = FLOPs"绑死。每加一个 layer 或加宽一个 hidden，激活就要走完所有权重，FLOPs 线性涨。结果是 70B → 405B → 1T 走到一定程度，单 step 算力就吃不消。MoE 的本质是把"FFN 这种容量大但每 token 只需要一小部分的算力"通过 router 稀疏化：每个 token 只激活 N 个 expert 中的 K 个（典型 K=2 或 K=8）。模型容量乘 N，但每 token FLOPs 只乘 K/N。</p>
+<p>但这不是免费的。一旦把 expert 切到不同 GPU（Expert Parallelism），系统就被强行拉出"算力主导"区，进入"通信 + 路由调度"主导的世界。新出现的不可化简问题包括：</p>
+<ul>
+<li><strong>token dispatch</strong>：router 决定每个 token 去哪些 expert 之后，必须把 token 物理搬到 expert 所在 GPU。这要求一次 All-to-All（dispatch），算完再一次 All-to-All（combine）回来。</li>
+<li><strong>load balance</strong>：router 是学出来的，没有任何机制自然保证 256 个 expert 收到同样多的 token。坍缩（router 把所有 token 喂给少数热门 expert）会让大部分 GPU 空转，少数 GPU OOM。</li>
+<li><strong>capacity 决策</strong>：每个 expert 物理上只能处理固定数量的 token。超过的 token 要么 drop、要么排队、要么走 padding。drop 损失训练信号，padding 浪费 FLOPs。</li>
+<li><strong>incast 网络</strong>：All-to-All 的 N×N 通信模式天然产生 incast。多个 sender 同时打向一个 receiver，交换机 buffer 溢出，ECMP 哈希不均，DCQCN/PFC 抖动。</li>
+<li><strong>checkpoint reshape</strong>：dense checkpoint 是 layer × tensor shard。MoE 是 layer × expert × tensor shard。expert 数量本身可能在续训时变化，reshape 不再是简单的 N→M。</li>
+<li><strong>故障爆炸半径</strong>：一个 expert GPU 挂了，会让全局 All-to-All hang；router 出 NaN 会让所有 EP rank 同时进入 dead path。</li>
+</ul>
+<p>这些子问题只在 MoE 出现，dense 训练的工程经验直接套过来会失败。所以 MoE 必须独立成章。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p><strong>为什么 sparse FFN？</strong> Transformer 里 FFN 占了 60-70% 的参数和 FLOPs，但每个 token 显然不需要"读完所有 FFN 权重"才能预测下一个 token。把 FFN 分裂成 N 个 expert，每个 token 由 router 选 K 个，能在保留容量的同时把 FLOPs 砍到 K/N。Switch Transformer / GShard / SMoE 是这个思路的早期工程化。</p>
+<p><strong>为什么 top-K + softmax？</strong> router 输出每个 expert 的得分，必须可微才能让 router 自己被训出来。top-K + softmax 是最自然的可微近似（top-1 = Switch，top-2 = GShard，top-8 = DeepSeek-V3）。K 越大，覆盖越好，但通信和 capacity 浪费也越大。</p>
+<p><strong>为什么需要 shared expert？</strong> routed expert 之间没有共享，导致每个 expert 必须独立学到"基础语言能力 + 自己的特化"。DeepSeek-V2/V3 把一部分容量留作 shared expert（每个 token 都过），让它承担"公共基线"，routed expert 只学差异。这降低了 expert 之间的冗余学习。</p>
+<p><strong>为什么 Expert Parallelism？</strong> 256 个 expert 每个 hidden=2048 的 FFN，光参数就要几百 GB，单卡放不下。把 expert 切到不同 GPU 是最自然的切法（与 TP 切单层、PP 切多层正交）。但因为 token 选哪个 expert 是动态的，必须把 token 物理搬到 expert 所在 GPU，于是出现 All-to-All。</p>
+<p><strong>为什么 capacity factor + drop？</strong> 若每个 expert 都按"最差情况"分配 GPU 内存，几乎所有 expert 会浪费 99% 容量。capacity factor 取一个折中值（通常 1.0-1.25），超出的 token 直接 drop 或者 overflow。drop 损失信号，但工程上是必要的。</p>
+<p><strong>为什么 load balance loss？</strong> 没有约束的 router 会迅速坍缩到只用少数 expert。load balance loss 强制 router 输出的概率分布接近均匀。DeepSeek-V3 进一步提出 auxiliary-loss-free balancing，用 expert 级 bias 动态调整，避免 aux loss 与主 loss 的梯度冲突。</p>
+<p><strong>为什么 communication-computation overlap？</strong> dispatch + combine 两次 All-to-All 加起来可以占 step time 的 30-50%。如果不与 expert 计算 overlap，MFU 会很差。DeepEP 等优化让 dispatch 与 expert 计算重叠，把 EP 通信几乎隐藏在计算后面。</p>
+<p><strong>为什么 checkpoint 要按 expert shard？</strong> dense 模型 checkpoint 是按 layer × TP shard。MoE 多了一个 expert 维度，每个 expert 的权重独立，必须能在 EP 拓扑变化时按 expert 重映射。这要求 manifest 显式记录"哪个 expert 在哪个 rank"。</p>
+<div class="note"><strong>三层翻译：</strong>MoE 不是"在 dense 上加一个 router"，而是把训练系统从"算力主导"重写为"路由 + 通信主导"。任何停留在"参数变多了"层面的理解都会在生产中翻车。</div>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((MoE 训练基础设施))
+    根问题
+      容量涨FLOPs不涨
+      参数N倍激活K倍
+      存储与算力解耦
+    架构机制
+      Sparse FFN
+      Top-K Routing
+      Shared Expert
+      Routed Expert
+    并行维度
+      Expert Parallelism
+      与DP正交
+      与TP正交
+      与PP正交
+      与CP正交
+    通信机制
+      All-to-All dispatch
+      All-to-All combine
+      Incast
+      DeepEP overlap
+    路由机制
+      Softmax Top-K
+      Aux Loss
+      Loss-Free Bias
+      Reproducibility
+    容量与drop
+      Capacity Factor
+      Token Drop
+      Padding
+      Overflow
+    失败模式
+      Expert 坍缩
+      Loss Spike
+      Router NaN
+      EP Hang
+    Checkpoint
+      Expert shard
+      EP reshape
+      Manifest
+    工程组合
+      EP+DP+TP+PP+CP
+      Megatron-Core MoE
+      DeepSpeed Ulysses
+      DeepEP
+    推理路径
+      与训练路径分离
+      专家放置
+      KV cache</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>MoE 与 dense 在容量、FLOPs、显存、通信、checkpoint 五个维度上分别相差多少倍？</li>
+<li>Top-K routing 的 K 选 1、2、8 对 capacity factor、All-to-All 体积、load balance 难度分别有什么影响？</li>
+<li>shared expert 与 routed expert 的设计动机是什么？为什么 DeepSeek-V3 同时用这两类？</li>
+<li>Expert Parallelism 引入的两次 All-to-All 在网络上是 incast 模式还是 ring 模式？为什么 NCCL 要专门提供 ALLTOALL_ALGO_*？</li>
+<li>capacity factor 为什么不能简单设为 2.0？drop rate 在训练初期、中期、末期分别有什么动态特性？</li>
+<li>expert 坍缩怎么发现？aux loss 与 loss-free balancing 的工程取舍是什么？</li>
+<li>EP=16 训练的 checkpoint 如何恢复到 EP=8 推理？</li>
+</ol>
+
+<h3>学习 checklist</h3>
+<ul>
+<li>能区分"参数容量"、"激活 FLOPs"、"通信体积"三个数字在 MoE 中的非线性关系</li>
+<li>能画出一次 MoE forward 的完整 dispatch / expert / combine 时序图</li>
+<li>能给出 capacity factor 的取值依据，并说明 drop rate 的监控阈值</li>
+<li>能解释 aux loss 与 loss-free balancing 的优缺点</li>
+<li>能根据 expert 数 / hidden / TP / PP / DP 估算 EP 的 All-to-All 体积</li>
+<li>能写出 MoE checkpoint manifest 的最小 schema</li>
+<li>能列出至少 3 种 MoE 特有的训练失败模式与对应的告警指标</li>
+</ul>
+</section>
+
+<section class="section" id="s2">
+<h2>2. MoE 架构基础：从 dense FFN 到 DeepSeek-V3</h2>
+
+<h3>2.1 dense FFN → Sparse MoE 的演化</h3>
+<pre><code>dense FFN:        x -&gt; W_up -&gt; SiLU -&gt; W_down -&gt; y           (所有 token 走全部权重)
+SMoE FFN:         x -&gt; Router(x) -&gt; {Expert_i}_{i in TopK} -&gt; WeightedSum -&gt; y
+DeepSeek-V3 FFN:  x -&gt; SharedExpert(x) + Σ_{i in TopK(routed)} g_i · Expert_i(x)</code></pre>
+
+<table>
+<tr><th>时间</th><th>模型</th><th>关键设计</th><th>工程意义</th></tr>
+<tr><td>2017</td><td>Outrageously Large NN</td><td>top-K gating + load balance</td><td>第一次把 sparse expert 引入 NLP</td></tr>
+<tr><td>2020</td><td>GShard</td><td>top-2 routing + capacity factor</td><td>首个工程化大规模 MoE</td></tr>
+<tr><td>2021</td><td>Switch Transformer</td><td>top-1 routing 简化通信</td><td>减少 dispatch 体积</td></tr>
+<tr><td>2024 Q1</td><td>Mixtral 8×7B</td><td>8 experts top-2，开放权重</td><td>工业界首个开源 MoE 标杆</td></tr>
+<tr><td>2024 Q2</td><td>DeepSeek-V2</td><td>多 routed + 1 shared expert，160 expert</td><td>shared expert 设计正式工程化</td></tr>
+<tr><td>2024 Q4</td><td>DeepSeek-V3</td><td>256 routed + 1 shared，top-8，loss-free balance</td><td>把 MoE 推到 671B 总参 / 37B 激活</td></tr>
+<tr><td>2024 Q4</td><td>Qwen2-MoE</td><td>A14B 激活，60 expert</td><td>同期开源 baseline</td></tr>
+<tr><td>2025 Q1</td><td>DeepEP</td><td>dispatch / combine kernel + overlap</td><td>EP 通信工程化开源</td></tr>
+</table>
+
+<h3>2.2 Routed expert vs Shared expert</h3>
+<table>
+<tr><th>维度</th><th>Routed expert</th><th>Shared expert</th></tr>
+<tr><td>激活方式</td><td>top-K 选择</td><td>所有 token 都过</td></tr>
+<tr><td>数量</td><td>几十到几百</td><td>通常 1-4</td></tr>
+<tr><td>学习目标</td><td>专业化分工</td><td>公共基线能力</td></tr>
+<tr><td>是否参与 routing</td><td>是</td><td>否</td></tr>
+<tr><td>是否参与 All-to-All</td><td>是</td><td>否（与 dense 同处理路径）</td></tr>
+<tr><td>显存放置</td><td>EP shard</td><td>与 dense 层同处理</td></tr>
+<tr><td>工程价值</td><td>容量扩张</td><td>减少 routed expert 之间的冗余学习</td></tr>
+</table>
+
+<h3>2.3 一个 MoE block 的标准结构</h3>
+<pre class="mermaid">flowchart LR
+  X[Input x: B x S x H] --&gt; SA[Self-Attention]
+  SA --&gt; N1[Norm + Residual]
+  N1 --&gt; R[Router: Linear H to N + Softmax]
+  R --&gt;|TopK 索引 + 权重| Disp[All-to-All Dispatch]
+  N1 --&gt;|公共路径| SE[Shared Expert FFN]
+  Disp --&gt; E1[Expert 1 FFN]
+  Disp --&gt; E2[Expert 2 FFN]
+  Disp --&gt; EN[Expert N FFN]
+  E1 --&gt; Comb[All-to-All Combine]
+  E2 --&gt; Comb
+  EN --&gt; Comb
+  SE --&gt; Sum[Weighted Sum]
+  Comb --&gt; Sum
+  Sum --&gt; Out[Norm + Residual -&gt; next layer]</pre>
+<div class="warn"><strong>工程边界：</strong>Router 是 linear + softmax，参数极小（H×N），放在 dense 路径里，每个 EP rank 都要复制一份，不参与 EP 切分。Router 必须用 FP32 计算，否则 BF16 累加顺序会让不同 rank 选出不同的 top-K，破坏一致性。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. Expert Parallelism (EP)：把 expert 切到不同 GPU</h2>
+
+<h3>3.1 为什么 EP 必然出现</h3>
+<p>DeepSeek-V3 的 256 个 routed expert 每个 FFN 大约 0.6B 参数。256×0.6B ≈ 150B 仅 expert 权重，加上 master weight + optimizer state（Adam ×2 + master FP32 + grad），实际占 BF16 等价的 6-8 倍 → 单 expert 路径就要 ~1TB 显存。这无论如何都不能放进单卡，必须切。</p>
+<table>
+<tr><th>切法</th><th>切什么</th><th>问题</th></tr>
+<tr><td>TP</td><td>切单个 expert 内部 hidden</td><td>expert 太多，每个 expert 内部 GEMM 又太小，TP overhead 大</td></tr>
+<tr><td>PP</td><td>把不同层的 MoE block 放不同 stage</td><td>适用，但只解决层数问题，不解决单层 expert 太多</td></tr>
+<tr><td>DP/FSDP</td><td>复制 expert</td><td>显存爆炸，方向相反</td></tr>
+<tr><td><strong>EP</strong></td><td>把不同 expert 放不同 GPU</td><td>自然，但要 All-to-All</td></tr>
+</table>
+
+<h3>3.2 EP 的 rank mesh</h3>
+<pre><code>global_rank = ep_rank × (DP * TP * PP * CP) + dp_rank × (TP * PP * CP) + ...
+EP group: 同一个 (DP, TP, PP, CP) 坐标下，跨 EP 的 rank 集合
+expert_per_rank = N / EP_size</code></pre>
+<table>
+<tr><th>EP size</th><th>expert_per_rank（N=256）</th><th>All-to-All 通信域大小</th></tr>
+<tr><td>8</td><td>32</td><td>8</td></tr>
+<tr><td>16</td><td>16</td><td>16</td></tr>
+<tr><td>32</td><td>8</td><td>32</td></tr>
+<tr><td>64</td><td>4</td><td>64</td></tr>
+<tr><td>128</td><td>2</td><td>128</td></tr>
+<tr><td>256</td><td>1</td><td>256（单 expert / GPU）</td></tr>
+</table>
+<div class="note"><strong>工程边界：</strong>EP_size 通常等于一个 NVLink/NVSwitch domain（8 或 16 卡）。再大就要跨 IB，All-to-All 体积乘 IB 链路数后吞吐很难打满。</div>
+
+<h3>3.3 EP 与其他并行的正交关系</h3>
+<table>
+<tr><th>并行</th><th>切的对象</th><th>与 EP 是否正交</th><th>备注</th></tr>
+<tr><td>DP</td><td>样本</td><td>是</td><td>每个 DP 副本内部独立 EP</td></tr>
+<tr><td>FSDP</td><td>训练状态</td><td>部分</td><td>shared expert + dense 路径走 FSDP，routed expert 不走</td></tr>
+<tr><td>TP</td><td>单层张量</td><td>是</td><td>TP 切 attention / shared FFN，EP 切 routed FFN</td></tr>
+<tr><td>PP</td><td>层段</td><td>是</td><td>PP 切 transformer blocks，EP 切每个 block 内的 expert</td></tr>
+<tr><td>CP</td><td>序列 / context</td><td>是</td><td>与 EP 完全独立</td></tr>
+<tr><td>SP</td><td>非 attention 序列 activation</td><td>是</td><td>与 EP 配合时要小心 dispatch 前的 sequence layout</td></tr>
+</table>
+</section>
+
+<section class="section" id="s4">
+<h2>4. All-to-All 通信：MoE 的真正瓶颈</h2>
+
+<h3>4.1 All-to-All 的体积账本</h3>
+<p>dispatch 阶段，每个 EP rank 需要把"自己拥有的 token 中要送给其他 expert 的部分"打包发出去：</p>
+<pre><code>dispatch 体积 (per rank, per layer) =
+  tokens_per_rank × hidden × 2 (BF16) × K (top-K) × overhead(capacity_factor)</code></pre>
+<p>以 DeepSeek-V3 的典型配置（global batch 4096 × seq 4096，top-K=8，hidden=7168，EP=64）：</p>
+<table>
+<tr><th>项</th><th>数值</th></tr>
+<tr><td>token 数（per EP rank）</td><td>4096 × 4096 / 64 ≈ 262K</td></tr>
+<tr><td>每 token dispatch payload</td><td>7168 × 2 × 8 = 114 KB</td></tr>
+<tr><td>单 layer dispatch 体积</td><td>262K × 114KB ≈ 30 GB</td></tr>
+<tr><td>combine 体积</td><td>同 dispatch ≈ 30 GB</td></tr>
+<tr><td>单 layer EP 通信</td><td>≈ 60 GB</td></tr>
+<tr><td>一次 forward（30 MoE layer）</td><td>≈ 1.8 TB</td></tr>
+<tr><td>forward + backward</td><td>≈ 3.6 TB</td></tr>
+</table>
+<div class="warn"><strong>工程含义：</strong>在 800 Gbps IB（约 100 GB/s 双向）上，单 step EP 通信至少 30+ 秒。必须靠 overlap、capacity 调优和 dispatch 压缩才能压到 5 秒以内。</div>
+
+<h3>4.2 All-to-All 与 Ring/Tree AllReduce 的本质区别</h3>
+<pre class="mermaid">flowchart TB
+  subgraph Ring[Ring AllReduce]
+    R1[rank0] --&gt; R2[rank1] --&gt; R3[rank2] --&gt; R4[rank3] --&gt; R1
+  end
+  subgraph A2A[All-to-All]
+    A1[rank0] --&gt;|不同 chunk| B1[to rank0]
+    A1 --&gt; B2[to rank1]
+    A1 --&gt; B3[to rank2]
+    A1 --&gt; B4[to rank3]
+    A2[rank1] --&gt; B1
+    A2 --&gt; B2
+    A2 --&gt; B3
+    A2 --&gt; B4
+  end</pre>
+
+<table>
+<tr><th>维度</th><th>Ring AllReduce</th><th>All-to-All</th></tr>
+<tr><td>通信模式</td><td>点对点环形，每 rank 1 send + 1 recv</td><td>N×N 全互联</td></tr>
+<tr><td>总体积</td><td>~2(N-1)/N × 单卡数据量</td><td>N × 单卡数据量</td></tr>
+<tr><td>网络压力</td><td>均匀，链路友好</td><td>incast 严重，受 ECMP 哈希影响</td></tr>
+<tr><td>时延</td><td>与 N 线性</td><td>与 N 线性，但常数大</td></tr>
+<tr><td>NCCL 实现</td><td>成熟，多种算法</td><td>单一算法（NCCL_ALLTOALL_ALGO 控制）</td></tr>
+<tr><td>失败影响</td><td>慢一段</td><td>全 group 同时 hang</td></tr>
+</table>
+
+<h3>4.3 NCCL ALLTOALL_ALGO 与网络规划</h3>
+<pre><code>NCCL_ALLTOALL_ALGO=PAIRWISE  # 默认，按 (i,j) 配对发送
+# Ring AllToAll 在 NCCL 不被支持
+NCCL_PXN_DISABLE / NCCL_IB_HCA / NCCL_NET_GDR_LEVEL  # 跨节点要点</code></pre>
+<table>
+<tr><th>网络层</th><th>调优要点</th><th>风险</th></tr>
+<tr><td>单机 NVLink/NVSwitch</td><td>All-to-All in-domain，几乎打满 NVLink 带宽</td><td>跨 NVSwitch domain 直接掉到 PCIe</td></tr>
+<tr><td>多机 IB 800G</td><td>必须 rail-aligned；同一 EP rank 集合走同一 rail</td><td>rail 不对齐 → ECMP 哈希成 hotspot</td></tr>
+<tr><td>ECMP / RDMA</td><td>用 entropy 字段（PSN / GID）打散流</td><td>单流容易在 1-2 链路堵塞</td></tr>
+<tr><td>交换机 buffer</td><td>shared buffer 大、PFC 配置正确</td><td>incast 时 PFC pause 反向传播</td></tr>
+</table>
+<div class="danger"><strong>规划错误：</strong>MoE 集群网络规划必须把 EP_size、rail 数、leaf 交换机 buffer 容量同时考虑。一个常见错误是按 dense 训练规划 IB（DP AllReduce 友好），结果 MoE 上线后 All-to-All 把交换机 buffer 打爆，PFC 风暴蔓延到整个 fabric。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. Gate Routing：让 router 学会公平分配</h2>
+
+<h3>5.1 标准 top-K softmax router</h3>
+<pre><code>logits = x @ W_gate                     # [B*S, N_experts]
+probs  = softmax(logits, dim=-1)
+topk_val, topk_idx = topk(probs, K)
+gates  = topk_val / topk_val.sum(-1)    # 归一化</code></pre>
+<table>
+<tr><th>设计选择</th><th>说明</th><th>风险</th></tr>
+<tr><td>Softmax 在 top-K 之前</td><td>概率含义清晰，可微</td><td>大部分概率被丢弃，浪费梯度</td></tr>
+<tr><td>Softmax 在 top-K 之后</td><td>直接归一化选中 expert</td><td>梯度信号集中但不是全局概率</td></tr>
+<tr><td>sigmoid 替代 softmax</td><td>DeepSeek-V3 改用 sigmoid + bias</td><td>解耦 expert 之间竞争</td></tr>
+<tr><td>K=1 (Switch)</td><td>通信最小，但负载均衡难</td><td>drop rate 高</td></tr>
+<tr><td>K=2 (GShard, Mixtral)</td><td>平衡选择</td><td>通信×2</td></tr>
+<tr><td>K=8 (DeepSeek-V3)</td><td>覆盖度高，loss 更稳</td><td>通信×8，capacity 难调</td></tr>
+</table>
+
+<h3>5.2 Router 决策流程</h3>
+<pre class="mermaid">flowchart TD
+  X[Input token x] --&gt; G[Linear: H to N_experts]
+  G --&gt; P{score 函数}
+  P --&gt;|softmax| S[probs]
+  P --&gt;|sigmoid+bias| SB[scores + b_i]
+  S --&gt; TK[Top-K 选择]
+  SB --&gt; TK
+  TK --&gt; Norm[归一化得 gate weights]
+  Norm --&gt; Disp[发往对应 expert]
+  TK --&gt; Mon{监控}
+  Mon --&gt; Load[per-expert load]
+  Mon --&gt; Ent[router entropy]
+  Mon --&gt; Drop[drop rate]
+  Load --&gt; Ctrl[loss-free 控制器更新 b_i]</pre>
+
+<h3>5.3 Router reproducibility</h3>
+<p>router 输出的 top-K 索引必须在 forward / backward / 重启之间完全一致，否则梯度不一致。常见的不一致来源：</p>
+<ul>
+<li><strong>浮点累加顺序</strong>：BF16 softmax 在不同 GPU 数值不同 → 用 FP32 router</li>
+<li><strong>NaN 处理</strong>：FP16 logits 溢出 → BF16 + clip</li>
+<li><strong>重排算法</strong>：top-K 实现的 tie-breaker 不固定 → 强制按 expert id 升序</li>
+<li><strong>dropout / 噪声</strong>：用 fixed seed 或不在 router 上加噪声</li>
+</ul>
+
+<h3>5.4 Load balance loss（aux loss）</h3>
+<pre><code>f_i = (1/T) Σ_t 1[token_t selects expert_i]   # 实际选中频率
+P_i = (1/T) Σ_t softmax(logits_t)[i]          # 平均概率
+L_aux = α · N · Σ_i f_i · P_i                 # Switch / GShard 的标准式</code></pre>
+<table>
+<tr><th>项</th><th>直觉</th></tr>
+<tr><td>f_i</td><td>实际负载</td></tr>
+<tr><td>P_i</td><td>router 信心</td></tr>
+<tr><td>f_i × P_i</td><td>让 router 不要把高概率给已经过载的 expert</td></tr>
+<tr><td>α</td><td>平衡系数，通常 0.001-0.01</td></tr>
+</table>
+
+<h3>5.5 DeepSeek-V3 的 auxiliary-loss-free balancing</h3>
+<p>aux loss 与主 loss 梯度方向常常冲突（aux loss 想"平均分散"，主 loss 想"专家化"）。DeepSeek-V3 改为：</p>
+<pre><code>score_i = sigmoid(logits_i) + b_i
+TopK by score, gate = sigmoid(logits) (only TopK)
+b_i 由控制器动态调整：load_i &gt; 平均 → b_i 减小；load_i &lt; 平均 → b_i 增大</code></pre>
+<table>
+<tr><th>维度</th><th>aux loss</th><th>loss-free balancing</th></tr>
+<tr><td>实现</td><td>loss 项</td><td>训练循环外的控制器</td></tr>
+<tr><td>主 loss 梯度污染</td><td>有</td><td>无</td></tr>
+<tr><td>收敛速度</td><td>慢</td><td>快</td></tr>
+<tr><td>工程复杂度</td><td>简单</td><td>需要每 step 维护 bias 状态</td></tr>
+<tr><td>是否需 checkpoint</td><td>否</td><td>是（bias 必须随 checkpoint 保存）</td></tr>
+</table>
+<div class="success"><strong>最佳实践：</strong>1B 以下 prototyping 用 aux loss 简单上手；10B+ 生产训练强烈推荐 loss-free balancing，但要把 bias state 纳入 checkpoint 协议。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. Capacity Factor 与 Token Drop</h2>
+
+<h3>6.1 容量定义</h3>
+<pre><code>capacity_per_expert = ceil(capacity_factor × tokens_per_batch × K / N_experts)</code></pre>
+<table>
+<tr><th>capacity_factor</th><th>含义</th><th>副作用</th></tr>
+<tr><td>1.0</td><td>平均期望</td><td>任何不均衡都会 drop</td></tr>
+<tr><td>1.25</td><td>标准生产值</td><td>浪费 25% padding</td></tr>
+<tr><td>2.0</td><td>几乎不 drop</td><td>浪费 100% padding，显存翻倍</td></tr>
+<tr><td>dropless</td><td>动态 capacity</td><td>实现复杂，无法预分配 buffer</td></tr>
+</table>
+
+<h3>6.2 capacity 决策树</h3>
+<pre class="mermaid">flowchart TD
+  Start[一个 batch token 数 T] --&gt; Calc[每 expert 期望 = T·K/N]
+  Calc --&gt; CF{capacity_factor 选择}
+  CF --&gt;|1.0| Tight[接受高 drop rate]
+  CF --&gt;|1.25| Std[标准 25% padding]
+  CF --&gt;|2.0| Waste[低 drop 但显存×2]
+  CF --&gt;|dropless| Dyn[动态 buffer 增长]
+  Tight --&gt; Drop{drop &gt; 5%?}
+  Drop --&gt;|是| Aux[加大 aux loss / 调 bias]
+  Drop --&gt;|否| OK[接受]
+  Std --&gt; OK
+  Waste --&gt; OK
+  Dyn --&gt; Mem{HBM 是否够?}
+  Mem --&gt;|否| Fall[fallback 到 1.25]
+  Mem --&gt;|是| OK</pre>
+
+<h3>6.3 drop rate 的训练动力学</h3>
+<table>
+<tr><th>训练阶段</th><th>典型 drop rate</th><th>原因</th></tr>
+<tr><td>初期 (step &lt; 1k)</td><td>30-50%</td><td>router 接近随机，所有 expert 抢同样的 token</td></tr>
+<tr><td>中期 (1k - 100k)</td><td>5-15%</td><td>router 开始分化，但容易过度集中</td></tr>
+<tr><td>末期 (&gt; 100k)</td><td>1-5%</td><td>平衡稳定</td></tr>
+<tr><td>失败征兆</td><td>drop rate 突增 + loss spike</td><td>router 坍缩或梯度爆炸</td></tr>
+</table>
+<div class="note"><strong>核心指标：</strong>drop rate 是 MoE 训练最重要的健康指标。建议 per-layer 输出，每 50 step 看一次。任何 layer drop &gt; 20% 持续 1k step 就要告警。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 通信 / 计算 Overlap：DeepEP 风格的工程化</h2>
+
+<h3>7.1 标准 SMoE 时序</h3>
+<pre class="mermaid">sequenceDiagram
+  participant GPU
+  participant Net as IB Network
+  Note over GPU: forward 一个 MoE block
+  GPU-&gt;&gt;GPU: Self-Attention + Norm
+  GPU-&gt;&gt;GPU: Router 计算 top-K
+  GPU-&gt;&gt;Net: All-to-All Dispatch (token to expert GPU)
+  Net--&gt;&gt;GPU: Dispatch 完成
+  GPU-&gt;&gt;GPU: Expert FFN forward
+  GPU-&gt;&gt;Net: All-to-All Combine (output back)
+  Net--&gt;&gt;GPU: Combine 完成
+  GPU-&gt;&gt;GPU: Weighted Sum + Residual</pre>
+<p>通信占比约 30-50%。MFU 通常只有 dense 模型的 0.6 倍。</p>
+
+<h3>7.2 DeepEP 等优化路径</h3>
+<pre class="mermaid">sequenceDiagram
+  participant GPU
+  participant Net
+  GPU-&gt;&gt;Net: Dispatch chunk1
+  Net--&gt;&gt;GPU: chunk1 ready
+  par expert 计算 chunk1
+    GPU-&gt;&gt;GPU: Expert FFN(chunk1)
+  and dispatch chunk2
+    GPU-&gt;&gt;Net: Dispatch chunk2
+    Net--&gt;&gt;GPU: chunk2 ready
+  end
+  par expert 计算 chunk2
+    GPU-&gt;&gt;GPU: Expert FFN(chunk2)
+  and combine chunk1
+    GPU-&gt;&gt;Net: Combine chunk1
+  end
+  Note over GPU,Net: 通信几乎被计算覆盖</pre>
+
+<table>
+<tr><th>优化技术</th><th>收益</th><th>限制</th></tr>
+<tr><td>dispatch chunking</td><td>overlap 通信与计算</td><td>增加 kernel launch overhead</td></tr>
+<tr><td>in-place layout</td><td>减少 buffer 拷贝</td><td>实现复杂</td></tr>
+<tr><td>RDMA 直写 expert buffer</td><td>避免 host 中转</td><td>需要 GDR + 特殊 kernel</td></tr>
+<tr><td>expert-side reduce</td><td>combine 阶段在 expert GPU 上做 reduce</td><td>需要修改 NCCL plugin</td></tr>
+</table>
+</section>
+
+<section class="section" id="s8">
+<h2>8. MoE Checkpoint：Expert 维度的 Reshape</h2>
+
+<h3>8.1 MoE checkpoint manifest schema</h3>
+<pre><code>checkpoint:
+  step: 120000
+  parallel:
+    DP: 16
+    TP: 8
+    PP: 8
+    CP: 1
+    EP: 64
+  experts:
+    total: 256
+    per_rank: 4
+    routing_fn: deepseek_v3_loss_free
+  shards:
+    - rank: 0
+      ep_rank: 0
+      experts_owned: [0, 1, 2, 3]
+      path: step_120000/ep00/expert_0_3.safetensors
+      checksum: sha256:abc...
+    - rank: 1
+      ep_rank: 1
+      experts_owned: [4, 5, 6, 7]
+      ...
+  bias_state:                       # loss-free balancing 的 bias
+    path: step_120000/router_bias.pt
+    checksum: sha256:def...</code></pre>
+
+<h3>8.2 Reshape：EP=64 → EP=32 的恢复</h3>
+<pre class="mermaid">flowchart LR
+  EP64[EP=64<br/>每 rank 4 expert] --&gt; Plan[读 manifest]
+  Plan --&gt; Map[新 expert 映射: 每 rank 8 expert]
+  Map --&gt; Read[每 EP rank 读 2 个旧 shard]
+  Read --&gt; Merge[合并到本地 buffer]
+  Merge --&gt; Write[新 EP=32 shard]</pre>
+
+<table>
+<tr><th>reshape 类型</th><th>难度</th><th>备注</th></tr>
+<tr><td>EP=64 → EP=32（合并）</td><td>容易</td><td>每 rank 只需多读一个旧 shard</td></tr>
+<tr><td>EP=64 → EP=128（拆分）</td><td>容易</td><td>每 rank 读一半旧 shard</td></tr>
+<tr><td>256 expert → 128 expert（剪枝）</td><td>难</td><td>需要 expert importance 排序 + router 权重重映射</td></tr>
+<tr><td>256 expert → 320 expert（增殖）</td><td>难</td><td>新 expert 初始化策略未定，常见做法是复制 + 加噪</td></tr>
+</table>
+
+<h3>8.3 与 dense checkpoint 的对比</h3>
+<table>
+<tr><th>维度</th><th>dense</th><th>MoE</th></tr>
+<tr><td>shard 维度</td><td>layer × TP</td><td>layer × expert × TP</td></tr>
+<tr><td>manifest 大小</td><td>KB</td><td>MB（256 expert × 60 layer）</td></tr>
+<tr><td>reshape 复杂度</td><td>TP / PP 重排</td><td>+ expert 重映射</td></tr>
+<tr><td>单 shard 大小</td><td>几 GB</td><td>几百 MB（每 expert 单独）</td></tr>
+<tr><td>写入吞吐</td><td>大文件少</td><td>小文件多，元数据压力大</td></tr>
+<tr><td>推荐存储</td><td>并行文件系统</td><td>object store + manifest</td></tr>
+</table>
+</section>
+
+<section class="section" id="s9">
+<h2>9. MoE 训练特有失败模式</h2>
+
+<h3>9.1 Expert 坍缩</h3>
+<pre class="mermaid">flowchart TD
+  Healthy[健康: 每 expert 4-6% 负载] --&gt;|router 漂移| Skew[轻度偏斜: 部分 expert 10%+]
+  Skew --&gt;|aux loss 失效或 lr 过高| Collapse[坍缩: top 8 expert 占 80%+ 负载]
+  Collapse --&gt;|大量 drop| Spike[loss spike + 梯度 NaN]
+  Spike --&gt; Crash[训练崩溃]</pre>
+
+<table>
+<tr><th>指标</th><th>阈值</th><th>含义</th></tr>
+<tr><td>max_expert_load / avg</td><td>&gt; 3</td><td>单 expert 严重过载</td></tr>
+<tr><td>min_expert_load / avg</td><td>&lt; 0.1</td><td>部分 expert 几乎不工作</td></tr>
+<tr><td>drop_rate per layer</td><td>&gt; 20% 持续 1k step</td><td>容量被打爆</td></tr>
+<tr><td>router_entropy</td><td>&lt; 2 (理论 max log(N))</td><td>router 确信度过高</td></tr>
+</table>
+
+<h3>9.2 Loss spike</h3>
+<table>
+<tr><th>来源</th><th>检测</th><th>缓解</th></tr>
+<tr><td>router NaN</td><td>监控 logits 范围</td><td>FP32 router + clip</td></tr>
+<tr><td>单 expert 梯度爆炸</td><td>per-expert grad norm</td><td>per-expert clip</td></tr>
+<tr><td>All-to-All 数据腐坏</td><td>combine 后激活 NaN</td><td>NCCL checksum + 重试</td></tr>
+<tr><td>capacity overflow</td><td>drop rate 突增</td><td>临时增大 capacity_factor</td></tr>
+</table>
+
+<h3>9.3 Router gradient noise</h3>
+<p>top-K 是不可微的（只有被选中的 expert 收到梯度）。常见症状：</p>
+<ul>
+<li>router 在前 1k step 几乎不动</li>
+<li>个别 expert 永远不被选中（dead expert）</li>
+<li>expert 之间梯度方差大</li>
+</ul>
+<p><strong>缓解</strong>：noisy top-K（GShard）、随机扰动、router 用 lower lr、热身阶段强制均匀路由。</p>
+<div class="warn"><strong>排障原则：</strong>MoE 训练任何 loss spike 第一时间看的不是 lr 或 grad，而是 per-expert load、drop rate、router entropy 这三条曲线。dense 经验在 MoE 中常常误导。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. MoE vs Dense 的工程对比</h2>
+
+<table>
+<tr><th>维度</th><th>Dense 70B</th><th>MoE 256×0.6B (DeepSeek-V3 风格)</th></tr>
+<tr><td>总参数</td><td>70B</td><td>671B</td></tr>
+<tr><td>激活参数 / token</td><td>70B</td><td>37B</td></tr>
+<tr><td>单 step FLOPs</td><td>1× baseline</td><td>0.5× baseline</td></tr>
+<tr><td>HBM 单卡（无 sharding）</td><td>800 GB+</td><td>8 TB+（必须 EP）</td></tr>
+<tr><td>通信 per step</td><td>DP AllReduce + TP AllReduce</td><td>+ 2× All-to-All per layer</td></tr>
+<tr><td>checkpoint 大小</td><td>~140 GB（fp16）</td><td>~1.4 TB</td></tr>
+<tr><td>checkpoint shard 数</td><td>数百</td><td>数千到数万</td></tr>
+<tr><td>故障爆炸半径</td><td>TP/PP group</td><td>+ EP group</td></tr>
+<tr><td>MFU 典型值</td><td>45-55%</td><td>25-35%</td></tr>
+<tr><td>训练稳定性</td><td>较好</td><td>需主动监控 expert 健康</td></tr>
+<tr><td>inference 难度</td><td>标准</td><td>需要 expert placement 策略</td></tr>
+</table>
+</section>
+
+<section class="section" id="s11">
+<h2>11. MoE + 其他并行的 5 维组合</h2>
+
+<h3>11.1 经典 5 维并行配置</h3>
+<pre class="mermaid">flowchart TB
+  Cluster[1024 H100] --&gt; DP[DP=16]
+  DP --&gt; EP[EP=64]
+  EP --&gt; TP[TP=8]
+  TP --&gt; PP[PP=8]
+  PP --&gt; CP[CP=1]
+  CP --&gt; Rank[per-rank: 1 dense layer slice + 4 expert]</pre>
+<p>注意 EP 与 TP/PP 在 mesh 上是正交而非简单乘法：EP 切 routed FFN，TP 切 attention/shared FFN，实际 rank 拓扑是 mesh。</p>
+
+<h3>11.2 Megatron-Core MoE 与 DeepSpeed-MoE 的差异</h3>
+<table>
+<tr><th>框架</th><th>EP 实现</th><th>与 PP 配合</th><th>与 ZeRO 配合</th></tr>
+<tr><td>Megatron-Core MoE</td><td>tensor mesh，EP 是 mesh 的一维</td><td>良好</td><td>部分</td></tr>
+<tr><td>DeepSpeed-MoE</td><td>EP 独立 group</td><td>需手工配置</td><td>ZeRO-3 已支持</td></tr>
+<tr><td>DeepEP (kernel only)</td><td>与上面框架配合</td><td>不参与</td><td>不参与</td></tr>
+<tr><td>Megatron + Ulysses</td><td>加 SP / CP 维度</td><td>良好</td><td>部分</td></tr>
+</table>
+
+<h3>11.3 5 维并行的 rank mesh 责任表</h3>
+<table>
+<tr><th>group</th><th>负责的状态</th><th>负责的通信</th><th>checkpoint shard 单位</th></tr>
+<tr><td>DP group</td><td>副本之间同步梯度</td><td>gradient AllReduce / FSDP AllGather</td><td>全副本</td></tr>
+<tr><td>EP group</td><td>不同 expert 的权重</td><td>All-to-All dispatch / combine</td><td>per expert</td></tr>
+<tr><td>TP group</td><td>单层张量切片</td><td>AllReduce / AllGather</td><td>per TP shard</td></tr>
+<tr><td>PP group</td><td>不同 stage 的层</td><td>activation send / recv</td><td>per stage</td></tr>
+<tr><td>CP group</td><td>attention context 切片</td><td>ring KV / All-to-All</td><td>（无 weight，运行时）</td></tr>
+</table>
+</section>
+
+<section class="section" id="s12">
+<h2>12. 推理时的 MoE：训练 ≠ 推理</h2>
+
+<table>
+<tr><th>维度</th><th>训练</th><th>推理</th></tr>
+<tr><td>batch</td><td>大 (4M tokens)</td><td>小 (1-100 sequences)</td></tr>
+<tr><td>capacity factor</td><td>1.25</td><td>必须 dropless</td></tr>
+<tr><td>EP 拓扑</td><td>与 GPU 数耦合</td><td>按 expert placement 优化</td></tr>
+<tr><td>通信</td><td>All-to-All 主导</td><td>期望避免 All-to-All（小 batch 不划算）</td></tr>
+<tr><td>部署</td><td>单一集群</td><td>可能多副本，每副本完整 expert set</td></tr>
+<tr><td>checkpoint 转换</td><td>不需要</td><td>必须把 EP shard reshape 到 inference EP</td></tr>
+</table>
+
+<h3>12.1 Mixtral / DeepSeek-V3 的推理部署</h3>
+<table>
+<tr><th>模型</th><th>总参</th><th>激活参</th><th>推理 EP</th><th>推理策略</th></tr>
+<tr><td>Mixtral 8×7B</td><td>47B</td><td>13B</td><td>EP=2 或 4</td><td>每副本完整 8 expert</td></tr>
+<tr><td>DeepSeek-V3</td><td>671B</td><td>37B</td><td>EP=8-16</td><td>多副本 + expert prefetch</td></tr>
+<tr><td>Qwen2-MoE A14B</td><td>A14B</td><td>2.7B</td><td>EP=4</td><td>标准部署</td></tr>
+</table>
+<div class="warn"><strong>训推差异：</strong>训练用 EP=64 + capacity_factor=1.25 + drop。推理 batch 极小时，drop 是不可接受的，必须 dropless 或 capacity=2.0。这意味着推理引擎的代码路径与训练完全不同。</div>
+</section>
+
+<section class="section" id="s13">
+<h2>13. Worked Example：DeepSeek-V3 风格 MoE 训练完整账本</h2>
+
+<h3>13.1 模型与集群设定</h3>
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>总参</td><td>671B</td></tr>
+<tr><td>激活参 / token</td><td>37B</td></tr>
+<tr><td>layers</td><td>61 (其中 58 个 MoE layer)</td></tr>
+<tr><td>hidden</td><td>7168</td></tr>
+<tr><td>expert FFN intermediate</td><td>2048</td></tr>
+<tr><td>routed expert</td><td>256</td></tr>
+<tr><td>shared expert</td><td>1</td></tr>
+<tr><td>top-K</td><td>8</td></tr>
+<tr><td>seq length</td><td>4096</td></tr>
+<tr><td>global batch</td><td>1024 sequences (4M tokens)</td></tr>
+<tr><td>GPU</td><td>2048 × H100 80GB（256 节点 × 8 卡）</td></tr>
+<tr><td>互联</td><td>节点内 NVSwitch 900 GB/s；节点间 8 × 400 Gbps IB</td></tr>
+</table>
+
+<h3>13.2 5 维并行配置</h3>
+<pre><code>DP = 32
+EP = 64
+TP = 8
+PP = 4
+CP = 1
+world_size 校验: DP × TP × PP × CP = 32 × 8 × 4 × 1 = 1024（dense 路径 rank 数）
+EP rank 数 = 64（与 dense 路径正交，覆盖 1024 ranks 的 expert routing）</code></pre>
+<table>
+<tr><th>维度</th><th>大小</th><th>放置</th></tr>
+<tr><td>TP</td><td>8</td><td>节点内 NVSwitch</td></tr>
+<tr><td>EP</td><td>64</td><td>跨 8 节点（每节点 8 个 EP rank）</td></tr>
+<tr><td>PP</td><td>4</td><td>跨 32 节点（每 stage 8 节点）</td></tr>
+<tr><td>DP</td><td>32</td><td>跨剩余维度</td></tr>
+</table>
+
+<h3>13.3 显存预算（per rank, 80 GB H100）</h3>
+<table>
+<tr><th>项</th><th>大小（GB）</th><th>说明</th></tr>
+<tr><td>dense 层参数（attention + shared FFN）shard</td><td>6</td><td>TP=8 切完</td></tr>
+<tr><td>routed expert 参数（4 expert / rank）</td><td>5</td><td>EP=64 切完后每 rank 4 个</td></tr>
+<tr><td>optimizer state (Adam, FP32 ×2)</td><td>22</td><td>DP / FSDP 部分 shard</td></tr>
+<tr><td>master weight (FP32)</td><td>11</td><td>—</td></tr>
+<tr><td>gradient buffer (BF16)</td><td>11</td><td>—</td></tr>
+<tr><td>activation (with checkpointing)</td><td>8</td><td>seq=4096, mb=1, recompute 70%</td></tr>
+<tr><td>dispatch / combine buffer</td><td>6</td><td>capacity_factor 1.25 × 8 token × 7168 × 2 byte</td></tr>
+<tr><td>NCCL / 通信 buffer</td><td>3</td><td>—</td></tr>
+<tr><td>余量</td><td>8</td><td>80GB 上限，剩余安全裕量</td></tr>
+</table>
+
+<h3>13.4 通信账本（per step）</h3>
+<table>
+<tr><th>通信</th><th>频率 / step</th><th>单次体积</th><th>总体积</th></tr>
+<tr><td>dispatch All-to-All</td><td>58 layer × 4 microbatch</td><td>30 GB / EP rank</td><td>~7 TB</td></tr>
+<tr><td>combine All-to-All</td><td>58 layer × 4 microbatch</td><td>30 GB / EP rank</td><td>~7 TB</td></tr>
+<tr><td>TP AllReduce (attention)</td><td>61 layer × 4 mb × 2</td><td>1 GB</td><td>~0.5 TB</td></tr>
+<tr><td>PP send/recv</td><td>4 stage × 4 mb × 2 dir</td><td>0.5 GB</td><td>~16 GB</td></tr>
+<tr><td>DP gradient AllReduce</td><td>1 / step</td><td>11 GB</td><td>11 GB</td></tr>
+</table>
+<div class="danger"><strong>关键瓶颈：</strong>dispatch + combine 占总通信 ~14 TB，是 DP AllReduce 的 1000 倍。MoE 训练的通信预算几乎完全由 EP 决定。</div>
+
+<h3>13.5 单 step 时序</h3>
+<pre class="mermaid">sequenceDiagram
+  participant Sched as Scheduler
+  participant PP0 as PP stage 0
+  participant PP1 as PP stage 1
+  participant PP2 as PP stage 2
+  participant PP3 as PP stage 3
+  participant EP as EP All-to-All Net
+  participant DP as DP AllReduce Net
+  Sched-&gt;&gt;PP0: microbatch 1 forward
+  PP0-&gt;&gt;EP: dispatch L0 MoE
+  EP--&gt;&gt;PP0: combine L0
+  PP0-&gt;&gt;PP1: activation 传递
+  PP1-&gt;&gt;EP: dispatch L15
+  EP--&gt;&gt;PP1: combine L15
+  PP1-&gt;&gt;PP2: activation
+  PP2-&gt;&gt;EP: dispatch L30
+  EP--&gt;&gt;PP2: combine L30
+  PP2-&gt;&gt;PP3: activation
+  PP3-&gt;&gt;PP3: loss + backward 启动
+  Note over PP3,PP0: backward 反向流，pipeline bubble 由 4 microbatch 摊平
+  PP0-&gt;&gt;DP: gradient ready
+  DP--&gt;&gt;PP0: AllReduce 完成
+  PP0-&gt;&gt;Sched: optimizer step</pre>
+
+<h3>13.6 健康指标 dashboard</h3>
+<table>
+<tr><th>指标</th><th>采集点</th><th>阈值</th><th>告警</th></tr>
+<tr><td>step time</td><td>trainer</td><td>&gt; 1.3 × baseline</td><td>warning</td></tr>
+<tr><td>All-to-All wait</td><td>NCCL trace</td><td>&gt; 40% step</td><td>critical</td></tr>
+<tr><td>drop rate per layer</td><td>router stat</td><td>&gt; 15% / 1k step</td><td>critical</td></tr>
+<tr><td>max_load / avg_load</td><td>router stat</td><td>&gt; 3 / 1k step</td><td>warning</td></tr>
+<tr><td>router entropy</td><td>router stat</td><td>&lt; 2</td><td>warning</td></tr>
+<tr><td>expert grad norm max/min</td><td>optimizer</td><td>&gt; 100</td><td>critical</td></tr>
+<tr><td>MFU</td><td>trainer</td><td>&lt; 25%</td><td>warning</td></tr>
+<tr><td>checkpoint write time</td><td>ckpt writer</td><td>&gt; 5 min</td><td>warning</td></tr>
+</table>
+
+<h3>13.7 一次 incident 排查示例</h3>
+<p>现象：step time 从 4.2s 涨到 6.8s，drop rate 从 5% 涨到 22%，loss 微涨。</p>
+<ol>
+<li>dashboard 看到 drop rate 突增 → 怀疑 router 漂移</li>
+<li>查看 per-expert load，发现 expert 17, 42, 109 负载占 65%</li>
+<li>查看 router_bias（loss-free balancing 状态），发现 bias 控制器在过去 1k step 没更新（一个 EP rank 的状态丢了）</li>
+<li>定位到 EP rank 23 在某次 OOM 重启后 bias state 没正确 restore</li>
+<li>修复：从 checkpoint 重新加载 router_bias，step time 和 drop rate 恢复</li>
+</ol>
+<div class="success"><strong>教训：</strong>MoE 的 checkpoint 不只是参数，<strong>控制器状态（bias、moving avg、capacity counter）必须一并 checkpoint</strong>，否则恢复后 router 行为不一致。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 工程边界总结</h2>
+<table>
+<tr><th>边界</th><th>说明</th></tr>
+<tr><td>EP_size 上限</td><td>实际不超过单个高速互联 domain（NVSwitch 8/16） + IB rail 数</td></tr>
+<tr><td>top-K 上限</td><td>K 越大通信越大；K=8 是当前生产上限</td></tr>
+<tr><td>capacity_factor 取值</td><td>1.0 太激进，2.0 太浪费，1.25 是工业默认</td></tr>
+<tr><td>router 数值精度</td><td>必须 FP32</td></tr>
+<tr><td>aux loss vs loss-free</td><td>大模型推荐 loss-free，小模型 aux 简单</td></tr>
+<tr><td>MoE checkpoint</td><td>必须含 expert 映射 + 控制器状态</td></tr>
+<tr><td>inference 路径</td><td>与训练完全分离，不可复用 EP=64</td></tr>
+<tr><td>故障半径</td><td>一个 expert GPU 挂 → 全 EP group hang，必须 fast detect</td></tr>
+</table>
+</section>
+
+<section class="section" id="s15">
+<h2>15. 练习</h2>
+<div class="grid-2">
+<div class="card"><strong>09e-1（基础）：参数与 FLOPs 比较</strong><br>dense 70B 与 MoE 256×0.6B（K=8）相比，激活 FLOPs 和总参各差多少倍？</div>
+<div class="card"><strong>09e-2（基础）：top-K 与通信</strong><br>top-K=2 与 top-K=8 的 dispatch 体积相差多少？capacity_factor 不变情况下哪个 drop rate 更高？</div>
+<div class="card"><strong>09e-3（基础）：capacity 公式</strong><br>写出 capacity_per_expert 的公式，并解释 capacity_factor=1.25 时 25% 的 padding 浪费来自哪里。</div>
+<div class="card"><strong>09e-4（基础）：失败模式</strong><br>列出 MoE 特有的 4 类失败模式，并对每一类给出至少一个监控指标。</div>
+<div class="card"><strong>09e-5（进阶）：sigmoid + bias 解耦</strong><br>DeepSeek-V3 用 sigmoid + bias 替代 softmax。请解释为什么这样可以解耦 expert 之间的竞争。</div>
+<div class="card"><strong>09e-6（进阶）：EP 通信延迟估算</strong><br>EP=64 在跨 8 节点的 IB 网络上做 All-to-All，请估算单 layer 通信延迟（假设 dispatch 30GB，800Gbps IB 双向，4 个 rail）。</div>
+<div class="card"><strong>09e-7（进阶）：checkpoint 设计</strong><br>设计一个 MoE checkpoint manifest schema，要求支持 EP=64 → EP=32 reshape，且包含 loss-free balancing 的 bias 状态。</div>
+<div class="card"><strong>09e-8（进阶）：dead expert 排查</strong><br>训练中观察到 expert 17 长期负载只有平均的 5%（dead expert），列出至少 3 种可能原因和对应排查命令。</div>
+<div class="card"><strong>09e-9（进阶）：DeepEP overlap 时序</strong><br>DeepEP 把 dispatch 拆 chunk 与 expert 计算 overlap。请画出一个 4 chunk 的时序图，并估算 overlap 后 EP 通信的有效占比。</div>
+<div class="card"><strong>09e-10（设计）：8 节点 MoE 并行配置</strong><br>为 8 节点 × 8 卡 H100（IB 800Gbps）设计一个 64 expert × top-2 的 MoE 训练并行配置。给出 DP / EP / TP / PP 的具体值，并估算单 step 显存和通信。</div>
+<div class="card"><strong>09e-11（设计）：训推路径转换</strong><br>训练用 EP=64 + capacity_factor=1.25 + drop。请设计推理路径的部署方案：单副本要求 dropless，推理 batch=8 sequences。说明 expert placement、KV cache、与训练 checkpoint 的转换步骤。</div>
+<div class="card"><strong>09e-12（开放）：CP + EP 组合</strong><br>MoE 与 long context（CP）同时使用时，dispatch 之前的 sequence 维度布局会变得复杂。请说明 SP+CP+EP 三者组合时，dispatch 应该在哪一步发生，激活布局如何切换。</div>
+</div>
+</section>
+
+<section class="refbox" id="s16">
+<h2>16. 深度参考阅读</h2>
+<h3>学习路线</h3>
+<ol>
+<li>用 §1 把 MoE 的"不可化简问题"建立心智：容量与 FLOPs 解耦的代价是通信、路由、checkpoint。</li>
+<li>用 §2-§3 掌握架构基础：从 dense FFN 到 shared+routed expert，以及 EP 为什么必然出现。</li>
+<li>用 §4 建立 All-to-All 的体积直觉，对比 Ring AllReduce 的本质差异。</li>
+<li>用 §5-§6 学会 router 设计与 capacity 调优，理解 loss-free balancing 的工程价值。</li>
+<li>用 §7 学习 DeepEP 风格的 overlap，建立通信隐藏的工程思路。</li>
+<li>用 §8-§9 把 checkpoint reshape 与失败模式纳入 SOP。</li>
+<li>用 §13 Worked Example 跑一遍 DeepSeek-V3 风格的端到端账本。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>Shazeer et al., <em>Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer</em>, ICLR 2017（top-K gating + load balance loss 起源）</li>
+<li>Lepikhin et al., <em>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding</em>, ICLR 2021（top-2 + capacity factor 工程化）</li>
+<li>Fedus et al., <em>Switch Transformer: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity</em>, JMLR 2022（top-1 + 简化通信）</li>
+<li>Mistral AI, <em>Mixtral of Experts</em>, 2024（8 expert top-2 开源标杆）</li>
+<li>DeepSeek-AI, <em>DeepSeekMoE: Towards Ultimate Expert Specialization</em>, 2024（fine-grained expert + shared expert）</li>
+<li>DeepSeek-AI, <em>DeepSeek-V2 / V3 Technical Reports</em>, 2024（loss-free balancing + 256 expert + 671B 工业实践）</li>
+<li>Qwen Team, <em>Qwen2-MoE Technical Report</em>, 2024</li>
+<li>DeepSeek-AI, <em>DeepEP: Efficient Expert Parallelism Communication Library</em>, GitHub 2025（dispatch / combine kernel + overlap）</li>
+<li>Megatron-Core MoE 文档（NVIDIA 工程实现）</li>
+<li>DeepSpeed-MoE 文档与 ZeRO-3 + EP 整合</li>
+<li>Tutel: An efficient mixture-of-experts implementation（微软）</li>
+<li>Zoph et al., <em>ST-MoE: Designing Stable and Transferable Sparse Expert Models</em>, 2022（router z-loss、稳定性技巧）</li>
+<li>Zhou et al., <em>Expert Choice Routing</em>, 2022（reverse routing：让 expert 选 token，天然平衡）</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

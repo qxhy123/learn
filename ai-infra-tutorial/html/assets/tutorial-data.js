@@ -258,6 +258,11 @@ const TUTORIAL = [
         "path": "part3/09-model-pipeline-parallel.html"
       },
       {
+        "id": "09e",
+        "title": "第 09e 章 · MoE 训练基础设施",
+        "path": "part3/09e-moe-training-infrastructure.html"
+      },
+      {
         "id": "10",
         "title": "第 10 章 · 内存优化、检查点与恢复",
         "path": "part3/10-memory-checkpointing-and-recovery.html"
@@ -306,6 +311,11 @@ const TUTORIAL = [
         "id": "11e",
         "title": "第 11e 章 · 数据版本、血缘与谱系",
         "path": "part4/11e-data-versioning-and-lineage.html"
+      },
+      {
+        "id": "11f",
+        "title": "第 11f 章 · 数据飞轮与持续学习闭环",
+        "path": "part4/11f-data-flywheel-online-learning.html"
       },
       {
         "id": "12",
@@ -391,6 +401,11 @@ const TUTORIAL = [
         "id": "16b",
         "title": "第 16b 章 · SGLang 内部机制深入",
         "path": "part5/16b-sglang-internals.html"
+      },
+      {
+        "id": "16c",
+        "title": "第 16c 章 · TensorRT-LLM 内部机制深入",
+        "path": "part5/16c-trt-llm-internals.html"
       },
       {
         "id": "17",

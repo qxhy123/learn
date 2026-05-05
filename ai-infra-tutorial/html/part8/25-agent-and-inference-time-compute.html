@@ -35,6 +35,11 @@
 <li><a class="anchor" href="#s15">成本与 SLA 怎样一起治理</a></li>
 <li><a class="anchor" href="#s16">工程建议与小结</a></li>
 <li><a class="anchor" href="#s17">练习题</a></li>
+<li><a class="anchor" href="#s18">Agent 架构模式对比</a></li>
+<li><a class="anchor" href="#s19">Agent Observability 与 Trace Schema</a></li>
+<li><a class="anchor" href="#s20">Tool Sandbox 工程实现</a></li>
+<li><a class="anchor" href="#s21">Long-term Memory 与状态持久化</a></li>
+<li><a class="anchor" href="#s22">端到端 Worked Example：SQL 查询 Agent</a></li>
 </ol></section>
 
 <section class="section" id="s1">
@@ -299,6 +304,304 @@ tool_pool_concurrency = concurrent_sessions
 <li>Tool calling 沙箱至少应该限制哪些资源？请说明超时、权限、网络和文件边界各自防止什么风险。</li>
 <li>如果 Best-of-N 从 1 提高到 8，平均成功率从 62% 提高到 78%，但 P95 延迟从 3 秒变成 11 秒，你会怎样决定是否对所有租户开启？</li>
 </ol>
+</section>
+
+<section class="section" id="s18">
+<h2>18. Agent 架构模式对比</h2>
+<p>Agent 架构不是"prompt 写法"的差异，而是任务分解方式、控制流位置和状态传递策略的根本差异。工程上有 4 种主流模式，各有适用边界。</p>
+
+<h3>ReAct：Thought → Action → Observation 循环</h3>
+<p>ReAct（Reason + Act）把推理和行动交织在单模型单上下文中：每一步先生成 Thought（分析当前状态），再生成 Action（调用工具或进行计算），最后把工具返回值作为 Observation 追加到 context，下一轮继续。这种架构实现最简单，适合步骤间依赖性强、工具调用数量少（通常 3-8 步）且上下文可以线性积累的任务。工具失败时没有结构化回退路径，只能依赖模型"下一步自己意识到失败"；多 step 错误在 context 中累积后模型容易迷失方向。</p>
+
+<h3>Plan-Execute：先规划后执行，含 Reflexion 自我批评</h3>
+<p>Plan-Execute 将任务分两阶段：先让模型一次性输出完整计划（步骤列表或 DAG），再按计划逐步执行。Reflexion 在此基础上引入第三个环节：执行结束后让模型对结果写 self-critique，把批评结果写入长期记忆，作为下一轮 plan 的输入。计划是结构化的，平台可以在执行前做安全审查（工具白名单、步骤上限、副作用检查）；执行步骤可以并行化；Reflexion 引入额外模型调用，成本较 ReAct 高 30-60%。</p>
+
+<h3>Multi-Agent：hierarchical / debate / swarm</h3>
+<p>Multi-Agent 通过分工降低单个 agent 上下文复杂度。Hierarchical 模式中 Orchestrator agent 把子任务分发给多个 sub-agent，结果回汇做综合；Debate 模式下多个 agent 对同一问题各自产出答案，通过多轮辩论或投票收敛；Swarm 是去中心化多 agent，每个 agent 只感知局部状态通过规则协作。Multi-agent 系统的状态管理、消息路由、资源隔离和 trace 复杂度均成倍上升。</p>
+
+<h3>框架映射</h3>
+<table>
+<tr><th>框架</th><th>主要模式</th><th>核心机制</th><th>适合场景</th></tr>
+<tr><td>LangGraph</td><td>Plan-Execute + ReAct 混合</td><td>有状态图（节点 = step，边 = 条件跳转），支持持久化检查点</td><td>复杂多步、需要人工审批或中断恢复的 agent</td></tr>
+<tr><td>AutoGen</td><td>Multi-Agent（hierarchical / debate）</td><td>GroupChat + ConversableAgent，消息驱动异步协作</td><td>多角色协作、代码生成与验证</td></tr>
+<tr><td>CrewAI</td><td>Multi-Agent（hierarchical，role-based）</td><td>Crew + Agent + Task，内置角色和工具注册</td><td>内容生产、营销自动化、结构化工作流</td></tr>
+<tr><td>OpenAI Swarm</td><td>Multi-Agent（去中心化 handoff）</td><td>轻量 handoff 机制，agent 间直接传递 context</td><td>教学/实验场景，生产需二次加固</td></tr>
+</table>
+
+<h3>决策矩阵</h3>
+<table>
+<tr><th>场景</th><th>推荐架构</th><th>原因</th></tr>
+<tr><td>用户自然语言问答 + 工具调用</td><td>ReAct</td><td>步骤少、可线性积累，实现成本低</td></tr>
+<tr><td>代码生成 + 测试验证</td><td>Plan-Execute + Reflexion</td><td>计划可审查，失败有回退，自我批评改善迭代质量</td></tr>
+<tr><td>批量文档摘要</td><td>Hierarchical Multi-Agent</td><td>文档间独立，sub-agent 并行处理后聚合</td></tr>
+<tr><td>法律或医疗高风险决策</td><td>Debate Multi-Agent</td><td>多视角降低单模型幻觉风险</td></tr>
+<tr><td>长时研究任务（> 10 分钟）</td><td>Plan-Execute + LangGraph 检查点</td><td>支持中断恢复、人工审批门</td></tr>
+<tr><td>高 QPS 简单任务（&lt; 3 步）</td><td>单模型 + function calling</td><td>架构越重成本越高，简单任务不需要 orchestrator</td></tr>
+</table>
+
+<pre class="mermaid">flowchart LR
+  subgraph ReAct
+    RT[Thought] --> RA[Action] --> RO[Observation] --> RT
+  end
+  subgraph PlanExecute["Plan-Execute + Reflexion"]
+    PE_P[Plan] --> PE_E[Execute] --> PE_V[Verify] --> PE_R[Reflect]
+    PE_R -->|写入长期记忆| PE_P
+  end
+  subgraph Hierarchical
+    HO[Orchestrator] --> HS1[Sub-Agent 1]
+    HO --> HS2[Sub-Agent 2]
+    HO --> HS3[Sub-Agent 3]
+    HS1 --> HR[聚合结果]
+    HS2 --> HR
+    HS3 --> HR
+  end
+  subgraph Debate
+    DA[Agent A] --> DC{投票/评分}
+    DB[Agent B] --> DC
+    DC -->|收敛| DF[最终答案]
+  end</pre>
+
+<div class="note"><strong>工程建议：</strong>先用 ReAct 跑通原型，再根据失败模式判断是否需要更复杂架构。架构升级的代价是成本、延迟和调试复杂度全部上升，升级决策应建立在实测失败率数据上，而不是预期。</div>
+<div class="warn"><strong>工程边界：</strong>Multi-Agent 系统的 trace 链路会横跨多个 agent，确保每个 agent_id 都被记入同一个 root trace_id，否则后续成本归因和失败定位将极为困难。</div>
+</section>
+
+<section class="section" id="s19">
+<h2>19. Agent Observability 与 Trace Schema</h2>
+<p>没有 trace 的 agent 是黑盒。一次 agent session 失败后，如果只能看到"最终答案是错的"，平台无法区分是规划阶段出错、工具返回脏数据、verifier 判断有误还是预算不足被截断。本节定义生产可用的 trace schema 并讨论 observability 平台选型。</p>
+
+<h3>Trace Schema 字段规范</h3>
+<table>
+<tr><th>字段</th><th>类型</th><th>说明</th></tr>
+<tr><td><code>trace_id</code></td><td>string (UUID)</td><td>整个 session 的唯一标识，从 root request 传递到所有子步骤</td></tr>
+<tr><td><code>step_id</code></td><td>string</td><td>本步骤唯一 ID，格式建议 <code>{trace_id}_{step_index}</code></td></tr>
+<tr><td><code>parent_id</code></td><td>string | null</td><td>父步骤 ID，顶层 step 为 null；构成树形结构</td></tr>
+<tr><td><code>agent_id</code></td><td>string</td><td>执行本步骤的 agent 标识（multi-agent 场景标识不同角色）</td></tr>
+<tr><td><code>step_type</code></td><td>enum</td><td>plan / execute / tool_call / verify / reflect / finalize</td></tr>
+<tr><td><code>tool_name</code></td><td>string | null</td><td>被调用工具名，非工具步骤为 null</td></tr>
+<tr><td><code>tool_args</code></td><td>object | null</td><td>工具入参，需做 PII 脱敏再存储</td></tr>
+<tr><td><code>tool_result</code></td><td>object | null</td><td>工具返回值，大型结果应截断并存摘要</td></tr>
+<tr><td><code>tokens_in</code></td><td>int</td><td>本步骤模型输入 token 数</td></tr>
+<tr><td><code>tokens_out</code></td><td>int</td><td>本步骤模型输出 token 数</td></tr>
+<tr><td><code>reasoning_tokens</code></td><td>int</td><td>thinking/reasoning 阶段消耗的 token（如有）</td></tr>
+<tr><td><code>latency_ms</code></td><td>int</td><td>本步骤 wall-clock 时间（毫秒）</td></tr>
+<tr><td><code>cost_usd</code></td><td>float</td><td>本步骤估算成本（美元），便于 session 级汇总</td></tr>
+<tr><td><code>outcome</code></td><td>enum</td><td>success / tool_error / timeout / budget_exceeded / halted</td></tr>
+<tr><td><code>error_class</code></td><td>string | null</td><td>失败类型，如 <code>ToolTimeoutError</code> / <code>SqlSyntaxError</code> / <code>PermissionDenied</code></td></tr>
+<tr><td><code>tenant_id</code></td><td>string</td><td>租户标识，用于成本归因和访问控制</td></tr>
+</table>
+
+<div class="warn"><strong>PII 脱敏：</strong><code>tool_args</code> 和 <code>tool_result</code> 在写入 trace store 前，必须过 PII 检测管道，对手机号、邮件、身份证号、密码字段做掩码或 hash。不要把原始 SQL 查询结果（可能含用户数据行）直接存入 trace。</div>
+<div class="note"><strong>Trace 大小控制：</strong>工具返回值超过 10 KB 时，存储截断版本（前 500 字符 + size_bytes 元信息），完整数据只写 primary 存储（如 S3）并记录引用 URL。</div>
+
+<h3>OpenTelemetry gen_ai.* namespace</h3>
+<p>OpenTelemetry Semantic Conventions 定义了 <code>gen_ai.*</code> 命名空间用于 LLM 可观测性：<code>gen_ai.system</code>（模型提供商）、<code>gen_ai.request.model</code>（请求模型 ID）、<code>gen_ai.usage.input_tokens</code> / <code>gen_ai.usage.output_tokens</code>（token 消耗）。Agent span 的父子关系应映射到 OTel span parent：同一 session 的所有 step span 挂在同一个 root trace 下，跨 agent 调用通过 <code>traceparent</code> HTTP header 传递 trace context。</p>
+
+<h3>主流可观测性平台</h3>
+<table>
+<tr><th>平台</th><th>定位</th><th>优势</th><th>局限</th></tr>
+<tr><td>Langfuse</td><td>开源 LLM 可观测性</td><td>原生支持 trace / span / observation 三层、cost 归因、eval 评分</td><td>社区版功能完整，需自托管</td></tr>
+<tr><td>LangSmith</td><td>LangChain 官方平台</td><td>深度集成 LangChain / LangGraph，trace 结构无缝</td><td>商业付费，与 LangChain 强耦合</td></tr>
+<tr><td>Weights &amp; Biases Traces</td><td>MLOps 平台扩展</td><td>与训练实验、模型版本一体化管理</td><td>trace 深度略逊于专业 LLM 平台</td></tr>
+<tr><td>Helicone</td><td>轻量 proxy + 可观测性</td><td>无代码接入，proxy 层自动截获所有 OpenAI 调用</td><td>深度 agent trace 需额外 SDK</td></tr>
+<tr><td>Arize Phoenix</td><td>开源 ML 可观测性</td><td>强大的 embedding drift 和 eval 框架，支持 span 查询</td><td>agent trace 支持相对较新</td></tr>
+</table>
+
+<h3>Agent Eval Framework</h3>
+<table>
+<tr><th>Benchmark</th><th>测试重点</th><th>评分方式</th><th>适用性</th></tr>
+<tr><td>GAIA</td><td>通用 agent 任务（搜索、计算、多跳推理）</td><td>人工标注答案精确匹配</td><td>衡量通用 agent 能力上限</td></tr>
+<tr><td>SWE-bench（含 Verified subset）</td><td>GitHub issue 修复（真实代码库）</td><td>单元测试通过率</td><td>衡量代码 agent 实用性，Verified subset 减少 false positive</td></tr>
+<tr><td>AgentBench</td><td>8 类 agent 任务（OS / DB / web / game）</td><td>任务完成率</td><td>多维度评估 agent 适应性</td></tr>
+<tr><td>τ-bench</td><td>工具调用可靠性（真实 API 场景）</td><td>工具调用成功率 + 参数正确率</td><td>聚焦工具使用质量</td></tr>
+<tr><td>WebArena</td><td>浏览器 web 操作</td><td>任务完成率</td><td>衡量 web agent 实用性</td></tr>
+<tr><td>OSWorld</td><td>桌面 OS 操作</td><td>截图验证完成状态</td><td>最接近真实用户操作场景</td></tr>
+</table>
+
+<pre class="mermaid">flowchart TD
+  R[Root Span: session_id] --> S1[Step 1: plan<br/>tokens_in=512 latency=340ms]
+  R --> S2[Step 2: tool_call=text_to_sql<br/>tokens_in=1024 latency=89ms]
+  R --> S3[Step 3: tool_call=execute_sql<br/>latency=1200ms outcome=success]
+  R --> S4[Step 4: finalize<br/>tokens_out=280 cost=$0.0042]
+  S2 -. PII脱敏 .-> TS[(Trace Store)]
+  S3 -. 截断result .-> TS
+  TS --> OPS[Langfuse / Arize Phoenix]
+  OPS --> EVAL[Eval / Cost Dashboard]</pre>
+
+<div class="success"><strong>Eval 闭环：</strong>生产 trace 是最好的 eval 数据集。把真实失败 trace（outcome=tool_error 或 budget_exceeded）自动采样入 eval 集，用 judge model 对结果打分，形成"生产 → trace → eval → 改进"的闭环，比单纯跑 benchmark 更能反映业务实际质量。</div>
+</section>
+
+<section class="section" id="s20">
+<h2>20. Tool Sandbox 工程实现</h2>
+<p>工具调用是 agent 触碰真实世界的地方，也是最高风险的地方。"在沙箱里执行"不是一个开关，而是一组需要逐层设计的隔离机制。</p>
+
+<h3>隔离方案矩阵</h3>
+<table>
+<tr><th>方案</th><th>隔离强度</th><th>启动延迟</th><th>适用场景</th><th>主要风险</th></tr>
+<tr><td>subprocess（直接）</td><td>无</td><td>&lt;5ms</td><td>开发调试</td><td>完全不隔离，不可用于生产</td></tr>
+<tr><td>Docker container</td><td>中</td><td>100-500ms（已有镜像）</td><td>通用代码执行</td><td>容器逃逸风险，需配合 seccomp</td></tr>
+<tr><td>gVisor（runsc）</td><td>高</td><td>150-600ms</td><td>安全要求高的代码执行</td><td>部分系统调用不兼容，性能约 30% 损失</td></tr>
+<tr><td>Firecracker microVM</td><td>极高</td><td>100-200ms（提前预热）</td><td>金融、医疗等高合规场景</td><td>需 KVM，配置复杂度高</td></tr>
+<tr><td>Wasmtime / WASM</td><td>高（沙箱语言级）</td><td>&lt;10ms</td><td>轻量函数执行、插件系统</td><td>语言支持有限，不能跑任意 Python</td></tr>
+<tr><td>E2B（云服务）</td><td>高（托管）</td><td>300-1000ms</td><td>快速落地不想自建</td><td>外部依赖，成本随并发线性增长</td></tr>
+<tr><td>Modal（云服务）</td><td>高（托管）</td><td>200-800ms</td><td>GPU 密集型工具执行</td><td>同上</td></tr>
+</table>
+
+<h3>seccomp Profile</h3>
+<p>生产环境代码执行容器应使用 <code>--security-opt seccomp=policy.json</code> 限制系统调用。默认 action 为 <code>SCMP_ACT_ERRNO</code>，只允许白名单调用。明确禁止：<code>ptrace</code>（进程追踪）、<code>kexec_load</code>（内核替换）、<code>create_module</code>（内核模块）、<code>mount</code>（文件系统挂载）、<code>pivot_root</code>（根切换）。</p>
+
+<h3>Network Isolation 与 File System Overlay</h3>
+<p>网络隔离分三级：禁止所有外网（Docker <code>--network none</code>，适合纯计算工具）；白名单出站（只允许访问内部服务，通过 iptables/ebpf 实现）；完全隔离 + 代理（所有出站经过 egress proxy 做域名白名单 + 审计）。文件系统使用 overlayfs：base 层只读（包含 Python 运行时和依赖库），workspace 层为 tmpfs（内存，大小上限 100MB），执行完后 tmpfs 丢弃，不留磁盘痕迹。</p>
+
+<h3>超时信号链</h3>
+<pre><code>SIGTERM  →  等待 30s  →  SIGKILL  →  等待 5s  →  强制清理容器/VM</code></pre>
+<p>发送 SIGTERM 后等待进程优雅退出；如果 30s 内未退出，发送 SIGKILL；5s 后还未退出则强制销毁容器，清理 tmpfs 和网络 namespace。整个超时链必须由容器外层 orchestrator 执行，不能让被执行代码自己管理超时。</p>
+
+<h3>完整运行命令示例</h3>
+<pre><code>docker run \
+  --rm \
+  --user 1000 \
+  --network none \
+  --memory 512m \
+  --cpus 1 \
+  --read-only \
+  --tmpfs /workspace:size=100m,mode=1777 \
+  --tmpfs /tmp:size=50m \
+  --security-opt seccomp=/etc/docker/seccomp/code-exec.json \
+  --security-opt no-new-privileges \
+  --pids-limit 64 \
+  code-sandbox:latest</code></pre>
+
+<pre class="mermaid">flowchart LR
+  AR[Agent Runtime] -->|提交代码 + 超时| TR[Tool Runner]
+  TR -->|docker run --network none --memory 512m| SB[Sandbox Container]
+  SB --> CE[Code Execution<br/>非特权用户 1000]
+  CE --> OF[Output tmpfs]
+  OF -->|读取结果| TR
+  TR -->|SIGTERM 30s → SIGKILL 5s| SB
+  TR --> QS[Quota: 记录 wall_time + exit_code]
+  TR -->|结果 + 元信息| AR
+  SB -.禁止.-> NET[外网]
+  SB -.禁止.-> FS[宿主文件系统]</pre>
+
+<div class="success"><strong>工程建议：</strong>E2B 和 Modal 等托管沙箱服务可以显著降低自建复杂度，适合早期产品。当执行量超过 10 万次/天或合规要求不允许数据出境时，再考虑自建 Firecracker 或 gVisor 方案。</div>
+<div class="danger"><strong>工程边界：</strong>沙箱超时不能只靠 Python 的 <code>signal.alarm</code>，被执行代码可以捕获 SIGALRM 或调用 <code>signal.signal(signal.SIGALRM, signal.SIG_IGN)</code> 绕过。超时必须由容器外层 orchestrator 发送 SIGKILL 来强制终止。</div>
+</section>
+
+<section class="section" id="s21">
+<h2>21. Long-term Memory 与状态持久化</h2>
+<p>Agent 的记忆不是一个选项，而是决定它能解决哪类任务的基础能力。记忆设计错误会导致状态泄露、成本失控或恢复失败。本节按时间维度分层讨论。</p>
+
+<h3>三层记忆架构</h3>
+<p><strong>短期记忆（秒级到分钟级）</strong>：context window 内的内容——对话历史、工具调用结果、中间推理步骤。受 <code>max_context_tokens</code> 约束，超出后触发 truncation 或 summarization。KV cache 是其在 GPU 侧的物化形式。不需要持久化，session 结束即释放。</p>
+<p><strong>中期记忆（分钟到天级）</strong>：跨 step 的 session 状态，存于 Redis 或 SQLite。</p>
+<table>
+<tr><th>存储</th><th>TTL 建议</th><th>适用内容</th></tr>
+<tr><td>Redis（内存）</td><td>30min - 2h</td><td>活跃 session 的 pending tool calls、partial output、预算余额</td></tr>
+<tr><td>Redis（持久化）</td><td>1 - 7 day</td><td>用户短期偏好、最近使用工具、跨 session 上下文摘要</td></tr>
+<tr><td>SQLite / PostgreSQL</td><td>7 - 90 day</td><td>审计日志、成本记录、任务结果存档</td></tr>
+</table>
+<p><strong>长期记忆（永久或大 TTL）</strong>：语义可检索的知识，分三类：向量库（对历史 session 摘要、工具调用结果做 embedding，支持语义相似度检索）、知识图谱（结构化关系存储，支持多跳推理）、Episodic Memory（按时间序列存储完整 episode，支持精确回放）。</p>
+
+<h3>主流 Memory 方案</h3>
+<table>
+<tr><th>方案</th><th>定位</th><th>核心机制</th><th>适用规模</th></tr>
+<tr><td>MemGPT / Letta</td><td>自管理记忆的 agent OS</td><td>把 LLM 上下文当 RAM，外部存储当磁盘，模型自决定何时 page in/out</td><td>研究和复杂长任务 agent</td></tr>
+<tr><td>mem0</td><td>轻量 memory API</td><td>自动提取 fact/preference 写入向量库，检索时按语义召回</td><td>快速接入，生产推荐</td></tr>
+<tr><td>Zep</td><td>对话 memory 平台</td><td>结构化 session memory + 图实体提取 + 时间衰减</td><td>对话助手、CRM 类场景</td></tr>
+<tr><td>Cognee</td><td>知识图谱 + 向量混合</td><td>把文档、对话解析为图关系，查询时图遍历 + 向量混合召回</td><td>知识密集型 agent</td></tr>
+</table>
+
+<h3>状态持久化协议</h3>
+<p><strong>必须持久化的内容：</strong><code>pending_tool_calls</code>（已规划但尚未执行的工具调用列表）、<code>partial_output</code>（已生成的部分答案）、<code>reasoning_state</code>（当前步骤编号、预算余额、已执行 tool 列表）、<code>session_metadata</code>（tenant_id、task_description、budget_envelope）。</p>
+<p><strong>不应持久化的内容：</strong>KV Cache（GPU 内存物化形式，成本高 TTL 短，应通过 prefix caching 命中或在 resume 时重新 prefill）、大于 10 KB 的原始工具结果（写对象存储记引用）、中间 logits / hidden states（计算成本高且通常无复用价值）。</p>
+
+<h3>失败恢复：异步 Agent 崩溃后 Resume</h3>
+<pre><code>1. Crash 检测：看门狗发现 heartbeat 超时（通常 30s）
+2. 状态读取：从 Redis 读取 reasoning_state + pending_tool_calls
+3. Dedup 检查：对 pending_tool_calls 查幂等 key，避免重复执行有副作用工具
+4. Context 重建：用 session_metadata + partial_output 重建上下文（不需重跑所有 step）
+5. Resume 点：从 last_completed_step + 1 继续
+6. 预算校验：检查剩余预算是否仍足够完成剩余步骤，不足则返回 partial result</code></pre>
+
+<pre class="mermaid">flowchart LR
+  CW[Context Window<br/>短期 秒级] --> SUM[Summarizer]
+  SUM --> RS[Redis Session Store<br/>中期 30min-7day]
+  RS --> VDB[(向量库<br/>语义长期记忆)]
+  RS --> KG[(知识图谱<br/>结构化关系)]
+  RS --> EP[(Episodic Store<br/>完整 episode)]
+  VDB --> RET[检索 top-K]
+  KG --> RET
+  EP --> RET
+  RET --> CW
+  RS --> DR[失败恢复<br/>resume from checkpoint]</pre>
+
+<div class="success"><strong>工程建议：</strong>对有副作用的工具调用，在执行前先把 <code>{tool_name, idempotency_key, args_hash}</code> 写入持久存储，执行成功后写 <code>completed</code> 标志。Resume 时先检查该标志，避免因崩溃重试导致重复副作用。</div>
+<div class="warn"><strong>工程边界：</strong>向量库的语义检索是模糊的，不能用它做 idempotency 判断，只能用于"找相关记忆"。精确的状态持久化和 dedup 必须用 key-value 存储。</div>
+</section>
+
+<section class="section" id="s22">
+<h2>22. 端到端 Worked Example：SQL 查询 Agent</h2>
+<p>本节用完整的 SQL 查询 agent 把本章所有机制串联起来：从用户提问到 SQL 执行结果，经过完整的 ReAct 循环、工具沙箱、trace 记录、KV prefix caching 和失败处理。</p>
+
+<h3>业务场景与完整架构</h3>
+<p>用户用自然语言向公司内部数据仓库提问（如"上个月各区域销售额 Top 5 是哪些？"）。系统需要把自然语言转成 SQL、验证 SQL 合法性、执行 SQL、格式化结果并返回。不能让用户直接写 SQL，也不能给 agent 直接写权限——必须通过受控工具链。</p>
+
+<pre class="mermaid">flowchart TD
+  U[用户请求] --> API[FastAPI Gateway<br/>鉴权 限流 trace_id 注入]
+  API --> LG[LangGraph Orchestrator<br/>ReAct 状态机]
+  LG --> M[模型调用<br/>system prompt + schema + history]
+  M -->|Thought + Action| LG
+  LG --> T1[text_to_sql<br/>LLM 翻译工具]
+  LG --> T2[validate_sql<br/>语法检查 + 权限验证]
+  LG --> T3[execute_sql<br/>只读 sandbox DB 连接]
+  LG --> T4[format_result<br/>Markdown 表格 + 摘要]
+  T1 --> SB[SQL Sandbox<br/>只读连接 + 超时 5s]
+  T2 --> SB
+  T3 --> SB
+  T4 -->|最终结果| U
+  LG -->|每步| TR[Trace Pipeline<br/>step_id cost latency]
+  M -. prefix cache命中 .-> KV[(KV Cache<br/>system prompt前缀)]</pre>
+
+<h3>一次完整 Trace</h3>
+<table>
+<tr><th>step_id</th><th>step_type</th><th>tool_name</th><th>tokens_in</th><th>tokens_out</th><th>reasoning_tokens</th><th>latency_ms</th><th>cost_usd</th><th>outcome</th></tr>
+<tr><td>s1</td><td>plan</td><td>—</td><td>1024</td><td>180</td><td>320</td><td>1340</td><td>$0.0021</td><td>success</td></tr>
+<tr><td>s2</td><td>tool_call</td><td>text_to_sql</td><td>512</td><td>95</td><td>0</td><td>680</td><td>$0.0009</td><td>success</td></tr>
+<tr><td>s3</td><td>tool_call</td><td>validate_sql</td><td>200</td><td>30</td><td>0</td><td>45</td><td>$0.0001</td><td>success</td></tr>
+<tr><td>s4</td><td>tool_call</td><td>execute_sql</td><td>0</td><td>0</td><td>0</td><td>1250</td><td>$0.0000</td><td>success</td></tr>
+<tr><td>s5</td><td>finalize</td><td>format_result</td><td>640</td><td>320</td><td>0</td><td>890</td><td>$0.0014</td><td>success</td></tr>
+<tr><td><strong>合计</strong></td><td></td><td></td><td><strong>2376</strong></td><td><strong>625</strong></td><td><strong>320</strong></td><td><strong>4205ms</strong></td><td><strong>$0.0045</strong></td><td></td></tr>
+</table>
+
+<h3>KV Prefix Caching 策略</h3>
+<p>system prompt 包含数据库 schema 描述（约 800 token），每次查询都相同。配合 vLLM 的 hash-based prefix caching，所有以相同 system prompt 开头的请求命中缓存，只需计算 user question 部分的 prefill。实测（LLaMA-3 70B，A100 × 2）：冷启动 TTFT 1800ms，热路径 TTFT 340ms（减少 81%），生产环境 cache 命中率平均 73%。</p>
+<div class="success"><strong>工程建议：</strong>把 system prompt + 工具描述设计为稳定前缀（不要把时间戳或 session_id 塞进 system prompt），最大化 prefix cache 命中率。动态内容放在 user turn 或 assistant turn，不要污染 system prompt。</div>
+
+<h3>失败模式与处理</h3>
+<table>
+<tr><th>失败类型</th><th>触发条件</th><th>处理策略</th><th>error_class</th></tr>
+<tr><td>SQL 语法错</td><td>validate_sql 返回错误</td><td>把错误信息回注 context，让模型重写 SQL，最多重试 2 次</td><td><code>SqlSyntaxError</code></td></tr>
+<tr><td>查询超时</td><td>execute_sql &gt; 5s</td><td>返回"查询超时，建议缩小时间范围"，不重试</td><td><code>QueryTimeoutError</code></td></tr>
+<tr><td>权限不足</td><td>validate_sql 检测到写操作</td><td>拒绝执行，返回"只允许只读查询"</td><td><code>PermissionDeniedError</code></td></tr>
+<tr><td>空结果</td><td>查询成功但返回 0 行</td><td>触发 format_result 生成"未找到数据"提示，不报错</td><td>—</td></tr>
+<tr><td>预算耗尽</td><td>reasoning_tokens 超过 max</td><td>截断推理，要求基于已有信息给出最简答案</td><td><code>BudgetExceededError</code></td></tr>
+<tr><td>幻觉表名</td><td>validate_sql 检测表不存在</td><td>把可用表列表回注，让模型重选，最多重试 1 次</td><td><code>TableNotFoundError</code></td></tr>
+</table>
+
+<h3>实测性能数据（100-prompt benchmark，生产环境）</h3>
+<table>
+<tr><th>指标</th><th>数值</th></tr>
+<tr><td>平均端到端 latency</td><td>4.2s</td></tr>
+<tr><td>P99 latency</td><td>11.8s（含 DB 慢查询）</td></tr>
+<tr><td>cost per query（平均）</td><td>$0.0045</td></tr>
+<tr><td>tool call success rate</td><td>94.2%</td></tr>
+<tr><td>SQL 正确率（judge 评分）</td><td>87%</td></tr>
+<tr><td>首次 SQL 命中率（不需重试）</td><td>78%</td></tr>
+<tr><td>空结果率（不是错误）</td><td>8%</td></tr>
+</table>
+
+<div class="note"><strong>P99 latency 分析：</strong>P99 的主要来源是 DB 慢查询（execute_sql 超时），而不是模型推理。对 P99 做优化应先看工具侧超时分布，再看模型调用次数，最后才考虑模型参数调整。</div>
+<div class="warn"><strong>工程边界：</strong>Judge model 评分不是 ground truth，87% 的"正确率"中可能有 3-5% 是 judge 本身的误判。重要决策（如上线新版本）应配合人工抽查，不能完全依赖 LLM judge。</div>
 </section>
 
 <section class="refbox">

@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 16c 章 · TensorRT-LLM 内部机制深入 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=16c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 16c 章 · TensorRT-LLM 内部机制深入</h1>
+<p class="sub">从"在 NVIDIA GPU 上把 TensorRT 图优化、CUDA kernel 融合、推理时调度三层做到极致，最大化单位 GPU 的 token 吞吐与 SLA 内的 P99 延迟"这一核心约束出发，把 BuildConfig、plugin_config、KvCacheConfig、Inflight Batching、量化生态、TP/PP、Hopper/Blackwell 路径与 Triton 集成串成一个"engine artifact + runtime executor"的体系。</p>
+<div class="chips"><span class="chip">TensorRT-LLM</span><span class="chip">Engine Build</span><span class="chip">Inflight Batching</span><span class="chip">Paged KV</span><span class="chip">Plugin Architecture</span><span class="chip">FP8 / FP4</span><span class="chip">ModelOpt</span><span class="chip">Hopper / Blackwell</span><span class="chip">Triton</span><span class="chip">Worked Example</span></div>
+<div class="note"><strong>不可化简的问题：</strong>在 NVIDIA GPU 上，把 TensorRT 图优化、CUDA kernel 融合、推理时调度做到极致，最大化单位 GPU 的 token 吞吐与 SLA 内的 P99 延迟——TRT-LLM 的所有内部设计都是在同时压住 build 期优化深度、运行时灵活度、shape contract 治理、量化覆盖度、跨 GPU 代际兼容这几个互相冲突的目标。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。本章定位是 Ch 16 的深挖子章节，承接 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的 KV Cache / 调度循环铺垫与 <a href="../part5/16-quantization-compilation-and-engines.html">第 16 章</a> 的引擎对比，回答"TRT-LLM 内部到底怎么实现、与 vLLM/SGLang 根本差异在哪"的问题。建议与 <a href="../part5/16a-vllm-internals.html">16a vLLM 深挖</a>、<a href="../part5/16b-sglang-internals.html">16b SGLang 深挖</a> 对照阅读。</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：TRT-LLM 在解决的工程问题</a></li>
+<li><a class="anchor" href="#s2">整体架构：编译期 vs 运行时</a></li>
+<li><a class="anchor" href="#s3">Engine 构建：BuildConfig 与 plugin_config</a></li>
+<li><a class="anchor" href="#s4">Plugin 架构：为何不用纯 TensorRT 图</a></li>
+<li><a class="anchor" href="#s5">Inflight Batching vs vLLM Continuous Batching</a></li>
+<li><a class="anchor" href="#s6">KvCacheConfig：paged KV / block reuse / host offload</a></li>
+<li><a class="anchor" href="#s7">量化路径深度：AWQ / GPTQ / FP8 / FP4 与 ModelOpt</a></li>
+<li><a class="anchor" href="#s8">多 GPU：TP / PP / custom all-reduce</a></li>
+<li><a class="anchor" href="#s9">Hopper / Blackwell 专属优化</a></li>
+<li><a class="anchor" href="#s10">与 Triton Inference Server 集成</a></li>
+<li><a class="anchor" href="#s11">Speculative Decoding：Medusa / ReDrafter / EAGLE / Lookahead</a></li>
+<li><a class="anchor" href="#s12">vLLM / SGLang / TRT-LLM 决策矩阵</a></li>
+<li><a class="anchor" href="#s13">性能调优手册</a></li>
+<li><a class="anchor" href="#s14">何时不该用 TRT-LLM</a></li>
+<li><a class="anchor" href="#s15">Worked Example：LLaMA-70B × 8×H100 build &amp; deploy</a></li>
+<li><a class="anchor" href="#s16">练习</a></li>
+</ol></section>
+
+<section class="section">
+<blockquote>
+<p>把 TensorRT 图优化、CUDA kernel 融合、inflight batching、KV Cache 治理、量化路径、TP/PP 通信、speculative decoding 全部塞进一个"先编译后执行"的引擎里——这就是 TensorRT-LLM 真正在做的事情。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章承接 <a href="15-batching-scheduling-and-kv-cache.html">第 15 章</a> 关于 KV Cache、PagedAttention、调度循环的概念铺垫，以及 <a href="16-quantization-compilation-and-engines.html">第 16 章</a> 关于推理引擎选型的整体对比。读完 Ch 15/16 与 <a href="16a-vllm-internals.html">16a vLLM 深挖</a>、<a href="16b-sglang-internals.html">16b SGLang 深挖</a> 后，本章回答的是更深入的问题：TRT-LLM 在内部如何把这些机制组织成一套"engine artifact + runtime executor"的体系；它与 vLLM、SGLang 的根本性差异在哪一层；某个 build flag 或 KV Cache 参数动起来会让哪几条路径同时变化。本章不是 TRT-LLM 用户手册，而是 TRT-LLM 工程师视角的深挖：每一个机制为何如此设计、与 vLLM/SGLang 相比贵在哪、便宜在哪、什么场景失效。Worked example 用一个 LLaMA-70B × 8×H100 的真实 build 与 deploy 过程来贯穿。</p>
+</blockquote>
+</section>
+
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：TRT-LLM 在解决的工程问题</h2>
+
+<h3>概念先说清楚：TRT-LLM 是什么，不是什么</h3>
+<p>TensorRT-LLM 是 NVIDIA 官方为 LLM 推理打造的"先编译后执行"运行时。它的核心工作不是"把一次 forward 跑通"，而是把模型在 build 期就专门化成一个绑定 GPU 型号、精度、并行度、batch/sequence 范围的 engine artifact，然后由 C++ runtime executor 在 inflight batching 模式下运行。它不是一个简单的 kernel 库，也不是一个普通的 Python serving 框架。</p>
+
+<table>
+<thead><tr><th>概念</th><th>在 TRT-LLM 里具体指什么</th><th>常见误解</th><th>工程边界</th></tr></thead>
+<tbody>
+<tr><td>Engine artifact</td><td>build 期生成的 <code>.engine</code> 文件 + plugin 元数据 + 配置，绑定 GPU/CUDA/TRT 版本/TP-PP 拓扑</td><td>不是普通的模型权重文件</td><td>任何 GPU 型号、精度、并行度、shape 上限变化都需要 rebuild</td></tr>
+<tr><td>BuildConfig</td><td>描述编译期参数：max batch、max input/output len、precision、KV 上限、plugin 开关</td><td>不是运行时参数</td><td>build 完就固化，运行时只能在 BuildConfig 的"信封"内动</td></tr>
+<tr><td>plugin_config</td><td>TRT-LLM 注入到 TensorRT 图里的自定义 op 集合（GPT attention plugin、GEMM plugin、KV plugin 等）</td><td>不是纯 TensorRT 优化能完成的</td><td>LLM 关键算子大量走 plugin，因为纯 TRT 图无法表达 paged KV、inflight batching</td></tr>
+<tr><td>Inflight Batching</td><td>在 GptManager / Executor 内部以 iteration 为单位插入新请求、踢出完成请求</td><td>不是 vLLM "continuous batching" 的同义词，但是同一类思想</td><td>TRT-LLM 实现路径是 C++ executor + plugin，调度逻辑写死在 C++</td></tr>
+<tr><td>KvCacheConfig</td><td>控制 paged KV、block reuse、free GPU memory fraction、host cache</td><td>不是 BuildConfig 的子集</td><td>运行时可调；和 BuildConfig 中的 max_batch、max_seq_len 共同决定可承载并发</td></tr>
+<tr><td>TensorRT Model Optimizer (ModelOpt)</td><td>NVIDIA 的量化校准工具链，输出 TRT-LLM checkpoint</td><td>不属于 TRT-LLM 仓库本身，是上游量化生态</td><td>AWQ/GPTQ/SmoothQuant/FP8/FP4 都通过它落到 TRT-LLM build 流程</td></tr>
+<tr><td>Triton tensorrtllm_backend</td><td>Triton Inference Server 的 TRT-LLM 后端，提供 HTTP/gRPC、动态 batching、多实例</td><td>不是 TRT-LLM 自己的 OpenAI server</td><td>生产部署最常用，提供 metrics、auto-scale、健康检查</td></tr>
+<tr><td>Speculative Decoding</td><td>TRT-LLM 内置 Medusa、ReDrafter、EAGLE、Lookahead 等 draft 路径</td><td>不是简单的小模型 + 大模型组合</td><td>多数实现需要在 build 阶段开启对应 plugin / draft head</td></tr>
+</tbody>
+</table>
+
+<p>一句话总结：<strong>TRT-LLM 是一个把"编译期优化 + 运行时调度"做到极致的 NVIDIA 专属推理栈，engine 是一份带强 shape contract 的二进制制品，不是一个通用 Python runtime。</strong> 如果只把它当成"另一种推理框架"，BuildConfig、plugin_config、KvCacheConfig 这些概念会显得彼此重复；如果把它当成"GPU 的 AOT 编译器 + 运行时 dispatcher"，每一项设计的位置就会清楚。</p>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>剥掉 inflight batching、paged KV、plugin、ModelOpt 这些工具名之后，TRT-LLM 真正面对的不可化简问题只有一个：<strong>在 NVIDIA GPU 上，把 TensorRT 图优化、CUDA kernel 融合、推理时调度三层做到极致，最大化单位 GPU 的 token 吞吐与 SLA 内的 P99 延迟</strong>。这一句话听起来与 vLLM 的目标相似，但每一个限定词都拉出一类完全不同的工程约束。</p>
+
+<p>"NVIDIA GPU"意味着所有抽象不必兼顾 ROCm、TPU、CPU，可以毫无包袱地下沉到 PTX、TMA、WGMMA、TensorCore 这些底层指令；"TensorRT 图优化"意味着模型必须先成为可被 TensorRT 静态编译的 network，再由 builder 做 layer fusion、precision selection、kernel autotune；"CUDA kernel 融合"意味着 GEMM、attention、layernorm、bias、激活、KV update 必须能合并成尽可能少的 kernel launch；"推理时调度"意味着 build 期固化的 engine 之上，运行时还要做请求级 batching、抢占、KV 复用，否则 engine 再快也无法服务高并发；"最大化吞吐与 P99"意味着最终衡量的不是离线 benchmark 而是生产 SLA。</p>
+
+<p>如果只优化其中一个目标，每个机制的形态都会变。比如只追求 build 期完美图优化而放弃运行时调度，TRT-LLM 就会退化为静态 TRT engine，连两个不同长度的请求都无法 batch；只追求运行时灵活而不要 build 期专门化，又会变成 vLLM 那条"运行时即编译"的路径，丢掉编译期收益。TRT-LLM 的所有内部设计——从 plugin 抽象、Build/Runtime 切分、KvCacheConfig、Executor 模式、speculative 集成——都是在试图同时压住"build 期优化深度 + 运行时灵活度 + shape contract 治理 + 量化覆盖度 + 跨 GPU 代际兼容"几个互相冲突的目标。</p>
+
+<p>TRT-LLM 的另一个不可化简问题是"engine artifact 必须治理"。它不像 vLLM 那样"启动即可服务"，而是产出一份带 GPU 型号、CUDA/TRT 版本、TP-PP 拓扑、shape range、量化方案签名的二进制。这份制品必须进入发布链：版本化、灰度、回滚、shape bucket 切换、跨集群分发。理解这一点，才能解释为什么 TRT-LLM 的一些"看起来就该简单"的需求（换一台 GPU 型号、扩 max_batch、改 max_input_len）都需要 rebuild，而不是改一行配置。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>第一层推 engine artifact + build/runtime 切分。如果"为这台 GPU 生成最优执行计划"是关键目标，那么"模型 → 计划"就必须是离线一次性动作。生成的计划必须是带 shape contract 的二进制，运行时只负责 dispatch、batch 组装、KV 管理、采样。这就是 TRT-LLM 为什么强制走 <code>trtllm-build</code> → <code>.engine</code> 这条路，而不是像 vLLM 那样直接拿 HF 权重启动。</p>
+
+<p>第二层推 plugin 架构。纯 TensorRT 图无法表达"paged KV 寻址"、"inflight batching 中的 variable-length attention"、"FP8/FP4 GEMM with per-token scale"这些 LLM 特有的算子。TRT-LLM 通过 plugin 机制把这些自定义 CUDA kernel 注册到 TensorRT 图里，让 builder 仍然能做整图调度，但关键算子由 plugin 接管。GPT attention plugin、GEMM plugin、KV cache plugin、RmsNorm plugin、custom all-reduce plugin 都是这条路。</p>
+
+<p>第三层推 inflight batching。如果运行时只是"按 build 期固定的 batch shape 跑一次 forward"，那 engine 优化得再好也无法承接动态到达的请求。TRT-LLM 在 GptManager / Executor 里实现 iteration-level scheduling：每个 iteration 决定哪些请求加入 batch、哪些请求 decode 一步、哪些请求完成出列。它的实现路径与 vLLM continuous batching 同思想但不同代码：调度循环写死在 C++，与 plugin 的 KV 寻址协议紧耦合，从而避免 Python 开销。</p>
+
+<p>第四层推 KvCacheConfig 与 paged KV plugin。Paged KV 让 build 期不必为"每请求最大上下文"预留显存，只在运行时按 block 申请。Block reuse 让相同 prefix 的请求共享 KV block，与 vLLM prefix cache 同概念。<code>free_gpu_memory_fraction</code> 决定运行时把多少剩余显存交给 KV 池；<code>host_cache_size</code> 控制 CPU offload 的二级缓存。这一组配置和 BuildConfig 中的 <code>max_num_tokens</code>、<code>max_batch_size</code>、<code>max_input_len</code> 共同决定运行时可承载的并发上限。</p>
+
+<p>第五层推量化路径与 ModelOpt。AWQ、GPTQ、SmoothQuant、FP8、FP4 在 TRT-LLM 里不是 runtime 切换，而是 build 期专门化：先用 ModelOpt 在 HF 模型上做校准，输出 TRT-LLM checkpoint（含 scale 与量化权重），再用 <code>trtllm-build</code> 编译进 engine。这种"量化即专门化"的做法让 GEMM plugin 可以选用最优的 TensorCore 路径（如 H100 的 FP8 GEMM、Blackwell 的 FP4 GEMM），代价是任何量化方案变更都要 rebuild。</p>
+
+<p>第六层推多 GPU 并行。TP 把单层 GEMM 切到多卡，需要 all-reduce；PP 把不同层切到不同 stage，需要 send/recv。TRT-LLM 在 build 期把 TP/PP 拓扑固化进 engine——对应 N 张卡的 N 份 engine 文件——运行时通过 NCCL 或 custom all-reduce plugin 通信。custom all-reduce 是 NVLink 拓扑下针对小消息的专门 kernel，比 NCCL 默认实现快很多。这意味着同一个模型在 TP=4 和 TP=8 下需要两份不同的 engine。</p>
+
+<p>第七层推 Hopper / Blackwell 专属优化。H100 引入 TMA（Tensor Memory Accelerator）与 WGMMA（warp-group MMA）、FlashAttention V3；B200 引入 FP4、第二代 Transformer Engine。TRT-LLM 在 plugin 层针对每代硬件单独写 kernel 路径，由 builder 在编译期根据 <code>--gpu_arch</code> 选择具体实现。这是 TRT-LLM 相对 vLLM 在新 GPU 上能更早出极致性能的原因。</p>
+
+<p>第八层推 Triton 集成。TRT-LLM 自身只提供 C++ executor 和 Python binding，不提供 OpenAI 兼容的 HTTP server。生产部署通常通过 <code>tensorrtllm_backend</code> 挂到 Triton Inference Server 上，由 Triton 提供 HTTP/gRPC 入口、动态 batching、模型仓库、多实例、metrics。这种"引擎 + 服务器分离"的设计让 TRT-LLM 可以专注于 GPU 上的极致性能，把服务化和多模型托管交给 Triton。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">
+mindmap
+  root((TRT-LLM 内部机制))
+    设计前提
+      NVIDIA only
+      AOT 编译
+      shape contract
+      二进制制品
+    Engine 构建
+      trtllm-build
+      BuildConfig
+      plugin_config
+      precision FP16 BF16 FP8 FP4
+      GPU arch 专门化
+    Plugin 架构
+      GPT Attention plugin
+      GEMM plugin
+      KV cache plugin
+      RmsNorm plugin
+      custom all-reduce
+      Quantize plugin
+    Inflight Batching
+      Executor C++
+      iteration scheduler
+      request 出入
+      max_num_tokens 预算
+    KvCacheConfig
+      paged KV
+      enable_block_reuse
+      free_gpu_memory_fraction
+      host_cache_size
+      kv_cache_dtype FP8
+    量化路径
+      ModelOpt
+      AWQ INT4
+      GPTQ INT4
+      SmoothQuant W8A8
+      FP8 E4M3
+      FP4
+    多 GPU 并行
+      TP build expert split
+      PP stage split
+      NCCL all-reduce
+      custom_all_reduce NVLink
+    硬件代际
+      Ampere FP16 BF16
+      Hopper FP8 TMA WGMMA FA3
+      Blackwell FP4 TE2
+    Speculative
+      Medusa heads
+      ReDrafter
+      EAGLE
+      Lookahead
+    生产集成
+      Triton tensorrtllm_backend
+      动态 batching
+      多实例
+      metrics
+    工程输出
+      最高吞吐
+      低 P99
+      shape contract 治理
+      跨 GPU 代际可移植性
+</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+<li>TRT-LLM 与 vLLM、SGLang 的根本架构差异是什么？为什么 TRT-LLM 必须 build 一份 engine 而 vLLM 不需要？</li>
+<li><code>BuildConfig</code>、<code>plugin_config</code>、<code>KvCacheConfig</code> 三类配置各自决定了哪些机制的边界？哪些参数在 build 期固化、哪些在运行时可调？</li>
+<li>TRT-LLM 的 inflight batching 与 vLLM continuous batching 在思想上同源，在实现上有哪些可观察的差异（调度位置、scheduler 抽象、Python 开销）？</li>
+<li>为什么 TRT-LLM 大量使用 plugin 而不是纯 TensorRT 图？plugin 与 builder 之间的边界是什么？</li>
+<li>AWQ / GPTQ / SmoothQuant / FP8 / FP4 在 TRT-LLM 的 build pipeline 中各走哪条路径？ModelOpt 在其中扮演什么角色？</li>
+<li><code>KvCacheConfig.enable_block_reuse</code>、<code>free_gpu_memory_fraction</code>、<code>host_cache_size</code>、<code>kv_cache_dtype</code> 分别影响哪些指标？什么时候应该开启 host offload？</li>
+<li>TP=4 与 TP=8 的 engine 是同一份吗？切换 TP 拓扑或迁移 GPU 型号时，发布链需要做哪些动作？</li>
+<li>Hopper 上的 FP8 + FlashAttention V3 + WGMMA 路径相对 Ampere 的 FP16 路径，在 TRT-LLM 内部走的是哪个 plugin 实现？</li>
+<li>为什么 TRT-LLM 通常配合 Triton 部署？如果跳过 Triton 自己写 HTTP server，会缺哪些能力？</li>
+</ol>
+
+<h3>学习 checklist</h3>
+<ul>
+<li>能画出 TRT-LLM 的完整数据流：HF checkpoint → ModelOpt 量化 → TRT-LLM checkpoint → <code>trtllm-build</code> → <code>.engine</code> → Executor → Triton</li>
+<li>能解释 GPT attention plugin、KV cache plugin、custom all-reduce plugin 三者之间的协议</li>
+<li>能给出 LLaMA-70B FP8 在 8×H100 上的一组合理 BuildConfig 与对应 KvCacheConfig</li>
+<li>能在 <code>gptManagerBenchmark</code> 或 Triton metrics 中找到 active_requests、kv_cache_block_count、generation_per_batch 等关键指标，并解释每个指标飙高时该调哪个参数</li>
+<li>能在企业级 NVIDIA 集群上完成"vLLM baseline → TRT-LLM build → Triton 部署 → 性能对比 → 决定是否切换"的完整闭环</li>
+</ul>
+</section>
+
+<section class="section" id="s2">
+<h2>2. TRT-LLM 整体架构：编译期 vs 运行时的根本切分</h2>
+<p>TRT-LLM 的代码与产品形态是"编译期 + 运行时"两端分离。编译期由 <code>tensorrt_llm</code> Python 包负责：把 HuggingFace 或自定义模型转换为 TRT-LLM checkpoint，再由 <code>trtllm-build</code> 调用 TensorRT builder 生成 <code>.engine</code>。运行时由 C++ 实现的 <code>Executor</code> / <code>GptManager</code> 负责加载 engine、接收请求、做 inflight batching、与 KV cache plugin 协作、流式输出 token。</p>
+
+<pre class="mermaid">
+flowchart TB
+  subgraph Build[编译期 Build Time]
+    HF[HF Checkpoint] --> Conv[convert_checkpoint.py<br/>HF -&gt; TRT-LLM checkpoint]
+    Conv --> Quant{Quantize?}
+    Quant -->|FP8/FP4/AWQ/GPTQ/SmoothQuant| MOpt[ModelOpt<br/>校准 + scale]
+    Quant -->|FP16/BF16| TLC[TRT-LLM Checkpoint<br/>权重 + scale + config]
+    MOpt --> TLC
+    TLC --> Build1[trtllm-build<br/>BuildConfig + plugin_config]
+    Build1 --> TRT[TensorRT Builder<br/>layer fusion + autotune]
+    TRT --> Eng[.engine + config.json]
+  end
+  subgraph Runtime[运行时 Runtime]
+    Eng --> Exec[Executor / GptManager<br/>C++ inflight batcher]
+    Exec --> KV[Paged KV Cache<br/>KvCacheConfig]
+    Exec --> Plug[Plugin kernels<br/>GPT attn / GEMM / all-reduce]
+    Exec --> Sample[Sampler<br/>top-k top-p beam]
+    Exec -. NCCL .- Exec2[Other Rank Executor]
+  end
+  subgraph Serve[服务层]
+    Triton[Triton Inference Server<br/>tensorrtllm_backend] --> Exec
+    HTTP[HTTP/gRPC client] --> Triton
+  end
+</pre>
+
+<table>
+<thead><tr><th>阶段</th><th>关键产物</th><th>关键抽象</th><th>性能敏感点</th><th>与 vLLM 对应概念</th></tr></thead>
+<tbody>
+<tr><td>HF → TRT-LLM checkpoint</td><td>tensorrt_llm checkpoint dir</td><td>weight name mapping、TP/PP split</td><td>大模型 IO/内存峰值</td><td>（vLLM 没有这一步）</td></tr>
+<tr><td>ModelOpt 量化</td><td>含 scale 的 checkpoint</td><td>calibration dataset、quant config</td><td>校准集质量、scale 选择</td><td>vLLM quantization config</td></tr>
+<tr><td>trtllm-build</td><td><code>.engine</code> + <code>config.json</code></td><td>BuildConfig、plugin_config、precision</td><td>builder 时间、autotune 范围</td><td>vLLM <code>torch.compile</code> + CUDA graph</td></tr>
+<tr><td>Executor / GptManager</td><td>C++ runtime</td><td>inflight batcher、KV cache、scheduler</td><td>iteration latency、Python 边界</td><td>vLLM <code>LLMEngine</code> / <code>Scheduler</code></td></tr>
+<tr><td>Plugin kernels</td><td>自定义 CUDA op</td><td>GPT attn、GEMM、KV plugin</td><td>kernel 选择、TensorCore 利用</td><td>vLLM AttentionBackend</td></tr>
+<tr><td>Triton tensorrtllm_backend</td><td>Triton 模型仓库子目录</td><td>动态 batching、多实例</td><td>RPC 开销、batch 形状</td><td>vLLM API server</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>设计原则：</strong>build 期把所有"能在编译期决定的事"全部固化到 engine；运行时只做必须动态的事（请求级 batching、KV 分配、采样）。每多一个运行时分支都要付 dispatch 代价。</div>
+
+<div class="note"><strong>note：</strong>与 vLLM/SGLang 不同，TRT-LLM 的 Python 层只是 build 工具与瘦绑定。绝大部分热路径在 C++ + plugin CUDA，这是它能在 NVIDIA 集群上跑出最高 token/s 的根本原因，但也意味着调试与定制门槛比 vLLM 高一个量级。</div>
+
+<div class="warn"><strong>warn：</strong>很多团队把 TRT-LLM 当成"另一种推理引擎"来评估，做完 vLLM 替换实验发现"性能没有传说中的 2x，但运维复杂度高很多"。原因往往是没有走完 build 期所有专门化（量化、shape bucket、custom all-reduce、speculative 等），engine 没有真正发挥优势。</div>
+</section>
+
+<section class="section" id="s3">
+<h2>3. Engine 构建：BuildConfig、plugin_config、量化与 checkpoint 转换</h2>
+<p><code>trtllm-build</code> 是 TRT-LLM 的核心入口。它接受一个 TRT-LLM checkpoint 目录与一组配置，输出 <code>.engine</code> 文件与 <code>config.json</code>。整个 build 期的关键决策都浓缩在 BuildConfig 与 plugin_config 上。</p>
+
+<h3>BuildConfig 关键字段</h3>
+<table>
+<thead><tr><th>字段</th><th>物理含义</th><th>选错的代价</th></tr></thead>
+<tbody>
+<tr><td><code>max_batch_size</code></td><td>运行时最大并发请求数</td><td>设小 → 吞吐受限；设大 → autotune 时间长、显存预算占大</td></tr>
+<tr><td><code>max_input_len</code></td><td>单请求最大 prompt 长度</td><td>超限 → 请求被拒；过大 → KV 预算保守</td></tr>
+<tr><td><code>max_seq_len</code></td><td>单请求 input + output 总长度</td><td>与 max_input_len 共同决定 KV 上限</td></tr>
+<tr><td><code>max_num_tokens</code></td><td>单 iteration 内总 token 预算（chunked context 时关键）</td><td>类似 vLLM <code>max_num_batched_tokens</code></td></tr>
+<tr><td><code>max_beam_width</code></td><td>beam search 宽度</td><td>不用 beam 时设 1 节省显存</td></tr>
+<tr><td><code>gather_context_logits</code> / <code>gather_generation_logits</code></td><td>是否回传 logits</td><td>不需要时关掉，省带宽</td></tr>
+<tr><td><code>strongly_typed</code></td><td>严格 dtype 模式</td><td>FP8/FP4 必须开</td></tr>
+<tr><td><code>gpt_attention_plugin</code></td><td>启用 GPT attention plugin（必开）</td><td>关掉 → 走纯 TRT 路径，性能崩盘</td></tr>
+<tr><td><code>gemm_plugin</code></td><td>启用 GEMM plugin</td><td>FP8/FP4/AWQ/GPTQ 必须开对应 plugin</td></tr>
+<tr><td><code>paged_kv_cache</code></td><td>启用 paged KV cache</td><td>不开 → 静态 KV，无法 inflight batching</td></tr>
+<tr><td><code>remove_input_padding</code></td><td>variable length 输入</td><td>不开 → 等长 padding，浪费算力</td></tr>
+<tr><td><code>use_paged_context_fmha</code></td><td>chunked context 模式</td><td>长 prompt 服务必开</td></tr>
+<tr><td><code>tokens_per_block</code></td><td>KV block 大小（token 数），常见 32 / 64 / 128</td><td>类似 vLLM block_size，但 TRT-LLM 默认更大</td></tr>
+<tr><td><code>tp_size</code> / <code>pp_size</code></td><td>张量并行 / 流水并行度</td><td>改了必 rebuild</td></tr>
+</tbody>
+</table>
+
+<h3>plugin_config 关键开关</h3>
+<pre><code>from tensorrt_llm.plugin import PluginConfig
+
+plugin_config = PluginConfig()
+plugin_config.gpt_attention_plugin = "auto"       # bf16/fp16/fp8 自动
+plugin_config.gemm_plugin = "auto"
+plugin_config.nccl_plugin = "auto"                # 多卡通信
+plugin_config.paged_kv_cache = True
+plugin_config.remove_input_padding = True
+plugin_config.use_paged_context_fmha = True       # chunked context
+plugin_config.use_fp8_context_fmha = True         # H100 FP8 attention
+plugin_config.reduce_fusion = True                # 通信 + layernorm 融合
+plugin_config.user_buffer = True                  # NVLS 用户态 buffer
+</code></pre>
+
+<h3>模型转换 pipeline</h3>
+<pre class="mermaid">
+flowchart LR
+  A[HF checkpoint] --> B[examples/llama/convert_checkpoint.py<br/>--tp_size N --dtype bfloat16]
+  B --> C[TRT-LLM checkpoint dir]
+  C --> D{quantize?}
+  D -->|FP8| E[ModelOpt FP8 calibration<br/>--qformat fp8]
+  D -->|AWQ INT4| F[ModelOpt AWQ search<br/>--qformat int4_awq]
+  D -->|GPTQ| G[GPTQ tool +<br/>convert with --use_weight_only]
+  D -->|SmoothQuant| H[ModelOpt SmoothQuant<br/>--qformat int8_sq]
+  D -->|FP4 Blackwell| I[ModelOpt NVFP4<br/>--qformat nvfp4]
+  D -->|none| J[BF16/FP16 checkpoint]
+  E --> K[trtllm-build<br/>BuildConfig + plugin_config]
+  F --> K
+  G --> K
+  H --> K
+  I --> K
+  J --> K
+  K --> L[.engine + config.json]
+</pre>
+
+<h3>Build 期典型命令</h3>
+<pre><code># 第 1 步：HF -&gt; TRT-LLM checkpoint（TP=8）
+python examples/llama/convert_checkpoint.py \
+  --model_dir /models/Llama-3-70B-Instruct \
+  --output_dir /tmp/llama70b-bf16-tp8 \
+  --dtype bfloat16 \
+  --tp_size 8
+
+# 第 2 步：FP8 量化（用 ModelOpt）
+python examples/quantization/quantize.py \
+  --model_dir /models/Llama-3-70B-Instruct \
+  --output_dir /tmp/llama70b-fp8-tp8 \
+  --dtype bfloat16 \
+  --qformat fp8 \
+  --kv_cache_dtype fp8 \
+  --calib_size 512 \
+  --tp_size 8
+
+# 第 3 步：build engine
+trtllm-build \
+  --checkpoint_dir /tmp/llama70b-fp8-tp8 \
+  --output_dir /engines/llama70b-fp8-tp8-h100 \
+  --gpt_attention_plugin auto \
+  --gemm_plugin auto \
+  --use_fp8_context_fmha enable \
+  --use_paged_context_fmha enable \
+  --max_batch_size 256 \
+  --max_input_len 4096 \
+  --max_seq_len 8192 \
+  --max_num_tokens 8192 \
+  --workers 8
+</code></pre>
+
+<div class="success"><strong>success：</strong>把 quantize 步骤独立出来是好实践——<code>/tmp/llama70b-fp8-tp8</code> 这份"含 scale 的 checkpoint"可以多次复用，重新 build 不同 max_batch / max_seq_len 的 engine 时不需要重新校准。</div>
+
+<div class="warn"><strong>warn：</strong><code>max_input_len</code> 与 <code>max_seq_len</code> 不是越大越好。它们是 builder 在 autotune 时考虑的上限，设到 32K 会让 builder 花很长时间，而真实流量大多是 4K，浪费的不只是 build 时间，还有 KV 预算的保守估计。生产应该按业务 SKU 拆 engine，而不是一份 engine 兜所有上下文长度。</div>
+
+<div class="danger"><strong>danger：</strong>忘记开 <code>paged_kv_cache</code> 的 engine 在运行时会退化为静态 batch，所有动态调度优势消失，吞吐可能比 vLLM 还低。这是 TRT-LLM 上线最常见的踩坑点之一。</div>
+</section>
+
+<section class="section" id="s4">
+<h2>4. Plugin 架构：为什么 TRT-LLM 大量用 plugin 而不是纯 TensorRT 图</h2>
+<p>TensorRT 是通用神经网络编译器，原生 op 集合不包含"paged KV"、"variable-length attention"、"FP8 GEMM with per-token scale"这些 LLM 特有的算子。TRT-LLM 通过 plugin 机制把这些自定义 CUDA kernel 注册到 TensorRT 图里，让 builder 仍然能做整图调度，但热路径关键算子由 plugin 接管。</p>
+
+<h3>主要 plugin 一览</h3>
+<table>
+<thead><tr><th>Plugin</th><th>职责</th><th>与 vLLM 对应实现</th></tr></thead>
+<tbody>
+<tr><td><code>gpt_attention</code></td><td>包含 prefill / decode / chunked context 的 attention，含 paged KV 寻址</td><td>vLLM AttentionBackend (FlashAttn / FlashInfer)</td></tr>
+<tr><td><code>gemm</code></td><td>FP16/BF16/FP8/FP4 GEMM，按 dtype 与 shape autotune</td><td>torch.compile 后的 GEMM</td></tr>
+<tr><td><code>kv_cache</code></td><td>KV block 的分配、寻址、release（C++ 侧）</td><td>BlockManager + AttentionBackend</td></tr>
+<tr><td><code>rms_norm</code> / <code>layer_norm</code></td><td>融合 norm + bias + 残差</td><td>torch.compile 融合</td></tr>
+<tr><td><code>nccl</code></td><td>多卡 all-reduce / all-gather / send-recv</td><td>torch.distributed</td></tr>
+<tr><td><code>custom_all_reduce</code></td><td>NVLink 拓扑下小消息专用 all-reduce</td><td>类似 vLLM custom_all_reduce</td></tr>
+<tr><td><code>quantize</code> / <code>dequantize</code></td><td>在 plugin 边界做量化 / 反量化</td><td>quantization layer</td></tr>
+<tr><td><code>lookup</code> / <code>embedding</code></td><td>embedding 查表</td><td>nn.Embedding</td></tr>
+<tr><td><code>lora</code></td><td>LoRA adapter 应用</td><td>punica 集成</td></tr>
+<tr><td><code>moe</code></td><td>MoE expert dispatch 与 GEMM</td><td>vLLM MoE layer</td></tr>
+</tbody>
+</table>
+
+<h3>为什么必须用 plugin</h3>
+<pre class="mermaid">
+flowchart LR
+  A[HF model graph] --> B[TensorRT network builder]
+  B --> C{算子是否能用纯 TRT 表达?}
+  C -->|是: linear, layernorm, softmax 等| D[纯 TRT layer<br/>builder 自动 autotune]
+  C -->|否: paged attention, FP8 GEMM with scale,<br/>variable-length, KV append| E[Plugin layer<br/>调用注册的 CUDA kernel]
+  D --> F[Engine plan]
+  E --> F
+  F --> G[Engine .engine 文件]
+</pre>
+
+<p>GPT attention plugin 是最重要的。它在内部完成：prefill 路径（variable-length flash attention，H100 走 FA3）、decode 路径（paged attention 读取非连续 KV block）、chunked context（把长 prompt 切片，每片视为一段 prefill chunk）、KV append（把当前 step 的 K/V 写入 paged 池）、ALiBi / RoPE / 位置编码统一处理。把这些动作放在一个 plugin 内，可以省去多次 kernel launch、共享 HBM 访问、统一处理 padding。这正是 TRT-LLM attention 性能领先的根本来源。</p>
+
+<div class="note"><strong>note：</strong>plugin 的代价是"对 TensorRT builder 不透明"——builder 无法跨 plugin 边界做融合、无法 autotune plugin 内部。所以 plugin 之间的边界划分要谨慎。TRT-LLM 把 attention + KV append 放在同一个 plugin，但把 GEMM 单独放，是经验权衡。</div>
+
+<div class="warn"><strong>工程边界：</strong>custom_all_reduce plugin 只在 NVLink 全连接拓扑（如单机 8×H100）下生效，跨机或 PCIe 拓扑会自动回退到 NCCL。如果你的集群是 PCIe + InfiniBand，开 custom_all_reduce 不会带来收益反而可能引入回退开销。</div>
+</section>
+
+<section class="section" id="s5">
+<h2>5. Inflight Batching 详解：与 vLLM Continuous Batching 的实现差异</h2>
+<p>Inflight batching 与 vLLM 的 continuous batching 在思想上同源——iteration-level scheduling、动态请求出入、prefill 与 decode 混排——但在实现路径上有显著差异。</p>
+
+<h3>调度循环的物理位置</h3>
+<table>
+<thead><tr><th>维度</th><th>vLLM</th><th>TRT-LLM</th></tr></thead>
+<tbody>
+<tr><td>调度位置</td><td>Python <code>Scheduler</code> 类（V1 在子进程）</td><td>C++ <code>BatchManager</code> / <code>Executor</code>（GptManager 兼容入口）</td></tr>
+<tr><td>调度数据结构</td><td><code>running</code> / <code>waiting</code> / <code>swapped</code> 三队列</td><td>C++ <code>RequestList</code> + 内部 priority queue</td></tr>
+<tr><td>Token budget</td><td><code>max_num_batched_tokens</code></td><td><code>max_num_tokens</code></td></tr>
+<tr><td>Prefill / Decode 混排</td><td>chunked prefill 默认开启</td><td><code>enable_chunked_context</code> + paged_context_fmha</td></tr>
+<tr><td>抢占语义</td><td>swap 或 recompute 二选一</td><td>默认无 swap，靠 KV 容量预留 + 拒绝新请求</td></tr>
+<tr><td>调度可观测性</td><td>Prometheus metrics + Python 日志</td><td>Triton metrics + C++ 日志，调试门槛更高</td></tr>
+<tr><td>最小 step latency</td><td>V1 后约 1-2 ms（仍有 Python 边界）</td><td>&lt; 1 ms（纯 C++）</td></tr>
+</tbody>
+</table>
+
+<h3>一次 iteration 的时序</h3>
+<pre class="mermaid">
+sequenceDiagram
+  participant Cli as Client
+  participant Tri as Triton tensorrtllm_backend
+  participant Ex as TRT-LLM Executor (C++)
+  participant Sc as Inflight Scheduler
+  participant KV as KV Cache Manager
+  participant Pl as GPT Attn Plugin
+  participant GM as GEMM Plugin
+
+  Cli->>Tri: HTTP request (prompt, max_new_tokens)
+  Tri->>Ex: enqueueRequest(req_X)
+  Note over Ex,Sc: iteration N
+  Ex->>Sc: scheduleNext()
+  Sc->>KV: canAllocate(req_X.prompt_len)?
+  KV-->>Sc: yes (need K blocks, prefix-hit M)
+  Sc->>KV: allocate (K - M) new blocks
+  Sc-->>Ex: batch = {prefill: [req_X chunk0], decode: [req_A, req_B, ...]}
+  Ex->>Pl: gpt_attention.forward(batch, paged KV view)
+  Pl->>GM: GEMM (Q/K/V projection, MLP)
+  GM-->>Pl: outputs
+  Pl-->>Ex: hidden states
+  Ex->>Ex: sample (top-k / top-p)
+  Ex->>KV: append K/V to paged blocks
+  Ex-->>Tri: token outputs (streaming)
+  Tri-->>Cli: SSE / gRPC stream
+  Note over Ex,Sc: iteration N+1
+  Ex->>Sc: scheduleNext()
+  Sc->>Sc: req_J finished -&gt; release blocks
+  Sc-->>Ex: batch = {prefill: [req_X chunk1], decode: [...]}
+</pre>
+
+<h3>与 vLLM 的可观察差异</h3>
+<ol>
+<li><strong>CPU 开销</strong>：TRT-LLM 调度循环全在 C++，每 iteration 几乎无 Python overhead。这是它在小模型 + 高 QPS 下相对 vLLM V0 的最大优势。vLLM V1 在子进程化后差距缩小但仍存在。</li>
+<li><strong>抢占模型</strong>：vLLM 在 KV 不足时会 swap 或 recompute；TRT-LLM 默认不 swap，而是靠 BuildConfig 的 max_batch + KvCacheConfig 的预留把 OOM 风险压在 admission 阶段。这意味着 TRT-LLM 更"保守"也更"可预测"，但需要前期把容量算准。</li>
+<li><strong>调度策略可定制性</strong>：vLLM 调度策略可以通过 Python 改；TRT-LLM 调度逻辑在 C++ 内部，定制需要修改源码并 rebuild executor。这是研究迭代场景下 TRT-LLM 不友好的根源。</li>
+<li><strong>请求生命周期</strong>：vLLM 把请求建模为 SequenceGroup（含 beam）；TRT-LLM 用 <code>Request</code> + <code>OutputConfig</code>，beam 与 spec decoding 通过 OutputConfig 切换。</li>
+</ol>
+
+<div class="note"><strong>note：</strong>选择 TRT-LLM 不等于"自动获得最高吞吐"。如果你的流量特征是"大量短 prompt + 极高 QPS"，C++ 调度优势会显著；如果是"中等并发 + 长 context"，差距会缩小到一倍以内。</div>
+
+<div class="warn"><strong>warn：</strong>从 GptManager API 迁到新的 Executor API 是 TRT-LLM 0.10+ 的重要变化。旧文档里的 <code>GptManagerConfig</code> 在新版被 <code>ExecutorConfig</code> 取代。生产代码要锁版本与文档版本一致，避免文档漂移。</div>
+</section>
+
+<section class="section" id="s6">
+<h2>6. KvCacheConfig：paged KV、block reuse、host offload</h2>
+<p>KvCacheConfig 是 TRT-LLM 运行时唯一可独立调整的"内存预算与复用策略"配置，重要程度等同于 vLLM 的 <code>gpu_memory_utilization</code> + <code>kv_cache_dtype</code> + <code>enable_prefix_caching</code> 之和。</p>
+
+<h3>关键字段</h3>
+<table>
+<thead><tr><th>字段</th><th>物理含义</th><th>默认值</th><th>调整建议</th></tr></thead>
+<tbody>
+<tr><td><code>enable_block_reuse</code></td><td>是否开启 prefix block 复用（类似 vLLM prefix caching）</td><td>True</td><td>永远开启，除非 prompt 几乎无重复</td></tr>
+<tr><td><code>free_gpu_memory_fraction</code></td><td>加载 engine 与 activation 后，剩余显存中给 KV 池的比例</td><td>0.9</td><td>留出 capture / NCCL buffer，0.85-0.92 较稳</td></tr>
+<tr><td><code>max_tokens</code></td><td>KV 池总 token 容量（覆盖 free_gpu_memory_fraction）</td><td>None（自动算）</td><td>想精确控制 KV 时直接指定</td></tr>
+<tr><td><code>host_cache_size</code></td><td>CPU 上的二级 KV cache 字节数</td><td>0</td><td>长会话 + 频繁回归对话开 8-32 GiB 收益明显</td></tr>
+<tr><td><code>kv_cache_dtype</code></td><td>KV 存储精度（fp16/bf16/fp8/int8）</td><td>follow build</td><td>H100 上 FP8 KV 几乎免费 2x 容量</td></tr>
+<tr><td><code>cross_kv_cache_fraction</code></td><td>encoder-decoder 模型用的 cross attention KV 比例</td><td>None</td><td>仅 enc-dec 模型相关</td></tr>
+<tr><td><code>secondary_offload_min_priority</code></td><td>block 被踢出 GPU 到 host 的优先级阈值</td><td>None</td><td>配合 host_cache_size 调</td></tr>
+</tbody>
+</table>
+
+<h3>三层 KV cache 的关系</h3>
+<pre class="mermaid">
+flowchart TB
+  subgraph G[GPU HBM]
+    Pool[Paged KV Pool<br/>由 free_gpu_memory_fraction 决定]
+    Pool --> Reuse[Block Reuse Index<br/>hash -&gt; block_id]
+  end
+  subgraph H[Host DRAM]
+    HC[Host KV Cache<br/>host_cache_size]
+  end
+  Pool <--> |evict / fetch| HC
+  HC <--> |可选: 二级 hit| Reuse
+
+  Req[新请求] --> Reuse
+  Reuse -->|hit on GPU| Hit1[直接复用 GPU block]
+  Reuse -->|miss but hit on host| Fetch[从 host 拷回 GPU]
+  Reuse -->|all miss| Compute[正常 prefill 计算]
+</pre>
+
+<h3>Block Reuse 与 vLLM Prefix Cache 的区别</h3>
+<table>
+<thead><tr><th>维度</th><th>vLLM Prefix Cache</th><th>TRT-LLM Block Reuse</th></tr></thead>
+<tbody>
+<tr><td>命中粒度</td><td>block_size = 16 token（默认）</td><td>tokens_per_block = 32/64/128（通常更大）</td></tr>
+<tr><td>失效条件</td><td>hash 不同即失效</td><td>同</td></tr>
+<tr><td>二级缓存</td><td>无（社区有 PR 探索）</td><td>内置 host cache offload</td></tr>
+<tr><td>跨副本共享</td><td>无</td><td>无（同样需要 prefix-aware 路由）</td></tr>
+<tr><td>与量化交互</td><td>FP8 KV 与 prefix cache 兼容</td><td>同样 OK</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>success：</strong>长会话场景（客服、教育辅导、多轮对话回归）一定要开 <code>host_cache_size</code>。一份 16 GiB host cache 在客服流量上能把 prefix hit rate 从 60% 提到 88%，因为常被切走的会话 KV 仍能从 host 回填。</div>
+
+<div class="warn"><strong>warn：</strong><code>free_gpu_memory_fraction = 0.95</code> 听起来"用满显存最好"，实际上会让 NCCL workspace、CUDA graph pool、临时 activation 没空间，warmup 后或长 prompt burst 时会 OOM。生产上 0.85-0.92 是更安全的区间。</div>
+
+<div class="note"><strong>note：</strong><code>tokens_per_block</code> 是 build 期参数（在 BuildConfig 里），不是 KvCacheConfig 字段。这意味着改 block 大小要 rebuild engine，而不是改运行时配置。</div>
+</section>
+
+<section class="section" id="s7">
+<h2>7. 量化路径深度：AWQ / GPTQ / SmoothQuant / FP8 / FP4 与 ModelOpt 生态</h2>
+<p>TRT-LLM 的量化覆盖度是它相对 vLLM/SGLang 的关键差异之一。所有量化方案都通过 NVIDIA 的 <code>TensorRT Model Optimizer</code>（简称 ModelOpt）落到 build pipeline。</p>
+
+<h3>量化方案矩阵</h3>
+<table>
+<thead><tr><th>方案</th><th>权重</th><th>激活</th><th>KV</th><th>校准要求</th><th>推荐 GPU</th><th>端到端加速（vs BF16）</th><th>质量损失典型值</th></tr></thead>
+<tbody>
+<tr><td>FP16 / BF16</td><td>16 bit</td><td>16 bit</td><td>16 bit</td><td>不需要</td><td>A100/H100/B200</td><td>1.0x</td><td>0%</td></tr>
+<tr><td>FP8 E4M3 (W8A8)</td><td>8 bit</td><td>8 bit</td><td>FP8</td><td>小校准集（128-512 样本）</td><td>H100/B200</td><td>1.6-2.0x</td><td>&lt; 1%</td></tr>
+<tr><td>AWQ INT4 (W4A16)</td><td>4 bit</td><td>16 bit</td><td>16 bit</td><td>中等校准集（128-1024 样本）</td><td>A100/H100</td><td>1.4-1.8x（decode 受限场景更高）</td><td>1-2%</td></tr>
+<tr><td>GPTQ INT4 (W4A16)</td><td>4 bit</td><td>16 bit</td><td>16 bit</td><td>中等校准集</td><td>A100/H100</td><td>1.4-1.7x</td><td>1-2%</td></tr>
+<tr><td>SmoothQuant W8A8</td><td>8 bit</td><td>8 bit</td><td>16/8 bit</td><td>需要 smooth scale 校准</td><td>A100/H100</td><td>1.3-1.6x</td><td>1-2%</td></tr>
+<tr><td>INT4 + FP8 KV</td><td>4 bit</td><td>16 bit</td><td>FP8</td><td>两步校准</td><td>H100</td><td>1.6-2.0x</td><td>1-2%</td></tr>
+<tr><td>NVFP4 (Blackwell)</td><td>4 bit</td><td>4 bit</td><td>FP8/FP4</td><td>需要 ModelOpt 新版本</td><td>B200</td><td>2.5-3.5x</td><td>1-3%</td></tr>
+</tbody>
+</table>
+
+<h3>Build pipeline 中的量化位置</h3>
+<pre class="mermaid">
+flowchart LR
+  HF[HF Checkpoint] --> Calib[校准数据集<br/>典型 128-512 样本]
+  Calib --> MOpt[ModelOpt: 量化 + scale 计算]
+  HF --> MOpt
+  MOpt --> CKPT[TRT-LLM checkpoint<br/>含 quant_config + scale]
+  CKPT --> Build[trtllm-build]
+  Build --> |自动选择 plugin| GP[gemm_plugin = fp8 / int4_awq / w8a8 / nvfp4]
+  GP --> Eng[.engine]
+  Eng --> Run[Executor]
+  Run --> KV{kv_cache_dtype}
+  KV -->|FP8| FP8KV[FP8 KV pool<br/>容量 2x]
+  KV -->|FP16| FP16KV[FP16 KV pool]
+</pre>
+
+<h3>几个关键边界</h3>
+<table>
+<thead><tr><th>边界</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>Ampere 不支持 FP8 计算</td><td>A100 上 FP8 GEMM 会回退到 BF16 路径，但 FP8 KV 仍可启用（节省显存）</td></tr>
+<tr><td>Hopper FP8 GEMM 走 TensorCore E4M3</td><td>配合 FlashAttention V3 + WGMMA</td></tr>
+<tr><td>Blackwell FP4 走第二代 Transformer Engine</td><td>需要 ModelOpt 0.15+ 支持 NVFP4</td></tr>
+<tr><td>AWQ 与 FP8 KV 可叠加</td><td>INT4 权重 + FP8 KV 是 H100 上常见的高性价比组合</td></tr>
+<tr><td>GPTQ 与 AWQ 不能同时用</td><td>选一个；TRT-LLM 把它们都映射到 weight-only INT4 路径</td></tr>
+<tr><td>SmoothQuant 需要修改激活分布</td><td>smooth_factor 选择需要校准；选错会让 P99 质量退化</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>success：</strong>如果你的目标是 H100 集群上跑 LLaMA-70B 或 DeepSeek-V3 类模型，<strong>FP8 W8A8 + FP8 KV</strong> 几乎是 TRT-LLM 的标准答案：吞吐相对 BF16 接近翻倍，质量损失在 1% 以内，build 时间增加可控。</div>
+
+<div class="warn"><strong>warn：</strong>量化变更必然 rebuild engine。生产上要把"量化方案 + 校准集版本 + ModelOpt 版本"作为 engine artifact 元数据的一部分，否则线上质量回归后无法溯源。</div>
+
+<div class="danger"><strong>danger：</strong>用错校准集（domain mismatch）会让线上质量比离线 benchmark 差很多。<strong>校准集必须从生产 prompt 采样</strong>，不能用 wikitext 这种通用数据兜所有场景。</div>
+</section>
+
+<section class="section" id="s8">
+<h2>8. 多 GPU：TP / PP 在 TRT-LLM 中的实现</h2>
+<p>TRT-LLM 把张量并行（TP）与流水并行（PP）的拓扑固化进 engine，N 张卡的部署对应 N 份 engine 文件（rank0 ~ rankN-1）。这种"build 期固化"的做法与 vLLM 的"运行时配置"不同，影响发布与回滚链路。</p>
+
+<pre class="mermaid">
+flowchart TB
+  subgraph Build[build 期]
+    HF[HF model] --> Convert[convert_checkpoint.py<br/>--tp_size TP --pp_size PP]
+    Convert --> CKPT0[rank0 ckpt]
+    Convert --> CKPT1[rank1 ckpt]
+    Convert --> CKPTN[rankN-1 ckpt]
+    CKPT0 --> B0[trtllm-build] --> E0[rank0.engine]
+    CKPT1 --> B1[trtllm-build] --> E1[rank1.engine]
+    CKPTN --> BN[trtllm-build] --> EN[rankN-1.engine]
+  end
+  subgraph Run[运行时]
+    E0 --> R0[GPU0 Executor]
+    E1 --> R1[GPU1 Executor]
+    EN --> RN[GPUN-1 Executor]
+    R0 <-. NCCL all-reduce .-> R1
+    R1 <-. NCCL all-reduce .-> RN
+    R0 <-. send/recv (PP) .-> R1
+  end
+</pre>
+
+<h3>TP vs PP 在 TRT-LLM 中的取舍</h3>
+<table>
+<thead><tr><th>维度</th><th>TP</th><th>PP</th></tr></thead>
+<tbody>
+<tr><td>通信模式</td><td>all-reduce / all-gather（每层）</td><td>send/recv（stage 之间）</td></tr>
+<tr><td>通信频率</td><td>高（每层 attention/MLP 后）</td><td>低（每 micro-batch 一次）</td></tr>
+<tr><td>显存收益</td><td>等比例切分</td><td>等比例切分</td></tr>
+<tr><td>适合拓扑</td><td>单机 NVLink</td><td>多机 InfiniBand</td></tr>
+<tr><td>推理 latency 影响</td><td>all-reduce 加 latency</td><td>引入 stage bubble</td></tr>
+<tr><td>TRT-LLM 实现</td><td><code>tp_size</code> + custom_all_reduce plugin</td><td><code>pp_size</code> + send/recv plugin</td></tr>
+<tr><td>适合并发</td><td>高并发</td><td>中低并发，长上下文</td></tr>
+</tbody>
+</table>
+
+<h3>custom all-reduce plugin</h3>
+<p>NCCL 默认 all-reduce 在小消息（&lt; 1 MiB）上有较大固定开销。TRT-LLM 的 <code>custom_all_reduce</code> plugin 在 NVLink 全连接拓扑下用 <code>nvlink_p2p</code> + <code>oneshot</code> 算法，对小消息显著快于 NCCL。它的工程边界：</p>
+
+<table>
+<thead><tr><th>条件</th><th>是否生效</th></tr></thead>
+<tbody>
+<tr><td>单机 8×H100 NVLink 全连接</td><td>生效，typically 30-50% 提速</td></tr>
+<tr><td>单机 8×A100 SXM4 NVLink</td><td>生效</td></tr>
+<tr><td>单机 8×A100 PCIe</td><td>自动回退 NCCL</td></tr>
+<tr><td>跨机 InfiniBand</td><td>自动回退 NCCL</td></tr>
+<tr><td>TP=2 跨机</td><td>不推荐这种拓扑</td></tr>
+</tbody>
+</table>
+
+<div class="note"><strong>note：</strong>切 TP 拓扑不只是改一个数字，是产出一份新的 engine artifact。发布链必须把 engine 版本、TP 拓扑、对应的 GPU 拓扑、Triton 配置一起 pin。</div>
+
+<div class="warn"><strong>warn：</strong>跨机 PP 在 TRT-LLM 内部支持，但调试与 metrics 比单机 TP 复杂得多。除非模型大到必须跨机（如 405B BF16、超长上下文），优先选单机 TP。</div>
+</section>
+
+<section class="section" id="s9">
+<h2>9. Hopper / Blackwell 专属优化：FP8 / FP4 / FA3 / WGMMA / TMA</h2>
+<p>TRT-LLM 在 plugin 层针对每代 GPU 单独写 kernel 路径，由 builder 在编译期根据 <code>--gpu_arch</code> 选择具体实现。这是它能在新 GPU 出货后短时间内跑出极致性能的根本原因。</p>
+
+<table>
+<thead><tr><th>GPU</th><th>关键硬件特性</th><th>TRT-LLM 利用</th></tr></thead>
+<tbody>
+<tr><td>A100 (Ampere)</td><td>TF32、BF16、FP16 TensorCore、第二代 NVLink</td><td>BF16/FP16 attention plugin、INT8/INT4 weight-only</td></tr>
+<tr><td>H100 (Hopper)</td><td>FP8 TensorCore (E4M3/E5M2)、TMA、WGMMA、第二代 SM</td><td>FP8 GEMM plugin、FlashAttention V3、<code>use_fp8_context_fmha</code></td></tr>
+<tr><td>H200</td><td>同 H100 但 HBM3e 141 GiB</td><td>同 H100，但更大 KV 池</td></tr>
+<tr><td>B200 (Blackwell)</td><td>FP4 TensorCore、第二代 Transformer Engine、NVLink 5</td><td>NVFP4 GEMM、FP4 attention、新一代 custom_all_reduce</td></tr>
+<tr><td>GB200 NVL72</td><td>72 张 B200 NVLink 全连接</td><td>跨机 TP 也能跑（机柜级 NVLink）</td></tr>
+</tbody>
+</table>
+
+<h3>Hopper FP8 路径详解</h3>
+<pre class="mermaid">
+flowchart LR
+  Q[Query BF16] --> QC[Q quantize<br/>per-token scale]
+  K[Key BF16] --> KC[K quantize<br/>per-tensor scale]
+  V[Value BF16] --> VC[V quantize<br/>per-tensor scale]
+  QC --> FP8GEMM[FP8 GEMM<br/>WGMMA 64x256 tile]
+  KC --> FP8GEMM
+  FP8GEMM --> Soft[softmax FP32 累加]
+  Soft --> FP8GEMM2[FP8 PV GEMM]
+  VC --> FP8GEMM2
+  FP8GEMM2 --> Out[Output BF16]
+</pre>
+
+<p>H100 FP8 的两个关键收益：</p>
+<ol>
+<li><strong>GEMM 算力翻倍</strong>：H100 FP8 TensorCore 算力（不带稀疏）是 1979 TFLOPS，BF16 是 989 TFLOPS。</li>
+<li><strong>HBM 带宽减半</strong>：FP8 权重一次从 HBM 读出的字节数是 BF16 的一半，decode 阶段（带宽受限）几乎线性提速。</li>
+</ol>
+
+<h3>FlashAttention V3 与 TMA / WGMMA</h3>
+<p>FlashAttention V3 是 H100 专用的 attention 实现，利用 TMA 做异步内存搬运、WGMMA 做大 tile MMA、warp specialization 做 producer-consumer。TRT-LLM 通过 <code>use_fp8_context_fmha</code> 与 <code>gpt_attention_plugin = fp8</code> 自动选用 FA3 路径。</p>
+
+<h3>Blackwell FP4 路径</h3>
+<p>B200 引入 NVFP4 数据类型（4 bit float，带 per-block scale）。TRT-LLM 通过 ModelOpt NVFP4 量化 + 新 GEMM plugin 路径支持，吞吐相对 H100 FP8 再提 1.5-2x。</p>
+
+<div class="note"><strong>note：</strong>Blackwell 路径在 TRT-LLM 0.15+ 才完整可用。早期版本可以跑，但 NVFP4 攻略与最佳实践仍在演进。</div>
+
+<div class="success"><strong>success：</strong>从 vLLM 切到 TRT-LLM 的最大单点收益往往就来自"H100 FP8 路径完整开启"——用 vLLM 跑 BF16 比用 TRT-LLM 跑 FP8 慢一倍，这一倍主要是硬件红利而不是引擎差异。</div>
+</section>
+
+<section class="section" id="s10">
+<h2>10. 与 Triton Inference Server 集成</h2>
+<p>TRT-LLM 自身只提供 C++ executor 与 Python binding，不提供 OpenAI 兼容的 HTTP server。生产部署通常通过 <code>tensorrtllm_backend</code> 挂到 Triton Inference Server，由 Triton 提供 HTTP/gRPC、模型仓库、动态 batching、多实例、auto-scaling、metrics。</p>
+
+<pre class="mermaid">
+flowchart LR
+  Cli[Client] --> LB[Load Balancer]
+  LB --> T1[Triton instance 1<br/>tensorrtllm_backend]
+  LB --> T2[Triton instance 2<br/>tensorrtllm_backend]
+  T1 --> R1[Replica 1<br/>8x H100<br/>TP=8 engine]
+  T2 --> R2[Replica 2<br/>8x H100<br/>TP=8 engine]
+  T1 -. metrics .-> Prom[Prometheus]
+  T2 -. metrics .-> Prom
+  Prom --> Graf[Grafana]
+</pre>
+
+<h3>Triton model_repository 结构</h3>
+<pre><code>model_repository/
+├── ensemble/                     # 负责 tokenize → llm → detokenize 串联
+│   └── config.pbtxt
+├── preprocessing/                # tokenize（Python backend）
+│   └── config.pbtxt
+├── postprocessing/               # detokenize
+│   └── config.pbtxt
+└── tensorrt_llm/                 # 真正跑 engine 的子模型
+    ├── config.pbtxt              # 含 KvCacheConfig / max_batch_size
+    └── 1/
+        ├── rank0.engine
+        ├── rank1.engine
+        └── ...
+</code></pre>
+
+<h3>tensorrtllm_backend 的关键 config</h3>
+<table>
+<thead><tr><th>参数</th><th>物理含义</th></tr></thead>
+<tbody>
+<tr><td><code>max_batch_size</code></td><td>Triton 层 batching 上限（与 engine 的 max_batch_size 取小）</td></tr>
+<tr><td><code>gpu_device_ids</code></td><td>该实例占用的 GPU id 列表</td></tr>
+<tr><td><code>kv_cache_free_gpu_mem_fraction</code></td><td>等同 KvCacheConfig.free_gpu_memory_fraction</td></tr>
+<tr><td><code>enable_kv_cache_reuse</code></td><td>block reuse 开关</td></tr>
+<tr><td><code>batching_strategy</code></td><td><code>inflight_fused_batching</code>（推荐） vs <code>static</code></td></tr>
+<tr><td><code>decoding_mode</code></td><td><code>top_k_top_p</code> / <code>beam_search</code> / <code>medusa</code> / <code>eagle</code></td></tr>
+<tr><td><code>enable_chunked_context</code></td><td>长 prompt 切片</td></tr>
+<tr><td><code>executor_worker_path</code></td><td>多 rank 时的 worker 二进制路径</td></tr>
+</tbody>
+</table>
+
+<div class="note"><strong>note：</strong><code>batching_strategy = inflight_fused_batching</code> 是 TRT-LLM + Triton 的推荐模式。<code>static</code> 模式只是兼容旧用法，会让所有动态调度优势消失。</div>
+
+<div class="warn"><strong>warn：</strong>如果你跳过 Triton 自己写 OpenAI server（用 TRT-LLM Python binding），会缺少：动态 batching、多实例、健康检查、metrics、模型热加载、ensemble。短期看似简化，长期会重新发明 Triton 的轮子。</div>
+</section>
+
+<section class="section" id="s11">
+<h2>11. Speculative Decoding：Medusa / ReDrafter / EAGLE / Lookahead</h2>
+<p>TRT-LLM 内置多种 speculative decoding 路径。与 vLLM 不同，TRT-LLM 的 spec decoding 多数需要在 build 阶段开启对应 plugin / draft head，运行时无法动态切换。</p>
+
+<table>
+<thead><tr><th>方案</th><th>原理</th><th>build 期开关</th><th>适合场景</th><th>TRT-LLM 实现细节</th></tr></thead>
+<tbody>
+<tr><td>Draft model</td><td>小模型 draft + 大模型 verify</td><td>build 两个 engine</td><td>通用，但要管理两份 engine</td><td>需要双 executor</td></tr>
+<tr><td>Medusa</td><td>大模型加多个 decoding head 并行预测</td><td><code>--speculative_decoding_mode medusa</code> + 含 medusa head 的权重</td><td>短输出、低并发</td><td>head 与 base 在同一 engine</td></tr>
+<tr><td>ReDrafter</td><td>RNN-based draft head</td><td><code>--speculative_decoding_mode draft_tokens_external</code></td><td>中等输出</td><td>需要 ReDrafter 训练好的权重</td></tr>
+<tr><td>EAGLE</td><td>基于隐藏态的 draft head</td><td><code>--speculative_decoding_mode eagle</code></td><td>长输出 + 低并发</td><td>接受率最高的方案之一</td></tr>
+<tr><td>Lookahead</td><td>n-gram 自洽 draft</td><td><code>--speculative_decoding_mode lookahead_decoding</code></td><td>代码生成、重复模式</td><td>不需要额外训练</td></tr>
+</tbody>
+</table>
+
+<h3>Spec decoding 的 ROI 公式</h3>
+<pre><code>ROI = (acceptance_rate × draft_length × verify_throughput) / (draft_cost + verify_cost)
+</code></pre>
+<ul>
+<li>高 <code>acceptance_rate</code>、长 <code>draft_length</code>、低 <code>draft_cost</code> → 收益大</li>
+<li>高 base latency 流量（长输出、低并发）收益最大</li>
+<li>高 QPS 流量下，verify batch 容量被 draft 的 K 倍 token 占满，收益反而归零</li>
+</ul>
+
+<div class="warn"><strong>warn：</strong>在高并发 chatbot 流量下开 speculative decoding 几乎一定是负优化。Spec decoding 是"用算力换 latency"的工具，只在有富余算力的场景下有用。</div>
+
+<div class="note"><strong>note：</strong>Medusa head 与 EAGLE head 都需要在 base model 上额外训练，TRT-LLM 仓库提供了示例脚本但训练数据需要自备。生产路径通常是：先用 Lookahead（不需训练）验证 spec decoding 是否对你的流量有效，再决定是否训练 Medusa/EAGLE。</div>
+</section>
+
+<section class="section" id="s12">
+<h2>12. vLLM / SGLang / TRT-LLM 决策矩阵（深挖版）</h2>
+<p>本节不重复 <a href="16-quantization-compilation-and-engines.html#s7">§16.7.1</a> 的整体引擎对比，而是聚焦在"什么场景应当走 TRT-LLM"。</p>
+
+<h3>6 维对比</h3>
+<table>
+<thead><tr><th>维度</th><th>vLLM</th><th>SGLang</th><th>TRT-LLM</th></tr></thead>
+<tbody>
+<tr><td>易用性（首次部署成本）</td><td>★★★★★ 启动即服务</td><td>★★★★ 启动即服务</td><td>★★ 必须 build engine</td></tr>
+<tr><td>性能（NVIDIA 集群极致）</td><td>★★★★ 通用最强</td><td>★★★★ prefix 复用强</td><td>★★★★★ 量化 + 编译最强</td></tr>
+<tr><td>灵活性（模型迭代）</td><td>★★★★★ 改完即跑</td><td>★★★★ 改完即跑</td><td>★★ 必 rebuild</td></tr>
+<tr><td>生态（量化方案覆盖）</td><td>★★★★★ 社区跟进最快</td><td>★★★★ 跟随 vLLM</td><td>★★★★★ ModelOpt 全覆盖</td></tr>
+<tr><td>维护成本（生产长期）</td><td>★★★★ Python 易调试</td><td>★★★ DSL 学习曲线</td><td>★★ engine artifact 治理重</td></tr>
+<tr><td>特殊场景适配</td><td>通用聊天</td><td>agent + 结构化输出</td><td>固定 NVIDIA 集群 + 极致单位成本</td></tr>
+</tbody>
+</table>
+
+<h3>决策树</h3>
+<pre class="mermaid">
+flowchart TD
+  A[起点：你的目标是?] --> B{固定 NVIDIA 集群<br/>且追求极致单位成本?}
+  B -->|否| Other[选 vLLM 或 SGLang]
+  B -->|是| C{模型 + shape 是否稳定?}
+  C -->|否，频繁迭代| Other
+  C -->|是，几个月才动一次| D{团队能否承担<br/>engine artifact 治理?}
+  D -->|否| Other
+  D -->|是| E{硬件是否 H100/B200?}
+  E -->|是| F[TRT-LLM + FP8/FP4<br/>能拿到完整收益]
+  E -->|A100 仅| G[TRT-LLM + INT8/INT4<br/>收益约 1.3-1.5x]
+  F --> H{需要复杂 agent / 结构化?}
+  G --> H
+  H -->|是| I[TRT-LLM 主路 + SGLang 子集]
+  H -->|否| J[全量 TRT-LLM]
+</pre>
+
+<h3>何时 TRT-LLM 一定胜出</h3>
+<table>
+<thead><tr><th>场景</th><th>TRT-LLM 收益（相对 vLLM）</th></tr></thead>
+<tbody>
+<tr><td>8×H100 跑 70B + FP8 + 高 QPS chatbot</td><td>1.5-2.0x throughput</td></tr>
+<tr><td>大集群跑同模型 + shape 范围窄</td><td>1.3-1.8x throughput + 更稳的 P99</td></tr>
+<tr><td>极致单请求 latency（小模型 + 短输出）</td><td>1.5-2.5x latency 降低</td></tr>
+<tr><td>长上下文 + paged_context_fmha + FP8 KV</td><td>1.4-1.8x throughput</td></tr>
+<tr><td>Blackwell + NVFP4</td><td>2.0-3.0x throughput</td></tr>
+</tbody>
+</table>
+
+<h3>何时 TRT-LLM 不胜出甚至吃亏</h3>
+<table>
+<thead><tr><th>场景</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>模型每周迭代</td><td>rebuild 成本吃掉所有性能收益</td></tr>
+<tr><td>需要快速接 LoRA / 多 adapter 频繁切换</td><td>TRT-LLM LoRA 支持成熟度低于 vLLM</td></tr>
+<tr><td>需要复杂结构化输出 / grammar</td><td>SGLang 更合适</td></tr>
+<tr><td>团队没有 C++ 调试能力</td><td>出问题排障门槛高</td></tr>
+<tr><td>跨硬件代际共用一份制品</td><td>TRT-LLM artifact 强绑定 GPU 型号</td></tr>
+<tr><td>CPU / 边缘 / 非 NVIDIA GPU</td><td>完全不适用</td></tr>
+</tbody>
+</table>
+</section>
+
+<section class="section" id="s13">
+<h2>13. 性能调优手册：参数决策表</h2>
+<p>下面这张决策表适合直接放进 on-call runbook。</p>
+
+<table>
+<thead><tr><th>现象</th><th>第一怀疑</th><th>关键指标</th><th>调整动作</th></tr></thead>
+<tbody>
+<tr><td>Throughput 偏低、GPU SM util &lt; 60%</td><td>batch 没填满</td><td>scheduled_requests / max_batch_size</td><td>提高 max_batch_size（rebuild）+ kv_cache_free_gpu_memory_fraction</td></tr>
+<tr><td>TTFT P99 高</td><td>长 prompt 独占 forward</td><td>longest_in_flight_request_input_tokens</td><td>开启 <code>enable_chunked_context</code> + 调小 max_num_tokens（rebuild）</td></tr>
+<tr><td>TPOT P99 抖动</td><td>KV 逼近上限</td><td>kv_cache_block_count、admission_reject</td><td>降并发上限、开 FP8 KV、增 host_cache_size</td></tr>
+<tr><td>OOM after warmup</td><td>KV 池太大、未给 NCCL/workspace 留空间</td><td>reserved memory、free_gpu_memory_fraction</td><td>降 free_gpu_memory_fraction 到 0.85-0.88</td></tr>
+<tr><td>Prefix hit 接近 0</td><td>enable_block_reuse 没开 / prompt 不重复</td><td>block_reuse_hit_rate</td><td>确认 KvCacheConfig；若 prompt 真不重复，关掉省 hash 开销</td></tr>
+<tr><td>长会话回归慢</td><td>二级 cache 没用</td><td>host cache hit rate</td><td>开 host_cache_size = 16-32 GiB</td></tr>
+<tr><td>custom_all_reduce 不生效</td><td>拓扑不匹配或没开</td><td>NCCL fallback log</td><td>仅在单机 NVLink 全连接开</td></tr>
+<tr><td>Spec decoding 负优化</td><td>高并发场景 verify batch 撑满</td><td>acceptance_rate、batch token usage</td><td>高并发时关 spec decoding</td></tr>
+<tr><td>FP8 模型上线后质量退化</td><td>校准集失真</td><td>离线 MMLU / 业务 eval</td><td>用生产 prompt 重做校准</td></tr>
+<tr><td>Build 时间过长（小时级）</td><td>autotune shape 范围太大</td><td>builder log</td><td>缩小 max_input_len/max_seq_len 至业务真实区间</td></tr>
+</tbody>
+</table>
+
+<h3>关键 build 参数决策矩阵</h3>
+<table>
+<thead><tr><th>业务</th><th>max_batch_size</th><th>max_input_len</th><th>max_seq_len</th><th>max_num_tokens</th><th>enable_chunked_context</th><th>quantization</th></tr></thead>
+<tbody>
+<tr><td>通用 chatbot（4K context）</td><td>256</td><td>4096</td><td>8192</td><td>8192</td><td>on</td><td>FP8</td></tr>
+<tr><td>长上下文 RAG（32K）</td><td>64</td><td>32768</td><td>33792</td><td>8192</td><td>on</td><td>FP8 + FP8 KV</td></tr>
+<tr><td>Agent / tool use（短-中）</td><td>128</td><td>8192</td><td>16384</td><td>8192</td><td>on</td><td>FP8</td></tr>
+<tr><td>代码补全（短输入短输出）</td><td>512</td><td>2048</td><td>2560</td><td>4096</td><td>on</td><td>FP8</td></tr>
+<tr><td>离线 batch 推理（高吞吐）</td><td>1024</td><td>4096</td><td>8192</td><td>16384</td><td>on</td><td>FP8</td></tr>
+</tbody>
+</table>
+
+<div class="success"><strong>success：</strong>稳健的调优顺序与 vLLM 一样：先 build/run baseline → 开 chunked context → 开 FP8 KV → 开 FP8 weight/activation → 调 batch / KV 容量 → 评估 spec decoding。每步只动一个参数，A/B 完整测一轮。</div>
+
+<div class="warn"><strong>warn：</strong>Build 期参数不能乱估。<code>max_batch_size = 1024</code> 听起来"未来友好"，但会让 builder autotune 时间从几十分钟变成几小时，并且让 KV 预算保守估计，反而损失运行时容量。按业务真实分布定上限，不要"为未来留 buffer"。</div>
+</section>
+
+<section class="section" id="s14">
+<h2>14. 何时不该用 TRT-LLM</h2>
+<p>TRT-LLM 不是万能的。下面这些场景应该考虑替代方案。</p>
+
+<table>
+<thead><tr><th>场景</th><th>为什么 TRT-LLM 不合适</th><th>替代方案</th></tr></thead>
+<tbody>
+<tr><td>研究 / 模型快速迭代（每周新模型）</td><td>每次 rebuild 几十分钟到几小时，迭代成本高</td><td>vLLM</td></tr>
+<tr><td>需要复杂结构化输出（grammar、JSON、function call）</td><td>TRT-LLM constrained decoding 成熟度低</td><td>SGLang</td></tr>
+<tr><td>需要快速接 LoRA / 多 adapter 频繁切换</td><td>TRT-LLM LoRA 支持滞后</td><td>vLLM 多 LoRA</td></tr>
+<tr><td>多模型托管 / 频繁切模型（每秒）</td><td>engine 加载是分钟级</td><td>NVIDIA Triton + vLLM ensemble</td></tr>
+<tr><td>CPU / 边缘 / 非 NVIDIA GPU</td><td>TRT-LLM 仅 NVIDIA GPU</td><td>llama.cpp / ONNX Runtime</td></tr>
+<tr><td>跨 GPU 代际共用一份制品</td><td>engine 与 GPU 型号、CUDA、TRT 版本强绑定</td><td>vLLM</td></tr>
+<tr><td>团队没有 C++ 调试能力</td><td>出问题需要看 plugin 源码</td><td>vLLM Python 易调试</td></tr>
+<tr><td>Prototype / 单次实验</td><td>build 期成本不值</td><td>vLLM 直接跑</td></tr>
+<tr><td>Encoder-decoder（T5、BART）</td><td>TRT-LLM 对 enc-dec 支持有限</td><td>TGI 或专门服务</td></tr>
+</tbody>
+</table>
+
+<div class="note"><strong>note：</strong>上面这些"不该用 TRT-LLM"的场景，往往不是 TRT-LLM 性能不行，而是它的"先编译后执行"假设和你的需求不匹配。选错引擎比调错参数代价更大。</div>
+
+<div class="success"><strong>success：</strong>一个常见的稳健路径是 <strong>"vLLM 做基线 + 对长期稳定的高 QPS 模型单独 build TRT-LLM 副本"</strong>——vLLM 处理迭代灵活性，TRT-LLM 处理极致单位成本，两条路线并存几个月，用真实数据收敛。</div>
+</section>
+
+<section class="section" id="s15">
+<h2>15. Worked Example：LLaMA-70B × 8×H100，TRT-LLM build &amp; deploy 实战</h2>
+<p>下面用一个真实风格的过程，把前面几节的机制串起来。场景：把 LLaMA-3-70B-Instruct 部署到一台 8×H100 80GB（NVLink 全连接）服务器，目标支持企业内部 chatbot，峰值 200 QPS，平均输入 1500 token、输出 400 token，目标 P99 TTFT &lt; 600ms、P99 TPOT &lt; 60ms。已有 vLLM baseline（参见 <a href="16a-vllm-internals.html#s14">16a §14</a>）作为对照。</p>
+
+<h3>第 0 步：vLLM baseline（参考）</h3>
+<p><code>vllm serve meta-llama/Llama-3-70B-Instruct --tensor-parallel-size 8</code> 调优后吞吐 4500 tps（GPTQ-Marlin INT4 + FP8 KV），P99 TTFT 750ms。这就是 TRT-LLM 要超越的对照线。</p>
+
+<h3>第 1 步：HF → TRT-LLM checkpoint（FP8）</h3>
+<pre><code># 用 ModelOpt 直接做 FP8 量化 + checkpoint 转换
+python examples/quantization/quantize.py \
+  --model_dir /models/Llama-3-70B-Instruct \
+  --output_dir /tmp/llama70b-fp8-tp8 \
+  --dtype bfloat16 \
+  --qformat fp8 \
+  --kv_cache_dtype fp8 \
+  --calib_size 512 \
+  --calib_dataset /data/prod-prompt-sample.jsonl \
+  --tp_size 8
+</code></pre>
+
+<table>
+<thead><tr><th>项</th><th>数值</th></tr></thead>
+<tbody>
+<tr><td>校准时长</td><td>~25 分钟（H100 单卡）</td></tr>
+<tr><td>校准集</td><td>512 条生产 prompt 采样</td></tr>
+<tr><td>Checkpoint 大小</td><td>~70 GB（FP8 权重 + scale + meta）</td></tr>
+</tbody>
+</table>
+
+<h3>第 2 步：trtllm-build engine</h3>
+<pre><code>trtllm-build \
+  --checkpoint_dir /tmp/llama70b-fp8-tp8 \
+  --output_dir /engines/llama70b-fp8-tp8-h100-v1 \
+  --gpt_attention_plugin auto \
+  --gemm_plugin auto \
+  --use_fp8_context_fmha enable \
+  --use_paged_context_fmha enable \
+  --reduce_fusion enable \
+  --user_buffer enable \
+  --max_batch_size 256 \
+  --max_input_len 4096 \
+  --max_seq_len 8192 \
+  --max_num_tokens 8192 \
+  --workers 8
+</code></pre>
+
+<table>
+<thead><tr><th>项</th><th>数值</th></tr></thead>
+<tbody>
+<tr><td>Build 时长</td><td>~35 分钟（8 worker 并行）</td></tr>
+<tr><td>Engine 单 rank 大小</td><td>~9 GB</td></tr>
+<tr><td>Engine 总大小（8 ranks）</td><td>~72 GB</td></tr>
+<tr><td>输出</td><td>8 份 <code>.engine</code> + 1 份 <code>config.json</code></td></tr>
+</tbody>
+</table>
+
+<h3>第 3 步：Triton 配置（KvCacheConfig + executor）</h3>
+<p><code>model_repository/tensorrt_llm/config.pbtxt</code>（关键字段）：</p>
+<pre><code>backend: "tensorrtllm"
+max_batch_size: 256
+model_transaction_policy { decoupled: True }
+parameters {
+  key: "gpt_model_type" value: { string_value: "inflight_fused_batching" }
+}
+parameters {
+  key: "kv_cache_free_gpu_mem_fraction" value: { string_value: "0.90" }
+}
+parameters {
+  key: "enable_kv_cache_reuse" value: { string_value: "true" }
+}
+parameters {
+  key: "enable_chunked_context" value: { string_value: "true" }
+}
+parameters {
+  key: "max_num_tokens" value: { string_value: "8192" }
+}
+parameters {
+  key: "host_cache_size" value: { string_value: "17179869184" }   # 16 GiB
+}
+instance_group [{ count: 1, kind: KIND_GPU }]
+</code></pre>
+
+<p>启动 Triton：</p>
+<pre><code>mpirun -n 8 --allow-run-as-root \
+  /opt/tritonserver/bin/tritonserver \
+  --model-repository=/model_repository
+</code></pre>
+
+<h3>第 4 步：压测与对比</h3>
+<table>
+<thead><tr><th>指标</th><th>vLLM baseline (INT4 + FP8 KV)</th><th>TRT-LLM v1 (FP8 + FP8 KV)</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Throughput</td><td>4,500 tps</td><td><strong>6,800 tps</strong></td><td>+51%</td></tr>
+<tr><td>P99 TTFT</td><td>750 ms</td><td><strong>420 ms</strong></td><td>-44%</td></tr>
+<tr><td>P99 TPOT</td><td>65 ms</td><td><strong>42 ms</strong></td><td>-35%</td></tr>
+<tr><td>Prefix hit rate</td><td>62%</td><td>68%（block reuse + 32 token block）</td><td>+6pp</td></tr>
+<tr><td>GPU SM util</td><td>88%</td><td>93%</td><td>+5pp</td></tr>
+<tr><td>GPU mem 总占用</td><td>~60 GB/卡</td><td>~74 GB/卡</td><td>更激进</td></tr>
+<tr><td>Engine 加载时间</td><td>N/A（直接加载权重）</td><td>~45 秒（8 rank 并行）</td><td>+45s 启动开销</td></tr>
+<tr><td>离线 MMLU</td><td>-1.2%（vs BF16）</td><td>-0.6%（vs BF16）</td><td>FP8 质量优于 INT4</td></tr>
+</tbody>
+</table>
+
+<h3>第 5 步：开 host cache（针对长会话）</h3>
+<p>业务有一定比例多轮对话回归（约 30% 流量），在 KvCacheConfig 中开 <code>host_cache_size = 16 GiB</code>。</p>
+
+<table>
+<thead><tr><th>指标</th><th>不开 host cache</th><th>开 host cache</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Prefix hit rate</td><td>68%</td><td>84%</td><td>+16pp</td></tr>
+<tr><td>TTFT P99（多轮场景）</td><td>380 ms</td><td>220 ms</td><td>-42%</td></tr>
+<tr><td>TTFT P99（单轮）</td><td>420 ms</td><td>425 ms</td><td>+1%（host cache 查询开销）</td></tr>
+</tbody>
+</table>
+
+<h3>第 6 步：观察是否值得开 spec decoding</h3>
+<p>业务流量是高并发 chatbot（200 QPS），平均输出 400 token。先用 Lookahead 试：</p>
+<pre><code>trtllm-build ... --speculative_decoding_mode lookahead_decoding
+</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>不开 spec</th><th>开 Lookahead</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Throughput</td><td>6,800 tps</td><td>6,200 tps</td><td>-9%</td></tr>
+<tr><td>P99 TTFT</td><td>420 ms</td><td>480 ms</td><td>+14%</td></tr>
+<tr><td>P99 TPOT</td><td>42 ms</td><td>38 ms</td><td>-10%</td></tr>
+</tbody>
+</table>
+
+<p>→ 高并发场景下 spec decoding 负优化（throughput 下降），关闭。换另一个低并发长输出的服务（代码生成）再评估时收益明显。</p>
+
+<h3>总结</h3>
+<table>
+<thead><tr><th>阶段</th><th>主要动作</th><th>tps</th><th>TTFT P99</th><th>TPOT P99</th><th>相对 vLLM baseline</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>vLLM INT4 baseline</td><td>4,500</td><td>750</td><td>65</td><td>1.0x</td></tr>
+<tr><td>1</td><td>TRT-LLM FP8 + chunked + block reuse</td><td>6,800</td><td>420</td><td>42</td><td>1.51x</td></tr>
+<tr><td>2</td><td>+ host_cache 16 GiB（多轮场景）</td><td>—</td><td>220</td><td>—</td><td>多轮 TTFT -42%</td></tr>
+<tr><td>3</td><td>spec decoding（高并发）</td><td>6,200</td><td>480</td><td>38</td><td>关闭</td></tr>
+</tbody>
+</table>
+
+<h3>教训</h3>
+<ol>
+<li><strong>build 期不要为未来留太多 buffer</strong>——max_batch / max_input / max_seq 按业务真实分布定，过大让 build 时长翻倍且 KV 预算保守。</li>
+<li><strong>校准集必须从生产 prompt 采样</strong>——这是 FP8 质量损失从 2% 降到 0.6% 的关键。</li>
+<li><strong>host_cache 是长会话场景的"免费午餐"</strong>——单轮场景几乎无影响，多轮场景 TTFT 显著改善。</li>
+<li><strong>Spec decoding 只在低并发长输出场景开启</strong>——高并发 chatbot 上几乎一定是负优化。</li>
+<li><strong>engine artifact 必须治理</strong>——<code>llama70b-fp8-tp8-h100-cuda12.4-trt10.0-modelopt0.13-bsz256-seq8192-v1.engine</code> 这样的命名加上 manifest 是发布链能跑得起来的最低要求。</li>
+<li><strong>TRT-LLM vs vLLM 1.5x 是现实区间</strong>——传说中的 2-3x 通常是把 vLLM 没开优化的对照组与 TRT-LLM 全量优化的实验组比较，不是公平对比。</li>
+</ol>
+</section>
+
+<section class="section" id="s16">
+<h2>16. 练习</h2>
+
+<h3>基础题</h3>
+<ol>
+<li><strong>16c-1（基础）</strong>：TRT-LLM 与 vLLM 在"模型如何变成可执行物"这一步上的根本差异是什么？为什么 TRT-LLM 必须走 build 流程，而 vLLM 不需要？</li>
+<li><strong>16c-2（基础）</strong>：解释 BuildConfig 的 <code>max_batch_size</code>、<code>max_input_len</code>、<code>max_seq_len</code>、<code>max_num_tokens</code> 四个字段的物理含义。其中哪些是 build 期固化、哪些影响运行时的 token budget？</li>
+<li><strong>16c-3（基础）</strong>：列出 TRT-LLM 至少 5 个关键 plugin，并解释为什么这些算子无法用纯 TensorRT 表达。</li>
+<li><strong>16c-4（基础）</strong>：KvCacheConfig 中 <code>enable_block_reuse</code>、<code>free_gpu_memory_fraction</code>、<code>host_cache_size</code>、<code>kv_cache_dtype</code> 各自影响哪些指标？默认值是什么？</li>
+<li><strong>16c-5（基础）</strong>：TRT-LLM 在 H100 上的 FP8 路径相对 BF16 路径，哪些环节获得加速？为什么 A100 上跑 FP8 无法获得相同收益？</li>
+</ol>
+
+<h3>进阶题</h3>
+<ol start="6">
+<li><strong>16c-6（进阶）</strong>：你的部署是 8×H100，模型是 LLaMA-70B，业务流量是 32K 长上下文 RAG。给出一组合理的 BuildConfig（max_batch_size、max_input_len、max_seq_len、max_num_tokens）与 KvCacheConfig，并说明每个参数的依据。</li>
+<li><strong>16c-7（进阶）</strong>：TRT-LLM 上线后吞吐只比 vLLM 高 10%（远低于预期 1.5x）。给出至少 5 种可能原因和排查顺序。</li>
+<li><strong>16c-8（进阶）</strong>：解释 TRT-LLM inflight batching 与 vLLM continuous batching 在抢占模型上的差异。哪种更适合"流量突发"场景？哪种更适合"严格 SLA"场景？</li>
+<li><strong>16c-9（进阶）</strong>：你的团队想把 8×H100 切到 8×B200（TP=8）。请说明发布链需要做哪些动作，engine artifact 治理上要注意什么。</li>
+<li><strong>16c-10（进阶）</strong>：spec decoding 开启后 throughput 反而下降 10%，acceptance_rate 75%（不低）。可能原因有哪些？应该看哪些 metrics 验证？</li>
+</ol>
+
+<h3>设计题</h3>
+<ol start="11">
+<li><strong>16c-11（设计）</strong>：为一家 NVIDIA 集群规模 100+ H100 节点的公司设计一份 "vLLM + TRT-LLM 混合部署" 方案，明确：哪些模型走 vLLM、哪些走 TRT-LLM、engine artifact 如何版本化、灰度策略、回滚策略、监控指标。</li>
+<li><strong>16c-12（设计）</strong>：你的团队要把一个使用 vLLM 的服务迁移到 TRT-LLM。设计一份迁移评估清单（至少 8 项），覆盖性能、运维、回滚、监控、量化方案兼容性、shape 治理、Triton 集成、团队能力等维度。</li>
+</ol>
+</section>
+
+<section class="refbox">
+<h2>深度参考阅读</h2>
+
+<h3>论文与 NVIDIA 技术报告</h3>
+<ul>
+<li><em>FasterTransformer</em>（NVIDIA，TRT-LLM 的前身，理解 attention plugin 设计起点）</li>
+<li><em>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</em>（Shah et al., 2024）—— H100 attention 路径的算法基础</li>
+<li><em>FP8 Formats for Deep Learning</em>（NVIDIA Whitepaper）—— H100 FP8 数据格式与 TensorCore</li>
+<li><em>NVFP4: A 4-bit Floating Point Format for Blackwell</em>（NVIDIA Whitepaper）—— B200 FP4 路径</li>
+<li><em>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</em>（Lin et al.）</li>
+<li><em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>（Frantar et al.）</li>
+<li><em>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</em>（Xiao et al.）</li>
+<li><em>Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</em>（Cai et al., 2024）</li>
+<li><em>EAGLE / EAGLE-2 / EAGLE-3</em>（SafeAILab 系列）</li>
+<li><em>Recurrent Drafter (ReDrafter)</em>（Apple, 2024）</li>
+</ul>
+
+<h3>官方资料</h3>
+<ul>
+<li>TensorRT-LLM 官方文档 <code>nvidia.github.io/TensorRT-LLM</code>，特别是 "Architecture"、"BuildConfig"、"Inflight Batching"、"KV Cache Reuse"、"Quantization"、"Speculative Decoding" 几节</li>
+<li>TensorRT Model Optimizer 官方文档 <code>nvidia.github.io/TensorRT-Model-Optimizer</code></li>
+<li>Triton Inference Server <code>tensorrtllm_backend</code> 仓库 README 与 perf_analyzer 教程</li>
+<li>NVIDIA GTC 2024 / 2025 关于 TRT-LLM、Hopper FP8、Blackwell FP4 的 session 录像</li>
+</ul>
+
+<h3>关键代码模块入口（TRT-LLM 主仓库 <code>NVIDIA/TensorRT-LLM</code>）</h3>
+<ul>
+<li><code>tensorrt_llm/builder.py</code> —— BuildConfig 与 build 流程</li>
+<li><code>tensorrt_llm/plugin/plugin.py</code> —— PluginConfig 与 plugin 注册</li>
+<li><code>tensorrt_llm/quantization/</code> —— 量化路径与 ModelOpt 集成</li>
+<li><code>tensorrt_llm/runtime/</code> —— Python 端 runtime binding</li>
+<li><code>cpp/tensorrt_llm/batch_manager/</code> —— C++ inflight batcher 与 Executor</li>
+<li><code>cpp/tensorrt_llm/kernels/</code> —— GPT attention、GEMM、KV cache、custom all-reduce 等 plugin kernel</li>
+<li><code>examples/llama/</code> —— LLaMA 系列模型转换与 build 脚本</li>
+<li><code>examples/quantization/</code> —— FP8/FP4/AWQ/GPTQ/SmoothQuant 量化脚本</li>
+<li><code>examples/medusa/</code> / <code>examples/eagle/</code> —— spec decoding 训练与 build 示例</li>
+</ul>
+
+<h3>Blog 与实战</h3>
+<ul>
+<li>NVIDIA Developer Blog 的 TRT-LLM 系列（搜索 "TensorRT-LLM" + 模型名）</li>
+<li>"Demystifying TensorRT-LLM: Inflight Batching, Paged KV, and FP8" 系列技术博文</li>
+<li>各大云厂商（AWS Bedrock、Azure ML、GCP Vertex）关于 TRT-LLM 部署的最佳实践</li>
+<li>LMSYS / Anyscale / Together AI 关于 vLLM vs TRT-LLM 的对比实测博客（注意识别 marketing 偏差与对照组优化是否对等）</li>
+</ul>
+
+<h3>学习路线</h3>
+<ol>
+<li>先读 <a href="15-batching-scheduling-and-kv-cache.html">第 15 章</a> 把 KV Cache、PagedAttention、调度循环的概念打牢</li>
+<li>再读 <a href="16-quantization-compilation-and-engines.html">第 16 章</a> 理解推理引擎选型矩阵中 TRT-LLM 的位置</li>
+<li>对照 <a href="16a-vllm-internals.html">16a vLLM 深挖</a> 理解"运行时即编译"路线的完整内部结构</li>
+<li>本章作为"先编译后执行"路线的对照</li>
+<li>读 <a href="16b-sglang-internals.html">16b SGLang 深挖</a> 理解"复杂编排 + 结构化输出"场景下的另一条路线</li>
+<li>最后读 <a href="17-multitenancy-and-cost.html">第 17 章</a> 把 TRT-LLM 的极致单位成本能力下放到 tenant 维度</li>
+</ol>
+
+<h3>相关章节</h3>
+<ul>
+<li><a href="14-online-inference-architecture.html">第 14 章 · 在线推理架构</a>：路由、副本、SLO 与 TRT-LLM 服务的整体集成</li>
+<li><a href="15-batching-scheduling-and-kv-cache.html">第 15 章 · 批处理、调度与 KV Cache</a>：本章的概念前置</li>
+<li><a href="16-quantization-compilation-and-engines.html">第 16 章 · 量化、编译与推理引擎</a>：TRT-LLM 在引擎选型矩阵中的位置</li>
+<li><a href="16a-vllm-internals.html">第 16a 章 · vLLM 内部机制深入</a>：另一条主流路线的内部细节，对照阅读</li>
+<li><a href="16b-sglang-internals.html">第 16b 章 · SGLang 内部机制深入</a>：复杂编排与结构化输出场景的另一条路线</li>
+<li><a href="17-multitenancy-and-cost.html">第 17 章 · 多租户与成本治理</a>：把 TRT-LLM 的极致单位成本能力下放到 tenant 维度</li>
+</ul>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
