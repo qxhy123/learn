@@ -176,6 +176,328 @@ TCP 的优势是通用、可靠、运维门槛低。小规模训练、控制面�
 
 **工程判断**：如果训练吞吐的价值高于网络复杂度，优先评估 RDMA 路径；如果团队不能观测和调 RoCE，就不要把 RoCE 当成"便宜 IB"；如果作业规模较小，TCP 可能是更稳的起点。
 
+#### 5c.2.5 RDMA verbs API：QP / CQ / MR / PD / SRQ
+
+前面把 RDMA 当成"NIC 直接读写远端内存"的能力，但**实际编程模型**是 senior 排查 IB/RoCE 事故必懂的层。任何用 RDMA 的库（NCCL、UCX、libfabric、MPI、Mellanox SHARP）底层都建立在这五个对象上。
+
+**核心对象**：
+
+```text
+PD (Protection Domain)
+  ↓ 像内存隔离域：所有 QP / MR 必须属于同一个 PD 才能交互
+  
+MR (Memory Region)
+  ↓ 内存区域注册：调 ibv_reg_mr() 把 user buffer "钉"进 RDMA NIC 视图
+  ↓ 注册后 NIC 知道虚拟地址 → 物理地址映射，可以直接 DMA
+  ↓ 返回 (lkey, rkey)：lkey 给本地用、rkey 给对端发起 RDMA Read/Write 用
+  ↓ 注册昂贵（要锁页 + 建 IOMMU 映射），生产中预注册 + 池化复用
+
+QP (Queue Pair)
+  ↓ 一对 send queue + recv queue，是 RDMA 的"连接"
+  ↓ 三种模式：
+  ↓   RC (Reliable Connected)    一对一可靠，TCP 风格 + RDMA 性能（NCCL 默认）
+  ↓   UC (Unreliable Connected)  一对一不可靠
+  ↓   UD (Unreliable Datagram)   广播式，RDMA-CM 控制面用
+  ↓ 必须握手到 INIT → RTR → RTS 状态才能传输
+
+CQ (Completion Queue)
+  ↓ 工作完成事件队列：每条 SEND/RECV/RDMA WRITE 完成时产生 WC (Work Completion)
+  ↓ 应用 ibv_poll_cq() 拿 WC，里面含 status（success / error code）
+  ↓ 大量小消息时 CQ 是热点，需要 CQ moderation 减少中断
+
+SRQ (Shared Receive Queue) [可选]
+  ↓ 多个 QP 共享一个 recv queue，避免每 QP 都预 post 大量 recv WR
+  ↓ 大集群（千 QP 级）必备
+```
+
+**两类操作**：
+
+| 操作 | 语义 | 是否需要对端 CPU 参与 |
+|---|---|---|
+| **SEND/RECV** | 双边：发送方 SEND，接收方必须先 post RECV | 是（接收方要预 post buffer）|
+| **RDMA WRITE** | 单边：发送方直接写到对端 MR，对端无感知 | 否（对端 NIC 自己 DMA）|
+| **RDMA READ** | 单边：发送方直接读对端 MR | 否 |
+| **ATOMIC** | 原子操作（compare-and-swap、fetch-and-add）| 否 |
+
+NCCL 在大消息上倾向 RDMA WRITE（单边，零拷贝、无 CPU 参与），小消息用 SEND/RECV（语义简单、CQ 通知触发依赖）。
+
+**RDMA-CM（Connection Manager）**：
+
+QP 不是直接连接的，要先通过 RDMA-CM 协议交换 QP 参数（QPN、PSN、GID/LID、PKey）。RDMA-CM 走 UD 或 IPoIB；NCCL bootstrap 时常用 socket(TCP) 交换 QP 信息后再切到 RDMA。这是为什么"NCCL 启动卡住"经常和 socket 网络（管理面）有关，而不是 RDMA fabric 本身。
+
+**生产事故诊断**：
+
+| 现象 | 根因 | 排查 |
+|---|---|---|
+| `ibv_reg_mr` 失败 | locked memory limit 不够（ulimit -l）| 改 `/etc/security/limits.conf` `memlock unlimited` |
+| QP 状态停在 INIT | RDMA-CM 没握手成功，可能是 socket bootstrap 网络问题 | `NCCL_DEBUG=INFO` 看 bootstrap 阶段日志 |
+| WC 报 `IBV_WC_RETRY_EXC_ERR` | 重传超过限制（坏链路、PFC 异常）| 看交换机端口 retrans / pause / discard counter |
+| WC 报 `IBV_WC_RNR_RETRY_EXC_ERR` | Receiver Not Ready：对端 SRQ/RECV 没 post 上 | 检查 SRQ 深度配置、对端是否阻塞 |
+| WC 报 `IBV_WC_REM_ACCESS_ERR` | 远端拒绝访问，rkey 错或 MR 已 dereg | NCCL bug 或镜像内 RDMA stack 不一致 |
+| 多 NIC 但只用一张 | 容器内只暴露部分 RDMA device | 检查 device cgroup 和 `rdma-core` 配置 |
+
+**调试命令**：
+
+```bash
+# RDMA 设备列表 + 端口状态
+ibv_devinfo                  # 详细：rate, state, link_layer, GID 表
+ibstat                       # 简洁：每个 HCA 的端口速率、state
+rdma link                    # 内核 rdma 子系统视角
+
+# locked memory 限制
+ulimit -l                    # unlimited 是健康值
+cat /proc/<pid>/status | grep VmLck
+
+# RoCE GID 表
+show_gids                    # GID index → IP / VLAN / RoCE version 映射
+
+# 端口错误计数
+cat /sys/class/infiniband/mlx5_0/ports/1/counters/*
+```
+
+#### 5c.2.6 InfiniBand Subnet Manager：路由的"控制平面"
+
+InfiniBand 不是以太网那样"插上就通"。**Subnet Manager (SM)** 是 IB fabric 的控制平面，所有 IB 集群必须有 SM 在跑（OpenSM 开源 / Mellanox UFM 商业 / 交换机内嵌 embedded SM）。SM 负责：
+
+- **LID 分配**：每个 IB 端口分配 16-bit Local Identifier（类似 IP 但只在 subnet 内）
+- **路由计算**：根据 fat-tree / DragonFly+ 拓扑算 forwarding tables，下发到每台交换机
+- **链路状态监控**：周期 sweep 子网，发现端口 down/up、链路降速、新设备加入
+- **多路径配置**：SHARP / Adaptive Routing 等高级特性的路由元数据
+- **PKey 管理**：partition keys，类似 VLAN，用于多租户 fabric 隔离
+
+**SM 失败模式**（生产 IB 集群最严重的根因之一）：
+
+| 现象 | 根因 | 影响范围 |
+|---|---|---|
+| 大量 NCCL timeout，但单端口测试正常 | SM 节点抖动，路由表过期，跨交换机路径错 | 全 fabric |
+| 节点新加入但 IB 端口 active 后无法通信 | SM 没及时 sweep 到，LID 没分配 | 该节点 |
+| 链路 down 后恢复，但流量没切回原路径 | SM 没触发重路由 | 受影响路径 |
+| 同一作业不同启动表现差异大 | 路由不稳定，每次 SM sweep 计算不同 | 大作业训练 |
+
+**SM 高可用配置**：
+
+```text
+- 至少 2 个 SM 节点（master + standby），互相心跳
+- master 异常时 standby 自动接管（SM priority）
+- OpenSM 的 -p 参数设置 priority
+- 商业 UFM 提供更完善的 HA + dashboard
+```
+
+**SM 监控**：
+
+```bash
+sminfo                       # 当前 master SM 是谁
+saquery NodeRecord           # 子网中所有节点
+ibnetdiscover                # 完整拓扑发现
+ibdiagnet -r                 # SM-aware 诊断报告
+```
+
+生产经验：**SM 节点必须独立、稳定、低负载**——不要把它放在训练节点上跑。SM 抖动 = 整个 IB fabric 抖动 = 所有训练 NCCL 抖动。这是大集群最常见的"网络看起来好但训练不稳定"的根因。
+
+#### 5c.2.7 RoCEv2 实际是 UDP encapsulation：跨设备 ECMP 与 DSCP
+
+RoCE v2 把 RDMA 数据帧封装在 UDP/IP 里：
+
+```text
+[ Ethernet ][ IP ][ UDP dst=4791 ][ IB BTH (Base Transport Header) ][ RDMA payload ]
+```
+
+UDP dst port **4791** 是 RoCEv2 IANA 分配端口，固定不变。这导致两个工程后果：
+
+**1. ECMP 哈希必须配对**：交换机做 ECMP（多路径选路）时常用 5-tuple hash（src IP + dst IP + src port + dst port + proto）。RoCEv2 的 dst port 永远是 4791，src port 由 NIC 选择——**如果 src port 也固定**，整个 fabric 看起来只有一条路径，多 rail 完全失效。Mellanox NIC 默认 entropy field 是 src port 自动 hash QP，但需要 RoCE Lossless 配置 + 交换机 ECMP 算法兼容。
+
+**2. DSCP 标记决定 PFC 队列**：RoCE 流量需要 lossless 队列（PFC pause），其他流量走普通队列。靠 DSCP 标记区分，主机 NIC 必须 mark RoCE traffic 为特定 DSCP value（典型 26 = AF31），ToR 交换机按 DSCP 分到 priority queue（priority 3）；priority 3 启用 PFC，其他不启用。
+
+**端到端一致性问题**：
+
+```text
+DSCP marking:    NIC → ToR → leaf → spine → leaf → ToR → 远端 NIC
+PFC priority:    必须每跳都把 RoCE 队列配 PFC，缺一跳就丢包
+MTU:             RoCE 一般 4200 (jumbo frame)，端到端必须一致
+ECN:             配 marking threshold（典型 buffer 1/3 满时 mark）
+```
+
+任何一跳配错（典型：spine 没配 PFC、某 leaf MTU 不对）都会让大并发训练 timeout。这就是 RoCE 比 IB 难调的根本——IB SM 自动管理 fabric 一致性，RoCE 靠运维手工配每个交换机。
+
+#### 5c.2.8 NCCL 内部 transport 选择与 GDR 协商
+
+NCCL 启动时按拓扑探测和环境变量选择 transport。理解这个选择逻辑，"NCCL 慢"的根因才有方向。
+
+**transport 类型**（按性能从高到低）：
+
+| Transport | 用途 | 触发条件 |
+|---|---|---|
+| **NVLink P2P** | 同一 NVSwitch domain GPU 间 | 自动检测 NVLink 拓扑 |
+| **PCIe P2P** | 同节点跨 NVLink domain GPU 间 | NVLink 不可用且 ACS 关闭 |
+| **GPUDirect RDMA (GDR)** | 跨节点 GPU 间，NIC 直读 GPU memory | NIC 支持 + nv_peer_mem 模块加载 + GPU/NIC 同 PCIe domain |
+| **Host staging RDMA** | 跨节点 GPU 间，先 H2D copy 到 host pinned，再 RDMA | GDR 不可用或 GPU/NIC 跨 NUMA 时 fallback |
+| **Sockets (TCP)** | RDMA 完全不可用 | 兜底，性能极差 |
+
+**GDR 协商流程**：
+
+```text
+NCCL 启动:
+1. 调 cuPointerGetAttribute() 检查 GPU memory 是否可被 NIC 访问
+2. 检查 nv_peer_mem.ko 内核模块是否加载（NVIDIA peermem）
+   modprobe nvidia-peermem  # H100 + Linux 5.6+
+3. 检查 GPU 和 NIC 是否在同一 PCIe root complex（nvidia-smi topo -m）
+4. 通过 NCCL_NET_GDR_LEVEL 决定阈值:
+   - PIX (1)  仅同一 PCIe switch 下才用 GDR
+   - PXB (2)  同一 PCIe host bridge 下用
+   - PHB (3)  同一 NUMA node 下用
+   - SYS (4)  跨 NUMA 也用（性能差）
+   - LOC (5)  从不用 GDR
+5. NCCL_NET_GDR_READ 控制 GDR 是否用于 RDMA Read（早期 GPU 不支持）
+```
+
+**关键环境变量**：
+
+```bash
+# 显式控制 transport 选择
+NCCL_NET=IB                  # 强制 IB（不允许 fallback 到 socket）
+NCCL_IB_HCA=mlx5_0:1,mlx5_1:1   # 指定哪些 HCA + port，避免错绑
+NCCL_IB_GID_INDEX=3          # RoCEv2 GID（看 show_gids 输出）
+NCCL_IB_TIMEOUT=23           # IB QP timeout 指数（22 ≈ 4s，23 ≈ 8s）
+NCCL_IB_RETRY_CNT=7          # 重试次数
+
+# GDR
+NCCL_NET_GDR_LEVEL=PIX       # 严格只在最近 PCIe topology 用
+NCCL_NET_GDR_READ=1          # H100+ 默认开
+
+# 多 rail
+NCCL_NSOCKS_PERTHREAD=4      # 每 thread 多少个 socket（fallback 路径）
+NCCL_SOCKET_NTHREADS=4
+
+# 调试
+NCCL_DEBUG=INFO
+NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,COLL
+NCCL_TOPO_DUMP_FILE=/tmp/topo.xml
+```
+
+**生产 checklist**：作业启动时 NCCL 日志必须显示：
+- `NET/IB : Using ...` 而不是 `NET/Socket`（否则 fallback 了）
+- 每个 rank 选择了预期的 HCA 和 port
+- `NCCL INFO Channel xx -> ...` 显示多 channel + 多 rail
+- 没有 `NCCL WARN`
+
+#### 5c.2.9 SHARP：交换机内做 reduce，让 AllReduce 跳过 ring
+
+**SHARP（Scalable Hierarchical Aggregation and Reduction Protocol）** 是 Mellanox/NVIDIA 高端 IB 集群的关键加速器，章节前面完全没提。它的核心想法是：**让 NVSwitch / IB switch 内部做 reduce 操作**，AllReduce 不再是端到端 ring，而是 in-network aggregation。
+
+**传统 ring AllReduce vs SHARP AllReduce**：
+
+```text
+传统 ring（N 个 rank，message size M）:
+  通信量: 2 × (N-1)/N × M per rank
+  时间: 2 × (N-1) × (alpha + M/N/B)  [alpha 是延迟，B 是带宽]
+  瓶颈: 最慢链路 + 串行 ring 距离
+
+SHARP（同样 N 个 rank）:
+  rank 把数据 SEND 到本地 leaf switch
+  leaf switch 做 reduce 后 SEND 到 spine switch
+  spine 做最终 reduce 后 BROADCAST 回各 leaf 再到 rank
+  通信量: ~M per rank（接近最优）
+  时间: 2 × log(N) × (alpha + M/B)
+  瓶颈: 网络 hop 数 + switch 内 ALU 速度（不再是 ring 距离）
+```
+
+**SHARP 性能优势**（NVIDIA 公开数据 + 实测口径）：
+
+| 集群规模 | message size | ring AllReduce | SHARP AllReduce | 加速 |
+|---|---|---|---|---|
+| 8 GPU | 16MB | ~50 μs | ~30 μs | 1.7× |
+| 64 GPU | 16MB | ~120 μs | ~50 μs | 2.4× |
+| 512 GPU | 64MB | ~3 ms | ~0.8 ms | 3.7× |
+| 4096 GPU | 1GB | 50-100 ms | 15-25 ms | 3-5× |
+
+集群越大、ring hop 越多，SHARP 优势越大。这是为什么 NVIDIA SuperPOD / DGX H100 Cluster 默认开启 SHARP。
+
+**两代 SHARP**：
+
+| 版本 | 支持位置 | 限制 |
+|---|---|---|
+| **SHARPv1** | IB switch ASIC 内的 reduction tree | 每集群一棵 tree，多 job 抢资源 |
+| **SHARPv2** | Quantum-2 / Quantum-X800 switches | 支持多 stream（多 job 并发 reduce）+ 32-bit float native + reproducibility |
+| **NVLink SHARP** | NVSwitch (H100/B200 时代) | 节点内 / NVL72 内 reduce，不需要走 IB |
+
+**SHARP 启用条件**：
+
+- 硬件：Mellanox Quantum / Quantum-2 / Quantum-X800 IB switch + ConnectX-6/7 HCA
+- 软件：HPC-X / NCCL ≥ 2.7 + SHARP daemon (sharpd) 在 SM 上运行
+- 配置：NCCL `NCCL_COLLNET_ENABLE=1` 触发 SHARP 路径
+- 调度：作业必须在同一 partition 内（SHARP tree 是 partition-bound）
+
+**调试**：
+
+```bash
+# 看 SHARP 是否被 NCCL 启用
+NCCL_DEBUG=INFO ./nccl-test 2>&1 | grep -i sharp
+# 应看到 "Connected SHARP rank xx, switch_lid xx, switch_qp xx"
+
+# SHARP daemon 状态
+systemctl status sharp_am
+sharp_am --status
+
+# SHARP tree 信息
+sharp_am --show-trees
+```
+
+**何时 SHARP 不生效**：
+
+- 跨 partition 训练（job 跨多个 SHARP tree）
+- 算子不被 SHARP 支持（FP32/BF16/FP16 + sum/max/min OK；FP8 看版本）
+- message 太小（< 8KB，setup 开销 > 收益）
+- NCCL 自动判断 ring 更优（小集群 + 大 message）
+
+#### 5c.2.10 Adaptive Routing：包级动态选路避免热点
+
+InfiniBand 默认是 **deterministic routing**（路由表确定的），同一对 src/dst 永远走同一条路径。这导致一个问题：当多个大 job 的流量哈希到同一组路径时，spine 链路会拥塞而其他链路空闲，整个 fabric 看起来"不够带宽"，实际只是路径分配不均。
+
+**Adaptive Routing（AR）的核心**：交换机按出口队列深度动态选路。同一对 src/dst 的不同包可能走不同 spine，避免单点拥塞。
+
+```text
+传统 deterministic routing:
+  src → leaf1 → spine_A (固定) → leaf2 → dst
+  spine_A 拥塞时无能为力
+
+AR:
+  src → leaf1 → 出口选择 = argmin(queue_depth) 在 [spine_A, spine_B, spine_C, ...]
+  负载自动均衡到所有可用 spine
+```
+
+**AR 的工程代价**：
+
+- **out-of-order delivery**：同一连接的包可能不按发送顺序到达。RDMA RC 模式严格要求顺序，必须有 NIC + switch 协作的 reorder 机制（Mellanox SHIELD）。
+- **不是所有 fabric 都支持**：需要 Quantum 系列 switch + ConnectX-6/7 + 适当 firmware；老 fabric 用 deterministic。
+
+**SHIELD（Self-Healing Interconnect Enhancement for inteLligent Datacenters）**：
+
+让 NIC 在收到 out-of-order 包时按 PSN（Packet Sequence Number）重组，对应用透明。配合 AR 使用。
+
+**配置（Mellanox UFM / OpenSM）**：
+
+```bash
+# OpenSM 配置 AR
+opensm --enable_quirks
+# /etc/opensm/opensm.conf:
+adaptive_routing_disable FALSE
+# 重启 opensm
+
+# 验证 AR 启用
+ibdiagnet --routing  
+# 看输出中 "Adaptive routing enabled" / "AR groups"
+```
+
+**SHARP + AR 是大集群标配**：千卡以上的 IB 训练集群应该同时启用。NVIDIA SuperPOD / DGX SuperCluster 默认配置；自建集群如果只有基础 OpenSM + deterministic routing，64 卡以上 NCCL AllReduce 性能会显著低于 datasheet。
+
+**故障模式**：
+
+| 现象 | 根因 | 排查 |
+|---|---|---|
+| AllReduce 大 message 性能远低于预期，但单 rail `ib_write_bw` 正常 | spine 拥塞，没有 AR | `ibdiagnet --routing` 看是否 deterministic |
+| 启用 AR 后 RDMA RC 报 PSN 错误 | SHIELD 没启用或 NIC firmware 不支持 | 升级 firmware；或 fallback deterministic |
+| SHARP daemon 报 tree 不可用 | switch firmware 没启用 SHARP / SM 不是 SHARP-aware | 检查 switch firmware；用 UFM SM 替代 OpenSM |
+
 ### 5c.3 NCCL collective 的数据路径
 
 NCCL 给框架提供的是 collective API，但底层会根据拓扑、消息大小、GPU 数、NIC 数、环境变量和版本选择算法。平台工程师不一定要手写 NCCL，但必须能把它的路径画出来。
