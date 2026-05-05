@@ -1424,6 +1424,65 @@ DDP full checkpoint
 - 训练 CP/SP：通常不改变权重 shape，但要确认 position encoding、rope scaling、long context metadata 进入推理 config。
 - 训练 EP：推理 router、expert placement、capacity 和 quantization 都要兼容。
 
+### 8.5 推理侧 Checkpoint 转换机制
+
+训练 checkpoint 到推理 runtime 的转换是生产最后一公里，也是最常踩坑的环节。
+
+**TP 转换：Column parallel 和 Row parallel 的拼接方向不同**
+
+```text
+Column parallel（Q/K/V projection，FC1 output dim 切分）：
+  merge：torch.cat(shards, dim=0)      ← 沿 output dim 拼接
+  reshard（训练 TP=8 → 推理 TP=4）：torch.chunk(merged, 4, dim=0)
+
+Row parallel（attention output proj，FC2 input dim 切分）：
+  merge：torch.cat(shards, dim=1)      ← 沿 input dim 拼接
+  reshard：torch.chunk(merged, 4, dim=1)
+
+常见错误：对 Row parallel 层用 dim=0 拼接 → 权重 shape 正确但含义错误 → loss 正常但 logit 质量下降。
+验证方法：对 10 个 token 比较训练推理 logit 相对差，阈值 < 1e-3（BF16）。
+```
+
+**PP 转换（flatten）：必须知道 layer-to-stage 映射**
+
+```text
+训练 checkpoint 目录结构（PP=4，每 stage 20 层）：
+  ckpt/stage0/model.pt  → layers 0-19
+  ckpt/stage1/model.pt  → layers 20-39
+  ckpt/stage2/model.pt  → layers 40-59
+  ckpt/stage3/model.pt  → layers 60-79
+
+flatten 步骤：
+  1. 读取 parallel_metadata.json，确认 layer-to-stage 映射
+  2. 按 layer_id 顺序合并：full_model = [stage0_layers, stage1_layers, ...]
+  3. 重命名 key（Megatron layer.{i} → HuggingFace model.layers.{i}）
+
+tied embedding（首尾 stage 共享）：
+  - 训练时 embedding 在 stage 0，LM head 在 stage N-1
+  - merge 时只取 stage N-1 的 LM head weight（两者 gradient 更新历史可能略有差异）
+  - 或显式校验两者 cosine similarity > 0.9999 后取均值
+```
+
+**常用工具链**
+
+| 工具 | 用途 | 适用场景 | 注意事项 |
+|---|---|---|---|
+| Megatron `tools/checkpoint/convert_checkpoint.py` | TP/PP reshape，导出 HuggingFace 格式 | Megatron 训练 checkpoint | tied embedding 需要单独验证 |
+| DeepSpeed `zero_to_fp32.py` | ZeRO-3 checkpoint 聚合为完整 FP32 权重 | DeepSpeed ZeRO-3 | 不处理 TP/PP，需先聚合再做 TP/PP 转换 |
+| HuggingFace `from_pretrained` + `save_pretrained` | HuggingFace 格式互转 | 标准 HuggingFace 模型 | 需要对应的 `modeling_xxx.py` 支持并行格式 |
+| vLLM `convert_megatron_checkpoint.py`（社区） | Megatron → vLLM 可读格式 | vLLM 部署 | 社区维护，稳定性不一，需要版本锁定 |
+
+**推理转换 preflight 流程**
+
+```text
+1. 保存训练 checkpoint（包含 parallel_metadata.json）
+2. 运行 convert_checkpoint.py（或等价工具），指定目标 TP/PP
+3. 用推理 runtime 加载转换后权重，对 10-100 个 prompt 做 logit 对比（vs 训练推理 forward）
+4. 确认 logit 最大绝对差 < 1e-2（BF16 容忍范围）
+5. 如有 tied embedding，显式验证 embed_tokens.weight == lm_head.weight（或 cosine > 0.9999）
+6. 在 preflight gate 中记录转换工具版本、权重 hash 和 logit diff 最大值
+```
+
 ---
 
 ## 9. Worked Example：70B 并行策略设计
