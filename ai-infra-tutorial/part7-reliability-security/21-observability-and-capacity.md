@@ -265,6 +265,47 @@ $$
 
 即至少需要 3 张 GPU，而且这还没算冗余和峰值抖动。
 
+#### 21.5.1 prefill / decode 分离建模（LLM serving 必做）
+
+> [!DANGER]
+> **上面的单 R 公式在 LLM serving 上经常严重失真**：prefill 和 decode 的 GPU 时间消耗特性完全不同。prefill 是 compute-bound（全 prompt 一次性吃 GEMM 算力），decode 是 memory-bandwidth-bound（每 token 把权重 + KV 全扫一遍）。同一张 H100 上，prefill 可以达到 30K-50K tokens/s，decode 在 batch=1 时只有 50-100 tokens/s（差距 300-1000×）。如果用平均 R 算容量，长 prompt + 长输出场景会严重低估，短 prompt + 短输出会严重高估。
+
+**正确做法**：拆成 `prefill_gpu_seconds` + `decode_gpu_seconds` 两条独立账本，再求和：
+
+$$
+\text{prefill\_gpu\_seconds\_per\_req} = \frac{T_{\text{prompt}}}{R_{\text{prefill}}}
+$$
+
+$$
+\text{decode\_gpu\_seconds\_per\_req} = \frac{T_{\text{output}}}{R_{\text{decode}}}
+$$
+
+$$
+\text{gpus required} \approx \frac{Q \times (\text{prefill\_gpu\_seconds\_per\_req} + \text{decode\_gpu\_seconds\_per\_req})}{\text{target utilization}}
+$$
+
+其中：
+- $R_{\text{prefill}}$：prefill 阶段单 GPU tokens/s（compute-bound，受 batch 影响小，可由 vLLM/SGLang benchmark 给出，典型 H100 BF16 dense LLaMA-70B 约 25K-50K tokens/s）
+- $R_{\text{decode}}$：decode 阶段单 GPU tokens/s（memory-bandwidth-bound，强依赖 continuous batching 的并发数；同样 LLaMA-70B 在 batch=1 约 80-120 tokens/s，batch=32 约 1500-3000 tokens/s）
+
+#### 21.5.2 完整算例：vs 单 R 公式的差异
+
+| 场景 | $T_{\text{prompt}}$ | $T_{\text{output}}$ | $Q$ | 单 R 公式估算 | prefill/decode 分离估算 | 误差 |
+|---|---:|---:|---:|---:|---:|---|
+| 短问答（chatbot） | 200 | 100 | 50 QPS | 1.8 GPU | 1.6 GPU | 单 R 略高估 13% |
+| **长 RAG（典型）** | 8000 | 500 | 10 QPS | 10.1 GPU | **5.6 GPU** | **单 R 高估 80%**（prefill 强大批化吸收了 8K 长 prompt 成本） |
+| **长输出（reasoning）** | 500 | 8000 | 5 QPS | 5.1 GPU | **18.2 GPU** | **单 R 严重低估 72%**（decode 8K 是真实瓶颈） |
+| Agent 多轮 | 2000 + 工具 | 800 / 步 × 5 步 | 2 QPS | 1.4 GPU | 4.8 GPU | 单 R 低估 71%（多步累积 decode） |
+
+> [!WARNING]
+> **真实 LLM 业务的 prompt / output 长度分布几乎都是双峰甚至多峰**：90% 的请求 short-prompt + short-output，5-10% long-context（RAG / 文档总结）。容量规划必须**按桶分别建模**——把总流量切成 4-6 个 (prompt_len, output_len) 桶，每桶单独算 prefill/decode，再求和。否则少数 long-context 请求会把 P99 拉到 SLO 之外。
+
+> [!NOTE]
+> **vLLM / SGLang / TRT-LLM 提供 benchmark 工具**直接给出 $R_{\text{prefill}}$ 和 $R_{\text{decode}}$（vLLM `benchmark_serving.py`、SGLang `bench_serving.py`、TRT-LLM `gptManagerBenchmark`）。在自己环境里跑一次 benchmark 比从论文抄数字更准。Benchmark 必须用真实 prompt 长度分布，不要用 fixed length 否则严重失真。
+
+> [!TIP]
+> **Disaggregated Prefill-Decode 架构**（DistServe / Mooncake / Splitwise）让 prefill 和 decode 跑在不同 GPU 池，可以分别按 $R_{\text{prefill}}$ 和 $R_{\text{decode}}$ 独立调容量。详见 §15.6 + Ch 16a §16a.6。如果你的业务 prompt/output 比例极不均衡（如 RAG 8000:500 或 reasoning 500:8000），disaggregated 比 collocated 容量利用率更高。
+
 ### 为什么要留余量
 
 如果你把容量设计到刚好够平均流量，一旦出现：

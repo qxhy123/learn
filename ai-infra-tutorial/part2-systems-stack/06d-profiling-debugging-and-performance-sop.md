@@ -412,7 +412,7 @@ ncu --set default \
 > **`ncu --set full` 的 overhead**：`illustrative workload label`：单 kernel replay profiling，shape=目标 kernel 的 5-10 次 launch 窗口，核对日期 `2026-05-05`；每个被采样的 kernel 会被 replay 多次以收集所有计数器，单 kernel 时间可能放大 **5-50×**。生产 step 上跑 full set 会让 step time 飙升甚至超时被 driver kill。规则：(1) 用 `--launch-skip` 跳过 warmup，(2) 用 `--launch-count` 限制采样数（通常 5-10），(3) 用 `--kernel-name` 只采目标 kernel，(4) 在专用 profile job 上跑而不是生产训练。
 
 > [!TIP]
-> **Nsight Compute `--set` 选项**：NVIDIA Nsight Compute CLI 公开文档包含 `default`、`detailed`、`full`、`roofline` 等 section set；括号内 overhead 只能作为 `illustrative` 经验量级：`default`（轻量，~5×）、`detailed`（中量，~10×）、`full`（全量，~30×）、`roofline`（含 Roofline 模型，~20×）。先 default 看大方向，需要时再 full。
+> **Nsight Compute `--set` 选项**：`source label = NVIDIA-public-doc + illustrative overhead`，核对日期 `2026-05-05`，workload shape=单 kernel replay profiling、目标 kernel 的 5-10 次 launch 窗口。NVIDIA Nsight Compute CLI 公开文档包含 `default`、`detailed`、`full`、`roofline` 等 section set；括号内 overhead 只能作为 `illustrative` 经验量级：`default`（轻量，~5×）、`detailed`（中量，~10×）、`full`（全量，~30×）、`roofline`（含 Roofline 模型，~20×）。先 default 看大方向，需要时再 full。
 
 不要一看到 launch 稀疏就立刻手写 CUDA kernel。更常见、更稳的路线是：删掉热路径里的同步和 Python 小逻辑，启用 `torch.compile`，使用 FlashAttention / fused optimizer / fused norm 等成熟实现，最后才考虑自定义算子。
 
