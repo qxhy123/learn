@@ -765,6 +765,44 @@ torchrun \
 DP = world_size / (TP * PP * CP) = 128 / (8 * 4 * 1) = 4
 ```
 
+**FP8 / Transformer Engine 配置（H100/H800/Blackwell）**
+
+H100 及后续架构支持 FP8 训练，通过 NVIDIA Transformer Engine（TE）实现。与并行策略的交互点：
+
+```bash
+# Megatron + Transformer Engine FP8 关键参数
+torchrun ... pretrain_gpt.py \
+  ...
+  --fp8-format hybrid \               # E4M3 forward，E5M2 backward
+  --fp8-amax-compute-algo max \       # amax 计算方式
+  --fp8-amax-history-len 16 \         # 滑动窗口长度
+  --transformer-impl transformer_engine  # 启用 TE kernel
+```
+
+**FP8 与 TP 的交互：scaling factor 同步**
+
+```text
+FP8 per-tensor scaling factor 在 TP 内所有 rank 必须相同：
+  - TP 把一个逻辑 tensor 切成多份，scaling 必须对应同一逻辑 amax
+  - Transformer Engine 通过 TP group 内 allreduce amax 自动同步
+  - 生产配置必须确认 TE 版本支持目标 TP size 的 amax allreduce
+
+FP8 checkpoint 额外状态：
+  - 每层有 amax_history（默认 16 步滑动窗口）和 scale factor
+  - FSDP/ZeRO checkpoint 需包含这些 metadata，否则 FP8 scale 冷启动
+  - 冷启动不影响正确性，但导致训练初期 loss 不稳定（scale 收敛过程）
+```
+
+**FP8 与 PP 的交互：stage 边界 activation dtype**
+
+```text
+PP send/recv 的 activation 可用 BF16 或 FP8：
+  - BF16（默认）：精度安全，占用 2× 带宽
+  - FP8（显式开启）：带宽减半，但引入量化误差积累风险
+
+生产建议：PP 边界 activation 默认 BF16；仅在带宽严重不足且 FP8 量化误差经过验证后才使用 FP8 send/recv。
+```
+
 配置审查要点：
 
 - `hidden-size`、`num-attention-heads`、KV heads 必须能被 TP 整除。
@@ -1299,8 +1337,9 @@ flowchart TD
 | CP | 新实现差异大 | Ulysses/Ring 相关实现 | 非主轴 | attention kernel、mask、position |
 | FSDP/ZeRO | Megatron distributed optimizer | ZeRO 成熟 | FSDP 原生 | checkpoint schema、param naming |
 | EP | Megatron MoE fork | MoE 支持依版本 | 非主轴 | All-to-All、load balance |
+| FP8（via TE） | 强（TE 原生） | 视 TE 集成版本 | 有限（需外部 TE wrapper） | TP amax 同步、PP 边界 dtype、checkpoint amax history |
 
-选型时不要只问“框架有这个参数吗”，要验证：
+选型时不要只问”框架有这个参数吗”，要验证：
 
 - 是否支持目标模型结构；
 - 是否支持目标 dtype / FP8 / Transformer Engine；
@@ -1669,6 +1708,9 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 - [ ] SP/CP attention kernel、mask、position encoding 已验证。
 - [ ] FSDP/ZeRO wrap 粒度与 layer/stage 边界一致。
 - [ ] FP8/BF16/Transformer Engine 与并行策略兼容。
+- [ ] FP8 训练时确认 TE 版本支持 TP size 的 amax allreduce。
+- [ ] FP8 checkpoint 包含 amax_history 和 scale factor；恢复后验证 scale 不重置。
+- [ ] PP stage 边界 activation dtype 已明确（默认 BF16）。
 
 ### 13.4 性能
 
