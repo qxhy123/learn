@@ -358,6 +358,232 @@ AI 事故常见表现包括：
 
 不对。很多系统还要同时回滚配置、索引、prompt 和路由规则。
 
+### 22.7.1 Argo Rollouts / Flagger 实际工作机制
+
+章节推荐"用 Argo Rollouts 做灰度"，但**它怎么实现 traffic split、怎么自动判断 metric、怎么 promote/rollback** 没讲。理解这些机制，灰度才能从"运行就行"变成"可解释、可调试"。
+
+**Argo Rollouts 基本结构**：用 `Rollout` CRD 替代 Deployment，引入 `strategy.canary` 声明式描述灰度阶段：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: llm-router
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      canaryService: llm-router-canary
+      stableService: llm-router-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: llm-router-vs
+      steps:
+        - setWeight: 1                  # 1% 流量到 canary
+        - pause: {duration: 10m}
+        - analysis:                     # 跑指标分析
+            templates:
+              - templateName: success-rate
+              - templateName: ttft-p95
+        - setWeight: 5
+        - pause: {duration: 30m}
+        - analysis:
+            templates:
+              - templateName: success-rate
+              - templateName: ttft-p95
+              - templateName: ttft-p99
+        - setWeight: 25
+        - pause: {duration: 1h}
+        - setWeight: 100
+```
+
+**traffic split 实现机制**：
+
+| TrafficRouting 后端 | 怎么改流量比例 |
+|---|---|
+| **Istio** | controller patch `VirtualService.spec.http[].route[].weight`，Istio Pilot 推送给 Envoy sidecar |
+| **SMI TrafficSplit** | controller 改 `TrafficSplit.spec.backends[].weight`，Linkerd/其他 mesh 实现 |
+| **nginx-ingress** | controller 改 Ingress annotation `nginx.ingress.kubernetes.io/canary-weight: "5"` |
+| **ALB Ingress** | controller 改 ALB target group weight |
+| **Service mesh agnostic** | 通过 Service `selector` 调整 stable/canary Pod 数量比例（粒度粗，不推荐生产）|
+
+**Analysis Template（自动判断 metric）**：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: ttft-p95
+spec:
+  metrics:
+    - name: ttft-p95
+      interval: 1m
+      successCondition: result[0] < 1500          # P95 < 1500ms
+      failureLimit: 3                              # 连续 3 次失败就 fail
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            histogram_quantile(0.95,
+              sum(rate(llm_ttft_seconds_bucket{
+                service="llm-router",
+                version="canary"
+              }[2m])) by (le)
+            ) * 1000
+```
+
+**自动 promote / rollback 逻辑**：
+
+```text
+controller 主循环:
+  每 10s reconcile:
+    检查当前 step:
+      - setWeight: patch trafficRouting，进入下一步
+      - pause: 等 duration 或人工 promote
+      - analysis: 启动 AnalysisRun
+    
+  AnalysisRun 内部:
+    每 metric.interval:
+      跑 Prometheus query → result
+      检查 successCondition / failureCondition
+      累计 inconclusive / successful / failed 次数
+    
+    达到 failureLimit → 标记 Failed → 触发 abort
+    达到 successfulRunHistoryLimit → 标记 Successful → 进入下一步
+  
+  Failed 时:
+    自动 setWeight: 0 (canary 摘流量)
+    回退到 stable 版本（pod 已经存在，立即生效）
+    标记 Rollout status: Aborted
+```
+
+**Flagger 的差异**：
+
+- Flagger 是 **service mesh native**（Istio/Linkerd/AppMesh/Contour），不支持 ingress controller。
+- Flagger 自己创建 primary 和 canary Deployment（不像 Rollouts 用一个 Rollout 资源管所有 Pod）。
+- Flagger 内置 load test webhook（在分析期间主动打流量到 canary，让 metric 有足够样本）。
+- Flagger 的 metric provider 选择更多：Prometheus、Datadog、New Relic、CloudWatch。
+
+**生产实战要点**：
+
+- **AnalysisTemplate 的 query 必须按 version label 区分**：`{version="canary"}` vs `{version="stable"}`——Pod 必须打这个 label，否则全局 metric 看不出 canary 退化。
+- **failureLimit 不能太低**：Prometheus rate window + scrape lag 可能让单点测量噪声大。建议 `interval: 1m` + `failureLimit: 3-5`，给 3-5 分钟才决策 abort。
+- **`pause` 阶段必备**：让流量进入新副本后稳态再 analyze，不能立刻 setWeight 然后立刻 query。
+- **多 metric AND 还是 OR**：默认 AND（所有 metric 都要 success）。要 OR 必须用 Argo Rollouts 的 `metricsTemplates` 嵌套或写一个 composite metric。
+- **流量分桶 vs sticky session**：mesh weight 是 per-request 随机，每个用户每次请求可能落到不同版本——对话场景这会导致用户体验不一致。需要 mesh + header-based routing（如 `consistent-hash` on `user_id`）。
+
+**与 LLM serving 的特殊配合**：
+
+- LLM 推理副本冷启动慢（权重加载 1-3min）。`pause` duration 要包含冷启动时间。
+- LLM canary 副本数太少（如 2 个）时 Prometheus rate 噪声大，建议 canary 至少 3-5 个副本才做 analysis。
+- LLM 推理 metric 通常需要更长 window（5-10min）才稳定，`interval: 1m` 偏短。
+
+### 22.7.2 LLM-as-judge 的偏差与校准
+
+章节推荐"用 LLM-as-judge 做质量评测"，但**LLM-as-judge 自己有哪些已知偏差、怎么校准**没讲。直接用 GPT-4 当 judge 不做校准是常见错误，结论可能偏向系统性。
+
+**主要偏差**：
+
+| 偏差 | 表现 | 严重程度 |
+|---|---|---|
+| **Position bias** | 让 judge 比较 (A, B) 时偏好第一个或最后一个，不论实际质量 | 严重——很多 judge 偏好第一个 60-70% |
+| **Verbosity bias** | 偏好更长的回答，即使内容差 | 中——简单 prompt 缓解 |
+| **Self-preference bias** | 用 GPT-4 当 judge 评 GPT-4 输出，得分系统性高于其他 model | 严重——同 family 模型不能互评 |
+| **Authority bias** | 偏好声明权威的回答（"作为专家..."）| 中 |
+| **Sycophancy** | judge 可能配合 prompt 暗示而非客观评判 | 严重——不能把"哪个更好"暗示放 prompt |
+| **Refusal asymmetry** | judge 可能偏好不拒答的版本，即使拒答更安全 | 严重——安全场景必须人工校准 |
+
+**Position bias 的校准方法**：
+
+```python
+# 错误方式：单方向比较
+score_A_vs_B = judge.compare(question, response_A, response_B)
+# response_A 在 prompt 里出现在 response_B 之前
+# → judge 系统性偏好 response_A
+
+# 正确方式：双向比较
+def fair_compare(question, A, B):
+    s_AB = judge.compare(question, A, B)  # A 在前
+    s_BA = judge.compare(question, B, A)  # B 在前
+    
+    if s_AB == "A wins" and s_BA == "B wins":
+        return "tie"  # judge 仅按位置选——结果不可信
+    if s_AB == "A wins" and s_BA == "A wins":
+        return "A wins"  # 两次方向都选 A，可信
+    ...
+```
+
+实测：双向比较后 30-40% 的"获胜"会变成 tie，说明这部分判断完全是 position bias。生产中 judge benchmark 的 win-rate 数字必须用双向校准过的。
+
+**Verbosity bias 校准**：
+
+```python
+# Prompt 中显式约束
+JUDGE_PROMPT = """
+评估以下两个回答。注意：**不要**因为某个回答更长就偏好它。
+更长不等于更好——评估应基于 correctness、relevance 和 conciseness。
+
+Question: {question}
+Response A: {A}
+Response B: {B}
+
+哪个更好？回答 A、B 或 tie。
+"""
+```
+
+或用 length-controlled judge：把两个回答 truncate 到相近长度再比较。
+
+**Self-preference bias 防范**：
+
+- **judge 模型与生产模型不同 family**：用 Claude 评 GPT-4 输出、用 GPT-4 评 Claude 输出。
+- **多 judge ensemble**：用 3 个不同 family 的 judge，多数投票。
+- **避免自我评价**：不要让模型评自己的输出（即使临时跑实验）。
+
+**Calibration（校准 judge 与人工标注一致性）**：
+
+```text
+1. 抽 500 条业务真实样本（覆盖各场景）
+2. 人工标注：response_A vs response_B 哪个更好
+3. 用 judge 跑同样的样本对
+4. 算 agreement rate：
+   - human-judge agreement: 人工和 judge 一致的比例
+   - cohen's kappa: 排除偶然一致后的一致性系数
+5. 阈值：
+   - kappa > 0.6: judge 可用作初筛
+   - kappa > 0.8: judge 可用作主判断（仍要抽样 5% 人工复核）
+   - kappa < 0.4: judge 不可信，找别的判断方法
+```
+
+**校准频率**：每月跑一次 calibration 样本（覆盖新业务变化），kappa 下降 > 0.1 时重新设计 judge prompt 或换 judge 模型。
+
+**生产 judge 设计 checklist**：
+
+- judge prompt 使用最新 best practices（chain-of-thought、给 judge 足够 reasoning 空间、明确 rubric）。
+- Position 双向校准是默认行为，不是可选项。
+- judge 模型与生产模型不同 family。
+- 定期用人工标注校准（kappa > 0.6 才 ship）。
+- judge 结果只作为 P50 quality 信号，不作为 P99 安全信号——后者必须人工。
+- safety / refusal 类判断不能完全靠 judge——judge 自己的 refusal asymmetry 会偏差。
+
+**与灰度结合**：
+
+```yaml
+# Argo Rollouts AnalysisTemplate
+- name: judge-quality
+  interval: 30m                   # judge 调用贵，跑得疏
+  successCondition: result[0] >= 0.55   # judge win rate >= 55%（接近 tie 通过）
+  failureCondition: result[0] < 0.45    # < 45% 视为退化
+  provider:
+    web:
+      url: http://judge-service/canary-vs-stable
+      method: POST
+      jsonBody: '{"window": "30m", "samples": 100}'
+      jsonPath: "{$.win_rate}"
+```
+
+注意 successCondition 不应该是 "> 0.5"——judge 噪声 + position bias 残留让 50/50 是合理 baseline，要求"显著优于 stable"才通过会过严。
+
 ## 本章涉及的常见工具
 
 | 概念 | 常见工具 / 命令 | 备注 |

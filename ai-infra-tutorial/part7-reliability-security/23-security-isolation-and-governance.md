@@ -193,6 +193,186 @@ Secrets 管理最常见的事故不是“加密算法失效”，而是流程太
 - 环境变量不是绝对禁止，但不适合作为高价值长期凭据的默认通道。短生命周期、低权限、单 Pod 使用的 token 可以临时用环境变量承载，但必须配合日志脱敏和 TTL。
 - 训练 Job 只应拿到访问当前数据集、当前模型仓库和当前对象前缀的最小权限；跨租户聚合、账单、审计由平台服务代办。
 
+#### Vault 实际怎么工作
+
+章节多次推荐 Vault 但**Vault 自己怎么工作**没讲。理解这个，"为什么用了 Vault 还泄密"、"动态 secret 怎么真正自动 revoke" 才有答案。
+
+**核心组件**：
+
+```text
+┌─────────────────────────────────────────┐
+│            Vault Server                  │
+│  ┌─────────────────────────────────────┐ │
+│  │ API (HTTP)                          │ │
+│  ├─────────────────────────────────────┤ │
+│  │ Auth Methods    │ Secret Engines    │ │
+│  │ - kubernetes    │ - kv-v2 (静态)    │ │
+│  │ - approle       │ - database (动态) │ │
+│  │ - jwt/oidc      │ - pki (证书)      │ │
+│  │ - aws iam       │ - transit (加密)  │ │
+│  ├─────────────────────────────────────┤ │
+│  │ Policies (HCL)                      │ │
+│  │ - 谁能访问哪些 path、哪些操作       │ │
+│  ├─────────────────────────────────────┤ │
+│  │ Storage Backend (encrypted)         │ │
+│  │ - Raft / Consul / etcd              │ │
+│  └─────────────────────────────────────┘ │
+│         ↑ Master Key (由 Unseal Keys 解) │
+└─────────────────────────────────────────┘
+```
+
+**Auth Methods（怎么向 Vault 证明身份）**：
+
+| Method | 适用 | 流程 |
+|---|---|---|
+| **Kubernetes** | K8s Pod | Pod 用挂载的 ServiceAccount JWT 调 Vault `/v1/auth/kubernetes/login`，Vault 用 K8s TokenReview API 验签 → 返回 Vault token |
+| **AppRole** | CI/CD、传统 VM | role_id（半公开）+ secret_id（机密，每次轮换）换 Vault token |
+| **JWT/OIDC** | OAuth 集成 | 把第三方 IdP 的 JWT/OIDC token 换 Vault token |
+| **AWS/Azure/GCP IAM** | 云上 workload | 用 cloud metadata service 的 instance identity 换 Vault token |
+
+**Secret Engines（实际存/产 secret）**：
+
+- **kv-v2**：版本化 KV 存储，put/get；数据存 Vault storage backend（加密）。
+- **database**：**动态 secret** 杀手级场景。配置数据库 admin 凭据后，每次请求 `/v1/database/creds/<role>` Vault **现场创建**一个临时数据库账号（用配置的 SQL template），返回 username+password 给 client，并把这个账号绑定到一个 lease。
+- **pki**：动态签发 X.509 证书；典型 mTLS 用。
+- **transit**：加密即服务，client 把数据发给 Vault encrypt/decrypt，密钥永远不离开 Vault。
+
+**Lease & TTL —— 动态 secret 的回收机制**：
+
+```text
+client 请求 database creds:
+  POST /v1/database/creds/llm-readonly
+  
+Vault 响应:
+  {
+    "lease_id": "database/creds/llm-readonly/abc123",
+    "lease_duration": 3600,     # 1 小时 TTL
+    "renewable": true,
+    "data": {
+      "username": "v-token-llm-r-x9f2",
+      "password": "..."
+    }
+  }
+
+Client 用这个账号 1 小时:
+  - 周期调 POST /v1/sys/leases/renew {lease_id} 续期（每 30 分钟）
+  - Vault 续期 → TTL 重置
+  
+Pod 退出 / 不再 renew:
+  - lease 到期，Vault 触发 revoke：DROP USER v-token-llm-r-x9f2
+  - 数据库账号自动消失，凭据失效
+```
+
+这就是动态 secret 的核心价值：凭据**和 client 生命周期绑定**，不需要轮换计划——退出即失效。生产建议所有可动态化的 secret（数据库、SSH、PKI）都用动态 engine，远比静态 KV 安全。
+
+**典型 Pod 注入路径（K8s 场景）**：
+
+| 方式 | 怎么工作 | 取舍 |
+|---|---|---|
+| **Vault Agent Injector** | mutating webhook 给 Pod 注入 vault-agent sidecar；sidecar 用 SA token 登录 Vault，把 secret 写到共享 emptyDir 文件 | 最贴近 Vault TTL 语义；secret 自动续期；但 Pod 多一个 sidecar 开销 |
+| **Vault CSI Provider** | Pod 用 CSI volume 挂载，CSI driver 调 Vault 拿 secret 写到 tmpfs | 不要 sidecar；通过 K8s Secret 同步可触发 Pod 重启 |
+| **Vault Secrets Operator (VSO)** | Operator watch CRD，从 Vault 拿 secret 同步到 K8s Secret | 最简单接入；缺点是仍依赖 K8s Secret 中转，TTL 语义弱 |
+
+**Seal/Unseal**：
+
+- Vault 启动后处于 **sealed** 状态，storage backend 加密，无法读 secret。
+- 必须用 **unseal key** 解 master key 才能 unseal。默认 Shamir secret sharing 5 把 unseal key，需 3 把才能 unseal。
+- 生产用 **auto-unseal**（AWS KMS / Azure Key Vault / GCP KMS），让 Vault 启动时用云 KMS 自动解，避免人工拿 unseal key。
+- **DR 演练必须包括 unseal**：备份恢复后 Vault 仍是 sealed 的，没有 unseal key 备份等于数据丢失。
+
+**生产事故模式**：
+
+| 事故 | 原因 | 防御 |
+|---|---|---|
+| Pod 拿不到 secret 卡启动 | Vault Agent 启动慢于业务容器 | 用 init container 形式让 secret 就绪后再启动业务 |
+| 大量 Pod 同时启动打挂 Vault | 没限流 + auth 重 | Vault HA + Vault Agent caching；scale Pod 用滚动 |
+| Lease 到期但 client 没 renew | Renew loop bug 或网络 partition | 监控 `vault.expire.leases`；client 用 official Vault SDK |
+| Unseal key 丢失 | 团队成员离职没交接 | unseal key 多人备份 + auto-unseal 主用人工备份 |
+
+#### K8s Secret 在 etcd 中的实际存储
+
+章节说"K8s Secret 不等于完整 Secret 管理"，但**etcd 怎么存 Secret、kubelet 怎么注入 Pod**没讲。这是 senior 必须懂的——很多团队以为 K8s Secret 已经"加密"了，实际上**默认是 base64 编码不是加密**。
+
+**默认行为**：
+
+```bash
+# 创建 Secret
+kubectl create secret generic db-creds --from-literal=password=hunter2
+
+# etcd 实际存储（直接拉 etcd 数据可见）：
+etcdctl get /registry/secrets/default/db-creds
+# > k8s\x00\n\f\n\x02v1\x12\x06Secret\x12...
+# >   "data": {"password": "aHVudGVyMg=="}    ← base64("hunter2")
+```
+
+**任何拿到 etcd 备份的人都能直接读所有 Secret**——base64 不是加密。这是为什么 etcd 备份必须严格保护、etcd 部署必须独立网络。
+
+**encryption-at-rest 配置（生产必需）**：
+
+```yaml
+# /etc/kubernetes/encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:                    # 或 aesgcm（更现代）/ secretbox / kms
+          keys:
+            - name: key1
+              secret: <32-byte base64 key>
+      - identity: {}               # fallback：未加密
+```
+
+API Server 启动加 `--encryption-provider-config=...`，之后写入的 Secret 加密；但**已存在的 Secret 仍是明文**——必须 `kubectl get secrets -A -o json | kubectl replace -f -` 触发重写。
+
+更安全的方案是 **KMS provider**：
+
+```yaml
+providers:
+  - kms:
+      name: aws-kms
+      endpoint: unix:///var/run/kmsplugin/socket.sock
+      cachesize: 1000
+      timeout: 3s
+```
+
+这样加密密钥本身在 AWS KMS / GCP KMS / HSM 里，etcd 数据 + API Server 配置都不含密钥。代价：每次读 Secret 增加 KMS round-trip（KMS provider 缓存 DEK 缓解）。
+
+**kubelet 怎么把 Secret 注入 Pod**：
+
+```text
+1. Pod scheduled 到 node
+2. kubelet 调 API Server GET /api/v1/namespaces/<ns>/secrets/<name>
+   - 这一步 API Server 调 KMS decrypt，返回明文 Secret
+3. kubelet 在 node 上创建 tmpfs（内存文件系统，不落盘）
+4. 把 Secret 文件写到 tmpfs
+5. mount tmpfs 到容器的指定路径（如 /etc/secrets/）
+6. 容器读文件
+```
+
+**关键性质**：
+
+- Secret 在 node 上是 **tmpfs**（在内存，机器断电消失）——不会进 node disk。
+- kubelet 必须 watch Secret 变化以更新挂载——但**容器内进程不会 hot-reload**，需要 `inotify` 或 SIGHUP 触发应用重读。
+- envFrom Secret 在 Pod 启动时一次性读，**Secret 改了 Pod 不重启就用旧值**——这是 envFrom 的最大坑。
+- **Secret 通过 RBAC 授权读取**：service account 必须有 `get`/`list secrets` 权限才能挂载——默认情况下任何 Pod 的 SA 都能读同 namespace 的所有 Secret，需要严格 RBAC。
+
+**审计要点**：
+
+```yaml
+# Audit policy 必须把 secrets 资源标为 RequestResponse 级别
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+```
+
+这样每次 `get secrets` 都会写 audit log。如果发现某 SA 异常读 Secret，能立刻定位。
+
 ### 23.3 供应链安全不能忽略
 
 AI 平台往往依赖大量镜像、Python 包和系统库。常见问题包括：
@@ -331,6 +511,151 @@ RAG 特别容易出的问题包括：
 - 对模型、索引、镜像、prompt 模板都建立版本和责任归属
 - 把成本标签、权限标签、租户标签纳入平台元数据
 
+### 23.9.1 OPA、Gatekeeper、Kyverno 怎么把策略变成集群默认行为
+
+章节前面多次提"用 OPA Gatekeeper、Kyverno 做策略执行"，但这些工具实际怎么插进 K8s 控制路径、policy 失败时集群怎么响应，是 senior 必须懂的运行时细节。
+
+**K8s admission 链路**：
+
+```text
+kubectl create / API 请求
+   ↓
+API Server 认证 / 授权（RBAC）
+   ↓
+[1] MutatingAdmissionWebhook 链
+    按 webhook 顺序调用，每个可改对象（注入 sidecar、加 label、设默认值）
+    Webhook 是 HTTPS endpoint，API Server 发 AdmissionReview，webhook 返回 patch
+   ↓
+对象 schema 验证（CRD validation、OpenAPI schema）
+   ↓
+[2] ValidatingAdmissionWebhook 链
+    并行调用，只能 allow/deny（无 patch）
+    OPA Gatekeeper、Kyverno 的 policy violation 在这里返回 deny
+   ↓
+写 etcd
+```
+
+每个 webhook 在 API Server 中注册为一个 `ValidatingWebhookConfiguration` 或 `MutatingWebhookConfiguration` 资源：
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: gatekeeper-validating-webhook
+webhooks:
+  - name: validation.gatekeeper.sh
+    clientConfig:
+      service:
+        namespace: gatekeeper-system
+        name: gatekeeper-webhook-service
+        path: /v1/admit
+      caBundle: <base64>
+    rules:
+      - operations: ["CREATE", "UPDATE"]
+        apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*"]
+    failurePolicy: Fail        # webhook 不可达时怎么办
+    admissionReviewVersions: ["v1"]
+    timeoutSeconds: 3
+```
+
+**`failurePolicy` 的关键取舍**：
+- `Fail`（默认推荐）：webhook 不可达时 API Server **拒绝请求**。安全但 webhook 抖动 = 整个集群 admission 抖动。生产必须给 webhook 配 HA（≥2 replicas + PDB + readiness probe）。
+- `Ignore`：webhook 不可达时直接放行。policy 失效但集群可用。审计和合规场景**绝对不要**用 Ignore。
+
+**OPA Gatekeeper 的 Rego DSL**：
+
+OPA 用 **Rego** 语言写 policy。它是声明式逻辑编程：rule body 是 conjunction（所有条件都要成立），同名 rule 多次定义是 disjunction（任一成立即触发）。Gatekeeper 把 Rego policy 包装成 `ConstraintTemplate` + `Constraint` 两层 CRD。
+
+```rego
+# ConstraintTemplate 定义 policy 逻辑
+package k8sgpurequired
+
+violation[{"msg": msg}] {
+  input.review.kind.kind == "Pod"
+  container := input.review.object.spec.containers[_]
+  not container.resources.limits["nvidia.com/gpu"]
+  not has_exempt_label(input.review.object)
+  msg := sprintf("Container %v must declare nvidia.com/gpu limit",
+                 [container.name])
+}
+
+has_exempt_label(obj) {
+  obj.metadata.labels["gpu-exempt"] == "true"
+}
+```
+
+```yaml
+# Constraint 实例化 policy（指定生效范围、参数）
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sGpuRequired
+metadata:
+  name: require-gpu-limits
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces: ["ai-prod", "ai-staging"]
+  parameters:
+    exemptLabels:
+      - "gpu-exempt"
+```
+
+**Kyverno 的差异**：YAML-only DSL，不需要学新语言；同时支持 validation、mutation、generation；mutation 用 Kustomize 风格 strategic merge patch。
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-gpu-limits
+spec:
+  validationFailureAction: Enforce  # 或 Audit（只记录不阻断）
+  rules:
+    - name: check-gpu-resource
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["ai-prod"]
+      validate:
+        message: "Container must declare nvidia.com/gpu limit"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    "nvidia.com/gpu": "?*"
+```
+
+**OPA vs Kyverno 实际选择**：
+
+| 维度 | OPA Gatekeeper | Kyverno |
+|---|---|---|
+| 学习曲线 | 高（Rego 是新语言）| 低（K8s 工程师都会写 YAML）|
+| 表达能力 | 极强（图灵完备）| 中（针对 K8s 场景够用）|
+| Mutation 支持 | 有限（OPA 主要做 validation）| 强（YAML 原生）|
+| Generation | 不支持 | 原生支持（自动创建 NetworkPolicy 等）|
+| 可移植性 | 跨 K8s/Terraform/Envoy/CICD | K8s only |
+| 生态 | OPA 通用 policy 引擎，多产品集成 | K8s native |
+
+工程经验：
+
+- **新团队、policy 量少（<20 条）、纯 K8s 场景**：选 Kyverno，开箱即用。
+- **已有 OPA 体系、跨平台 policy（CICD + Terraform + Envoy）、复杂逻辑**：选 OPA Gatekeeper。
+- **policy violation 反馈链路**：违规时 `kubectl create` 报错信息来自 webhook 返回的 `message`，写得清楚才能让用户自助修复。
+- **观测必备**：`gatekeeper_violations` / `kyverno_admission_review_total` metrics 接 Prometheus；policy violation events 写 K8s audit log；定期跑 `Audit mode` 评估新 policy 影响面再切 `Enforce`。
+
+**生产事故模式**：
+
+| 事故 | 原因 | 防御 |
+|---|---|---|
+| webhook OOM 后整个集群 admission 卡死 | failurePolicy=Fail + webhook 单副本 | HA + PDB + memory limit + 监控 webhook latency |
+| policy 误伤系统 namespace | match 没排除 `kube-system` | 所有 policy `namespaceSelector` 排除 system namespaces |
+| 升级 K8s 后 webhook 报 timeout | timeoutSeconds 太短（默认 3s）+ 大集群 | timeoutSeconds: 10；webhook 必须能在并发下 < timeout |
+| Rego 性能问题导致 admission 慢 | 复杂 policy 在每个 Pod 上执行 | 用 `match` 精确缩小范围；OPA 6.x+ 的 prepared queries |
+
 ### 本章涉及的常见工具
 
 | 概念 | 常见工具 / 命令 | 备注 |
@@ -338,7 +663,7 @@ RAG 特别容易出的问题包括：
 | Secret 注入 | Vault、External Secrets Operator | 适合把外部 Secret Manager 接到运行时 |
 | 镜像与依赖扫描 | Trivy、pip-audit | 用于提前暴露基础镜像和 Python 依赖风险 |
 | 签名与 provenance | cosign、SLSA provenance | 用于校验产物来源和构建责任 |
-| 策略执行 | OPA Gatekeeper、Kyverno | 适合把”非 root、必须签名、必须带标签”等规则做成默认策略 |
+| 策略执行 | OPA Gatekeeper、Kyverno | 适合把"非 root、必须签名、必须带标签"等规则做成默认策略 |
 
 ---
 
@@ -511,6 +836,139 @@ LLM 服务对外暴露 API 时，面临的不只是传统 Web API 的速率限�
 - **轮换周期**：高权限 Key 90 天，普通 Key 180 天，发现泄露立即轮换
 - **撤销机制**：维护全局 Key blacklist，新请求实时比对；结合 JWT 短 TTL（< 1h）降低撤销延迟
 - **审计**：每次 Key 使用记录调用方 IP、User-Agent、token 消耗量、时间戳
+
+#### JWT 实际验证机制
+
+JWT 在 LLM 服务里普遍用于服务间和用户认证，但**怎么验签、有哪些常见漏洞**章节没讲。错误验证 = 完全失去鉴权效果，这是 senior 必须懂的细节。
+
+**JWT 三段结构**（`.` 分隔，base64url 编码）：
+
+```text
+eyJhbGciOiJSUzI1NiIsImtpZCI6Im1haW4tMjAyNiJ9    ← header
+.eyJpc3MiOiJhdXRoLmV4YW1wbGUuY29tIiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20i     ← payload
+LCJhdWQiOiJsbG0tZ2F0ZXdheSIsImV4cCI6MTcxNDQwMjAwMCwiaWF0IjoxNzE0Mzk4NDAwfQ
+.kJNgPfTLQ5Iv...                                  ← signature
+
+解 base64url 后:
+header  = {"alg": "RS256", "kid": "main-2026"}
+payload = {"iss": "auth.example.com", "sub": "alice@example.com",
+           "aud": "llm-gateway", "exp": 1714402000, "iat": 1714398400}
+signature = RSA-SHA256(header_b64 + "." + payload_b64, private_key)
+```
+
+**Standard claims**（必须验证的）：
+
+| Claim | 含义 | 验证逻辑 |
+|---|---|---|
+| `iss` | issuer，token 签发方 | 必须等于预期 issuer URL |
+| `aud` | audience，目标接收方 | 必须包含当前服务自己的 ID |
+| `exp` | expiration（Unix timestamp）| 必须 > 当前时间（允许小漂移如 60s）|
+| `nbf` | not before | 必须 < 当前时间 |
+| `iat` | issued at | 通常用于检查 token 年龄上限 |
+| `sub` | subject，用户/服务身份 | 业务字段，按需验证 |
+
+**完整验证流程**：
+
+```text
+1. 解码 header（不验签也能解，因为 base64 不是加密）
+2. 看 header.alg：
+   - "none" → 立即拒绝（不接受未签名 token）
+   - "HS256" → 用预共享 secret 验 HMAC
+   - "RS256"/"ES256" → 用公钥验签
+3. 看 header.kid，从 JWKS 拿对应公钥
+4. 用公钥（或 secret）+ alg 验签：
+   验证 signature == sign(alg, header_b64 + "." + payload_b64, key)
+5. 验签成功后，解 payload，验 standard claims：
+   - now < exp + leeway
+   - now > nbf - leeway
+   - iss == expected_issuer
+   - my_service_id ∈ aud
+6. 业务 claim 验证（roles、tenant_id 等）
+```
+
+**JWKS（JSON Web Key Set）公钥分发**：
+
+```text
+issuer 在 https://auth.example.com/.well-known/jwks.json 暴露公钥列表:
+{
+  "keys": [
+    {"kty":"RSA","kid":"main-2026","use":"sig","alg":"RS256","n":"...","e":"AQAB"},
+    {"kty":"RSA","kid":"main-2025","use":"sig","alg":"RS256","n":"...","e":"AQAB"}
+  ]
+}
+
+服务启动时 fetch 一次 JWKS，cache 到内存。
+收到 token 时按 header.kid 从 cache 找公钥。
+cache miss 时（kid 是新的）→ 重新 fetch JWKS（rate limit 防 DoS）。
+issuer 轮换密钥时新旧 kid 共存 24-72h，让所有 client cache 自然更新。
+```
+
+**生产必须防的常见漏洞**：
+
+| 漏洞 | 攻击 | 防御 |
+|---|---|---|
+| `alg=none` 接受 | 攻击者改 header 为 `{"alg":"none"}`，去掉 signature 段，库可能仍接受 | 库配置允许的 alg 白名单（仅 RS256/ES256），显式拒绝 none |
+| Algorithm confusion | 服务用 RS256 公钥，攻击者把 alg 改成 HS256，用公钥当 HMAC secret 自己签——库可能验证通过 | 库必须按 issuer 配置锁定 alg，不能让 token header 决定 alg |
+| 不验 `aud` | A 服务的 token 在 B 服务也能用 | 显式验 `aud` 包含 self |
+| `exp` 不验或 leeway 过大 | 旧 token 长期可用 | 严格验 exp；leeway ≤ 60s |
+| `kid` 注入 | 攻击者 kid 指向自己控制的 key | JWKS 必须从可信 endpoint fetch，不接受 token 里的 jwks_url |
+| Token 在日志里出现 | 日志泄漏即 token 泄漏 | 日志 redact `Authorization` header；JWT 都是 bearer token 等同密码 |
+
+**短 TTL + refresh token**：JWT 一旦签发无法撤销（除非维护 blacklist），所以 access_token TTL 短（5-60min），refresh_token 长（30 天，存数据库可撤销）；client 用 refresh_token 换新 access_token。
+
+#### mTLS 握手与证书吊销
+
+mTLS（mutual TLS）在 service mesh 和零信任架构里很常见。章节提了但**握手时序和吊销机制**没讲。
+
+**TLS 1.3 + mTLS 握手**：
+
+```text
+Client                                                Server
+
+ClientHello (SNI + supported_versions + key_share)  -->
+                                                    <--  ServerHello (key_share)
+                                                         + EncryptedExtensions
+                                                         + CertificateRequest  ← mTLS 关键：要求 client 证书
+                                                         + Certificate (server cert chain)
+                                                         + CertificateVerify (server 用私钥签前面的握手)
+                                                         + Finished
+
+(Client 验证 server cert 链到 trust root)
+
+Certificate (client cert chain)                     -->
+CertificateVerify (client 用私钥签前面的握手)        -->
+Finished                                            -->
+
+(Server 验证 client cert 链到 trust root)
+
+Application Data (双向 AEAD 加密)                  <-->
+```
+
+每边都要验对方证书：
+
+```text
+1. 收到的 cert 用 issuer 的公钥验签
+2. issuer 的 cert 用上一级 issuer 验... 链到 trust root（预装的 CA）
+3. 验证 SAN (Subject Alternative Name) 包含期望的 hostname / SPIFFE ID
+4. 检查 not_before < now < not_after
+5. 检查吊销状态（CRL/OCSP）
+```
+
+**吊销机制**：证书在到期前可能被主动吊销（私钥泄漏、用户离职），必须有机制检查。
+
+| 机制 | 工作方式 | 优劣 |
+|---|---|---|
+| **CRL** (Certificate Revocation List) | CA 定期发布吊销证书列表（HTTP/LDAP），client 周期下载 | 简单但 CRL 可能很大（MB 级），更新延迟数小时；离线也可用 |
+| **OCSP** (Online Certificate Status Protocol) | client 收到 cert 后向 OCSP responder 查实时状态 | 实时但增加握手延迟；OCSP responder 是 SPOF |
+| **OCSP Stapling** | server 自己定期向 OCSP responder 拿响应，握手时附加给 client | 解决 OCSP 延迟和隐私问题，TLS 1.3 推荐 |
+| **Short-lived certs** | 证书 TTL 短（24h-7d），到期自动失效 | 不需要吊销机制；SPIFFE/SPIRE 用此模式 |
+
+**生产实现**：
+
+- **Kubernetes service mesh**：Istio/Linkerd 用 SPIFFE ID（`spiffe://cluster/ns/<ns>/sa/<sa>`）作为 workload identity，cert 由 mesh CA 自动签发并轮换（典型 24h），不需要 CRL/OCSP——靠 short-lived cert。
+- **cert-manager**：K8s 上管理 cert 生命周期的 controller，支持 Let's Encrypt、Vault、内部 CA；自动续期。
+- **mTLS 失败模式**：cert 过期是最常见事故源。监控 `cert_expiry_seconds`，告警阈值 ≥ 7 天。
+- **SNI vs hostname 验证**：握手时 client 在 ClientHello 发 SNI 告诉 server"我要哪个域名的证书"；server 选对应 cert；client 收到后再验 cert 的 SAN 包含该 SNI。SNI 与 SAN 不一致是 MITM 攻击信号。
 
 ### 23.11.2 Rate Limit 多层架构
 
@@ -740,6 +1198,114 @@ flowchart LR
 | 防护手段 | 机制 | 效果 | 代价 |
 |----------|------|------|------|
 | **差分隐私训练（DP-SGD）** | 训练时对梯度加入标准噪声，提供 (ε, δ)-DP 保证 | 可量化隐私保护 | 模型精度下降 1-5%，训练成本增加 |
+
+##### DP-SGD 的实际工作机制
+
+章节说"DP-SGD 加噪声、提供 (ε, δ)-DP 保证"——这是合规场景的关键工具。但 ε/δ 是什么、噪声怎么加、Privacy Accountant 怎么算，需要 senior 看懂数学才能在合规审查中讨论 trade-off。
+
+**(ε, δ)-DP 的直觉定义**：
+
+对任意相邻数据集 D 和 D'（**只差一个样本**），任意算法 M 的输出集合 S：
+
+$$P(M(D) \in S) \le e^\varepsilon \cdot P(M(D') \in S) + \delta$$
+
+含义："存在某个样本 vs 不存在某个样本"对模型输出分布的影响被 e^ε 放大上限和小概率 δ 兜底。
+
+- **ε 越小隐私越强**：ε = 0 表示完美隐私（M 与 D 无关，但模型也学不到东西）；ε = ∞ 表示零隐私。
+- **常见目标**：研究界严格 ε ∈ [0.5, 3]；工业可接受 ε ∈ [4, 10]；ε > 10 隐私意义微弱。
+- **δ 通常 < 1/n**（n 是样本数）：δ 是"灾难性失败"概率上限，必须远小于"随机猜中某样本"概率。
+
+**DP-SGD 算法**（Abadi et al. 2016）：
+
+```python
+# 普通 SGD:
+g_batch = mean([∇L(x_i, θ) for x_i in batch])
+θ -= lr * g_batch
+
+# DP-SGD:
+for x_i in batch:
+    g_i = ∇L(x_i, θ)                              # per-sample gradient
+    g_i_clipped = g_i * min(1, C / ||g_i||_2)     # 裁剪到 L2 norm ≤ C
+sum_clipped = sum([g_i_clipped for x_i in batch])
+noise = N(0, σ² · C² · I)                         # Gaussian 噪声
+g_dp = (sum_clipped + noise) / batch_size         # 加噪 + 平均
+θ -= lr * g_dp
+```
+
+两步关键操作：
+
+1. **Per-sample gradient clipping**：每个样本的 gradient 裁剪到 L2 norm ≤ C。这限制了"单样本影响 gradient 的最大幅度"——是 DP 的 sensitivity bound。
+2. **Gaussian noise**：在裁剪后的总和上加噪，σ 是 noise multiplier。每步 (ε_step, δ_step)-DP 保证由 σ 决定。
+
+**Per-sample gradient 是工程难点**：
+
+普通 SGD 的 gradient 是整个 batch 一起算（vectorized），per-sample gradient 需要每个样本独立 backward，naive 实现慢 batch_size 倍。Opacus / TF Privacy 用 **vectorized per-sample gradients (vmap)** 优化，但仍比普通训练慢 30-100%，显存翻倍。
+
+**Privacy Accountant：每步 budget 怎么累加**
+
+每步 DP-SGD 消耗的 ε 不是简单加和。如果 T 步训练每步是 (ε_step, δ_step)-DP，**朴素 composition** 给出 T·ε_step 上界，但太松。
+
+现代用 **RDP (Rényi DP) Accountant** 或 **Moments Accountant**（Abadi 2016 提出）：
+
+- 跟踪 RDP 损失：α-RDP 数值在每步加和，最后转回 (ε, δ)-DP。
+- subsampling amplification：每 step 只用一个 batch（占总数据 q = batch/N），noise 对未采样数据"等于"自动 0，所以等效 σ 增大；Moments Accountant 把这个考虑进去。
+- 现代 GDP/PRV Accountant 给更紧上界。
+
+```python
+# Opacus 用法
+from opacus import PrivacyEngine
+
+privacy_engine = PrivacyEngine()
+model, optimizer, data_loader = privacy_engine.make_private(
+    module=model,
+    optimizer=optimizer,
+    data_loader=data_loader,
+    noise_multiplier=1.1,    # σ
+    max_grad_norm=1.0,       # C
+)
+
+# 训练后查累计 ε
+epsilon = privacy_engine.get_epsilon(delta=1e-5)
+print(f"(ε={epsilon}, δ=1e-5)-DP")
+```
+
+**典型超参数与精度代价**（ImageNet ResNet-50）：
+
+| (ε, δ) 目标 | σ | C | epochs | 精度下降 vs 普通训练 |
+|---|---|---|---|---|
+| (8, 10⁻⁵) | 1.1 | 1.0 | 60 | -2 ~ -3 pp |
+| (3, 10⁻⁵) | 1.5 | 1.0 | 60 | -5 ~ -8 pp |
+| (1, 10⁻⁵) | 3.0 | 1.0 | 60 | -10 ~ -15 pp |
+
+ε 每减半，精度损失大致翻倍。LLM 场景下精度损失更敏感（Common Crawl 数据 + per-token loss），DP fine-tuning 比 DP pre-training 更可行。
+
+**生产代价**：
+
+- **训练时间**：per-sample gradient + 噪声 = +30-100% wall time。
+- **显存**：per-sample gradient 需要保留，显存翻倍；用 microbatching（一次只算几个样本的 per-sample grad）缓解。
+- **batch size 影响**：DP 偏好大 batch（N=2048-8192），因为 noise 在 batch 平均时被稀释；这进一步增加显存需求。
+- **不能用普通分布式技巧**：per-sample grad clipping 在 DDP 下需要 all-reduce 后再 clip 还是 clip 后 all-reduce？正确做法是 **clip 后 all-reduce + sum 噪声**，但这需要 DP-aware 的 framework。Opacus DDP 支持。
+
+**对实际隐私威胁的防护强度**：
+
+| 攻击 | DP-SGD 防护效果 |
+|---|---|
+| Training Data Extraction | (ε=8, δ=10⁻⁵) 把成功率从 ~5% 降到 < 0.1% |
+| Membership Inference | (ε=8) 把 advantage 从 > 0.3 降到 < 0.05 |
+| Model Extraction | DP 不直接防护，仍要 rate limit |
+| Backdoor Attack | DP 部分缓解，clipping 降低 poison sample 影响 |
+
+**合规场景的实际选择**：
+
+- **HIPAA 医疗** / **GDPR 高风险**：(ε=1-3, δ=10⁻⁶)，接受精度损失换强保证。
+- **一般 PII 训练**：(ε=8-10, δ=10⁻⁵)，平衡精度和隐私。
+- **公开数据 fine-tuning**：可不用 DP，但仍应 PII 扫描 + 输出层防护。
+
+**DP 不能替代什么**：
+
+- DP 不防 prompt injection、不防 jailbreak、不防 model extraction（rate limit 才行）。
+- DP 不防训练数据本身就是公开的——只防"特定个体是否在数据集里"被推断。
+- DP 不防 fine-tuning 阶段的 catastrophic forgetting 或后门——这些需要单独防护。
 | **输出截断** | 限制 completion 长度，防止大段训练数据被完整复现 | 部分有效 | 影响长文本生成场景 |
 | **API Rate Limit** | 限制单一调用方的查询速率，增加提取成本 | 提高攻击门槛 | 不能完全阻止 |
 | **对抗 query 检测** | 识别系统性探测模式（相似前缀、递增查询） | 高 | 需要长期监控基础设施 |

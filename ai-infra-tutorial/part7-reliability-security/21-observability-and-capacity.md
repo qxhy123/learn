@@ -144,6 +144,329 @@ Cardinality 指标签或字段可能出现多少不同取值。常见错误是�
 
 **工程边界**：告警和容量面板应基于低基数、稳定口径的指标；事故排查再通过 exemplars、trace_id 和日志下钻。新增 metrics label 应评审取值数、增长和保留周期。
 
+#### 21.2.6 Prometheus TSDB 与 cardinality 的实际成本
+
+章节强调 cardinality 治理，但**Prometheus 内部为什么对 cardinality 敏感**没讲清。理解 TSDB 工作机制，才能解释 "10 万 series 还行、100 万 series 卡死" 的边界。
+
+**Prometheus 数据模型**：每个唯一 `(metric_name, label_set)` 组合是一条 **time series**。TSDB 给每条 series 分配独立的 in-memory chunk（active chunk，2 小时一切）+ 落盘 block 索引。
+
+```text
+http_request_duration_seconds_bucket{method="POST", path="/v1/chat", status="200", le="0.1"} 1234
+                                    └────────────── label set ──────────────────────┘
+                                       这一组是一条 series
+
+如果 path 取值有 1000 种、status 6 种、method 4 种、le 10 种:
+  series 总数 = 1 (metric) × 1000 × 6 × 4 × 10 = 240,000 条
+```
+
+**每条 series 的成本**：
+
+- **Active memory**：~1-2 KB（最近 chunk + 索引）。100 万 series ≈ 1-2 GB 内存。
+- **Disk**：每 2 小时 flush 一个 block（含索引 + chunks）；series 多 = block 索引大 = compaction 耗时长。
+- **Query cost**：PromQL 查询要扫所有匹配 series 的 chunks。`rate(metric{}[5m])` 对 240K series 比 24K series 慢 ~10x。
+
+**Pull-based scrape 模型**：
+
+```text
+Prometheus 每 15s（默认 scrape_interval）主动拉每个 target 的 /metrics
+  ↓
+HTTP GET http://target:9090/metrics
+  ↓
+解析 exposition format（每行一条样本）
+  ↓
+更新 in-memory series store
+  ↓
+每 2h flush 到 disk block
+```
+
+**为什么 pull 而不是 push**：
+
+- Prometheus 主动控制采集速率，target 慢不会拖垮 Prometheus。
+- Target 健康可由 `up{}` metric 判断（pull 失败时 up=0）。
+- target 不需要知道 Prometheus 在哪——靠 service discovery（K8s SD、DNS、Consul、static config）。
+
+**例外**：短生命周期 batch job 来不及被 scrape，用 **Pushgateway** 推一次。但 Pushgateway 是反模式不能滥用——长期运行的服务一律 pull。
+
+**Prometheus 单机的实际限制**：
+
+| 维度 | 健康范围 | 危险阈值 |
+|---|---|---|
+| Active series | < 5M | > 10M（OOM 风险）|
+| Ingestion rate | < 500K samples/s | > 1M samples/s |
+| Query latency P99 | < 5s | > 30s（用户感知卡）|
+| Retention | 15-30 天 | > 90 天（block 过多影响 compaction）|
+| 内存 | 2-32 GB | > 64 GB（GC 抖动）|
+
+**HA 与长期存储**：
+
+单机 Prometheus 是 SPOF（数据 + 查询）。生产用 **Thanos** / **Cortex** / **Mimir**：
+
+- **Thanos sidecar 模式**：每个 Prometheus 旁边跑 sidecar，把 2h 落盘的 block 上传到 S3/GCS；查询通过 Thanos Querier 跨多个 Prometheus + 对象存储；compactor 在对象存储上做 downsampling（5min/1h 粒度）。Prometheus 仍保留本地 retention（15d）；长期数据在对象存储。
+- **Cortex / Mimir**：horizontally scalable Prometheus-compatible TSDB；ingester（接收 + 内存）/ store-gateway（查询 + 对象存储）/ compactor / querier 各自独立扩。比 Thanos 复杂但 cardinality 上限高。
+- **VictoriaMetrics**：另一种实现，单二进制，按 cluster mode 横向扩；通常资源消耗比 Cortex 低。
+
+**Cardinality 诊断**：
+
+```promql
+# 找出 cardinality 最高的 metric
+topk(20, count by(__name__)({__name__=~".+"}))
+
+# 某 metric 内 cardinality 最高的 label
+topk(20, count by(<label>)({__name__="<metric>"}))
+
+# 看 Prometheus 自己的状态
+prometheus_tsdb_head_series           # 当前 active series
+prometheus_tsdb_head_chunks            # active chunks
+prometheus_tsdb_symbol_table_size_bytes  # symbol table 内存
+rate(prometheus_tsdb_head_samples_appended_total[5m])  # 摄入速率
+```
+
+**Prometheus 与 OpenTelemetry Metrics 的关系**：
+
+- Prometheus 原生用 exposition format（pull）。
+- OTel 用 OTLP 协议（push）。
+- **Prometheus Remote Write**：让 OTel SDK 把 metrics push 到 Prometheus（需 Prometheus enable `--web.enable-remote-write-receiver`）。
+- **OTel Collector + Prometheus exporter**：让 OTel 数据通过 Collector 暴露成 Prometheus 格式，Prometheus 来 pull。
+
+#### 21.2.7 Histogram 与 histogram_quantile() 的实际机制
+
+章节用了大量 P99 latency 但**histogram_quantile 怎么算、bucket 怎么选**没讲。这是 senior 必须懂的——bucket 选错时 P99 误差可达 5-10x。
+
+**Classic histogram 在 Prometheus 中的存储**：
+
+```text
+http_duration_seconds_bucket{le="0.005"}  100      # ≤ 5ms 累积
+http_duration_seconds_bucket{le="0.01"}   120      # ≤ 10ms（含上面 100）
+http_duration_seconds_bucket{le="0.05"}   150
+http_duration_seconds_bucket{le="0.1"}    165
+http_duration_seconds_bucket{le="0.5"}    180
+http_duration_seconds_bucket{le="+Inf"}   200      # 所有样本
+http_duration_seconds_sum                 12.5
+http_duration_seconds_count               200
+
+注意：每个 bucket 是一条独立 series（cumulative count）。
+N 个 bucket 边界 = N+1 条 series（含 +Inf）。
+```
+
+**`histogram_quantile(0.99, rate(http_duration_seconds_bucket[5m]))` 算法**：
+
+```text
+1. 算每个 bucket 的 rate（5min 窗口内每秒增量）
+2. 找 cumulative_count >= 0.99 × total_count 的最小 bucket
+3. 在该 bucket 内做线性插值：
+   - 假设 bucket 内样本均匀分布
+   - bucket [l, u] 内有 m 个样本，目标位置在第 k 个
+   - 返回 l + (u-l) × k/m
+```
+
+**关键陷阱：bucket 选错时误差巨大**
+
+假设真实 P99 = 80ms，但 bucket 边界是 `[0.005, 0.01, 0.05, 0.5]`：
+
+```text
+total = 200, 99th = 198
+cumulative: 100, 120, 150, 180, 200
+198 落在 [0.5, +Inf] bucket
+→ 必须返回 +Inf 或回退到 0.5
+
+如果 bucket 加密到 [0.005, 0.01, 0.05, 0.1, 0.2, 0.5]:
+假设 cumulative: 100, 120, 150, 165, 195, 200
+198 落在 [0.2, 0.5] 内，线性插值：0.2 + (0.5-0.2) × 3/5 = 0.38s
+→ P99 估算 380ms（远偏离真实 80ms！）
+
+如果 bucket 在 80ms 附近密集 [0.05, 0.075, 0.1, 0.125, 0.15]:
+更准确，误差 < 20%
+```
+
+**bucket 选择规则**：
+
+- **必须围绕 SLO 目标密集**：守 100ms P99 SLO，bucket 必须有 80/100/125/160ms。
+- **跨数量级用对数尺度**：`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` 是 Prometheus 默认。
+- **覆盖最大值**：`+Inf` 是最后一个 bucket；如果 +Inf 装了 1% 以上数据，P99 不可估（直接返回前一 bucket 上界）。
+- **bucket 数量取舍**：每个 bucket 是一条 series，10 个 bucket = 10× cardinality。控制在 8-15 个。
+
+**精度盲区**：
+
+- **样本量 < 1000**：P99 不可信（< 100 是噪声）。
+- **`+Inf` bucket 装 1% 以上**：P99 一定不准。
+- **bucket 边界粒度粗于真实分布**：插值假设均匀但真实是双峰时错。
+
+**Native histograms（Prometheus 2.40+ 实验性）**：
+
+- 自适应 bucket（指数 schema），不需要预定义 le。
+- bucket 数动态，精度自适应（典型 ε < 1%）。
+- 单个 series 存所有 bucket 信息（不再每 bucket 一条 series），cardinality 大幅下降。
+- 兼容性问题：旧 Grafana / Prometheus 不支持，生产采用前要全栈升级。
+
+**生产建议**：
+
+- 业务关键 SLO metric 必须自定义 bucket，不要用客户端库默认值。
+- Prometheus 2.40+ 集群可以新 metric 用 native histogram，旧 metric 维持 classic。
+- Grafana 面板的 P99 panel 要看 bucket 是否合理——常见错误是用默认 bucket 监控 sub-millisecond latency。
+
+#### 21.2.8 OpenTelemetry Collector 内部架构
+
+章节用 tail-based sampling 但**Collector 怎么实现**没讲。这是部署 Collector 时绕不开的问题。
+
+**Collector pipeline**：
+
+```text
+[Receivers]            [Processors]                    [Exporters]
+  ↓                       ↓                               ↑
+otlp/grpc:4317     →   memory_limiter (必须 first)   →  otlphttp
+otlp/http:4318     →   batch                          →  prometheus
+prometheus (scrape)→   attributes (改/删 attribute)   →  loki
+zipkin             →   filter (drop 不要的 spans)     →  elasticsearch
+jaeger             →   tail_sampling                  →  splunk
+                       groupbytrace
+                       resourcedetection
+```
+
+**Receivers**：监听协议，把进来的数据转成 Collector 内部 **pdata**（protobuf-based）格式。
+
+**Processors（按声明顺序处理）**：
+
+| Processor | 作用 | 何时用 |
+|---|---|---|
+| `memory_limiter` | 监测进程内存，超阈值时 drop 数据防 OOM | **必须第一个**，所有 pipeline 都要 |
+| `batch` | 把 spans/metrics 攒成 batch 再发给 exporter | 通常最后一个，提升 export 效率 |
+| `attributes` | 增删改 attribute（如 PII redact） | 早期阶段做数据清洗 |
+| `filter` | 按规则 drop spans/metrics | 减少下游成本 |
+| `groupbytrace` | 按 trace_id 缓冲所有 spans | tail sampling 必备 |
+| `tail_sampling` | 按规则保留 trace（按 status、latency、attribute） | tail sampling 决策 |
+| `resourcedetection` | 自动加 cloud/host metadata | K8s/EC2 环境必备 |
+
+**`groupbytrace` 处理器内部**：
+
+```text
+配置：
+  wait_duration: 10s        # 一个 trace 等多久才认为完整
+  num_traces: 50000         # 内存中最多缓冲多少 trace
+  num_workers: 4
+
+工作流：
+  收到 span:
+    insert into trace_id → spans map
+    set timer for trace_id (wait_duration 后触发)
+  
+  timer 触发或 trace_id 达到完整信号:
+    pop spans from map
+    pass to next processor (typically tail_sampling)
+
+内存代价：
+  50000 traces × avg 20 spans/trace × 1KB/span = 1 GB
+  实际生产 Collector 配 4-8 GB 内存
+```
+
+**`tail_sampling` 决策（拿到完整 trace 后）**：
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}        # 全采错误
+      - name: slow
+        type: latency
+        latency: {threshold_ms: 1000}                # 全采 > 1s
+      - name: probabilistic
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}      # 1% 普通采样
+      - name: tenant-vip
+        type: string_attribute
+        string_attribute:
+          key: tenant.tier
+          values: [premium]                          # VIP 全采
+```
+
+policies 是 **OR** 关系——任一命中就保留 trace。
+
+**Collector 横向扩容的关键问题**：
+
+tail sampling 要求**同一 trace_id 的所有 spans 必须路由到同一个 Collector 实例**——否则 groupbytrace 看不到完整 trace。
+
+```text
+方案：load-balancing exporter（Collector 自带）
+
+Tier 1: Receiver Collector（多实例，前置 LB）
+   ↓
+   loadbalancing exporter（按 trace_id 一致性哈希）
+   ↓
+Tier 2: Sampling Collector（多实例，每实例固定一组 trace_id）
+   ↓
+   exporter (otlp/jaeger/...)
+   ↓
+后端
+```
+
+Tier 1 Collector 不做 sampling，只是接收 + 一致性哈希分发。Tier 2 Collector 做 groupbytrace + tail sampling。
+
+**生产失败模式**：
+
+| 事故 | 原因 | 防御 |
+|---|---|---|
+| Collector OOM | groupbytrace 内存满 | memory_limiter + 减小 num_traces |
+| 下游慢导致 backpressure | exporter 阻塞 | exporter sending_queue + retry 配 |
+| trace 不完整 | wait_duration 短于真实 trace 时长 | 调大 wait_duration（典型 10-30s）|
+| 部分 span 丢失 | 多 Tier 1 Collector 不一致哈希 | 用 loadbalancing exporter 保证一致性 |
+
+#### 21.2.9 W3C Trace Context：跨进程的 trace 怎么传
+
+章节用了 trace 但**context 怎么跨服务传**没讲。这是 trace 在分布式系统能 work 的根本机制。
+
+**W3C Trace Context 标准**（HTTP header）：
+
+```text
+traceparent: 00-{trace_id}-{parent_span_id}-{flags}
+            └─version─┘└──32 hex──┘└──16 hex──┘└─2 hex─┘
+
+例：
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+              version=00 (current)
+              trace_id=4bf92f...4736 (128-bit)
+              parent_span_id=00f067...02b7 (64-bit, 当前服务收到的 span id)
+              flags=01 (sampled)
+
+tracestate: vendor1=value1,vendor2=value2  ← vendor 自定义
+```
+
+**baggage**（用户业务字段，跨进程传递）：
+
+```text
+baggage: tenant_id=acme,environment=prod,user.tier=premium
+```
+
+baggage 与 attributes 的差异：
+- **attribute** 只附在创建该 attribute 的 span 上。
+- **baggage** 自动随 trace context 传播，附到所有下游 span。
+- **危险**：baggage 值会被附到所有后续 span，**cardinality 风险高**——把 user_id 放 baggage 会让所有 span 的 metrics 爆炸。
+
+**跨协议的传递**：
+
+| 协议 | 怎么传 |
+|---|---|
+| HTTP/1.1 / HTTP/2 | 加 `traceparent` header |
+| gRPC | 加 metadata（与 HTTP/2 header 类似）|
+| Kafka | 加 message header（key=`traceparent`）|
+| RabbitMQ | 加 message property |
+| 数据库 | SQL comment（`/* traceparent='...' */`），Postgres 14+ 自动捕获 |
+
+**自动 instrumentation**：
+
+- 现代 OTel SDK（Java/Python/Go/.NET）的 auto-instrumentation 自动处理 HTTP/gRPC client/server 的 traceparent；业务代码不用改。
+- 异步任务（Celery、消息队列）需要手动注入 baggage——一个常见 bug 源是消息处理时 trace context 丢失。
+
+**生产 checklist**：
+
+- 所有 ingress/egress 库（HTTP client、gRPC、Kafka client）必须 instrumented。
+- Async task 要显式传 trace context。
+- 跨语言服务边界要测 trace context propagation——Java OTel 的 traceparent 必须能被 Python OTel 解析（理论上 W3C 标准互通，但 vendor extension 经常出错）。
+- baggage 用得节制——只传 tenant_id、environment 这种低 cardinality 的字段。
+
 ### 21.3 AI 系统应该看哪些指标
 
 #### 21.3.1 资源面
