@@ -1,486 +1,1239 @@
 # 第9章：模型并行与流水并行
 
-> 当模型已经大到单卡放不下时，问题就从“怎么复制模型”变成了“怎么拆模型”。
+> 当模型、序列或训练状态已经不能被一张 GPU 完整承载时，训练系统必须把样本、层、张量、序列和状态同时拆开。本章讨论的不是术语清单，而是如何把这些切分组合成一个可训练、可恢复、可观测的生产方案。
 
-> **关联章节**：本章与 [第8章](./08-data-parallel.md) 的数据并行、[第10章](./10-memory-checkpointing-and-recovery.md) 的状态切分与 checkpoint 设计强相关。大模型训练通常不是替换关系，而是多种并行策略叠加。
-
-## 1. 第一性原理拆解：为什么会有模型并行与流水并行
-
-### 拆 — 不可化简的问题
-
-剥离 Data Parallelism、Tensor Parallelism、Pipeline Parallelism、ZeRO、FSDP、Sequence Parallelism、Context Parallelism 这些术语，本章真正面对的不可化简问题只有一个：**一个训练 step 需要保存和计算的状态超过了单个物理设备的容量与带宽，系统必须把状态、计算和通信同时拆开，并且拆完之后仍然保持数学等价和工程可恢复。** 数据并行在 [第8章](./08-data-parallel.md) 中解决的是“同一个模型副本如何吃更多样本”，它默认每张 GPU 都能放下完整参数、梯度、优化器状态和必要激活。一旦 7B、70B、405B 模型叠加 BF16 参数、FP32 master weights、Adam 一阶二阶动量、activation checkpointing、长上下文 attention workspace 后超过单卡或单节点容量，复制模型就从扩展手段变成了障碍。
-
-这个问题不能只用“显存不够”概括。显存只是第一层硬约束；第二层是计算单元是否闲置，第三层是 GPU 之间的链路能否承受同步，第四层是 checkpoint、恢复、故障定位是否还能解释清楚。一个策略如果让模型能放下，但每层都跨慢速网络 AllReduce，吞吐可能比小规模训练还差；另一个策略如果利用率很高，但 checkpoint 无法在 rank 重排后恢复，就不适合平台化运行。模型并行的本质不是“把模型分到多张卡”，而是在容量、带宽、延迟、调度复杂度和恢复复杂度之间做约束求解。
-
-因此，本章的学习目标不是记住某个框架参数怎么写，而是建立工程决策直觉：什么时候先用纯 DP，什么时候把层内矩阵切成 TP，什么时候按层段切成 PP，什么时候用 ZeRO / FSDP 切训练状态，什么时候因为序列长度太长而叠加 SP / CP，以及什么时候不应该继续叠加并行维度。读这一章时要一直追问：我切掉的是哪一种重复？新引入的是哪一种通信？这个通信发生在节点内还是跨节点？它会不会改变 checkpoint 的组织方式？当一个 rank 掉线或恢复时，系统还能不能知道每个 shard 属于谁？
-
-### 推 — 从这个问题如何推导出每个机制
-
-从“单卡装不下完整训练副本”出发，第一种直接推导是状态分片。参数、梯度、优化器状态存在大量副本，ZeRO / FSDP 就是把这些重复状态切开，让每张卡只保存一部分；但它没有自动切开单层 GEMM 的计算，也没有自动降低 attention 对超长序列的压力。于是第二种推导是张量并行（Tensor Parallelism, TP）：如果某一层的权重矩阵或 attention projection 太大，就沿 hidden dimension、head 或矩阵行列把单层计算拆给多张 GPU。TP 的收益是降低单层参数和计算峰值，代价是每层都可能出现 `AllReduce`、`AllGather` 或 `ReduceScatter`，所以它天然应该优先放在 NVLink / NVSwitch 这类节点内高速互联里。
-
-如果单层通过 TP 能放下，但整个网络层数太多、单节点仍然无法承载完整模型，就会推导出流水并行（Pipeline Parallelism, PP）：把 Transformer 层段切成多个 stage，不同 micro-batch 像工厂流水线一样依次通过 stage。PP 解决的是“整网太深、整模太大”，但它引入 pipeline bubble，因为流水线填充和排空阶段总有设备暂时没有活干。micro-batch 数 `m` 越少、stage 数 `p` 越多，bubble 越明显，因此 PP 必然引出 1F1B、Interleaved Pipeline、Zero Bubble 等调度优化。它们不是新的容量机制，而是在容量已经被 PP 解决后，进一步减少空闲槽。
-
-当模型能放下后，还要解决吞吐扩展，这自然回到数据并行（Data Parallelism, DP）：把已经由 TP / PP / ZeRO 组成的“一个模型副本”复制多份，每份吃不同 batch，再同步梯度。大规模训练常见的 `DP x PP x TP` 不是为了炫技，而是因为三个维度分别切样本、层段和层内计算。长上下文又会推导出另一个分支：TP 主要切 hidden，PP 主要切 layers，ZeRO 主要切训练状态；当 context 从 8K 拉到 128K+，真正爆掉的可能是 token 维度上的激活、KV 和 attention workspace。Sequence Parallelism（SP）在 TP 组内切非 attention 路径的 sequence 激活，Context Parallelism（CP）切 attention 所需的 context/KV 流动。二者的共同点是补“序列维度”的短板，不是替代 DP / TP / PP。
-
-工程上，机制推导的顺序也给出选型顺序：先问完整训练形态单卡能否放下；不能，再问单节点高速互联内能否通过 TP 或 FSDP 放下；还不能，再问模型是否适合按层切 PP；最后再根据长上下文、吞吐目标和 checkpoint 约束叠加 SP / CP / DP。边界很明确：每增加一个并行维度，rank 拓扑、通信域、日志归因、性能画像、checkpoint shard 数量都会变复杂。平台工程师的任务不是默认选择最复杂的组合，而是找到能满足容量和吞吐目标的最小复杂度组合。
-
-### 绘 — 因果链路
-
-```mermaid
-mindmap
-  root((模型并行与流水并行))
-    不可化简问题
-      单卡容量有限
-      互联带宽有限
-      调度空闲不可忽略
-      checkpoint 必须可恢复
-    先判断能否复制
-      单卡可放下
-        Data Parallelism
-        梯度同步
-      单卡放不下
-        状态冗余
-          ZeRO
-          FSDP
-        单层过大
-          Tensor Parallelism
-          节点内高速互联
-        整网过深
-          Pipeline Parallelism
-          micro-batch
-          pipeline bubble
-    利用率优化
-      1F1B
-      Interleaved Pipeline
-      Zero Bubble
-    长上下文压力
-      非 attention 激活
-        Sequence Parallelism
-      attention 和 KV
-        Context Parallelism
-    工程边界
-      通信域增加
-      拓扑绑定增强
-      checkpoint shard 化
-      排障成本上升
-```
-
-### 导 — 读完本章你应该能回答
-
-1. 当一个模型“单卡放不下”时，你如何区分是参数、优化器状态、激活、attention workspace 还是序列长度导致的容量问题？
-2. 为什么 TP 通常优先限制在单节点 NVLink / NVSwitch 内，而 DP 可以更自然地跨节点扩展？
-3. PP 的 pipeline bubble 从哪里来？为什么 stage 数变多不一定让训练更快？
-4. ZeRO / FSDP 和 TP / PP 为什么是互补关系，而不是互相替代？
-5. 给定 8、64、512 张 GPU，你如何从模型大小、上下文长度、micro-batch 和拓扑推导第一版并行配置？
-6. SP 和 CP 分别切 sequence 的哪一部分？为什么 128K+ context 不能只靠 ZeRO 解决？
-7. 并行维度叠加后，checkpoint、恢复和故障定位会发生哪些结构性变化？
+> **关联章节**：本章以 [第7章](./07-single-node-training.md) 的单节点容量账本和 [第8章](./08-data-parallel.md) 的 DDP/FSDP/ZeRO 同步路径为基础。checkpoint、异步保存、跨并行恢复和故障恢复协议见 [第10章](./10-memory-checkpointing-and-recovery.md)。
 
 ---
 
-## 正文内容
+## 1. 第一性原理拆解 + 学习大纲
 
-### 9.1 为什么数据并行不够了
+### 1.1 拆：不可化简的问题
 
-数据并行默认每张卡都要装下一份完整模型。
-当模型已经放不进单卡时，就必须改思路：
-
-- 不是复制模型
-- 而是把模型切开
-
-这就进入模型并行的世界。
-
-典型触发条件包括：
-
-- 参数规模过大
-- 中间激活太大
-- 序列长度太长
-- 单卡显存根本容纳不了目标训练形态
-
-### 9.2 张量并行：切层内部的计算
-
-张量并行的思路是：
-把同一层里的矩阵计算切到多张卡上。
-
-例如，一个大矩阵乘法可以按列或按行分片，让多张卡共同完成。
-
-优点：
-
-- 能解决单层参数太大问题
-- 对超大线性层特别有效
-
-难点：
-
-- 通信频繁
-- 对互联带宽和延迟敏感
-- 实现与调试复杂
-
-也就是说，张量并行把“显存问题”部分换成了“通信问题”。
-
-### 9.3 流水并行：按层切模型
-
-流水并行的思路是：
-
-- 把模型的不同层段放到不同设备
-- 让不同 micro-batch 像流水线一样流过这些阶段
-
-例如：
+模型并行与流水并行要解决的最小问题是：
 
 ```text
-Stage 1 -> Stage 2 -> Stage 3 -> Stage 4
+一个 training step 所需的参数、梯度、优化器状态、activation、attention workspace 和计算量，
+超过了单个设备或单个高速互联域的容量与带宽。
 ```
 
-优点：
+这个问题不能只归因于“显存不够”。显存只是第一道硬约束。生产训练中还会同时遇到：
 
-- 层次切分更符合模型结构
-- 每张卡只承担部分层
+- 单层矩阵太大：单个 attention projection、MLP projection 或 vocab head 的参数和 GEMM 峰值超过单卡容量或单卡算力效率边界。
+- 整网太深：单层能放下，但完整 Transformer blocks、embedding、loss head、activation 和 optimizer state 不能放进一张 GPU 或一个节点。
+- 序列太长：参数状态可分片，但 64K、128K、256K context 下的 attention activation、KV、workspace 和 mask 仍会爆 HBM。
+- 同步太重：切分以后产生新的 AllReduce、AllGather、ReduceScatter、All-to-All 或 activation send/recv，网络进入 step time。
+- 状态太碎：checkpoint 从一个文件变成成千上万个 shard，恢复时必须重建 parallel metadata。
+- 故障不再局部：一个 pipeline stage、TP group、CP ring 或 expert group 出错，可能让全局作业 hang 在不同 collective 上。
 
-难点：
+因此模型并行的本质不是“把模型分到多张卡”，而是对五类维度做约束求解：
 
-- 会出现 pipeline bubble
-- micro-batch 调度更复杂
-- 前后阶段可能负载不均
+| 维度 | 切什么 | 典型机制 | 主要收益 | 主要代价 |
+|---|---|---|---|---|
+| 样本 | batch / sample | DP | 提升样本吞吐 | 梯度同步、straggler |
+| 状态 | parameters / gradients / optimizer state | FSDP / ZeRO | 降低状态冗余 | 参数 all-gather、sharded checkpoint |
+| 层内张量 | hidden / heads / matrix rows or columns | TP | 降低单层峰值、增加层内算力 | 高频 collective，强依赖 NVLink/NVSwitch |
+| 层段 | Transformer blocks | PP | 降低每卡层数和整网驻留状态 | microbatch 调度、pipeline bubble |
+| 序列 / 上下文 | tokens / context blocks / KV | SP / CP | 降低长序列 activation 和 attention 压力 | 序列维度通信、kernel 支持要求高 |
+| 专家 | MoE experts | EP | 扩大稀疏容量 | token dispatch、All-to-All、load balance |
 
-### 9.4 什么是 pipeline bubble
+### 1.2 推：机制如何从问题中长出来
 
-在流水并行中，前几个 step 里后续 stage 还没工作，结束阶段里前面 stage 又可能空闲，这些空闲区间就是 bubble。
+从这个不可化简问题出发，可以自然推出每个机制。
 
-一个常见近似理解是：
+如果完整训练副本能放进单卡，最简单的扩展是数据并行：每张 GPU 复制模型，处理不同样本，再同步梯度。第8章已经说明，DP 切的是样本，不切模型状态。只要完整训练副本放不下，经典 DDP 就失效。
 
-$$
-\text{pipeline utilization} \approx \frac{m}{m+p-1}
-$$
+如果主要问题是训练状态重复，FSDP/ZeRO 是第一层补救。ZeRO-1 切 optimizer state，ZeRO-2 继续切 gradients，ZeRO-3 / FSDP FULL_SHARD 连 parameters 也常驻为 shard。它降低状态冗余，但不会自动切单层 GEMM，也不会自动切 attention context。
+
+如果单层过大或层内算力不足，需要 TP。TP 把一层里的权重矩阵、attention heads 或 hidden dimension 分到多个 rank。它的通信频率高，常在每个 Transformer block 内出现 AllReduce、AllGather 或 ReduceScatter，所以应该优先放在节点内 NVLink/NVSwitch。
+
+如果单层通过 TP 能放下，但完整网络仍太大，需要 PP。PP 按层段把模型放到不同 stage，microbatch 像流水线一样经过 stage。PP 的容量收益明确，但会产生 pipeline bubble。stage 越多、microbatch 越少，空闲比例越高。
+
+如果 PP bubble 太高，可以引入 interleaved pipeline 和 zero bubble 调度。interleaved pipeline 把一个物理 stage 拆成多个 virtual stage 交错执行，减少负载不均和填充/排空空闲。zero bubble 类调度把 backward 拆成输入梯度、权重梯度、更新等更细工作，尽量用可提前执行的工作填满空槽。
+
+如果上下文长度继续增加，SP/CP 成为必要补充。SP 通常在 TP 组内切非 attention 路径的 sequence activation，例如 LayerNorm、Dropout、Residual。CP 切 attention context，让 token block 或 K/V 在多卡之间流动。它们解决的是序列维度压力，不替代 TP/PP/DP/FSDP。
+
+如果模型是 MoE，还会引入 EP。EP 把不同 experts 放在不同 rank，token 通过 router 分发给少数 experts。EP 的主要瓶颈通常不是参数存储，而是 token dispatch、All-to-All、expert load balance 和 dropless routing 的尾延迟。本章只把 EP 放进策略边界，MoE 细节需要单独设计。
+
+### 1.3 学习大纲
+
+读完本章，你应该能回答：
+
+1. TP、PP、SP、CP、EP、FSDP/ZeRO 分别切什么，复制什么，通信什么。
+2. 3D parallel 的 rank mesh 如何映射到节点、GPU、NVSwitch island 和 IB/RoCE rail。
+3. microbatch、pipeline bubble、virtual stage、activation placement 如何共同决定 PP 效率。
+4. 为什么 TP 更适合节点内，DP 更适合跨节点，CP 对长上下文网络路径更敏感。
+5. 如何用模型大小、sequence length、GPU topology、framework support、checkpoint format 和 recovery SLA 选择并行策略。
+6. Megatron-style TP/PP/CP/DP 配置、DeepSpeed pipeline boundaries、FSDP hybrid sharding 的工程边界是什么。
+7. 并行策略如何改变 checkpoint、optimizer state、failure recovery 和 inference conversion。
+8. 如何为 70B 和 405B 模型比较至少两套并行配置，并解释显存、吞吐、网络压力和恢复复杂度。
+
+---
+
+## 2. 概念边界：是什么、不是什么、相邻概念边界
+
+### 2.1 是什么
+
+模型并行与流水并行是一组把训练 step 拆到多个 rank 的系统技术。它覆盖：
+
+- Tensor Parallelism, TP：切层内张量和矩阵计算。
+- Pipeline Parallelism, PP：切 Transformer layer stage。
+- Sequence Parallelism, SP：通常在 TP 组内切非 attention activation 的 sequence 维度。
+- Context Parallelism, CP：切长上下文 attention / KV / context blocks。
+- Expert Parallelism, EP：切 MoE experts 和 token dispatch。
+- FSDP/ZeRO：切 parameters、gradients、optimizer state。
+- 3D parallel：常指 `DP x PP x TP`，实际生产中还可能叠加 CP、SP、EP 或 ZeRO/FSDP。
+
+工程上，这些机制共同定义一个 rank mesh：
+
+```text
+global_rank
+  -> data_parallel_group
+  -> pipeline_stage
+  -> tensor_parallel_group
+  -> optional context_parallel_group
+  -> optional expert_parallel_group
+```
+
+每个 group 都有自己的通信域、状态归属、checkpoint shard、日志标签和故障传播方式。
+
+### 2.2 不是什么
+
+模型并行不是：
+
+- 纯粹的显存技巧。它会改变 step timeline、collective、checkpoint、恢复和推理转换。
+- “越多维度越高级”。每多一个维度，rank placement、debug、profile、resume 都更难。
+- 对 DP 的替代。多数大模型训练仍需要 DP 扩吞吐，只是 DP 的一个副本本身由 TP/PP/FSDP/CP 组成。
+- 对 FSDP/ZeRO 的替代。TP/PP 切计算和层，FSDP/ZeRO 切训练状态，二者经常叠加。
+- 框架参数的机械组合。`tensor-model-parallel-size=8` 只有在 hidden size、heads、节点内拓扑、kernel 和 checkpoint 格式都匹配时才成立。
+- 一次训练配置的终点。训练态的 shard layout 还要能转换到 inference engine 接受的 TP、quantization 和 checkpoint 格式。
+
+### 2.3 相邻概念边界
+
+| 概念 | 切分对象 | 不切什么 | 主要通信 | 常见放置 |
+|---|---|---|---|---|
+| DP | samples | 单个模型副本内部结构 | gradient AllReduce / ReduceScatter | 可跨节点 |
+| FSDP/ZeRO | training states | 单层 GEMM 本身 | parameter AllGather、gradient ReduceScatter | 节点内外均可，受网络影响 |
+| TP | layer tensor / heads / hidden | layers、samples | AllReduce、AllGather、ReduceScatter | 优先节点内 NVLink/NVSwitch |
+| PP | layers / stages | stage 内层计算 | activation / gradient send-recv | 可跨节点，但要固定拓扑 |
+| SP | non-attention sequence activations | attention context 全局依赖 | AllGather、ReduceScatter | 通常在 TP 组内 |
+| CP | attention context / KV / token blocks | parameters / optimizer states | ring KV、All-to-All、P2P | 高速互联优先，可跨节点但成本高 |
+| EP | experts | dense shared layers | token dispatch All-to-All | MoE expert mesh |
+
+一句话边界：
+
+```text
+DP 切样本，FSDP/ZeRO 切训练状态，TP 切层内张量，PP 切层段，
+SP 切非 attention 的序列激活，CP 切 attention context，EP 切专家。
+```
+
+---
+
+## 3. 架构：控制路径、数据路径、状态路径、故障路径
+
+### 3.1 责任边界
+
+一个混合并行训练系统至少有六个责任面：
+
+| 责任面 | 关键对象 | 失败表现 |
+|---|---|---|
+| Scheduler | node、GPU、NIC、topology label、placement policy | TP 跨慢链路，PP stage 跨坏节点，step time P95 飙升 |
+| Launcher | rank、local rank、world size、process groups | rank mesh 错位，collective hang |
+| Framework | Megatron、DeepSpeed、PyTorch FSDP、optimizer | OOM、loss 不一致、checkpoint mismatch |
+| Communication | NCCL groups、P2P、AllReduce、All-to-All、rails | bus bandwidth 低、timeout、rank tail |
+| State | parameters、gradients、optimizer、RNG、metadata | resume 后权重错位、optimizer shard 丢失 |
+| Observability | per-rank metrics、stage timeline、NCCL logs、checkpoint audit | 只能看到慢或 hang，无法归因到 TP/PP/CP |
+
+### 3.2 控制路径
+
+控制路径负责把一个逻辑训练配置变成确定性的 rank mesh：
+
+```text
+job spec
+  -> scheduler allocates topology-aware nodes
+  -> launcher assigns global/local ranks
+  -> framework builds DP/PP/TP/CP/EP/FSDP groups
+  -> model partitioner maps layers/tensors/context/expert shards
+  -> training loop executes microbatch schedule
+  -> checkpoint writer records shard layout and global step
+```
+
+控制路径的关键不变量：
+
+- `world_size == DP * PP * TP * CP * EP`，FSDP/ZeRO group size 另行定义。
+- 每个 Transformer layer 必须有唯一 stage owner，除非 interleaved pipeline 让一个物理 rank 拥有多个 virtual stage。
+- TP 组内 hidden size、attention heads、KV heads、vocab padding 必须可整除。
+- CP 组内 sequence partition、position encoding、attention mask、KV exchange 顺序必须一致。
+- checkpoint metadata 必须保存并行维度、rank mapping、tensor shard spec、optimizer shard spec 和 RNG/data cursor。
+
+### 3.3 数据路径
+
+混合并行下，数据路径不再是“每个 rank 一份 batch”这么简单。
+
+```text
+dataset shard
+  -> DP rank owns sample slice
+  -> microbatch split
+  -> PP stage 0 receives input tokens
+  -> activation flows stage by stage
+  -> TP group computes each layer shard
+  -> optional SP/CP repartitions sequence/context
+  -> final stage computes loss
+  -> gradients flow backward through pipeline
+```
 
 其中：
 
-- `m` 是 micro-batch 数
-- `p` 是 pipeline stage 数
+- DP group 之间处理不同样本。
+- PP stage 之间传 activation 和 activation gradients。
+- TP group 内共同计算同一层。
+- SP/CP group 内重新布局 sequence 或 context。
+- EP group 内做 token dispatch 和 expert output combine。
 
-这个式子的直觉很重要：
+因此一个 step 的慢点可能来自任意路径：DataLoader、PP send/recv、TP AllReduce、CP KV exchange、EP All-to-All 或 FSDP parameter AllGather。
 
-- micro-batch 太少，bubble 占比高
-- stage 太多，流水线填满更慢
+### 3.4 状态路径
 
-所以流水并行并不是“切得越细越好”。
+状态路径回答“每一份训练状态归谁拥有，何时一致，如何保存”。
 
-### 9.5 为什么大模型训练通常是混合并行
+| 状态 | TP | PP | SP/CP | FSDP/ZeRO | checkpoint 影响 |
+|---|---|---|---|---|---|
+| Parameters | tensor shard | layer stage shard | 通常不切参数 | param shard | 保存 tensor / layer / state shard spec |
+| Gradients | tensor shard gradient | stage-local gradient | 受重分布影响 | gradient shard | 需要记录 reduce/repartition 后的 owner |
+| Optimizer state | 跟随 param shard | stage-local optimizer | 通常跟随 param | optimizer shard | Adam m/v shard 数量急剧增加 |
+| Activations | TP 内可能分片 | 跨 stage 传递 | SP/CP 切 sequence/context | 不直接解决 activation | activation placement 决定 recompute 和内存峰值 |
+| RNG | 每 rank 独立 | 每 stage 独立 | dropout/mask 必须可复现 | 每 shard 独立 | resume 必须保存 rank-local RNG |
+| Dataset cursor | DP rank 负责 | stage 不拥有样本 | 不拥有样本 | 不拥有样本 | 保存 epoch、sample offset、packing seed |
+| Parallel metadata | group mesh | layer map | sequence map | shard map | 恢复和推理转换的关键输入 |
 
-现实中，超大模型训练很少只用一种并行方式，更常见的是组合：
+### 3.5 故障路径
 
-- 数据并行：做样本吞吐扩展
-- 张量并行：解决单层过大
-- 流水并行：解决整体层数过多
-- 参数 / 状态切分：进一步降低显存压力
+混合并行的故障通常有放大效应：
 
-这意味着平台需要处理的不只是某一种并行策略，而是：
+- 一个 TP rank OOM，TP group 的 AllReduce 会 hang，随后 PP stage 等不到 activation 或 gradient。
+- 一个 PP stage 慢，整条 pipeline 被最慢 stage 限速，DP group 在梯度同步前等待。
+- 一个 CP rank 网络抖动，长 context attention 的 KV exchange 拖慢全体 microbatch。
+- 一个 checkpoint shard 缺失，恢复时可能不是立即报错，而是在 optimizer step 后才出现 loss spike。
 
-- 不同组之间的 rank 组织
-- 不同通信域
-- 不同 checkpoint 方式
-- 不同恢复逻辑
+生产平台需要把故障标签写到指标里：
 
-### 9.6 ZeRO 系列与 FSDP
+```text
+rank, node, local_rank, dp_rank, pp_stage, tp_rank, cp_rank, ep_rank, virtual_stage
+```
 
-ZeRO 的核心思想不是“换一种模型并行”，而是把训练状态按不同粒度分片，减少每卡持有的冗余状态。
+没有这些维度，排障只能停留在“某个 rank 慢”。
 
-| 方案 | 主要分片什么 | 典型收益 | 主要代价 |
-|------|--------------|----------|----------|
-| ZeRO Stage 1 | Optimizer state | 先降优化器显存 | 实现简单，但参数和梯度仍全量保留 |
-| ZeRO Stage 2 | Optimizer state + Gradients | 进一步降梯度占用 | 通信更多，反向路径更复杂 |
-| ZeRO Stage 3 | Optimizer state + Gradients + Parameters | 最大幅度降低单卡状态占用 | 通信、checkpoint、恢复都更复杂 |
-| PyTorch FSDP | 常被视作官方 ZeRO-3 风格实现 | PyTorch 原生集成较好 | 仍需认真处理 shard、state dict 和恢复流程 |
+### 3.6 Mermaid：跨节点和 GPU 的 3D parallel placement
 
-工程上最重要的判断是：
+下面是一个 `DP=2, PP=4, TP=4` 的 32 GPU 示例。每个节点 8 GPU，TP=4 放在同一节点半边 NVSwitch 域内；两个 TP 组组成两个 PP stage pair；DP 复制整条 `PP x TP` 模型副本。
 
-- **ZeRO / FSDP 与 TP / PP 是互补关系，不是替代关系**
-- 当模型既放不下单卡，又不想把所有层硬切给 TP / PP 时，ZeRO / FSDP 往往是第一补充手段
+```mermaid
+flowchart TB
+  subgraph DP0["Data Parallel replica 0"]
+    subgraph N0["Node 0 - NVSwitch - GPUs 0-7"]
+      A0["PP0 / TP0-3\nlayers 0-19\nGPU0-3"]
+      A1["PP1 / TP0-3\nlayers 20-39\nGPU4-7"]
+    end
+    subgraph N1["Node 1 - NVSwitch - GPUs 0-7"]
+      A2["PP2 / TP0-3\nlayers 40-59\nGPU0-3"]
+      A3["PP3 / TP0-3\nlayers 60-79\nGPU4-7"]
+    end
+    A0 -- activation P2P --> A1
+    A1 -- activation over IB/RoCE --> A2
+    A2 -- activation P2P --> A3
+  end
 
-但一旦进入状态分片，你的 checkpoint 就不能再按“单文件全量模型”思路设计，通常要转向 [第10章 §10.6](./10-memory-checkpointing-and-recovery.md) 的分布式 checkpoint 方案。
+  subgraph DP1["Data Parallel replica 1"]
+    subgraph N2["Node 2 - NVSwitch - GPUs 0-7"]
+      B0["PP0 / TP0-3\nlayers 0-19\nGPU0-3"]
+      B1["PP1 / TP0-3\nlayers 20-39\nGPU4-7"]
+    end
+    subgraph N3["Node 3 - NVSwitch - GPUs 0-7"]
+      B2["PP2 / TP0-3\nlayers 40-59\nGPU0-3"]
+      B3["PP3 / TP0-3\nlayers 60-79\nGPU4-7"]
+    end
+    B0 -- activation P2P --> B1
+    B1 -- activation over IB/RoCE --> B2
+    B2 -- activation P2P --> B3
+  end
 
-### 9.7 Interleaved Pipeline 与 Zero Bubble 简述
+  A0 -. TP collectives stay inside GPU0-3 .- A0
+  A1 -. TP collectives stay inside GPU4-7 .- A1
+  A2 -. TP collectives stay inside GPU0-3 .- A2
+  A3 -. TP collectives stay inside GPU4-7 .- A3
+  A3 -- gradient sync across DP replicas --> B3
+  A2 -- gradient sync across DP replicas --> B2
+  A1 -- gradient sync across DP replicas --> B1
+  A0 -- gradient sync across DP replicas --> B0
+```
 
-传统 1F1B 已经能降低部分 bubble，但 stage 负载仍可能不均。进一步优化时，常见两个方向：
+设计要点：
 
-| 思路 | 在解决什么 | 工程代价 |
-|------|------------|----------|
-| Interleaved Pipeline | 让一个设备承担多个更细的 stage，降低空闲比例 | 调度更复杂，stage 划分更难 |
-| Zero Bubble 系列思路 | 尽量把前向、反向和权重更新空隙压到更低 | 依赖更复杂的调度与实现细节 |
+- TP collective 不跨节点，避免每层 AllReduce 进入 IB/RoCE。
+- PP activation 可以跨节点，但 stage 边界数量要少且固定。
+- DP 同步跨副本发生在等价 stage 和 tensor shard 之间。
+- 如果启用 FSDP hybrid sharding，FSDP group 应与 DP 或节点边界对齐，避免把 parameter AllGather 放到最慢路径。
 
-#### Interleaved Pipeline
+---
 
-Interleaved Pipeline 可以理解成“把原来每张卡只放一个大 stage，改成每张卡放多个更细的小 stage，再交错执行”。
-传统 1F1B 虽然已经比纯 GPipe 更省 bubble，但如果 `p` 个 stage 很粗，流水线填充和排空时仍会有明显空闲，特别是在 stage 数多、micro-batch 数不够多时更明显。Interleaved 的核心改进，不是改变“前向后向交替”的大方向，而是把 stage 切得更细，让同一张 GPU 在不同时间片承担多个虚拟 stage（virtual pipeline stage）。这样一来，单个 stage 的颗粒度更小，流水线更容易被填满，前后端空闲段也更短。
+## 4. 原理：从容量、通信和调度推导机制
 
-它解决的本质问题是：**传统 stage 太粗，导致 bubble 比例和负载不均同时存在。** 如果某个 stage 比其他 stage 更重，整条流水线都会被最慢 stage 拖住；而当每张卡承担多个更细的子阶段时，负载更容易被摊平，bubble 也通常会比原始 1F1B 更低。代价也很直接：切分后的依赖关系、activation 传递、micro-batch 调度都会更复杂，工程上往往需要框架原生支持，而不是平台自己临时拼出来。
+### 4.1 最小容量账本
 
-#### Zero Bubble
+一个 rank 的峰值 HBM 可以近似写成：
 
-Zero Bubble 这一类方法的目标更激进：它不是只接受“还有一点 bubble，但能忍”，而是试图把流水线中的空闲时间进一步塞满。核心直觉是，传统流水线通常把反向传播看成一个大块步骤，但从执行视角看，反向里其实包含不同类型的工作，例如输入梯度相关计算、权重梯度相关计算、以及后续权重更新。Zero Bubble 系列思路会把这些步骤拆成更细的 micro-op，然后重新编排，让原本会闲着的 stage 去做能够提前执行的那部分工作。
+```text
+HBM_rank =
+  parameter_shards
+  + gradient_shards
+  + optimizer_shards
+  + activation_resident
+  + attention_workspace
+  + communication_buffers
+  + fragmentation_margin
+```
 
-因此，Zero Bubble 解决的不是“流水并行能不能跑”，而是“流水并行已经能跑以后，如何继续压榨利用率”。它常见于超大规模训练、stage 很多、硬件极贵的场景，因为这时少量 bubble 都可能意味着大量 GPU 时间被浪费。要注意的是，这里的“Zero”更像优化目标，而不是说任何情况下都真的完全没有 bubble。平台侧真正需要理解的是：当团队讨论 Zero Bubble，他们通常已经在面对一个更高阶的问题，即**如何把 backward（B）和 weight update（W）拆散并穿插到原本空闲的时间槽里**。这会显著增加调度复杂度、实现难度和排障成本，但换来的是更高的流水线利用率。
+不同并行方式改变不同项：
 
-平台侧不一定要自己实现这些算法，但需要知道：当训练团队开始谈这些词，通常说明传统流水线利用率已经成为明确瓶颈。
+- TP 降低单层 parameter 和 compute shard，但增加 TP communication buffers。
+- PP 降低每 rank 常驻 layer 数，但增加跨 stage activation 缓冲。
+- SP 降低部分 sequence activation 常驻量。
+- CP 降低每 rank context / KV / attention workspace，但增加 KV exchange buffer。
+- FSDP/ZeRO 降低 parameter/gradient/optimizer 常驻量，但增加 all-gather 和 reduce-scatter buffer。
+- activation checkpointing 降低 activation resident，但增加 recompute FLOPs。
 
-### 9.8 Sequence Parallelism 与 Context Parallelism
+容量判断必须用真实训练形态，而不是只用参数量。粗略估算 BF16 dense 参数：
 
-当上下文长度从 4K、8K 拉到 32K、128K 甚至更长时，只靠 TP / PP / ZeRO 往往还不够，因为激活和 attention 的 KV 开销会随着序列长度迅速放大。
+```text
+parameter_bytes = num_parameters * 2
+Adam_states_without_sharding ~= num_parameters * (grad 2 + master 4 + m 4 + v 4)
+```
 
-这时常见补充手段有两类：
+70B 参数 BF16 仅约 `140 GB`，但不分片 AdamW 训练状态可超过 `980 GB`，还没算 activation、workspace 和 fragmentation。405B BF16 参数约 `810 GB`，已经超出单节点 8x80GB 的裸参数容量，更不用说训练状态。
 
-| 技术 | 切分什么 | 主要在解决什么 | 更依赖什么 | 常见通信 |
-|------|----------|----------------|------------|----------|
-| Tensor Parallelism | 隐藏维度 / 权重矩阵 | 单层参数或计算过大 | NVLink / NVSwitch | 每层 AllReduce |
-| Sequence Parallelism | 序列维度中的非 attention 部分 | 降低 LayerNorm、Dropout 等激活占用 | 通常要配合 TP | AllGather / ReduceScatter |
-| Context Parallelism | attention 的序列维度 | 让长上下文 attention / KV 不必全压在单卡 | 高速 GPU-GPU 或跨节点互联 | 环形 KV 传递 |
+### 4.2 TP 的通信边界
 
-#### Sequence Parallelism
+TP 常见做法：
 
-Megatron-LM 风格的 Sequence Parallelism（SP），首先要解决一个很容易被忽略的问题：**即便已经做了 TP，激活也不一定真的被切小了。**
+- Column parallel linear：切输出 hidden，forward 后通常保留分片，后续按实现决定是否 AllGather。
+- Row parallel linear：切输入 hidden，局部 matmul 后需要 AllReduce 或 ReduceScatter。
+- Attention head parallel：按 heads 切，要求 attention heads 或 KV heads 能被 TP size 整除。
+- Vocab parallel：切 vocab projection，loss 前后有特殊通信。
 
-原因在于，TP 主要切的是权重矩阵和隐藏维度上的 GEMM 计算；但像 LayerNorm、Dropout、Residual Add 这类“按 token 做、又不值得再做一次张量切分”的操作，在很多实现里仍然会在 TP 组内每张卡各自保留完整序列的激活。结果就是：
+TP 的工程判断：
 
-- 参数显存因为 TP 下降了
-- 但 activation memory 仍然按完整 sequence 保留
-- 当序列长度继续拉长时，真正先爆掉的常常是这些重复保留的激活，而不是权重
+```text
+TP_comm_exposed = max(TP_collective_time - overlap_with_compute, 0)
+```
 
-SP 的做法，就是在 **TP 组内部再按 sequence 维度切一刀**。直觉上可以理解成：
+如果 TP collective 在 Nsight Systems 中反复出现在每层 GEMM 之间，并且 NCCL bus bandwidth 明显低于节点内基线，TP size 可能过大或 placement 跨了慢链路。TP 不是越大越好：TP=8 通常适合 8 GPU NVSwitch 节点；TP=16 跨节点时，每层通信会直接吃掉训练效率。
 
-- TP 先把“大矩阵乘法”按隐藏维度切开
-- SP 再把 LayerNorm、Dropout、Residual 路径上的 token 按序列分段
-- 每张卡只保留自己那一段 token 的非 attention 激活
+### 4.3 PP、microbatch 和 pipeline bubble
 
-这样做之后，原来在每个 TP rank 上重复保留的一整条序列，会变成“每卡只拿到其中一段”，所以 LayerNorm / Dropout 一类中间激活显存会明显下降，通常能近似按 TP 组大小被摊薄。对于长序列训练，这个收益很直接，因为这些算子本来就是沿 token 独立处理的，最适合按 sequence 分摊。
+流水并行把一个 batch 切成 `m` 个 microbatch，通过 `p` 个 pipeline stage。**bubble 公式因调度策略不同而完全不同**——很多工程团队套用 GPipe 公式来算 1F1B 的效率，结果误差可达 2-3 倍。
 
-但 SP 不是白拿的。为了让前后算子仍能看到正确张量布局，框架通常要在层间插入额外通信：
+#### 4.3.1 三种主流调度的 bubble 公式
 
-- 某些阶段需要 `AllGather`，把序列片段重新拼成后续算子所需的视图
-- 某些阶段需要 `ReduceScatter`，在通信后再把结果重新按 sequence 分散回各卡
+| 调度策略 | bubble fraction | 直觉 | 典型框架 |
+|---|---|---|---|
+| **GPipe**（全 forward 后再全 backward） | `(p - 1) / (m + p - 1)` | warmup + cooldown 各占 `p-1` step | 早期 GPipe、PaddlePaddle FleetX |
+| **1F1B**（One-Forward-One-Backward） | `(p - 1) / m` | 稳态阶段 forward 和 backward 完全交错；只剩 startup `p-1` 个 bubble | **Megatron-LM 默认**、DeepSpeed PipelineEngine、TorchTitan |
+| **Interleaved 1F1B**（virtual stage = `v`） | `(p - 1) / (v · m)` | 把每个物理 stage 切成 v 个 virtual stage，bubble 进一步缩 v 倍 | Megatron-LM `--num-layers-per-virtual-pipeline-stage` |
+| **Zero Bubble Pipeline**（W-pass 拆分） | 接近 0（理想） | 把 backward 拆成 W（weight grad）+ B（input grad），用 W 填充 startup 空隙 | DeepSeek、Megatron-Core 实验路径 |
 
-所以 SP 的工程定位非常明确：**它通常不是独立并行维度，而是 TP 的增强件。** 如果没有 TP 组，Megatron 语境下的 SP 往往没有意义；如果序列不长、瓶颈也不在 activation，那么这层复杂度也不一定值得引入。
+#### 4.3.2 同条件下三种调度的 bubble 对比
 
-#### Context Parallelism
+以 `p = 8` PP stage 为例（典型 70B 模型 8 stage 配置）：
 
-Context Parallelism（CP）则是另一个层级的问题：**当上下文来到 128K、256K 甚至更高时，attention 本身就已经大到不能再把整条序列塞进单卡。**
+| `m`（microbatch 数） | GPipe bubble | 1F1B bubble | Interleaved 1F1B（`v=4`） | Zero Bubble |
+|---:|---:|---:|---:|---:|
+| 8 | **46.7%** | 87.5% | 21.9% | ~0% |
+| 16 | 30.4% | **43.8%** | 10.9% | ~0% |
+| 32 | 17.9% | 21.9% | 5.5% | ~0% |
+| 64 | 9.9% | 10.9% | 2.7% | ~0% |
+| 128 | 5.2% | 5.5% | 1.4% | ~0% |
 
-这里的压力主要来自三部分：
+> [!DANGER]
+> **注意一个反直觉数字**：`m = 8`、`p = 8` 时，1F1B 的 bubble 计算出来是 `(8-1)/8 = 87.5%`，**比 GPipe 的 46.7% 还高**。这是因为 1F1B 的"稳态完美交错"假设需要 `m ≥ p`。当 `m < p` 时 1F1B 进入 warmup 区间，行为退化甚至比 GPipe 还差。生产规则：**1F1B 的 m 至少应 ≥ p，最好 ≥ 4p 才能让稳态吞吐主导整个 batch**。
 
-- attention 相关激活会随序列长度快速膨胀，很多中间量带有明显的平方级趋势
-- KV 表示至少会随序列长度线性增长，context 越长，KV 占用越夸张
-- 即便参数已经通过 TP / PP / ZeRO 放下，attention workspace 仍可能把单卡显存顶满
+#### 4.3.3 工程含义
 
-所以 CP 不是在解决“权重太大”，而是在解决“**序列维度本身太长**”。它的核心思路是把 context 维度切到多张卡：
+- **生产几乎都用 1F1B 或 Interleaved 1F1B，不是 GPipe**。如果你看到旧文档/教程仍在用 `(p-1)/(m+p-1)` 估算，很可能是 GPipe 时代遗留——直接套到 Megatron 上估算会偏差几倍。
+- **Interleaved 1F1B 的 `v` 值**：常见 v=2~8。v 越大 bubble 越低，但每个 microbatch 走的物理 stage 边界更多 → activation send/recv 通信量随 v 倍增加。在 NVLink/IB 带宽不足时，v 太大反而拖慢。
+- **Zero Bubble** 在 DeepSeek-V3 训练里被报告把 ~10% bubble 进一步压到 ~1%，但实现复杂（必须重写 backward 把 W/B 拆开），框架支持仍在演进。
+- **microbatch 数 `m` 与 batch size 的关系**：global_batch = `m × micro_batch_size × DP_world_size`。增加 m 是降 bubble 最直接的手段，但 m 太大会让 activation 同时驻留更多（1F1B 稳态约驻留 p 个 microbatch 的 activation），可能再次撞上显存。
 
-- 每张卡只持有一段 token / context block
-- 本卡先对自己那段序列做局部 attention 计算
-- 为了拿到完整上下文所需的 K/V，再通过跨卡通信逐段交换或重排 K/V
+> [!NOTE]
+> 这个公式仍是估算，不替代 profile。真实集群 stage 计算时间可能不均匀（某些 stage 算 attention，某些算 MLP），需要 profile 后用 layer placement 调平 stage time，否则 bubble 公式对应的"理想 utilization"也拿不到。
 
-直觉上，CP 可以理解成“把一条超长文本拆成多段，让多张卡分摊 attention 的序列负担”。这样每张卡不再需要同时持有完整 128K+ 的 attention 激活和 KV，单卡显存才有机会落回可训练范围。
+### 4.4 virtual stage、interleaved pipeline 和 zero bubble
 
-常见实现思路包括 Ring Attention、DeepSpeed Ulysses 一类方案，但它们的通信直觉不完全一样：
+physical stage 是真实 rank 或 GPU 上的一段层。virtual stage 是同一物理 rank 上更细的层段。interleaved pipeline 让一个 rank 持有多个 virtual stage，例如：
 
-- **Ring Attention**：更像是“Q 留在本地，K/V 沿环逐跳传递”。每张卡反复接收下一段 K/V、更新本地 attention 结果，再继续把 K/V 往下传，通信模式很接近环形流水。
-- **Ulysses 一类方案**：更像先把 token / head 的布局重新分发，让每张卡在新的切分视图下运行更标准的 attention kernel，常见代价是更重的重排或 All-to-All 风格通信。
+```text
+rank0 owns virtual stages 0 and 4
+rank1 owns virtual stages 1 and 5
+rank2 owns virtual stages 2 and 6
+rank3 owns virtual stages 3 and 7
+```
 
-这两类方案的共同目标，都是把原本集中在单卡上的 attention 序列开销摊到多卡上。差别主要在于：**是让 K/V 在环上流动，还是先把张量布局重排后再算。**
+收益：
 
-为什么 128K+ 训练经常几乎必须上 CP？因为这时真正撑爆显存的，往往不是参数，而是 attention 相关激活、softmax 中间量和 KV。ZeRO 主要切的是参数、梯度、优化器状态；它并不会把“这 128K token 之间的 attention 关系”自动切掉。所以在超长上下文场景里，TP / PP / ZeRO 解决的是“模型能不能放下”，CP 解决的则是“**这个上下文本身能不能算得动**”。
+- stage 粒度更细，负载更容易均衡；
+- bubble 下降；
+- 首尾 embedding / loss head 对单个 stage 的拖累可被摊薄。
 
-#### SP / CP 与 TP / PP / DP 的关系
+代价：
 
-理解 SP / CP 最容易犯的错误，是把它们当成“新一代并行方案”，仿佛上了 SP 或 CP 就可以替换掉 DP / TP / PP。实际工程里通常不是这样。
+- activation placement 更复杂；
+- microbatch schedule 更难排查；
+- checkpoint layer mapping 必须记录 virtual stage；
+- 参数更新时序更容易和异步通信交织。
 
-- DP 切的是样本维度，主要解决吞吐扩展
-- TP 切的是层内隐藏维度 / 权重矩阵，主要解决单层太大
-- PP 切的是模型层段，主要解决整网太深、整模放不下
-- SP 切的是 **非 attention 路径**上的序列维度，主要给 TP 降 activation memory
-- CP 切的是 **attention 路径**上的 context 维度，主要让超长上下文 attention 能落到多卡
+zero bubble 类调度的目标是把传统 backward 拆成更细的可调度单元，例如 input-gradient backward、weight-gradient backward、optimizer update，把原本空闲的槽填上。平台侧不需要自己实现算法，但必须知道它改变证据形态：Nsight 中不再是整齐的 F/B/W 块，checkpoint 和 profiler tag 必须能识别 micro-op。
 
-所以它们通常是叠加关系，而不是替代关系。一个真实训练作业很可能同时长这样：
+### 4.5 activation placement
 
-- `DP x PP x TP` 作为基础并行框架
-- 在 TP 组内部再打开 SP，减少 LayerNorm / Dropout / Residual 的激活冗余
-- 当 context 拉到 128K+ 时，再叠加 CP 去切 attention 的序列负担
+activation placement 是 PP/SP/CP 中经常被低估的容量问题。需要明确：
 
-也就是说，**SP/CP 是补“序列维度显存”这块短板，而不是把已有 DP/TP/PP 推翻重来。**
+- 哪些 activation 常驻到 backward；
+- 哪些在 stage 边界发送后释放；
+- 哪些由 activation checkpointing 重算；
+- 哪些因为 SP 被 sequence shard 化；
+- 哪些因为 CP 只持有本地 context block；
+- 哪些 communication buffer 会和 compute peak 重叠。
 
-#### 什么时候该用，什么时候会失败
+常见反例：模型参数分片后 HBM 看起来足够，但 PP stage 边界缓存了过多 in-flight microbatch activation，导致 stage 1 或 stage 2 OOM。修复不是盲目减 TP，而是调 `num_microbatches`、activation checkpoint granularity、pipeline schedule 或 stage cut。
 
-| 技术 | 典型适用条件 | 主要收益 | 主要代价 | 常见失败条件 / 不适用场景 |
-|------|--------------|----------|----------|----------------------------|
-| DP | 单卡能容纳完整训练副本，主要目标是扩吞吐 | 实现最成熟，扩样本最直接 | 需要做全局梯度同步，模型副本完全重复 | 单卡放不下参数、梯度、优化器状态或激活时失效 |
-| TP | 单层线性层或注意力投影太大，且节点内有高速互联 | 把单层权重和计算切到多卡，解决单层过大问题 | 每层高频 `AllReduce` / `AllGather`，强依赖 NVLink / NVSwitch | 互联太慢、模型太小、隐藏维度不够大时，通信成本可能超过收益 |
-| PP | 整体网络太深或整模无法放入单节点，希望按层切分 | 每卡只承载一段层，适合超深模型 | 有 pipeline bubble，调度和负载均衡复杂 | 层数不够多、stage 切分不均、micro-batch 太少时效率差 |
-| SP | 已经在用 TP，且长序列下 LN / Dropout / Residual 激活占用明显 | 降低 TP 组内重复保留的非 attention 激活显存 | 每层引入额外 `AllGather` / `ReduceScatter`，实现更复杂 | 没有 TP、序列不长、瓶颈不在 activation 时收益有限 |
-| CP | 128K+ 长上下文训练，attention 激活 / KV / workspace 已成主瓶颈 | 把超长 context 的 attention 序列负担摊到多卡，长上下文几乎必备 | 序列维度通信重，依赖高速互联和专门 attention 实现 | 上下文不够长、跨卡带宽不足、框架 / kernel 不支持 Ring / All-to-All 式 attention 时难落地 |
+### 4.6 SP 和 CP 的本质区别
 
-平台视角里，SP / CP 也会改变拓扑要求：
+SP 通常依附于 TP。TP 切 hidden 后，LayerNorm、Dropout、Residual 等非 attention 路径可能仍在每个 TP rank 保留完整 sequence activation。SP 再按 sequence 分片，让这些 activation 不再重复。
 
-- SP 更常发生在同一 TP 组内，通常要求高速节点内互联
-- CP 会让长上下文阶段出现更重的序列维度通信，对 [第5章](../part2-systems-stack/05-memory-interconnect-io.md) 的互联和拓扑更敏感
+CP 面向 attention context。长上下文下，Q/K/V、attention scores、mask、KV cache 或 training KV activation 的压力随 sequence 增长。CP 让每个 rank 只持有一段 context，并通过 ring、P2P 或 All-to-All 获取完整 attention 所需的信息。
 
-所以一旦训练团队开始讨论 128K、256K context，平台就不能只问“显存够不够”，还要问“序列维度通信能不能承受”。
+边界：
 
-### 9.9 并行策略选型决策树
+- 8K/16K context：SP 可能已经有收益，CP 未必值得。
+- 64K/128K context：attention workspace 和 KV 通常成为瓶颈，CP 需要进入候选。
+- CP 需要 kernel、position encoding、mask、FlashAttention 变体和 checkpoint metadata 全部支持；不是开一个 group size 就能跑。
 
-下面给一个面向工程落地的简化决策树。输入不是“模型参数量”一个数，而是目标训练形态的完整账本：
+### 4.7 EP 的位置
 
-- 模型状态：参数、梯度、optimizer state、master weights、embedding / vocab、MoE expert 是否稀疏
-- 激活与序列：micro-batch、sequence length、activation checkpointing、attention workspace、KV / context block
-- 硬件资源：总 GPU 数、每节点 GPU 数、HBM 容量、节点内 NVLink / NVSwitch、跨节点 IB / RoCE 带宽
-- 工程约束：框架支持、checkpoint 格式、故障恢复 SLA、团队对混合并行调试的熟悉程度
+EP 主要用于 MoE。dense 模型没有 experts，EP 不适用。MoE 中每个 token 只路由到 top-k experts，参数容量可远大于实际激活计算。EP 的关键问题是：
+
+- token dispatch All-to-All；
+- expert load balance；
+- capacity factor 和 dropped tokens；
+- expert optimizer state placement；
+- checkpoint expert shard 与 inference router 兼容。
+
+如果一个 405B 是 MoE 而不是 dense，策略会完全不同：EP 可能比更高 PP 更重要。本章后面的 405B worked example 默认 dense 模型，MoE 只作为边界提醒。
+
+---
+
+## 5. 框架实现：knobs、constraints 和配置
+
+### 5.1 Megatron-style 配置示例
+
+下面是一个 70B dense 模型的 Megatron-style 片段，展示 TP/PP/CP/DP 如何落到真实参数。不同 fork 参数名会有差异，但工程语义基本一致。
+
+```bash
+torchrun \
+  --nnodes 16 \
+  --nproc_per_node 8 \
+  --rdzv_backend c10d \
+  --rdzv_endpoint "$MASTER_ADDR:29400" \
+  pretrain_gpt.py \
+  --num-layers 80 \
+  --hidden-size 8192 \
+  --num-attention-heads 64 \
+  --seq-length 8192 \
+  --max-position-embeddings 8192 \
+  --micro-batch-size 1 \
+  --global-batch-size 1024 \
+  --tensor-model-parallel-size 8 \
+  --pipeline-model-parallel-size 4 \
+  --context-parallel-size 1 \
+  --sequence-parallel \
+  --use-distributed-optimizer \
+  --overlap-grad-reduce \
+  --overlap-param-gather \
+  --bf16 \
+  --recompute-granularity full \
+  --recompute-method uniform \
+  --recompute-num-layers 1 \
+  --save ./checkpoints/70b_tp8_pp4_dp4 \
+  --load ./checkpoints/70b_tp8_pp4_dp4
+```
+
+如果 `world_size=128`，则：
+
+```text
+DP = world_size / (TP * PP * CP) = 128 / (8 * 4 * 1) = 4
+```
+
+配置审查要点：
+
+- `hidden-size`、`num-attention-heads`、KV heads 必须能被 TP 整除。
+- `num-layers` 应能被 PP 或 virtual pipeline stage 合理切分。
+- `global-batch-size == micro_batch * gradient_accumulation * DP`，PP 不乘 global batch。
+- `sequence-parallel` 通常要求 TP > 1。
+- `context-parallel-size > 1` 时，需要确认 attention kernel、mask、position encoding 和 checkpoint 支持。
+- `use-distributed-optimizer` 是状态分片层，不等同于 TP/PP。
+
+### 5.2 DeepSpeed pipeline boundaries
+
+DeepSpeed PipelineModule 需要显式定义 layer 顺序和 stage 边界。工程上最容易出问题的是首尾不均：
+
+```python
+from deepspeed.pipe import PipelineModule
+
+layers = [
+    EmbeddingLayer(config),
+    *[TransformerBlock(config, i) for i in range(config.num_layers)],
+    FinalNorm(config),
+    LMHead(config),
+]
+
+model = PipelineModule(
+    layers=layers,
+    num_stages=4,
+    partition_method="parameters",
+    activation_checkpoint_interval=1,
+)
+```
+
+边界要求：
+
+- embedding 和 LM head 可能比普通 block 更重，不能只按层数均分。
+- tied embeddings、loss computation、vocab parallel 需要和最后 stage 的通信匹配。
+- pipeline stage 边界必须和 checkpoint layer id 稳定对应。
+- virtual stage 或 interleaving 需要框架原生 schedule 支持，平台不要用外部脚本硬拼。
+
+ZeRO 与 PipelineModule checkpointing 的交互需要单独演练。ZeRO-1/2/3 会改变 optimizer state ownership，PipelineModule 又按 stage/layer mapping 拆 checkpoint；两者叠加后，某个 rank 保存的可能是“stage 内若干 layer 的参数 shard + ZeRO 分片后的 optimizer state”，而不是完整 stage 状态。常见风险是：stage 边界调整后 layer id 还能对上，但 optimizer shard owner 已经变化；或 ZeRO-3 参数 all-gather 让 checkpoint writer 误以为本 rank 拥有完整参数。生产前必须做一次 drill：保存 checkpoint、校验 checkpoint shape、kill job、同 shape 恢复、再跑 20 step loss continuity；如果计划改变 PP stage 或 ZeRO stage，还要明确是支持 reshape restore，还是只允许 model-only warm start。
+
+### 5.3 FSDP hybrid sharding
+
+PyTorch FSDP 可用于混合并行中的状态分片。常见做法是把 FSDP sharding group 限制在节点内或 DP 组内，避免 parameter AllGather 走最慢跨节点链路。
+
+```python
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+
+model = FSDP(
+    model,
+    sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+    device_id=torch.cuda.current_device(),
+    use_orig_params=True,
+    limit_all_gathers=True,
+)
+```
+
+工程边界：
+
+- FSDP HYBRID_SHARD 适合“节点内 shard、节点间 replicate 或 reduce”的拓扑。
+- 如果已经使用 TP/PP，FSDP wrap 粒度必须和 layer/stage 边界一致。
+- FSDP state dict 类型决定 checkpoint 和推理转换成本：full state dict 简单但内存/IO 峰值高，sharded state dict 可扩展但恢复协议复杂。
+- FSDP 与 Megatron TP/PP 叠加时，必须验证 optimizer state owner、param naming 和 tied weights。
+
+### 5.4 NCCL 和拓扑配置
+
+混合并行需要把通信域与网络能力对齐：
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,COLL
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+export NCCL_IB_GID_INDEX=3
+export NCCL_CROSS_NIC=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+```
+
+证据标准：
+
+- `nvidia-smi topo -m` 确认 TP group 在 NVLink/NVSwitch 内。
+- `nccl-tests` 记录节点内 AllReduce、跨节点 AllReduce、All-to-All 基线。
+- NCCL `GRAPH` 日志确认 rings/trees 没有经过错误 NIC 或错误 interface。
+- DCGM/NIC counters 确认 IB/RoCE rail 利用均衡。
+- Nsight Systems 确认 TP collective 没有跨层暴露过多 idle gap。
+
+---
+
+## 6. 工程化落地：配置、版本矩阵、准入、发布、观测、治理
+
+### 6.1 版本矩阵
+
+并行策略要和框架版本绑定。平台准入表至少包含：
+
+| 能力 | 需要记录的版本 / 开关 | 准入验证 |
+|---|---|---|
+| TP/PP | Megatron fork commit、Transformer Engine、CUDA、NCCL | 8 GPU dry-run、loss parity、rank mesh dump |
+| SP | Megatron sequence parallel support、LayerNorm kernel | long-seq OOM 对比、activation peak 对比 |
+| CP | Ring/Ulysses attention implementation、FlashAttention 版本 | 32K/128K correctness、mask/position test |
+| FSDP/ZeRO | PyTorch/DeepSpeed 版本、optimizer support | shard state dict save/load、resume loss continuity |
+| EP | MoE router、All-to-All backend、capacity factor | token balance、expert checkpoint restore |
+| Checkpoint | distributed checkpoint schema version | save, validate, kill, restore, convert |
+
+### 6.2 作业准入
+
+提交 70B+ 训练作业前，平台应要求以下字段：
+
+```yaml
+model:
+  parameters: 70B
+  layers: 80
+  hidden_size: 8192
+  attention_heads: 64
+training:
+  precision: bf16
+  sequence_length: 8192
+  micro_batch_size: 1
+  global_batch_size: 1024
+parallel:
+  tensor_model_parallel_size: 8
+  pipeline_model_parallel_size: 4
+  virtual_pipeline_model_parallel_size: null
+  context_parallel_size: 1
+  data_parallel_size: 4
+  sequence_parallel: true
+  fsdp_or_zero: distributed_optimizer
+placement:
+  tp_scope: single_node_nvswitch
+  pp_cross_node: allowed_fixed_order
+checkpoint:
+  format: sharded
+  interval_steps: 1000
+  metadata_schema: v3
+recovery:
+  max_requeue_minutes: 30
+  require_same_parallel_shape: true
+```
+
+拒绝准入的例子：
+
+- TP=16 但节点只有 8 GPU，且没有跨节点 TP 带宽证明。
+- PP=8、microbatch=8，没有 interleaving，bubble 估算超过 45%。
+- CP=4 但 attention kernel 不支持对应 mask 或 position encoding。
+- FSDP full state dict checkpoint 需要单 rank 聚合 800GB 权重。
+- checkpoint metadata 不记录 TP/PP/CP shape，无法恢复。
+
+### 6.3 Preflight
+
+建议在真实训练前运行四类 preflight：
+
+```bash
+# topology
+nvidia-smi topo -m
+ibstat
+
+# communication baselines
+./build/all_reduce_perf -b 64M -e 8G -f 2 -g 8
+./build/alltoall_perf -b 1M -e 1G -f 2 -g 8
+
+# framework dry-run
+torchrun --nnodes 2 --nproc_per_node 8 pretrain_gpt.py \
+  --train-iters 20 \
+  --tensor-model-parallel-size 8 \
+  --pipeline-model-parallel-size 2 \
+  --micro-batch-size 1 \
+  --global-batch-size 16 \
+  --sequence-parallel \
+  --bf16
+
+# checkpoint drill
+python tools/validate_dist_checkpoint.py \
+  --path ./checkpoints/dryrun \
+  --expected-tp 8 --expected-pp 2 --expected-cp 1
+```
+
+Preflight 通过标准：
+
+- rank mesh dump 与 scheduler placement 一致；
+- 第 10-20 step loss 无 NaN，且各 DP replica loss 对齐；
+- peak HBM 留出 8%-15% fragmentation margin；
+- TP/PP/DP/CP group 日志完整；
+- 保存后可在同并行 shape 下恢复继续训练 10 step；
+- 如要求 inference conversion，至少完成一次 sharded -> inference TP checkpoint 转换。
+
+### 6.4 发布与回滚
+
+并行策略变更应像发布系统一样管理：
+
+- 从 `TP=4, PP=2` 改到 `TP=8, PP=4` 是状态布局变更，不是普通参数变更。
+- 开启 CP 是 attention kernel 和 checkpoint schema 变更。
+- 开启 FSDP/ZeRO 是 optimizer state owner 变更。
+- 开启 interleaved pipeline 是 layer-to-stage mapping 变更。
+
+回滚必须回答：
+
+```text
+旧 checkpoint 能否被新 shape 读取？
+新 checkpoint 能否转换回旧 shape？
+optimizer state 是否可转换，还是只能从 model weights warm start？
+dataset cursor 和 global step 如何保持一致？
+```
+
+### 6.5 观测指标
+
+最低指标集：
+
+- `step_time_ms{rank,dp,pp,tp,cp,ep,virtual_stage}`
+- `forward_ms`, `backward_ms`, `optimizer_ms`
+- `tp_collective_ms`, `pp_send_recv_ms`, `cp_exchange_ms`, `dp_sync_ms`
+- `pipeline_bubble_fraction_estimated`
+- `microbatch_time_ms`
+- `tokens_per_sec`, `tokens_per_gpu_sec`, `MFU`
+- `hbm_allocated_bytes`, `hbm_reserved_bytes`, `activation_peak_bytes`
+- `checkpoint_write_seconds`, `checkpoint_shards`, `checkpoint_validate_seconds`
+- `nccl_timeout_count`, `rank_restart_count`
+
+日志要求：
+
+- 每次启动打印 rank mesh。
+- 每次 checkpoint 写 metadata schema、parallel shape、model hash。
+- 每次恢复打印 checkpoint shape 与当前 shape diff。
+- 每次 OOM 打印 rank、stage、microbatch id、activation checkpoint 状态。
+
+---
+
+## 7. 容量与效率：公式和数字模型
+
+### 7.1 并行维度乘法
+
+对 dense 模型，常见世界大小关系：
+
+```text
+world_size = DP * PP * TP * CP
+```
+
+SP 通常依附 TP，不单独乘 world size。FSDP/ZeRO 是状态分片层，可能与 DP 或节点边界对齐。EP 对 MoE 需要额外乘入或替换部分 mesh，取决于实现。
+
+### 7.2 PP bubble 与有效吞吐
+
+用前述近似：
+
+```text
+bubble = (PP - 1) / (microbatches + PP - 1)
+effective_tokens_per_sec = ideal_tokens_per_sec * (1 - bubble) * imbalance_factor
+```
+
+其中 `imbalance_factor` 表示最慢 stage 拖累，取值 `0-1`。如果 stage 负载均衡很差，即使 bubble 公式好看，真实吞吐仍会被最慢 stage 限制。
+
+示例：
+
+```text
+PP=8, microbatches=32, imbalance_factor=0.90
+bubble = 7 / 39 = 17.9%
+effective ~= ideal * 0.821 * 0.90 = ideal * 0.739
+```
+
+也就是理想算力只有约 74% 能反映到 tokens/s，剩下损失来自流水空泡和 stage 不均。
+
+### 7.3 70B 状态粗算
+
+假设 dense 70B，BF16 参数，AdamW，未分片状态：
+
+| 项 | 粗略大小 |
+|---|---:|
+| BF16 parameters | 70B * 2 = 140 GB |
+| BF16 gradients | 140 GB |
+| FP32 master weights | 280 GB |
+| Adam m | 280 GB |
+| Adam v | 280 GB |
+| 合计，不含 activation | 1120 GB |
+
+这解释了为什么 70B 训练不会只靠“80GB HBM 很大”解决。必须通过 TP/PP/FSDP/ZeRO 把状态和层计算切开。
+
+### 7.4 405B 状态粗算
+
+405B dense BF16 参数：
+
+| 项 | 粗略大小 |
+|---|---:|
+| BF16 parameters | 810 GB |
+| BF16 gradients | 810 GB |
+| FP32 master weights | 1620 GB |
+| Adam m | 1620 GB |
+| Adam v | 1620 GB |
+| 合计，不含 activation | 6480 GB |
+
+即使 512 张 80GB GPU 总 HBM 是 `40960 GB`，可用容量也不能简单总加。TP/PP/DP/FSDP shape 决定每 rank 峰值；activation、workspace、fragmentation、communication buffer 会出现在局部峰值上。
+
+---
+
+## 8. 策略选择：模型大小、序列长度、拓扑、框架和恢复
+
+### 8.1 决策树
 
 ```mermaid
 flowchart TD
-  A[给定模型、batch、sequence、精度、GPU 拓扑] --> B{单卡能放下完整训练副本?}
-  B -- 是 --> C[优先纯 DP]
-  C --> C1[检查全局 batch、梯度同步、checkpoint 简化]
-  B -- 否 --> D{主要是状态冗余过大?}
-  D -- 是 --> E[ZeRO-3 或 FSDP + DP]
-  E --> E1{单层计算峰值仍过大?}
-  E1 -- 是 --> F[加少量 TP]
-  E1 -- 否 --> G[保持状态分片方案]
-  D -- 否 --> H{单层权重或 GEMM 峰值过大?}
-  H -- 是 --> I[TP 优先放在单节点 NVLink/NVSwitch 内]
-  I --> J{一个 TP 组能承载完整模型?}
-  J -- 是 --> K[TP + DP]
-  J -- 否 --> L[TP + PP + DP]
-  H -- 否 --> M{整网层数/激活导致单节点放不下?}
-  M -- 是 --> N[PP + DP, 必要时叠加 TP]
-  M -- 否 --> O[回到显存账本, 优先调 batch/checkpointing]
-  L --> P{micro-batch 足以填流水线?}
-  N --> P
-  P -- 否 --> Q[降低 PP stage 或使用 Interleaved/Zero Bubble]
-  P -- 是 --> R[验证 stage 负载均衡]
-  G --> S{context >= 128K 或 attention/KV 成为主瓶颈?}
-  K --> S
-  L --> S
-  R --> S
-  S -- 是 --> T[叠加 CP, TP 组内可同时启用 SP]
-  S -- 否 --> U[冻结第一版并行拓扑]
-  T --> V[重新评估序列维度通信和 checkpoint shard]
-  U --> W[压测吞吐、显存峰值、恢复流程]
-  V --> W
+  A[模型配置 + seq length + precision + GPU topology] --> B{单卡完整训练副本能放下?}
+  B -- yes --> C[优先 DP, 必要时 FSDP/ZeRO 降状态]
+  B -- no --> D{主要是 optimizer/gradient/parameter 冗余?}
+  D -- yes --> E[FSDP/ZeRO, 验证 AllGather 和 checkpoint]
+  D -- no --> F{单层矩阵或 attention head 峰值过大?}
+  F -- yes --> G[TP, 优先节点内 NVLink/NVSwitch]
+  F -- no --> H{整网层数和 activation 太大?}
+  H -- yes --> I[PP, 计算 microbatch 和 bubble]
+  H -- no --> J[回到显存账本和 activation placement]
+  G --> K{一个 TP group 能承载完整模型?}
+  K -- yes --> L[TP + DP, 可加 SP]
+  K -- no --> M[TP + PP + DP]
+  I --> M
+  E --> N{长上下文 attention/KV 是瓶颈?}
+  L --> N
+  M --> N
+  N -- yes --> O[叠加 CP, 验证 kernel 和网络]
+  N -- no --> P[冻结最小复杂度策略]
+  O --> Q[checkpoint/recovery/inference conversion 演练]
+  P --> Q
 ```
 
-可以把每个分支理解成一个“先解决最硬约束，再做吞吐优化”的过程：
+### 8.2 拓扑选择
 
-- **单卡放得下 -> 纯 DP**。这是最优先的默认解。因为模型已经能完整落在单卡里，就没必要引入 TP / PP 的额外通信和调度复杂度。DP 的优点是实现成熟、调试成本最低、checkpoint 也最直观。这里的“放得下”必须按真实训练形态判断，而不是只看参数量；例如 7B 模型 BF16 参数约 14GB，但 Adam 状态、梯度、master weights 与激活会把训练显存推到远高于 14GB。工程边界是：如果必须靠极小 micro-batch 才勉强放下，导致 GPU 计算利用率很差，就应该比较 DP + activation checkpointing、FSDP 和 TP 的真实吞吐，而不是只看能否启动。
+优先级：
 
-- **状态冗余是主因 -> ZeRO-3 / FSDP + DP**。如果单层计算峰值不夸张，模型主要卡在 optimizer state、gradient、parameter replica 的冗余上，优先考虑 ZeRO-3 / FSDP。它比 PP 更容易保持模型结构完整，也比大 TP 组更少绑定拓扑。工程边界是：ZeRO-3 / FSDP 会把参数 all-gather 放进前向路径，把 reduce-scatter 放进反向路径，checkpoint 也会变成 shard 化 state dict；如果作业每几百 step 就要保存超大 checkpoint，文件系统和恢复流程必须先按 [第10章](./10-memory-checkpointing-and-recovery.md) 的分布式 checkpoint 思路设计。
+1. TP 放节点内 NVLink/NVSwitch。TP 每层通信频繁，不应默认跨 IB/RoCE。
+2. PP stage 可以跨节点，但 stage 边界要少且稳定，避免跨节点小消息过多。
+3. DP 跨节点最自然，因为梯度同步频率低于 TP 层内通信，可通过 bucket 和 overlap 缓解。
+4. CP 取决于 context size 和 attention 实现。长上下文下 CP 可能不得不跨节点，但需要专门压测 KV exchange 或 All-to-All。
+5. FSDP hybrid sharding 尽量让 shard group 与节点或高速互联域对齐。
 
-- **单层太大 -> TP（节点内）+ DP（跨节点）**。这是很多 30B-70B 量级模型的典型工程解。TP 的通信频率高，最好放在单节点内，用 NVLink / NVSwitch 承接每层 `AllReduce` / `AllGather` 成本；一旦节点内把模型切开装下了，就可以把一个 TP 组看成“逻辑模型副本”，再用 DP 在多个组之间扩吞吐。工程边界是：TP 组大小通常优先选 2、4、8 这类能整除 hidden size / attention heads 的值，而且尽量不跨慢速网络；跨节点 TP 只有在网络和框架都明确支持时才应作为高阶优化。
+拓扑证据：
 
-- **单节点仍放不下或层数过深 -> TP + PP + DP**。当一个完整模型连单节点都塞不下，且模型结构天然适合按 Transformer block 切段，就需要 PP。TP 解决单层太大，PP 解决整网太深，DP 保留样本吞吐扩展。工程边界是：PP 不是 stage 越多越好。若 `p=8`、micro-batch `m=8`，简单气泡近似下利用率只有 `8/(8+8-1)=53.3%`；即便 1F1B 会改善调度形态，stage 负载不均仍会被最慢 stage 放大。上 PP 前要确认 micro-batch 数足够、层切分均衡、embedding/loss 等首尾特殊层不会拖慢单个 stage。
+- `nvidia-smi topo -m` 中 TP group 应显示 NVLink/NVSwitch 等高速路径。
+- 跨节点 DP/PP/CP 应有 IB/RoCE bandwidth 基线。
+- 双 rail 或多 NIC 节点要验证 rail balance，不要只看总 bytes。
 
-- **超长上下文 -> 在原组合上叠加 SP / CP**。128K 以上时，真正先把显存顶爆的往往不是参数，而是 attention 相关激活、KV 和 workspace。SP 通常在 TP 组内部降低 LayerNorm、Dropout、Residual 等非 attention 激活冗余；CP 则切 attention context，让 K/V 或 token block 在多卡之间流动。工程边界是：SP / CP 会把通信从“层内隐藏维度”扩展到“序列维度”，对 kernel、通信库和拓扑更挑剔。上下文没有长到足以压垮显存时，盲目开启 CP 可能只是在增加 All-to-All 或环形传输成本。
+### 8.3 框架支持
 
-> **参考数量级（仅供建立直觉，实际值因硬件、精度、batch 和激活重计算设置差异较大）**
->
-> | 场景 | 典型值 | 说明 |
-> |------|--------|------|
-> | TP 组大小 | 2-8 卡 | 通常优先限制在单节点高速互联内 |
-> | PP stage 数 | 2-8 段 | 与 micro-batch 数一起决定 bubble 比例 |
-> | DP 组大小 | 2-数十组 | 取决于目标吞吐、全局 batch 和网络带宽 |
-> | CP 组大小 | 2-4 起步 | 常见于 128K+ context，通信代价明显上升 |
+| 策略 | Megatron | DeepSpeed | PyTorch FSDP | 主要约束 |
+|---|---|---|---|---|
+| TP | 强 | 部分场景 | 非原生主轴 | hidden/head/vocab 可整除，kernel 支持 |
+| PP | 强 | PipelineModule 支持 | 需要额外 pipeline 框架 | stage 切分、microbatch schedule |
+| SP | 强 | 视实现 | 非主轴 | 通常依赖 TP |
+| CP | 新实现差异大 | Ulysses/Ring 相关实现 | 非主轴 | attention kernel、mask、position |
+| FSDP/ZeRO | Megatron distributed optimizer | ZeRO 成熟 | FSDP 原生 | checkpoint schema、param naming |
+| EP | Megatron MoE fork | MoE 支持依版本 | 非主轴 | All-to-All、load balance |
 
-### 9.10 典型配置实例表
+选型时不要只问“框架有这个参数吗”，要验证：
 
-下面的组合不是唯一答案，但它们能帮助把上面的决策树落到真实规模上：
+- 是否支持目标模型结构；
+- 是否支持目标 dtype / FP8 / Transformer Engine；
+- 是否支持 tied embedding、vocab parallel、GQA/MQA；
+- 是否支持 sharded checkpoint 保存和恢复；
+- 是否能转换到目标 inference runtime，例如 TensorRT-LLM、vLLM、SGLang 或自研引擎。
 
-| 模型 / 场景 | 集群 | TP | PP | DP | ZeRO / FSDP | SP / CP | 第一版配置理由 | 工程边界 |
-|-------------|------|----|----|----|-------------|---------|----------------|----------|
-| 7B baseline pretrain / SFT | 8 x H100 单节点 | 1 | 1 | 8 | 可选 FSDP | - | 7B BF16 参数约 14GB，单卡通常能通过 BF16、activation checkpointing、合理 micro-batch 放下；纯 DP 或轻量 FSDP 调试成本最低。 | 若 optimizer state + 激活导致 80GB HBM 仍吃紧，先试 FSDP / ZeRO-2/3，不要过早引入 TP / PP。 |
-| 13B-34B，单节点多卡 | 8 x H100 或 A100 80G | 2-4 | 1 | 2-4 | 可选 | SP 可选 | 单层和激活开始变重，但通常仍希望把 TP 限在节点内；DP 复制 TP 组扩吞吐。 | TP 需要 hidden size、attention head 数能被 TP 整除；小 batch 下 TP 通信可能吃掉收益。 |
-| 70B 常规上下文训练 | 64 x H100（8 节点） | 8 | 4 | 2 | 可选 ZeRO-1/2 | SP 可选 | 70B 单卡放不下，TP=8 放在单节点高速互联内，PP=4 分摊层段，DP=2 形成两个逻辑副本。 | `TP x PP x DP = 64` 必须严格匹配 rank 编排；PP stage 不均会拖慢全局 step。 |
-| 70B，GPU 预算紧张 | 32-64 x A100 80G | 1-2 | 1-2 | 8-32 | ZeRO-3 / FSDP | - | 如果主要压力来自训练状态冗余，ZeRO-3 / FSDP 比深 PP 更容易落地；少量 TP 只用于解决大层峰值。 | checkpoint shard 多、恢复路径复杂；跨节点参数 all-gather 会让网络成为瓶颈。 |
-| 70B + 128K context | 128 x H100 | 8 | 2 | 4 | 可选 | SP + CP=2 | 参数量不是唯一瓶颈，128K attention / KV / workspace 会把单卡显存顶满；在 TP/PP/DP 基础上用 SP 降非 attention 激活，用 CP 切 context。 | CP 需要专门 attention 实现和高速互联；上下文通信失败时通常表现为吞吐骤降而不只是 OOM。 |
-| 405B dense 模型 | 512 x H100 | 8 | 8 | 8 | 可选 ZeRO-1/2 | SP 可选 | 405B 已进入必须 3D 并行的量级：TP 切层内，PP 切层段，DP 保留吞吐。 | 调参重点从“能否启动”变成 MFU、bubble、straggler、checkpoint 时间；平台必须有拓扑感知 placement。 |
-| MoE 模型，专家数远大于激活专家数 | 128-512 x H100 | EP/TP 混合 | 2-8 | 4-16 | 常用 | 视 context 而定 | MoE 还会引入 Expert Parallelism（EP），每 token 只激活少数专家，容量和通信模式不同于 dense。 | 本章不展开 EP；工程上要额外处理 token dispatch、load balance、all-to-all 热点。 |
+### 8.4 checkpoint、optimizer state、failure recovery、inference conversion
 
-这里有两个容易忽略的现实判断：
+并行策略会改变状态形态：
 
-- 表里的 `TP / PP / DP / CP` 是乘法关系，但 `ZeRO / FSDP` 更像“叠加的状态分片层”，不是和前面完全同一维度
-- 同一个模型会因为精度、activation checkpointing、micro-batch、大词表、MoE 与否而改变配置，所以表格是“工程直觉模板”，不是固定答案
-- 对平台团队来说，第一版配置还必须绑定 placement：TP 组尽量落在同一 NVSwitch island，PP stage 尽量沿网络距离稳定排布，DP 组之间允许跨节点但要保证梯度同步网络可预测
+- TP checkpoint：每个 tensor 被切成 TP shard，转换推理时可能需要 merge 或重新 shard。
+- PP checkpoint：每个 stage 只保存自己层段，layer id 到 stage 的 mapping 是恢复关键。
+- CP/SP checkpoint：参数未必变化，但 activation 和 RNG/mask 语义会影响 resume correctness；CP 还可能保存 context parallel metadata。
+- FSDP/ZeRO checkpoint：optimizer state 和参数 owner 是 shard，恢复需要同 shape 或 reshape 工具。
+- EP checkpoint：expert id 到 rank 的 mapping 必须稳定或可迁移。
 
-### 9.11 如何把决策树落地成第一版方案
+恢复复杂度从低到高大致是：
 
-如果你不想一开始就精确求最优解，可以按下面的顺序落地：
+```text
+DDP full checkpoint
+  < FSDP/ZeRO sharded checkpoint
+  < TP checkpoint
+  < TP + PP checkpoint
+  < TP + PP + CP + FSDP checkpoint
+  < TP + PP + CP + EP + optimizer reshape
+```
 
-1. 先判断单卡能不能放下完整训练副本；能放下就从纯 DP 起步
-2. 放不下时，优先看单节点 NVLink / NVSwitch 内能否通过 TP 装下
-3. 单节点还不够，再决定是走 `TP + PP + DP`，还是走 `ZeRO-3 / FSDP + DP`
-4. 如果 context 已经到 128K+，把 CP 当成额外维度，而不是最后临时补救
+推理转换要提前设计：
 
-真实选择还要继续检查这些现实约束：
-
-- 设备互联：TP 和 CP 都高度依赖拓扑
-- 软件栈支持：Megatron-LM、DeepSpeed、FSDP 的能力边界不同
-- 团队调试能力：越复杂的混合并行，越依赖经验
-- checkpoint 与恢复复杂度：并行维度一多，恢复链路会一起变复杂
-
-### 9.12 框架对照表
-
-| 框架 | 主要定位 | 更适合什么场景 |
-|------|----------|----------------|
-| DeepSpeed | ZeRO 全系列、训练工程化能力强 | 大规模分片训练、复杂优化器状态管理 |
-| PyTorch FSDP | 官方原生 ZeRO-3 风格实现 | 希望尽量留在 PyTorch 主生态 |
-| Megatron-LM | TP + PP + 混合并行成熟 | 超大 Transformer 训练 |
-| ColossalAI | 并行策略较丰富 | 想在多种并行手段间做组合试验 |
-| DeepSpeed Ulysses / Ring Attention 实现 | 更关注 Context Parallelism | 长上下文训练 |
-
-### 9.13 工程建议
-
-- 先用单机和小规模配置验证切分逻辑，再放大规模
-- 任何并行策略都要同时考虑训练路径和 checkpoint / 恢复路径
-- 当 TP / PP 已经很重时，再叠加 ZeRO / FSDP 前要先确认通信预算
-- 决策时不要只问“能不能跑”，要问“出故障后能不能恢复”
-
-#### 本章涉及的常见工具
-
-| 概念 | 常见工具 / 命令 | 备注 |
-|------|-----------------|------|
-| ZeRO 分片训练 | DeepSpeed | ZeRO Stage 1/2/3 是最常见入口 |
-| 原生状态分片 | PyTorch FSDP | 更贴近官方生态，便于与 PyTorch 配套 |
-| TP / PP 训练 | Megatron-LM | 大模型并行训练的常用参考实现 |
-| Sequence / Context Parallelism | Megatron-LM、DeepSpeed Ulysses | 适合长上下文训练和激活降压 |
-| 并行组合实验 | ColossalAI | 适合快速试不同并行编排 |
-
-### 9.14 常见误区
-
-#### 误区一：模型并行只是“分到多张卡”这么简单
-
-不对。它重塑了通信模式、同步点和故障处理逻辑。
-
-#### 误区二：流水线切得越细越高效
-
-不对。切得太细会增加 bubble 和调度复杂度。
-
-#### 误区三：张量并行只要显存够就行
-
-不对。它对互联和通信延迟极其敏感。
-
-#### 误区四：上了 ZeRO / FSDP 就不需要考虑模型并行
-
-不对。状态分片主要解决冗余状态问题，无法替代所有层级切分需求。
+- 训练 TP=8，推理 TP=4：需要合并再重切 tensor shard。
+- 训练 PP=8，推理通常不使用训练 PP：需要按 layer id 重组完整模型。
+- 训练 FSDP/ZeRO：需要 materialize 或转换 sharded state dict。
+- 训练 CP/SP：通常不改变权重 shape，但要确认 position encoding、rope scaling、long context metadata 进入推理 config。
+- 训练 EP：推理 router、expert placement、capacity 和 quantization 都要兼容。
 
 ---
 
-## 本章小结
+## 9. Worked Example：70B 并行策略设计
 
-| 并行方式 | 解决的问题 | 主要代价 |
-|----------|------------|----------|
-| 张量并行 | 单层参数或计算过大 | 高频通信 |
-| 流水并行 | 整体模型太深、单卡放不下 | bubble 与调度复杂度 |
-| ZeRO / FSDP | 冗余状态过重 | 通信、checkpoint 与恢复更复杂 |
-| Sequence / Context Parallelism | 长上下文激活或 KV 过大 | 序列维度通信更重 |
-| 混合并行 | 同时解决吞吐与显存问题 | 系统复杂度最高 |
+### 9.1 输入条件
+
+假设：
+
+- Dense 70B decoder-only Transformer。
+- 80 layers，hidden size 8192，64 attention heads。
+- BF16 training，AdamW，activation checkpointing enabled。
+- Sequence length 8192。
+- 集群：16 nodes x 8 H100 80GB = 128 GPUs。
+- 节点内 NVSwitch，节点间 400G IB/RoCE，多 rail。
+- 目标：稳定 pretraining，checkpoint 每 1000 step，允许同 shape 恢复。
+
+### 9.2 配置 A：TP=8, PP=4, DP=4
+
+```text
+world_size = 128
+TP = 8
+PP = 4
+CP = 1
+DP = 128 / (8 * 4 * 1) = 4
+micro_batch = 1
+global_batch = 1024
+gradient_accumulation = 1024 / (micro_batch * DP) = 256
+```
+
+放置：
+
+- TP=8 占满单节点 NVSwitch，层内 collective 不跨节点。
+- PP=4 跨 4 个节点，activation 在 stage 边界跨节点 3 次。
+- DP=4 复制四条完整 pipeline。
+- SP enabled，降低 TP 组内非 attention activation。
+- Megatron distributed optimizer 或 ZeRO-1/2 降 optimizer state。
+
+优点：
+
+- TP 通信路径最好；
+- PP stage 每段约 20 层，均衡性可控；
+- DP=4 有一定吞吐扩展；
+- checkpoint shard layout 直观：`dp, pp, tp` 三维。
+
+风险：
+
+- gradient accumulation 很大，optimizer step 间隔长，需要确认收敛 batch 语义；
+- PP bubble 取决于 microbatch 数。若 `m=32`，`p=4`，bubble 约 `3/35=8.6%`；若调度实际 microbatch 不足，bubble 会上升；
+- stage 0 embedding 和 stage 3 LM head 可能更重，需要按 profile 调整 layer split。
+
+### 9.3 配置 B：TP=4, PP=8, DP=4
+
+```text
+world_size = 128
+TP = 4
+PP = 8
+CP = 1
+DP = 4
+```
+
+放置：
+
+- 每个节点可放两个 TP=4 group。
+- PP=8 stage 更细，可能跨更多节点。
+- 每 stage 约 10 层，单 stage HBM 更低。
+
+优点：
+
+- 单 stage 层数少，activation 和 parameters 峰值下降；
+- 对 80GB HBM 更保守；
+- 如果某些层 activation 太大，PP=8 更容易放下。
+
+风险：
+
+- PP bubble 更高。`m=32, p=8` 时 bubble 约 `7/39=17.9%`；
+- PP send/recv 边界增加；
+- stage 切分、checkpoint layer mapping 和 failure recovery 更复杂；
+- TP=4 降低层内并行，某些 GEMM 可能变慢。
+
+### 9.4 70B 选择
+
+第一版推荐配置 A：`TP=8, PP=4, DP=4, SP=on, CP=1`。
+
+理由：
+
+- 70B 的层内矩阵足够大，TP=8 可以利用节点内 NVSwitch；
+- PP=4 把 80 层切成可控 stage，bubble 比 PP=8 低；
+- sequence length 8192 不需要 CP，SP 已足够降低部分 activation；
+- checkpoint 和恢复复杂度低于 PP=8；
+- 如果 HBM profile 发现 stage 峰值超过 72GB，再比较 PP=8 或更强 activation checkpointing，而不是先跨节点 TP。
+
+验收指标：
+
+- peak HBM < 72GB，reserved < 76GB；
+- pipeline bubble 估算 < 12%，profile 中 stage idle 与估算一致；
+- TP collective 主要在节点内，NCCL bus bandwidth 接近节点内基线；
+- checkpoint save/validate/restore 演练通过；
+- 从 checkpoint resume 后 20 step loss 与不中断路径对齐。
+
+### 9.5 70B 配置对比表
+
+| 配置 | throughput | HBM pressure | network pressure | checkpoint shape | recovery complexity |
+|---|---|---|---|---|---|
+| A: TP=8, PP=4, DP=4, SP=on | 较高；PP bubble 约 8.6% when `m=32`，TP GEMM 并行度好 | 中等；每 stage 约 20 层，需要关注首尾 stage | 中等；TP node-local，PP 跨 3 个 stage 边界，DP 跨副本同步 | `dp=4, pp=4, tp=8`，可选 distributed optimizer shard | 中等；同 shape restore 清晰，stage mapping 稳定 |
+| B: TP=4, PP=8, DP=4 | 中等；PP bubble 约 17.9% when `m=32`，TP 算力切分较少 | 较低；每 stage 约 10 层，activation 峰值更保守 | 较高；PP 边界更多，TP group 虽小但 pipeline send/recv 增加 | `dp=4, pp=8, tp=4`，stage shard 数翻倍 | 较高；layer/stage mapping、checkpoint shard、pipeline recovery 更复杂 |
 
 ---
 
-## 练习题
+## 10. Worked Example：405B 并行策略设计
 
-1. 为什么数据并行无法解决“模型放不下单卡”的问题？
-2. 请解释张量并行和流水并行分别在“切什么”。
-3. ZeRO Stage 1/2/3 的区别是什么？为什么它和 TP / PP 是互补关系？
-4. 如果你的模型已经用了 TP 和 PP，checkpoint 设计为什么还要跟着调整？
-5. 为什么 128K+ 上下文训练通常要开始讨论 Context Parallelism？
+### 10.1 输入条件
+
+假设：
+
+- Dense 405B decoder-only Transformer。
+- 126 layers，hidden size 16384，128 attention heads。
+- BF16 training，AdamW，activation checkpointing enabled。
+- Sequence length 8192 起步，未来可能扩到 32768。
+- 集群：128 nodes x 8 H100 80GB = 1024 GPUs。
+- 节点内 NVSwitch，节点间 400G/800G IB/RoCE。
+- 目标：长周期 pretraining，checkpoint 每 500-1000 step，必须支持同 shape 恢复和推理转换。
+
+### 10.2 配置 A：TP=8, PP=16, DP=8
+
+```text
+world_size = 1024
+TP = 8
+PP = 16
+CP = 1
+DP = 1024 / (8 * 16) = 8
+micro_batch = 1
+global_batch = 2048
+gradient_accumulation = 2048 / (1 * 8) = 256
+```
+
+放置：
+
+- TP=8 每个 stage 使用一个完整节点。
+- PP=16 跨 16 个节点形成一条 pipeline。
+- DP=8 复制 8 条 pipeline。
+- SP enabled。
+- Megatron distributed optimizer 或 ZeRO-1/2；谨慎叠加 ZeRO-3，避免过多 parameter AllGather 干扰 PP/TP。
+
+优点：
+
+- TP 不跨节点，层内通信最优；
+- 16 stage 把 126 层切到每 stage 约 8 层，405B 参数容量可控；
+- DP=8 保持样本吞吐；
+- checkpoint layout 仍是标准 `dp, pp, tp`。
+
+风险：
+
+- PP=16 的 bubble 很敏感。`m=64` 时 bubble 约 `15/79=19.0%`；`m=32` 时约 `31.9%`；
+- stage 数多，任意 stage straggler 都会拖慢全局；
+- checkpoint shard 数至少 `DP * PP * TP = 1024` 级别，optimizer shard 更多；
+- pipeline recovery 需要严格同 shape，节点替换要保持 stage order。
+
+### 10.3 配置 B：TP=8, PP=8, CP=2, DP=8
+
+```text
+world_size = 1024
+TP = 8
+PP = 8
+CP = 2
+DP = 1024 / (8 * 8 * 2) = 8
+```
+
+放置：
+
+- TP=8 仍在节点内。
+- CP=2 将 context 分到两个相邻节点或同一 pipeline stage 的成对节点。
+- PP=8 每 stage 约 16 层，比配置 A 层数更多。
+- SP enabled，CP 用于 32K+ context 预备。
+
+优点：
+
+- PP stage 减少，bubble 降低。`m=64, p=8` bubble 约 `9.9%`；
+- CP=2 为 32768 context 提前建立 attention 路径；
+- pipeline stage 边界减少，PP send/recv 和恢复映射更简单。
+
+风险：
+
+- 每 stage 层数翻倍，405B 下 HBM 峰值可能过高；
+- CP 引入 KV/context exchange，对 attention kernel 和网络更挑剔；
+- 8192 context 起步时 CP 可能收益不足，反而增加通信；
+- checkpoint metadata 增加 CP shape，推理转换要保留 long context 配置。
+
+### 10.4 配置 C：TP=8, PP=8, DP=16, FSDP HYBRID_SHARD
+
+```text
+world_size = 1024
+TP = 8
+PP = 8
+CP = 1
+DP = 16
+micro_batch = 1
+global_batch = 2048
+gradient_accumulation = 2048 / (micro_batch * DP) = 128
+FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shard group
+```
+
+放置：
+
+- TP=8 必须保持 node-local：一个 TP group 占满单个 8-GPU NVSwitch 节点，TP collective 不跨 IB/RoCE。
+- PP=8 使用 8 个相邻节点形成一条 pipeline；每个 DP replica 需要 8 个节点，16 条 pipeline 共 128 节点。
+- DP=16 跨 16 条 pipeline 同步等价 stage/tensor shard；DP gradient sync 可以跨节点，但需要 bucket/overlap。
+- FSDP HYBRID_SHARD 的 shard group 优先 node-local，与 TP=8 的节点边界对齐；如果实现要求在 DP subgroup 内 shard，subgroup 必须固定在同一 rail/topology 域内，不能让 parameter AllGather 穿过任意跨机路径。
+- FSDP wrap 粒度必须 stay stage-local：一个 FSDP unit 不能跨 PP stage，也不能跨 virtual stage；否则 checkpoint ownership 会同时跨 layer owner 和 optimizer owner。
+- optimizer state ownership 必须记录为 `(dp_subgroup, pp_stage, tp_rank, fsdp_shard_rank)`；恢复时不允许只凭 global rank 顺序推断 owner。
+
+优点：
+
+- DP=16 吞吐更高；
+- PP=8 bubble 低于 PP=16；
+- FSDP hybrid sharding 降 optimizer/gradient/parameter 冗余。
+
+风险：
+
+- FSDP parameter AllGather 可能和 TP/PP 通信重叠不佳；
+- 三套状态布局叠加，checkpoint 和恢复复杂；
+- 如果 FSDP group 跨节点，网络压力可能超过收益；
+- Megatron 参数命名、FSDP state dict、optimizer shard 转换需要专项验证。
+
+### 10.5 405B 选择
+
+第一版推荐配置 A：`TP=8, PP=16, DP=8, SP=on, CP=1`，先把 dense 405B 在 8192 context 下稳定跑通。
+
+选择理由：
+
+- 405B 参数量首先要求强 PP；PP=8 可能让 stage HBM 过高；
+- TP=8 放节点内，避免层内通信跨节点；
+- CP 暂不启用，避免在 8192 context 为未成为瓶颈的序列维度付费；
+- FSDP/ZeRO 只先使用 distributed optimizer 或 ZeRO-1/2，避免 ZeRO-3 的 parameter AllGather 与 TP/PP 同时进入关键路径。
+
+扩展路径：
+
+- 如果 PP bubble 在 profile 中超过 25%，优先试 interleaved pipeline 或增加 microbatch，而不是立刻减少 PP。
+- 如果 32768 context 成为目标，再比较 `TP=8, PP=8, CP=2, DP=8` 与 `TP=8, PP=16, CP=2, DP=4`。
+- 如果 optimizer state 成为主要 HBM 压力，再局部试 FSDP HYBRID_SHARD，并先做 checkpoint drill。
+
+验收指标：
+
+- 每 stage peak HBM < 72GB；
+- stage time P95/P50 < 1.15；
+- PP bubble 实测 < 22% 或 interleaved 后 < 15%；
+- TP collective 不跨节点；
+- checkpoint validate < checkpoint interval 的 10% wall time；
+- kill -9 任一非关键 rank 后，elastic 或 scheduler 重启能从最近 checkpoint 同 shape 恢复。
+
+### 10.6 405B 配置对比表
+
+| 配置 | throughput | HBM pressure | network pressure | checkpoint shape | recovery complexity |
+|---|---|---|---|---|---|
+| A: TP=8, PP=16, DP=8 | 中等偏高；TP 高效但 PP bubble 约 19.0% when `m=64` | 中等；每 stage 约 8 层，405B 下最稳妥 | 中等；TP node-local，PP 跨 15 个 stage 边界，DP=8 | `dp=8, pp=16, tp=8`，约 1024 基础 model shards | 中等偏高；stage 多但 shape 标准，恢复路径可控 |
+| B: TP=8, PP=8, CP=2, DP=8 | 取决于 context；32K+ 可更好，8K 可能被 CP 通信拖慢 | 中高；每 stage 约 16 层，但 CP 降 context 峰值 | 高；TP node-local，CP KV/context exchange 增加 network pressure | `dp=8, pp=8, tp=8, cp=2`，checkpoint shape 增加 CP metadata | 高；attention/kernel/CP shape 都参与恢复和推理转换 |
+| C: TP=8, PP=8, DP=16, FSDP HYBRID_SHARD | 理论最高；DP=16 且 PP bubble 较低，但取决于 FSDP overlap | 中等；FSDP 降 state，PP=8 增 stage 内层数 | 高；DP 同步 + FSDP param AllGather 可能叠加，必须 node-local 或 DP-subgroup-local | `dp=16, pp=8, tp=8, fsdp_hybrid`，optimizer shards 带 owner metadata | 很高；TP/PP/FSDP 三套 owner，必须 checkpoint drill 后生产 |
+
+---
+
+## 11. 故障排除
+
+| 症状 | 证据 | 可能根因 | 处理动作 |
+|---|---|---|---|
+| OOM 只发生在某个 PP stage | OOM rank 集中在同一 `pp_stage`；HBM peak 高于其他 stage；stage 包含 embedding/LM head | layer split 不均、activation placement 过重、in-flight microbatch 太多、checkpoint granularity 太粗 | 重新切 stage；开启或加密 activation checkpointing；降低 microbatch；把 embedding/loss head 单独计入负载模型 |
+| OOM 发生在长 context 才出现 | seq length 翻倍后 HBM 非线性增长；attention kernel workspace 峰值高 | attention workspace/KV/mask 成为瓶颈，ZeRO/FSDP 不切 context | 启用 CP；检查 FlashAttention/Ring/Ulysses 支持；降低 sequence 或改 attention checkpoint |
+| pipeline bubble 太高 | Nsight 中 stage idle 明显；公式估算 `(p-1)/(m+p-1)` 高；tokens/s 低但 HBM 还有余量 | PP stage 太多、microbatch 太少、stage 不均、未启用 interleaving | 增加 microbatches；降低 PP；启用 interleaved pipeline；重新按 profile 切层 |
+| TP communication bottleneck | 每层 GEMM 间 NCCL AllReduce 暴露；NCCL bus bandwidth 低；TP group 跨节点 | TP size 过大、placement 错误、NVLink/NVSwitch 未命中、NCCL ring 选错 | 把 TP 限制到节点内；调整 rank order；跑 nccl-tests；检查 `nvidia-smi topo -m` 和 NCCL GRAPH |
+| bad placement 导致全局慢 | 同配置不同作业 step time 差异大；慢作业 TP/PP 跨不同拓扑 | scheduler 未做 topology-aware placement；GPU-NIC 亲和性差；rail 不均衡 | 加 node/GPU topology label；固定 rank mapping；按 NIC locality 分配；在准入中检查 mesh dump |
+| checkpoint mismatch | restore 报 tensor shape/key mismatch；或恢复后 loss spike | TP/PP/CP shape 改变；layer-to-stage mapping 改变；optimizer shard owner 改变 | 使用同 shape 恢复；编写显式 reshape/merge 工具；保存 parallel metadata；先恢复 model-only 做 warm start |
+| resume 后随机性不一致 | loss 从恢复点后逐步偏离；dropout/mask 不一致 | RNG、dataset cursor、microbatch id、CP mask state 未保存 | 保存 rank-local RNG、sampler epoch/offset、packing seed、parallel shape；恢复后做 20 step parity |
+| CP 开启后吞吐骤降 | All-to-All 或 ring exchange 时间占比高；NIC counters 高但 SM idle | context partition 通信超过 attention compute，或 kernel 不匹配 | 降 CP size；改 placement；验证 attention 实现；只在更长 context 启用 CP |
+| EP MoE load imbalance | expert token counts P99/P50 高；All-to-All tail 高 | router 偏斜、capacity factor 不合适、expert placement 差 | 调 router loss/capacity；重排 experts；监控 dropped tokens；优化 All-to-All topology |
+
+排障原则：
+
+- 先按 rank mesh 聚合，再看单 rank 日志。
+- 先确认 placement，再解释 NCCL。
+- 先用公式估算 bubble，再看 profiler 是否符合。
+- checkpoint mismatch 一律按状态协议事故处理，不要只改 `strict=False`。
+
+---
+
+## 12. 反模式
+
+1. **只看参数量选并行策略**
+   70B BF16 参数约 140GB，但训练态和 activation 才决定 HBM 峰值。
+
+2. **TP 跨节点但没有证据**
+   TP 每层通信频繁，跨节点 TP 必须有带宽、延迟和 Nsight 证据。
+
+3. **PP stage 越多越安心**
+   stage 多会降低每 stage 容量压力，也会提高 pipeline bubble、send/recv 和恢复复杂度。
+
+4. **把 SP/CP 当成 DP/TP/PP 的替代品**
+   SP/CP 解决 sequence/context 压力，不解决 optimizer state 和层段容量。
+
+5. **训练 checkpoint 不考虑推理转换**
+   训练 TP/PP/FSDP shape 如果不能转换成推理 runtime 接受的 checkpoint，训练产物就无法上线。
+
+6. **用 `strict=False` 掩盖 checkpoint mismatch**
+   key mismatch 可能是 tensor shard、layer mapping 或 optimizer owner 错位，忽略会导致 silent corruption。
+
+7. **没有 rank mesh 日志**
+   没有 `dp/pp/tp/cp/ep` 标签，混合并行排障成本会成倍上升。
+
+---
+
+## 13. Checklist：parallel strategy design checklist
+
+### 13.1 容量
+
+- [ ] 参数、梯度、optimizer state、activation、attention workspace、communication buffer、fragmentation 都进入 HBM 账本。
+- [ ] 对目标 sequence length 和 microbatch 做过 peak HBM dry-run。
+- [ ] activation placement 和 checkpoint granularity 明确。
+- [ ] stage 0 embedding、最后 stage loss head 和 vocab parallel 单独计入负载。
+
+### 13.2 拓扑
+
+- [ ] TP group 限制在 NVLink/NVSwitch 或有跨节点证据。
+- [ ] PP stage order 固定，跨节点边界可解释。
+- [ ] DP group 网络带宽和 rail balance 已验证。
+- [ ] CP/EP 的 All-to-All 或 ring 路径有基线。
+- [ ] scheduler 能按 topology-aware policy 放置 rank。
+
+### 13.3 框架
+
+- [ ] hidden size、attention heads、KV heads、vocab padding 可被 TP 整除。
+- [ ] PP layer mapping、virtual stage、interleaving 被框架原生支持。
+- [ ] SP/CP attention kernel、mask、position encoding 已验证。
+- [ ] FSDP/ZeRO wrap 粒度与 layer/stage 边界一致。
+- [ ] FP8/BF16/Transformer Engine 与并行策略兼容。
+
+### 13.4 性能
+
+- [ ] pipeline bubble 公式估算已记录。
+- [ ] microbatch 和 gradient accumulation 满足 global batch 语义。
+- [ ] TP collective、PP send/recv、DP sync、CP exchange 可分开观测。
+- [ ] stage time P95/P50 和 rank straggler 指标已接入。
+- [ ] tokens/s、tokens/GPU/s、MFU 与单节点或小规模基线对齐。
+
+### 13.5 checkpoint 与恢复
+
+- [ ] checkpoint 保存 TP/PP/CP/EP/FSDP shape 和 rank mapping。
+- [ ] optimizer state shard owner 可恢复。
+- [ ] RNG、dataset cursor、global step、microbatch schedule 已保存。
+- [ ] 同 shape restore 演练通过。
+- [ ] 跨 shape conversion 策略明确：支持、只支持 model-only warm start，或禁止。
+- [ ] inference conversion 已至少 dry-run 一次。
+
+### 13.6 治理
+
+- [ ] 并行策略变更进入发布记录。
+- [ ] 准入拒绝条件明确。
+- [ ] 每次启动打印 rank mesh 和 checkpoint schema。
+- [ ] 每次失败能按 rank mesh 聚合日志。
+- [ ] 已定义恢复 SLA、checkpoint interval、retention 和清理策略。
+
+---
+
+## 14. 本章小结
+
+模型并行不是单一技术，而是一组围绕容量、通信、调度和状态恢复的切分协议。
+
+- TP 切层内张量，适合节点内高速互联。
+- PP 切层段，解决整网太大，但要支付 pipeline bubble。
+- SP/CP 切序列和上下文，服务长上下文 activation 和 attention。
+- EP 切专家，服务 MoE，但引入 token dispatch 和 load balance。
+- FSDP/ZeRO 切训练状态，与 TP/PP/CP 互补。
+- 3D parallel 的关键不是 `DP x PP x TP` 的乘法，而是 rank mesh、拓扑、checkpoint 和恢复的一致性。
+
+生产选型的原则是：先解决最硬容量约束，再用最少的并行维度达成吞吐目标；每增加一个维度，都必须同步增加观测、checkpoint metadata、preflight 和恢复演练。
+
+---
+
+## 15. 练习题
+
+1. 一个 70B 模型在 64 张 H100 上训练，`TP=8, PP=4, DP=2`。如果 microbatches 为 16，请估算 pipeline bubble fraction，并说明怎样降低它。
+2. 为什么 TP 通常优先放在节点内 NVLink/NVSwitch，而 DP 可以更自然地跨节点？
+3. FSDP/ZeRO 与 TP/PP 分别减少 HBM 账本中的哪些项？哪些项不会被 ZeRO 自动解决？
+4. 如果 checkpoint 从 `TP=8, PP=4` 恢复到 `TP=4, PP=8`，需要哪些 metadata 和转换步骤？
+5. 128K context 训练 OOM，但参数和 optimizer state 已经被 FSDP 切分。请解释为什么 CP 可能比继续加 ZeRO 更有效。
+6. 对 405B dense 模型，比较 `TP=8, PP=16, DP=8` 与 `TP=8, PP=8, CP=2, DP=8` 的吞吐、显存和恢复复杂度。
+7. 设计一个 rank mesh 日志格式，要求能在 OOM、NCCL timeout、checkpoint mismatch 三类事故中快速定位责任 group。

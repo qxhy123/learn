@@ -107,6 +107,20 @@ mindmap
 - **编译不是"一次搞定"**，它产出的是带前提假设的制品，shape 超出假设就会退化
 - **引擎选型不只是 benchmark**，它还决定了你平台的发布、回滚、排障方式
 
+### 概念先说清楚：三层边界
+
+本章的三个词经常被混用，先把边界说清楚：
+
+| 概念 | 它是什么 | 它不是什么 | 主要产物 | 主要风险 |
+|------|----------|------------|----------|----------|
+| 量化 | 改变模型数值表示，把 FP16/BF16 的权重、激活或 KV Cache 压到 FP8/INT8/INT4 等低精度 | 不是通用压缩算法，也不是一定提速的开关 | 低精度权重、scale/zero point、校准记录、量化配置 | 质量回退、kernel 不支持、反量化开销吃掉收益 |
+| 编译 | 把模型图和算子组合转换成更适合硬件执行的 plan | 不是模型训练，也不是自动适配任意 shape | engine、CUDA graph、AOT artifact、kernel plan | shape contract、版本绑定、回退路径难观测 |
+| 推理引擎 | 在线组织请求、batch、KV Cache、并行和 API 的运行时 | 不是单个 kernel，也不是简单 HTTP wrapper | vLLM/TensorRT-LLM/SGLang/TGI 服务进程、metrics、调度状态 | 运行时语义变复杂，发布、回滚和排障路径变化 |
+
+更工程化的说法是：**量化改变模型怎么存和怎么算，编译改变算子怎么排和怎么发，推理引擎改变请求怎么进入 GPU。** 三者可以组合，但不能互相替代。权重量化不会自动解决 KV Cache 爆显存；`torch.compile` 不会自动提供 continuous batching；换 vLLM 也不等于模型质量风险消失。
+
+还有一个容易误解的边界：Triton Inference Server 和 Triton language/kernel 不是同一个东西。前者是 NVIDIA 的模型托管服务器，可以挂 TensorRT、ONNX Runtime、Python backend 等；后者是 OpenAI Triton 语言，用来写 GPU kernel。讨论"引擎选型"时通常指前者；讨论"自定义 fused kernel"时通常指后者。
+
 ## 3. 正文内容
 
 ### 16.1 推理优化到底在优化什么
@@ -206,7 +220,7 @@ $$
 | 质量回退几乎不可接受，且模型已经能装下 GPU | FP16 / BF16 | 风险最低，排障最直接 | 成本高，但最容易做基线与回滚 | 如果显存已经被权重或 KV Cache 压满，这条路通常根本跑不起来 |
 | 有 H100/H200/B200 这类原生 FP8 路线，目标是在尽量保精度的前提下提吞吐 | FP8 | 比 INT8 / INT4 更接近高精度路径，通常更容易守住质量 | 依赖新硬件、特定库和引擎支持 | 卡型不是 Hopper/Blackwell，或者引擎只是"能加载"却没有原生 FP8 kernel，就容易退化成伪收益 |
 | 主要目标是通用在线 serving，加速和稳定性都要，且能拿到代表性校准集 | INT8（如 SmoothQuant、TensorRT INT8） | 压缩和质量之间更平衡，部署面广 | 更适合 W8A8 / W8A16 这类温和方案 | 校准集分布失真时，INT8 往往先在激活敏感层上出问题，离线分数看着正常、线上对话质量抖动 |
-| 模型必须塞进更小显卡，或 decode 明显 memory-bound，需要极致压缩 | INT4 weights-only（GPTQ / AWQ） | 对权重显存和带宽收益最大，最常见于低成本 serving | 更适合 decode 主导、W4A16 路径成熟的模型族 | 如果瓶颈其实是 prefill 算力、不是权重带宽，INT4 收益会很有限，甚至被反量化开销吃掉 |
+| 模型必须塞进更小显卡，或 decode 明显 memory-bound，需要极致压缩 | INT4 weights-only（GPTQ / AWQ） | 对权重显存和带宽收益最大，最常见于低成本 serving | 更适合 decode 主导、W4A16 路径成熟的模型族；**A100/H100 上必须配合 Marlin 或 Machete kernel 才有真实加速**（见下） | 如果瓶颈其实是 prefill 算力、不是权重带宽，INT4 收益会很有限；**没有 W4A16 优化 kernel 时，模型先反量化到 FP16 再算 GEMM，反而比 FP16 慢** |
 | 同样是 INT4，但你更看重通用性、模型覆盖面和保精度 | GPTQ | 逐层重建误差，通常在复杂模型上更稳 | 校准与离线量化时间更长 | 校准窗口太小或线上 prompt 形态变化快时，重建出的误差模型会失真 |
 | 同样是 INT4，但你更看重吞吐、部署路径和小中型模型的工程效率 | AWQ | 保护重要通道，很多 serving 引擎路径更顺 | 需要确认目标模型和目标引擎都对 AWQ 路径成熟 | 某些模型上精度可能不如 GPTQ，特别是长尾语言 / 代码 / 推理任务 |
 | 这是训练或 LoRA 微调，而不是线上推理 | NF4 / QLoRA | 训练显存收益很好，生态成熟 | 主要是训练格式，不是标准 GPU serving 终态 | 直接把 NF4 训练格式当生产推理格式，往往会卡在引擎支持或吞吐表现上 |
@@ -253,6 +267,31 @@ flowchart TD
 这张表的意思：你手里的卡决定了你能上什么精度。比如 A100 不支持 FP8，想上 FP8 要等到 H100；B200 引入的 MXFP8/NVFP4 则是面向未来的路线。
 
 对平台决策者：**量化方案要和硬件采购路线对齐**，否则"明年换 H100，今年先上 FP8"这种表述往往落不了地。
+
+#### 16.3.3 W4A16 的 kernel 决定一切：Marlin 与 Machete
+
+INT4 weights-only（W4A16）量化省显存的故事很美好——把 70B 模型从 140GB 压到 35GB——但**省显存不等于跑得快**。GPU Tensor Core 不直接执行 INT4 × FP16 的混合精度 GEMM，必须有专门写过的 kernel 把 INT4 权重在寄存器/共享内存里反量化，再喂给 Tensor Core。**没有这种 kernel，框架的 fallback 路径是先把整个 INT4 权重反量化到 FP16，再走标准 GEMM——结果是 INT4 推理比 FP16 还慢**（多一次反量化 + 同样的 compute + 多一次显存写回）。
+
+这就是为什么生产 W4A16 的真实瓶颈是 kernel 而不是量化算法：
+
+| Kernel | 开发方 | 目标硬件 | 适用场景 | 关键设计 |
+|---|---|---|---|---|
+| **Marlin** | IST Austria（vLLM 集成） | A100 / H100 | batch < 32 的 LLM decode | 用 mma.sync + ldmatrix 做 INT4→FP16 解码后立即喂 Tensor Core；只对 small-batch decode 的 GEMV 形态优化 |
+| **Machete** | NVIDIA（vLLM 集成） | H100 / Hopper-only | 中大 batch decode + prefill | 重写以利用 H100 WGMMA + TMA，比 Marlin 在 H100 上吞吐高 30-50% |
+| **bitblas / TileBlas** | Microsoft | A100 / H100 / 多种位宽 | 自定义量化格式 | 模板生成器，可生成 W2A16 / W4A16 / W8A16 kernel |
+| **MarlinV2 / GPTQ-Marlin** | vLLM 社区 | A100 / H100 | 兼容 GPTQ checkpoint 格式 | 接 GPTQ 输出格式，免去 repack |
+
+**工程含义**：
+- 你部署 GPTQ INT4 模型到 A100，必须确认 vLLM / TRT-LLM 走 Marlin 路径而不是反量化 fallback；否则 throughput 会比 BF16 还低（实测 30-50% 慢）
+- 在 H100 上优先选 Machete（vLLM `--quantization=marlin` 会自动在 H100 上用 Machete 后端），可以拿到比 A100 + Marlin 高得多的 throughput
+- batch 很大（比如 prefill 大 batch）时，W4A16 kernel 的反量化开销开始稀释收益，此时考虑 W8A8（INT8）或 FP8 路径
+- L40S / RTX 4090 等 Ada 卡 Marlin 支持有限（社区版本）
+
+> [!DANGER]
+> **最常见的 W4A16 部署陷阱**：团队听说 INT4 省显存就上线，但没看 kernel 路径，结果 P99 latency 不降反升。修复前先用 vLLM `--profile` 或 `nvidia-smi` 观察："这一次推理的 GEMM 时长真的下降了吗？" 如果没有，说明 kernel 路径退化了。
+
+> [!NOTE]
+> **W4A4 / W4A8 / 整体 INT4** 是另一类故事：Marlin / Machete 只解决 W4A16（权重 INT4，激活 FP16）。如果想把激活也压到 INT4 或 INT8，需要 SmoothQuant、QServe 等额外路径，kernel 选型完全不同。
 
 ### 16.4 校准（Calibration）过程说明
 
@@ -340,6 +379,20 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 
 **一个实战经验**：KV Cache 量化几乎没有"自由午餐"吞吐（因为 KV Cache 不是计算瓶颈，是容量瓶颈），但它能让你**塞进去更大的 batch 或更长的上下文**，间接换来吞吐。
 
+#### 16.5.3 量化对象的排障边界
+
+量化上线后，"质量掉了"这个症状太粗，必须先定位是哪类数值对象带来的误差。
+
+| 症状 | 更可能的问题 | 如何验证 | 常见修复 |
+|------|--------------|----------|----------|
+| 普通短问答也明显退化 | 权重量化误差过大，或 outlier 通道被压坏 | 对同一 prompt 比较 BF16 与量化 logits/top-k，逐层开关量化 | 从 INT4 回到 INT8/FP8；换 GPTQ/AWQ；关键层保高精度 |
+| 长上下文后半段更容易丢事实 | KV Cache 量化误差累积，长程 attention 受影响 | 按上下文长度分桶评测，比较 KV BF16/FP8/INT8 | KV 从 INT4 升到 INT8/FP8；缩小 max context；加强长上下文回归集 |
+| 代码/数学/多语言任务掉得比闲聊多 | 校准集覆盖不足，scale 对高动态范围 token 不友好 | 按语言、任务、长度切分离线指标 | 重做分层校准；增加代码/中文/长 prompt 样本 |
+| 吞吐不升反降 | 低精度格式没有走原生 kernel，运行时反量化后再算 | 打开 kernel trace，看 GEMM/attention backend 名称和 dtype | 换引擎支持的格式；改用 Marlin/FP8 kernel；回到 W8A16 |
+| TTFT 改善小但显存下降明显 | 量化解决的是容量，不是 prefill 算力 | 分开压测 prefill tokens/s 和 decode tokens/s | 调 batch/chunked prefill；引入编译或更强 prefill kernel |
+
+> **工程边界**：量化排障要保留 BF16 基线、量化配置、校准集 hash、评测集 hash、引擎版本和 kernel 路径。缺少任何一项，最后都会变成"这个模型好像不适合量化"这种不可复现的结论。
+
 ### 16.6 编译优化在解决什么
 
 编译和图优化关注的是：
@@ -377,6 +430,20 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 
 **静态 shape 优化**：如果编译器知道 batch、seq len 的确切值，可以选择专门优化的 kernel 而不是"通用万能" kernel。代价是一旦 shape 变了就得重新编译或回退。
 
+#### 16.6.2 编译器、graph capture、kernel library 的边界
+
+推理优化里"编译"也经常被叫混。平台上至少要区分三类东西：
+
+| 层次 | 代表 | 解决的问题 | 典型前提 | 失效信号 |
+|------|------|------------|----------|----------|
+| Graph compiler | `torch.compile`/TorchInductor、XLA、TensorRT build、TVM | 从模型图生成更少、更快的算子计划 | shape 范围、dtype、硬件、算子覆盖 | 首次请求编译很慢；shape 变化触发 recompile；某些算子 graph break |
+| Graph capture | CUDA Graph、vLLM warmup capture | 捕获一段稳定 CUDA 调用，减少 CPU launch overhead | batch/shape/内存地址稳定 | P99 抖动；capture 失败回到 eager；显存因 capture pool 增加 |
+| Kernel library | cuBLASLt、FlashAttention、FlashInfer、Marlin、Triton kernels | 为某个算子提供手写或自动生成的高性能 kernel | dtype/layout/head_dim/block_size 匹配 | profiler 里走了 fallback kernel；低精度没有 Tensor Core 利用 |
+
+这三层可以叠加，但排障方式不同。Graph compiler 出问题，通常看 graph break、recompile 次数和编译 artifact；CUDA Graph 出问题，通常看 shape bucket、warmup、内存地址稳定性；kernel library 出问题，通常看 profiler 里的 kernel 名称、Tensor Core 利用率和 HBM 带宽。
+
+> **反模式警告**：把 `torch.compile=True` 写进配置就认为"已经编译优化"是不够的。在线 LLM 的 shape 经常变化，prefill/decode 路径不同，采样逻辑也可能 graph break。编译收益必须按 prefill、decode、sampler 三段分别验证。
+
 ### 16.7 主流推理引擎对照
 
 引擎选择本质上是在性能、兼容性和平台整合度之间取舍。
@@ -392,6 +459,8 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 | Triton Inference Server | 多后端统一托管 | 依赖后端实现 | 支持 | 多模型、多框架统一平台 |
 
 选择时不要只问"谁最快"，还要问：当前发布链、观测链和排障工具能否接受这个引擎的运行时语义。
+
+这里的 Triton Inference Server 不等于 Triton language/kernel。前者是模型托管与多后端编排服务；后者是写自定义 GPU kernel 的语言和编译链，解决的是 fused kernel 和算子实现问题，不直接提供 LLM 请求调度、KV Cache 管理或 OpenAI-compatible API。
 
 量化支持矩阵会随版本、硬件和后端路径快速变化。像 vLLM、SGLang 这类项目，表里信息更适合作为"常见能力方向"，上线前仍应回到官方 support matrix 和当前 release note 做二次确认。
 
@@ -689,7 +758,44 @@ metadata.json:
 
 跳过其中任何一步，上线出问题的概率都会大幅上升。
 
-### 16.15 工程建议
+### 16.15 精度 / 吞吐 / 延迟排障手册
+
+推理优化的排障要按链路分段，先确认指标定义，再定位瓶颈层。否则一个"QPS 降了"可能被误判成量化失败，实际只是 router 把长 prompt 集中打到了同一个副本。
+
+| 指标异常 | 第一判断 | 要看的分解指标 | 常见原因 | 处理方向 |
+|----------|----------|----------------|----------|----------|
+| TTFT P99 高 | prefill 或排队慢 | queue time、prefill tokens/s、prefix hit rate、active seqs | 长 prompt burst、prefix cache 失效、chunk 太大、冷启动编译 | chunked prefill、prefix-aware routing、预热 compile/capture、单独 prefill 副本 |
+| TPOT/ITL 高 | decode 慢 | decode tokens/s、HBM bandwidth、SM util、batch size | 权重带宽瓶颈、低精度 kernel 没命中、TP 通信慢 | W4A16/W8A16、Marlin/FP8 kernel、调 TP、查 NCCL |
+| 吞吐高但 goodput 低 | 产出 token 多但不满足 SLO | SLO 内 tokens/s、P95/P99、超时率 | batch 塞太满、max_num_seqs 过大、抢占过多 | 降并发上限，按 SLO 做 admission control |
+| 显存 OOM | 权重/KV/workspace 预算错误 | weights memory、KV usage、CUDA graph pool、workspace | max_model_len 过大、gpu_memory_utilization 太激进、KV 未量化 | 降 max_num_seqs/max_model_len，KV FP8/INT8，预留 workspace |
+| 质量掉点 | 数值误差或分布漂移 | 分任务指标、logits diff、校准覆盖率 | INT4 过猛、KV 量化影响长上下文、校准集偏 | 回退精度、重做校准、关键层保高精度 |
+| 首次请求很慢 | 编译 / capture / 权重加载 | compile time、engine load time、warmup time | AOT artifact 缺失、CUDA graph 未预热、懒加载 | 发布前 warmup，保存 engine artifact，探针请求预热 |
+
+一个生产压测报告至少要按下面几个维度切片：
+
+| 切片维度 | 为什么必须切 |
+|----------|--------------|
+| input length bucket | TTFT 和 prefill 成本几乎按 prompt token 增长 |
+| output length bucket | 长输出会放大 decode 路径和 KV 压力 |
+| concurrency bucket | 低并发看 latency，高并发看吞吐和抢占 |
+| prefix share ratio | prefix cache 命中率会直接改变 prefill 成本 |
+| quantization mode | W4A16、W8A8、KV8 的瓶颈完全不同 |
+| hardware SKU | A100/H100/L40S/B200 的低精度 kernel 支持不同 |
+
+#### 16.15.1 反模式 Checklist
+
+| 反模式 | 现象 | 修复方向 |
+|--------|------|----------|
+| 只看平均 tokens/s | benchmark 很漂亮，上线 P99 超时 | 报告 TTFT/TPOT P50/P95/P99 和 goodput |
+| 用 demo prompt 校准 | 离线不掉点，线上长尾任务掉 | 从真实日志脱敏分层采样，记录校准集版本 |
+| 把权重量化当作长上下文解法 | 模型权重变小了，32K 并发仍上不去 | 计算 KV Cache 预算，评估 KV FP8/INT8 |
+| 引擎 artifact 没有元数据 | 换节点或升级 CUDA 后不可复现 | artifact 绑定模型、GPU、CUDA、shape、dtype、引擎版本 |
+| 混用 tokenizer / prompt 模板版本 | prefix cache 命中率突然归零 | tokenizer 和模板作为发布制品一起 pin |
+| 线上直接切 TensorRT-LLM | 极限性能提升，但回滚、构建、排障变慢 | 先做 shape bucket 和 engine 管理，再灰度 |
+| 只压测单请求 | 单请求 TPOT 很低，高并发吞吐差 | 用真实到达过程和长度分布做压测 |
+| 低精度 kernel 没确认 | 显存省了，延迟反而升 | profiler 确认 kernel 名称、Tensor Core 利用率和 fallback |
+
+### 16.16 工程建议
 
 - 先明确瓶颈在权重、带宽还是 KV Cache，再决定量化对象（详见 [第15章](15-batching-scheduling-and-kv-cache.md)）
 - PTQ 项目必须保留校准集来源与版本信息，否则问题难以复现
@@ -711,7 +817,7 @@ metadata.json:
 | 模型导出 | `torch.onnx.export`、`trtllm-build`、`trtexec` | 用于跨引擎验证和编译产物生成 |
 | 质量评测 | lm-eval-harness、AlpacaEval、MT-Bench | 量化前后回归对比必备 |
 
-### 16.16 常见误区
+### 16.17 常见误区
 
 #### 误区一：量化一定稳赚不赔
 

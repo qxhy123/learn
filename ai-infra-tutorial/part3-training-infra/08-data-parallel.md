@@ -1,843 +1,1502 @@
 # 第8章：数据并行
 
-> 数据并行是规模化训练的第一步，也是很多团队第一次真正面对"通信现实"的地方。
+> 数据并行的第一性原理是：复制可并行的样本计算，支付保持参数一致的同步成本。工程成败不在于能否启动 64 个 rank，而在于是否能证明每个新增 rank 带来的有效吞吐大于它引入的通信、等待和治理成本。
 
-> **关联章节**：本章以 [第7章](./07-single-node-training.md) 的单机基线为前提，也会直接影响 [第10章](./10-memory-checkpointing-and-recovery.md) 的 checkpoint 频率和恢复策略。通信越重，额外停顿越贵。后续章节里，[第9章](./09-model-parallel.md) 讨论的模型并行常常和数据并行组合使用，构成 2D / 3D 并行的基础。
+> **关联章节**：本章以 [第7章](./07-single-node-training.md) 的单节点基线为输入，继续扩展到多节点数据并行；当状态或模型无法再复制时，需要转向 [第9章](./09-model-pipeline-parallel.md) 的 TP / PP / CP / hybrid parallel；checkpoint 的状态一致性和恢复协议见 [第10章](./10-memory-checkpointing-and-recovery.md)。
 
-## 1. 第一性原理拆解：为什么数据并行会先解决吞吐，又立刻制造通信问题
+## 1. 第一性原理拆解 + 学习大纲
 
-### 拆 — 不可化简的问题
+### 1.1 拆：不可化简的问题
 
-剥离 DDP、NCCL、ZeRO、bucket 这些工具名之后，本章面对的不可化简问题只有一个：**训练一个模型需要反复用大量样本估计同一组参数的更新方向，而单个加速器在单位时间内能处理的样本数有限；如果复制计算者来提高样本吞吐，就必须付出让所有复制者重新达成一致的代价。** 数据并行不是“把脚本复制到多张卡上”这么简单，它是在两个物理事实之间做交换：一边是 GPU 对不同样本的前向和反向天然可并行，另一边是参数更新必须基于同一个全局梯度，否则每张卡很快就会训练成不同模型。只要训练算法仍然假设同步 SGD / Adam 这类全局一致的更新语义，同步梯度就不是可选优化，而是保持数学含义的必要步骤。
+训练不是单次推理，而是反复估计同一组参数的更新方向。
 
-这也是很多团队第一次真正面对“通信现实”的地方。单机阶段的主要矛盾通常是算子是否高效、显存是否够、DataLoader 是否稳定；一旦进入数据并行，step 时间里多了一段不做模型计算却必须完成的工作：把每张卡上的梯度聚合，再把聚合结果发回所有卡。卡数越多，样本吞吐潜力越高，但同步路径也越长；模型越大，梯度字节数越大；跨节点越多，网络带宽、延迟、拥塞、拓扑和慢节点都会进入训练主循环。更麻烦的是，扩卡还会改变 batch 语义：固定 per-device batch 会放大 global batch，固定 global batch 又会压小每卡计算量，使通信占比上升。因此，本章真正要建立的不是“会启动多卡训练”，而是能回答：复制多少计算者以后，额外同步代价是否仍然低于新增算力收益？
+单个 GPU 的样本吞吐有限。
 
-### 推 — 从这个问题如何推导出每个机制
+多个 GPU 可以同时处理不同样本。
 
-从“复制计算者提升吞吐，但必须保持参数一致”出发，第一个必然机制是**数据切分 + 模型复制**：每个 rank 拿不同 batch 分片，保留同一份模型，独立完成 forward / backward。第二个机制是**梯度聚合**：本地梯度只是局部样本的估计，必须通过 AllReduce 变成全局平均梯度；ring、tree、double binary tree 等算法本质上都是在不同消息大小、设备数和拓扑下，平衡带宽利用率与启动延迟。第三个机制是**通信与计算重叠**：如果等所有层反向结束后再同步全部梯度，GPU 会在 step 尾部纯等网络；于是 DDP 会把梯度组织成 bucket，让较早产生的梯度先开始 AllReduce，目标是把通信藏进 backward 时间里，只留下尽量短的 tail。
+但优化器更新必须基于同一个全局梯度视图。
 
-接着会推导出**扩展效率**这个指标。单看 8 卡吞吐没有意义，必须和 1 卡基线相比，判断新增卡数带来的吞吐是否接近线性；还要区分 strong scaling 和 weak scaling，因为前者固定任务总量，后者固定每卡工作量，回答的是两个不同问题。再往下会出现**batch 定义和梯度累积**：为了让每卡算得足够久、摊薄同步成本，你可能想增大 per-device batch；但优化算法看到的是 global batch，过大可能影响收敛，于是梯度累积、LR scaling、warmup 都进入系统设计边界。通信成为瓶颈后，又会推导出**bucket 调参、混合精度通信、梯度压缩**：先减少碎消息和尾部等待，再考虑用 BF16/FP16、quantization、sparsification 或 PowerSGD 减少传输字节，但这些近似会把系统问题重新带回收敛风险。最后，当“每张卡保留完整模型、梯度、优化器状态”这个前提不再成立，就会推导出 FSDP / ZeRO：它们仍属于数据并行家族，但把原来冗余保存的训练状态切分，从“同步梯度”扩展到“按需聚合参数和状态”。所以本章的逻辑链不是工具罗列，而是：吞吐不足导致复制，复制导致一致性，同步导致通信，通信导致 overlap / 压缩 / 拓扑调优，内存冗余导致 sharding。
+因此，同步数据并行的最小问题是：
 
-### 绘 — 因果链路
+```text
+复制计算者以提高样本吞吐，同时让所有计算者在 optimizer step 前重新达成参数一致。
+```
+
+这句话推出四个必然后果：
+
+1. 每个 rank 必须知道自己处理哪一份数据。
+2. 每个 rank 必须在同一个 step 上使用等价的模型状态。
+3. backward 产生的局部梯度必须变成全局平均梯度。
+4. 任意 rank 变慢、数据倾斜、网络退化都会拖慢整个同步组。
+
+数据并行不是“加卡就加速”。
+
+它是把单节点瓶颈从计算路径延伸到通信路径、状态路径和故障路径。
+
+### 1.2 推：机制如何从问题中长出来
+
+如果完整训练副本能放进每张 GPU，最直接机制是 DDP：复制参数、切分数据、同步梯度。
+
+如果 optimizer state 和 gradient 的重复存储太贵，机制变成 ZeRO-1 / ZeRO-2 或 FSDP `SHARD_GRAD_OP`：切分 optimizer state 或 gradient，用 ReduceScatter / AllGather 替代部分 AllReduce 语义。
+
+如果参数本身也放不下，机制变成 ZeRO-3 或 FSDP `FULL_SHARD`：参数常驻为 shard，在 forward/backward 前后用 AllGather 暂时拼回需要的参数，再释放。
+
+如果单层矩阵计算、流水空泡或超长序列成为瓶颈，数据并行不再是主轴，需要叠加 TP / PP / CP。
+
+### 1.3 学习大纲
+
+读完本章，你应该能回答：
+
+1. DDP、FSDP、ZeRO 分别复制什么、切分什么、通信什么、保存什么。
+2. AllReduce、ReduceScatter、AllGather 在 step timeline 中具体发生在哪里。
+3. `bucket_cap_mb`、overlap、gradient accumulation、global batch、loss scale 为什么会互相影响。
+4. straggler 和 data skew 为什么会让平均 GPU 利用率失真。
+5. NCCL ring/tree、rail、NIC、IB/RoCE 如何进入训练 step time。
+6. 如何用 NCCL 日志、`nccl-tests`、DCGM、Nsight、rank-level metrics 建立证据链。
+7. 什么时候继续 DP，什么时候切 FSDP/ZeRO，什么时候上 TP/PP/CP/hybrid。
+8. 如何为 8 节点 64 GPU 作业拆 step time，并定位 NCCL 或数据倾斜问题。
+
+## 2. 概念边界：是什么、不是什么、相邻概念边界
+
+### 2.1 是什么
+
+数据并行是一组训练进程共同训练同一个模型的系统形态。
+
+每个 rank 处理不同数据分片。
+
+每个 rank 在一个同步边界上贡献本地梯度。
+
+训练系统通过 collective communication 让优化器看到等价的全局梯度或等价的分片状态。
+
+工程上，数据并行包括：
+
+- process group 和 rank 管理；
+- sampler 和 dataset shard；
+- DDP/FSDP/ZeRO 包装；
+- gradient bucket 和通信 overlap；
+- NCCL 通信域和拓扑绑定；
+- checkpoint shard 与恢复元数据；
+- straggler、data skew、timeout 的观测和处置。
+
+### 2.2 不是什么
+
+数据并行不是：
+
+- 单卡 OOM 的通用解法；经典 DDP 每卡仍保存完整参数、梯度和优化器状态。
+- 网络问题的遮羞布；跨节点后 IB/RoCE/NIC/rail 会直接进入 step time。
+- 自动提升 MFU 的按钮；per-rank compute 太小会让通信占比上升。
+- 算法 batch 语义的免费扩展；global batch 改变会影响收敛、学习率和 warmup。
+- checkpoint 简化器；FSDP/ZeRO 会让 checkpoint 从单文件变成分片状态协议。
+
+### 2.3 相邻概念边界
+
+| 概念 | 解决的问题 | 复制什么 | 切分什么 | 主要通信 | 何时使用 |
+|---|---|---|---|---|---|
+| DDP | 增加样本吞吐 | 参数、梯度、optimizer state | 数据 | Gradient AllReduce | 模型和训练状态能放进单卡 |
+| ZeRO-1 | 减少 optimizer state 冗余 | 参数、梯度 | optimizer state | optimizer state AllGather/partition update | Adam state 顶显存但参数能放下 |
+| ZeRO-2 | 减少 optimizer + gradient 冗余 | 参数 | optimizer state、gradient | ReduceScatter + state partition | gradient/optimizer 占用太大 |
+| ZeRO-3 | 减少参数 + gradient + optimizer 冗余 | 很少常驻完整状态 | 参数、gradient、optimizer state | AllGather + ReduceScatter | 完整训练副本放不下 |
+| FSDP NO_SHARD | PyTorch 包装但不切分 | 同 DDP | 不切 | AllReduce | 迁移或调试 |
+| FSDP SHARD_GRAD_OP | PyTorch ZeRO-2 类形态 | 参数 | gradient、optimizer state | ReduceScatter | 参数能放下，状态太大 |
+| FSDP FULL_SHARD | PyTorch ZeRO-3 类形态 | 按需临时完整参数 | 参数、gradient、optimizer state | AllGather + ReduceScatter | 参数也需要分片 |
+| TP | 单层矩阵放不下或层内算力不足 | 数据并行组外可复制 | tensor dimension | AllReduce/AllGather/ReduceScatter | 优先节点内 NVLink/NVSwitch |
+| PP | 层数/整网状态太大 | stage 内参数 | layers | activation send/recv | 模型太深，TP/FSDP 不够 |
+| CP | context/attention 维度太大 | 依策略 | sequence/context | KV/attention collective | 长上下文训练 |
+
+边界判断的核心句子：
+
+```text
+DP 切样本，FSDP/ZeRO 切训练状态，TP 切层内张量，PP 切层段，CP 切上下文。
+```
+
+## 3. 架构：控制路径、数据路径、状态路径、故障路径
+
+### 3.1 责任边界
+
+一个生产级数据并行作业至少有五个责任面：
+
+| 责任面 | 关键对象 | 失败时的典型表现 |
+|---|---|---|
+| Scheduler | node、GPU、NIC、rank placement | rank 分布跨坏拓扑，P95 step time 上升 |
+| Launcher | `torchrun`、Slurm、K8s job、env vars | rendezvous 失败，rank/world size 不一致 |
+| Framework | DDP/FSDP/ZeRO、sampler、optimizer | hang、OOM、checkpoint mismatch |
+| Communication | NCCL process group、rings、trees、rails | timeout、bus bandwidth 低、collective tail |
+| Observability | profiler、NCCL logs、DCGM、dataset metrics | 只能看到“慢”，无法定位根因 |
+
+### 3.2 控制路径
+
+控制路径负责让所有 rank 在同一个训练协议里运行。
+
+```text
+scheduler allocates nodes
+  -> launcher assigns RANK / LOCAL_RANK / WORLD_SIZE
+  -> process group rendezvous
+  -> framework wraps model
+  -> sampler shards dataset
+  -> train loop enters synchronized steps
+  -> checkpoint coordinator records global_step and parallel metadata
+```
+
+控制路径的关键风险：
+
+- `WORLD_SIZE` 与实际进程数不一致；
+- node rank 重复；
+- hostname 或 interface 选择错误；
+- rank placement 不匹配 GPU-NIC topology；
+- elastic restart 后 sampler epoch 或 global step 不一致。
+
+### 3.3 数据路径
+
+数据路径负责保证每个 rank 看到不同且可复现的数据分片。
+
+```text
+dataset manifest
+  -> DistributedSampler / streaming shard planner
+  -> per-rank DataLoader workers
+  -> CPU preprocessing / tokenization / packing
+  -> pinned memory
+  -> H2D copy
+  -> forward/backward
+```
+
+数据路径不是通信路径的旁支。
+
+它会制造同步等待。
+
+如果 rank 17 因为样本更长、CPU worker 卡住、远端对象存储抖动而慢 200 ms，那么所有 rank 都会在 collective 或下一个 step 同步边界等它。
+
+### 3.4 状态路径
+
+状态路径回答“训练状态在哪里，谁拥有，何时一致”。
+
+| 状态 | DDP | FSDP FULL_SHARD / ZeRO-3 | checkpoint 形态 |
+|---|---|---|---|
+| Parameters | 每 rank 完整副本 | shard 常驻，计算时 AllGather | full 或 sharded state dict |
+| Gradients | 每 rank 完整梯度，AllReduce 后一致 | ReduceScatter 后每 rank 保存 shard | shard + metadata |
+| Optimizer state | 每 rank 完整 Adam state | 每 rank 保存 state shard | optimizer shard + param mapping |
+| RNG | 每 rank 独立但可恢复 | 同 DDP，需保存 rank/stream | rank-local RNG state |
+| Dataset cursor | sampler epoch + offset | 同 DDP | global step + data shard cursor |
+| Parallel metadata | process group | group + shard layout | world size、mesh、shard spec |
+
+### 3.5 故障路径
+
+数据并行的故障经常不是立刻报错，而是先表现为慢。
+
+故障路径通常是：
+
+```text
+rank-local anomaly
+  -> step skew
+  -> collective wait
+  -> NCCL watchdog timeout or throughput regression
+  -> retry / job failure / checkpoint rollback
+```
+
+定位时不要从 Python stack trace 开始猜。
+
+先建立证据：
+
+- 哪个 step 开始慢；
+- 哪些 rank 慢；
+- 是 data time、compute time、NCCL time、optimizer time 还是 checkpoint time；
+- 慢 rank 是否集中在同一 node、NIC、rail、rack、dataset shard；
+- NCCL 日志中 ring/tree/channel 是否退化；
+- DCGM 是否显示 GPU clock、PCIe replay、NVLink error、ECC、XID。
+
+## 4. 原理：从不可化简的问题推导机制
+
+### 4.1 DDP step timeline
+
+DDP 的数学语义是同步 SGD/Adam：每个 rank 计算局部梯度，所有 rank 得到全局平均梯度，然后各自执行相同 optimizer step。
+
+简化公式：
+
+```text
+global_grad = average(local_grad_rank_0 ... local_grad_rank_N-1)
+```
+
+DDP 不是等 backward 完成后才一次性通信。
+
+PyTorch DDP 会把参数梯度按 bucket 组织。
+
+当某个 bucket 内的梯度都 ready，DDP hook 会启动对应 AllReduce。
+
+理想情况是早期 bucket 的通信被后续 backward compute 掩盖。
+
+### 4.2 FSDP / ZeRO step timeline
+
+FSDP/ZeRO 的核心不是“更快同步”，而是“减少常驻冗余状态”。
+
+典型 FULL_SHARD timeline：
+
+1. layer forward 前 AllGather 该 layer 参数 shard；
+2. forward 使用临时完整参数；
+3. forward 后释放或 reshard 参数；
+4. backward 前可能再次 AllGather；
+5. backward 得到梯度；
+6. ReduceScatter 梯度到 owner rank；
+7. 每个 rank 只更新自己拥有的 optimizer state shard；
+8. checkpoint 保存 shard 和 layout metadata。
+
+### 4.3 DDP / FSDP 通信时间线
 
 ```mermaid
-mindmap
-  root((数据并行))
-    不可化简问题
-      单卡样本吞吐有限
-      参数更新需要全局一致
-      复制计算者会引入同步代价
-    基本机制
-      模型复制
-      数据切分
-      本地 forward/backward
-      梯度 AllReduce
-    通信现实
-      梯度字节数
-      Ring/Tree 算法
-      NVLink/IB/Ethernet 拓扑
-      慢 rank 木桶效应
-    工程优化
-      Bucket
-      通信计算重叠
-      BF16/FP16 通信
-      Quantization
-      Sparsification
-      PowerSGD
-    实验判断
-      Strong scaling
-      Weak scaling
-      tokens/sec
-      MFU
-      per-rank skew
-    边界
-      Global batch 改变收敛
-      单卡内存不减少
-      DDP 放不下转 FSDP/ZeRO
-      网络太差不适合跨节点 DP
+sequenceDiagram
+    participant CPU as DataLoader/CPU
+    participant R0 as Rank 0 GPU
+    participant R1 as Rank 1..N GPU
+    participant NCCL as NCCL Process Group
+    participant CKPT as Checkpoint Store
+
+    CPU->>R0: batch shard + H2D
+    CPU->>R1: batch shard + H2D
+    R0->>R0: forward
+    R1->>R1: forward
+    alt DDP backward overlap
+        R0->>R0: backward layer k gradients ready
+        R1->>R1: backward layer k gradients ready
+        R0->>NCCL: bucket k AllReduce
+        R1->>NCCL: bucket k AllReduce
+        NCCL-->>R0: averaged gradient bucket k
+        NCCL-->>R1: averaged gradient bucket k
+        R0->>R0: continue backward while comm overlaps
+        R1->>R1: continue backward while comm overlaps
+    else FSDP FULL_SHARD
+        R0->>NCCL: AllGather parameter shard for module k
+        R1->>NCCL: AllGather parameter shard for module k
+        NCCL-->>R0: full module parameters
+        NCCL-->>R1: full module parameters
+        R0->>R0: forward/backward module k
+        R1->>R1: forward/backward module k
+        R0->>NCCL: ReduceScatter gradient shard
+        R1->>NCCL: ReduceScatter gradient shard
+        NCCL-->>R0: owned gradient shard
+        NCCL-->>R1: owned gradient shard
+    end
+    R0->>R0: optimizer step
+    R1->>R1: optimizer step
+    R0->>CKPT: save full state or shard
+    R1->>CKPT: save full state or shard
 ```
 
-### 导 — 读完本章你应该能回答
+### 4.4 AllReduce、ReduceScatter、AllGather 的边界
 
-1. 如果每张卡已经能独立算梯度，为什么同步 AllReduce 仍然是同步数据并行的必要步骤，而不是一个可选优化？
-2. 给定模型参数量、梯度精度、卡数和有效带宽，你能否心算一次 ring AllReduce 的通信时间量级？
-3. 为什么 strong scaling 和 weak scaling 得到的扩展效率不能直接放在一张图里比较？
-4. 当 profiler 显示 step 尾部有明显 NCCL tail 时，你会优先检查 bucket、拓扑、慢 rank 还是 batch，并说明理由？
-5. 为什么增大 global batch 可能提升系统吞吐，却同时破坏优化稳定性？
-6. 梯度压缩什么时候能解决真实瓶颈，什么时候只是把网络问题换成收敛和排障问题？
-7. 经典 DDP 为什么不能缓解单卡训练状态内存，FSDP / ZeRO 又是从哪个冗余假设推导出来的？
+| Collective | 输入 | 输出 | DDP/FSDP 用途 | 性能敏感点 |
+|---|---|---|---|---|
+| AllReduce | 每 rank 一个 tensor | 每 rank 得到 reduce 后完整 tensor | DDP 梯度平均 | 大消息带宽、bucket tail、ring/tree 选择 |
+| ReduceScatter | 每 rank 一个完整 tensor | 每 rank 得到 reduce 后的一个 shard | ZeRO/FSDP 梯度分片 | shard layout、跨节点带宽、overlap |
+| AllGather | 每 rank 一个 shard | 每 rank 得到拼接后的完整 tensor | FSDP/ZeRO-3 参数按需聚合 | 调用频率、prefetch、wrap 粒度 |
 
-## 学习目标
+AllReduce 可以拆成 ReduceScatter + AllGather。
 
-完成本章学习后，你将能够：
+FSDP/ZeRO-3 显式利用这个拆分：常驻 shard，计算前后做必要 collective。
 
-1. 理解数据并行的基本工作方式
-2. 认识 AllReduce 与梯度同步开销
-3. 学会分析扩展效率下降的原因
-4. 理解数据并行的适用边界
-5. 用定量方式判断"加卡是否值得"
-6. 理解 global batch、per-device batch 与梯度累积的关系
-7. 区分单机数据并行和多机数据并行在拓扑上的差异
-8. 设计一个最低可用的扩展效率实验
-9. 理解 DDP、FSDP、ZeRO 各阶段在通信量和内存之间的权衡
-10. 读懂一次 profiler 时间线里的通信尾巴、bucket 节奏和 straggler
+### 4.5 bucket 与 overlap
 
----
+`bucket` 是通信调度单位。
 
-## 本章导读
+bucket 太小：
 
-很多人第一次接触数据并行时，会把它理解成：
+- collective 启动次数多；
+- latency 占比高；
+- NCCL channel 不能充分吃满带宽。
 
-- "把单卡脚本复制到多张卡上"
-- "反正每张卡都算一份，最后同步一下就行"
-- "卡数翻倍，速度大概也就翻倍"
+bucket 太大：
 
-这些理解只能覆盖最表面的部分。
-数据并行真正困难的地方，不在"怎么起 8 个进程"，而在于你开始第一次面对训练系统里的通信现实：
+- 早期梯度要等同 bucket 其他梯度；
+- overlap 变差；
+- step 末尾 tail 变长。
 
-- 梯度同步不是免费的
-- 多卡并不会自动消除单机阶段的问题
-- 网络和拓扑会直接进入 step 时间
-- 实验指标会因为 batch 定义变化而变得容易误读
-- "数据并行"这个词本身也在扩展 —— 从原始 DDP 到 FSDP / ZeRO，其实边界已经模糊
+有效调参不看“bucket 越大越好”。
 
-所以，本章真正要建立的不是"DDP 会用"，而是一套判断框架：
+要看 profiler timeline：
 
 ```text
-单机基线是否稳定
-  ├── 同步成本占比多少
-  ├── 通信和计算能否重叠
-  ├── 扩卡后 batch 定义是否变了
-  ├── 单卡是否还能放下模型（否则要考虑 FSDP / 模型并行）
-  └── 扩展效率下降到底是算法问题、数据问题还是网络问题
+healthy: backward compute covers most NCCL kernels
+bad-small-bucket: many tiny ncclKernel_AllReduce calls, launch overhead high
+bad-large-bucket: backward ends, final bucket still running, exposed tail high
 ```
 
-如果这些问题没有先想清楚，那么"多卡训练跑起来"并不意味着"规模化训练做好了"。
+### 4.6 gradient accumulation、global batch、loss scale
 
-## 正文内容
-
-### 8.1 数据并行的核心思想
-
-在数据并行中，每张卡持有一份完整模型，但处理不同的数据分片。一个 step 的基本流程是：
-
-1. 各卡各自前向和反向
-2. 得到本地梯度
-3. 通过通信把梯度聚合
-4. 各卡更新到相同参数
-
-用更抽象的话说，数据并行做的是：
-
-> **复制模型，切分数据，同步梯度。**
-
-它的优势是：
-
-- 模型逻辑改动相对小
-- 框架支持成熟
-- 是大多数训练集群的第一种并行方式
-- 调试链路短：出问题时一个 rank 就能复现大多数错误
-
-它的代价是：
-
-- 通信成本会随着规模上升越来越明显
-- 内存不会自动变多 —— 模型放不下单卡时，经典 DDP 救不了你
-- 每卡一份完整参数 + 梯度 + 优化器状态，存在大量冗余
-
-#### 8.1.1 DDP 在做什么，不在做什么
-
-从工程上看，PyTorch DDP 一类数据并行框架通常在做三件事：
-
-- 每个 rank 保留一份完整模型副本
-- 每个 rank 处理不同数据分片
-- 在反向传播过程中同步梯度，使参数重新保持一致
-
-但它**没有**解决下面这些问题：
-
-- 模型本体放不下单卡
-- 优化器状态太大
-- 序列长度把激活顶爆
-- 单机数据供给本来就跟不上
-
-换句话说，数据并行擅长解决的是：
-
-> **同一个模型已经能在单卡稳定训练，如何通过复制副本提升样本吞吐。**
-
-这也解释了为什么它常常是训练扩展的第一步，而不是最后一步。
-
-#### 8.1.2 一个容易忽略的事实：数据并行下每卡的内存其实更大
-
-很多人以为"加卡能分摊内存"，这在经典 DDP 下恰好是反的。一个 1B 参数模型在 Adam + 混合精度下的训练时内存构成（每卡，单位 GB）大概是：
-
-| 组成 | 占用 | 说明 |
-|------|------|------|
-| 模型权重（bf16） | 2 GB | 2 字节/参数 |
-| 梯度（bf16） | 2 GB | 和权重同大小 |
-| 优化器状态（fp32 主权重 + m + v） | 12 GB | Adam 下 12 字节/参数 |
-| 前向激活（bf16） | 视 batch 和 seq len | 常常 5 - 30 GB |
-| 框架额外（临时 buffer、NCCL、allocator 碎片） | 1 - 3 GB | 实测难以忽略 |
-| **合计** | **~20 - 50 GB** | |
-
-DDP 下这个数字**不会因为加卡而减少** —— 每卡都是完整副本。所以出现"模型明明只有 1B，怎么还 OOM"时，常见原因就在这里。
-
-这也引出了 **§8.9** 要讨论的问题：当单卡装不下时，你需要的不是"更多数据并行"，而是 FSDP / ZeRO / 模型并行。
-
-### 8.2 一个 step 的时间分解
-
-数据并行下，一个 step 可以粗略写成：
-
-$$
-t_{\text{step}} = t_{\text{forward}} + t_{\text{backward}} + t_{\text{allreduce}} + t_{\text{optim}}
-$$
-
-如果 `t_allreduce` 占比越来越高，那么说明你已经进入"通信主导"区间。
-
-这时就要开始问：
-
-- 梯度量有多大？
-- 网络拓扑怎样？
-- 是否能让通信和计算重叠？
-- 是否真的值得继续扩卡？
-
-#### 8.2.1 真正影响体验的，往往是"重叠得怎么样"
-
-上面的式子适合建立第一层直觉，但真实 DDP step 往往不是：
+全局 batch 定义：
 
 ```text
-forward -> backward -> allreduce -> optim
+global_batch = per_device_batch * world_size * gradient_accumulation_steps
 ```
 
-更常见的是：
+如果只增加 `world_size` 而保持其他不变，global batch 会线性变大。
+
+这可能提升系统吞吐，但改变优化算法看到的 batch 语义。
+
+如果要保持 global batch 不变，扩卡后必须降低 per-device batch 或 accumulation。
+
+这会缩短每个 rank 的 compute 时间，使通信更难隐藏。
+
+FP16 训练还要处理 loss scale。
+
+如果某个 rank overflow，生产系统必须明确策略：
+
+- 所有 rank 同步跳过 optimizer step；
+- loss scale 更新一致；
+- checkpoint 记录 scaler state；
+- 不能让部分 rank step、部分 rank skip。
+
+BF16 通常避免动态 loss scaling，但不是免费稳定；activation、optimizer、gradient clipping 仍需一致观测。
+
+### 4.7 exposed communication 公式
+
+训练工程里真正伤害吞吐的不是总通信，而是没有被计算覆盖的通信。
+
+本章使用以下公式：
 
 ```text
-forward
-  └── backward(逐层回传梯度)
-        └── 某些梯度桶一边生成，一边开始 allreduce
-              └── 剩余无法重叠的通信尾巴
-                    └── optim
+exposed communication = max(comm - overlap, 0)
 ```
 
-在输入链路已经相对稳定的前提下，一个更接近工程现实的近似式子是：
+对应 step time 近似：
 
-$$
-t_{\text{step}} \approx t_{\text{forward}} + \max(t_{\text{backward}}, t_{\text{allreduce, overlap}}) + t_{\text{tail}} + t_{\text{optim}}
-$$
+```text
+step_time = data_visible + forward + backward + exposed_communication + optimizer + misc
+```
 
 其中：
 
-- `t_allreduce, overlap`：能和反向传播重叠的通信部分
-- `t_tail`：反向结束后仍然没同步完的那段通信尾巴
+- `comm` 是 NCCL collective 的总 wall time 或估算时间；
+- `overlap` 是这些 collective 与 backward/forward compute 同时发生的部分；
+- `exposed_communication` 是 GPU 或训练 loop 明确等待通信完成的 tail。
 
-这会直接影响调优思路：
+### 4.8 AllReduce 通信量心算
 
-- 如果 `t_tail` 很大，说明 bucket / overlap 做得不理想
-- 如果 allreduce 几乎无法重叠，扩卡收益会很快下降
-- 如果单机数据链路本来就不稳，多卡后只会让问题更难看清
-
-#### 8.2.2 一个直观的时间线对比
-
-用 profiler 看 step 时间线时，差异往往非常明显。下面是两种 step 的示意：
-
-**健康的 step（overlap 好）**：
-```text
-GPU: [────forward────][──────backward──────][opt]
-NCCL:                  [──allreduce──]
-      └── 几乎没有"纯等通信"的 tail
-```
-
-**不健康的 step（overlap 差）**：
-```text
-GPU: [────forward────][──────backward──────]            [opt]
-NCCL:                                       [─allreduce─]
-                                            └── 明显的 tail，GPU 空等
-```
-
-同样的卡数和模型，第二种形态的 step 时间可能比第一种多 20-40%。而这种差异**看平均 GPU 利用率是看不出来的**（因为 GPU 在反向时确实很忙），必须看时间线。
-
-#### 8.2.3 一个简单的"通信占比"心算
-
-如果想快速判断一个训练任务的通信压力，一个粗略的心算是：
+Ring AllReduce 对每个 rank 的近似传输量：
 
 ```text
-通信时间 ≈ gradient_bytes × 2 × (N-1) / N / bandwidth
-计算时间 ≈ FLOPs / (GPU_peak × 利用率)
-通信占比 ≈ 通信时间 / (计算时间 + 通信时间)
+bytes_per_rank ~= 2 * (N - 1) / N * gradient_bytes
 ```
 
-举个例子：7B 模型，bf16 梯度 = 14 GB，8 卡 NVLink 节点内（约 300 GB/s 有效带宽）：
+通信时间近似：
 
 ```text
-通信时间 ≈ 14 × 2 × 7/8 / 300 ≈ 0.08 秒
+comm_time ~= bytes_per_rank / effective_bus_bandwidth + collective_latency
 ```
 
-如果这个模型单 step 计算 ~1 秒，那通信占比是 ~8%，扩卡收益会很健康。但换到跨节点 InfiniBand（约 25 GB/s 有效）：
+这不是精确模型，但足够用于 admission。
+
+例子：7B 模型 BF16 gradient 约 `13.4 GB`，64 rank ring AllReduce 每 rank 传输约：
 
 ```text
-通信时间 ≈ 14 × 2 × 7/8 / 25 ≈ 1 秒
+2 * 63 / 64 * 13.4 GB ~= 26.4 GB
 ```
 
-通信和计算 1:1，overlap 不到位就是灾难。这种心算不一定准确，但足以让你判断"这个规模值不值得继续扩"。
+如果跨节点有效 bus bandwidth 只有 `120 GB/s`，纯通信约 `220 ms`。
 
-### 8.3 AllReduce 为什么会成为瓶颈
+如果 profiler 看到 exposed tail 只有 `45 ms`，说明 overlap 大约吃掉了 `175 ms`。
 
-AllReduce 的本质是：把多个设备上的梯度做聚合，并把聚合结果再分发回去。
+如果 tail 是 `180 ms`，瓶颈不一定是总带宽，也可能是 bucket、rank skew、拓扑或数据等待破坏了 overlap。
 
-在一个粗略的 ring all-reduce 模型里，每个参与者大约要传输：
+## 5. 框架实现：真实旋钮与约束
 
-$$
-\text{传输量} \approx 2 \times \frac{N-1}{N} \times \text{gradient\_bytes}
-$$
+### 5.1 PyTorch DDP 关键旋钮
 
-其中 `N` 是参与设备数。
+| 旋钮 | 作用 | 工程约束 |
+|---|---|---|
+| `DistributedDataParallel(model, bucket_cap_mb=...)` | 控制 gradient bucket 上限 | 需要用 profiler 验证 tail，不靠默认值迷信 |
+| `static_graph=True` | 减少动态图开销，改善 bucket 稳定性 | 只有每步参数使用路径稳定时才能开 |
+| `find_unused_parameters=True` | 处理未参与 loss 的参数 | 会增加 autograd traversal，常降低性能 |
+| `gradient_as_bucket_view=True` | 减少 gradient copy | optimizer 或代码不能假设独立 grad storage |
+| `no_sync()` | gradient accumulation 中跳过中间 AllReduce | 只在最后一个 microstep 同步 |
+| `DistributedSampler.set_epoch(epoch)` | 保证 shuffle 可复现且 rank 间不同 | elastic/restart 后必须恢复 epoch/offset |
 
-这条式子的工程含义很直接：
+### 5.2 FSDP 关键旋钮
 
-- 梯度越大，通信越贵
-- 设备越多，通信协调越复杂
-- 网络越慢，扩卡收益越差
+| 旋钮 | 作用 | 风险 |
+|---|---|---|
+| `ShardingStrategy.FULL_SHARD` | 参数、梯度、optimizer state 全切分 | AllGather 频繁，wrap 粒度错误会很慢 |
+| `SHARD_GRAD_OP` | 梯度和 optimizer state 切分 | 参数仍常驻完整副本 |
+| `auto_wrap_policy` | 决定模块 shard 边界 | 太粗 OOM，太细 collective 过多 |
+| `backward_prefetch` | backward 中提前 AllGather | 可能增加 HBM 峰值 |
+| `limit_all_gathers=True` | 限制 in-flight AllGather | 稳内存但可能降低 overlap |
+| `state_dict_type=SHARDED_STATE_DICT` | 分片 checkpoint | 需要恢复工具理解 metadata |
+| `use_orig_params=True` | 保持原参数视图 | 某些 optimizer/compile 路径更容易兼容 |
 
-所以数据并行不是"卡越多越快"，而是"卡越多越依赖通信栈"。
+### 5.3 DeepSpeed ZeRO 关键边界
 
-#### 8.3.1 Ring 和 Tree：NCCL 为什么会选不同算法
+ZeRO 的阶段名称容易被当成性能等级。
 
-NCCL 其实不是只用一种 AllReduce 算法，不同场景下会切换：
+生产上应按状态边界选择：
 
-| 算法 | 特点 | 更适合 |
-|------|------|--------|
-| Ring AllReduce | 带宽利用率最优，延迟随 N 线性增长 | 大消息、小 N |
-| Tree AllReduce | 延迟随 log(N) 增长，但带宽利用率稍差 | 小消息、大 N |
-| Double Binary Tree | 前两者折中 | 大规模集群常见 |
+- ZeRO-1：optimizer state shard，适合 optimizer state 是主压力但参数能常驻。
+- ZeRO-2：optimizer + gradient shard，适合 DDP 显存紧但不想引入参数 AllGather。
+- ZeRO-3：parameter + gradient + optimizer shard，适合模型状态无法复制。
+- ZeRO-Offload：把 optimizer 或 parameter 放 CPU/NVMe，解决容量但引入 PCIe/NVMe 延迟，通常不作为吞吐优先方案。
 
-这就解释了一个看起来反直觉的现象：**小梯度不一定比大梯度同步快**。因为小消息下 latency 占主导，算法启动开销（握手、原语调用）可能超过数据传输。这也是后面 §8.6 要讲 bucket 合并的根本原因 —— 把一堆小梯度打包成一个大消息，通常比一个个发更快。
+#### 5.3.1 ZeRO 各阶段真实显存节省（Adam BF16 训练，N 个 DP rank）
 
-#### 8.3.2 单机 8 卡和多机 8 卡，难度不是一个量级
+ZeRO 节省的"几倍"经常被误读。真实的端到端 reduction 来自三类训练状态分别按 N 切分后的总和，不是某个状态内部的节省比例。
 
-很多团队第一次从单机 8 卡切到双机 16 卡时，最容易低估的就是拓扑差异。
+**单卡每参数训练状态构成（BF16 训练 + Adam，混合精度 master FP32）**：
 
-| 维度 | 单机多卡 | 多机多卡 |
-|------|----------|----------|
-| 主要链路 | NVLink / NVSwitch / PCIe | InfiniBand / RoCE / Ethernet + 机内链路 |
-| 典型有效带宽（8 卡 AllReduce） | 200-400 GB/s（NVLink） | 20-40 GB/s（IB 200Gbps） |
-| 延迟量级 | 微秒级 | 几十微秒到毫秒 |
-| 带宽与延迟 | 更高带宽、更低延迟 | 更容易受交换网络和拥塞影响 |
-| 排障复杂度 | 主要看机内拓扑与驱动 | 还要看 NIC、交换机、网卡绑定、路由 |
-| 常见问题 | PCIe 瓶颈、机内 NUMA 影响 | NCCL hang、跨机抖动、某节点拖慢全局 |
-| 失败域 | 一台挂全挂 | 一台慢全都慢，一条链抖动全部抖 |
+| 状态 | 单卡每参数字节 | 备注 |
+|---|---:|---|
+| 参数（BF16 训练副本） | 2 | forward / backward 用 |
+| 梯度（BF16） | 2 | backward 输出 |
+| Adam optimizer state（FP32 master + m + v） | 12 | master weight 4 + m 4 + v 4 |
+| **小计 / 卡** | **16** | 不含 activation / workspace |
 
-这也是为什么很多系统在单机 8 卡表现很好，但一跨节点效率就明显下滑。**带宽差一个量级，优化策略往往要彻底改写**。
+把这 16 bytes/参数 在 N 个 DP rank 之间按 ZeRO 各阶段切分后的真实占用：
 
-更进一步，一些大规模集群会采用分层通信思路：
+| 阶段 | 参数 | 梯度 | Optimizer | 单卡每参数字节 | vs DDP（16） | 端到端 reduction（N=8）|
+|---|---|---|---|---:|---|---:|
+| DDP（baseline） | 全量 2 | 全量 2 | 全量 12 | **16** | 1× | 1× |
+| ZeRO-1 | 全量 2 | 全量 2 | 切分 12/N | **4 + 12/N** | 略小 | N=8 时 5.5 字节 → ~**2.9× reduction** |
+| ZeRO-2 | 全量 2 | 切分 2/N | 切分 12/N | **2 + 14/N** | 中 | N=8 时 3.75 字节 → ~**4.3× reduction** |
+| ZeRO-3 | 切分 2/N | 切分 2/N | 切分 12/N | **16/N** | 极小 | N=8 时 2 字节 → **8× reduction**（即 ≈ N） |
 
-- 先在节点内聚合（走 NVLink，极快）
-- 再做跨节点通信（走 IB，相对慢）
-- 最后再在节点内分发
+> [!DANGER]
+> **不要把"ZeRO-1 节省 4×"挂在嘴边。** 这种说法源于"optimizer state 切 8 份"的内部视角（12 → 12/8 = 1.5，节省约 8x）。但端到端单卡总占用从 16 降到 5.5，**实际 reduction 只有约 2.9×**（N=8）。容量规划如果按 4× 估算 ZeRO-1，会把"装得下"判断错。同样，ZeRO-2 真实端到端 reduction ≈ 4.3×（不是 8×），ZeRO-3 ≈ N（8 卡时 8×）。
 
-这种做法 NCCL 的 `Tree` 和 `CollNet` 路径在某些配置下会自动启用，但实际效果要看集群拓扑和 `NCCL_TOPO_FILE` 是否配置正确。
+> [!WARNING]
+> **以上数字不含 activation**。激活随 batch、sequence length、layer、AC 策略大幅变化，ZeRO 不切 activation（CP / SP 才切）。所以 ZeRO 真正能解决的是"训练状态太大装不下"，对"激活吃满显存"无效——后者要靠 activation checkpointing、AC、BF16 activation、SP/CP。
 
-平台侧不一定要自己实现这些细节，但必须知道：
-**数据并行的瓶颈往往不只是"梯度有多大"，而是"梯度要跨什么路径传"。**
+> [!NOTE]
+> **N 越大 ZeRO 收益越大，但通信也成比例增加**。ZeRO-3 在 N=64 时单卡训练状态压到 16/64=0.25 字节/参数，但每个 forward / backward 都要做 AllGather 拉回完整参数 + ReduceScatter 散梯度，对带宽极度敏感。在跨节点带宽不足时（如只有 100Gbps Ethernet），ZeRO-3 的通信开销可能让 step time 比 ZeRO-2 还慢，节省的显存换不到 throughput。生产 64+ 卡 ZeRO-3 通常需要 IB / RoCE 200Gbps+ 或 NVLink 节点内分片。
 
-> **参考数量级（仅供建立直觉，实际值因硬件和配置差异较大）**
->
-> | 场景 | 典型值 | 说明 |
-> |------|--------|------|
-> | 单机 8 卡 NVLink / NVSwitch | 约 92%-97% scaling efficiency | 每卡 batch 足够大、通信有较好 overlap 时更容易达到 |
-> | 跨节点 InfiniBand 集群（200Gbps+） | 约 85%-90% scaling efficiency | 常见于训练配置较成熟的 2-8 节点规模 |
-> | 跨节点以太网（100Gbps） | 约 60%-75% scaling efficiency | 网络和 NCCL 调优不足时会更低 |
-> | 跨节点以太网（25Gbps） | 往往低于 50% | 对大模型基本不适合做数据并行 |
-> | checkpoint 与 AllReduce 同时形成停顿 | 可能放大 step 抖动 | 这会直接影响 [第10章 §10.7](./10-memory-checkpointing-and-recovery.md) 的保存频率选择 |
+### 5.4 Launcher 与 NCCL 配置示例
 
-### 8.4 扩展效率怎么理解
+以下示例展示 8 节点 64 GPU 的 DDP launcher 与 NCCL 环境。
 
-一个常见指标是扩展效率：
+具体 interface、HCA 名称要由 `ibdev2netdev`、`nvidia-smi topo -m`、集群布线和运维标准决定。
 
-$$
-\text{scaling efficiency} = \frac{T_N}{N \cdot T_1}
-$$
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-其中：
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export OMP_NUM_THREADS=8
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-- `T1` 是单卡吞吐
-- `TN` 是 `N` 卡时的吞吐
+# NCCL diagnostics. INFO 用于预发和事故复盘；稳定生产可降为 WARN。
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,ENV,GRAPH,COLL
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=0
 
-如果效率接近 `1`，说明扩卡较健康。  
-如果效率快速掉到很低，通常说明：
+# Network binding. 按实际集群替换。
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+export NCCL_IB_GID_INDEX=3          # RoCE 常见；IB 集群按实际 GID 配置
+export NCCL_IB_TC=106               # RoCE QoS 示例，需网络团队确认
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_RETRY_CNT=7
+export NCCL_NET_GDR_LEVEL=2
+export NCCL_CROSS_NIC=1
+export NCCL_MIN_NCHANNELS=8
+export NCCL_MAX_NCHANNELS=32
 
-- 通信开销过大
-- 数据供给跟不上
-- per-device batch 太小
-- 节点异构导致木桶效应
+# Rendezvous.
+export MASTER_ADDR="node-0"
+export MASTER_PORT="29500"
 
-这里的 `T1` 最好来自 [第7章 §7.7](./07-single-node-training.md) 已经稳定的单机基线，否则这个指标会失真。
+NODE_RANK="${NODE_RANK:?set by scheduler}"
 
-#### 8.4.1 强扩展和弱扩展不要混着看
+torchrun \
+  --nnodes=8 \
+  --nproc_per_node=8 \
+  --node_rank="${NODE_RANK}" \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  train.py \
+  --parallel ddp \
+  --model llama7b \
+  --precision bf16 \
+  --seq-len 4096 \
+  --micro-batch-size 2 \
+  --grad-accum-steps 2 \
+  --ddp-bucket-cap-mb 50 \
+  --log-rank-metrics \
+  --profile-window 100:130
+```
 
-扩展实验里最容易混淆的，是你到底固定了什么。
+FSDP FULL_SHARD 入口示例：
 
-| 实验方式 | 固定什么 | 更适合回答什么问题 | 常见陷阱 |
-|----------|----------|--------------------|----------|
-| 强扩展（strong scaling） | 固定 global batch 和任务总量 | 同一个任务能否更快做完 | 每卡 batch 变小，通信占比上升 |
-| 弱扩展（weak scaling） | 固定 per-device batch | 系统加卡后吞吐能否线性增长 | global batch 变大，优化行为也会变 |
+```bash
+torchrun --nnodes=8 --nproc_per_node=8 --node_rank="${NODE_RANK}" \
+  --rdzv_backend=c10d --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  train.py \
+  --parallel fsdp \
+  --fsdp-sharding-strategy full_shard \
+  --fsdp-auto-wrap transformer_block \
+  --fsdp-backward-prefetch backward_pre \
+  --fsdp-limit-all-gathers true \
+  --state-dict sharded \
+  --precision bf16
+```
 
-举个简单例子：
-
-- 如果 1 卡时吞吐是 `1000 samples/s`
-- 8 卡时吞吐是 `7200 samples/s`
-
-那么：
-
-$$
-\text{scaling efficiency} = \frac{7200}{8 \times 1000} = 90\%
-$$
-
-这个数字本身还不够，必须追问：
-
-- 8 卡时 global batch 是否变了？
-- 每卡 batch 是否太小？
-- 数据链路是否仍然稳定？
-
-否则"90% 效率"也可能和你以为的不是同一种实验。
-
-#### 8.4.2 看 tokens/sec 比看 steps/sec 更稳
-
-很多团队习惯用 "steps/sec" 或 "iter/sec" 作为吞吐指标。这在单机时没问题，但在扩卡实验里容易误导 —— **加卡后 step 定义本身就变了**（global batch 变了）。
-
-更稳的指标组合：
-
-| 指标 | 含义 | 为什么更稳 |
-|------|------|------------|
-| tokens/sec | 每秒处理的 token 数 | 和 batch 定义解耦 |
-| samples/sec | 每秒处理的样本数 | 同上 |
-| TFLOPS/GPU | 每卡实际算力利用 | 直接反映计算饱满度 |
-| MFU (Model FLOPs Utilization) | 实际 FLOPs / 理论峰值 | 跨硬件对比的黄金指标 |
-
-一个经验值：主流 LLM 训练在 H100 上能跑到 40-55% MFU 算优秀，跑到 30% 以下就要认真看看哪里出了问题。这比"我的 GPU 利用率 95%"这种数字有用得多 —— GPU 利用率 95% 可能 90% 在做内存 copy。
-
-### 8.5 为什么大 batch 不是免费午餐
-
-为了提高数据并行效率，很多人会想到增大 batch。确实，大 batch 往往能减少同步相对占比，但也会引入新问题：
-
-- 优化行为变化
-- 收敛路径改变
-- 学习率策略要调整
-- 显存压力增大
-
-所以平台和算法团队需要协作，而不是简单地"为了扩卡效率把 batch 无限做大"。
-
-#### 8.5.1 global batch 到底怎么算
-
-在数据并行里，一个最常见但也最容易被说乱的量是 global batch：
-
-$$
-B_{\text{global}} = B_{\text{per-device}} \times N_{\text{devices}} \times N_{\text{accum}}
-$$
-
-其中：
-
-- `B_per-device`：每张卡一次实际处理多少样本
-- `N_devices`：设备数
-- `N_accum`：梯度累积步数
-
-这条式子的工程意义非常大：
-
-- 扩卡后如果保持 `B_per-device` 不变，`B_global` 会随设备数线性变大
-- 如果想保持 `B_global` 不变，就必须缩小 `B_per-device` 或减少累积
-- `B_per-device` 太小，会让单卡计算不饱满、通信占比变大
-
-所以数据并行优化里常常存在一个张力：
-
-- 为了通信效率，希望每卡 batch 更大
-- 为了优化稳定性，又未必希望 global batch 无限变大
-
-这就是为什么数据并行调优经常不是纯系统问题，而是系统和算法的共同边界。
-
-#### 8.5.2 梯度累积：当你想要大 batch 又没那么多卡
-
-梯度累积的本质是**用时间换空间**：把一个大 batch 拆成若干 micro-batch，分多次前向/反向但不立刻更新，最后再一次性 optim.step()。
-
-它对基础设施的影响有三个：
-
-1. **通信频率降低**：accum_steps = 4 意味着每 4 个 micro-batch 才 allreduce 一次，通信占比大幅下降
-2. **实际吞吐可能下降**：因为每次 micro-batch 都要 forward + backward 但不更新，整体 step 时间变长
-3. **DDP 要配合 `no_sync()`**：否则每个 micro-batch 都会触发 allreduce，完全没省通信
-
-PyTorch 里的典型写法：
+### 5.5 训练代码中的 DDP 片段
 
 ```python
-for i, batch in enumerate(loader):
-    is_accum_step = (i + 1) % accum_steps != 0
-    ctx = model.no_sync() if is_accum_step else nullcontext()
-    with ctx:
-        loss = model(batch) / accum_steps
-        loss.backward()
-    if not is_accum_step:
-        optimizer.step()
-        optimizer.zero_grad()
+import os
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+
+def init_dist():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def wrap_ddp(model, local_rank, bucket_cap_mb):
+    model.cuda(local_rank)
+    return DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        bucket_cap_mb=bucket_cap_mb,
+        static_graph=True,
+        gradient_as_bucket_view=True,
+        find_unused_parameters=False,
+    )
+
+
+def train_one_epoch(model, dataset, optimizer, scaler, epoch, args):
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(),
+        rank=dist.get_rank(),
+        shuffle=True,
+        drop_last=True,
+    )
+    sampler.set_epoch(epoch)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.micro_batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    for step, batch in enumerate(loader):
+        sync_now = (step + 1) % args.grad_accum_steps == 0
+        ctx = model.no_sync() if not sync_now else torch.enable_grad()
+        with ctx:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model(batch.cuda(non_blocking=True)) / args.grad_accum_steps
+            loss.backward()
+
+        if sync_now:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 ```
 
-一个**常见翻车**：忘了 `no_sync()` 包装 accum 阶段的反向，结果 8 卡 accum_steps=4 下每 step 做了 4 次 allreduce，吞吐比不 accum 还低。
+关键点：
 
-#### 8.5.3 LR scaling 规则：大 batch 不是改个数字就完事
+- gradient accumulation 的中间 microstep 使用 `no_sync()`；
+- loss 除以 accumulation steps，保持梯度尺度；
+- BF16 不需要 dynamic loss scale，但 FP16 需要把 scaler state 纳入 checkpoint；
+- 每个 rank 的 sampler epoch 必须一致；
+- rank-level data time 和 step time 必须打点。
 
-扩卡改 global batch 后，学习率一般要跟着动。最朴素的规则：
+## 6. NCCL 与网络拓扑：ring/tree、rail、NIC、IB/RoCE、日志证据
 
-- **Linear scaling**：`lr_new = lr_base × (B_new / B_base)`，适合中等 batch 扩展
-- **Square-root scaling**：`lr_new = lr_base × sqrt(B_new / B_base)`，更保守，大 batch 下更常用
-- **Warmup 变长**：大 batch 下初期更不稳定，warmup steps 也要增加
+### 6.1 Ring 与 Tree
 
-对基础设施团队的影响：**扩卡实验除了记录吞吐，也要和算法同学核对学习率**。否则 "4 卡 loss 正常、32 卡 loss 爆炸" 这种现象很难排查 —— 系统侧没问题，是 optimizer 行为变了。
+NCCL collective 会基于拓扑构建 ring、tree 或混合算法。
 
-### 8.6 梯度压缩与通信优化
+| 算法 | 优势 | 劣势 | 常见场景 |
+|---|---|---|---|
+| Ring | 大消息带宽利用率高 | latency 随 rank 数和拓扑上升 | 大 gradient bucket、节点内/跨节点大吞吐 |
+| Tree / Double Tree | latency 更低 | 对大消息带宽未必最优 | 小消息、跨节点层级拓扑 |
+| CollNet / NVLS | 利用交换结构或 NVLink SHARP 类能力 | 依赖硬件和 NCCL 版本 | NVSwitch、特定云/集群环境 |
 
-当通信开始主导 step 时间时，常见优化思路主要有三类：
+不要手工指定算法作为第一反应。
 
-| 手段 | 在解决什么 | 适用条件 | 常见代价 |
-|------|------------|----------|----------|
-| 梯度压缩（quantization / sparsification / PowerSGD） | 减少传输字节数 | 网络较慢、模型大、收敛可重新验证 | 可能影响收敛稳定性，排障复杂 |
-| 混合精度通信 | 用 FP16 / BF16 传梯度或桶 | 训练已稳定、框架支持成熟 | 精度和数值排查更复杂 |
-| Gradient Bucketing | 把梯度按桶组织，尽早启动通信 | 反向传播较长、希望 overlap | 桶大小配置不合适会适得其反 |
+先看 NCCL 日志是否识别了正确 GPU、NIC、NVLink、IB/RoCE 路径。
 
-平台侧最实用的结论是：不要一开始就追求最激进压缩，先把 bucket、overlap 和拓扑利用率做好，收益往往更稳定。压缩应该被当成“通信已经被证明是主瓶颈后的近似算法变更”，而不是普通性能开关。
+### 6.2 rail、NIC、IB/RoCE
 
-#### 8.6.1 梯度压缩：省带宽不是免费的
+多 rail 是指节点有多张 NIC/HCA 可并行承载通信。
 
-梯度压缩的第一性目标很简单：AllReduce 传的是梯度张量，如果能把每个 step 要传的字节数从 `G` 降到 `G / k`，跨节点通信时间理论上也能接近下降 `k` 倍。但训练不是文件传输，梯度是优化方向的估计；压缩改变了这个估计，收益和风险必须一起看。最常见的三类路线是 quantization、sparsification 和 PowerSGD。
+常见问题：
 
-| 方法 | 基本思想 | 典型带宽收益 | 收敛风险 | 适用场景 | 不适用场景 | 工程边界 |
-|------|----------|--------------|----------|----------|------------|----------|
-| Quantization | 把梯度从 FP32/BF16 压到更低 bit，如 8-bit、4-bit、1-bit 或 sign | 2x-32x，BF16/FP16 通常是 2x，1-bit 理论 32x | 低 bit 会引入量化噪声；大梯度、稀有 token、训练早期更敏感 | 带宽明显不足、模型已稳定收敛、可接受少量精度回归 | loss 对数值很敏感、刚开始调新模型、没有离线收敛基线 | 必须记录压缩前后 loss 曲线、梯度 norm、最终指标；优先从 BF16/FP16 通信开始，不建议直接上 1-bit |
-| Sparsification | 只传 Top-K 或超过阈值的梯度，其余置零，常配 error feedback | 5x-100x，取决于稀疏率和索引编码 | 梯度方向偏差更大；稀疏 mask 变化可能导致震荡；索引开销会吃掉小张量收益 | 网络极慢、梯度天然稀疏、训练任务容忍较长调参周期 | 大 dense Transformer 预训练的早期阶段、小 bucket、多机延迟主导而非带宽主导 | 要把 value 和 index 都算进通信量；需要 error feedback buffer，显存和实现复杂度会上升 |
-| PowerSGD | 对二维梯度矩阵做低秩近似，传低秩因子而不是完整矩阵 | 约 4x-50x，取决于 rank、矩阵形状和 warm start | 低秩近似可能损失高频梯度信息；rank 太小会拖慢或破坏收敛 | 大矩阵层多、跨节点带宽不足、DDP comm hook 可直接接入 | 小张量多、embedding/LayerNorm 占比高、收敛预算紧 | 需要选择 matrix rank、是否 warm start、是否 error feedback；上线前必须做同 token 数对齐的 A/B |
+- 所有 rank 只走一张 NIC，另一张空闲；
+- GPU 到 NIC 跨 NUMA 或跨 PCIe switch；
+- RoCE PFC/ECN 配置不一致导致丢包重传；
+- IB 链路降速，例如 HDR/NDR 端口被错误协商到较低速率；
+- Kubernetes/容器没有暴露 RDMA device 或 IPC lock 权限不足。
 
-一个容易误判的点是：压缩比不等于 step 加速比。假设 7B 模型 bf16 梯度约 14 GB，跨节点有效带宽 25 GB/s，ring AllReduce 8 卡通信心算约 1 秒；如果 PowerSGD 把主要大矩阵梯度压到 1/10，通信可能省下数百毫秒。但如果原本通信已经被 backward overlap 掩盖，或者 step 里还有 800 ms dataloader / checkpoint 抖动，压缩带来的端到端收益可能只有 5%-10%。反过来，如果压缩 kernel、误差反馈和张量重排本身多花 100 ms，小模型上甚至会变慢。
+预发必须记录：
 
-工程上建议按风险递增推进：
+```bash
+nvidia-smi topo -m
+nvidia-smi -q -d CLOCK,PCIE,NVLINK,ECC
+ibdev2netdev
+ibstat
+rdma link
+ethtool -S <iface>
+numactl --hardware
+```
 
-1. 先确认瓶颈：用 profiler 证明 NCCL tail 或跨节点 AllReduce 是 step 的主因，而不是 DataLoader、checkpoint 或慢 rank。
-2. 先做低风险压缩：BF16/FP16 communication hook、合理 bucket、分层通信优先。
-3. 再做算法近似：quantization、sparsification、PowerSGD 必须和算法团队约定验收口径，例如同样 tokens 数下 loss 不高于基线 0.1%-0.3%，下游 eval 不下降，且 2-3 次随机种子结果稳定。
-4. 保留回滚路径：压缩开关、rank、稀疏率、error feedback buffer 都要进入实验配置和 checkpoint 元数据，否则恢复训练时可能出现“前半程无压缩、后半程有压缩”的不可复现实验。
+### 6.3 NCCL 日志怎么看
 
-**工程边界**：梯度压缩不适合当作掩盖网络配置错误的手段。如果 `nccl-tests` 已经显示 IB / RoCE 只有理论带宽的 30%-40%，应该先修链路、路由、MTU、ECN、NUMA 和 NIC 绑定；如果模型连单机基线都不稳定，不要用低 bit 或稀疏化同时引入新的数值变量。平台可以提供 comm hook 和实验矩阵，但是否接受压缩带来的优化路径变化，必须由训练目标和评测结果决定。
+建议事故复盘时保留每个 rank 的 NCCL 日志。
 
-#### 8.6.2 为什么 bucket 大小会影响扩展效率
+关键证据包括：
 
-梯度桶（bucket）的存在，是为了让某部分梯度一准备好就尽快发出去，而不是等全部反向都结束。
+- `NCCL INFO Bootstrap`：使用了哪个 interface；
+- `NCCL INFO NET/IB`：是否走 IB/RoCE，而不是 socket fallback；
+- `Channel xx/yy`：channel 数量是否符合预期；
+- `Trees` / `Rings`：拓扑构建是否跨越异常路径；
+- `WARN NET/IB`、`unhandled system error`、`connection timed out`：网络或权限问题；
+- `Watchdog caught collective operation timeout`：某 collective 等待超时，通常需要结合 rank skew 定位。
 
-但 bucket 不是越小越好，也不是越大越好：
-
-| bucket 倾向 | 好处 | 代价 |
-|-------------|------|------|
-| 更小 | 更早启动通信，更容易和反向重叠 | 通信调用更碎，latency 开销更明显 |
-| 更大 | 更容易吃满带宽，调用次数更少 | 启动通信更晚，尾部等待更长 |
-
-PyTorch DDP 的默认 `bucket_cap_mb` 是 25 MB。经验上：
-
-- **节点内 NVLink / 小模型**：25 MB 或更小通常 OK
-- **大模型（10B+）/ 跨节点**：50-100 MB 更合适，减少调用数
-- **非常不均匀的层**（有个别超大层）：反而可能需要更小的 bucket，避免某个桶独占
-
-如果你看到的现象是：
-
-- GPU 计算早就结束
-- 但 step 末尾总有一大段通信尾巴
-
-那就要开始怀疑：
-
-- bucket 是否太大
-- 梯度生成顺序是否不利于重叠
-- 某些大层是否把通信集中拖到了最后
-
-这类问题往往不会从平均 utilization 里直接看出来，但会在 profiler 时间线上非常明显。
-
-#### 8.6.3 DDP 还有哪些"官方"优化开关
-
-PyTorch DDP 里有几个常被忽视但效果明显的参数：
-
-| 参数 / 开关 | 作用 | 适用场景 |
-|-------------|------|----------|
-| `bucket_cap_mb` | 控制 bucket 大小 | 最基本的调优旋钮 |
-| `gradient_as_bucket_view=True` | 让梯度直接指向 bucket 内存，省一次 copy | 几乎无脑开 |
-| `static_graph=True` | 声明计算图每步一致，允许更激进优化 | 模型结构固定时 |
-| `find_unused_parameters=True` | 容忍部分参数不参与反向 | 有动态分支的模型，**有性能代价** |
-| DDP comm hooks（`fp16_compress_hook`、`bf16_compress_hook`、`powerSGD_hook`） | 自定义梯度通信逻辑 | 通信瓶颈明显时 |
-
-一个常见的反模式：**没必要却打开 `find_unused_parameters=True`**。它会强制 DDP 每步做一次额外的参数遍历，对大模型可能带来 10-20% 的性能损失。如果你的模型所有参数都参与反向，就关掉它。
-
-#### 8.6.4 混合精度通信：先试 BF16，再考虑更激进的
-
-PyTorch 提供的 `bf16_compress_hook` 是最容易上的一步 —— 把梯度从 fp32 转成 bf16 再 allreduce，流量减半，数值风险相对可控。
-
-| 方案 | 流量节省 | 收敛风险 | 何时考虑 |
-|------|----------|----------|----------|
-| FP16 通信 | 2x | 有 overflow 风险，尤其大梯度 | 模型本身也在 fp16 训练 |
-| BF16 通信 | 2x | 风险较小（动态范围和 fp32 相近） | 通用首选 |
-| PowerSGD | 10-100x | 需要 error feedback，收敛要验证 | 带宽严重不足 |
-| 1-bit / signSGD | 32x | 需要定制训练 | 研究场景为主 |
-
-**实战建议**：大多数团队做到 BF16 通信 + 合理 bucket 就够了。PowerSGD 这类激进压缩要配合严格的收敛验证，不是调个参数就能上线。
-
-### 8.7 NCCL 调优要点
-
-NCCL 很少是"装好就结束"的组件。出现扩展效率异常时，至少要先检查这几类配置：
-
-| 项目 | 作用 | 常见用途 |
-|------|------|----------|
-| `NCCL_DEBUG=INFO` | 打印通信初始化和错误信息 | 首次排障、确认拓扑和超时位置 |
-| `NCCL_DEBUG_SUBSYS=ALL` | 更细粒度的子系统日志 | 深度排障时配合使用 |
-| `NCCL_IB_DISABLE=1` | 禁用 InfiniBand 路径 | 用于隔离 IB / RoCE 相关问题 |
-| `NCCL_SOCKET_IFNAME=eth0` | 指定网卡接口 | 避免走错网卡或管理网 |
-| `NCCL_P2P_DISABLE=1` | 禁用 P2P（GPU 直接通信） | 排查 NVLink / PCIe 问题 |
-| `NCCL_ALGO=Ring/Tree` | 强制算法选择 | 实验用，生产一般让 NCCL 自选 |
-| `NCCL_NSOCKS_PERTHREAD`、`NCCL_SOCKET_NTHREADS` | 多网卡聚合 | 以太网集群调优 |
-| `nvidia-smi topo -m` | 查看 GPU / NIC 拓扑 | 判断通信路径是否符合预期 |
-
-常见排查顺序可以是：
-
-1. 先确认问题发生在单机还是跨机
-2. 再确认走的是 NVLink、IB 还是普通以太网
-3. 最后再调 bucket、batch 和环境变量
-
-#### 8.7.1 一些常见故障信号
-
-真实系统里，很多排障并不是"训练很慢"，而是"它慢得很有特点"。
-
-| 信号 | 更可能的问题 | 第一检查动作 |
-|------|--------------|--------------|
-| 初始化阶段就 hang 住 | 网卡接口、rank 配置、端口或拓扑异常 | 先看 `NCCL_DEBUG=INFO` 和网卡绑定 |
-| 只有跨节点时效率明显掉 | 交换网络、NIC 或跨机链路才是真瓶颈 | 先区分机内和机间通信占比 |
-| 某个 rank 总比别的 rank 慢 | 慢节点、NUMA、CPU 绑核或热降频 | 看 per-rank step time 和节点健康度 |
-| 偶发 timeout 或作业随机挂 | 网络抖动、IB / RoCE 不稳、驱动栈问题 | 看日志时间点是否和网络事件对应 |
-| step 末尾总卡一大段 | 通信 overlap 不足，bucket 或拓扑不理想 | 看 profiler 时间线里的通信尾巴 |
-| 第一个 step 特别慢、之后正常 | NCCL 初始化、cuBLAS 预热、buffer 分配 | 别把 step 0 算进平均 |
-| 吞吐每隔 N step 抖一下 | dataloader checkpoint、日志同步、gc | 看抖动是否周期性 |
-| 所有 rank 卡在同一个 collective | 其中一个 rank 先异常（crash/OOM）导致其他 rank 等它 | 看每个 rank 的最后日志 |
-
-这里最重要的经验是：
-
-> **不要把所有慢都归结成"网络不好"**。很多时候是某个 rank 先慢了，网络只是最后把这个慢放大给所有人看见。
-
-#### 8.7.2 一个典型案例：跨节点突然从 90% 掉到 60%
-
-一个真实场景：某团队从单机 8 卡扩到 2 机 16 卡，扩展效率从 92% 掉到 61%。排查路径大概是：
-
-1. **先区分机内机外通信**：在单节点再跑一次 8 卡，效率还是 92%，说明问题确实在跨节点
-2. **看 NCCL log**：发现 NCCL 选了 Ring 算法，跨节点走的是 IB
-3. **nccl-tests 基准**：在 2 节点跑 `all_reduce_perf`，发现带宽只有 IB 理论值的 40%
-4. **检查 NIC**：`ibstat` 显示一个节点上有张 NIC 链路速率配置错了（降到了 IB EDR 而非 HDR）
-5. **修完之后**：效率恢复到 88%
-
-这个例子的教训是：**扩展效率问题往往不是算法/框架的锅，而是硬件配置的锅**。训练平台团队需要有能力做跨层排查，不能只在 Python 层打转。
-
-### 8.8 工程实践中的关键点
-
-#### （1）尽量让每卡 batch 足够大
-
-太小的 per-device batch 容易让通信占比过高。一个经验阈值：per-device batch 小到单次 forward 不足 50 ms 时，通信/同步开销就开始明显。
-
-#### （2）尽量重叠通信与计算
-
-如果反向传播过程中能边算边同步一部分梯度，就能减少纯等待时间。DDP 默认就会尝试 overlap，但**静态图 + 合理 bucket 是前提**。
-
-#### （3）关注 NCCL 与拓扑
-
-同样是 8 卡，单机 NVLink 和跨机以太网的表现可能完全不同。扩卡前先用 `nccl-tests` 打个基础数据，心里有数。
-
-#### （4）避免节点异构
-
-一个慢节点经常会拖垮整个同步步调。同一个 DDP 组里，哪怕只有一张卡因为热降频慢了 5%，整组吞吐就会掉 5%。
-
-#### （5）第一个 step 不要算进平均
-
-NCCL 初始化、cuDNN 预热、内存分配都集中在前几步。report 时要丢掉前 N 步（典型 10-50 步）。
-
-#### 8.8.1 一个最低可用的扩展实验
-
-如果团队现在还没有系统化地测过扩展效率，至少可以先做一个很小的实验矩阵。
-
-| 维度 | 建议 |
-|------|------|
-| 卡数 | 1 / 2 / 4 / 8，必要时再加跨节点 16 |
-| 固定条件 | 同一模型、同一数据切片、同一精度、同一优化器 |
-| 必记指标 | 吞吐、step time P50 / P95、allreduce 占比、显存峰值 |
-| 补充指标 | data time 占比、per-rank skew、GPU utilization、MFU |
-
-一个实用顺序是：
-
-1. 先拿 [第7章](./07-single-node-training.md) 已经稳定的 1 卡基线
-2. 在单机内做 2 / 4 / 8 卡扩展
-3. 再决定是否切到跨节点
-4. 每次只改一类变量，不要同时改 batch、精度和 bucket
-
-最关键的不是把表做得很大，而是让结论可解释。
-例如：
-
-- 2 卡到 4 卡很健康，8 卡开始明显掉速 → 大概率是通信或 dataloader
-- 单机 8 卡还好，一跨节点就下滑 → 几乎确定是网络
-- 吞吐增长了，但 global batch 也一起变了 → 要区分是系统扩展还是 batch 放大效应
-- MFU 在单卡就已经低 → 先别扩卡，回去修单卡基线
-
-这些信息会直接决定你接下来该继续调 NCCL、调 batch，还是该重新审视并行策略。
-
-#### 8.8.2 一个记录扩展实验的 checklist
-
-一个合格的扩展实验报告，至少该记录这些字段：
+示例判断：
 
 ```text
-[基础信息]
-- 模型：<名称、参数量、架构>
-- 硬件：<GPU 型号、互联类型、节点数>
-- 软件：<PyTorch / NCCL / CUDA 版本>
-- 精度：<bf16 / fp16 / fp32>
-- 优化器：<Adam / AdamW / 其他>
-
-[实验矩阵]
-- 卡数：[1, 2, 4, 8, 16]
-- per-device batch：固定值 or 变化
-- gradient accumulation：固定值
-- global batch：每行单独记录
-
-[性能指标]
-- step time P50 / P95
-- tokens/sec 或 samples/sec
-- MFU
-- 通信占比（profiler 读）
-- 显存峰值
-- per-rank skew（最慢/最快的比值）
-
-[异常现象]
-- 是否有 NCCL warning
-- 是否有 OOM retry
-- 第一个 step 和稳态的差距
+证据：NCCL INFO NET/Socket : Using [0]eth0
+解释：NCCL 没有走 IB/RoCE，跨节点带宽会显著低于预期。
+动作：检查 NCCL_IB_DISABLE、容器 RDMA device、libnccl-net、HCA 名称、GID index。
 ```
 
-光有吞吐数字不够 —— **没有上下文的性能数据无法复现、无法对比、无法追溯**。
+### 6.4 nccl-tests admission
 
-#### 本章涉及的常见工具
+训练前至少跑这些基准：
 
-| 概念 | 常见工具 / 命令 | 备注 |
-|------|-----------------|------|
-| 多卡启动 | `torchrun --nproc_per_node=8 train.py` | 最常见的 PyTorch 数据并行入口 |
-| 通信排障 | `NCCL_DEBUG=INFO`、`NCCL_SOCKET_IFNAME=...`、`TORCH_DISTRIBUTED_DEBUG=DETAIL` | 先确认路径和错误位置 |
-| 拓扑检查 | `nvidia-smi topo -m`、`ibstat`、`ibstatus` | 看 GPU、NIC、交换网络是否匹配预期 |
-| 通信基准 | `nccl-tests`（`all_reduce_perf`、`all_gather_perf`） | 在真实训练前先验证通信栈基本健康度 |
-| 性能剖析 | PyTorch Profiler、Nsight Systems | 看时间线、通信尾巴、kernel 重叠 |
-| 多机启动 | `torchrun --nnodes=N --node_rank=R ...`、Slurm、Kubernetes | 不同环境选择不同入口 |
+```bash
+# 单节点 8 GPU
+./build/all_reduce_perf -b 8M -e 16G -f 2 -g 8
+./build/all_gather_perf -b 8M -e 16G -f 2 -g 8
+./build/reduce_scatter_perf -b 8M -e 16G -f 2 -g 8
 
-### 8.9 数据并行的边界：什么时候需要 FSDP / ZeRO
+# 多节点由 launcher 启动，每节点 8 GPU，按集群方式传 env。
+mpirun -np 64 -N 8 ./build/all_reduce_perf -b 8M -e 16G -f 2 -g 1
+```
 
-经典 DDP 有一个硬约束：**模型 + 梯度 + 优化器状态必须能塞进一张卡**。当这个前提不成立时，要么上模型并行（见 [第9章](./09-model-parallel.md)），要么把数据并行"升级"成 FSDP / ZeRO。
+记录字段：
 
-#### 8.9.1 FSDP / ZeRO 在做什么
+- alg bandwidth；
+- bus bandwidth；
+- P50/P95；
+- message size sweep；
+- rank/node mapping；
+- NCCL/CUDA/driver 版本；
+- HCA/rail/interface。
 
-FSDP（Fully Sharded Data Parallel）是 PyTorch 原生的实现，对应概念上等价于 DeepSpeed 的 ZeRO。它的核心观察是：
+Admission 不是追求理论峰值。
 
-> **DDP 下每张卡都存一份完整的权重、梯度、优化器状态，这里面有大量冗余。如果把这些状态切分到不同卡上，只在需要时临时聚合，就能大幅省内存。**
+目标是发现 socket fallback、单 rail、链路降速和跨 NUMA placement。
 
-ZeRO 的三个阶段是渐进式的：
+## 7. 工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理
 
-| 阶段 | 切分什么 | 内存节省 | 通信开销 | 对应 FSDP |
-|------|----------|----------|----------|-----------|
-| ZeRO-0 (DDP) | 不切 | 无 | 基线（1x allreduce） | DDP / NO_SHARD |
-| ZeRO-1 | 优化器状态 | ~4x（Adam 下） | 约等于 DDP | — |
-| ZeRO-2 | + 梯度 | ~8x | 约等于 DDP | SHARD_GRAD_OP |
-| ZeRO-3 | + 参数 | ~Nx（随 N 线性） | ~1.5x DDP | FULL_SHARD |
+### 7.1 版本矩阵
 
-具体到内存数字：一个 1B 参数 + Adam + 混合精度的训练状态，在 DDP 下每卡 ~16 GB，ZeRO-3 下 16 卡训练每卡降到 ~1 GB。
+生产平台不要只记录镜像 tag。
 
-ZeRO-3 的代价是**通信量增加约 50%**（需要额外的 all-gather 把参数临时聚合回来），换来的是内存随卡数线性下降。
+至少记录：
 
-#### 8.9.2 DDP、FSDP、ZeRO 的选择
+| 组件 | 必记字段 | 为什么重要 |
+|---|---|---|
+| GPU driver | version、CUDA compatibility | driver/CUDA/NCCL 组合影响通信 |
+| CUDA runtime | version | PyTorch wheel 和 NCCL ABI 依赖 |
+| PyTorch | version、commit、build CUDA | DDP/FSDP 行为和 bugfix 变化 |
+| NCCL | version、plugin | ring/tree、IB、NVLS、async error 行为变化 |
+| OFED / rdma-core | version | IB/RoCE 设备和 verbs 行为 |
+| Firmware | NIC firmware、GPU VBIOS | 链路稳定性和降速问题 |
+| Kernel | version、sysctl | RoCE、cgroup、IPC lock、hugepage 影响 |
+| Scheduler | Slurm/K8s plugin version | GPU/NIC 拓扑和 device injection |
 
-| 场景 | 推荐 | 理由 |
-|------|------|------|
-| 模型 + 训练状态能放下单卡 | DDP | 最简单，吞吐最高 |
-| 模型能放下但优化器状态顶不住 | ZeRO-2 / FSDP SHARD_GRAD_OP | 通信和 DDP 相当，内存显著节省 |
-| 模型本身放不下单卡 | ZeRO-3 / FSDP FULL_SHARD | 参数也切分，内存随 N 线性下降 |
-| 超大模型（100B+） | ZeRO-3 + TP + PP（3D 并行） | 单一策略不够，要组合 |
-| 模型不大但 batch 想开很大 | DDP + 梯度累积 | 不要为了"用新技术"而用 |
+### 7.2 作业准入
 
-一个经验数字（参考 Llama 3 8B bf16 + Adam 在 A100 80GB 上）：
+一个多节点 DP 作业进入生产队列前，应满足：
 
-- **DDP**：每卡 ~60 GB，4 卡能跑但只剩 20 GB 给激活
-- **FSDP FULL_SHARD (4 卡)**：每卡 ~15 GB，剩 65 GB 给激活和更大 batch
-- **Llama 3 70B** 在 DDP 下**单节点根本装不下**，FSDP 8 卡每卡 ~70 GB 勉强，16 卡每卡 ~35 GB 才舒适
+- 第7章单节点 baseline 已通过，且证据包包含 tokens/s、MFU、HBM、data wait、checkpoint time。
+- 模型状态账本明确：DDP/FSDP/ZeRO 每卡常驻内存低于 admission 上限。
+- `nccl-tests` 在目标节点池通过，bus bandwidth 不低于平台基线阈值。
+- dataset shard 计划可复现，样本长度分布已检查。
+- global batch、LR scaling、warmup、gradient accumulation 已由算法 owner 签字。
+- checkpoint 格式与并行策略匹配。
+- observability 包含 rank-level step breakdown。
 
-#### 8.9.3 FSDP 不是"免费加内存"
+### 7.3 持久化生产配置示例：`train_config.yaml`
 
-FSDP 有几个常见的"坑"，平台团队要提前知道：
+生产作业不能只靠 launcher 参数和临时环境变量复现。
 
-1. **checkpoint 变复杂了** —— 状态是分片的，保存/加载要用专门的 API（`torch.distributed.checkpoint`），不能直接 `torch.save`
-2. **wrap policy 很关键** —— 如果没有正确按 transformer block 切分，all-gather 颗粒度会很奇怪，性能很差
-3. **第一个 step 特别慢** —— all-gather 初始化比 DDP 重，热身步数要多给
-4. **通信量实际比理论值大** —— 因为要在 forward 和 backward 各做一次 all-gather
-5. **调试比 DDP 难** —— 参数在不同 rank 上状态不同，`print(model.weight)` 不再是你想的那个东西
+平台应持久化一份经过 admission 的训练配置，把并行策略、batch 语义、NCCL env policy、preflight gate、rollback gate 和 checkpoint schema 固定下来。
 
-对基础设施团队的要求：FSDP / ZeRO 上线前，要有一套**支持分片 checkpoint 的保存恢复流程**，这和经典 DDP 的 checkpoint 管理不是一套东西（详见 [第10章](./10-memory-checkpointing-and-recovery.md)）。
+示例：
 
-### 8.10 什么时候不该优先做数据并行
+```yaml
+run:
+  name: llama7b-fsdp-64gpu-bf16
+  owner: pretrain-platform
+  image_digest: sha256:9b1c...f43a
+  version_matrix:
+    pytorch: 2.4.1+cu124
+    cuda_runtime: 12.4
+    nccl: 2.21.5
+    driver: 550.54.15
+    ofed: 24.04-0.6.6.0
 
-以下情况要谨慎：
+parallel:
+  mode: fsdp_full_shard
+  world_size: 64
+  nnodes: 8
+  nproc_per_node: 8
+  fsdp:
+    auto_wrap_policy: transformer_block
+    backward_prefetch: backward_pre
+    limit_all_gathers: true
+    state_dict_type: sharded
 
-- 单卡训练还没稳定
-- 模型根本放不下单卡（此时要考虑 FSDP/ZeRO 或模型并行，而不是更多 DDP）
-- 数据读取已经是第一瓶颈
-- 网络条件很差（25 GbE 以下跨节点做大模型 DP 基本不现实）
-- per-device batch 已经小到计算根本喂不饱单卡
-- checkpoint / 评测 stall 频繁，通信停顿还要叠上 I/O 停顿
+batch:
+  sequence_length: 4096
+  micro_batch_per_gpu: 2
+  gradient_accumulation_steps: 4
+  global_batch_sequences: 512
+  token_accounting: non_pad_tokens
 
-这时继续做数据并行，可能只是把本来就没解决的问题放大。尤其当你还需要频繁保存 checkpoint 时，通信停顿和写盘停顿会叠加，恢复策略也要跟着调整（详见 [第10章 §10.8](./10-memory-checkpointing-and-recovery.md)）。
+precision:
+  compute: bf16
+  gradients: bf16
+  optimizer_state: fp32
+  fp16_loss_scale: disabled
 
-#### 8.10.1 反模式清单
+nccl_env_policy:
+  debug_level_for_preflight: INFO
+  production_debug_level: WARN
+  require_rdma: true
+  allow_socket_fallback: false
+  required_hcas: [mlx5_0, mlx5_1, mlx5_2, mlx5_3]
+  env:
+    NCCL_IB_DISABLE: "0"
+    NCCL_CROSS_NIC: "1"
+    NCCL_ASYNC_ERROR_HANDLING: "1"
+    NCCL_NET_GDR_LEVEL: "2"
 
-数据并行实践中几个高频反模式：
+preflight_gates:
+  steps: 300
+  min_p50_non_pad_tokens_per_s: 700000
+  min_p95_weak_scaling_efficiency: 0.85
+  max_nccl_exposed_tail_p95_ms: 150
+  max_rank_step_skew_p95: 1.12
+  max_data_visible_wait_ratio_p95: 0.05
+  max_hbm_p95_gib: 68
 
-| 反模式 | 典型表现 | 后果 | 正确做法 |
-|--------|----------|------|----------|
-| 单卡没调好就扩 | 单卡 MFU 20%，直接上 8 卡 | 8 卡 MFU 还是 20%，问题被放大 | 先把单卡调到 ≥40% MFU |
-| 为扩卡无限放大 batch | 只追求扩展效率，不管收敛 | 模型训不收敛或精度掉 | 和算法团队同步 LR scaling |
-| 跨节点用普通以太网 | 25 GbE 集群训 10B+ 模型 | 通信占比 > 50% | 要么换 IB，要么换策略 |
-| 忘了 `no_sync()` | 梯度累积下每 micro-batch 都同步 | 通信多了 N 倍 | 正确包装 accum 阶段 |
-| 把第一个 step 算进平均 | 报告吞吐"不稳" | 误判为框架有 bug | 丢掉前 N 步 |
-| 模型放不下却坚持 DDP | 不断 OOM retry | 训练根本跑不起来 | 切 FSDP 或上 TP |
-| 看 GPU 利用率就是吞吐 | "我的卡利用率 95%" | 可能 90% 在 memcpy | 看 MFU 和 tokens/sec |
+rollback_gates:
+  max_tokens_s_regression_ratio: 0.10
+  max_nccl_exposed_tail_p95_ms: 80
+  max_rank_step_skew_p95: 1.15
+  max_data_visible_wait_ratio_p95: 0.05
+  require_loss_parity: true
 
----
+checkpoint_schema:
+  type: torch_distributed_sharded
+  schema_version: dp-fsdp-v3
+  save_rng_state: true
+  save_sampler_state: true
+  save_optimizer_state: true
+  save_scaler_state: false
+  required_metadata:
+    - global_step
+    - world_size
+    - process_mesh
+    - shard_layout
+    - dataset_manifest_digest
+```
 
-## 本章小结
+这份配置不是为了替代训练代码，而是为了让平台 admission、preflight、发布、rollback gate 和 checkpoint schema 使用同一份事实来源。
 
-| 主题 | 关键点 |
-|------|--------|
-| 数据并行本质 | 复制模型，切分数据，同步梯度 |
-| 主要瓶颈 | AllReduce、拓扑质量与通信重叠能力 |
-| 扩展效率 | 是判断"加卡是否值得"的关键指标 |
-| Batch 定义 | global batch、per-device batch、梯度累积必须分清 |
-| 扩展实验 | 要区分强扩展和弱扩展，不能只看单个吞吐数字 |
-| 适用边界 | 模型放得下单卡、单卡基线稳定时最适合 |
-| 通信优化 | bucket、overlap 先调好，再考虑梯度压缩 |
-| 内存边界 | DDP 放不下时，FSDP/ZeRO 是自然延伸，不是"新技术" |
-| 故障诊断 | "慢"的原因多样，先分清单机/多机、通信/计算、均匀/不均 |
+### 7.4 TorchElastic restart 与 rendezvous 边界
 
----
+TorchElastic 解决的是“训练进程组如何重新 rendezvous，并从一致 checkpoint 恢复继续跑”。
 
-## 练习题
+它不能自动修复模型数学状态，也不能让没有保存的进度凭空回来。
+
+典型启动方式：
+
+```bash
+torchrun \
+  --nnodes=8:8 \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_id="${JOB_ID}" \
+  --rdzv_endpoint="${MASTER_ADDR}:29500" \
+  --max_restarts=3 \
+  --monitor_interval=5 \
+  train.py \
+  --config train_config.yaml \
+  --resume auto
+```
+
+TorchElastic 能覆盖的边界：
+
+- 单个 worker 进程退出后，launcher 重新拉起整组或局部 worker；
+- 节点短暂抖动后，所有 rank 重新 rendezvous；
+- 从最近一次完整 checkpoint 恢复模型、optimizer、scheduler、RNG、sampler 和 FSDP/ZeRO shard metadata；
+- 在固定 `nnodes=8:8` 的配置下保持 world size 不变，降低 checkpoint layout 变化风险。
+
+TorchElastic 不能覆盖的边界：
+
+- 没有写入 checkpoint 的 step 会丢失；RPO 由 checkpoint 频率决定；
+- checkpoint schema 不完整时，无法恢复 sampler cursor、loss scaler、RNG 或 FSDP shard layout；
+- world size 改变后，旧 shard layout 不一定能直接恢复，除非平台提供 reshard/conversion 工具；
+- NCCL fabric 持续故障、数据 shard 永久不可读、代码 deterministic bug 不会因 restart 消失；
+- 某些 rank 已经执行 optimizer step、另一些 rank 未执行的 partial step 不能被“继续跑”修复，必须回滚到上一个一致 checkpoint。
+
+因此，elastic restart 是恢复编排能力，不是状态一致性协议本身。
+
+### 7.5 Preflight
+
+建议每个正式作业先跑 100 到 300 step preflight。
+
+必须输出：
+
+```text
+step_time_p50_ms
+step_time_p95_ms
+data_visible_wait_p95_ms
+forward_backward_p50_ms
+nccl_total_p50_ms
+nccl_exposed_tail_p95_ms
+optimizer_p50_ms
+rank_step_skew_p95
+tokens_per_second_non_pad
+global_batch
+samples_per_rank
+hbm_p95_per_gpu
+nccl_busbw_allreduce_gbps
+checkpoint_dry_run_seconds
+```
+
+Preflight 失败不应只给“任务失败”。
+
+要自动分类：
+
+- memory admission failed；
+- NCCL baseline failed；
+- data skew failed；
+- rank straggler failed；
+- checkpoint dry-run failed；
+- convergence sanity failed。
+
+### 7.6 发布与回滚
+
+DP 配置发布要像服务配置发布一样治理。
+
+推荐策略：
+
+1. 单节点 baseline；
+2. 2 节点 16 GPU smoke；
+3. 8 节点 64 GPU preflight；
+4. 生产长跑；
+5. 每次只改变一个主变量，例如 bucket、NCCL env、parallel strategy、batch policy。
+
+回滚条件示例：
+
+- steady-state tokens/s 低于上一版本 10%；
+- NCCL exposed tail P95 高于 80 ms；
+- rank skew P95 大于 1.15；
+- data visible wait P95 大于 5% step time；
+- checkpoint dry run 超过 RTO 预算；
+- loss parity 与 baseline 偏离超过算法阈值。
+
+### 7.7 观测
+
+DP dashboard 至少分四层：
+
+| 层 | 指标 | 目标 |
+|---|---|---|
+| Training | non-pad tokens/s、loss、grad norm、global batch | 判断训练有效进展 |
+| Step breakdown | data、fwd/bwd、NCCL total、NCCL exposed、optimizer | 判断瓶颈位置 |
+| Rank skew | per-rank step P50/P95、data time、sample length | 找 straggler/data skew |
+| Fabric | NCCL busbw、IB port xmit/rcv、retransmit、GPU-NIC topo | 找网络退化 |
+| GPU | SM active、tensor active、HBM、clock、NVLink error、XID | 找硬件/内核问题 |
+
+日志必须带这些标签：
+
+```text
+run_id, job_id, global_step, rank, local_rank, node, gpu_uuid, hca, rail, dataset_shard, sample_tokens, parallel_mode
+```
+
+### 7.8 Governance
+
+平台需要把“经验调参”变成可审计策略：
+
+- NCCL env 由平台模板管理，用户可覆盖但必须记录 diff；
+- rank placement 策略由 scheduler plugin 或 admission controller 约束；
+- 多节点作业必须保存 preflight 证据包；
+- FSDP/ZeRO checkpoint schema 需要版本化；
+- data skew 超阈值应阻止进入长跑；
+- 事故复盘要能关联 NCCL 日志、scheduler placement、dataset shard 和 checkpoint metadata。
+
+## 8. 容量与效率模型
+
+### 8.1 状态容量
+
+DDP 每卡训练状态近似：
+
+```text
+state_per_gpu_ddp = params + grads + optimizer_states
+```
+
+BF16 参数 + BF16 梯度 + AdamW FP32 master/m/v 约：
+
+```text
+bytes_per_param ~= 2 + 2 + 12 = 16 bytes
+```
+
+7B 模型参数相关状态约：
+
+```text
+6.7e9 * 16 bytes ~= 107.2 GB ~= 99.8 GiB
+```
+
+这解释了为什么第7章接受的 LLaMA-7B 单节点 baseline 使用 FSDP/ZeRO-style state sharding，而不是朴素 DDP。
+
+### 8.2 FSDP/ZeRO 分片容量
+
+粗略估算：
+
+```text
+state_per_gpu_sharded ~= (params + grads + optimizer_states) / shard_world_size + live_allgather_params + activations + temp + fragmentation
+```
+
+`live_allgather_params` 取决于 wrap policy、prefetch、是否 reshard after forward。
+
+它不是零。
+
+因此 FULL_SHARD 的 admission 必须用 profiler 或 memory snapshot 验证 HBM P95，而不是只做 `/ world_size` 心算。
+
+### 8.3 扩展效率
+
+弱扩展口径：每卡 batch 不变，global batch 随 GPU 数增长。
+
+```text
+weak_scaling_efficiency = throughput_N / (N * throughput_1)
+```
+
+强扩展口径：global batch 固定，每卡工作量随 GPU 数下降。
+
+```text
+strong_scaling_efficiency = step_time_1 / (N * step_time_N)
+```
+
+两者不能混用。
+
+DP 扩展报告必须同时记录：
+
+- per-device batch；
+- gradient accumulation；
+- global batch；
+- sequence length；
+- non-pad token ratio；
+- precision；
+- parallel mode；
+- rank count。
+
+### 8.4 有效 step time 模型
+
+本章的生产估算模型：
+
+```text
+step_time = max_rank(data_visible + compute + exposed_communication + optimizer + misc)
+exposed communication = max(comm - overlap, 0)
+```
+
+`max_rank` 不能省略。
+
+同步训练的 step time 由最慢 rank 决定。
+
+### 8.5 Straggler 与 data skew 模型
+
+rank skew：
+
+```text
+rank_step_skew = p95(step_time_by_rank) / p50(step_time_by_rank)
+```
+
+样本长度倾斜：
+
+```text
+sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)
+```
+
+如果 `rank_step_skew` 和 `sample_token_skew` 同时上升，优先查 dataset packing/sharding。
+
+如果 `rank_step_skew` 上升但 token skew 正常，优先查硬件、CPU、I/O、GPU clock、NIC、NCCL path。
+
+## 9. 故障排除：症状、证据、根因、动作
+
+### 9.1 排障原则
+
+先确定慢在哪里。
+
+不要直接调 bucket 或换 NCCL env。
+
+按下面顺序收敛：
+
+1. 单节点 baseline 是否仍健康；
+2. 多节点 `nccl-tests` 是否健康；
+3. 训练 profiler 中 NCCL 是 total 高还是 exposed tail 高；
+4. 慢 rank 是否固定；
+5. 慢 rank 是否对应同一 dataset shard、node、GPU、NIC、rail；
+6. checkpoint/logging/eval 是否混进 step time；
+7. 最近变更是否涉及 image、driver、NCCL、dataset、batch、bucket、parallel strategy。
+
+### 9.2 Troubleshooting table
+
+| 症状 | 证据 | 可能根因 | 动作 |
+|---|---|---|---|
+| NCCL timeout | `Watchdog caught collective operation timeout`，某 collective seq num 卡住，部分 rank 无后续日志 | 某 rank 先崩、data loader 卡死、网络连接断、IB/RoCE 丢包、进程组不一致 | 收集所有 rank 日志；按 seq num 找第一个缺席 rank；检查 dmesg/XID/IB counters；开启 `NCCL_ASYNC_ERROR_HANDLING=1`；修复 rank-local 根因后重跑 |
+| low bus bandwidth | `nccl-tests` busbw 只有平台基线 40%-60%，NCCL 日志显示 Socket 或单 HCA | RDMA device 未注入、`NCCL_SOCKET_IFNAME` 错、`NCCL_IB_HCA` 错、单 rail、链路降速、跨 NUMA | 跑 `ibdev2netdev`、`ibstat`、`nvidia-smi topo -m`；修 HCA/env/device plugin；验证 all_reduce/all_gather/reduce_scatter |
+| rank straggler | per-rank step P95 中某 rank 持续慢 10%+，sample token skew 正常 | GPU 降频、ECC/XID、CPU steal、NUMA 错、PCIe/NVLink error、NIC 拥塞 | 查 DCGM clock/throttle、`nvidia-smi -q`、host CPU、IB port counters；隔离节点；重排 rank placement |
+| data skew | rank data time 和 sample tokens 同时倾斜，长样本集中在少数 rank | shard 不是按 token 平衡、packing 不均、远端数据分片热点、worker 数不足 | 按 non-pad tokens 做 batch/pack 平衡；记录 per-rank sample length；重建 manifest；加缓存或调整 worker/prefetch |
+| exposed NCCL tail 高 | profiler 显示 backward 后 NCCL 仍运行，GPU idle | bucket 太大、gradient ready 顺序差、dynamic graph、FSDP wrap 太粗、straggler 破坏 overlap | sweep `bucket_cap_mb`；打开 `static_graph` 前验证图稳定；调整 FSDP wrap；先排 rank skew |
+| AllGather 频繁小包 | FSDP timeline 里大量短 AllGather，NCCL launch overhead 高 | wrap policy 太细、prefetch 配置不当、module 边界碎 | 按 transformer block wrap；合并小模块；验证 HBM 峰值后调 prefetch |
+| OOM only at scale | 单节点不 OOM，多节点或 FSDP prefetch 后 OOM | live AllGather 参数增多、bucket buffer、activation 随 batch 改变、fragmentation | 降 microbatch；`limit_all_gathers=True`；调 wrap；记录 memory snapshot；避免同时增 world size 和 batch |
+| loss diverges after scaling | 吞吐提高但 loss parity 破坏 | global batch 变大、LR/warmup 未调整、FP16 loss scale 不一致、gradient clipping 时机错误 | 固定 global batch 做 A/B；同步 scaler state；检查 loss 除以 accumulation；算法 owner 审核 LR policy |
+| checkpoint restore mismatch | FSDP/ZeRO 恢复后参数 key 或 shard shape 不一致 | checkpoint metadata 缺 parallel layout、world size 变化未转换、state_dict 类型混用 | 使用 sharded checkpoint API；保存 mesh/shard spec；恢复前做 metadata validation |
+
+### 9.3 证据采集包
+
+一次 DP 事故复盘至少保存：
+
+```text
+logs/
+  rank-0000.stdout
+  rank-0000.nccl.log
+  ...
+profiles/
+  torch-profiler-step-100-130.json
+  nsys-node-3-rank-24.qdrep
+metrics/
+  rank_step_breakdown.parquet
+  dcgm.csv
+  ib_counters.txt
+  nccl_tests_before.txt
+  nccl_tests_after.txt
+config/
+  launcher.env
+  train_config.yaml
+  image_digest.txt
+  placement.json
+  dataset_manifest_digest.txt
+checkpoint/
+  latest_metadata.json
+```
+
+没有 rank 粒度证据的“网络慢”结论不可接受。
+
+## 10. 方案设计 / Worked Example：8 节点 64 GPU
+
+### 10.1 输入基线
+
+第7章给出的单节点 LLaMA-7B accepted baseline：
+
+| Metric | Accepted baseline | 口径 |
+|---|---:|---|
+| Effective non-pad tokens/s | 95,000 | 8 GPU aggregate，排除 padding |
+| MFU | 48.3% | `6N_p` FLOPs/token |
+| HFU | 60.3% | checkpointing 后约 `7.5N_p` actual FLOPs/token |
+| HBM P95 | 63 GiB/GPU | 低于 68 GiB admission 上限 |
+| DataLoader visible wait | 3% | steady-state profiler window |
+| Checkpoint time | 18 s / 1000 steps | 单独拆出，不混入稳态 step |
+
+目标：扩展到 8 节点 64 GPU，训练同一个 LLaMA-7B BF16 baseline。
+
+硬件假设：
+
+- 每节点 8xH100 SXM 80GB；
+- 节点内 NVSwitch；
+- 每节点 4x400Gb/s NDR IB 或等价 RoCE rail；
+- GPUDirect RDMA 可用；
+- 样例版本 tuple：PyTorch 2.4.1 + CUDA 12.4 + NCCL 2.21.5 + NVIDIA driver 550.54.15 + OFED 24.04。
+
+这个 tuple 只是 worked example 的可复现样例。
+
+真实生产必须把 PyTorch、CUDA、NCCL、driver、OFED、NIC firmware 和 scheduler plugin 固定在平台 version matrix 中，并把镜像 digest 写入 `train_config.yaml` 或等价 admission record。
+
+### 10.2 并行策略选择
+
+朴素 DDP 不通过容量 admission。
+
+原因：7B BF16 + AdamW 参数相关状态约 100 GiB/GPU，不含 activation。
+
+采用 FSDP FULL_SHARD 或 ZeRO-3 作为 DP-family baseline：
+
+```text
+parallel_mode = FSDP FULL_SHARD
+shard_world_size = 64
+node_local_topology = NVSwitch
+cross_node_collective = NCCL over IB/RoCE
+checkpoint = sharded state dict
+```
+
+为什么不立刻上 TP/PP：
+
+- 7B 模型层内计算和整网深度在 64xH100 上不是容量主问题；
+- TP 会给每层引入更频繁节点内 collective；
+- PP 会引入 microbatch bubble 和 checkpoint layout 复杂度；
+- 当前目标是验证从单节点到 8 节点的数据并行扩展，而不是为 70B/405B 设计 3D parallel。
+
+如果后续序列长度升到 32K/128K 或模型升到 70B，应转入第9章的 TP/PP/CP/hybrid 设计。
+
+### 10.3 Batch 与样本口径
+
+单节点 baseline 假设：
+
+```text
+seq_len = 4096
+micro_batch_per_gpu = 2
+grad_accum = 4
+world_size = 8
+global_batch_sequences = 2 * 4 * 8 = 64 sequences
+```
+
+64 GPU 如果保持 microbatch 和 accumulation 不变：
+
+```text
+global_batch_sequences = 2 * 4 * 64 = 512 sequences
+```
+
+这改变算法 batch。
+
+本 worked example 选择两阶段：
+
+| 阶段 | per GPU microbatch | grad accum | world size | global sequences | 目的 |
+|---|---:|---:|---:|---:|---|
+| A: system scaling | 2 | 4 | 64 | 512 | 测 weak scaling 和通信效率 |
+| B: loss parity | 2 | 1 | 64 | 128 | 接近较小 global batch，观察收敛 |
+
+若算法要求严格保持 64 sequences，则 64 GPU 下 `grad_accum=1` 仍有 128 sequences，必须降低 microbatch 到 1 或使用更复杂的 batch schedule。
+
+降低 microbatch 会缩短 compute，通信暴露可能上升。
+
+这就是系统效率和优化语义的真实冲突。
+
+### 10.4 Step time decomposition
+
+以阶段 A 为例，单节点 baseline 的有效吞吐是 95,000 non-pad tokens/s。
+
+弱扩展理想吞吐：
+
+```text
+ideal_64gpu_tokens_s = 95,000 * 8 = 760,000 non-pad tokens/s
+```
+
+假设 64 GPU preflight 实测：
+
+| Component | P50 ms | P95 ms | 证据来源 |
+|---|---:|---:|---|
+| data visible wait | 35 | 70 | rank-level dataloader timer |
+| forward + backward compute | 1,420 | 1,500 | torch profiler CUDA timeline |
+| FSDP AllGather total | 190 | 240 | NCCL range + profiler |
+| ReduceScatter total | 155 | 210 | NCCL range + profiler |
+| other NCCL / barriers | 25 | 45 | profiler |
+| communication total | 370 | 470 | summed NCCL kernels |
+| overlap with compute | 300 | 350 | timeline intersection |
+| exposed communication | 70 | 120 | `max(comm - overlap, 0)` |
+| optimizer | 115 | 140 | optimizer timer |
+| misc/logging | 25 | 40 | training loop timer |
+| step time | 1,665 | 1,870 | max rank step timer |
+
+P50 step 模型：
+
+```text
+step_time = data_visible + compute + exposed_communication + optimizer + misc
+          = 35 + 1420 + 70 + 115 + 25
+          = 1665 ms
+```
+
+每 step token 数估算：
+
+```text
+sequences_per_step = 2 * 4 * 64 = 512
+raw_tokens_per_step = 512 * 4096 = 2,097,152
+non_pad_ratio = 0.60
+non_pad_tokens_per_step = 1,258,291
+throughput = 1,258,291 / 1.665 ~= 756,000 non-pad tokens/s
+```
+
+弱扩展效率：
+
+```text
+weak_scaling_efficiency = 756,000 / 760,000 = 99.5%
+```
+
+这个数字看起来过高，必须做 sanity check。
+
+可能原因：
+
+- 单节点 baseline 是保守 acceptance，不是极限；
+- 64 GPU global batch 更大，compute 更容易饱和；
+- non-pad ratio 或 step 口径可能不一致；
+- checkpoint/eval/logging 是否被排除要核对。
+
+保守验收应同时看 P95：
+
+```text
+throughput_p95 ~= 1,258,291 / 1.870 = 673,000 non-pad tokens/s
+p95_efficiency = 673,000 / 760,000 = 88.6%
+```
+
+生产 acceptance 可以设置为：
+
+| Metric | Gate |
+|---|---:|
+| P50 non-pad tokens/s | >= 700,000 |
+| P95 weak scaling efficiency | >= 85% |
+| exposed communication P95 | <= 150 ms |
+| rank step skew P95 | <= 1.12 |
+| data visible wait P95 | <= 5% step time |
+| HBM P95 | <= 68 GiB/GPU |
+| checkpoint dry run | <= 120 s for sharded save |
+
+### 10.5 NCCL troubleshooting in the worked example
+
+故障版本实测：
+
+| Component | Healthy P95 | Bad P95 |
+|---|---:|---:|
+| communication total | 470 ms | 820 ms |
+| overlap | 350 ms | 430 ms |
+| exposed communication | 120 ms | 390 ms |
+| step time | 1,870 ms | 2,180 ms |
+| tokens/s P95 | 673,000 | 577,000 |
+| rank skew P95 | 1.10 | 1.28 |
+
+证据：
+
+```text
+NCCL INFO NET/Socket : Using [0]eth0
+NCCL INFO NET/IB : No device found.
+all_reduce_perf busbw 48 GB/s, platform baseline 125 GB/s
+```
+
+解释：NCCL fallback 到 socket 或 RDMA device 未注入。
+
+动作：
+
+1. 检查容器是否挂载 `/dev/infiniband`；
+2. 检查 `NCCL_IB_DISABLE=0`；
+3. 检查 `NCCL_IB_HCA` 与 `ibdev2netdev` 输出一致；
+4. 检查 RoCE `GID_INDEX`；
+5. 修复后重跑 `all_reduce_perf`、`all_gather_perf`、`reduce_scatter_perf`；
+6. 再跑 300 step preflight，不直接恢复长跑。
+
+### 10.6 Data-skew troubleshooting in the worked example
+
+另一种故障：NCCL bus bandwidth 正常，但 P95 step time 抖动。
+
+证据：
+
+```text
+rank_step_skew_p95 = 1.24
+sample_token_skew_p95 = 1.21
+data_visible_wait_p95 rank 39 = 310 ms
+rank 39 dataset_shard = shard-0187
+shard-0187 non_pad_ratio p95 = 0.91, fleet p50 = 0.59
+```
+
+解释：packing/sharding 按样本数均分，但没有按 token 数均衡。
+
+动作：
+
+1. dataset manifest 增加 token_count；
+2. shard planner 按 token budget 而不是 sample count 分配；
+3. batch 内 sequence packing 设置 max token bucket；
+4. 每 step 上报 per-rank non-pad tokens；
+5. 重新 preflight，要求 `sample_token_skew_p95 <= 1.08`。
+
+### 10.7 决策复盘
+
+本 64 GPU 方案接受 FSDP FULL_SHARD 的理由：
+
+- 经典 DDP 不满足每卡 HBM admission；
+- FSDP/ZeRO-3 保持 DP-family 的样本切分语义；
+- 7B 不需要 TP/PP 才能放下；
+- sharded checkpoint 与第10章恢复协议兼容；
+- 主要风险是 AllGather/ReduceScatter 暴露通信，能通过 NCCL + overlap 证据治理。
+
+不接受纯 DDP 的理由：
+
+- 参数相关状态约 100 GiB/GPU；
+- 即使用 80GB H100，也没有 activation/temp/fragmentation 空间；
+- OOM 后再调 batch 不解决 optimizer state 常驻问题。
+
+不接受 TP/PP 先行的理由：
+
+- 引入额外通信域和 checkpoint layout；
+- 对当前 7B 目标复杂度过高；
+- 应保留给 70B/405B 或长上下文任务。
+
+## 11. 决策边界：DP vs FSDP/TP/PP/CP/hybrid
+
+### 11.1 选择流程
+
+```text
+1. 单节点 baseline 是否健康？
+   no -> 回第7章修数据、显存、kernel、checkpoint
+   yes -> 继续
+
+2. 完整 DDP 训练状态能否放进每 GPU admission 上限？
+   yes -> DDP 优先
+   no -> FSDP/ZeRO
+
+3. FSDP/ZeRO 后单层 compute 或 activation 是否仍超 HBM？
+   yes -> TP 或 CP
+   no -> 继续
+
+4. 模型层数/总参数是否需要跨 stage 放置？
+   yes -> PP + DP/FSDP/TP
+   no -> 继续
+
+5. 上下文长度是否导致 attention/KV/activation 主导？
+   yes -> CP/SP + hybrid
+   no -> DP-family 足够
+
+6. 网络是否支持目标 collective？
+   no -> 降规模、改拓扑、换并行策略或先修 fabric
+```
+
+### 11.2 决策表
+
+| 现象 | 证据 | 推荐方向 | 不推荐 |
+|---|---|---|---|
+| 单节点 MFU 低 | 第7章 baseline MFU < 35%，data wait 高 | 先修单节点 | 直接扩 DP |
+| DDP OOM | 参数+grad+Adam state > HBM admission | FSDP/ZeRO-2/3 | 只降低 microbatch |
+| NCCL tail 主导 | exposed communication > 20% step | bucket/overlap/topology，必要时减少 DP degree | 盲目加节点 |
+| 单层 GEMM/activation 放不下 | FSDP 后仍 OOM，层内峰值高 | TP/SP | 继续加 DP |
+| pipeline 可按层切 | 70B/405B，整网状态太大 | PP + TP + DP/FSDP | 纯 FSDP 跨过大 world |
+| 长上下文爆炸 | attention/KV/sequence activation 主导 | CP/SP + TP/FSDP | 只切 optimizer state |
+| 网络弱 | 100GbE 且大模型梯度通信重 | 减少跨节点 DP，更多节点内并行或换 fabric | 大 world DDP |
+
+### 11.3 Hybrid 的边界
+
+Hybrid parallel 不是把所有并行维度打开。
+
+它应该是最小满足约束的组合：
+
+```text
+capacity constraints -> choose FSDP/ZeRO/TP/PP/CP
+throughput constraints -> choose DP degree and microbatch
+fabric constraints -> bind TP intra-node, DP/FSDP cross-node carefully
+recovery constraints -> choose checkpoint schema and shard ownership
+```
+
+每增加一个维度，都要增加：
+
+- process group 数量；
+- rank placement 规则；
+- checkpoint metadata；
+- restore conversion 工具；
+- profiler 分析复杂度；
+- failure blast radius。
+
+## 12. 反模式
+
+| 反模式 | 表现 | 后果 | 修正 |
+|---|---|---|---|
+| 单节点没验收就扩 | 多节点慢但不知道慢在哪里 | 把第7章问题复制到更多 rank | 先交付单节点 evidence package |
+| 把 DDP 当显存扩容 | 7B AdamW DDP 在 80GB 上 OOM | 反复降 batch 仍不够 | 用 FSDP/ZeRO 切状态 |
+| global batch 偷偷变大 | 64 GPU 吞吐好但 loss 变差 | 系统指标和算法指标冲突 | 明确 global batch 和 LR policy |
+| 忘记 `no_sync()` | accumulation 每个 microstep 都 AllReduce | 通信扩大 N 倍 | 只在最后 microstep 同步 |
+| 只看平均 GPU utilization | 利用率 95%，tokens/s 差 | 可能在等通信或处理 padding | 看 MFU、non-pad tokens/s、rank skew |
+| 盲调 NCCL env | env 越加越多，问题随机 | 破坏默认拓扑选择 | 先用日志和 nccl-tests 证明路径 |
+| 忽略 data skew | NCCL timeout 被误判为网络 | 慢 rank 其实在读长样本 | 记录 per-rank token 和 data time |
+| checkpoint 格式混用 | DDP full ckpt 与 FSDP shard 混在一起 | restore 失败或 silent mismatch | schema 版本化，保存 parallel metadata |
+| 跨节点 TP | TP collective 走慢网络 | 每层通信放大，吞吐崩 | TP 优先节点内，跨节点用 DP/PP 谨慎设计 |
+| 把 profiler overhead 算进生产吞吐 | profile run 结果偏慢 | 错误回滚或误判 | profile window 单独标记 |
+
+## 13. Checklist：data-parallel production readiness
+
+### 13.1 Baseline
+
+- [ ] 第7章单节点 baseline 已通过。
+- [ ] baseline 包含 non-pad tokens/s、MFU/HFU、HBM P95、data wait、checkpoint time。
+- [ ] 单节点配置、镜像 digest、数据 manifest digest 可复现。
+- [ ] 单节点瓶颈已归类，不存在未解释的 DataLoader 或 checkpoint stall。
+
+### 13.2 Parallel strategy
+
+- [ ] DDP/FSDP/ZeRO 选择有状态容量账本支撑。
+- [ ] 明确复制什么、切分什么、通信什么、保存什么。
+- [ ] global batch、per-device batch、gradient accumulation 已记录。
+- [ ] LR scaling、warmup、gradient clipping、loss scale 策略已确认。
+- [ ] FSDP/ZeRO checkpoint schema 已验证 restore。
+
+### 13.3 Fabric and topology
+
+- [ ] `nvidia-smi topo -m`、`ibdev2netdev`、`ibstat` 已归档。
+- [ ] `all_reduce_perf`、`all_gather_perf`、`reduce_scatter_perf` 达到平台基线。
+- [ ] NCCL 日志确认没有 socket fallback。
+- [ ] HCA、rail、NIC、NUMA、GPU placement 与调度策略一致。
+- [ ] RoCE/IB QoS、GID、PFC/ECN 或 IB fabric 配置由平台 owner 确认。
+
+### 13.4 Observability
+
+- [ ] rank-level step breakdown 已上线。
+- [ ] NCCL total 与 exposed communication 分开记录。
+- [ ] rank step skew 和 sample token skew 有告警阈值。
+- [ ] DCGM、IB counters、NCCL logs、training metrics 能按 run_id 关联。
+- [ ] profiler window 不混入生产吞吐统计。
+
+### 13.5 Release and recovery
+
+- [ ] 100-300 step preflight 通过。
+- [ ] checkpoint dry run 通过，RPO/RTO 符合预算。
+- [ ] elastic/restart 后 global step、sampler epoch、RNG、optimizer、scaler state 一致。
+- [ ] rollback gate 明确，包括 tokens/s、rank skew、NCCL tail、loss parity。
+- [ ] 事故证据包路径和保留周期已配置。
+
+## 14. 本章小结
+
+数据并行的核心不是启动多个进程，而是管理复制后的同步语义。
+
+DDP 复制完整训练状态，用 AllReduce 同步梯度。
+
+FSDP/ZeRO 仍在数据并行家族里，但把参数、梯度、optimizer state 的冗余切成 shard，用 AllGather 和 ReduceScatter 交换容量与通信。
+
+真正影响 step time 的是暴露通信：
+
+```text
+exposed communication = max(comm - overlap, 0)
+```
+
+bucket、overlap、gradient accumulation、global batch、loss scale 都必须放在同一个训练协议里理解。
+
+NCCL 问题必须用 ring/tree、rail、NIC、IB/RoCE、env vars、logs、`nccl-tests` 和 rank-level metrics 建立证据链。
+
+当容量、拓扑或序列长度超出 DP-family 能力时，应转向 TP/PP/CP/hybrid，而不是继续堆 rank。
+
+## 15. 练习题
 
 ### 基础题
 
-1. 为什么数据并行扩展到多机后收益常常变差？
-2. ring all-reduce 中，梯度量和设备数如何影响通信成本？
-3. 扩展效率下降时，你会优先从哪三类因素排查？
-4. 如果一个作业已经通信占比很高，checkpoint 策略为什么也要跟着改？
-5. 强扩展和弱扩展的区别是什么？为什么混用会导致误判？
+1. 解释 DDP 中每个 rank 在 forward、backward、AllReduce、optimizer step 之后分别持有哪些状态。
+2. 为什么经典 DDP 不能降低每 GPU optimizer state 内存？用 7B + AdamW 的数字估算。
+3. 写出 `global_batch = per_device_batch * world_size * gradient_accumulation_steps`，并说明扩 world size 时它如何影响收敛。
+4. AllReduce、ReduceScatter、AllGather 分别在 DDP/FSDP/ZeRO 中承担什么角色？
+5. 为什么 `exposed communication = max(comm - overlap, 0)` 比总 NCCL 时间更能解释吞吐？
 
 ### 进阶题
 
-6. 一个 7B 模型在 bf16 + Adam 下做 DDP 训练，估算每卡至少需要多少显存（不含激活）？如果单卡只有 40 GB，你会怎么做？
-7. 你用 8 卡 DDP 跑训练，发现 GPU 利用率显示 95%，但 MFU 只有 18%。这两个数字同时成立吗？可能的原因是什么？
-8. 一个作业跑到第 500 步突然某个 rank 比其他慢 30%，导致整体吞吐下降。你会怎么定位？
-9. 为什么 DDP 默认的 `bucket_cap_mb=25MB` 不是万能的？在什么场景下要调大、什么场景下要调小？
-10. 画一张图说明 ZeRO-1、ZeRO-2、ZeRO-3 分别在 DDP 基础上切分了什么，并解释 ZeRO-3 相比 DDP 通信量为什么增加了 ~50%。
+6. 你看到 profiler 中 backward 结束后还有 180 ms NCCL tail。列出三类可能根因和对应证据。
+7. 64 GPU 作业 NCCL timeout，日志显示 seq num 812 卡住。你如何从 rank 日志、dataset metrics、DCGM、IB counters 建立排障顺序？
+8. 一个作业 `rank_step_skew_p95=1.22`，`sample_token_skew_p95=1.03`。你会优先查 data skew 还是硬件/拓扑？为什么？
+9. FSDP FULL_SHARD 中 `auto_wrap_policy` 太细和太粗分别会造成什么问题？
+10. 在 8 节点 64 GPU 上，如果 `nccl-tests` bus bandwidth 只有平台基线 50%，你会阻止生产发布吗？给出证据和动作。
 
 ### 开放题
 
-11. 你所在的团队有 4 台 8 卡 A100 服务器，通过 100 GbE 以太网互联。现在要训练一个 13B 的模型。基于本章内容，你会选择什么并行策略？需要哪些前置验证？
-12. 某同事声称把 `find_unused_parameters=True` 和 `static_graph=True` 同时打开能让 DDP 更快。这个说法有没有问题？如何验证？
-13. 设计一个扩展效率回归测试：每周自动跑一次，在 1/2/4/8 卡上测同一个基准模型，自动生成对比报告。你会用什么指标作为"扩展效率回归"的告警阈值？
+11. 设计一个 16 节点 128 GPU 的 DP/FSDP preflight gate，列出必须采集的指标和拒绝条件。
+12. 某团队声称“把 bucket 从 25MB 改到 200MB 后吞吐提升 8%，所以所有作业都应该用 200MB”。请反驳并设计验证矩阵。
+13. 给定 70B、seq_len 8192、8 节点 64 GPU、每节点 NVSwitch、跨节点 400G IB，你会选择 DDP、FSDP、TP、PP、CP 里的哪些组合？说明哪些问题留给第9章解决。
+14. 写一份事故复盘摘要：NCCL timeout 最终根因是 dataset shard token skew，而不是网络。要求包含症状、证据、根因、修复、预防。

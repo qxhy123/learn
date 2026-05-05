@@ -1,0 +1,1370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 4b 章 · HBM、显存预算与 Roofline — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=04b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 4b 章 · HBM、显存预算与 Roofline</h1>
+<p class="sub">把模型状态、KV Cache、HBM 带宽、arithmetic intensity 和 machine balance 连成可操作的容量与性能判断。</p>
+<div class="chips"><span class="chip">HBM</span><span class="chip">显存预算</span><span class="chip">KV Cache</span><span class="chip">Roofline</span><span class="chip">Machine Balance</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#正文内容">正文内容</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="04-gpu-and-accelerators.html">第4章</a> 中 §4.2 显存/带宽和 §4.5
+arithmetic intensity 的深入拆分。这里专注单 GPU 内部的
+HBM、显存预算、训练/推理/KV Cache 与 roofline
+判断；多机互联、NVSwitch、MIG 和非 NVIDIA
+加速器只作为边界提及，详细内容交给第5章、第6章、第15章和平台调度章节。</p>
+</blockquote>
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>把 HBM、Tensor Core、FlashAttention、KV Cache、FP8
+这些名字先拿掉，GPU
+显存与带宽要解决的不可化简问题只有一个：<strong>计算单元每秒能消耗海量数据，但模型状态必须真实占据某些字节，且这些字节必须从有限容量、有限带宽的存储介质中被反复读写。</strong></p>
+<p>这句话有两个硬约束。第一是<strong>容量约束</strong>：权重、梯度、优化器状态、激活、临时
+buffer 和 KV Cache 不是抽象变量，它们最终都要落到显存地址空间里。单卡
+80GB 不是“差不多能跑 70B”，而是能否在某个并行策略、精度、batch、sequence
+length、并发和运行时碎片下，把所有状态放下。第二是<strong>带宽约束</strong>：就算放得下，如果每个
+token、每个 layer 或每个 kernel 都要反复扫过大块内存，性能上限也可能由
+HBM 每秒能搬多少字节决定，而不是由 Tensor Core
+每秒能做多少乘加决定。</p>
+<p>很多 AI Infra 事故都来自把这两个约束混在一起。显存 OOM 是容量失败；SM
+利用率低、HBM 带宽打满、TPOT 高是带宽失败；算力很强但 decode 不快，是
+arithmetic intensity 太低；训练 step
+里峰值显存突然爆掉，常常是激活、通信 buffer、CUDA workspace 和 allocator
+fragmentation 同时叠加。平台工程师不能只问“这张卡有多少
+TFLOPS”，而要能回答：这些字节有哪些、生命周期多长、每秒会被读写几次、可不可以分片、重算、量化、复用或缓存。</p>
+<h3 id="推--从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从容量约束出发，首先得到<strong>显存预算</strong>。训练时，参数会衍生出权重、梯度、优化器状态和
+master weight；forward 会产生激活；backward 会消耗和释放激活；框架还需要
+kernel workspace、通信 buffer、CUDA graph pool 和 allocator
+预留。推理时，没有梯度和优化器状态，但权重必须常驻，KV Cache 会随
+batch、并发、上下文长度和 layer 数增长。于是训练的核心问题是“状态倍数 +
+激活峰值”，推理的核心问题是“权重 + KV Cache + 并发”。</p>
+<p>从带宽约束出发，得到<strong>arithmetic intensity</strong>。如果一个
+kernel 每搬 1 byte 能做很多 ops，性能更可能受计算上限限制；如果每搬 1
+byte 只做很少 ops，性能更可能受 HBM 带宽限制。GEMM 通过复用矩阵块提高
+AI，所以大 batch、大 hidden size 时更接近
+compute-bound；LayerNorm、RMSNorm、embedding lookup、decode attention
+和许多 element-wise kernel 数据复用很少，所以更接近
+memory-bound。Roofline
+模型就是把这个判断画成一条上限曲线：左边受带宽斜线限制，右边受计算水平线限制，拐点就是
+machine balance。</p>
+<p>从生命周期出发，又能推导出训练和推理的差异。训练为了保存 backward
+所需信息，会在 forward 后保留激活；activation checkpointing
+用额外计算换显存；ZeRO/FSDP 用通信和分片换每卡状态；gradient
+accumulation 用更小 microbatch 换更大有效 batch。推理没有 backward，但
+decode 阶段每生成一个 token 都要读权重、读写 KV
+Cache，长上下文和高并发会把显存容量与 HBM 带宽同时推到上限。prefill 和
+decode 因此必须分开分析：prefill 常更接近 GEMM 计算，decode
+常更接近内存扫描和小矩阵运算。</p>
+<p>最后，所有公式都必须落回工程余量。纸面预算刚好 79GB 的任务，在 80GB
+卡上大概率不稳定，因为还没算 allocator fragmentation、通信临时区、CUDA
+graph capture、不同 batch shape 的
+workspace、峰值与稳态差异、监控和容错预留。可运行的预算通常需要留
+10%-20% headroom；在线推理还要给突发长请求、prefix cache、paged KV block
+碎片和模型热切换留空间。</p>
+<h3 id="概念先说清楚">概念先说清楚</h3>
+<p>HBM（High Bandwidth Memory）是贴近 GPU
+计算芯片的高带宽显存。它的核心价值不是“比内存更大”，而是让 SM、Tensor
+Core、L2、copy engine 能以 TB/s 级别持续读写模型状态。HBM
+同时有容量和带宽两个维度：容量决定权重、激活、optimizer state、KV
+Cache、workspace 能不能放下；带宽决定这些字节每秒能被搬运多少次。OOM
+是容量失败，HBM 利用率打满但 SM
+仍等数据是带宽失败，这两个问题的修复手段不同。</p>
+<p>显存预算是在回答“哪些字节必须在什么时候驻留
+HBM”。训练里的权重、梯度、优化器状态、master weight、激活、通信
+buffer、临时 workspace 和 allocator
+预留有不同生命周期；推理里的权重通常常驻，KV Cache 随
+batch、并发、上下文长度和 layer 数增长。KV Cache 不是普通缓存，而是
+attention decode 为了避免重复计算历史 token 而保存的 K/V
+tensor；它会把长上下文和高并发直接转成显存压力，并在 decode
+阶段反复被读写。</p>
+<p>Roofline 是一个性能上限模型，用来区分 kernel
+更可能受计算上限还是内存带宽上限限制。Arithmetic intensity 表示每搬 1
+byte 做多少计算；machine balance 表示这台 GPU
+的峰值计算能力和峰值内存带宽之间的比例。AI 较低的算子落在 roofline
+左侧，常被 HBM 限制；GEMM 等复用高的算子更可能靠近右侧，受 Tensor Core
+计算限制。它不是精确预测器，而是帮你判断“该优化访存、融合、重用、batch，还是该优化矩阵计算路径”的第一张图。</p>
+<h3 id="绘--因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((HBM Memory Roofline))
+    不可化简问题
+      字节真实占显存
+      字节必须被搬运
+      计算单元等待数据
+      容量与带宽同时有限
+    容量预算
+      训练
+        权重
+        梯度
+        优化器状态
+        激活
+        临时 buffer
+      推理
+        权重
+        KV Cache
+        runtime buffer
+        并发峰值
+    带宽预算
+      HBM TB/s
+      读写放大
+      kernel fusion
+      数据复用
+    Roofline
+      Arithmetic Intensity
+      Machine Balance
+      Memory Bound
+      Compute Bound
+    工程动作
+      量化
+      分片
+      激活重算
+      FlashAttention
+      Paged KV
+      Batch 调整</pre>
+<h3 id="导--读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>HBM
+的容量和带宽分别限制什么，为什么“放得下”和“跑得快”是两个不同问题？</li>
+<li>BF16 Adam 训练为什么常用 12-16 bytes/param
+做第一版预算？哪些配置会让这个倍数变化？</li>
+<li>LLM 推理中 KV Cache 的显存如何按 layer、KV head、head dim、token
+数和并发计算？</li>
+<li>为什么 prefill 和 decode 对 GPU 的压力不同，decode 为什么经常
+memory-bound？</li>
+<li>Arithmetic intensity、roofline 和 machine balance
+分别是什么，它们如何指导硬件选型和 kernel 排障？</li>
+<li>当 H100 的 BF16 算力远高于 A100，但某些任务提速不明显时，如何用
+roofline 解释？</li>
+<li>面对一次 OOM 或吞吐低的问题，如何判断该优先做量化、减
+batch、activation checkpointing、KV cache 管理，还是 kernel
+fusion？</li>
+</ol>
+<h2 id="正文内容">正文内容</h2>
+<h3 id="4b1-hbm-到底是什么不是显卡内存的普通升级">4b.1 HBM
+到底是什么：不是“显卡内存”的普通升级</h3>
+<p>HBM（High Bandwidth Memory）的关键不是名字里的 memory，而是 high
+bandwidth。普通服务器 DRAM 追求容量、成本和 CPU 访问语义；GPU HBM
+追求贴近计算芯片的极高并行带宽。AI 负载里的大矩阵乘法、attention、归约和
+KV Cache 访问，都会在极短时间里读取和写回大量
+tensor。如果内存系统不能持续供给，Tensor Core 再多也会空等。</p>
+<p>可以把 HBM 理解成 GPU 的“近场工作台”：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>HBM 的工程含义</th>
+<th>AI 负载里的表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>容量</td>
+<td>单卡能常驻多少状态</td>
+<td>模型权重、激活、KV Cache 是否放得下</td>
+</tr>
+<tr>
+<td>带宽</td>
+<td>每秒能读写多少字节</td>
+<td>decode TPOT、LayerNorm、attention、optimizer step
+是否被内存限制</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>单次访问仍不便宜</td>
+<td>GPU 靠大量线程隐藏延迟，不适合小而串行的访存</td>
+</tr>
+<tr>
+<td>共享性</td>
+<td>同一 GPU 上所有 SM 共享</td>
+<td>多 kernel、多 stream、多 tenant 会争同一条 HBM 通道</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>比 DRAM 昂贵且容量有限</td>
+<td>需要预算、复用、分片和量化</td>
+</tr>
+</tbody>
+</table>
+<p>HBM 与 CPU cache 的直觉也不同。GPU 没有靠一个巨大的低延迟 cache
+让单线程快速返回，而是靠海量线程、coalesced access、shared memory、L2 和
+HBM 带宽把吞吐堆起来。一个 kernel 如果访问模式不连续、复用低、warp
+分歧严重，即使总字节数不大，也可能跑不满带宽；另一个 kernel
+如果访问连续且并发高，就可能接近 HBM 理论带宽的相当比例。</p>
+<h3 id="4b2-显存预算的总公式">4b.2 显存预算的总公式</h3>
+<p>先给一个工程上足够实用的总公式：</p>
+<pre class="text"><code>峰值显存 =
+  常驻模型状态
++ 当前阶段激活 / KV Cache
++ 临时 workspace
++ 通信 buffer
++ framework / allocator / CUDA graph 预留
++ fragmentation 与安全余量</code></pre>
+<p>不要把 <code>torch.cuda.memory_allocated()</code>
+当作完整答案。它通常只显示框架已分配给 tensor
+的部分，不等于进程真正占用，也不等于下一次 shape
+变化时的峰值。排查时至少要同时看：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>常见工具</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocated</td>
+<td>框架当前 tensor 占用</td>
+<td>PyTorch memory summary</td>
+</tr>
+<tr>
+<td>reserved</td>
+<td>caching allocator 向 CUDA 申请后保留的池</td>
+<td>PyTorch memory summary</td>
+</tr>
+<tr>
+<td>device used</td>
+<td>驱动视角进程占用</td>
+<td><code>nvidia-smi</code></td>
+</tr>
+<tr>
+<td>peak allocated</td>
+<td>最近阶段的峰值</td>
+<td><code>torch.cuda.max_memory_allocated()</code></td>
+</tr>
+<tr>
+<td>kernel workspace</td>
+<td>cuBLAS/cuDNN/attention engine 临时区</td>
+<td>profiler、框架日志</td>
+</tr>
+<tr>
+<td>fragmentation</td>
+<td>空闲但不可用于大块申请的碎片</td>
+<td>OOM 报错、allocator snapshot</td>
+</tr>
+</tbody>
+</table>
+<p>工程预算最好分成<strong>稳态</strong>和<strong>峰值</strong>。稳态决定平均吞吐和可常驻副本数；峰值决定是否
+OOM。训练中，forward 末尾、backward 中部、optimizer step、checkpoint
+保存、ZeRO all-gather 都可能成为峰值点。推理中，prefill 大
+batch、长上下文请求进入、KV block 分配、CUDA graph capture
+和模型热加载都可能成为峰值点。</p>
+<h3 id="4b3-训练显存为什么-adam-会吃掉这么多">4b.3 训练显存：为什么 Adam
+会吃掉这么多</h3>
+<p>以 BF16 训练为例，最容易记住的参数状态预算是：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>常见精度</th>
+<th>bytes/param</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型权重</td>
+<td>BF16</td>
+<td>2</td>
+<td>forward/backward 主权重</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>BF16 或 FP32</td>
+<td>2-4</td>
+<td>取决于框架和优化器配置</td>
+</tr>
+<tr>
+<td>Adam 一阶矩 <code>m</code></td>
+<td>FP32</td>
+<td>4</td>
+<td>optimizer state</td>
+</tr>
+<tr>
+<td>Adam 二阶矩 <code>v</code></td>
+<td>FP32</td>
+<td>4</td>
+<td>optimizer state</td>
+</tr>
+<tr>
+<td>master weight</td>
+<td>FP32 或无</td>
+<td>0-4</td>
+<td>mixed precision 下有些配置保留</td>
+</tr>
+</tbody>
+</table>
+<p>所以常见粗算有两个口径：</p>
+<pre class="text"><code>保守 BF16 Adam ≈ 16 bytes/param
+较紧 BF16 Adam ≈ 12 bytes/param</code></pre>
+<p>差异来自梯度精度、是否保留 FP32 master weight、optimizer 实现和
+sharding 策略。平台做容量规划时，第一版通常用 16 bytes/param
+更安全；研究代码确认配置后，再把预算收紧。</p>
+<p>以 7B、70B、405B 参数模型为例，只看参数相关状态：</p>
+<table>
+<thead>
+<tr>
+<th>模型规模</th>
+<th>仅 BF16 权重</th>
+<th>12 bytes/param 训练状态</th>
+<th>16 bytes/param 训练状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7B</td>
+<td>14 GB</td>
+<td>84 GB</td>
+<td>112 GB</td>
+</tr>
+<tr>
+<td>70B</td>
+<td>140 GB</td>
+<td>840 GB</td>
+<td>1.12 TB</td>
+</tr>
+<tr>
+<td>405B</td>
+<td>810 GB</td>
+<td>4.86 TB</td>
+<td>6.48 TB</td>
+</tr>
+</tbody>
+</table>
+<p>这张表解释了为什么“70B 推理 2 张 80GB 卡能勉强放权重”和“70B
+训练需要很多卡”不是矛盾。推理主要放权重和 KV
+Cache；训练要放梯度、优化器状态、激活和临时 buffer。</p>
+<h4 id="4b31-激活显存真正让-batch-和-sequence-length-难调的部分">4b.3.1
+激活显存：真正让 batch 和 sequence length 难调的部分</h4>
+<p>参数状态通常和参数量线性相关，而激活显存和以下变量相关：</p>
+<pre class="text"><code>激活显存 ≈ layers × batch × sequence_length × hidden_size × bytes × 保存因子</code></pre>
+<p>“保存因子”不是固定常数，因为不同实现会保存不同中间值：attention 的
+Q/K/V、softmax 结果、MLP 中间激活、dropout mask、残差、norm
+输入等都会影响峰值。FlashAttention 这类实现的价值之一，就是减少
+attention 矩阵等中间状态的物化，把显存从近似 <code>O(seq_len^2)</code>
+的压力压回更接近流式计算的形态。</p>
+<p>激活显存有几个工程特征：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+<th>常见动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>sequence length 翻倍，显存不止翻倍</td>
+<td>attention 中间状态和部分 workspace 放大</td>
+<td>FlashAttention、缩短上下文、分块</td>
+</tr>
+<tr>
+<td>microbatch 增大很快 OOM</td>
+<td>激活随 batch 近似线性增长</td>
+<td>gradient accumulation、减 microbatch</td>
+</tr>
+<tr>
+<td>开启 activation checkpointing 后显存降、step 变慢</td>
+<td>backward 时重算 forward 片段</td>
+<td>用计算换容量</td>
+</tr>
+<tr>
+<td>不同模型实现显存差很多</td>
+<td>保存中间 tensor 的策略不同</td>
+<td>profiler 对比 peak allocation</td>
+</tr>
+<tr>
+<td>第一步比后续更高</td>
+<td>kernel autotune、workspace、CUDA graph capture</td>
+<td>warmup 后再测稳态，但峰值仍要预算</td>
+</tr>
+</tbody>
+</table>
+<h4 id="4b32-一个训练预算案例13b-sft-单机能不能跑">4b.3.2
+一个训练预算案例：13B SFT 单机能不能跑</h4>
+<p>假设要在 8×H100 80GB 节点上做 13B 模型 SFT，BF16，AdamW，sequence
+length 4096，global batch
+128。先不讨论跨节点，只判断单节点是否有希望。</p>
+<p>第一步，算参数状态：</p>
+<pre class="text"><code>13B × 16 bytes/param ≈ 208 GB</code></pre>
+<p>如果完全复制到每卡，每卡光参数状态就 208GB，必然不行。需要 FSDP/ZeRO
+把参数、梯度和优化器状态分片。8 卡均分后：</p>
+<pre class="text"><code>208 GB / 8 ≈ 26 GB/卡</code></pre>
+<p>第二步，给激活和临时区预算。假设 microbatch per GPU = 1，activation
+checkpointing 开启后，每卡激活峰值按 18-28GB 粗估；通信
+buffer、workspace、allocator 预留 8-12GB。</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>每卡估算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分片后的参数/梯度/优化器状态</td>
+<td>~26 GB</td>
+</tr>
+<tr>
+<td>激活峰值</td>
+<td>~18-28 GB</td>
+</tr>
+<tr>
+<td>通信和 workspace</td>
+<td>~8-12 GB</td>
+</tr>
+<tr>
+<td>安全余量</td>
+<td>~8 GB</td>
+</tr>
+<tr>
+<td>合计</td>
+<td>~60-74 GB</td>
+</tr>
+</tbody>
+</table>
+<p>结论：8×80GB 有希望，但不是“随便跑”。如果 sequence length 到
+8192、microbatch per GPU 到 2，或关闭 activation checkpointing，就很可能
+OOM。工程上应先用小 step 做 peak memory profile，再决定
+microbatch、checkpointing 粒度和 FSDP wrapping 策略。</p>
+<h3 id="4b4-推理显存权重不再是唯一主角">4b.4
+推理显存：权重不再是唯一主角</h3>
+<p>推理显存可以先用这个公式：</p>
+<pre class="text"><code>推理显存 ≈ 权重 + KV Cache + runtime buffer + fragmentation/headroom</code></pre>
+<p>权重部分很好算：</p>
+<table>
+<thead>
+<tr>
+<th>精度</th>
+<th>bytes/param</th>
+<th>70B 权重大致大小</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BF16/FP16</td>
+<td>2</td>
+<td>~140 GB</td>
+</tr>
+<tr>
+<td>FP8/INT8</td>
+<td>1</td>
+<td>~70 GB</td>
+</tr>
+<tr>
+<td>INT4/FP4</td>
+<td>0.5</td>
+<td>~35 GB</td>
+</tr>
+</tbody>
+</table>
+<p>但线上服务真正麻烦的是 KV Cache。权重是常驻固定成本，KV Cache
+是随请求增长的动态成本。并发越高、上下文越长、输出越长，KV Cache
+越大；如果没有分页式管理和良好的
+eviction，显存会被少数长请求迅速吃完。</p>
+<h3 id="4b5-kv-cache-的计算公式">4b.5 KV Cache 的计算公式</h3>
+<p>Transformer decode 时，每一层都会保存历史 token 的 Key 和
+Value。一个常用估算公式是：</p>
+<pre class="text"><code>KV Cache bytes =
+  batch_or_concurrent_sequences
+× total_tokens_per_sequence
+× layers
+× kv_heads
+× head_dim
+× 2                 # K 和 V
+× bytes_per_element</code></pre>
+<p>如果使用 GQA/MQA，<code>kv_heads</code> 小于 query heads，KV Cache
+会显著下降。这是现代 LLM 架构对推理显存很重要的原因之一。</p>
+<p>以一个 70B 级模型为例，假设：</p>
+<ul>
+<li>layers = 80</li>
+<li>kv_heads = 8</li>
+<li>head_dim = 128</li>
+<li>KV 精度 = FP16/BF16，2 bytes</li>
+</ul>
+<p>单 token KV Cache：</p>
+<pre class="text"><code>80 × 8 × 128 × 2 × 2 bytes = 327,680 bytes ≈ 320 KB/token</code></pre>
+<p>不同上下文和并发下：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>token 总量</th>
+<th>KV Cache</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 个请求，8K tokens</td>
+<td>8,192</td>
+<td>~2.5 GB</td>
+</tr>
+<tr>
+<td>1 个请求，32K tokens</td>
+<td>32,768</td>
+<td>~10 GB</td>
+</tr>
+<tr>
+<td>8 个并发，各 8K</td>
+<td>65,536</td>
+<td>~20 GB</td>
+</tr>
+<tr>
+<td>32 个并发，各 8K</td>
+<td>262,144</td>
+<td>~80 GB</td>
+</tr>
+<tr>
+<td>8 个并发，各 32K</td>
+<td>262,144</td>
+<td>~80 GB</td>
+</tr>
+</tbody>
+</table>
+<p>这张表比“某模型支持 128K
+上下文”更有工程意义。支持不等于便宜，更不等于高并发下稳定。长上下文会把显存从权重问题变成
+KV Cache 问题；高并发也会在相同 token 总量下产生相似压力。</p>
+<h4 id="4b51-kv-cache-的生命周期">4b.5.1 KV Cache 的生命周期</h4>
+<p>KV Cache 不是一块永远增长的数组，它有生命周期：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>KV 行为</th>
+<th>资源压力</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>一次性为 prompt token 写入 K/V</td>
+<td>大 GEMM + 大量写入，常有较高算力利用</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>每步追加新 token 的 K/V，并读取历史 K/V</td>
+<td>小 batch 时 memory-bound，受 HBM 和调度影响</td>
+</tr>
+<tr>
+<td>Finish</td>
+<td>请求结束后释放 KV block</td>
+<td>需要及时回收，否则显存泄漏式下降</td>
+</tr>
+<tr>
+<td>Prefix reuse</td>
+<td>共享系统 prompt 或长前缀</td>
+<td>节省 prefill 计算，但占用常驻 KV</td>
+</tr>
+<tr>
+<td>Eviction</td>
+<td>显存压力下淘汰低价值 cache</td>
+<td>影响命中率、尾延迟和重算成本</td>
+</tr>
+</tbody>
+</table>
+<p>Paged KV 的核心动机是避免为每个请求预留最大上下文长度，改成按 block
+分配。它解决的是容量碎片和动态并发问题，不会让每个 token
+的读写字节凭空消失。换句话说，paged KV
+更像“把显存用得更满、更稳”，不是“让 HBM 带宽无限大”。</p>
+<h3 id="4b6-prefill-vs-decode同一个模型的两个性能世界">4b.6 Prefill vs
+Decode：同一个模型的两个性能世界</h3>
+<p>LLM 推理至少要分成两个阶段：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>输入形态</th>
+<th>主要计算</th>
+<th>更常见瓶颈</th>
+<th>典型优化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>一次处理 prompt 中的很多 token</td>
+<td>大矩阵乘法、attention</td>
+<td>compute-bound 或混合</td>
+<td>大 batch、FlashAttention、prefix cache</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>每轮生成 1 个或少量 token</td>
+<td>小 GEMM、读权重、读写 KV</td>
+<td>memory-bound、调度开销</td>
+<td>continuous batching、KV 管理、量化、提高 HBM 带宽</td>
+</tr>
+</tbody>
+</table>
+<p>decode 的一个粗暴下限来自权重读取：</p>
+<pre class="text"><code>每 token 最低时间 ≥ 权重大小 / 有效 HBM 带宽</code></pre>
+<p>例如 70B BF16 权重约 140GB。如果总有效 HBM 带宽按 2 张 H100 聚合后
+6.7TB/s 粗算，单看权重扫描的理想下限：</p>
+<pre class="text"><code>140 GB / 6.7 TB/s ≈ 21 ms/token</code></pre>
+<p>真实系统还要加 KV Cache 访问、通信、kernel
+launch、调度、采样、runtime overhead 和未达到理论带宽的折损，所以 TPOT
+会更高。这个估算的价值不是预测精确延迟，而是告诉你：如果 decode
+已经受权重和 KV 的 HBM 读写限制，继续追 TFLOPS 没意义；更高 HBM
+带宽、更低权重量化、更好的 batching 和减少内存读写才是方向。</p>
+<h3 id="4b7-arithmetic-intensity把算和搬放到同一张账本">4b.7 Arithmetic
+Intensity：把“算”和“搬”放到同一张账本</h3>
+<p>Arithmetic intensity（AI）定义为：</p>
+<p><span class="math display">$$
+AI = \frac{\text{Ops}}{\text{Bytes moved}}
+$$</span></p>
+<p>它回答的问题是：每从内存系统搬 1 byte，能做多少计算。如果 AI
+高，说明数据复用好，可能受计算上限限制；如果 AI
+低，说明大量时间花在搬数据，可能受带宽限制。</p>
+<p>几个直觉例子：</p>
+<table>
+<thead>
+<tr>
+<th>算子 / 场景</th>
+<th>数据复用</th>
+<th>AI 直觉</th>
+<th>更常见瓶颈</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>大 GEMM</td>
+<td>A/B tile 被多次复用</td>
+<td>高</td>
+<td>Tensor Core / compute</td>
+</tr>
+<tr>
+<td>小 GEMM</td>
+<td>tile 小，复用不足</td>
+<td>中低</td>
+<td>launch、带宽、占用率</td>
+</tr>
+<tr>
+<td>LayerNorm/RMSNorm</td>
+<td>每个元素读写少量几次</td>
+<td>低</td>
+<td>HBM 带宽</td>
+</tr>
+<tr>
+<td>GELU/add/mul</td>
+<td>逐元素读写</td>
+<td>低</td>
+<td>HBM 带宽</td>
+</tr>
+<tr>
+<td>Embedding lookup</td>
+<td>随机读，几乎无复用</td>
+<td>很低</td>
+<td>HBM/L2/访存模式</td>
+</tr>
+<tr>
+<td>Attention prefill</td>
+<td>QK/AV 有矩阵复用</td>
+<td>中高</td>
+<td>shape 相关</td>
+</tr>
+<tr>
+<td>Attention decode</td>
+<td>每步读历史 KV</td>
+<td>低到中</td>
+<td>HBM 带宽</td>
+</tr>
+<tr>
+<td>Optimizer step</td>
+<td>读写权重、梯度、m、v</td>
+<td>低</td>
+<td>HBM 带宽</td>
+</tr>
+</tbody>
+</table>
+<h4 id="4b71-gemm-的-ai-为什么高">4b.7.1 GEMM 的 AI 为什么高</h4>
+<p>矩阵乘法 <span
+class="math inline"><em>C</em> = <em>A</em> × <em>B</em></span>，形状为
+<span class="math inline"><em>M</em> × <em>K</em></span> 乘 <span
+class="math inline"><em>K</em> × <em>N</em></span>。粗略 ops：</p>
+<pre class="text"><code>Ops ≈ 2 × M × N × K</code></pre>
+<p>如果只按每个矩阵读写一次粗算，bytes：</p>
+<pre class="text"><code>Bytes ≈ (M×K + K×N + M×N) × bytes_per_element</code></pre>
+<p>当 M、N、K 都很大时，ops 是三维乘积，bytes 是二维面积之和，所以 AI
+会随矩阵尺寸变大而变高。这就是为什么大 GEMM 能接近 Tensor Core
+峰值，而小 batch、小 hidden、碎矩阵很难跑满。</p>
+<h4 id="4b72-layernorm-为什么低">4b.7.2 LayerNorm 为什么低</h4>
+<p>LayerNorm/RMSNorm
+需要读输入、做归约、再写输出。每个元素参与的计算很少，且结果很难像 GEMM
+那样被大量复用。即使用很好的 kernel，把多次读写融合起来，AI
+仍然不会变成大 GEMM 那种量级。优化方向通常是：</p>
+<ul>
+<li>减少读写次数</li>
+<li>融合相邻 element-wise kernel</li>
+<li>保持连续访问和向量化 load/store</li>
+<li>避免中间 tensor 物化</li>
+</ul>
+<p>这类优化提升来自“少搬字节”，不是“多用 Tensor Core”。</p>
+<h3 id="4b8-roofline一张图判断上限">4b.8 Roofline：一张图判断上限</h3>
+<p>Roofline 模型把硬件上限写成：</p>
+<p><span
+class="math display"><em>P</em><em>e</em><em>r</em><em>f</em><em>o</em><em>r</em><em>m</em><em>a</em><em>n</em><em>c</em><em>e</em> ≤ min (<em>P</em><em>e</em><em>a</em><em>k</em><em>C</em><em>o</em><em>m</em><em>p</em><em>u</em><em>t</em><em>e</em>, <em>A</em><em>I</em> × <em>M</em><em>e</em><em>m</em><em>o</em><em>r</em><em>y</em><em>B</em><em>a</em><em>n</em><em>d</em><em>w</em><em>i</em><em>d</em><em>t</em><em>h</em>)</span></p>
+<p>其中：</p>
+<ul>
+<li><code>PeakCompute</code> 是该精度下的峰值算力</li>
+<li><code>MemoryBandwidth</code> 是 HBM 可达带宽</li>
+<li><code>AI × MemoryBandwidth</code>
+是在给定数据复用下，内存系统能支撑的性能上限</li>
+</ul>
+<pre class="text"><code>性能 ^
+     |                              compute roof
+     |                         ----------------------
+     |                       /
+     |                     /
+     |                   /
+     |                 /
+     |_______________/______________________________&gt; Arithmetic Intensity
+                    ^
+                    |
+              machine balance</code></pre>
+<p>拐点位置：</p>
+<p><span class="math display">$$
+MachineBalance = \frac{PeakCompute}{MemoryBandwidth}
+$$</span></p>
+<p>如果某 kernel 的 AI 小于 machine balance，它在 roofline 左侧，理论上
+memory-bound；如果 AI 大于 machine balance，它在右侧，理论上
+compute-bound。</p>
+<h4 id="4b81-不同-gpu-的-machine-balance">4b.8.1 不同 GPU 的 machine
+balance</h4>
+<p>用第4章相同的数量级口径，可以建立直觉：</p>
+<table>
+<thead>
+<tr>
+<th>设备</th>
+<th>BF16/FP16 dense 峰值</th>
+<th>HBM 带宽</th>
+<th>Machine balance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A100 80GB SXM</td>
+<td>~312 TFLOPS</td>
+<td>~2.0 TB/s</td>
+<td>~156 ops/byte</td>
+</tr>
+<tr>
+<td>H100 SXM</td>
+<td>~989 TFLOPS</td>
+<td>~3.35 TB/s</td>
+<td>~295 ops/byte</td>
+</tr>
+<tr>
+<td>H200 SXM</td>
+<td>~989 TFLOPS</td>
+<td>~4.8 TB/s</td>
+<td>~206 ops/byte</td>
+</tr>
+<tr>
+<td>B200 SXM</td>
+<td>~4500 TFLOPS</td>
+<td>~8.0 TB/s</td>
+<td>~562 ops/byte</td>
+</tr>
+<tr>
+<td>GB200 (per GPU)</td>
+<td>~5000 TFLOPS</td>
+<td>~8.0 TB/s</td>
+<td>~625 ops/byte</td>
+</tr>
+</tbody>
+</table>
+<p class="mini">数字基于 NVIDIA 官方 datasheet，以 dense Tensor Core 为口径；如果模型实际能用 sparse Tensor Core (2:4 结构稀疏)，dense 算力可视为乘以 2 上限。FP8 dense 算力约为 BF16 的 2x，FP4（B200/GB200 NV E2M1 格式）约为 BF16 的 4x。</p>
+<div class="warn"><strong>B200 machine balance 反向加速 memory-bound 失衡：</strong>B200 的 BF16 算力比 H100 翻 4.5x，但 HBM 带宽只提升 2.4x（3.35 TB/s → 8.0 TB/s），machine balance 从 295 飙升到 562。结果是：在 H100 上已经 memory-bound 的 kernel（如 decode attention、layernorm、small-batch GEMV、KV-cache 写回），从 H100 换 B200 实际加速远小于 TFLOPS 提升。生产中常见 LLM decode 只有 1.5-2x 加速（而非 4.5x），prefill 大 batch GEMM 才能接近 TFLOPS 上限。</div>
+<p>这张表有一个反直觉结论：H100 → B200 算力增速远高于 HBM 带宽增速，所以
+machine balance 急剧升高。同一个 AI 不变的 kernel，从 A100
+换到 B200 后，更容易落在 roofline 左侧——你会看到 GPU 标称算力暴涨，但某些
+memory-bound kernel 提速远小于 TFLOPS 提升。这也是为什么 B200 实际推理 throughput 提升通常依赖 FP4 / FP8 量化（直接降低 byte/token）+ MLA / GQA（降低 KV bandwidth）+ Speculative Decoding（提升 token/cycle），而不仅仅是换硬件。</p>
+<p>H200 没有把 BF16 算力翻倍，但 HBM
+容量和带宽提升明显，所以对长上下文、decode、optimizer
+step、activation-heavy workload
+可能比“算力没变”看起来更有价值。平台选型不能只看计算 roof，也要看 memory
+roof 的斜率。</p>
+<h4 id="4b82-roofline-不是精确预言而是排障坐标系">4b.8.2 Roofline
+不是精确预言，而是排障坐标系</h4>
+<p>Roofline 的价值不是告诉你“这个 kernel 一定跑到 73.2
+TFLOPS”，而是给排障排序：</p>
+<table>
+<thead>
+<tr>
+<th>观测</th>
+<th>Roofline 解读</th>
+<th>优先动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HBM 带宽高、SM/Tensor 利用低</td>
+<td>memory-bound</td>
+<td>fusion、减少读写、量化、改善访问模式</td>
+</tr>
+<tr>
+<td>SM/Tensor 利用高、HBM 未满</td>
+<td>compute-bound</td>
+<td>Tensor Core shape、精度、tile、occupancy</td>
+</tr>
+<tr>
+<td>HBM 和 SM 都低</td>
+<td>可能是 launch、同步、shape 太小、CPU 调度</td>
+<td>batch、CUDA graph、减少小 kernel</td>
+</tr>
+<tr>
+<td>理论 AI 高但实测像 memory-bound</td>
+<td>数据布局或 kernel 没有实现复用</td>
+<td>profiler 看 cache hit、shared memory、global load</td>
+</tr>
+<tr>
+<td>单 kernel 好，端到端差</td>
+<td>阶段间同步、runtime、调度或 IO</td>
+<td>trace 全链路，不只看 kernel</td>
+</tr>
+</tbody>
+</table>
+<h3 id="4b9-用-roofline-看训练-step">4b.9 用 roofline 看训练 step</h3>
+<p>一个 transformer 训练 step 可以粗略拆成：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>主要状态</th>
+<th>更常见 roofline 位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forward GEMM</td>
+<td>权重、激活</td>
+<td>compute-bound</td>
+</tr>
+<tr>
+<td>Attention prefill</td>
+<td>Q/K/V、attention 中间</td>
+<td>混合，取决于 seq 和 kernel</td>
+</tr>
+<tr>
+<td>Norm/element-wise</td>
+<td>激活读写</td>
+<td>memory-bound</td>
+</tr>
+<tr>
+<td>Backward GEMM</td>
+<td>激活、梯度、权重</td>
+<td>compute-bound</td>
+</tr>
+<tr>
+<td>Optimizer step</td>
+<td>weight/grad/m/v 读写</td>
+<td>memory-bound</td>
+</tr>
+<tr>
+<td>Activation recompute</td>
+<td>额外 forward</td>
+<td>compute 换 memory</td>
+</tr>
+</tbody>
+</table>
+<p>这解释了一个常见现象：训练 profiler 里 GEMM 很快，但 step time
+仍然不理想。原因可能不是 matmul 慢，而是大量低 AI kernel、optimizer
+step、通信前后的拷贝和显存压力拖慢了端到端。优化顺序通常是：</p>
+<ol type="1">
+<li>先确认是否 OOM 或接近 OOM，避免 allocator 抖动。</li>
+<li>再看时间占比最高的 kernel 或阶段。</li>
+<li>对 compute-bound GEMM，优化 shape、precision、Tensor Core
+利用。</li>
+<li>对 memory-bound kernel，优先减少读写、融合、重排布局。</li>
+<li>对显存容量，考虑 checkpointing、分片、offload 或减 microbatch。</li>
+</ol>
+<h3 id="4b10-用-roofline-看推理服务">4b.10 用 roofline 看推理服务</h3>
+<p>推理端最容易犯的错误，是只测一个短 prompt
+的吞吐，然后把结论推广到线上长上下文和高并发。更稳的拆法是：</p>
+<table>
+<thead>
+<tr>
+<th>负载形态</th>
+<th>资源主导</th>
+<th>关键指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>短 prompt、低并发</td>
+<td>launch/runtime overhead 明显</td>
+<td>TTFT、单请求 TPOT</td>
+</tr>
+<tr>
+<td>长 prompt prefill</td>
+<td>GEMM 和 attention</td>
+<td>prefill tokens/s、TTFT</td>
+</tr>
+<tr>
+<td>长 decode、高并发</td>
+<td>HBM 带宽 + KV Cache</td>
+<td>TPOT、tokens/s/GPU、显存水位</td>
+</tr>
+<tr>
+<td>多租户混合长度</td>
+<td>KV 分配和调度</td>
+<td>p95/p99 latency、OOM/eviction</td>
+</tr>
+<tr>
+<td>量化模型</td>
+<td>权重带宽下降，但 kernel 复杂</td>
+<td>质量、吞吐、反量化开销</td>
+</tr>
+</tbody>
+</table>
+<p>一个工程判断例子：</p>
+<table>
+<thead>
+<tr>
+<th>优化</th>
+<th>主要改善</th>
+<th>对 capacity</th>
+<th>对 bandwidth</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权重量化到 INT8/INT4</td>
+<td>权重显存和权重读取</td>
+<td>明显降低</td>
+<td>明显降低</td>
+<td>精度、kernel 支持</td>
+</tr>
+<tr>
+<td>KV Cache 量化</td>
+<td>KV 显存和读写</td>
+<td>长上下文收益大</td>
+<td>decode 收益大</td>
+<td>质量和实现复杂度</td>
+</tr>
+<tr>
+<td>Continuous batching</td>
+<td>提高 GPU 填充度</td>
+<td>不减少单请求 KV</td>
+<td>提高有效利用</td>
+<td>尾延迟调度复杂</td>
+</tr>
+<tr>
+<td>Prefix caching</td>
+<td>减少重复 prefill</td>
+<td>增加常驻 cache</td>
+<td>减少部分计算</td>
+<td>cache 命中依赖流量</td>
+</tr>
+<tr>
+<td>Paged KV</td>
+<td>降低碎片和预留浪费</td>
+<td>明显改善</td>
+<td>不直接提高带宽</td>
+<td>block 管理开销</td>
+</tr>
+</tbody>
+</table>
+<h3 id="4b11-工程案例一70b-推理为什么权重放下了仍然-oom">4b.11
+工程案例一：70B 推理为什么“权重放下了”仍然 OOM</h3>
+<p>背景：团队用 2×H100 80GB 部署 70B BF16 模型，tensor parallel =
+2。权重总大小约 140GB，每卡约
+70GB。上线前用单请求测试能跑；上线后并发稍高就 OOM。</p>
+<p>第一版错误判断：</p>
+<pre class="text"><code>每卡 80GB - 权重 70GB = 10GB
+还能跑一点并发</code></pre>
+<p>缺失项：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>每卡压力</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分片权重</td>
+<td>~70 GB</td>
+</tr>
+<tr>
+<td>runtime / workspace / graph / allocator</td>
+<td>2-5 GB</td>
+</tr>
+<tr>
+<td>KV Cache</td>
+<td>随并发和上下文增长</td>
+</tr>
+<tr>
+<td>fragmentation/headroom</td>
+<td>3-8 GB</td>
+</tr>
+</tbody>
+</table>
+<p>如果 70B 模型单 token KV 约 320KB，TP=2 后每卡是否保存完整 KV
+取决于实现和并行方式，但即使理想均分，每卡可用给 KV 的空间也可能只有几
+GB。一个 8K token 请求的总 KV 约
+2.5GB；多个并发或长上下文很快吃完余量。</p>
+<p>更可靠的结论：</p>
+<ul>
+<li>2×H100 BF16 适合证明“能加载”，不适合高并发长上下文。</li>
+<li>如果坚持 BF16，需要更多卡或更大显存卡。</li>
+<li>如果目标是在线服务，应评估 INT8/INT4 权重量化、KV
+量化、H200/B200、更严格的 max context 和 admission control。</li>
+<li>监控不能只看 GPU utilization，还要看 KV block 使用率、剩余
+block、请求长度分布和 OOM 前的 allocator 状态。</li>
+</ul>
+<h3
+id="4b12-工程案例二h100-比-a100-强很多为什么-layernorm-没快多少">4b.12
+工程案例二：H100 比 A100 强很多，为什么 LayerNorm 没快多少</h3>
+<p>背景：某训练代码从 A100 80GB 迁到 H100。GEMM 提速明显，但 profiler 里
+LayerNorm、residual add、dropout、optimizer step 的耗时下降有限，端到端
+step 只提升 1.6x，远低于 BF16 峰值算力提升。</p>
+<p>用 roofline 解释：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>A100</th>
+<th>H100</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BF16 dense 算力</td>
+<td>~312 TFLOPS</td>
+<td>~989 TFLOPS</td>
+<td>compute roof ~3.2x</td>
+</tr>
+<tr>
+<td>HBM 带宽</td>
+<td>~2.0 TB/s</td>
+<td>~3.35 TB/s</td>
+<td>memory roof ~1.7x</td>
+</tr>
+<tr>
+<td>LayerNorm AI</td>
+<td>低</td>
+<td>低</td>
+<td>主要吃 memory roof</td>
+</tr>
+</tbody>
+</table>
+<p>LayerNorm 这类 kernel 的上限大致跟有效 HBM 带宽走，而不是跟 Tensor
+Core 走。所以看到 1.5-1.8x 的提升并不奇怪。真正该做的是：</p>
+<ul>
+<li>融合 LayerNorm + residual + dropout 等相邻读写。</li>
+<li>避免产生额外中间 tensor。</li>
+<li>使用更好的 fused optimizer。</li>
+<li>确认 tensor layout 连续，避免非合并访存。</li>
+<li>把优化预期从“跟 TFLOPS 同比例”改成“跟有效 HBM 带宽同量级”。</li>
+</ul>
+<h3 id="4b13-工程案例三训练-oom-的最小排查链">4b.13 工程案例三：训练 OOM
+的最小排查链</h3>
+<p>现象：一个 7B SFT 任务在 8×A100 80GB 上偶发 OOM。相同配置有时能跑几十
+step，有时 warmup 后第一个长 batch OOM。</p>
+<p>排查链：</p>
+<ol type="1">
+<li>固定随机种子和输入长度，确认是否由变长 batch 触发。</li>
+<li>记录
+<code>max_memory_allocated</code>、<code>max_memory_reserved</code> 和
+<code>nvidia-smi</code> 峰值。</li>
+<li>分阶段打点：load model、first forward、loss、backward、optimizer
+step、eval。</li>
+<li>关闭 eval 或 generation，确认是否训练中插入推理造成 KV/activation
+峰值。</li>
+<li>降 microbatch，不降 global batch，观察是否线性缓解。</li>
+<li>开启或加深 activation checkpointing，观察显存下降与 step time
+上升。</li>
+<li>检查是否有保存 loss/logits/hidden states 到列表导致 tensor
+生命周期延长。</li>
+<li>调整 allocator 配置和固定 shape，确认是否 fragmentation。</li>
+</ol>
+<p>常见根因表：</p>
+<table>
+<thead>
+<tr>
+<th>根因</th>
+<th>表现</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>变长 batch 有极长样本</td>
+<td>偶发 OOM</td>
+<td>length bucketing、max length、token budget batch</td>
+</tr>
+<tr>
+<td>eval generation 混入训练进程</td>
+<td>训练中段峰值突增</td>
+<td>单独 eval、限制 eval batch、清理 cache</td>
+</tr>
+<tr>
+<td>保存 tensor 而未 detach</td>
+<td>显存逐 step 增长</td>
+<td><code>.detach()</code>、只保存标量</td>
+</tr>
+<tr>
+<td>activation 太大</td>
+<td>降 microbatch 立刻有效</td>
+<td>checkpointing、gradient accumulation</td>
+</tr>
+<tr>
+<td>allocator 碎片</td>
+<td>reserved 很高但 allocated 不高</td>
+<td>固定 shape、调整 allocator、重启进程</td>
+</tr>
+<tr>
+<td>optimizer state 未分片</td>
+<td>load 后就接近满</td>
+<td>FSDP/ZeRO 配置检查</td>
+</tr>
+</tbody>
+</table>
+<h3 id="4b14-常见优化手段它们到底换了什么">4b.14
+常见优化手段：它们到底换了什么</h3>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>主要解决</th>
+<th>付出的代价</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>降 precision / 量化</td>
+<td>权重和带宽</td>
+<td>精度风险、kernel 依赖</td>
+<td>推理、部分训练</td>
+</tr>
+<tr>
+<td>Activation checkpointing</td>
+<td>激活容量</td>
+<td>重算，step 变慢</td>
+<td>长序列训练</td>
+</tr>
+<tr>
+<td>FSDP/ZeRO</td>
+<td>每卡参数状态</td>
+<td>通信和复杂度</td>
+<td>大模型训练</td>
+</tr>
+<tr>
+<td>Gradient accumulation</td>
+<td>global batch 不变下降 microbatch</td>
+<td>step 内循环更多</td>
+<td>显存不够但吞吐可接受</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td>attention 中间显存和带宽</td>
+<td>kernel/shape 约束</td>
+<td>长序列</td>
+</tr>
+<tr>
+<td>Fused kernels</td>
+<td>中间 tensor 和 HBM 往返</td>
+<td>实现复杂</td>
+<td>norm、bias、activation、optimizer</td>
+</tr>
+<tr>
+<td>Paged KV</td>
+<td>KV 碎片和预留</td>
+<td>block 管理开销</td>
+<td>多并发推理</td>
+</tr>
+<tr>
+<td>KV quantization</td>
+<td>KV 容量和带宽</td>
+<td>质量风险</td>
+<td>长上下文 decode</td>
+</tr>
+<tr>
+<td>Admission control</td>
+<td>防止极端请求打爆显存</td>
+<td>拒绝或排队</td>
+<td>在线服务</td>
+</tr>
+</tbody>
+</table>
+<p>一个判断原则：<strong>容量问题优先减少常驻字节或峰值生命周期；带宽问题优先减少每
+token/每 step 搬运字节或提高访问复用；算力问题才优先追 Tensor Core
+利用。</strong></p>
+<h3 id="4b15-实战-checklist">4b.15 实战 Checklist</h3>
+<h4 id="训练显存预算-checklist">训练显存预算 Checklist</h4>
+<ul class="task-list">
+<li><label><input type="checkbox" />参数量、精度、optimizer
+类型是否明确？</label></li>
+<li><label><input type="checkbox" />是否保留 FP32 master
+weight？</label></li>
+<li><label><input type="checkbox" />梯度和 optimizer state
+是否分片？</label></li>
+<li><label><input type="checkbox" />microbatch、sequence
+length、activation checkpointing 是否明确？</label></li>
+<li><label><input type="checkbox" />是否估算了 activation
+峰值，而不只是参数状态？</label></li>
+<li><label><input type="checkbox" />是否给 workspace、communication
+buffer、allocator reserved 留余量？</label></li>
+<li><label><input type="checkbox" />是否区分 warmup 峰值、稳态峰值和
+eval/generation 峰值？</label></li>
+<li><label><input type="checkbox" />是否用真实长样本做过 peak memory
+profile？</label></li>
+</ul>
+<h4 id="推理显存预算-checklist">推理显存预算 Checklist</h4>
+<ul class="task-list">
+<li><label><input
+type="checkbox" />权重精度和实际加载格式是否明确？</label></li>
+<li><label><input type="checkbox" />KV Cache 公式里的
+layers、kv_heads、head_dim、bytes 是否按模型确认？</label></li>
+<li><label><input type="checkbox" />max context、max batched
+tokens、并发上限是否写入 admission control？</label></li>
+<li><label><input type="checkbox" />是否启用 paged KV、prefix cache 或
+KV quantization？</label></li>
+<li><label><input type="checkbox" />是否监控 KV block 使用率，而不只是
+<code>nvidia-smi</code>？</label></li>
+<li><label><input type="checkbox" />是否给 runtime buffer、CUDA
+graph、碎片和热更新留余量？</label></li>
+<li><label><input type="checkbox" />是否分别测
+prefill、decode、混合流量？</label></li>
+</ul>
+<h4 id="roofline-排障-checklist">Roofline 排障 Checklist</h4>
+<ul class="task-list">
+<li><label><input type="checkbox" />当前最慢的是
+kernel、阶段，还是端到端调度？</label></li>
+<li><label><input type="checkbox" />profiler 中 HBM
+带宽是否接近设备可达上限？</label></li>
+<li><label><input type="checkbox" />Tensor Core utilization
+是否高？</label></li>
+<li><label><input type="checkbox" />低 AI kernel
+是否占据大量时间？</label></li>
+<li><label><input type="checkbox" />是否存在很多小 kernel launch
+和同步？</label></li>
+<li><label><input type="checkbox" />shape 是否适合 Tensor Core
+tile？</label></li>
+<li><label><input type="checkbox" />tensor layout 是否连续，访存是否
+coalesced？</label></li>
+<li><label><input
+type="checkbox" />优化动作是否匹配瓶颈：减少字节、增加复用、还是提高计算利用？</label></li>
+</ul>
+<h2 id="本章小结">本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>核心问题</th>
+<th>工程判断</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HBM 容量</td>
+<td>状态能否放下</td>
+<td>权重、梯度、优化器、激活、KV、buffer 都要算</td>
+</tr>
+<tr>
+<td>HBM 带宽</td>
+<td>字节能否及时供给</td>
+<td>decode、norm、optimizer、embedding 常受限</td>
+</tr>
+<tr>
+<td>训练预算</td>
+<td>参数状态 + 激活峰值</td>
+<td>BF16 Adam 常用 12-16 bytes/param 起算</td>
+</tr>
+<tr>
+<td>推理预算</td>
+<td>权重 + KV Cache</td>
+<td>长上下文和高并发会让 KV 成为主角</td>
+</tr>
+<tr>
+<td>Arithmetic intensity</td>
+<td>每 byte 做多少 ops</td>
+<td>高 AI 看算力，低 AI 看带宽</td>
+</tr>
+<tr>
+<td>Machine balance</td>
+<td>compute roof / memory bandwidth</td>
+<td>判断 kernel 落在 roofline 左侧还是右侧</td>
+</tr>
+<tr>
+<td>优化手段</td>
+<td>改变容量、带宽或计算</td>
+<td>先判瓶颈，再选量化、分片、重算、fusion、paged KV</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>为什么“模型权重能放下”不等于“推理服务能上线”？请至少列出 3
+个额外显存项。</li>
+<li>BF16 Adam 训练中，为什么常用 12-16 bytes/param
+做参数状态预算？各项分别是什么？</li>
+<li>用公式计算：一个 32 layer、kv_heads=8、head_dim=128、BF16 KV
+的模型，每 token KV Cache 大约是多少？</li>
+<li>Prefill 和 decode 哪个更容易 memory-bound？为什么不能用一次短 prompt
+benchmark 代表线上性能？</li>
+<li>什么是 machine balance？它和 arithmetic intensity 如何共同判断
+memory-bound / compute-bound？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="6" type="1">
+<li>一个 13B 模型用 BF16 Adam 训练，按 16 bytes/param
+粗算参数状态需要多少显存？如果用 8 卡 FSDP
+均分，每卡参数状态约多少？</li>
+<li>某 70B BF16 推理模型 TP=2 部署在 2×80GB GPU 上，每卡权重约
+70GB。假设每卡还需要 5GB runtime/headroom，可用于 KV
+的显存还剩多少？这对 8K 上下文并发意味着什么？</li>
+<li>A100 80GB 的 machine balance 约 156 ops/byte，H100 SXM 约 295
+ops/byte。一个 AI=80 ops/byte 的 kernel
+在两张卡上都更接近哪类瓶颈？为什么换 H100 后提速可能不跟 TFLOPS
+成比例？</li>
+<li>一个训练任务 OOM，但 <code>allocated</code> 明显低于
+<code>reserved</code>。这可能说明什么？你会如何验证是否为碎片或 shape
+抖动？</li>
+<li>解释 FlashAttention
+为什么既可能降低显存，又可能提升速度。它减少的是哪些中间状态或内存往返？</li>
+</ol>
+<h3 id="开放题">开放题</h3>
+<ol start="11" type="1">
+<li>你的团队要上线一个长上下文客服模型，目标是 32K context、p95 TPOT
+&lt; 80ms、并发 64。请写出显存预算表和需要压测的指标。</li>
+<li>某供应商说“新 GPU BF16 算力是旧 GPU 的 3 倍，所以训练会快 3
+倍”。请用 roofline 组织一段反驳或验证计划。</li>
+<li>一个 70B 服务在白天高峰 OOM、夜间稳定。你会从请求长度分布、KV
+Cache、batching、allocator 和 admission control 哪些方向排查？</li>
+<li>对一个 HBM 带宽已接近上限的 decode 服务，列出 5
+个可能优化动作，并说明每个动作减少的是权重字节、KV
+字节、碎片，还是调度空洞。</li>
+<li>设计一次 profiler 实验，把 transformer step 中的 compute-bound GEMM
+和 memory-bound norm/optimizer
+分开测。你会采集哪些指标，如何判断优化是否有效？</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

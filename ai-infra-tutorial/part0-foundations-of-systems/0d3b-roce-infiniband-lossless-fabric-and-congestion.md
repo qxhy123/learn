@@ -155,13 +155,40 @@ PFC 是 IEEE 802.1Qbb Priority Flow Control。它允许接收端按 priority 发
 
 PFC 的副作用来自“暂停”这个动作本身。当一个下游端口拥塞，上游端口被 pause，上游再积压并 pause 更上游，拥塞可能沿 fabric 反向传播。如果多个业务共享 lossless priority，互不相关的流也会一起停，这就是 pause storm 和 head-of-line blocking 的根源。
 
-正确原则：
+### 8.1 PFC pause storm：自我强化与 fabric 死锁
+
+普通的"PFC 偶发"是健康的——burst 短时压制、ECN 来不及降速时，PFC 暂停几微秒后恢复。**真正的灾难是 pause storm**：
+
+1. 一个下游端口出现真实拥塞（如 incast、热点 spine、慢节点 GPU 处理 RDMA 不及时）→ 它向上游发 pause
+2. 上游入口 buffer 积压 → 上游也向**它的**上游发 pause
+3. 拥塞反向沿 fabric 传播；同 priority 的其他无关流也被一起暂停
+4. 在某些拓扑上（特别是非严格树形 + 循环路径），暂停信号绕回最初的拥塞点 → **pause loop / pause deadlock**：每个端口都在等其他端口先发数据，整个 priority 的所有流量永久卡死
+5. 表现：NCCL timeout、verbs retry exceeded、整个训练 job 全节点同时 hang，但 GPU 利用率显示 0%、链路 link state 仍然 UP
+
+### 8.2 PFC watchdog：必须配置的停损机制
+
+NIC 和交换机都提供 PFC watchdog 来检测异常持续的 pause 状态并强制恢复。**没有 watchdog 配置的 RoCE 集群会在 incast / 热点场景中遇到无法自愈的 fabric 死锁**。
+
+| 厂商 / 平台 | 配置位置 | 关键参数 | 触发后的动作 |
+|---|---|---|---|
+| Mellanox / NVIDIA NIC（mlx5） | `mlnx_qos`、`ethtool --show-priv-flags` | `pfc_stall_prevention` / `tx_pause_storm` | 进入 pfcdead 状态后丢弃该 priority 的发送队列直至恢复 |
+| Mellanox / NVIDIA Spectrum 交换机 | NOS（Cumulus / SONiC / NVOS） | `dcb pfc watchdog action drop`，`detection_time`、`restoration_time` | 检测到端口持续 pause 超阈值（如 200 ms）后，对该端口该 priority 临时切到 lossy（丢包），等待 `restoration_time` 后再尝试恢复 |
+| Arista / Cisco 等 | EOS / NX-OS | `priority-flow-control watch-dog action drop` | 同上 |
+| Broadcom Tomahawk-based 交换机 | SONiC / SAI | `pfcwd start` + `--detection-time --restoration-time --action drop` | SONiC 默认推荐打开 `pfcwd` |
+
+### 8.3 PFC 配置原则（含 watchdog）
 
 1. 只给真正需要 near-lossless 的 RDMA traffic class 开 PFC。
 2. 不要把所有 priority 都配置成 lossless。
 3. ECN 阈值应早于 PFC pause 阈值触发。
 4. PFC buffer 要按链路速率、线缆距离、pause reaction time 和 MTU 计算。
 5. 交换机 ingress/egress 队列水位要纳入变更验收。
+6. **PFC watchdog 必须开启**，`detection_time` 通常设 100-200 ms（足够覆盖正常 burst，又能快速止损死锁），`action=drop`（让该 priority 临时变 lossy 而不是永久死锁）。
+7. **NIC 侧也要开 `pfc_stall_prevention`**：交换机 watchdog 只解决"出方向"死锁，NIC 看到自己被 pause 长时间不释放也要能强制 drop。
+8. 监控 `ethtool -S <iface> | grep -i pause` 的 tx/rx pause counter 增量，以及 `pfcwd show stats` 的 storm-detected 事件——pause counter 持续上升或频繁 watchdog 触发是 fabric 设计或 incast 严重的信号。
+
+> [!DANGER]
+> **没有 PFC watchdog 的 RoCE 集群在生产 LLM 训练里几乎一定会出事**：MoE 的 All-to-All、checkpoint 大批量上传、跨 rail 流量不均都能在某些 ECMP hash 不幸时制造 pause loop。修复 deadlock 通常只能 reset 涉事端口或重启 NIC，整个训练 job 必须从最近 checkpoint 重启。把 watchdog 配置加入 fabric 上线 checklist，比追求"PFC counter 永远为零"更实际。
 
 ## 9. ECN、CNP 与 DCQCN
 

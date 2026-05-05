@@ -510,13 +510,22 @@ perf stat -e dTLB-loads,dTLB-load-misses -p <pid> -- sleep 10
 
 Transparent Huge Pages 会尝试把合适的 4 KiB 页合并成 2 MiB 页，或者在 fault 时直接分配 huge page。常见模式：
 
-| 模式 | 含义 | 适合 |
-|------|------|------|
-| `always` | 尽量自动使用 THP | 离线训练、批处理、大吞吐服务可测试 |
-| `madvise` | 只有应用标记区域才使用 THP | allocator 可控的大数组、arena |
-| `never` | 禁用 THP | 严格低延迟服务、内存碎片敏感环境 |
+| 模式 | 含义 | 适合 | 不适合 |
+|------|------|------|------|
+| `always` | 尽量自动使用 THP | 全量小型嵌入式 / 桌面工作负载 | **大内存 GPU 节点（≥128GB）、训练任务、推理服务、所有要求 P99 稳定的场景** |
+| `madvise` | 只有应用标记区域才使用 THP | **AI / 训练 / 推理生产节点的推荐默认值**：allocator、PyTorch arena、CUDA pinned 区域显式申请 | — |
+| `never` | 禁用 THP | 严格低延迟（≤ 1ms p99）服务、内存碎片极敏感环境 | 长期吞吐型批处理 |
 
 `defrag` 控制 THP 分配时是否做内存整理。内存 compaction 可能让单次分配或 page fault 等待更久，从而制造 p99/p999 延迟尖刺。
+
+> [!DANGER]
+> **不要在大内存 GPU 节点上盲目设 `always`。** 512GB+ 内存的训练/推理节点上，THP `always` 配合 `defrag=always` / `madvise` 模式时，`khugepaged` 后台合并 + page fault 路径上的 sync compaction 会触发 100ms-1s 量级的 stall，直接表现为 training step time 抖动、推理 P99 飙高。生产 AI 平台的实际经验：**默认 `madvise` + `defrag=defer+madvise` 是最安全的起点**，再由应用对明确的大连续区域显式 `madvise(MADV_HUGEPAGE)`。
+
+> [!WARNING]
+> **诊断 THP 引起的卡顿**：观察 `/proc/vmstat` 的 `compact_stall`、`compact_fail`、`thp_collapse_alloc_failed`、`thp_split_page` 计数随时间的增量；同时把 `khugepaged` 的 CPU 占用纳入监控。如果训练 step 延迟 spike 与 `compact_stall` 增长强相关，应立刻把 `enabled` 切到 `madvise`、`defrag` 切到 `defer+madvise` 或 `never`。
+
+> [!TIP]
+> **真正需要确定性大页的场景用 HugeTLB（`hugetlbfs`）而不是 THP**：`hugetlbfs` 由管理员预留固定数量的 2 MiB / 1 GiB 页，应用通过 `mmap(... MAP_HUGETLB)` 或 `shmget(... SHM_HUGETLB)` 显式申请。这条路径完全绕开 `khugepaged` 和 compaction，没有运行时合并/拆分的延迟尖峰。代价是预留的内存被永久 lock 住，不能再被普通 4 KiB 分配使用。
 
 ```bash
 cat /sys/kernel/mm/transparent_hugepage/enabled

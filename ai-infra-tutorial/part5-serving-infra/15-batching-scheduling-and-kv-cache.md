@@ -98,6 +98,21 @@ mindmap
 
 ## 本章导读
 
+### 概念先说清楚
+
+先把几个概念说清楚：
+
+| 概念 | 操作定义 | 解决的问题 |
+|------|----------|------------|
+| Batching | 把多个请求的计算合并到一次或少数几次 GPU forward 中 | 提高 GPU 利用率，摊薄 launch 和权重读取成本 |
+| Scheduling | 决定哪些请求、哪些 token、哪些 prefill chunk 在当前 step 执行 | 在吞吐、延迟、显存和公平性之间做实时取舍 |
+| KV Cache | 保存历史 token 在每层 attention 的 Key/Value 张量 | 避免每个 decode step 重算完整上下文 |
+| KV Block / Page | KV Cache 的固定大小物理分配单元 | 降低碎片，支持按需分配、共享和回收 |
+| Prefix Cache | 对相同前缀的 KV blocks 做复用 | 降低 TTFT，节省显存和 prefill 计算 |
+| Admission Control | 请求进入运行队列前的准入判断 | 避免系统接收明显无法按 SLO 完成的请求 |
+
+这几个词不是并列优化项，而是一条因果链：batching 让 GPU 不空等；scheduling 决定 batch 怎么组成；KV Cache 让 decode 不重算历史；block/page 让 KV 状态可管理；prefix cache 让共享前缀可复用；admission control 让调度器不会被无法完成的请求拖垮。
+
 一个容易被忽视的事实：**LLM 推理服务性能差异的 10 倍甚至 20 倍，往往不来自模型本身，而来自调度器**。
 
 这一点在 2023 年之后被反复验证：
@@ -293,9 +308,42 @@ $$
 | MHA（Multi-Head） | GPT-3、Llama 1 | 1x | 每个 head 独立 K/V |
 | MQA（Multi-Query） | Falcon、PaLM | ~1/N | 所有 head 共享一套 K/V |
 | GQA（Grouped-Query） | Llama 2/3、Mistral | ~1/G（典型 1/4 - 1/8） | 折中：每 G 个 head 共享 K/V |
-| MLA（Multi-Latent） | DeepSeek V2/V3 | ~1/10 以下 | 把 K/V 压到低维 latent |
+| MLA（Multi-Latent） | DeepSeek V2/V3、R1 | ~1/10 ~ 1/40 | 把 K/V 压到低维 latent，下面有专门公式 |
 
-从平台视角：**同一个模型参数量，MHA 和 MLA 的显存预算可能差 10 倍**。所以看一个模型"能不能上 128K 上下文"，不能只看参数量，要看 attention 实现。
+从平台视角：**同一个模型参数量，MHA 和 MLA 的显存预算可能差 10-40 倍**。所以看一个模型"能不能上 128K 上下文"，不能只看参数量，要看 attention 实现。
+
+> [!DANGER]
+> **MHA / GQA 的标准公式 `2 × L × n_kv_heads × d_head × dtype_bytes` 套到 MLA 上是错的。** MLA 不存独立的 K 和 V 头，而是把所有 head 压缩成一个共享的低维 latent vector，加上一小段单独的 RoPE 分量。直接套 MHA 公式（按 `n_kv_heads × d_head` 算）会高估 KV 占用 10-40 倍，导致副本数多配、admission 提前拒绝、容量规划严重偏差。**做 DeepSeek-V2/V3/R1 的容量规划必须用下面的 MLA 公式。**
+
+#### 15.3.2a MLA（Multi-Latent Attention）的 KV 显存公式
+
+DeepSeek 的 MLA 把每层每 token 的 KV 状态压缩为：
+
+- **共享 latent**（被所有 head 共用，推理时按需展开）：维度记为 `d_kv_latent`
+- **解耦的 RoPE 分量**：维度记为 `d_rope`（位置编码必须保留独立通道，不能压进 latent）
+
+DeepSeek-V2/V3/R1 的典型参数：`d_kv_latent = 512`，`d_rope = 64`。
+
+每 token 的 MLA KV 显存：
+
+$$
+M_{\text{mla\_kv/token}} = L \times (d_{\text{kv\_latent}} + d_{\text{rope}}) \times \text{dtype\_bytes}
+$$
+
+注意公式没有 `2 ×`（MHA 的 `2 ×` 是因为分别存 K 和 V，MLA 只存一份 latent 由推理时展开），也没有 `n_heads`（被全部 head 共享）。
+
+**对比示例（DeepSeek-V3，61 层，BF16）**：
+
+| 公式 | 每 token KV | 32K context 单请求 KV | 错误倍数 |
+|------|-------------|----------------------|---------|
+| 错误：套 MHA 公式（128 个 KV head × 128 d_head） | `2 × 61 × 128 × 128 × 2` ≈ 4 MB | ~128 GB | — |
+| 正确：MLA 公式（latent 512 + rope 64） | `61 × (512+64) × 2` ≈ 70 KB | ~2.3 GB | 高估约 56x |
+
+> [!NOTE]
+> **MLA 的工程含义**：DeepSeek-V3 这类 MLA 模型在 H100 80GB 上可以支撑非常长的 context 和高并发，KV 不再是显存瓶颈，反而 weights（670B 模型 BF16 = 1340GB，必须重 TP/PP/EP 切分）和激活（prefill 大 batch）成为新瓶颈。如果你延续 MHA/GQA 的容量直觉做 MLA 的部署，会浪费数倍 GPU 资源。
+
+> [!TIP]
+> **vLLM / SGLang / TRT-LLM 内部已经按 MLA 正确分配 KV block**——你不需要手写 kernel，但必须用正确的 KV 公式做容量规划，否则会反向"以小博大"按 GQA 配置选副本数，结果发现远低于实际能承载的 QPS。
 
 ### 15.3b Worked Example：LLaMA-70B 推理容量规划
 
@@ -602,6 +650,80 @@ V1 版本默认采用 recompute，因为：
 
 **一个容易被忽视的事实**：prefix cache 不仅是吞吐优化，还是**让 preemption 变便宜**的关键机制。
 
+### 15.5b Admission Control：先决定能不能进来
+
+调度器内部可以抢占、换出、重算，但这些动作都不是免费的。Admission control 的定义是：**在请求真正占用 GPU/KV 资源前，根据当前队列、显存、SLO、租户配额和请求预算，决定接收、排队、降级还是拒绝**。
+
+没有 admission control 的系统会出现一种典型事故：高峰期所有请求都被接收，队列越来越长，很多请求已经不可能在客户端超时前完成，但 GPU 仍在为它们计算。QPS 看起来高，goodput 反而下降。
+
+#### 15.5b.1 准入判断要看哪些量
+
+| 量 | 为什么重要 | 典型动作 |
+|----|------------|----------|
+| 输入 token 数 | 影响 prefill 时间和初始 KV 分配 | 超长请求进长上下文队列或拒绝 |
+| `max_tokens` / 预估输出 | 影响 decode 生命周期和 KV 增长 | 对低优先级租户下调 max_tokens |
+| 当前 queue time | 直接污染 TTFT | 超过预算返回 429/503 |
+| active sequences | 决定 decode batch 和 ITL | 达到上限后只允许高优先级进入 |
+| KV free blocks | 决定是否会 OOM 或 preempt | 低于阈值收紧 admission |
+| prefix cache hit 预测 | 命中高的请求成本更低 | 可给共享 prefix 请求更低准入成本 |
+| 租户优先级和剩余额度 | 防止 noisy neighbor | 低优先级排队或降级 |
+
+一个实用的 admission 伪代码：
+
+```text
+estimated_prefill_ms = f(input_tokens, prefix_hit)
+estimated_decode_ms = g(max_tokens, active_seqs, current_tpot)
+estimated_kv_blocks = blocks(input_tokens + max_tokens)
+
+if tenant_quota_exceeded:
+    reject_or_low_priority_queue()
+elif estimated_kv_blocks > free_blocks * safety_margin:
+    reject_or_reduce_max_tokens()
+elif queue_time_p95 + estimated_prefill_ms > ttft_budget:
+    reject_or_defer()
+elif estimated_decode_ms > output_budget:
+    reduce_max_tokens_or_route_to_slow_pool()
+else:
+    admit()
+```
+
+这不是要在 admission 阶段精确预测每个请求的完成时间，而是避免明显错误：明知排队已经 5 秒，还继续接收一个 TTFT SLO 为 800 ms 的聊天请求；明知 KV free blocks 只够 2K，还接收一个 32K prompt；明知某租户 burst 已经打满，还让它挤掉其他租户。
+
+#### 15.5b.2 Admission 的反模式
+
+| 反模式 | 现象 | 修复方向 |
+|--------|------|----------|
+| 只按 QPS 限流 | 100 个 100-token 请求和 100 个 32K 请求被视为一样 | 按 input/output tokens、KV blocks 和租户维度限流 |
+| 只在 gateway 限流 | gateway 不知道 GPU 队列和 KV 状态 | gateway 做粗限流，router/model server 回报实时容量 |
+| 接收后再慢慢排 | 客户端超时后服务端仍在生成 | admission 要考虑客户端 deadline，断连要取消 |
+| 用 GPU 利用率做唯一扩容信号 | 利用率高但 goodput 低 | autoscaler 同时看 queue、TTFT/TPOT、KV blocks |
+| 不区分长短请求 | 少量长上下文拖垮短聊天 | length bucket、专用池、chunked prefill |
+
+### 15.5c 公平性：吞吐最大化不等于服务可用
+
+公平性（fairness）的操作定义是：**在多租户、多长度、多优先级请求共享同一组 GPU 时，调度器不能让某一类请求长期得不到服务，也不能让低价值大请求无限挤占高价值短请求**。
+
+LLM serving 里的公平性比普通 Web 服务更难，因为请求成本差异极大。一个 32K prompt + 4K output 的请求，可能等价于几百个短问答。如果 FIFO 调度，它会拖慢所有后续请求；如果永远短请求优先，长请求可能饿死。
+
+| 策略 | 做法 | 优势 | 风险 |
+|------|------|------|------|
+| FIFO | 按到达顺序执行 | 简单，可解释 | 长请求 head-of-line blocking |
+| Shortest-job-first | 短 prompt / 短输出优先 | 降低平均延迟 | 长请求饥饿 |
+| Weighted fair queue | 按租户权重分配 token budget | 多租户隔离清晰 | 实现复杂，需要准确计量 |
+| Deadline-aware | 离 deadline 近的请求优先 | 更贴近 SLO | deadline 估算错误会反复抢占 |
+| Priority + quota | 高优先级可插队，但受预算约束 | 适合付费分层 | 配额配置不当会伤害普通流量 |
+
+实践中通常组合使用：gateway 做租户 quota，router 做 length bucket 和优先级，runtime 内部用 continuous batching 保持 GPU 满载。调度器不应只追求 raw tokens/s，而要追求 `SLO-satisfied tokens/s`。
+
+一个最小公平性 checklist：
+
+- 是否能按租户查看 TTFT/TPOT/P99 和 reject rate？
+- 是否能限制单租户同时占用的 active sequences 和 KV blocks？
+- 是否能给长上下文请求单独队列，而不是和短聊天 FIFO 混排？
+- 是否有请求 deadline，超时后能取消并释放 KV？
+- 是否记录 preemption 的被抢租户和请求类型，避免某类请求总被牺牲？
+- 是否有 aging 机制，让长请求等待太久后逐步提高优先级？
+
 ### 15.6 Prefill / Decode 解耦会怎样改写调度器
 
 一旦把 prefill 和 decode 分到不同资源池，调度器就不再只是"排一个队列"，而是变成两段 admission control：
@@ -719,7 +841,34 @@ PagedAttention 的思路类似操作系统分页：
 - 降低碎片
 - 更灵活地容纳不同长度请求
 
-#### 15.7.1 数字感受：PagedAttention 省了多少显存
+#### 15.7.1 KV Block / Page 的精确定义
+
+在 PagedAttention 语境里，**block/page** 可以理解为 KV Cache 的物理页。它通常包含一段固定 token 数的 KV，例如 `block_size=16` 表示一个 block 存 16 个 token 在所有层上的 K/V（实际布局由引擎决定）。请求看到的是逻辑 token 序列，runtime 看到的是 block table。
+
+```text
+Logical tokens of request R:
+  token 0 ... 15 | token 16 ... 31 | token 32 ... 47 | token 48 ...
+
+Block table:
+  R -> [physical_block_102, physical_block_17, physical_block_88, ...]
+
+Physical KV memory:
+  block_17  block_88  block_102  block_203 ...
+```
+
+这带来几个工程性质：
+
+| 性质 | 含义 | 影响 |
+|------|------|------|
+| 固定粒度分配 | KV 按 block 分配，不按请求最大长度一次性连续分配 | 减少外部碎片和过度预留 |
+| 逻辑连续、物理离散 | attention 通过 block table 找到对应 KV | runtime 需要高效查表和 kernel 支持 |
+| 引用计数 | prefix cache 共享的 block 可被多个请求引用 | 回收必须等所有引用释放 |
+| Copy-on-write | 共享 prefix 分叉后，新 token 分配新 block | prefix 共享不会污染其他请求 |
+| Eviction | block 不够时可驱逐低价值缓存 block | 驱逐策略影响 prefix hit 和 TTFT |
+
+`block_size` 不是越小越好。小 block 降低内部碎片，但 block table 更长、调度和查表开销更高；大 block 减少元数据开销，但最后一个 block 的浪费更明显，也会让短请求显存利用变差。多数引擎默认值已经比较稳，生产上更常调的是 `max_num_seqs`、`max_num_batched_tokens` 和显存利用上限，而不是 block size。
+
+#### 15.7.2 数字感受：PagedAttention 省了多少显存
 
 PagedAttention 论文和后续 vLLM 数据显示：**传统系统浪费 60-80% 的 KV Cache 显存，vLLM 把浪费降到 4% 以下**。
 
@@ -746,7 +895,7 @@ block table for C: [6]
 
 实际收益：**同样显存可以跑 3-5 倍更多的并发请求**。这就是 vLLM 为什么能在同样硬件上达到 24x 吞吐的核心原因之一。
 
-#### 15.7.2 Prefix Cache：PagedAttention 的"副产品"杀手锏
+#### 15.7.3 Prefix Cache：PagedAttention 的"副产品"杀手锏
 
 PagedAttention 有个意想不到的副产品：**不同请求可以共享 KV block**。
 
@@ -767,6 +916,21 @@ Req B: "You are a helpful assistant. <user: capital of France?>"
 根据 vLLM V1 的数据：**prefix cache 命中时 TTFT 降到近零；即使零命中，也几乎没有吞吐损失（<1%）**。
 
 对平台工程的启示：**prefix cache 应该默认开启**，没有理由不开。但要配合 prefix-aware 路由（见 [第14章](14-online-inference-architecture.md) §14.3.1），否则命中率会被随机路由拉低。
+
+#### 15.7.4 Prefix Cache 的失效条件
+
+Prefix cache 的定义听起来简单，但线上命中率经常低于预期。原因通常不是引擎没开，而是"看起来相同"的 prompt 在 token 层并不相同。
+
+| 失效原因 | 例子 | 排查方式 |
+|----------|------|----------|
+| 模板有动态字段 | system prompt 里拼了时间、request id、用户名 | 对 prefix 做 token hash，比较首个不同 token |
+| tokenizer / special token 不一致 | canary 版本 tokenizer 配置变化 | 记录 tokenizer version 和 prompt hash |
+| 消息顺序不稳定 | tool schema、few-shot 示例顺序随机 | 固定序列化顺序，做 canonicalization |
+| 路由随机 | 同 prefix 被打散到不同副本 | prefix-aware 或 session-aware routing |
+| cache 容量不足 | 热 prefix 被长请求挤出 | 观测 eviction、按 prefix 统计 hit/miss |
+| 多租户隔离 | 出于隐私不能跨租户共享 | 在租户内共享，公共模板单独标记 |
+
+工程上建议同时记录两个 hash：`raw_prompt_hash` 和 `token_prefix_hash`。前者用于业务排查，后者用于解释为什么 cache miss。真正决定 KV 复用的是 token 序列一致，而不是字符串看起来相似。
 
 ### 15.7b Chunked Prefill：一个被低估的关键优化
 
@@ -940,7 +1104,59 @@ MoE 模型并不是简单把 dense 模型做大，而是把调度问题进一步
 
 **一个实用经验**：多模态服务上线前，专门看一下"图像 token 占比"对资源的影响。一张高分辨率图可以轻易展开成 1000-4000 个 token，等价于一段很长的文本 prompt，但用户不会意识到这一点。
 
-### 15.12 工程建议
+### 15.12 OOM、碎片与尾延迟排障
+
+LLM 调度排障要先分清三类问题：**算不动、放不下、排不好**。算不动通常表现为 prefill/decode step 变慢；放不下表现为 OOM、preemption、swap、KV free blocks 下降；排不好表现为 P99 抖动、某些租户饥饿、goodput 下降。
+
+#### 15.12.1 故障信号映射表
+
+| 现象 | 优先指标 | 可能根因 | 处理动作 |
+|------|----------|----------|----------|
+| CUDA OOM 或 worker 重启 | KV usage、free blocks、max context、active seqs | admission 过松、长上下文突增、显存利用上限太高 | 降 `gpu_memory_utilization`、收紧长请求、降低 `max_num_seqs` |
+| OOM 前 preemption 暴涨 | `preemption_total`、recompute time、prefix hit | KV blocks 不够但系统还在接请求 | 收紧 admission、提高副本数、限制 max_tokens |
+| KV block utilization 低但 OOM | allocator reserved、碎片、非 KV workspace | runtime workspace 或 CUDA graph 占用被低估 | 降显存利用上限、减少 graph 形状、检查 engine 配置 |
+| Prefix hit 下降后 TTFT 升高 | prefix hit/miss by route、eviction | 路由打散、模板动态字段、cache 被挤出 | 恢复 prefix-aware、固定模板、扩大 cache 或分池 |
+| TTFT P99 高，decode 正常 | prefill queue、input length bucket、chunk size | 长 prompt head-of-line blocking | 开 chunked prefill、长短分流、P/D 解耦 |
+| ITL P99 抖，TPOT 平均正常 | decode step histogram、active seqs、stream flush | decode batch 过大、preemption、gateway buffering | 降 active seq 上限、减少抢占、检查 flush |
+| 高吞吐但 goodput 低 | SLO miss、queue time、deadline miss | batch 过大或超时请求仍在跑 | 以 deadline 做 admission，取消过期请求 |
+| 某租户 P99 特别差 | per-tenant queue、quota、preemption victim | noisy neighbor 或低优先级长期被抢 | weighted fair queue、租户级 KV/seq 限额 |
+
+#### 15.12.2 OOM 排查顺序
+
+1. 看 OOM 前 5-10 分钟的 `active_seqs`、input/output token 分布、KV free blocks 和 preemption。
+2. 确认是否有发布或参数变更：`max_num_seqs`、`max_num_batched_tokens`、`gpu_memory_utilization`、context length、CUDA graph 配置。
+3. 按租户和长度桶找突增来源，不要只看全局 QPS。
+4. 区分 KV OOM 和非 KV OOM：如果 KV blocks 仍有余量，问题可能在 workspace、graph、通信 buffer、LoRA adapter 或多模态 encoder。
+5. 临时止血优先级：降低 admission、限制 max_tokens、把长上下文切到专用池、降低 `max_num_seqs`，最后才重启 worker。
+
+#### 15.12.3 碎片和 block 浪费怎么判断
+
+PagedAttention 能显著降低碎片，但不是让碎片消失。你需要看：
+
+| 指标 | 解释 | 异常含义 |
+|------|------|----------|
+| `allocated_blocks` | 已分配 KV blocks | 持续上升可能有泄漏或未取消断连请求 |
+| `free_blocks` | 可用 KV blocks | 接近 0 会触发 preemption/OOM |
+| `block_utilization` | block 内实际 token 占比 | 低说明短请求多或 block size 不合适 |
+| `evicted_prefix_blocks` | prefix cache 被驱逐数量 | 高说明缓存容量或路由策略有问题 |
+| `shared_blocks_ratio` | 被多请求引用的 block 比例 | 低说明 prefix cache 没发挥 |
+
+如果 `free_blocks` 周期性掉到很低再恢复，通常是流量尖峰或长输出批次；如果只掉不回升，优先查断连取消、异常请求清理、引用计数和 worker bug。
+
+#### 15.12.4 调参 Checklist
+
+上线前至少跑三组压测：短 prompt 短输出、长 prompt 短输出、短 prompt 长输出。每组都要记录 TTFT、ITL、TPOT、goodput、KV blocks、preemption 和 prefix hit。
+
+| 步骤 | 调什么 | 看什么 | 停止条件 |
+|------|--------|--------|----------|
+| 1 | 开启 prefix cache 和 chunked prefill | prefix hit、TTFT、ITL | 基础优化稳定 |
+| 2 | 调 `max_num_seqs` | TPOT/ITL P99、active seqs | P99 不再满足前回退 |
+| 3 | 调 `max_num_batched_tokens` | prefill throughput、TTFT | 长 prompt 不再拖 decode |
+| 4 | 调 admission 阈值 | reject rate、goodput、queue time | goodput 达峰而非 raw QPS 达峰 |
+| 5 | 调租户权重 | per-tenant P99、preemption victim | 低优先级不饥饿，高优先级满足 SLO |
+| 6 | 压测故障模式 | OOM、断连、下游慢、canary | 降级和取消能按预期触发 |
+
+### 15.13 工程建议
 
 #### 必选项（几乎总是开）
 
@@ -985,7 +1201,7 @@ MoE 模型并不是简单把 dense 模型做大，而是把调度问题进一步
 | 压测 | GenAI-Perf、guidellm、Locust | 适合模拟不同输入长度与并发 |
 | 调度器可视化 | vLLM Prometheus metrics、SGLang metrics | 看 preemption 次数、KV 占用、prefix hit |
 
-### 15.13 常见误区
+### 15.14 常见误区
 
 #### 误区一：LLM 推理优化就是换一个更快算子
 

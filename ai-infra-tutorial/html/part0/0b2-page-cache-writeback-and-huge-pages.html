@@ -832,36 +832,18 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href=
 <p>Transparent Huge Pages 会尝试把合适的 4 KiB 页合并成 2 MiB 页，或者在
 fault 时直接分配 huge page。常见模式：</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
-<tr>
-<th>模式</th>
-<th>含义</th>
-<th>适合</th>
-</tr>
+<tr><th>模式</th><th>含义</th><th>适合</th><th>不适合</th></tr>
 </thead>
 <tbody>
-<tr>
-<td><code>always</code></td>
-<td>尽量自动使用 THP</td>
-<td>离线训练、批处理、大吞吐服务可测试</td>
-</tr>
-<tr>
-<td><code>madvise</code></td>
-<td>只有应用标记区域才使用 THP</td>
-<td>allocator 可控的大数组、arena</td>
-</tr>
-<tr>
-<td><code>never</code></td>
-<td>禁用 THP</td>
-<td>严格低延迟服务、内存碎片敏感环境</td>
-</tr>
+<tr><td><code>always</code></td><td>尽量自动使用 THP</td><td>全量小型嵌入式 / 桌面工作负载</td><td><strong>大内存 GPU 节点（≥128GB）、训练任务、推理服务、所有要求 P99 稳定的场景</strong></td></tr>
+<tr><td><code>madvise</code></td><td>只有应用标记区域才使用 THP</td><td><strong>AI / 训练 / 推理生产节点的推荐默认值</strong>：allocator、PyTorch arena、CUDA pinned 区域显式申请</td><td>—</td></tr>
+<tr><td><code>never</code></td><td>禁用 THP</td><td>严格低延迟（≤ 1ms p99）服务、内存碎片极敏感环境</td><td>长期吞吐型批处理</td></tr>
 </tbody>
 </table>
+<div class="danger"><strong>不要在大内存 GPU 节点上盲目设 <code>always</code>。</strong> 512GB+ 内存的训练/推理节点上，THP <code>always</code> 配合 <code>defrag=always</code> / <code>madvise</code> 模式时，<code>khugepaged</code> 后台合并 + page fault 路径上的 sync compaction 会触发 100ms-1s 量级的 stall，直接表现为 training step time 抖动、推理 P99 飙高。生产 AI 平台的实际经验：<strong>默认 <code>madvise</code> + <code>defrag=defer+madvise</code> 是最安全的起点</strong>，再由应用对明确的大连续区域显式 <code>madvise(MADV_HUGEPAGE)</code>。</div>
+<div class="warn"><strong>诊断 THP 引起的卡顿：</strong>观察 <code>/proc/vmstat</code> 的 <code>compact_stall</code>、<code>compact_fail</code>、<code>thp_collapse_alloc_failed</code>、<code>thp_split_page</code> 计数随时间的增量；同时把 <code>khugepaged</code> 的 CPU 占用纳入监控。如果训练 step 延迟 spike 与 <code>compact_stall</code> 增长强相关，应立刻把 <code>enabled</code> 切到 <code>madvise</code>、<code>defrag</code> 切到 <code>defer+madvise</code> 或 <code>never</code>。</div>
+<div class="success"><strong>真正需要确定性大页的场景用 HugeTLB（<code>hugetlbfs</code>）而不是 THP：</strong><code>hugetlbfs</code> 由管理员预留固定数量的 2 MiB / 1 GiB 页，应用通过 <code>mmap(... MAP_HUGETLB)</code> 或 <code>shmget(... SHM_HUGETLB)</code> 显式申请。这条路径完全绕开 <code>khugepaged</code> 和 compaction，没有运行时合并/拆分的延迟尖峰。代价是预留的内存被永久 lock 住，不能再被普通 4 KiB 分配使用。</div>
 <p><code>defrag</code> 控制 THP 分配时是否做内存整理。内存 compaction
 可能让单次分配或 page fault 等待更久，从而制造 p99/p999 延迟尖刺。</p>
 <div class="sourceCode" id="cb26"><pre

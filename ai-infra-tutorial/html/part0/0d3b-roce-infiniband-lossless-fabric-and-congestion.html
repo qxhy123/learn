@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d3b 章 · RoCE/InfiniBand、无损网络与拥塞控制 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d3b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d3b 章 · RoCE/InfiniBand、无损网络与拥塞控制</h1>
+<p class="sub">讲清 RDMA packet 如何跑在 RoCE 或 InfiniBand fabric 上，以及 PFC/ECN/DCQCN 如何影响训练。</p>
+<div class="chips"><span class="chip">RoCE</span><span class="chip">InfiniBand</span><span class="chip">PFC</span><span class="chip">ECN</span><span class="chip">DCQCN</span><span class="chip">MTU</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#roce-infiniband-到底是什么">1. RoCE / InfiniBand 到底是什么</a></li><li><a class="anchor" href="#第一性原理拆解-学习大纲">2. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#rdma-fabric-的数据面与控制面">3. RDMA Fabric 的数据面与控制面</a></li><li><a class="anchor" href="#roce-v1roce-v2-与-infiniband-总览">4. RoCE v1、RoCE v2 与 InfiniBand 总览</a></li><li><a class="anchor" href="#roce-v2-packet从-verbs-到以太网">5. RoCE v2 Packet：从 Verbs 到以太网</a></li><li><a class="anchor" href="#gid-与-gid-index">6. GID 与 GID Index</a></li><li><a class="anchor" href="#vlandscppcppriority">7. VLAN、DSCP、PCP、Priority</a></li><li><a class="anchor" href="#pfc按优先级暂停不是全局可靠性">8. PFC：按优先级暂停，不是全局可靠性</a></li><li><a class="anchor" href="#ecncnp-与-dcqcn">9. ECN、CNP 与 DCQCN</a></li><li><a class="anchor" href="#lossless-不是越多越好">10. Lossless 不是越多越好</a></li><li><a class="anchor" href="#mtu-与-path-mtu">11. MTU 与 Path MTU</a></li><li><a class="anchor" href="#ecmphash-与路径极化">12. ECMP、Hash 与路径极化</a></li><li><a class="anchor" href="#incastbuffer-与-hol-blocking">13. Incast、Buffer 与 HOL Blocking</a></li><li><a class="anchor" href="#infiniband-fabric-核心对象">14. InfiniBand Fabric 核心对象</a></li><li><a class="anchor" href="#subnet-managerlid-与路由">15. Subnet Manager、LID 与路由</a></li><li><a class="anchor" href="#pkeysl-与-vl">16. PKey、SL 与 VL</a></li><li><a class="anchor" href="#ib-link-widthspeed-与-mtu">17. IB Link Width、Speed 与 MTU</a></li><li><a class="anchor" href="#命令观测主机侧最小证据包">18. 命令观测：主机侧最小证据包</a></li><li><a class="anchor" href="#ethtool--s-与-roce-counter-读法">19. ethtool -S 与 RoCE Counter 读法</a></li><li><a class="anchor" href="#perfquery-与-ib-counter-读法">20. perfquery 与 IB Counter 读法</a></li><li><a class="anchor" href="#worked-examplegid-index-选错">21. Worked Example：GID Index 选错</a></li><li><a class="anchor" href="#worked-examplepfc-pause-storm-与-ecn-太晚">22. Worked Example：PFC Pause Storm 与 ECN 太晚</a></li><li><a class="anchor" href="#worked-exampleib-smpkeylid-与-mtu-不一致">23. Worked Example：IB SM、PKey、LID 与 MTU 不一致</a></li><li><a class="anchor" href="#roce-变更-sop">24. RoCE 变更 SOP</a></li><li><a class="anchor" href="#ib-变更-sop">25. IB 变更 SOP</a></li><li><a class="anchor" href="#故障排查-checklist">26. 故障排查 Checklist</a></li><li><a class="anchor" href="#练习">27. 练习</a></li><li><a class="anchor" href="#本章结论">28. 本章结论</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 0d3 的网络 fabric 专章。RDMA
+verbs、MR/QP/CQ 的基础语义见 <a
+href="0d3-rdma-roce-infiniband-and-gpudirect.html">0d3</a>，Linux
+TCP/MTU 见 <a
+href="0d1-linux-network-stack-tcp-and-mtu.html">0d1</a>，NIC
+queue/offload 见 <a
+href="0d2-nic-offload-queues-and-service-network-io.html">0d2</a>，NCCL
+端到端诊断见 <a
+href="0d4-nccl-collectives-and-network-diagnostics.html">0d4</a>。</p>
+</blockquote>
+<h2 id="roce-infiniband-到底是什么">1. RoCE / InfiniBand 到底是什么</h2>
+<p>RDMA 规定了应用、内存注册、队列和 NIC 如何协作，但 RDMA packet
+还需要一张网络把两端 HCA 连起来。<strong>RoCE 和 InfiniBand 解决的就是
+RDMA 数据包跑在什么 fabric 上，以及这张 fabric
+如何寻址、路由、隔离和处理拥塞。</strong></p>
+<p>InfiniBand 是专用 RDMA fabric。它有自己的链路层、Subnet
+Manager、LID、PKey、SL/VL、链路宽度、速率和管理工具。它的优点是 RDMA
+语义和运维边界集中，HPC/AI 训练中常见；代价是需要专用交换机、线缆和 IB
+运维知识。</p>
+<p>RoCE 是 RDMA over Converged Ethernet。RoCE v2 把 RDMA 封装在 UDP/IP
+上，跑在以太网和 L3 网络中。它的优点是复用以太网生态、IP
+路由、spine-leaf 和现有交换机体系；代价是以太网天然会丢包和排队，而 RDMA
+对丢包和尾延迟非常敏感，所以必须正确配置
+priority、PFC、ECN、CNP、DCQCN、MTU 和 ECMP。</p>
+<p>最小对比：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>问题</th>
+<th>InfiniBand 的答案</th>
+<th>RoCE v2 的答案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>承载</td>
+<td>IB 专用链路/fabric</td>
+<td>UDP/IP over Ethernet</td>
+</tr>
+<tr>
+<td>寻址</td>
+<td>LID、GID、PKey</td>
+<td>IP、GID/GID index、VLAN</td>
+</tr>
+<tr>
+<td>管理平面</td>
+<td>Subnet Manager、SA、IB tools</td>
+<td>Linux netdev、IP route、switch QoS</td>
+</tr>
+<tr>
+<td>拥塞/无损</td>
+<td>IB credit、VL/SL、IB 拥塞控制</td>
+<td>PFC、ECN、CNP、DCQCN</td>
+</tr>
+<tr>
+<td>常见错误</td>
+<td>SM、LID、PKey、link width/speed</td>
+<td>GID index、MTU、DSCP/PCP、PFC/ECN</td>
+</tr>
+</tbody>
+</table>
+<p>因此，本章不是重复 RDMA verbs，也不是讲 GPU。它专门回答：<strong>RDMA
+packet 在网络里怎么走，为什么会因为 MTU、GID、PFC、ECN、SM 或 PKey
+配错而 timeout、retry 或拖慢 NCCL。</strong></p>
+<h2 id="第一性原理拆解-学习大纲">2. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>RDMA 把数据面从内核协议栈和对端 CPU 中移走，让 NIC
+直接执行远端内存访问。这带来一个不可化简的问题：<strong>当传输栈不再依赖
+TCP 的逐流丢包恢复，fabric
+必须怎样承载、寻址、路由、隔离、拥塞反馈和观测，才能让大规模 GPU
+训练里的 RDMA 流量既快又不把网络拖入全局暂停？</strong></p>
+<p>RoCE v2 和 InfiniBand 都能承载 RDMA，但责任边界不同。RoCE v2
+复用以太网、IP、UDP、VLAN、DSCP、ECMP 和交换机队列；InfiniBand 使用专用
+fabric、Subnet Manager、LID、PKey、SL/VL 和 IB
+管理工具。因此排障不能只问“RDMA 通不通”，必须问：这个 QP 用什么
+GID、什么优先级、什么
+MTU、什么路径、什么拥塞反馈、什么隔离域、什么管理平面。</p>
+<h3 id="推-从目标推出机制">推 — 从目标推出机制</h3>
+<p>从“RDMA 不能像 TCP 一样靠大量丢包后恢复”推出 lossless 或
+near-lossless fabric；从“以太网本身可能丢包”推出 RoCE 的
+PFC、ECN、CNP、DCQCN 组合；从“PFC 会暂停链路”推出只对少数 RDMA priority
+开启 PFC，而不是全网全优先级无损；从“拥塞要在丢包前反馈”推出交换机 ECN
+标记、接收端 CNP 生成、发送端 DCQCN 降速。</p>
+<p>从“RoCE v2 是 UDP/IP”推出 GID index、VLAN、DSCP、PCP、routing、ECMP
+hash、path MTU 都是数据面的一部分；从“InfiniBand 是专用 fabric”推出 SM
+分配 LID、维护路由、管理 PKey、暴露链路宽度/速率和 fabric
+counter；从“训练流量是 incast 和同步 burst”推出要关注
+buffer、队列水位、HOL blocking、ECMP 极化和 pause storm。</p>
+<h3 id="绘-roce-v2-拥塞反馈链路">绘 — RoCE v2 拥塞反馈链路</h3>
+<pre class="mermaid">sequenceDiagram
+  participant S as Sender HCA
+  participant L as Leaf Switch
+  participant R as Receiver HCA
+  participant C as Congestion Control
+  S->>L: RoCE v2 UDP/IP packet with DSCP/PCP
+  L->>L: queue grows beyond ECN threshold
+  L-->>R: forward packet with ECN mark
+  R-->>S: CNP packet back to sender
+  S->>C: DCQCN decreases injection rate
+  C-->>S: additive/hyper increase after recovery
+  L-->>S: PFC pause only if lossless queue crosses pause threshold</pre>
+<h3 id="导-本章读完后你应该能回答">导 — 本章读完后你应该能回答</h3>
+<ol type="1">
+<li>RoCE v1、RoCE v2 和 InfiniBand
+在承载、寻址、路由、管理平面上分别差在哪里？</li>
+<li>GID、GID index、RoCE v2 UDP/IP、VLAN、DSCP、PCP、priority
+如何共同决定一条 RDMA 流的网络行为？</li>
+<li>PFC、ECN、CNP、DCQCN 的工作链路是什么，为什么 lossless
+不是越多越好？</li>
+<li>MTU、path MTU、ECMP hash、incast、buffer、head-of-line blocking
+如何把小错误放大成训练 timeout？</li>
+<li>InfiniBand 中 SM、LID、PKey、SL、VL、link width/speed
+分别解决什么问题？</li>
+<li>如何用
+<code>show_gids</code>、<code>ibv_devinfo</code>、<code>rdma link</code>、<code>ip -d link</code>、<code>ethtool -S</code>、<code>perfquery</code>、<code>ibstat</code>、<code>iblinkinfo</code>、<code>ibnetdiscover</code>、<code>sminfo</code>
+建立证据链？</li>
+<li>RoCE/IB 变更如何设计 SOP，避免一次调参把更大范围的 fabric
+带入风险？</li>
+</ol>
+<h2 id="rdma-fabric-的数据面与控制面">3. RDMA Fabric
+的数据面与控制面</h2>
+<p>RDMA fabric 可以分成四层：端口与链路、寻址与路径、隔离与
+QoS、拥塞反馈。第一层包括 HCA
+端口、交换机端口、线缆、FEC、链路速率、链路宽度、MTU；第二层在 RoCE 中是
+GID/IP/VLAN/ECMP，在 IB 中是 LID/SL/VL/SM 路由；第三层在 RoCE 中是
+VLAN、PCP、DSCP、TC、priority、PFC，在 IB 中是 PKey、SL、VL；第四层在
+RoCE 中主要是 PFC、ECN、CNP、DCQCN，在 IB 中是 credit、VL/SL、IB
+congestion control 和 fabric counter。</p>
+<p>训练网络最常见的误判是把这四层混在一起。例如 <code>ibv_devinfo</code>
+显示端口 <code>PORT_ACTIVE</code> 只说明 HCA 端口起来了，不说明 GID
+index 正确，不说明 DSCP 被交换机映射到 RDMA priority，不说明 ECN 早于
+PFC，也不说明 ECMP 没有热点。</p>
+<h2 id="roce-v1roce-v2-与-infiniband-总览">4. RoCE v1、RoCE v2 与
+InfiniBand 总览</h2>
+<p>RoCE v1 是二层以太网封装，通常局限在同一个 L2 broadcast domain。RoCE
+v2 是 UDP/IP 封装，能够经过 L3 路由，适合 spine-leaf 以太网
+fabric。InfiniBand 不是以太网封装，而是专用链路层和管理平面。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>维度</th>
+<th>RoCE v1</th>
+<th>RoCE v2</th>
+<th>InfiniBand</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>承载</td>
+<td>Ethernet L2</td>
+<td>UDP/IP over Ethernet</td>
+<td>IB link/fabric</td>
+</tr>
+<tr>
+<td>路由范围</td>
+<td>L2 域内</td>
+<td>L3 可路由</td>
+<td>IB subnet 内由 SM 管理</td>
+</tr>
+<tr>
+<td>关键地址</td>
+<td>MAC、GID</td>
+<td>IP、UDP、GID</td>
+<td>LID、GID、PKey</td>
+</tr>
+<tr>
+<td>管理平面</td>
+<td>以太网/VLAN/交换机配置</td>
+<td>IP routing、QoS、ECMP、交换机配置</td>
+<td>Subnet Manager、SA、IB tools</td>
+</tr>
+<tr>
+<td>拥塞控制</td>
+<td>PFC 为主</td>
+<td>PFC、ECN、CNP、DCQCN</td>
+<td>credit、VL/SL、IB congestion control</td>
+</tr>
+<tr>
+<td>常见风险</td>
+<td>L2 范围和 VLAN</td>
+<td>GID index、DSCP/PCP、ECMP、ECN</td>
+<td>SM、LID、PKey、链路质量</td>
+</tr>
+</tbody>
+</table>
+<p>RoCE v2 的优点是利用以太网运维体系，代价是配置面更宽：Linux
+netdev、VLAN、ToS、DSCP、switch QoS、PFC、ECN、routing、ECMP、NIC
+profile 都会影响 RDMA。InfiniBand 的优点是 RDMA fabric
+语义集中，代价是需要理解 IB 管理域：SM 是否唯一且稳定、PKey
+是否一致、LID 是否分配、link width/speed 是否符合预期、VL/SL
+映射是否合理。</p>
+<h2 id="roce-v2-packet从-verbs-到以太网">5. RoCE v2 Packet：从 Verbs
+到以太网</h2>
+<p>应用提交 verbs WR 时，看到的是 QP、remote QPN、remote
+address、rkey、AH 或连接参数。落到 RoCE v2
+数据面时，包会成为以太网帧里的 IP/UDP/RoCE payload。</p>
+<pre class="text"><code>verbs WR
+  -&gt; HCA QP context
+  -&gt; RoCE BTH/RETH/AETH payload
+  -&gt; UDP destination port 4791
+  -&gt; IPv4/IPv6 source/destination address
+  -&gt; DSCP/ECN bits
+  -&gt; Ethernet VLAN tag and PCP
+  -&gt; switch queue, PFC, ECN, ECMP</code></pre>
+<p>GID index 不是装饰项。它选择的是本地 HCA 端口上的某个 GID 表项。不同
+GID 表项可能对应 IPv4-mapped IPv6、IPv6、不同 VLAN、不同 RoCE
+version、不同 netdev。NCCL、UCX、MPI 或自写 verbs 程序如果选错 GID
+index，QP 可能能建起来，但包走到错误 VLAN、错误源 IP、错误 priority
+或不可达路径。</p>
+<h2 id="gid-与-gid-index">6. GID 与 GID Index</h2>
+<p>GID 是 128-bit 地址标识，在 RoCE 中通常由 IP
+地址映射而来。<code>show_gids</code> 会列出每个 HCA 端口的 GID
+表，关键是同时看设备、端口、index、GID、IP、RoCE version 和 netdev。</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>排障价值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DEV</td>
+<td>HCA 设备，如 <code>mlx5_0</code></td>
+<td>确认 NCCL/UCX 选的 HCA</td>
+</tr>
+<tr>
+<td>PORT</td>
+<td>HCA 端口</td>
+<td>多端口卡容易混淆</td>
+</tr>
+<tr>
+<td>INDEX</td>
+<td>GID index</td>
+<td>应用配置常用这个数字</td>
+</tr>
+<tr>
+<td>GID</td>
+<td>128-bit GID</td>
+<td>可识别 IPv4-mapped 地址</td>
+</tr>
+<tr>
+<td>IPv4</td>
+<td>对应 IPv4</td>
+<td>确认源 IP/VLAN</td>
+</tr>
+<tr>
+<td>VER</td>
+<td>RoCE v1/v2</td>
+<td>v1/v2 不匹配会失败</td>
+</tr>
+<tr>
+<td>NETDEV</td>
+<td>Linux netdev</td>
+<td>对应 <code>ibdev2netdev</code> 和 <code>ip link</code></td>
+</tr>
+</tbody>
+</table>
+<p>常见判断命令：</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">show_gids</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibdev2netdev</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">rdma</span> link show</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-br</span> addr</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-d</span> link show <span class="op">&lt;</span>iface<span class="op">&gt;</span></span></code></pre></div>
+<p>如果训练使用 <code>NCCL_IB_GID_INDEX=3</code>，不要只确认“3
+存在”。要确认 index 3 在所有节点上都对应同一个 RoCE version、同一业务
+VLAN、同一地址族和同一 routing domain。集群中不同镜像、不同固件、不同
+netplan 或不同 VLAN 子接口顺序，可能让同一个 index
+在不同机器上含义不同。</p>
+<h2 id="vlandscppcppriority">7. VLAN、DSCP、PCP、Priority</h2>
+<p>RoCE 里的“优先级”不是单个字段。应用或 RDMA CM 可能设置 ToS/traffic
+class；IP 头里有 DSCP 和 ECN bits；以太网 VLAN tag 里有 PCP；交换机会把
+DSCP/PCP 映射到内部 traffic class 或 priority group；NIC 会把 priority
+映射到 PFC-enabled 队列、DCQCN profile 或 ETS bandwidth group。</p>
+<pre class="text"><code>Application ToS / rdma_cm traffic_class
+  -&gt; IP DSCP + ECN capable transport bits
+  -&gt; switch DSCP-to-TC map
+  -&gt; egress queue / priority group
+  -&gt; optional VLAN PCP rewrite
+  -&gt; NIC priority / PFC / CNP handling</code></pre>
+<p>典型风险：</p>
+<ol type="1">
+<li>主机打了 DSCP，交换机没有 trust DSCP，包进了 default queue。</li>
+<li>交换机 trust PCP，但主机没有 VLAN tag，PCP 不存在。</li>
+<li>RDMA priority 开了 PFC，返回 CNP 的 priority
+没配对，反馈被普通队列拥塞。</li>
+<li>不同 leaf 的 DSCP-to-queue 映射不同，同一 job 跨 rack
+后行为不一致。</li>
+<li>管理流量、存储流量和 RDMA 流量共享同一 lossless
+priority，局部拥塞传播范围扩大。</li>
+</ol>
+<h2 id="pfc按优先级暂停不是全局可靠性">8.
+PFC：按优先级暂停，不是全局可靠性</h2>
+<p>PFC 是 IEEE 802.1Qbb Priority Flow Control。它允许接收端按 priority
+发 pause frame，让对端停止发送该 priority 的流量。PFC
+的目标不是提高吞吐，而是在短时 buffer 压力下避免 lossless priority
+丢包。它是逐跳机制，不是端到端拥塞控制。</p>
+<p>PFC 的副作用来自“暂停”这个动作本身。当一个下游端口拥塞，上游端口被
+pause，上游再积压并 pause 更上游，拥塞可能沿 fabric
+反向传播。如果多个业务共享 lossless
+priority，互不相关的流也会一起停，这就是 pause storm 和 head-of-line
+blocking 的根源。</p>
+<h3 id="81-pfc-pause-storm">8.1 PFC pause storm：自我强化与 fabric 死锁</h3>
+<p>普通的"PFC 偶发"是健康的——burst 短时压制、ECN 来不及降速时，PFC 暂停几微秒后恢复。<strong>真正的灾难是 pause storm</strong>：</p>
+<ol>
+<li>一个下游端口出现真实拥塞（如 incast、热点 spine、慢节点 GPU 处理 RDMA 不及时）→ 它向上游发 pause</li>
+<li>上游入口 buffer 积压 → 上游也向<strong>它的</strong>上游发 pause</li>
+<li>拥塞反向沿 fabric 传播；同 priority 的其他无关流也被一起暂停</li>
+<li>在某些拓扑上（特别是非严格树形 + 循环路径），暂停信号绕回最初的拥塞点 → <strong>pause loop / pause deadlock</strong>：每个端口都在等其他端口先发数据，整个 priority 的所有流量永久卡死</li>
+<li>表现：NCCL timeout、verbs retry exceeded、整个训练 job 全节点同时 hang，但 GPU 利用率显示 0%、链路 link state 仍然 UP</li>
+</ol>
+
+<h3 id="82-pfc-watchdog">8.2 PFC watchdog：必须配置的停损机制</h3>
+<p>NIC 和交换机都提供 PFC watchdog 来检测异常持续的 pause 状态并强制恢复。<strong>没有 watchdog 配置的 RoCE 集群会在 incast / 热点场景中遇到无法自愈的 fabric 死锁</strong>。</p>
+<table>
+<thead>
+<tr><th>厂商 / 平台</th><th>配置位置</th><th>关键参数</th><th>触发后的动作</th></tr>
+</thead>
+<tbody>
+<tr><td>Mellanox / NVIDIA NIC（mlx5）</td><td><code>mlnx_qos</code>、<code>ethtool --show-priv-flags</code></td><td><code>pfc_stall_prevention</code> / <code>tx_pause_storm</code></td><td>进入 pfcdead 状态后丢弃该 priority 的发送队列直至恢复</td></tr>
+<tr><td>Mellanox / NVIDIA Spectrum 交换机</td><td>NOS（Cumulus / SONiC / NVOS）</td><td><code>dcb pfc watchdog action drop</code>，<code>detection_time</code>、<code>restoration_time</code></td><td>检测到端口持续 pause 超阈值（如 200 ms）后，对该端口该 priority 临时切到 lossy（丢包），等待 <code>restoration_time</code> 后再尝试恢复</td></tr>
+<tr><td>Arista / Cisco 等</td><td>EOS / NX-OS</td><td><code>priority-flow-control watch-dog action drop</code></td><td>同上</td></tr>
+<tr><td>Broadcom Tomahawk-based 交换机</td><td>SONiC / SAI</td><td><code>pfcwd start</code> + <code>--detection-time --restoration-time --action drop</code></td><td>SONiC 默认推荐打开 <code>pfcwd</code></td></tr>
+</tbody>
+</table>
+
+<h3 id="83-pfc-配置原则含-watchdog">8.3 PFC 配置原则（含 watchdog）</h3>
+<ol type="1">
+<li>只给真正需要 near-lossless 的 RDMA traffic class 开 PFC。</li>
+<li>不要把所有 priority 都配置成 lossless。</li>
+<li>ECN 阈值应早于 PFC pause 阈值触发。</li>
+<li>PFC buffer 要按链路速率、线缆距离、pause reaction time 和 MTU
+计算。</li>
+<li>交换机 ingress/egress 队列水位要纳入变更验收。</li>
+<li><strong>PFC watchdog 必须开启</strong>，<code>detection_time</code> 通常设 100-200 ms（足够覆盖正常 burst，又能快速止损死锁），<code>action=drop</code>（让该 priority 临时变 lossy 而不是永久死锁）。</li>
+<li><strong>NIC 侧也要开 <code>pfc_stall_prevention</code></strong>：交换机 watchdog 只解决"出方向"死锁，NIC 看到自己被 pause 长时间不释放也要能强制 drop。</li>
+<li>监控 <code>ethtool -S &lt;iface&gt; | grep -i pause</code> 的 tx/rx pause counter 增量，以及 <code>pfcwd show stats</code> 的 storm-detected 事件——pause counter 持续上升或频繁 watchdog 触发是 fabric 设计或 incast 严重的信号。</li>
+</ol>
+<div class="danger"><strong>没有 PFC watchdog 的 RoCE 集群在生产 LLM 训练里几乎一定会出事</strong>：MoE 的 All-to-All、checkpoint 大批量上传、跨 rail 流量不均都能在某些 ECMP hash 不幸时制造 pause loop。修复 deadlock 通常只能 reset 涉事端口或重启 NIC，整个训练 job 必须从最近 checkpoint 重启。把 watchdog 配置加入 fabric 上线 checklist，比追求"PFC counter 永远为零"更实际。</div>
+
+<h2 id="ecncnp-与-dcqcn">9. ECN、CNP 与 DCQCN</h2>
+<p>ECN 是在 IP header 中标记拥塞，而不是丢包。RoCE v2 里交换机看到 RDMA
+队列超过 ECN threshold 后，对经过的 packet 标 ECN；接收端 HCA 收到带 ECN
+的 RoCE packet 后生成 CNP；发送端 HCA 收到 CNP 后，DCQCN
+降低发送速率，随后按算法逐步恢复。</p>
+<pre class="text"><code>queue grows
+  -&gt; ECN mark
+  -&gt; receiver generates CNP
+  -&gt; sender DCQCN rate decreases
+  -&gt; queue drains
+  -&gt; PFC should be rare</code></pre>
+<p>如果 PFC 比 ECN 更早频繁触发，说明拥塞控制太晚或
+buffer/阈值设计不合理。如果 ECN marks 很多但 CNP 很少，可能是接收端/NIC
+没生成 CNP、CNP priority 被阻塞、或者计数器口径不同。如果 CNP
+很多但发送速率不降，可能是 DCQCN profile 没启用、priority
+映射错误、驱动/固件参数不生效。</p>
+<h2 id="lossless-不是越多越好">10. Lossless 不是越多越好</h2>
+<p>“无损网络”在 RoCE 语境里更准确地说是：对少数 RDMA priority
+尽量避免丢包，并在丢包前通过 ECN/CNP/DCQCN
+降速。它不是全网所有流量都不能丢，更不是把所有 queue 都开 PFC。</p>
+<p>全局 lossless 会放大三个问题。第一，head-of-line
+blocking：某个拥塞流暂停了同 priority 的其他流。第二，拥塞扩散：pause
+frame
+是逐跳传播，局部热点会影响更大范围。第三，故障隐蔽：丢包变少但延迟和
+timeout 增加，应用只看到 NCCL timeout 或 verbs retry exceeded。</p>
+<p>一个健康 RoCE fabric 的目标不是 pause counter
+永远为零。更实际的目标是：ECN/CNP 在 burst 早期出现，PFC
+低频且局部，drop/retry 极低，作业带宽方差可控。</p>
+<h2 id="mtu-与-path-mtu">11. MTU 与 Path MTU</h2>
+<p>RoCE 有多层 MTU：Linux netdev MTU、交换机端口 L2 MTU、RoCE QP path
+MTU、HCA port active
+MTU。任一层不一致，都可能表现为吞吐低、retry、timeout
+或只在大消息出错。</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link show <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-d</span> link show <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;hca_id|port:|active_mtu|link_layer&#39;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">rdma</span> link show</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-k</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span></code></pre></div>
+<p>RoCE v2 是 UDP/IP，实际帧还包含 Ethernet、VLAN、IP、UDP、RoCE
+headers。如果你想承载 4096 byte RDMA payload，交换机 L2 MTU 不能只按 IP
+MTU 等值理解。在混合 VLAN、overlay 或交换机端口 profile 中，MTU
+不一致尤其常见。</p>
+<p>path MTU 还会影响性能。太小会增加 packet rate、加重交换机队列和 HCA
+packet processing；太大则要求所有路径一致，并可能增加单包占用 buffer
+的时间。</p>
+<h2 id="ecmphash-与路径极化">12. ECMP、Hash 与路径极化</h2>
+<p>RoCE v2 能跨 L3 路由，所以 spine-leaf 网络常依赖 ECMP 分摊流量。但
+ECMP 是基于 hash 字段选择路径，不是逐包平均分配。如果 hash
+字段不包含足够变化，或者 RDMA 流数量少于可用路径，就会出现路径极化。</p>
+<p>RDMA 流量还有一个特征：单个 QP 或少量 QP
+就可能承载很大带宽。这会让“平均链路利用率不高，但某些 spine link
+拥塞”的现象很常见。</p>
+<p>检查思路：</p>
+<ol type="1">
+<li>比较每条 spine/leaf uplink 的利用率和 ECN/PFC counter。</li>
+<li>确认 ECMP hash 是否包含 UDP source/destination port、IP
+五元组。</li>
+<li>确认 RoCE UDP source port 是否有足够 entropy。</li>
+<li>对比单 job、双 job、多 job 的热点是否固定。</li>
+<li>使用 per-port queue counter，而不是只看设备级总吞吐。</li>
+</ol>
+<h2 id="incastbuffer-与-hol-blocking">13. Incast、Buffer 与 HOL
+Blocking</h2>
+<p>训练 collective 经常形成 incast。例如多个 rank 同时向一个 rank
+或一个交换机下游端口发送。在 AllReduce、ReduceScatter、parameter
+server、checkpoint 汇聚、MoE token exchange
+中，都可能出现短时间多对一。</p>
+<p>Incast 的问题不只是总带宽超了。它会制造瞬时队列峰值，触发
+ECN、PFC、drop 或 HCA retry。如果 PFC 配置过宽，incast
+会把一条下游热点扩散到多个上游端口。</p>
+<p>buffer 配置要回答三个问题：</p>
+<ol type="1">
+<li>每个 lossless priority 预留多少 headroom？</li>
+<li>共享 buffer 与 dedicated buffer 如何分配？</li>
+<li>ECN threshold、PFC XOFF/XON threshold、drop threshold
+的先后关系是什么？</li>
+</ol>
+<p>理想顺序是 ECN 先标记，DCQCN 降速，队列开始回落。PFC
+只在短时突发超过控制回路反应能力时兜底。</p>
+<h2 id="infiniband-fabric-核心对象">14. InfiniBand Fabric 核心对象</h2>
+<p>InfiniBand fabric 有自己的管理平面。Subnet Manager 负责发现拓扑、分配
+LID、计算路由、维护 subnet；Subnet Administrator 提供查询服务。HCA
+端口进入 Active 状态并不等于所有分区和路径都正确。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>对象</th>
+<th>含义</th>
+<th>排障价值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SM</td>
+<td>Subnet Manager</td>
+<td>没有 SM 或 SM 不稳定会导致 LID/路由异常</td>
+</tr>
+<tr>
+<td>LID</td>
+<td>Local Identifier</td>
+<td>IB subnet 内转发地址</td>
+</tr>
+<tr>
+<td>PKey</td>
+<td>Partition Key</td>
+<td>隔离通信域，类似 fabric 分区</td>
+</tr>
+<tr>
+<td>SL</td>
+<td>Service Level</td>
+<td>服务等级，映射到 VL 或路径策略</td>
+</tr>
+<tr>
+<td>VL</td>
+<td>Virtual Lane</td>
+<td>链路层虚拟通道，缓解 HOL blocking</td>
+</tr>
+<tr>
+<td>GUID</td>
+<td>全局唯一设备/端口标识</td>
+<td>拓扑和设备定位</td>
+</tr>
+<tr>
+<td>Link width</td>
+<td>x1/x2/x4 等</td>
+<td>宽度降级会直接降带宽</td>
+</tr>
+<tr>
+<td>Link speed</td>
+<td>SDR/DDR/QDR/FDR/EDR/HDR/NDR 等</td>
+<td>速率不符常见于线缆或端口配置</td>
+</tr>
+</tbody>
+</table>
+<p>IB 排障的第一步通常不是 <code>ping</code>，而是 fabric 状态。</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sminfo</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ibnetdiscover</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">iblinkinfo</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">perfquery</span></span></code></pre></div>
+<h2 id="subnet-managerlid-与路由">15. Subnet Manager、LID 与路由</h2>
+<p>IB 中每个端口需要 LID 才能在 subnet 内通信。SM 负责分配 LID
+并建立转发表。如果 SM 缺失，端口可能停留在 Init 或 Armed。如果有多个 SM
+且优先级配置混乱，可能发生 master 切换，导致短时路由变化或 fabric
+抖动。</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sminfo</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;state|phys_state|base lid|sm lid|active_mtu|active_width|active_speed&#39;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ibnetdiscover</span> <span class="op">&gt;</span> fabric.topo</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">iblinkinfo</span></span></code></pre></div>
+<p>看 <code>base lid</code> 是否为非零，看 <code>sm lid</code>
+是否存在且稳定，看端口状态是否 <code>Active</code>、物理状态是否
+<code>LinkUp</code>，看 <code>iblinkinfo</code>
+中是否有降速、降宽、逻辑链路异常或大量 error。</p>
+<h2 id="pkeysl-与-vl">16. PKey、SL 与 VL</h2>
+<p>PKey 是 IB 的分区机制。通信双方必须在相容 PKey 分区中，QP 配置的 PKey
+index 必须指向正确 PKey。PKey 不一致时，应用可能看到连接失败、remote
+access error、retry exceeded 或 NCCL timeout。</p>
+<p>SL 是 service level，可以映射到不同 VL 或路由策略。VL 是 virtual
+lane，它在链路层提供独立流控资源，用来缓解 HOL blocking。不要把 SL/VL
+当成 RoCE 里的 DSCP/PCP
+的简单同义词：它们都在做服务等级与队列隔离，但管理平面和实现模型不同。</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span> <span class="kw">|</span> <span class="fu">less</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/class/infiniband/<span class="op">&lt;</span>dev<span class="op">&gt;</span>/ports/<span class="op">&lt;</span>port<span class="op">&gt;</span>/pkeys/<span class="pp">*</span></span></code></pre></div>
+<p>如果同一 job 的节点跨不同 PKey，RDMA
+连接会出现非常像“网络随机不通”的症状。</p>
+<h2 id="ib-link-widthspeed-与-mtu">17. IB Link Width、Speed 与 MTU</h2>
+<p>IB 链路带宽由 speed 和 width 共同决定。例如同样是 HDR，如果 width 从
+x4 降到
+x2，可用带宽会明显下降。降宽常见原因包括线缆、光模块、端口协商、交换机端口
+profile、硬件故障。</p>
+<p><code>ibstat</code> 和 <code>ibv_devinfo</code> 会显示 active
+width、active speed、active MTU。<code>iblinkinfo</code> 能从 fabric
+视角列出链路状态。<code>perfquery</code> 能看 symbol error、link error
+recovery、link downed、VL15 dropped 等 counter。</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iblinkinfo</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;down|reduced|could not|error&#39;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">perfquery</span> <span class="at">-x</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perfquery</span> <span class="at">-r</span> <span class="op">&lt;</span>lid<span class="op">&gt;</span> <span class="op">&lt;</span>port<span class="op">&gt;</span></span></code></pre></div>
+<p>IB MTU 不一致时，症状可能是某些路径性能低或连接参数协商失败。对于
+verbs RC QP，path MTU 是 QP 转到 RTR 时的重要参数。不要只看一端 active
+MTU，要确认端到端路径和应用选择的 MTU。</p>
+<h2 id="命令观测主机侧最小证据包">18. 命令观测：主机侧最小证据包</h2>
+<p>RoCE 主机侧建议一次收集：</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">hostname</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">uname</span> <span class="at">-a</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">show_gids</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ibdev2netdev</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">rdma</span> link show</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">rdma</span> resource show</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-br</span> link</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-br</span> addr</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-d</span> link show <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-i</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span></code></pre></div>
+<p>IB 主机侧建议一次收集：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">hostname</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">sminfo</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ibnetdiscover</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="ex">iblinkinfo</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">perfquery</span> <span class="at">-x</span></span></code></pre></div>
+<p>应用侧同时收集：</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">env</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;NCCL|UCX|FI_|RDMAV|MLX&#39;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="at">-T</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;mlx|rdma|ib|roce|cq|qp|syndrome&#39;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-k</span> <span class="at">--since</span> <span class="st">&#39;30 min ago&#39;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;mlx|rdma|ib|roce&#39;</span></span></code></pre></div>
+<p>证据包要包含“好节点”和“坏节点”的对比。只收坏节点很难判断是配置异常、拓扑差异还是正常计数器波动。</p>
+<h2 id="ethtool--s-与-roce-counter-读法">19. <code>ethtool -S</code> 与
+RoCE Counter 读法</h2>
+<p>不同厂商和不同驱动 counter 名称不同，但读法相似。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>类别</th>
+<th>例子</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>pause</td>
+<td><code>rx_prio*_pause</code>, <code>tx_prio*_pause</code></td>
+<td>PFC 是否触发，哪个 priority 触发</td>
+</tr>
+<tr>
+<td>ECN/CNP</td>
+<td><code>np_cnp_sent</code>, <code>rp_cnp_handled</code>,
+<code>ecn_marked</code></td>
+<td>拥塞反馈是否形成闭环</td>
+</tr>
+<tr>
+<td>drops</td>
+<td><code>rx_discards</code>, <code>tx_discards</code>,
+<code>out_of_buffer</code></td>
+<td>近无损队列是否仍在丢</td>
+</tr>
+<tr>
+<td>errors</td>
+<td>CRC、symbol、FCS</td>
+<td>物理链路和帧错误</td>
+</tr>
+<tr>
+<td>RoCE</td>
+<td>retry、timeout、out_of_sequence</td>
+<td>RDMA transport 异常</td>
+</tr>
+<tr>
+<td>queue</td>
+<td>per-priority/per-queue bytes、drops</td>
+<td>是否打到预期队列</td>
+</tr>
+</tbody>
+</table>
+<p>读 counter 的原则：先确认 counter 是累计值还是速率；变更前后取两次
+delta；分 priority 看，不只看总 pause；主机与交换机同一时间窗口对齐；把
+counter 与作业 rank、HCA、端口、GPU 拓扑对应起来。</p>
+<h2 id="perfquery-与-ib-counter-读法">20. <code>perfquery</code> 与 IB
+Counter 读法</h2>
+<p><code>perfquery</code> 读取 IB performance
+counter。常见关注项如下。</p>
+<table>
+<thead>
+<tr>
+<th>Counter</th>
+<th>可能含义</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SymbolErrorCounter</code></td>
+<td>物理链路问题</td>
+<td>查线缆、模块、端口</td>
+</tr>
+<tr>
+<td><code>LinkErrorRecoveryCounter</code></td>
+<td>链路恢复</td>
+<td>看是否持续增长</td>
+</tr>
+<tr>
+<td><code>LinkDownedCounter</code></td>
+<td>链路曾 down</td>
+<td>对齐作业失败时间</td>
+</tr>
+<tr>
+<td><code>PortRcvErrors</code></td>
+<td>接收错误</td>
+<td>定位对端端口和链路</td>
+</tr>
+<tr>
+<td><code>PortXmitDiscards</code></td>
+<td>发送丢弃</td>
+<td>看拥塞、VL、路由</td>
+</tr>
+<tr>
+<td><code>VL15Dropped</code></td>
+<td>管理 VL 丢包</td>
+<td>关注 SM/SA 管理面压力</td>
+</tr>
+<tr>
+<td><code>PortXmitWait</code></td>
+<td>等待 credit</td>
+<td>可能拥塞或下游慢</td>
+</tr>
+</tbody>
+</table>
+<p>IB 排障要把 counter 放回拓扑。<code>ibnetdiscover</code>
+提供节点和端口关系，<code>iblinkinfo</code> 帮你看到哪条链路降速、down
+或异常，<code>perfquery</code> 告诉你哪一端的哪个 port
+在增长错误。三者合起来才是证据链。</p>
+<h2 id="worked-examplegid-index-选错">21. Worked Example：GID Index
+选错</h2>
+<p>现象：两台机器 <code>ib_write_bw</code>
+单独跑有时成功，有时失败；NCCL 多机启动后报
+<code>unhandled system error</code> 或
+<code>retry exceeded</code>；部分节点能互通，跨 rack 失败。</p>
+<p>第一步，看 GID 表：</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">show_gids</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibdev2netdev</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-br</span> addr</span></code></pre></div>
+<p>发现节点 A 的 <code>mlx5_0 port 1 index 3</code> 是业务 VLAN 的 RoCE
+v2 IPv4 GID；节点 B 的同一 index 却对应管理网 IP，业务 VLAN GID 在 index
+4。</p>
+<p>第二步，看应用配置：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">env</span> <span class="kw">|</span> <span class="fu">grep</span> NCCL_IB_GID_INDEX</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">env</span> <span class="kw">|</span> <span class="fu">grep</span> UCX_IB_GID_INDEX</span></code></pre></div>
+<p>集群统一下发了 <code>NCCL_IB_GID_INDEX=3</code>。这在节点 A
+正确，在节点 B 错误。</p>
+<p>修复方式：</p>
+<ol type="1">
+<li>不把 GID index 当作跨节点稳定常量，先统一 netdev/VLAN/GID
+表生成规则。</li>
+<li>如果必须固定 index，验收脚本逐节点校验 index、RoCE
+version、IPv4、netdev、VLAN。</li>
+<li>在 NCCL/UCX 配置中同时约束 HCA 和业务接口，避免走管理网。</li>
+<li>变更后跑
+<code>ib_write_bw</code>、<code>ib_read_bw</code>、<code>nccl-tests</code>
+的跨 rack 矩阵。</li>
+</ol>
+<p>关键结论：GID index 是本机 HCA 端口 GID 表下标，不是 fabric
+全局语义。</p>
+<h2 id="worked-examplepfc-pause-storm-与-ecn-太晚">22. Worked
+Example：PFC Pause Storm 与 ECN 太晚</h2>
+<p>现象：大规模 AllReduce 到 128 节点后 step time 周期性尖刺。NCCL
+日志只看到 timeout 前的长时间无进展。主机没有明显丢包，但
+<code>ethtool -S</code> 显示 RDMA priority 的
+<code>rx_prio3_pause</code> 和 <code>tx_prio3_pause</code>
+快速增长。交换机上某些 leaf uplink 的 PFC pause 增长扩散到多个端口。</p>
+<p>第一步，确认是否 ECN 早于 PFC：</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;prio3|pause|cnp|ecn&#39;</span></span></code></pre></div>
+<p>交换机 telemetry 显示队列接近满时才开始 ECN mark，随后马上触发 PFC
+XOFF。DCQCN 来不及降速，PFC 成为主要控制机制。进一步检查发现存储复制和
+RDMA 训练共用 priority 3，且 priority 3 开了 PFC，一个 checkpoint burst
+能 pause 训练流量。</p>
+<p>修复方式：</p>
+<ol type="1">
+<li>分离训练 RDMA 与存储复制的 traffic class。</li>
+<li>调低 ECN marking threshold，使 ECN 明显早于 PFC XOFF。</li>
+<li>根据链路速率和 MTU 重新计算 PFC headroom。</li>
+<li>校验 CNP counter 增长后发送端速率确实下降。</li>
+<li>用压力测试验证 PFC 从高频全局扩散变成低频局部兜底。</li>
+</ol>
+<p>关键结论：PFC 频繁增长不是“lossless
+工作良好”，而是拥塞控制闭环太晚或队列隔离错误。</p>
+<h2 id="worked-exampleib-smpkeylid-与-mtu-不一致">23. Worked Example：IB
+SM、PKey、LID 与 MTU 不一致</h2>
+<p>现象：IB 集群重启交换机后，部分节点 <code>ibstat</code> 显示
+Active，但 MPI/NCCL
+跨节点失败；另一些节点能通信但带宽只有预期的一半。</p>
+<p>第一步，看 SM 和 LID：</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sminfo</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;state|base lid|sm lid|active_mtu|active_width|active_speed&#39;</span></span></code></pre></div>
+<p>发现部分节点 <code>base lid</code> 重新分配后正常，但有一组节点的
+PKey index 指向旧分区。同一 job 的节点不在相同 PKey，QP 初始化时使用的
+PKey index 在不同节点上对应不同值。</p>
+<p>第二步，看 PKey、链路宽度和 MTU：</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/class/infiniband/mlx5_0/ports/1/pkeys/<span class="pp">*</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iblinkinfo</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;reduced|down|error&#39;</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perfquery</span> <span class="at">-x</span></span></code></pre></div>
+<p>一条上联协商为低 width，且部分端口 active MTU 与预期不一致。</p>
+<p>修复方式：</p>
+<ol type="1">
+<li>确认唯一 master SM，固定 SM priority 与启动顺序。</li>
+<li>重新下发并校验 PKey 表，避免只校验 PKey index。</li>
+<li>修复降宽链路，替换可疑线缆或模块。</li>
+<li>统一 active MTU 与应用 path MTU。</li>
+<li>用 <code>ib_write_bw</code> 的节点矩阵和 <code>nccl-tests</code>
+验证。</li>
+</ol>
+<p>关键结论：IB 的端口 Active 只是入口，SM/LID/PKey/MTU/link width
+必须一起看。</p>
+<h2 id="roce-变更-sop">24. RoCE 变更 SOP</h2>
+<p>RoCE 变更要把主机、交换机、应用三侧同时纳入。</p>
+<p>变更前：</p>
+<ol type="1">
+<li>记录当前 NIC firmware、driver、OFED/rdma-core、kernel。</li>
+<li>导出
+<code>show_gids</code>、<code>rdma link</code>、<code>ip -d link</code>、<code>ethtool -S</code>
+baseline。</li>
+<li>导出交换机 QoS、PFC、ECN、buffer、DSCP/PCP map、ECMP hash
+配置。</li>
+<li>选择 canary 节点，覆盖同 leaf、跨 leaf、跨 rack。</li>
+<li>明确回滚条件：drop、PFC、CNP、带宽、p99 step time、timeout。</li>
+</ol>
+<p>变更中：</p>
+<ol type="1">
+<li>先改一组 leaf 或一小组节点。</li>
+<li>每一步都跑
+<code>ib_write_bw</code>、<code>ib_read_bw</code>、<code>ib_send_bw</code>
+的基本矩阵。</li>
+<li>再跑 <code>nccl-tests</code>
+覆盖小消息、大消息、单节点、多节点。</li>
+<li>同步采集主机和交换机 counter delta。</li>
+<li>不在同一窗口同时修改 GID、MTU、PFC、ECN、DCQCN 多类参数。</li>
+</ol>
+<p>变更后：</p>
+<ol type="1">
+<li>比较 baseline 与新 counter。</li>
+<li>观察至少一个训练高峰周期。</li>
+<li>固化验收脚本。</li>
+<li>把 GID index、DSCP/PCP、priority、MTU 写入资产和作业模板。</li>
+</ol>
+<h2 id="ib-变更-sop">25. IB 变更 SOP</h2>
+<p>IB 变更更关注 fabric 管理平面和物理链路。</p>
+<p>变更前：</p>
+<ol type="1">
+<li>记录 SM 位置、priority、版本、配置。</li>
+<li>保存 <code>ibnetdiscover</code> 拓扑。</li>
+<li>保存 <code>iblinkinfo</code> 链路宽度/速率状态。</li>
+<li>保存关键端口 <code>perfquery</code> baseline。</li>
+<li>导出 PKey 表和应用使用的 PKey index。</li>
+</ol>
+<p>变更中：</p>
+<ol type="1">
+<li>确认 master SM 稳定。</li>
+<li>每次拓扑或交换机变更后重新跑 <code>ibnetdiscover</code>。</li>
+<li>对比 LID 分配是否异常。</li>
+<li>检查 <code>VL15Dropped</code>、<code>PortXmitWait</code>、link error
+counter。</li>
+<li>用带宽矩阵验证跨 leaf、跨 spine、跨机柜路径。</li>
+</ol>
+<p>变更后：</p>
+<ol type="1">
+<li>确认所有端口 Active、speed/width 符合预期。</li>
+<li>确认 PKey 值一致，而不只是一致的 index。</li>
+<li>确认应用 path MTU 与 fabric active MTU 匹配。</li>
+<li>保留拓扑和 counter 快照供下一次事故对比。</li>
+</ol>
+<h2 id="故障排查-checklist">26. 故障排查 Checklist</h2>
+<p>RoCE checklist：</p>
+<ol type="1">
+<li>HCA、port、netdev 是否与作业期望一致？</li>
+<li><code>show_gids</code> 中应用选择的 GID index
+是否跨节点语义一致？</li>
+<li>RoCE version 是否一致，是否都为 v2？</li>
+<li>IP、VLAN、routing 是否可达，返回路径是否对称或至少可用？</li>
+<li>Linux MTU、交换机 MTU、QP path MTU 是否一致？</li>
+<li>DSCP/PCP 是否进入预期 priority？</li>
+<li>PFC 是否只对 RDMA priority 开启？</li>
+<li>ECN 是否早于 PFC，CNP 是否形成闭环？</li>
+<li>ECMP hash 是否有足够 entropy？</li>
+<li>主机与交换机 drop、pause、CNP、ECN counter
+是否对应同一时间窗口？</li>
+</ol>
+<p>IB checklist：</p>
+<ol type="1">
+<li>SM 是否存在且 master 稳定？</li>
+<li>端口是否 Active，phys state 是否 LinkUp？</li>
+<li>LID、SM LID 是否正常？</li>
+<li>PKey 值是否一致，PKey index 是否正确？</li>
+<li>active MTU、path MTU 是否一致？</li>
+<li>link width/speed 是否降级？</li>
+<li><code>perfquery</code> 是否有 symbol、link recovery、VL15
+dropped、xmit wait 异常？</li>
+<li><code>ibnetdiscover</code> 拓扑是否符合预期？</li>
+<li><code>iblinkinfo</code> 是否报告 down、reduced 或 error link？</li>
+<li>应用使用的 HCA/port 是否与 fabric 分区一致？</li>
+</ol>
+<h2 id="练习">27. 练习</h2>
+<ol type="1">
+<li>给定三台 RoCE 节点的 <code>show_gids</code> 输出，找出为什么统一设置
+<code>NCCL_IB_GID_INDEX=3</code> 会让其中一台走错 VLAN。</li>
+<li>设计一个 RoCE canary 测试，要求能发现 DSCP 没被交换机 trust
+的问题。</li>
+<li>解释为什么 PFC pause counter
+快速增长时，不能直接得出“网络没有丢包所以没问题”的结论。</li>
+<li>给出 ECN threshold、PFC XOFF threshold、drop threshold
+的合理触发顺序，并说明原因。</li>
+<li>一个 64 节点 job 只有跨 rack 慢，同 leaf 正常。列出 ECMP 和 spine
+uplink 的排查步骤。</li>
+<li>IB 中 <code>ibstat</code> Active，但应用连接失败。写出
+SM、LID、PKey、path MTU 的检查顺序。</li>
+<li><code>perfquery</code> 显示某端口 <code>PortXmitWait</code> 高但
+symbol error 为零。列出两个可能原因。</li>
+<li>设计 RoCE/IB 事故证据包目录结构，要求能支持事后对比好坏节点。</li>
+<li>解释为什么同一个 PKey index 在不同节点上不一定安全。</li>
+<li>把本章 checklist 改写成上线前自动验收脚本的伪代码。</li>
+</ol>
+<h2 id="本章结论">28. 本章结论</h2>
+<p>RoCE v2 的核心不是“UDP/IP 上跑 RDMA”这一句话，而是
+GID、VLAN、DSCP、PCP、priority、PFC、ECN、CNP、DCQCN、MTU、ECMP 和
+buffer 共同形成的 fabric 行为。</p>
+<p>InfiniBand 的核心不是“专用网络更快”这一句话，而是
+SM、LID、PKey、SL/VL、link width/speed、MTU 和 IB counter
+共同形成的受管理 fabric。</p>
+<p>训练集群里，RDMA 网络问题很少只停留在单点。GID index 错会变成跨 rack
+不通；ECN 太晚会变成 PFC pause storm；PKey 或 LID 问题会伪装成应用
+timeout。正确的工程习惯是先拆层，再对齐配置，再看 counter
+delta，最后用带宽矩阵和真实 collective 验证。</p>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

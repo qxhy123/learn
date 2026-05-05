@@ -224,10 +224,27 @@ flowchart TD
 
 | 门禁项 | 必过指标 | 对比基准 | 统计要求 |
 |--------|---------|----------|----------|
-| **核心任务指标** | ROUGE、BLEU、EM、F1 等（依任务定） | 上一个 production 版本 | 不低于 baseline 的 (1 - δ)，δ ≤ 2% |
+| **传统 ML 任务指标** | Accuracy、F1、AUC、NDCG、Recall@K（分类/排序/检索任务）| 上一个 production 版本 | 不低于 baseline 的 (1 - δ)，δ ≤ 2% |
+| **LLM 通用知识 / 推理** | **MMLU、MMLU-Pro、BBH、AGIEval** | 上一个 production 版本 + 公开 LLM 排行榜 | 关键 subset（如 MMLU STEM、BBH causal）不能下降 |
+| **LLM 数学推理** | **GSM8K、MATH、AIME** | 上一个版本 | 不低于 baseline，特别注意 fixed prompt 模板 |
+| **LLM 代码** | **HumanEval、HumanEval+、MBPP、LiveCodeBench**；工程任务用 **SWE-bench** | 上一个版本 | 必须沙箱执行验证（不是字符串匹配）|
+| **LLM 指令跟随 / 对话** | **MT-Bench、AlpacaEval 2.0、Arena-Hard、IFEval** | 上一个版本 | 用 GPT-4 / Claude 作 judge，固定 judge 版本，swap A/B 顺序消除 position bias |
+| **RAG 系统专用** | **Ragas（context relevance / faithfulness / answer correctness）、TruLens、RAGChecker** | 上一个版本 | 与 retrieval index 版本绑定 |
+| **Agent 系统专用** | **GAIA、AgentBench、SWE-bench、τ-bench** | 上一个版本 | 多步任务完成率 + 工具调用成功率 |
+| **业务 Golden Set** | 业务场景特定的事实正确性、合规性 | 维护的 50-500 条标注样本 | 不允许 high-criticality case 退化 |
 | **回归集** | 已知 bad case 集合的错误率 ≤ 阈值 | 固定的 bad case 集 | 不允许新增已知类型错误 |
-| **Safety 测试** | 恶意 prompt 拒绝率、PII 泄漏率、有害输出率 | 最严格的 safety baseline | 不能低于 baseline，有害输出率 ≤ 0.1% |
-| **成本测试** | 平均输出 token 数、每次调用推理时长 | 上一个版本 | 成本 regression ≤ 5% |
+| **Safety 测试** | **ToxiGen、AdvBench、HarmBench、PromptBench** + 恶意 prompt 拒绝率、PII 泄漏率、有害输出率 | 最严格的 safety baseline | 不能低于 baseline，有害输出率 ≤ 0.1%；prompt injection 防御成功率必跑 |
+| **成本测试** | 平均输出 token 数、每次调用推理时长、reasoning token 消耗（reasoning model） | 上一个版本 | 成本 regression ≤ 5% |
+| **传统 NLG（仅翻译/摘要任务）** | BLEU、ROUGE、BERTScore | 上一个版本 | 仅这两类任务保留，其他 LLM 任务不再使用 |
+
+> [!DANGER]
+> **不要把 BLEU / ROUGE 当 LLM 主评测指标。** 它们对开放式问答、推理、代码、Agent 任务与人评相关性很低（多份研究 Pearson < 0.3）。继续把它们当 release gate，会出现"分数没退化但用户感受明显变差"或"分数大幅退化但实际质量没变"两种错误信号。LLM 评测必须用上面表格里的 benchmark 矩阵。
+
+> [!NOTE]
+> **LLM-as-judge 工程化要点**：(1) 固定 judge 模型版本（judge 升级会引入 0.5-1 分系统漂移）；(2) swap A/B 顺序两次取均值消除 position bias；(3) 长度归一化或显式提示约束，避免 length bias（judge 偏好长答案）；(4) 用人工样本周期校准 judge，确保一致性 > 0.8；(5) judge 成本可观（GPT-4 1000 题约 $20-50），release gate 通常 sample 200-500 题做 daily run，full set 做 weekly。
+
+> [!TIP]
+> **release gate 最小组合**（任何 LLM 模型上线前必跑）：MMLU + GSM8K + HumanEval + MT-Bench + 业务 Golden Set + Safety benchmark。前 4 项可用 lm-evaluation-harness（EleutherAI）或 OpenCompass 在 1-2 小时跑完。
 
 > **统计显著性**：若两个版本的指标差异小于最小可检测效果量（MDE = 0.5σ），则认为差异不显著，视为通过（避免因噪声拒绝等效版本）。若差异超过 MDE 且低于阈值，则阻断。评测报告必须包含置信区间和样本量。
 

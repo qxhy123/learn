@@ -302,7 +302,7 @@ python train.py \
 | 镜像版本 | training-image:2026.04.24 |
 | 资源规格 | 8 × A100 80GB |
 | 随机种子 | seed=42 |
-| 训练指标 | loss、accuracy、AUC、BLEU、reward |
+| 训练指标 | loss、accuracy、AUC、reward；**LLM 任务用 perplexity / cross-entropy + 任务 benchmark（MMLU、HumanEval、GSM8K、MT-Bench）替代 BLEU/ROUGE**（详见 §3.5.3 / Ch 12c §12c.4） |
 | 输出制品 | checkpoint、tokenizer、config、日志 |
 
 这个阶段的核心目标是：
@@ -615,10 +615,33 @@ outputs:
 | 分类 | Accuracy、Precision、Recall、F1、AUC |
 | 排序 | NDCG、MRR、MAP、CTR Lift |
 | 检索 | Recall@K、Precision@K、Hit Rate |
-| 生成 | BLEU、ROUGE、BERTScore、人工评分 |
+| 翻译 / 摘要（仍适用 BLEU/ROUGE 的传统场景） | BLEU、ROUGE、BERTScore、人工评分 |
 | 推荐 | CTR、CVR、GMV、留存 |
 | 风控 | KS、AUC、坏账率、误杀率 |
-| 大模型问答 | 正确性、完整性、幻觉率、安全性、引用准确率 |
+| **LLM / 大模型应用**（推荐方案） | **任务 benchmark + LLM-as-judge + 业务指标**（详见下方"LLM 评测体系"） |
+
+#### LLM 评测体系（替代 BLEU/ROUGE 单一指标）
+
+> [!WARNING]
+> **BLEU / ROUGE 在 LLM 主流任务（对话、推理、代码、Agent）上已经基本不用作主评测指标**。它们对短答案和高词面重叠任务（机器翻译、抽取式摘要）仍有意义；但对开放式问答、推理、代码生成、长文回答，BLEU/ROUGE 与人类质量判断的相关性很低（多份研究报告 Pearson 相关系数 < 0.3）。生产 LLM 评测应改用以下分层组合：
+
+| 评测层 | 代表 benchmark | 衡量什么 | 工程注意 |
+|---|---|---|---|
+| **通用知识 / 推理** | MMLU（57 学科多选）、MMLU-Pro、AGIEval、BBH | 模型基础知识与推理能力 | 离线跑，结果稳定，是最常用的 release gate |
+| **数学推理** | GSM8K（小学数学）、MATH（竞赛数学）、AIME | 多步推理与计算 | 跑分对 prompt 敏感，需 fixed prompt 模板 |
+| **代码** | HumanEval、HumanEval+、MBPP、LiveCodeBench、SWE-bench | 函数级和真实工程任务的代码生成 | 必须用沙箱执行验证，不是字符串匹配 |
+| **指令跟随 / 对话质量** | MT-Bench（多轮）、AlpacaEval 2.0、Arena-Hard、IFEval | 模型遵从指令、风格、对话连贯性 | 通常需要 GPT-4 / Claude 作为 judge，质量但成本高 |
+| **真人偏好** | Chatbot Arena (LMSYS)、内部人评 | 真实用户对模型回答的相对偏好 | 慢、贵，但是最接近"上线后用户感受" |
+| **安全 / 红队** | ToxiGen、AdvBench、HarmBench、PromptBench | 拒绝有害请求、抗 jailbreak、抗 prompt injection | release 前必跑，业务红线 |
+| **领域 Golden Set** | 自建（如客服 50-200 条标注样本） | 业务场景特定的事实正确性、合规性 | 维护成本高但最有业务区分度 |
+| **RAG 专用** | Ragas、TruLens、RAGChecker | context relevance、faithfulness、answer correctness | RAG 系统必跑 |
+| **Agent 专用** | GAIA、AgentBench、SWE-bench、τ-bench | 工具调用成功率、多步任务完成率 | Agent 系统必跑 |
+
+> [!NOTE]
+> **LLM-as-judge 的工程化要点**：用 GPT-4 / Claude 给开放式回答打分（MT-Bench / AlpacaEval 2.0 都基于此）需要注意 (1) 同一 batch 用同一 judge 模型版本（judge 升级会引入 0.5-1 分系统漂移）；(2) judge 对位置敏感，需要 swap A/B 顺序两次取均值消除 position bias；(3) judge 对长答案有偏好（length bias），可以用长度归一化或显式提示约束；(4) 用人工样本周期校准 judge，确保一致性 > 0.8。
+
+> [!TIP]
+> **release gate 的最小组合**（任何 LLM 模型上线前应该跑）：MMLU + GSM8K + HumanEval + MT-Bench + 业务 Golden Set + 安全 benchmark。前四项可在 1-2 小时跑完，提供基础质量信号。MT-Bench 用于检测训练副作用（如新版本变啰嗦或拒绝率升高）。
 
 #### 第二类：回归测试
 
