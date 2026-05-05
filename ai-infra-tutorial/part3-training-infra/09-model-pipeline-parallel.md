@@ -380,7 +380,7 @@ Selective + FlashAttention： 80 × 8192 × 8192 ×  8 bytes ≈  43 GB
 
 - TP=8：每 rank hidden/8，`attn_input/output` 等正比降低；但 `attn_scores`（quadratic）只降 `num_heads/TP`，不降 seq²。
 - PP=4（70B 80 层）：每 rank 只有 20 层，activation 降到 1/4；但 stage 边界 send/recv buffer 增加（见 §4.1）。
-- CP=4：attention 的 KV/scores 从 full seq² 降到 `(seq/CP)²`，对 attention workspace 有二次方级别改善（见 §4.6a）。
+- CP=4：attention 的 KV/scores 从 full seq² 降到 `(seq/CP)²`，对 attention workspace 有二次方级别改善（见 §4.6.1）。
 
 ### 4.2 TP 的通信边界
 
@@ -398,6 +398,50 @@ TP_comm_exposed = max(TP_collective_time - overlap_with_compute, 0)
 ```
 
 如果 TP collective 在 Nsight Systems 中反复出现在每层 GEMM 之间，并且 NCCL bus bandwidth 明显低于节点内基线，TP size 可能过大或 placement 跨了慢链路。TP 不是越大越好：TP=8 通常适合 8 GPU NVSwitch 节点；TP=16 跨节点时，每层通信会直接吃掉训练效率。
+
+#### 4.2.1 TP 通信量估算
+
+第 8 章给出了 DP AllReduce 的心算公式。TP 需要等价的估算基础。
+
+**Megatron Column-then-Row TP 的 per-layer 通信**
+
+以标准 decoder-only Transformer 的 Megatron TP 实现为基准（Column parallel + Row parallel，每路各触发一次 AllReduce）：
+
+```text
+每个 Transformer block 的 AllReduce 次数：
+  Attention (Q,K,V projection → Column) + (output projection → Row)：forward 1次，backward 1次
+  MLP (FC1 → Column) + (FC2 → Row)：forward 1次，backward 1次
+  合计：每 block forward 2次，backward 2次 AllReduce
+
+每次 AllReduce 的数据量（Ring AllReduce，含 ReduceScatter + AllGather 两趟）：
+  message_size = micro_batch × seq_len × hidden_size × dtype_bytes
+  bytes_per_rank = 2 × (TP-1)/TP × message_size
+
+每 block forward TP 通信量（per rank）：
+  tp_fwd_bytes = 2 × 2 × (TP-1)/TP × micro_batch × seq × hidden × dtype_bytes
+```
+
+**数字示例（70B，BF16，seq=8192，micro_batch=1，TP=8，节点内 NVSwitch）**
+
+```text
+message_size = 1 × 8192 × 8192 × 2 = 134 MB
+bytes_per_rank per call = 2 × (7/8) × 134 MB ≈ 235 MB
+每 block forward 2次 AllReduce → per block ≈ 470 MB
+
+70B 有 80 层：total forward TP traffic per rank ≈ 80 × 470 MB ≈ 37 GB
+
+NVSwitch 节点内 AllReduce 有效 bus bandwidth ≈ 600 GB/s（8×H100 实测）：
+  single call time ≈ 235 MB / 600 GB/s ≈ 0.4 ms
+  80层 × 2次 = 160次 AllReduce，理论总时间约 64 ms（完全串行上界）
+  实际：大部分 AllReduce 被下层 GEMM 掩盖，exposed tail 通常 5-15 ms（见 §4.2.2）
+```
+
+**SP（Sequence Parallel）模式的差异**
+
+SP 把 TP AllReduce 改写为 ReduceScatter（scatter 到各 rank 保留 sequence 分片）+ AllGather（在需要全量时聚合），总通信量近似相同，但 activation 常驻量降低：每 rank 保存 `seq/TP` 的 sequence 分片而不是完整 seq。
+
+> [!NOTE]
+> 如果 TP collective 在节点内 NVSwitch 完全被 GEMM 掩盖（见 §4.2.2），TP 通信量对 step time 几乎无影响。跨节点 TP 时需用节点间带宽（如 400G IB ≈ 50 GB/s bus bw）重算：0.4 ms × (600/50) ≈ 4.8 ms per call，160 次串行约 768 ms——远超 GEMM 时间，成为严重瓶颈。这是"TP 优先节点内"的定量依据。
 
 ### 4.3 PP、microbatch 和 pipeline bubble
 
@@ -436,6 +480,47 @@ TP_comm_exposed = max(TP_collective_time - overlap_with_compute, 0)
 
 > [!NOTE]
 > 这个公式仍是估算，不替代 profile。真实集群 stage 计算时间可能不均匀（某些 stage 算 attention，某些算 MLP），需要 profile 后用 layer placement 调平 stage time，否则 bubble 公式对应的"理想 utilization"也拿不到。
+
+#### 4.3.4 PP 通信量估算
+
+PP activation send/recv 是跨节点通信，带宽上限由 IB/RoCE 决定。
+
+**Per stage boundary，per microbatch**
+
+```text
+forward activation send/recv（每个 stage 边界，每个 microbatch）：
+  pp_boundary_bytes = micro_batch × seq_len × hidden_size × dtype_bytes
+
+backward gradient send/recv（同一边界）：
+  pp_boundary_bwd_bytes = micro_batch × seq_len × hidden_size × dtype_bytes
+
+单 microbatch 走完一次完整 pipeline（PP stage，PP-1 个中间边界）：
+  pp_per_microbatch_total = 2 × (PP-1) × pp_boundary_bytes
+```
+
+**数字示例（70B，BF16，seq=8192，micro_batch=1，PP=4）**
+
+```text
+pp_boundary_bytes = 1 × 8192 × 8192 × 2 = 134 MB per boundary
+PP=4 有 3 个中间边界
+单 microbatch forward+backward PP 通信量 = 2 × 3 × 134 MB = 804 MB
+
+400G IB（单向 50 GB/s）：
+  单边界 forward send ≈ 134 MB / 50 GB/s ≈ 2.7 ms
+  1F1B 稳态下 send/recv 与 compute 部分重叠（见 §4.2.2）
+  exposed PP 通常 1-5 ms per boundary（取决于 overlap 效果）
+```
+
+**PP 通信量对 TP 的敏感性**
+
+PP 传输的是 full sequence activation（TP 切 hidden 后维度减半）：
+
+```text
+使用 TP=8（hidden 切 1/8）：
+  pp_boundary_bytes = 1 × 8192 × (8192/8) × 2 = 16.8 MB per boundary
+
+比 TP=1 降低 8×，大幅减少跨节点 PP 流量。这是 TP 与 PP 配合的隐性收益之一。
+```
 
 ### 4.4 virtual stage、interleaved pipeline 和 zero bubble
 
@@ -487,6 +572,44 @@ CP 面向 attention context。长上下文下，Q/K/V、attention scores、mask�
 - 8K/16K context：SP 可能已经有收益，CP 未必值得。
 - 64K/128K context：attention workspace 和 KV 通常成为瓶颈，CP 需要进入候选。
 - CP 需要 kernel、position encoding、mask、FlashAttention 变体和 checkpoint metadata 全部支持；不是开一个 group size 就能跑。
+
+#### 4.6.1 CP 通信量估算
+
+CP 通过 ring 传递 KV（Ring FlashAttention 实现）或 All-to-All（Ulysses 实现），通信量随 context 长度和 CP size 决定。
+
+**Ring FlashAttention CP 模式（每个 attention layer，每轮 ring）**
+
+```text
+每个 rank 持有 seq/CP 个 token 的 Q 分片；ring 交换只发送 K 和 V：
+  kv_per_step = micro_batch × (seq/CP) × num_kv_heads × head_dim × 2（K+V）× dtype_bytes
+
+一个 attention layer 完整 CP ring 通信量（CP-1 轮 ring，单向 send）：
+  cp_total_per_layer = (CP-1) × kv_per_step
+```
+
+**数字示例（70B GQA：num_kv_heads=8，head_dim=128，seq=65536，CP=4，BF16）**
+
+```text
+kv_per_step = 1 × (65536/4) × 8 × 128 × 2 × 2 = 67 MB per ring step
+3 ring steps per layer → 每层 CP 通信量 ≈ 201 MB（forward；backward 相似量级）
+70B 80 层：单 step CP 通信量 ≈ 80 × 201 MB × 2（fwd+bwd）≈ 32 GB
+
+对比标准 MHA（num_heads=64）：每步增至 537 MB，80 层 × 2 ≈ 256 GB（GQA 将 CP 通信量降低 8×）
+```
+
+> [!DANGER]
+> **GQA 下约 32 GB / step（标准 MHA 下约 256 GB），400G IB（50 GB/s）下纯通信时间分别约 0.64 s / 5.1 s。** 65K context 的 CP 必须依赖 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行，见 §4.2.2）才能将 exposed communication 压到可接受范围内，并且需要 800G 或更高带宽 IB 才能支撑大规模 CP。这是 CP 对网络最敏感的原因，也是 GQA 在长 context 下的隐性收益。
+
+**Ulysses（All-to-All CP）模式的通信量差异**
+
+Ulysses 把 Q/K/V 在 sequence 维度重排，通信方式是 All-to-All 而不是 ring send/recv：
+
+```text
+per All-to-All（每个 attention layer，forward）：
+  ulysses_bytes = micro_batch × seq × num_heads × head_dim × dtype_bytes × 2（QKV）
+
+All-to-All 每 rank 发送量 ≈ total / CP，接收量相同，通常效率高于 ring 但对拓扑敏感。
+```
 
 ### 4.7 EP 的位置
 
