@@ -6,6 +6,24 @@
 
 ## 1. 第一性原理拆解 + 学习大纲
 
+### 概念先说清楚
+
+多租户和成本治理里有很多词容易混用，先把边界定清楚：
+
+| 概念 | 一句话定义 | 工程上要落到哪里 |
+|------|------------|------------------|
+| Tenant | 拥有独立身份、预算、策略和审计边界的使用方 | API key、JWT claim、namespace、billing tag |
+| Isolation | 限制一个租户影响其他租户的范围 | GPU pool、MIG、queue、KV cache、日志与数据权限 |
+| Quota | 租户可消耗资源的硬上限或软上限 | gateway、scheduler、budget service |
+| Rate limit | 单位时间内允许进入系统的请求 / token 速率 | API gateway、router |
+| Fairness | 资源紧张时不同租户获得服务的规则 | 调度权重、reserved + burst、preemption |
+| Showback | 把成本展示给租户但不真实扣款 | 成本看板、月度报告 |
+| Chargeback | 把成本转成预算扣减或内部结算 | 财务系统、预算服务、准入控制 |
+| SLO class | 平台承诺的服务等级档位 | P99、可用性、warm pool、降级规则 |
+| Noisy neighbor | 一个租户的流量让其他租户 SLO 恶化 | 监控、隔离、限流、迁移 |
+
+**租户不是 Kubernetes namespace 的同义词**。一个租户可能跨多个 namespace、多个模型和多个区域；一个 namespace 里也可能有多个租户。真正不能丢的是 `tenant_id` 这条主线：从 gateway、router、model replica、KV cache、downstream trace 到账单，每一跳都要能带上同一个可审计的 tenant tag。
+
 ### 拆 — 不可化简的问题
 
 把所有平台名、调度器名、计费名词先拿掉，多租户与成本治理要解决的不可化简问题只有一个：**有限且昂贵的 GPU 时间，必须在多个会互相影响、价值不同、风险不同的请求之间分配，并且分配结果要能被解释、约束和纠偏**。GPU 不是一个抽象的"弹性资源"，它是每秒都在折旧或计费的物理设备；一次 LLM 请求也不是一个均匀的 HTTP 调用，而是输入 token 的 prefill、输出 token 的 decode、KV Cache 显存占用、下游检索 / rerank、日志与安全检查的组合。只要多个团队、多个模型版本、多个 SLA 档位进入同一个资源池，就必然出现四个不可逃避的事实：第一，资源在时间上有波峰波谷，按峰值隔离会贵，按平均共享会抖；第二，请求的成本差异极大，1K prompt 和 32K prompt 对 GPU、显存和排队的压力不是线性可替代的；第三，业务价值不同，核心生产流量和一次临时评测不应在高峰期拥有相同抢占权；第四，账单如果无法归因到租户和行为，就不会改变任何人的使用方式。
@@ -219,6 +237,32 @@ mindmap
 - **实验 / 离线 / 低优** → Spot / preemptible 池（最弱隔离，甚至可被抢占）
 
 这种分层让平台能同时达到"关键业务稳"和"整体利用率高"的目标。
+
+#### 17.2.2 Tenant isolation 的四层边界
+
+推理平台里的隔离不是一个开关，而是四层边界叠加：
+
+| 隔离层 | 要防什么 | 常见机制 | 成本代价 |
+|--------|----------|----------|----------|
+| 身份与权限隔离 | 租户越权调用模型、读取他人日志 | API key / OIDC、RBAC、OPA、审计日志 | 低，主要是控制面复杂度 |
+| 数据隔离 | prompt、response、RAG 文档、tool 结果串租户 | tenant-scoped cache key、per-tenant encryption、日志脱敏 | 中，cache 命中率可能下降 |
+| 资源隔离 | 一个租户吃满 GPU、显存、queue、下游 QPS | quota、rate limit、MIG、独占池、队列隔离 | 中到高，牺牲共享效率 |
+| 故障隔离 | 某租户 bug / 流量尖峰拖垮平台 | circuit breaker、bulkhead、独立副本、降级策略 | 高，需要冗余容量 |
+
+在 LLM serving 里，**缓存隔离尤其容易被低估**。Embedding cache、semantic cache、response cache、KV prefix cache 都必须把 tenant / model / policy version 纳入 key 或隔离域。否则命中率越高，越可能把 A 租户的上下文、权限或过期业务规则复用给 B 租户。
+
+```text
+安全的 cache key 至少包含:
+  tenant_id
+  model_id / model_version
+  tokenizer_version
+  policy_version
+  prompt_template_hash
+  data_acl_hash
+  normalized_input_hash
+```
+
+> **danger**：跨租户共享 system prompt 的 KV Cache 只有在 prompt 完全公共、没有租户私有工具、没有租户私有 policy、没有数据 ACL 差异时才安全。只要 tool schema 或安全策略按租户变化，就应把它们作为 prefix 的一部分，或者做 per-tenant cache namespace。
 
 ### 17.3 单位请求成本怎么看
 
@@ -610,6 +654,70 @@ MFU ≈ 140 × 2500 / 989000 ≈ 35%
 
 这个案例的启示：**不要只追"利用率"这个代理指标，要追"产出价值"这个实际指标**。
 
+### 17.4d GPU pool 与 autoscaling：把容量变成可治理的池子
+
+多租户平台通常不应该把所有 GPU 放进一个大池。更可控的做法是按 SLO、机型、引擎和抢占属性分池：
+
+| GPU pool | 典型租户 | 资源形态 | 调度规则 | 成本特征 |
+|----------|----------|----------|----------|----------|
+| `prod-reserved` | 核心产品、高 SLA 客户 | on-demand / on-prem，专用 warm pool | 保底容量优先，不轻易抢占 | 单价高，idle tax 明确 |
+| `prod-shared` | 普通线上业务 | on-demand / reserved 混合 | reserved + burst，按权重公平 | 利用率和尾延迟折中 |
+| `long-context` | 32K/128K 长上下文业务 | 大显存卡、fp8 KV、较低并发 | 按 input token 和 KV GB·s 限流 | 防止长 prompt 拖垮主池 |
+| `batch-eval` | 批评测、回放、离线 agent | spot / preemptible | 可抢占、可排队、可 checkpoint | 单价低，完成时间不稳定 |
+| `canary` | 新模型、新引擎、新版本 | 少量隔离副本 | 限租户、限流量、易回滚 | 容量小但避免污染主池 |
+
+Autoscaling 的目标也不能只写成"CPU/GPU 利用率高就扩容"。LLM 推理的扩缩容至少要看五类信号：
+
+| 信号 | 扩容含义 | 缩容风险 |
+|------|----------|----------|
+| queue wait / TTFT | 排队已经影响首 token | 新副本冷启动慢，可能来不及救 P99 |
+| decode occupancy | 自回归槽位被占满 | 缩容会让长输出租户互相挤压 |
+| KV pool pressure | 显存上下文容量不足 | 缩容会触发 eviction 和 cache miss |
+| request / token rate | 流量持续增长 | 只看 QPS 会低估长 prompt |
+| cache hit / prefix locality | 某些副本缓存已经热 | 缩掉热副本会造成成本反弹 |
+
+一个更像生产系统的 autoscaling 策略：
+
+```text
+scale_out if:
+  P95 queue_wait > 200ms for 5m
+  OR KV free ratio < 15% for 3m
+  OR goodput/SLO target < 98% for 5m
+
+scale_in only if:
+  P95 queue_wait < 50ms for 20m
+  AND KV free ratio > 35% for 20m
+  AND warm replica age > minimum_lifetime
+  AND replica is not a hot prefix/cache holder
+```
+
+> **warn**：大模型副本的冷启动通常是分钟级，包括镜像拉取、权重加载、CUDA graph / kernel warmup、prefix cache 预热。Autoscaling 必须配合预测式扩容和 warm pool；只靠反应式 HPA，常常是在高峰已经过去后才把副本拉起来。
+
+#### 17.4d.1 SLO class：把服务等级写成资源合同
+
+SLO class 是多租户成本治理的连接点：同一个请求，选择不同 SLO class，平台就应该给不同资源、不同价格、不同降级规则。
+
+| SLO class | 目标 | 资源策略 | 降级规则 | 计费 |
+|-----------|------|----------|----------|------|
+| Platinum | P99 TTFT < 300ms，可用性 99.95% | reserved pool + warm replica + 强隔离 | 只在全局故障时降级 | 高隔离溢价 |
+| Gold | P99 TTFT < 800ms，可用性 99.9% | shared pool + reserved quota | 容量紧张时限制 burst | 中等加成 |
+| Silver | P95 TTFT < 2s | shared pool + best effort burst | 可切小模型、截短输出 | 标准价 |
+| Batch | 完成时间按小时级 | spot / batch pool | 可排队、可抢占、可重试 | 折扣价 |
+
+SLO class 不能只写在文档里，必须进入 admission control：
+
+```text
+admission_score =
+  priority_weight(SLO)
++ reserved_capacity_credit
++ starvation_age_bonus
+- estimated_kv_cost
+- estimated_decode_time
+- budget_risk_penalty
+```
+
+这个分数不必一开始就很复杂，但要把平台政策变成可执行排序，而不是 on-call 临时决定谁让路。
+
 ### 17.5 公平性与利用率为什么会冲突
 
 如果你极度追求利用率，常见做法会是：
@@ -646,6 +754,37 @@ MFU ≈ 140 × 2500 / 989000 ≈ 35%
 
 大多数成熟平台用的是 **reserved + burst**（每人一个保底，burst 超出部分看总池剩余），具体实现参考 §17.7。
 
+#### 17.5.2 公平性算法如何落到 LLM 请求
+
+LLM 请求的公平性不能只按"请求数"算，因为一个 64K 输入、4K 输出的请求可能比几十个短请求更贵。更合理的做法是把请求换算成资源份额：
+
+```text
+estimated_request_cost =
+  a × input_tokens
++ b × output_tokens
++ c × expected_kv_gb_seconds
++ d × tool_calls
++ e × priority_penalty_or_discount
+```
+
+然后在租户维度做加权公平：
+
+```text
+tenant_deficit[T] += weight[T] × refill_rate
+admit request R from T only if tenant_deficit[T] >= estimated_request_cost(R)
+tenant_deficit[T] -= actual_request_cost(R) after completion
+```
+
+这种 token-bucket / deficit-round-robin 的混合策略有三个好处：
+
+| 好处 | 解释 |
+|------|------|
+| 短请求不会被长请求完全挤掉 | 长请求消耗更多 deficit，天然限速 |
+| 高权重租户可获得更多 burst | `weight` 直接表达业务优先级 |
+| 成本模型能反哺调度 | 估算越准确，公平性越接近真实资源消耗 |
+
+失败条件也要写清楚：如果 `estimated_output_tokens` 总是低估，长输出租户会占便宜；如果所有请求都在完成后才扣费，瞬时尖峰会突破池子。因此生产实现通常在 admission 时先按 `max_tokens` 或历史 P90 做预扣，完成后再按实际 token 结算，多退少补。
+
 ### 17.6 一个常见的治理工具箱
 
 多租户推理平台通常会用到：
@@ -679,6 +818,33 @@ MFU ≈ 140 × 2500 / 989000 ≈ 35%
 | 模型白名单 | 允许访问的模型 | 灰度控制 |
 
 成熟平台通常做成**多维度配额组合**，可以精细表达"这个租户每分钟最多 60 个请求，每个请求最长 8K 输入、2K 输出，总预算每月 $1000"。
+
+#### 17.6.2 Rate limit 与 quota 的区别
+
+Rate limit 管瞬时速率，quota 管一段时间内能用多少。两者都需要，因为它们处理的是不同事故：
+
+| 机制 | 时间尺度 | 防什么 | 例子 |
+|------|----------|--------|------|
+| Rate limit | 秒 / 分钟 | 流量尖峰打爆队列 | `600 RPM`、`2M input tokens/min` |
+| Concurrency limit | 当前时刻 | inflight 长请求占满 decode | `max 32 running requests` |
+| Daily quota | 天 | 自动任务失控烧钱 | `daily budget $500` |
+| Monthly budget | 月 | 团队长期超支 | `monthly budget $10K` |
+| Reserved quota | 长期合同 | 保证核心业务容量 | `reserved 4 GPU` |
+| Burst quota | 高峰临时借用 | 提升利用率 | `burst up to 12 GPU if pool idle` |
+
+入口处推荐按"由便宜到昂贵"的顺序检查：
+
+```text
+authn/authz
+→ tenant policy lookup
+→ request shape check (model, input length, max output)
+→ rate limit / concurrency limit
+→ budget check
+→ estimated cost precharge
+→ router / scheduler admission
+```
+
+越早拒绝越便宜。等请求进入 GPU prefill 后再拒绝，平台已经付出了最贵的成本。
 
 ### 17.7 一个简单的多租户策略示例
 
@@ -743,6 +909,17 @@ Router 选副本
 ```
 
 **关键点**：这些 check 必须在进入模型副本**之前**完成。如果到了 GPU 才发现超配额，GPU 的算力已经花了。
+
+#### 17.7.2 策略反模式
+
+| 反模式 | 结果 | 更好的做法 |
+|--------|------|------------|
+| 只按 QPS 限流 | 长 prompt 租户用很低 QPS 就能打满 GPU | 同时限制 input token/min、output token/min 和并发 |
+| 配额只写在文档里 | 网关和调度器无法执行 | 策略进入 policy service，所有入口强制检查 |
+| 高优租户无限 burst | 普通租户长期饿死 | reserved 保底 + burst 上限 + starvation guard |
+| 预算超了直接停服 | 租户月底业务事故 | 80% / 95% / 100% 分级降级 |
+| 所有租户共享一个 cache namespace | 越权和污染风险 | tenant-scoped cache key 或强隔离 |
+| 把实验流量放主池 | P99 被低价值任务拖高 | 实验进入 batch / spot / low-priority pool |
 
 ### 17.8 Chargeback 与成本归因
 
@@ -838,6 +1015,60 @@ Logging ───────┘
 
 只统计 LLM 那部分，就会低估 30-50% 的真实成本。**chargeback 要覆盖全链路依赖**，否则优化 LLM 的钱可能漏到向量库账单里。
 
+#### 17.8.3 成本公式：从 request trace 到租户账单
+
+实际系统里，最稳妥的做法是每个请求生成一条 cost trace：
+
+```json
+{
+  "tenant_id": "core_product",
+  "request_id": "req-123",
+  "model": "llama-70b-fp8",
+  "slo_class": "gold",
+  "input_tokens": 4200,
+  "output_tokens": 780,
+  "prefix_hit_tokens": 3000,
+  "kv_gb_seconds": 42.5,
+  "queue_ms": 80,
+  "prefill_ms": 260,
+  "decode_ms": 3100,
+  "tool_calls": 2,
+  "downstream_cost_usd": 0.003
+}
+```
+
+然后用同一套公式离线结算：
+
+```text
+effective_input_tokens = max(input_tokens - prefix_hit_tokens × cache_discount, 0)
+
+request_cost =
+  effective_input_tokens / 1e6 × input_rate
++ output_tokens / 1e6 × output_rate
++ kv_gb_seconds × kv_rate
++ downstream_cost
++ slo_multiplier × base_request_overhead
+
+tenant_monthly_bill =
+  sum(request_cost)
++ reserved_gpu_hours × reserved_rate
++ idle_tax_share
++ isolation_premium
+- spot_or_batch_discount
+```
+
+这里 `cache_discount` 可以小于 1，因为 prefix 命中虽然省了 prefill 计算，但仍占用 KV Cache 和调度资源。`slo_multiplier` 不应藏在黑盒里：Platinum 租户支付的 warm pool 和隔离溢价要能解释，否则 chargeback 会变成不可审计的内部税。
+
+#### 17.8.4 Showback 到 chargeback 的三阶段路线
+
+| 阶段 | 做什么 | 退出条件 |
+|------|--------|----------|
+| Stage 1: Showback | 只展示租户用量、成本估算和异常原因，不扣预算 | tenant tag 覆盖率 > 95%，token / trace 数据稳定 |
+| Stage 2: Budget guardrail | 超预算触发告警、软降级、需要审批才能继续 burst | 连续 2 个账期账单误差 < 10% |
+| Stage 3: Chargeback | 成本进入内部结算或硬预算扣减 | 租户认可规则，有争议处理流程 |
+
+不要跳过 showback。早期埋点一定会错：缺 tenant tag、token 计数不一致、重试重复计费、下游成本漏记都很常见。先展示、校准、建立信任，再把规则变成硬约束。
+
 ### 17.9 Noisy Neighbor 问题
 
 多租户共享 GPU 时，常见的麻烦并不是某个租户完全把服务打挂，而是它持续把别人的尾延迟拉高。
@@ -892,6 +1123,19 @@ LLM 服务里的租户流量分布通常比传统服务更极端：
 
 一刀切的策略通常对大户太松、对小户太紧。
 
+#### 17.9.3 Noisy neighbor 排障矩阵
+
+| 现象 | 可能的 noisy 源 | 快速确认 | 处置动作 |
+|------|-----------------|----------|----------|
+| 所有租户 TTFT 突然上升 | 某租户长上下文流量激增 | 按 tenant 看 input token P95 | 长上下文池、input token/min 限流 |
+| 短请求 P99 被拉高 | 长输出请求占 decode 槽位 | 按 tenant 看 output token P95 和 running time | max output 档位、decode 并发上限 |
+| admission reject 变多 | 某租户 KV Cache 占用过高 | KV GB·s / tenant、eviction rate | KV 配额、缩短上下文、独占池 |
+| cache hit 下降 | 新租户模板随机化或路由不亲和 | prefix hit / tenant、prompt hash diff | 模板治理、prefix-aware routing |
+| 下游依赖超时 | 某租户 tool / RAG 调用暴涨 | downstream QPS / tenant、timeout | tool rate limit、bulkhead、熔断 |
+| GPU 忙但 goodput 下降 | 低价值批任务进入主池 | SLO miss 与 batch job overlap | 迁移到 batch / spot 池 |
+
+Noisy neighbor 的处置原则是：先限影响面，再追根因。生产高峰时不应先做复杂归因，而是先把异常租户降级、限流或迁移到隔离池；事后再通过 trace 和成本报告修正策略。
+
 ### 17.10 把成本规则变成控制面动作
 
 如果成本治理只停留在看板，它就无法反过来改变平台行为。更实用的做法是把预算、SLA 和容量策略直接接进控制面。
@@ -935,6 +1179,85 @@ Budget exceeded (100%):
 ```
 
 这种状态机的价值在于**可预测**——当预算告警时，租户事先知道会发生什么。避免"月底突然全服务被砍"这种运营灾难。
+
+#### 17.10.2 Worked Example：三租户共享 24 张 H100 的治理方案
+
+假设平台有 24 张 H100，服务三个租户：
+
+| 租户 | 业务 | 流量特征 | SLO | 月预算 |
+|------|------|----------|-----|--------|
+| `search_core` | 线上搜索问答 | 2K 输入、500 输出，高峰明显 | Gold | $40K |
+| `agent_ops` | 内部 agent 工具 | 6K 输入、1K 输出，tool 调用多 | Silver | $12K |
+| `eval_lab` | 离线评测 | 可排队、长输出 | Batch | $8K |
+
+先把 24 张卡分池：
+
+| Pool | GPU | 租户 | 规则 |
+|------|-----|------|------|
+| prod-reserved | 8 | `search_core` | 保底，warm replicas，不被低优抢占 |
+| prod-shared | 10 | `search_core` + `agent_ops` | weighted fair，search 权重 3，agent 权重 1 |
+| long-context | 2 | `agent_ops` | 8K+ 输入路由到这里，限制并发 |
+| batch-spot | 4 | `eval_lab` | 可抢占，低价，完成时间 best effort |
+
+策略写成可执行规则：
+
+```yaml
+tenants:
+  search_core:
+    slo_class: gold
+    reserved_gpu: 8
+    burst_gpu: 8
+    input_tokens_per_min: 8_000_000
+    output_tokens_per_min: 2_000_000
+    max_input_tokens: 8192
+    max_output_tokens: 1024
+    monthly_budget_usd: 40000
+
+  agent_ops:
+    slo_class: silver
+    reserved_gpu: 0
+    burst_gpu: 6
+    input_tokens_per_min: 3_000_000
+    output_tokens_per_min: 800_000
+    max_input_tokens: 32768
+    max_output_tokens: 2048
+    long_context_pool_threshold: 8192
+    monthly_budget_usd: 12000
+
+  eval_lab:
+    slo_class: batch
+    reserved_gpu: 0
+    burst_gpu: 4
+    preemptible: true
+    max_output_tokens: 4096
+    monthly_budget_usd: 8000
+```
+
+按 §17.8 的公式估算一个月后：
+
+| 租户 | 主要成本来源 | 月成本 | 治理动作 |
+|------|--------------|--------|----------|
+| `search_core` | reserved + 高峰 burst + warm pool | $37K | 正常，继续保留 Gold |
+| `agent_ops` | 长上下文 KV GB·s + tool rerank | $15K | 超预算 25%，触发 Silver 降级：8K+ 请求排队或摘要 |
+| `eval_lab` | spot GPU-hour + 长输出 | $5K | 低于预算，可增加夜间 batch 配额 |
+
+一次事故复盘：某天 `agent_ops` 发布新 prompt，把完整工具日志塞进下一轮 observation，平均输入从 6K 变成 24K。平台看到：
+
+```text
+agent_ops input_tokens/min ↑ 3.8x
+long-context pool KV free ratio ↓ to 8%
+search_core P99 TTFT 在 shared pool 上升 600ms
+agent_ops 月预算预测从 $12K → $28K
+```
+
+控制面自动执行：
+
+1. `agent_ops` 8K+ 请求全部路由到 `long-context` 池，禁止进入 `prod-shared`。
+2. `agent_ops` 超过 16K 的 observation 先摘要，否则返回 400。
+3. `search_core` 暂停借出 reserved pool 的空闲容量。
+4. 给 `agent_ops` 发 showback 报告：成本上涨来自 input token 和 KV GB·s，而不是 QPS。
+
+这个案例说明，多租户治理不是一个单点功能，而是 tenant tag、资源池、quota、SLO class、成本公式和自动化动作的闭环。
 
 ### 17.11 发布与回滚：多租户里的"额外一层复杂度"
 

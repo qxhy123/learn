@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d2 章 · NIC Offload、队列与服务网络 IO — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d2" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d2 章 · NIC Offload、队列与服务网络 IO</h1>
+<p class="sub">从每包 CPU 成本出发，拆解 TSO/GSO/GRO/LRO、checksum offload、RSS/RPS/XPS、IRQ affinity、softirq 与推理网关网络 IO。</p>
+<div class="chips"><span class="chip">TSO/GSO</span><span class="chip">GRO/LRO</span><span class="chip">RSS</span><span class="chip">IRQ affinity</span><span class="chip">softirq</span><span class="chip">推理网关</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#nic-offload-总览">2. NIC Offload 总览</a></li><li><a class="anchor" href="#tso-与-gso发送侧分段">3. TSO 与 GSO：发送侧分段</a></li><li><a class="anchor" href="#gro-与-lro接收侧合并">4. GRO 与 LRO：接收侧合并</a></li><li><a class="anchor" href="#checksum-offload-与抓包误判">5. Checksum Offload 与抓包误判</a></li><li><a class="anchor" href="#multi-queue-与-rss">6. Multi-Queue 与 RSS</a></li><li><a class="anchor" href="#rpsrfs-与-xps">7. RPS、RFS 与 XPS</a></li><li><a class="anchor" href="#irq-affinitynapi-与-softirq">8. IRQ Affinity、NAPI 与 Softirq</a></li><li><a class="anchor" href="#ring-bufferdescriptor-与-drop">9. Ring Buffer、Descriptor 与 Drop</a></li><li><a class="anchor" href="#服务网络-io推理网关视角">10. 服务网络 IO：推理网关视角</a></li><li><a class="anchor" href="#control-plane-网络-io">11. Control Plane 网络 IO</a></li><li><a class="anchor" href="#mini-case推理网关-p99-从-30-ms-抖到-300-ms">12. Mini Case：推理网关 P99 从 30 ms 抖到 300 ms</a></li><li><a class="anchor" href="#mini-casetso-关闭后-cpu-飙高">13. Mini Case：TSO 关闭后 CPU 飙高</a></li><li><a class="anchor" href="#观测-sop">14. 观测 SOP</a></li><li><a class="anchor" href="#checklist">15. Checklist</a></li><li><a class="anchor" href="#练习">16. 练习</a></li><li><a class="anchor" href="#worked-examplerss-热点导致-p99-尖刺">17. Worked Example：RSS 热点导致 P99 尖刺</a></li><li><a class="anchor" href="#worked-examplegro-改善吞吐但伤害流式响应">18. Worked Example：GRO 改善吞吐但伤害流式响应</a></li><li><a class="anchor" href="#offload-变更风险表">19. Offload 变更风险表</a></li><li><a class="anchor" href="#生产观测指标建议">20. 生产观测指标建议</a></li><li><a class="anchor" href="#推理网关网络-io-设计-checklist">21. 推理网关网络 IO 设计 checklist</a></li><li><a class="anchor" href="#练习延伸用数据证明队列问题">22. 练习延伸：用数据证明队列问题</a></li><li><a class="anchor" href="#队列调优的顺序">23. 队列调优的顺序</a></li><li><a class="anchor" href="#观测字段对照表">24. 观测字段对照表</a></li><li><a class="anchor" href="#服务发布前网络-io-gate">25. 服务发布前网络 IO gate</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章承接 <a
+href="0d1-linux-network-stack-tcp-and-mtu.html">0d1</a> 的 Linux/TCP
+路径，并与 <a
+href="0b4-syscall-epoll-io-uring-and-service-io.html">0b4</a> 的服务 IO
+模型衔接。RDMA 数据面见 <a
+href="0d3-rdma-roce-infiniband-and-gpudirect.html">0d3</a>。</p>
+</blockquote>
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>网络带宽增长得比单核处理包的能力快。100G、200G、400G
+网卡可以每秒产生数百万到数千万个包，而每个包如果都由 CPU
+做分段、校验、协议头处理、中断、队列选择和 wakeup，服务 CPU
+很快会花在“照看包”而不是业务上。</p>
+<h3 id="推--从问题推出机制">推 — 从问题推出机制</h3>
+<p>因为每包成本太高，所以有 checksum
+offload、TSO、GSO、GRO、LRO；因为单队列无法利用多核，所以有
+multi-queue、RSS、MSI-X；因为硬件哈希不总够用，所以有
+RPS、RFS、XPS；因为中断太多会打爆 CPU，所以有 NAPI、interrupt moderation
+和 softirq budget；因为服务需要稳定 P99，所以必须把 NIC queue、IRQ
+CPU、NUMA 和应用 worker 放在同一张图上。</p>
+<h3 id="概念先说清楚">概念先说清楚</h3>
+<p>NIC offload
+指把一部分重复、机械、每包成本高的网络处理交给网卡、驱动或更低层的软件路径完成。Checksum
+offload 让 NIC 填校验和，TSO/GSO 把大 skb 延后切段，GRO/LRO
+把接收侧多个小包合并成大 skb。它们的共同目标是减少 CPU
+每包处理成本，不是改变 TCP 的可靠性语义，也不是让链路 MTU 失效。offload
+打开后，抓包位置和真实线上帧不再完全一致，所以排障时要同时看本机抓包、对端抓包、NIC
+counter 和交换机 counter。</p>
+<p>Multi-queue 是现代 NIC 把收发路径拆成多组 RX/TX queue。RSS 根据五元组
+hash 把流量分到不同 RX queue，每个 queue 通常有自己的 MSI-X interrupt
+vector，再绑定到某个 CPU 处理 NAPI poll 和
+softirq。它解决的是“多流如何利用多核”，不是“单个 TCP
+连接自动用满所有队列”。如果流量熵不足、长连接过于集中、RSS indirection
+table 配错，系统总 CPU 可能不高，但某个 queue、某个 IRQ CPU 或某个
+softirq 会成为 P99 尾部。</p>
+<p>IRQ affinity、RPS/RFS/XPS 和 NUMA 解决的是“包在哪个 CPU
+上处理、应用在哪个 CPU 上消费、内存和 NIC 离哪个 socket 近”。服务网络 IO
+的性能不是只由网卡速率决定，而是由 NIC queue、interrupt
+vector、softirq、socket queue、event loop、worker 线程和 NUMA locality
+串起来决定。理解这些对象的边界后，<code>softirq</code> 高、某个 RX queue
+drop、event loop lag、TLS CPU 高和应用 backpressure
+才能被放到同一条因果链里。</p>
+<h3 id="绘--nic-到-cpu-的并行结构">绘 — NIC 到 CPU 的并行结构</h3>
+<pre class="mermaid">flowchart LR
+  Wire[wire packets] --> NIC[NIC parser/offload]
+  NIC --> RX0[RX queue 0]
+  NIC --> RX1[RX queue 1]
+  NIC --> RXN[RX queue N]
+  RX0 --> IRQ0[MSI-X vector CPU0]
+  RX1 --> IRQ1[MSI-X vector CPU1]
+  RXN --> IRQN[MSI-X vector CPUn]
+  IRQ0 --> Soft[NET_RX softirq]
+  IRQ1 --> Soft
+  IRQN --> Soft
+  Soft --> Sock[socket queues]
+  Sock --> App[service workers]</pre>
+<h3 id="导--本章问题清单">导 — 本章问题清单</h3>
+<ol type="1">
+<li>TSO、GSO、GRO、LRO、checksum offload 分别节省哪段 CPU？</li>
+<li>为什么打开 offload 后抓包和真实链路帧可能不一致？</li>
+<li>RSS 如何把流分配到 RX queue，为什么五元组熵不足会导致热点？</li>
+<li>IRQ affinity、RPS、XPS、NUMA 如何影响服务尾延迟？</li>
+<li>softirq 高说明什么，为什么总 CPU 不高也可能 P99 抖动？</li>
+<li>推理网关、控制面服务、sidecar proxy 应该如何设计网络 IO 观测？</li>
+</ol>
+<h2 id="2-nic-offload-总览">2. NIC Offload 总览</h2>
+<p>NIC offload
+的本质是把可机械执行、重复度高、每包成本高的工作下推给硬件或更靠近驱动的路径。它不是免费午餐：offload
+会改变观测点、影响抓包解释、引入驱动/固件差异，也可能在虚拟化、容器、overlay
+或安全策略下被禁用。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>发送/接收</th>
+<th>节省什么</th>
+<th>排查注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>checksum offload</td>
+<td>两侧</td>
+<td>IP/TCP/UDP checksum 计算</td>
+<td>抓包可能显示 checksum incorrect，因为抓包发生在硬件填充前。</td>
+</tr>
+<tr>
+<td>TSO</td>
+<td>发送</td>
+<td>CPU 不必按 MSS 切 TCP 段</td>
+<td>本机看到大 skb，不代表线速帧超 MTU。</td>
+</tr>
+<tr>
+<td>GSO</td>
+<td>发送</td>
+<td>软件统一处理大 skb 后再分段</td>
+<td>TSO 不可用时由内核分段。</td>
+</tr>
+<tr>
+<td>GRO</td>
+<td>接收</td>
+<td>把多个包合并成大 skb</td>
+<td>降低每包成本，但可能影响延迟和抓包粒度。</td>
+</tr>
+<tr>
+<td>LRO</td>
+<td>接收</td>
+<td>更激进接收合并</td>
+<td>不适合所有转发/路由场景，可能破坏语义假设。</td>
+</tr>
+<tr>
+<td>RSS</td>
+<td>接收</td>
+<td>多队列并行收包</td>
+<td>依赖 hash key、indirection table 和流量熵。</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-tso-与-gso发送侧分段">3. TSO 与 GSO：发送侧分段</h2>
+<p>没有 TSO 时，内核需要把应用的大写入切成许多 MSS 大小的 TCP
+segment，为每个 segment 准备头、checksum 和 skb 元数据。TSO
+打开后，内核可以把较大的 skb 交给 NIC，由 NIC 按 MSS 产生线速帧。GSO
+是软件版本，提供统一抽象；TSO 是硬件执行。</p>
+<p>对大吞吐服务，TSO 可以显著降低 CPU；对极低延迟服务，过大的聚合可能与
+pacing、队列延迟产生相互作用，需要结合 P99 测试。不要凭“offload
+一定更快”做结论。</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-k</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;tcp-segmentation|generic-segmentation|tx-checksum&#39;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tcpdump</span> <span class="at">-i</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> -nn host <span class="op">&lt;</span>peer_ip<span class="op">&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-tinm</span> dst <span class="op">&lt;</span>peer_ip<span class="op">&gt;</span></span></code></pre></div>
+<h2 id="4-gro-与-lro接收侧合并">4. GRO 与 LRO：接收侧合并</h2>
+<p>GRO 把同一流的多个连续包合并成一个较大的
+skb，再交给协议栈上层。这样每个包触发的协议处理、内存分配和调度成本降低。LRO
+更偏硬件/驱动层，合并更激进，转发、桥接、虚拟化和某些安全场景下可能不适合。</p>
+<p>推理网关如果请求很小，GRO 的收益可能不如长连接大吞吐明显；如果响应
+token streaming 以小 chunk
+发出，接收侧合并也不能解决发送侧应用写小块的问题。</p>
+<h2 id="5-checksum-offload-与抓包误判">5. Checksum Offload
+与抓包误判</h2>
+<p>发送端抓包常见 <code>bad checksum</code>，这往往只是因为 tcpdump
+抓到的是 NIC 填 checksum 之前的 skb。判断线上 checksum
+错误要看对端、交换机、NIC error counter，而不是只看发送端抓包。</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-k</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;checksum|scatter-gather&#39;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;csum|checksum|err|crc|symbol&#39;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-s</span> link show dev <span class="op">&lt;</span>iface<span class="op">&gt;</span></span></code></pre></div>
+<h2 id="6-multi-queue-与-rss">6. Multi-Queue 与 RSS</h2>
+<p>现代 NIC 有多个 RX/TX queue。RSS 根据 hash key 和 indirection table
+把包分到 RX queue，常见输入是五元组。每个 RX queue 通常对应一个 MSI-X
+vector，再绑定到某个 CPU。这样多流可以并行处理，单流通常仍落在一个 RX
+queue。</p>
+<pre class="mermaid">flowchart TB
+  F[packet five-tuple] --> H[RSS hash]
+  H --> T[indirection table]
+  T --> Q[RX queue]
+  Q --> V[MSI-X vector]
+  V --> C[CPU handles NAPI]
+  C --> S[socket receive queue]</pre>
+<p>单个大流不能靠 RSS 自动分到多个 RX queue；多个连接如果五元组相似或
+NAT/负载均衡导致熵不足，也可能集中在少数 queue。推理网关常见问题是总 QPS
+不高，但某个 queue 和某个 CPU 被长连接或热点客户端打满。</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-l</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-x</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;rx_queue|tx_queue|rx[0-9]|tx[0-9]&#39;</span></span></code></pre></div>
+<h2 id="7-rpsrfs-与-xps">7. RPS、RFS 与 XPS</h2>
+<p>RPS 在软件层把接收处理分发到其他 CPU，弥补硬件 RSS queue 不足；RFS
+尝试把包送到消费该 socket 的 CPU，提高 cache locality；XPS
+控制发送侧由哪个 TX queue 发包，通常希望与运行发送线程的 CPU/NUMA
+对齐。</p>
+<p>这些机制能解决队列分布问题，也可能增加跨核 IPI 和 cache
+迁移。启用前要知道应用 worker 在哪些 CPU 上，NIC 属于哪个 NUMA node，IRQ
+当前落在哪里。</p>
+<h2 id="8-irq-affinitynapi-与-softirq">8. IRQ Affinity、NAPI 与
+Softirq</h2>
+<p>低流量时中断让包尽快被处理；高流量时每包中断会压垮 CPU，于是 NAPI
+切换到 poll。NAPI poll 的工作通常在 softirq 上下文执行，受 budget
+限制。<code>NET_RX</code> 某个 CPU
+异常高，是网络接收热点的重要信号。</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/interrupts <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;mlx|eth|ens|enp&#39;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/softirqs <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;NET_RX|NET_TX&#39;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mpstat</span> <span class="at">-P</span> ALL 1</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-Leo</span> pid,psr,comm <span class="kw">|</span> <span class="fu">head</span></span></code></pre></div>
+<p>IRQ affinity 的目标不是“平均撒到所有 CPU”，而是让网络处理、应用
+worker、NUMA 内存和 NIC PCIe locality 尽量一致。对于双 socket 机器，把
+NIC0 的 IRQ 打到远端 socket，可能让每个包多跨一次 UPI/QPI。</p>
+<h2 id="9-ring-bufferdescriptor-与-drop">9. Ring Buffer、Descriptor 与
+Drop</h2>
+<p>NIC driver 通过 RX/TX ring 与硬件交换 descriptor。RX ring
+太小会在突发流量下丢包；太大可能增加排队延迟。TX ring 满可能导致 requeue
+或 qdisc backlog。ring 参数要结合 burst、P99 和内存预算调整。</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-g</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-G</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> rx 4096 tx 4096</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;rx.*drop|rx.*miss|tx.*drop|timeout|buffer|ring&#39;</span></span></code></pre></div>
+<h2 id="10-服务网络-io推理网关视角">10. 服务网络 IO：推理网关视角</h2>
+<p>推理网关通常不是最大带宽问题，而是大量连接、短请求、长响应、token
+streaming、TLS、负载均衡、连接池、慢客户端和 backpressure 的组合。网络
+IO 的目标是让事件循环少做无效工作，让慢连接不能拖住快连接，让 RX/TX
+queue 分布和 worker 调度可控。</p>
+<table>
+<thead>
+<tr>
+<th>服务现象</th>
+<th>网络层可能原因</th>
+<th>应用层联动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P99 偶发尖刺</td>
+<td>单 IRQ CPU softirq 高</td>
+<td>worker 与 IRQ 争核，event loop lag。</td>
+</tr>
+<tr>
+<td>长连接分布不均</td>
+<td>RSS hash 或 SO_REUSEPORT 不均</td>
+<td>少数 listener/worker 热。</td>
+</tr>
+<tr>
+<td>send-q 持续升高</td>
+<td>慢客户端或下游拥塞</td>
+<td>需要 per-connection pending bytes。</td>
+</tr>
+<tr>
+<td>CPU 总体不高但延迟高</td>
+<td>单 queue 热点</td>
+<td>看 per-CPU 而不是平均 CPU。</td>
+</tr>
+</tbody>
+</table>
+<h2 id="11-control-plane-网络-io">11. Control Plane 网络 IO</h2>
+<p>Kubernetes API、scheduler、controller、metadata service、对象存储
+gateway 对带宽不敏感，但对连接建立、DNS、TLS、RPC
+timeout、重试风暴和队列长度敏感。它们通常继续走 TCP 和内核网络栈，因此
+0d1 的 TCP 基础和本章的队列/IRQ 仍然重要。</p>
+<p>控制面服务更需要保护：限制并发、连接池、指数退避、jitter、熔断、请求预算、慢依赖隔离。网络栈
+counter 只能说明一部分问题，必须和应用队列、RPC retry、GC、CPU profile
+一起看。</p>
+<h2 id="12-mini-case推理网关-p99-从-30-ms-抖到-300-ms">12. Mini
+Case：推理网关 P99 从 30 ms 抖到 300 ms</h2>
+<p>现象：平均延迟正常，P99 偶发 300 ms；网卡 25G
+未打满；<code>mpstat</code> 显示 CPU 总体
+35%；<code>cat /proc/softirqs</code> 显示 CPU 7 的 <code>NET_RX</code>
+明显高；<code>ethtool -S</code> 显示 rx_queue_3 包数远高于其他队列。</p>
+<p>推导：总带宽不是瓶颈，热点可能在 RSS queue 和 IRQ
+CPU。连接经过四层负载均衡后五元组熵不足，大量长连接落到同一 RX queue；该
+IRQ 与一个 event loop worker 同核，导致应用调度延迟。</p>
+<p>处理：调整 RSS indirection table，确认 hash field 包含源端口；把 IRQ
+affinity 移到同 NUMA 的独立 CPU；应用侧启用多 listener 或 SO_REUSEPORT
+并验证分布；为慢客户端设置 pending bytes 上限。复测必须同时记录
+per-queue counter、per-CPU softirq、event loop lag 和 P99。</p>
+<h2 id="13-mini-casetso-关闭后-cpu-飙高">13. Mini Case：TSO 关闭后 CPU
+飙高</h2>
+<p>现象：一次安全基线变更后，服务吞吐下降 40%，CPU user 不变但 system
+升高，<code>perf top</code> 中 TCP 分段和 checksum
+相关函数上升。<code>ethtool -k</code> 发现 TSO/GSO/checksum offload
+被关闭。</p>
+<p>推导：原本由 NIC 执行的分段和 checksum 回到
+CPU，每个大响应被拆成大量小段处理。恢复 offload 后 CPU
+降低；但同时需要验证抓包中的 checksum 报告不再被误读。</p>
+<h2 id="14-观测-sop">14. 观测 SOP</h2>
+<ol type="1">
+<li>固定负载和时间窗口，记录 P50/P95/P99/P999。</li>
+<li>看
+per-CPU：<code>mpstat -P ALL 1</code>、<code>/proc/softirqs</code>、<code>/proc/interrupts</code>。</li>
+<li>看 per-queue：<code>ethtool -S</code>，比较 RX/TX queue 分布。</li>
+<li>看 offload：<code>ethtool -k</code> 与基线 diff。</li>
+<li>看 ring：<code>ethtool -g</code> 和 drop/miss/timeout counter。</li>
+<li>看应用：event loop lag、pending bytes、连接分布、worker CPU。</li>
+<li>看 NUMA：NIC PCIe locality、worker pinning、IRQ affinity。</li>
+<li>每次只改一个变量，并保留回滚命令。</li>
+</ol>
+<h2 id="15-checklist">15. Checklist</h2>
+<ul>
+<li>offload 状态有基线，变更会自动 diff。</li>
+<li>RSS queue 数、indirection table、hash field 已记录。</li>
+<li>IRQ affinity 与 NIC NUMA、应用 worker 对齐。</li>
+<li><code>NET_RX</code>/<code>NET_TX</code> softirq 无单核热点。</li>
+<li>RX/TX ring、drop、miss、timeout counter 有告警。</li>
+<li>SO_REUSEPORT、listener、连接池分布有观测。</li>
+<li>慢客户端 pending bytes、write timeout、取消传播有上限。</li>
+<li>压测覆盖长连接、小请求、大响应、token streaming 和突发重连。</li>
+</ul>
+<h2 id="16-练习">16. 练习</h2>
+<ol type="1">
+<li>解释 TSO、GSO、GRO、LRO 的区别，并说明各自改变哪个观测点。</li>
+<li>给定 <code>NET_RX</code> 单核高、总 CPU 低，写出排查步骤。</li>
+<li>设计一个推理网关的 per-connection pending bytes 策略。</li>
+<li>解释为什么单 TCP 流通常不会被 RSS 分到多个 RX queue。</li>
+<li>比较增大 RX ring 与降低 P99 的 tradeoff。</li>
+<li>写一份 offload 变更前后的验证计划。</li>
+</ol>
+<h2 id="17-worked-examplerss-热点导致-p99-尖刺">17. Worked Example：RSS
+热点导致 P99 尖刺</h2>
+<p>环境：一台推理网关有 32 核、25G NIC、8 个 worker。压测平均 QPS
+只有容量的 40%，但 P99 从 40 ms 跳到 250 ms。<code>top</code> 看总 CPU
+不高，应用日志只显示 event loop lag。</p>
+<p>观测：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mpstat</span> <span class="at">-P</span> ALL 1</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/softirqs <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;CPU|NET_RX|NET_TX&#39;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/interrupts <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;&lt;iface&gt;|mlx|ens|enp&#39;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;rx_queue|tx_queue|rx[0-9]|tx[0-9]&#39;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-x</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span></span></code></pre></div>
+<p>结果发现 RX queue 2 的包量是其他队列 5 倍，MSI-X vector 绑定 CPU
+11，而 CPU 11 同时运行一个最忙的 gateway
+worker。负载均衡器到网关之间复用了少数长连接，源端口熵不足，RSS
+把这些连接打到同一个 queue。</p>
+<p>修复顺序：</p>
+<ol type="1">
+<li>调整上游连接池，让到每个网关实例的连接数增加并分散源端口。</li>
+<li>检查 RSS hash field 和 indirection table，确认 RX queue
+分布均匀。</li>
+<li>把 NIC IRQ 绑定到同 NUMA 但不跑 event loop 的 CPU 集合。</li>
+<li>应用启用多 listener 或 <code>SO_REUSEPORT</code>，验证 worker
+接收连接分布。</li>
+<li>复测 P99，同时保存 per-queue、per-CPU、event loop lag
+三组曲线。</li>
+</ol>
+<p>这个案例的关键是：平均 CPU 和平均带宽都不能解释队列热点。网络 IO
+的尾延迟问题必须看 per-CPU 和 per-queue。</p>
+<h2 id="18-worked-examplegro-改善吞吐但伤害流式响应">18. Worked
+Example：GRO 改善吞吐但伤害流式响应</h2>
+<p>环境：一个 token streaming 服务把模型输出以小 chunk 写回客户端。打开
+GRO 后，大文件下载吞吐更好，但流式首 token 后的间隔抖动增大。</p>
+<p>推导：GRO
+在接收侧合并包，减少每包协议处理；对大响应和反向代理接收上游数据有收益。但流式场景的延迟常由应用
+flush、TLS record、代理缓冲、Nagle/<code>TCP_NODELAY</code>、发送侧
+qdisc 和慢客户端共同决定。GRO 不能替代应用层的 write
+策略，某些场景下合并会让观测粒度变粗。</p>
+<p>验证方法：</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-k</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;generic-receive-offload|large-receive-offload&#39;</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-N</span> <span class="at">-w</span> <span class="st">&#39;%{time_starttransfer}\n&#39;</span> http://<span class="op">&lt;</span>gateway<span class="op">&gt;</span>/stream</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-tinm</span> sport = :<span class="op">&lt;</span>port<span class="op">&gt;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> top <span class="at">-g</span> <span class="at">--call-graph</span> dwarf</span></code></pre></div>
+<p>如果关闭 GRO 后 CPU 明显升高但 P99
+改善，需要权衡服务目标。推理网关通常可以按接口或服务类型区分策略：高吞吐后端链路保留
+GRO，大量小响应前端链路重点优化应用 flush、连接池和 worker 调度。</p>
+<h2 id="19-offload-变更风险表">19. Offload 变更风险表</h2>
+<table>
+<thead>
+<tr>
+<th>变更</th>
+<th>可能收益</th>
+<th>主要风险</th>
+<th>回滚信号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>开 TSO/GSO</td>
+<td>降低发送 CPU</td>
+<td>抓包更难解释，驱动 bug 暴露</td>
+<td>system CPU 下降但 retrans/drop 增长。</td>
+</tr>
+<tr>
+<td>关 TSO/GSO</td>
+<td>更贴近线速帧观测</td>
+<td>CPU 分段成本上升</td>
+<td>吞吐下降、<code>tcp_*segment*</code> 热。</td>
+</tr>
+<tr>
+<td>开 GRO</td>
+<td>降低接收每包成本</td>
+<td>小流延迟和抓包粒度变化</td>
+<td>P99 上升、流式 chunk 间隔变大。</td>
+</tr>
+<tr>
+<td>增大 RX ring</td>
+<td>吸收突发</td>
+<td>排队延迟增加</td>
+<td>drop 降了但 P99 升了。</td>
+</tr>
+<tr>
+<td>调 IRQ affinity</td>
+<td>降低热点和跨 NUMA</td>
+<td>绑定错误造成更严重热点</td>
+<td><code>NET_RX</code> 单核升高或远端 NUMA 访问增加。</td>
+</tr>
+</tbody>
+</table>
+<p>任何 offload
+变更都要在与生产相似的包大小、连接数、响应模式下测。只用大包吞吐测试不能覆盖推理网关、代理和控制面。</p>
+<h2 id="20-生产观测指标建议">20. 生产观测指标建议</h2>
+<p>主机层至少记录：</p>
+<ul>
+<li>per-CPU <code>NET_RX</code>、<code>NET_TX</code> softirq。</li>
+<li>per-IRQ 中断速率和 affinity。</li>
+<li>per-RX/TX queue packet、byte、drop、miss、timeout。</li>
+<li>offload 状态快照与配置 drift。</li>
+<li>qdisc backlog/drop/requeue。</li>
+<li>TCP retrans、listen overflow、accept queue、orphan、reset。</li>
+</ul>
+<p>应用层至少记录：</p>
+<ul>
+<li>event loop lag 或 reactor tick delay。</li>
+<li>每个 worker 的 active connection、pending bytes、write buffer。</li>
+<li>request queue wait、上游连接池等待、下游写阻塞。</li>
+<li>慢客户端数量和断开原因。</li>
+<li>P50/P95/P99/P999 分布，不只看平均。</li>
+</ul>
+<p>把这些指标按同一时间轴展示，才能判断是 NIC queue 先热、softirq
+先热，还是应用 worker 先堵。</p>
+<h2 id="21-推理网关网络-io-设计-checklist">21. 推理网关网络 IO 设计
+checklist</h2>
+<ol type="1">
+<li>listener 数与 worker 数匹配，连接分布可观测。</li>
+<li>worker CPU、IRQ CPU、NIC NUMA 有明确亲和策略。</li>
+<li>慢客户端有 <code>write_timeout</code>、pending bytes
+上限和取消传播。</li>
+<li>上游连接池有最大连接数、最大 pending 请求和健康检查。</li>
+<li>token streaming 使用明确 flush 策略，并验证 TLS/proxy
+是否缓冲。</li>
+<li>对大响应和小响应分别压测，不混成一个平均数。</li>
+<li>offload、RSS、ring、IRQ 配置纳入启动检查或节点验收。</li>
+<li>任何 P99 事故复盘都包含 per-queue 和 per-CPU 图。</li>
+</ol>
+<h2 id="22-练习延伸用数据证明队列问题">22.
+练习延伸：用数据证明队列问题</h2>
+<p>给一组压测数据：P99 尖刺时总 CPU 40%、NIC 带宽 30%、CPU 9 的
+<code>NET_RX</code> 为其他 CPU 的 6 倍、rx_queue_5 包量为其他 queue 的 7
+倍。请写出：</p>
+<ol type="1">
+<li>你会先否定哪些假设。</li>
+<li>你会追加哪些命令。</li>
+<li>你会如何区分 RSS 熵不足、IRQ 绑定错误和应用 worker 热点。</li>
+<li>你会如何设计一次最小变更验证。</li>
+</ol>
+<h2 id="23-队列调优的顺序">23. 队列调优的顺序</h2>
+<p>队列调优要按“证明热点、解释热点、移动热点、复测尾延迟”的顺序做。</p>
+<ol type="1">
+<li>证明热点：比较 per-queue packet/byte/drop、per-CPU
+<code>NET_RX</code>、IRQ rate。</li>
+<li>解释热点：看 RSS hash、indirection
+table、连接五元组、上游连接池、NAT/LB 行为。</li>
+<li>移动热点：调整连接熵、RSS table、IRQ affinity、worker pinning 或
+listener 分布。</li>
+<li>复测尾延迟：同时看 P99/P999、event loop lag、drop、softirq、CPU
+steal。</li>
+</ol>
+<p>不要把“均匀”当成唯一目标。某些低延迟服务会把 IRQ 放在独立 CPU，避免和
+worker 抢核；某些高吞吐服务会让 IRQ 和 worker 保持 cache
+locality。目标不同，最优亲和策略不同。</p>
+<h2 id="24-观测字段对照表">24. 观测字段对照表</h2>
+<table>
+<thead>
+<tr>
+<th>字段/命令</th>
+<th>说明</th>
+<th>异常解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/proc/interrupts</code></td>
+<td>MSI-X vector 到 CPU 的分布</td>
+<td>单 vector 过热或跑到远端 NUMA。</td>
+</tr>
+<tr>
+<td><code>/proc/softirqs</code></td>
+<td>网络 softirq 工作量</td>
+<td><code>NET_RX</code> 单核高说明接收处理热点。</td>
+</tr>
+<tr>
+<td><code>ethtool -S</code> queue counter</td>
+<td>RX/TX 队列包数、字节、drop</td>
+<td>RSS/XPS 分布不均或 ring 溢出。</td>
+</tr>
+<tr>
+<td><code>ethtool -k</code></td>
+<td>offload 状态</td>
+<td>与基线不一致可能改变 CPU 和抓包解释。</td>
+</tr>
+<tr>
+<td><code>ethtool -g</code></td>
+<td>ring 大小</td>
+<td>太小易 drop，太大可能增加排队。</td>
+</tr>
+<tr>
+<td>应用 pending bytes</td>
+<td>每连接待写数据</td>
+<td>慢客户端或下游拥塞。</td>
+</tr>
+</tbody>
+</table>
+<p>这些字段需要按时间差分。很多 counter
+是启动以来累计值，单次截图只能说明“曾经发生过”，不能说明当前事故是否由它触发。</p>
+<h2 id="25-服务发布前网络-io-gate">25. 服务发布前网络 IO gate</h2>
+<p>推理网关或代理服务发布前，至少跑四类流量：</p>
+<ol type="1">
+<li>小请求小响应：验证连接分布、event loop lag、P99。</li>
+<li>小请求大响应：验证 TSO/GSO、send-q、慢客户端 backpressure。</li>
+<li>长连接 token streaming：验证 flush、TLS/proxy buffering、chunk
+间隔。</li>
+<li>突发重连：验证 SYN backlog、accept queue、RSS 熵和 worker
+分布。</li>
+</ol>
+<p>每类流量都要保存 offload 状态、RSS 分布、IRQ affinity、ring
+设置和应用连接分布。这样下一次 P99
+事故才能判断是代码变了、流量变了，还是节点网络配置漂移。</p>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

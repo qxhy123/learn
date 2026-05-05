@@ -1,0 +1,1386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 19d 章 · Kubernetes AI 排障 SOP — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=19d" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 19d 章 · Kubernetes AI 排障 SOP</h1>
+<p class="sub">围绕 Pending、镜像拉取、GPU 不可见、NCCL、OOM、网络和存储建立 K8s AI 排障路径。</p>
+<div class="chips"><span class="chip">SOP</span><span class="chip">Events</span><span class="chip">GPU</span><span class="chip">NCCL</span><span class="chip">K8s</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#19d1-第一性原理拆解--学习大纲">19d.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#19d2-概念先说清楚">19d.2 概念先说清楚</a></li><li><a class="anchor" href="#19d3-架构排障视角下的路径和责任边界">19d.3
+架构：排障视角下的路径和责任边界</a></li><li><a class="anchor" href="#19d4-原理为什么这些证据能定位问题">19d.4
+原理：为什么这些证据能定位问题</a></li><li><a class="anchor" href="#19d5-工程化生产排障体系">19d.5 工程化：生产排障体系</a></li><li><a class="anchor" href="#19d6-方案设计ai-k8s-值班决策表">19d.6 方案设计：AI K8s
+值班决策表</a></li><li><a class="anchor" href="#19d7-pod-pending-sop">19d.7 Pod Pending SOP</a></li><li><a class="anchor" href="#19d8-imagepullbackoff-sop">19d.8 ImagePullBackOff SOP</a></li><li><a class="anchor" href="#19d9-gpu-不可见-sop">19d.9 GPU 不可见 SOP</a></li><li><a class="anchor" href="#19d10-nccl-timeout-sop">19d.10 NCCL Timeout SOP</a></li><li><a class="anchor" href="#19d11-oomkilled-与内存类故障-sop">19d.11 OOMKilled 与内存类故障
+SOP</a></li><li><a class="anchor" href="#19d12-readiness-flapping-sop">19d.12 Readiness Flapping SOP</a></li><li><a class="anchor" href="#19d13-service--ingress--gateway-sop">19d.13 Service / Ingress /
+Gateway SOP</a></li><li><a class="anchor" href="#19d14-pvc--存储-sop">19d.14 PVC / 存储 SOP</a></li><li><a class="anchor" href="#19d15-dns-sop">19d.15 DNS SOP</a></li><li><a class="anchor" href="#19d16-故障排除汇总表">19d.16 故障排除汇总表</a></li><li><a class="anchor" href="#19d17-反模式与-checklist">19d.17 反模式与 Checklist</a></li><li><a class="anchor" href="#19d18-worked-example推理服务间歇-502">19d.18 Worked
+Example：推理服务间歇 502</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>AI on Kubernetes
+的排障目标不是“找到一行看起来像原因的日志”，而是建立证据链：对象状态、事件、调度条件、容器日志、节点状态、GPU/DCGM
+指标、NCCL 日志、网络、存储和服务入口逐层闭环。本章把常见故障拆成可执行
+SOP。</p>
+</blockquote>
+<hr />
+<h2 id="19d1-第一性原理拆解--学习大纲">19d.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>Kubernetes 的一个症状往往不是一个根因。<code>Pod Pending</code>
+可能是 GPU 不足、节点标签不匹配、污点没有容忍、PVC 没绑定、quota
+超限、gang 调度未准入；<code>NCCL timeout</code> 可能是 rank 没齐、DNS
+解析错、NetworkPolicy 阻断、RDMA 设备没注入、MTU 不一致、某个 rank
+OOM、GPU Xid 或跨拓扑通信退化。</p>
+<p>AI 工作负载更难排，因为它横跨多个平面：</p>
+<ul>
+<li>Kubernetes 控制面：API Server、scheduler、controller、events、CRD
+status。</li>
+<li>节点运行时：kubelet、container runtime、CNI、CSI、device
+plugin。</li>
+<li>加速器：GPU driver、CUDA、NVIDIA container toolkit、MIG、DCGM。</li>
+<li>分布式通信：NCCL、MPI、Ray、RDMA、RoCE/IB、DNS、Service。</li>
+<li>存储路径：PVC、对象存储、并行文件系统、checkpoint、模型下载。</li>
+<li>应用语义：训练 rank、driver、launcher、model
+server、readiness、batching。</li>
+</ul>
+<p>不可化简的问题是：<strong>如何把用户看到的症状，映射到具体平面的具体失败点，并形成可复现、可交接、可自动化的证据链。</strong></p>
+<h3 id="推从问题推导-sop">推：从问题推导 SOP</h3>
+<p>从“症状跨层”推出固定顺序：先看对象状态和
+Events，再看容器日志，再看节点、GPU、网络、存储和应用指标。顺序错了会浪费时间，比如没确认
+Pod 是否调度成功就去看 NCCL。</p>
+<p>从“证据会消失”推出先采集再修复。<code>kubectl logs --previous</code>、events、节点日志、DCGM
+异常窗口、NCCL debug 日志都可能被轮转或覆盖。生产排障前先留证据，再删除
+Pod 或重启服务。</p>
+<p>从“AI 故障常复发”推出标准 runbook。Pending、ImagePullBackOff、GPU
+不可见、NCCL timeout、OOMKilled、readiness
+flapping、Service/Ingress、PVC、DNS
+都应该有固定证据、判断和处理动作。</p>
+<p>从“平台要规模化值班”推出结论格式：症状、影响范围、证据、根因、动作、后续预防。没有证据链的“可能是网络问题”不能作为事故结论。</p>
+<h3 id="学习大纲">学习大纲</h3>
+<p>本章按以下顺序展开：</p>
+<ol type="1">
+<li>概念边界：Kubernetes 排障、AI
+排障、应用排障、性能排障分别是什么。</li>
+<li>架构：控制路径、数据路径、观测路径和责任边界。</li>
+<li>原理：为什么要按状态机排障，Events、describe、logs、node、DCGM、NCCL
+logs 各自证明什么。</li>
+<li>工程化：生产 SOP、证据保全、版本矩阵、发布变更、观测与治理。</li>
+<li>方案设计：一套可执行的值班排障决策表和证据模板。</li>
+<li>专项
+SOP：Pending、ImagePull、GPU、NCCL、OOM、readiness、Service/Ingress、PVC、DNS。</li>
+<li>反模式、Checklist、Worked Example 和练习题。</li>
+</ol>
+<hr />
+<h2 id="19d2-概念先说清楚">19d.2 概念先说清楚</h2>
+<h3 id="kubernetes-排障是什么不是什么">Kubernetes
+排障是什么，不是什么</h3>
+<p>Kubernetes 排障是从 API
+对象和控制器状态出发，判断系统为什么没有达到期望状态。它回答的是：</p>
+<ul>
+<li>Pod 为什么没有被调度？</li>
+<li>容器为什么没有启动？</li>
+<li>Service 为什么没有 endpoint？</li>
+<li>Deployment 为什么 rollout 卡住？</li>
+<li>CRD 为什么 status 不更新？</li>
+</ul>
+<p>它不直接回答“模型为什么收敛差”或“推理质量为什么下降”。那些属于模型、数据或应用逻辑问题，但
+Kubernetes 排障可以先证明基础设施是否正常。</p>
+<h3 id="ai-排障是什么不是什么">AI 排障是什么，不是什么</h3>
+<p>AI 排障是在 Kubernetes 排障基础上加入
+GPU、分布式通信、模型加载、checkpoint 和 AI runtime 语义。它要回答：</p>
+<ul>
+<li>GPU 是否被调度、注入、识别和正确使用？</li>
+<li>NCCL/MPI/Ray 通信是否所有 rank 齐、网络通、设备路径正确？</li>
+<li>模型是否下载、加载、warmup 并进入 ready？</li>
+<li>OOM 是 cgroup memory、GPU memory、ephemeral storage
+还是节点压力？</li>
+<li>训练失败是框架错误、基础设施故障还是外部依赖故障？</li>
+</ul>
+<p>AI 排障不是调参。遇到 NCCL timeout 先不要调 batch size；遇到
+OOMKilled 先不要加 GPU；遇到 readiness 抖动先不要改
+Ingress。先定位层级，再做动作。</p>
+<h3 id="证据链是什么">证据链是什么</h3>
+<p>证据链是能支持结论的一组事实，至少包含：</p>
+<table>
+<thead>
+<tr>
+<th>证据</th>
+<th>证明什么</th>
+<th>常用命令</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对象 status</td>
+<td>当前 Kubernetes 认为对象处于什么状态</td>
+<td><code>kubectl get -o yaml</code></td>
+</tr>
+<tr>
+<td>Events</td>
+<td>控制器、scheduler、kubelet 记录的近期原因</td>
+<td><code>kubectl describe</code>、<code>kubectl get events</code></td>
+</tr>
+<tr>
+<td>容器日志</td>
+<td>应用、runtime、框架的直接错误</td>
+<td><code>kubectl logs</code></td>
+</tr>
+<tr>
+<td>previous logs</td>
+<td>上一次崩溃前的错误</td>
+<td><code>kubectl logs --previous</code></td>
+</tr>
+<tr>
+<td>Node 状态</td>
+<td>节点资源、压力、taint、allocatable</td>
+<td><code>kubectl describe node</code></td>
+</tr>
+<tr>
+<td>GPU/DCGM</td>
+<td>GPU 健康、Xid、显存、温度、利用率、ECC</td>
+<td>DCGM exporter、节点 <code>nvidia-smi</code></td>
+</tr>
+<tr>
+<td>NCCL logs</td>
+<td>rank、网卡、RDMA、collective 过程</td>
+<td><code>NCCL_DEBUG=INFO</code></td>
+</tr>
+<tr>
+<td>Service/Endpoint</td>
+<td>流量是否有 ready backend</td>
+<td><code>kubectl get svc,endpointslice</code></td>
+</tr>
+<tr>
+<td>PVC/CSI</td>
+<td>存储是否绑定、挂载、读写异常</td>
+<td><code>kubectl describe pvc/pv/pod</code></td>
+</tr>
+<tr>
+<td>DNS</td>
+<td>名称解析和服务发现是否正常</td>
+<td><code>nslookup</code>、<code>dig</code>、CoreDNS logs</td>
+</tr>
+</tbody>
+</table>
+<p>单条日志不是证据链。证据链应该能解释“为什么这个症状发生在这个对象、这个时间、这个范围”。</p>
+<h3 id="soprunbookpostmortem-的边界">SOP、Runbook、Postmortem
+的边界</h3>
+<p>SOP 是当下排障步骤。Runbook 是可复用操作手册。Postmortem
+是事故后复盘，关注根因、影响、修复和预防。值班时先按 SOP
+采证和止血，事后再把新经验沉淀到 runbook。</p>
+<hr />
+<h2 id="19d3-架构排障视角下的路径和责任边界">19d.3
+架构：排障视角下的路径和责任边界</h2>
+<h3 id="控制路径">控制路径</h3>
+<pre class="text"><code>kubectl / platform API
+  -&gt; API Server
+  -&gt; admission / CRD schema
+  -&gt; controller / operator
+  -&gt; scheduler / queue
+  -&gt; kubelet
+  -&gt; container runtime
+  -&gt; Pod status / events</code></pre>
+<p>控制路径上的失败通常表现为对象没有进入期望状态：Pending、ContainerCreating、ImagePullBackOff、CrashLoopBackOff、CRD
+status 卡住、rollout 超时。</p>
+<h3 id="数据路径">数据路径</h3>
+<pre class="text"><code>训练：dataset / object storage / PVC -&gt; Pod -&gt; GPU -&gt; NCCL/RDMA -&gt; peer GPU -&gt; checkpoint storage
+推理：client -&gt; DNS -&gt; Ingress/Gateway -&gt; Service -&gt; EndpointSlice -&gt; Pod -&gt; model runtime -&gt; GPU</code></pre>
+<p>数据路径上的失败通常表现为任务运行后卡住、timeout、吞吐下降、502/504、模型下载失败、checkpoint
+写失败、readiness 抖动。</p>
+<h3 id="观测路径">观测路径</h3>
+<pre class="text"><code>Kubernetes events/status
+  + container logs
+  + operator logs
+  + node/kubelet/runtime logs
+  + Prometheus metrics
+  + DCGM exporter
+  + NCCL/MPI/Ray logs
+  + tracing / ingress logs</code></pre>
+<p>排障不是所有来源都看一遍，而是按症状选择最短证据路径。比如 Pending
+首先看 scheduler events；NCCL timeout 首先看所有 rank 状态和 NCCL
+INIT/NET 日志；Service 不通首先看 EndpointSlice。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>责任方</th>
+<th>负责</th>
+<th>不负责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户代码</td>
+<td>训练逻辑、模型加载、应用日志、checkpoint 调用</td>
+<td>节点 GPU 驱动和调度策略</td>
+</tr>
+<tr>
+<td>平台 Operator</td>
+<td>CRD 状态、底层对象、events、默认配置</td>
+<td>容器内业务 bug</td>
+</tr>
+<tr>
+<td>Scheduler/Queue</td>
+<td>资源准入、节点选择、gang、quota</td>
+<td>应用 readiness 语义</td>
+</tr>
+<tr>
+<td>GPU 平台</td>
+<td>driver、device plugin、runtime、DCGM</td>
+<td>PyTorch 参数正确性</td>
+</tr>
+<tr>
+<td>网络平台</td>
+<td>CNI、Service、Ingress、RDMA fabric、DNS</td>
+<td>模型自身延迟</td>
+</tr>
+<tr>
+<td>存储平台</td>
+<td>PVC、CSI、对象存储、吞吐和可用性</td>
+<td>训练 checkpoint 策略</td>
+</tr>
+</tbody>
+</table>
+<p>清楚边界不是为了推责，而是为了让排障动作有针对性。</p>
+<hr />
+<h2 id="19d4-原理为什么这些证据能定位问题">19d.4
+原理：为什么这些证据能定位问题</h2>
+<h3 id="pod-状态机">Pod 状态机</h3>
+<p>Pod 生命周期中的常见状态和排障含义：</p>
+<table>
+<thead>
+<tr>
+<th>状态/原因</th>
+<th>意味着什么</th>
+<th>优先看什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pending</td>
+<td>Pod 未绑定节点或依赖未满足</td>
+<td><code>describe pod</code> Events、quota、PVC、node</td>
+</tr>
+<tr>
+<td>ContainerCreating</td>
+<td>已调度，容器还没启动</td>
+<td>CNI、CSI mount、image unpack、runtime</td>
+</tr>
+<tr>
+<td>ImagePullBackOff</td>
+<td>镜像拉取失败且进入退避</td>
+<td>Events、Secret、registry、节点网络</td>
+</tr>
+<tr>
+<td>CrashLoopBackOff</td>
+<td>容器启动后退出并反复重启</td>
+<td>current/previous logs、exit code、probe</td>
+</tr>
+<tr>
+<td>OOMKilled</td>
+<td>容器超过 cgroup memory limit 被杀</td>
+<td>lastState、node memory、应用内存</td>
+</tr>
+<tr>
+<td>Running but NotReady</td>
+<td>容器运行但 readiness 未通过</td>
+<td>probe events、app logs、model load</td>
+</tr>
+<tr>
+<td>Succeeded/Failed</td>
+<td>Job 类任务完成或失败</td>
+<td>exit code、logs、Job/CRD status</td>
+</tr>
+</tbody>
+</table>
+<p>先确认状态机位置，再决定下一步。Pending 的 Pod
+没有容器日志；ImagePullBackOff 的 Pod 没有应用日志；CrashLoopBackOff
+要看 <code>--previous</code>。</p>
+<h3 id="events-的价值和限制">Events 的价值和限制</h3>
+<p>Events 是 scheduler、kubelet、controller
+等组件写出的近期事实，适合定位调度、镜像、挂载、probe、驱逐等问题。</p>
+<p>限制是：</p>
+<ul>
+<li>Events 会被 TTL 清理。</li>
+<li>Events 有聚合和限流，可能丢细节。</li>
+<li>Events 记录的是组件观察，不一定包含应用根因。</li>
+</ul>
+<p>因此 Events 是入口，不是全部结论。</p>
+<h3 id="logs-的价值和限制">Logs 的价值和限制</h3>
+<p>容器日志证明应用或 runtime 输出了什么。对于 AI 任务，必须区分：</p>
+<ul>
+<li>主容器日志：训练脚本、模型服务 runtime。</li>
+<li>init container 日志：模型下载、依赖准备。</li>
+<li>sidecar 日志：model agent、mesh proxy、queue proxy。</li>
+<li>previous logs：崩溃前的最后输出。</li>
+<li>Operator logs：控制器为什么没有收敛。</li>
+</ul>
+<p>没有打开 NCCL debug 时，训练日志可能只显示 timeout，不显示网卡选择和
+rank 细节。生产镜像应支持通过环境变量打开详细日志。</p>
+<h3 id="nodegpudcgm-的价值">Node、GPU、DCGM 的价值</h3>
+<p>节点证据证明问题是否发生在单个节点、单类节点池或整个集群：</p>
+<ul>
+<li>Node
+condition：Ready、MemoryPressure、DiskPressure、PIDPressure、NetworkUnavailable。</li>
+<li>Allocatable：GPU、CPU、memory、ephemeral-storage
+是否存在且足够。</li>
+<li>Taints：节点是否被标记不可调度或维护。</li>
+<li>DCGM：GPU Xid、ECC、温度、功耗、显存、利用率、NVLink 错误。</li>
+<li><code>nvidia-smi</code>：驱动、CUDA 兼容、MIG、进程、拓扑。</li>
+</ul>
+<p>GPU 不可见或 NCCL 超时不能只看 Pod。必须把 Pod 所在节点、GPU
+设备和网络拓扑纳入证据链。</p>
+<hr />
+<h2 id="19d5-工程化生产排障体系">19d.5 工程化：生产排障体系</h2>
+<h3 id="最小证据包">最小证据包</h3>
+<p>遇到 AI on K8s 故障，先采集最小证据包：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="va">NS</span><span class="op">=&lt;</span>namespace<span class="op">&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="va">POD</span><span class="op">=&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">-o</span> wide</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">--all-containers</span> <span class="at">--tail</span><span class="op">=</span>300</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">--all-containers</span> <span class="at">--previous</span> <span class="at">--tail</span><span class="op">=</span>300</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="at">--sort-by</span><span class="op">=</span>.lastTimestamp</span></code></pre></div>
+<p>如果 Pod 已调度到节点：</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="va">NODE</span><span class="op">=</span><span class="va">$(</span><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">-o</span> jsonpath=<span class="st">&#39;{.spec.nodeName}&#39;</span><span class="va">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe node <span class="st">&quot;</span><span class="va">$NODE</span><span class="st">&quot;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get node <span class="st">&quot;</span><span class="va">$NODE</span><span class="st">&quot;</span> <span class="at">-o</span> yaml</span></code></pre></div>
+<p>如果是 CRD/Operator：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get <span class="op">&lt;</span>kind<span class="op">&gt;</span> -n <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="op">&lt;</span>name<span class="op">&gt;</span> -o yaml</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe <span class="op">&lt;</span>kind<span class="op">&gt;</span> -n <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="op">&lt;</span>name<span class="op">&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>operator-ns<span class="op">&gt;</span> deploy/<span class="op">&lt;</span>operator-deploy<span class="op">&gt;</span> --tail=300</span></code></pre></div>
+<p>如果是服务流量：</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get svc,endpointslice,ingress <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe svc <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="op">&lt;</span>svc<span class="op">&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get endpointslice <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$NS</span><span class="st">&quot;</span> <span class="at">-l</span> kubernetes.io/service-name=<span class="op">&lt;</span>svc<span class="op">&gt;</span> -o yaml</span></code></pre></div>
+<h3 id="证据命名和交接格式">证据命名和交接格式</h3>
+<p>值班记录建议固定格式：</p>
+<pre class="text"><code>时间：
+影响范围：
+对象：
+当前症状：
+关键证据：
+排除项：
+根因判断：
+已执行动作：
+风险和下一步：</code></pre>
+<p>“关键证据”要写具体事件、日志片段摘要、对象状态和时间，而不是“看起来像网络”。</p>
+<h3 id="版本矩阵">版本矩阵</h3>
+<p>生产排障时必须知道当前版本组合：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>例子</th>
+<th>常见问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes</td>
+<td>1.28/1.29/1.30</td>
+<td>API 行为、scheduler、kubelet bug</td>
+</tr>
+<tr>
+<td>Container Runtime</td>
+<td>containerd、CRI-O</td>
+<td>镜像拉取、runtime hook、cgroup</td>
+</tr>
+<tr>
+<td>CNI</td>
+<td>Calico、Cilium、VPC CNI</td>
+<td>Pod 网络、NetworkPolicy、MTU</td>
+</tr>
+<tr>
+<td>CSI/Storage</td>
+<td>EBS、Ceph、Lustre、NFS、对象存储</td>
+<td>PVC 绑定、挂载、吞吐、锁</td>
+</tr>
+<tr>
+<td>GPU Stack</td>
+<td>driver、CUDA、device plugin、GPU Operator</td>
+<td>GPU 注入、MIG、兼容性</td>
+</tr>
+<tr>
+<td>NCCL/RDMA</td>
+<td>NCCL、OFED、RoCE/IB、UCX</td>
+<td>timeout、fallback、带宽</td>
+</tr>
+<tr>
+<td>AI Runtime</td>
+<td>PyTorch、Ray、Triton、vLLM、KServe</td>
+<td>启动参数、readiness、batching</td>
+</tr>
+</tbody>
+</table>
+<p>很多“偶发问题”其实是变更问题。排障时要问：最近是否升级了镜像、驱动、Operator、CNI、CSI、KServe、Ingress
+或模型版本。</p>
+<h3 id="观测与告警">观测与告警</h3>
+<p>推荐告警维度：</p>
+<ul>
+<li>Pod：Pending
+超时、CrashLoopBackOff、ImagePullBackOff、OOMKilled、NotReady。</li>
+<li>Node：NotReady、MemoryPressure、DiskPressure、GPU allocatable
+消失。</li>
+<li>GPU：Xid、ECC、DCGM exporter down、显存长期满、温度/功耗异常。</li>
+<li>NCCL/训练：rank timeout、job restart count、checkpoint
+failure。</li>
+<li>Serving：ready endpoint 数为 0、5xx、p99
+延迟、模型加载失败、revision rollout 超时。</li>
+<li>Operator：reconcile error、workqueue depth、status update
+conflict、leader election 异常。</li>
+<li>存储：PVC Pending、mount failure、object storage 5xx、checkpoint
+写入失败。</li>
+</ul>
+<p>告警必须能链接到 runbook。只报“服务不可用”不够，要能提示下一步看
+EndpointSlice、readiness、Ingress controller 还是 backend logs。</p>
+<hr />
+<h2 id="19d6-方案设计ai-k8s-值班决策表">19d.6 方案设计：AI K8s
+值班决策表</h2>
+<h3 id="快速分类决策表">快速分类决策表</h3>
+<table>
+<thead>
+<tr>
+<th>用户症状</th>
+<th>第一判断</th>
+<th>第一命令</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>任务一直没开始</td>
+<td>Pod 是否 Pending</td>
+<td><code>kubectl get pod -o wide</code></td>
+<td>看 describe events</td>
+</tr>
+<tr>
+<td>镜像拉不下来</td>
+<td>是否 ImagePullBackOff</td>
+<td><code>kubectl describe pod</code></td>
+<td>查 tag、secret、registry、CA</td>
+</tr>
+<tr>
+<td>代码说没有 GPU</td>
+<td>Pod 是否请求 GPU 且节点 allocatable 正常</td>
+<td><code>describe pod/node</code></td>
+<td>查 device plugin、runtime、容器内 <code>nvidia-smi</code></td>
+</tr>
+<tr>
+<td>分布式训练卡住</td>
+<td>所有 rank 是否 Running</td>
+<td><code>kubectl get pod -l job=&lt;job&gt;</code></td>
+<td>查 NCCL logs、DNS、网络、GPU Xid</td>
+</tr>
+<tr>
+<td>训练被杀</td>
+<td>是否 OOMKilled</td>
+<td><code>get pod -o yaml</code></td>
+<td>区分 cgroup memory、GPU OOM、ephemeral storage</td>
+</tr>
+<tr>
+<td>服务间歇 502</td>
+<td>Service 是否有 ready endpoint</td>
+<td><code>get endpointslice</code></td>
+<td>查 readiness、Ingress、backend logs</td>
+</tr>
+<tr>
+<td>模型服务 rollout 卡住</td>
+<td>revision 是否 Ready</td>
+<td><code>get inferenceservice/revision</code></td>
+<td>查 model download、runtime、probe</td>
+</tr>
+<tr>
+<td>PVC 一直挂不上</td>
+<td>PVC 是否 Bound</td>
+<td><code>describe pvc/pod</code></td>
+<td>查 StorageClass、CSI、access mode、容量</td>
+</tr>
+<tr>
+<td>域名解析失败</td>
+<td>Pod 内 DNS 是否正常</td>
+<td><code>nslookup</code></td>
+<td>查 CoreDNS、Service、NetworkPolicy</td>
+</tr>
+</tbody>
+</table>
+<h3 id="可执行-triage-流程">可执行 triage 流程</h3>
+<pre class="text"><code>1. 定位对象：namespace、Pod/Job/CRD/Service 名称。
+2. 判断状态机位置：Pending、Pulling、Starting、Running、Ready、Terminating。
+3. 采集最小证据包：get、describe、events、logs、previous logs。
+4. 若已调度：补充 node、GPU、runtime、storage、network 证据。
+5. 若是 CRD：补充 CRD status、operator logs、owned resources。
+6. 若是服务流量：补充 Service、EndpointSlice、Ingress/Gateway、backend。
+7. 做最小修复动作：不先删除证据，不做无关变更。
+8. 记录根因和预防：告警、准入、默认值、runbook、测试。</code></pre>
+<hr />
+<h2 id="19d7-pod-pending-sop">19d.7 Pod Pending SOP</h2>
+<h3 id="症状">症状</h3>
+<p>Pod 长时间 <code>Pending</code>，训练任务未开始，CRD status 可能显示
+<code>WaitingForResources</code>、<code>PodsPending</code> 或
+<code>Admitted=False</code>。</p>
+<h3 id="证据">证据</h3>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -o wide</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> --sort-by=.lastTimestamp</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get resourcequota <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pvc <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span></code></pre></div>
+<p>查看节点 GPU：</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get nodes <span class="at">-o</span> custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe node <span class="op">&lt;</span>node<span class="op">&gt;</span></span></code></pre></div>
+<h3 id="常见事件和根因">常见事件和根因</h3>
+<table>
+<thead>
+<tr>
+<th>Event 关键字</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Insufficient nvidia.com/gpu</code></td>
+<td>GPU 数量或形状不足</td>
+<td>等待队列、扩容、降低请求、调整节点池</td>
+</tr>
+<tr>
+<td><code>didn't match Pod's node affinity/selector</code></td>
+<td>nodeSelector/affinity 过窄或标签错误</td>
+<td>修 Pod 约束或节点标签</td>
+</tr>
+<tr>
+<td><code>had untolerated taint</code></td>
+<td>节点有 taint，Pod 无 toleration</td>
+<td>加 toleration 或换节点池</td>
+</tr>
+<tr>
+<td><code>persistentvolumeclaim is not bound</code></td>
+<td>PVC 未绑定</td>
+<td>查 StorageClass、容量、accessMode</td>
+</tr>
+<tr>
+<td><code>exceeded quota</code></td>
+<td>namespace/queue quota 不足</td>
+<td>释放资源或调整 quota</td>
+</tr>
+<tr>
+<td><code>pod has unbound immediate PersistentVolumeClaims</code></td>
+<td>Immediate binding 阻塞调度</td>
+<td>改 WaitForFirstConsumer 或修 PV</td>
+</tr>
+<tr>
+<td><code>Preemption is not helpful</code></td>
+<td>抢占也无法满足形状</td>
+<td>需要扩容或改拓扑/资源请求</td>
+</tr>
+</tbody>
+</table>
+<h3 id="ai-特有判断">AI 特有判断</h3>
+<p>GPU 总数足够不代表可调度。8 卡 worker 需要单节点 8 张可用 GPU；集群里
+8 张碎片 GPU 分布在 8 台机器上没有用。多 worker 训练还要考虑
+gang：只调度一半 worker 可能占住 GPU 但训练无法开始。</p>
+<h3 id="处理动作">处理动作</h3>
+<ol type="1">
+<li>如果是资源不足：确认是否应该进入队列等待，而不是裸 Pending。</li>
+<li>如果是标签/污点：修正平台默认值，避免用户每次手写。</li>
+<li>如果是 PVC：先修存储绑定，不要删除训练 Pod 反复重试。</li>
+<li>如果是 gang 问题：接入 Kueue/Volcano/PodGroup，整体准入。</li>
+<li>status 应写明 <code>reason</code>，例如
+<code>InsufficientGPU</code>、<code>PVCNotBound</code>、<code>WaitingForGangAdmission</code>。</li>
+</ol>
+<hr />
+<h2 id="19d8-imagepullbackoff-sop">19d.8 ImagePullBackOff SOP</h2>
+<h3 id="症状-1">症状</h3>
+<p>Pod 状态为 <code>ErrImagePull</code> 或
+<code>ImagePullBackOff</code>。容器尚未启动，因此没有应用日志。</p>
+<h3 id="证据-1">证据</h3>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get secret <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get serviceaccount <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>sa<span class="op">&gt;</span> -o yaml</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -o jsonpath=<span class="st">&#39;{.spec.containers[*].image}&#39;</span></span></code></pre></div>
+<h3 id="常见根因">常见根因</h3>
+<table>
+<thead>
+<tr>
+<th>Event/错误</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>manifest unknown</code></td>
+<td>tag 不存在或镜像名写错</td>
+<td>修镜像 tag，发布不可变 digest</td>
+</tr>
+<tr>
+<td><code>unauthorized</code></td>
+<td>imagePullSecret 缺失或权限不足</td>
+<td>修 Secret、ServiceAccount、registry 权限</td>
+</tr>
+<tr>
+<td><code>x509: certificate signed by unknown authority</code></td>
+<td>私有 CA 未下发到节点 runtime</td>
+<td>配置节点 CA，重启 container runtime</td>
+</tr>
+<tr>
+<td><code>i/o timeout</code></td>
+<td>节点到 registry 网络不通</td>
+<td>查节点网络、代理、防火墙、registry</td>
+</tr>
+<tr>
+<td><code>no matching manifest for linux/amd64</code></td>
+<td>架构不匹配</td>
+<td>构建正确架构镜像</td>
+</tr>
+<tr>
+<td><code>toomanyrequests</code></td>
+<td>registry 限流</td>
+<td>配置镜像缓存、私有 registry、凭据</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-1">处理动作</h3>
+<ul>
+<li>优先用 digest 或受治理的 tag，避免 <code>latest</code>。</li>
+<li>镜像发布和训练任务提交之间要有准入检查。</li>
+<li>私有 registry 应配置节点级缓存或预拉取，降低大镜像启动抖动。</li>
+<li>不要通过删除 Pod 解决
+ImagePullBackOff；根因不修复，重建只会重放失败。</li>
+</ul>
+<hr />
+<h2 id="19d9-gpu-不可见-sop">19d.9 GPU 不可见 SOP</h2>
+<h3 id="症状-2">症状</h3>
+<ul>
+<li>Pod 已 Running，但容器内 <code>nvidia-smi</code> 不存在或报错。</li>
+<li>PyTorch <code>torch.cuda.is_available()</code> 为
+<code>False</code>。</li>
+<li>应用报
+<code>CUDA driver version is insufficient for CUDA runtime version</code>。</li>
+<li>Pod 请求了 GPU，但应用只看到 0 张卡或看到错误 MIG 设备。</li>
+</ul>
+<h3 id="证据-2">证据</h3>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -o jsonpath=<span class="st">&#39;{.spec.nodeName}&#39;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe node <span class="op">&lt;</span>node<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A10</span> <span class="at">-i</span> nvidia</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get ds <span class="at">-A</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> nvidia</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> gpu-operator-resources ds/nvidia-device-plugin-daemonset <span class="at">--tail</span><span class="op">=</span>200</span></code></pre></div>
+<p>容器内验证：</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- nvidia-smi</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- python <span class="at">-c</span> <span class="st">&quot;import torch; print(torch.cuda.is_available(), torch.cuda.device_count())&quot;</span></span></code></pre></div>
+<h3 id="分层判断">分层判断</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>检查</th>
+<th>常见根因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod spec</td>
+<td>是否请求 <code>nvidia.com/gpu</code> 或 MIG resource</td>
+<td>只设置 env，未请求 GPU</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>Pod 是否调到 GPU 节点</td>
+<td>selector/taint/queue 错</td>
+</tr>
+<tr>
+<td>Node allocatable</td>
+<td><code>allocatable.nvidia.com/gpu</code> 是否存在</td>
+<td>device plugin 未注册</td>
+</tr>
+<tr>
+<td>Device plugin</td>
+<td>DaemonSet 是否 Ready，日志是否报错</td>
+<td>driver 不匹配、MIG 配置错</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>NVIDIA container toolkit / runtimeClass</td>
+<td>容器未注入设备</td>
+</tr>
+<tr>
+<td>Driver/CUDA</td>
+<td>节点 driver 与镜像 CUDA 是否兼容</td>
+<td>镜像 CUDA 太新或驱动太旧</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>resource name 是否正确</td>
+<td>请求整卡但节点只暴露 MIG，或反之</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-2">处理动作</h3>
+<ol type="1">
+<li>先确认 Pod 是否真的请求 GPU。没有 resource request，Kubernetes
+不会注入设备。</li>
+<li>节点 allocatable 没 GPU，查 device plugin 和 GPU Operator。</li>
+<li>节点有 GPU 但容器不可见，查 runtimeClass、container toolkit、runtime
+hook。</li>
+<li>容器可见 GPU 但框架不可用，查 CUDA、PyTorch、driver 兼容。</li>
+<li>单节点异常时先 cordon 节点并迁移任务；集群性异常再回滚 GPU
+栈变更。</li>
+</ol>
+<hr />
+<h2 id="19d10-nccl-timeout-sop">19d.10 NCCL Timeout SOP</h2>
+<h3 id="症状-3">症状</h3>
+<ul>
+<li>PyTorch DDP/FSDP 卡在 rendezvous、init process
+group、allreduce。</li>
+<li>日志出现
+<code>NCCL timeout</code>、<code>socket timeout</code>、<code>unhandled system error</code>。</li>
+<li>多机训练吞吐极低，NCCL fallback 到 Socket。</li>
+<li>某些 rank 退出，其他 rank 等待直到超时。</li>
+</ul>
+<h3 id="证据-3">证据</h3>
+<p>先确认所有 rank：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> -l <span class="op">&lt;</span>job-label<span class="op">&gt;</span> -o wide</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> --all-containers <span class="at">--tail</span><span class="op">=</span>500</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> --all-containers <span class="at">--previous</span> <span class="at">--tail</span><span class="op">=</span>500</span></code></pre></div>
+<p>建议在训练任务中打开：</p>
+<pre class="text"><code>NCCL_DEBUG=INFO
+NCCL_DEBUG_SUBSYS=INIT,NET,COLL
+TORCH_DISTRIBUTED_DEBUG=DETAIL</code></pre>
+<p>如果使用 RDMA，还要确认设备和网络：</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- sh <span class="at">-c</span> <span class="st">&#39;ls -l /dev/infiniband || true&#39;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- sh <span class="at">-c</span> <span class="st">&#39;env | grep -E &quot;NCCL|UCX|GLOO|MASTER&quot;&#39;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- nvidia-smi topo <span class="at">-m</span></span></code></pre></div>
+<h3 id="排查顺序">排查顺序</h3>
+<ol type="1">
+<li>所有 rank 是否 Running 且 Ready。一个 rank OOM 或 CrashLoop 会让其他
+rank timeout。</li>
+<li><code>MASTER_ADDR</code>、<code>MASTER_PORT</code>、world size、rank
+是否一致。</li>
+<li>Pod 间 DNS 和端口是否互通，NetworkPolicy 是否阻断。</li>
+<li>NCCL 选择的网卡是否符合预期，是否选错 <code>eth0</code>、docker
+bridge 或管理网。</li>
+<li>RDMA 设备是否注入容器，库和驱动是否匹配。</li>
+<li>MTU、PFC、ECN、GID index、RoCE/IB 配置是否一致。</li>
+<li>GPU/NIC locality 是否异常，是否跨 socket、跨 rack、跨 AZ。</li>
+<li>DCGM 是否有 Xid、NVLink 错误、ECC 错误或 GPU reset。</li>
+</ol>
+<h3 id="日志线索">日志线索</h3>
+<table>
+<thead>
+<tr>
+<th>NCCL 日志线索</th>
+<th>可能根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>卡在 rendezvous</td>
+<td>rank 未齐、master DNS/端口错</td>
+<td>查 Pod 状态、Service/DNS、环境变量</td>
+</tr>
+<tr>
+<td><code>NET/IB : No device found</code></td>
+<td>RDMA 设备未注入或库缺失</td>
+<td>查 RDMA device plugin、镜像 OFED/UCX</td>
+</tr>
+<tr>
+<td>fallback to Socket</td>
+<td>IB/RDMA 不可用或 NCCL 选择错误</td>
+<td>设置 <code>NCCL_SOCKET_IFNAME</code>/IB 参数，修设备</td>
+</tr>
+<tr>
+<td><code>socketStartConnect</code> timeout</td>
+<td>Pod 网络不通、NetworkPolicy、端口被挡</td>
+<td>查 CNI、policy、Service</td>
+</tr>
+<tr>
+<td>某个 collective hang</td>
+<td>单 rank 慢、OOM、GPU Xid、网络丢包</td>
+<td>对齐各 rank 日志和 DCGM 时间线</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-3">处理动作</h3>
+<ul>
+<li>先保证 rank 齐，再看网络通，再看 RDMA/NVLink locality。</li>
+<li>不要只在一个 Pod 看日志。NCCL 问题必须按 rank 对齐时间线。</li>
+<li>生产训练模板应支持一键打开 NCCL debug，并把 rank、node、GPU、NIC
+信息写入日志。</li>
+<li>对频繁出现 Xid 的节点先 cordon，避免反复污染训练任务。</li>
+</ul>
+<hr />
+<h2 id="19d11-oomkilled-与内存类故障-sop">19d.11 OOMKilled 与内存类故障
+SOP</h2>
+<h3 id="概念边界">概念边界</h3>
+<p><code>OOMKilled</code> 通常指容器超过 cgroup memory limit，被 Linux
+内核杀死。它不等同于 CUDA out of memory。GPU OOM
+多数出现在应用日志里，容器可能退出、被框架捕获，也可能继续运行。</p>
+<p>还要区分 ephemeral storage 耗尽。它会导致 Pod
+被驱逐或写文件失败，但不是内存 OOM。</p>
+<h3 id="证据-4">证据</h3>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -o yaml</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> --previous <span class="at">--tail</span><span class="op">=</span>300</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> top pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe node <span class="op">&lt;</span>node<span class="op">&gt;</span></span></code></pre></div>
+<p>关注字段：</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">lastState</span><span class="kw">:</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">terminated</span><span class="kw">:</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> OOMKilled</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">exitCode</span><span class="kw">:</span><span class="at"> </span><span class="dv">137</span></span></code></pre></div>
+<h3 id="类型判断">类型判断</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>cgroup memory OOM</td>
+<td><code>reason=OOMKilled</code>、exit 137</td>
+<td>dataloader、tokenizer、checkpoint 序列化、内存 limit 太低</td>
+<td>提高 memory limit，降低 dataloader workers，分片 checkpoint</td>
+</tr>
+<tr>
+<td>CUDA OOM</td>
+<td>应用日志 <code>CUDA out of memory</code></td>
+<td>batch/context/KV cache 太大，显存碎片</td>
+<td>降 batch/context，gradient checkpointing，调 serving cache</td>
+</tr>
+<tr>
+<td>Node MemoryPressure</td>
+<td>node condition、eviction events</td>
+<td>节点整体内存压力</td>
+<td>降低 overcommit，迁移任务，修 requests/limits</td>
+</tr>
+<tr>
+<td>Ephemeral storage</td>
+<td>events 提到 <code>ephemeral-storage</code></td>
+<td>缓存、日志、模型文件、临时 checkpoint</td>
+<td>设置 ephemeral request/limit，清理缓存，挂载持久卷</td>
+</tr>
+<tr>
+<td>GPU Xid/reset</td>
+<td>DCGM、节点日志、应用异常</td>
+<td>GPU 硬件/驱动问题</td>
+<td>cordon 节点，迁移任务，检查硬件</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-4">处理动作</h3>
+<ul>
+<li>看到 <code>OOMKilled</code> 先查 cgroup memory，不要直接加
+GPU。</li>
+<li>训练任务给 dataloader、tokenization、checkpoint 留足 CPU
+memory。</li>
+<li>推理服务要把模型权重、KV cache、batching 峰值和 health probe
+都纳入容量估算。</li>
+<li>对 recurring OOM 建立基线：输入长度、batch、worker 数、checkpoint
+周期、内存曲线。</li>
+</ul>
+<hr />
+<h2 id="19d12-readiness-flapping-sop">19d.12 Readiness Flapping SOP</h2>
+<h3 id="症状-4">症状</h3>
+<p>Pod 反复 Ready/NotReady，EndpointSlice 抖动，Ingress 或 Gateway 间歇
+502/503。KServe/Knative 场景中可能表现为 revision 一直不 Ready
+或流量切换失败。</p>
+<h3 id="证据-5">证据</h3>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get endpointslice <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> -l kubernetes.io/service-name=<span class="op">&lt;</span>svc<span class="op">&gt;</span> -w</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> --all-containers <span class="at">--tail</span><span class="op">=</span>300</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get deploy,rs,pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> -l app=<span class="op">&lt;</span>app<span class="op">&gt;</span></span></code></pre></div>
+<p>如果是 KServe：</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get inferenceservice <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>name<span class="op">&gt;</span> -o yaml</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe inferenceservice <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>name<span class="op">&gt;</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get revision <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span></code></pre></div>
+<h3 id="常见根因-1">常见根因</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>启动后很久 NotReady</td>
+<td>模型下载/加载/warmup 慢</td>
+<td>增大 initialDelay 或 startupProbe，优化模型缓存</td>
+</tr>
+<tr>
+<td>负载高时 NotReady</td>
+<td>readiness probe 太重或与推理争资源</td>
+<td>probe 改轻量本地检查，设置超时和并发隔离</td>
+</tr>
+<tr>
+<td>间歇 502</td>
+<td>endpoint 短暂为 0 或 proxy 超时</td>
+<td>看 EndpointSlice 时间线和 Ingress logs</td>
+</tr>
+<tr>
+<td>新 revision 不 Ready</td>
+<td>storageUri、Secret、runtime、镜像问题</td>
+<td>查 init/model agent/runtime logs</td>
+</tr>
+<tr>
+<td>mesh/queue proxy 失败</td>
+<td>sidecar readiness 失败</td>
+<td>查 sidecar logs 和端口配置</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-5">处理动作</h3>
+<ul>
+<li>使用 startupProbe 保护冷启动，readinessProbe
+只表示“现在能否接流量”。</li>
+<li>readiness
+不要做真实大模型推理；可做轻量健康检查和模型加载标志检查。</li>
+<li>模型服务发布时设置最小 ready endpoint 或灰度比例，避免 endpoint
+清零。</li>
+<li>记录 model load time、warmup time、ready transition 次数。</li>
+</ul>
+<hr />
+<h2 id="19d13-service--ingress--gateway-sop">19d.13 Service / Ingress /
+Gateway SOP</h2>
+<h3 id="症状-5">症状</h3>
+<p>Pod
+Running/Ready，但客户端访问失败、超时、502/503/504，或集群内服务名无法访问。</p>
+<h3 id="证据-6">证据</h3>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get svc,endpointslice,ingress <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe svc <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>svc<span class="op">&gt;</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get endpointslice <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> -l kubernetes.io/service-name=<span class="op">&lt;</span>svc<span class="op">&gt;</span> -o yaml</span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe ingress <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>ingress<span class="op">&gt;</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>ingress-ns<span class="op">&gt;</span> deploy/<span class="op">&lt;</span>ingress-controller<span class="op">&gt;</span> --tail=300</span></code></pre></div>
+<p>集群内连通性：</p>
+<div class="sourceCode" id="cb23"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> run <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> netshoot <span class="at">--rm</span> <span class="at">-it</span> <span class="at">--image</span><span class="op">=</span>nicolaka/netshoot <span class="at">--</span> bash</span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-v</span> http://<span class="op">&lt;</span>svc<span class="op">&gt;</span>.<span class="op">&lt;</span>ns<span class="op">&gt;</span>.svc.cluster.local:<span class="op">&lt;</span>port<span class="op">&gt;</span>/health</span></code></pre></div>
+<h3 id="分层判断-1">分层判断</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>检查</th>
+<th>根因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service selector</td>
+<td>selector 是否匹配 Pod labels</td>
+<td>selector 错导致无 endpoint</td>
+</tr>
+<tr>
+<td>EndpointSlice</td>
+<td>是否有 ready endpoint、端口是否正确</td>
+<td>readiness 失败、targetPort 错</td>
+</tr>
+<tr>
+<td>Pod port</td>
+<td>containerPort/listen port 是否一致</td>
+<td>应用监听错端口或只监听 localhost</td>
+</tr>
+<tr>
+<td>NetworkPolicy</td>
+<td>client 到 backend 是否允许</td>
+<td>policy 阻断</td>
+</tr>
+<tr>
+<td>Ingress/Gateway</td>
+<td>host/path/TLS/backend 配置</td>
+<td>路由错、证书错、timeout</td>
+</tr>
+<tr>
+<td>Backend app</td>
+<td>应用是否处理路径和超时</td>
+<td>模型慢、队列满、崩溃</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-6">处理动作</h3>
+<ul>
+<li>Service 不通先看 EndpointSlice。没有 endpoint 时不要先改
+Ingress。</li>
+<li>Endpoint 存在但请求失败，再查端口、NetworkPolicy
+和应用监听地址。</li>
+<li>Ingress 5xx 要区分
+502、503、504：无后端、后端不可用、后端超时的处理不同。</li>
+<li>大模型推理常需要调大 gateway/proxy timeout，但先确认 backend 队列和
+readiness 没问题。</li>
+</ul>
+<hr />
+<h2 id="19d14-pvc--存储-sop">19d.14 PVC / 存储 SOP</h2>
+<h3 id="症状-6">症状</h3>
+<p>Pod Pending、ContainerCreating 卡住、模型下载慢、checkpoint
+写失败、训练中 I/O timeout。</p>
+<h3 id="证据-7">证据</h3>
+<div class="sourceCode" id="cb24"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pvc,pv <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pvc <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pvc<span class="op">&gt;</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get storageclass</span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> --sort-by=.lastTimestamp</span></code></pre></div>
+<p>如果是 CSI 问题：</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-A</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> csi</span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>csi-ns<span class="op">&gt;</span> deploy/<span class="op">&lt;</span>csi-controller<span class="op">&gt;</span> --tail=300</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> <span class="op">&lt;</span>csi-ns<span class="op">&gt;</span> ds/<span class="op">&lt;</span>csi-node<span class="op">&gt;</span> --tail=300</span></code></pre></div>
+<h3 id="常见根因-2">常见根因</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PVC Pending</td>
+<td>StorageClass 不存在、容量不足、accessMode 不支持</td>
+<td>修 StorageClass、容量、访问模式</td>
+</tr>
+<tr>
+<td>Pod 等 PVC</td>
+<td>Immediate binding 与节点拓扑冲突</td>
+<td>使用 WaitForFirstConsumer 或匹配 zone</td>
+</tr>
+<tr>
+<td>Mount 失败</td>
+<td>CSI node plugin 异常、权限、网络</td>
+<td>查 CSI logs、节点、Secret</td>
+</tr>
+<tr>
+<td>Checkpoint 慢</td>
+<td>单卷吞吐不足、小文件过多、对象存储限流</td>
+<td>分片 checkpoint、并发控制、提高吞吐</td>
+</tr>
+<tr>
+<td>模型下载失败</td>
+<td>Secret、CA、对象路径、网络</td>
+<td>查 init/model agent logs、对象存储</td>
+</tr>
+<tr>
+<td>Ephemeral 耗尽</td>
+<td>模型缓存或临时文件写满节点盘</td>
+<td>挂载缓存卷、设置清理策略和 limit</td>
+</tr>
+</tbody>
+</table>
+<h3 id="ai-特有判断-1">AI 特有判断</h3>
+<p>训练 checkpoint 会产生周期性 I/O 峰值，可能导致 GPU 等待、NCCL
+超时或容器
+OOM。推理模型冷启动会受模型大小、对象存储吞吐、节点缓存命中率影响。存储问题不一定只表现为
+PVC Pending，也可能表现为 readiness 慢或吞吐抖动。</p>
+<hr />
+<h2 id="19d15-dns-sop">19d.15 DNS SOP</h2>
+<h3 id="症状-7">症状</h3>
+<p>应用报无法解析 Service、master 地址、对象存储域名或模型 registry
+域名。分布式训练 rank 找不到 master；推理服务依赖调用间歇失败。</p>
+<h3 id="证据-8">证据</h3>
+<p>Pod 内测试：</p>
+<div class="sourceCode" id="cb26"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- nslookup kubernetes.default.svc.cluster.local</span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- nslookup <span class="op">&lt;</span>svc<span class="op">&gt;</span>.<span class="op">&lt;</span>ns<span class="op">&gt;</span>.svc.cluster.local</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> exec <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> <span class="op">&lt;</span>pod<span class="op">&gt;</span> -- cat /etc/resolv.conf</span></code></pre></div>
+<p>CoreDNS：</p>
+<div class="sourceCode" id="cb27"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> kube-system <span class="at">-l</span> k8s-app=kube-dns <span class="at">-o</span> wide</span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> kube-system deploy/coredns <span class="at">--tail</span><span class="op">=</span>300</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe configmap <span class="at">-n</span> kube-system coredns</span></code></pre></div>
+<h3 id="常见根因-3">常见根因</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service 名解析失败</td>
+<td>Service 不存在、namespace 错、search path 误解</td>
+<td>使用 FQDN，确认 Service</td>
+</tr>
+<tr>
+<td>外部域名慢或失败</td>
+<td>CoreDNS upstream、网络、限流</td>
+<td>查 CoreDNS logs、上游 DNS、NodeLocal DNSCache</td>
+</tr>
+<tr>
+<td>大量超时</td>
+<td>DNS QPS 高、ndots 过高、连接跟踪压力</td>
+<td>启用 NodeLocal DNSCache，优化 ndots</td>
+</tr>
+<tr>
+<td>只有某 namespace 失败</td>
+<td>NetworkPolicy 或 DNS policy</td>
+<td>查 egress 到 kube-dns</td>
+</tr>
+<tr>
+<td>master 地址解析错</td>
+<td>headless Service 或 selector 错</td>
+<td>查 EndpointSlice 和 Pod labels</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-7">处理动作</h3>
+<ul>
+<li>分布式训练建议使用稳定 Service DNS 或平台注入的 master 地址。</li>
+<li>高 QPS 推理服务要监控 DNS 延迟和 CoreDNS 饱和。</li>
+<li>排查 NCCL/rendezvous 时，把 DNS 解析结果纳入证据链。</li>
+</ul>
+<hr />
+<h2 id="19d16-故障排除汇总表">19d.16 故障排除汇总表</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>关键证据</th>
+<th>高概率根因</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod Pending</td>
+<td><code>describe pod</code> Events</td>
+<td>GPU/标签/污点/quota/PVC/gang</td>
+<td>修资源、约束、队列或存储</td>
+</tr>
+<tr>
+<td>ImagePullBackOff</td>
+<td>Events、Secret、SA</td>
+<td>tag、权限、CA、网络、架构</td>
+<td>修镜像发布和拉取凭据</td>
+</tr>
+<tr>
+<td>GPU 不可见</td>
+<td>Pod spec、node allocatable、device plugin logs</td>
+<td>未请求 GPU、plugin/runtime/driver/CUDA</td>
+<td>分层修 GPU 栈</td>
+</tr>
+<tr>
+<td>NCCL timeout</td>
+<td>rank 状态、NCCL logs、DCGM、网络</td>
+<td>rank 不齐、DNS、NetworkPolicy、RDMA、Xid</td>
+<td>对齐 rank 时间线，修网络/GPU</td>
+</tr>
+<tr>
+<td>OOMKilled</td>
+<td>lastState、previous logs、metrics</td>
+<td>cgroup memory、GPU OOM、临时盘</td>
+<td>区分类型后调资源或代码</td>
+</tr>
+<tr>
+<td>Readiness flapping</td>
+<td>Pod events、EndpointSlice、runtime logs</td>
+<td>probe、模型加载、依赖、显存压力</td>
+<td>调 probe、缓存、warmup、发布策略</td>
+</tr>
+<tr>
+<td>Service 不通</td>
+<td>EndpointSlice、Service selector、Ingress logs</td>
+<td>selector、端口、readiness、policy、gateway</td>
+<td>从 endpoint 到 gateway 逐层查</td>
+</tr>
+<tr>
+<td>PVC 卡住</td>
+<td>PVC/PV events、CSI logs</td>
+<td>StorageClass、容量、accessMode、zone</td>
+<td>修存储类、绑定模式、CSI</td>
+</tr>
+<tr>
+<td>DNS 失败</td>
+<td>Pod nslookup、CoreDNS logs</td>
+<td>Service 名、upstream、QPS、NetworkPolicy</td>
+<td>修 FQDN、CoreDNS、NodeLocal DNS</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="19d17-反模式与-checklist">19d.17 反模式与 Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>后果</th>
+<th>修正</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>先删除 Pod 再看证据</td>
+<td>previous logs、events、现场消失</td>
+<td>先采集最小证据包</td>
+</tr>
+<tr>
+<td>Pending 时看应用日志</td>
+<td>Pod 根本没启动，浪费时间</td>
+<td>先看 scheduler events</td>
+</tr>
+<tr>
+<td>ImagePullBackOff 时重启 Pod</td>
+<td>根因不变，退避重放</td>
+<td>修 tag、Secret、registry、CA</td>
+</tr>
+<tr>
+<td>GPU 不可见就改代码</td>
+<td>可能是 device plugin/runtime/driver</td>
+<td>先查 Pod spec、node、plugin、runtime</td>
+</tr>
+<tr>
+<td>NCCL timeout 只看一个 rank</td>
+<td>分布式问题需要多 rank 对齐</td>
+<td>收集所有 rank 日志和状态</td>
+</tr>
+<tr>
+<td>OOMKilled 直接加 GPU</td>
+<td>可能是 CPU memory 或临时盘</td>
+<td>区分 cgroup、CUDA、ephemeral</td>
+</tr>
+<tr>
+<td>502 先改 Ingress</td>
+<td>可能没有 ready endpoint</td>
+<td>先查 EndpointSlice</td>
+</tr>
+<tr>
+<td>不记录版本和变更</td>
+<td>无法判断回归</td>
+<td>记录镜像、驱动、Operator、CNI、CSI、模型版本</td>
+</tr>
+<tr>
+<td>结论没有证据</td>
+<td>事故复盘不可审计</td>
+<td>写症状、证据、根因、动作</td>
+</tr>
+</tbody>
+</table>
+<h3 id="值班-checklist">值班 Checklist</h3>
+<ul>
+<li>是否确认 namespace、对象名、时间窗口和影响范围？</li>
+<li>是否采集 <code>get/describe/events/logs/previous logs</code>？</li>
+<li>Pod
+处于哪个状态机位置：Pending、Pulling、Starting、Running、Ready、Terminating？</li>
+<li>若 Pending，是否检查 GPU、quota、PVC、affinity、taint、gang？</li>
+<li>若 Running，是否检查 node、GPU、runtime、CNI、CSI？</li>
+<li>若分布式训练，是否收集所有 rank 状态和 NCCL logs？</li>
+<li>若服务失败，是否从 EndpointSlice 到 Ingress/Gateway 逐层验证？</li>
+<li>是否区分 cgroup OOM、CUDA OOM 和 ephemeral storage？</li>
+<li>是否检查最近变更：镜像、模型、驱动、Operator、CNI、CSI、Ingress？</li>
+<li>修复前是否保留证据，修复后是否补充预防动作？</li>
+</ul>
+<hr />
+<h2 id="19d18-worked-example推理服务间歇-502">19d.18 Worked
+Example：推理服务间歇 502</h2>
+<h3 id="场景">场景</h3>
+<p>一个 KServe InferenceService <code>reranker</code>
+发布新模型后，用户反馈每隔几分钟出现 502。Pod 看起来大部分时间
+Running，CPU/GPU 利用率不高。</p>
+<h3 id="采证">采证</h3>
+<p>先看服务和 endpoint：</p>
+<div class="sourceCode" id="cb28"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get inferenceservice <span class="at">-n</span> serving reranker <span class="at">-o</span> yaml</span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get svc,endpointslice,ingress <span class="at">-n</span> serving</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get endpointslice <span class="at">-n</span> serving <span class="at">-l</span> kubernetes.io/service-name=reranker-predictor <span class="at">-w</span></span></code></pre></div>
+<p>发现 EndpointSlice 在 0 和 2 个 ready endpoint 之间反复切换。</p>
+<p>再看 Pod：</p>
+<div class="sourceCode" id="cb29"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="at">-n</span> serving <span class="op">&lt;</span>pod<span class="op">&gt;</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> serving <span class="op">&lt;</span>pod<span class="op">&gt;</span> --all-containers <span class="at">--tail</span><span class="op">=</span>300</span></code></pre></div>
+<p>Events 显示 readiness probe 间歇 timeout。runtime 日志显示 probe
+路径会触发一次轻量推理，但新模型冷启动后 KV cache 预热和首批请求竞争
+GPU，probe 超过 1 秒超时。</p>
+<h3 id="根因">根因</h3>
+<p>Ingress 502 是结果，不是根因。真正根因是 readiness probe 太重且
+timeout 过短，导致 ready endpoint 反复清零。EndpointSlice
+抖动把问题传递到 Ingress，客户端看到 502。</p>
+<h3 id="处理">处理</h3>
+<p>短期止血：</p>
+<ol type="1">
+<li>把 readiness probe 改成只检查本地模型加载标志和 runtime event
+loop。</li>
+<li>增加 <code>timeoutSeconds</code> 和
+<code>failureThreshold</code>，增加 startupProbe 覆盖模型加载和
+warmup。</li>
+<li>灰度发布时保持旧 revision 部分流量，避免新 revision endpoint
+清零影响全量请求。</li>
+</ol>
+<p>长期预防：</p>
+<ul>
+<li>记录 model load time、warmup time、ready transition count。</li>
+<li>发布前压测新模型冷启动和 readiness。</li>
+<li>告警增加 <code>ready endpoints == 0</code> 和 readiness flapping
+次数。</li>
+</ul>
+<h3 id="结论格式">结论格式</h3>
+<pre class="text"><code>症状：reranker 新版本间歇 502。
+证据：EndpointSlice ready endpoint 在 0/2 间抖动；Pod events 显示 readiness timeout；runtime logs 显示 probe 与 warmup 竞争 GPU。
+根因：readiness probe 过重且 timeout 过短。
+动作：改轻量 readiness，增加 startupProbe，灰度保留旧 revision。
+预防：增加 endpoint 清零告警和冷启动压测。</code></pre>
+<hr />
+<h2 id="本章小结">本章小结</h2>
+<p>Kubernetes for AI
+排障的核心是分层和证据链。先判断对象处于哪个状态机位置，再选择对应证据：Pending
+看 Events 和调度条件，ImagePull 看镜像和凭据，GPU 看 device
+plugin/runtime/driver，NCCL 看 rank、网络、RDMA 和 DCGM，服务失败看
+EndpointSlice、readiness 和入口日志，存储和 DNS 要纳入数据路径。</p>
+<p>好的 SOP
+能把一次救火变成可复用的工程资产：固定采证、明确根因、最小动作、记录预防。</p>
+<h2 id="练习题">练习题</h2>
+<ol type="1">
+<li>一个 Pod Pending，Events 同时出现 PVC 未绑定和 GPU
+不足。你会先处理哪个，为什么？</li>
+<li>PyTorch 训练报 NCCL timeout。请列出你会收集的 6
+类证据，并说明每类证据证明什么。</li>
+<li>如何区分 <code>OOMKilled</code>、CUDA OOM 和 ephemeral storage
+耗尽？</li>
+<li>推理服务 503，但 Pod 全部 Running。为什么第一步应该看
+EndpointSlice？</li>
+<li>设计一份值班记录模板，用于交接一次 GPU 不可见故障。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

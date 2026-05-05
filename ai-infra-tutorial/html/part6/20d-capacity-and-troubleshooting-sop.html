@@ -1,0 +1,1823 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 20d 章 · 容量与排障 SOP — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=20d" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 20d 章 · 容量与排障 SOP</h1>
+<p class="sub">用证据链解释有空闲 GPU 仍跑不起来、扩容慢、碎片化和容量治理问题。</p>
+<div class="chips"><span class="chip">Capacity</span><span class="chip">SOP</span><span class="chip">Pending</span><span class="chip">Quota</span><span class="chip">Fragmentation</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#20d1-第一性原理拆解--学习大纲">20d.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#20d2-概念先说清楚容量是什么不是什么">20d.2
+概念先说清楚：容量是什么，不是什么</a></li><li><a class="anchor" href="#20d3-架构容量证据链数据路径与控制路径">20d.3
+架构：容量证据链、数据路径与控制路径</a></li><li><a class="anchor" href="#20d4-原理为什么有空闲-gpu-仍然跑不起来">20d.4 原理：为什么有空闲
+GPU 仍然跑不起来</a></li><li><a class="anchor" href="#20d5-工程化生产落地配置版本矩阵发布观测治理">20d.5
+工程化：生产落地、配置、版本矩阵、发布、观测、治理</a></li><li><a class="anchor" href="#20d6-方案设计容量排障证据链与决策表">20d.6
+方案设计：容量排障证据链与决策表</a></li><li><a class="anchor" href="#20d7-sop-1有空闲-gpu-但扩不起来">20d.7 SOP 1：有空闲 GPU
+但扩不起来</a></li><li><a class="anchor" href="#20d8-sop-2pod-pending">20d.8 SOP 2：Pod Pending</a></li><li><a class="anchor" href="#20d9-sop-3quota-blocked">20d.9 SOP 3：Quota Blocked</a></li><li><a class="anchor" href="#20d10-sop-4fragmentation">20d.10 SOP 4：Fragmentation</a></li><li><a class="anchor" href="#20d11-sop-5image--weight--engine-cold-start">20d.11 SOP 5：Image
+/ Weight / Engine Cold Start</a></li><li><a class="anchor" href="#20d12-sop-6抢占恢复">20d.12 SOP 6：抢占恢复</a></li><li><a class="anchor" href="#20d13-sop-7扩容慢">20d.13 SOP 7：扩容慢</a></li><li><a class="anchor" href="#20d14-成本--利用率看板避免错误激励">20d.14 成本 /
+利用率看板：避免错误激励</a></li><li><a class="anchor" href="#20d15-故障排除总表症状证据根因动作">20d.15
+故障排除总表：症状、证据、根因、动作</a></li><li><a class="anchor" href="#20d16-反模式--checklist">20d.16 反模式 + Checklist</a></li><li><a class="anchor" href="#20d17-worked-example一次有卡但扩不起来的完整排障">20d.17 Worked
+Example：一次“有卡但扩不起来”的完整排障</a></li><li><a class="anchor" href="#20d18-本章小结">20d.18 本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>容量排障的核心不是问“还有多少
+GPU”，而是问“是否存在满足队列、配额、形状、调度、启动和运行时约束的可用容量，并且证据链是否能解释给用户”。</p>
+</blockquote>
+<h2 id="20d1-第一性原理拆解--学习大纲">20d.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>容量与排障 SOP 要解决的不可化简问题是：<strong>当用户说“明明有
+GPU，为什么我的作业跑不起来 /
+服务扩不起来”时，平台如何在有限时间内把现象分解成可验证的层次，找到阻塞点，给出恢复动作，并留下可审计的证据链。</strong></p>
+<p>AI 平台里最容易误导人的数字是总空闲 GPU。它隐藏了至少七类事实：</p>
+<table>
+<thead>
+<tr>
+<th>被隐藏的事实</th>
+<th>为什么重要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU 型号</td>
+<td>H100、A100、L40S 不能随意替代</td>
+</tr>
+<tr>
+<td>显存和切分形状</td>
+<td>80GB 整卡、40GB 卡、MIG profile 是不同资源</td>
+</tr>
+<tr>
+<td>拓扑</td>
+<td>8 卡同节点、NVLink、RDMA、zone 会决定能否启动</td>
+</tr>
+<tr>
+<td>队列和配额</td>
+<td>资源可能空闲，但不属于该队列或不可借用</td>
+</tr>
+<tr>
+<td>调度约束</td>
+<td>taint、affinity、PVC zone、runtime class 都可能阻塞</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>Pod Running 不代表镜像、权重、engine 和 warmup 完成</td>
+</tr>
+<tr>
+<td>运行时容量</td>
+<td>Ready 不代表 TTFT、TPOT、KV 和 goodput 健康</td>
+</tr>
+</tbody>
+</table>
+<p>因此，SOP
+的价值不是把命令列成清单，而是固定一种排障顺序：先判断卡在哪一层，再收集对应证据，最后选择最小有效动作。</p>
+<h3 id="推--从问题推导-sop">推 — 从问题推导 SOP</h3>
+<p>用户看到 Pending，可能是队列尚未准入，可能是 quota blocked，可能是
+gang 条件不满足，也可能是 kube-scheduler
+找不到节点。用户看到“扩容慢”，可能是 scaler
+没触发，可能是节点扩容被云配额挡住，可能是 GPU device plugin
+没上报资源，也可能是权重冷启动占了 5 分钟。用户看到“有空闲
+GPU”，可能只是账面总数有空闲，目标所需的 H100 80GB
+整卡同节点形状并不存在。</p>
+<p>于是 SOP 必须按层次组织：</p>
+<ol type="1">
+<li>队列层：是否允许这个工作负载开始竞争资源？</li>
+<li>配额层：是否触达 nominal quota、borrowing limit 或 hard cap？</li>
+<li>资源形状层：是否存在正确 SKU、MIG profile、显存、拓扑和池？</li>
+<li>调度层：Pod 是否创建，scheduler 为什么不放置？</li>
+<li>节点层：节点是否扩出、Ready、暴露 GPU？</li>
+<li>启动层：镜像、权重、engine、readiness 卡在哪一步？</li>
+<li>运行时层：服务 Ready 后是否真的恢复 SLO？</li>
+<li>运营层：用户解释、审计、成本和后续治理是否闭环？</li>
+</ol>
+<h3 id="绘--排障总流程">绘 — 排障总流程</h3>
+<pre class="mermaid">flowchart TD
+  A[用户投诉: 跑不起来/扩不动/很慢] --&gt; B{队列是否准入?}
+  B --&gt;|否| C[quota priority borrowing gang]
+  B --&gt;|是| D{资源形状是否存在?}
+  D --&gt;|否| E[SKU MIG 显存 拓扑 碎片化 池边界]
+  D --&gt;|是| F{Pod 是否创建并被调度?}
+  F --&gt;|否| G[scheduler event taint affinity PVC node capacity]
+  F --&gt;|是| H{节点和设备是否健康?}
+  H --&gt;|否| I[node scale cloud quota driver device plugin]
+  H --&gt;|是| J{容器是否 Ready?}
+  J --&gt;|否| K[image pull weight load engine init warmup]
+  J --&gt;|是| L{SLO 是否恢复?}
+  L --&gt;|否| M[queue wait KV TTFT TPOT dependency canary]
+  L --&gt;|是| N[记录证据链 关闭事故 补治理项]</pre>
+<h3 id="导--读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>为什么“空闲 GPU 数”不是容量承诺？</li>
+<li>有空闲 GPU 但扩不起来时，应该先查队列、形状还是 Pod？</li>
+<li>Pod Pending 如何区分 quota blocked、资源碎片化和调度约束？</li>
+<li>image cold start、weight cold start、engine cold start
+的证据分别是什么？</li>
+<li>抢占恢复慢时，应该检查哪些契约？</li>
+<li>扩容慢如何拆成
+scaler、准入、节点、设备、容器、模型和路由时间线？</li>
+<li>成本 / 利用率看板怎样避免“GPU 很忙但用户很慢”的误导？</li>
+<li>一条合格的证据链应该包含哪些字段？</li>
+</ol>
+<h2 id="20d2-概念先说清楚容量是什么不是什么">20d.2
+概念先说清楚：容量是什么，不是什么</h2>
+<p>容量不是一个总数，而是一组带约束的可交付能力。对 AI
+平台来说，容量至少有六种：</p>
+<table>
+<thead>
+<tr>
+<th>容量类型</th>
+<th>含义</th>
+<th>常见证据</th>
+<th>错误动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>账面容量</td>
+<td>集群总 GPU、CPU、内存</td>
+<td>inventory、allocatable</td>
+<td>用总数承诺具体作业能启动</td>
+</tr>
+<tr>
+<td>可准入容量</td>
+<td>队列和配额允许使用的容量</td>
+<td>Kueue/Volcano event、quota usage</td>
+<td>被 quota 挡住时盲目加节点</td>
+</tr>
+<tr>
+<td>可调度容量</td>
+<td>满足 Pod request、affinity、taint、拓扑的容量</td>
+<td>scheduler event、node labels</td>
+<td>把 Pending 都归因给 GPU 不够</td>
+</tr>
+<tr>
+<td>可启动容量</td>
+<td>Pod 能拉镜像、挂盘、加载权重并 Ready</td>
+<td>kubelet event、container log、startup span</td>
+<td>Running 就认为可服务</td>
+</tr>
+<tr>
+<td>可运行容量</td>
+<td>运行时能处理有效 token 或训练 step</td>
+<td>queue wait、TTFT、TPOT、step time</td>
+<td>GPU util 高就认为健康</td>
+</tr>
+<tr>
+<td>可恢复容量</td>
+<td>被抢占或失败后能从 checkpoint 恢复</td>
+<td>checkpoint age、requeue state</td>
+<td>抢占后让用户从头重跑</td>
+</tr>
+</tbody>
+</table>
+<h3 id="与相邻概念的边界">与相邻概念的边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>关注点</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Capacity planning</td>
+<td>未来要买多少资源、如何分池</td>
+<td>SOP 关注当前事故如何定位和恢复</td>
+</tr>
+<tr>
+<td>Scheduling</td>
+<td>单个 Pod / 作业如何放到节点</td>
+<td>SOP 要把队列、配额、冷启动也纳入排查</td>
+</tr>
+<tr>
+<td>Autoscaling</td>
+<td>何时改变副本或节点数量</td>
+<td>SOP 要验证扩容是否真正变成 Ready 和 goodput</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>指标、日志、trace 的采集</td>
+<td>SOP 规定排障时如何使用这些证据</td>
+</tr>
+<tr>
+<td>Cost governance</td>
+<td>GPU-hour、预算和利用率</td>
+<td>SOP 关注成本信号是否解释真实有效工作</td>
+</tr>
+</tbody>
+</table>
+<h3 id="五种没容量">五种“没容量”</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>表面现象</th>
+<th>本质</th>
+<th>第一证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>队列没容量</td>
+<td>Workload 不被放行</td>
+<td>配额、优先级、借用或 gang 不满足</td>
+<td>queue controller event</td>
+</tr>
+<tr>
+<td>形状没容量</td>
+<td>有 GPU 但拼不出需求</td>
+<td>SKU、显存、MIG、拓扑、池边界不匹配</td>
+<td>ResourceFlavor、节点空闲分布</td>
+</tr>
+<tr>
+<td>调度没容量</td>
+<td>Pod Pending</td>
+<td>scheduler 找不到满足约束的节点</td>
+<td><code>kubectl describe pod</code> events</td>
+</tr>
+<tr>
+<td>启动没容量</td>
+<td>Pod Running 但 not Ready</td>
+<td>image、weight、engine、readiness 慢或失败</td>
+<td>kubelet event、container log</td>
+</tr>
+<tr>
+<td>运行时没容量</td>
+<td>Ready 但 P99 差</td>
+<td>queue、KV、batch、依赖、canary 异常</td>
+<td>runtime metrics、trace</td>
+</tr>
+</tbody>
+</table>
+<p>分类是排障的第一步。没有分类，就会出现 quota blocked 去扩节点、MIG
+profile 错配去调 HPA、权重加载慢去改 scheduler 的错误动作。</p>
+<h2 id="20d3-架构容量证据链数据路径与控制路径">20d.3
+架构：容量证据链、数据路径与控制路径</h2>
+<h3 id="容量证据链">容量证据链</h3>
+<p>一条完整证据链应该能回答：请求或作业从提交到运行，在哪个关口被挡住，挡住它的规则是什么，谁能改变规则，改变规则的成本和风险是什么。</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>关键对象</th>
+<th>关键证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户 / 租户</td>
+<td>tenant、project、priority、budget</td>
+<td>租户、队列、优先级、SLO</td>
+</tr>
+<tr>
+<td>队列</td>
+<td>LocalQueue、ClusterQueue、PodGroup、Workload</td>
+<td>admitted、quota usage、borrowing、preemption</td>
+</tr>
+<tr>
+<td>资源形状</td>
+<td>ResourceFlavor、node pool、MIG profile、GPU SKU</td>
+<td>可用整卡数、profile 数、拓扑窗口</td>
+</tr>
+<tr>
+<td>Kubernetes 调度</td>
+<td>Pod、Node、PVC、PriorityClass、RuntimeClass</td>
+<td>Pending reason、taint、affinity、volume event</td>
+</tr>
+<tr>
+<td>节点 / 设备</td>
+<td>Node、GPU Operator、device plugin、driver</td>
+<td>node Ready、GPU allocatable、plugin log</td>
+</tr>
+<tr>
+<td>容器 / 模型</td>
+<td>image、init container、model artifact、readiness</td>
+<td>pull time、weight load、engine init、warmup</td>
+</tr>
+<tr>
+<td>运行时</td>
+<td>serving runtime、training job、router</td>
+<td>TTFT、TPOT、KV、step time、checkpoint</td>
+</tr>
+<tr>
+<td>运营</td>
+<td>incident、change、release、cost record</td>
+<td>时间线、处理动作、用户解释、复盘项</td>
+</tr>
+</tbody>
+</table>
+<h3 id="数据路径">数据路径</h3>
+<p>训练作业的数据路径通常是：</p>
+<pre class="text"><code>Submit Job
+  -&gt; Queue admission
+  -&gt; Workload / PodGroup
+  -&gt; Pod scheduling
+  -&gt; Node / GPU allocation
+  -&gt; Image pull and init
+  -&gt; Dataset / checkpoint access
+  -&gt; Training loop
+  -&gt; Checkpoint / metrics</code></pre>
+<p>推理扩容的数据路径通常是：</p>
+<pre class="text"><code>Scaler decision
+  -&gt; Replica desired count
+  -&gt; Pod scheduling
+  -&gt; Image pull
+  -&gt; Weight load
+  -&gt; Engine warmup
+  -&gt; Readiness
+  -&gt; Router endpoint
+  -&gt; User traffic</code></pre>
+<h3 id="控制路径">控制路径</h3>
+<table>
+<thead>
+<tr>
+<th>控制器</th>
+<th>负责动作</th>
+<th>常见问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue controller</td>
+<td>准入、借用、抢占</td>
+<td>规则不可见、quota event 不清楚</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>Pod 放置</td>
+<td>只看到 Pod 约束，不知道业务意图</td>
+</tr>
+<tr>
+<td>Cluster autoscaler</td>
+<td>节点扩容</td>
+<td>云配额、节点组标签、启动慢</td>
+</tr>
+<tr>
+<td>GPU operator / device plugin</td>
+<td>暴露 GPU 资源</td>
+<td>driver、MIG、device plugin 异常</td>
+</tr>
+<tr>
+<td>Workload controller</td>
+<td>JobSet、Ray、Deployment、ReplicaSet</td>
+<td>状态机卡住或重试策略错误</td>
+</tr>
+<tr>
+<td>Serving router</td>
+<td>副本入池、版本分流</td>
+<td>Ready 过早、endpoint stale</td>
+</tr>
+<tr>
+<td>Cost / governance</td>
+<td>chargeback、利用率、审计</td>
+<td>忙碌资源和有效资源混淆</td>
+</tr>
+</tbody>
+</table>
+<p>SOP
+的核心工程要求是：这些控制器的事件必须能按时间线关联。如果只能看到 Pod
+Pending，却看不到它上游的 queue event 和 quota
+decision，就无法给用户可信解释。</p>
+<h2 id="20d4-原理为什么有空闲-gpu-仍然跑不起来">20d.4 原理：为什么有空闲
+GPU 仍然跑不起来</h2>
+<h3 id="资源是离散形状不是连续水池">资源是离散形状，不是连续水池</h3>
+<p>假设集群显示空闲 12 张 GPU。一个作业需要 8 张同节点 H100 80GB
+整卡。下面四种情况都叫“有空闲 GPU”，但都不能启动该作业：</p>
+<table>
+<thead>
+<tr>
+<th>空闲分布</th>
+<th>为什么不能启动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12 张分散在 6 台节点</td>
+<td>没有 8 张同节点</td>
+</tr>
+<tr>
+<td>8 张是 A100，4 张是 H100</td>
+<td>SKU 不匹配</td>
+</tr>
+<tr>
+<td>8 张 H100 被切成 MIG <code>1g.10gb</code></td>
+<td>不是 80GB 整卡</td>
+</tr>
+<tr>
+<td>8 张在另一个不可借用队列</td>
+<td>队列和配额边界不允许</td>
+</tr>
+</tbody>
+</table>
+<p>这就是碎片化的本质：总量够，形状不够。</p>
+<h3 id="队列和配额先于调度">队列和配额先于调度</h3>
+<p>Kubernetes scheduler 只处理已经创建出来、进入调度流程的
+Pod。很多平台会在更上游用 Kueue、Volcano
+或自研队列先做准入。此时用户看到“作业没跑”，但 Pod
+可能还不存在，或者存在但被 gang 条件卡住。直接 <code>describe pod</code>
+可能查不到真正原因。</p>
+<h3 id="running-不等于-readyready-不等于恢复">Running 不等于
+Ready，Ready 不等于恢复</h3>
+<p>对于大模型推理，Pod 状态可能这样变化：</p>
+<pre class="text"><code>Pending
+  -&gt; ContainerCreating
+  -&gt; Running
+  -&gt; loading weights
+  -&gt; building engine
+  -&gt; warming up
+  -&gt; Ready
+  -&gt; in router
+  -&gt; receiving traffic
+  -&gt; SLO recovered</code></pre>
+<p>如果监控只看到
+Running，就会把“权重还在加载”误判成“服务已经扩出来”。如果只看到
+Ready，又可能漏掉 router 没有入池、canary
+流量没切、首批请求触发慢路径的问题。</p>
+<h2 id="20d5-工程化生产落地配置版本矩阵发布观测治理">20d.5
+工程化：生产落地、配置、版本矩阵、发布、观测、治理</h2>
+<h3 id="配置要可解释">配置要可解释</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>应包含内容</th>
+<th>排障用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue 配置</td>
+<td>nominal quota、hard cap、borrowing、priority</td>
+<td>判断 quota blocked 是否合理</td>
+</tr>
+<tr>
+<td>ResourceFlavor</td>
+<td>GPU SKU、显存、MIG profile、拓扑标签</td>
+<td>判断资源形状是否满足</td>
+</tr>
+<tr>
+<td>Node pool</td>
+<td>实例类型、zone、taint、label、autoscaler 范围</td>
+<td>判断能否扩出正确节点</td>
+</tr>
+<tr>
+<td>Workload spec</td>
+<td>request、limit、affinity、toleration、PodGroup</td>
+<td>判断 Pending 原因</td>
+</tr>
+<tr>
+<td>Image / artifact</td>
+<td>image digest、model version、checkpoint path</td>
+<td>判断冷启动和版本一致性</td>
+</tr>
+<tr>
+<td>Readiness</td>
+<td>image、weight、engine、warmup、router 入池条件</td>
+<td>判断 Running 到 Ready 的边界</td>
+</tr>
+<tr>
+<td>Preemption policy</td>
+<td>可抢占范围、checkpoint 要求、恢复保护窗口</td>
+<td>判断抢占是否可运营</td>
+</tr>
+</tbody>
+</table>
+<h3 id="版本矩阵">版本矩阵</h3>
+<p>容量事故经常来自版本组合变化。建议为每个关键服务或队列记录：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>记录字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平台</td>
+<td>Kubernetes、scheduler、Kueue/Volcano、cluster autoscaler</td>
+</tr>
+<tr>
+<td>GPU 栈</td>
+<td>driver、CUDA、NCCL、GPU operator、device plugin</td>
+</tr>
+<tr>
+<td>节点</td>
+<td>instance type、AMI / OS image、kernel、container runtime</td>
+</tr>
+<tr>
+<td>资源形状</td>
+<td>ResourceFlavor、MIG config、node labels、taints</td>
+</tr>
+<tr>
+<td>工作负载</td>
+<td>image digest、entrypoint、runtime、model artifact、checkpoint
+format</td>
+</tr>
+<tr>
+<td>存储网络</td>
+<td>CSI、对象存储 endpoint、registry、RDMA / CNI</td>
+</tr>
+<tr>
+<td>策略</td>
+<td>quota、priority、borrowing、preemption、autoscaling policy</td>
+</tr>
+</tbody>
+</table>
+<p>一次“昨天能跑，今天不能跑”的事故，可能不是用户作业变了，而是节点镜像、device
+plugin、MIG profile、quota 或模型权重路径变了。</p>
+<h3 id="发布和变更治理">发布和变更治理</h3>
+<table>
+<thead>
+<tr>
+<th>变更</th>
+<th>风险</th>
+<th>发布要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调整 quota / borrowing</td>
+<td>租户公平和抢占行为变化</td>
+<td>dry-run、影响队列列表、审批记录</td>
+</tr>
+<tr>
+<td>调整 ResourceFlavor</td>
+<td>作业可调度性变化</td>
+<td>兼容性检查、历史 workload replay</td>
+</tr>
+<tr>
+<td>重切 MIG</td>
+<td>驱逐和形状变化</td>
+<td>drain 窗口、回滚 profile、用户通知</td>
+</tr>
+<tr>
+<td>升级 GPU driver / device plugin</td>
+<td>GPU 不上报或性能变化</td>
+<td>金丝雀节点池、节点级回滚</td>
+</tr>
+<tr>
+<td>改 readiness</td>
+<td>扩容入池时机变化</td>
+<td>冷启动压测、router 验证</td>
+</tr>
+<tr>
+<td>改 autoscaling</td>
+<td>成本和 SLO 波动</td>
+<td>scaler dry-run、阶梯放量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="观测最小集合">观测最小集合</h3>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指标 / 事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>队列</td>
+<td>admitted、pending workload、quota usage、borrowing、preemption
+event</td>
+</tr>
+<tr>
+<td>资源形状</td>
+<td>idle by SKU、idle by MIG profile、free full-node windows、topology
+availability</td>
+</tr>
+<tr>
+<td>调度</td>
+<td>Pod Pending reason、scheduler attempts、taint / affinity
+mismatch</td>
+</tr>
+<tr>
+<td>节点</td>
+<td>node scale-up time、node Ready、GPU allocatable、device plugin
+health</td>
+</tr>
+<tr>
+<td>启动</td>
+<td>image pull seconds、init seconds、weight load seconds、engine init
+seconds、readiness seconds</td>
+</tr>
+<tr>
+<td>推理</td>
+<td>queue wait、TTFT、TPOT、KV utilization、active
+sequences、goodput</td>
+</tr>
+<tr>
+<td>训练</td>
+<td>pending time、step time、checkpoint age、restarts、preemption
+recovery time</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>allocated GPU-hour、idle GPU-hour、useful token/GPU-hour、wasted
+preempted GPU-hour</td>
+</tr>
+</tbody>
+</table>
+<h3 id="治理原则">治理原则</h3>
+<ol type="1">
+<li>所有 Pending 都必须有用户可读 reason。</li>
+<li>所有抢占都必须有审计记录、恢复路径和损失估计。</li>
+<li>所有扩容事件都必须能拆出时间线。</li>
+<li>所有容量看板都必须按 SKU、形状、队列和租户分桶。</li>
+<li>所有“临时绕过 quota”的动作都必须有审批和过期时间。</li>
+</ol>
+<h2 id="20d6-方案设计容量排障证据链与决策表">20d.6
+方案设计：容量排障证据链与决策表</h2>
+<h3 id="统一证据链模板">统一证据链模板</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">incident</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">id</span><span class="kw">:</span><span class="at"> inc-2026-05-04-001</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">symptom</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;70B service scale-out stuck&quot;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tenant</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;enterprise-a&quot;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">workload</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;chat-70b&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">start_time</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2026-05-04T10:12:00+08:00&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">timeline</span><span class="kw">:</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">t</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10:12&quot;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">event</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;queue_wait_p95 &gt; 800ms&quot;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">source</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;prometheus/router&quot;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">t</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10:13&quot;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">event</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;desired replicas 6 -&gt; 10&quot;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">source</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;custom-scaler&quot;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">t</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10:14&quot;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">event</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;3 pods pending: insufficient h100-80gb-full&quot;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">source</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;scheduler&quot;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">t</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10:15&quot;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">event</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;1 pod running, weight loading&quot;</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">source</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;container log&quot;</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="fu">classification</span><span class="kw">:</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">queue</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;admitted&quot;</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">quota</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;not blocked&quot;</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">shape</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;blocked: only 2 h100-80gb-full available&quot;</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scheduling</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;partial pending&quot;</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">startup</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;weight cold start&quot;</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">runtime</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;TTFT degraded, TPOT normal&quot;</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="fu">actions</span><span class="kw">:</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;move warm replica into serving pool&quot;</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;preempt 2 low-priority full-card batch jobs&quot;</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;disable new small-model placement on h100-full pool&quot;</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="fu">user_explanation</span><span class="kw">: </span><span class="ch">&gt;</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>  The cluster has idle GPUs, but the service requires H100 80GB full-card</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>  replicas. Idle GPUs are currently split across A100 and H100 MIG profiles.</span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>  One admitted replica is also still loading weights and is not ready for traffic.</span></code></pre></div>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>第一症状</th>
+<th>第一判断</th>
+<th>证据</th>
+<th>首要动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Workload 没有 Pod</td>
+<td>队列未准入</td>
+<td>queue event、quota usage</td>
+<td>查 quota、borrowing、gang</td>
+</tr>
+<tr>
+<td>Pod Pending 且 insufficient GPU</td>
+<td>形状或总量不足</td>
+<td>scheduler event、node idle map</td>
+<td>查 SKU、MIG、拓扑、节点扩容</td>
+</tr>
+<tr>
+<td>Pod Pending 且 affinity mismatch</td>
+<td>约束过窄</td>
+<td>affinity、node labels</td>
+<td>修标签或放宽约束</td>
+</tr>
+<tr>
+<td>Pod Running not Ready</td>
+<td>启动慢或失败</td>
+<td>kubelet event、container log</td>
+<td>拆 image、weight、engine、warmup</td>
+</tr>
+<tr>
+<td>Ready 副本不接流量</td>
+<td>路由或健康检查</td>
+<td>endpoint、router log</td>
+<td>修 readiness gate 或 traffic split</td>
+</tr>
+<tr>
+<td>GPU util 高但用户慢</td>
+<td>有效吞吐低</td>
+<td>goodput、timeout、KV、queue</td>
+<td>查长尾、preemption、取消传播</td>
+</tr>
+<tr>
+<td>抢占后没恢复</td>
+<td>恢复契约失败</td>
+<td>checkpoint age、controller state</td>
+<td>修 checkpoint、requeue、保护窗口</td>
+</tr>
+<tr>
+<td>扩容慢</td>
+<td>时间线未知</td>
+<td>scaler 到 SLO recovery spans</td>
+<td>拆阶段，定位最长耗时</td>
+</tr>
+</tbody>
+</table>
+<p>这个决策表是值班入口，不是替代具体排查。它的目标是在前 5
+分钟内把事故分到正确分支。</p>
+<h2 id="20d7-sop-1有空闲-gpu-但扩不起来">20d.7 SOP 1：有空闲 GPU
+但扩不起来</h2>
+<h3 id="排查顺序">排查顺序</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>检查</th>
+<th>证据</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>工作负载是否被队列准入</td>
+<td>Workload admitted、queue event</td>
+<td>未准入先查 quota / priority</td>
+</tr>
+<tr>
+<td>2</td>
+<td>目标资源形状是什么</td>
+<td>request、ResourceFlavor、nodeSelector</td>
+<td>明确 SKU、显存、MIG、拓扑</td>
+</tr>
+<tr>
+<td>3</td>
+<td>该形状是否存在空闲</td>
+<td>idle by SKU/profile/node</td>
+<td>判断是不是碎片化</td>
+</tr>
+<tr>
+<td>4</td>
+<td>空闲资源是否属于可用队列</td>
+<td>cohort、borrowing、hard cap</td>
+<td>判断是否被边界锁住</td>
+</tr>
+<tr>
+<td>5</td>
+<td>是否需要 gang / 同节点</td>
+<td>PodGroup、minAvailable、topology</td>
+<td>判断是否缺完整窗口</td>
+</tr>
+<tr>
+<td>6</td>
+<td>是否可通过抢占或 compact 释放</td>
+<td>preemptible workloads、checkpoint age</td>
+<td>判断恢复成本</td>
+</tr>
+<tr>
+<td>7</td>
+<td>节点池能否扩出正确形状</td>
+<td>node group、cloud quota、zone</td>
+<td>判断是否走集群扩容</td>
+</tr>
+</tbody>
+</table>
+<h3 id="用户解释模板">用户解释模板</h3>
+<pre class="text"><code>集群当前总空闲 GPU 为 12 张，但目标服务需要 2 张 H100 80GB 整卡作为一个副本。
+当前空闲资源中，6 张是 A100，4 张是 H100 MIG 1g.10gb，只有 2 张 H100 80GB 整卡。
+因此最多只能再启动 1 个副本。剩余副本 Pending 的原因是资源形状不足，不是 quota blocked。
+下一步动作：释放 h100-full 池中的低优先级任务，或等待节点池扩出新的 H100 80GB 节点。</code></pre>
+<h3 id="处理动作">处理动作</h3>
+<p>按侵入性从低到高：</p>
+<ol type="1">
+<li>等待短作业自然完成，给出 ETA。</li>
+<li>暂停新小任务进入关键整卡池。</li>
+<li>将可迁移任务 compact 到少数节点，腾出完整节点。</li>
+<li>抢占低优先级且 checkpoint 新鲜的借用任务。</li>
+<li>启动正确 node pool 扩容。</li>
+<li>重切 MIG profile，但必须评估驱逐和回滚。</li>
+<li>调整长期池划分和 quota。</li>
+</ol>
+<h2 id="20d8-sop-2pod-pending">20d.8 SOP 2：Pod Pending</h2>
+<p>Pod Pending 是结果，不是根因。排查要先分清 Pod 是被队列创建后
+Pending，还是工作负载根本没被准入。</p>
+<table>
+<thead>
+<tr>
+<th>Pending 原因</th>
+<th>关键证据</th>
+<th>根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>quota blocked</code></td>
+<td>ClusterQueue usage、hard cap</td>
+<td>队列没有可准入额度</td>
+<td>等待、开放 borrowing、审批临时额度</td>
+</tr>
+<tr>
+<td><code>gang not satisfied</code></td>
+<td>PodGroup minAvailable、created pods</td>
+<td>完整资源窗口不足</td>
+<td>等待、降规模、抢占、backfill</td>
+</tr>
+<tr>
+<td><code>insufficient nvidia.com/gpu</code></td>
+<td>scheduler event、node allocatable</td>
+<td>GPU 总量或形状不足</td>
+<td>查碎片、node pool、device plugin</td>
+</tr>
+<tr>
+<td><code>node affinity mismatch</code></td>
+<td>nodeSelector、node labels</td>
+<td>约束和节点标签不匹配</td>
+<td>修标签、放宽 affinity</td>
+</tr>
+<tr>
+<td><code>taint not tolerated</code></td>
+<td>node taints、pod tolerations</td>
+<td>队列没有进入该池的权限</td>
+<td>添加 toleration 或修队列绑定</td>
+</tr>
+<tr>
+<td><code>volume node affinity conflict</code></td>
+<td>PVC / PV zone</td>
+<td>存储 zone 和节点 zone 不一致</td>
+<td>调整 storageClass 或调度 zone</td>
+</tr>
+<tr>
+<td><code>image pull backoff</code></td>
+<td>kubelet event、registry log</td>
+<td>镜像不可达、认证失败或过大</td>
+<td>修 registry、凭证、预拉镜像</td>
+</tr>
+<tr>
+<td><code>runtime class</code> 错误</td>
+<td>RuntimeClass、container runtime log</td>
+<td>GPU runtime 配置错误</td>
+<td>修 runtimeClass 和节点运行时</td>
+</tr>
+</tbody>
+</table>
+<p>排查顺序：</p>
+<ol type="1">
+<li>先看队列控制器 event：是否 admitted。</li>
+<li>再看 PodGroup / Workload：是否 gang 满足。</li>
+<li>再看 scheduler event：为什么找不到节点。</li>
+<li>再看 kubelet event：节点上创建容器时发生了什么。</li>
+</ol>
+<p>只看最后一个 Pod event，容易错过上游准入原因。</p>
+<h2 id="20d9-sop-3quota-blocked">20d.9 SOP 3：Quota Blocked</h2>
+<p>quota blocked
+的关键是区分“确实超过合同边界”和“有空闲但策略不允许借用”。</p>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>要回答的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nominal quota</td>
+<td>当前队列是否用完名义额度</td>
+</tr>
+<tr>
+<td>hard cap</td>
+<td>是否触达绝对上限</td>
+</tr>
+<tr>
+<td>borrowing</td>
+<td>是否允许借用，借用额度是否用完</td>
+</tr>
+<tr>
+<td>cohort</td>
+<td>同共享组内是否有其他队列空闲</td>
+</tr>
+<tr>
+<td>flavor quota</td>
+<td>是所有 GPU 满，还是某个 H100 / MIG flavor 满</td>
+</tr>
+<tr>
+<td>preemption</td>
+<td>是否有可回收的低优先级借用资源</td>
+</tr>
+<tr>
+<td>priority</td>
+<td>当前工作负载优先级是否足以触发回收</td>
+</tr>
+<tr>
+<td>admission history</td>
+<td>最近是否有策略变更导致准入行为变化</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理原则">处理原则</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触达 hard cap</td>
+<td>不直接绕过，除非有审批、过期时间和成本归属</td>
+</tr>
+<tr>
+<td>nominal quota 满但 cohort 空闲</td>
+<td>考虑开放 borrowing 或提高 borrowing limit</td>
+</tr>
+<tr>
+<td>低优先级占用借用资源</td>
+<td>按抢占契约回收，检查 checkpoint</td>
+</tr>
+<tr>
+<td>仅某个 flavor 满</td>
+<td>转到资源形状排查，不要只加总 quota</td>
+</tr>
+<tr>
+<td>长期 quota blocked</td>
+<td>进入容量规划，调整保底、池划分或预算</td>
+</tr>
+</tbody>
+</table>
+<h3 id="解释模板">解释模板</h3>
+<pre class="text"><code>该作业被 quota blocked，不是 Kubernetes 调度失败。
+research 队列 H100 80GB nominal quota 为 64，目前已使用 64。
+同 cohort 中 online 队列还有空闲，但 hard cap 策略禁止 research 借用 online 保留容量。
+可选动作：等待当前 8 卡作业结束，或由资源 owner 审批 24 小时临时 borrowing。</code></pre>
+<h2 id="20d10-sop-4fragmentation">20d.10 SOP 4：Fragmentation</h2>
+<p>碎片化排障要从“总数”切到“形状”。建议建立一张关键形状表，而不是只看
+GPU idle。</p>
+<table>
+<thead>
+<tr>
+<th>形状维度</th>
+<th>必看问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>卡型</td>
+<td>H100、A100、L40S 是否混合展示</td>
+</tr>
+<tr>
+<td>显存</td>
+<td>40GB 和 80GB 是否被错误等价</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>profile 是否匹配请求，是否需要重切</td>
+</tr>
+<tr>
+<td>单节点</td>
+<td>是否有完整 8 卡 / 4 卡窗口</td>
+</tr>
+<tr>
+<td>拓扑</td>
+<td>NVLink、PCIe、RDMA、rack、zone 是否满足</td>
+</tr>
+<tr>
+<td>队列边界</td>
+<td>空闲资源是否可被当前队列借用</td>
+</tr>
+<tr>
+<td>常驻副本</td>
+<td>推理副本是否切碎训练节点</td>
+</tr>
+<tr>
+<td>时间窗口</td>
+<td>短作业多久释放，是否可以 backfill</td>
+</tr>
+</tbody>
+</table>
+<h3 id="碎片化例子">碎片化例子</h3>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th>空闲</th>
+<th>当前占用</th>
+<th>对 8 卡训练</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>node-a</td>
+<td>3 H100 full</td>
+<td>5 张被在线推理占用</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-b</td>
+<td>2 H100 full</td>
+<td>6 张被低优先级训练占用</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-c</td>
+<td>4 H100 MIG</td>
+<td>已切 <code>1g.10gb</code></td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-d</td>
+<td>3 A100 full</td>
+<td>卡型不匹配</td>
+<td>不可用</td>
+</tr>
+</tbody>
+</table>
+<p>总空闲 12 张，但没有一个 8 卡 H100 full 节点窗口。</p>
+<h3 id="治理动作">治理动作</h3>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>适用</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>compact 小任务</td>
+<td>释放完整节点</td>
+<td>单节点热点、迁移成本</td>
+</tr>
+<tr>
+<td>禁止新任务进入关键池</td>
+<td>防止碎片恶化</td>
+<td>低优先级等待变长</td>
+</tr>
+<tr>
+<td>抢占可恢复任务</td>
+<td>快速释放形状</td>
+<td>checkpoint 和用户影响</td>
+</tr>
+<tr>
+<td>重切 MIG profile</td>
+<td>profile 错配严重</td>
+<td>驱逐、重启、变更窗口</td>
+</tr>
+<tr>
+<td>推理训练分池</td>
+<td>保护在线和训练形状</td>
+<td>利用率峰谷互补下降</td>
+</tr>
+<tr>
+<td>调整 quota / borrowing</td>
+<td>长期形状错配</td>
+<td>需要治理审批</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20d11-sop-5image--weight--engine-cold-start">20d.11 SOP 5：Image
+/ Weight / Engine Cold Start</h2>
+<p>冷启动必须分段，否则会把所有启动慢都误归因给“扩容慢”。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>证据</th>
+<th>典型根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Image cold start</td>
+<td><code>Pulling image</code> 时间长、registry 5xx、节点无缓存</td>
+<td>镜像过大、跨区拉取、认证慢</td>
+<td>镜像瘦身、预拉、就近 registry、digest 固定</td>
+</tr>
+<tr>
+<td>Init cold start</td>
+<td>init container 长时间运行</td>
+<td>环境检查、依赖下载、权限等待</td>
+<td>减少 init 工作、缓存依赖、并行化</td>
+</tr>
+<tr>
+<td>Weight cold start</td>
+<td>容器 Running，日志显示加载权重</td>
+<td>权重大、对象存储慢、本地缓存 miss</td>
+<td>权重缓存、分层下载、P2P 分发、热副本</td>
+</tr>
+<tr>
+<td>Engine cold start</td>
+<td>build engine、compile、CUDA graph capture 慢</td>
+<td>runtime 编译、shape bucket 太多</td>
+<td>预构建 engine、固定 bucket、预热</td>
+</tr>
+<tr>
+<td>Readiness 过早</td>
+<td>Ready 后首批请求 TTFT spike</td>
+<td>probe 未覆盖 warmup</td>
+<td>readiness 包含代表性 warmup</td>
+</tr>
+<tr>
+<td>Router 入池慢</td>
+<td>Ready 后无流量</td>
+<td>endpoint 更新、health check、traffic split</td>
+<td>修 router 发现和健康检查</td>
+</tr>
+</tbody>
+</table>
+<h3 id="冷启动时间线">冷启动时间线</h3>
+<pre class="text"><code>scale decision
+  -&gt; pod created
+  -&gt; scheduled
+  -&gt; image pulled
+  -&gt; container started
+  -&gt; weights loaded
+  -&gt; engine initialized
+  -&gt; warmup completed
+  -&gt; readiness true
+  -&gt; router in pool
+  -&gt; first successful request</code></pre>
+<p>每一段都要有 span。如果只有总启动时间，事故复盘只能猜。</p>
+<h2 id="20d12-sop-6抢占恢复">20d.12 SOP 6：抢占恢复</h2>
+<p>抢占不是“杀掉低优先级任务”这么简单。没有恢复契约的抢占，会把平台利用率问题转化为用户信任问题。</p>
+<h3 id="四个契约">四个契约</h3>
+<table>
+<thead>
+<tr>
+<th>契约</th>
+<th>必须回答</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Checkpoint 契约</td>
+<td>最近 checkpoint 在哪里，多久前，是否完整可读</td>
+</tr>
+<tr>
+<td>Requeue 契约</td>
+<td>被抢占后是否自动回队列，保留哪些参数和优先级</td>
+</tr>
+<tr>
+<td>Protection 契约</td>
+<td>恢复后是否有保护窗口，避免刚恢复又被抢占</td>
+</tr>
+<tr>
+<td>Explanation 契约</td>
+<td>用户能否看到被谁抢占、为什么、损失多少、预计何时恢复</td>
+</tr>
+</tbody>
+</table>
+<h3 id="故障表">故障表</h3>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>根因</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>抢占后从头训练</td>
+<td>checkpoint age 很大或不可读</td>
+<td>checkpoint 频率不足、路径错误、权限错误</td>
+<td>缩短 checkpoint 间隔，启动前校验</td>
+</tr>
+<tr>
+<td>作业没有重入队</td>
+<td>controller state 卡住</td>
+<td>requeue 状态机缺陷</td>
+<td>修控制器，补偿性重新提交</td>
+</tr>
+<tr>
+<td>恢复后又被抢占</td>
+<td>preemption event 连续出现</td>
+<td>缺恢复保护窗口</td>
+<td>增加 grace period 和优先级提升</td>
+</tr>
+<tr>
+<td>抢占释放不了资源</td>
+<td>Pod termination 卡住</td>
+<td>finalizer、PVC、进程不响应</td>
+<td>强化优雅退出和超时清理</td>
+</tr>
+<tr>
+<td>用户无法接受</td>
+<td>没有通知和 ETA</td>
+<td>解释链断裂</td>
+<td>暴露 event、checkpoint、恢复 ETA</td>
+</tr>
+</tbody>
+</table>
+<h3 id="抢占前检查">抢占前检查</h3>
+<ol type="1">
+<li>被抢占对象是否标记 preemptible。</li>
+<li>checkpoint age 是否小于策略阈值。</li>
+<li>释放的资源形状是否真的满足高优先级需求。</li>
+<li>是否存在更低成本的 compact 或等待动作。</li>
+<li>抢占后是否会触发级联 Pending。</li>
+</ol>
+<h2 id="20d13-sop-7扩容慢">20d.13 SOP 7：扩容慢</h2>
+<p>扩容慢不是一个根因，而是一条时间线。必须把“决定扩容”到“SLO
+恢复”拆开。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>证据</th>
+<th>典型瓶颈</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>指标触发</td>
+<td>metric value、scaler log</td>
+<td>指标窗口太长、指标缺失</td>
+<td>调窗口、修指标、dry-run 校验</td>
+</tr>
+<tr>
+<td>副本决策</td>
+<td>desired replicas、cooldown</td>
+<td>阈值过高、冷却过长</td>
+<td>调策略、分开 scale-out/in</td>
+</tr>
+<tr>
+<td>队列准入</td>
+<td>Workload event、quota usage</td>
+<td>quota blocked、gang 不满足</td>
+<td>调 borrowing、释放形状</td>
+</tr>
+<tr>
+<td>Pod 调度</td>
+<td>scheduler event</td>
+<td>资源形状不足、affinity、taint</td>
+<td>查碎片、标签、节点池</td>
+</tr>
+<tr>
+<td>节点扩容</td>
+<td>node group event、cloud quota</td>
+<td>云配额、实例无货、启动慢</td>
+<td>预留、热节点、多 zone</td>
+</tr>
+<tr>
+<td>GPU 可分配</td>
+<td>device plugin、driver log</td>
+<td>节点 Ready 但 GPU 不上报</td>
+<td>修 driver、plugin、MIG</td>
+</tr>
+<tr>
+<td>容器启动</td>
+<td>image pull、init log</td>
+<td>镜像大、registry 慢</td>
+<td>预拉、瘦身、缓存</td>
+</tr>
+<tr>
+<td>模型启动</td>
+<td>weight / engine span</td>
+<td>权重加载、编译</td>
+<td>热权重、预构建 engine</td>
+</tr>
+<tr>
+<td>入路由池</td>
+<td>endpoint、router log</td>
+<td>readiness 或 discovery 问题</td>
+<td>修健康检查、渐进接流量</td>
+</tr>
+<tr>
+<td>SLO 恢复</td>
+<td>TTFT、TPOT、goodput</td>
+<td>新容量不足或瓶颈不在副本</td>
+<td>回到运行时排查</td>
+</tr>
+</tbody>
+</table>
+<h3 id="判断扩容是否真的有效">判断扩容是否真的有效</h3>
+<p>扩容有效不等于 desired replicas 增加。至少要看到：</p>
+<ol type="1">
+<li>scheduled replicas 增加。</li>
+<li>ready replicas 增加。</li>
+<li>router in-pool replicas 增加。</li>
+<li>queue wait 下降。</li>
+<li>TTFT / TPOT 回到目标。</li>
+<li>goodput 上升。</li>
+</ol>
+<p>缺任何一步，都要回到对应层定位。</p>
+<h2 id="20d14-成本--利用率看板避免错误激励">20d.14 成本 /
+利用率看板：避免错误激励</h2>
+<p>成本看板最常见的错误是只展示平均 GPU
+utilization。这个指标会把很多不同状态混在一起：有效训练、超时后仍在生成、被抢占后的重算、排队等待、低优先级填缝、不可服务的热副本。</p>
+<h3 id="最小看板集合">最小看板集合</h3>
+<table>
+<thead>
+<tr>
+<th>视图</th>
+<th>指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>库存</td>
+<td>total / allocatable / allocated / idle by SKU、显存、MIG
+profile</td>
+</tr>
+<tr>
+<td>形状</td>
+<td>可用 8 卡节点数、可用 4 卡节点数、可用 H100 full、可用 MIG
+profile</td>
+</tr>
+<tr>
+<td>队列</td>
+<td>pending workloads、queue wait、quota blocked、borrowing
+usage、preemption</td>
+</tr>
+<tr>
+<td>调度</td>
+<td>Pending reason 分布、affinity mismatch、taint mismatch、gang
+wait</td>
+</tr>
+<tr>
+<td>启动</td>
+<td>image pull P95、weight load P95、engine init P95、readiness P95</td>
+</tr>
+<tr>
+<td>推理</td>
+<td>TTFT、TPOT、queue wait、KV utilization、active
+sequences、goodput</td>
+</tr>
+<tr>
+<td>训练</td>
+<td>step time、checkpoint age、restart count、preemption recovery
+time</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>GPU-hour、idle GPU-hour、useful token/GPU-hour、wasted preempted
+GPU-hour</td>
+</tr>
+<tr>
+<td>治理</td>
+<td>按租户 / 队列 / 模型 / SKU 的成本和 SLO</td>
+</tr>
+</tbody>
+</table>
+<h3 id="busy-与-useful">Busy 与 useful</h3>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>GPU 是否忙</th>
+<th>是否有用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常训练 step</td>
+<td>忙</td>
+<td>有用</td>
+<td>产生有效进度</td>
+</tr>
+<tr>
+<td>推理按 SLO 返回 token</td>
+<td>忙</td>
+<td>有用</td>
+<td>goodput 增加</td>
+</tr>
+<tr>
+<td>客户端取消后仍生成</td>
+<td>忙</td>
+<td>无用</td>
+<td>需要取消传播</td>
+</tr>
+<tr>
+<td>KV preemption 重算</td>
+<td>忙</td>
+<td>部分无用</td>
+<td>容量过载导致 goodput 下降</td>
+</tr>
+<tr>
+<td>被抢占后从头训练</td>
+<td>忙</td>
+<td>大量浪费</td>
+<td>checkpoint 契约失败</td>
+</tr>
+<tr>
+<td>热副本等待流量</td>
+<td>不一定忙</td>
+<td>业务上有用但成本高</td>
+<td>应归入 warm capacity</td>
+</tr>
+<tr>
+<td>Pod Pending</td>
+<td>不忙</td>
+<td>无用</td>
+<td>可能占用队列额度或用户时间</td>
+</tr>
+</tbody>
+</table>
+<p>成本治理应该优化 useful capacity，而不是简单追求 utilization
+越高越好。</p>
+<h2 id="20d15-故障排除总表症状证据根因动作">20d.15
+故障排除总表：症状、证据、根因、动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>第一证据</th>
+<th>可能根因</th>
+<th>首要动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>有 GPU 但作业不启动</td>
+<td>idle by shape、queue event</td>
+<td>形状碎片、quota 边界、gang 不满足</td>
+<td>查 SKU/MIG/拓扑和准入</td>
+</tr>
+<tr>
+<td>Workload 长期未 admitted</td>
+<td>ClusterQueue event</td>
+<td>quota blocked、borrowing 关闭、hard cap</td>
+<td>查配额和 cohort</td>
+</tr>
+<tr>
+<td>Pod Pending insufficient GPU</td>
+<td>scheduler event、node allocatable</td>
+<td>GPU 不足、device plugin 未上报、MIG 错配</td>
+<td>查节点和资源形状</td>
+</tr>
+<tr>
+<td>Pod Pending affinity mismatch</td>
+<td>pod spec、node labels</td>
+<td>标签错误或约束过窄</td>
+<td>修标签或放宽约束</td>
+</tr>
+<tr>
+<td>Pod Running not Ready</td>
+<td>container log、readiness condition</td>
+<td>image/weight/engine/warmup 慢</td>
+<td>拆冷启动时间线</td>
+</tr>
+<tr>
+<td>扩容触发但 P99 不降</td>
+<td>ready/in-router replicas、queue wait</td>
+<td>新副本未接流量、瓶颈不在副本</td>
+<td>查路由和运行时</td>
+</tr>
+<tr>
+<td>抢占后损失大</td>
+<td>checkpoint age、restart log</td>
+<td>checkpoint 不可用或间隔过长</td>
+<td>修 checkpoint 契约</td>
+</tr>
+<tr>
+<td>扩节点失败</td>
+<td>cluster autoscaler、cloud event</td>
+<td>云配额、实例无货、zone 限制</td>
+<td>预留、多 zone、调整 node group</td>
+</tr>
+<tr>
+<td>GPU 节点 Ready 但无 GPU</td>
+<td>device plugin log、allocatable</td>
+<td>driver/MIG/plugin 异常</td>
+<td>重启 plugin、修驱动和节点镜像</td>
+</tr>
+<tr>
+<td>利用率高但用户慢</td>
+<td>goodput、timeout、KV、queue</td>
+<td>无效工作、长尾、KV 过载</td>
+<td>限流、取消传播、长短分流</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20d16-反模式--checklist">20d.16 反模式 + Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>现象</th>
+<th>修复方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用总空闲 GPU 做承诺</td>
+<td>用户经常看到“有卡不能用”</td>
+<td>展示关键形状可用数</td>
+</tr>
+<tr>
+<td>只给用户显示 Pending</td>
+<td>用户无法判断是配额还是调度</td>
+<td>展示 queue、quota、shape、scheduler 分层原因</td>
+</tr>
+<tr>
+<td>扩容慢就加节点</td>
+<td>成本增加但 SLO 不改善</td>
+<td>拆 image、weight、engine、router 时间线</td>
+</tr>
+<tr>
+<td>抢占不检查 checkpoint</td>
+<td>GPU-hour 被重算浪费</td>
+<td>抢占前校验 checkpoint age</td>
+</tr>
+<tr>
+<td>MIG profile 长期不复盘</td>
+<td>小切片很多，大模型没整卡</td>
+<td>定期按需求重切和分池</td>
+</tr>
+<tr>
+<td>readiness 只看进程存活</td>
+<td>Ready 后首批请求 spike</td>
+<td>readiness 覆盖模型可服务状态</td>
+</tr>
+<tr>
+<td>看板只看平均利用率</td>
+<td>高利用率掩盖用户慢和浪费</td>
+<td>引入 goodput、shape、队列、成本分桶</td>
+</tr>
+<tr>
+<td>临时绕过 quota 无过期</td>
+<td>公平性和预算失控</td>
+<td>审批、TTL、审计和回滚</td>
+</tr>
+</tbody>
+</table>
+<h3 id="checklist">Checklist</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>完成标准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户可见 reason</td>
+<td>每个 Pending / blocked 状态都有分层原因</td>
+</tr>
+<tr>
+<td>形状看板</td>
+<td>按 SKU、显存、MIG、拓扑、队列展示可用容量</td>
+</tr>
+<tr>
+<td>事件关联</td>
+<td>queue、scheduler、kubelet、runtime event 可串成时间线</td>
+</tr>
+<tr>
+<td>冷启动 span</td>
+<td>image、weight、engine、warmup、router 入池都有耗时</td>
+</tr>
+<tr>
+<td>抢占契约</td>
+<td>checkpoint、requeue、保护窗口、用户通知已实现</td>
+</tr>
+<tr>
+<td>扩容验证</td>
+<td>desired、scheduled、ready、in-router、SLO recovery 全链路可见</td>
+</tr>
+<tr>
+<td>成本归因</td>
+<td>busy、useful、wasted、warm capacity 分开统计</td>
+</tr>
+<tr>
+<td>变更治理</td>
+<td>quota、MIG、driver、readiness、autoscaling 变更有 dry-run 或
+canary</td>
+</tr>
+<tr>
+<td>演练</td>
+<td>定期演练 quota
+blocked、碎片化、冷启动慢、抢占恢复、节点扩容失败</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20d17-worked-example一次有卡但扩不起来的完整排障">20d.17 Worked
+Example：一次“有卡但扩不起来”的完整排障</h2>
+<h3 id="背景">背景</h3>
+<p>企业租户的 70B 推理服务需要从 4 个副本扩到 8 个副本。每个副本需要 2
+张 H100 80GB 整卡。10:00 开始 TTFT 告警，用户看到控制台显示“集群空闲 12
+张 GPU”，但 20 分钟后只有 5 个副本 Ready。</p>
+<h3 id="初始现象">初始现象</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>desired replicas</td>
+<td>4 -&gt; 8</td>
+</tr>
+<tr>
+<td>ready replicas</td>
+<td>4 -&gt; 5</td>
+</tr>
+<tr>
+<td>queue wait P95</td>
+<td>900ms</td>
+</tr>
+<tr>
+<td>TTFT P99</td>
+<td>7s</td>
+</tr>
+<tr>
+<td>TPOT P95</td>
+<td>正常</td>
+</tr>
+<tr>
+<td>集群总空闲 GPU</td>
+<td>12</td>
+</tr>
+</tbody>
+</table>
+<h3 id="排查过程">排查过程</h3>
+<ol type="1">
+<li>队列层：Workload 已 admitted，没有 quota blocked。</li>
+<li>配额层：企业租户未触达 hard cap，borrowing 未使用。</li>
+<li>形状层：目标需要 H100 80GB full。12 张空闲里，6 张是 A100，4 张是
+H100 MIG <code>1g.10gb</code>，只有 2 张 H100 full。</li>
+<li>调度层：第 6 到第 8 个副本 Pending，event 为
+<code>insufficient h100-80gb-full</code>。</li>
+<li>启动层：第 5 个副本 Running but not
+Ready，日志显示正在从对象存储加载 140GB 权重。</li>
+<li>路由层：router 曾短暂把流量打到第 5 个副本，导致 warmup
+请求和真实请求混在一起。</li>
+<li>运行时层：TTFT 差、TPOT 正常，说明主要是排队和 prefill /
+冷启动，不是 decode。</li>
+</ol>
+<h3 id="根因">根因</h3>
+<table>
+<thead>
+<tr>
+<th>根因</th>
+<th>证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>资源形状不足</td>
+<td>只有 2 张 H100 full，无法启动 3 个新副本</td>
+</tr>
+<tr>
+<td>权重冷启动慢</td>
+<td>第 5 副本 140GB 权重加载耗时超过 5 分钟</td>
+</tr>
+<tr>
+<td>readiness / router 边界不清</td>
+<td>warmup 未完成时进入流量池</td>
+</tr>
+<tr>
+<td>看板误导</td>
+<td>控制台只展示总空闲 GPU，没有展示 H100 full 可用数</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理动作-1">处理动作</h3>
+<ol type="1">
+<li>立即将第 5 个副本从普通流量池摘除，完成 warmup 后再入池。</li>
+<li>抢占 batch 队列中 2 个 checkpoint 新鲜的 H100 full 任务，释放 4
+张整卡。</li>
+<li>暂停小模型继续落入 H100 full 池，避免碎片扩大。</li>
+<li>启用本地权重缓存，并为该服务保留 1 个热副本。</li>
+<li>修改 readiness：必须完成权重加载、engine 初始化和代表性 warmup 后才
+Ready。</li>
+<li>控制台新增 <code>h100-80gb-full available</code> 和
+<code>ready/in-router replicas</code>。</li>
+</ol>
+<h3 id="用户解释">用户解释</h3>
+<pre class="text"><code>本次不是集群完全没有 GPU，而是目标服务需要 H100 80GB 整卡形状。
+事故时总空闲 GPU 为 12 张，但只有 2 张满足 H100 80GB 整卡要求，其余为空闲 A100 或 H100 MIG 小切片。
+同时一个新副本处于权重冷启动阶段，尚不能稳定接流量。
+平台已释放 4 张 H100 整卡、修正 readiness 入池规则，并增加该服务的热副本。</code></pre>
+<h3 id="长期治理">长期治理</h3>
+<table>
+<thead>
+<tr>
+<th>治理项</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>形状看板</td>
+<td>不再用总 GPU idle 承诺容量</td>
+</tr>
+<tr>
+<td>H100 full 池保护</td>
+<td>防止小模型切碎大模型池</td>
+</tr>
+<tr>
+<td>权重缓存</td>
+<td>降低扩容冷启动</td>
+</tr>
+<tr>
+<td>抢占恢复演练</td>
+<td>确保 batch 被抢占后可恢复</td>
+</tr>
+<tr>
+<td>Router readiness gate</td>
+<td>消除冷副本接真实流量</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20d18-本章小结">20d.18 本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>容量定义</td>
+<td>容量是带队列、形状、调度、启动和 SLO 约束的可交付能力</td>
+</tr>
+<tr>
+<td>排障顺序</td>
+<td>先准入和配额，再资源形状，再调度，再启动，再运行时</td>
+</tr>
+<tr>
+<td>Pending</td>
+<td>Pending 是结果，必须结合 queue event、scheduler event、kubelet
+event</td>
+</tr>
+<tr>
+<td>碎片化</td>
+<td>总空闲数不等于关键形状可用数</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>image、weight、engine、readiness 和 router 入池要分段观测</td>
+</tr>
+<tr>
+<td>抢占</td>
+<td>没有 checkpoint、requeue 和解释契约，抢占不可运营</td>
+</tr>
+<tr>
+<td>看板</td>
+<td>优化 useful capacity，不是盲目追求 GPU utilization</td>
+</tr>
+<tr>
+<td>证据链</td>
+<td>每个结论都要能落到事件、指标、日志或配置</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>为什么“集群空闲 10 张 GPU”不能直接承诺一个 8
+卡训练作业可以启动？</li>
+<li>Pod Pending 时，为什么要先看队列 event，再看 scheduler event？</li>
+<li>quota blocked 和资源碎片化有什么区别？</li>
+<li>image cold start、weight cold start、engine cold start
+的证据分别是什么？</li>
+<li>抢占恢复至少需要哪四个契约？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="6" type="1">
+<li>设计一个容量看板，要求能解释 H100 full、MIG profile、队列 quota
+和推理 goodput。</li>
+<li>一个 32 GPU 训练作业 Pending 30 分钟，但集群显示空闲 40
+GPU。写出你的排查顺序和每一步证据。</li>
+<li>一个推理服务 desired replicas 已经增加，但 TTFT 没恢复。请拆出从
+scaler 到 SLO recovery 的完整时间线。</li>
+<li>你会如何设计抢占前检查，避免释放了资源但高优先级作业仍然启动不了？</li>
+<li>发现 GPU utilization 长期
+90%，但用户投诉变慢。列出可能根因，并说明如何区分 busy 和 useful。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

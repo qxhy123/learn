@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d3 章 · RDMA、RoCE/IB 与 GPUDirect 导览 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d3" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d3 章 · RDMA、RoCE/IB 与 GPUDirect 导览</h1>
+<p class="sub">先讲清 RDMA、RoCE/InfiniBand、GPUDirect RDMA 的概念关系，再建立三层排障边界。</p>
+<div class="chips"><span class="chip">RDMA</span><span class="chip">RoCE</span><span class="chip">InfiniBand</span><span class="chip">GPUDirect</span><span class="chip">导览</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#三个概念先说清楚">1. 三个概念先说清楚</a></li><li><a class="anchor" href="#为什么要拆分-0d3">2. 为什么要拆分 0d3</a></li><li><a class="anchor" href="#拆分后的阅读路径">3. 拆分后的阅读路径</a></li><li><a class="anchor" href="#总框架三层责任边界">4. 总框架：三层责任边界</a></li><li><a class="anchor" href="#和相邻章节的关系">5. 和相邻章节的关系</a></li><li><a class="anchor" href="#快速自测">6. 快速自测</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>定位</strong>：本章是 0d3 系列导览。原来的
+RDMA、RoCE/IB、GPUDirect RDMA 内容已经拆成三个独立子章： <a
+href="0d3a-rdma-verbs-memory-registration-and-queues.html">0d3a</a>、<a
+href="0d3b-roce-infiniband-lossless-fabric-and-congestion.html">0d3b</a>、<a
+href="0d3c-gpudirect-rdma-gpu-nic-topology-and-diagnostics.html">0d3c</a>。Linux
+网络栈见 <a href="0d1-linux-network-stack-tcp-and-mtu.html">0d1</a>，NIC
+queue/offload 见 <a
+href="0d2-nic-offload-queues-and-service-network-io.html">0d2</a>，NCCL
+专章见 <a
+href="0d4-nccl-collectives-and-network-diagnostics.html">0d4</a>。</p>
+</blockquote>
+<h2 id="三个概念先说清楚">1. 三个概念先说清楚</h2>
+<p><strong>RDMA</strong>
+是一种“让网卡直接读写本机或远端已授权内存”的通信机制。普通 socket
+把网络抽象成内核管理的 fd：应用 <code>send()</code>，数据进入内核 socket
+buffer，经过 TCP/IP，再由对端内核交给对端应用。RDMA
+的思路是：应用先把内存注册给网卡，拿到访问
+key，然后把“读哪里、写哪里、完成后怎么通知”提交给 NIC。NIC 通过 DMA
+执行数据搬运，CPU 不再逐包处理 payload。</p>
+<p>所以 RDMA 主要回答：<strong>应用如何把内存、安全权限和异步队列交给
+NIC？</strong><br />
+它的关键词是 MR、lkey/rkey、QP、CQ、WR、WC、Send/Recv、RDMA Write、RDMA
+Read、Atomic。</p>
+<p><strong>RoCE / InfiniBand</strong> 不是另一个 RDMA API，而是 RDMA
+packet 跑在什么网络 fabric 上的问题。InfiniBand 是专用 RDMA
+fabric，有自己的链路层、Subnet Manager、LID、PKey、SL/VL
+和管理工具。RoCE 是 RDMA over Ethernet，RoCE v2 把 RDMA 封装在 UDP/IP
+上，跑在以太网和 L3 网络中。</p>
+<p>所以 RoCE/IB 主要回答：<strong>RDMA packet
+如何跨交换机、链路、优先级、拥塞和路由到达对端？</strong><br />
+它的关键词是 GID/GID
+index、LID、PKey、MTU、PFC、ECN、CNP、DCQCN、ECMP、SM、link
+width/speed。</p>
+<p><strong>GPUDirect RDMA</strong> 是 RDMA 的目标内存从 host DRAM 扩展到
+GPU HBM。没有 GPUDirect RDMA 时，跨节点 GPU 通信常要走：</p>
+<pre class="text"><code>GPU HBM -&gt; host pinned memory -&gt; NIC -&gt; network -&gt; peer NIC -&gt; host pinned memory -&gt; peer GPU HBM</code></pre>
+<p>启用 GPUDirect RDMA 后，目标路径变成：</p>
+<pre class="text"><code>GPU HBM &lt;-&gt; NIC RDMA engine &lt;-&gt; network &lt;-&gt; peer NIC &lt;-&gt; peer GPU HBM</code></pre>
+<p>所以 GPUDirect RDMA 主要回答：<strong>NIC 能不能绕过 host
+staging，直接 DMA 读写 GPU 显存？</strong><br />
+它的关键词是 <code>nvidia_peermem</code>、BAR/BAR1、PCIe
+P2P、IOMMU/ACS/ATS、GPU/NIC locality、CUDA buffer、NCCL/UCX/MPI
+fallback。</p>
+<p>三者的层次关系：</p>
+<pre class="text"><code>RDMA
+  = NIC 直接访问注册内存的机制
+
+RoCE / InfiniBand
+  = RDMA packet 跑在哪种网络 fabric 上
+
+GPUDirect RDMA
+  = RDMA 访问的内存不是 host DRAM，而是 GPU HBM</code></pre>
+<h2 id="为什么要拆分-0d3">2. 为什么要拆分 0d3</h2>
+<p>RDMA 不是一个单一开关。它同时包含用户态 verbs
+编程模型、网卡和内存注册机制、RoCE/InfiniBand fabric
+配置、拥塞控制、GPU/NIC 拓扑、GPUDirect RDMA 和通信库 fallback
+诊断。把这些放在一章里，很容易让读者把三个不同层次混在一起：</p>
+<ul>
+<li>RDMA verbs 解释“应用如何授权 NIC 直接访问内存”；</li>
+<li>RoCE/IB 解释“这些 RDMA packet 如何穿过网络 fabric”；</li>
+<li>GPUDirect RDMA 解释“NIC 如何直接访问 GPU HBM，并受 PCIe/NUMA
+拓扑约束”。</li>
+</ul>
+<p>拆分后的目标是：先掌握 RDMA 的队列和内存模型，再理解 RoCE/IB fabric
+的无损与拥塞控制，最后把 GPU memory、NIC、NCCL/UCX/MPI
+和容器权限串起来。</p>
+<h2 id="拆分后的阅读路径">3. 拆分后的阅读路径</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>子章</th>
+<th>主题</th>
+<th>读完应该能做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="0d3a-rdma-verbs-memory-registration-and-queues.html">0d3a
+RDMA Verbs、内存注册与队列模型</a></td>
+<td>MR、lkey/rkey、QP、CQ、WR/WC、registration
+cache、Send/Recv/Write/Read/Atomic</td>
+<td>能解释一次 RDMA Write 如何从用户态提交到 NIC，并能根据 WC status
+排查 verbs 错误。</td>
+</tr>
+<tr>
+<td><a
+href="0d3b-roce-infiniband-lossless-fabric-and-congestion.html">0d3b
+RoCE/InfiniBand、无损网络与拥塞控制</a></td>
+<td>RoCE v2、InfiniBand、GID/LID/PKey、PFC/ECN/DCQCN、MTU、ECMP、SM</td>
+<td>能区分 RoCE 和 IB 的故障模型，并能排查 GID、PFC pause storm、MTU 与
+SM/PKey 问题。</td>
+</tr>
+<tr>
+<td><a
+href="0d3c-gpudirect-rdma-gpu-nic-topology-and-diagnostics.html">0d3c
+GPUDirect RDMA、GPU/NIC 拓扑与诊断</a></td>
+<td>GDRDMA、nvidia_peermem、BAR/BAR1、PCIe P2P、IOMMU/ACS/ATS、GPU/NIC
+locality、NCCL/UCX/MPI fallback</td>
+<td>能判断 NIC 是否真的直接访问 GPU memory，并能定位跨
+socket、容器权限、peermem 或 HCA 选择错误。</td>
+</tr>
+</tbody>
+</table>
+<h2 id="总框架三层责任边界">4. 总框架：三层责任边界</h2>
+<pre class="mermaid">flowchart TB
+  App[应用 / NCCL / UCX / MPI] --> Verbs[0d3a: verbs 队列和内存注册]
+  Verbs --> Fabric[0d3b: RoCE/IB fabric]
+  Verbs --> GPUPath[0d3c: GPUDirect RDMA]
+  Fabric --> Switch[交换机 / lossless priority / ECN / PFC]
+  GPUPath --> Topo[GPU-NIC PCIe / NUMA / BAR / peermem]
+  Switch --> Symptom[timeout / retry / bandwidth drop]
+  Topo --> Symptom
+  Verbs --> Symptom</pre>
+<p>判断通信问题时，先问三个问题：</p>
+<ol type="1">
+<li><strong>verbs 层是否正确</strong>：MR、QP、CQ、access
+flag、rkey、WR/WC 是否合理？</li>
+<li><strong>fabric 层是否健康</strong>：RoCE/IB 的
+MTU、GID/LID、PFC、ECN、PKey、SM、端口 counter 是否合理？</li>
+<li><strong>GPU direct 层是否成立</strong>：GPU/NIC
+topology、<code>nvidia_peermem</code>、容器设备、GDRDMA 日志和 CUDA
+buffer benchmark 是否合理？</li>
+</ol>
+<h2 id="和相邻章节的关系">5. 和相邻章节的关系</h2>
+<ul>
+<li><a href="0b3-numa-pcie-dma-and-pinned-memory.html">0b3</a> 讲
+PCIe、DMA、pinned memory、NUMA、GPU/NIC locality 的主机侧基础。0d3c
+会把这些机制用于 GDRDMA。</li>
+<li><a href="0d1-linux-network-stack-tcp-and-mtu.html">0d1</a> 讲 Linux
+TCP/IP 和 MTU。RoCE v2 虽然不是 TCP，但仍依赖 IP、UDP、MTU、ECMP
+等路径。</li>
+<li><a href="0d2-nic-offload-queues-and-service-network-io.html">0d2</a>
+讲 NIC queue、offload、IRQ 和服务网络 IO。RDMA
+数据面绕过部分内核路径，但 NIC 队列和硬件 counter 仍然关键。</li>
+<li><a href="0d4-nccl-collectives-and-network-diagnostics.html">0d4</a>
+讲 NCCL collective。NCCL 的 <code>NET/IB</code>、GDRDMA、HCA/GID、socket
+fallback 都依赖 0d3 系列。</li>
+</ul>
+<h2 id="快速自测">6. 快速自测</h2>
+<ol type="1">
+<li><code>IBV_WC_RETRY_EXC_ERR</code> 应该先看应用代码、QP 参数、fabric
+counter 还是 GPU 拓扑？为什么？</li>
+<li>RoCE 中 PFC、ECN、CNP、DCQCN 分别解决什么问题？为什么 PFC pause
+很多但 ECN mark 很少是危险信号？</li>
+<li><code>NET/IB</code> 已经启用，为什么 NCCL
+跨节点带宽仍可能只有预期一半？</li>
+<li>容器里缺 <code>/dev/infiniband</code>、<code>nvidia_peermem</code>
+未加载、GPU/NIC 跨 socket，分别会导致什么现象？</li>
+<li>新训练节点入池前，RDMA、RoCE/IB、GDRDMA 三层各应该跑什么 smoke
+test？</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

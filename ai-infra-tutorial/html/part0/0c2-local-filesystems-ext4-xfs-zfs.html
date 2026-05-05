@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0c2 章 · ext4、XFS、ZFS 与本地文件系统选择 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0c2" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0c2 章 · ext4、XFS、ZFS 与本地文件系统选择</h1>
+<p class="sub">比较 journal、extent、allocation group、CoW、ARC、snapshot 与 AI workload 的匹配关系。</p>
+<div class="chips"><span class="chip">ext4</span><span class="chip">XFS</span><span class="chip">ZFS</span><span class="chip">journal</span><span class="chip">AI 选型</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</a></li><li><a class="anchor" href="#文件系统共同要解决什么">2. 文件系统共同要解决什么</a></li><li><a class="anchor" href="#ext4稳健默认值">3. ext4：稳健默认值</a></li><li><a class="anchor" href="#xfs并发和大文件友好">4. XFS：并发和大文件友好</a></li><li><a class="anchor" href="#zfscow校验和和数据管理">5. ZFS：CoW、校验和和数据管理</a></li><li><a class="anchor" href="#journallogcow-的语义差异">6. Journal、log、CoW 的语义差异</a></li><li><a class="anchor" href="#delayed-allocationextent-和碎片">7. Delayed allocation、extent
+和碎片</a></li><li><a class="anchor" href="#挂载参数和格式化参数">8. 挂载参数和格式化参数</a></li><li><a class="anchor" href="#ai-选型按-workload-讨论">9. AI 选型：按 workload 讨论</a></li><li><a class="anchor" href="#命令观测建立事实表">10. 命令观测：建立事实表</a></li><li><a class="anchor" href="#mini-casecheckpoint-目录选-ext4-还是-xfs">11. Mini
+case：checkpoint 目录选 ext4 还是 XFS</a></li><li><a class="anchor" href="#mini-casezfs-dataset-cache-的取舍">12. Mini case：ZFS dataset
+cache 的取舍</a></li><li><a class="anchor" href="#sop本地文件系统选型和验收">13. SOP：本地文件系统选型和验收</a></li><li><a class="anchor" href="#checklist">14. Checklist</a></li><li><a class="anchor" href="#练习">15. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章从 <a
+href="0c1-vfs-inode-dentry-and-block-layer.html">0c1</a> 的 VFS 和 block
+layer 往下看具体文件系统。持久化协议见 <a
+href="0c3-storage-semantics-fsync-direct-io-and-checkpoints.html">0c3</a>，对象存储和并行文件系统见
+<a
+href="0c4-object-storage-parallel-filesystems-and-dataset-io.html">0c4</a>。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>本地文件系统要把
+inode、目录、extent、空闲空间、journal、校验和、快照等元数据组织到块设备上。
+它必须在吞吐、延迟、崩溃恢复、空间效率、碎片、管理成本之间取舍。 AI
+Infra 关心的不是“哪个文件系统最快”，而是 workload 的 IO
+形状和文件系统机制是否匹配。</p>
+<h3 id="推从问题推出机制">推：从问题推出机制</h3>
+<ul>
+<li>崩溃后不能把目录树变成随机字节，所以 ext4 和 XFS 需要 journal
+保护元数据更新。</li>
+<li>大文件不能逐块索引，所以现代文件系统使用 extent 或 B+tree
+描述连续范围。</li>
+<li>多核并发写不能全局锁一把，所以 XFS 用 allocation group
+分散元数据竞争。</li>
+<li>快照和端到端校验需要写新块而不是覆盖旧块，所以 ZFS 使用 CoW
+transaction group。</li>
+<li>Dataset、checkpoint、权重加载有不同形状，因此选型必须按场景讨论。</li>
+</ul>
+<h3 id="绘同一-vfs-请求在三个文件系统里的落点">绘：同一 VFS
+请求在三个文件系统里的落点</h3>
+<pre class="mermaid">flowchart TD
+  VFS[VFS write/read] --> Ext4[ext4]
+  VFS --> XFS[XFS]
+  VFS --> ZFS[ZFS]
+  Ext4 --> EJ[jbd2 journal]
+  Ext4 --> EE[extent tree + block group]
+  XFS --> XLog[xlog journal]
+  XFS --> AG[allocation groups + B+trees]
+  ZFS --> TXG[transaction groups]
+  ZFS --> ARC[ARC + ZIL/SLOG + checksums]
+  EJ --> Block[block device]
+  EE --> Block
+  XLog --> Block
+  AG --> Block
+  TXG --> Pool[vdev pool]
+  ARC --> Pool</pre>
+<h3 id="导本章读完后能做什么">导：本章读完后能做什么</h3>
+<ol type="1">
+<li>说明 ext4、XFS、ZFS 的机制差异，而不是只背名字。</li>
+<li>判断 checkpoint、dataset
+cache、模型权重盘分别偏向哪类文件系统。</li>
+<li>理解 journal、delayed allocation、extent、CoW、ARC、ZIL/SLOG
+对性能和语义的影响。</li>
+<li>用
+<code>findmnt</code>、<code>xfs_info</code>、<code>tune2fs</code>、<code>zpool</code>、<code>zfs</code>
+观察真实配置。</li>
+<li>给 AI 集群制定本地盘格式化、挂载和验收 checklist。</li>
+</ol>
+<h2 id="文件系统共同要解决什么">2. 文件系统共同要解决什么</h2>
+<p>本地文件系统至少要维护五类状态。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>状态</th>
+<th>内容</th>
+<th>失败风险</th>
+<th>性能风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>命名</td>
+<td>目录项、link count</td>
+<td>rename/unlink 后目录不一致</td>
+<td>大目录 lookup 慢</td>
+</tr>
+<tr>
+<td>身份</td>
+<td>inode、权限、大小、时间戳</td>
+<td>inode 泄漏或错误引用</td>
+<td>inode cache 压力</td>
+</tr>
+<tr>
+<td>空间</td>
+<td>free block、extent、bitmap/B+tree</td>
+<td>重复分配或空间丢失</td>
+<td>碎片、分配锁竞争</td>
+</tr>
+<tr>
+<td>数据</td>
+<td>file block contents</td>
+<td>torn write、旧数据暴露</td>
+<td>随机 IO、写放大</td>
+</tr>
+<tr>
+<td>恢复</td>
+<td>journal、log、checkpoint</td>
+<td>crash 后 replay 失败</td>
+<td>sync latency、log tail</td>
+</tr>
+</tbody>
+</table>
+<p>AI 任务常把“普通文件系统设计点”推到极端。 checkpoint
+是少量大文件、同步发布、失败恢复敏感。 dataset cache
+是大量读、多进程共享、命名稳定。
+预处理临时目录是大量创建、rename、删除，元数据压力高。
+模型权重加载是大文件顺序读或 <code>mmap</code>，Page Cache
+行为明显。</p>
+<h2 id="ext4稳健默认值">3. ext4：稳健默认值</h2>
+<p>ext4 是很多 Linux 发行版的默认文件系统。 它使用 extent
+管理大文件，使用 jbd2 journal 记录元数据事务，常见模式是
+<code>data=ordered</code>。 <code>data=ordered</code>
+的直观含义是：与元数据提交相关的数据块会在 journal commit 前写出，避免
+crash 后新文件指向未初始化旧数据。 这不等于每次 <code>write()</code>
+都持久，也不等于不需要 <code>fsync()</code>。</p>
+<p>ext4 的优势：</p>
+<ul>
+<li>部署广，工具成熟，默认行为保守。</li>
+<li>对中小规模本地盘、系统盘、普通数据目录足够稳定。</li>
+<li><code>fsck</code>、resize、quota 等运维经验丰富。</li>
+<li>对单机训练 cache、临时目录、通用 checkpoint 目录通常可用。</li>
+</ul>
+<p>ext4 的限制：</p>
+<ul>
+<li>极高并发大目录和多线程分配下，扩展性不如 XFS 的 AG 设计。</li>
+<li>journal commit 和 barrier 配置会影响 <code>fsync()</code>
+尾延迟。</li>
+<li>大量小文件会被 inode、目录索引、dentry cache 和 Page Cache
+共同限制。</li>
+<li>云盘或 RAID 下如果底层 flush 语义弱，ext4
+无法单独提供端到端保护。</li>
+</ul>
+<p>常用观测：</p>
+<pre class="bash"><code>findmnt -T /mnt/local -o TARGET,SOURCE,FSTYPE,OPTIONS
+tune2fs -l /dev/nvme0n1p1 | egrep &#39;Filesystem features|Block size|Inode count|Journal&#39;
+dumpe2fs -h /dev/nvme0n1p1 | egrep &#39;Filesystem state|Errors behavior|Journal size&#39;
+cat /proc/fs/ext4/*/mb_groups 2&gt;/dev/null | head</code></pre>
+<h2 id="xfs并发和大文件友好">4. XFS：并发和大文件友好</h2>
+<p>XFS 的核心直觉是把文件系统划分为多个 allocation group。 每个 AG
+有自己的空闲空间和 inode 管理结构，减少全局锁竞争。 它广泛使用 B+tree
+管理 extent、free space、inode btree 和反向映射等结构。
+在大文件、并发写、海量容量、在线增长场景下，XFS 通常是强候选。</p>
+<p>XFS 的优势：</p>
+<ul>
+<li>多线程分配和大文件吞吐稳定。</li>
+<li>对大容量文件系统和在线扩容友好。</li>
+<li>延迟分配能把小写合并成更好的 extent。</li>
+<li>对 checkpoint、shard cache、日志归档这类大文件场景表现常很稳。</li>
+</ul>
+<p>XFS 的注意点：</p>
+<ul>
+<li>小文件性能不靠文件系统名称解决，目录布局和 shard 格式仍然关键。</li>
+<li><code>fsync()</code> 延迟受 log、设备 flush、dirty writeback
+和并发影响。</li>
+<li>格式化参数如
+<code>reflink</code>、<code>crc</code>、<code>ftype</code>
+会影响功能和兼容性。</li>
+<li>容器 overlayfs 通常要求底层 XFS <code>ftype=1</code>。</li>
+</ul>
+<p>常用观测：</p>
+<pre class="bash"><code>xfs_info /mnt/local
+xfs_db -r -c &#39;sb 0&#39; -c &#39;p agcount blocksize sectsize&#39; /dev/nvme0n1p1
+xfs_spaceman -c &#39;freesp -s&#39; /mnt/local 2&gt;/dev/null | head
+xfs_io -c &#39;stat&#39; /mnt/local/some-file</code></pre>
+<h2 id="zfscow校验和和数据管理">5. ZFS：CoW、校验和和数据管理</h2>
+<p>ZFS 不是传统意义上“文件系统 + 外部卷管理”的组合。
+它把存储池、vdev、文件系统、快照、校验和、压缩、ARC 缓存、ZIL/SLOG
+等能力放在一个系统里。 ZFS 的核心是
+CoW：修改不会原地覆盖旧块，而是写新块，再原子更新指针树。</p>
+<p>ZFS 的优势：</p>
+<ul>
+<li>端到端校验和能发现静默数据损坏。</li>
+<li>快照、clone、send/receive 适合数据版本和回滚。</li>
+<li>压缩常能提升文本、日志、部分 tensor metadata 的有效吞吐。</li>
+<li>ARC 对重复读取明显有帮助。</li>
+</ul>
+<p>ZFS 的代价：</p>
+<ul>
+<li>CoW 会带来写放大和碎片，尤其是随机覆盖写。</li>
+<li>ARC 会与 Linux Page Cache 争内存，需要明确内存上限。</li>
+<li>同步写依赖 ZIL，低延迟 sync workload 可能需要合适的 SLOG。</li>
+<li>运维复杂度高于 ext4/XFS，不适合作为不了解团队的默认选择。</li>
+</ul>
+<p>常用观测：</p>
+<pre class="bash"><code>zpool status
+zpool list -v
+zfs list -o name,used,avail,refer,compressratio,mountpoint
+zfs get recordsize,compression,atime,primarycache,logbias &lt;pool/dataset&gt;
+arcstat 1 5 2&gt;/dev/null || true</code></pre>
+<h2 id="journallogcow-的语义差异">6. Journal、log、CoW 的语义差异</h2>
+<p>ext4 和 XFS 都有 journal/log，但它们主要保护元数据一致性。
+它们不把所有用户数据都默认写入 journal。
+因此应用如果需要“文件内容已经到稳定存储”，仍要使用 <code>fsync()</code>
+或正确的同步协议。</p>
+<p>ZFS 的 CoW 让元数据树更新天然避免很多原地覆盖风险。 同步写通过 ZIL
+记录意图，之后再由 transaction group 汇总写入主存储池。
+这不意味着所有写都没有延迟，也不意味着忽略 <code>fsync()</code>
+就能得到应用级发布语义。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>机制</th>
+<th>保护重点</th>
+<th>对 checkpoint 的含义</th>
+<th>常见误解</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ext4 jbd2</td>
+<td>元数据事务</td>
+<td><code>rename</code> 元数据可恢复，文件数据仍需 sync</td>
+<td><code>write</code> 返回等于落盘</td>
+</tr>
+<tr>
+<td>XFS log</td>
+<td>元数据 log</td>
+<td>大文件并发写好，发布仍需文件和目录 sync</td>
+<td>XFS 不需要 <code>fsync</code></td>
+</tr>
+<tr>
+<td>ZFS CoW</td>
+<td>指针树一致性和校验</td>
+<td>快照强，sync 写延迟看 ZIL/SLOG</td>
+<td>CoW 自动解决应用协议</td>
+</tr>
+</tbody>
+</table>
+<h2 id="delayed-allocationextent-和碎片">7. Delayed allocation、extent
+和碎片</h2>
+<p>Delayed allocation
+会推迟真实块分配，等待内核看到更多写入后再分配更连续的 extent。
+这对大顺序写有利，因为文件系统能把许多小 write 合并成大 extent。
+但它也意味着 <code>write()</code> 返回时，文件还没有获得最终物理块。
+如果 crash 发生在 <code>fsync()</code>
+前，应用不能假设文件内容完整。</p>
+<p>Extent 是“从逻辑 offset 到物理连续块范围”的映射。 大 checkpoint
+如果被许多 rank 交错写到同一目录，或在空间接近满盘时写入，extent
+会更碎。 碎片会让顺序读变成更多随机请求。</p>
+<p>检查碎片和 extent：</p>
+<pre class="bash"><code>filefrag -v /mnt/local/checkpoints/ckpt_001/model.safetensors | head -40
+xfs_bmap -v /mnt/local/checkpoints/ckpt_001/model.safetensors 2&gt;/dev/null | head
+stat -c &#39;size=%s blocks=%b blksize=%o&#39; /mnt/local/checkpoints/ckpt_001/model.safetensors</code></pre>
+<h2 id="挂载参数和格式化参数">8. 挂载参数和格式化参数</h2>
+<p>参数不是性能开关清单，必须知道它改变了什么语义。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>参数</th>
+<th>常见位置</th>
+<th>作用</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>noatime</code></td>
+<td>mount</td>
+<td>读文件不更新访问时间</td>
+<td>依赖 atime 的清理逻辑失效</td>
+</tr>
+<tr>
+<td><code>discard</code></td>
+<td>mount</td>
+<td>在线 TRIM</td>
+<td>可能增加写延迟，常改用周期性 fstrim</td>
+</tr>
+<tr>
+<td><code>barrier</code>/flush</td>
+<td>FS/设备</td>
+<td>保证写顺序到稳定介质</td>
+<td>关闭会破坏 crash 假设</td>
+</tr>
+<tr>
+<td><code>inode64</code></td>
+<td>XFS</td>
+<td>允许 inode 分布在大容量空间</td>
+<td>老软件兼容性</td>
+</tr>
+<tr>
+<td><code>recordsize</code></td>
+<td>ZFS</td>
+<td>文件记录块大小</td>
+<td>与随机读写粒度不匹配会放大 IO</td>
+</tr>
+<tr>
+<td><code>compression</code></td>
+<td>ZFS</td>
+<td>透明压缩</td>
+<td>CPU 与压缩率取舍</td>
+</tr>
+</tbody>
+</table>
+<p>AI 本地 NVMe cache 常见基线：<code>noatime</code>、合理预留空间、定期
+<code>fstrim</code>、不要关闭 flush/barrier 来换 benchmark 分数。 XFS
+用于容器 overlay 底层时确认 <code>ftype=1</code>。 ZFS
+用于训练节点时限制 ARC，避免挤压 framework、Page Cache 和 NCCL
+buffer。</p>
+<h2 id="ai-选型按-workload-讨论">9. AI 选型：按 workload 讨论</h2>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>场景</th>
+<th>ext4</th>
+<th>XFS</th>
+<th>ZFS</th>
+<th>更重要的设计点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单机临时训练 cache</td>
+<td>合适</td>
+<td>合适</td>
+<td>可用但偏重</td>
+<td>shard、清理、容量水位</td>
+</tr>
+<tr>
+<td>大 checkpoint 顺序写</td>
+<td>可用</td>
+<td>常更稳</td>
+<td>可用，sync 延迟需测</td>
+<td>发布协议、并发 rank、fsync</td>
+</tr>
+<tr>
+<td>海量小文件 dataset</td>
+<td>不推荐单靠 FS 解决</td>
+<td>不推荐单靠 FS 解决</td>
+<td>不推荐单靠 FS 解决</td>
+<td>打包、manifest、index、本地 cache</td>
+</tr>
+<tr>
+<td>数据版本快照</td>
+<td>弱</td>
+<td>弱或依赖外部</td>
+<td>强</td>
+<td>snapshot 策略和恢复演练</td>
+</tr>
+<tr>
+<td>静默损坏敏感</td>
+<td>依赖底层</td>
+<td>依赖底层</td>
+<td>强</td>
+<td>校验和、scrub、备份</td>
+</tr>
+<tr>
+<td>容器镜像/overlay</td>
+<td>常见</td>
+<td>常见，需 ftype</td>
+<td>不常作为默认</td>
+<td>overlay 兼容性</td>
+</tr>
+</tbody>
+</table>
+<p>保守建议：</p>
+<ul>
+<li>通用 Linux 节点：ext4 或 XFS 都是合理默认值。</li>
+<li>多并发大文件、本地 NVMe 数据盘：优先评估 XFS。</li>
+<li>需要快照、校验、压缩和数据管理：评估
+ZFS，并把内存和运维纳入成本。</li>
+<li>不要用文件系统替代 dataset 格式治理；百万小文件应先改 IO 形状。</li>
+</ul>
+<h2 id="命令观测建立事实表">10. 命令观测：建立事实表</h2>
+<p>收集文件系统事实：</p>
+<pre class="bash"><code>findmnt -T /mnt/local -o TARGET,SOURCE,FSTYPE,OPTIONS
+lsblk -f
+stat -f -c &#39;type=%T bsize=%S blocks=%b files=%c&#39; /mnt/local
+df -hT /mnt/local
+df -ih /mnt/local</code></pre>
+<p>收集设备和延迟：</p>
+<pre class="bash"><code>iostat -x 1
+cat /sys/block/nvme0n1/queue/scheduler
+cat /sys/block/nvme0n1/queue/logical_block_size
+cat /sys/block/nvme0n1/queue/physical_block_size</code></pre>
+<p>收集 workload：</p>
+<pre class="bash"><code>find /mnt/local/dataset -type f -printf &#39;%s\n&#39; | awk &#39;{n++; s+=$1; if($1&lt;1048576) small++} END {print n,s/n,small}&#39;
+find /mnt/local/dataset -type f | sed &#39;s#/[^/]*$##&#39; | sort | uniq -c | sort -nr | head</code></pre>
+<h2 id="mini-casecheckpoint-目录选-ext4-还是-xfs">11. Mini
+case：checkpoint 目录选 ext4 还是 XFS</h2>
+<p>场景：每个节点 8 rank，每 30 分钟写一次 checkpoint。 每个 rank 写
+12GB shard，最后 rank0 发布 <code>latest</code> 指针。 本地盘是 2 块
+NVMe RAID0，checkpoint 会被异步上传到对象存储。</p>
+<p>评估维度：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>观察</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件大小</td>
+<td>少量 10GB 级文件</td>
+<td>大文件 extent 和顺序写重要</td>
+</tr>
+<tr>
+<td>并发</td>
+<td>8 rank 同时写不同文件</td>
+<td>分配并发重要</td>
+</tr>
+<tr>
+<td>恢复</td>
+<td>crash 后不能读到半成品</td>
+<td>应用协议比 FS 名字更重要</td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>写完上传，保留最近 N 个</td>
+<td>删除和空间水位要稳定</td>
+</tr>
+</tbody>
+</table>
+<p>ext4 能工作，但要实测 journal commit 和 <code>fsync()</code> 尾延迟。
+XFS 对多并发大文件分配通常更有优势，是优先候选。 ZFS
+如果需要本地快照和校验也可评估，但 ARC 和 sync 写延迟必须纳入压测。</p>
+<p>验收实验：</p>
+<pre class="bash"><code># 8 个 job，每个写 12G，模拟 rank shard
+fio --name=ckpt --directory=/mnt/ckpt --rw=write --bs=4m \
+  --size=12g --numjobs=8 --iodepth=8 --direct=1 \
+  --ioengine=libaio --fsync_on_close=1 --group_reporting
+
+# 观察尾延迟和设备队列
+iostat -x 1</code></pre>
+<p>通过标准不是“峰值最高”，而是 <code>fsync_on_close</code> 总耗时、99%
+延迟、空间回收和 crash 演练都满足训练恢复目标。</p>
+<h2 id="mini-casezfs-dataset-cache-的取舍">12. Mini case：ZFS dataset
+cache 的取舍</h2>
+<p>场景：研究平台需要在节点本地缓存多个数据版本。 数据以 tar shard
+存放，每个 shard 512MB 到 2GB。
+用户经常回滚到旧版本，要求能发现坏盘导致的数据损坏。</p>
+<p>ZFS 的优势变得具体：snapshot 记录版本，checksum 发现损坏，compression
+对部分元数据有效，send/receive 可迁移 cache。 但要设置 ARC
+上限，例如避免 ARC 抢走训练进程可用内存。 还要按 shard 读写粒度评估
+<code>recordsize</code>，不要让 4KB 随机读取被 1MB record
+放大，也不要让大顺序 shard 被过小 record 增加元数据。</p>
+<p>检查项：</p>
+<pre class="bash"><code>zfs set atime=off pool/cache
+zfs set compression=lz4 pool/cache
+zfs get recordsize,primarycache,compression pool/cache
+zpool scrub pool
+zpool status -v</code></pre>
+<p>如果团队没有 ZFS 运维经验，ext4/XFS + 应用层 manifest +
+对象存储校验可能更稳。</p>
+<h2 id="sop本地文件系统选型和验收">13. SOP：本地文件系统选型和验收</h2>
+<ol type="1">
+<li>写清 workload：文件大小分布、读写比例、并发 worker/rank、是否需要
+<code>fsync()</code>、保留周期。</li>
+<li>写清设备：NVMe、云盘、RAID、是否有掉电保护、flush 语义。</li>
+<li>选两个候选：通常 ext4 vs XFS；有快照/校验需求时加入 ZFS。</li>
+<li>固定格式化和挂载参数，不用不明来源的“性能参数包”。</li>
+<li>用代表性数据集压测
+cold/warm、顺序/随机、小文件/大文件、sync/async。</li>
+<li>跑 crash 演练：写入中 kill 进程、重启节点、检查目录和
+manifest。</li>
+<li>记录
+<code>findmnt</code>、<code>xfs_info</code>、<code>tune2fs</code>、<code>zfs get</code>、<code>iostat</code>、<code>fio</code>
+输出。</li>
+<li>制定空间水位：满盘会显著改变分配行为和碎片。</li>
+<li>制定 scrub/fsck/备份策略，不把单盘文件系统当长期真相源。</li>
+</ol>
+<h2 id="checklist">14. Checklist</h2>
+<ul>
+<li>是否知道当前目录真实 FSTYPE，而不是只看路径名？</li>
+<li>是否区分元数据 journal 和用户数据持久化？</li>
+<li>是否为 checkpoint 明确 <code>fsync</code> 和原子发布协议？</li>
+<li>是否测过 70%、85%、95% 空间水位下的写入表现？</li>
+<li>是否检查 inode 数量、目录 fanout 和小文件比例？</li>
+<li>是否确认容器 overlay 的底层兼容性？</li>
+<li>是否避免关闭 barrier/flush 换取不可恢复的 benchmark？</li>
+<li>是否对 ZFS 设置 ARC 上限并安排 scrub？</li>
+</ul>
+<h2 id="练习">15. 练习</h2>
+<ol type="1">
+<li>解释 ext4 <code>data=ordered</code> 能保证什么，不能保证什么。</li>
+<li>画出 XFS allocation group 如何减少并发分配竞争。</li>
+<li>给一个 8 rank checkpoint 场景，写出 ext4 vs XFS 的验收指标。</li>
+<li>说明 ZFS ARC 和 Linux Page Cache
+同时存在时为什么要关注内存预算。</li>
+<li>为一个 2000 万小文件数据集给出文件系统之外的治理方案。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

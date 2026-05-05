@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0c4 章 · 对象存储、并行文件系统与 Dataset IO — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0c4" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0c4 章 · 对象存储、并行文件系统与 Dataset IO</h1>
+<p class="sub">拆解 manifest、multipart、LIST、stripe、MDS、小文件治理和训练数据读取架构。</p>
+<div class="chips"><span class="chip">Object Storage</span><span class="chip">Manifest</span><span class="chip">Parallel FS</span><span class="chip">MDS</span><span class="chip">Dataset IO</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</a></li><li><a class="anchor" href="#对象存储不是-posix-文件系统">2. 对象存储不是 POSIX 文件系统</a></li><li><a class="anchor" href="#multipart-upload">3. Multipart upload</a></li><li><a class="anchor" href="#manifest-是发布入口">4. Manifest 是发布入口</a></li><li><a class="anchor" href="#list-的成本和陷阱">5. LIST 的成本和陷阱</a></li><li><a class="anchor" href="#对象存储读取路径range-getcacheprefetch">6.
+对象存储读取路径：Range GET、cache、prefetch</a></li><li><a class="anchor" href="#并行文件系统模型">7. 并行文件系统模型</a></li><li><a class="anchor" href="#stripe-策略">8. Stripe 策略</a></li><li><a class="anchor" href="#小文件治理">9. 小文件治理</a></li><li><a class="anchor" href="#dataset-读取架构">10. Dataset 读取架构</a></li><li><a class="anchor" href="#命令观测对象并行-fs本地-cache">11. 命令观测：对象、并行 FS、本地
+cache</a></li><li><a class="anchor" href="#worked-example2000-万小图片迁移">12. Worked example：2000
+万小图片迁移</a></li><li><a class="anchor" href="#mini-case并行文件系统-checkpoint-热点">13. Mini
+case：并行文件系统 checkpoint 热点</a></li><li><a class="anchor" href="#dataset-io-sop">14. Dataset IO SOP</a></li><li><a class="anchor" href="#checklist">15. Checklist</a></li><li><a class="anchor" href="#练习">16. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章把 <a
+href="0c1-vfs-inode-dentry-and-block-layer.html">0c1</a> 的 VFS
+思维扩展到非本地后端，并承接 <a
+href="0c3-storage-semantics-fsync-direct-io-and-checkpoints.html">0c3</a>
+的发布语义。重点是对象存储、并行文件系统、manifest、stripe、MDS
+和小文件治理。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>AI 数据平台既要喂饱
+GPU，又要支持多租户共享、版本管理、失败恢复和低成本存储。 单机 POSIX
+文件系统不能覆盖所有需求。 对象存储提供廉价、弹性、HTTP API
+和强大的持久性，但不是 inode + rename 模型。
+并行文件系统提供共享命名空间和高带宽，但元数据服务和条带策略会成为系统设计的一部分。</p>
+<h3 id="推从问题推出机制">推：从问题推出机制</h3>
+<ul>
+<li>对象存储没有目录 inode，key 前缀只是命名约定，所以 dataset 入口应是
+manifest 而不是递归 LIST。</li>
+<li>大对象上传不能一次请求完成，所以需要 multipart upload、part
+checksum、complete 和 abort。</li>
+<li>多 worker 读取不能全靠小对象随机 GET，所以需要 shard、range
+read、本地 cache 和 index。</li>
+<li>并行文件系统要把数据分散到多个 OSS/OST 或 NSD 上，所以需要 stripe
+size/count。</li>
+<li>海量小文件会打爆 MDS 或对象存储请求预算，所以要治理文件粒度。</li>
+</ul>
+<h3 id="绘三种存储模型">绘：三种存储模型</h3>
+<pre class="mermaid">flowchart TD
+  App[Training workers] --> POSIX[POSIX path API]
+  App --> SDK[Object SDK]
+  POSIX --> PFSClient[Parallel FS client]
+  PFSClient --> MDS[MDS/MDT metadata]
+  PFSClient --> OSS1[OSS/OST 1]
+  PFSClient --> OSS2[OSS/OST 2]
+  SDK --> Manifest[manifest.json]
+  Manifest --> Obj1[shard-0001.tar]
+  Manifest --> Obj2[shard-0002.tar]
+  Obj1 --> Range[Range GET]
+  Obj2 --> Range
+  POSIX --> LocalCache[local NVMe cache]
+  SDK --> LocalCache</pre>
+<h3 id="导本章读完后能做什么">导：本章读完后能做什么</h3>
+<ol type="1">
+<li>解释对象存储的 PUT/GET/LIST/multipart 与 POSIX 文件系统的差异。</li>
+<li>用 manifest 设计 dataset 和 checkpoint 的发布入口。</li>
+<li>判断并行文件系统瓶颈来自 MDS、OSS/OST、stripe、客户端 cache
+还是网络。</li>
+<li>把小文件 dataset 改造成 shard + index + cache 的读取路径。</li>
+<li>写出 dataset IO 的观测命令、SOP 和验收指标。</li>
+</ol>
+<h2 id="对象存储不是-posix-文件系统">2. 对象存储不是 POSIX 文件系统</h2>
+<p>对象存储的基本单位是 object。 object 有
+key、bytes、metadata、etag/version 等属性。 所谓目录通常只是 key
+前缀，例如 <code>dataset/v3/train/shard-0001.tar</code>。
+没有本地文件系统意义上的 inode、hard link、目录 fd、跨对象原子
+rename。</p>
+<p>常见操作：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>操作</th>
+<th>含义</th>
+<th>与 POSIX 的差异</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PUT object</td>
+<td>写入一个完整 object</td>
+<td>不是 <code>write()</code> 流式可见文件</td>
+</tr>
+<tr>
+<td>GET object</td>
+<td>读取 object</td>
+<td>可用 Range 读取片段</td>
+</tr>
+<tr>
+<td>LIST prefix</td>
+<td>枚举某个前缀</td>
+<td>不是目录 inode 遍历，成本和一致性要按服务理解</td>
+</tr>
+<tr>
+<td>Multipart upload</td>
+<td>分片上传大 object</td>
+<td>complete 前 object 通常不可见</td>
+</tr>
+<tr>
+<td>Copy + delete</td>
+<td>模拟 rename</td>
+<td>非原子，成本高，失败状态复杂</td>
+</tr>
+</tbody>
+</table>
+<p>现代主流对象存储通常提供强一致读写语义，但应用仍不应把 LIST 当成
+dataset 真相源。 原因是 LIST 成本高、分页复杂、跨账号/跨区域/网关/FUSE
+层语义可能变化，而且训练启动时全量 LIST 会制造控制面尖峰。</p>
+<h2 id="multipart-upload">3. Multipart upload</h2>
+<p>Multipart upload 把大对象拆成多个 part 上传。
+完成流程通常是：initiate、upload parts、complete。 complete 前，最终
+object 不应作为已发布数据被 reader 使用。 失败时要
+abort，避免遗留未完成分片占用成本。</p>
+<p>设计要点：</p>
+<ul>
+<li>part size 不要太小；太小会增加请求数和服务端元数据压力。</li>
+<li>每个 part 记录 checksum，complete 后记录 object checksum
+或组合校验。</li>
+<li>上传 worker 控制并发，避免把带宽、CPU checksum、TLS 和服务端
+throttling 混在一起。</li>
+<li>失败重试必须幂等，part number 和内容要稳定。</li>
+<li>complete 成功后再发布 manifest 指针。</li>
+</ul>
+<p>示例命令：</p>
+<pre class="bash"><code>aws s3api create-multipart-upload --bucket my-bucket --key dataset/v3/shard-0001.tar
+aws s3api upload-part --bucket my-bucket --key dataset/v3/shard-0001.tar \
+  --part-number 1 --body part-0001 --upload-id &lt;upload-id&gt;
+aws s3api complete-multipart-upload --bucket my-bucket --key dataset/v3/shard-0001.tar \
+  --upload-id &lt;upload-id&gt; --multipart-upload file://parts.json</code></pre>
+<h2 id="manifest-是发布入口">4. Manifest 是发布入口</h2>
+<p>Manifest 是对象存储和并行数据集里最重要的应用层边界。 它把“有哪些
+shard、每个 shard
+多大、校验和是什么、样本索引在哪里、版本是什么”写成一个小对象或小文件。
+训练入口读取 manifest，而不是实时扫描目录或 LIST prefix。</p>
+<p>一个最小 manifest：</p>
+<pre class="json"><code>{
+  &quot;dataset&quot;: &quot;imagenet-sharded&quot;,
+  &quot;version&quot;: &quot;v2026-05-04&quot;,
+  &quot;format&quot;: &quot;tar+idx&quot;,
+  &quot;shards&quot;: [
+    {&quot;key&quot;: &quot;train/shard-000000.tar&quot;, &quot;bytes&quot;: 1073741824, &quot;sha256&quot;: &quot;...&quot;, &quot;samples&quot;: 8192},
+    {&quot;key&quot;: &quot;train/shard-000001.tar&quot;, &quot;bytes&quot;: 1073741824, &quot;sha256&quot;: &quot;...&quot;, &quot;samples&quot;: 8192}
+  ],
+  &quot;index&quot;: &quot;train/index-v2026-05-04.parquet&quot;
+}</code></pre>
+<p>发布协议：</p>
+<ol type="1">
+<li>上传所有 shard，完成 multipart。</li>
+<li>校验 size 和 checksum。</li>
+<li>上传 manifest 到不可变 key，例如
+<code>manifests/v2026-05-04.json</code>。</li>
+<li>更新小指针 <code>current.json</code>，内容只包含当前 manifest key
+和版本。</li>
+<li>reader 读取 <code>current.json</code>，再读取 manifest，再按
+manifest 读取 shard。</li>
+</ol>
+<p>这样即使前缀下有临时对象、旧版本或失败上传残留，reader
+也不会把它们纳入训练。</p>
+<h2 id="list-的成本和陷阱">5. LIST 的成本和陷阱</h2>
+<p>LIST 适合管理和审计，不适合作为每个训练 job 的启动路径。 一个包含
+5000 万对象的数据集，如果每个 job 启动都分页
+LIST，会产生高延迟、高费用和控制面压力。
+分页过程中如果还有写入或删除，应用还要处理重复、遗漏、排序和
+continuation token。</p>
+<p>更稳的模式：</p>
+<ul>
+<li>数据生产时生成 manifest 和 index。</li>
+<li>训练时只读 manifest。</li>
+<li>定期离线审计 LIST 与 manifest 是否一致。</li>
+<li>清理任务只删除 manifest 不再引用的对象。</li>
+<li>多版本并存时用版本前缀或内容地址 key，避免覆盖更新。</li>
+</ul>
+<p>观测对象存储请求：</p>
+<pre class="bash"><code>aws s3 ls s3://bucket/dataset/v3/ --recursive --summarize
+aws s3api list-objects-v2 --bucket bucket --prefix dataset/v3/ --max-items 1000
+aws s3api head-object --bucket bucket --key dataset/v3/train/shard-0001.tar</code></pre>
+<h2 id="对象存储读取路径range-getcacheprefetch">6.
+对象存储读取路径：Range GET、cache、prefetch</h2>
+<p>训练读取 shard 时通常不下载整个 dataset。 worker 根据 index 定位
+shard 和 byte range，再发起 Range GET 或从本地 cache 读取。 本地 cache
+可以是节点 NVMe、daemon cache、FUSE cache 或框架自带 cache。</p>
+<p>设计参数：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>参数</th>
+<th>影响</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>shard size</td>
+<td>请求数、并行度、失败重试成本</td>
+<td>常从 256MB 到 2GB 起测</td>
+</tr>
+<tr>
+<td>sample grouping</td>
+<td>随机性和顺序读效率</td>
+<td>同一 shard 内打乱，跨 shard 分配</td>
+</tr>
+<tr>
+<td>prefetch depth</td>
+<td>隐藏网络延迟</td>
+<td>与 worker 数、内存、带宽一起调</td>
+</tr>
+<tr>
+<td>cache key</td>
+<td>复用和一致性</td>
+<td>dataset version + shard checksum</td>
+</tr>
+<tr>
+<td>retry budget</td>
+<td>尾延迟和成本</td>
+<td>区分 404、429、5xx、timeout</td>
+</tr>
+</tbody>
+</table>
+<p>不要让所有 rank 同时读取同一个 shard 开头。 可以按 global rank 对
+shard 列表做确定性切分，并在 epoch 间改变顺序。</p>
+<h2 id="并行文件系统模型">7. 并行文件系统模型</h2>
+<p>Lustre、GPFS/Spectrum Scale、BeeGFS 等并行文件系统提供 POSIX
+风格共享命名空间。 它们的核心是把元数据路径和数据路径拆开。 MDS/MDT
+负责目录、inode、权限、layout。 OSS/OST 或 NSD 负责数据块。 客户端把 VFS
+请求转成网络协议和后端请求。</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>负责</th>
+<th>典型瓶颈</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>client</td>
+<td>VFS 接入、cache、RPC</td>
+<td>CPU、网络、缓存失效</td>
+</tr>
+<tr>
+<td>MDS/MDT</td>
+<td>lookup、create、unlink、stat</td>
+<td>小文件、目录扫描、锁竞争</td>
+</tr>
+<tr>
+<td>OSS/OST</td>
+<td>数据读写</td>
+<td>顺序带宽、热点 OST</td>
+</tr>
+<tr>
+<td>network</td>
+<td>client 到服务端</td>
+<td>拥塞、包丢、RDMA 配置</td>
+</tr>
+<tr>
+<td>coordinator</td>
+<td>quota、锁、恢复</td>
+<td>大规模 job 同步风暴</td>
+</tr>
+</tbody>
+</table>
+<p>并行文件系统能提供很高 aggregate bandwidth，但不意味着
+<code>stat()</code> 无限快。 DataLoader 如果每个 sample 都触发
+open/stat，小文件元数据仍会先打满 MDS。</p>
+<h2 id="stripe-策略">8. Stripe 策略</h2>
+<p>Stripe 决定一个文件的数据如何分布到多个数据服务端。 stripe count
+越高，大文件可并行读写的服务端越多。 但小文件使用过高 stripe count
+会增加元数据和锁成本。 stripe size 决定连续多少字节放在同一 stripe
+上。</p>
+<p>Lustre 示例：</p>
+<pre class="bash"><code>lfs getstripe /mnt/lustre/dataset
+lfs setstripe -c 8 -S 16M /mnt/lustre/checkpoints
+lfs df -h
+lfs osts</code></pre>
+<p>经验方向：</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>文件类型</th>
+<th>stripe count</th>
+<th>stripe size</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>10GB+ checkpoint shard</td>
+<td>多 OST</td>
+<td>8MB 到 64MB 起测</td>
+<td>提升大文件并行带宽</td>
+</tr>
+<tr>
+<td>512MB tar shard</td>
+<td>中等</td>
+<td>4MB 到 16MB 起测</td>
+<td>平衡吞吐和管理成本</td>
+</tr>
+<tr>
+<td>100KB 小图片</td>
+<td>1</td>
+<td>默认或小 stripe</td>
+<td>避免为小文件放大元数据</td>
+</tr>
+<tr>
+<td>manifest/index 小文件</td>
+<td>1</td>
+<td>默认</td>
+<td>低延迟、简单</td>
+</tr>
+</tbody>
+</table>
+<p>Stripe 不是越大越好。 如果所有 rank 同时写很多大文件，高 stripe count
+可能让所有文件打到所有 OST，制造全局竞争。 更好的方案可能是按 rank
+或目录分布 stripe，使热点分散。</p>
+<h2 id="小文件治理">9. 小文件治理</h2>
+<p>小文件问题不是“文件系统不够快”，而是 IO 形状不匹配。
+每个样本一个对象或一个文件，会产生大量 open/stat/GET/head 请求。
+当单样本只有几十 KB，元数据、TLS、RPC、调度和 Python overhead
+可能超过数据传输本身。</p>
+<p>治理方向：</p>
+<ul>
+<li>打包成 tar、zip、RecordIO、Parquet、Arrow、TFRecord、WebDataset 等
+shard。</li>
+<li>为 shard 建 index，记录 sample id 到
+<code>(shard, offset, length)</code>。</li>
+<li>保持 shard 不可变，用 manifest 发布版本。</li>
+<li>把随机性放在 index 和 sampler 层，而不是依赖随机小文件读取。</li>
+<li>本地 cache 以 shard 为单位，不以单样本为单位。</li>
+<li>对异常样本建立 sidecar blacklist，不重写整个 dataset。</li>
+</ul>
+<p>文件大小分布观测：</p>
+<pre class="bash"><code>find /mnt/dataset -type f -printf &#39;%s\n&#39; \
+  | awk &#39;{n++; s+=$1; if($1&lt;65536)a++; if($1&lt;1048576)b++} END {print &quot;files&quot;,n,&quot;avg&quot;,s/n,&quot;&lt;64K&quot;,a,&quot;&lt;1M&quot;,b}&#39;
+find /mnt/dataset -type f | sed &#39;s#/[^/]*$##&#39; | sort | uniq -c | sort -nr | head -20</code></pre>
+<h2 id="dataset-读取架构">10. Dataset 读取架构</h2>
+<p>一个稳定的 dataset IO 架构通常包含四层。</p>
+<pre class="text"><code>manifest/current pointer
+  -&gt; shard manifest and index
+    -&gt; object store or parallel FS shards
+      -&gt; node-local cache
+        -&gt; worker prefetch and decode</code></pre>
+<p>职责分离：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>负责</th>
+<th>不应该负责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>manifest</td>
+<td>版本、完整性、shard 列表</td>
+<td>实时发现对象</td>
+</tr>
+<tr>
+<td>index</td>
+<td>sample 到 byte range</td>
+<td>数据持久性</td>
+</tr>
+<tr>
+<td>storage</td>
+<td>保存 shard bytes</td>
+<td>训练随机性</td>
+</tr>
+<tr>
+<td>cache</td>
+<td>降低重复读取成本</td>
+<td>版本真相</td>
+</tr>
+<tr>
+<td>worker</td>
+<td>prefetch、decode、batch</td>
+<td>全局目录扫描</td>
+</tr>
+</tbody>
+</table>
+<p>训练 worker 只需要知道当前 epoch 分到哪些 sample 或 shard。
+它不应在热路径里递归目录、LIST 对象前缀、或为每个样本做远端 HEAD。</p>
+<h2 id="命令观测对象并行-fs本地-cache">11. 命令观测：对象、并行 FS、本地
+cache</h2>
+<p>对象存储侧：</p>
+<pre class="bash"><code>aws s3api head-object --bucket bucket --key dataset/v3/manifest.json
+aws s3api list-objects-v2 --bucket bucket --prefix dataset/v3/train/ --max-items 10
+curl -I https://example-bucket.s3.amazonaws.com/dataset/v3/train/shard-0001.tar</code></pre>
+<p>并行文件系统侧：</p>
+<pre class="bash"><code>findmnt -T /mnt/shared -o TARGET,SOURCE,FSTYPE,OPTIONS
+df -hT /mnt/shared
+df -ih /mnt/shared
+lfs getstripe /mnt/shared/path 2&gt;/dev/null || true
+mmlsfs all 2&gt;/dev/null | head || true
+beegfs-ctl --getentryinfo /mnt/shared/path 2&gt;/dev/null || true</code></pre>
+<p>训练进程侧：</p>
+<pre class="bash"><code>pidstat -d -p &lt;pid&gt; 1
+strace -f -c -e trace=openat,newfstatat,read,close -p &lt;pid&gt;
+iostat -x 1
+ss -tinp | head</code></pre>
+<p>如果对象存储请求 p99 高，但本地 cache hit 率低，先优化 cache
+key、prefetch 和 shard 切分。 如果并行文件系统 MDS busy，而 OST
+带宽不高，先减少小文件和目录扫描。 如果 OST 带宽满而 MDS 空闲，再调
+stripe、worker 并发和压缩解码。</p>
+<h2 id="worked-example2000-万小图片迁移">12. Worked example：2000
+万小图片迁移</h2>
+<p>场景：原始数据是 2000 万张小图片，平均 80KB，按类别目录存放。
+训练启动要扫描目录生成 sample list，启动 20 分钟，GPU 经常等待。
+存储后端从本地 NFS 迁到对象存储后，直接一文件一对象更慢。</p>
+<p>迁移方案：</p>
+<ol type="1">
+<li>离线扫描原始目录，生成全量样本表：sample
+id、label、原始路径、size、checksum。</li>
+<li>按类别和随机种子打包为 1024MB 左右 tar shard。</li>
+<li>为每个 shard 生成 index：sample
+id、offset、length、label、checksum。</li>
+<li>上传 shard 到对象存储，使用 multipart 和 checksum。</li>
+<li>上传全局 Parquet index 和 manifest。</li>
+<li>训练读取 <code>current.json</code>，按 rank 切分 shard，Range GET
+或本地 cache 读取。</li>
+<li>每个 epoch 在 index 层 shuffle，不在对象存储层 LIST。</li>
+</ol>
+<p>收益评估：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>迁移前</th>
+<th>迁移后目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练启动</td>
+<td>20 分钟目录扫描</td>
+<td>读取 manifest/index 小于 30 秒</td>
+</tr>
+<tr>
+<td>请求数</td>
+<td>每 epoch 数千万 open/stat/GET</td>
+<td>每 shard 少量 GET/Range</td>
+</tr>
+<tr>
+<td>GPU idle</td>
+<td>随机尖峰</td>
+<td>decode 或训练成为主要瓶颈</td>
+</tr>
+<tr>
+<td>版本管理</td>
+<td>目录覆盖</td>
+<td>manifest 不可变版本</td>
+</tr>
+</tbody>
+</table>
+<p>失败处理：如果某个 shard checksum 不匹配，reader 标记该 shard
+不可用并停止训练，不能静默跳过样本。 清理任务只删除没有被任何 manifest
+引用的 shard。</p>
+<h2 id="mini-case并行文件系统-checkpoint-热点">13. Mini
+case：并行文件系统 checkpoint 热点</h2>
+<p>场景：64 节点训练，每节点 8 rank，每 rank 写一个 8GB 文件到 Lustre。
+所有 rank 写到同一个目录，默认 stripe count 为 1。
+现象是总吞吐远低于存储标称，MDS CPU 高，部分 OST 空闲。</p>
+<p>分析：</p>
+<ul>
+<li>同一目录创建 512 个文件，MDS 处理 create、layout、lock。</li>
+<li>stripe count 1 让每个大文件只落到一个 OST，分布可能不均。</li>
+<li>所有 rank 同时 rename 和 fsync 父目录，制造元数据同步尖峰。</li>
+</ul>
+<p>改法：</p>
+<ul>
+<li>预创建分层目录，例如
+<code>node-000/rank-000.bin</code>，减少单目录热点。</li>
+<li>对大 rank 文件设置合适 stripe count，例如 4 或 8，并压测 stripe
+size。</li>
+<li>rank 文件写完后由协调者分批发布 manifest，避免所有 rank
+同时操作同一父目录。</li>
+<li>把最终长期存储异步转移到对象存储，训练热路径只保留最近
+checkpoint。</li>
+</ul>
+<p>验证：看 MDS/OST
+指标、<code>lfs getstripe</code>、<code>iostat</code>、训练端 fsync
+p99。 不要只看 aggregate bandwidth 的单次峰值。</p>
+<h2 id="dataset-io-sop">14. Dataset IO SOP</h2>
+<ol type="1">
+<li>统计文件数量、大小分布、目录 fanout、样本读取顺序和解码成本。</li>
+<li>明确后端：对象存储、并行文件系统、本地 NVMe、NFS、FUSE 或混合。</li>
+<li>规定版本入口：<code>current.json</code> 或等价 manifest 指针。</li>
+<li>数据生产阶段生成 shard、index、checksum 和 manifest。</li>
+<li>训练阶段禁止热路径全量 LIST 或递归目录扫描。</li>
+<li>按 rank/worker 做确定性切分，避免所有 worker 抢同一 shard。</li>
+<li>设置本地 cache 容量、水位、淘汰策略和 cache key。</li>
+<li>记录请求 p50/p95/p99、cache hit、decode time、GPU wait、MDS/OST
+指标。</li>
+<li>做失败演练：缺 shard、坏 checksum、对象存储 429、MDS 抖动、cache
+满。</li>
+<li>把清理策略绑定 manifest 引用，不按前缀时间盲删。</li>
+</ol>
+<h2 id="checklist">15. Checklist</h2>
+<ul>
+<li>是否把对象存储 key 前缀当成命名约定，而不是 POSIX 目录？</li>
+<li>是否使用 manifest 作为 dataset 入口？</li>
+<li>是否避免训练启动时全量 LIST？</li>
+<li>是否为 multipart upload 记录 part 和最终 checksum？</li>
+<li>是否按 shard 而不是单小文件设计 cache？</li>
+<li>是否知道并行文件系统的 MDS 和数据服务端是否分别饱和？</li>
+<li>是否为大文件设置并验证 stripe，而不是照抄默认值？</li>
+<li>是否把小文件治理放在数据格式层，而不是只换后端？</li>
+<li>是否对 reader 做 size/checksum 校验？</li>
+</ul>
+<h2 id="练习">16. 练习</h2>
+<ol type="1">
+<li>设计一个 manifest，描述 3 个 shard、每个 shard 的 size、checksum
+和样本数。</li>
+<li>解释为什么对象存储上的 rename 不能当成本地 POSIX rename 使用。</li>
+<li>给一个 1TB tar shard 数据集，选择 shard size 和 worker
+切分策略。</li>
+<li>看到 MDS CPU 高、OST 带宽低，应如何改 DataLoader 或目录布局？</li>
+<li>为一个节点本地 cache 设计 key、容量水位和清理规则。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

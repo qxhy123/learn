@@ -1,0 +1,1420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 6b 章 · Stream、同步与 CUDA Graph — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=06b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 6b 章 · Stream、同步与 CUDA Graph</h1>
+<p class="sub">拆解 stream、event、默认 stream、隐式同步、H2D/compute/NCCL overlap 和 CUDA Graph capture/replay 的生产边界。</p>
+<div class="chips"><span class="chip">Stream</span><span class="chip">Event</span><span class="chip">Sync</span><span class="chip">Overlap</span><span class="chip">CUDA Graph</span><span class="chip">NCCL</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#正文内容">正文内容</a></li><li><a class="anchor" href="#排障-checklist">排障 Checklist</a></li><li><a class="anchor" href="#本章涉及的常见工具">本章涉及的常见工具</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="06-cuda-runtime-and-kernels.html">第6章</a> 中 stream、同步和 CUDA
+Graph 的独立展开。第6章回答”模型调用怎样落到 CUDA runtime 和
+kernel”，本章专注”命令流怎样排队、等待、重叠和回放”。H2D、PCIe、NUMA、pinned
+memory 的主机设备路径见 <a
+href="05b-host-device-io-pcie-numa-and-overlap.html">第5b章</a>；GPU
+执行模型和 Tensor Core 见 <a
+href="04a-gpu-execution-model-and-tensor-cores.html">第4a章</a>。本章不展开
+dispatcher 细节，也不下钻 kernel 内部 register、occupancy 和 PTX
+优化。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>把 CUDA stream、event、默认 stream、NCCL overlap、CUDA Graph
+这些名字先拿掉，AI 系统在 GPU
+运行时遇到的不可化简问题是：<strong>CPU、GPU copy engine、GPU compute
+engine
+和通信引擎都在不同时间尺度上工作；如果没有一套明确的命令排序和依赖表达机制，系统既无法保证数据正确，又无法让可并行的搬运、计算和通信真正重叠。</strong></p>
+<p>这里面有三个硬约束。</p>
+<p>第一是<strong>命令不是立即完成</strong>。一次
+<code>cudaMemcpyAsync</code>、一次 kernel launch、一次 NCCL
+collective，通常只是把工作提交到设备队列。CPU 很快返回，GPU
+稍后执行。于是代码表面上的顺序，不等于设备完成的顺序。你写下
+<code>y = model(x)</code> 后，CPU 可能已经继续跑 Python，GPU
+还在执行上一批 kernel。</p>
+<p>第二是<strong>数据依赖必须被表达出来</strong>。如果 H2D copy
+还没结束，compute kernel 就读取目标 buffer，结果就是未定义行为；如果
+backward 还没产出某个 gradient，NCCL allreduce
+就开始读它，通信得到的就是错误数据。系统必须知道”谁等谁”。这就是
+stream、event、<code>wait_stream</code>、record event、默认 stream
+语义存在的原因。</p>
+<p>第三是<strong>正确性和性能天然冲突</strong>。最粗暴的正确性做法是每一步都
+<code>cudaDeviceSynchronize()</code>：所有前序 GPU
+工作完成后再继续。这样当然正确，但会把 H2D、compute、D2H、NCCL
+全部拉成串行。高性能做法是只同步必要边界：让当前 batch 计算时，下一
+batch 的 H2D 已经在 copy stream 上进行；让 backward 计算较深层 gradient
+时，较浅 bucket 的 allreduce 已经在 NCCL stream 上进行；让稳定形状的推理
+decode 用 CUDA Graph 回放，减少 CPU launch
+开销。难点在于：少同步会错，多同步会慢。</p>
+<h3 id="推-从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从”设备工作是异步的”出发，第一步推出 stream。stream 可以理解成 GPU
+侧的命令队列：同一个 stream 内的命令按提交顺序执行，不同 stream
+的命令在依赖和硬件资源允许时可以并发。它不是线程，也不是独占
+GPU；它是一种排序语义。没有 stream，你很难表达”这段 H2D 可以和那段
+compute 重叠”。</p>
+<p>从”不同队列之间仍有数据依赖”出发，第二步推出 event。event
+是设备时间线上的一个标记：某个 stream 执行到这里时记录 event，另一个
+stream 可以等待这个 event。event
+的价值不是计时本身，而是把”等待某个局部条件”替代成”等待全设备完成”。正确使用
+event，可以只让 compute stream 等某次 H2D 完成，而不是让 CPU 调
+<code>torch.cuda.synchronize()</code> 等所有 GPU 工作完成。</p>
+<p>从”历史兼容和框架默认行为”出发，第三步必须理解默认 stream。默认
+stream 不是普通小细节。legacy default stream 可能与其他 blocking stream
+发生全局式顺序约束；per-thread default stream 则让每个 host thread
+有自己的默认 stream。框架通常帮你封装了大量细节，但当你手写
+CUDA、PyTorch stream、扩展算子或混用第三方库时，默认 stream
+语义会直接决定时间线是否能重叠。</p>
+<p>从”同步可以被隐藏在 API
+后面”出发，第四步得到隐式同步。<code>.item()</code>、打印 GPU
+tensor、<code>tensor.cpu()</code>、某些内存分配、错误检查、benchmark
+计时方式，都可能迫使 CPU 等
+GPU。隐式同步的危险在于它看起来不像同步：一行日志、一句断言、一个 shape
+分支，可能把本来能流水的 step 拉平。</p>
+<p>从”多段工作可以并行推进”出发，第五步得到 overlap。训练中最常见的
+overlap 是 H2D/compute overlap 和 compute/NCCL overlap。前者依赖 pinned
+host memory、non-blocking copy、copy stream 和正确等待；后者依赖梯度
+bucket、NCCL stream、反向计算顺序和通信拓扑。overlap
+的目标不是让单段工作消失，而是把端到端 step time 从
+<code>t_h2d + t_compute + t_comm</code> 逼近
+<code>max(t_h2d, t_compute, t_comm)</code> 的一部分。</p>
+<p>最后，从”重复 launch 的 CPU 开销不能靠更多 stream 解决”推出 CUDA
+Graph。stream 解决的是排序和重叠；CUDA Graph
+解决的是重复命令序列的提交开销。Graph capture 把一段稳定的 CUDA 工作录成
+DAG，replay 时以更低 CPU
+开销提交。它要求地址、shape、控制流、分配行为和依赖结构足够稳定，所以
+static buffer、warmup、固定 batch 形状和 graph pool
+才会成为生产边界。</p>
+<h3 id="绘-因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((CUDA stream 同步与 Graph))
+    不可化简问题
+      CPU与GPU异步
+      copy compute comm时间尺度不同
+      正确性需要依赖
+      性能需要少同步
+    Stream
+      命令队列
+      stream内有序
+      stream间可重叠
+      默认stream语义
+    Event
+      局部完成标记
+      wait_event
+      计时
+      跨stream依赖
+    隐式同步
+      item
+      cpu_numpy_print
+      synchronize
+      allocator与错误检查
+    Overlap
+      H2D与compute
+      D2H延后
+      backward与NCCL
+      copy engine与SM
+    CUDA Graph
+      capture
+      instantiate
+      replay
+      static buffer
+      dynamic shape限制
+    工程边界
+      debug关闭Graph
+      生产固定shape
+      nsys验证
+      回退路径</pre>
+<h3 id="导-读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>CUDA stream 是什么排序语义？为什么它不是 CPU thread，也不是 GPU
+独占通道？</li>
+<li>event 为什么比全局 synchronize 更适合表达跨 stream 依赖？</li>
+<li>默认 stream
+有哪些常见语义差异？为什么混用库和自定义算子时要特别小心？</li>
+<li>哪些 PyTorch / CUDA 写法会触发隐式同步？它们如何破坏
+H2D/compute/NCCL overlap？</li>
+<li>要让 H2D 和 compute 重叠，必须同时满足哪些内存、API、stream
+和时间线条件？</li>
+<li>DDP 中 backward 和 NCCL allreduce 为什么能 overlap？bucket
+大小、拓扑和同步点会怎样影响收益？</li>
+<li>CUDA Graph capture/replay 解决的是什么开销？为什么 static buffer
+和固定地址是关键？</li>
+<li>动态 shape、动态控制流、运行中分配、调试检查为什么会限制 CUDA
+Graph？</li>
+<li>debug 阶段和生产阶段应该怎样划分 stream、同步和 Graph
+的使用边界？</li>
+</ol>
+<h2 id="正文内容">正文内容</h2>
+<h3 id="b.1-先建立一个正确的时间线模型">6b.1
+先建立一个正确的时间线模型</h3>
+<p>很多 CUDA 性能问题来自一个误解：以为 Python 代码执行到下一行，上一行
+GPU 工作就已经完成。实际更接近下面这样：</p>
+<pre class="text"><code>CPU thread:
+  enqueue H2D(batch 0) ---- enqueue kernel(batch 0) ---- enqueue H2D(batch 1) ---- ...
+
+GPU device:
+                 copy batch 0 ---- compute batch 0
+                                      copy batch 1 ---- compute batch 1</code></pre>
+<p>CPU 侧调用通常只是提交命令，真正的执行发生在 GPU 时间线上。stream
+决定命令排队顺序，event 决定跨队列等待，synchronize 决定 CPU
+是否停下来等设备。</p>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 31%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th>对象</th>
+<th>第一性作用</th>
+<th>常见误解</th>
+<th>正确理解</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stream</td>
+<td>表达命令顺序</td>
+<td>一个 stream 等于一个 GPU 线程</td>
+<td>stream 是队列语义，不保证独占硬件</td>
+</tr>
+<tr>
+<td>event</td>
+<td>表达某个点已完成</td>
+<td>只用于计时</td>
+<td>更重要的是跨 stream 依赖</td>
+</tr>
+<tr>
+<td>default stream</td>
+<td>默认命令队列</td>
+<td>和普通 stream 完全一样</td>
+<td>语义受 legacy / per-thread 行为和库封装影响</td>
+</tr>
+<tr>
+<td>synchronize</td>
+<td>等待完成</td>
+<td>benchmark 随便用</td>
+<td>会切断异步流水，只应放在明确边界</td>
+</tr>
+<tr>
+<td>CUDA Graph</td>
+<td>录制并回放一段工作</td>
+<td>自动让 kernel 更快</td>
+<td>主要减少 launch / runtime 开销</td>
+</tr>
+</tbody>
+</table>
+<p>一个最小判断规则：<strong>只要某个 API 需要 CPU 立刻拿到 GPU
+结果，它就可能同步；只要某个 API 只提交 GPU
+后续工作，它就可能异步。</strong></p>
+<h3 id="b.2-stream不是并行魔法而是排序边界">6b.2
+Stream：不是并行魔法，而是排序边界</h3>
+<p>同一个 stream 内，CUDA 保证命令按提交顺序执行：</p>
+<pre class="text"><code>stream 0:
+  H2D A -&gt; kernel A -&gt; D2H A</code></pre>
+<p>这里 <code>kernel A</code> 不会在 <code>H2D A</code> 完成前读取
+A，<code>D2H A</code> 也不会在 <code>kernel A</code>
+完成前回传结果。这个顺序保证是 stream 的核心价值。</p>
+<p>不同 stream 之间，CUDA 允许在资源和依赖允许时重叠：</p>
+<pre class="text"><code>copy stream:
+  H2D batch 1 --------------------&gt;
+
+compute stream:
+        compute batch 0 --------------------&gt;</code></pre>
+<p>这不等于一定并发。能否重叠还取决于：</p>
+<ul>
+<li>H2D 是否来自 pinned host memory；</li>
+<li>拷贝是否用 async / non-blocking 语义提交；</li>
+<li>GPU 是否有可用 copy engine；</li>
+<li>compute kernel 是否占满所有相关资源；</li>
+<li>两个 stream 之间是否存在默认 stream 或 event 依赖；</li>
+<li>代码中是否有
+<code>.item()</code>、<code>synchronize()</code>、D2H、日志等同步点。</li>
+</ul>
+<h4 id="b.2.1-stream-的几个工程规则">6b.2.1 Stream 的几个工程规则</h4>
+<table>
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 23%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr>
+<th>规则</th>
+<th>含义</th>
+<th>违反后的表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同一数据的生产者和消费者必须有依赖</td>
+<td>copy 完才能 compute，compute 完才能通信或 D2H</td>
+<td>数据竞争、偶发错误、数值漂移</td>
+</tr>
+<tr>
+<td>不相关工作才适合放不同 stream</td>
+<td>下个 batch H2D 与当前 batch compute 可以重叠</td>
+<td>伪并发，甚至增加排队开销</td>
+</tr>
+<tr>
+<td>多 stream 不是越多越好</td>
+<td>stream 有调度和依赖管理成本</td>
+<td>时间线碎片化、debug 困难</td>
+</tr>
+<tr>
+<td>同步粒度越小越好</td>
+<td>等 event 优于等全设备</td>
+<td>GPU 空洞变小</td>
+</tr>
+<tr>
+<td>必须用 profiler 验证</td>
+<td>代码写成异步不代表真的重叠</td>
+<td>误把 API 形式当性能结果</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b.3-默认-stream最容易被忽略的同步来源">6b.3 默认
+Stream：最容易被忽略的同步来源</h3>
+<p>默认 stream 是没有显式指定 stream 时 CUDA 使用的
+stream。问题在于，默认 stream 的语义在不同模式和封装下可能不同。</p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>模式</th>
+<th>直觉</th>
+<th>工程影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>legacy default stream</td>
+<td>默认 stream 和其他 blocking stream 有较强顺序关系</td>
+<td>容易把多 stream 工作意外串行化</td>
+</tr>
+<tr>
+<td>per-thread default stream</td>
+<td>每个 host thread 有自己的默认 stream</td>
+<td>更利于多线程提交，但混用库时仍要检查</td>
+</tr>
+<tr>
+<td>framework current stream</td>
+<td>PyTorch 等框架维护当前设备和当前 stream</td>
+<td><code>with torch.cuda.stream(s)</code> 只影响作用域内提交</td>
+</tr>
+<tr>
+<td>library internal stream</td>
+<td>cuBLAS、NCCL、推理引擎可能设置自己的 stream</td>
+<td>需要确认 handle / communicator 绑定和等待关系</td>
+</tr>
+</tbody>
+</table>
+<p>不要把”没有显式写 stream”理解成”没有 stream”。所有 CUDA 工作都在某个
+stream 上，只是你可能不知道它是哪一个。</p>
+<h4 id="b.3.1-一个常见的串行化案例">6b.3.1 一个常见的串行化案例</h4>
+<p>假设你想让 H2D 在 side stream 上进行：</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>copy_stream <span class="op">=</span> torch.cuda.Stream()</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> torch.cuda.stream(copy_stream):</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    next_batch <span class="op">=</span> next_batch.to(<span class="st">&quot;cuda&quot;</span>, non_blocking<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> model(current_batch)</span></code></pre></div>
+<p>这段代码仍然不完整。因为 <code>next_batch</code> 后续被默认 current
+stream 消费时，必须让 compute stream 等待 copy stream：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>torch.cuda.current_stream().wait_stream(copy_stream)</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>out <span class="op">=</span> model(next_batch)</span></code></pre></div>
+<p>但等待的位置也不能太早。若你在当前 batch compute 之前就
+<code>wait_stream(copy_stream)</code>，那么 H2D 和 compute
+又被拉成串行。正确目标是：</p>
+<pre class="text"><code>1. side stream 提前搬 next_batch
+2. current stream 继续算 current_batch
+3. 到真正使用 next_batch 前，current stream 等 copy_stream</code></pre>
+<p>这就是 stream
+编程最核心的工程感：<strong>等待要靠近消费点，而不是靠近生产点。</strong></p>
+<h3 id="b.4-event用局部依赖替代全局等待">6b.4
+Event：用局部依赖替代全局等待</h3>
+<p>event 是记录在某个 stream 上的完成标记。另一个 stream 等待这个
+event，含义是”等到记录 event 之前的工作完成”，而不是”等整张 GPU
+空下来”。</p>
+<pre class="mermaid">sequenceDiagram
+  participant CS as copy stream
+  participant ES as event
+  participant MS as compute stream
+  CS->>CS: H2D next_batch
+  CS->>ES: record copy_done
+  MS->>MS: compute current_batch
+  MS->>ES: wait copy_done
+  MS->>MS: compute next_batch</pre>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>同步方式</th>
+<th>等待范围</th>
+<th>适合场景</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cudaEventRecord</code> + <code>cudaStreamWaitEvent</code></td>
+<td>某个 stream 上 event 之前的工作</td>
+<td>跨 stream 数据依赖</td>
+<td>依赖漏写会错</td>
+</tr>
+<tr>
+<td><code>stream.wait_stream(other)</code></td>
+<td>等 other stream 已提交的前序工作</td>
+<td>PyTorch 中简单跨 stream 等待</td>
+<td>等待点放太早会串行</td>
+</tr>
+<tr>
+<td><code>cudaStreamSynchronize(stream)</code></td>
+<td>CPU 等某个 stream 完成</td>
+<td>必须拿到该 stream 结果</td>
+<td>CPU 阻塞</td>
+</tr>
+<tr>
+<td><code>cudaDeviceSynchronize()</code> /
+<code>torch.cuda.synchronize()</code></td>
+<td>CPU 等整个设备完成</td>
+<td>benchmark、错误定位、退出前清理</td>
+<td>破坏所有 overlap</td>
+</tr>
+</tbody>
+</table>
+<p>event 也常用于计时，但要注意：CUDA event
+计的是设备时间线，不等于端到端 wall clock。测端到端延迟时，还要包括 CPU
+预处理、排队、调度、后处理和网络返回。</p>
+<h3 id="b.5-隐式同步最小的代码最大的时间线伤害">6b.5
+隐式同步：最小的代码，最大的时间线伤害</h3>
+<p>隐式同步之所以危险，是因为它通常长得不像性能代码。</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 28%" />
+<col style="width: 33%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>写法</th>
+<th>为什么同步</th>
+<th>常见出现位置</th>
+<th>替代做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>loss.item()</code></td>
+<td>GPU 标量要搬到 CPU Python 数值</td>
+<td>每 step 日志</td>
+<td>降低频率，设备侧累计，异步回传</td>
+</tr>
+<tr>
+<td><code>print(tensor)</code></td>
+<td>打印需要 CPU 读取内容</td>
+<td>debug 日志</td>
+<td>打印 shape / dtype / device，必要时抽样同步</td>
+</tr>
+<tr>
+<td><code>tensor.cpu()</code></td>
+<td>D2H 需要等待前序写入完成</td>
+<td>metrics、后处理</td>
+<td>批量 D2H，延后到边界</td>
+</tr>
+<tr>
+<td><code>tensor.numpy()</code></td>
+<td>先 D2H，再暴露 CPU array</td>
+<td>评估脚本</td>
+<td>明确放在 eval 边界</td>
+</tr>
+<tr>
+<td><code>if tensor_bool:</code></td>
+<td>Python 分支需要 CPU bool</td>
+<td>动态控制流、断言</td>
+<td>tensor 级控制或提前同步到明确边界</td>
+</tr>
+<tr>
+<td><code>torch.cuda.synchronize()</code></td>
+<td>显式全设备等待</td>
+<td>benchmark、排障</td>
+<td>只包住测量区间</td>
+</tr>
+<tr>
+<td><code>CUDA_LAUNCH_BLOCKING=1</code></td>
+<td>每个 launch 变成阻塞</td>
+<td>定位报错</td>
+<td>只在 debug 会话开启</td>
+</tr>
+<tr>
+<td>某些首次调用</td>
+<td>context 初始化、autotune、lazy load</td>
+<td>首 step、首请求</td>
+<td>warmup，不计入稳态</td>
+</tr>
+<tr>
+<td>运行中大分配</td>
+<td>allocator 可能触发整理或等待</td>
+<td>动态 shape、临时 tensor</td>
+<td>预分配、复用 static buffer</td>
+</tr>
+</tbody>
+</table>
+<p>一个实际经验是：训练日志里每 step
+<code>loss.item()</code>，通常不是一个”小小的 CPU
+读取”，而是一次强同步。它可能让 CPU 等
+backward、optimizer、前面所有已排队 kernel 完成，然后才继续提交下一 step
+的工作。</p>
+<h4 id="b.5.1-debug-代码如何进入生产事故">6b.5.1 Debug
+代码如何进入生产事故</h4>
+<p>常见事故链路如下：</p>
+<pre class="text"><code>线上吞吐下降
+  -&gt; 查看最近改动
+  -&gt; 某个 PR 加了每 batch nan 检查
+  -&gt; 检查写成 assert torch.isfinite(loss).all()
+  -&gt; Python 需要 bool
+  -&gt; 每 step D2H + synchronize
+  -&gt; H2D/compute/NCCL overlap 全部变差</code></pre>
+<p>这类问题很难靠代码 review
+肉眼发现，因为检查逻辑本身是合理的。更稳的做法是把 debug 检查分层：</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 50%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>阶段</th>
+<th>允许的同步</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>本地 debug</td>
+<td>可以开启 <code>CUDA_LAUNCH_BLOCKING=1</code>、频繁
+<code>.item()</code></td>
+<td>定位正确性错误</td>
+</tr>
+<tr>
+<td>性能调试</td>
+<td>只在测量边界同步</td>
+<td>得到可信时间线</td>
+</tr>
+<tr>
+<td>预生产压测</td>
+<td>禁止 per-step 隐式同步</td>
+<td>验证稳态吞吐</td>
+</tr>
+<tr>
+<td>生产</td>
+<td>同步必须可解释、可采样、可开关</td>
+<td>控制尾延迟和成本</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b.6-h2d-compute-overlap从三段串行到流水线">6b.6 H2D / Compute
+Overlap：从三段串行到流水线</h3>
+<p>最朴素的训练 step 是串行的：</p>
+<pre class="text"><code>CPU prepare batch 0
+H2D batch 0
+compute batch 0
+CPU prepare batch 1
+H2D batch 1
+compute batch 1</code></pre>
+<p>流水化后的目标是：</p>
+<pre class="mermaid">gantt
+  title H2D 与 compute overlap
+  dateFormat x
+  axisFormat %L
+  section CPU
+  prepare b0 :0, 20
+  prepare b1 :20, 20
+  prepare b2 :40, 20
+  section Copy Stream
+  H2D b0 :20, 12
+  H2D b1 :40, 12
+  H2D b2 :80, 12
+  section Compute Stream
+  compute b0 :32, 48
+  compute b1 :80, 48
+  compute b2 :128, 48</pre>
+<p>这张图表达的是结构，不是具体时间。真实系统里，copy 和 compute
+是否重叠要看 Nsight Systems 的 CUDA HW row、Memcpy row 和 stream
+row。</p>
+<h4 id="b.6.1-overlap-的必要条件">6b.6.1 Overlap 的必要条件</h4>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 37%" />
+<col style="width: 43%" />
+</colgroup>
+<thead>
+<tr>
+<th>条件</th>
+<th>为什么必要</th>
+<th>常见失败表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>host batch 在 pinned memory</td>
+<td>pageable memory 可能触发 staging 和同步</td>
+<td><code>non_blocking=True</code> 但 H2D 仍阻塞</td>
+</tr>
+<tr>
+<td>H2D 使用 async / non-blocking</td>
+<td>CPU 能继续提交后续工作</td>
+<td>copy 期间 CPU 卡住</td>
+</tr>
+<tr>
+<td>copy 与 compute 不在同一严格串行队列</td>
+<td>才有重叠机会</td>
+<td>时间线上 H2D 和 kernel 轮流出现</td>
+</tr>
+<tr>
+<td>消费前有 event / wait</td>
+<td>保证数据正确</td>
+<td>偶发错误或脏数据</td>
+</tr>
+<tr>
+<td>等待点靠近消费点</td>
+<td>保留 overlap 窗口</td>
+<td>过早 wait 导致串行</td>
+</tr>
+<tr>
+<td>compute 足够长</td>
+<td>copy 才有地方藏进去</td>
+<td>小模型中 overlap 收益有限</td>
+</tr>
+<tr>
+<td>没有隐式同步</td>
+<td>避免 CPU/GPU 队列被拉平</td>
+<td>每 step 固定空洞</td>
+</tr>
+</tbody>
+</table>
+<h4 id="b.6.2-pytorch-预取器骨架">6b.6.2 PyTorch 预取器骨架</h4>
+<p>下面的代码只展示机制，不是完整生产模板：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> CUDAPrefetcher:</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, loader, device):</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.loader <span class="op">=</span> <span class="bu">iter</span>(loader)</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.device <span class="op">=</span> device</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.stream <span class="op">=</span> torch.cuda.Stream(device<span class="op">=</span>device)</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.next_batch <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.preload()</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> preload(<span class="va">self</span>):</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>            batch <span class="op">=</span> <span class="bu">next</span>(<span class="va">self</span>.loader)</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> <span class="pp">StopIteration</span>:</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>.next_batch <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> torch.cuda.stream(<span class="va">self</span>.stream):</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>.next_batch <span class="op">=</span> {</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>                k: v.to(<span class="va">self</span>.device, non_blocking<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>                <span class="cf">for</span> k, v <span class="kw">in</span> batch.items()</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>            }</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="bu">next</span>(<span class="va">self</span>):</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>        torch.cuda.current_stream(<span class="va">self</span>.device).wait_stream(<span class="va">self</span>.stream)</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>        batch <span class="op">=</span> <span class="va">self</span>.next_batch</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> batch <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">None</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.preload()</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> batch</span></code></pre></div>
+<p>这段代码背后的时间线是：side stream 搬下一批，current stream
+使用上一批；使用前只等待必要的 copy stream。真实生产还要处理 nested
+batch、异常、epoch 边界、多个 GPU rank、device guard、静态 buffer、CUDA
+Graph capture 兼容性和内存峰值。</p>
+<h3 id="b.7-compute-nccl-overlap通信不是等-backward-全结束才开始">6b.7
+Compute / NCCL Overlap：通信不是等 backward 全结束才开始</h3>
+<p>分布式数据并行中，每个 rank 反向传播会产生梯度。朴素做法是：</p>
+<pre class="text"><code>backward all layers
+  -&gt; allreduce all gradients
+  -&gt; optimizer step</code></pre>
+<p>这会把通信完整加在 backward 后面。更好的做法是按 bucket overlap：</p>
+<pre class="mermaid">gantt
+  title Backward 与 NCCL overlap
+  dateFormat x
+  axisFormat %L
+  section Compute Stream
+  backward L4 :0, 20
+  backward L3 :20, 20
+  backward L2 :40, 20
+  backward L1 :60, 20
+  section NCCL Stream
+  allreduce bucket4 :22, 28
+  allreduce bucket3 :45, 28
+  allreduce bucket2 :68, 28
+  allreduce bucket1 :91, 28</pre>
+<p>当某个 bucket 的 gradient ready 后，DDP 可以在 NCCL stream 上启动
+allreduce，同时 compute stream 继续算更早层的 backward。这样总 step time
+更接近：</p>
+<pre class="text"><code>step_time ≈ forward + max(backward_compute, overlapped_comm) + exposed_comm_tail + optimizer</code></pre>
+<p>而不是：</p>
+<pre class="text"><code>step_time ≈ forward + backward_compute + all_comm + optimizer</code></pre>
+<h4 id="b.7.1-为什么-overlap-经常没有想象中好">6b.7.1 为什么 overlap
+经常没有想象中好</h4>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>原因</th>
+<th>表现</th>
+<th>调整方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bucket 太大</td>
+<td>很晚才 ready，通信启动晚</td>
+<td>调小 bucket，观察尾巴</td>
+</tr>
+<tr>
+<td>bucket 太小</td>
+<td>NCCL launch 太多，开销变大</td>
+<td>合并 bucket，减少碎片</td>
+</tr>
+<tr>
+<td>backward kernel 太短</td>
+<td>没有足够 compute 覆盖通信</td>
+<td>fusion / compile / graph，或接受通信尾巴</td>
+</tr>
+<tr>
+<td>拓扑瓶颈</td>
+<td>NCCL stream 长尾明显</td>
+<td>检查 NVLink、PCIe、NIC、NCCL topo</td>
+</tr>
+<tr>
+<td>隐式同步</td>
+<td>compute 和 NCCL 被强制对齐</td>
+<td>移除 <code>.item()</code>、debug assert、全局同步</td>
+</tr>
+<tr>
+<td>梯度使用顺序特殊</td>
+<td>bucket ready 顺序不理想</td>
+<td>调整模型结构或 bucket assignment</td>
+</tr>
+</tbody>
+</table>
+<p>NCCL collective 本身通常以 CUDA kernel
+或设备侧工作形式出现在时间线里。它也在 stream
+上排队，也需要正确依赖。不要把 NCCL 理解成”CPU 发一个网络请求”；在 GPU
+训练里，它是 GPU、NIC、互联拓扑和 runtime 共同构成的时间线。</p>
+<h3 id="b.8-cuda-graph把重复命令序列变成可回放-dag">6b.8 CUDA
+Graph：把重复命令序列变成可回放 DAG</h3>
+<p>CUDA Graph 的第一性目标是减少重复 launch 和 runtime
+调度开销。它不会自动改变单个 kernel 的数学实现，也不会让一个
+memory-bound kernel 变成 compute-bound。它主要解决这种场景：</p>
+<pre class="text"><code>每 step 都执行同样的 CUDA 操作序列
+  kernel A -&gt; kernel B -&gt; memcpy -&gt; kernel C -&gt; NCCL -&gt; kernel D
+
+如果每个操作都单独 launch:
+  CPU 每次都走 Python / framework / runtime / driver 提交流程
+
+如果 capture 成 graph:
+  稳态 replay 用低开销提交整个 DAG</code></pre>
+<p>Graph 的生命周期可以拆成四步：</p>
+<pre class="mermaid">flowchart LR
+  W[Warmup] --> C[Capture]
+  C --> I[Instantiate]
+  I --> R[Replay]
+  R --> R
+  R --> F[Fallback or recapture]</pre>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 33%" />
+<col style="width: 41%" />
+</colgroup>
+<thead>
+<tr>
+<th>阶段</th>
+<th>做什么</th>
+<th>工程注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>warmup</td>
+<td>初始化 context、allocator、autotune、lazy kernel</td>
+<td>不要把冷启动误判为 Graph 慢</td>
+</tr>
+<tr>
+<td>capture</td>
+<td>记录 CUDA 操作和依赖 DAG</td>
+<td>capture 内避免不支持的 CPU 同步和动态分配</td>
+</tr>
+<tr>
+<td>instantiate</td>
+<td>生成可执行 graph 对象</td>
+<td>可能占用额外内存</td>
+</tr>
+<tr>
+<td>replay</td>
+<td>重复提交同一 DAG</td>
+<td>输入输出地址必须稳定</td>
+</tr>
+<tr>
+<td>fallback / recapture</td>
+<td>shape 或路径变化时走回退</td>
+<td>需要明确策略，不能线上无限 recapture</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b.9-static-buffergraph-能工作的核心工程约束">6b.9 Static
+Buffer：Graph 能工作的核心工程约束</h3>
+<p>CUDA Graph replay
+复用的是捕获时的操作、依赖和内存地址。也就是说，Graph 中 kernel
+参数指向的 tensor 地址通常要保持稳定。于是生产里常见的做法是维护 static
+input / output buffer：</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>static_x <span class="op">=</span> torch.empty((batch_size, hidden), device<span class="op">=</span><span class="st">&quot;cuda&quot;</span>, dtype<span class="op">=</span>torch.float16)</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>static_y <span class="op">=</span> torch.empty((batch_size, hidden), device<span class="op">=</span><span class="st">&quot;cuda&quot;</span>, dtype<span class="op">=</span>torch.float16)</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co"># capture 前，模型和 allocator 已 warmup</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>g <span class="op">=</span> torch.cuda.CUDAGraph()</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> torch.cuda.graph(g):</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>    static_y.copy_(model(static_x))</span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run(x):</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>    static_x.copy_(x)</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>    g.replay()</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> static_y</span></code></pre></div>
+<p>这段代码只说明地址稳定的思想。真实 PyTorch Graph 使用还要考虑
+<code>make_graphed_callables</code>、optimizer、AMP、RNG
+state、多个输入输出、in-place 更新和 stream capture 约束。</p>
+<h4 id="b.9.1-static-buffer-的收益与代价">6b.9.1 Static buffer
+的收益与代价</h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>收益</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>launch 开销</td>
+<td>replay 降低 CPU 提交成本</td>
+<td>capture 前后代码复杂</td>
+</tr>
+<tr>
+<td>内存地址</td>
+<td>固定地址让 graph 可复用</td>
+<td>需要额外常驻 buffer</td>
+</tr>
+<tr>
+<td>shape</td>
+<td>固定 shape 下最稳定</td>
+<td>动态 shape 需要 padding 或多 graph</td>
+</tr>
+<tr>
+<td>allocator</td>
+<td>避免运行中频繁分配</td>
+<td>显存峰值可能升高</td>
+</tr>
+<tr>
+<td>debug</td>
+<td>稳态路径更可控</td>
+<td>错误栈和时间线不如 eager 直观</td>
+</tr>
+</tbody>
+</table>
+<p>一个容易忽略的问题是：static buffer
+不只是”多占一点显存”。它还改变了内存生命周期。原本 eager 模式下某些临时
+tensor 可以被 allocator 复用；Graph 模式下为了保证 replay 正确，graph
+pool
+和静态地址可能让显存常驻更高。对推理服务，吞吐提升和并发容量之间必须重新评估。</p>
+<h3 id="b.10-动态-shapecuda-graph-的主要边界">6b.10 动态 Shape：CUDA
+Graph 的主要边界</h3>
+<p>动态 shape 会让 Graph 复杂化，原因不是 CUDA 不喜欢 shape，而是 shape
+变化通常意味着：</p>
+<ul>
+<li>kernel 参数不同；</li>
+<li>grid / block 或库内部算法选择不同；</li>
+<li>tensor 地址和临时 buffer 大小不同；</li>
+<li>控制流路径不同；</li>
+<li>allocator 行为不同；</li>
+<li>某些分支会多出或少掉 CUDA 操作。</li>
+</ul>
+<p>常见处理策略如下：</p>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 35%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>适合场景</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>padding 到固定 shape</td>
+<td>把请求 pad 到固定 batch / seq len</td>
+<td>在线推理、decode bucket</td>
+<td>多算 padding token</td>
+</tr>
+<tr>
+<td>shape bucket</td>
+<td>为几个常见 shape 各 capture 一个 graph</td>
+<td>LLM prefill、图像多分辨率</td>
+<td>graph 数量和显存增加</td>
+</tr>
+<tr>
+<td>eager fallback</td>
+<td>少见 shape 不 graph</td>
+<td>长尾请求</td>
+<td>长尾延迟较高</td>
+</tr>
+<tr>
+<td>recapture</td>
+<td>shape 变化时重新 capture</td>
+<td>离线任务、低频变更</td>
+<td>线上抖动风险大</td>
+</tr>
+<tr>
+<td>编译器托管</td>
+<td>交给 <code>torch.compile</code>、TensorRT-LLM、vLLM</td>
+<td>标准模型路径</td>
+<td>仍需理解失败边界</td>
+</tr>
+</tbody>
+</table>
+<h4 id="b.10.1-llm-推理里的-shape-bucket">6b.10.1 LLM 推理里的 shape
+bucket</h4>
+<p>LLM 服务里，decode 阶段每步通常只生成少量 token，kernel 很碎，Graph
+收益明显。但请求的 batch size、sequence length、KV cache block
+分布又是动态的。常见工程折中是：</p>
+<pre class="text"><code>batch size bucket: 1, 2, 4, 8, 16, 32
+sequence bucket: 128, 256, 512, 1024, 2048, 4096
+
+请求实际 shape -&gt; 选择最接近的 bucket -&gt; pad / mask -&gt; replay 对应 graph</code></pre>
+<p>这个策略降低 launch 开销，但带来两个新问题：</p>
+<ol type="1">
+<li>padding 增加无效计算，尤其在长短请求混合时明显；</li>
+<li>每个 graph / bucket 可能持有静态
+buffer，显存容量和碎片都要重新测。</li>
+</ol>
+<p>所以 Graph 不是”开关优化”，而是一套调度、内存和 shape 策略。</p>
+<h3 id="b.11-capture-期间哪些事情容易出问题">6b.11 Capture
+期间哪些事情容易出问题</h3>
+<p>CUDA Graph capture 要求 capture 区间内的 CUDA
+行为可重复。以下操作经常成为问题源：</p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>操作</th>
+<th>风险</th>
+<th>处理方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>capture 内 <code>.item()</code></td>
+<td>CPU 需要等待 GPU 结果</td>
+<td>移出 capture，改设备侧逻辑</td>
+</tr>
+<tr>
+<td>capture 内动态分配</td>
+<td>replay 时地址和 allocator 行为不稳定</td>
+<td>warmup + 预分配</td>
+</tr>
+<tr>
+<td>capture 内 shape 分支</td>
+<td>DAG 结构可能变化</td>
+<td>shape bucket 或 fallback</td>
+</tr>
+<tr>
+<td>capture 内随机数</td>
+<td>RNG 状态需要可控</td>
+<td>使用框架支持的 graph-safe RNG</td>
+</tr>
+<tr>
+<td>capture 内 CPU IO / logging</td>
+<td>不是 CUDA DAG 的稳定部分</td>
+<td>移到 capture 外</td>
+</tr>
+<tr>
+<td>capture 内异常检查</td>
+<td>可能触发同步或分支</td>
+<td>debug 路径关闭 Graph</td>
+</tr>
+<tr>
+<td>混用未知第三方 CUDA 库</td>
+<td>可能不支持 stream capture</td>
+<td>查文档，做最小验证</td>
+</tr>
+</tbody>
+</table>
+<p>生产系统必须给 Graph 失败准备回退路径。最糟糕的做法是：线上遇到新
+shape 时在请求线程里同步 recapture，导致 P99 抖动；或者 capture
+失败后静默退回 eager，却没有指标，吞吐下降很久才被发现。</p>
+<h3 id="b.12-debug-与生产边界">6b.12 Debug 与生产边界</h3>
+<p>stream、event 和 Graph 的正确使用，需要把 debug
+和生产边界分清楚。</p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 45%" />
+<col style="width: 27%" />
+</colgroup>
+<thead>
+<tr>
+<th>阶段</th>
+<th>推荐设置</th>
+<th>禁忌</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正确性 debug</td>
+<td>eager，必要时 <code>CUDA_LAUNCH_BLOCKING=1</code>，关闭 Graph</td>
+<td>用 Graph 隐藏错误来源</td>
+</tr>
+<tr>
+<td>性能 profile</td>
+<td>固定输入，warmup 后采样，少量明确 synchronize</td>
+<td>把冷启动、compile、capture 计入稳态</td>
+</tr>
+<tr>
+<td>压测</td>
+<td>开启生产 stream / Graph / bucket 策略</td>
+<td>每请求打印 GPU tensor</td>
+</tr>
+<tr>
+<td>生产</td>
+<td>Graph 命中率、fallback、同步次数、P99 都要监控</td>
+<td>无指标地自动 recapture</td>
+</tr>
+<tr>
+<td>事故排查</td>
+<td>可切换 debug 开关，采样同步</td>
+<td>全量开启阻塞模式</td>
+</tr>
+</tbody>
+</table>
+<p>一个实用原则是：<strong>debug
+代码可以牺牲异步性，但必须有明确开关；生产代码可以使用异步和
+Graph，但必须有可观测的回退边界。</strong></p>
+<h4 id="b.12.1-生产指标应该看什么">6b.12.1 生产指标应该看什么</h4>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 27%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>指标</th>
+<th>意义</th>
+<th>异常信号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Graph replay 命中率</td>
+<td>请求是否走低开销路径</td>
+<td>shape 长尾过多，bucket 不合理</td>
+</tr>
+<tr>
+<td>Graph capture / recapture 次数</td>
+<td>是否稳态运行</td>
+<td>线上频繁 recapture</td>
+</tr>
+<tr>
+<td>fallback eager 比例</td>
+<td>Graph 失败或不适用程度</td>
+<td>新模型路径未覆盖</td>
+</tr>
+<tr>
+<td>H2D 与 compute overlap 比例</td>
+<td>输入流水是否有效</td>
+<td>copy 和 kernel 严格交替</td>
+</tr>
+<tr>
+<td>exposed NCCL tail</td>
+<td>通信未被计算覆盖的尾巴</td>
+<td>bucket 或拓扑问题</td>
+</tr>
+<tr>
+<td>per-step synchronize 次数</td>
+<td>隐式或显式同步风险</td>
+<td>debug 代码进入生产</td>
+</tr>
+<tr>
+<td>CUDA API CPU time</td>
+<td>launch / runtime 开销</td>
+<td>小 kernel 太多或 Graph 失效</td>
+</tr>
+<tr>
+<td>显存常驻和峰值</td>
+<td>static buffer 与 graph pool 成本</td>
+<td>bucket 过多导致容量下降</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b.13-工程案例一每-step-.item-让-overlap-消失">6b.13
+工程案例一：每 step <code>.item()</code> 让 overlap 消失</h3>
+<p>某训练任务在 8 GPU 上吞吐比预期低 12%。Nsight Systems 显示：</p>
+<pre class="text"><code>每 step backward 结束
+  -&gt; CUDA HW row 空一段
+  -&gt; CPU row 出现 D2H copy / synchronize
+  -&gt; 下一 step H2D 才开始</code></pre>
+<p>代码里有：</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>loss_value <span class="op">=</span> loss.item()</span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>logger.info(<span class="st">&quot;loss=</span><span class="sc">%f</span><span class="st">&quot;</span>, loss_value)</span></code></pre></div>
+<p>问题不是 D2H 的字节数大，而是 <code>.item()</code> 需要 CPU 拿到 GPU
+标量，所以它等待前面所有相关 GPU 工作完成。修复方式：</p>
+<ul>
+<li>每 N step 采样一次 loss；</li>
+<li>或在 GPU 上累计 metrics，按窗口回传；</li>
+<li>或把日志放到明确的 step 边界，并接受该边界同步；</li>
+<li>profile 验证 H2D prefetch 是否重新与 compute 重叠。</li>
+</ul>
+<p>这个案例的关键教训：<strong>小 D2H 也可能是大同步。</strong></p>
+<h3 id="b.14-工程案例二推理服务启用-cuda-graph-后-p99-变差">6b.14
+工程案例二：推理服务启用 CUDA Graph 后 P99 变差</h3>
+<p>某在线推理服务对固定 batch benchmark 启用 CUDA Graph 后，吞吐提升
+20%。上线后 P50 改善，但 P99 变差。排查发现：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Graph 命中率只有 55%</td>
+<td>请求 shape 长尾多</td>
+</tr>
+<tr>
+<td>fallback eager P99 高</td>
+<td>长尾 shape 走未优化路径</td>
+</tr>
+<tr>
+<td>显存占用增加</td>
+<td>为多个 bucket 常驻 static buffer</td>
+</tr>
+<tr>
+<td>偶发尖刺</td>
+<td>请求线程触发 recapture</td>
+</tr>
+</tbody>
+</table>
+<p>最终方案：</p>
+<ol type="1">
+<li>只为高频 batch / seq bucket 捕获 graph；</li>
+<li>长尾 shape 明确走 eager fallback，不在线 recapture；</li>
+<li>调度层把相近 shape 合批，提高 bucket 命中；</li>
+<li>每个模型版本上线前报告 graph 命中率、显存成本和 P99；</li>
+<li>debug 镜像默认关闭 Graph，生产镜像默认开启但可按模型回退。</li>
+</ol>
+<p>这个案例说明，CUDA Graph 的收益不是单点 benchmark
+决定的，而是由真实流量 shape 分布、bucket 策略和 fallback
+行为共同决定。</p>
+<h3 id="b.15-工程案例三nccl-overlap-被错误的等待点吃掉">6b.15
+工程案例三：NCCL overlap 被错误的等待点吃掉</h3>
+<p>一个 DDP 训练任务升级后，单卡 kernel 时间没变，网络带宽也正常，但
+step time 变长。时间线显示 NCCL allreduce 几乎都堆在 backward
+之后。排查发现自定义 hook 中加入了：</p>
+<div class="sourceCode" id="cb23"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>torch.cuda.synchronize()</span></code></pre></div>
+<p>作者的意图是”确保梯度已经 ready”，但 DDP 原本通过 bucket ready 和
+stream/event 表达依赖；全局 synchronize 把所有 backward compute
+等完，NCCL 才继续，overlap 消失。</p>
+<p>修复方式：</p>
+<ul>
+<li>删除全局 synchronize；</li>
+<li>用 event 或框架 hook 的 ready 语义表达局部依赖；</li>
+<li>调整 bucket size 后重新 profile；</li>
+<li>增加性能回归检查：exposed NCCL tail 不得超过基线阈值。</li>
+</ul>
+<h2 id="排障-checklist">排障 Checklist</h2>
+<h3 id="stream-与-event">Stream 与 Event</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />每个 H2D、compute、D2H、NCCL
+工作分别在哪个 stream 上？</label></li>
+<li><label><input type="checkbox" />同一 stream 内的顺序是否符合生产者 /
+消费者关系？</label></li>
+<li><label><input type="checkbox" />跨 stream 依赖是用 event / wait
+表达，还是靠全局 synchronize？</label></li>
+<li><label><input type="checkbox" />等待点是否靠近消费点，而不是过早切断
+overlap？</label></li>
+<li><label><input type="checkbox" />是否混用了默认 stream、自定义
+stream、库内部 stream，却没有明确等待关系？</label></li>
+<li><label><input type="checkbox" />Nsight Systems 中不同 stream
+的工作是否真的重叠？</label></li>
+</ul>
+<h3 id="隐式同步">隐式同步</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />训练或推理热路径里是否有
+<code>.item()</code>、<code>tensor.cpu()</code>、<code>numpy()</code>、打印
+GPU tensor？</label></li>
+<li><label><input type="checkbox" />是否有 Python <code>if</code> /
+<code>assert</code> 依赖 GPU tensor 值？</label></li>
+<li><label><input type="checkbox" />是否在每 step、每 request 或每
+bucket 调用 <code>torch.cuda.synchronize()</code>？</label></li>
+<li><label><input type="checkbox" />是否把
+<code>CUDA_LAUNCH_BLOCKING=1</code>
+带进了性能测试或生产环境？</label></li>
+<li><label><input type="checkbox" />benchmark
+是否只在测量边界同步，而不是每个小段都同步？</label></li>
+<li><label><input type="checkbox" />首 step 的 context
+初始化、autotune、compile、Graph capture
+是否和稳态分开统计？</label></li>
+</ul>
+<h3 id="h2d-compute-nccl-overlap">H2D / Compute / NCCL Overlap</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />DataLoader 是否使用 pinned
+memory，H2D 是否 <code>non_blocking=True</code>？</label></li>
+<li><label><input type="checkbox" />H2D 是否有独立 copy
+stream，并在消费前才等待？</label></li>
+<li><label><input type="checkbox" />copy 时间是否足够被 compute
+覆盖，还是 compute 太短无法隐藏？</label></li>
+<li><label><input type="checkbox" />D2H metrics / logs
+是否被延后或批量化？</label></li>
+<li><label><input type="checkbox" />DDP bucket 是否过大导致 allreduce
+启动太晚？</label></li>
+<li><label><input type="checkbox" />NCCL stream 是否与 backward compute
+overlap，还是形成通信尾巴？</label></li>
+<li><label><input type="checkbox" />拓扑、NCCL 算法和 bucket
+设置是否一起验证？</label></li>
+</ul>
+<h3 id="cuda-graph">CUDA Graph</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />Graph 捕获前是否完成
+warmup、allocator 预热和 autotune？</label></li>
+<li><label><input type="checkbox" />capture 区间内是否存在动态
+shape、动态控制流或运行中分配？</label></li>
+<li><label><input type="checkbox" />输入、输出和关键中间 buffer
+地址是否稳定？</label></li>
+<li><label><input type="checkbox" />static buffer
+的显存成本是否计入容量规划？</label></li>
+<li><label><input type="checkbox" />是否为常见 shape 设计 bucket，为长尾
+shape 设计 fallback？</label></li>
+<li><label><input type="checkbox" />是否监控 graph replay
+命中率、fallback 比例和 recapture 次数？</label></li>
+<li><label><input type="checkbox" />debug 路径是否能关闭
+Graph，生产路径是否能按模型回退？</label></li>
+</ul>
+<h2 id="本章涉及的常见工具">本章涉及的常见工具</h2>
+<table>
+<colgroup>
+<col style="width: 24%" />
+<col style="width: 52%" />
+<col style="width: 24%" />
+</colgroup>
+<thead>
+<tr>
+<th>目标</th>
+<th>工具 / 命令</th>
+<th>用法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>系统时间线</td>
+<td><code>nsys profile python train.py</code></td>
+<td>看 stream、Memcpy、kernel、NCCL 是否重叠</td>
+</tr>
+<tr>
+<td>PyTorch 侧 profile</td>
+<td><code>torch.profiler</code></td>
+<td>关联 Python op、CUDA op 和隐式同步</td>
+</tr>
+<tr>
+<td>强制同步定位错误</td>
+<td><code>CUDA_LAUNCH_BLOCKING=1</code></td>
+<td>只用于 debug，不用于性能结论</td>
+</tr>
+<tr>
+<td>手动同步测量</td>
+<td><code>torch.cuda.synchronize()</code></td>
+<td>只放在 benchmark 测量边界</td>
+</tr>
+<tr>
+<td>CUDA event 计时</td>
+<td><code>torch.cuda.Event(enable_timing=True)</code></td>
+<td>测设备侧区间</td>
+</tr>
+<tr>
+<td>Graph API</td>
+<td><code>torch.cuda.CUDAGraph()</code>、<code>torch.cuda.graph</code></td>
+<td>手动 capture / replay</td>
+</tr>
+<tr>
+<td>编译托管 Graph</td>
+<td><code>torch.compile(mode="reduce-overhead")</code></td>
+<td>优先尝试的 PyTorch 路径</td>
+</tr>
+<tr>
+<td>显存观察</td>
+<td><code>torch.cuda.memory_summary()</code>、<code>nvidia-smi</code></td>
+<td>看 static buffer 和 graph pool 成本</td>
+</tr>
+<tr>
+<td>NCCL 观察</td>
+<td><code>NCCL_DEBUG=INFO</code>、nsys NCCL row</td>
+<td>看通信算法、拓扑和通信尾巴</td>
+</tr>
+</tbody>
+</table>
+<h2 id="本章小结">本章小结</h2>
+<table>
+<colgroup>
+<col style="width: 37%" />
+<col style="width: 62%" />
+</colgroup>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stream</td>
+<td>表达 CUDA 命令队列顺序，同 stream 有序，跨 stream 可重叠</td>
+</tr>
+<tr>
+<td>event</td>
+<td>表达局部完成和跨 stream 依赖，优于全设备等待</td>
+</tr>
+<tr>
+<td>默认 stream</td>
+<td>不是无害默认值，混用库和自定义 stream 时要确认语义</td>
+</tr>
+<tr>
+<td>隐式同步</td>
+<td><code>.item()</code>、打印、D2H、断言和全局 synchronize
+会破坏异步流水</td>
+</tr>
+<tr>
+<td>H2D/compute overlap</td>
+<td>依赖 pinned memory、non-blocking copy、copy stream 和正确等待点</td>
+</tr>
+<tr>
+<td>NCCL overlap</td>
+<td>依赖 bucket ready、NCCL stream、反向计算顺序和拓扑</td>
+</tr>
+<tr>
+<td>CUDA Graph</td>
+<td>主要减少重复 launch / runtime 开销，不直接优化单个 kernel</td>
+</tr>
+<tr>
+<td>static buffer</td>
+<td>Graph replay 依赖稳定地址，代价是常驻显存和更复杂生命周期</td>
+</tr>
+<tr>
+<td>动态 shape</td>
+<td>需要 padding、bucket、fallback 或 recapture 策略</td>
+</tr>
+<tr>
+<td>debug / 生产边界</td>
+<td>debug 可牺牲异步性，生产必须监控同步、Graph 命中和回退</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>用自己的话解释 CUDA stream 的排序语义。为什么说 stream 不是 CPU
+thread，也不是 GPU 独占通道？</li>
+<li>event 和 <code>torch.cuda.synchronize()</code>
+都能”等待”，它们等待的范围有什么不同？</li>
+<li>列出 6 种常见隐式同步写法，并说明每一种为什么需要 CPU 等 GPU。</li>
+<li>默认 stream 为什么可能让原本不同 stream
+的工作串行化？请描述一个混用默认 stream 和 side stream 的例子。</li>
+<li>H2D copy 要和 compute 重叠，至少需要满足哪些条件？</li>
+<li>CUDA Graph capture/replay
+解决的主要开销是什么？它为什么不能让单个低效 kernel 自动变快？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="7" type="1">
+<li>某训练 step 中 H2D 18 ms、compute 60 ms、D2H metrics 2
+ms。串行执行需要多少时间？如果 H2D 完全被上一 step compute 覆盖，而 D2H
+每 20 step 批量一次，稳态下限大约是多少？</li>
+<li>下面的预取流程哪里可能过早同步：<code>copy next batch -&gt; wait copy stream -&gt; compute current batch -&gt; compute next batch</code>？请改写成更合理的等待顺序。</li>
+<li>一个 DDP 任务中 NCCL allreduce 总在 backward 后集中出现。请列出至少
+5 个可能原因和对应验证方法。</li>
+<li>一个推理服务启用 CUDA Graph 后平均延迟下降，但 P99 上升。请从 shape
+bucket、fallback、static buffer、recapture 四个角度分析。</li>
+<li>为什么 dynamic shape 会限制 CUDA Graph？请把原因拆成 kernel
+参数、临时 buffer、控制流、allocator 四类。</li>
+<li>设计一个 CUDA event 计时实验，比较设备侧 kernel
+时间和端到端请求时间。为什么两者可能相差很大？</li>
+</ol>
+<h3 id="开放题">开放题</h3>
+<ol start="13" type="1">
+<li>为一个单机训练任务设计 H2D/compute overlap 的 profiling
+SOP。要求包含采集命令、时间线观察点、常见根因和修复顺序。</li>
+<li>你的团队准备把训练默认打开
+<code>torch.compile(mode="reduce-overhead")</code>。请设计灰度策略，覆盖
+warmup、Graph capture 失败、动态
+shape、显存峰值、性能回归和回退开关。</li>
+<li>为一个 LLM 推理服务设计 CUDA Graph shape bucket 策略。给出 bucket
+选择、padding 代价、graph 命中率指标、fallback 规则和上线验收标准。</li>
+<li>某同事在自定义 DDP hook 里加入 <code>torch.cuda.synchronize()</code>
+来”保证梯度 ready”。请写一段技术评审意见，说明它为什么可能破坏 NCCL
+overlap，以及应该用什么依赖表达方式替代。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

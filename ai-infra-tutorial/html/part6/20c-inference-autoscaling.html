@@ -1,0 +1,1631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 20c 章 · 推理 Autoscaling — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=20c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 20c 章 · 推理 Autoscaling</h1>
+<p class="sub">围绕 TTFT、TPOT、queue wait、KV cache 和 token 指标设计 SLO-aware 推理扩缩容。</p>
+<div class="chips"><span class="chip">Inference</span><span class="chip">Autoscaling</span><span class="chip">SLO</span><span class="chip">KEDA</span><span class="chip">KV Cache</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#20c1-第一性原理拆解--学习大纲">20c.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#20c2-概念先说清楚autoscaling-是什么不是什么">20c.2
+概念先说清楚：Autoscaling 是什么，不是什么</a></li><li><a class="anchor" href="#20c3-架构组件数据路径控制路径与责任边界">20c.3
+架构：组件、数据路径、控制路径与责任边界</a></li><li><a class="anchor" href="#20c4-原理为什么-cpuqps-不够token-和-kv-才关键">20c.4
+原理：为什么 CPU/QPS 不够，Token 和 KV 才关键</a></li><li><a class="anchor" href="#20c5-ttfttpotgoodput-与-slo-aware-scaling">20c.5
+TTFT、TPOT、Goodput 与 SLO-aware Scaling</a></li><li><a class="anchor" href="#20c6-hpakeda-与-custom-metrics">20c.6 HPA、KEDA 与 Custom
+Metrics</a></li><li><a class="anchor" href="#20c7-工程化落地配置版本矩阵发布观测与治理">20c.7
+工程化落地：配置、版本矩阵、发布、观测与治理</a></li><li><a class="anchor" href="#20c8-方案设计slo-aware-推理扩缩容方案">20c.8 方案设计：SLO-aware
+推理扩缩容方案</a></li><li><a class="anchor" href="#20c9-冷启动warm-pool-与-scale-to-zero">20c.9 冷启动、Warm Pool
+与 Scale-to-Zero</a></li><li><a class="anchor" href="#20c10-canary限流与降级">20c.10 Canary、限流与降级</a></li><li><a class="anchor" href="#20c11-故障排除症状证据根因处理动作">20c.11
+故障排除：症状、证据、根因、处理动作</a></li><li><a class="anchor" href="#20c12-反模式--checklist">20c.12 反模式 + Checklist</a></li><li><a class="anchor" href="#20c13-worked-example70b-chat-服务的-slo-aware-扩缩容">20c.13
+Worked Example：70B Chat 服务的 SLO-aware 扩缩容</a></li><li><a class="anchor" href="#20c14-本章小结">20c.14 本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>推理扩缩容不是“指标超过阈值就加 Pod”，而是把用户等待、token
+工作量、KV cache、冷启动、路由和降级策略放进同一个容量控制回路。</p>
+</blockquote>
+<h2 id="20c1-第一性原理拆解--学习大纲">20c.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>在线推理 autoscaling
+要解决的不可化简问题是：<strong>在请求到达随机、请求成本高度不均、模型副本启动慢、GPU
+资源形状离散、运行时状态不断变化的条件下，平台如何让可交付容量持续贴近业务
+SLO，同时避免 GPU 成本失控。</strong></p>
+<p>普通 Web 服务常见的扩容逻辑是 CPU 高了加副本、QPS 低了缩副本。LLM
+推理不能这样处理，原因至少有六个：</p>
+<table>
+<thead>
+<tr>
+<th>差异</th>
+<th>Web 服务常见假设</th>
+<th>LLM 推理现实</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>请求成本</td>
+<td>单请求成本相对稳定</td>
+<td>10 token prompt 和 32K prompt 成本相差几个数量级</td>
+</tr>
+<tr>
+<td>执行阶段</td>
+<td>请求一次性执行</td>
+<td>prefill 和 decode 的瓶颈不同</td>
+</tr>
+<tr>
+<td>并发模型</td>
+<td>线程 / 连接数可粗略代表压力</td>
+<td>active sequences、batch、KV block 才接近真实状态</td>
+</tr>
+<tr>
+<td>资源瓶颈</td>
+<td>CPU / 内存经常能解释延迟</td>
+<td>GPU compute、HBM、KV cache、调度器、下游依赖都会卡</td>
+</tr>
+<tr>
+<td>扩容生效</td>
+<td>新 Pod Ready 后基本可用</td>
+<td>镜像、权重、engine、CUDA graph、warmup 都可能还没完成</td>
+</tr>
+<tr>
+<td>用户体验</td>
+<td>请求整体延迟</td>
+<td>TTFT、TPOT、超时、截断、goodput 要分开看</td>
+</tr>
+</tbody>
+</table>
+<p>因此，本章关注的不是 HPA、KEDA 或某个 scaler 的语法，而是如何构造一个
+SLO-aware 的推理容量控制系统。</p>
+<h3 id="推--从问题推导机制">推 — 从问题推导机制</h3>
+<p>先从用户体验推导指标。用户首先感知的是排队，所以要看
+<code>queue_wait</code>。请求进入运行时后，能否继续接请求取决于活跃序列和
+KV cache，所以要看
+<code>active_sequences</code>、<code>KV block utilization</code> 和
+preemption。推理计算量不是 QPS，而是输入 token 和输出 token，所以要看
+<code>prefill_tokens/s</code> 与
+<code>decode_tokens/s</code>。用户体验要拆成首 token 和后续
+token，所以要看 TTFT 与 TPOT。副本扩出来不等于可接流量，所以冷启动和
+readiness 必须进入扩容模型。</p>
+<p>再从控制动作推导组件。HPA 适合按 Kubernetes metrics 调 Deployment
+副本；KEDA 适合从队列、消息系统或外部事件源触发；custom scaler
+适合把运行时指标、路由队列、KV cache 和 SLO
+组合成业务特定的决策。扩不动或扩了也救不了时，还需要
+admission、限流、降级、canary 冻结和 warm pool。</p>
+<h3 id="绘--控制回路">绘 — 控制回路</h3>
+<pre class="mermaid">flowchart TD
+  A[请求到达 Gateway] --&gt; B[租户/模型/长度/优先级分类]
+  B --&gt; C{Admission 是否放行}
+  C --&gt;|否| D[排队 限流 降级 返回明确原因]
+  C --&gt;|是| E[Router 选择副本或队列]
+  E --&gt; F[模型运行时 Prefill/Decode/KV]
+  F --&gt; G[导出 queue wait active seqs tokens/s KV TTFT TPOT]
+  G --&gt; H[SLO-aware scaler]
+  H --&gt; I{需要动作?}
+  I --&gt;|扩容| J[HPA/KEDA/Custom 扩副本或唤醒 warm pool]
+  I --&gt;|缩容| K[drain 副本 冷却 释放资源]
+  I --&gt;|保护| L[限流 长短分流 降级 canary 冻结]
+  J --&gt; M[调度 镜像 权重 Engine Warmup Readiness]
+  M --&gt; N[新副本入路由池]
+  N --&gt; G</pre>
+<h3 id="导--读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>HPA、KEDA、custom scaler 分别适合控制什么，不适合控制什么？</li>
+<li>为什么 queue wait、active sequences、tokens/s、KV cache 比 CPU
+更接近推理瓶颈？</li>
+<li>TTFT 和 TPOT 分别反映哪段链路的问题？</li>
+<li>KV cache 为什么既是显存问题，也是 admission 和 autoscaling
+问题？</li>
+<li>冷启动为什么必须拆成 image、weight、engine、warmup 和
+readiness？</li>
+<li>warm pool、scale-to-zero、canary、降级如何和扩缩容配合？</li>
+<li>怎样设计一个 SLO-aware 的扩缩容策略，而不是只追求高 GPU
+utilization？</li>
+</ol>
+<h2 id="20c2-概念先说清楚autoscaling-是什么不是什么">20c.2
+概念先说清楚：Autoscaling 是什么，不是什么</h2>
+<p>推理 autoscaling 是一个闭环控制系统：它观察流量、队列、运行时和
+SLO，决定副本数、热容量、准入策略和降级动作，使服务在成本边界内满足目标体验。</p>
+<p>它不是下面这些东西：</p>
+<table>
+<thead>
+<tr>
+<th>不是</th>
+<th>为什么不够</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不是 CPU HPA</td>
+<td>CPU 可能很低，但 KV cache 已满、queue wait 已经爆掉</td>
+</tr>
+<tr>
+<td>不是 GPU utilization 阈值</td>
+<td>GPU 忙不等于用户有效吞吐高，GPU 不忙也可能在排队或受 KV 限制</td>
+</tr>
+<tr>
+<td>不是只调 <code>replicas</code></td>
+<td>新副本可能还在拉镜像、加载权重、编译 engine，不能立即接流量</td>
+</tr>
+<tr>
+<td>不是只看 QPS</td>
+<td>同样 10 QPS，短问答和 32K 长上下文成本完全不同</td>
+</tr>
+<tr>
+<td>不是替代限流</td>
+<td>资源不足、依赖异常或坏版本放量时，只扩容会扩大故障面</td>
+</tr>
+</tbody>
+</table>
+<h3 id="与相邻概念的边界">与相邻概念的边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>负责回答</th>
+<th>与 autoscaling 的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue / quota</td>
+<td>哪个租户和请求有资格消耗资源</td>
+<td>autoscaling 不应绕过配额和优先级</td>
+</tr>
+<tr>
+<td>GPU 资源切分</td>
+<td>是否有正确卡型、MIG profile、拓扑和隔离</td>
+<td>autoscaling 只能请求容量，不能凭空改变资源形状</td>
+</tr>
+<tr>
+<td>Load balancing</td>
+<td>现有副本之间如何分流</td>
+<td>autoscaling 决定容量规模，router 决定请求落点</td>
+</tr>
+<tr>
+<td>Admission control</td>
+<td>这个请求现在能不能进系统</td>
+<td>autoscaling 给 admission 提供容量信号，admission 保护 SLO</td>
+</tr>
+<tr>
+<td>Canary / release</td>
+<td>新版本是否继续放量</td>
+<td>canary 指标异常时应冻结扩容放量或回滚</td>
+</tr>
+<tr>
+<td>Cluster autoscaler</td>
+<td>节点池是否扩容</td>
+<td>推理 scaler 触发 Pod，节点 scaler 负责底层节点容量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="扩的到底是哪种容量">扩的到底是哪种容量</h3>
+<table>
+<thead>
+<tr>
+<th>容量</th>
+<th>含义</th>
+<th>代表指标</th>
+<th>常见误判</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度容量</td>
+<td>集群能否放下新 Pod</td>
+<td>Pending、ResourceFlavor、quota、node allocatable</td>
+<td>Pod 创建成功就代表扩容成功</td>
+</tr>
+<tr>
+<td>启动容量</td>
+<td>新副本多久变成可服务</td>
+<td>image pull、weight load、engine init、warmup</td>
+<td>容器 Running 就能接请求</td>
+</tr>
+<tr>
+<td>执行容量</td>
+<td>单位时间能处理多少 token</td>
+<td>prefill tokens/s、decode tokens/s、batch efficiency</td>
+<td>QPS 可以直接代表负载</td>
+</tr>
+<tr>
+<td>KV 容量</td>
+<td>能容纳多少上下文和活跃序列</td>
+<td>KV utilization、block free、preemption、OOM</td>
+<td>显存空闲就一定还能接更多请求</td>
+</tr>
+<tr>
+<td>SLO 容量</td>
+<td>按目标体验完成的有效吞吐</td>
+<td>TTFT、TPOT、timeout、goodput</td>
+<td>GPU util 高就是容量健康</td>
+</tr>
+</tbody>
+</table>
+<p>本章后面所有设计都围绕一个判断：<strong>autoscaling
+的目标不是副本数更多，而是按 SLO 可交付的 token
+容量更接近需求。</strong></p>
+<h2 id="20c3-架构组件数据路径控制路径与责任边界">20c.3
+架构：组件、数据路径、控制路径与责任边界</h2>
+<p>一个生产可用的推理 autoscaling 架构通常至少包含七类组件。</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>责任</th>
+<th>关键输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API Gateway</td>
+<td>鉴权、租户识别、全局限流、请求标签化</td>
+<td>tenant、model、priority、prompt length</td>
+</tr>
+<tr>
+<td>Admission Controller</td>
+<td>判断请求是否立即进入、排队、降级或拒绝</td>
+<td>admitted / queued / downgraded / rejected</td>
+</tr>
+<tr>
+<td>Router</td>
+<td>选择模型版本、副本、长度池、canary 比例</td>
+<td>routing decision、per-replica queue</td>
+</tr>
+<tr>
+<td>Serving Runtime</td>
+<td>执行 prefill / decode、管理 batch 和 KV cache</td>
+<td>active sequences、tokens/s、KV metrics</td>
+</tr>
+<tr>
+<td>Metrics Pipeline</td>
+<td>聚合 Prometheus / OpenTelemetry / runtime metrics</td>
+<td>窗口化指标、分桶指标、SLO burn</td>
+</tr>
+<tr>
+<td>Scaler</td>
+<td>根据策略改变副本、热池或降级开关</td>
+<td>scale event、cooldown、reason</td>
+</tr>
+<tr>
+<td>Orchestrator</td>
+<td>创建 Pod、调度 GPU、拉镜像、加载权重、readiness</td>
+<td>Pod state、node state、endpoint state</td>
+</tr>
+</tbody>
+</table>
+<h3 id="数据路径">数据路径</h3>
+<p>请求数据路径强调“用户请求如何变成 token 输出”：</p>
+<pre class="text"><code>Client
+  -&gt; Gateway
+  -&gt; Admission
+  -&gt; Router
+  -&gt; Model replica local queue
+  -&gt; Prefill
+  -&gt; Decode loop
+  -&gt; Streaming response</code></pre>
+<p>这个路径上的延迟可以拆成：</p>
+<table>
+<thead>
+<tr>
+<th>延迟</th>
+<th>说明</th>
+<th>常见指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>gateway latency</td>
+<td>网关鉴权、限流、序列化开销</td>
+<td>gateway p95</td>
+</tr>
+<tr>
+<td>admission wait</td>
+<td>全局队列或租户队列等待</td>
+<td>queue_wait</td>
+</tr>
+<tr>
+<td>router wait</td>
+<td>找不到合适副本或本地队列满</td>
+<td>pending_requests</td>
+</tr>
+<tr>
+<td>prefill latency</td>
+<td>输入 token 首次处理</td>
+<td>prefill time、input_tokens</td>
+</tr>
+<tr>
+<td>decode latency</td>
+<td>输出 token 逐步生成</td>
+<td>TPOT、output_tokens</td>
+</tr>
+<tr>
+<td>stream overhead</td>
+<td>网络和客户端消费速度</td>
+<td>stream flush、client abort</td>
+</tr>
+</tbody>
+</table>
+<h3 id="控制路径">控制路径</h3>
+<p>控制路径强调“指标如何变成动作”：</p>
+<pre class="text"><code>Runtime/Gateway metrics
+  -&gt; Metrics pipeline
+  -&gt; Policy evaluation
+  -&gt; HPA/KEDA/custom scaler
+  -&gt; Deployment/CRD/Endpoint update
+  -&gt; Pod scheduling and warmup
+  -&gt; Router endpoint discovery</code></pre>
+<p>控制路径的核心风险是滞后。假设指标窗口 60 秒、HPA 同步 15 秒、调度 60
+秒、镜像和权重 180 秒、warmup 30 秒，那么一次扩容可能 4 到 6
+分钟后才真正增加可服务容量。高峰只持续 2
+分钟时，盲目扩容会在流量过去后才产生额外成本。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>建议归属</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>是否接收某个请求</td>
+<td>Admission</td>
+<td>它知道租户、优先级、SLO 和当前容量</td>
+</tr>
+<tr>
+<td>请求落到哪个副本</td>
+<td>Router</td>
+<td>它掌握本地队列、版本、长度池和健康状态</td>
+</tr>
+<tr>
+<td>副本数目标</td>
+<td>Scaler</td>
+<td>它聚合窗口化指标并执行冷却策略</td>
+</tr>
+<tr>
+<td>Pod 能否被调度</td>
+<td>Kubernetes / queue layer</td>
+<td>它掌握 quota、ResourceFlavor、节点和拓扑</td>
+</tr>
+<tr>
+<td>副本是否 Ready</td>
+<td>Serving runtime + readiness probe</td>
+<td>只有运行时知道权重、engine、KV 和 warmup 是否完成</td>
+</tr>
+<tr>
+<td>是否降级</td>
+<td>Policy controller</td>
+<td>需要结合业务优先级、SLO burn 和风险开关</td>
+</tr>
+</tbody>
+</table>
+<p>不要把这些责任混在一个脚本里。脚本可以做
+PoC，生产系统需要每个动作都有指标、事件、审计和回滚路径。</p>
+<h2 id="20c4-原理为什么-cpuqps-不够token-和-kv-才关键">20c.4
+原理：为什么 CPU/QPS 不够，Token 和 KV 才关键</h2>
+<p>LLM 推理通常分为 prefill 和 decode。</p>
+<p>Prefill 阶段处理输入 prompt，特点是一次性读入大量
+token，矩阵计算密集，输入长度越长越贵。Decode 阶段逐 token
+生成输出，特点是每一步都依赖前一步，batch 和 KV cache
+状态决定吞吐与延迟。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>主要工作</th>
+<th>主要瓶颈</th>
+<th>用户感知</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>处理输入 tokens，建立 KV cache</td>
+<td>compute、HBM、长上下文 batch</td>
+<td>TTFT 变差</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>逐 token 生成输出</td>
+<td>KV 读取、调度步进、active sequences</td>
+<td>TPOT 变差</td>
+</tr>
+<tr>
+<td>Scheduling</td>
+<td>组织请求进入 batch</td>
+<td>队列、长度混合、优先级</td>
+<td>queue wait 和尾延迟</td>
+</tr>
+<tr>
+<td>Streaming</td>
+<td>输出给客户端</td>
+<td>网络、客户端速度、取消请求处理</td>
+<td>断流、超时、无效工作</td>
+</tr>
+</tbody>
+</table>
+<h3 id="queue-wait">Queue wait</h3>
+<p><code>queue_wait</code> 是请求被 admission
+放行后，到真正进入模型运行时之前的等待时间。它是最接近用户痛感的容量信号。</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>queue wait 上升，active sequences 接近上限</td>
+<td>副本执行槽不足，应考虑扩容或分流</td>
+</tr>
+<tr>
+<td>queue wait 上升，KV utilization 接近满</td>
+<td>继续塞请求会引发 preemption 或 OOM</td>
+</tr>
+<tr>
+<td>queue wait 上升，GPU util 不高</td>
+<td>可能是长请求阻塞、KV 受限、router 错配或下游依赖</td>
+</tr>
+<tr>
+<td>queue wait 低但 TPOT 差</td>
+<td>请求进得去，但 decode 阶段过载</td>
+</tr>
+</tbody>
+</table>
+<h3 id="active-sequences">Active sequences</h3>
+<p><code>active_sequences</code>
+表示运行时正在处理的序列数量。它不是越高越好。太低可能浪费
+GPU，太高可能让 decode 步进变慢、KV cache 被挤满、尾延迟恶化。</p>
+<p>一个实用判断是看
+<code>active_sequences / max_num_seqs</code>，但不能单独使用。<code>max_num_seqs</code>
+设置过大时，表面并发提高，实际 TPOT 和 P99 可能更差。</p>
+<h3 id="tokenss">Tokens/s</h3>
+<p>QPS 没有区分输入和输出成本。推理容量应该至少拆成：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>input_tokens/s</code></td>
+<td>判断 prompt 压力和 prefill 成本</td>
+</tr>
+<tr>
+<td><code>output_tokens/s</code></td>
+<td>判断 decode 压力和持续生成成本</td>
+</tr>
+<tr>
+<td><code>prefill_tokens/s</code></td>
+<td>判断 prefill 计算吞吐</td>
+</tr>
+<tr>
+<td><code>decode_tokens/s</code></td>
+<td>判断 decode 生成吞吐</td>
+</tr>
+<tr>
+<td><code>tokens_per_gpu_second</code></td>
+<td>做容量规划和成本归因</td>
+</tr>
+<tr>
+<td><code>good_tokens/s</code></td>
+<td>只统计按 SLO 完成、未超时、未取消的有效 token</td>
+</tr>
+</tbody>
+</table>
+<p>如果流量从“短问答”变成“长文档总结”，QPS 可能不变，但 input tokens/s
+暴涨，TTFT 会先坏。如果用户把 <code>max_tokens</code> 从 512 调到
+4096，QPS 也可能不变，但 decode 占用时间变长，TPOT
+和队列都会受影响。</p>
+<h3 id="kv-cache">KV cache</h3>
+<p>KV cache 存储 attention 需要的 key/value
+状态。它的规模大致受模型层数、hidden
+size、batch、上下文长度和精度影响。KV cache 是推理 autoscaling
+的关键，因为它决定一个副本能同时容纳多少活跃上下文。</p>
+<table>
+<thead>
+<tr>
+<th>KV 状态</th>
+<th>可能后果</th>
+<th>扩缩容含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>利用率低，queue wait 高</td>
+<td>可能是 compute 或路由问题</td>
+<td>不要只因 queue wait 扩容，先查瓶颈</td>
+</tr>
+<tr>
+<td>利用率中等，active sequences 高</td>
+<td>正常高负载</td>
+<td>可通过扩容或优化 batch 改善</td>
+</tr>
+<tr>
+<td>利用率接近上限</td>
+<td>新请求难以进入，可能 preempt</td>
+<td>需要扩容、长短分流或收紧 admission</td>
+</tr>
+<tr>
+<td>preemption 增加</td>
+<td>KV 不够导致换出或重算</td>
+<td>goodput 下降，扩容和限流都可能需要</td>
+</tr>
+<tr>
+<td>OOM</td>
+<td>admission 或参数失控</td>
+<td>立即保护，降低 <code>max_num_seqs</code> 或上下文上限</td>
+</tr>
+</tbody>
+</table>
+<p>GPU 显存指标经常显示“还有空闲”，但运行时的 KV block
+已经不可用。autoscaling 应该优先信任运行时暴露的 KV block
+指标，而不是只看节点层显存。</p>
+<h2 id="20c5-ttfttpotgoodput-与-slo-aware-scaling">20c.5
+TTFT、TPOT、Goodput 与 SLO-aware Scaling</h2>
+<h3 id="指标定义">指标定义</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>主要解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTFT</td>
+<td>Time To First Token，从请求进入到首 token 返回</td>
+<td>排队、路由、prefill、冷启动</td>
+</tr>
+<tr>
+<td>TPOT</td>
+<td>Time Per Output Token，后续 token 平均间隔</td>
+<td>decode 压力、active sequences、KV 读取</td>
+</tr>
+<tr>
+<td>E2E latency</td>
+<td>整个请求完成时间</td>
+<td>prompt + output 长度共同决定</td>
+</tr>
+<tr>
+<td>Timeout rate</td>
+<td>超时比例</td>
+<td>容量不足、依赖异常或客户端限制</td>
+</tr>
+<tr>
+<td>Goodput</td>
+<td>按 SLO 成功完成的有效吞吐</td>
+<td>真正可交付容量</td>
+</tr>
+<tr>
+<td>SLO burn rate</td>
+<td>错误预算消耗速度</td>
+<td>是否触发保护动作</td>
+</tr>
+</tbody>
+</table>
+<p>仅看平均 TPOT 或平均 TTFT 会掩盖租户、模型版本、prompt
+长度和输出长度差异。生产系统至少要按以下维度分桶：<code>model</code>、<code>version</code>、<code>tenant</code>、<code>priority</code>、<code>prompt_length_bucket</code>、<code>output_length_bucket</code>、<code>replica</code>、<code>gpu_sku</code>。</p>
+<h3 id="slo-aware-scaling-的基本思路">SLO-aware scaling 的基本思路</h3>
+<p>SLO-aware scaling 不把指标阈值当成唯一真相，而是问三个问题：</p>
+<ol type="1">
+<li>当前 SLO 是否正在被消耗？</li>
+<li>扩容在冷启动时间之后是否仍然来得及？</li>
+<li>如果扩容来不及，是否应该限流、降级或切池？</li>
+</ol>
+<p>示例策略：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">slo</span><span class="kw">:</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ttft_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">1000</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tpot_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">timeout_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 0.5%&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="fu">scale_out</span><span class="kw">:</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">all</span><span class="kw">:</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">queue_wait_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 200&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">pending_requests</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 2 * ready_replicas&quot;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">any</span><span class="kw">:</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">active_sequences_per_replica</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.80 * max_num_seqs&quot;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">prefill_tokens_per_gpu_second</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.75 * profiled_prefill_capacity&quot;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">decode_tokens_per_gpu_second</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.75 * profiled_decode_capacity&quot;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">guardrails</span><span class="kw">:</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">kv_cache_utilization_p95</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 0.92&quot;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">last_scale_out_seconds</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 60&quot;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="fu">protect</span><span class="kw">:</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">any</span><span class="kw">:</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">kv_cache_utilization_p95</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt;= 0.92&quot;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">preemption_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0&quot;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">slo_burn_rate_5m</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 4&quot;</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">actions</span><span class="kw">:</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> route_long_context_to_dedicated_pool</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> tighten_max_tokens_for_low_priority</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> freeze_canary</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> enable_tenant_burst_limit</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="fu">scale_in</span><span class="kw">:</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">all</span><span class="kw">:</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">queue_wait_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 30 for 20m&quot;</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">active_sequences_per_replica</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 0.35 * max_num_seqs for 20m&quot;</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">slo_burn_rate_30m</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 1&quot;</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">no_recent_cold_start_errors</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div>
+<p>这里的重点是 <code>guardrails</code>。KV
+已经接近满时，把更多请求塞进现有副本不是扩容，而是制造尾延迟和重算。此时更合理的动作可能是扩新副本、长短分流、限制长上下文或拒绝低优先级
+burst。</p>
+<h2 id="20c6-hpakeda-与-custom-metrics">20c.6 HPA、KEDA 与 Custom
+Metrics</h2>
+<h3 id="hpa">HPA</h3>
+<p>HPA 是 Kubernetes 原生的副本控制器。它适合用 CPU、内存、Prometheus
+Adapter 暴露的 custom metrics 调整 Deployment 或类似对象。</p>
+<table>
+<thead>
+<tr>
+<th>优点</th>
+<th>局限</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原生、稳定、容易接入 Deployment</td>
+<td>对 LLM 运行时语义无感</td>
+</tr>
+<tr>
+<td>支持 scale behavior、stabilization window</td>
+<td>指标窗口和冷启动容易滞后</td>
+</tr>
+<tr>
+<td>适合中小模型和简单服务</td>
+<td>难表达 KV、token、warm pool、降级动作</td>
+</tr>
+</tbody>
+</table>
+<p>HPA 可以作为执行器，但不要把 CPU HPA 当成推理 autoscaling
+的完整方案。</p>
+<h3 id="keda">KEDA</h3>
+<p>KEDA 更适合事件驱动扩缩容，例如 Kafka、SQS、Redis
+Stream、Prometheus、外部队列等。它的优势是能根据队列积压或外部事件唤醒服务，甚至支持
+scale-to-zero。</p>
+<table>
+<thead>
+<tr>
+<th>适合</th>
+<th>不适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>异步推理、批推理、embedding 队列、低频服务唤醒</td>
+<td>强实时聊天主链路只靠队列长度扩容</td>
+</tr>
+<tr>
+<td>消息积压和副本数关系相对清楚的服务</td>
+<td>请求 token 成本差异巨大的服务</td>
+</tr>
+<tr>
+<td>需要 scale-to-zero 的内部模型</td>
+<td>冷启动不可接受的高 SLO 服务</td>
+</tr>
+</tbody>
+</table>
+<p>队列长度必须转成工作量。100 个短 embedding 请求和 100 个 32K
+长上下文请求不应触发同样的扩容动作。</p>
+<h3 id="custom-scaler">Custom scaler</h3>
+<p>Custom scaler 适合在成熟平台中使用。它从
+gateway、router、runtime、Prometheus 和业务 SLO
+聚合指标，输出副本数、warm pool 规模、admission 开关和降级策略。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>工程要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>组合 queue wait、active seqs、tokens/s、KV、TTFT、TPOT</td>
+<td>指标命名稳定、窗口一致、缺失值策略明确</td>
+</tr>
+<tr>
+<td>区分模型、租户、长度和版本</td>
+<td>分桶不能爆炸，需要保留核心维度</td>
+</tr>
+<tr>
+<td>结合冷启动时间预测容量</td>
+<td>需要记录每阶段启动耗时</td>
+</tr>
+<tr>
+<td>输出降级和 canary 冻结动作</td>
+<td>需要审计、回滚和人工 override</td>
+</tr>
+</tbody>
+</table>
+<p>一个原则：先用 HPA/KEDA 建立闭环，再把确实需要业务语义的部分沉淀到
+custom scaler。不要一开始就写一个无法解释的大型控制器。</p>
+<h2 id="20c7-工程化落地配置版本矩阵发布观测与治理">20c.7
+工程化落地：配置、版本矩阵、发布、观测与治理</h2>
+<h3 id="配置分层">配置分层</h3>
+<p>推理 autoscaling 的配置至少分五层：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>示例</th>
+<th>变更频率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型容量画像</td>
+<td>每 GPU prefill/decode tokens/s、最大上下文、KV block</td>
+<td>模型或 runtime 变更时</td>
+</tr>
+<tr>
+<td>服务 SLO</td>
+<td>TTFT、TPOT、timeout、可降级策略</td>
+<td>产品或租户合同变更时</td>
+</tr>
+<tr>
+<td>scaler 策略</td>
+<td>scale-out/in 阈值、cooldown、min/max replicas</td>
+<td>容量调优时</td>
+</tr>
+<tr>
+<td>路由策略</td>
+<td>长短池、canary、租户权重、warm pool 入池规则</td>
+<td>发布或高峰前</td>
+</tr>
+<tr>
+<td>保护策略</td>
+<td>限流、max_tokens、模型降级、拒绝低优先级</td>
+<td>事故或演练时</td>
+</tr>
+</tbody>
+</table>
+<h3 id="版本矩阵">版本矩阵</h3>
+<p>推理 autoscaling
+的行为受多个版本影响。生产发布前建议维护一张矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>需要记录</th>
+<th>为什么重要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU / driver</td>
+<td>H100/A100/L40S、driver、CUDA</td>
+<td>性能和兼容性不同</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>vLLM / TensorRT-LLM / TGI / Triton 版本</td>
+<td>指标语义、KV 管理、batch 行为不同</td>
+</tr>
+<tr>
+<td>Model artifact</td>
+<td>权重版本、量化方式、context length</td>
+<td>tokens/s 和显存占用不同</td>
+</tr>
+<tr>
+<td>Container image</td>
+<td>镜像 digest、依赖、启动脚本</td>
+<td>image pull 和初始化可复现</td>
+</tr>
+<tr>
+<td>Scaler policy</td>
+<td>阈值、窗口、cooldown、min/max</td>
+<td>影响副本行为和事故复盘</td>
+</tr>
+<tr>
+<td>Router policy</td>
+<td>长短分流、canary、健康检查</td>
+<td>影响流量和 SLO</td>
+</tr>
+</tbody>
+</table>
+<p>不要只记录模型版本。一次 TPOT 退化可能来自 runtime
+升级、量化方式改变、driver 变化、CUDA graph capture 失败或 scaler
+窗口被调整。</p>
+<h3 id="发布策略">发布策略</h3>
+<p>推理服务发布要同时发布“模型、runtime、路由和 scaler”。建议顺序：</p>
+<ol type="1">
+<li>离线 profile：测 prefill/decode tokens/s、KV
+容量、最大并发、冷启动耗时。</li>
+<li>Shadow：复制真实请求但不返回用户，验证错误率、tokens/s
+和资源曲线。</li>
+<li>Canary：1% 到 5% 流量，单独看 TTFT、TPOT、queue
+wait、OOM、preemption。</li>
+<li>Scaler dry-run：新策略只记录建议副本数，不实际执行。</li>
+<li>小步放量：逐步提高 canary 和 scaler 生效范围。</li>
+<li>Freeze gate：任一核心 SLO 或运行时错误异常，冻结 canary 和
+scale-in。</li>
+</ol>
+<h3 id="观测与审计">观测与审计</h3>
+<p>最小观测集合：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>必备指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>流量</td>
+<td>QPS、input/output tokens/s、prompt/output length bucket</td>
+</tr>
+<tr>
+<td>队列</td>
+<td>queue wait P50/P95/P99、pending requests、admission decision</td>
+</tr>
+<tr>
+<td>运行时</td>
+<td>active sequences、batch size、prefill/decode tokens/s、KV
+utilization、preemption</td>
+</tr>
+<tr>
+<td>SLO</td>
+<td>TTFT、TPOT、timeout、client cancel、goodput</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>schedule time、image pull、weight load、engine
+init、warmup、readiness</td>
+</tr>
+<tr>
+<td>扩缩容</td>
+<td>desired/ready replicas、scale event reason、cooldown、HPA/KEDA
+status</td>
+</tr>
+<tr>
+<td>发布</td>
+<td>model version、runtime version、canary percentage、traffic
+split</td>
+</tr>
+</tbody>
+</table>
+<p>每次 scale event
+都应该能回答：为什么扩、扩到多少、预计何时生效、是否成功入池、SLO
+是否改善。</p>
+<h2 id="20c8-方案设计slo-aware-推理扩缩容方案">20c.8 方案设计：SLO-aware
+推理扩缩容方案</h2>
+<p>假设要设计一个 70B chat 服务，目标是 P95 TTFT &lt; 1s、P95 TPOT &lt;
+80ms/token，支持普通聊天和长文档总结。</p>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>决策点</th>
+<th>推荐方案</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础扩缩容</td>
+<td>custom metrics HPA 或自研 scaler 输出 Deployment replicas</td>
+<td>副本控制仍交给 K8s，指标用 LLM 语义</td>
+</tr>
+<tr>
+<td>扩容主信号</td>
+<td>queue_wait_p95 + active_sequences + tokens/s</td>
+<td>同时覆盖用户等待、并发槽和真实工作量</td>
+</tr>
+<tr>
+<td>保护信号</td>
+<td>KV utilization + preemption + SLO burn</td>
+<td>防止把过载误判为可继续加压</td>
+</tr>
+<tr>
+<td>冷启动处理</td>
+<td>min replicas + warm pool + readiness warmup</td>
+<td>70B 首请求冷启动不可接受</td>
+</tr>
+<tr>
+<td>长上下文处理</td>
+<td>单独长上下文池，独立 quota 和队列</td>
+<td>避免 32K 请求拖慢短问答</td>
+</tr>
+<tr>
+<td>scale-to-zero</td>
+<td>禁用于主链路，允许低频租户专属模型</td>
+<td>主链路 SLO 不接受分钟级启动</td>
+</tr>
+<tr>
+<td>canary</td>
+<td>版本级独立指标门禁，异常冻结</td>
+<td>防止坏版本被 autoscaling 放大</td>
+</tr>
+<tr>
+<td>降级</td>
+<td>低优先级收紧 max_tokens，必要时切小模型</td>
+<td>扩容滞后时保护核心 SLO</td>
+</tr>
+</tbody>
+</table>
+<h3 id="可执行配置草案">可执行配置草案</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">service</span><span class="kw">:</span><span class="at"> chat-70b</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gpu_flavor</span><span class="kw">:</span><span class="at"> h100-80gb-full</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tensor_parallel</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">min_replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">18</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">warm_pool_replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">slo</span><span class="kw">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ttft_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">1000</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tpot_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">timeout_rate_max</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.005</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="fu">routing</span><span class="kw">:</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pools</span><span class="kw">:</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">short_context</span><span class="kw">:</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">prompt_tokens_max</span><span class="kw">:</span><span class="at"> </span><span class="dv">8192</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">priority</span><span class="kw">:</span><span class="at"> default</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">long_context</span><span class="kw">:</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">prompt_tokens_min</span><span class="kw">:</span><span class="at"> </span><span class="dv">8193</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">priority</span><span class="kw">:</span><span class="at"> controlled</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">canary</span><span class="kw">:</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_percent_without_approval</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">freeze_on</span><span class="kw">:</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">ttft_p95_regression</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 20%&quot;</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">tpot_p95_regression</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 15%&quot;</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">runtime_error_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 1%&quot;</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="fu">scaling</span><span class="kw">:</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scale_out</span><span class="kw">:</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">window</span><span class="kw">:</span><span class="at"> 2m</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">step</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cooldown</span><span class="kw">:</span><span class="at"> 90s</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">when</span><span class="kw">:</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">queue_wait_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 200&quot;</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">active_sequences_ratio</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.80&quot;</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">or</span><span class="kw">:</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">prefill_tokens_per_gpu_second_ratio</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.75&quot;</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">decode_tokens_per_gpu_second_ratio</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.75&quot;</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scale_in</span><span class="kw">:</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">window</span><span class="kw">:</span><span class="at"> 20m</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">step</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cooldown</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">when</span><span class="kw">:</span></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">queue_wait_p95_ms</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 30&quot;</span></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">active_sequences_ratio</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 0.35&quot;</span></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">slo_burn_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt; 1&quot;</span></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">protect</span><span class="kw">:</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">when</span><span class="kw">:</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">kv_cache_utilization_p95</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0.92&quot;</span></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">preemption_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 0&quot;</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">slo_burn_rate_5m</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt; 4&quot;</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">actions</span><span class="kw">:</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> move_long_context_to_long_pool</span></span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> limit_low_priority_max_tokens</span></span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> freeze_canary</span></span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> reject_burst_above_tenant_limit</span></span></code></pre></div>
+<h3 id="为什么这个方案可执行">为什么这个方案可执行</h3>
+<p>这个设计把动作拆开了：正常压力用扩容处理，KV
+风险用保护动作处理，长上下文用路由隔离处理，版本风险用 canary
+门禁处理，冷启动用 warm pool 和 readiness
+处理。它不假设一个指标能解释全部问题。</p>
+<h2 id="20c9-冷启动warm-pool-与-scale-to-zero">20c.9 冷启动、Warm Pool
+与 Scale-to-Zero</h2>
+<p>大模型副本从 0 到可接流量，通常经历以下阶段：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>常见耗时来源</th>
+<th>可优化动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod 准入和调度</td>
+<td>quota、ResourceFlavor、节点容量</td>
+<td>保留热节点、合理 min replicas</td>
+</tr>
+<tr>
+<td>镜像拉取</td>
+<td>镜像过大、registry 跨区、节点无缓存</td>
+<td>镜像瘦身、预拉、就近 registry</td>
+</tr>
+<tr>
+<td>权重加载</td>
+<td>对象存储带宽、权重大小、本地盘缓存</td>
+<td>权重缓存、分层加载、P2P 分发</td>
+</tr>
+<tr>
+<td>Engine 初始化</td>
+<td>编译、CUDA graph capture、kernel autotune</td>
+<td>预构建 engine、固定 shape bucket</td>
+</tr>
+<tr>
+<td>KV / 显存预分配</td>
+<td>显存碎片、参数过大</td>
+<td>固定配置、启动自检</td>
+</tr>
+<tr>
+<td>Warmup</td>
+<td>首批请求触发慢路径</td>
+<td>readiness 前执行代表性 warmup</td>
+</tr>
+<tr>
+<td>入路由池</td>
+<td>endpoint 更新、健康检查、traffic split</td>
+<td>readiness gate、渐进接流量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="warm-pool">Warm pool</h3>
+<p>Warm pool 有不同深度：</p>
+<table>
+<thead>
+<tr>
+<th>深度</th>
+<th>已经准备好什么</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>热节点</td>
+<td>节点 Ready、driver 和 device plugin 正常</td>
+<td>云节点启动慢</td>
+</tr>
+<tr>
+<td>热镜像</td>
+<td>镜像已缓存</td>
+<td>镜像大、registry 慢</td>
+</tr>
+<tr>
+<td>热权重</td>
+<td>权重已在本地盘或内存缓存</td>
+<td>大模型权重加载慢</td>
+</tr>
+<tr>
+<td>热 engine</td>
+<td>runtime 初始化和编译完成</td>
+<td>TensorRT-LLM、CUDA graph 明显耗时</td>
+</tr>
+<tr>
+<td>热副本</td>
+<td>完成 warmup，随时入池</td>
+<td>强 SLO 在线服务</td>
+</tr>
+</tbody>
+</table>
+<p>越热越贵。warm pool
+的设计不是越多越好，而是让冷启动时间小于业务能接受的扩容反应时间。</p>
+<h3 id="scale-to-zero">Scale-to-zero</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>是否适合</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>低频内部工具模型</td>
+<td>适合</td>
+<td>首请求等待可接受，节省成本明显</td>
+</tr>
+<tr>
+<td>异步 embedding / rerank 队列</td>
+<td>视积压和 SLO 而定</td>
+<td>可用 KEDA 唤醒，但要估算积压清空时间</td>
+</tr>
+<tr>
+<td>70B 在线聊天主链路</td>
+<td>通常不适合</td>
+<td>权重和 engine 启动太慢</td>
+</tr>
+<tr>
+<td>租户专属低频模型</td>
+<td>可选 warm-to-zero</td>
+<td>可提前唤醒或保留工作时段热副本</td>
+</tr>
+<tr>
+<td>夜间批推理 endpoint</td>
+<td>适合</td>
+<td>用户不等待同步响应</td>
+</tr>
+</tbody>
+</table>
+<p>Scale-to-zero 是产品和 SLO
+决策，不是平台成熟度的证明。只要首请求不能接受几十秒到几分钟等待，就应保留最小热容量。</p>
+<h2 id="20c10-canary限流与降级">20c.10 Canary、限流与降级</h2>
+<p>Autoscaling
+只能增加容量，不能保证所有请求都值得被服务，也不能修复坏版本。生产系统必须把扩缩容和保护动作放在一起。</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>触发信号</th>
+<th>目的</th>
+<th>注意事项</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Canary 冻结</td>
+<td>新版本 TTFT/TPOT/错误率劣化</td>
+<td>防止坏版本继续放量</td>
+<td>canary 指标要独立于全量指标</td>
+</tr>
+<tr>
+<td>租户限流</td>
+<td>单租户 burst 导致全局 queue wait 上升</td>
+<td>保护多租户公平</td>
+<td>返回明确 reason 和 retry-after</td>
+</tr>
+<tr>
+<td>长短分流</td>
+<td>长 prompt 占比升高</td>
+<td>保护短请求 TTFT</td>
+<td>长池要有独立 SLO 和 quota</td>
+</tr>
+<tr>
+<td>收紧 max_tokens</td>
+<td>decode 压力过高</td>
+<td>降低长尾输出成本</td>
+<td>只对低优先级或可降级场景</td>
+</tr>
+<tr>
+<td>模型降级</td>
+<td>主模型容量不足或错误率高</td>
+<td>保持核心功能可用</td>
+<td>需要产品认可质量差异</td>
+</tr>
+<tr>
+<td>RAG 降级</td>
+<td>检索、rerank、向量库 P99 异常</td>
+<td>避免下游拖垮推理</td>
+<td>记录回答质量风险</td>
+</tr>
+<tr>
+<td>拒绝低优先级</td>
+<td>SLO burn 过快、KV 接近满</td>
+<td>避免系统雪崩</td>
+<td>明确错误码和恢复条件</td>
+</tr>
+</tbody>
+</table>
+<p>只扩容不
+admission，长请求仍会拖垮短请求。只限流不扩容，用户会看到稳定的
+429。成熟策略应该同时考虑容量动作和体验保护动作。</p>
+<h2 id="20c11-故障排除症状证据根因处理动作">20c.11
+故障排除：症状、证据、根因、处理动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>关键证据</th>
+<th>典型根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HPA 已扩容但 P99 没改善</td>
+<td>desired replicas 增加但 ready replicas 不增</td>
+<td>Pod Pending、镜像或权重冷启动</td>
+<td>拆启动时间线，启用 warm pool 或预拉</td>
+</tr>
+<tr>
+<td>Ready 副本增加但流量没分过去</td>
+<td>router endpoint、traffic split、health check</td>
+<td>新副本未入路由池或权重版本不匹配</td>
+<td>修 readiness gate 和 endpoint discovery</td>
+</tr>
+<tr>
+<td>queue wait 高但 GPU util 不高</td>
+<td>active seqs、KV、length bucket、router queue</td>
+<td>长请求阻塞、KV 满、路由倾斜</td>
+<td>长短分流、调 batch、扩正确池</td>
+</tr>
+<tr>
+<td>TTFT 差，TPOT 正常</td>
+<td>prefill tokens/s、input length、cold start</td>
+<td>长 prompt 高峰或 prefill 池不足</td>
+<td>chunked prefill、长上下文池、增加 prefill 容量</td>
+</tr>
+<tr>
+<td>TPOT 差，TTFT 正常</td>
+<td>decode tokens/s、active seqs、output length</td>
+<td>decode 并发过高或 max_tokens 太大</td>
+<td>降 <code>max_num_seqs</code>、扩 decode 容量、收紧低优先级输出</td>
+</tr>
+<tr>
+<td>KV utilization 高且 preemption 增加</td>
+<td>KV block、preemption count、OOM</td>
+<td>上下文过长、并发过高、参数错误</td>
+<td>限制上下文、分流长请求、扩副本</td>
+</tr>
+<tr>
+<td>scale-in 后马上 scale-out</td>
+<td>replica timeline、cooldown、traffic pattern</td>
+<td>缩容窗口太短，丢失热容量</td>
+<td>增大 stabilization window，保留 min replicas</td>
+</tr>
+<tr>
+<td>scale-to-zero 首请求超时</td>
+<td>cold start span、client timeout</td>
+<td>权重和 engine 启动超过用户等待</td>
+<td>禁用主链路 scale-to-zero 或异步唤醒</td>
+</tr>
+<tr>
+<td>canary 放量后全局排队</td>
+<td>per-version metrics</td>
+<td>新版本吞吐下降，被 autoscaler 误扩</td>
+<td>冻结 canary，回滚或隔离版本池</td>
+</tr>
+<tr>
+<td>GPU 利用率高但 goodput 低</td>
+<td>timeout、client cancel、good tokens/s</td>
+<td>超时后仍生成、重算、无效输出</td>
+<td>强化取消传播、保护策略、减少 preemption</td>
+</tr>
+</tbody>
+</table>
+<p>排障顺序建议：</p>
+<ol type="1">
+<li>先看请求分桶：租户、模型版本、prompt 长度、output
+长度是否变化。</li>
+<li>再看 queue wait、TTFT、TPOT，把问题定位到排队、prefill、decode 或
+streaming。</li>
+<li>再看运行时：active sequences、tokens/s、KV
+utilization、preemption、OOM。</li>
+<li>再看扩缩容时间线：desired、scheduled、ready、warmed、in-router。</li>
+<li>最后才看 kernel profiler、算子和底层性能。</li>
+</ol>
+<p>线上扩缩容事故大多不是算子问题，而是指标、冷启动、路由、admission
+和资源形状没有对齐。</p>
+<h2 id="20c12-反模式--checklist">20c.12 反模式 + Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>现象</th>
+<th>修复方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只用 CPU HPA</td>
+<td>GPU 服务排队严重，CPU 仍不高</td>
+<td>接入 queue wait、tokens/s、active sequences</td>
+</tr>
+<tr>
+<td>只看 QPS</td>
+<td>长上下文高峰被低估</td>
+<td>按 input/output tokens 分桶</td>
+</tr>
+<tr>
+<td>readiness 过早</td>
+<td>新副本刚接流量就 P99 spike</td>
+<td>readiness 包含权重、engine、warmup</td>
+</tr>
+<tr>
+<td>无 scale-in 冷却</td>
+<td>副本反复抖动，热容量被释放</td>
+<td>scale-out 和 scale-in 分开窗口</td>
+</tr>
+<tr>
+<td>所有请求同池</td>
+<td>长 prompt 拖慢短问答</td>
+<td>长短分流，按 SLO 和长度建池</td>
+</tr>
+<tr>
+<td>KV 满了还继续 admission</td>
+<td>preemption、OOM、尾延迟飙升</td>
+<td>KV 进入保护信号</td>
+</tr>
+<tr>
+<td>canary 和 autoscaling 混看</td>
+<td>坏版本吞吐下降被全局扩容掩盖</td>
+<td>版本级独立指标和冻结门禁</td>
+</tr>
+<tr>
+<td>盲目 scale-to-zero</td>
+<td>首请求超时，用户体验不可接受</td>
+<td>按业务 SLO 保留最小热副本</td>
+</tr>
+</tbody>
+</table>
+<h3 id="checklist">Checklist</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>完成标准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>指标</td>
+<td>queue wait、TTFT、TPOT、tokens/s、active sequences、KV、goodput
+都可按模型和版本分桶</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>schedule、image、weight、engine、warmup、入路由池都有 span</td>
+</tr>
+<tr>
+<td>策略</td>
+<td>scale-out、scale-in、protect、canary freeze 分开配置</td>
+</tr>
+<tr>
+<td>Readiness</td>
+<td>只有权重加载、engine 初始化、warmup 成功后才入池</td>
+</tr>
+<tr>
+<td>Warm pool</td>
+<td>明确热到哪一层，成本归属清楚</td>
+</tr>
+<tr>
+<td>降级</td>
+<td>每个降级动作有触发条件、影响范围和恢复条件</td>
+</tr>
+<tr>
+<td>审计</td>
+<td>每次扩缩容都有 reason、前后指标和操作者 / 控制器记录</td>
+</tr>
+<tr>
+<td>演练</td>
+<td>至少演练长 prompt 高峰、冷启动变慢、KV 满、坏 canary 四类场景</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20c13-worked-example70b-chat-服务的-slo-aware-扩缩容">20c.13
+Worked Example：70B Chat 服务的 SLO-aware 扩缩容</h2>
+<h3 id="背景">背景</h3>
+<p>某平台提供 70B chat 服务，部署在 H100 80GB 整卡池，tensor parallel 为
+2。业务目标：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P95 TTFT</td>
+<td>&lt; 1s</td>
+</tr>
+<tr>
+<td>P95 TPOT</td>
+<td>&lt; 80ms/token</td>
+</tr>
+<tr>
+<td>Timeout rate</td>
+<td>&lt; 0.5%</td>
+</tr>
+<tr>
+<td>工作时段</td>
+<td>09:00-23:00</td>
+</tr>
+<tr>
+<td>峰值</td>
+<td>250 QPS</td>
+</tr>
+</tbody>
+</table>
+<p>初始设计：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>设置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>min replicas</td>
+<td>4</td>
+</tr>
+<tr>
+<td>max replicas</td>
+<td>18</td>
+</tr>
+<tr>
+<td>warm pool</td>
+<td>2 个热副本，权重和 engine 已 ready，不接普通流量</td>
+</tr>
+<tr>
+<td>scale-out</td>
+<td>queue wait P95 &gt; 200ms 且 active seqs &gt; 80%，每次 +2</td>
+</tr>
+<tr>
+<td>scale-in</td>
+<td>queue wait P95 &lt; 30ms 且 active seqs &lt; 35%，持续 20 分钟，每次
+-1</td>
+</tr>
+<tr>
+<td>长上下文</td>
+<td>&gt;8K prompt 进入 long-context pool</td>
+</tr>
+<tr>
+<td>canary</td>
+<td>新版本最多 5%，独立 TTFT/TPOT 门禁</td>
+</tr>
+<tr>
+<td>降级</td>
+<td>低优先级 max_tokens 可从 4096 收紧到 1024</td>
+</tr>
+</tbody>
+</table>
+<h3 id="事故">事故</h3>
+<p>上午 10:12，告警显示：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTFT P99</td>
+<td>从 1.8s 升到 6.2s</td>
+</tr>
+<tr>
+<td>TPOT P95</td>
+<td>基本正常</td>
+</tr>
+<tr>
+<td>queue wait P95</td>
+<td>从 80ms 升到 850ms</td>
+</tr>
+<tr>
+<td>desired replicas</td>
+<td>从 6 增到 10</td>
+</tr>
+<tr>
+<td>ready replicas</td>
+<td>只从 6 增到 7</td>
+</tr>
+<tr>
+<td>long prompt 占比</td>
+<td>从 3% 升到 18%</td>
+</tr>
+</tbody>
+</table>
+<h3 id="排查">排查</h3>
+<ol type="1">
+<li>TTFT 坏、TPOT 正常，优先怀疑排队、prefill 或冷启动。</li>
+<li>desired replicas 增加但 ready replicas 增长慢，查看 cold start
+span。</li>
+<li>第 8 到第 10 个 Pod Running 但 not
+Ready，日志显示权重正在从对象存储加载。</li>
+<li>第 7 个副本虽然 Ready，但 warmup 未完成，router
+已经放入普通流量。</li>
+<li>长 prompt 占比异常升高，来自一个企业租户的文档总结任务。</li>
+</ol>
+<h3 id="根因">根因</h3>
+<p>这不是单纯副本不够，而是三个问题叠加：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>readiness 过早</td>
+<td>冷副本接流量，首批请求 TTFT spike</td>
+</tr>
+<tr>
+<td>长 prompt 未及时分流</td>
+<td>prefill 队列被长上下文占用</td>
+</tr>
+<tr>
+<td>扩容依赖远端权重加载</td>
+<td>扩容触发后 4 分钟才有真实容量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="处理">处理</h3>
+<ol type="1">
+<li>立即从路由池摘除未完成 warmup 的副本。</li>
+<li>将 &gt;8K prompt 强制切入 long-context pool，并对该租户启用 burst
+limit。</li>
+<li>从 warm pool 提升 2 个热副本进入普通池。</li>
+<li>冻结 canary，避免发布变量干扰容量事故。</li>
+<li>readiness 改为必须完成代表性 warmup 请求后才入池。</li>
+<li>scale-out 策略加入 <code>input_tokens_p95</code> 与
+<code>weight_load_seconds</code>，用于高峰前预热。</li>
+</ol>
+<h3 id="复盘结论">复盘结论</h3>
+<p>扩容动作本身没有错，但扩出来的副本不是立即可用容量。autoscaling
+的有效性取决于三个边界：高成本请求是否被准入和分流，新副本何时真正
+ready，冷启动是否小于 SLO 允许的反应时间。</p>
+<h2 id="20c14-本章小结">20c.14 本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>指标</td>
+<td>queue wait、active sequences、tokens/s、KV cache 比 CPU/QPS
+更贴近瓶颈</td>
+</tr>
+<tr>
+<td>SLO</td>
+<td>TTFT 定位排队和 prefill，TPOT 定位 decode，goodput 衡量有效容量</td>
+</tr>
+<tr>
+<td>控制</td>
+<td>HPA/KEDA 可以做执行器，复杂推理需要 custom metrics 和保护动作</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>image、weight、engine、warmup、readiness 必须进入容量模型</td>
+</tr>
+<tr>
+<td>Warm pool</td>
+<td>用成本换启动速度，要明确热到哪一层</td>
+</tr>
+<tr>
+<td>降级</td>
+<td>autoscaling 要和 admission、限流、canary、长短分流配套</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>为什么 LLM 推理 autoscaling 不应该只看 CPU 或 QPS？</li>
+<li>queue wait、active sequences、tokens/s 分别说明什么？</li>
+<li>TTFT 和 TPOT 分别对应推理链路中的哪些阶段？</li>
+<li>KV cache 利用率接近上限时，为什么不能只靠继续 admission 解决？</li>
+<li>scale-to-zero 适合哪些推理服务，不适合哪些服务？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="6" type="1">
+<li>为一个同时提供 7B、70B 和 embedding
+服务的平台设计扩缩容指标组合。</li>
+<li>HPA desired replicas 已经增加，但 P99 没有改善。列出至少 8
+个排查点，并说明证据来源。</li>
+<li>设计一个长上下文流量突增时的保护策略，至少包含
+admission、routing、scaling 和降级动作。</li>
+<li>如何判断一个扩容策略是在提高 goodput，而不是只提高 GPU
+utilization？</li>
+<li>你会如何为一个租户专属低频 13B 模型设计 scale-to-zero 与 warm pool
+策略？</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

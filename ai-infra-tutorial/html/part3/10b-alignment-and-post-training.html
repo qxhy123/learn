@@ -12,502 +12,1395 @@
 <nav class="topnav"></nav>
 <section class="hero">
 <h1>第 10b 章 · 对齐训练与后训练基础设施</h1>
-<p class="sub">从“外部偏好如何稳定变成模型参数变化”出发，把 SFT、DPO、PPO、GRPO、Reward Model、rollout、checkpoint、评测门禁和数据闭环组织成一套可复现、可恢复、可扩容的后训练系统。</p>
-<div class="chips"><span class="chip">Post-training</span><span class="chip">Alignment</span><span class="chip">RLHF / PPO</span><span class="chip">DPO / GRPO</span><span class="chip">Reward Model</span><span class="chip">Checkpoint</span><span class="chip">Eval Gate</span></div>
-<div class="note"><strong>不可化简的问题：</strong>预训练模型已经学会语言分布后，平台怎样把人类偏好、业务规则、安全边界和 judge 信号稳定地转化为模型行为变化，并保证每一次变化都可解释、可复现、可回滚？</div>
-<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+<p class="sub">把 SFT、RM、PPO、DPO、GRPO 写成多模型、多角色、多阶段的后训练系统。</p>
+<div class="chips"><span class="chip">RLHF</span><span class="chip">PPO</span><span class="chip">DPO</span><span class="chip">GRPO</span><span class="chip">Reward Model</span></div>
 </section>
-
-<section class="toc">
-<h2>本章目录</h2>
-<ol>
-<li><a class="anchor" href="#s1">第一性原理拆解：后训练闭环</a></li>
-<li><a class="anchor" href="#s2">学习目标</a></li>
-<li><a class="anchor" href="#s3">正文内容</a></li>
-<li><a class="anchor" href="#s35">Checkpoint 多模型一致性</a></li>
-<li><a class="anchor" href="#s4">本章小结</a></li>
-<li><a class="anchor" href="#s5">练习题</a></li>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</a></li><li><a class="anchor" href="#3-系统架构控制路径数据路径状态路径故障路径">3.
+系统架构：控制路径、数据路径、状态路径、故障路径</a></li><li><a class="anchor" href="#4-原理从不可化简的问题推导机制">4.
+原理：从不可化简的问题推导机制</a></li><li><a class="anchor" href="#5-框架实现从组件映射到真实-knobs">5. 框架实现：从组件映射到真实
+knobs</a></li><li><a class="anchor" href="#6-工程化落地配置版本矩阵准入preflight发布观测治理">6.
+工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</a></li><li><a class="anchor" href="#7-容量与效率吞吐匹配模型">7. 容量与效率：吞吐匹配模型</a></li><li><a class="anchor" href="#8-故障排除">8. 故障排除</a></li><li><a class="anchor" href="#9-方案设计--worked-examplellama-7b-pporlhf-pipeline">9. 方案设计
+/ Worked Example：LLaMA-7B PPO/RLHF pipeline</a></li><li><a class="anchor" href="#10-反模式">10. 反模式</a></li><li><a class="anchor" href="#11-checklistpost-training-pipeline-readiness">11.
+Checklist：post-training pipeline readiness</a></li><li><a class="anchor" href="#12-本章小结">12. 本章小结</a></li><li><a class="anchor" href="#13-练习题">13. 练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>预训练把通用能力写进参数，后训练把能力塑造成可交付行为。PPO/RLHF
+不是"换一个 loss
+的训练脚本"，而是一个同时运行推理、打分、训练、评测、checkpoint
+和发布门禁的多模型系统。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章依赖 <a
+href="10-memory-checkpointing-and-recovery.html">第10章</a> 的
+checkpoint 与恢复协议，也和 <a
+href="10c-finetuning-and-multi-adapter.html">第10c章</a> 的微调平台、<a
+href="../part5/14-online-inference-architecture.html">第14章</a>
+的推理服务强相关。后训练经常把训练资源和推理资源绑在同一条关键路径上。</p>
+</blockquote>
+<hr />
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="11-不可化简的问题">1.1 不可化简的问题</h3>
+<p>LLM post-training 的不可化简问题是：<strong>base model 已经学到了
+token
+分布，但产品需要的是符合指令、偏好、安全策略、工具协议和发布门禁的行为；平台必须把这些外部偏好稳定、可复现、可恢复地转成参数更新。</strong></p>
+<p>这个问题不能只靠一个训练 loop
+解决，因为偏好信号不在原始语料里。它来自示范数据、chosen/rejected
+偏好对、Reward Model、规则 reward、LLM
+judge、红队集、人工验收和线上策略。于是后训练系统天然包含三条路径：</p>
+<ul>
+<li><strong>生成路径</strong>：actor/policy 对 prompt 生成
+response，形成 rollout 样本。</li>
+<li><strong>反馈路径</strong>：reference 计算 KL 锚点，reward model
+或规则系统打分，critic 或组内 baseline 估计 advantage。</li>
+<li><strong>更新路径</strong>：training engine 消费带 reward
+的样本，更新 actor，必要时更新 critic，并把新权重同步回 rollout
+engine。</li>
+</ul>
+<p>pretraining 和 SFT 的系统中心是高吞吐训练 step；RLHF/PPO
+的系统中心是闭环控制。闭环里任何一个版本漂移，都会让结果变得不可解释：actor
+checkpoint 是 A，reference artifact 是 B，reward model prompt template
+是 C，rollout buffer 却来自旧
+actor，这种作业通常还能继续跑，但曲线、评测和发布结论都不可信。</p>
+<h3 id="12-学习大纲">1.2 学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>pretraining、SFT、RM、PPO、DPO、GRPO
+分别是什么系统形态，而不只是算法名。</li>
+<li>PPO/RLHF 中 actor、reference、reward、critic、rollout
+engine、training engine、sample generation、reward
+scoring、replay/buffer 的责任边界。</li>
+<li>rollout 生成吞吐、reward scoring
+吞吐和训练消费吞吐如何匹配，哪个环节会让 GPU 闲置。</li>
+<li>actor/ref/reward/critic 如何切分
+GPU，什么时候共置，什么时候训推分离。</li>
+<li>多模型 checkpoint 为什么必须用 manifest
+保证一致性，而不是保存几个目录。</li>
+<li>DPO/GRPO 为什么更容易平台化，又各自把复杂度转移到哪里。</li>
+<li>一个 LLaMA-7B PPO/RLHF 作业如何配置 GPU
+布局、容量模型、评测门禁和故障恢复。</li>
 </ol>
-</section>
-
-<section class="section" id="s1">
-<h2>1. 第一性原理拆解：对齐训练与后训练基础设施</h2>
-<h3>拆 — 不可化简的问题</h3>
-<p>剥掉 PPO、DPO、GRPO、RLHF、Reward Model 这些名字，本章真正要解决的不可化简问题是：一个预训练模型已经学会了语言分布，但它还不知道在具体产品场景里什么回答更应该被偏好、什么边界必须遵守、什么行为虽然概率高却不能交付；平台必须把这些外部偏好稳定地转化为模型参数变化，并且保证这个转化过程可复现、可评测、可恢复、可扩容。预训练只要求模型继续压低 token prediction loss，目标函数来自语料本身；后训练的目标函数却来自人、规则、judge、业务策略和安全约束。它们不是自然存在于语料里的单一数值，而是一组会漂移、会冲突、会被模型利用漏洞的外部信号。</p>
-<p>这就带来一个基础设施层面的本质差异：pretraining 的系统中心是一个连续训练 loop，alignment 的系统中心是一个闭环控制系统。这个闭环里至少有四类状态同时存在：policy model 负责生成候选行为，reference model 负责约束它不要离原始能力太远，reward model 或规则系统负责把行为映射成偏好信号，critic/value 或组内 baseline 负责把稀疏反馈变成可更新的梯度。每一类状态都可能有独立版本、独立显存峰值、独立吞吐瓶颈和独立失败模式。</p>
-<p>工程上最容易犯的错误，是把对齐训练想象成“换一个 loss 的 SFT”。如果这样做，rollout 阶段会把训练卡闲置，RM 打分会拖慢 step，reference 版本漂移会让 KL 曲线不可解释，checkpoint 恢复后 policy、critic、rollout buffer 不一致会让训练继续跑但结论失真。因此，本章不是算法排行榜，而是后训练基础设施的建模课。你要学会把“模型怎样更符合偏好”拆成数据、推理、训练、评测、checkpoint、服务化部署六个互相约束的问题：数据决定偏好信号是否可信，推理决定 rollout 是否跟得上训练，训练决定参数如何更新，评测决定更新是否真的改善行为，checkpoint 决定失败后能否回到同一组状态，部署选型决定 RM/ref/rollout 是共置还是独立服务。只要其中一个环节没有版本化和可观测性，对齐结果就很难解释。</p>
-<h3>推 — 从这个问题如何推导出每个机制</h3>
-<p>从“外部偏好如何变成参数变化”出发，可以自然推导出本章每个机制。第一步是 SFT：如果我们有高质量示范回答，就先用监督学习把 base model 拉到可指令跟随的区域，这降低后续偏好优化的探索成本。第二步是偏好数据：单个标准答案不足以表达“更好”，所以需要同一 prompt 下的 chosen/rejected、打分、critique 或规则验证结果。第三步是 DPO：如果偏好对已经离线存在，那么最省系统复杂度的做法，是直接比较 policy 对 chosen/rejected 的 logprob，并用 reference model 作为锚点；这解释了为什么 DPO 像 SFT，却必须严守 tokenizer、chat template、截断策略和 reference 版本一致性。</p>
-<p>如果偏好信号必须来自当前 policy 生成的新样本，就推导到 PPO/GRPO。PPO 需要 rollout，因为模型需要在线试错；需要 Reward Model，因为人类不可能在训练内环实时打分；需要 reference model，因为只追 reward 会导致模型跑偏；需要 critic/value model，因为单条 response 的 reward 太稀疏，需要估计 advantage 来稳定更新。于是 PPO 必然变成多模型协调系统，而不是单模型训练脚本。GRPO 则从 critic 的成本继续推导：如果同一 prompt 可以生成一组 response，并且 reward 能在组内比较，那么组均值可以充当 baseline，critic 就可以被移除；代价是 rollout 样本数上升，推理引擎吞吐变得更关键。</p>
-<p>再往下推，就是 RM 部署、显存账本和 checkpoint 一致性。RM 如果写在训练脚本里，任何超时都会阻塞策略更新；如果服务化，就必须有批处理、版本路由、限流、重试和指标。PPO 显存账本必须列出 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer，因为这些组件虽然不一定同时峰值，却会在阶段切换、权重同步、checkpoint 保存时形成短暂 OOM。checkpoint 也不能只保存 policy 权重，而要把 policy、critic、reference artifact、RM artifact、rollout buffer、KL controller、rng、数据游标写进同一份 manifest；否则恢复出来的是一组目录，而不是同一个训练状态。最后，评测必须进入训练内环，因为 loss 或 reward 上升不代表行为改善，win-rate、长度分布、安全拒答、格式遵循和 judge 版本才决定一个 checkpoint 是否值得继续训练或进入发布门禁。</p>
-<h3>绘 — 因果链路</h3>
-<pre class="mermaid">mindmap
-  root((对齐训练与后训练基础设施))
-    不可化简问题
-      外部偏好如何变成参数变化
-      行为约束如何稳定复现
-      多模型状态如何保持一致
-    数据与目标
-      SFT示范数据
-      chosen_rejected偏好对
-      规则奖励与LLM_judge
-      安全与工具使用样本
-    机制推导
-      DPO
-        离线偏好优化
-        policy加reference
-        数据质量与模板一致性
-      PPO
-        在线rollout
-        Reward_Model打分
-        Reference_KL约束
-        Critic_Value估计
-      GRPO
-        组内相对奖励
-        去掉critic
-        更高rollout吞吐
-    基础设施压力
-      显存账本
-        policy_ref_reward_value
-        optimizer_activation
-        KV_Cache_rollout_buffer
-      RM服务化
-        批处理
-        版本路由
-        断路器
-      Checkpoint事务
-        manifest
-        多模型hash
-        KL_controller
-        rng和数据游标</pre>
-<h3>导 — 读完本章你应该能回答</h3>
-<ol>
-<li>为什么 post-training 不是“预训练后再训一下”，而是一条包含数据、训练、推理、评测和发布门禁的闭环管线？</li>
-<li>为什么 alignment training 不能等同于 RLHF，SFT、DPO、GRPO、PPO 分别解决偏好塑形里的哪一层问题？</li>
-<li>给定 LLaMA-7B 和 8×H100 80GB，怎样把 PPO 的 policy、reference、reward、value/critic、optimizer、activation、KV Cache 或 rollout buffer 分项列成显存账本？</li>
-<li>为什么 DPO 更容易平台化，但仍然需要严格保证 reference model、tokenizer、chat template、数据版本和评测口径一致？</li>
-<li>什么情况下应该把 Reward Model 和训练节点共置，什么情况下应该把 RM 做成独立推理服务或共享推理池？</li>
-<li>GRPO 去掉 critic 后省掉了哪些状态，又为什么会把压力转移到大 batch rollout 和 reward 可靠性上？</li>
-<li>一个可恢复的 PPO checkpoint manifest 至少要记录哪些模型、控制器、随机数、数据游标和评测版本？</li>
-</ol>
-</section>
-
-<section class="section" id="s2">
-<h2>2. 学习目标</h2>
-<p>完成本章学习后，你将能够区分 pretraining、post-training、alignment training 三者的关系；理解 SFT、偏好优化、安全/工具使用整形、评测门禁这些后训练阶段；看懂 PPO / RLHF 里的多模型协调关系；区分 PPO、DPO、GRPO 在资源形态上的差异；识别 RLHF 系统里的典型性能瓶颈；设计更适合后训练的实验管理与 checkpoint 策略；并为不同规模的团队选择合适的对齐路线。</p>
-<div class="warn"><strong>边界提醒：</strong>本章关注基础设施形态，不把 PPO、DPO、GRPO 当成算法优劣排行榜。平台设计的核心是让数据、训练、推理、评测和恢复闭环稳定，而不是追逐单个 loss 名字。</div>
-</section>
-
-<section class="section" id="s3">
-<h2>3. 正文内容</h2>
-<h3>10b.1 先分清 Pretraining、Post-Training 与 Alignment Training</h3>
-<p>很多人第一次接触这一块时，最容易把三个词混成一个。Pretraining 是让模型在大规模通用数据上学会语言、代码或多模态分布；Post-training 是在 base model 预训练完成之后，用更贴近产品目标的数据和目标函数继续塑形；Alignment training 是 post-training 里的一个重要子集，重点让模型行为更接近人类、系统或产品希望它遵守的偏好与约束。</p>
-<pre><code>pretraining
-  └── post-training
-        ├── instruction tuning / SFT
-        ├── alignment training  (DPO / PPO / GRPO / RLAIF / Constitutional AI ...)
-        ├── tool-use / agent tuning
-        ├── safety / refusal shaping
-        └── domain adaptation / distillation</code></pre>
+<hr />
+<h2 id="2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</h2>
+<h3 id="21-是什么">2.1 是什么</h3>
+<p><strong>Post-training</strong> 是 base model
+预训练完成后的继续塑形过程，目标是让模型在指令、格式、偏好、安全、工具使用、领域任务上更可交付。它包含
+SFT、偏好优化、安全补丁、工具轨迹训练、领域蒸馏、评测门禁和发布候选产物管理。</p>
+<p><strong>Alignment training</strong> 是 post-training
+的子集，重点把外部偏好和约束写入模型行为。PPO/RLHF、DPO、GRPO、RLAIF、Constitutional
+AI 都属于这个范围，但 SFT 也常承担一部分对齐作用。</p>
+<p><strong>RLHF/PPO 平台</strong>
+是一个多模型、多阶段、训推混合系统。它至少要调度
+actor/policy、reference、Reward Model、critic/value、rollout
+engine、training engine、sample buffer、eval gate 和 checkpoint
+manager。</p>
+<h3 id="22-不是什么">2.2 不是什么</h3>
+<p>它不是：</p>
+<ul>
+<li>不是 pretraining 的小号版本。pretraining 主要优化 next-token
+loss，post-training 的目标来自外部偏好和发布策略。</li>
+<li>不是单纯的 SFT。SFT 消费示范答案；PPO/GRPO 还要在线 sample
+generation、reward scoring、KL 约束和 buffer 管理。</li>
+<li>不是只看 reward 越高越好。reward 上升可能是 reward
+hacking，必须同时看
+win-rate、KL、长度分布、安全拒答、格式遵循和人工抽检。</li>
+<li>不是训练脚本内部的一个函数。Reward Model
+在平台里是推理服务，reference 是版本锚点，rollout engine
+是吞吐瓶颈，eval gate 是发布门禁。</li>
+</ul>
+<h3 id="23-相邻概念边界">2.3 相邻概念边界</h3>
 <table>
-<tr><th>维度</th><th>Pretraining</th><th>Post-training</th><th>Alignment training</th></tr>
-<tr><td>核心问题</td><td>模型会什么</td><td>模型怎样更可用</td><td>模型怎样更符合偏好和约束</td></tr>
-<tr><td>常见数据</td><td>海量通用语料、代码、多模态数据</td><td>指令样本、偏好对、工具轨迹、安全样本</td><td>偏好数据、规则反馈、拒答 / 安全数据</td></tr>
-<tr><td>常见目标</td><td>学表示、学通用能力</td><td>提升任务可用性与产品形态</td><td>提升 helpfulness、truthfulness、harmlessness、风格一致性</td></tr>
-<tr><td>资源特征</td><td>大吞吐、长作业、强通信</td><td>数据更小但 loop 更多</td><td>训练 + 推理 + 评测更强耦合</td></tr>
+<thead>
+<tr>
+<th>形态</th>
+<th>系统中心</th>
+<th>模型数量</th>
+<th>数据来源</th>
+<th>主要瓶颈</th>
+<th>典型 checkpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pretraining</td>
+<td>连续训练 step</td>
+<td>1 个主模型</td>
+<td>海量语料 token</td>
+<td>计算、通信、数据读取</td>
+<td>model、optimizer、scheduler、RNG、dataset cursor</td>
+</tr>
+<tr>
+<td>SFT</td>
+<td>离线监督训练</td>
+<td>1 个主模型</td>
+<td>prompt-response 示范</td>
+<td>数据质量、显存、吞吐</td>
+<td>SFT model + tokenizer/chat template/data version</td>
+</tr>
+<tr>
+<td>RM 训练</td>
+<td>pairwise/ranking 训练</td>
+<td>1 个 reward model</td>
+<td>chosen/rejected、score、critique</td>
+<td>标注噪声、长度偏差</td>
+<td>reward model + reward head + label schema</td>
+</tr>
+<tr>
+<td>DPO</td>
+<td>离线偏好优化</td>
+<td>policy + reference</td>
+<td>chosen/rejected</td>
+<td>reference 一致性、beta、数据噪声</td>
+<td>policy + frozen reference artifact hash</td>
+</tr>
+<tr>
+<td>PPO/RLHF</td>
+<td>在线 rollout + RL update</td>
+<td>actor + reference + reward + critic</td>
+<td>policy 生成样本 + RM 分数</td>
+<td>rollout、RM 延迟、critic 稳定性、KL</td>
+<td>多模型 manifest + buffer + controller state</td>
+</tr>
+<tr>
+<td>GRPO</td>
+<td>在线 group rollout + relative update</td>
+<td>actor + reference + reward/rule</td>
+<td>同 prompt 多 response</td>
+<td>rollout 大 batch、reward 方差</td>
+<td>actor + reference hash + group sample state</td>
+</tr>
+</tbody>
 </table>
-<div class="note"><strong>实用判断：</strong>pretraining 更像“把能力写进参数”，post-training 更像“把能力组织成可交付行为”，alignment training 则是在其中明确约束“应该怎样做、不应该怎样做”。</div>
-
-<h3>10b.2 一个典型的后训练 Pipeline 长什么样</h3>
-<p>后训练不是一个单一算法名，更像一条工艺链。一次完整的模型发布，往往是 1 次 SFT + 3 到 5 次偏好优化 + 多轮 safety 补丁 + 十几次评测。</p>
-<pre class="mermaid">flowchart TD
-  A[base pretrained model] --> B[SFT / instruction tuning]
-  B --> C[preference data construction]
-  C --> D[preference optimization: DPO / PPO / GRPO / RLAIF]
-  D --> E[safety / refusal / tool-use shaping]
-  E --> F[eval / red-team / release gate]
-  F --> G[release candidate]
-  F -->|失败样本回流| C</pre>
-<table>
-<tr><th>阶段</th><th>常见输入</th><th>主要目标</th><th>更像哪类基础设施</th></tr>
-<tr><td>SFT / instruction tuning</td><td>prompt-response 演示数据</td><td>先学会按指令回答、输出格式更稳定</td><td>离线训练 job</td></tr>
-<tr><td>偏好数据构建</td><td>chosen / rejected、打分、critique、AI feedback</td><td>给“什么更好”提供监督信号</td><td>数据平台 + 标注 / judge 流水线</td></tr>
-<tr><td>偏好优化</td><td>DPO、PPO、GRPO 等训练流程</td><td>让模型行为向偏好分布靠近</td><td>训练 + 推理混合系统</td></tr>
-<tr><td>安全 / 工具使用整形</td><td>refusal 样本、工具轨迹、策略规则</td><td>让模型学会边界、调用方式和失败处理</td><td>训练 + 策略控制面</td></tr>
-<tr><td>评测与放行</td><td>benchmark、红队数据、人工 / LLM judge</td><td>判断版本是否可上线</td><td>评测平台 + 发布门禁</td></tr>
-</table>
-<p>Llama 3 等公开案例说明，生产级 post-training 不是“选一个最火算法”的问题，而是多阶段工艺组合的问题。平台要能跑多种不同形态的训练 job，在同一个实验框架下对比；数据平台要支持模型生成、模型打分、人工校验的半自动流水线；评测系统要能在 checkpoint 粒度自动触发，而不是等训练完才评。</p>
-<table>
-<tr><th>训练形态</th><th>7B 模型代价</th><th>70B 模型代价</th><th>数据准备成本</th></tr>
-<tr><td>SFT（单卡 / 小集群）</td><td>$50 - $500</td><td>$500 - $5K</td><td>示范数据标注 $5K - $50K</td></tr>
-<tr><td>DPO</td><td>$200 - $500</td><td>$2K - $5K</td><td>偏好对标注 $10K - $100K</td></tr>
-<tr><td>PPO（全量 RLHF）</td><td>$2K - $5K</td><td>$20K - $50K</td><td>偏好 + RM 数据 $50K - $500K</td></tr>
-<tr><td>GRPO（规则奖励）</td><td>$1K - $5K</td><td>$10K - $30K</td><td>可低至 $0（规则生成）</td></tr>
-</table>
-<div class="success"><strong>产品价值判断：</strong>post-training 通常只占整个训练预算的一小部分，但它对最终产品体验的影响很大；它虽然相对便宜，但单位算力的产品价值很高。</div>
-
-<h3>10b.3 为什么对齐训练是一个独立的基础设施问题</h3>
-<p>Pretraining 的主路径通常是一个模型、持续前向 / 反向 / 更新，关注吞吐、扩展效率和 checkpoint。对齐训练经常同时包含生成 rollout、计算偏好或 reward、做策略更新、维护多个模型状态。平台面对的不再是“一个训练 job”，而是“推理子系统 + 训练子系统 + 评测回路”的组合。</p>
-<table>
-<tr><th>维度</th><th>Pretraining / SFT</th><th>对齐训练</th></tr>
-<tr><td>模型数量</td><td>通常 1 个主模型</td><td>2-4 个模型并存</td></tr>
-<tr><td>主资源形态</td><td>连续训练</td><td>推理与训练交替</td></tr>
-<tr><td>关键瓶颈</td><td>吞吐、通信、显存</td><td>显存峰值、rollout 吞吐、实验稳定性</td></tr>
-<tr><td>通信模式</td><td>主要是 gradient all-reduce</td><td>还要 policy → rollout engine 同步权重</td></tr>
-<tr><td>失败模式</td><td>OOM、通信挂</td><td>以上全部 + reward hacking、KL 发散</td></tr>
-<tr><td>checkpoint</td><td>主要保存模型与优化器</td><td>还要保存 policy / critic / 偏好训练状态</td></tr>
-</table>
-<pre class="mermaid">sequenceDiagram
-  participant O as Orchestrator
-  participant P as Policy Rollout Engine
-  participant R as Reward Model
-  participant Ref as Reference Model
-  participant T as Trainer
-  participant C as Checkpoint Store
-  O->>P: sync latest policy weights
-  P->>P: generate responses with KV Cache
-  P->>R: score prompt+response batch
-  P->>Ref: compute reference logprob / KL baseline
-  R-->>O: rewards
-  Ref-->>O: ref logprobs
-  O->>T: assemble rollout batch
-  T->>T: PPO / GRPO update
-  T->>C: write multi-model checkpoint manifest</pre>
-<div class="warn"><strong>效率黑洞：</strong>RLHF 训练时间中常有大量时间花在 sample generation / rollout 上。把 rollout 提速，通常比只优化反向传播更能改善总 step time。</div>
-
-<h3>10b.4 RLHF / PPO 的基础设施形态</h3>
-<p>如果采用经典 RLHF 路线，一个常见顺序是 SFT model → preference collection → reward model training → PPO against reward + KL to reference model。一次 PPO 训练循环大致可以拆成 <code>t_step ≈ t_rollout + t_ref + t_reward + t_update + t_checkpoint</code>。其中前半段更像推理，后半段才是训练。</p>
-<table>
-<tr><th>模型</th><th>是否训练</th><th>在做什么</th><th>主要资源压力</th><th>可否替换</th></tr>
-<tr><td>Policy model</td><td>是</td><td>生成 response、参与 PPO 更新</td><td>参数、梯度、优化器、KV Cache</td><td>核心，不可替换</td></tr>
-<tr><td>Reference model</td><td>否</td><td>提供 KL 约束基线</td><td>只读权重、前向显存</td><td>可与 policy 共享权重（LoRA 场景）</td></tr>
-<tr><td>Reward model</td><td>否</td><td>给 rollout 打分</td><td>高频推理吞吐</td><td>可替换为规则 / judge LLM</td></tr>
-<tr><td>Critic / Value model</td><td>是</td><td>估计 value，参与更新</td><td>参数、梯度、优化器</td><td>GRPO 中被组内相对奖励替代</td></tr>
-</table>
-<p>PPO 必须单独做显存预算，因为它不是“一个 7B 模型训练”，而是同一轮里要同时管理 policy、reference、reward、critic 和 rollout KV Cache。以 LLaMA-7B 级 policy、bf16 权重、Adam 全量训练、8×H100 80GB 单节点为例：7B bf16 权重约 14GB；全量 Adam 训练通常按“参数 + 梯度 + optimizer state”约 12 bytes/param 估算，即单个可训练 7B 模型约 84GB，不含激活、通信 bucket 和碎片。</p>
-<table>
-<tr><th>组件</th><th>单模型/阶段估算</th><th>是否常驻</th><th>8×H100 上的工程含义</th></tr>
-<tr><td>Policy 参数 + 梯度 + optimizer</td><td>~84GB</td><td>update 阶段常驻</td><td>可用 ZeRO/FSDP 切到 8 卡，但还要加激活和通信缓冲</td></tr>
-<tr><td>Reference model bf16 权重</td><td>~14GB</td><td>通常常驻或可重载</td><td>只前向，用于 KL；运行时仍要有可访问权重</td></tr>
-<tr><td>Reward model bf16 权重</td><td>~14GB</td><td>rollout 后打分阶段常驻或远端服务</td><td>共置吃训练节点显存；独立部署吃网络和服务治理</td></tr>
-<tr><td>Critic 参数 + 梯度 + optimizer</td><td>~84GB</td><td>update 阶段常驻</td><td>PPO 的第二个可训练模型，是 GRPO 最主要省掉的部分</td></tr>
-<tr><td>Policy/critic 训练激活</td><td>~20-80GB</td><td>update 阶段峰值</td><td>取决于 micro-batch、seq len、checkpointing</td></tr>
-<tr><td>Rollout KV Cache</td><td>~10-60GB</td><td>rollout 阶段峰值</td><td>与并发序列数、层数、hidden size、生成长度线性相关</td></tr>
-<tr><td>通信 / allocator / runtime buffer</td><td>~20-50GB</td><td>阶段切换时明显</td><td>NCCL、FSDP/ZeRO、CUDA graph、推理引擎预分配都会吃余量</td></tr>
-</table>
-<table>
-<tr><th>方案</th><th>显存利用率</th><th>扩展性</th><th>实现复杂度</th><th>推荐场景</th></tr>
-<tr><td>同机共置</td><td>低（峰值挤）</td><td>差</td><td>低</td><td>单实验原型</td></tr>
-<tr><td>训推分离</td><td>中</td><td>好</td><td>中</td><td>生产 PPO 平台</td></tr>
-<tr><td>Hybrid Engine</td><td>高</td><td>好</td><td>高</td><td>追求极致效率的团队</td></tr>
-</table>
-<table>
-<tr><th>故障模式</th><th>现象</th><th>根因</th><th>平台应提供</th></tr>
-<tr><td>Reward hacking</td><td>reward 飙升但人眼看质量下降</td><td>RM 有漏洞，模型学到“刷分姿势”</td><td>在线 win-rate、多样本抽检</td></tr>
-<tr><td>KL 发散</td><td>KL 越训越大，模型跑偏</td><td>KL 系数太小或 reward 太强</td><td>KL 实时监控、自动回滚</td></tr>
-<tr><td>Loss 震荡</td><td>训练曲线剧烈抖动</td><td>learning rate 大、batch 小</td><td>自动早停、ckpt 对比</td></tr>
-<tr><td>输出退化</td><td>长度崩塌、重复、空输出</td><td>advantage 估计不稳、reward 畸形</td><td>rollout 样本抽样展示</td></tr>
-<tr><td>Critic 学不动</td><td>value loss 长期不降</td><td>value function 难估</td><td>考虑切 GRPO</td></tr>
-</table>
-<div class="danger"><strong>严重风险：</strong>8×H100 总显存够，不代表可以把四个模型无脑共置。PPO 的 OOM 常发生在 rollout、update、checkpoint、权重同步这些阶段切换的几秒钟峰值里。</div>
-
-<h3>10b.5 DPO / GRPO 等方法为什么更容易平台化</h3>
-<p>PPO 是训推混合系统，DPO 更像离线训练，GRPO 介于两者之间。选错方法的代价不只是效果差，还包括错误采购 GPU、错误建设 RM 服务、错误设计 checkpoint 格式。基础设施团队的目标不是证明某个算法先进，而是在当前数据、算力和评测成熟度下，选一条能稳定迭代的路线。</p>
-<table>
-<tr><th>方法</th><th>在线 rollout</th><th>需 reward model 打分</th><th>需 critic</th><th>需 reference</th><th>基础设施复杂度</th></tr>
-<tr><td>PPO / RLHF</td><td>需要</td><td>通常需要</td><td>需要</td><td>需要</td><td>★★★★★</td></tr>
-<tr><td>GRPO</td><td>需要</td><td>可由规则或组内相对奖励替代</td><td>不需要</td><td>需要</td><td>★★★</td></tr>
-<tr><td>RLOO / REINFORCE++</td><td>需要</td><td>需要</td><td>不需要</td><td>需要</td><td>★★★</td></tr>
-<tr><td>DPO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>需要</td><td>★★</td></tr>
-<tr><td>ORPO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>不需要</td><td>★</td></tr>
-<tr><td>KTO</td><td>不需要</td><td>不需要</td><td>不需要</td><td>需要</td><td>★★</td></tr>
-</table>
-<h4>DPO：偏好优化的离线化</h4>
-<p>DPO 把“在线试错”变成“离线监督”，直接消费已经准备好的偏好对，把 chosen 和 rejected 的相对概率拉开。对基础设施团队来说，这意味着少了 rollout 服务、RM 在线打分、critic checkpoint、权重同步这几类最容易出故障的环节。</p>
-<pre><code>{
-  "prompt": "...",
-  "chosen": "...",
-  "rejected": "...",
-  "metadata": {
-    "source": "human|llm_judge|rule",
-    "judge_model": "optional",
-    "quality_score": 0.93
-  }
-}</code></pre>
-<p>DPO 的训练器像 SFT，但数据校验和评测要求更接近对齐训练。工程上要保证 policy 和 reference 使用同一 tokenizer、同一截断策略、同一 chat template；训练日志里除了 loss，还要看 chosen/rejected reward margin、隐式 KL、长度分布和 win-rate。</p>
-<h4>GRPO：砍掉 critic 的 PPO</h4>
-<p>GRPO 的核心观察是：如果同一个 prompt 采样一组 response，并且 reward 可以在组内比较，那么组均值可以充当 baseline，不必额外训练一个 critic。这会省掉一份模型权重、梯度、optimizer、checkpoint 和 value loss 监控，但会把压力转移到大 batch rollout 和 reward 可靠性上。</p>
-<table>
-<tr><th>维度</th><th>PPO</th><th>GRPO</th><th>差异</th></tr>
-<tr><td>Critic 模型</td><td>需要（和 policy 同大小）</td><td>不需要</td><td>显存明显下降</td></tr>
-<tr><td>Critic 优化器</td><td>需要</td><td>不需要</td><td>checkpoint 和恢复更简单</td></tr>
-<tr><td>每 prompt 采样数</td><td>1-4</td><td>16-64</td><td>rollout 开销上升</td></tr>
-<tr><td>典型适用任务</td><td>软偏好、helpfulness、写作质量</td><td>数学、代码、结构化答案</td><td>取决于 reward 是否可验证</td></tr>
-</table>
-<pre class="mermaid">flowchart TD
-  A{你有什么数据?}
-  A -->|只有示范数据| B[SFT]
-  A -->|有 chosen/rejected 偏好对| C{数据量与平台成熟度}
-  C -->|想快速落地| D[DPO]
-  C -->|只有单点好坏反馈| E[KTO / ORPO]
-  A -->|有可验证 reward| F[GRPO / DAPO]
-  A -->|有学习型 RM + 大算力| G[PPO]
-  D --> H[先闭合数据-训练-评测]
-  F --> I[投资 rollout 引擎]
-  G --> J[建设训推调度和多模型 checkpoint]</pre>
-<div class="success"><strong>实战路径：</strong>即便最终想上 PPO，也应该先用 DPO 跑通整条数据-训练-评测链路。DPO 花的成本更低，却能暴露数据 schema、评测指标、实验管理、checkpoint 流程中的大部分工程问题。</div>
-
-<h3>10b.6 Reward Model 本质上是推理子系统</h3>
-<p>Reward Model 经常被算法论文写成一个函数 <code>reward(x, y)</code>，但在平台里它是一个会排队、会超时、会吃显存、会产生版本漂移的在线推理服务。只要 PPO 训练内环依赖 RM 分数，RM 的吞吐和稳定性就会直接决定训练 step time；RM 的版本和 prompt template 也会直接决定 reward 曲线是否可比较。</p>
-<table>
-<tr><th>维度</th><th>线上推理服务</th><th>RM 打分服务</th></tr>
-<tr><td>请求模式</td><td>长时间稀疏到达</td><td>训练步内集中突发</td></tr>
-<tr><td>首 token 延迟</td><td>关键</td><td>不关心（不生成）</td></tr>
-<tr><td>吞吐</td><td>重要</td><td>决定训练 step 时长</td></tr>
-<tr><td>可用性</td><td>5 个 9</td><td>训练期可用即可</td></tr>
-<tr><td>失败处理</td><td>必须降级</td><td>可重试甚至丢弃样本</td></tr>
-</table>
-<table>
-<tr><th>部署方式</th><th>决策条件</th><th>优点</th><th>代价</th><th>更适合什么场景</th></tr>
-<tr><td>和训练节点共置</td><td>RM 较小、训练节点峰值后仍有 20%-30% 显存余量、rollout batch 不大</td><td>路径短，少一次网络跳转</td><td>抢显存，故障耦合</td><td>小规模实验、LoRA PPO、单节点验证</td></tr>
-<tr><td>独立 RM 服务</td><td>RM 较大、多个作业共享、训练节点显存紧</td><td>训练显存更稳，便于扩容</td><td>多一跳网络与服务治理</td><td>稳定 PPO 平台、多个实验并行</td></tr>
-<tr><td>共享推理池部署</td><td>RM 和 judge/ref 共用 vLLM/SGLang 池</td><td>GPU 利用率高，可按队列调度</td><td>多租户隔离复杂，队列延迟波动</td><td>中大型平台</td></tr>
-<tr><td>批量异步打分</td><td>rollout batch 很大，step 可容忍 buffer 延迟</td><td>吞吐高，成本更好控</td><td>step 延迟更难预测</td><td>大批量 rollout、离线 RLAIF</td></tr>
-</table>
-<p>一个简单规则是：如果 RM 权重 + peak KV Cache + update 激活之后，训练节点剩余显存低于 20%，就不要共置；如果 RM 的目标吞吐超过单训练节点本地推理能力，或者多个 PPO 作业会复用同一个 RM，也应独立部署。</p>
-<table>
-<tr><th>打分模式</th><th>工作方式</th><th>优点</th><th>风险</th><th>适合场景</th></tr>
-<tr><td>全量打分</td><td>rollout 一整批生成完后，一次性提交给 RM</td><td>实现简单，batch 大，GPU 吞吐高</td><td>step 尾延迟由最慢样本决定；队列突发明显</td><td>小中批量 PPO、同步训练 loop</td></tr>
-<tr><td>流式打分</td><td>每个 response 或小 micro-batch 生成完就提交 RM</td><td>隐藏 RM 延迟，减少训练等待</td><td>orchestration 更复杂；需要样本 id、幂等写入、乱序聚合</td><td>大 rollout、长 response、训推分离平台</td></tr>
-</table>
-
-<h3>10b.7 实验管理的额外复杂度</h3>
-<p>对齐训练的难点通常不止算力，更在于可解释性更差、变量更多。同样的训练脚本跑两次，结果都可能有几个百分点的差异。平台必须把“训练健康”和“行为健康”同时监控，否则等到人工评测才发现问题时，已经浪费了大量 rollout 和 GPU 时间。</p>
-<table>
-<tr><th>复杂度来源</th><th>为什么麻烦</th><th>平台应提供什么</th></tr>
-<tr><td>超参更多</td><td>KL 系数、rollout 长度、mini-batch、reward scaling、group size 都会影响稳定性</td><td>结构化实验配置与追踪</td></tr>
-<tr><td>训练更不稳</td><td>reward hacking、KL 发散、loss 震荡更常见</td><td>更密的指标采集和早停规则</td></tr>
-<tr><td>状态更多</td><td>policy、critic、optimizer、sampler 状态都要保存</td><td>更完整的 checkpoint 模板</td></tr>
-<tr><td>数据链更长</td><td>演示数据、偏好对、judge 结果、红队样本都要版本化</td><td>数据 lineage 与标注元数据管理</td></tr>
-<tr><td>评测更复杂</td><td>不能只看 loss，还要看偏好评测和人工 / LLM judge</td><td>离线评测流水线</td></tr>
-</table>
-<div class="grid-2">
-<div class="card"><strong>训练侧指标</strong><br>policy loss、value loss、KL divergence、reward 均值/方差/直方图、advantage 分布、gradient norm、learning rate。</div>
-<div class="card"><strong>Rollout 侧指标</strong><br>响应长度分布、tokens/sec、停止原因分布、重复率、n-gram 多样性。</div>
-<div class="card"><strong>评测侧指标</strong><br>win-rate vs reference、能力基准、安全评测通过率、格式遵循率。</div>
-<div class="card"><strong>系统侧指标</strong><br>GPU 利用率、各阶段耗时占比、checkpoint 保存时长、失败重试次数。</div>
-</div>
-<h4>Checkpoint 比预训练更复杂</h4>
-<p>PPO checkpoint 应该被当作“多模型事务”。恢复对象不再是一个模型，而是一组必须版本一致的状态机。如果 policy 回到 step 12000，但 critic 是 step 11800，rollout buffer 来自旧 policy，KL controller 又重置了，训练曲线可能立刻漂移，甚至 reward/KL 指标都无法解释。</p>
+<p>一个实用判断：如果你的训练过程不需要当前 policy 生成新
+response，它大概率是 SFT/DPO 类离线训练；如果需要当前 policy
+生成并被打分，它就是 RL 系统，必须按推理和训练混合平台设计。</p>
+<hr />
+<h2 id="3-系统架构控制路径数据路径状态路径故障路径">3.
+系统架构：控制路径、数据路径、状态路径、故障路径</h2>
+<h3 id="31-rlhfppo-控制和数据路径">3.1 RLHF/PPO 控制和数据路径</h3>
 <pre class="mermaid">flowchart LR
-  A[checkpoint manifest] --> B[policy weights + optimizer + scheduler]
-  A --> C[critic weights + optimizer + scheduler]
-  A --> D[reference artifact hash]
-  A --> E[reward model artifact hash]
-  A --> F[rollout policy id + sample ids]
-  A --> G[KL controller + reward normalization]
-  A --> H[rng states + data cursor]
-  A --> I[eval suite + judge version]
-  B --> J{restore validation}
-  C --> J
-  D --> J
-  E --> J
-  F --> J
-  G --> J
-  H --> J
-  I --> J
-  J -->|一致| K[resume training]
-  J -->|不一致| L[fail fast / discard stale rollout]</pre>
-<table>
-<tr><th>状态类别</th><th>必须保存什么</th><th>一致性风险</th><th>恢复校验</th></tr>
-<tr><td>Policy 状态</td><td>权重、optimizer、scheduler、global step</td><td>权重和 optimizer step 不匹配</td><td>校验 config hash、optimizer step、权重 shard 完整性</td></tr>
-<tr><td>Critic 状态</td><td>权重、optimizer、scheduler、value head 配置</td><td>critic 落后 policy 让 advantage 失真</td><td>要求 policy_step == critic_step，或显式记录可接受偏移</td></tr>
-<tr><td>Reference/RM 状态</td><td>model id、artifact hash、tokenizer/chat template</td><td>ref/RM 版本漂移让 KL 或 reward 不可比</td><td>从 registry 拉同 hash，不允许 latest</td></tr>
-<tr><td>Rollout 状态</td><td>prompt cursor、sample id、policy version、生成参数、可选 buffer</td><td>旧 policy rollout 混入新 policy update</td><td>rollout 必须绑定 policy checkpoint id</td></tr>
-<tr><td>控制器状态</td><td>KL coef、reward normalization、rng、data cursor</td><td>恢复后 KL 系数重置，训练行为突变</td><td>training_state.json 必须记录并打印</td></tr>
-<tr><td>评测状态</td><td>eval suite version、judge model id、上次通过门禁的 ckpt</td><td>无法判断恢复后模型是否退化</td><td>恢复后触发 quick-eval 对齐基线</td></tr>
-</table>
-<pre><code>checkpoint-step-12000/
-├── policy/
-│   ├── model.safetensors
-│   ├── optimizer.pt
-│   └── scheduler.pt
-├── critic/
-│   ├── model.safetensors
-│   ├── optimizer.pt
-│   └── scheduler.pt
-├── refs/
-│   ├── reference_model_id.txt
-│   └── reward_model_id.txt
-├── training_state.json
-├── rollout_buffer.pt
-└── metadata.json</code></pre>
-<div class="danger"><strong>恢复风险：</strong>不要只保存 policy 权重。忘记 KL controller、rng、rollout policy id 或 RM/ref artifact hash，会造成“恢复后还能跑，但结果不可解释”。</div>
-<h4>LLM-as-judge 自动评估 loop</h4>
-<pre class="mermaid">flowchart TD
-  A[checkpoint produced] --> B[quick sample: fixed prompt set + fresh prompt set]
-  B --> C[candidate/reference 双模型生成]
-  C --> D[LLM-as-judge 成对打分]
-  D --> E[聚合 win-rate / 长度 / 格式 / 安全 / 拒答]
-  E --> F{门禁判断}
-  F -->|通过| G[写入 tracker 和 checkpoint manifest]
-  F -->|失败| H[暂停 / 回滚 / 调 KL / 缩短 rollout]
-  H --> I[失败样本回流 error analysis]
-  I --> J[下一轮偏好数据构建]</pre>
-<p>LLM-as-judge 不是人工评测的替代品，而是训练内环的早期预警器。工程上要记录 judge model 版本、prompt 模板、采样温度、评测集 hash 和 rubric 版本，否则 win-rate 的历史曲线不可比。</p>
+  subgraph CP[Control Plane]
+    ORCH[orchestrator\njob spec, phase, admission]
+    EXP[experiment tracker\nrun id, metrics, artifacts]
+    EVAL[eval gate\nbenchmarks, red-team, judge]
+    CKPT[checkpoint manager\natomic manifest]
+  end
 
-<h3>10b.8 数据与评测管线：被低估的基础设施</h3>
-<p>对齐训练里最贵的失败往往不是训练失败，而是训练“成功”后发现偏好方向错了。GPU 可以重跑，脏数据和错误评测带来的结论污染却会进入下一轮数据构建、超参选择和发布判断。平台必须把数据版本、样本来源、judge 结果、红队反馈和模型 checkpoint 绑定起来，才能解释一次效果回退到底来自算法、数据还是评测。</p>
-<pre class="mermaid">flowchart TD
-  A[prompt pool] --> B[response sampling]
-  B --> C[annotation / AI judge]
-  C --> D[quality filtering]
-  D --> E[versioning & dedup]
-  E --> F[training use: DPO / PPO / GRPO]
-  F --> G[feedback / error analysis]
-  G --> A</pre>
-<table>
-<tr><th>类型</th><th>频率</th><th>目的</th><th>工具</th></tr>
-<tr><td>训练内环评测</td><td>每 N 步</td><td>看训练是否健康、早停</td><td>小 benchmark、LLM judge win-rate</td></tr>
-<tr><td>发布门禁评测</td><td>候选 ckpt 出来后</td><td>决定能否上线</td><td>完整 benchmark 套件、红队、人工 eval</td></tr>
-</table>
-<p>训练内环评测要快，哪怕粗；发布门禁要全，哪怕慢。两者用同一套节奏是常见错误：要么训练监控跟不上节奏，要么发布决策过于草率。</p>
+  subgraph DATA[Data Plane]
+    PROMPT[prompt dataset\nversioned shards]
+    ROLL[rollout engine\nvLLM/SGLang/TGI]
+    BUF[replay/buffer\nsample_id, logprob, reward]
+    TRAIN[training engine\nPPO minibatches]
+  end
 
-<h3>10b.9 工程建议</h3>
-<div class="grid-2">
-<div class="card"><strong>架构层面</strong><br>先把 post-training 总管线和 alignment 具体阶段分开建模；先用 SFT / DPO 跑通数据、评测和 artifact 流程；把 rollout、RM、reference 都抽象成独立服务；PPO 按峰值 1.3x 留冗余。</div>
-<div class="card"><strong>训练选型</strong><br>先验证 SFT 数据流程，再 DPO，再 PPO/GRPO；小团队或规则奖励优先 GRPO；软奖励 + 大算力再考虑 PPO；任何对齐训练都要配 SFT 数据做 KL 锚点。</div>
-<div class="card"><strong>监控与可观测</strong><br>rollout、RM 打分、策略更新应拆成可观测的三个阶段；KL、reward 均值、响应长度是三个最关键的健康指标；多 seed 是必需的。</div>
-<div class="card"><strong>数据与评测</strong><br>偏好数据集像代码一样版本化；训练内环评测要快，发布评测要全；把 RM 当作推理服务运营；为 reward hacking 准备早期预警。</div>
-</div>
-<table>
-<tr><th>反模式</th><th>典型表现</th><th>后果</th><th>正确做法</th></tr>
-<tr><td>把 PPO 当 SFT 跑</td><td>用同一套 SFT 平台直接起 PPO</td><td>OOM、rollout 卡死</td><td>单独设计对齐作业类型</td></tr>
-<tr><td>忽略 rollout 吞吐</td><td>训练卡强、推理引擎弱</td><td>训练卡空等</td><td>先上 vLLM 之类的推理引擎</td></tr>
-<tr><td>RM 和训练耦合</td><td>RM 写在训练脚本里</td><td>RM 挂训练死</td><td>独立服务 + 断路器</td></tr>
-<tr><td>不记数据版本</td><td>训完发现效果回退找不到原因</td><td>无法排查</td><td>数据版本强制绑定</td></tr>
-<tr><td>只看 loss</td><td>训练曲线好看但模型变差</td><td>reward hacking</td><td>加 win-rate、响应长度监控</td></tr>
-<tr><td>单次实验下结论</td><td>A 配置跑一次比 B 好 0.5 分</td><td>噪声当信号</td><td>至少 3 seed</td></tr>
-</table>
-<table>
-<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
-<tr><td>SFT / DPO 训练</td><td>TRL、LLaMA-Factory、Axolotl</td><td>Hugging Face 生态入口较常见</td></tr>
-<tr><td>分布式 RLHF</td><td>OpenRLHF、Verl、RLHFuse、Ray</td><td>更适合多角色协调</td></tr>
-<tr><td>DeepSpeed 对齐训练</td><td>DeepSpeed-Chat</td><td>适合已有 DeepSpeed 栈的团队</td></tr>
-<tr><td>Reward Model 推理</td><td>vLLM、TGI、SGLang、自建批处理服务</td><td>重点是吞吐与批处理</td></tr>
-<tr><td>Rollout 引擎</td><td>vLLM、SGLang、TensorRT-LLM</td><td>RLHF 时间常花在这里，不可忽视</td></tr>
-<tr><td>GRPO 实现</td><td>TRL（GRPOTrainer）、OpenRLHF、Verl</td><td>DeepSeek-R1 路线</td></tr>
-<tr><td>评测追踪</td><td>Weights & Biases、MLflow、Aim</td><td>方便比较 reward、KL、win-rate</td></tr>
-<tr><td>LLM judge 框架</td><td>LLM-as-a-judge pipelines、AlpacaEval、MT-Bench</td><td>自动化偏好评测</td></tr>
-</table>
-</section>
+  subgraph MODELS[Model Roles]
+    ACT[actor/policy\ntrainable]
+    REF[reference\nfrozen KL anchor]
+    RM[Reward Model or rule scorer\nfrozen/versioned]
+    CRT[critic/value\ntrainable]
+  end
 
-<section class="section" id="s35">
-<h2>10b.10 Checkpoint 多模型一致性</h2>
-<p>§10b.7.2 已经列出 PPO checkpoint 必须覆盖的状态类别，但还缺一个关键工程问题：这些状态如何作为<strong>一个事务</strong>被原子地写出和恢复。PPO/RLHF 训练中需要同时持久化 policy / reference / RM / critic 四类模型 + 各自的 optimizer 状态 + RNG 种子 + iteration counter，这套多 artifact checkpoint 的核心难点就是<strong>原子提交</strong>。</p>
-<div class="grid-2">
-<div class="card"><strong>风险</strong><br>写完 policy 后节点 OOM，写到 critic 时崩溃，恢复时 policy 是 step 12000 而 critic 仍是 step 11800，advantage 估计失真，KL 曲线错位，训练继续跑但分布发散。</div>
-<div class="card"><strong>必要性</strong><br>和单模型 SFT 不同，PPO 的四个模型相互引用（policy 推 → reward → critic 评估 → policy 更新），任何一个 artifact 旧版本都会污染整套训练状态。Reference 旧版本会让 KL 锚点漂移，RM 旧版本会让 reward 不可比，critic 旧版本会让 value loss 误导更新方向。</div>
-</div>
-<h3>工程实现</h3>
-<ol>
-<li><strong>写入侧采用临时目录 + rename</strong>：所有 artifact 先写到 <code>checkpoint-step-12000.tmp/</code>，全部 fsync 成功后再 <code>os.rename</code> 整体提交为 <code>checkpoint-step-12000/</code>。如果用对象存储，则用 multipart upload + finalize 语义；阶段性 part 不会被 reader 看到。</li>
-<li><strong>manifest 文件</strong>：每个 step 写一个 <code>checkpoint-manifest.json</code>，列出 4 个 artifact 的 path、size、sha256、训练 step、KL 系数、tokenizer hash、reference/RM artifact id 和 rollout policy id。manifest 必须最后一个写入，扮演事务 commit 的角色。</li>
-<li><strong>恢复侧先校验后加载</strong>：先读 manifest，校验 4 个 artifact 都存在、size 匹配、sha256 一致；任意一项不通过即 fail fast，禁止"先 load 一部分再决定"。</li>
-<li><strong>失败回滚</strong>：启动时先扫描 checkpoint 根目录，发现 <code>*.tmp</code> 临时目录或 manifest 缺失 / 损坏的 step，整组丢弃并回退到上一个完整 commit；写入崩溃留下的孤儿目录由后台清理任务处理。</li>
+  ORCH --&gt;|start phase, quotas| ROLL
+  ORCH --&gt;|start update| TRAIN
+  ORCH --&gt;|trigger| EVAL
+  PROMPT --&gt;|prompt batch| ROLL
+  ACT --&gt;|weights sync| ROLL
+  ROLL --&gt;|responses, actor logprobs| BUF
+  BUF --&gt;|prompt + response| REF
+  BUF --&gt;|prompt + response| RM
+  REF --&gt;|ref logprobs, KL inputs| BUF
+  RM --&gt;|reward scores| BUF
+  BUF --&gt;|trajectories| TRAIN
+  ACT &lt;--&gt;|grad update| TRAIN
+  CRT &lt;--&gt;|value update| TRAIN
+  TRAIN --&gt;|metrics, KL, losses| EXP
+  ROLL --&gt;|latency, tokens/s, backlog| EXP
+  RM --&gt;|score latency, failures| EXP
+  TRAIN --&gt;|consistent state| CKPT
+  CKPT --&gt;|actor/ref/rm/critic hashes| EXP
+  EVAL --&gt;|pass/fail release decision| ORCH</pre>
+<p>这张图要读出四条路径：</p>
+<ul>
+<li><strong>控制路径</strong>：orchestrator 决定 rollout、reward
+scoring、PPO update、evaluation、checkpoint 的阶段切换和准入。</li>
+<li><strong>数据路径</strong>：prompt 进入 rollout engine，生成
+response，再经过 reference/RM 打分，写入 replay/buffer，最后被 training
+engine 消费。</li>
+<li><strong>状态路径</strong>：actor 和 critic 会变化；reference 和 RM
+必须冻结并版本化；buffer、KL controller、RNG、data cursor
+也是状态。</li>
+<li><strong>故障路径</strong>：RM 超时会堵住 buffer，rollout backlog
+会让训练卡空转，checkpoint manifest 不一致会污染恢复，eval gate
+失败必须阻断 release。</li>
+</ul>
+<h3 id="32-责任边界">3.2 责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>责任</th>
+<th>不负责</th>
+<th>关键指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>actor/policy</td>
+<td>生成 response，接受 PPO/DPO/GRPO 更新</td>
+<td>充当评测标准</td>
+<td>actor tokens/s、policy loss、approx KL、entropy</td>
+</tr>
+<tr>
+<td>reference</td>
+<td>提供冻结基线，计算 KL 或 DPO ref logprob</td>
+<td>跟随 actor 更新</td>
+<td>ref artifact hash、ref forward latency、KL inputs coverage</td>
+</tr>
+<tr>
+<td>Reward Model</td>
+<td>把 prompt+response 映射成 reward</td>
+<td>决定发布是否通过</td>
+<td>reward p50/p95 latency、score distribution、failure rate</td>
+</tr>
+<tr>
+<td>critic/value</td>
+<td>估计 value，降低 PPO advantage 方差</td>
+<td>替代 RM 判断好坏</td>
+<td>value loss、explained variance、critic checkpoint age</td>
+</tr>
+<tr>
+<td>rollout engine</td>
+<td>批量 sample generation，管理 KV cache，接受 actor 权重同步</td>
+<td>执行反向传播</td>
+<td>generated samples/s、output tokens/s、KV cache usage、backlog</td>
+</tr>
+<tr>
+<td>training engine</td>
+<td>PPO/DPO/GRPO minibatch update，写训练状态</td>
+<td>托管长期 prompt 队列</td>
+<td>update samples/s、GPU MFU、step time、OOM count</td>
+</tr>
+<tr>
+<td>replay/buffer</td>
+<td>绑定 sample、logprob、reward、ref logprob、actor version</td>
+<td>长期数据湖</td>
+<td>ready samples、age、version mismatch count</td>
+</tr>
+<tr>
+<td>checkpoint manager</td>
+<td>原子记录多模型一致状态</td>
+<td>修复坏训练</td>
+<td>manifest completeness、restore test result、RPO/RTO</td>
+</tr>
+<tr>
+<td>eval gate</td>
+<td>checkpoint 粒度评测、阻断坏版本</td>
+<td>替代训练监控</td>
+<td>win-rate、safety pass、format pass、regression count</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-状态路径多模型-checkpoint-不是多个目录">3.3 状态路径：多模型
+checkpoint 不是多个目录</h3>
+<p>PPO checkpoint 应该是一个事务 manifest，而不是"actor.pt + critic.pt +
+一堆外部路径"。最低要求：</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;rlhf-llama7b-helpfulness-0421&quot;</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;global_step&quot;</span><span class="fu">:</span> <span class="dv">820</span><span class="fu">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;phase&quot;</span><span class="fu">:</span> <span class="st">&quot;after_ppo_update&quot;</span><span class="fu">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;actor&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;uri&quot;</span><span class="fu">:</span> <span class="st">&quot;s3://ckpt/actor/step_820&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;actor_hash&quot;</span><span class="fu">},</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;critic&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;uri&quot;</span><span class="fu">:</span> <span class="st">&quot;s3://ckpt/critic/step_820&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;critic_hash&quot;</span><span class="fu">},</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;reference&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;artifact&quot;</span><span class="fu">:</span> <span class="st">&quot;sft-v17&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;ref_hash&quot;</span><span class="fu">,</span> <span class="dt">&quot;frozen&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">},</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;reward_model&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;artifact&quot;</span><span class="fu">:</span> <span class="st">&quot;rm-helpful-v9&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;rm_hash&quot;</span><span class="fu">,</span> <span class="dt">&quot;prompt_template&quot;</span><span class="fu">:</span> <span class="st">&quot;rm_template_v4&quot;</span><span class="fu">},</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;tokenizer&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;artifact&quot;</span><span class="fu">:</span> <span class="st">&quot;tokenizer-v17&quot;</span><span class="fu">,</span> <span class="dt">&quot;chat_template&quot;</span><span class="fu">:</span> <span class="st">&quot;chatml-v6&quot;</span><span class="fu">},</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;data&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;prompt_dataset&quot;</span><span class="fu">:</span> <span class="st">&quot;prompts-v31&quot;</span><span class="fu">,</span> <span class="dt">&quot;cursor&quot;</span><span class="fu">:</span> <span class="st">&quot;shard-044:000912&quot;</span><span class="fu">},</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;buffer&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;uri&quot;</span><span class="fu">:</span> <span class="st">&quot;s3://buffer/run/step_820&quot;</span><span class="fu">,</span> <span class="dt">&quot;policy_version&quot;</span><span class="fu">:</span> <span class="st">&quot;actor_hash&quot;</span><span class="fu">},</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;controllers&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;kl_coef&quot;</span><span class="fu">:</span> <span class="fl">0.034</span><span class="fu">,</span> <span class="dt">&quot;reward_norm&quot;</span><span class="fu">:</span> <span class="st">&quot;ema-v3&quot;</span><span class="fu">},</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;rng&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;python&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">,</span> <span class="dt">&quot;torch_cuda&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">,</span> <span class="dt">&quot;sampler&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">},</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;eval&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;suite&quot;</span><span class="fu">:</span> <span class="st">&quot;posttrain-gate-v12&quot;</span><span class="fu">,</span> <span class="dt">&quot;last_passed_step&quot;</span><span class="fu">:</span> <span class="dv">800</span><span class="fu">}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>恢复时必须校验 actor、reference、Reward
+Model、critic、tokenizer、prompt template、buffer 的版本关系。只恢复
+actor 权重而丢掉 KL controller、reward normalization 或 buffer
+policy_version，会产生一种危险状态：训练继续跑，但 advantage、KL 和
+reward 分布已经不再对应同一轮 rollout。</p>
+<hr />
+<h2 id="4-原理从不可化简的问题推导机制">4.
+原理：从不可化简的问题推导机制</h2>
+<h3 id="41-为什么-sft-是第一站">4.1 为什么 SFT 是第一站</h3>
+<p>如果 actor 连指令格式都不稳定，在线 RL 会把大量 rollout
+浪费在无效输出上。SFT 用 prompt-response 示范把 base model
+拉到可交互区域，让后续偏好优化关注"哪个回答更好"，而不是"模型是否知道要回答"。</p>
+<p>SFT 的系统形态接近普通监督训练：</p>
+<pre class="text"><code>versioned examples -&gt; DataLoader -&gt; policy forward/backward -&gt; checkpoint -&gt; eval gate</code></pre>
+<p>它的工程重点不是 rollout，而是数据准入：去重、PII、license、chat
+template、response 质量分、长度分布、拒答样本比例。SFT 产物通常作为
+reference 初始点，因此 tokenizer 和 chat template 一旦不受控，后续
+DPO/PPO 的 KL 和 logprob 都会失真。</p>
+<p>一个真实的平台事故通常长这样：SFT 数据集 <code>sft-helpful-v18</code>
+用 <code>chatml-v6</code> 生成，训练 job 却从镜像默认配置读到了
+<code>chatml-v5</code>；两者都能正常 tokenize，loss 也会下降，但
+assistant 起始 token、system prompt 拼接和 EOS 位置不同。后续 DPO 用
+<code>chatml-v6</code> 计算 reference logprob 时，policy
+实际学到的是另一种格式，表现为 chosen/rejected margin
+抖动、平均输出更长、KL 偏高但没有明显 OOM 或 NaN。另一个常见事故是
+tokenizer registry 指向同名不同 hash 的 artifact，新增 special token 后
+embedding resize 发生在 SFT 阶段，却没有写进 reference manifest；PPO
+恢复时 reference 前向可以跑，但 token id 对不上，KL 曲线失去意义。</p>
+<p>SFT 作业的最小平台配置应该显式绑定这些版本：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sft_job</span><span class="kw">:</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">dataset</span><span class="kw">:</span><span class="at"> sft-helpful-v18@sha256:data_hash</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">data_schema</span><span class="kw">:</span><span class="at"> chat_completion_v3</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">base_model</span><span class="kw">:</span><span class="at"> llama-7b-base-v12@sha256:model_hash</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokenizer</span><span class="kw">:</span><span class="at"> tokenizer-v17@sha256:tok_hash</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">chat_template</span><span class="kw">:</span><span class="at"> chatml-v6@sha256:tmpl_hash</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_seq_len</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">packing</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">response_loss_only</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">output_artifact</span><span class="kw">:</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">model</span><span class="kw">:</span><span class="at"> llama-7b-sft-v18</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">must_record</span><span class="kw">:</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> dataset</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> tokenizer</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> chat_template</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> special_tokens_map</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> data_filter_config</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> truncation_policy</span></span></code></pre></div>
+<p>准入规则很简单：如果
+<code>dataset.chat_template_hash != job.chat_template_hash</code>，或者
+tokenizer special tokens 和 base model embedding shape
+不匹配，作业直接拒绝启动。不要把这类问题留给训练曲线发现，因为曲线通常不会立刻报错。</p>
+<h3 id="42-为什么-rm-是独立系统">4.2 为什么 RM 是独立系统</h3>
+<p>Reward Model 训练通常消费 chosen/rejected 或分数数据，学习
+<code>reward(prompt, response)</code>。论文里它像一个函数；平台里它是推理服务，因为
+PPO 内环会高频调用它。</p>
+<p>RM 必须版本化这些内容：</p>
+<ul>
+<li>base model 和 reward head 权重。</li>
+<li>tokenizer、chat template、截断长度、special token 策略。</li>
+<li>label schema：pairwise、scalar score、rank list、rule label。</li>
+<li>校准集：score distribution、长度偏差、类别偏差、拒答偏差。</li>
+<li>服务配置：batch size、max sequence
+length、timeout、retry、fallback。</li>
+</ul>
+<p>RM 不是发布质量的唯一裁判。它能提供训练信号，但可能被 actor
+利用。发布判断要看 eval gate 的多指标，而不是单一 reward。</p>
+<p>RM 的平台故障也经常不是 crash，而是 reward 分布悄悄漂移。例子一：RM
+训练时使用 <code>rm_template_v4</code>，线上 scoring worker rolling
+update 后一半实例路由到 <code>rm_template_v5</code>，同一批 rollout
+被两个模板打分；训练日志只看到 reward 方差变大，根因其实是 version route
+没有按 run_id 固定。例子二：RM 对长回答有 length
+bias，<code>prompt+response &gt; 3072</code> tokens
+时截断掉后半段，长而空泛的回答反而保留了高分开头；PPO 会学会变长，eval
+里 <code>avg_response_tokens_delta</code> 上升。例子三：batching 按
+request count 而不是 token count 合批，混入超长样本后 RM p95 从 8s 抬到
+35s，rollout engine 和 training engine 都在等 reward。</p>
+<p>一个 RM worker 配置至少要把模板、长度、batching
+和版本路由写清楚：</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">reward_worker</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">artifact</span><span class="kw">:</span><span class="at"> rm-helpful-v9@sha256:rm_hash</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokenizer</span><span class="kw">:</span><span class="at"> tokenizer-v17@sha256:tok_hash</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">prompt_template</span><span class="kw">:</span><span class="at"> rm_template_v4@sha256:tmpl_hash</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">route_key</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;{run_id}:{reward_model_hash}:{prompt_template_hash}&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_input_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">truncation</span><span class="kw">:</span><span class="at"> reject_over_limit</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">batching</span><span class="kw">:</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">policy</span><span class="kw">:</span><span class="at"> token_bucket</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_batch_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">65536</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_wait_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">50</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">length_buckets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">1024</span><span class="kw">,</span><span class="at"> </span><span class="dv">2048</span><span class="kw">,</span><span class="at"> </span><span class="dv">4096</span><span class="kw">]</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">guards</span><span class="kw">:</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">reject_mixed_template_batch</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">emit_length_bias_metrics</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">timeout_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">30000</span></span></code></pre></div>
+<p>RM 的 length bias 要用证据看：按 response token 分桶画平均
+reward、win-rate 和 judge disagreement。如果 0-512 token bucket 的人工
+win-rate 高于 1024+ token bucket，但 RM 平均分反过来，就不能继续把这个
+RM 放进 PPO 内环。</p>
+<h3 id="43-为什么-ppo-必然变成多模型系统">4.3 为什么 PPO
+必然变成多模型系统</h3>
+<p>PPO 要解决的是在线偏好优化：actor 生成新 response，RM 给
+reward，reference 约束 actor 不要离 SFT 太远，critic 估计 value
+降低方差，然后 actor 根据 advantage 更新。</p>
+<p>一个 PPO batch 的关键字段应该像这样：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sample_id&quot;</span><span class="fu">:</span> <span class="st">&quot;run820-p044-000912-g03&quot;</span><span class="fu">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;prompt_id&quot;</span><span class="fu">:</span> <span class="st">&quot;prompts-v31/shard-044/000912&quot;</span><span class="fu">,</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;actor_version&quot;</span><span class="fu">:</span> <span class="st">&quot;actor_step_819_hash&quot;</span><span class="fu">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;reference_version&quot;</span><span class="fu">:</span> <span class="st">&quot;sft-v17_hash&quot;</span><span class="fu">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;reward_version&quot;</span><span class="fu">:</span> <span class="st">&quot;rm-helpful-v9_hash&quot;</span><span class="fu">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;prompt&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;response&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">,</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;actor_logprobs&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fl">-1.9</span><span class="ot">,</span> <span class="fl">-0.7</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ref_logprobs&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fl">-1.8</span><span class="ot">,</span> <span class="fl">-0.9</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;reward&quot;</span><span class="fu">:</span> <span class="fl">2.43</span><span class="fu">,</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;value&quot;</span><span class="fu">:</span> <span class="fl">1.91</span><span class="fu">,</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sequence_length&quot;</span><span class="fu">:</span> <span class="dv">1372</span><span class="fu">,</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;finish_reason&quot;</span><span class="fu">:</span> <span class="st">&quot;stop&quot;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>缺少 <code>actor_version</code> 或 <code>reward_version</code> 的
+buffer 不能进入训练。否则 training engine 会把不同 policy、不同 RM
+或不同 prompt template 的样本混在同一个 PPO update
+中，曲线看起来只是"噪声大"，实际是训练目标被污染。</p>
+<h3 id="44-为什么-dpo-更像训练平台grpo-更像-rollout-平台">4.4 为什么 DPO
+更像训练平台，GRPO 更像 rollout 平台</h3>
+<p>DPO 消费离线偏好对，不需要在线 sample generation，也不需要 Reward
+Model 在线打分。它只需要 policy 和 frozen reference 的 logprob。因此 DPO
+对平台最友好：现有 SFT trainer 加上偏好数据 schema、reference 前向和 DPO
+loss，就能跑通。</p>
+<p>GRPO 去掉 critic，用同一 prompt 的多条 response 组内 reward 均值作为
+baseline。它减少了 critic 权重、optimizer、checkpoint 和 value
+loss，但要求每个 prompt 生成更多 response。平台复杂度从 critic
+训练转移到 rollout 吞吐、组内样本聚合和 reward 稳定性。</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>省掉的系统组件</th>
+<th>新增或保留的压力</th>
+<th>平台化结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DPO vs PPO</td>
+<td>rollout engine、online RM scoring、critic、replay
+buffer、权重同步</td>
+<td>reference logprob、偏好数据校验、beta/length 监控</td>
+<td>最适合作为第一条偏好优化产品线</td>
+</tr>
+<tr>
+<td>GRPO vs PPO</td>
+<td>critic/value model、critic optimizer、critic checkpoint、value loss
+排障</td>
+<td>每 prompt 多样本 rollout、组内 reward 方差、reward/rule 质量</td>
+<td>适合数学、代码、可验证任务和强推理引擎平台</td>
+</tr>
+<tr>
+<td>PPO</td>
+<td>无</td>
+<td>多模型一致性、RM 服务、rollout/training 匹配、KL 控制</td>
+<td>效果空间大，但只有在数据、评测、服务治理成熟后才值得上</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-框架实现从组件映射到真实-knobs">5. 框架实现：从组件映射到真实
+knobs</h2>
+<h3 id="51-常见框架映射">5.1 常见框架映射</h3>
+<table>
+<thead>
+<tr>
+<th>平台能力</th>
+<th>OpenRLHF / verl / TRL / DeepSpeed-Chat / Ray 中的对应项</th>
+<th>关键约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>actor training</td>
+<td>PPO trainer、DPO trainer、FSDP/DeepSpeed actor worker</td>
+<td>actor 和 rollout engine 权重同步延迟必须可观测</td>
+</tr>
+<tr>
+<td>reference forward</td>
+<td>ref model worker、reference logprob worker</td>
+<td>frozen artifact hash 固定，不能跟随 actor 更新</td>
+</tr>
+<tr>
+<td>reward scoring</td>
+<td>reward model worker、remote RM service、rule scorer</td>
+<td>timeout、batching、score version 必须写入样本</td>
+</tr>
+<tr>
+<td>critic training</td>
+<td>critic/value worker</td>
+<td>PPO 需要与 actor checkpoint 同步；GRPO 不需要</td>
+</tr>
+<tr>
+<td>rollout engine</td>
+<td>vLLM、SGLang、TGI、Ray actor worker</td>
+<td>KV cache 预留和 max_num_batched_tokens 决定吞吐</td>
+</tr>
+<tr>
+<td>replay/buffer</td>
+<td>rollout storage、experience maker、Ray object store</td>
+<td>样本必须带 actor/ref/RM 版本和幂等 sample_id</td>
+</tr>
+<tr>
+<td>distributed training</td>
+<td>DeepSpeed ZeRO、FSDP、Megatron TP/PP</td>
+<td>optimizer state 和 checkpoint schema 要能恢复</td>
+</tr>
+<tr>
+<td>evaluation gate</td>
+<td>lm-eval-harness、自研 judge、red-team runner</td>
+<td>judge model、prompt template 和阈值版本化</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-verl--openrlhf-风格-knobs">5.2 verl / OpenRLHF 风格
+knobs</h3>
+<p>真实框架的参数名会随版本变化，但平台工程师需要识别这些 knob
+对应的系统边界。下面的写法接近 verl 的 Hydra/Ray 配置和 OpenRLHF 的
+Ray/vLLM 启动参数，重点是语义映射。</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">verl_style</span><span class="kw">:</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">actor_rollout_ref</span><span class="kw">:</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">actor</span><span class="kw">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">strategy</span><span class="kw">:</span><span class="at"> fsdp</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ppo_mini_batch_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">256</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ppo_micro_batch_size_per_gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">optim</span><span class="kw">:</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">lr</span><span class="kw">:</span><span class="at"> </span><span class="fl">1.0e-6</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">fsdp_config</span><span class="kw">:</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">param_offload</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">optimizer_offload</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rollout</span><span class="kw">:</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> vllm</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">tensor_model_parallel_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">gpu_memory_utilization</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.82</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">max_num_batched_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">262144</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">n</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">temperature</span><span class="kw">:</span><span class="at"> </span><span class="fl">1.0</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">prompt_length</span><span class="kw">:</span><span class="at"> </span><span class="dv">1024</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">response_length</span><span class="kw">:</span><span class="at"> </span><span class="dv">768</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">enforce_eager</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">free_cache_engine</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ref</span><span class="kw">:</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">log_prob_micro_batch_size_per_gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">fsdp_config</span><span class="kw">:</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">param_offload</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">reward_model</span><span class="kw">:</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">enable</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">strategy</span><span class="kw">:</span><span class="at"> fsdp</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">micro_batch_size_per_gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_length</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">reward_manager</span><span class="kw">:</span><span class="at"> batched_remote</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">algorithm</span><span class="kw">:</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kl_ctrl</span><span class="kw">:</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">type</span><span class="kw">:</span><span class="at"> adaptive</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">kl_target</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.05</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">init_kl_coef</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.03</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">adv_estimator</span><span class="kw">:</span><span class="at"> gae</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">trainer</span><span class="kw">:</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">save_freq</span><span class="kw">:</span><span class="at"> </span><span class="dv">20</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">test_freq</span><span class="kw">:</span><span class="at"> </span><span class="dv">20</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">total_epochs</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># OpenRLHF/Ray/vLLM 风格：参数名按框架版本会有差异，平台侧要保留这些语义。</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">openrlhf_train_ppo</span> <span class="dt">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--pretrain</span> llama-7b-sft-v17 <span class="dt">\</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--reward_pretrain</span> rm-helpful-v9 <span class="dt">\</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--actor_num_nodes</span> 1 <span class="at">--actor_num_gpus_per_node</span> 4 <span class="dt">\</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--critic_num_nodes</span> 1 <span class="at">--critic_num_gpus_per_node</span> 2 <span class="dt">\</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--ref_num_nodes</span> 1 <span class="at">--ref_num_gpus_per_node</span> 1 <span class="dt">\</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--reward_num_nodes</span> 1 <span class="at">--reward_num_gpus_per_node</span> 1 <span class="dt">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vllm_num_engines</span> 4 <span class="dt">\</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vllm_tensor_parallel_size</span> 2 <span class="dt">\</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vllm_gpu_memory_utilization</span> 0.82 <span class="dt">\</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--rollout_batch_size</span> 2048 <span class="dt">\</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--micro_train_batch_size</span> 4 <span class="dt">\</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--train_batch_size</span> 2048 <span class="dt">\</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--n_samples_per_prompt</span> 2 <span class="dt">\</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_prompt_len</span> 1024 <span class="dt">\</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_new_tokens</span> 768 <span class="dt">\</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--init_kl_coef</span> 0.03 <span class="dt">\</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--kl_target</span> 0.05 <span class="dt">\</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--save_steps</span> 20 <span class="dt">\</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>  <span class="at">--eval_steps</span> 20</span></code></pre></div>
+<p>这些 knob 可以映射到平台控制面：</p>
+<table>
+<thead>
+<tr>
+<th>knob 族</th>
+<th>verl / OpenRLHF 典型字段</th>
+<th>平台含义</th>
+<th>失配证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>actor-rollout sync</td>
+<td><code>free_cache_engine</code>、actor weight
+sync、<code>save_freq</code> 附近的权重发布逻辑</td>
+<td>actor 更新后多久同步到 rollout engine，是否释放旧 KV/cache</td>
+<td><code>weight_sync_seconds</code>
+高、<code>actor_version_lag &gt; 1</code></td>
+</tr>
+<tr>
+<td>RM worker placement</td>
+<td><code>reward_model.enable</code>、<code>reward_num_nodes</code>、<code>reward_num_gpus_per_node</code>、remote
+reward manager</td>
+<td>RM 共置还是独立服务，是否按 run_id 固定 version route</td>
+<td>RM p95 高、mixed RM hash、score distribution 漂移</td>
+</tr>
+<tr>
+<td>rollout tensor parallel</td>
+<td><code>tensor_model_parallel_size</code>、<code>vllm_tensor_parallel_size</code>、<code>vllm_num_engines</code></td>
+<td>rollout engine 的吞吐、显存和跨 GPU 通信边界</td>
+<td>tokens/s 低、KV cache OOM、TP 通信占比高</td>
+</tr>
+<tr>
+<td>microbatching</td>
+<td><code>ppo_micro_batch_size_per_gpu</code>、<code>micro_train_batch_size</code>、<code>log_prob_micro_batch_size_per_gpu</code></td>
+<td>actor/ref/RM 前向和 PPO update 的显存-吞吐交换</td>
+<td>update OOM、ref logprob 慢、GPU util 锯齿</td>
+</tr>
+<tr>
+<td>KL controller</td>
+<td><code>algorithm.kl_ctrl.type</code>、<code>init_kl_coef</code>、<code>kl_target</code></td>
+<td>actor 偏离 reference 的闭环控制</td>
+<td>approx KL 发散、clip fraction 飙升、reward hacking</td>
+</tr>
+<tr>
+<td>checkpoint/eval cadence</td>
+<td><code>save_freq</code>、<code>test_freq</code>、<code>save_steps</code>、<code>eval_steps</code></td>
+<td>checkpoint 和 eval cadence 是否足以限制 RPO 和坏版本传播</td>
+<td>失败后 RPO 大、last passed checkpoint 太旧</td>
+</tr>
+</tbody>
+</table>
+<h3 id="53-actorrefrewardcritic-资源布局配置示例">5.3
+actor/ref/reward/critic 资源布局配置示例</h3>
+<p>下面是一个可执行作业 spec
+的形状，不是某个框架的完整语法，但字段都能映射到 Ray placement
+group、Kubernetes pod、OpenRLHF/verl worker、vLLM runtime 和
+DeepSpeed/FSDP 参数。</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">job</span><span class="kw">:</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> rlhf-llama7b-helpful-ppo</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">run_id</span><span class="kw">:</span><span class="at"> rlhf-llama7b-helpful-20260504-001</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">method</span><span class="kw">:</span><span class="at"> ppo</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">base_model</span><span class="kw">:</span><span class="at"> llama-7b-sft-v17</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokenizer</span><span class="kw">:</span><span class="at"> tokenizer-v17</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">chat_template</span><span class="kw">:</span><span class="at"> chatml-v6</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">prompt_dataset</span><span class="kw">:</span><span class="at"> prompts-helpful-v31</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">prompt_config</span><span class="kw">:</span><span class="at"> prompt-pack-v12</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_prompt_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">1024</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_response_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">768</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rollout_batch_prompts</span><span class="kw">:</span><span class="at"> </span><span class="dv">1024</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">samples_per_prompt</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">placement</span><span class="kw">:</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">node_group</span><span class="kw">:</span><span class="at"> h100-80g</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">total_nodes</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus_per_node</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">actor</span><span class="kw">:</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">role</span><span class="kw">:</span><span class="at"> trainable</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodes</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">]</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">,</span><span class="dv">1</span><span class="kw">,</span><span class="dv">2</span><span class="kw">,</span><span class="dv">3</span><span class="kw">]</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">parallelism</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="fu">fsdp_shards</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span><span class="kw">,</span><span class="at"> </span><span class="fu">tensor_parallel</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span><span class="kw">}</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">optimizer</span><span class="kw">:</span><span class="at"> adamw_bf16</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">critic</span><span class="kw">:</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">role</span><span class="kw">:</span><span class="at"> trainable</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodes</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">]</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">4</span><span class="kw">,</span><span class="dv">5</span><span class="kw">]</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">parallelism</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="fu">fsdp_shards</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span><span class="kw">}</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">optimizer</span><span class="kw">:</span><span class="at"> adamw_bf16</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">reference</span><span class="kw">:</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">role</span><span class="kw">:</span><span class="at"> frozen_forward</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodes</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">]</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">6</span><span class="kw">]</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_batch_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">65536</span></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">reward</span><span class="kw">:</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">role</span><span class="kw">:</span><span class="at"> frozen_forward</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodes</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">]</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">7</span><span class="kw">]</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">artifact</span><span class="kw">:</span><span class="at"> rm-helpful-v9</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">timeout_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">30000</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_batch_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">65536</span></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rollout_engine</span><span class="kw">:</span></span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">runtime</span><span class="kw">:</span><span class="at"> vllm</span></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodes</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">1</span><span class="kw">]</span></span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpus</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="dv">0</span><span class="kw">,</span><span class="dv">1</span><span class="kw">,</span><span class="dv">2</span><span class="kw">,</span><span class="dv">3</span><span class="kw">,</span><span class="dv">4</span><span class="kw">,</span><span class="dv">5</span><span class="kw">,</span><span class="dv">6</span><span class="kw">,</span><span class="dv">7</span><span class="kw">]</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tensor_parallel</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpu_memory_utilization</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.82</span></span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">max_num_batched_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">262144</span></span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">weight_sync</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="fu">source</span><span class="kw">:</span><span class="at"> actor</span><span class="kw">,</span><span class="at"> </span><span class="fu">every_updates</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span><span class="kw">,</span><span class="at"> </span><span class="fu">max_staleness_updates</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span><span class="kw">}</span></span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-56"><a href="#cb9-56" aria-hidden="true" tabindex="-1"></a><span class="fu">ppo</span><span class="kw">:</span></span>
+<span id="cb9-57"><a href="#cb9-57" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">kl_target</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.05</span></span>
+<span id="cb9-58"><a href="#cb9-58" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">init_kl_coef</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.03</span></span>
+<span id="cb9-59"><a href="#cb9-59" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">train_batch_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">2048</span></span>
+<span id="cb9-60"><a href="#cb9-60" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minibatch_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">256</span></span>
+<span id="cb9-61"><a href="#cb9-61" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ppo_epochs</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb9-62"><a href="#cb9-62" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gamma</span><span class="kw">:</span><span class="at"> </span><span class="fl">1.0</span></span>
+<span id="cb9-63"><a href="#cb9-63" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lambda</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.95</span></span>
+<span id="cb9-64"><a href="#cb9-64" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">clip_range</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.2</span></span>
+<span id="cb9-65"><a href="#cb9-65" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">reward_normalization</span><span class="kw">:</span><span class="at"> ema_by_run</span></span>
+<span id="cb9-66"><a href="#cb9-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-67"><a href="#cb9-67" aria-hidden="true" tabindex="-1"></a><span class="fu">checkpoint</span><span class="kw">:</span></span>
+<span id="cb9-68"><a href="#cb9-68" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">every_updates</span><span class="kw">:</span><span class="at"> </span><span class="dv">20</span></span>
+<span id="cb9-69"><a href="#cb9-69" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">atomic_manifest</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-70"><a href="#cb9-70" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">include_buffer</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-71"><a href="#cb9-71" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">restore_validation</span><span class="kw">:</span><span class="at"> strict_hash</span></span>
+<span id="cb9-72"><a href="#cb9-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-73"><a href="#cb9-73" aria-hidden="true" tabindex="-1"></a><span class="fu">evaluation</span><span class="kw">:</span></span>
+<span id="cb9-74"><a href="#cb9-74" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gate_every_updates</span><span class="kw">:</span><span class="at"> </span><span class="dv">20</span></span>
+<span id="cb9-75"><a href="#cb9-75" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">suite</span><span class="kw">:</span><span class="at"> posttrain-gate-v12</span></span>
+<span id="cb9-76"><a href="#cb9-76" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">block_on_fail</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-77"><a href="#cb9-77" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">thresholds</span><span class="kw">:</span></span>
+<span id="cb9-78"><a href="#cb9-78" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">helpful_winrate_vs_sft</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt;= 0.56&quot;</span></span>
+<span id="cb9-79"><a href="#cb9-79" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">safety_regression_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt;= 0.01&quot;</span></span>
+<span id="cb9-80"><a href="#cb9-80" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">format_pass_rate</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&gt;= 0.98&quot;</span></span>
+<span id="cb9-81"><a href="#cb9-81" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">avg_response_tokens_delta</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;&lt;= 0.15&quot;</span></span></code></pre></div>
+<p>这个配置里最重要的不是 YAML 格式，而是资源语义：actor/critic
+是训练态，reference/reward 是冻结前向，rollout engine
+是推理态，checkpoint 和 eval gate 都知道这些角色的版本关系。</p>
+<h3 id="54-框架-knobs-与约束">5.4 框架 knobs 与约束</h3>
+<table>
+<thead>
+<tr>
+<th>knob</th>
+<th>影响</th>
+<th>常见证据</th>
+<th>错配后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rollout_batch_prompts</code></td>
+<td>rollout 洪峰、buffer 大小、RM 批量效率</td>
+<td>rollout p95、buffer ready samples</td>
+<td>太小 GPU 不满，太大 RM 队列尖峰</td>
+</tr>
+<tr>
+<td><code>samples_per_prompt</code> / group size</td>
+<td>探索、多样性、GRPO baseline 方差</td>
+<td>per-prompt reward std、tokens/s</td>
+<td>太小 advantage 噪声大，太大 rollout 成本高</td>
+</tr>
+<tr>
+<td><code>max_response_tokens</code></td>
+<td>KV cache、reward latency、长度偏置</td>
+<td>output length p50/p95、KV usage</td>
+<td>长输出拖慢所有路径，短输出学会截断</td>
+</tr>
+<tr>
+<td><code>init_kl_coef</code> / KL controller</td>
+<td>actor 偏离 reference 的速度</td>
+<td>approx KL、clip fraction</td>
+<td>太小 reward hacking，太大不学习</td>
+</tr>
+<tr>
+<td><code>max_num_batched_tokens</code></td>
+<td>vLLM/SGLang 吞吐与显存峰值</td>
+<td>engine tokens/s、OOM、queue wait</td>
+<td>太低吞吐差，太高阶段切换 OOM</td>
+</tr>
+<tr>
+<td><code>reward.timeout_ms</code></td>
+<td>step 尾延迟与失败恢复</td>
+<td>RM timeout rate、retry count</td>
+<td>太短误杀慢批次，太长训练空等</td>
+</tr>
+<tr>
+<td><code>checkpoint.include_buffer</code></td>
+<td>恢复一致性和存储成本</td>
+<td>restore dry-run、manifest size</td>
+<td>不保存 buffer 会丢 rollout，保存过多会拖慢 ckpt</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-工程化落地配置版本矩阵准入preflight发布观测治理">6.
+工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</h2>
+<h3 id="61-版本矩阵">6.1 版本矩阵</h3>
+<p>每个 run 必须记录一张版本矩阵。缺任意一列，复盘时都会变成猜测。</p>
+<table>
+<thead>
+<tr>
+<th>版本项</th>
+<th>示例</th>
+<th>为什么必须记录</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>base/SFT model</td>
+<td><code>llama-7b-sft-v17@sha256</code></td>
+<td>reference 和 actor 初始点</td>
+</tr>
+<tr>
+<td>actor checkpoint</td>
+<td><code>actor-step-820@sha256</code></td>
+<td>发布候选和恢复目标</td>
+</tr>
+<tr>
+<td>critic checkpoint</td>
+<td><code>critic-step-820@sha256</code></td>
+<td>PPO advantage 一致性</td>
+</tr>
+<tr>
+<td>Reward Model</td>
+<td><code>rm-helpful-v9@sha256</code></td>
+<td>reward 曲线可比较性</td>
+</tr>
+<tr>
+<td>tokenizer/chat template</td>
+<td><code>tokenizer-v17</code>, <code>chatml-v6</code></td>
+<td>logprob、KL、RM 输入一致性</td>
+</tr>
+<tr>
+<td>prompt dataset</td>
+<td><code>prompts-helpful-v31</code></td>
+<td>rollout 样本来源</td>
+</tr>
+<tr>
+<td>prompt/config version</td>
+<td><code>prompt-pack-v12</code>, decoding config</td>
+<td>sample generation 可复现</td>
+</tr>
+<tr>
+<td>evaluation suite</td>
+<td><code>posttrain-gate-v12</code></td>
+<td>门禁阈值和 judge 版本</td>
+</tr>
+<tr>
+<td>framework image</td>
+<td><code>verl:0.4.2-cu124</code>, <code>vllm:0.8.x</code></td>
+<td>kernel、调度和输出差异</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-作业准入与-preflight">6.2 作业准入与 preflight</h3>
+<p>后训练作业提交前至少检查：</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据 schema 和版本完整性</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> tools/validate_posttrain_data.py <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dataset</span> prompts-helpful-v31 <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--schema</span> rollout_prompt_v2 <span class="dt">\</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--require-license</span> <span class="dt">\</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--require-chat-template</span> chatml-v6</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 模型角色是否兼容</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> tools/validate_model_roles.py <span class="dt">\</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--actor</span> llama-7b-sft-v17 <span class="dt">\</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--reference</span> llama-7b-sft-v17 <span class="dt">\</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--reward</span> rm-helpful-v9 <span class="dt">\</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--tokenizer</span> tokenizer-v17</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 资源和吞吐预算</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> tools/plan_rlhf_capacity.py <span class="dt">\</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--actor</span> 7b <span class="at">--critic</span> 7b <span class="at">--reward</span> 7b <span class="dt">\</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--rollout-gpus</span> 8 <span class="at">--train-gpus</span> 8 <span class="dt">\</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--samples-per-prompt</span> 2 <span class="at">--max-response-tokens</span> 768</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 恢复协议预演</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> tools/check_checkpoint_manifest.py <span class="dt">\</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>  <span class="at">--manifest-template</span> configs/ppo_manifest_v3.json <span class="dt">\</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>  <span class="at">--strict</span></span></code></pre></div>
+<p>这些命令是平台能力的表达：数据、模型、资源、checkpoint
+在准入时就要失败，而不是训练 6 小时后才失败。</p>
+<h3 id="63-观测指标">6.3 观测指标</h3>
+<p>PPO/RLHF 需要同时观测系统健康和行为健康。</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>指标</th>
+<th>告警例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>rollout</td>
+<td>generated samples/s、output tokens/s、queue wait、KV cache
+usage、weight sync lag</td>
+<td><code>rollout_backlog_ready_seconds &gt; 300</code></td>
+</tr>
+<tr>
+<td>reward</td>
+<td>p50/p95/p99 latency、timeout rate、score distribution、batch
+tokens</td>
+<td><code>rm_p95_latency_ms &gt; 20000 for 5m</code></td>
+</tr>
+<tr>
+<td>reference</td>
+<td>ref forward tokens/s、KL input coverage、version hash</td>
+<td><code>ref_version != manifest.reference</code></td>
+</tr>
+<tr>
+<td>training</td>
+<td>update samples/s、policy loss、value loss、approx KL、clip
+fraction、entropy</td>
+<td><code>approx_kl &gt; 2 * kl_target</code></td>
+</tr>
+<tr>
+<td>buffer</td>
+<td>ready samples、stale samples、version mismatch、sample age</td>
+<td><code>buffer_stale_ratio &gt; 0.02</code></td>
+</tr>
+<tr>
+<td>evaluation</td>
+<td>win-rate、safety regression、format pass、length delta、judge
+disagreement</td>
+<td><code>eval_gate_status = failed</code></td>
+</tr>
+<tr>
+<td>checkpoint</td>
+<td>manifest write time、restore dry-run result、RPO/RTO、artifact hash
+mismatch</td>
+<td><code>last_restore_validation_failed = 1</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="64-发布和回滚">6.4 发布和回滚</h3>
+<p>发布候选不应直接来自"最后一个 checkpoint"。推荐流程：</p>
+<ol type="1">
+<li>checkpoint manager 写入 <code>candidate_manifest</code>。</li>
+<li>eval gate 对固定 suite
+跑自动评测、红队集、格式测试、长度分布、成本估计。</li>
+<li>experiment tracker 生成和基线的差异报告。</li>
+<li>人工抽检只看通过自动门禁的候选。</li>
+<li>release controller 把 actor artifact 推给 serving registry。</li>
+<li>回滚按 manifest 回到上一个 passed checkpoint，不按目录名猜。</li>
 </ol>
-<pre class="mermaid">sequenceDiagram
-  participant Boot as 启动器
-  participant FS as Checkpoint Store
-  participant V as 校验器
-  participant L as 多模型 Loader
-  participant T as Trainer
-  Boot->>FS: 扫描最新 checkpoint-step-N
-  FS-->>Boot: 候选目录列表 + manifest
-  Boot->>V: 读取 checkpoint-manifest.json
-  V->>FS: 列出 policy/critic/ref/RM artifact
-  FS-->>V: size + sha256
-  V->>V: 校验 artifact 完整性 + step 一致性 + tokenizer hash
-  alt 校验失败
-    V-->>Boot: fail fast，回退到上一个完整 commit
-    Boot->>FS: 标记当前目录为孤儿，清理 *.tmp
-  else 校验通过
-    V-->>L: 通过校验
-    L->>FS: 按 manifest 顺序 load policy → critic → ref → RM
-    L->>L: 恢复 KL controller / RNG / data cursor
-    L-->>T: 资源就绪
-    T->>T: 触发 quick-eval 对齐恢复点行为
-  end</pre>
-<h3>与 Ch 12 的差异</h3>
-<p><a href="../part4/12-artifacts-and-checkpoints.html">第 12 章</a> 的"制品 / Checkpoint 管理"讲的是<strong>单模型版本治理</strong>——不同实验、不同发布候选之间的血缘、审计、灰度和回收。本节讲的是<strong>同一训练任务内多模型同 step 的原子性</strong>——同一次 PPO 实验里，policy / critic / reference / RM 四份 artifact 必须以同一个 step 的同一组状态被打包和恢复。前者关注跨实验治理，后者关注单实验内一致性。</p>
-<div class="warn"><strong>失败模式对照：</strong>跨实验治理失败的典型现象是"找不到上线了哪个版本"；单实验一致性失败的典型现象是"训练能继续跑但 reward / KL / advantage 不再对应同一组模型状态"。两个层面都要做，不能彼此替代。</div>
-</section>
-
-<section class="section" id="s4">
-<h2>4. 本章小结</h2>
+<p>失败门禁必须阻断发布，但不一定阻断训练。比如 safety regression
+超阈值时，可以允许训练继续探索，同时把该 checkpoint 标为不可发布；如果
+KL 发散或 reward 分布异常，则应触发早停或回滚到上一个可训练状态。</p>
+<hr />
+<h2 id="7-容量与效率吞吐匹配模型">7. 容量与效率：吞吐匹配模型</h2>
+<h3 id="71-rolloutrewardtraining-的匹配公式">7.1
+rollout、reward、training 的匹配公式</h3>
+<p>设：</p>
+<ul>
+<li><code>P</code> = 每轮 prompt 数。</li>
+<li><code>G</code> = 每个 prompt 生成 response 数。</li>
+<li><code>S = P * G</code> = 每轮样本数。</li>
+<li><code>L_out</code> = 平均生成 token 数。</li>
+<li><code>R_rollout</code> = rollout engine 生成吞吐，单位 output
+tokens/s。</li>
+<li><code>R_rm</code> = Reward Model 打分吞吐，单位 samples/s。</li>
+<li><code>R_train</code> = training engine 消费吞吐，单位
+samples/s。</li>
+<li><code>T_sync</code> = actor 权重同步、buffer 聚合、调度开销。</li>
+</ul>
+<p>则一轮 PPO 的关键路径近似为：</p>
+<p><span class="math display">$$
+T_{iter} \approx \max\left(\frac{S \cdot L_{out}}{R_{rollout}},\
+\frac{S}{R_{rm}}\right) + \frac{S \cdot E_{ppo}}{R_{train}} + T_{sync}
+$$</span></p>
+<p>其中 <code>E_ppo</code> 是每批样本重复训练的 PPO epoch
+数。训练卡是否空转，取决于样本供给：</p>
+<p><span class="math display">$$
+\rho_{train} = \frac{S / T_{rollout+reward}}{R_{train}/E_{ppo}}
+$$</span></p>
+<p>如果 <code>rho_train &lt; 1</code>，训练消费能力大于 rollout+reward
+供给，训练 GPU 会等待；如果 <code>rho_train &gt; 1</code>，buffer
+会堆积，rollout 或 RM 产生的样本可能因为 actor 版本过旧而失效。</p>
+<p>Reward Model 是否是瓶颈，可以用：</p>
+<p><span class="math display">$$
+B_{rm} = \frac{S}{R_{rm}} - \frac{S \cdot L_{out}}{R_{rollout}}
+$$</span></p>
+<p><code>B_rm &gt; 0</code> 表示 reward scoring 慢于 sample
+generation；<code>B_rm &lt; 0</code> 表示 rollout 更慢。</p>
+<h3 id="72-数字模型">7.2 数字模型</h3>
+<p>假设 LLaMA-7B PPO：</p>
+<ul>
+<li><code>P=1024</code>，<code>G=2</code>，每轮
+<code>S=2048</code>。</li>
+<li>平均生成 <code>L_out=512</code> tokens。</li>
+<li>rollout engine 吞吐
+<code>R_rollout=52000 output tokens/s</code>。</li>
+<li>RM 打分吞吐 <code>R_rm=180 samples/s</code>。</li>
+<li>training engine 消费
+<code>R_train=900 samples/s</code>，<code>E_ppo=4</code>。</li>
+<li>权重同步和调度 <code>T_sync=25s</code>。</li>
+</ul>
+<p>计算：</p>
+<pre class="text"><code>T_rollout = 2048 * 512 / 52000 = 20.2s
+T_reward  = 2048 / 180 = 11.4s
+T_update  = 2048 * 4 / 900 = 9.1s
+T_iter    = max(20.2, 11.4) + 9.1 + 25 = 54.3s
+rho_train = 2048 / 20.2 / (900 / 4) = 0.45</code></pre>
+<p>结论：训练引擎只能被喂到约 45%，主要瓶颈是 rollout 和权重同步，不是
+RM。优化方向应该先看 rollout engine batching、生成长度、actor weight
+sync 和 <code>max_num_batched_tokens</code>，而不是盲目加 training
+GPU。</p>
+<p>如果 RM 降到 <code>R_rm=60 samples/s</code>：</p>
+<pre class="text"><code>T_reward = 2048 / 60 = 34.1s
+T_iter   = max(20.2, 34.1) + 9.1 + 25 = 68.2s
+B_rm     = 34.1 - 20.2 = 13.9s</code></pre>
+<p>这时 RM 明确成为瓶颈。正确动作是提高 RM batch tokens、加 RM
+副本、流式打分或降低 rollout 洪峰，而不是改 PPO learning rate。</p>
+<hr />
+<h2 id="8-故障排除">8. 故障排除</h2>
+<h3 id="81-症状证据根因动作表">8.1 症状、证据、根因、动作表</h3>
 <table>
-<tr><th>主题</th><th>关键点</th></tr>
-<tr><td>Post-training</td><td>是 pretraining 之后的一整条塑形管线，不是单个算法名</td></tr>
-<tr><td>Alignment training</td><td>是 post-training 的重要子集，重点解决行为是否符合偏好与约束</td></tr>
-<tr><td>PPO 资源形态</td><td>同时包含推理、打分、更新三条路径，4 个模型并存</td></tr>
-<tr><td>DPO</td><td>只需 policy + reference，最容易平台化</td></tr>
-<tr><td>GRPO</td><td>砍掉 critic，用大 batch rollout 换显存，适合规则奖励场景</td></tr>
-<tr><td>Reward Model</td><td>本质上是训练内环里的推理子系统，吞吐决定训练速度</td></tr>
-<tr><td>Rollout 瓶颈</td><td>是优化重点，不能被当成训练脚本里的附属函数</td></tr>
-<tr><td>实验管理</td><td>checkpoint、评测和数据 lineage 复杂度都明显高于 pretraining</td></tr>
-<tr><td>数据质量</td><td>最终效果高度依赖偏好数据质量，不只是算法</td></tr>
-<tr><td>评测节奏</td><td>训练内环快而粗、发布门禁慢而全，不能混</td></tr>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reward Model latency 升高</td>
+<td><code>rm_p95_latency_ms</code> 从 8s 到 35s；RM GPU 利用率 40%
+但队列长；batch tokens 波动大</td>
+<td>动态 batching 配置太保守；长 response 混入同批；RM
+服务副本不足；网络重试</td>
+<td>按长度分桶；提高 <code>max_batch_tokens</code>；加 RM
+replica；启用流式打分；设置超时后局部重试</td>
+</tr>
+<tr>
+<td>rollout backlog 堆积</td>
+<td><code>buffer_ready_samples</code> 增长但
+<code>sample_age_p95 &gt; 2 updates</code>；actor version lag
+超阈值</td>
+<td>training engine 太慢；PPO epochs 太多；rollout
+生成超过消费；权重同步慢导致样本变旧</td>
+<td>降低 <code>ppo_epochs</code> 或 rollout 并发；按 actor_version
+丢弃过旧样本；提高训练 GPU；缩短 weight sync</td>
+</tr>
+<tr>
+<td>训练卡空转</td>
+<td>training GPU util 周期性降到
+0；<code>rho_train &lt; 1</code>；rollout queue wait 高</td>
+<td>rollout output tokens/s 不足；RM 比 rollout 慢；prompt
+数据加载慢</td>
+<td>用吞吐公式定位；增大 rollout replicas；优化 vLLM
+<code>max_num_batched_tokens</code>；缓存 prompt shard；扩 RM</td>
+</tr>
+<tr>
+<td>checkpoint 多模型不一致</td>
+<td>restore dry-run 报 actor step 820、critic step 800；buffer policy
+hash 不等于 manifest actor hash</td>
+<td>非原子保存；critic 保存失败但 actor
+可见；恢复脚本按最新目录拼接</td>
+<td>使用 atomic manifest；先写临时目录再提交 manifest；恢复时 strict
+hash 校验；坏 manifest 标记 quarantine</td>
+</tr>
+<tr>
+<td>failed evaluation gate</td>
+<td>reward 上升但 win-rate 下降；safety regression 超 1%；平均长度下降
+25%</td>
+<td>reward hacking；KL 太松；RM 长度偏置；评测 prompt template 变更</td>
+<td>阻断 release；回滚到 last passed checkpoint；固定 judge/template
+复评；加长度惩罚或调 KL；抽样人工复核</td>
+</tr>
+<tr>
+<td>KL 突然发散</td>
+<td><code>approx_kl &gt; 2x target</code>，clip fraction 飙升，response
+风格突变</td>
+<td>KL controller 状态丢失；reference 版本错；reward scale 变大</td>
+<td>停止 update；校验 reference hash；恢复 KL controller；降低 LR/reward
+scale；从上一个 manifest 重跑</td>
+</tr>
+<tr>
+<td>critic 学不动</td>
+<td>value loss 高位震荡；explained variance 近 0；policy update
+噪声大</td>
+<td>reward 太稀疏；critic LR 不合适；样本太短或分布漂移</td>
+<td>调 critic LR；增加 batch；做 reward
+normalization；如果任务可规则验证，评估 GRPO</td>
+</tr>
+<tr>
+<td>buffer version mismatch</td>
+<td><code>version_mismatch_count &gt; 0</code>；同 batch 混入多个 RM
+hash</td>
+<td>RM rolling update 没有 drain；actor weight sync
+和样本写入无事务</td>
+<td>RM 灰度必须按 run_id 路由；buffer schema
+强制版本字段；训练前过滤混版样本</td>
+</tr>
+</tbody>
 </table>
-</section>
+<h3 id="82-证据链模板">8.2 证据链模板</h3>
+<p>排查 PPO 事故时不要从 loss 开始猜。建议按这条证据链：</p>
+<pre class="text"><code>1. run manifest: actor/ref/RM/critic/tokenizer/data/eval 是否一致
+2. rollout metrics: samples/s、tokens/s、长度分布、finish_reason、backlog
+3. reward metrics: latency、score distribution、timeout、RM version
+4. training metrics: KL、clip fraction、policy/value loss、entropy
+5. buffer audit: sample_id、actor_version、reward_version、sample_age
+6. eval result: win-rate、safety、format、length、judge disagreement
+7. checkpoint restore: strict hash dry-run、RPO/RTO、last passed step</code></pre>
+<hr />
+<h2 id="9-方案设计--worked-examplellama-7b-pporlhf-pipeline">9. 方案设计
+/ Worked Example：LLaMA-7B PPO/RLHF pipeline</h2>
+<h3 id="91-目标和输入">9.1 目标和输入</h3>
+<p>目标：把 <code>llama-7b-sft-v17</code> 做一轮 helpfulness
+PPO/RLHF，对比 SFT baseline 的自动 judge win-rate 至少提升 6 个点，同时
+safety regression 不超过 1%。</p>
+<p>输入：</p>
+<ul>
+<li>actor 初始权重：<code>llama-7b-sft-v17</code>。</li>
+<li>reference：冻结的 <code>llama-7b-sft-v17</code>。</li>
+<li>Reward Model：<code>rm-helpful-v9</code>，7B reward
+head，bf16。</li>
+<li>prompt dataset：<code>prompts-helpful-v31</code>，80K
+prompts，已按长度和场景分桶。</li>
+<li>eval suite：<code>posttrain-gate-v12</code>，包含
+helpfulness、safety、format、length、red-team。</li>
+<li>硬件：2 节点，每节点 8xH100 80GB，节点内 NVSwitch，节点间 400Gbps
+IB。</li>
+</ul>
+<h3 id="92-gpu-布局">9.2 GPU 布局</h3>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th>GPU</th>
+<th>角色</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>node0</td>
+<td>0-3</td>
+<td>actor training</td>
+<td>FSDP 4-way，AdamW bf16，gradient checkpointing</td>
+</tr>
+<tr>
+<td>node0</td>
+<td>4-5</td>
+<td>critic training</td>
+<td>FSDP 2-way，独立 optimizer，与 actor 同步 checkpoint</td>
+</tr>
+<tr>
+<td>node0</td>
+<td>6</td>
+<td>reference forward</td>
+<td>frozen SFT，批量计算 ref logprobs</td>
+</tr>
+<tr>
+<td>node0</td>
+<td>7</td>
+<td>Reward Model</td>
+<td>frozen RM，本地服务，长度分桶 batching</td>
+</tr>
+<tr>
+<td>node1</td>
+<td>0-7</td>
+<td>rollout engine</td>
+<td>vLLM，4 replicas，每 replica TP=2，接收 actor 权重同步</td>
+</tr>
+</tbody>
+</table>
+<p>这个布局故意把 rollout 放到独立节点。原因是 PPO 的 sample generation
+占关键路径大头，rollout engine 需要 KV cache 和连续推理吞吐；如果和
+actor/critic 共置，阶段切换会产生显存碎片和权重加载峰值。reference/RM
+留在训练节点，是因为 7B 前向可控，且能减少一跳网络；如果 RM p95 超过
+20s，再迁到独立服务池。</p>
+<h3 id="93-显存和吞吐预算">9.3 显存和吞吐预算</h3>
+<p>粗略显存：</p>
+<ul>
+<li>actor 7B 全量训练态：约 84GB，加激活、bucket、碎片后 node0 GPU0-3
+每卡目标峰值 &lt; 62GB。</li>
+<li>critic 7B 训练态分到 2 卡，峰值预计每卡 55-70GB，必须启用 activation
+checkpointing 和较小 microbatch。</li>
+<li>reference/RM 每个 7B bf16 权重约 14GB，加前向 activation 和 batch
+buffer 后单卡 25-40GB。</li>
+<li>rollout node 每 replica TP=2，7B 权重分片后加 KV cache，单卡限制
+<code>gpu_memory_utilization=0.82</code>，给权重同步和 allocator
+留余量。</li>
+</ul>
+<p>吞吐测算采用第 7 节公式：</p>
+<pre class="text"><code>P = 1024 prompts
+G = 2 responses per prompt
+S = 2048 samples
+L_out = 512 tokens
+R_rollout = 52000 output tokens/s
+R_rm = 180 samples/s
+R_train = 900 samples/s
+E_ppo = 4
+T_sync = 25s
 
-<section class="section" id="s5">
-<h2>5. 练习题</h2>
-<p class="caption">练习编号采用 <code>练习 10b-N（基础/进阶/设计）</code> 形式，与 <a href="../appendix/answers.html#第10b章对齐训练与后训练基础设施">附录 A 答案集</a> 一一对应。基础题 = 10b-1 至 10b-6，进阶题 = 10b-7 至 10b-13，设计题 = 10b-14 至 10b-17。</p>
-<h3>练习 10b-1（基础）</h3>
-<p>post-training 和 alignment training 的关系是什么？为什么不能把两者完全等同？</p>
-<h3>练习 10b-2（基础）</h3>
-<p>为什么 PPO 的基础设施形态不能简单等同于 pretraining？至少列出 3 个维度的差异。</p>
-<h3>练习 10b-3（基础）</h3>
-<p>用 LLaMA-7B bf16 全量训练粗估 policy 的参数、梯度、Adam optimizer 显存，为什么会接近 84GB？</p>
-<h3>练习 10b-4（基础）</h3>
-<p>DPO 的偏好对数据一般包含哪些字段？为什么 chosen/rejected 必须来自同一个 prompt？</p>
-<h3>练习 10b-5（基础）</h3>
-<p>Reward Model 适合和训练节点共置还是独立服务？请分别说明模型大小、吞吐和显存余量对决策的影响。</p>
-<h3>练习 10b-6（基础）</h3>
-<p>如果一个 PPO 作业要支持恢复，checkpoint 至少应额外保存哪些状态？</p>
-<h3>练习 10b-7（进阶）</h3>
-<p>假设你要在 8×H100 80GB 上给 7B 模型做全量 PPO，按 policy ~84GB、critic ~84GB、ref ~14GB、RM ~14GB、KV Cache ~10-60GB 估算总账本，并说明为什么总显存够不代表不会 OOM。</p>
-<h3>练习 10b-8（进阶）</h3>
-<p>某团队有 20 万条高质量 chosen/rejected 偏好对、没有稳定 RM、只有 SFT 训练平台。它应优先选 DPO、PPO 还是 GRPO？说明理由和风险。</p>
-<h3>练习 10b-9（进阶）</h3>
-<p>GRPO 相比 PPO 省下了 critic，但代价是每个 prompt 要采样 16-64 个 response。在什么样的任务和硬件配置下，GRPO 会比 PPO 更划算？</p>
-<h3>练习 10b-10（进阶）</h3>
-<p>你发现训练中 reward 越来越高但人工抽查觉得质量变差了。这是什么现象？在基础设施层面应该怎样提前预警？</p>
-<h3>练习 10b-11（进阶）</h3>
-<p>KL 系数调得过大或过小分别会带来什么模型行为和系统指标变化？平台应如何监控和自动干预？</p>
-<h3>练习 10b-12（进阶）</h3>
-<p>rollout 长度从 512 增加到 2048，会如何影响 KV Cache、RM 打分吞吐、step time 和 checkpoint 频率？</p>
-<h3>练习 10b-13（进阶）</h3>
-<p>对同一批 rollout，选择全量打分和流式打分分别会怎样影响 RM 服务的吞吐、尾延迟、重试语义和训练器复杂度？</p>
-<h3>练习 10b-14（设计）</h3>
-<p>你的团队现在只有 4 张 A100 80GB，想做 7B 模型的对齐训练。给出一个从 SFT → 偏好优化 → 上线的完整路线图，说明每一步选什么算法、为什么。</p>
-<h3>练习 10b-15（设计）</h3>
-<p>设计一个 PPO 多模型 checkpoint 恢复策略：如何组织 policy、critic、reference、RM、rollout buffer、KL controller 和数据游标？恢复时应做哪些一致性校验？结合 <a href="#s35">§10b.10</a> 的 Checkpoint 多模型一致性讨论给出 manifest 字段、原子提交流程与失败回滚步骤。</p>
-<h3>练习 10b-16（设计）</h3>
-<p>设计一个 LLM-as-judge 评测 pipeline：从 checkpoint 产生到 quick-eval、judge 打分、门禁、失败样本回流，说明每一步记录哪些版本信息。</p>
-<h3>练习 10b-17（设计）</h3>
-<p>某团队声称他们“用 DPO 完全替代了 PPO，效果一样还更省钱”。结合本章内容，你会问他们哪些问题来判断这个结论是否可靠？</p>
-</section>
+T_iter = 54.3s</code></pre>
+<p>预期每小时约：</p>
+<pre class="text"><code>iterations/hour = 3600 / 54.3 = 66.3
+samples/hour = 66.3 * 2048 = 135,782
+output_tokens/hour = 135,782 * 512 = 69.5M</code></pre>
+<p>这不是最终性能承诺，而是 admission baseline。上线后如果
+<code>T_iter</code> 连续 10 轮高于 70s，orchestrator 应自动标记 capacity
+drift 并输出瓶颈诊断。</p>
+<h3 id="94-瓶颈诊断">9.4 瓶颈诊断</h3>
+<p>运行 3 小时后观测：</p>
+<pre class="text"><code>rollout output tokens/s: 31K, expected 52K
+RM p95 latency: 9.8s, expected &lt; 20s
+training update time: 8.7s, expected 9.1s
+weight sync time: 41s, expected 25s
+rho_train: 0.31
+buffer stale ratio: 0.018
+eval gate at step 80: not run yet</code></pre>
+<p>诊断：</p>
+<ul>
+<li>RM 没有瓶颈，p95 低于阈值。</li>
+<li>training engine 没有瓶颈，update time 符合预期。</li>
+<li>rollout output tokens/s 只有预期 60%，weight sync time 超预期
+16s，训练卡供给率 <code>rho_train=0.31</code>，说明主要瓶颈在 rollout
+和权重同步。</li>
+</ul>
+<p>处理动作：</p>
+<ol type="1">
+<li>检查 vLLM replica 的 <code>max_num_batched_tokens</code> 和实际 KV
+cache。若 GPU memory usage 只有 68%，把
+<code>gpu_memory_utilization</code> 从 0.82 提到
+0.87，<code>max_num_batched_tokens</code> 从 262144 提到 393216。</li>
+<li>把 actor weight sync 从完整 checkpoint 拷贝改成分片增量同步，目标把
+<code>T_sync</code> 降回 25s。</li>
+<li>输出长度 p95 如果超过 900 tokens，收紧 decoding config
+或按长度分桶，避免长样本拖慢 batch。</li>
+<li>继续监控 <code>buffer_stale_ratio</code>，超过 0.02 时丢弃旧
+actor_version 样本，防止 PPO update 混入过旧 policy。</li>
+</ol>
+<p>如果优化后 rollout 到 50K tokens/s 但 RM p95 升到
+35s，则第二阶段动作变成：把 RM 从 node0 GPU7 拆到独立 2-GPU
+服务池，启用流式打分和长度分桶，而不是继续调 rollout。</p>
+<h3 id="95-checkpoint-和-evaluation-gate">9.5 checkpoint 和 evaluation
+gate</h3>
+<p>每 20 个 PPO update 写一次 manifest。写入顺序：</p>
+<ol type="1">
+<li>actor、critic 分别写临时 shard。</li>
+<li>buffer 写入本轮可恢复样本和 policy_version。</li>
+<li>checkpoint manager 校验 reference/RM/tokenizer/data/eval artifact
+hash。</li>
+<li>写 <code>manifest.tmp</code>，restore dry-run 通过后 rename 为可见
+manifest。</li>
+<li>eval gate 异步评测该 manifest。</li>
+</ol>
+<p>门禁阈值：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>阈值</th>
+<th>失败动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>helpful win-rate vs SFT</td>
+<td><code>&gt;= 0.56</code></td>
+<td>标记不可发布，继续训练最多 2 个 gate 周期</td>
+</tr>
+<tr>
+<td>safety regression</td>
+<td><code>&lt;= 0.01</code></td>
+<td>立即阻断 release，触发安全集抽样</td>
+</tr>
+<tr>
+<td>format pass rate</td>
+<td><code>&gt;= 0.98</code></td>
+<td>阻断 release，生成格式错误样本报告</td>
+</tr>
+<tr>
+<td>avg response tokens delta</td>
+<td><code>&lt;= 0.15</code></td>
+<td>检查 reward 长度偏置和 decoding</td>
+</tr>
+<tr>
+<td>KL mean</td>
+<td><code>&lt;= 0.08</code></td>
+<td>若连续 3 轮超阈值，回滚到 last passed checkpoint</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10-反模式">10. 反模式</h2>
+<ol type="1">
+<li><strong>把 PPO 当成 train.py 参数</strong>：没有
+rollout/RM/buffer/checkpoint 独立指标，故障时只能看 loss 猜。</li>
+<li><strong>只保存 actor checkpoint</strong>：恢复后 critic、KL
+controller、buffer 和 RM 版本对不上，曲线不可解释。</li>
+<li><strong>RM 不版本化 prompt template</strong>：同一个 RM
+权重不同模板会产生不同 score distribution。</li>
+<li><strong>用最终 reward 决定发布</strong>：reward
+可能被攻击，发布必须看 eval gate 和人工抽检。</li>
+<li><strong>rollout 无限堆 buffer</strong>：样本来自旧 actor，PPO
+更新会变成离线混版训练。</li>
+<li><strong>DPO 没有 reference 校验</strong>：policy/ref tokenizer
+或截断不一致时，DPO loss 会优化错误目标。</li>
+<li><strong>GRPO 只看省 critic</strong>：去掉 critic 后 rollout
+样本数暴涨，推理引擎弱时总成本可能更高。</li>
+<li><strong>共置所有模型不留峰值余量</strong>：平均显存低不代表阶段切换、KV
+cache、checkpoint、NCCL buffer 不会 OOM。</li>
+</ol>
+<hr />
+<h2 id="11-checklistpost-training-pipeline-readiness">11.
+Checklist：post-training pipeline readiness</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" />SFT、RM、DPO、PPO、GRPO
+作业类型在平台 schema 中有明确 role 和 resource contract。</label></li>
+<li><label><input type="checkbox" />actor、reference、Reward
+Model、critic、tokenizer、chat template、prompt/config、data、eval suite
+都进入版本矩阵。</label></li>
+<li><label><input type="checkbox" />rollout 样本包含
+sample_id、prompt_id、actor_version、reference_version、reward_version、decoding
+config。</label></li>
+<li><label><input type="checkbox" />replay/buffer 拒绝混 actor/RM
+版本的样本进入同一 update。</label></li>
+<li><label><input type="checkbox" />rollout、reward scoring、training
+consumption 有容量模型和 admission 阈值。</label></li>
+<li><label><input type="checkbox" />RM 服务有 p95
+latency、timeout、batch tokens、score distribution、version route
+指标。</label></li>
+<li><label><input type="checkbox" />actor 权重同步到 rollout engine 有
+max staleness 约束和失败重试。</label></li>
+<li><label><input type="checkbox" />checkpoint 使用 atomic
+manifest，包含 actor/critic/ref/RM/buffer/controller/RNG/data
+cursor。</label></li>
+<li><label><input type="checkbox" />restore dry-run 是 checkpoint
+写入门槛，不是事故后手工动作。</label></li>
+<li><label><input type="checkbox" />eval gate 能阻断 release，并记录失败
+checkpoint 的指标和样本。</label></li>
+<li><label><input type="checkbox" />experiment tracker 能按 run_id
+对比数据版本、prompt template、reward version、KL、win-rate
+和安全回归。</label></li>
+<li><label><input type="checkbox" />PPO 有 KL 发散、reward
+hacking、长度崩塌、critic 学不动的早停或回滚策略。</label></li>
+<li><label><input type="checkbox" />DPO 有 reference logprob
+一致性检查、beta 扫描、chosen/rejected margin
+和长度分布监控。</label></li>
+<li><label><input type="checkbox" />GRPO 有 group size、组内 reward
+方差、rollout tokens/s 和规则 reward 可信度监控。</label></li>
+<li><label><input type="checkbox" />发布只允许引用 passed
+manifest，不允许手工挑 actor 权重目录。</label></li>
+</ul>
+<hr />
+<h2 id="12-本章小结">12. 本章小结</h2>
+<p>后训练的核心不是"哪个对齐算法最好"，而是外部偏好如何通过可控系统进入模型参数。SFT
+是离线监督入口，RM 是偏好信号服务，DPO 是最容易平台化的离线偏好优化，PPO
+是最完整也最重的训推混合闭环，GRPO 用更多 rollout 样本换掉 critic。</p>
+<p>对 AI Infra 工程师来说，PPO/RLHF 的主要工作不是推导算法公式，而是把
+actor、reference、Reward Model、critic、rollout engine、training
+engine、buffer、checkpoint、eval gate
+变成可观测、可恢复、可扩容、可治理的系统。只要 rollout/training
+吞吐不匹配、多模型 checkpoint 不一致、RM
+版本漂移或评测门禁缺失，训练结果就算跑完也难以交付。</p>
+<hr />
+<h2 id="13-练习题">13. 练习题</h2>
+<ol type="1">
+<li>你的平台有 8xH100，只能跑一个 7B 后训练作业。给出
+SFT、DPO、PPO、GRPO 四种路线的资源布局，并说明你会先上线哪一种。</li>
+<li>一个 PPO run 的 reward 从 1.8 涨到 2.6，但 eval win-rate 从 55% 降到
+48%。按本章证据链列出你要查的 8 个指标。</li>
+<li>设计一个 checkpoint manifest，要求支持
+actor/critic/RM/reference/tokenizer/prompt dataset/eval suite 的 strict
+restore。</li>
+<li>计算：<code>P=2048</code>、<code>G=4</code>、<code>L_out=384</code>、<code>R_rollout=90000 tokens/s</code>、<code>R_rm=160 samples/s</code>、<code>R_train=1200 samples/s</code>、<code>E_ppo=4</code>、<code>T_sync=30s</code>
+时，瓶颈在哪一段？</li>
+<li>你的 DPO 训练 loss 正常下降，但输出平均长度增加
+40%。列出三种可能根因和对应的平台证据。</li>
+<li>对一个数学 reasoning 任务，比较 PPO 和 GRPO 的平台成本。假设规则
+reward 几乎免费，但每个 prompt 需要 <code>G=32</code> 个 response。</li>
+</ol>
 
-<section class="refbox">
-<h2>参考资料与学习路线</h2>
-<div class="grid-2">
-<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复机制；再用本章理解 post-training 闭环；随后阅读 <a href="../part3/10c-finetuning-and-multi-adapter.html">第 10c 章</a> 的 fine-tuning 与多 Adapter 服务；最后结合 <a href="../part5/14-online-inference-architecture.html">第 14 章</a> 理解 RM、judge、rollout engine 的推理服务化。</div>
-<div class="card"><strong>延伸阅读</strong><br>建议对照阅读 RLHF/PPO、DPO、GRPO、OpenRLHF、Verl、TRL、vLLM/SGLang 的官方文档或论文，重点不是背算法公式，而是比较它们的模型数量、rollout 形态、显存账本、checkpoint 状态和评测门禁。</div>
-</div>
-<div class="note"><strong>关联章节：</strong>本章建立在 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复机制之上，也和 <a href="../part3/10c-finetuning-and-multi-adapter.html">第 10c 章</a> 的微调形态、<a href="../part5/14-online-inference-architecture.html">第 14 章</a> 的推理系统强相关。对齐训练经常同时消耗训练资源和推理资源。</div>
 </section>
-
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
 </main>

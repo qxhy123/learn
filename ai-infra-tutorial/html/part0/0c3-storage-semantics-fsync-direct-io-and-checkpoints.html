@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0c3 章 · fsync、Direct IO 与 checkpoint 语义 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0c3" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0c3 章 · fsync、Direct IO 与 checkpoint 语义</h1>
+<p class="sub">把 write、fsync、rename、dir fsync、O_DIRECT、io_uring 组织成可恢复的 checkpoint 发布协议。</p>
+<div class="chips"><span class="chip">fsync</span><span class="chip">rename</span><span class="chip">O_DIRECT</span><span class="chip">io_uring</span><span class="chip">checkpoint</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</a></li><li><a class="anchor" href="#write-成功到底意味着什么">2. write 成功到底意味着什么</a></li><li><a class="anchor" href="#fsyncfdatasyncsyncfs">3. fsync、fdatasync、syncfs</a></li><li><a class="anchor" href="#rename-的原子性和限制">4. rename 的原子性和限制</a></li><li><a class="anchor" href="#父目录-fsync">5. 父目录 fsync</a></li><li><a class="anchor" href="#标准-checkpoint-发布协议">6. 标准 checkpoint 发布协议</a></li><li><a class="anchor" href="#checkpoint-crash-matrix">7. Checkpoint crash matrix</a></li><li><a class="anchor" href="#direct-io">8. Direct IO</a></li><li><a class="anchor" href="#o_synco_dsyncrwf_dsync">9. O_SYNC、O_DSYNC、RWF_DSYNC</a></li><li><a class="anchor" href="#io_uring-文件-io">10. io_uring 文件 IO</a></li><li><a class="anchor" href="#命令观测看语义和延迟">11. 命令观测：看语义和延迟</a></li><li><a class="anchor" href="#worked-example16-rank-checkpoint-发布">12. Worked example：16
+rank checkpoint 发布</a></li><li><a class="anchor" href="#mini-case为什么只-rename-final-不够">13. Mini case：为什么只
+rename final 不够</a></li><li><a class="anchor" href="#sopcheckpoint-语义验收">14. SOP：checkpoint 语义验收</a></li><li><a class="anchor" href="#checklist">15. Checklist</a></li><li><a class="anchor" href="#练习">16. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章承接 <a
+href="0c1-vfs-inode-dentry-and-block-layer.html">0c1</a> 的 VFS/Page
+Cache 和 <a href="0c2-local-filesystems-ext4-xfs-zfs.html">0c2</a>
+的本地文件系统机制，目标是把“写完了”拆成可证明的发布协议。对象存储发布方式见
+<a
+href="0c4-object-storage-parallel-filesystems-and-dataset-io.html">0c4</a>。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习地图">1. 第一性原理拆解 + 学习地图</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>应用想表达的是：“这个 checkpoint 可以恢复训练”。 操作系统看到的是一串
+<code>write()</code>、<code>rename()</code>、<code>fsync()</code>、<code>close()</code>、目录更新和设备
+flush。 失败可以发生在任意两步之间。 因此 checkpoint
+质量不是看文件名是否出现，而是看 crash 后 reader 会看到什么状态。</p>
+<h3 id="推从问题推出机制">推：从问题推出机制</h3>
+<ul>
+<li><code>write()</code> 只说明字节进入内核路径，不等于稳定存储。</li>
+<li><code>fsync(file)</code>
+推动文件数据和必要元数据持久化，但不一定持久化父目录项。</li>
+<li><code>rename(old, new)</code>
+在同一目录同一文件系统内提供原子命名切换，但不替你 sync 数据。</li>
+<li><code>fsync(parent_dir)</code> 用来持久化目录项创建、删除或 rename
+的结果。</li>
+<li><code>O_DIRECT</code>、<code>O_SYNC</code>、<code>RWF_DSYNC</code>、<code>io_uring</code>
+改变提交路径或等待点，但不改变应用必须定义发布协议这个事实。</li>
+</ul>
+<h3 id="绘安全发布的状态机">绘：安全发布的状态机</h3>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> WritingTmp
+  WritingTmp --> FileSynced: fsync(tmp fd)
+  FileSynced --> Renamed: rename(tmp, final)
+  Renamed --> DirSynced: fsync(parent dir)
+  DirSynced --> ManifestSynced: write+fsync manifest
+  ManifestSynced --> Published: rename manifest + fsync dir
+  WritingTmp --> Cleanup: crash or error
+  FileSynced --> Cleanup: crash before rename
+  Renamed --> Recoverable: crash before dir fsync
+  DirSynced --> Recoverable: final file durable
+  Published --> [*]</pre>
+<h3 id="导本章读完后能做什么">导：本章读完后能做什么</h3>
+<ol type="1">
+<li>区分
+<code>write</code>、<code>fdatasync</code>、<code>fsync</code>、<code>syncfs</code>、<code>close</code>
+的语义。</li>
+<li>解释为什么安全 checkpoint 常需要 temp file、file fsync、rename、dir
+fsync、manifest。</li>
+<li>设计 checkpoint crash matrix，而不是重复相信“rename 原子”。</li>
+<li>判断
+<code>O_DIRECT</code>、<code>io_uring</code>、<code>RWF_DSYNC</code>
+对性能和语义分别改变了什么。</li>
+<li>写出训练恢复、模型发布和 dataset manifest 的 SOP。</li>
+</ol>
+<h2 id="write-成功到底意味着什么">2. write 成功到底意味着什么</h2>
+<p><code>write(fd, buf, len)</code>
+返回成功，最小含义是内核接受了这些字节的一部分或全部。 对 buffered
+IO，它通常已经把用户缓冲区复制进 Page Cache，并把相关页标记 dirty。
+它不表示数据已经写到 SSD，也不表示设备的易失 cache 已经 flush。</p>
+<p><code>write()</code> 可能短写。
+网络文件系统、配额、ENOSPC、EIO、信号中断都可能导致返回值小于请求长度。
+可靠写入循环必须处理短写和错误。</p>
+<pre class="c"><code>ssize_t full_write(int fd, const char *p, size_t n) {
+    size_t off = 0;
+    while (off &lt; n) {
+        ssize_t r = write(fd, p + off, n - off);
+        if (r &gt; 0) { off += (size_t)r; continue; }
+        if (r &lt; 0 &amp;&amp; errno == EINTR) continue;
+        return -1;
+    }
+    return (ssize_t)off;
+}</code></pre>
+<p><code>close()</code> 也可能返回错误。 如果之前的 writeback
+失败，错误可能延迟到 <code>fsync()</code> 或 <code>close()</code>
+才暴露。 训练代码如果忽略 close/fsync 错误，就可能把坏 checkpoint
+标记为成功。</p>
+<h2 id="fsyncfdatasyncsyncfs">3. fsync、fdatasync、syncfs</h2>
+<p><code>fsync(fd)</code>
+请求把文件数据和恢复该文件所需的元数据写到稳定存储。
+如果文件大小变化，size 元数据也需要持久化。
+如果只是覆盖已有范围，<code>fdatasync(fd)</code>
+可能少同步部分时间戳等非必要元数据。
+实际差异取决于文件系统和内核实现。</p>
+<p><code>syncfs(fd)</code> 作用在 fd
+所在文件系统，把该文件系统上的脏数据推进同步。
+它适合管理工具，不适合作为单个 checkpoint 的精确发布边界。</p>
+<p>常见误解：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>调用</th>
+<th>能说明什么</th>
+<th>不能说明什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>write()</code></td>
+<td>内核接受了字节</td>
+<td>字节已经持久化</td>
+</tr>
+<tr>
+<td><code>fsync(file)</code></td>
+<td>文件内容和必要元数据已推进持久化</td>
+<td>父目录项一定持久化</td>
+</tr>
+<tr>
+<td><code>fdatasync(file)</code></td>
+<td>文件数据和必要元数据已推进持久化</td>
+<td>所有元数据都持久化</td>
+</tr>
+<tr>
+<td><code>close()</code></td>
+<td>fd 被释放，可能报告延迟错误</td>
+<td>自动完成正确发布协议</td>
+</tr>
+<tr>
+<td><code>syncfs()</code></td>
+<td>文件系统级同步请求</td>
+<td>单文件原子发布</td>
+</tr>
+</tbody>
+</table>
+<h2 id="rename-的原子性和限制">4. rename 的原子性和限制</h2>
+<p><code>rename(old, new)</code>
+在同一挂载的同一文件系统内是命名原子操作。 reader
+要么看到旧名字，要么看到新名字，不会看到半个目录项。 如果
+<code>new</code> 已存在，POSIX 语义下替换也是原子的。</p>
+<p>限制必须说清：</p>
+<ul>
+<li>跨文件系统 rename 会失败为 <code>EXDEV</code>，应用常退化成 copy +
+unlink，这不再是原子切换。</li>
+<li>rename 原子不代表新文件内容已经落盘。</li>
+<li>rename 后如果不 <code>fsync(parent_dir)</code>，crash
+后目录项更新是否保留不能作为应用协议假设。</li>
+<li>对象存储里的 rename 通常不是这个语义，见 0c4。</li>
+</ul>
+<p><code>renameat2()</code> 还提供
+<code>RENAME_NOREPLACE</code>、<code>RENAME_EXCHANGE</code> 等选项。
+它们能表达“不要覆盖”或“交换两个名字”，但仍不能替代 file fsync 和 dir
+fsync。</p>
+<h2 id="父目录-fsync">5. 父目录 fsync</h2>
+<p>目录也是文件系统对象。 创建文件、unlink、rename
+会改变父目录的目录项。 <code>fsync(file)</code>
+关注文件内容和该文件自身必要元数据；父目录的命名更新需要对目录 fd 调用
+<code>fsync()</code>。</p>
+<p>安全发布通常要：</p>
+<pre class="text"><code>open tmp
+write all bytes
+fsync tmp file
+close tmp file
+rename tmp -&gt; final
+open parent directory
+fsync parent directory
+close parent directory</code></pre>
+<p>目录 fd 示例：</p>
+<pre class="c"><code>int dfd = open(&quot;/mnt/ckpt/run42&quot;, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+if (dfd &lt; 0) abort();
+if (fsync(dfd) &lt; 0) abort();
+close(dfd);</code></pre>
+<p>一些文件系统或挂载组合对目录 fsync 的支持和语义不同。
+生产协议应在目标文件系统上做 crash 演练，而不是只依赖开发机经验。</p>
+<h2 id="标准-checkpoint-发布协议">6. 标准 checkpoint 发布协议</h2>
+<p>单文件 checkpoint 的保守协议：</p>
+<ol type="1">
+<li>写到同目录临时文件，例如
+<code>model.safetensors.tmp.&lt;pid&gt;</code>。</li>
+<li>处理所有短写和错误。</li>
+<li><code>fsync(tmp_fd)</code>。</li>
+<li><code>close(tmp_fd)</code> 并检查返回值。</li>
+<li><code>rename(tmp, final)</code>。</li>
+<li><code>fsync(parent_dir)</code>。</li>
+<li>更新 manifest 或 <code>latest</code> 指针时重复同样的 temp + fsync +
+rename + dir fsync。</li>
+</ol>
+<p>多 rank checkpoint 的推荐结构：</p>
+<pre class="text"><code>ckpt-000123.tmp/
+  rank-00000.bin
+  rank-00001.bin
+  ...
+  metadata.json
+ckpt-000123/              # rename or manifest published only after all files synced
+latest.json               # small manifest pointer</code></pre>
+<p>如果目录整体 rename
+在同一文件系统内可用，可以先完成临时目录内所有文件 fsync，再 rename
+目录，最后 fsync 父目录。
+但很多对象存储或远端文件系统不提供同样语义，因此跨后端可移植方案更偏向
+manifest 发布。</p>
+<h2 id="checkpoint-crash-matrix">7. Checkpoint crash matrix</h2>
+<p>下面的矩阵用于检查 reader 在不同失败点会看到什么。
+它不是重复同一张表，而是把协议动作和可见状态对应起来。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>失败点</th>
+<th>目录里可能看到</th>
+<th>reader 应该怎么做</th>
+<th>是否可接受</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>写 tmp 中</td>
+<td><code>*.tmp</code> 或残缺临时目录</td>
+<td>忽略 tmp，后台清理</td>
+<td>可接受</td>
+</tr>
+<tr>
+<td><code>fsync(tmp)</code> 前</td>
+<td>tmp 内容不可信</td>
+<td>忽略 tmp</td>
+<td>可接受</td>
+</tr>
+<tr>
+<td><code>fsync(tmp)</code> 后、rename 前</td>
+<td>tmp 完整但未发布</td>
+<td>忽略 tmp</td>
+<td>可接受</td>
+</tr>
+<tr>
+<td>rename 后、dir fsync 前</td>
+<td>final 可能可见，crash 后可能回退</td>
+<td>reader 只相信 manifest</td>
+<td>取决于协议</td>
+</tr>
+<tr>
+<td>dir fsync 后、manifest 前</td>
+<td>final durable 但未进入 latest</td>
+<td>恢复工具可扫描，默认 reader 不读</td>
+<td>可接受</td>
+</tr>
+<tr>
+<td>manifest temp 写入中</td>
+<td><code>latest.tmp</code></td>
+<td>忽略 tmp</td>
+<td>可接受</td>
+</tr>
+<tr>
+<td>manifest rename + dir fsync 后</td>
+<td><code>latest.json</code> 指向完整文件集</td>
+<td>按 manifest 校验后读取</td>
+<td>目标状态</td>
+</tr>
+</tbody>
+</table>
+<p>关键原则：reader 不扫描“看起来像 checkpoint 的目录”作为真相。 reader
+只读取已经发布并通过校验的 manifest。
+这样目录中存在临时文件、孤儿完整文件、旧版本都不会破坏恢复。</p>
+<h2 id="direct-io">8. Direct IO</h2>
+<p><code>O_DIRECT</code> 主要改变缓存路径。 它减少 Page Cache
+污染和一次内存复制，允许应用更直接地控制 IO 并发。
+它不自动提供数据完整性协议。 <code>O_DIRECT</code>
+写成功后，如果没有同步标志或 <code>fsync()</code>，仍然不能把 checkpoint
+标记为已发布。</p>
+<p>Direct IO 要注意：</p>
+<ul>
+<li>buffer 地址、长度、文件 offset 常需要按块大小对齐。</li>
+<li>混用 buffered IO 和 Direct IO
+访问同一文件会引入一致性和性能复杂度。</li>
+<li>小 IO 使用 Direct IO 可能牺牲 Page Cache 合并和 readahead。</li>
+<li>某些文件系统在不满足条件时失败或退化，必须实测。</li>
+</ul>
+<p>对 checkpoint，大块 Direct IO + 显式 <code>fsync()</code> 可能有用。
+对 dataset 读取，buffered IO 通常更容易利用 Page Cache 和
+readahead。</p>
+<h2 id="o_synco_dsyncrwf_dsync">9. O_SYNC、O_DSYNC、RWF_DSYNC</h2>
+<p><code>O_SYNC</code> 让每次 write 等待数据和相关元数据同步完成。
+<code>O_DSYNC</code> 更接近每次 write 后执行 data
+sync，可能少同步部分非必要元数据。 <code>pwritev2()</code> 的
+<code>RWF_DSYNC</code> 让同步语义作用在单次写请求上，而不是整个 fd
+生命周期。</p>
+<p>这些选项的代价是每个写请求都可能触发更频繁的 flush 或 log force。
+如果 checkpoint 由许多小 tensor write 组成，逐次同步会极慢。
+更常见的高效协议是批量写完一个大文件后 <code>fsync()</code> 一次。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>方式</th>
+<th>适合</th>
+<th>不适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>buffered + final fsync</td>
+<td>大 checkpoint、manifest</td>
+<td>需要每条记录立即持久的日志</td>
+</tr>
+<tr>
+<td><code>O_DSYNC</code></td>
+<td>小型事务日志</td>
+<td>大量小 tensor 分片写</td>
+</tr>
+<tr>
+<td><code>RWF_DSYNC</code></td>
+<td>局部同步请求</td>
+<td>老内核或不支持文件系统</td>
+</tr>
+<tr>
+<td>Direct IO + fsync</td>
+<td>避免 cache 污染的大文件</td>
+<td>不对齐短写、复杂格式</td>
+</tr>
+</tbody>
+</table>
+<h2 id="io_uring-文件-io">10. io_uring 文件 IO</h2>
+<p><code>io_uring</code> 改变提交和完成模型。 应用把 SQE 放进 submission
+queue，内核完成后写 CQE。 它可以减少系统调用次数，提升高并发 IO
+的提交效率，并支持 linked operation、fixed file、registered buffer
+等优化。</p>
+<p>但 <code>io_uring</code> 不改变持久化语义。 一个 async write
+完成，只说明该写请求完成到对应语义点。 如果需要 durable
+publish，仍然要提交 fsync 请求，并在 fsync CQE 成功后再 rename 或发布
+manifest。</p>
+<p>文件 IO 中使用 <code>io_uring</code> 的判断：</p>
+<ul>
+<li>有大量并发请求、希望减少 syscall overhead，值得评估。</li>
+<li>单个大 checkpoint 顺序写，瓶颈常在设备和 flush，收益可能有限。</li>
+<li>需要严格顺序时，用 linked SQE
+或应用状态机表达依赖，不要只靠提交顺序猜测。</li>
+<li>任何 CQE error 都必须进入失败路径，不能只统计成功吞吐。</li>
+</ul>
+<h2 id="命令观测看语义和延迟">11. 命令观测：看语义和延迟</h2>
+<p>观察系统调用：</p>
+<pre class="bash"><code>strace -f -tt -e trace=openat,write,pwrite64,fdatasync,fsync,rename,close -p &lt;pid&gt;</code></pre>
+<p>观察 dirty/writeback：</p>
+<pre class="bash"><code>grep -E &#39;Dirty|Writeback|Cached&#39; /proc/meminfo
+vmstat 1</code></pre>
+<p>观察设备 flush 和延迟：</p>
+<pre class="bash"><code>iostat -x 1
+blktrace -d /dev/nvme0n1 -o - 2&gt;/dev/null | blkparse -i - | head</code></pre>
+<p>用 <code>fio</code> 近似 checkpoint：</p>
+<pre class="bash"><code>fio --name=ckpt --directory=/mnt/ckpt --rw=write --bs=4m \
+  --size=20g --numjobs=8 --iodepth=8 --direct=1 \
+  --ioengine=libaio --fsync_on_close=1 --group_reporting</code></pre>
+<p>如果 <code>write</code> 阶段快而 <code>fsync_on_close</code> 或 close
+阶段长，说明数据被缓存吸收，真正持久化成本集中在尾部。 这对训练 step
+time 的影响取决于 checkpoint 是否在 critical path 上。</p>
+<h2 id="worked-example16-rank-checkpoint-发布">12. Worked example：16
+rank checkpoint 发布</h2>
+<p>场景：16 rank，每个 rank 写 50GB，总 checkpoint 800GB。 要求 crash
+后要么恢复到旧 checkpoint，要么恢复到完整新 checkpoint，不能读到部分
+rank。</p>
+<p>设计：</p>
+<pre class="text"><code>runs/job-7/
+  ckpt-0041/
+    manifest.json
+  ckpt-0042.tmp.&lt;uuid&gt;/
+    rank-00000.bin
+    ...
+    rank-00015.bin
+    metadata.json
+  latest.json</code></pre>
+<p>每个 rank：</p>
+<ol type="1">
+<li>写自己的 <code>rank-xxxxx.bin.tmp</code>。</li>
+<li><code>fsync(file)</code>。</li>
+<li><code>rename(tmp, rank-xxxxx.bin)</code>。</li>
+<li><code>fsync(ckpt_tmp_dir)</code> 或由协调者统一 fsync 目录。</li>
+<li>报告 checksum、size、duration。</li>
+</ol>
+<p>协调者：</p>
+<ol type="1">
+<li>等待所有 rank 成功。</li>
+<li>写 <code>metadata.json.tmp</code>，包含 rank
+文件名、size、checksum、global step、代码版本。</li>
+<li>fsync metadata，rename metadata，fsync 临时目录。</li>
+<li>发布 <code>latest.json.tmp</code>，指向
+<code>ckpt-0042.tmp.&lt;uuid&gt;</code> 或最终目录名。</li>
+<li>如果需要目录名稳定，先 rename 目录为 <code>ckpt-0042</code>，fsync
+父目录，再发布 latest。</li>
+</ol>
+<p>恢复：只读取 <code>latest.json</code> 指向的 manifest。
+逐项校验文件存在、size 和 checksum。 任何不匹配都回退到上一个 latest
+或进入人工恢复流程。</p>
+<h2 id="mini-case为什么只-rename-final-不够">13. Mini case：为什么只
+rename final 不够</h2>
+<p>错误实现：</p>
+<pre class="text"><code>open final
+write bytes
+close final
+rename final latest</code></pre>
+<p>问题有三个。 第一，reader 可能在写入过程中看到
+final，因为写入目标不是 tmp。 第二，close 错误被忽略时，latest
+可能指向损坏文件。 第三，rename latest 没有配套文件 fsync 和目录
+fsync，crash 后可能丢失目录项或文件内容。</p>
+<p>修正后：</p>
+<pre class="text"><code>write final.tmp
+fsync final.tmp
+close final.tmp with error check
+rename final.tmp final
+fsync parent dir
+write latest.tmp
+fsync latest.tmp
+rename latest.tmp latest
+fsync parent dir</code></pre>
+<p>这个协议牺牲了一些尾延迟，换来明确的恢复状态。
+如果尾延迟不可接受，应优化文件布局、并发、设备和异步上传，而不是删除同步步骤。</p>
+<h2 id="sopcheckpoint-语义验收">14. SOP：checkpoint 语义验收</h2>
+<ol type="1">
+<li>写出发布协议状态机，明确 reader 只相信什么入口。</li>
+<li>所有写入处理短写、EINTR、ENOSPC、EDQUOT、EIO。</li>
+<li>文件内容写完后 <code>fsync(file)</code>，并检查返回值。</li>
+<li>rename 后 <code>fsync(parent_dir)</code>。</li>
+<li>manifest 包含 size、checksum、rank 数、训练 step、格式版本。</li>
+<li>恢复流程验证 manifest，不靠目录扫描猜测完整性。</li>
+<li>压测包括正常写、kill -9、节点重启、满盘、权限错误、远端 IO
+error。</li>
+<li>记录 fsync p50/p95/p99 和最大值，不只记录平均吞吐。</li>
+<li>对对象存储使用 manifest/multipart 协议，不假设 POSIX rename。</li>
+</ol>
+<h2 id="checklist">15. Checklist</h2>
+<ul>
+<li>是否把 <code>write()</code> 成功和持久化成功分开处理？</li>
+<li>是否检查 <code>fsync()</code> 和 <code>close()</code> 错误？</li>
+<li>是否在 rename 后同步父目录？</li>
+<li>是否避免 reader 直接读取临时文件或未发布目录？</li>
+<li>是否为多 rank checkpoint 设计 all-or-nothing manifest？</li>
+<li>是否知道当前后端是否支持目录 fsync、rename 原子性和 Direct IO？</li>
+<li>是否把 <code>io_uring</code> 看作提交机制，而不是持久化协议？</li>
+<li>是否做过 crash 演练并保存结果？</li>
+</ul>
+<h2 id="练习">16. 练习</h2>
+<ol type="1">
+<li>解释 <code>fsync(file)</code> 后为什么还可能需要
+<code>fsync(parent_dir)</code>。</li>
+<li>设计一个三文件 checkpoint 的 manifest 格式，包含 checksum 和
+size。</li>
+<li>说明 <code>O_DIRECT</code> 能减少什么，不能保证什么。</li>
+<li>把一个错误的“直接写 final 文件”协议改成安全发布协议。</li>
+<li>给出 5 个 crash 注入点，并写出 reader 应看到的结果。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

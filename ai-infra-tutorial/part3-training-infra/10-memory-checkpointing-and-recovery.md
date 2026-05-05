@@ -1,1572 +1,912 @@
-# 第10章：内存优化、检查点与恢复（扩充版）
+# 第10章：内存优化、Checkpoint 与恢复
 
-> 长时间训练任务一定要假设“它会失败”；内存优化和 checkpoint 机制，本质上都是在和资源约束以及失败概率做交易。
+> 长训练任务不是“一次跑完”的程序，而是一个持续数天到数月的分布式状态机。本章把显存优化、checkpoint、恢复、TorchElastic、NCCL hang 和 straggler detection 放在同一个可靠性控制面里讨论。
 
-> **关联章节**：本章内容与 [第8章](./08-data-parallel.md) 的通信停顿、[第9章](./09-model-pipeline-parallel.md) 的状态切分密切相关。并行策略决定 checkpoint 的形态，checkpoint 反过来也会影响训练节奏。
+> **关联章节**：第7章建立单机 step 和显存基线；第8章讨论数据并行同步与 NCCL 证据链；第9章讨论 TP/PP/CP/FSDP/ZeRO 等并行策略。第10章关注这些策略如何被保存、验证、恢复和治理。
 
 ---
 
 ## 1. 第一性原理拆解 + 学习大纲
 
-### 拆 — 不可化简的问题
+### 1.1 不可化简的问题
 
-剥掉 activation checkpointing、ZeRO、FSDP、NCCL、TorchElastic、SafeTensors 这些工具名以后，本章只剩下一个不可化简的问题：**一次训练是一个长时间运行的状态转移过程，而它依赖的显存、网络、存储、节点和调度系统都不是无限、稳定、同步的资源；我们怎样在这些资源会耗尽、会变慢、会失联、会写坏的现实里，让状态仍然正确地向前推进？** 这比“模型能不能放进显存”更基础。模型参数只是状态的一部分，训练还同时携带梯度、优化器动量、scheduler、随机数、数据进度、并行分片布局和临时通信 buffer。推理阶段通常只要把权重放好并完成一次前向；训练阶段则要保留足够多的历史信息，以便反向传播能计算梯度、优化器能按正确轨迹更新、恢复后还能解释 loss 曲线为什么连续或为什么跳变。
+训练系统最小的事实不是“模型很大”，而是：
 
-很多人第一次做大模型训练时，会把问题理解成三个孤立问题：模型能不能放进显存，代码能不能跑起来，训练能不能继续。但工程现实里它们会连在一起：显存不够，于是引入激活重计算或状态切分；状态被切分后，checkpoint 不再是一个 `model.pt` 文件；checkpoint 变复杂后，恢复逻辑、存储后端、清理策略也必须跟着升级；作业规模变大以后，失败从“偶发事故”变成“系统常态”。所以本章不是单独讲“省显存技巧”，也不是单独讲“断点续训”，而是把两件事放到同一个平台工程视角下看：如何让训练在资源受限、故障频发、同步点很多的条件下，仍然能稳定推进。
+> 训练是一个长时间运行的状态转移过程；状态大到无法完整复制在每张 GPU 上，运行时间长到一定会遇到 GPU、网络、存储、节点、调度器或代码发布失败。
 
-这个不可化简问题还有一个容易被低估的维度：同步训练的进度不是由平均节点决定，而是由最慢的 rank 和最晚完成的 collective 决定。一台机器数据加载慢 10%，所有 GPU 都可能在通信点等它；一次 checkpoint 只有 127 个 rank 写完、1 个 rank 写坏，整版状态就不能被当成可恢复版本；一个 worker 被抢占后，如果 world size、global batch、数据 shard 和学习率规则没有被重新定义，所谓“自动恢复”就可能只是把错误更快地重复一遍。因此，本章讨论的内存优化、checkpoint、NCCL hang、straggler detection、elastic training 和 pre-flight validation，本质上都是围绕同一件事：把训练状态从脆弱的单次运行，变成可以度量、可以切分、可以校验、可以恢复的系统过程。
+如果只看模型权重，checkpoint 像一个文件保存问题；如果看完整训练状态，checkpoint 是恢复协议。它必须回答：
 
-### 推 — 从这个问题如何推导出每个机制
+- 状态有哪些：model parameters、gradients、optimizer states、scheduler、loss scaler、RNG、dataset cursor、global step、parallel metadata。
+- 状态在哪里：GPU HBM、CPU DRAM、NVMe、本地 scratch、并行文件系统、对象存储。
+- 谁拥有写入权：每个 rank 写自己的 shard，还是 coordinator 聚合 metadata，还是专用 checkpoint writer 异步落盘。
+- 何时可见：半成品不能被 `latest` 指针暴露给恢复流程。
+- 如何验证：shape、dtype、checksum、world size、parallel layout、训练配置、数据版本必须能被机器检查。
+- 如何清理：retention 不能删掉最后一个可恢复版本，也不能让存储被里程碑 checkpoint 撑爆。
+- 如何跨并行策略恢复：从 TP=8/PP=4/FSDP shard 恢复到 TP=4/PP=8 时，需要明确权重重分片、optimizer 是否可恢复、global batch 是否保持。
 
-从“状态太大”出发，首先会推出显存估算。参数、梯度、优化器状态、激活和临时 buffer 必须分开看，因为它们的增长规律不同：7B 模型 BF16 权重约 14GB，但 Adam 下每个参数还可能对应 BF16 梯度和 FP32 一阶、二阶矩，参数相关状态可接近 12 bytes/param；激活则随 batch size、sequence length、hidden size、层数增长，长上下文训练时经常比参数更先成为瓶颈。既然显存有限，就会自然推出两类交换：激活重计算用额外计算换显存，状态切分用额外通信和更复杂的状态布局换单卡容量。它们并不是“优化开关”，而是把瓶颈从内存侧转移到计算侧、通信侧和恢复复杂度侧。
+内存优化和 checkpoint 不是两个孤立主题。activation checkpointing 降低 HBM 但增加重算；offload 降低 GPU 常驻状态但增加 PCIe/NVMe 路径；optimizer state sharding 降低单卡状态但让 checkpoint 变成 sharded checkpoint；FP8 降低激活和通信体积但引入 scale/amax 状态；allocator fragmentation 不改变数学模型，却能让“理论可放下”的作业实际 OOM。每个省显存动作都会改变恢复协议和故障面。
 
-从“状态会丢失或损坏”出发，会推出 checkpoint。真正的 checkpoint 不是权重导出，而是训练状态版本化：要保存模型、优化器、scheduler、step、RNG、sampler、并行布局和 metadata；要用 manifest 判断 shard 是否齐全；要用临时目录、校验和原子提交避免半成品被误读；要把 `latest`、`best`、milestone 分开，因为恢复、评测和发布的语义不同。保存频率也不是固定经验值，而是由可接受进度损失、单次保存停顿、存储带宽、故障概率共同决定。异步 checkpoint 进一步把阻塞改成后台 I/O，但它会消耗 CPU 内存、本地盘和文件系统带宽，因此必须有在飞任务上限和失败状态机。
+### 1.2 学习大纲
 
-从“同步训练会被最慢一环拖住”出发，会推出 NCCL hang 排查、straggler detection 和 pre-flight validation。NCCL hang 表面是所有 rank 卡住，根因可能是某个 rank 没进入 collective、某条链路 flap、某张 GPU Xid、某个 dataloader 卡在远端读取，或者编排器已经驱逐了 worker。排查必须按 GPU/主机、网络、数据/存储、框架、编排分层收敛。Straggler detection 则要求把 per-rank step time、data time、comm wait、checkpoint 写盘长尾做成指标，而不是只看 job 级 tokens/sec。Pre-flight validation 是把坏卡、坏链路、坏版本组合拦在训练开始前，用几十分钟 smoke test 换掉数小时甚至数天的无效训练。
+读完本章，你应该能回答：
 
-从“节点数量会变化”出发，会推出 elastic training。弹性训练不是简单重试，而是在 `min:max` worker 范围内接受 worker group 重建、缩容、扩容和从 checkpoint 恢复。它要求 checkpoint 能描述 world size、分片布局、sampler 进度和训练配置；要求恢复后明确 global batch、学习率规则、数据 shard 是否变化；也要求监控把吞吐变化解释为弹性事件，而不是误报成性能退化。最后，从“硬件算力口径容易被误解”出发，会推出 FP8 训练管线和 HFU/MFU 整合：低精度能提高 Tensor Core 理论吞吐，但如果 scale 管理、amax 统计、cast 边界、通信精度和 loss stability 没处理好，看到的 HFU 可能只是口径漂亮，训练质量和端到端效率并没有改善。
+1. activation checkpoint、offload、optimizer state sharding、mixed precision、FP8、allocator fragmentation 分别解决什么，不解决什么，代价在哪里。
+2. 一个可 true resume 的 checkpoint schema 应包含哪些对象、metadata 和校验字段。
+3. sharded checkpoint、async checkpoint、atomic visibility、retention、RPO/RTO 如何一起决定长期训练可靠性。
+4. TorchElastic elastic restart 如何和 checkpoint 语义配合，哪些场景不能“自动弹性”。
+5. NCCL hang、腐坏 checkpoint、slow checkpoint、restore mismatch、straggler 的证据链怎么收敛。
+6. 千卡训练中断后，如何从告警、rank 状态、NCCL 日志、checkpoint metadata、存储指标和调度事件推导恢复方案。
 
-### 绘 — 因果链路
+---
+
+## 2. 概念边界：是什么、不是什么、相邻概念边界
+
+### 2.1 是什么
+
+本章讨论的是训练可靠性控制面，核心职责是让训练状态在资源受限和故障频发的系统里正确前进：
+
+- **显存控制**：用 activation checkpointing、offload、optimizer state sharding、mixed precision、FP8、allocator 策略降低单卡峰值。
+- **状态版本化**：把完整训练状态写成可验证、可恢复、可清理的 checkpoint schema。
+- **恢复编排**：在进程、节点、world size 或并行策略变化后，恢复一致的 global step、数据游标和优化器轨迹。
+- **故障控制**：用 preflight validation、straggler detection、NCCL hang 排障和 TorchElastic restart 降低无效训练时间。
+
+### 2.2 不是什么
+
+- 不是“只保存 `model.state_dict()`”。那是权重导出，通常只能 warm start，不能保证 optimizer、scheduler、RNG、dataset cursor 连续。
+- 不是“把 batch size 调小”。调小 microbatch 是容量手段之一，但会改变吞吐、梯度累积、pipeline bubble 和 optimizer step 频率。
+- 不是“打开 FSDP/ZeRO 就结束”。状态切分会改变通信路径、checkpoint writer ownership、restore layout 和故障恢复复杂度。
+- 不是“失败后重跑”。没有 RPO/RTO 目标、checkpoint 校验和恢复演练的重跑只是碰运气。
+- 不是“框架自动处理”。PyTorch、DeepSpeed、Megatron、TorchElastic 提供机制，生产语义仍由平台配置、准入、版本矩阵和治理规则定义。
+
+### 2.3 相邻概念边界
+
+| 概念 | 本章关注 | 相邻章节关注 | 边界 |
+|---|---|---|---|
+| 单机显存预算 | activation、optimizer、fragmentation、checkpoint buffer | 第7章的完整 step timeline | 本章强调长任务下的容量和恢复影响 |
+| 数据并行通信 | checkpoint shard、NCCL hang、straggler | 第8章的 AllReduce/ReduceScatter/AllGather | 本章关注通信故障如何触发恢复 |
+| 模型并行策略 | parallel metadata、cross-parallelism restore | 第9章的 TP/PP/CP/EP 设计 | 本章关注并行布局如何被持久化 |
+| 评测与发布 | checkpoint visibility、best/milestone 语义 | 后训练与 serving 章节 | 本章只讨论训练恢复，不讨论模型质量治理全链路 |
+
+---
+
+## 3. 架构：控制路径、数据路径、状态路径、故障路径
+
+### 3.1 责任边界
+
+一个生产训练平台至少需要把责任拆成五层：
+
+| 层 | 责任 | 典型 owner | 失败证据 |
+|---|---|---|---|
+| Training loop | 产生 step、保存 state_dict、恢复状态 | 训练框架/算法工程 | loss jump、step 回退、RNG 不一致 |
+| Distributed runtime | rank group、collective、elastic restart | Infra/框架 | NCCL timeout、rank exit、world size 变化 |
+| Checkpoint library | sharding、async writer、manifest、atomic commit | Infra/框架 | shard 缺失、checksum mismatch、latest 指针错误 |
+| Storage service | 吞吐、元数据、权限、生命周期 | Storage/SRE | I/O latency p99、429/5xx、quota full |
+| Scheduler/platform | 节点分配、抢占、重启、隔离 | Platform/SRE | pod eviction、node NotReady、GPU Xid |
+
+### 3.2 控制路径
+
+控制路径定义什么时候保存、谁能提交、恢复哪个版本：
+
+1. trainer 在 `global_step % save_interval == 0` 或收到 preemption signal 时发起 checkpoint。
+2. rank group 进入 save barrier，冻结需要一致化的 metadata。
+3. 每个 writer 写入自己的临时 shard，例如 `step_12000.tmp/rank_00342/optim.safetensors`。
+4. coordinator 写 manifest，验证 shard count、size、checksum、schema_version、parallel metadata。
+5. coordinator 通过原子 rename 或 pointer update 暴露 `step_12000`，再更新 `latest`。
+6. retention controller 清理过期版本，但保留 last-good、milestone、best、pre-upgrade。
+
+### 3.3 数据路径
+
+数据路径关心 bytes 怎么移动：
+
+- GPU HBM -> CPU pinned memory：async checkpoint 常见 staging 路径，受 PCIe/NVLink-C2C、CPU 内存和 pinning 限制。
+- GPU HBM -> storage：少数 GPUDirect Storage 场景可走直接路径，但生产可用性取决于文件系统、驱动和框架支持。
+- CPU DRAM -> local NVMe -> remote storage：常见两段式写入，先落本地 scratch，再后台上传对象存储或并行文件系统。
+- rank shard -> object storage prefix：对象数量太多会打爆 metadata/list；对象太大又影响并发和失败重试粒度。
+
+### 3.4 状态路径
+
+状态路径回答“恢复需要什么”：
+
+- Model params：权重本体，可能按 DP/FSDP/TP/PP/EP 切分。
+- Optimizer states：Adam `exp_avg`、`exp_avg_sq`、master weights、ZeRO/FSDP shard。
+- Scheduler：step index、warmup、decay、restart policy。
+- Precision state：GradScaler、FP8 amax history、scale、recipe、cast 边界。
+- RNG：Python、NumPy、PyTorch CPU、CUDA 每卡、dataloader worker seed。
+- Dataset cursor：epoch、sample index、shuffle seed、consumed tokens、streaming dataset offset。
+- Parallel metadata：world size、rank mapping、TP/PP/CP/EP/DP degree、pipeline stage、tensor shard axis、vocab padding。
+- Config and code identity：git SHA、container image digest、framework versions、feature flags。
+
+### 3.5 故障路径
+
+故障路径从症状反推责任层：
+
+- 所有 GPU 利用率归零，进程不退出：优先看 NCCL hang、某 rank 未进入 collective、dataloader deadlock。
+- checkpoint 写入 p99 飙升：看 storage bandwidth、metadata ops、writer concurrency、async backlog。
+- 恢复后 loss 跳变：看 optimizer/scheduler/RNG/dataset cursor/global step 是否一致。
+- 某些 rank step time 长尾：看 straggler detection 的 data time、comm wait、GPU clocks、ECC/Xid、host I/O。
+- 弹性重启后吞吐下降：看 world size、global batch、gradient accumulation、parallel layout 是否变化。
+
+### 3.6 Checkpoint 写入与恢复状态机
 
 ```mermaid
-mindmap
-  root((训练状态如何在有限且会失败的系统里前进))
-    状态太大
-      参数
-        BF16权重
-        梯度
-        Adam状态
-      激活
-        Batch
-        Sequence
-        Hidden
-        Layers
-      临时Buffer
-        Kernel workspace
-        NCCL buffer
-        Fragmentation
-      推导机制
-        激活重计算
-        ZeRO和FSDP
-        Offload
-        FP8训练
-    状态会丢
-      Checkpoint
-        Model
-        Optimizer
-        Scheduler
-        RNG
-        Sampler
-        Parallel layout
-      版本化
-        Manifest
-        Atomic commit
-        Latest
-        Best
-      恢复语义
-        True resume
-        Warm start
-    同步会被拖慢
-      NCCL Hang
-        Rank未进入collective
-        网络链路异常
-        GPU或驱动异常
-      Straggler
-        Per-rank step time
-        Data time
-        Comm wait
-      Pre-flight
-        nccl-tests
-        GPU健康
-        存储写入
-        版本矩阵
-    节点会变化
-      Elastic Training
-        Min max workers
-        World size变化
-        Global batch调整
-        Sampler重建
-      工程边界
-        训练语义不能漂移
-        半成品不能恢复
-        坏节点先隔离
+stateDiagram-v2
+    [*] --> Running
+    Running --> SaveRequested: interval / preemption / manual
+    SaveRequested --> FreezeMetadata: barrier + capture global_step
+    FreezeMetadata --> WriteTmpShards: rank-owned writes
+    WriteTmpShards --> ValidateTmp: count + shape + dtype + checksum
+    ValidateTmp --> PublishAtomic: manifest ok
+    ValidateTmp --> SaveFailed: missing shard / checksum mismatch
+    PublishAtomic --> UpdatePointers: expose step_N + latest
+    UpdatePointers --> RetentionSweep: protect last-good
+    RetentionSweep --> Running
+    SaveFailed --> CleanupTmp: remove incomplete prefix
+    CleanupTmp --> Running
+
+    Running --> FailureDetected: rank exit / NCCL hang / preemption
+    FailureDetected --> QuiesceGroup: kill or drain worker group
+    QuiesceGroup --> SelectCheckpoint: choose latest validated
+    SelectCheckpoint --> PreflightRestore: schema + versions + storage + topology
+    PreflightRestore --> RestoreShards: map shards to ranks
+    RestoreShards --> ValidateState: params + optim + RNG + cursor + metadata
+    ValidateState --> ResumeTraining: step continuity ok
+    ValidateState --> RestoreFailed: mismatch
+    RestoreFailed --> SelectCheckpoint: fallback previous checkpoint
+    ResumeTraining --> Running
 ```
 
-### 导 — 读完本章你应该能回答
-
-1. 为什么训练显存不能只按模型权重估算？参数、梯度、优化器、激活和临时 buffer 分别按什么规律增长？
-2. 激活重计算、状态切分、offload 和 FP8 分别把瓶颈从哪里转移到哪里？什么时候它们会得不偿失？
-3. 一个可 true resume 的 checkpoint 至少要包含哪些状态？为什么只保存权重更接近 warm start？
-4. 为什么分布式 checkpoint 必须有 manifest、metadata、原子提交和版本指针？半成品 checkpoint 会造成什么事故？
-5. NCCL hang 出现时，如何区分“某个 rank 没进 collective”和“collective / 网络本身卡死”？
-6. Straggler detection 为什么要看 per-rank 分布而不是只看平均吞吐？慢 5%-10% 的单节点如何拖慢整个同步训练？
-7. Elastic training 在 world size 变化后必须重新确认哪些训练语义？global batch、LR、sampler 和分片布局如何影响恢复正确性？
-
 ---
 
-## 正文内容
+## 4. 原理：从不可化简的问题推导机制
 
-### 10.1 训练为什么这么吃内存
+### 4.1 显存预算不是权重预算
 
-训练阶段不仅要放模型参数，还要同时承担：
-
-- 梯度
-- 优化器状态
-- 激活
-- 临时 buffer
-- 运行时碎片
-
-可以粗略写成：
+训练峰值显存可以写成：
 
 $$
-M_{\text{train}} \approx M_{\text{params}} + M_{\text{grads}} + M_{\text{optim}} + M_{\text{activations}} + M_{\text{temp}}
+M_{peak} =
+M_{params} + M_{grads} + M_{optim} + M_{acts}
++ M_{comm} + M_{temp} + M_{ckpt\_buffer} + M_{frag}
 $$
 
-这解释了为什么很多模型“能推理，但不能训练”。
+其中每项增长规律不同：
 
-#### 10.1.1 推理和训练的本质区别
+- `M_params` 跟参数量、dtype、TP/FSDP shard 有关。
+- `M_grads` 跟是否 sharded、是否 `set_to_none=True`、bucket 生命周期有关。
+- `M_optim` 对 Adam 类优化器通常是大头；FP32 moment 会让状态远大于 BF16 权重。
+- `M_acts` 跟 microbatch、sequence length、hidden size、layer count、checkpoint granularity 有关。
+- `M_comm` 跟 DDP/FSDP bucket、NCCL buffer、TP activation collective 有关。
+- `M_ckpt_buffer` 来自 async checkpoint staging；大作业里经常被遗漏。
+- `M_frag` 是 allocator fragmentation，可能导致 reserved memory 高于 allocated memory 很多。
 
-推理时最核心的是：
-
-- 参数要常驻
-- 当前层中间结果用完可释放
-- 没有梯度
-- 通常也没有优化器状态
-
-训练则不同：
-
-- 要保留反向传播所需的中间激活
-- 每个可训练参数都对应梯度
-- 优化器还可能维护额外状态
-- 混合精度下常常还有 master weights、梯度缩放状态等额外开销
-
-因此，**训练显存通常远大于推理显存**。
-很多时候“模型能在单卡推理”，并不意味着“模型能在同一张卡上训练”。
-
-#### 10.1.2 一个粗糙但很有用的估算方法
-
-假设：
-
-- 参数量为 \(N\)
-- 参数用 BF16 存储，每个参数约 2 字节
-- 梯度也用 BF16，约 2 字节
-- 优化器用 Adam，通常还需要一阶矩和二阶矩，若以 FP32 保存，各约 4 字节
-
-则只看参数相关部分，单参数大概对应：
-
-- 参数：2B
-- 梯度：2B
-- Adam 一阶矩：4B
-- Adam 二阶矩：4B
-
-合计大约：
+一个工程上有用的公式是 activation checkpointing 的节省和代价模型：
 
 $$
-2 + 2 + 4 + 4 = 12 \text{ bytes / param}
+M_{acts,ckpt} \approx \frac{M_{acts,full}}{K} + M_{boundary},
+\quad
+T_{step,ckpt} \approx T_{step,base} + r \cdot T_{forward}
 $$
 
-这还**没有**算激活、临时 buffer、通信缓冲区和碎片。
+`K` 是重计算分段数，`M_boundary` 是必须保留的分段边界激活，`r` 是额外重算比例。Transformer 中常见经验是 activation memory 下降 30%-70%，step time 增加 5%-30%；具体值必须用 profiler 验证，因为 FlashAttention、sequence parallel、compiler fusion 会改变边界。
 
-于是一个非常粗糙但工程上有帮助的直觉是：
+### 4.2 activation checkpointing：用计算换 HBM
 
-> **Adam + 混合精度训练时，参数相关状态通常是“参数本体大小”的数倍。**
+activation checkpointing 的正确边界：
 
-例如：
+- 适合：activation 是峰值主因，GPU compute 仍有余量，长上下文或 microbatch 受限。
+- 不适合：step 已被 compute 完全打满，或 recompute 破坏 kernel overlap，或 checkpoint segment 切在跨设备 collective 周围导致额外同步。
+- 关键 knob：checkpoint granularity、reentrant/non-reentrant、selective checkpoint、RNG preserve、pipeline stage 内切分。
 
-- 7B 参数，BF16 权重本体约 14GB
-- 若把梯度和 Adam 状态也算进去，参数相关状态可能就接近 80GB 量级
-- 再加上激活和临时 buffer，单卡几乎不可能完整承载
+PyTorch 约束：
 
-这就是为什么大模型训练一定会引入：
+- `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` 更适合现代 autograd 场景。
+- 如果 dropout 存在，`preserve_rng_state` 影响重算一致性；关闭后可能提高速度，但必须接受随机轨迹变化。
+- 编译器、FlashAttention、FSDP auto-wrap 会改变 activation 生命周期，不能只靠静态估算。
 
-- 数据并行
-- 张量并行 / 流水并行
-- ZeRO / FSDP
-- 激活重计算
-- CPU / NVMe offload
+### 4.3 offload：用慢路径换容量
 
-#### 10.1.3 激活为什么有时比参数更可怕
+offload 把 GPU HBM 中的状态移到 CPU DRAM 或 NVMe：
 
-参数大小通常是相对稳定的，但激活大小会随很多因素上升：
+- activation offload：把部分激活放到 CPU，反向前再搬回。
+- optimizer offload：ZeRO-Offload/FSDP CPU offload 常见，把 optimizer state 和部分参数更新放 CPU。
+- parameter offload：需要前向前 prefetch，容易被 PCIe/NVMe latency 控制。
 
-- batch size 增大
-- 序列长度变长
-- hidden size 变大
-- 层数变多
-- 中间实现不够节省（例如 attention 暂存过多）
+边界：
 
-可以粗略理解为：
+- PCIe Gen4 x16 理论单向约 32 GB/s，远低于 HBM 和 NVLink；NVMe 还要低一个数量级。
+- offload 只有在通信/计算能覆盖搬运，或否则作业根本放不下时才划算。
+- CPU memory pinning、NUMA placement、local NVMe endurance 都是生产约束。
 
-$$
-M_{\text{activations}} \propto B \times S \times H \times L
-$$
+反例：把 optimizer offload 打开后 OOM 消失，但 step time 从 1.2s 变成 4.8s，GPU duty cycle 只有 35%。这不是训练优化，而是把瓶颈换成了 PCIe/CPU。
 
-其中：
+### 4.4 optimizer state sharding：用复杂状态布局换单卡容量
 
-- \(B\)：batch size
-- \(S\)：sequence length
-- \(H\)：hidden size
-- \(L\)：layer 数
+DDP 复制 optimizer state；FSDP/ZeRO 把 params、grads、optimizer states 不同程度切分：
 
-所以训练中常见的一类现象是：
+| 策略 | 单卡状态 | 通信 | checkpoint 影响 |
+|---|---|---|---|
+| DDP | params/grads/optim 全复制 | gradient AllReduce | checkpoint 简单但总写入重复 |
+| ZeRO-1 | optimizer sharded | gradient AllReduce | optimizer shard 必须保存 |
+| ZeRO-2 | optimizer + gradients sharded | ReduceScatter/AllGather | 恢复依赖 shard metadata |
+| ZeRO-3/FSDP full shard | params + grads + optim sharded | prefetch + AllGather + ReduceScatter | checkpoint 必须支持 sharded 或聚合导出 |
 
-- 模型参数量没变
-- 只是把上下文长度从 4k 拉到 8k
-- 或者把 micro-batch 从 1 调到 2
-- 显存却直接爆掉
+生产判断：
 
-这并不奇怪，因为激活部分经常是最先失控的。
+- 如果 checkpoint 只保存 rank0 full state，ZeRO-3 训练会在保存点产生巨大 gather，可能 OOM 或造成长时间 pause。
+- 如果保存 sharded checkpoint，恢复时必须保存 shard axis、rank mapping、FSDP wrap policy、flatten param mapping。
+- 如果要跨 parallelism restore，需要一个重分片工具链，而不是依赖原 rank 文件名。
 
-#### 10.1.4 临时 buffer 和碎片为什么容易被忽略
+### 4.5 mixed precision 与 FP8：省显存也引入状态
 
-很多人会把显存问题简单归因于“参数太大”，但真实系统里还有两类隐性消耗：
+mixed precision 的状态不只是 dtype：
 
-**1）临时 buffer**
+- BF16：范围比 FP16 好，通常不需要 GradScaler，但某些 optimizer/kernel 仍有 FP32 master 或 accumulator。
+- FP16：可能需要 loss scaling，checkpoint 要保存 `GradScaler` state。
+- FP8：常见于 Transformer Engine/Megatron 路径，需要保存 amax history、scale、scale_inv、FP8 recipe、layer-wise cast 边界。
 
-典型来源包括：
+FP8 的工程边界：
 
-- GEMM / attention kernel 的 workspace
-- NCCL 通信缓冲区
-- 张量重排、拼接、cast 时的临时副本
-- dataloader 到 GPU 的 staging buffer
+- FP8 可以降低 activation 和部分通信体积，提高 Tensor Core 吞吐口径。
+- 训练稳定性依赖 scale 更新策略；恢复时如果丢失 amax/scale，短期 loss spike 很常见。
+- FP8 checkpoint 不能只描述 tensor dtype，还要描述哪些 tensor 是 FP8 存储、哪些是 BF16/FP32 master。
+- 跨框架恢复时，FP8 metadata 的兼容性通常弱于 BF16 权重。
 
-**2）碎片（fragmentation）**
+### 4.6 allocator fragmentation：理论容量和实际 OOM 的差距
 
-当显存频繁申请 / 释放不同尺寸的块时，可能出现：
+PyTorch CUDA allocator 会缓存显存块。常见现象：
 
-- 总剩余显存很多
-- 但没有足够大的连续块
-- 最终仍然 OOM
+- `allocated` 不高，但 `reserved` 很高。
+- `nvidia-smi` 显示还有空闲，但大块 allocation 失败。
+- 训练到某个 sequence length、checkpoint 或 eval step 才 OOM。
 
-因此“nvidia-smi 还显示有空闲显存，但程序就是报 OOM”并不一定矛盾。
-
-#### 10.1.5 什么时候要先看谁
-
-碰到显存问题时，一个非常实用的判断顺序是：
-
-1. **先看激活**：是不是 batch / sequence / hidden 过大
-2. **再看参数相关状态**：是不是 Adam + 全量副本导致单卡承载不了
-3. **再看并行策略**：有没有机会通过 ZeRO / FSDP / pipeline 切分
-4. **最后看碎片和实现细节**：是不是因为 kernel、缓存或内存分配策略导致额外浪费
-
----
-
-### 10.2 激活重计算在解决什么
-
-激活重计算（activation checkpointing）的核心思路是：
-
-- 前向时不保存所有中间激活
-- 反向时需要时再重新算一遍
-
-它本质上是：
-
-> **用更多计算，换更少显存。**
-
-好处：
-
-- 降低激活占用
-- 支持更大 batch 或更长序列
-
-代价：
-
-- 反向更慢
-- 代码和调试复杂度增加
-
-#### 10.2.1 为什么它有效
-
-反向传播要计算梯度，需要知道前向过程中的一些中间值。
-最直接的做法，是前向时把这些值都保存下来。这样反向最快，但显存最大。
-
-激活重计算做了另一种选择：
-
-- 不是所有中间值都保存
-- 只保存一部分“检查点”
-- 反向时从这些检查点再跑一次局部前向，把需要的中间值重新算出来
-
-因此：
-
-- **保存更少** → 显存下降
-- **重新计算更多** → 时间上升
-
-它本质上是一个经典的时间—空间交换。
-
-#### 10.2.2 适合放在哪里
-
-不是所有模块都值得做激活重计算。工程上更常见的做法是：
-
-- 对大块 Transformer block 做 checkpoint
-- 对 attention / MLP 这种激活占用高的模块优先做
-- 对非常轻的小模块通常收益不大
-
-一个常见经验是：
-
-> 优先给“激活大、计算相对规则、边界清晰”的模块做 activation checkpointing。
-
-#### 10.2.3 一个最小 PyTorch 示例
+证据命令：
 
 ```python
 import torch
-import torch.nn as nn
+print(torch.cuda.memory_summary(device=0, abbreviated=False))
+print(torch.cuda.max_memory_allocated() / 2**30)
+print(torch.cuda.max_memory_reserved() / 2**30)
+```
+
+常见动作：
+
+- 设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256` 并用 A/B 验证。
+- 固定 shape，减少动态 sequence packing 的极端 batch。
+- checkpoint/eval 前释放不再使用的引用，避免 Python object 持有 tensor。
+- 避免在 hot path 中反复创建不同大小的临时 tensor。
+
+---
+
+## 5. Checkpoint 作为恢复协议
+
+### 5.1 checkpoint schema
+
+一个生产 checkpoint schema 至少包含：
+
+```text
+checkpoint/
+  step_00120000/
+    manifest.json
+    metadata.json
+    ranks/
+      rank_000000/
+        model.safetensors
+        optim.safetensors
+        rng.pt
+        dataloader.json
+      rank_000001/
+        model.safetensors
+        optim.safetensors
+        rng.pt
+        dataloader.json
+    global/
+      scheduler.pt
+      scaler.pt
+      tokenizer.json
+      train_config.yaml
+  latest -> step_00120000
+```
+
+`manifest.json` 应包含机器可验证字段：
+
+| 字段 | 作用 |
+|---|---|
+| `schema_version` | 支持迁移和拒绝不兼容恢复 |
+| `global_step` / `consumed_tokens` | 定义训练进度 |
+| `world_size` / `rank_count` | 验证 shard 数量 |
+| `parallelism` | TP/PP/CP/EP/DP/FSDP/ZeRO degree 和 rank mapping |
+| `model_config_hash` | 防止错误模型结构恢复 |
+| `optimizer_config_hash` | 防止 Adam beta、weight decay、param group 错配 |
+| `dataset_version` / `shuffle_seed` | 保证数据进度可解释 |
+| `files[]` | path、size、sha256、tensor_count、dtype summary |
+| `created_by` | git SHA、image digest、framework versions |
+| `status` | `writing`、`validated`、`published` |
+
+### 5.2 保存内容：true resume 最小集合
+
+| 状态 | 不保存的后果 | 验证方式 |
+|---|---|---|
+| model params | 权重丢失或回退 | tensor name/shape/dtype/checksum |
+| optimizer states | loss 短期跳变，收敛轨迹改变 | param group、moment shape、step |
+| scheduler | LR 重复 warmup 或提前 decay | scheduler state 和 global_step |
+| RNG | dropout、数据增强、采样轨迹变化 | CPU/CUDA/worker seed |
+| dataset cursor | 重复或跳过样本 | epoch、offset、consumed samples/tokens |
+| global step | 日志、LR、eval、save cadence 错位 | manifest 单一来源 |
+| parallel metadata | shard 无法映射或静默错位 | rank mapping 和 shard axis |
+| precision state | FP16/FP8 scale 错误 | GradScaler、amax/scale history |
+
+如果只保存 model params，这叫 warm start。warm start 可以用于迁移训练、微调或发布权重，但不能声称 RPO 等于 checkpoint 间隔，也不能解释 optimizer 连续性。
+
+### 5.3 writer ownership
+
+三种 writer ownership 模式：
+
+| 模式 | 优点 | 风险 | 适用 |
+|---|---|---|---|
+| rank-owned shard | 并发高，无集中 OOM | 文件数多，manifest 必须严格 | FSDP/ZeRO 大规模训练 |
+| coordinator gather | 恢复简单，单文件少 | rank0 OOM，pause 长 | 小模型或导出发布权重 |
+| async writer pool | 训练 pause 短 | staging memory、backlog、失败语义复杂 | 长任务周期保存 |
+
+生产默认应倾向 rank-owned sharded checkpoint，加 coordinator manifest。发布用 full checkpoint 可以由离线 conversion job 从 sharded checkpoint 生成。
+
+### 5.4 atomic visibility
+
+checkpoint 可见性必须是原子的：
+
+1. 写入 `step_N.tmp/`。
+2. 每个 shard fsync 或对象存储完成 multipart commit。
+3. coordinator 校验 manifest。
+4. rename `step_N.tmp` 到 `step_N`，或写不可变 prefix 后更新 `latest` pointer。
+5. `latest` pointer 更新必须晚于 manifest validated。
+
+对象存储没有 POSIX rename 语义时，不要假设目录 rename 原子。更稳妥的方式是：
+
+- 每个 step prefix 不可变。
+- `manifest.json` 包含 `status=validated`。
+- `latest.json` 是小对象，最后写入，包含 step、manifest checksum 和 generation id。
+- restore 只读取 `latest.json` 指向且 manifest validated 的版本。
+
+### 5.5 validation 与 cleanup
+
+保存后立即验证：
+
+- shard count 等于 expected writer count。
+- 每个 shard size > 0，checksum 匹配。
+- tensor name/shape/dtype 与 schema 匹配。
+- global metadata 在所有 rank 一致。
+- storage read-after-write 检查通过。
+- 恢复 smoke test 能在小 world size 或 dry-run 模式加载 metadata。
+
+cleanup 原则：
+
+- 清理 `*.tmp` 和 failed prefix。
+- 保留至少 2 个 last-good checkpoint，避免最新版本恢复失败时没有后退点。
+- milestone checkpoint 使用单独 retention 类，不能被普通 rolling policy 删除。
+- pre-upgrade checkpoint 保护到新版本完成恢复演练。
+
+### 5.6 sharded checkpoint 与 cross-parallelism restore
+
+sharded checkpoint 必须让 shard 名称不依赖物理 rank：
+
+```text
+model.layers.17.attn.q_proj.weight:
+  global_shape: [8192, 8192]
+  dtype: bfloat16
+  shard_axis: 0
+  shards:
+    - logical_shard: tp0_fsdp0
+      offset: [0, 0]
+      shape: [1024, 8192]
+      file: ranks/rank_000032/model.safetensors
+      checksum: sha256:...
+```
+
+跨并行策略恢复的关键问题：
+
+- TP degree 改变：tensor shard axis 需要重分片。
+- PP degree 改变：layer-to-stage mapping 需要重算。
+- FSDP wrap policy 改变：flat parameter mapping 可能不兼容。
+- DP world size 改变：optimizer shard 需要重新分配。
+- global batch 改变：LR schedule 和 gradient accumulation 必须显式声明策略。
+
+工程建议：权重跨并行恢复可以支持；optimizer 跨布局恢复要谨慎。对关键 pretraining，如果必须恢复 optimizer，应保持 shard schema 稳定，或提供经过测试的 offline reshard 工具。
+
+### 5.7 async checkpoint
+
+async checkpoint 把训练 pause 拆成两段：
+
+- synchronous capture：冻结 step metadata，把 GPU tensor 转移到 staging buffer 或创建一致视图。
+- background flush：writer pool 写本地盘、并行文件系统或对象存储。
+
+必须治理的指标：
+
+- `checkpoint_capture_seconds`
+- `checkpoint_flush_seconds`
+- `checkpoint_async_backlog`
+- `checkpoint_staging_memory_bytes`
+- `checkpoint_bytes_written`
+- `checkpoint_last_success_step`
+- `checkpoint_validation_failures_total`
+
+硬边界：
+
+- 最多允许 1-2 个 in-flight checkpoint。超过后要阻塞训练或跳过新 checkpoint，不能无限堆积。
+- preemption signal 到来时，如果后台 flush 未完成，需要明确选择等待、降级保存轻量 checkpoint，或回退到 last-good。
+- async 失败不能只写日志；必须把 checkpoint 标记为 failed，并阻止 `latest` 更新。
+
+---
+
+## 6. 容量与效率：RPO/RTO 和 checkpoint cost
+
+### 6.1 checkpoint 成本模型
+
+一次 checkpoint 的端到端成本可以估算为：
+
+$$
+T_{ckpt} =
+T_{barrier} + T_{capture} +
+\max_i \frac{B_i}{BW_i \cdot \eta_i} +
+T_{manifest} + T_{validate}
+$$
+
+其中 `B_i` 是第 `i` 个 writer 写入字节数，`BW_i` 是有效带宽，`\eta_i` 是并发效率。同步 checkpoint 的 pause 近似等于 `T_ckpt`；async checkpoint 的训练 pause 近似等于：
+
+$$
+T_{pause,async} = T_{barrier} + T_{capture}
+$$
+
+但后台 flush 仍会消耗存储和 CPU 资源。如果 `T_flush` 大于保存间隔，backlog 会持续增长。
+
+### 6.2 RPO/RTO
+
+训练平台需要显式定义：
+
+- **RPO (Recovery Point Objective)**：故障后最多可接受丢失多少训练进度。
+- **RTO (Recovery Time Objective)**：从故障检测到恢复训练吞吐达标最多多久。
+
+如果每 `I` 分钟保存一次 checkpoint，保存耗时 `T_ckpt`，故障检测和重启耗时 `T_restart`，恢复加载耗时 `T_restore`：
+
+$$
+RPO_{worst} \approx I + T_{inflight\_loss}
+$$
+
+$$
+RTO \approx T_{detect} + T_{quiesce} + T_{schedule} + T_{restore} + T_{warmup}
+$$
+
+例子：每 30 分钟保存，async flush 8 分钟，最多 1 个 in-flight，故障发生在 flush 未完成时，worst-case RPO 可能接近 60 分钟，而不是 30 分钟。因为最新 checkpoint 不可见，必须回退到上一个 validated 版本。
+
+### 6.3 保存间隔选择
+
+保存太频繁会浪费吞吐和存储；保存太稀疏会扩大 RPO。一个实用策略：
+
+- 小规模实验：15-30 分钟 rolling checkpoint，保留 3-5 个。
+- 百卡训练：30-60 分钟，根据 checkpoint pause 控制在 step time budget 的 1%-3%。
+- 千卡预训练：按 tokens 或 wall clock 双触发；preemption window、存储带宽和 RPO 共同决定。
+- 关键里程碑：按 consumed tokens 保存 milestone，不参与普通滚动清理。
+
+---
+
+## 7. 框架实现：knobs、约束与配置示例
+
+### 7.1 PyTorch activation checkpointing
+
+```python
+import torch
 from torch.utils.checkpoint import checkpoint
 
-class Block(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
+class Block(torch.nn.Module):
+    def forward(self, x, attention_mask):
+        def inner(hidden):
+            return self.mlp(self.attn(hidden, attention_mask))
+
+        return checkpoint(
+            inner,
+            x,
+            use_reentrant=False,
+            preserve_rng_state=True,
         )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Model(nn.Module):
-    def __init__(self, dim=4096, depth=12):
-        super().__init__()
-        self.blocks = nn.ModuleList([Block(dim) for _ in range(depth)])
-
-    def forward(self, x):
-        for blk in self.blocks:
-            x = checkpoint(blk, x)   # 用重计算换显存
-        return x
 ```
 
-这个例子表达的不是“最佳写法”，而是：
+约束：
 
-- 原本每层前向的中间激活都可能被保存
-- 加上 `checkpoint(blk, x)` 之后，只保留必要边界
-- 反向时需要时再重跑该块前向
+- dropout 存在时，`preserve_rng_state=True` 更接近原始语义。
+- 分段太细会增加调度开销；分段太粗节省有限。
+- PP/TP 边界附近切 checkpoint 要看 collective 是否被重复触发。
 
-#### 10.2.4 使用时的几个坑
-
-**1）不是所有操作都和重计算天然兼容**
-
-例如：
-
-- 有随机性操作（dropout）
-- 有依赖全局状态的逻辑
-- 前向里混入不可重复副作用（日志、计数器、缓存写入）
-
-否则就可能出现：
-
-- 前向和重算结果不一致
-- 梯度异常
-- 很难复现的 bug
-
-**2）调试体验会变差**
-
-因为：
-
-- 真正报错的位置可能出现在反向重算阶段
-- stack trace 不一定直观
-- 性能剖析也会更复杂
-
-**3）吞吐会下降**
-
-节省的不是“白拿”的显存，而是拿算力换来的。
-所以适合不适合，要看你的瓶颈到底是：
-
-- 显存
-- 还是算力 / 吞吐
-
-#### 10.2.5 一个经验判断
-
-如果你的训练现在是：
-
-- 明确被显存卡住
-- 但 GPU 计算还有余量
-- 且模型块边界较清晰
-
-那么激活重计算通常值得尝试。
-
-如果你现在已经：
-
-- 通信很重
-- 算力已经接近打满
-- 吞吐非常敏感
-
-那它未必是第一优先级。
-
----
-
-### 10.3 参数 / 状态切分在解决什么
-
-除了激活，参数、梯度和优化器状态本身也会占大量显存。
-这时常见思路是切分：
-
-- 参数切分
-- 梯度切分
-- 优化器状态切分
-
-这类方法的核心目的，是让每张卡不需要持有全部状态，从而降低单卡压力。
-
-但副作用也很明显：
-
-- 通信更多
-- checkpoint 更复杂
-- 恢复和排障更难
-
-如果你正在使用 [第9章 §9.6](./09-model-pipeline-parallel.md) 的 ZeRO / FSDP，那么 checkpoint 格式通常也必须跟着变。
-
-#### 10.3.1 它到底在切什么
-
-可以把训练状态想成四类：
-
-1. **参数**：模型当前权重
-2. **梯度**：反向传播得到的更新方向
-3. **优化器状态**：例如 Adam 的一阶矩、二阶矩
-4. **运行时激活**：前向/反向中间值
-
-状态切分主要是针对前 3 类。它不直接消灭总状态量，而是把它们分摊到多张卡上。
-
-#### 10.3.2 为什么它比“多卡复制一份模型”更省
-
-在最朴素的数据并行中，每张卡通常都有：
-
-- 一整份模型参数
-- 一整份梯度
-- 一整份优化器状态
-
-这在小模型时代还可以接受，但在大模型里就会迅速失控。
-
-ZeRO / FSDP 一类方案的核心思想是：
-
-> 既然不同 rank 之间本来就会协作，那就不必让每张卡永久持有全部状态。
-
-典型收益是：
-
-- 单卡显存压力明显下降
-- 可以训练更大模型
-- 可以把显存预算更多留给激活和 batch
-
-#### 10.3.3 为什么通信会变重
-
-状态不再完整常驻本地后，就意味着：
-
-- 用参数前，可能要先 gather
-- 算完梯度后，可能要再 reduce / scatter
-- 优化器更新时，也可能涉及分片状态同步
-
-所以状态切分的另一面是：
-
-- 更依赖稳定的互联
-- 更依赖正确的 collective 时序
-- 更依赖训练框架和 checkpoint 系统的配合
-
-从这个角度看，**它不是单纯的“省显存技巧”，而是把问题从显存侧转移了一部分到通信侧和系统复杂度侧。**
-
-#### 10.3.4 为什么 checkpoint 会跟着复杂化
-
-一旦状态是分片的，就会出现几个新问题：
-
-- checkpoint 是保存每张卡的局部状态，还是先聚合成完整状态？
-- 恢复时 world size 变化了还能不能读？
-- 某个 rank 的分片丢了怎么办？
-- 保存时如果一半 rank 成功、一半失败，如何判断这个版本是否可用？
-
-因此：
-
-> 用了分片训练，checkpoint 设计就不能再停留在“把 Python 对象 `torch.save` 一下”的思维。
-
----
-
-### 10.4 checkpoint 为什么是基础设施能力
-
-训练长任务时，失败是高概率事件：
-
-- 节点掉线
-- 抢占
-- 网络异常
-- 写盘失败
-- OOM
-- 用户代码异常
-
-如果没有 checkpoint，任务失败就意味着大段训练进度直接丢失。
-
-因此 checkpoint 不只是框架功能，更是平台能力的一部分。
-平台至少要回答：
-
-- checkpoint 存到哪里
-- 什么时候存
-- 保存失败怎么办
-- 恢复时如何定位最近可用版本
-
-特别是在 [第8章 §8.3](./08-data-parallel.md) 已经通信繁重的训练里，保存操作带来的额外停顿会更明显。
-
-#### 10.4.1 为什么“失败”是默认前提
-
-训练一小时和训练三天，容错需求完全不是一个量级。
-
-长任务里你几乎一定会遇到其中某些事情：
-
-- spot / preemptible 实例被回收
-- 某台机器链路抖动
-- 某张卡突然 ECC 错误升高
-- 某个写盘动作卡住
-- dataloader 读远端数据变慢
-- 某条样本触发用户代码 bug
-
-所以成熟系统不会问“会不会失败”，而会问：
-
-- **失败会多频繁**
-- **失败后最多损失多少进度**
-- **恢复要不要人工介入**
-- **恢复后结果是否还能保持正确性**
-
-#### 10.4.2 checkpoint 的职责不只是“保存”
-
-一个真正可用的 checkpoint 子系统，至少要覆盖四件事：
-
-**1）生成状态**
-
-把训练恢复所需的状态组织出来。
-
-**2）原子发布**
-
-不能出现“看上去保存成功，实际文件只写了一半”的假成功。
-
-**3）元数据管理**
-
-知道有哪些版本、哪个是 latest、哪个是 best、哪个已损坏。
-
-**4）恢复决策**
-
-作业重启时，自动找到最近可用且一致的版本。
-
-所以更准确地说：
-
-> checkpoint 是“训练状态版本化与恢复系统”，而不是一个单纯的序列化函数。
-
----
-
-### 10.5 checkpoint 中到底应该包含什么
-
-一个能真正恢复训练的 checkpoint 通常不只包含模型参数，还应尽量包含：
-
-- 模型权重
-- 优化器状态
-- scheduler 状态
-- 当前 step / epoch
-- 随机数状态
-- 分布式并行状态
-
-如果只存权重，通常更像“部署模型包”，而不是真正可恢复训练状态。
-
-#### 10.5.1 最低恢复集合
-
-一个最常见、最低可用的训练恢复集合通常是：
+### 7.2 FSDP sharded checkpoint 示例
 
 ```python
-{
-    "model": ...,
-    "optimizer": ...,
-    "scheduler": ...,
-    "step": ...,
-    "epoch": ...,
-    "scaler": ...,      # AMP 场景
-    "rng": {
-        "python": ...,
-        "numpy": ...,
-        "torch_cpu": ...,
-        "torch_cuda": ...,
-    },
-}
-```
-
-如果是分布式训练，还往往需要：
-
-- world size / rank 拓扑信息
-- 分片布局信息
-- dataloader / sampler 的进度
-- gradient accumulation 相关状态
-
-#### 10.5.2 为什么随机数状态值得保存
-
-不保存随机数状态时，恢复后可能会出现：
-
-- dropout 序列变化
-- 数据 shuffle 顺序变化
-- 数据增强结果变化
-
-在很多任务里这未必完全不可接受，但在以下场景里会很重要：
-
-- 你需要尽量复现之前的训练轨迹
-- 你正在定位某个不稳定 bug
-- 你希望恢复前后 loss 曲线尽量连续
-
-所以更稳妥的做法是：
-
-- Python `random`
-- NumPy
-- PyTorch CPU RNG
-- PyTorch CUDA RNG
-
-都一起保存。
-
-#### 10.5.3 dataloader / sampler 状态为什么经常被漏掉
-
-恢复训练时，很多人只想着：
-
-- 权重恢复了
-- 优化器恢复了
-- step 也恢复了
-
-但如果数据侧状态没恢复，仍然可能出问题：
-
-- 样本重复消费
-- 某些样本被跳过
-- epoch 边界错乱
-- 多卡 shard 重新分配不一致
-
-尤其是：
-
-- iterable dataset
-- 流式数据
-- 多 worker dataloader
-- 分布式 sampler
-
-这些场景下，数据进度状态可能和模型状态一样重要。
-
-#### 10.5.4 训练 checkpoint 和发布权重要分开理解
-
-这是一个特别常见的混淆点：
-
-- **训练 checkpoint**：为了恢复训练，必须尽量完整
-- **发布权重**：为了推理或分享，通常只关心模型参数本身
-
-两者目的不同，格式和体积也常常不同。
-
-一个很实用的工程做法是：
-
-- 训练过程中保存完整训练 checkpoint
-- 到关键里程碑时，额外导出一份“面向部署/评测”的轻量权重包
-
-这样职责更清晰。
-
----
-
-### 10.6 Checkpoint 格式与存储选择
-
-Checkpoint 这里最好拆成两个正交问题来看：一类是“状态如何编码和恢复”，另一类是“状态落到哪里、冷热层怎么组织”。
-
-| 方案 | 优点 | 局限 | 更适合什么场景 |
-|------|------|------|----------------|
-| `torch.save`（pickle） | 简单直接，实验阶段最方便 | Python / pickle 绑定强，安全性和跨环境可移植性一般 | 单机、小规模实验、快速原型 |
-| SafeTensors | 更安全，可零拷贝读取权重 | 更适合权重分发，本身不等于完整训练状态 | 模型发布、推理权重、离线权重交换 |
-| `torch.distributed.checkpoint` | 感知分片状态，适合分布式恢复 | 接入复杂度更高 | ZeRO / FSDP / 大规模分布式训练 |
-
-存储后端也要一起考虑：
-
-- **本地 NVMe / 并行文件系统**：低延迟，适合频繁短周期保存
-- **对象存储**：容量弹性好，适合长期保留和跨集群恢复，但写入更慢
-
-简化理解就是：
-
-- 只想先跑通实验：`torch.save`
-- 要安全分发模型权重：SafeTensors
-- 要和 [第9章 §9.6](./09-model-pipeline-parallel.md) 的分片训练配套：分布式 checkpoint
-- 要给训练主路径提供热层：并行文件系统或本地 NVMe，再异步刷到对象存储
-
-#### 10.6.1 先问“恢复目标”再选格式
-
-格式选择最好不要从“社区现在流行什么”开始，而是先问：
-
-1. 我要恢复的是**单机实验**还是**分布式训练**？
-2. 恢复时 world size 会不会变化？
-3. 我更在意**简单**、**安全**还是**分片感知**？
-4. 这个文件是给**训练恢复**用，还是给**推理发布**用？
-
-否则很容易出现一种常见错误：
-
-- 用适合权重分发的格式，硬去装完整训练状态
-- 或用适合实验的单文件保存方式，硬套到大规模分片训练上
-
-#### 10.6.2 一个推荐的目录结构
-
-一个比较实用的 checkpoint 目录通常长这样：
-
-```text
-checkpoints/
-├── latest
-├── step_0001000/
-│   ├── manifest.json
-│   ├── metadata.json
-│   ├── model/
-│   ├── optim/
-│   ├── scheduler/
-│   └── rng/
-├── step_0002000/
-│   ├── manifest.json
-│   ├── metadata.json
-│   ├── model/
-│   ├── optim/
-│   ├── scheduler/
-│   └── rng/
-└── best/
-```
-
-这里面几个设计点很重要：
-
-- `latest` 最好是一个轻量指针，而不是完整数据副本
-- `manifest.json` 用来描述该 checkpoint 应包含哪些文件
-- `metadata.json` 记录 step、时间、world size、版本、校验信息
-- `best/` 可以是指针，也可以是单独标记
-
-这样恢复逻辑就不会依赖“猜目录名”。
-
-#### 10.6.3 为什么要有 manifest
-
-manifest 的作用类似“装箱清单”：
-
-- 这一版 checkpoint 应该包含哪些 shard
-- 每个 shard 对应哪个 rank / 哪类状态
-- 文件大小、hash 或校验信息是什么
-- 这版状态是否写完并且完成 commit
-
-没有 manifest 时，恢复常常只能靠：
-
-- 扫目录
-- 猜文件名
-- 看哪个文件“像是比较完整”
-
-这在单机实验里还能凑合，在多机分布式训练里很危险。
-
----
-
-### 10.7 保存频率怎么权衡
-
-checkpoint 太少：
-
-- 恢复时损失进度大
-
-checkpoint 太频繁：
-
-- 训练被频繁打断
-- 存储成本上升
-- 写入路径容易成为瓶颈
-
-一个粗略判断方式是：
-
-$$
-\text{checkpoint interval} \approx \text{可接受进度损失} \times \text{训练稳定性预期}
-$$
-
-工程上更实用的做法通常是：
-
-- 周期性保存最近几个
-- 对关键里程碑保存长期版本
-- 把“latest”指针和“完整 checkpoint 文件”解耦
-
-> **参考数量级（仅供建立直觉，实际值因硬件和配置差异较大）**
->
-> | 场景 | 典型值 | 说明 |
-> |------|--------|------|
-> | 70B 级模型 BF16 权重快照 | 约 130-140 GB | 若连同优化器状态，数据量会更大 |
-> | 写入高速 NVMe | 约 30-60 秒 | 取决于并发写入、压缩和文件数 |
-> | 写入对象存储 | 约 3-10 分钟 | 更适合长期保留，不适合过高频率保存 |
-> | 最近版本保留数 | 常见 3-5 个 | 便于快速回滚，同时控制存储膨胀 |
-
-#### 10.7.1 一个更工程化的思路：按“可承受损失”反推
-
-比起直接问“每 1000 步存一次行不行”，更好的问法是：
-
-- 我最多能接受丢多少训练进度？
-- 我的平均故障间隔有多长？
-- 一次保存会给训练引入多大停顿？
-- 保存失败后是否有重试或降级策略？
-
-例如：
-
-- 单步耗时 2 秒
-- 能接受最多丢 10 分钟进度
-- 那 checkpoint 周期就不应远大于 300 step
-
-但如果：
-
-- 一次 checkpoint 本身要卡 4 分钟
-- 存太频繁会把吞吐拉垮
-
-那你就要考虑异步、热冷分层或者减少保存内容。
-
-#### 10.7.2 两套版本体系通常更稳
-
-很多训练系统最后都会落到“两套保留规则”：
-
-**1）短期恢复版本**
-
-- 保存较频繁
-- 只保留最近 N 个
-- 目的是快速恢复，不是长期留档
-
-**2）长期里程碑版本**
-
-- 保存较少
-- 但保留更久
-- 目的是回溯、评测、回滚、模型审计
-
-这种拆分有两个好处：
-
-- 日常恢复不至于损失太多进度
-- 存储成本又不会因为高频版本无限膨胀
-
-#### 10.7.3 不要把 best 和 latest 混为一谈
-
-- `latest`：最近一次完整可恢复版本
-- `best`：某个指标上效果最好的版本
-
-这两个概念经常不同：
-
-- 最近版本未必效果最好
-- 效果最好版本也未必包含完整训练状态
-
-因此最好独立维护：
-
-- `latest` 供恢复
-- `best` 供评测 / 发布
-
----
-
-### 10.8 异步 Checkpoint
-
-同步保存的问题很直接：训练线程要等写盘完成，step 会被硬性拉长。
-
-异步 checkpoint 的常见做法是：
-
-1. 先把待保存状态从 GPU 侧整理出来
-2. 拷到 CPU 内存或本地缓冲区
-3. 后台线程 / 进程继续写盘
-
-这样可以减少主训练路径阻塞，但代价也明确：
-
-- 需要额外 CPU 内存
-- 需要更稳定的本地缓存和 I/O 带宽
-- 失败处理更复杂
-
-如果作业本身已经存在较重的通信停顿，异步 checkpoint 往往比单纯“少存几次”更值得优先评估（详见 [第8章 §8.9](./08-data-parallel.md)）。
-
-#### 10.8.1 异步并不等于“没有代价”
-
-异步最容易被误解成：
-
-- 后台写盘了
-- 主训练线程就完全不受影响了
-
-实际上它只是把影响从**直接阻塞**变成了**资源竞争**，常见代价包括：
-
-- CPU 内存被 staging buffer 占用
-- PCIe / NVLink / DMA 复制本身也要时间
-- 本地 NVMe 或文件系统带宽被后台写线程占用
-- 过多并发异步写会反过来拖慢训练主路径
-
-所以异步 checkpoint 的关键不只是“开后台线程”，而是：
-
-- 限制同时在飞的保存任务数
-- 控制 staging buffer 大小
-- 为训练主路径预留 I/O 带宽
-
-#### 10.8.2 一个简单的状态机更安全
-
-异步保存建议显式维护状态，而不是只靠“有没有文件夹”判断：
-
-- `PREPARING`
-- `COPYING`
-- `WRITING`
-- `VERIFYING`
-- `COMMITTED`
-- `FAILED`
-
-这样系统才能回答两个关键问题：
-
-1. 当前这版 checkpoint 是否已经可恢复？
-2. 如果作业此时崩掉，下一次重启应该忽略哪些半成品？
-
-#### 10.8.3 原子提交比“写完文件”更重要
-
-一个好用的实践是：
-
-- 先写到临时目录，比如 `step_0002000.tmp/`
-- 全部 shard、manifest、metadata 都写完并校验
-- 最后再原子性更新 `latest` 指针或 rename 为正式目录
-
-这样即使中途失败，也不会让恢复逻辑误把半成品当成可用版本。
-
----
-
-### 10.9 Checkpoint 清理策略
-
-如果只会不断保存而不会清理，存储成本很快会失控。常见策略是：
-
-| 策略 | 作用 | 典型配置 |
-|------|------|----------|
-| 保留最近 N 个 | 便于快速恢复 | 最近 3-5 个 |
-| 每 K 步 / 每天保留一个长期版本 | 便于回溯关键里程碑 | 每 1000-5000 步或每天 1 个 |
-| 标记 best / milestone | 便于后续评测和上线 | 单独保留，不参与自动清理 |
-
-这类清理逻辑最好内建到平台，而不是依赖用户手工删除。
-
-#### 10.9.1 清理策略本质上是在平衡三件事
-
-- **恢复速度**
-- **回溯深度**
-- **存储成本**
-
-只保留最近几个：
-
-- 恢复快
-- 但历史丢失多
-
-保留所有版本：
-
-- 回溯完整
-- 但成本和目录复杂度很快失控
-
-因此通常要分层：
-
-- 最近版本：高频、短保留
-- 里程碑版本：低频、长保留
-- best 版本：指标驱动、单独保留
-
-#### 10.9.2 清理前先确认“版本是否健康”
-
-一个稳妥的清理流程不应该只看“时间最老”，还应先确认：
-
-- 该版本是否已经 `COMMITTED`
-- manifest 是否完整
-- 是否仍被某个恢复流程引用
-- 是否被标记为 best / milestone / audit
-
-否则你可能删掉：
-
-- 唯一一个真正可恢复的版本
-- 或刚好是事故前最后的好版本
-
-#### 10.9.3 推荐的清理顺序
-
-1. 先删除失败或未完成的临时版本
-2. 再按规则裁剪“最近 N 个”之外的普通版本
-3. 最后保留 best / milestone / 审计版本
-
----
-
-### 10.10 恢复不是“重试一下”那么简单
-
-真正的恢复流程要区分失败原因：
-
-- 临时性基础设施错误：可自动重试
-- 持续性代码错误：重试没有意义
-- 数据损坏：必须停止并排查
-- OOM：可能要改变 batch 或策略
-
-如果平台只会盲目重试，最终只会把问题放大。
-
-#### 10.10.1 一个基本恢复决策树
-
-可以把失败大致分为四类：
-
-| 失败类型 | 典型例子 | 是否适合自动恢复 | 常见处理 |
-|---------|----------|------------------|----------|
-| 瞬时基础设施失败 | 网络抖动、短时存储不可用、节点被抢占 | 是 | 从最近 checkpoint 重启 |
-| 持续性配置错误 | 路径写错、权限不足、版本不兼容 | 否 | 停止并人工修复 |
-| 用户代码错误 | shape mismatch、空数据、异常样本 | 否 | 停止并排障 |
-| 资源约束问题 | OOM、磁盘写满、inode 耗尽 | 视情况而定 | 调整 batch、精度、清理空间 |
-
-重点不是“有没有自动重试”，而是：
-
-> **系统能不能先判断这次失败是不是“重试有意义”的失败。**
-
-#### 10.10.2 恢复前最好做三件事
-
-**1）选择最近完整版本**
-
-不能只选“最新目录”，要选“最后一个已提交且校验通过的版本”。
-
-**2）验证环境兼容性**
-
-例如：
-
-- world size 是否兼容
-- 代码版本是否匹配
-- 依赖版本是否变化
-- 参数命名或模块结构是否变动
-
-**3）决定恢复模式**
-
-是：
-
-- 全量恢复继续训练
-- 仅恢复模型做评测
-- 仅恢复部分状态并重置优化器
-- 还是降级为 warm start
-
-这几种语义不要混用。
-
-#### 10.10.3 warm start 和 true resume 不是一回事
-
-- **True resume**：尽量恢复到中断前的训练状态，继续往下跑
-- **Warm start**：只加载部分权重，把它当作初始化再训练
-
-两者看起来都叫“加载 checkpoint”，但差别很大：
-
-| 方式 | 恢复内容 | 目标 |
-|------|----------|------|
-| True resume | 权重 + 优化器 + step + RNG + 训练状态 | 尽量延续原训练轨迹 |
-| Warm start | 通常只加载权重 | 以已有权重为起点重新训练 |
-
-如果系统把这两件事混在一起，常见后果包括：
-
-- 学习率 schedule 错位
-- loss 曲线跳变
-- 指标解释混乱
-- 用户以为自己在“断点续训”，实际已经换了训练语义
-
----
-
-### 10.11 大规模训练里的高频失败与弹性训练
-
-当规模进入数十到数百张 GPU 后，最常见的问题往往不再是“代码会不会跑”，而是“哪一个节点先把整体拖死”。
-
-| 问题 | 典型信号 | 先看什么 | 常见处理 |
-|------|----------|----------|----------|
-| NCCL hang | 所有 rank 卡住，watchdog 超时 | `NCCL_DEBUG=INFO`、超时位置、哪一 rank 最后输出日志 | 隔离故障节点、检查 IB / RoCE、确认是否某 rank 数据加载卡住 |
-| Straggler | 某节点 step time 持续慢 5%-10% | per-node step time、AllReduce 等待时间分布 | 标记慢节点、迁移作业、排查链路或硬件退化 |
-| 存储抖动 | checkpoint / dataloader 阶段整体变慢 | 本地 NVMe、并行文件系统、对象存储延迟 | 改为热层落盘，异步上传冷层 |
-| 抢占 / 节点掉线 | worker 消失、world size 变化 | 作业编排器事件、训练框架重启日志 | 从最近 checkpoint 恢复，必要时缩容继续 |
-
-#### 10.11.1 NCCL hang / 通信故障的分层排障路径
-
-NCCL hang 难排的地方在于：表面上看是“所有 rank 都卡住”，但真实世界里往往是某一个 rank 没有按时进入 collective，剩余 rank 只是被动等待。因此 on-call 不应该只盯 `NCCL_DEBUG=INFO`，而是按“训练栈分层”去收敛范围。
-
-```mermaid
-flowchart TD
-    A[发现训练无进展或 watchdog timeout] --> B{所有 rank 都有心跳吗}
-    B -- 否 --> C[定位失联 rank 和所在节点]
-    C --> D{编排器是否驱逐或重启容器}
-    D -- 是 --> E[按抢占或节点失联处理 从最近 COMMITTED checkpoint 恢复]
-    D -- 否 --> F[检查 GPU Xid ECC dmesg 进程状态]
-    F --> G{硬件健康异常吗}
-    G -- 是 --> H[隔离节点 终止挂起作业 恢复训练]
-    G -- 否 --> I[采集 py-spy 或 native backtrace]
-    B -- 是 --> J[对齐最后成功 step collective 名称和 rank 日志]
-    J --> K{可疑 rank 是否未进入 collective}
-    K -- 是 --> L[看 dataloader I/O 样本解码 checkpoint 写盘]
-    K -- 否 --> M[运行同拓扑 nccl-tests 和最小 all-reduce]
-    M --> N{通信 benchmark 异常吗}
-    N -- 是 --> O[升级网络或拓扑 排查 HCA 交换机 MTU ECN]
-    N -- 否 --> P[回看框架时序 版本组合 CUDA/NCCL/driver]
-    I --> Q{调用栈卡在数据或存储吗}
-    Q -- 是 --> L
-    Q -- 否 --> M
-    L --> R{同 step 或同样本可复现吗}
-    R -- 是 --> S[停止自动重试 转数据或代码排障]
-    R -- 否 --> E
-    O --> T[修复后先跑 pre-flight 再放回训练池]
-    P --> U[锁定或回退版本 用最小复现确认]
-```
-
-| 排查层次 | 先看哪些指标 / 证据 | 常见工具 / 动作 | 何时可以判定这一层有问题 |
-|----------|---------------------|-----------------|--------------------------|
-| GPU / 主机层 | GPU Xid、ECC error、温度、降频、PCIe/NVLink 带宽、进程是否还在跑 | `nvidia-smi -q`、主机监控、GPU 健康告警 | 某张卡 ECC/Xid 异常持续增长，或该 rank 所在主机 GPU 利用率异常掉到 0 |
-| 网络层 | IB / RoCE link flap、重传、端口错误、collective 延迟、节点间 RTT 抖动 | 交换机 / HCA 指标、`nccl-tests`、网络告警面板 | 单节点网络错误计数明显异常，或同组 benchmark 带宽显著低于其他节点 |
-| 存储 / 数据层 | dataloader queue 深度、远端读取延迟、样本解码耗时、checkpoint 写盘延迟 | dataloader 指标、对象存储 / 并行文件系统时延、`py-spy` | 可疑 rank 长时间卡在 `DataLoader` / I/O 调用栈，且并未进入 collective |
-| 框架 / 运行时层 | 哪个 rank 最后打印日志、watchdog timeout 发生在 init 还是训练中、collective 名称、step 号 | `NCCL_DEBUG=INFO`、框架日志、rank 心跳 | timeout 总是稳定出现在相同步骤 / 同一 collective，说明问题可复现到框架时序 |
-| 调度 / 编排层 | 节点是否被驱逐、容器是否重启、cgroup OOM、作业重建事件 | 作业编排器事件流、节点事件 | 某个 worker 在 hang 前已被驱逐或短暂失联，说明训练 hang 只是结果不是根因 |
-
-如果第一轮还无法定位，可以继续按下面的值班流程推进：
-
-| On-call 步骤 | 目的 | 可执行检查项 | 失败条件 / 升级边界 |
-|--------------|------|--------------|----------------------|
-| 1. 定位最后失联 rank | 缩小调查面，避免全量翻日志 | 看 rank 心跳、最近一个成功 step、哪一 rank 最后打印 `NCCL_DEBUG=INFO` | 10 分钟内无法缩到单个或少量 rank，升级到平台侧统一采集日志 |
-| 2. 区分“没进 collective”还是“collective 卡死” | 决定先看数据侧还是网络侧 | 对可疑 rank 用 `py-spy` 抽样；必要时再看 native backtrace | Python 栈卡在 dataloader / I/O，则先按数据或存储问题处理；否则继续看 NCCL / 驱动 |
-| 3. 核对节点健康 | 判断是否需要立即隔离主机 | 看 GPU Xid/ECC、网卡错误、宿主机 dmesg、磁盘超时 | 任一硬件健康指标持续异常，直接 cordon / 排除节点，不继续让其回到训练池 |
-| 4. 交叉验证网络 | 防止把单机代码问题误判为 NCCL bug | 用同拓扑 `nccl-tests` 或最小 all-reduce smoke test 复现 | benchmark 明显异常则按网络 / 拓扑问题升级；benchmark 正常则回看训练栈 |
-| 5. 执行恢复 | 让训练尽快回到前进状态 | 标记故障节点、终止挂住作业、从最近可用 checkpoint 恢复 | 若连续两次在同节点 / 同step附近复现，停止自动重试，转人工深挖 |
-
-常见根因和推荐动作也最好预先表格化，而不是只靠经验记忆：
-
-| 根因类别 | 典型现象 | 最小确认信号 | 立即动作 | 不应继续自动重试的条件 |
-|----------|----------|--------------|----------|--------------------------|
-| GPU 硬件故障 | 单 rank 利用率掉零、Xid/ECC 告警、进程仍存活但不前进 | 主机健康面板或 GPU 错误日志异常 | 隔离该节点，从最近 checkpoint 恢复 | 同一主机短时间内重复触发错误 |
-| 网络链路 flap | 多节点 collective 超时、带宽骤降、重传升高 | HCA / 交换机错误计数上升，`nccl-tests` 退化 | 切出故障链路或节点，复跑通信 smoke test | 相同机架或同一 fabric 多点同时异常 |
-| 数据加载卡死 | 某 rank 不再进入 step，其他 rank 等待 | `py-spy` 显示停在 dataloader / 解码 / 远端读取 | 重启 dataloader worker，排查样本或存储 | 同一批数据反复触发，说明是数据或代码错误 |
-| 驱动 / 版本 bug | 只在特定镜像、驱动或 CUDA/NCCL 组合出现 | 同配置复现、升级或回滚后消失 | 锁版本、回退到已验证组合 | 未固定版本就继续扩大训练规模 |
-
-#### 10.11.2 Straggler Detection（慢节点检测）
-
-同步训练看的是最慢节点。某台机器只要慢 10%，整个 job 就会按它的节奏走，所以平均吞吐往往会掩盖问题。更有效的方式是直接盯“等待在哪里发生”“是谁在拖慢同步点”。
-
-| 观察维度 | 建议指标 | 典型阈值 / 异常信号 | 常见根因 |
-|----------|----------|---------------------|----------|
-| 训练节奏 | per-node step time、step time P95/P99、每 rank 最近 N step 偏差 | 某节点持续比中位数慢 5%-10% 以上 | GPU 降频、坏卡、CPU 抢占、数据局部热点 |
-| 通信等待 | AllReduce / AllGather 等待时间分布、comm time 占比 | 单节点 comm wait 长尾明显更大 | 网络抖动、collective 拓扑异常、背景流量争抢 |
-| 数据侧 | data time、queue depth、样本解码耗时 | 仅某些 rank data time 异常高 | 远端存储慢、样本倾斜、dataloader worker 异常 |
-| 存储侧 | checkpoint 写盘分位数、本地盘 / PFS 延迟 | 保存阶段只有少量节点明显更慢 | 本地 NVMe 抖动、PFS 热点、共享带宽不足 |
-
-值班上更重要的是处理策略和边界，而不只是“看到慢”：
-
-| 处理动作 | 适用场景 | 工程边界 | 失败条件 |
-|----------|----------|----------|----------|
-| 自动标记慢节点 | 短时抖动和硬件退化混在一起时，先收集证据 | 只对持续多窗口异常的节点触发，避免偶发抖动误杀 | 节点恢复后仍反复进入慢节点名单 |
-| 重新调度 / 迁移作业 | 排除调度干扰或 noisy neighbor | 平台必须支持节点隔离或作业重绑 | 迁移后仍慢，说明不是调度问题 |
-| 排除故障节点 | 已确认硬件或网络退化 | 需要有剩余容量，或训练可接受缩容 | 缩容后 global batch / 学习率未重算 |
-| 降级保存频率或启用异步上传 | straggler 来自 checkpoint I/O 长尾 | 只适合根因在存储，不解决 GPU / 网络问题 | 保存长尾下降但 step 长尾不变，说明找错方向 |
-
-#### 10.11.3 Elastic Training（弹性训练）在解决什么
-
-弹性训练的目标不是“让训练永远不失败”，而是让训练系统把节点故障当作常态，而不是把每次掉线都等同于整批作业报废。常见实现是 `torchrun` / TorchElastic 这类 worker group 管理器：它们允许作业在 `min:max` worker 范围内启动，在部分节点失联时自动重启 worker group，必要时缩到更小的 world size 继续跑，等新节点补齐后再扩回来。这个机制最适合 spot / preemptible 集群、长时间大规模训练、或者机器池质量不稳定的环境，因为这些场景下“总有节点会掉”是现实前提。
-
-但弹性训练不是给 checkpoint 系统“外面包一层自动重试”就结束了。真正困难的部分在于：训练状态原本是按某个 world size、某个分片布局、某个 global batch 组织起来的；一旦部分节点消失，这三个前提都可能变化。于是 checkpoint 不仅要保存模型和优化器状态，还要能描述分片布局、并行拓扑、sampler 进度，以及哪些状态在恢复时可以直接继承、哪些必须重算。否则自动重启只会把“节点故障”升级成“训练语义漂移”。
-
-从工程角度看，弹性训练是一个吞吐稳定性和可完成性之间的交换：你接受短时间缩容、step time 抖动、监控口径变化，换取任务在频繁故障下仍能完成；你也通常要接受更频繁的周期性 checkpoint、更复杂的 manifest / metadata，以及作业恢复逻辑对 world size 变化的显式支持。
-
-| 弹性场景 | 系统应自动做什么 | checkpoint / 恢复要求 | 工程边界 |
-|----------|------------------|-----------------------|----------|
-| 单节点掉线，仍高于 `min_nodes` | 重启 worker group 或缩容继续 | 最近 checkpoint 可被较小 world size 读取；sampler 可重建 | 若缩容会破坏训练语义，宁可停止也不要“假恢复” |
-| 新节点回归，允许扩容 | 重新组成 worker group，回到目标规模 | checkpoint metadata 记录并行布局，支持新 rank 重映射 | 扩容后必须重新评估 global batch 和 LR 规则 |
-| 高频抢占环境 | 更积极地 checkpoint，减少进度损失 | 保存频率和写盘路径要与抢占间隔匹配 | checkpoint 过重导致吞吐损失超过抢占收益时，要重新算账 |
-| 故障率高但容量紧张 | 优先保证训练完成，而不是吞吐完美稳定 | 允许回退到上一个完整版本，必要时缩容运行 | 若可用节点长期低于 `min_nodes`，应停止等待资源而不是无穷重试 |
-
-#### 10.11.4 world size 变化为什么会影响恢复
-
-很多人直觉上会觉得：
-
-- checkpoint 既然已经保存了
-- 重启时把它读回来不就行了
-
-但在弹性场景里，world size 变化会引出新问题：
-
-- 原来的分片布局是否还能映射到新的 rank 集合
-- global batch size 要不要随 worker 数改变
-- 学习率缩放规则是否需要跟着变
-- dataloader 的 shard 切分是否会导致重复或遗漏数据
-
-因此真正支持 elastic resume 的系统，需要 checkpoint 不只是“能读文件”，而是：
-
-- 能重建状态布局
-- 能重新计算训练配置
-- 能明确区分哪些状态可直接继承、哪些状态必须重算
-
-#### 10.11.5 失败恢复与 checkpoint 策略
-
-在弹性环境里，checkpoint 不是“多久存一次”这么简单，而是要回答三个问题：失败后最多损失多少进度、局部失败能不能自动恢复、以及为了减少损失愿意付出多少吞吐代价。
-
-| 场景 | 推荐 checkpoint 策略 | 恢复路径 | 工程边界 / 失败条件 |
-|------|----------------------|----------|---------------------|
-| 常规长训练 | 固定步数周期性保存，最近 3-5 个版本 + 低频里程碑 | 读取最近 `COMMITTED` 版本继续训练 | checkpoint 周期不能显著大于可接受进度损失 |
-| spot / preemptible | checkpoint 周期按平均抢占间隔反推，并尽量先写热层再异步上传冷层 | 抢占后从最近热层或已完成上传版本恢复 | 若单次保存开销接近或超过平均抢占间隔，这个策略本身就需要重构 |
-| 局部失败（少量 worker 掉线） | 使用分布式 checkpoint，保存分片布局和 world metadata | 先判断是否可缩容继续，再决定是否全量重组 worker group | 若恢复后无法保证 shard 正确映射，就必须停止而不是强行 resume |
-| 存储不稳定 | 降低同步写冷层频率，保留本地 / PFS 热层缓存，增加 manifest 校验 | 回退到最后一个完整且校验通过的版本 | 如果连续两个版本都无法校验通过，说明不是单次偶发失败，应停止自动恢复 |
-
-对 on-call 来说，更实用的是知道每种失败该怎么判断是否还值得自动恢复：
-
-| 失败类型 | 默认动作 | 为什么 | 停止自动恢复的条件 |
-|----------|----------|--------|--------------------|
-| 节点被抢占 / 临时失联 | 自动从最近 checkpoint 恢复 | 根因通常在集群容量，不在训练语义 | 连续恢复后 world size 长期低于 `min_nodes` |
-| 单节点硬件故障 | 排除节点后恢复，必要时缩容 | 继续把坏节点放回池里只会再次触发 hang | 相同硬件池连续出现相同故障 |
-| checkpoint 写入失败 | 回退到上一个完整版本，并切换热层路径或延后冷层上传 | 半成品 checkpoint 比“不恢复”更危险 | 最近两个 checkpoint 都写不完整或 manifest 不一致 |
-| 用户代码 / 数据错误 | 停止自动恢复，转人工排障 | 重试不会改变代码和脏数据 | 相同步骤、相同样本反复报错 |
-
-#### 10.11.6 弹性训练最容易忽略的约束
-
-**1）统计口径会变**
-
-worker 变了以后：
-
-- step 吞吐
-- samples/sec
-- global tokens/sec
-
-都会变，监控和告警口径必须能解释这个变化。
-
-**2）学习率策略可能要重审**
-
-如果 global batch 改了，而学习率策略没跟着变，训练动态可能直接被改变。
-
-**3）数据一致性要求更高**
-
-尤其是在流式数据和分布式采样下，恢复后如何避免：
-
-- 重复样本
-- 漏样本
-- shard 错位
-
-这比普通单机 resume 难得多。
-
-#### 10.11.7 训练前预检（Pre-flight Validation）
-
-百卡级训练里，最便宜的排障通常发生在真正开跑之前，而不是作业已经跑了 2 小时后才发现其中一张卡或一组版本组合根本不稳定。更稳妥的做法，是把启动前预检做成固定流程：
-
-| 检查项 | 看什么 | 通过标准 | 不通过时怎么处理 |
-|--------|--------|----------|------------------|
-| 通信 smoke test | `nccl-tests` 或最小 all-reduce benchmark 的带宽、延迟、错误日志 | 同批节点结果接近基线，没有明显长尾或超时 | 把异常节点从训练池剔除，先修链路 / 拓扑再开跑 |
-| GPU 健康 | ECC 错误、Xid、温度、降频、显存自检 | 无持续增长的 ECC/Xid，温度和频率稳定 | 标记坏卡或坏机，避免“先跑再说” |
-| 主机与互联带宽 | PCIe / NVLink / NIC 带宽和错误计数 | 不低于该机型正常区间 | 若显著偏低，优先排查固件、拓扑、共享干扰 |
-| 存储预检 | 本地盘 / PFS / 对象存储写入和读取延迟 | 热层写入可满足 checkpoint 周期，冷层上传不会阻塞主路径 | 必要时改成本地 / PFS 热层 + 异步冷层 |
-| 版本兼容性 | driver、CUDA、NCCL、训练框架、容器镜像版本 | 在已验证兼容矩阵内 | 先锁定版本，避免“边训练边试组合” |
-| 调度就绪度 | 可用节点数、配额、抢占策略、自动重试策略 | 满足 `min_nodes`，且调度策略与训练模式匹配 | 若容量达不到下限，不要启动后再等失败 |
-
-它的目的不是做完整压测，而是尽早把坏卡、坏链路和坏版本组合拦在训练启动前。
-
----
-
-### 10.12 FP8 训练管线与 HFU 整合
-
-FP8 训练的第一性目的不是“把所有张量都变成 8 bit”，而是在 H100/H200/GB200 这类支持 FP8 Tensor Core 的硬件上，让矩阵乘主路径以更高吞吐运行，同时把训练稳定性损失限制在可控范围内。工程上通常会保留一部分高精度状态：权重主副本、优化器状态、梯度归约、loss scale 或 amax 统计不一定都用 FP8；FP8 更多用于 GEMM 输入、激活、权重的计算副本和部分通信前后的 cast 边界。也就是说，FP8 是一条训练管线，不是一个 dtype 开关。
-
-一个简化的 FP8 管线可以按 step 拆成 5 段：第一，读取 BF16/FP32 主权重并根据历史 amax 计算 scale；第二，把参与 GEMM 的激活和权重 cast 到 E4M3 或 E5M2；第三，用 FP8 Tensor Core 完成 forward / backward 的主要矩阵乘；第四，把梯度按策略保留在 BF16/FP32 或通信前做受控压缩；第五，用高精度优化器状态更新主权重，并刷新下一步使用的 scale / amax window。这里的关键风险是 scale 过大导致 underflow，scale 过小导致 overflow，或者不同 rank 的 amax/scale 统计不同步，最终让 loss 曲线出现难以解释的尖峰。
-
-| 管线位置 | 常见精度 | 关注指标 | 工程边界 |
-|----------|----------|----------|----------|
-| 主权重 / optimizer state | BF16 / FP32 | loss 连续性、更新范数、溢出次数 | 不建议为了省显存直接把 Adam 一阶 / 二阶矩降到 FP8 |
-| GEMM 输入副本 | FP8 E4M3 / E5M2 | Tensor Core 利用率、amax 分布、cast 开销 | 只有大 GEMM 足够多时收益明显，小算子 cast 可能抵消收益 |
-| 梯度与通信 | BF16 为主，部分场景压缩 | all-reduce 时间、梯度范数、数值偏差 | 通信压缩必须验证收敛，不应只看带宽下降 |
-| Scale / amax 统计 | FP32 metadata | overflow / underflow、跨 rank 一致性 | 多并行维度下要明确 scale 同步范围 |
-| Checkpoint | 主权重 + scale metadata + optimizer state | resume 后 loss 是否跳变 | checkpoint 不能只存 FP8 计算副本，否则恢复语义不完整 |
-
-HFU（Hardware FLOPs Utilization）适合用来观察“硬件峰值算力被用掉多少”，但它在 FP8 场景中特别容易被误读。若分母使用 FP8 Tensor Core peak，HFU 会比 BF16 口径更难看；若仍用 BF16 peak，数值又会被人为抬高。因此平台指标必须同时记录 dtype、硬件峰值口径、模型理论 FLOPs、端到端 step time、通信与 checkpoint 时间。一个可落地的看板至少应分开展示：model FLOPs utilization、FP8 Tensor Core HFU、tokens/sec、data/compute/comm/checkpoint time 占比，以及 loss stability 指标。只有当 tokens/sec 提升、loss 曲线稳定、checkpoint 可恢复、通信和 cast 开销没有吞掉收益时，FP8 才算真正改善训练效率。
-
-| 判断问题 | 推荐阈值 / 证据 | 下一步动作 |
-|----------|-----------------|------------|
-| HFU 变高但 tokens/sec 没变 | compute time 降了，但 comm / data / checkpoint 占比上升 | 先优化端到端瓶颈，不继续调 FP8 scale |
-| tokens/sec 提升但 loss 尖峰 | overflow、amax 长尾、梯度范数异常 | 缩小 scale window 或回退部分模块到 BF16 |
-| 单卡快，多卡收益差 | all-reduce 时间占比增加，scale metadata 同步频繁 | 检查通信精度、bucket、并行拓扑 |
-| resume 后 loss 跳变 | checkpoint 缺少 scale / RNG / optimizer metadata | 修正 checkpoint schema 后重新验证恢复 |
-
-**工程边界**：FP8 不适合在没有稳定 BF16 baseline 的情况下直接上百卡规模试跑；不适合只凭一次短 benchmark 宣称收益；不适合把 checkpoint 缩成 FP8 权重副本来节省存储。更稳的推进顺序是：单机数百 step 验证 loss 和 amax 分布，单节点多卡验证通信和 scale 同步，小规模多节点验证 HFU 口径与恢复，再进入正式长训练。
-
----
-
-### 10.13 工程建议
-
-- 先决定恢复目标，再决定 checkpoint 内容和格式
-- 只要用了状态分片，就尽量避免把 checkpoint 退化成单文件思维
-- 保存频率要和通信开销、I/O 路径一起看，不要孤立配置
-- 清理策略必须自动化，否则成本一定失控
-- 对 100+ GPU 作业，默认假设会遇到慢节点和抢占，而不是把它们当作例外
-
-#### 10.13.1 一个最低可用训练恢复方案
-
-如果你现在要从零搭一套“够用但不夸张”的训练恢复方案，可以先做到这几个点：
-
-**状态内容**
-
-- 模型权重
-- 优化器状态
-- scheduler 状态
-- step / epoch
-- AMP scaler
-- Python / NumPy / Torch RNG
-- 关键超参数和代码版本
-
-**版本管理**
-
-- 每次保存写入独立目录
-- 完成后再更新 `latest` 指针
-- 每个版本带 metadata 和 manifest
-
-**保存策略**
-
-- 固定步数保存最近 3-5 个
-- 每天 / 每若干千步保留一个里程碑版本
-- best 单独标记
-
-**恢复策略**
-
-- 启动时优先读取最近一个 `COMMITTED` 版本
-- 若失败则自动回退到上一个完整版本
-- 连续失败时停止重试并告警
-
-这已经能覆盖很多真实训练任务。
-
-#### 10.13.2 一个很实用的故障分层思维
-
-排障时可以先按“层”来看，而不是一上来就盯某个错误码：
-
-| 层次 | 常见问题 |
-|------|----------|
-| 用户代码层 | shape 错误、数据为空、死循环、异常样本 |
-| 框架层 | AMP、FSDP、Dataloader、checkpoint 接口使用错误 |
-| 通信层 | NCCL hang、collective 超时、rank 不一致 |
-| 存储层 | 写盘失败、对象存储延迟、文件缺失、manifest 不一致 |
-| 硬件层 | GPU ECC、网卡异常、NVMe 抖动、过热降频 |
-| 编排层 | 抢占、节点漂移、自动重启策略不合理 |
-
-这样排障路径会比“看见 hang 就一直翻 NCCL 日志”更清楚。
-
-#### 10.13.3 三个高频反模式
-
-**反模式 1：只存模型权重，却把它叫 resume**
-
-这通常不是完整断点续训，而只是 warm start。
-
-**反模式 2：latest 直接指向正在写的目录**
-
-一旦中途失败，恢复就可能读到半成品。
-
-**反模式 3：高频 checkpoint 直接写对象存储**
-
-主训练路径容易被远端写入延迟拖垮。更合理的是：
-
-- 热层快速落本地 / 并行文件系统
-- 冷层异步归档到对象存储
-
----
-
-## 实战示例
-
-### 示例 1：单机实验的最小断点续训
-
-```python
-import os
-import random
-import numpy as np
 import torch
+import torch.distributed as dist
+import os
+from torch.distributed.checkpoint import FileSystemWriter, save
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+)
 
-def save_ckpt(path, model, optimizer, scheduler, step):
-    ckpt = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler else None,
-        "step": step,
+def validate_manifest(manifest, expected):
+    assert manifest["schema_version"] == expected["schema_version"]
+    assert manifest["global_step"] == expected["global_step"]
+    assert manifest["world_size"] == expected["world_size"]
+    assert manifest["parallelism"] == expected["parallelism"]
+    assert manifest["rank_count"] == expected["world_size"]
+    assert manifest["status"] == "writing"
+    assert len(manifest["files"]) == expected["file_count"]
+    for f in manifest["files"]:
+        assert f["bytes"] > 0
+        assert f["sha256"].startswith("sha256:")
+        assert f["tensor_count"] > 0
+        assert f["dtype_summary"]
+
+def atomic_publish(tmp_dir, visible_dir, latest_path, manifest):
+    # POSIX filesystem path: validate first, then make the step visible, then
+    # update latest. Object storage should use immutable prefix + latest.json.
+    manifest["status"] = "validated"
+    write_json(f"{tmp_dir}/manifest.json", manifest)
+    fsync_tree(tmp_dir)
+    os.rename(tmp_dir, visible_dir)
+    write_json(latest_path, {
+        "step": manifest["global_step"],
+        "path": visible_dir,
+        "manifest_sha256": sha256_file(f"{visible_dir}/manifest.json"),
+        "generation": manifest["created_at_unix"],
+    })
+
+def save_sharded_checkpoint(model, optimizer, scheduler, dataloader_state, step, ckpt_dir):
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    tmp_dir = f"{ckpt_dir}/step_{step:08d}.tmp"
+    visible_dir = f"{ckpt_dir}/step_{step:08d}"
+    state = {
+        "model": get_model_state_dict(model, options=options),
+        "optimizer": get_optimizer_state_dict(model, optimizer, options=options),
+        "scheduler": scheduler.state_dict(),
         "rng": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
             "torch_cpu": torch.get_rng_state(),
-            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        }
+            "torch_cuda": torch.cuda.get_rng_state_all(),
+        },
+        "dataloader": dataloader_state,
+        "metadata": {
+            "schema_version": 3,
+            "global_step": step,
+            "world_size": dist.get_world_size(),
+            "parallelism": {
+                "dp": 128,
+                "tp": 4,
+                "pp": 2,
+                "cp": 1,
+                "fsdp": "full_shard",
+            },
+        },
     }
-    tmp_path = path + ".tmp"
-    torch.save(ckpt, tmp_path)
-    os.replace(tmp_path, path)   # 原子替换，避免半成品
+    writer = FileSystemWriter(tmp_dir)
+    save(state, storage_writer=writer)
 
-def load_ckpt(path, model, optimizer=None, scheduler=None):
-    ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model"])
-    if optimizer is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scheduler is not None and ckpt["scheduler"] is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
-
-    random.setstate(ckpt["rng"]["python"])
-    np.random.set_state(ckpt["rng"]["numpy"])
-    torch.set_rng_state(ckpt["rng"]["torch_cpu"])
-    if torch.cuda.is_available() and ckpt["rng"]["torch_cuda"] is not None:
-        torch.cuda.set_rng_state_all(ckpt["rng"]["torch_cuda"])
-
-    return ckpt["step"]
+    if dist.get_rank() == 0:
+        manifest = build_manifest_from_tmp_dir(tmp_dir, state["metadata"])
+        validate_manifest(manifest, expected={
+            "schema_version": 3,
+            "global_step": step,
+            "world_size": dist.get_world_size(),
+            "parallelism": state["metadata"]["parallelism"],
+            "file_count": dist.get_world_size() * 4,
+        })
+        atomic_publish(tmp_dir, visible_dir, f"{ckpt_dir}/latest.json", manifest)
 ```
 
-这个例子体现了三个关键点：
+这个示例中的 `build_manifest_from_tmp_dir`、`write_json`、`fsync_tree` 和 `sha256_file` 是平台侧伪函数，重点是顺序：先写 `step_N.tmp`，再检查 `schema_version/global_step/world_size/parallelism/rank_count/files[].bytes/files[].sha256/files[].tensor_count/dtype_summary`，然后把 manifest 标为 `validated`，最后 temp-to-visible atomic publish 并更新 `latest.json`。生产还需要 retention、权限和指标。
 
-- 不只保存模型，还保存优化器、scheduler、step 和 RNG
-- 先写临时文件，再原子替换
-- 恢复时把训练轨迹相关状态一起拉回来
+### 7.3 TorchElastic launcher 与 preflight snippet
 
-### 示例 2：保存最近 N 个 + 里程碑版本
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-```python
-from pathlib import Path
-import shutil
+export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
-def cleanup_checkpoints(root: str, keep_last: int = 3):
-    root = Path(root)
-    ckpts = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("step_")])
-    normal_ckpts = [p for p in ckpts if "milestone" not in p.name and "best" not in p.name]
+# Preflight: fail fast before reserving a multi-day run.
+nvidia-smi -L
+python - <<'PY'
+import torch
+assert torch.cuda.is_available()
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(i, p.name, p.total_memory)
+PY
 
-    for p in normal_ckpts[:-keep_last]:
-        shutil.rmtree(p, ignore_errors=True)
+# Cluster preflight normally also runs nccl-tests, storage write/read,
+# dataset manifest validation, and checkpoint restore dry-run.
+torchrun \
+  --nnodes="${NNODES_MIN}:${NNODES_MAX}" \
+  --nproc-per-node=8 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint="${RDZV_ENDPOINT}" \
+  --rdzv-id="${JOB_ID}" \
+  --max-restarts=8 \
+  train.py \
+  --checkpoint-dir "${CHECKPOINT_DIR}" \
+  --resume auto \
+  --save-interval-minutes 30 \
+  --checkpoint-format sharded_v3 \
+  --rpo-minutes 45 \
+  --rto-minutes 20
 ```
 
-真实系统会更复杂，但最核心的思路是：
+TorchElastic 注意点：
 
-- 高频版本只保留最近几个
-- 里程碑 / best 单独保护
-- 清理逻辑最好自动执行
+- `--max-restarts` 不是可靠性目标；没有 validated checkpoint 时，restart 只能重复失败。
+- elastic world size 改变后必须重新计算 DP degree、gradient accumulation、global batch 和 sampler partition。
+- 如果训练语义要求固定 global batch，应在 worker 数变化时调整 accumulation，而不是静默改变学习率有效尺度。
 
-### 示例 3：恢复前的版本筛选逻辑（伪代码）
+### 7.4 DeepSpeed / Megatron 常见 knobs
 
-```text
-for ckpt in checkpoints_sorted_by_step_desc:
-    if ckpt.status != COMMITTED:
-        continue
-    if not verify_manifest(ckpt):
-        continue
-    if not environment_compatible(ckpt):
-        continue
-    return ckpt
+| 框架 | knob | 工程含义 |
+|---|---|---|
+| DeepSpeed | `zero_optimization.stage` | optimizer/grad/param sharding 级别 |
+| DeepSpeed | `offload_optimizer.device=cpu/nvme` | 把 optimizer state 移出 HBM，换 PCIe/NVMe 压力 |
+| DeepSpeed | `checkpoint.tag_validation` | 防止 tag 不一致恢复 |
+| Megatron | `--use-distributed-optimizer` | optimizer state sharding |
+| Megatron | `--use-checkpoint-args` | checkpoint 内参数约束恢复 |
+| Megatron | `--fp8-format`, `--fp8-amax-history-len` | FP8 scale/amax 状态边界 |
+| PyTorch FSDP | `StateDictType.SHARDED_STATE_DICT` | 生产保存大模型默认选项 |
+| PyTorch | `torch.distributed.checkpoint` | 分布式保存/恢复 API |
 
-raise NoUsableCheckpointError
+版本矩阵要固定到 container image digest，不能只写“PyTorch 2.x”。checkpoint schema 和分布式 API 在小版本间可能有兼容差异。
+
+---
+
+## 8. 工程化落地：准入、发布、观测、治理
+
+### 8.1 版本矩阵
+
+生产作业提交前记录并校验：
+
+| 类别 | 必填字段 |
+|---|---|
+| 代码 | git SHA、dirty flag、训练入口、config hash |
+| 镜像 | image digest、CUDA runtime、cuDNN、NCCL、PyTorch |
+| 驱动 | NVIDIA driver、GPU firmware、DCGM exporter |
+| 通信 | IB/RoCE driver、OFED、NCCL topology、rail 配置 |
+| 存储 | backend 类型、endpoint、quota、带宽等级、一致性语义 |
+| 数据 | dataset manifest、tokenizer hash、shuffle seed |
+| checkpoint | schema_version、retention class、restore policy |
+
+### 8.2 admission control
+
+准入检查不只是资源够不够：
+
+- 显存预算：估算 `M_peak`，要求 headroom >= 10%-15%，长上下文或动态 shape >= 20%。
+- checkpoint 带宽：估算 `B_total / save_interval`，不能超过存储保底带宽的 30%-40%。
+- 文件数量：rank-owned shard 数量乘 retention 后不能超过 metadata 服务阈值。
+- RPO/RTO：作业声明目标，平台验证配置能满足。
+- 并行策略：checkpoint schema 支持当前 TP/PP/CP/FSDP/ZeRO 组合。
+- 恢复演练：新模型规模或新 schema 必须通过 dry-run restore。
+
+### 8.3 preflight validation
+
+preflight 应在真正训练前执行：
+
+```bash
+# GPU health
+nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,clocks.sm,power.limit,ecc.errors.uncorrected.volatile.total --format=csv
+
+# NCCL smoke test, example path depends on deployment image
+all_reduce_perf -b 8M -e 8G -f 2 -g 8
+
+# Storage write/read/checksum
+dd if=/dev/zero of="${CKPT_TEST_PATH}/rank_${RANK}.bin" bs=64M count=16 oflag=direct
+sha256sum "${CKPT_TEST_PATH}/rank_${RANK}.bin"
+
+# Dataset manifest
+python tools/validate_dataset_manifest.py --manifest "${DATASET_MANIFEST}"
+
+# Checkpoint restore dry-run
+python train.py --checkpoint-dir "${CHECKPOINT_DIR}" --resume dry-run --exit-after-restore
 ```
 
-这段伪代码想表达的是：
+preflight pass/fail 阈值建议写进 admission policy，而不是靠人工读日志：
 
-- 恢复不是“选最新目录”
-- 而是“选最新的、完整的、可验证的、环境兼容的版本”
+| 项目 | Pass threshold | Fail condition |
+|---|---|---|
+| `nccl-tests` | 单节点 AllReduce busbw >= 同机历史 p50 的 90%；跨节点 >= 同拓扑历史 p50 的 85%；rank 间 p95/p50 <= 1.2 | 任一 rank timeout；busbw 低于阈值；重复 3 次波动 > 15% |
+| storage write/read | 每 rank 1GB 写读成功；checksum 匹配；聚合写入带宽 >= checkpoint 预算带宽的 1.5x；p99 latency < 2s | 5xx/429 非零；checksum mismatch；带宽不足；metadata/list p99 > 5s |
+| dataset manifest | 100% shard 可访问；样本数/token 数/hash 与 manifest 匹配；随机抽样 1000 条 decode 成功 | 缺 shard；tokenizer hash 不一致；抽样 decode 失败率 > 0.1% |
+| restore dry-run | manifest validated；model/optimizer/scheduler/RNG/dataset cursor/global step/parallel metadata 全部加载；退出码 0；耗时 < RTO 预算的 25% | 任一状态缺失；shape/dtype mismatch；schema 不兼容；耗时超过阈值 |
 
----
+### 8.4 release 与 rollback
 
-## 监控与可观测性建议
+checkpoint 相关变更必须按 schema 变更处理：
 
-仅仅“支持保存和恢复”还不够，系统最好还能观测到 checkpoint 和训练稳定性的关键指标。
+- backward compatible：新增 optional metadata，可直接发布。
+- read-new/write-old：先升级 reader，再切 writer。
+- breaking change：新旧 schema 双写或提供 migration job。
+- rollback：保留 pre-upgrade last-good checkpoint，直到新版本完成至少一次保存和恢复演练。
 
-### 1）训练侧指标
+### 8.5 observability
 
-- step time（均值、P95、P99）
-- tokens/sec 或 samples/sec
-- data time / compute time / comm time 占比
-- OOM 次数
-- gradient overflow 次数（AMP）
+最小指标集：
 
-### 2）checkpoint 侧指标
+- step：`train_step_seconds{rank}`、`data_time_seconds{rank}`、`comm_wait_seconds{rank}`。
+- memory：`cuda_allocated_bytes`、`cuda_reserved_bytes`、`cuda_oom_total`、fragmentation ratio。
+- checkpoint：`checkpoint_capture_seconds`、`checkpoint_flush_seconds`、`checkpoint_bytes`、`checkpoint_failures_total`、`last_success_step`。
+- storage：write/read throughput、p99 latency、5xx/429、metadata ops、quota。
+- elastic：restart count、rendezvous time、world size changes、restore duration。
+- NCCL：timeout count、async error count、collective duration p99、rank last collective。
 
-- checkpoint 生成耗时
-- staging copy 耗时
-- 写盘耗时
-- 校验耗时
-- 保存失败率
-- 最近一次成功保存时间
-- 正在进行的异步保存任务数
+### 8.6 straggler detection policy
 
-### 3）基础设施侧指标
+straggler detection policy 要用窗口和自动动作定义清楚，避免只在事故后看平均 tokens/s：
 
-- GPU 利用率、显存利用率、ECC 错误
-- 节点间网络重传或丢包
-- NVMe / 并行文件系统延迟
-- 对象存储上传时延
-- rank 级心跳和 step 进度
+| 信号 | Warning | Critical | 自动动作 |
+|---|---|---|---|
+| rank step p99/p50 | 10 分钟窗口内 > 1.15 | 连续 3 个窗口 > 1.25 | 标记 suspect node，禁止新作业调度 |
+| rank step p95/p50 | 10 分钟窗口内 > 1.10 | 连续 6 个窗口 > 1.18 | 触发 per-rank timeline dump |
+| data_time skew | 最慢 rank / median rank > 1.5 | 连续 3 个窗口 > 2.0 | 重新分配 dataset shard；检查远端 I/O |
+| comm_wait skew | 最慢 rank / median rank > 1.3 | 连续 3 个窗口 > 1.6 | 采集 NCCL log、IB/RoCE counters、拓扑 |
+| checkpoint flush skew | 最慢 writer / median writer > 2.0 | 单次 > 4.0 或连续 2 次 > 3.0 | 降低 writer 并发；切 local NVMe staging |
+| GPU health | clocks 低于同型号 median 10% | Xid/ECC uncorrected 或 clocks 低于 20% | auto-quarantine node，训练从 last-good checkpoint 重启 |
 
-### 4）on-call 优先看的关联指标
+auto-quarantine 只应在证据足够时触发：同一节点连续 3 个窗口命中 critical，或任一 GPU 出现 Xid/ECC uncorrected，或 `nccl-tests` 复测低于同拓扑基线 80%。隔离动作必须写入 scheduler event，并把 job 的 RPO/RTO 计算更新到事故记录里；否则平台只是在静默替换坏节点，复盘时无法解释吞吐波动。
 
-| 症状 | 必看的第一组指标 | 第二组交叉验证 | 常见指向 |
-|------|------------------|----------------|----------|
-| 所有 rank 卡住 | watchdog timeout、最后活跃 rank、`NCCL_DEBUG=INFO` | GPU Xid/ECC、网络错误计数、`py-spy` 调用栈 | 通信 hang、坏节点、数据加载卡死 |
-| 吞吐缓慢下降 | per-node step time、comm wait 分布 | 温度 / 降频、PFS / 对象存储延迟 | straggler、热节点、存储长尾 |
-| checkpoint 越来越慢 | 热层写盘延迟、异步队列积压、最近成功保存时间 | 对象存储上传时延、inode / 磁盘空间 | 存储抖动、异步保存反压 |
-| 频繁自动重启 | 编排器事件、恢复耗时、失败类型分布 | world size 变化、checkpoint 校验结果 | 抢占环境、恢复策略错误、持续性配置问题 |
+### 8.7 governance
 
-### 5）为什么这些指标重要
+治理规则应写成平台策略：
 
-因为很多“训练挂了”的根因并不在训练代码本身：
-
-- checkpoint 慢，可能是存储抖动
-- allreduce 慢，可能是某个 straggler
-- resume 后 loss 跳变，可能是 scheduler 或 RNG 没恢复
-- 经常重启，可能是自动重试策略放大了持续性错误
-
-没有这些指标，系统很容易变成只能“看到结果失败”，却看不到失败是怎么酝酿出来的。
+- 任何长于 6 小时的训练必须启用 checkpoint，并声明 RPO/RTO。
+- 任何超过 64 GPU 的训练必须通过 NCCL 和 storage preflight。
+- schema_version 变更必须带 restore test。
+- 最后一个 validated checkpoint 禁止自动删除。
+- checkpoint restore mismatch 必须阻断恢复，不允许降级成只加载权重，除非用户显式选择 warm start。
 
 ---
 
-## 设计清单（Checklist）
+## 9. 故障排除
 
-### 训练前
+| 症状 | 证据 | 可能根因 | 动作 |
+|---|---|---|---|
+| NCCL hang，所有 rank 卡住 | `NCCL_DEBUG=INFO` 最后 collective 不一致；某 rank 无新日志；GPU 利用率 0 | rank 未进入 collective、dataloader 卡死、GPU Xid、网络链路 flap、进程被调度器杀死 | 找 last collective；比对 rank heartbeat；查 `dmesg`/DCGM/Xid；启用 `NCCL_ASYNC_ERROR_HANDLING=1`；隔离坏节点后从 last-good checkpoint 恢复 |
+| corrupt checkpoint | manifest checksum mismatch；shard size 0；restore 读到 EOF；`latest` 指向 tmp prefix | writer 崩溃、对象存储 multipart 未完成、atomic visibility 错误、cleanup 误删 | 禁止读取该 step；回退前一 validated；修复 publish 顺序；增加 read-after-write validation |
+| slow checkpoint | `checkpoint_flush_seconds` p99 飙升；storage 429/5xx；metadata ops 高 | shard 过多、writer 并发过高、对象存储限流、并行文件系统 metadata 热点 | 限制 writer 并发；合并小 shard；两段式 local NVMe staging；调整 save interval；和 storage 团队确认带宽配额 |
+| restore mismatch | tensor shape/dtype mismatch；optimizer param group 数不同；loss 恢复后跳变 | 代码/config 变更、parallel metadata 不兼容、optimizer 未恢复、FP8 scale 丢失、dataset cursor 错 | 阻断 true resume；比对 config hash；执行 offline reshard；必要时显式 warm start 并重置 optimizer/scheduler |
+| straggler，step p99 被少数 rank 拉长 | per-rank `data_time` 或 `comm_wait` 长尾；某节点 GPU clocks 低；NIC counters 异常 | 数据倾斜、远端 I/O 慢、GPU 降频、PCIe/NIC 拓扑差、节点健康问题 | 按 rank 展开 step timeline；重分配 dataset shard；隔离慢节点；检查 NUMA/NIC/GPU 亲和；重新跑 nccl-tests |
+| OOM 只发生在 checkpoint 或 eval | `max_reserved` 高；checkpoint staging memory 增长；eval batch shape 不同 | async staging buffer、allocator fragmentation、eval 临时 tensor、未释放引用 | 降低 in-flight checkpoint；调整 allocator config；固定 eval microbatch；checkpoint 前后记录 memory snapshot |
+| elastic restart 后吞吐下降 | world size 变小；global batch 改变；accumulation 未调整 | worker 缩容后训练语义漂移、DP degree 变化、sampler repartition | 明确 elastic policy；保持 global batch 或记录变更；恢复后打点 world size 和 consumed tokens |
 
-- [ ] 是否估算过参数、梯度、优化器、激活的大致显存占用
-- [ ] 是否决定使用混合精度、激活重计算、ZeRO/FSDP 或 offload
-- [ ] 是否完成通信和 GPU 健康预检（如 `nccl-tests`、ECC、带宽）
-- [ ] 是否明确 checkpoint 的保存目录、格式和恢复目标
-- [ ] 是否定义 `min_nodes` / `max_nodes`、缩容策略和 world size 变化后的 batch / LR 规则
+NCCL hang 排查顺序：
 
-### 训练中
-
-- [ ] 是否保存模型、优化器、scheduler、step、RNG 等完整状态
-- [ ] `latest` 是否只在 checkpoint 完整提交后才更新
-- [ ] 是否有自动清理策略
-- [ ] 是否监控 step time、保存耗时、失败率和 straggler
-- [ ] 是否保留 rank 心跳、watchdog timeout、最后活跃 rank 等排障证据
-- [ ] 是否明确“自动恢复最多连续几次，超过后转人工”
-
-### 训练失败后
-
-- [ ] 是否先区分瞬时错误、持续性错误、OOM、数据损坏
-- [ ] 是否验证待恢复 checkpoint 的完整性和环境兼容性
-- [ ] 是否确认这是 true resume 还是 warm start
-- [ ] 是否保留足够的日志来定位 rank、通信、数据或存储问题
-- [ ] 是否判断这次失败属于 GPU / 网络 / 存储 / 调度中的哪一层，再决定升级路径
-- [ ] 是否在恢复前隔离故障节点，而不是让同一坏节点立即重新入池
+1. 确定是 collective hang 还是某 rank 没进入 collective：看每个 rank 最后一条 collective 日志。
+2. 确定进程是否仍活着：scheduler event、rank heartbeat、host pid。
+3. 查 GPU/驱动：DCGM、Xid、ECC、温度、功耗、clocks。
+4. 查网络：IB port counters、RoCE pause/PFC、NCCL topology、rail mapping。
+5. 查数据路径：dataloader worker、远端数据源、文件系统 p99。
+6. 收敛后隔离节点，从 last-good checkpoint 恢复，保留现场日志做事故复盘。
 
 ---
 
-## 本章小结
+## 10. 方案设计 / Worked Example：千卡训练中断恢复
 
-| 主题 | 关键点 |
-|------|--------|
-| 显存消耗 | 参数、梯度、优化器、激活、临时 buffer 共同构成训练内存 |
-| 推理 vs 训练 | 训练不仅保存参数，还要承担梯度、优化器状态和激活 |
-| 激活重计算 | 以更多计算换更少显存，适合显存受限但算力仍有余量的场景 |
-| 状态切分 | 降低单卡压力，但增加通信、checkpoint 和恢复复杂度 |
-| checkpoint | 是训练容错的核心系统，不只是“存个权重文件” |
-| 异步保存 | 能减少主路径阻塞，但会引入 CPU / I/O / 状态管理复杂度 |
-| 恢复策略 | 必须区分 true resume、warm start、自动重试和失败类型 |
-| 大规模训练 | 真正的常态问题是 hang、straggler、抢占和 world size 变化 |
+### 10.1 背景
+
+任务：
+
+- 模型：约 180B dense Transformer。
+- 集群：128 节点，每节点 8xH100，共 1024 GPU。
+- 并行：TP=8，PP=8，DP=16，FSDP shard within DP，sequence length 8192。
+- 精度：BF16 params，FP8 activation/GEMM 路径，AdamW，distributed optimizer。
+- 吞吐：约 2.2M tokens/s。
+- checkpoint：每 30 分钟保存 sharded checkpoint，单次总量约 18 TB，async capture 80s，flush p50 7min、p99 13min。
+- RPO 目标：45 分钟；RTO 目标：25 分钟。
+- 存储：local NVMe staging + 对象存储，`latest.json` 原子 pointer。
+
+### 10.2 事故时间线
+
+| 时间 | 事件 |
+|---|---|
+| 03:10 | `step_08460000` checkpoint published，manifest validated |
+| 03:40 | `step_08478000.tmp` 开始写入 |
+| 03:48 | storage p99 从 180ms 升到 4.2s，async backlog=1 |
+| 03:52 | 节点 `node-077` 出现 GPU Xid 79，rank 616 退出 |
+| 03:53 | 多数 rank 卡在 pipeline boundary 后的 NCCL AllReduce，NCCL watchdog 报 timeout |
+| 03:54 | TorchElastic 标记 worker group failed，scheduler 重新拉起 127 节点，`node-077` 被隔离 |
+| 04:02 | restore preflight 发现 `step_08478000.tmp` 缺少 6 个 shard，未发布 |
+| 04:03 | 选择 `step_08460000` last-good 恢复 |
+| 04:15 | 1024 GPU 恢复训练，前 200 step warmup metrics 正常 |
+
+### 10.3 证据链
+
+- NCCL：rank 616 最后日志停在进入 collective 前，其他 ranks 停在同一 collective 等待。
+- DCGM：`node-077/gpu3` Xid 79，随后 NVLink error counter 增长。
+- Scheduler：pod eviction 发生在 checkpoint flush 期间。
+- Checkpoint metadata：`step_08478000.tmp/manifest.json` 未写入 `status=validated`；`latest.json` 仍指向 `step_08460000`。
+- Storage：03:48-03:57 对象存储 5xx 增加，flush p99 超过保存间隔的一半。
+- Training metrics：恢复后 `global_step=8460000`，`consumed_tokens` 与 manifest 一致，LR scheduler step 连续，FP8 amax history 存在。
+
+### 10.4 决策
+
+1. 不尝试从 `step_08478000.tmp` 恢复。它缺 shard 且未 validated，使用会造成 optimizer shard 静默错位风险。
+2. 隔离 `node-077`，保持 world size=1024。因为平台有 spare node，避免 DP degree 和 global batch 改变。
+3. 从 `step_08460000` true resume。丢失 30 分钟内训练进度，满足 RPO 45 分钟。
+4. 恢复后执行 200 step guardrail：loss、grad norm、tokens/s、FP8 scale、per-rank step p99 与事故前窗口对比。
+5. 暂停 retention sweep 2 小时，保留事故前后 checkpoint 和 tmp prefix 供复盘。
+
+### 10.5 RPO/RTO 复盘
+
+- 实际 RPO：03:10 到 03:52，约 42 分钟。满足 45 分钟，但接近上限。
+- 实际 RTO：03:52 到 04:15，约 23 分钟。满足 25 分钟。
+- lost tokens：2.2M tokens/s * 42 * 60 = 5.544B tokens。因为从 `step_08460000` true resume，这些 tokens 对训练进度无贡献，日志中必须标记为 replay/lost window。
+- GPU-hour cost：1024 GPU * 42 / 60 = 716.8 GPU-hour。若按 H100 internal chargeback 3.20 USD/GPU-hour，直接算力成本约 2294 USD，未含存储、调度空转和工程处理成本。
+- 风险：flush p99 13 分钟，保存间隔 30 分钟，若连续 storage 抖动，in-flight checkpoint 会让 worst-case RPO 超过目标。
+
+改进动作：
+
+- 把 checkpoint interval 从 30 分钟降到 25 分钟，但要求 flush p99 低于 10 分钟；否则无效。
+- 对象存储按 job 申请独立带宽配额，writer 并发从 4096 降到 1024，合并小 shard。
+- preemption/GPU Xid 触发时优先 kill 整个 worker group，避免其他 rank 长时间 NCCL hang。
+- 增加 `checkpoint_latest_age_minutes` 告警，超过 RPO 的 70% 即报警。
+- 每周恢复演练随机选择上一个 milestone checkpoint，在隔离队列跑 100 step。
+
+### 10.6 取舍
+
+- 使用 sharded checkpoint 而不是 rank0 gather：保存 pause 从不可接受的 OOM 风险变成可控的存储并发问题。
+- 保持 world size 恢复而不是缩容弹性：牺牲调度灵活性，换取 global batch、LR 和 sampler 语义稳定。
+- async checkpoint 降低训练 pause，但引入 backlog 风险；因此必须把 RPO 计算建立在 validated checkpoint 上，而不是开始写入的 checkpoint 上。
+- FP8 带来吞吐收益，但恢复必须保存 scale/amax；否则事故后 loss spike 会难以区分是恢复错误还是正常波动。
 
 ---
 
-## 练习题
+## 11. 反模式
 
-1. 为什么训练阶段的显存占用远不止模型参数本身？
-2. 假设参数使用 BF16、优化器使用 Adam，请粗略说明为什么参数相关状态可能达到“参数本体数倍”。
-3. 激活重计算的收益和代价分别是什么？它更适合哪类瓶颈场景？
-4. 为什么使用 ZeRO / FSDP 后，checkpoint 设计不能再停留在单文件思维？
-5. `torch.save`、SafeTensors、分布式 checkpoint 各更适合什么场景？
-6. 为什么训练 checkpoint 和部署权重包不应混为一谈？
-7. 设计一个适合长训练任务的 checkpoint 保存与清理策略。
-8. 为什么异步 checkpoint 虽然减少阻塞，却会增加系统复杂度？
-9. 什么情况下自动重试有意义，什么情况下自动重试只会放大问题？
-10. 为什么弹性训练对 checkpoint 的要求比普通重试更高？
+- **只保存权重却标记为 resume**：恢复后 optimizer 和 scheduler 轨迹改变，事故复盘无法解释 loss。
+- **`latest` 指向正在写的目录**：半成品被恢复流程读取，造成 corrupt checkpoint。
+- **checkpoint 文件名绑定物理 rank**：换节点或 world size 后无法恢复，或更糟的是静默错位。
+- **没有 restore test 的 schema 变更**：保存成功不代表能恢复。
+- **无限 async backlog**：训练看似不阻塞，实际把失败推迟到存储爆掉或 preemption 到来。
+- **把 NCCL hang 当成只调 env var**：如果根因是 rank 未进入 collective 或节点 Xid，调大 timeout 只会延长事故。
+- **自动删除最后一个好版本**：retention 只按时间清理，没有 last-good 保护。
+- **elastic 缩容后不记录训练语义变化**：global batch 和 sampler 改变后，实验不可复现。
 
 ---
 
-## 练习题参考思路（教师版可选）
+## 12. Checkpoint and Recovery Production Readiness Checklist
 
-> 若你后续想把本教程做成“自学版 + 教师版”两套内容，可以保留这一节；如果想保持学生版紧凑，也可以在最终公开版中删去。
-
-### 第1题参考思路
-
-因为训练除了模型参数，还要保存：
-
-- 梯度
-- 优化器状态
-- 中间激活
-- 临时 buffer
-
-而推理通常不需要这些额外状态。
-
-### 第3题参考思路
-
-激活重计算的收益是：
-
-- 降低激活显存
-- 支持更大 batch 或更长序列
-
-代价是：
-
-- 反向更慢
-- 实现和调试更复杂
-- 对含随机性或副作用逻辑的模块更敏感
-
-### 第7题参考思路
-
-可从下面几个维度作答：
-
-- 高频保存最近 3-5 个版本
-- 每天 / 每 K 步保留一个长期里程碑版本
-- `latest` 与完整文件分离
-- 使用 manifest 和原子提交
-- 清理失败 / 半成品版本
-- 恢复时只读取 `COMMITTED` 且校验通过的版本
+- [ ] 显存预算包含 params、grads、optimizer、activations、comm/temp、checkpoint buffer、allocator fragmentation。
+- [ ] activation checkpointing 的 memory saving 和 step time penalty 有 profiler 证据。
+- [ ] offload 策略记录 CPU/NVMe/PCIe 带宽假设，并有 NUMA 亲和配置。
+- [ ] optimizer state sharding 的 checkpoint schema 包含 shard axis、logical shard、rank mapping。
+- [ ] checkpoint 保存 model、optimizer、scheduler、RNG、dataset cursor、global step、parallel metadata、precision state。
+- [ ] manifest 包含 schema_version、config hash、dataset version、framework versions、file checksum。
+- [ ] 半成品 checkpoint 使用 tmp prefix，validated 后才 atomic publish。
+- [ ] `latest`、`best`、milestone、pre-upgrade checkpoint 有不同 retention policy。
+- [ ] async checkpoint 有 in-flight 上限、backlog 指标和失败阻断。
+- [ ] RPO/RTO 是作业配置的一部分，并被平台 admission 校验。
+- [ ] TorchElastic restart 后会验证 world size、global batch、sampler 和 LR 语义。
+- [ ] preflight 覆盖 GPU health、NCCL、storage、dataset manifest、restore dry-run。
+- [ ] NCCL hang 有 per-rank last collective、heartbeat、DCGM/Xid、network counters 证据链。
+- [ ] straggler detection 暴露 per-rank data time、comm wait、step p50/p95/p99。
+- [ ] schema 变更有 read compatibility 计划、migration 或双写策略。
+- [ ] 每个生产模型至少定期做一次 checkpoint restore 演练。
 
 ---
 
-## 延伸阅读建议
+## 13. 本章小结
 
-如果你准备继续深入本章内容，下一步最值得展开的方向通常有三个：
+内存优化解决的是单次 step 能不能在有限 HBM 内完成；checkpoint 和恢复解决的是数万到数百万 step 能不能在不可靠系统里正确前进。两者必须一起设计。activation checkpointing、offload、optimizer state sharding、mixed precision、FP8 和 allocator 策略会改变显存峰值，也会改变保存内容、恢复成本和故障面。
 
-1. **FSDP / ZeRO 的状态布局与 checkpoint 恢复机制**
-   重点理解“训练状态分片”如何影响保存格式与 world size 变化下的恢复。
+生产 checkpoint 不是文件保存，而是协议：schema、writer ownership、atomic visibility、validation、cleanup、retention、RPO/RTO、cross-parallelism restore 都是协议的一部分。TorchElastic 可以重建 worker group，但不能替你定义训练语义；NCCL hang 和 straggler 也不能只靠重启掩盖，必须有 rank 级证据链。可靠的训练平台把失败当常态，把 last-good checkpoint 当控制面事实来源，把恢复演练当发布门禁。
 
-2. **激活内存与长上下文训练优化**
-   重点理解 sequence length、attention 实现、KV/cache 形态、flash attention 等对显存的影响。
+---
 
-3. **训练平台可观测性与故障定位体系**
-   重点理解 rank 级日志、NCCL 诊断、存储延迟、GPU 健康指标如何共同帮助定位问题。
+## 14. 练习题
+
+1. 一个 70B 模型使用 BF16、AdamW、FSDP full shard，在 64 GPU 上训练。请估算 params、grads、optimizer state 的单卡下界，并说明 activation 和 fragmentation 为什么仍可能导致 OOM。
+2. 设计一个 checkpoint schema，使它能从 TP=8/PP=4 恢复到 TP=4/PP=8。哪些状态可以重分片，哪些状态应拒绝 true resume？
+3. 某训练每 20 分钟保存一次，async flush p99 为 18 分钟，最多允许 2 个 in-flight checkpoint。请计算 worst-case RPO 风险，并给出治理动作。
+4. 恢复后 loss 从 2.1 跳到 2.8，100 step 后仍未回落。列出你会检查的 8 类状态和对应证据。
+5. 一个 512 GPU 作业每隔数小时 NCCL hang，一直没有 rank crash。请设计排障计划，区分网络问题、数据加载 straggler 和 rank 未进入 collective。
+6. FP8 训练恢复后前 50 step grad norm 异常。说明 FP8 checkpoint 需要保存哪些额外状态，以及如何做恢复 smoke test。

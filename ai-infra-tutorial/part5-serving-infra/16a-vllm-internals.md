@@ -8,6 +8,23 @@
 
 ## 16a.1 第一性原理拆解：vLLM 在解决的工程问题
 
+### 概念先说清楚：vLLM 是什么，不是什么
+
+vLLM 是一个面向 LLM 在线生成的推理运行时。它的核心工作不是"把一次 forward 跑通"，而是在一个长时间运行的服务进程里持续回答：哪些请求下一步进入 GPU、每个请求的 KV Cache 放在哪里、哪些 prefix 可以复用、长 prompt 是否要切片、输出 token 如何流式返回、多卡 worker 如何同步、量化和 LoRA 该走哪个 kernel。
+
+| 概念 | 在 vLLM 里具体指什么 | 常见误解 | 工程边界 |
+|------|----------------------|----------|----------|
+| PagedAttention | KV Cache 的 block/page 化寻址方式，attention kernel 通过 block table 读取非连续物理 KV | 不是一种新的 attention 数学公式 | 解决显存碎片和复用，不自动提升所有 workload 的单请求 latency |
+| BlockManager / BlockPool | 管理 physical KV blocks 的分配、释放、引用计数、prefix hash 和 eviction | 不是普通 Python cache | 它的状态决定能不能继续 admission，任何泄漏都会变成 KV OOM |
+| Scheduler iteration | vLLM 每个 step 的调度决策单位，同时安排 prefill chunk、decode token、抢占和恢复 | 不是 HTTP request 级别的调度 | `max_num_batched_tokens` 和 `max_num_seqs` 直接改变每个 iteration 的形状 |
+| Prefix cache | 用 token id 前缀 hash 复用已经算好的 KV blocks | 不是语义缓存，不理解文本含义 | token id 必须完全一致；tokenizer、模板、LoRA id 都会影响命中 |
+| Chunked prefill | 把长 prompt 的 prefill 切成多个 chunk，和 decode 混合进入 batch | 不是缩短长 prompt 的总计算量 | 改善其他请求 TTFT/ITL，但可能增加长 prompt 自身 TTFT |
+| Spec decode | 用 draft 路径预测多个 token，target 一次 verify | 不是近似采样，也不应该改变分布 | acceptance rate、额外显存和高并发 token budget 会决定收益 |
+| LoRA serving | 同一 base model 上按请求切换 adapter，常用 punica/segmented GEMM | 不是免费多模型托管 | adapter 数量会影响 GPU cache、prefix cache 命中率和 batch 形状 |
+| TP/PP | 把同一个逻辑模型切到多卡 / 多机 Worker 上执行 | 不是简单复制副本 | TP 降低单卡显存但增加 all-reduce；PP 增加容量但引入 bubble |
+
+一句话总结：**vLLM 是一个带内存管理器和调度器的 LLM runtime，不是单纯的模型加载库。** 如果只把它当成 OpenAI API server，很多参数会显得像黑魔法；如果把它当成"GPU 上的操作系统"，PagedAttention、BlockManager、Scheduler 和 prefix cache 的边界就会清楚很多。
+
 ### 拆 — 不可化简的问题
 
 剥掉 PagedAttention、continuous batching、prefix cache、chunked prefill、speculative decoding 这些工具名之后，vLLM 真正面对的不可化简问题只有一个：**在 GPU 显存有限的前提下，让动态长度、动态到达的请求在共享 KV Cache 池上达到最高 token 吞吐，并保持 TTFT/TPOT 可控。** 这一句听起来简单，但每一个限定词都对应一类工程约束。"显存有限"意味着权重、KV Cache、激活、CUDA workspace、通信 buffer 必须共用同一张 80 GB HBM；"动态长度"意味着 prompt 和输出长度都不可预测，无法用静态 batch 尺寸预分配；"动态到达"意味着调度器必须随时把新请求插入正在运行的 forward；"共享 KV Cache 池"意味着同一段 system prompt 的 KV 必须能被多个请求复用，而不是每个请求各算一份；"最高 token 吞吐 + TTFT/TPOT 可控"意味着平均延迟和尾延迟同时是约束条件，而不是可以二选一。
@@ -402,7 +419,7 @@ Speculative decoding（投机解码）的核心已经在 [§15.9](15-batching-sc
 ```mermaid
 flowchart TB
   subgraph DM[Draft Model 路径]
-    DM1[小模型权重<br/>独立加载] --> DM2[draft.forward(k 步)]
+    DM1[小模型权重<br/>独立加载] --> DM2["draft.forward(k 步)"]
     DM2 --> DM3[k 个候选 token]
   end
   subgraph MED[Medusa 路径]
@@ -642,6 +659,76 @@ flowchart TD
 ```
 
 > **success**：调优心法——一次只动一个参数，每次都对比 6 个核心指标（throughput tokens/s, TTFT P99, TPOT P99, prefix hit rate, preemption count, KV cache usage）。把这些指标做成 Grafana dashboard，调参就是看曲线。
+
+### 16a.12.1 三类生产配置画像
+
+默认参数只是起点。生产配置应该从流量形状反推，而不是从"别人 benchmark 的命令行"复制。
+
+| 服务画像 | 流量特征 | 推荐起点 | 重点指标 | 最容易踩的坑 |
+|----------|----------|----------|----------|--------------|
+| 短问答 / Chatbot | prompt 200-2K，输出 100-800，高并发 | `max_num_seqs=512-1024`，`max_num_batched_tokens=4096-8192`，prefix cache 开启 | TPOT P99、goodput、prefix hit rate | `max_num_seqs` 拉太高导致 KV 满和抢占 |
+| 长上下文 / RAG | prompt 4K-64K，输出中等，prefix 共享明显 | `max_num_batched_tokens=8192-32768`，`kv_cache_dtype=fp8/int8`，chunked prefill 开启 | TTFT P99、KV usage、preemption_count | 只做权重量化，不压 KV；prompt 模板插入时间戳导致 prefix miss |
+| 低并发长输出 | prompt 中短，输出 2K+，并发低 | 评估 speculative decoding，`max_num_seqs` 保守，`swap_space=8-16` | TPOT、acceptance_rate、GPU util | 高 acceptance rate 但总 token budget 被 verify 撑爆 |
+| Multi-LoRA SaaS | 多租户 adapter，请求级 LoRA id | `--enable-lora`，按热度设置 `max_loras`，限制 `max_lora_rank` | LoRA cache hit、prefix hit by LoRA、adapter load latency | adapter 太多且流量均匀，prefix cache 和 LoRA GPU cache 同时失效 |
+| 固定系统提示词 Copilot | 大量共享 system prompt / few-shot | prefix-aware routing，模板版本化，prefix cache 默认开 | prefix_hit_rate、TTFT by replica | 多副本随机路由稀释 prefix cache |
+| 跨机超大模型 | 200B+ 或 MoE，单机装不下 | 优先 PP 跨机、TP 尽量留在 NVLink 域内，EP 单独压测 | NCCL latency、step time skew、bubble ratio | 跨机 TP all-reduce 把每层延迟放大 |
+
+一个可执行的配置评审模板：
+
+```yaml
+model: llama-3-70b-instruct
+traffic_profile:
+  input_tokens_p50_p95_p99: [900, 6000, 16000]
+  output_tokens_p50_p95_p99: [250, 900, 2000]
+  prefix_share_ratio: 0.65
+  target_slo:
+    ttft_p99_ms: 1000
+    tpot_p99_ms: 80
+runtime:
+  tensor_parallel_size: 8
+  max_model_len: 32768
+  max_num_seqs: 512
+  max_num_batched_tokens: 8192
+  kv_cache_dtype: fp8
+  gpu_memory_utilization: 0.90
+release_guardrails:
+  preemption_rate_max: 0.05/s
+  prefix_hit_rate_min: 0.50
+  quality_regression_max: 1.0%
+```
+
+> **工程边界**：`max_model_len` 是容量承诺，不是越大越好。即使 99% 请求只有 4K，只要配置成 128K，KV block 预算和 admission 行为都会按更大的上限变保守。生产上通常按业务 SKU 分不同上下文长度的副本池，而不是一个池承诺所有长度。
+
+### 16a.12.2 故障排除：从指标回到内部机制
+
+vLLM 的故障排除要把指标映射回 Scheduler、BlockManager、AttentionBackend、Worker 通信四条路径。
+
+| 现象 | 首先定位到 | 关键指标 / 证据 | 常见原因 | 调整动作 |
+|------|------------|------------------|----------|----------|
+| TTFT P99 突然升高 | prefill 或 admission | queue time、prefill time、waiting seqs、prefix hit rate | 长 prompt burst、prefix cache 失效、chunk 太大 | 降 `max_num_batched_tokens`，做 prefix-aware routing，拆长上下文副本池 |
+| TPOT P99 抖动 | decode iteration | step latency、active seqs、preemption_count | `max_num_seqs` 过高、KV 逼近上限、NCCL 抖动 | 降 `max_num_seqs`，增加 KV 预算，检查跨卡通信 |
+| `num_preemptions_total` 持续增长 | BlockManager 容量 | KV cache usage、free blocks、swap/recompute 次数 | admission 太激进、输出长度被低估、KV dtype 太大 | 降并发，KV FP8/INT8，限制 max output，调 `swap_space` |
+| prefix hit rate 从 80% 掉到 5% | Prefix cache | tokenizer/template 版本、LoRA id 分布、hash miss | 模板加入 request id/time，tokenizer 升级，router 随机打散 | 模板版本化，固定 tokenizer，按 prefix 路由 |
+| GPU util 低但排队高 | CPU / 调度 / 通信 | scheduler time、model execute time、NCCL time、Python overhead | V0 路径、采样慢、Worker 同步等待 | 升 V1，打开 CUDA graph/compile，查慢 rank |
+| OOM 发生在 warmup 后 | CUDA graph / workspace | reserved memory、graph pool、workspace | `gpu_memory_utilization` 太高，没有给 capture 留 buffer | 调到 0.85-0.90，减少 capture shapes，降 batch |
+| LoRA 请求尾延迟高 | LoRA cache | adapter load count、LoRA LRU hit、rank 分布 | 冷 adapter 从磁盘/CPU 换入，rank 超 kernel 支持 | 预热热 adapter，限制 rank，把冷租户隔离到独立池 |
+| spec decode 负优化 | SpecDecodeWorker | acceptance_rate、draft tokens、verify tokens、batch token usage | 高并发下 verify 撑大 batch，draft 太慢，guided decoding 降接受率 | 只给低并发长输出池开启，降低 draft length，关闭 guided 场景 |
+
+> **反模式警告**：看到 preemption 就直接把 `gpu_memory_utilization` 调到 0.98，通常会把问题从"偶发抢占"变成"CUDA workspace 或 graph capture OOM"。先用 KV 预算算清楚，再决定是降并发、降上下文、压 KV 还是加副本。
+
+### 16a.12.3 生产上线 Checklist
+
+| 类别 | 检查项 | 为什么重要 |
+|------|--------|------------|
+| 模型制品 | 权重、tokenizer、chat template、generation config 版本一起 pin | prefix cache 和质量回归都依赖 token id 完全一致 |
+| 容量预算 | 明确权重、KV、activation peak、CUDA graph pool、NCCL buffer 的显存预算 | `gpu_memory_utilization` 只是一行配置，不等于真实安全余量 |
+| 流量分桶 | 按 input/output length、prefix share、LoRA id、租户切分压测 | 平均流量会掩盖长上下文和 adapter 冷启动 |
+| 指标 | TTFT、TPOT、goodput、prefix hit、preemption、KV usage、NCCL time、LoRA load 全部进 dashboard | vLLM 的瓶颈跨 CPU/GPU/网络/缓存，单指标不够 |
+| 回滚 | BF16 或旧量化模型、副本配置、router 权重都能独立回滚 | vLLM 参数变更也可能造成事故，不只是模型权重 |
+| 预热 | 服务启动后跑代表性 shape、LoRA、prefix 和 CUDA graph warmup | 避免首次真实用户承担编译和加载成本 |
+| 限流 | 对超长 prompt、超长输出、冷 LoRA、低优租户设置 admission control | 防止少数请求把 KV 池或 Scheduler 占满 |
+| 版本绑定 | vLLM、CUDA、driver、NCCL、FlashAttention/FlashInfer、量化 backend 固定 | 低精度和 attention kernel 对版本非常敏感 |
+| 灰度 | 先影子，再 1%/10%/50%，每档看 P99 和质量回归 | vLLM 运行时变化可能只在真实并发下暴露 |
 
 ---
 

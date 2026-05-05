@@ -1,0 +1,1668 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 18a 章 · AI 镜像与 CUDA 兼容矩阵 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=18a" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 18a 章 · AI 镜像与 CUDA 兼容矩阵</h1>
+<p class="sub">把 AI 镜像从实验环境整理成可复现、可发布、可诊断的生产运行基线。</p>
+<div class="chips"><span class="chip">Image</span><span class="chip">CUDA</span><span class="chip">Driver</span><span class="chip">PyTorch</span><span class="chip">Release</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#18a1-第一性原理拆解--学习大纲">18a.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#18a2-概念先说清楚">18a.2 概念先说清楚</a></li><li><a class="anchor" href="#18a3-架构关键组件数据路径与责任边界">18a.3
+架构：关键组件、数据路径与责任边界</a></li><li><a class="anchor" href="#18a4-原理cudadriver-兼容为什么存在">18a.4 原理：CUDA/Driver
+兼容为什么存在</a></li><li><a class="anchor" href="#18a5-nvidiacuda-基础镜像baseruntimedevel">18a.5
+nvidia/cuda 基础镜像：base/runtime/devel</a></li><li><a class="anchor" href="#18a6-版本矩阵从文档表格变成发布控制面">18a.6
+版本矩阵：从文档表格变成发布控制面</a></li><li><a class="anchor" href="#18a7-训练镜像与推理镜像分层">18a.7 训练镜像与推理镜像分层</a></li><li><a class="anchor" href="#18a8-多阶段构建把编译环境和运行环境切开">18a.8
+多阶段构建：把编译环境和运行环境切开</a></li><li><a class="anchor" href="#18a9-镜像体积漏洞治理与冷启动">18a.9
+镜像体积、漏洞治理与冷启动</a></li><li><a class="anchor" href="#18a10-工程化落地生产基线发布观测治理">18a.10
+工程化落地：生产基线、发布、观测、治理</a></li><li><a class="anchor" href="#18a11-方案设计ai-镜像基线决策表">18a.11 方案设计：AI
+镜像基线决策表</a></li><li><a class="anchor" href="#18a12-worked-example把实验镜像改造成生产推理镜像">18a.12 Worked
+Example：把实验镜像改造成生产推理镜像</a></li><li><a class="anchor" href="#18a13-故障排除症状证据根因处理动作">18a.13
+故障排除：症状、证据、根因、处理动作</a></li><li><a class="anchor" href="#18a14-反模式与-checklist">18a.14 反模式与 Checklist</a></li><li><a class="anchor" href="#18a15-本章小结">18a.15 本章小结</a></li><li><a class="anchor" href="#18a16-练习题">18a.16 练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>AI 镜像的核心不是“能 build 出来”，而是把 CUDA
+userspace、深度学习框架、推理引擎、应用依赖、模型运行约束和宿主机 Driver
+的兼容关系固化成可复现、可发布、可审计、可回滚的平台基线。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章承接 <a
+href="18-containers-and-runtime.html">第18章</a>
+的镜像边界；运行时设备注入见 <a
+href="18b-container-runtime-and-device-injection.html">第18b章</a>，镜像签名、SBOM
+与发布治理见 <a
+href="18c-artifact-supply-chain-and-image-governance.html">第18c章</a>，故障排查见
+<a href="18d-runtime-troubleshooting.html">第18d章</a>。</p>
+</blockquote>
+<h2 id="18a1-第一性原理拆解--学习大纲">18a.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆ai-镜像到底在解决什么问题">拆：AI 镜像到底在解决什么问题</h3>
+<p>AI 镜像要解决的不可化简问题是：</p>
+<p><strong>把一个依赖 GPU
+的软件栈变成可重复拉取、可重复运行、可审计、可回滚的文件系统快照，同时不把宿主机
+Driver 这类应该由节点提供的能力错误地封进镜像。</strong></p>
+<p>普通 Web 服务镜像通常只需要 OS
+userspace、语言运行时、应用包和配置。AI
+镜像更复杂，因为一次训练或推理会同时依赖：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>典型内容</th>
+<th>错误后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OS userspace</td>
+<td>glibc、libstdc++、openssl、python、system package</td>
+<td>Python wheel 加载失败、TLS/证书问题、CVE 扫描噪音</td>
+</tr>
+<tr>
+<td>CUDA userspace</td>
+<td>libcudart、cuBLAS、cuDNN、NCCL、CUDA compatibility libraries</td>
+<td>CUDA 初始化失败、算子性能异常、通信失败</td>
+</tr>
+<tr>
+<td>框架</td>
+<td>PyTorch、JAX、TensorFlow、DeepSpeed、Megatron</td>
+<td>wheel ABI 不匹配、自定义算子 import 失败</td>
+</tr>
+<tr>
+<td>推理引擎</td>
+<td>vLLM、TensorRT-LLM、SGLang、TGI、Triton Inference Server</td>
+<td>engine 构建失败、kernel 不支持、冷启动过慢</td>
+</tr>
+<tr>
+<td>自定义扩展</td>
+<td>FlashAttention、xFormers、自研 CUDA op、Triton kernel</td>
+<td>编译架构不对、运行节点不可用</td>
+</tr>
+<tr>
+<td>应用层</td>
+<td>tokenizer、serve entrypoint、health check、配置模板</td>
+<td>启动失败、探针误杀、回滚不可复现</td>
+</tr>
+<tr>
+<td>模型相关制品</td>
+<td>engine plan、tokenizer files、adapter、model config</td>
+<td>权重和运行环境错配、启动时重复构建</td>
+</tr>
+</tbody>
+</table>
+<p>真正驱动 GPU 的 NVIDIA Driver
+在宿主机上，包括内核模块和一部分驱动相关 userspace
+能力。容器镜像中通常不应该安装或升级宿主机 Driver。容器里放的是 CUDA
+userspace、框架和应用。运行时再把必要的设备节点和驱动库注入进容器。这个边界一旦混乱，就会出现“镜像能构建、容器能启动、业务一碰
+CUDA 就失败”的典型事故。</p>
+<p>第一原则可以写成一句话：</p>
+<p><strong>镜像锁定 userspace，节点锁定
+Driver，平台锁定兼容矩阵，运行时负责设备与驱动能力注入。</strong></p>
+<h3 id="推为什么会有这些工程机制">推：为什么会有这些工程机制</h3>
+<p>从上面的第一原则可以推导出本章所有机制：</p>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>推导出的机制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>userspace 要可复现</td>
+<td>使用基础镜像、锁依赖、固定 digest、生成 SBOM</td>
+</tr>
+<tr>
+<td>Driver 不进镜像</td>
+<td>维护 Driver/CUDA 兼容矩阵，由节点池提供 Driver</td>
+</tr>
+<tr>
+<td>编译和运行目标不同</td>
+<td>使用 <code>devel</code> 构建、<code>runtime</code>
+运行，多阶段构建</td>
+</tr>
+<tr>
+<td>训练和推理目标不同</td>
+<td>拆分训练镜像、推理镜像、debug 镜像</td>
+</tr>
+<tr>
+<td>扩展 ABI 脆弱</td>
+<td>固定 Python、CUDA、torch、GPU arch、编译参数</td>
+</tr>
+<tr>
+<td>镜像体积影响启动</td>
+<td>分层复用、裁剪依赖、预构建 wheel/engine、节点预热</td>
+</tr>
+<tr>
+<td>漏洞和许可证要治理</td>
+<td>扫描、豁免、基础镜像生命周期、发布门禁</td>
+</tr>
+<tr>
+<td>多团队共享平台</td>
+<td>golden image、版本矩阵、准入规则、弃用窗口</td>
+</tr>
+</tbody>
+</table>
+<h3
+id="绘镜像driver运行时三者关系">绘：镜像、Driver、运行时三者关系</h3>
+<pre class="mermaid">flowchart TB
+    A[Source / Dockerfile / lock files] --&gt; B[Build pipeline]
+    B --&gt; C[AI image digest]
+    C --&gt; D[OS userspace]
+    C --&gt; E[CUDA userspace]
+    C --&gt; F[Framework / engine / app]
+
+    G[Host node] --&gt; H[NVIDIA Driver]
+    G --&gt; I[GPU hardware]
+    H --&gt; I
+
+    J[Container runtime] --&gt; K[Device and driver library injection]
+    K --&gt; L[Container process]
+    C --&gt; L
+    H --&gt; K
+    E --&gt; H
+
+    M[Platform compatibility matrix] --&gt; B
+    M --&gt; G
+    M --&gt; J</pre>
+<p>这张图的关键是责任边界：</p>
+<ul>
+<li>镜像负责应用可执行文件和 CUDA userspace。</li>
+<li>宿主机负责 Driver 和硬件健康。</li>
+<li>运行时负责把设备和驱动能力以受控方式暴露给容器。</li>
+<li>平台矩阵负责定义哪些组合允许进入生产。</li>
+</ul>
+<h3 id="导本章学习大纲">导：本章学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>AI 镜像与普通服务镜像的本质差异是什么？</li>
+<li><code>nvidia/cuda</code> 的
+<code>base</code>、<code>runtime</code>、<code>devel</code>
+分别包含什么，适合什么阶段？</li>
+<li>为什么 CUDA userspace 版本必须和宿主机 Driver 版本一起管理？</li>
+<li>PyTorch、cuDNN、NCCL、TensorRT-LLM、vLLM
+这类组件如何进入版本矩阵？</li>
+<li>训练镜像、推理镜像、builder 镜像、debug
+镜像为什么不应该长期混用？</li>
+<li>多阶段构建应该如何切分编译依赖、运行依赖、模型制品和应用代码？</li>
+<li>镜像体积、漏洞治理、冷启动、缓存命中率之间如何权衡？</li>
+<li>如何设计一个可执行的 AI 镜像基线和发布门禁？</li>
+<li>GPU 初始化失败时，如何判断是镜像问题、Driver
+问题还是运行时注入问题？</li>
+</ol>
+<h2 id="18a2-概念先说清楚">18a.2 概念先说清楚</h2>
+<h3 id="ai-镜像是什么">AI 镜像是什么</h3>
+<p>AI 镜像是一个包含 AI 工作负载运行所需 userspace
+依赖的容器镜像。它通常包括：</p>
+<ul>
+<li>Linux 发行版 userspace。</li>
+<li>Python 或其他语言运行时。</li>
+<li>CUDA runtime 相关库。</li>
+<li>深度学习框架。</li>
+<li>通信、算子、推理引擎依赖。</li>
+<li>应用服务代码、entrypoint、健康检查。</li>
+<li>可选的预编译 wheel、kernel cache、engine plan 或轻量模型配置。</li>
+</ul>
+<p>AI 镜像的目标是让运行环境可复制。它不是 GPU 本身，也不是节点
+Driver，也不是 Kubernetes 调度策略。</p>
+<h3 id="ai-镜像不是什么">AI 镜像不是什么</h3>
+<table>
+<thead>
+<tr>
+<th>容易混淆的对象</th>
+<th>为什么不是 AI 镜像的职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVIDIA Driver 生命周期</td>
+<td>Driver 应由节点镜像、驱动安装器或 GPU Operator 管理</td>
+</tr>
+<tr>
+<td>GPU 分配</td>
+<td>由编排系统、Device Plugin、调度器和运行时完成</td>
+</tr>
+<tr>
+<td>多机网络 fabric</td>
+<td>由节点、NIC、CNI、RDMA 配置、网络团队和平台基线管理</td>
+</tr>
+<tr>
+<td>模型注册表</td>
+<td>镜像可引用模型制品，但模型版本和血缘应由模型仓库管理</td>
+</tr>
+<tr>
+<td>全部安全治理</td>
+<td>镜像扫描是安全治理输入，不等于运行时隔离、身份、网络策略</td>
+</tr>
+</tbody>
+</table>
+<h3 id="与相邻概念的边界">与相邻概念的边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>定义</th>
+<th>与 AI 镜像的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础镜像</td>
+<td>构建上层镜像的起点，提供 OS 和 CUDA userspace 基线</td>
+<td>AI 镜像继承它，但还要加入框架和应用</td>
+</tr>
+<tr>
+<td>golden image</td>
+<td>平台验证过并承诺支持的内部基础镜像</td>
+<td>不是业务镜像，而是业务镜像的标准底座</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>宿主机内核态驱动和配套组件</td>
+<td>不应靠业务镜像安装或升级</td>
+</tr>
+<tr>
+<td>CUDA toolkit</td>
+<td>nvcc、头文件、库和工具集合</td>
+<td>builder 阶段可能需要，runtime 阶段通常不需要完整 toolkit</td>
+</tr>
+<tr>
+<td>CUDA runtime</td>
+<td>运行 CUDA 程序所需动态库</td>
+<td>推理和训练运行镜像通常需要</td>
+</tr>
+<tr>
+<td>cuDNN</td>
+<td>深度学习算子库</td>
+<td>通常随框架或基础镜像进入，需要和框架/CUDA 对齐</td>
+</tr>
+<tr>
+<td>NCCL</td>
+<td>GPU 集合通信库</td>
+<td>多卡、多机训练和部分推理场景需要重点验证</td>
+</tr>
+<tr>
+<td>推理 engine</td>
+<td>TensorRT engine、TensorRT-LLM 构建产物等</td>
+<td>可放镜像或外置缓存，但必须记录生成环境</td>
+</tr>
+<tr>
+<td>SBOM</td>
+<td>镜像软件物料清单</td>
+<td>用于审计和漏洞影响分析，不改变镜像本身</td>
+</tr>
+</tbody>
+</table>
+<h3 id="一条实用心智模型">一条实用心智模型</h3>
+<p>可以把 AI 镜像想成“GPU userspace 合同”：</p>
+<pre class="text"><code>镜像承诺：我包含这些 CUDA/框架/应用 userspace。
+节点承诺：我提供满足矩阵要求的 Driver、GPU、拓扑和设备健康。
+运行时承诺：我把被分配的设备和必要驱动库注入容器。
+平台承诺：这些组合经过验证，超出矩阵默认不支持。</code></pre>
+<h2 id="18a3-架构关键组件数据路径与责任边界">18a.3
+架构：关键组件、数据路径与责任边界</h2>
+<h3 id="关键组件">关键组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>责任</th>
+<th>常见拥有者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dockerfile / build config</td>
+<td>描述镜像如何构建</td>
+<td>应用团队、平台团队</td>
+</tr>
+<tr>
+<td>基础镜像 registry</td>
+<td>提供 <code>base</code>、<code>runtime</code>、<code>devel</code>
+或内部 golden image</td>
+<td>平台团队</td>
+</tr>
+<tr>
+<td>依赖锁文件</td>
+<td>固定 Python/system/engine 版本</td>
+<td>应用团队</td>
+</tr>
+<tr>
+<td>CI builder</td>
+<td>构建镜像、生成 SBOM、扫描、签名</td>
+<td>平台团队</td>
+</tr>
+<tr>
+<td>兼容矩阵</td>
+<td>定义 Driver/CUDA/框架/引擎/GPU 组合</td>
+<td>平台团队、训练/推理框架团队</td>
+</tr>
+<tr>
+<td>镜像 registry</td>
+<td>存储和分发镜像层</td>
+<td>平台团队</td>
+</tr>
+<tr>
+<td>节点池</td>
+<td>提供 Driver、GPU、运行时、缓存</td>
+<td>基础设施团队</td>
+</tr>
+<tr>
+<td>发布系统</td>
+<td>选择 digest、灰度、回滚、记录证据</td>
+<td>平台团队、SRE</td>
+</tr>
+</tbody>
+</table>
+<h3 id="构建时数据路径">构建时数据路径</h3>
+<pre class="mermaid">flowchart LR
+    A[Source code] --&gt; B[Dependency locks]
+    C[Golden CUDA image digest] --&gt; D[CI build]
+    B --&gt; D
+    D --&gt; E[Builder stage]
+    E --&gt; F[Wheel / extension / engine artifact]
+    F --&gt; G[Runtime stage]
+    G --&gt; H[Image digest]
+    H --&gt; I[SBOM]
+    H --&gt; J[Vulnerability scan]
+    H --&gt; K[Signature]
+    H --&gt; L[Registry]</pre>
+<p>构建路径里最重要的原则是：编译结果可以进入最终镜像，编译环境不应该无条件进入最终镜像。</p>
+<h3 id="运行时数据路径">运行时数据路径</h3>
+<pre class="mermaid">sequenceDiagram
+    participant P as Platform matrix
+    participant R as Registry
+    participant N as GPU node
+    participant C as Container runtime
+    participant A as AI process
+
+    P-&gt;&gt;R: allow image digest and baseline
+    N-&gt;&gt;R: pull image layers
+    C-&gt;&gt;N: request GPU devices and driver libraries
+    C-&gt;&gt;A: start process with mounts/env/devices
+    A-&gt;&gt;A: load CUDA/framework/engine userspace
+    A-&gt;&gt;N: call host Driver through injected device path</pre>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>首要归属</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch</code> wheel 与 CUDA 不匹配</td>
+<td>镜像/矩阵</td>
+<td>由镜像构建和依赖锁控制</td>
+</tr>
+<tr>
+<td>宿主机 Driver 太旧</td>
+<td>节点基线</td>
+<td>镜像不能修复旧 Driver</td>
+</tr>
+<tr>
+<td><code>/dev/nvidia0</code> 不存在</td>
+<td>运行时注入/资源分配</td>
+<td>先查 18b 的 runtime path</td>
+</tr>
+<tr>
+<td>NCCL 版本与框架冲突</td>
+<td>镜像/矩阵</td>
+<td>需要在基线测试中覆盖</td>
+</tr>
+<tr>
+<td>镜像拉取 8 分钟</td>
+<td>镜像工程/registry/cache</td>
+<td>与体积、层复用、预热相关</td>
+</tr>
+<tr>
+<td>CVE 来自编译工具链</td>
+<td>镜像分层</td>
+<td>多阶段构建应移除编译工具</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18a4-原理cudadriver-兼容为什么存在">18a.4 原理：CUDA/Driver
+兼容为什么存在</h2>
+<h3 id="内核态-driver-与-userspace-cuda-的分工">内核态 Driver 与
+userspace CUDA 的分工</h3>
+<p>GPU 程序不是直接“访问显卡”。它大致经过这些层：</p>
+<pre class="text"><code>PyTorch / TensorRT / custom op
+  -&gt; CUDA runtime / CUDA driver API / cuDNN / cuBLAS / NCCL
+  -&gt; libcuda.so and driver userspace interface
+  -&gt; NVIDIA kernel driver
+  -&gt; GPU hardware</code></pre>
+<p>镜像里通常包含上半部分的 userspace 库。宿主机提供下半部分的 Driver
+和硬件。CUDA userspace 会调用 Driver 提供的接口。如果 userspace 需要的
+Driver 能力比宿主机 Driver 新，就会失败。</p>
+<p>这就是为什么“镜像 CUDA 版本”和“宿主机 Driver
+版本”必须一起看。只看镜像 tag 或只看 <code>nvidia-smi</code>
+都不够。</p>
+<h3 id="向后兼容的直觉">向后兼容的直觉</h3>
+<p>工程上可以先记住一条粗规则：</p>
+<p><strong>较新的 NVIDIA Driver 通常能运行较旧的 CUDA userspace；较旧的
+Driver 通常不能运行需要更新 Driver 的 CUDA userspace。</strong></p>
+<p>但这只是方向，不是发布依据。生产平台必须以 NVIDIA、框架、推理引擎的
+release note 和内部验证结果为准，把可用组合固化成矩阵。</p>
+<h3 id="为什么-pytorch-wheel-也进入矩阵">为什么 PyTorch wheel
+也进入矩阵</h3>
+<p>PyTorch、JAX、TensorFlow 的 GPU wheel 不是普通 Python
+包。它们通常绑定特定 CUDA 版本、cuDNN/NCCL 版本和编译 ABI。自定义 CUDA
+extension 又绑定：</p>
+<ul>
+<li>Python minor version。</li>
+<li>PyTorch ABI。</li>
+<li>CUDA toolkit 版本。</li>
+<li>GPU compute capability。</li>
+<li>编译器和 libstdc++。</li>
+<li>是否使用特定 kernel 或 Triton 版本。</li>
+</ul>
+<p>所以不能把 <code>pip install torch</code> 当成普通业务依赖处理。AI
+镜像要记录并验证框架 wheel 来源、CUDA 变体、NCCL/cuDNN
+版本和扩展构建环境。</p>
+<h3 id="为什么推理引擎更脆弱">为什么推理引擎更脆弱</h3>
+<p>推理引擎通常会更强地绑定底层能力：</p>
+<table>
+<thead>
+<tr>
+<th>引擎/组件</th>
+<th>常见绑定点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TensorRT</td>
+<td>CUDA、cuDNN、GPU 架构、plugin ABI、engine plan 生成版本</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>TensorRT、CUDA、NCCL、MPI/通信库、GPU 架构</td>
+</tr>
+<tr>
+<td>vLLM</td>
+<td>PyTorch、CUDA、Triton、FlashAttention、GPU capability</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>PyTorch/CUDA、后端 kernel、scheduler/runtime 约束</td>
+</tr>
+<tr>
+<td>Triton Inference Server</td>
+<td>backend 版本、CUDA/TensorRT backend、模型仓库格式</td>
+</tr>
+</tbody>
+</table>
+<p>训练镜像经常以“能跑脚本”为验收，推理镜像必须以“固定模型、固定
+engine、固定并发、固定启动路径、固定健康检查”为验收。</p>
+<h2 id="18a5-nvidiacuda-基础镜像baseruntimedevel">18a.5
+<code>nvidia/cuda</code> 基础镜像：base/runtime/devel</h2>
+<p>NVIDIA CUDA 镜像常见分层是
+<code>base</code>、<code>runtime</code>、<code>devel</code>。不要只看名字，要看它们的责任。</p>
+<table>
+<thead>
+<tr>
+<th>镜像类型</th>
+<th>通常包含</th>
+<th>适合场景</th>
+<th>不适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>base</code></td>
+<td>最小 CUDA userspace 基础组件</td>
+<td>自己精确安装所需 CUDA 库、极简服务</td>
+<td>直接运行复杂 PyTorch/vLLM 服务</td>
+</tr>
+<tr>
+<td><code>runtime</code></td>
+<td>CUDA runtime 动态库和常见运行依赖</td>
+<td>生产推理、训练运行层、已预编译 wheel 的运行环境</td>
+<td>编译 CUDA extension、构建 TensorRT plugin</td>
+</tr>
+<tr>
+<td><code>devel</code></td>
+<td><code>runtime</code> + nvcc + headers + 开发工具链</td>
+<td>builder 阶段、开发调试、编译自定义算子</td>
+<td>生产最终镜像长期运行</td>
+</tr>
+<tr>
+<td>框架官方镜像</td>
+<td>CUDA + PyTorch/JAX/TensorFlow 预装</td>
+<td>快速实验、上游组合验证</td>
+<td>严格安全基线、内部治理、体积控制</td>
+</tr>
+<tr>
+<td>推理引擎官方镜像</td>
+<td>引擎和 backend 预装</td>
+<td>PoC、对齐官方示例</td>
+<td>多团队统一平台和精简生产镜像</td>
+</tr>
+<tr>
+<td>内部 golden image</td>
+<td>OS、CUDA、基础安全策略、镜像标签规范</td>
+<td>生产基线、多团队复用</td>
+<td>没有维护 SLA 的临时实验</td>
+</tr>
+</tbody>
+</table>
+<p>选择顺序应该是：</p>
+<ol type="1">
+<li>目标 GPU 和节点 Driver。</li>
+<li>框架或推理引擎支持范围。</li>
+<li>CUDA userspace 版本。</li>
+<li>是否需要编译 CUDA extension。</li>
+<li>OS 发行版和 glibc/libstdc++ 要求。</li>
+<li>体积、安全、冷启动和运维治理要求。</li>
+</ol>
+<p>不要从“最新版 CUDA”开始选。最新版经常意味着更高 Driver
+要求、更少第三方 wheel 支持、更长验证周期。</p>
+<h2 id="18a6-版本矩阵从文档表格变成发布控制面">18a.6
+版本矩阵：从文档表格变成发布控制面</h2>
+<h3 id="最小矩阵字段">最小矩阵字段</h3>
+<p>一个可运营的平台至少维护下面这些字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>示例</th>
+<th>为什么必须记录</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平台基线名</td>
+<td><code>cuda12.4-pytorch2.4-runtime</code></td>
+<td>供人沟通和策略引用</td>
+</tr>
+<tr>
+<td>基础镜像 digest</td>
+<td><code>registry/ai/cuda@sha256:...</code></td>
+<td>防止 tag 漂移</td>
+</tr>
+<tr>
+<td>OS 发行版</td>
+<td>Ubuntu 22.04</td>
+<td>决定 glibc、包管理和 CVE 基线</td>
+</tr>
+<tr>
+<td>GPU 型号</td>
+<td>A100、H100、L40S</td>
+<td>决定 compute capability、MIG、FP8 等能力</td>
+</tr>
+<tr>
+<td>Driver 最低版本</td>
+<td><code>&gt;= 550.xx</code></td>
+<td>决定 CUDA userspace 能否运行</td>
+</tr>
+<tr>
+<td>CUDA userspace</td>
+<td>12.4</td>
+<td>框架和扩展 ABI 基线</td>
+</tr>
+<tr>
+<td>cuDNN</td>
+<td>9.x</td>
+<td>算子库兼容和性能</td>
+</tr>
+<tr>
+<td>NCCL</td>
+<td>2.x</td>
+<td>多卡/多机通信</td>
+</tr>
+<tr>
+<td>Python</td>
+<td>3.10/3.11</td>
+<td>wheel ABI</td>
+</tr>
+<tr>
+<td>框架</td>
+<td>PyTorch 2.4.x</td>
+<td>应用和 extension 兼容</td>
+</tr>
+<tr>
+<td>推理引擎</td>
+<td>vLLM/TensorRT-LLM/SGLang 版本</td>
+<td>推理路径兼容</td>
+</tr>
+<tr>
+<td>支持状态</td>
+<td>canary/supported/deprecated/blocked</td>
+<td>发布门禁</td>
+</tr>
+<tr>
+<td>支持到期日</td>
+<td><code>2026-09-30</code></td>
+<td>迁移计划</td>
+</tr>
+<tr>
+<td>验证套件</td>
+<td>smoke/perf/regression 链接</td>
+<td>证明不是只写文档</td>
+</tr>
+</tbody>
+</table>
+<h3 id="矩阵示例">矩阵示例</h3>
+<p>下面是示意矩阵，具体版本应以组织内部验证和上游 release note
+为准。</p>
+<table>
+<thead>
+<tr>
+<th>基线</th>
+<th style="text-align: right;">Driver 要求</th>
+<th style="text-align: right;">CUDA</th>
+<th>框架/引擎</th>
+<th>适用场景</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ai-cu11.8-legacy</code></td>
+<td style="text-align: right;">520+</td>
+<td style="text-align: right;">11.8</td>
+<td>PyTorch 2.0/2.1、老扩展</td>
+<td>存量训练和老模型服务</td>
+<td>deprecated</td>
+</tr>
+<tr>
+<td><code>ai-cu12.1-stable</code></td>
+<td style="text-align: right;">535+</td>
+<td style="text-align: right;">12.1</td>
+<td>PyTorch 2.2/2.3、vLLM 稳定线</td>
+<td>常规训练和稳定推理</td>
+<td>supported</td>
+</tr>
+<tr>
+<td><code>ai-cu12.4-current</code></td>
+<td style="text-align: right;">550+</td>
+<td style="text-align: right;">12.4</td>
+<td>PyTorch 2.4/2.5、TensorRT-LLM 验证线</td>
+<td>新 GPU、新推理优化</td>
+<td>supported/canary</td>
+</tr>
+<tr>
+<td><code>ai-cu12.x-experimental</code></td>
+<td style="text-align: right;">按节点池</td>
+<td style="text-align: right;">12.x</td>
+<td>nightly wheel、自研 kernel</td>
+<td>性能实验</td>
+<td>blocked for prod</td>
+</tr>
+</tbody>
+</table>
+<h3 id="矩阵如何落到工程系统">矩阵如何落到工程系统</h3>
+<p>矩阵不能只存在 Wiki 里。它至少要影响这些环节：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>矩阵动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>镜像构建</td>
+<td>只允许从矩阵内基础镜像构建生产镜像</td>
+</tr>
+<tr>
+<td>CI 测试</td>
+<td>自动读取基线，运行 CUDA/framework/NCCL smoke test</td>
+</tr>
+<tr>
+<td>发布门禁</td>
+<td>不在矩阵内的 digest 默认阻断</td>
+</tr>
+<tr>
+<td>节点准入</td>
+<td>节点 Driver、GPU、runtime 版本必须打标签并校验</td>
+</tr>
+<tr>
+<td>调度策略</td>
+<td>工作负载声明所需基线，调度到匹配节点池</td>
+</tr>
+<tr>
+<td>漏洞治理</td>
+<td>按基线更新基础镜像，通知下游重建</td>
+</tr>
+<tr>
+<td>弃用迁移</td>
+<td>deprecated 基线设期限，超过期限阻断新发布</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18a7-训练镜像与推理镜像分层">18a.7 训练镜像与推理镜像分层</h2>
+<h3 id="训练镜像的目标函数">训练镜像的目标函数</h3>
+<p>训练镜像重视“实验和分布式训练能力完整”：</p>
+<ul>
+<li>支持编译或加载自定义 CUDA extension。</li>
+<li>包含 DeepSpeed、Megatron、FSDP、数据处理工具。</li>
+<li>包含 NCCL tests、profiling、debug 工具。</li>
+<li>支持 checkpoint、对象存储、数据集读取。</li>
+<li>支持多机启动器和作业调度入口。</li>
+</ul>
+<p>训练镜像可以比推理镜像大，但不能无限膨胀。训练集群也会受镜像拉取、CVE
+和依赖冲突影响。</p>
+<h3 id="推理镜像的目标函数">推理镜像的目标函数</h3>
+<p>推理镜像重视“稳定、快、可回滚、攻击面小”：</p>
+<ul>
+<li>只保留服务运行必要依赖。</li>
+<li>不在启动路径安装依赖或编译核心产物。</li>
+<li>入口、健康检查、metrics 和日志路径固定。</li>
+<li>与模型格式、engine plan、tokenizer、adapter 版本绑定。</li>
+<li>冷启动时间可拆解、可观测、可优化。</li>
+</ul>
+<h3 id="分层建议">分层建议</h3>
+<pre class="text"><code>OS + security baseline
+  -&gt; CUDA runtime baseline
+  -&gt; framework or inference engine baseline
+  -&gt; prebuilt wheels / kernels / engine plugins
+  -&gt; application code
+  -&gt; small config defaults</code></pre>
+<p>训练和推理可以共用底层 golden image，但不应该共用上层工具集合。</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>训练镜像</th>
+<th>推理镜像</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>依赖范围</td>
+<td>宽，含训练框架、数据工具、debug 工具</td>
+<td>窄，只含服务运行路径</td>
+</tr>
+<tr>
+<td>编译能力</td>
+<td>可以在 builder 或开发镜像中保留</td>
+<td>生产最终镜像通常不保留</td>
+</tr>
+<tr>
+<td>体积容忍度</td>
+<td>中等偏高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>漏洞容忍</td>
+<td>仍需治理</td>
+<td>更严格</td>
+</tr>
+<tr>
+<td>启动路径</td>
+<td>作业启动、分布式 launcher、checkpoint resume</td>
+<td>服务启动、模型加载、warmup、health check</td>
+</tr>
+<tr>
+<td>变更频率</td>
+<td>随实验较快</td>
+<td>跟发布节奏和回滚策略</td>
+</tr>
+<tr>
+<td>验收</td>
+<td>训练 smoke、NCCL、checkpoint</td>
+<td>SLA、冷启动、吞吐、延迟、回滚</td>
+</tr>
+</tbody>
+</table>
+<p>长期共用一个“大而全”镜像的后果通常是：</p>
+<ul>
+<li>推理服务背着训练工具上线。</li>
+<li>漏洞报告里充满生产不用的软件包。</li>
+<li>节点扩容时拉取巨大镜像。</li>
+<li>镜像缓存命中变差。</li>
+<li>任何依赖升级都可能影响训练和推理两条链路。</li>
+<li>排障时无法判断某个库到底是否属于运行路径。</li>
+</ul>
+<h2 id="18a8-多阶段构建把编译环境和运行环境切开">18a.8
+多阶段构建：把编译环境和运行环境切开</h2>
+<h3 id="基本模式">基本模式</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> nvidia/cuda:12.4.1-devel-ubuntu22.04 <span class="kw">AS</span> builder</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /src</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">ENV</span> PIP_NO_CACHE_DIR=1</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> <span class="dt">\</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    python3 python3-pip python3-dev build-essential git ca-certificates <span class="dt">\</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /var/lib/apt/lists/<span class="pp">*</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> requirements-build.txt .</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">--upgrade</span> pip <span class="kw">&amp;&amp;</span> <span class="dt">\</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">-r</span> requirements-build.txt</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> . .</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> build <span class="at">--wheel</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> nvidia/cuda:12.4.1-runtime-ubuntu22.04 <span class="kw">AS</span> runtime</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /app</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="kw">ENV</span> PIP_NO_CACHE_DIR=1 <span class="op">\</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    PYTHONDONTWRITEBYTECODE=1 <span class="op">\</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    PYTHONUNBUFFERED=1</span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> <span class="dt">\</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    python3 python3-pip ca-certificates <span class="dt">\</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /var/lib/apt/lists/<span class="pp">*</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> requirements-runtime.txt .</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">--upgrade</span> pip <span class="kw">&amp;&amp;</span> <span class="dt">\</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">-r</span> requirements-runtime.txt</span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> <span class="op">--from=builder</span> /src/dist/*.whl /tmp/</span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install /tmp/<span class="pp">*</span>.whl <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /tmp/<span class="pp">*</span>.whl</span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> serve.py .</span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">useradd</span> <span class="at">--create-home</span> <span class="at">--uid</span> 10001 appuser</span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> 10001</span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="kw">CMD</span> [<span class="st">&quot;python3&quot;</span>, <span class="st">&quot;serve.py&quot;</span>]</span></code></pre></div>
+<p>这个例子的重点不是具体包名，而是边界：</p>
+<ul>
+<li><code>builder</code> 可以有
+nvcc、头文件、编译器、git、源码和缓存。</li>
+<li><code>runtime</code> 只保留运行所需库、wheel、服务入口。</li>
+<li>最终镜像不应该依赖 build cache。</li>
+<li>生产默认非 root。</li>
+<li>apt 缓存和 pip 缓存在同一层清理。</li>
+</ul>
+<h3 id="ai-镜像多阶段构建的常见切分">AI 镜像多阶段构建的常见切分</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>内容</th>
+<th>产出</th>
+<th>是否进入最终镜像</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>base</code></td>
+<td>OS、证书、用户、安全基线</td>
+<td>可复用底层</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>cuda-runtime</code></td>
+<td>CUDA runtime、cuDNN/NCCL</td>
+<td>运行库</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>builder</code></td>
+<td>nvcc、headers、compiler、source</td>
+<td>wheel、plugin、engine</td>
+<td>否，只复制产物</td>
+</tr>
+<tr>
+<td><code>test</code></td>
+<td>smoke test、单元测试、NCCL test</td>
+<td>测试报告</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>runtime</code></td>
+<td>运行依赖、应用、entrypoint</td>
+<td>生产镜像</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>gdb、nsys、curl、vim、shell 工具</td>
+<td>调试镜像</td>
+<td>单独发布，不作为默认生产镜像</td>
+</tr>
+</tbody>
+</table>
+<h3 id="自定义-cuda-extension-的关键点">自定义 CUDA extension
+的关键点</h3>
+<p>构建 FlashAttention、xFormers、自研 op 或 Triton kernel
+时，要记录：</p>
+<ul>
+<li>构建使用的 CUDA toolkit 版本。</li>
+<li>PyTorch/JAX 版本。</li>
+<li>Python 版本。</li>
+<li><code>TORCH_CUDA_ARCH_LIST</code> 或目标 GPU 架构。</li>
+<li>编译器版本。</li>
+<li>wheel 文件名和 build metadata。</li>
+<li>是否依赖运行时 JIT。</li>
+</ul>
+<p>如果训练在 A100、推理在 L40S 或 H100，必须确认编译架构覆盖目标
+GPU。否则可能出现“开发环境能跑，生产节点第一次调用 kernel 失败”。</p>
+<h2 id="18a9-镜像体积漏洞治理与冷启动">18a.9
+镜像体积、漏洞治理与冷启动</h2>
+<h3 id="镜像体积为什么是-ai-平台问题">镜像体积为什么是 AI 平台问题</h3>
+<p>镜像体积不仅占 registry 空间，还会影响：</p>
+<ul>
+<li>节点扩容时 image pull 时间。</li>
+<li>Pod 冷启动和自动扩缩容响应。</li>
+<li>registry 出口带宽和缓存压力。</li>
+<li>漏洞扫描时间。</li>
+<li>层缓存命中率。</li>
+<li>回滚速度。</li>
+</ul>
+<p>推理服务尤其敏感。一个 12GB
+镜像在单副本滚动发布时可能只是慢，在突发扩容时会变成 SLA 事故。</p>
+<h3 id="体积治理动作">体积治理动作</h3>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>解决的问题</th>
+<th>注意事项</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>使用 runtime 而不是 devel</td>
+<td>减少工具链和头文件</td>
+<td>builder 产物要完整复制</td>
+</tr>
+<tr>
+<td>合并安装与清理</td>
+<td>减少无效层</td>
+<td><code>apt-get update/install/clean</code> 放同一层</td>
+</tr>
+<tr>
+<td>固定依赖并裁剪 extras</td>
+<td>避免装入 notebook/dev/test 工具</td>
+<td>requirements 分 build/runtime</td>
+</tr>
+<tr>
+<td>预构建 wheel</td>
+<td>避免启动时编译</td>
+<td>wheel 要进入矩阵和 SBOM</td>
+</tr>
+<tr>
+<td>外置大模型权重</td>
+<td>减少镜像变更频率</td>
+<td>需要模型缓存和版本绑定</td>
+</tr>
+<tr>
+<td>分层复用 golden image</td>
+<td>提高缓存命中</td>
+<td>底层 digest 不要频繁漂移</td>
+</tr>
+<tr>
+<td>单独 debug 镜像</td>
+<td>生产镜像更小</td>
+<td>debug 镜像要有权限控制</td>
+</tr>
+</tbody>
+</table>
+<h3 id="漏洞治理">漏洞治理</h3>
+<p>漏洞治理不是“扫描出 0 个 CVE”这么简单。现实中 AI 镜像依赖多，某些 CVE
+可能暂时无修复版本。平台需要可执行策略：</p>
+<table>
+<thead>
+<tr>
+<th>风险</th>
+<th>默认动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Critical 且可利用</td>
+<td>阻断发布</td>
+</tr>
+<tr>
+<td>High</td>
+<td>修复或提交限期豁免</td>
+</tr>
+<tr>
+<td>来自生产不需要的工具</td>
+<td>从 runtime 镜像移除</td>
+</tr>
+<tr>
+<td>来自基础镜像</td>
+<td>平台发布新 golden image，下游重建</td>
+</tr>
+<tr>
+<td>来自 Python wheel</td>
+<td>升级、替换或记录风险接受</td>
+</tr>
+<tr>
+<td>无修复版本</td>
+<td>限期豁免、隔离部署、持续复查</td>
+</tr>
+</tbody>
+</table>
+<p>生产镜像中最常见、也最容易处理的漏洞来源，是 builder 工具、notebook
+工具、包管理缓存和调试工具进入最终镜像。</p>
+<h3 id="冷启动时间拆解">冷启动时间拆解</h3>
+<p>冷启动不要只看总耗时，要拆成：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>观测点</th>
+<th>优化方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度等待</td>
+<td>scheduler event、队列等待</td>
+<td>容量、优先级、节点池</td>
+</tr>
+<tr>
+<td>image pull</td>
+<td>kubelet/containerd event</td>
+<td>缩小镜像、registry mirror、预拉取</td>
+</tr>
+<tr>
+<td>容器创建</td>
+<td>runtime 日志</td>
+<td>减少 mount、修 hook、优化权限</td>
+</tr>
+<tr>
+<td>Python import</td>
+<td>应用启动日志</td>
+<td>裁剪依赖、lazy import、预编译</td>
+</tr>
+<tr>
+<td>模型下载</td>
+<td>对象存储指标</td>
+<td>本地缓存、分层缓存、并行下载</td>
+</tr>
+<tr>
+<td>engine build</td>
+<td>TensorRT/vLLM 日志</td>
+<td>预构建 engine、持久缓存</td>
+</tr>
+<tr>
+<td>GPU warmup</td>
+<td>metrics、首请求延迟</td>
+<td>显式 warmup、CUDA graph 预热</td>
+</tr>
+<tr>
+<td>探针通过</td>
+<td>startupProbe/health event</td>
+<td>分离 startupProbe 和 readinessProbe</td>
+</tr>
+</tbody>
+</table>
+<p>镜像治理只能解决其中一部分。模型下载和 engine
+构建如果仍在启动路径里，镜像变小也不能让服务快速 ready。</p>
+<h2 id="18a10-工程化落地生产基线发布观测治理">18a.10
+工程化落地：生产基线、发布、观测、治理</h2>
+<h3 id="生产镜像基线">生产镜像基线</h3>
+<p>一个平台可以定义如下基线：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">baseline</span><span class="kw">:</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> ai-cu12.4-pytorch2.4-runtime</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">os</span><span class="kw">:</span><span class="at"> ubuntu22.04</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">cuda</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;12.4&quot;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">min_driver</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;550.xx&quot;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">python</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;3.10&quot;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">framework</span><span class="kw">:</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">torch</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2.4.x+cu124&quot;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">libraries</span><span class="kw">:</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cudnn</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;9.x&quot;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nccl</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2.x&quot;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">allowed_gpu</span><span class="kw">:</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> A100</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> H100</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> L40S</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tag</span><span class="kw">:</span><span class="at"> registry.internal/ai/golden:cu12.4-py310-runtime</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">digest</span><span class="kw">:</span><span class="at"> sha256:...</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">status</span><span class="kw">:</span><span class="at"> supported</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">expires_after</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2026-12-31&quot;</span></span></code></pre></div>
+<p>业务镜像声明继承哪个 baseline，CI 根据 baseline
+注入测试和发布门禁。</p>
+<h3 id="发布流程">发布流程</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>必做动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>设计</td>
+<td>选择矩阵内 baseline，确认目标节点池和 GPU</td>
+</tr>
+<tr>
+<td>构建</td>
+<td>使用 digest 固定基础镜像，多阶段构建</td>
+</tr>
+<tr>
+<td>测试</td>
+<td>运行 import、CUDA、framework、NCCL/engine smoke test</td>
+</tr>
+<tr>
+<td>扫描</td>
+<td>生成 SBOM、漏洞扫描、许可证检查</td>
+</tr>
+<tr>
+<td>签名</td>
+<td>对镜像 digest 签名</td>
+</tr>
+<tr>
+<td>发布</td>
+<td>按 digest 部署，不按可变 tag 部署</td>
+</tr>
+<tr>
+<td>预热</td>
+<td>目标节点池预拉取镜像层或复用缓存</td>
+</tr>
+<tr>
+<td>观测</td>
+<td>记录 image pull、startup、模型加载、warmup 指标</td>
+</tr>
+<tr>
+<td>回滚</td>
+<td>回滚到已验证且仍保留的 digest</td>
+</tr>
+</tbody>
+</table>
+<h3 id="镜像观测指标">镜像观测指标</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>image pull duration</td>
+<td>判断镜像体积和 registry/cache 问题</td>
+</tr>
+<tr>
+<td>unpack duration</td>
+<td>判断层数、节点 IO、containerd 压力</td>
+</tr>
+<tr>
+<td>cold start duration</td>
+<td>发布和扩缩容 SLO</td>
+</tr>
+<tr>
+<td>import duration</td>
+<td>Python 依赖膨胀信号</td>
+</tr>
+<tr>
+<td>model load duration</td>
+<td>区分镜像慢还是模型慢</td>
+</tr>
+<tr>
+<td>engine build duration</td>
+<td>判断是否应预构建</td>
+</tr>
+<tr>
+<td>vulnerability count by severity</td>
+<td>风险趋势</td>
+</tr>
+<tr>
+<td>baseline adoption ratio</td>
+<td>迁移和弃用治理</td>
+</tr>
+<tr>
+<td>cache hit ratio</td>
+<td>预热和分层复用效果</td>
+</tr>
+</tbody>
+</table>
+<h3 id="版本升级策略">版本升级策略</h3>
+<p>升级顺序建议是：</p>
+<ol type="1">
+<li>新建 canary baseline，不直接覆盖 stable baseline。</li>
+<li>在独立节点池或少量节点升级 Driver。</li>
+<li>构建新 CUDA/framework 镜像。</li>
+<li>跑框架 smoke、NCCL、多模型推理、性能回归。</li>
+<li>选择少量服务灰度。</li>
+<li>标记 supported。</li>
+<li>宣布旧 baseline deprecated 和迁移截止日期。</li>
+<li>到期后阻断旧 baseline 新发布，只允许安全修复。</li>
+</ol>
+<p>不要在一个发布窗口里同时升级
+Driver、CUDA、PyTorch、推理引擎、模型权重和服务代码。出问题时无法归因。</p>
+<h2 id="18a11-方案设计ai-镜像基线决策表">18a.11 方案设计：AI
+镜像基线决策表</h2>
+<h3 id="设计目标">设计目标</h3>
+<p>为一个同时支持训练和在线推理的平台设计镜像策略：</p>
+<ul>
+<li>节点池包含 A100 和 H100。</li>
+<li>训练团队需要自定义 CUDA extension。</li>
+<li>推理团队使用 vLLM 和 TensorRT-LLM。</li>
+<li>线上扩容要求冷启动可控。</li>
+<li>安全团队要求高危漏洞有处置记录。</li>
+</ul>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>决策项</th>
+<th>方案 A：单一大镜像</th>
+<th>方案 B：分层 golden + 训练/推理拆分</th>
+<th>方案 C：每团队自选</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>兼容治理</td>
+<td>简单但脆弱</td>
+<td>平台矩阵统一控制</td>
+<td>不可控</td>
+</tr>
+<tr>
+<td>镜像体积</td>
+<td>最大</td>
+<td>可控</td>
+<td>不确定</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>差</td>
+<td>好</td>
+<td>不确定</td>
+</tr>
+<tr>
+<td>漏洞治理</td>
+<td>噪音大</td>
+<td>可按运行路径裁剪</td>
+<td>难统一</td>
+</tr>
+<tr>
+<td>实验灵活性</td>
+<td>中</td>
+<td>builder/debug 镜像支持</td>
+<td>高</td>
+</tr>
+<tr>
+<td>生产稳定性</td>
+<td>中低</td>
+<td>高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>推荐</td>
+<td>不推荐</td>
+<td>推荐</td>
+<td>只适合沙箱</td>
+</tr>
+</tbody>
+</table>
+<h3 id="可执行设计">可执行设计</h3>
+<pre class="text"><code>1. 平台维护 3 类 golden image：
+   - ai-cu12.1-runtime
+   - ai-cu12.4-runtime
+   - ai-cu12.4-devel
+
+2. 应用团队只能从 golden image digest 构建生产镜像。
+
+3. 训练镜像：
+   - final 可以包含训练 launcher、NCCL tests、必要 debug 工具。
+   - 自定义 extension 在 builder 阶段构建 wheel。
+   - 训练镜像允许更宽依赖，但必须扫描和记录 SBOM。
+
+4. 推理镜像：
+   - final 使用 runtime baseline。
+   - 不含 notebook、compiler、git、vim。
+   - engine、plugin、wheel 预构建。
+   - 启动路径禁止 pip install 和编译核心产物。
+
+5. 发布门禁：
+   - baseline 必须 supported。
+   - image digest、SBOM、扫描报告、签名必须存在。
+   - CUDA/framework/engine smoke test 必须通过。
+   - Critical CVE 阻断或有到期豁免。
+
+6. 节点池：
+   - A100 stable 池运行 supported baseline。
+   - H100 canary 池验证新 CUDA/Driver/engine。
+   - 节点标签记录 driver、gpu、cuda-baseline-support。</code></pre>
+<h2 id="18a12-worked-example把实验镜像改造成生产推理镜像">18a.12 Worked
+Example：把实验镜像改造成生产推理镜像</h2>
+<h3 id="初始镜像">初始镜像</h3>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> nvidia/cuda:12.4.1-devel-ubuntu22.04</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> git build-essential vim curl</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">pip</span> install torch vllm flash-attn jupyter pandas scipy</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> . /workspace</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /workspace</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CMD</span> [<span class="st">&quot;python&quot;</span>, <span class="st">&quot;serve.py&quot;</span>]</span></code></pre></div>
+<h3 id="问题分析">问题分析</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最终镜像使用 <code>devel</code></td>
+<td>nvcc、headers、编译工具增加体积和漏洞面</td>
+</tr>
+<tr>
+<td>依赖未锁定</td>
+<td>每次构建结果可能不同</td>
+</tr>
+<tr>
+<td><code>pip install torch vllm</code> 未指定 CUDA 变体</td>
+<td>可能装到不符合矩阵的 wheel</td>
+</tr>
+<tr>
+<td>Jupyter、vim、git、pandas 进入生产</td>
+<td>攻击面和 CVE 增加</td>
+</tr>
+<tr>
+<td>FlashAttention 可能在运行时编译</td>
+<td>冷启动不稳定</td>
+</tr>
+<tr>
+<td>默认 root</td>
+<td>权限边界过宽</td>
+</tr>
+<tr>
+<td>无 digest/SBOM/扫描</td>
+<td>无法审计和回滚</td>
+</tr>
+</tbody>
+</table>
+<h3 id="改造目标">改造目标</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>改造前</th>
+<th>改造后目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础镜像</td>
+<td>上游 tag</td>
+<td>内部 supported baseline digest</td>
+</tr>
+<tr>
+<td>构建方式</td>
+<td>单阶段</td>
+<td>builder/runtime 多阶段</td>
+</tr>
+<tr>
+<td>生产依赖</td>
+<td>训练和 debug 工具混入</td>
+<td>只保留服务路径</td>
+</tr>
+<tr>
+<td>启动路径</td>
+<td>可能安装/编译</td>
+<td>不安装、不编译</td>
+</tr>
+<tr>
+<td>权限</td>
+<td>root</td>
+<td>非 root</td>
+</tr>
+<tr>
+<td>发布证据</td>
+<td>无</td>
+<td>digest + SBOM + scan + signature</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>不可预测</td>
+<td>分阶段可观测</td>
+</tr>
+</tbody>
+</table>
+<h3 id="改造后示意">改造后示意</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> registry.internal/ai/golden:cu12.4-devel@sha256:... <span class="kw">AS</span> builder</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /src</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">ENV</span> PIP_NO_CACHE_DIR=1</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> requirements-build.lock .</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">-r</span> requirements-build.lock</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> . .</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> build <span class="at">--wheel</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> registry.internal/ai/golden:cu12.4-runtime@sha256:... <span class="kw">AS</span> runtime</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /app</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ENV</span> PIP_NO_CACHE_DIR=1 <span class="op">\</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    PYTHONDONTWRITEBYTECODE=1 <span class="op">\</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    PYTHONUNBUFFERED=1</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> requirements-runtime.lock .</span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install <span class="at">-r</span> requirements-runtime.lock</span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> <span class="op">--from=builder</span> /src/dist/*.whl /tmp/</span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">python3</span> <span class="at">-m</span> pip install /tmp/<span class="pp">*</span>.whl <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /tmp/<span class="pp">*</span>.whl</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> serve.py .</span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> config/ ./config/</span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> 10001</span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="kw">CMD</span> [<span class="st">&quot;python3&quot;</span>, <span class="st">&quot;serve.py&quot;</span>]</span></code></pre></div>
+<h3 id="验证脚本">验证脚本</h3>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="st">import torch</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="st">print(&quot;torch&quot;, torch.__version__)</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="st">print(&quot;cuda&quot;, torch.version.cuda)</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="st">print(&quot;available&quot;, torch.cuda.is_available())</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="st">print(&quot;devices&quot;, torch.cuda.device_count())</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="st">import vllm</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="st">print(&quot;vllm import ok&quot;)</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p>如果是多卡或多机推理，还要加入 NCCL 或引擎 smoke
+test。验收不是“容器能启动”，而是“在目标节点池上完成 GPU
+初始化、模型加载、warmup 和健康检查”。</p>
+<h2 id="18a13-故障排除症状证据根因处理动作">18a.13
+故障排除：症状、证据、根因、处理动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>必收证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUDA driver version is insufficient</code></td>
+<td>宿主机 <code>nvidia-smi</code>、镜像 CUDA、框架 CUDA</td>
+<td>Driver 低于 CUDA userspace 要求</td>
+<td>升级节点 Driver，或降级镜像到矩阵内</td>
+</tr>
+<tr>
+<td><code>libcuda.so.1</code> 找不到</td>
+<td>容器内 <code>ldconfig -p</code>、<code>/dev/nvidia*</code>、runtime
+配置</td>
+<td>Driver 库未由运行时注入</td>
+<td>查 18b 的 NVIDIA runtime hook</td>
+</tr>
+<tr>
+<td><code>libcudart.so</code> 或 <code>libcudnn.so</code> 找不到</td>
+<td><code>ldd</code>、基础镜像类型、SBOM</td>
+<td>runtime 镜像缺运行库或路径错误</td>
+<td>换正确 runtime baseline，修库路径</td>
+</tr>
+<tr>
+<td>自定义 op import 失败</td>
+<td>wheel build log、torch/CUDA/Python 版本</td>
+<td>ABI 或 GPU arch 不匹配</td>
+<td>在矩阵内重建 wheel</td>
+</tr>
+<tr>
+<td>H100 上失败，A100 上成功</td>
+<td>GPU capability、编译 arch、Driver、engine 版本</td>
+<td>wheel/engine 未覆盖 H100 架构</td>
+<td>重编译并纳入 H100 验证</td>
+</tr>
+<tr>
+<td><code>no kernel image is available</code></td>
+<td><code>TORCH_CUDA_ARCH_LIST</code>、GPU 型号、extension 信息</td>
+<td>编译时未包含目标架构</td>
+<td>重新构建扩展</td>
+</tr>
+<tr>
+<td>推理容器启动 10 分钟</td>
+<td>image pull、模型下载、engine build 时间线</td>
+<td>镜像大、启动时下载或编译</td>
+<td>裁剪镜像、预热缓存、预构建 engine</td>
+</tr>
+<tr>
+<td>漏洞扫描高危很多</td>
+<td>SBOM、包列表、层分析</td>
+<td>builder/debug 工具进入 final</td>
+<td>多阶段构建，拆 debug 镜像</td>
+</tr>
+<tr>
+<td>同一 tag 昨天能跑今天失败</td>
+<td>image digest、registry tag history</td>
+<td>tag 漂移</td>
+<td>按 digest 发布，禁止生产覆盖 tag</td>
+</tr>
+<tr>
+<td>PyTorch 可用但 NCCL timeout</td>
+<td>NCCL 版本、RDMA 注入、NCCL debug</td>
+<td>通信库或运行时设备问题</td>
+<td>对照矩阵和 18b RDMA 注入排查</td>
+</tr>
+</tbody>
+</table>
+<p>排障顺序建议：</p>
+<ol type="1">
+<li>固定 image digest，不用可变 tag 排查。</li>
+<li>记录宿主机 Driver、GPU 型号、MIG 状态。</li>
+<li>记录容器内 CUDA/framework/engine 版本。</li>
+<li>先跑最小 CUDA smoke test。</li>
+<li>再跑 framework/import/custom op smoke test。</li>
+<li>涉及多卡多机时再跑 NCCL/RDMA test。</li>
+<li>把结论写回矩阵或镜像构建规则。</li>
+</ol>
+<h2 id="18a14-反模式与-checklist">18a.14 反模式与 Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<ul>
+<li>生产镜像长期使用 <code>devel</code>。</li>
+<li>使用 <code>latest</code> 或可覆盖 tag 作为生产发布依据。</li>
+<li>每个团队自行选择 CUDA/Driver/PyTorch/vLLM 组合。</li>
+<li>在容器启动时 <code>pip install</code>、下载大量依赖或编译 CUDA
+extension。</li>
+<li>训练、推理、notebook、debug 共用同一个镜像。</li>
+<li>把宿主机 Driver 安装逻辑写进业务 Dockerfile。</li>
+<li>只验证 <code>nvidia-smi</code>，不验证框架、引擎和自定义 op。</li>
+<li>镜像里塞入模型权重但没有模型版本和镜像版本绑定策略。</li>
+<li>为了修一个库加载问题，在 final 镜像里复制整棵
+<code>/usr/local/cuda</code>。</li>
+<li>CVE 只做截图式扫描，不进入发布阻断、豁免和修复闭环。</li>
+</ul>
+<h3 id="checklist">Checklist</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>通过标准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础镜像</td>
+<td>来自 supported baseline，记录 digest</td>
+</tr>
+<tr>
+<td>Driver/CUDA</td>
+<td>组合在平台矩阵内</td>
+</tr>
+<tr>
+<td>框架/引擎</td>
+<td>PyTorch/cuDNN/NCCL/vLLM/TensorRT-LLM 版本明确</td>
+</tr>
+<tr>
+<td>Python 依赖</td>
+<td>lock file 可复现，wheel 来源明确</td>
+</tr>
+<tr>
+<td>自定义扩展</td>
+<td>记录 CUDA、torch、Python、GPU arch 构建信息</td>
+</tr>
+<tr>
+<td>多阶段构建</td>
+<td>builder/runtime 边界清楚</td>
+</tr>
+<tr>
+<td>训练/推理拆分</td>
+<td>生产推理不含无关训练、notebook、debug 工具</td>
+</tr>
+<tr>
+<td>镜像体积</td>
+<td>有目标阈值，层复用和缓存策略明确</td>
+</tr>
+<tr>
+<td>漏洞治理</td>
+<td>SBOM、扫描、修复/豁免、阻断规则齐全</td>
+</tr>
+<tr>
+<td>权限</td>
+<td>默认非 root，不依赖 root 启动</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>image pull、模型加载、engine build、warmup 可观测</td>
+</tr>
+<tr>
+<td>发布</td>
+<td>按 digest 部署，支持回滚</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18a15-本章小结">18a.15 本章小结</h2>
+<p>AI 镜像治理的本质是把 GPU userspace 变成平台合同。镜像负责固定 CUDA
+runtime、框架、引擎和应用；节点负责 Driver
+和硬件；运行时负责设备和驱动能力注入；兼容矩阵负责告诉所有人哪些组合可以进入生产。</p>
+<p>生产级 AI 镜像不是一个
+Dockerfile，而是一套工程系统：基础镜像、版本矩阵、多阶段构建、训练/推理拆分、SBOM、漏洞治理、发布门禁、缓存预热和可观测性。只要
+Driver/CUDA/框架/引擎组合没有进入矩阵，镜像问题迟早会变成运行时事故。</p>
+<h2 id="18a16-练习题">18a.16 练习题</h2>
+<ol type="1">
+<li>你的团队有一个 <code>nvidia/cuda:12.4.1-devel</code>
+单阶段训练镜像，现在要改造成在线推理镜像。列出应该移除、保留、预构建和外置的内容。</li>
+<li>设计一张最小兼容矩阵，字段至少包含 Driver、CUDA、PyTorch、NCCL、GPU
+型号、基础镜像 digest 和支持状态。</li>
+<li>某服务在 A100 节点正常，在 H100 节点报
+<code>no kernel image is available for execution on the device</code>。请写出排障证据链和修复方案。</li>
+<li>一个 14GB 推理镜像扩容慢。请把冷启动拆成至少 5
+个阶段，并说明每个阶段如何观测。</li>
+<li>为什么不能靠在业务 Dockerfile 里安装 NVIDIA Driver 来解决 CUDA
+兼容问题？</li>
+<li>比较“模型权重打进镜像”和“模型权重外置缓存”两种方案的优缺点。什么时候可以接受前者？</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

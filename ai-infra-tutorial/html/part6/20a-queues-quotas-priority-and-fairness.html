@@ -1,0 +1,1189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 20a 章 · 队列、配额、优先级与公平调度 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=20a" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 20a 章 · 队列、配额、优先级与公平调度</h1>
+<p class="sub">用队列、配额、优先级、抢占和借用机制设计多租户 AI 平台公平性。</p>
+<div class="chips"><span class="chip">Queue</span><span class="chip">Quota</span><span class="chip">Priority</span><span class="chip">Fairness</span><span class="chip">Preemption</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#20a1-第一性原理拆解--学习大纲">20a.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#20a2-概念先说清楚">20a.2 概念先说清楚</a></li><li><a class="anchor" href="#20a3-架构关键组件路径与责任边界">20a.3
+架构：关键组件、路径与责任边界</a></li><li><a class="anchor" href="#20a4-原理这些机制为什么存在">20a.4 原理：这些机制为什么存在</a></li><li><a class="anchor" href="#20a5-volcanokueue-与原生-kubernetes-的边界">20a.5 Volcano、Kueue
+与原生 Kubernetes 的边界</a></li><li><a class="anchor" href="#20a6-工程化生产落地配置发布与治理">20a.6
+工程化：生产落地、配置、发布与治理</a></li><li><a class="anchor" href="#20a7-方案设计三层准入决策表">20a.7 方案设计：三层准入决策表</a></li><li><a class="anchor" href="#20a8-作业准入和恢复契约">20a.8 作业准入和恢复契约</a></li><li><a class="anchor" href="#20a9-故障排除症状证据根因动作">20a.9
+故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#20a10-反模式--checklist">20a.10 反模式 + Checklist</a></li><li><a class="anchor" href="#20a11-worked-example一次高峰中的准入借用和抢占">20a.11 Worked
+Example：一次高峰中的准入、借用和抢占</a></li><li><a class="anchor" href="#20a12-本章小结">20a.12 本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>队列不是“把任务排成一排”，而是把稀缺资源的分配规则产品化、可审计化、可恢复化。</p>
+</blockquote>
+<p>本章讨论 AI
+平台控制面里最容易被低估的一层：队列、配额、优先级、抢占与公平调度。它位于用户提交作业和
+Kubernetes 真正创建 Pod
+之间，负责回答一个很直接但很难答好的问题：<strong>谁现在有资格消耗资源，谁应该等待，谁可以借用，谁必须让路，以及让路之后如何恢复。</strong></p>
+<hr />
+<h2 id="20a1-第一性原理拆解--学习大纲">20a.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>AI 集群的资源分配不是一个单纯的“有空闲 GPU
+就启动”的问题。真实平台同时面对这些约束：</p>
+<ul>
+<li>资源稀缺：GPU、CPU、内存、本地盘、网络带宽都可能成为瓶颈。</li>
+<li>资源离散：一个 32 GPU 作业通常不能用分散在 32
+台机器上的单卡拼出来。</li>
+<li>租户竞争：线上、研究、评测、数据生成、教学和 notebook
+都想占用同一批卡。</li>
+<li>作业整体性：分布式训练如果只启动一半
+worker，通常没有有效训练进度。</li>
+<li>业务差异：线上紧急修复和低优先级实验不能同权。</li>
+<li>恢复成本：抢占一个没有 checkpoint 的训练任务，可能浪费几百
+GPU-hour。</li>
+<li>组织治理：平台需要解释为什么某个团队可以用、为什么另一个团队要等。</li>
+</ul>
+<p>所以队列层的不可化简问题是：</p>
+<p><strong>在多租户、多资源、多优先级、可抢占和不可抢占作业并存时，平台如何把资源分配决策变成可预测、可审计、可恢复的准入过程。</strong></p>
+<h3 id="推从问题推导机制">推：从问题推导机制</h3>
+<p>从“提交到达是随机的”推出队列。</p>
+<p>从“强势租户会自然挤占弱势租户”推出配额。</p>
+<p>从“生产服务、紧急修复和普通实验不能同权”推出优先级。</p>
+<p>从“资源已经满载时，高优先级不能只停留在标签上”推出抢占。</p>
+<p>从“只按 GPU 数公平会忽略 CPU、内存、本地盘和网络”推出 DRF。</p>
+<p>从“分布式训练要么整体启动，要么不要占卡空等”推出 gang
+scheduling。</p>
+<p>从“保底不能让空闲资源浪费”推出 borrow / lend。</p>
+<p>从“被抢占后要能继续工作”推出作业准入和恢复契约。</p>
+<h3 id="绘队列层因果链路">绘：队列层因果链路</h3>
+<pre class="mermaid">flowchart TD
+  A[用户提交作业] --&gt; B[解析租户 队列 优先级 资源形状]
+  B --&gt; C[准入校验: 身份 预算 策略]
+  C --&gt; D{队列配额是否允许?}
+  D --&gt;|否| E[等待: quota blocked]
+  D --&gt;|是| F{是否需要借用?}
+  F --&gt;|是| G[检查 lending pool 和 borrowing limit]
+  F --&gt;|否| H[进入候选集]
+  G --&gt; H
+  H --&gt; I{Gang 条件是否满足?}
+  I --&gt;|否| J[等待完整资源形状]
+  I --&gt;|是| K[按优先级 DRF 等待时长排序]
+  K --&gt; L{需要抢占吗?}
+  L --&gt;|否| M[准入运行]
+  L --&gt;|是| N[选择可抢占 victims]
+  N --&gt; O{恢复契约满足?}
+  O --&gt;|否| P[继续等待或降级]
+  O --&gt;|是| Q[发出抢占 通知 恢复计划]
+  Q --&gt; M</pre>
+<h3 id="学习大纲">学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>队列、配额、优先级和抢占分别解决什么问题。</li>
+<li>为什么优先级不能替代配额，配额也不能替代优先级。</li>
+<li>DRF 为什么比“按 GPU 数公平”更适合 AI 平台。</li>
+<li>borrow / lend 如何在保底和利用率之间折中。</li>
+<li>gang scheduling 为什么是训练、Ray、MPI、批推理的基本语义。</li>
+<li>Volcano 和 Kueue 分别把调度责任放在哪里。</li>
+<li>多租户平台如何定义作业准入和恢复契约。</li>
+<li>如何从 event、队列状态和审计日志解释一次 Pending 或抢占。</li>
+</ol>
+<hr />
+<h2 id="20a2-概念先说清楚">20a.2 概念先说清楚</h2>
+<h3 id="队列是什么不是什么">队列是什么，不是什么</h3>
+<p>队列是作业进入运行态之前的治理边界。它记录等待中的工作负载，并按租户、优先级、配额、资源形状、等待时间、可恢复性和策略约束决定谁先被准入。</p>
+<p>队列不是简单 FIFO。FIFO
+只能表达“谁先来”，不能表达“谁有保底”“谁是紧急生产修复”“谁能被抢占”“谁需要同节点
+8 卡”“谁已经借用了别人容量”。</p>
+<h3 id="配额是什么不是什么">配额是什么，不是什么</h3>
+<p>配额是平台给租户或队列定义的资源权利边界。它至少应表达三类语义：</p>
+<ul>
+<li>保底：资源紧张时，租户应该至少能获得多少。</li>
+<li>上限：无论优先级多高，租户最多不能超过多少。</li>
+<li>借用：别人不用时，是否能临时使用更多资源。</li>
+</ul>
+<p>配额不是单纯限制。一个只有限制、不能借用的配额系统会让集群在 A
+团队空闲时仍然拒绝 B 团队作业，利用率和体验都会很差。</p>
+<h3 id="优先级是什么不是什么">优先级是什么，不是什么</h3>
+<p>优先级表达业务重要性。它回答“资源冲突时谁更重要”。优先级常用于线上修复、故障恢复、重要实验窗口、发布验证和普通探索之间的排序。</p>
+<p>优先级不是无限通行证。高优先级仍应受 hard
+cap、预算、租户策略、资源形状和恢复契约约束。否则一个高优先级队列会吃掉整个集群，让平台失去多租户公平。</p>
+<h3 id="抢占是什么不是什么">抢占是什么，不是什么</h3>
+<p>抢占是在资源已被占用时，为更高价值工作负载回收资源的机制。抢占通常会终止、驱逐或暂停低优先级任务，让高优先级任务获得可运行资源。</p>
+<p>抢占不是免费操作。它会带来 checkpoint
+恢复、数据重读、缓存丢失、训练重算、用户通知、成本归因和 SLA
+解释。没有恢复契约的抢占，经常只是把 GPU
+利用率问题转化成训练浪费问题。</p>
+<h3 id="drf-是什么不是什么">DRF 是什么，不是什么</h3>
+<p>DRF（Dominant Resource
+Fairness）是一种多资源公平方法。它比较每个租户在“占比最高的那类资源”上的使用份额，而不是只看某一种资源。</p>
+<p>DRF
+不是业务优先级系统。它解决公平计算，不解决业务价值排序。生产队列可以有更高权重，但权重必须显式、可审计，并且不能掩盖
+request 造假或资源画像错误。</p>
+<h3 id="gang-scheduling-是什么不是什么">Gang scheduling
+是什么，不是什么</h3>
+<p>Gang scheduling 表达“一组 Pod 必须作为一个整体被准入”。如果一个 8
+worker 分布式训练作业只启动了 5 个 worker，已经启动的 5 个 worker
+可能只是在 rendezvous 阶段空等。</p>
+<p>Gang scheduling
+不是加速器。它经常会让作业等更久，但能避免半启动造成的资源浪费和错误状态。</p>
+<h3 id="相邻概念边界">相邻概念边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>回答的问题</th>
+<th>不负责的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td>谁在等待，按什么规则进入候选集</td>
+<td>单张 GPU 如何切分</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td>租户的保底、上限、借用边界</td>
+<td>某个模型是否值得训练</td>
+</tr>
+<tr>
+<td>Priority</td>
+<td>冲突时谁更重要</td>
+<td>是否具备正确 GPU 形状</td>
+</tr>
+<tr>
+<td>Preemption</td>
+<td>是否可以回收低价值占用</td>
+<td>应用如何写 checkpoint</td>
+</tr>
+<tr>
+<td>DRF</td>
+<td>多资源占用是否公平</td>
+<td>业务是否重要</td>
+</tr>
+<tr>
+<td>Gang scheduling</td>
+<td>一组 Pod 是否整体启动</td>
+<td>节点内拓扑是否最快</td>
+</tr>
+<tr>
+<td>Autoscaling</td>
+<td>是否改变副本或节点规模</td>
+<td>已有资源如何公平分配</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20a3-架构关键组件路径与责任边界">20a.3
+架构：关键组件、路径与责任边界</h2>
+<h3 id="关键组件">关键组件</h3>
+<pre class="mermaid">flowchart TB
+  User[用户 / CI / 平台 API] --&gt; Submit[作业提交层]
+  Submit --&gt; Admission[多租户准入控制]
+  Admission --&gt; Queue[队列控制器]
+  Queue --&gt; Quota[配额与借用控制器]
+  Queue --&gt; Fairness[公平排序 DRF / Weight / Age]
+  Queue --&gt; Gang[Gang / PodGroup / JobSet]
+  Queue --&gt; Preempt[抢占控制器]
+  Preempt --&gt; Recovery[恢复契约与通知]
+  Queue --&gt; Workload[Workload / Job / PodGroup]
+  Workload --&gt; Scheduler[Kubernetes / Volcano Scheduler]
+  Scheduler --&gt; Kubelet[Kubelet]
+  Kubelet --&gt; GPU[GPU 节点]
+  Queue --&gt; Audit[事件 审计 指标]</pre>
+<h3 id="控制路径">控制路径</h3>
+<ol type="1">
+<li>用户通过平台、CLI、CI 或 API 提交作业。</li>
+<li>准入层解析租户、项目、预算、镜像、资源
+request、优先级和作业类型。</li>
+<li>队列层把作业放入 LocalQueue、Queue 或等价对象。</li>
+<li>配额层检查 nominal quota、hard cap、borrow limit 和当前使用量。</li>
+<li>公平层根据优先级、DRF、权重、等待时间和作业大小排序。</li>
+<li>Gang 层检查 <code>minAvailable</code>、PodGroup、JobSet 或训练框架
+worker 数是否能整体满足。</li>
+<li>若资源不足，抢占层选择可抢占对象，并检查 checkpoint、PDB、grace
+period 和恢复策略。</li>
+<li>作业被准入后，控制器创建或放行 Pod，进入 Kubernetes 或 Volcano
+调度路径。</li>
+<li>所有决策写入 event、metrics、audit log 和用户可见状态。</li>
+</ol>
+<h3 id="数据路径">数据路径</h3>
+<p>队列层通常不直接处理训练数据，但它会影响数据路径：</p>
+<ul>
+<li>抢占会导致 checkpoint 写入和读取。</li>
+<li>等待过久会让缓存、预热镜像和临时数据失效。</li>
+<li>作业重启可能改变节点位置，影响数据本地性、NCCL 和远端存储压力。</li>
+<li>gang 准入会决定所有 worker 是否同时进入 rendezvous。</li>
+</ul>
+<p>因此队列层不能只看资源数量，还要理解作业恢复、缓存、数据读写和训练阶段。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>负责什么</th>
+<th>不负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平台提交层</td>
+<td>身份、租户、项目、预算、作业模板</td>
+<td>实际设备分配</td>
+</tr>
+<tr>
+<td>队列层</td>
+<td>等待、准入、公平、配额、借用</td>
+<td>CUDA 性能调优</td>
+</tr>
+<tr>
+<td>抢占层</td>
+<td>victim 选择、通知、恢复契约</td>
+<td>应用内部 checkpoint 实现</td>
+</tr>
+<tr>
+<td>调度器</td>
+<td>节点选择、Pod 调度、插件策略</td>
+<td>组织预算和业务价值判断</td>
+</tr>
+<tr>
+<td>训练框架</td>
+<td>rendezvous、checkpoint、容错</td>
+<td>租户公平</td>
+</tr>
+<tr>
+<td>观测系统</td>
+<td>原因解释、审计、趋势分析</td>
+<td>自动替代治理决策</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20a4-原理这些机制为什么存在">20a.4 原理：这些机制为什么存在</h2>
+<h3 id="fifo-为什么不够">FIFO 为什么不够</h3>
+<p>FIFO 对低成本任务有吸引力，因为它简单。但 AI 平台中 FIFO
+会迅速失效：</p>
+<ul>
+<li>一个 256 GPU 长作业可能堵住后面大量 1 GPU 短作业。</li>
+<li>先提交的大租户会自然占据资源，小租户只能等待。</li>
+<li>线上修复可能排在普通实验后面。</li>
+<li>半启动的 gang 作业会占着卡不产生进度。</li>
+<li>只按提交时间排序无法表达借用和回收。</li>
+</ul>
+<p>因此成熟队列通常是多因素排序：<code>priority + quota + fairness + age + size + preemptibility + resource shape</code>。</p>
+<h3
+id="配额为什么要分保底上限和借用">配额为什么要分保底、上限和借用</h3>
+<p>只设置保底会浪费资源。只设置上限会让租户缺少确定性。只设置借用会让资源紧张时争议很大。生产可用的配额模型通常需要三件事同时存在：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nominal quota</td>
+<td>名义配额或保底</td>
+<td>定义正常情况下的资源权利</td>
+</tr>
+<tr>
+<td>hard cap</td>
+<td>绝对上限</td>
+<td>防止一个租户无限扩张</td>
+</tr>
+<tr>
+<td>borrowing limit</td>
+<td>可借用上限</td>
+<td>提高闲时利用率</td>
+</tr>
+</tbody>
+</table>
+<p>borrow / lend
+的核心规则是：<strong>借来的资源必须能被收回，并且收回时要有明确顺序、通知和恢复语义。</strong></p>
+<h3 id="drf-如何工作">DRF 如何工作</h3>
+<p>假设集群有 100 GPU、1000 vCPU、2000GB 内存：</p>
+<table>
+<thead>
+<tr>
+<th>队列</th>
+<th>GPU</th>
+<th>CPU</th>
+<th>内存</th>
+<th>GPU share</th>
+<th>CPU share</th>
+<th>内存 share</th>
+<th>Dominant share</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>online</td>
+<td>20</td>
+<td>120</td>
+<td>300GB</td>
+<td>20%</td>
+<td>12%</td>
+<td>15%</td>
+<td>20%</td>
+</tr>
+<tr>
+<td>research</td>
+<td>35</td>
+<td>180</td>
+<td>400GB</td>
+<td>35%</td>
+<td>18%</td>
+<td>20%</td>
+<td>35%</td>
+</tr>
+<tr>
+<td>data</td>
+<td>5</td>
+<td>420</td>
+<td>600GB</td>
+<td>5%</td>
+<td>42%</td>
+<td>30%</td>
+<td>42%</td>
+</tr>
+</tbody>
+</table>
+<p>只看 GPU，<code>data</code> 看起来很节省；但它已经占用了 42% CPU。DRF
+会把 <code>data</code> 的 dominant share 视为 42%，提醒平台继续给它
+CPU-heavy 作业会加剧不公平。</p>
+<p>带权重 DRF 常用公式是：</p>
+<pre class="text"><code>effective_share = dominant_share / weight</code></pre>
+<p>生产队列权重为 2 时，20% dominant share 会变成 10% effective
+share。这样生产更容易获得资源，但仍然是显式策略，不是无上限插队。</p>
+<p>DRF 的工程前提是 request 可信。用户低报
+CPU、内存、临时盘或显存需求，会让公平计算失真。平台需要通过历史画像、LimitRange、ResourceQuota、运行时采样和
+chargeback 修正。</p>
+<h3 id="抢占为什么必须绑定恢复契约">抢占为什么必须绑定恢复契约</h3>
+<p>抢占的价值来自“释放资源给更重要的任务”。但如果低优先级训练完全不能恢复，抢占会造成巨大浪费。一个合格的抢占决策至少需要这些输入：</p>
+<ul>
+<li>作业是否声明 <code>preemptible: true</code>。</li>
+<li>最近 checkpoint 时间和 checkpoint 可读性。</li>
+<li>预计恢复耗时。</li>
+<li>已运行时间和已消耗 GPU-hour。</li>
+<li>是否处于不可中断阶段，例如评测、保存、通信初始化。</li>
+<li>PodDisruptionBudget、terminationGracePeriod
+和框架信号处理能力。</li>
+<li>被抢占后的重入队优先级和补偿策略。</li>
+</ul>
+<p>抢占不是“杀掉低优先级 Pod”，而是“执行一份可解释的资源回收协议”。</p>
+<h3 id="gang-scheduling-的底层语义">Gang scheduling 的底层语义</h3>
+<p>Gang scheduling 需要调度器或队列控制器先判断整组 Pod
+是否满足最小可用条件，再允许它们运行。常见表达包括：</p>
+<ul>
+<li>Volcano PodGroup 的 <code>minMember</code> /
+<code>minResources</code>。</li>
+<li>Kueue Workload 对 Job、JobSet、RayJob 等工作负载的准入。</li>
+<li>Kubernetes JobSet / Indexed Job 提供稳定 worker 身份。</li>
+<li>MPI、Ray、PyTorch Elastic 等框架的 rendezvous 和 worker
+数约束。</li>
+</ul>
+<p>Gang 的本质是把“Pod
+级可运行”提升为“作业级可运行”。这对分布式训练特别重要。</p>
+<hr />
+<h2 id="20a5-volcanokueue-与原生-kubernetes-的边界">20a.5 Volcano、Kueue
+与原生 Kubernetes 的边界</h2>
+<h3 id="原生-kubernetes">原生 Kubernetes</h3>
+<p>原生 Kubernetes 有
+PriorityClass、ResourceQuota、PodDisruptionBudget、scheduler
+framework、Job、Indexed Job 等能力，但它默认的资源视角仍以 Pod
+为中心。它不天然提供完整的多租户队列、borrow / lend、作业级配额准入和
+batch gang 语义。</p>
+<h3 id="volcano">Volcano</h3>
+<p>Volcano 更像一个批调度器。它直接参与 Pod 调度，适合 HPC、AI
+训练、MPI、Spark、Ray 等需要 gang、preempt、backfill、binpack
+的批任务。</p>
+<p>常见对象和能力：</p>
+<ul>
+<li>Queue：队列和资源权重。</li>
+<li>PodGroup：一组 Pod 的整体调度语义。</li>
+<li>VolcanoJob：批任务抽象。</li>
+<li>Scheduler plugins：gang、priority、drf、proportion、binpack、preempt
+等。</li>
+</ul>
+<p>Volcano 的优势是调度动作直接，适合需要强 gang
+语义的训练平台。代价是它会成为调度路径中的关键组件，需要明确与
+kube-scheduler、平台 API 和作业控制器的责任边界。</p>
+<h3 id="kueue">Kueue</h3>
+<p>Kueue 更像一个批任务准入控制器。它不替代所有调度动作，而是在 Workload
+创建或运行前决定是否准入，并为其分配 ResourceFlavor 和 quota。</p>
+<p>常见对象和能力：</p>
+<ul>
+<li>LocalQueue：命名空间内用户提交入口。</li>
+<li>ClusterQueue：跨命名空间资源池和配额边界。</li>
+<li>ResourceFlavor：不同资源形状，例如 H100、A100、spot、MIG
+profile。</li>
+<li>Workload：被准入或等待的作业抽象。</li>
+<li>cohort：多个 ClusterQueue 之间共享和借用资源。</li>
+</ul>
+<p>Kueue 的优势是适合 Kubernetes 原生 batch、多团队 quota、borrow / lend
+和准入治理。它不负责训练框架的 checkpoint，也不替平台决定业务价值。</p>
+<h3 id="选择建议">选择建议</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>更倾向</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>强 gang 训练、MPI、HPC 风格批调度</td>
+<td>Volcano</td>
+<td>调度器直接表达 gang 和 batch 插件</td>
+</tr>
+<tr>
+<td>多团队 Kubernetes batch 准入、quota、ResourceFlavor</td>
+<td>Kueue</td>
+<td>准入边界清晰，适合平台治理</td>
+</tr>
+<tr>
+<td>简单单租户 GPU Job</td>
+<td>原生 Kubernetes</td>
+<td>复杂队列可能不是第一优先级</td>
+</tr>
+<tr>
+<td>需要 borrow / lend 和跨队列公平</td>
+<td>Kueue 或 Volcano + 平台层</td>
+<td>原生 ResourceQuota 不够表达借用</td>
+</tr>
+<tr>
+<td>训练平台同时需要强 gang 与组织配额</td>
+<td>组合设计</td>
+<td>用一个系统做准入，另一个系统做调度时要避免双重决策冲突</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20a6-工程化生产落地配置发布与治理">20a.6
+工程化：生产落地、配置、发布与治理</h2>
+<h3 id="多租户准入字段">多租户准入字段</h3>
+<p>平台提交作业时，至少应该生成或校验这些字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tenant / project</td>
+<td>成本归因、配额、审计</td>
+</tr>
+<tr>
+<td>queue</td>
+<td>进入哪个等待和准入域</td>
+</tr>
+<tr>
+<td>priorityClass</td>
+<td>冲突时排序</td>
+</tr>
+<tr>
+<td>resource request</td>
+<td>GPU、CPU、内存、本地盘、网络需求</td>
+</tr>
+<tr>
+<td>resource flavor</td>
+<td>H100、A100、L40S、MIG profile、spot 等</td>
+</tr>
+<tr>
+<td>gang size</td>
+<td><code>minAvailable</code>、worker 数、rank 数</td>
+</tr>
+<tr>
+<td>preemptible</td>
+<td>是否可抢占</td>
+</tr>
+<tr>
+<td>checkpoint policy</td>
+<td>checkpoint 频率、路径、最近成功时间</td>
+</tr>
+<tr>
+<td>max runtime</td>
+<td>防止借用作业无限占用</td>
+</tr>
+<tr>
+<td>retry policy</td>
+<td>被抢占、失败、节点故障后的恢复方式</td>
+</tr>
+</tbody>
+</table>
+<h3 id="配置示例抽象队列策略">配置示例：抽象队列策略</h3>
+<p>下面示例是平台策略的抽象表达，不绑定某个具体 API 版本：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">queues</span><span class="kw">:</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">online</span><span class="kw">:</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nominalQuota</span><span class="kw">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">hardCap</span><span class="kw">:</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">48</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">priorityWeight</span><span class="kw">:</span><span class="at"> </span><span class="fl">2.0</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">borrowingLimit</span><span class="kw">:</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preemption</span><span class="kw">:</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">canBePreempted</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">canPreempt</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;batch&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;research-borrowed&quot;</span><span class="kw">]</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">research</span><span class="kw">:</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nominalQuota</span><span class="kw">:</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">64</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">800</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 2Ti</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">hardCap</span><span class="kw">:</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">96</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">borrowingLimit</span><span class="kw">:</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gang</span><span class="kw">:</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">requiredForGpuCountAtLeast</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preemption</span><span class="kw">:</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">canBePreempted</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">requireCheckpointYoungerThan</span><span class="kw">:</span><span class="at"> 30m</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">batch</span><span class="kw">:</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nominalQuota</span><span class="kw">:</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">l40s</span><span class="kw">:</span><span class="at"> </span><span class="dv">64</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">borrowingLimit</span><span class="kw">:</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">h100-80gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">maxRuntime</span><span class="kw">:</span><span class="at"> 12h</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preemption</span><span class="kw">:</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">canBePreempted</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">gracePeriod</span><span class="kw">:</span><span class="at"> 120s</span></span></code></pre></div>
+<h3 id="版本矩阵与兼容性">版本矩阵与兼容性</h3>
+<p>队列系统会触碰 Kubernetes
+API、CRD、调度器和作业控制器，升级前要维护版本矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>需要确认</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes</td>
+<td>scheduler framework、PriorityClass、PDB、JobSet、CRD 版本</td>
+</tr>
+<tr>
+<td>Volcano</td>
+<td>scheduler 插件、PodGroup API、Queue API、与 kube-scheduler
+共存方式</td>
+</tr>
+<tr>
+<td>Kueue</td>
+<td>Workload、ClusterQueue、ResourceFlavor、cohort、支持的 Job 类型</td>
+</tr>
+<tr>
+<td>Kubeflow / Ray / Spark / MPI</td>
+<td>是否能被 Kueue/Volcano 正确识别和准入</td>
+</tr>
+<tr>
+<td>GPU Operator / device plugin</td>
+<td>资源名是否与 ResourceFlavor、quota 一致</td>
+</tr>
+<tr>
+<td>训练框架</td>
+<td>checkpoint、elastic、signal handling、rank 稳定性</td>
+</tr>
+</tbody>
+</table>
+<h3 id="发布路径">发布路径</h3>
+<p>队列策略不能一次性全量切换。推荐发布顺序：</p>
+<ol type="1">
+<li>只观察：接入事件和指标，不改变准入结果。</li>
+<li>影子计算：并行计算新策略决策，与旧策略对比。</li>
+<li>小队列试点：选择一个低风险 batch 队列启用。</li>
+<li>只限新作业：不迁移已运行作业。</li>
+<li>启用借用：先允许借用，再启用回收。</li>
+<li>启用抢占：先抢占明确 preemptible 且 checkpoint 新鲜的任务。</li>
+<li>扩展到生产：建立回滚开关和人工 override。</li>
+</ol>
+<h3 id="观测指标">观测指标</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>queue wait time p50/p95/p99</td>
+<td>用户等待体验</td>
+</tr>
+<tr>
+<td>admitted workloads</td>
+<td>准入吞吐</td>
+</tr>
+<tr>
+<td>quota used / nominal / borrowed</td>
+<td>保底和借用状态</td>
+</tr>
+<tr>
+<td>dominant share by queue</td>
+<td>多资源公平状态</td>
+</tr>
+<tr>
+<td>preemption count and reason</td>
+<td>抢占频率和原因</td>
+</tr>
+<tr>
+<td>checkpoint age at preemption</td>
+<td>抢占是否安全</td>
+</tr>
+<tr>
+<td>gang pending reason</td>
+<td>是否缺完整形状</td>
+</tr>
+<tr>
+<td>rejected workload count</td>
+<td>准入策略拒绝情况</td>
+</tr>
+<tr>
+<td>time to recovery after preemption</td>
+<td>被抢占后的恢复质量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="治理规则">治理规则</h3>
+<p>生产平台应把这些规则写成制度，而不是只放在代码里：</p>
+<ul>
+<li>谁可以创建高优先级作业。</li>
+<li>谁可以修改 hard cap 和 borrowing limit。</li>
+<li>抢占是否需要业务审批。</li>
+<li>借用资源的最大运行时间。</li>
+<li>被抢占任务是否有补偿优先级。</li>
+<li>资源账单按 nominal、borrowed 还是 actual usage 计费。</li>
+<li>异常情况下谁有权执行 emergency override。</li>
+</ul>
+<hr />
+<h2 id="20a7-方案设计三层准入决策表">20a.7 方案设计：三层准入决策表</h2>
+<p>一个可执行的队列设计可以分成三层：准入、排序、回收。</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>决策问题</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>准入</td>
+<td>这个作业是否允许进入队列</td>
+<td>身份、预算、镜像、资源 request、queue</td>
+<td>accepted / rejected</td>
+</tr>
+<tr>
+<td>排序</td>
+<td>等待作业中谁应该先跑</td>
+<td>priority、DRF、age、gang size、quota</td>
+<td>candidate list</td>
+</tr>
+<tr>
+<td>回收</td>
+<td>为候选作业释放哪些资源</td>
+<td>preemptible、checkpoint、borrowed usage、PDB</td>
+<td>victim list / no action</td>
+</tr>
+</tbody>
+</table>
+<h3 id="设计方案多租户训练集群">设计方案：多租户训练集群</h3>
+<p>假设有 128 张 H100 80GB，三个队列：</p>
+<table>
+<thead>
+<tr>
+<th>队列</th>
+<th>工作负载</th>
+<th>nominal</th>
+<th>hard cap</th>
+<th>借用</th>
+<th>抢占规则</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>online</td>
+<td>在线推理、紧急修复</td>
+<td>32</td>
+<td>48</td>
+<td>8</td>
+<td>不被抢占，可抢占 batch</td>
+</tr>
+<tr>
+<td>research</td>
+<td>8/16/32 卡训练</td>
+<td>64</td>
+<td>96</td>
+<td>32</td>
+<td>可被抢占借用部分，要求 30 分钟内 checkpoint</td>
+</tr>
+<tr>
+<td>batch</td>
+<td>评测、数据生成、低优先级任务</td>
+<td>16</td>
+<td>64</td>
+<td>48</td>
+<td>总是可抢占，最大运行 12 小时</td>
+</tr>
+</tbody>
+</table>
+<p>决策规则：</p>
+<ol type="1">
+<li>4 GPU 及以上训练必须声明 gang size。</li>
+<li><code>online</code> 高优先级但受 hard cap 限制。</li>
+<li><code>research</code> 可借用 <code>batch</code>
+空闲容量，但借用部分优先被回收。</li>
+<li><code>batch</code>
+可填充碎片资源，但必须声明可抢占和最大运行时间。</li>
+<li>抢占顺序：<code>batch borrowed -&gt; batch nominal -&gt; research borrowed -&gt; research nominal</code>。</li>
+<li>不抢占没有成功 checkpoint 的 research 作业，除非进入人工 emergency
+模式。</li>
+<li>被抢占作业恢复后保留原提交时间，并增加一次 aging
+boost，避免反复饥饿。</li>
+</ol>
+<h3 id="准入伪代码">准入伪代码</h3>
+<pre class="text"><code>for workload in pending_workloads:
+  validate_identity_budget_policy(workload)
+  queue = resolve_queue(workload)
+  flavor = resolve_resource_flavor(workload)
+
+  if exceeds_hard_cap(queue, workload, flavor):
+    mark(workload, &quot;blocked: hard cap&quot;)
+    continue
+
+  if within_nominal_quota(queue, workload, flavor):
+    add_candidate(workload)
+    continue
+
+  if can_borrow(queue, workload, flavor):
+    add_candidate(workload, borrowed=true)
+    continue
+
+  mark(workload, &quot;blocked: quota&quot;)
+
+sort candidates by priority, weighted_drf, age, fit_score
+
+for candidate in candidates:
+  if gang_not_satisfied(candidate):
+    mark(candidate, &quot;blocked: gang resources unavailable&quot;)
+    continue
+  if resources_available(candidate):
+    admit(candidate)
+  else:
+    victims = find_preemptible_victims(candidate)
+    if recovery_contract_ok(victims):
+      preempt(victims)
+      admit(candidate)</code></pre>
+<hr />
+<h2 id="20a8-作业准入和恢复契约">20a.8 作业准入和恢复契约</h2>
+<h3 id="为什么要有契约">为什么要有契约</h3>
+<p>队列系统最容易引发争议的地方不是等待，而是不透明等待和不可恢复抢占。平台应在作业进入队列时明确契约，让用户知道：</p>
+<ul>
+<li>这个作业可能等多久。</li>
+<li>等待原因是什么。</li>
+<li>是否可能被抢占。</li>
+<li>被抢占前是否会收到信号。</li>
+<li>需要怎样的 checkpoint 才能获得更高准入优先级。</li>
+<li>恢复失败时由谁负责。</li>
+</ul>
+<h3 id="契约字段">契约字段</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>示例</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>preemptible</code></td>
+<td><code>true</code></td>
+<td>是否允许平台回收</td>
+</tr>
+<tr>
+<td><code>checkpoint.path</code></td>
+<td><code>s3://ckpt/job-123/</code></td>
+<td>恢复位置</td>
+</tr>
+<tr>
+<td><code>checkpoint.interval</code></td>
+<td><code>15m</code></td>
+<td>期望保存周期</td>
+</tr>
+<tr>
+<td><code>checkpoint.maxAge</code></td>
+<td><code>30m</code></td>
+<td>超过后视为不可安全抢占</td>
+</tr>
+<tr>
+<td><code>terminationGracePeriod</code></td>
+<td><code>120s</code></td>
+<td>收到信号后的保存窗口</td>
+</tr>
+<tr>
+<td><code>resumePolicy</code></td>
+<td><code>same-rank</code> / <code>elastic</code></td>
+<td>恢复是否要求稳定 rank</td>
+</tr>
+<tr>
+<td><code>maxRetries</code></td>
+<td><code>5</code></td>
+<td>抢占或失败后的重试上限</td>
+</tr>
+<tr>
+<td><code>requeuePolicy</code></td>
+<td><code>keep-age</code></td>
+<td>恢复时是否保留等待年龄</td>
+</tr>
+</tbody>
+</table>
+<h3 id="恢复失败的责任边界">恢复失败的责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>平台负责</th>
+<th>应用负责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>没有发送终止信号</td>
+<td>是</td>
+<td>否</td>
+</tr>
+<tr>
+<td>checkpoint 路径不可写</td>
+<td>准入校验和权限提示</td>
+<td>正确配置路径</td>
+</tr>
+<tr>
+<td>checkpoint 文件损坏</td>
+<td>存储和审计证据</td>
+<td>写入一致性</td>
+</tr>
+<tr>
+<td>rank 变化导致恢复失败</td>
+<td>提供稳定身份能力</td>
+<td>支持 elastic 或声明限制</td>
+</tr>
+<tr>
+<td>被反复抢占</td>
+<td>调整抢占和 aging 策略</td>
+<td>声明不可抢占或提高 checkpoint 频率</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20a9-故障排除症状证据根因动作">20a.9
+故障排除：症状、证据、根因、动作</h2>
+<p>排障顺序建议：先判断是否被队列准入卡住，再判断是否缺资源形状，最后才看单个
+Pod 调度事件。</p>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>作业长时间 <code>quota blocked</code></td>
+<td>ClusterQueue 使用量、nominal/hard cap、borrowed</td>
+<td>队列达到上限，或 borrowing 被禁用</td>
+<td>调整借用、扩容配额、提示等待 ETA</td>
+</tr>
+<tr>
+<td>高优先级作业仍 Pending</td>
+<td>priority、可抢占对象、PDB、checkpoint age</td>
+<td>没有可安全抢占对象，或资源形状不匹配</td>
+<td>放宽 victim 范围、等待 checkpoint、转查 20b</td>
+</tr>
+<tr>
+<td>低优先级队列长期饥饿</td>
+<td>DRF share、admission history、preemption history</td>
+<td>高优先级持续借用，缺少 aging 或保底</td>
+<td>设置最小保底、aging boost、借用冷却</td>
+</tr>
+<tr>
+<td>Gang 作业不启动</td>
+<td>PodGroup/Workload 状态、<code>minAvailable</code>、节点空闲形状</td>
+<td>总量够但完整形状不够</td>
+<td>compact 小作业、调整池、降低规模</td>
+</tr>
+<tr>
+<td>作业被抢占后没恢复</td>
+<td>event、训练日志、checkpoint 列表、重试状态</td>
+<td>checkpoint 缺失、rank 变化、权限错误</td>
+<td>修复恢复契约，重新入队，限制抢占</td>
+</tr>
+<tr>
+<td>用户质疑公平性</td>
+<td>审计日志、dominant share、quota 使用曲线</td>
+<td>规则不可见或 request 不可信</td>
+<td>展示解释页面，修正画像和 chargeback</td>
+</tr>
+<tr>
+<td>队列吞吐突然下降</td>
+<td>控制器日志、API latency、CRD reconcile 指标</td>
+<td>队列控制器故障或 API 压力</td>
+<td>降级到只准入模式，扩控制器，限流</td>
+</tr>
+</tbody>
+</table>
+<h3 id="排障命令思路">排障命令思路</h3>
+<p>实际命令取决于使用 Volcano、Kueue
+还是自研控制器，但证据类型类似：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe workload <span class="op">&lt;</span>name<span class="op">&gt;</span> -n <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe clusterqueue <span class="op">&lt;</span>name<span class="op">&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe localqueue <span class="op">&lt;</span>name<span class="op">&gt;</span> -n <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get podgroup <span class="at">-A</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> --sort-by=.lastTimestamp</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> top pods <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span></span></code></pre></div>
+<p>关键不是记住命令，而是把状态拆成四类：<code>rejected</code>、<code>quota blocked</code>、<code>shape blocked</code>、<code>admitted but unscheduled</code>。</p>
+<hr />
+<h2 id="20a10-反模式--checklist">20a.10 反模式 + Checklist</h2>
+<h3 id="常见反模式">常见反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>现象</th>
+<th>修复方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只有 FIFO</td>
+<td>长作业堵住短作业，生产修复排队</td>
+<td>加入配额、优先级、backfill</td>
+</tr>
+<tr>
+<td>高优先级无上限</td>
+<td>一个队列吃光全池</td>
+<td>优先级受 hard cap 和预算约束</td>
+</tr>
+<tr>
+<td>抢占无 checkpoint</td>
+<td>训练反复重跑，GPU-hour 浪费</td>
+<td>抢占前校验恢复契约</td>
+</tr>
+<tr>
+<td>配额不能借用</td>
+<td>A 队列空闲，B 队列排爆</td>
+<td>nominal + borrowing + 回收规则</td>
+</tr>
+<tr>
+<td>只按 GPU 公平</td>
+<td>CPU、内存或本地盘先被吃光</td>
+<td>引入 DRF 和资源画像</td>
+</tr>
+<tr>
+<td>gang 作业拆成普通 Pod</td>
+<td>worker 占卡空等 rendezvous</td>
+<td>使用 PodGroup、JobSet 或 Workload 准入</td>
+</tr>
+<tr>
+<td>规则只在代码里</td>
+<td>用户不知道为什么 Pending</td>
+<td>暴露事件、原因、审计和解释页</td>
+</tr>
+<tr>
+<td>所有抢占同等处理</td>
+<td>大作业反复被杀，小作业填满</td>
+<td>victim 选择考虑成本、年龄和恢复</td>
+</tr>
+</tbody>
+</table>
+<h3 id="checklist">Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />每个作业都有
+tenant、queue、priority、resource flavor。</label></li>
+<li><label><input type="checkbox" />配额同时包含 nominal、hard
+cap、borrowing limit。</label></li>
+<li><label><input type="checkbox" />4 GPU 及以上训练声明 gang
+size。</label></li>
+<li><label><input type="checkbox" />高优先级队列仍受 hard cap
+控制。</label></li>
+<li><label><input type="checkbox" />可抢占作业声明 checkpoint
+路径和恢复策略。</label></li>
+<li><label><input type="checkbox" />抢占事件对用户可见，并包含
+victim、原因和恢复计划。</label></li>
+<li><label><input type="checkbox" />DRF 至少覆盖
+GPU、CPU、内存，必要时覆盖本地盘和网络。</label></li>
+<li><label><input
+type="checkbox" />队列等待、借用、抢占、恢复都有指标和审计。</label></li>
+<li><label><input
+type="checkbox" />发布新策略前做影子计算和小队列试点。</label></li>
+<li><label><input type="checkbox" />有 emergency
+override，但有审批和审计。</label></li>
+</ul>
+<hr />
+<h2 id="20a11-worked-example一次高峰中的准入借用和抢占">20a.11 Worked
+Example：一次高峰中的准入、借用和抢占</h2>
+<h3 id="背景">背景</h3>
+<p>某平台有 128 张 H100，当前状态：</p>
+<table>
+<thead>
+<tr>
+<th>队列</th>
+<th>nominal</th>
+<th>当前使用</th>
+<th>其中借用</th>
+<th>待运行作业</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>online</td>
+<td>32</td>
+<td>28</td>
+<td>0</td>
+<td>需要扩到 44</td>
+</tr>
+<tr>
+<td>research</td>
+<td>64</td>
+<td>76</td>
+<td>12</td>
+<td>一个 16 GPU 训练，一个 8 GPU 训练</td>
+</tr>
+<tr>
+<td>batch</td>
+<td>16</td>
+<td>24</td>
+<td>8</td>
+<td>多个评测任务</td>
+</tr>
+</tbody>
+</table>
+<p>集群总使用已经接近满载。此时线上服务因流量上涨，需要从 28 GPU 扩到 44
+GPU。</p>
+<h3 id="决策过程">决策过程</h3>
+<ol type="1">
+<li><code>online</code> 目标 44 GPU 小于 hard cap
+48，允许进入候选集。</li>
+<li>当前空闲不足，需要回收 16 GPU。</li>
+<li>系统先查 borrowed usage：<code>batch</code> 借用 8
+GPU，<code>research</code> 借用 12 GPU。</li>
+<li>抢占顺序为
+<code>batch borrowed -&gt; batch nominal -&gt; research borrowed</code>。</li>
+<li>平台选择 8 个 batch GPU 任务作为第一批 victims，因为它们可抢占且无
+checkpoint 要求。</li>
+<li>仍缺 8 GPU，于是选择 research 中两个 4 GPU 借用作业，但要求
+checkpoint age 小于 30 分钟。</li>
+<li>一个 research 作业 checkpoint age 为 12 分钟，另一个为 52
+分钟。系统只抢占 12 分钟的作业。</li>
+<li>剩余 4 GPU 通过等待一个 batch
+任务自然结束获得，避免抢占不可安全恢复的训练。</li>
+</ol>
+<h3 id="用户看到的解释">用户看到的解释</h3>
+<pre class="text"><code>online/service-scaleout-2026-05-04 admitted
+reason: priority + within hardCap + production scaleout
+resources: h100-80gb x16
+reclaimed:
+  - batch/eval-881: borrowed resource, preemptible
+  - research/train-204: borrowed resource, checkpoint age 12m
+not reclaimed:
+  - research/train-198: checkpoint age 52m exceeds policy 30m</code></pre>
+<h3 id="结果">结果</h3>
+<p>这个例子体现了三条原则：</p>
+<ul>
+<li>高优先级可以触发回收，但不能突破 hard cap。</li>
+<li>借用资源优先被回收。</li>
+<li>抢占训练任务前必须看恢复契约，而不是只看优先级。</li>
+</ul>
+<hr />
+<h2 id="20a12-本章小结">20a.12 本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>队列</td>
+<td>把等待和准入规则显式化</td>
+</tr>
+<tr>
+<td>配额</td>
+<td>同时表达保底、上限和借用</td>
+</tr>
+<tr>
+<td>优先级</td>
+<td>表达业务重要性，但不能替代配额</td>
+</tr>
+<tr>
+<td>抢占</td>
+<td>必须绑定 checkpoint、通知和恢复</td>
+</tr>
+<tr>
+<td>DRF</td>
+<td>多资源公平比单 GPU 计数更诚实</td>
+</tr>
+<tr>
+<td>Gang scheduling</td>
+<td>防止分布式作业半启动半浪费</td>
+</tr>
+<tr>
+<td>Volcano / Kueue</td>
+<td>一个偏批调度器，一个偏准入控制器</td>
+</tr>
+<tr>
+<td>工程治理</td>
+<td>指标、审计、发布和权限边界与算法同等重要</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>为什么优先级不能替代配额？</li>
+<li>DRF 的 dominant share 是什么？请用 GPU、CPU、内存举例说明。</li>
+<li>Gang scheduling 和普通 Pod 调度最大的差别是什么？</li>
+<li>borrow / lend 为什么必须绑定回收规则？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="5" type="1">
+<li>为一个包含线上推理、训练实验、低优先级批处理的集群设计
+quota、priority 和 preemption 策略。</li>
+<li>一个 32 GPU 作业一直 Pending，但集群总空闲 GPU 有 40
+张。列出队列层、资源形状层和调度器层各自可能的原因。</li>
+<li>设计一份抢占恢复契约，至少包含 checkpoint、通知、grace
+period、重试和重入队策略。</li>
+<li>如果某团队长期通过低报 CPU request 获得 DRF
+优势，你会如何在平台侧发现和治理？</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

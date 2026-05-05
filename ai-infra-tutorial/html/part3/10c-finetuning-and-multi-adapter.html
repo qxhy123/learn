@@ -10,325 +10,1798 @@
 <iframe id="sidebar" src="../sidebar.html?current=10c" class="sidebar-frame" loading="eager"></iframe>
 <main class="page">
 <nav class="topnav"></nav>
-
 <section class="hero">
 <h1>第 10c 章 · Fine-Tuning 基础设施与多 Adapter 服务</h1>
-<p class="sub">从“不能为每个业务完整复制大模型，但又必须快速改变模型行为”出发，建立微调任务、adapter 制品、版本兼容、共享推理池和多租户治理之间的因果链。</p>
-<div class="chips"><span class="chip">Fine-Tuning</span><span class="chip">LoRA / QLoRA</span><span class="chip">FTaaS</span><span class="chip">Adapter Registry</span><span class="chip">Multi-LoRA Serving</span><span class="chip">A/B 测试</span></div>
-<div class="note"><strong>不可化简的问题：</strong>一个已经很大的 base model 不能为了每个业务、每个租户、每次实验都完整复制、完整训练、完整部署，但业务又确实需要快速改变它在某个任务上的行为。</div>
-<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+<p class="sub">构建 FTaaS、adapter registry、Multi-LoRA serving 和从训练产物到生产推理的治理路径。</p>
+<div class="chips"><span class="chip">FTaaS</span><span class="chip">LoRA</span><span class="chip">Adapter Registry</span><span class="chip">Multi-LoRA</span><span class="chip">Serving</span></div>
 </section>
-
-<section class="toc"><h2>本章目录</h2><ol>
-<li><a class="anchor" href="#s1">第一性原理拆解</a></li>
-<li><a class="anchor" href="#s2">学习目标与导读</a></li>
-<li><a class="anchor" href="#s3">为什么 fine-tuning 需要独立讲</a></li>
-<li><a class="anchor" href="#s4">全量微调、LoRA、QLoRA</a></li>
-<li><a class="anchor" href="#s5">FTaaS 控制面与 pipeline</a></li>
-<li><a class="anchor" href="#s6">Multi-LoRA Serving</a></li>
-<li><a class="anchor" href="#s7">合并部署、动态挂载与兼容性</a></li>
-<li><a class="anchor" href="#s8">Adapter Registry 与 A/B 测试</a></li>
-<li><a class="anchor" href="#s9">观测、容量与失败模式</a></li>
-<li><a class="anchor" href="#s10">工程建议、小结与练习</a></li>
-</ol></section>
-
-<div class="note">本章与 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint、<a href="../part3/10b-alignment-and-post-training.html">第 10b 章</a> 的后训练流程、<a href="../part4/12-artifacts-and-checkpoints.html">第 12 章</a> 的制品管理、<a href="../part5/14-online-inference-architecture.html">第 14 章</a> 的推理架构、<a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的多租户成本控制密切相关。adapter 既是训练产物，也是服务期的一等制品。</div>
-
-<section class="section" id="s1">
-<h2>1. 第一性原理拆解：Fine-Tuning 基础设施与多 Adapter 服务</h2>
-<h3>拆 — 不可化简的问题</h3>
-<p>剥掉 LoRA、QLoRA、PEFT、Multi-LoRA、FTaaS 这些名字后，本章面对的不可化简问题只有一个：一个已经很大的 base model 不能为了每个业务、每个租户、每次实验都完整复制、完整训练、完整部署，但业务又确实需要快速改变它在某个任务上的行为。这同时是训练问题、制品问题和服务问题。训练侧的问题是：如果每个需求都全量更新几十亿到几千亿参数，显存、GPU 时间、checkpoint 存储和排队时延都会把平台压垮。制品侧的问题是：如果训练结果只是某个目录里的小文件，没有记录它依赖的 base model、tokenizer、chat template、target modules 和评测结果，它就不能被安全复现、审计、回滚或上线。服务侧的问题是：如果每个 adapter 都独立部署一套 base model，成本会回到“每个需求复制一份大模型”；如果所有 adapter 都动态挂载到同一个 serving pool，又会带来显存预算、缓存淘汰、路由隔离和版本兼容问题。</p>
-<p>因此 fine-tuning 不能只被理解成“规模更小的训练”，Multi-LoRA 也不能只被理解成“把多个 LoRA 文件挂上去”。平台真正要交付的是一条闭环：业务提交数据和目标，系统选择允许的 base model 与模板，调度短训练任务，生成 adapter，做评测与兼容性门禁，把 adapter 注册成可治理制品，再让线上服务按租户、版本、实验桶和权限选择它。任何一环缺失，都会把风险推到下一环：训练不记录 base hash，服务就可能加载到错误权重；registry 不记录模板，线上输出就可能因为 prompt 契约变化而漂移；serving 不做 cache budget，热点 adapter 和 KV cache 就会在流量高峰互相挤爆。</p>
-<h3>推 — 从这个问题如何推导出每个机制</h3>
-<p>既然不能为每个任务完整训练一份模型，就会推导出参数高效微调：冻结 base model，只训练一小组增量参数。LoRA 把大矩阵更新拆成低秩矩阵 <code>BA</code>，把“更新整个权重空间”变成“学习一个任务相关方向”；QLoRA 再把训练期 base model 量化，换取更低显存门槛。既然训练产物不再是完整模型，而是依附于 base 的 adapter，就会推导出 adapter registry：它不能只保存文件路径，还要保存 base model digest、tokenizer、chat template、adapter schema、训练代码、数据版本、评测报告和权限边界。既然业务需要自助提交大量短任务，就会推导出 FTaaS 控制面：API、配额、准入、状态机、调度、失败重试、评测门禁、制品注册和发布事件必须被串成一个可观测流程。</p>
-<p>既然服务期不能为每个 adapter 复制 base model，就会推导出 Multi-LoRA Serving：base 权重常驻并共享，adapter 按请求、租户或版本动态选择。共享 base 节省的是固定成本，但 adapter 热层、KV cache、临时 buffer 和碎片化会形成新的显存账本，因此必须把 <code>base 常驻</code>、<code>热点 adapter</code>、<code>峰值 KV cache</code>、<code>安全余量</code> 分开预算。既然 adapter 可以动态加载，就会推导出缓存分层：GPU 显存是 hot 层，CPU 内存或本地 NVMe 是 warm 层，对象存储和 registry 是 cold 层；LRU、预加载、租户权重和灰度优先级共同决定哪些 adapter 留在热层。既然 adapter 与 base 权重空间强绑定，就会推导出版本兼容性门禁：base hash、tokenizer、模板、target modules、serving engine adapter 格式只要有一个不匹配，就不能默认上线。最后，既然不同 adapter 会影响路由、batching 和线上行为，就会推导出 A/B、shadow、canary、按 adapter 维度观测和快速回滚。</p>
-<h3>绘 — 因果链路</h3>
-<pre class="mermaid">mindmap
-  root((Fine-Tuning 与 Multi-Adapter))
-    不可完整复制大模型
-      参数高效微调
-        LoRA
-        QLoRA
-        rank 与 target_modules
-      短作业资源池
-        准入控制
-        显存估算
-        失败重试
-    产物依附 base
-      Adapter Registry
-        base_model_hash
-        tokenizer_version
-        chat_template_version
-        eval_report
-      版本兼容门禁
-        shape 校验
-        schema 校验
-        engine 支持
-    需要低成本服务
-      Multi-LoRA Serving
-        共享 base model
-        动态挂载 adapter
-        adapter 路由
-      显存预算
-        base 常驻
-        热点 adapter
-        KV cache
-        安全余量
-    需要可运营上线
-      FTaaS Pipeline
-        数据快照
-        训练
-        评测
-        注册
-        热加载
-        灰度回滚
-      多租户治理
-        配额
-        权限
-        审计
-        成本归因</pre>
-<h3>导 — 读完本章你应该能回答</h3>
-<ol>
-<li>为什么 fine-tuning 的平台目标不是“把 pretraining 缩小”，而是缩短从数据到线上 adapter 的反馈回路？</li>
-<li>LoRA、QLoRA 分别改变了训练显存、制品大小和服务部署形态里的哪一部分成本？</li>
-<li>为什么 adapter 必须绑定 base model hash、tokenizer、chat template 和 target modules，而不能只登记一个文件地址？</li>
-<li>一个 FTaaS pipeline 从数据快照到 production 灰度至少需要哪些状态、门禁和失败处理？</li>
-<li>Multi-LoRA Serving 的显存为什么要同时预算 base 权重、热点 adapter、KV cache 和安全余量？</li>
-<li>base model 升级时，为什么“shape 能加载”不等于“语义兼容”，平台应该如何灰度和回滚？</li>
-<li>当一个租户的 adapter 变成短时热点时，路由、batching、缓存淘汰和配额分别会受到什么影响？</li>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</a></li><li><a class="anchor" href="#3-资源交换full-fine-tuneloraqloradora">3. 资源交换：Full
+Fine-Tune、LoRA、QLoRA、DoRA</a></li><li><a class="anchor" href="#4-系统架构ftaas-控制路径数据路径状态路径故障路径">4.
+系统架构：FTaaS 控制路径、数据路径、状态路径、故障路径</a></li><li><a class="anchor" href="#5-工程化落地准入版本矩阵preflightrelease治理">5.
+工程化落地：准入、版本矩阵、preflight、release、治理</a></li><li><a class="anchor" href="#6-adapterbase-compatibility从能加载到可信运行">6. Adapter/Base
+Compatibility：从能加载到可信运行</a></li><li><a class="anchor" href="#7-merge-deployment-与-dynamic-attach">7. Merge Deployment 与
+Dynamic Attach</a></li><li><a class="anchor" href="#8-multi-lora-servinghot-loadcacheabrollbackpermissionaudit">8.
+Multi-LoRA Serving：Hot
+Load、Cache、A/B、Rollback、Permission、Audit</a></li><li><a class="anchor" href="#9-容量与效率adapter-memory-budget-和-tenant-capacity-model">9.
+容量与效率：Adapter Memory Budget 和 Tenant Capacity Model</a></li><li><a class="anchor" href="#10-框架实现真实-knobs-与约束">10. 框架实现：真实 knobs
+与约束</a></li><li><a class="anchor" href="#11-故障排除">11. 故障排除</a></li><li><a class="anchor" href="#12-方案设计--worked-example多租户-lora-平台">12. 方案设计 /
+Worked Example：多租户 LoRA 平台</a></li><li><a class="anchor" href="#13-反模式">13. 反模式</a></li><li><a class="anchor" href="#14-ftaas-和-multi-adapter-production-readiness-checklist">14.
+FTaaS 和 Multi-Adapter Production Readiness Checklist</a></li><li><a class="anchor" href="#15-本章小结">15. 本章小结</a></li><li><a class="anchor" href="#16-练习题">16. 练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>本章讨论的不是“怎样调一个 LoRA 训练脚本”，而是如何把 fine-tuning
+做成面向租户的 FTaaS 控制面，并把训练产物安全接入 production
+inference。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：<a
+href="10-memory-checkpointing-and-recovery.html">第10章</a> 讲
+checkpoint 与恢复协议，<a
+href="10b-alignment-and-post-training.html">第10b章</a> 讲 SFT/RLHF/DPO
+等后训练 pipeline，<a
+href="../part4/12-artifacts-and-checkpoints.html">第12章</a>
+讲制品与 checkpoint，<a
+href="../part5/14-online-inference-architecture.html">第14章</a>
+讲推理架构，<a
+href="../part5/17-multitenancy-and-cost.html">第17章</a>
+讲多租户成本治理。</p>
+</blockquote>
+<hr />
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="11-不可化简的问题">1.1 不可化简的问题</h3>
+<p>一个已经足够大的 base
+model，不能为了每个租户、每个任务、每次实验都完整复制、完整训练、完整部署。业务侧却需要快速改变模型行为，例如客服话术、法律检索摘要、游戏
+NPC 风格、内部工单分类、行业术语抽取。这个矛盾同时落在四条路径上：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>不可化简的问题</th>
+<th>如果没有平台机制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练路径</td>
+<td>每个任务都更新全量参数会消耗过多 GPU、存储和排队时间</td>
+<td>短作业被长作业挤压，用户等待小时到天</td>
+</tr>
+<tr>
+<td>制品路径</td>
+<td>adapter 依附 base
+model、tokenizer、template、训练数据和评测报告</td>
+<td>线上无法证明“这个小文件能挂在哪个服务上”</td>
+</tr>
+<tr>
+<td>服务路径</td>
+<td>不能为每个 adapter 常驻一套完整 base model</td>
+<td>成本退回到每租户一模型，发布和回滚变慢</td>
+</tr>
+<tr>
+<td>治理路径</td>
+<td>多租户需要配额、权限、审批、审计、A/B 和 rollback</td>
+<td>一个租户的训练或路由错误会影响其他租户</td>
+</tr>
+</tbody>
+</table>
+<p>所以 fine-tuning infra 的目标不是把 pretraining 缩小，而是把“数据提交
+-&gt; 短训练 -&gt; 评测 -&gt; adapter registry -&gt; hot load -&gt;
+production route”变成可治理闭环。</p>
+<h3 id="12-从问题推导机制">1.2 从问题推导机制</h3>
+<ol type="1">
+<li><strong>不能全量复制模型</strong>，推导出参数高效微调。LoRA、QLoRA、DoRA
+等方法冻结大部分 base
+权重，只训练小规模增量参数，把训练成本、制品大小和上线粒度降下来。</li>
+<li><strong>adapter 不是独立模型</strong>，推导出 adapter
+registry。registry 必须记录 base digest、tokenizer digest、chat
+template、rank、target
+modules、quantization、license、安全策略和评测结论。</li>
+<li><strong>租户会高频提交短任务</strong>，推导出 FTaaS
+控制面。控制面需要数据准入、队列、quota、image allowlist、base model
+constraints、审批、artifact release 和审计。</li>
+<li><strong>服务不能复制 base</strong>，推导出 Multi-LoRA serving。base
+model 常驻，adapter 按租户、版本和实验桶动态 attach，配合 hot
+load、cache、A/B、rollback、权限和审计。</li>
+<li><strong>动态 attach 会制造新风险</strong>，推导出
+admission、preflight、compatibility gate、capacity model 和 per-adapter
+observability。</li>
 </ol>
-</section>
-
-<section class="section" id="s2">
-<h2>2. 学习目标与导读</h2>
-<p>生产环境里最常见的训练，不是从头预训练，而是围绕一个已有 base model 做大量小而快的微调任务。本章把训练、制品和服务连成同一条链路，而不是把“LoRA 怎么训”和“线上怎么挂 adapter”拆成两套孤立系统。</p>
-<div class="grid-2">
-<div class="card"><strong>你将能解释</strong><br>为什么 fine-tuning 需要独立于 pretraining 讨论，为什么 LoRA/QLoRA 会改变平台资源形态，以及 FTaaS 控制面为什么必须管理状态、配额、评测和 registry。</div>
-<div class="card"><strong>你将能设计</strong><br>从数据快照到 adapter 上线的 pipeline，Multi-LoRA 的缓存和显存预算，adapter 的版本兼容校验，以及 shadow / canary / A/B / rollback 流程。</div>
-</div>
-<pre><code>数据快照
-  -> 训练作业
-  -> adapter 制品
-  -> 评测与注册
-  -> 多 adapter 路由
-  -> 线上灰度 / 回滚</code></pre>
-<div class="success"><strong>主线判断：</strong>fine-tuning 和 multi-adapter serving 不应被拆成“两套彼此无关的系统”。训练阶段的 base、模板和元数据，直接决定服务阶段能否安全热加载和治理。</div>
-</section>
-
-<section class="section" id="s3">
-<h2>3. 为什么 fine-tuning 需要独立讲</h2>
-<p>把 fine-tuning 当成“缩小版 pretraining”通常会误导平台设计。两者最关键的差异不是“参数少了一点”，而是目标函数、作业节奏、交付物和服务方式都变了。</p>
-<table><tr><th>维度</th><th>全量预训练 / 全量微调</th><th>参数高效微调</th></tr><tr><td>核心目标</td><td>学通用能力或重写整个模型</td><td>在固定 base model 上做定向增强</td></tr><tr><td>训练参数</td><td>大部分甚至全部参数</td><td>少量 adapter 参数</td></tr><tr><td>任务时长</td><td>天到周</td><td>分钟到小时</td></tr><tr><td>作业形态</td><td>少量长作业</td><td>大量短作业</td></tr><tr><td>交付物</td><td>checkpoint / 完整模型包</td><td>adapter + 元数据</td></tr><tr><td>平台重点</td><td>吞吐、扩展效率、恢复</td><td>多租户、低成本、快速交付</td></tr><tr><td>服务形态</td><td>独立部署一套模型</td><td>共享 base model + 动态挂载 adapter</td></tr></table>
-<p>pretraining 更像研发主线工程，fine-tuning 更像平台化产品能力。它通常天然走向多团队共享同一组 base model、多个租户高频提交微调任务、每次训练只改极小一部分参数、训练完成后很快进入评测、灰度和上线。</p>
-<div class="warn"><strong>资源池边界：</strong>如果把长 pretraining 作业和短 fine-tuning 作业强行塞进同一队列，长作业会压住短作业，短作业会打碎大作业的容量规划，调度器也很难同时优化吞吐和首个可用版本返回速度。</div>
-</section>
-
-<section class="section" id="s4">
-<h2>4. 全量微调、LoRA、QLoRA 到底在交换什么</h2>
-<p>LoRA 的核心思想是冻结 base model，只训练插入到特定层中的低秩矩阵。QLoRA 则进一步把 base model 量化到更低比特表示，以进一步降低训练显存。LoRA 不是“把大模型变小”，而是只训练一小块可控增量。</p>
-<pre><code>若 W 属于 R^(d_out x d_in)
-LoRA 把更新写成:
-  ΔW = B A
-
-A 属于 R^(r x d_in)
-B 属于 R^(d_out x r)
-新增参数量约为:
-  r(d_in + d_out)
-而不是:
-  d_out x d_in</code></pre>
-<table><tr><th>方案</th><th>Base model 形态</th><th>训练成本</th><th>服务期形态</th><th>是否适合 Multi-Adapter</th><th>常见风险</th></tr><tr><td>全量微调</td><td>全精度可训练</td><td>最高</td><td>常常变成一个新完整模型</td><td>较差</td><td>制品大、发布慢、难共享</td></tr><tr><td>LoRA</td><td>Base 冻结，adapter 可训练</td><td>低很多</td><td>可合并，也可动态挂载</td><td>很适合</td><td>adapter 数量膨胀、版本管理复杂</td></tr><tr><td>QLoRA</td><td>Base 量化 + adapter 可训练</td><td>更低</td><td>训练更省，但服务仍需考虑兼容引擎</td><td>适合，但约束更多</td><td>训练与服务环境不一致、精度波动</td></tr></table>
-<table><tr><th>7B 级模型场景</th><th>粗略显存量级</th><th>工程含义</th></tr><tr><td>全量微调</td><td>常见 35-50 GB 起</td><td>往往逼近高端训练卡</td></tr><tr><td>LoRA</td><td>常见十几到二十多 GB</td><td>单卡中高端 GPU 就可覆盖很多任务</td></tr><tr><td>QLoRA</td><td>常见可进一步下降到十几 GB 内外</td><td>更适合成本敏感平台</td></tr></table>
-<div class="note"><strong>基础设施参数：</strong><code>rank</code> 更像“单个 adapter 的容量旋钮”，<code>target_modules</code> 更像“这个 adapter 侵入模型多少位置”。它们会影响训练显存、吞吐、adapter 文件大小、服务加载时延和多 adapter 共存时的缓存压力。</div>
-</section>
-
-<section class="section" id="s5">
-<h2>5. FTaaS 控制面与端到端 pipeline</h2>
-<p>平台里的 fine-tuning 不应被抽象成“跑完一个 <code>train.py</code> 就结束”。在生产环境里，FTaaS 更像一个围绕 adapter 生命周期构建的小型控制面，它负责把一次训练请求安全地推进到“可被线上服务加载”的状态。</p>
-<pre class="mermaid">flowchart TD
-  A[数据快照 / 数据清洗] --> B[选择 base model / tokenizer / template]
-  B --> C[提交 FTaaS 任务]
-  C --> D{准入控制}
-  D -- 配额 / 显存 / 权限通过 --> E[训练执行]
-  D -- 拒绝 --> R[返回可解释原因]
-  E --> F[冻结 adapter / config / dataset version]
-  F --> G[自动评测]
-  G --> H{质量与安全门禁}
-  H -- 通过 --> I[兼容性校验]
-  H -- 未通过 --> J[registered: non_deployable]
-  I --> K{base / tokenizer / schema / engine 匹配}
-  K -- 通过 --> L[Adapter Registry]
-  K -- 未通过 --> M[load_blocked]
-  L --> N[通知 serving pool 预加载]
-  N --> O{热加载成功}
-  O -- 成功 --> P[staging / shadow / canary / production]
-  O -- 失败 --> Q[load_failed + 保持旧路由]
-  P --> S[线上观测 / A/B / 回滚 / 下线]</pre>
-<table><tr><th>阶段</th><th>主要输入</th><th>平台要保证什么</th><th>典型输出</th></tr><tr><td>数据快照</td><td>训练样本、清洗规则</td><td>数据可追踪、可复现</td><td>dataset version</td></tr><tr><td>训练提交</td><td>base model、超参、租户信息</td><td>鉴权、配额、资源估算</td><td>training job</td></tr><tr><td>训练执行</td><td>GPU、checkpoint 存储</td><td>稳定运行、失败恢复</td><td>adapter / checkpoint</td></tr><tr><td>自动评测</td><td>基准集、判分器、门禁规则</td><td>不让“训练成功但效果退化”的版本进入上线</td><td>eval report</td></tr><tr><td>注册</td><td>制品元数据</td><td>版本绑定、状态管理、审计</td><td>adapter record</td></tr><tr><td>热加载</td><td>serving pool、路由信息</td><td>可观测、可回退、不重启</td><td>loaded adapter</td></tr><tr><td>发布</td><td>灰度策略、SLO、告警规则</td><td>可回滚、权限正确、流量可控</td><td>online version</td></tr></table>
-<p>平台里经常要明确区分三种“成功”：训练成功是 job 没挂并产出了 adapter；评测成功是 adapter 达到了离线门槛并通过兼容性检查；发布成功是 adapter 被正确加载，并在真实流量里表现稳定。这三者不是同义词。</p>
-<pre class="mermaid">stateDiagram-v2
-  [*] --> submitted
-  submitted --> admitted
-  admitted --> staging_data
-  staging_data --> running
-  running --> evaluating
-  evaluating --> registered
-  registered --> loading
-  loading --> deployable
-  running --> failed
-  running --> cancelled
-  running --> retrying
-  retrying --> running
-  evaluating --> rejected
-  loading --> load_failed
-  deployable --> deprecated
-</pre>
-<div class="danger"><strong>严重风险：</strong>训练 worker 只能声明训练产物已冻结，不能直接把 adapter 标成可上线；评测 worker 只能给出离线门禁结果，不能绕过 registry；serving loader 只能汇报加载结果，不能改写 adapter 元数据。</div>
-<table><tr><th>调度维度</th><th>为什么重要</th></tr><tr><td>预计显存</td><td>决定能否落到某个 GPU 档位</td></tr><tr><td>base model 本地性</td><td>减少重复下载和冷启动时间</td></tr><tr><td>checkpoint / 数据位置</td><td>影响作业启动耗时</td></tr><tr><td>租户配额与优先级</td><td>防止一个团队把短作业池打满</td></tr><tr><td>是否可抢占</td><td>决定能否放到更便宜资源上</td></tr><tr><td>任务时长预估</td><td>帮助调度器减少碎片和排队抖动</td></tr></table>
-</section>
-
-<section class="section" id="s6">
-<h2>6. Multi-LoRA Serving</h2>
-<p>训练完成后的 adapter，往往不会单独起一套 base model 服务，而是挂载到共享实例上。核心思想是 base model 权重只保留一份，多个 adapter 共用同一组推理副本，adapter 按请求、租户、会话或版本动态选择。</p>
-<pre class="mermaid">flowchart LR
-  A[request] --> B[gateway / auth]
-  B --> C[router tenant/task/version]
-  C --> D[model pool: shared base model]
-  D --> E[adapter loader/cache]
-  E --> F[inference]
-  G[Adapter Registry] --> E
-  H[Hot GPU cache] <--> E
-  I[Warm CPU/NVMe] <--> E
-  J[Cold object storage] <--> I</pre>
-<table><tr><th>组成部分</th><th>在服务期做什么</th><th>资源关注点</th></tr><tr><td>Base model</td><td>共享主权重</td><td>大头显存、预热成本</td></tr><tr><td>Adapter</td><td>叠加到请求路径</td><td>增量显存、切换延迟</td></tr><tr><td>Router</td><td>按 tenant / task / version 选 adapter</td><td>路由正确性和隔离</td></tr><tr><td>Loader</td><td>热加载 / 热卸载 adapter</td><td>不重启、低抖动</td></tr></table>
-<p>Multi-LoRA Serving 的关键收益是 base model 不需要为每个小任务复制一份，新 adapter 上线不必重新部署整套模型，多个业务实验可以共享 warm pool，灰度和回滚粒度可以细到 adapter 版本。这也是它常常和 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 的多租户治理绑在一起讲的原因。</p>
-<div class="warn"><strong>不是免费午餐：</strong>adapter 越多，缓存淘汰、热加载失败回滚、权限控制、跨 adapter batching、热点租户挤占 cache 等问题越明显。平台要默认认为跨 adapter 的批处理通常更难做。</div>
-<table><tr><th>层级</th><th>典型位置</th><th>作用</th></tr><tr><td>Hot</td><td>GPU 显存</td><td>当前高频 adapter，追求最低切换延迟</td></tr><tr><td>Warm</td><td>CPU 内存或本地 NVMe</td><td>避免每次都回对象存储拉取</td></tr><tr><td>Cold</td><td>对象存储 / registry</td><td>作为真实来源与长期归档</td></tr></table>
-<h3>Multi-LoRA 显存管理</h3>
-<p>从显存账本看，Multi-LoRA Serving 的核心不是“adapter 很小，所以问题不大”，而是要把共享成本、增量成本和并发成本分开核算。</p>
-<pre><code>总显存 ≈ base_model_size
-       + N × adapter_size
-       + concurrent_requests × kv_cache_per_request
-       + workspace
-       + safety_margin</code></pre>
-<table><tr><th>预算项</th><th>估算口径</th><th>7B BF16 示例</th><th>工程动作</th></tr><tr><td>Base 权重常驻</td><td>参数量 × dtype bytes</td><td>约 14 GB</td><td>每个 replica 必须预留，不能被 adapter 挤占</td></tr><tr><td>单个 LoRA adapter</td><td>target modules 参数增量 × dtype bytes</td><td>rank 16 常见几十到数百 MB</td><td>注册时写入精确文件大小和加载后显存增量</td></tr><tr><td>热点 adapter 池</td><td>hot_adapter_count × adapter_size</td><td>32 × 120 MB = 3.8 GB</td><td>设置每副本 hot 层上限，超过则驱逐或拒绝预加载</td></tr><tr><td>KV cache</td><td>并发 × context × dtype 相关</td><td>32 个中等上下文请求可能数 GB</td><td>与 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 的 batching 策略联动</td></tr><tr><td>workspace / 碎片 / 安全余量</td><td>压测得到</td><td>常见总容量 10%-20% 起</td><td>admission control 按硬阈值执行</td></tr></table>
-<pre class="mermaid">flowchart TD
-  A[GPU 总容量] --> B[base 常驻]
-  A --> C[热点 adapter 常驻]
-  A --> D[峰值 KV cache]
-  A --> E[workspace / CUDA graph]
-  A --> F[碎片与安全余量]
-  C --> G{hot 层接近阈值?}
-  G -- 是 --> H[LRU / 权重驱逐]
-  G -- 否 --> I[允许预加载]
-  D --> J{p95 KV 超预算?}
-  J -- 是 --> K[降并发 / 拒绝新 adapter / 调整 batching]
-  H --> L[保持 base 与稳定路由]
-  I --> L
-  K --> L</pre>
-<div class="success"><strong>工程边界：</strong>显存预算不能只在部署时算一次。registry 应保存 adapter 静态大小，loader 应上报加载后真实增量，serving pool 应周期性上报 hot adapter 数、KV cache 峰值、eviction 次数和 OOM 近失事件。</div>
-</section>
-
-<section class="section" id="s7">
-<h2>7. 合并部署、动态挂载与版本兼容性</h2>
-<p>很多团队在 adapter 上线时，会在两条路之间选择：把 adapter 合并进权重后导出独立模型版本，或者让 base model 常驻并按需动态挂载 adapter。LoRA 是训练形态，Multi-LoRA 是服务形态；两者常一起出现，但不是强绑定。</p>
-<table><tr><th>路径</th><th>做法</th><th>优点</th><th>代价</th><th>更适合</th></tr><tr><td>合并部署（merge）</td><td>把 adapter 合并进权重，再导出独立模型版本</td><td>推理路径简单、单模型性能更稳定</td><td>失去热切换能力，制品变大</td><td>单租户、固定版本、吞吐优先</td></tr><tr><td>动态挂载（side-load）</td><td>base model 常驻，adapter 按需加载</td><td>多租户友好、热上线快、成本低</td><td>缓存、路由、权限更复杂</td><td>多版本并存、频繁实验、平台化服务</td></tr></table>
-<p>adapter 与 base 的兼容性不能只看 shape。LoRA 的本质是对特定 base 权重空间做低秩增量拟合，训练出来的矩阵不是抽象地绑定在“某个 7B 模型品类”上，而是绑定在某一版具体 base 权重上。只要 base model 升级了 checkpoint、替换了 tokenizer、调整了 chat template，甚至只是做了看似温和的后训练，adapter 对应的最优增量方向都可能已经变化。</p>
-<table><tr><th>变化项</th><th>典型例子</th><th>加载层面</th><th>语义层面</th><th>平台默认动作</th></tr><tr><td>base checkpoint digest 变化</td><td><code>base-v1</code> 重新上传但标签不变</td><td>可能能加载</td><td>高风险</td><td>阻断自动发布，要求重训或完整验收</td></tr><tr><td>tokenizer 变化</td><td>新增 special token、改变 BOS/EOS</td><td>可能能启动</td><td>高风险</td><td>阻断，要求 adapter 重新评测</td></tr><tr><td>chat template 变化</td><td>system/user/assistant 包装格式改变</td><td>能加载</td><td>高风险</td><td>阻断 production，允许 shadow 验证</td></tr><tr><td>target modules 变化</td><td><code>q_proj/v_proj</code> 改名或层数不同</td><td>常直接失败</td><td>不可信</td><td>注册阶段拒绝</td></tr><tr><td>serving engine 变化</td><td>vLLM、TRT-LLM、LoRAX 支持差异</td><td>可能失败</td><td>需压测</td><td>进入 engine 兼容矩阵</td></tr><tr><td>base 做了对齐后训练</td><td>SFT/RLHF/DPO 后的新权重</td><td>可能能加载</td><td>高风险</td><td>新旧 base 并存，adapter 分批重训</td></tr></table>
-<pre><code>adapter_id: tenant-a/summarizer-lora
-adapter_version: 2026-05-03.4
-base_model_id: llama-3.1-8b-instruct
-base_model_digest: sha256:...
-tokenizer_digest: sha256:...
-chat_template_version: chatml-v3
-adapter_format: peft-lora-safetensors
-adapter_schema:
-  rank: 16
-  alpha: 32
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
-training:
-  dataset_version: ds-2026-05-01-cleaned
-  trainer_image_digest: sha256:...
-  seed: 42
-evaluation:
-  report_id: eval-98231
-  status: passed
-serving:
-  allowed_engines: [vllm-0.8-lora]
-  status: deployable</code></pre>
-<div class="danger"><strong>兼容性底线：</strong>只要 base 权重、输入契约或 adapter schema 任一项变化，就不能把旧 adapter 当作自动兼容。如果业务强烈希望复用，也应进入 <code>compatibility_review</code> 或 <code>shadow_only</code> 状态，而不是直接设为 <code>deployable</code>。</div>
-</section>
-
-<section class="section" id="s8">
-<h2>8. Adapter Registry、兼容性约束与 A/B 测试</h2>
-<p>adapter 不能只当一个小文件看待，它必须和运行它所需的上下文一起管理。registry 里登记的不是“一个 <code>.safetensors</code> 文件”，而应该是“这个 adapter 能在哪个 base model、哪种模板、哪种服务引擎上被谁以什么状态使用”。</p>
-<table><tr><th>要管理的对象</th><th>为什么重要</th></tr><tr><td>Base model 版本</td><td>base 一变，adapter 可能立刻失效</td></tr><tr><td>Tokenizer / chat template</td><td>输入格式变了，行为可能明显漂移</td></tr><tr><td>Adapter 格式与目标模块</td><td>层名、shape、target modules 不匹配会直接加载失败</td></tr><tr><td>训练配置与数据版本</td><td>没有元数据就难以复现</td></tr><tr><td>评测结果</td><td>方便做上线门禁和回归判断</td></tr><tr><td>租户与权限信息</td><td>防止路由到不该访问的 adapter</td></tr></table>
-<pre class="mermaid">flowchart TD
-  A[adapter candidate] --> B{base_model_id 与 digest 匹配?}
-  B -- 否 --> X[blocked: base_mismatch]
-  B -- 是 --> C{tokenizer / template 允许?}
-  C -- 否 --> Y[shadow_only 或 rejected]
-  C -- 是 --> D{target modules / schema 可加载?}
-  D -- 否 --> Z[registration rejected]
-  D -- 是 --> E{离线评测通过?}
-  E -- 否 --> F[registered: non_deployable]
-  E -- 是 --> G{tenant 有发布权限?}
-  G -- 否 --> H[permission_rejected]
-  G -- 是 --> I[deployable candidate]
-  I --> J[shadow]
-  J --> K[canary]
-  K --> L[production]
-  K --> M[rollback]</pre>
-<table><tr><th>阶段</th><th>目的</th></tr><tr><td>离线评测</td><td>先挡住明显退化版本</td></tr><tr><td>Shadow / Replay</td><td>看真实流量下的输出差异，不影响用户</td></tr><tr><td>Canary</td><td>小流量真实放量，观察错误率和延迟</td></tr><tr><td>扩量</td><td>逐步从 5% / 10% 提升到更高比例</td></tr><tr><td>全量 / 回滚</td><td>达标则放量，不达标立刻回滚</td></tr></table>
-<div class="note"><strong>A/B 设计重点：</strong>adapter 维度的实验不仅要看质量指标，还要看 TTFT、tokens/s、cache hit、load latency、route miss 和 permission reject。某个 adapter 质量更好但让缓存抖动严重，也可能不适合直接放量。</div>
-</section>
-
-<section class="section" id="s9">
-<h2>9. 观测指标、容量规划与典型失败模式</h2>
-<p>fine-tuning 和 multi-adapter 系统要观测的，不只是 GPU 利用率。训练侧关心作业周转和制品质量，服务侧关心加载延迟、缓存稳定、路由正确和按 adapter 维度的线上行为。</p>
-<div class="grid-2">
-<div class="card"><strong>训练侧指标</strong><br>作业等待时间、作业成功率 / 重试率、tokens/s 或 samples/s、单作业显存峰值、checkpoint / artifact 上传耗时、eval pass rate。</div>
-<div class="card"><strong>服务侧指标</strong><br>adapter load latency P50/P95、adapter cache hit rate、route miss / permission reject、TTFT / tokens per second、OOM / eviction rate、按 adapter 维度的错误率。</div>
-</div>
-<table><tr><th>失败模式</th><th>典型表现</th><th>更根本的问题</th></tr><tr><td>Base model 不匹配</td><td>adapter 加载失败或效果异常</td><td>版本绑定不严</td></tr><tr><td>Tokenizer / template 变化</td><td>线上输出风格突变</td><td>输入契约未被登记</td></tr><tr><td>target modules 不匹配</td><td>启动时报 shape / key 错误</td><td>训练与服务环境不一致</td></tr><tr><td>热点 adapter 频繁被淘汰</td><td>延迟剧烈波动</td><td>cache 策略没有考虑热度分布</td></tr><tr><td>训练成功但 registry 元数据缺失</td><td>无法上线或无法回滚</td><td>制品流转链路不完整</td></tr><tr><td>路由越权</td><td>请求拿到错误 adapter</td><td>多租户隔离没进入控制面</td></tr></table>
-<div class="warn"><strong>排障视角：</strong>adapter 系统的问题，很少只是“模型训练得好不好”，更多是“训练、制品、路由、缓存、权限有没有被当成同一条链路设计”。</div>
-</section>
-
-<section class="section" id="s10">
-<h2>10. 工程建议、小结与练习</h2>
-<h3>工程建议</h3>
+<h3 id="13-学习大纲">1.3 学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>full fine-tune、LoRA、QLoRA、DoRA
+分别交换了哪些显存、质量、训练时间、存储和服务成本。</li>
+<li>一个 FTaaS 控制面如何处理数据准入、queue、quota、镜像、base model
+constraints、approval 和 artifact release。</li>
+<li>adapter/base compatibility 为什么必须覆盖
+architecture、tokenizer、rank、target modules、quantization、license 和
+safety policy。</li>
+<li>merge deployment 与 dynamic attach 的边界在哪里。</li>
+<li>Multi-LoRA serving 如何实现 hot
+load、cache、A/B、rollback、permission 和 audit。</li>
+<li>训练产物如何从 checkpoint/object storage 进入 production inference
+service。</li>
+<li>如何为多租户 LoRA 平台做容量预算、排障和 readiness review。</li>
+</ol>
+<hr />
+<h2 id="2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</h2>
+<h3 id="21-是什么">2.1 是什么</h3>
+<p>Fine-tuning infra 是围绕已有 base model
+的短训练、制品和服务生命周期系统。它的核心对象不是单个训练脚本，而是下面这组契约：</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>平台含义</th>
+<th>必须可追踪的字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Base model</td>
+<td>被冻结或部分更新的主权重</td>
+<td>model id、checkpoint digest、architecture、license、safety
+profile</td>
+</tr>
+<tr>
+<td>Dataset snapshot</td>
+<td>本次训练可复现的数据输入</td>
+<td>dataset id、版本、清洗规则、PII scan、许可、样本数</td>
+</tr>
+<tr>
+<td>Trainer image</td>
+<td>实际执行训练的环境</td>
+<td>image digest、CUDA、PyTorch、PEFT、bitsandbytes、driver
+constraints</td>
+</tr>
+<tr>
+<td>Adapter artifact</td>
+<td>训练产物或增量权重</td>
+<td>format、rank、alpha、target modules、dtype、quantization
+dependency</td>
+</tr>
+<tr>
+<td>Adapter registry record</td>
+<td>可上线制品元数据</td>
+<td>compatibility、eval report、approval、tenant ACL、serving
+status</td>
+</tr>
+<tr>
+<td>Serving route</td>
+<td>production inference 选择规则</td>
+<td>tenant、traffic split、adapter version、rollback target、audit
+id</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-不是什么">2.2 不是什么</h3>
+<table>
+<thead>
+<tr>
+<th>误解</th>
+<th>为什么不成立</th>
+<th>工程后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fine-tuning 是小号 pretraining</td>
+<td>作业节奏、制品形态、评测门禁、发布路径都不同</td>
+<td>用长作业调度器会导致短任务排队抖动</td>
+</tr>
+<tr>
+<td>LoRA 文件就是完整模型</td>
+<td>adapter 强绑定 base 权重空间和输入契约</td>
+<td>脱离 base digest 无法安全加载</td>
+</tr>
+<tr>
+<td>QLoRA 只影响训练</td>
+<td>训练期量化配置会影响可复现性和质量评测边界</td>
+<td>registry 必须记录量化方式和库版本</td>
+</tr>
+<tr>
+<td>Multi-LoRA 只是多加载几个文件</td>
+<td>它改变 batching、KV cache、权限、cache eviction 和路由</td>
+<td>没有容量模型会在流量峰值 OOM</td>
+</tr>
+<tr>
+<td>shape 能对上就兼容</td>
+<td>tokenizer、chat template、safety policy 变化也会语义漂移</td>
+<td>可能出现加载成功但线上质量回退</td>
+</tr>
+</tbody>
+</table>
+<h3 id="23-相邻概念边界">2.3 相邻概念边界</h3>
+<table>
+<thead>
+<tr>
+<th>相邻概念</th>
+<th>与本章关系</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SFT/RLHF/DPO</td>
+<td>fine-tuning 可以是 SFT 或偏好训练的一个阶段</td>
+<td>本章重点是平台生命周期，不展开算法目标函数</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>full fine-tune 产物通常是 checkpoint，LoRA 产物通常是 adapter</td>
+<td>checkpoint 恢复协议详见第10章</td>
+</tr>
+<tr>
+<td>Artifact store</td>
+<td>保存文件字节</td>
+<td>adapter registry 保存可运行契约和状态机，不只是文件路径</td>
+</tr>
+<tr>
+<td>Model serving</td>
+<td>执行推理请求</td>
+<td>本章只讨论 adapter 如何进入 serving 和多 adapter 运行边界</td>
+</tr>
+<tr>
+<td>Feature flag</td>
+<td>控制流量策略</td>
+<td>adapter A/B 还必须绑定模型兼容性、权限和审计</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-资源交换full-fine-tuneloraqloradora">3. 资源交换：Full
+Fine-Tune、LoRA、QLoRA、DoRA</h2>
+<h3 id="31-四种路径的工程边界">3.1 四种路径的工程边界</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>训练哪些参数</th>
+<th>训练显存</th>
+<th>制品大小</th>
+<th>推理接入</th>
+<th>质量/风险边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full fine-tune</td>
+<td>全部或大部分 base 权重</td>
+<td>最高；参数、梯度、optimizer state 都是大头</td>
+<td>接近完整模型</td>
+<td>常作为独立模型部署或覆盖 checkpoint</td>
+<td>能力改写强，但灾难性遗忘、发布慢、回滚重</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>冻结 base，训练低秩矩阵</td>
+<td>低；base 权重常驻，adapter 参数和 optimizer 小</td>
+<td>MB 到数百 MB 常见</td>
+<td>可 merge，也可 dynamic attach</td>
+<td>依赖 target modules/rank，质量上限受低秩容量约束</td>
+</tr>
+<tr>
+<td>QLoRA</td>
+<td>量化 base，训练 LoRA adapter</td>
+<td>更低；NF4/4bit base 降低训练门槛</td>
+<td>adapter 仍小，外加量化元数据</td>
+<td>服务期未必使用同一量化路径</td>
+<td>对量化库、dtype、梯度 checkpoint 更敏感</td>
+</tr>
+<tr>
+<td>DoRA</td>
+<td>将权重更新拆成方向与幅度，通常结合 LoRA</td>
+<td>比 LoRA 略高或相近，取决于实现</td>
+<td>比同 rank LoRA 略大</td>
+<td>需要 serving engine 支持对应 adapter 格式或先 merge</td>
+<td>可能提升低 rank 表达力，但兼容矩阵更窄</td>
+</tr>
+</tbody>
+</table>
+<p>不要把这个表理解为“越省越好”。平台选型取决于约束：</p>
 <ul>
-<li>资源队列上明确区分“全量训练”和“fine-tuning”任务。</li>
-<li>adapter 作为一等制品进入 registry，而不是只存训练输出目录。</li>
-<li>在训练完成和允许发布之间插入兼容性校验与离线评测。</li>
-<li>先把 base model、tokenizer、template 的版本绑定做严，再谈 Multi-LoRA Serving。</li>
-<li>在生产前压测 adapter 热加载 / 热卸载延迟，而不只是看单次训练是否成功。</li>
-<li>对高并发场景，优先设计 adapter 缓存与淘汰策略，而不是只关注单次训练成本。</li>
-<li>让多租户配额、权限和路由进入控制面，否则 adapter 服务很容易变成“能跑但不可治理”。</li>
+<li><strong>质量优先且版本少</strong>：full fine-tune 或 LoRA merge
+更容易压榨单版本质量和吞吐。</li>
+<li><strong>租户多且版本高频</strong>：LoRA dynamic attach
+更容易做上线、A/B、rollback 和成本分摊。</li>
+<li><strong>训练资源稀缺</strong>：QLoRA 把更多任务放进中低端
+GPU，但要强化量化环境复现。</li>
+<li><strong>低 rank 质量不足</strong>：DoRA 可以进入候选，但 registry 和
+serving engine 必须支持它的 schema。</li>
 </ul>
-<table><tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr><tr><td>参数高效微调</td><td>PEFT</td><td>Hugging Face 生态的统一入口</td></tr><tr><td>量化微调</td><td>bitsandbytes、QLoRA</td><td>常用于降低单卡显存要求</td></tr><tr><td>高效 LoRA 训练</td><td>Unsloth</td><td>面向更快的单机 / 单卡 LoRA 训练</td></tr><tr><td>Multi-LoRA Serving</td><td>vLLM Multi-LoRA、LoRAX</td><td>关注热加载与共享 base model</td></tr><tr><td>制品管理</td><td>MLflow、Weights &amp; Biases、自建 registry</td><td>关键是版本绑定和可追踪性</td></tr></table>
-<h3>本章小结</h3>
-<table><tr><th>主题</th><th>关键点</th></tr><tr><td>Fine-tuning 本质</td><td>高频、短任务、多租户，与 pretraining 完全不同</td></tr><tr><td>LoRA / QLoRA</td><td>通过冻结或量化 base model 显著降低训练成本</td></tr><tr><td>FTaaS</td><td>重点是队列、配额、状态机、制品管理，而不是极限扩展效率</td></tr><tr><td>Multi-LoRA Serving</td><td>通过共享 base model 降成本，但会引入缓存、路由和权限复杂度</td></tr><tr><td>兼容性约束</td><td>adapter 必须和 base model、tokenizer、模板、评测结果一起管理</td></tr><tr><td>观测重点</td><td>训练看周转与成功率，服务看加载延迟、缓存命中和路由正确性</td></tr></table>
-<h3>练习题</h3>
-<ol>
-<li>为什么 fine-tuning 任务不应该和 pretraining 任务共用同一资源队列？</li>
-<li>LoRA 和 QLoRA 的平台意义分别是什么？它们分别改变了训练侧和服务侧的哪些成本结构？</li>
-<li>为什么 adapter 是“一等制品”，而不是训练脚本顺手导出的一个小文件？</li>
-<li>画出一个 FTaaS 的任务状态机，并解释为什么 <code>training succeeded</code>、<code>evaluation passed</code>、<code>deployable</code> 必须是三个不同状态。</li>
-<li>基于公式 <code>总显存 ≈ base_model_size + N × adapter_size + concurrent_requests × kv_cache_per_request</code>，说明只盯 adapter 文件大小为什么会低估显存风险。</li>
-<li>为什么 base model 升级后，已有 LoRA adapter 往往需要重新训练或重新验收？</li>
-<li>设计一个 adapter A/B 测试流程，说明离线评测、shadow、canary、扩量和回滚各自的作用。</li>
+<h3 id="32-lora-参数量与-adapter-体积">3.2 LoRA 参数量与 adapter
+体积</h3>
+<p>对一个线性层：</p>
+<p><span
+class="math display"><em>W</em> ∈ ℝ<sup><em>d</em><sub><em>o</em><em>u</em><em>t</em></sub> × <em>d</em><sub><em>i</em><em>n</em></sub></sup>,  <em>Δ</em><em>W</em> = <em>B</em><em>A</em></span></p>
+<p>其中：</p>
+<p><span
+class="math display"><em>A</em> ∈ ℝ<sup><em>r</em> × <em>d</em><sub><em>i</em><em>n</em></sub></sup>,  <em>B</em> ∈ ℝ<sup><em>d</em><sub><em>o</em><em>u</em><em>t</em></sub> × <em>r</em></sup></span></p>
+<p>该层 LoRA 参数量为：</p>
+<p><span
+class="math display"><em>P</em><sub><em>l</em><em>o</em><em>r</em><em>a</em>, <em>l</em><em>a</em><em>y</em><em>e</em><em>r</em></sub> = <em>r</em>(<em>d</em><sub><em>i</em><em>n</em></sub> + <em>d</em><sub><em>o</em><em>u</em><em>t</em></sub>)</span></p>
+<p>如果一个 adapter 覆盖若干 target modules：</p>
+<p><span
+class="math display"><em>P</em><sub><em>a</em><em>d</em><em>a</em><em>p</em><em>t</em><em>e</em><em>r</em></sub> = ∑<sub><em>m</em> ∈ <em>t</em><em>a</em><em>r</em><em>g</em><em>e</em><em>t</em>_<em>m</em><em>o</em><em>d</em><em>u</em><em>l</em><em>e</em><em>s</em></sub><em>r</em><sub><em>m</em></sub>(<em>d</em><sub><em>i</em><em>n</em>, <em>m</em></sub> + <em>d</em><sub><em>o</em><em>u</em><em>t</em>, <em>m</em></sub>)</span></p>
+<p>adapter 文件预算近似为：</p>
+<p><span
+class="math display"><em>M</em><sub><em>a</em><em>d</em><em>a</em><em>p</em><em>t</em><em>e</em><em>r</em></sub> ≈ <em>P</em><sub><em>a</em><em>d</em><em>a</em><em>p</em><em>t</em><em>e</em><em>r</em></sub> × <em>b</em><em>y</em><em>t</em><em>e</em><em>s</em>(<em>d</em><em>t</em><em>y</em><em>p</em><em>e</em>) + <em>M</em><sub><em>m</em><em>e</em><em>t</em><em>a</em><em>d</em><em>a</em><em>t</em><em>a</em></sub></span></p>
+<p>例如 BF16 adapter 使用 2 bytes/parameter。rank 从 16 提到 64，adapter
+参数和服务 hot 层显存近似线性增长 4 倍。target modules 从
+<code>q_proj,v_proj</code> 扩到
+<code>q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj</code>，增长可能比
+rank 调整更剧烈。</p>
+<h3 id="33-训练成本不是唯一成本">3.3 训练成本不是唯一成本</h3>
+<table>
+<thead>
+<tr>
+<th>成本项</th>
+<th>Full fine-tune</th>
+<th>LoRA</th>
+<th>QLoRA</th>
+<th>DoRA</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU 小时</td>
+<td>高</td>
+<td>低</td>
+<td>更低或可用更便宜 GPU</td>
+<td>低到中</td>
+</tr>
+<tr>
+<td>启动时延</td>
+<td>拉取完整 checkpoint，optimizer 初始化重</td>
+<td>主要拉取 base 和 adapter config</td>
+<td>额外加载量化依赖</td>
+<td>依赖实现</td>
+</tr>
+<tr>
+<td>artifact 上传</td>
+<td>完整模型级别</td>
+<td>adapter 级别</td>
+<td>adapter 级别</td>
+<td>adapter 级别</td>
+</tr>
+<tr>
+<td>serving 热加载</td>
+<td>通常不能热加载完整模型</td>
+<td>可热加载</td>
+<td>取决于 serving 是否支持格式</td>
+<td>支持面较窄</td>
+</tr>
+<tr>
+<td>rollback</td>
+<td>需要模型级回滚</td>
+<td>路由切回旧 adapter</td>
+<td>路由切回旧 adapter</td>
+<td>同 LoRA，但要校验 schema</td>
+</tr>
+<tr>
+<td>兼容风险</td>
+<td>新完整模型风险</td>
+<td>base 绑定风险</td>
+<td>base + quantization 绑定风险</td>
+<td>base + schema 支持风险</td>
+</tr>
+</tbody>
+</table>
+<p>工程判断不能只看训练 job 成功率，还要看从提交到 production 的 lead
+time：</p>
+<pre class="text"><code>time_to_prod = queue_wait + data_stage + train + eval + register + preload + canary_window</code></pre>
+<p>FTaaS 的优化目标通常是降低 p50/p95 <code>time_to_first_eval</code> 和
+<code>time_to_prod</code>，而不是追求单个训练 job 的极限 MFU。</p>
+<hr />
+<h2 id="4-系统架构ftaas-控制路径数据路径状态路径故障路径">4.
+系统架构：FTaaS 控制路径、数据路径、状态路径、故障路径</h2>
+<h3 id="41-ftaas-控制面与-artifact-path-到-serving">4.1 FTaaS 控制面与
+artifact path 到 serving</h3>
+<pre class="mermaid">flowchart LR
+  subgraph Tenant[&quot;Tenant / Project&quot;]
+    U[Submit fine-tune request]
+    D[Dataset snapshot]
+  end
+
+  subgraph Control[&quot;FTaaS Control Plane&quot;]
+    API[API + AuthN/AuthZ]
+    AD[Admission: data, quota, base constraints]
+    Q[Priority queue]
+    IMG[Trainer image resolver]
+    SCHED[GPU scheduler]
+    REG[adapter registry]
+    APPR[Approval + release gate]
+  end
+
+  subgraph Train[&quot;Training Data Plane&quot;]
+    STAGE[Data staging]
+    WORKER[LoRA/QLoRA/DoRA worker]
+    CKPT[Checkpoint + adapter artifact]
+    EVAL[Eval + safety scan]
+  end
+
+  subgraph Serve[&quot;Inference Serving Plane&quot;]
+    STORE[Artifact store]
+    EVENT[Registry release event]
+    LOADER[Serving adapter loader]
+    CACHE[GPU/CPU/NVMe adapter cache]
+    ROUTER[Router: tenant, version, A/B]
+    MODEL[Shared base model replicas]
+    AUDIT[Permission + audit log]
+  end
+
+  U --&gt; API
+  D --&gt; AD
+  API --&gt; AD
+  AD --&gt; Q
+  Q --&gt; IMG
+  IMG --&gt; SCHED
+  SCHED --&gt; STAGE
+  STAGE --&gt; WORKER
+  WORKER --&gt; CKPT
+  CKPT --&gt; STORE
+  CKPT --&gt; EVAL
+  EVAL --&gt; REG
+  REG --&gt; APPR
+  APPR --&gt; EVENT
+  EVENT --&gt; LOADER
+  STORE --&gt; LOADER
+  LOADER --&gt; CACHE
+  ROUTER --&gt; AUDIT
+  ROUTER --&gt; MODEL
+  CACHE --&gt; MODEL
+  MODEL --&gt; AUDIT</pre>
+<p>这张图里有四类路径：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>经过组件</th>
+<th>平台责任</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>控制路径</td>
+<td>API、admission、queue、scheduler、approval、release event</td>
+<td>谁能提交、能用什么、排到哪里、何时发布</td>
+</tr>
+<tr>
+<td>数据路径</td>
+<td>dataset snapshot、staging、worker、artifact store、loader</td>
+<td>数据和 adapter 字节如何移动，是否可复现</td>
+</tr>
+<tr>
+<td>状态路径</td>
+<td>job state、eval state、registry state、serving load state</td>
+<td>每个状态由哪个 actor 推进，是否可审计</td>
+</tr>
+<tr>
+<td>故障路径</td>
+<td>rejected、failed、non_deployable、load_failed、rolled_back</td>
+<td>失败是否阻断下一步，旧版本是否保持服务</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-ftaas-状态机">4.2 FTaaS 状态机</h3>
+<pre class="text"><code>submitted
+  -&gt; admitted
+  -&gt; queued
+  -&gt; staging_data
+  -&gt; running
+  -&gt; evaluating
+  -&gt; registered
+  -&gt; approval_pending
+  -&gt; released
+  -&gt; preloading
+  -&gt; canary
+  -&gt; production</code></pre>
+<p>允许的失败转移必须显式建模：</p>
+<table>
+<thead>
+<tr>
+<th>转移</th>
+<th>触发条件</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>submitted -&gt; rejected</code></td>
+<td>数据许可、PII、安全策略、quota、base constraints 不通过</td>
+<td>返回机器可读原因，不创建训练 job</td>
+</tr>
+<tr>
+<td><code>running -&gt; retrying</code></td>
+<td>节点重启、对象存储 5xx、可抢占资源回收</td>
+<td>指数退避，复用最近 checkpoint</td>
+</tr>
+<tr>
+<td><code>running -&gt; failed</code></td>
+<td>配置错误、shape mismatch、数据 schema 错误</td>
+<td>停止重试，生成失败证据</td>
+</tr>
+<tr>
+<td><code>evaluating -&gt; non_deployable</code></td>
+<td>质量、安全、回归门禁未通过</td>
+<td>registry 保留记录，但不能 release</td>
+</tr>
+<tr>
+<td><code>preloading -&gt; load_failed</code></td>
+<td>serving engine 不支持、显存不足、artifact 拉取失败</td>
+<td>保持旧路由，告警</td>
+</tr>
+<tr>
+<td><code>canary -&gt; rolled_back</code></td>
+<td>错误率、TTFT、业务指标、拒答率异常</td>
+<td>route 指向上一 stable version</td>
+</tr>
+</tbody>
+</table>
+<h3 id="43-责任边界">4.3 责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>可以做什么</th>
+<th>不可以做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Training worker</td>
+<td>训练、保存 checkpoint、上报 artifact digest</td>
+<td>不能直接把 adapter 标为 production</td>
+</tr>
+<tr>
+<td>Eval worker</td>
+<td>运行离线质量、安全、兼容评测</td>
+<td>不能绕过审批和 registry</td>
+</tr>
+<tr>
+<td>Adapter registry</td>
+<td>保存元数据、状态、ACL、release event</td>
+<td>不能修改对象存储里的 artifact 字节</td>
+</tr>
+<tr>
+<td>Serving loader</td>
+<td>校验并加载 adapter，上报真实显存增量</td>
+<td>不能变更租户权限和流量比例</td>
+</tr>
+<tr>
+<td>Router/release system</td>
+<td>做 A/B、canary、rollback、traffic split</td>
+<td>不能偷偷替换 base model digest</td>
+</tr>
+<tr>
+<td>Audit service</td>
+<td>记录谁在何时使用或发布哪个 adapter</td>
+<td>不能作为 runtime 权限判断的唯一来源</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-工程化落地准入版本矩阵preflightrelease治理">5.
+工程化落地：准入、版本矩阵、preflight、release、治理</h2>
+<h3 id="51-data-admission">5.1 Data admission</h3>
+<p>数据准入不是“能读到文件就可以训练”。FTaaS
+需要在提交阶段给出确定性拒绝原因。</p>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>证据</th>
+<th>拒绝条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据格式</td>
+<td>JSONL/Parquet schema validate report</td>
+<td>缺少 prompt/response/messages 字段，或 schema 混杂</td>
+</tr>
+<tr>
+<td>样本规模</td>
+<td>sample count、token count、max length histogram</td>
+<td>超过租户 quota 或 base max context</td>
+</tr>
+<tr>
+<td>数据许可</td>
+<td>dataset license tag、owner approval</td>
+<td>license 与 base license 或商用策略冲突</td>
+</tr>
+<tr>
+<td>PII/secret</td>
+<td>scanner report、命中样本 id</td>
+<td>高危 PII 未脱敏，secret 泄露</td>
+</tr>
+<tr>
+<td>安全策略</td>
+<td>policy classifier report</td>
+<td>禁止类别样本比例超过阈值</td>
+</tr>
+<tr>
+<td>去重与污染</td>
+<td>hash dedup、eval contamination scan</td>
+<td>与评测集或禁止语料重叠</td>
+</tr>
+</tbody>
+</table>
+<p>最小 admission 命令可以做成可复现 preflight：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ftaasctl</span> validate-data <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dataset</span> s3://tenant-a/datasets/support-2026-05-01.jsonl <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--schema</span> chat_messages_v2 <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--base-model</span> llama-3.1-8b-instruct@sha256:ab12 <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max-samples</span> 200000 <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max-seq-len</span> 8192 <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--policy</span> commercial-safe-v4</span></code></pre></div>
+<h3 id="52-queuequotaimagebase-model-constraints">5.2
+Queue、quota、image、base model constraints</h3>
+<table>
+<thead>
+<tr>
+<th>控制项</th>
+<th>推荐策略</th>
+<th>失败证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td>按 tenant/project/base_model 分层队列，支持 priority 和 aging</td>
+<td><code>queue_wait_p95</code> 持续升高，单租户占满短作业池</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td>同时限制并发 job、GPU hours/day、artifact size、hot adapter
+count</td>
+<td>租户账单异常或 cache 被单租户挤爆</td>
+</tr>
+<tr>
+<td>Trainer image</td>
+<td>image digest allowlist，不接受浮动 tag</td>
+<td>同一配置两次训练结果不可复现</td>
+</tr>
+<tr>
+<td>Base constraints</td>
+<td>allowlist base id + digest + license + max context + adapter
+support</td>
+<td>训练成功但 serving 不支持</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td>固定 CUDA、driver、PyTorch、PEFT、bitsandbytes、transformers
+组合</td>
+<td>QLoRA resume 失败或数值漂移</td>
+</tr>
+</tbody>
+</table>
+<p>示例版本矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>CUDA/Driver</th>
+<th>PyTorch</th>
+<th>transformers</th>
+<th>PEFT</th>
+<th>bitsandbytes</th>
+<th>serving engine</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lora-bf16-v1</code></td>
+<td>CUDA 12.4 / 550+</td>
+<td>2.4.x</td>
+<td>4.45.x</td>
+<td>0.13.x</td>
+<td>optional</td>
+<td>vLLM Multi-LoRA compatible</td>
+</tr>
+<tr>
+<td><code>qlora-nf4-v1</code></td>
+<td>CUDA 12.1 / 535+</td>
+<td>2.3.x</td>
+<td>4.43.x</td>
+<td>0.12.x</td>
+<td>0.43.x</td>
+<td>adapter export validated before serving</td>
+</tr>
+<tr>
+<td><code>dora-v1</code></td>
+<td>CUDA 12.4 / 550+</td>
+<td>2.4.x</td>
+<td>4.45.x</td>
+<td>0.13.x</td>
+<td>optional</td>
+<td>merge or engine-specific adapter plugin</td>
+</tr>
+</tbody>
+</table>
+<h3 id="53-preflight-for-training-and-serving">5.3 Preflight for
+training and serving</h3>
+<p>训练前 preflight 至少输出一个不可变 manifest：</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">job_id</span><span class="kw">:</span><span class="at"> ftjob-20260504-001392</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">tenant_id</span><span class="kw">:</span><span class="at"> tenant-a</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">base_model</span><span class="kw">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">id</span><span class="kw">:</span><span class="at"> llama-3.1-8b-instruct</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">digest</span><span class="kw">:</span><span class="at"> sha256:ab12...</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">architecture</span><span class="kw">:</span><span class="at"> llama</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_position_embeddings</span><span class="kw">:</span><span class="at"> </span><span class="dv">8192</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">license</span><span class="kw">:</span><span class="at"> llama-community</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">trainer</span><span class="kw">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.internal/ftaas/lora-trainer@sha256:99ef...</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">profile</span><span class="kw">:</span><span class="at"> lora-bf16-v1</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="fu">dataset</span><span class="kw">:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">snapshot</span><span class="kw">:</span><span class="at"> s3://ml-data/tenant-a/support-ds@sha256:2211...</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">samples</span><span class="kw">:</span><span class="at"> </span><span class="dv">120000</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokens_estimate</span><span class="kw">:</span><span class="at"> </span><span class="dv">410000000</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="fu">adapter</span><span class="kw">:</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">method</span><span class="kw">:</span><span class="at"> lora</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rank</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">alpha</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">target_modules</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">q_proj</span><span class="kw">,</span><span class="at"> k_proj</span><span class="kw">,</span><span class="at"> v_proj</span><span class="kw">,</span><span class="at"> o_proj</span><span class="kw">]</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">dropout</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.05</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gpu_type</span><span class="kw">:</span><span class="at"> l4-24gb</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gpu_count</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_runtime_hours</span><span class="kw">:</span><span class="at"> </span><span class="dv">6</span></span></code></pre></div>
+<p>serving 前 preflight 需要校验：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ftaasctl</span> preflight-serving <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--adapter</span> tenant-a/support-bot:2026-05-04.3 <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--serving-pool</span> llama31-8b-prod <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--check-base-digest</span> <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--check-tokenizer</span> <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--check-engine</span> vllm-0.8-lora <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--estimate-hot-memory</span></span></code></pre></div>
+<h3 id="54-adapter-registry-schema-示例">5.4 Adapter registry schema
+示例</h3>
+<p>下面的 schema 是生产上更接近可用的最小记录。注意它既包含 artifact
+信息，也包含 compatibility、release、permission、audit。</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">adapter_id</span><span class="kw">:</span><span class="at"> tenant-a/support-bot</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">adapter_version</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2026-05-04.3&quot;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">status</span><span class="kw">:</span><span class="at"> approval_pending</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">artifact</span><span class="kw">:</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">uri</span><span class="kw">:</span><span class="at"> s3://ml-artifacts/adapters/tenant-a/support-bot/2026-05-04.3/adapter.safetensors</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">digest</span><span class="kw">:</span><span class="at"> sha256:74bb...</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">format</span><span class="kw">:</span><span class="at"> peft-lora-safetensors</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">size_bytes</span><span class="kw">:</span><span class="at"> </span><span class="dv">188743680</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">created_by_job</span><span class="kw">:</span><span class="at"> ftjob-20260504-001392</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">base_compatibility</span><span class="kw">:</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">base_model_id</span><span class="kw">:</span><span class="at"> llama-3.1-8b-instruct</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">base_model_digest</span><span class="kw">:</span><span class="at"> sha256:ab12...</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">architecture</span><span class="kw">:</span><span class="at"> llama</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hidden_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">num_layers</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokenizer_digest</span><span class="kw">:</span><span class="at"> sha256:cf21...</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">chat_template_version</span><span class="kw">:</span><span class="at"> chatml-v3</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_position_embeddings</span><span class="kw">:</span><span class="at"> </span><span class="dv">8192</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="fu">adapter_schema</span><span class="kw">:</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">method</span><span class="kw">:</span><span class="at"> lora</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rank</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">alpha</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">target_modules</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">q_proj</span><span class="kw">,</span><span class="at"> k_proj</span><span class="kw">,</span><span class="at"> v_proj</span><span class="kw">,</span><span class="at"> o_proj</span><span class="kw">]</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">dtype</span><span class="kw">:</span><span class="at"> bf16</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">quantization_dependency</span><span class="kw">:</span><span class="at"> none</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">mergeable</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="fu">policy</span><span class="kw">:</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tenant_id</span><span class="kw">:</span><span class="at"> tenant-a</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">allowed_projects</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">support-prod</span><span class="kw">,</span><span class="at"> support-staging</span><span class="kw">]</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">license</span><span class="kw">:</span><span class="at"> commercial-internal</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">safety_policy</span><span class="kw">:</span><span class="at"> commercial-safe-v4</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pii_review</span><span class="kw">:</span><span class="at"> passed</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="fu">evaluation</span><span class="kw">:</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">report_id</span><span class="kw">:</span><span class="at"> eval-20260504-4432</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">quality_gate</span><span class="kw">:</span><span class="at"> passed</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">safety_gate</span><span class="kw">:</span><span class="at"> passed</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">regression_gate</span><span class="kw">:</span><span class="at"> passed</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metrics</span><span class="kw">:</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">task_f1</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.842</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">refusal_rate</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.031</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">win_rate_vs_previous</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.57</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a><span class="fu">serving</span><span class="kw">:</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">allowed_engines</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">vllm-0.8-lora</span><span class="kw">,</span><span class="at"> lorax</span><span class="fl">-0.9</span><span class="kw">]</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hot_load</span><span class="kw">:</span><span class="at"> allowed</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_traffic_percent</span><span class="kw">:</span><span class="at"> </span><span class="dv">25</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rollback_target</span><span class="kw">:</span><span class="at"> tenant-a/support-bot:2026-04-29.2</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a><span class="fu">audit</span><span class="kw">:</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">requested_by</span><span class="kw">:</span><span class="at"> alice@example.com</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">approved_by</span><span class="kw">:</span><span class="at"> bob@example.com</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">approval_ticket</span><span class="kw">:</span><span class="at"> CHG-89231</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">created_at</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2026-05-04T10:12:33Z&quot;</span></span></code></pre></div>
+<h3 id="55-artifact-release">5.5 Artifact release</h3>
+<p>artifact release 不是把文件复制到线上目录。推荐把 release
+拆成四个独立动作：</p>
+<ol type="1">
+<li><strong>Freeze</strong>：训练 worker 写入 artifact，生成
+digest，关闭写权限。</li>
+<li><strong>Register</strong>：registry 记录 artifact 与 compatibility
+metadata，状态为 <code>registered</code>。</li>
+<li><strong>Approve</strong>：自动门禁和人工审批把状态推进到
+<code>released</code> 或 <code>non_deployable</code>。</li>
+<li><strong>Load</strong>：serving loader 根据 release event 拉取
+artifact，完成 hot load 后上报 <code>loaded_revision</code>。</li>
 </ol>
-</section>
+<p>任何一步失败都不能覆盖旧版本 route。production route
+只引用已经加载成功的 adapter revision。</p>
+<hr />
+<h2 id="6-adapterbase-compatibility从能加载到可信运行">6. Adapter/Base
+Compatibility：从能加载到可信运行</h2>
+<h3 id="61-兼容性维度">6.1 兼容性维度</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>必须校验什么</th>
+<th>常见证据</th>
+<th>默认策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Architecture</td>
+<td><code>llama</code>、<code>mistral</code>、<code>qwen</code>、层数、hidden
+size、attention 结构</td>
+<td>config diff、state_dict key list</td>
+<td>不匹配直接拒绝</td>
+</tr>
+<tr>
+<td>Tokenizer</td>
+<td>vocab、special tokens、BOS/EOS、added tokens</td>
+<td>tokenizer digest、sample encode diff</td>
+<td>digest 不同进入 review</td>
+</tr>
+<tr>
+<td>Chat template</td>
+<td>system/user/assistant 包装、工具调用格式</td>
+<td>template version、golden prompt replay</td>
+<td>变化后不允许自动 production</td>
+</tr>
+<tr>
+<td>Rank/alpha</td>
+<td>rank、alpha、dropout、scaling</td>
+<td>adapter config</td>
+<td>schema 不同按新 adapter type 管理</td>
+</tr>
+<tr>
+<td>Target modules</td>
+<td>q/k/v/o、MLP、embedding、lm_head</td>
+<td>module existence check、shape check</td>
+<td>key/shape 不匹配拒绝</td>
+</tr>
+<tr>
+<td>Quantization</td>
+<td>NF4、int8、AWQ/GPTQ、serving dtype</td>
+<td>quantization config、engine matrix</td>
+<td>训练量化与 serving 不一致时重评</td>
+</tr>
+<tr>
+<td>License</td>
+<td>base license、dataset license、adapter license</td>
+<td>policy scan、legal tag</td>
+<td>冲突则拒绝 release</td>
+</tr>
+<tr>
+<td>Safety policy</td>
+<td>数据安全、输出安全、拒答策略</td>
+<td>eval report、policy version</td>
+<td>policy 不一致时 shadow only</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-shape-通过不是上线许可">6.2 “shape 通过”不是上线许可</h3>
+<p>最危险的兼容问题不是 loader 报错，而是 loader
+成功但语义漂移。下面几种变化都可能 shape 通过：</p>
+<ul>
+<li>base model 做了新的 SFT/DPO 后训练。</li>
+<li>tokenizer 只新增了 special token。</li>
+<li>chat template 增加了工具调用字段。</li>
+<li>safety policy 从 <code>research-safe</code> 切到
+<code>commercial-safe</code>。</li>
+<li>serving engine 改了 LoRA scaling 或 dtype 路径。</li>
+</ul>
+<p>因此 compatibility gate
+只能证明“允许进入下一阶段”，不能替代离线评测、shadow、canary 和线上
+per-adapter 指标。</p>
+<h3 id="63-compatibility-preflight-输出示例">6.3 Compatibility preflight
+输出示例</h3>
+<pre class="text"><code>adapter: tenant-a/support-bot:2026-05-04.3
+base digest: expected sha256:ab12..., serving sha256:ab12... OK
+tokenizer digest: expected sha256:cf21..., serving sha256:cf21... OK
+target modules: q_proj,k_proj,v_proj,o_proj OK
+rank/alpha: rank=16 alpha=32 OK
+engine support: vllm-0.8-lora OK
+license: commercial-internal + llama-community OK
+safety policy: commercial-safe-v4 OK
+estimated loaded delta: 214 MiB
+decision: load_allowed</code></pre>
+<hr />
+<h2 id="7-merge-deployment-与-dynamic-attach">7. Merge Deployment 与
+Dynamic Attach</h2>
+<h3 id="71-两种-deployment-策略">7.1 两种 deployment 策略</h3>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优点</th>
+<th>代价</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Merge deployment</td>
+<td>将 adapter 合并到 base 权重，导出完整模型或量化模型</td>
+<td>推理路径简单，batching 友好，运行时权限和 cache 简化</td>
+<td>发布慢，制品大，每版本占完整模型资源</td>
+<td>少量稳定版本、单租户、吞吐优先</td>
+</tr>
+<tr>
+<td>Dynamic attach</td>
+<td>base 常驻，adapter 按请求或租户动态 attach</td>
+<td>多租户成本低，hot load 快，A/B 和 rollback 细粒度</td>
+<td>cache、权限、fragmentation、路由复杂</td>
+<td>大量租户、高频实验、FTaaS 平台</td>
+</tr>
+</tbody>
+</table>
+<p>LoRA 是训练形态，Multi-LoRA 是服务形态。训练用 LoRA 后，既可以
+merge，也可以 dynamic attach；full fine-tune 也可以被拆成独立 serving
+pool。</p>
+<h3 id="72-决策边界">7.2 决策边界</h3>
+<table>
+<thead>
+<tr>
+<th>判断问题</th>
+<th>倾向 merge</th>
+<th>倾向 dynamic attach</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>adapter 数量</td>
+<td>1-5 个稳定版本</td>
+<td>数十到数千个版本</td>
+</tr>
+<tr>
+<td>流量分布</td>
+<td>单版本高流量</td>
+<td>长尾租户 + 少量热点</td>
+</tr>
+<tr>
+<td>发布频率</td>
+<td>周级/月级</td>
+<td>小时级/天级</td>
+</tr>
+<tr>
+<td>服务目标</td>
+<td>极限吞吐、固定 SLA</td>
+<td>快速上线、多租户隔离</td>
+</tr>
+<tr>
+<td>回滚方式</td>
+<td>模型版本回滚</td>
+<td>路由层 rollback</td>
+</tr>
+<tr>
+<td>权限治理</td>
+<td>服务实例级</td>
+<td>请求/租户/adapter 级</td>
+</tr>
+</tbody>
+</table>
+<h3 id="73-serving-hot-load-config-示例">7.3 Serving hot-load config
+示例</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">serving_pool</span><span class="kw">:</span><span class="at"> llama31-8b-prod</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">base_model</span><span class="kw">:</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">id</span><span class="kw">:</span><span class="at"> llama-3.1-8b-instruct</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">digest</span><span class="kw">:</span><span class="at"> sha256:ab12...</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="fu">engine</span><span class="kw">:</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> vllm</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">version</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;0.8-lora&quot;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">dtype</span><span class="kw">:</span><span class="at"> bf16</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="fu">multi_lora</span><span class="kw">:</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">enabled</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_loras_per_replica</span><span class="kw">:</span><span class="at"> </span><span class="dv">48</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_lora_rank</span><span class="kw">:</span><span class="at"> </span><span class="dv">64</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hot_cache_memory_gib</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">warm_cache_path</span><span class="kw">:</span><span class="at"> /mnt/nvme/adapter-cache</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">eviction_policy</span><span class="kw">:</span><span class="at"> weighted_lru</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">preload_on_release</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">load_timeout_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">30000</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">unload_grace_period_ms</span><span class="kw">:</span><span class="at"> </span><span class="dv">60000</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="fu">routing</span><span class="kw">:</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">default_adapter</span><span class="kw">:</span><span class="at"> none</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">tenant</span><span class="kw">:</span><span class="at"> tenant-a</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">project</span><span class="kw">:</span><span class="at"> support-prod</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">adapter</span><span class="kw">:</span><span class="at"> tenant-a/support-bot:2026-05-04.3</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">traffic_percent</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ab_bucket</span><span class="kw">:</span><span class="at"> canary</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">rollback_target</span><span class="kw">:</span><span class="at"> tenant-a/support-bot:2026-04-29.2</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="fu">permissions</span><span class="kw">:</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">enforce_adapter_acl</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">deny_cross_tenant_route</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="fu">audit</span><span class="kw">:</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">log_adapter_id</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">log_release_id</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">sample_rate</span><span class="kw">:</span><span class="at"> </span><span class="fl">1.0</span></span></code></pre></div>
+<hr />
+<h2 id="8-multi-lora-servinghot-loadcacheabrollbackpermissionaudit">8.
+Multi-LoRA Serving：Hot
+Load、Cache、A/B、Rollback、Permission、Audit</h2>
+<h3 id="81-runtime-数据路径">8.1 Runtime 数据路径</h3>
+<pre class="text"><code>request
+  -&gt; gateway auth
+  -&gt; route lookup(tenant, project, model_alias, A/B bucket)
+  -&gt; permission check(adapter ACL, base license, safety policy)
+  -&gt; adapter cache lookup(GPU hot -&gt; CPU/NVMe warm -&gt; object store cold)
+  -&gt; hot load if admitted
+  -&gt; shared base model forward with selected adapter
+  -&gt; per-adapter metrics and audit log</code></pre>
+<h3 id="82-hot-load-不是简单-load-file">8.2 Hot load 不是简单 load
+file</h3>
+<p>一次 adapter hot load 至少包括：</p>
+<ol type="1">
+<li>从 registry 读取 adapter record 和 artifact digest。</li>
+<li>校验 serving pool 的 base digest、tokenizer、engine、policy。</li>
+<li>检查 GPU hot cache 预算，必要时选择可驱逐 adapter。</li>
+<li>从 warm/cold 层拉取 artifact，并校验 digest。</li>
+<li>在 engine 内创建 adapter handle，绑定 rank、target
+modules、dtype。</li>
+<li>运行小流量 synthetic prompt 或 golden prompt smoke test。</li>
+<li>上报 loaded revision、load latency、loaded delta memory。</li>
+</ol>
+<p>如果第 3 步无法找到足够预算，应该返回
+<code>load_blocked_capacity</code>，而不是强行加载等 CUDA OOM。</p>
+<h3 id="83-cache-分层">8.3 Cache 分层</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>位置</th>
+<th>目标</th>
+<th>典型指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot</td>
+<td>GPU memory</td>
+<td>最低 TTFT，直接参与请求</td>
+<td>hot hit rate、loaded adapters、evictions、fragmentation</td>
+</tr>
+<tr>
+<td>Warm</td>
+<td>CPU memory 或本地 NVMe</td>
+<td>避免对象存储冷拉取</td>
+<td>warm hit rate、promotion latency</td>
+</tr>
+<tr>
+<td>Cold</td>
+<td>Artifact store + registry</td>
+<td>真实来源和审计归档</td>
+<td>fetch latency、digest mismatch、object 404</td>
+</tr>
+</tbody>
+</table>
+<p>Weighted LRU 比纯 LRU 更适合多租户，因为它可以把租户等级、canary
+状态、预约活动、历史 QPS 纳入驱逐权重。驱逐时必须跳过 active requests
+绑定的 adapter。</p>
+<h3 id="84-ab-与-rollback">8.4 A/B 与 rollback</h3>
+<p>adapter A/B 不是普通 feature flag。它必须带上 base digest、adapter
+version 和 safety policy：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>流量</th>
+<th>放行条件</th>
+<th>失败动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Offline eval</td>
+<td>0%</td>
+<td>任务指标、安全、回归门禁通过</td>
+<td><code>non_deployable</code></td>
+</tr>
+<tr>
+<td>Shadow/replay</td>
+<td>0% 用户可见</td>
+<td>输出差异、拒答率、延迟在阈值内</td>
+<td>保持 shadow only</td>
+</tr>
+<tr>
+<td>Canary</td>
+<td>1%-10%</td>
+<td>p95 TTFT、错误率、质量代理指标达标</td>
+<td>route rollback</td>
+</tr>
+<tr>
+<td>Ramp</td>
+<td>10%-50%</td>
+<td>分租户指标稳定</td>
+<td>暂停扩量或回滚</td>
+</tr>
+<tr>
+<td>Production</td>
+<td>100% 或默认路由</td>
+<td>变更窗口结束，审计完成</td>
+<td>保留上一 stable revision</td>
+</tr>
+</tbody>
+</table>
+<p>rollback 必须是路由层原子切换，不依赖重新训练，也不依赖卸载新
+adapter。常见策略是先把 route 指回
+<code>rollback_target</code>，再异步卸载坏 adapter。</p>
+<h3 id="85-permission-与-audit">8.5 Permission 与 audit</h3>
+<p>多租户 Multi-LoRA
+的权限要在请求路径执行，而不是只在控制台隐藏按钮：</p>
+<ul>
+<li>request tenant 必须能访问 adapter tenant。</li>
+<li>adapter policy 必须允许目标 project 和 serving pool。</li>
+<li>base license 和 adapter license 不能冲突。</li>
+<li>safety policy 必须满足目标 route 的策略。</li>
+<li>audit log 必须记录 request id、tenant、base digest、adapter
+id、adapter version、release id、A/B bucket。</li>
+</ul>
+<p>审计样例：</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;request_id&quot;</span><span class="fu">:</span> <span class="st">&quot;req-91a2&quot;</span><span class="fu">,</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;tenant_id&quot;</span><span class="fu">:</span> <span class="st">&quot;tenant-a&quot;</span><span class="fu">,</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;serving_pool&quot;</span><span class="fu">:</span> <span class="st">&quot;llama31-8b-prod&quot;</span><span class="fu">,</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;base_model_digest&quot;</span><span class="fu">:</span> <span class="st">&quot;sha256:ab12...&quot;</span><span class="fu">,</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;adapter&quot;</span><span class="fu">:</span> <span class="st">&quot;tenant-a/support-bot:2026-05-04.3&quot;</span><span class="fu">,</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;route_rule&quot;</span><span class="fu">:</span> <span class="st">&quot;rr-20260504-77&quot;</span><span class="fu">,</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ab_bucket&quot;</span><span class="fu">:</span> <span class="st">&quot;canary&quot;</span><span class="fu">,</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;decision&quot;</span><span class="fu">:</span> <span class="st">&quot;allowed&quot;</span><span class="fu">,</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="st">&quot;2026-05-04T12:40:11Z&quot;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<hr />
+<h2 id="9-容量与效率adapter-memory-budget-和-tenant-capacity-model">9.
+容量与效率：Adapter Memory Budget 和 Tenant Capacity Model</h2>
+<h3 id="91-单副本显存预算">9.1 单副本显存预算</h3>
+<p>Multi-LoRA serving 的显存预算不能只看 adapter
+文件大小。一个实用公式是：</p>
+<p><span
+class="math display"><em>M</em><sub><em>g</em><em>p</em><em>u</em></sub> ≥ <em>M</em><sub><em>b</em><em>a</em><em>s</em><em>e</em></sub> + <em>M</em><sub><em>h</em><em>o</em><em>t</em>_<em>a</em><em>d</em><em>a</em><em>p</em><em>t</em><em>e</em><em>r</em><em>s</em></sub> + <em>M</em><sub><em>k</em><em>v</em>_<em>c</em><em>a</em><em>c</em><em>h</em><em>e</em>, <em>p</em>95</sub> + <em>M</em><sub><em>w</em><em>o</em><em>r</em><em>k</em><em>s</em><em>p</em><em>a</em><em>c</em><em>e</em></sub> + <em>M</em><sub><em>f</em><em>r</em><em>a</em><em>g</em><em>m</em><em>e</em><em>n</em><em>t</em><em>a</em><em>t</em><em>i</em><em>o</em><em>n</em></sub> + <em>M</em><sub><em>s</em><em>a</em><em>f</em><em>e</em><em>t</em><em>y</em></sub></span></p>
+<p>其中：</p>
+<p><span class="math display">$$
+M_{hot\_adapters} = \sum_{i=1}^{N_{hot}} P_{adapter,i} \times
+bytes(dtype) \times \gamma_{engine}
+$$</span></p>
+<p><code>gamma_engine</code> 是 serving engine 对 adapter
+handle、padding、alignment、metadata 的放大系数。生产上不要假设它等于
+1，应该由 loader 上报真实 delta memory。容量准入可以写成：</p>
+<p><span class="math display">$$
+N_{hot,max} = \left\lfloor \frac{M_{gpu,total} - M_{base} - M_{kv,p95} -
+M_{workspace} - M_{fragmentation} - M_{safety}}{M_{adapter,p95}}
+\right\rfloor
+$$</span></p>
+<h3 id="92-数字模型">9.2 数字模型</h3>
+<p>假设一个 80 GB GPU 副本：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU total</td>
+<td>80 GiB</td>
+</tr>
+<tr>
+<td>base model BF16 常驻</td>
+<td>32 GiB</td>
+</tr>
+<tr>
+<td>p95 KV cache 预算</td>
+<td>22 GiB</td>
+</tr>
+<tr>
+<td>workspace/CUDA graph</td>
+<td>4 GiB</td>
+</tr>
+<tr>
+<td>fragmentation reserve</td>
+<td>4 GiB</td>
+</tr>
+<tr>
+<td>safety margin</td>
+<td>8 GiB</td>
+</tr>
+<tr>
+<td>p95 adapter loaded delta</td>
+<td>180 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>可用于 hot adapter 的预算：</p>
+<pre class="text"><code>80 - 32 - 22 - 4 - 4 - 8 = 10 GiB</code></pre>
+<p>可常驻 hot adapter 数：</p>
+<pre class="text"><code>floor(10 GiB / 180 MiB) = floor(10240 / 180) = 56</code></pre>
+<p>如果产品要求 90 个 hot
+adapters，不能只改配置。必须至少做一项取舍：</p>
+<ul>
+<li>降低 p95 KV cache 预算，例如缩短 max context 或降低并发。</li>
+<li>增加副本数，把 hot set 分片到多个 serving pools。</li>
+<li>减小 adapter rank/target modules。</li>
+<li>使用更大显存 GPU。</li>
+<li>接受更高 cold/warm load rate 和 TTFT 抖动。</li>
+</ul>
+<h3 id="93-租户容量模型">9.3 租户容量模型</h3>
+<p>多租户平台还要限制每个租户能占多少热层：</p>
+<p><span
+class="math display"><em>q</em><em>u</em><em>o</em><em>t</em><em>a</em><sub><em>t</em><em>e</em><em>n</em><em>a</em><em>n</em><em>t</em>, <em>h</em><em>o</em><em>t</em></sub> = min (<em>Q</em><sub><em>c</em><em>o</em><em>n</em><em>t</em><em>r</em><em>a</em><em>c</em><em>t</em></sub>, ⌊<em>N</em><sub><em>h</em><em>o</em><em>t</em>, <em>m</em><em>a</em><em>x</em></sub> × <em>w</em><em>e</em><em>i</em><em>g</em><em>h</em><em>t</em><sub><em>t</em><em>e</em><em>n</em><em>a</em><em>n</em><em>t</em></sub>⌋)</span></p>
+<p>其中 <code>weight_tenant</code> 来自套餐、历史 QPS、SLO
+等级和活动预约。实际 admission 规则：</p>
+<pre class="text"><code>if tenant_hot_loaded + requested_preload &gt; quota_tenant_hot:
+  reject preload or place adapter in warm tier
+if pool_free_hot_memory &lt; requested_adapter_delta + safety_delta:
+  reject load_blocked_capacity
+if tenant_qps surge is scheduled:
+  temporarily raise weight with expiry</code></pre>
+<p>这个模型能防止一个租户把所有 GPU hot cache
+占满，也能让平台把高价值活动的 adapter 预加载做成显式预约。</p>
+<hr />
+<h2 id="10-框架实现真实-knobs-与约束">10. 框架实现：真实 knobs
+与约束</h2>
+<h3 id="101-training-knobs">10.1 Training knobs</h3>
+<table>
+<thead>
+<tr>
+<th>框架/库</th>
+<th>Knob</th>
+<th>工程含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hugging Face PEFT</td>
+<td><code>LoraConfig(r, lora_alpha, target_modules, lora_dropout, task_type)</code></td>
+<td>决定 adapter 参数量、服务兼容性和质量容量</td>
+</tr>
+<tr>
+<td>transformers Trainer</td>
+<td><code>gradient_checkpointing</code>, <code>bf16</code>,
+<code>per_device_train_batch_size</code>,
+<code>gradient_accumulation_steps</code></td>
+<td>显存/吞吐/稳定性的核心旋钮</td>
+</tr>
+<tr>
+<td>bitsandbytes</td>
+<td><code>load_in_4bit</code>, <code>bnb_4bit_quant_type="nf4"</code>,
+<code>bnb_4bit_compute_dtype</code></td>
+<td>QLoRA 训练显存和数值路径</td>
+</tr>
+<tr>
+<td>DeepSpeed</td>
+<td>ZeRO stage、offload、bf16/fp16</td>
+<td>full fine-tune 或较大 adapter 训练的状态切分</td>
+</tr>
+<tr>
+<td>Accelerate</td>
+<td><code>device_map</code>, <code>mixed_precision</code>, multi-GPU
+launch</td>
+<td>轻量分布式 fine-tuning</td>
+</tr>
+<tr>
+<td>Ray/Kueue/Volcano</td>
+<td>queue、priority、quota、gang scheduling</td>
+<td>FTaaS 作业调度</td>
+</tr>
+</tbody>
+</table>
+<p>训练配置示例：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">method</span><span class="kw">:</span><span class="at"> qlora</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">base_model</span><span class="kw">:</span><span class="at"> llama-3.1-8b-instruct@sha256:ab12...</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">tokenizer</span><span class="kw">:</span><span class="at"> llama-3.1-8b-instruct@sha256:cf21...</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">peft</span><span class="kw">:</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">r</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lora_alpha</span><span class="kw">:</span><span class="at"> </span><span class="dv">32</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lora_dropout</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.05</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">target_modules</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">q_proj</span><span class="kw">,</span><span class="at"> k_proj</span><span class="kw">,</span><span class="at"> v_proj</span><span class="kw">,</span><span class="at"> o_proj</span><span class="kw">]</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">bias</span><span class="kw">:</span><span class="at"> none</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="fu">quantization</span><span class="kw">:</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">load_in_4bit</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">bnb_4bit_quant_type</span><span class="kw">:</span><span class="at"> nf4</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">bnb_4bit_compute_dtype</span><span class="kw">:</span><span class="at"> bfloat16</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="fu">training</span><span class="kw">:</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">bf16</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gradient_checkpointing</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">per_device_train_batch_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gradient_accumulation_steps</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_seq_length</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">learning_rate</span><span class="kw">:</span><span class="at"> </span><span class="fl">2.0e-4</span></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_steps</span><span class="kw">:</span><span class="at"> </span><span class="dv">3000</span></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a><span class="fu">artifact</span><span class="kw">:</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">save_format</span><span class="kw">:</span><span class="at"> safetensors</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">publish_to_registry</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div>
+<h3 id="102-serving-knobs">10.2 Serving knobs</h3>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Multi-LoRA 相关约束</th>
+<th>平台动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM Multi-LoRA</td>
+<td>max LoRA rank、max loaded adapters、adapter dtype、scheduler
+支持</td>
+<td>registry 记录 allowed engine 和 rank 上限</td>
+</tr>
+<tr>
+<td>LoRAX</td>
+<td>面向 adapter serving，支持动态选择和加载</td>
+<td>强化 artifact cache 和 route metadata</td>
+</tr>
+<tr>
+<td>TensorRT-LLM</td>
+<td>追求吞吐，LoRA 支持受版本和构建约束影响</td>
+<td>需要 engine-specific compatibility matrix</td>
+</tr>
+<tr>
+<td>TGI</td>
+<td>取决于版本和 LoRA 支持路径</td>
+<td>不允许 registry 泛化为所有 engine</td>
+</tr>
+</tbody>
+</table>
+<p>平台不要把“PEFT 能训练”推导成“所有 serving engine 都能 hot
+load”。每个 adapter release 都应经过 engine-specific preflight。</p>
+<hr />
+<h2 id="11-故障排除">11. 故障排除</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>根因</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>adapter incompatible</td>
+<td>loader 报 missing keys、shape mismatch；preflight 显示
+base/tokenizer digest 不一致</td>
+<td>base architecture、target modules、rank schema、tokenizer 或 chat
+template 不匹配</td>
+<td>阻断 release；把 registry 状态置为
+<code>load_blocked_incompatible</code>；要求重训或重新验收</td>
+</tr>
+<tr>
+<td>hot-load failure</td>
+<td><code>load_timeout_ms</code> 超时、artifact 404、digest
+mismatch、engine unsupported</td>
+<td>artifact 未 freeze、对象存储权限错误、engine 不支持 DoRA/QLoRA
+export 格式</td>
+<td>保持旧路由；修复 artifact ACL；补 engine matrix；重新触发
+preload</td>
+</tr>
+<tr>
+<td>fragmentation / OOM</td>
+<td>GPU free memory 看似足够但 CUDA OOM；eviction 增多；load delta
+波动大</td>
+<td>hot adapter 频繁加载卸载、KV cache 波峰、allocator
+fragmentation、短时双拷贝</td>
+<td>提高 safety margin；降低 max_loras_per_replica；重启滚动整理；把长尾
+adapter 留在 warm tier</td>
+</tr>
+<tr>
+<td>quality regression</td>
+<td>canary win rate 下降、拒答率上升、业务错误率升高，loader 无报错</td>
+<td>base 语义漂移、数据污染、rank/target modules 不足、chat template
+变化</td>
+<td>route rollback；冻结问题版本；做 golden set diff；必要时重训</td>
+</tr>
+<tr>
+<td>tenant isolation breach</td>
+<td>audit 显示 tenant-b 请求命中 tenant-a adapter；route miss 增多</td>
+<td>router 规则默认值错误、ACL 未在 runtime 执行、adapter id
+命名不隔离</td>
+<td>立即关闭 route；按 request id 审计影响范围；强制 runtime ACL；增加
+deny-cross-tenant 测试</td>
+</tr>
+<tr>
+<td>queue starvation</td>
+<td>某些租户 <code>queue_wait_p95</code> 高，GPU 空闲碎片多</td>
+<td>队列只按 FIFO，未按 base locality 和 quota 分层</td>
+<td>引入 tenant fair share、priority aging、base-aware scheduling</td>
+</tr>
+<tr>
+<td>eval passed but production failed</td>
+<td>离线指标正常，线上 TTFT/错误率异常</td>
+<td>eval 未覆盖 serving engine、真实 template 或长上下文</td>
+<td>增加 shadow/replay；把 serving smoke test 纳入 release gate</td>
+</tr>
+</tbody>
+</table>
+<p>排障顺序建议：</p>
+<pre class="text"><code>registry record -&gt; compatibility preflight -&gt; artifact digest -&gt; serving loader log
+  -&gt; GPU memory timeline -&gt; router decision log -&gt; per-adapter quality metrics</code></pre>
+<p>不要从“重新训练一个 adapter”开始排障。很多事故根因在
+registry、route、cache 或 serving engine。</p>
+<hr />
+<h2 id="12-方案设计--worked-example多租户-lora-平台">12. 方案设计 /
+Worked Example：多租户 LoRA 平台</h2>
+<h3 id="121-背景">12.1 背景</h3>
+<p>一家 SaaS 公司要给 200 个企业租户提供客服助手定制能力。统一 base
+model 是 <code>llama-3.1-8b-instruct</code>，每个租户可以上传自己的
+FAQ、工单、话术样例，平台训练 LoRA adapter 并接入共享推理池。</p>
+<p>业务目标：</p>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>租户数</td>
+<td>200</td>
+</tr>
+<tr>
+<td>每天 fine-tune job</td>
+<td>300 p50，600 p95</td>
+</tr>
+<tr>
+<td>单 job 数据</td>
+<td>20k-150k samples，p95 5e8 tokens</td>
+</tr>
+<tr>
+<td>time_to_first_eval</td>
+<td>p95 &lt; 4 小时</td>
+</tr>
+<tr>
+<td>production release</td>
+<td>自动门禁通过后 30 分钟内可 canary</td>
+</tr>
+<tr>
+<td>推理 QPS</td>
+<td>全平台 1200 QPS，前 20 租户占 70%</td>
+</tr>
+<tr>
+<td>GPU</td>
+<td>训练池 32 x L4 24GB；服务池 24 x H100 80GB</td>
+</tr>
+</tbody>
+</table>
+<h3 id="122-训练平台设计">12.2 训练平台设计</h3>
+<p>决策：</p>
+<ol type="1">
+<li>只允许 <code>lora-bf16-v1</code> 和 <code>qlora-nf4-v1</code> 两个
+trainer profile。</li>
+<li>每个租户默认并发 2 个 training jobs，企业级租户可到 8 个。</li>
+<li>每个 job admission 限制 max runtime 6 小时、max seq length 8192、max
+artifact 512 MiB。</li>
+<li>数据准入必须通过 PII scan、license scan、schema validation、eval
+contamination scan。</li>
+<li>full fine-tune 不进入 FTaaS 自动发布
+pipeline，只走离线训练队列和单独评审。</li>
+</ol>
+<p>调度策略：</p>
+<pre class="text"><code>queue_key = (base_model_digest, trainer_profile, tenant_priority)
+score = priority_weight + aging_minutes * 0.1 + base_locality_bonus - quota_penalty</code></pre>
+<p>这样做的原因是 base locality 会减少反复拉取 base checkpoint
+的冷启动，tenant quota 防止一个大租户把短作业池占满，aging
+防止低优先级任务长期饥饿。</p>
+<h3 id="123-registry-与-release">12.3 Registry 与 release</h3>
+<p>每个 adapter 注册后进入 <code>approval_pending</code>。自动 release
+条件：</p>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>task metric</td>
+<td>相比上一 stable adapter 不低于 -1%，或 win rate &gt;= 0.53</td>
+</tr>
+<tr>
+<td>safety regression</td>
+<td>高危输出不高于上一版本</td>
+</tr>
+<tr>
+<td>refusal rate</td>
+<td>绝对变化 &lt; 2%</td>
+</tr>
+<tr>
+<td>compatibility</td>
+<td>base/tokenizer/template/engine 全部通过</td>
+</tr>
+<tr>
+<td>artifact</td>
+<td>digest 校验通过，size &lt; 512 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>如果租户开启自动发布，版本进入 shadow 30 分钟，再 5% canary 60
+分钟。失败时 route rollback 到 <code>rollback_target</code>。</p>
+<h3 id="124-serving-platform-设计">12.4 Serving platform 设计</h3>
+<p>服务池 24 x H100 80GB，按 3 个 pool 分片：</p>
+<table>
+<thead>
+<tr>
+<th>Pool</th>
+<th>副本</th>
+<th>租户</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>hot-enterprise</td>
+<td>10</td>
+<td>前 20 租户</td>
+<td>每副本最多 56 个 hot adapters，预加载活动版本</td>
+</tr>
+<tr>
+<td>standard</td>
+<td>10</td>
+<td>中等流量租户</td>
+<td>weighted LRU，warm tier NVMe</td>
+</tr>
+<tr>
+<td>long-tail</td>
+<td>4</td>
+<td>低频租户</td>
+<td>更小 hot cache，允许较高 warm load</td>
+</tr>
+</tbody>
+</table>
+<p>使用第 9 节模型，单 H100 可放约 56 个 p95 adapter。平台不把 200
+个租户全部放进每个副本，而是按流量分片。这样前 20 租户有更高 cache hit
+rate，长尾租户接受更高 TTFT。</p>
+<h3 id="125-关键取舍">12.5 关键取舍</h3>
+<table>
+<thead>
+<tr>
+<th>取舍</th>
+<th>选择</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LoRA vs full fine-tune</td>
+<td>FTaaS 默认 LoRA/QLoRA</td>
+<td>满足短反馈和多租户上线；full fine-tune 走独立评审</td>
+</tr>
+<tr>
+<td>Dynamic attach vs merge</td>
+<td>多租户默认 dynamic attach</td>
+<td>每天数百版本，merge 会造成模型副本爆炸</td>
+</tr>
+<tr>
+<td>Hot cache 策略</td>
+<td>weighted LRU + preload</td>
+<td>纯 LRU 会在大客户活动前冷启动</td>
+</tr>
+<tr>
+<td>A/B 粒度</td>
+<td>tenant + adapter version + release id</td>
+<td>只按 model alias 不足以审计</td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td>route rollback first，卸载异步</td>
+<td>回滚不依赖 loader 或训练系统</td>
+</tr>
+</tbody>
+</table>
+<h3 id="126-演练一次-adapter-从训练到上线">12.6 演练：一次 adapter
+从训练到上线</h3>
+<pre class="text"><code>10:00 tenant-a 提交 support-bot 数据集
+10:03 data admission 通过，job 进入 queue
+10:18 scheduler 分配 4 x L4，开始 QLoRA
+12:41 worker freeze adapter，写入 artifact digest
+12:55 eval 通过，registry 创建版本 2026-05-04.3
+13:02 approval gate 通过，release event 发给 hot-enterprise pool
+13:05 10 个副本 preload 完成，load p95 7.4s，delta memory 204 MiB
+13:10 shadow 开始，真实流量 replay 不返回用户
+13:40 canary 5%，route rule 绑定 rollback_target
+14:40 指标达标，扩到 25%</code></pre>
+<p>如果 13:40 canary 发现拒答率从 3% 升到 8%，release system 立即把
+route 指回上一版本。问题 adapter 保留在 registry，状态改成
+<code>rolled_back_quality</code>，训练和评测团队用 golden prompt diff
+排查。</p>
+<hr />
+<h2 id="13-反模式">13. 反模式</h2>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>为什么危险</th>
+<th>替代方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只保存 adapter 文件路径</td>
+<td>无法证明兼容哪个 base、tokenizer、template</td>
+<td>adapter registry 保存完整 contract</td>
+</tr>
+<tr>
+<td>所有 base model 使用浮动标签</td>
+<td>同名 checkpoint 被覆盖后旧 adapter 静默漂移</td>
+<td>使用 digest 和不可变 release</td>
+</tr>
+<tr>
+<td>训练成功自动上线</td>
+<td>质量、安全、兼容和服务加载都可能失败</td>
+<td>训练、评测、注册、审批、加载分离</td>
+</tr>
+<tr>
+<td>不限制 rank 和 target modules</td>
+<td>租户可制造超大 adapter，占满 hot cache</td>
+<td>admission 限制 max rank、target modules allowlist</td>
+</tr>
+<tr>
+<td>把 ACL 只做在控制台</td>
+<td>runtime route 仍可能越权</td>
+<td>serving path 强制 permission check</td>
+</tr>
+<tr>
+<td>用纯 LRU 管所有租户</td>
+<td>高价值租户活动前可能被长尾驱逐</td>
+<td>weighted LRU + preload + tenant quota</td>
+</tr>
+<tr>
+<td>merge 和 dynamic attach 混用但无记录</td>
+<td>回滚时不知道线上到底跑的是哪个权重</td>
+<td>route 记录 deployment mode 和 digest</td>
+</tr>
+<tr>
+<td>base 升级原地替换</td>
+<td>所有 adapter 生态同时暴露在语义漂移下</td>
+<td>新旧 base 并存，adapter 分批重训与 canary</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="14-ftaas-和-multi-adapter-production-readiness-checklist">14.
+FTaaS 和 Multi-Adapter Production Readiness Checklist</h2>
+<h3 id="141-ftaas-readiness">14.1 FTaaS readiness</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />数据准入覆盖
+schema、PII、license、安全策略、污染扫描和 token length
+histogram。</label></li>
+<li><label><input type="checkbox" />queue 支持 tenant
+quota、priority、aging、base locality 和可解释拒绝原因。</label></li>
+<li><label><input type="checkbox" />trainer image 使用 digest
+allowlist，禁止生产 job 使用浮动 tag。</label></li>
+<li><label><input type="checkbox" />base model allowlist 绑定
+architecture、digest、tokenizer、template、license、max
+context。</label></li>
+<li><label><input type="checkbox" />training manifest 可复现，包含
+seed、trainer profile、dataset snapshot、adapter schema。</label></li>
+<li><label><input type="checkbox" />artifact freeze 后不可变，release
+使用 digest 而不是路径覆盖。</label></li>
+<li><label><input type="checkbox" />eval gate 覆盖任务质量、安全、回归和
+serving smoke test。</label></li>
+<li><label><input type="checkbox" />full fine-tune、LoRA、QLoRA、DoRA
+有清晰准入边界和资源池策略。</label></li>
+</ul>
+<h3 id="142-adapter-registry-readiness">14.2 Adapter registry
+readiness</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />registry 记录 base
+compatibility、adapter schema、artifact
+digest、policy、eval、serving、audit。</label></li>
+<li><label><input type="checkbox" />compatibility gate 覆盖
+architecture、tokenizer、rank、target
+modules、quantization、license、safety policy。</label></li>
+<li><label><input type="checkbox" />registry 状态机区分
+<code>registered</code>、<code>approval_pending</code>、<code>released</code>、<code>loaded</code>、<code>production</code>、<code>rolled_back</code>。</label></li>
+<li><label><input type="checkbox" />approval 和 release
+有操作者、ticket、时间戳和 rollback target。</label></li>
+<li><label><input type="checkbox" />registry 事件幂等，重复 release
+不会造成多次加载或路由错乱。</label></li>
+</ul>
+<h3 id="143-serving-readiness">14.3 Serving readiness</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />serving pool 校验 base digest 和
+tokenizer digest 后才接受 adapter。</label></li>
+<li><label><input type="checkbox" />hot load 有超时、digest
+校验、capacity admission、smoke test 和失败状态。</label></li>
+<li><label><input type="checkbox" />GPU/CPU/NVMe/object store cache
+分层有指标和驱逐策略。</label></li>
+<li><label><input type="checkbox" />单副本显存预算包含 base、hot
+adapters、p95 KV cache、workspace、fragmentation、safety。</label></li>
+<li><label><input type="checkbox" />A/B、canary、rollback
+在路由层原子执行，不依赖重新训练。</label></li>
+<li><label><input type="checkbox" />runtime permission check 阻断跨租户
+adapter route。</label></li>
+<li><label><input type="checkbox" />audit log 记录 request
+id、tenant、base digest、adapter version、route rule、A/B
+bucket。</label></li>
+<li><label><input type="checkbox" />按 adapter 维度观测
+TTFT、tokens/s、错误率、拒答率、cache hit、load
+latency、eviction。</label></li>
+</ul>
+<hr />
+<h2 id="15-本章小结">15. 本章小结</h2>
+<p>Fine-tuning infra 的核心不是更小的训练脚本，而是一个 adapter
+生命周期系统。full fine-tune、LoRA、QLoRA、DoRA
+的差异体现在训练显存、制品大小、质量风险和 serving 接入方式上。FTaaS
+控制面必须把数据准入、队列、quota、镜像、base model constraints、adapter
+registry、approval 和 artifact release 串起来。</p>
+<p>adapter 与 base model 的关系是强绑定，不只是 shape 绑定，还包括
+architecture、tokenizer、chat template、rank、target
+modules、quantization、license 和 safety policy。merge deployment
+适合少量稳定版本，dynamic attach 适合多租户和高频实验。Multi-LoRA
+serving 通过共享 base 降低固定成本，但把复杂度转移到 hot
+load、cache、A/B、rollback、permission、audit 和显存容量模型上。</p>
+<p>生产判断标准很简单：如果一个 adapter 从训练产物到 production route
+的每一步都能被解释、校验、回滚和审计，这个平台才真正具备 FTaaS 和多
+adapter 服务能力。</p>
+<hr />
+<h2 id="16-练习题">16. 练习题</h2>
+<ol type="1">
+<li>为什么 fine-tuning infra 的目标不是最大化单 job MFU，而是缩短
+<code>time_to_first_eval</code> 和 <code>time_to_prod</code>？</li>
+<li>对比 full
+fine-tune、LoRA、QLoRA、DoRA：它们分别节省了哪些成本，又引入了哪些新约束？</li>
+<li>设计一个 data admission report，要求能阻断 PII、license 冲突、schema
+错误和 eval contamination。</li>
+<li>为什么 adapter registry 必须记录 base digest，而不能只记录
+<code>base_model_name</code>？</li>
+<li>举例说明 tokenizer 或 chat template 变化为什么可能导致 adapter shape
+能加载但质量回退。</li>
+<li>写出一个 compatibility gate，覆盖
+architecture、tokenizer、rank、target
+modules、quantization、license、safety policy。</li>
+<li>给定 80 GiB GPU、base 34 GiB、p95 KV cache 24 GiB、workspace 5
+GiB、fragmentation 4 GiB、safety 7 GiB、p95 adapter 220
+MiB，计算最多可放多少 hot adapters。</li>
+<li>如果租户要求从 50 个 hot adapters 提升到 90 个，你会如何在
+rank、target modules、KV cache、分片和 GPU 类型之间取舍？</li>
+<li>说明 merge deployment 和 dynamic attach 在
+A/B、rollback、吞吐、权限和成本上的差异。</li>
+<li>设计一次 adapter hot load
+的状态机和失败处理，要求加载失败时旧路由不受影响。</li>
+<li>为什么 pure LRU 不适合多租户 adapter cache？weighted LRU
+应该纳入哪些信号？</li>
+<li>一个 canary adapter 的拒答率从 3% 升到 8%，但 loader
+无错误。请给出证据链和 rollback 动作。</li>
+<li>如何证明某次线上回复使用了哪个 base digest、哪个 adapter
+version、哪个 A/B bucket？</li>
+<li>为什么 full fine-tune 不应该默认进入和 LoRA 相同的自动 hot-load
+release pipeline？</li>
+<li>为 200 租户、每天 600 个 fine-tune jobs 的平台设计 queue 和 quota
+策略。</li>
+<li>当 serving engine 升级后，哪些 adapter 需要重新 preflight 或 shadow
+验证？</li>
+<li>如果 adapter artifact digest mismatch，release
+system、registry、loader 应分别做什么？</li>
+<li>设计一个跨 base model 升级方案，要求新旧 base 并存、adapter
+分批重训、canary 和 rollback。</li>
+</ol>
 
-<section class="refbox">
-<h2>参考资料与学习路线</h2>
-<div class="grid-2">
-<div class="card"><strong>学习路线</strong><br>先复习 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a> 的 checkpoint 与恢复，再结合 <a href="../part3/10b-alignment-and-post-training.html">第 10b 章</a> 的后训练流程理解 SFT/RLHF/DPO 的平台共性，然后进入本章的 LoRA/QLoRA、FTaaS、adapter registry 和 Multi-LoRA serving，最后延伸到 <a href="../part5/15-batching-scheduling-and-kv-cache.html">第 15 章</a> 与 <a href="../part5/17-multitenancy-and-cost.html">第 17 章</a> 看推理期缓存、调度和成本治理。</div>
-<div class="card"><strong>延伸阅读</strong><br>PEFT / LoRA / QLoRA 论文与实现，vLLM Multi-LoRA、LoRAX、Hugging Face PEFT、bitsandbytes、Unsloth、MLflow/W&amp;B artifact 管理，以及自建 adapter registry 的 schema、状态机、热加载和回滚设计。</div>
-</div>
-<p class="mini">实践时优先把“训练任务状态、adapter 元数据契约、serving 缓存预算、发布门禁、回滚路径”写成同一份设计文档。adapter 不是一个小文件，而是平台契约的一部分。</p>
 </section>
-
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
 </main>

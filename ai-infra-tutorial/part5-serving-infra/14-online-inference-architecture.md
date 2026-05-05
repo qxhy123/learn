@@ -91,6 +91,21 @@ mindmap
 
 ### 14.1 在线推理到底在处理什么
 
+#### 14.1.1 概念先说清楚
+
+先把概念说清楚：**在线推理（online inference）** 是指模型服务在用户请求到达后立即完成计算并返回结果的系统形态。它和离线批推理最大的区别，不是入口从文件变成 HTTP，而是多了三个硬约束：用户正在等待、请求形态不可提前完全知道、系统必须在有限 SLO 内决定接收、排队、降级还是拒绝。
+
+一个在线推理请求通常包含四类对象：
+
+| 对象 | 操作定义 | 工程含义 |
+|------|----------|----------|
+| Request | 一次用户调用，包含 prompt、参数、租户、鉴权信息和 trace id | admission、计费、排障都以 request 为基本单位 |
+| Session | 多轮交互中的状态边界，例如对话 id、用户上下文、工具调用历史 | 影响路由亲和、缓存复用和隐私隔离 |
+| Model endpoint | 对外暴露的逻辑服务名，例如 `chat-prod`、`rerank-v2` | 客户端不应直接感知底层副本和权重路径 |
+| Replica | 一个实际加载权重并执行推理的运行实例 | 具备本地 KV Cache、allocator、warmup 状态，不是纯无状态 worker |
+
+所以本章说的"架构"，不是画几个框，而是在定义这些对象之间的契约：请求从哪里进入，谁决定能不能进，谁决定去哪个副本，副本如何报告容量，控制面如何把异常副本摘掉，数据面如何把 token 持续发回用户。
+
 一个在线推理系统最常见的工作流是：
 
 ```text
@@ -120,7 +135,7 @@ mindmap
 这意味着"模型推理延迟"通常只是总延迟的一部分。  
 平台工程里最危险的误解之一，就是把模型执行时间误当成整个服务延迟。
 
-#### 14.1.1 一个真实的时间构成比例
+#### 14.1.2 一个真实的时间构成比例
 
 作为一个粗略的感受，一个典型 RAG 服务的延迟构成大约是这样：
 
@@ -198,6 +213,17 @@ $$
 
 ### 14.3 网关、路由和模型副本各自解决什么问题
 
+这三个词很容易混用，生产上必须拆开：
+
+| 层 | 一句话定义 | 不该承担的职责 |
+|----|------------|----------------|
+| Gateway | 所有外部请求进入平台的统一边界 | 不应该理解每个模型副本的 KV 状态 |
+| Router | 根据模型、版本、长度、租户和实时容量选择目标池/副本 | 不应该做通用鉴权、WAF 和外部协议治理 |
+| Model server | 持有权重、KV Cache 和推理 runtime 的进程 | 不应该直接暴露为所有客户端依赖的公网入口 |
+| Runtime / Engine | 模型 server 内执行 batching、调度、kernel、KV 管理的内核 | 不应该承担业务级灰度、租户计费和发布审批 |
+
+分层的价值在故障时最明显：gateway 能快速拒绝非法或超配额流量；router 能把长上下文流量切到专用池；model server 能报告本地 queue、KV block、prefix hit 和 preemption；runtime 能在进程内做 continuous batching。把这些职责塞到一个服务里，短期 demo 很快，长期会让灰度、限流、排障和容量规划互相污染。
+
 #### 网关
 
 负责统一入口，包括：
@@ -248,6 +274,35 @@ $$
 - 固定权重的负载均衡器永远不可能两者兼顾
 
 对大多数平台团队来说，不一定要立刻上 ML 路由，但要知道：**简单 LB 在 LLM 服务上的上限明显低于传统服务**。
+
+#### 14.3.3 Control Plane vs Data Plane
+
+在线推理系统还有另一条必须说清楚的边界：**控制面（control plane）** 和 **数据面（data plane）**。
+
+| 平面 | 定义 | 典型组件 | 失败表现 |
+|------|------|----------|----------|
+| Data plane | 每个用户请求真实经过的低延迟路径 | gateway 数据路径、router 决策路径、model server、streaming channel | 直接影响 TTFT、TPOT、错误率和用户可见超时 |
+| Control plane | 负责配置、发布、扩缩容、健康判断和策略下发的管理路径 | registry、deployment controller、autoscaler、release gate、quota 配置、灰度规则 | 可能导致新版本无法发布、坏副本摘不掉、限流规则不生效 |
+
+两个平面要解耦，但不能互相失明。数据面不能每个请求都阻塞等待 control plane 查询，否则 control plane 抖动会变成用户 P99；但 control plane 也必须持续消费数据面的指标，否则它无法做扩缩容、熔断和回滚。
+
+一个常见设计：
+
+```text
+Control plane:
+  Model Registry -> Release Controller -> Router Config -> Autoscaler
+                  -> Quota / Policy Store -> Canary / Rollback Gate
+
+Data plane:
+  Client -> Gateway -> Router -> Model Server -> Runtime -> Streaming Response
+```
+
+工程边界：
+
+- 路由规则、模型版本和租户配额应由 control plane 下发，本地缓存，带版本号和过期时间
+- 数据面必须在 control plane 短暂不可用时继续服务已有稳定配置
+- 新配置发布要有 dry-run、灰度比例、自动回滚和审计记录
+- model server 的 readiness 不只看进程存活，还要看权重加载、warmup、KV allocator 和首个测试请求是否通过
 
 ### 14.4 为什么在线推理的核心不是平均延迟，而是尾延迟
 
@@ -579,7 +634,71 @@ Client
 
 没有这套流程的话，第一个真实用户通常会吃到几秒的额外延迟 —— 这在 P99 图上会表现为"每次扩容都有一段 spike"。
 
-### 14.11 熔断与降级
+### 14.11 流式响应：用户体验和系统背压的交界面
+
+流式响应（streaming response）不是"边生成边打印"这么简单。它的操作定义是：**模型 server 在 decode 过程中把已生成 token 分批 flush 给客户端，客户端在最终完成前持续收到增量结果**。它把一次长请求拆成多个用户可见事件，因此 TTFT、ITL 和连接稳定性都会进入架构设计。
+
+常见协议选择：
+
+| 协议 | 优势 | 风险 | 适用场景 |
+|------|------|------|----------|
+| Server-Sent Events (SSE) | 简单，浏览器和 OpenAI-style API 生态兼容好 | 单向流，二进制能力弱 | 聊天、文本生成 |
+| WebSocket | 双向通信，适合交互式 agent | 网关、鉴权、负载均衡更复杂 | 工具调用、多轮实时交互 |
+| gRPC streaming | 强类型、服务间调用友好 | 浏览器直连不如 SSE 方便 | 内部微服务链路 |
+| HTTP chunked | 基础设施兼容广 | 事件语义需要自定义 | 简单流式 API |
+
+流式链路里有三个容易被低估的问题：
+
+1. **flush 位置**：只在 model worker 内部记录 token 生成时间不够，gateway flush、HTTP/2 buffering、代理缓冲和客户端读取速度都会影响用户看到 token 的时间。
+2. **断连处理**：客户端断开后，model server 必须及时取消 decode 并释放 KV blocks，否则用户已经走了，GPU 还在继续烧钱。
+3. **背压传播**：如果客户端网络慢，streaming buffer 会堆积；系统要限制每连接缓冲区，必要时取消请求，而不是让内存无限增长。
+
+最小观测点：
+
+| 指标 | 采集位置 | 用来判断 |
+|------|----------|----------|
+| `first_token_flush_ms` | gateway 或 model server flush 后 | 用户真实 TTFT |
+| `inter_token_flush_ms` | 每次 flush | 流式抖动，而不只是模型 step 抖动 |
+| `client_disconnect_total` | gateway / server | 客户端超时、网络问题或生成太慢 |
+| `cancel_to_kv_free_ms` | model server | 断连后资源回收是否及时 |
+| `stream_buffer_bytes` | gateway | 是否存在下游背压 |
+
+一个反模式：模型 worker 已经生成 token，但 gateway 为了凑更大的 chunk 才 flush。这样服务端 TPOT 看起来很好，用户看到的 ITL 却很差。流式 API 的 flush 策略应该是显式配置，例如按 token、按 20-50 ms 时间窗、或按标点聚合，而不是被代理默认缓冲决定。
+
+### 14.12 灰度、熔断与降级
+
+#### 14.12.1 灰度发布的最小闭环
+
+模型灰度（canary）不是把 1% 流量切到新模型就结束，而是一条带门禁的发布状态机：
+
+```text
+staging eval pass
+  -> shadow traffic
+  -> 1% canary
+  -> 5% canary
+  -> 25% canary
+  -> full rollout
+  -> old version drain
+```
+
+每一档都要同时看系统指标和质量指标：
+
+| 门禁 | 示例阈值 | 失败动作 |
+|------|----------|----------|
+| 错误率 | 新版本 5xx 不高于旧版本 +0.1% | 自动回滚到上一档 |
+| TTFT / TPOT | P95 不高于旧版本 +10%，P99 不高于 +20% | 暂停放量，保留流量采样 |
+| 成本 | output tokens/GPU-hour 不低于旧版本 90% | 进入容量复核 |
+| 安全 | policy violation 不高于旧版本 | 立即停止灰度 |
+| 质量 | golden set / online judge 不低于阈值 | 回滚或只保留 shadow |
+
+灰度的工程细节：
+
+- 版本选择应该发生在 router，而不是客户端硬编码模型版本
+- 灰度要支持按租户、地区、prompt 类型、长度桶分层，否则 1% 可能刚好全是短请求，掩盖长上下文问题
+- shadow traffic 不应把响应返回给用户，但要记录延迟、成本和质量评测结果
+- 回滚要预留旧版本 warm pool；如果旧版本已被缩到 0，"回滚"会先变成几分钟冷启动
+
+#### 14.12.2 熔断与降级
 
 当下游依赖抖动或模型池接近饱和时，在线推理不能只靠"多加副本"兜底，还要有明确的保护动作。
 
@@ -608,7 +727,134 @@ Client
 
 一个实战经验：**降级策略要定期演练**。如果线上从来没真正触发过降级，那它出问题时多半不会按你想的方式工作。
 
-### 14.12 工程建议
+### 14.13 观测与故障排除
+
+在线推理的可观测性要覆盖三层：请求链路、模型运行时、业务质量。缺任意一层，都会出现"系统看起来健康，用户却投诉"的情况。
+
+#### 14.13.1 最小指标集
+
+| 层 | 指标 | 说明 |
+|----|------|------|
+| 入口层 | QPS、429/503、租户配额命中、请求大小 | 判断是不是流量和配额问题 |
+| 队列层 | queue time、queue depth、admission reject、timeout before start | 判断请求是否死在进入模型前 |
+| 模型层 | TTFT、TPOT、ITL、prefill tokens/s、decode tokens/s | 判断 prefill 和 decode 哪段变慢 |
+| KV 层 | KV block utilization、prefix hit rate、preemption count、OOM count | 判断显存状态是否健康 |
+| 依赖层 | embedding/vector/rerank/tool P95/P99 | 判断 RAG 或 agent 依赖是否拖尾 |
+| 流式层 | first flush、inter-token flush、disconnect、cancel latency | 判断用户真实流式体验 |
+| 发布层 | version、canary bucket、rollback event、warmup status | 判断异常是否和发布相关 |
+| 质量层 | refusal rate、toxicity/safety hit、groundedness、user feedback | 判断模型是否"健康地生成垃圾" |
+
+#### 14.13.2 排障映射表
+
+| 现象 | 优先看什么 | 典型根因 | 常见动作 |
+|------|------------|----------|----------|
+| TTFT P99 升高，TPOT 正常 | prefill queue、input token bucket、prefix hit | 长 prompt、prefix cache miss、冷副本接流量 | 长短分流、chunked prefill、预热、prefix-aware 路由 |
+| TPOT / ITL P99 升高，TTFT 正常 | active seqs、decode step、KV usage | decode batch 过大、KV 压力、preemption | 降 `max_num_seqs`、限制 max_tokens、扩 decode 池 |
+| 平均延迟正常但投诉多 | P99/P99.9、tenant bucket、length bucket | 少数租户或长请求拖尾 | 分桶限流、租户隔离、长上下文池 |
+| GPU 利用率高但 goodput 低 | SLO miss、queue time、preemption | 批太大、低价值重算、超时后仍生成 | admission 收紧、取消超时请求、调整 batch |
+| 发布后错误率不高但质量下降 | canary quality、prompt 类别、judge score | tokenizer/schema/system prompt 不兼容 | 回滚、冻结灰度、补兼容性门禁 |
+| RAG 服务偶发 8 秒 | trace span、vector/rerank P99 | 下游扫全表、索引 miss、rerank 饱和 | 依赖熔断、fallback 检索、rerank 限时 |
+
+排障顺序建议：
+
+1. 先按模型版本、租户、输入长度、输出长度、是否命中 prefix cache 分桶。
+2. 再看请求时间拆解：queue、preprocess、prefill、decode、downstream、postprocess。
+3. 如果只有 P99 异常，优先查排队、长输入、preemption、下游 P99 和冷启动。
+4. 如果 P50/P95/P99 同时变差，优先查容量、发布、依赖全局故障和引擎参数变更。
+5. 最后才进入 kernel 级 profiling。大多数线上事故不是第一时间靠 Nsight 找出来的。
+
+### 14.14 Worked Example：把一个 RAG Chatbot 从 Demo 改成生产架构
+
+假设有一个企业内部 RAG chatbot，当前 demo 架构是：
+
+```text
+Client -> FastAPI -> embedding -> vector db -> rerank -> vLLM -> response
+```
+
+目标：日常 50 QPS，峰值 150 QPS；P95 TTFT < 800 ms，P95 TPOT < 80 ms/token；支持两个模型版本灰度；企业客户按租户限流；RAG 依赖偶发抖动时不能拖垮主服务。
+
+#### 第一步：定义请求和路由维度
+
+| 维度 | 分桶 | 用途 |
+|------|------|------|
+| 租户 | free / pro / enterprise | 配额、优先级、降级顺序 |
+| 输入长度 | <1K、1K-8K、>8K token | 长短分流和 admission |
+| 模型版本 | stable、canary、shadow | 灰度与回滚 |
+| Prefix hash | system prompt + policy template hash | prefix-aware 路由 |
+| RAG 模式 | normal、fallback-no-rerank、cached | 降级路径 |
+
+#### 第二步：拆出 gateway/router/model server
+
+```text
+Client
+  -> Gateway
+     auth, tenant id, rate limit, request size limit
+  -> LLM Router
+     model version, canary bucket, length bucket, prefix affinity
+  -> RAG Orchestrator
+     embedding, vector db, rerank with timeout budget
+  -> Model Server Pool
+     vLLM, prefix cache, chunked prefill, streaming
+  -> Gateway streaming flush
+```
+
+这里 RAG orchestrator 可以在 router 前后，取决于是否要先用 intent 决定模型。关键是每一跳都要带同一个 trace id，并把 token 数、租户、版本和 cache hit 写入 span attributes。
+
+#### 第三步：设置控制面规则
+
+| 规则 | 初始值 | 触发动作 |
+|------|--------|----------|
+| 单租户 burst | enterprise 2x、pro 1x、free 0.5x | 超出返回 429 或排低优先级队列 |
+| 长 prompt admission | >8K 单独队列，队列超 1s 拒绝 | 防止拖慢短请求 |
+| Rerank timeout | 150 ms | 超时跳过 rerank，标记 degraded |
+| Vector DB P99 | >500 ms 持续 3 分钟 | 熔断高级检索，切 fallback index |
+| Canary 放量 | 1% -> 5% -> 25% -> 100% | 任一门禁失败自动回退 |
+| Streaming cancel | 客户端断连后 100 ms 内取消 decode | 释放 KV blocks |
+
+#### 第四步：上线观测面板
+
+最小面板不按"机器"组织，而按用户体验组织：
+
+```text
+Overview:
+  QPS, error rate, goodput, cost/token
+
+Latency:
+  TTFT P50/P95/P99 by model/version/tenant/length
+  TPOT and ITL P50/P95/P99 by pool
+
+Runtime:
+  prefill tokens/s, decode tokens/s, active seqs
+  KV block utilization, prefix hit, preemption, OOM
+
+Dependencies:
+  embedding/vector/rerank P95/P99, timeout, fallback rate
+
+Release:
+  canary bucket, quality score, rollback events, warmup status
+```
+
+#### 第五步：一次真实故障演练
+
+故障：周一上午 10 点，用户投诉"第一个字很久才出来"，但平均延迟只从 1.4s 升到 1.8s。
+
+排查：
+
+1. `TTFT P99` 从 900 ms 升到 7s，`TPOT P99` 基本不变，说明主要是 prefill/queue，不是 decode。
+2. 按长度分桶发现 `>8K` 请求占比从 2% 升到 12%，来自一个企业租户批量上传长文档。
+3. 同时 `prefix_hit_rate` 从 70% 掉到 25%，因为 round-robin fallback 被打开，prefix 亲和失效。
+4. `queue_time` 在短请求池也升高，说明长请求和短请求共享了 admission。
+
+修复：
+
+- 立即把 >8K 请求切到长上下文池，短请求池恢复。
+- 恢复 prefix-aware 路由，关闭 round-robin fallback。
+- 对该租户设置长 prompt burst 上限和后台批处理建议。
+- 在 control plane 增加规则：长请求占比超过阈值时自动收紧长上下文 admission，而不是影响短请求。
+
+这个案例的重点是：**P99 TTFT 故障通常不是靠换模型解决，而是靠分桶、路由、admission 和缓存亲和解决**。
+
+### 14.15 工程建议
 
 - 用请求时间拆解定位瓶颈，不要先假设模型执行最慢
 - 路由策略要显式区分模型版本、上下文长度和租户优先级
@@ -631,7 +877,7 @@ Client
 | 压测与延迟分析 | GenAI-Perf、guidellm、Locust、`hey`、`wrk` | 能算 TTFT/TPOT/ITL/goodput 的优先用 |
 | 可观测性 | Prometheus + Grafana、OpenTelemetry | trace 一定要穿透到模型副本层 |
 
-### 14.13 常见误区
+### 14.16 常见误区
 
 #### 误区一：在线推理慢，先去优化模型算子
 

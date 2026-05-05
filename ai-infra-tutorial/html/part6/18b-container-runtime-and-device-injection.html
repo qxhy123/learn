@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 18b 章 · 容器运行时与设备注入 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=18b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 18b 章 · 容器运行时与设备注入</h1>
+<p class="sub">理解 containerd/runc、NVIDIA Container Toolkit、GPU/MIG/RDMA 注入和最小权限边界。</p>
+<div class="chips"><span class="chip">Runtime</span><span class="chip">OCI</span><span class="chip">GPU</span><span class="chip">MIG</span><span class="chip">RDMA</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#18b1-第一性原理拆解--学习大纲">18b.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#18b2-概念先说清楚">18b.2 概念先说清楚</a></li><li><a class="anchor" href="#18b3-架构关键组件控制路径与数据路径">18b.3
+架构：关键组件、控制路径与数据路径</a></li><li><a class="anchor" href="#18b4-原理ocinamespacecgroup-与-device-权限">18b.4
+原理：OCI、namespace、cgroup 与 device 权限</a></li><li><a class="anchor" href="#18b5-nvidia-container-toolkit设备与库如何注入">18b.5 NVIDIA
+Container Toolkit：设备与库如何注入</a></li><li><a class="anchor" href="#18b6-mig-注入不是半张-gpu这么简单">18b.6 MIG 注入：不是“半张
+GPU”这么简单</a></li><li><a class="anchor" href="#18b7-rdmanvmehugepages-与-devshm-注入">18b.7
+RDMA、NVMe、HugePages 与 /dev/shm 注入</a></li><li><a class="anchor" href="#18b8-rootless非-rootprivileged-与最小权限边界">18b.8
+Rootless、非 root、privileged 与最小权限边界</a></li><li><a class="anchor" href="#18b9-工程化落地配置发布观测治理">18b.9
+工程化落地：配置、发布、观测、治理</a></li><li><a class="anchor" href="#18b10-方案设计最小权限-ai-容器运行时基线">18b.10
+方案设计：最小权限 AI 容器运行时基线</a></li><li><a class="anchor" href="#18b12-故障排除症状证据根因处理动作">18b.12
+故障排除：症状、证据、根因、处理动作</a></li><li><a class="anchor" href="#18b13-反模式与-checklist">18b.13 反模式与 Checklist</a></li><li><a class="anchor" href="#18b14-本章小结">18b.14 本章小结</a></li><li><a class="anchor" href="#18b15-练习题">18b.15 练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>容器运行时的核心矛盾是：进程要被隔离，但 AI 进程又必须受控地访问
+GPU、MIG、RDMA、NVMe、共享内存和宿主机驱动能力。运行时层决定了“硬件能力如何进入容器”，也决定了生产环境能不能做到最小权限。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：镜像和 CUDA 兼容矩阵见 <a
+href="18a-ai-images-and-cuda-compatibility.html">第18a章</a>；镜像供应链治理见
+<a
+href="18c-artifact-supply-chain-and-image-governance.html">第18c章</a>；设备和运行时故障排查见
+<a href="18d-runtime-troubleshooting.html">第18d章</a>；Kubernetes
+Device Plugin 和调度链路见 <a
+href="19-kubernetes-for-ai.html">第19章</a>。</p>
+</blockquote>
+<h2 id="18b1-第一性原理拆解--学习大纲">18b.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆运行时到底在解决什么问题">拆：运行时到底在解决什么问题</h3>
+<p>容器运行时要解决的不可化简问题是：</p>
+<p><strong>把一个进程放进受限的文件系统、进程空间、网络空间、挂载空间和资源配额里，同时只暴露它运行
+AI 工作负载所需的硬件设备、驱动接口和内核能力。</strong></p>
+<p>普通服务容器主要依赖 CPU、内存、网络和文件系统。AI
+容器还可能需要：</p>
+<ul>
+<li><code>/dev/nvidia*</code> GPU 设备节点。</li>
+<li>MIG compute instance 或 GPU instance。</li>
+<li>NVIDIA Driver userspace library。</li>
+<li><code>/dev/infiniband/*</code> RDMA/InfiniBand/RoCE 设备。</li>
+<li>NVMe 本地盘或特定挂载路径。</li>
+<li>大 <code>/dev/shm</code>。</li>
+<li>memlock、HugePages、IPC 能力。</li>
+<li>拓扑信息、NUMA 亲和、NIC/GPU 近邻关系。</li>
+</ul>
+<p>隔离太强，容器看不到设备；权限太大，容器接近宿主机；注入不完整，应用报出的却可能只是
+<code>CUDA unknown error</code>、<code>NCCL timeout</code> 或
+<code>operation not permitted</code>。所以运行时不是 Docker
+命令的细节，而是 AI 平台硬件访问边界的执行面。</p>
+<h3 id="推为什么会有-ocihook-和设备注入">推：为什么会有 OCI、hook
+和设备注入</h3>
+<p>从“隔离进程”出发，会得到
+namespace、cgroup、mount、seccomp、capability。它们定义进程能看到什么、能用多少资源、能调用哪些系统能力。</p>
+<p>从“镜像要跨运行时可用”出发，会得到 OCI Image 和 OCI Runtime
+Spec。镜像格式和容器创建规范标准化后，containerd、CRI-O、Docker、runc、Kata
+等组件才能协作。</p>
+<p>从“容器要访问 GPU，但 Driver 不在镜像里”出发，会得到 NVIDIA Container
+Toolkit。它在容器启动时根据分配结果，把 GPU
+设备节点、驱动库、环境变量和部分配置注入容器。</p>
+<p>从“硬件不只是整卡 GPU”出发，会得到 MIG、RDMA、NVMe、HugePages、shared
+memory
+的专门注入路径。不同设备的控制面、权限模型和验证方法不同，不能用一个
+<code>privileged: true</code> 统统解决。</p>
+<p>从“生产要最小权限”出发，会得到受控 RuntimeClass、Device
+Plugin、cgroup device allowlist、capability 白名单、hostPath 准入和
+debug 权限审批。</p>
+<h3 id="绘运行时执行链路">绘：运行时执行链路</h3>
+<pre class="mermaid">flowchart TB
+    A[CLI / Kubernetes / Orchestrator] --&gt; B[CRI]
+    B --&gt; C[containerd]
+    C --&gt; D[Image snapshot]
+    C --&gt; E[OCI runtime spec]
+    E --&gt; F[OCI hooks]
+    F --&gt; G[NVIDIA Container Toolkit]
+    E --&gt; H[runc]
+    G --&gt; I[Device nodes]
+    G --&gt; J[Driver libraries]
+    G --&gt; K[Env and mounts]
+    H --&gt; L[Namespaces / cgroups / seccomp / caps]
+    I --&gt; M[Container process]
+    J --&gt; M
+    K --&gt; M
+    L --&gt; M</pre>
+<h3 id="导本章学习大纲">导：本章学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>containerd、runc、OCI spec、NVIDIA Container Toolkit
+分别处于哪一层？</li>
+<li>容器看到 GPU 至少需要哪些设备节点、动态库、环境变量和 cgroup
+权限？</li>
+<li>Runtime hook 是什么，为什么 GPU 注入通常发生在容器创建路径上？</li>
+<li>Device Plugin 和 NVIDIA Container Toolkit 的边界是什么？</li>
+<li>MIG 的注入和整卡 GPU 有什么不同？</li>
+<li>RDMA、NVMe、HugePages、<code>/dev/shm</code>
+分别通过什么方式进入容器？</li>
+<li>cgroup device allowlist 如何影响设备访问？</li>
+<li>rootless、privileged、capability、hostPath、hostPID、hostNetwork
+的安全边界是什么？</li>
+<li>如何设计 AI 容器的最小权限基线？</li>
+<li>遇到 GPU/RDMA/NVMe 不可用时，如何按运行时链路排障？</li>
+</ol>
+<h2 id="18b2-概念先说清楚">18b.2 概念先说清楚</h2>
+<h3 id="容器运行时是什么">容器运行时是什么</h3>
+<p>容器运行时不是单一进程，而是一组职责：</p>
+<ul>
+<li>管理镜像拉取和解包。</li>
+<li>准备 root filesystem。</li>
+<li>生成或消费 OCI Runtime Spec。</li>
+<li>配置 namespace、cgroup、mount、capability、seccomp。</li>
+<li>执行 runtime hook。</li>
+<li>启动容器进程。</li>
+<li>管理容器生命周期和退出状态。</li>
+</ul>
+<p>在 Kubernetes 中，常见路径是：</p>
+<pre class="text"><code>kubelet
+  -&gt; CRI
+  -&gt; containerd
+  -&gt; OCI runtime spec
+  -&gt; runc
+  -&gt; container process</code></pre>
+<p>AI 设备注入通常插在 “生成 OCI spec 到 runc 创建进程” 这条路径里。</p>
+<h3 id="容器运行时不是什么">容器运行时不是什么</h3>
+<table>
+<thead>
+<tr>
+<th>误解</th>
+<th>正确边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>containerd 负责 GPU 调度</td>
+<td>调度由 Kubernetes scheduler、Device Plugin 和资源声明完成</td>
+</tr>
+<tr>
+<td>runc 理解 <code>nvidia.com/gpu</code></td>
+<td>runc 只按 OCI spec 创建进程，不理解 Kubernetes 资源语义</td>
+</tr>
+<tr>
+<td>NVIDIA runtime 能修复 CUDA 镜像不兼容</td>
+<td>它负责注入设备和驱动能力，不负责 PyTorch/CUDA wheel 选择</td>
+</tr>
+<tr>
+<td><code>nvidia-smi</code> 成功就代表业务一定能跑</td>
+<td>还要验证框架、NCCL、engine、权限和拓扑</td>
+</tr>
+<tr>
+<td><code>privileged: true</code> 是 GPU 容器标准配置</td>
+<td>这是绕开隔离的高权限配置，生产默认不应使用</td>
+</tr>
+</tbody>
+</table>
+<h3 id="相邻概念边界">相邻概念边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>是什么</th>
+<th>不负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OCI Image</td>
+<td>镜像层、config、manifest 的标准格式</td>
+<td>GPU 分配和设备注入</td>
+</tr>
+<tr>
+<td>OCI Runtime Spec</td>
+<td>容器进程、mount、env、devices、hooks 等规范</td>
+<td>业务发布策略</td>
+</tr>
+<tr>
+<td>containerd</td>
+<td>镜像、快照、容器生命周期和 runtime 调用</td>
+<td>GPU Driver 实现</td>
+</tr>
+<tr>
+<td>runc</td>
+<td>按 OCI spec 创建 Linux 容器进程</td>
+<td>Kubernetes 资源调度</td>
+</tr>
+<tr>
+<td>NVIDIA Container Toolkit</td>
+<td>计算并注入 NVIDIA 设备、库和配置</td>
+<td>镜像 CUDA 兼容治理</td>
+</tr>
+<tr>
+<td>Device Plugin</td>
+<td>向 Kubernetes 报告和分配设备资源</td>
+<td>容器内 Python 包和动态库</td>
+</tr>
+<tr>
+<td>RuntimeClass</td>
+<td>为 Pod 选择特定 runtime handler</td>
+<td>自动创建 GPU 资源或修复 Driver</td>
+</tr>
+<tr>
+<td>CDI</td>
+<td>用声明式方式描述设备注入</td>
+<td>不替代硬件健康和调度策略</td>
+</tr>
+<tr>
+<td>cgroup</td>
+<td>限制和统计资源，控制设备访问</td>
+<td>不安装设备驱动</td>
+</tr>
+</tbody>
+</table>
+<h3 id="device-plugin-与-runtime-hook-的区别">Device Plugin 与 Runtime
+Hook 的区别</h3>
+<p>最常见的混淆是把 Device Plugin 和 NVIDIA Container Toolkit
+当成一件事。</p>
+<pre class="text"><code>Device Plugin：
+  告诉 Kubernetes 节点上有哪些设备，并在 Pod 请求资源时分配设备。
+
+Runtime Hook / NVIDIA Toolkit：
+  在容器创建时把分配到的设备节点、驱动库和环境变量放进 OCI spec。</code></pre>
+<p>前者是编排层控制面，后者是容器启动执行面。GPU Pod
+能否运行，需要两者都正确。</p>
+<h2 id="18b3-架构关键组件控制路径与数据路径">18b.3
+架构：关键组件、控制路径与数据路径</h2>
+<h3 id="关键组件">关键组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>责任</th>
+<th>AI 相关关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>kubelet</td>
+<td>调用 CRI 创建 Pod sandbox 和容器</td>
+<td>Pod spec、resources、securityContext</td>
+</tr>
+<tr>
+<td>CRI</td>
+<td>Kubernetes 与容器运行时接口</td>
+<td>runtime handler、sandbox 参数</td>
+</tr>
+<tr>
+<td>containerd</td>
+<td>管理镜像、snapshot、task、runtime</td>
+<td>runtime 配置、NVIDIA handler、日志</td>
+</tr>
+<tr>
+<td>runc</td>
+<td>根据 OCI spec 创建容器进程</td>
+<td>devices、mounts、cgroup、caps</td>
+</tr>
+<tr>
+<td>NVIDIA Container Toolkit</td>
+<td>注入 GPU 设备和 Driver 能力</td>
+<td>hook、<code>nvidia-container-cli</code>、capabilities</td>
+</tr>
+<tr>
+<td>NVIDIA Device Plugin</td>
+<td>发现 GPU/MIG 并暴露资源</td>
+<td>资源名、MIG strategy、health</td>
+</tr>
+<tr>
+<td>RDMA Device Plugin</td>
+<td>发现 HCA/RDMA 设备并暴露资源</td>
+<td><code>/dev/infiniband</code>、资源分配</td>
+</tr>
+<tr>
+<td>CSI/hostPath/local PV</td>
+<td>暴露 NVMe 或本地存储路径</td>
+<td>权限、隔离、拓扑</td>
+</tr>
+<tr>
+<td>Admission Policy</td>
+<td>限制 privileged、hostPath、capability</td>
+<td>最小权限治理</td>
+</tr>
+</tbody>
+</table>
+<h3 id="控制路径从-pod-spec-到容器进程">控制路径：从 Pod spec
+到容器进程</h3>
+<pre class="mermaid">sequenceDiagram
+    participant U as User / Controller
+    participant K as Kubernetes API
+    participant S as Scheduler
+    participant D as Device Plugin
+    participant L as kubelet
+    participant C as containerd
+    participant N as NVIDIA hook
+    participant R as runc
+    participant P as Process
+
+    U-&gt;&gt;K: submit Pod with gpu resource
+    S-&gt;&gt;D: consider node device availability
+    S-&gt;&gt;K: bind Pod to node
+    L-&gt;&gt;D: allocate device
+    D--&gt;&gt;L: device ids / env / annotations
+    L-&gt;&gt;C: CreateContainer via CRI
+    C-&gt;&gt;N: apply runtime hook / CDI device spec
+    N--&gt;&gt;C: add devices, mounts, env
+    C-&gt;&gt;R: create/start with OCI spec
+    R-&gt;&gt;P: start container process</pre>
+<h3 id="数据路径容器如何调用-gpu">数据路径：容器如何调用 GPU</h3>
+<pre class="text"><code>application process
+  -&gt; framework or inference engine
+  -&gt; CUDA/NCCL/cuDNN userspace in image
+  -&gt; injected libcuda / driver userspace
+  -&gt; /dev/nvidia* device node
+  -&gt; host NVIDIA kernel driver
+  -&gt; GPU hardware</code></pre>
+<p>任何一环缺失，应用都可能失败。运行时层主要保证
+<code>libcuda</code>、设备节点、mount、env、cgroup device allowlist
+和权限边界正确。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>失败点</th>
+<th>首要排查层</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod 没有被调度到 GPU 节点</td>
+<td>scheduler、Device Plugin、资源声明</td>
+</tr>
+<tr>
+<td>容器内没有 <code>/dev/nvidia*</code></td>
+<td>Device Plugin 分配、runtime hook、OCI spec</td>
+</tr>
+<tr>
+<td><code>/dev/nvidia*</code> 存在但访问 denied</td>
+<td>cgroup device allowlist、文件权限、securityContext</td>
+</tr>
+<tr>
+<td><code>nvidia-smi</code> 失败</td>
+<td>Driver 注入、宿主机 Driver、utility capability</td>
+</tr>
+<tr>
+<td><code>nvidia-smi</code> 成功但 torch 失败</td>
+<td>镜像 CUDA/框架兼容，见 18a</td>
+</tr>
+<tr>
+<td>RDMA 设备存在但 NCCL timeout</td>
+<td>memlock、NIC 选择、GID/MTU、fabric、rank 状态</td>
+</tr>
+<tr>
+<td>NVMe 挂载路径错误</td>
+<td>volume/CSI/hostPath、权限、节点拓扑</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18b4-原理ocinamespacecgroup-与-device-权限">18b.4
+原理：OCI、namespace、cgroup 与 device 权限</h2>
+<h3 id="oci-runtime-spec-的核心字段">OCI Runtime Spec 的核心字段</h3>
+<p>OCI spec 可以简化理解为“runc 创建容器进程的说明书”。AI
+容器最关心这些字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>process.args</code></td>
+<td>容器入口命令</td>
+</tr>
+<tr>
+<td><code>process.env</code></td>
+<td>CUDA/NVIDIA/NCCL 等环境变量</td>
+</tr>
+<tr>
+<td><code>process.capabilities</code></td>
+<td>Linux capability</td>
+</tr>
+<tr>
+<td><code>root.path</code></td>
+<td>容器 root filesystem</td>
+</tr>
+<tr>
+<td><code>mounts</code></td>
+<td><code>/dev/shm</code>、驱动库、设备相关 mount</td>
+</tr>
+<tr>
+<td><code>linux.devices</code></td>
+<td>注入的 device node</td>
+</tr>
+<tr>
+<td><code>linux.resources.devices</code></td>
+<td>cgroup device allow/deny 规则</td>
+</tr>
+<tr>
+<td><code>linux.namespaces</code></td>
+<td>PID、mount、network、IPC、UTS、user namespace</td>
+</tr>
+<tr>
+<td><code>hooks</code></td>
+<td>prestart/createRuntime 等 hook</td>
+</tr>
+</tbody>
+</table>
+<p>GPU 注入的最终结果不是“容器多了一个参数”，而是 OCI spec 里多了
+devices、mounts、env 和 cgroup 权限。</p>
+<h3 id="namespace-负责看见什么">namespace 负责“看见什么”</h3>
+<table>
+<thead>
+<tr>
+<th>namespace</th>
+<th>作用</th>
+<th>AI 相关点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mount</td>
+<td>隔离挂载视图</td>
+<td>驱动库、设备文件、NVMe 路径、<code>/dev/shm</code></td>
+</tr>
+<tr>
+<td>PID</td>
+<td>隔离进程号</td>
+<td><code>hostPID</code> 只应调试使用</td>
+</tr>
+<tr>
+<td>network</td>
+<td>隔离网络栈</td>
+<td>RDMA/NCCL 有时要求特殊网络模式或 CNI</td>
+</tr>
+<tr>
+<td>IPC</td>
+<td>隔离 System V IPC 和 POSIX shm</td>
+<td>dataloader、NCCL、推理服务共享内存</td>
+</tr>
+<tr>
+<td>UTS</td>
+<td>隔离 hostname/domain</td>
+<td>rank 命名和日志</td>
+</tr>
+<tr>
+<td>user</td>
+<td>UID/GID 映射</td>
+<td>rootless 和 device 权限更复杂</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cgroup-devices-负责能访问什么">cgroup devices
+负责“能访问什么”</h3>
+<p>Linux 设备节点是文件，但只看到文件不等于能访问。cgroup devices
+控制容器进程能否对某类 device 做 read/write/mknod。</p>
+<p>一个 GPU 容器通常需要：</p>
+<ul>
+<li>设备节点存在于容器 mount namespace。</li>
+<li>设备节点 major/minor 对应正确。</li>
+<li>cgroup allowlist 允许访问这些 major/minor。</li>
+<li>文件权限或用户组允许当前用户访问。</li>
+<li>seccomp/capability 不阻断必要系统调用。</li>
+</ul>
+<p>所以排障时不能只执行 <code>ls -l /dev/nvidia0</code>。设备存在但
+cgroup 拒绝访问，也会失败。</p>
+<h3 id="capability-与-privileged">capability 与 privileged</h3>
+<p>Linux capability 是把 root
+权限拆成多个较小能力。<code>privileged: true</code>
+则基本绕过许多容器隔离限制，暴露全部或大量设备，并放宽
+seccomp/cgroup/capability 限制。</p>
+<p>AI 生产容器默认不应该 privileged。需要什么能力就授予什么能力，例如
+RDMA 内存注册常见会涉及 memlock 配置和
+<code>IPC_LOCK</code>，但这不代表需要 <code>SYS_ADMIN</code> 或
+privileged。</p>
+<h2 id="18b5-nvidia-container-toolkit设备与库如何注入">18b.5 NVIDIA
+Container Toolkit：设备与库如何注入</h2>
+<h3 id="它解决的问题">它解决的问题</h3>
+<p>NVIDIA Container Toolkit 的目标是：</p>
+<p><strong>让容器在不把宿主机 Driver 打进镜像的情况下，访问被分配的
+NVIDIA GPU 和 Driver userspace 能力。</strong></p>
+<p>它通常会处理：</p>
+<ul>
+<li>根据可见设备配置选择 GPU 或 MIG 设备。</li>
+<li>挂载
+<code>/dev/nvidiactl</code>、<code>/dev/nvidia-uvm</code>、<code>/dev/nvidia-uvm-tools</code>
+和具体 GPU device node。</li>
+<li>注入或挂载 Driver userspace libraries，例如
+<code>libcuda.so</code>、NVML 相关库。</li>
+<li>设置或尊重 <code>NVIDIA_VISIBLE_DEVICES</code>。</li>
+<li>根据 <code>NVIDIA_DRIVER_CAPABILITIES</code> 控制
+compute、utility、video 等能力。</li>
+<li>修改 OCI spec 中 devices、mounts、env、cgroup device 规则。</li>
+</ul>
+<h3 id="关键变量">关键变量</h3>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>作用</th>
+<th>常见问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NVIDIA_VISIBLE_DEVICES</code></td>
+<td>控制容器可见 GPU/MIG 设备</td>
+<td>空值、UUID 错误、与调度结果不一致</td>
+</tr>
+<tr>
+<td><code>NVIDIA_DRIVER_CAPABILITIES</code></td>
+<td>控制暴露的驱动能力，如 <code>compute,utility</code></td>
+<td>缺 <code>utility</code> 导致 <code>nvidia-smi</code> 不可用</td>
+</tr>
+<tr>
+<td><code>CUDA_VISIBLE_DEVICES</code></td>
+<td>框架层可见设备重映射</td>
+<td>应用覆盖后设备数量不对</td>
+</tr>
+<tr>
+<td><code>LD_LIBRARY_PATH</code></td>
+<td>动态库搜索路径</td>
+<td>手工覆盖导致加载错误库</td>
+</tr>
+<tr>
+<td><code>NCCL_*</code></td>
+<td>NCCL 网络、调试和算法选择</td>
+<td>掩盖 RDMA 注入或 fabric 问题</td>
+</tr>
+</tbody>
+</table>
+<h3 id="最小-gpu-注入验证">最小 GPU 注入验证</h3>
+<p>容器内验证建议分三层：</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/nvidia<span class="pp">*</span> <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="st">import torch</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.__version__)</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.version.cuda)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.is_available())</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.device_count())</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p>判断规则：</p>
+<ul>
+<li><code>/dev/nvidia*</code> 不存在：优先查资源分配、runtime hook、OCI
+spec。</li>
+<li><code>/dev/nvidia*</code> 存在但 <code>nvidia-smi</code>
+失败：优先查 Driver 注入、utility capability、宿主机 Driver。</li>
+<li><code>nvidia-smi</code> 成功但 PyTorch 失败：优先查 18a 的
+CUDA/框架兼容。</li>
+</ul>
+<h3 id="runtime-hook-与-cdi">runtime hook 与 CDI</h3>
+<p>传统路径常通过 runtime hook 修改 OCI spec。更现代的设备注入也可以使用
+CDI 这类声明式设备描述，让设备以标准化名称进入容器 spec。</p>
+<p>不论实现是 hook 还是 CDI，生产关注点相同：</p>
+<ul>
+<li>分配到哪些设备。</li>
+<li>注入哪些 device node。</li>
+<li>挂载哪些 host library。</li>
+<li>设置哪些 env。</li>
+<li>cgroup 允许哪些 major/minor。</li>
+<li>谁能修改这些注入规则。</li>
+</ul>
+<h2 id="18b6-mig-注入不是半张-gpu这么简单">18b.6 MIG 注入：不是“半张
+GPU”这么简单</h2>
+<p>MIG 将支持的 NVIDIA GPU 切分成多个隔离的 GPU instance 和 compute
+instance。对平台来说，MIG 改变了资源粒度、设备枚举和调度语义。</p>
+<h3 id="mig-与整卡的差异">MIG 与整卡的差异</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>整卡 GPU</th>
+<th>MIG</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度资源</td>
+<td><code>nvidia.com/gpu: 1</code></td>
+<td>如 <code>nvidia.com/mig-1g.10gb: 1</code></td>
+</tr>
+<tr>
+<td>设备标识</td>
+<td>GPU UUID、minor number</td>
+<td>MIG UUID、GI/CI 实例</td>
+</tr>
+<tr>
+<td>显存</td>
+<td>整卡显存</td>
+<td>切片显存</td>
+</tr>
+<tr>
+<td>隔离</td>
+<td>进程共享整卡资源</td>
+<td>硬件级分区，能力受 profile 限制</td>
+</tr>
+<tr>
+<td>拓扑</td>
+<td>物理 GPU 拓扑</td>
+<td>还要映射到父 GPU</td>
+</tr>
+<tr>
+<td>运维</td>
+<td>设备相对稳定</td>
+<td>重建 MIG 会改变实例映射</td>
+</tr>
+</tbody>
+</table>
+<h3 id="mig-注入关注点">MIG 注入关注点</h3>
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MIG strategy</td>
+<td>节点上 Device Plugin 如何暴露 MIG 资源</td>
+</tr>
+<tr>
+<td>资源命名</td>
+<td>业务请求具体 profile，而不是模糊请求</td>
+</tr>
+<tr>
+<td>UUID 记录</td>
+<td>日志和指标记录 MIG UUID，便于排障</td>
+</tr>
+<tr>
+<td>父 GPU 映射</td>
+<td>性能和故障需要回到物理 GPU</td>
+</tr>
+<tr>
+<td>重配置窗口</td>
+<td>改 MIG profile 通常影响节点上现有 workload</td>
+</tr>
+<tr>
+<td>监控维度</td>
+<td>既看 MIG 实例，也看父 GPU 健康</td>
+</tr>
+</tbody>
+</table>
+<h3 id="mig-反直觉点">MIG 反直觉点</h3>
+<p><code>cuda:0</code> 只是容器内可见设备序号，不代表物理机上的 GPU
+0，也不代表固定 MIG 实例。生产日志应该记录 UUID，而不是只记录
+index。</p>
+<h2 id="18b7-rdmanvmehugepages-与-devshm-注入">18b.7
+RDMA、NVMe、HugePages 与 <code>/dev/shm</code> 注入</h2>
+<h3 id="rdma--infiniband--roce">RDMA / InfiniBand / RoCE</h3>
+<p>RDMA 容器通常需要：</p>
+<ul>
+<li><code>/dev/infiniband/*</code> 设备节点。</li>
+<li>rdma-core userspace 库和工具。</li>
+<li>足够 memlock。</li>
+<li>正确网络接口、GID、MTU、RoCE/IB fabric 配置。</li>
+<li>NCCL 能选择正确 NIC。</li>
+<li>GPU/NIC 拓扑满足性能要求。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>注入对象</th>
+<th>说明</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/dev/infiniband/uverbs*</code></td>
+<td>verbs userspace 设备</td>
+<td><code>ls -l /dev/infiniband</code></td>
+</tr>
+<tr>
+<td>rdma-core</td>
+<td>verbs 库和工具</td>
+<td><code>ibv_devinfo</code></td>
+</tr>
+<tr>
+<td>memlock</td>
+<td>内存注册限制</td>
+<td><code>ulimit -l</code></td>
+</tr>
+<tr>
+<td>网络接口</td>
+<td>NCCL socket/RDMA 选择</td>
+<td><code>NCCL_DEBUG=INFO</code></td>
+</tr>
+<tr>
+<td>GPU/NIC 拓扑</td>
+<td>跨 NUMA 会影响性能</td>
+<td><code>nvidia-smi topo -m</code></td>
+</tr>
+</tbody>
+</table>
+<p>RDMA 不通时，不要只调 NCCL 参数。先证明 verbs 在容器内可用，再看 NCCL
+是否选对网络，再看 fabric。</p>
+<h3 id="nvme-本地盘">NVMe 本地盘</h3>
+<p>NVMe 可以通过多种方式暴露给容器：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>适用场景</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>hostPath 挂载目录</td>
+<td>节点本地缓存、模型缓存</td>
+<td>路径过宽、权限混乱</td>
+</tr>
+<tr>
+<td>local PersistentVolume</td>
+<td>Kubernetes 管理本地盘</td>
+<td>调度和生命周期要设计</td>
+</tr>
+<tr>
+<td>CSI driver</td>
+<td>云盘或本地盘插件</td>
+<td>插件稳定性和权限</td>
+</tr>
+<tr>
+<td>block device</td>
+<td>高性能或特殊文件系统</td>
+<td>设备权限和误格式化风险</td>
+</tr>
+</tbody>
+</table>
+<p>AI 工作负载常用 NVMe 存模型缓存、dataset cache、checkpoint staging
+或推理 engine cache。生产上应优先暴露受控目录，而不是把整块盘或整个
+<code>/</code> 挂进容器。</p>
+<h3 id="hugepages-与-pinned-memory">HugePages 与 pinned memory</h3>
+<p>部分训练、推理或通信路径会受益于 HugePages、pinned memory 或 memlock
+配置。但它们不是越大越好：</p>
+<ul>
+<li>HugePages 需要节点预留。</li>
+<li>pinned memory 会占用宿主机内存，过量会影响系统稳定。</li>
+<li>memlock 放太宽可能扩大风险。</li>
+<li>资源请求和限制应进入调度和容量模型。</li>
+</ul>
+<h3 id="devshm"><code>/dev/shm</code></h3>
+<p>Docker 默认 <code>/dev/shm</code> 往往较小。AI 场景可能因为
+dataloader、多进程推理、NCCL、Ray、Python multiprocessing 或 tokenizer
+worker 需要更大共享内存。</p>
+<p>Kubernetes 中常见做法：</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">emptyDir</span><span class="kw">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">medium</span><span class="kw">:</span><span class="at"> Memory</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">sizeLimit</span><span class="kw">:</span><span class="at"> 16Gi</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> worker</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /dev/shm</span></span></code></pre></div>
+<p>这会占用节点内存，应结合容器 memory limit 设计，不要无上限。</p>
+<h2 id="18b8-rootless非-rootprivileged-与最小权限边界">18b.8
+Rootless、非 root、privileged 与最小权限边界</h2>
+<h3 id="非-root-不等于-rootless">非 root 不等于 rootless</h3>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>含义</th>
+<th>AI 设备影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>非 root 容器</td>
+<td>容器内进程 UID 不是 0</td>
+<td>推荐生产默认，但要处理设备文件权限</td>
+</tr>
+<tr>
+<td>rootless runtime</td>
+<td>容器运行时本身不以 root 管理容器</td>
+<td>设备注入、cgroup、GPU 支持更复杂</td>
+</tr>
+<tr>
+<td>privileged 容器</td>
+<td>放宽大量隔离和设备限制</td>
+<td>生产默认禁止，仅限受控调试</td>
+</tr>
+</tbody>
+</table>
+<p>生产推理和训练容器通常至少应该做到“容器进程非 root”。rootless runtime
+是否可用，要结合 GPU、cgroup v2、NVIDIA Toolkit 和发行版能力验证。</p>
+<h3 id="常见权限项">常见权限项</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>什么时候可能需要</th>
+<th>风险</th>
+<th>推荐策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>privileged: true</code></td>
+<td>底层节点排障、驱动调试</td>
+<td>接近宿主机权限</td>
+<td>生产工作负载禁止</td>
+</tr>
+<tr>
+<td>hostPath <code>/dev</code></td>
+<td>粗暴暴露所有设备</td>
+<td>设备越权</td>
+<td>精确设备注入</td>
+</tr>
+<tr>
+<td>hostPath 模型缓存</td>
+<td>节点本地缓存</td>
+<td>路径逃逸、权限误配</td>
+<td>固定目录、只读优先、准入校验</td>
+</tr>
+<tr>
+<td><code>hostPID</code></td>
+<td>节点进程排障</td>
+<td>泄露宿主机进程</td>
+<td>debug Pod 限时使用</td>
+</tr>
+<tr>
+<td><code>hostNetwork</code></td>
+<td>特殊 RDMA/NCCL 或性能排障</td>
+<td>网络隔离变弱、端口冲突</td>
+<td>先证明 CNI 不满足</td>
+</tr>
+<tr>
+<td><code>SYS_ADMIN</code></td>
+<td>某些 mount/ns 调试</td>
+<td>过宽能力</td>
+<td>默认禁止</td>
+</tr>
+<tr>
+<td><code>IPC_LOCK</code></td>
+<td>RDMA memlock、内存注册</td>
+<td>能力扩大</td>
+<td>只给 RDMA workload</td>
+</tr>
+<tr>
+<td><code>NET_ADMIN</code></td>
+<td>网络调试或配置</td>
+<td>可改网络栈</td>
+<td>生产默认禁止</td>
+</tr>
+<tr>
+<td><code>allowPrivilegeEscalation</code></td>
+<td>子进程提权</td>
+<td>提权风险</td>
+<td>设为 false</td>
+</tr>
+<tr>
+<td><code>readOnlyRootFilesystem</code></td>
+<td>防止写镜像层</td>
+<td>应用需写临时文件</td>
+<td>推荐开启并挂载明确 tmp/cache</td>
+</tr>
+</tbody>
+</table>
+<h3 id="最小权限原则">最小权限原则</h3>
+<p>最小权限设计不是“先开 privileged，再慢慢关”。正确顺序是：</p>
+<ol type="1">
+<li>列出 workload 需要的设备。</li>
+<li>列出需要的库 mount 和环境变量。</li>
+<li>列出需要写入的路径。</li>
+<li>列出需要的 Linux capability。</li>
+<li>列出需要的 namespace 放宽项。</li>
+<li>对每一项写明证据和验证命令。</li>
+<li>默认拒绝未列出的 hostPath、capability 和 privileged。</li>
+</ol>
+<h2 id="18b9-工程化落地配置发布观测治理">18b.9
+工程化落地：配置、发布、观测、治理</h2>
+<h3 id="containerd-runtime-配置基线">containerd runtime 配置基线</h3>
+<p>平台应维护节点级 runtime 基线，至少包括：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>containerd 版本</td>
+<td>纳入节点基线和升级计划</td>
+</tr>
+<tr>
+<td>runc 版本</td>
+<td>纳入安全更新</td>
+</tr>
+<tr>
+<td>NVIDIA Container Toolkit 版本</td>
+<td>与 Driver、GPU Operator 或节点镜像配套验证</td>
+</tr>
+<tr>
+<td>runtime handler</td>
+<td>明确默认 runtime 和 NVIDIA runtime handler</td>
+</tr>
+<tr>
+<td>cgroup mode</td>
+<td>cgroup v1/v2 明确，和 kubelet 一致</td>
+</tr>
+<tr>
+<td>CDI/hook 策略</td>
+<td>选择并标准化设备注入方式</td>
+</tr>
+<tr>
+<td>seccomp profile</td>
+<td>默认开启，例外审批</td>
+</tr>
+<tr>
+<td>日志</td>
+<td>containerd、kubelet、nvidia-container-cli 可收集</td>
+</tr>
+</tbody>
+</table>
+<h3 id="pod-配置基线">Pod 配置基线</h3>
+<p>一个生产 GPU 推理 Pod 的基线可以是：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Pod</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> llm-server</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">runtimeClassName</span><span class="kw">:</span><span class="at"> nvidia</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> server</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.internal/llm/server@sha256:...</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 64Gi</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">securityContext</span><span class="kw">:</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">runAsNonRoot</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">runAsUser</span><span class="kw">:</span><span class="at"> </span><span class="dv">10001</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">allowPrivilegeEscalation</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">readOnlyRootFilesystem</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">capabilities</span><span class="kw">:</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">drop</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;ALL&quot;</span><span class="kw">]</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> tmp</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /tmp</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /dev/shm</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> model-cache</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /models</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">readOnly</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> tmp</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">emptyDir</span><span class="kw">:</span><span class="at"> </span><span class="kw">{}</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">emptyDir</span><span class="kw">:</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">medium</span><span class="kw">:</span><span class="at"> Memory</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">sizeLimit</span><span class="kw">:</span><span class="at"> 16Gi</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> model-cache</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">hostPath</span><span class="kw">:</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /var/lib/ai-model-cache/llm-server</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Directory</span></span></code></pre></div>
+<p>这不是通用模板，而是展示基线思想：GPU
+用资源声明进入注入路径；文件写入通过明确 volume；root filesystem
+只读；默认 drop capabilities；hostPath 限定到具体缓存目录。</p>
+<h3 id="发布与变更治理">发布与变更治理</h3>
+<p>运行时变更的风险不低于镜像变更。以下变更应走灰度：</p>
+<ul>
+<li>NVIDIA Driver 升级。</li>
+<li>NVIDIA Container Toolkit 升级。</li>
+<li>containerd/runc 升级。</li>
+<li>cgroup v1/v2 切换。</li>
+<li>Device Plugin MIG strategy 变更。</li>
+<li>RDMA Device Plugin 或 CNI 配置变更。</li>
+<li>默认 seccomp/capability 策略变更。</li>
+</ul>
+<p>灰度时要用固定镜像 digest 和固定 smoke
+test，避免把镜像问题和运行时问题混在一起。</p>
+<h3 id="观测指标">观测指标</h3>
+<table>
+<thead>
+<tr>
+<th>指标/日志</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU allocation success/failure</td>
+<td>判断 Device Plugin 和调度问题</td>
+</tr>
+<tr>
+<td>container create duration</td>
+<td>判断 runtime hook、mount、cgroup 问题</td>
+</tr>
+<tr>
+<td>NVIDIA hook error count</td>
+<td>判断设备注入失败</td>
+</tr>
+<tr>
+<td><code>/dev/nvidia*</code> visibility smoke</td>
+<td>节点健康巡检</td>
+</tr>
+<tr>
+<td>GPU UUID/MIG UUID in app logs</td>
+<td>关联调度、设备和业务</td>
+</tr>
+<tr>
+<td>RDMA verbs smoke result</td>
+<td>通信链路巡检</td>
+</tr>
+<tr>
+<td>cgroup device deny event</td>
+<td>定位权限问题</td>
+</tr>
+<tr>
+<td>privileged Pod count</td>
+<td>治理安全例外</td>
+</tr>
+<tr>
+<td>hostPath usage inventory</td>
+<td>治理越权挂载</td>
+</tr>
+<tr>
+<td><code>/dev/shm</code> usage</td>
+<td>定位共享内存不足</td>
+</tr>
+</tbody>
+</table>
+<h3 id="治理策略">治理策略</h3>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>推荐默认</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>privileged</td>
+<td>生产 namespace 禁止</td>
+</tr>
+<tr>
+<td>hostPath</td>
+<td>白名单路径，必须声明只读/读写理由</td>
+</tr>
+<tr>
+<td>capabilities</td>
+<td>默认 drop all，按 workload 加最小集合</td>
+</tr>
+<tr>
+<td>runtimeClass</td>
+<td>GPU workload 使用受控 RuntimeClass</td>
+</tr>
+<tr>
+<td>GPU 资源</td>
+<td>必须显式声明，不允许靠手动挂设备</td>
+</tr>
+<tr>
+<td>debug 权限</td>
+<td>单独 namespace、限时、审计</td>
+</tr>
+<tr>
+<td>RDMA 权限</td>
+<td>只给声明 RDMA 资源的 workload</td>
+</tr>
+<tr>
+<td>root filesystem</td>
+<td>推理服务默认只读</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18b10-方案设计最小权限-ai-容器运行时基线">18b.10
+方案设计：最小权限 AI 容器运行时基线</h2>
+<h3 id="设计目标">设计目标</h3>
+<p>设计一个同时支持三类工作负载的运行时策略：</p>
+<ol type="1">
+<li>单卡在线推理。</li>
+<li>多机 GPU 训练，使用 RDMA。</li>
+<li>使用 MIG 的多租户小模型推理。</li>
+</ol>
+<p>目标是生产默认最小权限，调试能力受控，运行时变更可灰度。</p>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>单卡推理</th>
+<th>RDMA 训练</th>
+<th>MIG 推理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU 资源</td>
+<td><code>nvidia.com/gpu: 1</code></td>
+<td><code>nvidia.com/gpu: N</code></td>
+<td><code>nvidia.com/mig-...: 1</code></td>
+</tr>
+<tr>
+<td>RuntimeClass</td>
+<td><code>nvidia</code></td>
+<td><code>nvidia</code> + RDMA 节点池</td>
+<td><code>nvidia</code></td>
+</tr>
+<tr>
+<td>RDMA 设备</td>
+<td>不注入</td>
+<td>通过 RDMA Device Plugin 注入</td>
+<td>不注入</td>
+</tr>
+<tr>
+<td>capability</td>
+<td>drop all</td>
+<td>add <code>IPC_LOCK</code>，其余 drop</td>
+<td>drop all</td>
+</tr>
+<tr>
+<td><code>/dev/shm</code></td>
+<td>8-16Gi</td>
+<td>按 dataloader/NCCL 设置</td>
+<td>4-8Gi</td>
+</tr>
+<tr>
+<td>hostNetwork</td>
+<td>默认否</td>
+<td>仅 fabric 证明需要时允许</td>
+<td>否</td>
+</tr>
+<tr>
+<td>hostPath</td>
+<td>模型缓存只读</td>
+<td>数据/cache 按白名单</td>
+<td>模型缓存只读</td>
+</tr>
+<tr>
+<td>privileged</td>
+<td>禁止</td>
+<td>禁止，调试例外</td>
+<td>禁止</td>
+</tr>
+<tr>
+<td>观测</td>
+<td>GPU UUID、启动时间</td>
+<td>GPU/NIC 拓扑、NCCL、RDMA</td>
+<td>MIG UUID、父 GPU</td>
+</tr>
+</tbody>
+</table>
+<h3 id="可执行方案">可执行方案</h3>
+<pre class="text"><code>1. 节点池分层：
+   - gpu-standard：整卡推理和常规训练。
+   - gpu-rdma：多机训练，安装 RDMA stack 和 Device Plugin。
+   - gpu-mig：启用 MIG strategy，资源名稳定。
+
+2. RuntimeClass：
+   - nvidia：启用 NVIDIA 设备注入。
+   - nvidia-rdma：在 nvidia 基础上配套 RDMA 节点准入和策略。
+
+3. Admission：
+   - 禁止 privileged。
+   - 禁止挂载整个 /dev。
+   - hostPath 只能使用白名单目录。
+   - capability 默认 drop all。
+   - 只有声明 RDMA 资源的 Pod 可加 IPC_LOCK。
+
+4. Smoke test：
+   - GPU：nvidia-smi + torch CUDA。
+   - MIG：nvidia-smi -L + UUID 记录。
+   - RDMA：ibv_devinfo + nccl-tests。
+   - NVMe：挂载路径、权限、fio 快测。
+
+5. 发布：
+   - runtime/toolkit/driver 变更先灰度节点池。
+   - 固定镜像 digest 跑同一组测试。
+   - 通过后扩大节点池。</code></pre>
+<h2
+id="18b11-worked-example给多机训练-pod-注入-gpurdma-和共享内存">18b.11
+Worked Example：给多机训练 Pod 注入 GPU、RDMA 和共享内存</h2>
+<h3 id="目标">目标</h3>
+<p>一个分布式训练 worker 需要：</p>
+<ul>
+<li>8 张 GPU。</li>
+<li>1 个 RDMA HCA。</li>
+<li>64Gi <code>/dev/shm</code>。</li>
+<li>RDMA 内存注册能力。</li>
+<li>非 root 运行。</li>
+<li>不使用 privileged。</li>
+</ul>
+<h3 id="示意配置">示意配置</h3>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Pod</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> trainer-rank-0</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">runtimeClassName</span><span class="kw">:</span><span class="at"> nvidia</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ai.nodepool/type</span><span class="kw">:</span><span class="at"> gpu-rdma</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> trainer</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.internal/train/worker@sha256:...</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">rdma/hca</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Gi</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> NCCL_DEBUG</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">value</span><span class="kw">:</span><span class="at"> INFO</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> NCCL_DEBUG_SUBSYS</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">value</span><span class="kw">:</span><span class="at"> INIT,NET</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">securityContext</span><span class="kw">:</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">runAsNonRoot</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">runAsUser</span><span class="kw">:</span><span class="at"> </span><span class="dv">10001</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">allowPrivilegeEscalation</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">capabilities</span><span class="kw">:</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">drop</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;ALL&quot;</span><span class="kw">]</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">add</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;IPC_LOCK&quot;</span><span class="kw">]</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /dev/shm</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> checkpoint-staging</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /checkpoints</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> dshm</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">emptyDir</span><span class="kw">:</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">medium</span><span class="kw">:</span><span class="at"> Memory</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">sizeLimit</span><span class="kw">:</span><span class="at"> 64Gi</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> checkpoint-staging</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">hostPath</span><span class="kw">:</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /local_nvme/checkpoints/job-123</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> DirectoryOrCreate</span></span></code></pre></div>
+<h3 id="为什么这样设计">为什么这样设计</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nvidia.com/gpu: 8</code></td>
+<td>通过 GPU Device Plugin 分配整卡</td>
+</tr>
+<tr>
+<td><code>rdma/hca: 1</code></td>
+<td>通过 RDMA 资源声明注入 HCA</td>
+</tr>
+<tr>
+<td><code>runtimeClassName: nvidia</code></td>
+<td>进入 NVIDIA 设备注入路径</td>
+</tr>
+<tr>
+<td><code>IPC_LOCK</code></td>
+<td>支持 RDMA 内存注册相关需求</td>
+</tr>
+<tr>
+<td><code>/dev/shm</code> 64Gi</td>
+<td>满足 dataloader/NCCL/多进程共享内存</td>
+</tr>
+<tr>
+<td>非 root</td>
+<td>降低运行权限</td>
+</tr>
+<tr>
+<td>不 privileged</td>
+<td>保持设备和能力最小化</td>
+</tr>
+<tr>
+<td>hostPath 限定目录</td>
+<td>使用本地 NVMe，但不暴露整盘或整个宿主机</td>
+</tr>
+</tbody>
+</table>
+<h3 id="启动后验证">启动后验证</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">-L</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/nvidia<span class="pp">*</span> <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/infiniband <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="bu">ulimit</span> <span class="at">-l</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /dev/shm</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="st">import torch</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.is_available())</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.device_count())</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p>通信验证：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET <span class="ex">./all_reduce_perf</span> <span class="at">-b</span> 8M <span class="at">-e</span> 1G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span></code></pre></div>
+<p>如果 verbs 不通，先修 RDMA 注入和节点配置；如果 verbs 通但 NCCL 选错
+NIC，再调 NCCL 网络选择；如果单机通多机不通，再查
+fabric、GID、MTU、防火墙和 rank 状态。</p>
+<h2 id="18b12-故障排除症状证据根因处理动作">18b.12
+故障排除：症状、证据、根因、处理动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>必收证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod 一直 Pending</td>
+<td>Pod events、节点资源、Device Plugin 日志</td>
+<td>GPU/MIG/RDMA 资源不足或资源名错误</td>
+<td>修资源声明、节点标签或扩容</td>
+</tr>
+<tr>
+<td>容器内没有 <code>/dev/nvidia*</code></td>
+<td>Pod resource、allocated device、OCI spec、runtime 日志</td>
+<td>没申请 GPU、Device Plugin 未分配、NVIDIA hook 未执行</td>
+<td>修资源声明、runtimeClass、toolkit 配置</td>
+</tr>
+<tr>
+<td><code>/dev/nvidia0</code> 存在但访问失败</td>
+<td>cgroup device rule、文件权限、用户 UID/GID</td>
+<td>cgroup 不允许或非 root 无权限</td>
+<td>修 device allowlist、设备权限、运行用户组</td>
+</tr>
+<tr>
+<td><code>nvidia-smi</code> 失败</td>
+<td>宿主机/容器内
+<code>nvidia-smi</code>、Driver、<code>NVIDIA_DRIVER_CAPABILITIES</code></td>
+<td>Driver 注入缺失、utility capability 缺失、宿主机 Driver 异常</td>
+<td>修 NVIDIA runtime 或节点 Driver</td>
+</tr>
+<tr>
+<td>torch 看不到 GPU</td>
+<td><code>nvidia-smi</code>、torch CUDA、镜像 digest</td>
+<td>镜像 CUDA/框架不兼容或 env 覆盖</td>
+<td>回到 18a 矩阵，检查 <code>CUDA_VISIBLE_DEVICES</code></td>
+</tr>
+<tr>
+<td>MIG 数量或显存不对</td>
+<td><code>nvidia-smi -L</code>、MIG strategy、resource name、UUID</td>
+<td>请求 profile 错、MIG 重配置、实例映射变化</td>
+<td>固定资源名，记录 MIG UUID，重建节点状态</td>
+</tr>
+<tr>
+<td>RDMA 设备缺失</td>
+<td><code>/dev/infiniband</code>、RDMA plugin 日志、Pod resource</td>
+<td>未声明 RDMA、插件异常、节点无 HCA</td>
+<td>修资源声明和 RDMA Device Plugin</td>
+</tr>
+<tr>
+<td><code>ibv_devinfo</code> 失败</td>
+<td>rdma-core、设备节点、权限</td>
+<td>缺 userspace 库或设备权限</td>
+<td>安装运行库，修设备注入</td>
+</tr>
+<tr>
+<td>NCCL timeout</td>
+<td>NCCL debug、rank 日志、GID/MTU、memlock、接口</td>
+<td>NIC 选错、fabric 问题、rank 先失败、memlock 不足</td>
+<td>固定接口，修 fabric，调整 memlock</td>
+</tr>
+<tr>
+<td>NVMe 路径不可写</td>
+<td>mount、UID/GID、hostPath type、SELinux/AppArmor</td>
+<td>路径不存在或权限不匹配</td>
+<td>预创建目录，修 ownership，改只读/读写策略</td>
+</tr>
+<tr>
+<td><code>/dev/shm</code> 不足</td>
+<td><code>df -h /dev/shm</code>、应用日志</td>
+<td>默认 shm 太小</td>
+<td>使用 memory emptyDir 并设置 sizeLimit</td>
+</tr>
+<tr>
+<td>只有 privileged 才能跑</td>
+<td>对比 capability、device、mount、seccomp</td>
+<td>缺某个具体设备或能力，被 privileged 掩盖</td>
+<td>找出最小缺项，不保留 privileged</td>
+</tr>
+</tbody>
+</table>
+<h3 id="分层排障顺序">分层排障顺序</h3>
+<ol type="1">
+<li>看 Pod 是否拿到资源：events、limits、Device Plugin allocation。</li>
+<li>看容器是否拿到设备：<code>/dev/nvidia*</code>、<code>/dev/infiniband</code>、mount。</li>
+<li>看 cgroup 和权限是否允许访问：device
+allowlist、capability、UID/GID。</li>
+<li>看宿主机 Driver 和设备是否健康。</li>
+<li>看框架和镜像兼容。</li>
+<li>看通信、拓扑、NVMe 和共享内存。</li>
+<li>把临时放权改回最小权限配置。</li>
+</ol>
+<h2 id="18b13-反模式与-checklist">18b.13 反模式与 Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<ul>
+<li>为了让 GPU 可见，给所有 AI Pod <code>privileged: true</code>。</li>
+<li>手动挂载整个 <code>/dev</code> 到容器。</li>
+<li>只检查 <code>nvidia-smi</code>，不验证 PyTorch、NCCL、RDMA 和业务
+engine。</li>
+<li>把 MIG 当成稳定的 <code>cuda:0</code> 编号，而不记录 MIG UUID。</li>
+<li>RDMA 容器只挂 <code>/dev/infiniband</code>，不检查
+rdma-core、memlock、GID、MTU 和 NCCL 选网。</li>
+<li>生产 Pod 默认 root、默认可写 root filesystem、默认保留全部
+capability。</li>
+<li>用 hostPath 暴露整块 NVMe 或宿主机根目录。</li>
+<li>runtime/toolkit/Driver 升级不灰度，直接全量替换节点。</li>
+<li>用应用环境变量强行覆盖平台注入的
+<code>CUDA_VISIBLE_DEVICES</code>。</li>
+<li>把 debug 权限留在长期运行的生产 workload 里。</li>
+</ul>
+<h3 id="checklist">Checklist</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>通过标准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>container runtime</td>
+<td>containerd/runc 版本纳入节点基线</td>
+</tr>
+<tr>
+<td>NVIDIA Toolkit</td>
+<td>版本、runtime handler、hook/CDI 配置已验证</td>
+</tr>
+<tr>
+<td>Device Plugin</td>
+<td>GPU/MIG/RDMA 资源名和健康状态明确</td>
+</tr>
+<tr>
+<td>GPU 注入</td>
+<td>容器内可见预期 GPU UUID 和 <code>/dev/nvidia*</code></td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>profile、UUID、父 GPU、调度策略一致</td>
+</tr>
+<tr>
+<td>RDMA</td>
+<td>设备、rdma-core、memlock、接口、NCCL test 通过</td>
+</tr>
+<tr>
+<td>NVMe</td>
+<td>只暴露所需目录或设备，权限清晰</td>
+</tr>
+<tr>
+<td>cgroup devices</td>
+<td>device allowlist 与注入设备一致</td>
+</tr>
+<tr>
+<td>capability</td>
+<td>默认 drop all，仅添加证明需要的能力</td>
+</tr>
+<tr>
+<td>privileged</td>
+<td>生产禁止，debug 例外限时审计</td>
+</tr>
+<tr>
+<td>rootless/非 root</td>
+<td>生产进程非 root，rootless runtime 单独验证</td>
+</tr>
+<tr>
+<td><code>/dev/shm</code></td>
+<td>按 workload 设置并纳入内存容量</td>
+</tr>
+<tr>
+<td>观测</td>
+<td>runtime hook、container create、设备 UUID、RDMA smoke 可见</td>
+</tr>
+</tbody>
+</table>
+<h2 id="18b14-本章小结">18b.14 本章小结</h2>
+<p>容器运行时是 AI 平台硬件访问边界的执行者。containerd
+管理镜像、快照和生命周期；runc 根据 OCI spec 创建隔离进程；NVIDIA
+Container Toolkit 把被分配的 GPU 设备、Driver
+库和环境变量注入容器；Device Plugin 在编排层负责设备发现和分配。</p>
+<p>生产系统的目标不是“给够权限能跑”，而是“只给必需设备和必需能力也能稳定跑”。MIG、RDMA、NVMe、HugePages
+和 <code>/dev/shm</code>
+都有各自的注入路径和排障证据。最小权限不是安全口号，而是运行时架构设计：明确资源声明、明确设备注入、明确
+cgroup 权限、明确 capability、明确 hostPath
+边界，并把所有例外纳入治理。</p>
+<h2 id="18b15-练习题">18b.15 练习题</h2>
+<ol type="1">
+<li>画出从 Kubernetes Pod 请求 <code>nvidia.com/gpu: 1</code>
+到容器内出现 <code>/dev/nvidia0</code> 的控制路径，并标出 Device
+Plugin、containerd、NVIDIA hook 和 runc 的位置。</li>
+<li>某 GPU Pod 内 <code>ls /dev/nvidia*</code> 为空。请列出至少 5
+个可能原因，并说明每个原因的证据。</li>
+<li>为什么 <code>nvidia-smi</code> 成功不能证明 PyTorch 或 vLLM
+一定能正常运行？</li>
+<li>一个 RDMA 训练任务 NCCL timeout。请按 verbs、memlock、NCCL
+选网、fabric、rank 状态写出排障顺序。</li>
+<li>设计一个 MIG 推理 Pod 的最小权限配置。要求说明资源名、UUID 记录、非
+root、capability 和 <code>/dev/shm</code>。</li>
+<li>说明 <code>privileged: true</code>
+解决问题时可能掩盖了哪些具体缺项。如何把它收敛成最小权限？</li>
+<li>比较“hostPath 挂载 NVMe 目录”和“暴露 block
+device”两种方式的风险和适用场景。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

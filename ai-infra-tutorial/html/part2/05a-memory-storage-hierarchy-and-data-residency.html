@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 5a 章 · 内存与存储层级、数据驻留 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=05a" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 5a 章 · 内存与存储层级、数据驻留</h1>
+<p class="sub">从 HBM、DRAM、Page Cache、NVMe、并行文件系统和对象存储解释数据应该驻留在哪里，以及语义和成本如何影响系统设计。</p>
+<div class="chips"><span class="chip">HBM</span><span class="chip">DRAM</span><span class="chip">Page Cache</span><span class="chip">NVMe</span><span class="chip">对象存储</span><span class="chip">热层冷层</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#学习目标">学习目标</a></li><li><a class="anchor" href="#正文内容">正文内容</a></li><li><a class="anchor" href="#练习题">练习题</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>AI
+系统里最贵的字节，不一定是最大的一份字节，而是下一毫秒就要被计算单元使用、却还停在错误层级里的字节。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="05-memory-interconnect-io.html">第5章</a> 的存储层级拆分，专注
+HBM、DRAM、Page
+Cache、NVMe、并行文件系统和对象存储之间的数据驻留、缓存和语义差异。PCIe
+与 H2D 细节见 <a
+href="05b-host-device-io-pcie-numa-and-overlap.html">第5b章</a>，RDMA
+与拓扑见 <a
+href="05c-rdma-collectives-and-cluster-topology.html">第5c章</a>，checkpoint
+热层和 IO 诊断见 <a
+href="05d-training-storage-checkpoint-and-io-diagnostics.html">第5d章</a>。</p>
+</blockquote>
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆--不可化简的问题">拆 — 不可化简的问题</h3>
+<p>把 HBM、DRAM、NVMe、Lustre、S3、Page Cache 这些名字先拿掉，AI
+系统里的存储层级要解决的不可化简问题只有一个：<strong>计算只能消费已经驻留在合适位置、以合适格式、在合适时间可见的字节，而现实中的数据和状态分布在容量、延迟、带宽、成本和语义完全不同的介质里。</strong></p>
+<p>这个问题有四个硬约束。第一是<strong>位置约束</strong>：GPU kernel
+只能直接高效访问 HBM 中的
+tensor；训练样本如果还在对象存储，就必须经过远端读取、本地缓存、主机内存、解码和
+H2D 才能参与计算。第二是<strong>时间约束</strong>：训练 step
+和在线推理都有稳定节拍，数据可以慢慢归档，但不能在 batch
+需要时才开始跨层级搬运。第三是<strong>语义约束</strong>：POSIX
+文件系统里的 <code>rename()</code>、<code>fsync()</code>、目录遍历、Page
+Cache，与对象存储里的 <code>PUT</code>、multipart upload、prefix
+listing、immutable key
+不是同一套承诺；把对象存储当成本地文件系统，会在可见性、原子性和成本上制造隐患。第四是<strong>经济约束</strong>：越靠近计算，通常越快、越贵、容量越小；越远离计算，通常越便宜、越大、延迟越高。平台设计的本质，是把每一类字节放在它的价值密度能够匹配的层级里。</p>
+<p>因此，数据驻留不是“存储选型”的附属问题，而是 AI
+系统吞吐、尾延迟、恢复时间、成本和可复现性的共同底座。一个训练任务 GPU
+利用率低，可能不是模型算得慢，而是样本还在冷层、小文件打满元数据服务、Page
+Cache 被错误污染、NVMe 缓存没有预热、对象存储被频繁 <code>LIST</code>
+或随机读放大。一个推理服务冷启动慢，可能不是引擎差，而是权重从对象存储拉取、解压、校验、加载到
+DRAM，再迁移到 HBM 的链路没有被显式管理。</p>
+<h3 id="推--从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从“字节必须在正确位置”出发，首先得到<strong>内存/存储层级</strong>。HBM
+放模型权重、激活、KV Cache 和 kernel workspace，因为这些字节马上要被 GPU
+访问；DRAM 放 dataloader 队列、解码后的
+batch、主机侧缓存和运行时元数据，因为它比存储快但容量仍有限；Page Cache
+吸收文件读取的重复访问和顺序预读，但它不是应用级缓存，不能替代数据版本、淘汰策略和容量治理；本地
+NVMe 放热数据 shard、模型热副本、shuffle
+临时文件和中间制品，因为它能把远端抖动隔离在训练节点之外；并行文件系统放集群共享的热数据和大规模写入结果，因为它提供共享命名空间和聚合带宽；对象存储放冷数据、长期归档、跨集群分发和不可变制品，因为它容量弹性好、成本低、适合以对象为单位管理。</p>
+<p>从“层级速度和容量不可能同时最好”出发，必然得到<strong>热层和冷层</strong>。热层不是一个具体产品，而是一组“近期会被高频读取或低延迟读取”的驻留策略：预热到本地
+NVMe、保留在 Page Cache、pin 到 DRAM、常驻
+HBM、复制到集群共享缓存。冷层保存长期价值更高但即时访问价值更低的数据：原始语料、旧
+checkpoint、历史评测、过期模型包。冷热分层的关键不是按年龄机械划线，而是按未来访问概率、重建成本、合规保留要求和访问延迟预算共同决策。</p>
+<p>从“远端读取不稳定”出发，得到<strong>缓存预热和生命周期管理</strong>。训练前预热常用
+shard manifest 把本轮会读的数据拉到本地 NVMe；推理服务发布前把权重和
+tokenizer 拉到节点镜像层或模型缓存；RAG
+索引可以把热文档、向量块或倒排段缓存在本地
+SSD。缓存不是复制一份文件这么简单，它必须回答：缓存 key
+是路径还是内容哈希，失效由版本号还是 TTL 驱动，容量满时按 LRU、LFU
+还是作业优先级淘汰，预热失败时是降级、阻塞还是换节点。</p>
+<p>从“语义不同”出发，得到<strong>存储协议边界</strong>。POSIX
+擅长目录、随机读写、原子 rename
+和进程间共享路径；对象存储擅长大对象、不可变
+key、多副本耐久和按请求计费。并行文件系统看起来像
+POSIX，但元数据服务、stripe、锁和小文件仍可能成为瓶颈。Page Cache
+看起来像免费加速，但它受全机内存压力、读写模式和内核回收影响。一个成熟平台不会假设所有后端都像本地磁盘，而会把“字节所在位置”和“该位置承诺的语义”同时写进系统设计。</p>
+<h3 id="概念先说清楚">概念先说清楚</h3>
+<p>数据驻留（data
+residency）指某份字节在某个时刻实际停在哪个层级，以及这个层级能以什么延迟、带宽、容量、成本和语义服务它。它不是“数据最终存在哪里”的静态问题，而是一个随训练
+step、推理请求、缓存预热、checkpoint、归档不断变化的状态问题。AI
+系统里同一份数据可能先在对象存储，随后进入本地 NVMe、Page
+Cache、DRAM、pinned memory，最后进入
+HBM；每跨一层，都要付出搬运、排队和一致性成本。</p>
+<p>内存/存储层级不是单纯快慢排序。HBM 最靠近 GPU
+计算，适合权重、激活、KV Cache 和 workspace；DRAM 适合
+DataLoader、解码后 batch、主机缓存和运行时元数据；Page Cache
+是内核自动管理的文件页缓存，能加速重复读但不能作为可控版本管理；本地
+NVMe 适合热数据
+shard、模型热副本和临时文件；并行文件系统适合集群共享热层；对象存储适合冷数据、不可变制品和长期归档。每层的“快”都绑定特定访问形状和语义。</p>
+<p>热层、冷层和缓存层是角色，不是固定产品。热层服务近期高频、低延迟访问；冷层保存长期价值更高但即时访问概率低的数据；缓存层用可丢弃副本减少重复远端读取。POSIX
+文件系统、并行文件系统、对象存储和 Page Cache 的语义不同，尤其在
+<code>rename()</code>、<code>fsync()</code>、目录遍历、原子可见性、请求计费和一致性上不能混用。数据驻留设计的本质，是让每类字节停在与它未来访问价值匹配的位置。</p>
+<h3 id="绘--因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((数据驻留层级))
+    不可化简问题
+      字节必须在正确位置
+      时间窗口有限
+      存储语义不同
+      成本随距离变化
+    近计算层
+      HBM
+        权重
+        激活
+        KV Cache
+      DRAM
+        DataLoader
+        解码后 batch
+        主机缓存
+      Page Cache
+        文件读缓存
+        顺序预读
+    本地与共享热层
+      NVMe
+        shard cache
+        模型热副本
+        shuffle 临时文件
+      并行文件系统
+        共享热数据
+        大文件聚合带宽
+        共享命名空间
+    冷层与归档
+      对象存储
+        原始数据
+        长期制品
+        跨集群分发
+    工程机制
+      缓存预热
+      生命周期策略
+      manifest
+      内容哈希
+      淘汰策略
+    取舍
+      容量
+      延迟
+      带宽
+      成本
+      语义</pre>
+<h3 id="导--读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>为什么 HBM、DRAM、Page
+Cache、NVMe、并行文件系统、对象存储不能只按“快慢”或“容量”排序？</li>
+<li>一个训练 batch 从对象存储到 GPU
+计算之间，会经过哪些驻留点，每个驻留点的失败模式是什么？</li>
+<li>热层和冷层应该按年龄、访问频率、重建成本还是延迟预算来划分？为什么通常需要组合判断？</li>
+<li>Page Cache
+和应用级缓存有什么差别，为什么不能把前者当成可控的数据生命周期机制？</li>
+<li>POSIX 文件系统和对象存储在
+rename、fsync、目录遍历、原子可见性和计费模型上有哪些关键差异？</li>
+<li>缓存预热应该在什么时候做，如何避免预热把存储系统打崩或把错误版本缓存到计算节点？</li>
+<li>面对 GPU
+利用率低、训练启动慢、推理冷启动慢或对象存储账单异常，如何从数据驻留层级回溯原因？</li>
+</ol>
+<h2 id="学习目标">学习目标</h2>
+<p>完成本章学习后，你将能够：</p>
+<ol type="1">
+<li>用数据驻留视角解释 AI 训练和推理中的内存/存储瓶颈</li>
+<li>区分 HBM、DRAM、Page Cache、NVMe、并行文件系统和对象存储的职责</li>
+<li>设计热层、冷层、缓存预热和数据生命周期策略</li>
+<li>判断 POSIX 与对象存储语义差异对工程可靠性的影响</li>
+<li>在容量、延迟、带宽和成本之间做可解释的工程取舍</li>
+</ol>
+<hr />
+<h2 id="正文内容">正文内容</h2>
+<h3 id="5a1-数据驻留层级不是越快越好">5a.1
+数据驻留层级不是“越快越好”</h3>
+<p>很多初学者会把存储层级理解成一条简单的速度排序：</p>
+<pre class="text"><code>HBM &gt; DRAM &gt; NVMe &gt; 文件系统 &gt; 对象存储</code></pre>
+<p>这个排序只能建立粗略直觉，不能指导工程设计。真正的设计问题至少有五个维度：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>需要回答的问题</th>
+<th>常见误判</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>容量</td>
+<td>这一层能放多少数据，能否容纳峰值和副本</td>
+<td>只看单盘或单卡容量，不算副本、临时文件和碎片</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>第一个字节多久能到，尾延迟是否稳定</td>
+<td>只看平均吞吐，忽略小文件和冷启动</td>
+</tr>
+<tr>
+<td>带宽</td>
+<td>稳态每秒能供给多少字节，是否可并发扩展</td>
+<td>把厂商理论值当作训练有效吞吐</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>每 GB 存储、每 GB 读取、每次请求和运维成本是多少</td>
+<td>只看容量单价，不看读放大和跨层级流量</td>
+</tr>
+<tr>
+<td>语义</td>
+<td>是否支持随机写、原子替换、目录遍历、权限和一致性</td>
+<td>把对象存储 mount 成文件系统后假装语义相同</td>
+</tr>
+</tbody>
+</table>
+<p>AI
+系统经常要同时优化这些维度。比如训练数据放对象存储最便宜，但如果每个
+epoch 都从远端随机读千万小文件，GPU
+等待和请求成本会吞掉便宜容量带来的好处。把全部数据复制到每台机器的 NVMe
+可以降低抖动，但会牺牲容量、预热时间和数据一致性。把权重常驻 HBM
+能降低推理延迟，但会降低同卡可承载模型数和租户密度。</p>
+<h3 id="5a2-六个层级的职责边界">5a.2 六个层级的职责边界</h3>
+<p>下面这张表给出 AI
+系统中常见驻留层级的工程画像。数字只用于建立数量级直觉，实际值会随硬件、文件大小、并发、压缩、内核参数和后端配置变化。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>典型介质</th>
+<th>容量直觉</th>
+<th>延迟直觉</th>
+<th>带宽直觉</th>
+<th>典型驻留数据</th>
+<th>主要风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HBM</td>
+<td>GPU 显存</td>
+<td>数十 GB 到百 GB 级/卡</td>
+<td>极低</td>
+<td>TB/s 级</td>
+<td>权重、激活、KV Cache、workspace</td>
+<td>容量稀缺、碎片、错误常驻导致并发下降</td>
+</tr>
+<tr>
+<td>DRAM</td>
+<td>主机内存</td>
+<td>百 GB 到 TB 级/节点</td>
+<td>低</td>
+<td>数十到数百 GB/s</td>
+<td>DataLoader 队列、解码后 batch、主机缓存</td>
+<td>NUMA、内存压力、被 Page Cache 挤压</td>
+</tr>
+<tr>
+<td>Page Cache</td>
+<td>Linux 内核文件缓存</td>
+<td>共享 DRAM 剩余空间</td>
+<td>低到中</td>
+<td>取决于命中率和底层存储</td>
+<td>最近读过的文件页、顺序预读</td>
+<td>不可精确控制、污染、回收抖动</td>
+</tr>
+<tr>
+<td>本地 NVMe</td>
+<td>节点 SSD</td>
+<td>TB 到数十 TB/节点</td>
+<td>中低</td>
+<td>GB/s 级/盘，可并发</td>
+<td>训练 shard、模型热副本、临时 shuffle</td>
+<td>容量治理、盘磨损、节点失效丢缓存</td>
+</tr>
+<tr>
+<td>并行文件系统</td>
+<td>Lustre、GPFS、BeeGFS 等</td>
+<td>PB 级共享</td>
+<td>中</td>
+<td>聚合 GB/s 到 TB/s</td>
+<td>共享热数据、大 shard、大制品 staging</td>
+<td>元数据瓶颈、小文件、stripe 不匹配</td>
+</tr>
+<tr>
+<td>对象存储</td>
+<td>S3、GCS、OSS、MinIO</td>
+<td>几乎弹性</td>
+<td>高</td>
+<td>高吞吐但请求语义不同</td>
+<td>原始数据、冷层、长期制品、跨集群分发</td>
+<td>非 POSIX、请求成本、LIST/小对象放大</td>
+</tr>
+</tbody>
+</table>
+<p>这张表的重点不是背数值，而是看“职责边界”。HBM
+不是用来放可重建冷数据的；对象存储不是用来承接训练内循环随机小读的；Page
+Cache 不是一个可审计缓存系统；并行文件系统不是无限吞吐的共享目录；NVMe
+缓存不是长期真相源。</p>
+<h3 id="5a3-一条训练数据的驻留路径">5a.3 一条训练数据的驻留路径</h3>
+<p>一个典型训练样本进入 GPU 前，可能经历如下路径：</p>
+<pre class="text"><code>对象存储 raw/sample shards
+  -&gt; 并行文件系统或本地 NVMe 热层
+  -&gt; Linux Page Cache
+  -&gt; 用户态 DataLoader buffer
+  -&gt; 解码 / tokenize / augment 后的 DRAM batch
+  -&gt; pinned memory
+  -&gt; HBM tensor
+  -&gt; GPU kernel 消费</code></pre>
+<p>每一跳都有不同失败模式：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>典型瓶颈</th>
+<th>表面现象</th>
+<th>常见动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对象存储到热层</td>
+<td>小对象多、请求并发不足、跨区读取</td>
+<td>训练启动慢、账单高、偶发 5xx</td>
+<td>合并 shard、manifest、限速预热、就近副本</td>
+</tr>
+<tr>
+<td>热层到 Page Cache</td>
+<td>随机读、小文件、目录元数据压力</td>
+<td>dataloader 抖动、worker 空等</td>
+<td>大 shard、顺序读、预取、目录分散</td>
+</tr>
+<tr>
+<td>Page Cache 到用户态</td>
+<td>命中率低、缓存污染、内存压力</td>
+<td>首轮慢、后续不稳定</td>
+<td>固定数据顺序、控制并发、应用级缓存</td>
+</tr>
+<tr>
+<td>用户态处理</td>
+<td>解码/tokenize CPU 不够、格式低效</td>
+<td>CPU 高、GPU 低</td>
+<td>预处理、二进制格式、worker 调整</td>
+</tr>
+<tr>
+<td>DRAM 到 HBM</td>
+<td>batch 未准备好、拷贝未重叠</td>
+<td>GPU 利用率锯齿</td>
+<td>pinned memory、prefetch、异步 H2D</td>
+</tr>
+</tbody>
+</table>
+<p>注意，本章只把最后的 H2D 当作驻留路径的一环，不展开 PCIe
+和互联细节。这里真正想强调的是：如果前面的层级没有稳定供给，后面的高速链路也无事可做。</p>
+<h3 id="5a4-page-cache有用但不是平台缓存">5a.4 Page
+Cache：有用，但不是平台缓存</h3>
+<p>Page Cache 是 Linux 用 DRAM
+缓存文件页的机制。它让重复读取和顺序读取更快，也能把很多“第一次慢、第二次快”的现象解释清楚。训练时，如果多个
+epoch 重复读同一批 shard，或者同一节点上多个 worker 顺序扫文件，Page
+Cache 命中会显著降低底层存储压力。</p>
+<p>但 Page Cache 不是一个平台级缓存系统：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>Page Cache</th>
+<th>应用级缓存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>key</td>
+<td>文件 inode 和页</td>
+<td>内容哈希、dataset version、模型版本</td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>内核按内存压力回收</td>
+<td>业务可定义 TTL、pin、优先级</td>
+</tr>
+<tr>
+<td>可观测性</td>
+<td>需要系统工具间接观察</td>
+<td>可记录命中率、版本、容量、租户</td>
+</tr>
+<tr>
+<td>一致性</td>
+<td>依赖文件系统语义</td>
+<td>可绑定 manifest 和校验和</td>
+</tr>
+<tr>
+<td>跨节点</td>
+<td>不共享</td>
+<td>可做分发、预热和复制</td>
+</tr>
+</tbody>
+</table>
+<p>所以 Page Cache 可以作为性能红利，但不应该作为 correctness
+的基础。比如一次训练要求使用
+<code>dataset=v2026-05-01</code>，平台应该通过
+manifest、内容哈希和路径隔离保证版本，而不是寄希望于 Page Cache
+“刚好缓存了正确文件”。同样，缓存预热应该明确写入本地 NVMe
+或应用缓存目录，而不是只靠 <code>cat</code>
+一遍文件期待内核永远保留这些页。</p>
+<h3 id="5a5-热层与冷层按未来访问价值分层">5a.5
+热层与冷层：按未来访问价值分层</h3>
+<p>冷热分层不是简单地“最近 7 天是热，7 天以前是冷”。AI
+系统里的数据价值由多个因素决定：</p>
+<table>
+<thead>
+<tr>
+<th>因素</th>
+<th>热层倾向</th>
+<th>冷层倾向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>未来访问概率</td>
+<td>最近训练、近期上线模型、热门索引</td>
+<td>历史实验、过期中间结果</td>
+</tr>
+<tr>
+<td>重建成本</td>
+<td>重新清洗或 tokenize 很贵</td>
+<td>可从原始数据快速重建</td>
+</tr>
+<tr>
+<td>延迟预算</td>
+<td>在线权重、RAG 热文档、训练首轮 shard</td>
+<td>合规归档、历史日志</td>
+</tr>
+<tr>
+<td>共享范围</td>
+<td>多作业会同时读</td>
+<td>偶尔审计或回放</td>
+</tr>
+<tr>
+<td>合规要求</td>
+<td>需要快速删除或权限隔离</td>
+<td>需要长期保留但少读</td>
+</tr>
+</tbody>
+</table>
+<p>一个合理策略通常会分成三类：</p>
+<ol type="1">
+<li><strong>常驻热层</strong>：正在服务的模型权重、热门
+tokenizer、当前训练 dataset manifest、本周高频 RAG 索引段。</li>
+<li><strong>可预热温层</strong>：即将训练的数据 shard、候选模型包、近期
+checkpoint、常用评测集。</li>
+<li><strong>归档冷层</strong>：原始语料、历史版本、长期审计制品、可重建中间层。</li>
+</ol>
+<p>冷热迁移要避免两个极端：一是冷层读取完全不治理，导致训练启动时所有节点同时打远端存储；二是热层无限保留，最后本地
+NVMe 被旧实验填满，真正需要的数据无法预热。</p>
+<h3 id="5a6-缓存预热把不确定性移出关键路径">5a.6
+缓存预热：把不确定性移出关键路径</h3>
+<p>缓存预热的目标不是“让缓存看起来满”，而是把关键路径上的远端读取、解压、校验和小文件遍历提前完成。一个训练作业预热通常需要四个输入：</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">job_id</span><span class="kw">:</span><span class="at"> train-20260504-001</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dataset_version</span><span class="kw">:</span><span class="at"> webtext-clean-v18</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">manifest</span><span class="kw">:</span><span class="at"> s3://datasets/webtext-clean-v18/manifest.json</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">target_cache</span><span class="kw">:</span><span class="at"> /local_nvme/dataset-cache/webtext-clean-v18</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">required_shards</span><span class="kw">:</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> shard-00000.tar</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> shard-00001.tar</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> shard-00002.tar</span></span></code></pre></div>
+<p>预热流程可以画成：</p>
+<pre class="mermaid">flowchart LR
+  A[读取 dataset manifest] --> B[解析需要的 shard]
+  B --> C[检查本地 NVMe cache]
+  C -->|命中且校验通过| D[登记 cache lease]
+  C -->|未命中| E[限速拉取对象]
+  E --> F[写临时文件]
+  F --> G[校验大小与 checksum]
+  G --> H[原子发布到 cache key]
+  H --> D
+  D --> I[训练 DataLoader 读取本地路径]</pre>
+<p>这里有几个工程要点：</p>
+<ul>
+<li><strong>用 manifest 驱动</strong>：不要靠递归 <code>ls</code>
+或对象存储 <code>LIST</code> 作为训练开始条件。</li>
+<li><strong>用内容哈希或版本号做
+key</strong>：路径复用但内容变化，会产生最难排查的脏缓存。</li>
+<li><strong>限速和错峰</strong>：100
+个节点同时预热同一批对象，可能把对象存储、NAT 或共享文件层打满。</li>
+<li><strong>先写临时文件再发布</strong>：避免训练读到半个 shard。</li>
+<li><strong>缓存
+lease</strong>：作业运行期间不要被清理进程删掉正在读的数据。</li>
+<li><strong>记录命中率和预热耗时</strong>：否则无法区分训练慢是冷启动还是计算慢。</li>
+</ul>
+<p>推理服务也有类似预热，只是对象从 dataset shard
+换成权重、tokenizer、engine cache、LoRA adapter
+或索引段。在线系统更关心尾延迟，所以经常要求实例进入 ready
+前完成模型文件校验和 HBM/DRAM 加载。</p>
+<h3 id="5a7-posix-vs-object同样是存文件语义完全不同">5a.7 POSIX vs
+Object：同样是“存文件”，语义完全不同</h3>
+<p>POSIX 文件系统和对象存储的差异，常常被 mount
+工具掩盖。把对象存储挂成路径后，应用可以
+<code>open()</code>，但底层仍然不是本地文件系统。</p>
+<table>
+<thead>
+<tr>
+<th>语义</th>
+<th>POSIX / 并行文件系统</th>
+<th>对象存储</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基本单位</td>
+<td>文件和目录</td>
+<td>object key</td>
+</tr>
+<tr>
+<td>写入方式</td>
+<td>可随机写、覆盖、追加取决于 FS</td>
+<td>通常 PUT 整个对象或 multipart complete 后可见</td>
+</tr>
+<tr>
+<td>rename</td>
+<td>同一文件系统内通常可原子 rename</td>
+<td>通常是 copy + delete，不是原子 rename</td>
+</tr>
+<tr>
+<td>fsync</td>
+<td>可要求文件和目录元数据持久化</td>
+<td>没有本地 fsync 语义</td>
+</tr>
+<tr>
+<td>目录</td>
+<td>真实目录或元数据命名空间</td>
+<td>prefix 模拟目录</td>
+</tr>
+<tr>
+<td>list</td>
+<td>文件系统目录遍历</td>
+<td><code>LIST prefix</code> 请求，可能分页且有成本</td>
+</tr>
+<tr>
+<td>小文件</td>
+<td>受元数据服务影响</td>
+<td>受请求数、延迟和计费影响</td>
+</tr>
+<tr>
+<td>并发读</td>
+<td>取决于客户端、server、stripe</td>
+<td>适合大对象高并发读，但要控制请求形状</td>
+</tr>
+<tr>
+<td>原子发布</td>
+<td>temp file + rename 常见</td>
+<td>immutable objects + manifest 更稳妥</td>
+</tr>
+</tbody>
+</table>
+<p>因此，对象存储上的可靠发布模式通常不是“写目录然后改名”，而是：</p>
+<pre class="text"><code>1. 写入不可变对象：shard-00001.&lt;checksum&gt;.tar
+2. 校验每个对象大小和 checksum
+3. 写入 manifest：列出所有对象、版本、schema、样本数
+4. 发布一个小的版本指针：current -&gt; manifest id
+5. 读取端只信 manifest，不递归扫描目录</code></pre>
+<p>这和第12章的制品管理思路一致：对象存储保存字节，manifest 或 registry
+才定义“这一组字节是不是一个完整版本”。</p>
+<h3 id="5a8-数据生命周期从原始数据到清理">5a.8
+数据生命周期：从原始数据到清理</h3>
+<p>数据生命周期要把性能、成本、复现和合规放在同一个流程里。一个常见 AI
+数据生命周期如下：</p>
+<pre class="mermaid">flowchart TD
+  A[原始接入] --> B[清洗与脱敏]
+  B --> C[样本化与分片]
+  C --> D[发布 dataset manifest]
+  D --> E[热层预热]
+  E --> F[训练或评测读取]
+  F --> G[生成模型与中间制品]
+  G --> H[保留策略判定]
+  H -->|近期复用| I[保留热/温层]
+  H -->|长期价值| J[归档对象存储]
+  H -->|可重建且无保留要求| K[清理]</pre>
+<p>生命周期策略至少应该明确：</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>保留依据</th>
+<th>热层策略</th>
+<th>冷层策略</th>
+<th>清理条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始数据</td>
+<td>合规、可追溯</td>
+<td>通常不常驻</td>
+<td>长期归档</td>
+<td>达到保留期限且允许删除</td>
+</tr>
+<tr>
+<td>清洗后数据</td>
+<td>复现实验、回放</td>
+<td>近期版本保留</td>
+<td>重要版本归档</td>
+<td>可由原始层重建且无引用</td>
+</tr>
+<tr>
+<td>训练 shard</td>
+<td>吞吐、复用</td>
+<td>当前/近期任务预热</td>
+<td>manifest 归档</td>
+<td>无运行 job lease 且低频</td>
+</tr>
+<tr>
+<td>模型权重</td>
+<td>服务与回滚</td>
+<td>production/staging 常驻</td>
+<td>历史版本归档</td>
+<td>非回滚候选且过期</td>
+</tr>
+<tr>
+<td>临时文件</td>
+<td>运行时中间态</td>
+<td>本地短期</td>
+<td>通常不归档</td>
+<td>job 完成或失败后清理</td>
+</tr>
+</tbody>
+</table>
+<p>清理最危险的不是删得太少，而是删掉仍被
+manifest、模型版本、评测报告或运行作业引用的数据。成熟平台会把清理做成引用计数或可达性分析，而不是简单
+<code>find -mtime +30 -delete</code>。</p>
+<h3 id="5a9-工程案例一训练集群-gpu-利用率锯齿化">5a.9
+工程案例一：训练集群 GPU 利用率锯齿化</h3>
+<p>某团队在 64 卡训练中看到 GPU 利用率周期性从 90% 掉到 20%，但 profiler
+显示主要 kernel 本身没有明显问题。初始判断是通信慢，后来发现每隔一段时间
+dataloader worker 会同时等待远端对象存储。</p>
+<p>排查链路如下：</p>
+<table>
+<thead>
+<tr>
+<th>观察</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一个 epoch 很慢，第二个 epoch 部分变快</td>
+<td>Page Cache 和本地缓存有命中</td>
+</tr>
+<tr>
+<td>worker 日志里大量小文件读取</td>
+<td>样本没有合并成 shard</td>
+</tr>
+<tr>
+<td>对象存储请求数很高，但字节吞吐不高</td>
+<td>请求放大而非带宽不足</td>
+</tr>
+<tr>
+<td>GPU 空转发生在 batch 边界</td>
+<td>数据供给不能稳定覆盖 compute</td>
+</tr>
+</tbody>
+</table>
+<p>修复动作：</p>
+<ol type="1">
+<li>把千万级小样本合并为 256MB 到 1GB 级 shard。</li>
+<li>用 manifest 固定 dataset version 和 shard 列表。</li>
+<li>训练启动前按 rank 预热所需 shard 到本地 NVMe。</li>
+<li>DataLoader 只读本地路径，远端失败不进入 step 关键路径。</li>
+<li>记录缓存命中率、预热耗时、每 rank 读取吞吐。</li>
+</ol>
+<p>结果不是 GPU kernel
+变快了，而是数据驻留从“训练时随机碰远端冷层”变成“训练前受控拉到本地热层”。</p>
+<h3 id="5a10-工程案例二推理冷启动慢">5a.10 工程案例二：推理冷启动慢</h3>
+<p>一个多模型推理平台在扩容时实例 ready 时间超过 8
+分钟。模型权重放在对象存储中，每个实例启动时下载、解压、校验、加载到
+DRAM，再初始化推理引擎。线上流量高峰时同时扩容 50
+个实例，对象存储和镜像层都出现抖动。</p>
+<p>可以把冷启动拆成：</p>
+<pre class="text"><code>调度实例
+  -&gt; 拉取镜像
+  -&gt; 拉取模型对象
+  -&gt; 校验与解压
+  -&gt; 加载到 DRAM
+  -&gt; 加载到 HBM / 初始化 engine
+  -&gt; health check 通过</code></pre>
+<p>优化方向：</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>解决的问题</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>节点级模型缓存</td>
+<td>避免每个实例重复下载</td>
+<td>占用 NVMe，需要淘汰策略</td>
+</tr>
+<tr>
+<td>发布前预热 staging 节点</td>
+<td>把下载和校验移出扩容路径</td>
+<td>发布流程变长</td>
+</tr>
+<tr>
+<td>使用内容哈希命名权重</td>
+<td>避免脏缓存和重复副本</td>
+<td>需要 registry/manifest 配合</td>
+</tr>
+<tr>
+<td>小文件合并或打包</td>
+<td>降低 open/list/请求放大</td>
+<td>局部更新粒度变粗</td>
+</tr>
+<tr>
+<td>常用模型常驻 HBM</td>
+<td>降低首请求延迟</td>
+<td>降低模型密度和多租户弹性</td>
+</tr>
+</tbody>
+</table>
+<p>这里的关键取舍是：为了降低冷启动和尾延迟，平台愿意在本地 NVMe、DRAM
+或 HBM 中保留多少热副本。</p>
+<h3 id="5a11-容量延迟带宽成本的取舍方法">5a.11
+容量、延迟、带宽、成本的取舍方法</h3>
+<p>做存储层级设计时，可以先用一个简单公式估算关键路径压力：</p>
+<pre class="text"><code>所需稳态带宽 ≈ 每 step 消费字节数 / 可用于读取的时间窗口</code></pre>
+<p>例如每个训练 step 需要 8GB 解码后样本，compute 时间 2
+秒，如果希望数据读取完全隐藏在计算后面，那么数据管道到 DRAM
+的有效供给至少要接近
+4GB/s，还要留出解码、抖动和尾延迟余量。若数据还在对象存储且格式是大量小文件，理论带宽再高也可能无法达到这个有效供给。</p>
+<p>做取舍时可以按以下顺序问：</p>
+<ol type="1">
+<li><strong>这份数据下次什么时候会被读？</strong>
+如果马上读，应该靠近计算；如果一年后审计，应该进冷层。</li>
+<li><strong>读取形状是什么？</strong>
+大对象顺序读适合对象存储和并行文件系统；随机小读需要合并、索引或本地化。</li>
+<li><strong>是否能重建？</strong>
+可重建中间结果不应长期占昂贵热层；不可重建原始数据要优先保留。</li>
+<li><strong>是否需要原子版本语义？</strong> 需要就用
+manifest、内容哈希和发布指针，而不是目录扫描。</li>
+<li><strong>是否有多租户冲突？</strong>
+热层容量被一个作业占满，会影响其他作业启动和服务扩容。</li>
+<li><strong>成本来自哪里？</strong>
+容量、请求数、跨区流量、元数据服务、运维复杂度都可能是主成本。</li>
+</ol>
+<h3 id="5a12-典型反模式">5a.12 典型反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>为什么危险</th>
+<th>更稳妥做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练直接递归读取对象存储目录</td>
+<td><code>LIST</code>、小对象和远端尾延迟进入关键路径</td>
+<td>manifest + shard + 预热</td>
+</tr>
+<tr>
+<td>把对象存储 mount 成 POSIX 后依赖 rename</td>
+<td>rename 可能是 copy+delete，原子性不成立</td>
+<td>immutable object + manifest 发布</td>
+</tr>
+<tr>
+<td>认为 Page Cache 命中率会自然稳定</td>
+<td>内存压力和其他进程会改变缓存状态</td>
+<td>应用级缓存和可观测指标</td>
+</tr>
+<tr>
+<td>本地 NVMe 永不清理</td>
+<td>热层被历史实验占满</td>
+<td>lease、引用计数、优先级淘汰</td>
+</tr>
+<tr>
+<td>所有数据都进并行文件系统</td>
+<td>元数据服务和小文件会成为共享瓶颈</td>
+<td>大 shard、分层、冷数据进对象存储</td>
+</tr>
+<tr>
+<td>权重每次实例启动都远端拉取</td>
+<td>扩容尾延迟和远端抖动不可控</td>
+<td>节点缓存、发布预热、内容哈希</td>
+</tr>
+<tr>
+<td>只看存储容量单价</td>
+<td>请求数、读放大和 GPU 空转成本被忽略</td>
+<td>同时核算吞吐、延迟和计算浪费</td>
+</tr>
+</tbody>
+</table>
+<h2
+id="checklist设计数据驻留层级时检查什么">Checklist：设计数据驻留层级时检查什么</h2>
+<ul class="task-list">
+<li><label><input
+type="checkbox" />每类数据是否明确了真相源、热副本和可删除副本？</label></li>
+<li><label><input type="checkbox" />dataset、模型权重和索引是否有
+manifest 或内容哈希，而不是只靠路径？</label></li>
+<li><label><input
+type="checkbox" />训练关键路径是否避免远端随机小读和递归目录扫描？</label></li>
+<li><label><input type="checkbox" />本地 NVMe
+缓存是否有容量上限、淘汰策略和运行中 lease？</label></li>
+<li><label><input type="checkbox" />Page Cache
+命中是否被当作性能优化，而不是 correctness 前提？</label></li>
+<li><label><input
+type="checkbox" />对象存储读取是否控制了请求数、并发、重试和跨区流量？</label></li>
+<li><label><input
+type="checkbox" />并行文件系统是否避免单目录海量小文件和不合适的
+stripe？</label></li>
+<li><label><input type="checkbox" />推理服务是否区分下载、校验、DRAM
+加载和 HBM 常驻时间？</label></li>
+<li><label><input type="checkbox" />清理任务是否检查
+manifest、registry、运行 job 和回滚候选引用？</label></li>
+<li><label><input type="checkbox" />监控是否覆盖 cache hit
+ratio、预热耗时、读取吞吐、远端请求数和热层容量？</label></li>
+</ul>
+<h2 id="练习题">练习题</h2>
+<ol type="1">
+<li>画出一个 LLM SFT 任务从对象存储读取训练 shard 到 GPU
+计算的驻留路径，标出每一层可能出现的瓶颈。</li>
+<li>某训练集由 2,000 万个 20KB 小文件组成，总量约 400GB。请设计一种
+shard、manifest
+和本地缓存方案，说明为什么它比直接随机读取对象存储更稳。</li>
+<li>一个推理平台要求新实例 90 秒内 ready，但模型包
+80GB，当前从对象存储下载和加载需要 6
+分钟。请给出至少三种降低冷启动的方案，并说明各自成本。</li>
+<li>Page Cache 命中后第二个 epoch
+明显变快。为什么这不能证明数据管道设计已经可靠？还需要补哪些指标？</li>
+<li>设计一个对象存储上的 dataset
+发布协议，要求读取端不会看到半成品版本。请说明对象命名、checksum、manifest
+和版本指针如何配合。</li>
+<li>某节点本地 NVMe 缓存经常被旧作业占满，导致新训练预热失败。请设计一套
+lease、优先级和清理规则。</li>
+<li>对比 POSIX 文件系统和对象存储：如果一个作业依赖
+<code>tmp -&gt; final</code> 的 rename
+发布结果，迁移到对象存储后会出现什么风险？如何改造？</li>
+</ol>
+<h2 id="本章小结">本章小结</h2>
+<p>AI
+系统中的内存/存储层级，本质上是在为不同价值密度的字节安排驻留位置。HBM、DRAM、Page
+Cache、NVMe、并行文件系统和对象存储各自解决不同问题：越靠近计算，越适合放即将被高频访问的状态；越远离计算，越适合放大容量、长期保留和跨集群分发的数据。</p>
+<p>工程上最重要的不是记住某一层“快多少”，而是把容量、延迟、带宽、成本和语义一起看。热层、冷层、缓存预热、manifest、内容哈希、生命周期和清理策略，都是为了避免错误的字节在错误的时间停留在错误的位置。只要这个视角建立起来，很多
+GPU
+空转、冷启动慢、对象存储账单异常和数据版本事故，都可以沿着驻留层级被系统化排查。</p>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

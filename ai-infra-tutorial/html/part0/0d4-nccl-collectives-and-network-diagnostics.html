@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d4 章 · NCCL Collective 与网络诊断 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d4" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d4 章 · NCCL Collective 与网络诊断</h1>
+<p class="sub">专讲 NCCL 的 collective 语义、算法、transport、拓扑、日志、nccl-tests、性能模型和生产排障。</p>
+<div class="chips"><span class="chip">NCCL</span><span class="chip">Collective</span><span class="chip">AllReduce</span><span class="chip">Transport</span><span class="chip">GDRDMA</span><span class="chip">nccl-tests</span><span class="chip">Timeout</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#nccl-在训练栈里的位置">2. NCCL 在训练栈里的位置</a></li><li><a class="anchor" href="#nccl-核心对象rankcommunicatorchannel">3. NCCL 核心对象：rank、communicator、channel</a></li><li><a class="anchor" href="#collective-语义allreduce-只是其中一种">4. Collective 语义：AllReduce 只是其中一种</a></li><li><a class="anchor" href="#allreduce-算法ringtreecollnetnvls">5. AllReduce 算法：ring、tree、CollNet、NVLS</a></li><li><a class="anchor" href="#nccl-protocolllll128simple-的直觉">6. NCCL Protocol：LL、LL128、Simple 的直觉</a></li><li><a class="anchor" href="#transportp2pshmnetsocketnetib">7. Transport：P2P、SHM、NET/Socket、NET/IB</a></li><li><a class="anchor" href="#gpudirect-rdmanccl-的跨节点快路径">8. GPUDirect RDMA：NCCL 的跨节点快路径</a></li><li><a class="anchor" href="#topologynccl-自动探测也需要正确资源布局">9. Topology：NCCL 自动探测也需要正确资源布局</a></li><li><a class="anchor" href="#环境变量诊断工具不是魔法咒语">10. 环境变量：诊断工具，不是魔法咒语</a></li><li><a class="anchor" href="#nccl-日志分阶段读法">11. NCCL 日志分阶段读法</a></li><li><a class="anchor" href="#nccl-tests怎么跑才有意义">12. nccl-tests：怎么跑才有意义</a></li><li><a class="anchor" href="#algbwbusbw-和理论带宽">13. algbw、busbw 和理论带宽</a></li><li><a class="anchor" href="#性能模型为什么小-bucket-和大-bucket-不一样">14. 性能模型：为什么小 bucket 和大 bucket 不一样</a></li><li><a class="anchor" href="#与-pytorch-profiler-nsight-的关系">15. 与 PyTorch Profiler / Nsight 的关系</a></li><li><a class="anchor" href="#常见故障模式总表">16. 常见故障模式总表</a></li><li><a class="anchor" href="#worked-examplesocket-fallback">17. Worked Example：socket fallback</a></li><li><a class="anchor" href="#worked-examplegid-index-错">18. Worked Example：GID index 错</a></li><li><a class="anchor" href="#worked-exampleecn-mtu-规模故障">19. Worked Example：ECN + MTU 规模故障</a></li><li><a class="anchor" href="#worked-examplerank-stall-伪装成-nccl-timeout">20. Worked Example：rank stall 伪装成 NCCL timeout</a></li><li><a class="anchor" href="#nccl-调优顺序">21. NCCL 调优顺序</a></li><li><a class="anchor" href="#训练集群-nccl-验收-sop">22. 训练集群 NCCL 验收 SOP</a></li><li><a class="anchor" href="#hard-gate-与-soft-gate">23. Hard Gate 与 Soft Gate</a></li><li><a class="anchor" href="#生产事故取证包">24. 生产事故取证包</a></li><li><a class="anchor" href="#checklist">25. Checklist</a></li><li><a class="anchor" href="#练习">26. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章专门讲 NCCL。Linux TCP/MTU 见 <a
+href="0d1-linux-network-stack-tcp-and-mtu.html">0d1</a>，NIC
+queue/offload 见 <a
+href="0d2-nic-offload-queues-and-service-network-io.html">0d2</a>，RDMA/RoCE/IB/GPUDirect
+见 <a
+href="0d3-rdma-roce-infiniband-and-gpudirect.html">0d3</a>，GPU/NIC/NUMA
+拓扑见 <a href="0b3-numa-pcie-dma-and-pinned-memory.html">0b3</a>。第 8
+章会从数据并行训练语义继续使用本章结论。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>NCCL 要解决的不是“把一段 bytes 从 A 发到
+B”这么简单。训练里的通信通常是 collective：所有 rank
+要在同一个逻辑步骤里共同完成
+AllReduce、ReduceScatter、AllGather、Broadcast 或
+AllToAll。不可化简的问题是：</p>
+<p><strong>一组 GPU 分布在不同
+PCIe/NVLink/NVSwitch/NIC/交换机路径上，但训练语义要求它们像一个同步机器一样前进；NCCL
+必须把 tensor 切片、选择算法、选择 transport、安排 channel、利用 GPU
+kernel 和网络设备，并在任意 rank 变慢时暴露足够证据。</strong></p>
+<p>这也是 NCCL 难排的根因：一次 timeout 可能来自算法选择、消息大小、rank
+没进 collective、GPU kernel 阻塞、P2P 被禁、GDRDMA fallback、HCA
+选错、GID 错、MTU 不一致、PFC pause、ECMP
+不均、容器权限、driver/CUDA/NCCL 版本组合。NCCL
+日志只是入口，不是结论。</p>
+<h3 id="推-从问题推出机制">推 — 从问题推出机制</h3>
+<p>从“所有 rank 要共同完成一个通信语义”推出 collective API；从“单次
+tensor 很大”推出 chunk、slice、pipeline 和 channel；从“拓扑不均匀”推出
+ring/tree/CollNet/NVLS 等算法选择；从“节点内和跨节点路径不同”推出
+P2P/SHM/NVLink/NET transport；从“跨节点要低 CPU 开销”推出
+NET/IB、RoCE/IB、GPUDirect RDMA；从“自动选择会出错或被环境破坏”推出
+<code>NCCL_DEBUG</code>、topology dump、<code>nccl-tests</code> 和分层
+SOP。</p>
+<h3 id="绘-nccl-工作栈">绘 — NCCL 工作栈</h3>
+<pre class="mermaid">flowchart TB
+  Framework[PyTorch DDP/FSDP/DeepSpeed] --> API[NCCL collective API]
+  API --> Plan[Algorithm + Protocol + Channel plan]
+  Plan --> Intra[Intra-node transport]
+  Plan --> Inter[Inter-node NET transport]
+  Intra --> P2P[P2P / NVLink / NVSwitch]
+  Intra --> SHM[SHM / host path]
+  Inter --> Socket[NET/Socket TCP]
+  Inter --> IB[NET/IB verbs RoCE/IB]
+  IB --> GDR[GPUDirect RDMA]
+  Plan --> Kernels[NCCL GPU kernels]
+  Kernels --> Streams[CUDA streams and synchronization]
+  IB --> Fabric[MTU / ECN / PFC / ECMP / switch queues]
+  Fabric --> Evidence[logs + nccl-tests + host/switch counters]</pre>
+<h3 id="导-本章读完后你应该能回答">导 — 本章读完后你应该能回答</h3>
+<ol type="1">
+<li>NCCL 中 collective、rank、channel、algorithm、protocol、transport
+分别是什么？</li>
+<li>Ring、tree、CollNet、NVLS 大致在解决什么问题？</li>
+<li><code>NET/Socket</code>、<code>NET/IB</code>、P2P、SHM、GDRDMA
+日志各意味着什么？</li>
+<li><code>NCCL_IB_HCA</code>、<code>NCCL_SOCKET_IFNAME</code>、<code>NCCL_IB_GID_INDEX</code>
+等变量什么时候该用，什么时候会误导？</li>
+<li><code>nccl-tests</code> 的
+<code>algbw</code>、<code>busbw</code>、消息大小曲线和规模曲线怎么读？</li>
+<li>NCCL timeout 如何区分 rank stall、socket fallback、RDMA
+fabric、MTU/ECN/PFC、GPU/NIC 拓扑问题？</li>
+<li>一个训练集群上线前，NCCL 验收 hard gate 应该包含什么？</li>
+</ol>
+<h2 id="nccl-在训练栈里的位置">2. NCCL 在训练栈里的位置</h2>
+<p>NCCL 通常不直接由业务代码调用，而是被 PyTorch
+Distributed、DDP、FSDP、DeepSpeed、Megatron、Tensor Parallel、Pipeline
+Parallel 或 MoE runtime 间接调用。</p>
+<pre class="text"><code>loss.backward()
+  -&gt; autograd hooks
+  -&gt; DDP gradient bucket ready
+  -&gt; torch.distributed all_reduce / reduce_scatter
+  -&gt; ProcessGroupNCCL
+  -&gt; NCCL communicator
+  -&gt; NCCL kernels + transport
+  -&gt; GPU/NIC/fabric</code></pre>
+<p>这个路径说明两个边界：</p>
+<ul>
+<li>NCCL 慢不一定是 NCCL 本身慢。可能是 bucket 没 ready、某个 rank
+dataloader 慢、某个 CUDA kernel 没结束、CPU 线程没及时提交
+collective。</li>
+<li>训练慢也不一定体现为 NCCL error。很多通信退化只是 step time
+变长、GPU utilization 掉、<code>nccl-tests</code> 方差变大。</li>
+</ul>
+<p>常见调用场景：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>场景</th>
+<th>NCCL collective</th>
+<th>典型瓶颈</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP 梯度同步</td>
+<td>AllReduce</td>
+<td>bucket ready time、跨节点带宽、慢 rank</td>
+</tr>
+<tr>
+<td>FSDP / ZeRO</td>
+<td>ReduceScatter + AllGather</td>
+<td>参数 shard 重建、通信与计算重叠</td>
+</tr>
+<tr>
+<td>Tensor Parallel</td>
+<td>AllReduce / AllGather / ReduceScatter</td>
+<td>节点内 NVLink/NVSwitch、跨节点 TP 风险</td>
+</tr>
+<tr>
+<td>Pipeline Parallel</td>
+<td>Send/Recv + 部分 collective</td>
+<td>stage bubble、microbatch 调度</td>
+</tr>
+<tr>
+<td>MoE Expert Parallel</td>
+<td>AllToAll</td>
+<td>ECMP、队列、incast、消息碎片</td>
+</tr>
+<tr>
+<td>初始化/权重广播</td>
+<td>Broadcast</td>
+<td>bootstrap、首轮拓扑、冷路径</td>
+</tr>
+</tbody>
+</table>
+<h2 id="nccl-核心对象rankcommunicatorchannel">3. NCCL
+核心对象：rank、communicator、channel</h2>
+<p>NCCL 的最小世界观：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>概念</th>
+<th>含义</th>
+<th>排障意义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>rank</td>
+<td>collective 中的一个参与者，通常绑定到一张 GPU</td>
+<td>慢 rank 会拖住全体</td>
+</tr>
+<tr>
+<td>world size</td>
+<td>communicator 中 rank 总数</td>
+<td>影响算法、ring 数、树形结构</td>
+</tr>
+<tr>
+<td>communicator</td>
+<td>一组 rank 的通信上下文</td>
+<td>初始化失败和训练中 timeout 要分开看</td>
+</tr>
+<tr>
+<td>channel</td>
+<td>NCCL 内部并行通信通道</td>
+<td>影响带宽、ECMP 熵、GPU kernel 并发</td>
+</tr>
+<tr>
+<td>chunk/slice</td>
+<td>tensor 被切开的通信单元</td>
+<td>影响 pipeline 和小消息效率</td>
+</tr>
+<tr>
+<td>stream</td>
+<td>NCCL kernel 所在 CUDA stream</td>
+<td>与计算 kernel 的依赖关系决定 overlap</td>
+</tr>
+</tbody>
+</table>
+<p>channel 不是“越多越好”。更多 channel
+可以提高并行度和网络熵，但也会增加 kernel、queue
+pair、buffer、调度和交换机队列压力。不同 NCCL 版本、GPU 数、NIC
+数、消息大小会选择不同 channel 数。</p>
+<p>观察入口：</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,GRAPH,NET,COLL</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_TOPO_DUMP_FILE</span><span class="op">=</span>/tmp/nccl-topo.xml</span></code></pre></div>
+<p>日志里看到
+<code>Channel 00/..</code>、<code>Ring</code>、<code>Tree</code>、<code>NET/IB</code>、<code>GDRDMA</code>
+等字段时，不要只摘一行，要把同一 rank 的 INIT、GRAPH、NET、COLL
+阶段连起来读。</p>
+<h2 id="collective-语义allreduce-只是其中一种">4. Collective
+语义：AllReduce 只是其中一种</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Collective</th>
+<th>输入输出语义</th>
+<th>常见训练位置</th>
+<th>性能敏感点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AllReduce</td>
+<td>所有 rank 输入，所有 rank 得到 reduce 结果</td>
+<td>DDP 梯度同步</td>
+<td>带宽、慢 rank、重叠</td>
+</tr>
+<tr>
+<td>ReduceScatter</td>
+<td>reduce 后每个 rank 得到一片</td>
+<td>FSDP/ZeRO 梯度或参数分片</td>
+<td>分片布局、bucket 粒度</td>
+</tr>
+<tr>
+<td>AllGather</td>
+<td>每个 rank 的分片收集成全量</td>
+<td>FSDP 参数重建、TP</td>
+<td>峰值显存、带宽、调度</td>
+</tr>
+<tr>
+<td>Broadcast</td>
+<td>一个 root 发给所有 rank</td>
+<td>初始化、权重同步</td>
+<td>root 路径、树形 fanout</td>
+</tr>
+<tr>
+<td>AllToAll</td>
+<td>每个 rank 给每个 rank 不同数据</td>
+<td>MoE expert dispatch</td>
+<td>小消息、ECMP、incast</td>
+</tr>
+<tr>
+<td>Send/Recv</td>
+<td>点对点语义</td>
+<td>pipeline parallel、custom runtime</td>
+<td>顺序、死锁、流依赖</td>
+</tr>
+</tbody>
+</table>
+<p>AllReduce 常被用来代表 NCCL，但真正的大模型训练往往更依赖
+ReduceScatter/AllGather 的组合。FSDP 和 ZeRO
+把参数、梯度、优化器状态分片后，通信模式从“每步一个大 AllReduce”变成多次
+bucket 化的 ReduceScatter/AllGather。MoE 则会引入
+AllToAll，它对网络队列和 ECMP 更敏感。</p>
+<h2 id="allreduce-算法ringtreecollnetnvls">5. AllReduce
+算法：ring、tree、CollNet、NVLS</h2>
+<h3 id="ring">5.1 Ring</h3>
+<p>Ring AllReduce 通常拆成 reduce-scatter + all-gather 两段。每个 rank
+只和 ring 上相邻 rank 通信，带宽利用率好，适合大消息。</p>
+<pre class="text"><code>rank0 -&gt; rank1 -&gt; rank2 -&gt; ... -&gt; rankN-1 -&gt; rank0
+reduce-scatter: 每轮规约一片
+all-gather: 每轮传播一片结果</code></pre>
+<p>直觉：</p>
+<ul>
+<li>大消息带宽效率高；</li>
+<li>每个 rank 的链路负载相对均匀；</li>
+<li>延迟随 rank 数和轮数增长；</li>
+<li>ring 顺序如果跨拓扑不合理，会把远路径放进关键环。</li>
+</ul>
+<h3 id="tree">5.2 Tree</h3>
+<p>Tree 更像规约树 +
+广播树，常用于小中消息或更重视延迟的场景。它减少某些轮次，但可能让树根或上层路径压力更高。</p>
+<h3 id="collnet-hierarchical">5.3 CollNet / Hierarchical</h3>
+<p>多节点多 GPU
+中，常见思想是先节点内规约，再跨节点通信，再节点内广播。这样能更好利用
+NVLink/NVSwitch 和每节点 NIC。CollNet
+类算法会利用这种层级结构，但需要硬件、拓扑和 NCCL 支持。</p>
+<h3 id="nvls">5.4 NVLS</h3>
+<p>NVLS 与 NVLink/NVSwitch 相关，目标是在支持的节点内 fabric
+上更高效地做 collective。是否启用、效果如何，要看 GPU
+代际、NVSwitch、驱动、NCCL 版本和日志。</p>
+<p>工程结论：不要手工固定算法当长期默认。正确流程是：</p>
+<ol type="1">
+<li>先记录 NCCL 自动选择；</li>
+<li>用 <code>nccl-tests</code> 按消息大小画曲线；</li>
+<li>只在明确复现某个消息范围退化时，用环境变量做最小约束；</li>
+<li>约束必须绑定版本、机型和拓扑。</li>
+</ol>
+<h2 id="nccl-protocolllll128simple-的直觉">6. NCCL
+Protocol：LL、LL128、Simple 的直觉</h2>
+<p>NCCL 除了选择算法，还会选择 protocol。不同 protocol
+在小消息延迟、带宽效率、CPU/GPU
+协调、内存访问方式上有取舍。你不需要把内部实现细节背下来，但要知道同一个
+AllReduce 在不同消息大小下可能走不同 protocol。</p>
+<p>粗略直觉：</p>
+<table>
+<thead>
+<tr>
+<th>Protocol</th>
+<th>典型直觉</th>
+<th>排障意义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LL</td>
+<td>低延迟，小消息友好</td>
+<td>小 bucket 多时可能看到</td>
+</tr>
+<tr>
+<td>LL128</td>
+<td>低延迟和带宽折中</td>
+<td>中等消息可能出现</td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>大消息带宽友好</td>
+<td>大 tensor / 大 bucket 常见</td>
+</tr>
+</tbody>
+</table>
+<p>如果训练改了 bucket size、FSDP prefetch、gradient accumulation 或
+tensor parallel 粒度，NCCL 的消息大小分布会变，算法/protocol
+选择也可能变。通信性能不能只用“总梯度大小”解释，要看 bucket
+切分后的消息大小直方图。</p>
+<h2 id="transportp2pshmnetsocketnetib">7.
+Transport：P2P、SHM、NET/Socket、NET/IB</h2>
+<p>NCCL transport 是数据真正走的路径。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Transport</th>
+<th>路径</th>
+<th>常见用途</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P2P</td>
+<td>GPU-GPU 直接路径，可能经 NVLink/PCIe P2P</td>
+<td>节点内 GPU 通信</td>
+<td>P2P 被禁、ACS/IOMMU、拓扑远</td>
+</tr>
+<tr>
+<td>SHM</td>
+<td>通过 host shared memory</td>
+<td>节点内 fallback 或辅助路径</td>
+<td>Host memory 带宽和 NUMA</td>
+</tr>
+<tr>
+<td>NET/Socket</td>
+<td>TCP socket</td>
+<td>无 RDMA 或 fallback</td>
+<td>带宽低、CPU 高、受 TCP/MTU/route 影响</td>
+</tr>
+<tr>
+<td>NET/IB</td>
+<td>verbs over InfiniBand/RoCE</td>
+<td>跨节点训练主路径</td>
+<td>HCA/GID/MTU/PFC/ECN/GDRDMA</td>
+</tr>
+</tbody>
+</table>
+<p>排障第一问：<strong>实际 transport 是什么？</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;NET/Socket|NET/IB|P2P|SHM|GDR|Channel|Ring|Tree&#39;</span> nccl.log</span></code></pre></div>
+<p>如果期望 RDMA，却看到 <code>NET/Socket</code>，先不要调 NCCL
+算法；先查容器权限、<code>/dev/infiniband</code>、libibverbs、NCCL net
+plugin、<code>NCCL_IB_DISABLE</code>、HCA 可见性和 GID。</p>
+<h2 id="gpudirect-rdmanccl-的跨节点快路径">8. GPUDirect RDMA：NCCL
+的跨节点快路径</h2>
+<p>没有 GDRDMA 时，GPU 数据可能要经 host pinned memory staging：</p>
+<pre class="text"><code>GPU HBM -&gt; host pinned memory -&gt; NIC -&gt; network -&gt; peer NIC -&gt; host pinned memory -&gt; peer GPU</code></pre>
+<p>启用 GDRDMA 后，NIC 可以直接 DMA 读写 GPU memory，CPU 主要负责
+setup/control：</p>
+<pre class="text"><code>GPU HBM &lt;-&gt; NIC RDMA engine &lt;-&gt; network &lt;-&gt; peer NIC &lt;-&gt; peer GPU HBM</code></pre>
+<p>成立条件来自多个层次：</p>
+<ul>
+<li>GPU、NIC、driver、CUDA、NCCL/插件版本支持；</li>
+<li><code>nvidia_peermem</code> 或对应 peer memory 模块可用；</li>
+<li>容器能看到 RDMA device 和必要库；</li>
+<li>GPU/NIC PCIe topology 合理，跨 socket 会变慢；</li>
+<li>IOMMU/ACS/BIOS 设置不破坏 peer mapping；</li>
+<li>NCCL 真的选择 <code>NET/IB</code> 且 GDRDMA enabled。</li>
+</ul>
+<p>验证不是看一个开关：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">lsmod</span> <span class="kw">|</span> <span class="fu">grep</span> nvidia_peermem</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET,GRAPH <span class="ex">./all_reduce_perf</span> <span class="at">-b</span> 64M <span class="at">-e</span> 4G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span></code></pre></div>
+<p>GDRDMA disabled 不一定是错误。如果 GPU/NIC
+远、平台不支持或出于隔离策略禁用，它可能是预期状态。关键是平台文档要写清楚预期，并让
+<code>nccl-tests</code> 基线与预期一致。</p>
+<h2 id="topologynccl-自动探测也需要正确资源布局">9. Topology：NCCL
+自动探测也需要正确资源布局</h2>
+<p>NCCL 会探测 GPU、CPU、NIC、PCIe、NVLink/NVSwitch
+的拓扑，但调度器如果把 rank/GPU/NIC 放错，它只能在坏布局里优化。</p>
+<p>必须记录：</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">-q</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;PCI|Bus Id|NUMA&#39;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /sys/class/infiniband</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> h <span class="kw">in</span> /sys/class/infiniband/<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span> <span class="fu">cat</span> <span class="va">$h</span>/device/numa_node<span class="kw">;</span> <span class="cf">done</span></span></code></pre></div>
+<p>典型错误：</p>
+<ul>
+<li>rank0 使用 GPU0，但 <code>NCCL_IB_HCA</code> 绑到远端 socket 的
+NIC；</li>
+<li>每个节点 8 GPU 2 NIC，但所有 rank 都压到一个 HCA；</li>
+<li>容器里 HCA 名称和宿主机不一致，环境变量约束失效；</li>
+<li>MIG、虚拟化或 cgroup 让拓扑可见性和物理拓扑不一致；</li>
+<li>多 rail 物理存在，但 ECMP/路由/变量没有提供足够并行路径。</li>
+</ul>
+<p>一个健康的 launcher 应把 rank、GPU、CPU set、NUMA memory、HCA、rail
+一起作为资源组，而不是只设置 <code>CUDA_VISIBLE_DEVICES</code>。</p>
+<h2 id="环境变量诊断工具不是魔法咒语">10.
+环境变量：诊断工具，不是魔法咒语</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>变量</th>
+<th>主要用途</th>
+<th>常见误用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NCCL_DEBUG</code></td>
+<td>打开日志</td>
+<td>长期开 INFO，日志太大且影响可读性</td>
+</tr>
+<tr>
+<td><code>NCCL_DEBUG_SUBSYS</code></td>
+<td>限定 INIT/NET/GRAPH/COLL 等</td>
+<td>只开 WARN，错过初始化证据</td>
+</tr>
+<tr>
+<td><code>NCCL_TOPO_DUMP_FILE</code></td>
+<td>输出拓扑</td>
+<td>只保存一台机器，缺少全局对比</td>
+</tr>
+<tr>
+<td><code>NCCL_SOCKET_IFNAME</code></td>
+<td>约束 socket/bootstrap 接口</td>
+<td>把 bootstrap 绑到错误 VLAN</td>
+</tr>
+<tr>
+<td><code>NCCL_IB_HCA</code></td>
+<td>约束 RDMA HCA</td>
+<td>拓扑变化后选错 NIC</td>
+</tr>
+<tr>
+<td><code>NCCL_IB_GID_INDEX</code></td>
+<td>选择 RoCE GID</td>
+<td>GID index 错导致连不通或路径错</td>
+</tr>
+<tr>
+<td><code>NCCL_IB_DISABLE</code></td>
+<td>验证 socket fallback</td>
+<td>忘记恢复，长期走 TCP</td>
+</tr>
+<tr>
+<td><code>NCCL_P2P_DISABLE</code></td>
+<td>验证节点内 P2P 问题</td>
+<td>生产默认禁用导致节点内退化</td>
+</tr>
+<tr>
+<td><code>NCCL_ALGO</code></td>
+<td>约束算法</td>
+<td>用 microbenchmark 结论覆盖真实训练</td>
+</tr>
+<tr>
+<td><code>NCCL_PROTO</code></td>
+<td>约束 protocol</td>
+<td>忽略消息大小分布</td>
+</tr>
+</tbody>
+</table>
+<p>推荐使用方式：</p>
+<ol type="1">
+<li>baseline：不加约束，只开必要日志，记录自动选择；</li>
+<li>hypothesis：一次只改一个变量验证假设；</li>
+<li>compare：同节点、同消息大小、同版本复测；</li>
+<li>document：把变量和适用机型/拓扑/版本绑定；</li>
+<li>fail-fast：启动脚本检查“期望 RDMA/GDRDMA 时是否真的启用”。</li>
+</ol>
+<h2 id="nccl-日志分阶段读法">11. NCCL 日志分阶段读法</h2>
+<h3 id="bootstrap">11.1 Bootstrap</h3>
+<p>Bootstrap 是 control plane。NCCL 需要让 rank
+互相发现并建立初始连接。这里可能走 TCP socket，即使数据面走 RDMA。</p>
+<p>看点：</p>
+<ul>
+<li>使用哪个 interface；</li>
+<li>是否走管理网；</li>
+<li>rank/world size 是否一致；</li>
+<li>端口、防火墙、DNS、容器网络是否正常；</li>
+<li>启动慢是否来自 rendezvous 而不是 data plane。</li>
+</ul>
+<h3 id="graph-topology">11.2 Graph / Topology</h3>
+<p>看 GPU/NIC/CPU 距离、ring/tree 构造、channel 数、P2P
+路径。<code>NCCL_TOPO_DUMP_FILE</code> 对排查很有价值。</p>
+<h3 id="net">11.3 NET</h3>
+<p>看 <code>NET/Socket</code> 还是
+<code>NET/IB</code>，HCA、port、GID、GDRDMA、网卡插件、错误。</p>
+<h3 id="coll">11.4 COLL</h3>
+<p>看具体 collective、算法、protocol、消息大小。训练中如果只在某个
+bucket 或某种 collective 慢，COLL 日志和框架 profiler 要一起看。</p>
+<p>快速过滤：</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Bootstrap|NET/|GDR|Channel|Ring|Tree|Coll|WARN|ERROR|socket|mlx5|GID&#39;</span> nccl-<span class="pp">*</span>.log</span></code></pre></div>
+<h2 id="nccl-tests怎么跑才有意义">12. nccl-tests：怎么跑才有意义</h2>
+<p><code>nccl-tests</code>
+的价值是隔离训练框架变量，但它也容易被误用。一个只跑单节点、只看最大带宽的结果，不足以证明集群健康。</p>
+<h3 id="单节点">12.1 单节点</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./all_reduce_perf</span> <span class="at">-b</span> 8M <span class="at">-e</span> 4G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./all_gather_perf</span> <span class="at">-b</span> 8M <span class="at">-e</span> 4G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./reduce_scatter_perf</span> <span class="at">-b</span> 8M <span class="at">-e</span> 4G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span></code></pre></div>
+<p>目的：验证 P2P/NVLink/NVSwitch/SHM 基线。</p>
+<h3 id="两节点">12.2 两节点</h3>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mpirun</span> <span class="at">-np</span> 16 <span class="at">-N</span> 8 <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-x</span> NCCL_DEBUG=INFO <span class="dt">\</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-x</span> NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  ./all_reduce_perf <span class="at">-b</span> 8M <span class="at">-e</span> 4G <span class="at">-f</span> 2 <span class="at">-g</span> 8</span></code></pre></div>
+<p>目的：验证 HCA、GID、MTU、GDRDMA、跨节点基本带宽。</p>
+<h3 id="阶梯规模">12.3 阶梯规模</h3>
+<p>跑 2/4/8/16/32/目标节点规模，记录每档 busbw、方差、timeout、交换机
+counter。很多 RoCE/ECMP/PFC 问题只在规模上来后出现。</p>
+<h3 id="节点矩阵">12.4 节点矩阵</h3>
+<p>当只有部分组合慢时，跑节点 pair 或 rack pair
+矩阵。慢组合如果集中在某个节点、ToR、uplink 或
+rail，故障域会清楚很多。</p>
+<h2 id="algbwbusbw-和理论带宽">13. algbw、busbw 和理论带宽</h2>
+<p><code>algbw</code> 是 collective
+语义下的有效数据带宽，<code>busbw</code>
+是按算法通信量折算后的总线带宽。不同 collective 的通信量不同，所以不要把
+AllReduce、AllGather、ReduceScatter 的数值直接横比。</p>
+<p>验收建议：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>用途</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>algbw</td>
+<td>看应用语义有效吞吐</td>
+<td>受 collective 类型影响</td>
+</tr>
+<tr>
+<td>busbw</td>
+<td>看底层通信路径利用率</td>
+<td>和理论链路带宽更接近</td>
+</tr>
+<tr>
+<td>time</td>
+<td>看小消息延迟和尾部</td>
+<td>训练 step 更关心长尾</td>
+</tr>
+<tr>
+<td>方差</td>
+<td>看稳定性</td>
+<td>平均值好但方差大仍危险</td>
+</tr>
+<tr>
+<td>错误/timeout</td>
+<td>hard gate</td>
+<td>不应进入长训练</td>
+</tr>
+</tbody>
+</table>
+<p>理论值只能给上限。例如 400GbE 单 rail 单向约 50 GB/s，8 GPU/多
+rail/双向/协议开销/collective 算法都会改变可达值。不要用宣传带宽直接判定
+NCCL 应该达到某个数字；要用同机型历史基线。</p>
+<h2 id="性能模型为什么小-bucket-和大-bucket-不一样">14.
+性能模型：为什么小 bucket 和大 bucket 不一样</h2>
+<p>通信时间可以粗略拆成：</p>
+<pre class="text"><code>T = launch/sync overhead + latency rounds + bytes / effective_bandwidth + queueing_tail</code></pre>
+<p>小消息主要受
+launch、latency、rounds、协议选择影响；大消息主要受带宽、拓扑、fabric、GDRDMA、ECMP
+影响。DDP bucket 太小会制造大量小 collective，带宽上不去；bucket
+太大又可能降低计算通信重叠，让反向传播后半段等待变长。</p>
+<p>调优方向：</p>
+<ul>
+<li>DDP bucket：观察 bucket ready time 和 allreduce duration；</li>
+<li>FSDP prefetch：观察 AllGather 是否挡在 compute 前；</li>
+<li>Tensor Parallel：尽量把高频 TP 通信放在 NVLink/NVSwitch 域内；</li>
+<li>MoE AllToAll：关注消息碎片、ECMP 熵和小包压力；</li>
+<li>gradient accumulation：减少同步频率，但改变内存和优化器语义。</li>
+</ul>
+<h2 id="与-pytorch-profiler-nsight-的关系">15. 与 PyTorch Profiler /
+Nsight 的关系</h2>
+<p>NCCL collective 在 GPU 上通常表现为 NCCL kernel。Profiler 里看到 NCCL
+kernel 长，不一定说明网络慢；也可能是它在等待其他 rank、等待 CUDA stream
+依赖、等待远端进入 collective。</p>
+<p>需要同时看：</p>
+<pre class="text"><code>PyTorch profiler:
+  - bucket ready time
+  - nccl all_reduce / reduce_scatter / all_gather duration
+  - CPU submit time
+
+Nsight Systems:
+  - NCCL kernels timeline
+  - compute/communication overlap
+  - H2D/D2H 是否干扰
+
+NCCL logs:
+  - transport / algorithm / protocol / channel
+
+Host/fabric counters:
+  - NIC queue, RDMA retry, ECN, PFC, drop</code></pre>
+<p>如果某个 rank 的 NCCL kernel
+晚开始，优先查应用/compute/data；如果所有 rank
+同时进入但结束时间差异大，再查通信路径。</p>
+<h2 id="常见故障模式总表">16. 常见故障模式总表</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>现象</th>
+<th>高概率原因</th>
+<th>快速证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>带宽只有预期 10%-20%</td>
+<td>socket fallback</td>
+<td><code>NET/Socket</code>、容器无 RDMA device</td>
+</tr>
+<tr>
+<td>单节点正常，两节点慢</td>
+<td>HCA/GID/MTU/GDRDMA</td>
+<td><code>NET/IB</code> 日志、GID、PMTU、topo</td>
+</tr>
+<tr>
+<td>小规模正常，大规模慢</td>
+<td>ECMP/PFC/ECN/incast</td>
+<td>交换机 counter、阶梯测试</td>
+</tr>
+<tr>
+<td>某些节点组合慢</td>
+<td>坏链路/坏 NIC/拓扑</td>
+<td>节点矩阵、端口 error</td>
+</tr>
+<tr>
+<td>timeout 指向某 rank</td>
+<td>rank stall 或路径故障</td>
+<td>rank enter time + fabric counter</td>
+</tr>
+<tr>
+<td>训练慢但 nccl-tests 正常</td>
+<td>bucket/overlap/data stall</td>
+<td>profiler、per-rank timeline</td>
+</tr>
+<tr>
+<td>升级后变慢</td>
+<td>版本/插件/变量变化</td>
+<td>版本矩阵、日志 diff</td>
+</tr>
+<tr>
+<td>只在 MoE 慢</td>
+<td>AllToAll 小消息/ECMP</td>
+<td>AllToAll perf、flow distribution</td>
+</tr>
+</tbody>
+</table>
+<h2 id="worked-examplesocket-fallback">17. Worked Example：socket
+fallback</h2>
+<p>现象：新镜像发布后 16 节点训练吞吐降到原来的 15%。GPU 利用率低，NCCL
+没有立刻报错。</p>
+<p>证据：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;NET/Socket|NET/IB|mlx5|infiniband&#39;</span> nccl.log</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/infiniband</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ldconfig</span> <span class="at">-p</span> <span class="kw">|</span> <span class="fu">grep</span> ibverbs</span></code></pre></div>
+<p>发现日志全是 <code>NET/Socket</code>，容器里没有
+<code>/dev/infiniband</code>。宿主机 RDMA 正常。</p>
+<p>修复：</p>
+<ul>
+<li>恢复容器 RDMA device 挂载；</li>
+<li>确认 libibverbs、NCCL net plugin、权限和 securityContext；</li>
+<li>启动前加 fail-fast：期望 RDMA 的训练若出现
+<code>NET/Socket</code>，直接失败；</li>
+<li>把镜像升级纳入 NCCL smoke test。</li>
+</ul>
+<h2 id="worked-examplegid-index-错">18. Worked Example：GID index
+错</h2>
+<p>现象：RoCE 集群中部分节点 NCCL
+初始化失败，部分节点能跑但带宽不稳定。团队固定了
+<code>NCCL_IB_GID_INDEX=3</code>。</p>
+<p>排查：</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">show_gids</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET <span class="ex">./all_reduce_perf</span> ...</span></code></pre></div>
+<p>发现不同网卡/端口上的 GID index 排列不一致，index 3
+在某些节点对应错误 VLAN 或地址族。</p>
+<p>修复：</p>
+<ul>
+<li>用自动发现或按节点模板生成 GID index；</li>
+<li>在入池检查中验证 GID、RoCE version、VLAN、source IP；</li>
+<li>不把从一台机器抄来的 GID index 当全局真理。</li>
+</ul>
+<h2 id="worked-exampleecn-mtu-规模故障">19. Worked Example：ECN + MTU
+规模故障</h2>
+<p>现象：64 节点训练偶发 timeout，32
+节点以下正常。<code>nccl-tests</code> 在 8 节点达到基线，64 节点只有基线
+55%。日志显示 <code>NET/IB</code> 和 GDRDMA 都启用。</p>
+<p>第一轮证据：</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> bond0 bond0.3000<span class="kw">;</span> <span class="cf">do</span> <span class="ex">ip</span> <span class="at">-d</span> link show dev <span class="va">$dev</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-M</span> do <span class="at">-s</span> 8972 <span class="op">&lt;</span>peer<span class="op">&gt;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ethtool</span> <span class="at">-S</span> <span class="op">&lt;</span>iface<span class="op">&gt;</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;pause|ecn|cnp|drop|discard|prio&#39;</span></span></code></pre></div>
+<p>发现物理 bond 是 MTU 9000，但 VLAN 子接口是 1500；交换机 PFC pause
+增长明显，ECN mark 和 CNP 很少。</p>
+<p>推导：</p>
+<ul>
+<li>socket fallback 已排除；</li>
+<li>GDRDMA 已启用；</li>
+<li>规模扩大后才慢，说明 incast、ECMP 或拥塞控制被触发；</li>
+<li>MTU 不一致让大包路径不可靠；</li>
+<li>ECN/CNP 少而 PFC pause 多，说明拥塞反馈太晚；</li>
+<li>collective 同步把少数路径 pause 放大全局 step time。</li>
+</ul>
+<p>修复：统一 MTU，核对 DSCP/PCP 到 lossless priority，调整 ECN/WRED
+threshold，让 CNP 在 PFC 前出现。验收通过标准不是“没有 timeout”，而是
+busbw、PFC pause、ECN mark、CNP、drop 都回到基线区间。</p>
+<h2 id="worked-examplerank-stall-伪装成-nccl-timeout">20. Worked
+Example：rank stall 伪装成 NCCL timeout</h2>
+<p>现象：NCCL timeout 总是指向 rank 37。网络 counter 正常，节点间
+<code>nccl-tests</code> 正常。该 rank 所在节点 checkpoint
+压缩线程在同一时间 CPU 飙高。</p>
+<p>验证：</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>torch.cuda.synchronize()</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>t0 <span class="op">=</span> time.time()</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>dist.all_reduce(tensor)</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>torch.cuda.synchronize()</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>t1 <span class="op">=</span> time.time()</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(rank, socket.gethostname(), <span class="st">&quot;enter&quot;</span>, t0, <span class="st">&quot;cost&quot;</span>, t1 <span class="op">-</span> t0)</span></code></pre></div>
+<p>把 enter time、NCCL 日志、CPU、IO、checkpoint 日志对齐后发现：rank 37
+比其他 rank 晚 28 秒进入 collective。其他 rank 只是被动等待。</p>
+<p>修复：</p>
+<ul>
+<li>checkpoint 压缩和通信线程隔离 CPU；</li>
+<li>checkpoint 写入加限速和错峰；</li>
+<li>训练日志增加 per-rank collective enter/exit 采样；</li>
+<li>timeout 处理流程先分离 rank stall 与 fabric 故障。</li>
+</ul>
+<h2 id="nccl-调优顺序">21. NCCL 调优顺序</h2>
+<p>不要从环境变量开始。推荐顺序：</p>
+<ol type="1">
+<li>语义层：确认 collective 类型、消息大小、bucket、并行策略。</li>
+<li>时间线：确认 rank 是否同时进入 collective，compute/comm
+是否重叠。</li>
+<li>自动选择：记录 NCCL algorithm/protocol/transport/channel。</li>
+<li>拓扑层：确认 GPU/NIC/NUMA/HCA/rail。</li>
+<li>Fabric 层：确认 MTU、GID、PFC、ECN、ECMP、drop。</li>
+<li>变量实验：一次只改一个 NCCL 变量。</li>
+<li>固化：只固化已证明对目标 workload 有收益的变量。</li>
+</ol>
+<p>错误顺序是：一看到慢就复制网上的 <code>NCCL_*</code>
+参数。这样可能掩盖 topology 或 fabric
+问题，也可能让下一次升级更难解释。</p>
+<h2 id="训练集群-nccl-验收-sop">22. 训练集群 NCCL 验收 SOP</h2>
+<ol type="1">
+<li>收集硬件：GPU、NIC、PCIe/NVLink/NVSwitch、交换机、线缆、端口。</li>
+<li>收集软件：driver、CUDA、NCCL、OFED/rdma-core、kernel、firmware、container
+runtime。</li>
+<li>验证基础：<code>nvidia-smi topo -m</code>、<code>ibv_devinfo</code>、<code>show_gids</code>、MTU、路由、容器设备。</li>
+<li>跑单节点
+<code>nccl-tests</code>：AllReduce、AllGather、ReduceScatter。</li>
+<li>跑两节点 <code>nccl-tests</code>：确认
+<code>NET/IB</code>、GDRDMA、HCA/GID。</li>
+<li>跑阶梯规模：2/4/8/16/目标节点。</li>
+<li>跑节点矩阵：定位慢节点、慢 ToR、慢 rail。</li>
+<li>同步采集主机和交换机 counter。</li>
+<li>形成 hard gate / soft gate。</li>
+<li>保存报告，作为后续升级回归基线。</li>
+</ol>
+<h2 id="hard-gate-与-soft-gate">23. Hard Gate 与 Soft Gate</h2>
+<p>Hard gate，直接阻止入池或训练：</p>
+<ul>
+<li>期望 RDMA 却出现 <code>NET/Socket</code>；</li>
+<li>期望 GDRDMA 却未启用，且没有豁免说明；</li>
+<li>MTU 在主机、bond、VLAN、容器、交换机之间不一致；</li>
+<li><code>nccl-tests</code> 出现 timeout、unhandled system error、WC
+retry exceeded；</li>
+<li>交换机端口有持续 drop、discard、CRC、symbol error；</li>
+<li>RoCE lossless priority 的 PFC/ECN/CNP 策略明显失效；</li>
+<li>NCCL/CUDA/driver/OFED 版本不在兼容矩阵。</li>
+</ul>
+<p>Soft gate，需要人工复核：</p>
+<ul>
+<li>busbw 低于历史基线；</li>
+<li>方差过高；</li>
+<li>PFC pause 接近阈值；</li>
+<li>ECMP uplink 利用率明显不均；</li>
+<li>某些节点 pair 异常但可隔离；</li>
+<li><code>nccl-tests</code> 正常但真实训练 overlap 变差。</li>
+</ul>
+<h2 id="生产事故取证包">24. 生产事故取证包</h2>
+<p>一次 NCCL 事故至少要收：</p>
+<pre class="text"><code>job metadata:
+  model, parallelism, world size, node list, rank mapping
+software:
+  driver, CUDA, NCCL, framework, OFED/rdma-core, kernel, image digest
+NCCL:
+  NCCL_DEBUG logs, topo dump, env vars
+timeline:
+  per-rank step time, collective enter/exit, profiler slice
+host:
+  nvidia-smi topo, dmesg, Xid, ethtool -S, softirq, CPU, IO
+fabric:
+  port utilization, drop/discard, ECN mark, CNP, PFC pause, buffer
+benchmark:
+  single-node, two-node, ladder scale, node matrix nccl-tests</code></pre>
+<p>没有 rank mapping 和时间同步，NCCL
+事故很难闭环。平台应自动收集这些信息，而不是让用户在 timeout
+后手工翻日志。</p>
+<h2 id="checklist">25. Checklist</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" />是否知道当前 workload 的 collective
+类型和消息大小分布？</label></li>
+<li><label><input type="checkbox" />是否确认 rank 按时进入
+collective？</label></li>
+<li><label><input type="checkbox" />是否保存 NCCL INIT/GRAPH/NET
+日志？</label></li>
+<li><label><input type="checkbox" />是否确认 transport 是预期的
+P2P/SHM/NET/IB/Socket？</label></li>
+<li><label><input type="checkbox" />是否确认 HCA、GID、GPU/NIC
+locality、GDRDMA？</label></li>
+<li><label><input
+type="checkbox" />是否跑过单节点、两节点、阶梯规模、节点矩阵
+<code>nccl-tests</code>？</label></li>
+<li><label><input type="checkbox" />是否把
+<code>algbw</code>、<code>busbw</code>、方差和 counter
+一起看？</label></li>
+<li><label><input type="checkbox" />是否有 NCCL
+版本升级回归测试？</label></li>
+<li><label><input type="checkbox" />是否把 socket fallback、MTU
+不一致、RDMA device 不可见做成 fail-fast？</label></li>
+<li><label><input type="checkbox" />是否区分 rank stall 和 fabric
+故障？</label></li>
+</ul>
+<h2 id="练习">26. 练习</h2>
+<ol type="1">
+<li>从一段 NCCL 日志中标出 bootstrap
+interface、transport、HCA、GID、GDRDMA、channel、ring/tree。</li>
+<li>设计一个启动前 fail-fast 脚本：期望 RDMA/GDRDMA 时，发现 socket
+fallback 应立即失败。</li>
+<li>给出 DDP bucket 过小导致 NCCL 效率差的证据链。</li>
+<li>设计 8/16/32/64 节点 <code>nccl-tests</code> 阶梯验收矩阵。</li>
+<li>解释为什么 <code>nccl-tests</code> 正常，真实训练仍可能 NCCL
+等待很长。</li>
+<li>分析 MoE AllToAll 为什么比普通 AllReduce 更容易触发 ECMP
+和队列问题。</li>
+<li>写出一次 NCCL timeout 的事故取证包字段。</li>
+<li>给一次 NCCL/CUDA/driver 升级设计回归测试计划。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

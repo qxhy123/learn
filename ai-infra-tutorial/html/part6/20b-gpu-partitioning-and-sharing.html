@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 20b 章 · GPU 资源切分与共享 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=20b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 20b 章 · GPU 资源切分与共享</h1>
+<p class="sub">比较整卡、MIG、MPS、time-slicing 和 warm pool 的资源形状与治理策略。</p>
+<div class="chips"><span class="chip">GPU</span><span class="chip">MIG</span><span class="chip">MPS</span><span class="chip">Sharing</span><span class="chip">Fragmentation</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#20b1-第一性原理拆解--学习大纲">20b.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#20b2-概念先说清楚">20b.2 概念先说清楚</a></li><li><a class="anchor" href="#20b3-架构关键组件控制路径和数据路径">20b.3
+架构：关键组件、控制路径和数据路径</a></li><li><a class="anchor" href="#20b4-原理切分与共享如何工作">20b.4 原理：切分与共享如何工作</a></li><li><a class="anchor" href="#20b5-资源形状从硬件到平台-sku">20b.5 资源形状：从硬件到平台
+SKU</a></li><li><a class="anchor" href="#20b6-工程化生产落地配置发布与治理">20b.6
+工程化：生产落地、配置、发布与治理</a></li><li><a class="anchor" href="#20b7-bin-packing-与碎片化治理">20b.7 Bin packing
+与碎片化治理</a></li><li><a class="anchor" href="#20b8-方案设计资源形状决策表">20b.8 方案设计：资源形状决策表</a></li><li><a class="anchor" href="#20b9-故障排除症状证据根因动作">20b.9
+故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#20b10-反模式--checklist">20b.10 反模式 + Checklist</a></li><li><a class="anchor" href="#20b11-worked-example从整卡浪费到资源形状治理">20b.11 Worked
+Example：从整卡浪费到资源形状治理</a></li><li><a class="anchor" href="#20b12-本章小结">20b.12 本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>GPU
+共享不是把一张卡“变多”，而是在隔离、性能确定性、碎片化和利用率之间重新签合同。</p>
+</blockquote>
+<p>本章讨论 AI 平台的 GPU 资源层：整卡池、MIG、MPS、time-slicing、warm
+pool、资源形状、bin packing 和碎片化治理。它接在第19b章 GPU
+调度与拓扑之后，也为第20a章队列配额提供资源形状基础。</p>
+<hr />
+<h2 id="20b1-第一性原理拆解--学习大纲">20b.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>GPU 资源层要解决的问题是：</p>
+<p><strong>一组离散、异构、昂贵且带拓扑约束的设备，如何被表达成平台可调度、可配额、可计费、可观测、可解释的资源形状。</strong></p>
+<p>CPU 可以相对连续地按 core 和 memory 分配。GPU 不行。影响 GPU
+可用性的因素很多：</p>
+<ul>
+<li>型号：H100、A100、L40S、L4 的性能和能力完全不同。</li>
+<li>显存：40GB、80GB、94GB 不是同一种资源。</li>
+<li>拓扑：同机 8 卡、跨机 8 卡、NVLink、NVSwitch、PCIe
+路径差异很大。</li>
+<li>切分方式：整卡、MIG、MPS、time-slicing 的隔离语义不同。</li>
+<li>软件栈：驱动、CUDA、container toolkit、device
+plugin、NCCL、推理引擎版本影响能否运行。</li>
+<li>状态：是否已经拉好镜像、加载权重、构建 engine、预热 KV cache。</li>
+<li>租户边界：跨租户共享和同团队共享的风险不同。</li>
+</ul>
+<p>所以平台不能只暴露 <code>nvidia.com/gpu: 1</code>。它必须回答“这 1 个
+GPU 到底是什么形状、什么隔离、什么性能承诺、什么故障边界”。</p>
+<h3 id="推从问题推导机制">推：从问题推导机制</h3>
+<p>从“大训练和大模型需要完整显存、拓扑和性能确定性”推出整卡池。</p>
+<p>从“小模型长期独占整卡会浪费”推出 MIG。</p>
+<p>从“同信任域轻量进程想共享 CUDA 上下文”推出 MPS。</p>
+<p>从“开发、教学和低优先级任务只需要先跑起来”推出 time-slicing。</p>
+<p>从“模型冷启动慢，权重加载和 engine 构建昂贵”推出 warm pool。</p>
+<p>从“资源形状越来越多，账面空闲和可调度空闲分裂”推出 bin packing
+和碎片化治理。</p>
+<p>从“共享会带来互扰”推出隔离等级、性能确定性和准入策略。</p>
+<h3 id="绘gpu-形状决策链路">绘：GPU 形状决策链路</h3>
+<pre class="mermaid">flowchart TD
+  A[工作负载需求] --&gt; B{需要强隔离和稳定性能?}
+  B --&gt;|是| C{需要完整显存或多卡拓扑?}
+  C --&gt;|是| D[整卡池]
+  C --&gt;|否| E[MIG 固定切片]
+  B --&gt;|否| F{是否同信任域且轻量?}
+  F --&gt;|是| G[MPS]
+  F --&gt;|否| H{是否开发/教学/低优先级?}
+  H --&gt;|是| I[Time-slicing]
+  H --&gt;|否| D
+  D --&gt; J[资源形状建模]
+  E --&gt; J
+  G --&gt; J
+  I --&gt; J
+  J --&gt; K[队列配额与 ResourceFlavor]
+  K --&gt; L[Bin packing / defrag / warm pool]</pre>
+<h3 id="学习大纲">学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>整卡、MIG、MPS、time-slicing 的隔离边界分别在哪里。</li>
+<li>为什么 MIG 能提高利用率，也可能制造新的碎片。</li>
+<li>MPS 和 time-slicing 为什么不适合强 SLA 跨租户生产服务。</li>
+<li>warm pool 解决的是启动路径问题，不是总容量问题。</li>
+<li>资源形状应该如何进入队列、配额、计费和观测。</li>
+<li>bin packing 为什么不能只按 GPU 数量做。</li>
+<li>如何排查“有空闲 GPU 但作业起不来”。</li>
+</ol>
+<hr />
+<h2 id="20b2-概念先说清楚">20b.2 概念先说清楚</h2>
+<h3 id="整卡池是什么不是什么">整卡池是什么，不是什么</h3>
+<p>整卡池把物理 GPU 作为最小分配单元。一个 Pod 获得一张或多张完整
+GPU，通常通过 <code>nvidia.com/gpu</code> 或平台定义的 ResourceFlavor
+表达。</p>
+<p>整卡池不是低利用率的同义词。对于多卡训练、大模型推理、强 SLA
+在线服务、长上下文、RDMA/NVLink
+敏感任务，整卡池是保护性能确定性和拓扑完整性的必要手段。</p>
+<h3 id="mig-是什么不是什么">MIG 是什么，不是什么</h3>
+<p>MIG（Multi-Instance GPU）是 NVIDIA 部分数据中心 GPU
+支持的硬件切分能力。它把一张物理卡切成若干固定
+profile，每个实例拥有相对隔离的显存、计算资源和故障边界。</p>
+<p>MIG 不是显存超卖，也不是任意比例切片。它只能使用硬件支持的
+profile。切分形状如果与业务需求不匹配，会产生比整卡更难解释的碎片。</p>
+<h3 id="mps-是什么不是什么">MPS 是什么，不是什么</h3>
+<p>MPS（Multi-Process Service）让多个 CUDA 进程共享同一 GPU
+上下文，降低上下文切换和提交开销，改善轻量 kernel 并发。</p>
+<p>MPS
+不是强隔离多租户。它更适合同团队、同信任域、可容忍互扰的任务。跨租户使用
+MPS 时，一个进程的显存峰值、异常 kernel 或错误可能影响同卡其他进程。</p>
+<h3 id="time-slicing-是什么不是什么">Time-slicing 是什么，不是什么</h3>
+<p>Time-slicing 通过时间片让多个工作负载轮流使用同一张 GPU。它通常由
+device plugin 或平台调度策略表达。</p>
+<p>Time-slicing 不是性能承诺。它适合 notebook、教学、开发、demo
+和低优先级实验，不适合 P99 延迟、吞吐和抖动有明确 SLA 的生产推理。</p>
+<h3 id="warm-pool-是什么不是什么">Warm pool 是什么，不是什么</h3>
+<p>Warm pool 是预热容量或预热状态：热节点、热镜像、热权重、热
+engine、热副本、热 KV
+cache。它缩短从“需要扩容”到“可以接流量”的路径。</p>
+<p>Warm pool 不是 GPU
+切分方式，也不增加总容量。它用长期占用成本换启动速度。</p>
+<h3 id="相邻概念边界">相邻概念边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>解决什么</th>
+<th>不解决什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>整卡</td>
+<td>显存、拓扑、性能确定性</td>
+<td>小模型成本浪费</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>固定小规格强隔离</td>
+<td>任意比例弹性切片</td>
+</tr>
+<tr>
+<td>MPS</td>
+<td>同信任域多进程并发</td>
+<td>跨租户强隔离</td>
+</tr>
+<tr>
+<td>Time-slicing</td>
+<td>提高开发可获得性</td>
+<td>稳定延迟和吞吐</td>
+</tr>
+<tr>
+<td>Warm pool</td>
+<td>冷启动路径</td>
+<td>总容量不足</td>
+</tr>
+<tr>
+<td>Bin packing</td>
+<td>保留关键资源形状</td>
+<td>业务优先级治理</td>
+</tr>
+<tr>
+<td>队列配额</td>
+<td>谁能使用资源</td>
+<td>一张卡如何切分</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20b3-架构关键组件控制路径和数据路径">20b.3
+架构：关键组件、控制路径和数据路径</h2>
+<h3 id="关键组件">关键组件</h3>
+<pre class="mermaid">flowchart TB
+  subgraph Control[控制面]
+    Platform[平台 API / 作业模板]
+    Queue[队列与配额]
+    Flavor[ResourceFlavor / GPU SKU]
+    Scheduler[调度器 / Kueue / Volcano]
+    Policy[共享策略与准入]
+  end
+
+  subgraph Node[GPU 节点]
+    Driver[NVIDIA Driver]
+    Toolkit[NVIDIA Container Toolkit]
+    DP[Device Plugin]
+    MIG[MIG Manager]
+    MPS[MPS Control Daemon]
+    DCGM[DCGM Exporter]
+    Kubelet[Kubelet]
+    GPU[Physical GPU / MIG Instance]
+  end
+
+  Platform --&gt; Queue
+  Queue --&gt; Flavor
+  Flavor --&gt; Scheduler
+  Policy --&gt; Scheduler
+  Scheduler --&gt; Kubelet
+  Kubelet --&gt; DP
+  DP --&gt; GPU
+  MIG --&gt; GPU
+  MPS --&gt; GPU
+  Driver --&gt; GPU
+  Toolkit --&gt; Driver
+  DCGM --&gt; Queue</pre>
+<h3 id="控制路径">控制路径</h3>
+<ol type="1">
+<li>运维系统把节点划入不同 GPU 池，例如
+<code>h100-full</code>、<code>h100-mig-small</code>、<code>l40s-dev-shared</code>。</li>
+<li>GPU Operator、device plugin、MIG manager、MPS
+组件在节点上安装并暴露资源。</li>
+<li>NFD 或 GPU feature discovery
+给节点打上型号、显存、MIG、拓扑和软件版本标签。</li>
+<li>平台把用户请求转换成 ResourceFlavor，例如
+<code>h100-80gb-full</code>、<code>a100-40gb-mig-1g.5gb</code>。</li>
+<li>队列和配额层决定租户是否有资格使用该 flavor。</li>
+<li>调度器根据资源数量、节点标签、污点、亲和、拓扑和 gang
+条件选择节点。</li>
+<li>kubelet 调用 device plugin 分配设备，runtime 注入
+<code>/dev/nvidia*</code> 和驱动库。</li>
+<li>观测系统采集 GPU util、显存、错误、XID、MIG 使用、共享倍率和
+throttling。</li>
+</ol>
+<h3 id="数据路径">数据路径</h3>
+<p>GPU 任务的数据路径包括：</p>
+<ul>
+<li>模型权重从对象存储、PVC、本地 NVMe 或镜像层进入内存和显存。</li>
+<li>输入数据从网络、存储或消息队列进入 CPU，再进入 GPU。</li>
+<li>多卡训练通过 PCIe、NVLink、NVSwitch、RDMA 交换梯度或激活。</li>
+<li>推理服务在 GPU 显存中维护权重、KV cache、workspace 和临时
+buffer。</li>
+<li>checkpoint 从 GPU/CPU 状态落到本地盘、共享文件系统或对象存储。</li>
+</ul>
+<p>共享方式会改变数据路径的风险。MIG 隔离显存空间；MPS 和 time-slicing
+下同卡任务更容易在显存、cache、kernel 执行和错误传播上互相影响。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>负责什么</th>
+<th>不负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU Operator</td>
+<td>驱动、toolkit、device plugin、MIG 管理</td>
+<td>租户公平和业务优先级</td>
+</tr>
+<tr>
+<td>Device Plugin</td>
+<td>暴露和分配 GPU / MIG 资源</td>
+<td>推理 P99 和训练收敛</td>
+</tr>
+<tr>
+<td>平台资源层</td>
+<td>GPU 池、flavor、共享策略、碎片治理</td>
+<td>应用内部显存优化</td>
+</tr>
+<tr>
+<td>队列配额层</td>
+<td>哪个租户可用哪个 flavor</td>
+<td>单节点内部性能调优</td>
+</tr>
+<tr>
+<td>调度器</td>
+<td>节点选择和资源绑定</td>
+<td>模型权重预热</td>
+</tr>
+<tr>
+<td>应用框架</td>
+<td>CUDA、NCCL、推理 engine、checkpoint</td>
+<td>集群级资源治理</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="20b4-原理切分与共享如何工作">20b.4 原理：切分与共享如何工作</h2>
+<h3 id="整卡保护完整性">整卡：保护完整性</h3>
+<p>整卡调度的核心价值是完整性：</p>
+<ul>
+<li>完整显存：大模型权重、KV cache 和训练 activation 不被硬切。</li>
+<li>完整计算资源：SM、Tensor Core、带宽不被固定切片。</li>
+<li>完整拓扑：多卡作业可以获得同机、同 NVLink/NVSwitch 域的 GPU。</li>
+<li>完整故障边界：同卡没有其他租户任务互扰。</li>
+</ul>
+<p>整卡的代价是小模型可能低利用率。治理方向不是简单共享所有卡，而是识别哪些负载需要整卡，哪些负载可以进入
+MIG 或共享池。</p>
+<h3 id="mig固定-profile-的硬件隔离">MIG：固定 profile 的硬件隔离</h3>
+<p>MIG 把一张支持的 GPU 切成多个 GPU instance / compute
+instance。Kubernetes 中通常暴露为不同资源名，例如：</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nvidia.com/mig-1g.10gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<p>MIG 的优点：</p>
+<ul>
+<li>显存和计算资源隔离比 MPS、time-slicing 更强。</li>
+<li>小模型推理、固定规格 notebook、轻量服务可以配额化和计费。</li>
+<li>一个租户的显存占用不应直接吞掉另一个 MIG 实例的显存。</li>
+</ul>
+<p>MIG 的风险：</p>
+<ul>
+<li>profile 固定，不能任意拆分。</li>
+<li>重切 profile 往往需要驱逐已有负载。</li>
+<li>profile 和业务需求错配会形成碎片。</li>
+<li>MIG 资源名会让 quota、监控和计费更复杂。</li>
+</ul>
+<p>设计 MIG 时先问“业务稳定需要哪些
+profile”，而不是“硬件最多能切几份”。</p>
+<h3 id="mps共享-cuda-执行通道">MPS：共享 CUDA 执行通道</h3>
+<p>MPS 通过一个控制 daemon 协调多个 CUDA 进程共享 GPU。它适合小
+kernel、低占用、多进程并发提交场景。</p>
+<p>MPS 的关键限制：</p>
+<ul>
+<li>隔离弱于 MIG。</li>
+<li>显存超用和异常行为可能影响同卡其他进程。</li>
+<li>性能互扰依赖 workload 行为，很难向用户承诺稳定 P99。</li>
+<li>运维上需要限制同卡进程数、租户边界和资源 request。</li>
+</ul>
+<p>MPS 更适合作为“同团队共享优化”，不应作为跨租户强隔离的默认方案。</p>
+<h3 id="time-slicing提高可获得性">Time-slicing：提高可获得性</h3>
+<p>Time-slicing 让多个 Pod 或容器以时间片方式共享
+GPU。用户会看到自己获得了一个 GPU
+资源，但实际执行时间被多个任务分摊。</p>
+<p>它的价值是降低门槛：开发、教学和 notebook
+可以快速启动。它的代价是性能不确定：同卡任务数、kernel
+类型、显存水位和上下文切换都会影响体验。</p>
+<p>一个实用规则是：time-slicing 可以承诺“能跑”，不要承诺“跑得稳”。</p>
+<h3 id="warm-pool热的是路径不是容量">Warm
+pool：热的是路径，不是容量</h3>
+<p>推理扩容慢常常不是没有 GPU，而是启动路径长：</p>
+<pre class="text"><code>节点加入 -&gt; 镜像拉取 -&gt; 权重下载 -&gt; engine 构建 -&gt; 显存分配 -&gt; 预热 -&gt; readiness</code></pre>
+<p>Warm pool 可以在不同层次截断这条路径：</p>
+<table>
+<thead>
+<tr>
+<th>Warm pool 对象</th>
+<th>缩短什么</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>热节点</td>
+<td>节点 provisioning</td>
+<td>空闲节点费用</td>
+</tr>
+<tr>
+<td>热镜像</td>
+<td>image pull</td>
+<td>镜像缓存和更新治理</td>
+</tr>
+<tr>
+<td>热权重</td>
+<td>weight download</td>
+<td>磁盘、网络、版本一致性</td>
+</tr>
+<tr>
+<td>热 engine</td>
+<td>TensorRT / vLLM 初始化</td>
+<td>版本和硬件绑定</td>
+</tr>
+<tr>
+<td>热副本</td>
+<td>readiness 到接流量</td>
+<td>GPU 常驻成本</td>
+</tr>
+<tr>
+<td>热 KV / 预热请求</td>
+<td>首批请求抖动</td>
+<td>预热流量和状态管理</td>
+</tr>
+</tbody>
+</table>
+<p>Warm pool 必须按模型、卡型、MIG profile 和版本管理。一个 H100
+整卡热副本不能替代 <code>3g.40gb</code> MIG 热副本。</p>
+<hr />
+<h2 id="20b5-资源形状从硬件到平台-sku">20b.5 资源形状：从硬件到平台
+SKU</h2>
+<p>资源形状是平台对 GPU 可用性的产品化表达。它不只是数量，还包括：</p>
+<ul>
+<li>GPU 型号和显存。</li>
+<li>是否整卡、MIG、MPS、time-slicing。</li>
+<li>单节点 GPU 数量和拓扑。</li>
+<li>驱动、CUDA、NCCL、推理 engine 版本。</li>
+<li>是否允许跨租户共享。</li>
+<li>是否可抢占、是否 spot、是否 warm。</li>
+<li>计费倍率和配额归属。</li>
+</ul>
+<h3 id="resourceflavor-设计示例">ResourceFlavor 设计示例</h3>
+<table>
+<thead>
+<tr>
+<th>Flavor</th>
+<th>资源</th>
+<th>适合负载</th>
+<th>隔离</th>
+<th>SLA</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>h100-80gb-full-nvlink</code></td>
+<td>H100 80GB 整卡，同 NVLink 域</td>
+<td>8 卡训练、70B 推理</td>
+<td>强</td>
+<td>强</td>
+</tr>
+<tr>
+<td><code>h100-80gb-full-single</code></td>
+<td>H100 80GB 单整卡</td>
+<td>中大模型推理、单卡训练</td>
+<td>强</td>
+<td>强</td>
+</tr>
+<tr>
+<td><code>h100-mig-1g.10gb</code></td>
+<td>MIG 小切片</td>
+<td>7B 小模型、embedding、notebook</td>
+<td>强</td>
+<td>中</td>
+</tr>
+<tr>
+<td><code>a100-mig-3g.40gb</code></td>
+<td>MIG 中切片</td>
+<td>中等模型推理</td>
+<td>强</td>
+<td>中</td>
+</tr>
+<tr>
+<td><code>l40s-mps-team</code></td>
+<td>MPS 同团队共享</td>
+<td>轻量实验、低风险批处理</td>
+<td>中弱</td>
+<td>弱</td>
+</tr>
+<tr>
+<td><code>l4-timeslice-dev</code></td>
+<td>time-slicing</td>
+<td>开发、教学、demo</td>
+<td>弱</td>
+<td>无强承诺</td>
+</tr>
+<tr>
+<td><code>h100-warm-70b</code></td>
+<td>热权重 / 热副本</td>
+<td>70B 在线扩容</td>
+<td>强</td>
+<td>强</td>
+</tr>
+</tbody>
+</table>
+<h3 id="配额和计费">配额和计费</h3>
+<p>资源形状必须进入配额和计费，否则平台会出现“账面公平、实际不公平”。例如：</p>
+<ul>
+<li>1 个 H100 整卡不能与 1 个 L4 time-slice 等价。</li>
+<li>1 个 <code>3g.40gb</code> MIG 不能与 1 个 <code>1g.10gb</code> MIG
+等价。</li>
+<li>热副本消耗 GPU 即使没有流量，也应计入容量成本。</li>
+<li>MPS/time-slicing 的计费需要表达共享倍率和性能承诺缺失。</li>
+</ul>
+<hr />
+<h2 id="20b6-工程化生产落地配置发布与治理">20b.6
+工程化：生产落地、配置、发布与治理</h2>
+<h3 id="池化策略">池化策略</h3>
+<p>GPU 池不要只按卡型拆，也要按使用契约拆：</p>
+<table>
+<thead>
+<tr>
+<th>池</th>
+<th>用途</th>
+<th>典型策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>full-train</td>
+<td>多卡训练</td>
+<td>保留 8 卡整节点，强 gang，少放碎片任务</td>
+</tr>
+<tr>
+<td>full-online</td>
+<td>强 SLA 推理</td>
+<td>整卡、反亲和、warm pool</td>
+</tr>
+<tr>
+<td>mig-small</td>
+<td>小模型推理</td>
+<td>固定 profile，独立 quota</td>
+</tr>
+<tr>
+<td>mig-notebook</td>
+<td>notebook / 开发</td>
+<td>较低优先级，可重切</td>
+</tr>
+<tr>
+<td>shared-dev</td>
+<td>MPS / time-slicing</td>
+<td>同团队或低优先级，限制共享倍率</td>
+</tr>
+<tr>
+<td>warm-online</td>
+<td>热副本</td>
+<td>版本绑定，严格变更</td>
+</tr>
+</tbody>
+</table>
+<h3 id="配置示例抽象-gpu-池策略">配置示例：抽象 GPU 池策略</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gpuPools</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">h100-full-train</span><span class="kw">:</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">accelerator</span><span class="kw">:</span><span class="at"> h100-80gb</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">topology</span><span class="kw">:</span><span class="at"> nvlink-8</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">sharing</span><span class="kw">:</span><span class="at"> none</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preserveShape</span><span class="kw">:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">minFreeFullNodes</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">allowedQueues</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;research&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;priority-train&quot;</span><span class="kw">]</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">h100-mig-small</span><span class="kw">:</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">accelerator</span><span class="kw">:</span><span class="at"> h100-80gb</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">mig</span><span class="kw">:</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">profiles</span><span class="kw">:</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">&quot;1g.10gb&quot;</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">&quot;2g.20gb&quot;</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reconfigureWindow</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Sun 02:00-04:00&quot;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">allowedQueues</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;online-small&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;notebook&quot;</span><span class="kw">]</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">l40s-dev-shared</span><span class="kw">:</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">accelerator</span><span class="kw">:</span><span class="at"> l40s</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">sharing</span><span class="kw">:</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mode</span><span class="kw">:</span><span class="at"> time-slicing</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">replicasPerGpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">maxMemoryFraction</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.25</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">allowedQueues</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;dev&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;teaching&quot;</span><span class="kw">]</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">sla</span><span class="kw">:</span><span class="at"> best-effort</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">h100-warm-70b</span><span class="kw">:</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">accelerator</span><span class="kw">:</span><span class="at"> h100-80gb</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">warm</span><span class="kw">:</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">image</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">weights</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;llm-70b@2026-05-04&quot;</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">engine</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">minReadyReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">allowedQueues</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;online&quot;</span><span class="kw">]</span></span></code></pre></div>
+<h3 id="版本矩阵">版本矩阵</h3>
+<p>GPU 共享方案对版本非常敏感。生产环境至少维护：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVIDIA Driver</td>
+<td>CUDA runtime 兼容、MIG/MPS 支持、XID 修复</td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td>应用镜像、框架 wheel、推理 engine 兼容</td>
+</tr>
+<tr>
+<td>NVIDIA Container Toolkit</td>
+<td>设备和驱动库注入</td>
+</tr>
+<tr>
+<td>NVIDIA Device Plugin</td>
+<td>MIG strategy、time-slicing 配置、资源名</td>
+</tr>
+<tr>
+<td>GPU Operator</td>
+<td>driver、toolkit、DCGM、MIG manager 生命周期</td>
+</tr>
+<tr>
+<td>DCGM Exporter</td>
+<td>指标维度、MIG 指标、错误事件</td>
+</tr>
+<tr>
+<td>Kubernetes</td>
+<td>device plugin API、scheduler、topology manager</td>
+</tr>
+<tr>
+<td>NCCL / UCX</td>
+<td>多卡训练和 RDMA 性能</td>
+</tr>
+<tr>
+<td>vLLM / TensorRT-LLM / Triton</td>
+<td>显存、engine、batching、KV cache 行为</td>
+</tr>
+</tbody>
+</table>
+<h3 id="发布路径">发布路径</h3>
+<ol type="1">
+<li>盘点现有 workload 的显存峰值、GPU util、吞吐和延迟。</li>
+<li>先拆出整卡保护池，避免 MIG 或共享策略破坏关键大作业。</li>
+<li>选择单一低风险池试点 MIG 或 time-slicing。</li>
+<li>用 ResourceFlavor 和 quota 显式暴露新资源形状。</li>
+<li>接入 DCGM、应用指标和队列指标，观察性能互扰。</li>
+<li>配置回滚：MIG 重切窗口、节点 cordon/drain、迁移计划。</li>
+<li>再扩大到生产推理或多租户场景。</li>
+</ol>
+<h3 id="观测指标">观测指标</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocatable by flavor</td>
+<td>每种资源形状可用量</td>
+</tr>
+<tr>
+<td>free full nodes</td>
+<td>完整 8 卡节点数量</td>
+</tr>
+<tr>
+<td>GPU util / memory used</td>
+<td>粗粒度利用率</td>
+</tr>
+<tr>
+<td>SM occupancy / memory bandwidth</td>
+<td>性能瓶颈判断</td>
+</tr>
+<tr>
+<td>MIG profile allocation</td>
+<td>profile 碎片</td>
+</tr>
+<tr>
+<td>time-slicing replicas per GPU</td>
+<td>共享倍率</td>
+</tr>
+<tr>
+<td>MPS active clients</td>
+<td>同卡进程数</td>
+</tr>
+<tr>
+<td>XID errors</td>
+<td>设备故障和驱动错误</td>
+</tr>
+<tr>
+<td>ECC / retired pages</td>
+<td>硬件健康</td>
+</tr>
+<tr>
+<td>cold start breakdown</td>
+<td>镜像、权重、engine、readiness 耗时</td>
+</tr>
+<tr>
+<td>pending by flavor</td>
+<td>需求和供给是否错配</td>
+</tr>
+</tbody>
+</table>
+<h3 id="治理规则">治理规则</h3>
+<ul>
+<li>跨租户默认使用整卡或 MIG，不默认使用 MPS。</li>
+<li>强 SLA 推理禁止 time-slicing。</li>
+<li>多卡训练池保留完整节点，不允许小任务随意填满。</li>
+<li>MIG profile 变更必须有维护窗口和驱逐计划。</li>
+<li>warm pool 必须有版本归属、容量预算和过期策略。</li>
+<li>所有 flavor 都进入配额、计费和审计。</li>
+<li>共享池必须标注 best-effort 或明确 SLA 降级。</li>
+</ul>
+<hr />
+<h2 id="20b7-bin-packing-与碎片化治理">20b.7 Bin packing
+与碎片化治理</h2>
+<h3 id="碎片化定义">碎片化定义</h3>
+<p>碎片化不是“GPU 利用率不高”，而是：</p>
+<p><strong>账面上有空闲容量，但没有某个工作负载所需的完整资源形状。</strong></p>
+<p>例子：4 台 8xH100 节点，总空闲 10 张 GPU。</p>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th>空闲 GPU</th>
+<th>当前占用</th>
+<th>对 8 卡训练是否可用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>node-a</td>
+<td>3</td>
+<td>5 张被推理副本占用</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-b</td>
+<td>2</td>
+<td>6 张被实验任务占用</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-c</td>
+<td>4</td>
+<td>已切 MIG profile</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>node-d</td>
+<td>1</td>
+<td>7 张被训练占用</td>
+<td>不可用</td>
+</tr>
+</tbody>
+</table>
+<p>用户说“还有 10 张空闲卡”，平台说“没有 1 台完整 8
+卡节点”，两者都对。差异在资源形状。</p>
+<h3 id="bin-packing-目标">Bin packing 目标</h3>
+<p>Bin packing 不是把每张卡都塞满，而是保留关键形状：</p>
+<ul>
+<li>对 8 卡训练，保留完整 8 卡节点。</li>
+<li>对 70B 推理，保留成对或成组整卡。</li>
+<li>对小模型推理，把相近 profile 放到 MIG 池。</li>
+<li>对开发任务，优先填共享池，不污染整卡训练池。</li>
+<li>对可抢占任务，优先填将来可回收的位置。</li>
+</ul>
+<h3 id="策略对照">策略对照</h3>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>适合</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>compact 小任务</td>
+<td>保留完整节点</td>
+<td>单节点热点和故障影响集中</td>
+</tr>
+<tr>
+<td>spread 在线副本</td>
+<td>降低故障域风险</td>
+<td>破坏整卡训练形状</td>
+</tr>
+<tr>
+<td>按卡型拆池</td>
+<td>避免性能误配</td>
+<td>池过细降低利用率</td>
+</tr>
+<tr>
+<td>按 MIG profile 拆池</td>
+<td>profile 可审计</td>
+<td>需求变化时难借用</td>
+</tr>
+<tr>
+<td>低峰 defrag</td>
+<td>回收碎片，恢复大形状</td>
+<td>需要 checkpoint 和维护窗口</td>
+</tr>
+<tr>
+<td>reserved full nodes</td>
+<td>保护大训练窗口</td>
+<td>闲时看起来利用率低</td>
+</tr>
+</tbody>
+</table>
+<h3 id="碎片治理动作">碎片治理动作</h3>
+<ol type="1">
+<li>建立 <code>pending by flavor</code> 和 <code>available shape</code>
+看板。</li>
+<li>定义关键形状，例如
+<code>8xh100-full-node</code>、<code>2xh100-80gb</code>、<code>mig-3g.40gb</code>。</li>
+<li>小任务默认 compact 到非关键节点。</li>
+<li>借用任务必须可抢占，方便 defrag。</li>
+<li>定期复盘 MIG profile 分布，避免长期错配。</li>
+<li>对训练高峰前做预整理，释放完整节点。</li>
+<li>把碎片成本纳入队列策略，而不是只看 GPU util。</li>
+</ol>
+<hr />
+<h2 id="20b8-方案设计资源形状决策表">20b.8 方案设计：资源形状决策表</h2>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>工作负载</th>
+<th>显存需求</th>
+<th>SLA</th>
+<th>租户边界</th>
+<th>推荐形状</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>70B 在线推理</td>
+<td>高</td>
+<td>强</td>
+<td>跨租户</td>
+<td>整卡 + warm pool</td>
+<td>保护显存、拓扑和冷启动</td>
+</tr>
+<tr>
+<td>8 卡训练</td>
+<td>高</td>
+<td>中</td>
+<td>单租户</td>
+<td>整卡同节点 + gang</td>
+<td>保护 NVLink 和整体准入</td>
+</tr>
+<tr>
+<td>7B 小模型推理</td>
+<td>中低</td>
+<td>中</td>
+<td>跨租户</td>
+<td>MIG</td>
+<td>固定 profile，较强隔离</td>
+</tr>
+<tr>
+<td>embedding 服务</td>
+<td>中</td>
+<td>中</td>
+<td>跨租户</td>
+<td>MIG 或整卡</td>
+<td>看显存峰值和批大小</td>
+</tr>
+<tr>
+<td>notebook</td>
+<td>低</td>
+<td>弱</td>
+<td>多租户</td>
+<td>MIG 或 time-slicing</td>
+<td>不能承诺稳定性能</td>
+</tr>
+<tr>
+<td>教学实验</td>
+<td>低</td>
+<td>弱</td>
+<td>多租户</td>
+<td>time-slicing</td>
+<td>目标是可获得性</td>
+</tr>
+<tr>
+<td>同团队轻量批处理</td>
+<td>低</td>
+<td>弱</td>
+<td>同信任域</td>
+<td>MPS</td>
+<td>限制同卡进程和显存</td>
+</tr>
+</tbody>
+</table>
+<h3 id="可执行方案64-张-h100-平台改造">可执行方案：64 张 H100
+平台改造</h3>
+<p>现状：</p>
+<ul>
+<li>20 个 7B 小模型各占一张整卡，GPU util 10%-20%。</li>
+<li>4 个 70B 服务各需要 2 张 H100 整卡。</li>
+<li>研究团队每天提交 8 卡训练，经常因碎片 Pending。</li>
+<li>开发 notebook 经常抢占整卡。</li>
+</ul>
+<p>目标：</p>
+<ul>
+<li>降低小模型成本。</li>
+<li>保留 8 卡训练形状。</li>
+<li>降低 70B 扩容冷启动。</li>
+<li>让开发任务能跑，但不污染关键池。</li>
+</ul>
+<p>设计：</p>
+<table>
+<thead>
+<tr>
+<th>池</th>
+<th>容量</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>h100-full-train</code></td>
+<td>24 GPU</td>
+<td>3 台完整 8 卡节点，只放 8 卡训练和少量可抢占大训练</td>
+</tr>
+<tr>
+<td><code>h100-full-online</code></td>
+<td>16 GPU</td>
+<td>70B 整卡推理，反亲和，强 SLA</td>
+</tr>
+<tr>
+<td><code>h100-mig-small</code></td>
+<td>16 GPU</td>
+<td>切 <code>1g.10gb</code> / <code>2g.20gb</code>，承载 7B 小模型</td>
+</tr>
+<tr>
+<td><code>h100-warm-online</code></td>
+<td>4 GPU</td>
+<td>70B 热权重和热副本</td>
+</tr>
+<tr>
+<td><code>h100-dev-shared</code></td>
+<td>4 GPU</td>
+<td>time-slicing，开发和 notebook，best-effort</td>
+</tr>
+</tbody>
+</table>
+<p>准入规则：</p>
+<ol type="1">
+<li>70B 服务只能使用 <code>full-online</code> 或
+<code>warm-online</code>。</li>
+<li>8 卡训练只能使用 <code>full-train</code>，必须 gang
+scheduling。</li>
+<li>7B 小模型默认使用 <code>mig-small</code>，除非显存画像超过 MIG
+profile。</li>
+<li>notebook 进入 <code>dev-shared</code>，不得申请整卡生产池。</li>
+<li><code>dev-shared</code> 可被全部抢占，用于 emergency defrag。</li>
+<li>MIG profile 每周复盘，变更只在维护窗口执行。</li>
+</ol>
+<p>成功指标：</p>
+<ul>
+<li>8 卡训练 Pending p95 下降。</li>
+<li>7B 小模型单请求成本下降。</li>
+<li>70B 扩容 readiness 时间下降。</li>
+<li><code>available full nodes</code> 不低于阈值。</li>
+<li>MIG profile pending 与 idle 同时出现的时间减少。</li>
+</ul>
+<hr />
+<h2 id="20b9-故障排除症状证据根因动作">20b.9
+故障排除：症状、证据、根因、动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>有空闲 GPU 但 8 卡作业 Pending</td>
+<td>节点级空闲、Pod event、ResourceFlavor</td>
+<td>空闲卡分散，没有完整 8 卡节点</td>
+<td>compact 小任务、等待窗口、迁移可抢占任务</td>
+</tr>
+<tr>
+<td>MIG 服务扩不起来</td>
+<td>MIG profile allocatable、pending flavor</td>
+<td>只有 <code>1g.10gb</code>，没有 <code>3g.40gb</code></td>
+<td>重切 profile、拆池、调整模型规格</td>
+</tr>
+<tr>
+<td>time-slicing Running 但很慢</td>
+<td>同卡 replicas、GPU util、kernel 时间</td>
+<td>共享倍率过高或邻居任务重</td>
+<td>限制 replicas、迁到 MIG/整卡</td>
+</tr>
+<tr>
+<td>MPS 下 P99 抖动</td>
+<td>MPS clients、显存峰值、应用日志</td>
+<td>同卡进程互扰</td>
+<td>限同团队、限显存、关键服务禁用 MPS</td>
+</tr>
+<tr>
+<td>warm pool 有节点但扩容仍慢</td>
+<td>cold start breakdown</td>
+<td>热的是节点，不是权重/engine/readiness</td>
+<td>预热镜像、权重、engine 和探针</td>
+</tr>
+<tr>
+<td>GPU 不可见</td>
+<td><code>nvidia-smi</code>、device plugin 日志、node allocatable</td>
+<td>driver/toolkit/device plugin 异常</td>
+<td>重启组件、隔离节点、检查版本</td>
+</tr>
+<tr>
+<td>容器 OOM 或 CUDA OOM</td>
+<td>应用日志、显存曲线、MIG profile</td>
+<td>profile 太小或 batch/KV cache 超预期</td>
+<td>调整 profile、限制 batch、改整卡</td>
+</tr>
+<tr>
+<td>XID 错误频繁</td>
+<td>DCGM、内核日志、节点事件</td>
+<td>硬件、驱动或压力问题</td>
+<td>cordon 节点、迁移负载、升级或报修</td>
+</tr>
+<tr>
+<td>NCCL 性能异常</td>
+<td>NCCL logs、拓扑、网卡 locality</td>
+<td>跨 NUMA、跨慢链路、混卡</td>
+<td>加 topology constraint，拆池，固定节点</td>
+</tr>
+</tbody>
+</table>
+<h3 id="排障顺序">排障顺序</h3>
+<ol type="1">
+<li>看作业请求的是哪个 flavor，而不是只看 GPU 数。</li>
+<li>看该 flavor 的 allocatable、allocated、pending。</li>
+<li>看节点级完整形状，例如完整 8 卡节点数。</li>
+<li>看共享方式：MIG、MPS、time-slicing 是否符合 SLA。</li>
+<li>看设备健康和版本：driver、device plugin、DCGM、XID。</li>
+<li>看应用层：显存峰值、batch、KV cache、NCCL、checkpoint。</li>
+</ol>
+<h3 id="常用证据">常用证据</h3>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe node <span class="op">&lt;</span>gpu-node<span class="op">&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pods <span class="at">-A</span> <span class="at">-o</span> wide</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pod <span class="op">&lt;</span>pod<span class="op">&gt;</span> -n <span class="op">&lt;</span>ns<span class="op">&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> <span class="op">&lt;</span>ns<span class="op">&gt;</span> --sort-by=.lastTimestamp</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span></code></pre></div>
+<p>如果使用 MIG、Kueue 或 Volcano，还要查看对应 CRD
+状态、ResourceFlavor、ClusterQueue、PodGroup 和 device plugin 配置。</p>
+<hr />
+<h2 id="20b10-反模式--checklist">20b.10 反模式 + Checklist</h2>
+<h3 id="常见反模式">常见反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>现象</th>
+<th>修复方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把所有 GPU 当一种 SKU</td>
+<td>作业性能差异巨大，调度解释困难</td>
+<td>按型号、显存、拓扑、共享方式建 flavor</td>
+</tr>
+<tr>
+<td>为利用率全开 MIG</td>
+<td>大模型和 8 卡训练长期无卡</td>
+<td>保留整卡池和重切窗口</td>
+</tr>
+<tr>
+<td>跨租户默认 MPS</td>
+<td>一个租户影响另一个租户</td>
+<td>跨租户优先 MIG 或整卡</td>
+</tr>
+<tr>
+<td>time-slicing 跑生产推理</td>
+<td>P99 抖动，用户投诉</td>
+<td>只用于开发和低优先级</td>
+</tr>
+<tr>
+<td>只看总空闲 GPU</td>
+<td>“有卡但 Pending”反复发生</td>
+<td>看关键形状可用数</td>
+</tr>
+<tr>
+<td>warm pool 只热节点</td>
+<td>扩容仍慢在权重和 engine</td>
+<td>热到 readiness 层</td>
+</tr>
+<tr>
+<td>小任务随意 spread</td>
+<td>破坏完整 8 卡节点</td>
+<td>小任务 compact 到专用池</td>
+</tr>
+<tr>
+<td>MIG profile 长期不复盘</td>
+<td>idle 和 pending 同时存在</td>
+<td>根据需求重切和拆池</td>
+</tr>
+</tbody>
+</table>
+<h3 id="checklist">Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />GPU flavor
+覆盖型号、显存、整卡/MIG/MPS/time-slicing、拓扑和 SLA。</label></li>
+<li><label><input
+type="checkbox" />多卡训练池保留完整节点，并与小任务隔离。</label></li>
+<li><label><input type="checkbox" />MIG profile
+来自真实显存画像，不是硬件最大切分能力。</label></li>
+<li><label><input type="checkbox" />MPS
+限定同信任域，并限制同卡进程数和显存。</label></li>
+<li><label><input type="checkbox" />Time-slicing 标注
+best-effort，不承诺强 SLA。</label></li>
+<li><label><input type="checkbox" />Warm pool
+明确热到节点、镜像、权重、engine 还是副本。</label></li>
+<li><label><input type="checkbox" />每个 flavor
+都进入配额、计费、审计和看板。</label></li>
+<li><label><input type="checkbox" />看板展示
+<code>pending by flavor</code> 和关键形状可用数。</label></li>
+<li><label><input type="checkbox" />有 MIG 重切、节点 drain、defrag
+的维护窗口。</label></li>
+<li><label><input type="checkbox" />XID、ECC、显存、共享倍率和 cold
+start 都可观测。</label></li>
+</ul>
+<hr />
+<h2 id="20b11-worked-example从整卡浪费到资源形状治理">20b.11 Worked
+Example：从整卡浪费到资源形状治理</h2>
+<h3 id="初始状态">初始状态</h3>
+<p>一个团队有 64 张 H100：</p>
+<ul>
+<li>20 个 7B 小模型各占 1 张整卡，平均 GPU util 15%。</li>
+<li>4 个 70B 服务各占 2 张整卡，扩容冷启动 8 分钟。</li>
+<li>研究团队每天提交 8 卡训练，p95 等待超过 2 小时。</li>
+<li>notebook 用户经常申请整卡，运行 10 分钟后空闲。</li>
+</ul>
+<h3 id="诊断">诊断</h3>
+<p>平台看板显示：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>状态</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平均 GPU util</td>
+<td>45%</td>
+<td>不算高，但不能说明容量健康</td>
+</tr>
+<tr>
+<td>总空闲 GPU</td>
+<td>12</td>
+<td>看起来有空闲</td>
+</tr>
+<tr>
+<td>完整 8 卡节点</td>
+<td>0</td>
+<td>训练 Pending 的直接原因</td>
+</tr>
+<tr>
+<td>7B 显存峰值</td>
+<td>13GB</td>
+<td>不需要 H100 整卡</td>
+</tr>
+<tr>
+<td>70B cold start</td>
+<td>权重 4m + engine 3m + readiness 1m</td>
+<td>warm pool 应热到 engine</td>
+</tr>
+<tr>
+<td>notebook 使用</td>
+<td>峰值短、空闲长</td>
+<td>适合共享池</td>
+</tr>
+</tbody>
+</table>
+<h3 id="改造">改造</h3>
+<ol type="1">
+<li>把 3 台 8 卡节点划入
+<code>h100-full-train</code>，小任务不得进入。</li>
+<li>把 2 台节点划入 <code>h100-full-online</code>，承载 70B 服务。</li>
+<li>把 2 台节点划入 <code>h100-mig-small</code>，按 <code>1g.10gb</code>
+和 <code>2g.20gb</code> 承载 7B。</li>
+<li>用 4 张 GPU 做 <code>h100-warm-70b</code>，预加载权重和
+engine。</li>
+<li>剩余 4 张 GPU 做 <code>h100-dev-shared</code>，time-slicing 给
+notebook。</li>
+<li>队列侧把 <code>dev-shared</code> 标记为 best-effort 和可抢占。</li>
+</ol>
+<h3 id="结果">结果</h3>
+<ul>
+<li>7B 模型从整卡迁到 MIG，单位成本下降。</li>
+<li>8 卡训练至少能看到保留的完整节点。</li>
+<li>70B 扩容从 8 分钟下降到 1 分钟以内。</li>
+<li>notebook 可获得性提升，但明确没有强 SLA。</li>
+</ul>
+<p>真正的收益不是“平均 GPU util
+变高”这一项，而是资源形状变得可解释：谁需要整卡、谁适合 MIG、谁只能
+best-effort、谁需要 warm pool，都有明确边界。</p>
+<hr />
+<h2 id="20b12-本章小结">20b.12 本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>整卡</td>
+<td>保护显存、拓扑、隔离和性能确定性</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>硬件固定切分，适合稳定小规格强隔离场景</td>
+</tr>
+<tr>
+<td>MPS</td>
+<td>同信任域多进程共享，不适合默认跨租户</td>
+</tr>
+<tr>
+<td>Time-slicing</td>
+<td>提高开发可获得性，不提供强性能承诺</td>
+</tr>
+<tr>
+<td>Warm pool</td>
+<td>缩短冷启动路径，不增加总容量</td>
+</tr>
+<tr>
+<td>资源形状</td>
+<td>GPU 平台应调度、配额、计费 flavor，而不是抽象 GPU 数</td>
+</tr>
+<tr>
+<td>Bin packing</td>
+<td>目标是保留关键形状，不是盲目塞满</td>
+</tr>
+<tr>
+<td>碎片治理</td>
+<td>需要指标、维护窗口、抢占和池化策略共同完成</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>MIG 和 MPS 的隔离边界有什么不同？</li>
+<li>为什么 time-slicing 不适合强 SLA 在线推理？</li>
+<li>warm pool 为什么不能简单理解为“更多 GPU”？</li>
+<li>为什么“总空闲 GPU 数”不是容量健康的充分指标？</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="5" type="1">
+<li>给一个同时有 7B、70B、8 卡训练和 notebook 的集群设计 GPU 池和
+ResourceFlavor。</li>
+<li>一个服务需要 <code>3g.40gb</code>，集群剩很多
+<code>1g.10gb</code>。解释为什么扩不起来，并给出治理动作。</li>
+<li>某 8 卡训练作业 Pending，但集群有 12 张空闲
+H100。请设计排障证据链。</li>
+<li>你准备把小模型推理从整卡迁到
+MIG。列出发布步骤、观测指标和回滚策略。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

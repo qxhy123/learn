@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 19b 章 · GPU 调度与拓扑感知 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=19b" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 19b 章 · GPU 调度与拓扑感知</h1>
+<p class="sub">从 GPU 请求、亲和性、拓扑、队列和碎片治理理解 AI 调度。</p>
+<div class="chips"><span class="chip">Scheduler</span><span class="chip">GPU</span><span class="chip">Topology</span><span class="chip">MIG</span><span class="chip">Queue</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#19b1-第一性原理拆解--学习大纲">19b.1 第一性原理拆解 +
+学习大纲</a></li><li><a class="anchor" href="#19b2-概念先说清楚">19b.2 概念先说清楚</a></li><li><a class="anchor" href="#19b3-架构设备注册调度与容器启动路径">19b.3
+架构：设备注册、调度与容器启动路径</a></li><li><a class="anchor" href="#19b4-原理底层机制如何工作">19b.4 原理：底层机制如何工作</a></li><li><a class="anchor" href="#19b5-工程化节点池标签版本发布观测治理">19b.5
+工程化：节点池、标签、版本、发布、观测、治理</a></li><li><a class="anchor" href="#19b6-方案设计gpu-调度决策表与-yaml">19b.6 方案设计：GPU
+调度决策表与 YAML</a></li><li><a class="anchor" href="#19b7-numanvlinkrdma-locality-深入">19b.7 NUMA、NVLink、RDMA
+Locality 深入</a></li><li><a class="anchor" href="#19b8-故障排除症状证据根因动作">19b.8
+故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#19b9-反模式与-checklist">19b.9 反模式与 Checklist</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>GPU 在 Kubernetes 里不是“更贵的 CPU”。本章从 GPU Device Plugin、GPU
+Operator、MIG、Node Feature
+Discovery、节点标签、taint/toleration、亲和、拓扑分布、NUMA、NVLink 和
+RDMA locality 出发，解释为什么 AI 任务经常“有卡但
+Pending”，或者“能调度但跑不快”。</p>
+</blockquote>
+<hr />
+<h2 id="19b1-第一性原理拆解--学习大纲">19b.1 第一性原理拆解 +
+学习大纲</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>GPU 调度的不可化简问题是：</p>
+<p><strong>AI 任务需要的不是任意 N 张
+GPU，而是一组满足型号、显存、切分方式、驱动、拓扑、网络和租户策略约束的设备集合。</strong></p>
+<p>一个小模型推理副本可能只需要任意 1 张 L4。一个 70B
+推理服务可能需要同机 8 张 H100，并且最好在同一个 NVSwitch domain。一个
+64 卡训练任务不仅需要 8 台各有 8 张空闲卡的节点，还需要 RDMA
+fabric、NCCL 可达、机架分布、CPU/GPU/NIC locality 和一致的软件版本。</p>
+<p>Kubernetes 默认调度器擅长处理 CPU、内存和扩展资源数量。GPU 通过
+device plugin 暴露为 <code>nvidia.com/gpu</code> 或 MIG profile
+资源后，调度器能知道“节点还有几个设备可分配”。但这个数量不自动表达：</p>
+<ul>
+<li>GPU 型号和显存大小。</li>
+<li>MIG profile 与整卡的区别。</li>
+<li>GPU 之间是否有 NVLink / NVSwitch。</li>
+<li>GPU、CPU、NIC 是否在同一个 NUMA locality。</li>
+<li>跨节点是否有 RDMA，NCCL 是否会走正确网卡。</li>
+<li>节点驱动、container toolkit、CUDA 镜像是否兼容。</li>
+<li>这个租户是否允许使用该卡型和节点池。</li>
+</ul>
+<p>所以 GPU
+调度是信号工程和策略工程：把硬件事实、软件基线、网络拓扑和组织策略变成调度器、准入系统和用户都能理解的约束。</p>
+<h3 id="推从问题推导机制">推：从问题推导机制</h3>
+<p>从“GPU 要被 kubelet 和调度器看见”推出 GPU Device Plugin。</p>
+<p>从“驱动、容器工具链、device plugin、监控组件要一致”推出 GPU
+Operator。</p>
+<p>从“一张物理卡要被切成多个硬件隔离实例”推出 MIG。</p>
+<p>从“节点硬件事实要进入调度语言”推出 Node Feature Discovery
+和节点标签。</p>
+<p>从“GPU 节点不能被普通 CPU Pod 占满”推出 taint/toleration。</p>
+<p>从“任务要落在特定卡型、节点池、机架或网络域”推出 nodeSelector、node
+affinity、pod affinity、pod anti-affinity 和 topology spread
+constraints。</p>
+<p>从“数量正确不等于性能正确”推出 NUMA、NVLink、RDMA locality
+的建模和排障。</p>
+<h3 id="学习大纲">学习大纲</h3>
+<p>读完本章，你应该能回答：</p>
+<ol type="1">
+<li>Device Plugin 在 Kubernetes GPU 链路中负责什么，不负责什么。</li>
+<li>GPU Operator 管理哪些组件，为什么它不等于调度策略。</li>
+<li>MIG 适合什么场景，为什么会产生资源碎片。</li>
+<li>NFD、节点标签、taint/toleration、affinity 各自解决什么问题。</li>
+<li>NUMA、NVLink、RDMA locality 为什么会影响训练和推理性能。</li>
+<li>如何设计一个 GPU 节点池和调度约束方案。</li>
+<li>如何按证据链排查 Pending、GPU 不可见、NCCL timeout 和吞吐异常。</li>
+</ol>
+<hr />
+<h2 id="19b2-概念先说清楚">19b.2 概念先说清楚</h2>
+<h3 id="gpu-device-plugin-是什么不是什么">GPU Device Plugin
+是什么，不是什么</h3>
+<p>GPU Device Plugin 是 kubelet 的设备插件。它把节点上的 GPU 注册为
+Kubernetes extended resource，例如：</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<p>它负责向 kubelet
+汇报设备列表和健康状态，并在容器启动时返回需要注入的设备信息。随后
+NVIDIA container toolkit 和容器运行时把
+<code>/dev/nvidia*</code>、driver library、环境变量等注入容器。</p>
+<p>Device Plugin 不负责训练框架调优，不负责 NCCL
+拓扑选择，也不保证申请到的多张 GPU
+具备理想互联。默认调度器看到的主要是资源名和数量。</p>
+<h3 id="gpu-operator-是什么不是什么">GPU Operator 是什么，不是什么</h3>
+<p>GPU Operator 是节点 GPU 软件栈的运维控制面。典型组件包括：</p>
+<ul>
+<li>NVIDIA driver 或 driver manager。</li>
+<li>NVIDIA container toolkit。</li>
+<li>NVIDIA device plugin。</li>
+<li>DCGM exporter。</li>
+<li>MIG manager。</li>
+<li>GPU feature discovery 或与 NFD 集成的标签组件。</li>
+<li>validator 和节点健康检查组件。</li>
+</ul>
+<p>GPU Operator
+解决“节点基线一致”和“组件持续管理”。它不是容量规划器，不替代队列系统，也不会自动把一个
+64 卡训练任务放到最优拓扑上。</p>
+<h3 id="mig-是什么不是什么">MIG 是什么，不是什么</h3>
+<p>MIG（Multi-Instance GPU）把支持的 NVIDIA GPU
+切成多个硬件隔离实例。Kubernetes 中这些实例通常暴露为不同扩展资源，例如
+<code>nvidia.com/mig-1g.10gb</code>。</p>
+<p>MIG 不是显存超卖，也不是任意比例切片。它只能使用硬件支持的
+profile，并会带来碎片治理问题。MIG
+适合小模型推理、Notebook、开发环境和强隔离多租户；不适合需要整卡显存、大规模
+GPU-GPU 通信或频繁改变切分形状的任务。</p>
+<h3 id="nfd标签污点亲和的边界">NFD、标签、污点、亲和的边界</h3>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>解决什么</th>
+<th>不解决什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NFD</td>
+<td>自动发现 CPU、PCI、内核、设备等特征并打标签</td>
+<td>判断业务是否该用这些节点</td>
+</tr>
+<tr>
+<td>节点标签</td>
+<td>把硬件、拓扑、节点池、运维状态表达给调度策略</td>
+<td>自动保证标签永远正确</td>
+</tr>
+<tr>
+<td>taint/toleration</td>
+<td>控制哪些 Pod 可以进入节点</td>
+<td>选择最优节点或最优 GPU</td>
+</tr>
+<tr>
+<td>node affinity</td>
+<td>选择具备某些节点特征的节点</td>
+<td>表达单节点内部具体哪张 GPU</td>
+</tr>
+<tr>
+<td>pod affinity</td>
+<td>让 Pod 靠近某些已有 Pod</td>
+<td>保证 GPU/NIC locality</td>
+</tr>
+<tr>
+<td>pod anti-affinity</td>
+<td>让 Pod 远离某些已有 Pod</td>
+<td>保证资源性能不互相干扰</td>
+</tr>
+<tr>
+<td>topology spread</td>
+<td>控制副本跨 zone、rack、node 分布</td>
+<td>表达 GPU-GPU/NIC 细粒度拓扑</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="19b3-架构设备注册调度与容器启动路径">19b.3
+架构：设备注册、调度与容器启动路径</h2>
+<h3 id="关键组件">关键组件</h3>
+<pre class="mermaid">flowchart TB
+  subgraph Node[GPU Node]
+    GPU[GPU / MIG Devices]
+    Driver[NVIDIA Driver]
+    Toolkit[NVIDIA Container Toolkit]
+    DP[NVIDIA Device Plugin]
+    DCGM[DCGM Exporter]
+    NFD[NFD / GPU Feature Discovery]
+    Kubelet[Kubelet]
+    Runtime[containerd / CRI]
+  end
+
+  API[Kubernetes API Server]
+  Scheduler[Scheduler]
+  Pod[GPU Pod]
+  Labels[Node Labels]
+  Metrics[GPU Metrics]
+
+  GPU --&gt; Driver
+  Driver --&gt; DP
+  DP --&gt; Kubelet
+  NFD --&gt; Labels
+  DCGM --&gt; Metrics
+  API --&gt; Scheduler
+  Scheduler --&gt; Pod
+  Pod --&gt; Kubelet
+  Kubelet --&gt; Runtime
+  Runtime --&gt; Toolkit
+  Toolkit --&gt; Driver</pre>
+<h3 id="控制路径">控制路径</h3>
+<ol type="1">
+<li>GPU Operator 或运维系统安装 driver、toolkit、device
+plugin、DCGM、NFD。</li>
+<li>Device Plugin 通过 kubelet device plugin API 注册
+<code>nvidia.com/gpu</code> 或 MIG 资源。</li>
+<li>kubelet 把节点 <code>capacity</code> 和 <code>allocatable</code>
+上报给 API Server。</li>
+<li>NFD / GPU feature discovery
+给节点打上卡型、显存、MIG、PCI、CPU、网络等标签。</li>
+<li>用户提交带 GPU request/limit、toleration、affinity 的 Pod。</li>
+<li>scheduler
+根据资源数量、标签、污点、亲和、拓扑分布和队列策略选节点。</li>
+<li>kubelet 调用 device plugin 分配设备，并通过 runtime/toolkit
+注入容器。</li>
+<li>应用在容器内通过 CUDA、NCCL、框架 runtime 使用 GPU。</li>
+</ol>
+<h3 id="数据路径">数据路径</h3>
+<p>GPU 任务的数据路径通常包括：</p>
+<ul>
+<li>CPU 内存到 GPU 显存的拷贝。</li>
+<li>GPU 之间通过 PCIe、NVLink 或 NVSwitch 通信。</li>
+<li>GPU 与 NIC 之间通过 PCIe/NUMA 路径进行 RDMA 或普通网络通信。</li>
+<li>数据集、checkpoint、模型权重通过本地
+NVMe、PVC、并行文件系统或对象存储读写。</li>
+</ul>
+<p>调度只选节点不等于选中了正确数据路径。多卡训练和大模型推理经常在“数量满足、路径不优”时出现吞吐下降。</p>
+<h3 id="责任边界">责任边界</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>负责什么</th>
+<th>不负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Device Plugin</td>
+<td>暴露设备、健康状态、设备分配信息</td>
+<td>容量规划、队列公平、NCCL 调优</td>
+</tr>
+<tr>
+<td>GPU Operator</td>
+<td>安装和管理节点 GPU 软件栈</td>
+<td>业务调度策略和模型性能目标</td>
+</tr>
+<tr>
+<td>NFD / 标签系统</td>
+<td>把硬件事实变成标签</td>
+<td>保证策略设计正确</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>根据资源和约束选节点</td>
+<td>理解所有 AI 性能语义</td>
+</tr>
+<tr>
+<td>Kubelet / Runtime</td>
+<td>启动容器、注入设备</td>
+<td>判断训练是否收敛</td>
+</tr>
+<tr>
+<td>AI 平台</td>
+<td>队列、配额、准入、拓扑策略、用户解释</td>
+<td>替代底层设备插件</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="19b4-原理底层机制如何工作">19b.4 原理：底层机制如何工作</h2>
+<h3 id="extended-resource-为什么必须用-limits">Extended Resource
+为什么必须用 limits</h3>
+<p>GPU 通常以 extended resource 暴露。Kubernetes 对这类资源不支持像 CPU
+一样的超卖语义，调度时按离散整数分配。实际 YAML 通常只写
+<code>limits</code>：</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span></code></pre></div>
+<p>对 GPU 来说，“申请 4 张卡”意味着容器需要独占或按插件语义获得 4
+个设备。调度器会在节点 allocatable 中扣减对应数量，但它不知道这 4
+张卡在节点内部的 PCIe/NVLink 位置，除非使用额外插件或策略。</p>
+<h3 id="device-plugin-的核心接口">Device Plugin 的核心接口</h3>
+<p>Device Plugin 的逻辑可以简化为：</p>
+<pre class="text"><code>ListAndWatch: 持续告诉 kubelet 节点有哪些设备、哪些健康
+Allocate: 当 Pod 被分配设备时，返回设备节点、挂载、环境变量等注入信息
+GetPreferredAllocation: 可选，给 kubelet 推荐更合适的设备组合</code></pre>
+<p><code>GetPreferredAllocation</code>
+可以帮助节点内设备选择，但它不等价于全局拓扑调度。跨节点、跨机架、跨
+RDMA fabric 的选择仍然需要调度层和平台层协作。</p>
+<h3 id="gpu-operator-为什么存在">GPU Operator 为什么存在</h3>
+<p>没有 Operator 时，节点 GPU 栈常出现漂移：</p>
+<ul>
+<li>有的节点 driver 版本不同。</li>
+<li>有的节点 container toolkit 缺失。</li>
+<li>device plugin DaemonSet 没运行或版本不一致。</li>
+<li>MIG 配置变更后资源名没有正确刷新。</li>
+<li>DCGM 指标缺失，导致观测断层。</li>
+</ul>
+<p>GPU Operator 把这些组件作为 Kubernetes 资源持续管理，减少人工 SSH
+运维。但它仍然需要版本矩阵、变更窗口和回滚策略。</p>
+<h3 id="mig-的资源形状">MIG 的资源形状</h3>
+<p>MIG 把一张物理 GPU 切成固定 profile。调度器看到的是 profile
+资源数量，不是“显存总和”。例如一个节点暴露：</p>
+<pre class="text"><code>nvidia.com/mig-1g.10gb: 4
+nvidia.com/mig-3g.40gb: 1</code></pre>
+<p>一个需要 <code>nvidia.com/mig-7g.80gb: 1</code> 的 Pod 不能用四个
+<code>1g.10gb</code> 拼出来。MIG
+碎片就是资源形状不匹配，而不是简单容量不足。</p>
+<h3 id="locality-为什么决定性能">Locality 为什么决定性能</h3>
+<p>GPU 性能错配常来自 locality：</p>
+<ul>
+<li>NUMA：CPU 线程、内存、GPU、NIC 跨 socket 访问，数据路径变远。</li>
+<li>NVLink/NVSwitch：GPU-GPU 通信不在高速互联域内，allreduce 或 tensor
+parallel 变慢。</li>
+<li>RDMA：跨节点通信没走 IB/RoCE、走错网卡、rail 不对齐或 GPUDirect RDMA
+未生效。</li>
+<li>存储 locality：模型加载和 checkpoint 写入经过慢盘或拥塞网络。</li>
+</ul>
+<p>在 Kubernetes YAML 中，<code>nvidia.com/gpu: 8</code>
+只能表达数量，不能表达这些路径。平台要把 locality
+转成标签、节点池、准入规则、调度插件或提交前校验。</p>
+<hr />
+<h2 id="19b5-工程化节点池标签版本发布观测治理">19b.5
+工程化：节点池、标签、版本、发布、观测、治理</h2>
+<h3 id="节点池设计">节点池设计</h3>
+<p>GPU 集群不要只按“有 GPU”建一个大池。常见拆法：</p>
+<table>
+<thead>
+<tr>
+<th>节点池</th>
+<th>适合</th>
+<th>标签示例</th>
+<th>taint 示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gpu-h100-sxm-train</code></td>
+<td>大训练、70B+ 推理</td>
+<td><code>gpu.model=H100</code>、<code>gpu.fabric=nvswitch</code>、<code>rdma=true</code></td>
+<td><code>ai.local/gpu=true:NoSchedule</code></td>
+</tr>
+<tr>
+<td><code>gpu-l40s-serving</code></td>
+<td>中小模型推理</td>
+<td><code>gpu.model=L40S</code>、<code>workload=serving</code></td>
+<td><code>ai.local/gpu=true:NoSchedule</code></td>
+</tr>
+<tr>
+<td><code>gpu-a100-mig-dev</code></td>
+<td>Notebook、小模型、多租户</td>
+<td><code>gpu.mig=enabled</code></td>
+<td><code>ai.local/mig=true:NoSchedule</code></td>
+</tr>
+<tr>
+<td><code>gpu-h100-maintenance</code></td>
+<td>维护、烧机、隔离</td>
+<td><code>maintenance=true</code></td>
+<td><code>maintenance=true:NoSchedule</code></td>
+</tr>
+</tbody>
+</table>
+<p>节点池边界越清楚，调度约束越容易解释。把所有型号、MIG、整卡、训练、推理混在一个池里，会让排障和容量治理变复杂。</p>
+<h3 id="标签规范">标签规范</h3>
+<p>标签要稳定、可审计、可自动生成。示例：</p>
+<pre class="text"><code>gpu.nvidia.com/model=H100
+gpu.nvidia.com/memory=80gb
+gpu.nvidia.com/product=NVIDIA-H100-80GB-HBM3
+gpu.nvidia.com/mig.strategy=none
+ai.local/gpu-pool=h100-sxm-train
+ai.local/nvlink-domain=hgx-12
+ai.local/rdma=true
+ai.local/rdma-rail=dual
+ai.local/local-nvme=true
+topology.kubernetes.io/zone=az-a
+topology.kubernetes.io/rack=rack-03</code></pre>
+<p>原则：</p>
+<ul>
+<li>硬件事实尽量由 NFD/GPU feature discovery 自动生成。</li>
+<li>平台策略标签由控制面生成，例如节点池、租户池、维护状态。</li>
+<li>标签值要可枚举，避免自由文本。</li>
+<li>定期校验标签和真实硬件是否一致。</li>
+</ul>
+<h3 id="tainttoleration">taint/toleration</h3>
+<p>GPU 节点通常要加 taint，防止普通 CPU Pod 占用
+CPU、内存、临时盘或网络：</p>
+<pre class="text"><code>ai.local/gpu=true:NoSchedule</code></pre>
+<p>GPU Pod 必须显式 toleration：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">tolerations</span><span class="kw">:</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/gpu</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> Equal</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;true&quot;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">effect</span><span class="kw">:</span><span class="at"> NoSchedule</span></span></code></pre></div>
+<p>toleration
+只表示“允许进入”，不表示“应该进入”。真正的放置还需要资源请求和
+affinity。</p>
+<h3 id="node-affinity-与拓扑分布">node affinity 与拓扑分布</h3>
+<p>硬约束用
+<code>requiredDuringSchedulingIgnoredDuringExecution</code>，性能偏好用
+<code>preferredDuringSchedulingIgnoredDuringExecution</code>：</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">affinity</span><span class="kw">:</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">nodeAffinity</span><span class="kw">:</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">requiredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">nodeSelectorTerms</span><span class="kw">:</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">matchExpressions</span><span class="kw">:</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/gpu-pool</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;h100-sxm-train&quot;</span><span class="kw">]</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/rdma</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;true&quot;</span><span class="kw">]</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preferredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">weight</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">preference</span><span class="kw">:</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">matchExpressions</span><span class="kw">:</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/local-nvme</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;true&quot;</span><span class="kw">]</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="fu">topologySpreadConstraints</span><span class="kw">:</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">maxSkew</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">topologyKey</span><span class="kw">:</span><span class="at"> topology.kubernetes.io/rack</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">whenUnsatisfiable</span><span class="kw">:</span><span class="at"> ScheduleAnyway</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">labelSelector</span><span class="kw">:</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> llm-serving</span></span></code></pre></div>
+<p>把所有偏好都写成 required，会让 Pod 在资源紧张时长期
+Pending。生产中要区分“没有就不能跑”和“没有就跑慢”。</p>
+<h3 id="pod-affinity--anti-affinity">pod affinity / anti-affinity</h3>
+<p>推理副本通常希望分散，避免一个节点或机架故障影响全部副本：</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">affinity</span><span class="kw">:</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">podAntiAffinity</span><span class="kw">:</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">preferredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">weight</span><span class="kw">:</span><span class="at"> </span><span class="dv">100</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">podAffinityTerm</span><span class="kw">:</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">labelSelector</span><span class="kw">:</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">app</span><span class="kw">:</span><span class="at"> reranker-serving</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">topologyKey</span><span class="kw">:</span><span class="at"> kubernetes.io/hostname</span></span></code></pre></div>
+<p>训练作业的多角色 Pod
+有时希望靠近同一机架，以降低网络延迟；有时希望跨故障域分散，以提高容错。选择取决于任务规模和容错策略。</p>
+<h3 id="版本矩阵">版本矩阵</h3>
+<p>GPU 集群必须维护版本矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>示例</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kubernetes</td>
+<td>1.28 / 1.29 / 1.30</td>
+<td>Device plugin API、调度特性、RuntimeClass</td>
+</tr>
+<tr>
+<td>NVIDIA driver</td>
+<td>535 / 550 / 560</td>
+<td>CUDA 兼容、MIG、GDS、NCCL</td>
+</tr>
+<tr>
+<td>CUDA 用户态</td>
+<td>12.2 / 12.4 / 12.5</td>
+<td>PyTorch / TensorRT / vLLM ABI</td>
+</tr>
+<tr>
+<td>NVIDIA container toolkit</td>
+<td>1.14+</td>
+<td>设备和库注入失败</td>
+</tr>
+<tr>
+<td>GPU Operator</td>
+<td>24.x / 25.x</td>
+<td>组件版本打包、CRD 行为</td>
+</tr>
+<tr>
+<td>Device Plugin</td>
+<td>与 Operator 匹配</td>
+<td>MIG resource 暴露策略</td>
+</tr>
+<tr>
+<td>NCCL</td>
+<td>2.18+ / 2.20+</td>
+<td>RDMA、NVLink、拓扑识别</td>
+</tr>
+<tr>
+<td>OFED / RDMA driver</td>
+<td>云厂商或发行版版本</td>
+<td>IB/RoCE、GPUDirect RDMA</td>
+</tr>
+</tbody>
+</table>
+<p>升级顺序通常是测试池验证，再灰度节点池，再扩大范围。不要在大训练窗口中滚动升级
+driver 或 MIG 配置。</p>
+<h3 id="观测">观测</h3>
+<p>最小观测面：</p>
+<ul>
+<li>节点：GPU allocatable、device plugin Ready、driver 版本、MIG
+状态、节点标签。</li>
+<li>Pod：Pending events、分配节点、容器内
+<code>nvidia-smi</code>、环境变量、runtimeClass。</li>
+<li>GPU：利用率、显存、功耗、温度、ECC、XID、PCIe replay、NVLink
+counters。</li>
+<li>训练：step time、samples/s、allreduce time、NCCL
+logs、重试次数。</li>
+<li>网络：IB/RoCE link、GID、MTU、PFC/ECN、丢包、NCCL transport。</li>
+<li>存储：模型加载时间、checkpoint 写入时间、吞吐和延迟。</li>
+</ul>
+<h3 id="治理">治理</h3>
+<p>GPU 治理要覆盖：</p>
+<ul>
+<li>namespace / 队列级 GPU 配额。</li>
+<li>卡型和节点池权限。</li>
+<li>整卡池与 MIG 池比例。</li>
+<li>优先级、抢占、gang scheduling 或队列准入。</li>
+<li>维护 taint、节点 drain、烧机验证。</li>
+<li>成本归因：租户、项目、作业、模型版本。</li>
+<li>空闲检测：分配了 GPU 但利用率长期为 0 的任务要告警或回收。</li>
+</ul>
+<hr />
+<h2 id="19b6-方案设计gpu-调度决策表与-yaml">19b.6 方案设计：GPU
+调度决策表与 YAML</h2>
+<h3 id="决策表">决策表</h3>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>推荐机制</th>
+<th>原因</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只需要任意 1 张 GPU</td>
+<td><code>limits.nvidia.com/gpu: 1</code> + GPU toleration</td>
+<td>简单直接</td>
+<td>可能落到不合适卡型</td>
+</tr>
+<tr>
+<td>需要指定卡型</td>
+<td>node affinity / nodeSelector</td>
+<td>用节点标签表达型号</td>
+<td>标签漂移会误调度</td>
+</tr>
+<tr>
+<td>需要小规格隔离</td>
+<td>MIG resource</td>
+<td>硬件隔离，提升利用率</td>
+<td>profile 碎片</td>
+</tr>
+<tr>
+<td>需要同机 8 卡高速互联</td>
+<td>整节点节点池 + <code>nvidia.com/gpu: 8</code> + 标签</td>
+<td>避免跨弱拓扑</td>
+<td>节点碎片导致 Pending</td>
+</tr>
+<tr>
+<td>需要 RDMA 训练</td>
+<td>RDMA 标签 + 队列准入 + NCCL 校验</td>
+<td>数量和网络都要满足</td>
+<td>标签正确但 fabric 异常</td>
+</tr>
+<tr>
+<td>推理副本要高可用</td>
+<td>pod anti-affinity + topology spread</td>
+<td>分散故障域</td>
+<td>过度分散影响缓存复用</td>
+</tr>
+<tr>
+<td>普通 Pod 不能进 GPU 节点</td>
+<td>taint/toleration</td>
+<td>节点准入控制</td>
+<td>toleration 滥用</td>
+</tr>
+</tbody>
+</table>
+<h3 id="单卡推理-yaml">单卡推理 YAML</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> embedding-serving</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> embedding-serving</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> embedding-serving</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">tolerations</span><span class="kw">:</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/gpu</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> Equal</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;true&quot;</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">effect</span><span class="kw">:</span><span class="at"> NoSchedule</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">affinity</span><span class="kw">:</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">nodeAffinity</span><span class="kw">:</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">requiredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">nodeSelectorTerms</span><span class="kw">:</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="kw">-</span><span class="at"> </span><span class="fu">matchExpressions</span><span class="kw">:</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> gpu.nvidia.com/model</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="at">                    </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="at">                    </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;L40S&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;L4&quot;</span><span class="kw">]</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">preferredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">weight</span><span class="kw">:</span><span class="at"> </span><span class="dv">50</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">preference</span><span class="kw">:</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">matchExpressions</span><span class="kw">:</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/local-nvme</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a><span class="at">                    </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a><span class="at">                    </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;true&quot;</span><span class="kw">]</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">podAntiAffinity</span><span class="kw">:</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">preferredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">weight</span><span class="kw">:</span><span class="at"> </span><span class="dv">100</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">podAffinityTerm</span><span class="kw">:</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">labelSelector</span><span class="kw">:</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a><span class="at">                    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> embedding-serving</span></span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">topologyKey</span><span class="kw">:</span><span class="at"> kubernetes.io/hostname</span></span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> server</span></span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.local/ai/embedding-serving:cuda12.4</span></span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;4&quot;</span></span>
+<span id="cb11-49"><a href="#cb11-49" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 32Gi</span></span>
+<span id="cb11-50"><a href="#cb11-50" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb11-51"><a href="#cb11-51" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;4&quot;</span></span>
+<span id="cb11-52"><a href="#cb11-52" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 32Gi</span></span>
+<span id="cb11-53"><a href="#cb11-53" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<h3 id="8-卡训练-worker-yaml-片段">8 卡训练 worker YAML 片段</h3>
+<p>多节点训练通常由 TorchJob、MPIJob、RayJob 或 JobSet 生成 Pod。底层
+worker template 应表达资源和拓扑硬约束：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tolerations</span><span class="kw">:</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/gpu</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> Equal</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;true&quot;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">effect</span><span class="kw">:</span><span class="at"> NoSchedule</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">affinity</span><span class="kw">:</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nodeAffinity</span><span class="kw">:</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">requiredDuringSchedulingIgnoredDuringExecution</span><span class="kw">:</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">nodeSelectorTerms</span><span class="kw">:</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="fu">matchExpressions</span><span class="kw">:</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/gpu-pool</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;h100-sxm-train&quot;</span><span class="kw">]</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> ai.local/rdma</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;true&quot;</span><span class="kw">]</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="kw">-</span><span class="at"> </span><span class="fu">key</span><span class="kw">:</span><span class="at"> gpu.nvidia.com/mig.strategy</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">operator</span><span class="kw">:</span><span class="at"> In</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;none&quot;</span><span class="kw">]</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> trainer</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.local/ai/train:cuda12.4-nccl2.20</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> NCCL_DEBUG</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">value</span><span class="kw">:</span><span class="at"> INFO</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> NCCL_IB_HCA</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;mlx5_0,mlx5_1&quot;</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;64&quot;</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Gi</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">ephemeral-storage</span><span class="kw">:</span><span class="at"> 1Ti</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;64&quot;</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Gi</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">ephemeral-storage</span><span class="kw">:</span><span class="at"> 1Ti</span></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span></code></pre></div>
+<p>这只解决单个 worker 的节点选择。完整 64 卡训练还需要队列或 gang
+scheduling 确保 8 个 worker 同时拿到满足条件的节点，避免先启动的 worker
+占卡等待，后续 worker 永远调不上。</p>
+<hr />
+<h2 id="19b7-numanvlinkrdma-locality-深入">19b.7 NUMA、NVLink、RDMA
+Locality 深入</h2>
+<h3 id="numa-locality">NUMA locality</h3>
+<p>NUMA 描述 CPU socket、内存和 PCIe 设备之间的距离。GPU、NIC、本地 NVMe
+往往挂在某个 PCIe root complex 下，离某个 CPU socket 更近。</p>
+<p>性能影响：</p>
+<ul>
+<li>dataloader 线程在远端 NUMA 分配内存，CPU 到 GPU 拷贝变慢。</li>
+<li>GPU 和 RDMA NIC 跨 NUMA，GPUDirect RDMA 路径变差。</li>
+<li>CPU offload 或参数卸载跨 socket，尾延迟变高。</li>
+</ul>
+<p>证据：</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lscpu</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">numactl</span> <span class="at">--hardware</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span></code></pre></div>
+<p>工程动作：</p>
+<ul>
+<li>开启 CPU Manager static policy 和 Topology Manager。</li>
+<li>为大训练预留整节点，减少混部干扰。</li>
+<li>将 CPU、内存、GPU、NIC 亲和策略纳入节点画像。</li>
+</ul>
+<h3 id="nvlink--nvswitch-locality">NVLink / NVSwitch locality</h3>
+<p>NVLink 和 NVSwitch 决定 GPU-GPU 带宽。Tensor parallel、pipeline
+parallel、FSDP、allreduce 都可能受影响。</p>
+<p>典型错配：</p>
+<ul>
+<li>同样申请 8 张 GPU，有的节点是 HGX NVSwitch，有的只是 PCIe GPU。</li>
+<li>两个 4 卡推理 Pod 分别占用互联不理想的 GPU 组合。</li>
+<li>节点被碎片化后，大任务拿不到完整 NVLink domain。</li>
+</ul>
+<p>证据：</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO <span class="ex">nccl-tests</span></span></code></pre></div>
+<p>工程动作：</p>
+<ul>
+<li>把 HGX/NVSwitch 节点单独成池。</li>
+<li>大模型推理和训练使用整节点调度。</li>
+<li>通过准入系统拒绝不满足 topology profile 的提交。</li>
+</ul>
+<h3 id="rdma-locality">RDMA locality</h3>
+<p>跨节点训练依赖 RDMA fabric。Kubernetes Pod 网络能通，不代表 NCCL
+走了正确 RDMA 路径。</p>
+<p>常见问题：</p>
+<ul>
+<li>NCCL 退化到 TCP。</li>
+<li>选错 HCA 或 GID。</li>
+<li>MTU 不一致。</li>
+<li>RoCE PFC/ECN 配置不正确。</li>
+<li>多 rail 没有对齐。</li>
+<li>GPUDirect RDMA 未生效。</li>
+</ul>
+<p>证据：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ibstat</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="ex">rdma</span> link</span></code></pre></div>
+<p>工程动作：</p>
+<ul>
+<li>用节点标签表达 <code>rdma=true</code>、rail、rack、fabric。</li>
+<li>在训练镜像里固化 NCCL 和 RDMA 诊断工具。</li>
+<li>提交前做准入校验，运行前做短 nccl-tests。</li>
+<li>对网络变更建立独立变更窗口和回滚方案。</li>
+</ul>
+<hr />
+<h2 id="19b8-故障排除症状证据根因动作">19b.8
+故障排除：症状、证据、根因、动作</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>证据</th>
+<th>常见根因</th>
+<th>处理动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod Pending: insufficient <code>nvidia.com/gpu</code></td>
+<td><code>kubectl describe pod</code> events、node allocatable</td>
+<td>GPU 数量不足、device plugin 未注册、节点被占满</td>
+<td>查看 device plugin DaemonSet；核对 allocatable；释放或扩容</td>
+</tr>
+<tr>
+<td>有空卡但调不上</td>
+<td>scheduler events、node labels、taints</td>
+<td>toleration 缺失、affinity 太严、节点池标签不匹配</td>
+<td>修正 toleration；把偏好改为 preferred；修复标签</td>
+</tr>
+<tr>
+<td>MIG Pod Pending</td>
+<td>resource name、node allocatable</td>
+<td>请求的 MIG profile 不存在或碎片化</td>
+<td>调整 profile；维护窗口重配 MIG；规划 MIG 池</td>
+</tr>
+<tr>
+<td>容器内看不到 GPU</td>
+<td><code>nvidia-smi</code> 失败、容器 env</td>
+<td>runtimeClass、toolkit、driver、device plugin 注入失败</td>
+<td>检查 GPU Operator、container runtime、驱动和 Pod spec</td>
+</tr>
+<tr>
+<td><code>nvidia-smi</code> 正常但框架报 CUDA 错</td>
+<td>应用日志、driver/CUDA 版本</td>
+<td>镜像 CUDA、PyTorch、driver ABI 不兼容</td>
+<td>对齐版本矩阵；替换镜像或升级 driver</td>
+</tr>
+<tr>
+<td>训练能跑但吞吐低</td>
+<td>step time、NCCL logs、DCGM</td>
+<td>跨 NUMA、NVLink 不匹配、未走 RDMA、存储慢</td>
+<td>检查 <code>nvidia-smi topo -m</code>、NCCL transport、存储指标</td>
+</tr>
+<tr>
+<td>NCCL timeout</td>
+<td>NCCL logs、网络指标</td>
+<td>RDMA 配置、MTU、GID、HCA 选择、节点间防火墙</td>
+<td>固定 NCCL env；验证 ib link；跑 nccl-tests</td>
+</tr>
+<tr>
+<td>GPU 利用率长期为 0</td>
+<td>DCGM、应用日志</td>
+<td>数据加载卡住、挂载慢、进程等待 rank、死锁</td>
+<td>看 dataloader、存储、rendezvous、rank 日志</td>
+</tr>
+<tr>
+<td>XID / ECC 错误</td>
+<td>DCGM、dmesg、GPU Operator validator</td>
+<td>硬件或驱动异常</td>
+<td>cordon/drain 节点；隔离 GPU；跑硬件诊断</td>
+</tr>
+<tr>
+<td>推理延迟异常高</td>
+<td>TTFT/TPOT、GPU 利用率、拓扑</td>
+<td>被调到弱卡、MIG profile 太小、CPU/NUMA 错配</td>
+<td>固定卡型；调整 profile；优化 CPU/GPU 亲和</td>
+</tr>
+</tbody>
+</table>
+<p>排查顺序：</p>
+<ol type="1">
+<li>节点是否暴露预期 extended resource。</li>
+<li>Pod 请求的资源名是否正确，尤其是 MIG profile。</li>
+<li>taint/toleration、nodeSelector、affinity、topology spread
+是否匹配。</li>
+<li>Pod 是否真的被分配到符合卡型和节点池的节点。</li>
+<li>容器内 <code>nvidia-smi</code>、CUDA、框架是否正常。</li>
+<li>NCCL、RDMA、NVLink、NUMA、存储路径是否符合性能预期。</li>
+<li>队列、配额、gang 条件和维护 taint 是否影响调度。</li>
+</ol>
+<hr />
+<h2 id="19b9-反模式与-checklist">19b.9 反模式与 Checklist</h2>
+<h3 id="反模式">反模式</h3>
+<table>
+<thead>
+<tr>
+<th>反模式</th>
+<th>后果</th>
+<th>修正</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只按 GPU 数调度</td>
+<td>能跑但吞吐不稳定</td>
+<td>把卡型、显存、MIG、NVLink、RDMA 纳入调度信号</td>
+</tr>
+<tr>
+<td>所有 GPU 节点不加 taint</td>
+<td>CPU Pod 占用 GPU 节点资源</td>
+<td>GPU 节点统一 taint，GPU Pod 显式 toleration</td>
+</tr>
+<tr>
+<td>把所有偏好写成 required affinity</td>
+<td>资源紧张时大量 Pending</td>
+<td>required 只放硬约束，preferred 放性能偏好</td>
+</tr>
+<tr>
+<td>手工维护硬件标签且不审计</td>
+<td>标签漂移导致误调度</td>
+<td>NFD/GFD 自动发现 + 定期校验</td>
+</tr>
+<tr>
+<td>所有卡都切 MIG</td>
+<td>大训练和大模型推理无整卡池</td>
+<td>独立规划整卡池、MIG 池和维护窗口</td>
+</tr>
+<tr>
+<td>只看集群总空闲 GPU 数</td>
+<td>忽略完整节点、卡型和拓扑形状</td>
+<td>统计“满足任务 profile 的可用节点组”</td>
+</tr>
+<tr>
+<td>忽略 RDMA/NCCL 诊断</td>
+<td>任务能跑但通信退化到 TCP</td>
+<td>标准化 NCCL env、nccl-tests 和网络指标</td>
+</tr>
+<tr>
+<td>GPU Operator 当成调度器</td>
+<td>节点软件栈正常但策略仍然错误</td>
+<td>单独建设队列、准入和拓扑调度策略</td>
+</tr>
+<tr>
+<td>推理副本全部集中到一个节点</td>
+<td>节点故障影响全部服务</td>
+<td>pod anti-affinity 和 topology spread</td>
+</tr>
+<tr>
+<td>不治理空闲 GPU</td>
+<td>成本失控，队列拥塞</td>
+<td>利用率告警、空闲回收、成本归因</td>
+</tr>
+</tbody>
+</table>
+<h3 id="checklist">Checklist</h3>
+<ul>
+<li>device plugin DaemonSet 是否 Ready？</li>
+<li>节点 <code>capacity/allocatable</code> 是否包含预期 GPU 或 MIG
+resource？</li>
+<li>GPU Operator 管理的 driver、toolkit、device plugin、DCGM
+是否版本一致？</li>
+<li>GPU 节点是否加 taint，GPU Pod 是否有对应 toleration？</li>
+<li>任务是否请求了正确卡型、MIG profile、节点池和 RDMA 标签？</li>
+<li>required affinity 是否只表达硬约束？</li>
+<li>多卡任务是否需要整节点、NVLink domain、同机 8 卡或 gang
+scheduling？</li>
+<li>训练任务是否需要 RDMA rail、rack、zone 等拓扑信号？</li>
+<li>推理副本是否通过 anti-affinity 或 topology spread 分散故障域？</li>
+<li>NCCL 日志是否显示使用预期 NIC、transport 和 GPU 拓扑？</li>
+<li>GPU 利用率、显存、XID、ECC、温度是否纳入告警？</li>
+<li>MIG 池和整卡池比例是否有容量规划和 defrag 机制？</li>
+</ul>
+<hr />
+<h2
+id="19b10-worked-example64-卡-h100-训练为什么-pending-又跑不快">19b.10
+Worked Example：64 卡 H100 训练为什么 Pending 又跑不快</h2>
+<p>团队提交一个 64 卡训练任务，期望 8 个 worker，每个 worker 申请 8 张
+H100：</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="fu">nodeSelector</span><span class="kw">:</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">gpu.nvidia.com/model</span><span class="kw">:</span><span class="at"> H100</span></span></code></pre></div>
+<p>集群看起来还有 80 张 H100 空闲，但任务 Pending。排查发现：</p>
+<ol type="1">
+<li>只有 5 台节点完整空闲 8 张卡，其余节点每台只剩 2 到 4 张。</li>
+<li>作业每个 worker 需要单节点 8 卡，不能把一个 worker 的 8
+张卡拆到多台节点。</li>
+<li>其中 2 台完整节点缺少 <code>ai.local/rdma=true</code>
+标签，平台准入不允许进入分布式训练队列。</li>
+<li>另有 1 台节点带 <code>maintenance=true:NoSchedule</code> taint，Pod
+没有 toleration。</li>
+</ol>
+<p>这说明“集群总空闲 GPU 数”没有意义。调度需要的是“8 个满足
+H100、整节点、RDMA、非维护状态的节点”。</p>
+<p>修复后任务能调度，但吞吐只有预期的 55%。继续排查：</p>
+<ul>
+<li><code>NCCL_DEBUG=INFO</code> 显示部分连接使用 socket，而不是
+IB。</li>
+<li><code>nvidia-smi topo -m</code> 显示某些节点 GPU/NIC 跨 NUMA。</li>
+<li>其中一个机架 MTU 配置和其他机架不一致。</li>
+<li>训练镜像中的 NCCL 版本比基线镜像旧。</li>
+</ul>
+<p>最终处理动作：</p>
+<ol type="1">
+<li>队列准入改为按 topology profile 统计可用完整节点，而不是按 GPU
+总数。</li>
+<li>修正 RDMA 标签来源，标签由自动发现和网络验证共同生成。</li>
+<li>将 H100 训练池设置为整节点调度，减少碎片。</li>
+<li>标准化 NCCL 版本和 <code>NCCL_IB_HCA</code> 配置。</li>
+<li>在作业启动前运行短 nccl-tests，失败则不进入长训练。</li>
+</ol>
+<p>这个例子体现了 19b 的核心：Pending 问题看调度证据，性能问题看
+topology 和通信证据。数量只是第一层。</p>
+<hr />
+<h2 id="本章小结">本章小结</h2>
+<p>GPU 调度的核心不是让 Pod 写上
+<code>nvidia.com/gpu</code>，而是把设备数量、型号、显存、MIG、节点基线、NUMA、NVLink、RDMA、租户权限和运维状态变成可调度、可观测、可解释的信号。Device
+Plugin 解决“看见 GPU”，GPU Operator 解决“节点 GPU
+栈一致”，NFD/标签/污点/亲和/拓扑策略解决“放到正确的位置”。AI
+平台要对用户解释的不是“还有多少张卡”，而是“还有多少组满足任务形状的可用资源”。</p>
+<h2 id="练习题">练习题</h2>
+<ol type="1">
+<li>为什么 <code>nvidia.com/gpu: 8</code> 不能保证 8 张 GPU 在同一个
+NVLink domain？你会补充哪些标签或准入规则？</li>
+<li>一个 Pod Pending，事件显示 node had untolerated taint。请解释
+taint/toleration 的语义，并给出修复思路。</li>
+<li>设计一个包含 H100 整卡训练池、L40S 推理池、A100 MIG 开发池的标签和
+taint 方案。</li>
+<li>一个训练任务容器内 <code>nvidia-smi</code> 正常，但 NCCL 日志显示走
+TCP。请列出排查证据和处理动作。</li>
+<li>MIG 为什么会产生碎片？如果集群同时服务 Notebook
+和大模型推理，你会如何规划整卡池与 MIG 池？</li>
+<li>推理副本应该什么时候用 pod anti-affinity，什么时候用 topology spread
+constraints？请结合故障域说明。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

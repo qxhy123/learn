@@ -1,0 +1,1943 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 6c 章 · 算子库、融合与 SM 资源边界 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=06c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 6c 章 · 算子库、融合与 SM 资源边界</h1>
+<p class="sub">从 cuBLAS/cuDNN/FlashAttention/Triton 到 fusion、occupancy、register pressure 和 spill，判断 kernel 是否真的吃到硬件。</p>
+<div class="chips"><span class="chip">cuBLAS</span><span class="chip">cuDNN</span><span class="chip">FlashAttention</span><span class="chip">Triton</span><span class="chip">Fusion</span><span class="chip">Occupancy</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#学习目标">学习目标</a></li><li><a class="anchor" href="#c.1-为什么高质量算子库是-ai-系统的基础设施">6c.1
+为什么高质量算子库是 AI 系统的基础设施</a></li><li><a class="anchor" href="#c.2-cublas-与-cublasltgemm-是主干不是普通算子">6c.2 cuBLAS 与
+cuBLASLt：GEMM 是主干，不是普通算子</a></li><li><a class="anchor" href="#c.3-cudnn深度学习-primitive-的工程化集合">6c.3 cuDNN：深度学习
+primitive 的工程化集合</a></li><li><a class="anchor" href="#c.4-cutlass当你确实需要接近库内部的模板化-kernel">6c.4
+CUTLASS：当你确实需要接近库内部的模板化 kernel</a></li><li><a class="anchor" href="#c.5-flashattention融合不是把代码粘起来而是改变数据流">6c.5
+FlashAttention：融合不是把代码粘起来，而是改变数据流</a></li><li><a class="anchor" href="#c.6-triton高生产率的-tile-编程不是性能自动挡">6c.6
+Triton：高生产率的 tile 编程，不是性能自动挡</a></li><li><a class="anchor" href="#c.7-算子融合的层次从-epilogue-到算法级融合">6c.7
+算子融合的层次：从 epilogue 到算法级融合</a></li><li><a class="anchor" href="#c.8-smblockwarpkernel-在设备里怎么占资源">6c.8
+SM、block、warp：kernel 在设备里怎么占资源</a></li><li><a class="anchor" href="#c.9-occupancy重要诊断指标但不是-kpi">6c.9
+Occupancy：重要诊断指标，但不是 KPI</a></li><li><a class="anchor" href="#c.10-register-pressure融合变慢的常见根因">6c.10 Register
+pressure：融合变慢的常见根因</a></li><li><a class="anchor" href="#c.11-shared-memory复用数据也会限制驻留">6c.11 Shared
+memory：复用数据，也会限制驻留</a></li><li><a class="anchor" href="#c.12-memory-coalescing带宽不是自动给你的">6c.12 Memory
+coalescing：带宽不是自动给你的</a></li><li><a class="anchor" href="#c.13-为什么-fused-kernel-可能变慢">6c.13 为什么 fused kernel
+可能变慢</a></li><li><a class="anchor" href="#c.14-工程案例一fused-rmsnorm-反而变慢">6c.14 工程案例一：Fused
+RMSNorm 反而变慢</a></li><li><a class="anchor" href="#c.15-工程案例二70b-推理-prefill-快decode-慢">6c.15
+工程案例二：70B 推理 prefill 快，decode 慢</a></li><li><a class="anchor" href="#c.16-工程案例三moe-grouped-gemm-看似快端到端没变快">6c.16
+工程案例三：MoE grouped GEMM 看似快，端到端没变快</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>AI 系统性能优化的第一原则不是”多写
+kernel”，而是知道什么时候应该信任成熟库，什么时候融合真的减少了瓶颈，什么时候一个看起来更聪明的
+fused kernel 反而把 SM 内部资源压垮。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="06-cuda-runtime-and-kernels.html">第6章</a> 的独立拆分篇，重点从
+runtime 和 launch 链路下沉到算子库选择、kernel 融合边界和 SM
+内部资源。GPU 执行模型与 Tensor Core 见 <a
+href="04a-gpu-execution-model-and-tensor-cores.html">第4a章</a>，HBM、arithmetic
+intensity 和 roofline 见 <a
+href="04b-hbm-memory-and-roofline.html">第4b章</a>。本章只轻触 launch
+overhead，不展开 CUDA Graph 和 runtime 调度。</p>
+</blockquote>
+<h2 id="第一性原理拆解-学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆-不可化简的问题">拆 — 不可化简的问题</h3>
+<p>去掉
+cuBLAS、cuDNN、CUTLASS、FlashAttention、Triton、fusion、occupancy
+这些名字，本章真正要解决的问题是：<strong>一个模型 step
+或一次推理请求最终会变成许多 kernel，而每个 kernel 必须在有限的
+SM、warp、register、shared memory、HBM
+带宽和指令调度能力内完成工作；高性能来自把正确的计算形状交给正确的库，并让
+kernel 内部资源不要互相踩踏。</strong></p>
+<p>这句话里有三层约束。</p>
+<p>第一层是<strong>算子形状约束</strong>。Transformer 的主干里有
+GEMM、batched
+GEMM、convolution、attention、normalization、activation、softmax、sampling、embedding
+lookup、optimizer update、quantization / dequantization
+等算子。它们的计算密度、数据复用方式和 shape 规律完全不同。GEMM
+可以高效使用 Tensor Core；LayerNorm、RMSNorm、softmax、embedding、decode
+attention 更容易受 HBM 带宽、访存规整性和小 batch
+影响。一个平台如果把所有算子都当成”GPU
+计算”，就无法解释为什么某些层很快，某些层换新卡也不怎么快。</p>
+<p>第二层是<strong>实现质量约束</strong>。高质量算子库不是简单包了一层
+API，而是在大量
+dtype、layout、tile、pipeline、prefetch、epilogue、workspace、Tensor
+Core
+指令和硬件版本上做了长期调优。cuBLAS/cuBLASLt、cuDNN、CUTLASS、FlashAttention、Triton
+各自服务不同层级：有的给你现成的生产级
+kernel，有的给你可配置模板，有的给你更高生产率的自定义 kernel
+语言。工程上最贵的错误，是在成熟库已经覆盖的主路径上自研低质量
+kernel，然后把时间花在追平别人多年优化上。</p>
+<p>第三层是<strong>SM 资源约束</strong>。一个 kernel 被切成 block，block
+驻留在 SM 上，SM 再调度 warp。每个线程要用 register，每个 block 可能要用
+shared memory，每个 SM 能驻留的 block 和 warp
+有硬上限。为了减少中间写回而融合多个算子，可能会增加每个线程的临时变量、shared
+memory tile、同步点和代码路径。于是 fused kernel 有双重性：它可能减少
+HBM 往返和 launch 数，也可能降低 occupancy、增加 register pressure、触发
+spill、破坏 memory coalescing，最后更慢。</p>
+<p>因此，本章的核心不是背库名，而是建立判断顺序：<strong>先识别算子形状，再选择成熟实现，再用
+profiler 看 kernel
+内部资源，最后才决定是否自定义或加深融合。</strong></p>
+<h3 id="推-从这个问题如何推导出每个机制">推 —
+从这个问题如何推导出每个机制</h3>
+<p>从”算子形状不同”出发，首先推出算子库分工。矩阵乘法是训练和推理里最值钱的密集计算，所以
+cuBLAS 和 cuBLASLt 成为主路径；卷积、batch norm、pooling、RNN、部分
+attention 和 fused deep learning primitive 更适合
+cuDNN；如果要自己拼高性能 GEMM、implicit GEMM convolution 或特定
+epilogue，CUTLASS 提供接近库内部风格的模板化组件；如果要写 Python
+生态里快速迭代的自定义 elementwise、reduction、attention 变体或推理
+kernel，Triton 提供更高层的 tile 编程模型；如果要优化 Transformer
+attention 的内存往返，FlashAttention 这类专门算法库会比手写普通 softmax
+attention 更可靠。</p>
+<p>从”中间结果写回昂贵”出发，推出算子融合。没有融合时，<code>x -&gt; bias -&gt; activation -&gt; dropout -&gt; residual -&gt; norm</code>
+可能被拆成多个 kernel，每一步都读写 HBM。融合后，中间值可以留在 register
+或 shared memory，最后只写一次输出。attention 也类似：普通 attention
+会显式 materialize <code>QK^T</code> 和 softmax 矩阵；FlashAttention
+通过 tile 化和在线 softmax 避免把巨大 attention matrix 写到
+HBM。融合的本质不是魔法，而是减少不必要的字节移动和固定调度成本。</p>
+<p>从”SM 内部资源有限”出发，推出 occupancy、register pressure、shared
+memory 和 spill。occupancy 衡量一个 SM 上有多少活跃 warp
+能帮助隐藏延迟；register pressure 衡量每个线程需要多少寄存器；shared
+memory 用量决定每个 SM 能放几个 block；spill
+表示寄存器不够时临时值被放到 local memory，而 local memory
+通常走显存路径。一个 kernel
+是否快，不由”融合了几个算子”决定，而由这些资源共同决定。</p>
+<p>最后，从”硬件以 warp 为单位执行”推出 memory coalescing 和 warp-level
+设计。相邻线程访问相邻地址，内存事务才能合并；线程分支一致，warp
+才不会分路径串行；tile 对齐 Tensor Core
+形状，矩阵乘加才能命中高吞吐路径。很多性能退化并不是 FLOPs
+多，而是访存不连续、layout 不匹配、tail shape 太碎、mask
+太复杂、寄存器太多或 shared memory bank conflict 太重。</p>
+<h3 id="绘-因果链路">绘 — 因果链路</h3>
+<pre class="mermaid">flowchart TD
+  A[模型张量表达] --> B[算子形状识别]
+  B --> C{主路径是否被成熟库覆盖}
+  C -->|GEMM / batched GEMM| D[cuBLAS / cuBLASLt]
+  C -->|Conv / DL primitive| E[cuDNN]
+  C -->|可模板化高性能 kernel| F[CUTLASS]
+  C -->|Transformer attention| G[FlashAttention]
+  C -->|快速自定义 tile kernel| H[Triton]
+  D --> I[Kernel 实际执行]
+  E --> I
+  F --> I
+  G --> I
+  H --> I
+  I --> J[SM / block / warp]
+  J --> K[Register]
+  J --> L[Shared memory]
+  J --> M[HBM transaction]
+  J --> N[Tensor Core / CUDA core]
+  K --> O{资源是否平衡}
+  L --> O
+  M --> O
+  N --> O
+  O -->|平衡| P[高吞吐]
+  O -->|不平衡| Q[低 occupancy / stall / spill / 非合并访存]
+  Q --> R[融合可能变慢]</pre>
+<pre class="mermaid">mindmap
+  root((Kernel 性能判断))
+    库选择
+      cuBLAS
+      cuBLASLt
+      cuDNN
+      CUTLASS
+      FlashAttention
+      Triton
+    融合层次
+      库内 epilogue
+      手写 fused kernel
+      编译器融合
+      attention 算法融合
+      推理引擎融合
+    SM资源
+      block驻留
+      warp调度
+      occupancy
+      register pressure
+      shared memory
+      spill
+    访存质量
+      coalescing
+      layout
+      alignment
+      bank conflict
+      cache locality
+    工程结论
+      优先成熟库
+      用profiler验证
+      不迷信fusion
+      端到端吞吐说话</pre>
+<h3 id="导-读完本章你应该能回答">导 — 读完本章你应该能回答</h3>
+<ol type="1">
+<li>cuBLAS、cuBLASLt、cuDNN、CUTLASS、FlashAttention 和 Triton
+分别解决什么层级的问题？</li>
+<li>为什么生产训练和推理中，GEMM、attention、normalization、sampling
+不应该用同一种性能直觉分析？</li>
+<li>算子融合减少了哪些成本？它又可能增加哪些 kernel 内部资源压力？</li>
+<li>SM、block、warp、thread 之间是什么关系？block size 为什么会影响
+occupancy？</li>
+<li>register pressure、shared memory 用量和 occupancy
+之间如何互相制约？</li>
+<li>spill 到 local memory 为什么经常让 fused kernel 变慢？</li>
+<li>memory coalescing 为什么会决定一个看似简单的 elementwise 或 gather
+kernel 的性能？</li>
+<li>面对一个慢 kernel，你如何判断应该换库、调 layout、改 shape、拆
+fusion，还是写 Triton / CUTLASS kernel？</li>
+</ol>
+<h2 id="学习目标">学习目标</h2>
+<p>完成本章学习后，你将能够：</p>
+<ol type="1">
+<li>建立”算子形状 -&gt; 库实现 -&gt; SM 资源 -&gt;
+端到端吞吐”的性能分析链路。</li>
+<li>区分 cuBLAS、cuBLASLt、cuDNN、CUTLASS、FlashAttention、Triton
+的工程定位。</li>
+<li>理解融合在 elementwise、GEMM
+epilogue、attention、推理引擎中的不同层次。</li>
+<li>读懂 occupancy、registers per thread、shared memory per block、local
+memory load/store、memory throughput、warp stall 等 profiler 指标。</li>
+<li>解释为什么 fused kernel 可能因为 register pressure、spill、shared
+memory 占用或 coalescing 退化而变慢。</li>
+<li>给训练和推理团队设计一套算子优化排查 Checklist。</li>
+</ol>
+<hr />
+<h2 id="c.1-为什么高质量算子库是-ai-系统的基础设施">6c.1
+为什么高质量算子库是 AI 系统的基础设施</h2>
+<p>AI
+工程里最常见的误区之一，是把算子库看成”底层细节”。实际情况正好相反：算子库决定了模型表达能不能吃到硬件能力。一个
+Transformer block 的数学形式很简洁，但落到 GPU 上，要处理
+dtype、layout、stride、tile、workspace、epilogue、mask、dropout、causal
+attention、GQA/MQA、quantization scale、KV Cache layout、batch shape
+和硬件代际差异。</p>
+<p>高质量算子库通常做了这些事：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>库内部工作</th>
+<th>工程意义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>根据 shape 选择 kernel algorithm</td>
+<td>同一个 GEMM 的 M/N/K 不同，最佳 tile 和 pipeline 不同</td>
+</tr>
+<tr>
+<td>根据 dtype 命中 Tensor Core</td>
+<td>BF16、FP16、TF32、FP8、INT8 路径不同</td>
+</tr>
+<tr>
+<td>管理 layout 和 alignment</td>
+<td>避免 transpose、非连续 stride 和不对齐访存</td>
+</tr>
+<tr>
+<td>使用 shared memory 做 tile 复用</td>
+<td>减少 HBM 读取次数</td>
+</tr>
+<tr>
+<td>使用 register blocking</td>
+<td>提升每个线程的计算复用</td>
+</tr>
+<tr>
+<td>使用 pipelining / prefetch</td>
+<td>让计算和数据搬运在 kernel 内重叠</td>
+</tr>
+<tr>
+<td>提供 fused epilogue</td>
+<td>GEMM 后直接做 bias、activation、scale、residual</td>
+</tr>
+<tr>
+<td>适配硬件代际</td>
+<td>Ampere、Hopper、Blackwell 的指令和最佳参数不同</td>
+</tr>
+</tbody>
+</table>
+<p>这也是为什么”同样是矩阵乘法”，调用成熟库和手写朴素 kernel
+的差距可能是数量级。朴素 kernel 每个输出元素由一个线程计算，不做 tile
+复用、不用 Tensor Core、不管 coalescing；成熟 GEMM kernel
+则把矩阵切成多层 tile，在 global memory、shared memory、register 和
+Tensor Core 指令之间安排数据流。</p>
+<h3 id="c.1.1-库不是越底层越好">6c.1.1 库不是越底层越好</h3>
+<p>选择库时，应该先问：当前问题在哪一层？</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>层级</th>
+<th>你面对的问题</th>
+<th>更合适的工具</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>标准大 GEMM</td>
+<td>线性层、QKV projection、MLP projection</td>
+<td>cuBLAS、cuBLASLt、框架内置 GEMM</td>
+</tr>
+<tr>
+<td>GEMM 后处理复杂</td>
+<td>bias、GELU、scale、amax、residual、quantize</td>
+<td>cuBLASLt epilogue、CUTLASS、Triton</td>
+</tr>
+<tr>
+<td>卷积或传统 CV primitive</td>
+<td>Conv、BN、pooling、RNN</td>
+<td>cuDNN</td>
+</tr>
+<tr>
+<td>Transformer attention</td>
+<td>causal / sliding / paged / varlen attention</td>
+<td>FlashAttention、xFormers、Triton attention kernel、推理引擎内核</td>
+</tr>
+<tr>
+<td>高性能模板开发</td>
+<td>自定义 GEMM-like kernel</td>
+<td>CUTLASS</td>
+</tr>
+<tr>
+<td>快速定制 kernel</td>
+<td>elementwise、reduction、routing、sampling、小型 fused op</td>
+<td>Triton</td>
+</tr>
+<tr>
+<td>端到端推理引擎</td>
+<td>graph rewrite、kernel selection、KV Cache、量化</td>
+<td>TensorRT-LLM、vLLM、SGLang 等</td>
+</tr>
+</tbody>
+</table>
+<p>越底层，控制力越强，但你要自己承担更多正确性和性能细节。生产系统里，优先级通常是：</p>
+<ol type="1">
+<li>先确认框架是否已经调用成熟库。</li>
+<li>再确认 dtype、layout、shape 是否让成熟库选到了好 kernel。</li>
+<li>再尝试库提供的 fused epilogue 或 engine fusion。</li>
+<li>只有当主路径确实未覆盖，才写 CUTLASS / Triton / CUDA kernel。</li>
+</ol>
+<h2 id="c.2-cublas-与-cublasltgemm-是主干不是普通算子">6c.2 cuBLAS 与
+cuBLASLt：GEMM 是主干，不是普通算子</h2>
+<p>大模型训练和推理中，绝大多数 dense FLOPs 来自矩阵乘法。线性层、QKV
+projection、attention output projection、MLP up/gate/down
+projection，本质都是 GEMM 或 batched GEMM。</p>
+<pre class="text"><code>C = A x B + bias
+
+A: [batch_tokens, hidden]
+B: [hidden, out_features]
+C: [batch_tokens, out_features]</code></pre>
+<p>GEMM 的高性能来自三件事：</p>
+<ol type="1">
+<li><strong>高 arithmetic
+intensity</strong>：每个输入元素可以被多个输出复用。</li>
+<li><strong>规整 tile</strong>：矩阵可以切成适合 Tensor Core 的块。</li>
+<li><strong>成熟调度</strong>：库可以根据 shape 选择不同 kernel。</li>
+</ol>
+<h3 id="c.2.1-cublas-解决标准-gemm">6c.2.1 cuBLAS 解决标准 GEMM</h3>
+<p>cuBLAS 是 NVIDIA GPU 上最重要的基础数学库之一。对 AI
+工程师来说，它的核心价值是：你不用自己实现高性能 GEMM，只要把
+dtype、layout、transpose、leading dimension 和 batch
+参数交对，库就能选择高度优化的 kernel。</p>
+<p>常见问题不在 cuBLAS 本身，而在调用条件：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>问题</th>
+<th>后果</th>
+<th>处理方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tensor 非连续</td>
+<td>额外 copy 或低效 stride 访问</td>
+<td>在上游保持 layout，避免频繁 transpose</td>
+</tr>
+<tr>
+<td>M/N/K 太小</td>
+<td>Tensor Core 不容易吃满</td>
+<td>batch 合并、算子融合、调整并发</td>
+</tr>
+<tr>
+<td>dtype 不匹配</td>
+<td>走不到期望 Tensor Core 路径</td>
+<td>明确 BF16/FP16/TF32/FP8 策略</td>
+</tr>
+<tr>
+<td>shape 不对齐</td>
+<td>tile 尾部浪费或 fallback</td>
+<td>padding、bucket、固定 shape</td>
+</tr>
+<tr>
+<td>batch 维度碎片化</td>
+<td>很多小 GEMM</td>
+<td>grouped GEMM、batched GEMM、合并 token</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c.2.2-cublaslt-解决更可调的-gemm">6c.2.2 cuBLASLt 解决更可调的
+GEMM</h3>
+<p>cuBLASLt 可以理解为更灵活的 GEMM 接口。它支持更丰富的 algorithm
+search、layout 描述和 epilogue
+融合，常用于现代训练和推理框架的线性层优化。</p>
+<p>cuBLASLt 常见能力包括：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>能力</th>
+<th>例子</th>
+<th>为什么重要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Algorithm selection</td>
+<td>同一 GEMM 选择不同 tile / splitK / workspace</td>
+<td>shape 变化时避免固定算法退化</td>
+</tr>
+<tr>
+<td>Epilogue fusion</td>
+<td>GEMM + bias + activation</td>
+<td>少一次读写 HBM</td>
+</tr>
+<tr>
+<td>Layout 描述</td>
+<td>row-major / col-major / interleaved</td>
+<td>适配 Tensor Core 友好布局</td>
+</tr>
+<tr>
+<td>低精度路径</td>
+<td>FP8 / INT8 等</td>
+<td>推理和新硬件训练需要</td>
+</tr>
+<tr>
+<td>Heuristic search</td>
+<td>给定 workspace 和 shape 选择候选</td>
+<td>工程上比手调 kernel 稳定</td>
+</tr>
+</tbody>
+</table>
+<p>一个典型例子是 MLP：</p>
+<pre class="text"><code>x
+  -&gt; GEMM up_proj
+  -&gt; GELU / SwiGLU
+  -&gt; GEMM down_proj</code></pre>
+<p>如果第一个 GEMM 后立即写出完整 activation，再读回来做
+GELU，会产生大量 HBM 流量。cuBLASLt 或专门 fused kernel 可以把部分
+epilogue 合进去。但注意，GEMM
+主体通常仍应该交给成熟库，而不是为了融合一点后处理就牺牲 Tensor Core
+GEMM 的质量。</p>
+<h2 id="c.3-cudnn深度学习-primitive-的工程化集合">6c.3 cuDNN：深度学习
+primitive 的工程化集合</h2>
+<p>cuDNN 最初以 convolution、pooling、normalization 等 deep learning
+primitive 著称。虽然 LLM 让 GEMM 和 attention 成为主角，但 cuDNN
+仍是很多视觉、多模态、语音、推荐和传统网络的核心路径。</p>
+<p>cuDNN 的价值不只是”有卷积”：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>cuDNN 的作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conv2D / Conv3D</td>
+<td>选择 direct、FFT、Winograd、implicit GEMM 等算法</td>
+</tr>
+<tr>
+<td>BatchNorm / Layer-like primitive</td>
+<td>提供稳定、高带宽实现</td>
+</tr>
+<tr>
+<td>RNN / sequence primitive</td>
+<td>管理复杂数据布局和 workspace</td>
+</tr>
+<tr>
+<td>Fused op</td>
+<td>在支持范围内减少中间读写</td>
+</tr>
+<tr>
+<td>Backend graph</td>
+<td>用更结构化方式组合 primitive</td>
+</tr>
+</tbody>
+</table>
+<p>卷积和 GEMM 有相似处：都依赖数据复用和 tile。但卷积多了 kernel
+size、stride、padding、dilation、NCHW/NHWC layout、workspace
+选择等维度。错误的 layout 会让性能直接掉到不可接受。</p>
+<p>工程判断：</p>
+<ul>
+<li>视觉模型优先确认是否使用 cuDNN 推荐 layout，比如 Tensor Core 友好的
+NHWC。</li>
+<li>不要只看单个 conv kernel，很多模型慢在 layout transform
+和小算子夹杂。</li>
+<li>对多模态模型，视觉 encoder 的 kernel 路径和 LLM decoder 的 kernel
+路径要分别 profile。</li>
+</ul>
+<h2 id="c.4-cutlass当你确实需要接近库内部的模板化-kernel">6c.4
+CUTLASS：当你确实需要接近库内部的模板化 kernel</h2>
+<p>CUTLASS 是 CUDA Templates for Linear Algebra
+Subroutines。它更像一个高性能 kernel 组件库，而不是一个简单 runtime
+API。它暴露了 tile shape、warp shape、instruction
+shape、epilogue、threadblock swizzle、pipeline stage
+等概念，让你以模板方式组合 GEMM-like kernel。</p>
+<p>什么时候该考虑 CUTLASS？</p>
+<table>
+<thead>
+<tr>
+<th>适合</th>
+<th>不适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自定义 GEMM epilogue 很复杂</td>
+<td>标准线性层直接替代 cuBLAS</td>
+</tr>
+<tr>
+<td>需要 grouped GEMM / MoE expert GEMM</td>
+<td>简单 elementwise op</td>
+</tr>
+<tr>
+<td>想长期维护 C++/CUDA 生产 kernel</td>
+<td>快速试验一个模型变体</td>
+</tr>
+<tr>
+<td>需要精确控制 tile 和 pipeline</td>
+<td>团队没有 CUDA 性能维护能力</td>
+</tr>
+</tbody>
+</table>
+<p>CUTLASS 的价值在于，它让你站在高性能 GEMM
+的抽象层上修改，而不是从零写 shared memory tile、mma 指令和
+epilogue。代价是模板复杂、编译慢、调参空间大，并且需要理解硬件架构。</p>
+<h3 id="c.4.1-cutlass-的性能问题仍然是资源问题">6c.4.1 CUTLASS
+的性能问题仍然是资源问题</h3>
+<p>即使用 CUTLASS，下面这些约束仍然存在：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>参数</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Threadblock tile</td>
+<td>决定每个 block 的工作量和 shared memory 用量</td>
+</tr>
+<tr>
+<td>Warp tile</td>
+<td>决定 warp 内计算分配</td>
+</tr>
+<tr>
+<td>Instruction tile</td>
+<td>决定 Tensor Core 指令形状</td>
+</tr>
+<tr>
+<td>Pipeline stages</td>
+<td>增加重叠，但也增加 shared memory 和 register</td>
+</tr>
+<tr>
+<td>Epilogue</td>
+<td>融合越多，register pressure 可能越高</td>
+</tr>
+<tr>
+<td>Split-K / grouped scheduling</td>
+<td>改善小 batch 或 MoE，但增加归约和调度复杂度</td>
+</tr>
+</tbody>
+</table>
+<p>工程上经常看到这种情况：为了融合 quantization
+scale、bias、activation、residual 和输出重排，把 epilogue
+做得很重，结果主 GEMM 很快，epilogue 部分寄存器暴涨，occupancy
+降低，甚至 spill。此时不一定要放弃融合，但要重新选择融合边界。</p>
+<h2 id="c.5-flashattention融合不是把代码粘起来而是改变数据流">6c.5
+FlashAttention：融合不是把代码粘起来，而是改变数据流</h2>
+<p>标准 attention 可以写成：</p>
+<pre class="text"><code>S = Q K^T / sqrt(d)
+P = softmax(S + mask)
+O = P V</code></pre>
+<p>朴素实现会显式 materialize <code>S</code> 和
+<code>P</code>。对于长序列，<code>S</code> 和 <code>P</code> 是
+<code>[batch, heads, seq, seq]</code>，会迅速变成巨大的 HBM
+读写和显存占用。</p>
+<p>FlashAttention 的核心不是”少 launch 一两个 kernel”，而是<strong>用
+tile 化和在线 softmax 改变 attention 的内存复杂度</strong>：</p>
+<ol type="1">
+<li>把 Q、K、V 分块读取。</li>
+<li>在 SRAM/shared memory/register 层级内计算局部 score。</li>
+<li>在线维护 softmax 的 max 和 sum，避免保存完整 attention matrix。</li>
+<li>直接累加输出 O。</li>
+<li>只把必要结果写回 HBM。</li>
+</ol>
+<pre class="mermaid">flowchart LR
+  Q[Q tile] --> S[局部 QK^T]
+  K[K tile] --> S
+  S --> M[在线 max/sum]
+  M --> P[局部 softmax]
+  V[V tile] --> O[累加 O tile]
+  P --> O
+  O --> HBM[写回输出]
+  S -.不写回完整矩阵.-> X[避免 HBM materialization]
+  P -.不写回完整矩阵.-> X</pre>
+<h3 id="c.5.1-flashattention-为什么又省显存又快">6c.5.1 FlashAttention
+为什么又省显存又快</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>朴素 attention</th>
+<th>FlashAttention 类实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>中间矩阵</td>
+<td>保存 <code>QK^T</code> 和 softmax</td>
+<td>不保存完整矩阵</td>
+</tr>
+<tr>
+<td>HBM 流量</td>
+<td>多次读写大矩阵</td>
+<td>主要读 Q/K/V，写 O</td>
+</tr>
+<tr>
+<td>长序列显存</td>
+<td><code>O(seq^2)</code> 中间状态</td>
+<td>显著降低</td>
+</tr>
+<tr>
+<td>kernel 数</td>
+<td>多个阶段</td>
+<td>更少、更融合</td>
+</tr>
+<tr>
+<td>难点</td>
+<td>实现简单但流量大</td>
+<td>数值稳定、tile、mask、dropout、varlen 复杂</td>
+</tr>
+</tbody>
+</table>
+<p>但 FlashAttention 也不是所有 attention 场景的万能答案：</p>
+<ul>
+<li>极小序列长度下，复杂 kernel 的固定开销可能不划算。</li>
+<li>非标准 mask、稀疏 pattern、paged KV、sliding window、prefix sharing
+可能需要专门变体。</li>
+<li>decode 阶段 batch 很小、每步只生成一个 token，瓶颈可能更偏 KV Cache
+读取和调度，而不是 prefill attention 的 <code>seq^2</code> 矩阵。</li>
+<li>不同 GPU 代际的最佳 kernel 不同，库版本很关键。</li>
+</ul>
+<h2 id="c.6-triton高生产率的-tile-编程不是性能自动挡">6c.6
+Triton：高生产率的 tile 编程，不是性能自动挡</h2>
+<p>Triton 的价值是让工程师用 Python 风格写出 tile-level GPU
+kernel，常用于 PyTorch 生态的自定义算子和编译器后端。它比手写 CUDA
+更容易表达 block program、mask、vectorized load/store、program
+id、stride 和 tile 计算。</p>
+<p>Triton 特别适合：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Elementwise + reduction 融合</td>
+<td>表达简单，减少 HBM 往返</td>
+</tr>
+<tr>
+<td>LayerNorm / RMSNorm 变体</td>
+<td>每行归约，shape 相对稳定</td>
+</tr>
+<tr>
+<td>Sampling / top-k / logits 处理</td>
+<td>推理端常有定制逻辑</td>
+</tr>
+<tr>
+<td>MoE routing / token dispatch</td>
+<td>框架内置库不一定覆盖</td>
+</tr>
+<tr>
+<td>自定义 attention 变体</td>
+<td>快速试验布局和 mask</td>
+</tr>
+<tr>
+<td>Quantization / dequantization</td>
+<td>scale、zero point、packing 逻辑多</td>
+</tr>
+</tbody>
+</table>
+<p>Triton 不适合被理解成”写了就快”。它仍然要面对：</p>
+<ul>
+<li>block size 选择是否合适；</li>
+<li><code>num_warps</code> 和 <code>num_stages</code> 是否导致 register
+/ shared memory 过高；</li>
+<li>mask 是否让很多 lane 空转；</li>
+<li>load/store 是否 coalesced；</li>
+<li>数据 layout 是否导致 stride 访问；</li>
+<li>reduction 是否产生过多同步和临时值；</li>
+<li>auto-tune 是否覆盖真实 shape 分布。</li>
+</ul>
+<h3 id="c.6.1-triton-kernel-的典型调参旋钮">6c.6.1 Triton kernel
+的典型调参旋钮</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>旋钮</th>
+<th>增大后可能收益</th>
+<th>增大后可能代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BLOCK_M / BLOCK_N / BLOCK_K</td>
+<td>提高复用，减少 program 数</td>
+<td>register 和 shared memory 上升，tail 浪费</td>
+</tr>
+<tr>
+<td>num_warps</td>
+<td>更多并行 lane</td>
+<td>调度和寄存器压力上升</td>
+</tr>
+<tr>
+<td>num_stages</td>
+<td>更好地 prefetch / pipeline</td>
+<td>shared memory 和 register 增加</td>
+</tr>
+<tr>
+<td>vectorized load</td>
+<td>更高带宽利用</td>
+<td>要求对齐和连续</td>
+</tr>
+<tr>
+<td>mask 逻辑</td>
+<td>支持 ragged shape</td>
+<td>分支和无效 lane 增加</td>
+</tr>
+<tr>
+<td>fused epilogue</td>
+<td>减少 HBM 往返</td>
+<td>register pressure 上升</td>
+</tr>
+</tbody>
+</table>
+<p>一个实用规则：Triton 的性能优化不应该只对一个 shape
+调参。训练和推理中的真实 shape 往往有分布，例如 prompt 长度、batch token
+数、expert token 数、sequence bucket。只对 benchmark shape
+最优，线上可能退化。</p>
+<h2 id="c.7-算子融合的层次从-epilogue-到算法级融合">6c.7
+算子融合的层次：从 epilogue 到算法级融合</h2>
+<p>“融合”这个词经常被过度泛化。不同层次的融合，收益和风险并不相同。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>融合层次</th>
+<th>例子</th>
+<th>主要收益</th>
+<th>主要风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Elementwise fusion</td>
+<td>bias + GELU + dropout + residual</td>
+<td>减少 launch 和 HBM 往返</td>
+<td>register 增加，mask / RNG 复杂</td>
+</tr>
+<tr>
+<td>Reduction fusion</td>
+<td>RMSNorm + residual</td>
+<td>少读写一次激活</td>
+<td>归约占 shared memory / register</td>
+</tr>
+<tr>
+<td>GEMM epilogue fusion</td>
+<td>GEMM + bias + activation / quantize</td>
+<td>保持 GEMM 主体高效，少写中间结果</td>
+<td>epilogue 太重会拖慢主 kernel</td>
+</tr>
+<tr>
+<td>Attention 算法融合</td>
+<td>FlashAttention</td>
+<td>避免 materialize attention matrix</td>
+<td>实现复杂，shape / mask 覆盖受限</td>
+</tr>
+<tr>
+<td>Block-level fusion</td>
+<td>多个小 op 放进一个 block 内</td>
+<td>中间值留在 shared memory</td>
+<td>shared memory 限制 occupancy</td>
+</tr>
+<tr>
+<td>Persistent kernel</td>
+<td>长时间占住 SM 做调度或 decode</td>
+<td>减少重复加载和调度</td>
+<td>隔离差，调参复杂，可能影响其他 kernel</td>
+</tr>
+<tr>
+<td>编译器图融合</td>
+<td>TorchInductor / XLA</td>
+<td>自动减少小 kernel</td>
+<td>动态 shape、alias、side effect 影响覆盖</td>
+</tr>
+<tr>
+<td>推理引擎融合</td>
+<td>TensorRT-LLM、vLLM 内置 fused op</td>
+<td>端到端路径优化</td>
+<td>引擎版本、模型结构和插件依赖</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c.7.1-融合收益来自哪里">6c.7.1 融合收益来自哪里</h3>
+<p>融合通常减少四类成本：</p>
+<ol type="1">
+<li><strong>HBM 中间写回</strong>：中间 tensor 不落显存，直接在
+register/shared memory 里消费。</li>
+<li><strong>HBM 中间读入</strong>：下一步不用重新从显存读中间
+tensor。</li>
+<li><strong>kernel 固定调度成本</strong>：多个小 kernel 变少。</li>
+<li><strong>cache / locality
+损失</strong>：数据在更近的层级被复用。</li>
+</ol>
+<p>以 <code>RMSNorm + residual</code> 为例：</p>
+<pre class="text"><code>拆开：
+  read x, residual -&gt; add -&gt; write y
+  read y -&gt; compute rms -&gt; write normed
+
+融合：
+  read x, residual
+  add and accumulate sumsq
+  normalize
+  write final output</code></pre>
+<p>如果中间 <code>y</code>
+很大，融合能减少一次写和一次读，收益明显。</p>
+<h3 id="c.7.2-融合成本来自哪里">6c.7.2 融合成本来自哪里</h3>
+<p>融合也会增加成本：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>成本</th>
+<th>解释</th>
+<th>profiler 线索</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Register pressure</td>
+<td>一个线程要同时保存更多中间值</td>
+<td>registers per thread 高</td>
+</tr>
+<tr>
+<td>Shared memory 占用</td>
+<td>多阶段 tile 或 reduction 需要更多 shared memory</td>
+<td>shared memory per block 高</td>
+</tr>
+<tr>
+<td>Occupancy 下降</td>
+<td>每个 block 消耗资源多，SM 上驻留 block 变少</td>
+<td>achieved occupancy 低</td>
+</tr>
+<tr>
+<td>Spill</td>
+<td>register 不够，临时值落到 local memory</td>
+<td>local load/store 高</td>
+</tr>
+<tr>
+<td>指令数增加</td>
+<td>fusion 后每个元素做更多分支和计算</td>
+<td>instruction count 高</td>
+</tr>
+<tr>
+<td>Coalescing 变差</td>
+<td>为兼容多个 layout，访问模式变复杂</td>
+<td>memory transactions 增加</td>
+</tr>
+<tr>
+<td>Divergence 增加</td>
+<td>mask、dropout、tail、ragged batch 分支多</td>
+<td>branch / predication 指标异常</td>
+</tr>
+<tr>
+<td>调参空间变大</td>
+<td>一个 kernel 要覆盖更多 shape</td>
+<td>某些 shape 退化</td>
+</tr>
+</tbody>
+</table>
+<p>所以，融合的正确表述不是”融合一定快”，而是：<strong>当减少的 HBM
+往返和调度成本大于新增的资源压力与指令成本时，融合才快。</strong></p>
+<h2 id="c.8-smblockwarpkernel-在设备里怎么占资源">6c.8
+SM、block、warp：kernel 在设备里怎么占资源</h2>
+<p>GPU 执行模型可以简化为：</p>
+<pre class="text"><code>Grid
+  -&gt; Blocks
+      -&gt; Warps
+          -&gt; Threads</code></pre>
+<p>一个 block 会被完整调度到一个 SM 上，不能拆到多个 SM。block
+内线程可以同步，并共享 shared memory。warp 通常由 32
+个线程组成，是硬件调度的基本执行单位。</p>
+<pre class="mermaid">flowchart TD
+  Grid[Kernel grid] --> B0[Block 0]
+  Grid --> B1[Block 1]
+  Grid --> Bn[Block N]
+  B0 --> SM0[SM 0]
+  B1 --> SM1[SM 1]
+  Bn --> SMk[SM k]
+  SM0 --> W0[Warp 0]
+  SM0 --> W1[Warp 1]
+  SM0 --> Wm[Warp m]
+  W0 --> T[32 threads lockstep]
+  SM0 --> R[Register file]
+  SM0 --> S[Shared memory / L1]
+  SM0 --> TC[Tensor Core / CUDA core]</pre>
+<h3 id="c.8.1-一个-sm-能放多少-block不只看线程数">6c.8.1 一个 SM
+能放多少 block，不只看线程数</h3>
+<p>每个 SM 能驻留多少 block / warp，受多个上限共同限制：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>限制</th>
+<th>例子</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最大 blocks per SM</td>
+<td>硬件上限</td>
+<td>block 太小也不能无限增加</td>
+</tr>
+<tr>
+<td>最大 warps / threads per SM</td>
+<td>硬件上限</td>
+<td>block size 影响活跃 warp</td>
+</tr>
+<tr>
+<td>Register file 容量</td>
+<td>每线程 registers x threads</td>
+<td>register 多会减少驻留 block</td>
+</tr>
+<tr>
+<td>Shared memory 容量</td>
+<td>每 block shared memory</td>
+<td>shared memory 大会减少驻留 block</td>
+</tr>
+<tr>
+<td>Barrier / scheduler 资源</td>
+<td>同步和调度槽位</td>
+<td>复杂 kernel 可能受限</td>
+</tr>
+</tbody>
+</table>
+<p>occupancy 可以粗略理解为：</p>
+<pre class="text"><code>occupancy = active warps on SM / maximum resident warps on SM</code></pre>
+<p>但 occupancy 不是目标函数。高 occupancy 说明有足够 warp
+可以隐藏延迟，却不保证每个 warp 做的是有价值的 Tensor Core 计算；低
+occupancy 也不一定慢，如果 kernel 的数据复用好、每个 warp
+计算密度高、延迟不靠大量 warp 隐藏。</p>
+<h3 id="c.8.2-为什么-block-size-不是越大越好">6c.8.2 为什么 block size
+不是越大越好</h3>
+<p>较大的 block size 可能带来：</p>
+<ul>
+<li>更多线程协作，适合归约或 tile；</li>
+<li>更少 block 数，调度开销降低；</li>
+<li>更大的 shared memory tile，提高复用。</li>
+</ul>
+<p>但也可能导致：</p>
+<ul>
+<li>每个 block 消耗更多 register 和 shared memory；</li>
+<li>SM 上能驻留的 block 更少；</li>
+<li>tail shape 浪费更多线程；</li>
+<li>block 内同步成本变高；</li>
+<li>单个 block 工作过大，负载均衡变差。</li>
+</ul>
+<p>所以 block size 要和数据形状、tile 复用、资源占用一起调。对于小 batch
+decode、MoE expert token 分布不均、ragged sequence，负载均衡往往比单
+block 理论效率更重要。</p>
+<h2 id="c.9-occupancy重要诊断指标但不是-kpi">6c.9
+Occupancy：重要诊断指标，但不是 KPI</h2>
+<p>occupancy 经常被误用。一个团队看到 occupancy 只有 35%，就想把它优化到
+80%。这个目标可能对，也可能完全错误。</p>
+<p>更好的判断方式是：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能解释</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>低 occupancy + high memory stall</td>
+<td>活跃 warp 不够隐藏访存延迟</td>
+<td>降 register/shared memory、增 block、改善 coalescing</td>
+</tr>
+<tr>
+<td>低 occupancy + high Tensor Core utilization</td>
+<td>计算密度高，可能没问题</td>
+<td>看端到端吞吐，不强行提高 occupancy</td>
+</tr>
+<tr>
+<td>高 occupancy + low throughput</td>
+<td>warp 多但都在等内存或分支</td>
+<td>查 stall reason、coalescing、divergence</td>
+</tr>
+<tr>
+<td>高 occupancy + low Tensor Core utilization</td>
+<td>没命中 Tensor Core 或算子不是 GEMM</td>
+<td>查 dtype、shape、layout、kernel 类型</td>
+</tr>
+<tr>
+<td>occupancy 波动大</td>
+<td>shape 分布或 autotune 不稳定</td>
+<td>bucket shape、固定 hot path</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c.9.1-隐藏延迟靠-warp但吞吐靠有效工作">6c.9.1 隐藏延迟靠
+warp，但吞吐靠有效工作</h3>
+<p>SM 通过在多个 warp 之间切换来隐藏延迟。一个 warp 等 HBM
+数据时，scheduler 可以切到另一个 ready warp。如果 ready warp 不够，SM
+就会 stall。</p>
+<p>但如果很多 warp 都在执行低效工作，例如：</p>
+<ul>
+<li>访问不连续地址；</li>
+<li>lane 大量被 mask 掉；</li>
+<li>分支路径发散；</li>
+<li>做标量控制逻辑而不是矩阵乘加；</li>
+<li>等待 shared memory bank conflict；</li>
+</ul>
+<p>那么 occupancy 高也只是”很多 warp 一起低效”。</p>
+<h2 id="c.10-register-pressure融合变慢的常见根因">6c.10 Register
+pressure：融合变慢的常见根因</h2>
+<p>register
+是线程最快的私有存储。每个线程的临时变量、指针、循环变量、accumulator、predicate、中间结果都要占
+register。高性能 GEMM 甚至会故意使用较多 register 来保存多个
+accumulator，提高每次加载后的计算复用。</p>
+<p>register pressure 的问题在于：SM 的 register file
+总量有限。每个线程用得越多，同一个 SM 能驻留的线程 / warp / block
+越少。</p>
+<p>粗略关系是：</p>
+<pre class="text"><code>resident_blocks_by_register
+  = floor(registers_per_SM / (registers_per_thread x threads_per_block))</code></pre>
+<p>如果融合后 <code>registers_per_thread</code> 从 48 增加到
+120，哪怕线程数不变，SM 上可驻留 block
+数可能直接减半。更严重时，编译器无法把所有 live variable 放进
+register，就会 spill。</p>
+<h3 id="c.10.1-spill-到-local-memory-为什么贵">6c.10.1 Spill 到 local
+memory 为什么贵</h3>
+<p>local memory
+这个名字容易误导。它不是”离线程很近的小内存”，而是线程私有地址空间，通常落在
+global memory/HBM 路径上，并经过缓存。访问 local memory 比 register
+慢得多。</p>
+<p>常见 spill 来源：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>来源</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>融合太多阶段</td>
+<td>同时保存 norm、activation、residual、scale、mask 中间值</td>
+</tr>
+<tr>
+<td>accumulator 太多</td>
+<td>每线程负责过大 tile</td>
+</tr>
+<tr>
+<td>unroll 过度</td>
+<td>循环展开后 live variable 激增</td>
+</tr>
+<tr>
+<td>模板参数过大</td>
+<td>CUTLASS/Triton tile 过大</td>
+</tr>
+<tr>
+<td>分支路径复杂</td>
+<td>多个路径的变量生命周期重叠</td>
+</tr>
+<tr>
+<td>调试或边界逻辑</td>
+<td>额外 index、predicate、检查变量</td>
+</tr>
+</tbody>
+</table>
+<p>profiler 中如果看到 local memory load/store 明显，且 registers per
+thread 很高，就要怀疑 spill。解决方向通常不是”继续融合”，而是：</p>
+<ul>
+<li>拆掉一部分 fusion；</li>
+<li>缩小 tile；</li>
+<li>降低 unroll；</li>
+<li>减少 live variable 生命周期；</li>
+<li>把某些中间值改为重新计算而不是保存；</li>
+<li>分离 hot path 和 rare path；</li>
+<li>使用库 epilogue 而不是自定义大而全 kernel；</li>
+<li>对不同 shape 使用不同 specialized kernel。</li>
+</ul>
+<h2 id="c.11-shared-memory复用数据也会限制驻留">6c.11 Shared
+memory：复用数据，也会限制驻留</h2>
+<p>shared memory 是 block 内线程共享的片上存储，延迟远低于 HBM，常用于
+tile 复用、归约、scan、transpose、staging buffer。</p>
+<p>典型用途：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>用途</th>
+<th>例子</th>
+<th>收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GEMM tile staging</td>
+<td>A/B tile 从 HBM 载入 shared memory</td>
+<td>多个线程复用</td>
+</tr>
+<tr>
+<td>Reduction</td>
+<td>LayerNorm / softmax sum</td>
+<td>block 内协作</td>
+</tr>
+<tr>
+<td>Transpose</td>
+<td>改善写出或读入 coalescing</td>
+<td>避免非连续访问</td>
+</tr>
+<tr>
+<td>Attention tile</td>
+<td>Q/K/V tile 临时存放</td>
+<td>减少 HBM 往返</td>
+</tr>
+<tr>
+<td>Pipeline buffer</td>
+<td>double buffering</td>
+<td>搬运与计算重叠</td>
+</tr>
+</tbody>
+</table>
+<p>shared memory 的代价是每个 SM 容量有限。每个 block 使用越多 shared
+memory，同一 SM 能驻留的 block 越少。某些 kernel 为了提高 tile
+复用，增加 shared memory 后，可能从每 SM 4 个 block 降到 1 个
+block；如果这个 kernel 又有长 HBM 延迟，就可能因为没有足够 warp
+隐藏延迟而变慢。</p>
+<h3 id="c.11.1-shared-memory-bank-conflict">6c.11.1 Shared memory bank
+conflict</h3>
+<p>shared memory 也不是随便访问都快。它被分成多个 bank。如果同一个 warp
+内多个线程访问冲突的 bank，访问会被串行化。常见于 transpose、strided
+access、某些 reduction pattern。</p>
+<p>处理方向：</p>
+<ul>
+<li>调整 shared memory layout；</li>
+<li>padding 一列避免固定 stride 冲突；</li>
+<li>使用 warp-level primitive 替代 shared memory；</li>
+<li>让访问模式贴合连续线程访问连续地址；</li>
+<li>参考成熟库的 tile layout，而不是随手二维数组。</li>
+</ul>
+<h2 id="c.12-memory-coalescing带宽不是自动给你的">6c.12 Memory
+coalescing：带宽不是自动给你的</h2>
+<p>HBM 带宽很高，但前提是 warp 内线程访问模式规整。coalescing
+的核心直觉是：<strong>一个 warp
+里的相邻线程最好访问相邻、对齐、连续的地址，这样硬件能把多个访问合成较少的
+memory transaction。</strong></p>
+<h3 id="c.12.1-好访问与坏访问">6c.12.1 好访问与坏访问</h3>
+<pre class="text"><code>好：
+thread 0 -&gt; a[0]
+thread 1 -&gt; a[1]
+thread 2 -&gt; a[2]
+...
+
+坏：
+thread 0 -&gt; a[index[0]]
+thread 1 -&gt; a[index[1]]
+thread 2 -&gt; a[index[2]]
+...
+index 无规律</code></pre>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>访问模式</th>
+<th>常见场景</th>
+<th>性能风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连续读写</td>
+<td>elementwise、contiguous tensor</td>
+<td>高带宽</td>
+</tr>
+<tr>
+<td>固定 stride</td>
+<td>transpose 后 tensor、列访问</td>
+<td>transaction 增多</td>
+</tr>
+<tr>
+<td>gather/scatter</td>
+<td>embedding、MoE dispatch、KV page indirection</td>
+<td>随机访问，cache 命中不稳</td>
+</tr>
+<tr>
+<td>ragged sequence</td>
+<td>varlen attention、packed batch</td>
+<td>mask 和边界判断多</td>
+</tr>
+<tr>
+<td>misaligned vector load</td>
+<td>dtype packing、量化权重</td>
+<td>不能有效向量化</td>
+</tr>
+</tbody>
+</table>
+<p>很多推理 kernel 慢，不是因为计算多，而是因为访问模式不规整。比如
+paged KV Cache 可以降低显存碎片、支持连续 batching，但如果 page/block
+layout 设计不好，decode attention 会在每个 token 上做大量间接访问，HBM
+transaction 和 cache miss 会拖慢 TPOT。</p>
+<h3 id="c.12.2-layout-是性能契约">6c.12.2 Layout 是性能契约</h3>
+<p>layout 不是数据长什么样的附属信息，而是 kernel
+和上游系统之间的性能契约。常见 layout 问题：</p>
+<ul>
+<li>训练时频繁 <code>transpose + contiguous</code>，把时间花在 layout
+变换；</li>
+<li>推理 engine 需要特定 KV Cache
+layout，但模型导出路径给了不匹配格式；</li>
+<li>quantized weight packing 和 kernel 预期不一致；</li>
+<li>MoE expert token 排列不连续，grouped GEMM 前后 dispatch
+开销过高；</li>
+<li>batch 中 sequence length 分布过散，varlen kernel tail
+浪费严重。</li>
+</ul>
+<p>调 layout 的收益经常比改 kernel
+更大，因为它让成熟库重新命中好路径。</p>
+<h2 id="c.13-为什么-fused-kernel-可能变慢">6c.13 为什么 fused kernel
+可能变慢</h2>
+<p>把前面的机制合起来，可以系统解释这个反直觉现象。</p>
+<h3 id="c.13.1-一个-fused-kernel-变慢的因果链">6c.13.1 一个 fused kernel
+变慢的因果链</h3>
+<pre class="mermaid">flowchart TD
+  A[想减少中间 HBM 读写] --> B[把多个 op 合成一个 kernel]
+  B --> C[每线程临时变量增加]
+  B --> D[每 block shared memory 增加]
+  B --> E[mask / branch / index 逻辑增加]
+  C --> F[registers per thread 上升]
+  F --> G[SM 可驻留 warp 下降]
+  F --> H[register spill 到 local memory]
+  D --> G
+  E --> I[warp divergence / 指令数增加]
+  H --> J[额外 HBM local load/store]
+  G --> K[隐藏延迟能力下降]
+  I --> L[有效吞吐下降]
+  J --> L
+  K --> L
+  L --> M[fused kernel 比拆开更慢]</pre>
+<h3 id="c.13.2-典型场景">6c.13.2 典型场景</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>场景</th>
+<th>为什么融合后可能慢</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RMSNorm + residual + quantize + reorder</td>
+<td>norm 归约、scale、写出重排让 register 和 shared memory 都增加</td>
+</tr>
+<tr>
+<td>GEMM + 复杂 epilogue</td>
+<td>主 GEMM 很快，epilogue 变成瓶颈，还可能降低 occupancy</td>
+</tr>
+<tr>
+<td>attention 加很多 mask 变体</td>
+<td>分支和 predicate 增加，warp divergence 上升</td>
+</tr>
+<tr>
+<td>MoE dispatch + compute 融合</td>
+<td>token 分布不均，coalescing 变差，负载不均</td>
+</tr>
+<tr>
+<td>sampling fused kernel</td>
+<td>top-k/top-p、temperature、penalty、mask
+逻辑复杂，寄存器和分支多</td>
+</tr>
+<tr>
+<td>小 shape 大融合</td>
+<td>减少 launch 的收益小于复杂 kernel 成本</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c.13.3-判断-fusion-是否值得的公式">6c.13.3 判断 fusion
+是否值得的公式</h3>
+<p>可以用一个简化收益模型：</p>
+<pre class="text"><code>fusion_gain
+  = saved_hbm_read_write
+  + saved_launch_or_dispatch_cost
+  + improved_locality
+  - extra_register_cost
+  - extra_shared_memory_cost
+  - extra_instruction_cost
+  - spill_cost
+  - coalescing_loss
+  - divergence_loss</code></pre>
+<p>这个公式不是用来精确计算，而是提醒你：融合收益和融合成本都要列出来。只说”减少了一个
+kernel”是不够的。</p>
+<h2 id="c.14-工程案例一fused-rmsnorm-反而变慢">6c.14 工程案例一：Fused
+RMSNorm 反而变慢</h2>
+<p><strong>背景</strong>：训练团队把
+<code>residual add + RMSNorm + quantize</code> 合成一个 Triton
+kernel。单看逻辑，中间 tensor 少写一次，kernel 数也减少了。但上线后 step
+time 增加 8%。</p>
+<p><strong>profile 现象</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">拆开前</th>
+<th style="text-align: right;">融合后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>kernel 数</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>HBM write bytes</td>
+<td style="text-align: right;">较高</td>
+<td style="text-align: right;">较低</td>
+</tr>
+<tr>
+<td>registers per thread</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">112</td>
+</tr>
+<tr>
+<td>achieved occupancy</td>
+<td style="text-align: right;">62%</td>
+<td style="text-align: right;">28%</td>
+</tr>
+<tr>
+<td>local memory load/store</td>
+<td style="text-align: right;">几乎无</td>
+<td style="text-align: right;">明显</td>
+</tr>
+<tr>
+<td>warp stall memory dependency</td>
+<td style="text-align: right;">中等</td>
+<td style="text-align: right;">高</td>
+</tr>
+</tbody>
+</table>
+<p><strong>解释</strong>：</p>
+<p>融合确实减少了中间 HBM 写回，但 <code>RMSNorm</code>
+的归约、quantization scale、clamp、packing、residual 中间值和边界 mask
+让每个线程 live variable 增多。寄存器压力上升后，SM 上可驻留 warp
+下降，部分变量 spill 到 local memory。最终节省的一次中间写回，被 spill
+和低 occupancy 吃掉。</p>
+<p><strong>处理方案</strong>：</p>
+<ol type="1">
+<li>把 quantize 从 norm kernel 中拆出，只保留
+<code>residual + RMSNorm</code>。</li>
+<li>对 hidden size 的热 shape 写专门 kernel，减少泛化分支。</li>
+<li>调小 block size，降低每 program 的寄存器压力。</li>
+<li>检查是否需要保存某些中间值，能否用重算替代。</li>
+<li>如果目标是推理，比较引擎内置 fused RMSNorm / quant
+kernel，不先维护自研路径。</li>
+</ol>
+<p><strong>工程结论</strong>：融合边界不是越大越好。对 memory-bound
+norm，减少 HBM 往返很重要；但一旦 spill 出现，“本来想少访问
+HBM”会变成”通过 local memory 又访问回去了”。</p>
+<h2 id="c.15-工程案例二70b-推理-prefill-快decode-慢">6c.15
+工程案例二：70B 推理 prefill 快，decode 慢</h2>
+<p><strong>背景</strong>：一个 70B 在线推理服务使用 FlashAttention
+后，长 prompt prefill 明显加速，但 decode 阶段 TPOT 改善很小。团队误以为
+FlashAttention 没生效。</p>
+<p><strong>拆解</strong>：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>阶段</th>
+<th>主要工作</th>
+<th>常见瓶颈</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill</td>
+<td>一次处理大量 prompt token，attention 近似大矩阵</td>
+<td>attention 中间矩阵、GEMM、HBM 往返</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>每步生成一个 token，读取历史 KV</td>
+<td>KV Cache 读取、batch 小、调度和 memory bandwidth</td>
+</tr>
+</tbody>
+</table>
+<p>FlashAttention 对 prefill 的收益很自然，因为它避免 materialize 大
+attention matrix，提升 tile 复用。但 decode 每步 query token
+很少，主要是读历史 KV Cache 和做小 batch
+attention。此时要看的不是”有没有 FlashAttention”，而是：</p>
+<ul>
+<li>KV Cache layout 是否连续、对齐；</li>
+<li>paged KV block 大小是否合适；</li>
+<li>batch scheduler 是否把足够 token 合在一起；</li>
+<li>GQA/MQA 是否减少 KV 读取量；</li>
+<li>decode attention kernel 是否针对 small query 优化；</li>
+<li>logits sampling 是否有大量小 kernel 或 CPU 同步；</li>
+<li>tensor parallel 通信是否进入 TPOT 主路径。</li>
+</ul>
+<p><strong>工程结论</strong>：attention 优化要分 prefill 和
+decode。一个库在 prefill 上收益巨大，不代表 decode 自动解决。decode
+端常常更像 memory coalescing、KV layout 和调度问题。</p>
+<h2 id="c.16-工程案例三moe-grouped-gemm-看似快端到端没变快">6c.16
+工程案例三：MoE grouped GEMM 看似快，端到端没变快</h2>
+<p><strong>背景</strong>：MoE 模型把多个 expert 的小 GEMM 合成 grouped
+GEMM。单个 grouped GEMM kernel 时间下降 35%，但端到端 tokens/s 只提升
+5%。</p>
+<p><strong>可能原因</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>退化点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Router</td>
+<td>top-k routing 和 score 计算仍是小 kernel</td>
+</tr>
+<tr>
+<td>Token dispatch</td>
+<td>token 按 expert 重排产生 scatter/gather</td>
+</tr>
+<tr>
+<td>Expert imbalance</td>
+<td>热 expert token 多，冷 expert token 少，负载不均</td>
+</tr>
+<tr>
+<td>Padding</td>
+<td>为了 grouped GEMM 对齐，填充 token 造成无效计算</td>
+</tr>
+<tr>
+<td>Combine</td>
+<td>expert 输出合并回原 token 顺序，访存不连续</td>
+</tr>
+<tr>
+<td>通信</td>
+<td>expert parallel 跨 GPU all-to-all 进入主路径</td>
+</tr>
+</tbody>
+</table>
+<p><strong>处理顺序</strong>：</p>
+<ol type="1">
+<li>先画端到端时间线，确认 grouped GEMM 是否真是主瓶颈。</li>
+<li>统计每个 expert 的 token 分布，观察 imbalance 和 padding
+waste。</li>
+<li>分开测 routing、dispatch、grouped GEMM、combine、通信。</li>
+<li>调整 expert capacity、bucket、token 排列和 grouped GEMM 参数。</li>
+<li>如果跨 GPU，联动第5c章的拓扑和 collective 分析。</li>
+</ol>
+<p><strong>工程结论</strong>：优化一个 kernel 不等于优化一个 layer。MoE
+的瓶颈经常在数据重排和负载均衡，而不是 GEMM 本体。</p>
+<h2 id="c.17-profiler-读数从现象到假设">6c.17 Profiler
+读数：从现象到假设</h2>
+<p>本章重点是 kernel 内部资源，所以更关注 Nsight Compute 这类 kernel
+profiler 指标。Nsight Systems 仍然有价值，但本章不展开 runtime
+时间线。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>你看到的现象</th>
+<th>可能假设</th>
+<th>下一步验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>registers per thread 很高</td>
+<td>register pressure 限制 occupancy</td>
+<td>看 achieved occupancy、spill、本地内存</td>
+</tr>
+<tr>
+<td>local load/store 明显</td>
+<td>发生 spill 或 local array</td>
+<td>查编译报告、减少 live variable</td>
+</tr>
+<tr>
+<td>shared memory per block 高</td>
+<td>每 SM 驻留 block 少</td>
+<td>看 occupancy limit reason</td>
+</tr>
+<tr>
+<td>global load efficiency 低</td>
+<td>coalescing 差或 stride 访问</td>
+<td>查 memory transaction、layout</td>
+</tr>
+<tr>
+<td>HBM bandwidth 接近上限</td>
+<td>memory-bound</td>
+<td>减少字节、改善复用、量化</td>
+</tr>
+<tr>
+<td>Tensor Core utilization 低</td>
+<td>未命中 Tensor Core 或 shape 不合适</td>
+<td>查 dtype、layout、M/N/K、kernel 名</td>
+</tr>
+<tr>
+<td>warp stall memory dependency 高</td>
+<td>等内存</td>
+<td>coalescing、cache、occupancy、prefetch</td>
+</tr>
+<tr>
+<td>warp stall barrier 高</td>
+<td>block 内同步重</td>
+<td>优化 reduction / shared memory</td>
+</tr>
+<tr>
+<td>branch / predication 异常</td>
+<td>divergence 或 mask 多</td>
+<td>分离 hot path、bucket shape</td>
+</tr>
+<tr>
+<td>kernel 时间随 shape 抖动</td>
+<td>autotune 或 tail shape 问题</td>
+<td>shape bucket、专用 kernel</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c.17.1-排查顺序">6c.17.1 排查顺序</h3>
+<p>面对一个慢 kernel，不要直接改代码。先按下面顺序缩小问题：</p>
+<ol type="1">
+<li><strong>确认是不是主瓶颈</strong>：该 kernel 占端到端多少时间？</li>
+<li><strong>确认是不是已有库覆盖</strong>：是否可以换到
+cuBLASLt、cuDNN、FlashAttention、引擎内置 kernel？</li>
+<li><strong>确认 shape 和 dtype</strong>：是否命中 Tensor
+Core，是否有奇怪 tail？</li>
+<li><strong>确认 layout</strong>：是否连续、对齐、符合库预期？</li>
+<li><strong>看资源限制</strong>：register、shared
+memory、occupancy、spill。</li>
+<li><strong>看访存质量</strong>：coalescing、HBM bandwidth、cache
+hit、local memory。</li>
+<li><strong>看控制流</strong>：branch、mask、barrier、divergence。</li>
+<li><strong>决定动作</strong>：换库、调 layout、调 tile、拆 fusion、专用
+hot shape、或重写 kernel。</li>
+</ol>
+<h2 id="c.18-生产系统里的库版本和算法选择">6c.18
+生产系统里的库版本和算法选择</h2>
+<p>算子库性能会随版本变化。CUDA、cuBLASLt、cuDNN、FlashAttention、Triton、PyTorch
+Inductor、TensorRT-LLM、vLLM 的版本组合，可能决定某个模型是否命中理想
+kernel。</p>
+<p>生产环境要把算子库当作可验证依赖：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>管理项</th>
+<th>为什么重要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CUDA driver / runtime 版本</td>
+<td>决定可用指令、兼容性和库行为</td>
+</tr>
+<tr>
+<td>cuBLASLt / cuDNN 版本</td>
+<td>影响 algorithm heuristic 和新 dtype 支持</td>
+</tr>
+<tr>
+<td>FlashAttention 版本</td>
+<td>影响 GPU 代际、mask、varlen、dropout、decode 支持</td>
+</tr>
+<tr>
+<td>Triton 版本</td>
+<td>影响 codegen、autotune、编译缓存</td>
+</tr>
+<tr>
+<td>PyTorch / Inductor 版本</td>
+<td>影响 graph fusion 和 kernel lowering</td>
+</tr>
+<tr>
+<td>推理引擎版本</td>
+<td>影响 KV Cache、quantization、attention backend</td>
+</tr>
+<tr>
+<td>Benchmark baseline</td>
+<td>版本升级必须有可比较数据</td>
+</tr>
+</tbody>
+</table>
+<p>不要只做”能跑”测试。算子库升级至少要有：</p>
+<ul>
+<li>标准 GEMM microbenchmark；</li>
+<li>attention prefill/decode benchmark；</li>
+<li>norm / activation / sampling microbenchmark；</li>
+<li>真实模型 step time 或 tokens/s；</li>
+<li>显存峰值；</li>
+<li>数值一致性和质量回归；</li>
+<li>关键 shape 分桶结果；</li>
+<li>fallback kernel 检查。</li>
+</ul>
+<h2 id="c.19-算子优化-checklist">6c.19 算子优化 Checklist</h2>
+<h3 id="库选择-checklist">库选择 Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />当前瓶颈算子是否属于
+GEMM、attention、norm、conv、sampling、MoE、optimizer
+中的哪一类？</label></li>
+<li><label><input type="checkbox" />是否已经确认框架实际调用的是
+cuBLAS/cuBLASLt/cuDNN/FlashAttention/推理引擎内置 kernel，而不是
+fallback？</label></li>
+<li><label><input type="checkbox" />dtype
+是否符合预期：BF16、FP16、TF32、FP8、INT8
+是否真的命中目标路径？</label></li>
+<li><label><input type="checkbox" />tensor layout、stride、alignment
+是否符合库推荐？</label></li>
+<li><label><input type="checkbox" />shape 是否太小、太碎或 tail
+太多，导致成熟库也跑不满？</label></li>
+<li><label><input type="checkbox" />cuBLASLt / cuDNN heuristic 是否受
+workspace 限制？</label></li>
+<li><label><input type="checkbox" />库版本是否支持当前 GPU
+代际和模型结构？</label></li>
+</ul>
+<h3 id="fusion-checklist">Fusion Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />融合前后分别减少了哪些 HBM
+读写？</label></li>
+<li><label><input type="checkbox" />融合前后 kernel
+数、端到端耗时、显存峰值是否都有测量？</label></li>
+<li><label><input type="checkbox" />registers per thread
+是否明显上升？</label></li>
+<li><label><input type="checkbox" />achieved occupancy
+是否下降？下降是否影响吞吐？</label></li>
+<li><label><input type="checkbox" />是否出现 local memory
+load/store？</label></li>
+<li><label><input type="checkbox" />shared memory per block 是否限制驻留
+block？</label></li>
+<li><label><input type="checkbox" />mask、branch、tail 逻辑是否增加
+divergence？</label></li>
+<li><label><input type="checkbox" />coalescing 是否因为融合多个 layout
+变差？</label></li>
+<li><label><input type="checkbox" />是否只对一个 benchmark shape
+变快，对线上 shape 变慢？</label></li>
+<li><label><input
+type="checkbox" />是否有更小融合边界可以保留主要收益？</label></li>
+</ul>
+<h3 id="sm-资源-checklist">SM 资源 Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />block size、num warps、tile shape
+是否和数据 shape 匹配？</label></li>
+<li><label><input type="checkbox" />occupancy 的限制来自
+register、shared memory、threads 还是 block 上限？</label></li>
+<li><label><input type="checkbox" />低 occupancy 是否真的导致 memory
+stall，而不是计算密度高的正常现象？</label></li>
+<li><label><input type="checkbox" />register pressure 是否来自过多
+accumulator、unroll、复杂 epilogue 或泛化分支？</label></li>
+<li><label><input type="checkbox" />shared memory 是否存在 bank conflict
+或过大 tile？</label></li>
+<li><label><input type="checkbox" />warp stall 的主因是 memory
+dependency、barrier、execution dependency 还是 not
+selected？</label></li>
+<li><label><input type="checkbox" />global load/store 是否
+coalesced、aligned、vectorized？</label></li>
+<li><label><input type="checkbox" />是否有 local memory 访问、非预期
+copy 或 layout transform？</label></li>
+</ul>
+<h3 id="推理-kernel-checklist">推理 Kernel Checklist</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />prefill 和 decode 是否分别
+profile？</label></li>
+<li><label><input type="checkbox" />decode 阶段 KV Cache layout
+是否适合连续读取？</label></li>
+<li><label><input type="checkbox" />paged KV 的 block size
+是否平衡碎片和访问效率？</label></li>
+<li><label><input type="checkbox" />logits processing、sampling、penalty
+是否产生大量小 kernel？</label></li>
+<li><label><input type="checkbox" />quantized weight packing 是否和
+kernel 预期一致？</label></li>
+<li><label><input type="checkbox" />batch scheduler
+是否提供足够大且稳定的 token batch？</label></li>
+<li><label><input type="checkbox" />tensor parallel 通信是否掩盖了
+kernel 优化收益？</label></li>
+</ul>
+<h2 id="c.20-常见误区">6c.20 常见误区</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>误区</th>
+<th>更准确的说法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自己写 kernel 一定比库快</td>
+<td>成熟库覆盖主路径时，自研通常很难赢</td>
+</tr>
+<tr>
+<td>fusion 越多越快</td>
+<td>fusion 会增加 register、shared memory、分支和调参复杂度</td>
+</tr>
+<tr>
+<td>occupancy 越高越好</td>
+<td>occupancy 是诊断指标，最终看有效吞吐</td>
+</tr>
+<tr>
+<td>local memory 是快的本地内存</td>
+<td>local memory 常走 HBM 路径，spill 很贵</td>
+</tr>
+<tr>
+<td>HBM 带宽标称值自动可用</td>
+<td>需要 coalesced、aligned、足够并行的访问</td>
+</tr>
+<tr>
+<td>FlashAttention 能解决所有 attention 慢</td>
+<td>prefill、decode、mask、KV layout 是不同问题</td>
+</tr>
+<tr>
+<td>Triton 写起来短，所以性能也自动好</td>
+<td>Triton 仍要调 tile、warps、stages、layout 和 mask</td>
+</tr>
+<tr>
+<td>GEMM 快，整个模型就快</td>
+<td>norm、attention、sampling、dispatch、通信也可能主导端到端</td>
+</tr>
+</tbody>
+</table>
+<h2 id="c.21-本章小结">6c.21 本章小结</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>概念</th>
+<th>一句话</th>
+<th>工程判断</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>cuBLAS</td>
+<td>标准 GEMM 主路径</td>
+<td>优先保证 dtype、layout、shape 命中好 kernel</td>
+</tr>
+<tr>
+<td>cuBLASLt</td>
+<td>更灵活的 GEMM 和 epilogue</td>
+<td>适合 bias/activation/quant 等后处理融合</td>
+</tr>
+<tr>
+<td>cuDNN</td>
+<td>深度学习 primitive 库</td>
+<td>CV、多模态、卷积路径优先确认 layout 和算法</td>
+</tr>
+<tr>
+<td>CUTLASS</td>
+<td>高性能模板化 kernel 组件</td>
+<td>适合长期维护的 GEMM-like 自定义 kernel</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td>改变 attention 数据流</td>
+<td>prefill 收益常大，decode 还要看 KV layout</td>
+</tr>
+<tr>
+<td>Triton</td>
+<td>高生产率 tile kernel 语言</td>
+<td>适合快速定制，但仍需 profiler 调参</td>
+</tr>
+<tr>
+<td>Fusion</td>
+<td>减少 HBM 往返和小 kernel</td>
+<td>可能增加 register、shared memory、spill 和 divergence</td>
+</tr>
+<tr>
+<td>Occupancy</td>
+<td>活跃 warp 比例</td>
+<td>诊断延迟隐藏能力，不是单独 KPI</td>
+</tr>
+<tr>
+<td>Register pressure</td>
+<td>每线程寄存器需求</td>
+<td>过高会降低驻留，严重时 spill</td>
+</tr>
+<tr>
+<td>Shared memory</td>
+<td>block 内片上复用</td>
+<td>提高复用，也限制每 SM 驻留 block</td>
+</tr>
+<tr>
+<td>Spill</td>
+<td>register 放不下落到 local memory</td>
+<td>常让 fused kernel 反而变慢</td>
+</tr>
+<tr>
+<td>Coalescing</td>
+<td>warp 内合并访存</td>
+<td>layout 和连续访问决定带宽能否用上</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="练习题">练习题</h2>
+<h3 id="基础题">基础题</h3>
+<ol type="1">
+<li>用自己的话解释：为什么高质量算子库是 AI
+基础设施，而不是普通依赖？</li>
+<li>cuBLAS 和 cuBLASLt 的区别是什么？cuBLASLt 的 epilogue fusion
+解决什么问题？</li>
+<li>cuDNN 在 LLM
+时代是否还重要？请从视觉、多模态或卷积模型角度说明。</li>
+<li>CUTLASS 和 Triton 都能写自定义
+kernel，它们的抽象层级和适用场景有什么不同？</li>
+<li>FlashAttention 为什么能减少显存和 HBM 流量？它避免 materialize
+的中间状态是什么？</li>
+<li>什么是 occupancy？为什么 occupancy 高不等于 kernel 一定快？</li>
+<li>register pressure 如何影响每个 SM 上可驻留的 block / warp？</li>
+<li>local memory 为什么不是”很快的本地内存”？</li>
+<li>memory coalescing
+的核心直觉是什么？举一个连续访问和一个非连续访问的例子。</li>
+</ol>
+<h3 id="进阶题">进阶题</h3>
+<ol start="10" type="1">
+<li>某 fused kernel 把 <code>bias + GELU + dropout + residual</code>
+合成一个 kernel，理论 HBM 读写减少，但 <code>ncu</code> 显示 registers
+per thread 从 40 增到 128，local store
+明显。请解释为什么可能变慢，并给出三种修复方向。</li>
+<li>一个 GEMM kernel Tensor Core utilization 很低。请列出至少 5
+个可能原因，覆盖 dtype、shape、layout 和库选择。</li>
+<li>一个 decode attention kernel 的 HBM bandwidth 不高，但 TPOT
+很慢。除了带宽上限，你还会查哪些指标或现象？</li>
+<li>你的 Triton RMSNorm kernel 在 hidden size=4096 时很快，在 hidden
+size=5120 时慢很多。请设计一次 shape 分桶和 autotune 实验。</li>
+<li>MoE grouped GEMM 单 kernel 加速 40%，但端到端只加速
+5%。请画出你会拆分 profile 的阶段，并说明每段可能瓶颈。</li>
+<li>某团队想把所有小算子融合成一个 persistent kernel。请从
+register、shared memory、调度隔离、debug 和 shape
+覆盖角度评估风险。</li>
+</ol>
+<h3 id="开放题">开放题</h3>
+<ol start="16" type="1">
+<li>为一个 70B 推理服务设计 kernel 性能基线。要求分别覆盖
+prefill、decode、RMSNorm、MLP GEMM、logits sampling、KV Cache
+读取和量化路径。</li>
+<li>选择一个你熟悉的 Transformer 子图，写出两个 fusion
+方案：一个保守方案，一个激进方案。分别列出预期收益、资源风险和 profiler
+验证指标。</li>
+<li>你的团队准备升级 CUDA、PyTorch、Triton、FlashAttention
+和推理引擎版本。请设计一套算子库升级验收流程，覆盖性能、显存、正确性和回滚。</li>
+<li>给定一个 profiler 结果：occupancy 25%，Tensor Core utilization
+70%，HBM bandwidth 40%，kernel 占 step time
+3%。你会不会优化它？为什么？</li>
+<li>给定另一个 profiler 结果：occupancy 80%，Tensor Core utilization
+5%，HBM bandwidth 75%，global load efficiency
+很低。请提出排查假设和优化顺序。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>

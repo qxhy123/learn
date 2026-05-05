@@ -6,6 +6,22 @@
 
 ## 16b.1 第一性原理拆解 + 学习大纲
 
+### 概念先说清楚
+
+在深入机制前，先把本章几个词定义清楚，避免把 SGLang 理解成"另一个 vLLM server"：
+
+| 概念 | 一句话定义 | 工程上真正管理的东西 |
+|------|------------|----------------------|
+| SGLang | 面向结构化语言模型程序的 serving runtime | 生成程序、KV Cache、调度计划和 decoder 约束 |
+| Frontend Language | 嵌入 Python 的生成 DSL | `gen`、`select`、`fork`、structured output、tool call 的执行图 |
+| Runtime | 把生成程序变成 GPU 可执行步骤的服务端执行层 | tokenizer、scheduler、KV pool、model executor、streaming |
+| RadixAttention | 用 radix tree 索引 KV Cache 的 prefix 复用机制 | token 序列到 KV 指针的树形映射、引用计数、驱逐 |
+| Cache-aware scheduling | 把 prefix 命中长度纳入调度优先级 | 谁先进 prefill、谁进 decode batch、谁被推迟 |
+| Constrained decoding | 让每一步采样只从合法 token 集合中选 | logits mask、FSM / grammar 状态、jump-forward |
+| Tool / function calling | 让模型输出可执行工具名和参数的结构化生成模式 | tool schema、参数 grammar、工具执行结果回灌 |
+
+**SGLang 的核心边界**也要先说清楚：它不是通用 agent 框架，不负责替你设计工具、记忆、权限和业务流程；它负责把已经明确的生成流程高效执行。LangChain / LlamaIndex 更像客户端编排层，vLLM 更像通用高吞吐模型引擎，TensorRT-LLM 更像编译优化后的 NVIDIA 推理栈；SGLang 夹在应用程序和模型执行器之间，把"程序结构"下推到 serving 层。
+
 ### 拆 — 不可化简的问题
 
 剥掉 vLLM、SGLang、TensorRT-LLM、PagedAttention、RadixAttention 这些名字，本章面对的不可化简问题只有一个：**当 LLM 调用从"单次 generate"演化成"复杂程序"——多轮对话、分支采样、约束生成、tool use、agent loop——之后，怎样把 prefix 复用、KV Cache 调度、结构化解码做成原生设施，而不是在应用层一层一层拼装？**
@@ -150,6 +166,49 @@ flowchart TB
 
 > **note**：SGLang 也提供 OpenAI 兼容的 HTTP server。但 OpenAI API 是无状态的、prompt 是黑盒，SGLang 在这条路径上只能基于 prefix hash + radix tree 做"被动复用"。要拿到 fork / join / structured 的 token 经济性，必须显式写 DSL，或在 client 用 SGLang 提供的 SDK。
 
+### 一次请求在 runtime 里的生命周期
+
+把 SGLang 当成生产系统看，最重要的是知道一次请求在每层留下了什么状态：
+
+```mermaid
+sequenceDiagram
+    participant C as Client / SDK
+    participant F as Frontend DSL
+    participant R as Router
+    participant S as Scheduler
+    participant K as RadixAttention
+    participant D as Decoder
+    participant E as Model Executor
+
+    C->>F: run @sgl.function(args)
+    F->>R: schedule plan + prompt fragments + constraints
+    R->>R: choose replica by prefix summary
+    R->>S: enqueue program node
+    S->>K: match longest prefix
+    K-->>S: matched KV ptr + missing token span
+    S->>E: prefill only missing span
+    E->>K: append KV nodes
+    loop decode step
+      S->>D: current grammar / select state
+      D-->>S: legal token mask or jump-forward token
+      S->>E: forward active batch if needed
+      E-->>S: logits / sampled token
+      S->>K: extend tree path
+      S-->>C: stream token
+    end
+```
+
+| 阶段 | 关键决策 | 常见故障信号 |
+|------|----------|--------------|
+| Frontend plan 构造 | DSL 是否显式表达共享 prefix、fork、约束 | DSL 写法像普通 Python loop，server 端看不到复用机会 |
+| Router 选副本 | 是否把同 prefix 请求送到同一副本 | 多副本整体命中率低，单副本局部命中高 |
+| Scheduler admission | KV pool 是否容得下新请求 | queue wait 高、admission reject、反复 preempt |
+| Radix match | 能否复用已有 KV | prefix hit length 低于预期 |
+| Constrained decode | grammar 是否可编译、mask 是否过窄 | 编译耗时高、输出质量被硬约束拉低 |
+| Streaming | token 是否及时返回客户端 | server 内部 TPOT 正常但端到端延迟高 |
+
+这个生命周期也解释了为什么 SGLang 的性能问题很少能只靠 `nvidia-smi` 定位：同样是 GPU 不满，可能是 router 没有 cache locality，也可能是 grammar 编译卡在 CPU，或者 scheduler 因 KV pool 紧张不敢 admission。
+
 ---
 
 ## 16b.3 RadixAttention 详解：用 radix tree 组织 KV Cache 实现自动 prefix 共享
@@ -190,14 +249,14 @@ flowchart TB
 ```mermaid
 flowchart LR
   subgraph 分裂前
-    A1["A: 'You are helpful. Answer in JSON.'"]
+    A1["A: You are helpful. Answer in JSON."]
   end
   subgraph 分裂后
-    B1["'You are helpful. '"]
-    B1 --> B2["'Answer in JSON.'"]
-    B1 --> B3["'Be concise.'"]
+    B1["You are helpful. "]
+    B1 --> B2["Answer in JSON."]
+    B1 --> B3["Be concise."]
   end
-  分裂前 -.新请求 'You are helpful. Be concise.'.-> 分裂后
+  分裂前 -."新请求 'You are helpful. Be concise.'".-> 分裂后
 ```
 
 ### 引用计数与驱逐
@@ -305,6 +364,42 @@ def agent(s, query, tools):
 | `s += sgl.image(img)` | 多模态 prompt 拼接 | 图像 token 展开 | OpenAI vision 接口 |
 
 > **note**：SGLang 的 DSL 不是"另一种 LangChain"。LangChain 是客户端编排框架，最终还是把 prompt 拼好后发给 LLM；SGLang 把编排下推到了 serving 层，prefix 树和 fork-join 是后端原生概念。这两条路线并不互斥——可以用 LangChain 调用 SGLang server，但要拿到 fork / select 的 token 经济性必须用 SGLang DSL。
+
+### Function calling 的语义拆解
+
+很多人把 tool calling 理解成"模型输出一段 JSON，然后应用层执行"。在 SGLang 视角里，它其实被拆成四个可优化的子问题：
+
+| 子问题 | 普通 OpenAI-compatible 路径 | SGLang native 路径 |
+|--------|----------------------------|--------------------|
+| 选择哪个工具 | 模型自由生成 tool name，再由客户端校验 | `select(choices=tool_names)`，非法工具名不会出现 |
+| 生成参数 | 生成 JSON 字符串，客户端 parse / retry | JSON schema / regex 编译成 grammar，decoder 内部保证合法 |
+| 执行工具 | 客户端拿到响应后再调用工具 | DSL 内部调用 Python 函数或由 server-side runtime 执行 |
+| 回灌 observation | 客户端拼历史 prompt 再发下一次请求 | 同一条 prefix 路径继续延伸，KV 原地复用 |
+
+把这四步拆开后，tool calling 的成本来源也更清楚：
+
+```text
+tool_call_cost =
+  tool schema prefill
++ tool name decode
++ argument decode
++ tool runtime latency
++ observation prefill
++ next-step decode
+```
+
+SGLang 能省的是 schema / 历史对话的重复 prefill、非法 JSON 的重试、以及多轮 HTTP 往返；它不能省工具本身的执行时间。如果工具是慢 SQL、网页检索或外部 SaaS API，端到端延迟仍可能主要卡在工具层，这时要把 tool timeout、幂等重试、结果缓存和权限审计放在同等重要的位置。
+
+#### Tool calling 的反模式
+
+| 反模式 | 表现 | 后果 | 修正 |
+|--------|------|------|------|
+| 把请求 ID / 时间戳写进 system prompt | 每次 prompt 顶部都不同 | RadixAttention 顶部公共前缀失效 | 变量放到 user message 或 metadata |
+| tool schema 每次动态排序 | 同一组工具 token 顺序不同 | prefix hash / radix match 下降 | 固定 schema 序列化顺序 |
+| 参数 schema 过宽 | `args` 几乎等于自由文本 | constrained decoding 收益低 | 用 enum、pattern、required 字段收紧 |
+| 参数 schema 过窄 | 合法业务值没写进 enum | 模型被迫输出错误参数 | 用线上样本回放校验 schema 覆盖率 |
+| 客户端循环调用 SGLang OpenAI API | 每轮重新走网关和队列 | 拿不到 native DSL 的主要收益 | 把 loop 下推成 `@sgl.function` |
+| Observation 不做截断 | 工具返回几万 token | KV pool 被工具结果挤爆 | 对 observation 做摘要、分页或 top-k |
 
 ---
 
@@ -512,6 +607,45 @@ SGLang 的核心调优参数与 vLLM 类似，但语义略有差别。生产上�
 | 结构化输出慢 | jump-forward 是否开 | 确认 constrained decoding 走 grammar 路径 |
 
 > **danger**：与 vLLM 一样，**一次只动一个参数**。SGLang 的参数耦合度比 vLLM 还高（因为 RadixAttention 和 schedule policy 互相影响），同时改两个参数往往让 A/B 失去因果关系。
+
+### 16b.11a 排障手册：从症状反推 SGLang 内部机制
+
+SGLang 的排障要先判断问题发生在哪条链路：prefix 复用、调度 admission、decoder 约束、GPU 执行，还是外部工具。下面这张表适合直接放进 on-call runbook：
+
+| 症状 | 第一怀疑 | 需要看的指标 / 日志 | 快速验证 | 常见修复 |
+|------|----------|---------------------|----------|----------|
+| prefix hit rate 突然下降 | prompt 模板或路由亲和变了 | matched prefix length、router replica choice、prompt hash diff | 抽样比较新旧 prompt token 序列 | 固定模板序列化、开启 prefix-aware routing |
+| TTFT 高但 GPU 不满 | prefill 被长 prompt 或 admission 卡住 | queue wait、prefill tokens、KV free blocks | 分桶看 0-2K / 2-8K / 8K+ prompt | chunked prefill、长上下文单独池 |
+| TPOT / ITL 抖动 | decode batch 过大或频繁抢占 | running requests、decode batch size、preempt count | 降低 `max-running-requests` 做 A/B | 降并发上限、分离高低优请求 |
+| OOM 或 admission reject | KV pool 预算不足 | KV used tokens、eviction rate、max-total-tokens | 临时调低上下文 / 并发是否恢复 | fp8 KV、调小 max tokens、扩 TP / DP |
+| structured output 很慢 | grammar 编译或 mask 过大 | grammar compile time、jump-forward ratio | 对同 schema 复用 compiled grammar | 缓存 grammar、简化 schema |
+| structured output 质量差 | 约束过窄 | forced low-prob token rate、invalid business cases | 关闭 grammar 与 grammar 版对比 | 放宽 enum / regex，增加 fallback |
+| 多副本命中率低 | router 没拿到 tree summary | per-replica prefix hit、summary staleness | 单副本压测与多副本压测对比 | 调整 summary 同步频率和路由策略 |
+| tool agent 端到端慢 | 外部工具而非模型慢 | tool latency、timeout、retry count | 把 tool mock 成常量响应压测 | tool cache、超时预算、并发隔离 |
+| 延迟只在某租户高 | 租户 prompt / schema 异常 | tenant-level input len、cache hit、schema compile | 按 tenant 过滤 trace | 租户配额、模板治理、独占池 |
+
+#### 排查顺序 checklist
+
+1. 先用真实请求 trace 切分 `queue wait / prefill / decode / tool / stream`，不要先猜 GPU kernel。
+2. 看 prefix hit length 的分布，而不是只看平均 hit rate；少数超长 miss 会主导成本。
+3. 单副本复现一次。如果单副本好、多副本差，优先查 prefix-aware router。
+4. 关闭 constrained decoding 做一次对照。如果自由生成快很多，查 grammar 编译、jump-forward ratio 和 schema 复杂度。
+5. 把 tool mock 掉做一次对照。如果 mock 后恢复，模型 serving 不是主因。
+6. 每次只改一个参数，至少跑过相同流量分桶，否则无法判断因果。
+
+#### Benchmark 可信度检查
+
+看到"SGLang 比 vLLM 快 N 倍"时，先问下面这些问题：
+
+| 问题 | 为什么重要 |
+|------|------------|
+| prefix 复用率是多少？ | SGLang 的主收益来自复用；无复用流量不能外推 |
+| 输出长度分布是什么？ | jump-forward 和 speculative 对短输出 / 长输出收益不同 |
+| 是否使用 native DSL？ | OpenAI-compatible 模式只能拿到部分收益 |
+| grammar / schema 是否真实？ | toy JSON schema 会高估 constrained decoding 收益 |
+| 多副本路由是否 prefix-aware？ | 单副本 benchmark 常高估生产多副本收益 |
+| P99 和 goodput 是否同时达标？ | 平均吞吐提高可能牺牲短请求尾延迟 |
+| vLLM 是否开了 prefix cache / chunked prefill？ | 关掉对照组优化会得到无意义结论 |
 
 ---
 

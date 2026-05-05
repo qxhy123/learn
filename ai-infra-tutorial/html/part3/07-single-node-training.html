@@ -12,412 +12,1948 @@
 <nav class="topnav"></nav>
 <section class="hero">
 <h1>第 7 章 · 单机训练系统</h1>
-<p class="sub">从“一台有限机器如何持续、可解释地把数据变成参数更新”出发，建立训练 step、数据供给、显存预算、精度策略、效率指标和可复现实验之间的因果链。</p>
-<div class="chips"><span class="chip">单机训练</span><span class="chip">Step Time</span><span class="chip">显存预算</span><span class="chip">AMP</span><span class="chip">MFU/HFU</span><span class="chip">Profiling</span></div>
-<div class="note"><strong>不可化简的问题：</strong>如何让一台由 CPU、内存、存储、PCIe/NVLink、GPU HBM 和 Tensor Core 组成的有限机器，按可解释、可复现、可度量的方式，把数据转化成一次次参数更新？</div>
-<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）</div>
+<p class="sub">建立训练 step、数据供给、显存预算、精度策略、效率指标和单机可复现 baseline。</p>
+<div class="chips"><span class="chip">Single Node</span><span class="chip">Step Time</span><span class="chip">HBM</span><span class="chip">AMP</span><span class="chip">MFU/HFU</span></div>
 </section>
-
-<section class="toc">
-<h2>本章目录</h2>
-<ol>
-<li><a class="anchor" href="#s1">第一性原理拆解：单机训练最小闭环</a></li>
-<li><a class="anchor" href="#s2">学习目标</a></li>
-<li><a class="anchor" href="#s3">本章导读</a></li>
-<li><a class="anchor" href="#s4">训练 step 与数据供给</a></li>
-<li><a class="anchor" href="#s5">显存预算、AMP 与 batch 策略</a></li>
-<li><a class="anchor" href="#s6">7B Worked Example</a></li>
-<li><a class="anchor" href="#s7">瓶颈、profiling 与效率指标</a></li>
-<li><a class="anchor" href="#s8">单机基线实验与工程建议</a></li>
-<li><a class="anchor" href="#s9">本章小结与练习题</a></li>
-</ol>
-</section>
-
-<section class="section" id="s1">
-<h2>1. 第一性原理拆解：为什么单机训练是训练系统的最小闭环</h2>
-<h3>拆 — 不可化简的问题</h3>
-<p>剥掉 PyTorch、DDP、FSDP、AMP、Nsight 这些名字之后，单机训练要解决的不可化简问题其实只有一个：<strong>如何让一台有限的机器，按可解释、可复现、可度量的方式，把数据转化成一次次参数更新。</strong>这台机器不是一个抽象的“GPU”，而是一组有边界的物理资源：CPU 负责读取、解码、拼 batch 和发起 kernel；主机内存负责缓存数据和承接 pinned memory；PCIe 或 NVLink 路径负责把数据送到设备；GPU HBM 放权重、梯度、优化器状态、activation 和临时 buffer；Tensor Core 负责真正的矩阵计算；本地盘或远端存储还会在 checkpoint、dataset shard、日志写入时插入额外扰动。训练脚本只是把这些资源串起来的调度程序。</p>
-<p>因此，本章不是“单卡怎么跑一个 demo”，而是建立后续所有训练基础设施的测量原点。单机阶段最宝贵的地方在于变量还少：没有跨机网络，没有大规模 collective，没有队列调度造成的拓扑差异，也没有多租户干扰。如果在这个最小闭环里，step time、显存峰值、tokens/s、loss 曲线、checkpoint 耗时都无法解释，那么到了 <a href="../part3/08-data-parallel.html">第 8 章</a> 的数据并行和 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 的模型并行，问题会被复制到更多设备上，排障成本会按卡数和节点数放大。单机基线的价值不是“规模小”，而是它让你第一次能把训练系统当作一条完整因果链来观察：输入有没有连续到达，计算有没有吃满硬件，显存预算是否闭合，指标是否在描述真实进展。</p>
-<p>这个不可化简问题还包含一个容易被忽略的约束：训练不是一次前向计算，而是持续数千、数万甚至数百万个 step 的闭环。一个 step 的延迟高并不可怕，可怕的是你不知道高在哪里；一次 OOM 也不可怕，可怕的是你无法判断它来自参数、梯度、优化器状态、activation、碎片还是临时通信 buffer。平台工程师需要的不是背诵“调大 num_workers”“打开 AMP”“用更大 batch”，而是能把每个动作映射到资源账本和时间账本：它减少了哪一项，增加了哪一项，是否只是把瓶颈从 HBM 挪到了输入链路，或者从计算挪到了 checkpoint 写入。</p>
-<h3>推 — 从这个问题如何推导出每个机制</h3>
-<p>从“数据要持续变成参数更新”出发，第一件必然出现的机制是 step 拆解。因为训练慢不是一个可操作的诊断，必须把它拆成 <code>load</code>、<code>preprocess</code>、<code>h2d</code>、<code>forward</code>、<code>backward</code>、<code>optim</code>、<code>checkpoint</code> 和 <code>logging</code>。拆开之后，dataloader、pinned memory、prefetch、stream overlap 才有意义：它们并不是孤立技巧，而是在缩短或隐藏输入阶段，让 GPU 计算阶段不要等数据。</p>
-<p>第二件必然出现的机制是显存预算。权重只是模型训练账本里的第一行。训练需要梯度来更新参数，需要 AdamW 的 <code>m/v</code> 和可能存在的 FP32 master weight，需要为反向保留 activation，还需要 CUDA allocator、NCCL、framework runtime 的临时空间。于是 micro-batch、sequence length、activation checkpointing、optimizer 选择、mixed precision 都从同一个问题里被推导出来：在有限 HBM 里，哪些张量必须保存，哪些可以重算，哪些可以降精度，哪些必须分片。</p>
-<p>第三件必然出现的机制是精度策略。FP32 稳但贵，BF16/FP16 能让 Tensor Core 更有效，也能降低参数、梯度和 activation 的字节数。AMP 的本质不是“自动加速开关”，而是在数值稳定性、吞吐和显存之间给每类算子选择合适的数据格式。BF16 通常少受 loss scaling 困扰；FP16 更依赖 GradScaler 和溢出检查；某些 reduction、normalization、optimizer update 仍需要更高精度。平台侧要记录的不只是“开了 AMP”，而是具体 dtype、是否保留 master weight、loss scaling 策略、哪些算子被 autocast。</p>
-<p>第四件必然出现的机制是效率指标。GPU utilization 只回答设备是不是忙，不能回答忙在有效模型计算、重算、等待、拷贝还是低效 kernel。MFU 把“理论上一次训练 step 应该完成的模型 FLOPs”除以硬件峰值，用来衡量有效训练进展；HFU 看硬件实际执行了多少 FLOPs，activation checkpointing 这类重算会提高 HFU，却不提高每个 token 的有效训练进展。于是单机基线必须同时记录 tokens/s、step time、显存峰值、MFU/HFU 和 profiling 证据，否则高 utilization 可能只是一个漂亮但误导的表面数字。</p>
-<p>第五件必然出现的机制是基线实验。所有优化都需要对照组，所以必须固定数据切片、随机种子、sequence length、micro-batch、gradient accumulation、precision、checkpoint 频率和 profiler 采样窗口。单变量改变才有诊断价值：调 <code>num_workers</code> 是在验证输入供给，调 micro-batch 是在验证 HBM 与 Tensor Core 饱和度，开 activation checkpointing 是在用算力换显存，改 checkpoint 频率是在验证持久化写入对稳态 step 的干扰。单机训练因此成为后续分布式训练的校准尺，而不是临时过渡阶段。</p>
-<h3>绘 — 因果链路</h3>
-<pre class="mermaid">mindmap
-  root((单机训练最小闭环))
-    不可化简问题
-      数据持续变成参数更新
-      有限CPU内存HBM算力
-      每个step必须可解释
-    时间账本
-      load
-      preprocess
-      H2D
-      forward
-      backward
-      optimizer
-      checkpoint
-      overlap与同步点
-    显存账本
-      params
-      grads
-      optimizer_state
-      activations
-      fragmentation
-      temporary_buffers
-    推导出的机制
-      dataloader_prefetch
-      pinned_memory
-      micro_batch
-      gradient_accumulation
-      mixed_precision_AMP
-      activation_checkpointing
-    效率指标
-      GPU_utilization
-      tokens_per_second
-      MFU
-      HFU
-      step_time_P50_P95
-    工程边界
-      单机基线先固定
-      单变量试验
-      profiler证据
-      再进入数据并行和模型并行</pre>
-<h3>导 — 读完本章你应该能回答</h3>
-<ol>
-<li>拿到一个训练作业时，如何把“训练慢”拆成可测量的 step 时间账本？</li>
-<li>为什么 7B 模型的 BF16 权重约 <code>14 GB</code>，但朴素训练仍然放不进一张 <code>80 GB</code> GPU？</li>
-<li>micro-batch、gradient accumulation 和 effective batch 分别改变显存、吞吐和优化行为中的哪一部分？</li>
-<li>AMP 为什么既可能提升吞吐、降低显存，也可能引入数值稳定性和算子覆盖边界？</li>
-<li>GPU utilization、MFU、HFU 三个指标分别回答什么问题，为什么高 utilization 不能证明训练高效？</li>
-<li>当 step time 抖动时，如何区分数据供给、H2D、kernel、checkpoint 和 logging 的影响？</li>
-<li>一个最低可用的单机基线实验，必须固定和记录哪些变量，才能服务后续多卡扩展分析？</li>
-</ol>
-</section>
-
-<section class="section" id="s2">
-<h2>2. 学习目标</h2>
-<p>完成本章学习后，你应该能够理解单机训练任务的完整时间结构，知道 dataloader、前向、反向、优化器分别处在什么位置；能分析 GPU 利用率低的单机原因，理解显存预算和 batch size 的关系；能区分 GPU utilization、MFU 和 HFU，理解 micro-batch、梯度累积和有效 batch 的区别，并设计一个最低可用的单机基线实验。</p>
-<div class="grid-3">
-<div class="card"><strong>时间账本</strong><br>把 step 拆成输入、搬运、计算、优化、checkpoint 和 logging。</div>
-<div class="card"><strong>显存账本</strong><br>把参数、梯度、优化器状态、activation、碎片和临时 buffer 分开估算。</div>
-<div class="card"><strong>实验账本</strong><br>固定变量、记录指标、单变量变更，给多卡扩展建立对照组。</div>
-</div>
-<div class="success"><strong>学习目标的核心：</strong>不是记住某个经验 batch 或 worker 数，而是让每次训练结果都能回到资源、时间和指标三张账本上解释。</div>
-</section>
-
-<section class="section" id="s3">
-<h2>3. 本章导读</h2>
-<p>很多人会把“单机训练”理解成写训练脚本时的临时调试阶段、上分布式前随便跑一下的过渡步骤，或者只要 loss 在降就算完成。但工程现实恰恰相反。单机训练是你第一次能把整个训练系统当作一台完整机器来看清楚的时候：数据从哪里来，CPU 和 GPU 怎么接力，时间到底花在输入、计算还是同步，显存为什么会在某个 batch 突然爆掉，某次“优化”到底是让吞吐真的变高，还是只是让曲线更好看。</p>
-<pre><code>输入链路是否顺
-  -&gt; 单步时间结构是否清楚
-  -&gt; 显存预算是否可解释
-  -&gt; 指标是否可信
-  -&gt; 基线是否可复现</code></pre>
-<p>如果这些问题在单机阶段就讲不清，到了 <a href="../part3/08-data-parallel.html">第 8 章</a>、<a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 和 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>，问题只会变得更贵、更难定位。</p>
-<div class="warn"><strong>工程边界：</strong>单机训练不是“小规模所以不重要”，而是“变量少所以最适合作为诊断基线”。没有单机基线，多卡结果很难判断是扩展收益还是噪声叠加。</div>
-</section>
-
-<section class="section" id="s4">
-<h2>4. 训练 step 与数据供给</h2>
-<h3>7.1 单机训练是所有复杂系统的最小原型</h3>
-<p>很多团队一开始就急着上多卡、多机、调度平台，但如果单机训练本身都不稳定、不高效，那么问题只会在更大规模下被放大。单机训练至少应该回答：数据是否能稳定供给，GPU 是否被喂饱，step time 是否稳定，loss 是否正常下降，checkpoint 是否能按预期写出。如果这些基础问题都还没解决，分布式只会让排障更难。</p>
-<h3>7.2 一个 step 到底包含哪些阶段</h3>
-<p>单机训练的一个 step 通常可以拆成：</p>
-<pre><code>t_step = t_load + t_preprocess + t_h2d + t_forward + t_backward + t_optim</code></pre>
-<p>实际工程里有时还需要加上 <code>t_checkpoint</code>、<code>t_eval</code> 和 <code>t_logging</code>。这条式子把“训练慢”从一个模糊描述拆成了可测量的几段。</p>
-<p>真实系统里，step 时间不一定是完全串行相加。可以先把它压缩成两大块：</p>
-<pre><code>t_input = t_load + t_preprocess + t_h2d
-t_gpu   = t_forward + t_backward + t_optim
-t_step ≈ max(t_input, t_gpu) + t_unoverlapped</code></pre>
-<pre class="mermaid">gantt
-  title 单机训练 step 时间线：串行与重叠
-  dateFormat X
-  axisFormat %s
-  section 低效串行
-  load/preprocess     :a1, 0, 2
-  H2D                 :a2, after a1, 1
-  forward/backward    :a3, after a2, 4
-  optimizer           :a4, after a3, 1
-  section 健康重叠
-  step k GPU compute  :b1, 0, 4
-  step k+1 input      :b2, 1, 3
-  unavoidable sync    :b3, 4, 1</pre>
-<div class="note"><strong>调优顺序：</strong>如果 <code>t_input</code> 明显大于 <code>t_gpu</code>，优先看数据链路；如果两者已经充分重叠，再继续加 dataloader worker，收益可能很小。</div>
-<h3>7.3 数据供给链路</h3>
-<p>GPU 前面通常有一条更长的供给链：远端数据源 → 本地缓存 → dataloader → CPU 预处理 → H2D 拷贝 → GPU 执行。如果这条链路中的任意一段慢，就会看到 GPU 利用率上下剧烈波动、dataloader worker 长时间繁忙、step time 不稳定、CPU 使用率高但 GPU 没吃满。</p>
-<table>
-<tr><th>旋钮</th><th>在解决什么</th><th>常见副作用</th></tr>
-<tr><td><code>num_workers</code></td><td>让 CPU 解码、切分、拼接更并行</td><td>过多时会带来上下文切换、内存压力和 I/O 抢占</td></tr>
-<tr><td><code>pin_memory</code></td><td>让 H2D 拷贝更顺畅</td><td>会增加主机内存占用</td></tr>
-<tr><td><code>prefetch_factor</code></td><td>让 worker 提前准备更多 batch，减少抖动</td><td>会占用更多 CPU / 内存缓存</td></tr>
-<tr><td><code>persistent_workers</code></td><td>避免每轮 epoch 反复拉起 worker</td><td>长生命周期 worker 更难调试</td></tr>
-<tr><td>本地缓存 / shard 预热</td><td>减少远端存储读取延迟</td><td>增加磁盘占用和缓存管理复杂度</td></tr>
-</table>
-<div class="danger"><strong>常见误区：</strong>dataloader 慢不等于把 <code>num_workers</code> 一路调大。先确认瓶颈在远端读取、CPU 预处理还是 H2D，再选择对应旋钮。</div>
-<pre class="mermaid">flowchart LR
-  A[远端数据源] --> B[本地缓存/Shard]
-  B --> C[Dataloader Workers]
-  C --> D[CPU Decode/Tokenize/Collate]
-  D --> E[Pinned Memory]
-  E --> F[H2D Copy]
-  F --> G[GPU Forward/Backward]
-  C -.prefetch.-> D
-  E -.non_blocking.-> F
-  F -.overlap.-> G</pre>
-</section>
-
-<section class="section" id="s5">
-<h2>5. 显存预算、AMP 与 batch 策略</h2>
-<h3>7.4 显存预算要怎么算</h3>
-<p>一个简单但很实用的显存预算式子是：</p>
-<pre><code>M_total ≈ M_params + M_grads + M_optim + M_activations + M_fragmentation</code></pre>
-<p>为什么同一模型有时能放下、有时 OOM？原因常常不只是参数数量，而是 batch size 改了、序列长度变了、激活多了、mixed precision 关闭了，或者运行时出现内存碎片。</p>
-<pre class="mermaid">flowchart TD
-  A[HBM 总预算] --> B[参数 params]
-  A --> C[梯度 grads]
-  A --> D[优化器状态 optim]
-  A --> E[激活 activations]
-  A --> F[碎片和临时 buffer]
-  E --> G[micro-batch]
-  E --> H[sequence length]
-  E --> I[activation checkpointing]
-  D --> J[AdamW m/v]
-  D --> K[FP32 master weight]
-  F --> L[allocator/runtime/NCCL]</pre>
-<h3>7.4.1 Mixed Precision 对显存和速度的影响</h3>
-<p>AMP 的目标不是简单地“把所有张量变成半精度”，而是把训练 step 里不同数值敏感度的部分分层处理：矩阵乘、卷积、attention projection 这类 Tensor Core 友好的大算子尽量用 BF16 / FP16；loss、部分 reduction、normalization、optimizer update 等更容易受精度影响的路径保留 FP32 或更保守的累积方式。</p>
-<pre><code class="language-python">scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-
-for batch in loader:
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(batch).loss
-
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)</code></pre>
-<table>
-<tr><th>精度策略</th><th>参数/激活字节</th><th>Tensor Core 友好度</th><th>数值稳定性</th><th>工程边界</th></tr>
-<tr><td>FP32</td><td><code>4 bytes</code></td><td>通常较差</td><td>最稳</td><td>显存和吞吐成本高，适合 debug 或少数敏感算子</td></tr>
-<tr><td>FP16 AMP</td><td><code>2 bytes</code></td><td>高</td><td>依赖 loss scaling</td><td>需要监控 overflow、<code>nan</code>、scaler 回退频率</td></tr>
-<tr><td>BF16 AMP</td><td><code>2 bytes</code></td><td>高</td><td>通常更稳</td><td>需要硬件支持，老卡吞吐可能不理想</td></tr>
-<tr><td>FP8 / 低精度训练</td><td><code>1 byte</code> 级</td><td>很高</td><td>策略复杂</td><td>超出本章单机基线范围，通常要配合框架和校准策略</td></tr>
-</table>
-<div class="warn"><strong>AMP 边界：</strong>AMP 不能修复数据供给瓶颈，也不能让过小 micro-batch 自动吃满 GPU；它降低的是张量字节数并提升部分算子的峰值效率。</div>
-<h3>7.4.2 典型模型显存实例</h3>
-<table>
-<tr><th>模型</th><th>参数显存 FP32</th><th>参数显存 BF16 / FP16</th><th>Adam 状态显存</th><th>典型激活显存估算</th><th>工程含义</th></tr>
-<tr><td>LLaMA 7B</td><td>约 28 GB</td><td>约 14 GB</td><td>约 56 GB</td><td>约 6-10 GB</td><td>推理容易单卡，训练时梯度和优化器很快把显存吃满</td></tr>
-<tr><td>LLaMA 13B</td><td>约 52 GB</td><td>约 26 GB</td><td>约 104 GB</td><td>约 12-20 GB</td><td>单卡训练通常需要 AMP、重计算或切分</td></tr>
-<tr><td>LLaMA 70B</td><td>约 280 GB</td><td>约 140 GB</td><td>约 560 GB</td><td>约 60-100 GB</td><td>必然进入多卡并行和状态分片</td></tr>
-</table>
-<div class="note"><strong>参考数量级：</strong>AMP 相对 FP32 常见可节省约 30%-50% 显存；7B 级模型 BF16 参数本体约 14 GB，但 Adam 状态约 <code>8 bytes / param</code>，若保留 FP32 master weight 还要更高。</div>
-<h3>7.4.3 batch size、micro-batch 与梯度累积</h3>
-<p>很多单机训练的问题，表面上是在问“batch 能开多大”，实际上是在混淆三个不同概念：micro-batch 是一次前向 / 反向真正送进设备的 batch；gradient accumulation 是积累多少个 micro-batch 再做一次优化器更新；effective batch 是真正影响优化行为的总 batch。</p>
-<pre><code>B_effective = B_micro x N_accum</code></pre>
-<table>
-<tr><th>调大什么</th><th>更直接影响什么</th><th>常见代价</th></tr>
-<tr><td><code>micro-batch</code></td><td>GPU 利用率、单次前后向吞吐</td><td>激活显存迅速上升，最容易 OOM</td></tr>
-<tr><td><code>gradient accumulation</code></td><td>有效 batch，不必立即增加显存</td><td>每次参数更新更慢，单次 optimizer step 间隔更长</td></tr>
-<tr><td><code>sequence length</code></td><td>单样本上下文能力</td><td>激活和 attention 开销上升非常快</td></tr>
-</table>
-</section>
-
-<section class="section" id="s6">
-<h2>6. Worked Example：LLaMA-7B 单机训练资源规划</h2>
-<p>下面用一个平台侧经常会遇到的配置，把前面的公式真正算一遍。目标不是追求“唯一正确答案”，而是建立一套拿到新模型后就能快速估预算、判可行性、找第一瓶颈的流程。</p>
-<table>
-<tr><th>项目</th><th>假设值</th><th>为什么这样选</th></tr>
-<tr><td>模型规模</td><td><code>7B params</code></td><td>代表常见的 LLaMA-7B 量级</td></tr>
-<tr><td>层数 / hidden size</td><td><code>32 layers</code> / <code>4096 hidden</code></td><td>方便估 activation 数量级</td></tr>
-<tr><td>精度</td><td><code>BF16</code></td><td>H100 上最常见，也比 FP16 更稳</td></tr>
-<tr><td>优化器</td><td><code>AdamW + FP32 master weight</code></td><td>平台默认最常见，也最占显存</td></tr>
-<tr><td>序列长度</td><td><code>4096</code> tokens</td><td>已能看出长上下文对显存和 step time 的压力</td></tr>
-<tr><td>micro-batch</td><td><code>4 seq / GPU</code></td><td>单机吞吐和显存之间的常见折中</td></tr>
-<tr><td>gradient accumulation</td><td><code>4</code></td><td>让有效 batch 不必直接顶满显存</td></tr>
-<tr><td>目标机器</td><td><code>8 x H100-80GB, NVLink</code></td><td>典型单机训练节点</td></tr>
-</table>
-<p>先看和 batch 无关、几乎“跑起来就必须付”的静态显存：</p>
-<table>
-<tr><th>组成</th><th>计算</th><th>结果</th><th>工程解释</th></tr>
-<tr><td>参数</td><td><code>7B x 2 bytes</code></td><td><code>14 GB</code></td><td>BF16 权重本体</td></tr>
-<tr><td>梯度</td><td><code>7B x 2 bytes</code></td><td><code>14 GB</code></td><td>反向后需要保留到优化器更新</td></tr>
-<tr><td>AdamW optimizer state</td><td><code>7B x 12 bytes</code></td><td><code>84 GB</code></td><td><code>FP32 master + m + v</code>，训练和推理差异最大的来源</td></tr>
-<tr><td>静态小计</td><td><code>14 + 14 + 84</code></td><td><code>112 GB</code></td><td>还没算 activation、临时 buffer、碎片</td></tr>
-</table>
-<div class="danger"><strong>关键结论：</strong>“7B 参数”只说明推理权重大约是 <code>14 GB</code>，并不说明训练能放进一张 <code>80 GB</code> 卡。朴素单卡或 DDP 复制思路下，每张卡都要持有静态状态，显存已经不闭合。</div>
-<p>activation 只用 hidden state 下界做一个估算：</p>
-<pre><code>M_act_floor ≈ L x B_micro x S x H x 2 bytes
-32 x 4 x 4096 x 4096 x 2 ≈ 4.3 GB</code></pre>
-<table>
-<tr><th>activation 口径</th><th>估算值</th><th>解释</th></tr>
-<tr><td>hidden-state floor</td><td><code>约 4.3 GB / GPU</code></td><td>只保留最基础的层输入</td></tr>
-<tr><td>不开 activation checkpointing</td><td><code>约 12-18 GB / GPU</code></td><td>通常是 floor 的 <code>3x-4x</code>，实现差异很大</td></tr>
-<tr><td>开 activation checkpointing</td><td><code>约 6-10 GB / GPU</code></td><td>用更多重算换更低显存</td></tr>
-</table>
-<table>
-<tr><th>方案</th><th>每卡显存近似</th><th>是否可行</th><th>第一瓶颈通常是什么</th></tr>
-<tr><td><code>1 x H100-80GB</code>，无状态分片</td><td><code>112 GB + 12-18 GB</code></td><td>不可行</td><td>HBM 容量直接不够</td></tr>
-<tr><td><code>8 x H100</code>，纯 DDP 复制</td><td>每卡仍是 <code>112 GB + 12-18 GB</code></td><td>不可行</td><td>卡数增加了，但每卡仍保留整份状态</td></tr>
-<tr><td><code>2 x H100</code>，ZeRO-1</td><td><code>14 + 14 + 42 + 6-10 = 76-80 GB</code></td><td>很紧</td><td>activation 一抖就 OOM，几乎没有碎片余量</td></tr>
-<tr><td><code>2 x H100</code>，FSDP / ZeRO-3</td><td><code>7 + 7 + 42 + 6-10 = 62-66 GB</code></td><td>可行</td><td>all-gather / reduce-scatter 开始明显进入 step time</td></tr>
-<tr><td><code>8 x H100</code>，ZeRO-2</td><td><code>14 + 1.75 + 10.5 + 6-10 = 32.25-36.25 GB</code></td><td>很稳</td><td>从“能不能放下”转向“通信和数据能不能喂满”</td></tr>
-</table>
-<pre class="mermaid">flowchart TD
-  A[7B 训练预算] --> B{静态状态是否闭合}
-  B -->|单卡/纯DDP 112GB+| C[不可行: HBM 不够]
-  B -->|状态分片| D{activation 是否有余量}
-  D -->|2卡 ZeRO-1 76-80GB| E[很紧: 容易 OOM]
-  D -->|FSDP/ZeRO-3| F[可行但通信进入 step time]
-  D -->|8卡 ZeRO-2| G[显存稳: 查数据和通信吞吐]
-  G --> H[tokens/s + MFU + profiler 证据]</pre>
-<p>在 <code>8 x H100 + ZeRO-2</code> 方案上，按 <code>8 GPUs x 4 seq x 4 accum x 4096</code> 计算，一个 optimizer step 覆盖 <code>524,288 tokens</code>。对 7B decoder-only 模型，常见训练 FLOPs 估算是 <code>6 x params x tokens</code>，约为 <code>22 PFLOPs / optimizer step</code>。</p>
-<table>
-<tr><th>假设的 optimizer step time</th><th>对应吞吐</th><th>近似 MFU</th><th>读数含义</th></tr>
-<tr><td><code>6 s</code></td><td><code>约 87k tokens/s</code></td><td><code>约 46%</code></td><td>单机 <code>8</code> 卡、NVLink 健康区间</td></tr>
-<tr><td><code>8 s</code></td><td><code>约 65k tokens/s</code></td><td><code>约 35%</code></td><td>系统在跑，但 overlap 和输入供给还有明显损失</td></tr>
-<tr><td><code>12 s</code></td><td><code>约 44k tokens/s</code></td><td><code>约 23%</code></td><td>要优先查 dataloader、通信等待、checkpoint 干扰</td></tr>
-</table>
-<table>
-<tr><th>训练步骤</th><th>主要资源动作</th><th>期望观察</th><th>异常时优先检查</th></tr>
-<tr><td>读取 batch</td><td>CPU worker 从 shard 读取并 tokenize / collate</td><td>data time 低于 GPU compute time，P95 不剧烈抖动</td><td>远端存储、本地缓存、<code>num_workers</code>、CPU NUMA</td></tr>
-<tr><td>H2D 搬运</td><td>batch 从 host pinned memory 进入 GPU</td><td>H2D 与上一个 step 的计算部分重叠</td><td><code>pin_memory</code>、non_blocking copy、隐式同步</td></tr>
-<tr><td>前向 / 反向</td><td>BF16 matmul、attention、MLP、梯度计算</td><td>GPU kernel 连续，显存按 micro-batch 上升</td><td>micro-batch 太小、算子碎片、sequence length 过长、梯度 <code>nan</code></td></tr>
-<tr><td>梯度规约</td><td>ZeRO/FSDP reduce-scatter / all-gather</td><td>通信与反向尽量 overlap</td><td>NCCL 等待、bucket 太小、NVLink 拓扑问题</td></tr>
-<tr><td>optimizer / checkpoint</td><td>更新状态并周期性写权重、状态和指标</td><td>周期稳定，固定 step 出现可解释尖峰</td><td>fused optimizer、allocator 碎片、文件系统吞吐、保存频率</td></tr>
-</table>
-</section>
-
-<section class="section" id="s7">
-<h2>7. 瓶颈、profiling 与效率指标</h2>
-<h3>7.5 单机训练最常见的几类瓶颈</h3>
-<table>
-<tr><th>瓶颈类型</th><th>典型症状</th><th>第一动作</th></tr>
-<tr><td>数据加载瓶颈</td><td>GPU 周期性空转，dataloader 时间占比高，调大 worker 后吞吐改善明显</td><td>看 dataloader 时间、CPU 使用率、远端读取和 H2D overlap</td></tr>
-<tr><td>显存瓶颈</td><td>batch 很小，稍微拉长序列就 OOM，激活重计算一开速度变慢但任务能跑</td><td>看显存峰值，区分参数状态、activation、碎片和临时 buffer</td></tr>
-<tr><td>算子执行瓶颈</td><td>GPU 利用率长期高，调大 batch 仍提升有限，profiler 显示少数 kernel 占主导</td><td>查 micro-batch、dtype、算子融合、Tensor Core 命中和单 kernel 详情</td></tr>
-<tr><td>日志 / checkpoint 干扰</td><td>每隔固定时间 step time 抖动，保存 checkpoint 后训练中断明显</td><td>对照保存、eval、logging 周期，评估异步写入和频率</td></tr>
-</table>
-<pre class="mermaid">flowchart TD
-  A[训练变慢] --> B{Step time 稳定吗}
-  B -->|不稳定| C{是否固定周期}
-  C -->|是| D[查 checkpoint/eval/logging]
-  C -->|否| E[查数据 shard/远端存储/CPU 抖动]
-  B -->|稳定偏慢| F{GPU 忙吗}
-  F -->|不忙| G[查 dataloader/H2D/同步点]
-  F -->|很忙| H{MFU 是否低}
-  H -->|低| I[查 kernel 形态/小 batch/重算]
-  H -->|正常| J[记录为基线或查业务口径]</pre>
-<h3>7.6 一个最低限度的单机排障顺序</h3>
-<ol>
-<li>看 step time 是否稳定。</li>
-<li>看 GPU 利用率与显存占用。</li>
-<li>看 dataloader / CPU / I/O。</li>
-<li>看 batch size 和序列长度变化。</li>
-<li>看 checkpoint / eval / logging 是否插入额外停顿。</li>
-</ol>
-<div class="success"><strong>排障顺序：</strong>先判断是不是供给链问题，再判断是不是纯计算问题。这样能避免一上来就钻进单个 kernel，而忽略了 GPU 其实在等数据。</div>
-<table>
-<tr><th>工具</th><th>看什么</th><th>何时用</th><th>常见输出</th></tr>
-<tr><td><code>nvidia-smi</code> / <code>nvidia-smi dmon</code></td><td>利用率、显存、功耗、温度</td><td>先判断是不是明显空转或 OOM 临界</td><td>终端实时数据</td></tr>
-<tr><td><code>torch.profiler</code></td><td>step 内算子、CPU/GPU 时间分布</td><td>从 PyTorch 层拆前向 / 反向 / dataloader</td><td>Chrome trace / TensorBoard</td></tr>
-<tr><td>Nsight Systems (<code>nsys</code>)</td><td>kernel、stream、H2D、同步是否重叠</td><td>怀疑 pipeline 串行、拷贝阻塞、CPU 等待</td><td>系统级时间线</td></tr>
-<tr><td>Nsight Compute (<code>ncu</code>)</td><td>单个慢 kernel 的 occupancy、访存效率</td><td>已定位到个别 kernel 很慢时</td><td>kernel 报告</td></tr>
-<tr><td><code>torch.cuda.memory_summary()</code></td><td>分配峰值、保留量、碎片线索</td><td>OOM、显存涨不回去、怀疑碎片</td><td>文本报告</td></tr>
-</table>
-<h3>7.6b MFU、HFU 和 GPU Utilization 不是一回事</h3>
-<pre><code>MFU = (model FLOPs per step / t_step) / (peak device FLOPS x N_devices)
-HFU = (actual hardware FLOPs per step / t_step) / (peak device FLOPS x N_devices)</code></pre>
-<table>
-<tr><th>指标</th><th>在回答什么问题</th><th>分子口径</th><th>容易被什么误导</th></tr>
-<tr><td>GPU utilization</td><td>GPU 是否长期在忙</td><td>采样窗口内 GPU 是否有活动</td><td>SM 忙于等待、拷贝或低效 kernel 时也可能很高</td></tr>
-<tr><td>tokens/s</td><td>训练进度是否变快</td><td>单位时间处理 token 数</td><td>batch、sequence length、accumulation 口径不一致时不可比</td></tr>
-<tr><td>MFU</td><td>有效模型计算占理论峰值多少</td><td>模型 FLOPs / step time</td><td>不包含激活重计算等“额外 FLOPs”</td></tr>
-<tr><td>HFU</td><td>硬件实际执行 FLOPs 占理论峰值多少</td><td>实际硬件 FLOPs / step time</td><td>开了重计算时可能高于 MFU，但有效进展没同比增加</td></tr>
-</table>
-<table>
-<tr><th>组合读数</th><th>更可能的解释</th><th>下一步动作</th></tr>
-<tr><td>utilization 低，MFU 低，data time 高</td><td>GPU 被输入链路饿住</td><td>查 dataloader、storage、H2D overlap</td></tr>
-<tr><td>utilization 高，MFU 低，HFU 也低</td><td>GPU 忙但 kernel 效率差</td><td>查 micro-batch、算子融合、Tensor Core dtype</td></tr>
-<tr><td>utilization 高，MFU 低，HFU 较高</td><td>额外计算多，常见于重算</td><td>查 activation checkpointing、重复 forward、profiler FLOPs</td></tr>
-<tr><td>MFU 正常但 P95 step 抖动</td><td>稳态计算健康，周期性干扰明显</td><td>查 checkpoint、eval、日志、数据 shard 切换</td></tr>
-<tr><td>tokens/s 高但 loss 更新慢</td><td>gradient accumulation 口径被忽略</td><td>区分 micro-step 和 optimizer step</td></tr>
-</table>
-<div class="warn"><strong>指标边界：</strong>MFU/HFU 都依赖 FLOPs 口径，不能脱离模型结构、精度峰值和 step 定义使用。团队内部应固定口径，跨论文或跨厂商数字只能做数量级参考。</div>
-</section>
-
-<section class="section" id="s8">
-<h2>8. 单机基线实验与工程建议</h2>
-<h3>7.7 为什么单机基线极其重要</h3>
-<p>平台工程里有一个很实用的原则：如果单机 1 卡的性能和稳定性没有基线，任何多卡、多机数据都很难解释。你至少应该知道单机单卡 step time、吞吐、显存占用，以及它们在不同 batch 下的变化趋势。只有这样，当你开始做 <a href="../part3/08-data-parallel.html#s4">第 8 章 §8.4</a> 的扩展效率分析时，才知道哪里是真扩展，哪里只是引入了更多噪声。</p>
-<h3>7.7.1 一个最低可用的单机基线实验</h3>
-<table>
-<tr><th>阶段</th><th>建议动作</th><th>目的</th></tr>
-<tr><td>固定输入</td><td>固定数据切片、随机种子、序列长度、精度和优化器</td><td>避免每次结果不可比</td></tr>
-<tr><td>预热</td><td>先跑一小段 warmup，再开始记正式数据</td><td>去掉首次编译、缓存和 autotune 扰动</td></tr>
-<tr><td>稳态采样</td><td>连续记录一段稳定 step 的 P50 / P95 step time</td><td>避免只看单个幸运 step</td></tr>
-<tr><td>记录关键指标</td><td>samples/s 或 tokens/s、显存峰值、data time 占比、utilization</td><td>给后续优化留对照组</td></tr>
-<tr><td>单变量试验</td><td>每次只改一个变量，如 batch、worker、precision</td><td>避免不知道是哪个改动生效</td></tr>
-</table>
-<p>最小记录表通常至少包含模型名和配置、数据切片版本、micro-batch / sequence length、precision、平均 step time、吞吐、最大显存占用，以及是否开 checkpointing、梯度累积、重计算等备注。</p>
-<pre class="mermaid">flowchart LR
-  A[固定数据切片/种子/配置] --> B[Warmup]
-  B --> C[稳态采样]
-  C --> D[记录 P50/P95 step time]
-  D --> E[记录 tokens/s 与显存峰值]
-  E --> F[单变量试验]
-  F --> G[写入单机基线报告]
-  G --> H[服务第8章扩展效率分析]</pre>
-<h3>7.8 工程建议</h3>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</a></li><li><a class="anchor" href="#3-架构控制路径数据路径状态路径故障路径">3.
+架构：控制路径、数据路径、状态路径、故障路径</a></li><li><a class="anchor" href="#4-原理从-step-time显存和效率指标推导机制">4. 原理：从 step
+time、显存和效率指标推导机制</a></li><li><a class="anchor" href="#5-amp--bf16--fp8-工程取舍">5. AMP / BF16 / FP8 工程取舍</a></li><li><a class="anchor" href="#6-框架实现pytorch-knobs-and-constraints">6. 框架实现：PyTorch
+knobs and constraints</a></li><li><a class="anchor" href="#7-工程化落地配置版本矩阵准入preflight发布观测治理">7.
+工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</a></li><li><a class="anchor" href="#8-容量与效率公式模型和边界">8. 容量与效率：公式、模型和边界</a></li><li><a class="anchor" href="#9-故障排除症状证据根因动作">9.
+故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#10-方案设计--worked-examplellama-7b-on-8xh100">10. 方案设计 /
+Worked Example：LLaMA-7B on 8xH100</a></li><li><a class="anchor" href="#11-反模式">11. 反模式</a></li><li><a class="anchor" href="#12-checklistsingle-node-baseline-acceptance-checklist">12.
+Checklist：single-node baseline acceptance checklist</a></li><li><a class="anchor" href="#13-本章小结">13. 本章小结</a></li><li><a class="anchor" href="#14-练习题">14. 练习题</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p>分布式训练之前，先把单机训练讲清楚。单机不是 demo
+阶段，而是训练系统最小、最便宜、最可解释的生产基线。</p>
+</blockquote>
+<blockquote>
+<p><strong>关联章节</strong>：本章是 <a
+href="08-data-parallel.html">第8章</a> 的数据并行效率基线，也是 <a
+href="09-model-pipeline-parallel.html">第9章</a>
+做模型并行切分前的容量基线，并依赖 <a
+href="../part2/05-memory-interconnect-io.html">第5章</a>
+对主机内存、PCIe/NVLink、存储和 page cache 的解释。</p>
+</blockquote>
+<hr />
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="11-不可化简的问题">1.1 不可化简的问题</h3>
+<p>单机训练要解决的最小问题不是“让 GPU 跑起来”，而是：</p>
+<blockquote>
+<p>如何在一台有限资源的机器上，以可复现、可观测、可解释的方式，把数据流持续转化为参数更新。</p>
+</blockquote>
+<p>这个问题不可再分，因为训练 step 同时消耗五类资源：</p>
 <ul>
-<li>先固定数据集切片、随机种子和 batch，再记录单机基线。</li>
-<li>单机阶段就把 profiler 跑通，不要等到多卡出问题再补。</li>
-<li>显存一旦接近上限，就同时检查参数、激活和优化器，不要只盯模型大小。</li>
-<li>每次改数据管道、精度策略或 checkpoint 频率，都应重测单机基线。</li>
+<li>数据资源：dataset shard、metadata、tokenized
+sample、随机采样顺序。</li>
+<li>主机资源：CPU core、page cache、DRAM、pinned memory、worker
+进程、文件描述符。</li>
+<li>传输资源：PCIe、NVLink、DMA engine、copy stream、NUMA
+locality。</li>
+<li>设备资源：HBM、SM、Tensor Core、L2、kernel launch queue、CUDA
+allocator。</li>
+<li>状态资源：参数、梯度、优化器状态、scheduler、RNG、global
+step、checkpoint。</li>
 </ul>
-<table>
-<tr><th>概念</th><th>常见工具 / 命令</th><th>备注</th></tr>
-<tr><td>启动单机训练</td><td><code>torchrun --nproc_per_node=1 train.py</code></td><td>建立后续多卡对照基线</td></tr>
-<tr><td>显存巡检</td><td><code>nvidia-smi</code>、<code>torch.cuda.memory_summary()</code></td><td>快速定位 OOM 和碎片问题</td></tr>
-<tr><td>Step 分析</td><td><code>torch.profiler</code>、Nsight Systems</td><td>看数据供给和计算是否重叠</td></tr>
-<tr><td>混合精度</td><td><code>torch.cuda.amp.autocast</code>、<code>GradScaler</code></td><td>BF16 更稳，FP16 更依赖 loss scaling</td></tr>
-</table>
-<div class="success"><strong>基线判断：</strong>只有把变量、指标和 profiler 证据留下来，单机基线才不是“我记得上次好像更快”，而是一份之后可以拿来和多卡、多机对照的证据。</div>
-</section>
-
-<section class="section" id="s9">
-<h2>9. 本章小结与练习题</h2>
-<table>
-<tr><th>主题</th><th>关键点</th></tr>
-<tr><td>单机训练价值</td><td>是所有训练系统优化的基线</td></tr>
-<tr><td>step 结构</td><td>数据、搬运、前向、反向、优化器共同决定总时间</td></tr>
-<tr><td>时间线理解</td><td>真实 step 常是输入与计算部分重叠，而不是完全串行</td></tr>
-<tr><td>显存预算</td><td>不只看参数量，还要看梯度、优化器和激活</td></tr>
-<tr><td>Batch 策略</td><td>micro-batch 决定显存压力，梯度累积决定有效 batch</td></tr>
-<tr><td>Profiling</td><td>先看 step 结构，再看系统时间线，最后才钻到单 kernel</td></tr>
-<tr><td>效率指标</td><td>utilization 说明是否忙，MFU / HFU 才更接近“忙得是否有效”</td></tr>
-<tr><td>排障顺序</td><td>先看供给链，再看计算本身</td></tr>
-</table>
-<h3>练习题</h3>
-<ol>
-<li>为什么说多机训练前必须先掌握单机训练基线？</li>
-<li>写出一个训练 step 的时间拆解式，并说明哪一项最容易被忽视。</li>
-<li>如果 GPU 利用率周期性掉到很低，你会优先怀疑什么？</li>
-<li>以 LLaMA 13B 为例，为什么只看参数显存会低估真实训练显存？</li>
-<li>为什么 <code>nvidia-smi</code> 看起来很忙，不代表 MFU 一定高？</li>
+<p>单机训练的工程目标是让这些资源形成稳定闭环：</p>
+<pre class="text"><code>dataset -&gt; CPU pipeline -&gt; H2D -&gt; GPU compute -&gt; optimizer update -&gt; durable state</code></pre>
+<p>如果这个闭环里任何一段不可解释，后续上 DDP、FSDP、TP、PP
+只会把问题复制到更多 rank
+上。单机阶段的价值在于变量少：没有跨节点网络，没有 collective
+退化，没有调度系统造成的拓扑差异，也没有大规模 rank
+failure。它是所有训练系统的测量原点。</p>
+<h3 id="12-从不可化简问题推导机制">1.2 从不可化简问题推导机制</h3>
+<p>从“数据持续转化为参数更新”出发，可以推导出本章所有机制：</p>
+<ol type="1">
+<li>必须拆 training step path，否则“训练慢”无法诊断。</li>
+<li>必须建显存账本，否则 OOM 只能靠猜。</li>
+<li>必须区分 GPU utilization、SM
+occupancy、MFU、HFU、tokens/s，否则会把“硬件忙”误判成“训练有效”。</li>
+<li>必须定义 precision policy，否则 AMP/BF16/FP8
+只是开关，不是工程决策。</li>
+<li>必须建立 profiler chain，否则无法把症状映射到证据。</li>
+<li>必须做单机 baseline acceptance，否则多机扩展没有参照物。</li>
 </ol>
-<div class="note"><strong>自测标准：</strong>如果你能把每道题都回答成“变量、资源项、指标、证据”的组合，而不是只给一个经验建议，就说明本章的单机基线视角已经建立起来。</div>
-</section>
+<h3 id="13-学习大纲">1.3 学习大纲</h3>
+<p>读完本章，你应该能够回答：</p>
+<ul>
+<li>一个完整 training step 从 dataset read 到 checkpoint
+的每一段在哪里排队、在哪里同步、在哪里消耗显存。</li>
+<li>为什么 BF16 的 LLaMA-7B 参数只有约 <code>13.0 GiB</code>，但 AdamW
+训练账本远大于参数本身。</li>
+<li>microbatch、gradient accumulation、global batch、sequence length
+分别影响 HBM、吞吐和优化行为的哪一项。</li>
+<li>为什么 GPU utilization 高不代表 MFU 高，为什么 activation
+checkpointing 可能提高 HFU 但降低 tokens/s。</li>
+<li>AMP、BF16、FP8 的工程边界是什么，哪些算子和状态不能盲目降精度。</li>
+<li>如何用 <code>torch.profiler</code>、Nsight Systems、Nsight
+Compute、DCGM、<code>iostat</code>、<code>perf</code> 串起证据链。</li>
+<li>如何为 LLaMA-7B on 8xH100 设计单机
+baseline，计算显存、吞吐、MFU/HFU，并定位瓶颈。</li>
+</ul>
+<hr />
+<h2 id="2-概念边界是什么不是什么相邻概念边界">2.
+概念边界：是什么、不是什么、相邻概念边界</h2>
+<h3 id="21-是什么">2.1 是什么</h3>
+<p>单机训练系统是一个训练作业在单台服务器内的完整执行系统。它包括：</p>
+<ul>
+<li>训练控制面：launcher、配置、随机种子、resume 逻辑、checkpoint
+policy、日志策略。</li>
+<li>数据路径：dataset read、page cache、本地缓存、CPU
+preprocessing、DataLoader worker、collate、pinned memory、H2D。</li>
+<li>计算路径：forward、loss、backward、gradient accumulation、optimizer
+step、AMP/GradScaler、scheduler。</li>
+<li>状态路径：model weights、gradients、optimizer state、RNG、global
+step、dataset cursor、checkpoint metadata。</li>
+<li>故障路径：OOM、NaN、DataLoader hang、I/O stall、H2D stall、kernel
+inefficiency、checkpoint stall。</li>
+</ul>
+<p>本章讨论的“单机”可以是：</p>
+<ul>
+<li>单 GPU 训练。</li>
+<li>单节点多 GPU 训练，但重点仍是节点内资源路径，不展开跨节点通信。</li>
+<li>单节点 DDP/FSDP 的 baseline，但 collective 细节留给第8章。</li>
+</ul>
+<h3 id="22-不是什么">2.2 不是什么</h3>
+<p>单机训练不是：</p>
+<ul>
+<li>只跑一个 notebook 或 demo batch。</li>
+<li>只看 loss 是否下降。</li>
+<li>只调
+<code>num_workers</code>、<code>batch_size</code>、<code>fp16=True</code>
+三个旋钮。</li>
+<li>只用 <code>nvidia-smi</code> 看 GPU utilization。</li>
+<li>只靠经验判断 OOM 来自哪里。</li>
+<li>只在失败后保存一次 checkpoint。</li>
+</ul>
+<p>生产级单机训练基线必须给出可复现配置、时间账本、显存账本、精度策略、profile
+证据和 acceptance checklist。</p>
+<h3 id="23-相邻概念边界">2.3 相邻概念边界</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>单机训练中的含义</th>
+<th>相邻概念边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Microbatch</td>
+<td>单次 forward/backward 放入一张 GPU 或一个 rank 的 batch</td>
+<td>不等于 global batch；global batch 还乘以 gradient accumulation 和
+data parallel size</td>
+</tr>
+<tr>
+<td>Gradient accumulation</td>
+<td>多个 microbatch 累计梯度后再 optimizer step</td>
+<td>增加优化步间样本数，不自动提升单 step kernel 效率</td>
+</tr>
+<tr>
+<td>GPU utilization</td>
+<td>GPU 在采样窗口内是否忙</td>
+<td>不说明忙的是 compute、copy、kernel launch 还是低效小 kernel</td>
+</tr>
+<tr>
+<td>SM occupancy</td>
+<td>SM 上 active warp / 理论上限</td>
+<td>高 occupancy 不保证 Tensor Core 使用率高</td>
+</tr>
+<tr>
+<td>MFU</td>
+<td>有效模型 FLOPs / 硬件峰值 FLOPs</td>
+<td>排除重算、低效 kernel 等无效工作，更接近训练效率</td>
+</tr>
+<tr>
+<td>HFU</td>
+<td>硬件实际执行 FLOPs / 硬件峰值 FLOPs</td>
+<td>activation checkpointing 会增加重算 FLOPs，HFU 可能高于 MFU</td>
+</tr>
+<tr>
+<td>AMP</td>
+<td>框架按算子选择 dtype 的机制</td>
+<td>不等于所有张量都变成 FP16/BF16</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>8-bit exponent、7-bit mantissa 的 16-bit 浮点</td>
+<td>比 FP16 更稳，精度尾数更少；仍需注意 reduction 和 optimizer</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>E4M3/E5M2 等 8-bit 浮点训练路径</td>
+<td>依赖硬件、Transformer Engine、scaling metadata 和框架覆盖</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>可恢复训练状态协议</td>
+<td>不只是保存 <code>model.state_dict()</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-架构控制路径数据路径状态路径故障路径">3.
+架构：控制路径、数据路径、状态路径、故障路径</h2>
+<h3 id="31-责任边界">3.1 责任边界</h3>
+<p>单机训练系统可以按责任拆成四条路径：</p>
+<ul>
+<li>控制路径：谁启动训练、谁决定
+precision、batch、checkpoint、resume、profile 窗口。</li>
+<li>数据路径：样本如何从存储进入 HBM。</li>
+<li>状态路径：参数、梯度、优化器、RNG、dataset cursor
+如何更新和持久化。</li>
+<li>故障路径：异常如何被发现、定位、止损、恢复。</li>
+</ul>
+<p>这四条路径必须分开看。很多“GPU
+低利用率”实际是数据路径问题；很多“checkpoint
+慢”实际是状态路径和存储路径问题；很多“NaN”实际是 precision policy 和
+optimizer 状态问题。</p>
+<h3 id="32-完整-training-step-timeline">3.2 完整 training step
+timeline</h3>
+<p>下面的 Mermaid 图是本章最重要的路径图。它故意把 page cache、pinned
+memory、H2D、AMP、logging、checkpoint
+放进同一条时间线，因为生产排障时这些阶段会互相遮蔽。</p>
+<pre class="mermaid">sequenceDiagram
+    autonumber
+    participant S as Storage / Dataset Shard
+    participant PC as Linux Page Cache
+    participant W as DataLoader Worker
+    participant H as Host RAM / Pinned Memory
+    participant C as CUDA Copy Stream
+    participant G as GPU Compute Stream
+    participant O as Optimizer / Scheduler
+    participant L as Logger
+    participant CK as Checkpoint Writer
 
-<section class="refbox">
-<h2>参考资料与学习路线</h2>
-<p><strong>学习路线：</strong>先用本章建立单机 step、显存和指标基线；再进入 <a href="../part3/08-data-parallel.html">第 8 章</a> 分析数据并行扩展效率；随后阅读 <a href="../part3/09-model-pipeline-parallel.html">第 9 章</a> 和 <a href="../part3/10-memory-checkpointing-and-recovery.html">第 10 章</a>，把模型并行、状态分片、重计算和 checkpoint 放回同一张资源账本。</p>
-<p><strong>延伸阅读：</strong>建议回看 <a href="../part2/05-memory-interconnect-io.html">第 5 章</a> 的内存、互联与 IO，因为单机训练的 H2D、NVLink、存储抖动和 checkpoint 写入都直接依赖那条数据供给链路。</p>
-<p><strong>实践路线：</strong>先跑一个固定数据切片的单卡基线，记录 step time、tokens/s、显存峰值和 profiler；再分别改变 <code>num_workers</code>、micro-batch、precision、activation checkpointing 和 checkpoint 频率，形成团队内部可复用的基线表。</p>
+    S-&gt;&gt;PC: read sample bytes or mmap pages
+    PC--&gt;&gt;W: cache hit or block on disk/network
+    W-&gt;&gt;W: decode/tokenize/augment/filter
+    W-&gt;&gt;H: collate batch in pageable memory
+    H-&gt;&gt;H: pin memory when pin_memory=True
+    H-&gt;&gt;C: enqueue non_blocking H2D copy
+    C-&gt;&gt;G: device batch ready event
+    G-&gt;&gt;G: AMP autocast forward
+    G-&gt;&gt;G: loss compute and reduction
+    G-&gt;&gt;G: backward, save/recompute activations
+    G-&gt;&gt;O: gradients ready
+    O-&gt;&gt;O: unscale/clip/update AdamW/scheduler
+    O-&gt;&gt;G: zero_grad or set_to_none
+    O-&gt;&gt;L: emit metrics every N steps
+    O-&gt;&gt;CK: save model/optimizer/RNG/dataloader state
+    CK-&gt;&gt;S: write checkpoint shards and metadata</pre>
+<h3 id="33-控制路径">3.3 控制路径</h3>
+<p>控制路径的输入是训练配置，输出是可重复的 step
+序列。生产上至少要固定：</p>
+<ul>
+<li>代码版本：git SHA、container image digest、CUDA/cuDNN/NCCL/PyTorch
+版本。</li>
+<li>模型配置：layers、hidden size、heads、sequence
+length、vocab、normalization、activation。</li>
+<li>数据配置：dataset revision、shard list、shuffle seed、tokenizer
+version、packing policy。</li>
+<li>训练配置：microbatch、gradient accumulation、optimizer、LR
+schedule、precision、grad clip。</li>
+<li>系统配置：CPU affinity、NUMA policy、DataLoader worker、pinned
+memory、prefetch、profile window。</li>
+<li>状态配置：checkpoint interval、retention、resume mode、RNG
+capture、dataset cursor。</li>
+</ul>
+<p>控制路径常见同步点：</p>
+<ul>
+<li><code>loss.item()</code> 会触发 GPU 到 CPU 同步。</li>
+<li>过频繁 logging 会把异步执行变成串行。</li>
+<li><code>torch.cuda.synchronize()</code>
+只应出现在测量边界，不应散落在训练循环里。</li>
+<li>checkpoint 写入如果在训练主线程执行，会把持久化延迟直接打进 step
+time。</li>
+</ul>
+<h3 id="34-数据路径">3.4 数据路径</h3>
+<p>数据路径是：</p>
+<pre class="text"><code>dataset storage
+  -&gt; Linux page cache
+  -&gt; DataLoader worker process
+  -&gt; CPU preprocessing / tokenize / decode / collate
+  -&gt; pageable host memory
+  -&gt; pinned host memory
+  -&gt; H2D DMA over PCIe or NVLink path
+  -&gt; GPU HBM</code></pre>
+<p>关键工程事实：</p>
+<ul>
+<li>page cache 命中时，<code>read()</code> 主要消耗 memory bandwidth 和
+CPU；miss 时会阻塞在本地盘、网络盘或对象存储客户端。</li>
+<li><code>num_workers</code> 增加的是并行 CPU preprocessing
+和预取能力，不会自动提高磁盘吞吐。</li>
+<li><code>pin_memory=True</code> 让 H2D DMA 更稳定，但 pinned memory
+太多会挤压普通 DRAM 和 page cache。</li>
+<li><code>non_blocking=True</code> 只有在源 tensor 位于 pinned memory 且
+stream 使用合理时才有实际 overlap。</li>
+<li>dataset shard 太小会放大 open/seek/metadata 开销；shard 太大又会降低
+shuffle 粒度和失败重试效率。</li>
+<li>NUMA 错配会让 CPU worker 在一个 socket 上准备数据，却通过另一个
+socket 连接的 PCIe root complex 送 GPU。</li>
+</ul>
+<h3 id="35-状态路径">3.5 状态路径</h3>
+<p>状态路径包含训练能否正确 resume 的全部内容：</p>
+<ul>
+<li>model parameters。</li>
+<li>gradients 或 gradient accumulation buffer。</li>
+<li>optimizer state，例如 AdamW 的
+<code>exp_avg</code>、<code>exp_avg_sq</code>。</li>
+<li>LR scheduler state。</li>
+<li>AMP GradScaler state，FP16 训练尤其需要。</li>
+<li>RNG state：Python、NumPy、PyTorch CPU、PyTorch CUDA。</li>
+<li>dataset sampler state 和 consumed token/sample cursor。</li>
+<li>global step、epoch、microstep。</li>
+<li>framework metadata，例如 FSDP/DDP wrapper、dtype policy、checkpoint
+schema。</li>
+</ul>
+<p>即使本章聚焦单机，也要把 checkpoint
+当成恢复协议，而不是文件保存动作。否则第10章讨论的恢复一致性无法建立。</p>
+<h3 id="36-故障路径">3.6 故障路径</h3>
+<p>单机训练故障通常先表现为：</p>
+<ul>
+<li>step time P95/P99 抖动。</li>
+<li>GPU utilization sawtooth。</li>
+<li>HBM 峰值逐步爬升或突然 OOM。</li>
+<li>loss spike、NaN、GradScaler scale 持续下降。</li>
+<li>DataLoader worker timeout。</li>
+<li>checkpoint 周期性造成长尾 step。</li>
+<li>page cache miss 或网络读导致 CPU pipeline 空转。</li>
+</ul>
+<p>故障路径的处理原则是先定位资源域，再动配置：</p>
+<pre class="text"><code>symptom -&gt; metric evidence -&gt; timeline evidence -&gt; resource domain -&gt; single variable change</code></pre>
+<p>不要直接从症状跳到“加 worker”“降 batch”“开
+AMP”。这些动作会改变多个资源账本，容易把问题挪走而不是解决。</p>
+<hr />
+<h2 id="4-原理从-step-time显存和效率指标推导机制">4. 原理：从 step
+time、显存和效率指标推导机制</h2>
+<h3 id="41-step-time-模型">4.1 Step time 模型</h3>
+<p>最朴素的串行模型是：</p>
+<p><span
+class="math display"><em>t</em><sub>step</sub> = <em>t</em><sub>read</sub> + <em>t</em><sub>cpu-preprocess</sub> + <em>t</em><sub>h2d</sub> + <em>t</em><sub>forward</sub> + <em>t</em><sub>loss</sub> + <em>t</em><sub>backward</sub> + <em>t</em><sub>optimizer</sub> + <em>t</em><sub>logging</sub> + <em>t</em><sub>checkpoint</sub></span></p>
+<p>真实训练会有 overlap，因此更有用的模型是：</p>
+<p><span
+class="math display"><em>t</em><sub>step</sub> ≈ max (<em>t</em><sub>input-visible</sub>, <em>t</em><sub>gpu-compute</sub>) + <em>t</em><sub>sync</sub> + <em>t</em><sub>unhidden-io</sub></span></p>
+<p>其中：</p>
+<ul>
+<li><code>t_input-visible</code> 是 DataLoader/H2D 中没有被当前 step
+计算隐藏的部分。</li>
+<li><code>t_gpu-compute</code> 是 forward、loss、backward、optimizer 的
+GPU 可见时间。</li>
+<li><code>t_sync</code> 来自 CPU 读取 GPU 标量、barrier、stream
+synchronize、blocking copy。</li>
+<li><code>t_unhidden-io</code> 来自同步 checkpoint、同步
+eval、日志后端阻塞。</li>
+</ul>
+<p>调优前先判断哪项是 visible。被 overlap
+隐藏的开销不一定需要优化；visible 开销才影响 tokens/s。</p>
+<h3 id="42-数据供给机制">4.2 数据供给机制</h3>
+<p>DataLoader 的本质是一个带预取的多进程 producer-consumer 系统：</p>
+<pre class="text"><code>worker queue depth = num_workers * prefetch_factor</code></pre>
+<p>它解决两个问题：</p>
+<ul>
+<li>把 CPU preprocessing 从训练主线程移出去。</li>
+<li>让下一批数据准备与当前 GPU 计算重叠。</li>
+</ul>
+<p>它不解决三个问题：</p>
+<ul>
+<li>远端存储本身慢。</li>
+<li>单样本 decode/tokenize 太重。</li>
+<li>batch 内 padding 或 packing 策略导致有效 tokens/s 低。</li>
+</ul>
+<p>证据链应该这样看：</p>
+<ul>
+<li><code>torch.profiler</code> 中
+<code>enumerate(DataLoader)#_MultiProcessingDataLoaderIter</code> 是否占
+visible time。</li>
+<li><code>iostat -xz 1</code> 中
+<code>%util</code>、<code>await</code>、<code>r/s</code>、<code>w/s</code>
+是否异常。</li>
+<li><code>pidstat -dru -p &lt;worker_pid&gt; 1</code> 看 worker 是 CPU
+忙、I/O 等还是被调度抢占。</li>
+<li><code>perf top -p &lt;worker_pid&gt;</code> 看 CPU 时间是否耗在
+tokenizer、jpeg decode、compression、pickle、collate。</li>
+<li><code>nvidia-smi dmon</code> 或 DCGM 看 SM 是否周期性掉到低位。</li>
+</ul>
+<h3 id="43-显存模型">4.3 显存模型</h3>
+<p>本章要求记住这条公式：</p>
+<p><span class="math display">memory budget = params + grads + optimizer
+states + activations + temp + fragmentation</span></p>
+<p>更工程化地写：</p>
+<p><span
+class="math display"><em>M</em><sub>peak</sub> = <em>N</em><sub><em>p</em></sub><em>B</em><sub><em>p</em></sub> + <em>N</em><sub><em>p</em></sub><em>B</em><sub><em>g</em></sub> + <em>N</em><sub><em>p</em></sub><em>B</em><sub><em>o</em></sub> + <em>M</em><sub>act</sub>(<em>B</em><sub><em>μ</em></sub>, <em>S</em>, <em>L</em>, <em>H</em>, <em>C</em>) + <em>M</em><sub>temp</sub> + <em>M</em><sub>frag</sub></span></p>
+<p>符号含义：</p>
+<ul>
+<li><code>N_p</code>：参数个数。</li>
+<li><code>B_p</code>：每个参数常驻字节数，例如 BF16 为 2 bytes。</li>
+<li><code>B_g</code>：每个梯度字节数，通常 BF16/FP16 为 2
+bytes，部分框架保留 FP32 grad。</li>
+<li><code>B_o</code>：每个参数对应 optimizer state 字节数。AdamW FP32
+<code>m/v</code> 是 8 bytes，若还有 FP32 master weight 再加 4
+bytes。</li>
+<li><code>M_act</code>：activation，与 microbatch
+<code>B_mu</code>、sequence length <code>S</code>、layers
+<code>L</code>、hidden <code>H</code>、checkpointing 策略 <code>C</code>
+强相关。</li>
+<li><code>M_temp</code>：临时 buffer，例如 attention workspace、cuBLASLt
+workspace、fused optimizer workspace、CUDA graph pool。</li>
+<li><code>M_frag</code>：allocator fragmentation 和 reserved-but-unused
+内存。</li>
+</ul>
+<p>一个常用 admission 规则：</p>
+<pre class="text"><code>M_peak_p95 &lt;= 0.85 * HBM_capacity</code></pre>
+<p>留 15% 不是保守主义，而是给 allocator、输入 shape 抖动、CUDA
+context、临时 kernel workspace 和 checkpoint/eval 插入留余量。</p>
+<h3 id="44-参数梯度优化器状态">4.4 参数、梯度、优化器状态</h3>
+<p>以 7B 参数模型为例：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th style="text-align: right;">BF16/AdamW 常见大小</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Params</td>
+<td style="text-align: right;"><code>7B * 2 = 14 GB</code>，约
+<code>13.0 GiB</code></td>
+<td>常驻 BF16 权重</td>
+</tr>
+<tr>
+<td>Gradients</td>
+<td style="text-align: right;"><code>7B * 2 = 14 GB</code>，约
+<code>13.0 GiB</code></td>
+<td>每个 optimizer step 前需要</td>
+</tr>
+<tr>
+<td>AdamW m/v</td>
+<td style="text-align: right;"><code>7B * 8 = 56 GB</code>，约
+<code>52.2 GiB</code></td>
+<td>FP32 <code>exp_avg</code> + <code>exp_avg_sq</code></td>
+</tr>
+<tr>
+<td>FP32 master weights</td>
+<td style="text-align: right;"><code>7B * 4 = 28 GB</code>，约
+<code>26.1 GiB</code></td>
+<td>FP16 路径常见，BF16 可视框架策略省略</td>
+</tr>
+<tr>
+<td>Activations</td>
+<td style="text-align: right;">与 batch/seq/layer 相关</td>
+<td>通常是 OOM 触发项</td>
+</tr>
+<tr>
+<td>Temp + fragmentation</td>
+<td style="text-align: right;">5% 到 20% HBM</td>
+<td>与 shape、allocator、kernel workspace 相关</td>
+</tr>
+</tbody>
+</table>
+<p>这解释了为什么“参数 14 GB”不代表“80 GB 卡随便训”。朴素单卡 AdamW
+如果保留 FP32 master weight，参数相关状态就接近
+<code>104.4 GiB</code>，还没有算 activation。单节点 8xH100 训练 7B
+通常要用 DDP 分摊 batch 吞吐，或用 FSDP/ZeRO 分摊状态；本章的 worked
+example 会给出单节点基线方案。</p>
+<h3 id="45-activations-与-microbatch">4.5 Activations 与 microbatch</h3>
+<p>Activation 是最容易被低估的显存项。它取决于：</p>
+<ul>
+<li>microbatch size。</li>
+<li>sequence length。</li>
+<li>hidden size。</li>
+<li>layer 数。</li>
+<li>attention 实现。</li>
+<li>是否保存 attention probabilities。</li>
+<li>是否 activation checkpointing。</li>
+<li>是否使用 fused kernels、FlashAttention、sequence packing。</li>
+</ul>
+<p>粗略判断：</p>
+<pre class="text"><code>activation memory grows roughly with microbatch * sequence_length * hidden_size * layers</code></pre>
+<p>如果 OOM 随 sequence length 或 microbatch 线性放大，优先怀疑
+activation。如果 OOM 与 batch 无关，优先看参数状态、optimizer、allocator
+fragmentation 或 checkpoint/eval 额外状态。</p>
+<h3 id="46-allocator-fragmentation">4.6 Allocator fragmentation</h3>
+<p>PyTorch CUDA allocator 会缓存和复用显存块。你看到的：</p>
+<ul>
+<li><code>allocated</code>：tensor 当前实际占用。</li>
+<li><code>reserved</code>：allocator 向 CUDA 申请并保留的块。</li>
+<li><code>inactive_split</code>：切分后暂时无法复用的碎片。</li>
+</ul>
+<p>诊断命令：</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(torch.cuda.memory_summary(device<span class="op">=</span><span class="va">None</span>, abbreviated<span class="op">=</span><span class="va">False</span>))</span></code></pre></div>
+<p>常用证据：</p>
+<ul>
+<li><code>reserved &gt;&gt; allocated</code> 且 OOM message 提示
+reserved memory large，说明碎片或 shape 抖动可能严重。</li>
+<li>每 step shape 不稳定，例如 dynamic padding、变长图像、随机
+crop，会增加 allocator 压力。</li>
+<li>eval/checkpoint 临时分配大 tensor，可能在训练循环中造成峰值。</li>
+</ul>
+<p>常用动作：</p>
+<ul>
+<li>固定或 bucket sequence length。</li>
+<li>使用
+<code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256</code>
+做实验对比。</li>
+<li>将 eval 与 train 分离，或清理临时引用后再进入训练。</li>
+<li>避免在 step 内创建大量短生命周期大 tensor。</li>
+</ul>
+<h3 id="47-mfuhfugpu-utilizationsm-occupancytokenss-边界">4.7
+MFU、HFU、GPU utilization、SM occupancy、tokens/s 边界</h3>
+<p>这些指标回答的问题不同：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>回答的问题</th>
+<th>容易误用的地方</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tokens/s</td>
+<td>单位时间处理多少训练 token</td>
+<td>padding 多时会高估有效数据进展，需区分 raw tokens 和 non-pad
+tokens</td>
+</tr>
+<tr>
+<td>GPU utilization</td>
+<td>GPU 是否忙</td>
+<td>不说明是否在做有效模型 FLOPs</td>
+</tr>
+<tr>
+<td>SM occupancy</td>
+<td>SM 上并发 warp 是否足够</td>
+<td>不说明 Tensor Core 是否吃满，也不说明 memory stall</td>
+</tr>
+<tr>
+<td>Tensor Core utilization</td>
+<td>MMA/Tensor Core 指令使用情况</td>
+<td>需要 Nsight Compute 或框架 profile，不等于 SM utilization</td>
+</tr>
+<tr>
+<td>MFU</td>
+<td>有效模型 FLOPs / 理论峰值</td>
+<td>依赖 FLOPs 估算，适合模型训练效率对比</td>
+</tr>
+<tr>
+<td>HFU</td>
+<td>实际硬件 FLOPs / 理论峰值</td>
+<td>包含重算和额外工作，可能被无效计算抬高</td>
+</tr>
+</tbody>
+</table>
+<p>常用公式：</p>
+<p><span class="math display">$$
+\text{MFU} =
+\frac{\text{model FLOPs per token} \times \text{tokens/s}}
+{\text{peak FLOPs per GPU} \times \text{num GPUs}}
+$$</span></p>
+<p>对 decoder-only Transformer，训练 FLOPs 常用近似：</p>
+<p><span class="math display">model FLOPs per
+token ≈ 6<em>N</em><sub><em>p</em></sub></span></p>
+<p>这个 <code>6N_p</code> 近似包含 forward 和 backward
+的主要矩阵计算，不包含所有 attention 二次项、重算、optimizer、padding
+浪费和 kernel inefficiency。对长序列或特殊 attention 结构要修正。</p>
+<p>HFU 可以写成：</p>
+<p><span class="math display">$$
+\text{HFU} =
+\frac{\text{actual executed FLOPs/s}}
+{\text{peak FLOPs/s}}
+$$</span></p>
+<p>如果开启 activation checkpointing，反向会重算部分 forward：</p>
+<pre class="text"><code>HFU may increase while MFU and tokens/s stay flat or decrease</code></pre>
+<p>原因是硬件执行了更多 FLOPs，但每个 token 的有效训练进展没有增加。</p>
+<hr />
+<h2 id="5-amp--bf16--fp8-工程取舍">5. AMP / BF16 / FP8 工程取舍</h2>
+<h3 id="51-amp-是策略不是魔法开关">5.1 AMP 是策略，不是魔法开关</h3>
+<p>AMP 的工程含义是：</p>
+<ul>
+<li>由 autocast 决定哪些算子用低精度。</li>
+<li>由 GradScaler 在 FP16 路径上处理 underflow/overflow。</li>
+<li>由 optimizer 保持必要的高精度状态。</li>
+<li>由框架决定部分 reduction、normalization、softmax 是否回到
+FP32。</li>
+</ul>
+<p>上线时不能只记录 <code>amp=True</code>，必须记录：</p>
+<ul>
+<li><code>precision=fp16|bf16|fp8|tf32|fp32</code>。</li>
+<li>autocast dtype。</li>
+<li>GradScaler 初始 scale、growth/backoff、是否频繁 overflow。</li>
+<li>optimizer state dtype。</li>
+<li>master weight policy。</li>
+<li>FP8 scaling recipe、amax history、per-tensor/per-channel
+scale。</li>
+</ul>
+<h3 id="52-bf16">5.2 BF16</h3>
+<p>BF16 是大模型训练的常用默认选择，原因是 exponent 范围接近 FP32，比
+FP16 更不容易 overflow/underflow。工程优点：</p>
+<ul>
+<li>通常不需要 loss scaling。</li>
+<li>HBM 占用与 FP16 相同，每值 2 bytes。</li>
+<li>在 A100/H100 等硬件上 Tensor Core 支持成熟。</li>
+<li>对 LLM pretraining 的稳定性通常好于 FP16。</li>
+</ul>
+<p>边界：</p>
+<ul>
+<li>BF16 mantissa 只有 7 bits，某些小梯度、统计量、optimizer update
+仍需要 FP32。</li>
+<li>CPU preprocessing 和 tokenizer 不因 BF16 自动变快。</li>
+<li>如果 kernel 没走 Tensor Core，BF16 不保证提速。</li>
+<li>某些老 GPU 或软件栈对 BF16 支持有限。</li>
+</ul>
+<h3 id="53-fp16">5.3 FP16</h3>
+<p>FP16 的优点是硬件覆盖广、吞吐高，但工程风险更高：</p>
+<ul>
+<li>exponent 范围小，更容易 gradient underflow/overflow。</li>
+<li>需要 GradScaler。</li>
+<li>overflow 会跳过 optimizer step，tokens/s 看起来正常但有效 update
+变少。</li>
+<li>FP32 master weights 常见，会增加显存账本。</li>
+</ul>
+<p>诊断信号：</p>
+<ul>
+<li>GradScaler scale 持续下降。</li>
+<li><code>found_inf</code> 频繁出现。</li>
+<li>loss spike 后恢复慢。</li>
+<li>gradient norm 偶发 <code>inf</code> 或 <code>nan</code>。</li>
+</ul>
+<h3 id="54-fp8">5.4 FP8</h3>
+<p>FP8 是 H100 时代重要的吞吐和显存优化方向，但它不是“把 dtype 改成
+fp8”。工程要求包括：</p>
+<ul>
+<li>H100/Ada 等支持 FP8 Tensor Core 的硬件。</li>
+<li>Transformer Engine 或框架级 FP8 recipe。</li>
+<li>E4M3/E5M2 格式选择。</li>
+<li>amax history、scaling factor、delayed scaling 或 dynamic
+scaling。</li>
+<li>对 attention、MLP、linear、activation、grad 的覆盖边界。</li>
+<li>checkpoint 是否保存 scaling metadata。</li>
+<li>与 optimizer state、master weight、loss scale 的兼容策略。</li>
+</ul>
+<p>常见取舍：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>收益</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BF16 baseline</td>
+<td>稳定，排障简单</td>
+<td>吞吐和 HBM 不如 FP8 激进</td>
+</tr>
+<tr>
+<td>FP8 linear only</td>
+<td>降低 matmul 带宽和提高 Tensor Core 吞吐</td>
+<td>覆盖有限，需要校验 loss parity</td>
+</tr>
+<tr>
+<td>FP8 activation + weight</td>
+<td>更高吞吐潜力</td>
+<td>scaling recipe 复杂，调试成本高</td>
+</tr>
+<tr>
+<td>FP8 optimizer state</td>
+<td>显存收益大</td>
+<td>训练稳定性风险高，通常不作为初始 baseline</td>
+</tr>
+</tbody>
+</table>
+<p>生产建议：</p>
+<ul>
+<li>先建立 BF16 baseline，再做 FP8 A/B。</li>
+<li>A/B 固定 data order、global batch、LR schedule、warmup、seed。</li>
+<li>对比不只看 tokens/s，还看 loss parity、gradient
+norm、overflow、MFU/HFU、checkpoint 可恢复性。</li>
+<li>FP8 失败时回退 BF16 必须是配置级回滚，而不是改代码热修。</li>
+</ul>
+<hr />
+<h2 id="6-框架实现pytorch-knobs-and-constraints">6. 框架实现：PyTorch
+knobs and constraints</h2>
+<h3 id="61-pytorch-dataloader--amp--training-loop-示例">6.1 PyTorch
+DataLoader / AMP / training loop 示例</h3>
+<p>下面示例不是完整项目模板，而是把单机基线必须显式化的旋钮放在一起。</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.utils.data <span class="im">import</span> DataLoader</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>torch.backends.cuda.matmul.allow_tf32 <span class="op">=</span> <span class="va">True</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>torch.backends.cudnn.allow_tf32 <span class="op">=</span> <span class="va">True</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>torch.set_float32_matmul_precision(<span class="st">&quot;high&quot;</span>)</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>device <span class="op">=</span> torch.device(<span class="st">&quot;cuda&quot;</span>, <span class="bu">int</span>(os.environ.get(<span class="st">&quot;LOCAL_RANK&quot;</span>, <span class="st">&quot;0&quot;</span>)))</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>torch.cuda.set_device(device)</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>loader <span class="op">=</span> DataLoader(</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    train_dataset,</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    batch_size<span class="op">=</span>microbatch_size,</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>    shuffle<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    num_workers<span class="op">=</span><span class="dv">8</span>,</span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    pin_memory<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    persistent_workers<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>    prefetch_factor<span class="op">=</span><span class="dv">4</span>,</span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    drop_last<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> model.to(device)</span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>optimizer <span class="op">=</span> torch.optim.AdamW(</span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>    model.parameters(),</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>    lr<span class="op">=</span><span class="fl">3e-4</span>,</span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>    betas<span class="op">=</span>(<span class="fl">0.9</span>, <span class="fl">0.95</span>),</span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>    eps<span class="op">=</span><span class="fl">1e-8</span>,</span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>    fused<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>grad_accum_steps <span class="op">=</span> <span class="dv">8</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>use_bf16 <span class="op">=</span> <span class="va">True</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>scaler <span class="op">=</span> torch.cuda.amp.GradScaler(enabled<span class="op">=</span><span class="va">False</span>)  <span class="co"># BF16 usually does not need scaling.</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>model.train()</span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>optimizer.zero_grad(set_to_none<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> step, batch <span class="kw">in</span> <span class="bu">enumerate</span>(loader):</span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>    t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    batch <span class="op">=</span> {</span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>        k: v.to(device, non_blocking<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> k, v <span class="kw">in</span> batch.items()</span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> torch.autocast(device_type<span class="op">=</span><span class="st">&quot;cuda&quot;</span>, dtype<span class="op">=</span>torch.bfloat16, enabled<span class="op">=</span>use_bf16):</span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>        out <span class="op">=</span> model(<span class="op">**</span>batch)</span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>        loss <span class="op">=</span> out.loss <span class="op">/</span> grad_accum_steps</span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>    loss.backward()</span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (step <span class="op">+</span> <span class="dv">1</span>) <span class="op">%</span> grad_accum_steps <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a>        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm<span class="op">=</span><span class="fl">1.0</span>)</span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>        optimizer.step()</span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a>        optimizer.zero_grad(set_to_none<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a>        scheduler.step()</span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> step <span class="op">%</span> <span class="dv">20</span> <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Avoid logging GPU tensors directly; .item() is a synchronization point.</span></span>
+<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>        loss_value <span class="op">=</span> <span class="bu">float</span>(loss.detach().cpu()) <span class="op">*</span> grad_accum_steps</span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>        max_mem <span class="op">=</span> torch.cuda.max_memory_allocated(device) <span class="op">/</span> <span class="dv">1024</span><span class="op">**</span><span class="dv">3</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>        logger.info({</span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;step&quot;</span>: step,</span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;loss&quot;</span>: loss_value,</span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;max_mem_gib&quot;</span>: <span class="bu">round</span>(max_mem, <span class="dv">2</span>),</span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;step_s&quot;</span>: <span class="bu">round</span>(time.perf_counter() <span class="op">-</span> t0, <span class="dv">4</span>),</span>
+<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>        })</span>
+<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> step <span class="op">&gt;</span> <span class="dv">0</span> <span class="kw">and</span> step <span class="op">%</span> <span class="dv">1000</span> <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb10-72"><a href="#cb10-72" aria-hidden="true" tabindex="-1"></a>        ckpt <span class="op">=</span> {</span>
+<span id="cb10-73"><a href="#cb10-73" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;model&quot;</span>: model.state_dict(),</span>
+<span id="cb10-74"><a href="#cb10-74" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;optimizer&quot;</span>: optimizer.state_dict(),</span>
+<span id="cb10-75"><a href="#cb10-75" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;scheduler&quot;</span>: scheduler.state_dict(),</span>
+<span id="cb10-76"><a href="#cb10-76" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;rng_cpu&quot;</span>: torch.get_rng_state(),</span>
+<span id="cb10-77"><a href="#cb10-77" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;rng_cuda&quot;</span>: torch.cuda.get_rng_state_all(),</span>
+<span id="cb10-78"><a href="#cb10-78" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;step&quot;</span>: step,</span>
+<span id="cb10-79"><a href="#cb10-79" aria-hidden="true" tabindex="-1"></a>        }</span>
+<span id="cb10-80"><a href="#cb10-80" aria-hidden="true" tabindex="-1"></a>        torch.save(ckpt, <span class="ss">f&quot;/checkpoints/step-</span><span class="sc">{</span>step<span class="sc">:08d}</span><span class="ss">.pt&quot;</span>)</span></code></pre></div>
+<p>工程约束：</p>
+<ul>
+<li><code>pin_memory=True</code> 与 <code>non_blocking=True</code>
+要配套测，不是单独保证 overlap。</li>
+<li><code>loss.item()</code>、<code>tensor.cpu()</code>、<code>print(cuda_tensor)</code>
+都可能同步 GPU。</li>
+<li><code>optimizer.zero_grad(set_to_none=True)</code>
+通常减少内存写入和 fragmentation。</li>
+<li><code>fused=True</code> 依赖 PyTorch/CUDA/参数 dtype
+支持，失败时要有 fallback。</li>
+<li>BF16 autocast 不代表 optimizer state 也是 BF16。</li>
+</ul>
+<h3 id="62-torchrun-单节点多-gpu-launcher">6.2 torchrun 单节点多 GPU
+launcher</h3>
+<p>单节点 8 GPU baseline 可以先用 <code>torchrun</code>：</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">CUDA_VISIBLE_DEVICES</span><span class="op">=</span>0,1,2,3,4,5,6,7</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">OMP_NUM_THREADS</span><span class="op">=</span>8</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">TOKENIZERS_PARALLELISM</span><span class="op">=</span>false</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">PYTORCH_CUDA_ALLOC_CONF</span><span class="op">=</span>expandable_segments:True,max_split_size_mb:256</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">torchrun</span> <span class="dt">\</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--standalone</span> <span class="dt">\</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--nnodes</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--nproc_per_node</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>  train.py <span class="dt">\</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--model</span> llama-7b <span class="dt">\</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--seq-len</span> 4096 <span class="dt">\</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--micro-batch-size</span> 2 <span class="dt">\</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--grad-accum-steps</span> 16 <span class="dt">\</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--precision</span> bf16 <span class="dt">\</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dataloader-num-workers</span> 8 <span class="dt">\</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--pin-memory</span> true <span class="dt">\</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--prefetch-factor</span> 4 <span class="dt">\</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--checkpoint-interval</span> 1000 <span class="dt">\</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--log-interval</span> 20</span></code></pre></div>
+<p>如果这个 baseline 使用 DDP，通信仍在单节点 NVLink/NVSwitch
+内。它可以作为第8章多节点 DDP
+之前的局部基线，但本章排障重点仍是节点内数据、显存、kernel
+和状态路径。</p>
+<h3 id="63-pytorch-fsdp-full_shard-示例">6.3 PyTorch FSDP FULL_SHARD
+示例</h3>
+<p>LLaMA-7B on 8xH100 的 worked example 不建议用朴素 DDP 承载 AdamW
+状态。下面是可以映射到真实代码的 FSDP baseline 片段，重点是
+<code>ShardingStrategy.FULL_SHARD</code>、BF16 mixed
+precision、transformer block wrapping、activation checkpointing 和
+sharded state-dict。</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> functools</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch.distributed <span class="im">as</span> dist</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.distributed.fsdp <span class="im">import</span> (</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    FullyShardedDataParallel <span class="im">as</span> FSDP,</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    FullStateDictConfig,</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    MixedPrecision,</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    ShardedStateDictConfig,</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    ShardingStrategy,</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>    StateDictType,</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.distributed.fsdp.wrap <span class="im">import</span> transformer_auto_wrap_policy</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.distributed.algorithms._checkpoint.checkpoint_wrapper <span class="im">import</span> (</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>    CheckpointImpl,</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    apply_activation_checkpointing,</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>    checkpoint_wrapper,</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>dist.init_process_group(backend<span class="op">=</span><span class="st">&quot;nccl&quot;</span>)</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>local_rank <span class="op">=</span> <span class="bu">int</span>(os.environ[<span class="st">&quot;LOCAL_RANK&quot;</span>])</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>torch.cuda.set_device(local_rank)</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>bf16_policy <span class="op">=</span> MixedPrecision(</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>    param_dtype<span class="op">=</span>torch.bfloat16,</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>    reduce_dtype<span class="op">=</span>torch.bfloat16,</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    buffer_dtype<span class="op">=</span>torch.bfloat16,</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>wrap_policy <span class="op">=</span> functools.partial(</span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>    transformer_auto_wrap_policy,</span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>    transformer_layer_cls<span class="op">=</span>{LlamaDecoderLayer},</span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> FSDP(</span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>    build_llama_7b_model().to(local_rank),</span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>    sharding_strategy<span class="op">=</span>ShardingStrategy.FULL_SHARD,</span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>    auto_wrap_policy<span class="op">=</span>wrap_policy,</span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a>    mixed_precision<span class="op">=</span>bf16_policy,</span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>    device_id<span class="op">=</span>torch.cuda.current_device(),</span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>    limit_all_gathers<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a>    use_orig_params<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a>non_reentrant_wrapper <span class="op">=</span> functools.partial(</span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>    checkpoint_wrapper,</span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a>    checkpoint_impl<span class="op">=</span>CheckpointImpl.NO_REENTRANT,</span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>apply_activation_checkpointing(</span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a>    model,</span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a>    checkpoint_wrapper_fn<span class="op">=</span>non_reentrant_wrapper,</span>
+<span id="cb12-52"><a href="#cb12-52" aria-hidden="true" tabindex="-1"></a>    check_fn<span class="op">=</span><span class="kw">lambda</span> m: <span class="bu">isinstance</span>(m, LlamaDecoderLayer),</span>
+<span id="cb12-53"><a href="#cb12-53" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-54"><a href="#cb12-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-55"><a href="#cb12-55" aria-hidden="true" tabindex="-1"></a><span class="co"># Training checkpoint: sharded state_dict keeps per-rank memory and write pressure bounded.</span></span>
+<span id="cb12-56"><a href="#cb12-56" aria-hidden="true" tabindex="-1"></a>FSDP.set_state_dict_type(</span>
+<span id="cb12-57"><a href="#cb12-57" aria-hidden="true" tabindex="-1"></a>    model,</span>
+<span id="cb12-58"><a href="#cb12-58" aria-hidden="true" tabindex="-1"></a>    StateDictType.SHARDED_STATE_DICT,</span>
+<span id="cb12-59"><a href="#cb12-59" aria-hidden="true" tabindex="-1"></a>    state_dict_config<span class="op">=</span>ShardedStateDictConfig(offload_to_cpu<span class="op">=</span><span class="va">True</span>),</span>
+<span id="cb12-60"><a href="#cb12-60" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-61"><a href="#cb12-61" aria-hidden="true" tabindex="-1"></a>train_ckpt <span class="op">=</span> {</span>
+<span id="cb12-62"><a href="#cb12-62" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;model&quot;</span>: model.state_dict(),</span>
+<span id="cb12-63"><a href="#cb12-63" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;optimizer&quot;</span>: FSDP.optim_state_dict(model, optimizer),</span>
+<span id="cb12-64"><a href="#cb12-64" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;scheduler&quot;</span>: scheduler.state_dict(),</span>
+<span id="cb12-65"><a href="#cb12-65" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;rng_cpu&quot;</span>: torch.get_rng_state(),</span>
+<span id="cb12-66"><a href="#cb12-66" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;rng_cuda&quot;</span>: torch.cuda.get_rng_state_all(),</span>
+<span id="cb12-67"><a href="#cb12-67" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;global_step&quot;</span>: global_step,</span>
+<span id="cb12-68"><a href="#cb12-68" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;sampler_cursor&quot;</span>: sampler.state_dict(),</span>
+<span id="cb12-69"><a href="#cb12-69" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb12-70"><a href="#cb12-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-71"><a href="#cb12-71" aria-hidden="true" tabindex="-1"></a><span class="co"># Release/export checkpoint: gather only outside the hot path.</span></span>
+<span id="cb12-72"><a href="#cb12-72" aria-hidden="true" tabindex="-1"></a>full_cfg <span class="op">=</span> FullStateDictConfig(offload_to_cpu<span class="op">=</span><span class="va">True</span>, rank0_only<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb12-73"><a href="#cb12-73" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):</span>
+<span id="cb12-74"><a href="#cb12-74" aria-hidden="true" tabindex="-1"></a>    export_state_dict <span class="op">=</span> model.state_dict()</span></code></pre></div>
+<p>工程约束：</p>
+<ul>
+<li><code>FULL_SHARD</code> 会 shard params、grads、optimizer states，但
+forward/backward 仍有 layer all-gather working set。</li>
+<li><code>limit_all_gathers=True</code> 通常降低瞬时 HBM
+峰值，代价是可能减少 prefetch overlap。</li>
+<li>wrapping granularity 直接影响 all-gather buffer、通信频率和
+checkpoint shard 数量。</li>
+<li>activation checkpointing 是显存换算力；必须同时记录 MFU/HFU 和
+tokens/s。</li>
+<li>训练 checkpoint 用 sharded state-dict；导出或转换推理权重再使用 full
+state-dict，避免热路径 rank0 OOM。</li>
+</ul>
+<h3 id="64-torchprofiler-最小-profile">6.4 torch.profiler 最小
+profile</h3>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> torch.profiler <span class="im">import</span> ProfilerActivity, profile, schedule, tensorboard_trace_handler</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>prof_schedule <span class="op">=</span> schedule(wait<span class="op">=</span><span class="dv">5</span>, warmup<span class="op">=</span><span class="dv">5</span>, active<span class="op">=</span><span class="dv">10</span>, repeat<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> profile(</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    activities<span class="op">=</span>[ProfilerActivity.CPU, ProfilerActivity.CUDA],</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    schedule<span class="op">=</span>prof_schedule,</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    on_trace_ready<span class="op">=</span>tensorboard_trace_handler(<span class="st">&quot;./traces/single-node&quot;</span>),</span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    record_shapes<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>    profile_memory<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>    with_stack<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>) <span class="im">as</span> prof:</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> step, batch <span class="kw">in</span> <span class="bu">enumerate</span>(loader):</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>        train_one_microstep(batch)</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>        prof.step()</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> step <span class="op">&gt;=</span> <span class="dv">32</span>:</span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span></code></pre></div>
+<p>看 profile 时优先回答：</p>
+<ul>
+<li>DataLoader 是否出现在 visible critical path。</li>
+<li>H2D copy 是否和 compute overlap。</li>
+<li>forward/backward 是否被大量小 kernel 和 CPU launch gap 打碎。</li>
+<li>optimizer 是否有大块 unfused elementwise kernel。</li>
+<li>memory peak 是否出现在 forward、backward、optimizer、checkpoint 或
+eval。</li>
+</ul>
+<h3 id="65-nsight--dcgm--linux-工具链">6.5 Nsight / DCGM / Linux
+工具链</h3>
+<p>单机排障工具不是互相替代，而是分层：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>主要回答</th>
+<th>典型命令或入口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch.profiler</code></td>
+<td>PyTorch op、CPU/CUDA 时间、memory、shape</td>
+<td>TensorBoard trace</td>
+</tr>
+<tr>
+<td>Nsight Systems</td>
+<td>CPU thread、CUDA stream、H2D、kernel launch gap、NVTX timeline</td>
+<td><code>nsys profile -t cuda,nvtx,osrt,cudnn,cublas -o run python train.py</code></td>
+</tr>
+<tr>
+<td>Nsight Compute</td>
+<td>单个 kernel 的 SM、Tensor Core、memory stall、occupancy</td>
+<td><code>ncu --set full --kernel-name regex:... python train.py</code></td>
+</tr>
+<tr>
+<td>DCGM</td>
+<td>GPU health、SM active、tensor active、PCIe/NVLink、power、XID</td>
+<td><code>dcgmi dmon -e 1002,1003,1004,1005,1009</code></td>
+</tr>
+<tr>
+<td><code>iostat</code></td>
+<td>本地盘 I/O queue、await、util</td>
+<td><code>iostat -xz 1</code></td>
+</tr>
+<tr>
+<td><code>perf</code></td>
+<td>CPU preprocessing 热点、系统调用、锁竞争</td>
+<td><code>perf top -p &lt;pid&gt;</code></td>
+</tr>
+<tr>
+<td><code>pidstat</code></td>
+<td>worker CPU、I/O、context switch</td>
+<td><code>pidstat -dru -p &lt;pid&gt; 1</code></td>
+</tr>
+</tbody>
+</table>
+<p>推荐 profiler chain：</p>
+<pre class="text"><code>symptom dashboard
+  -&gt; torch.profiler locate PyTorch stage
+  -&gt; Nsight Systems confirm timeline and sync
+  -&gt; Nsight Compute inspect bad kernels
+  -&gt; DCGM validate device counters and health
+  -&gt; iostat/perf inspect host-side data path</code></pre>
+<p>不要一开始就用 Nsight Compute 抓全量训练。先用
+<code>torch.profiler</code> 和 Nsight Systems 找到阶段，再对具体 kernel
+做 Nsight Compute。</p>
+<hr />
+<h2 id="7-工程化落地配置版本矩阵准入preflight发布观测治理">7.
+工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</h2>
+<h3 id="71-配置分层">7.1 配置分层</h3>
+<p>生产训练配置至少分四层：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>例子</th>
+<th>变更风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model config</td>
+<td>hidden size、layers、heads、seq len、vocab</td>
+<td>改变显存、FLOPs、checkpoint 兼容性</td>
+</tr>
+<tr>
+<td>Training config</td>
+<td>optimizer、LR、batch、precision、grad clip</td>
+<td>改变收敛和数值稳定</td>
+</tr>
+<tr>
+<td>System config</td>
+<td>workers、pin memory、prefetch、allocator、CPU affinity</td>
+<td>改变吞吐和稳定性</td>
+</tr>
+<tr>
+<td>State config</td>
+<td>checkpoint interval、retention、resume、RNG</td>
+<td>改变恢复能力和存储成本</td>
+</tr>
+</tbody>
+</table>
+<p>要求：</p>
+<ul>
+<li>每次 baseline 只能允许一个主变量变化。</li>
+<li>配置必须随 checkpoint 保存。</li>
+<li>恢复时校验配置兼容性，不允许静默加载不兼容状态。</li>
+</ul>
+<h3 id="72-版本矩阵">7.2 版本矩阵</h3>
+<p>单机训练 admission 前至少记录：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>必填项</th>
+<th>验证命令</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>型号、HBM、驱动、MIG 状态、ECC</td>
+<td><code>nvidia-smi -q</code></td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td>runtime、driver compatibility</td>
+<td><code>python -c "import torch; print(torch.version.cuda)"</code></td>
+</tr>
+<tr>
+<td>PyTorch</td>
+<td>version、git、CUDA build</td>
+<td><code>python -c "import torch; print(torch.__version__)"</code></td>
+</tr>
+<tr>
+<td>NCCL</td>
+<td>version，即使单节点也可能用</td>
+<td><code>python -c "import torch; print(torch.cuda.nccl.version())"</code></td>
+</tr>
+<tr>
+<td>cuDNN/cuBLASLt</td>
+<td>framework bundle</td>
+<td>PyTorch collect env</td>
+</tr>
+<tr>
+<td>Dataset</td>
+<td>revision、shard manifest、tokenizer</td>
+<td>manifest hash</td>
+</tr>
+<tr>
+<td>Container</td>
+<td>image digest、entrypoint</td>
+<td>scheduler metadata</td>
+</tr>
+</tbody>
+</table>
+<p>建议把 <code>torch.utils.collect_env</code> 输出保存到 run
+artifact。</p>
+<h3 id="73-admission">7.3 Admission</h3>
+<p>作业准入必须过以下硬门槛：</p>
+<ul>
+<li>显存预算小于 <code>0.85 * HBM</code>。</li>
+<li>本地磁盘或远端缓存有足够 dataset shard 空间。</li>
+<li>checkpoint 路径有足够容量和写入吞吐。</li>
+<li>数据 shard manifest 完整且 hash 可验证。</li>
+<li>precision policy 有 baseline 和 rollback。</li>
+<li>checkpoint resume 在小步数上验证成功。</li>
+<li>profile window 不覆盖 warmup 和首次 compilation/caching 阶段。</li>
+</ul>
+<p>拒绝准入的例子：</p>
+<ul>
+<li>只给出 <code>batch_size=auto</code>，没有显存估算。</li>
+<li>数据从对象存储逐样本随机读，没有本地 cache 或 shard 策略。</li>
+<li>checkpoint 只保存 model，不保存 optimizer/RNG/global step。</li>
+<li>FP8 训练没有 loss parity 和 fallback 计划。</li>
+</ul>
+<h3 id="74-preflight">7.4 Preflight</h3>
+<p>单机 preflight 可以用 200 到 500 step 完成：</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-m</span> torch.utils.collect_env <span class="op">&gt;</span> artifacts/collect_env.txt</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span> <span class="op">&gt;</span> artifacts/topology.txt</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">-q</span> <span class="op">&gt;</span> artifacts/nvidia-smi-q.txt</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1 5 <span class="op">&gt;</span> artifacts/iostat-preflight.txt</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="ex">torchrun</span> <span class="at">--standalone</span> <span class="at">--nproc_per_node</span><span class="op">=</span>8 train.py <span class="dt">\</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max-steps</span> 500 <span class="dt">\</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile-steps</span> 50:80 <span class="dt">\</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--save-steps</span> 250 <span class="dt">\</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--resume-check</span> artifacts/ckpt-step-250 <span class="dt">\</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--strict-config</span> true</span></code></pre></div>
+<p>Preflight 通过标准：</p>
+<ul>
+<li>warmup 后 step time P50/P95 稳定。</li>
+<li>max HBM 小于阈值。</li>
+<li>GPU SM active 与 tensor active 没有周期性掉零。</li>
+<li>DataLoader visible wait 小于总 step 的 5% 到
+10%，具体阈值按任务类型定义。</li>
+<li>checkpoint 写入耗时可解释，并且不会污染稳态 step 统计。</li>
+<li>resume 后 loss、global step、LR、RNG、dataset cursor 连续。</li>
+</ul>
+<h3 id="75-发布与回滚">7.5 发布与回滚</h3>
+<p>单机 baseline
+发布不是把训练跑满，而是发布一个“可扩展前的证据包”：</p>
+<ul>
+<li>config snapshot。</li>
+<li>environment snapshot。</li>
+<li>500 step 稳态 metrics。</li>
+<li>torch.profiler trace。</li>
+<li>Nsight Systems timeline。</li>
+<li>memory summary。</li>
+<li>checkpoint + resume verification。</li>
+<li>loss curve and gradient norm。</li>
+<li>bottleneck diagnosis。</li>
+</ul>
+<p>回滚策略：</p>
+<ul>
+<li>precision 从 FP8 回 BF16。</li>
+<li>allocator config 回默认。</li>
+<li>fused optimizer 回非 fused。</li>
+<li>DataLoader worker/prefetch 回上一版。</li>
+<li>checkpoint interval 回上一版。</li>
+</ul>
+<p>每个回滚必须是配置变更，不能依赖临时改代码。</p>
+<h3 id="76-observability">7.6 Observability</h3>
+<p>单机训练 dashboard 至少包含：</p>
+<ul>
+<li><code>step_time_s</code>：P50/P95/P99。</li>
+<li><code>tokens_per_s_raw</code> 与
+<code>tokens_per_s_nonpad</code>。</li>
+<li><code>loss</code>、<code>grad_norm</code>、<code>lr</code>、<code>overflow_count</code>。</li>
+<li><code>gpu_sm_active</code>、<code>gpu_tensor_active</code>、<code>gpu_mem_used</code>、<code>gpu_power_w</code>。</li>
+<li><code>h2d_time_ms</code>、<code>dataloader_wait_ms</code>。</li>
+<li><code>max_memory_allocated_gib</code>、<code>max_memory_reserved_gib</code>。</li>
+<li><code>checkpoint_write_s</code>、<code>checkpoint_bytes</code>。</li>
+<li><code>samples_consumed</code>、<code>tokens_consumed</code>、<code>global_step</code>。</li>
+</ul>
+<p>日志治理：</p>
+<ul>
+<li>不要每 step 同步 GPU tensor 到 CPU。</li>
+<li>不要把完整 batch 或 logits 打进日志。</li>
+<li>指标上报失败不能阻塞训练主循环。</li>
+<li>对 profile run 打标签，避免把 profiler overhead 混进生产基线。</li>
+</ul>
+<h3 id="77-governance">7.7 Governance</h3>
+<p>平台侧应强制保存：</p>
+<ul>
+<li>run config。</li>
+<li>image digest。</li>
+<li>source SHA。</li>
+<li>dataset manifest。</li>
+<li>tokenizer hash。</li>
+<li>precision policy。</li>
+<li>checkpoint schema version。</li>
+<li>acceptance checklist 结果。</li>
+</ul>
+<p>这些不是审计形式主义。没有这些信息，事故复盘会退化成“当时好像改过
+batch”。</p>
+<hr />
+<h2 id="8-容量与效率公式模型和边界">8. 容量与效率：公式、模型和边界</h2>
+<h3 id="81-effective-batch">8.1 Effective batch</h3>
+<p>单机或单节点多 GPU 的有效 batch：</p>
+<p><span
+class="math display"><em>B</em><sub>global</sub> = <em>B</em><sub><em>μ</em></sub> × <em>G</em><sub>accum</sub> × <em>N</em><sub>gpu</sub></span></p>
+<p>如果按 token 计：</p>
+<p><span
+class="math display"><em>T</em><sub>global</sub> = <em>B</em><sub><em>μ</em></sub> × <em>S</em> × <em>G</em><sub>accum</sub> × <em>N</em><sub>gpu</sub></span></p>
+<p>其中：</p>
+<ul>
+<li><code>B_mu</code> 是每 GPU 每 microstep 的样本数。</li>
+<li><code>S</code> 是 sequence length。</li>
+<li><code>G_accum</code> 是 gradient accumulation steps。</li>
+<li><code>N_gpu</code> 是单节点 GPU 数。</li>
+</ul>
+<p>注意：</p>
+<ul>
+<li>增加 <code>G_accum</code> 提高 global batch，但不提高单 microstep 的
+Tensor Core 饱和度。</li>
+<li>增加 <code>B_mu</code> 通常提高 kernel efficiency，但会增加
+activation 显存。</li>
+<li>增加 <code>S</code> 提高每样本 tokens，也可能触发 attention 二次项和
+HBM 压力。</li>
+</ul>
+<h3 id="82-step-time-to-tokenss">8.2 Step time to tokens/s</h3>
+<p>如果一个 optimizer step 包含 <code>G_accum</code> 个 microstep：</p>
+<p><span class="math display">$$
+\text{tokens/s} =
+\frac{B_{\mu} \times S \times G_{\text{accum}} \times N_{\text{gpu}}}
+{t_{\text{optimizer-step}}}
+$$</span></p>
+<p>如果统计的是 microstep：</p>
+<p><span class="math display">$$
+\text{tokens/s} =
+\frac{B_{\mu} \times S \times N_{\text{gpu}}}
+{t_{\text{microstep}}}
+$$</span></p>
+<p>两者都可以用，但不能混用。报告时必须说明 denominator 是 microstep
+time 还是 optimizer-step time。</p>
+<h3 id="83-mfu-数值模型">8.3 MFU 数值模型</h3>
+<p>对 LLaMA-7B，参数量近似 <code>6.7B</code>。训练 FLOPs/token
+近似：</p>
+<pre class="text"><code>6 * 6.7B = 40.2B FLOPs/token</code></pre>
+<p>8xH100 SXM BF16 峰值可按每卡约 <code>989 TFLOP/s</code> 估算：</p>
+<pre class="text"><code>peak = 8 * 989e12 = 7.912e15 FLOP/s</code></pre>
+<p>如果实测 <code>tokens/s = 95,000</code>：</p>
+<pre class="text"><code>effective FLOPs/s = 95,000 * 40.2e9 = 3.819e15
+MFU = 3.819e15 / 7.912e15 = 48.3%</code></pre>
+<p>这比 GPU utilization 更有诊断价值。若 dashboard 显示 GPU utilization
+98%，但 MFU 只有 25%，需要继续看：</p>
+<ul>
+<li>padding waste。</li>
+<li>小 microbatch 导致 GEMM shape 不佳。</li>
+<li>kernel launch gap。</li>
+<li>unfused optimizer。</li>
+<li>H2D 或 logging 同步。</li>
+<li>activation checkpointing 重算是否被算进 HFU。</li>
+</ul>
+<h3 id="84-hfu-与重算">8.4 HFU 与重算</h3>
+<p>如果 activation checkpointing 让每 token 实际执行 FLOPs 从
+<code>6N_p</code> 增加到 <code>7.5N_p</code>，同样
+<code>tokens/s=95,000</code>：</p>
+<pre class="text"><code>actual FLOPs/s = 95,000 * 7.5 * 6.7e9 = 4.774e15
+HFU = 4.774e15 / 7.912e15 = 60.3%
+MFU remains 48.3%</code></pre>
+<p>因此：</p>
+<ul>
+<li>MFU 衡量有效训练进展。</li>
+<li>HFU 衡量硬件执行强度。</li>
+<li>checkpointing 可能把 HFU 抬高，但不代表训练变便宜。</li>
+</ul>
+<h3 id="85-hbm-admission-例子">8.5 HBM admission 例子</h3>
+<p>假设每张 H100 80GB，生产 admission 使用 <code>0.85</code>：</p>
+<pre class="text"><code>usable HBM per GPU = 80 GiB * 0.85 = 68 GiB</code></pre>
+<p>DDP 下每卡复制完整参数、梯度、优化器状态。若 BF16 params + BF16 grads
++ FP32 AdamW m/v：</p>
+<pre class="text"><code>params = 13.0 GiB
+grads = 13.0 GiB
+adam_m_v = 52.0 GiB
+subtotal = 78.0 GiB</code></pre>
+<p>这已经超过 68 GiB，不含 activation。因此 7B 用 DDP + AdamW 在 80GB
+单卡上通常不可接受，除非：</p>
+<ul>
+<li>使用 optimizer state sharding。</li>
+<li>使用 8-bit optimizer 并接受精度风险。</li>
+<li>用 SGD/Adafactor 等不同 optimizer。</li>
+<li>用 CPU offload 并接受吞吐下降。</li>
+<li>减少状态，例如 BF16 optimizer policy，但需验证稳定性。</li>
+</ul>
+<p>这也是为什么单节点 8xH100 worked example 会选择 FSDP/ZeRO-style state
+sharding 作为训练基线，而不是朴素 DDP。</p>
+<hr />
+<h2 id="9-故障排除症状证据根因动作">9.
+故障排除：症状、证据、根因、动作</h2>
+<h3 id="91-troubleshooting-table">9.1 Troubleshooting table</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Evidence</th>
+<th>Root cause</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU utilization sawtooth，SM active 周期性掉零</td>
+<td><code>torch.profiler</code> 显示 DataLoader wait；DCGM SM active
+低谷；<code>iostat await</code> 高</td>
+<td>数据读取或 CPU preprocessing visible，GPU 等 batch</td>
+<td>预热 page cache；增大 shard；调
+<code>num_workers/prefetch_factor</code>；把 tokenize
+离线；检查远端存储</td>
+</tr>
+<tr>
+<td>H2D copy 与 compute 严格串行</td>
+<td>Nsight Systems 中 memcpy HtoD 在 compute 前完整阻塞；copy stream 没
+overlap</td>
+<td>未使用 pinned memory、<code>non_blocking</code> 无效、隐式同步</td>
+<td>开 <code>pin_memory=True</code>；确认 tensor 来自 pinned
+memory；使用 dedicated stream；移除 step 内同步</td>
+</tr>
+<tr>
+<td>HBM OOM 但 <code>allocated</code> 明显小于
+<code>reserved</code></td>
+<td>OOM message 提到 reserved memory；<code>memory_summary</code>
+inactive split 高</td>
+<td>CUDA allocator fragmentation 或 dynamic shape 抖动</td>
+<td>bucket sequence length；设置 <code>PYTORCH_CUDA_ALLOC_CONF</code> 做
+A/B；减少 step 内临时大 tensor</td>
+</tr>
+<tr>
+<td>OOM 随 microbatch 或 seq len 增大线性出现</td>
+<td>profile memory peak 在 forward/backward；activation 占比高</td>
+<td>activation memory 超预算</td>
+<td>降 microbatch；开 activation checkpointing；用 FlashAttention；减少
+padding</td>
+</tr>
+<tr>
+<td>loss 出现 NaN 或 GradScaler scale 持续下降</td>
+<td><code>found_inf</code> 频繁；grad norm 为 inf；FP16 run 复现，BF16
+不复现</td>
+<td>FP16 overflow/underflow 或不稳定算子</td>
+<td>切 BF16；调 loss scale；保持 norm/softmax/reduction FP32；降 LR；加
+grad clip</td>
+</tr>
+<tr>
+<td>GPU utilization 高但 MFU 低</td>
+<td>DCGM utilization 高；tokens/s 低；Nsight Compute 显示 Tensor Core
+utilization 低</td>
+<td>小 GEMM、padding waste、unfused kernels、重算过多</td>
+<td>增 microbatch；sequence packing；fuse optimizer；检查 matmul
+dtype；减少不必要 checkpointing</td>
+</tr>
+<tr>
+<td>step time 每 N step 出现尖峰</td>
+<td>尖峰与 log/checkpoint/eval interval 对齐；CPU stack 在
+serialization/write</td>
+<td>同步日志或 checkpoint 阻塞训练主线程</td>
+<td>降低日志频率；异步 checkpoint；分离 eval；写本地再异步上传</td>
+</tr>
+<tr>
+<td>DataLoader worker timeout</td>
+<td>worker stderr、<code>pidstat</code> worker stuck、open file count
+高</td>
+<td>worker 死锁、pickle 大对象、文件句柄耗尽、远端 read hang</td>
+<td>降低 worker；修 dataset <code>__getitem__</code>；增
+<code>ulimit -n</code>；加 read timeout；避免 worker 内全局锁</td>
+</tr>
+<tr>
+<td>CPU 100%，GPU 低</td>
+<td><code>perf top</code> 显示 tokenizer/decode/compression；DataLoader
+wait 高</td>
+<td>CPU preprocessing 太重</td>
+<td>离线 tokenize；使用 mmap/arrow/webdataset；向量化 collate；绑定 CPU
+affinity</td>
+</tr>
+<tr>
+<td>checkpoint 后 resume loss 跳变</td>
+<td>resume 后 LR/global_step/RNG/cursor 不一致；dataset sample
+重复或跳过</td>
+<td>checkpoint 状态不完整</td>
+<td>保存 optimizer/scheduler/RNG/sampler/global step；resume 做 strict
+validation</td>
+</tr>
+<tr>
+<td>H100 上 BF16 吞吐低</td>
+<td>Nsight Compute 显示未走 Tensor Core；matmul dtype 为 FP32；TF32
+disabled</td>
+<td>autocast 覆盖不正确或 shape 不适合 Tensor Core</td>
+<td>检查 autocast scope；启用 TF32；调整 hidden/microbatch shape；升级
+kernel/library</td>
+</tr>
+<tr>
+<td>训练越跑越慢</td>
+<td>page cache 被挤出；reserved memory 增长；checkpoint
+目录文件数暴涨</td>
+<td>内存泄漏、fragmentation、存储 metadata 退化</td>
+<td>周期性 memory snapshot；清理引用；checkpoint retention；监控
+inode/metadata latency</td>
+</tr>
+</tbody>
+</table>
+<h3 id="92-排障顺序">9.2 排障顺序</h3>
+<p>推荐顺序：</p>
+<ol type="1">
+<li>先看 run config 是否发生变化。</li>
+<li>看 step time P50/P95/P99 和尖峰周期。</li>
+<li>用 <code>torch.profiler</code> 定位 visible stage。</li>
+<li>用 Nsight Systems 验证 stream、H2D、kernel launch gap、sync。</li>
+<li>对坏 kernel 用 Nsight Compute。</li>
+<li>用 DCGM 验证设备 counters。</li>
+<li>用 <code>iostat</code>、<code>pidstat</code>、<code>perf</code> 查
+host-side。</li>
+<li>单变量改配置，记录 A/B。</li>
+</ol>
+<p>反例：</p>
+<ul>
+<li>看到 GPU 低就直接增 batch，可能触发 OOM。</li>
+<li>看到 OOM 就直接开 checkpointing，可能把瓶颈转成 compute 并降低
+tokens/s。</li>
+<li>看到 DataLoader wait 就盲目加 worker，可能把 page cache 挤掉并让 I/O
+更差。</li>
+</ul>
+<h3 id="93-必备命令片段">9.3 必备命令片段</h3>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># GPU topology and health</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> dmon <span class="at">-s</span> pucvmet <span class="at">-d</span> 1</span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="ex">dcgmi</span> dmon <span class="at">-e</span> 1002,1003,1004,1005,1009</span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Disk and host</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-dru</span> 1</span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> top <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="co"># PyTorch memory</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a><span class="st">import torch</span></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.memory_summary(abbreviated=False))</span></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a><span class="co"># Nsight Systems</span></span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a><span class="ex">nsys</span> profile <span class="at">-t</span> cuda,nvtx,osrt,cudnn,cublas <span class="dt">\</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--capture-range</span><span class="op">=</span>cudaProfilerApi <span class="dt">\</span></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> artifacts/nsys-single-node <span class="dt">\</span></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a>  python train.py <span class="at">--profile-nsys</span> true</span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Nsight Compute for selected kernels only</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--kernel-name</span> regex:gemm <span class="dt">\</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-skip</span> 20 <span class="at">--launch-count</span> 10 <span class="dt">\</span></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>  python train.py <span class="at">--max-steps</span> 30</span></code></pre></div>
+<hr />
+<h2 id="10-方案设计--worked-examplellama-7b-on-8xh100">10. 方案设计 /
+Worked Example：LLaMA-7B on 8xH100</h2>
+<h3 id="101-目标">10.1 目标</h3>
+<p>设计一个单节点 8xH100 SXM 80GB 的 LLaMA-7B 训练
+baseline。目标不是追求极限吞吐，而是得到可解释、可复现、可扩展到第8章的基线。</p>
+<p>假设：</p>
+<ul>
+<li>Model：LLaMA-7B，<code>N_p = 6.7B</code>。</li>
+<li>Sequence length：4096。</li>
+<li>GPU：8xH100 SXM 80GB。</li>
+<li>Precision：BF16 baseline。</li>
+<li>Optimizer：AdamW，FP32 m/v。</li>
+<li>Attention：FlashAttention。</li>
+<li>Parallel：single-node FSDP full shard 或 ZeRO-3 style state
+sharding。</li>
+<li>Target：HBM peak P95 &lt; 68 GiB/GPU，MFU &gt; 45%，DataLoader
+visible wait &lt; 5%。</li>
+</ul>
+<h3 id="102-为什么不用朴素-ddp">10.2 为什么不用朴素 DDP</h3>
+<p>DDP 每卡复制完整参数、梯度和优化器状态：</p>
+<pre class="text"><code>params BF16 = 6.7B * 2 bytes = 13.4 GB = 12.5 GiB
+grads BF16  = 6.7B * 2 bytes = 13.4 GB = 12.5 GiB
+Adam m/v FP32 = 6.7B * 8 bytes = 53.6 GB = 49.9 GiB
+subtotal = 74.9 GiB</code></pre>
+<p>如果还保留 FP32 master weights：</p>
+<pre class="text"><code>master weights = 6.7B * 4 bytes = 26.8 GB = 25.0 GiB
+subtotal = 99.9 GiB</code></pre>
+<p>这还没算 activation、temporary buffers、fragmentation。80GB H100 的
+production usable target 是 68 GiB，所以朴素 DDP + AdamW 不作为
+baseline。</p>
+<h3 id="103-fsdpzero-style-显存预算">10.3 FSDP/ZeRO-style 显存预算</h3>
+<p>单节点 8 GPU full shard 粗略分摊参数、梯度、optimizer state：</p>
+<pre class="text"><code>params per GPU = 12.5 GiB / 8 = 1.6 GiB resident shard
+grads per GPU = 12.5 GiB / 8 = 1.6 GiB shard
+Adam m/v per GPU = 49.9 GiB / 8 = 6.2 GiB shard
+sharded subtotal = 9.4 GiB</code></pre>
+<p>FSDP 在 forward/backward 时会 all-gather 当前 layer
+参数，因此还要加：</p>
+<pre class="text"><code>unsharded layer working set + prefetch buffer + reduce-scatter buffer</code></pre>
+<p>工程估算：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th style="text-align: right;">估算/GPU</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sharded params/grads/Adam</td>
+<td style="text-align: right;">9.4 GiB</td>
+<td>稳态 shard</td>
+</tr>
+<tr>
+<td>All-gather working params</td>
+<td style="text-align: right;">2-6 GiB</td>
+<td>取决于 wrap granularity 和 prefetch</td>
+</tr>
+<tr>
+<td>Activations, microbatch=2, seq=4096</td>
+<td style="text-align: right;">28-36 GiB</td>
+<td>FlashAttention + selective checkpointing</td>
+</tr>
+<tr>
+<td>Temporary buffers</td>
+<td style="text-align: right;">4-8 GiB</td>
+<td>cuBLASLt、attention、optimizer、communication</td>
+</tr>
+<tr>
+<td>Fragmentation reserve</td>
+<td style="text-align: right;">6-10 GiB</td>
+<td>dynamic shape 越多越高</td>
+</tr>
+<tr>
+<td>Total expected</td>
+<td style="text-align: right;">49-66 GiB</td>
+<td>目标小于 68 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>结论：</p>
+<ul>
+<li><code>microbatch=2</code> 是初始候选。</li>
+<li>若 HBM P95 &gt; 68 GiB，先开更激进 activation checkpointing 或降到
+<code>microbatch=1</code>。</li>
+<li>若 HBM P95 &lt; 55 GiB 且 MFU 低，可以试 <code>microbatch=3</code>
+或减少 accumulation。</li>
+</ul>
+<h3 id="104-batch-与-gradient-accumulation">10.4 Batch 与 gradient
+accumulation</h3>
+<p>初始配置：</p>
+<pre class="text"><code>microbatch per GPU = 2
+sequence length = 4096
+num GPUs = 8
+grad accumulation = 16
+
+tokens per optimizer step =
+2 * 4096 * 8 * 16 = 1,048,576 tokens</code></pre>
+<p>如果单个 microstep 平均 86 ms，16 个 accumulation 加
+optimizer/scheduler/comm 后 optimizer step 约 1.48 s：</p>
+<pre class="text"><code>tokens/s = 1,048,576 / 1.48 = 708,497 tokens/s</code></pre>
+<p>这个数对 7B on 8xH100 可能偏激进；真实值取决于 framework、FSDP
+overlap、sequence packing、kernel、checkpointing。保守 baseline 先把
+acceptance target 定义为可解释、可复现，而不是追求 raw tokens/s
+峰值：</p>
+<pre class="text"><code>tokens/s raw &gt;= 90,000 for early bring-up
+tokens/s non-pad ~= 95,000 for accepted baseline
+MFU &gt;= 45% for production baseline</code></pre>
+<p>报告时必须说明是 raw tokens 还是 non-pad tokens。若 packing 不好，raw
+tokens/s 可能漂亮但有效样本进展差。</p>
+<h3 id="105-mfuhfu-计算">10.5 MFU/HFU 计算</h3>
+<p>先用 <code>tokens/s = 300,000</code> 做口径 sanity
+check，而不是把它当成 accepted baseline：</p>
+<pre class="text"><code>model FLOPs/token = 6 * 6.7e9 = 40.2e9
+effective FLOPs/s = 300,000 * 40.2e9 = 12.06e15
+peak BF16 FLOPs/s = 8 * 989e12 = 7.912e15</code></pre>
+<p>这个结果会得到 MFU &gt; 100%，说明假设不自洽。原因可能是：</p>
+<ul>
+<li><code>6N</code> 近似与实际模型/统计口径不匹配。</li>
+<li>tokens/s 包含 padding、重复统计或跨 step denominator 错误。</li>
+<li>H100 peak 使用了错误精度口径。</li>
+<li>统计把 8 GPU 每卡 tokens/s 又乘了一次。</li>
+</ul>
+<p>因此本章把 <code>tokens/s = 95,000</code> 的 non-pad 口径作为可接受
+baseline，并把它交给第8章作为单节点扩展前的参照：</p>
+<pre class="text"><code>effective FLOPs/s = 95,000 * 40.2e9 = 3.819e15
+MFU = 3.819e15 / 7.912e15 = 48.3%</code></pre>
+<p>若 activation checkpointing 让实际 FLOPs/token 增至
+<code>7.5N</code>：</p>
+<pre class="text"><code>actual FLOPs/s = 95,000 * 7.5 * 6.7e9 = 4.774e15
+HFU = 4.774e15 / 7.912e15 = 60.3%</code></pre>
+<p>解释：</p>
+<ul>
+<li>MFU 48.3% 表示有效模型训练进展合理。</li>
+<li>HFU 60.3% 表示硬件多做了重算。</li>
+<li>如果改 checkpointing 后 HFU 升、MFU
+降，说明显存换算力的成本过高。</li>
+</ul>
+<p>Accepted baseline for Chapter 8：</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">Accepted baseline</th>
+<th>口径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Effective non-pad tokens/s</td>
+<td style="text-align: right;">95,000</td>
+<td>8 GPU aggregate，排除 padding</td>
+</tr>
+<tr>
+<td>MFU</td>
+<td style="text-align: right;">48.3%</td>
+<td><code>6N_p</code> FLOPs/token，有效训练进展</td>
+</tr>
+<tr>
+<td>HFU</td>
+<td style="text-align: right;">60.3%</td>
+<td>checkpointing 后约 <code>7.5N_p</code> actual FLOPs/token</td>
+</tr>
+<tr>
+<td>HBM P95</td>
+<td style="text-align: right;">63 GiB/GPU</td>
+<td>低于 68 GiB admission 上限</td>
+</tr>
+<tr>
+<td>DataLoader visible wait</td>
+<td style="text-align: right;">3%</td>
+<td><code>torch.profiler</code> steady-state window</td>
+</tr>
+<tr>
+<td>Checkpoint time</td>
+<td style="text-align: right;">18 s / 1000 steps</td>
+<td>从稳态 step 统计中单独拆出</td>
+</tr>
+</tbody>
+</table>
+<h3 id="106-throughput-边界诊断">10.6 Throughput 边界诊断</h3>
+<p>假设实测：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>microstep time P50</td>
+<td style="text-align: right;">140 ms</td>
+</tr>
+<tr>
+<td>optimizer-step time P50</td>
+<td style="text-align: right;">2.35 s</td>
+</tr>
+<tr>
+<td>raw tokens/s</td>
+<td style="text-align: right;">446,000</td>
+</tr>
+<tr>
+<td>non-pad tokens/s</td>
+<td style="text-align: right;">91,000</td>
+</tr>
+<tr>
+<td>GPU utilization</td>
+<td style="text-align: right;">96%</td>
+</tr>
+<tr>
+<td>SM active</td>
+<td style="text-align: right;">88%</td>
+</tr>
+<tr>
+<td>tensor active</td>
+<td style="text-align: right;">61%</td>
+</tr>
+<tr>
+<td>MFU by non-pad tokens</td>
+<td style="text-align: right;">46%</td>
+</tr>
+<tr>
+<td>HFU</td>
+<td style="text-align: right;">58%</td>
+</tr>
+<tr>
+<td>HBM peak P95</td>
+<td style="text-align: right;">63 GiB</td>
+</tr>
+<tr>
+<td>DataLoader visible wait</td>
+<td style="text-align: right;">3%</td>
+</tr>
+<tr>
+<td>checkpoint write</td>
+<td style="text-align: right;">18 s every 1000 steps</td>
+</tr>
+</tbody>
+</table>
+<p>诊断：</p>
+<ul>
+<li>raw tokens/s 与 non-pad tokens/s 差距大，说明 padding/packing
+是有效吞吐瓶颈。</li>
+<li>GPU utilization 96% 但 tensor active 61%，需要看 GEMM shape、fused
+kernels、checkpointing 重算。</li>
+<li>HBM 63 GiB 在 68 GiB admission 内，可以尝试
+<code>microbatch=3</code>，但必须观察 activation peak。</li>
+<li>DataLoader visible wait 3% 不是优先瓶颈。</li>
+<li>checkpoint 18 s/1000 steps 如果同步写，会在 P99
+形成尖峰；需要异步或从稳态统计中单独拆出。</li>
+</ul>
+<p>下一轮 A/B：</p>
+<ol type="1">
+<li>开 sequence packing，目标 non-pad/raw ratio 从 20% 提到 70%
+以上。</li>
+<li>对比 <code>microbatch=2</code> 与 <code>microbatch=3</code> 的
+HBM、MFU、step time。</li>
+<li>对 optimizer 使用 fused AdamW，观察 optimizer stage。</li>
+<li>checkpoint 写本地 NVMe 后异步上传，观察 P99。</li>
+<li>对关键 GEMM 用 Nsight Compute 看 Tensor Core utilization。</li>
+</ol>
+<h3 id="107-worked-example-配置">10.7 Worked Example 配置</h3>
+<div class="sourceCode" id="cb33"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="fu">run</span><span class="kw">:</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> llama7b-single-node-h100-bf16-baseline</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.example.com/train:pytorch-2.4-cuda-12.4</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">git_sha</span><span class="kw">:</span><span class="at"> 4f3a9c1</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a><span class="fu">model</span><span class="kw">:</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">family</span><span class="kw">:</span><span class="at"> llama</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">params</span><span class="kw">:</span><span class="at"> </span><span class="fl">6.7e9</span></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">seq_len</span><span class="kw">:</span><span class="at"> </span><span class="dv">4096</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tokenizer_revision</span><span class="kw">:</span><span class="at"> tok-2026-05-04</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-12"><a href="#cb33-12" aria-hidden="true" tabindex="-1"></a><span class="fu">parallel</span><span class="kw">:</span></span>
+<span id="cb33-13"><a href="#cb33-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">launcher</span><span class="kw">:</span><span class="at"> torchrun</span></span>
+<span id="cb33-14"><a href="#cb33-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">nnodes</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb33-15"><a href="#cb33-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">nproc_per_node</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb33-16"><a href="#cb33-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">strategy</span><span class="kw">:</span><span class="at"> fsdp_full_shard</span></span>
+<span id="cb33-17"><a href="#cb33-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">mixed_precision</span><span class="kw">:</span><span class="at"> bf16</span></span>
+<span id="cb33-18"><a href="#cb33-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">activation_checkpointing</span><span class="kw">:</span><span class="at"> selective</span></span>
+<span id="cb33-19"><a href="#cb33-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-20"><a href="#cb33-20" aria-hidden="true" tabindex="-1"></a><span class="fu">training</span><span class="kw">:</span></span>
+<span id="cb33-21"><a href="#cb33-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">microbatch_per_gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb33-22"><a href="#cb33-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">grad_accum_steps</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb33-23"><a href="#cb33-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">global_tokens_per_update</span><span class="kw">:</span><span class="at"> </span><span class="dv">1048576</span></span>
+<span id="cb33-24"><a href="#cb33-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">optimizer</span><span class="kw">:</span><span class="at"> adamw_fused</span></span>
+<span id="cb33-25"><a href="#cb33-25" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lr</span><span class="kw">:</span><span class="at"> </span><span class="fl">3.0e-4</span></span>
+<span id="cb33-26"><a href="#cb33-26" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">betas</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="fl">0.9</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.95</span><span class="kw">]</span></span>
+<span id="cb33-27"><a href="#cb33-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">grad_clip</span><span class="kw">:</span><span class="at"> </span><span class="fl">1.0</span></span>
+<span id="cb33-28"><a href="#cb33-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-29"><a href="#cb33-29" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb33-30"><a href="#cb33-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">format</span><span class="kw">:</span><span class="at"> pretokenized_packed_shards</span></span>
+<span id="cb33-31"><a href="#cb33-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">num_workers</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb33-32"><a href="#cb33-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pin_memory</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb33-33"><a href="#cb33-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">prefetch_factor</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb33-34"><a href="#cb33-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">persistent_workers</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb33-35"><a href="#cb33-35" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">local_cache</span><span class="kw">:</span><span class="at"> /local_nvme/dataset_cache</span></span>
+<span id="cb33-36"><a href="#cb33-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-37"><a href="#cb33-37" aria-hidden="true" tabindex="-1"></a><span class="fu">checkpoint</span><span class="kw">:</span></span>
+<span id="cb33-38"><a href="#cb33-38" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">interval_steps</span><span class="kw">:</span><span class="at"> </span><span class="dv">1000</span></span>
+<span id="cb33-39"><a href="#cb33-39" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">async_upload</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb33-40"><a href="#cb33-40" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">include</span><span class="kw">:</span></span>
+<span id="cb33-41"><a href="#cb33-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> model</span></span>
+<span id="cb33-42"><a href="#cb33-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> optimizer</span></span>
+<span id="cb33-43"><a href="#cb33-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> scheduler</span></span>
+<span id="cb33-44"><a href="#cb33-44" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> rng</span></span>
+<span id="cb33-45"><a href="#cb33-45" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> sampler_cursor</span></span>
+<span id="cb33-46"><a href="#cb33-46" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> global_step</span></span>
+<span id="cb33-47"><a href="#cb33-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-48"><a href="#cb33-48" aria-hidden="true" tabindex="-1"></a><span class="fu">acceptance</span><span class="kw">:</span></span>
+<span id="cb33-49"><a href="#cb33-49" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hbm_peak_p95_gib_max</span><span class="kw">:</span><span class="at"> </span><span class="dv">68</span></span>
+<span id="cb33-50"><a href="#cb33-50" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">mfu_min</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.45</span></span>
+<span id="cb33-51"><a href="#cb33-51" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">dataloader_visible_wait_pct_max</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb33-52"><a href="#cb33-52" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">resume_validation_steps</span><span class="kw">:</span><span class="at"> </span><span class="dv">20</span></span></code></pre></div>
+<h3 id="108-交付物">10.8 交付物</h3>
+<p>这个 worked example 通过后，必须产出：</p>
+<ul>
+<li><code>collect_env.txt</code>。</li>
+<li><code>nvidia-smi topo -m</code>。</li>
+<li>500 step metrics CSV。</li>
+<li><code>torch.profiler</code> trace。</li>
+<li>Nsight Systems timeline。</li>
+<li>memory summary before and after optimizer step。</li>
+<li>checkpoint resume validation log。</li>
+<li>bottleneck diagnosis markdown。</li>
+</ul>
+<p>没有这些证据，不应进入多节点扩展。</p>
+<hr />
+<h2 id="11-反模式">11. 反模式</h2>
+<h3 id="111-把-nvidia-smi-当成效率分析">11.1 把 nvidia-smi
+当成效率分析</h3>
+<p><code>nvidia-smi</code> 只能告诉你 GPU 忙不忙。它不能告诉你：</p>
+<ul>
+<li>Tensor Core 是否吃满。</li>
+<li>kernel 是否被 launch gap 打碎。</li>
+<li>H2D 是否和 compute overlap。</li>
+<li>padding 是否浪费 token。</li>
+<li>activation checkpointing 是否造成无效重算。</li>
+</ul>
+<p>需要用 MFU/HFU、tokens/s、Nsight 和 profiler 补齐。</p>
+<h3 id="112-用-batch-size-掩盖数据路径问题">11.2 用 batch size
+掩盖数据路径问题</h3>
+<p>GPU 低利用率时，增大 microbatch 可能让 utilization 变好，但如果根因是
+DataLoader visible wait，问题会在更高 batch 下变成 OOM 或更大 step
+jitter。</p>
+<p>正确做法：</p>
+<ul>
+<li>先定位 visible wait。</li>
+<li>再判断是 read、preprocess、collate、pin memory 还是 H2D。</li>
+<li>最后只改对应变量。</li>
+</ul>
+<h3 id="113-amp-只写一个布尔值">11.3 AMP 只写一个布尔值</h3>
+<p><code>amp=True</code> 不是可复现配置。至少要记录：</p>
+<ul>
+<li>autocast dtype。</li>
+<li>GradScaler 是否启用。</li>
+<li>optimizer state dtype。</li>
+<li>master weights。</li>
+<li>FP8 scaling recipe。</li>
+<li>不参与低精度的算子列表。</li>
+</ul>
+<h3 id="114-checkpoint-只保存-model">11.4 Checkpoint 只保存 model</h3>
+<p>只保存 model 会导致 resume 后：</p>
+<ul>
+<li>optimizer momentum 丢失。</li>
+<li>LR schedule 错位。</li>
+<li>RNG 不连续。</li>
+<li>dataset sample 重复或跳过。</li>
+<li>loss 曲线跳变。</li>
+</ul>
+<p>生产 checkpoint 必须是状态协议。</p>
+<h3 id="115-profile-warmup-或首步">11.5 Profile warmup 或首步</h3>
+<p>首步包含：</p>
+<ul>
+<li>CUDA context 初始化。</li>
+<li>kernel autotune。</li>
+<li>allocator 初始扩张。</li>
+<li>dataset cache cold miss。</li>
+<li>lazy import 和 compilation。</li>
+</ul>
+<p>把首步放进稳态统计会误导 admission。profile 应该有 wait/warmup/active
+窗口。</p>
+<h3 id="116-追求单机极限导致不可扩展">11.6 追求单机极限导致不可扩展</h3>
+<p>单机 baseline 要服务后续扩展。如果为了单机吞吐使用不可恢复、不兼容
+checkpoint、不稳定 FP8 recipe
+或过度依赖本地手工缓存，进入多机后会付出更高成本。</p>
+<hr />
+<h2 id="12-checklistsingle-node-baseline-acceptance-checklist">12.
+Checklist：single-node baseline acceptance checklist</h2>
+<h3 id="121-配置与版本">12.1 配置与版本</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />记录 git SHA、container image
+digest、PyTorch、CUDA、NCCL、driver。</label></li>
+<li><label><input type="checkbox" />保存
+model、data、training、system、checkpoint 配置。</label></li>
+<li><label><input type="checkbox" />固定 dataset manifest、tokenizer
+hash、shuffle seed。</label></li>
+<li><label><input type="checkbox" />明确 precision
+policy：BF16/FP16/FP8、GradScaler、optimizer state dtype。</label></li>
+<li><label><input type="checkbox" />记录 GPU topology、NUMA、local
+NVMe、MIG/ECC 状态。</label></li>
+</ul>
+<h3 id="122-数据路径">12.2 数据路径</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />dataset shard
+可校验，读路径没有逐样本远端随机读。</label></li>
+<li><label><input type="checkbox" />DataLoader wait 在稳态 step
+中低于目标阈值。</label></li>
+<li><label><input
+type="checkbox" /><code>num_workers</code>、<code>prefetch_factor</code>、<code>pin_memory</code>
+有 A/B 证据。</label></li>
+<li><label><input type="checkbox" />H2D 与 compute 至少部分
+overlap，Nsight Systems 可见。</label></li>
+<li><label><input type="checkbox" />page cache、本地缓存、磁盘 await
+没有异常长尾。</label></li>
+</ul>
+<h3 id="123-显存与状态">12.3 显存与状态</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />显存预算使用公式
+<code>params + grads + optimizer states + activations + temp + fragmentation</code>。</label></li>
+<li><label><input type="checkbox" />HBM peak P95 小于
+<code>0.85 * capacity</code>。</label></li>
+<li><label><input type="checkbox" /><code>allocated/reserved</code>
+差距可解释。</label></li>
+<li><label><input type="checkbox" />activation checkpointing 的收益和
+tokens/s 成本有记录。</label></li>
+<li><label><input type="checkbox" />optimizer
+state、GradScaler、RNG、sampler cursor 被 checkpoint 覆盖。</label></li>
+</ul>
+<h3 id="124-效率">12.4 效率</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />报告 raw tokens/s 和 non-pad
+tokens/s。</label></li>
+<li><label><input type="checkbox" />报告 step time
+P50/P95/P99。</label></li>
+<li><label><input type="checkbox" />计算 MFU 和 HFU，并说明 FLOPs
+口径。</label></li>
+<li><label><input type="checkbox" />GPU utilization、SM active、tensor
+active 同时采集。</label></li>
+<li><label><input type="checkbox" />profile 不包含 warmup
+和首步初始化。</label></li>
+</ul>
+<h3 id="125-故障与恢复">12.5 故障与恢复</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />OOM、NaN、DataLoader
+timeout、checkpoint stall 有排障 runbook。</label></li>
+<li><label><input type="checkbox" />checkpoint 可以 strict
+resume。</label></li>
+<li><label><input type="checkbox" />resume 后 loss、LR、global
+step、dataset cursor 连续。</label></li>
+<li><label><input
+type="checkbox" />日志后端失败不会阻塞训练。</label></li>
+<li><label><input type="checkbox" />profile 和 debug
+开关可配置关闭。</label></li>
+</ul>
+<h3 id="126-进入分布式前的门禁">12.6 进入分布式前的门禁</h3>
+<ul class="task-list">
+<li><label><input
+type="checkbox" />单机瓶颈已归类为数据、H2D、kernel、optimizer、checkpoint
+或 logging。</label></li>
+<li><label><input type="checkbox" />不存在未解释的 step time
+周期性尖峰。</label></li>
+<li><label><input type="checkbox" />不存在未解释的 HBM
+增长。</label></li>
+<li><label><input type="checkbox" />不存在高 utilization 低 MFU
+的未解释差距。</label></li>
+<li><label><input type="checkbox" />baseline
+证据包可供第8章和第9章复用。</label></li>
+</ul>
+<hr />
+<h2 id="13-本章小结">13. 本章小结</h2>
+<p>单机训练不是规模小的训练，而是训练系统的最小闭环。它把数据路径、计算路径、状态路径和故障路径放在一台机器里，让工程师可以用最低成本建立因果链。</p>
+<p>本章的核心结论：</p>
+<ul>
+<li>Training step 必须拆到 dataset read、CPU preprocessing、DataLoader
+worker、page cache、pinned
+memory、H2D、forward、loss、backward、optimizer、AMP、logging、checkpoint。</li>
+<li>显存预算必须包含 params、grads、optimizer
+states、activations、temp、fragmentation。</li>
+<li>GPU utilization 不能替代 MFU/HFU/tokens/s。</li>
+<li>BF16 是稳健 baseline，FP16 需要 loss scaling，FP8
+需要硬件、recipe、scaling metadata 和 loss parity。</li>
+<li>Profiler chain 应从 <code>torch.profiler</code> 到 Nsight
+Systems，再到 Nsight
+Compute、DCGM、<code>iostat</code>、<code>perf</code>。</li>
+<li>LLaMA-7B on 8xH100 的 baseline 应先证明显存、吞吐、MFU/HFU 和
+checkpoint resume，再进入多节点扩展。</li>
+</ul>
+<p>一句话概括：</p>
+<blockquote>
+<p>单机基线不是“先跑一下”，而是训练基础设施的第一份可审计证据。</p>
+</blockquote>
+<hr />
+<h2 id="14-练习题">14. 练习题</h2>
+<ol type="1">
+<li>给定一个 13B 模型、BF16 参数、AdamW FP32 m/v、8x80GB GPU，估算 DDP
+是否能训。写出 params、grads、optimizer
+states、activation、temp、fragmentation 的预算。</li>
+<li>一个训练 run 的 GPU utilization 为 98%，MFU 为 28%，tokens/s
+低于预期。列出 5 个可能根因，并说明你会用哪些工具验证。</li>
+<li>DataLoader wait 占 step time 25%。设计一个单变量 A/B
+实验序列，区分远端读取、CPU preprocessing、collate、H2D
+哪一段是瓶颈。</li>
+<li>FP16 run 中 GradScaler scale 从 <code>65536</code> 持续降到
+<code>128</code>，loss 偶发 spike。给出证据链和回滚策略。</li>
+<li>LLaMA-7B on 8xH100，<code>microbatch=2</code> 时 HBM P95 为 63
+GiB、MFU 48%；<code>microbatch=3</code> 时 HBM P95 为 75 GiB、MFU
+53%。你是否接受 <code>microbatch=3</code> 进入生产
+baseline？说明理由。</li>
+<li>设计一个 checkpoint resume validation：需要保存哪些状态，resume
+后比较哪些指标，跑多少 step 才算通过。</li>
+<li>用 Nsight Systems 看到 H2D copy 与 compute 严格串行。列出 4
+个可能原因和对应修复动作。</li>
+<li>activation checkpointing 后 HFU 从 52% 升到 63%，MFU 从 47% 降到
+43%。解释这个现象，并给出下一步实验。</li>
+<li>训练每 1000 step 出现一次 30 秒尖峰。你如何证明它来自
+checkpoint，而不是 DataLoader 或 kernel？</li>
+<li>写一份单机 baseline evidence package
+目录结构，要求能支持一个新工程师复现你的结论。</li>
+</ol>
+
 </section>
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>

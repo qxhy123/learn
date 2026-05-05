@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 0d3c 章 · GPUDirect RDMA、GPU/NIC 拓扑与诊断 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=0d3c" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 0d3c 章 · GPUDirect RDMA、GPU/NIC 拓扑与诊断</h1>
+<p class="sub">讲清 NIC 如何直接访问 GPU HBM，以及 peermem、BAR、PCIe 拓扑和容器权限如何决定 GDRDMA 是否成立。</p>
+<div class="chips"><span class="chip">GPUDirect</span><span class="chip">GDRDMA</span><span class="chip">GPU HBM</span><span class="chip">NIC</span><span class="chip">PCIe</span><span class="chip">NCCL</span></div>
+</section>
+<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#gpudirect-rdma-到底是什么">1. GPUDirect RDMA 到底是什么</a></li><li><a class="anchor" href="#第一性原理拆解-学习大纲">2. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#gpudirect-rdma-在系统栈里的位置">3. GPUDirect RDMA 在系统栈里的位置</a></li><li><a class="anchor" href="#普通路径gpu-hbm-到-host-pinned-再到-nic">4. 普通路径：GPU HBM 到 host pinned 再到 NIC</a></li><li><a class="anchor" href="#gdrdma-direct-path-的数据面">5. GDRDMA direct path 的数据面</a></li><li><a class="anchor" href="#nvidia_peermem-与-peer-memory">6. nvidia_peermem 与 peer memory</a></li><li><a class="anchor" href="#barbar1-与-gpu-memory-aperture">7. BAR、BAR1 与 GPU memory aperture</a></li><li><a class="anchor" href="#pcie-p2proot-complex-与-switch">8. PCIe P2P、root complex 与 switch</a></li><li><a class="anchor" href="#iommuacs-与-ats">9. IOMMU、ACS 与 ATS</a></li><li><a class="anchor" href="#dma-mapping-与-mr-的边界">10. DMA mapping 与 MR 的边界</a></li><li><a class="anchor" href="#gpu-memory-registration-cache">11. GPU memory registration cache</a></li><li><a class="anchor" href="#gpunic-localityrootswitchnuma">12. GPU/NIC locality：root、switch、NUMA</a></li><li><a class="anchor" href="#multi-rail-与-rankgpuhca-绑定">13. multi-rail 与 rank/GPU/HCA 绑定</a></li><li><a class="anchor" href="#nccl-如何使用-cuda-buffer">14. NCCL 如何使用 CUDA buffer</a></li><li><a class="anchor" href="#ucx-如何使用-cuda-buffer">15. UCX 如何使用 CUDA buffer</a></li><li><a class="anchor" href="#mpi-如何使用-cuda-buffer">16. MPI 如何使用 CUDA buffer</a></li><li><a class="anchor" href="#如何判断-gdrdma-enabled-或-fallback">17. 如何判断 GDRDMA enabled 或 fallback</a></li><li><a class="anchor" href="#性能模型host-staging-与-direct-path">18. 性能模型：host staging 与 direct path</a></li><li><a class="anchor" href="#对-cpudram-与-copy-engine-的影响">19. 对 CPU、DRAM 与 copy engine 的影响</a></li><li><a class="anchor" href="#命令观测拓扑">20. 命令观测：拓扑</a></li><li><a class="anchor" href="#命令观测rdma-与-peermem">21. 命令观测：RDMA 与 peermem</a></li><li><a class="anchor" href="#命令观测gdrdma-microbenchmark">22. 命令观测：GDRDMA microbenchmark</a></li><li><a class="anchor" href="#命令观测nccl">23. 命令观测：NCCL</a></li><li><a class="anchor" href="#命令观测ucxmpi">24. 命令观测：UCX/MPI</a></li><li><a class="anchor" href="#容器与-kubernetes-权限">25. 容器与 Kubernetes 权限</a></li><li><a class="anchor" href="#版本矩阵与变更风险">26. 版本矩阵与变更风险</a></li><li><a class="anchor" href="#worked-examplegdrdma-disabled">27. Worked Example：GDRDMA disabled</a></li><li><a class="anchor" href="#worked-examplegpunic-跨-socket-选错-hca">28. Worked Example：GPU/NIC 跨 socket 选错 HCA</a></li><li><a class="anchor" href="#worked-example容器缺-device-或-peermem-fallback">29. Worked Example：容器缺 device 或 peermem fallback</a></li><li><a class="anchor" href="#故障模式总表">30. 故障模式总表</a></li><li><a class="anchor" href="#gdrdma-验收-sop">31. GDRDMA 验收 SOP</a></li><li><a class="anchor" href="#checklist">32. Checklist</a></li><li><a class="anchor" href="#练习">33. 练习</a></li></ol></section>
+<section class="section">
+<blockquote>
+<p><strong>关联章节</strong>：本章是 GPUDirect RDMA 专章，聚焦 GPU HBM
+到 NIC 的跨节点快路径、PCIe/NUMA 拓扑约束、NCCL/UCX/MPI 的 CUDA buffer
+使用和生产排障。RDMA verbs、RoCE/IB、PFC/ECN/MTU 的通用背景见 <a
+href="0d3-rdma-roce-infiniband-and-gpudirect.html">0d3</a>，NUMA、PCIe、DMA
+和 pinned memory 的基础见 <a
+href="0b3-numa-pcie-dma-and-pinned-memory.html">0b3</a>，NCCL collective
+诊断见 <a
+href="0d4-nccl-collectives-and-network-diagnostics.html">0d4</a>。</p>
+</blockquote>
+<h2 id="gpudirect-rdma-到底是什么">1. GPUDirect RDMA 到底是什么</h2>
+<p>GPUDirect RDMA 是 RDMA 的一个关键扩展：<strong>让 RDMA NIC 直接 DMA
+读写 GPU HBM，而不是先把 GPU 数据复制到 host pinned
+memory。</strong></p>
+<p>没有 GPUDirect RDMA 时，跨节点 GPU 通信通常要经过 host staging：</p>
+<pre class="text"><code>GPU HBM -&gt; host pinned memory -&gt; NIC -&gt; network -&gt; peer NIC -&gt; host pinned memory -&gt; peer GPU HBM</code></pre>
+<p>这个路径是正确的，但它会额外占用 GPU copy engine、PCIe、host DRAM
+带宽和 CPU/驱动调度资源。启用 GPUDirect RDMA 后，理想路径变成：</p>
+<pre class="text"><code>GPU HBM &lt;-&gt; NIC RDMA engine &lt;-&gt; network &lt;-&gt; peer NIC &lt;-&gt; peer GPU HBM</code></pre>
+<p>这并不只是 NCCL 的一个环境变量。它要求 GPU driver、RDMA
+driver、<code>nvidia_peermem</code>、HCA、IOMMU/ACS/ATS、PCIe
+P2P、BAR/BAR1
+映射、容器设备权限和通信库都配合。任何一层不成立，通信库仍可能接受 CUDA
+pointer，但实际退回 host staging 或 socket fallback。</p>
+<p>GPUDirect RDMA 和前两章的关系：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>层次</th>
+<th>负责的问题</th>
+<th>本章如何使用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RDMA verbs</td>
+<td>NIC 如何访问注册内存</td>
+<td>CUDA device memory 也必须能被注册/映射成 NIC 可访问的 MR</td>
+</tr>
+<tr>
+<td>RoCE/IB</td>
+<td>RDMA packet 如何穿过 fabric</td>
+<td>GDRDMA 只优化 GPU/NIC 内存路径，不替代 MTU/PFC/ECN/GID/SM</td>
+</tr>
+<tr>
+<td>GPUDirect RDMA</td>
+<td>NIC 如何直接访问 GPU HBM</td>
+<td>关注 GPU/NIC 拓扑、peer memory、BAR、IOMMU、容器权限和 fallback</td>
+</tr>
+</tbody>
+</table>
+<p>一句话：<strong>RDMA 让 NIC 直接访问内存；RoCE/IB 决定这些 RDMA
+packet 怎么过网络；GPUDirect RDMA 让这块“内存”可以是 GPU
+显存。</strong></p>
+<h2 id="第一性原理拆解-学习大纲">2. 第一性原理拆解 + 学习大纲</h2>
+<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
+<p>分布式训练的跨节点通信经常从 GPU memory 出发，也经常落到另一块 GPU
+memory。不可化简的问题不是“网络带宽够不够”，而是：</p>
+<p><strong>NIC 是否能在正确授权、正确地址翻译、正确 PCIe
+路径和正确软件栈下，直接 DMA 访问 GPU HBM
+对应的虚拟地址，而不把数据先搬到 host pinned memory。</strong></p>
+<p>这句话拆成五个约束：</p>
+<ol type="1">
+<li>buffer 约束：通信库拿到的是 CUDA device pointer，不是普通 host
+pointer。</li>
+<li>注册约束：RDMA NIC 只能访问已注册、已 pin、已映射并有 key 的 memory
+region。</li>
+<li>地址约束：GPU virtual address、GPU physical backing、PCIe bus
+address、IOMMU IO virtual address 不是一回事。</li>
+<li>拓扑约束：GPU 和 HCA 可能同 PCIe switch、同 root complex、跨
+root、跨 socket，路径成本差异很大。</li>
+<li>权限约束：kernel module、driver、OFED、容器
+device、memlock、IPC_LOCK、NVIDIA runtime 任一层缺失都会退化。</li>
+</ol>
+<h3 id="推从问题推出机制">推：从问题推出机制</h3>
+<p>如果 NIC 不能直接读写 GPU memory，通信库只能走 staging：</p>
+<ol type="1">
+<li>GPU copy engine 把 HBM 复制到 host pinned memory。</li>
+<li>NIC DMA 读取 host pinned memory 并发往网络。</li>
+<li>对端 NIC DMA 写入 host pinned memory。</li>
+<li>对端 GPU copy engine 再把 host pinned memory 复制到 HBM。</li>
+</ol>
+<p>如果要避免这两次 host staging，就必须让 NIC verbs registration 能识别
+CUDA pointer，让 GPU driver 暴露 peer memory 映射，让 HCA 建立可 DMA
+的页表，并让 PCIe fabric 允许 P2P transaction。于是推出
+<code>nvidia_peermem</code>、BAR/BAR1 映射、peer memory client、DMA
+mapping、MR key、IOMMU/ACS/ATS 策略和拓扑 locality 这些机制。</p>
+<h3 id="绘普通路径与-gdrdma-快路径">绘：普通路径与 GDRDMA 快路径</h3>
+<pre class="mermaid">flowchart LR
+  subgraph Slow[普通跨节点路径：host staging]
+    G0[GPU0 HBM] --> CE0[GPU copy engine]
+    CE0 --> H0[Host pinned buffer]
+    H0 --> NIC0[NIC DMA read]
+    NIC0 --> Fabric[RDMA fabric]
+    Fabric --> NIC1[NIC DMA write]
+    NIC1 --> H1[Host pinned buffer]
+    H1 --> CE1[GPU copy engine]
+    CE1 --> G1[GPU1 HBM]
+  end
+
+  subgraph Fast[GDRDMA direct path]
+    G2[GPU0 HBM] --> BAR0[GPU BAR/BAR1 peer mapping]
+    BAR0 --> NIC2[NIC DMA read GPU memory]
+    NIC2 --> Fabric2[RDMA fabric]
+    Fabric2 --> NIC3[NIC DMA write GPU memory]
+    NIC3 --> BAR1[GPU BAR/BAR1 peer mapping]
+    BAR1 --> G3[GPU1 HBM]
+  end</pre>
+<h3 id="导本章读完后你应该能回答">导：本章读完后你应该能回答</h3>
+<ol type="1">
+<li>为什么 CUDA buffer 不能自动等价于 RDMA MR？</li>
+<li><code>nvidia_peermem</code>、BAR1、PCIe P2P、IOMMU、ACS、ATS
+分别卡在哪一层？</li>
+<li><code>nvidia-smi topo -m</code> 里的
+<code>PIX</code>、<code>PXB</code>、<code>PHB</code>、<code>NODE</code>、<code>SYS</code>
+对 GPU/NIC 绑定意味着什么？</li>
+<li>NCCL、UCX、MPI 拿到 CUDA buffer 后如何选择 GPUDirect RDMA、host
+staging 或 socket fallback？</li>
+<li>如何从
+<code>NCCL_DEBUG</code>、<code>UCX_LOG_LEVEL</code>、<code>ib_write_bw --use_cuda</code>
+判断 direct path 是否真的启用？</li>
+<li>容器和 Kubernetes 为什么经常让裸机可用的 GDRDMA 退化？</li>
+<li>性能曲线如何区分 host staging、跨 socket HCA、copy engine
+饱和、fabric 拥塞和 registration 抖动？</li>
+</ol>
+<h2 id="gpudirect-rdma-在系统栈里的位置">3. GPUDirect RDMA
+在系统栈里的位置</h2>
+<p>GPUDirect 是 NVIDIA 对 GPU 与外设直接交互的一组能力名。GPUDirect RDMA
+特指第三方 PCIe 设备，最常见是 Mellanox/NVIDIA ConnectX HCA，通过 RDMA
+verbs 直接访问 GPU memory。它不是 NCCL 独有能力，UCX、MPI、NVSHMEM、GDS
+等栈也可能使用相近的 peer memory 机制。</p>
+<p>典型训练调用链如下：</p>
+<pre class="text"><code>PyTorch / JAX / TensorFlow
+  -&gt; NCCL / UCX-Py / MPI / NVSHMEM
+  -&gt; CUDA pointer detection
+  -&gt; verbs memory registration
+  -&gt; nvidia_peermem peer memory callback
+  -&gt; HCA MTT/MPT/IOMMU mapping
+  -&gt; PCIe read/write to GPU BAR aperture
+  -&gt; RDMA packets over IB or RoCE</code></pre>
+<p>两个边界要分清：RDMA 是网络和 HCA 能力，GDRDMA 是 RDMA 访问 GPU
+memory 的能力；CUDA-aware MPI 或 CUDA-aware UCX 只说明库能接受 CUDA
+pointer，不保证最终一定走 GDRDMA。</p>
+<h2 id="普通路径gpu-hbm-到-host-pinned-再到-nic">4. 普通路径：GPU HBM 到
+host pinned 再到 NIC</h2>
+<p>没有 GDRDMA 时，通信库仍然可以支持 CUDA buffer。它会把 device memory
+分块搬到 host pinned buffer，再让 NIC 访问 host
+buffer。这个路径正确但昂贵。</p>
+<pre class="text"><code>send side:
+  cudaMemcpyAsync(host_pinned &lt;- gpu_buffer)
+  wait or pipeline copy completion
+  ibv_post_send(host_pinned MR)
+  NIC DMA reads host DRAM
+
+receive side:
+  NIC DMA writes host_pinned MR
+  poll CQ
+  cudaMemcpyAsync(gpu_buffer &lt;- host_pinned)</code></pre>
+<p>host staging 的成本来自四处：PCIe 上多走两段 GPU &lt;-&gt; host
+DMA；host DRAM 带宽被通信占用；GPU copy engine 被 D2H/H2D 占用；pipeline
+需要额外同步，放大小消息 latency。大 buffer 时，有效带宽通常被
+<code>min(GPU D2H, host DRAM, NIC line rate, H2D)</code> 限制。</p>
+<h2 id="gdrdma-direct-path-的数据面">5. GDRDMA direct path 的数据面</h2>
+<p>GDRDMA 目标是让 HCA 对 GPU memory 执行 DMA read/write。它不是把 HBM
+变成普通系统内存，而是建立一条授权过的 peer mapping。</p>
+<pre class="text"><code>CUDA device pointer
+  -&gt; communication library detects pointer type
+  -&gt; ibv_reg_mr() or registration cache asks verbs to register
+  -&gt; peer memory client recognizes GPU VA range
+  -&gt; NVIDIA driver pins GPU pages and exposes DMA mapping
+  -&gt; HCA programs memory translation and access key
+  -&gt; NIC issues PCIe read/write toward GPU</code></pre>
+<p>关键点：HCA 看到的是可 DMA 的 bus/I/O virtual address，不是 CUDA
+虚拟地址本身；GPU memory registration 有生命周期；NIC 直接写 GPU memory
+不等价于 GPU kernel 已经看到数据，通信库仍然要处理 CUDA
+stream、event、memory ordering；跨 socket 或被 ACS 强制上行到 root
+complex 时，direct path 仍可能慢。</p>
+<h2 id="nvidia_peermem-与-peer-memory">6. nvidia_peermem 与 peer
+memory</h2>
+<p><code>nvidia_peermem</code> 是 NVIDIA GPU driver 与 RDMA core/OFED
+之间的 peer memory 模块。它让 verbs registration 遇到 GPU memory
+时，可以调用 NVIDIA driver 完成 pin、map、unmap、invalidate 等动作。</p>
+<p>检查项：<code>lsmod | egrep 'nvidia_peermem|nv_peer_mem|mlx5_core|ib_core'</code>、<code>modinfo nvidia_peermem</code>、<code>dmesg | egrep -i 'nvidia_peermem|peer.*mem|mlx5'</code>。</p>
+<p>实践边界：</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>组件</th>
+<th>作用</th>
+<th>失败表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nvidia_peermem</code></td>
+<td>连接 NVIDIA driver 与 RDMA peer memory 注册</td>
+<td><code>ib_write_bw --use_cuda</code> 失败或退到 host</td>
+</tr>
+<tr>
+<td><code>mlx5_core</code> / <code>mlx5_ib</code></td>
+<td>HCA PCIe、verbs、MR、QP、CQ</td>
+<td>没有 RDMA device，NCCL 退到 socket</td>
+</tr>
+<tr>
+<td>RDMA core / OFED</td>
+<td>verbs ABI、kernel/user library</td>
+<td><code>ibv_reg_mr</code> 失败，版本 ABI 不匹配</td>
+</tr>
+<tr>
+<td>CUDA driver</td>
+<td>CUDA VA、GPU page pin、BAR 映射</td>
+<td>CUDA pointer 识别失败或映射失效</td>
+</tr>
+</tbody>
+</table>
+<p>历史上有 <code>nv_peer_mem</code> out-of-tree 模块；新栈通常使用
+<code>nvidia_peermem</code>。生产排障时不要只看模块名，还要核对
+driver、CUDA、OFED、kernel 的组合是否被厂商支持。</p>
+<h2 id="barbar1-与-gpu-memory-aperture">7. BAR、BAR1 与 GPU memory
+aperture</h2>
+<p>PCIe 设备通过 BAR 暴露 MMIO 或 memory aperture。GPU 的 BAR1 常用于让
+CPU 或 peer device 访问 GPU memory 的窗口。GDRDMA 并不要求把全部 HBM
+永久映射进 BAR1；驱动和 HCA 会按页、窗口和访问模式建立映射。</p>
+<p>常见误解：BAR1 size 小于 HBM size 不等于 GDRDMA 不可用；BAR1
+可见不等于 HCA 一定能访问，还要看 peer memory、IOMMU、ACS
+和拓扑；<code>nvidia-smi -q</code> 看到 BAR1 usage
+增加可以作为线索，但不能单独证明性能路径。可用
+<code>nvidia-smi -q -d MEMORY</code> 和
+<code>lspci -vv -s &lt;bdf&gt;</code> 查看 BAR、Resizable
+BAR、ACS、ATS。</p>
+<h2 id="pcie-p2proot-complex-与-switch">8. PCIe P2P、root complex 与
+switch</h2>
+<p>PCIe P2P 指一个 endpoint 直接向另一个 endpoint 发
+transaction，而不是所有流量都必须经过 host memory。GPU 与 HCA 同挂一个
+PCIe switch 时，P2P 路径通常最短；跨 root complex 或跨 socket
+时，transaction 可能经过 CPU root port、UPI/Infinity Fabric 和另一个
+root port。</p>
+<p><code>nvidia-smi topo -m</code> 常见标记：</p>
+<table>
+<thead>
+<tr>
+<th>标记</th>
+<th>含义</th>
+<th>对 GDRDMA 的直觉</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PIX</code></td>
+<td>经过一个 PCIe switch</td>
+<td>通常是优先绑定对象</td>
+</tr>
+<tr>
+<td><code>PXB</code></td>
+<td>经过多个 PCIe bridge/switch</td>
+<td>可用但 latency/带宽可能差</td>
+</tr>
+<tr>
+<td><code>PHB</code></td>
+<td>经过 PCIe host bridge</td>
+<td>需要谨慎验证</td>
+</tr>
+<tr>
+<td><code>NODE</code></td>
+<td>跨同 NUMA node 内互连</td>
+<td>可能可用但不如近邻</td>
+</tr>
+<tr>
+<td><code>SYS</code></td>
+<td>跨 NUMA socket</td>
+<td>高风险，容易带宽低和抖动</td>
+</tr>
+<tr>
+<td><code>NV#</code></td>
+<td>GPU 间 NVLink</td>
+<td>影响节点内 GPU P2P，不代表 HCA locality</td>
+</tr>
+</tbody>
+</table>
+<p>拓扑不是“能不能跑”的二值判断，而是“应该把哪个 rank 绑到哪个 GPU
+和哪个 HCA”的优化问题。</p>
+<h2 id="iommuacs-与-ats">9. IOMMU、ACS 与 ATS</h2>
+<p>IOMMU 把 device DMA address 转换成系统物理地址或 I/O virtual
+address。它提供隔离，但也可能增加映射复杂度。ACS 控制 PCIe transaction
+是否能在 switch 内 peer-to-peer 直达，还是必须上送 root complex。ATS
+允许设备缓存地址翻译，减少 IOMMU 开销，但需要平台、BIOS、kernel、device
+共同支持。</p>
+<p>对 GDRDMA 的影响：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>可能收益</th>
+<th>可能风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IOMMU on</td>
+<td>DMA 隔离、虚拟化支持</td>
+<td>P2P mapping 失败、性能下降</td>
+</tr>
+<tr>
+<td>IOMMU passthrough</td>
+<td>较低开销，保留部分 IOMMU 框架</td>
+<td>隔离弱于严格模式</td>
+</tr>
+<tr>
+<td>ACS enabled</td>
+<td>隔离和路由控制清晰</td>
+<td>禁止或绕远 P2P，跨 root 往返</td>
+</tr>
+<tr>
+<td>ACS override</td>
+<td>可能恢复 P2P</td>
+<td>安全边界变弱，不宜随意用于生产</td>
+</tr>
+<tr>
+<td>ATS/PRI</td>
+<td>减少地址翻译压力</td>
+<td>需要端到端支持，故障更隐蔽</td>
+</tr>
+</tbody>
+</table>
+<p>排障原则：不要先改 BIOS。先用
+topo、<code>lspci -vv</code>、性能测试证明路径问题，再由平台团队评估
+IOMMU/ACS 策略。</p>
+<h2 id="dma-mapping-与-mr-的边界">10. DMA mapping 与 MR 的边界</h2>
+<p>RDMA verbs 的 memory registration 给 HCA 一个可访问的 MR，应用拿到
+<code>lkey</code> 或 <code>rkey</code>。GPU memory registration 与 host
+memory registration 的关键差异在 backing store 和 invalidate
+生命周期。</p>
+<p>host pinned memory：</p>
+<pre class="text"><code>process VA -&gt; pinned host pages -&gt; DMA map -&gt; HCA MR</code></pre>
+<p>GPU memory：</p>
+<pre class="text"><code>CUDA VA -&gt; GPU allocation -&gt; peer memory pin -&gt; BAR/IOMMU DMA map -&gt; HCA MR</code></pre>
+<p>边界条件：<code>cudaMalloc</code>、<code>cudaMallocAsync</code>、framework
+allocator 和 memory pool 会复用地址，registration cache
+必须处理释放与重分配；Unified Memory 可能发生 page migration；IPC
+handle、MPS、MIG、容器 namespace 会改变可见性；通信库需要 CUDA event 或
+stream dependency 确保 kernel 写完后 NIC 再读。</p>
+<h2 id="gpu-memory-registration-cache">11. GPU memory registration
+cache</h2>
+<p>每次注册 GPU memory 都可能触发 driver 回调、页 pin、DMA mapping、HCA
+表项更新和同步。高性能通信库通常会做 registration cache，按地址范围缓存
+MR。</p>
+<p>缓存命中时，CUDA buffer range 直接 lookup existing MR 后 post RDMA
+work request；缓存未命中时，先 register peer memory、update cache，再
+post request。</p>
+<p>常见问题包括动态 shape 降低 cache 命中率、频繁创建销毁 communicator
+或 CUDA context、memlock 限制过低、allocator
+释放后复用同一虚拟地址但通信库 invalidate 处理不正确。</p>
+<h2 id="gpunic-localityrootswitchnuma">12. GPU/NIC
+locality：root、switch、NUMA</h2>
+<p>GPU/NIC locality 的目标是把每个 rank 的 GPU 绑定到最近的 HCA
+port。训练节点可能是 8 GPU + 8 HCA、8 GPU + 4 HCA、8 GPU + 2 HCA，或
+HGX/DGX 形态；即使 GPU 间有 NVSwitch，NIC locality 仍受 PCIe/NUMA
+影响。</p>
+<p>先画拓扑，再谈环境变量：</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-p2p</span> w</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="at">-tv</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;NVIDIA|Mellanox|ConnectX&#39;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">numactl</span> <span class="at">-H</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/class/infiniband/mlx5_<span class="pp">*</span>/device/numa_node</span></code></pre></div>
+<p>判断顺序：先找每个 GPU 的 closest HCA，再确认 HCA port 的 link
+layer、rate、state，然后叠加 rank/GPU/HCA 绑定，最后检查跨 socket
+路径是否只在必要时发生。</p>
+<h2 id="multi-rail-与-rankgpuhca-绑定">13. multi-rail 与 rank/GPU/HCA
+绑定</h2>
+<p>multi-rail 的目标是同时使用多张 HCA 或多个 port，提高总带宽并减少单
+rail 热点。它不是简单地把 <code>NCCL_IB_HCA=mlx5_0,mlx5_1,...</code>
+写得越多越好。</p>
+<p>绑定对象有三层：进程层把 rank 绑到 CPU NUMA，GPU 层用
+<code>CUDA_VISIBLE_DEVICES</code> 和 local rank 绑 CUDA device，NIC 层用
+NCCL topology、<code>NCCL_IB_HCA</code> 或 UCX
+<code>UCX_NET_DEVICES</code> 选择 HCA/port。</p>
+<p>8 GPU + 8 HCA 的示例绑定：</p>
+<pre class="text"><code>rank0 -&gt; GPU0 -&gt; mlx5_0:1 -&gt; CPU NUMA 0
+rank1 -&gt; GPU1 -&gt; mlx5_1:1 -&gt; CPU NUMA 0
+rank2 -&gt; GPU2 -&gt; mlx5_2:1 -&gt; CPU NUMA 0
+rank3 -&gt; GPU3 -&gt; mlx5_3:1 -&gt; CPU NUMA 0
+rank4 -&gt; GPU4 -&gt; mlx5_4:1 -&gt; CPU NUMA 1
+rank5 -&gt; GPU5 -&gt; mlx5_5:1 -&gt; CPU NUMA 1
+rank6 -&gt; GPU6 -&gt; mlx5_6:1 -&gt; CPU NUMA 1
+rank7 -&gt; GPU7 -&gt; mlx5_7:1 -&gt; CPU NUMA 1</code></pre>
+<p>风险包括所有 rank 选到同一 HCA、rank0/GPU0 选到 socket1 的
+HCA、容器里 HCA 设备名顺序和宿主机不一致、双端节点 rail 命名不一致。</p>
+<h2 id="nccl-如何使用-cuda-buffer">14. NCCL 如何使用 CUDA buffer</h2>
+<p>NCCL 收到 collective 的 send/recv buffer 后，会识别 pointer 是否在
+CUDA device memory。跨节点时它选择 NET transport，常见是
+<code>NET/IB</code> 或 <code>NET/Socket</code>。如果 <code>NET/IB</code>
+可用且 GPU memory registration 成功，NCCL 可以使用
+GDRDMA；如果失败，可能走 host staging 或 socket。</p>
+<p>关键日志入口：</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET,GRAPH,COLL</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_TOPO_DUMP_FILE</span><span class="op">=</span>/tmp/nccl-topo.xml</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_IB_HCA</span><span class="op">=</span>mlx5_0,mlx5_1</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_SOCKET_IFNAME</span><span class="op">=</span>eth0</span></code></pre></div>
+<p>常见日志线索：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>日志片段</th>
+<th>可能含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NET/IB</code></td>
+<td>NCCL 使用 verbs/RDMA 网络插件</td>
+</tr>
+<tr>
+<td><code>NET/Socket</code></td>
+<td>没用 RDMA，走 TCP socket</td>
+</tr>
+<tr>
+<td><code>GDRDMA</code> / <code>GPU Direct RDMA</code></td>
+<td>direct path 被探测或启用</td>
+</tr>
+<tr>
+<td><code>Could not enable P2P</code></td>
+<td>GPU P2P 或 GPU/NIC P2P 相关能力不足</td>
+</tr>
+<tr>
+<td><code>Failed to open libibverbs</code></td>
+<td>容器或镜像缺 verbs library</td>
+</tr>
+<tr>
+<td><code>No device found</code></td>
+<td>HCA 不可见、端口 down、device cgroup 或 namespace 问题</td>
+</tr>
+</tbody>
+</table>
+<p>不要只 grep 一个词就下结论；要把 NCCL
+日志、<code>ib_write_bw --use_cuda</code>、topology
+和性能曲线合起来看。</p>
+<h2 id="ucx-如何使用-cuda-buffer">15. UCX 如何使用 CUDA buffer</h2>
+<p>UCX 会通过 memory type detection 判断 buffer 属于 host、CUDA
+device、CUDA managed 等类型，然后选择 transport lane。典型 CUDA/RDMA
+相关 transport 包括
+<code>rc_x</code>、<code>dc_x</code>、<code>cuda_copy</code>、<code>cuda_ipc</code>、<code>gdr_copy</code>。</p>
+<p>常用变量：</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">UCX_LOG_LEVEL</span><span class="op">=</span>info</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">UCX_TLS</span><span class="op">=</span>rc_x,cuda_copy,cuda_ipc,gdr_copy</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">UCX_NET_DEVICES</span><span class="op">=</span>mlx5_0:1</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">UCX_MEMTYPE_CACHE</span><span class="op">=</span>y</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ucx_info</span> <span class="at">-d</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ucx_perftest</span> <span class="at">-t</span> tag_bw <span class="at">-m</span> cuda <span class="at">-s</span> 1048576 <span class="op">&lt;</span>peer<span class="op">&gt;</span></span></code></pre></div>
+<p>判断思路：<code>cuda_ipc</code> 主要用于同节点进程间 GPU
+memory；<code>cuda_copy</code> 表示用 CUDA copy engine 做 host/device
+copy，不等于 GDRDMA；<code>gdr_copy</code> 常用于小消息 CPU 映射 GPU
+memory copy，不等同于 HCA RDMA direct；<code>rc_x</code> 或
+<code>dc_x</code> 是 RDMA transport，但是否直接访问 GPU memory 还要看
+memory registration 和日志。</p>
+<p>UCX 报错经常比 NCCL 更贴近 verbs 层，例如 memory type cache、IB
+port、GID、registration、devx 权限。MPI 栈用 UCX 时，先用
+<code>ucx_perftest</code> 缩小问题比直接跑完整训练更快。</p>
+<h2 id="mpi-如何使用-cuda-buffer">16. MPI 如何使用 CUDA buffer</h2>
+<p>CUDA-aware MPI 指 MPI API 可以接受 CUDA pointer。实现方式取决于 MPI
+发行版和配置，常见底层是 UCX、OFI 或厂商 PML/BTL。</p>
+<p>检查入口：</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ompi_info</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;cuda|ucx|openib|ofi&#39;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mpirun</span> <span class="at">-x</span> UCX_LOG_LEVEL=info <span class="at">-x</span> UCX_TLS=rc_x,cuda_copy,gdr_copy ./cuda_mpi_test</span></code></pre></div>
+<p>边界：<code>MPI_Send(device_ptr, ...)</code> 能运行，不代表走
+GDRDMA；有些 MPI 会在小消息走 host bounce buffer，大消息才尝试 RDMA；MPI
+launcher 的 rank mapping 直接影响 GPU/NIC locality；容器中
+<code>mpirun</code>、PMIx、verbs library 和 host OFED ABI
+不一致时，错误可能表现为初始化失败，也可能表现为性能 fallback。</p>
+<h2 id="如何判断-gdrdma-enabled-或-fallback">17. 如何判断 GDRDMA enabled
+或 fallback</h2>
+<p>按证据强度排序：</p>
+<ol type="1">
+<li><code>ib_write_bw --use_cuda</code> 在指定 GPU/HCA
+组合上成功，带宽接近 HCA line rate，CPU/DRAM 负载低。</li>
+<li>NCCL 日志显示 <code>NET/IB</code>、GDRDMA 相关路径，并且
+<code>nccl-tests</code> 跨节点 busbw 符合理想拓扑。</li>
+<li>UCX debug/info 日志显示 CUDA memory registration 走 RDMA
+transport。</li>
+<li><code>nvidia_peermem</code> 已加载，HCA/GPU topo 近，BAR1
+有使用变化。</li>
+<li>host DRAM 带宽和 CPU memcpy 指标没有随通信线性升高。</li>
+</ol>
+<p>fallback 线索包括
+<code>NET/Socket</code>、<code>cuda_copy</code>、host
+bounce、staging、pinned buffer pool 日志增加；大消息带宽接近 PCIe
+D2H/H2D 或 host DRAM 限制；CPU utilization、memory controller
+read/write、NUMA remote traffic 随通信增加；同一节点不同 GPU/HCA
+组合性能差异巨大。</p>
+<h2 id="性能模型host-staging-与-direct-path">18. 性能模型：host staging
+与 direct path</h2>
+<p>设单向消息大小为 <code>S</code>，GPU 到 host copy 带宽为
+<code>B_d2h</code>，host 到 GPU copy 带宽为 <code>B_h2d</code>，NIC
+有效带宽为 <code>B_net</code>，固定开销为 <code>L</code>。</p>
+<p>host staging 的单向近似：</p>
+<pre class="text"><code>T_stage ~= L_copy + S / B_d2h + L_net + S / B_net</code></pre>
+<p>双端 GPU 到 GPU：</p>
+<pre class="text"><code>T_stage_gpu_to_gpu ~= L + S/B_d2h_sender + S/B_net + S/B_h2d_receiver</code></pre>
+<p>GDRDMA direct path：</p>
+<pre class="text"><code>T_gdr ~= L_reg_or_cache + L_net + S / min(B_pcie_p2p, B_net)</code></pre>
+<p>这只是上界直觉。实际还受 NCCL chunk pipeline、多个 channel、copy
+engine 并发、PCIe read completion、HCA outstanding read、GPU memory
+ordering 和 fabric 拥塞影响。</p>
+<h2 id="对-cpudram-与-copy-engine-的影响">19. 对 CPU、DRAM 与 copy
+engine 的影响</h2>
+<p>GDRDMA 的价值不只是网络带宽更高，还包括释放 CPU 和 host DRAM。host
+staging 需要 CPU 管理 memcpy、poll、同步和 buffer pool，占用 host DRAM
+bandwidth 与 GPU copy engine，并让 PCIe 走 GPU-host + host-NIC
+多段路径。GDRDMA 主要保留提交和 poll 开销，让通信不再线性消耗 host
+DRAM；如果训练还同时做 CPU offload、checkpoint、dataloader
+decode，这个差异会直接反映到 step time。</p>
+<h2 id="命令观测拓扑">20. 命令观测：拓扑</h2>
+<p>最小拓扑取证包：</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">hostname</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">-L</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-m</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> topo <span class="at">-p2p</span> w</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="at">-tv</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;NVIDIA|Mellanox|ConnectX&#39;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="ex">numactl</span> <span class="at">-H</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> d <span class="kw">in</span> /sys/class/infiniband/mlx5_<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$d</span><span class="st"> numa=</span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$d</span>/device/numa_node<span class="va">)</span><span class="st"> bdf=</span><span class="va">$(</span><span class="fu">basename</span> <span class="va">$(</span><span class="fu">readlink</span> <span class="va">$d</span>/device<span class="va">))</span><span class="st">&quot;</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>读法：先找每个 GPU 到每个 NIC 的 topo label，再看 NIC 的 NUMA node
+是否接近，用 <code>lspci -tv</code> 验证同 switch 或同 root，最后叠加
+launcher 的 local rank 映射。</p>
+<h2 id="命令观测rdma-与-peermem">21. 命令观测：RDMA 与 peermem</h2>
+<p>RDMA device
+取证：<code>lsmod | egrep 'nvidia_peermem|mlx5_core|mlx5_ib|ib_uverbs|ib_core'</code>、<code>ibv_devinfo</code>、<code>ibstat</code>、<code>rdma link show</code>、<code>rdma resource show</code>、<code>devlink dev show</code>。</p>
+<p>端口状态：</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> d <span class="kw">in</span> /sys/class/infiniband/mlx5_<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;== </span><span class="va">$d</span><span class="st"> ==&quot;</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span> <span class="va">$d</span>/ports/1/state <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span> <span class="va">$d</span>/ports/1/rate <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span> <span class="va">$d</span>/ports/1/link_layer <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>RoCE
+还要看网卡接口：<code>ip -br link</code>、<code>ip -br addr</code>、<code>ethtool -S &lt;iface&gt; | egrep -i 'pause|pfc|ecn|cnp|drop|timeout|retry|roce'</code>。</p>
+<h2 id="命令观测gdrdma-microbenchmark">22. 命令观测：GDRDMA
+microbenchmark</h2>
+<p>用 perftest 的 CUDA 模式先验证单 GPU/HCA 对：</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># server</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ib_write_bw</span> <span class="at">-d</span> mlx5_0 <span class="at">-i</span> 1 <span class="at">--use_cuda</span><span class="op">=</span>0 <span class="at">--report_gbits</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co"># client</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ib_write_bw</span> <span class="op">&lt;</span>server_ip<span class="op">&gt;</span> -d mlx5_0 <span class="at">-i</span> 1 <span class="at">--use_cuda</span><span class="op">=</span>0 <span class="at">--report_gbits</span></span></code></pre></div>
+<p>不同版本的 perftest 参数可能是 <code>--use_cuda=&lt;gpu_id&gt;</code>
+或 <code>--use_cuda</code> 搭配 GPU id 选项，以本机
+<code>ib_write_bw --help</code> 为准。</p>
+<p>测试矩阵至少覆盖 GPU0/GPU1/跨 socket GPU，closest/remote HCA，4
+KiB/64 KiB/1 MiB/64 MiB，write/read/bidirectional，local/remote CPU
+bind。如果 host memory <code>ib_write_bw</code> 正常而
+<code>--use_cuda</code> 失败，优先查
+<code>nvidia_peermem</code>、CUDA/OFED ABI、BAR/IOMMU 和容器
+device。</p>
+<h2 id="命令观测nccl">23. 命令观测：NCCL</h2>
+<p>跨节点验证建议用 <code>nccl-tests</code>：</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_DEBUG_SUBSYS</span><span class="op">=</span>INIT,NET,GRAPH</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_TOPO_DUMP_FILE</span><span class="op">=</span>/tmp/nccl-topo.xml</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_IB_DISABLE</span><span class="op">=</span>0</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_SOCKET_IFNAME</span><span class="op">=</span>eth0</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="ex">mpirun</span> <span class="at">-np</span> 16 <span class="at">-N</span> 8 <span class="dt">\</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-x</span> NCCL_DEBUG <span class="at">-x</span> NCCL_DEBUG_SUBSYS <span class="at">-x</span> NCCL_TOPO_DUMP_FILE <span class="dt">\</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-x</span> NCCL_IB_DISABLE <span class="at">-x</span> NCCL_SOCKET_IFNAME <span class="dt">\</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>  ./build/all_reduce_perf <span class="at">-b</span> 8 <span class="at">-e</span> 8G <span class="at">-f</span> 2 <span class="at">-g</span> 1</span></code></pre></div>
+<p>关键读法：<code>algbw</code> 是 collective
+语义带宽，<code>busbw</code> 是按算法换算后的总线压力估计；小消息看
+latency 和曲线平滑度，大消息看平台上限；只跑一个最大 size 不够，要看
+size sweep；单节点正常不代表跨节点 GDRDMA 正常。</p>
+<h2 id="命令观测ucxmpi">24. 命令观测：UCX/MPI</h2>
+<p>UCX 先看
+<code>ucx_info -d | egrep -i 'cuda|gdr|mlx5|rc|dc'</code>，再跑
+<code>UCX_LOG_LEVEL=info UCX_TLS=rc_x,cuda_copy,gdr_copy UCX_NET_DEVICES=mlx5_0:1 ucx_perftest &lt;peer&gt; -t tag_bw -m cuda -s 1048576</code>。Open
+MPI + UCX 先用 <code>ompi_info | egrep -i 'ucx|cuda'</code>
+看构建能力，再用 <code>mpirun -x UCX_LOG_LEVEL=info ...</code> 跑 CUDA
+pingpong。</p>
+<p>如果 UCX 日志只出现
+<code>tcp</code>、<code>self</code>、<code>sm</code> 或
+<code>cuda_copy</code>，说明还没有证明跨节点 CUDA buffer 走 RDMA
+direct。</p>
+<h2 id="容器与-kubernetes-权限">25. 容器与 Kubernetes 权限</h2>
+<p>裸机正常、容器异常是 GDRDMA 的高频故障。容器需要同时看到 GPU、RDMA
+device、verbs library、driver ABI 和足够的锁页权限。</p>
+<p>最小检查：</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/infiniband</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/nvidia<span class="pp">*</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ldconfig</span> <span class="at">-p</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;libibverbs|libmlx5|libcuda|libnccl&#39;</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="bu">ulimit</span> <span class="at">-l</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> Cap /proc/self/status</span></code></pre></div>
+<p>Kubernetes 常见配置项：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVIDIA device plugin / runtime</td>
+<td>注入 GPU device 和 driver library</td>
+</tr>
+<tr>
+<td>RDMA device plugin</td>
+<td>注入 <code>/dev/infiniband/*</code></td>
+</tr>
+<tr>
+<td><code>IPC_LOCK</code> capability</td>
+<td>允许锁页和 memory registration</td>
+</tr>
+<tr>
+<td><code>ulimit memlock</code> 或容器 runtime memlock</td>
+<td>避免 MR 注册失败</td>
+</tr>
+<tr>
+<td>host OFED 与镜像 verbs ABI</td>
+<td>避免 user/kernel ABI 不匹配</td>
+</tr>
+<tr>
+<td>privileged 或精确 device cgroup</td>
+<td>暴露 HCA char device</td>
+</tr>
+</tbody>
+</table>
+<p>容器内能 <code>nvidia-smi</code> 不代表能 GDRDMA；能
+<code>ibv_devinfo</code> 不代表 CUDA peer memory
+注册成功，二者都要验证。</p>
+<h2 id="版本矩阵与变更风险">26. 版本矩阵与变更风险</h2>
+<p>GDRDMA 是跨层能力，版本组合比单个软件版本更重要。</p>
+<p>需要记录：</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="fu">uname</span> <span class="at">-a</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /etc/os-release</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="ex">modinfo</span> nvidia <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;^version&#39;</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="ex">modinfo</span> nvidia_peermem <span class="kw">|</span> <span class="fu">egrep</span> <span class="st">&#39;^version|filename&#39;</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ofed_info</span> <span class="at">-s</span> <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span> <span class="at">-v</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="st">import torch</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.__version__)</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.version.cuda)</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a><span class="st">print(torch.cuda.nccl.version() if torch.cuda.is_available() else None)</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p>变更风险排序：kernel 更新但 OFED/peer memory module 没同步；NVIDIA
+driver 更新但容器镜像仍挂旧 userspace library；NCCL 更新改变 HCA
+选择、GDR level 或 topology 解析；Kubernetes device plugin 更新改变
+device 暴露顺序；BIOS 更新改变 ACS/IOMMU/Resizable BAR 策略。</p>
+<h2 id="worked-examplegdrdma-disabled">27. Worked Example：GDRDMA
+disabled</h2>
+<p>现象：</p>
+<pre class="text"><code>nccl-tests 跨节点可运行，但 busbw 只有预期的 35% 到 50%。
+CPU memory bandwidth 随 all_reduce 增加明显升高。
+ib_write_bw host memory 正常，ib_write_bw --use_cuda 失败。</code></pre>
+<p>证据：</p>
+<div class="sourceCode" id="cb24"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="fu">lsmod</span> <span class="kw">|</span> <span class="fu">grep</span> nvidia_peermem</span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="co"># no output</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ib_write_bw</span> <span class="at">--use_cuda</span><span class="op">=</span>0 <span class="at">-d</span> mlx5_0 <span class="op">&lt;</span>peer<span class="op">&gt;</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="co"># CUDA memory registration failed</span></span></code></pre></div>
+<p>推理：RDMA host path 正常，说明 HCA、port、fabric 不是第一嫌疑；CUDA
+buffer path 失败，说明问题在 peer memory registration 或 GPU/HCA
+mapping；NCCL 能跑但慢，符合 host staging fallback。</p>
+<p>处理：</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> modprobe nvidia_peermem</span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="fu">lsmod</span> <span class="kw">|</span> <span class="fu">grep</span> nvidia_peermem</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">egrep</span> <span class="at">-i</span> <span class="st">&#39;nvidia_peermem|peer&#39;</span></span></code></pre></div>
+<p>验收：<code>ib_write_bw --use_cuda</code> 成功，NCCL 日志出现
+<code>NET/IB</code> 且没有 socket fallback，大消息 busbw
+回到平台预期范围，CPU/DRAM 压力下降。</p>
+<h2 id="worked-examplegpunic-跨-socket-选错-hca">28. Worked
+Example：GPU/NIC 跨 socket 选错 HCA</h2>
+<p>现象：</p>
+<pre class="text"><code>nodeA GPU0 到 nodeB GPU0 all_reduce 慢。
+nodeA GPU4 到 nodeB GPU4 正常。
+所有 HCA port state active，ib_write_bw host memory 正常。</code></pre>
+<p>拓扑：</p>
+<pre class="text"><code>GPU0  &lt;-&gt; mlx5_0 : PIX
+GPU0  &lt;-&gt; mlx5_4 : SYS
+GPU4  &lt;-&gt; mlx5_4 : PIX</code></pre>
+<p>错误配置：</p>
+<div class="sourceCode" id="cb28"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">CUDA_VISIBLE_DEVICES</span><span class="op">=</span>0,1,2,3,4,5,6,7</span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">NCCL_IB_HCA</span><span class="op">=</span>mlx5_4</span></code></pre></div>
+<p>推理：GPU0 的通信被强制走 socket1 的 HCA，PCIe transaction 跨 CPU
+socket，带宽下降且 latency 抖动；collective 由最慢 rank
+决定，单个错误绑定会拖慢全局。</p>
+<p>修正：</p>
+<div class="sourceCode" id="cb29"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 让 NCCL 拓扑自动选择，或按 local rank 分组注入</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="bu">unset</span> <span class="va">NCCL_IB_HCA</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果必须手动绑定，按 GPU 分组启动</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="ex">rank0-3:</span> NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3</span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="ex">rank4-7:</span> NCCL_IB_HCA=mlx5_4,mlx5_5,mlx5_6,mlx5_7</span></code></pre></div>
+<p>验收：<code>NCCL_DEBUG_SUBSYS=GRAPH,NET</code> 中 rank/HCA 与 topo
+一致，<code>numactl -H</code> 与 cpuset 没有把 rank pin 到远端
+socket，分 GPU/HCA 矩阵测试不再出现单边慢点。</p>
+<h2 id="worked-example容器缺-device-或-peermem-fallback">29. Worked
+Example：容器缺 device 或 peermem fallback</h2>
+<p>现象：</p>
+<pre class="text"><code>宿主机 ib_write_bw --use_cuda 正常。
+容器内 nvidia-smi 正常，但 NCCL 日志显示 NET/Socket。
+容器内 ibv_devinfo 报 No IB devices found。</code></pre>
+<p>容器检查：</p>
+<div class="sourceCode" id="cb31"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/infiniband</span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="co"># No such file or directory</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ldconfig</span> <span class="at">-p</span> <span class="kw">|</span> <span class="fu">grep</span> libibverbs</span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="co"># empty or wrong path</span></span></code></pre></div>
+<p>推理：GPU device 已注入，RDMA device 没注入；NCCL 找不到 verbs
+device，只能走 socket；如果 <code>/dev/infiniband</code> 存在但 memlock
+太低，则可能是 registration 失败后 fallback。</p>
+<p>修正方向：</p>
+<div class="sourceCode" id="cb32"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="fu">securityContext</span><span class="kw">:</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">capabilities</span><span class="kw">:</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">add</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;IPC_LOCK&quot;</span><span class="kw">]</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rdma/hca</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<p>还需要由运行时或镜像保证
+<code>/dev/infiniband/uverbs*</code>、<code>rdma_cm</code>、<code>issm*</code>
+按需可见，NVIDIA runtime 注入匹配宿主机 driver 的
+<code>libcuda.so</code>，verbs provider <code>libmlx5</code> 与 kernel
+driver ABI 匹配，<code>ulimit -l</code> 足够大。</p>
+<p>验收：</p>
+<div class="sourceCode" id="cb33"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ibv_devinfo</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ib_write_bw</span> <span class="at">--use_cuda</span><span class="op">=</span>0 <span class="at">-d</span> mlx5_0 <span class="op">&lt;</span>peer<span class="op">&gt;</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="va">NCCL_DEBUG</span><span class="op">=</span>INFO <span class="ex">./all_reduce_perf</span> ...</span></code></pre></div>
+<h2 id="故障模式总表">30. 故障模式总表</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>现象</th>
+<th>第一嫌疑</th>
+<th>关键证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NET/Socket</code></td>
+<td>verbs/HCA 不可见</td>
+<td>NCCL 日志、<code>ibv_devinfo</code></td>
+</tr>
+<tr>
+<td><code>ib_write_bw</code> host 正常，CUDA 失败</td>
+<td>peermem/GPU mapping</td>
+<td><code>lsmod nvidia_peermem</code>、dmesg</td>
+</tr>
+<tr>
+<td>某些 GPU 慢</td>
+<td>HCA locality 错</td>
+<td><code>nvidia-smi topo -m</code> 矩阵</td>
+</tr>
+<tr>
+<td>大消息慢，小消息正常</td>
+<td>PCIe/fabric 带宽</td>
+<td>size sweep、port counters</td>
+</tr>
+<tr>
+<td>小消息抖动</td>
+<td>registration miss、CPU poll、CQ moderation</td>
+<td>UCX/NCCL 日志、perf</td>
+</tr>
+<tr>
+<td>容器内失败</td>
+<td>device/capability/library</td>
+<td><code>/dev/infiniband</code>、<code>ulimit -l</code></td>
+</tr>
+<tr>
+<td>RoCE 间歇 timeout</td>
+<td>PFC/ECN/MTU/fabric drop</td>
+<td>switch/NIC counters</td>
+</tr>
+<tr>
+<td>更新后退化</td>
+<td>版本矩阵变化</td>
+<td>driver/OFED/NCCL diff</td>
+</tr>
+</tbody>
+</table>
+<h2 id="gdrdma-验收-sop">31. GDRDMA 验收 SOP</h2>
+<p>单机先记录 GPU/HCA/NUMA/PCIe 拓扑，确认
+<code>nvidia_peermem</code>、<code>mlx5_core</code>、<code>mlx5_ib</code>、<code>ib_uverbs</code>
+加载，确认 HCA port active、rate 正确、link layer 符合预期，并检查
+memlock、IPC_LOCK、容器 device。两节点先用 host memory
+<code>ib_write_bw</code> 建立 baseline，再用 CUDA memory
+<code>ib_write_bw --use_cuda</code> 验证 peer memory，并对 GPU/HCA
+locality 组合采样。NCCL 验收从单节点 <code>all_reduce_perf</code>
+到两节点再到多节点扩展，保存 <code>NCCL_DEBUG=INFO</code>、topo
+dump、命令行和版本矩阵。上线门槛是目标 GPU/HCA 组合通过 CUDA RDMA
+microbenchmark、跨节点 busbw 达到平台预期、没有 socket
+fallback、容器内与宿主机一致、重启后可复现。</p>
+<h2 id="checklist">32. Checklist</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" /><code>nvidia-smi topo -m</code>
+已保存。</label></li>
+<li><label><input type="checkbox" /><code>lspci -tv</code>
+已保存。</label></li>
+<li><label><input type="checkbox" />GPU 到 HCA locality
+已形成矩阵。</label></li>
+<li><label><input type="checkbox" /><code>nvidia_peermem</code> 已加载且
+dmesg 无异常。</label></li>
+<li><label><input type="checkbox" /><code>ibv_devinfo</code> 能看到目标
+HCA。</label></li>
+<li><label><input type="checkbox" />HCA port state active，rate
+正确。</label></li>
+<li><label><input type="checkbox" /><code>ib_write_bw</code> host memory
+正常。</label></li>
+<li><label><input type="checkbox" /><code>ib_write_bw --use_cuda</code>
+对目标 GPU/HCA 正常。</label></li>
+<li><label><input type="checkbox" /><code>NCCL_DEBUG=INFO</code> 未出现
+socket fallback。</label></li>
+<li><label><input
+type="checkbox" /><code>NCCL_DEBUG_SUBSYS=GRAPH,NET</code> 显示 HCA
+选择符合拓扑。</label></li>
+<li><label><input type="checkbox" />UCX/MPI 如被使用，已单独跑 CUDA
+buffer perftest。</label></li>
+<li><label><input type="checkbox" />容器内 <code>/dev/infiniband</code>
+可见。</label></li>
+<li><label><input type="checkbox" />容器具备 <code>IPC_LOCK</code>
+或等效 memlock 配置。</label></li>
+<li><label><input type="checkbox" />NVIDIA runtime 与 driver library
+匹配。</label></li>
+<li><label><input type="checkbox" />OFED/RDMA core userspace 与 kernel
+driver 匹配。</label></li>
+<li><label><input type="checkbox" />RoCE 场景已核对
+MTU、GID、PFC、ECN、DSCP/PCP。</label></li>
+<li><label><input type="checkbox" />多 rail 没有单 HCA
+热点。</label></li>
+<li><label><input type="checkbox" />rank/GPU/HCA/CPU NUMA
+绑定可解释。</label></li>
+<li><label><input
+type="checkbox" />变更前后版本矩阵可对比。</label></li>
+<li><label><input
+type="checkbox" />验收日志和性能结果已归档。</label></li>
+</ul>
+<h2 id="练习">33. 练习</h2>
+<ol type="1">
+<li>给一台 8 GPU、4 HCA 节点画出 GPU/HCA locality 矩阵，并为每个 local
+rank 选择 HCA。</li>
+<li>构造 <code>ib_write_bw --use_cuda</code> 测试矩阵：至少包含 closest
+HCA、remote socket HCA、host memory baseline。</li>
+<li>给出一段 NCCL 日志，标出 bootstrap、NET transport、HCA
+selection、GDRDMA 或 fallback 证据。</li>
+<li>解释为什么 <code>nvidia-smi</code> 正常但容器内
+<code>ibv_devinfo</code> 失败时，NCCL 会走 socket。</li>
+<li>比较 host staging 与 GDRDMA 在 CPU DRAM bandwidth
+上的差异，并说明应该用哪些指标验证。</li>
+<li>在 RoCE 集群中，列出 GDRDMA 正常但 NCCL 仍 timeout 的三个 fabric
+层原因。</li>
+<li>说明为什么 <code>UCX_TLS=cuda_copy</code> 不能证明 GPUDirect RDMA
+已启用。</li>
+<li>设计一次 driver/OFED/NCCL 升级后的回归测试，要求能发现 peermem
+失效、HCA 选错和 socket fallback。</li>
+</ol>
+
+</section>
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
