@@ -20,7 +20,7 @@
 - 主机资源：CPU core、page cache、DRAM、pinned memory、worker 进程、文件描述符。
 - 传输资源：PCIe、NVLink、DMA engine、copy stream、NUMA locality。
 - 设备资源：HBM、SM、Tensor Core、L2、kernel launch queue、CUDA allocator。
-- 状态资源：参数、梯度、优化器状态、scheduler、RNG、global step、checkpoint。
+- 状态资源：参数、梯度、优化器状态、scheduler、RNG、`optimizer_step`、`microstep_idx`、checkpoint。
 
 单机训练的工程目标是让这些资源形成稳定闭环：
 
@@ -64,7 +64,7 @@ dataset -> CPU pipeline -> H2D -> GPU compute -> optimizer update -> durable sta
 - 训练控制面：launcher、配置、随机种子、resume 逻辑、checkpoint policy、日志策略。
 - 数据路径：dataset read、page cache、本地缓存、CPU preprocessing、DataLoader worker、collate、pinned memory、H2D。
 - 计算路径：forward、loss、backward、gradient accumulation、optimizer step、AMP/GradScaler、scheduler。
-- 状态路径：model weights、gradients、optimizer state、RNG、global step、dataset cursor、checkpoint metadata。
+- 状态路径：model weights、gradients、optimizer state、RNG、`optimizer_step`、`microstep_idx`、dataset cursor、checkpoint metadata。
 - 故障路径：OOM、NaN、DataLoader hang、I/O stall、H2D stall、kernel inefficiency、checkpoint stall。
 
 本章讨论的“单机”可以是：
@@ -126,30 +126,46 @@ sequenceDiagram
     participant S as Storage / Dataset Shard
     participant PC as Linux Page Cache
     participant W as DataLoader Worker
-    participant H as Host RAM / Pinned Memory
+    participant Q as Worker Result Queue
+    participant P as Pin Memory Thread
+    participant H as Pinned Host Batch
     participant C as CUDA Copy Stream
     participant G as GPU Compute Stream
+    participant A as Accumulation State
     participant O as Optimizer / Scheduler
     participant L as Logger
-    participant CK as Checkpoint Writer
+    participant CK as Checkpoint Capture / Writer
 
     S->>PC: read sample bytes or mmap pages
     PC-->>W: cache hit or block on disk/network
     W->>W: decode/tokenize/augment/filter
-    W->>H: collate batch in pageable memory
-    H->>H: pin memory when pin_memory=True
-    H->>C: enqueue non_blocking H2D copy
-    C->>G: device batch ready event
-    G->>G: AMP autocast forward
-    G->>G: loss compute and reduction
-    G->>G: backward, save/recompute activations
-    G->>O: gradients ready
-    O->>O: unscale/clip/update AdamW/scheduler
-    O->>G: zero_grad or set_to_none
-    O->>L: emit metrics every N steps
-    O->>CK: save model/optimizer/RNG/dataloader state
-    CK->>S: write checkpoint shards and metadata
+    W->>Q: collate batch into bounded result queue
+    Q-->>P: main process consumes next CPU batch
+    P->>H: pin pages when pin_memory=True
+    H->>C: enqueue non_blocking H2D copy on copy stream
+    C-->>G: record device-batch-ready event
+    G->>G: wait event, then AMP autocast forward
+    G->>G: loss compute, mask, reduction
+    G->>A: backward accumulates gradients for microstep_idx
+    alt not accumulation boundary
+        A->>G: keep gradients resident for next microstep
+    else optimizer-step boundary
+        A->>O: gradients ready for optimizer_step
+        O->>O: unscale/clip/update AdamW/scheduler
+        O->>G: zero_grad or set_to_none
+        O->>L: emit metrics without forcing per-step sync
+        O->>CK: capture state after stream fence
+        CK->>S: write checkpoint shards and metadata
+    end
 ```
+
+这条时间线要按 producer-consumer trace 读，而不是按串行伪代码读：
+
+- DataLoader worker 是 producer，`worker_result_queue` 是有界队列。队列为空会让训练主线程 visible wait；队列长期满则说明 GPU/主线程消费慢，继续加 worker 没意义。
+- `pin_memory=True` 通常由主进程侧 pin-memory thread 把 pageable batch 迁移到 pinned host pages。pinned memory 过量会挤压普通 DRAM 和 page cache。
+- H2D copy 应放在 dedicated copy stream；compute stream 只等待“这个 batch ready”的 event，不应全局 `torch.cuda.synchronize()`。
+- `microstep_idx` 每做一次 forward/backward 就递增；`optimizer_step` 只在 gradient accumulation boundary 且 optimizer update 真正执行后递增。
+- checkpoint capture fence 是状态一致性边界：默认只在 optimizer-step boundary，等相关 compute/copy stream 对本次 update 可见后，捕获 model/optimizer/scheduler/RNG/data cursor 等状态。checkpoint 写盘可以异步，但被写出的快照必须来自同一个边界。
 
 ### 3.3 控制路径
 
@@ -204,8 +220,24 @@ dataset storage
 - AMP GradScaler state，FP16 训练尤其需要。
 - RNG state：Python、NumPy、PyTorch CPU、PyTorch CUDA。
 - dataset sampler state 和 consumed token/sample cursor。
-- global step、epoch、microstep。
+- `optimizer_step`、`microstep_idx`、epoch。
 - framework metadata，例如 FSDP/DDP wrapper、dtype policy、checkpoint schema。
+
+`microstep_idx` 和 `optimizer_step` 不能混用：
+
+- `microstep_idx`：每消费一个 microbatch 并执行一次 forward/backward 后递增。它对应 DataLoader 进度、gradient accumulation substep 和 profiling 里的 microstep 时间。
+- `optimizer_step`：只在 accumulation boundary、梯度检查通过、optimizer update 和 scheduler update 完成后递增。它对应 LR schedule、checkpoint interval、训练曲线横轴和恢复一致性。
+- 如果 FP16 `GradScaler` 发现 overflow 并跳过 `optimizer.step()`，这次 microstep 已经发生，但 `optimizer_step` 不应递增；否则 tokens/s 看起来正常，实际 update 数会错。
+
+默认 checkpoint 只应在 optimizer-step boundary 保存。这样磁盘快照不需要保存半累计梯度，只需保存 update 后的 model、optimizer、scheduler、RNG、sampler cursor 和配置。若系统支持 mid-accum checkpoint，必须额外保存：
+
+- accumulated gradients 或可恢复的 gradient accumulation buffer。
+- `grad_accum_substep = microstep_idx % grad_accum_steps`。
+- sampler cursor、streaming shard offset、worker base seed。
+- packing residual buffer，例如上一个样本切分后尚未放入 packed sequence 的 token 尾巴。
+- AMP `GradScaler` state，包括 scale、growth tracker、found_inf 相关状态。
+- FP8 amax/scale metadata，包括 amax history、current scale、scale inverse 和 recipe 版本。
+- 所有 rank 对齐的 RNG state，以及 DataLoader worker 可复现所需的 seed/cursor。
 
 即使本章聚焦单机，也要把 checkpoint 当成恢复协议，而不是文件保存动作。否则第10章讨论的恢复一致性无法建立。
 
@@ -408,7 +440,7 @@ print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
 | 指标 | 回答的问题 | 容易误用的地方 |
 |---|---|---|
-| tokens/s | 单位时间处理多少训练 token | padding 多时会高估有效数据进展，需区分 raw tokens 和 non-pad tokens |
+| tokens/s | 单位时间处理多少 token 或槽位 | 必须拆成 `raw_sequence_slots/s`、`compute_tokens/s`、`non_pad_tokens/s`、`loss_tokens/s` |
 | GPU utilization | GPU 是否忙 | 不说明是否在做有效模型 FLOPs |
 | SM occupancy | SM 上并发 warp 是否足够 | 不说明 Tensor Core 是否吃满，也不说明 memory stall |
 | Tensor Core utilization | MMA/Tensor Core 指令使用情况 | 需要 Nsight Compute 或框架 profile，不等于 SM utilization |
@@ -419,7 +451,7 @@ print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
 $$
 \text{MFU} =
-\frac{\text{model FLOPs per token} \times \text{tokens/s}}
+\frac{\text{model FLOPs per effective token} \times \text{effective token/s}}
 {\text{peak FLOPs per GPU} \times \text{num GPUs}}
 $$
 
@@ -447,6 +479,60 @@ HFU may increase while MFU and tokens/s stay flat or decrease
 
 原因是硬件执行了更多 FLOPs，但每个 token 的有效训练进展没有增加。
 
+### 4.8 Token/FLOPs 账本：raw、compute、non-pad、loss
+
+训练吞吐必须先定义分母。一个 batch 里至少有四种 token 口径：
+
+| 名称 | 定义 | 典型来源 | 用途 |
+|---|---|---|---|
+| `raw_sequence_slots` | 固定 shape 中的 token 槽位数 | `B_mu * S * N_gpu`，optimizer step 再乘 `G_accum` | H2D、activation shape、dense kernel shape 的账本 |
+| `padding_slots` | padding 槽位数 | `(attention_mask == 0).sum()` 或 packing metadata | 衡量 padding waste |
+| `non_pad_tokens` | 非 padding token 数 | `attention_mask.sum()` 或 packed token count | 数据吞吐、样本进展 |
+| `compute_tokens` | 实际执行主要模型 FLOPs 的 token 数 | 由 kernel 输入 shape 和 compaction 策略决定 | HFU、硬件 FLOPs 账本 |
+| `loss_tokens` | 参与 loss reduction 的 label 数 | `(labels != -100).sum()`，注意 causal shift 后统计 | loss 分母、SFT 有效监督量 |
+
+由此得到两个效率：
+
+```text
+packing_efficiency = non_pad_tokens / raw_sequence_slots
+loss_efficiency = loss_tokens / non_pad_tokens
+```
+
+关键边界是：mask 不等于跳过计算。普通 padded dense Transformer 中，即使 `attention_mask` 阻止 pad token 被 attend，MLP/linear/norm 仍通常在 `[B, S, H]` 上执行；很多 attention kernel 也按 padded block shape 调度。因此：
+
+```text
+compute_tokens = raw_sequence_slots
+```
+
+如果声称 `compute_tokens < raw_sequence_slots`，必须说明具体机制：
+
+- sequence packing：多个短样本被拼进同一个长序列槽位，减少 `padding_slots`，但仍以 packed 后的 dense slots 执行。
+- unpadding / compaction：把非 pad token gather 成 `[total_non_pad_tokens, H]` 或 varlen layout，kernel 使用 `cu_seqlens`、offset table 等 metadata，只对 compacted token 执行部分算子。
+- varlen FlashAttention：attention 可按非 pad token 和真实 sequence 边界执行，但如果 MLP 仍回到 padded `[B, S, H]`，全模型 `compute_tokens` 不能简单等于 `non_pad_tokens`。
+- full compacted block：attention、MLP、norm、loss 都在 compacted token layout 上执行，并在需要时 scatter 回原 layout；这才可以把主要模型 FLOPs 近似按 compacted token 计。
+
+SFT 和 instruction tuning 还要单独说明 loss 分母。常见 causal LM 训练会做 shift：位置 `t` 的 hidden state 预测位置 `t+1` 的 label。工程上通常构造 `labels` 后用 `labels == -100` mask 掉不计 loss 的位置：
+
+- padding token 的 label 应为 `-100`。
+- prompt-only token 在 SFT 中通常 label 为 `-100`，只让 response token 计入 loss。
+- BOS 通常没有前文预测它；EOS 是否计入 loss 取决于模板策略，但必须固定并记录。
+- 如果代码先构造 `labels=input_ids.clone()` 再由模型内部 shift，统计 `loss_tokens` 要按 shift 后真正送入 cross entropy 的 `shift_labels != -100` 数量，而不是原始 `labels` 的数量。
+
+因此报告里至少写成：
+
+```text
+raw_sequence_slots/s = raw_sequence_slots / time
+compute_tokens/s = compute_tokens / time
+non_pad_tokens/s = non_pad_tokens / time
+loss_tokens/s = loss_tokens / time
+packing_efficiency = non_pad_tokens / raw_sequence_slots
+loss_efficiency = loss_tokens / non_pad_tokens
+MFU denominator = non_pad_tokens/s or loss_tokens/s, explicitly stated
+HFU denominator = compute_tokens/s plus recompute/optimizer/extra FLOPs, explicitly stated
+```
+
+本章默认用 `non_pad_tokens/s` 计算训练进展 MFU，用 `compute_tokens/s` 和重算系数估算 HFU；SFT 场景必须同时报告 `loss_tokens/s`，否则 prompt mask 会把“看起来很高的 non-pad 吞吐”变成很少的监督信号。
+
 ---
 
 ## 5. AMP / BF16 / FP8 工程取舍
@@ -469,6 +555,28 @@ AMP 的工程含义是：
 - master weight policy。
 - FP8 scaling recipe、amax history、per-tensor/per-channel scale。
 
+一个可落地的 dtype policy 必须拆开四层，而不是把“BF16 训练”当成单一状态：
+
+| 层 | BF16 baseline 常见策略 | 不能混淆的边界 |
+|---|---|---|
+| Compute autocast | matmul/conv/linear 等进入 BF16 Tensor Core 路径 | autocast 不强制所有 op BF16；softmax、norm、部分 reduction 可能保留或提升到 FP32 |
+| Parameters | FSDP/DDP 常驻训练参数可为 BF16 | FSDP `param_dtype=bf16` 表示 shard/通信工作集 dtype，不表示 optimizer 内部状态也是 BF16 |
+| Gradients / reduction | gradient bucket 或 reduce dtype 可为 BF16 | gradient clipping、norm 统计、overflow 检测和某些累加可能需要 FP32 语义 |
+| Optimizer state | AdamW `exp_avg`/`exp_avg_sq` 通常 FP32 | BF16 optimizer state 是另一项数值实验，不能作为默认 baseline |
+| Master weights | BF16 路径可省略 FP32 master，视框架和 optimizer 而定 | FP16 mixed precision 常见 FP32 master；容量账本必须显式写明有没有 master weights |
+
+因此报告里应写成类似：
+
+```text
+compute_autocast=bf16
+fsdp_param_dtype=bf16
+reduce_dtype=bf16
+optimizer_state_dtype=fp32
+master_weights=none
+fp16_grad_scaler=disabled
+fp32_ops=layernorm, softmax/reduction as required by framework
+```
+
 ### 5.2 BF16
 
 BF16 是大模型训练的常用默认选择，原因是 exponent 范围接近 FP32，比 FP16 更不容易 overflow/underflow。工程优点：
@@ -484,6 +592,8 @@ BF16 是大模型训练的常用默认选择，原因是 exponent 范围接近 F
 - CPU preprocessing 和 tokenizer 不因 BF16 自动变快。
 - 如果 kernel 没走 Tensor Core，BF16 不保证提速。
 - 某些老 GPU 或软件栈对 BF16 支持有限。
+- BF16 不需要 dynamic loss scaling 是经验默认，不代表可以跳过 `grad_norm`、NaN/Inf、optimizer update 范围的观测。
+- 使用 FSDP mixed precision 时，`param_dtype`、`reduce_dtype`、`buffer_dtype` 和 optimizer state dtype 要分别记录；否则 resume、checkpoint 转换和容量估算都会含糊。
 
 ### 5.3 FP16
 
@@ -500,6 +610,34 @@ FP16 的优点是硬件覆盖广、吞吐高，但工程风险更高：
 - `found_inf` 频繁出现。
 - loss spike 后恢复慢。
 - gradient norm 偶发 `inf` 或 `nan`。
+
+FP16 GradScaler 的生命周期要和 accumulation boundary 对齐：
+
+```text
+microstep:
+  autocast forward
+  scaled_loss = scaler.scale(loss / grad_accum_steps)
+  scaled_loss.backward()
+
+optimizer-step boundary:
+  scaler.unscale_(optimizer)
+  check found_inf across grads/ranks
+  optional grad clipping on unscaled grads
+  if no inf:
+      scaler.step(optimizer)      # optimizer_step increments only here
+      scheduler.step()
+  else:
+      skip optimizer/scheduler update
+  scaler.update()                 # grow/backoff scale
+  zero_grad(set_to_none=True)
+```
+
+几个容易错的点：
+
+- `clip_grad_norm_` 必须看 unscaled gradients；否则 max norm 的单位被 loss scale 污染。
+- overflow 时可以消费了 microbatch，但没有发生参数更新；`microstep_idx` 可以增加，`optimizer_step` 不能增加。
+- `GradScaler.state_dict()` 是 checkpoint 状态，不保存会导致 resume 后 scale/growth tracker 断裂，短期 loss 与 overflow 行为可能不同。
+- FSDP/DDP 下 `found_inf` 需要跨 rank 对齐；一个 rank overflow，全局都应跳过同一个 optimizer update。
 
 ### 5.4 FP8
 
@@ -529,6 +667,28 @@ FP8 是 H100 时代重要的吞吐和显存优化方向，但它不是“把 dty
 - 对比不只看 tokens/s，还看 loss parity、gradient norm、overflow、MFU/HFU、checkpoint 可恢复性。
 - FP8 失败时回退 BF16 必须是配置级回滚，而不是改代码热修。
 
+FP8 的核心状态不是单个 dtype，而是一套 amax/scale lifecycle：
+
+```text
+forward/backward matmul:
+  read current scale / scale_inv for each FP8 tensor
+  cast activation/weight/grad to FP8
+  execute FP8 Tensor Core kernel
+  collect observed amax
+
+end of FP8 update window:
+  update amax history
+  compute next scale from recipe margin/interval
+  publish scale/scale_inv for later kernels
+```
+
+常见 recipe 会使用 delayed scaling：本 step 的 kernel 使用上一窗口的 scale，本 step 观测到的 amax 进入 history，若达到 update interval 再生成后续 scale。工程含义：
+
+- amax history、scale、scale inverse、recipe 参数和 update interval 都是训练状态。
+- resume 时如果只恢复 model/optimizer，不恢复 FP8 metadata，前几个 step 会用错误 scale，可能出现 silent loss parity drift。
+- FP8 通常覆盖 Linear/GEMM 的 activation/weight/grad；optimizer state 仍默认 FP32，master weight 策略要单独写。
+- 不同 layer、tensor、channel granularity 的 scale 影响显存、通信和 checkpoint schema，不可只记录 `fp8=True`。
+
 ---
 
 ## 6. 框架实现：PyTorch knobs and constraints
@@ -541,7 +701,8 @@ FP8 是 H100 时代重要的吞吐和显存优化方向，但它不是“把 dty
 import os
 import time
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -550,10 +711,25 @@ torch.set_float32_matmul_precision("high")
 device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
 torch.cuda.set_device(device)
 
+if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized():
+    dist.init_process_group("nccl")
+
+rank = dist.get_rank() if dist.is_initialized() else 0
+world_size = dist.get_world_size() if dist.is_initialized() else 1
+sampler = DistributedSampler(
+    train_dataset,
+    num_replicas=world_size,
+    rank=rank,
+    shuffle=True,
+    seed=data_seed,
+    drop_last=True,
+)
+sampler.set_epoch(resume_epoch)
+
 loader = DataLoader(
     train_dataset,
     batch_size=microbatch_size,
-    shuffle=True,
+    sampler=sampler,
     num_workers=8,
     pin_memory=True,
     persistent_workers=True,
@@ -577,7 +753,10 @@ scaler = torch.cuda.amp.GradScaler(enabled=False)  # BF16 usually does not need 
 model.train()
 optimizer.zero_grad(set_to_none=True)
 
-for step, batch in enumerate(loader):
+optimizer_step = resume_optimizer_step
+microstep_idx = resume_microstep_idx
+
+for batch in loader:
     t0 = time.perf_counter()
 
     batch = {
@@ -590,43 +769,82 @@ for step, batch in enumerate(loader):
         loss = out.loss / grad_accum_steps
 
     loss.backward()
+    microstep_idx += 1
 
-    if (step + 1) % grad_accum_steps == 0:
+    is_accum_boundary = (microstep_idx % grad_accum_steps) == 0
+    if is_accum_boundary:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+        optimizer_step += 1
 
-    if step % 20 == 0:
+    if microstep_idx % 20 == 0:
         # Avoid logging GPU tensors directly; .item() is a synchronization point.
         loss_value = float(loss.detach().cpu()) * grad_accum_steps
         max_mem = torch.cuda.max_memory_allocated(device) / 1024**3
         logger.info({
-            "step": step,
+            "microstep_idx": microstep_idx,
+            "optimizer_step": optimizer_step,
             "loss": loss_value,
             "max_mem_gib": round(max_mem, 2),
             "step_s": round(time.perf_counter() - t0, 4),
         })
 
-    if step > 0 and step % 1000 == 0:
+    if (
+        is_accum_boundary
+        and optimizer_step > 0
+        and optimizer_step % 1000 == 0
+    ):
+        torch.cuda.synchronize(device)  # checkpoint capture fence, not a timing habit.
         ckpt = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all(),
-            "step": step,
+            "optimizer_step": optimizer_step,
+            "microstep_idx": microstep_idx,
+            "grad_accum_substep": 0,
+            "sampler_cursor": sampler.state_dict(),
         }
-        torch.save(ckpt, f"/checkpoints/step-{step:08d}.pt")
+        torch.save(ckpt, f"/checkpoints/step-{optimizer_step:08d}.pt")
 ```
 
 工程约束：
 
+- `torchrun` 下不要裸用 `shuffle=True`；必须用 `DistributedSampler` 或等价 streaming shard planner，并把 `epoch`、rank-local offset、streaming shard offset、packing residual buffer、worker base seed 和 gradient accumulation substep 纳入 checkpoint。
 - `pin_memory=True` 与 `non_blocking=True` 要配套测，不是单独保证 overlap。
 - `loss.item()`、`tensor.cpu()`、`print(cuda_tensor)` 都可能同步 GPU。
 - `optimizer.zero_grad(set_to_none=True)` 通常减少内存写入和 fragmentation。
 - `fused=True` 依赖 PyTorch/CUDA/参数 dtype 支持，失败时要有 fallback。
 - BF16 autocast 不代表 optimizer state 也是 BF16。
+- 示例默认只在 optimizer-step boundary 保存 checkpoint。若要在 accumulation 中间保存，不能把 `grad_accum_substep` 写成 0；还必须保存已累计梯度、sampler cursor、packing residual、GradScaler/FP8 metadata 和 worker/RNG 状态。
+
+H2D overlap 的最低契约是：DataLoader 输出 pinned CPU tensor，H2D copy 放在 dedicated stream，training stream 在使用 batch 前等待 copy stream 的 event，并且 step 内没有同步日志或 `.item()`。真实项目通常封装成 prefetcher：
+
+```python
+copy_stream = torch.cuda.Stream(device=device)
+
+
+def to_device_async(cpu_batch):
+    with torch.cuda.stream(copy_stream):
+        gpu_batch = {
+            k: v.to(device, non_blocking=True)
+            for k, v in cpu_batch.items()
+        }
+        ready = torch.cuda.Event()
+        ready.record(copy_stream)
+    return gpu_batch, ready
+
+
+next_batch, next_ready = to_device_async(next(loader_iter))
+for cpu_batch in loader_iter:
+    batch, ready = next_batch, next_ready
+    next_batch, next_ready = to_device_async(cpu_batch)
+    torch.cuda.current_stream(device).wait_event(ready)
+    # forward/backward uses batch here.
+```
 
 ### 6.2 torchrun 单节点多 GPU launcher
 
@@ -728,7 +946,9 @@ train_ckpt = {
     "scheduler": scheduler.state_dict(),
     "rng_cpu": torch.get_rng_state(),
     "rng_cuda": torch.cuda.get_rng_state_all(),
-    "global_step": global_step,
+    "optimizer_step": optimizer_step,
+    "microstep_idx": microstep_idx,
+    "grad_accum_substep": 0,
     "sampler_cursor": sampler.state_dict(),
 }
 
@@ -745,6 +965,37 @@ with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
 - wrapping granularity 直接影响 all-gather buffer、通信频率和 checkpoint shard 数量。
 - activation checkpointing 是显存换算力；必须同时记录 MFU/HFU 和 tokens/s。
 - 训练 checkpoint 用 sharded state-dict；导出或转换推理权重再使用 full state-dict，避免热路径 rank0 OOM。
+
+FSDP/ZeRO-3 的关键不是“状态被 shard 了”这一句，而是瞬时 HBM ownership：
+
+```text
+steady state:
+  resident param shard + optimizer shard + maybe grad shard
+
+forward for wrapped unit k:
+  all-gather param shards -> full params for unit k resident
+  run forward kernels
+  reshard full params after forward, unless kept for backward policy
+
+backward for wrapped unit k:
+  optional backward_prefetch all-gather params for next/previous unit
+  all-gather full params needed by unit k backward
+  run backward kernels and materialize grads
+  reduce-scatter grads -> resident grad shard
+  free full grad / full param working set when safe
+
+optimizer-step boundary:
+  local optimizer update on resident param shard + optimizer shard + grad shard
+  zero or free grad shard according to zero_grad policy
+```
+
+峰值 HBM 常常出现在“当前 unit full params + prefetched unit full params + activation + RS bucket + temporary workspace”叠加的瞬间，而不是稳态 shard 大小。几个旋钮的影响：
+
+- `backward_prefetch` 增加通信/计算 overlap，但可能让 backward 同时持有当前 full params 和 prefetched full params，抬高峰值。
+- `limit_all_gathers=True` 给 all-gather 加节流，限制 CPU 提前发太多 all-gather；它通常降低 HBM 峰值和 OOM 风险，但可能牺牲 overlap。
+- reduce-scatter bucket 越大，通信效率可能越好，但 grad bucket 和临时 buffer 的驻留时间更长；bucket 太小则 launch/collective overhead 增加。
+- wrapping 粒度越粗，单次 all-gather full params 越大；粒度太细又会增加 collective 次数和 Python/framework overhead。
+- CPU offload 会把 param/optimizer/grad shard staging 到 host pinned/pageable memory，降低 HBM resident 状态，但引入 H2D/D2H staging buffer、PCIe/NVLink 可见时间和 page cache/DRAM 压力。它是容量手段，不是免费吞吐优化。
 
 ### 6.4 torch.profiler 最小 profile
 
@@ -856,7 +1107,7 @@ symptom dashboard
 
 - 只给出 `batch_size=auto`，没有显存估算。
 - 数据从对象存储逐样本随机读，没有本地 cache 或 shard 策略。
-- checkpoint 只保存 model，不保存 optimizer/RNG/global step。
+- checkpoint 只保存 model，不保存 optimizer/RNG/`optimizer_step`/`microstep_idx`。
 - FP8 训练没有 loss parity 和 fallback 计划。
 
 ### 7.4 Preflight
@@ -884,7 +1135,7 @@ Preflight 通过标准：
 - GPU SM active 与 tensor active 没有周期性掉零。
 - DataLoader visible wait 小于总 step 的 5% 到 10%，具体阈值按任务类型定义。
 - checkpoint 写入耗时可解释，并且不会污染稳态 step 统计。
-- resume 后 loss、global step、LR、RNG、dataset cursor 连续。
+- resume 后 loss、`optimizer_step`、LR、RNG、dataset cursor 连续。
 
 ### 7.5 发布与回滚
 
@@ -915,13 +1166,14 @@ Preflight 通过标准：
 单机训练 dashboard 至少包含：
 
 - `step_time_s`：P50/P95/P99。
-- `tokens_per_s_raw` 与 `tokens_per_s_nonpad`。
+- `raw_sequence_slots_per_s`、`compute_tokens_per_s`、`non_pad_tokens_per_s`、`loss_tokens_per_s`。
+- `padding_slots`、`packing_efficiency`、`loss_efficiency`。
 - `loss`、`grad_norm`、`lr`、`overflow_count`。
 - `gpu_sm_active`、`gpu_tensor_active`、`gpu_mem_used`、`gpu_power_w`。
 - `h2d_time_ms`、`dataloader_wait_ms`。
 - `max_memory_allocated_gib`、`max_memory_reserved_gib`。
 - `checkpoint_write_s`、`checkpoint_bytes`。
-- `samples_consumed`、`tokens_consumed`、`global_step`。
+- `samples_consumed`、`non_pad_tokens_consumed`、`loss_tokens_consumed`、`microstep_idx`、`optimizer_step`。
 
 日志治理：
 
@@ -1001,7 +1253,23 @@ $$
 {t_{\text{microstep}}}
 $$
 
-两者都可以用，但不能混用。报告时必须说明 denominator 是 microstep time 还是 optimizer-step time。
+上面公式得到的是 `raw_sequence_slots/s`，也就是 fixed-shape 槽位吞吐。报告有效训练进展时要继续拆：
+
+```text
+raw_sequence_slots/s = raw_sequence_slots / time
+padding_slots/s = padding_slots / time
+compute_tokens/s = compute_tokens / time
+non_pad_tokens/s = non_pad_tokens / time
+loss_tokens/s = loss_tokens / time
+```
+
+如果没有全模型 unpadding/compaction，`compute_tokens = raw_sequence_slots`。如果做了 sequence packing，通常是降低 `padding_slots`、提高 `packing_efficiency`，不自动改变 dense kernel 的 `compute_tokens` 口径。如果 SFT 使用 prompt mask，`loss_tokens` 可能远小于 `non_pad_tokens`。
+
+microstep 和 optimizer-step 两种 denominator 都可以用，但不能混用。报告时必须说明：
+
+- 时间分母是 `t_microstep` 还是 `t_optimizer_step`。
+- token 分子是 `raw_sequence_slots`、`compute_tokens`、`non_pad_tokens` 还是 `loss_tokens`。
+- 是否跨 GPU aggregate，以及是否已经乘过 `N_gpu`。
 
 ### 8.3 MFU 数值模型
 
@@ -1017,7 +1285,7 @@ $$
 peak = 8 * 989e12 = 7.912e15 FLOP/s
 ```
 
-如果实测 `tokens/s = 95,000`：
+如果实测 `non_pad_tokens/s = 95,000`，并用 non-pad token 表示有效训练进展：
 
 ```text
 effective FLOPs/s = 95,000 * 40.2e9 = 3.819e15
@@ -1035,13 +1303,15 @@ MFU = 3.819e15 / 7.912e15 = 48.3%
 
 ### 8.4 HFU 与重算
 
-如果 activation checkpointing 让每 token 实际执行 FLOPs 从 `6N_p` 增加到 `7.5N_p`，同样 `tokens/s=95,000`：
+HFU 要用实际执行主要模型 FLOPs 的 `compute_tokens/s`。如果没有 padding，或已经做了全模型 compaction，使 `compute_tokens/s = non_pad_tokens/s = 95,000`，并且 activation checkpointing 让每个 compute token 实际执行 FLOPs 从 `6N_p` 增加到 `7.5N_p`：
 
 ```text
 actual FLOPs/s = 95,000 * 7.5 * 6.7e9 = 4.774e15
 HFU = 4.774e15 / 7.912e15 = 60.3%
 MFU remains 48.3%
 ```
+
+如果 padded dense kernel 仍对 raw slots 执行，HFU 应使用 `compute_tokens/s = raw_sequence_slots/s`，而 MFU 可以继续用 `non_pad_tokens/s` 表示有效进展。这就是 worked example 中 HFU 高于 compacted 情况的原因。
 
 因此：
 
@@ -1093,7 +1363,7 @@ subtotal = 78.0 GiB
 | step time 每 N step 出现尖峰 | 尖峰与 log/checkpoint/eval interval 对齐；CPU stack 在 serialization/write | 同步日志或 checkpoint 阻塞训练主线程 | 降低日志频率；异步 checkpoint；分离 eval；写本地再异步上传 |
 | DataLoader worker timeout | worker stderr、`pidstat` worker stuck、open file count 高 | worker 死锁、pickle 大对象、文件句柄耗尽、远端 read hang | 降低 worker；修 dataset `__getitem__`；增 `ulimit -n`；加 read timeout；避免 worker 内全局锁 |
 | CPU 100%，GPU 低 | `perf top` 显示 tokenizer/decode/compression；DataLoader wait 高 | CPU preprocessing 太重 | 离线 tokenize；使用 mmap/arrow/webdataset；向量化 collate；绑定 CPU affinity |
-| checkpoint 后 resume loss 跳变 | resume 后 LR/global_step/RNG/cursor 不一致；dataset sample 重复或跳过 | checkpoint 状态不完整 | 保存 optimizer/scheduler/RNG/sampler/global step；resume 做 strict validation |
+| checkpoint 后 resume loss 跳变 | resume 后 LR/`optimizer_step`/RNG/cursor 不一致；dataset sample 重复或跳过 | checkpoint 状态不完整 | 保存 optimizer/scheduler/RNG/sampler/`optimizer_step`/`microstep_idx`；resume 做 strict validation |
 | H100 上 BF16 吞吐低 | Nsight Compute 显示未走 Tensor Core；matmul dtype 为 FP32；TF32 disabled | autocast 覆盖不正确或 shape 不适合 Tensor Core | 检查 autocast scope；启用 TF32；调整 hidden/microbatch shape；升级 kernel/library |
 | 训练越跑越慢 | page cache 被挤出；reserved memory 增长；checkpoint 目录文件数暴涨 | 内存泄漏、fragmentation、存储 metadata 退化 | 周期性 memory snapshot；清理引用；checkpoint retention；监控 inode/metadata latency |
 
@@ -1220,7 +1490,7 @@ unsharded layer working set + prefetch buffer + reduce-scatter buffer
 - 若 HBM P95 > 68 GiB，先开更激进 activation checkpointing 或降到 `microbatch=1`。
 - 若 HBM P95 < 55 GiB 且 MFU 低，可以试 `microbatch=3` 或减少 accumulation。
 
-### 10.4 Batch 与 gradient accumulation
+### 10.4 Batch、gradient accumulation 与 token 口径
 
 初始配置：
 
@@ -1234,66 +1504,130 @@ tokens per optimizer step =
 2 * 4096 * 8 * 16 = 1,048,576 tokens
 ```
 
-如果单个 microstep 平均 86 ms，16 个 accumulation 加 optimizer/scheduler/comm 后 optimizer step 约 1.48 s：
+这里的 `1,048,576` 不是有效训练 token，而是固定 shape 的槽位数：
 
 ```text
-tokens/s = 1,048,576 / 1.48 = 708,497 tokens/s
+raw_sequence_slots per optimizer step = 1,048,576
 ```
 
-这个数对 7B on 8xH100 可能偏激进；真实值取决于 framework、FSDP overlap、sequence packing、kernel、checkpointing。保守 baseline 先把 acceptance target 定义为可解释、可复现，而不是追求 raw tokens/s 峰值：
+假设 dataloader 使用 pretokenized packed shards，但没有使用全模型 unpadding/compaction kernel。一个稳态窗口内测得：
 
 ```text
-tokens/s raw >= 90,000 for early bring-up
-tokens/s non-pad ~= 95,000 for accepted baseline
-MFU >= 45% for production baseline
+packing_efficiency = non_pad_tokens / raw_sequence_slots = 0.80
+padding_slots = 1,048,576 * 0.20 = 209,715
+non_pad_tokens = 838,861
+
+loss_efficiency = loss_tokens / non_pad_tokens = 0.985
+loss_tokens = 826,278
 ```
 
-报告时必须说明是 raw tokens 还是 non-pad tokens。若 packing 不好，raw tokens/s 可能漂亮但有效样本进展差。
+`loss_tokens` 要按真正进入 cross entropy 的 shifted labels 统计，也就是 `shift_labels != -100`。预训练 packed causal LM 中，padding、被切掉的无效边界、部分 BOS 位置不计 loss，所以 `loss_efficiency` 通常接近但小于 1。SFT 中如果 prompt token 被 mask 成 `labels=-100`，`loss_efficiency` 可能只有 0.2 到 0.6；这时必须额外报告 `loss_tokens/s`，不能只看 `non_pad_tokens/s`。
+
+由于本 baseline 没有全模型 compaction，padding 仍经过 dense MLP、norm 和多数 `[B, S, H]` kernel：
+
+```text
+compute_tokens = raw_sequence_slots = 1,048,576
+```
+
+`attention_mask` 和 `labels=-100` 只改变 attention 可见性和 loss 分母，不自动跳过 MLP FLOPs。若要把 `compute_tokens` 改成 `non_pad_tokens`，必须使用 unpadding/compaction：把非 pad token gather 成 compacted layout，attention/MLP/norm/loss 都在 compacted token 上执行，并用 offset metadata 恢复边界。只做 varlen FlashAttention 还不够，因为 MLP 仍可能按 padded shape 执行。
+
+假设 16 个 accumulation 加 optimizer/scheduler/FSDP communication 后，一个 optimizer step 的 P50 是 `8.83 s`：
+
+```text
+raw_sequence_slots/s = 1,048,576 / 8.83 = 118,751
+compute_tokens/s = 118,751
+non_pad_tokens/s = 838,861 / 8.83 = 95,000
+loss_tokens/s = 826,278 / 8.83 = 93,600
+```
+
+这个账本是闭合的：dense 计算吞吐是 `118,751 compute_tokens/s`，有效数据进展是 `95,000 non_pad_tokens/s`，loss 分母是 `93,600 loss_tokens/s`。
+
+保守 baseline 应拆成三档：
+
+| Gate | 口径 | 示例阈值 |
+|---|---|---:|
+| Physical sanity | `raw_sequence_slots/s <= peak / actual_FLOPs_per_compute_token` | 本例约 `<= 157,000` |
+| Early bring-up | `raw_sequence_slots/s`，确认 dense pipeline 能跑通 | `100,000-130,000` 且 HFU < 1 |
+| Data efficiency | `packing_efficiency = non_pad_tokens / raw_sequence_slots` | `>= 0.75`，或明确解释为何更低 |
+| Supervision efficiency | `loss_efficiency = loss_tokens / non_pad_tokens` | 预训练接近 1；SFT 必须单独报告 |
+| Production baseline | `non_pad_tokens/s` + MFU + HFU | 约 `95,000` non-pad tokens/s，MFU `>= 45%`，HFU `<= 80%` |
+
+报告时必须同时给 `raw_sequence_slots/s`、`compute_tokens/s`、`non_pad_tokens/s`、`loss_tokens/s`、`packing_efficiency`、`loss_efficiency` 和 denominator（microstep 还是 optimizer step）。若 packing 不好，raw slots/s 可能漂亮但有效样本进展差；若 loss mask 很重，non-pad 吞吐也可能高估监督信号。
 
 ### 10.5 MFU/HFU 计算
 
-先用 `tokens/s = 300,000` 做口径 sanity check，而不是把它当成 accepted baseline：
+对 LLaMA-7B，参数量近似 `6.7B`。有效训练 FLOPs/token 用 `6N_p`：
 
 ```text
 model FLOPs/token = 6 * 6.7e9 = 40.2e9
-effective FLOPs/s = 300,000 * 40.2e9 = 12.06e15
 peak BF16 FLOPs/s = 8 * 989e12 = 7.912e15
 ```
 
-这个结果会得到 MFU > 100%，说明假设不自洽。原因可能是：
-
-- `6N` 近似与实际模型/统计口径不匹配。
-- tokens/s 包含 padding、重复统计或跨 step denominator 错误。
-- H100 peak 使用了错误精度口径。
-- 统计把 8 GPU 每卡 tokens/s 又乘了一次。
-
-因此本章把 `tokens/s = 95,000` 的 non-pad 口径作为可接受 baseline，并把它交给第8章作为单节点扩展前的参照：
+本例用 `non_pad_tokens/s = 95,000` 作为有效训练进展：
 
 ```text
-effective FLOPs/s = 95,000 * 40.2e9 = 3.819e15
+effective model FLOPs/s = 95,000 * 40.2e9 = 3.819e15
 MFU = 3.819e15 / 7.912e15 = 48.3%
 ```
 
-若 activation checkpointing 让实际 FLOPs/token 增至 `7.5N`：
+HFU 用实际执行 FLOPs。这个 baseline 有 selective activation checkpointing，估算每个 dense compute token 实际执行 `7.5N_p`：
 
 ```text
-actual FLOPs/s = 95,000 * 7.5 * 6.7e9 = 4.774e15
+actual FLOPs/compute_token = 7.5 * 6.7e9 = 50.25e9
+actual executed FLOPs/s = 118,751 * 50.25e9 = 5.968e15
+HFU = 5.968e15 / 7.912e15 = 75.4%
+```
+
+这个结果满足 `HFU <= 1`。它也解释了为什么 padding 会拉开 MFU 和 HFU：硬件对 `118,751` 个 dense slots/s 做计算，但有效非 pad 进展只有 `95,000 tokens/s`。
+
+反过来，如果有人在同样 dense padded baseline 下报告：
+
+```text
+raw_sequence_slots/s = 708,000
+```
+
+那么只算 `7.5N_p` 重算：
+
+```text
+HFU = 708,000 * 50.25e9 / 7.912e15 = 450%
+```
+
+这不是高吞吐，而是账本错了。常见原因是：
+
+- 把 microstep denominator 和 optimizer-step denominator 混用。
+- 把每卡 tokens/s 又乘了一次 `N_gpu`。
+- 把 padded raw slots 当成 non-pad tokens 计算 MFU。
+- 声称跳过 padding FLOPs，但实际模型仍在 dense `[B, S, H]` 上跑 MLP/norm。
+- 使用了不同 precision peak，例如把 FP8 peak 拿来算 BF16 run。
+
+如果系统真的做了全模型 compaction，使 `compute_tokens/s = non_pad_tokens/s = 95,000`，HFU 可重新估成：
+
+```text
+actual FLOPs/s = 95,000 * 50.25e9 = 4.774e15
 HFU = 4.774e15 / 7.912e15 = 60.3%
 ```
 
+但这必须由 kernel layout、varlen metadata、Nsight timeline 或框架 profile 证明，不能只靠 `attention_mask` 推断。
+
 解释：
 
-- MFU 48.3% 表示有效模型训练进展合理。
-- HFU 60.3% 表示硬件多做了重算。
-- 如果改 checkpointing 后 HFU 升、MFU 降，说明显存换算力的成本过高。
+- MFU 48.3% 表示有效非 pad token 的模型训练进展合理。
+- HFU 75.4% 表示硬件对 dense slots 做了 padding FLOPs 和 checkpoint 重算。
+- 如果提高 packing 后 `non_pad_tokens/s` 上升而 `raw_sequence_slots/s` 接近不变，MFU 会升，HFU 可能基本不变。
+- 如果增加 activation checkpointing 后 HFU 升、MFU 降，说明显存换算力的成本过高。
 
 Accepted baseline for Chapter 8：
 
 | Metric | Accepted baseline | 口径 |
 |---|---:|---|
-| Effective non-pad tokens/s | 95,000 | 8 GPU aggregate，排除 padding |
+| Raw sequence slots/s | 118,751 | 8 GPU aggregate，fixed dense slots |
+| Compute tokens/s | 118,751 | 本例 padding 仍执行 dense MLP/norm |
+| Non-pad tokens/s | 95,000 | 8 GPU aggregate，排除 padding |
+| Loss tokens/s | 93,600 | shifted `labels != -100` |
+| Packing efficiency | 0.80 | `non_pad_tokens / raw_sequence_slots` |
+| Loss efficiency | 0.985 | `loss_tokens / non_pad_tokens` |
 | MFU | 48.3% | `6N_p` FLOPs/token，有效训练进展 |
-| HFU | 60.3% | checkpointing 后约 `7.5N_p` actual FLOPs/token |
+| HFU | 75.4% | dense compute slots，checkpointing 后约 `7.5N_p` actual FLOPs/token |
 | HBM P95 | 63 GiB/GPU | 低于 68 GiB admission 上限 |
 | DataLoader visible wait | 3% | `torch.profiler` steady-state window |
 | Checkpoint time | 18 s / 1000 steps | 从稳态 step 统计中单独拆出 |
@@ -1304,30 +1638,35 @@ Accepted baseline for Chapter 8：
 
 | 指标 | 值 |
 |---|---:|
-| microstep time P50 | 140 ms |
-| optimizer-step time P50 | 2.35 s |
-| raw tokens/s | 446,000 |
-| non-pad tokens/s | 91,000 |
+| microstep time P50 | 535 ms |
+| optimizer-step time P50 | 8.90 s |
+| raw_sequence_slots/s | 117,800 |
+| compute_tokens/s | 117,800 |
+| non_pad_tokens/s | 94,200 |
+| loss_tokens/s | 92,800 |
+| packing_efficiency | 0.80 |
+| loss_efficiency | 0.985 |
 | GPU utilization | 96% |
 | SM active | 88% |
-| tensor active | 61% |
-| MFU by non-pad tokens | 46% |
-| HFU | 58% |
+| tensor active | 74% |
+| MFU by non-pad tokens | 47.9% |
+| HFU | 74.8% |
 | HBM peak P95 | 63 GiB |
 | DataLoader visible wait | 3% |
 | checkpoint write | 18 s every 1000 steps |
 
 诊断：
 
-- raw tokens/s 与 non-pad tokens/s 差距大，说明 padding/packing 是有效吞吐瓶颈。
-- GPU utilization 96% 但 tensor active 61%，需要看 GEMM shape、fused kernels、checkpointing 重算。
+- `raw_sequence_slots/s` 与 `non_pad_tokens/s` 的差距来自 20% padding；packing 仍是有效吞吐变量，但不是第一优先级的灾难。
+- `loss_tokens/s` 接近 `non_pad_tokens/s`，说明这是预训练式监督口径；若换成 SFT prompt mask，需要重新给 loss 分母。
+- GPU utilization 96% 但 tensor active 74%，需要看 GEMM shape、fused kernels、checkpointing 重算和 FSDP all-gather overlap。
 - HBM 63 GiB 在 68 GiB admission 内，可以尝试 `microbatch=3`，但必须观察 activation peak。
 - DataLoader visible wait 3% 不是优先瓶颈。
 - checkpoint 18 s/1000 steps 如果同步写，会在 P99 形成尖峰；需要异步或从稳态统计中单独拆出。
 
 下一轮 A/B：
 
-1. 开 sequence packing，目标 non-pad/raw ratio 从 20% 提到 70% 以上。
+1. 提高 packing 或改 packing bucket，目标 `packing_efficiency` 从 0.80 到 0.88 以上。
 2. 对比 `microbatch=2` 与 `microbatch=3` 的 HBM、MFU、step time。
 3. 对 optimizer 使用 fused AdamW，观察 optimizer stage。
 4. checkpoint 写本地 NVMe 后异步上传，观察 P99。
@@ -1358,7 +1697,9 @@ parallel:
 training:
   microbatch_per_gpu: 2
   grad_accum_steps: 16
-  global_tokens_per_update: 1048576
+  raw_sequence_slots_per_update: 1048576
+  expected_packing_efficiency: 0.80
+  expected_loss_efficiency: 0.985
   optimizer: adamw_fused
   lr: 3.0e-4
   betas: [0.9, 0.95]
@@ -1366,6 +1707,8 @@ training:
 
 data:
   format: pretokenized_packed_shards
+  padding_policy: dense_padded_no_full_compaction
+  loss_mask_policy: pretraining_shifted_labels_ne_minus_100
   num_workers: 8
   pin_memory: true
   prefetch_factor: 4
@@ -1374,6 +1717,8 @@ data:
 
 checkpoint:
   interval_steps: 1000
+  interval_unit: optimizer_step
+  save_policy: optimizer_step_boundary_only
   async_upload: true
   include:
     - model
@@ -1381,11 +1726,18 @@ checkpoint:
     - scheduler
     - rng
     - sampler_cursor
-    - global_step
+    - packing_residual
+    - optimizer_step
+    - microstep_idx
 
 acceptance:
   hbm_peak_p95_gib_max: 68
+  raw_sequence_slots_per_s_range: [100000, 130000]
+  non_pad_tokens_per_s_min: 95000
+  loss_tokens_per_s_min: 93000
+  packing_efficiency_min: 0.75
   mfu_min: 0.45
+  hfu_max: 0.80
   dataloader_visible_wait_pct_max: 5
   resume_validation_steps: 20
 ```
@@ -1500,7 +1852,8 @@ GPU 低利用率时，增大 microbatch 可能让 utilization 变好，但如果
 
 ### 12.4 效率
 
-- [ ] 报告 raw tokens/s 和 non-pad tokens/s。
+- [ ] 报告 `raw_sequence_slots/s`、`compute_tokens/s`、`non_pad_tokens/s` 和 `loss_tokens/s`。
+- [ ] 报告 `packing_efficiency`、`loss_efficiency`、padding 是否仍执行 dense MLP/attention。
 - [ ] 报告 step time P50/P95/P99。
 - [ ] 计算 MFU 和 HFU，并说明 FLOPs 口径。
 - [ ] GPU utilization、SM active、tensor active 同时采集。
@@ -1510,7 +1863,7 @@ GPU 低利用率时，增大 microbatch 可能让 utilization 变好，但如果
 
 - [ ] OOM、NaN、DataLoader timeout、checkpoint stall 有排障 runbook。
 - [ ] checkpoint 可以 strict resume。
-- [ ] resume 后 loss、LR、global step、dataset cursor 连续。
+- [ ] resume 后 loss、LR、`optimizer_step`、`microstep_idx`、dataset cursor 连续。
 - [ ] 日志后端失败不会阻塞训练。
 - [ ] profile 和 debug 开关可配置关闭。
 
@@ -1532,7 +1885,7 @@ GPU 低利用率时，增大 microbatch 可能让 utilization 变好，但如果
 
 - Training step 必须拆到 dataset read、CPU preprocessing、DataLoader worker、page cache、pinned memory、H2D、forward、loss、backward、optimizer、AMP、logging、checkpoint。
 - 显存预算必须包含 params、grads、optimizer states、activations、temp、fragmentation。
-- GPU utilization 不能替代 MFU/HFU/tokens/s。
+- GPU utilization 不能替代 MFU/HFU/tokens/s；tokens/s 必须拆成 raw sequence slots、compute tokens、non-pad tokens 和 loss tokens。
 - BF16 是稳健 baseline，FP16 需要 loss scaling，FP8 需要硬件、recipe、scaling metadata 和 loss parity。
 - Profiler chain 应从 `torch.profiler` 到 Nsight Systems，再到 Nsight Compute、DCGM、`iostat`、`perf`。
 - LLaMA-7B on 8xH100 的 baseline 应先证明显存、吞吐、MFU/HFU 和 checkpoint resume，再进入多节点扩展。

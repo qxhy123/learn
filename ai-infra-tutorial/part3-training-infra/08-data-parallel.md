@@ -165,6 +165,40 @@ dataset manifest
 
 如果 rank 17 因为样本更长、CPU worker 卡住、远端对象存储抖动而慢 200 ms，那么所有 rank 都会在 collective 或下一个 step 同步边界等它。
 
+#### 3.3.1 Sampler 分片协议
+
+DDP/FSDP/ZeRO 不会自动保证“每个 rank 读到不同数据”。这个责任在 sampler 或 streaming shard planner。
+
+普通 map-style dataset 的最小协议是：
+
+```text
+global dataset order for epoch e
+  -> sampler.set_epoch(e) changes shuffle seed
+  -> shard by rank: indices[rank::world_size] or equivalent balanced split
+  -> DataLoader yields rank-local batches
+  -> all ranks finish the same number of optimizer steps
+```
+
+关键边界：
+
+- 每个 epoch 必须在所有 rank 上调用相同的 `set_epoch(epoch)`，否则不同 rank 可能重复样本或 shuffle 不一致。
+- `drop_last=True` 常用于训练，目的是让每个 rank 的 batch 数一致；如果不 drop，需要 padding 或 join 协议处理尾部，否则少数 rank 先结束会让其他 rank 卡在 collective。
+- 分片不能只看样本数。长文本训练应按 token count、packing 后 non-pad token 或 bucket 预算平衡，否则 rank-local compute 会倾斜。
+- 每条日志至少带 `epoch`、`global_step`、`rank`、`dataset_shard`、`sample_tokens`，否则 data skew 很难和 NCCL wait 关联。
+
+Streaming dataset 还要保存 cursor。
+
+```text
+manifest digest
+  -> stream shard assignment
+  -> rank-local object cursor
+  -> record offset / byte offset / sample id
+  -> packer residual buffer
+  -> global optimizer step
+```
+
+这里最容易漏的是 packing residual：一个 rank 在 step 结束时可能已经读了下一批 token 的一部分，但还没组成完整 sequence。elastic restart 如果只保存 `global_step`，不保存 stream cursor 和 residual buffer，就可能重复或跳过 token。生产上至少要在 validated checkpoint metadata 里保存 `epoch`、rank-local shard id、stream cursor、packer residual、world size 和 manifest digest；如果 world size 变化，必须通过 reshard 工具重新计算 offset，不能让新 rank 直接继承旧 rank 的局部 cursor。
+
 ### 3.4 状态路径
 
 状态路径回答“训练状态在哪里，谁拥有，何时一致”。
@@ -223,6 +257,51 @@ PyTorch DDP 会把参数梯度按 bucket 组织。
 
 理想情况是早期 bucket 的通信被后续 backward compute 掩盖。
 
+真实执行可以把 DDP reducer 看成一个小状态机。
+
+初始化阶段：
+
+```text
+rank process group ready
+  -> rank 0 broadcasts initial parameters and buffers
+  -> DDP walks model parameters in reverse backward-ready order
+  -> reducer builds gradient buckets by dtype/device/size
+  -> each parameter's AccumulateGrad registers autograd hook
+  -> bucket state = pending grads, pending work = none
+```
+
+这里的 init broadcast 是语义边界：所有 rank 从同一组参数出发。bucket 构建决定后续通信粒度；`static_graph=True` 依赖每步参数使用路径稳定，否则 reducer 可能要处理 unused parameter 或 rebuild bucket，overlap 会变差。
+
+Backward 阶段：
+
+```text
+loss.backward()
+  -> autograd computes grad for parameter p
+  -> DDP hook marks p.grad ready
+  -> reducer copies or aliases grad into bucket view
+  -> if all grads in bucket are ready:
+       bucket state = ready
+       launch async AllReduce(bucket)
+       bucket state = in_flight
+  -> backward continues computing earlier layers
+```
+
+bucket 内最后一个 ready 的梯度决定该 bucket 何时能发出 collective。所有 rank 必须以相同 collective 顺序进入 NCCL；如果 rank 3 的 bucket 12 没 ready，其他 rank 已经 launch bucket 12 的 AllReduce，也只能等它。
+
+Optimizer boundary 是强同步边界：
+
+```text
+before optimizer.step()
+  -> reducer waits for all in-flight bucket work
+  -> AllReduce result is divided by world_size or pre-divided by comm hook
+  -> p.grad points to averaged gradient
+  -> optional unscale / clipping sees synchronized gradients
+  -> optimizer.step() consumes averaged grads
+  -> zero_grad prepares next reducer iteration
+```
+
+如果使用 `gradient_as_bucket_view=True`，`param.grad` 可能是 bucket buffer 的 view，而不是独立 tensor。好处是少一次 grad copy 和少一份显存；代价是 optimizer、gradient clipping、日志代码不能对 `.grad` 做 `detach_()`、长期保存引用或假设每个 grad storage 独立。`zero_grad(set_to_none=True)` 通常安全，但自定义 optimizer 如果原地替换 `.grad` storage，会破坏下一轮 bucket view 复用。
+
 ### 4.2 FSDP / ZeRO step timeline
 
 FSDP/ZeRO 的核心不是“更快同步”，而是“减少常驻冗余状态”。
@@ -237,6 +316,56 @@ FSDP/ZeRO 的核心不是“更快同步”，而是“减少常驻冗余状态�
 6. ReduceScatter 梯度到 owner rank；
 7. 每个 rank 只更新自己拥有的 optimizer state shard；
 8. checkpoint 保存 shard 和 layout metadata。
+
+更具体地说，FSDP FULL_SHARD / ZeRO-3 的 per-layer shard lifecycle 是：
+
+```text
+steady state:
+  each rank owns flat_param_shard[i]
+  optimizer owns only local shard state: master weight shard, m shard, v shard
+
+forward(module k):
+  pre-forward AllGather flat_param_shard[k] from all ranks
+  materialize full flat_param[k] and expose parameter views to module k
+  run module k forward
+  if reshard_after_forward: free full flat_param[k], keep local shard
+
+backward(module k):
+  backward prefetch may AllGather module k-1 or k parameters before use
+  materialize full param again if it was resharded after forward
+  autograd computes full gradient for module k locally
+  ReduceScatter full gradient across ranks
+  rank i keeps grad_shard[i] for the flat param it owns
+  free full param and full grad buffers
+
+optimizer:
+  local optimizer updates only owned param shard and optimizer state shard
+  updated shards become the next steady state
+```
+
+`flat_param` 是性能和内存管理单位：框架把一个 FSDP unit 内多个原始 parameter flatten 成连续 buffer，再按 rank 切 shard。AllGather 拼出 full flat param 后，原始 parameter view 临时指向 full buffer；reshard 后这些 full view 不能再被用户代码长期引用。
+
+单个 Transformer block 的 mini trace：
+
+```text
+Block 12 FSDP unit, world_size=8
+
+forward:
+  R0..R7 each holds 1/8 flat_param(Block12)
+  AllGather -> every rank materializes full Block12 weight
+  run LN -> QKV -> attention -> MLP
+  save activations needed by backward
+  reshard_after_forward -> free full Block12 weight, keep 1/8 shard
+
+backward, running from last block to first:
+  backward_prefetch starts AllGather(Block11) while Block12 backward compute runs
+  AllGather(Block12) again if full weight was freed after forward
+  compute dW(Block12) on each rank from its local microbatch activations
+  ReduceScatter dW(Block12) -> R0 gets grad shard 0, ..., R7 gets grad shard 7
+  local optimizer owner updates only its shard of Block12 master/m/v/param
+```
+
+ZeRO-3 的语义相同，名字通常是 parameter partition、gathered parameter、release parameter 和 reduce-scatter gradient。FSDP 更强调 wrap unit 和 flat param，DeepSpeed 更强调 partition owner 和 offload/prefetch policy；读 timeline 时应看“谁常驻 shard、谁临时 materialize full、谁拥有 optimizer state”，而不是只看框架名。
 
 ### 4.3 DDP / FSDP 通信时间线
 
@@ -291,6 +420,26 @@ AllReduce 可以拆成 ReduceScatter + AllGather。
 
 FSDP/ZeRO-3 显式利用这个拆分：常驻 shard，计算前后做必要 collective。
 
+对同一个 `tensor_bytes = B`、`N` 个 rank 的 ring 近似：
+
+```text
+AllReduce bytes_per_rank      ~= 2 * (N - 1) / N * B
+ReduceScatter bytes_per_rank  ~=     (N - 1) / N * B
+AllGather bytes_per_rank      ~=     (N - 1) / N * B
+```
+
+手算例子：`N=8`，`B=1 GiB`，ring 近似每 rank 传输量是：
+
+| Collective | 语义输入/输出 | per-rank bytes | 如果有效 busbw = 100 GiB/s |
+|---|---|---:|---:|
+| AllReduce | 1 GiB -> 每 rank 得到 reduce 后 1 GiB | `2 * 7/8 * 1 GiB = 1.75 GiB` | `1.75 / 100 = 17.5 ms` |
+| ReduceScatter | 1 GiB -> 每 rank 得到 reduce 后 1/8 GiB | `7/8 * 1 GiB = 0.875 GiB` | `0.875 / 100 = 8.75 ms` |
+| AllGather | 1/8 GiB -> 每 rank 得到拼接后 1 GiB | `7/8 * 1 GiB = 0.875 GiB` | `0.875 / 100 = 8.75 ms` |
+
+这只是大消息带宽心算，实际还要加 collective latency、拓扑层级、channel 数、rank skew 和与计算 overlap 的部分。
+
+`algbw` 是从 tensor 语义看见的有效算法带宽，`busbw` 是折算到物理链路上的带宽。不同 collective 的 busbw/algbw 换算不同：同样的 1 GiB tensor，AllReduce 在 ring 上物理传输约 1.75 GiB，而 ReduceScatter/AllGather 约 0.875 GiB。于是 `all_reduce_perf` 的 `busbw=100 GiB/s` 和 `all_gather_perf` 的 `busbw=100 GiB/s` 可以说明物理链路利用相近，但不能说 AllReduce 和 AllGather 对训练 step 的 tensor 语义成本相同；也不能把某个 collective 的 `algbw` 拿去估另一个 collective。容量 admission 用 tensor bytes 心算，网络验收用同拓扑 nccl-tests baseline 和 profiler exposed tail 共同判断。
+
 ### 4.5 bucket 与 overlap
 
 `bucket` 是通信调度单位。
@@ -343,6 +492,35 @@ FP16 训练还要处理 loss scale。
 - 不能让部分 rank step、部分 rank skip。
 
 BF16 通常避免动态 loss scaling，但不是免费稳定；activation、optimizer、gradient clipping 仍需一致观测。
+
+完整协议可以写成：
+
+```text
+for microstep in 1..grad_accum:
+  scale loss by 1 / grad_accum
+  if microstep < grad_accum:
+    DDP: no_sync() or FSDP/ZeRO defer reduce
+    backward accumulates local grads only
+  else:
+    backward launches gradient communication
+    wait for synchronized full grads or reduced grad shards
+    unscale FP16 grads
+    all-reduce found_inf across ranks
+    if found_inf: all ranks skip optimizer.step(), update scaler, zero grads
+    else: clip grads with strategy-specific global norm, optimizer.step(), zero grads
+```
+
+`no_sync()` 只推迟通信，不推迟本地梯度累加。最后一个 microstep 必须进入同步路径，否则 optimizer 看到的是 rank-local gradient，等价于每个 rank 训练不同模型。
+
+FP16 dynamic loss scaling 的 `found_inf` 必须 all-rank 同步，常见实现是对每 rank 的 overflow flag 做 `MAX` AllReduce。只要一个 rank overflow，所有 rank 都要跳过 optimizer step，并以相同方式更新 loss scale；否则部分 rank 更新参数、部分 rank 不更新，下一轮 collective 即使不 hang，数学状态也已经分叉。
+
+Gradient clipping 也要按并行策略区分：
+
+- DDP：每 rank 在 AllReduce 后持有完整平均梯度，`clip_grad_norm_(model.parameters())` 看到的是 full global grad norm。
+- FSDP/ZeRO-2/3：每 rank 只持有 gradient shard 时，不能直接把 local shard norm 当 full norm；需要 shard-aware global norm，通常是各 rank 计算 local squared norm，再 AllReduce sum，取 sqrt 后按同一个 scale 缩放本地 shard。
+- 如果 clipping 放在 communication 之前，DDP 会按 rank-local gradient 裁剪，语义不同；除非算法明确需要 local clipping，否则生产默认应在同步或 shard-aware norm 之后裁剪。
+
+skip optimizer 的一致性同样适用于 scheduler、EMA、weight decay、gradient scaler 和 checkpoint step counter。一次 skipped step 不应推进 `global_step` 或保存为 validated checkpoint，除非训练框架把“skip 但 step counter 前进”的语义写入配置并由所有 rank 一致执行。
 
 ### 4.7 exposed communication 公式
 
@@ -479,7 +657,7 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 # NCCL diagnostics. INFO 用于预发和事故复盘；稳定生产可降为 WARN。
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,GRAPH,COLL
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1  # PyTorch ProcessGroupNCCL；旧栈可能仍接受旧 NCCL 变量名
 export NCCL_BLOCKING_WAIT=0
 
 # Network binding. 按实际集群替换。
@@ -509,7 +687,7 @@ torchrun \
   --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
   train.py \
   --parallel ddp \
-  --model llama7b \
+  --model 1b-smoke \
   --precision bf16 \
   --seq-len 4096 \
   --micro-batch-size 2 \
@@ -518,6 +696,8 @@ torchrun \
   --log-rank-metrics \
   --profile-window 100:130
 ```
+
+这个 DDP launcher 是网络、sampler、NCCL 和日志链路的 smoke test，不是 7B AdamW 训练方案。7B BF16 + AdamW 在 DDP 下单卡状态约 100 GiB，不含 activation；生产基线应切到下面的 FSDP/ZeRO-3 入口，或把 smoke test 模型控制在能完整复制的规模。
 
 FSDP FULL_SHARD 入口示例：
 
@@ -604,6 +784,32 @@ def train_one_epoch(model, dataset, optimizer, scaler, epoch, args):
 - BF16 不需要 dynamic loss scale，但 FP16 需要把 scaler state 纳入 checkpoint；
 - 每个 rank 的 sampler epoch 必须一致；
 - rank-level data time 和 step time 必须打点。
+
+上面的片段是 BF16 简化版。FP16 + DDP 的 optimizer boundary 应显式包含 scaler 和全 rank overflow 同步；下面是协议伪代码，不是可直接复制的完整训练循环：
+
+```python
+def sync_found_inf(found_inf: torch.Tensor) -> torch.Tensor:
+    dist.all_reduce(found_inf, op=dist.ReduceOp.MAX)
+    return found_inf
+
+
+if sync_now:
+    scaler.unscale_(optimizer)
+    found_inf = get_local_found_inf_from_scaler(scaler, optimizer)
+    global_found_inf = sync_found_inf(found_inf.to("cuda"))
+
+    if global_found_inf.item() == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+
+    # 关键点：update 也必须使用 global_found_inf，而不是每个 rank 的本地 overflow。
+    # 实际框架可以把 global flag 写回 scaler 的 found_inf state，或由 rank0 计算
+    # new_scale 后 broadcast；不能让无 overflow 的 rank 自己 grow scale。
+    scaler_update_with_global_found_inf(scaler, global_found_inf)
+    optimizer.zero_grad(set_to_none=True)
+```
+
+实际代码应优先使用框架公开 API 或训练库封装；这里展示的是协议边界：unscale 后同步 `found_inf`，所有 rank 对 step/skip 作同一个决定，并且 loss scale update 也必须使用同一个 global overflow 结果。只把 `global_found_inf` 用来跳过 `optimizer.step()` 还不够：如果 `scaler.update()` 仍读取每个 rank 的本地 overflow，某些 rank 会 grow scale、某些 rank 会 backoff，下一轮即使参数还没分叉，AMP 状态也已经分叉。FSDP/ZeRO 场景不要用普通 `clip_grad_norm_` 读 shard 当 full norm，应使用 FSDP/DeepSpeed 提供的 shard-aware clipping 或自己做 squared norm AllReduce。
 
 ## 6. NCCL 与网络拓扑：ring/tree、rail、NIC、IB/RoCE、日志证据
 
@@ -759,8 +965,8 @@ parallel:
 batch:
   sequence_length: 4096
   micro_batch_per_gpu: 2
-  gradient_accumulation_steps: 4
-  global_batch_sequences: 512
+  gradient_accumulation_steps: 16
+  global_batch_sequences: 2048
   token_accounting: non_pad_tokens
 
 precision:
@@ -778,21 +984,21 @@ nccl_env_policy:
   env:
     NCCL_IB_DISABLE: "0"
     NCCL_CROSS_NIC: "1"
-    NCCL_ASYNC_ERROR_HANDLING: "1"
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
     NCCL_NET_GDR_LEVEL: "2"
 
 preflight_gates:
   steps: 300
   min_p50_non_pad_tokens_per_s: 700000
   min_p95_weak_scaling_efficiency: 0.85
-  max_nccl_exposed_tail_p95_ms: 150
+  max_nccl_exposed_tail_ratio_p95: 0.08
   max_rank_step_skew_p95: 1.12
   max_data_visible_wait_ratio_p95: 0.05
   max_hbm_p95_gib: 68
 
 rollback_gates:
   max_tokens_s_regression_ratio: 0.10
-  max_nccl_exposed_tail_p95_ms: 80
+  max_nccl_exposed_tail_ratio_p95: 0.10
   max_rank_step_skew_p95: 1.15
   max_data_visible_wait_ratio_p95: 0.05
   require_loss_parity: true
@@ -809,8 +1015,13 @@ checkpoint_schema:
     - world_size
     - process_mesh
     - shard_layout
+    - sampler_epoch
+    - sampler_cursor
+    - packer_residual_digest
     - dataset_manifest_digest
 ```
+
+这里的 batch 字段对应第 10 节 worked example 的阶段 A：`2 * 16 * 64 = 2048 sequences`，用于系统 weak scaling 和通信效率验收。它不是 loss parity 阶段的配置；如果做阶段 B，应把 `gradient_accumulation_steps` 改成 `1`，并把 `global_batch_sequences` 改成 `128`，同时记录 LR/warmup 策略差异。
 
 这份配置不是为了替代训练代码，而是为了让平台 admission、preflight、发布、rollback gate 和 checkpoint schema 使用同一份事实来源。
 
@@ -852,6 +1063,32 @@ TorchElastic 不能覆盖的边界：
 - 某些 rank 已经执行 optimizer step、另一些 rank 未执行的 partial step 不能被“继续跑”修复，必须回滚到上一个一致 checkpoint。
 
 因此，elastic restart 是恢复编排能力，不是状态一致性协议本身。
+
+一次 collective hang 到 rollback 的状态机通常是：
+
+```text
+all ranks enter step S
+  -> rank 17 fails before collective seq=812
+  -> ranks 0..16,18..63 enter seq=812 and wait
+  -> ProcessGroupNCCL watchdog observes timeout
+  -> async error is recorded and communicators abort
+  -> launcher kills remaining workers
+  -> rendezvous starts a fresh worker group
+  -> training code loads last validated checkpoint C
+  -> sampler/RNG/optimizer/scaler/FSDP shard metadata restore from C
+  -> any partial work from steps C+1..S is discarded
+```
+
+`seq num` 是排障线索，不是恢复点。它告诉你哪些 rank 进入了哪个 collective，帮助找第一个缺席 rank；恢复仍只能从上一个 validated checkpoint 开始。
+
+validated checkpoint 的意思是：所有 rank 完成同一个 optimizer boundary，checkpoint metadata 写完并通过基本校验。以下状态不能作为恢复基准：
+
+- 某些 rank 已经 ReduceScatter 完梯度，另一些 rank 还没进入 collective；
+- 某些 rank 已经 `optimizer.step()`，另一些 rank 因 overflow、OOM 或 timeout 未 step；
+- sharded optimizer state 写了一部分对象，但 metadata 没有 commit；
+- streaming sampler cursor 已推进，但 model/optimizer checkpoint 没有对应推进。
+
+partial optimizer step 必须丢弃。最实用的做法是把 checkpoint commit 设计成两阶段：先写 rank-local shard 到临时路径，再由 coordinator 写 `latest_metadata.json` 或等价 commit marker。elastic resume 只认 commit marker，不扫描“看起来最新”的分片文件。
 
 ### 7.5 Preflight
 
@@ -902,7 +1139,7 @@ DP 配置发布要像服务配置发布一样治理。
 回滚条件示例：
 
 - steady-state tokens/s 低于上一版本 10%；
-- NCCL exposed tail P95 高于 80 ms；
+- NCCL exposed tail P95 高于 step time 的 10%；
 - rank skew P95 大于 1.15；
 - data visible wait P95 大于 5% step time；
 - checkpoint dry run 超过 RTO 预算；
@@ -1055,7 +1292,7 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)
 
 | 症状 | 证据 | 可能根因 | 动作 |
 |---|---|---|---|
-| NCCL timeout | `Watchdog caught collective operation timeout`，某 collective seq num 卡住，部分 rank 无后续日志 | 某 rank 先崩、data loader 卡死、网络连接断、IB/RoCE 丢包、进程组不一致 | 收集所有 rank 日志；按 seq num 找第一个缺席 rank；检查 dmesg/XID/IB counters；开启 `NCCL_ASYNC_ERROR_HANDLING=1`；修复 rank-local 根因后重跑 |
+| NCCL timeout | `Watchdog caught collective operation timeout`，某 collective seq num 卡住，部分 rank 无后续日志 | 某 rank 先崩、data loader 卡死、网络连接断、IB/RoCE 丢包、进程组不一致 | 收集所有 rank 日志；按 seq num 找第一个缺席 rank；检查 dmesg/XID/IB counters；开启 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`；修复 rank-local 根因后重跑 |
 | low bus bandwidth | `nccl-tests` busbw 只有平台基线 40%-60%，NCCL 日志显示 Socket 或单 HCA | RDMA device 未注入、`NCCL_SOCKET_IFNAME` 错、`NCCL_IB_HCA` 错、单 rail、链路降速、跨 NUMA | 跑 `ibdev2netdev`、`ibstat`、`nvidia-smi topo -m`；修 HCA/env/device plugin；验证 all_reduce/all_gather/reduce_scatter |
 | rank straggler | per-rank step P95 中某 rank 持续慢 10%+，sample token skew 正常 | GPU 降频、ECC/XID、CPU steal、NUMA 错、PCIe/NVLink error、NIC 拥塞 | 查 DCGM clock/throttle、`nvidia-smi -q`、host CPU、IB port counters；隔离节点；重排 rank placement |
 | data skew | rank data time 和 sample tokens 同时倾斜，长样本集中在少数 rank | shard 不是按 token 平衡、packing 不均、远端数据分片热点、worker 数不足 | 按 non-pad tokens 做 batch/pack 平衡；记录 per-rank sample length；重建 manifest；加缓存或调整 worker/prefetch |
@@ -1103,9 +1340,12 @@ checkpoint/
 
 | Metric | Accepted baseline | 口径 |
 |---|---:|---|
+| Raw sequence slots/s | 118,751 | 8 GPU aggregate，fixed dense slots |
+| Compute tokens/s | 118,751 | padding 仍执行 dense MLP/norm |
 | Effective non-pad tokens/s | 95,000 | 8 GPU aggregate，排除 padding |
+| Loss tokens/s | 93,600 | shifted `labels != -100` |
 | MFU | 48.3% | `6N_p` FLOPs/token |
-| HFU | 60.3% | checkpointing 后约 `7.5N_p` actual FLOPs/token |
+| HFU | 75.4% | dense compute slots，checkpointing 后约 `7.5N_p` actual FLOPs/token |
 | HBM P95 | 63 GiB/GPU | 低于 68 GiB admission 上限 |
 | DataLoader visible wait | 3% | steady-state profiler window |
 | Checkpoint time | 18 s / 1000 steps | 单独拆出，不混入稳态 step |
@@ -1140,6 +1380,16 @@ cross_node_collective = NCCL over IB/RoCE
 checkpoint = sharded state dict
 ```
 
+这里的 `shard_world_size=64` 不是“把第7章单节点 FSDP 除以 8 再线性扩展”。64-way FULL_SHARD 会让参数 AllGather 和梯度 ReduceScatter 跨节点进入 IB/RoCE critical path，wrap 粒度、prefetch、bucket 和 rank placement 都会改变 step time。真实 admission 至少要比较三档：
+
+| 方案 | shard group | 容量收益 | 通信路径 | 适用判断 |
+|---|---|---|---|---|
+| 单节点 FULL_SHARD | 8 GPU/node | 中 | NVSwitch 内 | 第7章 baseline，验证模型可训和 dtype policy |
+| 64-way FULL_SHARD | 64 GPU | 高 | NVSwitch + IB/RoCE | 状态压力最大、网络足够强且 overlap 证据好 |
+| HYBRID_SHARD | node-local shard + cross-node replicate/sync | 中高 | 参数聚合多在节点内，跨节点做 DP 同步 | HBM 足够但跨节点 AllGather tail 过高 |
+
+如果 64-way FULL_SHARD 的 exposed AllGather P95 超过预算，不应只调 NCCL env；先评估 HYBRID_SHARD 或 ZeRO-2/3 的分组策略，确认容量和通信哪个是主约束。
+
 为什么不立刻上 TP/PP：
 
 - 7B 模型层内计算和整网深度在 64xH100 上不是容量主问题；
@@ -1156,15 +1406,15 @@ checkpoint = sharded state dict
 ```text
 seq_len = 4096
 micro_batch_per_gpu = 2
-grad_accum = 4
+grad_accum = 16
 world_size = 8
-global_batch_sequences = 2 * 4 * 8 = 64 sequences
+global_batch_sequences = 2 * 16 * 8 = 256 sequences
 ```
 
 64 GPU 如果保持 microbatch 和 accumulation 不变：
 
 ```text
-global_batch_sequences = 2 * 4 * 64 = 512 sequences
+global_batch_sequences = 2 * 16 * 64 = 2048 sequences
 ```
 
 这改变算法 batch。
@@ -1173,10 +1423,10 @@ global_batch_sequences = 2 * 4 * 64 = 512 sequences
 
 | 阶段 | per GPU microbatch | grad accum | world size | global sequences | 目的 |
 |---|---:|---:|---:|---:|---|
-| A: system scaling | 2 | 4 | 64 | 512 | 测 weak scaling 和通信效率 |
+| A: system scaling | 2 | 16 | 64 | 2048 | 测 weak scaling 和通信效率，沿用第7章每 rank accumulation |
 | B: loss parity | 2 | 1 | 64 | 128 | 接近较小 global batch，观察收敛 |
 
-若算法要求严格保持 64 sequences，则 64 GPU 下 `grad_accum=1` 仍有 128 sequences，必须降低 microbatch 到 1 或使用更复杂的 batch schedule。
+若算法要求严格保持第7章的 256 sequences，则 64 GPU 下 `grad_accum=2` 得到 256 sequences。若要求更小的 64 sequences，64 GPU 下 `microbatch=1, grad_accum=1` 仍有 64 sequences，但每 rank compute 变短，通信暴露会明显上升。
 
 降低 microbatch 会缩短 compute，通信暴露可能上升。
 
@@ -1197,39 +1447,39 @@ ideal_64gpu_tokens_s = 95,000 * 8 = 760,000 non-pad tokens/s
 | Component | P50 ms | P95 ms | 证据来源 |
 |---|---:|---:|---|
 | data visible wait | 35 | 70 | rank-level dataloader timer |
-| forward + backward compute | 1,420 | 1,500 | torch profiler CUDA timeline |
-| FSDP AllGather total | 190 | 240 | NCCL range + profiler |
-| ReduceScatter total | 155 | 210 | NCCL range + profiler |
+| forward + backward compute | 5,680 | 6,000 | torch profiler CUDA timeline，16 个 accumulation microstep |
+| FSDP AllGather total | 760 | 960 | NCCL range + profiler，按 microstep 聚合 |
+| ReduceScatter total | 620 | 840 | NCCL range + profiler，按 microstep 聚合 |
 | other NCCL / barriers | 25 | 45 | profiler |
-| communication total | 370 | 470 | summed NCCL kernels |
-| overlap with compute | 300 | 350 | timeline intersection |
-| exposed communication | 70 | 120 | `max(comm - overlap, 0)` |
+| communication total | 1,405 | 1,845 | summed NCCL kernels |
+| overlap with compute | 1,125 | 1,365 | timeline intersection |
+| exposed communication | 280 | 480 | `max(comm - overlap, 0)` |
 | optimizer | 115 | 140 | optimizer timer |
 | misc/logging | 25 | 40 | training loop timer |
-| step time | 1,665 | 1,870 | max rank step timer |
+| step time | 6,135 | 6,730 | max rank optimizer-step timer |
 
 P50 step 模型：
 
 ```text
 step_time = data_visible + compute + exposed_communication + optimizer + misc
-          = 35 + 1420 + 70 + 115 + 25
-          = 1665 ms
+          = 35 + 5680 + 280 + 115 + 25
+          = 6135 ms
 ```
 
 每 step token 数估算：
 
 ```text
-sequences_per_step = 2 * 4 * 64 = 512
-raw_tokens_per_step = 512 * 4096 = 2,097,152
+sequences_per_step = 2 * 16 * 64 = 2048
+raw_tokens_per_step = 2048 * 4096 = 8,388,608
 non_pad_ratio = 0.60
-non_pad_tokens_per_step = 1,258,291
-throughput = 1,258,291 / 1.665 ~= 756,000 non-pad tokens/s
+non_pad_tokens_per_step = 5,033,165
+throughput = 5,033,165 / 6.135 ~= 820,000 non-pad tokens/s
 ```
 
 弱扩展效率：
 
 ```text
-weak_scaling_efficiency = 756,000 / 760,000 = 99.5%
+weak_scaling_efficiency = 820,000 / 760,000 = 107.9%
 ```
 
 这个数字看起来过高，必须做 sanity check。
@@ -1244,8 +1494,8 @@ weak_scaling_efficiency = 756,000 / 760,000 = 99.5%
 保守验收应同时看 P95：
 
 ```text
-throughput_p95 ~= 1,258,291 / 1.870 = 673,000 non-pad tokens/s
-p95_efficiency = 673,000 / 760,000 = 88.6%
+throughput_p95 ~= 5,033,165 / 6.730 = 748,000 non-pad tokens/s
+p95_efficiency = 748,000 / 760,000 = 98.4%
 ```
 
 生产 acceptance 可以设置为：
@@ -1254,7 +1504,7 @@ p95_efficiency = 673,000 / 760,000 = 88.6%
 |---|---:|
 | P50 non-pad tokens/s | >= 700,000 |
 | P95 weak scaling efficiency | >= 85% |
-| exposed communication P95 | <= 150 ms |
+| exposed communication P95 / step time P95 | <= 8% |
 | rank step skew P95 | <= 1.12 |
 | data visible wait P95 | <= 5% step time |
 | HBM P95 | <= 68 GiB/GPU |
@@ -1266,11 +1516,12 @@ p95_efficiency = 673,000 / 760,000 = 88.6%
 
 | Component | Healthy P95 | Bad P95 |
 |---|---:|---:|
-| communication total | 470 ms | 820 ms |
-| overlap | 350 ms | 430 ms |
-| exposed communication | 120 ms | 390 ms |
-| step time | 1,870 ms | 2,180 ms |
-| tokens/s P95 | 673,000 | 577,000 |
+| communication total | 1,845 ms | 2,620 ms |
+| overlap | 1,365 ms | 1,590 ms |
+| exposed communication | 480 ms | 1,030 ms |
+| exposed / step | 7.1% | 14.1% |
+| step time | 6,730 ms | 7,300 ms |
+| tokens/s P95 | 748,000 | 690,000 |
 | rank skew P95 | 1.10 | 1.28 |
 
 证据：

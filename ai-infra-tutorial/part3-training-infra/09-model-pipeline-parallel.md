@@ -35,7 +35,7 @@
 | 层内张量 | hidden / heads / matrix rows or columns | TP | 降低单层峰值、增加层内算力 | 高频 collective，强依赖 NVLink/NVSwitch |
 | 层段 | Transformer blocks | PP | 降低每卡层数和整网驻留状态 | microbatch 调度、pipeline bubble |
 | 序列 / 上下文 | tokens / context blocks / KV | SP / CP | 降低长序列 activation 和 attention 压力 | 序列维度通信、kernel 支持要求高 |
-| 专家 | MoE experts | EP | 扩大稀疏容量 | token dispatch、All-to-All、load balance |
+| 专家 | MoE experts | EP | 扩大稀疏容量 | token dispatch、All-to-All/AllToAllV、load balance |
 
 ### 1.2 推：机制如何从问题中长出来
 
@@ -53,7 +53,7 @@
 
 如果上下文长度继续增加，SP/CP 成为必要补充。SP 通常在 TP 组内切非 attention 路径的 sequence activation，例如 LayerNorm、Dropout、Residual。CP 切 attention context，让 token block 或 K/V 在多卡之间流动。它们解决的是序列维度压力，不替代 TP/PP/DP/FSDP。
 
-如果模型是 MoE，还会引入 EP。EP 把不同 experts 放在不同 rank，token 通过 router 分发给少数 experts。EP 的主要瓶颈通常不是参数存储，而是 token dispatch、All-to-All、expert load balance 和 dropless routing 的尾延迟。本章只把 EP 放进策略边界，MoE 细节需要单独设计。
+如果模型是 MoE，还会引入 EP。EP 把不同 experts 放在不同 rank，token 通过 router 分发给少数 experts。EP 的主要瓶颈通常不是参数存储，而是 token dispatch、All-to-All/AllToAllV、expert load balance 和 dropless routing 的尾延迟。本章只把 EP 放进策略边界，MoE 细节需要单独设计。
 
 ### 1.3 学习大纲
 
@@ -97,6 +97,65 @@ global_rank
 
 每个 group 都有自己的通信域、状态归属、checkpoint shard、日志标签和故障传播方式。
 
+一个可审计的 launcher 必须把这个映射写成确定的代数，而不是散落在各框架默认值里。下面是一种常见的 row-major 顺序，约定 `tp` 是最内层维度，`dp` 是最外层维度：
+
+```text
+world_size = DP * PP * CP * TP
+
+tp_rank = global_rank % TP
+cp_rank = (global_rank // TP) % CP
+pp_rank = (global_rank // (TP * CP)) % PP
+dp_rank = global_rank // (TP * CP * PP)
+
+global_rank =
+  (((dp_rank * PP + pp_rank) * CP + cp_rank) * TP + tp_rank)
+```
+
+例如 `DP=2, PP=4, CP=2, TP=8` 时，`global_rank=93`：
+
+```text
+tp_rank = 93 % 8 = 5
+cp_rank = (93 // 8) % 2 = 1
+pp_rank = (93 // 16) % 4 = 1
+dp_rank = 93 // 64 = 1
+
+global_rank = (((1 * 4 + 1) * 2 + 1) * 8 + 5) = 93
+```
+
+也可以选择 `dp/pp/tp/cp`、`pp/dp/tp/cp` 等其他 order，但 scheduler placement、launcher、框架 process group、日志标签和 checkpoint metadata 必须使用同一个 order。最危险的事故不是启动时报错，而是训练能跑、checkpoint 能写，但恢复或推理转换时按另一套 order 解释 shard owner，导致 silent weight corruption。
+
+#### 2.1.1 Rank ID 表：`DP=2, PP=4, TP=4`
+
+去掉 CP 后，上面的 row-major 公式退化为：
+
+```text
+world_size = 2 * 4 * 4 = 32
+global_rank = ((dp_rank * PP + pp_rank) * TP + tp_rank)
+```
+
+完整 rank 表如下。读表时要先定位 `dp` 副本，再定位 `pp` stage，最后才是同 stage 内的 `tp` shard：
+
+| `dp_rank` | `pp_rank` | `tp_rank=0` | `tp_rank=1` | `tp_rank=2` | `tp_rank=3` |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 0 | 1 | 2 | 3 |
+| 0 | 1 | 4 | 5 | 6 | 7 |
+| 0 | 2 | 8 | 9 | 10 | 11 |
+| 0 | 3 | 12 | 13 | 14 | 15 |
+| 1 | 0 | 16 | 17 | 18 | 19 |
+| 1 | 1 | 20 | 21 | 22 | 23 |
+| 1 | 2 | 24 | 25 | 26 | 27 |
+| 1 | 3 | 28 | 29 | 30 | 31 |
+
+由这张表可以直接构造 process group：
+
+| group 类型 | 构造规则 | 示例 |
+|---|---|---|
+| TP group | 固定 `(dp_rank, pp_rank)`，枚举 `tp_rank` | `dp0,pp2` → `[8,9,10,11]`；`dp1,pp0` → `[16,17,18,19]` |
+| PP chain | 固定 `(dp_rank, tp_rank)`，按 `pp_rank=0..3` 串 stage | `dp0,tp0` → `[0,4,8,12]`；`dp1,tp3` → `[19,23,27,31]` |
+| DP group | 固定 `(pp_rank, tp_rank)`，枚举 `dp_rank` | `pp0,tp0` → `[0,16]`；`pp3,tp2` → `[14,30]` |
+
+这三个 group 不能互换：TP group 共同算同一层的一个 microbatch，PP chain 传 activation/activation gradient，DP group 同步等价 tensor shard 的梯度或 optimizer state。checkpoint metadata 至少要能从任意 `global_rank` 反查出这三个 group，否则 reshape restore 和故障定位都会变成猜测。
+
 ### 2.2 不是什么
 
 模型并行不是：
@@ -118,7 +177,7 @@ global_rank
 | PP | layers / stages | stage 内层计算 | activation / gradient send-recv | 可跨节点，但要固定拓扑 |
 | SP | non-attention sequence activations | attention context 全局依赖 | AllGather、ReduceScatter | 通常在 TP 组内 |
 | CP | attention context / KV / token blocks | parameters / optimizer states | ring KV、All-to-All、P2P | 高速互联优先，可跨节点但成本高 |
-| EP | experts | dense shared layers | token dispatch All-to-All | MoE expert mesh |
+| EP | experts | dense shared layers | token dispatch All-to-All/AllToAllV | MoE expert mesh |
 
 一句话边界：
 
@@ -162,7 +221,7 @@ job spec
 
 - `world_size == DP * PP * TP * CP * EP`，FSDP/ZeRO group size 另行定义。
 - 每个 Transformer layer 必须有唯一 stage owner，除非 interleaved pipeline 让一个物理 rank 拥有多个 virtual stage。
-- TP 组内 hidden size、attention heads、KV heads、vocab padding 必须可整除。
+- TP 组内 hidden size、attention heads、vocab padding 必须可整除；GQA/MQA 的 KV heads 约束取决于框架布局，见 §5.1。
 - CP 组内 sequence partition、position encoding、attention mask、KV exchange 顺序必须一致。
 - checkpoint metadata 必须保存并行维度、rank mapping、tensor shard spec、optimizer shard spec 和 RNG/data cursor。
 
@@ -190,7 +249,7 @@ dataset shard
 - SP/CP group 内重新布局 sequence 或 context。
 - EP group 内做 token dispatch 和 expert output combine。
 
-因此一个 step 的慢点可能来自任意路径：DataLoader、PP send/recv、TP AllReduce、CP KV exchange、EP All-to-All 或 FSDP parameter AllGather。
+因此一个 step 的慢点可能来自任意路径：DataLoader、PP send/recv、TP AllReduce、CP KV exchange、EP All-to-All/AllToAllV 或 FSDP parameter AllGather。
 
 ### 3.4 状态路径
 
@@ -380,7 +439,7 @@ Selective + FlashAttention： 80 × 8192 × 8192 ×  8 bytes ≈  43 GB
 
 - TP=8：每 rank hidden/8，`attn_input/output` 等正比降低；但 `attn_scores`（quadratic）只降 `num_heads/TP`，不降 seq²。
 - PP=4（70B 80 层）：每 rank 只有 20 层，activation 降到 1/4；但 stage 边界 send/recv buffer 增加（见 §4.1）。
-- CP=4：attention 的 KV/scores 从 full seq² 降到 `(seq/CP)²`，对 attention workspace 有二次方级别改善（见 §4.6.1）。
+- CP=4：attention 的 KV/scores 从 full seq² 降到 `(seq/CP)²`，对 attention workspace 有二次方级别改善（见 §4.6.3）。
 
 ### 4.2 TP 的通信边界
 
@@ -388,7 +447,7 @@ TP 常见做法：
 
 - Column parallel linear：切输出 hidden，forward 后通常保留分片，后续按实现决定是否 AllGather。
 - Row parallel linear：切输入 hidden，局部 matmul 后需要 AllReduce 或 ReduceScatter。
-- Attention head parallel：按 heads 切，要求 attention heads 或 KV heads 能被 TP size 整除。
+- Attention head parallel：按 heads 切，Q heads 通常需要能被 TP size 整除；GQA/MQA 的 KV heads 是否也硬性整除取决于框架 layout 和是否支持 KV replication/special handling。
 - Vocab parallel：切 vocab projection，loss 前后有特殊通信。
 
 TP 的工程判断：
@@ -399,7 +458,73 @@ TP_comm_exposed = max(TP_collective_time - overlap_with_compute, 0)
 
 如果 TP collective 在 Nsight Systems 中反复出现在每层 GEMM 之间，并且 NCCL bus bandwidth 明显低于节点内基线，TP size 可能过大或 placement 跨了慢链路。TP 不是越大越好：TP=8 通常适合 8 GPU NVSwitch 节点；TP=16 跨节点时，每层通信会直接吃掉训练效率。
 
-#### 4.2.1 TP 通信量估算
+#### 4.2.1 Decoder block TP shape trace
+
+下面用一个 decoder block 说明 TP 到底怎么执行。约定：
+
+```text
+输入 X: [B, S, H]
+TP = T
+num_q_heads = Nh
+num_kv_heads = Nkv        # GQA/MQA 时 Nkv <= Nh
+head_dim = Dh
+H = Nh * Dh
+FFN hidden = 4H           # 为简化，实际 SwiGLU 常为 8H/3 或框架指定值
+```
+
+**不启用 SP 时，Megatron-style Column/Row TP 的前向 trace**
+
+| 步骤 | 每个 TP rank 的输入 | 本地权重 shard | 本地输出 | 通信 / 下一步 |
+|---|---|---|---|---|
+| block input | `X [B,S,H]`（每 rank 都有完整 hidden） | - | `X` | 来自上一层 RowParallel 的 AllReduce 输出 |
+| Q ColumnParallel | `X [B,S,H]` | `Wq_i [H, (Nh/T)*Dh]` | `Q_i [B,S,H/T]` | 不 AllGather；本 rank 只算本地 Q heads |
+| K/V ColumnParallel（MHA） | `X [B,S,H]` | `Wk_i,Wv_i [H, (Nkv/T)*Dh]` | `K_i,V_i [B,S,(Nkv/T)*Dh]` | 要求 `Nkv % T == 0` |
+| K/V ColumnParallel（GQA/MQA replication） | `X [B,S,H]` | `Wk_i,Wv_i` 可能是 owner shard 或复制 shard | `K_i,V_i` 可能少于、等于或复制本 rank 所需 KV heads | 需要 checkpoint 标记 KV owner/replica，不能只按 `tp_rank` 等分 |
+| attention | `Q_i,K_i,V_i` | - | `Ctx_i [B,S,H/T]` | 本地 heads 内做 softmax；不跨 TP rank 混 heads |
+| attention output RowParallel | `Ctx_i [B,S,H/T]` | `Wo_i [H/T,H]` | `Y_i_partial [B,S,H]` | 对 `Y_i_partial` 做 AllReduce，得到 `Y [B,S,H]` |
+| residual + norm | `Y [B,S,H]` | LN 参数通常复制 | `U [B,S,H]` | 无 TP 通信 |
+| MLP FC1 ColumnParallel | `U [B,S,H]` | `W1_i [H,4H/T]` | `M_i [B,S,4H/T]` | activation/GELU/SwiGLU 本地执行 |
+| MLP FC2 RowParallel | `M_i [B,S,4H/T]` | `W2_i [4H/T,H]` | `Z_i_partial [B,S,H]` | AllReduce 得到 block output `Z [B,S,H]` |
+
+因此一个普通 block 中，真正把各 TP shard 汇合回 full hidden 的位置通常是两个 RowParallel：attention output projection 和 MLP second projection。ColumnParallel 不急着 AllGather，是为了让后面的 attention heads 或 MLP activation 继续在本地 shard 上算。
+
+**启用 SP 时，同一条 trace 的 layout 变化**
+
+SP 的目标是避免每个 TP rank 都常驻完整 `[B,S,H]` 的非 attention activation。它把 RowParallel 后的 full-hidden AllReduce 改成序列维度上的 ReduceScatter，并在下一个 ColumnParallel 需要 full sequence 输入前 AllGather：
+
+| 边界 | TP-only layout | SP layout | 通信替换 |
+|---|---|---|---|
+| attention RowParallel 输出 | 每 rank 得到 `Y [B,S,H]` | 每 rank 得到 `Y_seq_i [B,S/T,H]` | `AllReduce(hidden)` → `ReduceScatter(seq)` |
+| LayerNorm / Dropout / Residual | 每 rank 对完整 `S` 重复做 | 每 rank 只对 `S/T` token 做 | 无额外通信，activation 常驻量约降到 `1/T` |
+| 下一次 ColumnParallel 前 | 输入已是 `[B,S,H]` | 需要 `AllGather(seq)` 得到 `U [B,S,H]` | 插入 `AllGather(seq)` |
+| MLP RowParallel 输出 | 每 rank 得到 `Z [B,S,H]` | 每 rank 得到 `Z_seq_i [B,S/T,H]` | `AllReduce(hidden)` → `ReduceScatter(seq)` |
+
+这就是“`AllReduce -> ReduceScatter(seq) + AllGather(seq)`”的含义：总 bytes 近似不变，但常驻 activation 从每 rank 保存完整 sequence，变成大部分时间只保存 `S/T` sequence shard。实现上要注意 sequence 维度 shard 的 tensor stride/layout；很多 fused LayerNorm、Dropout、bias-dropout-add kernel 假设 `[tokens, hidden]` 连续，SP 打开后必须走支持 sequence shard 的 kernel。
+
+**Backward trace**
+
+反向传播沿前向反过来走：
+
+```text
+dZ [B,S,H] 或 dZ_seq_i [B,S/T,H]
+  -> MLP FC2 RowParallel backward:
+       dM_i [B,S,4H/T] 本地算
+       dW2_i [4H/T,H] 本地累积
+       dU partial 需要跨 TP reduce；SP 下对应 AllGather/ReduceScatter 的反向互换
+  -> MLP FC1 ColumnParallel backward:
+       dW1_i [H,4H/T] 本地累积
+       dU_i_partial [B,S,H] 跨 TP AllReduce 或 SP ReduceScatter 得到 dU
+  -> attention output RowParallel backward:
+       dCtx_i [B,S,H/T] 本地算
+       dWo_i [H/T,H] 本地累积
+  -> QKV ColumnParallel backward:
+       dWq_i/dWk_i/dWv_i 本地累积
+       dX partial 跨 TP reduce 得到 dX；SP 下继续保持 sequence shard，必要处 AllGather(seq)
+```
+
+参数梯度天然跟随本地 weight shard，例如 `dWq_i`、`dWo_i`、`dW1_i`、`dW2_i` 都只在本 TP rank 上保存；需要跨 TP 同步的是 activation gradient 的合并，而不是把每个 weight shard 拼成 full weight 再更新。
+
+#### 4.2.2 TP 通信量估算
 
 第 8 章给出了 DP AllReduce 的心算公式。TP 需要等价的估算基础。
 
@@ -433,7 +558,7 @@ bytes_per_rank per call = 2 × (7/8) × 134 MB ≈ 235 MB
 NVSwitch 节点内 AllReduce 有效 bus bandwidth ≈ 600 GB/s（8×H100 实测）：
   single call time ≈ 235 MB / 600 GB/s ≈ 0.4 ms
   80层 × 2次 = 160次 AllReduce，理论总时间约 64 ms（完全串行上界）
-  实际：大部分 AllReduce 被下层 GEMM 掩盖，exposed tail 通常 5-15 ms（见 §4.2.2）
+  实际：大部分 AllReduce 被下层 GEMM 掩盖，exposed tail 通常 5-15 ms（见 §4.2.3）
 ```
 
 **SP（Sequence Parallel）模式的差异**
@@ -441,9 +566,9 @@ NVSwitch 节点内 AllReduce 有效 bus bandwidth ≈ 600 GB/s（8×H100 实测�
 SP 把 TP AllReduce 改写为 ReduceScatter（scatter 到各 rank 保留 sequence 分片）+ AllGather（在需要全量时聚合），总通信量近似相同，但 activation 常驻量降低：每 rank 保存 `seq/TP` 的 sequence 分片而不是完整 seq。
 
 > [!NOTE]
-> 如果 TP collective 在节点内 NVSwitch 完全被 GEMM 掩盖（见 §4.2.2），TP 通信量对 step time 几乎无影响。跨节点 TP 时需用节点间带宽（如 400G IB ≈ 50 GB/s bus bw）重算：0.4 ms × (600/50) ≈ 4.8 ms per call，160 次串行约 768 ms——远超 GEMM 时间，成为严重瓶颈。这是"TP 优先节点内"的定量依据。
+> 如果 TP collective 在节点内 NVSwitch 完全被 GEMM 掩盖（见 §4.2.3），TP 通信量对 step time 几乎无影响。跨节点 TP 时需用节点间带宽（如 400G IB ≈ 50 GB/s bus bw）重算：0.4 ms × (600/50) ≈ 4.8 ms per call，160 次串行约 768 ms——远超 GEMM 时间，成为严重瓶颈。这是"TP 优先节点内"的定量依据。
 
-#### 4.2.2 3D Parallel 通信重叠机制
+#### 4.2.3 3D Parallel 通信重叠机制
 
 "通信量小"不等于"对 step time 无影响"。每种通信能否被 compute 掩盖，取决于实现条件。
 
@@ -453,9 +578,11 @@ SP 把 TP AllReduce 改写为 ReduceScatter（scatter 到各 rank 保留 sequenc
 |---|---|---|---|
 | TP AllReduce（Row parallel 输出） | 下一层的 Column GEMM（前向）、下一层的 backward GEMM | `CUDA_DEVICE_MAX_CONNECTIONS=1` + 独立 CUDA stream（Megatron 默认） | 与 GEMM 在同一 stream；显式 synchronize；未开 async collective |
 | PP send/recv（forward activation） | 同 stage 下一个 microbatch 的某些 compute（1F1B 稳态） | 使用异步 `isend`/`irecv`；m ≥ PP（1F1B 稳态前提） | m < PP（warmup 区间 overlap 差）；同步 send/recv API |
-| DP gradient AllReduce / ReduceScatter | optimizer step 或下一 step 的 forward | DDP bucket 就绪即启动异步 AllReduce；与 backward 后续计算重叠 | accumulation 中途未用 `no_sync()`；bucket 太大导致 tail 暴露（见第 8 章 §4.5） |
+| DP gradient AllReduce / ReduceScatter | 同一次 backward 中更早 bucket 的通信可与后续 layer backward compute 重叠 | DDP bucket 就绪即启动异步 AllReduce；FSDP grad shard ready 后启动 ReduceScatter | optimizer step 前必须 wait 全部 gradient sync；accumulation 中途未用 `no_sync()`；bucket 太大导致 tail 暴露（见第 8 章 §4.5） |
 | FSDP AllGather（backward 参数预取） | 前一个 FSDP unit 的 backward compute | `backward_prefetch=BACKWARD_PRE`；FSDP 内部异步 AllGather stream | `limit_all_gathers=True` 过于保守；wrap 粒度太粗 |
 | CP KV ring exchange | 本地 context 块的 attention compute（Ring FlashAttention） | Ring FlashAttention 实现（Megatron-Core CP / `ring_flash_attn`）；计算时间 ≥ KV 传输时间 | 未使用 Ring FA（标准 FA 无法重叠 ring exchange）；带宽严重不足时计算来不及覆盖 |
+
+默认同步训练的参数一致性边界在 optimizer step 前：DDP/FSDP 必须先完成本轮 gradient AllReduce/ReduceScatter，才能 unscale/clip/optimizer step；下一轮 forward 也不能越过这个边界。若系统把 gradient sync 与 optimizer 或下一 step forward 重叠，那已经进入 async optimizer / stale update 语义，需要单独的收敛和恢复协议，不能用本章默认公式。
 
 **Profiler 中的健康 vs 不健康形态**
 
@@ -478,7 +605,7 @@ FSDP AllGather 暴露（不健康）：
 
 CP ring exchange 暴露（不健康）：
   Ring FlashAttention 阶段出现 send/recv 先于 attention compute 结束。
-  → 检查带宽（见 §4.6.1 估算）；尝试降 CP size 或升级 IB 带宽
+  → 检查带宽（见 §4.6.3 估算）；尝试降 CP size 或升级 IB 带宽
 ```
 
 **调整顺序建议**
@@ -492,43 +619,93 @@ CP ring exchange 暴露（不健康）：
 4. PP 问题：检查 m vs PP 关系，确认使用异步 send/recv API
 5. DP 问题：对齐第 8 章 §4.5 bucket + overlap 诊断
 6. FSDP 问题：调 wrap policy 和 prefetch，不要先调 limit_all_gathers
-7. CP 问题：确认 Ring FA 实现，估算 §4.6.1 数字后再决定是否降 CP
+7. CP 问题：确认 Ring FA 实现，估算 §4.6.3 数字后再决定是否降 CP
 ```
 
 ### 4.3 PP、microbatch 和 pipeline bubble
 
-流水并行把一个 batch 切成 `m` 个 microbatch，通过 `p` 个 pipeline stage。**bubble 公式因调度策略不同而完全不同**——很多工程团队套用 GPipe 公式来算 1F1B 的效率，结果误差可达 2-3 倍。
+流水并行把一个 batch 切成 `m` 个 microbatch，通过 `p` 个 pipeline stage。教程和论文里常见两个 bubble 口径，必须先说清楚：
 
-#### 4.3.1 三种主流调度的 bubble 公式
+```text
+空槽个数（bubble_slots）≈ p - 1                 # 1F1B 稳态估算，忽略首尾双向细节
+理想计算槽个数（ideal_compute_slots）= m
+端到端 elapsed 槽个数（elapsed_slots）= m + p - 1
 
-| 调度策略 | bubble fraction | 直觉 | 典型框架 |
-|---|---|---|---|
-| **GPipe**（全 forward 后再全 backward） | `(p - 1) / (m + p - 1)` | warmup + cooldown 各占 `p-1` step | 早期 GPipe、PaddlePaddle FleetX |
-| **1F1B**（One-Forward-One-Backward） | `(p - 1) / m` | 稳态阶段 forward 和 backward 完全交错；只剩 startup `p-1` 个 bubble | **Megatron-LM 默认**、DeepSpeed PipelineEngine、TorchTitan |
-| **Interleaved 1F1B**（virtual stage = `v`） | `(p - 1) / (v · m)` | 把每个物理 stage 切成 v 个 virtual stage，bubble 进一步缩 v 倍 | Megatron-LM `--num-layers-per-virtual-pipeline-stage` |
-| **Zero Bubble Pipeline**（W-pass 拆分） | 接近 0（理想） | 把 backward 拆成 W（weight grad）+ B（input grad），用 W 填充 startup 空隙 | DeepSeek、Megatron-Core 实验路径 |
+overhead_vs_ideal_compute = bubble_slots / ideal_compute_slots
+                          = (p - 1) / m
 
-#### 4.3.2 同条件下三种调度的 bubble 对比
+elapsed_idle_fraction     = bubble_slots / elapsed_slots
+                          = (p - 1) / (m + p - 1)
+```
+
+`(p-1)/m` 是“相对理想计算槽的额外开销”，常用于问“要多付多少流水空泡成本”。`(p-1)/(m+p-1)` 是“端到端 elapsed time 中有多少比例是空槽”，常用于画时间线或估算 utilization。二者不是互相矛盾的调度公式，而是同一批空槽的不同分母。本文后续用 `bubble_overhead` 表示 `(p-1)/m`，用 `bubble_elapsed_fraction` 表示 `(p-1)/(m+p-1)`。
+
+#### 4.3.1 主流调度的 bubble 口径
+
+| 调度策略 | `bubble_overhead`（相对理想计算槽） | `bubble_elapsed_fraction`（端到端占比） | 典型框架 |
+|---|---:|---:|---|
+| **GPipe**（全 forward 后再全 backward） | 约 `2(p - 1) / m` | 约 `2(p - 1) / (2m + 2p - 2)` | 早期 GPipe、PaddlePaddle FleetX |
+| **1F1B**（One-Forward-One-Backward） | `(p - 1) / m` | `(p - 1) / (m + p - 1)` | **Megatron-LM 默认**、DeepSpeed PipelineEngine、TorchTitan |
+| **Interleaved 1F1B**（virtual stage = `v`） | 约 `(p - 1) / (v · m)` | 约 `(p - 1) / (v · m + p - 1)` | Megatron-LM `--num-layers-per-virtual-pipeline-stage` |
+| **Zero Bubble Pipeline**（W-pass 拆分） | 接近 0（理想） | 接近 0（理想） | DeepSeek、Megatron-Core 实验路径 |
+
+GPipe 的精确分母取决于把 forward/backward 作为一个 slot 还是两个 slot，以及 backward 计算是否约等于 forward。生产估算时更重要的是不要把 `elapsed_idle_fraction` 当成 `overhead`，否则会低估需要多少 microbatch 才能压低空泡。
+
+#### 4.3.2 同条件下 1F1B 的两种 bubble 口径
 
 以 `p = 8` PP stage 为例（典型 70B 模型 8 stage 配置）：
 
-| `m`（microbatch 数） | GPipe bubble | 1F1B bubble | Interleaved 1F1B（`v=4`） | Zero Bubble |
+| `m`（microbatch 数） | 1F1B `bubble_overhead=(p-1)/m` | 1F1B `bubble_elapsed_fraction=(p-1)/(m+p-1)` | Interleaved 1F1B overhead（`v=4`） | Zero Bubble |
 |---:|---:|---:|---:|---:|
-| 8 | **46.7%** | 87.5% | 21.9% | ~0% |
-| 16 | 30.4% | **43.8%** | 10.9% | ~0% |
-| 32 | 17.9% | 21.9% | 5.5% | ~0% |
-| 64 | 9.9% | 10.9% | 2.7% | ~0% |
-| 128 | 5.2% | 5.5% | 1.4% | ~0% |
+| 8 | 87.5% | 46.7% | 21.9% | ~0% |
+| 16 | 43.8% | 30.4% | 10.9% | ~0% |
+| 32 | 21.9% | 17.9% | 5.5% | ~0% |
+| 64 | 10.9% | 9.9% | 2.7% | ~0% |
+| 128 | 5.5% | 5.2% | 1.4% | ~0% |
 
 > [!DANGER]
-> **注意一个反直觉数字**：`m = 8`、`p = 8` 时，1F1B 的 bubble 计算出来是 `(8-1)/8 = 87.5%`，**比 GPipe 的 46.7% 还高**。这是因为 1F1B 的"稳态完美交错"假设需要 `m ≥ p`。当 `m < p` 时 1F1B 进入 warmup 区间，行为退化甚至比 GPipe 还差。生产规则：**1F1B 的 m 至少应 ≥ p，最好 ≥ 4p 才能让稳态吞吐主导整个 batch**。
+> **注意口径差异**：`m = 8`、`p = 8` 时，同一条 1F1B pipeline 的 overhead 是 `(8-1)/8 = 87.5%`，elapsed idle fraction 是 `(8-1)/(8+8-1)=46.7%`。前者回答“相对满流水多付了多少空槽”，后者回答“端到端时间线里空槽占多少”。生产规则：**1F1B 的 m 至少应 ≥ p，最好 ≥ 4p，才能让稳态吞吐主导整个 batch**。
 
 #### 4.3.3 工程含义
 
-- **生产几乎都用 1F1B 或 Interleaved 1F1B，不是 GPipe**。如果你看到旧文档/教程仍在用 `(p-1)/(m+p-1)` 估算，很可能是 GPipe 时代遗留——直接套到 Megatron 上估算会偏差几倍。
+- **生产几乎都用 1F1B 或 Interleaved 1F1B，不是 GPipe**。看到 `(p-1)/(m+p-1)` 时先确认它是不是 elapsed idle fraction；如果拿它当 overhead，会低估 bubble 成本。
 - **Interleaved 1F1B 的 `v` 值**：常见 v=2~8。v 越大 bubble 越低，但每个 microbatch 走的物理 stage 边界更多 → activation send/recv 通信量随 v 倍增加。在 NVLink/IB 带宽不足时，v 太大反而拖慢。
 - **Zero Bubble** 在 DeepSeek-V3 训练里被报告把 ~10% bubble 进一步压到 ~1%，但实现复杂（必须重写 backward 把 W/B 拆开），框架支持仍在演进。
-- **microbatch 数 `m` 与 batch size 的关系**：global_batch = `m × micro_batch_size × DP_world_size`。增加 m 是降 bubble 最直接的手段，但 m 太大会让 activation 同时驻留更多（1F1B 稳态约驻留 p 个 microbatch 的 activation），可能再次撞上显存。
+- **microbatch 数 `m` 与 batch size 的关系**：global_batch = `m × micro_batch_size × DP_world_size`。增加 m 是降 bubble 最直接的手段，但 activation 常驻不是“每个 stage 都约 p 个 microbatch”。非 interleaved 1F1B 下，stage `s`（从 0 开始）峰值大致是 `p-s` 个 microbatch activation；interleaved 时还要乘上同一物理 rank 上未完成的 virtual stage 数，见下表。
+
+**`p=4,m=8` 的 1F1B stage-local trace**
+
+下表展示每个 stage 的本地调度槽。`RFa` 表示从前一 stage recv forward activation，`SFa` 表示 send activation 到后一 stage；`RG` 表示从后一 stage recv activation gradient，`SG` 表示 send input gradient 到前一 stage。真实 wall-clock 上，某个槽如果依赖未到会等待；调度器的核心约束是本地只在 `F` 和 `B` 间切换，并按 recv/send 依赖推进。
+
+| local slot | Stage 0 | Stage 1 | Stage 2 | Stage 3 |
+|---:|---|---|---|---|
+| 0 | `F0/SFa` | `RFa/F0/SFa` | `RFa/F0/SFa` | `RFa/F0` |
+| 1 | `F1/SFa` | `RFa/F1/SFa` | `RFa/F1/SFa` | `B0/SG` |
+| 2 | `F2/SFa` | `RFa/F2/SFa` | `RG/B0/SG` | `RFa/F1` |
+| 3 | `F3/SFa` | `RG/B0/SG` | `RFa/F2/SFa` | `B1/SG` |
+| 4 | `RG/B0` | `RFa/F3/SFa` | `RG/B1/SG` | `RFa/F2` |
+| 5 | `F4/SFa` | `RG/B1/SG` | `RFa/F3/SFa` | `B2/SG` |
+| 6 | `RG/B1` | `RFa/F4/SFa` | `RG/B2/SG` | `RFa/F3` |
+| 7 | `F5/SFa` | `RG/B2/SG` | `RFa/F4/SFa` | `B3/SG` |
+| 8 | `RG/B2` | `RFa/F5/SFa` | `RG/B3/SG` | `RFa/F4` |
+| 9 | `F6/SFa` | `RG/B3/SG` | `RFa/F5/SFa` | `B4/SG` |
+| 10 | `RG/B3` | `RFa/F6/SFa` | `RG/B4/SG` | `RFa/F5` |
+| 11 | `F7/SFa` | `RG/B4/SG` | `RFa/F6/SFa` | `B5/SG` |
+| 12 | `RG/B4` | `RFa/F7/SFa` | `RG/B5/SG` | `RFa/F6` |
+| 13 | `RG/B5` | `RG/B5/SG` | `RFa/F7/SFa` | `B6/SG` |
+| 14 | `RG/B6` | `RG/B6/SG` | `RG/B6/SG` | `RFa/F7` |
+| 15 | `RG/B7` | `RG/B7/SG` | `RG/B7/SG` | `B7/SG` |
+
+按阶段拆开看：
+
+| Stage | warmup（只做 forward） | steady（1F1B） | drain（只做 backward） | activation resident peak |
+|---:|---|---|---|---:|
+| 0 | `F0,F1,F2,F3` | `B0,F4,B1,F5,B2,F6,B3,F7` | `B4,B5,B6,B7` | 4 |
+| 1 | `F0,F1,F2` | `B0,F3,B1,F4,B2,F5,B3,F6,B4,F7` | `B5,B6,B7` | 3 |
+| 2 | `F0,F1` | `B0,F2,B1,F3,B2,F4,B3,F5,B4,F6,B5,F7` | `B6,B7` | 2 |
+| 3 | `F0` | `B0,F1,B1,F2,B2,F3,B3,F4,B4,F5,B5,F6,B6,F7` | `B7` | 1 |
+
+这个 resident count 是“该 stage 已 forward、但对应 backward 尚未释放”的 microbatch 数。若启用 virtual pipeline，一个物理 rank 可能同时拥有 `vs0` 和 `vs4` 这样的多个 virtual stage，物理 rank 的 activation peak 近似是这些 virtual stage resident 的和；如果 W-pass 被推迟（zero bubble），还要把等待 W-pass 的 activation 计入，不能只套 `p-s`。
 
 > [!NOTE]
 > 这个公式仍是估算，不替代 profile。真实集群 stage 计算时间可能不均匀（某些 stage 算 attention，某些算 MLP），需要 profile 后用 layer placement 调平 stage time，否则 bubble 公式对应的"理想 utilization"也拿不到。
@@ -541,38 +718,51 @@ PP activation send/recv 是跨节点通信，带宽上限由 IB/RoCE 决定。
 
 ```text
 forward activation send/recv（每个 stage 边界，每个 microbatch）：
-  pp_boundary_bytes = micro_batch × seq_len × hidden_size × dtype_bytes
+  pp_boundary_bytes = micro_batch × seq_len × boundary_hidden_width × dtype_bytes
 
 backward gradient send/recv（同一边界）：
-  pp_boundary_bwd_bytes = micro_batch × seq_len × hidden_size × dtype_bytes
+  pp_boundary_bwd_bytes = micro_batch × seq_len × boundary_hidden_width × dtype_bytes
 
 单 microbatch 走完一次完整 pipeline（PP stage，PP-1 个中间边界）：
   pp_per_microbatch_total = 2 × (PP-1) × pp_boundary_bytes
 ```
 
-**数字示例（70B，BF16，seq=8192，micro_batch=1，PP=4）**
+`boundary_hidden_width` 取决于 TP/PP 边界 layout：
+
+- Megatron 常见 layout：PP 边界在 TP rank 之间一一对应传输 hidden shard，`boundary_hidden_width = hidden_size / TP`。每个 TP rank 只发自己的 shard，但同一个 PP boundary 上有 `TP` 对 P2P。
+- 需要 gather/scatter 的实现：PP send 前先 AllGather 成 full hidden，或跨 stage 后再 Scatter，`boundary_hidden_width = hidden_size`。这种实现更简单，但 PP 边界 payload 和 buffer 是 Megatron shard layout 的 `TP` 倍，还会额外引入 gather/scatter collective。
+- 如果 stage 边界跨越了会改变布局的模块（例如 vocab/loss、某些 sequence/context repartition），必须按边界处真实 tensor shape 计费，而不是机械套 `hidden/TP`。
+
+**数字示例（70B，BF16，seq=8192，micro_batch=1，PP=4, TP=8）**
 
 ```text
-pp_boundary_bytes = 1 × 8192 × 8192 × 2 = 134 MB per boundary
-PP=4 有 3 个中间边界
-单 microbatch forward+backward PP 通信量 = 2 × 3 × 134 MB = 804 MB
+Megatron shard layout：
+  pp_boundary_bytes = 1 × 8192 × (8192/8) × 2 = 16.8 MB per boundary per rank
+  PP=4 有 3 个中间边界
+  单 microbatch forward+backward PP 通信量（per rank）= 2 × 3 × 16.8 MB = 101 MB
+
+full-hidden gather/scatter layout：
+  pp_boundary_bytes = 1 × 8192 × 8192 × 2 = 134 MB per boundary per rank
+  单 microbatch forward+backward PP 通信量（per rank）= 2 × 3 × 134 MB = 804 MB
 
 400G IB（单向 50 GB/s）：
-  单边界 forward send ≈ 134 MB / 50 GB/s ≈ 2.7 ms
-  1F1B 稳态下 send/recv 与 compute 部分重叠（见 §4.2.2）
-  exposed PP 通常 1-5 ms per boundary（取决于 overlap 效果）
+  Megatron shard layout 单边界 forward send ≈ 16.8 MB / 50 GB/s ≈ 0.34 ms
+  full-hidden layout 单边界 forward send ≈ 134 MB / 50 GB/s ≈ 2.7 ms
 ```
 
 **PP 通信量对 TP 的敏感性**
 
-PP 传输的是 full sequence activation（TP 将 hidden 维度降至 1/TP）：
+TP 是否降低 PP payload 不是数学必然，而是 layout 选择：
 
 ```text
-使用 TP=8（hidden 切 1/8）：
-  pp_boundary_bytes = 1 × 8192 × (8192/8) × 2 = 16.8 MB per boundary
+Megatron shard layout：
+  PP 边界 payload per rank 随 TP 约 1/TP 降低，但 boundary 上有 TP 条并行 P2P。
 
-比 TP=1 降低 8×，大幅减少跨节点 PP 流量。这是 TP 与 PP 配合的隐性收益之一。
+gather/scatter layout：
+  PP 边界 payload per rank 仍是 full hidden；TP 只改变边界前后的本地计算分片。
 ```
+
+因此评审配置时必须问清楚：PP send/recv 的 tensor 是 `[seq, hidden/TP]` 还是 `[seq, hidden]`，checkpoint 和 profiler 里的 tensor shape 要能验证这一点。
 
 #### 4.3.5 Stage 负载均衡
 
@@ -720,7 +910,65 @@ CP 面向 attention context。长上下文下，Q/K/V、attention scores、mask�
 - 64K/128K context：attention workspace 和 KV 通常成为瓶颈，CP 需要进入候选。
 - CP 需要 kernel、position encoding、mask、FlashAttention 变体和 checkpoint metadata 全部支持；不是开一个 group size 就能跑。
 
-#### 4.6.1 CP 通信量估算
+#### 4.6.1 SP/CP tensor layout
+
+SP 与 CP 都切 sequence，但语义不同：
+
+| 机制 | 本地 tensor | 全局语义 | 典型通信 | 参数是否切分 |
+|---|---|---|---|---|
+| SP | `X_sp_i [B,S/T,H]`，通常在 TP group 内 | 每 rank 持有一段 token 的非 attention activation | RowParallel 处 `ReduceScatter(seq)`，ColumnParallel 前 `AllGather(seq)` | 不新增参数切分 |
+| CP | `Q_i [B,S/C,Hq]`，`K_i,V_i [B,S/C,Hkv]` | 每 rank 只拥有一段 context，但 attention 需要看历史全局 context | Ring KV exchange 或 Ulysses All-to-All | 通常不切参数，只切 attention context |
+
+CP 的关键是不允许把本地 token 当成从 0 开始的新序列。每个 local token 必须保留全局位置：
+
+```text
+global_seq_start = cp_rank * ceil_div(S, CP)      # 或按 packed sequence metadata 给出
+global_pos = global_seq_start + local_pos
+
+RoPE(Q_i,K_i) 使用 global_pos，而不是 local_pos
+causal_mask(q_global, k_global) = (k_global <= q_global)
+```
+
+packed dataset 或 variable length sequence 下，`global_seq_start` 不能只由 `cp_rank` 推断，必须来自 sample/segment 的 prefix-sum metadata。否则 RoPE 相位和 causal mask 会在 CP 边界错位，表现为 loss 能下降但长上下文能力损坏。
+
+#### 4.6.2 Ring Attention execution trace
+
+以 `CP=4`、rank `r` 持有第 `r` 段 query tokens 为例，Ring FlashAttention 的 forward 不是把 K/V 全量 AllGather 到本地，而是一边转发 K/V block，一边用 online softmax 合并局部结果：
+
+| ring step | 本 rank 的 Q | 当前参与 attention 的 K/V block | mask 与 position | online softmax 状态 |
+|---:|---|---|---|---|
+| 0 | `Q_r [B,S/4,Hq]` | 本地 `K_r,V_r` | 用 `q_global` 与 `k_global` 做 causal mask | 初始化 `m_i=-inf,l_i=0,o_i=0` |
+| 1 | `Q_r` | 从左/右邻居收到 `K_{r-1},V_{r-1}`（方向依实现） | 对收到 block 的全局 K 位置重算 mask | 更新 `m_i,l_i,o_i` |
+| 2 | `Q_r` | 收到下一段 `K_{r-2},V_{r-2}` | 同上 | 继续 online merge |
+| 3 | `Q_r` | 收到最后一段 `K_{r-3},V_{r-3}` | 同上 | 得到 `O_r [B,S/4,Hq]` 与 `LSE_r [B,heads,S/4]` |
+
+online softmax 的核心是保存每个 query/head 的 running max 和 log-sum-exp（LSE），这样不同 K/V block 的 softmax 可以数值稳定地合并：
+
+```text
+score_block = Q_r @ K_block^T / sqrt(Dh) + causal_mask(global_q, global_k)
+m_new = max(m_old, max(score_block))
+l_new = exp(m_old - m_new) * l_old + sum(exp(score_block - m_new))
+o_new = exp(m_old - m_new) * o_old + exp(score_block - m_new) @ V_block
+O = o_final / l_final
+LSE = log(l_final) + m_final
+```
+
+GQA/MQA 下，Q heads 与 KV heads 不一一对应。Ring 中传的是实际 owner 的 K/V heads：
+
+```text
+若保守 layout: 每 TP rank 持有 num_kv_heads/TP 个唯一 KV heads；
+若 KV replication: 多个 TP rank 持有同一 KV head，CP ring 必须只发送唯一 owner，或显式接受重复发送的通信成本；
+若 custom KV sharding: checkpoint metadata 必须记录 kv_head_id -> (tp_rank, replica_rank)。
+```
+
+Backward 有两种安全路径：
+
+- 保存 forward 的 `LSE_r`，backward 复用它计算 `dQ,dK,dV`，避免重做完整 softmax denominator。
+- 不保存 `LSE_r`，但 backward 必须按同样 ring 顺序 recompute score/mask/RoPE/LSE；这种路径省 HBM，但增加 FLOPs 和通信调度复杂度。
+
+不允许的中间态是“forward 用 online softmax，backward 既没有 LSE 也没有可复现 recompute metadata”。这会让 CP 边界上的 softmax denominator 不一致，轻则梯度漂移，重则恢复后 loss spike。
+
+#### 4.6.3 CP 通信量估算
 
 CP 通过 ring 传递 KV（Ring FlashAttention 实现）或 All-to-All（Ulysses 实现），通信量随 context 长度和 CP size 决定。
 
@@ -745,28 +993,42 @@ kv_per_step = 1 × (65536/4) × 8 × 128 × 2 × 2 = 67 MB per ring step
 ```
 
 > [!DANGER]
-> **GQA 下约 32 GB / step（标准 MHA 下约 258 GB），400G IB（50 GB/s）下纯通信时间分别约 0.64 s / 5.2 s。** 64K context 的 CP 必须依赖 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行，见 §4.2.2）才能将 exposed communication 压到可接受范围内，并且需要 800G 或更高带宽 IB 才能支撑大规模 CP。这是 CP 对网络最敏感的原因，也是 GQA 在长 context 下的隐性收益。
+> **GQA 下约 32 GB / step（标准 MHA 下约 258 GB），400G IB（50 GB/s）下纯通信时间分别约 0.64 s / 5.2 s。** 64K context 的 CP 必须依赖 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行，见 §4.2.3）才能将 exposed communication 压到可接受范围内，并且需要 800G 或更高带宽 IB 才能支撑大规模 CP。这是 CP 对网络最敏感的原因，也是 GQA 在长 context 下的隐性收益。
 
 **Ulysses（All-to-All CP）模式的通信量差异**
 
 Ulysses 把 Q/K/V 在 sequence 维度重排，通信方式是 All-to-All 而不是 ring send/recv：
 
 ```text
-per All-to-All（每个 attention layer，forward）：
-  ulysses_bytes = micro_batch × seq × num_heads × head_dim × dtype_bytes × 2（QKV）
+以 head-parallel attention 为例，forward 通常包含两次 All-to-All：
+  A2A#1：把 sequence-sharded Q/K/V 重排成 head-sharded Q/K/V
+  A2A#2：把 attention output 从 head-sharded 重排回 sequence-sharded
 
-All-to-All 每 rank 发送量 ≈ total / CP，接收量相同，通常效率高于 ring 但对拓扑敏感。
+per tensor logical size:
+  tensor_bytes = micro_batch × seq × heads_or_kv_heads × head_dim × dtype_bytes
+
+A2A#1 payload:
+  Q + K + V 三个 tensor；GQA 下 K/V 用 num_kv_heads，Q 用 num_q_heads
+
+A2A#2 payload:
+  O 一个 tensor；heads = num_q_heads
+
+All-to-All 每 rank 发送量约为 total × (CP-1)/CP，接收量相同。
 ```
+
+所以旧口径里常见的“`×2（QKV）`”不是说只有两个 QKV tensor，而是把通信轮次粗略写成两次 All-to-All；第一轮搬 Q/K/V，第二轮搬 O。若要做 bytes 预算，应按 `Q + K + V + O` 四类 tensor 分开算，并在 GQA/MQA 下用实际 KV heads 修正。
 
 ### 4.7 EP 的位置
 
 EP 主要用于 MoE。dense 模型没有 experts，EP 不适用。MoE 中每个 token 只路由到 top-k experts，参数容量可远大于实际激活计算。EP 的关键问题是：
 
-- token dispatch All-to-All；
+- token dispatch All-to-All/AllToAllV；
 - expert load balance；
-- capacity factor 和 dropped tokens；
+- dropless routing 下的 variable-size dispatch（AllToAllV）、padding/fallback semantics 和尾延迟；
 - expert optimizer state placement；
 - checkpoint expert shard 与 inference router 兼容。
+
+旧式 MoE 文档常围绕固定容量系数和 overflow 丢 token 展开，这只适用于允许丢弃或 padding 到固定容量的实现。当前大模型训练更常见的目标是 dropless：token 不应被静默丢弃，dispatch payload 变成 per-expert 变长，通信从固定 All-to-All 走向 AllToAllV 或带 padding 的 fallback。平台准入要看 `tokens_per_expert` 的 P50/P99、fallback padding 比例和 router auxiliary loss，而不是只记录一个固定容量参数。
 
 如果一个 405B 是 MoE 而不是 dense，策略会完全不同：EP 可能比更高 PP 更重要。本章后面的 405B worked example 默认 dense 模型，MoE 只作为边界提醒。
 
@@ -853,7 +1115,7 @@ PP send/recv 的 activation 可用 BF16 或 FP8：
 
 配置审查要点：
 
-- `hidden-size`、`num-attention-heads`、KV heads 必须能被 TP 整除。
+- `hidden-size`、`num-attention-heads` 必须能被 TP 整除；GQA/MQA 的 KV heads 要按下文专项规则审查。
 - `num-layers` 应能被 PP 或 virtual pipeline stage 合理切分。
 - `global-batch-size == micro_batch * gradient_accumulation * DP`，PP 不乘 global batch。
 - `sequence-parallel` 通常要求 TP > 1。
@@ -862,18 +1124,25 @@ PP send/recv 的 activation 可用 BF16 或 FP8：
 
 **GQA / MQA TP 约束专项**
 
-现代 LLM 普遍使用 Grouped Query Attention（GQA），KV heads 远少于 Q heads。**TP size 必须能整除 KV heads**，而不仅仅是 Q heads。
+现代 LLM 普遍使用 Grouped Query Attention（GQA）或 Multi-Query Attention（MQA），KV heads 远少于 Q heads。这里不能写成绝对的“TP size 必须整除 KV heads”：Megatron 经典 GQA layout 通常要求 `num_kv_heads % TP == 0`，但一些框架/版本支持在 TP 组内复制 KV heads、对 K/V 使用特殊 shard 规则，或在 checkpoint conversion 时把 KV tensor reshape 成目标 TP layout。
 
 ```text
-合法性规则（同时满足）：
+保守合法性规则（Megatron 常见 layout，同时满足）：
   num_q_heads   % TP == 0
-  num_kv_heads  % TP == 0        ← GQA 额外约束，通常是瓶颈
+  num_kv_heads  % TP == 0        # 常见硬约束，通常是瓶颈
   hidden_size   % TP == 0
   ffn_size      % TP == 0
   vocab_size    % TP == 0（vocab parallel 模式下为硬约束）
+
+带 KV replication/special handling 的实现：
+  num_q_heads   % TP == 0
+  hidden_size   % TP == 0
+  num_kv_heads 可以小于 TP 或不整除 TP，但 K/V 在多个 TP rank 复制或按自定义规则分配
 ```
 
-**主流 GQA 模型的合法 TP 值**
+KV replication 不是免费午餐：K/V 参数和 activation 在 TP 组内出现额外重复，attention kernel 必须知道本地 KV layout，TP checkpoint shard 不能再只靠 `tp_rank` 等分推断。启用 CP 时，§4.6.3 的 `num_kv_heads` 通信公式也要按“每个 CP rank 实际发送的 KV heads 数”重算；如果复制后每个 TP rank 都持有同一份 KV，CP/NCCL 路径可能发送重复 KV，或者需要框架做去重/分组。
+
+**主流 GQA 模型在保守 Megatron layout 下的 TP 值**
 
 | 模型 | Q heads | KV heads | 合法 TP 值 | 常见生产 TP |
 |---|---|---|---|---|
@@ -887,16 +1156,18 @@ PP send/recv 的 activation 可用 BF16 或 FP8：
 | 标准 MHA（如 GPT-3 175B） | 96 | 96 | 1~96（因子集） | 8 或 16 |
 
 > [!DANGER]
-> **TP=16 在 8 KV head 模型上无效。** 大多数 GQA 模型的 KV heads 为 8，TP 上限为 8，与单节点 8-GPU NVSwitch 对齐——这是架构约束而非工程选择。尝试 TP=16 时，Megatron-LM 会报错退出，部分 DeepSpeed 版本会产生 silent shape mismatch。
+> **不要把 TP=16 直接套到 8 KV head 模型上。** 在 Megatron 常见 layout 下，8 KV heads 的 GQA 模型 TP 上限通常是 8，与单节点 8-GPU NVSwitch 对齐。若框架声称支持 TP=16，必须验证它采用的是 KV replication、custom KV sharding 还是 checkpoint conversion 特例，并重新评估 HBM、CP 通信和推理转换。
 
 **框架检查行为**
 
 ```text
-Megatron-LM：assert kv_heads % tp_size == 0，报错退出
-DeepSpeed：部分版本不检查，可能 silent mismatch
+Megatron-LM / Megatron-Core：常见路径会 assert kv_heads % tp_size == 0；新版本和 fork 可能有专门 GQA layout，需看具体 commit
+DeepSpeed：依 PipelineModule、inference kernel 和 attention 实现而异；部分版本不检查，可能 silent mismatch
 PyTorch FSDP：不处理 attention head 约束，用户自行保证
-Transformer Engine GQA：内置 assertion
+Transformer Engine GQA：通常有 shape assertion，但行为随 TE 版本和集成方式变化
 ```
+
+checkpoint conversion 也必须把这个约束显式化：训练 TP=8、推理 TP=4 的 GQA 权重可以常规 merge/reshard；训练使用 KV replication 或特殊 TP=16 layout 时，转换工具必须知道哪些 KV shard 是复制、哪些是唯一 owner，否则 merge 后会重复拼接 K/V heads。
 
 ### 5.2 DeepSpeed pipeline boundaries
 
@@ -989,7 +1260,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 | SP | Megatron sequence parallel support、LayerNorm kernel | long-seq OOM 对比、activation peak 对比 |
 | CP | Ring/Ulysses attention implementation、FlashAttention 版本 | 32K/128K correctness、mask/position test |
 | FSDP/ZeRO | PyTorch/DeepSpeed 版本、optimizer support | shard state dict save/load、resume loss continuity |
-| EP | MoE router、All-to-All backend、capacity factor | token balance、expert checkpoint restore |
+| EP | MoE router、All-to-All/AllToAllV backend、dropless/fallback policy | token balance、expert checkpoint restore |
 | Checkpoint | distributed checkpoint schema version | save, validate, kill, restore, convert |
 
 ### 6.2 作业准入
@@ -1098,7 +1369,8 @@ dataset cursor 和 global step 如何保持一致？
 - `step_time_ms{rank,dp,pp,tp,cp,ep,virtual_stage}`
 - `forward_ms`, `backward_ms`, `optimizer_ms`
 - `tp_collective_ms`, `pp_send_recv_ms`, `cp_exchange_ms`, `dp_sync_ms`
-- `pipeline_bubble_fraction_estimated`
+- `pipeline_bubble_overhead_estimated`
+- `pipeline_bubble_elapsed_fraction_estimated`
 - `microbatch_time_ms`
 - `tokens_per_sec`, `tokens_per_gpu_sec`, `MFU`
 - `hbm_allocated_bytes`, `hbm_reserved_bytes`, `activation_peak_bytes`
@@ -1131,17 +1403,19 @@ SP 通常依附 TP，不单独乘 world size。FSDP/ZeRO 是状态分片层，�
 用前述近似：
 
 ```text
-bubble = (PP - 1) / (microbatches + PP - 1)
-effective_tokens_per_sec = ideal_tokens_per_sec * (1 - bubble) * imbalance_factor
+bubble_overhead = (PP - 1) / microbatches
+bubble_elapsed_fraction = (PP - 1) / (microbatches + PP - 1)
+effective_tokens_per_sec = ideal_tokens_per_sec * (1 - bubble_elapsed_fraction) * imbalance_factor
 ```
 
-其中 `imbalance_factor` 表示最慢 stage 拖累，取值 `0-1`。如果 stage 负载均衡很差，即使 bubble 公式好看，真实吞吐仍会被最慢 stage 限制。
+其中 `bubble_overhead` 用于评估相对理想计算槽的额外开销，`bubble_elapsed_fraction` 用于端到端吞吐折减；`imbalance_factor` 表示最慢 stage 拖累，取值 `0-1`。如果 stage 负载均衡很差，即使 bubble 公式好看，真实吞吐仍会被最慢 stage 限制。
 
 示例：
 
 ```text
 PP=8, microbatches=32, imbalance_factor=0.90
-bubble = 7 / 39 = 17.9%
+bubble_overhead = 7 / 32 = 21.9%
+bubble_elapsed_fraction = 7 / 39 = 17.9%
 effective ~= ideal * 0.821 * 0.90 = ideal * 0.739
 ```
 
@@ -1154,25 +1428,30 @@ effective ~= ideal * 0.821 * 0.90 = ideal * 0.739
 **组合模型**
 
 ```text
-step_time_3d ≈ max_dp_replica(
-    PP_warmup                                           # (PP-1) × avg_stage_time，无法掩盖
-  + m × max_stage(
+stage_slot_time ≈ max_stage(
         max_rank_in_stage(
             microbatch_compute                          # CUDA kernel 时间，profiler 直接测量
           + max(tp_collective - tp_overlap, 0)          # TP exposed（节点内通常 5-15 ms）
           + max(pp_send_recv - pp_overlap, 0)           # PP exposed（跨节点通常 1-5 ms per boundary）
         )
     )
-  + PP_drain                                            # (PP-1) × avg_stage_time，无法掩盖
+
+pipeline_compute_time_1f1b ≈ (m + PP - 1) × stage_slot_time
+
+step_time_3d ≈ max_dp_replica(
+    pipeline_compute_time_1f1b
   + max(dp_sync - dp_overlap, 0)                        # DP exposed（梯度同步，见第 8 章公式）
   + max(fsdp_allgather - fsdp_overlap, 0)              # FSDP exposed（如启用 hybrid sharding）
   + max(cp_exchange - cp_overlap, 0)                    # CP exposed（KV exchange，长上下文敏感）
   + optimizer
 )
 
-bubble_latency = PP_warmup + PP_drain ≈ 2 × (PP-1) × avg_stage_time
-bubble_fraction = bubble_latency / pipeline_step_time
+bubble_slots_1f1b ≈ PP - 1
+bubble_overhead ≈ (PP - 1) / m
+bubble_elapsed_fraction ≈ (PP - 1) / (m + PP - 1)
 ```
+
+这个模型固定采用 1F1B elapsed slots 口径：`m` 个有效 microbatch slot 加 `PP-1` 个 bubble slot。若使用 GPipe、flush schedule、同步 send/recv 或 stage 边界无法 overlap，应该把上式标为“1F1B 下界”，并按实际 schedule 重新写 elapsed slots，而不是再额外叠加一个 `PP_warmup + PP_drain`。
 
 **各组件数量级参考（70B，TP=8, PP=4, DP=4，seq=8192，节点内 NVSwitch，跨节点 400G IB）**
 
@@ -1180,10 +1459,10 @@ bubble_fraction = bubble_latency / pipeline_step_time
 |---|---|---|---|
 | microbatch_compute（per stage） | 350-500 ms | 380-540 ms | 无，是基准 |
 | tp_collective（per layer，节点内） | 0.4 ms/call，160 calls ≈ 0.6-1 ms exposed | 1-2 ms exposed | 下一层 GEMM（CUDA stream） |
-| pp_send_recv（per boundary） | 2.7 ms，3 boundaries ≈ 5-8 ms exposed | 8-15 ms exposed | 下一个 microbatch 某层 compute |
+| pp_send_recv（per boundary） | Megatron shard layout 约 0.34 ms；full-hidden layout 约 2.7 ms | shard layout 1-5 ms exposed；full-hidden layout 8-15 ms exposed | 下一个 microbatch 某层 compute |
 | dp_sync（梯度 AllReduce，DP=4） | 按第 8 章公式，通常 20-60 ms total | 40-80 ms total | backward 最后阶段（DDP bucket） |
 | optimizer | 100-140 ms | 130-160 ms | 无（Adam 顺序更新） |
-| PP bubble（PP=4，m=32，1F1B） | (4-1)/32 ≈ 9.4% × pipeline_step | 同 | 无 |
+| PP bubble（PP=4，m=32，1F1B） | overhead 9.4%，elapsed fraction 8.6% | 同 | 无 |
 
 **诊断路径**
 
@@ -1207,7 +1486,7 @@ step_time 高 → 拆分 profiler：
    → 检查 wrap policy、limit_all_gathers、backward_prefetch
 
 6. CP exchange 暴露（长上下文）
-   → 检查 Ring FA 实现是否支持 KV overlap；检查 CP 网络带宽（见 §4.6.1）
+   → 检查 Ring FA 实现是否支持 KV overlap；检查 CP 网络带宽（见 §4.6.3）
 
 7. compute 主导（所有通信被完全掩盖）
    → 系统工作正常；优化 kernel（FlashAttention、FP8）或增加 GPU 数量
@@ -1266,8 +1545,10 @@ Step 2：确定最小 TP（解决单层 GEMM 峰值）
   单层 activation peak（BF16，hidden 比例项，无 AC）≈ batch × seq × hidden × 18 bytes（见 §4.1.1）
   除以 TP 后 ≤ available_hbm × 0.25（留给其他项）→ 确定 min_tp
 
-  GQA 约束（见 §5.1 GQA 专项）：TP 必须整除 kv_heads
-  → 最终 TP = max(min_tp，满足 GQA 的最小合法值) 且 ≤ 节点 GPU 数
+  GQA/MQA 约束（见 §5.1 GQA 专项）：
+    保守 Megatron layout 要求 TP 整除 kv_heads；
+    若框架支持 KV replication/special handling，需要把额外 HBM、CP 通信和 checkpoint conversion 计入
+  → 最终 TP = max(min_tp，满足目标框架 KV layout 的最小合法值) 且 ≤ 节点 GPU 数
 
 Step 3：确定最小 PP（解决整网层数和状态）
   per_rank_params = total_params × 2 bytes / TP      （BF16，不含 optimizer）
@@ -1285,9 +1566,10 @@ Step 5：验证 bubble 和带宽
   microbatch_count m = global_batch / (micro_batch_size × dp)
   必须保证 m ≥ PP（1F1B 稳态条件，否则 bubble 恶化，见 §4.3.1）
 
-  bubble（1F1B） = (PP-1) / m
-  若 bubble > 20%：优先增加 m（增大 global_batch 或降 micro_batch_size）；
-                   次选 interleaved pipeline；最后再考虑减少 PP
+  bubble_overhead（1F1B） = (PP-1) / m
+  bubble_elapsed_fraction（1F1B） = (PP-1) / (m+PP-1)
+  若 bubble_overhead > 20%：优先增加 m（增大 global_batch 或降 micro_batch_size）；
+                            次选 interleaved pipeline；最后再考虑减少 PP
 
   TP 带宽（节点内 NVSwitch）：用 §4.2.1 公式估算 per-call 时间，与 GEMM 时间对比
   PP 带宽（跨节点 IB）：用 §4.3.4 公式估算 per-boundary 时间，与 stage compute 对比
@@ -1303,13 +1585,13 @@ Step 5：验证 bubble 和带宽
 
 Step 1：available_hbm = 80 GB × (1 - 0.12 - 0.06) = 66 GB
 
-Step 2：KV heads=8 → TP ∈ {1,2,4,8}；min_tp 检查：
+Step 2：KV heads=8；按保守 Megatron layout，TP ∈ {1,2,4,8}；min_tp 检查：
   单层 activation（hidden 比例项，无 AC，TP=1）= 1 × 8192 × 12288 × 18 bytes ≈ 2.2 GB
   → TP=1 时单层 activation 2.2 GB < 66 GB × 0.25 = 16.5 GB，层级上 TP=1 可行
   但整网状态（见 Step 3）需要 TP≥4；选 TP=8（最大合法值，节点内最优）
 
 Step 3：per_rank_params（TP=8，PP=1）= 180B × 2 / 8 = 45 GB
-  per_rank_optim（ZeRO-1，PP=1，256 DP）= 180B × 12 / 256 = 8.4 GB（optimizer shard）
+  per_rank_optim（ZeRO-1，PP=1，world_size=256）= 180B × 12 / 256 = 8.4 GB（optimizer shard；此处不是 DP=256）
   per_rank_activ（无 PP，AC=selective+FA，8 bytes/elem）= 96 × 8192 × 12288 × 8 bytes ≈ 77 GB
   合计 = 45 + 8.4 + 77 = 130.4 GB >> 66 GB → 需要 PP
 
@@ -1320,7 +1602,9 @@ Step 3：per_rank_params（TP=8，PP=1）= 180B × 2 / 8 = 45 GB
 
 Step 4：DP = 256 / (8 × 8) = 4
 
-Step 5：m = 2048 / (1 × 4) = 512；bubble = (8-1)/512 = 1.4% ✓（m >> PP）
+Step 5：m = 2048 / (1 × 4) = 512；
+  bubble_overhead = (8-1)/512 = 1.4%
+  bubble_elapsed_fraction = 7/(512+7) = 1.3% ✓（m >> PP）
 
   TP 通信估算（per call）= 2 × (7/8) × 8192 × 12288 × 2 = 352 MB
     NVSwitch 600 GB/s → 0.59 ms per call，96 层 × 2 = 192 calls ≈ 113 ms 理论上界
@@ -1379,12 +1663,12 @@ flowchart TD
 
 | 策略 | Megatron | DeepSpeed | PyTorch FSDP | 主要约束 |
 |---|---|---|---|---|
-| TP | 强 | 部分场景 | 非原生主轴 | hidden/head/vocab 可整除，kernel 支持；GQA 模型需 KV heads 整除 TP |
+| TP | 强 | 部分场景 | 非原生主轴 | hidden/head/vocab 可整除，kernel 支持；GQA/MQA 的 KV heads 约束依框架 layout，保守 Megatron layout 需 KV heads 整除 TP |
 | PP | 强 | PipelineModule 支持 | 需要额外 pipeline 框架 | stage 切分、microbatch schedule |
 | SP | 强 | 视实现 | 非主轴 | 通常依赖 TP |
 | CP | 新实现差异大 | Ulysses/Ring 相关实现 | 非主轴 | attention kernel、mask、position |
 | FSDP/ZeRO | Megatron distributed optimizer | ZeRO 成熟 | FSDP 原生 | checkpoint schema、param naming |
-| EP | Megatron MoE fork | MoE 支持依版本 | 非主轴 | All-to-All、load balance |
+| EP | Megatron MoE fork | MoE 支持依版本 | 非主轴 | All-to-All/AllToAllV、load balance、dropless/fallback semantics |
 | FP8（via TE） | 强（TE 原生） | 视 TE 集成版本 | 有限（需外部 TE wrapper） | TP amax 同步、PP 边界 dtype、checkpoint amax history |
 
 选型时不要只问”框架有这个参数吗”，要验证：
@@ -1422,7 +1706,7 @@ DDP full checkpoint
 - 训练 PP=8，推理通常不使用训练 PP：需要按 layer id 重组完整模型。
 - 训练 FSDP/ZeRO：需要 materialize 或转换 sharded state dict。
 - 训练 CP/SP：通常不改变权重 shape，但要确认 position encoding、rope scaling、long context metadata 进入推理 config。
-- 训练 EP：推理 router、expert placement、capacity 和 quantization 都要兼容。
+- 训练 EP：推理 router、expert placement、dropless/fallback policy 和 quantization 都要兼容。
 
 ### 8.5 推理侧 Checkpoint 转换机制
 
@@ -1432,12 +1716,20 @@ DDP full checkpoint
 
 ```text
 Column parallel（Q/K/V projection，FC1 output dim 切分）：
-  merge：torch.cat(shards, dim=0)      ← 沿 output dim 拼接
-  reshard（训练 TP=8 → 推理 TP=4）：torch.chunk(merged, 4, dim=0)
+  训练 TP=8:
+    shard0..shard7 each [out/8, in]
+  merge:
+    full = torch.cat([shard0, ..., shard7], dim=0)     ← 沿 output dim 拼接，得到 [out, in]
+  reshard 到 TP=4:
+    new_shards = torch.chunk(full, 4, dim=0)           ← 每片 [out/4, in]
 
 Row parallel（attention output proj，FC2 input dim 切分）：
-  merge：torch.cat(shards, dim=1)      ← 沿 input dim 拼接
-  reshard：torch.chunk(merged, 4, dim=1)
+  训练 TP=8:
+    shard0..shard7 each [out, in/8]
+  merge:
+    full = torch.cat([shard0, ..., shard7], dim=1)     ← 沿 input dim 拼接，得到 [out, in]
+  reshard 到 TP=4:
+    new_shards = torch.chunk(full, 4, dim=1)           ← 每片 [out, in/4]
 
 常见错误：对 Row parallel 层用 dim=0 拼接 → 权重 shape 正确但含义错误 → loss 正常但 logit 质量下降。
 验证方法：对 10 个 token 比较训练推理 logit 相对差，阈值 < 1e-3（BF16）。
@@ -1462,6 +1754,57 @@ tied embedding（首尾 stage 共享）：
   - merge 时只取 stage N-1 的 LM head weight（两者 gradient 更新历史可能略有差异）
   - 或显式校验两者 cosine similarity > 0.9999 后取均值
 ```
+
+**PP reshape restore：按 `layer_id`，不要按 stage 文件名**
+
+从 `PP=4` 恢复或转换到 `PP=8` 时，旧 stage 文件不能一一对应新 stage：
+
+```text
+旧 PP=4（80 层）：
+  stage0 -> layers 0-19
+  stage1 -> layers 20-39
+  stage2 -> layers 40-59
+  stage3 -> layers 60-79
+
+新 PP=8：
+  stage0 -> layers 0-9
+  stage1 -> layers 10-19
+  stage2 -> layers 20-29
+  ...
+  stage7 -> layers 70-79
+
+restore mini trace：
+  1. 扫描所有旧 stage 文件，建立 layer_id -> tensor_shards 映射
+  2. 对每个 layer_id 先做 TP merge/reshard（例如 TP=8 -> TP=4）
+  3. 用新 layer_to_stage(layer_id) 把 layer 写入新 stage 文件
+  4. 对 embedding、final_norm、lm_head 等非 Transformer block 用 metadata 中的 owner 规则处理
+```
+
+这样做的原因是 stage 是运行时 placement，`layer_id` 才是模型语义。只按 `stage0.pt -> new_stage0.pt` 加载，会把旧 layers 0-19 塞到新 stage 0 期望的 layers 0-9 中，轻则 shape/key mismatch，重则 key 名对上但语义错位。
+
+**Optimizer true resume 的 fail-closed 条件**
+
+跨 shape 恢复分两类：
+
+```text
+model-only warm start:
+  只恢复参数；optimizer state、scheduler、global step 可重置或按策略迁移。
+
+true resume:
+  恢复参数 + gradients/optimizer m/v/master weights + RNG + dataset cursor + global step，
+  并要求下一步训练等价于未中断路径。
+```
+
+true resume 必须 fail-closed。只要下面任一条件不满足，就应拒绝 true resume，降级为显式 model-only warm start 或要求同 shape 恢复：
+
+- checkpoint 缺少 `parallel_shape`、rank order、TP/PP/CP/EP/FSDP group metadata。
+- 缺少 `tensor_shard_spec`，无法判断 Column/Row/Vocab/embedding 的切分维度。
+- 缺少 `layer_id -> stage/virtual_stage` 映射，或当前模型 layer 数、顺序、参数名 hash 不匹配。
+- optimizer shard owner 不能从旧 `(dp,pp,tp,fsdp)` 映射到新 owner，或 Adam `m/v/master` 任一 shard 缺失。
+- RNG、dataset cursor、microbatch schedule、gradient accumulation、loss scale/FP8 amax history 不完整。
+- GQA/MQA 的 KV shard/replica metadata 缺失，无法区分唯一 KV owner 与复制 shard。
+
+这条规则故意保守：恢复工具宁可在加载阶段报错，也不能靠 `strict=False` 或缺省 owner 推断继续训练。
 
 **常用工具链**
 
@@ -1509,7 +1852,8 @@ CP = 1
 DP = 128 / (8 * 4 * 1) = 4
 micro_batch = 1
 global_batch = 1024
-gradient_accumulation = 1024 / (micro_batch * DP) = 256
+num_microbatches m = global_batch / (micro_batch * DP) = 1024 / (1 * 4) = 256
+gradient_accumulation = m = 256
 ```
 
 放置：
@@ -1530,7 +1874,7 @@ gradient_accumulation = 1024 / (micro_batch * DP) = 256
 风险：
 
 - gradient accumulation 很大，optimizer step 间隔长，需要确认收敛 batch 语义；
-- PP bubble 取决于 microbatch 数。若 `m=32`，`p=4`，bubble 约 `3/35=8.6%`；若调度实际 microbatch 不足，bubble 会上升；
+- PP bubble 取决于 microbatch 数。本配置 `m=256`、`p=4`，`bubble_overhead=3/256=1.2%`，`bubble_elapsed_fraction=3/259=1.2%`；如果为了吞吐/显存改成更小的 `m`，必须同步重算；
 - stage 0 embedding 和 stage 3 LM head 可能更重，需要按 profile 调整 layer split。
 
 ### 9.3 配置 B：TP=4, PP=8, DP=4
@@ -1557,7 +1901,7 @@ DP = 4
 
 风险：
 
-- PP bubble 更高。`m=32, p=8` 时 bubble 约 `7/39=17.9%`；
+- PP bubble 更高。在同一 global batch 下 `m=256, p=8`，`bubble_overhead=7/256=2.7%`，`bubble_elapsed_fraction=7/263=2.7%`；若实际只用 `m=32`，overhead 会升至 `21.9%`、elapsed fraction 为 `17.9%`；
 - PP send/recv 边界增加；
 - stage 切分、checkpoint layer mapping 和 failure recovery 更复杂；
 - TP=4 降低层内并行，某些 GEMM 可能变慢。
@@ -1586,8 +1930,25 @@ DP = 4
 
 | 配置 | throughput | HBM pressure | network pressure | checkpoint shape | recovery complexity |
 |---|---|---|---|---|---|
-| A: TP=8, PP=4, DP=4, SP=on | 较高；PP bubble 约 8.6% when `m=32`，TP GEMM 并行度好 | 中等；每 stage 约 20 层，需要关注首尾 stage | 中等；TP node-local，PP 跨 3 个 stage 边界，DP 跨副本同步 | `dp=4, pp=4, tp=8`，可选 distributed optimizer shard | 中等；同 shape restore 清晰，stage mapping 稳定 |
-| B: TP=4, PP=8, DP=4 | 中等；PP bubble 约 17.9% when `m=32`，TP 算力切分较少 | 较低；每 stage 约 10 层，activation 峰值更保守 | 较高；PP 边界更多，TP group 虽小但 pipeline send/recv 增加 | `dp=4, pp=8, tp=4`，stage shard 数翻倍 | 较高；layer/stage mapping、checkpoint shard、pipeline recovery 更复杂 |
+| A: TP=8, PP=4, DP=4, SP=on | 较高；`m=256` 时 PP elapsed fraction 约 1.2%，TP GEMM 并行度好 | 中等；每 stage 约 20 层，需要关注首尾 stage | 中等；TP node-local，PP 跨 3 个 stage 边界，DP 跨副本同步 | `dp=4, pp=4, tp=8`，可选 distributed optimizer shard | 中等；同 shape restore 清晰，stage mapping 稳定 |
+| B: TP=4, PP=8, DP=4 | 中等；`m=256` 时 PP elapsed fraction 约 2.7%，TP 算力切分较少 | 较低；每 stage 约 10 层，activation 峰值更保守 | 较高；PP 边界更多，TP group 虽小但 pipeline send/recv 增加 | `dp=4, pp=8, tp=4`，stage shard 数翻倍 | 较高；layer/stage mapping、checkpoint shard、pipeline recovery 更复杂 |
+
+### 9.6 70B per-rank HBM 预算模板
+
+不要只写“70B 总状态约多少 GB”。上线前至少按 rank 维度填下面的预算表，数值来自 framework dry-run、memory snapshot 或同模型缩放估算：
+
+| 输入 / 项 | 配置 A 待填值 | 说明 |
+|---|---:|---|
+| GPU HBM | 80 GB | 单卡物理容量 |
+| fragmentation + allocator reserve | 8-12 GB | `reserved - allocated` 和碎片余量 |
+| parameters per rank | `70B * 2 / (TP * PP)` | 若 embedding/LM head 不均，按 stage 覆盖修正 |
+| gradients per rank | 同 parameters 或 optimizer 实现相关 | distributed optimizer/FSDP 会改变常驻形态 |
+| optimizer state per rank | `70B * 12 / (TP * PP * optimizer_shard_degree)` | AdamW master/m/v，按真实 shard group 填 |
+| activation resident | `layers_on_stage * micro_batch * seq * hidden * ac_bytes / TP_or_SP_effect` | 用 §4.1.1 的 AC 系数和真实 SP/TP layout |
+| PP boundary buffers | `inflight_microbatches * seq * boundary_hidden_width * dtype_bytes` | `boundary_hidden_width` 按 §4.3.4 取 full hidden 或 hidden/TP |
+| TP/DP/FSDP comm buffers | profile / NCCL snapshot | 包含 all-gather/reduce-scatter 临时 buffer |
+| attention workspace | kernel profile | FlashAttention、CP、mask 实现差异很大 |
+| peak HBM target | < 72 GB allocated | 给 80GB 卡留恢复和碎片余量 |
 
 ---
 
@@ -1615,7 +1976,8 @@ CP = 1
 DP = 1024 / (8 * 16) = 8
 micro_batch = 1
 global_batch = 2048
-gradient_accumulation = 2048 / (1 * 8) = 256
+num_microbatches m = global_batch / (micro_batch * DP) = 2048 / (1 * 8) = 256
+gradient_accumulation = m = 256
 ```
 
 放置：
@@ -1635,7 +1997,7 @@ gradient_accumulation = 2048 / (1 * 8) = 256
 
 风险：
 
-- PP=16 的 bubble 很敏感。`m=64` 时 bubble 约 `15/79=19.0%`；`m=32` 时约 `31.9%`；
+- PP=16 的 bubble 很敏感。本配置 `m=256` 时，`bubble_overhead=15/256=5.9%`，`bubble_elapsed_fraction=15/271=5.5%`；如果实际为了内存或调度只跑 `m=64`，overhead 会升至 `23.4%`、elapsed fraction 为 `19.0%`；
 - stage 数多，任意 stage straggler 都会拖慢全局；
 - checkpoint shard 数至少 `DP * PP * TP = 1024` 级别，optimizer shard 更多；
 - pipeline recovery 需要严格同 shape，节点替换要保持 stage order。
@@ -1659,7 +2021,7 @@ DP = 1024 / (8 * 8 * 2) = 8
 
 优点：
 
-- PP stage 减少，bubble 降低。`m=64, p=8` bubble 约 `9.9%`；
+- PP stage 减少，bubble 降低。若 `m=256, p=8`，`bubble_overhead=2.7%`，`bubble_elapsed_fraction=2.7%`；若 `m=64, p=8`，overhead 为 `10.9%`、elapsed fraction 为 `9.9%`；
 - CP=2 为 32768 context 提前建立 attention 路径；
 - pipeline stage 边界减少，PP send/recv 和恢复映射更简单。
 
@@ -1680,8 +2042,9 @@ CP = 1
 DP = 16
 micro_batch = 1
 global_batch = 2048
-gradient_accumulation = 2048 / (micro_batch * DP) = 128
-FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shard group
+num_microbatches m = global_batch / (micro_batch * DP) = 2048 / (1 * 16) = 128
+gradient_accumulation = m = 128
+FSDP HYBRID_SHARD group = explicit DP-subgroup of replicas with same (pp_rank, tp_rank)
 ```
 
 放置：
@@ -1689,7 +2052,7 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 - TP=8 必须保持 node-local：一个 TP group 占满单个 8-GPU NVSwitch 节点，TP collective 不跨 IB/RoCE。
 - PP=8 使用 8 个相邻节点形成一条 pipeline；每个 DP replica 需要 8 个节点，16 条 pipeline 共 128 节点。
 - DP=16 跨 16 条 pipeline 同步等价 stage/tensor shard；DP gradient sync 可以跨节点，但需要 bucket/overlap。
-- FSDP HYBRID_SHARD 的 shard group 优先 node-local，与 TP=8 的节点边界对齐；如果实现要求在 DP subgroup 内 shard，subgroup 必须固定在同一 rail/topology 域内，不能让 parameter AllGather 穿过任意跨机路径。
+- FSDP HYBRID_SHARD 的 shard group 不能直接设成 TP group。TP group 内各 rank 持有不同 tensor shard，不是同一参数副本；FSDP shard group 必须沿相同 `(pp_rank, tp_rank)` 下的 DP/DP-subgroup 副本切分。若要求 node-local HYBRID_SHARD，需要 placement 先保证同一节点内有多个可分片的 DP replicas；在 `TP=8` 独占节点的布局里，FSDP shard group 通常只能跨节点或改用不同 placement/ZeRO 策略。
 - FSDP wrap 粒度必须 stay stage-local：一个 FSDP unit 不能跨 PP stage，也不能跨 virtual stage；否则 checkpoint ownership 会同时跨 layer owner 和 optimizer owner。
 - optimizer state ownership 必须记录为 `(dp_subgroup, pp_stage, tp_rank, fsdp_shard_rank)`；恢复时不允许只凭 global rank 顺序推断 owner。
 
@@ -1736,9 +2099,25 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 
 | 配置 | throughput | HBM pressure | network pressure | checkpoint shape | recovery complexity |
 |---|---|---|---|---|---|
-| A: TP=8, PP=16, DP=8 | 中等偏高；TP 高效但 PP bubble 约 19.0% when `m=64` | 中等；每 stage 约 8 层，405B 下最稳妥 | 中等；TP node-local，PP 跨 15 个 stage 边界，DP=8 | `dp=8, pp=16, tp=8`，约 1024 基础 model shards | 中等偏高；stage 多但 shape 标准，恢复路径可控 |
+| A: TP=8, PP=16, DP=8 | 中等偏高；`m=256` 时 PP elapsed fraction 约 5.5%，若 `m=64` 则约 19.0% | 中等；每 stage 约 8 层，405B 下最稳妥 | 中等；TP node-local，PP 跨 15 个 stage 边界，DP=8 | `dp=8, pp=16, tp=8`，约 1024 基础 model shards | 中等偏高；stage 多但 shape 标准，恢复路径可控 |
 | B: TP=8, PP=8, CP=2, DP=8 | 取决于 context；32K+ 可更好，8K 可能被 CP 通信拖慢 | 中高；每 stage 约 16 层，但 CP 降 context 峰值 | 高；TP node-local，CP KV/context exchange 增加 network pressure | `dp=8, pp=8, tp=8, cp=2`，checkpoint shape 增加 CP metadata | 高；attention/kernel/CP shape 都参与恢复和推理转换 |
 | C: TP=8, PP=8, DP=16, FSDP HYBRID_SHARD | 理论最高；DP=16 且 PP bubble 较低，但取决于 FSDP overlap | 中等；FSDP 降 state，PP=8 增 stage 内层数 | 高；DP 同步 + FSDP param AllGather 可能叠加，必须 node-local 或 DP-subgroup-local | `dp=16, pp=8, tp=8, fsdp_hybrid`，optimizer shards 带 owner metadata | 很高；TP/PP/FSDP 三套 owner，必须 checkpoint drill 后生产 |
+
+### 10.7 405B per-rank HBM 预算关键输入
+
+405B 的总状态数字只能说明问题规模，不能证明某个 rank 能放下。配置评审时必须逐项填 per-rank 预算：
+
+| 输入 / 项 | 配置 A 起点 | 说明 |
+|---|---:|---|
+| layers_on_stage | `ceil(126 / 16) ≈ 8` | 非均匀 stage 要分别列 stage 0、middle、last |
+| parameters per rank | `405B * 2 / (TP * PP)` | 约 6.3GB 的均摊下界；embedding/LM head 另算 |
+| optimizer state per rank | `405B * 12 / (TP * PP * optimizer_shard_degree)` | distributed optimizer/ZeRO degree 必须写清楚 |
+| activation resident | `layers_on_stage * micro_batch * seq * hidden * ac_bytes / TP_or_SP_effect` | 用真实 AC、SP、FlashAttention 设置 |
+| PP boundary buffers | `inflight_microbatches * seq * boundary_hidden_width * dtype_bytes` | `boundary_hidden_width` 不能默认 full hidden，见 §4.3.4 |
+| CP attention/KV workspace | 若 CP=1 填 0 或 kernel workspace；CP>1 按 §4.6.3 | GQA KV replication 会改变实际 KV heads |
+| FSDP/ZeRO all-gather buffers | 若启用必须单列 | 与 optimizer shard 不同，是临时峰值 |
+| fragmentation + NCCL buffers | 10-15GB 起步校准 | 1024 GPU 作业要按 P95 rank 看 |
+| target peak allocated | < 72GB | H100 80GB 上给 recovery、allocator、通信峰值留余量 |
 
 ---
 
@@ -1746,16 +2125,16 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 
 | 症状 | 证据 | 可能根因 | 处理动作 |
 |---|---|---|---|
-| OOM 只发生在某个 PP stage | OOM rank 集中在同一 `pp_stage`；HBM peak 高于其他 stage；stage 包含 embedding/LM head | layer split 不均、activation placement 过重、in-flight microbatch 太多、checkpoint granularity 太粗 | 重新切 stage；开启或加密 activation checkpointing；降低 microbatch；把 embedding/loss head 单独计入负载模型 |
+| OOM 只发生在某个 PP stage | OOM rank 集中在同一 `pp_stage`；HBM peak 高于其他 stage；stage 包含 embedding/LM head | layer split 不均、activation placement 过重、in-flight microbatch 太多、checkpoint granularity 太粗 | 重新切 stage；开启或加强 activation checkpointing；降低 microbatch；把 embedding/loss head 单独计入负载模型 |
 | OOM 发生在长 context 才出现 | seq length 翻倍后 HBM 非线性增长；attention kernel workspace 峰值高 | attention workspace/KV/mask 成为瓶颈，ZeRO/FSDP 不切 context | 启用 CP；检查 FlashAttention/Ring/Ulysses 支持；降低 sequence 或改 attention checkpoint |
-| pipeline bubble 太高 | Nsight 中 stage idle 明显；公式估算 `(p-1)/(m+p-1)` 高；tokens/s 低但 HBM 还有余量 | PP stage 太多、microbatch 太少、stage 不均、未启用 interleaving | 增加 microbatches；降低 PP；启用 interleaved pipeline；重新按 profile 切层 |
+| pipeline bubble 太高 | Nsight 中 stage idle 明显；`bubble_overhead=(p-1)/m` 或 `bubble_elapsed_fraction=(p-1)/(m+p-1)` 高；tokens/s 低但 HBM 还有余量 | PP stage 太多、microbatch 太少、stage 不均、未启用 interleaving | 增加 microbatches；降低 PP；启用 interleaved pipeline；重新按 profile 切层 |
 | stage 时间不均 | `microbatch_compute_time{pp_stage=X}` P50 中某 stage 比其他 stage 慢 10%+；stage P95/P50 比值高；bubble 公式估算与实测差距 > 5%（且排除 data skew 后） | embedding/LM head 在普通 stage；vocab parallel 未启用；data skew 误判为 stage 不均 | 按 `pp_stage` 聚合 compute time；将 embedding/LM head 单独处理；排查 data skew（见第 8 章 §10.6）；调整 partition method |
 | TP communication bottleneck | 每层 GEMM 间 NCCL AllReduce 暴露；NCCL bus bandwidth 低；TP group 跨节点 | TP size 过大、placement 错误、NVLink/NVSwitch 未命中、NCCL ring 选错 | 把 TP 限制到节点内；调整 rank order；跑 nccl-tests；检查 `nvidia-smi topo -m` 和 NCCL GRAPH |
 | bad placement 导致全局慢 | 同配置不同作业 step time 差异大；慢作业 TP/PP 跨不同拓扑 | scheduler 未做 topology-aware placement；GPU-NIC 亲和性差；rail 不均衡 | 加 node/GPU topology label；固定 rank mapping；按 NIC locality 分配；在准入中检查 mesh dump |
 | checkpoint mismatch | restore 报 tensor shape/key mismatch；或恢复后 loss spike | TP/PP/CP shape 改变；layer-to-stage mapping 改变；optimizer shard owner 改变 | 使用同 shape 恢复；编写显式 reshape/merge 工具；保存 parallel metadata；先恢复 model-only 做 warm start |
 | resume 后随机性不一致 | loss 从恢复点后逐步偏离；dropout/mask 不一致 | RNG、dataset cursor、microbatch id、CP mask state 未保存 | 保存 rank-local RNG、sampler epoch/offset、packing seed、parallel shape；恢复后做 20 step parity |
 | CP 开启后吞吐骤降 | All-to-All 或 ring exchange 时间占比高；NIC counters 高但 SM idle | context partition 通信超过 attention compute，或 kernel 不匹配 | 降 CP size；改 placement；验证 attention 实现；只在更长 context 启用 CP |
-| EP MoE load imbalance | expert token counts P99/P50 高；All-to-All tail 高 | router 偏斜、capacity factor 不合适、expert placement 差 | 调 router loss/capacity；重排 experts；监控 dropped tokens；优化 All-to-All topology |
+| EP MoE load imbalance | expert token counts P99/P50 高；All-to-All/AllToAllV tail 高；fallback padding 比例高 | router 偏斜、dropless 变长 dispatch 尾延迟、expert placement 差 | 调 router auxiliary loss；重排 experts；监控 per-expert token 和 fallback padding；优化 All-to-All/AllToAllV topology |
 
 排障原则：
 
@@ -1810,7 +2189,7 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 
 ### 13.3 框架
 
-- [ ] hidden size、attention heads、KV heads、vocab padding 可被 TP 整除。
+- [ ] hidden size、attention heads、vocab padding 可被 TP 整除；GQA/MQA 的 KV heads layout、复制策略和 checkpoint conversion 已验证。
 - [ ] PP layer mapping、virtual stage、interleaving 被框架原生支持。
 - [ ] SP/CP attention kernel、mask、position encoding 已验证。
 - [ ] FSDP/ZeRO wrap 粒度与 layer/stage 边界一致。
@@ -1853,7 +2232,7 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 - TP 切层内张量，适合节点内高速互联。
 - PP 切层段，解决整网太大，但要支付 pipeline bubble。
 - SP/CP 切序列和上下文，服务长上下文 activation 和 attention。
-- EP 切专家，服务 MoE，但引入 token dispatch 和 load balance。
+- EP 切专家，服务 MoE，但引入 token dispatch、AllToAllV/fallback 和 load balance。
 - FSDP/ZeRO 切训练状态，与 TP/PP/CP 互补。
 - 3D parallel 的关键不是 `DP x PP x TP` 的乘法，而是 rank mesh、拓扑、checkpoint 和恢复的一致性。
 

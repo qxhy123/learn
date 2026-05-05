@@ -146,20 +146,103 @@ PPO checkpoint 应该是一个事务 manifest，而不是"actor.pt + critic.pt +
   "run_id": "rlhf-llama7b-helpfulness-0421",
   "global_step": 820,
   "phase": "after_ppo_update",
-  "actor": {"uri": "s3://ckpt/actor/step_820", "sha256": "actor_hash"},
-  "critic": {"uri": "s3://ckpt/critic/step_820", "sha256": "critic_hash"},
+  "update_id": "ppo_update_820",
+  "world": {"num_nodes": 2, "gpus_per_node": 8, "global_world_size": 16},
+  "actor": {
+    "uri": "s3://ckpt/actor/step_820",
+    "sha256": "actor_hash",
+    "weight_version": "actor_step_820_hash",
+    "optimizer": {"uri": "s3://ckpt/actor_optim/step_820", "sha256": "actor_optim_hash", "type": "adamw"},
+    "scheduler": {"uri": "s3://ckpt/actor_sched/step_820", "sha256": "actor_sched_hash"},
+    "distributed_state": {"strategy": "fsdp", "shards": 4, "zero_stage": null}
+  },
+  "critic": {
+    "uri": "s3://ckpt/critic/step_820",
+    "sha256": "critic_hash",
+    "optimizer": {"uri": "s3://ckpt/critic_optim/step_820", "sha256": "critic_optim_hash", "type": "adamw"},
+    "scheduler": {"uri": "s3://ckpt/critic_sched/step_820", "sha256": "critic_sched_hash"},
+    "distributed_state": {"strategy": "fsdp", "shards": 2, "zero_stage": null}
+  },
   "reference": {"artifact": "sft-v17", "sha256": "ref_hash", "frozen": true},
   "reward_model": {"artifact": "rm-helpful-v9", "sha256": "rm_hash", "prompt_template": "rm_template_v4"},
   "tokenizer": {"artifact": "tokenizer-v17", "chat_template": "chatml-v6"},
   "data": {"prompt_dataset": "prompts-v31", "cursor": "shard-044:000912"},
-  "buffer": {"uri": "s3://buffer/run/step_820", "policy_version": "actor_hash"},
+  "buffer": {
+    "uri": "s3://buffer/run/step_820",
+    "policy_version": "actor_step_819_hash",
+    "accepted_policy_versions": ["actor_step_819_hash"],
+    "min_ready_samples": 2048
+  },
+  "rollout": {
+    "actor_weight_version": "actor_step_819_hash",
+    "actor_weight_hash": "actor_step_819_hash",
+    "engine": "vllm-0.8.x",
+    "decoding_config_hash": "decode_v12_hash"
+  },
   "controllers": {"kl_coef": 0.034, "reward_norm": "ema-v3"},
   "rng": {"python": "...", "torch_cuda": "...", "sampler": "..."},
   "eval": {"suite": "posttrain-gate-v12", "last_passed_step": 800}
 }
 ```
 
-恢复时必须校验 actor、reference、Reward Model、critic、tokenizer、prompt template、buffer 的版本关系。只恢复 actor 权重而丢掉 KL controller、reward normalization 或 buffer policy_version，会产生一种危险状态：训练继续跑，但 advantage、KL 和 reward 分布已经不再对应同一轮 rollout。
+`phase: after_ppo_update` 的含义要严格限定：actor/critic 已完成 update 820，optimizer/scheduler/FSDP 或 ZeRO shard 已写入，但 rollout buffer 仍然只能包含 update 819 的 actor 生成样本，因为这些样本是在 update 前 rollout 的。典型阶段关系如下：
+
+| 阶段 | actor 版本 | buffer policy_version | 允许动作 |
+|------|------------|-----------------------|----------|
+| `pretrain_or_sft_seed` | SFT artifact | none | 初始化 actor、reference、tokenizer 和 RM 版本 |
+| `rollout_generation` | `actor_step_819_hash` | `actor_step_819_hash` | rollout engine 生成 response，写入 actor hash、weight version 和 decoding config |
+| `reward_scoring` | 不更新 | `actor_step_819_hash` | reference/RM/verifier 对同一批样本补 logprob 和 reward |
+| `ppo_update` | 从 819 更新到 820 | consume `actor_step_819_hash` only | training engine 拒绝混入其他 actor/RM/template 版本 |
+| `after_ppo_update` | `actor_step_820_hash` | last consumed `actor_step_819_hash` | 保存 actor/critic optimizer、scheduler、distributed state，准备同步 rollout 权重 |
+| `rollout_weight_sync` | `actor_step_820_hash` | next `actor_step_820_hash` | rollout engine 清理旧 KV/cache，barrier 后才接受新 prompt |
+| `save_manifest` | manifest actor=820 | buffer 指向已保存或已消费区间 | strict restore dry-run 通过后 manifest 可见 |
+
+恢复时必须校验 actor、reference、Reward Model、critic、tokenizer、prompt template、buffer、optimizer、scheduler、FSDP/ZeRO shard 和 world size 的版本关系。只恢复 actor 权重而丢掉 KL controller、reward normalization、optimizer state 或 buffer policy_version，会产生一种危险状态：训练继续跑，但 advantage、KL 和 reward 分布已经不再对应同一轮 rollout。
+
+### 3.4 一个 PPO iteration：update 819 -> 820
+
+把 PPO 看成控制 loop，最小 trace 应该能串起一次 update 的所有状态变更。下面以 actor 从 `actor_step_819_hash` 更新到 `actor_step_820_hash` 为例：
+
+1. orchestrator 打开 `ppo_update_820`，冻结本轮版本元组：`actor_step_819_hash`、`ref_hash`、`rm_hash`、`rm_template_v4_hash`、`chatml_v6_hash`、`decode_v12_hash`、`klctl-v12`、`reward-whiten-ema-v4`。prompt service 从 `prompts-v31/shard-044:000912` 开始 reserve `P=1024` 个 prompt，为每个 prompt 和 sample slot 生成幂等 `sample_id`，状态进入 `ReservedPrompt`。
+2. rollout scheduler 只把这些 reserved prompts 派给已经加载并校验 `actor_step_819_hash` 的 rollout engine。engine 生成 response，同时写入 `rollout_actor_weight_hash`、decoding config、seed、finish reason 和 response token 上的 `old_logprobs_response`。这些 logprob 是 PPO ratio 的分母，不能在 update 前用当前 actor 重算。成功样本进入 `Generated`；如果 worker 回报的 actor hash 不等于 reservation 里的 hash，样本直接 quarantine。
+3. buffer 把 `Generated` 样本转成 `ScoringPending`。reference worker 计算 `ref_logprobs_response`；RM worker 用同一 `rm_hash` 和 `template_hash` 打分，返回 raw reward 和 calibrated reward。reward shaping 在 buffer/scoring 层完成：按 token 计算 `kl = old_logprob - ref_logprob`，写入 `non_score_reward = -kl_coef * kl_sum + rule_bonus - length_penalty`，再得到 `final_reward`。reward normalization 用本轮 manifest 里的 normalization state 产生 `normalized_reward`，并记录 normalization version。
+4. critic 用 `critic_step_819_hash` 对 response loss token 计算 `values_response`。advantage worker 用 `normalized_reward`、`values_response`、`gamma`、`lambda` 生成 GAE `advantages` 和 `returns`。只有 `old_logprobs`、`ref_logprobs`、raw/calibrated reward、normalized reward、values、advantages、returns、版本字段和 mask 都齐全，样本才进入 `Ready`。
+5. training engine 向 buffer 请求 lease：`lease_ready_samples(count=2048, actor=actor_step_819_hash, ref=ref_hash, rm=rm_hash, template=rm_template_v4_hash, chat_template=chatml_v6_hash, decoding=decode_v12_hash)`。buffer 只能从同一 actor/RM/template/decoding_config 的 `Ready` 集合里返回样本，写入 `lease_id`、`trainer_worker_id`、`expires_at`，状态进入 `TrainerLeased`。
+6. trainer 对 leased samples 跑 `E_ppo=4` 个 PPO epoch，每个 epoch 再切 minibatch。每个 minibatch 重新用当前 trainable actor 计算 `new_logprobs_response`，用 `ratio = exp(new_logprob - old_logprob)` 计算 clipped policy loss，用当前 critic 计算 value prediction 和 value loss，同时记录 entropy、clip fraction、approx KL、value loss 和 explained variance。任何样本的 actor/RM/template/decoding tuple 不一致，本轮 update 拒绝启动，而不是过滤后凑 batch。
+7. actor 和 critic optimizer/scheduler 从 819 推进到 820。KL controller 根据 consumed set 的 measured KL 和 target 更新 `kl_coef`；reward normalization controller 写入本轮统计的 after-state，但不回写已经训练消费过的 sample reward。trainer 以 `lease_id` ack consumed `sample_id` 列表，buffer 幂等地把这些样本转为 `ConsumedAck`。
+8. buffer 定期 expire stale leases：未 ack 且 TTL 到期的 `TrainerLeased` 样本，如果 actor age 仍在准入窗口内，回到 `Ready` 等待重新 lease；超过 `max_staleness_updates` 的样本删除或 quarantine，不能混入后续 actor version 的 update。prompt cursor 只在 reservation 和 checkpoint 协议确认后推进，防止恢复后重复或跳过 prompt shard。
+9. checkpoint manager 原子写 actor 820、critic 820、optimizer/scheduler、KL controller、reward normalization controller、RNG、data cursor 和 buffer cursor/retention range。restore dry-run 校验 actor 820 可以和 consumed actor 819 的 buffer 边界同时解释，才把 manifest 从 `manifest.tmp` rename 成可见。
+10. rollout side 进入 weight sync：orchestrator 停止给 `actor_step_819_hash` 派新 prompt，等待 active requests drain 或按策略取消，释放旧 KV/prefix cache，加载 `actor_step_820_hash` shard，校验 hash 后才把 rollout admission 从 819 推进到 820。此后新 prompt reserve 才允许写入 `policy_version=actor_step_820_hash`。
+
+这条 trace 的重点不是顺序必须完全串行，而是每个异步 worker 都围绕同一个版本元组和 sample state 推进。rollout、scoring、training 可以流水化，但 trainer 消费的 ready set 不能跨 actor、RM、template 或 decoding config 混批。
+
+### 3.5 Buffer lifecycle FSM
+
+replay/buffer 不是一个 append-only 表，而是 PPO 控制 loop 的状态机。正常路径如下：
+
+```text
+ReservedPrompt -> RolloutInFlight -> Generated -> ScoringPending -> Ready -> TrainerLeased -> ConsumedAck -> RetainedForCheckpoint/Deleted
+```
+
+| 状态 | 进入条件 | 退出条件 |
+|------|----------|----------|
+| `ReservedPrompt` | prompt cursor 已预留，`sample_id`、actor version、template、decoding config 已绑定 | rollout engine 接受请求并写入 rollout lease |
+| `RolloutInFlight` | rollout worker 持有 prompt lease，actor hash 已校验 | response、old logprobs、finish reason 写入，或 rollout 失败 |
+| `Generated` | response 和 rollout-side metadata 完整 | reference/RM/verifier scoring 任务入队 |
+| `ScoringPending` | 等待 ref logprobs、RM/raw reward、calibrated reward、critic values 或 verifier result | 全部字段齐全后进入 `Ready`；失败后按失败分支处理 |
+| `Ready` | sample 可训练，且 ready index 按 actor/RM/template/decoding_config 分区 | trainer lease 命中同一版本元组 |
+| `TrainerLeased` | trainer 拿到 `lease_id`、sample ids 和 TTL | trainer ack、lease expired 或 actor age 超限 |
+| `ConsumedAck` | trainer 幂等确认 PPO update 已消费 | checkpoint retention 决定保留或删除 |
+| `RetainedForCheckpoint/Deleted` | manifest 需要恢复窗口或审计样本 | RPO 窗口过期、checkpoint 可恢复后删除 |
+
+失败分支要和正常路径一样显式：
+
+- **RM timeout retry**：`ScoringPending` 可以重试，但只能重试同一个 `rm_hash`、`template_hash`、tokenizer、calibration version 和 length policy。重试预算耗尽后进入 quarantine，不能 fallback 到另一个 RM hash。
+- **version mismatch quarantine**：rollout、reference、RM 或 verifier 返回的 actor/RM/template/decoding hash 与 reservation 不一致时，样本进入 quarantine；平台不能“修字段”后继续训练。
+- **lease expired recycle**：`TrainerLeased` 到期但未 ack 时，如果 actor age 仍小于 `max_staleness_updates`，样本回到同一 ready partition；否则按 stale sample 删除或 quarantine。
+- **actor too old expire**：`Ready` 样本如果来自过旧 actor，即使字段完整也要 expire，因为 PPO 的 on-policy 假设已经被破坏。
+
+因此 trainer 的读取 API 不应该是 `next_ready_batch()`，而应该是带完整版本谓词的 lease：`next_ready_batch(actor_hash, rm_hash, template_hash, decoding_config_hash, count)`。这条约束比 schema 字段本身更重要。
 
 ---
 
@@ -214,7 +297,7 @@ RM 必须版本化这些内容：
 - tokenizer、chat template、截断长度、special token 策略。
 - label schema：pairwise、scalar score、rank list、rule label。
 - 校准集：score distribution、长度偏差、类别偏差、拒答偏差。
-- 服务配置：batch size、max sequence length、timeout、retry、fallback。
+- 服务配置：batch size、max sequence length、timeout、retry；fallback 只能指向同一 RM hash 的健康副本，不能切到另一个 RM artifact。
 
 RM 不是发布质量的唯一裁判。它能提供训练信号，但可能被 actor 利用。发布判断要看 eval gate 的多指标，而不是单一 reward。
 
@@ -241,6 +324,44 @@ reward_worker:
     timeout_ms: 30000
 ```
 
+RM runtime path 要按请求级别记录版本和校准，而不是只在 job config 里写一遍：
+
+```json
+{
+  "request_type": "ScoreRequest",
+  "sample_id": "run820-p044-000912-g03",
+  "run_id": "rlhf-llama7b-helpfulness-0421",
+  "rm_hash": "rm_hash",
+  "template_hash": "rm_template_v4_hash",
+  "tokenizer_hash": "tok_hash",
+  "calibration_version": "rm-calib-v9:zscore-domain-v3",
+  "length_policy_hash": "reject_over_4096_hash",
+  "prompt_token_count": 812,
+  "response_token_count": 560,
+  "max_input_tokens": 4096
+}
+```
+
+gateway 收到 `ScoreRequest(sample_id, rm_hash, template_hash)` 后，先按 `run_id:rm_hash:template_hash` 固定路由，再按 token bucket 合批。合批键至少包含 `rm_hash`、`template_hash`、`tokenizer_hash` 和 length bucket；batch admission 看 `max_batch_tokens`，不能只看 request 数。长度策略必须在 scoring 前执行：manifest 写 `reject_over_limit` 就拒绝并把样本标成 scoring failure；写 deterministic truncate 就必须记录截断方向、截断 token 数和 policy hash。不能让 worker 静默截断，因为这会把长回答 reward bias 藏进训练信号。
+
+正常返回应该区分 raw score 和校准后 reward：
+
+```json
+{
+  "request_type": "ScoreResult",
+  "sample_id": "run820-p044-000912-g03",
+  "rm_hash": "rm_hash",
+  "template_hash": "rm_template_v4_hash",
+  "raw_reward": 2.28,
+  "calibrated_reward": 2.18,
+  "calibration_version": "rm-calib-v9:zscore-domain-v3",
+  "length_policy_action": "accepted",
+  "score_latency_ms": 842
+}
+```
+
+retry 只能在同一个 `rm_hash`、`template_hash`、`tokenizer_hash`、`calibration_version` 下发生；换 RM hash 等于换训练目标，必须开新 run 或新 manifest。超时、长度拒绝、校准缺失、mixed template batch 都应把 sample 或 group 标记为 quarantine，而不是给一个默认低分继续训练。
+
 RM 的 length bias 要用证据看：按 response token 分桶画平均 reward、win-rate 和 judge disagreement。如果 0-512 token bucket 的人工 win-rate 高于 1024+ token bucket，但 RM 平均分反过来，就不能继续把这个 RM 放进 PPO 内环。
 
 ### 4.3 为什么 PPO 必然变成多模型系统
@@ -256,24 +377,144 @@ PPO 要解决的是在线偏好优化：actor 生成新 response，RM 给 reward
   "actor_version": "actor_step_819_hash",
   "reference_version": "sft-v17_hash",
   "reward_version": "rm-helpful-v9_hash",
+  "rollout_actor_weight_version": "actor_step_819_hash",
+  "rollout_actor_weight_hash": "actor_step_819_hash",
+  "decoding_config": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_new_tokens": 768,
+    "stop": ["<|eot_id|>"],
+    "seed": 913337
+  },
   "prompt": "...",
   "response": "...",
-  "actor_logprobs": [-1.9, -0.7],
-  "ref_logprobs": [-1.8, -0.9],
-  "reward": 2.43,
-  "value": 1.91,
+  "input_ids": [128000, 882, 198],
+  "response_token_ids": [128006, 78191],
+  "attention_mask": [1, 1, 1, 1, 1],
+  "response_mask": [0, 0, 0, 1, 1],
+  "loss_mask": [0, 0, 0, 1, 1],
+  "old_logprobs_response": [-1.9, -0.7],
+  "ref_logprobs_response": [-1.8, -0.9],
+  "values_response": [1.71, 1.91],
+  "advantages": [0.41, 0.19],
+  "returns": [2.12, 2.10],
+  "advantage_estimator": "gae_lambda_0.95",
+  "reward_normalization_version": "reward-whiten-ema-v4",
+  "kl_controller_version": "klctl-v12",
+  "value_model_version": "critic_step_819_hash",
+  "raw_reward": 2.28,
+  "non_score_reward": -0.17,
+  "final_reward": 2.11,
+  "normalized_reward": 0.73,
+  "reward_components": {
+    "rm_score": 2.18,
+    "rule_bonus": 0.10,
+    "format_penalty": 0.00,
+    "kl_penalty": -0.15,
+    "length_penalty": -0.02
+  },
   "sequence_length": 1372,
   "finish_reason": "stop"
 }
 ```
 
-缺少 `actor_version` 或 `reward_version` 的 buffer 不能进入训练。否则 training engine 会把不同 policy、不同 RM 或不同 prompt template 的样本混在同一个 PPO update 中，曲线看起来只是"噪声大"，实际是训练目标被污染。
+`old_logprobs_response` 必须来自 rollout 时的 actor，而不是 update 前临时重算的当前 actor；它和 `response_mask` 一起决定 PPO ratio 的有效 token 范围。`old_logprobs_response`、`ref_logprobs_response`、`values_response`、`advantages`、`returns` 的长度必须等于 response loss token 数。`advantages`/`returns` 要记录生成算法和 reward normalization 版本，例如 GAE、whitening、per-batch normalize 或 EMA normalize。reward 字段要拆清 raw RM 分、KL/长度等 non-score reward、最终训练 reward 和 normalized reward，避免训练端重复扣 KL 或漏扣 KL。缺少 `actor_version`、`rollout_actor_weight_hash`、`reward_version` 或 decoding config 的 buffer 不能进入训练。否则 training engine 会把不同 policy、不同 RM、不同采样策略或不同 prompt template 的样本混在同一个 PPO update 中，曲线看起来只是"噪声大"，实际是训练目标被污染。
 
 ### 4.4 为什么 DPO 更像训练平台，GRPO 更像 rollout 平台
 
-DPO 消费离线偏好对，不需要在线 sample generation，也不需要 Reward Model 在线打分。它只需要 policy 和 frozen reference 的 logprob。因此 DPO 对平台最友好：现有 SFT trainer 加上偏好数据 schema、reference 前向和 DPO loss，就能跑通。
+DPO 消费离线偏好对，不需要在线 sample generation，也不需要 Reward Model 在线打分。它只需要 policy 和 frozen reference 的 logprob。但这不等于 DPO 是“两个字符串丢进 loss”。生产 schema 至少要绑定 pair id、chosen/rejected 的同源 prompt、tokenization/truncation、reference logprob cache、beta 和长度监控：
+
+```json
+{
+  "pair_id": "pref-v22/shard-003/000812",
+  "prompt_id": "prompt-7742",
+  "prompt": "...",
+  "chosen": "...",
+  "rejected": "...",
+  "chosen_token_ids": [128006, 78191],
+  "rejected_token_ids": [128006, 2345],
+  "chosen_loss_mask": [1, 1],
+  "rejected_loss_mask": [1, 1],
+  "source": {"annotator_pool": "helpful-raters-v5", "label_schema": "pairwise_v3"},
+  "tokenization": {
+    "tokenizer_hash": "tok_hash",
+    "chat_template_hash": "chatml-v6_hash",
+    "prompt_tokens": 812,
+    "chosen_response_tokens": 241,
+    "rejected_response_tokens": 189,
+    "truncation": "reject_over_4096",
+    "truncation_side": "right"
+  },
+  "ref_logprob_cache": {
+    "reference_hash": "sft-v17_hash",
+    "logprob_scope": "response_only",
+    "chosen_sum_logprob": -132.4,
+    "rejected_sum_logprob": -118.7,
+    "chosen_tokens": 241,
+    "rejected_tokens": 189,
+    "cache_key": "ref_hash:tok_hash:tmpl_hash:pair_id"
+  },
+  "dpo": {"beta": 0.1, "loss_variant": "sigmoid", "length_normalization": "token_mean_monitor_only"}
+}
+```
+
+cache 只能在 reference、tokenizer、chat template、truncation policy 全部一致时复用。DPO 的主要平台风险是 length bias：chosen 如果系统性更长或更短，sum logprob margin 会把长度差带进训练目标。平台必须按 chosen/rejected token length bucket 监控 margin、win-rate、loss、输出平均长度，并做 beta sweep；`beta` 太小容易弱化偏好信号，太大容易把 noisy pair 和长度偏置放大。因此 DPO 对平台最友好，是指它没有在线 rollout/RM 内环，不是指它可以省掉数据契约和 logprob 版本治理。
+
+DPO reference cache 的最小生命周期可以写成：
+
+```text
+CacheMissing -> RefForward(policy_batch waits only for cache key) -> CacheReady -> TrainerRead -> Retained
+                         \-> QuarantinedPair / StaleInvalidated
+```
+
+cache key 应该覆盖会影响 ref logprob 的全部输入，例如：
+
+```text
+dpo_reflogprob:{reference_hash}:{tokenizer_hash}:{chat_template_hash}:{truncation_policy_hash}:{logprob_scope}:{pair_id}:{chosen_hash}:{rejected_hash}
+```
+
+`policy_weight_version` 不应该放进 ref cache key，因为 DPO 每个 step 都要用当前 policy 重新算 chosen/rejected logprob；但 trainer batch 必须同时记录当前 `policy_weight_version` 和 cache 里的 `reference_hash`，否则复盘时看不出 margin 变化来自 policy 更新还是 reference cache 漂移。chosen/rejected 必须来自同一个 prompt group；如果 `prompt_hash` 不一致、tokenization 后 mask 长度和 logprob 长度不一致、pair bytes 与 cache key 里的 response hash 不一致，pair 进入 quarantine。reference、tokenizer、chat template、truncation policy、logprob scope 任一 hash 变化，旧 cache 只能标记 stale invalidated，不能“继续用到本 epoch 结束”。
 
 GRPO 去掉 critic，用同一 prompt 的多条 response 组内 reward 均值作为 baseline。它减少了 critic 权重、optimizer、checkpoint 和 value loss，但要求每个 prompt 生成更多 response。平台复杂度从 critic 训练转移到 rollout 吞吐、组内样本聚合和 reward 稳定性。
+
+GRPO 的 batch 不能把 group 当成普通样本 shuffle。每个 group 必须保持完整性：
+
+```json
+{
+  "group_id": "prompt-7742:actor_step_819:g32",
+  "prompt_id": "prompt-7742",
+  "actor_version": "actor_step_819_hash",
+  "decoding_config_hash": "decode_v12_hash",
+  "group_size": 32,
+  "responses": [{
+    "sample_id": "g00",
+    "response": "...",
+    "response_token_ids": [128006, 78191],
+    "response_mask": [1, 1],
+    "old_logprobs_response": [-1.2, -0.8],
+    "ref_logprobs_response": [-1.1, -0.9],
+    "reward": 0.83,
+    "reward_components": {"correctness": 1.0, "format": 0.0, "tool_success": 0.0, "kl_penalty": -0.17},
+    "finish_reason": "stop",
+    "decoding_config_hash": "decode_v12_hash"
+  }],
+  "verifier": {"type": "math_rule+unit_tests", "version": "verifier-v6", "timeout_ms": 2000},
+  "reward_components": ["correctness", "format", "tool_success", "kl_penalty"],
+  "group_reward_mean": 0.47,
+  "group_reward_std": 0.31,
+  "kl_aggregation": "token_mean_then_group_mean"
+}
+```
+
+admission 要拒绝 group 缺样、混 actor version、混 verifier version、混 decoding config 的样本。`group_reward_std` 太低时 advantage 近似退化，说明 verifier 分辨率不足或采样多样性不够；太高时要检查 verifier timeout、规则 reward 和 prompt 难度分桶。KL 聚合要明确是 token mean、sequence sum 还是 group mean，否则不同实现之间的 KL 曲线不可比较。
+
+GRPO group assembly 的最小 trace 是：
+
+1. prompt scheduler reserve 一个 group slot，生成 `group_id=prompt_id:actor_step_819_hash:decode_v12_hash:g32`，并绑定 actor、reference、verifier/RM、template、decoding config 和 group size。
+2. rollout engine 对同一 prompt 生成 `G=32` 条 response，每条 response 有独立 seed、`sample_id`、old logprobs 和 finish reason，但共享同一 `group_id` 和版本元组。
+3. scorer/verifier 对 32 条 response 写 reward 和 ref logprobs。buffer 只有在 group 内所有 sample 都 scored 且版本一致时才计算 `group_reward_mean`、`group_reward_std` 和 per-sample advantage。
+4. trainer 可以把 group 内样本分到不同 minibatch 做张量并行，但 advantage 计算前不能把 group 拆散，也不能把同一 prompt 的 31 条新 actor response 和 1 条旧 actor response 凑成完整 group。
+5. 缺样、verifier timeout 超预算、混 actor/RM/verifier/template/decoding hash、group size 不足都会让整个 group quarantine 或 recycle prompt；超过 actor staleness 窗口的 group 整组 expire。
 
 | 方法 | 省掉的系统组件 | 新增或保留的压力 | 平台化结论 |
 |------|----------------|------------------|------------|
@@ -318,13 +559,21 @@ verl_style:
       name: vllm
       tensor_model_parallel_size: 2
       gpu_memory_utilization: 0.82
+      max_model_len: 4096
+      max_num_seqs: 256
       max_num_batched_tokens: 262144
+      enable_prefix_caching: true
+      logprobs: 1
       n: 2
       temperature: 1.0
       prompt_length: 1024
       response_length: 768
       enforce_eager: false
       free_cache_engine: true
+      sleep_level: 1
+      backpressure:
+        max_pending_requests: 4096
+        reject_when_buffer_ready_samples_above: 8192
     ref:
       log_prob_micro_batch_size_per_gpu: 8
       fsdp_config:
@@ -439,8 +688,19 @@ resources:
     tensor_parallel: 2
     replicas: 4
     gpu_memory_utilization: 0.82
+    max_model_len: 4096
+    max_num_seqs: 256
     max_num_batched_tokens: 262144
-    weight_sync: {source: actor, every_updates: 1, max_staleness_updates: 1}
+    enable_prefix_caching: true
+    logprobs: 1
+    kv_cache: {sleep_level: 1, free_before_weight_sync: true}
+    backpressure: {max_pending_requests: 4096, buffer_high_watermark: 8192}
+    weight_sync:
+      source: actor
+      every_updates: 1
+      max_staleness_updates: 1
+      barrier: drain_requests_then_swap_weights
+      verify_hash_before_accepting_prompts: true
 
 ppo:
   kl_target: 0.05
@@ -472,6 +732,10 @@ evaluation:
 
 这个配置里最重要的不是 YAML 格式，而是资源语义：actor/critic 是训练态，reference/reward 是冻结前向，rollout engine 是推理态，checkpoint 和 eval gate 都知道这些角色的版本关系。
 
+rollout contract 需要比“用 vLLM 生成”更具体。`max_model_len` 决定 prompt+response 的硬上限，必须和训练端 `max_prompt_tokens + max_response_tokens`、RM `max_input_tokens`、reference 前向长度一致；`max_num_seqs` 和 `max_num_batched_tokens` 共同决定 scheduler 能否把短长请求混批；prefix cache 可以显著降低共享 system prompt 的 prefill 成本，但权重切换时必须按 actor weight version 隔离或清理。PPO 还需要 rollout 端返回 response token 的 old logprobs，不能只返回文本，否则 update 阶段会被迫用新 actor 重算旧策略 logprob。
+
+权重同步必须有 barrier：orchestrator 先停止给旧 actor version 派新 prompt，等待 active requests drain 或达到超时策略，调用 KV sleep/free 释放旧权重和 prefix/KV cache 的显存，再加载新 actor shard，校验 `actor_weight_hash`，最后才把 buffer policy_version 推进到新版本。backpressure 也要写进契约：当 buffer ready samples 超过高水位、reward backlog 过大或 rollout engine pending requests 超限时，rollout 应该减速或拒绝新 prompt，而不是继续制造会过期的旧 policy 样本。
+
 ### 5.4 框架 knobs 与约束
 
 | knob | 影响 | 常见证据 | 错配后果 |
@@ -479,8 +743,11 @@ evaluation:
 | `rollout_batch_prompts` | rollout 洪峰、buffer 大小、RM 批量效率 | rollout p95、buffer ready samples | 太小 GPU 不满，太大 RM 队列尖峰 |
 | `samples_per_prompt` / group size | 探索、多样性、GRPO baseline 方差 | per-prompt reward std、tokens/s | 太小 advantage 噪声大，太大 rollout 成本高 |
 | `max_response_tokens` | KV cache、reward latency、长度偏置 | output length p50/p95、KV usage | 长输出拖慢所有路径，短输出学会截断 |
+| `max_model_len` / `max_num_seqs` | vLLM/SGLang admission、KV cache 上限和并发 | prefill queue、decode queue、OOM、truncation count | 与训练/RM 长度不一致会让样本不可复现或被 RM 截断 |
 | `init_kl_coef` / KL controller | actor 偏离 reference 的速度 | approx KL、clip fraction | 太小 reward hacking，太大不学习 |
 | `max_num_batched_tokens` | vLLM/SGLang 吞吐与显存峰值 | engine tokens/s、OOM、queue wait | 太低吞吐差，太高阶段切换 OOM |
+| prefix cache / logprobs | prefill 成本和 PPO ratio 输入 | prefix hit rate、old logprob coverage | cache 未按权重隔离会污染 rollout，缺 logprob 会破坏 PPO |
+| KV sleep/free / backpressure | 权重同步峰值和样本新鲜度 | sync time、pending requests、buffer stale ratio | 不 drain 就换权重会混版，不卡流会堆过期样本 |
 | `reward.timeout_ms` | step 尾延迟与失败恢复 | RM timeout rate、retry count | 太短误杀慢批次，太长训练空等 |
 | `checkpoint.include_buffer` | 恢复一致性和存储成本 | restore dry-run、manifest size | 不保存 buffer 会丢 rollout，保存过多会拖慢 ckpt |
 
@@ -503,6 +770,17 @@ evaluation:
 | prompt/config version | `prompt-pack-v12`, decoding config | sample generation 可复现 |
 | evaluation suite | `posttrain-gate-v12` | 门禁阈值和 judge 版本 |
 | framework image | `verl:0.4.2-cu124`, `vllm:0.8.x` | kernel、调度和输出差异 |
+
+RM 训练和评测也要有自己的校准记录，不能只写一个 RM artifact hash：
+
+| RM 校准项 | 示例 | 为什么必须记录 |
+|-----------|------|----------------|
+| training label schema | pairwise helpfulness v3, 3-rater majority | RM 学到的偏好语义边界 |
+| holdout/calibration set | rm-calib-v9@sha256 | 分数分布和跨版本可比性 |
+| score calibration | z-score by domain, isotonic optional | PPO reward scale 和 KL controller 输入 |
+| length bucket report | 0-256, 256-512, 512-1024, 1024+ | 发现长回答 reward 偏置 |
+| category slice report | safety, refusal, coding, math, multilingual | 防止某类 prompt 上 reward 失真 |
+| judge disagreement | RM vs human/judge delta | 决定 RM 是否能进在线内环 |
 
 ### 6.2 作业准入与 preflight
 
@@ -551,6 +829,18 @@ PPO/RLHF 需要同时观测系统健康和行为健康。
 | evaluation | win-rate、safety regression、format pass、length delta、judge disagreement | `eval_gate_status = failed` |
 | checkpoint | manifest write time、restore dry-run result、RPO/RTO、artifact hash mismatch | `last_restore_validation_failed = 1` |
 
+发布门禁应该用 safety suite matrix，而不是一个总分：
+
+| Suite | 样本来源 | 指标 | 阈值动作 |
+|-------|----------|------|----------|
+| harmless red-team | 内部红队 + 公开越狱改写 | unsafe comply rate、refusal correctness | 超阈值阻断 release |
+| policy regression | 上一稳定版失败样本回放 | 新增违规数、修复保持率 | 新增高危违规为 hard fail |
+| benign refusal | 正常帮助请求 | over-refusal rate、helpfulness win-rate | 拒答率异常升高阻断 canary |
+| format/tool safety | JSON/tool call/system prompt cases | schema pass、tool misuse | 工具 misuse 为 hard fail |
+| length/cost safety | 长上下文和长回答 bucket | avg tokens delta、timeout、RM length bias | 长度漂移触发人工复核 |
+
+safety gate 失败不一定停止训练，但必须把 manifest 标为 `non_releasable`，并把失败样本、judge/verifier 版本、policy 版本和对应 actor hash 写进 eval report。
+
 ### 6.4 发布和回滚
 
 发布候选不应直接来自"最后一个 checkpoint"。推荐流程：
@@ -563,6 +853,22 @@ PPO/RLHF 需要同时观测系统健康和行为健康。
 6. 回滚按 manifest 回到上一个 passed checkpoint，不按目录名猜。
 
 失败门禁必须阻断发布，但不一定阻断训练。比如 safety regression 超阈值时，可以允许训练继续探索，同时把该 checkpoint 标为不可发布；如果 KL 发散或 reward 分布异常，则应触发早停或回滚到上一个可训练状态。
+
+release gate 也应该有显式状态机：
+
+```text
+candidate_manifest -> eval_running -> passed/releasable
+                                   \-> failed/non_releasable
+```
+
+| 状态 | serving registry | 训练作业 | 控制面动作 |
+|------|------------------|----------|------------|
+| `candidate_manifest` | 保持 last passed actor | 可继续下一轮 rollout/update，但候选不能发布 | 固定 eval suite、judge/template、阈值和 candidate manifest hash |
+| `eval_running` | 不变 | 默认异步继续；若门禁是 hard blocking，可暂停发布队列但不改 serving | eval 只读 candidate manifest，不读“最新目录” |
+| `passed/releasable` | release controller 才允许把 actor artifact 推到 canary/serving | 继续训练或结束 run 都可以 | 标记 `last_passed_step`，记录可回滚 manifest |
+| `failed/non_releasable` | 必须不变，不能自动切到 candidate | 视失败类型继续训练、rollback 或 early stop | 写失败样本、指标、judge/verifier 版本、actor hash 和不可发布原因 |
+
+失败后的动作要分层：helpfulness win-rate 未达标通常允许训练继续最多几个 gate 周期；format fail 可以继续训练但要把错误样本送回数据/模板修复；safety hard fail 必须阻断 release 并触发人工抽检，serving registry 仍指向上一个 passed manifest；KL 发散、reward 分布突变、mixed RM hash 这类训练目标异常应暂停 update，回滚到 last trainable manifest 或 early stop。无论哪种失败，`failed/non_releasable` manifest 不能被 serving registry 引用。
 
 ---
 
@@ -647,7 +953,7 @@ B_rm     = 34.1 - 20.2 = 13.9s
 | Reward Model latency 升高 | `rm_p95_latency_ms` 从 8s 到 35s；RM GPU 利用率 40% 但队列长；batch tokens 波动大 | 动态 batching 配置太保守；长 response 混入同批；RM 服务副本不足；网络重试 | 按长度分桶；提高 `max_batch_tokens`；加 RM replica；启用流式打分；设置超时后局部重试 |
 | rollout backlog 堆积 | `buffer_ready_samples` 增长但 `sample_age_p95 > 2 updates`；actor version lag 超阈值 | training engine 太慢；PPO epochs 太多；rollout 生成超过消费；权重同步慢导致样本变旧 | 降低 `ppo_epochs` 或 rollout 并发；按 actor_version 丢弃过旧样本；提高训练 GPU；缩短 weight sync |
 | 训练卡空转 | training GPU util 周期性降到 0；`rho_train < 1`；rollout queue wait 高 | rollout output tokens/s 不足；RM 比 rollout 慢；prompt 数据加载慢 | 用吞吐公式定位；增大 rollout replicas；优化 vLLM `max_num_batched_tokens`；缓存 prompt shard；扩 RM |
-| checkpoint 多模型不一致 | restore dry-run 报 actor step 820、critic step 800；buffer policy hash 不等于 manifest actor hash | 非原子保存；critic 保存失败但 actor 可见；恢复脚本按最新目录拼接 | 使用 atomic manifest；先写临时目录再提交 manifest；恢复时 strict hash 校验；坏 manifest 标记 quarantine |
+| checkpoint 多模型不一致 | restore dry-run 报 actor step 820、critic step 800；buffer policy version 不符合当前 phase 的 expected consumed/next policy version | 非原子保存；critic 保存失败但 actor 可见；恢复脚本按最新目录拼接；phase contract 校验缺失 | 使用 atomic manifest；先写临时目录再提交 manifest；恢复时 strict hash 和 phase contract 校验；坏 manifest 标记 quarantine |
 | failed evaluation gate | reward 上升但 win-rate 下降；safety regression 超 1%；平均长度下降 25% | reward hacking；KL 太松；RM 长度偏置；评测 prompt template 变更 | 阻断 release；回滚到 last passed checkpoint；固定 judge/template 复评；加长度惩罚或调 KL；抽样人工复核 |
 | KL 突然发散 | `approx_kl > 2x target`，clip fraction 飙升，response 风格突变 | KL controller 状态丢失；reference 版本错；reward scale 变大 | 停止 update；校验 reference hash；恢复 KL controller；降低 LR/reward scale；从上一个 manifest 重跑 |
 | critic 学不动 | value loss 高位震荡；explained variance 近 0；policy update 噪声大 | reward 太稀疏；critic LR 不合适；样本太短或分布漂移 | 调 critic LR；增加 batch；做 reward normalization；如果任务可规则验证，评估 GRPO |
