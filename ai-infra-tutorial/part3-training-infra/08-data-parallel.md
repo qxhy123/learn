@@ -457,6 +457,7 @@ ZeRO 节省的"几倍"经常被误读。真实的端到端 reduction 来自三�
 
 > [!WARNING]
 > **以上数字不含 activation**。激活随 batch、sequence length、layer、AC 策略大幅变化，ZeRO 不切 activation（CP / SP 才切）。所以 ZeRO 真正能解决的是"训练状态太大装不下"，对"激活吃满显存"无效——后者要靠 activation checkpointing、AC、BF16 activation、SP/CP。
+> **Activation 内存的定量估算和不同 AC 策略对比，参见 [第9章 §4.1a](./09-model-pipeline-parallel.md#41a-activation-内存估算)。**
 
 > [!NOTE]
 > **N 越大 ZeRO 收益越大，但通信也成比例增加**。ZeRO-3 在 N=64 时单卡训练状态压到 16/64=0.25 字节/参数，但每个 forward / backward 都要做 AllGather 拉回完整参数 + ReduceScatter 散梯度，对带宽极度敏感。在跨节点带宽不足时（如只有 100Gbps Ethernet），ZeRO-3 的通信开销可能让 step time 比 ZeRO-2 还慢，节省的显存换不到 throughput。生产 64+ 卡 ZeRO-3 通常需要 IB / RoCE 200Gbps+ 或 NVLink 节点内分片。

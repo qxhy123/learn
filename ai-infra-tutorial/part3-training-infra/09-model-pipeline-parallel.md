@@ -311,6 +311,65 @@ Adam_states_without_sharding ~= num_parameters * (grad 2 + master 4 + m 4 + v 4)
 
 70B 参数 BF16 仅约 `140 GB`，但不分片 AdamW 训练状态可超过 `980 GB`，还没算 activation、workspace 和 fragmentation。405B BF16 参数约 `810 GB`，已经超出单节点 8x80GB 的裸参数容量，更不用说训练状态。
 
+### 4.1a Activation 内存估算
+
+activation 是 HBM 账本中变化最大、最容易被低估的项。它不随并行维度切分而自动缩小——TP 切 hidden 后每 rank 的 activation 维度减半，PP 切层数后每 rank 的层数减少，但 ZeRO/FSDP 不切 activation。
+
+**Per Transformer block activation（BF16，标准 MHA，无 AC）**
+
+```text
+以 BF16 训练为基准，一个 Transformer block 的 activation 近似占用：
+
+  attn_input       = batch × seq × hidden × 2
+  attn_scores      = batch × num_heads × seq × seq × 2   （quadratic！标准 MHA）
+  attn_output      = batch × seq × hidden × 2
+  mlp_activation   = batch × seq × intermediate × 2       （通常 intermediate = 4 × hidden）
+  residual + norms = batch × seq × hidden × 2 × 3
+
+  per_block_bytes ≈ batch × seq × hidden × (1+1+1+4+3) × 2
+                  = batch × seq × hidden × 20 bytes        （BF16，无 AC）
+```
+
+**FlashAttention 对 activation 的影响**
+
+FlashAttention 不存储 O(seq²) 的 attention score，只存 softmax 分母（log-sum-exp）：
+
+```text
+lse_bytes = batch × num_heads × seq × 4 bytes（FP32 LSE）
+
+节省量（vs 标准 MHA）：
+  saved = batch × num_heads × seq × seq × 2
+```
+
+对 seq=8192、64 heads、batch=1：`saved = 1 × 64 × 8192 × 8192 × 2 ≈ 8.6 GB / layer`。这是 FlashAttention 在长序列下成为必选项的根本原因。
+
+**不同 AC 策略的 per-block activation 对比（BF16）**
+
+| AC 策略 | Per-block activation | 额外 FLOPs | 备注 |
+|---|---|---|---|
+| 无 AC（全量存储） | `batch × seq × hidden × 20 bytes` | 0 | 短序列、HBM 充足 |
+| Full recompute（每层重算） | `batch × seq × hidden × 2 bytes`（只存 block 输入） | +33%（多一次 forward） | HBM 极度紧张 |
+| Selective recompute（重算 attention） | `batch × seq × hidden × 12 bytes` | +~15% | 平衡选项 |
+| FlashAttention（自动节省 attention score） | `batch × seq × hidden × 12 bytes` | 0（kernel fusion） | 生产首选 |
+| Selective + FlashAttention | `batch × seq × hidden × 8 bytes` | 接近 0 | 长序列生产标准 |
+
+**数字示例（70B，hidden=8192，seq=8192，micro_batch=1，BF16，80 层）**
+
+```text
+无 AC：                     80 × 20 × 8192 × 8192 × 2 bytes ≈ 214 GB
+Full recompute：            80 × 2  × 8192 × 8192 × 2 bytes ≈  21 GB
+Selective + FlashAttention：80 × 8  × 8192 × 8192 × 2 bytes ≈  86 GB
+```
+
+> [!DANGER]
+> **214 GB 超过整个 8×80GB 节点总 HBM。** 生产 70B 训练必须开 FlashAttention 或 Selective AC，无论是 DDP、FSDP 还是 TP/PP 配置。ZeRO 和 FSDP 不切 activation；降低 activation 的唯一系统手段是 AC（含 FlashAttention 隐式 AC）、降 batch/seq、或 SP/CP 切 sequence 维度。
+
+**TP 和 PP 对 activation 的影响**
+
+- TP=8：每 rank hidden/8，`attn_input/output` 等正比降低；但 `attn_scores`（quadratic）只降 `num_heads/TP`，不降 seq²。
+- PP=4（70B 80 层）：每 rank 只有 20 层，activation 降到 1/4；但 stage 边界 send/recv buffer 增加（见 §4.1）。
+- CP=4：attention 的 KV/scores 从 full seq² 降到 `(seq/CP)²`，对 attention workspace 有二次方级别改善（见 §4.6a）。
+
 ### 4.2 TP 的通信边界
 
 TP 常见做法：
