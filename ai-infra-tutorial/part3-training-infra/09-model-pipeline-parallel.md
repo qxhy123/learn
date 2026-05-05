@@ -513,7 +513,7 @@ PP=4 有 3 个中间边界
 
 **PP 通信量对 TP 的敏感性**
 
-PP 传输的是 full sequence activation（TP 切 hidden 后维度减半）：
+PP 传输的是 full sequence activation（TP 将 hidden 维度降至 1/TP）：
 
 ```text
 使用 TP=8（hidden 切 1/8）：
@@ -594,11 +594,11 @@ kv_per_step = 1 × (65536/4) × 8 × 128 × 2 × 2 = 67 MB per ring step
 3 ring steps per layer → 每层 CP 通信量 ≈ 201 MB（forward；backward 相似量级）
 70B 80 层：单 step CP 通信量 ≈ 80 × 201 MB × 2（fwd+bwd）≈ 32 GB
 
-对比标准 MHA（num_heads=64）：每步增至 537 MB，80 层 × 2 ≈ 256 GB（GQA 将 CP 通信量降低 8×）
+对比标准 MHA（num_heads=64）：每层增至 537 MB × 3 = 1611 MB，80 层 × 2 ≈ 258 GB（GQA 将 CP 通信量降低 8×）
 ```
 
 > [!DANGER]
-> **GQA 下约 32 GB / step（标准 MHA 下约 256 GB），400G IB（50 GB/s）下纯通信时间分别约 0.64 s / 5.1 s。** 65K context 的 CP 必须依赖 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行，见 §4.2.2）才能将 exposed communication 压到可接受范围内，并且需要 800G 或更高带宽 IB 才能支撑大规模 CP。这是 CP 对网络最敏感的原因，也是 GQA 在长 context 下的隐性收益。
+> **GQA 下约 32 GB / step（标准 MHA 下约 258 GB），400G IB（50 GB/s）下纯通信时间分别约 0.64 s / 5.2 s。** 64K context 的 CP 必须依赖 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行，见 §4.2.2）才能将 exposed communication 压到可接受范围内，并且需要 800G 或更高带宽 IB 才能支撑大规模 CP。这是 CP 对网络最敏感的原因，也是 GQA 在长 context 下的隐性收益。
 
 **Ulysses（All-to-All CP）模式的通信量差异**
 
