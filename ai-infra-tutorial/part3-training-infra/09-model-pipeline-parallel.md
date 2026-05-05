@@ -443,6 +443,58 @@ SP 把 TP AllReduce 改写为 ReduceScatter（scatter 到各 rank 保留 sequenc
 > [!NOTE]
 > 如果 TP collective 在节点内 NVSwitch 完全被 GEMM 掩盖（见 §4.2.2），TP 通信量对 step time 几乎无影响。跨节点 TP 时需用节点间带宽（如 400G IB ≈ 50 GB/s bus bw）重算：0.4 ms × (600/50) ≈ 4.8 ms per call，160 次串行约 768 ms——远超 GEMM 时间，成为严重瓶颈。这是"TP 优先节点内"的定量依据。
 
+#### 4.2.2 3D Parallel 通信重叠机制
+
+"通信量小"不等于"对 step time 无影响"。每种通信能否被 compute 掩盖，取决于实现条件。
+
+**各类通信的重叠条件**
+
+| 通信类型 | 能与什么重叠 | 实现条件 | 破坏条件 |
+|---|---|---|---|
+| TP AllReduce（Row parallel 输出） | 下一层的 Column GEMM（前向）、下一层的 backward GEMM | `CUDA_DEVICE_MAX_CONNECTIONS=1` + 独立 CUDA stream（Megatron 默认） | 与 GEMM 在同一 stream；显式 synchronize；未开 async collective |
+| PP send/recv（forward activation） | 同 stage 下一个 microbatch 的某些 compute（1F1B 稳态） | 使用异步 `isend`/`irecv`；m ≥ PP（1F1B 稳态前提） | m < PP（warmup 区间 overlap 差）；同步 send/recv API |
+| DP gradient AllReduce / ReduceScatter | optimizer step 或下一 step 的 forward | DDP bucket 就绪即启动异步 AllReduce；与 backward 后续计算重叠 | accumulation 中途未用 `no_sync()`；bucket 太大导致 tail 暴露（见第 8 章 §4.5） |
+| FSDP AllGather（backward 参数预取） | 前一个 FSDP unit 的 backward compute | `backward_prefetch=BACKWARD_PRE`；FSDP 内部异步 AllGather stream | `limit_all_gathers=True` 过于保守；wrap 粒度太粗 |
+| CP KV ring exchange | 本地 context 块的 attention compute（Ring FlashAttention） | Ring FlashAttention 实现（Megatron-Core CP / `ring_flash_attn`）；计算时间 ≥ KV 传输时间 | 未使用 Ring FA（标准 FA 无法重叠 ring exchange）；带宽严重不足时计算来不及覆盖 |
+
+**Profiler 中的健康 vs 不健康形态**
+
+```text
+健康（Nsight Systems）：
+  NCCL kernel 与 cuBLAS/cuDNN kernel 在时间轴交织；GPU SM active 无大段空洞。
+
+TP AllReduce 暴露（不健康）：
+  每层 GEMM 之后有明显 idle gap，AllReduce 结束后才出现下一层 GEMM。
+  → 检查 CUDA_DEVICE_MAX_CONNECTIONS 和 TP placement（节点内？）
+
+PP send/recv 暴露（不健康）：
+  stage 完成 compute 后，有明显等待 recv 的 idle 段，recv 完成后才恢复 compute。
+  → 检查 m vs PP：若 m < PP，进入 warmup 区间，overlap 天然差
+  → 检查跨节点带宽：send/recv 时间 > stage compute 时间时无法掩盖
+
+FSDP AllGather 暴露（不健康）：
+  backward 中频繁出现 AllGather + idle gap 序列（参数聚合完成前计算停等）。
+  → 调整 wrap policy（粒度适中）；确认 backward_prefetch 已开启
+
+CP ring exchange 暴露（不健康）：
+  Ring FlashAttention 阶段出现 send/recv 先于 attention compute 结束。
+  → 检查带宽（见 §4.6.1 估算）；尝试降 CP size 或升级 IB 带宽
+```
+
+**调整顺序建议**
+
+```text
+出现通信 exposed tail 时，按以下顺序调整：
+
+1. 先确认 placement 正确（TP 在 NVLink/NVSwitch 内，PP stage order 固定）
+2. 再看 profiler 是哪类通信暴露（不要凭直觉先调 NCCL env）
+3. TP 问题：检查 CUDA_DEVICE_MAX_CONNECTIONS=1，运行节点内 all_reduce_perf
+4. PP 问题：检查 m vs PP 关系，确认使用异步 send/recv API
+5. DP 问题：对齐第 8 章 §4.5 bucket + overlap 诊断
+6. FSDP 问题：调 wrap policy 和 prefetch，不要先调 limit_all_gathers
+7. CP 问题：确认 Ring FA 实现，估算 §4.6.1 数字后再决定是否降 CP
+```
+
 ### 4.3 PP、microbatch 和 pipeline bubble
 
 流水并行把一个 batch 切成 `m` 个 microbatch，通过 `p` 个 pipeline stage。**bubble 公式因调度策略不同而完全不同**——很多工程团队套用 GPipe 公式来算 1F1B 的效率，结果误差可达 2-3 倍。
