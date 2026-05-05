@@ -211,6 +211,89 @@ GPU 任务的数据路径包括：
 
 整卡的代价是小模型可能低利用率。治理方向不是简单共享所有卡，而是识别哪些负载需要整卡，哪些负载可以进入 MIG 或共享池。
 
+### MIG 的硬件分区机制：为什么是这些 profile
+
+章节前面说"MIG 把 GPU 切成多个隔离实例"，但**为什么是这些 profile 而不是任意比例**没讲。这要回到 A100/H100 的内部硬件结构。
+
+**A100/H100 的内部结构**（H100 SXM 80GB 为例）：
+
+```text
+H100 GPU 内部:
+  ┌─────────────────────────────────────────────────────────┐
+  │  144 个 SM（Streaming Multiprocessor）                  │
+  │  组织成 8 个 GPC（GPU Processing Cluster），每 GPC 18 SM │
+  │                                                         │
+  │  L2 cache: 50MB，分成 8 个 slice，每 GPC 一个           │
+  │                                                         │
+  │  HBM3: 80GB，分成 5 个 stacks（实际是 6 stack 但 1 disabled）│
+  │                                                         │
+  │  GPU Engine + PCIe DMA + 通用控制单元 (1 份固定开销)    │
+  └─────────────────────────────────────────────────────────┘
+```
+
+**MIG 的物理切分**：
+
+- 一个 **GI（GPU Instance）** = 1+ 个 GPC 的连续切片 + 对应比例的 L2 slice + 对应比例的 HBM。每个 GI 有独立的 memory controller path 和 L2 slice，**物理上不共享**——这是"硬件级隔离"的物理含义。
+- 一个 **CI（Compute Instance）** = GI 内的 SM 子集，多个 CI 共享同一 GI 的 memory，但 SM 独占。
+
+**为什么最多 7 个 1g 实例**（H100 / A100 都是 7+1）：
+
+H100 的 GPC 是 8 个，但 **1 个 GPC 给 GPU engine 和系统用**（DMA、控制路径、调度），用户可分配的最多 7 个 GPC。这就是为什么：
+- 最多 7 × `1g.10gb`（每 GI 1 GPC + 10GB）
+- 最多 3 × `2g.20gb`（每 GI 2 GPC + 20GB）+ 还剩 1 个 GPC 不能用
+- 1 × `7g.80gb` = 整卡
+
+**H100 支持的 7 种 profile**：
+
+| Profile | GPC 数 | L2 (MB) | HBM (GB) | 最多实例数 | 等效"算力比例" |
+|---|---|---|---|---|---|
+| `1g.10gb` | 1 | 6.25 | 10 | 7 | 1/7 ≈ 14% |
+| `1g.10gb+me` | 1 | 6.25 | 10 | 7 | 同上，但带 media engine |
+| `2g.20gb` | 2 | 12.5 | 20 | 3 | 2/7 ≈ 28% |
+| `3g.40gb` | 3 | 18.75 | 40 | 2 | 3/7 ≈ 42% |
+| `4g.40gb` | 4 | 25 | 40 | 1（**注意：3/8 HBM 不连续**）| 4/7 |
+| `7g.80gb` | 7 | 50 | 80 | 1 | 整卡 |
+
+A100 类似但是 GPC 数少（A100 是 7+1 → 用户 7 GPC），profile 不同（`1g.5gb` / `2g.10gb` / `3g.20gb` / `4g.20gb` / `7g.40gb` 或 80GB 版本翻倍）。
+
+**为什么不能任意切分**：
+
+- L2 cache 必须按 slice 整数倍分配（每 GPC 一个 slice）。
+- HBM 控制器在 GPC 边界路由，跨 GPC 的访问会绕远路。
+- SM 调度器的硬件实现假设连续 GPC，跨 GPC 的非连续切片性能不可预测。
+- NVIDIA 验证了固定 profile 的隔离强度，任意切分会让性能/隔离不可保证。
+
+**MIG 切换的实际代价**：
+
+```bash
+# 看当前 MIG 状态
+nvidia-smi mig -lgi   # list GPU instances
+nvidia-smi mig -lci   # list compute instances
+
+# 重切 profile（必须先停所有用该 GPU 的进程）
+nvidia-smi mig -dci   # destroy all CI
+nvidia-smi mig -dgi   # destroy all GI  
+nvidia-smi mig -cgi 19,19,19,19,19,19,19  # create 7 个 1g.10gb (profile id 19)
+nvidia-smi mig -cci   # auto-create CI
+```
+
+时序：destroy + create 大约 5-10 秒，但**期间所有该 GPU 的进程必须停**——这就是为什么 MIG 重切要走维护窗口。GPU Operator 的 MIG Manager 自动化这个过程，但仍需要 cordon + drain 节点。
+
+**碎片化的本质**：
+
+集群里有 5 个节点，每节点 8 张 H100 全部切成 `1g.10gb`，总共 280 个 1g 实例。突然来一个 `3g.40gb` 请求——**虽然总算力够，但没有任何节点上有连续 3 个未占用的 GPC**。这就是 MIG 的碎片：profile 错配比"显存不够"更难定位。
+
+诊断：
+
+```bash
+# 看每个 GPU 上的 MIG profile 分布和占用
+nvidia-smi -L
+# GPU 0: NVIDIA H100 80GB (UUID: GPU-...)
+#   MIG 1g.10gb     Device  0: (UUID: MIG-...)  [in use]
+#   MIG 1g.10gb     Device  1: (UUID: MIG-...)  [free]
+#   ...
+```
+
 ### MIG：固定 profile 的硬件隔离
 
 MIG 把一张支持的 GPU 切成多个 GPU instance / compute instance。Kubernetes 中通常暴露为不同资源名，例如：
@@ -247,7 +330,134 @@ MPS 的关键限制：
 - 性能互扰依赖 workload 行为，很难向用户承诺稳定 P99。
 - 运维上需要限制同卡进程数、租户边界和资源 request。
 
-MPS 更适合作为“同团队共享优化”，不应作为跨租户强隔离的默认方案。
+MPS 更适合作为"同团队共享优化"，不应作为跨租户强隔离的默认方案。
+
+#### MPS 的实际架构：daemon、SM 配额与 Volta+ 的硬件隔离
+
+章节前面说"MPS 让多进程共享 CUDA context"，但实际架构和"为什么 Volta MPS 比 Pascal MPS 强很多"没讲。
+
+**MPS server / client 模型**：
+
+```text
+节点上启动 nvidia-cuda-mps-control daemon
+  ↓ fork
+  ↓
+nvidia-cuda-mps-server（per-GPU 一个）
+  - 持有该 GPU 的 CUDA context
+  - 监听 named pipe
+  
+应用进程（CUDA client）启动:
+  - 设置 CUDA_MPS_PIPE_DIRECTORY 指向 mps server pipe
+  - libcudart 检测到 MPS 环境，所有 CUDA call (cudaMalloc/Launch/Memcpy)
+    通过 named pipe 转发给 MPS server
+  - MPS server 在自己的 CUDA context 里调度所有 client 的 kernel
+```
+
+**Pascal 之前的 MPS（旧）**：所有 client 共享单一 GPU stream context，靠 CUDA driver 的软件 stream interleaving 调度。同 GPU 有 4 个进程时，每个进程的 kernel 都跑全部 SM，**靠时间错峰**——其实是软件 time-slicing 的高级版。一个 client 跑 long kernel 期间其他 client 等待，互扰严重。
+
+**Volta+ 的 MPS（新，CUDA 9.0+ on Volta+ GPU）**：硬件支持 **multi-context concurrent execution**，每个 client 可以有独立 SM 配额：
+
+```bash
+# 配置某 client 最多用 50% SM 的 GPU
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50
+./my_cuda_app
+```
+
+GPU 硬件层面把该 client 的 thread block 限制在 50% 的 SM 上跑，**不是靠时间错峰**，是 SM 资源真正分配。这是 Volta+ MPS 与 Pascal MPS 的根本区别——Volta MPS 接近"软 MIG"，但显存仍然共享、隔离不如 MIG 强。
+
+**MPS 适用场景**：
+
+| 场景 | 适合度 | 原因 |
+|---|---|---|
+| 同团队多进程小 batch 推理 | 高 | SM 配额避免互扰，同 GPU 资源共享降本 |
+| 同任务多 worker（数据并行的 dataloader、Ray actor） | 高 | 信任域统一，错误传播可接受 |
+| 跨租户生产服务 | 低 | 显存共享，OOM/异常会污染同卡其他 client |
+| 性能 SLA 严格的推理 | 低 | SM 配额是软上限，仍有干扰 |
+| Volta 之前的 GPU | 不推荐 | 旧 MPS 是软 time-slicing |
+
+**MIG vs MPS vs time-slicing 的本质**：
+
+| 维度 | MIG | MPS（Volta+） | Time-slicing |
+|---|---|---|---|
+| 隔离粒度 | GPC（硬件分区）| SM（硬件配额）| 时间片（无空间隔离）|
+| 显存隔离 | 是（独立 HBM 段） | 否（共享） | 否（共享）|
+| 故障隔离 | 是（一个 MIG crash 不影响其他）| 否（client 错可能影响 server）| 否 |
+| 性能确定性 | 强 | 中 | 弱 |
+| 重配代价 | 必须停所有 GPU 进程 ~10s | 启动 daemon 即可 | 无（只是 device plugin 配置）|
+| 跨租户 | 安全 | 不安全 | 不安全 |
+
+#### NVIDIA Device Plugin 的 time-slicing 实现：把 1 张 GPU 报成 N 个
+
+章节说"time-slicing 让多 Pod 共享 GPU"，但**实现机制完全没讲**——其实非常简单粗暴：Device Plugin 在 ListAndWatch 里**对单个物理 GPU 报告 N 份虚拟 device ID**。
+
+配置（NVIDIA Device Plugin v0.14+）：
+
+```yaml
+# /etc/nvidia-device-plugin/config.yaml
+sharing:
+  timeSlicing:
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4   # 1 张物理 GPU 报告成 4 个 nvidia.com/gpu
+```
+
+实际效果：
+
+```text
+节点物理上有 1 张 H100 (UUID: GPU-abc):
+  Device Plugin ListAndWatch 报告给 kubelet:
+    - device id: "GPU-abc::0"   (虚拟 0)
+    - device id: "GPU-abc::1"   (虚拟 1)
+    - device id: "GPU-abc::2"   (虚拟 2)
+    - device id: "GPU-abc::3"   (虚拟 3)
+  
+节点 allocatable: nvidia.com/gpu = 4
+  
+4 个 Pod 各申请 nvidia.com/gpu = 1 都可以调上去:
+  Pod A 拿到 device "GPU-abc::0", NVIDIA_VISIBLE_DEVICES=GPU-abc
+  Pod B 拿到 device "GPU-abc::1", NVIDIA_VISIBLE_DEVICES=GPU-abc
+  Pod C 拿到 device "GPU-abc::2", NVIDIA_VISIBLE_DEVICES=GPU-abc
+  Pod D 拿到 device "GPU-abc::3", NVIDIA_VISIBLE_DEVICES=GPU-abc
+  
+四个 Pod 全部看到同一张物理 GPU（同一 UUID），CUDA context 各自独立，
+完全靠 GPU 硬件本身的 time-slicing（CUDA context switch）轮转。
+```
+
+这意味着：
+
+- **没有任何隔离**：4 个 Pod 共享显存（`nvidia-smi` 在每个 Pod 内都看到整张 80GB）、共享 SM、共享 L2、共享 PCIe 带宽。
+- **没有性能配额**：哪个 Pod 跑大 kernel 就占满 GPU，其他 Pod 的 kernel 排队。
+- **OOM 互相影响**：一个 Pod cudaMalloc 80GB 会让其他 Pod 的 cudaMalloc 失败。
+- **device plugin 不限**：可以设 `replicas: 16` 让一张 GPU 报成 16 份——但 16 个 Pod 一起跑性能极差。
+
+这就是为什么 time-slicing 是 best-effort：底层 device plugin 根本没做任何限制，全靠 GPU 自己的 context switch。
+
+**配额配合**：
+
+```yaml
+# 让 time-slicing 池单独成池，普通工作负载不进
+sharing:
+  timeSlicing:
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4
+        rename: nvidia.com/gpu.shared   # 改资源名，避免和整卡混
+```
+
+这样 Pod 申请 `nvidia.com/gpu.shared: 1` 才进 time-slicing 池，申请 `nvidia.com/gpu: 1` 走整卡池。这是生产上把 time-slicing 隔离成 dev/notebook 池的标准做法。
+
+**与 MPS 配合**：
+
+```yaml
+sharing:
+  mps:
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4
+        memSlicePercentage: 25   # 每 client 显存上限 25%
+```
+
+device plugin 同时启动 MPS daemon，让 4 个 client 走 MPS 路径。这比纯 time-slicing 强（有 SM 配额、有显存软上限），但仍然是同信任域才推荐。
 
 ### Time-slicing：提高可获得性
 

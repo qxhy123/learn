@@ -319,6 +319,219 @@ PY
 - cgroup 允许哪些 major/minor。
 - 谁能修改这些注入规则。
 
+#### CDI spec 长什么样、谁解析、何时解析
+
+CDI（Container Device Interface）是 K8s 1.27+ GA、正在替代旧 hook 路径的设备注入标准。它的核心思想是把"哪个设备需要注入什么"做成**声明式静态文件**，而不是每次容器创建时跑用户态进程。
+
+CDI spec 是 YAML 文件，典型路径 `/etc/cdi/nvidia.yaml`，由 `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 在节点启动时生成一次：
+
+```yaml
+cdiVersion: 0.6.0
+kind: nvidia.com/gpu
+devices:
+  - name: "GPU-abc123def"     # 按物理 GPU UUID 索引
+    containerEdits:
+      deviceNodes:
+        - path: /dev/nvidia0
+        - path: /dev/nvidiactl
+        - path: /dev/nvidia-uvm
+      mounts:
+        - hostPath: /usr/lib/x86_64-linux-gnu/libcuda.so.535.86.10
+          containerPath: /usr/lib/x86_64-linux-gnu/libcuda.so.535.86.10
+        - hostPath: /usr/bin/nvidia-smi
+          containerPath: /usr/bin/nvidia-smi
+      env:
+        - NVIDIA_VISIBLE_DEVICES=GPU-abc123def
+      hooks:                  # 可选，CDI 仍支持挂 hook
+        - hookName: createContainer
+          path: /usr/bin/nvidia-ctk
+          args: ["hook", "update-ldcache", "--folder=/usr/lib/x86_64-linux-gnu"]
+  - name: "all"               # 特殊设备名，注入所有 GPU
+    containerEdits:
+      ...
+containerEdits:               # 适用于该 kind 的所有设备的公共 edits
+  deviceNodes:
+    - path: /dev/nvidia-modeset
+```
+
+**谁解析、何时解析**：
+
+```text
+1. Pod spec 带注解（CRI 协议传 CDIDevices 字段）：
+   annotations:
+     cdi.k8s.io/devices: "nvidia.com/gpu=GPU-abc123def,nvidia.com/gpu=GPU-xyz789"
+
+   Device Plugin 1.27+ 在 Allocate response 里返回 CDIDevices = ["nvidia.com/gpu=..."]
+   kubelet 把这个值通过 CRI 传给 containerd。
+
+2. containerd 1.7+（CRI-O 1.24+）原生支持 CDI：
+   收到 CDI device 名称后，读 /etc/cdi/*.yaml，
+   找到对应 device 的 containerEdits，把 deviceNodes/mounts/env/hooks
+   合并进即将传给 runc 的 OCI runtime spec。
+
+3. 旧路径（hook-based）：
+   不读 CDI 文件，而是注册 nvidia-container-runtime-hook 作为 OCI prestart hook
+   每次容器启动时跑这个二进制，由它在运行时算出该挂什么、改 OCI spec。
+```
+
+CDI vs hook 的本质区别：
+
+| 维度 | OCI hook（旧） | CDI（新） |
+|---|---|---|
+| 注入决策何时做 | 每次容器创建时跑 user binary | 节点启动时生成一次 spec 文件 |
+| 是否要在容器启动路径上调外部程序 | 是（`nvidia-container-runtime-hook`） | 否（containerd 直接读文件） |
+| 调试 | 看 hook 日志 + 试运行 | 看 spec 文件直接知道注入什么 |
+| 审计 | 每次都要 trace | spec 文件可静态扫描签名 |
+| 缓存 | 无 | 文件本身就是缓存 |
+| 失败模式 | hook crash → 容器启动失败 | spec 解析错误 → 容器启动失败，但更容易排查 |
+| K8s 集成 | 通过 runc binary 替换 | 1.27+ DRA / Device Plugin Allocate 的标准接口 |
+
+**生产建议**：
+
+- containerd 1.7+ + nvidia-container-toolkit 1.14+ 已经走 CDI 优先路径。新集群建议默认用 CDI。
+- 旧节点（containerd 1.6 或更早）只能走 hook 路径，混合集群要兼容两条路径并验证一致性。
+- CDI spec 必须随 driver 升级重新生成（`nvidia-ctk cdi generate`），driver 版本和 spec 内容绑定——升级时这一步漏了，新 driver 路径但 spec 还引用旧路径的 `libcuda.so` 是常见事故。
+
+### NVIDIA Container Toolkit 内部组件分工
+
+平台上提到 "NVIDIA Container Toolkit" 经常被当成单一组件，实际它由 4 个二进制 + 1 个库组成。调试时必须分清是哪一层失败：
+
+| 组件 | 形态 | 职责 | 可独立调用 |
+|---|---|---|---|
+| **`libnvidia-container`** | C 库 | mount 设备、注入 driver 库、配置 cgroup（含 v1/v2 BPF）、设置 env | 否（其他组件链接它） |
+| **`nvidia-container-cli`** | 二进制（链接上面的库） | 命令行入口，所有"实际注入"动作都通过它 | 是（最有用的调试工具）|
+| **`nvidia-container-runtime-hook`** | 二进制 | OCI prestart hook，被 runc 调用，内部调 `nvidia-container-cli configure` | 由 runc 自动调，旧路径用 |
+| **`nvidia-container-runtime`** | 二进制（runc 的薄 wrapper） | 在 runc 之上注入 hook 或 CDI 引用，通过 containerd `runtime_handler` 选择 | 由 containerd 自动调 |
+| **`nvidia-ctk`** | 二进制（CLI 工具集） | 生成 CDI spec、配置 containerd、修改 toolkit config | 是（运维工具） |
+
+调试套路：
+
+```bash
+# 直接调 cli，绕过 hook/runtime/CDI 看注入是否能成功
+nvidia-container-cli --load-kmods info
+nvidia-container-cli --debug list
+
+# 模拟一次 configure（看会注入什么 device/mount/env），不实际启动容器
+nvidia-container-cli --debug configure \
+    --device=GPU-abc123 \
+    --compute --utility \
+    --pid=$$ /tmp/fake-rootfs
+
+# 看节点上 CDI spec 的内容（如果走 CDI 路径）
+ls /etc/cdi/
+cat /etc/cdi/nvidia.yaml
+
+# 看 containerd 配置中 nvidia runtime 怎么注册的
+grep -A 5 'runtimes\.nvidia' /etc/containerd/config.toml
+```
+
+containerd 配置里把请求路由到 nvidia 的链是这样的：
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+    BinaryName = "/usr/bin/nvidia-container-runtime"  # runc 的 wrapper
+```
+
+Pod spec 用 `runtimeClassName: nvidia` 触发这条 runtime handler。如果 RuntimeClass 没配、或 BinaryName 路径错（升级 toolkit 后路径改了）、或 wrapper 不存在，整条链就走不通——这是"GPU Pod 启动后 nvidia-smi 找不到"事故的常见原因之一。
+
+### cgroup v1 vs v2 device controller：BPF 改变了一切
+
+章节前面提了 "cgroup devices 控制能否访问"，但 v1 和 v2 的实现差异巨大且生产很常踩。
+
+**cgroup v1 device controller（老）**：
+
+```text
+/sys/fs/cgroup/devices/<container-id>/devices.allow
+/sys/fs/cgroup/devices/<container-id>/devices.deny
+内容是文本，每行一条规则: c 195:0 rwm  (字符设备 major:195 minor:0 读写 mknod)
+runc 直接 echo 写入这两个文件
+```
+
+**cgroup v2 device controller（新，cgroup v2 默认）**：
+
+```text
+device controller 完全用 eBPF 实现：
+  - 没有 devices.allow/deny 文件
+  - runc 编译一段 BPF 程序（cgroup_device_program），attach 到 cgroup
+  - 内核每次设备访问都跑 BPF 程序判断 allow/deny
+
+诊断 cgroup v2 设备权限只能用 bpftool:
+  bpftool cgroup show /sys/fs/cgroup/<container>
+  bpftool prog dump xlated id <prog_id>
+```
+
+判断节点用的是 v1 还是 v2：
+
+```bash
+stat -fc %T /sys/fs/cgroup/
+# tmpfs       = cgroup v1（混合或纯 v1）
+# cgroup2fs   = cgroup v2（纯 v2，systemd 默认 unified）
+
+mount | grep cgroup
+# v1: cgroup on /sys/fs/cgroup/devices type cgroup (rw,nosuid,...,devices)
+# v2: cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,...,nsdelegate)
+```
+
+**为什么 v1/v2 差异在 GPU 容器上是个大坑**：
+
+- **`libnvidia-container` 1.10 之前不会写 BPF**——它只 echo `devices.allow`，在 v2 节点上完全无效。表现是：容器内 `/dev/nvidia0` 文件存在（mount 成功）、但 read/write 设备会得到 `Operation not permitted`，看起来像权限问题。
+- 1.10+ 的 `libnvidia-container` 检测到 v2 后用 `nvidia-container-cli` 内部的 BPF 编译器写规则。
+- **运行时不一致风险**：runc 1.0+ 已经用 BPF（v2 上），但 `nvidia-container-cli` 配置 cgroup 的时机和 runc 不同——如果两者 BPF 程序冲突，最后一个赢，可能导致设备权限丢失。
+- RHEL 9 / Ubuntu 22.04+ / Fedora 38+ 默认 cgroup v2；老 RHEL 7、Ubuntu 18.04 默认 v1；混合集群要小心。
+- `systemd.unified_cgroup_hierarchy=0` 内核参数可以强制 v1（运维兜底手段）。
+
+**生产 checklist**：
+
+```bash
+# 1. 节点用什么 cgroup 版本
+stat -fc %T /sys/fs/cgroup/
+
+# 2. nvidia-container-toolkit 版本（>= 1.10 才正确支持 v2）
+nvidia-container-cli --version
+dpkg -l | grep nvidia-container-toolkit  # Debian/Ubuntu
+rpm -qa | grep nvidia-container-toolkit   # RHEL
+
+# 3. runc / containerd / kubelet 都要支持 v2
+runc --version
+containerd --version
+kubelet --version  # 1.25+ 默认 v2
+```
+
+### NVIDIA_VISIBLE_DEVICES → /dev/nvidiaN 的实际解析路径
+
+章节前面列了环境变量，但 Device Plugin → toolkit → cli 的解析路径没讲清楚。完整链路：
+
+```text
+1. kubelet 收到 Pod with limits: nvidia.com/gpu=2
+2. kubelet 调 NVIDIA Device Plugin 的 Allocate(["GPU-uuid-A","GPU-uuid-B"])
+3. Device Plugin 返回 AllocateResponse:
+   - Envs: NVIDIA_VISIBLE_DEVICES="GPU-uuid-A,GPU-uuid-B"
+   - DeviceSpecs: [/dev/nvidiactl, /dev/nvidia-uvm]    (旧路径)
+   - 或 CDIDevices: ["nvidia.com/gpu=GPU-uuid-A", "nvidia.com/gpu=GPU-uuid-B"]   (CDI 路径)
+4a. CDI 路径: containerd 读 /etc/cdi/nvidia.yaml，
+    按 GPU-uuid-A、GPU-uuid-B 找到 device entries，
+    把 deviceNodes/mounts/env 合并进 OCI spec
+4b. Hook 路径: nvidia-container-runtime-hook 在 prestart 阶段被调用，
+    读取容器 env NVIDIA_VISIBLE_DEVICES，
+    调 nvidia-container-cli configure --device=GPU-uuid-A,GPU-uuid-B
+    cli 通过 NVML 把 UUID 解析成 minor number，挂载 /dev/nvidia<minor>
+5. runc 用最终 OCI spec 创建容器进程
+6. 容器内 nvidia-smi 读 /dev/nvidiactl，看到分配的 GPU
+```
+
+中间任何一环错都有典型症状：
+
+| 环节 | 错的表现 | 诊断 |
+|---|---|---|
+| Device Plugin Allocate 失败 | Pod 一直 ContainerCreating | `kubectl describe pod`、看 device plugin 日志 |
+| `NVIDIA_VISIBLE_DEVICES` 为空或 `void` | 容器内无 `/dev/nvidia*` | `kubectl exec ... env | grep NVIDIA` |
+| CDI spec 引用的 `libcuda.so` 路径不存在（driver 升级后没重新 generate） | 容器启动失败，containerd 报 CDI mount error | `journalctl -u containerd`、`nvidia-ctk cdi generate --output=...` 重新生成 |
+| Hook 路径上 `nvidia-container-runtime-hook` 不存在或路径错 | 容器启动失败，containerd 报 hook execution failed | 检查 containerd config 的 BinaryName 路径 |
+| BPF cgroup 没设（v2 + 老 toolkit） | `/dev/nvidia0` 存在但访问 EPERM | 升级 toolkit 到 1.10+，或检查 `bpftool cgroup show` |
+| NVML stale cache | 容器内 nvidia-smi 报 GPU 不存在但 host 上存在 | 重启 device plugin、检查 `nvidia-persistenced` |
+
 ## 18b.6 MIG 注入：不是“半张 GPU”这么简单
 
 MIG 将支持的 NVIDIA GPU 切分成多个隔离的 GPU instance 和 compute instance。对平台来说，MIG 改变了资源粒度、设备枚举和调度语义。

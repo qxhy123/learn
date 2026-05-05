@@ -226,6 +226,235 @@ nvidia.com/mig-3g.40gb: 1
 
 一个需要 `nvidia.com/mig-7g.80gb: 1` 的 Pod 不能用四个 `1g.10gb` 拼出来。MIG 碎片就是资源形状不匹配，而不是简单容量不足。
 
+### Scheduling Framework：kube-scheduler 的扩展点
+
+章节前面提到 "scheduler 选节点"，但 kube-scheduler 1.19+ 的实际架构是 **Scheduling Framework**——一个有 11 个扩展点的 plugin 系统。所有自定义 GPU 调度器（Volcano、scheduler-plugins、Yunikorn）都基于这套机制。理解这套，"Volcano 是替换 default scheduler 还是扩展它" 这种问题才有答案。
+
+11 个扩展点（按一个 Pod 调度的时序）：
+
+```text
+[QueueSort]      -> 决定 pending pod 队列顺序（FIFO 或自定义优先级）
+[PreFilter]      -> 预处理 pod，缓存信息供 Filter 用（如算 PodAffinity 需求）
+[Filter]         -> 对每个候选节点判断"能不能放下"（资源、taint、affinity）
+[PostFilter]     -> Filter 全部失败时跑（默认抢占 plugin 在这里）
+[PreScore]       -> 预处理用于打分
+[Score]          -> 对通过 Filter 的节点打 0-100 分
+[NormalizeScore] -> 各 plugin 分数归一化
+[Reserve]        -> 选定节点后预留资源（Pod 状态尚未持久化）
+[Permit]         -> 最后审批（gang scheduling 在这里等其他 Pod）
+[PreBind]        -> 实际 bind 前的最后准备（如 PV provisioning）
+[Bind]           -> 写 Pod.spec.nodeName 到 API server
+[PostBind]       -> bind 完成后的副作用（metrics、event）
+```
+
+每个 plugin 可以注册到一个或多个扩展点。例如 NodeResourcesFit plugin 同时在 PreFilter / Filter / Score 三处出现：PreFilter 算 Pod 资源需求并缓存，Filter 判断节点是否有足够可分配资源，Score 给"剩余资源越多越好"或"打包越紧越好"的节点更高分。
+
+**Volcano vs scheduler-plugins vs default scheduler 的关系**：
+
+| 形态 | 实现方式 | 部署 | 影响范围 |
+|---|---|---|---|
+| **default scheduler** | kube-scheduler binary 内置 | K8s 控制平面默认 | 集群所有 `schedulerName: default-scheduler` 的 Pod |
+| **scheduler-plugins**（kubernetes-sigs） | 在 default scheduler 框架上加 plugin（CapacityScheduling、CoScheduling、NodeResourceTopology 等），重编译一个新 scheduler binary | 替换或并行 default scheduler | 取决于配置 |
+| **Volcano** | 完整独立 scheduler binary，自己的 plugin 系统（gang、drf、proportion、binpack、preempt），不基于 framework | 独立 Deployment，Pod 用 `schedulerName: volcano` 切到 | 仅 schedulerName 匹配的 Pod |
+| **多 scheduler 共存** | 同集群跑多个 scheduler binary，按 schedulerName 分流 | 各自独立 | 必须保证不会同时 schedule 同一个 Pod |
+
+工程含义：
+
+- 一个集群可以同时跑 default scheduler 和 Volcano，AI 训练 Pod 用 `schedulerName: volcano`，普通服务保留 default scheduler。
+- scheduler-plugins 的 CoScheduling 和 Volcano 的 gang plugin 解决同一问题（gang scheduling），实现完全不同——前者通过 Permit phase 等待，后者在自己的 Allocate 流程里整体调度。
+- 自研 GPU 拓扑调度器（如把同 NVLink domain 的 GPU 优先分给同一 Pod）通常实现为 scheduler-plugins 的 Filter+Score plugin，而不是改 default scheduler。
+
+### Topology Manager + Hint Provider：NUMA-aware 调度的实际机制
+
+章节前面提了"开启 Topology Manager"，但它怎么工作没讲。这是 K8s NUMA-aware scheduling 的**唯一**机制。
+
+**问题**：一台节点有 2 个 CPU socket（每 socket 一个 NUMA node），GPU 0-3 挂在 socket 0、GPU 4-7 挂在 socket 1，NIC 0 在 socket 0、NIC 1 在 socket 1。Pod 申请 1 GPU + 8 CPU + 32GB memory + 1 NIC，应该让这 4 类资源都在**同一个 NUMA**——否则跨 socket QPI/UPI 访问会让性能掉 10-30%。default scheduler 不解决这个，它只看节点级 allocatable。
+
+**Topology Manager 的解法**：把"决策每个资源放哪个 NUMA"的责任推给 kubelet（在 admission 阶段），由 4 个 **Hint Provider** 协作：
+
+```text
+kubelet admission 收到 Pod after schedule:
+  ├── CPU Manager: GetTopologyHints(pod, container)
+  │       → "我倾向给这容器分配 socket=0 的 8 个 CPU"
+  │       → returns [{NUMANodeAffinity: 0001, Preferred: true}]
+  ├── Memory Manager: GetTopologyHints(pod, container)
+  │       → "32GB memory 我可以从 socket 0 或 socket 1 分配"
+  │       → returns [{0001, true}, {0010, true}]
+  ├── Device Manager (NVIDIA Device Plugin GetPreferredAllocation):
+  │       → "你要 1 GPU，按 NUMA 偏好我推荐 GPU-0（在 socket 0）"
+  │       → returns [{0001, true}]
+  └── Hugepages Manager (如果有): ...
+  
+Topology Manager 把 4 个 Hint Provider 的偏好做 mask 交集:
+  socket 0 = 0001
+  socket 0 or 1 = 0011
+  socket 0 = 0001
+  → 交集 = 0001 (socket 0)
+  
+Policy 决定怎么处理这个交集:
+  - none:            完全不调用 Topology Manager (默认!)
+  - best-effort:     有交集就用，没有也允许调度
+  - restricted:      没有交集就 admission reject (Pod 永远 Pending)
+  - single-numa-node: 必须是单 NUMA 内可满足
+  
+最终告诉每个 Manager:
+  CPU Manager: "请从 socket 0 分配 CPU"
+  Memory Manager: "请从 socket 0 分配 memory"  
+  Device Manager: "请用 GPU-0"
+```
+
+**Topology Manager Scope**：
+
+- `container`（默认）：每个容器独立算 hint。多容器 Pod 内不同容器可能分到不同 NUMA。
+- `pod`：整个 Pod 当一个单元算，所有容器在同一 NUMA。多 GPU 训练通常用这个。
+
+**Device Plugin 的 GetPreferredAllocation**：
+
+NVIDIA Device Plugin 通过 NVML 拿到每个 GPU 的 NUMA node（`nvidia-smi topo -m` 看到的 `affinity`），在 `GetPreferredAllocation(available_devices, must_include, size)` 里返回**对该 NUMA 偏好最强**的 device 子集。Topology Manager 把这个 hint 与 CPU/Memory hint 求交集。
+
+**生产开启**：
+
+```yaml
+# kubelet config
+topologyManagerPolicy: single-numa-node
+topologyManagerScope: pod
+cpuManagerPolicy: static                # CPU Manager 必须是 static 才能 NUMA-aware
+memoryManagerPolicy: Static             # 同上
+reservedSystemCPUs: "0,1"               # 保留给系统
+```
+
+要点：
+
+- CPU Manager 必须是 `static`，default 不分 NUMA。
+- 节点必须用 `Guaranteed` QoS 的 Pod（CPU/memory request == limit、整数 CPU）才会被 NUMA-aware 处理——`Burstable` Pod 走简单路径。
+- Topology Manager **不是 scheduler**！它在 kubelet admission 阶段工作，决策已经晚了——节点已经被 default scheduler 选好。如果该节点 NUMA 已被占满、当前 Pod 算出的 hint 是 0011（要跨 NUMA），`single-numa-node` policy 会拒绝该 Pod，Pod 重新进入调度循环可能再次落到同一节点又被拒。
+- 解决"调度循环"问题需要 scheduler 端就感知 NUMA：scheduler-plugins 的 **NodeResourceTopology** plugin 让 scheduler 在 Filter 阶段就考虑 NUMA，避免 admission 反复拒。这是生产 NUMA-aware 调度的完整方案。
+
+### PodGroup / Gang scheduling 在 scheduler 内部的实现
+
+章节前面说"使用 gang scheduling"，但调度器**怎么知道一组 Pod 属于同一个 gang、什么时候不调度单个 Pod** 没讲。两种主流实现：
+
+**方案 1：Volcano PodGroup**（独立 scheduler 路径）
+
+```yaml
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata:
+  name: train-job-pg
+spec:
+  minMember: 8                # 必须 8 个 Pod 都能 schedule 才整体 admit
+  minResources:
+    nvidia.com/gpu: 64        # 8 worker × 8 GPU
+  queue: train-prod
+```
+
+```yaml
+# Pod 通过 annotation 关联到 PodGroup
+metadata:
+  annotations:
+    scheduling.volcano.sh/group-name: train-job-pg
+```
+
+Volcano scheduler 的 gang plugin 工作流程：
+
+```text
+1. Pod 来了不立即考虑调度，先 group 到 PodGroup
+2. PodGroup 进入 Pending 状态，scheduler 看 minResources 是否在集群可获得
+3. 资源够 → PodGroup 进入 Inqueue
+4. scheduler Allocate 阶段：尝试给 PodGroup 内所有 Pod 找节点
+   - 如果能找到 minMember 个可放置的位置 → batch bind 所有 Pod
+   - 找不到 → 回滚已分配的临时 reservation，PodGroup 回到 Pending
+5. 资源被部分释放后，PodGroup 重新尝试
+```
+
+关键点：**scheduler 不会先 bind 一部分 Pod、等其他 Pod 资源够了再 bind**——要么全部 bind，要么都不 bind。这就避免了"5 个 worker 跑起来占着卡，等剩下 3 个永远等不到"。
+
+**方案 2：scheduler-plugins CoScheduling**（default scheduler + plugin）
+
+不需要独立 scheduler binary，在 default scheduler 框架上加 CoScheduling plugin：
+
+```yaml
+metadata:
+  labels:
+    pod-group.scheduling.sigs.k8s.io/name: train-job-pg
+    pod-group.scheduling.sigs.k8s.io/min-available: "8"
+```
+
+工作机制利用 Scheduling Framework 的 **Permit phase**：
+
+```text
+Pod 1 完成 Filter+Score → Reserve（占节点资源）→ Permit
+  CoScheduling plugin 在 Permit: "我属于 train-job-pg，目前只有 1/8 到 Permit，wait 60s"
+  → Pod 1 状态: Waiting in Permit (节点资源已 reserve 但 Pod 没 bind)
+
+Pod 2 → 同样到 Permit → wait
+
+...
+
+Pod 8 → Permit: "我是第 8 个，gang 满足！"
+  → CoScheduling 调用 framework.Allow 给所有 8 个 wait 中的 Pod
+  → 所有 Pod 一起进入 PreBind/Bind，原子地写 nodeName
+
+如果 60s 内 Pod 8 没到（比如资源不够无法 Filter 通过），
+所有 wait 中的 Pod 触发 Reject，释放 reserve，重新进入 PendingQueue。
+```
+
+**两种方案的取舍**：
+
+| 维度 | Volcano | scheduler-plugins CoScheduling |
+|---|---|---|
+| 实现 | 独立 scheduler binary | default scheduler + plugin |
+| Permit timeout | scheduler 内部协调 | Permit phase 等待（默认 60s）|
+| 资源占用风险 | scheduler 自己管 reservation 状态 | Reserve phase 已经占节点资源，等待期间其他 Pod 看不到 |
+| 抢占语义 | 完整自定义抢占 | 复用 default scheduler 抢占 + gang 感知 |
+| 适合场景 | 大规模批训练、HPC 风格 | K8s 原生场景中加 gang 能力 |
+| 部署复杂度 | 需要 PodGroup CRD + Volcano controllers | 替换 scheduler image + 配置 plugin |
+
+工程经验：
+
+- 不要混用——同集群同时让 Volcano 和 default+CoScheduling 处理同一批 Pod 会出竞争。
+- Permit phase 的 wait 不是"无限等"，超时后 Pod 会被 reject，需要重新进入调度——这意味着大 gang（>32 Pod）+ 资源紧张时，CoScheduling 会反复 reject-retry，吞吐很差。Volcano 的 PodGroup-level reservation 机制更适合大 gang。
+- gang 的 `minMember` 不一定等于总 worker 数：弹性训练（PyTorch Elastic、DeepSpeed）允许 minMember < total，先用 minMember 个起步，后续 worker 加进来时弹性扩。这种场景必须用支持 elastic 的 gang 实现。
+
+### NFD 和 GPU Feature Discovery 怎么工作
+
+章节前面提了"NFD 自动打标签"，但 NFD 本身的架构和更新机制对调试"标签陈旧"事故很重要。
+
+NFD 由 **master + worker** 组成：
+
+```text
+NFD-master (Deployment, 集群级):
+  - 接收 worker 上报的 features
+  - 决定哪些 feature 转换成 node label
+  - 通过 NodeFeatureRule CRD 让用户自定义 feature → label 映射
+
+NFD-worker (DaemonSet, 每节点一个):
+  - 周期性扫描节点（默认 60s）:
+    - CPU: cpuid 寄存器、特性
+    - PCI: lspci，识别 NVIDIA GPU、Mellanox NIC
+    - Kernel: 版本、内核模块
+    - 文件系统: 检测特定路径存在
+    - 自定义 source: 用户 hook
+  - 上报给 master 或直接 patch node label
+
+GPU Feature Discovery (GFD):
+  - 是 NFD 之上的 GPU 专用扩展
+  - 调 NVML 获取每张卡的型号、显存、CUDA capability、MIG 状态、driver 版本
+  - 把这些信息打成标签:
+      nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
+      nvidia.com/gpu.memory=81920
+      nvidia.com/gpu.count=8
+      nvidia.com/cuda.driver.major=535
+      nvidia.com/mig.strategy=single
+```
+
+关键工程点：
+
+- **更新延迟**：NFD-worker 默认 60s 扫一次，硬件变化（如 driver 升级、MIG profile 重切）后标签可能 1-2 分钟才更新。在窗口期内调度可能用旧标签。
+- **静态 fact vs 动态状态**：NFD/GFD 暴露的是节点静态特性，**不是健康状态**。GPU XID 错误、ECC failure、MIG 错配这些"健康事实"必须通过 DCGM Exporter + 节点健康 controller 单独治理。把 ECC 错误的卡 cordon 是另一条机制（Node Problem Detector + custom controller）。
+- **标签漂移**：手动 `kubectl label node` 加的自定义标签，如果和 NFD/GFD 标签命名冲突，重启 worker 时会被 NFD 覆盖。生产建议给所有人工标签用专属 prefix（如 `ai.local/`），与 NFD 的 `feature.node.kubernetes.io/`、GFD 的 `nvidia.com/` 区分。
+- **审计**：定期对比 `kubectl get node -o yaml` 中的 NFD 标签 vs `nvidia-smi` 实际输出，发现不一致就重启对应 worker。这一步如果没做，"调度看到 H100 节点但容器跑起来发现是 A100" 是可能发生的（虽然罕见）。
+
 ### Locality 为什么决定性能
 
 GPU 性能错配常来自 locality：

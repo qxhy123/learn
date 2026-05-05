@@ -254,7 +254,198 @@ DRF 的工程前提是 request 可信。用户低报 CPU、内存、临时盘或
 - PodDisruptionBudget、terminationGracePeriod 和框架信号处理能力。
 - 被抢占后的重入队优先级和补偿策略。
 
-抢占不是“杀掉低优先级 Pod”，而是“执行一份可解释的资源回收协议”。
+抢占不是"杀掉低优先级 Pod"，而是"执行一份可解释的资源回收协议"。
+
+#### 抢占在 kube-scheduler 内部的实际算法
+
+章节前面给了"victim 选择规则"的概念，但 default scheduler 的抢占机制（PostFilter phase 的 DefaultPreemption plugin）实际怎么工作没讲。理解这个，"为什么我的高优 Pod 已经触发抢占但还要等 30 秒"、"PDB 能不能阻止抢占"、"NominatedNodeName 是什么"才有答案。
+
+**触发时机**：当 Pod 在 Filter phase 没找到任何可调度节点（资源不够），调度器进入 **PostFilter** phase，DefaultPreemption plugin 启动：
+
+```text
+PostFilter (DefaultPreemption.PreemptIfNeeded):
+  1. 对每个候选节点 N，模拟"如果我抢占 N 上的某些低优 Pod，能不能让当前 Pod fit"
+     - 列出 N 上所有 priority < pod.priority 的 Pod 作为 candidates
+     - 试着 evict 不同 candidates 子集，跑 Filter 看是否能让 pod fit
+  
+  2. 找到能 fit 的最小 victim 子集（minimal victim set algorithm）:
+     - 从 lowest priority 开始 evict
+     - 一次 evict 一个，直到 pod 能 fit
+     - 这是 greedy，不是全局最优，但避免组合爆炸
+  
+  3. 在所有可行方案中按以下规则排序选最优:
+     a. 选 PDB 违反次数最少的方案 (好心 - 但不强制)
+     b. 选 victim 中最高 priority 最低的方案
+     c. 选 victim 总优先级和最小的方案
+     d. 选 victim 数最少的方案
+     e. 选最近创建的 victim (运行时间短，损失少)
+     f. 选 victim 总运行时间最短的方案
+  
+  4. 选定方案后:
+     a. API Server.delete(victim) with gracePeriod (默认 30s)
+        → kubelet 收到 SIGTERM，给容器 graceful shutdown
+     b. 给当前 pod 设 .status.nominatedNodeName = N
+        → 告诉其他 scheduler 决策"这个节点已经为我留着，别人别抢"
+     c. 当前 pod 重新进入 PendingQueue 等待
+     d. victim 终止后，当前 pod 在下一轮调度循环用 nominatedNodeName 优先尝试
+```
+
+**关键点 1：抢占不是同步的**
+
+高优 pod 触发抢占后**不会立即跑起来**——它进入等待，等 victim graceful shutdown（默认 30s）结束、节点资源真正释放后，下一轮调度才把它 bind 上去。整个流程典型 30-60 秒。这就是为什么"紧急扩容"靠抢占救不了——抢占只能腾出未来的资源，不能瞬时。
+
+**关键点 2：PodDisruptionBudget 不能阻止抢占**
+
+这是常见误解。PDB（`disruptionsAllowed: 0`）只能阻止 **voluntary disruption**（kubectl drain、cluster autoscaler 缩容），**不能阻止 involuntary disruption**——抢占属于后者。这是因为 K8s 哲学：抢占是为了高优工作负载，PDB 是 SLO 工具，两者冲突时高优先级赢。
+
+实际行为：抢占算法在选 victim 时**会优先选不违反 PDB 的方案**（步骤 3a），但如果所有方案都违反 PDB，仍然会执行抢占，只是这条 PDB 被 "burned"（计数）。
+
+**关键点 3：NominatedNodeName 协议**
+
+```yaml
+# 高优 Pod 触发抢占后
+status:
+  nominatedNodeName: "node-h100-3"
+```
+
+这个字段告诉所有 scheduler："这个 Pod 已经为 node-h100-3 留着，victim 终止后我就上去"。其他 Pod 在调度时看到 node-h100-3 上有 nominated pod 时会**预留资源**，避免别的 Pod 抢先占走。
+
+但这只是"善意提醒"，不是强保证。如果 victim 终止过程中又有更高优先级的 Pod 来抢同一节点，nominatedNodeName 会被覆盖。
+
+**关键点 4：PreemptionPolicy: Never（PriorityClass 1.24+）**
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority-no-preempt
+value: 100000
+preemptionPolicy: Never   # 关键
+```
+
+设置后，这个高优 Pod **不会触发抢占**——只在有空闲资源时调度，资源不足就一直 Pending。适合"重要但不紧急"的训练任务（深夜跑、周末跑），不希望它把生产服务踢下来。
+
+**完整的 priority + preemption 矩阵**：
+
+| PriorityClass priority | preemptionPolicy | 行为 |
+|---|---|---|
+| 100000 | PreemptLowerPriority（默认）| 抢占任何 priority < 100000 的 pod |
+| 100000 | Never | 不抢占；资源不足时 Pending |
+| 1000 | PreemptLowerPriority | 抢占 priority < 1000 的 pod |
+| -1000 | PreemptLowerPriority | 比默认 priority (0) 还低；几乎不会抢占别人，反而最容易被抢占 |
+
+**生产建议**：
+
+- 给所有 PriorityClass 显式声明 preemptionPolicy，不要依赖默认。
+- "保护类"高优（如基础监控、网关）用 Never + 容量预留，避免它去抢生产推理。
+- 训练任务的可抢占性靠 PriorityClass 区分（research-batch < research-experiment < research-priority），让队列有抢占链路可走。
+- **不要给 system-critical 之外的 pod 用 1000000+ 的 priority**。1B+ 数字是 K8s 内部 system pod 的范围，业务 pod 用 100-100000 区间。
+
+#### Kueue admission cycle 实际怎么工作
+
+章节前面给了 LocalQueue / ClusterQueue / ResourceFlavor / Workload 的概念，但 Kueue 怎么从 Job 提交到 Pod 启动**实际怎么协调**没讲。这是"为什么 PyTorchJob 提交后 Pod 不立刻创建"的根本机制。
+
+**关键设计：Kueue 通过 `suspend` 字段控制 Job 是否启动**
+
+Kueue 不是 scheduler，它是**准入控制器**。它的核心 trick 是用 Job 类型自带的 `spec.suspend: true` 字段暂停 Pod 创建：
+
+```yaml
+# 用户提交一个 PyTorchJob
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: train-reranker
+spec:
+  suspend: true   # Kueue 加上的，用户不需要手写
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 8
+      ...
+```
+
+`suspend: true` 时，PyTorchJob controller **不创建 Pod**——Kueue 在它准入通过前不让任何 GPU 被占用。
+
+**完整 admission cycle**：
+
+```text
+1. 用户提交 PyTorchJob（不带 suspend，或 suspend=false）
+   
+2. Kueue webhook 拦截 (mutating admission webhook):
+   - 自动给 spec.suspend = true
+   - 创建对应的 Workload 对象 (Kueue 自定义 CRD):
+       Workload {
+         podSets: [{ name: "Worker", count: 8, template: {gpu:8, ...} }]
+         queueName: "train-prod"
+         priorityClassName: "research-experiment"
+       }
+   - 写 ownerReference 让 Workload 跟随 Job 删除
+
+3. PyTorchJob controller 看到 suspend=true，什么都不做（不创建 Pod）
+
+4. Kueue admission controller (单独 reconciler) 持续 evaluate Workloads:
+   for each pending Workload:
+     - 找到对应 LocalQueue → ClusterQueue
+     - 算 quota: nominal + borrow available?
+     - 如果 cohort 启用 borrowing，遍历 cohort 内其他 ClusterQueue 看能借多少
+     - 检查 ResourceFlavor 匹配（H100 vs A100 不同 flavor）
+     - 如果通过 → admit Workload，patch Job spec.suspend = false
+
+5. Job spec.suspend = false 后:
+   - PyTorchJob controller 看到，开始创建 Master/Worker Pods
+   - Kubelet 启动容器
+   - Workload.status.admission = Accepted
+
+6. 训练完成或失败:
+   - PyTorchJob 状态变 Succeeded/Failed
+   - Kueue 减去对应 quota usage
+   - 释放给其他 Workload 使用
+```
+
+**为什么这个设计很巧妙**：
+
+- 不用替换 scheduler——Kueue 跟 Volcano 不同，它**不参与调度**，只决定 Pod 是否被创建。Pod 一旦创建，default scheduler 接管。
+- 兼容所有 Job 类型——Kueue 只要求 Job 类型支持 `suspend`，PyTorchJob/RayJob/MPIJob/JobSet/原生 Job 都支持。
+- Quota 与调度解耦——Kueue 算配额时不看节点细节，只看 Pod 资源声明的总和；scheduler 负责实际放置。
+
+**关键失败模式**：
+
+| 现象 | 根因 | 排查 |
+|---|---|---|
+| Job suspend=true 但 Workload 一直 Pending | Quota 不够、Flavor 不匹配、cohort 借用受限 | `kubectl describe workload <name>` 看 conditions |
+| Workload Admitted 但 Pod 没创建 | Job controller 没看到 suspend 变化，或 watch 抖动 | 重启 Job controller、看 events |
+| Pod 创建后 scheduler Pending | Kueue 算 quota 时按声明，但实际节点 NUMA/拓扑不匹配 | 调度问题不是 Kueue 范畴，看 scheduler events |
+| 抢占发生在 Workload 层 | Kueue **可以抢占** Workload（撤销 admission，suspend=true，Pod 被删） | 看 Workload preemption events |
+
+**Kueue 与 default scheduler 的协调**：
+
+Kueue 不是 scheduler，但它的抢占会影响 scheduler 看到的资源：
+
+```text
+场景: cohort 内 borrow 关系
+  - ClusterQueue A: nominal 32 GPU, used 32, borrowed 8 from B
+  - ClusterQueue B: nominal 16 GPU, used 8, lent 8 to A
+  - B 收到一个高优 Workload 需要 8 GPU
+  
+Kueue 决策:
+  1. B 的 nominal 还没用完 (8 < 16)，但当前 free = 0（因为借给 A 了）
+  2. 触发"reclaim borrowed"——回收借出的 8 GPU
+  3. 选 A 的某个 Workload（按 priority 低、运行时间短）撤销 admission
+  4. 该 Workload 的 Pod 被驱逐（spec.suspend=true 触发 Job controller 删 Pod）
+  5. B 的高优 Workload admit
+  
+Default scheduler 视角:
+  - 完全不参与 Kueue 决策，只看到一批 Pod 被删了、新一批 Pod 出现
+  - 按节点资源选放置位置
+```
+
+这就是为什么 Kueue 的抢占叫 "borrowing reclaim"，不是 "Pod preemption"——它操作的是 Workload，scheduler 操作的是 Pod。
+
+**生产建议**：
+
+- 不要同时用 Kueue 和 Volcano gang scheduling 处理同一批 Job——两个准入控制器会抢决策权。
+- Kueue 的 ResourceFlavor 必须和节点标签 + taint 一一对应，否则 Workload admit 后 Pod 永远 Pending（Kueue 以为有资源但 scheduler 找不到匹配节点）。
+- Workload 的 priority 影响 Kueue 内部抢占顺序，但**和 K8s PriorityClass 不直接挂钩**——这是两个独立的优先级体系。
+- 多团队场景用 cohort 启用 borrowing，比硬性 quota 切分更灵活。
 
 ### Gang scheduling 的底层语义
 

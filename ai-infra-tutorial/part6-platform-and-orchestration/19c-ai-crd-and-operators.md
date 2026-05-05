@@ -292,6 +292,276 @@ metadata:
 
 ownerReference 让 Kubernetes 知道归属关系；labels 让 controller、用户、Prometheus、日志系统、成本系统能查询和聚合。不要只依赖名字前缀。
 
+### controller-runtime 内部架构：从 API Server 到 Reconcile
+
+章节前面说 "Operator watch 对象、reconcile" 是高层视角。实际上每个 Operator 内部都基于 **client-go** 的一套架构（controller-runtime 是它的封装）。理解这套，"为什么我的 Operator 偶尔漏处理事件"、"为什么 reconcile 看到的对象比我刚 update 的旧"、"resync 是什么、为什么需要它" 这些问题才有答案。
+
+完整链路：
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    API Server                               │
+└────────┬────────────────────────────────────────────────────┘
+         │ List + Watch (HTTP long polling, ResourceVersion)
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Reflector (controller-runtime 内部)                        │
+│  - 启动: List 全量，记下 lastResourceVersion                │
+│  - 持续: Watch from lastResourceVersion                     │
+│  - 连接断开: 用 lastResourceVersion 续传，不丢事件           │
+└────────┬────────────────────────────────────────────────────┘
+         │ Add/Update/Delete events
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  DeltaFIFO                                                  │
+│  - 每对象一个 deltas 队列                                   │
+│  - 同对象多次更新被合并（只留最新）                         │
+│  - Pop 时返回该对象的所有 deltas                            │
+└────────┬────────────────────────────────────────────────────┘
+         │ Pop deltas
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Informer Cache (thread-safe local store)                  │
+│  - 索引: namespace/name → object                            │
+│  - 所有 Get/List 操作 O(1)，不打 API Server                 │
+│  - **Cache 永远比 API Server 慢若干 watch event**           │
+└────────┬────────────────────────────────────────────────────┘
+         │ EventHandler 注册回调
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Workqueue (rate limited, deduplicated)                    │
+│  - Add(key="ns/name") 自动去重                              │
+│  - 限速器: 失败 Pod 退避重试 (5ms → 10ms → ... → 1000s)     │
+│  - 全局令牌桶: 防雪崩                                       │
+└────────┬────────────────────────────────────────────────────┘
+         │ Get() blocks until key available
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Reconciler.Reconcile(ctx, req)                            │
+│  1. 从 Informer cache 读对象（不是 API Server！）           │
+│  2. 算 desired vs actual                                    │
+│  3. Patch/Apply 到 API Server                               │
+│  4. return Result{Requeue: bool, RequeueAfter: duration}    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+每一层都解决一个具体问题：
+
+- **Reflector List+Watch + ResourceVersion**：保证不丢事件。watch 连接断了，下次 watch 用 `lastResourceVersion` 续传——API Server 还有对应历史时返回缺失事件，没有时（默认 5min 历史，保留范围有限）返回 410 Gone，Reflector 触发重新 List。这是为什么 Operator 重启时没事——Informer 自动重建。
+- **DeltaFIFO 合并**：对象在短时间内被改 100 次，FIFO 里只有 1 个最新对象等着 reconcile。这避免了 watch 风暴让 reconcile 排队爆炸。
+- **Informer cache 的强一致幻觉**：cache 永远略晚于 API Server，所以 Reconcile 拿到对象后**必须用 ResourceVersion 防 conflict**——`Update()` 时 K8s 比对 ResourceVersion，cache 旧的就 reject，Reconciler 把请求重新入 queue。
+- **Workqueue 的限速**：默认用 `ItemExponentialFailureRateLimiter`（指数退避，5ms 起跳，1000s 封顶）+ `BucketRateLimiter`（10 qps + 100 burst 全局令牌桶）。这两层叠加：单个对象失败会指数退避，但全局也不会被狂打 API Server。
+
+#### Periodic Resync：Operator 自愈的隐形机制
+
+DeltaFIFO 默认启用 **Resync**（典型 10 分钟）。每 10 分钟，Informer 会**遍历自己的全部缓存对象、对每个对象触发一次 fake update event**，把它们重新塞进 workqueue 走 reconcile。
+
+这就是 Operator 的"隐形自愈"：
+
+- **Reconcile 失败用尽 retry**：原本对象就再也不会被处理了。Resync 让它有机会重新尝试。
+- **外部状态漂移**：底层 Pod 被运维手动删了、Service 被覆盖了，Operator 没收到事件。Resync 让 Operator 定期对账。
+- **bug 导致 status 没写**：Resync 让 Operator 有机会重新算 status。
+
+这也意味着：Reconcile **必须幂等**。同一对象在 1 小时内可能被 reconcile 几十次（10min Resync × 6 + watch event）。每次都要从头算 desired，不能假设"上次执行成功"。
+
+工程经验：
+
+- 不要依赖 Reconcile 内的内存状态（local cache 之外的）。重启或 resync 后丢失。
+- 看到 `controller_runtime_reconcile_total` metric 数字远大于实际事件数？正常——含 resync。
+- Resync period 太短（< 1min）会让 controller CPU 飙高；太长（> 1h）让自愈变慢。默认 10min 是经验值。
+
+### Server-Side Apply (SSA)：现代 Operator 多控制器协作的关键
+
+章节前面提到 "用 patch 或 SSA 管理字段边界"，但 SSA（K8s 1.22 GA）的核心机制——**field manager**——没讲清楚。
+
+**问题**：一个 Pod 的 spec.replicas 字段，可能同时被 Deployment controller、HPA、admin 手工 kubectl edit 修改。如果 Operator 用传统 `Update()` 全量覆盖，会把别人的修改盖掉——典型事故："我手动改了 replicas，5 秒后被 Operator 还原"。
+
+**SSA 的解法**：每个 client 用 **field manager 名字**（字符串，如 `"torchjob-controller"`）声明"我对哪些字段负责"。API Server 跟踪每个字段的 owner，发生冲突时返回 `Conflict` 让 client 决定怎么处理。
+
+```go
+// controller-runtime 风格
+err := client.Patch(ctx, obj, client.Apply, &client.PatchOptions{
+    FieldManager: "torchjob-controller",
+    Force:        false,  // 冲突时报错；true = 强制接管
+})
+```
+
+实际行为：
+
+```text
+场景: 用户 kubectl edit 改了 Deployment.spec.replicas = 5
+      manager = "kubectl-edit"
+      
+随后 HPA 想改 replicas = 8:
+  客户端: kubectl patch deploy ... --type=apply --field-manager=horizontal-pod-autoscaler
+  API Server: 看到 replicas 字段当前 owner 是 "kubectl-edit"
+  返回: Conflict, fields managed by "kubectl-edit": [.spec.replicas]
+  
+HPA controller 决定: 我有合法权限改 replicas (它知道是 autoscaling 场景)
+  重发: 加 force=true
+  API Server: 更新 replicas，owner 改为 "horizontal-pod-autoscaler"
+
+随后 Operator 用 Update() 全量写整个 Deployment:
+  manager = "torchjob-controller"
+  API Server 看 .spec.replicas 现在是 "horizontal-pod-autoscaler" 的
+  Update() 是 imperative，不是 SSA → 直接覆盖（用 .spec.replicas = 老值）
+  HPA 的 8 被改回 5
+  → 事故！
+```
+
+**生产规则**：
+
+1. **Operator 一律用 SSA Patch，不用 Update**。`controller-runtime` 0.9+ 推荐 `client.Apply` patch type。
+2. **Operator 只声明自己负责的字段**，不要把整个对象 apply。常见做法是用 `apply configurations`（如 `appsv1ac.Deployment(name, ns).WithSpec(...)`）只构造自己关心的部分。
+3. **Force=true 谨慎使用**——只在有"我有权接管"的判断后才用。
+4. **观测**：API Server `apiserver_request_total{verb="apply"}` 看 SSA 使用情况；冲突会出现在 audit log 的 `Conflict` 响应。
+
+**SSA + status subresource**：
+
+CRD 启用 `subresources.status: {}` 后，spec 和 status 的更新走不同 API endpoint。Operator 用 `client.Status().Patch(...)` 改 status，不会触发 spec 的 SSA 冲突。这是为什么所有现代 CRD 都开 status subresource。
+
+### Conversion Webhook：multi-version CRD 的工作机制
+
+章节前面提了"multi-version CRD 要 conversion webhook"，但实际机制和失败模式没讲。
+
+**问题**：CRD 从 `v1alpha1` 升级到 `v1`，字段重命名、结构调整。集群里同时有 v1alpha1 和 v1 的对象，API Server 怎么处理？
+
+**Conversion webhook 的工作流**：
+
+```text
+API Server 收到任何 CRD 对象操作（read/write/list/watch）:
+  1. 先决定 storage version（CRD 定义里 storage: true 的那个）
+     存储格式永远是 storage version (比如 v1)
+  
+  2. 客户端请求版本 != storage version 时:
+     API Server 调 ConversionReview 给 webhook:
+        ConversionRequest:
+          desiredAPIVersion: "v1"
+          objects: [<v1alpha1 格式对象>]
+     
+     Webhook 返回:
+        ConversionResponse:
+          convertedObjects: [<v1 格式对象>]
+          result: { status: Success }
+     
+  3. API Server 用转换后的对象响应客户端
+  
+  4. 写操作时反过来: client 提交 v1 → 转换为 storage version 写 etcd
+```
+
+**典型 CRD 配置**：
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: training.example.com
+  names:
+    kind: PyTorchJob
+  versions:
+    - name: v1alpha1
+      served: true        # 仍允许 client 用这个版本
+      storage: false      # 但不是存储版本
+      schema: ...
+    - name: v1
+      served: true
+      storage: true       # 写 etcd 用 v1
+      schema: ...
+  conversion:
+    strategy: Webhook
+    webhook:
+      conversionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          namespace: training-system
+          name: training-operator-webhook
+          path: /convert
+        caBundle: <base64>
+```
+
+**失败模式**：
+
+| 失败 | 后果 | 排查 |
+|---|---|---|
+| Webhook service 不可达（pod 死了） | **整个 CRD 不可用**——所有操作返回 5xx | `kubectl describe crd <name>` 看 status.conditions；保证 webhook deployment 高可用、有 PDB |
+| Webhook 返回错误（panic、bug） | 同上 | webhook pod 日志 |
+| caBundle 过期 | 同上 | 用 cert-manager 自动轮换 |
+| Conversion 函数有 bug，返回错误对象 | 客户端拿到错对象，调度等下游链路出错 | webhook 必须充分单测，特别是 round-trip（v1→v1alpha1→v1 应等于原对象）|
+
+**生产 checklist**：
+
+- Webhook service **必须高可用**（≥ 2 replicas + PDB），否则 webhook 抖动 = CRD 抖动 = 整个 Operator 链路抖动。
+- caBundle 用 cert-manager 自动管理，不要手动维护。
+- 在 CI 跑 round-trip 测试：随机生成 v1 对象，转 v1alpha1 再转回 v1，必须等同。
+- **CRD 升级回滚最危险**：旧版本 webhook 可能不知道怎么转新字段。回滚前要测降级路径。
+
+### Leader Election：实际机制
+
+章节前面说 "Operator 多副本要 leader election"，但具体协议没讲。
+
+**机制**：用 `coordination.k8s.io/v1` 的 `Lease` 对象作为分布式锁。多个 Operator 副本竞争同一个 Lease，只有持有 Lease 的副本执行 reconcile。
+
+```yaml
+# kube-system 下的 Lease 对象示例
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: training-operator-leader
+  namespace: training-system
+spec:
+  holderIdentity: "training-operator-7d8f6c9-xkj2p"   # 当前 leader pod
+  leaseDurationSeconds: 15                            # leader 多久不续就失效
+  renewTime: "2026-05-04T10:23:45Z"                   # 上次续期时间
+  acquireTime: "2026-05-04T10:00:00Z"                 # leader 获得锁的时间
+  leaseTransitions: 3                                 # 历史切换次数
+```
+
+**三个时间参数**（默认值）：
+
+```go
+LeaderElectionConfig {
+  LeaseDuration: 15 * time.Second,   // leader 持锁时长
+  RenewDeadline: 10 * time.Second,   // leader 必须在这时间内续期，否则放弃
+  RetryPeriod:    2 * time.Second,    // 候选者每 2 秒尝试获取
+}
+```
+
+工作流程：
+
+```text
+启动:
+  3 个 operator pod 同时启动
+  各自尝试 update Lease.holderIdentity = self
+  K8s 用 ResourceVersion 保证只有 1 个成功
+  → Pod A 成为 leader，启动 informer/reconciler
+  → Pod B、C 进入 standby 状态，每 2 秒尝试夺锁
+
+正常运行:
+  Pod A 每 ~5 秒（< RenewDeadline）调 update 续 renewTime
+  Pod B/C 看 Lease 没过期，继续 standby
+
+Leader 失联:
+  Pod A 网络断/进程卡/被 kill
+  Pod A 没续期 renewTime
+  超过 LeaseDuration (15s) 后，Pod B/C 看 Lease 过期
+  Pod B/C 同时尝试 update，只有 1 个成功
+  → Pod B 成为新 leader (leaseTransitions++)
+
+Pod A 恢复:
+  Pod A 醒来发现 Lease.holderIdentity != self
+  立即停止所有 reconcile，进入 standby
+  这就是 RenewDeadline (10s) < LeaseDuration (15s) 的设计:
+  保证 Pod A 在自己以为还是 leader 的窗口内（10s）放弃，
+  让 Pod B 在 Lease 真正过期（15s）后接管时不会有重叠 leader
+```
+
+工程要点：
+
+- **Failover 时间**：从 leader 失联到新 leader 接管 = LeaseDuration（默认 15s）。生产 SLA 紧的服务可以缩到 5-10s，但太短会让 leader 临时网络抖动也触发切换。
+- **Split brain 防护**：3 个时间参数的关系是 `RenewDeadline < LeaseDuration` 且 `RetryPeriod < RenewDeadline`。RenewDeadline 比 LeaseDuration 短，让旧 leader 在被认为过期前就主动放弃，防止两个 leader 短暂共存。
+- **不能用于业务一致性**：Leader Election 保证"大概只有一个 reconcile 在跑"，但 leader 切换瞬间可能有重叠操作。所有 reconcile 操作必须基于 ResourceVersion 做乐观并发，不能假设独占。
+- **观测**：`kubectl get lease -n training-system` 看当前 leader；`leaseTransitions` 数字增长率反映 leader 抖动情况。
+
 ### Finalizer
 
 删除带 finalizer 的对象时，API Server 会设置 `metadata.deletionTimestamp`，但对象仍存在。Operator 看到 deletionTimestamp 后进入清理逻辑：
