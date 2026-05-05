@@ -399,7 +399,7 @@ prefetcher 何时**害你**：
 flowchart TB
   Access[访问 line N] --> Detect{Prefetcher<br/>检测模式}
   Detect -->|顺序| NextLine[Next-line:<br/>预取 N+1]
-  Detect -->|固定步长| Stride[Stride:<br/>预取 N+k, N+2k...]
+  Detect -->|固定步长| Stride[Stride:<br/>预取 N+k, N+2k, N+3k]
   Detect -->|长流| Stream[Stream:<br/>深度预取]
   Detect -->|随机| NoOp[不预取或<br/>误判污染]
   NextLine --> Useful{是否真用到}

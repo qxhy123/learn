@@ -114,7 +114,7 @@ SIMD 用一条 `vaddps` 指令在 ymm 寄存器里同时做 8 个 fp32 加法（
 ```mermaid
 flowchart LR
   subgraph SISD[SISD 标量]
-    S1[addss x0, y0] --> S2[addss x1, y1] --> S3[addss x2, y2] --> S4[...x32 次]
+    S1[addss x0, y0] --> S2[addss x1, y1] --> S3[addss x2, y2] --> S4[addss x31, y31]
   end
   subgraph SIMD[SIMD AVX]
     V1[vaddps ymm0, ymm1, ymm2<br/>8 个 fp32 同时加]
@@ -392,7 +392,7 @@ flowchart LR
 
 ```text
 HTTP parse → JSON validate → tokenize → request schedule
-  → batch pack → host→device copy → GPU prefill → ...
+  → batch pack → host→device copy → GPU prefill → first token
 ```
 
 前 5 步全在 CPU 上跑。如果 tokenizer 没有 SIMD ASCII 快速路径，长 prompt（10k token）可能多 10-20ms。这是 TTFT（Time To First Token）的纯增量。

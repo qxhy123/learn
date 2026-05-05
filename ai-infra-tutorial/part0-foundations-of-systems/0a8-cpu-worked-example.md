@@ -304,7 +304,7 @@ fn validate_token(s: &str) -> Result<(), Error> {
             return handle_non_ascii(c);
         }
         if is_special(c) {            // 不可预测
-            ...
+            return handle_special(c);
         }
     }
     Ok(())
@@ -319,11 +319,11 @@ fn validate_token(s: &str) -> Result<(), Error> {
 // Rust nightly 用 #[cold] 属性
 #[cold]
 #[inline(never)]
-fn handle_non_ascii(c: char) -> Result<(), Error> { ... }
+fn handle_non_ascii(c: char) -> Result<(), Error> { Err(Error::NonAscii(c)) }
 
 #[cold]
 #[inline(never)]
-fn handle_special(c: char) -> Result<(), Error> { ... }
+fn handle_special(c: char) -> Result<(), Error> { Err(Error::Special(c)) }
 
 fn validate_token(s: &str) -> Result<(), Error> {
     // hot path: 99% ASCII

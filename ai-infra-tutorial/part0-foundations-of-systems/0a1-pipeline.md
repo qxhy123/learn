@@ -256,7 +256,7 @@ Skylake 主要"段"概念上包括（顺序近似，实际有重叠和拆分）�
 |---|---|---|---|---|
 | RAW | Read After Write | `add r1,r2,r3; sub r4,r1,r5` | 是（真依赖） | Forwarding，必要时 stall |
 | WAR | Write After Read | `add r4,r1,r5; add r1,r2,r3` | 否（假依赖，名字冲突） | 顺序流水线天然无问题；OoO 需重命名 |
-| WAW | Write After Write | `add r1,r2,r3; ...; add r1,r4,r5` | 否（假依赖） | 顺序流水线天然无问题；OoO 需重命名 |
+| WAW | Write After Write | `add r1,r2,r3; mul r8,r9,r10; add r1,r4,r5` | 否（假依赖） | 顺序流水线天然无问题；OoO 需重命名 |
 
 顺序 5 段流水线只会遇到 RAW。WAR 和 WAW 是乱序执行才会暴露的"假依赖"，通过寄存器重命名消除（详见 0a-2）。
 

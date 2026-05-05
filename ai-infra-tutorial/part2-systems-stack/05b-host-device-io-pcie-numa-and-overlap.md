@@ -220,10 +220,10 @@ Pinned memory，也叫 page-locked memory，把主机页固定住，使 GPU copy
 ```python
 loader = DataLoader(
     dataset,
-    batch_size=...,
-    num_workers=...,
+    batch_size=32,
+    num_workers=8,
     pin_memory=True,
-    prefetch_factor=...,
+    prefetch_factor=2,
     persistent_workers=True,
 )
 

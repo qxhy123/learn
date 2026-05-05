@@ -329,7 +329,7 @@ GPU datasheet 是选型输入，不是选型结论。最危险的做法是把不
 异构池一旦规模化，最重要的抽象不是"GPU 数量"，而是"能力标签"。调度系统至少应该知道：
 
 ```text
-gpu.vendor = nvidia / amd / huawei / ...
+gpu.vendor = nvidia / amd / huawei / custom-asic
 gpu.model = H100-SXM-80GB
 gpu.memory_gb = 80
 gpu.interconnect = nvswitch / nvlink / pcie

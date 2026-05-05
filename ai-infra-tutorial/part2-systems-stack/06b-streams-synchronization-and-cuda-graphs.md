@@ -99,7 +99,7 @@ mindmap
 
 ```text
 CPU thread:
-  enqueue H2D(batch 0) ---- enqueue kernel(batch 0) ---- enqueue H2D(batch 1) ---- ...
+  enqueue H2D(batch 0) ---- enqueue kernel(batch 0) ---- enqueue H2D(batch 1) ---- enqueue kernel(batch 1)
 
 GPU device:
                  copy batch 0 ---- compute batch 0

@@ -8,7 +8,7 @@
 
 OoO 不是"硬件偷懒帮你重排指令"。它是在回答一个不可化简的问题：当一条指令的 latency 远大于 1 cycle（典型 load 4-12 cycle，L2 miss 25 cycle，L3 miss 100+ cycle，DRAM miss 200-300 cycle，除法 20-40 cycle，gather 数十 cycle），而 CPU 每周期可以发射 4-8 条 uop 的时候，怎样让那些"和正在等待的指令无关"的后续工作不要白白闲置？顺序流水线在此刻只能 stall：因为它的硬件状态机是"指令必须按程序顺序进入 EX"。一旦某条 load miss，后面所有指令都要排在它后面排队，即使它们并不读这个 load 的结果。
 
-这背后还有第二个不可化简的问题：程序文本中"先后写同一个寄存器"看起来像依赖，但很多时候只是符号复用。`r1 = a+b; ...; r1 = c+d` 在程序员眼里是同一个 `r1`，但语义上第二次写完全可以在第一次写之前完成（只要中间没人读 `r1`）。这种 WAW（Write-After-Write）和 WAR（Write-After-Read）依赖，被叫做"假依赖"或"name dependence"。如果硬件不消除它，OoO 的潜力会被架构寄存器数量（x86-64 只有 16 个 GPR）严格限制。
+这背后还有第二个不可化简的问题：程序文本中"先后写同一个寄存器"看起来像依赖，但很多时候只是符号复用。`r1 = a+b; r8 = e+f; r1 = c+d` 在程序员眼里是同一个 `r1`，但语义上第二次写完全可以在第一次写之前完成（只要中间没人读 `r1`）。这种 WAW（Write-After-Write）和 WAR（Write-After-Read）依赖，被叫做"假依赖"或"name dependence"。如果硬件不消除它，OoO 的潜力会被架构寄存器数量（x86-64 只有 16 个 GPR）严格限制。
 
 第三个不可化简的问题：乱序完成后，外界看到的状态必须仍然像顺序执行。否则中断、page fault、divide-by-zero、debug 单步都没法定位"刚才执行到哪了"，更没法精确回滚一个 speculative 分支。这就要求"执行可以乱序、提交必须顺序"，且需要一个集中数据结构，按程序顺序追踪每条已派遣但未提交的 uop——这就是 ROB。
 
@@ -208,11 +208,11 @@ D-E-F 这条链与 A-B-C 完全独立，可以在 A miss 等待时并行执行�
 ```mermaid
 flowchart LR
   subgraph RENAME[Rename Stage]
-    RAT[Register Alias Table\nrax -> P11/P12 ...]
-    FREE[Free List\nP12 P13 P14 ...]
+    RAT[Register Alias Table\nrax -> P11/P12/P17]
+    FREE[Free List\nP12 P13 P14 P15]
   end
   Decoded[Decoded uop\nwrite arch rax] --> RENAME
-  RENAME -->|alloc P12| Tagged[uop with Pdest=P12, Psrc1=...]
+  RENAME -->|alloc P12| Tagged[uop with Pdest=P12, Psrc1=P7]
   Tagged --> ROBIN[ROB allocate]
   Tagged --> SCHED[Scheduler]
   COMMIT[Retire stage] --> RECYCLE[Old physical reg back to Free List]
@@ -223,8 +223,8 @@ RAT 维护"当前每个架构寄存器映射到哪个物理寄存器"。Free Lis
 | 依赖类型 | 名称 | 例子 | 是否真依赖 | 能否被 rename 消除 |
 |---|---|---|---|---|
 | RAW | Read After Write | `add r1, r2; sub r3, r1` | 是 | 否（语义上必须） |
-| WAR | Write After Read | `add r3, r1; mov r1, ...` | 否（假） | 是 |
-| WAW | Write After Write | `mov r1, ...; mov r1, ...` | 否（假） | 是 |
+| WAR | Write After Read | `add r3, r1; mov r1, r8` | 否（假） | 是 |
+| WAW | Write After Write | `mov r1, r8; mov r1, r9` | 否（假） | 是 |
 
 > **callout · 工程边界**：寄存器分配紧的代码（编译器溢出到栈）会迫使更多 load/store，反而消耗 LSQ 资源；同时减少 OoO 可发现的并行度。`-O2` 与 `-O3` 之间，loop unroll 程度对 PRF pressure 影响很大，需要实测。
 

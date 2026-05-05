@@ -238,7 +238,7 @@ Tensor properties
   layout = strided
   requires_grad = true
   autocast = enabled
-  ...
+  memory_format = contiguous
 
 Dispatcher chooses:
   AutogradCUDA wrapper
@@ -328,7 +328,7 @@ ATen 可以理解为 PyTorch 的核心 tensor 算子层。到了 ATen，问题�
 一次 CUDA kernel launch 可以粗略理解成：
 
 ```c
-kernel<<<grid, block, shared_mem, stream>>>(args...);
+kernel<<<grid, block, shared_mem, stream>>>(input, weight, output);
 ```
 
 框架和库最终会把它变成 runtime/driver 层的命令提交。提交内容至少包括：

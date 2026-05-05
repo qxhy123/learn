@@ -564,7 +564,7 @@ Transparent Huge Pages 会尝试把合适的 4 KiB 页合并成 2 MiB 页，或�
 > **诊断 THP 引起的卡顿**：观察 `/proc/vmstat` 的 `compact_stall`、`compact_fail`、`thp_collapse_alloc_failed`、`thp_split_page` 计数随时间的增量；同时把 `khugepaged` 的 CPU 占用纳入监控。如果训练 step 延迟 spike 与 `compact_stall` 增长强相关，应立刻把 `enabled` 切到 `madvise`、`defrag` 切到 `defer+madvise` 或 `never`。
 
 > [!TIP]
-> **真正需要确定性大页的场景用 HugeTLB（`hugetlbfs`）而不是 THP**：`hugetlbfs` 由管理员预留固定数量的 2 MiB / 1 GiB 页，应用通过 `mmap(... MAP_HUGETLB)` 或 `shmget(... SHM_HUGETLB)` 显式申请。这条路径完全绕开 `khugepaged` 和 compaction，没有运行时合并/拆分的延迟尖峰。代价是预留的内存被永久 lock 住，不能再被普通 4 KiB 分配使用。
+> **真正需要确定性大页的场景用 HugeTLB（`hugetlbfs`）而不是 THP**：`hugetlbfs` 由管理员预留固定数量的 2 MiB / 1 GiB 页，应用通过 `mmap(addr, len, prot, flags | MAP_HUGETLB, fd, offset)` 或 `shmget(key, size, flags | SHM_HUGETLB)` 显式申请。这条路径完全绕开 `khugepaged` 和 compaction，没有运行时合并/拆分的延迟尖峰。代价是预留的内存被永久 lock 住，不能再被普通 4 KiB 分配使用。
 
 ```bash
 cat /sys/kernel/mm/transparent_hugepage/enabled

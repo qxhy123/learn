@@ -129,7 +129,7 @@ flowchart LR
     A["counter[0] (Core 0 写)"]
     B["counter[1] (Core 1 写)"]
     C["counter[2] (Core 2 写)"]
-    D["...其余 5 个 counter"]
+    D["counter[3..7] (其余 5 个 counter)"]
   end
   C0[Core 0] -->|"lock xadd"| A
   C1[Core 1] -->|"lock xadd"| B

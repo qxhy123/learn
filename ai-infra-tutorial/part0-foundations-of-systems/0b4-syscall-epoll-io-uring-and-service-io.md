@@ -1,6 +1,6 @@
 # 第 0b4 章：Syscall、Epoll、io_uring 与 IO 服务模型
 
-> **关联章节**：本章是 [第 0b 章](./0b-memory-virtual-memory-and-io.html) 的用户态/内核态与服务 IO 模型拆分篇。Page Cache、dirty page 和 Huge Pages 见 [0b2](./0b2-page-cache-writeback-and-huge-pages.html)，NUMA、PCIe、DMA 与 pinned memory 见 [0b3](./0b3-numa-pcie-dma-and-pinned-memory.html)，文件系统内部机制见 [0c](./0c-filesystems-and-storage-internals.html)，网络协议栈见 [0d](./0d-network-stack-fundamentals.html)。
+> **关联章节**：本章是 [第 0b 章](./0b-memory-virtual-memory-and-io.md) 的用户态/内核态与服务 IO 模型拆分篇。Page Cache、dirty page 和 Huge Pages 见 [0b2](./0b2-page-cache-writeback-and-huge-pages.md)，NUMA、PCIe、DMA 与 pinned memory 见 [0b3](./0b3-numa-pcie-dma-and-pinned-memory.md)，文件系统内部机制见 [0c](./0c-filesystems-and-storage-internals.md)，网络协议栈见 [0d](./0d-network-stack-fundamentals.md)。
 
 ## 1. 第一性原理拆解 + 学习大纲
 

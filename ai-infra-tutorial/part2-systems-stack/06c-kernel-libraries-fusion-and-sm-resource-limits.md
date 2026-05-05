@@ -606,13 +606,13 @@ HBM 带宽很高，但前提是 warp 内线程访问模式规整。coalescing �
 thread 0 -> a[0]
 thread 1 -> a[1]
 thread 2 -> a[2]
-...
+thread 31 -> a[31]
 
 坏：
 thread 0 -> a[index[0]]
 thread 1 -> a[index[1]]
 thread 2 -> a[index[2]]
-...
+thread 31 -> a[index[31]]
 index 无规律
 ```
 

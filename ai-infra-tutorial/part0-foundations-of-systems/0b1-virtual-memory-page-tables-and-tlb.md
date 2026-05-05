@@ -82,7 +82,7 @@ mmap_warmup_time
 
 ## 2. 虚拟内存：地址空间是幻觉，但这个幻觉很有用
 
-每个 Linux 进程都有自己的虚拟地址空间。用户程序里看到的指针，例如 `0x7f...`，不是 DRAM 上的真实地址，而是虚拟地址。CPU 访问内存时，MMU 会把虚拟地址翻译成物理地址。
+每个 Linux 进程都有自己的虚拟地址空间。用户程序里看到的指针，例如 `0x7f8a12004000`，不是 DRAM 上的真实地址，而是虚拟地址。CPU 访问内存时，MMU 会把虚拟地址翻译成物理地址。
 
 | 概念 | 含义 | AI 场景 |
 |------|------|---------|
@@ -382,9 +382,9 @@ mmap 文件页通常通过 Page Cache 管理。多个进程 mmap 同一个只读
 
 ```text
 models/
-  sha256-abc.../model.safetensors
-  sha256-def.../model.safetensors
-  current -> sha256-def...
+  sha256-abc123/model.safetensors
+  sha256-def456/model.safetensors
+  current -> sha256-def456
 ```
 
 这样旧进程继续持有旧 inode，新进程加载新 inode，避免 mmap 文件被原地修改。

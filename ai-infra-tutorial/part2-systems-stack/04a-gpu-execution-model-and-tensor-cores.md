@@ -163,7 +163,7 @@ SIMT 的关键是：程序员写的是标量线程，硬件执行时把线程打
 flowchart TB
   Kernel[CUDA kernel grid] --> B0[Thread Block 0]
   Kernel --> B1[Thread Block 1]
-  Kernel --> B2[Thread Block ...]
+  Kernel --> B2[Thread Block 2]
   B0 --> W0[Warp 0: thread 0-31]
   B0 --> W1[Warp 1: thread 32-63]
   B0 --> W2[Warp 2: thread 64-95]
@@ -213,7 +213,7 @@ LLM 里常见的 divergence 来源包括 variable-length sequence mask、ragged 
 warp 内线程如果访问连续地址，硬件能把多个线程的 load/store 合并成少量内存事务；如果访问完全散乱的地址，就会产生更多事务，执行单元等数据。
 
 ```text
-好：thread 0 读 a[0], thread 1 读 a[1], ..., thread 31 读 a[31]
+好：thread 0 读 a[0], thread 1 读 a[1], thread 31 读 a[31]
 坏：thread 0 读 a[idx0], thread 1 读 a[idx1], idx 完全随机
 ```
 
@@ -267,7 +267,7 @@ cycle 0: warp A 发出 load，开始等待
 cycle 1: scheduler 切到 warp B，执行 MMA
 cycle 2: scheduler 切到 warp C，执行 add
 cycle 3: warp B 等依赖，切到 warp D
-...
+cycle 4: warp A 数据返回，重新进入 ready 队列
 若没有其他 ready warp，SM 执行槽空转
 ```
 

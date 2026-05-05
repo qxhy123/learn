@@ -410,7 +410,7 @@ PyTorch 中最常见写法：
 ```python
 loader = DataLoader(
     dataset,
-    batch_size=...,
+    batch_size=32,
     num_workers=8,
     pin_memory=True,
     persistent_workers=True,
@@ -549,7 +549,7 @@ ib_read_bw  -d <mlx5_dev> --use_cuda=<gpu_id> <server>
 NCCL 相关观察：
 
 ```bash
-NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun ...
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun --nproc_per_node=8 train.py
 ```
 
 不同 NCCL/OFED/CUDA 版本日志字段会变化，不要只依赖某个字符串。更稳的方式是结合拓扑、模块、带 CUDA buffer benchmark、NCCL timeline 和网络计数器。
@@ -670,7 +670,7 @@ torch.cuda.synchronize()
 
 同一批 8 GPU 机器，跨节点 all-reduce 吞吐低于预期。单机 GPU-GPU NVLink 正常，网络端口也能跑满普通 host memory RDMA benchmark，但 NCCL 多机训练慢。
 
-`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun ...` 显示使用 IB/RDMA，但吞吐仍低。团队怀疑网络交换机拥塞。
+`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun --nproc_per_node=8 train.py` 显示使用 IB/RDMA，但吞吐仍低。团队怀疑网络交换机拥塞。
 
 ### 8.2 采拓扑：GPU 和 NIC 绑定错 rail
 
@@ -797,7 +797,7 @@ ibv_devinfo
 ibstat
 ibdev2netdev
 nvidia-smi topo -m
-NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun ...
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH torchrun --nproc_per_node=8 train.py
 ```
 
 带 CUDA buffer 分组合测：
