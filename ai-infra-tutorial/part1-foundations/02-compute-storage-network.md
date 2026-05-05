@@ -6,6 +6,8 @@
 
 很多 AI 系统问题看起来发生在模型层，真正的瓶颈却早已在算力、存储和网络之间决定了上限。真正成熟的 AI 工程分析，不是先问“模型还能不能再优化”，而是先问：**数据有没有按时送到？算力有没有被喂饱？通信有没有拖住整体？系统有没有被最慢的一段卡死？**
 
+本章的定位是桥接章：它不是模型教程，也不在这里展开 CPU cache、Page Cache、PCIe、NVMe、RDMA、NCCL 或 CUDA kernel 的完整机制。后续 Part 0 和 Part 2 会分别解释这些机制；这里先建立一套证据优先的 resource chain（资源链）诊断语言。遇到慢训练、慢推理或扩卡收益差，先把现象写成 `EvidenceBundle`，用 `perf`、`fio`、H2D copy 时间、NCCL trace、队列时间和 p99 等证据确认 critical path / 关键路径，再用 `threshold` 和 `retest` 判断改动是否真的移除了 resource bottleneck。
+
 把所有术语先拿掉，只保留不可化简的问题：一个 AI 任务要把输入数据变成输出结果，必然要经历“取数、搬运、计算、同步、保存或返回”这些物理动作。每个动作都占用一种有限资源：存储负责把字节交出来，CPU 和内存负责解码、拼 batch、调度和缓存，PCIe / NVLink 负责把数据送到设备，GPU 负责高密度矩阵计算，网络负责跨机器同步或跨服务调用。只要其中一段供给速度低于后续消费速度，后续资源就会等待；只要其中一段尾延迟变大，端到端体验就会被拉长。这个问题不能被“更大模型”“更强 GPU”“更多机器”单独解决，因为系统吞吐不是某个部件的最大值，而是依赖链路上可持续供给能力的最小值。
 
 因此，本章的核心不是背诵“算力、存储、网络”三个名词，而是建立一个资源守恒视角：计算不会凭空发生，GPU 每算一次都需要权重、激活和输入数据已经在正确的显存位置；分布式训练每推进一步都需要各 rank 的梯度或参数状态达到一致；在线推理每返回一个 token 都要经过队列、模型服务、下游服务和客户端连接。所谓“GPU 利用率低”，本质上是昂贵计算单元处在等待状态；所谓“扩卡收益差”，本质上是新增计算能力被通信、同步、慢节点或调度开销吃掉；所谓“p99 很差”，本质上是某些请求走到了更慢的存储、网络或队列路径。先把这些物理约束看清楚，后面的机制才有意义。
@@ -78,6 +80,21 @@ mindmap
       端到端 trace
 ```
 
+同一条链路也可以画成可以采证的流水线。后续章节会深入每一段的机制；本章只要求你能把观察点放到正确位置：
+
+```mermaid
+flowchart LR
+  A[数据集 / 在线请求] --> B[存储读取<br/>fio / IOPS / latency]
+  B --> C[CPU + DRAM<br/>perf / decode / Page Cache]
+  C --> D[H2D / PCIe / NUMA<br/>copy time / pinned memory]
+  D --> E[GPU 计算<br/>utilization / SM / HBM]
+  E --> F[网络同步或下游调用<br/>NCCL / RTT / p99]
+  F --> G[checkpoint 写回或响应返回<br/>write bw / TTFT / TPOT]
+  B -. resource bottleneck .-> H[关键路径 / 木桶效应]
+  D -. resource bottleneck .-> H
+  F -. resource bottleneck .-> H
+```
+
 ### 导 — 读完本章你应该能回答
 
 1. 当 GPU utilization 只有 30% 时，如何判断它是在等数据、等 H2D、等通信，还是 batch / kernel 本身太小？
@@ -98,9 +115,10 @@ mindmap
 2. 理解 AI 训练和推理为什么本质上都是一条资源链路。
 3. 用“木桶效应”和“关键路径”判断系统吞吐上限。
 4. 理解 GPU 利用率低、step time 抖动、推理尾延迟高背后的常见资源原因。
-5. 能用简单公式拆解训练 step 和推理请求的耗时组成。
+5. 能用简单公式拆解训练 step 和推理请求的耗时组成，并用阈值判断瓶颈是否成立。
 6. 能识别数据加载、显存、通信、checkpoint、KV Cache、下游服务等常见瓶颈。
-7. 建立“先看资源，再看模型；先拆链路，再谈优化”的工程习惯。
+7. 能写出一个最小 `EvidenceBundle` 和 `CapacityLedger`，把现象、证据、阈值和复测结果放在同一张表里。
+8. 建立“先看资源，再看模型；先拆链路，再谈优化”的工程习惯。
 
 ---
 
@@ -145,6 +163,70 @@ GPU 计算
 ```
 
 这条链路上每一段都可能成为瓶颈。**模型越大、数据越多、并发越高，系统问题就越不像一个单纯的模型问题，而越像资源调度问题。**
+
+### 2.0.1 EvidenceBundle：先把瓶颈写成可验证证据
+
+排查资源瓶颈时，推荐先写一个很小的 `EvidenceBundle`。它的作用不是替代 profiler 报告，而是避免“看起来像 GPU 慢”这种模糊判断，把现象、证据、阈值、处置和复测绑定在一起。
+
+| 字段 | 写什么 | 例子 |
+|---|---|---|
+| `symptom` | 用户或训练任务看到的现象 | GPU utilization 周期性掉到 20%，step time p95 是 p50 的 2.4 倍 |
+| `segment` | 资源链中的候选段 | storage、CPU preprocess、H2D、GPU compute、NCCL sync、checkpoint、downstream |
+| `evidence` | 直接证据，不写猜测 | `fio` 顺序读只有 800MB/s；`perf top` 显示解码函数占 CPU；H2D copy 45ms；NCCL AllReduce p95 180ms |
+| `threshold` | 判定瓶颈成立的阈值 | 目标 step 需要 2GB/s；GPU idle 超过 25%；通信占 step time 超过 30%；p99 超过 SLA 2 倍 |
+| `critical_path` | 是否在关键路径 / 关键路径上 | H2D 在 forward 前串行等待，所以是 critical path |
+| `action` | 一次只改一个主要变量 | 数据打包成 shard；开启 pinned memory；调整 NCCL topology；下游加 timeout |
+| `retest` | 复测指标和通过条件 | 同样 batch、同样并发复测；step time p95 降到 1.2 倍以内；GPU utilization 稳定超过 70% |
+
+一个最小记录可以这样写：
+
+```text
+EvidenceBundle:
+  symptom: 8 卡图像训练 GPU utilization 在 90% 和 20% 间周期性摆动
+  segment: storage + CPU preprocess + H2D
+  evidence: fio 顺序读 0.8GB/s；perf 显示 jpeg decode 占 CPU 42%；H2D copy p95 38ms
+  threshold: 目标 1s step 需要稳定 2GB/s，H2D 不应超过 step time 的 5%
+  critical_path: dataloader queue 为空时 GPU forward 等待，属于关键路径
+  action: shard 数据 + 本地 NVMe 缓存 + pinned memory + worker/NUMA 绑定
+  retest: 同一训练配置跑 500 step，GPU utilization p50 > 75%，step time p95/p50 < 1.2
+```
+
+这个格式故意朴素。真正重要的是：瓶颈必须有证据、有阈值、有复测，而不是凭直觉命名。
+
+### 2.0.2 CapacityLedger：把资源链写成容量账本
+
+`CapacityLedger` 是一张容量账本，用来回答“哪一段供给能力低于目标需求”。它不要求你从第一天就精确到硬件计数器，但要把 compute、storage、memory 和 network 放到同一张表里，避免只看一个资源。
+
+| 资源段 | 需求怎么算 | 供给怎么看 | 典型证据 | 常见阈值 / 决策规则 |
+|---|---|---|---|---|
+| Storage read | `bytes_per_step / target_step_time` | 本地盘、并行文件系统或对象存储的稳定吞吐 | `fio`、dataloader wait、IO latency、Page Cache hit | 供给 < 需求的 1.2 倍时，先怀疑数据供给 |
+| CPU / DRAM | decode、tokenize、augment、batch 拼接时间 | CPU core、内存带宽、Page Cache、NUMA locality | `perf`、CPU utilization、context switch、major fault | CPU 长期满载且 GPU idle，先查 preprocess |
+| H2D / PCIe | `batch_bytes / copy_bandwidth` | PCIe / NVLink、pinned memory、DMA overlap | profiler H2D copy、pinned memory、NUMA 拓扑 | H2D 串行占 step time > 5% 且 GPU 等待，先查搬运 |
+| GPU compute / HBM | FLOPs、activation、KV Cache、HBM bytes | SM utilization、Tensor Core、显存容量和带宽 | GPU utilization、SM occupancy、HBM bandwidth、OOM | utilization 高且队列不空，才优先看算子和显存 |
+| Network / NCCL / downstream | gradients、activations、RPC bytes、p99 | NIC bandwidth、RTT、拓扑、拥塞和重试 | NCCL trace、RTT、packet loss、服务 p99 | sync 或下游 p99 超过预算，就在关键路径上治理 |
+| Checkpoint / writeback | checkpoint bytes / interval | 写入带宽、元数据能力、后台上传能力 | write throughput、fsync time、checkpoint duration | 周期性卡顿和写回重叠时，先降阻塞写入 |
+
+可以用下面的决策规则做第一轮判断：
+
+$$
+\text{resource headroom}_i = \frac{\text{sustainable supply}_i}{\text{required demand}_i}
+$$
+
+$$
+\text{bottleneck} = \arg\min_i(\text{resource headroom}_i),\quad \text{当 } \min_i(\text{resource headroom}_i) < 1.2
+$$
+
+这里的 1.2 不是永恒真理，而是给抖动、尾延迟和测量误差留下的工程余量。若某段 `headroom < 1`，它已经无法满足目标吞吐；若 `1 <= headroom < 1.2`，上线或多机并发后也很容易变成最短板。
+
+一个训练容量账本示例：
+
+| 项目 | 目标需求 | 已测供给 | headroom | 判断 |
+|---|---:|---:|---:|---|
+| storage read | 2.0GB/s | 0.8GB/s | 0.40 | 明确瓶颈，先做 shard / cache |
+| CPU preprocess | 500 batch/s | 430 batch/s | 0.86 | 也在关键路径，需看 `perf` |
+| H2D | 1.0GB/s | 10GB/s | 10.00 | 容量够，但仍要看是否与 compute 重叠 |
+| GPU compute | 450 batch/s | 900 batch/s | 2.00 | 不是当前最短板 |
+| NCCL sync | 120ms budget | 80ms p95 | 1.50 | 暂不优先 |
 
 ---
 
