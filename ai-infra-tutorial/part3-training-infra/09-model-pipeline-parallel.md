@@ -647,6 +647,54 @@ rank3 owns virtual stages 3 and 7
 
 zero bubble 类调度的目标是把传统 backward 拆成更细的可调度单元，例如 input-gradient backward、weight-gradient backward、optimizer update，把原本空闲的槽填上。平台侧不需要自己实现算法，但必须知道它改变证据形态：Nsight 中不再是整齐的 F/B/W 块，checkpoint 和 profiler tag 必须能识别 micro-op。
 
+**Zero Bubble Pipeline 工程细节**
+
+Zero Bubble（ZB1P）的关键创新是把传统 backward 拆分为两个可独立调度的计算单元：
+
+```text
+B-pass（backward input gradient）：
+  计算 dL/dX（输入梯度），用于向前一个 stage 传播梯度。
+  必须在前一 stage 的 B-pass 开始前完成（依赖链不变）。
+
+W-pass（backward weight gradient）：
+  计算 dL/dW（权重梯度），累积到 gradient buffer。
+  不需要立即完成——只要在 optimizer step 前完成即可。
+  → 可以推迟到 pipeline warmup 的空槽中执行，填充原本空闲的 stage。
+```
+
+**工程代价**
+
+| 代价项 | 说明 |
+|---|---|
+| Activation 保留时间延长 | W-pass 推迟时，对应 forward 的 activation 必须保留到 W-pass 执行完毕。推迟越多，activation 常驻量越高，可能超过标准 1F1B |
+| Optimizer step 时序 | 调度器必须跟踪每个 microbatch 的 W-pass 状态，确保全部完成才触发 optimizer step |
+| Profiler 证据形态变化 | Nsight 中不再是整齐的 F/B/W 块；checkpoint 和 profiler tag 必须能识别 B-pass 和 W-pass 两类 micro-op |
+
+**框架支持现状（2026-05）**
+
+```text
+Megatron-Core：实验分支，可用 --pipeline-schedule ZB1P 触发
+  → 需要验证 checkpoint metadata 是否记录 W-pass 状态
+
+DeepSeek-V3 训练：自研实现，1024 GPU 规模下验证
+  → 报告 bubble 从 ~10% 降到 ~1%；对 PP=16、m=64 场景收益最大
+
+PyTorch：暂无原生支持，需要外部 pipeline schedule 库
+  → 使用前必须做 20 step loss continuity 对比（B/W 拆分后梯度累积正确性）
+```
+
+**何时值得引入**
+
+```text
+Zero Bubble 收益最大的场景：
+  PP 阶段数 ≥ 8，microbatch 数 m 受限（无法通过增大 m 降低 bubble）。
+
+不值得引入的场景：
+  m >> PP（bubble 已 < 5%，增加实现复杂度不划算）；
+  框架尚无原生支持（需要自行实现 B/W 拆分，引入正确性风险）；
+  activation 内存已经紧张（W-pass 推迟会进一步增加 activation 驻留）。
+```
+
 ### 4.5 activation placement
 
 activation placement 是 PP/SP/CP 中经常被低估的容量问题。需要明确：
