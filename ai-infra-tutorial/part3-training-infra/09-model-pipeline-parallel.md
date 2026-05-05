@@ -1117,6 +1117,89 @@ step_time 高 → 拆分 profiler：
 
 ## 8. 策略选择：模型大小、序列长度、拓扑、框架和恢复
 
+### 8.0 Rank Mesh 推导：从约束到配置的五步流程
+
+第 9/10 节的 70B/405B worked example 直接给出配置结论。本节补充推导过程，使同样的方法可迁移到其他模型和集群。
+
+**五步推导框架**
+
+```text
+Step 1：计算可用 HBM 预算
+  available_hbm = gpu_hbm × (1 - fragmentation_ratio - comm_buffer_ratio)
+  fragmentation_ratio ≈ 0.10-0.15（经验值；实测用 memory snapshot 校准）
+  comm_buffer_ratio ≈ 0.05-0.08（NCCL、FSDP AllGather buffer、PP buffer）
+
+Step 2：确定最小 TP（解决单层 GEMM 峰值）
+  单层 activation peak（BF16，hidden 比例项，无 AC）≈ batch × seq × hidden × 18 bytes（见 §4.1.1）
+  除以 TP 后 ≤ available_hbm × 0.25（留给其他项）→ 确定 min_tp
+
+  GQA 约束（见 §5.1 GQA 专项）：TP 必须整除 kv_heads
+  → 最终 TP = max(min_tp，满足 GQA 的最小合法值) 且 ≤ 节点 GPU 数
+
+Step 3：确定最小 PP（解决整网层数和状态）
+  per_rank_params = total_params × 2 bytes / TP      （BF16，不含 optimizer）
+  per_rank_optim  = total_params × 12 bytes / (TP × ZeRO_degree × PP)（AdamW，ZeRO 切分后）
+  per_rank_activ  = num_layers/PP × batch × seq × hidden × AC_factor_bytes（见 §4.1.1 AC 表）
+
+  若 per_rank_params + per_rank_optim + per_rank_activ > available_hbm：
+    增大 PP，直到满足预算；min_pp = ceil(合计 / available_hbm) 取上界
+
+Step 4：计算 DP
+  dp = world_size / (TP × PP)
+  验证 dp ≥ 1；dp 太小（如 dp=1）意味着没有样本并行，可考虑减少 PP 或 TP
+
+Step 5：验证 bubble 和带宽
+  microbatch_count m = global_batch / (micro_batch_size × dp)
+  必须保证 m ≥ PP（1F1B 稳态条件，否则 bubble 恶化，见 §4.3.1）
+
+  bubble（1F1B） = (PP-1) / m
+  若 bubble > 20%：优先增加 m（增大 global_batch 或降 micro_batch_size）；
+                   次选 interleaved pipeline；最后再考虑减少 PP
+
+  TP 带宽（节点内 NVSwitch）：用 §4.2.1 公式估算 per-call 时间，与 GEMM 时间对比
+  PP 带宽（跨节点 IB）：用 §4.3.4 公式估算 per-boundary 时间，与 stage compute 对比
+```
+
+**推导示例：180B dense 模型，256 GPU，400G IB**
+
+```text
+输入：
+  180B dense，hidden=12288，layers=96，Q heads=96，KV heads=8，ffn=4×hidden
+  集群：32 nodes × 8 H100 80GB（256 GPU），节点内 NVSwitch，跨节点 400G IB
+  目标：seq=8192，BF16，AdamW，global_batch=2048
+
+Step 1：available_hbm = 80 GB × (1 - 0.12 - 0.06) = 66 GB
+
+Step 2：KV heads=8 → TP ∈ {1,2,4,8}；min_tp 检查：
+  单层 activation（hidden 比例项，无 AC，TP=1）= 1 × 8192 × 12288 × 18 bytes ≈ 2.2 GB
+  → TP=1 时单层 activation 2.2 GB < 66 GB × 0.25 = 16.5 GB，层级上 TP=1 可行
+  但整网状态（见 Step 3）需要 TP≥4；选 TP=8（最大合法值，节点内最优）
+
+Step 3：per_rank_params（TP=8，PP=1）= 180B × 2 / 8 = 45 GB
+  per_rank_optim（ZeRO-1，PP=1，256 DP）= 180B × 12 / 256 = 8.4 GB（optimizer shard）
+  per_rank_activ（无 PP，AC=selective+FA，8 bytes/elem）= 96 × 8192 × 12288 × 8 bytes ≈ 77 GB
+  合计 = 45 + 8.4 + 77 = 130.4 GB >> 66 GB → 需要 PP
+
+  尝试 PP=8：
+    per_rank_params = 45 × (12/96) = 5.6 GB（每 rank 12 层）
+    per_rank_activ  = 12 × 8192 × 12288 × 8 bytes ≈ 9.7 GB
+    合计 ≈ 5.6 + 8.4 + 9.7 + comm_buffer(5 GB) = 28.7 GB ✓（< 66 GB）
+
+Step 4：DP = 256 / (8 × 8) = 4
+
+Step 5：m = 2048 / (1 × 4) = 512；bubble = (8-1)/512 = 1.4% ✓（m >> PP）
+
+  TP 通信估算（per call）= 2 × (7/8) × 8192 × 12288 × 2 = 352 MB
+    NVSwitch 600 GB/s → 0.59 ms per call，96 层 × 2 = 192 calls ≈ 113 ms 理论上界
+    实际 GEMM 时间远超 0.59 ms/call，几乎完全被掩盖 ✓
+
+  PP 边界通信（TP=8 时 hidden/8 = 1536）：
+    pp_boundary = 1 × 8192 × 1536 × 2 = 25 MB per boundary
+    400G IB（50 GB/s）→ 0.5 ms per boundary，7 个 boundary ≈ 3.5 ms exposed（可接受）✓
+
+结论：TP=8, PP=8, DP=4 是可行起点。下一步：HBM dry-run（preflight）+ nccl-tests。
+```
+
 ### 8.1 决策树
 
 ```mermaid
