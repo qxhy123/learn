@@ -253,15 +253,17 @@ GPU datasheet 是选型输入，不是选型结论。最危险的做法是把不
 
 下表用公开资料的常见数量级建立工程直觉，重点是定位差异，不是替代正式 datasheet。采购前应回到具体服务器形态、power cap、驱动版本和供应商配置。
 
-| 设备 | 典型显存 | HBM 带宽数量级 | 互联形态 | 更适合 | 主要边界 |
-|------|----------|----------------|----------|--------|----------|
-| A100 40GB PCIe | 40 GB | ~1.5 TB/s | PCIe，少量场景有桥接 | 成熟推理、开发、成本敏感微调 | 显存偏小，TP 和大模型推理受限 |
-| A100 80GB SXM | 80 GB | ~2 TB/s | NVLink / NVSwitch 节点 | 稳定训练、传统大模型推理 | 算力和带宽落后 Hopper / Blackwell |
-| L40S | 48 GB GDDR6 | 低于 HBM 数据中心训练卡 | PCIe | 视觉推理、小模型服务、embedding、开发 | 无 HBM，训练大模型和长上下文 LLM 不占优 |
-| H100 PCIe | 80 GB | ~2 TB/s 级 | PCIe | 单卡推理、成本较受控的 Hopper 资源 | 互联弱于 SXM，8 卡 TP 不应按 HGX 假设 |
-| H100 SXM | 80 GB | ~3.3 TB/s | NVLink / NVSwitch | 主流大模型训练、高性能推理 | 显存对长上下文和 70B+ 推理仍紧张 |
-| H200 SXM | 141 GB | ~4.8 TB/s | NVLink / NVSwitch | 长上下文推理、显存敏感训练、decode-heavy 服务 | BF16 算力与 H100 同级，收益主要来自 HBM |
-| B200 / GB200 | 180GB+ 级 | ~8 TB/s 级 | 更高带宽 NVLink，GB200 可进入 rack-level NVLink domain | 新一代训练、超大模型推理、MoE | 功耗、液冷、供应、软件版本和调度边界更复杂 |
+**数字口径标签**：`vendor-public`，规格核对日期 `2026-05-05`；显存和 HBM 带宽按单 GPU 或该行明确的产品形态摘录，不是实测吞吐；workload shape = `N/A`。来源口径：NVIDIA A100 datasheet（Jun21）、NVIDIA H100/H200 产品规格页、NVIDIA DGX/HGX B200 产品规格页；L40S 用 NVIDIA 产品规格中的 48 GB GDDR6 形态做类别对比，不把 GDDR6 带宽换算成 HBM 等价能力。
+
+| 设备 | 典型显存 | HBM / 显存带宽数量级 | 互联形态 | 数字口径 | 更适合 | 主要边界 |
+|------|----------|----------------------|----------|----------|--------|----------|
+| A100 40GB PCIe | 40 GB | ~1.5 TB/s | PCIe，少量场景有桥接 | vendor-public，A100 datasheet，per-GPU，shape=N/A | 成熟推理、开发、成本敏感微调 | 显存偏小，TP 和大模型推理受限 |
+| A100 80GB SXM | 80 GB | ~2 TB/s | NVLink / NVSwitch 节点 | vendor-public，A100 datasheet，per-GPU，shape=N/A | 稳定训练、传统大模型推理 | 算力和带宽落后 Hopper / Blackwell |
+| L40S | 48 GB GDDR6 | 低于 HBM 数据中心训练卡 | PCIe | vendor-public，产品形态标签，非 HBM，shape=N/A | 视觉推理、小模型服务、embedding、开发 | 无 HBM，训练大模型和长上下文 LLM 不占优 |
+| H100 PCIe | 80 GB | ~2 TB/s 级 | PCIe | vendor-public，H100 产品规格，per-GPU，shape=N/A | 单卡推理、成本较受控的 Hopper 资源 | 互联弱于 SXM，8 卡 TP 不应按 HGX 假设 |
+| H100 SXM | 80 GB | ~3.35 TB/s | NVLink / NVSwitch | vendor-public，H100 产品规格，per-GPU，shape=N/A | 主流大模型训练、高性能推理 | 显存对长上下文和 70B+ 推理仍紧张 |
+| H200 SXM | 141 GB | ~4.8 TB/s | NVLink / NVSwitch | vendor-public，H200 产品规格，per-GPU，shape=N/A | 长上下文推理、显存敏感训练、decode-heavy 服务 | BF16 算力与 H100 同级，收益主要来自 HBM |
+| B200 / GB200 | B200 180 GB 级；DGX B200 8 GPU 合计 1,440 GB | B200 约 8 TB/s 级；DGX B200 合计 64 TB/s | 更高带宽 NVLink，GB200 可进入 rack-level NVLink domain | vendor-public，DGX/HGX B200 规格，per-GPU 或 system 需分清，shape=N/A | 新一代训练、超大模型推理、MoE | 功耗、液冷、供应、软件版本和调度边界更复杂 |
 
 #### 4d.4.1 不能只横向比单卡
 

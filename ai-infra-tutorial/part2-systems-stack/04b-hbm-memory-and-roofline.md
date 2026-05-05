@@ -689,7 +689,7 @@ LayerNorm 这类 kernel 的上限大致跟有效 HBM 带宽走，而不是跟 Te
 
 6. 一个 13B 模型用 BF16 Adam 训练，按 16 bytes/param 粗算参数状态需要多少显存？如果用 8 卡 FSDP 均分，每卡参数状态约多少？
 7. 某 70B BF16 推理模型 TP=2 部署在 2×80GB GPU 上，每卡权重约 70GB。假设每卡还需要 5GB runtime/headroom，可用于 KV 的显存还剩多少？这对 8K 上下文并发意味着什么？
-8. A100 80GB 的 machine balance 约 156 ops/byte，H100 SXM 约 295 ops/byte。一个 AI=80 ops/byte 的 kernel 在两张卡上都更接近哪类瓶颈？为什么换 H100 后提速可能不跟 TFLOPS 成比例？
+8. 口径标签：`illustrative exercise`，规格核对日期 `2026-05-05`，按 `vendor-public dense BF16 Tensor Core peak / vendor-public HBM bandwidth` 粗算，shape=`N/A`。A100 80GB 的 machine balance 约 `312 TFLOPS / 2.0 TB/s ≈ 156 ops/byte`，H100 SXM 约 `989 TFLOPS / 3.35 TB/s ≈ 295 ops/byte`。一个 AI=80 ops/byte 的 kernel 在两张卡上都更接近哪类瓶颈？为什么换 H100 后提速可能不跟 TFLOPS 成比例？
 9. 一个训练任务 OOM，但 `allocated` 明显低于 `reserved`。这可能说明什么？你会如何验证是否为碎片或 shape 抖动？
 10. 解释 FlashAttention 为什么既可能降低显存，又可能提升速度。它减少的是哪些中间状态或内存往返？
 

@@ -359,7 +359,7 @@ Tensor Core 喜欢规整 tile。矩阵维度、数据布局、对齐和 batch �
 
 ### 04a.6.3 Hopper 的 WGMMA 与 TMA：H100 算力兑现的关键
 
-如果只看 datasheet TFLOPS，H100 比 A100 涨 3 倍多。但实际 LLM 训练 / 推理 kernel 在 H100 上的 speedup 经常远高于 3x（如 FlashAttention-3 vs FA-2 在 H100 上吞吐翻倍以上）。差距来自两个 Hopper 引入的核心硬件机制：
+如果只看 datasheet TFLOPS，H100 相对 A100 的峰值提升只是上限口径，不能直接推出 LLM 训练 / 推理 kernel 的端到端加速。**口径标签**：`vendor-public`，规格核对日期 `2026-05-05`，H100/A100 峰值来自 NVIDIA 公开规格，shape=`N/A`；FlashAttention-3 的 1.5-2.0x 是 `paper-reported microbenchmark`，来源为 NeurIPS 2024 / arXiv 2024-07-11，GPU=H100 SXM5，论文固定参数示例包含 `{batch,seqlen,nheads,hdim}={4,8448,16,128}`，不是完整模型端到端吞吐。差距来自两个 Hopper 引入的核心硬件机制：
 
 **1. WGMMA（Warp Group MMA）—— 单条指令异步驱动整个 warp group**
 
@@ -387,7 +387,7 @@ TMA 把传统上消耗 warp 时间和寄存器的"搬数据"工作交给独立�
 - **B200 / Blackwell** 进一步引入了 5th-gen Tensor Core 和 TMA 增强（cluster-wide TMA、distributed shared memory），CUTLASS 4.x / FlashAttention-4 / CuDNN frontend 9.x 都在跟进。
 
 > [!NOTE]
-> **不讲 WGMMA / TMA，就解释不了"为什么 H100 标称 3x，但 LLM kernel 实测 5-10x"**。这两个机制是 Hopper 这一代算力真正兑现的关键，比 TF32 / BF16 这些精度变化更影响实际 throughput。
+> **不讲 WGMMA / TMA，就解释不了为什么部分 Hopper attention microbenchmark 能明显超过朴素 datasheet 比值的直觉。** 这两个机制是 Hopper 这一代算力真正兑现的关键，但任何“几倍提升”都必须绑定 GPU 型号、精度、shape、kernel 版本和端到端 retest。
 
 ## 04a.7 低精度口径：训练、推理和 datasheet 不是一件事
 
@@ -401,17 +401,19 @@ TMA 把传统上消耗 warp 时间和寄存器的"搬数据"工作交给独立�
 
 ### 04a.7.1 常见精度格式
 
+**表格口径标签**：生态状态按 `ecosystem-checkpoint`，核对日期 `2026-05-05`；硬件峰值按 `vendor-public`，workload shape=`N/A`；推理/训练“常见性”只表示工程采用趋势，不等同于当前项目可用。上线前必须核对 CUDA、driver、cuBLAS/cuDNN/CUTLASS、TensorRT-LLM、vLLM、Transformer Engine、ModelOpt 和内核仓库的具体版本。
+
 | 格式 | 大致特点 | 训练常见性 | 推理常见性 | 主要风险 |
 |---|---|---|---|---|
 | FP32 | 动态范围和精度高 | 现在多用于 master weight、特殊算子或验证 | 少 | 成本高 |
 | TF32 | FP32 范围、较低尾数，走 Tensor Core | NVIDIA 上常用于兼容 FP32 训练加速 | 少 | 数值和 FP32 不完全一致 |
 | FP16 | 位宽低、吞吐高，动态范围窄 | 常见，需要 loss scaling | 常见 | overflow/underflow |
 | BF16 | FP32 级指数范围、尾数较少 | 现代训练主力 | 常见 | 精度比 FP16 尾数更粗 |
-| FP8 | E4M3（推理 / forward）/ E5M2（训练 backward 梯度）两种格式 | Hopper 起原生 Tensor Core 支持，**训练（FP8 mixed precision）和推理已规模化生产** | 增长快，TRT-LLM / vLLM / Transformer Engine 全支持 | scale 管理（per-tensor / per-channel / per-block）、amax history、算子覆盖、质量验证 |
+| FP8 | E4M3（推理 / forward）/ E5M2（训练 backward 梯度）两种格式 | Hopper 起原生 Tensor Core 支持；生产可用性取决于 Transformer Engine / framework 版本和模型验证 | 增长快；TRT-LLM、vLLM、Transformer Engine 等路径需按版本核对 | scale 管理（per-tensor / per-channel / per-block）、amax history、算子覆盖、质量验证 |
 | INT8 | 整数量化，生态成熟 | 训练少（QAT 偶有），SmoothQuant W8A8 推理常见 | 很常见 | 校准、outlier、per-channel scale |
-| INT4 | 4-bit 整数（GPTQ / AWQ 权重量化为主） | 推理生产已普及，**A100/H100 上必须有 Marlin / Machete kernel 才有真实加速**（详见 §16.3.3） | 权重量化（W4A16）非常常见 | 校准误差、kernel 路径、激活仍是 FP16 |
-| FP4 (NV E2M1) | 4-bit 浮点，Blackwell 起原生 Tensor Core 支持 | **B200 / GB200 已产品级** dense ~4500 TFLOPS（约 BF16 的 4×）；TRT-LLM、vLLM 已有 FP4 推理路径 | 推理快速增长；训练（NVIDIA Modelopt + FP4 QAT）仍在早期 | 校准、kernel 覆盖、与 W4A16 GPTQ/AWQ 路径不同 |
-| MXFP8 / MXFP6 / MXFP4 | OCP microscaling 格式，per-block scale | Blackwell 原生支持，更细粒度 scale → 量化误差比 per-tensor FP8 小 | 推理早期采用，训练实验中 | 框架支持仍在演进，需要 MXLib / Transformer Engine |
+| INT4 | 4-bit 整数（GPTQ / AWQ 权重量化为主） | 训练少；A100/H100 上是否真实加速取决于 Marlin / Machete / TensorRT-LLM 等 kernel 路径 | 权重量化（W4A16）非常常见，但要按 shape retest | 校准误差、kernel 路径、激活仍是 FP16 |
+| FP4 (NV E2M1 / NVFP4) | 4-bit 浮点，Blackwell 起原生 Tensor Core 支持 | vendor-public 口径：DGX B200 8 GPU 系统 FP4 Tensor Core 为 72 PFLOPS dense / 144 PFLOPS sparse；折算到项目必须绑定系统形态和 sparsity 口径 | 推理快速增长；训练 / QAT 仍需按 ModelOpt、TRT-LLM、vLLM 和 kernel 版本核对 | 校准、kernel 覆盖、与 W4A16 GPTQ/AWQ 路径不同 |
+| MXFP8 / MXFP6 / MXFP4 | OCP microscaling 格式，per-block scale | Blackwell 支持相关 microscaling 路径；具体训练可用性按 Transformer Engine / MXLib 版本核对 | 推理早期采用，训练实验中 | 框架支持仍在演进，需要版本和质量门槛 |
 
 BF16 和 FP16 的差异值得单独记：
 
