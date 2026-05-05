@@ -81,6 +81,78 @@ mindmap
 6. 当 H100 的 BF16 算力远高于 A100，但某些任务提速不明显时，如何用 roofline 解释？
 7. 面对一次 OOM 或吞吐低的问题，如何判断该优先做量化、减 batch、activation checkpointing、KV cache 管理，还是 kernel fusion？
 
+### 本章拥有 / 不拥有
+
+本章拥有的是**容量与带宽证据链**：把模型状态写成 CapacityLedger，把 kernel 或阶段写成 Roofline 坐标，再用 `torch.profiler`、PyTorch memory summary、`nsys`、`ncu` 和 DCGM 区分容量失败、HBM bandwidth 失败、Tensor Core compute-bound 和 runtime 空洞。本章不拥有 GPU-GPU 拓扑、NCCL rail、MIG/MPS 隔离策略或 GPU selection 的完整治理；如果 OOM 来自跨 GPU shard 策略或性能问题来自 NVLink/NIC，应转到 04c/04d 和并行训练章节。
+
+### 04b CapacityLedger：先把字节写清楚
+
+所有显存判断先落到 CapacityLedger，而不是凭经验说“70B 应该能放下”。最小账本如下：
+
+```text
+TrainingCapacityLedger =
+  parameters
++ gradients
++ optimizer_state
++ master_weights
++ saved_activations
++ recompute_or_checkpoint_workspace
++ communication_buffers
++ cuda_graph_or_runtime_workspace
++ allocator_reserved_not_allocated
++ fragmentation_headroom
+
+InferenceCapacityLedger =
+  resident_weights
++ KV_cache
++ paged_kv_metadata
++ prefix_cache
++ runtime_workspace
++ cuda_graph_pool
++ allocator_reserved_not_allocated
++ fragmentation_headroom
+```
+
+常用 threshold：
+
+- 训练任务启动前，纸面峰值显存不应超过可用 HBM 的 80%-90%；长序列、动态 shape、eval/generation 混跑时更接近 80%。
+- 在线推理的稳态显存水位不应长期贴近 90%；如果 p95 watermark 高于 85% 且请求长度分布有长尾，应增加 admission control 或降低 max batched tokens。
+- `reserved >> allocated` 且 OOM 报错要求大块连续分配时，优先怀疑 fragmentation 或 shape 抖动，不要直接采购更大 GPU。
+- KV block free ratio 低于服务设定 threshold 时，应先拒绝/排队长请求，而不是等 CUDA OOM 把进程打掉。
+
+### 04b EvidenceBundle：容量、HBM、Roofline 的采集路径
+
+| 问题 | 证据 | 工具 / 命令 | 判断方式 |
+|------|------|-------------|----------|
+| 是否容量失败 | peak allocated、reserved、device used、KV block 使用率、OOM 栈 | PyTorch memory summary、`torch.cuda.max_memory_allocated()`、`nvidia-smi`、DCGM | CapacityLedger 超过 threshold 或峰值阶段明确 |
+| 是否带宽失败 | HBM bandwidth、memory pipe、dram throughput、L2 hit、load/store efficiency | `ncu` memory workload sections、DCGM memory counters | HBM 接近可达上限而 Tensor Core/SM 不高 |
+| 是否 runtime 空洞 | kernel 间隙、CPU launch、同步、H2D/D2H 拷贝 | `nsys`、`torch.profiler` | HBM 与 SM 都不高但时间线有空洞 |
+| 是否 compute-bound | Tensor Core utilization、MMA 指令、SM issue active | `ncu` compute sections | AI 高且接近 compute roof |
+| 是否拓扑牵连 | GPU-GPU/NIC 路径、NCCL collective 时间 | `nvidia-smi topo -m`、NCCL log | 跨 GPU 或跨节点阶段异常，转 04c |
+
+命令模板：
+
+```bash
+# 1. 保存端到端时间线：看 OOM 前后、prefill/decode、optimizer step 是否阶段分明
+nsys profile -t cuda,nvtx,osrt,cudnn,cublas -o memory_timeline python run_workload.py
+
+# 2. PyTorch 显存：同时记录 allocated、reserved、peak、allocator 行为
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python run_memory_profile.py
+
+# 3. 单 kernel Roofline：只对 nsys 中确认耗时的 kernel 下钻
+ncu --set full --target-processes all -o roofline_kernel python run_workload.py
+
+# 4. 设备侧 HBM、温度、功耗与 throttle
+dcgmi dmon -e 100,101,150,155,156,203,204
+```
+
+Retest criteria：
+
+- 容量修复必须用最坏请求长度、最大并发、真实 batch bucketing 和 warmup 后稳态重测；只用短 prompt 或固定小 batch 不算通过。
+- Roofline 优化必须同时报告 bytes/token 或 bytes/step、有效 HBM bandwidth、Tensor Core utilization 和端到端 TTFT/TPOT/step time。
+- 量化、paged KV、activation checkpointing、FlashAttention、fused optimizer 等动作改变的是不同账本项；retest 报告必须说明减少了哪个字节项或提高了哪个复用项。
+- driver、CUDA、PyTorch、推理引擎、batch scheduler、MIG profile、power cap 或 GPU SKU 变化后，CapacityLedger 和 BenchmarkProtocol 都要重新跑。
+
 ## 正文内容
 
 ### 4b.1 HBM 到底是什么：不是“显卡内存”的普通升级

@@ -74,6 +74,46 @@ mindmap
 6. TF32、FP16、BF16、FP8、INT8、INT4/FP4 各自适合什么阶段？训练和推理的低精度风险有什么不同？
 7. 读 GPU 算力指标时，如何统一 dense/sparse、per-GPU/system、输入精度/累加精度这些口径？
 
+### 本章拥有 / 不拥有
+
+本章拥有的是**执行证据链**：一个 tensor op 如何落到 kernel、kernel 如何落到 block/warp/SM/Tensor Core，以及如何用 `nsys`、`ncu`、`torch.profiler` 证明慢点在 launch、同步、Tensor Core 未命中、warp stall、register spill 还是访存不规整。本章只把 HBM、NVLink、NVSwitch、MIG/MPS 作为边界信号提到：如果证据显示问题主要是容量、Roofline、GPU-GPU 通信、GPU selection 或虚拟化隔离，应转到 04b、04c、04d 或第 6 章。
+
+### 04a EvidenceBundle：执行问题的证据路径
+
+执行问题不要从 `nvidia-smi` utilization 下结论。最小 EvidenceBundle 是一条从端到端指标到单 kernel 指标的链：
+
+| 层级 | 工具 / 命令 | 关键证据 | 判断 threshold |
+|------|-------------|----------|----------------|
+| 端到端 | 训练 step time、推理 TTFT/TPOT/P99、tokens/s/GPU | 先证明用户可见指标真的变差 | 同一输入分布下连续 5-10 个窗口偏离基线超过 10% 才进入 kernel 排障 |
+| 时间线 | `nsys profile -t cuda,nvtx,osrt,cudnn,cublas -o trace python run.py` | kernel 间隙、CPU launch、同步、memcpy、collective 排列 | GPU 空洞或 CPU 同步占比超过 5%-10% 时，先查 runtime/调度 |
+| Framework 映射 | `torch.profiler` + NVTX ranges + `record_shapes=True` | PyTorch op 到 CUDA kernel 的对应关系、shape、dtype、显存峰值 | 同名 op 的 shape/dtype 变化必须单独分桶 |
+| 单 kernel | `ncu --set full --target-processes all --kernel-name <regex> python run.py` | tensor pipe、SM issue、warp stall、occupancy、register、local memory | Tensor Core kernel 的 tensor pipe 利用低且 stall reason 明确时才改 kernel |
+| 健康旁证 | DCGM / `dcgmi dmon` | clock throttle、power cap、Xid、ECC、温度 | 任何硬件 throttle 或 Xid 都先排除健康问题 |
+| 拓扑旁证 | `nvidia-smi topo -m`、NCCL log | 同一 kernel 在不同节点差异是否来自拓扑 | 只有跨 GPU 或跨节点路径变化时才归入 04c |
+
+一个可复现采集模板：
+
+```bash
+# 1. 端到端时间线，确认慢点属于 GPU kernel、CPU launch、同步还是拷贝
+nsys profile -t cuda,nvtx,osrt,cudnn,cublas -o exec_timeline python run_workload.py
+
+# 2. PyTorch op 映射，保存 shape、dtype 和显存峰值
+TORCH_SHOW_CPP_STACKTRACES=1 python run_with_torch_profiler.py
+
+# 3. 只对 nsys 中最慢的 3-5 个 kernel 下钻
+ncu --set full --target-processes all --kernel-name regex:gemm|attention|layernorm -o exec_kernel python run_workload.py
+
+# 4. 排除硬件健康和功耗降频
+dcgmi dmon -e 100,101,150,155,156,203,204
+```
+
+Retest criteria：
+
+- retest 必须固定模型版本、batch、sequence length、dtype、并发、CUDA/cuDNN/cuBLASLt/Triton/driver 版本、power cap 和 MIG/MPS 状态。
+- kernel 优化成功不能只看单 kernel time；至少同时报告端到端 step time 或 TPOT、kernel 数、GPU 空洞、Tensor Core utilization、HBM bandwidth 和质量指标。
+- 如果优化改变低精度路径，必须重新跑分任务/分长度质量回归；如果只是 Tensor Core 利用率上升但 quality threshold 失败，优化不成立。
+- 如果同一 profile 在另一台节点上失效，先采集 DCGM、`nvidia-smi topo -m` 和 NCCL topology，再判断是不是执行模型问题。
+
 ## 04a.2 GPU 为什么适合 AI：不是"核心多"，而是控制开销被摊薄
 
 一个标量 CPU 核心执行 1024 个 fp32 乘加，至少要面对 1024 组数据的指令调度、依赖跟踪和执行端口竞争。现代 CPU 可以乱序执行、SIMD 向量化，也能用 AMX 这类矩阵单元加速，但 CPU 仍然要保留大量晶体管服务复杂控制流、缓存一致性、分支预测、中断、系统调用和低延迟响应。
