@@ -63,8 +63,15 @@ object 有 key、bytes、metadata、etag/version 等属性。
 | Multipart upload | 分片上传大 object | complete 前 object 通常不可见 |
 | Copy + delete | 模拟 rename | 非原子，成本高，失败状态复杂 |
 
-现代主流对象存储通常提供强一致读写语义，但应用仍不应把 LIST 当成 dataset 真相源。
-原因是 LIST 成本高、分页复杂、跨账号/跨区域/网关/FUSE 层语义可能变化，而且训练启动时全量 LIST 会制造控制面尖峰。
+现代主流对象存储**目前**提供强一致读写语义，但这是历史不长的现状：
+
+- **AWS S3 自 2020-12 起**才提供 strong read-after-write 和 strong list-after-write；之前是 read-after-write 强一致 + list 最终一致。许多博客、论文、SDK 文档仍写着旧语义。
+- GCS 一直提供 strong read-after-write；LIST 在跨 bucket / 大量 prefix 场景下仍有"最终一致"的尾巴要小心。
+- Azure Blob Storage 是 strong read-after-write。
+- MinIO、Ceph RGW、各类对象存储网关、跨区域复制的 bucket：一致性语义差别大，要看具体配置和版本。
+- **FUSE 挂载层会重新引入弱一致性窗口**：s3fs、goofys、JuiceFS、ossfs 等基于元数据缓存（默认几秒到几十秒），写完不能立刻读到——这是"挂着像 POSIX 实际不是 POSIX"的最常见坑。
+
+即便底层对象存储是强一致，应用仍不应把 LIST 当成 dataset 真相源。LIST 成本高、分页复杂、跨账号/跨区域/网关/FUSE 层语义可能变化，而且训练启动时全量 LIST 会制造控制面尖峰。
 
 ## 3. Multipart upload
 
@@ -80,6 +87,15 @@ complete 前，最终 object 不应作为已发布数据被 reader 使用。
 - 上传 worker 控制并发，避免把带宽、CPU checksum、TLS 和服务端 throttling 混在一起。
 - 失败重试必须幂等，part number 和内容要稳定。
 - complete 成功后再发布 manifest 指针。
+
+S3 的硬约束（其他对象存储类似但数字略有出入，以官方文档为准）：
+
+- 单个 part：5 MB 起，5 GB 止（最后一个 part 可小于 5 MB）。
+- 单次上传最多 10000 parts。
+- 单 object 上限 5 TB。
+- 这三条决定 shard size 的可行区间：5 GB shard 用 1 part；50 GB shard 至少 10 parts，每 part 5 GB；500 GB shard 必须 part 大小 ≥ 50 MB；接近 5 TB 时 part 必须 ≥ 500 MB。
+- 实际选择常落在 part 16-128 MB，单 shard 1-50 GB——既有合理并发，又留容错重试空间。
+- 未 complete 的 multipart upload 不会自动清理，**要配 lifecycle rule 在 N 天后 abort**，否则不可见的"半成品"会持续吃存储费用。
 
 示例命令：
 
@@ -122,6 +138,15 @@ Manifest 是对象存储和并行数据集里最重要的应用层边界。
 
 这样即使前缀下有临时对象、旧版本或失败上传残留，reader 也不会把它们纳入训练。
 
+**Content-addressed key（CAS）模式**：把 object key 包含内容 sha256（如 `blobs/sha256/ab/abcd1234.../shard.tar`），manifest 引用这个 key。好处：
+
+- 上传天然幂等：重复上传同 key 同内容是 no-op，重复上传同 key 不同内容是 bug 报警点。
+- 跨数据集去重：同一 shard 在多个 manifest 引用，只存一份。
+- 缓存 key 直接用 sha256，cache invalidation 不需要版本号约定。
+- 清理只删"没有任何 manifest 引用的 blob"，回收策略简单。
+
+代价是 key 不可读，需要双层目录结构（manifest → CAS key），开发期定位文件不直观。学术 dataset、企业训练平台多采用这一模式。
+
 ## 5. LIST 的成本和陷阱
 
 LIST 适合管理和审计，不适合作为每个训练 job 的启动路径。
@@ -163,6 +188,18 @@ worker 根据 index 定位 shard 和 byte range，再发起 Range GET 或从本�
 不要让所有 rank 同时读取同一个 shard 开头。
 可以按 global rank 对 shard 列表做确定性切分，并在 epoch 间改变顺序。
 
+读对象存储到 GPU 的现代捷径：
+
+- **NVIDIA DALI**（数据加载/解码 pipeline）和 **cuFile/GDS** 配合，可以把对象存储 → 节点 NVMe cache → GPU 的解码和拷贝大幅 offload；JPEG/视频解码可直接在 GPU 上做。
+- 对纯 IO 密集的 dataset（fp16 tensor、tokenized text），GDS 直读 NVMe shard cache 比"先到 CPU 再 cudaMemcpy"省一份内存带宽。GDS 路径细节见 [0c1 §8.5](0c1-vfs-inode-dentry-and-block-layer.md#85-gpudirect-storage-与-cufile) 和 [0d3c](0d3-rdma-roce-infiniband-and-gpudirect.md)。
+
+PyTorch DataLoader + 对象存储常见坑：
+
+- `fsspec` / `s3fs` / `boto3.client` 的连接池在 `fork` 后不可重用；`num_workers > 0` 时必须在 worker init（`worker_init_fn`）里**重新创建** S3 client，否则会出现 `BotoCoreError` 或随机 hang。
+- 默认 boto3 连接池上限 10，单 worker 高并发 Range GET 时是隐形瓶颈，要显式 `botocore.config.Config(max_pool_connections=64)`。
+- `requests`/`urllib3` 的 keepalive 可以让一个 worker 复用 TLS 连接，省下握手；但每个 worker 进程独立连接池，跨 worker 不复用，total connections = workers × pool_size，注意被服务端限流。
+- 重试策略：区分 `404`（key 真不存在，立刻失败）、`429/503`（限流，指数退避）、`5xx`（短重试）、network timeout（短重试 + 换连接）。一律重试会把限流问题放大成雪崩。
+
 ## 7. 并行文件系统模型
 
 Lustre、GPFS/Spectrum Scale、BeeGFS 等并行文件系统提供 POSIX 风格共享命名空间。
@@ -181,6 +218,132 @@ OSS/OST 或 NSD 负责数据块。
 
 并行文件系统能提供很高 aggregate bandwidth，但不意味着 `stat()` 无限快。
 DataLoader 如果每个 sample 都触发 open/stat，小文件元数据仍会先打满 MDS。
+
+并行 FS 尾延迟的隐形来源——**分布式锁**：
+
+- Lustre 用 **LDLM（Lustre Distributed Lock Manager）**：每个 inode/extent 范围由 server 颁发锁给 client，写共享区域需要 revoke 其他 client 的锁。多 rank 写同一目录、追加同一 log 文件，会触发频繁锁回收，体现为客户端 stall。
+- GPFS/Spectrum Scale 用 **token manager**：类似机制，token revoke 在跨节点 workload 上是常见尾延迟来源。某些版本 token manager 单点会成为瓶颈。
+- **`fsync(parent_dir)` 在 Lustre 上是一次到 MDS 的同步 RPC**——所有 rank 同时 fsync 同一目录就是把 MDS 当串行队列用，是 §13 mini case 的本质问题。
+- 诊断：Lustre 用 `lctl get_param ldlm.namespaces.*.pool.stats`、`llstat`；GPFS 用 `mmdiag --tokenmgr`、`mmpmon`。
+
+### 7.1 Lustre 对象模型：FID、Layout EA、OST object
+
+Lustre 的"client/MDS/OSS 三层"是表层架构。要真正调它，必须理解它的对象模型——一次 `read("/mnt/lustre/data/shard.tar")` 在内部是怎么落到具体存储节点上的。
+
+**FID（File Identifier）** 是 Lustre 的核心命名实体：
+
+- 128-bit 全局唯一标识（`seq:oid:ver`），相当于 Lustre 版的 inode number。
+- 不同于本地 inode，FID 在整个 Lustre 文件系统范围内唯一，跨 MDT 不冲突。
+- 客户端操作文件时，路径解析的输出是 FID；之后所有对该文件的 RPC 都以 FID 为 key——不再依赖路径。
+- 这就是 Lustre 支持"open-by-FID"的基础：进程持有 FID 后，文件被 rename 不影响读写（因为 FID 不变），类似本地 FS 的 fd 在 unlink 后仍能用。
+
+**MDT（Metadata Target）** 上每个文件是一个 MDT inode：
+
+- 存储常规元数据（mode、owner、size、mtime 等）。
+- 关键扩展属性 **Layout EA（`trusted.lov` 或 `trusted.lmv`）** 记录这个文件由哪些 OST object 组成、stripe 策略是什么。
+- `lfs getstripe <path>` 实际就是读这个 EA。
+
+**Layout EA 的内容**（简化）：
+
+```text
+magic = LOV_MAGIC_V3
+pattern = RAID0 (stripe)
+stripe_size = 1MB
+stripe_count = 4
+objects = [
+  {ost_idx=2, object_id=FID_2_obj_xxx},
+  {ost_idx=5, object_id=FID_5_obj_yyy},
+  {ost_idx=7, object_id=FID_7_obj_zzz},
+  {ost_idx=11, object_id=FID_11_obj_www}
+]
+```
+
+**OST（Object Storage Target）** 上每个 object 是一个独立的存储对象，由该 OST 后端文件系统（典型 ldiskfs 即修改版 ext4，或 ZFS）存储。**file 不是直接放在 OST 上**——file 的字节按 stripe 切分后，每个 stripe 写到对应 OST object 的相应 offset。
+
+读 `shard.tar` offset 0 到 4MB 的实际过程（stripe_size=1MB, count=4）：
+
+1. 客户端有 FID 和 Layout EA（`open` 时从 MDS 取，缓存在内存）。
+2. 0-1MB 落 ost_idx=2 的 object 的 0-1MB；1-2MB 落 ost_idx=5 的 object 的 0-1MB；以此类推。
+3. 客户端**并行**向 4 个 OST 发 read RPC（走 LNET）。
+4. 4 个 OST 各自读自己后端 ldiskfs/ZFS，返回数据。
+5. 客户端组装成连续 buffer 返回给应用。
+
+理解这个模型后，调优就有锚点了：
+
+- **stripe_count 提升大文件吞吐**因为是物理上多 OST 并发；但小文件 stripe_count > 1 增加 RPC 数和锁开销。
+- **DoM**（Data on MDT）是把小文件的"前 N KB"直接存在 MDT 的 inode 关联区域，**完全跳过 OST**——`open + read` 一次 MDS RPC 完成，对 manifest、index 这种小热文件 latency 显著降低。
+- **PFL** 让 Layout EA 支持"按 offset 区间用不同 stripe 策略"，本质是 Layout EA 编码多个 component。
+
+### 7.2 LNET：Lustre 的网络抽象
+
+Lustre 不直接跑在 TCP 或 RDMA 上，而是跑在 **LNET（Lustre Networking）** 上。LNET 是一个抽象的消息层，下面挂不同的 LND（LNet Network Driver）：
+
+- `socklnd`：跑在 TCP 上，部署最容易，性能上限有限。
+- `o2iblnd`：跑在 InfiniBand verbs 上，AI 训练集群典型选择。
+- `kfilnd`：跑在 OFI/libfabric 上，Slingshot 等新一代网络。
+
+每个 Lustre 节点（client、MDS、OSS）都有一个 NID（Network ID，格式 `<IP>@<lnd>`，如 `10.0.0.5@o2ib`）。客户端 mount 时指定 MGS 的 NID，从 MGS 拿到整个 cluster 的 NID 拓扑和 router 配置。
+
+LNET 关键能力：
+
+- **multi-rail**：一个节点多张 NIC 可以聚合成一个 LNET interface，自动负载均衡和 failover。
+- **LNET routers**：跨网段（不同 LND 之间）的网关，让 IB 子网的 client 访问 TCP 子网的 OSS。
+- **discovery**：节点发现和健康监测在 LNET 层，比上层 RPC 更早发现链路问题。
+
+诊断：
+
+```bash
+lctl list_nids                              # 本节点 NID
+lctl which_nis                              # LNET 接口状态
+lnetctl net show -v                         # 详细网络拓扑
+lctl get_param 'osc.*.import' | grep state  # client → OSS 连接状态
+lfs check servers                           # 所有 server 是否可达
+```
+
+### 7.3 LDLM 锁的类型与命名空间
+
+LDLM（Lustre Distributed Lock Manager）是 Lustre 一致性和并发控制的核心。锁分多种类型，挂在不同命名空间下：
+
+**锁类型**（按强度排序，可兼容性递增）：
+
+| 类型 | 含义 | 兼容 |
+|---|---|---|
+| `EX`（Exclusive） | 独占写 | 不兼容任何其他锁 |
+| `PW`（Protected Write） | 保护写 | 兼容其他 PW 和更弱锁的部分组合 |
+| `CW`（Concurrent Write） | 并发写 | 多 client 同时写不同 extent |
+| `PR`（Protected Read） | 保护读 | 兼容其他读和 CR |
+| `CR`（Concurrent Read） | 并发读 | 兼容性最高 |
+| `NL`（Null） | 占位 | 与所有兼容 |
+
+**锁命名空间**：每个 server 上有一个 LDLM namespace，client 上对应的 import 也是 namespace。锁按资源类型分：
+
+- **MDC（Metadata Client）锁** `mdc-*`：锁 MDT 上的 inode、目录项。`open` 拿 inode 锁，`readdir` 拿目录锁。
+- **OSC（Object Storage Client）锁** `osc-*`：锁 OST object 的某个 extent 范围。`read` 拿 PR 锁、`write` 拿 PW 锁，可以是 `[0, EOF]` 整文件锁，也可以是某个 byte range。
+
+锁的关键机制是 **lock revocation**：
+
+- 一个 client 拿了 PW 锁，另一个 client 来要 EX 锁，server 必须先回收前者的锁——发 BL_AST（Blocking AST）通知 client 释放或降级。
+- client 收到 BL_AST 时，必须先 flush 所有相关 dirty page、推进 in-flight RPC，才能 release 锁。
+- **这就是多 rank 写同一文件、同一目录时尾延迟抖动的根源**：锁回收链上任何一个 client 慢，整条链阻塞。
+
+实战观察：
+
+```bash
+lctl get_param ldlm.namespaces.*.lock_count             # 各 namespace 锁数量
+lctl get_param ldlm.namespaces.*.pool.granted           # 已授予锁
+lctl get_param ldlm.namespaces.*.lru_size               # 锁 LRU 大小
+lctl set_param ldlm.namespaces.*.lru_size=clear         # 清 LRU（紧急）
+lctl get_param osc.*.rpc_stats                          # OST RPC 统计
+lctl get_param mdc.*.rpc_stats                          # MDT RPC 统计
+```
+
+设计 checkpoint workload 时的几条经验：
+
+- **每个 rank 写独立的文件**，避免在同一 OST object 上拿锁。
+- **预创建分目录**让锁分散到不同 MDT inode 命名空间。
+- **避免所有 rank fsync 同一个父目录**：dir fsync 触发 MDT 上的 inode 锁强制同步，512 个并发 = 串行队列。
+- **大文件 PFL + DoM** 让小文件不占 OST 锁、大文件 stripe 到多 OST 让锁分散。
+- **DLM lock cancel 风暴**（大量 BL_AST 在短时间内涌出）是 Lustre 节点 OOM 或重启后常见现象，可在 `/var/log/messages` 看到。
 
 ## 8. Stripe 策略
 
@@ -210,6 +373,17 @@ lfs osts
 Stripe 不是越大越好。
 如果所有 rank 同时写很多大文件，高 stripe count 可能让所有文件打到所有 OST，制造全局竞争。
 更好的方案可能是按 rank 或目录分布 stripe，使热点分散。
+
+现代 Lustre（2.10+）的两个关键 layout 机制，在大型训练集群里直接决定吞吐：
+
+- **PFL（Progressive File Layout）**：同一文件在不同 offset 区间用不同 stripe 策略。例如：
+  - 0-1MB：stripe count=1（小文件友好，少占 OST）。
+  - 1MB-1GB：stripe count=4（中等并发）。
+  - 1GB+：stripe count=16（大文件追求并行带宽）。
+  - 这样写小文件不浪费 OST，写大 checkpoint 又能展开到多 OST。`lfs setstripe -E 1M -c 1 -E 1G -c 4 -E -1 -c 16 /mnt/lustre/data`。
+- **DoM（Data on MDT）**：极小文件（典型阈值 64KB-1MB）数据直接存在 MDT 上，`open + read` 一次 RPC 到 MDS 完成，不再触达 OST。对 manifest、index、tokenizer 这种小但热的文件 latency 显著降低。代价是吃 MDT 容量，必须留足。`lfs setstripe -E 64K -L mdt -E -1 -c 4`。
+
+Mixed PFL + DoM 是 AI 训练 Lustre 的现代默认布局。设置错或没设，单租户能看到正常带宽，多租户混跑时 MDS 和 OST 利用率严重不均。
 
 ## 9. 小文件治理
 
@@ -331,17 +505,38 @@ ss -tinp | head
 
 - 同一目录创建 512 个文件，MDS 处理 create、layout、lock。
 - stripe count 1 让每个大文件只落到一个 OST，分布可能不均。
-- 所有 rank 同时 rename 和 fsync 父目录，制造元数据同步尖峰。
+- **所有 rank 同时 `rename` + `fsync(parent_dir)` 等于把 MDS 当串行队列**：每次 dir fsync 都是一次到 MDS 的同步 RPC，512 个并发请求在 MDS 上排队完成。这是本案瓶颈的核心。
 
 改法：
 
-- 预创建分层目录，例如 `node-000/rank-000.bin`，减少单目录热点。
-- 对大 rank 文件设置合适 stripe count，例如 4 或 8，并压测 stripe size。
-- rank 文件写完后由协调者分批发布 manifest，避免所有 rank 同时操作同一父目录。
+- 预创建分层目录，例如 `node-000/rank-000.bin`，减少单目录热点（每个子目录独立 LDLM 锁域）。
+- 对大 rank 文件设置合适 stripe count，例如 4 或 8，并压测 stripe size；或直接用 PFL layout 让大段自动 stripe 多 OST。
+- rank 文件写完后由协调者**串行**或**分批**发布 manifest，避免所有 rank 同时操作同一父目录。每个节点选 1 个 rank 做发布代理，节点间 reduce 后再写 manifest 是常见模式。
 - 把最终长期存储异步转移到对象存储，训练热路径只保留最近 checkpoint。
+- 进一步：用 reflink（如果底层是 XFS scratch + 异步同步到 Lustre）或对 Lustre 直接配置 PFL/DoM。
 
 验证：看 MDS/OST 指标、`lfs getstripe`、`iostat`、训练端 fsync p99。
 不要只看 aggregate bandwidth 的单次峰值。
+
+## 13.5 Mini case：FUSE/s3fs 假装 POSIX 训练慢
+
+场景：团队为了"代码不改"，把 S3 bucket 用 s3fs（或 goofys、ossfs）FUSE 挂到 `/mnt/dataset`，DataLoader 直接 `Image.open(path)` 读小图。
+现象：单节点训练 GPU 利用率 < 30%，`iostat` 看不到块设备流量，`ss -t` 看到大量 https 连接，单 step 的 batch wait 时间是本地 NVMe 的 10× 以上。
+
+为什么慢，按层次拆：
+
+1. **每次 `open()` 都触发一次 HEAD 请求**：FUSE 没有真目录，s3fs 必须问对象存储"这个 key 存在吗、多大"。HEAD 单次 ~30ms（同区域），1 万张图就是 5 分钟纯 metadata。
+2. **FUSE 上下文切换**：每个 syscall（`open/read/getattr`）都从内核态跳到 s3fs 用户态进程再跳回，2-5× 延迟惩罚。
+3. **元数据缓存默认弱一致**：写后立刻读可能拿到旧值或 404；为了稳定常配置 short TTL，进一步放大请求量。
+4. **没有 prefetch、没有 Range 优化**：每张图一次完整 GET，没有打包读、没有 keep-alive 复用。
+5. **被 throttle**：单 prefix 高频 GET 会触发 5xx，s3fs 默认重试更放大请求。
+
+正确做法：
+
+- **不要把 FUSE 当 POSIX 用做训练热路径**。FUSE 适合管理工具、调试、低频访问。
+- 改造为 manifest + shard + 节点本地 cache：原始小图打包为 WebDataset/tar shard，训练直接 `boto3.client.get_object` 走 SDK，cache 到本地 NVMe。
+- 如果一定要 POSIX 接口，用专为训练设计的客户端（JuiceFS、3FS、MountPoint for S3 with prefetching、Lustre-on-S3 等），并明确其元数据缓存语义、prefetch 行为、强一致窗口。
+- 验证：迁移前后对比 `pidstat -d`、TCP 连接数、GPU 利用率、单 step batch wait p99；FUSE 路径下 batch wait p99 通常是新路径的 5-20×。
 
 ## 14. Dataset IO SOP
 

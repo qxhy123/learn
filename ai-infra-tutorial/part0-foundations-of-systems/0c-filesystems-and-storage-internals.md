@@ -51,6 +51,7 @@ flowchart TD
 | 小图片目录 | 海量 `open/stat/read/close` | dentry/inode/MDS/IOPS | 0c1、0c4 |
 | safetensors 权重加载 | 大文件顺序读或 `mmap` fault | Page Cache 误判、NUMA | 0c1、0b2 |
 | 对象存储 dataset | Range GET + 本地 cache | LIST、重试、manifest 语义 | 0c4 |
+| GDS / cuFile 直读 | NVMe/NFSoRDMA → GPU，绕开 Page Cache | 对齐、cuFile driver、NIC/PCIe 拓扑 | 0c1、0d3c |
 
 ## 5. 常见误判
 
@@ -59,6 +60,8 @@ flowchart TD
 - `fio --direct=0` 的高吞吐，不代表真实设备持续写入能力。
 - 对象存储的 key 不是 POSIX inode，`rename` 通常是 copy/delete 或应用层模拟。
 - 并行文件系统的大带宽不代表小文件 `stat` 快；MDS 可能先被打满。
+- S3 自 2020-12 起提供 strong read-after-write 与 strong LIST，但 FUSE/s3fs/网关层会重新引入弱一致性窗口；不要把"S3 强一致"当成"任意 LIST 都便宜"。
+- FUSE 把 POSIX 路径假装成对象存储或远端 FS，每次 syscall 多一次 user/kernel round-trip，常见 2-5× 延迟惩罚；性能问题在挂载层而不是远端。
 
 ## 6. 排障入口
 
@@ -68,6 +71,7 @@ pidstat -d -p <pid> 1
 iostat -x 1
 grep -E 'Cached|Dirty|Writeback|SReclaimable' /proc/meminfo
 df -ih /mnt/dataset
+lsof +L1            # 列出 link count=0 但仍被打开的文件（"删了但 df 不降"）
 ```
 
 ## 7. 读法建议

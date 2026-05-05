@@ -74,9 +74,13 @@ ssize_t full_write(int fd, const char *p, size_t n) {
 ## 3. fsync、fdatasync、syncfs
 
 `fsync(fd)` 请求把文件数据和恢复该文件所需的元数据写到稳定存储。
-如果文件大小变化，size 元数据也需要持久化。
-如果只是覆盖已有范围，`fdatasync(fd)` 可能少同步部分时间戳等非必要元数据。
-实际差异取决于文件系统和内核实现。
+`fdatasync(fd)` 只同步"恢复该文件数据所必需"的元数据：
+
+- 文件大小变化（append、truncate）：size 必须同步，否则恢复时读不到这些字节，所以 `fdatasync` 在 size 变化时**仍然**同步 size。
+- 仅覆盖已有范围：`fdatasync` 跳过 mtime/atime 等纯时间戳更新，省一次 journal commit，对 append-only 日志或固定大小 mmap 区域有微小但稳定的收益。
+- block mapping 变化（首次写到稀疏文件中段、新分配 extent）：`fdatasync` 必须同步，因为这是数据可达性的一部分。
+
+实际差异取决于文件系统和内核实现，但语义上的分界点是"恢复时能不能读到正确字节"，不是字面上的"少几个时间戳"。在 ext4 fast_commit（5.10+）下两者差距进一步缩小，因为 fast_commit 本身只 log 必要 delta。
 
 `syncfs(fd)` 作用在 fd 所在文件系统，把该文件系统上的脏数据推进同步。
 它适合管理工具，不适合作为单个 checkpoint 的精确发布边界。
@@ -97,6 +101,11 @@ ssize_t full_write(int fd, const char *p, size_t n) {
 reader 要么看到旧名字，要么看到新名字，不会看到半个目录项。
 如果 `new` 已存在，POSIX 语义下替换也是原子的。
 
+更精确地说，"原子"指：从其他进程视角，一次成功的 `rename` 内核序列里不会观察到中间状态。但要小心两个常见误用：
+
+- 跨目录 rename 涉及两个 parent inode；POSIX 仍保证原子可见性，但底层文件系统通常需要拿两个目录的 lock，是潜在序列化点。
+- `rename` 的原子性不等于"已持久化"。reader 只看内存中的目录树时确实是切换发生的瞬间，但 crash 后磁盘上的目录项是否保留了 rename 结果，必须 `fsync(parent_dir)` 才有保证。
+
 限制必须说清：
 
 - 跨文件系统 rename 会失败为 `EXDEV`，应用常退化成 copy + unlink，这不再是原子切换。
@@ -104,8 +113,12 @@ reader 要么看到旧名字，要么看到新名字，不会看到半个目录�
 - rename 后如果不 `fsync(parent_dir)`，crash 后目录项更新是否保留不能作为应用协议假设。
 - 对象存储里的 rename 通常不是这个语义，见 0c4。
 
-`renameat2()` 还提供 `RENAME_NOREPLACE`、`RENAME_EXCHANGE` 等选项。
-它们能表达“不要覆盖”或“交换两个名字”，但仍不能替代 file fsync 和 dir fsync。
+`renameat2()` 还提供 `RENAME_NOREPLACE`、`RENAME_EXCHANGE`、`RENAME_WHITEOUT` 等选项。
+- `RENAME_NOREPLACE`：目标存在则失败，避免无意覆盖最新发布。
+- `RENAME_EXCHANGE`：原子交换两个名字，可以用来实现"上线新版本同时把旧版本挪到 .prev"。
+- `RENAME_WHITEOUT`：overlayfs 用，应用层一般不直接用。
+
+它们仍不能替代 file fsync 和 dir fsync。
 
 ## 5. 父目录 fsync
 
@@ -135,8 +148,14 @@ if (fsync(dfd) < 0) abort();
 close(dfd);
 ```
 
-一些文件系统或挂载组合对目录 fsync 的支持和语义不同。
-生产协议应在目标文件系统上做 crash 演练，而不是只依赖开发机经验。
+一些文件系统或挂载组合对目录 fsync 的支持和语义不同：
+
+- ext4 默认 `data=ordered` + journal 模式下，`fsync(file)` 通常会顺带把所属目录项的更新一起推进，因此很多代码"漏写 dir fsync"也没崩——这是**实现细节，不是协议保证**。
+- XFS 不做这种隐式同步；`fsync(file)` 只关心文件自身，目录项需要显式 `fsync(parent_dir)`。
+- 网络文件系统（NFS、Lustre、GPFS）和对象存储 FUSE 挂载的目录 fsync 语义高度依赖客户端实现，常见的坑是"返回成功但实际没同步"。
+- Btrfs、ZFS 因为 CoW 结构，目录 fsync 触发的是 transaction group 提交，代价可能比 ext4/XFS 大。
+
+可移植的协议必须**永远显式 fsync 父目录**，不能依赖某个 FS 的隐式同步。生产协议应在目标文件系统上做 crash 演练，而不是只依赖开发机经验。
 
 ## 6. 标准 checkpoint 发布协议
 
@@ -164,6 +183,24 @@ latest.json               # small manifest pointer
 
 如果目录整体 rename 在同一文件系统内可用，可以先完成临时目录内所有文件 fsync，再 rename 目录，最后 fsync 父目录。
 但很多对象存储或远端文件系统不提供同样语义，因此跨后端可移植方案更偏向 manifest 发布。
+
+**`copy_file_range` 与 reflink 在 checkpoint 流程中的现代用法：**
+
+很多 checkpoint 设计需要"快速冻结一份用于异步上传/转换/评测"，传统 `cp` 会把 800GB 真复制一遍，把节点本地盘打满。在 XFS reflink 或 Btrfs 上：
+
+```c
+// 内核 4.5+：copy_file_range 在支持的文件系统上会触发 reflink，无数据复制
+ssize_t n = copy_file_range(src_fd, &src_off, dst_fd, &dst_off, len, 0);
+```
+
+```bash
+# Shell 等价：XFS reflink 文件系统下，元数据-only clone
+cp --reflink=always ckpt-0042/ ckpt-0042.uploading/
+```
+
+reflink clone 后，原 checkpoint 可以被下一轮 step 覆盖；上传进程读 `.uploading/` 副本，写时才发生实际块拷贝（CoW）。配合 manifest 发布协议，可以做到"训练主路径几乎不被 checkpoint 上传阻塞"。
+
+注意：`copy_file_range` 在不支持 reflink 的 FS 上会回退到普通拷贝（仍走内核态，比 read/write 循环略快但没有 metadata-only 的奇迹）。生产前必须在目标 FS 上验证。
 
 ## 7. Checkpoint crash matrix
 
@@ -193,10 +230,10 @@ reader 只读取已经发布并通过校验的 manifest。
 
 Direct IO 要注意：
 
-- buffer 地址、长度、文件 offset 常需要按块大小对齐。
+- buffer 地址、长度、文件 offset 常需要按设备逻辑扇区或文件系统块对齐。
 - 混用 buffered IO 和 Direct IO 访问同一文件会引入一致性和性能复杂度。
 - 小 IO 使用 Direct IO 可能牺牲 Page Cache 合并和 readahead。
-- 某些文件系统在不满足条件时失败或退化，必须实测。
+- **不对齐时主流本地 FS（ext4/XFS）直接返回 `EINVAL`**——不要写"会自动退化为 buffered"的代码假设，那只在部分 NFS 客户端上成立。Linux 6.1+ 用 `statx(STATX_DIOALIGN)` 可查询对齐要求。
 
 对 checkpoint，大块 Direct IO + 显式 `fsync()` 可能有用。
 对 dataset 读取，buffered IO 通常更容易利用 Page Cache 和 readahead。
@@ -235,6 +272,13 @@ Direct IO 要注意：
 - 需要严格顺序时，用 linked SQE 或应用状态机表达依赖，不要只靠提交顺序猜测。
 - 任何 CQE error 都必须进入失败路径，不能只统计成功吞吐。
 
+`io_uring` 中的 fsync 操作：
+
+- `IORING_OP_FSYNC` + flag `IORING_FSYNC_DATASYNC` 表达 `fdatasync` 语义。
+- `IOSQE_IO_LINK` 把 write SQE 和 fsync SQE 链接，内核保证 fsync 在 write 完成后才执行；这是表达 "write 完了才 sync" 的正确方式，比应用层等 CQE 再提交 fsync 少一轮 round-trip。
+- `SQPOLL` 模式下内核线程轮询提交队列，能减少 syscall，但对 fsync 这种本身就要等设备的操作收益有限，且会持续吃一个 CPU 核——共享节点慎用。
+- 提交了 fsync SQE 不等于持久化完成；必须在对应 CQE 成功返回后才能进入下一阶段（rename、发布 manifest）。
+
 ## 11. 命令观测：看语义和延迟
 
 观察系统调用：
@@ -267,6 +311,20 @@ fio --name=ckpt --directory=/mnt/ckpt --rw=write --bs=4m \
 
 如果 `write` 阶段快而 `fsync_on_close` 或 close 阶段长，说明数据被缓存吸收，真正持久化成本集中在尾部。
 这对训练 step time 的影响取决于 checkpoint 是否在 critical path 上。
+
+参考数字（fsync 单次延迟，p50；用作合理性校验，不是规格表）：
+
+| 后端 | fsync(空文件) | fsync(刚写 1MB) | fsync(刚写 1GB) |
+|---|---|---|---|
+| 数据中心 NVMe + PLP | 30-100 μs | 100-300 μs | 5-30 ms（取决于 dirty 量） |
+| 消费级 NVMe（无 PLP，启用 cache flush） | 100-500 μs | 1-3 ms | 50-200 ms |
+| AWS EBS gp3 | 1-2 ms | 2-5 ms | 100-500 ms |
+| EBS io2 Block Express | 0.5-1 ms | 1-2 ms | 50-200 ms |
+| NFSv4 over 100GbE（同区域） | 200-500 μs | 500 μs-2 ms | 20-100 ms |
+| Lustre（写到 OST，含 dir fsync 到 MDS） | 1-5 ms | 5-20 ms | 100 ms-1 s（涉及 OST/MDS 同步） |
+| 对象存储 FUSE（s3fs 等） | 不要相信这里报的延迟 | 同上 | 同上 |
+
+如果你测出本地 NVMe `fsync(1GB)` 是 200ms，先怀疑：盘有没有 PLP？write cache 是否启用且没 FUA？文件系统 journal 大小？这些往往才是真正的差异源（见 §13.5）。
 
 ## 12. Worked example：16 rank checkpoint 发布
 
@@ -339,6 +397,40 @@ fsync parent dir
 
 这个协议牺牲了一些尾延迟，换来明确的恢复状态。
 如果尾延迟不可接受，应优化文件布局、并发、设备和异步上传，而不是删除同步步骤。
+
+## 13.5 设备 cache、FUA、FLUSH 与掉电语义
+
+`fsync` 落到设备这一层时发生什么，决定 checkpoint 的真实可靠性。
+
+NVMe 协议有两种持久化原语：
+
+- **FLUSH** 命令：把设备 volatile write cache 中所有已 ACK 的写入推到 NAND。代价是几百微秒到几毫秒。
+- **FUA**（Force Unit Access）：单条写命令上的位，写完直接落 NAND，不进 cache。代价分摊在每个 IO 上。
+
+Linux 文件系统在 fsync 路径默认走 FLUSH（除非 mount 时关掉 barrier）。所以：
+
+- **关掉 barrier/flush 来换 benchmark 数字 = 把"crash 后能否恢复"换成"benchmark 上漂亮"**。生产 checkpoint 路径**绝对不要**这么干。
+- `nobarrier`（旧 mount 选项）和 `hdparm -W 0`（关 cache）两条路径效果不同：前者让 FS 不发 FLUSH，后者让设备根本不缓存写入。后者性能更差但语义最干净。
+
+PLP（Power-Loss Protection，掉电保护电容）是数据中心 SSD 和消费 SSD 的核心区别：
+
+- 有 PLP 的盘：volatile cache 里的数据在掉电时由电容保证写完，FLUSH 命令几乎是 no-op，fsync 延迟极低（几十微秒）。
+- 无 PLP 的盘：FLUSH 必须真的把 cache 推到 NAND，延迟几毫秒；如果运行时关掉 cache，每个 write 都直写 NAND，吞吐崩塌。
+
+诊断和验证：
+
+```bash
+nvme id-ctrl /dev/nvme0 | egrep 'vwc|fr|mn'  # vwc=Volatile Write Cache 能力位
+hdparm -W /dev/sda                            # SATA：cache 是否启用
+cat /sys/block/nvme0n1/queue/write_cache      # write back / write through
+cat /sys/block/nvme0n1/queue/fua              # 是否支持 FUA
+```
+
+实战经验：
+
+- 选盘看 spec 上是否明确写 "Power Loss Protection" 或 "Enhanced Power Loss Data Protection"。Samsung PM 系列、Intel/Solidigm D7 系列、Micron 7450 等是常见 PLP 盘。
+- 云盘（EBS、PD-SSD 等）的"持久化"语义由云厂商负责实现，应用看到的就是 fsync 返回；但延迟特征通常显著差于本地 PLP NVMe（见 §11 表）。
+- crash 演练必须包括"硬掉电"（拉电源/虚机 instance kill），不能只测 `kill -9`——后者不暴露设备 cache 问题。
 
 ## 14. SOP：checkpoint 语义验收
 
