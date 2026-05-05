@@ -1,12 +1,12 @@
 # 第 0a-4 章 · SIMD：SSE、AVX、AVX-512
 
-第 0a 章的 [§0a.5](./0a-cpu-microarchitecture.md#0a5-simd-sseavxavx-512-与向量化判断) 用一节篇幅讲了 SIMD 的判断标准，但 AI Infra 的 host-side 热点（tokenizer、UTF-8 校验、bf16/fp16 解码、batch packing、采样后处理）几乎都是 SIMD 适用区。本章把视角拉到"指令集层面"：从 SISD 到 SIMD 为什么必然出现，x86 SSE/AVX/AVX-512 的演进取舍是什么，AVX-512 频率降级究竟该不该怕，编译器自动向量化为什么经常失败，以及在 GPU 时代 CPU SIMD 仍然不可替代的几个工程场景。
+第 0a 章导览已经把 SIMD 列为独立深挖章，但 AI Infra 的 host-side 热点（tokenizer、UTF-8 校验、bf16/fp16 解码、batch packing、采样后处理）几乎都是 SIMD 适用区。本章把视角拉到"指令集层面"：从 SISD 到 SIMD 为什么必然出现，x86 SSE/AVX/AVX-512 的演进取舍是什么，AVX-512 频率降级究竟该不该怕，编译器自动向量化为什么经常失败，以及在 GPU 时代 CPU SIMD 仍然不可替代的几个工程场景。
 
 ## 0a-4.1 第一性原理拆解 + 学习大纲
 
 ### 拆 — 不可化简的问题
 
-先把 SIMD 这个名字放下。CPU 的核心矛盾在 [§0a.1](./0a-cpu-microarchitecture.md#0a1-第一性原理拆解--学习大纲) 已经说过：晶体管有限、延迟不可消除。但其中还有一个更具体的不可化简问题：当一段代码对一个连续数据数组反复执行同一个简单操作（"扫一段 byte 数组找非 ASCII"、"对一个 float 数组做 mask"、"对 logits 做 temperature scaling"），如果硬件还把每个元素当成独立的标量指令来取指、译码、发射、写回，那么**绝大多数前端带宽和译码资源都被浪费在重复的指令头部上，而不是数据上**。这种浪费不是因为算法不好，也不是因为 cache miss，而是因为**指令粒度比数据粒度粗**。
+先把 SIMD 这个名字放下。CPU 微架构总览已经说过：晶体管有限、延迟不可消除。但其中还有一个更具体的不可化简问题：当一段代码对一个连续数据数组反复执行同一个简单操作（"扫一段 byte 数组找非 ASCII"、"对一个 float 数组做 mask"、"对 logits 做 temperature scaling"），如果硬件还把每个元素当成独立的标量指令来取指、译码、发射、写回，那么**绝大多数前端带宽和译码资源都被浪费在重复的指令头部上，而不是数据上**。这种浪费不是因为算法不好，也不是因为 cache miss，而是因为**指令粒度比数据粒度粗**。
 
 要消除这种浪费，唯一的办法是让一条指令在一个 cycle 内处理多个元素。这就是 SIMD（Single Instruction, Multiple Data）。它不是"额外的优化"，而是当数据并行可识别时的物理必然——只要硬件愿意把 ALU 加宽、寄存器加宽、load/store 端口加宽，编译器和程序员就能把"同一操作扫一段数组"的代码翻译成数倍快的指令流。
 
@@ -75,6 +75,36 @@ mindmap
 6. 未对齐 load 在不同代际硬件上的代价差多少？什么时候必须强制对齐？
 7. GPU 时代 CPU SIMD 在 LLM 推理服务里还能解决哪些 host-side 瓶颈？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：判断一段 host-side 热点是否能把同一操作批量映射到 SIMD lane，并处理 ISA、runtime dispatch、对齐、tail、降频和正确性测试。**本章不负责**分支预测器、LLC 容量、NUMA/coherence 根因；如果 SIMD retired counter 上升但业务不变，优先回到 0a-1/0a-5/0a-7。控制路径是 ISA detect -> dispatch -> vector loop -> masked/scalar tail；数据路径是 contiguous load/store、shuffle、mask、gather；失败路径是未向量化、lane 利用率低、AVX-512 降频、cache miss 主导、边界输入错误。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -p $(pgrep -f tokenizer) -e cycles,instructions,branches,branch-misses,LLC-load-misses -- sleep 30
+perf stat -p $(pgrep -f tokenizer) -e fp_arith_inst_retired.scalar_single,fp_arith_inst_retired.128b_packed_single,fp_arith_inst_retired.256b_packed_single,fp_arith_inst_retired.512b_packed_single -- sleep 30
+perf stat -p $(pgrep -f tokenizer) -e core_power.lvl1_turbo_license,core_power.lvl2_turbo_license -- sleep 30
+```
+
+整数/byte SIMD 需要换成平台对应事件，并结合编译器报告：GCC `-fopt-info-vec`，Clang `-Rpass=loop-vectorize -Rpass-missed=loop-vectorize`。
+
+**CapacityLedger / 数值模型**：
+
+```text
+lane_utilization = processed_elements / (vector_instructions * lanes_per_instruction)
+expected_speedup <= min(vector_width_lanes * lane_utilization, scalar_cycles / memory_cycles)
+```
+
+决策规则：连续数据、同一操作、分支可 mask、lane 利用率 > 70%、cache miss rate < 20% 时才优先 SIMD；如果 `LLC-load-misses` 或 `topdown-be-bound` 主导，先改布局再 SIMD；Skylake/Cascade Lake 上 AVX-512 heavy cycles < 10% 时保留 AVX2 路径更稳。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| 以为向量化但没变快 | SIMD retired counter 低，编译器报告 missed | alias、控制流、trip count 或对齐未知 | 加 `restrict`、拆分支、主循环+tail、显式 dispatch | SIMD counter 上升，单位元素 cycles 下降 |
+| SIMD counter 高但吞吐不升 | LLC miss 高、IPC 仍低 | memory bound，不是执行单元瓶颈 | 分块、SoA、预取、减少 gather | LLC miss rate 降低后再比较 SIMD/标量 |
+| AVX-512 后整体变慢 | power license 事件高，scalar 段也降频 | 短小 AVX-512 helper 触发频率降级 | 改 AVX2、集中 AVX-512 到长循环、runtime gating | p99 不升，license2 时间下降 |
+| 边界 case 错误 | fuzz/单测失败于 0/1/N-1/N+1/跨页 | tail mask 或未对齐路径错误 | 补 masked tail、scalar fallback、跨页测试 | correctness suite 全绿，perf 回归 < 3% |
+
 ## 0a-4.2 SISD vs SIMD：为什么标量浪费数据并行机会
 
 经典 RISC/CISC 是 SISD（Single Instruction, Single Data）：一条指令处理一个标量元素。处理 32 个 fp32 加法需要 32 条 `addss` 指令，每条都要走完取指、译码、发射、执行、写回的全流水线。即使 OoO 能让多条独立加法并行执行（superscalar 4-wide 大约能让 4 条加法挤在同一 cycle），仍然有 8 个 cycle 才能完成。
@@ -103,7 +133,7 @@ flowchart LR
 > [!NOTE]
 > SIMD 不会让"单个元素"变快，它让"一组元素摊到一条指令上"。如果你的算法每次只处理一个元素（比如链表遍历），SIMD 就帮不上忙。这是判断一段代码是否值得 SIMD 化的第一标准。
 
-工程边界：SIMD 收益的天花板是"前端 + 执行单元能跑满的吞吐"。如果热点已经被 cache miss 或 branch miss 主导，SIMD 化只是把闲置的流水线换成了同样闲置的宽流水线，吞吐不会涨。先用 [§0a.10](#0a-410-工程操作perf-stat-看-fp_arith_inst_retired--检查-simd-是否生效) 的 perf 命令确认前端没瓶颈，再做 SIMD 化决策。
+工程边界：SIMD 收益的天花板是"前端 + 执行单元能跑满的吞吐"。如果热点已经被 cache miss 或 branch miss 主导，SIMD 化只是把闲置的流水线换成了同样闲置的宽流水线，吞吐不会涨。先用 [§0a-4.10](#0a-410-工程操作perf-stat-看-fp_arith_inst_retired--检查-simd-是否生效) 的 perf 命令确认前端没瓶颈，再做 SIMD 化决策。
 
 ## 0a-4.3 x86 SIMD 演进：MMX → SSE/SSE2/3/4 → AVX/AVX2 → AVX-512 → AVX10
 
@@ -338,7 +368,7 @@ flowchart LR
 - **Streaming store (`_mm256_stream_si256`)** 必须对齐，否则结果未定义。这是写大量数据绕过 cache 时的常用指令。
 
 > [!NOTE]
-> "对齐 vs 未对齐"是上一代优化指南的重点话题。在 2025 年，结论是：除非你跑 Nehalem/Westmere 古董，对齐已经不影响 SIMD 性能。但仍然按 64B 分配热点数组以避免 false sharing（见 [§0a.8](./0a-cpu-microarchitecture.md#0a8-伪共享dataloader-worker-counter-实例)）和利好预取。
+> "对齐 vs 未对齐"是上一代优化指南的重点话题。在 2025 年，结论是：除非你跑 Nehalem/Westmere 古董，对齐已经不影响 SIMD 性能。但仍然按 64B 分配热点数组以避免 false sharing（见 [0a-7](./0a7-false-sharing.md)）和利好预取。
 
 ## 0a-4.9 AI Infra 视角：为什么 GPU 时代 CPU SIMD 仍然重要
 

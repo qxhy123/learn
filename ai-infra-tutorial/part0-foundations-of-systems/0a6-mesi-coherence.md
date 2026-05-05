@@ -1,6 +1,6 @@
 # 第 0a-6 章 · MESI 一致性协议
 
-第 0a 章 [§0a.7](./0a-cpu-microarchitecture.md#section) 已经把 MESI 当作"一段表 + 一张状态机"匆匆带过。但在 AI Infra 真实负载里，cache coherence 不是教科书里的玩具：训练节点 64 核双 socket、推理服务上百 worker、调度器跨 NUMA 共享队列，coherence 流量经常成为 GPU idle、p99 抖动、扩容反向收益的根因。本章把 MESI 拆开重建，从"私有 cache + 共享内存"的本质冲突开始，逐一推出四状态、状态机、snoop 与 directory、MOESI/MESIF 变种、跨 socket 一致性流量代价，并给出 `perf c2c`、`intel-pcm` 这类工程工具的用法。
+第 0a 章导览中的 MESI 一致性协议条目已经把 MESI 当作"一段表 + 一张状态机"匆匆带过。但在 AI Infra 真实负载里，cache coherence 不是教科书里的玩具：训练节点 64 核双 socket、推理服务上百 worker、调度器跨 NUMA 共享队列，coherence 流量经常成为 GPU idle、p99 抖动、扩容反向收益的根因。本章把 MESI 拆开重建，从"私有 cache + 共享内存"的本质冲突开始，逐一推出四状态、状态机、snoop 与 directory、MOESI/MESIF 变种、跨 socket 一致性流量代价，并给出 `perf c2c`、`intel-pcm` 这类工程工具的用法。
 
 ## 0a-6.1 第一性原理拆解 + 学习大纲
 
@@ -91,6 +91,37 @@ mindmap
 - [ ] 能区分 MOESI 和 MESIF 的动机
 - [ ] 能粗估"跨 socket invalidate"和"L3 命中"的延迟比，量级别错
 - [ ] 会用 `perf c2c record/report` 找 HITM，并理解输出列含义
+
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：解释硬件如何用 MESI/MOESI/MESIF 维护 cache line 一致性，以及 RFO、Invalidate、HITM、snoop/directory、UPI/Infinity Fabric 的代价。**本章不负责**单对象布局修复套路（0a-7）、普通容量 miss（0a-5）、语言内存模型完整语义；ordering 只讲到它和 coherence 的边界。控制路径是 local load/store/atomic -> cache controller -> directory/home agent -> snoop/invalidate；数据路径是 dirty line forward/writeback；失败路径是 RFO storm、Remote HITM、directory/home agent 拥塞、NUMA 跨 socket 放大。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -a -e cycles,instructions,cache-references,cache-misses,mem_load_l3_miss_retired.remote_hitm,mem_inst_retired.lock_loads -- sleep 30
+perf c2c record -ag -- sleep 30
+perf c2c report --stdio | head -100
+```
+
+跨 socket 机器再补 `pcm.x 1`、`pcm-memory.x 1` 或厂商等价工具，确认 UPI/Infinity Fabric 流量是否和 HITM 同步升高。
+
+**CapacityLedger / 数值模型**：
+
+```text
+coherence_time_per_sec ~= HITM_per_sec * avg_HITM_latency_ns / 1e9
+atomic_rfo_rate = atomic_updates_per_request * QPS
+cross_socket_penalty ~= remote_HITM / total_HITM * avg_remote_transfer_ns
+```
+
+决策规则：`remote_hitm` 与 `lock_loads` 同量级时，atomic 是核心嫌疑；Remote HITM 占比 > 50% 时，先做 NUMA/亲和排查；单条 cache line HITM > 5% 时，转 0a-7 判断 true sharing 还是 false sharing。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| 多 socket 上吞吐塌方 | Remote HITM 高，UPI/IF non-data 流量高 | dirty line 跨 socket 迁移 | socket-local shard、绑核绑内存、减少跨 socket writer | Remote HITM 降到 <20%，UPI 利用率回落 |
+| atomic counter 成热点 | `mem_inst_retired.lock_loads` 高，HITM 指向 counter | 真共享 RMW | per-CPU/per-worker counter + 周期 reduce | lock_loads/request 降数量级，指标延迟可接受 |
+| padding 后 HITM 还高 | HITM 仍集中同一变量 | 真共享，不是 false sharing | 改语义：分片、批处理、读复制 | HITM 分散或频率下降，语义一致 |
+| ARM 上偶发错乱 | perf 不一定异常，复现依赖弱序 | 把 coherence 当 ordering 用，缺 acquire/release | 加正确 memory_order/barrier，补跨架构测试 | x86/ARM 压测均通过，性能回归有界 |
 
 ## 0a-6.2 为什么多核需要一致性：私有 cache + 共享内存的本质冲突
 
@@ -304,7 +335,7 @@ sequenceDiagram
 | UPI 1.0/2.0/3.0 | Intel | 10.4-16+ GT/s × 多 lane | 80-150ns（含 home 仲裁） | 双/四 socket Xeon |
 | Infinity Fabric (Inter-socket) | AMD EPYC | 18-36 GT/s | 100-200ns | 双 socket EPYC |
 | xGMI | AMD MI 系列 GPU 互连 | 数百 GB/s 总带宽 | GPU 间 | 不在 CPU coherence 范围 |
-| CXL.cache | 多厂商新协议 | PCIe Gen5/6 速率 | 待定（早期 ~150-300ns） | 设备-CPU 一致性 |
+| CXL.cache | 多厂商新协议 | PCIe Gen5/6 速率 | 早期实现约 ~150-300ns | 设备-CPU 一致性 |
 
 跨 socket 一次 HITM 事务粗略要走："请求 core → 本 socket home → UPI → 远 socket home → 远 socket owner → 数据返回"，多跳累计延迟可达 200-500ns。比同 socket L3 hit（30-80ns）贵一个数量级。
 

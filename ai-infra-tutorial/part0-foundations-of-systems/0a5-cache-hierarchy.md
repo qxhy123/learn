@@ -1,6 +1,6 @@
 # 第 0a-5 章 · Cache 层级：L1、L2、L3、Cache Line 与关联度
 
-Cache 是 AI Infra 工程师离 GPU 最远、却又最容易被忽视的微架构主题。CPU 上几乎所有"看起来用率很高、实际吞吐却上不去"的现象，最终都可以拆到 cache 层级、cache line、关联度、替换策略、写策略、prefetcher 这几件事。本章在 [§0a.6](./0a-cpu-microarchitecture.md) 的基础上，把 cache 层级展开成一条可排障的链路：从延迟悬崖、Cache Line、关联度、Index/Tag/Offset 计算、替换/写策略、三种 miss、LLC 切片、硬件 prefetcher，一路推到 DataLoader/tensor stride/padding 这种 AI 数据路径上的真实场景。
+Cache 是 AI Infra 工程师离 GPU 最远、却又最容易被忽视的微架构主题。CPU 上几乎所有"看起来用率很高、实际吞吐却上不去"的现象，最终都可以拆到 cache 层级、cache line、关联度、替换策略、写策略、prefetcher 这几件事。本章在 0a 总览的基础上，把 cache 层级展开成一条可排障的链路：从延迟悬崖、Cache Line、关联度、Index/Tag/Offset 计算、替换/写策略、三种 miss、LLC 切片、硬件 prefetcher，一路推到 DataLoader/tensor stride/padding 这种 AI 数据路径上的真实场景。
 
 ## 0a-5.1 第一性原理拆解 + 学习大纲
 
@@ -74,6 +74,37 @@ mindmap
 6. 三种 miss 各自对应什么优化手段，padding 为什么有时反而增加 miss？
 7. 硬件 prefetcher 在 NHWC vs NCHW、随机 shuffle 数据上的行为差异如何排查？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：解释 L1/L2/LLC/DRAM/NUMA 的容量、延迟、line、关联度、替换、prefetcher 和 3C miss，并把它们转成 DataLoader、tokenizer、tensor layout 决策。**本章不负责**page table/TLB/page cache（0b）、coherence 状态机（0a-6）、false sharing 修复细节（0a-7）。控制路径是 load/store uop -> LSU -> L1D -> L2 -> LLC slice -> memory controller/NUMA；数据路径是 cache line 填充、writeback、prefetch；失败路径是 compulsory/capacity/conflict/coherence miss、prefetch 污染、远端 NUMA。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -p $(pgrep -f train) -e cycles,instructions,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,LLC-stores,LLC-store-misses -- sleep 30
+perf stat -a -e uncore_imc/cas_count_read/,uncore_imc/cas_count_write/ -- sleep 30
+perf stat -p $(pgrep -f train) -e topdown-be-bound,topdown-retiring -- sleep 30
+```
+
+必要时补 `perf mem record` 定位 load 地址，或用 `numactl --hardware` / `numastat -p` 验证 NUMA 归属。若 HITM 高，转 0a-6/0a-7 用 `perf c2c`。
+
+**CapacityLedger / 数值模型**：
+
+```text
+working_set_per_worker = hot_buffers + decoded_batch + tokenizer_tables + metadata
+LLC_fit_rule = active_workers_per_socket * working_set_per_worker < 0.6 * LLC_capacity_per_socket
+miss_penalty_budget = LLC_misses_per_sec * avg_LLC_miss_ns
+```
+
+决策规则：预留 40% LLC 给 runtime、kernel、其他 worker；一旦 LLC miss rate > 30% 或 DataLoader queue depth 波动，先降每 socket worker 数或拆热/冷数据。stride 若为 `sets * line_size` 的整数倍，优先怀疑 conflict miss。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| worker 加倍吞吐不升 | LLC miss rate 从 <15% 升到 >30%，IPC 下降 | per-worker working set 挤爆 LLC | 降 worker/socket、分块、热冷拆分、NUMA 绑核 | LLC miss rate 降到 <20%，HFU 稳定 |
+| 内层循环慢但 L1 容量够 | 固定 stride 下 L1 miss 异常高 | conflict miss，多个地址打同一 set | 改 padding 破 2 的幂 stride、blocked layout | L1D miss 下降，IPC 上升 |
+| 顺序扫描污染热表 | LLC misses 高，热 symbol 命中下降 | streaming 数据挤掉 vocab/index | non-temporal store/load、分离线程、缩小预取距离 | 热表 miss rate 降低，stream 吞吐不降 |
+| 跨 socket 延迟高 | `numastat` remote 高，LLC miss 后 DRAM latency 高 | NUMA 错绑或 first-touch 错误 | `numactl --cpunodebind --membind`，worker 本地初始化 | remote fault/remote access 下降，p99 收敛 |
+
 ## 0a-5.2 内存延迟悬崖：cycle 视角下的 L1/L2/L3/DRAM/远端 NUMA
 
 CPU 核心一个 cycle 约 0.3-0.4ns（3GHz 时 0.33ns）。从这个时间尺度看，每一层存储的延迟都是一道"悬崖"：
@@ -116,7 +147,7 @@ Cache line 是 cache 与下层存储交换数据的最小单位。读 1 byte 也
 
 第二，**transfer granularity**。DRAM 的 burst 长度、互连协议（DDR4/5 一次 burst 8 beat × 8B = 64B）都按 64B 对齐设计，硬件就此收敛。
 
-第三，**MESI 一致性的最小粒度**。线程间 false sharing 的故事在 [§0a.8](./0a-cpu-microarchitecture.md#0a8-伪共享dataloader-worker-counter-实例) 已经讲过：一致性消息按 line 发，line 越大伪共享风险越高。所以 64B 是"局部性收益已经饱和、伪共享代价尚未失控"的折中。
+第三，**MESI 一致性的最小粒度**。线程间 false sharing 的故事在 [0a-7](./0a7-false-sharing.md) 已经讲过：一致性消息按 line 发，line 越大伪共享风险越高。所以 64B 是"局部性收益已经饱和、伪共享代价尚未失控"的折中。
 
 | 设计选择 | 优势 | 劣势 |
 |---|---|---|
@@ -303,7 +334,7 @@ stateDiagram-v2
 | **Capacity（容量）** | working set > cache 容量 | 否 | 是 | 缩小 working set、tile/blocking、按热度分层 |
 | **Conflict（冲突）** | 落在同一个 set 的 line 数 > way 数 | 否 | 否 | 改 stride、padding（注意双刃）、错峰访问 |
 
-> 现代延伸：还有 **Coherence miss**（多核场景下被其他核 invalidate 导致），是 [§0a.8 false sharing](./0a-cpu-microarchitecture.md#0a8-伪共享dataloader-worker-counter-实例) 的物理来源。
+> 现代延伸：还有 **Coherence miss**（多核场景下被其他核 invalidate 导致），是 [0a-7 false sharing](./0a7-false-sharing.md) 的物理来源。
 
 **关键反直觉：padding 是双刃剑。** 
 - 在 false sharing 场景，padding 把不同 thread 的写隔离到不同 line，**减少** coherence miss。

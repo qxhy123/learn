@@ -74,6 +74,38 @@ mindmap
 6. MESI 如何保证多核缓存一致，为什么一致性流量会在多 socket 机器上放大？
 7. 如何从 `perf stat` 和 `perf c2c` 的现象推断 false sharing，而不是盲目加 worker？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：建立 CPU 微架构的机制地图、证据路径和容量决策入口；把流水线、OoO、分支、SIMD、Cache、MESI、false sharing 串成一个可排障的系统模型。**本章不负责**展开虚拟内存、page cache、PCIe DMA、GPU kernel、NCCL 或调度器业务语义；这些分别在 0b、Part 2 和后续训练/推理章节处理。控制路径从 PC/BTB/预测器到 decode/rename/retire；数据路径从 register/LSQ 到 L1/L2/LLC/DRAM/NUMA；失败路径分成四类：front-end 供不上、backend 等内存或端口、bad speculation 冲刷流水线、coherence/false sharing 让 cache line 在核心间迁移。
+
+**CPU EvidenceBundle** 是所有 0a 章节共用的最小证据包：
+
+```bash
+perf stat -a -e cycles,instructions,branches,branch-misses,cache-references,cache-misses,LLC-loads,LLC-load-misses -- sleep 30
+perf stat -a -e topdown-fe-bound,topdown-be-bound,topdown-bad-spec,topdown-retiring -- sleep 30
+perf c2c record -ag -- sleep 30 && perf c2c report --stdio | head -80
+```
+
+如果运行环境不支持 Top-Down 事件，改用 `perf stat --topdown`、`toplev --level 2` 或厂商工具（VTune / AMD uProf）补齐同类证据。证据包必须和业务指标同窗采集：GPU SM util、MFU、HFU（Host Feeding Utilization，CPU 能否持续把 batch 喂给 GPU）、QPS、p50/p99、DataLoader queue depth。只看 CPU% 不足以做结论。
+
+**CapacityLedger 决策规则**：先写出每个 socket 的预算，再决定 worker/thread 数量。
+
+```text
+CPU_headroom = physical_cores * target_IPC * freq
+LLC_budget_per_worker = LLC_effective_capacity / active_workers_per_socket
+coherence_budget = HITM_per_sec * avg_line_transfer_ns
+host_feed_budget = batch_ready_deadline_ms - tokenizer_ms - decode_ms - scheduler_ms
+```
+
+经验阈值：`IPC < 1.0` 且 `topdown-be-bound > 50%` 先查 LLC/DRAM/NUMA；`branch-misses / branches > 5%` 或 `topdown-bad-spec > 10%` 先查 cold path；`perf c2c` 单条 line HITM 占比 > 5% 先查 false sharing；LLC miss rate > 30% 时不要继续加 worker，先缩 working set、分 NUMA 或改布局。
+
+| 症状 | 证据 | 可能根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| GPU util 掉、CPU% 高 | `perf stat` IPC < 1，`topdown-be-bound` 高，LLC miss 高 | DataLoader/tokenizer working set 溢出 LLC 或 NUMA 远端访问 | 降 worker/socket、绑 NUMA、改数据布局、分块 | 同样压测下 IPC > 1.2，LLC miss rate 下降 30%+，HFU/MFU 回升 |
+| p99 抖动但 p50 正常 | `branch-misses` 与 `topdown-bad-spec` 在长尾请求升高 | cold path、schema fallback、短循环未收敛 | hot/cold path 分离，减少数据驱动分支，必要时 SIMD fast path | branch-miss rate 回到 < 3%，p99 回落且 p50 不退化 |
+| 加线程吞吐下降 | `perf c2c` HITM 集中在少数 line，Remote HITM 高 | false sharing 或真共享 atomic | `alignas(64/128)`、thread-local reduce、分片计数、socket 亲和 | HITM 降到原值 < 10%，吞吐随线程数至少单调到容量拐点 |
+| Retiring 高但吞吐不达标 | IPC 高、cache/branch 健康，SIMD counter 低 | 标量路径占主导，未向量化 | 开启编译器向量化报告，runtime dispatch AVX2/AVX-512/NEON/SVE | SIMD retired counter 上升，单位 CPU cycle 的处理元素数提升 |
+
 ## 0a.2 八个深挖章节导览
 
 | 章节 | 标题 | 核心主题 | 何时优先读 |

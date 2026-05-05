@@ -70,6 +70,36 @@ mindmap
 7. 推理服务 cold path（schema fallback、超长 prompt、罕见 token）为什么特别容易触发分支误预测？
 8. `__builtin_expect` 和 `[[likely]]/[[unlikely]]` 影响的是什么？什么场景下其实没必要？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：只负责控制流预测和误预测恢复，包括 direction predictor、BTB、RAS、间接跳转和 cold path 布局。**本章不负责**执行端口、SIMD lane、cache 容量和 coherence 诊断；这些要在 branch 证据不足以解释现象后转到 0a-2/0a-4/0a-5/0a-7。控制路径是 PC -> predictor/BTB/RAS -> fetch -> branch execute -> ROB squash/restart；数据路径只在它影响分支条件可用时间时讨论；失败路径是 direction miss、BTB miss、RAS 污染、indirect target miss、machine clear。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -p $(pgrep -f tokenizer) -e cycles,instructions,branches,branch-misses,cache-misses,topdown-bad-spec,topdown-fe-bound -- sleep 30
+perf record -e branch-misses -c 30000 -g -p $(pgrep -f tokenizer) -- sleep 30
+perf report --stdio --sort symbol,dso | head -60
+```
+
+业务上必须按请求类型分桶采集：normal、long_prompt、schema_fallback、non_ascii_fallback、cold_start。只给全局 branch miss rate 会把长尾冲淡。
+
+**CapacityLedger / 数值模型**：
+
+```text
+Delta_CPI_branch = branch_density * branch_miss_rate * miss_penalty_cycles
+branch_MPKI = branch_misses / instructions * 1000
+```
+
+决策规则：`Delta_CPI_branch > 0.15`、`branch_MPKI > 10` 或 `topdown-bad-spec > 10%` 时，branch 足以解释一个主要瓶颈；如果 branch miss rate 降低后 p99 不降，说明 cold path 同时带来 cache miss、malloc 或 syscall，需要转 0a-5/0b/0d。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| P99 抖动、P50 稳定 | cold path 分桶 `branch-misses/branches > 5%`，`topdown-bad-spec > 10%` | schema fallback、长 prompt、异常 token 污染预测器 | hot/cold path 分离，`#[cold]` / `__attribute__((cold))`，减少热循环分支 | 分桶 branch miss < 3%，P99 降到 SLA 内 |
+| 首批请求慢 | cold_start 分桶 BTB/RAS/branch miss 高 | predictor 尚未训练，I-cache cold | warmup 请求、固定代码布局、预热 tokenizer tables | 冷启动窗口缩短，steady-state 不退化 |
+| 间接调用热点 | `perf record -e branch-misses` 指向 dispatcher/vtable | indirect predictor 目标多变 | 去虚化、枚举 fast path、把策略 dispatch 移出内循环 | 目标 symbol 的 branch miss 占比下降 |
+| 加 likely 无收益 | 代码布局变了但 miss rate 不变 | 动态预测已学会，瓶颈不在 branch | 回退 hint，查 cache/OOO | branch 相关指标不差，下一象限证据明确 |
+
 ## 0a-3.2 为什么必须预测：流水线深度 × 分支密度的代价矩阵
 
 把"分支预测错一次浪费多少"量化。设流水线深度（front-end + back-end）为 P cycle，分支密度为 b（每条指令中分支占比），错预测率为 m，每次错预测的恢复 penalty 为 P_miss（约等于 in-flight 指令的清空时间）。则 CPI 中由分支误预测贡献的部分约为：

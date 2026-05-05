@@ -1,6 +1,6 @@
 # 第 0a-7 章 · 伪共享（False Sharing）
 
-伪共享是一类「写得对、跑得慢」的典型 Bug。代码逻辑看起来完全没有共享变量，profiler 也找不到锁竞争，但加线程不增吞吐、CPU 占用高得离谱、p99 抖动严重。它的根因在 [§0a.7 MESI 协议](./0a-cpu-microarchitecture.md#0a7) 与 [§0a.8 伪共享：DataLoader Worker Counter 实例](./0a-cpu-microarchitecture.md#0a8) 之间的"语义/物理粒度不一致"。本章把这个一句话能讲完的概念，展开为一条完整的工程链路：从物理机理、数据结构反例、检测方法、修复套路，到 NUMA 叠加、容器场景，最后落到 AI Infra 真实事故和一份可以贴在值班 wiki 的 SOP。
+伪共享是一类「写得对、跑得慢」的典型 Bug。代码逻辑看起来完全没有共享变量，profiler 也找不到锁竞争，但加线程不增吞吐、CPU 占用高得离谱、p99 抖动严重。它的根因在 [0a-6 MESI 一致性协议](./0a6-mesi-coherence.md) 所维护的 cache line 粒度一致性，与本章后面的 DataLoader Worker Counter 实例之间的"语义/物理粒度不一致"。本章把这个一句话能讲完的概念，展开为一条完整的工程链路：从物理机理、数据结构反例、检测方法、修复套路，到 NUMA 叠加、容器场景，最后落到 AI Infra 真实事故和一份可以贴在值班 wiki 的 SOP。
 
 ## 0a-7.1 第一性原理拆解 + 学习大纲
 
@@ -76,6 +76,37 @@ mindmap
 - [ ] 能描述跨 socket 一致性流量的代价来源（UPI/Infinity Fabric、目录、远端 invalidate）。
 - [ ] 能为多 worker 共享指标设计 thread-local + 周期 reduce 的方案，并说明 reduce 周期的选择依据。
 - [ ] 能给出一份从"线程数加倍但吞吐下降"到"改对齐复测"的完整 SOP，并指出每一步的回滚条件。
+
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：只处理"逻辑上独立、物理上同 cache line"导致的 false sharing，以及它和 true sharing/data race 的区分。**本章不负责**MESI 协议完整状态机（0a-6）、普通 capacity/conflict miss（0a-5）、锁算法正确性。控制路径是 worker 写字段 -> RFO -> invalidate 其他 sharer -> HITM 取回；数据路径是 cache line ownership 在 core/socket 间迁移；失败路径是 padding 过度导致容量 miss、thread-local flush 太慢导致指标陈旧、绑核掩盖而不修复代码。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -a -e cycles,instructions,cache-references,cache-misses,mem_load_l3_miss_retired.remote_hitm,mem_inst_retired.lock_loads -- sleep 30
+perf c2c record -F 4000 -ag -- sleep 30
+perf c2c report --stdio | head -120
+```
+
+同时做 thread-count sweep：1/2/4/8/16/32 worker 的吞吐、IPC、HITM 曲线。false sharing 的典型形状是 CPU% 升、IPC 降、吞吐过拐点反降。
+
+**CapacityLedger / 数值模型**：
+
+```text
+line_slots = cache_line_bytes / sizeof(counter_or_stats)
+flush_rate = workers * updates_per_worker_per_sec / flush_every
+padding_memory_overhead = padded_size / original_size
+```
+
+决策规则：一条 64B line 放 4 个 16B stats 时，只要 2 个以上 writer 位于不同 core，就可能反复迁移；`flush_every` 至少让全局 atomic RFO 频率降 10x，指标实时性要求再决定是否提高频率；padding 后总体 hot object 不能把 LLC 容量打爆。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| 加 worker 反降 | `perf c2c` 单 line HITM > 5%，offset 分散在多个字段 | false sharing | `alignas(64/128)`、tail padding、CachePadded | HITM 降到原值 <10%，吞吐曲线恢复单调 |
+| counter padding 后仍慢 | HITM 指向同一 offset/同一变量 | true sharing | per-thread/per-socket shard + reduce | HITM 频率降，读侧接受 reduce 延迟 |
+| padding 后 cache miss 升高 | LLC miss rate 升，HITM 降 | padding 让 working set 溢出 LLC | 只 padding 高频写对象，冷字段拆出 | HITM 低且 LLC miss 不高于基线 10% |
+| 只在生产双路复现 | Remote HITM 高，开发机无异常 | NUMA/跨 socket 放大 | 生产同拓扑压测、绑核、first-touch 本地化 | Remote HITM 占比下降，p99 收敛 |
 
 ## 0a-7.2 伪共享的物理机理：cache line 粒度 vs 程序员的语义粒度
 
@@ -430,7 +461,7 @@ numastat -p <pid>
 
 下面三个事故来自 AI Infra 工程经验，都是把上面的机理摁到具体场景的产物。
 
-### 事故 1：DataLoader worker stats 数组（即 [§0a.9 Worked Example](./0a-cpu-microarchitecture.md#0a9)）
+### 事故 1：DataLoader worker stats 数组（即 [0a-8 Worked Example](./0a8-cpu-worked-example.md)）
 
 8 worker 6400 samples/s，16 worker 反降到 5300。根因：`std::vector<WorkerStats>` 紧凑布局，4 个 worker 同 line。修复：`alignas(64)` + 每 64 sample 批量 flush + NUMA 亲和。最终 16 worker 7350 samples/s。
 

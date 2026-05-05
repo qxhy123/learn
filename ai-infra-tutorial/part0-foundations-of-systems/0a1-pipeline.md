@@ -83,6 +83,35 @@ mindmap
 6. 为什么 AI Infra 的 tokenizer 和 DataLoader 代码 IPC 经常只有 0.5-1.2，而训练主循环的 numerical kernel 反而能到 2.0+？这两类代码触发的流水线 stall 类型有何不同？
 7. 给一个 worked example：tokenizer 热点 IPC = 0.7，frontend stall = 25%，backend stall = 55%。你的下一步排查动作是什么？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：只解释流水线如何把单指令 latency 转换成吞吐，以及数据冒险、控制冒险、结构冒险如何制造 bubble。**本章不负责**预测器算法细节（0a-3）、ROB/rename/LSQ 的乱序调度（0a-2）、cache/MESI 具体状态（0a-5/0a-6）。控制路径是 PC -> IF -> ID -> EX 分支解析 -> flush/restart；数据路径是 register/forwarding -> EX/MEM/WB；失败路径是 load-use stall、branch flush、端口冲突、frontend 供指不足。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -p $(pgrep -f tokenizer_worker) -e cycles,instructions,branches,branch-misses,stalled-cycles-frontend,stalled-cycles-backend -- sleep 30
+perf stat -p $(pgrep -f tokenizer_worker) -e topdown-fe-bound,topdown-be-bound,topdown-bad-spec,topdown-retiring -- sleep 30
+```
+
+无法使用通用 stall 事件时，用 `perf stat --topdown` 或 `toplev --level 1` 替代。采样窗口必须和业务窗口对齐：同一段压测、同一批输入分布、同一 CPU 频率 governor。
+
+**CapacityLedger / 数值模型**：
+
+```text
+CPI_total = CPI_base + load_use_stalls/inst + branch_misses/inst * miss_penalty + structural_stalls/inst
+IPC = 1 / CPI_total
+```
+
+决策规则：如果 `IPC < 1.0` 且 `topdown-be-bound > topdown-fe-bound + topdown-bad-spec`，先查 load-use、cache miss、依赖链；如果 `topdown-fe-bound > 20%`，先查 I-cache/decoder/uop cache；如果 `branch-misses/branches > 5%`，跳到 0a-3，不要在本章层面继续猜。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| IPC 0.5-0.9，backend stall 高 | `perf stat` cycles 高、instructions 低，`topdown-be-bound > 50%` | load-use 链、L1/L2 miss、长依赖链 | 批处理、拆依赖、预取、改连续布局；必要时转 0a-5 | IPC 提升 > 30%，backend-bound 降到 < 35% |
+| frontend stall 高 | `stalled-cycles-frontend` 或 `topdown-fe-bound > 20%` | I-cache 热路径过大、间接调用/解释器前端压力 | hot/cold path 分离、减少模板膨胀、检查 uop cache 命中 | frontend-bound 下降，branch-miss 不上升 |
+| 改 SIMD 后没有收益 | SIMD counter 上升但 IPC 不升，backend stall 仍高 | 流水线不是执行单元瓶颈，而是等数据 | 回退宽 SIMD，先缩 working set 或分块 | tokenizer/preprocess 延迟不退化，cache miss 降低后再重试 SIMD |
+| 分支修复后仍慢 | `branch-misses` 降了但 IPC 仍 < 1 | 次级瓶颈转为 cache/OoO | 继续采 `LLC-load-misses`、`cycle_activity.stalls_l3_miss` | 用同样输入复测，确认瓶颈象限变化可解释 |
+
 ## 0a-1.2 5 段经典流水线：IF/ID/EX/MEM/WB
 
 5 段流水线源自 MIPS R2000，今天仍是教学和嵌入式核心的标准模型，也是理解所有现代深流水的基线。每段做的事情如下：

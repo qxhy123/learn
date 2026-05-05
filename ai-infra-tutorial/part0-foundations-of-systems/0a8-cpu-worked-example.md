@@ -1,6 +1,6 @@
 # 第 0a-8 章 · 综合 Worked Example：CPU 微架构端到端排障
 
-本章不再讲新机制，而是把 [§0a.2 流水线](./0a-cpu-microarchitecture.md#0a2-流水线5-段停顿冒险与-cpi)、[§0a.3 OoO](./0a-cpu-microarchitecture.md#0a3-乱序执行register-renaming-与-rob)、[§0a.4 分支预测](./0a-cpu-microarchitecture.md#0a4-分支预测btb预测器类型误预测代价)、[§0a.5 SIMD](./0a-cpu-microarchitecture.md#0a5-simdsseavxavx-512-与向量化判断)、[§0a.6 Cache](./0a-cpu-microarchitecture.md#0a6-cache-层级容量带宽延迟cache-line-与关联度)、[§0a.7 MESI](./0a-cpu-microarchitecture.md#0a7-mesi-协议四状态一致性流量与多-socket) 与 [§0a.8 伪共享](./0a-cpu-microarchitecture.md#0a8-伪共享dataloader-worker-counter-实例) 这 7 节学到的机制，串成 3 个端到端排障剧本，并提炼 Top-Down 方法、工具栈对照、SOP、反模式、综合 checklist。这是 Part 0 的"实战压轴"。
+本章不再讲新机制，而是把 [0a-1 流水线](./0a1-pipeline.md)、[0a-2 OoO](./0a2-out-of-order-execution.md)、[0a-3 分支预测](./0a3-branch-prediction.md)、[0a-4 SIMD](./0a4-simd.md)、[0a-5 Cache](./0a5-cache-hierarchy.md)、[0a-6 MESI](./0a6-mesi-coherence.md) 与 [0a-7 伪共享](./0a7-false-sharing.md) 这 7 节学到的机制，串成 3 个端到端排障剧本，并提炼 Top-Down 方法、工具栈对照、SOP、反模式、综合 checklist。这是 Part 0 的"实战压轴"。
 
 ## 0a-8.1 第一性原理拆解 + 学习大纲
 
@@ -65,7 +65,7 @@ mindmap
 2. 如何从 `perf stat` 的 IPC、cache-miss、branch-miss 三个数字粗判瓶颈类别？
 3. 什么时候应该上 `perf c2c`？它的 HITM 报告该怎么读？
 4. tokenizer 服务 P99 抖动而 P50 正常，最可能的微架构原因是什么？应该用哪些 perf 事件验证？
-5. vLLM/继续 batch 调度循环 QPS 上不去，如何用 0a-7 MESI + 0a-8 false sharing 的知识反推到具体代码行？
+5. vLLM/连续 batch 调度循环 QPS 上不去，如何用 0a-6 MESI + 0a-7 false sharing 的知识反推到具体代码行？
 6. 哪些情况下加 SIMD、改对齐、减少分支都是徒劳？此时真正的瓶颈在哪？
 7. 上线前的 CPU 微架构 checklist 至少应该覆盖哪些项？例行巡检至少要监控哪些 counter？
 
@@ -78,6 +78,38 @@ mindmap
 - [ ] 能给业务团队提交一份 before/after 数据齐全的修复报告
 - [ ] 能列出"看起来像 CPU 瓶颈但其实不是"的至少 3 种反模式
 - [ ] 能为新上线服务设计一份 CPU 微架构监控仪表盘最小项
+
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：这是 practical worked example 章节，负责把现象、假设、证据、修复和复测串成诊断流；不再引入新微架构机制，也不把自己写成泛泛结论。**本章不负责**替代每个机制章的细节解释：公式和机制回看 0a-1 到 0a-7。控制路径是告警 -> 假设排序 -> EvidenceBundle -> 最小修复 -> retest；数据路径横跨业务指标、PMU、flame graph、`perf c2c`、NUMA/GPU 指标；失败路径是采错窗口、指标无对照、把次级瓶颈当根因、修复后不复测。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -a -e cycles,instructions,branches,branch-misses,cache-references,cache-misses,LLC-loads,LLC-load-misses -- sleep 30
+perf stat -a -e topdown-fe-bound,topdown-be-bound,topdown-bad-spec,topdown-retiring -- sleep 30
+perf c2c record -ag -- sleep 30 && perf c2c report --stdio | head -100
+nvidia-smi dmon -s pucvmet -d 1
+```
+
+证据必须同窗：同一压测阶段、同一流量分桶、同一 worker 数、同一 CPU 频率策略。所有 worked example 都要给 before/after 的 IPC、branch-miss、LLC miss、HITM、QPS、p99、MFU/HFU。
+
+**CapacityLedger / 决策规则**：
+
+```text
+root_cause_score = severity * explainability * fix_reversibility
+host_gap_ms = observed_batch_ready_ms - target_batch_ready_ms
+retest_accept = p99_improved && no_regression_p50 && PMU_counter_moves_in_expected_direction
+```
+
+优先处理能解释端到端 gap 且可逆的根因：`topdown-be-bound > 50%` 查 cache/coherence；`topdown-bad-spec > 10%` 查 branch/cold path；`perf c2c` 热 line 明确时先修 false sharing；如果 PMU 变好但业务不变，立即进入次级瓶颈分支，而不是宣布修复。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| GPU util 周期性掉 | CPU EvidenceBundle 显示 backend/cache 或 HITM 异常 | host feed 断流，DataLoader/tokenizer/scheduler 卡住 | 按 Top-Down 分支进入 cache、branch、false sharing 剧本 | HFU/MFU 回升，GPU kernel gap 缩短，CPU counter 同向改善 |
+| 修了一个热点但 SLA 仍不达标 | 原热点 counter 降，p99 不降 | 次级瓶颈暴露或修复不在关键路径 | 重跑 EvidenceBundle，重新排序假设 | 新 top 根因能解释剩余 gap |
+| `perf` 数据和业务指标矛盾 | 采样窗口、cpuset、容器权限、频率策略不一致 | 证据包失真 | 固定频率/亲和，确认 CAP_PERFMON，重采 | 两次采样方差可接受，业务与 PMU 同窗 |
+| 回滚后仍异常 | 同样 PMU 异常仍在 | 根因不在该修改或环境变更 | 查部署、kernel、BIOS、NUMA、输入分布 | 回到基线版本的指标可复现，RCA 有对照 |
 
 ## 0a-8.2 完整剧本一：DataLoader 16 worker 反而比 8 worker 慢
 

@@ -1,6 +1,6 @@
 # 第 0a-2 章 · 乱序执行、寄存器重命名与 ROB
 
-第 0a 章把 OoO（Out-of-Order Execution）放在 §0a.3 用一节带过：流水线只解决"阶段重叠"，OoO 解决"等待时别闲着"。但对 AI Infra 工程师来说，这个机制值得被单独拆开：现代服务器 CPU（Intel Sapphire Rapids、AMD Zen4、ARM Neoverse V2 等）的 ROB（Reorder Buffer）容量都在 224-352 之间，每个核心同时维持 90-110 个 in-flight loads。如果你写出来的 host-side LLM 服务代码让 ROB 平均只能装 30-50 条 in-flight uop，CPU 算力会被结构性浪费 70% 以上，而 `top` 看到的还是 100% 利用率。本章把 OoO 引擎完整剖开：frontend、rename、issue queue、reservation station、ROB、LSQ；并解释为什么"指针追逐 + 分支密集"的 Python/C++ 服务代码，是 OoO 最不喜欢的形状。
+第 0a 章总览把 OoO（Out-of-Order Execution）列为独立深挖主题：流水线只解决"阶段重叠"，OoO 解决"等待时别闲着"。但对 AI Infra 工程师来说，这个机制值得被单独拆开：现代服务器 CPU（Intel Sapphire Rapids、AMD Zen4、ARM Neoverse V2 等）的 ROB（Reorder Buffer）容量都在 224-352 之间，每个核心同时维持 90-110 个 in-flight loads。如果你写出来的 host-side LLM 服务代码让 ROB 平均只能装 30-50 条 in-flight uop，CPU 算力会被结构性浪费 70% 以上，而 `top` 看到的还是 100% 利用率。本章把 OoO 引擎完整剖开：frontend、rename、issue queue、reservation station、ROB、LSQ；并解释为什么"指针追逐 + 分支密集"的 Python/C++ 服务代码，是 OoO 最不喜欢的形状。
 
 ## 0a-2.1 第一性原理拆解 + 学习大纲
 
@@ -68,9 +68,38 @@ mindmap
 6. 一段"链表遍历 + 每个节点判断 if 后调函数"的 Python/C++ host 代码，为什么在现代 OoO CPU 上 IPC 经常只有 0.4-0.8？
 7. 当你看到 `perf stat` 里 `uops_executed.thread / uops_retired.retire_slots > 1.5` 或 `cycles - uops_retired/4 > 0` 显著时，应该怀疑哪一类瓶颈？
 
+### 边界、EvidenceBundle、CapacityLedger 与故障排除
+
+**本章拥有的边界**：解释 rename、scheduler、ROB、PRF、LSQ 如何把独立 uop 放到 in-flight 窗口里隐藏 latency。**本章不负责**分支预测算法（0a-3）、SIMD lane 内算法（0a-4）、具体 cache line 布局（0a-5/0a-7）。控制路径是 decode -> rename/allocate -> dispatch -> issue -> retire；数据路径是物理寄存器、load/store queue、cache miss outstanding request；失败路径是 ROB/PRF/LSQ 满、memory disambiguation squash、machine clear、retire 受队头阻塞。
+
+**EvidenceBundle**：
+
+```bash
+perf stat -p $(pgrep -f serve) -e cycles,instructions,uops_issued.any,uops_retired.retire_slots,uops_executed.thread,cycle_activity.stalls_l3_miss,machine_clears.memory_ordering -- sleep 30
+perf stat -p $(pgrep -f serve) -e topdown-fe-bound,topdown-be-bound,topdown-bad-spec,topdown-retiring -- sleep 30
+```
+
+AMD/ARM 事件名不同，仍保留同一证据形状：retire 槽利用率、backend memory stall、machine clear、LLC/DRAM miss、IPC。
+
+**CapacityLedger / 数值模型**：
+
+```text
+needed_inflight_uops ~= miss_latency_cycles * target_retire_uops_per_cycle
+MLP_upper_bound ~= min(load_buffer_entries, MSHR_entries, ROB_entries / uops_between_misses)
+```
+
+决策规则：L3 miss 80 cycle、目标 retire 4 uop/cycle 时，完全隐藏一次 miss 需要约 320 个独立 in-flight uop；如果热点是链表/哈希指针追逐，每次 miss 之间只有 5-10 uop，ROB 再大也无法形成 MLP。`topdown-be-bound > 60%` 且 `cycle_activity.stalls_l3_miss/cycles > 30%` 时，优先改数据布局，而不是加线程。
+
+| 症状 | 证据 | 根因 | 动作 | Retest / 复测 |
+|---|---|---|---|---|
+| CPU% 高但 IPC < 0.8 | backend-bound 高，retire slots 利用率低 | ROB 找不到独立工作，长依赖链 | SoA、数组索引替代指针、批处理多个请求 | IPC > 1.5，L3-miss-bound 降到 < 15% |
+| machine clear 高 | `machine_clears.memory_ordering` 或 vendor IBS 类事件高 | store/load 别名预测错，投机 load 被回滚 | 加 `restrict`、拆 alias、重排 store/load、减少共享 buffer | machine clear 降低，bad-spec 不上升 |
+| rename/allocate stall | uops issued 低、frontend 看似空闲、PRF/ROB 相关事件高 | PRF/ROB/LSQ 资源耗尽 | 降 unroll、减少临时对象、拆循环、减少 in-flight store | retire slots 利用率回升，cache miss 不恶化 |
+| 加 worker 无收益 | 每 worker IPC 更低，LLC miss 或 HITM 上升 | OoO 容量被 cache/coherence 吃掉 | 限制每 socket worker 数，转 0a-5/0a-7 查 LLC 和 false sharing | 总吞吐单调上升到新拐点，单 worker IPC 不再坍塌 |
+
 ## 0a-2.2 顺序流水线为什么不够：依赖链与 stall 主导
 
-回到 §0a.2 的 5 段流水线模型。理想 CPI = 1，但只要有一条 load miss 到 L2（约 25 cycle）甚至 L3（约 80 cycle），后面 25-80 个 cycle 全部是 bubble。问题是：那 25 个 cycle 里，常常有大量后续指令的操作数其实是就绪的，只是因为它们排在 miss 的 load 后面，硬件不允许越过。
+回到 [0a-1.2 的 5 段流水线模型](./0a1-pipeline.md#0a-12-5-段经典流水线ifidexmemwb)。理想 CPI = 1，但只要有一条 load miss 到 L2（约 25 cycle）甚至 L3（约 80 cycle），后面 25-80 个 cycle 全部是 bubble。问题是：那 25 个 cycle 里，常常有大量后续指令的操作数其实是就绪的，只是因为它们排在 miss 的 load 后面，硬件不允许越过。
 
 举一个具体例子。下面这段循环计算两个数组的加权和与最大值：
 
