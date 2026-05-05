@@ -574,6 +574,51 @@ PP 传输的是 full sequence activation（TP 将 hidden 维度降至 1/TP）：
 比 TP=1 降低 8×，大幅减少跨节点 PP 流量。这是 TP 与 PP 配合的隐性收益之一。
 ```
 
+#### 4.3.5 Stage 负载均衡
+
+bubble 公式假设所有 stage 计算时间相同。真实集群中首尾 stage 通常更慢，导致实测吞吐低于公式预测。
+
+**量化不均衡**
+
+```text
+stage_imbalance_ratio = max(stage_time_p50_per_stage) / mean(stage_time_p50_per_stage) - 1
+
+门限（参考值）：
+  < 5%：可接受，公式误差范围内
+  5-15%：显著，应用 layer redistribution 改善
+  > 15%：强制修复，interleaved pipeline 也无法弥补
+```
+
+观测方式：从 training metric 中按 `pp_stage` 维度聚合 `microbatch_compute_time`；或在 Nsight Systems 中按 stage 分组比较 compute kernel 时长。
+
+**常见不均衡来源与修复**
+
+| 来源 | 识别方式 | 修复方式 |
+|---|---|---|
+| Stage 0 含 embedding | Stage 0 compute 慢 10-30% | 将 embedding 单独作为 stage 0（0 层 Transformer block） |
+| Stage N-1 含 LM head + loss | 最后 stage 显著更慢 | Vocab parallel 切分 LM head；或让 LM head 独占最后 stage |
+| 序列长度倾斜（data skew） | 与第 8 章 data skew 症状一致（rank token skew P95 高） | 按第 8 章 §10.6 处理，不是 stage 负载均衡问题 |
+
+**Megatron 非均匀切分**
+
+Megatron 默认按均匀层数切分 stage。调整时：
+
+```bash
+# 通过 --num-layers-per-virtual-pipeline-stage 配合 interleaving 改变 virtual stage 粒度
+# 自定义不均匀切分需修改 megatron/core/pipeline_parallel/schedules.py 中的 partition 函数
+
+# DeepSpeed PipelineModule 提供 partition_method="parameters"（按参数量切分）
+# 对 embedding/LM head 不均有一定改善，但不精确
+model = PipelineModule(
+    layers=layers,
+    num_stages=8,
+    partition_method="parameters",  # 而非默认 "uniform"
+)
+```
+
+> [!WARNING]
+> 在修复 stage 不均衡之前，先确认 stage 时间差来自 compute（layer 负载），而不是来自 data skew（某些 rank 样本更长）。两种症状都表现为"某个 stage 慢"，但修复方式完全不同。
+
 ### 4.4 virtual stage、interleaved pipeline 和 zero bubble
 
 physical stage 是真实 rank 或 GPU 上的一段层。virtual stage 是同一物理 rank 上更细的层段。interleaved pipeline 让一个 rank 持有多个 virtual stage，例如：
@@ -1556,6 +1601,7 @@ FSDP HYBRID_SHARD group = node-local TP group or explicit DP-subgroup-local shar
 | OOM 只发生在某个 PP stage | OOM rank 集中在同一 `pp_stage`；HBM peak 高于其他 stage；stage 包含 embedding/LM head | layer split 不均、activation placement 过重、in-flight microbatch 太多、checkpoint granularity 太粗 | 重新切 stage；开启或加密 activation checkpointing；降低 microbatch；把 embedding/loss head 单独计入负载模型 |
 | OOM 发生在长 context 才出现 | seq length 翻倍后 HBM 非线性增长；attention kernel workspace 峰值高 | attention workspace/KV/mask 成为瓶颈，ZeRO/FSDP 不切 context | 启用 CP；检查 FlashAttention/Ring/Ulysses 支持；降低 sequence 或改 attention checkpoint |
 | pipeline bubble 太高 | Nsight 中 stage idle 明显；公式估算 `(p-1)/(m+p-1)` 高；tokens/s 低但 HBM 还有余量 | PP stage 太多、microbatch 太少、stage 不均、未启用 interleaving | 增加 microbatches；降低 PP；启用 interleaved pipeline；重新按 profile 切层 |
+| stage 时间不均 | `microbatch_compute_time{pp_stage=X}` P50 中某 stage 比其他 stage 慢 10%+；stage P95/P50 比值高；bubble 公式估算与实测差距 > 5% | embedding/LM head 在普通 stage；vocab parallel 未启用；data skew 误判为 stage 不均 | 按 `pp_stage` 聚合 compute time；将 embedding/LM head 单独处理；排查 data skew（见第 8 章 §10.6）；调整 partition method |
 | TP communication bottleneck | 每层 GEMM 间 NCCL AllReduce 暴露；NCCL bus bandwidth 低；TP group 跨节点 | TP size 过大、placement 错误、NVLink/NVSwitch 未命中、NCCL ring 选错 | 把 TP 限制到节点内；调整 rank order；跑 nccl-tests；检查 `nvidia-smi topo -m` 和 NCCL GRAPH |
 | bad placement 导致全局慢 | 同配置不同作业 step time 差异大；慢作业 TP/PP 跨不同拓扑 | scheduler 未做 topology-aware placement；GPU-NIC 亲和性差；rail 不均衡 | 加 node/GPU topology label；固定 rank mapping；按 NIC locality 分配；在准入中检查 mesh dump |
 | checkpoint mismatch | restore 报 tensor shape/key mismatch；或恢复后 loss spike | TP/PP/CP shape 改变；layer-to-stage mapping 改变；optimizer shard owner 改变 | 使用同 shape 恢复；编写显式 reshape/merge 工具；保存 parallel metadata；先恢复 model-only 做 warm start |
