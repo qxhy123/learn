@@ -71,6 +71,42 @@ flowchart TB
 5. pinned memory 为什么可能挤压 Page Cache？
 6. GPUDirect RDMA 为什么关心 GPU/NIC locality？
 
+### EvidenceBundle：NUMA、H2D、pinned memory 与 RDMA 路径
+
+H2D stalls、NUMA locality 和 RDMA fallback 不能靠单个 GPU util 判断。最小 EvidenceBundle 要把“静态拓扑、页在哪里、copy 怎么走、设备是否近、库是否 fallback”连成同一条链：
+
+| 证据 | 命令或来源 | 判断点 |
+|------|------------|--------|
+| 静态拓扑 | `nvidia-smi topo -m`、`numactl -H`、`lscpu -e`、`lspci -tv` | GPU、NIC、NVMe、CPU set、NUMA node 是否成组 |
+| PCIe 链路 | `lspci -vv -s <BDF>` 的 `LnkCap/LnkSta` | Gen/Width 是否降级，switch 上行是否共享 |
+| 页位置 | `numastat -p <pid>`、`/proc/<pid>/numa_maps` | batch/pinned buffer 是否 first-touch 到目标 NUMA node |
+| pinned 预算 | memlock、`Mlocked/Unevictable`、cgroup memory、DataLoader queue depth | pinned footprint 是否挤压 Page Cache 或触发注册失败 |
+| H2D timeline | Nsight Systems、CUDA event、copy stream/event | pageable staging、隐式同步、小 copy、copy engine 排队是否存在 |
+| RDMA/GDRDMA | `nvidia_peermem`、NCCL/UCX logs、`ib_write_bw --use_cuda` near/far 对比 | CUDA buffer 是否直接走近端 HCA，是否 fallback 到 host staging |
+
+### CapacityLedger：链路带宽和锁页预算
+
+```text
+required_h2d_bw
+  = host_input_bytes_per_step / allowed_copy_seconds
+
+observed_h2d_bw
+  = copied_bytes / cuda_event_elapsed_seconds
+
+pinned_footprint
+  ~= ranks_per_node * workers_per_rank * prefetch_factor * batch_bytes * buffer_copies
+
+safe_pinned_budget
+  <= MemAvailable - anon_working_set - hot_page_cache_set - dirty_budget - kernel_reserve
+```
+
+工程 decision rule：
+
+- `observed_h2d_bw` 应与 PCIe `LnkSta`、NUMA 距离和 copy size 匹配。PCIe 4.0 x16 的大块 H2D 长期只有 10 GiB/s 时，先查 pageable staging、远端 NUMA、同步和小 copy，再怀疑硬件。
+- `pin_memory=True` 只在 pinned footprint 可预算时启用；它提升 DMA 条件，但会减少可回收 Page Cache。打开 pinning 后 dataset 第二轮变慢，要把 pinned footprint 和 Page Cache 一起复测。
+- rank/GPU/CPU/memory/NIC/NVMe 必须作为资源组调度。RDMA 或 GDS 路径只看“能跑通”不够，要 near/far 分组合测。
+- retest 不只看 H2D 单段变快，还要看 step wall time、GPU idle、copy/compute overlap 和同机 Page Cache 是否仍达 threshold。
+
 ## 2. NUMA：内存不是均匀池
 
 NUMA（Non-Uniform Memory Access）指 CPU 访问不同内存 node 的成本不同。双路服务器中，每个 socket 直接连接一组 DRAM channel。socket0 访问 node0 是本地访问；socket0 访问 node1 要经过 UPI、Infinity Fabric 或类似 socket interconnect。远端访问能工作，但延迟更高、带宽更低，还会占用跨 socket 链路。
@@ -772,6 +808,17 @@ ib_write_bw -d <far_hca>  --use_cuda=<near_gpu> <server>
 ```
 
 判断 near GPU/NIC 是否明显快于 far GPU/NIC，peermem 是否加载，NCCL/UCX/MPI 是否选到预期 HCA，host DRAM 带宽是否异常升高，fallback 是否只发生在特定 GPU/NIC 组合。
+
+### 9.7 Troubleshooting table：H2D stalls、NUMA locality、RDMA fallback
+
+| 症状 | 优先假设 | EvidenceBundle | 修复方向 | retest criteria |
+|------|----------|----------------|----------|-----------------|
+| H2D 带宽远低于链路合理区间 | pageable staging、copy size 太小或 PCIe 降级 | CUDA event、Nsight Systems、`LnkSta`、batch tensor layout | 开启并复用 pinned buffer，合并小 tensor，修复链路降级 | 大块 H2D bw 达到链路 threshold，小 copy 数下降 |
+| `pin_memory=True` 后仍不能 overlap | 默认 stream 或隐式同步串行化 | Nsight timeline、`.item()`/sync logging、copy stream event | 独立 copy stream、event 依赖、移除每 step sync | timeline 显示下一批 H2D 被当前计算遮住，step wall time 下降 |
+| GPU0 比 GPU7 慢，代码相同 | rank/worker first-touch 到远端 NUMA node | `nvidia-smi topo -m`、`numastat -p`、CPU affinity | rank/GPU/CPU/memory 绑定，worker 继承 cpuset | `numastat` 目标 node 占比达 threshold，H2D p95 收敛 |
+| 开启 pinning 后 IO 读变慢 | pinned footprint 挤压 Page Cache | `Mlocked/Unevictable`、`Cached`、major fault、DataLoader queue depth | 降低 workers/prefetch，复用 pinned pool，限制每 rank buffer | H2D 保持收益，major fault/refault 不超过 threshold |
+| GDRDMA 吞吐低或跨节点 all-reduce 慢 | GPU/NIC rail 错配或 fallback 到 host staging | NCCL/UCX logs、near/far `ib_write_bw --use_cuda`、host DRAM bw | 按 rail 绑定 rank/GPU/NIC，加载 peermem，修复 ACS/IOMMU/BIOS 配置 | near 组合显著优于 far 组合，多机 all-reduce 达标 |
+| RDMA 可用但 p99 抖 | 跨 socket、IOMMU/IOTLB 或共享 switch 上行竞争 | topology、PCIe counters、CPU memory bw、NCCL graph | 重新分组、分 rail 限速、避开共享上行热点 | all-reduce p95/p99 和 step p95 在压力复现下稳定 |
 
 ## 10. 常见误区
 

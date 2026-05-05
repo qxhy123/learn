@@ -52,6 +52,45 @@ flowchart LR
 7. dataset service、model gateway、log agent 应该如何选择 IO 模型？
 8. 如何用 `strace`、`perf`、`pidstat`、`ss`、`iostat` 和 `/proc` 建立证据，而不是凭感觉换架构？
 
+### EvidenceBundle：service IO latency 与 IO 模型判断
+
+服务 IO 的证据要覆盖三层：内核边界、应用队列、下游状态。只看 CPU util 或只看 QPS 都不足以判断该用 blocking、`epoll` 还是 `io_uring`。
+
+| 证据 | 命令或指标 | 判断点 |
+|------|------------|--------|
+| syscall 形态 | `strace -c`、`perf stat syscalls:*`、`read/write/recv/send` 次数和耗时 | 小 IO 是否把固定 syscall 成本放大 |
+| 调度成本 | context switches、run queue、thread count、off-CPU profile | blocking 等待、线程池过大或 futex/锁竞争是否存在 |
+| fd/socket 队列 | fd count、`ss -tinp`、send-q/recv-q、CLOSE_WAIT | 慢客户端、fd 泄漏或连接状态异常 |
+| event loop | event loop lag、ready events per tick、callback duration | CPU 重活是否放在事件循环，`epoll_wait` 是否 busy return |
+| 应用容量 | per-connection pending bytes、per-tenant in-flight、buffer pool used/free | backpressure 是否有上限 |
+| `io_uring` 路径 | kernel feature probe、opcode support、SQ/CQ depth、CQE error、fallback 统计 | 是否真的走目标 opcode，是否只是线程池 fallback |
+
+### CapacityLedger：服务 IO 的队列和边界公式
+
+```text
+syscall_rate
+  ~= payload_throughput_bytes_per_sec / chunk_size_bytes
+
+connection_buffer_budget
+  = max_connections * per_connection_pending_bytes
+
+tenant_budget
+  = active_tenants * per_tenant_pending_bytes
+
+ring_memory_budget
+  ~= sq_entries * sqe_bytes + cq_entries * cqe_bytes + fixed_buffer_count * fixed_buffer_size
+
+queueing_delay_floor
+  >= queued_bytes / drain_bytes_per_sec
+```
+
+工程 decision rule：
+
+- 如果 `syscall_rate` 很高但 chunk 只有 4 KiB-16 KiB，先增大 chunk、合并协议和减少小文件/小消息，再评估 `io_uring`。
+- 每连接、每租户、全局 pending bytes 必须有 threshold；没有 backpressure 的 `epoll` 或 `io_uring` 只会更快地积压内存。
+- `io_uring` 只有在 syscall 提交/完成路径、NVMe 队列深度或 fixed buffer/file 注册能被证据证明为瓶颈时才进入改造；低 QPS 控制面优先保持简单。
+- retest 必须包含正常负载、慢客户端、慢磁盘或慢对象存储、下游故障四类场景，且 p99/p999、event loop lag、pending bytes、reject/cancel counter 都要低于发布 threshold。
+
 ## 2. 用户态、内核态与 syscall：边界为什么存在
 
 CPU 用特权级隔离用户程序和内核。应用进程运行在用户态，只能访问自己的虚拟地址空间和普通指令；内核运行在更高特权级，可以管理页表、调度线程、控制设备、处理中断、维护文件系统和网络协议栈。
@@ -758,6 +797,17 @@ cat /proc/net/sockstat
 | NVMe 未打满但 `pread` 提交成本高 | 批量预取，评估 `io_uring` |
 | 磁盘 await 高、util 高 | 存储瓶颈，优化格式、缓存、队列深度 |
 | 对象存储 RTT 高 | 连接池、range 合并、缓存、并发控制 |
+
+### 12.6 Troubleshooting table：service IO latency、epoll 与 io_uring
+
+| 症状 | 优先假设 | EvidenceBundle | 修复方向 | retest criteria |
+|------|----------|----------------|----------|-----------------|
+| QPS 不高但线程很多、p99 高 | blocking 线程池被慢依赖占满 | off-CPU、context switch、线程栈、依赖耗时 | 线程池隔离、超时、bulkhead、必要时 async | 慢依赖注入下快路径 p99 低于 threshold |
+| CPU 高、NVMe/网络没打满 | 小 read/write 和 syscall 过多 | `strace -c`、syscall rate、chunk size 分布 | 增大 chunk、批量协议、shard 合并，再评估 `io_uring` | syscall rate 下降，CPU/QPS 改善，吞吐达到容量目标 |
+| `epoll_wait` 频繁立刻返回 | 未 drain 到 `EAGAIN`、错误管理或 busy loop | ready events/tick、`strace -ttT`、event loop lag | 修正 LT/ET drain loop，只在有 pending output 时关注 `EPOLLOUT` | event loop idle 恢复，空转 CPU 降低 |
+| 慢客户端拖垮快客户端 | per-connection 或 per-tenant pending 无上限 | send-q、pending bytes、客户端速率分布 | backpressure、write timeout、取消上游、分租户限额 | 慢客户端压测下快客户端 p99/p999 达标 |
+| `io_uring` 改造后无收益 | fallback、队列深度不足或瓶颈不在 syscall | feature probe、CQE res、SQ/CQ depth、CPU profile | 回退成熟 runtime，或只保留证明有收益的本地 NVMe pipeline | A/B 下 p95/p99、CPU、吞吐均超过预设收益 threshold |
+| RSS 持续增长 | buffer 生命周期错误或 CQE 未消费 | buffer pool used/free、CQ backlog、pending bytes | 固定 buffer owner，free-list 水位，完成后再复用 | 长压测 RSS 平稳，CQ backlog 和 pending bytes 有界 |
 
 ## 13. 设计清单
 

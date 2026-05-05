@@ -44,6 +44,42 @@ flowchart LR
 4. DataLoader `fork` 后哪些页会共享，哪些写入会触发 COW？
 5. RSS、PSS、VMS 为什么不能混用？为什么“看起来占了很多内存”未必代表真实独占？
 
+### EvidenceBundle：page fault 与地址空间排障最小证据
+
+遇到 page-fault storm、mmap 冷启动尖刺、fork 后 RSS 暴涨或 TLB miss 异常时，不要只看 `top`。先把证据包采完整：
+
+| 证据 | 命令或来源 | 用来排除什么误判 |
+|------|------------|------------------|
+| fault rate | `perf stat -e minor-faults,major-faults,page-faults -p <pid> -- sleep 30` | 区分 minor fault 风暴和真正读盘的 major fault |
+| 内存构成 | `/proc/<pid>/smaps_rollup`、`RssAnon/RssFile/RssShmem` | 区分匿名页、文件页、共享页和私有脏页 |
+| 页表成本 | `/proc/<pid>/status` 的 `VmPTE` | 判断大 mmap 或碎映射是否把页表本身变成容量项 |
+| COW 证据 | `Private_Dirty`、worker PSS、父对象写入路径 | 判断 DataLoader worker 是否复制父进程对象 |
+| 冷启动路径 | readiness 前后的 major fault、存储读带宽、请求 p99 | 判断首个用户请求是否在替服务触碰冷 mmap 页 |
+
+一个 EvidenceBundle 必须同时包含时间窗口、进程或线程 ID、工作负载阶段和改动前后对比。只记录“RSS 很高”或“page faults 很多”不能说明根因。
+
+### CapacityLedger：虚拟内存也要算账
+
+最小容量账不是单个 RSS 数字，而是：
+
+```text
+effective_private_memory
+  ~= RssAnon + Private_Dirty + private allocator/cache + page_table_bytes
+
+page_table_bytes_4k
+  ~= mapped_resident_bytes / 4096 * bytes_per_pte_with_upper_levels
+
+mmap_warmup_time
+  >= cold_file_bytes / sustained_read_bw + major_fault_count * per_fault_overhead
+```
+
+工程 decision rule：
+
+- 服务进入 readiness 后，请求路径 `major-faults` 的 threshold 应为 0；任何新增 major fault 都要解释为预热缺口、内存压力或后端文件页被回收。
+- 多 worker 内存预算用 PSS 和 `Private_Dirty`，不要用 `RSS * workers`，也不要完全忽略共享页。
+- `VmPTE` 到 GiB 级时，页表已经是容量问题；先减少碎 VMA、评估 0b2 的 Huge Pages，再判断是不是业务对象泄漏。
+- mmap 权重或索引的 cold-cache benchmark 和 warm-cache benchmark 必须分开报告，否则无法区分 Page Cache 收益和模型路径收益。
+
 ## 2. 虚拟内存：地址空间是幻觉，但这个幻觉很有用
 
 每个 Linux 进程都有自己的虚拟地址空间。用户程序里看到的指针，例如 `0x7f...`，不是 DRAM 上的真实地址，而是虚拟地址。CPU 访问内存时，MMU 会把虚拟地址翻译成物理地址。
@@ -582,6 +618,16 @@ cat /proc/$pid/smaps_rollup
 pidstat -r -p $pid 1
 perf stat -e minor-faults,major-faults,dTLB-load-misses -p $pid -- sleep 30
 ```
+
+### 10.1 Troubleshooting table：page-fault storm 与 COW
+
+| 症状 | 优先假设 | EvidenceBundle | 修复方向 | retest criteria |
+|------|----------|----------------|----------|-----------------|
+| 服务首个请求 p99 尖刺，之后恢复 | mmap 权重、tokenizer 或索引冷页在请求路径触碰 | readiness 前后 `major-faults`、存储读带宽、请求 timeline | 启动阶段顺序 warmup 关键 byte range；必要时限制接流量条件 | 连续压测窗口内 `major-faults` 不增长，首批请求 p99 低于发布 threshold |
+| 训练启动或 epoch 切换时 minor fault 极高 | 大匿名页首次 touch、allocator arena 初始化或 COW | `minor-faults`、`Private_Dirty`、初始化阶段日志 | 把首次 touch 移到非关键路径；减少 worker 写父对象 | 同样 batch/worker 配置下 minor fault 峰值下降，step time 尖刺消失 |
+| DataLoader worker RSS 看起来复制了父进程 | RSS 重复计算共享页，或真实 COW | worker PSS、`Shared_Clean`、`Private_Dirty`、父对象写路径 | metadata 只读化，改 mmap/Arrow/NumPy，worker cache 本地化 | PSS 稳定，`Private_Dirty` 不随 epoch 单调增长 |
+| `VmPTE` 异常高，TLB miss 也高 | 映射太碎或 4 KiB 页覆盖巨大工作集 | `VmPTE`、VMA 数、dTLB miss、`smaps` | 合并映射，减少小对象图，评估 0b2 THP/HugeTLB | `VmPTE` 和 dTLB miss 下降，吞吐或 p99 有可重复改善 |
+| major fault 在运行中重新出现 | Page Cache 被回收、内存压力或远端 FS 抖动 | `pgmajfault`、`workingset_refault_file`、`MemAvailable`、存储 await | 降低同机压力，预留 hot file working set，调整调度 | 相同压力模型下 major fault rate 低于 threshold，p95/p99 不再同步抖动 |
 
 ## 11. Checklist
 

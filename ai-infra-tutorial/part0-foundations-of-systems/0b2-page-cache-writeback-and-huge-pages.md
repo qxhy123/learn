@@ -51,6 +51,45 @@ sequenceDiagram
 6. THP `always`、`madvise`、`never` 和 HugeTLB 分别适合什么场景？
 7. Huge Pages 解决 TLB 压力，不解决哪些内存和 IO 问题？
 
+### EvidenceBundle：Page Cache、dirty writeback 与 huge page misses
+
+本章只处理“文件页是否在内存、脏页何时落盘、地址转换是否被 4 KiB 页放大”这三件事。不要把对象存储鉴权、Lustre MDT 调度、NVMe 队列调优或通用文件系统设计塞进这里；那些属于后续存储章节。本章的 EvidenceBundle 要能证明 Page Cache / writeback / huge page 机制是否在场：
+
+| 主题 | 必采证据 | 解释边界 |
+|------|----------|----------|
+| page cache 命中 | `Cached`、`Active(file)`、`Inactive(file)`、major fault、存储读带宽 | 证明第二轮变快是文件页命中，不证明解码、tokenization 或应用 cache 变快 |
+| page cache 回收 | `workingset_refault_file`、`pgscan/pgsteal`、`MemAvailable`、同机作业时间线 | 证明热文件页被挤出，不直接证明底层存储坏 |
+| dirty writeback | `Dirty`、`Writeback`、`nr_dirty`、`nr_writeback`、`iostat await/util`、`fsync` 耗时 | 证明 checkpoint 尾延迟来自回写债务或存储队列 |
+| checkpoint 语义 | tmp shard、manifest、`rename()`、父目录 `fsync()`、恢复演练日志 | 证明恢复路径不会读到半成品 |
+| huge page misses | dTLB miss、`AnonHugePages`、`FilePmdMapped`、THP/compaction 指标、p99 timeline | 证明大页减少地址转换成本，或证明 THP 引入尾延迟 |
+
+### CapacityLedger：缓存、回写和大页预算
+
+把 Page Cache 当成全机容量账，而不是“Linux 自己会处理”的黑盒：
+
+```text
+hot_file_working_set
+  <= MemAvailable - anon_working_set - pinned_footprint - kernel_reserve - dirty_budget
+
+dirty_tail_seconds
+  >= dirty_bytes / sustained_write_bw
+
+checkpoint_wall_time_floor
+  >= checkpoint_bytes / min(sustained_write_bw, network_or_fs_bw)
+
+pte_count_4k
+  ~= resident_large_region_bytes / 4096
+pte_count_2m
+  ~= resident_large_region_bytes / (2 * 1024 * 1024)
+```
+
+工程 decision rule：
+
+- 大内存训练节点优先用 `vm.dirty_bytes` / `vm.dirty_background_bytes` 表达 dirty budget；ratio 只适合内存规格一致且已经验证尾延迟的节点池。
+- checkpoint 允许额外等待 `S` 秒、稳定写吞吐为 `B` GiB/s 时，`dirty_bytes` 不应远高于 `B * S`。否则延迟债务会在 throttle 或 `fsync()` 处集中出现。
+- Lustre、NFS、并行文件系统或 object storage FUSE 上的 mmap/page cache 行为仍要看 major fault 和 read bandwidth；不要把远端后端的 warm-cache 命中当成真实 cold-cache 容量。
+- THP/HugeTLB 只有在 dTLB miss 或 page walk 是瓶颈时才进入优化路径；收益必须用吞吐或 p99 retest 证明。
+
 ## 2. Page Cache：空闲内存不是浪费
 
 Linux 会用空闲 DRAM 缓存文件页。`free -h` 里 `buff/cache` 不是浪费，而是可回收缓存。训练读取 dataset 时，第一轮可能受 NVMe、NFS、并行文件系统或对象存储 gateway 限制；第二轮如果命中 Page Cache，会接近内存速度。
@@ -723,6 +762,17 @@ grep -E 'AnonHugePages|THPeligible' /proc/<pid>/smaps_rollup
 4. 从 always 改 madvise，启动期预热大 arena
 5. 必要时用 HugeTLB 换确定性
 ```
+
+### 10.1 Troubleshooting table：Page Cache、dirty writeback、huge page misses
+
+| 症状 | 优先假设 | EvidenceBundle | 修复方向 | retest criteria |
+|------|----------|----------------|----------|-----------------|
+| dataset 第一轮慢、第二轮快 | 第一轮 cold-cache miss，第二轮 page cache hit | major fault、存储读带宽、`Cached/Active(file)`、drop-cache 或隔离冷启动对比 | 分开报告 cold/warm；调整 shard、readahead、预热或本地缓存策略 | cold-cache 吞吐达到容量 threshold；warm-cache 结果不再被当成存储基线 |
+| 多作业运行后读延迟抖动 | Page Cache 被污染或热文件页 refault | `workingset_refault_file`、`pgscan/pgsteal`、同机 job IO 时间线 | 调度隔离、大扫描后 `fadvise(DONTNEED)`、限制同机缓存竞争 | 压力复现下 refault 和 major fault rate 低于 threshold，batch p99 收敛 |
+| checkpoint 前快后慢 | dirty page 积压后被 throttle 或 `fsync` 集中偿还 | `Dirty/Writeback`、`nr_dirty/nr_writeback`、`iostat await`、`fsync` span | 用 bytes 控制 dirty budget，限并发，rank 错峰，本地落盘后归档 | checkpoint wall time p95/p99 达标，`Dirty` 不超过预算，GPU idle 时间下降 |
+| checkpoint 恢复读到半成品 | 提交协议缺少 manifest、原子 rename 或目录 fsync | 崩溃矩阵、目录项、manifest 校验、恢复演练 | tmp shard -> fsync -> rename -> manifest -> dir fsync；恢复只认完整 manifest | kill -9 / 节点重启演练后只恢复到完整 checkpoint |
+| THP 打开后 p99 变差 | fault-time compaction、khugepaged 合并/拆分影响请求路径 | THP mode、compaction、`AnonHugePages`、dTLB miss、请求 timeline | `always` 改 `madvise`，启动期预分配触碰，必要时 HugeTLB | dTLB miss 不回升或可接受，p99/p999 低于服务 threshold |
+| HugeTLB 申请失败或收益不稳定 | 预留容量不足，或原瓶颈不在 TLB | HugeTLB pool、`smaps_rollup`、dTLB miss、吞吐对比 | 把预留纳入容量账，只对长期大数组使用 | huge page 命中率稳定，普通内存和 Page Cache 没被挤压 |
 
 ## 11. Checklist
 
