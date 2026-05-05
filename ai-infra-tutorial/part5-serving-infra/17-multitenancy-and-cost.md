@@ -846,6 +846,262 @@ authn/authz
 
 越早拒绝越便宜。等请求进入 GPU prefill 后再拒绝，平台已经付出了最贵的成本。
 
+#### 17.6.3 分布式 quota 的实际同步机制
+
+"网关检查 quota" 在单实例 gateway 时是简单的 token bucket。多实例 gateway（一个 LLM 平台通常有几十到几百个 gateway pod）时，**多个实例怎么共享同一个租户的配额**就成了核心工程问题。
+
+**强一致方案：Redis Lua 原子 token bucket**
+
+```lua
+-- KEYS[1] = bucket key, ARGV[1] = current_time, ARGV[2] = cost
+-- ARGV[3] = capacity, ARGV[4] = refill_rate
+local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1]) or tonumber(ARGV[3])
+local last_refill = tonumber(bucket[2]) or tonumber(ARGV[1])
+
+-- 按时间补充 token
+local elapsed = tonumber(ARGV[1]) - last_refill
+tokens = math.min(tonumber(ARGV[3]), tokens + elapsed * tonumber(ARGV[4]))
+
+if tokens >= tonumber(ARGV[2]) then
+    tokens = tokens - tonumber(ARGV[2])
+    redis.call('HMSET', KEYS[1], 'tokens', tokens, 'last_refill', ARGV[1])
+    return 1   -- 通过
+else
+    return 0   -- 拒绝
+end
+```
+
+每次请求 gateway 都跑这段 Lua 脚本（Redis 单线程保证原子）。优点是配额严格不超用；代价是**每个请求一次 Redis round-trip**，gateway → Redis 通常 0.5-2ms，对 LLM 场景可接受（相比 GPU 处理时间），但对超低延迟服务可能成为瓶颈。
+
+**最终一致方案：Local bucket + 周期同步**
+
+每个 gateway 持有一份本地 bucket，独立扣 token。每 100-500ms 向中心 Redis 同步一次：
+
+```text
+gateway_local_bucket:
+  reserved_share = total_capacity / num_gateways  # 启动时分配
+  
+请求到达:
+  if local_tokens >= cost:
+    local_tokens -= cost
+    accept
+  else:
+    refresh_from_central()  # 从中心 Redis 看是否还有借用空间
+    retry
+    
+周期同步（每 200ms）:
+  central.tokens = sum(gateway_local_tokens) over all gateways
+  gateway 按当前流量重新分配 share
+```
+
+代价是**配额会被超用 1-2x**：在同步窗口内，多个 gateway 都觉得自己还有 token，独立放过去。生产权衡：
+
+- 用 Redis 原子 bucket：配额准确但延迟高、Redis 单点。
+- 用 local bucket + 同步：高吞吐、Redis 抖动不影响数据面，但配额是"软上限"。
+- 多数 LLM 平台选 local + 同步，因为 quota 本身已经是"防爆"而非"精确计费"——多放过 5% 不是事故，但所有 gateway 都被 Redis 拖慢就是事故。
+
+**Sliding window vs Token bucket vs Leaky bucket**：
+
+| 算法 | 适合 | LLM 场景 |
+|---|---|---|
+| Token bucket | 允许 burst，按平均速率 refill | RPS / RPM 限流首选 |
+| Leaky bucket | 严格平滑流出，不允许 burst | 防止下游过载（如向量库） |
+| Fixed window | 简单，但跨窗口边界有 2x burst | 不适合 LLM（请求成本差异大） |
+| Sliding window log | 精确但内存代价高（存每次请求时间戳） | 对小流量、严格精度场景 |
+| Sliding window counter | 平衡精度和开销（前一窗口的 weighted decay） | 大流量推荐 |
+
+LLM 场景特殊点：**请求成本差异巨大**。短问答 100 token vs 长上下文 32K token，token bucket 应该按 **estimated tokens** 扣 cost 而非按"1 个请求 = 1 个 token"。Pre-charge by `max_tokens`、完成后多退少补是更合理的实现。
+
+#### 17.6.4 Deficit Round-Robin 在 LLM 场景的实际队列
+
+§17.5.2 给了 DRR 公式，这里讲实际队列怎么实现。生产通常长这样：
+
+```text
+struct TenantQueue {
+    queue: FIFO<Request>            # 该租户的等待请求
+    deficit: f64                    # 当前还能消耗的 token 预算
+    weight: f64                     # 租户优先级权重
+    last_active_ts: timestamp       # 上次有请求的时间
+}
+
+scheduler 主循环:
+    for tenant in active_tenants（按 round-robin 顺序）:
+        tenant.deficit += tenant.weight × refill_rate × dt
+        
+        while tenant.queue not empty:
+            req = tenant.queue.peek()
+            cost = estimate_cost(req)           # input + output × decode_rate + KV
+            if cost <= tenant.deficit:
+                tenant.deficit -= cost
+                admit(req)                      # 进入实际 GPU 调度
+                tenant.queue.pop()
+            else:
+                break                            # 这租户配额不够，下一轮再处理
+        
+        if tenant.queue empty for > idle_timeout:
+            remove tenant from active list      # 闲置租户从轮转中移除
+```
+
+关键工程点：
+
+- **Cost estimation 必须 conservative**：估低了短租户会偷占长租户预算。`max_tokens` 而非平均输出。
+- **Aging（饥饿保护）**：长期等待的请求 deficit 加 bonus，防止长 prompt 大户永远抢不到资源。`bonus = (now - req.arrived_at) × age_weight`。
+- **Active list 维护**：不让"死租户"占轮转位（每 round 都要白白遍历）。idle 超过 30s 移出，新请求来时再加回来。
+- **Per-shard scheduler**：单 scheduler 通常 100-500K req/s 上限。超过用 consistent hash 把 tenant_id 分到多个 scheduler shard，每 shard 独立跑 DRR。
+
+**Borrowed Virtual Time (BVT) 变体**：紧急请求允许"透支" deficit（变成负的），未来通过更慢的 refill 还回来。这对 SLO Platinum 租户的 burst 场景有用，但实现要小心防止租户长期透支。
+
+### 17.4e Autoscaling controller 的实际机制
+
+§17.4d 给了五类信号，生产里这些信号怎么变成"扩缩容动作"？这里讲三种主流 controller 的实际机制。
+
+**机制 1：Kubernetes HPA + Custom Metrics Adapter**
+
+```text
+HPA controller（kube-controller-manager 内置）每 15s 跑一次：
+  1. 从 metrics.k8s.io 拉取目标指标（如 P95 TTFT、KV usage）
+  2. 当前 replicas × (current_metric / target_metric) = desired_replicas
+  3. 如果 desired ≠ current，调整 Deployment.replicas
+
+custom metrics 来源：
+  Prometheus Adapter:
+    Prometheus 持续抓取 vLLM /metrics 端点
+    Adapter 把 PromQL 查询结果暴露为 metrics.k8s.io API
+    HPA 看到的是 "vllm_p95_ttft_seconds_5m" 这种聚合指标
+```
+
+工程边界：
+
+- HPA 的反应延迟典型 30s-2min（scrape interval + adapter 延迟 + HPA loop）。LLM 副本冷启动 1-3 分钟——HPA 反应过来时高峰可能已经过去。
+- 不要直接用 GPU utilization 触发扩容；用 queue wait 或 KV pressure。
+- `behavior` 字段控制扩缩速度。生产配置常见 `scaleUp.policies={Pods: 4 per 60s}` 防止瞬时尖峰过度扩容。
+
+**机制 2：KEDA（事件驱动 autoscaler）**
+
+KEDA 比 HPA 更适合 LLM 场景，因为它支持外部指标作为触发器：
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-scaler
+spec:
+  scaleTargetRef:
+    name: vllm-deployment
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 2
+  maxReplicaCount: 50
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus:9090
+      query: |
+        avg(rate(vllm_request_queue_time_seconds_sum[1m]) /
+            rate(vllm_request_queue_time_seconds_count[1m]))
+      threshold: "0.2"   # 200ms queue wait
+  - type: prometheus
+    metadata:
+      query: max(vllm_gpu_cache_usage_perc)
+      threshold: "85"
+```
+
+KEDA 把多个 trigger 取 max（"任一指标超阈值就扩"），比 HPA 的单指标灵活得多。
+
+**机制 3：Karpenter / Cluster Autoscaler（节点级扩缩）**
+
+HPA/KEDA 改 replica 数，但没有节点的话 pod 永远 pending。Karpenter 看 pending pod 自动 provision GPU 节点：
+
+```text
+HPA 决定 replicas = 20 → 创建 20 个 vLLM pod
+当前节点池只装得下 12 个 → 8 个 pod pending
+Karpenter:
+  → 看到 pending pod 的 resources.limits.nvidia.com/gpu = 8
+  → 计算需要新增 1 台 8×H100 节点
+  → 调云厂商 API provision EC2 / GCE 实例
+  → 节点 ready 后 pod 自动调度上去
+```
+
+工程边界：
+
+- GPU 节点 provision 通常 3-10 分钟（比 CPU 节点慢得多，因为镜像大、驱动初始化、CUDA warmup）。
+- Spot 实例 + Karpenter 配合 `consolidation`（自动整理碎片）能省 30-50%，但要做好 drain 演练。
+
+**机制 4：预测式扩容**
+
+反应式（reactive）autoscaling 在 LLM 场景永远跟不上——副本冷启动比流量上升慢。生产高 SLO 服务必须叠加**预测式扩容**：
+
+```text
+预测模型输入特征:
+  - 过去 7 天每分钟的 QPS 时间序列
+  - hour-of-day, day-of-week, holiday flag
+  - 上游业务的预期事件（如 "今晚 8 点直播"）
+  - 当前 1 分钟、5 分钟、15 分钟的实际 QPS（观测最新趋势）
+
+预测算法:
+  Holt-Winters / 简单 EMA: 季节性 + 趋势分解
+  Prophet: Facebook 开源，对节假日和周期性友好
+  小型 LSTM / Transformer: 流量形态复杂时
+  
+输出:
+  predicted_qps_at(t + 5min), predicted_qps_at(t + 15min)
+  → 转换为 predicted_replicas = predicted_qps × seconds_per_request / target_concurrency
+  → 提前 N 分钟 scale，N = 副本冷启动时间 + 安全 buffer
+```
+
+实战经验：
+
+- **简单 EMA 通常足够**：特别是流量形态周期性强（早高峰、晚高峰）的内部业务。复杂模型反而过拟合。
+- **预测错时 fallback 到反应式**：永远不要让预测路径成为唯一扩缩容路径。Reactive HPA 是兜底。
+- **Buffer pool（warm pool）是预测扩容的退化版**：如果不愿意做预测模型，预留 N 个 warm 副本兜底也行——成本高但实现简单。
+
+#### 17.9.4 Noisy neighbor 反事实估计的实现
+
+§17.9.1 给了 ΔP99 的概念，但"如果没有 T 流量时其他租户会怎样"这个反事实怎么实际估计？三种主流方法：
+
+**方法 A：时间段对比（最简单）**
+
+```text
+对租户 T，找出今天 T 的高峰时段（top 20% 流量）
+对比同时段的其他租户 P99 vs 昨天/上周同时段（T 流量正常时）
+
+ΔP99(T) = P99(others, T_high_today) - P99(others, T_normal_yesterday)
+```
+
+简单但易受混淆：周二和周三流量本来就不同。
+
+**方法 B：A/B 流量分桶（更可靠）**
+
+```text
+配 5% 流量永久走 "T-isolated pool"（强隔离副本）
+对比:
+  control_group: 5% 走 isolated（不受 T 影响）
+  treatment_group: 95% 走 shared（受 T 影响）
+
+ΔP99(T) = P99(others, treatment) - P99(others, control)
+```
+
+成本是要预留 5% 容量做 control。但能持续监测，不依赖时间窗口对齐。
+
+**方法 C：因果推断（学术风格，少用）**
+
+用 propensity score matching 或 instrumental variable，从历史观测数据估计因果。理论严格但实现复杂，工程上少用。
+
+实际生产更多用 A 做粗筛、B 做核心租户的持续监测。识别出 noisy neighbor 后的处置流水线：
+
+```text
+1. ΔP99(T) > threshold 持续 15min → 标记 candidate
+2. 查 T 的近期变化（input length 变长？QPS 翻倍？新接入租户？）
+3. 自动动作:
+   - 把 T 的长 prompt 路由到 long-context pool
+   - T 的输入 token rate 限到原 80%
+   - 通知 T 的 owner（Slack / 工单）
+4. 人工 review:
+   - T 是否需要独立池？
+   - T 的 SLO class 是否需要调整（升 Gold 让 T 付溢价）
+```
+
 ### 17.7 一个简单的多租户策略示例
 
 可以想象这样一套规则：

@@ -293,6 +293,155 @@ INT4 weights-only（W4A16）量化省显存的故事很美好——把 70B 模�
 > [!NOTE]
 > **W4A4 / W4A8 / 整体 INT4** 是另一类故事：Marlin / Machete 只解决 W4A16（权重 INT4，激活 FP16）。如果想把激活也压到 INT4 或 INT8，需要 SmoothQuant、QServe 等额外路径，kernel 选型完全不同。
 
+### 16.3a GPTQ 算法：逐列量化 + 误差补偿
+
+GPTQ 的核心问题是：**不重训的情况下，把 BF16 权重压到 INT4 而尽量保住精度**。它把每一层独立看作一个最小化问题：
+
+$$
+\arg\min_{\hat{W}} \| W X - \hat{W} X \|_F^2
+$$
+
+其中 $W$ 是该层原始权重、$X$ 是该层在校准集上的输入激活。如果允许 $\hat{W}$ 取任意实数，最优解就是 $W$ 自身——一旦 $\hat{W}$ 被限制在 INT4 量化网格上，问题变成一个**带约束的二次优化**，直接量化会丢精度。GPTQ 的关键观察是：这个问题对每一行（output channel）独立、对每一列（input dim）有耦合，且最优解可以用 **Hessian 矩阵的逆** 一列一列推进。
+
+**算法核心**（每行独立处理）：
+
+1. 算 Hessian $H = 2 X X^T + \lambda I$（$\lambda$ 防奇异）。
+2. 算 Cholesky 分解 $H^{-1} = L L^T$，得到逆矩阵的上三角。
+3. 按列从左到右处理。处理第 $j$ 列时：
+   - 把 $w_j$ 量化到最近的 INT4 网格点 $\hat{w}_j$，得到误差 $e_j = w_j - \hat{w}_j$。
+   - **把 $e_j$ 按 $H^{-1}$ 的对应列分摊到剩余还没量化的列上**：$w_{j+1:} \mathrel{-}= e_j \cdot \frac{H^{-1}_{j, j+1:}}{H^{-1}_{j,j}}$。
+   - 这一步是 GPTQ 的灵魂：当前列量化造成的误差，**用后面还能改的列去补偿**。
+
+```text
+未补偿（Round-To-Nearest, RTN）的量化:
+  w = [1.3, 0.7, -1.1, 0.4, ...]
+  量化后:[1, 1, -1, 0, ...]   // 每个 token 累积误差，可能越走越偏
+
+GPTQ 的量化:
+  量化第 1 列（误差 0.3）→ 把 0.3 按 H⁻¹ 分摊到列 2,3,4,...
+                            列 2,3,4 的 w 被修正，新值更"知道"前面有 0.3 的偏差
+  量化第 2 列（修正后的 w₂，误差更小）→ 继续补偿
+  ...
+```
+
+**为什么用 Hessian**？$H = X X^T$ 描述的是"输入激活之间的相关性"。如果列 $j$ 和列 $k$ 的输入高度相关（$H_{jk}$ 大），列 $j$ 量化产生的误差对总损失的影响和列 $k$ 类似——所以应该把误差更多地分摊到列 $k$。GPTQ 用 $H^{-1}$ 一次性算出"误差应该按什么比例分摊给后续列"，这是一种 **Optimal Brain Surgeon (OBS)** 风格的局部最优补偿。
+
+工程上的几个关键点：
+
+- **校准集大小**：典型 128-512 条样本就够算 $X X^T$；多了帮助有限。
+- **per-row vs per-channel**：每个 output row 独立处理，因为它们共享同一个输入 $X$，可以并行。
+- **act_order（desc_act）**：先处理"激活方差大"的列（重要的列），把误差留给"激活方差小"的列（不重要）。开 `desc_act=True` 通常多 0.5-1pp 精度。
+- **groupsize**：把列分组（128 是典型值），每组共享一个 scale。groupsize 小精度好但元数据开销大。
+
+GPTQ 的代价是**校准时间长**：70B 模型逐层逐列处理，单 A100 通常要 4-8 小时。但因为是 PTQ，跑一次出 checkpoint 可永久使用。
+
+### 16.3b AWQ 算法：activation-aware 通道保护
+
+AWQ 的核心观察是：**模型权重里只有少数 channel（通常 < 1%）真正"重要"**——它们对应的激活值大，对最终输出影响大。RTN 量化对所有 channel 一视同仁，把这些重要 channel 量化坏就直接掉点。AWQ 的解法不是改算法，而是**在量化前对权重做一个 channel-wise 缩放**，让重要 channel 的数值放大，量化后的相对误差减小。
+
+**核心数学等价**：对线性层 $Y = X W$，引入 per-channel scale $s$（向量，长度 = input channel 数）：
+
+$$
+Y = X W = (X \cdot \text{diag}(1/s)) \cdot (\text{diag}(s) \cdot W)
+$$
+
+这是恒等变换——但变换后**激活变小、权重变大**。在量化时只量化新权重 $W' = \text{diag}(s) \cdot W$，激活 $X' = X / s$ 保持 BF16（W4A16 不量化激活，所以 $X/s$ 在线时直接做或预先 fuse 进前一层）。
+
+**为什么有效**：INT4 量化的相对误差大致是 $\Delta / W_{max}$，其中 $\Delta$ 是量化步长。对于 scale 后的新权重，重要 channel 的 $W'_j = s_j \cdot W_j$ 更大，相对误差更小；不重要 channel 的 $W'_k$ 仍然小但反正它对输出影响也小。**误差被搬到了"不重要"的地方**。
+
+**怎么搜 $s$**？AWQ 在校准集上跑前向，统计每个 channel 的激活幅度均值 $|X|_j$，然后用一个**幂律启发式**：
+
+$$
+s_j = |X|_j^{\alpha}
+$$
+
+$\alpha$（典型 0.5）通过对小校准集做 grid search 选——评测指标是量化后输出与原始输出的 MSE。整个过程对单层只要几秒钟，所以 AWQ 校准比 GPTQ 快得多（70B 通常 30 分钟内）。
+
+```text
+RTN 量化:                      AWQ 量化:
+  W: [大权重, 小权重, 小权重]    W: [大权重, 小权重, 小权重]
+  X: [大激活, 小激活, 小激活]    X: [大激活, 小激活, 小激活]
+                                ↓ 引入 s = |X|^0.5
+                                W' = diag(s) · W = [更大, 略大, 略大]
+                                X' = X / s         = [略小, 略小, 略小]
+  量化 W → 大权重的相对误差大     量化 W' → 重要 channel 因为放大，量化误差相对小
+  → 重要 channel 掉点             → 重要 channel 几乎不掉
+```
+
+**与 GPTQ 的本质差异**：
+
+- GPTQ 改 **W**（量化时用 Hessian 重分布误差）。
+- AWQ 改 **scale**（量化前用 activation 引导重要 channel 缩放）。
+- 二者**正交**：理论上可以叠加（先 AWQ scale 再 GPTQ 误差补偿），实践中 vLLM/TRT-LLM 选一个就够。
+
+工程上的关键点：
+
+- **激活信息很重要**：校准集分布偏，搜出的 $s$ 偏，重要 channel 选错。AWQ 对校准集质量的要求和 GPTQ 一样高。
+- **AWQ 的 scale 可以 fuse 进前一层**：让推理时不用真的算 $X / s$。这是 vLLM AWQ 路径几乎 0 反量化开销的根本。
+- **AWQ 比 GPTQ 推理稍快**：因为 fuse 后 kernel 路径更短；但精度 GPTQ 通常略好（特别在长尾任务）。
+
+### 16.3c SmoothQuant：把激活的难题转移给权重
+
+W8A8 INT8 比 W4A16 难的根本原因：**LLM 激活有严重的 outlier**。某些 channel（也是 ~1%）的激活值可以是其他 channel 的 100 倍。RTN 量化激活时 scale 必须迁就这些 outlier，结果**绝大多数普通激活被量化到只有几个值**——精度暴跌。
+
+GPTQ 解决不了这个，因为它只动权重；AWQ 也解决不了，因为 W4A16 根本不量化激活。SmoothQuant 的核心 trick 是：**用一个 per-channel scale，让 outlier 通道的激活幅度变小、权重幅度变大；权重容易量化（无 outlier），所以多承担一点动态范围反而 work**。
+
+**核心数学等价**（同 AWQ 的等价变换，但目标不同）：
+
+$$
+Y = X W = (X \cdot \text{diag}(1/s)) \cdot (\text{diag}(s) \cdot W)
+$$
+
+差别在于 SmoothQuant 之后**激活和权重都要量化**（W8A8）。现在变换让：
+
+- 激活 $X' = X/s$ 的 outlier 被压平，per-tensor INT8 量化精度大幅提升。
+- 权重 $W' = s \cdot W$ 的动态范围变大——但权重量化对此并不敏感（因为权重本身没有 outlier，只是数值变大）。
+
+**怎么选 $s$**？SmoothQuant 用一个**迁移强度 $\alpha$**（典型 0.5）平衡两侧难度：
+
+$$
+s_j = \frac{\max(|X_j|)^\alpha}{\max(|W_j|)^{1-\alpha}}
+$$
+
+$\alpha = 0$ 完全不缩放，$\alpha = 1$ 完全把 outlier 转到权重。0.5 是经验上多数模型的甜点。
+
+```text
+原始量化（W8A8 INT8 RTN）:
+  X channel j: [0.1, 0.2, 100.0, 0.15, ...]   ← outlier 100
+  量化 scale = 100/127 ≈ 0.79
+  普通激活 0.1 → round(0.1/0.79) = 0           ← 严重精度损失！
+  
+SmoothQuant（α=0.5, 选 s_j 让 outlier 平摊）:
+  X' = X / s_j → [0.01, 0.02, 10.0, 0.015, ...]  ← outlier 缩小 10x
+  W' = s_j × W → 权重变大 10x，但权重无 outlier 所以 OK
+  量化 X' scale = 10/127 ≈ 0.079
+  普通激活 0.01 → round(0.01/0.079) = 0          ← 仍然有精度损失
+                                                 但相对 outlier 而言比例更好
+  量化 W' → INT8，权重量化精度反而比原始好（动态范围更平均）
+```
+
+**与 AWQ 的关系**：数学上是同一个等价变换，但优化目标不同：
+
+- AWQ 优化 W4A16，scale 选择最大化"重要 channel 的相对量化精度"。
+- SmoothQuant 优化 W8A8，scale 选择最小化"激活 outlier 对量化的影响"。
+
+**工程上的关键点**：
+
+- **SmoothQuant 必须配合 INT8 GEMM kernel**（cuBLASLt INT8、CUTLASS、TRT-LLM gemm plugin），否则没有真实加速。
+- **对长尾任务敏感**：α 选错（特别是 0.7 以上）会让权重侧动态范围过大，复杂任务（代码、长链推理）首先掉点。
+- **可以 per-channel scale per-tensor quant**：scale 是 per-channel 的，但量化用 per-tensor scale；这是大多数 INT8 GEMM kernel 的硬约束。
+
+**三种方法的总结对比**：
+
+| 方法 | 核心思想 | 改什么 | 怎么用 activation 信息 | 主要适用 |
+|---|---|---|---|---|
+| GPTQ | 量化误差用 Hessian 分摊到后续列 | W | $X X^T$ 决定误差分摊比例 | W4A16 weights-only |
+| AWQ | 重要 channel 量化前放大 | scale | $\|X\|_j^{0.5}$ 决定每 channel 缩放 | W4A16 weights-only |
+| SmoothQuant | 把激活 outlier 转移到权重 | scale | $\max\|X\|^\alpha / \max\|W\|^{1-\alpha}$ | W8A8（含激活量化） |
+
+> [!NOTE]
+> **三种方法都不重训**——这是 PTQ 的共同优势。它们的差异不在"压缩率上限"，而在"针对什么数值现象做了什么数学补偿"。理解这一点后，就不会问"GPTQ 比 AWQ 快多少"这种没有意义的问题——它们解决的是同一个问题的不同侧面。
+
 ### 16.4 校准（Calibration）过程说明
 
 PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能够代表真实推理分布的样本，用来估计激活范围、scale、zero point 和 outlier 行为。换句话说，校准是在回答："这个模型在线上最常见的数值范围是什么，哪些通道最容易被截断，哪些层必须保留更多动态范围？"
@@ -379,6 +528,74 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 
 **一个实战经验**：KV Cache 量化几乎没有"自由午餐"吞吐（因为 KV Cache 不是计算瓶颈，是容量瓶颈），但它能让你**塞进去更大的 batch 或更长的上下文**，间接换来吞吐。
 
+#### KV Cache 量化的内部机制
+
+权重量化是离线一次完成的；KV Cache 量化必须**在线**做——每生成一个 token 都要把新的 K、V 量化后写入 KV pool，attention 计算时再反量化。这条路径的实现细节决定了"看起来 2x 显存节省"是不是真能拿到。
+
+**关键决策 1：scale 的粒度**
+
+| 粒度 | 含义 | 显存额外代价 | 精度 | 主流引擎选择 |
+|---|---|---|---|---|
+| per-tensor | 整个 KV pool 共享一个 scale | 几乎 0 | 差，长上下文累积 outlier 一次性打穿 | 几乎不用 |
+| per-token | 每个 token 的 K（或 V）一个 scale | 每 token 加 2 个 FP16（4 bytes / token） | 中 | TRT-LLM 默认 INT8 KV |
+| per-channel（per-head_dim） | 每个 head_dim 维度一个 scale | scale 数量 = num_kv_heads × head_dim，固定开销 | 好 | vLLM FP8 KV |
+| per-token + per-channel（双向） | 两套 scale 共同决定 | per-token 那部分线性增长 | 最好但开销最大 | 实验性 |
+
+**关键决策 2：量化时机**
+
+```text
+方案 A（写入时量化）：
+  decode step → 算出新 token 的 K, V (BF16) 
+              → quantize(K, V, scale) → 存 INT8/FP8 到 KV pool
+              → attention 时 dequantize KV → 算 BF16 attention
+
+方案 B（attention 内融合反量化）：
+  decode step → 算出新 token 的 K, V (BF16)
+              → quantize(K, V) → 存 INT8/FP8 到 KV pool
+              → attention kernel 内部一边读 INT8/FP8 KV 一边 dequant，
+                直接用 reduced precision GEMM（如 H100 FP8 Tensor Core）累加到 FP32
+```
+
+方案 B 是 **FlashAttention V3 + FP8 KV** 的实际路径——FA3 接受 FP8 K、V 作为输入，dequant 与 attention GEMM 在同一 kernel 里完成，没有单独的 dequant pass。这就是 H100 上 FP8 KV"几乎没有反量化开销"的来源。
+
+方案 A 是更老的实现，每次 attention 前要先把整段历史 KV 反量化到 BF16 到一个临时 buffer——多了一次 HBM 读写，量化收益被吃掉一部分。INT8 KV 在不支持原生 INT8 attention kernel 的引擎上仍然走方案 A。
+
+**关键决策 3：FP8 vs INT8 的 dynamic range**
+
+FP8 有两种格式：
+
+| 格式 | 指数位 | 尾数位 | Dynamic range | 适合 |
+|---|---|---|---|---|
+| **E4M3**（4 指数 + 3 尾数） | 4 | 3 | $\pm 448$ | KV 存储、GEMM 输入 |
+| **E5M2**（5 指数 + 2 尾数） | 5 | 2 | $\pm 57344$ | gradient（训练）、累加器 |
+
+KV Cache 一律用 **E4M3**——LLM 激活的 dynamic range 通常在 $\pm 50$ 以内，E4M3 的精度（3 尾数位 ≈ $2^{-3} = 12.5\%$ ULP）远好于 E5M2，dynamic range 也够。
+
+INT8 的 dynamic range 是 $[-127, 127]$，配 per-token scale 后等效 dynamic range 接近 FP8 E4M3，但**精度分布不同**：INT8 等距，FP8 在 0 附近精度更高。LLM 的激活分布是"小值多、大值少"，FP8 E4M3 的非线性精度分布刚好对得上——这是为什么 H100 上 FP8 KV 通常质量比 INT8 KV 略好的根本原因。
+
+**关键决策 4：K 与 V 是否分别量化**
+
+K 和 V 的 dynamic range 通常不同：K 经过 RoPE 后值域更窄，V 来自 down-projection 通常更宽。生产引擎一般给 K、V 各算一套 scale（per-token），不共用。共享 scale 会让一边精度严重浪费。
+
+**实际工程选择**：
+
+- **vLLM `kv_cache_dtype=fp8`**（H100+）：FP8 E4M3 + per-channel scale + FA3 融合反量化。是 LLaMA-70B 长上下文场景的几乎默认选择。
+- **vLLM `kv_cache_dtype=fp8_e5m2`**：实验性，dynamic range 大但精度差，长上下文质量明显回退，**不要用于生产**。
+- **TRT-LLM `kv_cache_dtype=int8`**：per-token scale + per-K/V scale，配合 GPT attention plugin 内部融合反量化。
+- **vLLM INT4 KV**：实验性，per-token + per-channel 双向 scale；显存对半再对半，但长上下文（>16K）质量回退明显，慎用。
+
+**诊断 KV 量化是否真生效**：
+
+```bash
+# vLLM Prometheus metrics 看 kv_cache_usage 和 num_running_seqs 同时上升
+vllm:gpu_cache_usage_perc
+
+# nvidia-smi dmon 看显存占用，应该比 BF16 KV 小约 50%
+nvidia-smi --query-gpu=memory.used --format=csv -l 1
+```
+
+**反模式**：开了 `kv_cache_dtype=fp8` 但没确认引擎使用的 attention backend 支持 FP8 KV——某些版本回退到"FP8 存储 + 反量化到 BF16 再算 attention"，显存省了但 latency 反而升高。生产前务必跑一组 baseline（BF16 KV）vs 量化（FP8 KV）的 P99 对比，看 TPOT 有没有恶化。
+
 #### 16.5.3 量化对象的排障边界
 
 量化上线后，"质量掉了"这个症状太粗，必须先定位是哪类数值对象带来的误差。
@@ -430,6 +647,48 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 
 **静态 shape 优化**：如果编译器知道 batch、seq len 的确切值，可以选择专门优化的 kernel 而不是"通用万能" kernel。代价是一旦 shape 变了就得重新编译或回退。
 
+#### 算子融合的两个具体例子
+
+**例 1：FlashAttention 的 online softmax** —— 教科书 attention 是 `softmax(QK^T / √d) V`，传统实现要分三步：
+1. 算 $S = QK^T$（HBM 写出 $S$，shape = [seq, seq]）
+2. 算 $P = \text{softmax}(S)$（HBM 读 $S$、再写出 $P$）
+3. 算 $O = PV$（HBM 读 $P$、写出 $O$）
+
+中间矩阵 $S$、$P$ 在长 seq 下是 $O(N^2)$，HBM 读写带宽完全主导延迟，且占 $N^2$ 显存。FlashAttention 的核心是把这三步**融在一个 kernel 里、永不写出 $S$ 和 $P$ 到 HBM**。
+
+难点是 softmax 必须看到整行才能归一化（要先求 max、再求 sum）。**Online softmax** 用增量更新避开两遍扫描。把 K/V 切成 block，沿 seq 轴一块一块扫：
+
+```text
+对每个 K, V block i 处理:
+  S_i = Q · K_i^T              // 局部 attention scores
+  m_new = max(m_old, max(S_i))  // 全局 max 增量更新
+  P_i = exp(S_i - m_new)        // 局部 softmax 数值，用新的 max 重 normalize
+  alpha = exp(m_old - m_new)    // 旧累加结果的修正因子
+  O = O · alpha + P_i · V_i     // 输出累加，旧 O 用 alpha 修正
+  l = l · alpha + sum(P_i)      // 归一化分母同样修正
+end loop
+O = O / l                       // 最终归一化
+```
+
+关键观察：每次新 block 进来，旧累加结果 $O$ 和分母 $l$ 都用 `exp(m_old - m_new)` 缩放——这就是 online softmax 的正确性证明。融合后整个 attention 只需要 $O(N)$ HBM 读（Q、K、V 各一遍），$O$ 一次写出，**完全不写中间矩阵**。FlashAttention V2/V3 在此基础上进一步优化 block 调度顺序（V2 把外循环改到 Q 维度让 GPU SM 并行更高效）和指令选择（V3 在 H100 上用 WGMMA + TMA + warp specialization）。
+
+**例 2：GEMM epilogue fusion** —— Transformer block 里 GEMM 后通常跟一连串 elementwise 算子：`Y = GeLU(X·W + bias) * scale`。朴素实现是 GEMM 写出 $X·W$ 到 HBM、再启 bias kernel、再启 GeLU kernel、再启 scale kernel——四次 HBM 读写。
+
+CUTLASS 的 **Epilogue Visitor Tree (EVT)** 让用户在 GEMM kernel 内部直接 inline 这些后处理：每个线程算完自己负责的输出 tile（结果还在寄存器里），紧接着做 bias add、GeLU、scale，**结果直接写出最终值**。FlashInfer、CUTLASS、TRT-LLM 的 GEMM plugin 大量用这条路径。
+
+工程上 epilogue 能融的算子有限制：
+- **不能改 GEMM 输出 shape**（broadcast 可以，reduce 不行——reduce 要跨 thread block 同步）。
+- **激活函数必须是 elementwise**（GeLU、SiLU、ReLU 都行，softmax 不行）。
+- **bias 必须是简单 broadcast**（per-row 或 per-column）。
+
+**编译器决定哪些 op 能融的判断**（producer-consumer rule）：
+- A 的输出是 B 的唯一输入 → 可融。
+- A、B 都是 pointwise → 几乎一定融。
+- B 需要 cross-thread reduction（如 softmax、layernorm）→ 一般不能和上游 GEMM 融。
+- 共享内存 / 寄存器预算够 → 可融；否则编译器会拆分。
+
+`torch.compile` 的 Inductor、TensorRT、TVM 都自动做这套 producer-consumer 分析；手写 kernel（FlashAttention、Marlin）则是开发者把这套规则手工应用到极致。
+
 #### 16.6.2 编译器、graph capture、kernel library 的边界
 
 推理优化里"编译"也经常被叫混。平台上至少要区分三类东西：
@@ -443,6 +702,52 @@ PTQ 的关键步骤不是"跑一次脚本"，而是让量化器见到一组能�
 这三层可以叠加，但排障方式不同。Graph compiler 出问题，通常看 graph break、recompile 次数和编译 artifact；CUDA Graph 出问题，通常看 shape bucket、warmup、内存地址稳定性；kernel library 出问题，通常看 profiler 里的 kernel 名称、Tensor Core 利用率和 HBM 带宽。
 
 > **反模式警告**：把 `torch.compile=True` 写进配置就认为"已经编译优化"是不够的。在线 LLM 的 shape 经常变化，prefill/decode 路径不同，采样逻辑也可能 graph break。编译收益必须按 prefill、decode、sampler 三段分别验证。
+
+#### CUDA Graph 是怎么工作的
+
+CUDA Graph 不是一种"编译"，而是一种**减少 CPU launch 开销**的机制。每个 CUDA kernel launch 都要走 driver API（参数打包、stream submit、同步），单次 launch 在现代 GPU 上 ~5-10 μs 的 CPU 开销。一个 LLM decode step 内部有几百个 kernel（attention、各 layer 的 GEMM、norm、采样等），launch 开销加起来可能 1-2 ms——decode 本身才几十 ms，CPU launch 占 5-10% 不奇怪。CUDA Graph 把"一段 stream 上所有的 kernel launch + memcpy"录制成一个 DAG，之后 replay 整个 graph 只需要一次 driver call。
+
+**Capture 的实际过程**：
+
+```text
+1. cudaStreamBeginCapture(stream, mode):
+     stream 进入 capture 模式，所有 launch 不真正执行，
+     只把 (kernel name, args, dependencies) 记到一个内部 graph node
+2. 用户跑一段正常代码（一次 forward，含 N 个 kernel launch + memcpy）：
+     每次 launch 在 graph 里加一个 node
+     每次 cudaStreamSynchronize / wait event 加一条依赖边
+3. cudaStreamEndCapture(stream, &graph):
+     得到 cudaGraph_t，是个不可变的 DAG
+4. cudaGraphInstantiate(&graphExec, graph):
+     把 graph 编译成可执行的 graphExec（实例化阶段）
+5. cudaGraphLaunch(graphExec, stream):
+     之后每次 launch 这个 graphExec 只需要一次 driver call，
+     N 个 kernel 按 DAG 顺序在 GPU 上自动跑
+```
+
+关键约束：**capture 时 kernel 参数中的指针、size、dim 都被 hardcode 进 graph node**。这意味着：
+
+- **shape 变了必须重新 capture**：vLLM 在 warmup 时对常见 shape（batch=1, 2, 4, 8, 16, ..., 256；context=128, 256, 512, ...）逐个 capture，得到一个 graph pool。运行时按当前 shape 选最匹配的 graph 跑。
+- **指针变了必须重新 capture**：内存分配位置必须稳定。这就是为什么 vLLM 用专门的 KV pool 而不是每次动态 alloc——动态 alloc 后地址变了，graph 里 hardcode 的指针就指错了。
+- **控制流不能在 graph 里**：if/else 决定走哪个 kernel 不能 capture（capture 时只走一个分支）。所以 sampler 里 top-k vs top-p、greedy vs random 的分支必须在 capture **之外**；进入 graph 的部分必须是固定路径。
+
+**显存代价**：每个 captured shape 占一份 workspace（GEMM 中间结果、attention 临时 buffer 等）。vLLM `gpu_memory_utilization=0.9` 留 10% 给 CUDA workspace + graph pool 是经验值，因为典型 graph pool 占 5-10%。
+
+**与 `torch.compile` 的关系**：
+
+| 层 | torch.compile mode | 用什么 |
+|---|---|---|
+| `default` | 算子融合 + Triton kernel | 不开 CUDA Graph |
+| `reduce-overhead` | 默认 + CUDA Graph capture | 自动按 shape bucket capture |
+| `max-autotune` | 默认 + CUDA Graph + autotune kernel | 同上 + 更激进的 kernel 搜索 |
+
+vLLM V1 的 model executor 内部就是 `torch.compile(mode="reduce-overhead")` + 手动管理 shape bucket。
+
+**生产排障**：
+
+- **首次请求慢**：第一次跑某个 shape 会触发 capture（可能数百毫秒），看起来像"P99 偶发尖峰"。修复：服务启动时的 warmup pass 必须覆盖所有线上常见 shape。
+- **OOM at warmup**：graph pool 把显存吃完。修复：降 `gpu_memory_utilization`，或减少 capture 的 shape 数（vLLM 的 `--enforce-eager` 关闭 graph capture，方便排查）。
+- **Capture 失败回退到 eager**：常见原因是某个算子在 capture 时调用了 host-side decision（e.g., 动态 reshape、host-to-device sync），这会让 capture mode 自动失败。打开 `CUDA_LAUNCH_BLOCKING=1` 可以定位是哪个 kernel。
 
 ### 16.7 主流推理引擎对照
 

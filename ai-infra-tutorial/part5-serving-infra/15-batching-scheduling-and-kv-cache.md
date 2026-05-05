@@ -239,6 +239,47 @@ LLM 推理通常分成两个阶段：
 
 这就是"为什么 prefill/decode 争用是 LLM 服务最常见的尾延迟来源"。解决思路有二：要么像 §15.6 介绍的那样把两者拆到不同池，要么像 §15.7b 的 chunked prefill 把大 prefill 切成小片，让 decode 能"插队"。
 
+#### 15.2.2 变长序列在一次 forward 里 attention 是怎么算的
+
+Continuous batching 听起来很美——"完成一个、补一个"——但有个绕不开的工程门槛：**同一次 forward 里不同请求的序列长度不一样**。短请求 50 token、长请求 8000 token 同 batch，attention kernel 要怎么算？这是 continuous batching 在 GPU 上能 work 的根本前提，前几代实现（HF Transformers）做不好就是因为这一层。
+
+**朴素方案：padding** —— 把整个 batch padding 到最长序列。一个 50-token 请求和一个 8000-token 请求同 batch，前者要补 7950 个 PAD token，attention 要算并丢弃 PAD 位置——浪费几乎 100x 算力。
+
+**现代方案：variable-length packed batch** —— 把多个序列首尾相接打成一个 1D tensor，用 **`cu_seqlens`（cumulative sequence lengths）** 数组标记边界：
+
+```text
+3 个序列长度分别是 50, 200, 4000:
+  packed_tokens: [seq0_token0, ..., seq0_token49, seq1_token0, ..., seq1_token199, seq2_token0, ..., seq2_token3999]
+  cu_seqlens:    [0, 50, 250, 4250]   # 累积长度，长度 = batch+1
+  total_tokens:  4250
+```
+
+FlashAttention 的 **varlen 接口**（`flash_attn_varlen_func`）就吃这个格式：kernel 内部用 `cu_seqlens[i]` 和 `cu_seqlens[i+1]` 算出第 $i$ 个序列的范围，每个 attention block 只在自己序列内做 self-attention，**完全没有 padding，也没有跨序列的 attention 泄漏**。这是 continuous batching 在 attention kernel 层的物理基础。
+
+**Prefill chunk + decode token 同 batch 的特殊处理**：
+
+Continuous batching 的另一个挑战是同一 batch 里有两类工作：
+
+```text
+batch 构成（混合 prefill chunk + decode）:
+  req_A: prefill chunk, 512 token   (chunk 内部是 causal self-attention)
+  req_B: prefill chunk, 1024 token
+  req_C: decode 1 token             (要 attend 到自己的 KV history 4096 个 token)
+  req_D: decode 1 token             (要 attend 到自己的 KV history 8192 个 token)
+```
+
+prefill 部分需要"在 chunk 内部做 causal attention"；decode 部分需要"用当前 1 个 query token 去 attend 整个历史 KV（在 KV pool 里、按 block_table 间接寻址）"。这两类计算的 attention pattern 完全不同。
+
+现代引擎的做法是**单一融合 kernel 处理两类**：
+
+- **vLLM / FlashAttention V3 的 `flash_attn_with_kvcache`**：接受三组输入——packed Q（含 prefill chunk + decode query）、`cu_seqlens_q`（每序列的 query 长度，prefill 是 chunk 长度、decode 是 1）、`cu_seqlens_k`（每序列的 KV history 总长度，含已 cache 的 + 当前 chunk）、`block_table`（PagedAttention 的 KV 间接寻址表）。
+- kernel 内部对每序列单独算："我的 query 长度多少、KV 历史多少、KV 在哪些 block"。
+- causal mask 自动按 query 位置和 key 位置算（query 第 $i$ 位置只看 key 前 $i$ 位置）。
+
+整个混合 batch 在一个 kernel 里跑完，没有为 prefill 和 decode 分别 launch 两个 kernel。这是 chunked prefill 在工程上能 work 的根本——attention kernel 的 varlen 接口同时容纳了两种 workload。
+
+**为什么这件事很难**：FlashAttention V1 时代只支持 fixed-length batch（要 padding），V2 引入 varlen 接口（有 cu_seqlens），V3 才彻底融合 prefill + decode（接受 query 长度和 KV 长度可以不同）。这条接口演进直接决定了 vLLM、TRT-LLM、SGLang 在 continuous batching 上的可行性。开 chunked prefill = 默认依赖 FA2/FA3 varlen——某些自定义 attention 实现没跟上这条接口，开 chunked prefill 会回退到慢路径甚至错误。
+
 ### 15.3 KV Cache 为什么重要
 
 如果每生成一个新 token 都重新计算全部历史上下文，复杂度会迅速变大。
@@ -280,6 +321,56 @@ M_{\text{kv}} \approx 2 \times 80 \times 1024 \times 131072 \times 1 \times 2 \a
 $$
 
 这解释了为什么长上下文服务经常优先受 KV Cache 约束，而不是先受权重大小约束。
+
+#### 15.3.0 KV Cache 在显存里的物理布局
+
+公式说"KV Cache 占多少 GB"很容易，但 KV 实际怎么排在显存里**直接决定 attention kernel 性能**。同样的 KV 总量，layout 不同时 kernel 的 HBM 带宽利用率可以差 2-3x。
+
+主流引擎的两种 layout：
+
+**Layout A（vLLM PagedAttention 默认）**：
+```text
+[num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]
+                ↑                ↑                       ↑
+                K 和 V 分开存     一个 block = 16 token   每 head 内部连续
+```
+
+K 和 V 在最外层就分开（`num_layers × [K_pool, V_pool]`），分别是两块独立的大 tensor。一个 block 内 16 个 token 的某个 head 的 head_dim 维度连续——这刚好是 attention kernel 算 $QK^T$ 时**沿 head_dim 做点积**所需的访存模式。
+
+**Layout B（TRT-LLM `kv_layout="BLOCK_HND"`）**：
+```text
+[num_blocks, num_layers, 2, num_kv_heads, block_size, head_dim]
+```
+
+外层先按 block，便于 paged attention plugin 一次拿到整个 block 内所有 layer 的 KV——但要求 attention kernel 的 SM 内并行模式与之匹配（CUTLASS 的 BLOCK 风格 layout）。
+
+**为什么 K 和 V 要分开存（不是 [batch, seq, layer, kv, head, head_dim] 这种）**：
+
+attention 计算分两步：
+1. $S = Q K^T / \sqrt{d}$ —— 用 K 计算
+2. $O = \text{softmax}(S) \cdot V$ —— 用 V 计算
+
+如果 K 和 V 交错存（`[..., K_or_V, ...]`），步骤 1 读 K 时每两个连续元素就跳过一个（V），HBM coalescing 减半——读取效率打对折。把 K 和 V 分成两个独立 pool，每步只读自己需要的，coalescing 完美。
+
+**block_size = 16 的工程权衡**：
+
+- block_size 太小（比如 4）：block_table 长，attention kernel 每步要查更多次表，间接寻址延迟主导。
+- block_size 太大（比如 128）：内部碎片大，单短请求浪费一整块。
+- **block_size = 16 是 vLLM 的默认值**，刚好和 FlashAttention 的 K/V tile 大小（典型 64 或 128）能整数对齐——一次 attention block 处理 4-8 个 KV block，间接寻址开销被均摊。
+
+**实际诊断**：
+
+```bash
+# vLLM 启动时打印 KV cache 配置
+INFO ...kv_cache_dtype=auto, num_gpu_blocks=12345, block_size=16
+INFO ...num_kv_heads=8, head_dim=128, num_layers=80
+
+# 总 KV pool 字节数（验证算式）
+# num_gpu_blocks × block_size × 2(K+V) × num_kv_heads × head_dim × dtype_bytes × num_layers
+# 12345 × 16 × 2 × 8 × 128 × 2 × 80 ≈ 80 GB
+```
+
+如果手算和实际不一致，多半是引擎按 TP 切 num_kv_heads 后的 per-rank 数字与全局数字搞混了——特别是 TP=8 时单卡的 num_kv_heads 已经是 1，按全局算会多算 8x。
 
 #### 15.3.1 KV Cache vs 权重：谁先顶爆？
 
@@ -1088,6 +1179,81 @@ MoE 模型并不是简单把 dense 模型做大，而是把调度问题进一步
 | Expert 预热 | 冷 expert 也要预热，避免首批请求慢 | warmup 更长 |
 
 对平台团队：**MoE 的基础设施复杂度至少是 dense 的 2x**。如果团队还没把 dense 模型的 serving 做稳，不建议立刻上 MoE。
+
+#### 15.10.2 MoE token dispatching 是怎么实现的
+
+MoE 论文里"router 把 token 路由到 expert"看起来像一行代码：`expert_idx = top_k(router_logits)`。但在多 GPU 上把 token 真的送到对应 expert，是 MoE serving 最重的工程点。
+
+**问题设定**：8 卡 EP（Expert Parallel），64 个 expert 平均分到 8 卡（每卡 8 个 expert）。一个 batch 里有 1024 token，每 token 选 top-2 expert。最坏情况下这 2048 个 (token, expert) 对完全均匀分布——平均每卡发出 256 个 token、收到 256 个 token。
+
+**Dispatching 的三个阶段**：
+
+```text
+1. Permute 阶段（单卡内）：
+   原始 batch:  token_0 → expert_5,17    token_1 → expert_3,42  ...
+   按目标 expert id 排序，得到一个 permutation P
+   按 P 重排 batch 后:
+     bucket_for_expert_0:  [token_x1, token_x2, ...]
+     bucket_for_expert_1:  [...]
+     ...
+     bucket_for_expert_63: [...]
+
+2. All-to-all 阶段（跨卡）：
+   每卡知道"我这一批 token 中哪些要发到 rank 0、rank 1、... 各多少个"
+   一次 all-to-all 通信，每卡同时
+     发出: 8 个 bucket（每 rank 一个）
+     接收: 8 个 bucket（来自各 rank）
+   通信量 ≈ batch_token × top_k × hidden_dim × 2(每 token 来回) × dtype_bytes
+
+3. Compute 阶段（单卡内 expert 计算）：
+   每卡现在收到了"分给我这 8 个 expert 的所有 token"
+   按 expert 分组做 grouped GEMM（每个 expert 一次 GEMM）
+   算完后再做反向 all-to-all 把结果送回原 token 所在卡
+   反向 permutation 把 token 顺序还原
+```
+
+**两个隐性瓶颈**：
+
+1. **All-to-all 通信开销**：DeepSeek-V3 671B（256 expert，top-8）一次 forward 有 ~120 次 all-to-all（每 MoE layer 2 次）。在 200Gb IB 上单次 all-to-all 几百微秒，叠加起来 50-100 ms——可能比 attention + GEMM 加起来还多。
+2. **Load imbalance**：理想情况下 token 均匀分布到 expert，每 expert 收到 `batch × top_k / num_experts` 个 token。实际 router 不均匀（"hot expert" 收到的 token 是均值的 3-5x），慢的 expert 决定整个 step 的 latency。
+
+**Capacity factor 的实际作用**：
+
+为防止 hot expert 把单卡 GEMM 拖到不可接受的长度，每 expert 限制最多接收 `C × N × top_k / E` 个 token（C=capacity factor，典型 1.0-1.5）。超出的 token 怎么办？
+
+```text
+choice 1: drop（训练时常用）
+  超出 capacity 的 token 直接丢弃，对应位置输出全 0 或 residual passthrough
+  → 训练时 router 学会避免拥堵；推理时一般不接受静默丢 token
+
+choice 2: token reroute / fallback 到 dense path
+  超出的 token 走第 (top_k+1) 名的 expert，或 fallback 到一个共享的 dense MLP
+  → 推理时常用，质量损失最小
+  
+choice 3: pad 到 capacity
+  expert 收到的 token 数永远 = capacity（不够就 padding，超出就 drop）
+  → 让 grouped GEMM shape 固定，对 CUDA Graph capture 友好
+  → DeepSpeed-MoE / Megablocks 早期路径
+```
+
+DeepSeek 系（V2/V3/R1）选择不在推理时做 capacity 限制——靠 router 训练得足够好 + load balancing loss + dispatch kernel（DeepEP）极致优化通信。这把质量风险从"运行时 drop"转为"训练时学到的均衡"。
+
+**现代 dispatching kernel 的优化方向**：
+
+| Kernel | 解决什么 | 代表 |
+|---|---|---|
+| **DeepEP** | 极致优化 all-to-all，重叠通信和计算（compute-comm overlap） | DeepSeek 开源，vLLM/SGLang 集成 |
+| **Megablocks** | 用 sparse GEMM 直接跑不平衡的 expert load，不需要 padding | Stanford / Databricks |
+| **Tutel** | Adaptive parallelism + flexible dispatching | Microsoft |
+| **NVIDIA Grouped GEMM** | 一次 kernel 处理多个 expert 的 GEMM（每 expert shape 不同） | TRT-LLM、cuBLAS 12+ |
+
+**生产排障要点**：
+
+- MoE 的 step latency 由**最慢的 rank** 决定（all-to-all 是同步点）。监控 per-rank step latency 的 P99，如果某 rank 持续慢 → 是 hot expert 命中那张卡。
+- All-to-all 在 NVLink（300+ GB/s）上 vs 跨机 IB（25 GB/s）上差一个数量级。**MoE 跨机 EP 几乎不可行**，这是为什么 DeepSeek 推理通常用单机 8 卡 EP 而不是 16 卡跨机。
+- DeepSeek V3 这种 256 expert 模型在 H100 8 卡上单卡放 32 expert，每个 expert 显存占用很小但 dispatching 通信量极大，算力反而是次要瓶颈。
+
+理解 MoE dispatching 后，"MoE 的复杂度是 dense 2x" 的来源就清楚了：调度增加一层"按 expert 重新分配 token"，通信从纯 TP 的 all-reduce 变成 EP 的 all-to-all，capacity policy 是新的失效维度。
 
 ### 15.11 多模态请求的调度差异
 

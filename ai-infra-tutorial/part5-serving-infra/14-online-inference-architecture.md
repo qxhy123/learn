@@ -263,6 +263,82 @@ $$
 
 如果路由层只做简单 round-robin，prefix cache 基本形同虚设。
 
+##### Prefix-aware 路由的实际实现机制
+
+"按 prefix hash 路由"听起来简单，但生产里要回答几个具体问题：怎么算 hash key？多个副本之间如何决定谁有什么 prefix？副本扩缩时怎么 rebalance？
+
+**方案 A：一致性哈希（最朴素，开源 router 常用）**
+
+把所有副本放在一个 hash ring 上，请求按 `hash(system_prompt + tool_schema)` 在 ring 上找最近的副本：
+
+```text
+hash ring（环长 2^32）:
+  replica_0 在 hash 位置 1.2B
+  replica_1 在 hash 位置 2.5B
+  replica_2 在 hash 位置 3.8B
+  ...
+
+请求 prefix hash = 2.3B  →  路由到 replica_1（顺时针最近）
+```
+
+**Virtual nodes** 是必备技巧：每个副本不是占一个 hash 点，而是 100-200 个虚拟点散布在 ring 上。这样副本扩缩时只有 `1/N` 的请求被重新映射到新副本，不是全洗牌。
+
+工程边界：
+
+- 一致性哈希只能保证"相同 prefix 路由到相同副本"，不能保证副本真的有那个 prefix 的 KV cache（副本可能刚 evict、可能刚扩容上线）。
+- prefix 完全不同时，路由是均匀的——但**长尾大户**（10% 租户占 80% 流量）会让某些副本一直热、其他副本一直冷。
+- 副本失败时会让该副本对应的 1/N hash 段全部 miss，引发 prefix cache 雪崩。
+
+**方案 B：副本 prefix tree summary 聚合（SGLang router、Mooncake）**
+
+每个副本周期性向 router 上报"我现在 cache 里有哪些 prefix"，router 维护一个聚合的 prefix tree：
+
+```text
+router 持有的全局 prefix tree（每节点标记"哪些副本有"）:
+  root
+   └─ "You are a helpful assistant..."  [replica_0, replica_1, replica_2]
+      ├─ "Tools: search, calc"          [replica_0, replica_1]
+      │   ├─ "User: 1+1?"               [replica_0]
+      │   └─ "User: capital..."         [replica_1]
+      └─ "Tools: code_exec"             [replica_2]
+
+新请求带 system prompt "You are helpful... Tools: search, calc"
+→ router 在 tree 上走，找到匹配最长 prefix 的节点
+→ 节点上 [replica_0, replica_1] 都有这段 KV
+→ 在这两个副本里再用 SLO-aware 选（看谁负载低）
+```
+
+同步机制：
+
+- **Push-based**：副本每 1-5 秒向 router 推送 prefix summary（典型是 prefix hash 列表 + 引用计数 + KV usage）。
+- **Pull-based**：router 周期性 poll 副本（不常用，延迟高）。
+- **Event-based**：副本 evict prefix 时主动通知 router（精确但实现复杂）。
+
+实际生产取舍：
+
+| 维度 | 一致性哈希 | Prefix tree summary |
+|---|---|---|
+| 实现复杂度 | 低 | 高 |
+| 路由准确性 | 中（命中"应该有"的副本） | 高（命中"真正有"的副本） |
+| 副本失败容忍 | 差（hash 段全 miss） | 好（fallback 到其他持有副本） |
+| 扩缩容平滑度 | 中（virtual node 缓解） | 好（新副本不持有 prefix，自动不被路由） |
+| 多 prefix 复用 | 不支持 | 支持（同 prefix 多副本共持，按负载选） |
+
+vLLM Production Stack 用一致性哈希做基础，叠加副本健康度做加权；SGLang router 用 prefix tree summary 是更激进的实现；Mooncake 把 KV 当一等数据面对象，router 直接查询 KV metadata service。
+
+##### 实际生产形态的几种 LLM Router
+
+| 实现 | 形态 | 路由策略 | 适合 |
+|---|---|---|---|
+| **vLLM Production Stack** | Helm chart + sidecar router | 一致性哈希 + queue depth | 简单生产部署 |
+| **Envoy + LLM filter** | Envoy WASM 扩展 | 自定义 LB（基于 prefix hash） | 已有 service mesh 的团队 |
+| **AIBrix（字节开源）** | K8s controller + Envoy gateway | prefix-aware + autoscaling | 平台化 LLM serving |
+| **KServe LLMRouter** | KServe v0.13+ 内置 | model version + prefix | KServe 用户 |
+| **Higress AI Gateway** | 阿里开源，基于 Envoy | rate limit + tenant + prefix | 多租户 SaaS |
+| **SGLang Router** | SGLang 自带 | radix tree summary | 用 SGLang 的 agent 平台 |
+
+> **工程边界**：自研 LLM router 看起来不难（一两周写完一致性哈希），但**rebalance、健康检查、配置热加载、多版本灰度**这些"运维细节"才是真成本。除非有强定制需求，优先用上面这些开源实现，把精力留给 prefix 模板治理和 SLO 监控。
+
 #### 14.3.2 Predicted-latency 路由：更精细的副本选择
 
 更进一步的路由策略是**基于预测延迟选副本**。Google 在 Vertex AI 上部署的 llm-d 项目公开报告：用 XGBoost 预测每个副本的 TTFT 和 TPOT，再选 headroom 最大的副本，在生产环境把 TTFT 和 ITL 降低了约 40%。
@@ -274,6 +350,47 @@ $$
 - 固定权重的负载均衡器永远不可能两者兼顾
 
 对大多数平台团队来说，不一定要立刻上 ML 路由，但要知道：**简单 LB 在 LLM 服务上的上限明显低于传统服务**。
+
+##### Predicted-latency 路由的内部机制
+
+把"用 ML 预测延迟"当黑盒不够，至少要懂 feature、label 和更新机制。生产实现（如 llm-d 的 EPP、Microsoft Splitwise scheduler）通常长这样：
+
+**输入特征**（来自 router 端实时观测，每副本一组）：
+
+| Feature | 来源 | 为什么有用 |
+|---|---|---|
+| current queue depth | 副本上报 | 直接的排队信号 |
+| active sequences | 副本上报 | decode batch 拥挤度 |
+| KV pool usage % | 副本上报 | 显存压力，影响是否会 preempt |
+| current batch token count | 副本上报 | prefill 是否在跑 |
+| recent TTFT/TPOT P50/P95（5s 窗口） | router 自己累计 | 该副本最近表现 |
+| prefix hit rate（5s 窗口） | router 累计 | 该副本是否命中"对的" prefix |
+| 请求 input length（当前请求） | 请求自带 | 决定 prefill 成本 |
+| 请求 estimated output length | 客户端 hint 或历史均值 | 决定 decode 占用时长 |
+| 时间特征（hour-of-day、weekday） | 系统 | 流量周期性 |
+
+**Label**：当请求实际完成时，记下它在该副本上的 TTFT 和 TPOT，作为这次预测的 ground truth。
+
+**模型选择**：
+
+- **XGBoost / LightGBM**（llm-d 用）：100-1000 棵树，训练秒级，inference < 1ms。是工业界默认。
+- **Linear regression + 手工特征交叉**：超低开销，特征工程做好了和 GBDT 差距不大。
+- **小型神经网络**：如果想做时序（LSTM 看 queue depth 历史趋势），但 inference 延迟可能成为 router 自身瓶颈。
+
+**预测和路由结合**：对每个候选副本预测 TTFT，选 **headroom 最大的副本**（headroom = SLO target - predicted latency）。不是简单选预测最快的——选最快的会让那个副本继续被打、其他副本闲着。Headroom 视角让负载自然均衡。
+
+**在线更新机制**：
+
+- **Stream training**：每完成一个请求，都喂给模型做一次更新（incremental learning）。XGBoost 不直接支持，需要每隔 N 分钟用最近窗口的数据**重训整树**（典型 5-15 分钟）。
+- **Shadow eval**：新模型上线前，先在 shadow mode 跑 1-2 小时，对比预测值和实际值的 MAE，达标后再切换。
+- **A/B 分桶**：5% 流量永远走"预测路由"、95% 走"基线路由"（如最少 queue），周期性比较两组的整体 P99——如果预测路由优势消失（流量分布漂移），自动回退基线。
+
+**预测错时的 fallback**：
+
+- 预测的 P99 误差应该被监控。如果某副本的"实际/预测比"持续大于 1.5x（系统性低估），说明特征不全或模型 stale，触发重训和告警。
+- 极端情况下（router 启动初期、新副本上线、流量突变），直接 fallback 到一致性哈希 + queue depth 的简单加权——预测不准时简单算法兜底。
+
+**收益的实际范围**：llm-d 报告的"P99 TTFT/ITL 降 40%" 是在**多模型 + 长短混合 + 高并发**的场景下；如果流量很均匀，简单 LB 就够，预测路由的额外复杂度不一定划算。判断标准：当前服务的 **副本间 P99 latency 标准差 / 平均值** 大于 30% 时，预测路由有显著价值。
 
 #### 14.3.3 Control Plane vs Data Plane
 
@@ -303,6 +420,74 @@ Data plane:
 - 数据面必须在 control plane 短暂不可用时继续服务已有稳定配置
 - 新配置发布要有 dry-run、灰度比例、自动回滚和审计记录
 - model server 的 readiness 不只看进程存活，还要看权重加载、warmup、KV allocator 和首个测试请求是否通过
+
+##### 配置下发的实际机制
+
+"control plane 下发配置"听起来抽象，生产里实际有两条主路径：
+
+**Push（推模型，xDS 风格）**：control plane 主动把配置推到 data plane。Envoy 的 xDS 协议（Aggregated Discovery Service）是工业界标准实现：
+
+```text
+data plane（Envoy 实例）启动:
+  → 与 control plane 建立 gRPC 长连接（双向 stream）
+  → control plane 推 initial config，含 version_info "v1"
+  → Envoy ACK "v1" 已应用
+
+config 变更:
+  → control plane 计算 delta，推 incremental update
+  → 含 version_info "v2"、modified resources、removed resources
+  → Envoy 应用变更，ACK "v2"
+  → 失败时 NACK + error_detail，control plane 决定回退还是重推
+```
+
+**Pull（拉模型，Kubernetes informer / etcd watch 风格）**：data plane 周期或长连接 watch 一个配置存储：
+
+```text
+data plane:
+  → watch /config/router/v* 路径
+  → 收到变更事件 → 拉取新版本 → 校验 → 应用
+  → 周期性全量同步（兜底，防 watch 漏事件）
+```
+
+**两条路径的取舍**：
+
+| 维度 | Push (xDS) | Pull (watch) |
+|---|---|---|
+| 延迟 | 极低（control plane 推完即知） | 略高（watch 通知 + 拉取） |
+| 长连接负担 | 每个 data plane 一条 | 通常是 etcd/Consul 一组 watcher |
+| 复杂度 | 高（双向 stream、ACK/NACK 协议） | 中（watch + 重试） |
+| 配置一致性 | 强（control plane 知道每个 data plane 的版本） | 弱（data plane 自治） |
+| Control plane 抖动容忍 | 数据面用本地缓存继续服务 | 同上 |
+| 适合 | 大规模 + 强一致需求 | 中小规模 + 简单部署 |
+
+**版本号 + ETag/MVCC 的必要性**：
+
+```text
+data plane 收到配置 {version: "v2", payload: ...}
+但当前已经在跑 v3（来自之前的乱序到达 / 不同来源）：
+  → 比较 version，丢弃 v2，避免回退
+```
+
+没有版本号的话，"网络重传 + 多 control plane 实例 + 多个 push 路径" 任何一种乱序都可能让 data plane 应用旧配置，覆盖新规则。生产配置发布工具（OPA、Istio Pilot、自研 policy service）一律用单调递增的 version 或 ETag。
+
+**Stale 配置的降级策略**：
+
+```text
+data plane 与 control plane 失联（network partition）:
+  正常: 用最近一次拉到的配置（带 timestamp T_last）继续服务
+  T_last 老于 60s: 进入 "degraded" 状态，开始拒绝高风险变更（如新模型版本切流）
+  T_last 老于 600s: 报警 + 拒绝所有租户级变更，但保持现有流量服务
+  永远不应: 失联就停止服务（control plane 抖动会变成全站故障）
+```
+
+类比：Kubernetes kubelet 在与 apiserver 失联时也是用本地最后一次同步的 PodSpec 继续运行——这不是 bug，是关键设计原则。LLM serving 的 control plane 抖动比 K8s 频繁（部署、灰度、quota 调整都触发），data plane 必须假设 control plane 随时可能短暂不可达。
+
+**实际生产形态**：
+
+- **Envoy + Istio Pilot**：xDS push，成熟的工业标准，AI gateway 直接复用。
+- **自研 policy service + Redis pub/sub**：中小团队常用，Redis 做 fan-out broadcast，data plane subscribe。延迟 < 100ms，足够 LLM 场景的配置下发节奏。
+- **OpenPolicyAgent (OPA) + REST polling**：data plane 每秒 GET 一次 policy bundle，OPA evaluate 配额规则。简单，适合配额这种"次秒级延迟可接受"的场景。
+- **Kubernetes ConfigMap + sidecar reload**：最朴素，依赖 kubelet 同步 ConfigMap 到 Pod 文件系统。延迟可能几秒到几十秒，适合非热路径的发布配置。
 
 ### 14.4 为什么在线推理的核心不是平均延迟，而是尾延迟
 
