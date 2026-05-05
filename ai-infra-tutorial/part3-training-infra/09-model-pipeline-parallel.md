@@ -924,7 +924,76 @@ effective ~= ideal * 0.821 * 0.90 = ideal * 0.739
 
 也就是理想算力只有约 74% 能反映到 tokens/s，剩下损失来自流水空泡和 stage 不均。
 
-### 7.3 70B 状态粗算
+### 7.3 3D Parallel Step Time 组合模型
+
+第 8 章的 DP step time 模型（`step_time = compute + exposed_comm + optimizer`）在混合并行下需要扩展。3D parallel 的 step time 来源于四类通信的叠加，每类都有独立的 overlap 条件。
+
+**组合模型**
+
+```text
+step_time_3d ≈ max_dp_replica(
+    PP_warmup                                           # (PP-1) × avg_stage_time，无法掩盖
+  + m × max_stage(
+        max_rank_in_stage(
+            microbatch_compute                          # CUDA kernel 时间，profiler 直接测量
+          + max(tp_collective - tp_overlap, 0)          # TP exposed（节点内通常 5-15 ms）
+          + max(pp_send_recv - pp_overlap, 0)           # PP exposed（跨节点通常 1-5 ms per boundary）
+        )
+    )
+  + PP_drain                                            # (PP-1) × avg_stage_time，无法掩盖
+  + max(dp_sync - dp_overlap, 0)                        # DP exposed（梯度同步，见第 8 章公式）
+  + max(fsdp_allgather - fsdp_overlap, 0)              # FSDP exposed（如启用 hybrid sharding）
+  + max(cp_exchange - cp_overlap, 0)                    # CP exposed（KV exchange，长上下文敏感）
+  + optimizer
+)
+
+bubble_latency = PP_warmup + PP_drain ≈ 2 × (PP-1) × avg_stage_time
+bubble_fraction = bubble_latency / pipeline_step_time
+```
+
+**各组件数量级参考（70B，TP=8, PP=4, DP=4，seq=8192，节点内 NVSwitch，跨节点 400G IB）**
+
+| 组件 | 典型 P50 | 典型 P95 | 主要 overlap 来源 |
+|---|---|---|---|
+| microbatch_compute（per stage） | 350-500 ms | 380-540 ms | 无，是基准 |
+| tp_collective（per layer，节点内） | 0.4 ms/call，160 calls ≈ 0.6-1 ms exposed | 1-2 ms exposed | 下一层 GEMM（CUDA stream） |
+| pp_send_recv（per boundary） | 2.7 ms，3 boundaries ≈ 5-8 ms exposed | 8-15 ms exposed | 下一个 microbatch 某层 compute |
+| dp_sync（梯度 AllReduce，DP=4） | 按第 8 章公式，通常 20-60 ms total | 40-80 ms total | backward 最后阶段（DDP bucket） |
+| optimizer | 100-140 ms | 130-160 ms | 无（Adam 顺序更新） |
+| PP bubble（PP=4，m=32，1F1B） | (4-1)/32 ≈ 9.4% × pipeline_step | 同 | 无 |
+
+**诊断路径**
+
+```text
+step_time 高 → 拆分 profiler：
+
+1. PP bubble 明显（stage idle 约占 10% 以上）
+   → 增加 microbatch_count（m），或开 interleaved pipeline；先不换 PP size
+
+2. TP collective 暴露（每层 GEMM 间有明显 idle gap）
+   → 验证 TP group 在 NVSwitch 内；检查 CUDA_DEVICE_MAX_CONNECTIONS=1；
+     运行 nccl-tests 节点内 all_reduce_perf
+
+3. PP send/recv 暴露（stage 结束后空闲等待 recv）
+   → 检查 m 是否 ≥ PP（1F1B 稳态需要 m ≥ p）；检查跨节点 IB/RoCE 带宽
+
+4. DP sync 暴露（与第 8 章 §9.2 对齐诊断）
+   → 检查 bucket_cap_mb、overlap 配置、DP group 带宽
+
+5. FSDP AllGather 暴露
+   → 检查 wrap policy、limit_all_gathers、backward_prefetch
+
+6. CP exchange 暴露（长上下文）
+   → 检查 Ring FA 实现是否支持 KV overlap；检查 CP 网络带宽（见 §4.6.1）
+
+7. compute 主导（所有通信被完全掩盖）
+   → 系统工作正常；优化 kernel（FlashAttention、FP8）或增加 GPU 数量
+```
+
+> [!NOTE]
+> 上述模型假设 microbatch 内 stage 时间均匀。真实 stage 不均衡（见 §4.3.5）会让 `max_stage()` 明显大于 `avg_stage()`，使 bubble 估算低估实际 stage idle 时间。排查 step time 时应同时检查 stage time 的 P95/P50 比值。
+
+### 7.4 70B 状态粗算
 
 假设 dense 70B，BF16 参数，AdamW，未分片状态：
 
@@ -939,7 +1008,7 @@ effective ~= ideal * 0.821 * 0.90 = ideal * 0.739
 
 这解释了为什么 70B 训练不会只靠“80GB HBM 很大”解决。必须通过 TP/PP/FSDP/ZeRO 把状态和层计算切开。
 
-### 7.4 405B 状态粗算
+### 7.5 405B 状态粗算
 
 405B dense BF16 参数：
 
