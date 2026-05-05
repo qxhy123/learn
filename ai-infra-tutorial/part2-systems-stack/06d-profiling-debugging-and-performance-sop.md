@@ -311,7 +311,7 @@ Launch 稀疏的典型图像是：CUDA HW 轨道上有很多短 kernel，像离�
 4. 做 A/B：eager vs `torch.compile`，debug metric 开关，固定 shape vs 动态 shape。
 5. 只用端到端 step time 验收，不用“kernel 数减少”作为唯一成功标准。
 
-`torch.profiler` 示例：
+`torch.profiler` 示例（一次性采集，适合调试）：
 
 ```python
 import torch
@@ -332,6 +332,87 @@ with profile(
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
 print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
 ```
+
+#### 6d.6.1 生产级 torch.profiler：schedule + Chrome Trace + 低 overhead
+
+**工具口径标签**：`tooling-public-doc + illustrative overhead`，核对日期 `2026-05-05`；API 以 PyTorch `torch.profiler` 当前公开接口为准，shape=大模型训练或推理服务的稳定 step/request 窗口。overhead 数字是经验量级，不是某个固定模型的保证值；上线前必须用目标 workload 复测。
+
+调试模式的 profiler 在生产 step 上跑会让 step time 翻 2-5 倍。生产环境用 `schedule` 限制采样窗口，把数据导出到 Chrome Trace（在 `chrome://tracing` 或 [Perfetto](https://ui.perfetto.dev/) 打开）：
+
+```python
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
+
+# schedule: 跳过 wait 步、热身 warmup 步、active 步采样、然后重复 repeat 次
+prof = profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(wait=10, warmup=5, active=20, repeat=1),
+    on_trace_ready=tensorboard_trace_handler("./logs/profiler"),
+    record_shapes=True,
+    profile_memory=False,   # 生产关闭，with_stack 也关闭
+    with_stack=False,
+)
+prof.start()
+for step, batch in enumerate(loader):
+    train_step(batch)
+    prof.step()        # 必须每步调用，让 schedule 推进
+    if step >= 50:
+        break
+prof.stop()
+
+# 同时导出 Chrome Trace 给单步深度分析
+# 上面 tensorboard_trace_handler 会自动生成 .pt.trace.json
+# 在 Perfetto 打开即可看到完整 timeline
+```
+
+**生产 overhead 控制要点**：
+
+| 选项 | 默认 | 生产建议 | 原因 |
+|---|---|---|---|
+| `with_stack` | False | **保持 False** | 开启会让每个 op 抓 Python 栈，overhead 5-20× |
+| `profile_memory` | False | **保持 False** | memory tracking 引入 hook，overhead 2-5× |
+| `record_shapes` | False | True 可接受 | 仅记录 shape，overhead 小 |
+| `schedule` | 全程采样 | **必须配置** | 全程采样让 step time 翻倍 |
+| `with_modules` | False | False | 同 with_stack |
+| 采样比例 | — | < 1% step | tail-sampling：异常请求或周期性少量采样 |
+
+> [!DANGER]
+> **不要把 `with_stack=True` + `profile_memory=True` 直接挂到生产训练上**。`illustrative workload label`：单机或多机 PyTorch 大模型训练，step time 基线约 2 秒，核对日期 `2026-05-05`；这两个组合可能把 step time 放大到 10-20 秒量级，长窗口还可能因为 profiler 数据和内存上限被 kill。生产用 schedule + 低粒度，调试用 full mode。
+
+#### 6d.6.2 Nsight Systems / Compute 命令速查
+
+**工具口径标签**：`NVIDIA-public-doc`，核对日期 `2026-05-05`；CUDA 12.x 文档仍把 Visual Profiler / `nvprof` 标为 deprecated，CUDA 13.0 release notes 标明二者已移除。新项目统一用 Nsight Systems（系统时间线）和 Nsight Compute（kernel 微结构）：
+
+```bash
+# Nsight Systems —— 端到端时间线（CPU API + CUDA HW + Memcpy + NCCL + NVTX + IO）
+nsys profile -t cuda,nvtx,osrt,cudnn,cublas,nccl \
+  -o trace_$(date +%Y%m%d_%H%M%S) \
+  --stats=true \
+  python train.py
+
+# 把 nsys 输出转成 SQL/CSV 进一步分析
+nsys stats --report cudaapisum,gpukernsum trace.nsys-rep
+
+# Nsight Compute —— 单 kernel 下钻（先用 nsys 找慢点，再用 ncu 看少数 kernel）
+ncu --set full \
+  --target-processes all \
+  --kernel-name regex:gemm|attention|layernorm \
+  --launch-skip 100 --launch-count 10 \
+  -o kernel_$(date +%Y%m%d_%H%M%S) \
+  python train.py
+
+# 只采集少量轻量 section（避免 overhead 过大）
+ncu --set default \
+  --kernel-name regex:flash_attn \
+  --launch-skip 100 --launch-count 5 \
+  python train.py
+```
+
+> [!WARNING]
+> **`ncu --set full` 的 overhead**：`illustrative workload label`：单 kernel replay profiling，shape=目标 kernel 的 5-10 次 launch 窗口，核对日期 `2026-05-05`；每个被采样的 kernel 会被 replay 多次以收集所有计数器，单 kernel 时间可能放大 **5-50×**。生产 step 上跑 full set 会让 step time 飙升甚至超时被 driver kill。规则：(1) 用 `--launch-skip` 跳过 warmup，(2) 用 `--launch-count` 限制采样数（通常 5-10），(3) 用 `--kernel-name` 只采目标 kernel，(4) 在专用 profile job 上跑而不是生产训练。
+
+> [!TIP]
+> **Nsight Compute `--set` 选项**：NVIDIA Nsight Compute CLI 公开文档包含 `default`、`detailed`、`full`、`roofline` 等 section set；括号内 overhead 只能作为 `illustrative` 经验量级：`default`（轻量，~5×）、`detailed`（中量，~10×）、`full`（全量，~30×）、`roofline`（含 Roofline 模型，~20×）。先 default 看大方向，需要时再 full。
 
 不要一看到 launch 稀疏就立刻手写 CUDA kernel。更常见、更稳的路线是：删掉热路径里的同步和 Python 小逻辑，启用 `torch.compile`，使用 FlashAttention / fused optimizer / fused norm 等成熟实现，最后才考虑自定义算子。
 
