@@ -675,6 +675,44 @@ DP = world_size / (TP * PP * CP) = 128 / (8 * 4 * 1) = 4
 - `context-parallel-size > 1` 时，需要确认 attention kernel、mask、position encoding 和 checkpoint 支持。
 - `use-distributed-optimizer` 是状态分片层，不等同于 TP/PP。
 
+**GQA / MQA TP 约束专项**
+
+现代 LLM 普遍使用 Grouped Query Attention（GQA），KV heads 远少于 Q heads。**TP size 必须能整除 KV heads**，而不仅仅是 Q heads。
+
+```text
+合法性规则（同时满足）：
+  num_q_heads   % TP == 0
+  num_kv_heads  % TP == 0        ← GQA 额外约束，通常是瓶颈
+  hidden_size   % TP == 0
+  ffn_size      % TP == 0
+  vocab_size    % TP == 0（vocab parallel 模式下为硬约束）
+```
+
+**主流 GQA 模型的合法 TP 值**
+
+| 模型 | Q heads | KV heads | 合法 TP 值 | 常见生产 TP |
+|---|---|---|---|---|
+| Llama-3 8B | 32 | 8 | 1, 2, 4, **8** | 4 或 8 |
+| Llama-3 70B | 64 | 8 | 1, 2, 4, **8** | **8** |
+| Llama-3 405B | 128 | 8 | 1, 2, 4, **8** | **8**（节点内）|
+| Mistral 7B | 32 | 8 | 1, 2, 4, **8** | 4 或 8 |
+| Qwen2.5 72B | 64 | 8 | 1, 2, 4, **8** | **8** |
+| Qwen2.5 7B | 28 | 4 | 1, 2, **4** | **4** |
+| Gemma2 27B | 32 | 16 | 1,2,4,8,**16** | 8 |
+| 标准 MHA（如 GPT-3 175B） | 96 | 96 | 1~96（因子集） | 8 或 16 |
+
+> [!DANGER]
+> **TP=16 在 8 KV head 模型上无效。** 大多数 GQA 模型的 KV heads 为 8，TP 上限为 8，与单节点 8-GPU NVSwitch 对齐——这是架构约束而非工程选择。尝试 TP=16 时，Megatron-LM 会报错退出，部分 DeepSpeed 版本会产生 silent shape mismatch。
+
+**框架检查行为**
+
+```text
+Megatron-LM：assert kv_heads % tp_size == 0，报错退出
+DeepSpeed：部分版本不检查，可能 silent mismatch
+PyTorch FSDP：不处理 attention head 约束，用户自行保证
+Transformer Engine GQA：内置 assertion
+```
+
 ### 5.2 DeepSpeed pipeline boundaries
 
 DeepSpeed PipelineModule 需要显式定义 layer 顺序和 stage 边界。工程上最容易出问题的是首尾不均：
@@ -1073,7 +1111,7 @@ flowchart TD
 
 | 策略 | Megatron | DeepSpeed | PyTorch FSDP | 主要约束 |
 |---|---|---|---|---|
-| TP | 强 | 部分场景 | 非原生主轴 | hidden/head/vocab 可整除，kernel 支持 |
+| TP | 强 | 部分场景 | 非原生主轴 | hidden/head/vocab 可整除，kernel 支持；GQA 模型需 KV heads 整除 TP |
 | PP | 强 | PipelineModule 支持 | 需要额外 pipeline 框架 | stage 切分、microbatch schedule |
 | SP | 强 | 视实现 | 非主轴 | 通常依赖 TP |
 | CP | 新实现差异大 | Ulysses/Ring 相关实现 | 非主轴 | attention kernel、mask、position |
