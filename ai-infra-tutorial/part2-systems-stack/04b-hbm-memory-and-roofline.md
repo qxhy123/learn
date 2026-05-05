@@ -464,6 +464,8 @@ $$
 
 用第4章相同的数量级口径，可以建立直觉：
 
+**数字口径标签**：`vendor-public + illustrative calculation`，规格核对日期 `2026-05-05`，shape=`N/A`；表内 peak compute 和 HBM 带宽来自 NVIDIA 公开规格，Machine balance 为 `dense Tensor Core peak / HBM bandwidth` 的手算值，不是 kernel 实测吞吐。
+
 | 设备 | BF16/FP16 dense 峰值 | HBM 带宽 | Machine balance |
 |------|----------------------|----------|-----------------|
 | A100 80GB SXM | ~312 TFLOPS | ~2.0 TB/s | ~156 ops/byte |
@@ -472,10 +474,10 @@ $$
 | B200 SXM | ~4500 TFLOPS | ~8.0 TB/s | ~562 ops/byte |
 | GB200 (per GPU) | ~5000 TFLOPS | ~8.0 TB/s | ~625 ops/byte |
 
-数字基于 NVIDIA 官方 datasheet（公开规格），以 dense Tensor Core 为口径；如果模型实际能用 sparse Tensor Core (2:4 结构稀疏)，dense 算力可视为乘以 2 上限。FP8 dense 算力约为 BF16 的 2x，FP4（B200/GB200 NV E2M1 格式）约为 BF16 的 4x。
+数字基于 NVIDIA 官方 datasheet / 产品规格（公开规格），以 dense Tensor Core 为口径；如果模型实际能用 sparse Tensor Core (2:4 结构稀疏)，dense 算力可视为乘以 2 上限。FP8 dense 算力约为 BF16 的 2x，FP4（B200/GB200 NV E2M1 格式）约为 BF16 的 4x。
 
 > [!WARNING]
-> **B200 machine balance 反向加速 memory-bound 失衡**：B200 的 BF16 算力比 H100 翻 4.5x，但 HBM 带宽只提升 2.4x（3.35 TB/s → 8.0 TB/s），machine balance 从 295 飙升到 562。结果是：在 H100 上已经 memory-bound 的 kernel（如 decode attention、layernorm、small-batch GEMV、KV-cache 写回），从 H100 换 B200 实际加速远小于 TFLOPS 提升。生产中常见 LLM decode 只有 1.5-2x 加速（而非 4.5x），prefill 大 batch GEMM 才能接近 TFLOPS 上限。
+> **B200 machine balance 反向加速 memory-bound 失衡**：B200 的 BF16 算力比 H100 翻 4.5x，但 HBM 带宽只提升 2.4x（3.35 TB/s → 8.0 TB/s），machine balance 从 295 飙升到 562。结果是：在 H100 上已经 memory-bound 的 kernel（如 decode attention、layernorm、small-batch GEMV、KV-cache 写回），从 H100 换 B200 实际加速远小于 TFLOPS 提升。`illustrative workload label`：decode-heavy LLM serving、small batch、KV-cache bandwidth bound、相同模型和引擎版本、核对日期 `2026-05-05`；这类路径常见预期应按 1.5-2x 量级先压测验证，而不能按 4.5x TFLOPS 上限预算。prefill 大 batch GEMM 才更可能接近 compute roof。
 
 这张表有一个反直觉结论：H100 → B200 算力增速远高于 HBM 带宽增速，所以 machine balance 急剧升高。同一个 AI 不变的 kernel，从 A100 换到 B200 后，更容易落在 roofline 左侧——你会看到 GPU 标称算力暴涨，但某些 memory-bound kernel 提速远小于 TFLOPS 提升。这也是为什么 B200 实际推理 throughput 提升通常依赖 FP4 / FP8 量化（直接降低 byte/token）+ MLA / GQA（降低 KV bandwidth）+ Speculative Decoding（提升 token/cycle），而不仅仅是换硬件。
 

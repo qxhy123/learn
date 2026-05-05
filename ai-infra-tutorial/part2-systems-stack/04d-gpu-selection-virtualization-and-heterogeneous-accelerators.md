@@ -390,13 +390,18 @@ Time-slicing 更像"排队轮流用"。它的优势是简单、兼容性好，�
 
 NVIDIA 的优势不只是 GPU 本身，而是 CUDA、cuDNN、NCCL、TensorRT、Triton kernel、DCGM、GPU Operator、Nsight、社区 benchmark 和大量开源项目默认路径。非 NVIDIA 加速器要进入生产平台，必须回答"软件栈能不能稳定承载目标模型"。
 
+**数字口径标签**：`vendor-public + ecosystem-checkpoint`，核对日期 `2026-05-05`，shape=`N/A`；表内 HBM、带宽、端口和 pod 规模来自各厂商公开规格或云产品资料，生态成熟度是工程评估入口，不是稳定事实。所有“性价比”“已部署”“成熟”类判断上线前必须用目标模型、目标 runtime 和目标云/机房环境重测。
+
 | 平台 | 典型优势 | 主要生态成本 | 更适合的进入方式 |
 |------|----------|--------------|------------------|
-| AMD MI300X / MI325X / MI350 | 大 HBM、ROCm 逐步成熟、云上供给增加 | ROCm 版本兼容、CUDA kernel 迁移、部分推理引擎支持滞后 | 从显存敏感推理或特定训练栈试点 |
-| Google TPU v5 / v6 | Pod 级训练、XLA 编译、Google Cloud 集成 | 云生态绑定、PyTorch/JAX 路径差异、调试模型不同 | 已在 GCP 和 JAX/XLA 生态内的团队 |
-| Intel Gaudi 3 | 成本导向、以太网互联思路清晰 | 社区规模、kernel 和框架适配成熟度 | 标准模型、标准训练流程试点 |
-| 华为昇腾 910B / 910C | 本土供应链、政企和区域化场景 | CANN / MindSpore / PyTorch 适配、算子覆盖、迁移工程 | 有合规或供应链约束的平台 |
-| AWS Trainium / Inferentia | AWS 内部 TCO、托管生态 | Neuron SDK、云绑定、迁出成本 | 深度使用 AWS 的训练或推理服务 |
+| **AMD MI300X**（**192 GB HBM3** 业界单卡最大 / **5.3 TB/s** / 153 TFLOPS BF16 dense） | 单卡装 Llama-405B BF16；ROCm 6.x + vLLM/SGLang/TRT-LLM 替代支持已成熟；Llama-405B 单节点已在 OCI/Azure ND MI300X v5 规模化部署 | ROCm 版本兼容（驱动升级风险）、部分 CUDA kernel 迁移仍有空白、FlashAttention 在 MI300X 有专门实现但性能曲线和 H100 不同 | 超长上下文推理或显存敏感训练试点 |
+| **AMD MI325X / MI350**（MI325X **256 GB HBM3e**；MI350 即将量产） | HBM 容量进一步放大，对 200B+ 模型推理价值明显 | 同 MI300X，新代际 ROCm 适配窗口短 | Long-Context Inference 试点 |
+| **Google TPU v5e**（推理优化，16 GB HBM / 256 chip pod） | per-chip 价格远低于 v5p；JAX 推理生态成熟；GCP 上中等推理性价比好 | XLA 调试模型不同、JAX/PyTorch XLA 与原生 PyTorch 路径不一致 | GCP 上中等规模推理/微调 |
+| **Google TPU v5p**（训练优化，95 GB HBM / 8960 chip pod / 3D Torus） | 超大 Pod 训练 trillion-parameter 模型；Gemini 训练硬件 | 仅 GCP 可用、JAX/XLA 学习曲线 | GCP 上超大规模训练 |
+| **Google TPU v6e (Trillium)**（32 GB HBM / 256 chip pod） | v5e 后继，FP8 + per-chip 算力翻倍 | 同 v5e | GCP 推理 + 中等微调 |
+| **Intel Gaudi 3**（128 GB HBM2e / 1.835 TB/s / **24 × 200Gbps RoCE 端口 = 3.6 Tbps 双向**） | 集成 RoCE 网卡设计天然适合 scale-out；价格显著低于 H100；Intel Developer Cloud 已规模化 serving | SynapseAI / OneAPI 仍较新、PyTorch HPU plugin 算子覆盖不全 | 标准 LLM 训练/推理试点，对 NVLink-style scale-up 不强需求场景 |
+| 华为昇腾 910B / 910C | 本土供应链、政企和区域化合规场景；MindSpore 生态 | CANN / MindSpore / PyTorch Ascend plugin 适配、算子覆盖、迁移工程 | 有合规或供应链约束的平台 |
+| **AWS Trainium 2 / Inferentia 2**（Trn2 单节点 16 chip NeuronLink；Inf2 推理优化） | AWS 内部 TCO、托管生态、与 SageMaker / Bedrock 深度集成 | Neuron SDK 学习曲线、云绑定、迁出成本 | 深度使用 AWS 的训练或推理服务 |
 
 #### 4d.8.1 评估非 NVIDIA 的问题清单
 
