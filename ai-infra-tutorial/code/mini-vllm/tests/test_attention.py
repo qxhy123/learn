@@ -1,6 +1,6 @@
 import torch
 from mini_vllm.backends.torch_backend import TorchBackend
-from mini_vllm.backends.reference import reference_decode
+from mini_vllm.backends.reference import reference_decode, reference_prefill
 
 
 def test_reshape_and_cache_writes_correct_slots():
@@ -47,3 +47,25 @@ def test_torch_decode_matches_reference():
     out = backend.decode(q, kc, vc, block_table, context_lens, scale)
     ref = reference_decode(q, kc, vc, block_table, context_lens, scale)
     assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_torch_prefill_matches_reference_and_is_causal():
+    torch.manual_seed(0)
+    H, D, H_kv = 8, 16, 2
+    # Two seqs, lengths 5 and 3
+    seq_lens = torch.tensor([5, 3])
+    query_lens = torch.tensor([5, 3])
+    N = 8
+    q = torch.randn(N, H, D)
+    k = torch.randn(N, H_kv, D)
+    v = torch.randn(N, H_kv, D)
+    scale = D ** -0.5
+    out = TorchBackend().prefill(q, k, v, seq_lens, query_lens, scale)
+    ref = reference_prefill(q, k, v, seq_lens, query_lens, scale)
+    assert torch.allclose(out, ref, atol=1e-5)
+    # Causal sanity: position 0 of seq 0 attends only to itself
+    # Easy check: re-run with k/v of pos>0 zeroed out and result for pos 0 unchanged
+    k2 = k.clone(); v2 = v.clone()
+    k2[1:5] = 0; v2[1:5] = 0  # zero out future positions of seq 0
+    out2 = TorchBackend().prefill(q, k2, v2, seq_lens, query_lens, scale)
+    assert torch.allclose(out[0], out2[0], atol=1e-5)
