@@ -1,5 +1,6 @@
 import torch
 from mini_vllm.backends.torch_backend import TorchBackend
+from mini_vllm.backends.reference import reference_decode
 
 
 def test_reshape_and_cache_writes_correct_slots():
@@ -24,3 +25,25 @@ def test_reshape_and_cache_writes_correct_slots():
     # Other slots untouched
     assert (kc[0] == 0).all()
     assert (kc[3] == 0).all()
+
+
+def test_torch_decode_matches_reference():
+    torch.manual_seed(0)
+    B, H, D, H_kv = 3, 8, 16, 2  # GQA: 4 query heads per kv head
+    block_size = 4
+    num_blocks = 16
+    max_blocks_per_seq = 4
+    kc = torch.randn(num_blocks, H_kv, D, block_size)
+    vc = torch.randn(num_blocks, H_kv, D, block_size)
+    q = torch.randn(B, H, D)
+    block_table = torch.tensor([
+        [0, 1, 2, 3],
+        [4, 5, 6, 0],
+        [7, 8, 0, 0],
+    ], dtype=torch.int32)
+    context_lens = torch.tensor([13, 10, 6], dtype=torch.int32)
+    scale = D ** -0.5
+    backend = TorchBackend()
+    out = backend.decode(q, kc, vc, block_table, context_lens, scale)
+    ref = reference_decode(q, kc, vc, block_table, context_lens, scale)
+    assert torch.allclose(out, ref, atol=1e-5)
