@@ -6,8 +6,14 @@
 
 - 输入 markdown：例如 `part3-training-infra/09-model-pipeline-parallel.md`
 - 输出 HTML：`html/part3/09-model-pipeline-parallel.html`
+- 站点首页映射：`README.md` → `html/index.html`
+- 前言映射：`00-preface.md` → `html/preface.html`
 - Part 0 输出：`html/part0/0a-cpu-microarchitecture.html`
 - 附录输出：`html/appendix/glossary.html`
+
+公开发布源稿只包括 `README.md`、`00-preface.md`、`part*/` 和 `appendix/` 下的教程正文。`docs/superpowers/` 为内部协作与转换说明，SPEC archive 为归档资料，二者不转换为公开 HTML，不加入发布导航。
+
+`html/preface.html` 是根目录页面，资源路径必须使用 `assets/`、`sidebar.html`、`part*/...html`，不要使用章节页的 `../assets/` 前缀。它在 `html/assets/tutorial-data.js` 中作为开头的“开始之前”导航项登记，推荐 `id: "preface"`、`path: "preface.html"`、`title: "前言：如何使用本教程"`。
 
 ## 2. 必须出现的结构元素
 

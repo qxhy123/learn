@@ -10,1291 +10,781 @@
 <iframe id="sidebar" src="../sidebar.html?current=19c" class="sidebar-frame" loading="eager"></iframe>
 <main class="page">
 <nav class="topnav"></nav>
+
 <section class="hero">
 <h1>第 19c 章 · AI CRD 与 Operator</h1>
-<p class="sub">设计面向 AI 平台的声明式 API、Controller、状态机和运维自动化。</p>
-<div class="chips"><span class="chip">CRD</span><span class="chip">Operator</span><span class="chip">Controller</span><span class="chip">Reconcile</span><span class="chip">API</span></div>
+<p class="sub">从"如何把 AI 任务的高层语义声明为稳定 API，并持续把真实集群状态推进到期望状态"出发，拆解 CRD、Operator、reconciliation loop、状态机、ownerReference、finalizer 与 TorchJob、RayJob、MPIJob、KServe 的核心语义。</p>
+<div class="chips">
+  <span class="chip">CRD</span>
+  <span class="chip">Operator</span>
+  <span class="chip">TorchJob</span>
+  <span class="chip">RayJob</span>
+  <span class="chip">MPIJob</span>
+  <span class="chip">KServe</span>
+  <span class="chip">Reconciliation</span>
+  <span class="chip">LeaderWorkerSet</span>
+  <span class="chip">Server-Side Apply</span>
+</div>
+<div class="note"><strong>不可化简的问题：</strong>AI 任务有角色、拓扑、协议、生命周期、失败语义和观测语义，这些都无法用 Pod/Job/Deployment 表达清楚——如何把这些高层语义声明为稳定 Kubernetes API，并由控制器持续把真实状态收敛到期望状态？</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。先建立 CRD/Operator/Reconciliation 的第一性原理，再深入架构与机制（controller-runtime、SSA、Conversion Webhook、Leader Election），然后拆解四类 AI CRD 的语义，最后覆盖工程化、方案设计、排障与 Worked Example。</div>
 </section>
-<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#19c1-第一性原理拆解--学习大纲">19c.1 第一性原理拆解 +
-学习大纲</a></li><li><a class="anchor" href="#19c2-概念先说清楚">19c.2 概念先说清楚</a></li><li><a class="anchor" href="#19c3-架构组件路径与责任边界">19c.3
-架构：组件、路径与责任边界</a></li><li><a class="anchor" href="#19c4-原理reconciliation状态机与对象语义">19c.4
-原理：Reconciliation、状态机与对象语义</a></li><li><a class="anchor" href="#19c5-常见-ai-crd-的语义">19c.5 常见 AI CRD 的语义</a></li><li><a class="anchor" href="#19c6-工程化生产落地版本发布观测与治理">19c.6
-工程化：生产落地、版本、发布、观测与治理</a></li><li><a class="anchor" href="#19c7-方案设计ai-crd-选择与-operator-设计">19c.7 方案设计：AI CRD
-选择与 Operator 设计</a></li><li><a class="anchor" href="#19c8-故障排除症状证据根因动作">19c.8
-故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#19c9-反模式与-checklist">19c.9 反模式与 Checklist</a></li><li><a class="anchor" href="#19c10-worked-example8-节点-pytorch-训练的控制面设计">19c.10
-Worked Example：8 节点 PyTorch 训练的控制面设计</a></li><li><a class="anchor" href="#本章小结">本章小结</a></li><li><a class="anchor" href="#练习题">练习题</a></li></ol></section>
-<section class="section">
-<blockquote>
-<p>Pod、Job、Deployment 是 Kubernetes 的通用抽象；AI
-平台还需要表达分布式训练、Ray 集群、MPI
-launcher、模型服务灰度、弹性伸缩和失败恢复。本章从第一性原理出发，讲清
-CRD/Operator 如何把这些 AI 语义变成 Kubernetes API
-中可观察、可治理、可恢复的一等对象。</p>
-</blockquote>
-<hr />
-<h2 id="19c1-第一性原理拆解--学习大纲">19c.1 第一性原理拆解 +
-学习大纲</h2>
-<h3 id="拆不可化简的问题">拆：不可化简的问题</h3>
-<p>AI 平台上的高层任务不是“一组容器”这么简单。一个 64 卡 PyTorch
-训练任务至少包含这些约束：</p>
-<ul>
-<li>角色：master、worker、可能还有 evaluator、parameter
-server、launcher。</li>
-<li>拓扑：每个 worker 几张 GPU，是否要求整机，是否要求同 rack 或同 IB
-fabric。</li>
-<li>协议：rendezvous 地址、rank、world size、NCCL 网卡、端口。</li>
-<li>生命周期：初始化、等待所有
-rank、训练、checkpoint、失败重启、成功归档。</li>
-<li>失败语义：单个 worker
-失败时是重启全局训练、弹性缩容，还是直接失败。</li>
-<li>观测语义：用户需要看到的是“等待 8 卡 gang 调度”，不是“某个 Pod
-Pending”。</li>
-</ul>
-<p>同理，RayJob 不是一个普通 Job，MPIJob 不是一堆 worker Pod，KServe
-InferenceService 也不是一个
-Deployment。它们都有各自的控制面语义。如果把这些语义分散在脚本、CI
-模板、平台后端和人工 runbook
-里，系统会变得不可恢复、不可解释、不可审计。</p>
-<p>不可化简的问题是：<strong>如何把 AI 任务的高层语义声明为稳定
-API，并持续把真实集群状态推进到期望状态。</strong></p>
-<h3 id="推从问题推导机制">推：从问题推导机制</h3>
-<p>从“用户应该提交高层语义”推出 CRD。CRD 让 Kubernetes API 增加
-<code>PyTorchJob</code>、<code>RayJob</code>、<code>MPIJob</code>、<code>InferenceService</code>
-等资源类型。</p>
-<p>从“真实世界持续变化”推出 Operator。节点会重启，Pod
-会失败，镜像会拉取失败，PVC 会等待绑定，用户会修改副本数，服务 revision
-会切流量。一次性生成 YAML 不能处理这些变化，必须有控制器持续
-reconcile。</p>
-<p>从“期望状态和真实状态必须分离”推出 <code>spec</code> 与
-<code>status</code>。<code>spec</code>
-是用户或平台声明的目标；<code>status</code>
-是控制器观察到的结果。控制器不应该偷偷修改 <code>spec</code>
-来表达运行状态。</p>
-<p>从“删除也有语义”推出 finalizer。删除训练任务时可能要清理临时
-Service、外部 Ray cluster、云端 endpoint、模型缓存或 checkpoint
-lease。Kubernetes 的普通垃圾回收只认识集群内对象，不认识外部资源。</p>
-<p>从“底层对象必须有归属”推出 ownerReference 和 label selector。Operator
-创建的 Pod、Service、ConfigMap、Job、Revision
-必须能被反查、清理和聚合状态。</p>
-<p>从“AI 任务有阶段”推出状态机与 conditions。单个
-<code>phase=Running</code> 不够，平台还要表达
-<code>Admitted</code>、<code>PodsCreated</code>、<code>RendezvousReady</code>、<code>ModelLoaded</code>、<code>TrafficReady</code>、<code>CheckpointRestored</code>
-等细粒度条件。</p>
-<h3 id="学习大纲">学习大纲</h3>
-<p>本章按以下顺序展开：</p>
-<ol type="1">
-<li>概念边界：CRD、Custom
-Resource、Controller、Operator、Webhook、Helm、Scheduler
-分别是什么。</li>
-<li>架构：API Server、etcd、watch
-cache、controller-runtime、workqueue、ownerReference、finalizer
-的协作路径。</li>
-<li>原理：reconciliation
-loop、幂等性、乐观并发、状态机、条件、失败恢复。</li>
-<li>AI CRD：TorchJob、RayJob、MPIJob、KServe InferenceService
-的核心语义和底层对象。</li>
-<li>工程化：配置、版本矩阵、发布、观测、RBAC、安全治理和兼容性。</li>
-<li>方案设计：如何为训练和推理选择 CRD，以及如何设计一个可上线的
-Operator。</li>
-<li>排障与反模式：从症状、证据、根因到处理动作。</li>
-<li>Worked Example：把 8 节点 PyTorch 训练做成可恢复、可排障的 CRD
-工作负载。</li>
-</ol>
-<hr />
-<h2 id="19c2-概念先说清楚">19c.2 概念先说清楚</h2>
-<h3 id="crd-是什么不是什么">CRD 是什么，不是什么</h3>
-<p>CRD 的全称是 CustomResourceDefinition。它向 Kubernetes API
-注册一种新的资源类型。注册后，用户可以像操作 Pod
-一样操作自定义对象：</p>
-<div class="sourceCode" id="cb1"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pytorchjobs <span class="at">-n</span> train</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe rayjob <span class="at">-n</span> ml batch-embed-v3</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get inferenceservice <span class="at">-n</span> serving reranker <span class="at">-o</span> yaml</span></code></pre></div>
-<p>CRD 是 API 扩展机制，不是调度器，不是工作流引擎，也不是模板语言。CRD
-本身只负责让 API Server
-接受、校验、存储和返回这种对象。没有控制器时，一个 CRD 对象只是 etcd
-里的声明，不会自动创建 Pod。</p>
-<h3 id="custom-resource-是什么不是什么">Custom Resource
-是什么，不是什么</h3>
-<p>Custom Resource 是 CRD 的实例。例如 <code>kind: PyTorchJob</code> 的
-<code>train-reranker</code>
-对象就是一个自定义资源。它通常包含三类字段：</p>
-<table>
-<thead>
-<tr>
-<th>字段</th>
-<th>归属</th>
-<th>含义</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>metadata</code></td>
-<td>Kubernetes</td>
-<td>name、namespace、labels、annotations、finalizers、ownerReferences</td>
-</tr>
-<tr>
-<td><code>spec</code></td>
-<td>用户或平台</td>
-<td>期望状态，例如副本数、镜像、资源、模型路径、重启策略</td>
-</tr>
-<tr>
-<td><code>status</code></td>
-<td>控制器</td>
-<td>观察状态，例如 phase、conditions、replica
-status、revision、失败原因</td>
-</tr>
-</tbody>
-</table>
-<p><code>spec</code> 是输入，<code>status</code> 是输出。用户改
-<code>spec</code>，控制器改 <code>status</code>。把运行时状态写进
-<code>spec</code> 会破坏声明式 API 的边界。</p>
-<h3 id="controller-与-operator-的边界">Controller 与 Operator
-的边界</h3>
-<p>Controller 是 Kubernetes
-控制循环的通用名字：监听对象变化，比较期望状态和真实状态，执行修正动作。</p>
-<p>Operator 是面向某个领域的控制器加运维知识。AI Operator 不只是创建
-Pod，还要知道训练角色、rank、launcher、checkpoint、模型服务
-revision、流量切分、自动扩缩容和失败恢复策略。</p>
-<p>可以这样区分：</p>
-<table>
-<thead>
-<tr>
-<th>名称</th>
-<th>关注点</th>
-<th>例子</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Controller</td>
-<td>通用控制循环</td>
-<td>Deployment controller、Job controller</td>
-</tr>
-<tr>
-<td>Operator</td>
-<td>带领域语义的控制器</td>
-<td>Kubeflow Training Operator、KubeRay Operator、KServe controller</td>
-</tr>
-<tr>
-<td>Admission Webhook</td>
-<td>创建或更新前的校验/默认值/变更</td>
-<td>校验 GPU 请求、注入默认 runtime</td>
-</tr>
-<tr>
-<td>Scheduler</td>
-<td>为 Pod 选择节点</td>
-<td>default-scheduler、Volcano、Kueue 集成调度</td>
-</tr>
-<tr>
-<td>Helm/Kustomize</td>
-<td>渲染和发布 YAML</td>
-<td>安装 Operator、生成默认 CRD 实例</td>
-</tr>
-</tbody>
-</table>
-<p>Operator 不是“高级 Helm”。Helm 渲染发生在提交前，Operator
-控制发生在运行中。真正的 Operator
-必须面对失败、重试、并发、删除和状态漂移。</p>
-<h3 id="reconciliation-loop-是什么">Reconciliation Loop 是什么</h3>
-<p>Reconciliation loop 是 Operator 的核心。它反复执行：</p>
-<pre class="text"><code>观察对象变化
-  -&gt; 读取期望状态：CRD spec
-  -&gt; 读取真实状态：Pod、Service、Job、Revision、PVC、外部系统
-  -&gt; 计算差异
-  -&gt; 创建、更新、删除或等待
-  -&gt; 写 status、记录 event、导出 metric
-  -&gt; 决定是否重新入队</code></pre>
-<p>这个循环必须是幂等的。同一个对象可能被重复 reconcile；一次 reconcile
-也可能执行到一半失败。正确实现的控制器不依赖“刚才那一步一定成功”，而是每次都从
-API Server 重新读取事实。</p>
-<h3 id="finalizer-与-ownerreference-的边界">Finalizer 与 OwnerReference
-的边界</h3>
-<p><code>ownerReference</code> 用于 Kubernetes
-内部对象的级联删除。PyTorchJob 创建的 worker Pod 带上 ownerReference
-后，删除 PyTorchJob 时，垃圾回收器可以删除这些 Pod。</p>
-<p><code>finalizer</code> 用于删除前置清理。它会阻止对象立刻从 API
-Server 消失，直到控制器完成清理并移除 finalizer。适合清理 Kubernetes
-垃圾回收器看不到的东西：外部负载均衡器、云端
-endpoint、对象存储临时目录、checkpoint lock、Ray runtime env
-缓存等。</p>
-<p>不要用 finalizer 做普通状态流转，也不要把所有底层对象都用 finalizer
-管起来。finalizer 是删除协议，不是生命周期状态机。</p>
-<hr />
-<h2 id="19c3-架构组件路径与责任边界">19c.3
-架构：组件、路径与责任边界</h2>
-<h3 id="关键组件">关键组件</h3>
-<table>
-<thead>
-<tr>
-<th>组件</th>
-<th>责任</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>API Server</td>
-<td>接收 CRD 和自定义资源请求，执行认证、授权、准入、校验和持久化</td>
-</tr>
-<tr>
-<td>etcd</td>
-<td>存储 CRD schema、自定义资源和底层对象状态</td>
-</tr>
-<tr>
-<td>CRD Schema</td>
-<td>定义字段、类型、默认值、版本、status subresource、conversion</td>
-</tr>
-<tr>
-<td>Admission Webhook</td>
-<td>做默认值、校验、变更、策略拦截</td>
-</tr>
-<tr>
-<td>Operator Controller</td>
-<td>watch 目标对象，执行 reconciliation loop</td>
-</tr>
-<tr>
-<td>Workqueue</td>
-<td>对变化对象去重、限速、重试、延迟处理</td>
-</tr>
-<tr>
-<td>Cache/Informer</td>
-<td>本地缓存 watch 到的对象，降低 API Server 压力</td>
-</tr>
-<tr>
-<td>Owned Resources</td>
-<td>Pod、Job、Service、ConfigMap、PVC、Revision、HPA 等底层对象</td>
-</tr>
-<tr>
-<td>Scheduler/Queue</td>
-<td>为 Pod 或 Workload 做准入和调度，处理
-GPU、gang、quota、priority</td>
-</tr>
-<tr>
-<td>Observability</td>
-<td>events、status conditions、logs、metrics、traces、dashboards</td>
-</tr>
-</tbody>
-</table>
-<h3 id="控制路径">控制路径</h3>
-<p>以 PyTorchJob 为例，控制路径如下：</p>
-<pre class="text"><code>用户提交 PyTorchJob
-  -&gt; API Server 校验 CRD schema 和 admission policy
-  -&gt; etcd 持久化对象
-  -&gt; Training Operator watch 到变化
-  -&gt; Operator 读取 spec，生成 master/worker Pod、Service、ConfigMap
-  -&gt; Scheduler 为 Pod 绑定节点
-  -&gt; kubelet 启动容器并注入 GPU
-  -&gt; Operator watch Pod 状态，更新 PyTorchJob status
-  -&gt; 用户通过 kubectl/API/平台 UI 看到训练状态</code></pre>
-<p>这里有两个重要边界：</p>
-<ul>
-<li>Operator 不直接启动容器，它创建 Kubernetes 对象，由 kube-scheduler
-和 kubelet 完成调度与运行。</li>
-<li>Scheduler 不理解 PyTorchJob 的完整业务语义，除非 Operator 把
-gang、quota、priority 等信息通过 PodGroup、Workload 或 labels
-传给调度层。</li>
-</ul>
-<h3 id="数据路径">数据路径</h3>
-<p>训练或推理的数据路径不经过 Operator。Operator 只是控制面。</p>
-<pre class="text"><code>训练数据：对象存储 / PVC / 并行文件系统 -&gt; worker Pod -&gt; GPU
-参数同步：GPU -&gt; NCCL / MPI / Ray object store -&gt; GPU
-推理请求：Client -&gt; Gateway / Ingress -&gt; Service -&gt; Pod -&gt; GPU
-模型加载：Model registry / object storage -&gt; init/model agent -&gt; runtime</code></pre>
-<p>这意味着 Operator 状态正常不代表数据路径正常。InferenceService
-<code>Ready=True</code> 也不等于模型延迟达标；TorchJob
-<code>Running=True</code> 也不等于 NCCL 带宽正常。</p>
-<h3 id="责任边界">责任边界</h3>
-<table>
-<thead>
-<tr>
-<th>层</th>
-<th>负责什么</th>
-<th>不负责什么</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>CRD Schema</td>
-<td>API 字段、类型、版本、默认值边界</td>
-<td>运行时恢复和业务决策</td>
-</tr>
-<tr>
-<td>Operator</td>
-<td>期望状态到真实状态的收敛、status、events</td>
-<td>容器内训练代码正确性</td>
-</tr>
-<tr>
-<td>Admission</td>
-<td>创建/更新前校验、默认值、准入策略</td>
-<td>运行中的失败恢复</td>
-</tr>
-<tr>
-<td>Scheduler/Queue</td>
-<td>资源准入、节点选择、gang、公平性</td>
-<td>rank 协议和 checkpoint</td>
-</tr>
-<tr>
-<td>Device Plugin/Runtime</td>
-<td>GPU 资源注册和容器设备注入</td>
-<td>AI 任务状态机</td>
-</tr>
-<tr>
-<td>Serving Runtime</td>
-<td>模型加载、推理协议、batching</td>
-<td>K8s 对象生命周期</td>
-</tr>
-</tbody>
-</table>
-<p>清晰的责任边界能避免“所有问题都怪 Operator”。Operator
-应该暴露证据，但不应该吞掉底层失败。</p>
-<hr />
-<h2 id="19c4-原理reconciliation状态机与对象语义">19c.4
-原理：Reconciliation、状态机与对象语义</h2>
-<h3 id="为什么需要-reconciliation">为什么需要 Reconciliation</h3>
-<p>声明式系统的核心不是“创建一次”，而是“持续收敛”。真实状态会因为以下原因漂移：</p>
-<ul>
-<li>Pod 被 kubelet 重启或被节点故障驱逐。</li>
-<li>用户修改了 CRD 的副本数、镜像、资源或流量比例。</li>
-<li>Scheduler 长时间无法满足 GPU、PVC、affinity 或 gang 约束。</li>
-<li>其他控制器修改了 Service、EndpointSlice、HPA、Revision。</li>
-<li>Operator 自己重启，丢失内存中的中间状态。</li>
-<li>API Server 返回冲突，status 更新失败。</li>
-</ul>
-<p>因此 Operator
-的正确姿势是每次都重新观察对象，而不是依赖本地变量：</p>
-<pre class="text"><code>desired = read(cr.spec)
-actual = list_owned_resources(cr)
-plan = diff(desired, actual)
-apply(plan)
-patch_status(observed(actual))</code></pre>
-<h3 id="幂等性与乐观并发">幂等性与乐观并发</h3>
-<p>幂等性意味着重复执行同一个 reconcile
-不会产生额外副作用。常见做法：</p>
-<ul>
-<li>底层对象使用确定性名称，例如
-<code>&lt;job-name&gt;-master-0</code>、<code>&lt;job-name&gt;-worker-3</code>。</li>
-<li>用 labels 和 ownerReference 查找已有对象，而不是盲目创建。</li>
-<li>使用 server-side apply 或 patch，只管理自己负责的字段。</li>
-<li>status 更新使用 <code>resourceVersion</code> 或 patch，遇到 conflict
-重新读取。</li>
-<li>外部资源用幂等 API，例如 create-or-get、delete-if-exists。</li>
-</ul>
-<p>Operator 不能假设“我上次创建的对象还在”。它必须从 API Server
-中重建事实。</p>
-<h3 id="specstatusconditions">Spec、Status、Conditions</h3>
-<p>一个有工程质量的 CRD status 应该回答三个问题：</p>
-<ol type="1">
-<li>当前阶段是什么。</li>
-<li>卡住或失败的直接原因是什么。</li>
-<li>系统下一步是否会自动处理。</li>
-</ol>
-<p>示例：</p>
-<div class="sourceCode" id="cb6"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">status</span><span class="kw">:</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">observedGeneration</span><span class="kw">:</span><span class="at"> </span><span class="dv">7</span></span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">phase</span><span class="kw">:</span><span class="at"> Pending</span></span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">conditions</span><span class="kw">:</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Admitted</span></span>
-<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;False&quot;</span></span>
-<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> InsufficientGPU</span></span>
-<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">message</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;queue train-prod needs 64 nvidia.com/gpu, currently 48 fit the topology&quot;</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">lastTransitionTime</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2026-05-04T10:20:00Z&quot;</span></span>
-<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> PodsCreated</span></span>
-<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;False&quot;</span></span>
-<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> WaitingForAdmission</span></span>
-<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicaStatuses</span><span class="kw">:</span></span>
-<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">Worker</span><span class="kw">:</span></span>
-<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">desired</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
-<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">active</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
-<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">failed</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span></code></pre></div>
-<p><code>observedGeneration</code> 很关键。它表示 status 对应的 spec
-generation。如果用户刚修改 spec，而 controller
-还没处理，<code>metadata.generation</code> 会大于
-<code>status.observedGeneration</code>。平台 UI 和自动化系统应据此判断
-status 是否新鲜。</p>
-<h3 id="状态机">状态机</h3>
-<p>AI Operator 常见状态机如下：</p>
-<table>
-<thead>
-<tr>
-<th>Phase</th>
-<th>触发条件</th>
-<th>控制器动作</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Created</td>
-<td>CRD 已保存，controller 第一次观察到</td>
-<td>加 finalizer，创建或修正底层对象</td>
-</tr>
-<tr>
-<td>Admitting</td>
-<td>等待队列、quota、gang 或策略准入</td>
-<td>创建 Workload/PodGroup，写等待原因</td>
-</tr>
-<tr>
-<td>Pending</td>
-<td>底层对象已创建但关键 Pod 未就绪</td>
-<td>汇总调度、PVC、镜像、准入事件</td>
-</tr>
-<tr>
-<td>Initializing</td>
-<td>Pod 启动，init、模型加载、rendezvous 或 runtime env 准备中</td>
-<td>观察日志信号、readiness、sidecar 状态</td>
-</tr>
-<tr>
-<td>Running</td>
-<td>关键角色进入运行态</td>
-<td>监控 replica、driver、launcher、revision、metrics</td>
-</tr>
-<tr>
-<td>Restarting</td>
-<td>发生可恢复失败</td>
-<td>按策略重建、全局重启、resume checkpoint</td>
-</tr>
-<tr>
-<td>Succeeded</td>
-<td>任务达到成功条件</td>
-<td>写完成时间，清理临时资源</td>
-</tr>
-<tr>
-<td>Failed</td>
-<td>不可恢复或超过重试预算</td>
-<td>写失败原因，保留证据</td>
-</tr>
-<tr>
-<td>Terminating</td>
-<td>用户删除对象</td>
-<td>finalizer 清理外部资源，移除 finalizer</td>
-</tr>
-</tbody>
-</table>
-<p>状态机不是 UI 标签，而是控制器决策的依据。对于非 elastic PyTorch
-训练，任意 worker 失败可能意味着全局 restart；对于 elastic
-training，worker 短暂丢失可能只是缩容和重新 rendezvous。</p>
-<h3 id="ownerreferencelabel-与-selector">OwnerReference、Label 与
-Selector</h3>
-<p>Operator 创建底层对象时应同时使用 ownerReference 和稳定 labels：</p>
-<div class="sourceCode" id="cb7"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app.kubernetes.io/name</span><span class="kw">:</span><span class="at"> pytorchjob</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">training.kubeflow.org/job-name</span><span class="kw">:</span><span class="at"> train-reranker</span></span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">training.kubeflow.org/replica-type</span><span class="kw">:</span><span class="at"> worker</span></span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ownerReferences</span><span class="kw">:</span></span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> kubeflow.org/v1</span></span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">kind</span><span class="kw">:</span><span class="at"> PyTorchJob</span></span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> train-reranker</span></span>
-<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">uid</span><span class="kw">:</span><span class="at"> 1f4...</span></span>
-<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">controller</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
-<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">blockOwnerDeletion</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div>
-<p>ownerReference 让 Kubernetes 知道归属关系；labels 让
-controller、用户、Prometheus、日志系统、成本系统能查询和聚合。不要只依赖名字前缀。</p>
-<h3 id="finalizer">Finalizer</h3>
-<p>删除带 finalizer 的对象时，API Server 会设置
-<code>metadata.deletionTimestamp</code>，但对象仍存在。Operator 看到
-deletionTimestamp 后进入清理逻辑：</p>
-<pre class="text"><code>if deletionTimestamp is set:
-  delete external endpoint / cloud load balancer / temporary model cache
-  release checkpoint lease or queue admission
-  remove finalizer
-  return</code></pre>
-<p>finalizer 要快、幂等、可重试。清理失败时要写 event 和
-condition，避免对象永久卡在 Terminating 且没有解释。</p>
-<hr />
-<h2 id="19c5-常见-ai-crd-的语义">19c.5 常见 AI CRD 的语义</h2>
-<h3 id="torchjob--pytorchjob">TorchJob / PyTorchJob</h3>
-<p>TorchJob 表达 PyTorch 分布式训练。不同发行版中 kind 可能叫
-<code>PyTorchJob</code>，用户口语常称 TorchJob。核心不是“创建多个
-Pod”，而是表达 PyTorch 分布式语义。</p>
-<p>关键字段通常包括：</p>
-<ul>
-<li><code>pytorchReplicaSpecs</code>：Master、Worker 等角色。</li>
-<li>每个角色的 <code>replicas</code>、Pod template、资源请求。</li>
-<li><code>runPolicy</code>：cleanPodPolicy、backoffLimit、ttlSecondsAfterFinished、suspend。</li>
-<li>restart policy：ExitCode、OnFailure、Never 等实现依发行版而定。</li>
-<li>环境变量和启动命令：master address、rank、world size、backend、NCCL
-参数。</li>
-</ul>
-<p>示例：</p>
-<div class="sourceCode" id="cb9"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> kubeflow.org/v1</span></span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> PyTorchJob</span></span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
-<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> train-reranker</span></span>
-<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> train</span></span>
-<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
-<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">runPolicy</span><span class="kw">:</span></span>
-<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cleanPodPolicy</span><span class="kw">:</span><span class="at"> Running</span></span>
-<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">backoffLimit</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
-<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pytorchReplicaSpecs</span><span class="kw">:</span></span>
-<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">Master</span><span class="kw">:</span></span>
-<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
-<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">restartPolicy</span><span class="kw">:</span><span class="at"> OnFailure</span></span>
-<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">template</span><span class="kw">:</span></span>
-<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">spec</span><span class="kw">:</span></span>
-<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">containers</span><span class="kw">:</span></span>
-<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> pytorch</span></span>
-<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.local/ml/reranker-train:cuda12.4-v42</span></span>
-<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;torchrun&quot;</span><span class="kw">]</span></span>
-<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">args</span><span class="kw">:</span></span>
-<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;--nnodes=8&quot;</span></span>
-<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;--nproc_per_node=8&quot;</span></span>
-<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;--rdzv_backend=c10d&quot;</span></span>
-<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;--rdzv_endpoint=$(MASTER_ADDR):29400&quot;</span></span>
-<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;train.py&quot;</span></span>
-<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">resources</span><span class="kw">:</span></span>
-<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">limits</span><span class="kw">:</span></span>
-<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
-<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">Worker</span><span class="kw">:</span></span>
-<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">7</span></span>
-<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">restartPolicy</span><span class="kw">:</span><span class="at"> OnFailure</span></span>
-<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">template</span><span class="kw">:</span></span>
-<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">spec</span><span class="kw">:</span></span>
-<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">containers</span><span class="kw">:</span></span>
-<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> pytorch</span></span>
-<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.local/ml/reranker-train:cuda12.4-v42</span></span>
-<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">resources</span><span class="kw">:</span></span>
-<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">limits</span><span class="kw">:</span></span>
-<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span></code></pre></div>
-<p>生产中，TorchJob 往往需要和 Kueue、Volcano 或其他 gang scheduler
-集成。否则 8 个 worker 可能只启动 5 个，训练卡在 rendezvous。</p>
-<h3 id="rayjob">RayJob</h3>
-<p>RayJob 表达“提交一个 Ray driver，并在 RayCluster
-上运行”。常见对象关系是：</p>
-<pre class="text"><code>RayJob
-  -&gt; RayCluster
-       -&gt; head Pod + head Service
-       -&gt; worker Pods
-  -&gt; submitter / driver Job</code></pre>
-<p>RayJob 的关键语义：</p>
-<ul>
-<li>RayCluster 生命周期：由 RayJob
-创建、引用已有集群，还是任务结束后清理。</li>
-<li>Head/Worker 规格：CPU、GPU、内存、对象存储内存、节点选择。</li>
-<li>Runtime env：Python 包、working directory、环境变量。</li>
-<li>Driver 状态：提交成功、运行中、失败、成功。</li>
-<li>Ray 内部任务状态和 Kubernetes Pod 状态之间的映射。</li>
-</ul>
-<p>RayJob 的排障不能只看 Kubernetes Pod。Pod Running 只是 Ray runtime
-在跑，不代表 driver 成功，也不代表 Ray task 没有失败。Operator 应把
-driver 状态、RayCluster 状态和 Kubernetes 状态都写到 status。</p>
-<h3 id="mpijob">MPIJob</h3>
-<p>MPIJob 表达 launcher + worker slot 的启动模式，常用于
-Horovod、OpenMPI、传统 HPC 风格训练。</p>
-<p>典型结构：</p>
-<pre class="text"><code>MPIJob
-  -&gt; launcher Pod
-       -&gt; mpirun / mpiexec
-       -&gt; hostfile / ssh or kubexec protocol
-  -&gt; worker Pods
-       -&gt; slots / GPU resources</code></pre>
-<p>MPIJob 的核心语义：</p>
-<ul>
-<li>launcher 是控制入口，worker 是计算资源。</li>
-<li>slot 数必须和 worker 副本、每 Pod GPU/CPU 数一致。</li>
-<li>hostfile 或等价发现机制必须准确反映 worker 地址。</li>
-<li>worker 未齐时，launcher 不应过早启动或应能重试。</li>
-</ul>
-<p>MPIJob 常见失败是 launcher 先启动，worker 未齐，随后连接超时。成熟
-Operator 会通过 init、状态检查或调度集成降低这类问题。</p>
-<h3 id="inferenceservice--kserve">InferenceService / KServe</h3>
-<p>KServe 的 InferenceService 表达在线模型服务。它通常把一个服务拆成
-predictor、transformer、explainer，并通过
-Knative、Deployment、Service、Ingress/Gateway、autoscaler
-等底层对象运行。</p>
-<p>简化示例：</p>
-<div class="sourceCode" id="cb12"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> serving.kserve.io/v1beta1</span></span>
-<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> InferenceService</span></span>
-<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
-<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> reranker</span></span>
-<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> serving</span></span>
-<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
-<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">predictor</span><span class="kw">:</span></span>
-<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">model</span><span class="kw">:</span></span>
-<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">modelFormat</span><span class="kw">:</span></span>
-<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">name</span><span class="kw">:</span><span class="at"> pytorch</span></span>
-<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">runtime</span><span class="kw">:</span><span class="at"> vllm-runtime</span></span>
-<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">storageUri</span><span class="kw">:</span><span class="at"> s3://model-registry/reranker/v42</span></span>
-<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">resources</span><span class="kw">:</span></span>
-<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">limits</span><span class="kw">:</span></span>
-<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">nvidia.com/gpu</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
-<p>生产语义包括：</p>
-<ul>
-<li>模型加载：storageUri、model agent、local cache、Secret、CA。</li>
-<li>Runtime：Triton、TorchServe、vLLM、自定义 runtime。</li>
-<li>Revision：每次模型或配置变化生成新 revision。</li>
-<li>Traffic split：灰度、金丝雀、回滚。</li>
-<li>Autoscaling：基于并发、QPS、延迟、GPU 指标或队列长度。</li>
-<li>Readiness：模型是否加载完成、是否可以接流量。</li>
-</ul>
-<p>InferenceService 不是普通 Deployment
-的薄包装。它的价值在于把模型版本、流量、readiness、runtime
-和弹性策略变成模型服务控制面。</p>
-<h3 id="jobset-与其他组合对象">JobSet 与其他组合对象</h3>
-<p>JobSet、LeaderWorkerSet、XGBoostJob、TFJob 等对象也常出现在 AI
-平台。它们的共同点是表达多角色、多 Job 或框架特定语义。选择 CRD
-时要看业务语义，而不是看哪个 YAML 最短。</p>
 
-<h4 id="lws-leaderworkerset">LeaderWorkerSet (LWS)：大模型多机推理的主流 CRD</h4>
-<p>LWS（<a href="https://github.com/kubernetes-sigs/lws">Kubernetes SIGs LeaderWorkerSet</a>）专为"一组 Pod 共同服务一个推理副本"的场景设计——典型如 vLLM / SGLang / TRT-LLM 把一个 70B-405B 模型用 TP+PP 切到多机多卡上推理。每个推理副本由 1 个 leader Pod + N-1 个 worker Pod 组成，所有 Pod 必须 gang 启动、共享 NCCL/RDMA bootstrap、一起 ready 才能接流量。这套语义用裸 Deployment + Service 表达极其复杂，LWS 把它做成原生 CRD：</p>
+<section class="toc">
+<h2>本章目录</h2>
+<ol>
+  <li><a class="anchor" href="#s1">第一性原理拆解：AI CRD 与 Operator</a></li>
+  <li><a class="anchor" href="#s2">概念先说清楚</a></li>
+  <li><a class="anchor" href="#s3">架构：组件、路径与责任边界</a></li>
+  <li><a class="anchor" href="#s4">原理：Reconciliation、状态机与对象语义</a></li>
+  <li><a class="anchor" href="#s5">常见 AI CRD 的语义</a></li>
+  <li><a class="anchor" href="#s6">工程化：生产落地、版本、发布、观测与治理</a></li>
+  <li><a class="anchor" href="#s7">方案设计：AI CRD 选择与 Operator 设计</a></li>
+  <li><a class="anchor" href="#s8">故障排除：症状、证据、根因、动作</a></li>
+  <li><a class="anchor" href="#s9">反模式与 Checklist</a></li>
+  <li><a class="anchor" href="#s10">Worked Example：8 节点 PyTorch 训练的控制面设计</a></li>
+</ol>
+</section>
+
+<!-- ========== §1 第一性原理 ========== -->
+<section class="section" id="s1">
+<h2>1. 第一性原理拆解：AI CRD 与 Operator</h2>
+
+<h3>拆 — 不可化简的问题</h3>
+<p>Pod、Job、Deployment 是 Kubernetes 的通用抽象，足以表达"运行一组容器"的语义。但 AI 平台上的高层任务远不止"一组容器"这么简单。以一个 64 卡 PyTorch 训练任务为例，它至少包含以下无法被通用对象表达的约束：</p>
+<ul>
+  <li><strong>角色</strong>：master、worker，可能还有 evaluator、parameter server、launcher，每个角色有不同的资源需求和生命周期。</li>
+  <li><strong>拓扑</strong>：每个 worker 几张 GPU，是否要求整机，是否要求同 rack 或同 IB fabric 的 gang 调度。</li>
+  <li><strong>协议</strong>：rendezvous 地址、rank、world size、NCCL 网卡、端口——这些必须在 Pod 启动前注入，而不是每次手工管理。</li>
+  <li><strong>生命周期</strong>：初始化、等待所有 rank 就绪、训练主循环、周期性 checkpoint、失败重启、成功归档——每个阶段对观测和决策的要求都不同。</li>
+  <li><strong>失败语义</strong>：单个 worker 失败时，非 elastic 训练要全局 restart，elastic 训练只要缩容重新 rendezvous，而不是简单重启一个 Pod。</li>
+  <li><strong>观测语义</strong>：用户应该看到"等待 8 卡 gang 调度 (InsufficientGPU)"，而不是"某个 Pod Pending"——这是两层完全不同的诊断信息。</li>
+</ul>
+<p>同理，RayJob 不是一个普通 Job，MPIJob 不是一堆 worker Pod，KServe InferenceService 也不是一个 Deployment。它们都有各自的控制面语义——模型版本、流量切分、revision、runtime env、driver 状态等。如果把这些语义分散在脚本、CI 模板、平台后端和人工 runbook 里，系统就会变得不可恢复（失败后不知道从哪恢复）、不可解释（用户看不到有意义的状态）、不可审计（谁改了什么无从追溯）。</p>
+<p><strong>不可化简的问题是：如何把 AI 任务的高层语义声明为稳定 API，并持续把真实集群状态推进到期望状态。</strong>这个问题的"持续"二字是关键——不是"一次性生成 YAML"，而是面对节点重启、Pod 驱逐、镜像拉取失败、PVC 等待绑定、用户修改副本数、服务 revision 切流量等所有真实世界变化，系统仍然能自动收敛。</p>
+
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p>从"用户应该提交高层语义"推出 <strong>CRD</strong>。CRD（CustomResourceDefinition）让 Kubernetes API 增加 <code>PyTorchJob</code>、<code>RayJob</code>、<code>MPIJob</code>、<code>InferenceService</code> 等资源类型，使 AI 平台的领域概念成为可 <code>kubectl get</code>、可 RBAC 管控、可 API 版本化的一等对象。</p>
+<p>从"真实世界持续变化"推出 <strong>Operator</strong>。节点会重启，Pod 会失败，镜像会拉取失败，PVC 会等待绑定，用户会修改副本数，服务 revision 会切流量。一次性生成 YAML 不能处理这些变化，必须有控制器持续监听对象变化、比较期望状态与真实状态、执行修正动作。</p>
+<p>从"期望状态和真实状态必须分离"推出 <code>spec</code> 与 <code>status</code> 的边界。<code>spec</code> 是用户或平台声明的目标；<code>status</code> 是控制器观察到的结果。控制器不应偷偷修改 <code>spec</code> 来表达运行状态，否则声明式 API 的边界就被破坏——用户的意图和系统的观测会混在一起，无法区分。</p>
+<p>从"删除也有语义"推出 <strong>finalizer</strong>。删除训练任务时可能要清理临时 Service、外部 Ray cluster、云端 endpoint、模型缓存或 checkpoint lease。Kubernetes 的普通垃圾回收只认识集群内对象，不认识外部资源。finalizer 让控制器可以在删除前执行自定义清理，确保不泄漏外部资源。</p>
+<p>从"底层对象必须有归属"推出 <strong>ownerReference 和 label selector</strong>。Operator 创建的 Pod、Service、ConfigMap、Job、Revision 必须能被反查、清理和聚合状态。ownerReference 启用 Kubernetes 的级联垃圾回收；稳定 labels 让 Prometheus、日志系统、成本系统能对任意维度聚合。</p>
+<p>从"AI 任务有阶段"推出<strong>状态机与 conditions</strong>。单个 <code>phase=Running</code> 不够，平台还要表达 <code>Admitted</code>、<code>PodsCreated</code>、<code>RendezvousReady</code>、<code>ModelLoaded</code>、<code>TrafficReady</code>、<code>CheckpointRestored</code> 等细粒度条件，让用户和自动化系统能做精确决策而不是凭猜测。</p>
+<p>从"多个控制器协作同一对象"推出 <strong>Server-Side Apply（SSA）</strong>。HPA 改 replicas、Operator 管 spec、用户手动 edit——三者同时修改同一个 Deployment 时，传统 Update 全量覆盖会让彼此的修改互相覆盖。SSA 用 field manager 机制让每个控制器只声明自己负责的字段，冲突时显式协商而不是静默覆盖。</p>
+<p>从"Operator 重启不能丢事件"推出 <strong>List-Watch + Informer Cache + Workqueue</strong>。Operator 基于 client-go 的 Reflector List+Watch 机制，用 ResourceVersion 保证断线续传不丢事件；Informer Cache 在内存中维护对象副本，所有 Get/List 操作 O(1) 且不打 API Server；Workqueue 对同对象多次变化去重、失败指数退避、防雪崩。</p>
+<p>从"CRD API 需要演化"推出 <strong>Conversion Webhook 和版本矩阵</strong>。CRD 从 v1alpha1 升级到 v1 时，集群里可能同时存在两个版本的对象。Conversion Webhook 让 API Server 在客户端请求版本和存储版本不同时自动转换，保证旧对象可读、新控制器可处理。</p>
+
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((AI 任务高层语义 → 稳定 API))
+    CRD：API 扩展机制
+      PyTorchJob / TorchJob
+      RayJob
+      MPIJob
+      InferenceService
+      LeaderWorkerSet
+      JobSet / TrainingJob
+    Operator：持续收敛引擎
+      Reconciliation Loop
+        spec vs actual
+        幂等 diff + apply
+        status + events
+      controller-runtime 内部
+        Reflector List+Watch
+        DeltaFIFO 合并去重
+        Informer Cache
+        Workqueue 限速退避
+      Leader Election
+        Lease 对象
+        LeaseDuration/RenewDeadline
+    对象语义
+      spec 用户意图
+      status 控制器观测
+      conditions 细粒度阶段
+      observedGeneration 新鲜度
+    删除与清理
+      ownerReference 级联 GC
+      finalizer 外部资源清理
+      Terminating 阻塞协议
+    多控制器协作
+      Server-Side Apply SSA
+      field manager 字段归属
+      Conflict 显式协商
+    API 演化
+      Conversion Webhook
+      storage version
+      round-trip 测试
+</pre>
+
+<h3>导 — 读完本章你应该能回答</h3>
+<ol>
+  <li>为什么 Operator 不是 Helm 的替代品？二者分别解决运行前和运行中的什么问题？</li>
+  <li>Reconciliation loop 的幂等性为什么是必要而非可选的设计要求？</li>
+  <li><code>spec</code>、<code>status</code>、<code>conditions</code>、<code>observedGeneration</code> 各自的语义边界是什么？控制器应该修改哪一个？</li>
+  <li>finalizer 和 ownerReference 在删除语义上的区别是什么？什么场景只能用 finalizer？</li>
+  <li>controller-runtime 的 Reflector → DeltaFIFO → Informer Cache → Workqueue → Reconciler 这五层各解决什么具体问题？</li>
+  <li>Server-Side Apply 的 field manager 如何防止多控制器互相覆盖字段？</li>
+  <li>TorchJob、RayJob、MPIJob、InferenceService、LWS 各自表达了哪些裸 Pod/Job 无法表达的语义？</li>
+</ol>
+
+<div class="note"><strong>本章与 <a href="../part6/19a-kubernetes-ai-workloads.html">第 19a 章</a> 的关系：</strong>19a 讲 K8s 原生对象（Pod/Job/Deployment）的语义建模；19c 讲在原生对象之上，如何用 CRD+Operator 把 AI 特有的分布式语义变成平台 API。19c 依赖 19a 的基础，但关注 API 扩展和控制面设计。</div>
+</section>
+
+<!-- ========== §2 概念先说清楚 ========== -->
+<section class="section" id="s2">
+<h2>2. 概念先说清楚</h2>
+
+<h3>CRD 是什么，不是什么</h3>
+<p>CRD（CustomResourceDefinition）向 Kubernetes API 注册一种新的资源类型。注册后，用户可以像操作 Pod 一样操作自定义对象：</p>
+<pre><code>kubectl get pytorchjobs -n train
+kubectl describe rayjob -n ml batch-embed-v3
+kubectl get inferenceservice -n serving reranker -o yaml</code></pre>
+<p>CRD 是 API 扩展机制，不是调度器，不是工作流引擎，也不是模板语言。CRD 本身只负责让 API Server 接受、校验、存储和返回这种对象。<strong>没有控制器时，一个 CRD 对象只是 etcd 里的声明，不会自动创建 Pod。</strong></p>
+
+<h3>Custom Resource、Controller、Operator 的区别</h3>
+<table>
+<thead><tr><th>名称</th><th>关注点</th><th>例子</th></tr></thead>
+<tbody>
+<tr><td>CRD Schema</td><td>API 字段、类型、默认值、版本注册</td><td><code>CustomResourceDefinition</code> 对象本身</td></tr>
+<tr><td>Custom Resource</td><td>CRD 的实例（用户创建的对象）</td><td><code>kind: PyTorchJob</code> 的 <code>train-reranker</code></td></tr>
+<tr><td>Controller</td><td>通用控制循环，监听变化并修正</td><td>Deployment controller、Job controller</td></tr>
+<tr><td>Operator</td><td>带领域语义的控制器</td><td>Kubeflow Training Operator、KubeRay、KServe controller</td></tr>
+<tr><td>Admission Webhook</td><td>创建或更新前的校验/默认值/变更</td><td>校验 GPU 请求、注入默认 runtime</td></tr>
+<tr><td>Scheduler</td><td>为 Pod 选择节点</td><td>default-scheduler、Volcano、Kueue 集成调度</td></tr>
+<tr><td>Helm/Kustomize</td><td>渲染和发布 YAML</td><td>安装 Operator、生成默认 CRD 实例</td></tr>
+</tbody>
+</table>
+
+<div class="warn"><strong>Operator 不是高级 Helm：</strong>Helm 渲染发生在提交前，Operator 控制发生在运行中。真正的 Operator 必须面对失败、重试、并发、删除和状态漂移。Helm chart 跑完就退出，Operator 持续运行。</div>
+
+<h3>Custom Resource 的字段结构</h3>
+<table>
+<thead><tr><th>字段</th><th>归属</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>metadata</code></td><td>Kubernetes</td><td>name、namespace、labels、annotations、finalizers、ownerReferences</td></tr>
+<tr><td><code>spec</code></td><td>用户或平台</td><td>期望状态：副本数、镜像、资源、模型路径、重启策略</td></tr>
+<tr><td><code>status</code></td><td>控制器</td><td>观察状态：phase、conditions、replica status、revision、失败原因</td></tr>
+</tbody>
+</table>
+<p><code>spec</code> 是输入，<code>status</code> 是输出。用户改 <code>spec</code>，控制器改 <code>status</code>。把运行时状态写进 <code>spec</code> 会破坏声明式 API 的边界——用户无法区分哪些是自己的意图，哪些是系统注入的运行时信息。</p>
+
+<h3>Reconciliation Loop 的本质</h3>
+<pre><code>观察对象变化
+  -> 读取期望状态：CRD spec
+  -> 读取真实状态：Pod、Service、Job、Revision、PVC、外部系统
+  -> 计算差异
+  -> 创建、更新、删除或等待
+  -> 写 status、记录 event、导出 metric
+  -> 决定是否重新入队</code></pre>
+<p>这个循环<strong>必须是幂等的</strong>。同一个对象可能被重复 reconcile（每 10 分钟 resync 一次）；一次 reconcile 也可能执行到一半失败。正确实现的控制器不依赖"刚才那一步一定成功"，而是每次都从 API Server 重新读取事实。</p>
+
+<h3>Finalizer 与 OwnerReference 的边界</h3>
+<p><code>ownerReference</code> 用于 Kubernetes 内部对象的级联删除。PyTorchJob 创建的 worker Pod 带上 ownerReference 后，删除 PyTorchJob 时，垃圾回收器可以自动删除这些 Pod。</p>
+<p><code>finalizer</code> 用于删除前置清理，阻止对象立刻从 API Server 消失，直到控制器完成清理并移除 finalizer。适合清理 Kubernetes 垃圾回收器看不到的东西：外部负载均衡器、云端 endpoint、对象存储临时目录、checkpoint lock、Ray runtime env 缓存等。</p>
+<div class="danger"><strong>不要滥用 finalizer：</strong>finalizer 是删除协议，不是生命周期状态机。不要用 finalizer 做普通状态流转，也不要把所有底层对象都用 finalizer 管起来。finalizer 清理失败会让对象永久卡在 Terminating，必须写 event 和 condition 说明原因。</div>
+</section>
+
+<!-- ========== §3 架构 ========== -->
+<section class="section" id="s3">
+<h2>3. 架构：组件、路径与责任边界</h2>
+
+<h3>关键组件</h3>
+<table>
+<thead><tr><th>组件</th><th>责任</th></tr></thead>
+<tbody>
+<tr><td>API Server</td><td>接收 CRD 和自定义资源请求，执行认证、授权、准入、校验和持久化</td></tr>
+<tr><td>etcd</td><td>存储 CRD schema、自定义资源和底层对象状态</td></tr>
+<tr><td>CRD Schema</td><td>定义字段、类型、默认值、版本、status subresource、conversion</td></tr>
+<tr><td>Admission Webhook</td><td>做默认值、校验、变更、策略拦截</td></tr>
+<tr><td>Operator Controller</td><td>watch 目标对象，执行 reconciliation loop</td></tr>
+<tr><td>Workqueue</td><td>对变化对象去重、限速、重试、延迟处理</td></tr>
+<tr><td>Cache/Informer</td><td>本地缓存 watch 到的对象，降低 API Server 压力</td></tr>
+<tr><td>Owned Resources</td><td>Pod、Job、Service、ConfigMap、PVC、Revision、HPA 等底层对象</td></tr>
+<tr><td>Scheduler/Queue</td><td>为 Pod 或 Workload 做准入和调度，处理 GPU、gang、quota、priority</td></tr>
+<tr><td>Observability</td><td>events、status conditions、logs、metrics、traces、dashboards</td></tr>
+</tbody>
+</table>
+
+<h3>PyTorchJob 控制路径</h3>
+<pre class="mermaid">sequenceDiagram
+  participant User as 用户
+  participant API as API Server
+  participant etcd
+  participant Op as Training Operator
+  participant Sched as Scheduler
+  participant kubelet
+
+  User->>API: 提交 PyTorchJob
+  API->>API: 校验 CRD schema + Admission Webhook
+  API->>etcd: 持久化对象
+  Op->>API: List+Watch 监听变化
+  API-->>Op: Watch Event (ADDED)
+  Op->>API: 读取 spec，创建 master/worker Pod、Service、ConfigMap
+  Sched->>API: 绑定 Pod 到节点
+  kubelet->>API: 启动容器，注入 GPU
+  Op->>API: Watch Pod 状态变化
+  Op->>API: 更新 PyTorchJob status (conditions, phase)
+  User->>API: kubectl describe PyTorchJob (看状态)
+</pre>
+
+<div class="note"><strong>两个重要边界：</strong>Operator 不直接启动容器，它创建 Kubernetes 对象，由 kube-scheduler 和 kubelet 完成调度与运行。Scheduler 不理解 PyTorchJob 的完整业务语义，除非 Operator 把 gang、quota、priority 等信息通过 PodGroup、Workload 或 labels 传给调度层。</div>
+
+<h3>责任边界</h3>
+<table>
+<thead><tr><th>层</th><th>负责什么</th><th>不负责什么</th></tr></thead>
+<tbody>
+<tr><td>CRD Schema</td><td>API 字段、类型、版本、默认值边界</td><td>运行时恢复和业务决策</td></tr>
+<tr><td>Operator</td><td>期望状态到真实状态的收敛、status、events</td><td>容器内训练代码正确性</td></tr>
+<tr><td>Admission</td><td>创建/更新前校验、默认值、准入策略</td><td>运行中的失败恢复</td></tr>
+<tr><td>Scheduler/Queue</td><td>资源准入、节点选择、gang、公平性</td><td>rank 协议和 checkpoint</td></tr>
+<tr><td>Device Plugin/Runtime</td><td>GPU 资源注册和容器设备注入</td><td>AI 任务状态机</td></tr>
+<tr><td>Serving Runtime</td><td>模型加载、推理协议、batching</td><td>K8s 对象生命周期</td></tr>
+</tbody>
+</table>
+
+<div class="warn"><strong>数据路径不经过 Operator：</strong>训练数据（对象存储 → worker → GPU）、NCCL 参数同步（GPU → GPU）、推理请求（Client → Gateway → Pod → GPU）都走数据面。Operator 状态正常不代表数据路径正常。InferenceService Ready=True 也不等于模型延迟达标；TorchJob Running=True 也不等于 NCCL 带宽正常。</div>
+</section>
+
+<!-- ========== §4 原理 ========== -->
+<section class="section" id="s4">
+<h2>4. 原理：Reconciliation、状态机与对象语义</h2>
+
+<h3>controller-runtime 内部架构：从 API Server 到 Reconcile</h3>
+<p>理解这五层架构，才能回答"为什么我的 Operator 偶尔漏处理事件"、"为什么 reconcile 看到的对象比刚 update 的旧"、"resync 是什么"这些实际问题：</p>
+
+<pre class="mermaid">flowchart TD
+  A["API Server\nList + Watch"] -->|ResourceVersion 续传| B["Reflector\n启动 List 全量\nWatch 持续增量"]
+  B -->|Add/Update/Delete events| C["DeltaFIFO\n同对象多次更新合并\n只留最新"]
+  C -->|Pop deltas| D["Informer Cache\nthread-safe 本地 store\nGet/List O(1) 不打 API Server"]
+  D -->|EventHandler 回调| E["Workqueue\n去重 ns/name key\n指数退避 + 全局令牌桶"]
+  E -->|Get 阻塞直到 key available| F["Reconciler.Reconcile\n从 Cache 读对象\n算 desired vs actual\nPatch/Apply 到 API Server\n返回 Requeue / RequeueAfter"]
+</pre>
+
+<p>每一层解决一个具体问题：</p>
+<ul>
+  <li><strong>Reflector List+Watch + ResourceVersion</strong>：保证不丢事件。watch 连接断了，下次 watch 用 <code>lastResourceVersion</code> 续传。没有对应历史时（API Server 默认保留 5min 历史）返回 410 Gone，Reflector 触发重新 List。</li>
+  <li><strong>DeltaFIFO 合并</strong>：对象在短时间内被改 100 次，FIFO 里只有 1 个最新对象等着 reconcile，避免 watch 风暴导致 reconcile 排队爆炸。</li>
+  <li><strong>Informer Cache 的强一致幻觉</strong>：cache 永远略晚于 API Server，所以 Reconcile 拿到对象后必须用 ResourceVersion 防 conflict——<code>Update()</code> 时 K8s 比对 ResourceVersion，cache 旧的就 reject，Reconciler 把请求重新入队。</li>
+  <li><strong>Workqueue 的限速</strong>：默认用 <code>ItemExponentialFailureRateLimiter</code>（指数退避，5ms 起跳，1000s 封顶）+ <code>BucketRateLimiter</code>（10 qps + 100 burst 全局令牌桶），防单对象失败雪崩，也防全局打爆 API Server。</li>
+</ul>
+
+<h3>Periodic Resync：Operator 自愈的隐形机制</h3>
+<p>DeltaFIFO 默认启用 Resync（典型 10 分钟）。每 10 分钟，Informer 遍历全部缓存对象、对每个对象触发一次 fake update event，把它们重新塞进 workqueue 走 reconcile。这是 Operator 的"隐形自愈"：</p>
+<ul>
+  <li>Reconcile 失败用尽 retry：原本对象就再也不会被处理了。Resync 让它有机会重新尝试。</li>
+  <li>外部状态漂移：底层 Pod 被手动删了、Service 被覆盖，Operator 没收到事件。Resync 让 Operator 定期对账。</li>
+  <li>bug 导致 status 没写：Resync 让 Operator 有机会重新算 status。</li>
+</ul>
+<div class="success"><strong>生产建议：</strong>Resync period 太短（&lt; 1min）会让 controller CPU 飙高；太长（&gt; 1h）让自愈变慢。默认 10min 是经验值。看到 <code>controller_runtime_reconcile_total</code> metric 数字远大于实际事件数是正常的——含 resync。</div>
+
+<h3>Server-Side Apply（SSA）：多控制器协作</h3>
+<p>问题：HPA 改 <code>spec.replicas</code>，用户手工 kubectl edit 改 replicas，Operator 全量 Update——三者同时修改会让彼此的修改互相覆盖。</p>
+<p>SSA 的解法：每个 client 用 <strong>field manager 名字</strong>（如 <code>"torchjob-controller"</code>）声明"我对哪些字段负责"。API Server 跟踪每个字段的 owner，发生冲突时返回 <code>Conflict</code> 让 client 决定怎么处理。</p>
+<pre><code class="language-go">// controller-runtime 风格
+err := client.Patch(ctx, obj, client.Apply, &amp;client.PatchOptions{
+    FieldManager: "torchjob-controller",
+    Force:        false,  // 冲突时报错；true = 强制接管
+})</code></pre>
+<div class="success"><strong>生产规则：</strong>Operator 一律用 SSA Patch，不用 Update。Operator 只声明自己负责的字段，不要把整个对象 apply。Force=true 谨慎使用——只在有"我有权接管"的判断后才用。CRD 启用 <code>subresources.status: {}</code> 后，status 更新走独立 endpoint，不触发 spec 的 SSA 冲突。</div>
+
+<h3>Conversion Webhook：multi-version CRD 的工作机制</h3>
+<p>CRD 从 v1alpha1 升级到 v1 时，集群里可能同时有两个版本的对象。Conversion webhook 让 API Server 在客户端请求版本和存储版本不同时自动转换：</p>
+<pre class="mermaid">sequenceDiagram
+  participant Client
+  participant API as API Server
+  participant Webhook as Conversion Webhook
+
+  Client->>API: GET pytorchjob (请求 v1)
+  API->>API: 存储版本是 v1，etcd 里是 v1alpha1 格式
+  API->>Webhook: ConversionReview {desiredAPIVersion: v1, objects: [v1alpha1格式]}
+  Webhook-->>API: ConversionResponse {convertedObjects: [v1格式]}
+  API-->>Client: 返回 v1 格式对象
+</pre>
+
+<table>
+<thead><tr><th>失败场景</th><th>后果</th><th>排查方式</th></tr></thead>
+<tbody>
+<tr><td>Webhook service 不可达（pod 死了）</td><td>整个 CRD 不可用，所有操作返回 5xx</td><td><code>kubectl describe crd</code> 看 status.conditions；保证 webhook 高可用 + PDB</td></tr>
+<tr><td>Webhook 返回错误（panic、bug）</td><td>同上</td><td>webhook pod 日志</td></tr>
+<tr><td>caBundle 过期</td><td>同上</td><td>用 cert-manager 自动轮换</td></tr>
+<tr><td>Conversion 函数有 bug</td><td>客户端拿到错对象，调度等下游链路出错</td><td>round-trip 单测（v1→v1alpha1→v1 应等于原对象）</td></tr>
+</tbody>
+</table>
+
+<h3>Leader Election：实际机制</h3>
+<p>Operator 多副本用 <code>coordination.k8s.io/v1</code> 的 <code>Lease</code> 对象作为分布式锁。只有持有 Lease 的副本执行 reconcile，其他副本进入 standby。</p>
+<pre><code class="language-yaml"># training-system 下的 Lease 示例
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: training-operator-leader
+  namespace: training-system
+spec:
+  holderIdentity: "training-operator-7d8f6c9-xkj2p"
+  leaseDurationSeconds: 15   # leader 多久不续就失效
+  renewTime: "2026-05-05T10:23:45Z"
+  leaseTransitions: 3        # 历史切换次数</code></pre>
+<p>三个时间参数关系：<code>RetryPeriod(2s) &lt; RenewDeadline(10s) &lt; LeaseDuration(15s)</code>。RenewDeadline 比 LeaseDuration 短，确保旧 leader 在被认为过期前就主动放弃，防止两个 leader 短暂共存（split brain）。</p>
+<div class="warn"><strong>Leader Election 不能替代乐观并发：</strong>切换瞬间可能有重叠操作。所有 reconcile 操作必须基于 ResourceVersion 做乐观并发，不能假设独占。用 <code>kubectl get lease -n training-system</code> 监控当前 leader；<code>leaseTransitions</code> 增长率反映 leader 抖动情况。</div>
+
+<h3>AI Operator 状态机</h3>
+<pre class="mermaid">stateDiagram-v2
+  [*] --> Created : CRD 保存，controller 首次观察
+  Created --> Admitting : 加 finalizer，提交 Workload/PodGroup
+  Admitting --> Pending : queue/gang 准入通过，创建底层对象
+  Pending --> Initializing : 关键 Pod 启动，运行 init/rendezvous/模型加载
+  Initializing --> Running : 关键角色就绪
+  Running --> Restarting : 可恢复失败（按策略）
+  Restarting --> Running : 从 checkpoint 恢复
+  Running --> Succeeded : 任务达到成功条件
+  Running --> Failed : 不可恢复或超过重试预算
+  Succeeded --> [*]
+  Failed --> [*]
+  Created --> Terminating : 用户删除
+  Admitting --> Terminating
+  Pending --> Terminating
+  Running --> Terminating
+  Terminating --> [*] : finalizer 清理完成
+</pre>
+
+<h3>Spec、Status、Conditions</h3>
+<p>一个有工程质量的 CRD status 应该回答三个问题：当前阶段是什么、卡住或失败的直接原因是什么、系统下一步是否会自动处理。</p>
+<pre><code class="language-yaml">status:
+  observedGeneration: 7   # 对应 metadata.generation，判断 status 新鲜度
+  phase: Pending
+  conditions:
+    - type: Admitted
+      status: "False"
+      reason: InsufficientGPU
+      message: "queue train-prod needs 64 nvidia.com/gpu, currently 48 fit the topology"
+      lastTransitionTime: "2026-05-05T10:20:00Z"
+    - type: PodsCreated
+      status: "False"
+      reason: WaitingForAdmission
+  replicaStatuses:
+    Worker:
+      desired: 8
+      active: 0
+      failed: 0</code></pre>
+<p><code>observedGeneration</code> 很关键。如果用户刚修改 spec，而 controller 还没处理，<code>metadata.generation</code> 会大于 <code>status.observedGeneration</code>。平台 UI 和自动化系统应据此判断 status 是否新鲜，不要把"正在收敛"误报为"稳定运行"。</p>
+</section>
+
+<!-- ========== §5 常见 AI CRD ========== -->
+<section class="section" id="s5">
+<h2>5. 常见 AI CRD 的语义</h2>
+
+<h3>TorchJob / PyTorchJob</h3>
+<p>TorchJob 表达 PyTorch 分布式训练。核心不是"创建多个 Pod"，而是表达 PyTorch 分布式语义：</p>
+<ul>
+  <li><code>pytorchReplicaSpecs</code>：Master、Worker 等角色及其 replicas、Pod template、资源请求。</li>
+  <li><code>runPolicy</code>：cleanPodPolicy、backoffLimit、ttlSecondsAfterFinished、suspend。</li>
+  <li>环境变量和启动命令：master address、rank、world size、backend、NCCL 参数。</li>
+</ul>
+<pre><code class="language-yaml">apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: train-reranker
+  namespace: train
+spec:
+  runPolicy:
+    cleanPodPolicy: Running
+    backoffLimit: 3
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: registry.local/ml/reranker-train:cuda12.4-v42
+              command: ["torchrun"]
+              args: ["--nnodes=8","--nproc_per_node=8","--rdzv_backend=c10d",
+                     "--rdzv_endpoint=$(MASTER_ADDR):29400","train.py"]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+    Worker:
+      replicas: 7
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: registry.local/ml/reranker-train:cuda12.4-v42
+              resources:
+                limits:
+                  nvidia.com/gpu: 8</code></pre>
+<div class="warn"><strong>必须接入 Gang 调度：</strong>生产中，TorchJob 必须和 Kueue、Volcano 或其他 gang scheduler 集成。否则 8 个 worker 可能只启动 5 个，训练卡在 rendezvous 永久等待，占用 GPU 但不产出任何训练进度。</div>
+
+<h3>RayJob</h3>
+<p>RayJob 表达"提交一个 Ray driver，并在 RayCluster 上运行"。对象关系：</p>
+<pre><code>RayJob
+  -> RayCluster
+       -> head Pod + head Service
+       -> worker Pods
+  -> submitter / driver Job</code></pre>
+<p>排障时不能只看 Pod。Pod Running 只是 Ray runtime 在跑，不代表 driver 成功，也不代表 Ray task 没有失败。Operator 应把 driver 状态、RayCluster 状态和 Kubernetes 状态都写到 status。</p>
+
+<h3>MPIJob</h3>
+<p>MPIJob 表达 launcher + worker slot 的启动模式，常用于 Horovod、OpenMPI、传统 HPC 风格训练。典型结构：</p>
+<pre><code>MPIJob
+  -> launcher Pod (mpirun / mpiexec)
+  -> worker Pods (slots / GPU resources)</code></pre>
+<p>MPIJob 最常见的失败是 launcher 先启动，worker 未齐，随后连接超时。成熟 Operator 会通过 init、状态检查或调度集成降低这类问题。</p>
+
+<h3>InferenceService / KServe</h3>
+<p>KServe 的 InferenceService 表达在线模型服务，通常把服务拆成 predictor、transformer、explainer，通过 Knative、Deployment、Service、Ingress/Gateway、autoscaler 等底层对象运行。</p>
+<pre><code class="language-yaml">apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: reranker
+  namespace: serving
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: pytorch
+      runtime: vllm-runtime
+      storageUri: s3://model-registry/reranker/v42
+      resources:
+        limits:
+          nvidia.com/gpu: 1</code></pre>
+<p>生产语义包括：模型加载（storageUri、model agent、local cache）、Runtime（Triton/TorchServe/vLLM/自定义）、Revision（每次变化生成新 revision）、Traffic split（灰度/金丝雀/回滚）、Autoscaling（基于并发/QPS/延迟/GPU 指标）。</p>
+<div class="note"><strong>InferenceService 不是薄包装：</strong>它的价值在于把模型版本、流量、readiness、runtime 和弹性策略变成模型服务控制面。Ready=True 也不等于延迟达标——模型加载完成和服务质量是两个不同维度。</div>
+
+<h3>LeaderWorkerSet（LWS）：大模型多机推理</h3>
+<p>LWS 专为"一组 Pod 共同服务一个推理副本"的场景设计——典型如 vLLM / SGLang / TRT-LLM 把 70B-405B 模型用 TP+PP 切到多机多卡推理。每个推理副本由 1 个 leader Pod + N-1 个 worker Pod 组成，所有 Pod 必须 gang 启动、共享 NCCL/RDMA bootstrap、一起 ready 才能接流量。</p>
+
 <table>
 <thead><tr><th>字段</th><th>含义</th><th>与 vLLM 对应</th></tr></thead>
 <tbody>
 <tr><td><code>replicas</code></td><td>推理副本数（每个副本是一组 leader+worker）</td><td>vLLM 副本数</td></tr>
 <tr><td><code>leaderWorkerTemplate.size</code></td><td>单副本内 Pod 总数（leader + worker）</td><td>TP × PP × DP / GPUs_per_pod</td></tr>
-<tr><td><code>leaderWorkerTemplate.leaderTemplate</code></td><td>leader Pod 模板（处理 HTTP 入口 + Ray head 等）</td><td>vLLM serve <code>--tensor-parallel-size</code> 入口节点</td></tr>
-<tr><td><code>leaderWorkerTemplate.workerTemplate</code></td><td>worker Pod 模板（仅参与计算）</td><td>vLLM Ray worker</td></tr>
-<tr><td><code>leaderWorkerTemplate.restartPolicy</code></td><td><code>RecreateGroupOnPodRestart</code> 任一 Pod 重启则整组重启</td><td>必选，否则 NCCL 状态不一致</td></tr>
-<tr><td><code>rolloutStrategy</code></td><td>副本级滚动升级策略</td><td>不能像 Deployment 一样按 Pod 滚</td></tr>
-<tr><td><code>startupPolicy</code></td><td><code>LeaderCreated</code> / <code>LeaderReady</code> 控制 worker 何时开始拉起</td><td>leader 先把模型加载完再起 worker</td></tr>
+<tr><td><code>restartPolicy: RecreateGroupOnPodRestart</code></td><td>任一 Pod 重启则整组重启</td><td>必选，否则 NCCL 状态不一致</td></tr>
+<tr><td><code>rolloutStrategy</code></td><td>副本级滚动升级策略</td><td>不能像 Deployment 按 Pod 滚</td></tr>
+<tr><td><code>startupPolicy: LeaderReady</code></td><td>leader 模型加载完再起 worker</td><td>避免 worker 空等</td></tr>
 </tbody>
 </table>
 
-<p><strong>为什么需要 LWS（vs JobSet / StatefulSet / 自研）</strong>：</p>
 <table>
 <thead><tr><th>替代方案</th><th>不适合大模型多机推理的原因</th></tr></thead>
 <tbody>
 <tr><td>Deployment + Service</td><td>没有 gang 语义；Pod 个体重启会让 NCCL 链路死锁</td></tr>
 <tr><td>StatefulSet</td><td>提供有序启动，但缺少"组级 ready"和"组级重启"语义</td></tr>
-<tr><td>Job / JobSet</td><td>Job 假设跑完即结束；推理是长服务，不该用 Job 模型</td></tr>
-<tr><td>Ray Operator + RayCluster</td><td>强依赖 Ray runtime，不适合 vLLM 之外的引擎</td></tr>
-<tr><td><strong>LWS</strong></td><td><strong>专为"长生命周期 + 组级语义 + 滚动升级"设计，已是 vLLM/TRT-LLM/SGLang 多机部署的官方推荐路径</strong></td></tr>
+<tr><td>Job / JobSet</td><td>Job 假设跑完即结束；推理是长服务</td></tr>
+<tr><td>RayCluster</td><td>强依赖 Ray runtime，不适合 vLLM 之外的引擎</td></tr>
+<tr><td><strong>LWS</strong></td><td><strong>专为"长生命周期 + 组级语义 + 滚动升级"设计，vLLM/TRT-LLM/SGLang 多机推理官方推荐路径</strong></td></tr>
 </tbody>
 </table>
-
-<p><strong>典型 LWS YAML（vLLM 70B TP=8 跨 2 机）</strong>：</p>
-<pre><code>apiVersion: leaderworkerset.x-k8s.io/v1
-kind: LeaderWorkerSet
-metadata:
-  name: vllm-llama-70b
-spec:
-  replicas: 2                # 2 个推理副本
-  leaderWorkerTemplate:
-    size: 2                  # 每副本 2 个 Pod（leader + 1 worker）
-    restartPolicy: RecreateGroupOnPodRestart
-    leaderTemplate:
-      spec:
-        containers:
-        - name: vllm-leader
-          image: vllm/vllm-openai:latest
-          command: ["/bin/sh","-c"]
-          args:
-          - |
-            python -m vllm.entrypoints.openai.api_server \
-              --model meta-llama/Llama-3-70B \
-              --tensor-parallel-size 8 \
-              --pipeline-parallel-size 2 \
-              --distributed-executor-backend ray
-          resources:
-            limits:
-              nvidia.com/gpu: 8
-              rdma/hca: 1
-    workerTemplate:
-      spec:
-        containers:
-        - name: vllm-worker
-          image: vllm/vllm-openai:latest
-          resources:
-            limits:
-              nvidia.com/gpu: 8
-              rdma/hca: 1
-  rolloutStrategy:
-    type: RollingUpdate
-    rollingUpdateConfiguration:
-      maxUnavailable: 1
-      maxSurge: 1</code></pre>
 
 <div class="note"><strong>LWS 已进入 Kubernetes SIGs 官方路径</strong>（kubernetes-sigs/lws v0.4+），并被 NVIDIA / vLLM / Anyscale / Google 官方文档作为大模型多机推理推荐 CRD。如果你在裸 K8s 上做 70B+ 模型多机推理且没用 LWS，意味着你正在自己重新实现 gang 启动、组级重启、组级滚动这些已经被解决的问题。</div>
+<div class="warn"><strong>LWS + Volcano/Kueue 是叠加关系，不是替代：</strong>调度层（Volcano PodGroup / Kueue Workload）确保副本"一组 Pod 同时拿到 GPU"；LWS 确保"已分配的 Pod 一起启动且组级管理"。两者通常一起用。</div>
+</section>
 
-<div class="warn"><strong>LWS + Volcano/Kueue 的叠加</strong>：调度层（Volcano PodGroup / Kueue Workload）和工作负载层（LWS）解决不同问题：调度层确保副本"一组 Pod 同时拿到 GPU"，LWS 确保"已分配的 Pod 一起启动且组级管理"。两者通常一起用而不是替代关系。</div>
+<!-- ========== §6 工程化 ========== -->
+<section class="section" id="s6">
+<h2>6. 工程化：生产落地、版本、发布、观测与治理</h2>
 
-<hr />
-<h2 id="19c6-工程化生产落地版本发布观测与治理">19c.6
-工程化：生产落地、版本、发布、观测与治理</h2>
-<h3 id="配置设计">配置设计</h3>
-<p>CRD spec 应该表达稳定的业务意图，不要把所有 Pod
-字段原样暴露给用户。推荐分层：</p>
+<h3>CRD 配置分层</h3>
 <table>
-<thead>
-<tr>
-<th>层</th>
-<th>示例字段</th>
-<th>管理者</th>
-</tr>
-</thead>
+<thead><tr><th>层</th><th>示例字段</th><th>管理者</th></tr></thead>
 <tbody>
-<tr>
-<td>用户意图</td>
-<td><code>replicas</code>、<code>modelRef</code>、<code>datasetRef</code>、<code>framework</code>、<code>entrypoint</code></td>
-<td>用户或训练平台</td>
-</tr>
-<tr>
-<td>资源策略</td>
-<td>GPU 数、节点池、priority、queue、gang、checkpointPolicy</td>
-<td>平台</td>
-</tr>
-<tr>
-<td>Pod 模板</td>
-<td>image、env、volume、securityContext</td>
-<td>平台和高级用户</td>
-</tr>
-<tr>
-<td>默认值</td>
-<td>runtimeClass、tolerations、labels、sidecar、probe</td>
-<td>admission/operator</td>
-</tr>
-<tr>
-<td>运行状态</td>
-<td>phase、conditions、replicaStatuses、revision</td>
-<td>operator status</td>
-</tr>
+<tr><td>用户意图</td><td><code>replicas</code>、<code>modelRef</code>、<code>datasetRef</code>、<code>framework</code>、<code>entrypoint</code></td><td>用户或训练平台</td></tr>
+<tr><td>资源策略</td><td>GPU 数、节点池、priority、queue、gang、checkpointPolicy</td><td>平台</td></tr>
+<tr><td>Pod 模板</td><td>image、env、volume、securityContext</td><td>平台和高级用户</td></tr>
+<tr><td>默认值</td><td>runtimeClass、tolerations、labels、sidecar、probe</td><td>admission/operator</td></tr>
+<tr><td>运行状态</td><td>phase、conditions、replicaStatuses、revision</td><td>operator status</td></tr>
 </tbody>
 </table>
-<p>字段越靠近业务语义，越适合作为 CRD
-顶层字段；字段越靠近容器细节，越适合放在 template 或平台默认值里。</p>
-<h3 id="版本矩阵">版本矩阵</h3>
-<p>AI Operator 的版本兼容不是单一维度。生产发布前至少维护这张矩阵：</p>
+
+<h3>版本矩阵与 API 版本策略</h3>
+<p>不要只写"支持 Kubernetes 1.29"。对 AI 平台而言，更重要的是"PyTorchJob v1 + Kueue x.y + H100 CUDA 12.4 + NCCL 2.x + driver branch + operator 版本"的组合是否验证过。</p>
 <table>
-<thead>
-<tr>
-<th>维度</th>
-<th>示例</th>
-<th>兼容风险</th>
-</tr>
-</thead>
+<thead><tr><th>阶段</th><th>API 版本</th><th>策略</th></tr></thead>
 <tbody>
-<tr>
-<td>Kubernetes</td>
-<td>1.28、1.29、1.30</td>
-<td>API 版本、admission、CEL 校验、Server-Side Apply</td>
-</tr>
-<tr>
-<td>CRD API</td>
-<td><code>v1alpha1</code>、<code>v1beta1</code>、<code>v1</code></td>
-<td>字段变更、status 语义、conversion</td>
-</tr>
-<tr>
-<td>Operator</td>
-<td>Training Operator、KubeRay、KServe 版本</td>
-<td>reconcile 行为、RBAC、底层对象变化</td>
-</tr>
-<tr>
-<td>Scheduler/Queue</td>
-<td>default、Volcano、Kueue</td>
-<td>gang、quota、priority、preemption</td>
-</tr>
-<tr>
-<td>GPU 栈</td>
-<td>driver、CUDA、device plugin、GPU Operator</td>
-<td>resource name、MIG、runtimeClass</td>
-</tr>
-<tr>
-<td>Serving 栈</td>
-<td>KServe、Knative、Istio/Envoy、runtime</td>
-<td>revision、autoscaling、probe、网关路由</td>
-</tr>
-<tr>
-<td>框架</td>
-<td>PyTorch、Ray、MPI、Triton、vLLM</td>
-<td>启动参数、环境变量、协议</td>
-</tr>
+<tr><td>实验</td><td><code>v1alpha1</code></td><td>快速迭代，不承诺长期兼容</td></tr>
+<tr><td>试生产</td><td><code>v1beta1</code></td><td>字段基本稳定，允许小幅调整</td></tr>
+<tr><td>生产稳定</td><td><code>v1</code></td><td>强兼容，变更需要迁移和公告</td></tr>
 </tbody>
 </table>
-<p>不要只写“支持 Kubernetes 1.29”。对 AI 平台而言，更重要的是“PyTorchJob
-v1 + Kueue x.y + H100 CUDA 12.4 + NCCL 2.x + driver branch + operator
-版本”的组合是否验证过。</p>
-<h3 id="crd-升级与兼容性">CRD 升级与兼容性</h3>
-<p>CRD 一旦成为平台 API，就要像产品 API 一样治理。</p>
-<p>关键规则：</p>
-<ul>
-<li>新增字段优先做可选字段，并提供默认值。</li>
-<li>不要轻易改变字段语义；语义变化要新增字段或新版本。</li>
-<li>删除字段前先标记 deprecated，保留兼容窗口。</li>
-<li>status 字段也会被平台 UI、告警、自动化依赖，不能随意改名。</li>
-<li>多版本 CRD 要提供 conversion webhook 或清晰迁移路径。</li>
-<li>storage version 迁移要测试回滚场景。</li>
-</ul>
-<p>典型版本策略：</p>
-<table>
-<thead>
-<tr>
-<th>阶段</th>
-<th>API 版本</th>
-<th>策略</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>实验</td>
-<td><code>v1alpha1</code></td>
-<td>快速迭代，不承诺长期兼容</td>
-</tr>
-<tr>
-<td>试生产</td>
-<td><code>v1beta1</code></td>
-<td>字段基本稳定，允许小幅调整</td>
-</tr>
-<tr>
-<td>生产稳定</td>
-<td><code>v1</code></td>
-<td>强兼容，变更需要迁移和公告</td>
-</tr>
-</tbody>
-</table>
-<p>升级 Operator 时要先确认旧对象能被新控制器
-reconcile，新对象不会被旧控制器误处理，回滚时不会因为 CRD schema 或
-conversion 导致对象不可读。</p>
-<h3 id="发布策略">发布策略</h3>
-<p>推荐发布顺序：</p>
-<ol type="1">
-<li>发布 CRD schema，但不立即启用新行为。</li>
-<li>发布 admission webhook，先以 audit 或 warn 模式验证策略。</li>
-<li>滚动升级 Operator，观察 reconcile error、workqueue depth、status
-update conflict。</li>
-<li>对少量 namespace 或 queue 启用新字段。</li>
-<li>扩大灰度，更新平台 UI 和文档。</li>
-<li>固化版本矩阵和回滚手册。</li>
+
+<h3>发布策略</h3>
+<ol>
+  <li>发布 CRD schema，但不立即启用新行为。</li>
+  <li>发布 admission webhook，先以 audit 或 warn 模式验证策略。</li>
+  <li>滚动升级 Operator，观察 reconcile error、workqueue depth、status update conflict。</li>
+  <li>对少量 namespace 或 queue 启用新字段。</li>
+  <li>扩大灰度，更新平台 UI 和文档。</li>
+  <li>固化版本矩阵和回滚手册。</li>
 </ol>
-<p>Operator 本身要支持 leader
-election，避免多副本同时控制同一对象。多副本 controller
-提高可用性，但只有 leader 执行写操作。</p>
-<h3 id="观测">观测</h3>
+
+<h3>观测</h3>
 <p>Operator 观测至少包含：</p>
 <ul>
-<li>日志：reconcile 开始/结束、对象
-namespace/name、generation、错误、重试原因。</li>
-<li>Events：面向用户的关键状态变化，例如
-<code>WaitingForGPU</code>、<code>ImagePullFailed</code>、<code>RevisionReady</code>。</li>
-<li>Metrics：reconcile duration、error count、queue depth、requeue
-count、status update conflict、managed objects。</li>
-<li>Status：phase、conditions、observedGeneration、replica
-status、failure reason。</li>
-<li>Trace 或关联 ID：把平台提交、CRD、Operator、底层 Pod
-日志串起来。</li>
+  <li><strong>日志</strong>：reconcile 开始/结束、对象 namespace/name、generation、错误、重试原因。</li>
+  <li><strong>Events</strong>：面向用户的关键状态变化，例如 <code>WaitingForGPU</code>、<code>ImagePullFailed</code>、<code>RevisionReady</code>。</li>
+  <li><strong>Metrics</strong>：reconcile duration、error count、queue depth、requeue count、status update conflict、managed objects。</li>
+  <li><strong>Status</strong>：phase、conditions、observedGeneration、replica status、failure reason。</li>
+  <li><strong>AI 领域指标</strong>：训练 job 运行时长、失败重启次数、checkpoint 恢复次数、Ray driver 状态、InferenceService revision ready 延迟、模型加载耗时、流量切换状态。</li>
 </ul>
-<p>对于 AI CRD，还要暴露领域指标：训练 job
-运行时长、失败重启次数、checkpoint 恢复次数、Ray driver
-状态、InferenceService revision ready
-延迟、模型加载耗时、流量切换状态。</p>
-<h3 id="rbac-与安全治理">RBAC 与安全治理</h3>
-<p>Operator 权限要最小化。常见权限边界：</p>
+
+<h3>RBAC 与安全治理</h3>
 <ul>
-<li>只能 watch/list/get 自己管理的 CRD 和底层对象。</li>
-<li>只能 create/update/delete 自己 namespace 或目标 namespace
-下的对象。</li>
-<li>status 更新使用 <code>/status</code> 子资源权限。</li>
-<li>finalizer 更新需要更新主资源 metadata 的权限。</li>
-<li>不要给 cluster-admin 作为默认安装方式。</li>
+  <li>只能 watch/list/get 自己管理的 CRD 和底层对象。</li>
+  <li>只能 create/update/delete 自己 namespace 或目标 namespace 下的对象。</li>
+  <li>status 更新使用 <code>/status</code> 子资源权限。</li>
+  <li>不要给 cluster-admin 作为默认安装方式。</li>
+  <li>Admission 校验镜像来源、GPU 请求、queue、priority、hostPath、privileged。</li>
+  <li>为不同团队划分 namespace、queue、quota 和 service account。</li>
 </ul>
-<p>治理策略还包括：</p>
-<ul>
-<li>Admission 校验镜像来源、GPU
-请求、queue、priority、hostPath、privileged。</li>
-<li>限制用户直接修改 Operator 管理的底层对象。</li>
-<li>对 CRD spec 做审计，记录谁提交了什么模型、数据和资源。</li>
-<li>为不同团队划分 namespace、queue、quota 和 service account。</li>
-</ul>
-<hr />
-<h2 id="19c7-方案设计ai-crd-选择与-operator-设计">19c.7 方案设计：AI CRD
-选择与 Operator 设计</h2>
-<h3 id="crd-选择决策表">CRD 选择决策表</h3>
+</section>
+
+<!-- ========== §7 方案设计 ========== -->
+<section class="section" id="s7">
+<h2>7. 方案设计：AI CRD 选择与 Operator 设计</h2>
+
+<h3>CRD 选择决策表</h3>
 <table>
-<thead>
-<tr>
-<th>需求</th>
-<th>推荐对象</th>
-<th>关键判断</th>
-</tr>
-</thead>
+<thead><tr><th>需求</th><th>推荐对象</th><th>关键判断</th></tr></thead>
 <tbody>
-<tr>
-<td>单机训练、一次性脚本</td>
-<td>Job</td>
-<td>不需要分布式角色和框架语义</td>
-</tr>
-<tr>
-<td>PyTorch DDP/FSDP 多机训练</td>
-<td>PyTorchJob + queue/gang</td>
-<td>需要 rank、world size、worker 状态、全局失败恢复</td>
-</tr>
-<tr>
-<td>Ray 数据处理、RL、批推理</td>
-<td>RayJob</td>
-<td>需要 RayCluster、driver、runtime env</td>
-</tr>
-<tr>
-<td>Horovod/OpenMPI 训练</td>
-<td>MPIJob</td>
-<td>需要 launcher、hostfile、slot</td>
-</tr>
-<tr>
-<td>在线模型服务</td>
-<td>InferenceService</td>
-<td>需要模型加载、revision、autoscaling、traffic split</td>
-</tr>
-<tr>
-<td>多角色复杂批任务</td>
-<td>JobSet 或自定义 CRD</td>
-<td>需要多个 Job 的整体状态和准入</td>
-</tr>
-<tr>
-<td>公司内部统一训练平台</td>
-<td>自定义 TrainingJob CRD</td>
-<td>需要屏蔽框架差异、统一治理</td>
-</tr>
+<tr><td>单机训练、一次性脚本</td><td>Job</td><td>不需要分布式角色和框架语义</td></tr>
+<tr><td>PyTorch DDP/FSDP 多机训练</td><td>PyTorchJob + queue/gang</td><td>需要 rank、world size、worker 状态、全局失败恢复</td></tr>
+<tr><td>Ray 数据处理、RL、批推理</td><td>RayJob</td><td>需要 RayCluster、driver、runtime env</td></tr>
+<tr><td>Horovod/OpenMPI 训练</td><td>MPIJob</td><td>需要 launcher、hostfile、slot</td></tr>
+<tr><td>在线模型服务（单机）</td><td>InferenceService</td><td>需要模型加载、revision、autoscaling、traffic split</td></tr>
+<tr><td>大模型多机推理（TP+PP）</td><td>LeaderWorkerSet</td><td>需要 gang 启动、组级重启、组级滚动升级</td></tr>
+<tr><td>多角色复杂批任务</td><td>JobSet 或自定义 CRD</td><td>需要多个 Job 的整体状态和准入</td></tr>
+<tr><td>公司内部统一训练平台</td><td>自定义 TrainingJob CRD</td><td>需要屏蔽框架差异、统一治理</td></tr>
 </tbody>
 </table>
-<h3 id="设计方案公司内部-trainingjob-crd">设计方案：公司内部 TrainingJob
-CRD</h3>
-<p>假设平台要支持 PyTorch 和 Ray 两类训练，同时接入 Kueue
-做队列准入，接入对象存储做 checkpoint。可以设计一个上层
-<code>TrainingJob</code>，由内部 Operator 翻译为 PyTorchJob 或
-RayJob。</p>
-<p>设计目标：</p>
-<ul>
-<li>用户提交统一对象，不直接接触框架 Operator 的复杂字段。</li>
-<li>平台统一治理镜像、资源、queue、checkpoint、日志和成本标签。</li>
-<li>底层继续复用成熟 Operator，避免重写 PyTorch/Ray 细节。</li>
-</ul>
-<p>示例：</p>
-<div class="sourceCode" id="cb13"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> platform.example.com/v1beta1</span></span>
-<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> TrainingJob</span></span>
-<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
-<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> reranker-v42</span></span>
-<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> train</span></span>
-<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
-<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">framework</span><span class="kw">:</span><span class="at"> pytorch</span></span>
-<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">queue</span><span class="kw">:</span><span class="at"> h100-prod</span></span>
-<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.local/ml/reranker-train:cuda12.4-v42</span></span>
-<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">entrypoint</span><span class="kw">:</span></span>
-<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;torchrun&quot;</span><span class="kw">]</span></span>
-<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">args</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;--nnodes=8&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;--nproc_per_node=8&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;train.py&quot;</span><span class="kw">]</span></span>
-<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span></span>
-<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">workers</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
-<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gpuPerWorker</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
-<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">checkpoint</span><span class="kw">:</span></span>
-<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">uri</span><span class="kw">:</span><span class="at"> s3://checkpoints/reranker/v42</span></span>
-<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resumePolicy</span><span class="kw">:</span><span class="at"> Latest</span></span>
-<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">failurePolicy</span><span class="kw">:</span></span>
-<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">maxRestarts</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
-<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">restartScope</span><span class="kw">:</span><span class="at"> AllWorkers</span></span></code></pre></div>
-<p>内部 Operator 的责任：</p>
-<pre class="text"><code>TrainingJob
-  -&gt; validate queue, image, checkpoint policy
-  -&gt; create Kueue Workload / PodGroup
-  -&gt; create PyTorchJob or RayJob
-  -&gt; copy important status back to TrainingJob
-  -&gt; emit platform-level events and metrics</code></pre>
+
+<h3>公司内部 TrainingJob CRD 设计</h3>
+
+<pre class="mermaid">flowchart TD
+  User[用户提交 TrainingJob] --> Op[TrainingJob Operator]
+  Op --> V[校验 queue/image/checkpoint]
+  V --> WL[创建 Kueue Workload / PodGroup]
+  WL --> PJ{framework?}
+  PJ -->|pytorch| TJ[创建 PyTorchJob]
+  PJ -->|ray| RJ[创建 RayJob]
+  TJ --> Agg[汇聚底层 CRD status]
+  RJ --> Agg
+  Agg --> Status[写回 TrainingJob status\n+ 平台 events + metrics]
+</pre>
+
+<p>TrainingJob 示例 YAML：</p>
+<pre><code class="language-yaml">apiVersion: platform.example.com/v1beta1
+kind: TrainingJob
+metadata:
+  name: reranker-v42
+  namespace: train
+spec:
+  framework: pytorch
+  queue: h100-prod
+  image: registry.local/ml/reranker-train:cuda12.4-v42
+  entrypoint:
+    command: ["torchrun"]
+    args: ["--nnodes=8", "--nproc_per_node=8", "train.py"]
+  replicas:
+    workers: 8
+    gpuPerWorker: 8
+  checkpoint:
+    uri: s3://checkpoints/reranker/v42
+    resumePolicy: Latest
+  failurePolicy:
+    maxRestarts: 3
+    restartScope: AllWorkers</code></pre>
+
 <p>责任边界：</p>
 <table>
-<thead>
-<tr>
-<th>组件</th>
-<th>责任</th>
-</tr>
-</thead>
+<thead><tr><th>组件</th><th>责任</th></tr></thead>
 <tbody>
-<tr>
-<td>TrainingJob Operator</td>
-<td>统一 API、治理、准入、状态聚合</td>
-</tr>
-<tr>
-<td>PyTorchJob/RayJob Operator</td>
-<td>框架级底层对象和运行状态</td>
-</tr>
-<tr>
-<td>Kueue/Volcano</td>
-<td>资源队列、gang、priority、quota</td>
-</tr>
-<tr>
-<td>GPU Operator</td>
-<td>驱动、device plugin、runtime</td>
-</tr>
-<tr>
-<td>用户代码</td>
-<td>训练逻辑、checkpoint 读写、框架参数</td>
-</tr>
+<tr><td>TrainingJob Operator</td><td>统一 API、治理、准入、状态聚合</td></tr>
+<tr><td>PyTorchJob/RayJob Operator</td><td>框架级底层对象和运行状态</td></tr>
+<tr><td>Kueue/Volcano</td><td>资源队列、gang、priority、quota</td></tr>
+<tr><td>GPU Operator</td><td>驱动、device plugin、runtime</td></tr>
+<tr><td>用户代码</td><td>训练逻辑、checkpoint 读写、框架参数</td></tr>
 </tbody>
 </table>
-<p>这个方案的风险是状态转译复杂。内部 Operator 不应把底层 CRD
-的所有字段重新发明一遍，而应只抽象平台真正需要稳定承诺的字段。</p>
-<hr />
-<h2 id="19c8-故障排除症状证据根因动作">19c.8
-故障排除：症状、证据、根因、动作</h2>
+<div class="warn"><strong>状态转译是风险点：</strong>内部 Operator 不应把底层 CRD 的所有字段重新发明一遍，而应只抽象平台真正需要稳定承诺的字段。字段越多，升级兼容越难。</div>
+</section>
+
+<!-- ========== §8 排障 ========== -->
+<section class="section" id="s8">
+<h2>8. 故障排除：症状、证据、根因、动作</h2>
+
 <table>
-<thead>
-<tr>
-<th>症状</th>
-<th>证据</th>
-<th>常见根因</th>
-<th>处理动作</th>
-</tr>
-</thead>
+<thead><tr><th>症状</th><th>证据</th><th>常见根因</th><th>处理动作</th></tr></thead>
 <tbody>
-<tr>
-<td>CRD 创建后没有底层 Pod</td>
-<td><code>kubectl describe &lt;crd&gt;</code>、Operator
-logs、events</td>
-<td>Operator 未运行、RBAC 不足、watch namespace 错、admission 拒绝</td>
-<td>修复部署、权限、namespace selector 或 webhook</td>
-</tr>
-<tr>
-<td>status 长时间不更新</td>
-<td><code>status.observedGeneration</code>、Operator logs</td>
-<td>controller 卡住、status 子资源无权限、update conflict、leader
-election 异常</td>
-<td>检查 <code>/status</code> RBAC、reconcile error、leader</td>
-</tr>
-<tr>
-<td>删除对象卡在 Terminating</td>
-<td><code>metadata.finalizers</code>、Operator logs</td>
-<td>finalizer 清理失败、外部资源删除失败、Operator 离线</td>
-<td>恢复 Operator，修复外部 API；确认无泄漏后才手工移除 finalizer</td>
-</tr>
-<tr>
-<td>TorchJob worker 部分 Running</td>
-<td>Pod events、queue status、CRD conditions</td>
-<td>无 gang 调度、GPU 碎片、quota 不足</td>
-<td>接入 Kueue/Volcano，调整队列或节点池</td>
-</tr>
-<tr>
-<td>TorchJob 反复重启</td>
-<td>Pod previous logs、checkpoint logs、status restart count</td>
-<td>非 elastic 训练单 rank 失败、checkpoint 不可恢复、应用异常</td>
-<td>区分应用 bug 与节点故障，调整 failurePolicy</td>
-</tr>
-<tr>
-<td>RayJob Pod Running 但任务失败</td>
-<td>RayJob status、driver logs、Ray dashboard</td>
-<td>runtime env 失败、依赖缺失、driver 异常</td>
-<td>看 driver 而不只看 Pod，修 runtime env 或入口命令</td>
-</tr>
-<tr>
-<td>MPIJob launcher 超时</td>
-<td>launcher logs、worker Pod 状态、hostfile</td>
-<td>worker 未齐、hostfile 错、端口/NetworkPolicy 阻断</td>
-<td>延后 launcher、修发现机制、检查网络策略</td>
-</tr>
-<tr>
-<td>InferenceService Ready=False</td>
-<td>InferenceService status、revision、pod logs、endpoint</td>
-<td>模型下载失败、runtime 启动失败、readiness 失败</td>
-<td>查 storage secret、runtime、probe、revision</td>
-</tr>
-<tr>
-<td>新版本无法回滚</td>
-<td>CRD versions、storedVersions、conversion logs</td>
-<td>CRD schema 不兼容、conversion webhook 失败</td>
-<td>固定 storage version，测试降级，修 conversion</td>
-</tr>
+<tr><td>CRD 创建后没有底层 Pod</td><td><code>kubectl describe &lt;crd&gt;</code>、Operator logs、events</td><td>Operator 未运行、RBAC 不足、watch namespace 错、admission 拒绝</td><td>修复部署、权限、namespace selector 或 webhook</td></tr>
+<tr><td>status 长时间不更新</td><td><code>status.observedGeneration</code>、Operator logs</td><td>controller 卡住、status 子资源无权限、update conflict、leader election 异常</td><td>检查 <code>/status</code> RBAC、reconcile error、leader</td></tr>
+<tr><td>删除对象卡在 Terminating</td><td><code>metadata.finalizers</code>、Operator logs</td><td>finalizer 清理失败、外部资源删除失败、Operator 离线</td><td>恢复 Operator，修复外部 API；确认无泄漏后才手工移除 finalizer</td></tr>
+<tr><td>TorchJob worker 部分 Running</td><td>Pod events、queue status、CRD conditions</td><td>无 gang 调度、GPU 碎片、quota 不足</td><td>接入 Kueue/Volcano，调整队列或节点池</td></tr>
+<tr><td>TorchJob 反复重启</td><td>Pod previous logs、checkpoint logs、status restart count</td><td>非 elastic 训练单 rank 失败、checkpoint 不可恢复、应用异常</td><td>区分应用 bug 与节点故障，调整 failurePolicy</td></tr>
+<tr><td>RayJob Pod Running 但任务失败</td><td>RayJob status、driver logs、Ray dashboard</td><td>runtime env 失败、依赖缺失、driver 异常</td><td>看 driver 而不只看 Pod，修 runtime env 或入口命令</td></tr>
+<tr><td>MPIJob launcher 超时</td><td>launcher logs、worker Pod 状态、hostfile</td><td>worker 未齐、hostfile 错、端口/NetworkPolicy 阻断</td><td>延后 launcher、修发现机制、检查网络策略</td></tr>
+<tr><td>InferenceService Ready=False</td><td>InferenceService status、revision、pod logs、endpoint</td><td>模型下载失败、runtime 启动失败、readiness 失败</td><td>查 storage secret、runtime、probe、revision</td></tr>
+<tr><td>新版本无法回滚</td><td>CRD versions、storedVersions、conversion logs</td><td>CRD schema 不兼容、conversion webhook 失败</td><td>固定 storage version，测试降级，修 conversion</td></tr>
 </tbody>
 </table>
-<p>常用命令：</p>
-<div class="sourceCode" id="cb15"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get crd <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pytorch|ray|mpi|inference&#39;</span></span>
-<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pytorchjob <span class="at">-n</span> train train-reranker <span class="at">-o</span> yaml</span>
-<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pytorchjob <span class="at">-n</span> train train-reranker</span>
-<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> train <span class="at">-l</span> training.kubeflow.org/job-name=train-reranker <span class="at">-o</span> wide</span>
-<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> logs <span class="at">-n</span> kubeflow deploy/training-operator <span class="at">--tail</span><span class="op">=</span>200</span>
-<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> train <span class="at">--sort-by</span><span class="op">=</span>.lastTimestamp</span></code></pre></div>
-<p>排障时先看 CRD status，再看底层对象，再看 Operator 日志。只看 Pod
-会丢失高层语义；只看 CRD 会丢失底层失败证据。</p>
-<hr />
-<h2 id="19c9-反模式与-checklist">19c.9 反模式与 Checklist</h2>
-<h3 id="反模式">反模式</h3>
+
+<h3>常用排障命令</h3>
+<pre><code class="language-bash">kubectl get crd | grep -E 'pytorch|ray|mpi|inference'
+kubectl get pytorchjob -n train train-reranker -o yaml
+kubectl describe pytorchjob -n train train-reranker
+kubectl get pod -n train -l training.kubeflow.org/job-name=train-reranker -o wide
+kubectl logs -n kubeflow deploy/training-operator --tail=200
+kubectl get events -n train --sort-by=.lastTimestamp
+kubectl get lease -n training-system   # 查看 leader election 状态</code></pre>
+
+<div class="note"><strong>排障顺序：</strong>先看 CRD status，再看底层对象，再看 Operator 日志。只看 Pod 会丢失高层语义；只看 CRD 会丢失底层失败证据。排障时两层都要看，用 conditions 的 reason 和 message 定位卡点。</div>
+</section>
+
+<!-- ========== §9 反模式 ========== -->
+<section class="section" id="s9">
+<h2>9. 反模式与 Checklist</h2>
+
+<h3>常见反模式</h3>
 <table>
-<thead>
-<tr>
-<th>反模式</th>
-<th>后果</th>
-<th>修正</th>
-</tr>
-</thead>
+<thead><tr><th>反模式</th><th>后果</th><th>修正</th></tr></thead>
 <tbody>
-<tr>
-<td>把 Operator 写成 YAML 渲染器</td>
-<td>Pod 漂移、失败、删除后无法恢复</td>
-<td>实现真正 reconcile，按实际状态收敛</td>
-</tr>
-<tr>
-<td>status 只有 Running/Failed</td>
-<td>用户不知道卡在调度、镜像、模型加载还是应用</td>
-<td>使用 conditions、reason、message、observedGeneration</td>
-</tr>
-<tr>
-<td>控制器覆盖用户和其他控制器字段</td>
-<td>破坏手工修复、HPA、service mesh、平台策略</td>
-<td>用 patch/SSA 管理字段边界</td>
-</tr>
-<tr>
-<td>不设置 ownerReference 和稳定 labels</td>
-<td>无法清理、查询、聚合成本和日志</td>
-<td>所有 managed objects 统一标签和 owner</td>
-</tr>
-<tr>
-<td>finalizer 不幂等</td>
-<td>删除对象永久卡住</td>
-<td>finalizer 只做删除清理，失败可重试并写事件</td>
-</tr>
-<tr>
-<td>失败恢复不分类</td>
-<td>镜像错误、代码错误、节点故障都反复重启</td>
-<td>区分调度、镜像、应用、节点、外部依赖</td>
-</tr>
-<tr>
-<td>CRD 字段直接暴露所有 Pod 细节</td>
-<td>API 难以治理，升级兼容困难</td>
-<td>顶层表达业务语义，template 留给高级场景</td>
-</tr>
-<tr>
-<td>忽略版本矩阵</td>
-<td>升级后旧任务不可读或行为变化</td>
-<td>维护 CRD、Operator、K8s、GPU、调度、框架矩阵</td>
-</tr>
+<tr><td>把 Operator 写成 YAML 渲染器</td><td>Pod 漂移、失败、删除后无法恢复</td><td>实现真正 reconcile，按实际状态收敛</td></tr>
+<tr><td>status 只有 Running/Failed</td><td>用户不知道卡在调度、镜像、模型加载还是应用</td><td>使用 conditions、reason、message、observedGeneration</td></tr>
+<tr><td>控制器用 Update 全量覆盖字段</td><td>破坏手工修复、HPA、service mesh、平台策略</td><td>用 SSA Patch 管理字段边界，声明 field manager</td></tr>
+<tr><td>不设置 ownerReference 和稳定 labels</td><td>无法清理、查询、聚合成本和日志</td><td>所有 managed objects 统一标签和 owner</td></tr>
+<tr><td>finalizer 不幂等</td><td>删除对象永久卡住，无法修复</td><td>finalizer 只做删除清理，失败可重试并写事件</td></tr>
+<tr><td>失败恢复不分类</td><td>镜像错误、代码错误、节点故障都反复重启</td><td>区分调度、镜像、应用、节点、外部依赖</td></tr>
+<tr><td>CRD 字段直接暴露所有 Pod 细节</td><td>API 难以治理，升级兼容困难</td><td>顶层表达业务语义，template 留给高级场景</td></tr>
+<tr><td>忽略版本矩阵</td><td>升级后旧任务不可读或行为变化</td><td>维护 CRD、Operator、K8s、GPU、调度、框架矩阵</td></tr>
 </tbody>
 </table>
-<h3 id="checklist">Checklist</h3>
+
+<h3>生产 Checklist</h3>
 <ul>
-<li>CRD 顶层字段是否表达 AI 语义，而不是简单复制 Pod template？</li>
-<li><code>spec</code> 与 <code>status</code> 的边界是否清楚？</li>
-<li>是否启用了 status subresource？</li>
-<li>status 是否包含
-<code>observedGeneration</code>、conditions、reason、message？</li>
-<li>reconcile 是否幂等，是否能处理重复事件和中途失败？</li>
-<li>底层对象是否有 ownerReference、稳定 labels 和可查询 selector？</li>
-<li>finalizer 是否只处理删除清理，且幂等、可超时、可重试？</li>
-<li>失败策略是否区分可恢复、不可恢复和需要人工介入？</li>
-<li>是否接入 queue/gang/priority/quota，而不是让多 worker
-训练裸跑？</li>
-<li>Operator 是否有最小 RBAC、leader election、metrics、events
-和告警？</li>
-<li>CRD 升级是否测试旧对象、新对象、回滚和 conversion？</li>
-<li>平台 UI 是否基于 conditions 展示原因，而不是只展示 phase？</li>
+  <li>CRD 顶层字段是否表达 AI 语义，而不是简单复制 Pod template？</li>
+  <li><code>spec</code> 与 <code>status</code> 的边界是否清楚？是否启用了 status subresource？</li>
+  <li>status 是否包含 <code>observedGeneration</code>、conditions、reason、message？</li>
+  <li>reconcile 是否幂等，是否能处理重复事件和中途失败？</li>
+  <li>底层对象是否有 ownerReference、稳定 labels 和可查询 selector？</li>
+  <li>finalizer 是否只处理删除清理，且幂等、可超时、可重试？</li>
+  <li>失败策略是否区分可恢复、不可恢复和需要人工介入？</li>
+  <li>是否接入 queue/gang/priority/quota，而不是让多 worker 训练裸跑？</li>
+  <li>Operator 是否有最小 RBAC、leader election、metrics、events 和告警？</li>
+  <li>CRD 升级是否测试旧对象、新对象、回滚和 conversion？</li>
+  <li>Operator 是否用 SSA Patch，而不是全量 Update？</li>
+  <li>平台 UI 是否基于 conditions 展示原因，而不是只展示 phase？</li>
 </ul>
-<hr />
-<h2 id="19c10-worked-example8-节点-pytorch-训练的控制面设计">19c.10
-Worked Example：8 节点 PyTorch 训练的控制面设计</h2>
-<h3 id="场景">场景</h3>
+</section>
+
+<!-- ========== §10 Worked Example ========== -->
+<section class="section" id="s10">
+<h2>10. Worked Example：8 节点 PyTorch 训练的控制面设计</h2>
+
+<h3>场景</h3>
 <p>团队要训练一个 reranker，需求如下：</p>
 <ul>
-<li>8 个节点，每节点 8 张 H100，总计 64 GPU。</li>
-<li>必须所有 worker 同时启动，否则 rendezvous 会超时。</li>
-<li>允许节点故障后从最近 checkpoint 全局重启，最多 3 次。</li>
-<li>训练结束后保留失败 Pod 证据，成功后清理运行中 Pod。</li>
-<li>平台要在 UI 上展示“等待队列准入”“等待 GPU”“训练中”“从 checkpoint
-恢复”等状态。</li>
+  <li>8 个节点，每节点 8 张 H100，总计 64 GPU。</li>
+  <li>必须所有 worker 同时启动，否则 rendezvous 会超时。</li>
+  <li>允许节点故障后从最近 checkpoint 全局重启，最多 3 次。</li>
+  <li>训练结束后保留失败 Pod 证据，成功后清理运行中 Pod。</li>
+  <li>平台要在 UI 上展示"等待队列准入""等待 GPU""训练中""从 checkpoint 恢复"等状态。</li>
 </ul>
-<h3 id="设计">设计</h3>
-<p>选择对象：</p>
+
+<h3>设计决策</h3>
 <table>
-<thead>
-<tr>
-<th>需求</th>
-<th>设计</th>
-</tr>
-</thead>
+<thead><tr><th>需求</th><th>设计</th></tr></thead>
 <tbody>
-<tr>
-<td>PyTorch 分布式语义</td>
-<td>使用 PyTorchJob</td>
-</tr>
-<tr>
-<td>64 GPU 整体准入</td>
-<td>接入 Kueue Workload 或 Volcano PodGroup</td>
-</tr>
-<tr>
-<td>全局失败恢复</td>
-<td>failurePolicy 设置为 AllWorkers restart，配合 checkpoint</td>
-</tr>
-<tr>
-<td>状态展示</td>
-<td>Operator 写 conditions，平台聚合 Pod events</td>
-</tr>
-<tr>
-<td>删除清理</td>
-<td>ownerReference 清理 Pod，finalizer 释放 queue admission 和
-checkpoint lease</td>
-</tr>
+<tr><td>PyTorch 分布式语义</td><td>使用 PyTorchJob（kubeflow.org/v1）</td></tr>
+<tr><td>64 GPU 整体准入</td><td>接入 Kueue Workload 或 Volcano PodGroup，gang=8×8</td></tr>
+<tr><td>全局失败恢复</td><td>failurePolicy 设置为 AllWorkers restart，配合 checkpoint</td></tr>
+<tr><td>状态展示</td><td>Operator 写 conditions，平台聚合 Pod events</td></tr>
+<tr><td>删除清理</td><td>ownerReference 清理 Pod，finalizer 释放 queue admission 和 checkpoint lease</td></tr>
 </tbody>
 </table>
-<p>控制路径：</p>
-<pre class="text"><code>TrainingJob/PyTorchJob submitted
-  -&gt; admission injects queue, labels, tolerations, runtimeClass
-  -&gt; Operator creates Workload/PodGroup
-  -&gt; Queue admits only when 8x8 H100 fit
-  -&gt; Operator creates master/worker Pods and rendezvous Service
-  -&gt; Scheduler binds all Pods
-  -&gt; Pods start torchrun
-  -&gt; Operator observes replica status and writes Running
-  -&gt; failure triggers global restart and checkpoint resume</code></pre>
-<h3 id="状态设计">状态设计</h3>
-<div class="sourceCode" id="cb17"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">status</span><span class="kw">:</span></span>
-<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">observedGeneration</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
-<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">phase</span><span class="kw">:</span><span class="at"> Admitting</span></span>
-<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">conditions</span><span class="kw">:</span></span>
-<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> QueueAdmitted</span></span>
-<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;False&quot;</span></span>
-<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> WaitingForGangResources</span></span>
-<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">message</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;requires 8 nodes with 8 H100 each in queue h100-prod&quot;</span></span>
-<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> PodsReady</span></span>
-<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;False&quot;</span></span>
-<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> NotCreated</span></span>
-<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> CheckpointReady</span></span>
-<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;True&quot;</span></span>
-<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> LatestCheckpointFound</span></span>
-<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">message</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;s3://checkpoints/reranker/v42/step-18400&quot;</span></span></code></pre></div>
-<h3 id="故障演练">故障演练</h3>
-<p>故障：5 个 worker Running，3 个 worker Pending，训练卡在
-rendezvous。</p>
-<p>证据：</p>
-<div class="sourceCode" id="cb18"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get pod <span class="at">-n</span> train <span class="at">-l</span> training.kubeflow.org/job-name=reranker-v42 <span class="at">-o</span> wide</span>
-<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> describe pytorchjob <span class="at">-n</span> train reranker-v42</span>
-<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get events <span class="at">-n</span> train <span class="at">--sort-by</span><span class="op">=</span>.lastTimestamp</span></code></pre></div>
-<p>根因：没有 gang 准入，调度器先绑定了部分 Pod，剩余 3 个 Pod 因 GPU
-形状不足 Pending。对 PyTorch 非 elastic
-训练而言，部分启动没有业务意义。</p>
-<p>处理：</p>
-<ol type="1">
-<li>为任务创建 Workload/PodGroup，要求 8 个 8-GPU worker 整体准入。</li>
-<li>未准入前不创建训练 Pod，或让 Pod 处于 gated 状态。</li>
-<li>status 写 <code>QueueAdmitted=False</code>，reason 为
-<code>WaitingForGangResources</code>。</li>
-<li>释放已占用但无法成组的 Pod，避免 GPU 被半个任务长时间占住。</li>
+
+<h3>控制路径</h3>
+<pre class="mermaid">flowchart TD
+  A[用户提交 PyTorchJob] --> B[Admission Webhook\n注入 queue/labels/tolerations/runtimeClass]
+  B --> C[Training Operator\n创建 Kueue Workload / PodGroup]
+  C --> D{Queue 准入?}
+  D -->|等待| E[status: Admitting\nQueueAdmitted=False\nWaitingForGangResources]
+  D -->|准入通过| F[Operator 创建 master+worker Pod\n+ rendezvous Service]
+  F --> G[Scheduler 绑定全部 8x8 Pod\ngang 必须全部成功]
+  G --> H[Pod 启动 torchrun\nrendezvous 完成]
+  H --> I[Operator 写 Running\nPodsReady=True]
+  I --> J{Worker 失败?}
+  J -->|节点故障| K[全局 restart\n从 checkpoint 恢复]
+  K --> H
+  J -->|重试超限| L[status: Failed\n保留 Pod 证据]
+  I -->|训练完成| M[status: Succeeded\n清理 Running Pod]
+</pre>
+
+<h3>Status 设计示例</h3>
+<pre><code class="language-yaml">status:
+  observedGeneration: 3
+  phase: Admitting
+  conditions:
+    - type: QueueAdmitted
+      status: "False"
+      reason: WaitingForGangResources
+      message: "requires 8 nodes with 8 H100 each in queue h100-prod"
+    - type: PodsReady
+      status: "False"
+      reason: NotCreated
+    - type: CheckpointReady
+      status: "True"
+      reason: LatestCheckpointFound
+      message: "s3://checkpoints/reranker/v42/step-18400"</code></pre>
+
+<h3>故障演练：部分 worker Pending</h3>
+<p><strong>故障：</strong>5 个 worker Running，3 个 worker Pending，训练卡在 rendezvous。</p>
+<pre><code class="language-bash">kubectl get pod -n train -l training.kubeflow.org/job-name=reranker-v42 -o wide
+kubectl describe pytorchjob -n train reranker-v42
+kubectl get events -n train --sort-by=.lastTimestamp</code></pre>
+<p><strong>根因：</strong>没有 gang 准入，调度器先绑定了部分 Pod，剩余 3 个 Pod 因 GPU 形状不足 Pending。对 PyTorch 非 elastic 训练而言，部分启动没有业务意义。</p>
+<p><strong>处理：</strong></p>
+<ol>
+  <li>为任务创建 Workload/PodGroup，要求 8 个 8-GPU worker 整体准入。</li>
+  <li>未准入前不创建训练 Pod，或让 Pod 处于 gated 状态。</li>
+  <li>status 写 <code>QueueAdmitted=False</code>，reason 为 <code>WaitingForGangResources</code>。</li>
+  <li>释放已占用但无法成组的 Pod，避免 GPU 被半个任务长时间占住。</li>
 </ol>
-<p>这个例子说明，AI Operator 的职责不是少写
-YAML，而是把训练语义传递给调度、状态、恢复和治理系统。</p>
-<hr />
-<h2 id="本章小结">本章小结</h2>
-<p>CRD 让 AI 语义进入 Kubernetes API，Operator 通过 reconciliation loop
-把这些语义持续落实到底层对象。高质量的 AI Operator 必须处理 spec/status
-边界、幂等控制、状态机、ownerReference、finalizer、失败恢复、版本兼容、观测和治理。</p>
-<p>TorchJob、RayJob、MPIJob、InferenceService 的核心价值不是包装
-Pod，而是把 rank、driver、launcher、revision、traffic、checkpoint
-和恢复策略变成平台可解释、可审计、可自动化的控制面能力。</p>
-<h2 id="练习题">练习题</h2>
-<ol type="1">
-<li>为什么说 Operator 不是 Helm
-的替代品？请从运行时漂移和失败恢复两个角度解释。</li>
-<li>设计一个 <code>TrainingJob</code> status，至少包含 5 个
-conditions，并说明每个 condition 对用户有什么价值。</li>
-<li>一个 PyTorchJob 删除后卡在 Terminating，你会按什么顺序检查
-finalizer、Operator 日志和外部资源？</li>
-<li>RayJob 的 Pod 全部 Running，但任务失败。为什么不能只根据 Pod
-状态判断 RayJob 成功？</li>
-<li>选择一个你熟悉的模型服务场景，说明 InferenceService 比 Deployment
-多表达了哪些生产语义。</li>
+<div class="success"><strong>核心结论：</strong>AI Operator 的职责不是少写 YAML，而是把训练语义传递给调度、状态、恢复和治理系统。一个能正确表达"等待 gang 准入"而不是"Pod Pending"的 status，就能让平台 UI 显示有意义的信息，让运维人员快速定位问题，让自动化系统做出正确决策。</div>
+</section>
+
+<!-- ========== refbox ========== -->
+<section class="refbox">
+<h2>参考资料与延伸阅读</h2>
+
+<h3>学习路线</h3>
+<ol>
+  <li>基础：<a href="../part6/19a-kubernetes-ai-workloads.html">第 19a 章 · AI 工作负载对象建模</a>——先理解 Pod/Job/Deployment 的原生语义。</li>
+  <li>调度：<a href="../part6/19b-gpu-scheduling-and-topology.html">第 19b 章 · GPU 调度与拓扑感知</a>——理解 gang 调度、Kueue、Volcano 如何配合 Operator 工作。</li>
+  <li>本章（19c）：CRD + Operator + AI 特定 CRD 的语义和控制面设计。</li>
+  <li>排障：<a href="../part6/19d-kubernetes-ai-troubleshooting.html">第 19d 章 · Kubernetes AI 排障 SOP</a>——把本章知识应用到实际故障场景。</li>
 </ol>
 
+<h3>延伸阅读</h3>
+<ul>
+  <li><a href="https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/" target="_blank">Kubernetes 官方文档：Custom Resources</a></li>
+  <li><a href="https://github.com/kubeflow/training-operator" target="_blank">Kubeflow Training Operator（TorchJob/MPIJob 源码）</a></li>
+  <li><a href="https://github.com/ray-project/kuberay" target="_blank">KubeRay（RayJob/RayCluster 源码）</a></li>
+  <li><a href="https://github.com/kserve/kserve" target="_blank">KServe（InferenceService 源码）</a></li>
+  <li><a href="https://github.com/kubernetes-sigs/lws" target="_blank">LeaderWorkerSet（LWS 源码，多机推理推荐 CRD）</a></li>
+  <li><a href="https://github.com/kubernetes-sigs/controller-runtime" target="_blank">controller-runtime（Operator 开发框架）</a></li>
+  <li><a href="https://kubernetes.io/docs/reference/using-api/server-side-apply/" target="_blank">Server-Side Apply 官方文档</a></li>
+  <li><a href="https://book.kubebuilder.io/" target="_blank">Kubebuilder Book：Operator 开发完整指南</a></li>
+  <li><a href="https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/" target="_blank">CRD 版本与 Conversion Webhook 官方文档</a></li>
+</ul>
 </section>
+
 <nav class="bottomnav"></nav>
-<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+
+<footer class="footer">
+  <p>AI Infra 教程 · 第 19c 章 · AI CRD 与 Operator</p>
+</footer>
 </main>
+
 <script src="../assets/tutorial-data.js"></script>
 <script src="../assets/mermaid.min.js"></script>
 <script src="../assets/nav.js"></script>

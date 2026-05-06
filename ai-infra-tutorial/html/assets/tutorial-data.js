@@ -1,5 +1,15 @@
 const TUTORIAL = [
   {
+    "part": "开始之前",
+    "chapters": [
+      {
+        "id": "preface",
+        "title": "前言：如何使用本教程",
+        "path": "preface.html"
+      }
+    ]
+  },
+  {
     "part": "Part 0 · 体系结构基础",
     "chapters": [
       {

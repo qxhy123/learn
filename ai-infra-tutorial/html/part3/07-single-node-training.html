@@ -14,17 +14,26 @@
 <h1>第 7 章 · 单机训练系统</h1>
 <p class="sub">建立训练 step、数据供给、显存预算、精度策略、效率指标和单机可复现 baseline。</p>
 <div class="chips"><span class="chip">Single Node</span><span class="chip">Step Time</span><span class="chip">HBM</span><span class="chip">AMP</span><span class="chip">MFU/HFU</span></div>
+<div class="note"><strong>不可化简的问题：</strong>如何在一台有限资源的机器上，以可复现、可观测、可解释的方式，把数据流持续转化为参数更新。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 -> 推 -> 绘 -> 导（详见 §1）。先把单机闭环做成可审计证据，再进入 <a href="08-data-parallel.html">第8章</a> 的数据并行扩展。</div>
 </section>
-<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#2-概念边界是什么不是什么相邻概念边界">2.
-概念边界：是什么、不是什么、相邻概念边界</a></li><li><a class="anchor" href="#3-架构控制路径数据路径状态路径故障路径">3.
-架构：控制路径、数据路径、状态路径、故障路径</a></li><li><a class="anchor" href="#4-原理从-step-time显存和效率指标推导机制">4. 原理：从 step
-time、显存和效率指标推导机制</a></li><li><a class="anchor" href="#5-amp--bf16--fp8-工程取舍">5. AMP / BF16 / FP8 工程取舍</a></li><li><a class="anchor" href="#6-框架实现pytorch-knobs-and-constraints">6. 框架实现：PyTorch
-knobs and constraints</a></li><li><a class="anchor" href="#7-工程化落地配置版本矩阵准入preflight发布观测治理">7.
-工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</a></li><li><a class="anchor" href="#8-容量与效率公式模型和边界">8. 容量与效率：公式、模型和边界</a></li><li><a class="anchor" href="#9-故障排除症状证据根因动作">9.
-故障排除：症状、证据、根因、动作</a></li><li><a class="anchor" href="#10-方案设计--worked-examplellama-7b-on-8xh100">10. 方案设计 /
-Worked Example：LLaMA-7B on 8xH100</a></li><li><a class="anchor" href="#11-反模式">11. 反模式</a></li><li><a class="anchor" href="#12-checklistsingle-node-baseline-acceptance-checklist">12.
-Checklist：single-node baseline acceptance checklist</a></li><li><a class="anchor" href="#13-本章小结">13. 本章小结</a></li><li><a class="anchor" href="#14-练习题">14. 练习题</a></li></ol></section>
-<section class="section">
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">第一性原理拆解：单机训练系统</a></li>
+<li><a class="anchor" href="#s2">概念边界：是什么、不是什么、相邻概念边界</a></li>
+<li><a class="anchor" href="#s3">架构：控制路径、数据路径、状态路径、故障路径</a></li>
+<li><a class="anchor" href="#s4">原理：从 step time、显存和效率指标推导机制</a></li>
+<li><a class="anchor" href="#s5">AMP / BF16 / FP8 工程取舍</a></li>
+<li><a class="anchor" href="#s6">框架实现：PyTorch knobs and constraints</a></li>
+<li><a class="anchor" href="#s7">工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</a></li>
+<li><a class="anchor" href="#s8">容量与效率：公式、模型和边界</a></li>
+<li><a class="anchor" href="#s9">故障排除：症状、证据、根因、动作</a></li>
+<li><a class="anchor" href="#s10">方案设计 / Worked Example：LLaMA-7B on 8xH100</a></li>
+<li><a class="anchor" href="#s11">反模式</a></li>
+<li><a class="anchor" href="#s12">Checklist：single-node baseline acceptance checklist</a></li>
+<li><a class="anchor" href="#s13">本章小结</a></li>
+<li><a class="anchor" href="#s14">练习题</a></li>
+</ol></section>
+<section class="section" id="s1">
 <blockquote>
 <p>分布式训练之前，先把单机训练讲清楚。单机不是 demo
 阶段，而是训练系统最小、最便宜、最可解释的生产基线。</p>
@@ -38,8 +47,8 @@ href="../part2/05-memory-interconnect-io.html">第5章</a>
 对主机内存、PCIe/NVLink、存储和 page cache 的解释。</p>
 </blockquote>
 <hr />
-<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
-<h3 id="11-不可化简的问题">1.1 不可化简的问题</h3>
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解：单机训练系统</h2>
+<h3 id="11-不可化简的问题">拆 — 不可化简的问题</h3>
 <p>单机训练要解决的最小问题不是“让 GPU 跑起来”，而是：</p>
 <blockquote>
 <p>如何在一台有限资源的机器上，以可复现、可观测、可解释的方式，把数据流持续转化为参数更新。</p>
@@ -64,7 +73,7 @@ step、checkpoint。</li>
 上。单机阶段的价值在于变量少：没有跨节点网络，没有 collective
 退化，没有调度系统造成的拓扑差异，也没有大规模 rank
 failure。它是所有训练系统的测量原点。</p>
-<h3 id="12-从不可化简问题推导机制">1.2 从不可化简问题推导机制</h3>
+<h3 id="12-从不可化简问题推导机制">推 — 从这个问题如何推导出每个机制</h3>
 <p>从“数据持续转化为参数更新”出发，可以推导出本章所有机制：</p>
 <ol type="1">
 <li>必须拆 training step path，否则“训练慢”无法诊断。</li>
@@ -76,7 +85,55 @@ occupancy、MFU、HFU、tokens/s，否则会把“硬件忙”误判成“训练
 <li>必须建立 profiler chain，否则无法把症状映射到证据。</li>
 <li>必须做单机 baseline acceptance，否则多机扩展没有参照物。</li>
 </ol>
-<h3 id="13-学习大纲">1.3 学习大纲</h3>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((单机训练系统))
+    根问题
+      有限资源
+      数据转参数更新
+      可复现
+      可观测
+    Step Path
+      Dataset Read
+      CPU Pipeline
+      H2D
+      Forward
+      Backward
+      Optimizer
+    资源账本
+      HBM
+      SM Tensor Core
+      Page Cache
+      Pinned Memory
+      CUDA Allocator
+    状态账本
+      Parameters
+      Gradients
+      Optimizer State
+      RNG
+      Sampler Cursor
+      optimizer_step
+      microstep_idx
+    精度策略
+      BF16 Baseline
+      FP16 GradScaler
+      FP8 Metadata
+    效率口径
+      raw sequence slots
+      compute tokens
+      non-pad tokens
+      loss tokens
+      MFU HFU
+    排障证据
+      torch profiler
+      Nsight
+      DCGM
+      iostat perf
+    交付物
+      Preflight
+      Checkpoint Resume
+      Evidence Package</pre>
+<h3 id="13-学习大纲">导 — 读完本章你应该能回答</h3>
 <p>读完本章，你应该能够回答：</p>
 <ul>
 <li>一个完整 training step 从 dataset read 到 checkpoint
@@ -94,6 +151,8 @@ Compute、DCGM、<code>iostat</code>、<code>perf</code> 串起证据链。</li>
 baseline，计算显存、吞吐、MFU/HFU，并定位瓶颈。</li>
 </ul>
 <hr />
+</section>
+<section class="section" id="s2">
 <h2 id="2-概念边界是什么不是什么相邻概念边界">2.
 概念边界：是什么、不是什么、相邻概念边界</h2>
 <h3 id="21-是什么">2.1 是什么</h3>
@@ -105,8 +164,7 @@ policy、日志策略。</li>
 preprocessing、DataLoader worker、collate、pinned memory、H2D。</li>
 <li>计算路径：forward、loss、backward、gradient accumulation、optimizer
 step、AMP/GradScaler、scheduler。</li>
-<li>状态路径：model weights、gradients、optimizer state、RNG、global
-step、dataset cursor、checkpoint metadata。</li>
+<li>状态路径：model weights、gradients、optimizer state、RNG、<code>optimizer_step</code>、<code>microstep_idx</code>、dataset cursor、checkpoint metadata。</li>
 <li>故障路径：OOM、NaN、DataLoader hang、I/O stall、H2D stall、kernel
 inefficiency、checkpoint stall。</li>
 </ul>
@@ -194,6 +252,8 @@ data parallel size</td>
 </tbody>
 </table>
 <hr />
+</section>
+<section class="section" id="s3">
 <h2 id="3-架构控制路径数据路径状态路径故障路径">3.
 架构：控制路径、数据路径、状态路径、故障路径</h2>
 <h3 id="31-责任边界">3.1 责任边界</h3>
@@ -220,29 +280,45 @@ memory、H2D、AMP、logging、checkpoint
     participant S as Storage / Dataset Shard
     participant PC as Linux Page Cache
     participant W as DataLoader Worker
-    participant H as Host RAM / Pinned Memory
+    participant Q as Worker Result Queue
+    participant P as Pin Memory Thread
+    participant H as Pinned Host Batch
     participant C as CUDA Copy Stream
     participant G as GPU Compute Stream
+    participant A as Accumulation State
     participant O as Optimizer / Scheduler
     participant L as Logger
-    participant CK as Checkpoint Writer
+    participant CK as Checkpoint Capture / Writer
 
     S-&gt;&gt;PC: read sample bytes or mmap pages
     PC--&gt;&gt;W: cache hit or block on disk/network
     W-&gt;&gt;W: decode/tokenize/augment/filter
-    W-&gt;&gt;H: collate batch in pageable memory
-    H-&gt;&gt;H: pin memory when pin_memory=True
-    H-&gt;&gt;C: enqueue non_blocking H2D copy
-    C-&gt;&gt;G: device batch ready event
-    G-&gt;&gt;G: AMP autocast forward
-    G-&gt;&gt;G: loss compute and reduction
-    G-&gt;&gt;G: backward, save/recompute activations
-    G-&gt;&gt;O: gradients ready
-    O-&gt;&gt;O: unscale/clip/update AdamW/scheduler
-    O-&gt;&gt;G: zero_grad or set_to_none
-    O-&gt;&gt;L: emit metrics every N steps
-    O-&gt;&gt;CK: save model/optimizer/RNG/dataloader state
-    CK-&gt;&gt;S: write checkpoint shards and metadata</pre>
+    W-&gt;&gt;Q: collate batch into bounded result queue
+    Q--&gt;&gt;P: main process consumes next CPU batch
+    P-&gt;&gt;H: pin pages when pin_memory=True
+    H-&gt;&gt;C: enqueue non_blocking H2D copy on copy stream
+    C--&gt;&gt;G: record device-batch-ready event
+    G-&gt;&gt;G: wait event, then AMP autocast forward
+    G-&gt;&gt;G: loss compute, mask, reduction
+    G-&gt;&gt;A: backward accumulates gradients for microstep_idx
+    alt not accumulation boundary
+        A-&gt;&gt;G: keep gradients resident for next microstep
+    else optimizer-step boundary
+        A-&gt;&gt;O: gradients ready for optimizer_step
+        O-&gt;&gt;O: unscale/clip/update AdamW/scheduler
+        O-&gt;&gt;G: zero_grad or set_to_none
+        O-&gt;&gt;L: emit metrics without forcing per-step sync
+        O-&gt;&gt;CK: capture state after stream fence
+        CK-&gt;&gt;S: write checkpoint shards and metadata
+    end</pre>
+<p>这条时间线要按 producer-consumer trace 读，而不是按串行伪代码读：</p>
+<ul>
+<li>DataLoader worker 是 producer，<code>worker_result_queue</code> 是有界队列。队列为空会让训练主线程 visible wait；队列长期满则说明 GPU/主线程消费慢，继续加 worker 没意义。</li>
+<li><code>pin_memory=True</code> 通常由主进程侧 pin-memory thread 把 pageable batch 迁移到 pinned host pages。pinned memory 过量会挤压普通 DRAM 和 page cache。</li>
+<li>H2D copy 应放在 dedicated copy stream；compute stream 只等待“这个 batch ready”的 event，不应全局 <code>torch.cuda.synchronize()</code>。</li>
+<li><code>microstep_idx</code> 每做一次 forward/backward 就递增；<code>optimizer_step</code> 只在 gradient accumulation boundary 且 optimizer update 真正执行后递增。</li>
+<li>checkpoint capture fence 是状态一致性边界：默认只在 optimizer-step boundary，等相关 compute/copy stream 对本次 update 可见后，捕获 model/optimizer/scheduler/RNG/data cursor 等状态。checkpoint 写盘可以异步，但被写出的快照必须来自同一个边界。</li>
+</ul>
 <h3 id="33-控制路径">3.3 控制路径</h3>
 <p>控制路径的输入是训练配置，输出是可重复的 step
 序列。生产上至少要固定：</p>
@@ -305,9 +381,24 @@ socket 连接的 PCIe root complex 送 GPU。</li>
 <li>AMP GradScaler state，FP16 训练尤其需要。</li>
 <li>RNG state：Python、NumPy、PyTorch CPU、PyTorch CUDA。</li>
 <li>dataset sampler state 和 consumed token/sample cursor。</li>
-<li>global step、epoch、microstep。</li>
+<li><code>optimizer_step</code>、<code>microstep_idx</code>、epoch。</li>
 <li>framework metadata，例如 FSDP/DDP wrapper、dtype policy、checkpoint
 schema。</li>
+</ul>
+<p><code>microstep_idx</code> 和 <code>optimizer_step</code> 不能混用：</p>
+<ul>
+<li><code>microstep_idx</code>：每消费一个 microbatch 并执行一次 forward/backward 后递增。它对应 DataLoader 进度、gradient accumulation substep 和 profiling 里的 microstep 时间。</li>
+<li><code>optimizer_step</code>：只在 accumulation boundary、梯度检查通过、optimizer update 和 scheduler update 完成后递增。它对应 LR schedule、checkpoint interval、训练曲线横轴和恢复一致性。</li>
+<li>如果 FP16 <code>GradScaler</code> 发现 overflow 并跳过 <code>optimizer.step()</code>，这次 microstep 已经发生，但 <code>optimizer_step</code> 不应递增；否则 tokens/s 看起来正常，实际 update 数会错。</li>
+</ul>
+<p>默认 checkpoint 只应在 optimizer-step boundary 保存。若系统支持 mid-accum checkpoint，必须额外保存：</p>
+<ul>
+<li>accumulated gradients 或可恢复的 gradient accumulation buffer。</li>
+<li><code>grad_accum_substep = microstep_idx % grad_accum_steps</code>。</li>
+<li>sampler cursor、streaming shard offset、worker base seed。</li>
+<li>packing residual buffer，例如上一个样本切分后尚未放入 packed sequence 的 token 尾巴。</li>
+<li>AMP <code>GradScaler</code> state，包括 scale、growth tracker、found_inf 相关状态。</li>
+<li>FP8 amax/scale metadata，包括 amax history、current scale、scale inverse 和 recipe 版本。</li>
 </ul>
 <p>即使本章聚焦单机，也要把 checkpoint
 当成恢复协议，而不是文件保存动作。否则第10章讨论的恢复一致性无法建立。</p>
@@ -327,6 +418,8 @@ schema。</li>
 <p>不要直接从症状跳到“加 worker”“降 batch”“开
 AMP”。这些动作会改变多个资源账本，容易把问题挪走而不是解决。</p>
 <hr />
+</section>
+<section class="section" id="s4">
 <h2 id="4-原理从-step-time显存和效率指标推导机制">4. 原理：从 step
 time、显存和效率指标推导机制</h2>
 <h3 id="41-step-time-模型">4.1 Step time 模型</h3>
@@ -516,9 +609,8 @@ MFU、HFU、GPU utilization、SM occupancy、tokens/s 边界</h3>
 <tbody>
 <tr>
 <td>tokens/s</td>
-<td>单位时间处理多少训练 token</td>
-<td>padding 多时会高估有效数据进展，需区分 raw tokens 和 non-pad
-tokens</td>
+<td>单位时间处理多少 token 或槽位</td>
+<td>必须拆成 <code>raw_sequence_slots/s</code>、<code>compute_tokens/s</code>、<code>non_pad_tokens/s</code>、<code>loss_tokens/s</code></td>
 </tr>
 <tr>
 <td>GPU utilization</td>
@@ -568,7 +660,34 @@ $$</span></p>
 <p>如果开启 activation checkpointing，反向会重算部分 forward：</p>
 <pre class="text"><code>HFU may increase while MFU and tokens/s stay flat or decrease</code></pre>
 <p>原因是硬件执行了更多 FLOPs，但每个 token 的有效训练进展没有增加。</p>
+<h3 id="48-tokenflops-账本rawcomputenon-padloss">4.8 Token/FLOPs 账本：raw、compute、non-pad、loss</h3>
+<p>训练吞吐必须先定义分母。一个 batch 里至少有四种 token 口径：</p>
+<table>
+<thead>
+<tr><th>名称</th><th>定义</th><th>典型来源</th><th>用途</th></tr>
+</thead>
+<tbody>
+<tr><td><code>raw_sequence_slots</code></td><td>固定 shape 中的 token 槽位数</td><td><code>B_mu * S * N_gpu</code>，optimizer step 再乘 <code>G_accum</code></td><td>H2D、activation shape、dense kernel shape 的账本</td></tr>
+<tr><td><code>padding_slots</code></td><td>padding 槽位数</td><td><code>(attention_mask == 0).sum()</code> 或 packing metadata</td><td>衡量 padding waste</td></tr>
+<tr><td><code>non_pad_tokens</code></td><td>非 padding token 数</td><td><code>attention_mask.sum()</code> 或 packed token count</td><td>数据吞吐、样本进展</td></tr>
+<tr><td><code>compute_tokens</code></td><td>实际执行主要模型 FLOPs 的 token 数</td><td>由 kernel 输入 shape 和 compaction 策略决定</td><td>HFU、硬件 FLOPs 账本</td></tr>
+<tr><td><code>loss_tokens</code></td><td>参与 loss reduction 的 label 数</td><td><code>(labels != -100).sum()</code>，注意 causal shift 后统计</td><td>loss 分母、SFT 有效监督量</td></tr>
+</tbody>
+</table>
+<pre class="text"><code>packing_efficiency = non_pad_tokens / raw_sequence_slots
+loss_efficiency = loss_tokens / non_pad_tokens</code></pre>
+<p>关键边界是：mask 不等于跳过计算。普通 padded dense Transformer 中，即使 <code>attention_mask</code> 阻止 pad token 被 attend，MLP/linear/norm 仍通常在 <code>[B, S, H]</code> 上执行。因此常见默认是：</p>
+<pre class="text"><code>compute_tokens = raw_sequence_slots</code></pre>
+<p>如果声称 <code>compute_tokens &lt; raw_sequence_slots</code>，必须说明具体机制：sequence packing、unpadding/compaction、varlen FlashAttention 或 full compacted block。SFT 和 instruction tuning 还要单独说明 loss 分母；若 prompt token 被 mask 成 <code>labels=-100</code>，必须报告 <code>loss_tokens/s</code>。</p>
+<pre class="text"><code>raw_sequence_slots/s = raw_sequence_slots / time
+compute_tokens/s = compute_tokens / time
+non_pad_tokens/s = non_pad_tokens / time
+loss_tokens/s = loss_tokens / time
+MFU denominator = non_pad_tokens/s or loss_tokens/s, explicitly stated
+HFU denominator = compute_tokens/s plus recompute/optimizer/extra FLOPs, explicitly stated</code></pre>
 <hr />
+</section>
+<section class="section" id="s5">
 <h2 id="5-amp--bf16--fp8-工程取舍">5. AMP / BF16 / FP8 工程取舍</h2>
 <h3 id="51-amp-是策略不是魔法开关">5.1 AMP 是策略，不是魔法开关</h3>
 <p>AMP 的工程含义是：</p>
@@ -676,6 +795,8 @@ norm、overflow、MFU/HFU、checkpoint 可恢复性。</li>
 <li>FP8 失败时回退 BF16 必须是配置级回滚，而不是改代码热修。</li>
 </ul>
 <hr />
+</section>
+<section class="section" id="s6">
 <h2 id="6-框架实现pytorch-knobs-and-constraints">6. 框架实现：PyTorch
 knobs and constraints</h2>
 <h3 id="61-pytorch-dataloader--amp--training-loop-示例">6.1 PyTorch
@@ -986,6 +1107,8 @@ eval。</li>
 <code>torch.profiler</code> 和 Nsight Systems 找到阶段，再对具体 kernel
 做 Nsight Compute。</p>
 <hr />
+</section>
+<section class="section" id="s7">
 <h2 id="7-工程化落地配置版本矩阵准入preflight发布观测治理">7.
 工程化落地：配置、版本矩阵、准入、preflight、发布、观测、治理</h2>
 <h3 id="71-配置分层">7.1 配置分层</h3>
@@ -1177,6 +1300,8 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href=
 <p>这些不是审计形式主义。没有这些信息，事故复盘会退化成“当时好像改过
 batch”。</p>
 <hr />
+</section>
+<section class="section" id="s8">
 <h2 id="8-容量与效率公式模型和边界">8. 容量与效率：公式、模型和边界</h2>
 <h3 id="81-effective-batch">8.1 Effective batch</h3>
 <p>单机或单节点多 GPU 的有效 batch：</p>
@@ -1269,6 +1394,8 @@ subtotal = 78.0 GiB</code></pre>
 <p>这也是为什么单节点 8xH100 worked example 会选择 FSDP/ZeRO-style state
 sharding 作为训练基线，而不是朴素 DDP。</p>
 <hr />
+</section>
+<section class="section" id="s9">
 <h2 id="9-故障排除症状证据根因动作">9.
 故障排除：症状、证据、根因、动作</h2>
 <h3 id="91-troubleshooting-table">9.1 Troubleshooting table</h3>
@@ -1430,6 +1557,8 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href=
 <span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-skip</span> 20 <span class="at">--launch-count</span> 10 <span class="dt">\</span></span>
 <span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>  python train.py <span class="at">--max-steps</span> 30</span></code></pre></div>
 <hr />
+</section>
+<section class="section" id="s10">
 <h2 id="10-方案设计--worked-examplellama-7b-on-8xh100">10. 方案设计 /
 Worked Example：LLaMA-7B on 8xH100</h2>
 <h3 id="101-目标">10.1 目标</h3>
@@ -1761,6 +1890,8 @@ class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb33-1"><a href=
 </ul>
 <p>没有这些证据，不应进入多节点扩展。</p>
 <hr />
+</section>
+<section class="section" id="s11">
 <h2 id="11-反模式">11. 反模式</h2>
 <h3 id="111-把-nvidia-smi-当成效率分析">11.1 把 nvidia-smi
 当成效率分析</h3>
@@ -1820,6 +1951,8 @@ jitter。</p>
 checkpoint、不稳定 FP8 recipe
 或过度依赖本地手工缓存，进入多机后会付出更高成本。</p>
 <hr />
+</section>
+<section class="section" id="s12">
 <h2 id="12-checklistsingle-node-baseline-acceptance-checklist">12.
 Checklist：single-node baseline acceptance checklist</h2>
 <h3 id="121-配置与版本">12.1 配置与版本</h3>
@@ -1903,6 +2036,8 @@ type="checkbox" />单机瓶颈已归类为数据、H2D、kernel、optimizer、ch
 证据包可供第8章和第9章复用。</label></li>
 </ul>
 <hr />
+</section>
+<section class="section" id="s13">
 <h2 id="13-本章小结">13. 本章小结</h2>
 <p>单机训练不是规模小的训练，而是训练系统的最小闭环。它把数据路径、计算路径、状态路径和故障路径放在一台机器里，让工程师可以用最低成本建立因果链。</p>
 <p>本章的核心结论：</p>
@@ -1926,6 +2061,8 @@ checkpoint resume，再进入多节点扩展。</li>
 <p>单机基线不是“先跑一下”，而是训练基础设施的第一份可审计证据。</p>
 </blockquote>
 <hr />
+</section>
+<section class="section" id="s14">
 <h2 id="14-练习题">14. 练习题</h2>
 <ol type="1">
 <li>给定一个 13B 模型、BF16 参数、AdamW FP32 m/v、8x80GB GPU，估算 DDP
@@ -1954,6 +2091,23 @@ checkpoint，而不是 DataLoader 或 kernel？</li>
 目录结构，要求能支持一个新工程师复现你的结论。</li>
 </ol>
 
+</section>
+<section class="refbox" id="s15">
+<h2>参考资料与学习路线</h2>
+<h3>学习路线</h3>
+<ol>
+<li>先用 §1-§3 建立单机 training step 的资源闭环：数据、传输、计算、状态和故障路径。</li>
+<li>再用 §4-§5 拆显存、token/FLOPs 和精度口径，避免把 GPU busy 误判成训练有效。</li>
+<li>用 §6-§9 把 PyTorch/FSDP、profile chain、preflight 和 troubleshooting 固化成证据链。</li>
+<li>最后用 §10 worked example 与 §12 checklist 产出可供 <a href="08-data-parallel.html">第8章</a> 复用的单机 evidence package。</li>
+</ol>
+<h3>延伸阅读</h3>
+<ul>
+<li>PyTorch Profiler、DistributedSampler、FSDP 与 AMP 官方文档。</li>
+<li>NVIDIA Nsight Systems / Nsight Compute / DCGM 文档。</li>
+<li>NVIDIA Transformer Engine FP8 recipe 与 mixed precision 训练资料。</li>
+<li>Megatron-LM / DeepSpeed 关于 MFU、HFU、activation checkpointing 和 sharded checkpoint 的工程说明。</li>
+</ul>
 </section>
 <nav class="bottomnav"></nav>
 <footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>

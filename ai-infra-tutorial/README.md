@@ -64,6 +64,8 @@
 
 本仓库以 Markdown 源稿为唯一事实来源。教程正文链接应指向 `.md` 文件；`html/` 目录是发布构建产物，不作为改稿依据。除非章节专门说明浏览器访问方式，正文不应把生成的 `.html` 文件作为内部章节链接。
 
+公开发布源稿范围包括：`README.md` 发布为 `html/index.html`，`00-preface.md` 发布为 `html/preface.html`，以及 `part*/` 与 `appendix/` 下的教程正文。`docs/superpowers/` 是内部工作说明，SPEC archive 是归档资料，二者不进入公开发布内容。
+
 后续改稿必须先更新 Markdown，再由构建流程生成 HTML。检查内部链接时，以 Markdown 文件是否存在为准。
 
 ---
@@ -308,7 +310,7 @@ cd html && python3 -m http.server 8000
 HTML 版本特点：
 
 - 浅色 paper 风格，每章独立文件
-- 左侧 sidebar 可视化全 31 章导航
+- 左侧 sidebar 可视化完整章节导航（含前言、Part 0-8 与附录）
 - mermaid 图表 + 手工 SVG 流程图
 - 所有内容与 Markdown 版本同步
 

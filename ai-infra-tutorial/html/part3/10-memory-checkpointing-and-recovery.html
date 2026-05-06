@@ -12,19 +12,28 @@
 <nav class="topnav"></nav>
 <section class="hero">
 <h1>第 10 章 · 内存优化、Checkpoint 与恢复</h1>
-<p class="sub">把显存优化、checkpoint schema、RPO/RTO、TorchElastic 和故障恢复统一成可靠性控制面。</p>
-<div class="chips"><span class="chip">Checkpoint</span><span class="chip">RPO/RTO</span><span class="chip">TorchElastic</span><span class="chip">FP8</span><span class="chip">Recovery</span></div>
+<p class="sub">长训练不是一次跑完的程序，而是持续数天到数月的分布式状态机。本章把显存优化、checkpoint schema、true resume、RPO/RTO、TorchElastic、NCCL hang 和 straggler detection 放进同一个可靠性控制面。</p>
+<div class="chips"><span class="chip">Checkpoint</span><span class="chip">True Resume</span><span class="chip">RPO/RTO</span><span class="chip">TorchElastic</span><span class="chip">FP8</span><span class="chip">Recovery</span></div>
+<div class="note"><strong>不可化简的问题：</strong>训练状态大到无法完整复制在每张 GPU 上，运行时间长到一定会遇到 GPU、网络、存储、节点、调度器或代码发布失败；系统必须能把完整状态保存、验证、发布为可恢复事实，并在失败后 fail-closed 地恢复。</div>
+<div class="success"><strong>本章学习地图：</strong>拆 → 推 → 绘 → 导（详见 §1）。先从显存状态和恢复协议的共同根因出发，再落到 checkpoint schema、atomic visibility、async backlog、TorchElastic 和千卡事故恢复。</div>
 </section>
-<section class="toc"><h2>本章目录</h2><ol><li><a class="anchor" href="#1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</a></li><li><a class="anchor" href="#2-概念边界是什么不是什么相邻概念边界">2.
-概念边界：是什么、不是什么、相邻概念边界</a></li><li><a class="anchor" href="#3-架构控制路径数据路径状态路径故障路径">3.
-架构：控制路径、数据路径、状态路径、故障路径</a></li><li><a class="anchor" href="#4-原理从不可化简的问题推导机制">4.
-原理：从不可化简的问题推导机制</a></li><li><a class="anchor" href="#5-checkpoint-作为恢复协议">5. Checkpoint 作为恢复协议</a></li><li><a class="anchor" href="#6-容量与效率rporto-和-checkpoint-cost">6. 容量与效率：RPO/RTO 和
-checkpoint cost</a></li><li><a class="anchor" href="#7-框架实现knobs约束与配置示例">7.
-框架实现：knobs、约束与配置示例</a></li><li><a class="anchor" href="#8-工程化落地准入发布观测治理">8.
-工程化落地：准入、发布、观测、治理</a></li><li><a class="anchor" href="#9-故障排除">9. 故障排除</a></li><li><a class="anchor" href="#10-方案设计--worked-example千卡训练中断恢复">10. 方案设计 /
-Worked Example：千卡训练中断恢复</a></li><li><a class="anchor" href="#11-反模式">11. 反模式</a></li><li><a class="anchor" href="#12-checkpoint-and-recovery-production-readiness-checklist">12.
-Checkpoint and Recovery Production Readiness Checklist</a></li><li><a class="anchor" href="#13-本章小结">13. 本章小结</a></li><li><a class="anchor" href="#14-练习题">14. 练习题</a></li></ol></section>
-<section class="section">
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#s1">1. 第一性原理拆解：内存优化、Checkpoint 与恢复</a></li>
+<li><a class="anchor" href="#s2">2. 概念边界：是什么、不是什么、相邻概念边界</a></li>
+<li><a class="anchor" href="#s3">3. 架构：控制路径、数据路径、状态路径、故障路径</a></li>
+<li><a class="anchor" href="#s4">4. 原理：从不可化简的问题推导机制</a></li>
+<li><a class="anchor" href="#s5">5. Checkpoint 作为恢复协议</a></li>
+<li><a class="anchor" href="#s6">6. 容量与效率：RPO/RTO 和 checkpoint cost</a></li>
+<li><a class="anchor" href="#s7">7. 框架实现：knobs、约束与配置示例</a></li>
+<li><a class="anchor" href="#s8">8. 工程化落地：准入、发布、观测、治理</a></li>
+<li><a class="anchor" href="#s9">9. 故障排除</a></li>
+<li><a class="anchor" href="#s10">10. Worked Example：千卡训练中断恢复</a></li>
+<li><a class="anchor" href="#s11">11. 反模式</a></li>
+<li><a class="anchor" href="#s12">12. Checkpoint and Recovery Production Readiness Checklist</a></li>
+<li><a class="anchor" href="#s13">13. 本章小结</a></li>
+<li><a class="anchor" href="#s14">14. 练习题</a></li>
+</ol></section>
+<section class="section" id="s1">
 <blockquote>
 <p>长训练任务不是“一次跑完”的程序，而是一个持续数天到数月的分布式状态机。本章把显存优化、checkpoint、恢复、TorchElastic、NCCL
 hang 和 straggler detection 放在同一个可靠性控制面里讨论。</p>
@@ -35,15 +44,9 @@ hang 和 straggler detection 放在同一个可靠性控制面里讨论。</p>
 TP/PP/CP/FSDP/ZeRO
 等并行策略。第10章关注这些策略如何被保存、验证、恢复和治理。</p>
 </blockquote>
-<hr />
-<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解 + 学习大纲</h2>
-<h3 id="11-不可化简的问题">1.1 不可化简的问题</h3>
-<p>训练系统最小的事实不是“模型很大”，而是：</p>
-<blockquote>
-<p>训练是一个长时间运行的状态转移过程；状态大到无法完整复制在每张 GPU
-上，运行时间长到一定会遇到
-GPU、网络、存储、节点、调度器或代码发布失败。</p>
-</blockquote>
+<h2 id="1-第一性原理拆解--学习大纲">1. 第一性原理拆解：内存优化、Checkpoint 与恢复</h2>
+<h3>拆 — 不可化简的问题</h3>
+<p>训练系统最小的事实不是“模型很大”，而是：训练是一个长时间运行的状态转移过程；状态大到无法完整复制在每张 GPU 上，运行时间长到一定会遇到 GPU、网络、存储、节点、调度器或代码发布失败。</p>
 <p>如果只看模型权重，checkpoint
 像一个文件保存问题；如果看完整训练状态，checkpoint
 是恢复协议。它必须回答：</p>
@@ -70,7 +73,60 @@ HBM 但增加重算；offload 降低 GPU 常驻状态但增加 PCIe/NVMe
 checkpoint；FP8 降低激活和通信体积但引入 scale/amax 状态；allocator
 fragmentation 不改变数学模型，却能让“理论可放下”的作业实际
 OOM。每个省显存动作都会改变恢复协议和故障面。</p>
-<h3 id="12-学习大纲">1.2 学习大纲</h3>
+<h3>推 — 从这个问题如何推导出每个机制</h3>
+<p><strong>显存控制</strong>来自状态不可复制：参数、梯度、optimizer slot、激活、通信 bucket、checkpoint staging 和 allocator cache 共同决定峰值。activation checkpointing 用重算换 HBM，offload 用 PCIe/NVMe 慢路径换容量，FSDP/ZeRO 用复杂状态布局换单卡可承载规模，mixed precision/FP8 用 dtype 和 scale state 换吞吐与显存。</p>
+<p><strong>checkpoint schema</strong>来自状态必须可机器验证：model params、optimizer、scheduler、precision state、RNG、dataset cursor、global step、parallel metadata、code/config identity 都要进入 manifest。只保存 <code>model.state_dict()</code> 是 warm start，不是 true resume。</p>
+<p><strong>atomic visibility</strong>来自半成品不能被恢复路径看到：rank-owned writer 可以并发写 shard，但必须先 tmp/prefix 写入、校验 checksum 和 logical tensor identity，再通过 POSIX rename 或 object-store generation/CAS 更新 <code>latest.json</code>。manifest 的对象状态是 <code>writing/validated/failed/quarantined</code>；是否可恢复由 pointer record 表达。</p>
+<p><strong>恢复编排</strong>来自分布式状态必须重新对齐：TorchElastic 只能重建 worker group，不能替系统决定 TP/PP/CP/EP/FSDP/ZeRO 是否可变。恢复流程必须从 latest pointer 读起，验证 support matrix、process groups、logical tensor map、optimizer slot、RNG、dataset cursor、FP8 scale 和 tied storage；失败时 quarantine 当前候选并回退 previous validated，而不是静默 warm start。</p>
+<p><strong>RPO/RTO</strong>来自故障一定发生：RPO 只能按 <code>last_validated_capture_step</code> 计算，不能按“开始 capture”的时间算。async checkpoint 能降低训练 pause，却引入 staging memory、flush backlog、post-publish barrier 和 preemption grace period 的治理问题。</p>
+<div class="warn"><strong>工程边界：</strong>任何把 checkpoint 当作文件目录、把 Elastic 当作自动缩扩容、把 capture 当作可恢复点、或把 warm start 伪装成 true resume 的实现，都会在长任务事故里制造无法解释的 loss、LR、数据游标和优化器轨迹。</div>
+<h3>绘 — 因果链路</h3>
+<pre class="mermaid">mindmap
+  root((内存优化与恢复协议))
+    根事实
+      状态巨大
+      长时间运行
+      故障必然发生
+      分布式一致性
+    显存控制
+      Activation checkpointing
+      Offload
+      FSDP和ZeRO
+      Mixed precision
+      FP8 scale和amax
+      Fragmentation
+    Checkpoint schema
+      Model params
+      Optimizer slots
+      Scheduler
+      RNG
+      Dataset cursor
+      Parallel metadata
+      Logical tensor identity
+    发布可见性
+      tmp prefix
+      manifest validated
+      latest pointer
+      CAS generation
+      retention
+    恢复算法
+      Rendezvous
+      Support matrix
+      Logical tensor map
+      Restore validation
+      Quarantine fallback
+    容量效率
+      RPO
+      RTO
+      Async backlog
+      Preemption
+    故障证据
+      NCCL hang
+      Storage p99
+      Loss jump
+      Straggler
+      Xid ECC</pre>
+<h3>导 — 读完本章你应该能回答</h3>
 <p>读完本章，你应该能回答：</p>
 <ol type="1">
 <li>activation checkpoint、offload、optimizer state sharding、mixed
@@ -87,7 +143,8 @@ mismatch、straggler 的证据链怎么收敛。</li>
 <li>千卡训练中断后，如何从告警、rank 状态、NCCL 日志、checkpoint
 metadata、存储指标和调度事件推导恢复方案。</li>
 </ol>
-<hr />
+</section>
+<section class="section" id="s2">
 <h2 id="2-概念边界是什么不是什么相邻概念边界">2.
 概念边界：是什么、不是什么、相邻概念边界</h2>
 <h3 id="21-是什么">2.1 是什么</h3>
@@ -155,7 +212,8 @@ writer ownership、restore layout 和故障恢复复杂度。</li>
 </tr>
 </tbody>
 </table>
-<hr />
+</section>
+<section class="section" id="s3">
 <h2 id="3-架构控制路径数据路径状态路径故障路径">3.
 架构：控制路径、数据路径、状态路径、故障路径</h2>
 <h3 id="31-责任边界">3.1 责任边界</h3>
@@ -281,15 +339,19 @@ accumulation、parallel layout 是否变化。</li>
 
     Running --&gt; FailureDetected: rank exit / NCCL hang / preemption
     FailureDetected --&gt; QuiesceGroup: kill or drain worker group
-    QuiesceGroup --&gt; SelectCheckpoint: choose latest validated
-    SelectCheckpoint --&gt; PreflightRestore: schema + versions + storage + topology
-    PreflightRestore --&gt; RestoreShards: map shards to ranks
+    QuiesceGroup --&gt; Rendezvous: get world + rank map
+    Rendezvous --&gt; ReadLatestPointer: step + manifest checksum + CAS generation
+    ReadLatestPointer --&gt; PreflightRestore: manifest status validated + schema + config + framework
+    PreflightRestore --&gt; SupportMatrix: elastic axes + global batch + parallelism
+    SupportMatrix --&gt; RestoreShards: process groups + logical tensor map
     RestoreShards --&gt; ValidateState: params + optim + RNG + cursor + metadata
     ValidateState --&gt; ResumeTraining: step continuity ok
     ValidateState --&gt; RestoreFailed: mismatch
-    RestoreFailed --&gt; SelectCheckpoint: fallback previous checkpoint
+    RestoreFailed --&gt; Quarantine: mark bad candidate
+    Quarantine --&gt; ReadLatestPointer: fallback previous validated
     ResumeTraining --&gt; Running</pre>
-<hr />
+</section>
+<section class="section" id="s4">
 <h2 id="4-原理从不可化简的问题推导机制">4.
 原理：从不可化简的问题推导机制</h2>
 <h3 id="41-显存预算不是权重预算">4.1 显存预算不是权重预算</h3>
@@ -463,7 +525,21 @@ class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a hr
 tensor。</li>
 <li>避免在 hot path 中反复创建不同大小的临时 tensor。</li>
 </ul>
-<hr />
+<h3 id="47-step-timeline显存优化和-checkpoint-capture-交界">4.7 step timeline：显存优化和 checkpoint capture 交界</h3>
+<p>checkpoint capture 只能发生在训练状态稳定的边界上。activation checkpointing、offload、FSDP、FP8 和 allocator 策略都会改变“状态何时稳定”的判断：</p>
+<pre class="text"><code>microbatch fetch
+  -&gt; forward: checkpoint 只保留边界激活，FSDP/TP 可能 AllGather 参数，FP8 记录 amax
+  -&gt; backward: checkpoint segment 重算，梯度 bucket / ReduceScatter 完成
+  -&gt; optimizer step: params、optimizer slots、master weights 更新完成
+  -&gt; scheduler / GradScaler / FP8 scale update
+  -&gt; dataset cursor commit: consumed tokens、next sample、packing residual 固化
+  -&gt; StepCommitted: global_step=N 的 true-resume 状态稳定
+  -&gt; FenceStreams: training/NCCL/FSDP/copy/offload stream 全部 fenced
+  -&gt; SnapshotStaged: sharded state_dict、RNG、cursor、precision state 进入 staging
+  -&gt; TrainMayAdvance: staging 生命周期由 writer future 持有，训练可以进入 N+1</code></pre>
+<div class="note"><strong>capture 边界：</strong>activation checkpointing 保存的是重算策略，不保存 activation 本身；FSDP/ZeRO 的稳定状态是 sharded param、sharded grad/optimizer slot 和可逆 flat param map；optimizer offload 还在 update/prefetch/evict 时不能 capture；FP8 的 amax/scale/recipe 更新属于 step committed 状态。</div>
+</section>
+<section class="section" id="s5">
 <h2 id="5-checkpoint-作为恢复协议">5. Checkpoint 作为恢复协议</h2>
 <h3 id="51-checkpoint-schema">5.1 checkpoint schema</h3>
 <p>一个生产 checkpoint schema 至少包含：</p>
@@ -487,7 +563,7 @@ tensor。</li>
       scaler.pt
       tokenizer.json
       train_config.yaml
-  latest -&gt; step_00120000</code></pre>
+  latest.json</code></pre>
 <p><code>manifest.json</code> 应包含机器可验证字段：</p>
 <table>
 <thead>
@@ -527,7 +603,7 @@ tensor。</li>
 </tr>
 <tr>
 <td><code>files[]</code></td>
-<td>path、size、sha256、tensor_count、dtype summary</td>
+<td>path、size、sha256、tensor_count、dtype summary，以及 sharded tensor index</td>
 </tr>
 <tr>
 <td><code>created_by</code></td>
@@ -535,10 +611,40 @@ tensor。</li>
 </tr>
 <tr>
 <td><code>status</code></td>
-<td><code>writing</code>、<code>validated</code>、<code>published</code></td>
+<td><code>writing</code>、<code>validated</code>、<code>failed</code>、<code>quarantined</code>；发布不写进 manifest status，而由 <code>latest.json</code> pointer record 表达</td>
 </tr>
 </tbody>
 </table>
+<p>本章统一使用这个语义：<code>writing</code> 表示对象还在写，<code>validated</code> 表示对象本身已完整且校验通过，<code>failed</code> 表示写入或校验失败，<code>quarantined</code> 表示曾经被选作恢复候选但恢复校验失败。<code>published</code> 不是 manifest 的终态；某个 checkpoint 是否对恢复可见，只看 <code>latest.json</code> 或同等 pointer record 是否以 CAS/generation 条件指向它。</p>
+<p>对 ZeRO/FSDP，<code>files[]</code> 不能只列文件。manifest 还需要逻辑 tensor identity index，使恢复流程不依赖物理 rank 文件名：</p>
+<pre><code>{
+  "path": "ranks/rank_000032/model.safetensors",
+  "bytes": 1073741824,
+  "sha256": "sha256:...",
+  "tensor_count": 128,
+  "dtype_summary": {"bfloat16": 96, "float32": 32},
+  "logical_tensors": [{
+    "canonical_name": "model.embed_tokens.weight",
+    "param_uuid": "p-7f2c...",
+    "global_shape": [32000, 8192],
+    "dtype": "bfloat16",
+    "shard_offsets": [4096, 0],
+    "shard_shape": [1024, 8192],
+    "flat_param_id": "fsdp_flat_embeddings",
+    "flat_param_range": [33554432, 41943040],
+    "optimizer_slot": null,
+    "param_group_id": 3,
+    "tied_to": ["lm_head.weight"],
+    "shared_storage_id": "shared-embed-lm-head"
+  }]
+}</code></pre>
+<ul>
+<li><code>canonical_name</code> 是跨 rank、跨进程稳定的参数名；不能用本次运行的 Python object id。</li>
+<li><code>param_uuid</code> 是由模型初始化/导入阶段生成并持久化的参数身份，用于处理重命名和 shared parameter。</li>
+<li><code>flat_param_id</code>、<code>flat_param_range</code> 描述 FSDP flatten 后的原始参数区间。</li>
+<li><code>optimizer_slot</code> 区分 <code>param</code>、<code>grad</code>、<code>exp_avg</code>、<code>exp_avg_sq</code>、<code>master_weight</code> 等状态。</li>
+<li><code>tied_to</code>、<code>shared_storage_id</code> 明确 tied embedding、shared projection 等关系，恢复后必须重新建立 alias，而不是复制成两份独立 tensor。</li>
+</ul>
 <h3 id="52-保存内容true-resume-最小集合">5.2 保存内容：true resume
 最小集合</h3>
 <table>
@@ -568,12 +674,12 @@ tensor。</li>
 <tr>
 <td>RNG</td>
 <td>dropout、数据增强、采样轨迹变化</td>
-<td>CPU/CUDA/worker seed</td>
+<td>CPU/CUDA/per-DP-rank sampler/worker seed</td>
 </tr>
 <tr>
 <td>dataset cursor</td>
 <td>重复或跳过样本</td>
-<td>epoch、offset、consumed samples/tokens</td>
+<td>per-DP-rank sampler state、streaming offsets、packing residual、worker seeds、grad accumulation substep</td>
 </tr>
 <tr>
 <td>global step</td>
@@ -595,7 +701,69 @@ tensor。</li>
 <p>如果只保存 model params，这叫 warm start。warm start
 可以用于迁移训练、微调或发布权重，但不能声称 RPO 等于 checkpoint
 间隔，也不能解释 optimizer 连续性。</p>
-<h3 id="53-writer-ownership">5.3 writer ownership</h3>
+<p>dataset cursor 建议使用显式 schema，而不是只保存一个全局 offset：</p>
+<pre><code>{
+  "dataset_cursor": {
+    "dataset_version": "pretrain_mix_2026_04_30",
+    "global_consumed_tokens": 184467440737,
+    "global_consumed_samples": 912345678,
+    "gradient_accumulation_substep": 3,
+    "dp_ranks": [{
+      "dp_rank": 0,
+      "sampler_epoch": 12,
+      "sampler_position": 345678,
+      "sampler_rng_state": "base64:...",
+      "streaming_offsets": [{"shard": "s3://bucket/corpus/a.jsonl.zst", "byte_offset": 987654321, "record_index": 123456}],
+      "packing_residual": {"token_ids": [101, 234, 567], "segment_ids": [0, 0, 0], "source_sample_ids": ["doc-9"]},
+      "worker_seeds": {"worker_0": 193847, "worker_1": 193848}
+    }]
+  }
+}</code></pre>
+<p>恢复时必须按 DP rank 重建 sampler partition。若 DP degree 改变，平台要么有确定性的 cursor repartition 逻辑，要么拒绝 true resume；不能只把 <code>global_consumed_tokens</code> 均分给新 rank。</p>
+<h3 id="53-true-resume-restore-algorithm">5.3 true resume restore algorithm</h3>
+<p>true resume 不是“把文件读回来”，而是一组 fail-closed 的校验和加载步骤。恢复入口应该只从 latest pointer 开始，除非用户显式指定某个受保护 checkpoint：</p>
+<pre><code>restore_from_latest:
+  candidates = read_latest_chain(ckpt_dir)
+  for pointer in candidates:
+    verify pointer.kind == "latest"
+    verify pointer.step &gt;= 0
+    verify pointer.manifest_sha256 startswith "sha256:"
+    verify pointer.generation
+
+    manifest = read_json(pointer.manifest_path)
+    verify sha256_json(manifest) == pointer.manifest_sha256
+    verify manifest.status == "validated"
+    verify manifest.global_step == pointer.step
+    verify manifest.rank_count == unique_rank_count(manifest.files)
+
+    rdzv = runtime.rendezvous_world_info()
+    assert_supported_world(
+      saved=manifest.parallelism,
+      current=rdzv.parallelism,
+      elastic_axes=manifest.elastic_axes,
+      support_matrix=manifest.restore_support_matrix,
+      global_batch_policy=job_config.global_batch_policy)
+    assert_schema_config_framework(manifest, job_config, runtime.framework_versions)
+
+    logical_map = build_logical_tensor_map(manifest.files, rdzv.rank, rdzv.parallelism)
+    process_groups = build_process_groups(rdzv, manifest.parallelism)
+    init model/FSDP/FP8 using manifest recipe
+
+    load model params by logical identity
+    load optimizer slots by param_uuid + optimizer_slot + param_group_id
+    restore scheduler, GradScaler, FP8 amax/scale, RNG, dataset cursor, global step
+    validate LR, consumed_tokens, next_sample, tied/shared storage, all-rank digest
+    run restore dry-run or guardrail window
+    return manifest.global_step
+
+    on any failure:
+      quarantine checkpoint sidecar/denylist
+      continue previous validated
+  raise RestoreFailed</code></pre>
+<p>这段伪代码里的关键顺序不能反过来：先读 <code>latest.json</code>，验证 generation/CAS、manifest checksum 和 step；再读 manifest 并要求 <code>status=validated</code>；然后比较 <code>elastic_axes</code>、parallelism、global batch policy 和 support matrix。DP elastic 可以有条件通过；TP/PP/CP/EP、FSDP wrap、ZeRO stage、optimizer param groups、schema/config/framework 不兼容时必须 fail closed。</p>
+<div class="danger"><strong>true resume 底线：</strong>optimizer slot 不能按文件顺序猜，只能按 <code>param_uuid + optimizer_slot + param_group_id</code> 对齐；embedding/lm_head 这类 tied weight 恢复后必须共享 storage；任一 rank 的 restore digest、dataset next sample、LR、FP8 scale 或 tied storage 校验失败，都要 quarantine 当前候选并回退 previous validated。</div>
+<p>MoE 的 true resume 还要额外恢复 expert placement、expert parallel rank map、router bias、router/load-balancing loss 的 moving average、capacity/overflow counters，以及每个 expert optimizer slot 的 logical identity。EP degree 或 expert placement reshape 只能由离线 conversion job 显式生成新 checkpoint；TorchElastic 不应在 worker group restart 时自动尝试 EP reshape。</p>
+<h3 id="54-writer-ownership">5.4 writer ownership</h3>
 <p>三种 writer ownership 模式：</p>
 <table>
 <thead>
@@ -630,15 +798,16 @@ tensor。</li>
 <p>生产默认应倾向 rank-owned sharded checkpoint，加 coordinator
 manifest。发布用 full checkpoint 可以由离线 conversion job 从 sharded
 checkpoint 生成。</p>
-<h3 id="54-atomic-visibility">5.4 atomic visibility</h3>
+<h3 id="55-atomic-visibility">5.5 atomic visibility</h3>
 <p>checkpoint 可见性必须是原子的：</p>
 <ol type="1">
 <li>写入 <code>step_N.tmp/</code>。</li>
-<li>每个 shard fsync 或对象存储完成 multipart commit。</li>
-<li>coordinator 校验 manifest。</li>
-<li>rename <code>step_N.tmp</code> 到 <code>step_N</code>，或写不可变
-prefix 后更新 <code>latest</code> pointer。</li>
-<li><code>latest</code> pointer 更新必须晚于 manifest validated。</li>
+<li>每个 writer 写完 shard 后 <code>fsync(file)</code>，再 <code>fsync(parent_dir)</code>；对象存储路径必须完成 multipart commit，并记录 object generation/version。</li>
+<li>所有 rank 上报写入结果，coordinator 做 all-rank failure aggregation；任一 rank 失败则整个 checkpoint failed。</li>
+<li>coordinator 校验 manifest，并把 <code>capture_time</code>、文件 checksum、generation/CAS token 写入 manifest；此时 manifest 仍为 <code>status=validated</code>。</li>
+<li>POSIX 文件系统上，<code>fsync(step_N.tmp/manifest.json)</code> 和目录后，<code>rename(step_N.tmp, step_N)</code>，再 <code>fsync(ckpt_dir)</code>。</li>
+<li>对象存储上，不使用“目录 rename”假设；写不可变 step prefix，用 <code>latest.json</code> 的 generation/CAS 条件更新暴露版本。</li>
+<li>pointer 更新后执行 post-publish barrier。所有 rank 必须观察到同一个 latest pointer 或同一个失败结果，训练 loop 才能继续把该 step 计入 <code>last_validated_capture_step</code>。</li>
 </ol>
 <p>对象存储没有 POSIX rename 语义时，不要假设目录 rename
 原子。更稳妥的方式是：</p>
@@ -646,11 +815,11 @@ prefix 后更新 <code>latest</code> pointer。</li>
 <li>每个 step prefix 不可变。</li>
 <li><code>manifest.json</code> 包含 <code>status=validated</code>。</li>
 <li><code>latest.json</code> 是小对象，最后写入，包含 step、manifest
-checksum 和 generation id。</li>
+checksum 和 generation id；更新时使用 compare-and-swap 或 generation precondition，避免两个 coordinator 互相覆盖。</li>
 <li>restore 只读取 <code>latest.json</code> 指向且 manifest validated
 的版本。</li>
 </ul>
-<h3 id="55-validation-与-cleanup">5.5 validation 与 cleanup</h3>
+<h3 id="56-validation-与-cleanup">5.6 validation 与 cleanup</h3>
 <p>保存后立即验证：</p>
 <ul>
 <li>shard count 等于 expected writer count。</li>
@@ -670,7 +839,7 @@ checkpoint，避免最新版本恢复失败时没有后退点。</li>
 policy 删除。</li>
 <li>pre-upgrade checkpoint 保护到新版本完成恢复演练。</li>
 </ul>
-<h3 id="56-sharded-checkpoint-与-cross-parallelism-restore">5.6 sharded
+<h3 id="57-sharded-checkpoint-与-cross-parallelism-restore">5.7 sharded
 checkpoint 与 cross-parallelism restore</h3>
 <p>sharded checkpoint 必须让 shard 名称不依赖物理 rank：</p>
 <pre class="text"><code>model.layers.17.attn.q_proj.weight:
@@ -695,7 +864,21 @@ checkpoint 与 cross-parallelism restore</h3>
 <p>工程建议：权重跨并行恢复可以支持；optimizer 跨布局恢复要谨慎。对关键
 pretraining，如果必须恢复 optimizer，应保持 shard schema
 稳定，或提供经过测试的 offline reshard 工具。</p>
-<h3 id="57-async-checkpoint">5.7 async checkpoint</h3>
+<p>支持矩阵建议写进 schema 和 admission policy：</p>
+<table>
+<thead><tr><th>变化</th><th>true resume</th><th>warm start</th><th>offline reshard</th><th>默认动作</th></tr></thead>
+<tbody>
+<tr><td>DP degree 变化，TP/PP/CP/EP/FSDP wrap 不变</td><td>有条件支持：optimizer shard、sampler state、global batch 策略必须可重分配</td><td>支持</td><td>通常不需要</td><td>通过 preflight 后允许</td></tr>
+<tr><td>只替换物理节点，world size 和 rank topology 不变</td><td>支持</td><td>支持</td><td>不需要</td><td>直接 true resume</td></tr>
+<tr><td>TP degree 变化</td><td>通常不支持 optimizer true resume</td><td>支持权重</td><td>需要 tensor reshard</td><td>默认 fail closed</td></tr>
+<tr><td>PP degree 或 layer-to-stage mapping 变化</td><td>通常不支持 optimizer true resume</td><td>支持权重</td><td>需要 layer/stage remap</td><td>默认 fail closed</td></tr>
+<tr><td>FSDP wrap policy、flat param layout 变化</td><td>不支持，除非 flat param map 可逆且版本兼容</td><td>支持权重</td><td>需要 unflatten/reshard</td><td>默认 fail closed</td></tr>
+<tr><td>ZeRO stage 变化</td><td>通常不支持 optimizer true resume</td><td>支持权重</td><td>需要 optimizer state conversion</td><td>默认 fail closed</td></tr>
+<tr><td>EP/MoE expert parallel degree 变化</td><td>通常不支持</td><td>有条件支持权重</td><td>只能 offline conversion 生成新 expert placement</td><td>默认 fail closed；TorchElastic 不自动尝试</td></tr>
+</tbody>
+</table>
+<p>这里的 <code>true resume</code> 表示 model、optimizer、scheduler、precision state、RNG、dataset cursor、global step 全部连续；<code>warm start</code> 表示只把权重作为初始化，optimizer/scheduler/RNG/cursor 重新定义。平台不要在不满足 true resume 的情况下静默降级成 warm start。</p>
+<h3 id="58-async-checkpoint">5.8 async checkpoint</h3>
 <p>async checkpoint 把训练 pause 拆成两段：</p>
 <ul>
 <li>synchronous capture：冻结 step metadata，把 GPU tensor 转移到
@@ -703,6 +886,30 @@ staging buffer 或创建一致视图。</li>
 <li>background flush：writer pool
 写本地盘、并行文件系统或对象存储。</li>
 </ul>
+<p>完整状态机建议写成平台状态，而不是散落在日志里：</p>
+<pre class="text"><code>StepCommitted(N)
+  -&gt; FenceStreams(N)
+  -&gt; SnapshotStaged(N)
+  -&gt; TrainMayAdvance(N, inflight &lt;= max_inflight)
+  -&gt; FlushAttempt(N, k=1)
+  -&gt; Validate(N)
+  -&gt; PublishCAS(N)
+  -&gt; PostPublishBarrier(N)
+  -&gt; last_validated_capture_step = N</code></pre>
+<table>
+<thead><tr><th>状态</th><th>失败/事件</th><th>动作</th></tr></thead>
+<tbody>
+<tr><td><code>FenceStreams</code></td><td>CUDA/NCCL/copy/offload stream event timeout</td><td>标记 capture failed；释放未发布 staging；训练按策略 fail fast 或跳过本次 checkpoint</td></tr>
+<tr><td><code>SnapshotStaged</code></td><td>CPU pinned/NVMe staging 不足</td><td>backpressure：等待最老 in-flight、降低并发或跳过 capture 并记录 RPO 风险</td></tr>
+<tr><td><code>TrainMayAdvance</code></td><td><code>inflight &gt; max_inflight</code> 或 <code>checkpoint_async_backlog</code> high</td><td>阻塞训练直到最老 flush 完成，或进入 degraded mode；不能继续申请无界 staging</td></tr>
+<tr><td><code>FlushAttempt(k)</code></td><td>storage 429/5xx、timeout、multipart abort</td><td>指数退避重试到 <code>k_max</code>；重试期间 checkpoint 仍不可见</td></tr>
+<tr><td><code>Validate</code></td><td>checksum/size/tensor identity/status 校验失败</td><td>manifest 标记 <code>failed</code>，checkpoint quarantine，禁止更新 latest，回退 previous validated</td></tr>
+<tr><td><code>PublishCAS</code></td><td>CAS lost，另一个 coordinator 已更新 latest</td><td>重新读取 latest；若对方 step 更新且 manifest validated，接受较新 pointer；若冲突，当前 step quarantine 并告警</td></tr>
+<tr><td><code>PostPublishBarrier</code></td><td>有 rank 未观察到同一 pointer</td><td>worker group fail closed，从最新 pointer 重新 rendezvous 和 restore</td></tr>
+<tr><td>任意状态</td><td>preemption signal</td><td>若 flush 可在 grace period 内完成则等待；否则停止新 capture，保留 last-good，退出给调度器重启</td></tr>
+</tbody>
+</table>
+<div class="warn"><strong>async 可见性：</strong><code>last_validated_capture_step</code> 只能在 <code>PostPublishBarrier</code> 后更新。<code>SnapshotStaged</code> 或 <code>FlushAttempt</code> 中的 checkpoint 即使包含完整 bytes，也还不是恢复点。</div>
 <p>必须治理的指标：</p>
 <ul>
 <li><code>checkpoint_capture_seconds</code></li>
@@ -723,7 +930,8 @@ last-good。</li>
 <li>async 失败不能只写日志；必须把 checkpoint 标记为 failed，并阻止
 <code>latest</code> 更新。</li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s6">
 <h2 id="6-容量与效率rporto-和-checkpoint-cost">6. 容量与效率：RPO/RTO 和
 checkpoint cost</h2>
 <h3 id="61-checkpoint-成本模型">6.1 checkpoint 成本模型</h3>
@@ -750,17 +958,35 @@ Objective)</strong>：故障后最多可接受丢失多少训练进度。</li>
 <li><strong>RTO (Recovery Time
 Objective)</strong>：从故障检测到恢复训练吞吐达标最多多久。</li>
 </ul>
-<p>如果每 <code>I</code> 分钟保存一次 checkpoint，保存耗时
-<code>T_ckpt</code>，故障检测和重启耗时
-<code>T_restart</code>，恢复加载耗时 <code>T_restore</code>：</p>
-<p><span
-class="math display"><em>R</em><em>P</em><em>O</em><sub><em>w</em><em>o</em><em>r</em><em>s</em><em>t</em></sub> ≈ <em>I</em> + <em>T</em><sub><em>i</em><em>n</em><em>f</em><em>l</em><em>i</em><em>g</em><em>h</em><em>t</em>_<em>l</em><em>o</em><em>s</em><em>s</em></sub></span></p>
+<p>RPO 不能用“开始写 checkpoint 的时间”计算，必须用已验证且已被 pointer 暴露的 checkpoint 计算。定义：</p>
+<ul>
+<li><code>capture_time(step)</code>：训练状态被冻结的时间点，对应该 checkpoint 的 <code>global_step</code>、optimizer step、RNG、dataset cursor。</li>
+<li><code>publish_time(step)</code>：manifest validated 且 <code>latest</code> 或等价 pointer record 原子暴露该 step 的时间点。</li>
+<li><code>last_validated_capture_step(t)</code>：在时间 <code>t</code> 之前已经完成 publish、恢复流程可以读取的最大 capture step。</li>
+<li><code>failed_capture_step</code>：曾经开始 capture 或 flush，但未 validated 或未被 pointer 暴露的 step；它不能参与 RPO 计算。</li>
+</ul>
+<p>如果故障发生在时间 <code>t_fail</code>，以 wall clock 表示：</p>
+<p><span class="math display">$$
+RPO(t_{fail}) =
+t_{fail} - capture\_time(last\_validated\_capture\_step(t_{fail}))
+$$</span></p>
+<p>以训练进度表示：</p>
+<p><span class="math display">$$
+RPO_{steps}(t_{fail}) =
+global\_step(t_{fail}) -
+last\_validated\_capture\_step(t_{fail})
+$$</span></p>
 <p><span
 class="math display"><em>R</em><em>T</em><em>O</em> ≈ <em>T</em><sub><em>d</em><em>e</em><em>t</em><em>e</em><em>c</em><em>t</em></sub> + <em>T</em><sub><em>q</em><em>u</em><em>i</em><em>e</em><em>s</em><em>c</em><em>e</em></sub> + <em>T</em><sub><em>s</em><em>c</em><em>h</em><em>e</em><em>d</em><em>u</em><em>l</em><em>e</em></sub> + <em>T</em><sub><em>r</em><em>e</em><em>s</em><em>t</em><em>o</em><em>r</em><em>e</em></sub> + <em>T</em><sub><em>w</em><em>a</em><em>r</em><em>m</em><em>u</em><em>p</em></sub></span></p>
-<p>例子：每 30 分钟保存，async flush 8 分钟，最多 1 个
-in-flight，故障发生在 flush 未完成时，worst-case RPO 可能接近 60
-分钟，而不是 30 分钟。因为最新 checkpoint 不可见，必须回退到上一个
-validated 版本。</p>
+<table>
+<thead><tr><th>场景</th><th>条件</th><th>可恢复版本</th><th>RPO 直觉</th></tr></thead>
+<tbody>
+<tr><td>no-backlog</td><td><code>T_flush &lt; I</code>，且最新 capture 已被 pointer 暴露</td><td>最新 pointer-visible step</td><td>接近故障到最新 <code>capture_time</code> 的间隔，通常小于 <code>I + T_flush</code></td></tr>
+<tr><td>backlog</td><td><code>T_flush &gt;= I</code> 或 in-flight 达上限，后续 capture 不能及时更新 pointer</td><td>仍然是最后一个 pointer-visible step</td><td>RPO 会随 backlog 增长，可能超过多个保存间隔</td></tr>
+<tr><td>checkpoint failure</td><td>某 step capture/write/validate 失败，未被 pointer 暴露</td><td>跳过失败 step，回退到更早 pointer-visible step</td><td>失败 checkpoint 的 capture 不能降低 RPO</td></tr>
+</tbody>
+</table>
+<p>例子：保存间隔 <code>I=30min</code>，<code>step_A</code> 在 03:00 capture、03:08 更新 latest pointer；<code>step_B</code> 在 03:30 capture、03:38 仍未更新 pointer，03:35 故障。<code>last_validated_capture_step(03:35)=step_A</code>，RPO 是 35 分钟，而不是 5 分钟。如果 <code>step_B</code> 最终 validation failure，03:52 故障时仍只能回到 <code>step_A</code>，RPO 是 52 分钟。</p>
 <h3 id="63-保存间隔选择">6.3 保存间隔选择</h3>
 <p>保存太频繁会浪费吞吐和存储；保存太稀疏会扩大 RPO。一个实用策略：</p>
 <ul>
@@ -772,7 +998,8 @@ window、存储带宽和 RPO 共同决定。</li>
 <li>关键里程碑：按 consumed tokens 保存
 milestone，不参与普通滚动清理。</li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s7">
 <h2 id="7-框架实现knobs约束与配置示例">7.
 框架实现：knobs、约束与配置示例</h2>
 <h3 id="71-pytorch-activation-checkpointing">7.1 PyTorch activation
@@ -989,7 +1216,8 @@ knobs</h3>
 </table>
 <p>版本矩阵要固定到 container image digest，不能只写“PyTorch
 2.x”。checkpoint schema 和分布式 API 在小版本间可能有兼容差异。</p>
-<hr />
+</section>
+<section class="section" id="s8">
 <h2 id="8-工程化落地准入发布观测治理">8.
 工程化落地：准入、发布、观测、治理</h2>
 <h3 id="81-版本矩阵">8.1 版本矩阵</h3>
@@ -1193,7 +1421,8 @@ scheduler event，并把 job 的 RPO/RTO
 <li>checkpoint restore mismatch
 必须阻断恢复，不允许降级成只加载权重，除非用户显式选择 warm start。</li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s9">
 <h2 id="9-故障排除">9. 故障排除</h2>
 <table>
 <thead>
@@ -1281,7 +1510,8 @@ mapping。</li>
 <li>收敛后隔离节点，从 last-good checkpoint
 恢复，保留现场日志做事故复盘。</li>
 </ol>
-<hr />
+</section>
+<section class="section" id="s10">
 <h2 id="10-方案设计--worked-example千卡训练中断恢复">10. 方案设计 /
 Worked Example：千卡训练中断恢复</h2>
 <h3 id="101-背景">10.1 背景</h3>
@@ -1419,7 +1649,8 @@ batch、LR 和 sampler 语义稳定。</li>
 <li>FP8 带来吞吐收益，但恢复必须保存 scale/amax；否则事故后 loss spike
 会难以区分是恢复错误还是正常波动。</li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s11">
 <h2 id="11-反模式">11. 反模式</h2>
 <ul>
 <li><strong>只保存权重却标记为 resume</strong>：恢复后 optimizer 和
@@ -1441,7 +1672,8 @@ backlog</strong>：训练看似不阻塞，实际把失败推迟到存储爆掉�
 <li><strong>elastic 缩容后不记录训练语义变化</strong>：global batch 和
 sampler 改变后，实验不可复现。</li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s12">
 <h2 id="12-checkpoint-and-recovery-production-readiness-checklist">12.
 Checkpoint and Recovery Production Readiness Checklist</h2>
 <ul class="task-list">
@@ -1482,7 +1714,8 @@ data time、comm wait、step p50/p95/p99。</label></li>
 <li><label><input type="checkbox" />每个生产模型至少定期做一次
 checkpoint restore 演练。</label></li>
 </ul>
-<hr />
+</section>
+<section class="section" id="s13">
 <h2 id="13-本章小结">13. 本章小结</h2>
 <p>内存优化解决的是单次 step 能不能在有限 HBM 内完成；checkpoint
 和恢复解决的是数万到数百万 step
@@ -1497,7 +1730,8 @@ restore 都是协议的一部分。TorchElastic 可以重建 worker
 group，但不能替你定义训练语义；NCCL hang 和 straggler
 也不能只靠重启掩盖，必须有 rank 级证据链。可靠的训练平台把失败当常态，把
 last-good checkpoint 当控制面事实来源，把恢复演练当发布门禁。</p>
-<hr />
+</section>
+<section class="section" id="s14">
 <h2 id="14-练习题">14. 练习题</h2>
 <ol type="1">
 <li>一个 70B 模型使用 BF16、AdamW、FSDP full shard，在 64 GPU
