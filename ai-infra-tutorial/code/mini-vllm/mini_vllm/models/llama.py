@@ -57,3 +57,25 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
     q_rot = (q * cos) + (_rotate_half(q) * sin)
     k_rot = (k * cos) + (_rotate_half(k) * sin)
     return q_rot, k_rot
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm
+# ---------------------------------------------------------------------------
+
+class LlamaRMSNorm(nn.Module):
+    """Root-mean-square LayerNorm without bias / mean subtraction.
+    out = (x / rms(x)) * weight,  rms(x) = sqrt(mean(x^2) + eps)
+    """
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Cast to fp32 for the norm to stay numerically stable, then back.
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.variance_epsilon)
+        return (self.weight * x).to(input_dtype)
