@@ -40,6 +40,37 @@ def test_e2e_determinism():
     assert a[0][1] == b[0][1]
 
 
+def test_e2e_chunked_prefill_matches_unchunked():
+    """Chunked prefill must produce identical greedy output to one-shot prefill.
+
+    Use a long prompt and a small `chunked_prefill_size` to force multiple
+    chunks. Run the same model twice (chunked vs unchunked); outputs must be
+    bit-identical.
+    """
+    backend = TorchBackend()
+    model = ToyGPT.random_init(backend, vocab_size=50257, n_layer=2,
+                               d_model=64, n_head=4, max_pos=128, seed=0)
+    tokenizer = TokenizerWrapper.from_pretrained_gpt2()
+    # Prompt long enough that chunking actually triggers.
+    prompts = ["Once upon a time in a faraway kingdom there lived a king who loved cake"]
+    sp = SamplingParams(max_tokens=4, greedy=True)
+
+    eng_unchunked = LLMEngine(model, tokenizer, EngineConfig(
+        model=model.config, cache=CacheConfig(block_size=8, num_gpu_blocks=32),
+        device="cpu", seed=0,
+        enable_chunked_prefill=False))
+    out_un = eng_unchunked.generate(prompts, sp)
+
+    eng_chunked = LLMEngine(model, tokenizer, EngineConfig(
+        model=model.config, cache=CacheConfig(block_size=8, num_gpu_blocks=32),
+        device="cpu", seed=0,
+        enable_chunked_prefill=True, chunked_prefill_size=4))   # tiny chunks
+    out_ch = eng_chunked.generate(prompts, sp)
+
+    assert out_un[0][1] == out_ch[0][1], (out_un[0][1], out_ch[0][1])
+    assert eng_chunked.block_manager.num_free_blocks == eng_chunked.cfg.cache.num_gpu_blocks
+
+
 def test_e2e_continuous_batching_vs_baseline_same_output():
     """Same prompts must produce identical greedy output regardless of whether
     continuous batching is on (Plan 4 default) or off (Plan 1 baseline).

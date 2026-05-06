@@ -25,9 +25,14 @@ class Sequence:
     status: SequenceStatus = SequenceStatus.WAITING
     output_token_ids: List[int] = field(default_factory=list)
     block_table: Optional["BlockTable"] = None
-    # In Plan 4+: number of prompt tokens already prefilled (for chunked prefill).
-    # In Plan 1 it equals num_prompt_tokens after the first prefill step.
+    # Number of prompt tokens already prefilled. In Plan 1-4 (no chunking)
+    # it jumps from 0 to num_prompt_tokens in one step. In Plan 5 chunked
+    # prefill it advances by `scheduled_chunk_len` per step.
     num_prefilled: int = 0
+    # Set by the Scheduler each step: how many prompt tokens to prefill in
+    # the current step. Equal to (num_prompt_tokens - num_prefilled) when
+    # chunked prefill is OFF; capped to chunk_size when ON.
+    scheduled_chunk_len: int = 0
 
     @property
     def num_prompt_tokens(self) -> int:

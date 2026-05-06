@@ -18,10 +18,11 @@ class AttentionBackend(Protocol):
     def prefill(
         self,
         q: torch.Tensor,           # [num_prefill_tokens, num_heads, head_dim]
-        k: torch.Tensor,           # [num_prefill_tokens, num_kv_heads, head_dim]
-        v: torch.Tensor,           # same
-        seq_lens: torch.Tensor,    # [batch] full ctx len after this prefill
-        query_lens: torch.Tensor,  # [batch] tokens being prefilled this step
+        key_cache: torch.Tensor,   # [num_blocks, num_kv_heads, head_dim, block_size]
+        value_cache: torch.Tensor, # same — chunk's K/V already written via reshape_and_cache
+        block_table: torch.Tensor, # [batch, max_blocks] int — blocks holding K/V for [0, seq_len)
+        seq_lens: torch.Tensor,    # [batch] full ctx len AFTER this prefill (= num_prefilled + chunk_len)
+        query_lens: torch.Tensor,  # [batch] tokens being prefilled this step (chunk size)
         scale: float,
     ) -> torch.Tensor:             # [num_prefill_tokens, num_heads, head_dim]
         ...

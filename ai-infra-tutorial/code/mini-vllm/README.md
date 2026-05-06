@@ -5,14 +5,16 @@ to `part5-serving-infra/16a-lab-mini-vllm.md`.
 
 ## Status
 
-**Plan 4 complete.** Engine runs both a toy GPT and TinyLlama-1.1B end-to-end
-on CPU/MPS via the Torch paged-attention backend. Continuous batching with
-token budget; greedy sampling. Parity-tested against HF `transformers` (8/8
-token greedy match on `"The capital of France is"`).
+**Plan 5 complete.** Engine supports continuous batching, chunked prefill,
+prefix caching with copy-on-write, and runs TinyLlama-1.1B end-to-end on
+CPU/MPS via the Torch paged-attention backend. Parity-tested against HF
+`transformers` (8/8 token greedy match), and bit-identical output across
+chunked vs unchunked prefill.
 
-Setting `EngineConfig(enable_continuous_batching=False)` reverts to the
-Plan 1 baseline (no admission while running queue is non-empty) for
-benchmark comparison.
+Each feature is a flag on `EngineConfig`:
+  `enable_continuous_batching`, `enable_chunked_prefill`,
+  `enable_prefix_caching`, `enable_swap` (Plan 6, not yet).
+Set any to `False` for benchmark comparison against the prior baseline.
 
 ## Install
 
@@ -40,7 +42,7 @@ TinyLlama-1.1B (downloads ~2.2 GB on first run, slow on CPU):
 - [ ] Plan 2: Triton paged-attention kernel (deferred — needs GPU machine)
 - [x] Plan 3: TinyLlama-1.1B + HF safetensors loader
 - [x] Plan 4: continuous batching (chunked prefill rolled into Plan 5 — shared kernel)
-- [ ] Plan 5: prefix caching + CoW + chunked prefill
+- [x] Plan 5: prefix caching + CoW + chunked prefill
 - [ ] Plan 6: swap to CPU + preemption
 - [ ] Plan 7: streaming + full sampler (temperature/top-p/top-k) + bench
 - [ ] Plan 8: tutorial chapter `16a-lab-mini-vllm.md`

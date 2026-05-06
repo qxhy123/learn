@@ -32,11 +32,15 @@ class LLMEngine:
         self.model = model
         dtype = _DTYPES[cfg.model.dtype]
         self.cache_engine = CacheEngine(cfg.model, cfg.cache, cfg.device, dtype)
-        self.block_manager = BlockManager(cfg.cache.num_gpu_blocks, cfg.cache.block_size)
+        self.block_manager = BlockManager(
+            cfg.cache.num_gpu_blocks, cfg.cache.block_size,
+            enable_prefix_caching=cfg.enable_prefix_caching)
         self.scheduler = Scheduler(
             self.block_manager,
             max_num_batched_tokens=cfg.max_num_batched_tokens,
             enable_continuous_batching=cfg.enable_continuous_batching,
+            enable_chunked_prefill=cfg.enable_chunked_prefill,
+            chunked_prefill_size=cfg.chunked_prefill_size,
         )
         self.runner = ModelRunner(model, self.cache_engine, self.block_manager, cfg.device)
         self.sampler = Sampler()
@@ -57,17 +61,33 @@ class LLMEngine:
         if not sched.prefill_seqs and not sched.decode_seqs:
             return []
         logits = self.runner.execute(sched.prefill_seqs, sched.decode_seqs)
-        # Order in logits: prefill_seqs (one row each, last-position) then decode_seqs
-        all_seqs = sched.prefill_seqs + sched.decode_seqs
-        params = [s.sampling_params for s in all_seqs]
-        tokens = self.sampler.sample(logits, params)
+
+        # Tokens are sampled only for seqs whose prefill COMPLETES this step
+        # (chunk reaches end of prompt) plus all decode seqs. A seq still in
+        # mid-chunk-prefill produces no logit row this step.
+        sampled_seqs: List[Sequence] = [
+            s for s in sched.prefill_seqs
+            if s.num_prefilled + s.scheduled_chunk_len == s.num_prompt_tokens
+        ]
+        sampled_seqs.extend(sched.decode_seqs)
+
+        # Advance prefill progress for ALL prefill seqs (whether they finished
+        # this step or not). Then schedule sees them in the right state next step.
+        for seq in sched.prefill_seqs:
+            seq.num_prefilled += seq.scheduled_chunk_len
+            # Register newly-filled blocks for prefix-cache reuse.
+            self.block_manager.register_filled_blocks(seq)
+        # Decode steps may also fill a block (when seq_len % block_size == 0).
+        for seq in sched.decode_seqs:
+            self.block_manager.register_filled_blocks(seq)
 
         outputs: List[StepOutput] = []
-        for seq in sched.prefill_seqs:
-            self.scheduler.mark_prefilled(seq)
-        for seq, tok in zip(all_seqs, tokens):
-            seq.append_token(tok)
-            outputs.append(StepOutput(seq.request_id, tok, seq.is_finished()))
+        if sampled_seqs:
+            params = [s.sampling_params for s in sampled_seqs]
+            tokens = self.sampler.sample(logits, params)
+            for seq, tok in zip(sampled_seqs, tokens):
+                seq.append_token(tok)
+                outputs.append(StepOutput(seq.request_id, tok, seq.is_finished()))
         self.scheduler.free_finished()
         return outputs
 

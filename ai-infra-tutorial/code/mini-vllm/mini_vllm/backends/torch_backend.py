@@ -22,9 +22,11 @@ class TorchBackend:
             key_cache[block_ids[n], :, :, offsets[n]] = key[n]
             value_cache[block_ids[n], :, :, offsets[n]] = value[n]
 
-    def prefill(self, q, k, v, seq_lens, query_lens, scale):
-        # In Plan 1, prefill computes attention on the fresh K/V only (no prefix cache).
-        return reference_prefill(q, k, v, seq_lens, query_lens, scale)
+    def prefill(self, q, key_cache, value_cache, block_table, seq_lens, query_lens, scale):
+        # Plan 5: prefill reads K/V from cache (chunk's K/V already written).
+        # Causal mask within the new chunk; cached prefix fully visible.
+        return reference_prefill(q, key_cache, value_cache, block_table,
+                                 seq_lens, query_lens, scale)
 
     def decode(self, q, key_cache, value_cache, block_table, context_lens, scale):
         # Plan 1 uses the reference implementation as the production decode kernel.
