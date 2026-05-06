@@ -16,6 +16,13 @@ class TokenizerWrapper:
         tk = Tokenizer.from_pretrained("gpt2")
         return cls(tk)
 
+    @classmethod
+    def from_pretrained_llama(cls, repo_id: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+                              ) -> "TokenizerWrapper":
+        # TinyLlama ships a fast tokenizer.json directly loadable by `tokenizers`.
+        tk = Tokenizer.from_pretrained(repo_id)
+        return cls(tk)
+
     def encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text).ids
 
