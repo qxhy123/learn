@@ -47,7 +47,7 @@ class EngineConfig:
     # Set to False to opt back into the prior baseline (for benchmarks).
     enable_continuous_batching: bool = True   # Plan 4
     enable_chunked_prefill: bool = True       # Plan 5
-    enable_prefix_caching: bool = False       # Plan 5 (in progress)
+    enable_prefix_caching: bool = True        # Plan 5
     enable_swap: bool = False                 # Plan 6
     max_num_batched_tokens: int = 2048
     chunked_prefill_size: int = 512

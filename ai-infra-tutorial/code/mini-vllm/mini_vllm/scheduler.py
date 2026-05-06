@@ -99,10 +99,11 @@ class Scheduler:
         if can_admit:
             while self.waiting and budget > 0:
                 seq = self.waiting[0]
-                # Decide chunk size before allocating.
-                # When chunked prefill is OFF, we require the FULL prompt fits the
-                # budget; partial admission is forbidden.
-                remaining = seq.num_prompt_tokens
+                # Account for prefix-cache hits (Plan 5 prefix caching): tokens
+                # in matched cached blocks need no compute, so chunk_len is
+                # measured against the UNCACHED remainder.
+                cached_tokens = self.bm.cached_prefix_tokens(seq.prompt_token_ids)
+                remaining = seq.num_prompt_tokens - cached_tokens
                 if self.enable_chunked_prefill:
                     chunk = min(remaining, self.chunked_prefill_size, budget)
                     if chunk <= 0:
@@ -114,7 +115,7 @@ class Scheduler:
 
                 status = self.bm.can_allocate(seq)
                 if status == AllocStatus.OK:
-                    self.bm.allocate(seq)
+                    self.bm.allocate(seq)   # may bump seq.num_prefilled via prefix cache
                     seq.status = SequenceStatus.RUNNING
                     seq.scheduled_chunk_len = chunk
                     self.running.append(seq)

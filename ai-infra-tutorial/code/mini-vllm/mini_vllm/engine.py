@@ -32,7 +32,9 @@ class LLMEngine:
         self.model = model
         dtype = _DTYPES[cfg.model.dtype]
         self.cache_engine = CacheEngine(cfg.model, cfg.cache, cfg.device, dtype)
-        self.block_manager = BlockManager(cfg.cache.num_gpu_blocks, cfg.cache.block_size)
+        self.block_manager = BlockManager(
+            cfg.cache.num_gpu_blocks, cfg.cache.block_size,
+            enable_prefix_caching=cfg.enable_prefix_caching)
         self.scheduler = Scheduler(
             self.block_manager,
             max_num_batched_tokens=cfg.max_num_batched_tokens,
@@ -73,6 +75,11 @@ class LLMEngine:
         # this step or not). Then schedule sees them in the right state next step.
         for seq in sched.prefill_seqs:
             seq.num_prefilled += seq.scheduled_chunk_len
+            # Register newly-filled blocks for prefix-cache reuse.
+            self.block_manager.register_filled_blocks(seq)
+        # Decode steps may also fill a block (when seq_len % block_size == 0).
+        for seq in sched.decode_seqs:
+            self.block_manager.register_filled_blocks(seq)
 
         outputs: List[StepOutput] = []
         if sampled_seqs:
