@@ -46,7 +46,8 @@ class EngineConfig:
     # Feature flags. Each plan flips its flag to True default upon completion.
     # Set to False to opt back into the prior baseline (for benchmarks).
     enable_continuous_batching: bool = True   # Plan 4
-    enable_chunked_prefill: bool = False      # Plan 5 (with prefix caching)
-    enable_prefix_caching: bool = False       # Plan 5
+    enable_chunked_prefill: bool = True       # Plan 5
+    enable_prefix_caching: bool = False       # Plan 5 (in progress)
     enable_swap: bool = False                 # Plan 6
     max_num_batched_tokens: int = 2048
+    chunked_prefill_size: int = 512

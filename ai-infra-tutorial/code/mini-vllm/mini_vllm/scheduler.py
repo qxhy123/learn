@@ -1,19 +1,11 @@
-"""Scheduler — Plan 4: continuous batching with token budget.
+"""Scheduler — Plan 5: continuous batching + chunked prefill.
 
-State machine:
-    waiting -> running: admitted in a `schedule()` call when token budget allows
-    running -> finished: when seq.is_finished()
+Plan 4 added continuous-batching admission. Plan 5 adds chunked prefill:
+long prompts can be split across multiple steps, with each chunk attending
+to prior chunks' K/V already in cache. The kernel-level mechanism for that
+(prefill reads from KV cache via block_table) is shared with prefix caching.
 
-Plan 5 will add prefix-cache lookup; Plan 6 adds swap_in/out and the `swapped` queue.
-
-Continuous batching:
-    When `enable_continuous_batching=True` (default), each `schedule()` step
-    tries to admit waiting requests in addition to continuing running ones.
-    Admission is gated by `max_num_batched_tokens` — total tokens (prefill +
-    decode) per step is capped to keep step latency bounded.
-
-    When False, the scheduler falls back to Plan 1 behavior: only admit when
-    `running` is empty. This is the comparison baseline for benchmarks.
+Plan 6 will add swap_in/out and the `swapped` queue.
 """
 from __future__ import annotations
 from collections import deque
@@ -30,16 +22,20 @@ class SchedulerOutput:
     decode_seqs: List[Sequence] = field(default_factory=list)
     swap_in: Dict[int, int] = field(default_factory=dict)    # Plan 6
     swap_out: Dict[int, int] = field(default_factory=dict)   # Plan 6
-    blocks_to_copy: List[Tuple[int, int]] = field(default_factory=list)  # Plan 5
+    blocks_to_copy: List[Tuple[int, int]] = field(default_factory=list)  # Plan 5 prefix cache
 
 
 class Scheduler:
     def __init__(self, block_manager: BlockManager,
                  max_num_batched_tokens: int = 2048,
-                 enable_continuous_batching: bool = True):
+                 enable_continuous_batching: bool = True,
+                 enable_chunked_prefill: bool = False,
+                 chunked_prefill_size: int = 512):
         self.bm = block_manager
         self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_continuous_batching = enable_continuous_batching
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
 
@@ -50,6 +46,8 @@ class Scheduler:
         return bool(self.waiting) or bool(self.running)
 
     def mark_prefilled(self, seq: Sequence) -> None:
+        """Legacy helper used by older tests. New code lets `Engine.step`
+        advance `num_prefilled` by `scheduled_chunk_len` per step."""
         seq.num_prefilled = seq.num_prompt_tokens
 
     def free_finished(self) -> List[Sequence]:
@@ -62,43 +60,66 @@ class Scheduler:
             self.bm.free(s)
         return finished
 
+    def _chunk_for(self, seq: Sequence, budget: int) -> int:
+        """How many tokens to prefill this step for a seq with `budget` left."""
+        remaining = seq.num_prompt_tokens - seq.num_prefilled
+        chunk = remaining
+        if self.enable_chunked_prefill:
+            chunk = min(chunk, self.chunked_prefill_size)
+        chunk = min(chunk, budget)
+        return max(0, chunk)
+
     def schedule(self) -> SchedulerOutput:
         out = SchedulerOutput()
-        token_budget = self.max_num_batched_tokens
+        budget = self.max_num_batched_tokens
 
-        # 1. Continue running seqs first (they have priority — already paid the
-        #    prefill cost, so completing them is the cheapest path to free blocks).
+        # Reset per-step planning fields.
+        for seq in self.running:
+            seq.scheduled_chunk_len = 0
+
+        # 1. Continue running seqs (priority: finishing them frees blocks).
         for seq in self.running:
             if seq.num_prefilled < seq.num_prompt_tokens:
-                # First step after admission: still need prefill (full prompt at once
-                # in Plan 4; chunked prefill is Plan 5).
+                chunk = self._chunk_for(seq, budget)
+                if chunk == 0:
+                    continue   # no budget this step; pick up next step
+                seq.scheduled_chunk_len = chunk
                 out.prefill_seqs.append(seq)
-                token_budget -= seq.num_prompt_tokens
+                budget -= chunk
             else:
-                # Need to ensure a slot exists for the upcoming token.
-                # Plan 4: still no preemption — out-of-blocks raises. Plan 6 adds swap.
+                # Decode — single token per step.
+                if budget <= 0:
+                    continue
                 self.bm.append_slot(seq)
                 out.decode_seqs.append(seq)
-                token_budget -= 1
+                budget -= 1
 
-        # 2. Admit new waiting requests if budget remains.
-        # In Plan 1 mode (continuous batching off), we only admit when the running
-        # queue is empty — preserves the original "process one batch at a time" behavior.
+        # 2. Admit waiting requests if budget remains and policy allows.
         can_admit = self.enable_continuous_batching or not self.running
         if can_admit:
-            while self.waiting and token_budget > 0:
+            while self.waiting and budget > 0:
                 seq = self.waiting[0]
-                # Skip if this seq alone would blow the remaining budget.
-                # (Don't want to partially-admit; Plan 5 chunked prefill handles that.)
-                if seq.num_prompt_tokens > token_budget:
-                    break
+                # Decide chunk size before allocating.
+                # When chunked prefill is OFF, we require the FULL prompt fits the
+                # budget; partial admission is forbidden.
+                remaining = seq.num_prompt_tokens
+                if self.enable_chunked_prefill:
+                    chunk = min(remaining, self.chunked_prefill_size, budget)
+                    if chunk <= 0:
+                        break
+                else:
+                    if remaining > budget:
+                        break    # FCFS: head blocks the rest until a step has more budget
+                    chunk = remaining
+
                 status = self.bm.can_allocate(seq)
                 if status == AllocStatus.OK:
                     self.bm.allocate(seq)
                     seq.status = SequenceStatus.RUNNING
+                    seq.scheduled_chunk_len = chunk
                     self.running.append(seq)
                     out.prefill_seqs.append(seq)
-                    token_budget -= seq.num_prompt_tokens
+                    budget -= chunk
                     self.waiting.popleft()
                 elif status == AllocStatus.LATER:
                     break

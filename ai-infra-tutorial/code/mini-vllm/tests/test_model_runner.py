@@ -22,10 +22,13 @@ def test_runner_prefill_then_decode():
     seq = Sequence("r0", prompt_token_ids=[1, 2, 3, 4, 5],
                    sampling_params=SamplingParams(max_tokens=4))
     bm.allocate(seq)
-    # Prefill step
+    # Prefill step — emulate scheduler setting chunk len = full prompt.
+    seq.scheduled_chunk_len = seq.num_prompt_tokens
     logits = runner.execute(prefill_seqs=[seq], decode_seqs=[])
     assert logits.shape == (1, 128)
     next_token = int(logits.argmax(dim=-1).item())
+    # Engine would advance num_prefilled here.
+    seq.num_prefilled = seq.num_prompt_tokens
 
     # Apply token to seq, then decode step
     seq.append_token(next_token)

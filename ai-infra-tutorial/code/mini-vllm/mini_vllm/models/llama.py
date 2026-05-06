@@ -130,7 +130,7 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(q_size, cfg.hidden_size, bias=False)
 
     def forward(self, x, positions, slot_mapping, kv_cache,
-                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                prefill_block_table, prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
                 decode_block_table, decode_context_lens):
         N = x.shape[0]
         qkv = self.qkv_proj(x)
@@ -152,7 +152,7 @@ class LlamaAttention(nn.Module):
         out_dec = None
         if num_prefill_tokens > 0:
             out_pre = self.backend.prefill(
-                q[:num_prefill_tokens], k[:num_prefill_tokens], v[:num_prefill_tokens],
+                q[:num_prefill_tokens], kc, vc, prefill_block_table,
                 prefill_seq_lens, prefill_query_lens, self.scale)
         if N - num_prefill_tokens > 0:
             qd = q[num_prefill_tokens:]
@@ -181,10 +181,10 @@ class LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(cfg.hidden_size, cfg.intermediate_size)
 
     def forward(self, x, positions, slot_mapping, kv_cache,
-                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                prefill_block_table, prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
                 decode_block_table, decode_context_lens):
         h = self.self_attn(self.input_layernorm(x), positions, slot_mapping, kv_cache,
-                           prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                           prefill_block_table, prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
                            decode_block_table, decode_context_lens)
         x = x + h
         x = x + self.mlp(self.post_attention_layernorm(x))
@@ -211,13 +211,13 @@ class LlamaModel(nn.Module):
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
     def forward(self, input_ids, positions, slot_mapping, kv_caches,
-                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                prefill_block_table, prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
                 decode_block_table, decode_context_lens,
                 sample_indices: torch.Tensor):
         x = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
             x = layer(x, positions, slot_mapping, kv_caches[i],
-                      prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                      prefill_block_table, prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
                       decode_block_table, decode_context_lens)
         x = self.norm(x)
         x_sample = x[sample_indices]

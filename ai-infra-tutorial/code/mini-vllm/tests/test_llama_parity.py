@@ -45,9 +45,12 @@ def test_logits_match_hf_top5():
     slot_mapping = torch.arange(N, dtype=torch.long)
     positions = torch.arange(N)
     sample_indices = torch.tensor([N - 1])
+    # Block table: 8 tokens fit in 1 block of size 16, so seq's block is [0].
+    prefill_block_table = torch.tensor([[0]], dtype=torch.int32)
     with torch.inference_mode():
         our_logits = ours(
             prompt_ids, positions, slot_mapping, ce.kv_caches,
+            prefill_block_table=prefill_block_table,
             prefill_seq_lens=torch.tensor([N], dtype=torch.int32),
             prefill_query_lens=torch.tensor([N], dtype=torch.int32),
             num_prefill_tokens=N,

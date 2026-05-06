@@ -21,8 +21,12 @@ def test_toy_gpt_prefill_only_forward():
     slot_mapping = torch.arange(N, dtype=torch.long)
     sample_indices = torch.tensor([N - 1])  # only sample the last position
 
+    # 5 tokens fit in 2 blocks of size 4: block 0 (offsets 0..3), block 1 (offset 0).
+    # We allocate blocks 0 and 1 manually for this single-seq test.
+    prefill_block_table = torch.tensor([[0, 1]], dtype=torch.int32)
     logits = model(
         input_ids, positions, slot_mapping, ce.kv_caches,
+        prefill_block_table=prefill_block_table,
         prefill_seq_lens=torch.tensor([N]),
         prefill_query_lens=torch.tensor([N]),
         num_prefill_tokens=N,
