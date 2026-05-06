@@ -102,3 +102,66 @@ class LlamaMLP(nn.Module):
         gu = self.gate_up_proj(x)
         gate, up = gu.chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+
+# ---------------------------------------------------------------------------
+# Attention layer
+# ---------------------------------------------------------------------------
+
+class LlamaAttention(nn.Module):
+    """GQA + RoPE attention. Q/K/V are FUSED into a single qkv_proj.
+    The K/V written to the paged cache are the *post-RoPE* values, matching
+    HF's behavior.
+    """
+    def __init__(self, cfg: ModelConfig, backend: AttentionBackend,
+                 rotary: RotaryEmbedding):
+        super().__init__()
+        self.cfg = cfg
+        self.backend = backend
+        self.rotary = rotary
+        self.num_heads = cfg.num_attention_heads
+        self.num_kv_heads = cfg.num_kv_heads
+        self.head_dim = cfg.head_dim
+        self.scale = self.head_dim ** -0.5
+
+        q_size = cfg.num_attention_heads * cfg.head_dim
+        kv_size = cfg.num_kv_heads * cfg.head_dim
+        self.qkv_proj = nn.Linear(cfg.hidden_size, q_size + 2 * kv_size, bias=False)
+        self.o_proj = nn.Linear(q_size, cfg.hidden_size, bias=False)
+
+    def forward(self, x, positions, slot_mapping, kv_cache,
+                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                decode_block_table, decode_context_lens):
+        N = x.shape[0]
+        qkv = self.qkv_proj(x)
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q = q.view(N, self.num_heads, self.head_dim)
+        k = k.view(N, self.num_kv_heads, self.head_dim)
+        v = v.view(N, self.num_kv_heads, self.head_dim)
+
+        # Apply RoPE BEFORE writing K to cache — paged cache holds rotated K.
+        cos, sin = self.rotary(positions)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        kc, vc = kv_cache
+        self.backend.reshape_and_cache(k, v, kc, vc, slot_mapping)
+
+        out_pre = None
+        out_dec = None
+        if num_prefill_tokens > 0:
+            out_pre = self.backend.prefill(
+                q[:num_prefill_tokens], k[:num_prefill_tokens], v[:num_prefill_tokens],
+                prefill_seq_lens, prefill_query_lens, self.scale)
+        if N - num_prefill_tokens > 0:
+            qd = q[num_prefill_tokens:]
+            out_dec = self.backend.decode(
+                qd, kc, vc, decode_block_table, decode_context_lens, self.scale)
+
+        if out_pre is not None and out_dec is not None:
+            out = torch.cat([out_pre, out_dec], dim=0)
+        else:
+            out = out_pre if out_pre is not None else out_dec
+        out = out.reshape(N, self.num_heads * self.head_dim)
+        return self.o_proj(out)
