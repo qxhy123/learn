@@ -79,3 +79,26 @@ class LlamaRMSNorm(nn.Module):
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.variance_epsilon)
         return (self.weight * x).to(input_dtype)
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU MLP
+# ---------------------------------------------------------------------------
+
+class LlamaMLP(nn.Module):
+    """SwiGLU: down(silu(gate(x)) * up(x)).
+
+    HF stores gate_proj and up_proj as separate matrices. We FUSE them
+    into a single `gate_up_proj` (output dim = 2 * intermediate_size) and
+    split internally — this is one of the optimizations vLLM uses, and
+    keeps the loader honest about the layout we expect.
+    """
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gu = self.gate_up_proj(x)
+        gate, up = gu.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
