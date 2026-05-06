@@ -541,6 +541,25 @@ S_t = TopK(score_t, K)</code></pre>
       role: router
       replicated_across: [EP]
       path: step_120000/layer_003/router.safetensors
+  optimizer:
+    - shard_id: adam_l03_e000_w_gate_m
+      layer_id: 3
+      expert_id: 0
+      param_name: experts.0.w_gate
+      state_name: adam_m
+      shape: [7168, 2048]
+      dtype: fp32
+      tp_rank: 0
+      etp_rank: 0
+      path: step_120000/optim/layer_003/expert_000/adam_m_tp00_etp00.safetensors
+  shared_experts:
+    - layer_id: 3
+      param_name: shared_expert.w_gate
+      shape: [7168, 2048]
+      dtype: bf16
+      tp_rank: 0
+      role: shared_expert_param
+      path: step_120000/layer_003/shared/tp00.safetensors
   controller_state:
     router_bias:
       shape: [58, 256]
@@ -552,8 +571,11 @@ S_t = TopK(score_t, K)</code></pre>
       path: step_120000/router_load_ema.safetensors
     overflow_fallback_counters:
       dtype: int64
-      path: step_120000/moe_overflow_counters.json</code></pre>
-<p>最小 manifest 必须回答：<code>layer_id</code>、<code>expert_id</code>、<code>param_name</code>、<code>shape</code>、<code>dtype</code>、TP/ETP shard、这是参数还是 optimizer state、属于 router / shared expert / routed expert / controller state 中哪一类。</p>
+      path: step_120000/moe_overflow_counters.json
+  bias_state:
+    path: step_120000/bias_state.safetensors
+    checksum: sha256:def...</code></pre>
+<p>最小 manifest 必须回答：<code>layer_id</code>、<code>expert_id</code>、<code>param_name</code>、<code>shape</code>、<code>dtype</code>、TP/ETP shard、这是参数还是 optimizer state、属于 router / shared expert / routed expert / bias / controller state 中哪一类。bias/controller state 包括 loss-free router bias、load EMA、overflow fallback counters 和框架兼容的 dense/shared bias；缺少任一项，EP/ETP reshape、optimizer resume 或 loss-free bias restore 都可能变成靠文件名猜。</p>
 
 <h3>8.2 Reshape：EP=64 → EP=32 的恢复</h3>
 <pre class="mermaid">flowchart LR
@@ -564,12 +586,23 @@ S_t = TopK(score_t, K)</code></pre>
   Bundle --> Write[写新 EP=32 shard + manifest]</pre>
 <table>
 <tr><th>reshape 类型</th><th>难度</th><th>备注</th></tr>
-<tr><td>EP=64 → EP=32</td><td>容易</td><td>ownership remap；不是把 expert tensor 相加</td></tr>
-<tr><td>EP=64 → EP=128</td><td>容易</td><td>新 rank 拥有更少完整 expert；不是把 tensor 拆半</td></tr>
-<tr><td>ETP=1 → ETP=4</td><td>中等</td><td>这才是 tensor 维度 reshard</td></tr>
-<tr><td>ETP=4 → ETP=1</td><td>中等</td><td>按 param_name 聚合 ETP shards 并校验 checksum</td></tr>
-<tr><td>expert 剪枝 / 增殖</td><td>难</td><td>需要 router 权重重映射和新 expert 初始化策略</td></tr>
+<tr><td>EP=64 → EP=32（ownership remap）</td><td>容易</td><td>新 rank 拥有更多完整 expert；不是把 expert tensor 相加</td></tr>
+<tr><td>EP=64 → EP=128（ownership remap）</td><td>容易</td><td>新 rank 拥有更少完整 expert；不是把 expert tensor 拆半</td></tr>
+<tr><td>ETP=1 → ETP=4</td><td>中等</td><td>这才是 tensor 维度 reshard，需要按 FFN 权重维度切分</td></tr>
+<tr><td>ETP=4 → ETP=1</td><td>中等</td><td>需要按 param_name 聚合 ETP shards，并校验形状和 checksum</td></tr>
+<tr><td>256 expert → 128 expert（剪枝）</td><td>难</td><td>需要 expert importance 排序 + router 权重重映射</td></tr>
+<tr><td>256 expert → 320 expert（增殖）</td><td>难</td><td>新 expert 初始化策略未定，常见做法是复制 + 加噪</td></tr>
 </table>
+<p>EP degree 改变时，通常改的是 <code>expert_id -&gt; owner_ep_rank</code>：例如 old <code>expert 17 -&gt; ep_rank 4, local_expert_id 1</code>，new <code>expert 17 -&gt; ep_rank 2, local_expert_id 5</code>，但 <code>experts.17.w_gate / w_up / w_down</code> 的 shape 不变。只有改变 ETP、TP shard 规则、expert FFN hidden/intermediate，或剪枝/增殖 expert 时，才需要真正 reshape expert tensor；把 EP reshape 写成“把 expert tensor 拆半/合并”会导致 checkpoint 工具错误处理 optimizer slots。</p>
+<p><strong>optimizer true resume 默认应该保守：</strong></p>
+<table>
+<tr><th>恢复模式</th><th>允许条件</th><th>默认策略</th></tr>
+<tr><td>weight-only load</td><td>expert 参数、router、shared expert、bias/controller state 能按 manifest 对齐</td><td>允许，用于拓扑变化后的 warm resume / finetune</td></tr>
+<tr><td>optimizer true resume, EP only remap</td><td><code>param_name + expert_id + etp_rank + shape + optimizer state_name</code> 全部一一对应，step/lr scaler 一致</td><td>可允许，但必须离线验证后写新 manifest</td></tr>
+<tr><td>optimizer true resume, ETP/TP changed</td><td>Adam <code>m/v</code>、master weight、grad accumulator 都已按同一 tensor 规则 reshard</td><td>默认拒绝，除非离线 reshard 工具生成校验报告</td></tr>
+<tr><td>optimizer true resume, expert 剪枝/增殖</td><td>optimizer slot 没有自然对应关系</td><td>默认拒绝；只能 weight-only 或显式初始化新 slot</td></tr>
+</table>
+<p>离线 reshard 工具至少要输出：每个 <code>expert_id</code> 的参数 checksum、每个 optimizer slot 的 shape/dtype/checksum、旧新 manifest 的 <code>expert_id</code> 对齐表、canonical replica 去重结果。缺少这些证据时，训练系统应该 fail closed，而不是“尽量加载”。</p>
 
 <h3>8.3 与 dense checkpoint 的对比</h3>
 <table>
@@ -678,8 +711,51 @@ S_t = TopK(score_t, K)</code></pre>
 <tr><td>DeepSeek-V3 风格</td><td>数百 B</td><td>37B 量级</td><td>多副本 + expert placement + prefetch</td></tr>
 <tr><td>Qwen2-MoE</td><td>A14B 级</td><td>小激活路径</td><td>标准 MoE serving + dropless</td></tr>
 </table>
+<div class="warn"><strong>部署口径：</strong>不要把 DeepSeek-V3 风格训练写成 <code>EP=64 + capacity_factor=1.25 + drop</code>。训练和推理都不应把正常 token drop 当作默认路径；训练用大 batch dropless alltoallv / flex dispatcher 追求吞吐，推理 batch 极小时要按 expert placement、prefetch 和低延迟 dispatcher 重新设计。</div>
 <h3>12.2 Expert placement 与 node-limited routing</h3>
-<p>推理时常把热 expert 复制、把同一请求高概率命中的 experts 放在同一节点或同一高速互联域，并用 node-limited routing 减少跨节点 All-to-All。训练 checkpoint 中的 <code>expert_id -> owner_ep_rank</code> 是训练 owner，不等于推理 placement；转换工具要生成新的 serving manifest。</p>
+<p>无论训练还是推理，<code>expert_id -&gt; node/gpu</code> 都不是简单取模就完事。placement 同时决定通信 locality、load skew 和 straggler；训练 checkpoint 中的 <code>expert_id -&gt; owner_ep_rank</code> 是训练 owner，不等于推理 placement，转换工具要生成新的 serving manifest。</p>
+<p>最小 placement manifest 应显式记录：</p>
+<pre><code>expert_placement:
+  layer_id: 3
+  ep_group_id: dp0_pp1_tp0_cp0
+  policy: node_limited_round_robin_v1
+  experts:
+    - expert_id: 0
+      node_id: node000
+      gpu_id: 0
+      ep_rank: 0
+      local_expert_id: 0
+    - expert_id: 1
+      node_id: node000
+      gpu_id: 1
+      ep_rank: 1
+      local_expert_id: 0</code></pre>
+<table>
+<tr><th>策略</th><th>做法</th><th>适用场景</th><th>风险</th></tr>
+<tr><td>round-robin by expert_id</td><td><code>owner = expert_id % EP</code></td><td>baseline，易复现</td><td>热门 expert 可能集中到同一节点或 rail</td></tr>
+<tr><td>node-balanced placement</td><td>先按 node 分桶，再在节点内按 gpu 轮转</td><td>训练 EP group 跨多节点</td><td>需要 topology-aware rank map</td></tr>
+<tr><td>replicated hot experts</td><td>热门 expert 多副本，router 或 dispatcher 选最近副本</td><td>推理、小 batch</td><td>训练 optimizer 同步复杂，不是默认训练路径</td></tr>
+<tr><td>straggler-aware remap</td><td>根据 load EMA / layer timer 周期性交换 expert owner</td><td>长训中消除 tail rank</td><td>会改变 checkpoint ownership，必须在 step 边界做</td></tr>
+</table>
+<p><strong>node-limited routing</strong> 的思路是：router 先产生全局 score，但 dispatch plan 可以把候选 expert 限制在少数节点内，降低跨节点 A2A：</p>
+<pre><code>for each token t on node n:
+  candidate_nodes = topM_nodes(score_t, placement, M)
+  candidate_experts = experts_on(candidate_nodes)
+  S_t = topK(score_t over candidate_experts)</code></pre>
+<p>这不是免费优化：限制候选节点会改变模型可表达性和 load balance。训练里如果使用 node-limited routing，必须把 <code>candidate_nodes</code> 规则视为 router 语义的一部分，checkpoint 和评估都要一致；推理里可以更激进，因为目标是低延迟和 locality。</p>
+<p><strong>send plan</strong> 应由 placement 派生，而不是在通信层猜：</p>
+<pre><code>topk_idx[token,k] -&gt; expert_id
+expert_id -&gt; (node_id, gpu_id, ep_rank, local_expert_id)
+ep_rank -&gt; send_counts[ep_rank] += 1</code></pre>
+<p>如果发现 straggler，重排流程要在算法层闭环：</p>
+<ol>
+<li>收集每层 <code>tokens_per_expert</code>、<code>tokens_per_rank</code>、dispatch/combine time、expert GEMM time。</li>
+<li>把 expert 分成 hot / cold / normal，按 layer 单独处理，不要全局平均。</li>
+<li>在同一 EP group 内交换 hot expert 与 cold expert 的 owner，优先跨节点/跨 rail 打散。</li>
+<li>在 step 边界广播新 placement version，更新 router/dispatcher/checkpoint manifest。</li>
+<li>若要 true resume，先把 optimizer slots 跟随 expert_id 一起迁移，再允许 optimizer step。</li>
+</ol>
+<p>placement 的核心原则是：<strong>expert_id 是语义身份，rank/gpu 只是 owner</strong>。所有 send_counts、checkpoint shard、optimizer slot、load EMA 和 loss-free bias 都必须跟 <code>expert_id</code> 对齐，而不是跟当前 rank 对齐。</p>
 <div class="warn"><strong>训推差异：</strong>训练的 EP=64、dropless/fallback、DeepEP normal mode 不能直接等同于推理路径。推理更关注 tail latency、KV cache locality、expert hotness 和小 batch dropless。</div>
 </section>
 

@@ -442,7 +442,64 @@ step_time = data_visible + forward + backward + exposed_communication + optimize
 
 <div class="note"><strong>N 越大 ZeRO 收益越大，但通信也成比例增加。</strong>ZeRO-3 在 N=64 时单卡训练状态压到 16/64=0.25 字节/参数，但每个 forward/backward 都要做 AllGather + ReduceScatter，对带宽极度敏感。在跨节点带宽不足时，ZeRO-3 的通信开销可能让 step time 比 ZeRO-2 还慢。生产 64+ 卡 ZeRO-3 通常需要 IB / RoCE 200Gbps+。</div>
 
-<h3>5.4 训练代码中的 DDP 核心片段</h3>
+<h4>DeepSpeed ZeRO 关键边界</h4>
+<table>
+  <thead>
+    <tr><th>策略</th><th>切分边界</th><th>适用边界</th><th>主要代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ZeRO-1</td><td>optimizer state</td><td>参数和梯度能完整常驻，但 Adam state 是主显存压力</td><td>optimizer step 需要分片状态同步，容量收益有限于 optimizer 部分</td></tr>
+    <tr><td>ZeRO-2</td><td>optimizer state + gradient</td><td>DDP 显存紧，且希望避免每层参数 AllGather</td><td>梯度 ReduceScatter 增加通信路径，对 bucket 和 overlap 更敏感</td></tr>
+    <tr><td>ZeRO-3</td><td>parameter + gradient + optimizer state</td><td>模型状态无法复制，必须把参数本身也切开</td><td>forward/backward 进入 AllGather critical path，跨节点带宽和 tail latency 决定吞吐</td></tr>
+    <tr><td>ZeRO-Offload</td><td>optimizer 或 parameter 下沉到 CPU/NVMe</td><td>GPU HBM 是硬容量瓶颈，接受吞吐下降来换更大容量</td><td>PCIe/NVMe 带宽和延迟会暴露到 step time；NVMe 扩容量最强，但 page/prefetch miss 会让训练变成 I/O bound</td></tr>
+  </tbody>
+</table>
+<div class="warn"><strong>ZeRO-Offload 是容量逃生门，不是吞吐优先方案。</strong>CPU offload 受 PCIe 往返、pinned memory 和 NUMA placement 限制；NVMe offload 进一步受队列深度、随机读写和预取命中率限制。只有当"装不下"比"跑得快"更重要时才把它放进生产候选，并且必须单独记录 offload I/O wait。</div>
+
+<h3>5.4 Launcher / NCCL smoke test 与训练代码片段</h3>
+<p>8 节点 64 GPU 的 launcher 首先用于验证 rendezvous、rank mapping、sampler、NCCL 路径和日志链路是否可用。下面语义是 smoke test：它可以跑一个能完整复制的小模型来证明平台路径健康，不能被当成 7B BF16 + AdamW 的生产方案；7B 的 DDP 参数相关状态约 100 GiB/GPU，不含 activation，应转 FSDP FULL_SHARD 或 ZeRO-3。</p>
+<table>
+  <thead>
+    <tr><th>字段 / 环境变量</th><th>语义</th><th>验证点</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>--nnodes=8</code>、<code>--nproc_per_node=8</code></td><td>声明 8 节点、每节点 8 rank，共 64 rank</td><td>日志中 world size、local rank、node rank 与调度器一致</td></tr>
+    <tr><td><code>MASTER_ADDR</code>、<code>MASTER_PORT</code></td><td>所有 rank 的 rendezvous 入口</td><td>重启后不会复用错误端口或旧 rendezvous</td></tr>
+    <tr><td><code>NODE_RANK</code></td><td>调度器注入的节点序号</td><td>rank 到 node/GPU/NIC 的映射可追溯</td></tr>
+    <tr><td><code>NCCL_SOCKET_IFNAME</code></td><td>bootstrap 和 socket fallback 的网卡选择</td><td>不能误绑管理网或低速网卡</td></tr>
+    <tr><td><code>NCCL_IB_DISABLE=0</code>、<code>NCCL_IB_HCA</code></td><td>启用并约束 IB/RoCE HCA</td><td>NCCL 日志显示 <code>NET/IB</code>，且 HCA 名称匹配 <code>ibdev2netdev</code></td></tr>
+    <tr><td><code>NCCL_IB_GID_INDEX</code>、<code>NCCL_IB_TC</code></td><td>RoCE GID 与 QoS 示例</td><td>必须由集群网络标准确认，不能跨集群照抄</td></tr>
+    <tr><td><code>TORCH_NCCL_ASYNC_ERROR_HANDLING=1</code></td><td>collective 异常尽快向进程组传播</td><td>timeout 时能形成清晰失败，而不是长时间挂死</td></tr>
+    <tr><td><code>NCCL_DEBUG=INFO</code></td><td>预发和事故复盘打开拓扑、env、collective 证据</td><td>稳定生产可降为 <code>WARN</code>，避免日志成本进入吞吐统计</td></tr>
+  </tbody>
+</table>
+<pre><code class="language-bash">export MASTER_ADDR="node-0"
+export MASTER_PORT="29500"
+export NODE_RANK="${NODE_RANK:?set by scheduler}"
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,ENV,GRAPH,COLL
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+export NCCL_IB_GID_INDEX=3
+
+torchrun \
+  --nnodes=8 \
+  --nproc_per_node=8 \
+  --node_rank="${NODE_RANK}" \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  train.py \
+  --parallel ddp \
+  --model 1b-smoke \
+  --precision bf16 \
+  --seq-len 4096 \
+  --micro-batch-size 2 \
+  --grad-accum-steps 2 \
+  --log-rank-metrics</code></pre>
+
+<p><strong>训练代码中的 DDP 核心片段：</strong></p>
 <pre><code class="language-python">import os
 import torch
 import torch.distributed as dist
@@ -562,7 +619,54 @@ mpirun -np 64 -N 8 ./build/all_reduce_perf -b 8M -e 16G -f 2 -g 1</code></pre>
   </tbody>
 </table>
 
-<h3>7.2 TorchElastic restart 与 rendezvous 边界</h3>
+<h3>7.2 作业准入</h3>
+<p>多节点 DP 作业进入生产队列前要先过 admission，而不是直接把单节点脚本放大。准入记录至少要包含：第 7 章单节点 baseline 证据包（tokens/s、MFU/HFU、HBM、data wait、checkpoint time）、DDP/FSDP/ZeRO 每卡状态容量账本、目标节点池 <code>nccl-tests</code> bus bandwidth、可复现 dataset shard 计划、global batch/LR/warmup/accumulation 算法签字、checkpoint schema 与 rank-level step breakdown。</p>
+
+<h3>7.3 持久化生产配置：<code>train_config.yaml</code> 最小字段</h3>
+<p>生产作业不能只靠 launcher 参数和临时环境变量复现。<code>train_config.yaml</code> 或等价 admission record 应固定并行策略、batch 语义、NCCL env policy、preflight gate、rollback gate 和 checkpoint schema。</p>
+<pre><code class="language-yaml">run:
+  name: llama7b-fsdp-64gpu-bf16
+  owner: pretrain-platform
+  image_digest: sha256:...
+  version_matrix:
+    pytorch: 2.4.1+cu124
+    cuda_runtime: "12.4"
+    nccl: 2.21.5
+    driver: 550.54.15
+parallel:
+  mode: fsdp_full_shard
+  world_size: 64
+  nnodes: 8
+  nproc_per_node: 8
+batch:
+  sequence_length: 4096
+  micro_batch_per_gpu: 2
+  gradient_accumulation_steps: 16
+  global_batch_sequences: 2048
+  token_accounting: non_pad_tokens
+precision:
+  compute: bf16
+  gradients: bf16
+  optimizer_state: fp32
+nccl_env_policy:
+  require_rdma: true
+  allow_socket_fallback: false
+  production_debug_level: WARN
+preflight_gates:
+  steps: 300
+  min_p50_non_pad_tokens_per_s: 700000
+  max_rank_step_skew_p95: 1.12
+  max_data_visible_wait_ratio_p95: 0.05
+  max_hbm_p95_gib: 68
+rollback_gates:
+  max_tokens_s_regression_ratio: 0.10
+  max_rank_step_skew_p95: 1.20
+  require_loss_parity: true
+checkpoint:
+  type: sharded_state_dict
+  commit_marker: latest_metadata.json</code></pre>
+
+<h3>7.4 TorchElastic restart 与 rendezvous 边界</h3>
 
 <pre class="mermaid">stateDiagram-v2
     [*] --> Running : torchrun launch
@@ -581,10 +685,14 @@ mpirun -np 64 -N 8 ./build/all_reduce_perf -b 8M -e 16G -f 2 -g 1</code></pre>
 
 <div class="success"><strong>validated checkpoint 设计原则：</strong>所有 rank 完成同一个 optimizer boundary 后才提交 checkpoint；使用两阶段 commit：先写 rank-local shard 到临时路径，再由 coordinator 写 <code>latest_metadata.json</code> 或等价 commit marker；elastic resume 只认 commit marker，不扫描"看起来最新"的分片文件。</div>
 
-<h3>7.3 Preflight</h3>
+<h3>7.5 Preflight</h3>
 <p>建议每个正式作业先跑 100 到 300 step preflight。必须输出：<code>step_time_p50_ms</code>、<code>step_time_p95_ms</code>、<code>data_visible_wait_p95_ms</code>、<code>nccl_exposed_tail_p95_ms</code>、<code>rank_step_skew_p95</code>、<code>tokens_per_second_non_pad</code>、<code>hbm_p95_per_gpu</code>、<code>nccl_busbw_allreduce_gbps</code>、<code>checkpoint_dry_run_seconds</code>。Preflight 失败必须自动分类：memory / NCCL / data skew / straggler / checkpoint / convergence sanity。</p>
 
-<h3>7.4 观测</h3>
+<h3>7.6 发布、回滚与治理边界</h3>
+<p>发布应走 staged rollout：先 smoke test 验证 launcher/NCCL，再 100-300 step preflight，再短窗 shadow 或 canary，最后长跑。任何阶段如果 tokens/s 回退超过 rollback gate、rank skew 或 NCCL exposed tail 超阈值、loss parity 破坏、checkpoint dry run 失败，都回滚到上一份已准入的镜像 digest、配置和 checkpoint schema。</p>
+<div class="warn"><strong>Governance 边界：</strong>平台 owner 负责镜像、driver/NCCL/OFED、HCA/rail、scheduler device injection、checkpoint commit 协议和事故证据包；算法 owner 负责 global batch、LR scaling、warmup、loss mask、token 口径和收敛验收。系统吞吐变好不能自动批准算法 batch 变更，算法 loss 正常也不能豁免 NCCL 或 checkpoint 准入。</div>
+
+<h3>7.7 观测</h3>
 <table>
   <thead>
     <tr><th>层</th><th>指标</th><th>目标</th></tr>
@@ -663,13 +771,17 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)</c
   </thead>
   <tbody>
     <tr><td>Raw sequence slots/s</td><td>118,751</td><td>8 GPU aggregate，fixed dense slots</td></tr>
+    <tr><td>Compute tokens/s</td><td>118,751</td><td>padding 仍执行 dense MLP/norm，用于算 dense compute 吞吐</td></tr>
     <tr><td>Effective non-pad tokens/s</td><td>95,000</td><td>8 GPU aggregate，排除 padding</td></tr>
+    <tr><td>Loss tokens/s</td><td>93,600</td><td>shifted <code>labels != -100</code>，用于 loss/收敛口径</td></tr>
     <tr><td>MFU</td><td>48.3%</td><td><code>6N_p</code> FLOPs/token</td></tr>
+    <tr><td>HFU</td><td>75.4%</td><td>dense compute slots；checkpointing 后约 <code>7.5N_p</code> actual FLOPs/token</td></tr>
     <tr><td>HBM P95</td><td>63 GiB/GPU</td><td>低于 68 GiB admission 上限</td></tr>
     <tr><td>DataLoader visible wait</td><td>3%</td><td>steady-state profiler window</td></tr>
     <tr><td>Checkpoint time</td><td>18 s / 1000 steps</td><td>单独拆出，不混入稳态 step</td></tr>
   </tbody>
 </table>
+<p>HFU 输入基线必须使用实际执行 FLOPs，而不是只用理论训练 FLOPs：activation checkpointing、重算和 dense padding 都会让实际硬件工作量高于 <code>6N_p</code>。因此本例同时保留 Compute tokens/s、non-pad tokens/s 和 Loss tokens/s，避免把系统吞吐、硬件利用率和 loss 口径混在一起。</p>
 
 <h3>10.2 并行策略选择</h3>
 <p>朴素 DDP 不通过容量 admission：7B BF16 + AdamW 参数相关状态约 100 GiB/GPU，不含 activation。采用 FSDP FULL_SHARD 或 ZeRO-3 作为 DP-family baseline。</p>
@@ -684,7 +796,20 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)</c
   </tbody>
 </table>
 
-<h3>10.3 Step time decomposition（阶段 A，preflight 实测）</h3>
+<h3>10.3 Batch 与样本口径</h3>
+<p>单节点 baseline 的样本口径是 <code>seq_len=4096</code>、<code>micro_batch_per_gpu=2</code>、<code>grad_accum=16</code>、<code>world_size=8</code>，所以 <code>global_batch_sequences = 2 * 16 * 8 = 256</code>。64 GPU 如果保持 microbatch 和 accumulation 不变，global batch 变成 <code>2 * 16 * 64 = 2048</code> sequences；这会改变算法 batch，不只是系统扩容。</p>
+<table>
+  <thead>
+    <tr><th>阶段</th><th>per GPU microbatch</th><th>grad accum</th><th>world size</th><th>global sequences</th><th>目的</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A: system scaling</td><td>2</td><td>16</td><td>64</td><td>2048</td><td>测 weak scaling 和通信效率，沿用每 rank accumulation</td></tr>
+    <tr><td>B: loss parity</td><td>2</td><td>1</td><td>64</td><td>128</td><td>接近较小 global batch，观察 loss/收敛</td></tr>
+  </tbody>
+</table>
+<div class="note">如果算法要求严格保持第 7 章的 256 sequences，则 64 GPU 下应把 <code>grad_accum</code> 改为 2。降低 accumulation 会缩短 per-step compute，通信暴露可能上升，这就是系统效率和优化语义的真实冲突。</div>
+
+<h3>10.4 Step time decomposition（阶段 A，preflight 实测）</h3>
 <table>
   <thead>
     <tr><th>Component</th><th>P50 ms</th><th>P95 ms</th><th>证据来源</th></tr>
@@ -699,8 +824,20 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)</c
     <tr><td>step time</td><td>6,135</td><td>6,730</td><td>max rank optimizer-step timer</td></tr>
   </tbody>
 </table>
+<pre><code>step_time_p50 = data_visible + compute + exposed_communication + optimizer + misc
+              = 35 + 5680 + 280 + 115 + 25
+              = 6135 ms
 
-<h3>10.4 Production acceptance gate</h3>
+sequences_per_step = 2 * 16 * 64 = 2048
+raw_tokens_per_step = 2048 * 4096 = 8,388,608
+non_pad_ratio = 0.60
+non_pad_tokens_per_step = 5,033,165
+throughput_p50 = 5,033,165 / 6.135 ~= 820,000 non-pad tokens/s</code></pre>
+
+<h3>10.5 Throughput sanity check 与 acceptance gate</h3>
+<p>单节点 baseline 的有效吞吐是 95,000 non-pad tokens/s；8 节点弱扩展理想值是 <code>95,000 * 8 = 760,000</code>。P50 估算得到 820,000，看起来超过理想值，必须做 throughput sanity check：单节点 baseline 是否只是保守 acceptance、64 GPU global batch 是否更大、non-pad ratio 与 token 口径是否一致、checkpoint/eval/logging 是否被排除、profiler overhead 是否混入稳态 step。</p>
+<pre><code>throughput_p95 ~= 5,033,165 / 6.730 = 748,000 non-pad tokens/s
+p95_efficiency = 748,000 / 760,000 = 98.4%</code></pre>
 <table>
   <thead>
     <tr><th>Metric</th><th>Gate</th></tr>
@@ -715,6 +852,21 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)</c
     <tr><td>checkpoint dry run</td><td>&lt;= 120 s for sharded save</td></tr>
   </tbody>
 </table>
+
+<h3>10.6 NCCL troubleshooting in the worked example</h3>
+<p>若 P95 tokens/s 从 748,000 掉到 690,000，同时 exposed communication / step 从 7.1% 升到 14.1%，rank skew P95 到 1.28，先看 NCCL 证据而不是先改 batch。</p>
+<pre><code>NCCL INFO NET/Socket : Using [0]eth0
+NCCL INFO NET/IB : No device found.
+all_reduce_perf busbw 48 GB/s, platform baseline 125 GB/s</code></pre>
+<p>这说明 NCCL fallback 到 socket 或 RDMA device 未注入。动作顺序是：检查容器是否挂载 <code>/dev/infiniband</code>；确认 <code>NCCL_IB_DISABLE=0</code>；让 <code>NCCL_IB_HCA</code> 匹配 <code>ibdev2netdev</code>；检查 RoCE <code>GID_INDEX</code>；修复后重跑 <code>all_reduce_perf</code>、<code>all_gather_perf</code>、<code>reduce_scatter_perf</code>；最后再跑 300 step preflight，不直接恢复长跑。</p>
+
+<h3>10.7 Data-skew troubleshooting in the worked example</h3>
+<p>另一类故障是 NCCL bus bandwidth 正常，但 P95 step time 抖动。若证据显示 <code>rank_step_skew_p95 = 1.24</code>、<code>sample_token_skew_p95 = 1.21</code>、慢 rank 对应同一个 dataset shard，且该 shard 的 non-pad ratio P95 明显高于全局 p50，就不是网络优先，而是 Data-skew。</p>
+<p>处理机制是把 dataset manifest 补上 <code>token_count</code>，shard planner 按 token budget 而不是 sample count 分配，batch 内 sequence packing 设置 max token bucket，并每 step 上报 per-rank non-pad tokens。重新 preflight 时要求 <code>sample_token_skew_p95 &lt;= 1.08</code>。</p>
+
+<h3>10.8 决策复盘</h3>
+<p>本 64 GPU 方案接受 FSDP FULL_SHARD，是因为经典 DDP 不满足每卡 HBM admission，FSDP/ZeRO-3 保持 DP-family 的样本切分语义，7B 不需要 TP/PP 才能放下，sharded checkpoint 与恢复协议兼容，主要风险是 AllGather/ReduceScatter 暴露通信且能用 NCCL 与 overlap 证据治理。</p>
+<p>不接受纯 DDP，是因为参数相关状态约 100 GiB/GPU，80GB H100 没有 activation、temp 和 fragmentation 空间，OOM 后再调 batch 不能解决 optimizer state 常驻问题。不先上 TP/PP，是因为它们会引入额外通信域、pipeline bubble 和 checkpoint layout 复杂度，应保留给 70B/405B 或长上下文任务。</p>
 </section>
 
 <!-- ===== §11 决策边界 ===== -->
@@ -754,6 +906,23 @@ sample_token_skew = p95(non_pad_tokens_by_rank) / p50(non_pad_tokens_by_rank)</c
   </tbody>
 </table>
 
+<h3>11.2 Hybrid 的边界</h3>
+<p>Hybrid parallel 不是把所有并行维度打开，而是选择最小满足约束的组合。约束应该先分类，再决定是否增加并行维度：</p>
+<pre><code>capacity constraints -> FSDP / ZeRO / TP / PP / CP
+topology constraints -> placement / hybrid shard
+algorithm constraints -> global batch / LR
+operations constraints -> checkpoint / rollback</code></pre>
+<table>
+  <thead>
+    <tr><th>约束</th><th>机制怎么工作</th><th>边界</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Capacity</td><td>FSDP/ZeRO 切训练状态；TP 切层内张量；PP 切层；CP/SP 切长序列相关状态</td><td>先用最少维度装下模型和 activation；只因容量不够才继续叠加</td></tr>
+    <tr><td>Topology</td><td>TP 优先放节点内 NVSwitch；DP/FSDP 跨节点要绑定 HCA/rail；HYBRID_SHARD 把 shard 留在节点内、跨节点复制或同步</td><td>跨节点 collective tail 高时先改 placement/hybrid shard，而不是盲目加 NCCL env</td></tr>
+    <tr><td>Algorithm</td><td>world size、microbatch、grad accumulation 共同决定 global batch；LR scaling 和 warmup 必须随 batch 语义审查</td><td>系统 weak scaling 成功不代表 loss parity 自动成立</td></tr>
+    <tr><td>Operations</td><td>每种并行布局都要保存 checkpoint metadata、shard ownership、restore conversion 和 rollback gate</td><td>不能发布没有恢复演练和 rollback 证据的 hybrid 配置</td></tr>
+  </tbody>
+</table>
 <div class="warn"><strong>Hybrid parallel 不是把所有并行维度打开。</strong>每增加一个维度，都要增加 process group 数量、rank placement 规则、checkpoint metadata、restore conversion 工具、profiler 分析复杂度和 failure blast radius。最小满足约束的组合才是正确设计。</div>
 </section>
 

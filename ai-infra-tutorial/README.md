@@ -312,7 +312,7 @@ HTML 版本特点：
 - 浅色 paper 风格，每章独立文件
 - 左侧 sidebar 可视化完整章节导航（含前言、Part 0-8 与附录）
 - mermaid 图表 + 手工 SVG 流程图
-- 所有内容与 Markdown 版本同步
+- 发布前检查公开 Markdown 到 HTML 的一一映射与导航同步
 
 ---
 
