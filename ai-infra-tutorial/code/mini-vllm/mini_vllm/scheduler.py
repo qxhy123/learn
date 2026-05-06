@@ -1,12 +1,19 @@
-"""Plan 1 scheduler: FCFS, no continuous batching, no preemption.
+"""Scheduler — Plan 4: continuous batching with token budget.
 
 State machine:
-    waiting -> running: admitted in a `schedule()` call when running is empty
+    waiting -> running: admitted in a `schedule()` call when token budget allows
     running -> finished: when seq.is_finished()
 
-Plan 4 will turn `_can_admit_more()` from "running is empty" into
-continuous-batching-with-token-budget; Plan 5 adds prefix cache lookup;
-Plan 6 adds swap_in/out and the `swapped` queue.
+Plan 5 will add prefix-cache lookup; Plan 6 adds swap_in/out and the `swapped` queue.
+
+Continuous batching:
+    When `enable_continuous_batching=True` (default), each `schedule()` step
+    tries to admit waiting requests in addition to continuing running ones.
+    Admission is gated by `max_num_batched_tokens` — total tokens (prefill +
+    decode) per step is capped to keep step latency bounded.
+
+    When False, the scheduler falls back to Plan 1 behavior: only admit when
+    `running` is empty. This is the comparison baseline for benchmarks.
 """
 from __future__ import annotations
 from collections import deque
@@ -27,8 +34,12 @@ class SchedulerOutput:
 
 
 class Scheduler:
-    def __init__(self, block_manager: BlockManager):
+    def __init__(self, block_manager: BlockManager,
+                 max_num_batched_tokens: int = 2048,
+                 enable_continuous_batching: bool = True):
         self.bm = block_manager
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.enable_continuous_batching = enable_continuous_batching
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
 
@@ -53,27 +64,41 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         out = SchedulerOutput()
-        # Decode existing running seqs first.
+        token_budget = self.max_num_batched_tokens
+
+        # 1. Continue running seqs first (they have priority — already paid the
+        #    prefill cost, so completing them is the cheapest path to free blocks).
         for seq in self.running:
             if seq.num_prefilled < seq.num_prompt_tokens:
-                # First step after admission: still need prefill.
+                # First step after admission: still need prefill (full prompt at once
+                # in Plan 4; chunked prefill is Plan 5).
                 out.prefill_seqs.append(seq)
+                token_budget -= seq.num_prompt_tokens
             else:
                 # Need to ensure a slot exists for the upcoming token.
-                # Plan 1: just append; out-of-blocks raises (no preemption).
+                # Plan 4: still no preemption — out-of-blocks raises. Plan 6 adds swap.
                 self.bm.append_slot(seq)
                 out.decode_seqs.append(seq)
+                token_budget -= 1
 
-        # Admit new requests only when no running seqs exist (no continuous batching).
-        if not self.running:
-            while self.waiting:
+        # 2. Admit new waiting requests if budget remains.
+        # In Plan 1 mode (continuous batching off), we only admit when the running
+        # queue is empty — preserves the original "process one batch at a time" behavior.
+        can_admit = self.enable_continuous_batching or not self.running
+        if can_admit:
+            while self.waiting and token_budget > 0:
                 seq = self.waiting[0]
+                # Skip if this seq alone would blow the remaining budget.
+                # (Don't want to partially-admit; Plan 5 chunked prefill handles that.)
+                if seq.num_prompt_tokens > token_budget:
+                    break
                 status = self.bm.can_allocate(seq)
                 if status == AllocStatus.OK:
                     self.bm.allocate(seq)
                     seq.status = SequenceStatus.RUNNING
                     self.running.append(seq)
                     out.prefill_seqs.append(seq)
+                    token_budget -= seq.num_prompt_tokens
                     self.waiting.popleft()
                 elif status == AllocStatus.LATER:
                     break

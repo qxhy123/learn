@@ -33,7 +33,11 @@ class LLMEngine:
         dtype = _DTYPES[cfg.model.dtype]
         self.cache_engine = CacheEngine(cfg.model, cfg.cache, cfg.device, dtype)
         self.block_manager = BlockManager(cfg.cache.num_gpu_blocks, cfg.cache.block_size)
-        self.scheduler = Scheduler(self.block_manager)
+        self.scheduler = Scheduler(
+            self.block_manager,
+            max_num_batched_tokens=cfg.max_num_batched_tokens,
+            enable_continuous_batching=cfg.enable_continuous_batching,
+        )
         self.runner = ModelRunner(model, self.cache_engine, self.block_manager, cfg.device)
         self.sampler = Sampler()
         self._next_request_id = 0
