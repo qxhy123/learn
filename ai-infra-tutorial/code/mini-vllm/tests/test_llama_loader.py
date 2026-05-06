@@ -62,3 +62,24 @@ def test_fuse_gate_up_concatenates_in_order():
     assert fused.shape == (2 * I, 64)
     assert torch.equal(fused[:I], gate)
     assert torch.equal(fused[I:], up)
+
+
+from mini_vllm.backends.torch_backend import TorchBackend
+from mini_vllm.models.llama import LlamaModel
+from mini_vllm.models.llama_loader import load_hf_to_llama_model
+
+TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+
+@pytest.mark.slow
+def test_load_tinyllama_weights():
+    cfg = LlamaModel.tinyllama_config()
+    model = LlamaModel(cfg, TorchBackend()).to(torch.float32)
+    load_hf_to_llama_model(model, TINYLLAMA, dtype=torch.float32)
+    # Sanity: embed_tokens should now be non-zero (init was random,
+    # but loaded values overwrite them).
+    assert model.embed_tokens.weight.abs().sum() > 0
+    # Spot-check: layer 0 q (first slice of qkv_proj) shouldn't equal layer 21's.
+    qkv0 = model.layers[0].self_attn.qkv_proj.weight
+    qkv21 = model.layers[21].self_attn.qkv_proj.weight
+    assert not torch.allclose(qkv0, qkv21)

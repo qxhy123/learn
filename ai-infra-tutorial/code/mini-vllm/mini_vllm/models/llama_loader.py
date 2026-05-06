@@ -67,3 +67,78 @@ def _fuse_gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """gate_up_proj = concat(gate, up), so chunk(2) inside LlamaMLP.forward
     yields (gate, up)."""
     return torch.cat([gate, up], dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Full loader: HF model directory (or HF Hub repo) -> our LlamaModel
+# ---------------------------------------------------------------------------
+
+import os
+from collections import defaultdict
+from typing import Optional
+
+from safetensors import safe_open
+from huggingface_hub import snapshot_download
+
+
+def _gather_hf_state_dict(model_dir: str) -> Dict[str, torch.Tensor]:
+    """Read all .safetensors shards in `model_dir` into a flat dict."""
+    state: Dict[str, torch.Tensor] = {}
+    shards = sorted(f for f in os.listdir(model_dir) if f.endswith(".safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No .safetensors files in {model_dir!r}")
+    for shard in shards:
+        path = os.path.join(model_dir, shard)
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                state[k] = f.get_tensor(k)
+    return state
+
+
+def load_hf_to_llama_model(
+    llama_model,                              # LlamaModel instance (random-init)
+    model_id_or_path: str,                    # HF repo id or local dir
+    dtype: Optional[torch.dtype] = None,      # cast loaded weights to this
+) -> None:
+    """Mutates `llama_model` in place: loads weights from `model_id_or_path`."""
+    if os.path.isdir(model_id_or_path):
+        model_dir = model_id_or_path
+    else:
+        model_dir = snapshot_download(model_id_or_path,
+                                      allow_patterns=["*.safetensors", "*.json"])
+
+    hf_state = _gather_hf_state_dict(model_dir)
+    keymap = _hf_to_ours_keymap(list(hf_state.keys()))
+
+    # Group HF tensors by destination key
+    grouped: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+    for hf_key, ours_key in keymap.items():
+        grouped[ours_key][hf_key] = hf_state[hf_key]
+
+    our_state: Dict[str, torch.Tensor] = {}
+    layer_re = re.compile(r"layers\.(\d+)\.")
+    for ours_key, contributors in grouped.items():
+        if ".self_attn.qkv_proj.weight" in ours_key:
+            i = layer_re.search(ours_key).group(1)
+            q = contributors[f"model.layers.{i}.self_attn.q_proj.weight"]
+            k = contributors[f"model.layers.{i}.self_attn.k_proj.weight"]
+            v = contributors[f"model.layers.{i}.self_attn.v_proj.weight"]
+            our_state[ours_key] = _fuse_qkv(q, k, v)
+        elif ".mlp.gate_up_proj.weight" in ours_key:
+            i = layer_re.search(ours_key).group(1)
+            g = contributors[f"model.layers.{i}.mlp.gate_proj.weight"]
+            u = contributors[f"model.layers.{i}.mlp.up_proj.weight"]
+            our_state[ours_key] = _fuse_gate_up(g, u)
+        else:
+            assert len(contributors) == 1, f"Unexpected fan-in for {ours_key}"
+            our_state[ours_key] = next(iter(contributors.values()))
+
+    if dtype is not None:
+        our_state = {k: t.to(dtype) for k, t in our_state.items()}
+
+    missing, unexpected = llama_model.load_state_dict(our_state, strict=False)
+    # Allow unexpected ONLY if it's the rotary buffers (registered but persistent=False)
+    real_unexpected = [k for k in unexpected if "rotary" not in k and "_cached" not in k]
+    if missing or real_unexpected:
+        raise RuntimeError(f"State dict mismatch. Missing: {missing}, "
+                           f"Unexpected: {real_unexpected}")
