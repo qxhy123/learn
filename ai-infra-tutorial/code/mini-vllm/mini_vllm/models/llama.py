@@ -165,3 +165,83 @@ class LlamaAttention(nn.Module):
             out = out_pre if out_pre is not None else out_dec
         out = out.reshape(N, self.num_heads * self.head_dim)
         return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Decoder layer + full model
+# ---------------------------------------------------------------------------
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(self, cfg: ModelConfig, backend: AttentionBackend,
+                 rotary: RotaryEmbedding):
+        super().__init__()
+        self.input_layernorm = LlamaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.self_attn = LlamaAttention(cfg, backend, rotary)
+        self.post_attention_layernorm = LlamaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.mlp = LlamaMLP(cfg.hidden_size, cfg.intermediate_size)
+
+    def forward(self, x, positions, slot_mapping, kv_cache,
+                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                decode_block_table, decode_context_lens):
+        h = self.self_attn(self.input_layernorm(x), positions, slot_mapping, kv_cache,
+                           prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                           decode_block_table, decode_context_lens)
+        x = x + h
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
+
+class LlamaModel(nn.Module):
+    def __init__(self, cfg: ModelConfig, backend: AttentionBackend):
+        super().__init__()
+        self.config = cfg
+        self.backend = backend
+        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        # Single shared RoPE instance reused by all layers.
+        self.rotary = RotaryEmbedding(cfg.head_dim, cfg.max_position_embeddings,
+                                      base=cfg.rope_theta)
+        self.layers = nn.ModuleList([
+            LlamaDecoderLayer(cfg, backend, self.rotary)
+            for _ in range(cfg.num_hidden_layers)
+        ])
+        self.norm = LlamaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        if cfg.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+    def forward(self, input_ids, positions, slot_mapping, kv_caches,
+                prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                decode_block_table, decode_context_lens,
+                sample_indices: torch.Tensor):
+        x = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, positions, slot_mapping, kv_caches[i],
+                      prefill_seq_lens, prefill_query_lens, num_prefill_tokens,
+                      decode_block_table, decode_context_lens)
+        x = self.norm(x)
+        x_sample = x[sample_indices]
+        if self.lm_head is None:
+            logits = x_sample @ self.embed_tokens.weight.T
+        else:
+            logits = self.lm_head(x_sample)
+        return logits
+
+    @staticmethod
+    def tinyllama_config() -> ModelConfig:
+        """Hardcoded config for TinyLlama-1.1B-Chat-v1.0."""
+        return ModelConfig(
+            model_type="llama",
+            vocab_size=32000,
+            hidden_size=2048,
+            num_hidden_layers=22,
+            num_attention_heads=32,
+            num_kv_heads=4,
+            head_dim=64,
+            max_position_embeddings=2048,
+            intermediate_size=5632,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,   # TinyLlama unties them
+            dtype="float32",
+        )
