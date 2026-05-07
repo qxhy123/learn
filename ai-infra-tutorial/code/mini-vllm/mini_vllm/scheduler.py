@@ -81,16 +81,22 @@ class Scheduler:
                                  out: SchedulerOutput) -> None:
         """If `decoding_seq` will need a new GPU block this step and the pool
         is empty, evict the most recently admitted OTHER running seq via swap.
-        Repeats until either there's room or no eligible victim remains."""
-        # How many extra blocks does decoding_seq need this step? Either 0
-        # (still room in last block) or 1 (last block full → new block needed).
+        Repeats until either there's room or no eligible victim remains.
+
+        IMPORTANT: victims must be seqs not yet committed to this step's batch
+        (`out.prefill_seqs` / `out.decode_seqs`). Otherwise the runner would
+        find their block_table pointing at CPU blocks while their slot_mapping
+        still expects GPU writes — corruption."""
         bs = self.bm.block_size
         used = decoding_seq.seq_len
         needed = (used + bs) // bs                    # after writing 1 more token
         have = len(decoding_seq.block_table.physical_blocks)
         extra = max(0, needed - have)
+        committed: set[int] = {id(s) for s in out.prefill_seqs}
+        committed.update(id(s) for s in out.decode_seqs)
         while extra > self.bm.num_free_blocks:
-            victim = self._pick_swap_victim(exclude=decoding_seq)
+            victim = self._pick_swap_victim(exclude=decoding_seq,
+                                            committed=committed)
             if victim is None:
                 break  # no eligible victim; the append_slot will raise
             mapping = self.bm.swap_out(victim)
@@ -99,11 +105,14 @@ class Scheduler:
             victim.status = SequenceStatus.SWAPPED
             self.swapped.append(victim)
 
-    def _pick_swap_victim(self, exclude: Sequence) -> "Sequence | None":
+    def _pick_swap_victim(self, exclude: Sequence,
+                          committed: set[int]) -> "Sequence | None":
         """Pick the most-recently-admitted running seq that's eligible to swap.
-        Recency = position from end of `self.running` (LIFO of admissions)."""
+        Recency = position from end of `self.running` (LIFO of admissions).
+        Skips `exclude` (the seq we're trying to make room for) and any seq
+        already added to this step's prefill/decode batch."""
         for seq in reversed(self.running):
-            if seq is exclude:
+            if seq is exclude or id(seq) in committed:
                 continue
             if self.bm.can_swap_out(seq):
                 return seq

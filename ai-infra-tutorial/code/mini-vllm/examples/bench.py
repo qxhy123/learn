@@ -49,9 +49,13 @@ class Config:
     engine: EngineConfig
 
 
-def _build_configs(model_cfg) -> List[Config]:
+def _build_configs(model_cfg, num_prompts: int) -> List[Config]:
+    # Size the cache so it comfortably holds the workload across all configs.
+    # Each prompt ~20 tokens + decode → ~5 blocks at block_size=8. We allow
+    # ~6 blocks per prompt to keep the non-swap configs running without OOM.
+    big_pool = max(64, num_prompts * 6)
     base = dict(model=model_cfg, device="cpu", seed=0,
-                cache=CacheConfig(block_size=8, num_gpu_blocks=64, num_cpu_blocks=0))
+                cache=CacheConfig(block_size=8, num_gpu_blocks=big_pool, num_cpu_blocks=0))
     # Each config flips one more flag.
     configs = []
     cfg = EngineConfig(
@@ -90,9 +94,14 @@ def _build_configs(model_cfg) -> List[Config]:
     )
     configs.append(Config("+ prefix caching", cfg))
 
-    # For the swap config, shrink the GPU pool and add a CPU pool.
+    # For the swap config, halve the GPU pool (forcing swap to engage) and
+    # give a generous CPU pool. We can't go below ~half because our scheduler
+    # rejects committed/shared seqs as swap victims, so a too-small pool
+    # creates unrecoverable OOM in dense batches.
     swap_base = dict(base)
-    swap_base["cache"] = CacheConfig(block_size=8, num_gpu_blocks=16, num_cpu_blocks=64)
+    swap_base["cache"] = CacheConfig(block_size=8,
+                                     num_gpu_blocks=big_pool // 2,
+                                     num_cpu_blocks=big_pool * 2)
     cfg = EngineConfig(
         **swap_base,
         enable_continuous_batching=True,
@@ -161,7 +170,7 @@ def main():
     backend = TorchBackend()
     sniff_model = ToyGPT.random_init(backend, vocab_size=50257, n_layer=2,
                                      d_model=64, n_head=4, max_pos=256, seed=0)
-    configs = _build_configs(sniff_model.config)
+    configs = _build_configs(sniff_model.config, args.num_prompts)
 
     rows = []
     print(f"\nbench: {args.num_prompts} prompts × {args.max_tokens} tokens, toy GPT (n_layer=2, d=64)")
