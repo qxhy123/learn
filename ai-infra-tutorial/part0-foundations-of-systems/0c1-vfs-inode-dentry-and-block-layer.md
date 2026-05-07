@@ -516,7 +516,7 @@ NVMe 把数据写到 NAND → CQ 写完成项 → MSI-X 触发 IRQ → 落到指
 - 小文件随机读：每次 cuFile 都要走 Direct IO 路径，对齐要求严格，小请求收益不抵元数据开销。
 - 需要 CPU 解码（JPEG decode、tokenize）：数据必须先到 CPU 才能算，GDS 没意义。
 
-诊断和拓扑见 [0d3c](0d3-rdma-roce-infiniband-and-gpudirect.md)。常见现象：未配 GDS 时 `nvidia-smi dmon` 显示 PCIe RX 流量集中在 GPU0，CPU 内存带宽被打满；配置正确后 `gdscheck -p` 报告 supported，且 `iostat` 上看不到对应 page-in 流量。
+诊断和拓扑见 [0d3c](0d3c-gpudirect-rdma-gpu-nic-topology-and-diagnostics.md)。常见现象：未配 GDS 时 `nvidia-smi dmon` 显示 PCIe RX 流量集中在 GPU0，CPU 内存带宽被打满；配置正确后 `gdscheck -p` 报告 supported，且 `iostat` 上看不到对应 page-in 流量。
 
 ## 9. fio：不要只跑一个默认测试
 

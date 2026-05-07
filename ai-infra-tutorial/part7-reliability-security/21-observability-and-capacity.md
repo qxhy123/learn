@@ -291,17 +291,18 @@ cumulative: 100, 120, 150, 180, 200
 - **`+Inf` bucket 装 1% 以上**：P99 一定不准。
 - **bucket 边界粒度粗于真实分布**：插值假设均匀但真实是双峰时错。
 
-**Native histograms（Prometheus 2.40+ 实验性）**：
+**Native histograms（版本口径）**：
 
 - 自适应 bucket（指数 schema），不需要预定义 le。
 - bucket 数动态，精度自适应（典型 ε < 1%）。
 - 单个 series 存所有 bucket 信息（不再每 bucket 一条 series），cardinality 大幅下降。
-- 兼容性问题：旧 Grafana / Prometheus 不支持，生产采用前要全栈升级。
+- 版本状态：早期 Prometheus 2.40+ 需要特性开关，仍按实验性能力对待；Prometheus 3.8+ 中 native histograms 已稳定。
+- 兼容性问题：生产采用前仍要验证采集端、远端存储、Grafana 面板和 PromQL 查询兼容性。
 
 **生产建议**：
 
 - 业务关键 SLO metric 必须自定义 bucket，不要用客户端库默认值。
-- Prometheus 2.40+ 集群可以新 metric 用 native histogram，旧 metric 维持 classic。
+- Prometheus 3.8+ 集群可以评估新 metric 使用 native histogram，旧 metric 维持 classic；早期 2.40+ 集群需要确认特性开关、采集链路和查询链路都支持。
 - Grafana 面板的 P99 panel 要看 bucket 是否合理——常见错误是用默认 bucket 监控 sub-millisecond latency。
 
 #### 21.2.8 OpenTelemetry Collector 内部架构
@@ -1345,7 +1346,7 @@ if __name__ == "__main__":
 
 ### 21.11.4 训练任务的 Spot 容错策略
 
-与[第 10 章](../part4-training-systems/10-elastic-training-and-fault-tolerance.md)的 Elastic Training 机制配合：
+与[第 10 章](../part3-training-infra/10-memory-checkpointing-and-recovery.md)的 Elastic Training 机制配合：
 
 - **Checkpoint 频率**：Spot 环境建议每 10-15 分钟 checkpoint 一次，比普通环境（30-60 分钟）更频繁
 - **异步 checkpoint**：训练继续进行的同时，后台线程将 checkpoint 写入对象存储，避免 checkpoint 期间的算力停顿

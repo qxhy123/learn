@@ -461,19 +461,20 @@ sequenceDiagram
     R->>S: multipart upload rank_N.pt (1 part = 100 MB)
     R->>S: complete multipart upload
     Note over R: barrier：等所有 rank upload 完成
-    R->>M: rank 0 PUT manifest.json (含所有分片 key + sha256)
-    R->>S: rank 0 PUT ckpt_latest = "step52000"
+    R->>M: rank 0 PUT manifest.json (含所有分片 key + sha256 + etag/generation)
+    R->>S: rank 0 conditional PUT ckpt_latest = "step52000"
     Note over S: marker key 写入后，版本对外可见
 ```
 
 S3 的 multipart upload 保证：
 - 单个 part 上传失败不影响其他 part
 - `complete_multipart_upload` 是服务端原子操作（key 要么可见要么不可见）
-- manifest 写入后，reader 才认为这个版本"committed"
+- manifest 写入后，reader 还必须校验每个 shard 的 `sha256`、size、multipart `etag` 或对象存储 generation/version id，确认 manifest validated 后才认为这个版本"committed"
+- `ckpt_latest` 这类 marker key 必须用条件写：S3 用 `If-Match` / `If-None-Match` 配合当前 ETag，GCS 用 generation precondition，OSS 用等价条件头，避免两个训练作业或重试进程互相覆盖最新指针
 
 > **[success] S3 版本化（Versioning）可以防止覆盖**：开启 S3 Bucket versioning 后，即使 manifest 被意外覆盖，旧版本的 manifest 仍可恢复。建议在 checkpoint bucket 上开启 versioning 并设置 Object Lock，防止误删。
 
-> **[danger] LIST prefix 不是事务边界**：不要用 `s3 ls s3://bucket/ckpt_step52000/` 来判断 checkpoint 是否完整，因为 LIST 看到的文件可能来自多个并发写入操作的混合状态。必须用 manifest 的存在性和内容作为完整性判断。
+> **[danger] LIST prefix 不是事务边界**：不要用 `s3 ls s3://bucket/ckpt_step52000/` 来判断 checkpoint 是否完整，因为 LIST 看到的文件可能来自多个并发写入操作的混合状态。必须用 validated manifest 的存在性、内容和 marker key 条件写结果作为完整性判断。对象存储语义见 [§0c 文件系统](../part0-foundations-of-systems/0c-filesystems-and-storage-internals.md)，checkpoint manifest 的基础协议见 [第10章](../part3-training-infra/10-memory-checkpointing-and-recovery.md)。
 
 ---
 
@@ -498,10 +499,12 @@ checkpoint overhead 成本：
 E[overhead] = (t_save / T) × C × T_total
 ```
 
-对 T 求导取极小值，近似最优间隔：
+对 T 求导取极小值，得到 Young/Daly 一类的一阶近似最优间隔：
 ```
 T* = sqrt(2 × t_save / λ)
 ```
+
+也可以写成等价模板 `T ≈ sqrt(2C/λ)`，其中 `C` 是一次 checkpoint 在关键路径上的时间成本（小时），这里与 `t_save` 同义；`λ` 是作业级故障率（次/小时），不是单卡故障率，集群越大通常越高。这个公式假设故障服从近似泊松过程、故障在两次 checkpoint 之间均匀落点、恢复时间和重排队时间可忽略、checkpoint 成本固定且不会与训练完全重叠。真实系统里如果有异步 checkpoint、preemption warning、恢复要重新排队、对象存储带宽抖动、checkpoint backlog 或验证 manifest 的额外延迟，就要把 `C` 改成实际暴露在关键路径上的成本，并单独加入 restore/requeue 代价。
 
 | 场景 | λ（次/小时） | t_save（分钟） | T*（分钟） | 吞吐损失 |
 |------|------------|--------------|----------|---------|

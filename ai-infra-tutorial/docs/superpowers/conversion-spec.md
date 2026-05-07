@@ -15,6 +15,8 @@
 
 `html/preface.html` 是根目录页面，资源路径必须使用 `assets/`、`sidebar.html`、`part*/...html`，不要使用章节页的 `../assets/` 前缀。它在 `html/assets/tutorial-data.js` 中作为开头的“开始之前”导航项登记，推荐 `id: "preface"`、`path: "preface.html"`、`title: "前言：如何使用本教程"`。
 
+lab 章如采用轻量 HTML 包装或 Markdown 主体直出，必须在转换报告中作为例外声明；未声明例外时，后续构建仍需补齐 §1/mindmap/refbox/bottomnav 等本规范要求。
+
 ## 2. 必须出现的结构元素
 
 每个章节 HTML 必须按下列顺序包含：

@@ -115,11 +115,11 @@ mindmap
 
 一个容易被忽视的事实：**LLM 推理服务性能差异的 10 倍甚至 20 倍，往往不来自模型本身，而来自调度器**。
 
-这一点在 2023 年之后被反复验证：
+这一点在 2023 年之后被反复验证。但下面这些数值只能当作**特定 benchmark 的数量级**，不能直接外推到你的线上服务；必须同时给出模型、输入/输出长度分布、并发、GPU、引擎版本、attention backend、是否启用 prefix cache / chunked prefill，以及 TTFT/TPOT/goodput 的测量口径。
 
-- vLLM 相对 Hugging Face 原生 Transformers：**吞吐 24x**，来自 PagedAttention + continuous batching
-- Continuous batching 相对 static batching：**P50 延迟降低、吞吐提升 23x**（Anyscale 早期测试）
-- 开 prefix cache 的 chatbot：**TTFT 近乎归零**（相同 system prompt 的请求）
+- vLLM 相对 Hugging Face 原生 Transformers：在早期特定 benchmark 中出现过**约 24x 吞吐量级**，主要来自 PagedAttention + continuous batching
+- Continuous batching 相对 static batching：在 Anyscale 早期特定测试中出现过**约 23x 吞吐量级**，同时延迟分位数依赖 workload
+- 开 prefix cache 的 chatbot：当 system prompt / tokenizer / 模板完全一致且命中率高时，**可显著降低命中部分的 prefill 与 TTFT**，但不代表全请求 TTFT 无条件接近 0
 
 这些数字背后是同一件事 —— **GPU 是昂贵的，不能让它空等**。调度器的全部工作就是在显存、吞吐、延迟、公平性之间做实时权衡，让 GPU 尽可能多做"有价值的工作"。
 
@@ -196,7 +196,7 @@ Disaggregated prefill / decode（DistServe、Mooncake）
      把两个阶段彻底拆到不同机器
 ```
 
-对大多数团队来说，**continuous batching 是必选项，chunked prefill 是默认开启**，disaggregated 是"大规模长上下文业务才考虑"的选项。
+对大多数团队来说，**continuous batching 是基础能力，chunked prefill 要按当前引擎 release/config 验证是否启用**，disaggregated 是"大规模长上下文业务才考虑"的选项。
 
 ### 15.2 Prefill 与 Decode 的本质区别
 
@@ -936,6 +936,8 @@ PagedAttention 的思路类似操作系统分页：
 
 在 PagedAttention 语境里，**block/page** 可以理解为 KV Cache 的物理页。它通常包含一段固定 token 数的 KV，例如 `block_size=16` 表示一个 block 存 16 个 token 在所有层上的 K/V（实际布局由引擎决定）。请求看到的是逻辑 token 序列，runtime 看到的是 block table。
 
+> **容量公式与 kernel layout 是两件事**：容量估算只关心"有多少 token 的 K/V 需要常驻"，常用公式是 `resident_kv_bytes ~= resident_tokens × layers × 2(K,V) × kv_heads_per_rank × head_dim × bytes_per_kv_element`，再按 `ceil(tokens / block_size) × block_size` 计入尾部碎片。kernel/backend layout 则关心这些 K/V 在 HBM 里的维度顺序、tile 形状、对齐和访问模式。实际 layout 会受 attention backend、GPU、KV dtype、TP rank、engine version 影响，不能从教学公式反推出真实 kernel 内存排布。
+
 ```text
 Logical tokens of request R:
   token 0 ... 15 | token 16 ... 31 | token 32 ... 47 | token 48 ...
@@ -1002,11 +1004,11 @@ Req B: "You are a helpful assistant. <user: capital of France?>"
 这带来两个巨大收益：
 
 1. **显存节省**：高复用的 system prompt 只需存一份
-2. **TTFT 降到接近零**：后续相同 prefix 的请求直接跳过 prefill 部分
+2. **命中部分 TTFT 显著降低**：后续相同 prefix 的请求可以跳过已命中 prefix 的 prefill 部分
 
-根据 vLLM V1 的数据：**prefix cache 命中时 TTFT 降到近零；即使零命中，也几乎没有吞吐损失（<1%）**。
+根据部分 vLLM V1 benchmark 口径：prefix cache 命中时，已命中 prefix 对应的 prefill 成本可以大幅下降；零命中时的额外开销通常较小。但这些结论必须随模型、prompt 模板、命中率、并发、版本和测量口径复测，不能把"命中 prefix 很快"写成"整请求 TTFT 近乎归零"。
 
-对平台工程的启示：**prefix cache 应该默认开启**，没有理由不开。但要配合 prefix-aware 路由（见 [第14章](14-online-inference-architecture.md) §14.3.1），否则命中率会被随机路由拉低。
+对平台工程的启示：prefix cache 在共享 system prompt、RAG 模板、few-shot 这类场景通常值得开启；具体是否默认开启、开关名称和指标名称要以当前 vLLM release/config 为准。上线时要配合 prefix-aware 路由（见 [第14章](14-online-inference-architecture.md) §14.3.1），否则命中率会被随机路由拉低。
 
 #### 15.7.4 Prefix Cache 的失效条件
 
@@ -1060,7 +1062,7 @@ Forward pass 的 batch 构成（chunked prefill 启用）:
 
 #### 15.7b.2 什么时候 chunked prefill 是默认项
 
-vLLM V1、TensorRT-LLM、SGLang 都已经默认开启或推荐开启 chunked prefill。对大多数团队的建议是：
+vLLM、TensorRT-LLM、SGLang 的 chunked prefill 默认行为和参数名会随 release、engine mode 与 backend 变化，生产判断以当前 vLLM release/config 为准。对大多数团队的建议是：
 
 - **如果你的流量有任何长 prompt**（> 1K token），开
 - **如果你的 TPOT 在某些时段异常**，开
@@ -1092,12 +1094,27 @@ vLLM V1、TensorRT-LLM、SGLang 都已经默认开启或推荐开启 chunked pre
 | `max_num_seqs` | 单 step 最多多少个请求同时跑 | 128-512 | 吞吐 vs TTFT/TPOT |
 | `max_num_batched_tokens` | 单 step 所有 token（prefill+decode）总上限 | 4K-16K | 控制 prefill 切片大小 |
 | `gpu_memory_utilization` | 显存占用比例 | 0.85-0.95 | 留给 KV 的空间 vs OOM 风险 |
-| `enable_prefix_caching` | 是否开 prefix cache | 默认 True | 几乎总是开 |
-| `enable_chunked_prefill` | 是否开 chunked prefill | 默认 True（V1） | 几乎总是开 |
+| `enable_prefix_caching` | 是否开 prefix cache | 以当前 vLLM release/config 为准 | 共享前缀场景优先验证开启 |
+| `enable_chunked_prefill` | 是否开 chunked prefill | 以当前 vLLM release/config 为准 | 长 prompt 场景优先验证开启 |
 | `block_size` | PagedAttention block 大小 | 16 | 很少需要动 |
 | `swap_space` | CPU 上给 preemption 保留多少 | 4-16 GB | swap vs recompute 选择 |
 
 调参心法：**先固定架构选项（prefix cache、chunked prefill 都开），再调数值参数**。数值参数之间耦合很强，一次动一个变量。
+
+#### 15.8.2 业务流量到副本数：容量估算 worksheet
+
+把线上流量转成副本数时，不要从单条 benchmark 的 tokens/s 直接除。更稳的 worksheet 是：
+
+| 步骤 | 输入 | 计算 / 观测 | 输出 |
+|------|------|-------------|------|
+| 1. 长度分布 | `input_tokens`、`output_tokens` 的 P50/P90/P99，按租户/接口分桶 | 区分短问答、长 RAG、代码补全、agent tool-use | 代表性流量桶 |
+| 2. resident KV | 活跃请求数、已生成长度、prefix 命中率、KV dtype、TP | `resident_tokens ~= active_prefill_tokens + active_decode_context_tokens - shared_prefix_tokens`；再套 KV 容量公式 | 每桶常驻 KV bytes |
+| 3. admission 上限 | GPU HBM、权重、workspace、通信 buffer、LoRA adapter | `max_num_seqs` 不能超过 KV 池和 token budget 同时允许的工作点 | 每副本可安全 active seqs |
+| 4. goodput | 压测得到 TTFT/TPOT P99 下的有效 output tokens/s | goodput 只计算满足 SLO 的 token，不把超时 token 当产能 | 每副本有效产能 |
+| 5. replicas | 目标 QPS × 输出长度分布 × 峰值系数 | `replicas = ceil(required_goodput / per_replica_goodput)`，再乘 N+1 或可用区冗余 | 初始副本数 |
+| 6. autoscaling 指标 | `kv_cache_usage`、`num_running_seqs`、queue time、TTFT/TPOT、preemption、prefix hit | 以 SLO 和 KV 压力共同扩缩，避免只看 GPU 利用率 | HPA/KEDA 指标组合 |
+
+经验上，长上下文服务常由 resident KV 限制，短问答高并发常由 decode goodput 限制，RAG burst 常由 TTFT 和 prefill queue 限制。副本数估算必须按桶做，再把各桶按流量占比合成。
 
 ### 15.9 Speculative Decoding 简述
 
@@ -1131,6 +1148,8 @@ sequenceDiagram
 
 它适合的是 decode 成本占主导、且平台能接受更复杂运行时的场景，不是所有在线服务的默认优化项。
 
+正确性依赖 rejection sampling 的条件：draft 只能提出候选，最终接受/拒绝必须使用 target 分布的概率比修正；fallback token 必须从修正后的 residual distribution 或 target 分布路径产生；采样参数、logits processor、stop 条件和 tokenization 必须在 draft/target verify 中一致。若实现只是"target 看起来同意就接受"，就可能改变目标模型分布。
+
 #### 15.9.1 几种投机解码变体
 
 | 变体 | 草稿来源 | 典型加速 | 复杂度 |
@@ -1153,7 +1172,7 @@ sequenceDiagram
 
 所以投机解码不是"全场景加速器"，它是**给低并发或长输出场景的特效药**。
 
-**工程边界**：上线 speculative decoding 前要先压测 accepted tokens/step，而不是只看论文里的加速倍数。若 draft 每步预测 4 个 token，但平均只接受 1.2 个，同时目标模型验证 forward 让 batch token 数翻倍，decode pool 的 goodput 可能下降。生产上至少要观测 `draft_latency_ms`、`verify_latency_ms`、`acceptance_rate`、`accepted_tokens_per_step`、`fallback_rate` 和 ITL P99；并按场景开关，例如代码补全、结构化 JSON、长文本续写可打开，短问答、高并发聊天可关闭或只对低负载时段启用。使用独立 draft model 时还要考虑权重显存、版本一致性和发布回滚；使用 Medusa/EAGLE 这类模型内方法时，要确认推理引擎、量化路径和 KV layout 都支持对应 head 或 hidden-state 预测。
+**工程边界**：上线 speculative decoding 前要先压测 accepted tokens/step，而不是只看论文里的加速倍数。temperature 越高、top-p 越激进、logits processor 越多，draft 与 target 的可接受前缀通常越短；guided/grammar decoding、JSON schema、tool-call 约束会改变合法 token 集，必须确认 draft 和 target 使用同一约束状态机，否则 acceptance rate 会下降甚至破坏正确性。若 draft 每步预测 4 个 token，但平均只接受 1.2 个，同时目标模型验证 forward 让 batch token 数翻倍，decode pool 的 goodput 可能下降。生产上至少要观测 `draft_latency_ms`、`verify_latency_ms`、`acceptance_rate`、`draft_tokens_per_step`、`verify_tokens_per_step`、`accepted_tokens_per_step`、`fallback_rate` 和 ITL P99；并按场景开关，例如代码补全、结构化 JSON、长文本续写可打开，短问答、高并发聊天可关闭或只对低负载时段启用。使用独立 draft model 时还要考虑权重显存、draft/target KV 双份占用、版本一致性和发布回滚；使用 Medusa/EAGLE 这类模型内方法时，要确认推理引擎、量化路径和 KV layout 都支持对应 head 或 hidden-state 预测。
 
 ### 15.10 MoE 模型的调度特殊性
 

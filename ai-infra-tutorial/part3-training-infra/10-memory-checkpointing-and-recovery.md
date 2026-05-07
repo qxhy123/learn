@@ -1283,6 +1283,8 @@ NCCL hang 排查顺序：
 
 生产 checkpoint 不是文件保存，而是协议：schema、writer ownership、atomic visibility、validation、cleanup、retention、RPO/RTO、cross-parallelism restore 都是协议的一部分。TorchElastic 可以重建 worker group，但不能替你定义训练语义；NCCL hang 和 straggler 也不能只靠重启掩盖，必须有 rank 级证据链。可靠的训练平台把失败当常态，把 last-good checkpoint 当控制面事实来源，把恢复演练当发布门禁。
 
+本章交付物是 `checkpoint_recovery_drill.md`：它接收第8-09e章的 DP/FSDP、TP/PP/CP 和 MoE checkpoint schema，记录 dry-run、故障注入、RPO/RTO、last-good manifest 和跨并行形态恢复边界。下一章会把这个 validated base checkpoint 作为 SFT/RLHF 的输入，而不是把未验证权重目录直接交给后训练流水线。
+
 ---
 
 ## 14. 练习题

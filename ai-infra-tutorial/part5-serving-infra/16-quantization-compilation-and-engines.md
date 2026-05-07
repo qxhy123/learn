@@ -107,6 +107,8 @@ mindmap
 - **编译不是"一次搞定"**，它产出的是带前提假设的制品，shape 超出假设就会退化
 - **引擎选型不只是 benchmark**，它还决定了你平台的发布、回滚、排障方式
 
+> **版本矩阵 / 适用口径**：本章涉及 vLLM V1、SGLang、TensorRT-LLM、ModelOpt、FP8 KV、FP4/FP8、FlashAttention V3、A100/H100/B200 等能力时，都默认需要按实际版本、GPU SKU、CUDA/driver、attention backend、量化 checkpoint、容器镜像或 commit 重新确认。表格里的"支持"表示常见能力方向，不等于任意版本和任意模型都可直接上线；benchmark 结论必须附带模型、输入/输出分布、并发、测量指标和复测环境。
+
 ### 概念先说清楚：三层边界
 
 本章的三个词经常被混用，先把边界说清楚：
@@ -264,7 +266,7 @@ flowchart TD
 | INT4（W4A16） | 部分（weights-only） | 部分 | 部分 | 支持更广 |
 | MXFP8 / NVFP4 | ✗ | ✗ | ✗ | ✓ |
 
-这张表的意思：你手里的卡决定了你能上什么精度。比如 A100 不支持 FP8，想上 FP8 要等到 H100；B200 引入的 MXFP8/NVFP4 则是面向未来的路线。
+这张表的意思：你手里的卡决定了你能上什么低精度计算路径。比如 A100 没有 Hopper FP8 Tensor Core，不能把 FP8 当作通用计算加速路线；某些引擎可能支持在 A100 上用 FP8 KV 做存储压缩，但那首先是容量收益，不等同于 TPOT 一定下降。H100 之后才需要重点评估 FP8 计算、FA3 融合反量化等性能口径；B200 引入的 MXFP8/NVFP4 则是面向更新硬件的软件栈路线。
 
 对平台决策者：**量化方案要和硬件采购路线对齐**，否则"明年换 H100，今年先上 FP8"这种表述往往落不了地。
 
@@ -579,7 +581,7 @@ K 和 V 的 dynamic range 通常不同：K 经过 RoPE 后值域更窄，V 来�
 
 **实际工程选择**：
 
-- **vLLM `kv_cache_dtype=fp8`**（H100+）：FP8 E4M3 + per-channel scale + FA3 融合反量化。是 LLaMA-70B 长上下文场景的几乎默认选择。
+- **vLLM `kv_cache_dtype=fp8`**：在 A100 上即便版本支持，也主要按"KV 存储容量减半、降低 preemption/OOM 风险"评估，不应默认承诺 TPOT 提升；在 H100+ 且 attention backend 走 FA3/融合反量化路径时，才可能同时讨论容量与性能收益。上线前必须对 BF16 KV vs FP8 KV 做同环境 P99 TTFT/TPOT/goodput 复测。
 - **vLLM `kv_cache_dtype=fp8_e5m2`**：实验性，dynamic range 大但精度差，长上下文质量明显回退，**不要用于生产**。
 - **TRT-LLM `kv_cache_dtype=int8`**：per-token scale + per-K/V scale，配合 GPT attention plugin 内部融合反量化。
 - **vLLM INT4 KV**：实验性，per-token + per-channel 双向 scale；显存对半再对半，但长上下文（>16K）质量回退明显，慎用。
@@ -815,7 +817,7 @@ flowchart TD
   S -->|不能| C
 ```
 
-**一个行业观察**：2024-2025 年的推理引擎格局正在快速收敛到 vLLM 为核心的开源生态。TensorRT-LLM 在绝对性能上仍领先，但 vLLM 在功能覆盖（量化方案、新硬件支持、调度优化）和社区活跃度上遥遥领先。对大多数团队，**先上 vLLM、特殊场景再评估 TensorRT-LLM** 是稳妥路径。
+**一个评估框架**：不要用"某引擎遥遥领先"来做选型结论，而要把引擎放进同一套 workload 里比较：模型与量化格式支持、input/output length 分布、TTFT/TPOT/goodput、prefix/cache 命中、KV 容量、显卡与网络拓扑、发布回滚成本、metrics 可观测性和团队维护能力。vLLM 常适合作为通用在线生成基线；TensorRT-LLM、SGLang、TGI、llama.cpp 是否更合适，要由这些维度的复测结果决定。
 
 #### 16.7.3 vLLM / TensorRT-LLM / SGLang 内部机制对比
 

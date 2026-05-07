@@ -1,6 +1,6 @@
 # 第 09e 章 · MoE 训练基础设施
 
-> 2024-2025 年的大模型训练已经从 dense 集中走向 MoE：Mixtral 8×7B、DeepSeek-V2/V3、Qwen2-MoE、Grok、GPT-4、Claude 都采用了某种形式的 sparse expert 架构。MoE 让模型容量（总参数）增长不再线性拉高 FLOPs，但代价是：每个 MoE layer 的 forward 至少 dispatch + combine 两次 All-to-All，backward 还要反向通信，必须在数百个 expert 之间维持 load balance，必须把 checkpoint 从"按层 shard"改成"按 expert shard"。本章把 MoE 训练当成 [第 9 章](./09-model-pipeline-parallel.md) 的第六个并行维度（EP）来系统讲。
+> 2024-2025 年的大模型训练已经从 dense 集中走向 MoE：公开资料可确认的代表包括 Mixtral 8×7B、DeepSeek-V2/V3、Qwen2-MoE 等；Grok 等模型也公开披露了 MoE / sparse expert 方向。GPT-4、Claude 这类闭源模型是否采用 MoE 只能作为外部推测或行业传闻处理，不能写成确定事实。MoE 让模型容量（总参数）增长不再线性拉高 FLOPs，但代价是：每个 MoE layer 的 forward 至少 dispatch + combine 两次 All-to-All，backward 还要反向通信，必须在数百个 expert 之间维持 load balance，必须把 checkpoint 从"按层 shard"改成"按 expert shard"。本章把 MoE 训练当成 [第 9 章](./09-model-pipeline-parallel.md) 的第六个并行维度（EP）来系统讲。
 
 > **关联章节**：阅读本章前请先掌握 [§9](./09-model-pipeline-parallel.md) 的 5 维并行（DP/TP/PP/CP/SP）和 rank mesh 的责任划分；阅读本章后再去 [§10](./10-memory-checkpointing-and-recovery.md) 看 checkpoint 协议在 expert shard 维度的影响。
 
@@ -17,7 +17,7 @@ MoE 训练要解决的不可化简问题，可以浓缩成一句话：
 同时 step time、显存、collective、checkpoint 和故障域都还能在生产规模下收敛？
 ```
 
-dense 模型把"参数 = 容量 = FLOPs"绑死。每加一个 layer 或加宽一个 hidden，激活就要走完所有权重，FLOPs 线性涨。结果是 70B → 405B → 1T 走到一定程度，单 step 算力就吃不消。MoE 的本质是把"FFN 这种容量大但每 token 只需要一小部分的算力"通过 router 稀疏化：每个 token 只激活 N 个 expert 中的 K 个（典型 K=2 或 K=8）。模型容量乘 N，但每 token FLOPs 只乘 K/N。
+dense 模型把"参数 = 容量 = FLOPs"绑死。每加一个 layer 或加宽一个 hidden，激活就要走完所有权重，FLOPs 线性涨。结果是 70B → 405B → 1T 走到一定程度，单 step 算力就吃不消。MoE 的本质是把"FFN 这种容量大但每 token 只需要一小部分的算力"通过 router 稀疏化：每个 token 只激活 N 个 routed expert 中的 K 个（典型 K=2 或 K=8）。在单个 MoE layer 的 routed FFN 局部口径下，expert FFN 计算大致随 K 增长，而不是随全部 N 个 expert 增长；不能把端到端每 token FLOPs 简化成"只乘 K/N"。完整 step time 还包括 attention、router、shared expert、dispatch/combine、load imbalance、activation recompute、反向传播通信和 optimizer/checkpoint 等路径。
 
 但这不是免费的。一旦把 expert 切到不同 GPU（Expert Parallelism），系统就被强行拉出"算力主导"区，进入"通信 + 路由调度"主导的世界。新出现的不可化简问题包括：
 
@@ -366,15 +366,15 @@ flowchart TB
 | group aggregate remote wire | ~`N-1 × D` 每阶段，AllReduce 两阶段约 `2(N-1)D` | ~`(N-1) × D` |
 | 网络压力 | 均匀，链路友好 | incast 严重，受 ECMP 哈希影响 |
 | 时延 | 与 N 线性 | 与 N 线性，但常数大 |
-| NCCL 实现 | 成熟，多种算法 | 常用 `ncclAlltoAll` 或 P2P alltoallv；生产 MoE 往往接 DeepEP / FlexDispatcher |
+| NCCL 实现 | 成熟，多种算法 | NCCL AllToAll API 的可用版本和语义需要按目标 NCCL release 核对；生产 MoE 更常围绕 P2P alltoallv、framework dispatcher、DeepEP / FlexDispatcher 组合实现 |
 | 失败影响 | 慢一段 | 全 group 同时 hang |
 
 ### 4.4 NCCL / P2P alltoallv 与网络规划
 
-MoE 里不要假设存在一个通用的 NCCL all-to-all 专用算法开关可以解决问题。常见路径是：
+MoE 里不要假设存在一个通用的 NCCL all-to-all 专用算法开关可以解决问题，也不要把 `ncclAlltoAll` 写成所有生产 MoE 的常用/默认事实。NCCL 已有 AllToAll API 的版本、等长/不等长 payload 语义、in-place/out-of-place 限制和 framework 暴露方式，都需要按目标 NCCL release 与训练框架核对。dropless MoE 的难点通常是可变长度通信计划、token layout、dispatch/combine metadata、通信计算 overlap、buffer 峰值和失败恢复语义，而不是单个 collective API 名称。常见路径是：
 
 ```text
-固定等长 payload: ncclAlltoAll / grouped send-recv
+固定等长 payload: NCCL AllToAll API（版本语义需核对）/ grouped send-recv
 可变长度 dropless payload: P2P alltoallv / framework flex dispatcher
 DeepSeek-V3 风格: DeepEP normal/low-latency kernels + FlexDispatcher 集成
 
@@ -672,7 +672,7 @@ DeepEP 不是"替换 NCCL 后自动加速 MoE"。它通常处在 framework dispa
 | dtype | payload 常见 BF16/FP16，router logits/bias/统计建议 FP32；量化通信需显式处理 scale 和 combine 精度 |
 | SM budget | dispatch/combine kernel 会占 SM，与 expert GEMM 抢资源；需要限制通信 kernel 占用，避免 overlap 变成互相挤压 |
 | buffers | 预分配 send/recv、combine、metadata、workspace；dropless 要按 p99/p999 token load 留峰值余量 |
-| fallback | DeepEP 不可用、buffer 不足、alltoallv plan 异常时，要能退回 framework P2P / `ncclAlltoAll` / fixed-capacity 保护路径，并把触发计数打到告警 |
+| fallback | DeepEP 不可用、buffer 不足、alltoallv plan 异常时，要能退回 framework P2P、经版本语义核对的 NCCL AllToAll 路径或 fixed-capacity 保护路径，并把触发计数打到告警 |
 
 最容易踩的坑是只接了 DeepEP kernel，没有把 flex dispatcher 的 token layout、ETP shard、gate weight、combine index 和 fallback 语义一起接上。结果看起来通信 kernel 变快了，端到端 step time 却被重排、buffer 拷贝或 straggler 吃掉。
 
@@ -988,7 +988,7 @@ top-K 是不可微的（只有被选中的 expert 收到梯度）。常见症状
 |---|---|---|
 | 总参数 | 70B | 671B |
 | 激活参数 / token | 70B | 37B |
-| 单 step FLOPs | 1× baseline | 0.5× baseline |
+| 单 step FLOPs | 1× baseline | routed FFN 局部 FLOPs 低于同总参数 dense；端到端 step time 取决于 attention/router/shared expert/dispatch/combine/load imbalance/backward communication |
 | HBM 单卡（无 sharding） | 800 GB+ | 8 TB+（必须 EP） |
 | 通信 per step | DP AllReduce + TP AllReduce | forward 2× A2A / MoE layer，backward 2× A2A，checkpoint recompute 可能再加 |
 | checkpoint 大小 | ~140 GB（fp16） | ~1.4 TB |
@@ -1274,6 +1274,8 @@ sequenceDiagram
 | MoE checkpoint | 必须含 expert→rank 映射 + 控制器状态 |
 | inference 路径 | 与训练完全分离，不可复用 EP=64 |
 | 故障半径 | 一个 expert GPU 挂 → 全 EP group hang，必须 fast detect |
+
+本章交付物是 `moe_ep_report.md`：它接收第9章的 70B dense rank mesh，补充 EP group、expert placement、router/load-balance 指标、All-to-All 证据和 MoE checkpoint manifest。下一章会把 dense 与 MoE 两类 checkpoint 都纳入 dry-run/recovery，验证 expert、router controller、parallel metadata 和 optimizer shard 能否在事故后严格恢复。
 
 ---
 

@@ -1,6 +1,6 @@
 # 第6b章：CUDA Stream、同步与 CUDA Graph
 
-> **关联章节**：本章是 [第6章](./06-cuda-runtime-and-kernels.md) 中 stream、同步和 CUDA Graph 的独立展开。第6章回答"模型调用怎样落到 CUDA runtime 和 kernel"，本章专注"命令流怎样排队、等待、重叠和回放"。H2D、PCIe、NUMA、pinned memory 的主机设备路径见 [第5b章](./05b-host-device-io-pcie-numa-and-overlap.md)；GPU 执行模型和 Tensor Core 见 [第4a章](./04a-gpu-execution-model-and-tensor-cores.md)。本章不展开 dispatcher 细节，也不下钻 kernel 内部 register、occupancy 和 PTX 优化。
+> **关联章节**：本章是 [第6章](./06-cuda-runtime-and-kernels.md) 中 stream、同步和 CUDA Graph 的独立展开。第6章回答"模型调用怎样落到 CUDA runtime 和 kernel"，本章专注"命令流怎样排队、等待、重叠和回放"。H2D、PCIe、NUMA、pinned memory 的主机设备路径见 [第5b章](./05b-host-device-io-pcie-numa-and-overlap.md)；GPU 执行模型和 Tensor Core 见 [第4a章](./04a-gpu-execution-model-and-tensor-cores.md)。本章不展开 dispatcher 细节，也不下钻 kernel 内部 register、occupancy 和 PTX 优化。推理服务中的 continuous batching、shape bucket、prefill/decode 分离和 graph replay hit rate 如何进入调度与 SLO，见 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)。
 
 ## 1. 第一性原理拆解 + 学习大纲
 
@@ -521,6 +521,8 @@ sequence bucket: 128, 256, 512, 1024, 2048, 4096
 2. 每个 graph / bucket 可能持有静态 buffer，显存容量和碎片都要重新测。
 
 所以 Graph 不是"开关优化"，而是一套调度、内存和 shape 策略。
+
+这也是 CUDA Graph 与推理引擎的交界：continuous batching 改变 decode batch size 分布，prefill/decode 分离让 prefill 的长序列 shape 和 decode 的小步进 shape 分别建 bucket，shape bucket 决定能捕获多少 graph，graph replay hit rate 决定 launch 开销是否真正下降。服务上线时应把这些指标和 TTFT、TPOT、P99 一起验收，相关调度与 KV Cache 预算见 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)。
 
 ### 6b.11 Capture 期间哪些事情容易出问题
 

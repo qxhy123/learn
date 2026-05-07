@@ -356,22 +356,28 @@ providers:
 - Secret 在 node 上是 **tmpfs**（在内存，机器断电消失）——不会进 node disk。
 - kubelet 必须 watch Secret 变化以更新挂载——但**容器内进程不会 hot-reload**，需要 `inotify` 或 SIGHUP 触发应用重读。
 - envFrom Secret 在 Pod 启动时一次性读，**Secret 改了 Pod 不重启就用旧值**——这是 envFrom 的最大坑。
-- **Secret 通过 RBAC 授权读取**：service account 必须有 `get`/`list secrets` 权限才能挂载——默认情况下任何 Pod 的 SA 都能读同 namespace 的所有 Secret，需要严格 RBAC。
+- **挂载 Secret 不要求 Pod 的 ServiceAccount 拥有 `get`/`list secrets`**：kubelet 代表节点读取 Pod 规格中引用的 Secret，再把内容挂载进容器。真正危险的是“谁能创建或更新 Pod”：只要某个主体能在 namespace 里创建 Pod，就可以让 Pod 挂载该 namespace 中任意可引用的 Secret，从而间接读取它。需要把 Pod 创建权限、Secret 引用范围、准入策略和 namespace 隔离一起设计，而不是只看运行时 SA 的 RBAC。
 
 **审计要点**：
 
 ```yaml
-# Audit policy 必须把 secrets 资源标为 RequestResponse 级别
+# 不要对 secrets 使用 RequestResponse：响应体可能把 Secret 明文写入审计日志。
+# 对 Secret 资源使用 Metadata 或 Request 级别，配合准入控制与异常检测。
 apiVersion: audit.k8s.io/v1
 kind: Policy
 rules:
-  - level: RequestResponse
+  - level: Metadata
     resources:
       - group: ""
         resources: ["secrets"]
+  - level: Request
+    verbs: ["create", "update", "patch"]
+    resources:
+      - group: ""
+        resources: ["pods"]
 ```
 
-这样每次 `get secrets` 都会写 audit log。如果发现某 SA 异常读 Secret，能立刻定位。
+这样可以记录 Secret 访问元数据，并记录 Pod 创建/变更请求以排查“通过 Pod 挂载 Secret”的间接读取路径。治理上还应加入准入策略：限制哪些 ServiceAccount 可以被工作负载使用、禁止普通用户创建引用高敏 Secret 的 Pod、检测异常 Secret 挂载、对生产 namespace 使用最小权限和更细粒度隔离。
 
 ### 23.3 供应链安全不能忽略
 
@@ -1341,7 +1347,7 @@ PyTorch 的 `.pt`、`.bin`、`.ckpt` 文件默认使用 Python pickle 格式。P
 | 安全维度 | `torch.load(f)` | `torch.load(f, weights_only=True)` | `safetensors.load_file(f)` |
 |----------|-----------------|------------------------------------|----------------------------|
 | 代码执行风险 | 极高（任意 `__reduce__`） | 低（仅白名单类型） | 无（纯数据格式）|
-| PyTorch 版本要求 | 所有版本 | 2.0+（2.4+ 推荐，默认将改为 True） | 需安装 safetensors 库 |
+| PyTorch 版本要求 | 所有支持 `torch.load` 的版本 | 是否支持、默认值和限制以当前 PyTorch release note / API 文档为准，平台不要依赖隐式默认值 | 需安装 safetensors 库 |
 | 支持 optimizer state | 是 | 部分（取决于类型） | 否（仅权重张量）|
 | 跨语言支持 | Python only | Python only | Python / Rust / C++ / JS |
 | 推理部署推荐 | 不推荐 | 可接受（受信任内部 checkpoint） | 首选 |
@@ -1352,10 +1358,10 @@ PyTorch 的 `.pt`、`.bin`、`.ckpt` 文件默认使用 Python pickle 格式。P
 # 错误做法（高风险）
 model = torch.load(“model.pt”)
 
-# 改进做法（PyTorch 2.0+，限制反序列化类型）
+# 改进做法：以当前 PyTorch release note 为准，平台显式设置 weights_only
 model = torch.load(“model.pt”, weights_only=True)
 
-# 最佳做法（推理部署，无代码执行风险）
+# 默认做法：推理部署优先使用 SafeTensors
 from safetensors.torch import load_file
 state_dict = load_file(“model.safetensors”)
 model.load_state_dict(state_dict)

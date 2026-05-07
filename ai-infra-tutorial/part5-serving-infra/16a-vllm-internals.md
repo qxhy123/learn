@@ -4,6 +4,8 @@
 
 > **关联章节**：本章承接 [第15章](15-batching-scheduling-and-kv-cache.md) 关于 KV Cache、PagedAttention、调度循环的概念铺垫，以及 [第16章](16-quantization-compilation-and-engines.md) 关于推理引擎选型的整体对比。读完 Ch 15/16 后，本章回答的是更深入的问题：vLLM 在内部如何把这些机制串成一个完整的运行时；不同机制之间存在哪些实现耦合；某个参数动起来会让哪几条路径同时变化。本章不是 vLLM 用户手册，而是 vLLM 工程师视角的深挖：每一个机制为何如此设计、与替代方案相比贵在哪、便宜在哪、什么场景失效。Worked example 用一个 LLaMA-70B × 8×A100 的真实调优过程来贯穿。
 
+> **版本矩阵 / 适用口径**：本章所有 vLLM V1、prefix caching、chunked prefill、FP8 KV、AWQ/GPTQ、FlashAttention/FlashInfer、A100/H100 性能描述，都需要按 vLLM commit 或镜像、GPU SKU、CUDA/driver、attention backend、模型结构和量化 checkpoint 复测。默认行为、启动参数和 metrics 名称都以当前 vLLM release/config 为准；文中的数字是教学 benchmark 口径，不是通用 SLA。尤其 FP8 KV 在 A100 上主要先按容量/存储路径理解，H100+FA3/融合反量化路径才可能有不同性能口径。
+
 ---
 
 ## 16a.1 第一性原理拆解：vLLM 在解决的工程问题
@@ -35,13 +37,13 @@ vLLM 的另一个不可化简问题是"运行时即治理"。它不只是把模�
 
 ### 推 — 从这个问题如何推导出每个机制
 
-第一层推 PagedAttention。如果显存按"每请求最大上下文 × dtype × 层数"预分配，70B 模型 32K 上下文每请求要预留 10 GB，单卡 80 GB 最多放 5 个请求，绝大部分空间被未使用的尾部 token 浪费。于是必须把 KV Cache 切成固定大小的 block（vLLM 默认 16 token），用 block table 间接寻址，让请求按需申请、按需释放。Block 既是分配单位，也是复用单位——同一段 prefix 的 block 可以被多个请求共享，引用计数管理生命周期。
+第一层推 PagedAttention。如果显存按"每请求最大上下文 × dtype × 层数"预分配，70B 模型 32K 上下文每请求要预留 10 GB，单卡 80 GB 最多放 5 个请求，绝大部分空间被未使用的尾部 token 浪费。于是必须把 KV Cache 切成固定大小的 block（常见配置是 16 token，具体以当前 vLLM release/config 为准），用 block table 间接寻址，让请求按需申请、按需释放。Block 既是分配单位，也是复用单位——同一段 prefix 的 block 可以被多个请求共享，引用计数管理生命周期。
 
 第二层推 Scheduler。Block 是显存的"页"，Scheduler 是显存的"内存管理器 + 进程调度器"。每一次 step 都要回答四个问题：哪些请求可以进入下一次 forward；这一次 forward 的 token budget 是多少（prefill chunk + decode token 总和）；当 KV 不够时谁被抢占；被抢占的请求用 swap 还是 recompute 恢复。vLLM 的 V1 Scheduler 把这四个决策合并成一次 `_schedule_running()` + `_schedule_waiting()` + `_schedule_preempted()` 的调用链，并且让每次决策都基于显存余量、SLO 余量和请求年龄做加权。
 
 第三层推 chunked prefill。如果每次 forward 要么是纯 prefill 要么是纯 decode，长 prompt 的 prefill 会独占整个 forward；如果允许 prefill 和 decode 同 batch，长 prompt 可以被切成 512 或 1024 token 的 chunk，每个 chunk 和当前活跃 decode 一起跑。这就要求 attention kernel 必须支持"variable length prefill + decode mixed batch"，flashattn-2 的 varlen 接口和 vLLM 的 attention backend 抽象都为此而生。
 
-第四层推 prefix caching。当 KV Cache 是 block，Block Manager 又有引用计数，那么"两个请求共享前缀的 KV"自然就变成"两个 SequenceGroup 的 block table 前 N 项指向同一组 physical block"。vLLM v0.6+ 引入 hash-based prefix caching，让任意请求都能基于 token id 序列的 hash 命中已有 block，不再要求请求显式声明 prefix。这一步把 prefix cache 从"对话场景的可选优化"变成"所有场景的默认基线"。
+第四层推 prefix caching。当 KV Cache 是 block，Block Manager 又有引用计数，那么"两个请求共享前缀的 KV"自然就变成"两个 SequenceGroup 的 block table 前 N 项指向同一组 physical block"。较新的 vLLM release 支持 hash-based prefix caching，让请求能基于 token id 序列的 hash 命中已有 block，不再要求业务显式声明 prefix。是否默认启用、是否受 V0/V1 engine mode 影响、是否与当前模型/backend 兼容，都以当前 vLLM release/config 为准。
 
 第五层推 speculative decoding。Decode 每步只产一个 token、目标模型 forward 一次的 cost 和算 k 个 token 的 cost 相差不大，于是引入 draft model（小模型）一次预测 k 个候选，目标模型一次 verify k 个，接受的部分按目标模型分布吐出。vLLM 把这条路径抽象为 SpecDecodeWorker，draft 可以是另一个小模型，也可以是 Medusa head，也可以是 EAGLE 隐藏态预测器，背后共享同一套调度和 KV 管理。
 
@@ -134,7 +136,7 @@ mindmap
 - 能画出 vLLM 一次 step 内的完整数据流（Scheduler → ModelRunner → Worker → Attention kernel → BlockManager），并说明每一步的 GPU/CPU 开销
 - 能解释 BlockManager 的 free block list、ref count、CoW 复制三者如何协作支持 prefix cache 和 beam search
 - 能给出 chunked prefill 在 chunk=512 / 1024 / 2048 时的吞吐和 TTFT 取舍曲线
-- 能在 vLLM Prometheus metrics 中找到 acceptance_rate、preemption_count、prefix_hit_rate、kv_cache_usage 这些关键指标，并解释每个指标飙高时该调哪个参数
+- 能在 vLLM Prometheus metrics 中按当前 release 的真实名称找到 acceptance_rate、preemption_count、prefix_hit_rate、kv_cache_usage 这些关键指标，并解释每个指标飙高时该调哪个参数
 - 能在 LLaMA-70B × 8×A100 的部署中，从默认配置出发，做出至少 3 轮参数调优，把吞吐提升 2 倍以上
 
 ---
@@ -246,7 +248,7 @@ BlockManager 维护一个 `free_block_list`（vLLM 实现里实际是 `BlockPool
 | 32 | 尾部碎片增大（最差 31 token），prefix 命中粒度变粗，但 block table 短 |
 | 64+ | 长 prompt 友好，但 short request 浪费大；prefix cache 命中率显著下降 |
 
-> **工程边界**：block_size 是 vLLM 里"最不该乱动"的参数之一。改它会同时影响 attention kernel 性能、显存利用率、prefix cache 命中率、preemption 粒度。除非你有非常具体的场景理由（比如全是 8K+ 长 prompt），保持默认 16。
+> **工程边界**：block_size 是 vLLM 里"最不该乱动"的参数之一。改它会同时影响 attention kernel 性能、显存利用率、prefix cache 命中率、preemption 粒度。默认值以当前 vLLM release/config 为准；除非你有非常具体的场景理由（比如全是 8K+ 长 prompt），不要凭直觉修改。
 
 > **danger**：把 block_size 改成 1 听起来"碎片为零"，实际上会让 block table 长度暴涨，attention kernel 访存模式完全失效，吞吐可能掉 80%。
 
@@ -304,7 +306,7 @@ vLLM Scheduler 的核心 budget 是 `max_num_batched_tokens`。一次 step 内�
 
 ### Preemption 决策
 
-当 BlockManager 报告"无法为当前调度方案分配足够 block"时，Scheduler 必须抢占已 running 的 SequenceGroup。vLLM V1 默认策略：
+当 BlockManager 报告"无法为当前调度方案分配足够 block"时，Scheduler 必须抢占已 running 的 SequenceGroup。不同 vLLM release、V0/V1 engine mode 和配置下的抢占策略会变化，以下按常见实现口径理解，生产以当前 vLLM release/config 为准：
 
 - 优先抢年龄最小（最近开始的）请求
 - 先尝试 swap：把 KV blocks 拷到 CPU 内存（占用 `swap_space`）
@@ -315,9 +317,9 @@ vLLM Scheduler 的核心 budget 是 `max_num_batched_tokens`。一次 step 内�
 | Swap | 几十 ms（PCIe 拷贝） | swap_space CPU 内存 | 短 prompt 长输出，重算成本高；CPU 内存够 |
 | Recompute | 几百 ms 到秒级（重新 prefill） | 无额外资源 | 长 prompt 短输出，prefix cache 能命中 |
 
-> **note**：V1 默认偏好 recompute，因为 prefix cache 让重算成本被极大压缩。如果你的服务 prefix cache 命中率低（< 30%），可以显式开 swap。
+> **note**：一些 V1 配置会偏好 recompute，因为 prefix cache 可以压缩重算成本；是否如此以当前 vLLM release/config 为准。如果你的服务 prefix cache 命中率低（< 30%），应复测 swap 与 recompute 的 P99 取舍。
 
-> **warn**：preemption 次数飙高（`vllm:num_preemptions_total` 持续增长）几乎一定意味着 `max_num_seqs` 或 `gpu_memory_utilization` 设得太激进，应该回调一档。
+> **warn**：preemption 次数飙高（指标名以当前 vLLM release/config 为准，例如 num_preemptions_total 一类计数）通常意味着 `max_num_seqs` 或 `gpu_memory_utilization` 设得太激进，应该回调一档。
 
 ---
 
@@ -357,9 +359,9 @@ stateDiagram-v2
 | 代码补全 | 40-70% | 文件头部、import、上下文 |
 | 完全独立的短问答 | < 5% | 几乎不共享 |
 
-> **note**：prefix cache 的命中率是 vLLM 调优中收益最大的单一指标。`vllm:gpu_prefix_cache_hit_rate` 在生产上应该是 dashboard 必看项。
+> **note**：prefix cache 的命中率是 vLLM 调优中收益最大的单一指标之一。指标名称以当前 vLLM release/config 为准，生产上应先打开 `/metrics` 或 Prometheus scrape，确认是否存在 prefix cache hit/miss、KV usage、eviction 相关序列，再写 dashboard 和告警。
 
-> **success**：prefix cache 几乎是免费的——v0.6+ 默认开启，开关基本不需要关。少数场景（比如每个请求都用唯一 hash 后的 prompt）可能因为 hash 计算和字典查找产生少量开销，但实测一般 < 1%。
+> **工程边界**：prefix cache 的默认行为以当前 vLLM release/config 为准。少数场景（比如每个请求都用唯一 hash 后的 prompt）可能因为 hash 计算、字典查找和 eviction 带来开销；上线时用显式启动参数、启动日志和 `/metrics` 三条路径确认它确实按预期启用。
 
 > **工程边界**：prefix cache 的命中要求 token id 完全一致。任何 tokenizer 版本变化、`add_special_tokens` 不一致、prompt 中插入时间戳/uuid，都会让命中率归零。生产上要把 prompt 模板作为 versioned artifact 管理。
 
@@ -367,7 +369,7 @@ stateDiagram-v2
 
 ## 16a.6 Chunked Prefill：长 prompt 切片 + 与 decode 混合 batch
 
-Chunked prefill 是 vLLM V1 的默认行为（V0 时是 opt-in）。它的核心思路是：不让任何一次 forward 被单个长 prompt 独占；所有 prefill 都按 `chunk_size`（实际由 `max_num_batched_tokens` 隐含决定）切片，每片和当前活跃 decode 一起进 batch。
+Chunked prefill 的默认行为会随 vLLM release、V0/V1 engine mode、模型和 backend 变化，生产以当前 vLLM release/config 为准。它的核心思路是：不让任何一次 forward 被单个长 prompt 独占；prefill 按调度器 token budget 切片，每片和当前活跃 decode 一起进 batch。
 
 ```mermaid
 sequenceDiagram
@@ -392,7 +394,7 @@ sequenceDiagram
 
 ### 对比：non-chunked vs chunked
 
-| 指标 | Non-chunked（V0 默认） | Chunked（V1 默认） |
+| 指标 | Non-chunked | Chunked |
 |------|------------------------|--------------------|
 | 长 prompt prefill 期间 GPU 利用率 | 高（纯 prefill） | 略低（混 decode） |
 | 同期 decode 请求 ITL | 被独占 2 秒 | 每步正常推进 |
@@ -451,6 +453,8 @@ flowchart TB
 
 `SpecDecodeWorker` 在 verify 时，会把 `k+1` 个 token id 一次性送进 target model 做一次 forward。Target model 输出 `k+1` 个 logits，依次和 draft 候选比较。vLLM 用了 rejection sampling 的修正算法保证最终采样分布与目标模型一致。Verify 通过后，被接受的 token 都是"免费"的——它们共享同一次 target forward 的算力。
 
+正确性条件是：draft 只负责提出候选，接受概率必须由 target/draft 概率比和 rejection sampling 修正决定；fallback token 必须从修正后的 residual distribution 或 target 路径采样；temperature、top-p/top-k、logits processor、guided/grammar decoding 状态、stop 条件和 tokenizer 都必须在 draft/target verify 里一致。temperature 越高、top-p 越宽或 grammar/tool-call 约束越强，draft 与 target 的分布越容易分叉，acceptance rate 通常越低。独立 draft model 还会占用自己的权重和 KV；target verify 也会为候选 token 推进 KV，因此容量评估要把 draft/target KV 占用和 token budget 一起算。
+
 ### 何时不用
 
 | 场景 | 加速效果 | 原因 |
@@ -461,7 +465,7 @@ flowchart TB
 | 短输出（< 100 token） | 1.0-1.2x | 投机收益还没积累就结束 |
 | 严格质量约束 | 不应使用 | 虽然分布上正确，但实现 bug 风险高 |
 
-> **danger**：上线 speculative decoding 前，必须监控 `vllm:spec_decode_acceptance_rate`、`vllm:spec_decode_num_accepted_tokens`、`vllm:spec_decode_num_draft_tokens`。如果 acceptance rate < 50%，几乎一定是负优化。
+> **danger**：上线 speculative decoding 前，必须监控 `acceptance_rate`、`draft_tokens_per_step`、`verify_tokens_per_step`、accepted tokens、draft latency、verify latency 和 `fallback_rate`。vLLM Prometheus 指标的真实名称以当前 vLLM release/config 为准，先从 `/metrics` grep `spec` / `draft` / `accept` 确认，再绑定 dashboard。
 
 > **工程边界**：speculative decoding 与 chunked prefill、prefix cache 是正交机制，但与 LoRA 切换、guided decoding（结构化输出）有耦合——后两者会让 draft 分布和 target 分布发散，acceptance rate 大幅下降。
 
@@ -533,7 +537,7 @@ sequenceDiagram
 
 ## 16a.9 LoRA / Multi-LoRA Serving：punica 集成、adapter 切换路径
 
-vLLM 支持在同一个 base model 上动态挂载多个 LoRA adapter，请求级别指定 `lora_request`，所有 LoRA 在同一个 batch 里被并行处理（基于 punica kernel 的 segmented gemm）。这让"多个微调版本共享一套底座"成为可能。
+vLLM 支持在同一个 base model 上动态挂载多个 LoRA adapter，请求级别指定 `lora_request`，所有 LoRA 在同一个 batch 里被并行处理（基于 punica kernel 的 segmented gemm）。这让"多个微调版本共享一套底座"成为可能。LoRA 训练和 adapter 制品管理可回看 [第 10c 章](../part3-training-infra/10c-finetuning-and-multi-adapter.md)；本节只讨论 serving runtime。
 
 ### 工作原理
 
@@ -551,6 +555,20 @@ LoRA 把 `W' = W + α × B × A`，A、B 是低秩矩阵。Punica kernel 的核�
 
 > **warn**：punica kernel 对 LoRA rank 有上限要求；rank 超过 kernel 支持时（通常是 64）会回退到逐请求循环，性能急剧下降。
 
+### Adapter 生命周期
+
+Multi-LoRA 不是把 adapter 文件放到对象存储就结束。生产上至少要管住以下生命周期：
+
+| 阶段 | 要做什么 | 关键风险 |
+|------|----------|----------|
+| 注册 | 记录 adapter id、base model id、rank、训练数据版本、质量基线和租户归属 | adapter 与 base model/tokenizer 不匹配 |
+| 热加载 | 从磁盘/对象存储加载到 CPU/GPU cache，预热代表性 shape | 首次请求承担加载和 kernel warmup |
+| 驱逐 | 按 LRU、租户优先级或显存水位移出冷 adapter | 抖动流量导致频繁换入换出 |
+| 灰度 | adapter 版本按租户或百分比放量 | 单 adapter 质量回归影响全部租户 |
+| 质量回归 | 固定 golden prompts，比较 base、旧 adapter、新 adapter | 只看平均分漏掉长尾工具调用或安全策略 |
+| 租户配额 | 限制每租户 adapter 数、并发 LoRA 数、冷加载频率 | 少数租户占满 LoRA GPU cache |
+| rank 约束 | 发布前检查 `max_lora_rank`、kernel 支持和显存预算 | rank 超限触发慢路径或直接加载失败 |
+
 ---
 
 ## 16a.10 量化集成：AWQ、GPTQ、FP8、SmoothQuant 在 vLLM 中的落地路径
@@ -562,10 +580,10 @@ vLLM 把量化封装成 Linear 层的不同实现。`QuantizationConfig` 在模�
 | AWQ (W4A16) | 成熟 | INT4 + scale | BF16 | 是 | 是 | decode 快 1.5-2x，prefill 略快 |
 | GPTQ (W4A16) | 成熟 | INT4 + scale + zeros | BF16 | 是 | 是 | 与 AWQ 接近 |
 | GPTQ-Marlin | 成熟（Ampere+） | INT4 packed | BF16 | 是 | 是 | 比 GPTQ 默认快 1.5x |
-| FP8 (W8A8) | 成熟（Hopper+） | FP8 E4M3 | FP8 | 是 | 是 | 在 H100 上 prefill+decode 都快 1.5-2x |
+| FP8 (W8A8) | 成熟度随 Hopper+/后端变化 | FP8 E4M3 | FP8 | 是 | 是 | H100+ 原生 FP8 kernel 才讨论性能收益，需按版本复测 |
 | SmoothQuant W8A8 INT8 | 成熟 | INT8 | INT8 | 是 | 是 | 通用 GPU 上加速 |
 | compressed-tensors | 成熟（覆盖多种） | 多种 | 多种 | 是 | 是 | Neural Magic 路径，覆盖最广 |
-| KV Cache FP8 | 成熟 | KV: FP8 | 计算 BF16 | 是 | 是 | 长上下文必看 |
+| KV Cache FP8 | 随 GPU/backend 变化 | KV: FP8 | 计算 BF16 或融合路径 | 是 | 是 | A100 主要看容量节省；H100+FA3/融合反量化才评估 TPOT 收益 |
 | INT4 KV Cache | 实验性 | KV: INT4 | 计算 BF16 | 部分 | 部分 | 长上下文显存对半 |
 | MXFP4 / NVFP4 | 实验性（Blackwell） | 4-bit float | 4-bit float | 待验证 | 待验证 | 未来路线 |
 
@@ -587,7 +605,7 @@ vLLM 把量化封装成 Linear 层的不同实现。`QuantizationConfig` 在模�
 
 ## 16a.11 V1 引擎重构：与 V0 相比的架构变化
 
-vLLM V1（v0.6+ 引入，v0.8 后默认）相对 V0 是一次系统性重构，核心目标是消除"Python overhead"——把调度循环里所有可能的 Python-level 开销搬到 C++/Rust 或 CUDA。
+vLLM V1 相对 V0 是一次系统性重构，核心目标是消除"Python overhead"——把调度循环里所有可能的 Python-level 开销搬到 C++/Rust 或 CUDA。V1 的引入版本、默认启用版本和关闭方式都以当前 vLLM release/config 为准。
 
 ### 主要变化
 
@@ -598,8 +616,8 @@ vLLM V1（v0.6+ 引入，v0.8 后默认）相对 V0 是一次系统性重构，�
 | Block Manager | 多种 block manager（v0、v1、v2） | 统一 block manager + hash prefix | 实现简化 |
 | Sampler | Python 循环 | torch.compile + CUDA graph 化 | 长 vocab 模型 sampler 不再是瓶颈 |
 | Worker | 同步 RPC | 异步 RPC + CUDA graph capture | warmup 后 step 几乎零 Python overhead |
-| Chunked prefill | opt-in | 默认开 | 长 prompt 不再独占 |
-| Prefix caching | opt-in，session-level | 默认开，hash-based | 命中率显著提升 |
+| Chunked prefill | 常见为 opt-in | 常见配置会启用 | 长 prompt 不再独占 |
+| Prefix caching | 早期多为 opt-in / session-level | 较新 release 支持 hash-based | 命中率显著提升 |
 | Speculative decoding | 单独 worker，集成度低 | 统一抽象 SpecDecodeWorker | 更易扩展新 draft 算法 |
 | 多模态 | 实验性 | 成熟（VLM 主流模型支持） | 多模态服务可生产 |
 | LoRA | 通过 punica，集成有限 | 一等公民，与 prefix cache、quant 协调 | 多 LoRA 服务化更顺 |
@@ -608,7 +626,7 @@ vLLM V1（v0.6+ 引入，v0.8 后默认）相对 V0 是一次系统性重构，�
 
 V0 时代，一次 step 的 Python 调度开销 ~ 5-10 ms；当 batch=256、decode step 本身只需 30 ms 时，Python 开销占了 20-30%。V1 把这部分压到 < 1 ms。在高并发场景（多个长上下文请求 + 大 batch decode）下，V1 相对 V0 的吞吐提升常常达到 30-80%，且 ITL P99 显著更稳。
 
-> **note**：从 v0.8 开始，V1 是默认选项。如果你还在使用 V0，几乎所有场景都建议升级。
+> **note**：V1 是否默认启用以当前 vLLM release/config 为准。升级前先确认模型、采样、LoRA、量化、guided decoding 等路径在 V1 上有等价实现，再用同一 workload 比较。
 
 > **工程边界**：V1 的某些边缘特性（如某些自定义 sampler、特定老模型）支持还不完整。生产上要确认你需要的特性在 V1 上有等价实现。
 
@@ -620,19 +638,19 @@ V0 时代，一次 step 的 Python 调度开销 ~ 5-10 ms；当 batch=256、deco
 
 | 参数 | 物理含义 | 默认 / 范围 | 调大的代价 | 调小的代价 | 决策规则 |
 |------|----------|-------------|------------|------------|----------|
-| `gpu_memory_utilization` | 整张卡总预算占比（含权重 + KV + workspace） | 0.9 / 0.5-0.95 | OOM 风险，CUDA workspace 不够 | KV 池小，能放的请求少 | 起点 0.9；遇到 OOM 回到 0.85；需要 CUDA graph 时考虑留 5-10% buffer |
-| `max_num_batched_tokens` | 每 step 所有 token（prefill chunk + decode）总上限 | 8192 / 2048-32768 | 长 prefill 不被切碎，但 ITL 抖 | chunk 太小，schedule overhead 高 | 短 prompt 服务调小到 2048-4096；长 prompt 调大到 16384-32768 |
-| `max_num_seqs` | 同一 step 最多多少个 active sequence | 256 / 64-1024 | 并发更高，吞吐更高，但 KV 容易满，TPOT 抖 | 吞吐受限 | 用 KV 显存预算反推：`max_num_seqs ≈ KV_budget / per_seq_KV` |
-| `block_size` | 每个 KV block 的 token 数 | 16 / 8-32 | prefix 命中粒度变粗，碎片大 | block table 长，attention 慢 | 99% 场景保持 16 |
-| `swap_space` | preempt 时换出 KV 用的 CPU 内存（GB / GPU） | 4 / 0-32 | 占主机内存 | 抢占时只能 recompute | 长输出 + 低 prefix 命中时调到 8-16 |
-| `enable_prefix_caching` | 是否开 prefix cache | True / bool | 极小（< 1%） | 命中场景吞吐显著下降 | 永远开 |
-| `enable_chunked_prefill` | 是否开 chunked prefill | True (V1) | 短 prompt 多时略增 schedule | 长 prompt 独占 forward | V1 默认开；除非全是短 prompt |
-| `tensor_parallel_size` | TP 卡数 | 1 / 1-8 | NCCL 通信 | 装不下大模型 | 按模型大小：7B→1, 70B→4 或 8 |
-| `pipeline_parallel_size` | PP stage 数 | 1 / 1-8 | pipeline bubble | 单 stage 显存不够 | 跨机扩 KV 时考虑 |
-| `kv_cache_dtype` | KV Cache 精度 | auto / fp8 / int8 | 长上下文显存对半 | 极小质量退化 | 长上下文 + Hopper+ 默认 fp8 |
+| `gpu_memory_utilization` | 整张卡总预算占比（含权重 + KV + workspace） | 以当前 vLLM release/config 为准 | OOM 风险，CUDA workspace 不够 | KV 池小，能放的请求少 | 从保守值起压测；遇到 OOM 回退；需要 CUDA graph 时留 buffer |
+| `max_num_batched_tokens` | 每 step 所有 token（prefill chunk + decode）总上限 | 以当前 vLLM release/config 为准 | 长 prefill 不被切碎，但 ITL 抖 | chunk 太小，schedule overhead 高 | 按 input/output length 分布和 ITL P99 调 |
+| `max_num_seqs` | 同一 step 最多多少个 active sequence | 以当前 vLLM release/config 为准 | 并发更高，吞吐更高，但 KV 容易满，TPOT 抖 | 吞吐受限 | 用 KV 显存预算反推：`max_num_seqs ≈ KV_budget / per_seq_KV` |
+| `block_size` | 每个 KV block 的 token 数 | 以当前 vLLM release/config 为准 | prefix 命中粒度变粗，碎片大 | block table 长，attention 慢 | 通常保持默认，除非有专项压测 |
+| `swap_space` | preempt 时换出 KV 用的 CPU 内存（GB / GPU） | 以当前 vLLM release/config 为准 | 占主机内存 | 抢占时只能 recompute | 长输出 + 低 prefix 命中时复测 swap |
+| `enable_prefix_caching` | 是否开 prefix cache | 以当前 vLLM release/config 为准 | hash/查表/eviction 开销 | 命中场景吞吐显著下降 | 共享前缀场景验证开启，并查日志/metrics |
+| `enable_chunked_prefill` | 是否开 chunked prefill | 以当前 vLLM release/config 为准 | 短 prompt 多时略增 schedule | 长 prompt 独占 forward | 长 prompt 场景验证开启 |
+| `tensor_parallel_size` | TP 卡数 | 以模型和硬件为准 | NCCL 通信 | 装不下大模型 | 按模型大小、KV 预算和网络拓扑选 |
+| `pipeline_parallel_size` | PP stage 数 | 以模型和硬件为准 | pipeline bubble | 单 stage 显存不够 | 跨机扩 KV 时考虑 |
+| `kv_cache_dtype` | KV Cache 精度 | auto / fp8 / int8 等，以当前 release/backend 为准 | 可能引入反量化或质量风险 | KV 容量压力更大 | 长上下文先按容量收益复测 |
 | `quantization` | 模型量化方案 | None / awq / gptq / fp8 / ... | 取决于硬件 | BF16 / FP16 baseline | 见 §16a.10 |
-| `max_lora_rank` / `max_loras` | LoRA 配置 | 16 / 1 | LRU 切换开销 | LoRA 并发受限 | 按业务需要 |
-| `disable_log_stats` | 是否关停 metrics | False | 几乎为零 | 失去观测 | 永远开 metrics |
+| `max_lora_rank` / `max_loras` | LoRA 配置 | 以当前 release/config 为准 | LRU 切换开销 | LoRA 并发受限 | 按 adapter 生命周期和租户配额设置 |
+| `disable_log_stats` | 是否关停 metrics | 以当前 release/config 为准 | 少量上报开销 | 失去观测 | 生产保留 metrics，除非有明确压测证据 |
 
 ### 调优决策树
 
@@ -752,9 +770,11 @@ vLLM 不是万能的。下面这些场景应该考虑替代方案。
 
 ---
 
-## 16a.14 Worked Example：LLaMA-70B × 8×A100，从 1200 tps 到 4500 tps
+## 16a.14 Worked Example：LLaMA-70B × 8×A100，特定 benchmark 的调优数量级
 
 下面用一个真实风格的调优过程，把前面几节的机制串起来。场景：把 LLaMA-3-70B-Instruct 部署到一台 8×A100 80GB 服务器（NVLink，单机），目标支持企业内部 chatbot，峰值 200 QPS，平均输入 1500 token、输出 400 token，目标 P99 TTFT < 800ms、P99 TPOT < 80ms。
+
+> **benchmark 口径**：本节的 1,200→4,500 tps、TTFT/TPOT 数值只是一个特定模型、输入/输出分布、并发、GPU、vLLM 版本、attention backend 和测量口径下的数量级示例。复现时必须固定 commit/镜像、CUDA/driver、采样参数、warmup、压测工具和 P99 统计窗口；不要把这些数字当成 A100 或 vLLM 的通用承诺。
 
 ### 第 0 步：baseline
 
@@ -787,7 +807,7 @@ vllm serve meta-llama/Llama-3-70B-Instruct \
   --max-model-len 8192 \
   --max-num-seqs 512 \
   --gpu-memory-utilization 0.92
-# V1 在 v0.8+ 已是默认
+# V1 是否默认启用以当前 vLLM release/config 为准
 ```
 
 | 指标 | 数值 | Δ |
@@ -820,7 +840,7 @@ vllm serve meta-llama/Llama-3-70B-Instruct \
 
 ### 第 3 步：开 FP8 KV Cache
 
-诊断：A100 不支持 FP8 计算，但支持 FP8 KV Cache（vLLM 的 `kv_cache_dtype=fp8`）。这能把 KV 占用减半，让 max_num_seqs 进一步提高，吞吐提升。
+诊断：A100 没有 Hopper FP8 Tensor Core；如果当前 vLLM 版本和 attention backend 支持 `kv_cache_dtype=fp8`，它首先应被视为 KV 存储容量优化：KV 占用下降后，preemption/OOM 风险降低，`max_num_seqs` 可能有空间提高。是否带来 TPOT 或吞吐提升取决于反量化路径、batch 形状和调度瓶颈，不能只因打开 FP8 KV 就默认变快。
 
 ```bash
 vllm serve meta-llama/Llama-3-70B-Instruct \
@@ -876,7 +896,7 @@ vllm serve TheBloke/Llama-3-70B-Instruct-GPTQ \
 | 0 | 默认 baseline | 1,200 | 4,200ms | 145ms | 1.0x |
 | 1 | V1 + max_num_seqs=512 | 2,100 | 3,800ms | 110ms | 1.75x |
 | 2 | chunked prefill (batched_tokens=4096) | 2,800 | 1,400ms | 95ms | 2.33x |
-| 3 | FP8 KV Cache | 3,400 | 1,200ms | 78ms | 2.83x |
+| 3 | FP8 KV Cache（容量优化口径） | 3,400 | 1,200ms | 78ms | 2.83x |
 | 4 | GPTQ-Marlin INT4 | **4,500** | **750ms** | **65ms** | **3.75x** |
 
 ### 教训
@@ -885,7 +905,7 @@ vllm serve TheBloke/Llama-3-70B-Instruct-GPTQ \
 2. **max_num_seqs 和 gpu_memory_utilization 要联动调**——单独调一个常常引发 OOM 或 KV 浪费。
 3. **量化是最后一步**，因为它改变模型版本，影响发布、回滚、质量评估流程。前面四步都不动模型权重，只调 runtime。
 4. **每步都要复测全部 6 个指标**——只看 throughput 不看 TTFT 会上线翻车。
-5. **A100 不支持 FP8 计算但支持 FP8 KV Cache**——这是个常被忽视的免费优化。
+5. **A100 上的 FP8 KV 先按容量优化评估**——它可能让 KV 余量更大、抢占更少，但不是免费的 TPOT 加速开关；H100+FA3/融合反量化路径需要另行建立性能口径。
 
 ---
 
@@ -952,5 +972,5 @@ vllm serve TheBloke/Llama-3-70B-Instruct-GPTQ \
 - [第 14 章 · 在线推理架构](14-online-inference-architecture.md)：路由、副本、SLO 与 vLLM serving 的整体集成
 - [第 15 章 · 批处理、调度与 KV Cache](15-batching-scheduling-and-kv-cache.md)：本章的概念前置
 - [第 16 章 · 量化、编译与推理引擎](16-quantization-compilation-and-engines.md)：vLLM 与 TRT-LLM、SGLang、TGI 的横向对比
-- [第 16a-lab 章 · Mini-vLLM 实战](16a-lab-mini-vllm.md)：本章概念的**配套实战代码**，1500 行 Python 从零实现 PagedAttention / continuous batching / chunked prefill / prefix caching / swap / streaming，与 HF transformers 在 TinyLlama-1.1B 上 8/8 token greedy 完全一致
+- [第 16a-lab 章 · Mini-vLLM 实战](16a-lab-mini-vllm.md)：本章概念的**配套实战代码**，1500 行 Python 从零实现 PagedAttention / continuous batching / chunked prefill / prefix caching / swap / streaming，并提供 TinyLlama-1.1B 的 HF smoke/parity check
 - [第 17 章 · 多租户与成本治理](17-multitenancy-and-cost.md)：vLLM 在多租户平台中的隔离、配额与成本归因

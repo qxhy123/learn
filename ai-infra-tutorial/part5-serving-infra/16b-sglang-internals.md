@@ -4,6 +4,8 @@
 
 > **关联章节**：本章在 [第 15 章](15-batching-scheduling-and-kv-cache.md) 的 KV Cache 与调度基础上，深入 SGLang 的内部实现；与 [第 16 章](16-quantization-compilation-and-engines.md) 的引擎选型互补；并与 16a vLLM 内部机制（`16a-vllm-internals.md`）形成左右路线对比。
 
+> **适用口径 / 版本矩阵**：本章对 SGLang、RadixAttention、FlashInfer/FlashAttention、FP8 KV、EAGLE、MLA、结构化解码和 router 的描述，默认需要按 SGLang commit 或镜像、GPU SKU（A100/H100/B200 等）、CUDA/driver、attention backend、模型结构、量化 checkpoint 和业务生成程序复测。任何"SGLang 比 vLLM 快 N 倍"都只能是特定 benchmark 结论，必须附带 prefix 复用率、输入/输出分布、并发、版本和测量口径。
+
 ## 16b.1 第一性原理拆解 + 学习大纲
 
 ### 概念先说清楚

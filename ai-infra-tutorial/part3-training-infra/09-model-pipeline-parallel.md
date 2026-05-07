@@ -2238,6 +2238,8 @@ FSDP HYBRID_SHARD group = explicit DP-subgroup of replicas with same (pp_rank, t
 
 生产选型的原则是：先解决最硬容量约束，再用最少的并行维度达成吞吐目标；每增加一个维度，都必须同步增加观测、checkpoint metadata、preflight 和恢复演练。
 
+本章交付物是 `parallel_strategy_70b.md`：它接收第8章的 DDP/FSDP 扩展报告，固定 70B 的 TP/PP/CP/FSDP rank mesh、拓扑放置、microbatch schedule、HBM 预算和 checkpoint metadata。下一章 09e 会在这套 dense 并行策略上替换部分 FFN 为 MoE，继续复用 rank mesh、checkpoint schema 和恢复门禁，只额外引入 EP、router 与 expert 状态。
+
 ---
 
 ## 15. 练习题

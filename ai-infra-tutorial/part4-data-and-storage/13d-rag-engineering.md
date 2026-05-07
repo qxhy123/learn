@@ -702,11 +702,21 @@ caching:
     backend: Redis + Qdrant (cache index)
     similarity_threshold: 0.93
     ttl_seconds: 7200  # 2 小时，知识库每日更新
-    key_includes: [tenant_id, user_acl_hash, index_version]
+    key_includes:
+      - tenant_id
+      - user_acl_hash
+      - index_version
+      - model_id
+      - model_revision
+      - tokenizer_version
+      - chat_template_version
+      - generation_params_hash
+      - tool_schema_version
+      - policy_version
   embedding_cache:
     backend: Redis
     ttl_seconds: 86400  # 24 小时
-    key: sha256(text + model_version + preprocess_version)
+    key: sha256(text + model_id + model_revision + tokenizer_version + preprocess_version)
   retrieval_cache:
     backend: Redis
     ttl_seconds: 3600
@@ -739,6 +749,8 @@ vllm_server_args = {
     "kv_cache_dtype": "fp8",  # 减少 KV 显存，容纳更多 cached prefix
 }
 ```
+
+RAG 的 output/semantic/prefix cache key 不能只包含 query 和索引版本。至少要把 `model_id`、`model_revision`、tokenizer/chat_template version、generation params、tool schema version、policy version 纳入 key 或失效条件；否则同一段检索结果在模型小版本、工具 schema 或安全策略变化后仍命中旧答案，命中率越高风险越大。
 
 ### 全量重建流程
 

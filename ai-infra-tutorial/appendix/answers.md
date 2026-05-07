@@ -5032,3 +5032,17 @@ RoCE 对丢包敏感，丢包会造成性能急剧下降。PFC 用 pause 降低�
 ## 结束语
 
 如果你发现自己开始能用“资源、链路、平台、治理”四个维度来回答这些题，而不是只记住一串工具名，那么这套教程的目标就达到了。
+
+## 第26/27章评分样例与面试校准索引
+
+本节不是逐题标准答案，而是给面试官和自测者一个校准锚点：好答案必须把结论落到证据对象、平台契约和 retest 上，不能只背组件名。
+
+| 主题 | 参考章节 | 3 分答案应覆盖 | 5 分答案应额外覆盖 |
+|------|----------|----------------|--------------------|
+| 平台调度 | 第26章平台/调度题；第27章模拟面试平台轮 | 能解释 GPU flavor、MIG/MPS、queue/quota、gang scheduling、PodGroup、borrow/lend、preemption 的取舍，并给出公平排队例子 | 把 Kueue/Volcano 的 admission timeline 写入 EvidenceBundle，把 queue/quota 写入 CapacityLedger，并设计 retest：多租户同时提交、抢占、配额归还和拓扑约束验证 |
+| 推理容量 | 第26章 serving/容量题；第27章系统设计轮 | 能拆 TTFT、TPOT、KV cache、batching、prefill/decode、warm pool 和 autoscaling，说明 P95/P99 与成本的权衡 | 给出 engine shape contract、量化格式、batch occupancy、KV headroom、冷启动曲线和 CapacityLedger 更新；用固定流量阶跃验证 HPA/KEDA/Knative 扩缩容与 SLO |
+| 事故处理 | 第26章 reliability/incident 题；第27章值班追问 | 能按 symptom、scope、timeline、rollback、runbook、postmortem 回答，并区分止血和根因修复 | 把 ReleaseUnit、Rollback Target、EvidenceBundle、retest threshold 串成闭环；说明 canary/shadow 指标失败如何自动暂停、回滚、复盘并沉淀平台规则 |
+| 安全供应链 | 第26章 security/governance 题；第27章安全追问 | 能说明 SBOM、provenance、attestation、cosign、Trivy/Grype、Kyverno/Gatekeeper、Vault、SafeTensors 的职责边界 | 设计准入策略：未签名镜像、无 SBOM、高危漏洞、未知 pickle 权重、越权 secret 挂载均被拒绝；用 dry-run、签名验证、漏洞重扫和 secret 轮换做 retest |
+| 综合系统设计 | 第26章 capstone/开放设计题；第27章综合面试 | 能从训练提交、资源排队、评测门禁、灰度发布、观测回滚、成本归因讲完整最小闭环 | 明确对象模型：TrainingJob、EvalRun、ModelVersion、ReleaseUnit、EvidenceBundle、CapacityLedger；给出失败演练、评分 rubric、组织边界和未来扩展路径 |
+
+校准时可按同一把尺判断：只说工具名通常不超过 2 分；能说清对象、状态和指标是 3 分；能给出证据、阈值、retest 和回滚路径才接近 5 分。

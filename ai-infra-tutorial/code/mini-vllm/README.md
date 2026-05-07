@@ -3,12 +3,18 @@
 Educational reimplementation of vLLM with PagedAttention. Companion code
 to `part5-serving-infra/16a-lab-mini-vllm.md`.
 
+This is a correctness-first reference for learning scheduler, block table,
+prefix cache, swap, streaming, and sampler semantics. It is intentionally not a
+realistic performance path and does not represent vLLM's production kernels,
+async engine, CUDA graph capture, distributed workers, or memory layout.
+
 ## Status
 
 **Plan 7 complete.** Engine supports continuous batching, chunked prefill,
 prefix caching with CoW, swap-to-CPU, full sampling (temperature / top-p /
 top-k / per-request seed), and token-by-token streaming. TinyLlama-1.1B
-greedy parity vs HF `transformers` is preserved (8/8 token match).
+HF `transformers` coverage is kept as slow smoke/parity checks: top-k logits
+overlap plus a short greedy generation token-match check.
 
 Each feature is a flag on `EngineConfig`:
   `enable_continuous_batching`, `enable_chunked_prefill`,
@@ -66,8 +72,11 @@ contract is:
 
 Outputs must `allclose` the Torch reference at `atol=1e-2, rtol=1e-2`
 (fp16). The `make_backend(device)` factory in `mini_vllm/backends/__init__.py`
-auto-selects Triton on CUDA when available and falls back to Torch
-otherwise.
+defaults to the Torch/reference backend, including on CUDA. Triton remains an
+experimental path and is not selected just because CUDA + Triton import
+successfully; opt in explicitly after CUDA runtime validation:
+
+    MINI_VLLM_BACKEND=triton python examples/run_toy.py
 
 ## Roadmap
 

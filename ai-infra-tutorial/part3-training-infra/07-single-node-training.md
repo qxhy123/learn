@@ -6,6 +6,14 @@
 
 ---
 
+## Part3 贯穿实验路线图
+
+Part3 建议用同一个训练作业贯穿所有章节：先用 LLaMA-7B 或同量级 7B dense 模型在单机 8xH100 上建立 baseline，固定 dataset manifest、token 口径、precision policy、显存账本、profile 窗口和 checkpoint schema；然后把同一作业扩到 DDP/FSDP，比较 global batch、通信暴露时间、rank skew 和恢复语义。
+
+当 7B 作业的容量、吞吐和 checkpoint 交付物都稳定后，再把输入约束升级到 70B：第9章用 TP/PP/CP/hybrid 设计 rank mesh，第09e章把 dense FFN 替换为 MoE 并补充 EP、router 和 expert checkpoint，第10章对这些并行形态做 checkpoint dry-run、故障注入和恢复演练。最后，第10b/10c章复用同一套 base checkpoint、数据 manifest、eval gate 和 artifact registry，把预训练作业交付到 SFT/RLHF 以及 LoRA/Adapter 生命周期。
+
+贯穿交付物按章节递进：`single_node_baseline.md` -> `dp_fsdp_scale_report.md` -> `parallel_strategy_70b.md` / `moe_ep_report.md` -> `checkpoint_recovery_drill.md` -> `post_training_manifest.md` -> `adapter_release_record.md`。每章不是孤立知识点，而是在补齐下一章必须消费的配置、指标、状态和准入证据。
+
 ## 1. 第一性原理拆解 + 学习大纲
 
 ### 1.1 不可化简的问题

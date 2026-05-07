@@ -1127,6 +1127,8 @@ eval gate at step 80: not run yet
 
 对 AI Infra 工程师来说，PPO/RLHF 的主要工作不是推导算法公式，而是把 actor、reference、Reward Model、critic、rollout engine、training engine、buffer、checkpoint、eval gate 变成可观测、可恢复、可扩容、可治理的系统。只要 rollout/training 吞吐不匹配、多模型 checkpoint 不一致、RM 版本漂移或评测门禁缺失，训练结果就算跑完也难以交付。
 
+本章交付物是 `post_training_manifest.md`：它接收第10章 validated base checkpoint，补充 SFT/RM/DPO/PPO/GRPO 的数据版本、actor/ref/RM/critic 状态、eval gate、buffer 和发布门禁。下一章会把通过 gate 的 SFT 或 preference-tuned base 作为 fine-tuning/adapter 平台的 base contract，继续追踪 tokenizer、chat template、license、安全策略和 artifact digest。
+
 ---
 
 ## 13. 练习题

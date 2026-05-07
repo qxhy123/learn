@@ -549,7 +549,7 @@ const TUTORIAL = [
       },
       {
         "id": "27",
-        "title": "第 27 章 · AI Infra 面试题、自测与面试官题库",
+        "title": "第 27 章 · AI Infra 模拟面试与评分校准手册",
         "path": "part8/27-ai-infra-interview-questions.html"
       }
     ]

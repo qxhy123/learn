@@ -251,13 +251,13 @@ GPU datasheet 是选型输入，不是选型结论。最危险的做法是把不
 
 ### 4d.4 主流 GPU 横向对比
 
-下表用公开资料的常见数量级建立工程直觉，重点是定位差异，不是替代正式 datasheet。采购前应回到具体服务器形态、power cap、驱动版本和供应商配置。
+下表用公开资料的常见数量级建立工程直觉，重点是定位差异，不是替代正式 datasheet。采购前应回到具体服务器形态、power cap、驱动版本和供应商配置。硬件规格、云可用区 / 裸金属可用性、软件成熟度和价格都必须按采购或上线日期重新核对；不要把本表的核对日期外推到未来采购。
 
 **数字口径标签**：`vendor-public`，规格核对日期 `2026-05-05`；显存和 HBM 带宽按单 GPU 或该行明确的产品形态摘录，不是实测吞吐；workload shape = `N/A`。来源口径：NVIDIA A100 datasheet（Jun21）、NVIDIA H100/H200 产品规格页、NVIDIA DGX/HGX B200 产品规格页；L40S 用 NVIDIA 产品规格中的 48 GB GDDR6 形态做类别对比，不把 GDDR6 带宽换算成 HBM 等价能力。
 
 | 设备 | 典型显存 | HBM / 显存带宽数量级 | 互联形态 | 数字口径 | 更适合 | 主要边界 |
 |------|----------|----------------------|----------|----------|--------|----------|
-| A100 40GB PCIe | 40 GB | ~1.5 TB/s | PCIe，少量场景有桥接 | vendor-public，A100 datasheet，per-GPU，shape=N/A | 成熟推理、开发、成本敏感微调 | 显存偏小，TP 和大模型推理受限 |
+| A100 40GB PCIe | 40 GB | ~1.5 TB/s | PCIe，少量场景有桥接 | vendor-public，A100 datasheet，per-GPU，shape=N/A | 存量推理、开发、成本敏感微调 | 显存偏小，TP 和大模型推理受限 |
 | A100 80GB SXM | 80 GB | ~2 TB/s | NVLink / NVSwitch 节点 | vendor-public，A100 datasheet，per-GPU，shape=N/A | 稳定训练、传统大模型推理 | 算力和带宽落后 Hopper / Blackwell |
 | L40S | 48 GB GDDR6 | 低于 HBM 数据中心训练卡 | PCIe | vendor-public，产品形态标签，非 HBM，shape=N/A | 视觉推理、小模型服务、embedding、开发 | 无 HBM，训练大模型和长上下文 LLM 不占优 |
 | H100 PCIe | 80 GB | ~2 TB/s 级 | PCIe | vendor-public，H100 产品规格，per-GPU，shape=N/A | 单卡推理、成本较受控的 Hopper 资源 | 互联弱于 SXM，8 卡 TP 不应按 HGX 假设 |
@@ -371,11 +371,13 @@ MIG 把一张支持该能力的 NVIDIA GPU 切成多个 GPU instance / compute i
 - 某些 GPU 特性、profiling 工具、P2P 通信、MPS 组合方式会受限制，必须以驱动和 GPU Operator 支持矩阵为准。
 - 对大模型 TP 来说，多个 MIG slice 不是多个完整 GPU；跨 slice 通信和带宽都不是目标设计场景。
 
+在 Kubernetes 里，MIG 通常由 NVIDIA GPU Operator / device plugin 暴露成扩展资源，例如 `nvidia.com/mig-1g.10gb`、`nvidia.com/mig-2g.20gb` 这类 profile 资源名。调度器看到的是离散资源计数，不会自动知道“两个小 profile 可以拼成一个大 profile”；profile 配置一旦碎片化，可能出现节点还有空闲 SM/HBM 但无法满足下一个 `mig-1g.10gb` 或更大 profile 请求的情况。生产平台要把 profile 组合、重配 drain、配额和队列策略写进调度契约，队列 / 配额见 [第20章](../part6-platform-and-orchestration/20-queues-quotas-and-autoscaling.md)，Kubernetes AI workload 与节点表达见 [第19a章](../part6-platform-and-orchestration/19a-kubernetes-ai-workloads.md)，资源切分与 GPU 共享治理见 [第20b章](../part6-platform-and-orchestration/20b-gpu-partitioning-and-sharing.md)。
+
 #### 4d.7.2 MPS 与 time-slicing 的正确位置
 
-MPS 更像"让同一 GPU 上的多个 CUDA 进程更好地并发"。它适合一个团队内部把多个小进程合并使用一张卡，降低 context switching 和小 kernel 空洞。它不提供强显存隔离，也不适合彼此不信任的租户。
+MPS 更像"让同一 GPU 上的多个 CUDA 进程更好地并发"。它适合一个团队内部把多个小进程合并使用一张卡，降低 context switching 和小 kernel 空洞。它不提供强显存隔离，也不是安全隔离边界，不适合彼此不信任的租户；在 Kubernetes 中通常要通过准入控制、同租户约束和 device-plugin/runtime 配置限制使用范围。
 
-Time-slicing 更像"排队轮流用"。它的优势是简单、兼容性好，尤其适合开发环境和低优先级任务。但线上推理使用 time-slicing 很容易让 P99 抖动，因为请求可能刚好等到别人的时间片结束。
+Time-slicing 更像"排队轮流用"。它的优势是简单、兼容性好，尤其适合开发环境和低优先级任务。但线上推理使用 time-slicing 很容易让 P99 抖动，因为请求可能刚好等到别人的时间片结束；只要承诺 TTFT / TPOT / P99，就必须把 time-slicing 当成尾延迟风险而不是免费超售手段。
 
 一个实用判断：
 
@@ -390,18 +392,18 @@ Time-slicing 更像"排队轮流用"。它的优势是简单、兼容性好，�
 
 NVIDIA 的优势不只是 GPU 本身，而是 CUDA、cuDNN、NCCL、TensorRT、Triton kernel、DCGM、GPU Operator、Nsight、社区 benchmark 和大量开源项目默认路径。非 NVIDIA 加速器要进入生产平台，必须回答"软件栈能不能稳定承载目标模型"。
 
-**数字口径标签**：`vendor-public + ecosystem-checkpoint`，核对日期 `2026-05-05`，shape=`N/A`；表内 HBM、带宽、端口和 pod 规模来自各厂商公开规格或云产品资料，生态成熟度是工程评估入口，不是稳定事实。所有“性价比”“已部署”“成熟”类判断上线前必须用目标模型、目标 runtime 和目标云/机房环境重测。
+**数字口径标签**：`vendor-public + ecosystem-checkpoint`，核对日期 `2026-05-05`，shape=`N/A`；表内 HBM、带宽、端口和 pod 规模来自各厂商公开规格或云产品资料。生态、价格和部署规模只作为截至核对日期的评估假设或观察入口，不是采购结论；硬件规格、云可用性、软件成熟度、驱动 / runtime 支持矩阵和实际报价都必须按采购或上线日期重新核对，所有“性价比”“部署案例”“成熟度”判断上线前必须用目标模型、目标 runtime 和目标云/机房环境重测。
 
-| 平台 | 典型优势 | 主要生态成本 | 更适合的进入方式 |
-|------|----------|--------------|------------------|
-| **AMD MI300X**（**192 GB HBM3** 业界单卡最大 / **5.3 TB/s** / 153 TFLOPS BF16 dense） | 单卡装 Llama-405B BF16；ROCm 6.x + vLLM/SGLang/TRT-LLM 替代支持已成熟；Llama-405B 单节点已在 OCI/Azure ND MI300X v5 规模化部署 | ROCm 版本兼容（驱动升级风险）、部分 CUDA kernel 迁移仍有空白、FlashAttention 在 MI300X 有专门实现但性能曲线和 H100 不同 | 超长上下文推理或显存敏感训练试点 |
-| **AMD MI325X / MI350**（MI325X **256 GB HBM3e**；MI350 即将量产） | HBM 容量进一步放大，对 200B+ 模型推理价值明显 | 同 MI300X，新代际 ROCm 适配窗口短 | Long-Context Inference 试点 |
-| **Google TPU v5e**（推理优化，16 GB HBM / 256 chip pod） | per-chip 价格远低于 v5p；JAX 推理生态成熟；GCP 上中等推理性价比好 | XLA 调试模型不同、JAX/PyTorch XLA 与原生 PyTorch 路径不一致 | GCP 上中等规模推理/微调 |
-| **Google TPU v5p**（训练优化，95 GB HBM / 8960 chip pod / 3D Torus） | 超大 Pod 训练 trillion-parameter 模型；Gemini 训练硬件 | 仅 GCP 可用、JAX/XLA 学习曲线 | GCP 上超大规模训练 |
-| **Google TPU v6e (Trillium)**（32 GB HBM / 256 chip pod） | v5e 后继，FP8 + per-chip 算力翻倍 | 同 v5e | GCP 推理 + 中等微调 |
-| **Intel Gaudi 3**（128 GB HBM2e / 1.835 TB/s / **24 × 200Gbps RoCE 端口 = 3.6 Tbps 双向**） | 集成 RoCE 网卡设计天然适合 scale-out；价格显著低于 H100；Intel Developer Cloud 已规模化 serving | SynapseAI / OneAPI 仍较新、PyTorch HPU plugin 算子覆盖不全 | 标准 LLM 训练/推理试点，对 NVLink-style scale-up 不强需求场景 |
-| 华为昇腾 910B / 910C | 本土供应链、政企和区域化合规场景；MindSpore 生态 | CANN / MindSpore / PyTorch Ascend plugin 适配、算子覆盖、迁移工程 | 有合规或供应链约束的平台 |
-| **AWS Trainium 2 / Inferentia 2**（Trn2 单节点 16 chip NeuronLink；Inf2 推理优化） | AWS 内部 TCO、托管生态、与 SageMaker / Bedrock 深度集成 | Neuron SDK 学习曲线、云绑定、迁出成本 | 深度使用 AWS 的训练或推理服务 |
+| 平台 | 硬件事实 / 公开规格入口 | 软件支持观察（截至核对日期，非稳定事实） | 必须实测项 / 进入方式 |
+|------|--------------------------|------------------------------------------|--------------------------|
+| **AMD MI300X**（**192 GB HBM3** / **5.3 TB/s** / 153 TFLOPS BF16，厂商峰值需核对 dense/sparse） | 单卡 HBM 容量大，适合显存敏感负载建立候选池 | ROCm 6.x、vLLM/SGLang/TRT-LLM 等路径已有适配案例，但不同模型、kernel 和云环境差异大 | 用目标模型验证 weight/KV 容量、FlashAttention/attention kernel、RCCL 通信、线上 P99；先做超长上下文推理或显存敏感训练试点 |
+| **AMD MI325X / MI350**（MI325X **256 GB HBM3e**；MI350 供给与形态需按采购时点核对） | HBM 容量进一步放大，可能缓解 200B+ 模型推理容量压力 | 新代际 ROCm、驱动和镜像适配窗口更短，公开案例不能直接外推 | 跑 long-context inference、量化路径、故障恢复和升级回滚试点 |
+| **Google TPU v5e**（推理优化，16 GB HBM / 256 chip pod） | GCP 托管形态，pod 规模和单 chip 资源边界清晰 | JAX/XLA 路径较常见；PyTorch XLA 与原生 PyTorch 工程体验不同 | 用目标框架验证编译时间、动态 shape、serving P99、质量一致性和 tokens/sec/$；适合作为 GCP 中等规模推理/微调试点 |
+| **Google TPU v5p**（训练优化，95 GB HBM / 8960 chip pod / 3D Torus） | 大 pod 训练形态，适合评估超大规模训练 | 仅 GCP 可用，JAX/XLA 和数据管线需要专门工程能力 | 跑端到端训练 smoke、checkpoint/恢复、输入管线和失效域演练 |
+| **Google TPU v6e (Trillium)**（32 GB HBM / 256 chip pod） | v5e 后继形态，低精度能力需按官方规格核对 | 生态观察可参考 TPU/XLA 路径，但不能用 v5e 结果直接承诺 | GCP 推理和中等微调试点，重测编译、低精度、serving 和成本模型 |
+| **Intel Gaudi 3**（128 GB HBM2e / 1.835 TB/s / **24 × 200Gbps RoCE 端口 = 3.6 Tbps 双向**） | 集成 RoCE 网卡设计适合 scale-out 候选场景 | SynapseAI / OneAPI 和 PyTorch HPU plugin 仍需按目标算子覆盖核对；价格优势只能按实际报价和可用区重算 | 验证标准 LLM 训练/推理、collective、算子 fallback、serving P99 和运维工具；先进入对 NVLink-style scale-up 不强依赖的试点 |
+| 华为昇腾 910B / 910C | 本土供应链、政企和区域化合规场景候选 | CANN / MindSpore / PyTorch Ascend plugin 的适配深度取决于模型和版本 | 实测算子覆盖、迁移工作量、监控告警、故障定位和合规交付链路 |
+| **AWS Trainium 2 / Inferentia 2**（Trn2 单节点 16 chip NeuronLink；Inf2 推理优化） | AWS 托管生态和专用互联形态 | Neuron SDK 与 SageMaker / Bedrock 路径适合深度 AWS 用户评估，但云绑定和迁出成本需要写入 TCO | 验证训练/推理端到端、编译缓存、弹性扩缩容、质量一致性和迁出预案 |
 
 #### 4d.8.1 评估非 NVIDIA 的问题清单
 

@@ -614,12 +614,12 @@ class CrossShardDataset(IterableDataset):
 | Worker 状态 | prefetch queue 位置 | 每个 worker 的 shard 游标 |
 | Collate 状态 | 通常无状态 | 通常无状态 |
 
-### PyTorch 2.3+ StatefulDataLoader
+### TorchData StatefulDataLoader
 
-PyTorch 2.3 引入了 `StatefulDataLoader`（实验性）：
+TorchData 提供 `StatefulDataLoader`：
 
 ```python
-from torch.utils.data import StatefulDataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 dataloader = StatefulDataLoader(dataset, batch_size=32, num_workers=4)
 
@@ -632,9 +632,23 @@ dataloader.load_state_dict(torch.load("dataloader_state.pt"))
 # 从断点继续，而不是从 epoch 头开始
 ```
 
-**内部实现**：记录每个 worker 的 `dataset.__iter__` 的状态（通过 `__getstate__/__setstate__`），以及主进程的 index 发送位置和 result queue 中 in-flight batch 数量。
+它的定位是 `torch.utils.data.DataLoader` 的 drop-in 扩展：构造参数和常规 DataLoader 尽量保持一致，但额外提供 `state_dict()` / `load_state_dict()`。实际使用前要按当前 release 核对 `torchdata`、PyTorch、DataLoader2/DataPipes 生态的兼容状态；这些 API 在不同版本里的迁移和维护边界变化较快，不能只按旧 RFC 或旧博客写死。
 
-> **工程提醒**：Resume 要真正有效，dataset 的 `__iter__` 必须实现 `__getstate__` 和 `__setstate__`。WebDataset 已原生支持；自定义 IterableDataset 需要手动实现。
+> **工程提醒**：Resume 要真正有效，dataset、sampler、worker 里的自定义状态必须可恢复。自定义 `IterableDataset`、shuffle buffer、远端 shard cursor、worker RNG、动态 bucketing sampler 等状态，需要自己实现 `state_dict()` / `load_state_dict()`，或显式自管 cursor/RNG 并写入训练 checkpoint。只保存 DataLoader 外壳状态，不能自动恢复用户代码里隐藏的游标。
+
+### 分布式 DataLoader 诊断：慢数据会伪装成慢 NCCL
+
+DDP/FSDP 的 step 是全局同步的：一个 rank 因 S3 GET 抖动、解码慢、worker OOM 重启或本地 cache miss 卡住，其他 rank 会在梯度 collective 处等待。trace 上经常表现为 `nccl_wait` 变长，但根因是慢 rank 的数据输入。
+
+最小诊断指标要按 per-rank 打点：
+
+| 指标 | 含义 | 诊断用法 |
+|---|---|---|
+| `data_time` | 上一个 step 结束到 batch ready 的时间 | 找出慢 rank / 慢 worker / cache miss |
+| `step_time` | 完整训练 step wall time | 对齐吞吐波动和 straggler |
+| `nccl_wait` | collective 内等待时间 | 与 `data_time` 联合判断是真通信慢还是被慢 rank 拖住 |
+
+如果 `rank_i.data_time` 先升高，随后其他 rank 的 `nccl_wait` 升高，应优先排查数据路径，而不是直接调 NCCL 参数。通信侧排查方法见 [第08章](../part3-training-infra/08-data-parallel.md)。
 
 ---
 
@@ -890,7 +904,7 @@ def benchmark_dataloader(dataloader, n_batches=50):
 | IterableDataset | shuffle buffer 是近似随机；大规模训练的实际最优方案 |
 | 流式框架 | WebDataset 灵活、Streaming 全局 shuffle、litdata 轻量 |
 | 性能诊断 | GPU util + DataLoader wait time 是最直接的诊断双指标 |
-| Resume | StatefulDataLoader（PyTorch 2.3+）是推荐方案 |
+| Resume | `torchdata.stateful_dataloader.StatefulDataLoader` 可作为 DataLoader 的有状态扩展，但自定义 dataset/sampler/worker 状态仍要显式保存 |
 
 ---
 

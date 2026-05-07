@@ -4,7 +4,7 @@
 
 ## 1. GPUDirect RDMA 到底是什么
 
-GPUDirect RDMA 是 RDMA 的一个关键扩展：**让 RDMA NIC 直接 DMA 读写 GPU HBM，而不是先把 GPU 数据复制到 host pinned memory。**
+GPUDirect RDMA 是 RDMA 的一个关键扩展：**在 peer memory / BAR 映射、驱动授权、地址翻译和 GPU/NIC 拓扑都允许时，让 RDMA NIC 对 GPU HBM 对应的可 DMA 映射发起读写，从而避免先把 GPU 数据复制到 host pinned memory 做 host staging。**
 
 没有 GPUDirect RDMA 时，跨节点 GPU 通信通常要经过 host staging：
 

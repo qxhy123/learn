@@ -1728,6 +1728,8 @@ NCCL 问题必须用 ring/tree、rail、NIC、IB/RoCE、env vars、logs、`nccl-
 
 当容量、拓扑或序列长度超出 DP-family 能力时，应转向 TP/PP/CP/hybrid，而不是继续堆 rank。
 
+本章交付物是 `dp_fsdp_scale_report.md`：它接收第7章的单机 baseline，补充 DDP/FSDP/ZeRO 的 global batch、rank-level step breakdown、NCCL 证据、checkpoint dry-run 和恢复语义。下一章会直接消费这些数字来判断 70B 是否仍能靠 DP-family 解决，还是必须引入 TP/PP/CP/hybrid rank mesh。
+
 ## 15. 练习题
 
 ### 基础题

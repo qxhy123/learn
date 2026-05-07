@@ -295,7 +295,7 @@ H100 到 H200 的平台判断不要简化成“新卡更快”。H200 的核心�
 
 ### 4c.6 GB200 NVL72：机柜级 scale-up 域
 
-GB200 NVL72 把 scale-up 边界从“8-GPU 主板 / 服务器”推到“72-GPU 液冷机柜”。公开资料中，NVL72 包含 36 个 Grace CPU 和 72 个 Blackwell GPU，使用 NVLink-C2C 连接 Grace 与 Blackwell Superchip 内的 GPU，并通过 NVLink Switch System 形成 72-GPU NVLink domain；rack 级 NVLink 通信带宽数量级为 130 TB/s，HBM 总容量约 13.4 TB。
+GB200 NVL72 把 scale-up 边界从“8-GPU 主板 / 服务器”推到“72-GPU 液冷机柜”。公开资料中，NVL72 包含 36 个 Grace CPU 和 72 个 Blackwell GPU，使用 NVLink-C2C 连接 Grace 与 Blackwell Superchip 内的 GPU，并通过 NVLink Switch System 形成 72-GPU NVLink domain；rack 级 NVLink 通信带宽数量级为 130 TB/s，HBM 总容量约 13.4 TB。这里的数字要标成 `vendor-public`：它们是 per-rack / system aggregate 口径，NVLink 数字通常是双向聚合或 bisection / aggregate bandwidth，不是任意 GPU 对、任意通信模式都能达到的可用带宽。
 
 ```mermaid
 flowchart TB
@@ -322,7 +322,7 @@ flowchart TB
   FAC["Power + liquid cooling + service domain"] -. facility boundary .- Rack
 ```
 
-这不是把 9 台 8 卡服务器简单堆进一个机柜。关键差异是：rack 内高频 GPU-GPU 通信可以留在 NVLink domain 里，而不是每次都跨 IB/RoCE。对万亿参数推理、MoE、超大 TP/EP 分区，这会改变并行策略的可行边界。
+这不是把 9 台 8 卡服务器简单堆进一个机柜。关键差异是：rack 内高频 GPU-GPU 通信可以留在 NVLink domain 里，而不是每次都跨 IB/RoCE。对万亿参数推理、MoE、超大 TP/EP 分区，这会改变并行策略的可行边界。但不要把 130 TB/s 这类 rack-level aggregate 数字直接代入一次 all-reduce、all-to-all 或 point-to-point 的时间公式；真实可达吞吐取决于 NVLS 分区、消息大小、collective 算法、rank placement、并发流、bisection 路径和健康链路。
 
 | 系统形态 | Scale-up 域 | Scale-out 依赖 | 适合放进去的通信 | 平台风险 |
 |----------|-------------|----------------|------------------|----------|

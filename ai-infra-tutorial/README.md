@@ -66,11 +66,15 @@
 
 公开发布源稿范围包括：`README.md` 发布为 `html/index.html`，`00-preface.md` 发布为 `html/preface.html`，以及 `part*/` 与 `appendix/` 下的教程正文。`docs/superpowers/` 是内部工作说明，SPEC archive 是归档资料，二者不进入公开发布内容。
 
-后续改稿必须先更新 Markdown，再由构建流程生成 HTML。检查内部链接时，以 Markdown 文件是否存在为准。
+后续改稿必须先更新 Markdown 源稿，再由构建流程生成 HTML；发布前应通过链接检查脚本验证 Markdown 内部链接，以 Markdown 文件是否存在为准。若 HTML 构建或链接检查脚本尚未纳入仓库，当前 HTML 仍只视为发布产物，不应手工当源稿修改。
 
 ---
 
 ## 章节导航目录
+
+### 症状到 Part 0 回读
+
+遇到具体症状时，可以先读第 2 章建立资源链路，再回到 Part 0 查底层机制：tokenizer / CPU hot path 看 0a4、0a5、0a7；Page Cache、NUMA、H2D 看 0b；checkpoint 写入与恢复语义看 0c；NCCL、RDMA、RoCE、GDRDMA 和 `NET/IB` / `NET/Socket` fallback 看 0d3、0d3c、0d4。
 
 ### 开始之前
 
@@ -116,10 +120,10 @@
 | 第7章 | [单机训练系统](./part3-training-infra/07-single-node-training.md) | 训练循环、Profiler、数据管道与显存、LLaMA-7B Worked Example、MFU/HFU 与 AMP | 单机性能基线 |
 | 第8章 | [数据并行](./part3-training-infra/08-data-parallel.md) | AllReduce、同步点、NCCL、吞吐扩展、梯度压缩与 PowerSGD | 规模化第一步 |
 | 第9章 | [模型并行与流水并行](./part3-training-infra/09-model-pipeline-parallel.md) | TP/PP/EP、SP/CP、Interleaved/Zero Bubble、并行策略决策树与配置实例 | 超大模型训练 |
+| 第09e章 | [MoE 训练基础设施](./part3-training-infra/09e-moe-training-infrastructure.md) | EP、All-to-All、gate routing、aux load-balance loss、capacity factor、token drop、MoE checkpoint、5 维并行（DeepSeek-V3 风格）| 2024-2025 主流 MoE 训练 |
 | 第10章 | [内存优化、检查点与恢复](./part3-training-infra/10-memory-checkpointing-and-recovery.md) | 激活重计算、ZeRO、Checkpoint、NCCL Hang 排查、Straggler、Elastic Training、FP8 | 稳定完成训练 |
 | 第10b章 | [对齐训练与后训练基础设施](./part3-training-infra/10b-alignment-and-post-training.md) | RLHF、DPO、PPO/GRPO、RM 部署、PPO Worked Example 与多模型 checkpoint 一致性 | 理解后训练的独特资源模式 |
 | 第10c章 | [Fine-Tuning 基础设施与多 Adapter 服务](./part3-training-infra/10c-finetuning-and-multi-adapter.md) | LoRA、QLoRA、Multi-LoRA 显存预算、Adapter/Base 兼容与 FTaaS pipeline | 微调与 adapter 的平台化 |
-| 第09e章 | [MoE 训练基础设施](./part3-training-infra/09e-moe-training-infrastructure.md) | EP、All-to-All、gate routing、aux load-balance loss、capacity factor、token drop、MoE checkpoint、5 维并行（DeepSeek-V3 风格）| 2024-2025 主流 MoE 训练 |
 
 ### 第四部分：数据与存储基础设施
 
@@ -178,8 +182,8 @@
 |------|------|----------|----------|
 | 第24章 | [构建一个 AI 平台](./part8-advanced-and-capstone/24-build-an-ai-platform.md) | 训练、评测、制品、部署、推理、观测的端到端蓝图与平台边界推导 | 形成系统设计能力 |
 | 第25章 | [AI Agent 与推理时计算基础设施](./part8-advanced-and-capstone/25-agent-and-inference-time-compute.md) | Agent 状态管理、thinking tokens 四模式、推理预算工程与推理服务集成 | 新范式下的推理系统设计 |
-| 第26章 | [AI Infra 面试题、自测与面试官题库](./part8-advanced-and-capstone/26-ai-infra-interview-questions.md) | 90 道面试题 + 5 套模拟面试组合，覆盖资源、链路、故障、治理四维度 | 面试表达与综合系统判断 |
-| 第27章 | [AI Infra 面试题、自测与面试官题库](./part8-advanced-and-capstone/27-ai-infra-interview-questions.md) | 90 道面试题 + 5 套模拟面试组合，覆盖资源、链路、故障、治理四维度 | 面试表达与综合系统判断 |
+| 第26章 | [AI Infra 面试题、自测与面试官题库](./part8-advanced-and-capstone/26-ai-infra-interview-questions.md) | 完整题库、自测框架与面试官追问/评分要点，覆盖资源、链路、故障、治理四维度 | 面试表达与综合系统判断 |
+| 第27章 | [AI Infra 模拟面试与评分校准手册](./part8-advanced-and-capstone/27-ai-infra-interview-questions.md) | 面向面试官的模拟面试组织、证据记录、评分校准与候选人答案策略 | 面试流程化与评估一致性 |
 
 ### 附录
 

@@ -1,10 +1,10 @@
 # 第 16a-lab 章 · Mini-vLLM 实战:从零写一个带 PagedAttention 的迷你推理引擎
 
-> 上一章[16a vLLM 内部机制](16a-vllm-internals.md)从工程师视角拆解了 vLLM 的设计取舍。本章把这些取舍**变成可读、可跑、可改的代码**:在 `code/mini-vllm/` 下的几百行 Python 里,从零实现 PagedAttention、continuous batching、prefix caching、chunked prefill、swap、streaming 和完整 sampler,并与 HF transformers 在 TinyLlama-1.1B 上做位级精确对拍。
+> 上一章[16a vLLM 内部机制](16a-vllm-internals.md)从工程师视角拆解了 vLLM 的设计取舍。本章把这些取舍**变成可读、可跑、可改的代码**:在 `code/mini-vllm/` 下的几百行 Python 里,从零实现 PagedAttention、continuous batching、prefix caching、chunked prefill、swap、streaming 和完整 sampler,并在 TinyLlama-1.1B 上做 HF transformers smoke/parity check。
 >
 > **目标读者:** 已经读过 [第 15 章](15-batching-scheduling-and-kv-cache.md) 和 [16a 主章](16a-vllm-internals.md),想"动手把这些机制串一遍"的人。本章不替代主章的概念解释,它是**带读者一步步加 feature 的实战手册**。
 >
-> **不期待:** 性能与真实 vLLM 对标(我们用纯 PyTorch reference attention,慢得多)。期待的是看清每个机制如何在最小可运行代码里成立。
+> **不期待:** 性能与真实 vLLM 对标(我们用纯 PyTorch reference attention,慢得多)。mini-vLLM 是 correctness-first reference，用来对齐语义，不代表真实 vLLM 的性能路径。期待的是看清每个机制如何在最小可运行代码里成立。
 
 ---
 
@@ -17,7 +17,7 @@ cd code/mini-vllm
 pip install -e ".[dev]"
 python examples/run_toy.py            # toy GPT,随机权重,秒跑通
 python examples/run_tinyllama.py      # TinyLlama-1.1B,首次下载 ~2.2 GB
-pytest tests/ -v                      # 54 个快速测试
+pytest tests/ -v                      # 快速测试子集(默认跳过 slow)
 pytest tests/ -m slow -v              # 加上 HF parity(下载权重)
 python examples/bench.py              # 5 配置 throughput 对比表
 ```
@@ -38,6 +38,8 @@ mini_vllm/
 ├── backends/{interface,reference,torch_backend}.py    # AttentionBackend
 └── models/{base,toy_gpt,llama,llama_loader}.py        # ToyGPT + Llama + HF loader
 ```
+
+与真实 vLLM 的对应关系：`block_manager.py` 对应 BlockManager/BlockPool 的核心语义，`scheduler.py` 对应 iteration-level scheduling，`cache_engine.py` 对应 KV cache pool，`model_runner.py` 对应 ModelRunner 组 batch 和 forward，`backends/reference.py` 对应 PagedAttention backend 的数学语义。省略项包括异步 EngineCore、multiproc/Ray worker、真实 CUDA/Triton/FlashAttention/FlashInfer kernel、CUDA graph、torch.compile、TP/PP/EP 通信、OpenAI server、Prometheus metrics、LoRA、量化和 speculative decoding。
 
 ## 路线图
 
@@ -233,8 +235,8 @@ n_cached=0 时这就是普通的 causal triangular。n_cached>0 时新 chunk 完
 
 `tests/test_attention.py` 锁三件事:
 1. `reshape_and_cache` 写到正确的物理 slot(block_id*block_size + offset)
-2. Torch backend 的 prefill/decode 与 reference 完全一致(allclose atol=1e-5,fp32)
-3. **Chunked prefill 与 unchunked 输出 bit-identical** —— 把一个长度 8 的 prompt 分成 chunk1(5 token)+ chunk2(3 token)算,与一次算 8 token,结果完全相同。这个测试是 Plan 5 chunked prefill 正确性的根基。
+2. Torch backend 的 prefill/decode 与 reference 满足 allclose(atol=1e-5,fp32)
+3. **Chunked prefill 与 unchunked 输出对齐** —— 把一个长度 8 的 prompt 分成 chunk1(5 token)+ chunk2(3 token)算,与一次算 8 token,结果相同。这个测试是 Plan 5 chunked prefill 正确性的根基。
 
 ### 练习
 
@@ -289,9 +291,9 @@ def test_logits_match_hf_top5():
     assert overlap(our_top5, hf_top5) >= 4
 ```
 
-实测 5/5 完全相同。`tests/test_llama_e2e.py` 进一步跑 8-token greedy 生成对比,**逐 token 8/8 完全一致**(参见 commit `fcc7bd6` 的实测输出)。
+这个测试合同关注 top-k logits overlap,用于发现 loader、RoPE、QKV fuse 等路径上的明显错位。`tests/test_llama_e2e.py` 进一步跑短 greedy 生成对比,要求前若干 token 与 HF 输出匹配。
 
-这意味着我们的实现在数学上与 HF transformers 等价。不是"接近",是"位级精确"。
+这意味着 TinyLlama 路径具备实用 smoke/parity 覆盖;它不是逐位精度合同,也不承诺任意长度生成都逐 token 对齐。
 
 ### 练习
 
@@ -343,7 +345,7 @@ toy GPT 上提升不大(prompts 都很短);真实 LLM + 长尾 prompt 上的差�
 ### 练习
 
 - E5.1 — 把 `max_num_batched_tokens` 改成 4(极端小)。跑 `examples/run_toy.py` 4 个 prompt,观察一步只能跑得动多少。
-- E5.2 — `tests/test_e2e.py::test_e2e_continuous_batching_vs_baseline_same_output` 断言 flag on/off **输出完全一致**。如果生成结果依赖调度顺序(比如 token attention 数值受 batch 内其它 seq 影响),这个测试会怎么 fail?为什么我们的实现不会?
+- E5.2 — `tests/test_e2e.py::test_e2e_continuous_batching_vs_baseline_same_output` 断言 flag on/off **输出 token 相同**。如果生成结果依赖调度顺序(比如 token attention 数值受 batch 内其它 seq 影响),这个测试会怎么 fail?为什么我们的实现不会?
 - E5.3 — 实现 LCFS(Last-Come-First-Served)admission policy 替代 FCFS,看 TTFT 中位数变化。
 
 ---
@@ -541,7 +543,7 @@ def swap_out(self, mapping):       # {gpu_id: cpu_id}
             self.cpu_kv_caches[layer][1][c_id].copy_(self.kv_caches[layer][1][g_id].to('cpu'))
 ```
 
-CPU pool 的 layout 与 GPU 完全一致(只是 device='cpu')。tensor copy 走 `.to('cpu')` / `.to(self.device)`(真实 vLLM 用 `cudaMemcpyAsync` + 多 stream 重叠)。
+CPU pool 的 layout 与 GPU 对齐(只是 device='cpu')。tensor copy 走 `.to('cpu')` / `.to(self.device)`(真实 vLLM 用 `cudaMemcpyAsync` + 多 stream 重叠)。
 
 ### BlockManager 双池(`mini_vllm/block_manager.py`)
 
@@ -603,7 +605,7 @@ def test_e2e_swap_matches_no_swap_baseline():
     eng_small = build(num_gpu_blocks=8, num_cpu_blocks=32, enable_swap=True)
     out_big   = eng_big.generate(prompts, sp)
     out_small = eng_small.generate(prompts, sp)
-    assert out_big == out_small   # 输出 token 完全一致
+    assert out_big == out_small   # 输出 token 相同
 ```
 
 Swap 改变的是**时序**(blocks 在 GPU/CPU 之间搬运),不改变**数学**(K/V 内容 bit-identical 经过 round-trip)。
@@ -657,7 +659,7 @@ Swap 改变的是**时序**(blocks 在 GPU/CPU 之间搬运),不改变**数学**
 
 如果你用 mini-vLLM 学完后再去看真实 vLLM 源码,这些**核心抽象一一对应**:
 
-- **Block table 间接寻址** —— 数据结构、`slot_mapping` 的含义、attention kernel 的接口形态完全一致
+- **Block table 间接寻址** —— 数据结构、`slot_mapping` 的含义、attention kernel 的接口形态对齐
 - **Continuous batching 调度模型** —— FCFS + token budget + admission policy
 - **Prefix caching 的 hash chain + 引用计数 + evictable** —— 算法等价
 - **Chunked prefill 在 kernel 层的"prior cached + new chunk"统一表达** —— 数学等价
@@ -667,7 +669,7 @@ Swap 改变的是**时序**(blocks 在 GPU/CPU 之间搬运),不改变**数学**
 
 ### 哪些机制我们没做(留作扩展)
 
-- **Triton/CUDA decode kernel**(Plan 2 spec 已写,待 GPU 机器):block_table 索引 + 在线 softmax(`m_i, l_i, acc`)+ GQA-aware tile
+- **Triton/CUDA decode kernel**(Plan 2 spec 已写,待 GPU 机器):block_table 索引 + 在线 softmax(`m_i, l_i, acc`)+ GQA-aware tile。`make_backend(device)` 默认仍走 Torch/reference 后端;在 CUDA runtime 验证前,Triton 是实验路径,需要显式设置 `MINI_VLLM_BACKEND=triton` 才会启用。
 - **Recompute preemption**:相比 swap 更便宜的短 prompt 路径
 - **Async engine**:`step()` 改成 `asyncio.run(...)` 包一层,引入 producer/consumer queue
 - **TP**:每个 layer 的 weight 沿 head 切,attention 后 all-reduce。最小实现 ~200 行
@@ -683,16 +685,16 @@ Swap 改变的是**时序**(blocks 在 GPU/CPU 之间搬运),不改变**数学**
 
 ## 总结
 
-我们用 1500 行左右的纯 Python 实现了 vLLM 的核心:**PagedAttention 寻址、continuous batching、chunked prefill、prefix caching with CoW、swap-to-CPU、full sampler、streaming**。每个 feature 通过 `EngineConfig` flag 切换,**与 HF transformers 在 TinyLlama-1.1B 上 8/8 token greedy 完全一致**。
+我们用 1500 行左右的纯 Python 实现了 vLLM 的核心:**PagedAttention 寻址、continuous batching、chunked prefill、prefix caching with CoW、swap-to-CPU、full sampler、streaming**。每个 feature 通过 `EngineConfig` flag 切换;TinyLlama-1.1B 路径通过 HF transformers slow smoke/parity check 覆盖,包括 top-k logits overlap 和短 greedy token match。
 
 性能我们完全没追求 —— reference attention 比真实 CUDA kernel 慢 50-100×。但**架构对得上**:你现在能在 PaperPaged 上读懂 PagedAttention 论文里每个图,在 vLLM 源码里认出每个核心数据结构,在生产 issue 里推断 metric 异常的可能根因。
 
 下一步:
-- 想跑性能?装 NVIDIA GPU,做 [Plan 2(Triton kernel)](../docs/superpowers/specs/2026-05-06-mini-vllm-paged-attention-design.md)
+- 想跑性能?装 NVIDIA GPU,做 [Plan 2(Triton kernel)](../docs/superpowers/specs/2026-05-06-mini-vllm-paged-attention-design.md),并用 `MINI_VLLM_BACKEND=triton` 显式 opt-in
 - 想理解更深?把上面 9 节的练习 E*.1/E*.2/E*.3 全做一遍
 - 想看真实生产形态?读 vLLM `v1/engine/core.py` 和 `v1/core/scheduler.py`,带着我们的概念对照表
 
-代码、测试、bench 都在 `code/mini-vllm/` 里。`pytest tests/ -m slow` 是最大的信任来源 —— 如果它过了,你的实现与 HF 数学一致;如果它挂了,某个 kernel/loader 写错了。
+代码、测试、bench 都在 `code/mini-vllm/` 里。`pytest tests/ -m slow` 是 TinyLlama/HF 路径最大的信任来源 —— 如果它过了,说明 loader、模型前向和短生成对拍没有明显偏离;如果它挂了,某个 kernel/loader 很可能写错了。
 
 ---
 
@@ -703,7 +705,7 @@ Swap 改变的是**时序**(blocks 在 GPU/CPU 之间搬运),不改变**数学**
 9453c7f  Plan 6: swap to CPU + LRU preemption
 5ac4b4a  Plan 5: prefix caching + CoW + chunked prefill
 497b727  Plan 4: continuous batching + token budget
-0a07b0a  Plan 3: TinyLlama 1.1B + HF safetensors loader (8/8 greedy parity)
+0a07b0a  Plan 3: TinyLlama 1.1B + HF safetensors loader (HF smoke/parity)
 6eb4b35  Plan 1: skeleton (toy GPT, Torch backend, naive scheduler)
 ```
 

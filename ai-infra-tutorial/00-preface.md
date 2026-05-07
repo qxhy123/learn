@@ -74,6 +74,8 @@ AI 系统的核心资源无非几类：**算力、显存、主存、网络带宽
 
 > 没有指标、日志、trace、配置、命令输出和复测结果，就不能把一个判断称为诊断结论。
 
+症状到 Part 0 的回读方式很简单：先在第 2 章把慢训练、慢推理、扩卡差或 checkpoint 卡顿拆成资源链路，再回 Part 0 查机制。CPU hot path 读 0a4/0a5/0a7，Page Cache、NUMA、H2D 读 0b，checkpoint 的 fsync/一致性读 0c，NCCL/RDMA/RoCE/GDRDMA 读 0d3/0d3c/0d4。
+
 每次阅读 worked example 或 SOP 时，都应主动补齐以下字段：
 
 | 字段 | 含义 |

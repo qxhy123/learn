@@ -518,7 +518,7 @@ AI 训练对存储的要求通常包括：
 
 ### 2.3.4 Page Cache / NUMA 如何影响数据到 GPU
 
-这里先做一个浅引用，完整机制见 [§0b](../part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md)。训练数据从文件系统读出时，通常不是每次都直接从磁盘进用户态，而是先经过 Linux Page Cache。第一次读取 shard 可能受远端存储、磁盘和文件系统限制；如果热数据仍在 Page Cache，后续 epoch 或相邻 worker 可能直接从内存命中，`t_load` 会明显下降。反过来，如果机器内存不足、checkpoint 写入产生大量脏页回写，或数据集工作集远大于可用内存，Page Cache 会频繁失效，表现为 step time 抖动、`cache` 指标下降、major page fault 或 IO wait 升高。
+这里先做一个浅引用，完整机制见 [§0b](../part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md)。训练数据从文件系统读出时，通常不是每次都直接从磁盘进用户态，而是先经过 Linux Page Cache。第一次读取 shard 可能受远端存储、磁盘和文件系统限制；如果热数据仍在 Page Cache，后续 epoch 或相邻 worker 可能直接从内存命中，`t_load` 会明显下降。反过来，如果机器内存不足、checkpoint 写入产生大量脏页回写，或数据集工作集远大于可用内存，Page Cache 会频繁失效，表现为 step time 抖动、`cache` 指标下降、major page fault 或 IO wait 升高。Page Cache 只缓存文件页，不等于 dataset cache、object cache、tokenization cache、KV Cache 或 semantic cache；这些缓存的命中键、生命周期、一致性和淘汰策略都不同。
 
 NUMA 的问题更隐蔽。多 socket 机器上，CPU core、DRAM、PCIe root complex、GPU、NIC 并不是等距连接。如果 dataloader worker 在 socket 0 上运行，却把 batch 分配到 socket 1 的内存，再拷到挂在 socket 0 PCIe root complex 下的 GPU，H2D 路径会多一次跨 socket 访问，带宽和延迟都可能变差。`pin_memory=True` 只是让 Host 内存变成 page-locked，方便 DMA 和 `cudaMemcpyAsync`；它不自动保证 NUMA 亲和正确。工程上要把 dataloader worker、CPU affinity、内存分配、GPU pinning、NIC affinity 一起看，尤其是 GPU Direct Storage、RDMA 数据路径或多 GPU 多 NIC 训练节点。
 
@@ -559,6 +559,8 @@ checkpoint 会带来几个工程问题：
 - 降低 checkpoint 频率。
 - 使用增量 checkpoint 或分层 checkpoint。
 
+但 checkpoint 的第一目标不是“写得快”，而是故障后能按一致的 manifest、完整的 rank/shard 状态和可验证的提交点恢复。只优化写入吞吐，却没有原子提交、校验、版本元数据、恢复演练和失败中断处理，可能得到一个很快写完但崩溃后不可用的 checkpoint；文件系统语义见 [§0c3](../part0-foundations-of-systems/0c3-storage-semantics-fsync-direct-io-and-checkpoints.md)，checkpoint 工程化见 [§12b](../part4-data-and-storage/12b-checkpoint-engineering.md)。
+
 ---
 
 ## 2.4 网络为什么不只是“把包发过去”
@@ -590,6 +592,8 @@ $$
 $$
 
 如果通信代价上升太快，多卡不仅不会带来线性加速，还可能让总成本更差。
+
+网络排障时要先确认 NCCL transport 是否走在预期路径上。`NCCL_DEBUG=INFO` / `NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,COLL` 里看到 `NET/IB`，通常说明 NCCL 选择了 RDMA/IB/RoCE transport；看到 `NET/Socket`，则说明退回 TCP socket 或没有选中 IB transport。即使显示 `NET/IB`，也还要继续验证 GDRDMA 是否真的启用、CUDA buffer 是否经过 peer memory/BAR 映射直接给 HCA 访问，还是退回 host staging。RoCE 场景还要核对 GID index、MTU、PFC、ECN、loss/ECN marking 和交换机队列；MoE 或多并行混合训练要把 rank timeline 展开，看慢的是某个 collective、某个 all-to-all、某个 rank 等待，还是 fabric 拥塞。机制背景见 [§0d3](../part0-foundations-of-systems/0d3-rdma-roce-infiniband-and-gpudirect.md)、[§0d4](../part0-foundations-of-systems/0d4-nccl-collectives-and-network-diagnostics.md)、[§8](../part3-training-infra/08-data-parallel.md) 和 [§09e](../part3-training-infra/09e-moe-training-infrastructure.md)。
 
 ### 2.4.2 为什么扩卡不一定线性加速
 
@@ -744,6 +748,17 @@ $$
 \text{step time} \approx t_{\text{load}} + t_{\text{preprocess}} + t_{\text{h2d}} + t_{\text{forward}} + t_{\text{backward}} + t_{\text{sync}} + t_{\text{update}} + t_{\text{checkpoint}}
 $$
 
+这个直接相加公式是未重叠上界模型：它假设数据加载、H2D、计算、同步和 checkpoint 都串行发生，因此适合做保守预算和找最大项，但不能代表成熟训练系统的真实关键路径。启用 prefetch、pinned memory、CUDA stream、gradient bucket overlap、async checkpoint 后，更接近下面的 critical path 近似：
+
+```text
+data_pipeline = max(t_load, t_preprocess, t_h2d)   # 下一批数据能否及时到 GPU
+compute_sync_path = t_forward + max(t_backward, t_sync_overlap_path) + t_update
+checkpoint_blocking = checkpoint 在训练主循环上的阻塞部分
+step_time ≈ max(data_pipeline, compute_sync_path, checkpoint_blocking)
+```
+
+这里的 `max` 不是说所有开销都会消失，而是说只有落在依赖链上的部分决定 step time。数据管道如果持续填满 prefetch queue，就不在当前 step 的关键路径；AllReduce 如果和 backward bucket 有效重叠，只剩未重叠的尾部；async checkpoint 如果主线程只等待 manifest commit 或少量 flush，阻塞项也应只算这部分。单机数据管道见 [§7](../part3-training-infra/07-single-node-training.md)，数据并行通信重叠见 [§8](../part3-training-infra/08-data-parallel.md)，DataLoader 工程化见 [§11d](../part4-data-and-storage/11d-streaming-and-dataloader-engineering.md)，checkpoint 阻塞边界见 [§12b](../part4-data-and-storage/12b-checkpoint-engineering.md)。
+
 其中：
 
 | 符号 | 含义 | 常见瓶颈 |
@@ -785,6 +800,8 @@ $$
 | $t_{\text{postprocess}}$ | 后处理 | 格式化、过滤、结构化解析 |
 | $t_{\text{downstream}}$ | 下游调用 | 向量库、数据库、工具、外部 API |
 | $t_{\text{return}}$ | 返回给客户端 | 网络、流式传输、客户端连接 |
+
+推理延迟也要单独看 CPU hot path。GPU prefill/decode 很快时，tokenizer 是否 SIMD 化、prompt 拼接是否频繁分配、scheduler queue 是否在锁竞争、HTTP/JSON 编解码是否占 CPU、sampling/top-k/top-p/logits processing 是否在主线程上，都可能决定 TTFT 或 p99。CPU 侧机制可回读 [§0a4](../part0-foundations-of-systems/0a4-simd.md)、[§0a5](../part0-foundations-of-systems/0a5-cache-hierarchy.md)、[§0a7](../part0-foundations-of-systems/0a7-false-sharing.md)、[§0b4](../part0-foundations-of-systems/0b4-syscall-epoll-io-uring-and-service-io.md)；推理架构、调度和引擎优化见 [§14](../part5-serving-infra/14-online-inference-architecture.md)、[§15](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) 和 [§16](../part5-serving-infra/16-quantization-compilation-and-engines.md)。
 
 LLM 推理尤其要区分两个指标：
 

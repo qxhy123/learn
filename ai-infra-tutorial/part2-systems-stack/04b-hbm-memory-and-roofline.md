@@ -464,22 +464,22 @@ $$
 
 用第4章相同的数量级口径，可以建立直觉：
 
-**数字口径标签**：`vendor-public + illustrative calculation`，规格核对日期 `2026-05-05`，shape=`N/A`；表内 peak compute 和 HBM 带宽来自 NVIDIA 公开规格，Machine balance 为 `dense Tensor Core peak / HBM bandwidth` 的手算值，不是 kernel 实测吞吐。
+**数字口径标签**：`vendor-public + illustrative calculation`，规格核对日期 `2026-05-05`，shape=`N/A`；表内 peak compute 和 HBM 带宽来自 NVIDIA 公开规格或产品页数量级，Machine balance 为 `厂商峰值 / HBM bandwidth` 的手算值，不是 kernel 实测吞吐。Blackwell/B200/GB200 行尤其要在采购或报告前重新核对 dense/sparse、BF16/FP16/FP8/FP4、单卡/system total 和具体服务器形态口径。
 
-| 设备 | BF16/FP16 dense 峰值 | HBM 带宽 | Machine balance |
+| 设备 | BF16/FP16 峰值口径 | HBM 带宽 | Machine balance |
 |------|----------------------|----------|-----------------|
-| A100 80GB SXM | ~312 TFLOPS | ~2.0 TB/s | ~156 ops/byte |
-| H100 SXM | ~989 TFLOPS | ~3.35 TB/s | ~295 ops/byte |
-| H200 SXM | ~989 TFLOPS | ~4.8 TB/s | ~206 ops/byte |
-| B200 SXM | ~4500 TFLOPS | ~8.0 TB/s | ~562 ops/byte |
-| GB200 (per GPU) | ~5000 TFLOPS | ~8.0 TB/s | ~625 ops/byte |
+| A100 80GB SXM | ~312 TFLOPS，厂商峰值；需确认 dense/sparse 与 dtype | ~2.0 TB/s | ~156 ops/byte |
+| H100 SXM | ~989 TFLOPS，厂商峰值；需确认 dense/sparse 与 dtype | ~3.35 TB/s | ~295 ops/byte |
+| H200 SXM | ~989 TFLOPS，厂商峰值；需确认 dense/sparse 与 dtype | ~4.8 TB/s | ~206 ops/byte |
+| B200 SXM | 厂商峰值数量级；需核对 dense/sparse、BF16/FP16/FP8/FP4 和单卡/system 口径 | ~8.0 TB/s | 仅作数量级示意 |
+| GB200 | 厂商峰值数量级；需核对是否为 per-GPU、Grace Blackwell module 或 rack/system total | ~8.0 TB/s 级 | 仅作数量级示意 |
 
-数字基于 NVIDIA 官方 datasheet / 产品规格（公开规格），以 dense Tensor Core 为口径；如果模型实际能用 sparse Tensor Core (2:4 结构稀疏)，dense 算力可视为乘以 2 上限。FP8 dense 算力约为 BF16 的 2x，FP4（B200/GB200 NV E2M1 格式）约为 BF16 的 4x。
+数字基于 NVIDIA 官方 datasheet / 产品规格（公开规格）或公开产品页数量级，不应用作未经复核的采购承诺。不同页面可能混用 dense、2:4 sparse、FP8/FP4 峰值、单 GPU 和整机/整柜总量；写入选型表前必须逐项标明。只有模型、kernel 和引擎实际走到对应低精度或结构稀疏路径时，相关峰值才有工程意义。
 
 > [!WARNING]
-> **B200 machine balance 反向加速 memory-bound 失衡**：B200 的 BF16 算力比 H100 翻 4.5x，但 HBM 带宽只提升 2.4x（3.35 TB/s → 8.0 TB/s），machine balance 从 295 飙升到 562。结果是：在 H100 上已经 memory-bound 的 kernel（如 decode attention、layernorm、small-batch GEMV、KV-cache 写回），从 H100 换 B200 实际加速远小于 TFLOPS 提升。`illustrative workload label`：decode-heavy LLM serving、small batch、KV-cache bandwidth bound、相同模型和引擎版本、核对日期 `2026-05-05`；这类路径常见预期应按 1.5-2x 量级先压测验证，而不能按 4.5x TFLOPS 上限预算。prefill 大 batch GEMM 才更可能接近 compute roof。
+> **B200/GB200 machine balance 口径提醒**：如果按厂商公开峰值和公开 HBM 带宽数量级粗算，Blackwell 一代的 compute roof 增长可能快于 HBM 带宽增长；但具体倍数取决于 dense/sparse、dtype、单卡/system total 和产品形态。结果是：在 H100 上已经 memory-bound 的 kernel（如 decode attention、layernorm、small-batch GEMV、KV-cache 写回），从 H100 换到新卡时不应按 TFLOPS 峰值同比例外推。`illustrative workload label`：decode-heavy LLM serving、small batch、KV-cache bandwidth bound、相同模型和引擎版本、核对日期 `2026-05-05`；这类路径必须用目标模型和引擎压测验证。prefill 大 batch GEMM 才更可能接近 compute roof。
 
-这张表有一个反直觉结论：H100 → B200 算力增速远高于 HBM 带宽增速，所以 machine balance 急剧升高。同一个 AI 不变的 kernel，从 A100 换到 B200 后，更容易落在 roofline 左侧——你会看到 GPU 标称算力暴涨，但某些 memory-bound kernel 提速远小于 TFLOPS 提升。这也是为什么 B200 实际推理 throughput 提升通常依赖 FP4 / FP8 量化（直接降低 byte/token）+ MLA / GQA（降低 KV bandwidth）+ Speculative Decoding（提升 token/cycle），而不仅仅是换硬件。
+这张表想表达的不是“某张新卡一定有某个 dense TFLOPS”，而是一个选型约束：compute roof 和 memory roof 的增长不同步时，同一个 AI 不变的 kernel 可能更容易落在 roofline 左侧。你会看到 GPU 标称算力暴涨，但某些 memory-bound kernel 提速远小于峰值 TFLOPS 提升。B200/GB200 的实际推理 throughput 还取决于 FP4 / FP8 量化是否可用、MLA / GQA 是否降低 KV bandwidth、Speculative Decoding 是否适配，以及 runtime 是否吃到对应 kernel 路径，而不仅仅是换硬件。
 
 H200 没有把 BF16 算力翻倍，但 HBM 容量和带宽提升明显，所以对长上下文、decode、optimizer step、activation-heavy workload 可能比”算力没变”看起来更有价值。平台选型不能只看计算 roof，也要看 memory roof 的斜率。
 

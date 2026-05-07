@@ -1,6 +1,6 @@
 # 第 13e 章 · Embedding 工程与缓存层
 
-> **关联章节**：本章深挖 embedding 工程与多级缓存，与 [第 13 章](./13-feature-vector-and-cache.md) 的特征和向量索引、[第 15 章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) 的 KV Cache 调度、以及 [第 16b 章](../part5-serving-infra/16b-sglang-radix-attention.md) 的 RadixAttention 直接衔接。Embedding 选错或没有维护好版本，所有下游的 retrieval / RAG / 推荐 / 风控全部失效；缓存设计错误，命中率越高，过期和越权风险越大。
+> **关联章节**：本章深挖 embedding 工程与多级缓存，与 [第 13 章](./13-feature-vector-and-cache.md) 的特征和向量索引、[第 15 章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) 的 KV Cache 调度、以及 [第 16b 章](../part5-serving-infra/16b-sglang-internals.md) 的 RadixAttention 直接衔接。Embedding 选错或没有维护好版本，所有下游的 retrieval / RAG / 推荐 / 风控全部失效；缓存设计错误，命中率越高，过期和越权风险越大。
 
 ---
 
@@ -337,10 +337,12 @@ L = -log( exp(sim(q,d+)) / sum_j exp(sim(q,d_j)) )
 
 | 缓存类型 | 缓存什么 | Key 设计 | 命中条件 | 失效触发 | 越权风险 |
 |---------|---------|---------|---------|---------|---------|
-| Embedding Cache | query/doc 的向量 | hash(text + model_version + preprocess_version) | 完全相同的输入+模型 | 模型版本升级、预处理规则变更 | 低（向量本身不含业务数据） |
-| Semantic Cache | LLM 的完整回答 | 向量相似度 >= 阈值的历史 query | 语义相近的 query | 底层文档更新、时效性内容 | 中（不同权限用户可能问相似问题但答案应不同） |
-| Output Cache | 完整 prompt-response 对 | hash(full_prompt) 或 hash(user_id + query) | 完全相同的 prompt | 文档更新、用户上下文变化 | 高（必须按 user/tenant 隔离） |
-| KV Prefix Cache | LLM 的前缀 KV 状态 | prefix token hash + 模型版本 | 静态前缀完全相同 | 前缀内容变化、模型版本升级 | 极高（必须按租户/权限隔离）|
+| Embedding Cache | query/doc 的向量 | hash(text + model_id + model_revision + tokenizer_version + preprocess_version) | 完全相同的输入+模型 | 模型版本升级、预处理规则变更 | 低（向量本身不含业务数据） |
+| Semantic Cache | LLM 的完整回答 | query embedding + tenant/ACL + index_version + model_id/model_revision + generation params + policy version | 语义相近且权限、模型、策略一致 | 底层文档更新、模型/策略/参数变化、时效性内容 | 中（不同权限用户可能问相似问题但答案应不同） |
+| Output Cache | 完整 prompt-response 对 | hash(full_prompt + model_id + model_revision + tokenizer/chat_template version + generation params + tool schema version + policy version) | 完全相同的 prompt 与生成环境 | 文档更新、用户上下文变化、工具或策略变化 | 高（必须按 user/tenant 隔离） |
+| KV Prefix Cache | LLM 的前缀 KV 状态 | prefix token hash + model_id/model_revision + tokenizer/chat_template version + LoRA/adapter id + policy version | 静态前缀 token 完全相同 | 前缀内容变化、模型/tokenizer/template/策略升级 | 极高（必须按租户/权限隔离）|
+
+其中 `generation params` 至少包括 temperature、top_p/top_k、max_tokens、stop sequences、logits processors、guided/grammar decoding 配置；`tool schema version` 要覆盖 function/tool 名称、参数 schema、序列化顺序和默认值；`policy version` 覆盖安全、权限、脱敏和合规策略。业务可以把这些字段 canonicalize 后做 hash，但不能在语义上省略。
 
 ### Semantic Cache 深入：阈值设定与失效策略
 
@@ -585,6 +587,7 @@ flowchart TD
 - [ ] Embedding Cache key 包含模型版本和预处理版本
 - [ ] Semantic Cache 阈值经 A/B 测试验证，并对时效性 query 做例外处理
 - [ ] Output Cache 按 user/tenant 隔离
+- [ ] Output/Semantic/KV Prefix Cache key 包含 model_id、model_revision、tokenizer/chat_template version、generation params、tool schema version、policy version
 - [ ] KV Prefix Cache key 不跨租户共享
 
 **监控与漂移检测**
@@ -669,5 +672,5 @@ flowchart TD
 **关联章节**
 - [第 13 章](./13-feature-vector-and-cache.md) — 特征、向量索引与缓存基础
 - [第 15 章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) — KV Cache 调度与 PagedAttention
-- [第 16b 章](../part5-serving-infra/16b-sglang-radix-attention.md) — SGLang RadixAttention 与前缀复用
+- [第 16b 章](../part5-serving-infra/16b-sglang-internals.md) — SGLang RadixAttention 与前缀复用
 - [第 23 章](../part7-reliability-security/23-security-isolation-and-governance.md) — 安全治理与权限隔离

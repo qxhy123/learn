@@ -222,7 +222,7 @@ agent session
 | Queue isolation | 给 planner、finalizer、verifier、summarizer 标注优先级 | 在不同队列或优先级中调度 decode | verifier 风暴可能拖慢高优用户请求 |
 | Tool calling 执行环境 | 在沙箱中执行工具，设置超时、权限、网络和文件边界，并把结果回注给下一轮模型 | 不直接执行工具，只接收回注后的 prompt | 工具结果未过滤会扩大提示注入和数据泄露风险 |
 
-这也是它与 [第15章](../part5-serving-infra/15-batching-scheduling-kv-cache.md) KV Cache 的直接关系：长 context 不只是 prompt 变长，还会让 KV Cache 变成 session 级资源。平台需要 prefix caching 降低重复 prefill，需要 KV 生命周期管理避免长会话挤占共享池，还需要在工具结果回注前做大小限制和安全过滤。
+这也是它与 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) KV Cache 的直接关系：长 context 不只是 prompt 变长，还会让 KV Cache 变成 session 级资源。平台需要 prefix caching 降低重复 prefill，需要 KV 生命周期管理避免长会话挤占共享池，还需要在工具结果回注前做大小限制和安全过滤。
 
 **工程边界**：不要让推理服务理解所有业务工具，也不要让 agent runtime 绕过推理服务直接占 GPU。前者会让 serving engine 被业务语义污染，后者会绕开 batching、KV 管理和配额。清晰边界是：runtime 管流程和状态，serving engine 管模型执行，quota/billing 管预算，tool runner 管外部动作。
 

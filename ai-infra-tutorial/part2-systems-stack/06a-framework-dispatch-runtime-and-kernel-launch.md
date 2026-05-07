@@ -1,6 +1,6 @@
 # 第6a章：从 `model(x)` 到 GPU 执行：框架调度、运行时与 Kernel Launch
 
-> **关联章节**：本章是第6章拆分出的独立上层路径篇，重点回答“一个 Python 里的 `model(x)` 如何变成 GPU 上的一串 kernel launch”。本章只轻触 stream、CUDA Graph 和 kernel 内部优化；更细的 stream / 同步 / CUDA Graph 见 [第6b章](./06b-streams-synchronization-and-cuda-graphs.md)，SM / warp / register / occupancy 见 [第6c章](./06c-kernel-libraries-fusion-and-sm-resource-limits.md)，profiling SOP 见 [第6d章](./06d-profiling-debugging-and-performance-sop.md)。数据搬运路径见 [第5b章](./05b-host-device-io-pcie-numa-and-overlap.md)，显存预算和 roofline 见 [第4b章](./04b-hbm-memory-and-roofline.md)。
+> **关联章节**：本章是第6章拆分出的独立上层路径篇，重点回答“一个 Python 里的 `model(x)` 如何变成 GPU 上的一串 kernel launch”。本章只轻触 stream、CUDA Graph 和 kernel 内部优化；更细的 stream / 同步 / CUDA Graph 见 [第6b章](./06b-streams-synchronization-and-cuda-graphs.md)，SM / warp / register / occupancy 见 [第6c章](./06c-kernel-libraries-fusion-and-sm-resource-limits.md)，profiling SOP 见 [第6d章](./06d-profiling-debugging-and-performance-sop.md)。数据搬运路径见 [第5b章](./05b-host-device-io-pcie-numa-and-overlap.md)，显存预算和 roofline 见 [第4b章](./04b-hbm-memory-and-roofline.md)。推理引擎如何把这些固定开销转化为 continuous batching、shape bucket、prefill/decode 分离和 graph replay hit rate 指标，见 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)。
 
 ## 1. 第一性原理拆解 + 学习大纲
 
@@ -580,6 +580,8 @@ GPU tensor 计算通常会产生输出 tensor 和临时 workspace。如果每次
 | 动态 shape | 每个请求 shape 不同，难以复用图 | bucketing、padding、shape guard |
 | fallback 路径 | 特殊 dtype/layout 不支持 fused kernel | 调整 layout/dtype 或换后端 |
 | 频繁 CPU-GPU 往返 | `.item()`、`.cpu()`、日志统计 | 延迟同步、批量汇总 |
+
+推理引擎层会把这些处理思路产品化：continuous batching 用更多请求填满 decode 小 kernel，shape bucket 让编译缓存和 CUDA Graph 更容易复用，prefill/decode 分离让长 prompt 计算和逐 token decode 走不同调度策略，graph replay hit rate 则衡量请求是否真的走到低 launch 开销路径。对应的服务侧调度、KV Cache 和指标口径见 [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)。
 
 ## 10. 工程案例一：小模型推理换 H100 后没有明显变快
 

@@ -74,6 +74,25 @@
 | LLM Serving | vLLM、TensorRT-LLM、TGI | 证据重点是 prefill/decode 分桶、KV cache、CUDA Graph、batch occupancy、tokens/s |
 | API 网关 | Envoy、NGINX、Kong、LiteLLM、Portkey | 区分 gateway latency、provider fallback、限流与模型 runtime latency |
 
+### 6.1 平台 / 治理工具证据映射
+
+| 工具 | 证明什么 | 进入哪个证据对象 | 如何 retest |
+|------|----------|------------------|-------------|
+| GPU Operator | 节点 driver、container toolkit、device plugin、DCGM exporter 与 GPU Feature Discovery 是否按目标版本闭环 | EvidenceBundle 的 fleet health / node baseline；CapacityLedger 的 GPU flavor 与可用容量 | 重启或新增节点后检查 operator 组件 ready，运行 `nvidia-smi`、DCGM 健康检查和一条最小 GPU workload |
+| NVIDIA Device Plugin | Pod 申请到的 GPU、MIG 分片或 time-slicing/MPS 策略是否与调度声明一致 | EvidenceBundle 的 allocation；CapacityLedger 的 GPU/MIG/MPS 口径 | 提交测试 Pod，核对 resource request、容器内设备、MIG UUID 和 DCGM 指标归属 |
+| DCGM / DCGM exporter | GPU 健康、XID/ECC/throttle、SM/HBM 利用率和温度功耗是否支持性能或故障判断 | EvidenceBundle 的 fleet health / incident timeline；CapacityLedger 的 headroom | 修复后观察无新增 XID/ECC，压测同一 workload 对比 util、clock、power、temp 和 p95 |
+| Kueue | ClusterQueue、ResourceFlavor、borrow/lend、preemption 和 admission 是否解释排队与公平性 | EvidenceBundle 的 scheduling timeline；CapacityLedger 的 queue/quota | 用 2-3 个租户提交同 shape workload，检查 admission、pending reason、抢占和配额归还 |
+| Volcano | PodGroup、gang scheduling、queue priority 和抢占是否避免分布式训练半启动 | EvidenceBundle 的 scheduling timeline；CapacityLedger 的 reserved GPU | 提交多 rank 作业，验证 minAvailable 不满足时不占半套 GPU，满足后同时启动并记录排队时长 |
+| KServe | ModelVersion 到 predictor、revision、流量权重和服务 SLI 的链路是否可追踪 | EvidenceBundle 的 release / serving；ReleaseUnit | 发布候选模型，检查 revision、route、TTFT/TPOT/error 指标，灰度失败后回滚到 Rollback Target |
+| Knative / KEDA / HPA | 冷启动、并发、队列长度、QPS 或 GPU 指标驱动的扩缩容是否符合 SLO | EvidenceBundle 的 autoscaling timeline；CapacityLedger 的 warm pool / headroom | 固定流量阶跃压测，比较 scale-out 时间、冷启动比例、p95/p99 和扩容后成本 |
+| Argo Rollouts / Flagger | canary、analysis、shadow/mirror、自动暂停和回滚是否执行发布门禁 | EvidenceBundle 的 release gate；ReleaseUnit | 构造错误率或延迟超阈值的候选版本，验证 analysis 失败、流量停止放量并切回 rollback target |
+| Kyverno / Gatekeeper | 镜像签名、资源限额、hostPath、特权容器、secret 挂载和命名空间策略是否被准入控制执行 | EvidenceBundle 的 policy decision；ReleaseUnit 的上线门禁 | 对违规 YAML 做 server-side dry-run 或测试部署，应被拒绝；修正后准入并记录 policy report |
+| Trivy / Grype | 镜像、文件系统或依赖漏洞是否达到安全门禁要求 | EvidenceBundle 的 scan result；ReleaseUnit / SBOM | 固定漏洞阈值重新扫描候选镜像，确认高危漏洞被修复、例外有 owner 和到期时间 |
+| cosign | 镜像、SBOM 或 attestation 的签名、身份和完整性是否可验证 | EvidenceBundle 的 provenance / attestation；ReleaseUnit | 对允许与篡改镜像分别执行 verify，允许项通过，篡改或无签名项被准入策略拒绝 |
+| Syft | 镜像或工件 SBOM 是否完整记录包、版本和来源 | EvidenceBundle 的 SBOM；ReleaseUnit | 重新生成 SBOM，与 registry 产物 digest 绑定，抽查关键依赖版本与扫描输入一致 |
+| Vault | secret 存储、动态凭据、租户隔离、轮换和审计是否可追踪 | EvidenceBundle 的 access audit；incident timeline | 轮换一条测试 secret，验证旧凭据失效、Pod 重载路径有效、审计日志包含主体和时间 |
+| OpenCost / Kubecost | GPU/CPU/存储/网络成本能否按 namespace、tenant、queue、model 或 job 归因 | CapacityLedger 的 cost / chargeback；EvidenceBundle 的 cost impact | 跑固定时长 workload，核对资源用量、单价、标签归属和优化前后成本差异 |
+
 ## 7. 网络、RDMA 与链路验收
 
 | 类别 | 常见示例 | 证据用途 |

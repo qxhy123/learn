@@ -191,7 +191,7 @@ worker 根据 index 定位 shard 和 byte range，再发起 Range GET 或从本�
 读对象存储到 GPU 的现代捷径：
 
 - **NVIDIA DALI**（数据加载/解码 pipeline）和 **cuFile/GDS** 配合，可以把对象存储 → 节点 NVMe cache → GPU 的解码和拷贝大幅 offload；JPEG/视频解码可直接在 GPU 上做。
-- 对纯 IO 密集的 dataset（fp16 tensor、tokenized text），GDS 直读 NVMe shard cache 比"先到 CPU 再 cudaMemcpy"省一份内存带宽。GDS 路径细节见 [0c1 §8.5](0c1-vfs-inode-dentry-and-block-layer.md#85-gpudirect-storage-与-cufile) 和 [0d3c](0d3-rdma-roce-infiniband-and-gpudirect.md)。
+- 对纯 IO 密集的 dataset（fp16 tensor、tokenized text），GDS 直读 NVMe shard cache 比"先到 CPU 再 cudaMemcpy"省一份内存带宽。GDS 路径细节见 [0c1 §8.5](0c1-vfs-inode-dentry-and-block-layer.md#85-gpudirect-storage-与-cufile) 和 [0d3c](0d3c-gpudirect-rdma-gpu-nic-topology-and-diagnostics.md)。
 
 PyTorch DataLoader + 对象存储常见坑：
 

@@ -1274,6 +1274,8 @@ adapter 与 base model 的关系是强绑定，不只是 shape 绑定，还包�
 
 生产判断标准很简单：如果一个 adapter 从训练产物到 production route 的每一步都能被解释、校验、回滚和审计，这个平台才真正具备 FTaaS 和多 adapter 服务能力。
 
+本章交付物是 `adapter_release_record.md`：它接收第10b章通过 eval gate 的 base/post-training manifest，沉淀 LoRA/QLoRA/DoRA adapter 的训练数据、base digest、兼容性检查、评测结果、registry 状态和 serving route。到这里，Part3 的同一条 7B/70B 实验线从训练 baseline 流向可审计的后训练与多 adapter 交付闭环。
+
 ---
 
 ## 16. 练习题

@@ -2,7 +2,9 @@
 
 > 把 TensorRT 图优化、CUDA kernel 融合、inflight batching、KV Cache 治理、量化路径、TP/PP 通信、speculative decoding 全部塞进一个"先编译后执行"的引擎里——这就是 TensorRT-LLM 真正在做的事情。
 
-> **关联章节**：本章承接 [第 15 章](15-batching-scheduling-and-kv-cache.html) 关于 KV Cache、PagedAttention、调度循环的概念铺垫，以及 [第 16 章](16-quantization-compilation-and-engines.html) 关于推理引擎选型的整体对比。读完 Ch 15/16 与 [16a vLLM 深挖](16a-vllm-internals.md)、[16b SGLang 深挖](16b-sglang-internals.md) 后，本章回答的是更深入的问题：TRT-LLM 在内部如何把这些机制组织成一套"engine artifact + runtime executor"的体系；它与 vLLM、SGLang 的根本性差异在哪一层；某个 build flag 或 KV Cache 参数动起来会让哪几条路径同时变化。本章不是 TRT-LLM 用户手册，而是 TRT-LLM 工程师视角的深挖：每一个机制为何如此设计、与 vLLM/SGLang 相比贵在哪、便宜在哪、什么场景失效。Worked example 用一个 LLaMA-70B × 8×H100 的真实 build 与 deploy 过程来贯穿。
+> **关联章节**：本章承接 [第 15 章](15-batching-scheduling-and-kv-cache.md) 关于 KV Cache、PagedAttention、调度循环的概念铺垫，以及 [第 16 章](16-quantization-compilation-and-engines.md) 关于推理引擎选型的整体对比。读完 Ch 15/16 与 [16a vLLM 深挖](16a-vllm-internals.md)、[16b SGLang 深挖](16b-sglang-internals.md) 后，本章回答的是更深入的问题：TRT-LLM 在内部如何把这些机制组织成一套"engine artifact + runtime executor"的体系；它与 vLLM、SGLang 的根本性差异在哪一层；某个 build flag 或 KV Cache 参数动起来会让哪几条路径同时变化。本章不是 TRT-LLM 用户手册，而是 TRT-LLM 工程师视角的深挖：每一个机制为何如此设计、与 vLLM/SGLang 相比贵在哪、便宜在哪、什么场景失效。Worked example 用一个 LLaMA-70B × 8×H100 的真实 build 与 deploy 过程来贯穿。
+
+> **版本矩阵 / 适用口径**：本章涉及 TensorRT-LLM、TensorRT、ModelOpt、FP8/FP4、paged KV、inflight batching、Triton tensorrtllm_backend、H100/B200 专属 kernel 时，默认都绑定 GPU SKU、driver/CUDA/TensorRT/TRT-LLM 版本、builder flags、engine shape contract、容器镜像和 commit。任何性能数字都应按模型、输入/输出分布、并发、精度、attention plugin、KV dtype 和测量口径重新 benchmark；换 GPU、换版本或改 max batch/context 通常要 rebuild 并复测。
 
 ---
 
@@ -739,7 +741,7 @@ ROI = (acceptance_rate × draft_length × verify_throughput) / (draft_cost + ver
 
 ## 16c.12 vLLM / SGLang / TRT-LLM 决策矩阵（深挖版）
 
-本节不重复 [§16.7.1](16-quantization-compilation-and-engines.html) 的整体引擎对比，而是聚焦在"什么场景应当走 TRT-LLM"。
+本节不重复 [§16.7.1](16-quantization-compilation-and-engines.md) 的整体引擎对比，而是聚焦在"什么场景应当走 TRT-LLM"。
 
 ### 6 维对比
 
@@ -851,7 +853,7 @@ TRT-LLM 不是万能的。下面这些场景应该考虑替代方案。
 
 ## 16c.15 Worked Example：LLaMA-70B × 8×H100，TRT-LLM build & deploy 实战
 
-下面用一个真实风格的过程，把前面几节的机制串起来。场景：把 LLaMA-3-70B-Instruct 部署到一台 8×H100 80GB（NVLink 全连接）服务器，目标支持企业内部 chatbot，峰值 200 QPS，平均输入 1500 token、输出 400 token，目标 P99 TTFT < 600ms、P99 TPOT < 60ms。已有 vLLM baseline（参见 [16a §14](16a-vllm-internals.html#s14)）作为对照。
+下面用一个真实风格的过程，把前面几节的机制串起来。场景：把 LLaMA-3-70B-Instruct 部署到一台 8×H100 80GB（NVLink 全连接）服务器，目标支持企业内部 chatbot，峰值 200 QPS，平均输入 1500 token、输出 400 token，目标 P99 TTFT < 600ms、P99 TPOT < 60ms。已有 vLLM baseline（参见 [16a §14](16a-vllm-internals.md#1614-worked-examplellama-70b--8a100特定-benchmark-的调优数量级)）作为对照。
 
 ### 第 0 步：vLLM baseline（参考）
 

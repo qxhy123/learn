@@ -16,7 +16,7 @@ tokenizer 看起来是一个简单的查表工具。但当训练语料从 1GB �
 
 第二个不可化简的约束：**GPU 需要固定形状的 batch，但文本长度天然参差不齐**。一句话 20 个 token，一篇论文摘要 512 个 token，一篇长文 8192 个 token。如果用 padding 对齐到最大长度，短文本就大量浪费算力（padding token 不贡献梯度却消耗显存和计算）。如果限制最大长度，长文本只能截断，信息丢失。工程解决方案是 sequence packing：把多条文档的 token 流拼接填满一个固定长度的序列，用 attention mask 或 document boundaries 区分边界。这本来是个聪明的方案，但它引入了第三个约束：**packing 改变了每条文档参与梯度的方式，影响 loss 的数值语义**。
 
-第三个约束：**存储格式决定读取效率**。1TB 文本经过 tokenizer 处理后变成 ~2000 亿整数（假设平均 ~5 字节/token，BF16 存储则约 400GB）。这些整数怎么存？存成 JSON 文件一行一个样本？存成 Parquet？存成二进制流？格式选择直接决定：随机访问 vs 顺序读取的成本、分布式训练的 shard 分配方式、能否在不落盘情况下流式训练、磁盘占用与读取带宽的比值、训练中途 crash 重启后能否从断点续训。
+第三个约束：**存储格式决定读取效率**。1TB 文本经过 tokenizer 处理后通常变成数千亿量级的 token id，但具体数量取决于这是原始 UTF-8 文本还是压缩文本、语料语言比例、代码比例和 tokenizer 的 bytes/token。经验值可以按 3-5 bytes/token 估算：1TB 原始文本约 200B-330B tokens。token id 是离散词表索引，不能用 BF16 存；常见落盘 dtype 是 `int32` / `uint32`（128K 词表足够）、少数框架用 `int64` 方便张量 API，或者用 packed/varint 格式压缩。格式选择直接决定：随机访问 vs 顺序读取的成本、分布式训练的 shard 分配方式、能否在不落盘情况下流式训练、磁盘占用与读取带宽的比值、训练中途 crash 重启后能否从断点续训。
 
 四个约束叠加在一起：tokenizer 映射层 × 序列形状约束 × packing 语义问题 × 存储格式效率——任何一个处理不当，都会导致训练效率损失、loss 数值不准或者训练不可恢复。这才是本章要解决的不可化简问题。
 
@@ -136,7 +136,7 @@ spm_train \
   --num_threads=32
 ```
 
-LLaMA 系列、Gemma、Mistral 均使用 SentencePiece。
+LLaMA 1/2 使用 SentencePiece；LLaMA 3/3.1/3.2 改为 tiktoken-based BPE，词表规模约 128K。Gemma、Mistral 等模型仍常见 SentencePiece，但复现已有模型时必须以对应 checkpoint 发布的 tokenizer 文件为准，不能只按模型家族名推断。
 
 ### Tiktoken：Rust 驱动的编码推理
 
@@ -185,7 +185,7 @@ outputs = tokenizer.encode_batch(["text1", "text2", "text3"])
 | 单线程编码吞吐 | ~100 MB/s | ~200 MB/s | ~500 MB/s | ~400 MB/s |
 | 并行批量编码 | 手动 multiprocessing | 部分支持 | 原生支持 | 原生支持 |
 | 算法支持 | BPE | BPE / Unigram | BPE | BPE / WordPiece / Unigram |
-| 典型使用方 | 早期 GPT-2 | LLaMA / Gemma / Mistral | GPT-3.5 / GPT-4 | BERT / RoBERTa / 自定义 |
+| 典型使用方 | 早期 GPT-2 | LLaMA 1/2 / Gemma / Mistral | GPT-3.5 / GPT-4 / LLaMA 3+ | BERT / RoBERTa / 自定义 |
 
 > **工程边界**：在 1TB 语料上，Python BPE 训练可能需要数天；SentencePiece 或 HuggingFace Tokenizers 通常在 1-4 小时内完成。编码推理阶段，单机 32 core 使用 HuggingFace encode_batch，吞吐通常在 5-15 GB/s（原始文本），足以在 24 小时内处理 1TB 语料。
 
@@ -201,8 +201,7 @@ outputs = tokenizer.encode_batch(["text1", "text2", "text3"])
 |---------|---------|---------|--------------|----------|
 | 32K | LLaMA-1/2, Mistral | 较长 | ~512MB (BF16, 4096 dim) | 欧洲语言一般，亚洲语言弱 |
 | 50K | GPT-2, RoBERTa | 中 | ~800MB | 英语为主 |
-| 65K | LLaMA-3 | 较短 | ~1.0GB | 改进多语言 |
-| 100K+ | GPT-4 (cl100k_base ~100K) | 短 | ~1.6GB | 较好多语言 |
+| 100K+ | GPT-4 (cl100k_base ~100K), LLaMA-3+ (~128K) | 短 | ~1.6-2.0GB | 较好多语言 |
 | 256K | Gemma-2 | 短 | ~4GB | 强多语言 |
 
 词表越大：同样文本用更少 token 表示（序列更短，注意力计算更省），Embedding 矩阵更大（显存开销），多语言效率更高。词表越小：Embedding 矩阵更小，但序列更长。对 attention 是 O(n²) 复杂度的模型，序列长度增加的代价比 Embedding 矩阵增大的代价更敏感。
@@ -704,7 +703,7 @@ flowchart LR
 ### 场景设定
 
 - 输入：1TB 原始文本（混合 Web 文本、书籍、代码），存储在 S3，约 500 亿原始 Unicode 字符
-- Tokenizer：LLaMA-3 tokenizer（128K 词表，SentencePiece-based），平均约 3.5 字节/token
+- Tokenizer：LLaMA-3 tokenizer（tiktoken-based BPE，128K 词表），平均约 3.5 字节/token
 - 目标序列长度：4096 tokens
 - 目标格式：MosaicML Streaming (.mds)，10M tokens/shard
 - 训练集群：64 个 H100 节点，每节点 8 卡
@@ -714,13 +713,13 @@ flowchart LR
 ```text
 原始文本：1TB = 1,000 GB = 10^12 字节
 平均字节/token = 3.5（英文约 4 字节，中文约 1.5 字节，代码约 3 字节，加权平均）
-估算 token 总数 = 1TB / 3.5B = ~286 亿 token ≈ 280B tokens
+估算 token 总数 = 10^12 bytes / 3.5 bytes/token ≈ 286B tokens
 
 存储计算（int32 存储 token ID）：
 280B tokens × 4 bytes/token = 1.12TB（未压缩）
 
-MosaicML .mds 格式，uint16 存储（词表 < 65536 无法用，128K 词表必须 uint32）：
-实际存储：280B tokens × 4 bytes = ~1.12TB
+MosaicML .mds 格式通常按字段 dtype 写 token id。128K 词表不能用 uint16，常用 int32/uint32；如果训练框架要求 int64，则未压缩体积翻倍；packed/varint 格式会更小但解码更重：
+实际存储（int32/uint32）：280B tokens × 4 bytes = ~1.12TB
 
 使用 zstd 压缩（典型压缩比 2-3x）：
 压缩后约 400-560 GB
@@ -739,26 +738,25 @@ Shard 数量（10M tokens/shard）：
 # 使用 Ray Data 并行 tokenization
 import ray
 from streaming.base import MDSWriter
-from tokenizers import Tokenizer
+from transformers import AutoTokenizer
 
 @ray.remote(num_cpus=4)
 class TokenizerWorker:
-    def __init__(self, tokenizer_path):
-        self.tokenizer = Tokenizer.from_file(tokenizer_path)
-        self.tokenizer.enable_padding(length=None)
+    def __init__(self, tokenizer_dir):
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, use_fast=True)
     
     def process_file(self, s3_path):
         texts = self._read_s3_jsonl(s3_path)
-        encodings = self.tokenizer.encode_batch(texts)
-        return [e.ids for e in encodings]
+        batch = self.tokenizer(texts, add_special_tokens=False)
+        return batch["input_ids"]
 
 # 64 个 worker 并行处理
-workers = [TokenizerWorker.remote("s3://model/tokenizer.json") for _ in range(64)]
+workers = [TokenizerWorker.remote("s3://model/llama3-tokenizer/") for _ in range(64)]
 ```
 
 **时间估算**：
 - 64 节点 × 32 core = 2048 core
-- 每 core 处理速度 ~200MB/s 文本（SentencePiece）
+- 每 core 处理速度按 tiktoken/Rust BPE 推理路径估算，通常高于 SentencePiece 单线程路径；真实吞吐以 tokenizer 文件、文本语言分布和批大小压测为准
 - 总 IO 吞吐：假设 S3 读取 20 GB/s（64节点 × 320 MB/s/节点）
 - 实际瓶颈：S3 读取带宽
 - 预计处理时间：1TB / 20 GB/s ≈ 50 秒纯读取，加上 tokenization CPU 约 2-4 小时
@@ -887,7 +885,8 @@ flowchart TD
 
 | 需求 | 推荐方案 |
 |------|---------|
-| 复现已有模型（LLaMA/Mistral） | 直接用对应 SentencePiece 模型 |
+| 复现 LLaMA 1/2 或 Mistral | 直接用对应 SentencePiece 模型 |
+| 复现 LLaMA 3+ | 使用对应发布的 tiktoken-based tokenizer（约 128K 词表） |
 | 复现 GPT 系列 | tiktoken cl100k_base / o200k_base |
 | 从头训练新 tokenizer | HuggingFace Tokenizers（BPE Trainer） |
 | 推理服务高吞吐 tokenization | tiktoken 或 HF Tokenizers Rust |

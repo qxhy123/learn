@@ -14,9 +14,16 @@
 | MIG（Multi-Instance GPU） | NVIDIA 的硬件级 GPU 切分能力，可把一张卡分成多个隔离实例 |
 | MPS（Multi-Process Service） | NVIDIA 的多进程共享机制，让多个进程复用同一 GPU 上下文 |
 | Time-Slicing | 在平台层按时间片复用 GPU 的方式，隔离弱但门槛低 |
+| SR-IOV（Single Root I/O Virtualization） | PCIe 设备虚拟化能力，把一个物理设备暴露成多个虚拟功能（VF）给虚拟机或容器使用；GPU / NIC 场景下常用于虚拟化隔离和资源切分，但性能、功能和安全边界取决于厂商实现 |
 | GPUDirect RDMA | 让 NIC 直接读写 GPU 显存的数据路径，减少 CPU 内存中转和拷贝开销 |
+| GDS（GPUDirect Storage） | 让 NVMe / 存储路径更直接地读写 GPU 显存的数据通路，减少 CPU bounce buffer 和主机内存拷贝，常用于高速数据加载、checkpoint 和权重加载 |
 | PCIe Lane | PCIe 链路的基本通道，lane 数和代际共同决定 GPU、NIC、NVMe 与 CPU 之间的带宽上限 |
+| ACS（Access Control Services） | PCIe 的访问控制能力，可影响 P2P、IOMMU 隔离和设备间事务路由；AI 服务器里 ACS/BIOS 配置不当可能让 GPUDirect 或 GPU-GPU P2P 走慢路径 |
+| IOMMU（Input-Output Memory Management Unit） | 设备 DMA 的地址翻译和隔离单元，用于把设备可见 IOVA 映射到物理内存；能增强隔离，也可能影响 P2P / GPUDirect 路径，需要按平台配置验证 |
 | DMA（Direct Memory Access） | 设备绕过 CPU 直接读写主存的机制，是高速网卡、NVMe、GPU 数据搬运的基础 |
+| WGMMA（Warp Group Matrix Multiply-Accumulate） | NVIDIA Hopper 及后续架构中的 warp group 级矩阵乘累加指令族，让多个 warp 协作驱动 Tensor Core，是高性能 GEMM / attention kernel 的关键底层能力 |
+| TMA（Tensor Memory Accelerator） | NVIDIA Hopper 及后续架构中的张量搬运硬件机制，可把多维 tile 在 global memory 与 shared memory 间异步搬运，降低复杂地址计算和拷贝开销 |
+| NVLS（NVLink Switch System） | NVIDIA 节点或机柜级 NVLink 交换系统，把多张 GPU 连接成更大的 NVLink fabric；GB200 NVL72 等系统中用于形成 rack-scale NVLink domain |
 
 ---
 
@@ -68,6 +75,8 @@
 | Fat-tree Topology | 一类提供较均衡跨节点带宽的数据中心网络拓扑，常见于大规模训练集群 |
 | Rail-optimized Topology | 让每个 GPU 或节点优先走固定 rail 的网络设计，用更低成本换可接受带宽 |
 | RDMA Verbs | RDMA 编程接口抽象，包括 QP、CQ、WR、WC 等，用于提交和完成零拷贝网络操作 |
+| HCA（Host Channel Adapter） | InfiniBand / RoCE 网卡在 RDMA 语境下的常用称呼，负责队列、DMA、RDMA verbs 和链路通信 |
+| GID（Global Identifier） | RDMA / InfiniBand 地址标识，RoCE 中常用于选择源地址、VLAN / 子网和路由语义；GID index 配错会导致通信失败或走错网络 |
 | QP（Queue Pair） | RDMA 通信端点，包含发送队列和接收队列 |
 | CQ（Completion Queue） | RDMA 完成队列，用于报告 Work Request 的完成状态 |
 | WR / WC | RDMA Work Request 表示提交的工作项，Work Completion 表示完成结果 |
@@ -165,11 +174,34 @@
 | 向量索引（Vector Index） | 支持近似最近邻检索的数据结构或服务 |
 | Volcano | 面向批任务和 AI 训练的 Kubernetes 调度系统，提供队列、gang scheduling 等能力 |
 | Kueue | Kubernetes 原生生态里的任务队列与准入控制组件，常用于批任务配额和 ResourceFlavor 管理 |
+| Gang Scheduling | 要求分布式训练的一组 Pod 同时获得资源后再启动，避免只启动部分 rank 占住 GPU 空转 |
+| PodGroup | Volcano / Kueue 等调度系统用于表达一组必须一起调度的 Pod、最小副本数和队列属性的对象 |
+| ResourceFlavor | Kueue 中描述资源来源或硬件类型的抽象，例如 H100、A100、MIG 分片、spot 或特定拓扑节点池 |
+| ClusterQueue | Kueue 中跨 namespace 汇聚资源配额、准入、借用和抢占策略的集群级队列 |
+| Borrow / Lend | 队列之间临时借用或出借未使用配额的策略，要求同时定义上限、归还和抢占语义 |
+| Preemption | 为更高优先级或更符合配额策略的 workload 腾出资源而中止或驱逐已有 workload 的机制 |
+| Topology-aware Scheduling | 调度时把 GPU/NIC/CPU socket/NVLink/PCIe switch 等拓扑关系纳入约束，降低跨 NUMA 或跨交换路径开销 |
+| DRA（Dynamic Resource Allocation） | Kubernetes 动态资源分配机制，用结构化方式申请、分配和绑定 GPU、加速器或其他扩展资源 |
+| CDI（Container Device Interface） | 容器运行时暴露设备的标准化描述接口，使 GPU/MIG/NIC 等设备注入更可审计、可移植 |
 | DRF（Dominant Resource Fairness） | 面向多资源系统的公平分配思路，关注租户占用的"主导资源"比例 |
 | Canary Release | 让新版本先接入少量真实流量，再逐步放量的发布方式 |
+| Canary | 同 Canary Release，强调发布单元在小流量真实请求下接受 SLO、质量和成本门禁验证 |
+| Shadow Traffic | 将真实请求复制给候选版本但不返回其结果，用于比较延迟、错误、成本和模型质量差异 |
+| Rollback Target | 发布前确认可切回的模型、engine、镜像、路由、索引、缓存和配置组合 |
+| Eval Gate | 发布状态机中的评测门禁，只有质量、安全、回归、成本或延迟阈值达标后才允许进入下一阶段 |
 | Blue-Green Deployment | 准备两套独立环境，通过切流快速完成发布或回滚的部署方式 |
 | 灰度发布（Progressive Delivery / Canary Rollout） | 让新模型或新服务先接收小比例流量，再逐步放量 |
 | SLSA（Supply-chain Levels for Software Artifacts） | 用于提升软件供应链可追溯性和可信度的分级框架 |
+| SBOM（Software Bill of Materials） | 软件物料清单，列出镜像、依赖、模型构建链路中的组件、版本和来源 |
+| Provenance | 构建来源证明，记录产物由哪个源码、数据、参数、构建器和流水线步骤生成 |
+| Attestation | 对构建、扫描、测试或发布事实的可验证声明，常与签名一起进入供应链证据 |
+| Cosign | Sigstore 生态中的镜像或工件签名与验证工具，常用于校验镜像、SBOM 和 attestation |
+| OPA / Gatekeeper | 基于 Open Policy Agent 的 Kubernetes 准入控制方案，用策略阻止不合规资源进入集群 |
+| Kyverno | Kubernetes 原生策略引擎，可做准入校验、默认值注入、资源变更和策略报告 |
+| Secret Encryption | 对 secret 在存储、传输和运行时挂载路径上的加密与权限控制，防止明文泄漏扩大影响 |
+| Prompt Injection | 外部输入通过提示词内容诱导模型越权、泄露数据或错误调用工具的攻击方式 |
+| Guardrails | 围绕模型输入、输出、工具调用和策略执行的约束层，用于降低越权、泄露和不安全响应风险 |
+| Token-level Quota | 以 token、请求、GPU-second 或模型调用成本为粒度的租户限额和熔断策略 |
 | 成本归因（Cost Attribution / Chargeback） | 将 GPU、存储、网络等资源成本归属到团队、项目、任务或模型 |
 | Mermaid | Markdown 中常用的文本化图表语法，可渲染流程图、时序图、状态图和 mindmap |
 
@@ -192,6 +224,13 @@
 | 术语 | 简要解释 |
 |------|----------|
 | SLO（Service Level Objective） | 服务等级目标，用于定义可用性、延迟、错误率等目标 |
+| SLI（Service Level Indicator） | 衡量服务状态的具体指标，例如 TTFT、TPOT、错误率、成功率、排队时长或恢复时间 |
+| Error Budget | SLO 允许消耗的错误额度，用来约束发布速度、变更风险和故障后的冻结策略 |
+| Burn Rate | 错误预算消耗速度，常用于判断是否需要告警、止血、暂停发布或降级 |
+| Trace Sampling | 在请求 trace 中按比例、规则或异常条件采样，平衡排障可见性与存储成本 |
+| High Cardinality | 指标标签取值过多导致存储、查询和告警成本急剧上升的现象，例如把 request id 当 label |
+| Runbook | 面向值班和故障处理的操作手册，包含触发条件、判断路径、止血动作、retest 和升级联系人 |
+| Postmortem | 事故后复盘文档，记录时间线、影响面、根因、修复、预防动作和平台规则沉淀 |
 
 > 注：可观测性相关的更细分指标（TTFT / TPOT / ITL 等）按主用场景归在 §F 推理；CPU 端可观测性指标（CPI、HITM、bad-speculation）按主用场景归在 §B。
 
