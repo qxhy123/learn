@@ -71,6 +71,37 @@ def test_e2e_chunked_prefill_matches_unchunked():
     assert eng_chunked.block_manager.num_free_blocks == eng_chunked.cfg.cache.num_gpu_blocks
 
 
+def test_e2e_streaming_yields_same_tokens_as_generate():
+    """generate_stream() must produce token-by-token the same sequence that
+    generate() returns whole. Greedy keeps both deterministic."""
+    backend = TorchBackend()
+    model = ToyGPT.random_init(backend, vocab_size=50257, n_layer=2,
+                               d_model=64, n_head=4, max_pos=128, seed=0)
+    tokenizer = TokenizerWrapper.from_pretrained_gpt2()
+    cfg = EngineConfig(
+        model=model.config, cache=CacheConfig(block_size=8, num_gpu_blocks=32),
+        device="cpu", seed=0)
+
+    eng_stream = LLMEngine(model, tokenizer, cfg)
+    sp = SamplingParams(max_tokens=8, greedy=True)
+    streamed_tokens = []
+    streamed_partial = None
+    for rid, tok, done, partial in eng_stream.generate_stream("Hello world", sp):
+        streamed_tokens.append(tok)
+        streamed_partial = partial
+        if done:
+            break
+    assert len(streamed_tokens) == 8
+
+    # Same prompt through generate(): final text must match the last partial.
+    eng_batch = LLMEngine(model, tokenizer, cfg)
+    out = eng_batch.generate(["Hello world"], sp)
+    assert streamed_partial == out[0][1]
+    # All blocks freed in both engines.
+    assert eng_stream.block_manager.num_free_blocks == 32
+    assert eng_batch.block_manager.num_free_blocks == 32
+
+
 def test_e2e_continuous_batching_vs_baseline_same_output():
     """Same prompts must produce identical greedy output regardless of whether
     continuous batching is on (Plan 4 default) or off (Plan 1 baseline).

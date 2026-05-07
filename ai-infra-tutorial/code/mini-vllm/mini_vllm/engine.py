@@ -106,3 +106,26 @@ class LLMEngine:
             for so in self.step():
                 outputs[so.request_id].append(so.new_token_id)
         return [(rid, self.tokenizer.decode(outputs[rid])) for rid in rids]
+
+    def generate_stream(self, prompt: str, sampling: SamplingParams):
+        """Yield (request_id, token_id, is_finished, partial_text) per token
+        as the engine produces them. Drives `step()` until this request finishes.
+
+        Other requests already in the engine continue to run; outputs not
+        belonging to `rid` are silently consumed (tokens still go to their
+        own seq's output buffer — they just aren't yielded here).
+
+        partial_text is the cumulative decoded text for this request after
+        this token, recomputed each step (cheap for small token counts).
+        """
+        rid = self.add_request(prompt, sampling)
+        my_tokens: List[int] = []
+        while self.scheduler.has_unfinished():
+            for so in self.step():
+                if so.request_id != rid:
+                    continue
+                my_tokens.append(so.new_token_id)
+                partial = self.tokenizer.decode(my_tokens)
+                yield (so.request_id, so.new_token_id, so.is_finished, partial)
+                if so.is_finished:
+                    return

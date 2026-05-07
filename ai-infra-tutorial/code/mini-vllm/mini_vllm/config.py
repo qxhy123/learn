@@ -31,10 +31,16 @@ class CacheConfig:
 
 @dataclass
 class SamplingParams:
-    """Plan 1 supports greedy only; later plans add temp/top-p/top-k."""
+    """Generation hyper-parameters. When `greedy=True`, the temperature/
+    top_p/top_k fields are ignored. Plan 7 adds the non-greedy path."""
     max_tokens: int = 32
     greedy: bool = True
     stop_token_ids: tuple[int, ...] = ()
+    # Non-greedy sampling (only used when greedy=False)
+    temperature: float = 1.0       # 1.0 = no scaling; lower → sharper
+    top_p: float = 1.0             # 1.0 = no nucleus filter
+    top_k: int = 0                 # 0 = no top-k filter
+    seed: int | None = None        # per-request seed for reproducibility
 
 
 @dataclass

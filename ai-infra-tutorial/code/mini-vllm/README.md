@@ -5,17 +5,32 @@ to `part5-serving-infra/16a-lab-mini-vllm.md`.
 
 ## Status
 
-**Plan 6 complete.** Engine supports continuous batching, chunked prefill,
-prefix caching with copy-on-write, and swap-to-CPU (LRU preemption when the
-GPU pool is over-subscribed). TinyLlama-1.1B parity vs HF `transformers`
-remains 8/8 greedy match; under-sized GPU pool with swap produces output
-bit-identical to the large-pool baseline.
+**Plan 7 complete.** Engine supports continuous batching, chunked prefill,
+prefix caching with CoW, swap-to-CPU, full sampling (temperature / top-p /
+top-k / per-request seed), and token-by-token streaming. TinyLlama-1.1B
+greedy parity vs HF `transformers` is preserved (8/8 token match).
 
 Each feature is a flag on `EngineConfig`:
   `enable_continuous_batching`, `enable_chunked_prefill`,
   `enable_prefix_caching`, `enable_swap`.
 Set any to `False` for benchmark comparison against the prior baseline.
 For swap to engage, set `CacheConfig(num_cpu_blocks=...)` to a non-zero size.
+
+## Streaming
+
+    for rid, tok, done, partial in engine.generate_stream(prompt, params):
+        print(partial, end="\r")
+
+## Sampling
+
+    SamplingParams(greedy=False, temperature=0.8, top_p=0.95, top_k=50, seed=42)
+
+## Benchmark
+
+    python examples/bench.py --num-prompts 16 --max-tokens 32
+
+Compares 5 stacked configs (naive → +continuous batching → +chunked prefill
+→ +prefix caching → +swap), reporting throughput and TTFT per config.
 
 ## Install
 
@@ -45,5 +60,5 @@ TinyLlama-1.1B (downloads ~2.2 GB on first run, slow on CPU):
 - [x] Plan 4: continuous batching (chunked prefill rolled into Plan 5 — shared kernel)
 - [x] Plan 5: prefix caching + CoW + chunked prefill
 - [x] Plan 6: swap to CPU + LRU preemption
-- [ ] Plan 7: streaming + full sampler (temperature/top-p/top-k) + bench
+- [x] Plan 7: streaming + full sampler (temperature/top-p/top-k) + bench
 - [ ] Plan 8: tutorial chapter `16a-lab-mini-vllm.md`
