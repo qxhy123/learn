@@ -30,20 +30,23 @@ class Scheduler:
                  max_num_batched_tokens: int = 2048,
                  enable_continuous_batching: bool = True,
                  enable_chunked_prefill: bool = False,
-                 chunked_prefill_size: int = 512):
+                 chunked_prefill_size: int = 512,
+                 enable_swap: bool = False):
         self.bm = block_manager
         self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_continuous_batching = enable_continuous_batching
         self.enable_chunked_prefill = enable_chunked_prefill
         self.chunked_prefill_size = chunked_prefill_size
+        self.enable_swap = enable_swap
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
+        self.swapped: List[Sequence] = []   # Plan 6
 
     def add(self, seq: Sequence) -> None:
         self.waiting.append(seq)
 
     def has_unfinished(self) -> bool:
-        return bool(self.waiting) or bool(self.running)
+        return bool(self.waiting) or bool(self.running) or bool(self.swapped)
 
     def mark_prefilled(self, seq: Sequence) -> None:
         """Legacy helper used by older tests. New code lets `Engine.step`
@@ -59,6 +62,52 @@ class Scheduler:
         for s in finished:
             self.bm.free(s)
         return finished
+
+    # ---- swap helpers (Plan 6) ----
+
+    def _try_swap_in(self, out: SchedulerOutput) -> None:
+        """FIFO swap-in from swapped queue while there's GPU room."""
+        while self.swapped:
+            seq = self.swapped[0]
+            if not self.bm.can_swap_in(seq):
+                break
+            mapping = self.bm.swap_in(seq)
+            out.swap_in.update(mapping)
+            self.swapped.pop(0)
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+
+    def _ensure_room_for_append(self, decoding_seq: Sequence,
+                                 out: SchedulerOutput) -> None:
+        """If `decoding_seq` will need a new GPU block this step and the pool
+        is empty, evict the most recently admitted OTHER running seq via swap.
+        Repeats until either there's room or no eligible victim remains."""
+        # How many extra blocks does decoding_seq need this step? Either 0
+        # (still room in last block) or 1 (last block full → new block needed).
+        bs = self.bm.block_size
+        used = decoding_seq.seq_len
+        needed = (used + bs) // bs                    # after writing 1 more token
+        have = len(decoding_seq.block_table.physical_blocks)
+        extra = max(0, needed - have)
+        while extra > self.bm.num_free_blocks:
+            victim = self._pick_swap_victim(exclude=decoding_seq)
+            if victim is None:
+                break  # no eligible victim; the append_slot will raise
+            mapping = self.bm.swap_out(victim)
+            out.swap_out.update(mapping)
+            self.running.remove(victim)
+            victim.status = SequenceStatus.SWAPPED
+            self.swapped.append(victim)
+
+    def _pick_swap_victim(self, exclude: Sequence) -> "Sequence | None":
+        """Pick the most-recently-admitted running seq that's eligible to swap.
+        Recency = position from end of `self.running` (LIFO of admissions)."""
+        for seq in reversed(self.running):
+            if seq is exclude:
+                continue
+            if self.bm.can_swap_out(seq):
+                return seq
+        return None
 
     def _chunk_for(self, seq: Sequence, budget: int) -> int:
         """How many tokens to prefill this step for a seq with `budget` left."""
@@ -77,6 +126,12 @@ class Scheduler:
         for seq in self.running:
             seq.scheduled_chunk_len = 0
 
+        # 0. Try swapping in from the swapped queue (FIFO). Only attempt this
+        # if it doesn't itself starve currently-running decodes; we leave a
+        # safety margin equal to the worst-case running decode demand.
+        if self.enable_swap and self.swapped:
+            self._try_swap_in(out)
+
         # 1. Continue running seqs (priority: finishing them frees blocks).
         for seq in self.running:
             if seq.num_prefilled < seq.num_prompt_tokens:
@@ -90,6 +145,11 @@ class Scheduler:
                 # Decode — single token per step.
                 if budget <= 0:
                     continue
+                # Check if a new block is needed and we're out of GPU room.
+                # If so, preempt LRU-style: swap out the most-recently-admitted
+                # running seq (excluding this one) until there's room.
+                if self.enable_swap:
+                    self._ensure_room_for_append(seq, out)
                 self.bm.append_slot(seq)
                 out.decode_seqs.append(seq)
                 budget -= 1

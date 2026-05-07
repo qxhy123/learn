@@ -5,16 +5,17 @@ to `part5-serving-infra/16a-lab-mini-vllm.md`.
 
 ## Status
 
-**Plan 5 complete.** Engine supports continuous batching, chunked prefill,
-prefix caching with copy-on-write, and runs TinyLlama-1.1B end-to-end on
-CPU/MPS via the Torch paged-attention backend. Parity-tested against HF
-`transformers` (8/8 token greedy match), and bit-identical output across
-chunked vs unchunked prefill.
+**Plan 6 complete.** Engine supports continuous batching, chunked prefill,
+prefix caching with copy-on-write, and swap-to-CPU (LRU preemption when the
+GPU pool is over-subscribed). TinyLlama-1.1B parity vs HF `transformers`
+remains 8/8 greedy match; under-sized GPU pool with swap produces output
+bit-identical to the large-pool baseline.
 
 Each feature is a flag on `EngineConfig`:
   `enable_continuous_batching`, `enable_chunked_prefill`,
-  `enable_prefix_caching`, `enable_swap` (Plan 6, not yet).
+  `enable_prefix_caching`, `enable_swap`.
 Set any to `False` for benchmark comparison against the prior baseline.
+For swap to engage, set `CacheConfig(num_cpu_blocks=...)` to a non-zero size.
 
 ## Install
 
@@ -43,6 +44,6 @@ TinyLlama-1.1B (downloads ~2.2 GB on first run, slow on CPU):
 - [x] Plan 3: TinyLlama-1.1B + HF safetensors loader
 - [x] Plan 4: continuous batching (chunked prefill rolled into Plan 5 — shared kernel)
 - [x] Plan 5: prefix caching + CoW + chunked prefill
-- [ ] Plan 6: swap to CPU + preemption
+- [x] Plan 6: swap to CPU + LRU preemption
 - [ ] Plan 7: streaming + full sampler (temperature/top-p/top-k) + bench
 - [ ] Plan 8: tutorial chapter `16a-lab-mini-vllm.md`

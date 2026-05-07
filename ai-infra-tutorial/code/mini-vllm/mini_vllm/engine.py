@@ -34,6 +34,7 @@ class LLMEngine:
         self.cache_engine = CacheEngine(cfg.model, cfg.cache, cfg.device, dtype)
         self.block_manager = BlockManager(
             cfg.cache.num_gpu_blocks, cfg.cache.block_size,
+            num_cpu_blocks=cfg.cache.num_cpu_blocks,
             enable_prefix_caching=cfg.enable_prefix_caching)
         self.scheduler = Scheduler(
             self.block_manager,
@@ -41,6 +42,7 @@ class LLMEngine:
             enable_continuous_batching=cfg.enable_continuous_batching,
             enable_chunked_prefill=cfg.enable_chunked_prefill,
             chunked_prefill_size=cfg.chunked_prefill_size,
+            enable_swap=cfg.enable_swap,
         )
         self.runner = ModelRunner(model, self.cache_engine, self.block_manager, cfg.device)
         self.sampler = Sampler()
@@ -58,6 +60,12 @@ class LLMEngine:
 
     def step(self) -> List[StepOutput]:
         sched = self.scheduler.schedule()
+        # Apply swap copies BEFORE the forward pass so the K/V tensors are at
+        # the right physical block ids by the time attention reads them.
+        if sched.swap_out:
+            self.cache_engine.swap_out(sched.swap_out)
+        if sched.swap_in:
+            self.cache_engine.swap_in(sched.swap_in)
         if not sched.prefill_seqs and not sched.decode_seqs:
             return []
         logits = self.runner.execute(sched.prefill_seqs, sched.decode_seqs)
