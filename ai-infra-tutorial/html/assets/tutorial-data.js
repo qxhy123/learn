@@ -576,6 +576,11 @@ const TUTORIAL = [
         "id": "answers",
         "title": "附录 D · 练习题详细参考解答",
         "path": "appendix/answers.html"
+      },
+      {
+        "id": "learning-map",
+        "title": "附录 F · 全书知识地图",
+        "path": "appendix/learning-map.html"
       }
     ]
   }
