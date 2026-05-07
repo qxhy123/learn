@@ -4,6 +4,8 @@
 
 > **关联章节**：本章是全书前 25 章的综合自测与面试评估手册。它不替代各章末尾的练习，而是从面试官视角对全书内容做交叉验证。系统设计案例需要回到 [第14章 在线推理](../part5-serving-infra/14-online-inference-architecture.md)、[第15章 KV Cache](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md)、[第18章 容器与运行时](../part6-platform-and-orchestration/18-containers-and-runtime.md)、[第24章 平台构建](24-build-an-ai-platform.md)、[第25章 Agent 推理时计算](25-agent-and-inference-time-compute.md) 调取证据。
 
+> **评分 Rubric**：刷题或面试校准前，建议先阅读 [附录H：AI Infra 面试与自测评分 Rubric](../appendix/interview-rubric.md)。所有题目都可按“识别资源、画链路、给证据、定方案、说 rollback”五步组织回答。
+
 ## 1. 第一性原理拆解 + 学习大纲
 
 ### 拆 — 不可化简的问题
@@ -3260,4 +3262,3 @@ CFO 抱怨"AI 平台月度成本环比 +30%，业务量没变"。请给出**成�
 - 能不能在 trade-off 取舍时给出"为什么这么选"
 - 排错时能不能从应急 → 根因 → 长期治理三层展开
 - 能不能讨论自己最遗憾的取舍 / 教训
-

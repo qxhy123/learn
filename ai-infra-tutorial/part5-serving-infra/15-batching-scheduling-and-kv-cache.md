@@ -1,5 +1,12 @@
 # 第15章：批处理、调度与 KV Cache
 
+> **前置知识**：已理解 [第14章](14-online-inference-architecture.md) 的在线推理链路，知道 prefill、decode、token、显存和延迟 SLO 的基本关系。
+> **读完能判断什么**：能判断 serving 瓶颈来自 batching、调度、KV Cache、prefill/decode 冲突还是 admission 策略，并能估算长上下文并发的显存上限。
+> **关键指标**：TTFT、ITL、TPOT、goodput、input/output tokens/s、active sequences、KV cache bytes、GPU memory headroom、P99 latency。
+> **相关章节**：[第14章](14-online-inference-architecture.md)、[第16章](16-quantization-compilation-and-engines.md)、[第16a章](16a-vllm-internals.md)、[第20c章](../part6-platform-and-orchestration/20c-inference-autoscaling.md)。
+> **常见误区**：只用 QPS 做容量规划；认为最大 batch 一定最好；忽略长 prompt 对 TTFT、decode ITL 和 KV admission 的连锁影响。
+> **验证/练习入口**：先做本章 KV 显存估算和调度压测题，入口见 [练习题](#练习题)，参考校准见 [附录D](../appendix/answers.md)。
+
 > 现代 LLM 推理系统的核心竞争力，很多时候不体现在模型本身，而体现在调度器如何组织请求、缓存状态和显存。
 
 > **关联章节**：本章的 KV Cache 与调度策略，会直接影响 [第16章](16-quantization-compilation-and-engines.md) 的量化与引擎选型；如果显存预算判断错了，再好的推理引擎也很难稳定运行。调度策略最终要通过 [第14章](14-online-inference-architecture.md) 的路由和副本组织落到真实流量上。

@@ -4,6 +4,8 @@
 
 > **关联章节**：本章应与 [第26章：AI Infra 面试题、自测与面试官题库](26-ai-infra-interview-questions.md)、[第24章：构建一个 AI 平台](24-build-an-ai-platform.md) 和 [第25章：AI Agent 与推理时计算基础设施](25-agent-and-inference-time-compute.md) 配合阅读：第26章提供完整题库，本章提供模拟面试、答案策略和评分校准方法。
 
+> **评分 Rubric**：组织模拟面试和记录证据时，可用 [附录H：AI Infra 面试与自测评分 Rubric](../appendix/interview-rubric.md) 统一 1-5 分标准，并把每次追问落到“识别资源、画链路、给证据、定方案、说 rollback”。
+
 > **后续整理方向**：当前正文仍保留大量与第26章相近的题块，后续应逐步改写为面试流程脚本、候选人答案策略、评分证据样例和校准 rubrics；本轮先通过标题、导语与使用方式明确互补定位，避免两章在目录中重复。
 
 ## 1. 第一性原理拆解 + 学习大纲

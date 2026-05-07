@@ -76,7 +76,10 @@
 python3 scripts/check_local_links.py
 python3 scripts/check_local_links.py --html-only
 python3 scripts/check_markdown_quality.py
+python3 scripts/audit_version_drift.py
 ```
+
+版本漂移审计脚本只输出候选清单，不作为失败门禁；命中的版本、硬件和组件词应按需回查 [版本矩阵](./appendix/version-matrix.md)。
 
 ---
 
@@ -204,7 +207,11 @@ python3 scripts/check_markdown_quality.py
 | 附录C | [上线与排障检查清单](./appendix/checklists.md) | 训练、推理、RAG、成本治理的常用检查项 |
 | 附录D | [练习题详细参考解答](./appendix/answers.md) | 各章练习题的完整思路、结果与架构示意 |
 | 附录E | [端到端主线案例](./appendix/end-to-end-case.md) | LLaMA-7B/70B 从数据、训练、制品、服务到事故复盘的工程路线图 |
-| 附录F | [版本矩阵](./appendix/version-matrix.md) | 本文假设版本、核对日期、必须复测项与易漂移默认值 |
+| 附录F | [全书知识地图](./appendix/learning-map.md) | 按资源瓶颈、训练链路、推理链路、治理、排障、数据/制品/安全反查章节和证据 |
+| 附录G | [版本矩阵](./appendix/version-matrix.md) | 本文假设版本、核对日期、必须复测项与易漂移默认值 |
+| 附录H | [事故驱动学习路径](./appendix/incident-driven-learning.md) | 从 GPU 利用率低、NCCL timeout、TTFT、KV OOM、RAG 和发布质量事故反查章节 |
+| 附录I | [AI Infra 面试与自测评分 Rubric](./appendix/interview-rubric.md) | 识别资源、画链路、给证据、定方案、说 rollback 的通用评分模板 |
+| 附录J | [Mermaid 图表资产](./appendix/diagrams.md) | 训练 step、推理 prefill/decode、KV Cache、NCCL topology 和平台控制面/数据面的可复用图表 |
 
 ---
 

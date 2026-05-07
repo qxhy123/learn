@@ -1,5 +1,12 @@
 # 第2章：算力、存储与网络
 
+> **前置知识**：理解 AI Infra 的基本问题域，建议先读 [第1章](./01-what-is-ai-infra.md)；具备 CPU、内存、磁盘、网络和 GPU 的基本直觉。
+> **读完能判断什么**：能把慢训练、慢推理或扩卡收益差拆成算力、存储、网络、H2D、调度等资源链路问题，并判断下一步该采集哪类证据。
+> **关键指标**：GPU utilization、MFU/HFU、tokens/s 或 samples/s、H2D copy time、I/O throughput、NCCL bus bandwidth、p95/p99 latency。
+> **相关章节**：[第1章](./01-what-is-ai-infra.md)、[第3章](./03-from-model-to-production.md)、[第5章](../part2-systems-stack/05-memory-interconnect-io.md)、[第21章](../part7-reliability-security/21-observability-and-capacity.md)。
+> **常见误区**：把 GPU 利用率低直接归因于模型代码；只看部件峰值而不看端到端关键路径；用平均值掩盖尾延迟和慢 rank。
+> **验证/练习入口**：按本章资源链路方法构造 `EvidenceBundle`，并对照 [附录C 检查清单](../appendix/checklists.md) 与 [附录D 参考解答](../appendix/answers.md) 校验推理过程。
+
 ## 1. 第一性原理拆解：为什么算力、存储与网络必须一起看
 
 ### 拆 — 不可化简的问题

@@ -1,5 +1,12 @@
 # 第8章：数据并行
 
+> **前置知识**：已建立 [第7章](./07-single-node-training.md) 的单节点训练基线，理解 optimizer step、gradient、GPU 显存和 NCCL collective 的基本含义。
+> **读完能判断什么**：能判断一个训练任务该继续用 DDP，还是切到 FSDP/ZeRO 或叠加 TP/PP/CP，并能解释新增 rank 是否真的带来有效吞吐。
+> **关键指标**：step time、samples/s 或 tokens/s、scaling efficiency、AllReduce/ReduceScatter/AllGather time、NCCL busbw、rank skew、HBM peak。
+> **相关章节**：[第7章](./07-single-node-training.md)、[第9章](./09-model-pipeline-parallel.md)、[第10章](./10-memory-checkpointing-and-recovery.md)、[第5c章](../part2-systems-stack/05c-rdma-collectives-and-cluster-topology.md)。
+> **常见误区**：认为加卡一定线性加速；只看平均 GPU 利用率而忽略慢 rank；把 FSDP/ZeRO 当成纯显存优化而忽略通信和 checkpoint 形态。
+> **验证/练习入口**：从本章 `nccl-tests`、rank-level metrics 和 [练习题](#15-练习题) 开始，答案校准见 [附录D](../appendix/answers.md)。
+
 > 数据并行的第一性原理是：复制可并行的样本计算，支付保持参数一致的同步成本。工程成败不在于能否启动 64 个 rank，而在于是否能证明每个新增 rank 带来的有效吞吐大于它引入的通信、等待和治理成本。
 
 > **关联章节**：本章以 [第7章](./07-single-node-training.md) 的单节点基线为输入，继续扩展到多节点数据并行；当状态或模型无法再复制时，需要转向 [第9章](./09-model-pipeline-parallel.md) 的 TP / PP / CP / hybrid parallel；checkpoint 的状态一致性和恢复协议见 [第10章](./10-memory-checkpointing-and-recovery.md)。
