@@ -408,6 +408,11 @@ const TUTORIAL = [
         "path": "part5/16a-vllm-internals.html"
       },
       {
+        "id": "16a-lab",
+        "title": "第 16a-lab 章 · Mini-vLLM 实战",
+        "path": "part5/16a-lab-mini-vllm.html"
+      },
+      {
         "id": "16b",
         "title": "第 16b 章 · SGLang 内部机制深入",
         "path": "part5/16b-sglang-internals.html"

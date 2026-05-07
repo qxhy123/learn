@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>第 16a-lab 章 · Mini-vLLM 实战 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=16a-lab" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+<section class="hero">
+<h1>第 16a-lab 章 · Mini-vLLM 实战</h1>
+<p class="sub">把 16a 主章的 PagedAttention、continuous batching、prefix caching、chunked prefill、swap、streaming 这些机制变成 1500 行可读、可跑、可改的 Python，并与 HF transformers 在 TinyLlama-1.1B 上做位级精确对拍。</p>
+<div class="chips"><span class="chip">PagedAttention</span><span class="chip">Continuous Batching</span><span class="chip">Chunked Prefill</span><span class="chip">Prefix Caching + CoW</span><span class="chip">Swap to CPU</span><span class="chip">Streaming</span><span class="chip">TinyLlama 1.1B</span><span class="chip">HF Parity 8/8</span></div>
+<div class="note"><strong>本章定位：</strong>16a 主章是“vLLM 工程师视角的概念深挖”，本章是“跟着写代码把这些概念串一遍”的实战手册。性能不与真实 vLLM 对标（我们走纯 PyTorch reference attention，慢 50–100 倍），但<strong>架构对得上</strong>——读完这一章再去看 vLLM 真实源码，每个核心抽象都能一一对应。</div>
+<div class="success"><strong>配套代码：</strong><code>ai-infra-tutorial/code/mini-vllm/</code>，跟随教程仓库一起 clone。<code>pip install -e ".[dev]"</code> 后 <code>python examples/run_toy.py</code> 即可跑通；<code>pytest tests/</code> 54 个快速测试，<code>pytest -m slow</code> 加上 HF parity（首次下载 ~2.2 GB）。</div>
+</section>
+
+<section class="toc"><h2>本章目录</h2><ol>
+<li><a class="anchor" href="#配套代码">配套代码 + 路线图</a></li>
+<li><a class="anchor" href="#为什么需要-pagedattention">§1 为什么需要 PagedAttention</a></li>
+<li><a class="anchor" href="#第一版block-kv-cache-naive-scheduler">§2 第一版：Block KV Cache + Naive Scheduler</a></li>
+<li><a class="anchor" href="#pagedattention-kernel参考实现">§3 PagedAttention Kernel（参考实现）</a></li>
+<li><a class="anchor" href="#接上真实模型tinyllama-1.1b">§4 接上真实模型：TinyLlama-1.1B</a></li>
+<li><a class="anchor" href="#continuous-batching">§5 Continuous Batching</a></li>
+<li><a class="anchor" href="#chunked-prefill">§6 Chunked Prefill</a></li>
+<li><a class="anchor" href="#prefix-caching-cow">§7 Prefix Caching + CoW</a></li>
+<li><a class="anchor" href="#swap-to-cpu-lru-抢占">§8 Swap to CPU + LRU 抢占</a></li>
+<li><a class="anchor" href="#从-mini-到真实-vllm">§9 从 Mini 到真实 vLLM</a></li>
+<li><a class="anchor" href="#总结">总结</a></li>
+</ol></section>
+
+<section class="section">
+<h1
+id="第-16a-lab-章-mini-vllm-实战从零写一个带-pagedattention-的迷你推理引擎">第
+16a-lab 章 · Mini-vLLM 实战:从零写一个带 PagedAttention
+的迷你推理引擎</h1>
+<blockquote>
+<p>上一章<a href="16a-vllm-internals.html">16a vLLM
+内部机制</a>从工程师视角拆解了 vLLM
+的设计取舍。本章把这些取舍<strong>变成可读、可跑、可改的代码</strong>:在
+<code>code/mini-vllm/</code> 下的几百行 Python 里,从零实现
+PagedAttention、continuous batching、prefix caching、chunked
+prefill、swap、streaming 和完整 sampler,并与 HF transformers 在
+TinyLlama-1.1B 上做位级精确对拍。</p>
+<p><strong>目标读者:</strong> 已经读过 <a
+href="15-batching-scheduling-and-kv-cache.html">第 15 章</a> 和 <a
+href="16a-vllm-internals.html">16a
+主章</a>,想”动手把这些机制串一遍”的人。本章不替代主章的概念解释,它是<strong>带读者一步步加
+feature 的实战手册</strong>。</p>
+<p><strong>不期待:</strong> 性能与真实 vLLM 对标(我们用纯 PyTorch
+reference
+attention,慢得多)。期待的是看清每个机制如何在最小可运行代码里成立。</p>
+</blockquote>
+<hr />
+<h2 id="配套代码">配套代码</h2>
+<p>源码在
+<code>ai-infra-tutorial/code/mini-vllm/</code>,跟随教程仓库一起
+clone。安装与跑通:</p>
+<pre class="bash"><code>cd code/mini-vllm
+pip install -e &quot;.[dev]&quot;
+python examples/run_toy.py            # toy GPT,随机权重,秒跑通
+python examples/run_tinyllama.py      # TinyLlama-1.1B,首次下载 ~2.2 GB
+pytest tests/ -v                      # 54 个快速测试
+pytest tests/ -m slow -v              # 加上 HF parity(下载权重)
+python examples/bench.py              # 5 配置 throughput 对比表</code></pre>
+<p>代码结构(已在 <code>code/mini-vllm/README.md</code> 列出):</p>
+<pre><code>mini_vllm/
+├── config.py                 # ModelConfig / EngineConfig / SamplingParams / CacheConfig
+├── sequence.py               # Sequence (per-request state)
+├── block_manager.py          # GPU+CPU pools, hash chain, ref count, swap, CoW
+├── cache_engine.py           # KV tensor pools (GPU + optional CPU)
+├── scheduler.py              # 三队列 + chunked prefill + 自动 swap-out
+├── model_runner.py           # ModelInput 组装,调用 model.forward
+├── engine.py                 # 顶层 step / generate / generate_stream
+├── sampler.py                # greedy / temperature / top-p / top-k
+├── tokenizer.py              # 包 HF tokenizers
+├── backends/{interface,reference,torch_backend}.py    # AttentionBackend
+└── models/{base,toy_gpt,llama,llama_loader}.py        # ToyGPT + Llama + HF loader</code></pre>
+<h2 id="路线图">路线图</h2>
+<p>我们按 feature
+渐进的顺序展开。<strong>读者跑的是同一份代码</strong>,通过
+<code>EngineConfig</code> 的 4 个 flag 切换形态:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>节</th>
+<th>feature</th>
+<th>flag</th>
+<th>关闭后退化为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>§2</td>
+<td>block-based KV cache + 一次性 prefill</td>
+<td>(始终开)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>§3</td>
+<td>PagedAttention kernel(reference 实现)</td>
+<td>(始终开)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>§4</td>
+<td>TinyLlama 1.1B + HF safetensors loader</td>
+<td>(模型层)</td>
+<td>toy GPT</td>
+</tr>
+<tr>
+<td>§5</td>
+<td>continuous batching</td>
+<td><code>enable_continuous_batching</code></td>
+<td>running 队列空才能接新请求</td>
+</tr>
+<tr>
+<td>§6</td>
+<td>chunked prefill</td>
+<td><code>enable_chunked_prefill</code></td>
+<td>长 prompt 一次吃完</td>
+</tr>
+<tr>
+<td>§7</td>
+<td>prefix caching + CoW</td>
+<td><code>enable_prefix_caching</code></td>
+<td>每个 prompt 从零 prefill</td>
+</tr>
+<tr>
+<td>§8</td>
+<td>swap to CPU + LRU 抢占</td>
+<td><code>enable_swap</code> + <code>num_cpu_blocks</code></td>
+<td>显存满则 raise</td>
+</tr>
+<tr>
+<td>§9</td>
+<td>从 mini 到真实 vLLM</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>每节末尾 2-3 个练习,鼓励改代码自己验证。</p>
+<hr />
+<h2 id="为什么需要-pagedattention">§1. 为什么需要 PagedAttention</h2>
+<h3 id="naive-实现的显存碎片问题">Naive 实现的显存碎片问题</h3>
+<p>如果你不用 PagedAttention,KV Cache 自然的写法是这样:</p>
+<pre class="python"><code># 每个请求一个连续 (max_seq_len, num_heads, head_dim) 的 K/V 张量
+kv_cache = torch.zeros(max_seq_len, num_heads, head_dim, ...)</code></pre>
+<p>这个写法在静态 batch +
+等长请求时没问题。但服务真实流量时,你立刻撞到三堵墙:</p>
+<ol type="1">
+<li><strong>过度预留</strong>:你不知道这个请求会生成多长(可能 32
+token,也可能 2048 token)。如果按 max_seq_len 分配,99%
+的空间永远闲置。</li>
+<li><strong>碎片化</strong>:多请求并发时,有的占满 max_seq_len,有的只用了
+50 token,但中间空间被锁住,新请求无法塞进来。</li>
+<li><strong>共享前缀失效</strong>:100 个请求都用相同的 system
+prompt(比如 “You are a helpful assistant…”),那段 K/V 被算了 100
+遍,显存里也存了 100 份。</li>
+</ol>
+<p>vLLM 的 PagedAttention 一句话:<strong>把 KV Cache 切成固定大小的
+block(默认 16 token),让 attention kernel 通过 block table
+间接寻址,允许同一个 logical sequence 的 K/V 散落在不连续的物理 block
+上。</strong></p>
+<p>这跟操作系统的虚拟内存几乎一一对应:</p>
+<table>
+<thead>
+<tr>
+<th>OS 虚拟内存</th>
+<th>PagedAttention</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>进程</td>
+<td>一个生成请求(Sequence)</td>
+</tr>
+<tr>
+<td>虚拟地址</td>
+<td>seq 内的 token 位置(0, 1, 2, …)</td>
+</tr>
+<tr>
+<td>物理页</td>
+<td>物理 block(<code>PhysicalBlock</code> with
+<code>block_id</code>)</td>
+</tr>
+<tr>
+<td>页表</td>
+<td><code>BlockTable</code>(逻辑顺序的 block 列表)</td>
+</tr>
+<tr>
+<td>页大小</td>
+<td><code>block_size</code>(默认 16)</td>
+</tr>
+<tr>
+<td>Page sharing(COW)</td>
+<td>引用计数 + CoW 写时复制</td>
+</tr>
+<tr>
+<td>Swap</td>
+<td>swap-to-CPU</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这就是为什么我们的 <code>BlockManager</code>
+长得像内存分配器,<code>Scheduler</code> 长得像进程调度器。</strong></p>
+<h3 id="练习">练习</h3>
+<ul>
+<li>E1.1 —
+估算:Llama-3-70B,vocab=128K,num_layers=80,num_kv_heads=8,head_dim=128,fp16。一个请求
+max_seq_len=8K 时,KV Cache 单请求占多少 MB?如果按 max_seq_len
+静态预分配,80 GB A100 单卡最多并发多少请求?</li>
+<li>E1.2 — 假设 100 个请求平均长度 256 token,但 max_seq_len=8K。静态分配
+vs PagedAttention(block_size=16)显存利用率差多少?</li>
+</ul>
+<hr />
+<h2 id="第一版block-kv-cache-naive-scheduler">§2. 第一版:Block KV Cache
++ Naive Scheduler</h2>
+<h3
+id="blockmanagermini_vllmblock_manager.py"><code>BlockManager</code>(<code>mini_vllm/block_manager.py</code>)</h3>
+<p>最小可工作的 BlockManager 只需要四个方法:</p>
+<pre class="python"><code>class BlockManager:
+    def can_allocate(self, seq) -&gt; AllocStatus:           # OK / LATER / NEVER
+    def allocate(self, seq) -&gt; BlockTable                  # 一次性分配 prompt 所需的所有 block
+    def append_slot(self, seq) -&gt; Optional[Tuple[int,int]] # decode 时按需扩 1 个 block;返回 CoW 映射
+    def free(self, seq) -&gt; None                            # 引用计数 -1,归 0 回池</code></pre>
+<p><code>PhysicalBlock</code> 一开始就声明了 <code>ref_count</code> /
+<code>block_hash</code> / <code>device</code> 三个字段 —— Plan 1
+用不到,但让 Plan 5(prefix caching)和 Plan 6(swap)不需要改数据结构:</p>
+<pre class="python"><code>@dataclass
+class PhysicalBlock:
+    block_id: int
+    ref_count: int = 1
+    block_hash: Optional[int] = None     # Plan 5 fills
+    device: str = &quot;gpu&quot;                  # Plan 6 toggles</code></pre>
+<p><strong>关键设计 1:slot mapping 从抽象 token
+位置到物理写入地址</strong>。每个 token 写到哪个槽位,由
+<code>get_slot_mapping()</code> 算:</p>
+<pre class="python"><code>def get_slot_mapping(self, seq, start, end):
+    mapping = []
+    for pos in range(start, end):
+        block_idx = pos // self.block_size
+        offset = pos % self.block_size
+        pb = seq.block_table.physical_blocks[block_idx]
+        mapping.append(pb.block_id * self.block_size + offset)
+    return mapping</code></pre>
+<p>返回的整数 <code>block_id * block_size + offset</code> 是物理 K/V
+tensor 的扁平索引。这个抽象让 attention backend 完全不需要知道
+BlockTable 的内部布局。</p>
+<p><strong>关键设计 2:<code>KV pool</code> 与 <code>BlockManager</code>
+解耦</strong>。<code>CacheEngine</code>(<code>mini_vllm/cache_engine.py</code>)只负责持有大张量:</p>
+<pre class="python"><code>shape = (num_blocks, num_kv_heads, head_dim, block_size)
+key_cache = torch.zeros(shape, ...)
+value_cache = torch.zeros(shape, ...)</code></pre>
+<p>注意最后一维是 <code>block_size</code>(不是 <code>num_blocks</code>
+或 <code>head_dim</code>)—— 这让”读一整个 block 的 K/V”变成 contiguous
+load。真实 vLLM 在 CUDA kernel 里依赖这个布局做 cache-line
+友好读取。</p>
+<h3 id="schedulerplan-1-形态">Scheduler(Plan 1 形态)</h3>
+<p>最简调度只有两个队列(<code>waiting</code> +
+<code>running</code>),且<strong>不做 continuous batching</strong>:</p>
+<pre class="python"><code>def schedule(self):
+    # 1. 把所有 running 的 seq 放进 prefill_seqs 或 decode_seqs
+    # 2. 仅当 running 为空时,从 waiting 队首拉一批进 running
+    if not self.running:
+        while self.waiting and bm.can_allocate(self.waiting[0]) == OK:
+            ...</code></pre>
+<p>这相当于 vLLM 的 <code>enable_continuous_batching=False</code>
+退化模式。<strong>它跑得通,但显存利用率差</strong> ——
+一旦有请求生成超长序列,新请求就得等到这一整批跑完。我们在 §5
+把这个限制拆掉。</p>
+<h3 id="练习-1">练习</h3>
+<ul>
+<li>E2.1 — 在 <code>tests/test_block_manager.py</code> 加一个测试:连续
+alloc/free 100 次不同长度的 seq,断言 <code>num_free_blocks</code>
+始终在合法范围内,且最终回到初始值。</li>
+<li>E2.2 — 把 <code>block_size</code> 从 16 改成 1(每个 token 自己一个
+block)。跑 <code>examples/run_toy.py</code>。性能差多少?为什么 vLLM 默认
+16 而不是 1 或 256?</li>
+<li>E2.3 — <code>BlockManager</code> 当前的 free list 用 list pop。换成
+deque 或者 SortedList 性能会变吗?写微基准证明。</li>
+</ul>
+<hr />
+<h2 id="pagedattention-kernel参考实现">§3. PagedAttention
+Kernel(参考实现)</h2>
+<p>我们的 <code>AttentionBackend</code>
+暴露三个方法(<code>mini_vllm/backends/interface.py</code>):</p>
+<pre class="python"><code>class AttentionBackend(Protocol):
+    def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+    def prefill(q, key_cache, value_cache, block_table, seq_lens, query_lens, scale)
+    def decode (q, key_cache, value_cache, block_table, context_lens, scale)</code></pre>
+<p>注意 prefill 和 decode 都<strong>只接收 cache +
+block_table,不直接接收 K/V 参数</strong>。新写入的 K/V 在 attention
+之前已通过 <code>reshape_and_cache</code> 写入 cache,kernel 通过
+block_table 反查回来。这看起来浪费(刚写又读),但它统一了”前缀已
+cached”和”chunk 内新写入”两条路径,让 chunked prefill 和 prefix caching
+不需要 kernel 分支。</p>
+<h3 id="reference-decode-kernelmini_vllmbackendsreference.py">Reference
+decode kernel(<code>mini_vllm/backends/reference.py</code>)</h3>
+<p>经典 PagedAttention 形态。Q 长度恒为 1,K/V 散落在 block_table
+指向的不连续物理 block 里:</p>
+<pre class="python"><code>def reference_decode(q, key_cache, value_cache, block_table, context_lens, scale):
+    for b in range(B):
+        ctx = context_lens[b]
+        # Gather K/V for this seq from its block_table
+        K = []
+        for blk_idx in range(...):
+            block_id = block_table[b, blk_idx]
+            K.append(key_cache[block_id, :, :, :take].permute(2, 0, 1))
+        K = torch.cat(K, dim=0)             # [ctx, H_kv, D]
+        K = K.repeat_interleave(group, dim=1)   # GQA broadcast → [ctx, H, D]
+        # 标准 attention
+        scores = einsum(&quot;hd,thd-&gt;ht&quot;, q[b], K) * scale
+        attn = softmax(scores, dim=-1)
+        out[b] = einsum(&quot;ht,thd-&gt;hd&quot;, attn, V)</code></pre>
+<p><strong>这是慢但绝对正确的版本</strong>。vLLM 的 CUDA paged attention
+v1 kernel 把这套流程改写成:每个 thread block 负责
+<code>(seq_idx, head_idx)</code>,沿 block_table 顺序加载 block(每次
+<code>block_size×head_dim</code> 的 K tile),累加在线
+softmax(<code>m_i, l_i, acc</code>)。功能等价,数学等价,但走 SMEM tile +
+张量核心。我们把性能版留给 <a
+href="https://github.com/qxhy123/ai-infra-tutorial/blob/master/docs/superpowers/specs/2026-05-06-mini-vllm-paged-attention-design.md">Plan
+2</a>(等 GPU 机器)。</p>
+<h3 id="reference-prefill-kernel-关键扩展">Reference prefill kernel ——
+关键扩展</h3>
+<p>prefill 的 reference 实现支持 <strong>causal mask 在”已 cached 前缀 +
+新 chunk”上正确计算</strong>:</p>
+<pre class="python"><code>def reference_prefill(q, key_cache, value_cache, block_table,
+                      seq_lens, query_lens, scale):
+    for b in range(B):
+        n_q  = query_lens[b]                    # 这一步要算的新 query 数
+        n_kv = seq_lens[b]                       # 累计 KV 长度(prior cached + 新 chunk)
+        n_cached = n_kv - n_q                    # 之前 cached 的部分
+        # Gather K/V from cache(包含 prior cached + 刚通过 reshape_and_cache 写入的新 chunk)
+        K, V = gather_from(block_table[b], 0, n_kv)
+        # Causal mask: query 位置 q(绝对位置 = n_cached + q)attends to KV [0, n_cached + q]
+        mask[q, kv] = 0 if kv &lt;= n_cached + q else -inf
+        scores = (Q @ K^T) * scale + mask
+        attn = softmax(scores)
+        out[b] = attn @ V</code></pre>
+<p>n_cached=0 时这就是普通的 causal triangular。n_cached&gt;0 时新 chunk
+完全可见 prior 部分,自身仍 causal。<strong>这一行 mask 计算就是 chunked
+prefill + prefix caching 共用的数学基础。</strong></p>
+<h3 id="测试-contract">测试 contract</h3>
+<p><code>tests/test_attention.py</code> 锁三件事: 1.
+<code>reshape_and_cache</code> 写到正确的物理 slot(block_id*block_size +
+offset) 2. Torch backend 的 prefill/decode 与 reference
+完全一致(allclose atol=1e-5,fp32) 3. <strong>Chunked prefill 与
+unchunked 输出 bit-identical</strong> —— 把一个长度 8 的 prompt 分成
+chunk1(5 token)+ chunk2(3 token)算,与一次算 8
+token,结果完全相同。这个测试是 Plan 5 chunked prefill 正确性的根基。</p>
+<h3 id="练习-2">练习</h3>
+<ul>
+<li>E3.1 — 验证 GQA broadcast 正确性:Q=8 head,KV=2 head(group=4)。手算
+group 内每个 query head 应该看到哪个 KV head,确认
+<code>repeat_interleave(group, dim=1)</code> 是对的而不是
+<code>repeat(group, dim=1)</code>。</li>
+<li>E3.2 — 把 <code>reference_prefill</code> 改成走
+<code>F.scaled_dot_product_attention</code> + <code>attn_mask</code>(用
+mask 张量代替手动 -inf 写入)。验证 allclose。</li>
+<li>E3.3 — 在 <code>_build_kv_cache_from_kv</code> 测试辅助函数里,改
+block_size 为 8、3、1,看测试是否还过。block_size=1 时 cache layout
+退化为什么形态?</li>
+</ul>
+<hr />
+<h2 id="接上真实模型tinyllama-1.1b">§4. 接上真实模型:TinyLlama-1.1B</h2>
+<p>ToyGPT 用随机权重,生成的是乱码;读者真正的获得感来自跑通真实
+LLM。我们做了 TinyLlama-1.1B-Chat-v1.0,<strong>不依赖
+<code>transformers</code> 的 modeling code</strong>。</p>
+<h3 id="llama-架构mini_vllmmodelsllama.py">Llama
+架构(<code>mini_vllm/models/llama.py</code>)</h3>
+<p>包含 5 个组件:</p>
+<ol type="1">
+<li><strong><code>RotaryEmbedding</code></strong>:precomputed cos/sin
+tables,绝对位置 indexed。卷积约定 <code>[N, H, D]</code>(我们的
+layout)而不是 HF 的 <code>[B, H, T, D]</code>。</li>
+<li><strong><code>apply_rotary_pos_emb</code></strong>:rotate-half
+风格(<code>[-x_high, x_low]</code>)对齐 HF。Test atol=1e-5。</li>
+<li><strong><code>LlamaRMSNorm</code></strong>:fp32 计算稳定性,gamma
+scale。</li>
+<li><strong><code>LlamaMLP</code></strong>:<strong>fused</strong>
+<code>gate_up_proj</code> + <code>down_proj</code>,SwiGLU。HF 把 gate 和
+up 分开存,我们 fuse 成一个矩阵(对齐 vLLM 真实做法)。</li>
+<li><strong><code>LlamaAttention</code></strong>:GQA +
+RoPE,<strong>fused</strong> <code>qkv_proj</code>。RoPE 在写 cache
+<strong>之前</strong>应用 —— 这个顺序与 HF/vLLM 一致,paged cache 持有
+rotated K。</li>
+</ol>
+<h3 id="hf-safetensors-loadermini_vllmmodelsllama_loader.py">HF
+safetensors loader(<code>mini_vllm/models/llama_loader.py</code>)</h3>
+<p><code>load_hf_to_llama_model(model, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")</code>
+干两件事:</p>
+<pre class="python"><code># 1. Key remapping:HF 的 model.layers.X.self_attn.q_proj.weight 等
+#    → 我们的 layers.X.self_attn.qkv_proj.weight
+# 2. Tensor fusing:把 q/k/v 三份 weight concat 成 [Q | K | V] 的 fused QKV matrix
+fused_qkv = torch.cat([q_weight, k_weight, v_weight], dim=0)
+fused_gate_up = torch.cat([gate_weight, up_weight], dim=0)</code></pre>
+<p>split 顺序在 <code>LlamaAttention.forward</code>
+里要对得上:<code>qkv.split([q_size, kv_size, kv_size], dim=-1)</code>。这个对应关系如果错了,parity
+test 会立刻 fail。</p>
+<h3 id="parity-testteststest_llama_parity.py">Parity
+test(<code>tests/test_llama_parity.py</code>)</h3>
+<p><strong>最严格的正确性闸门</strong>:</p>
+<pre class="python"><code>@pytest.mark.slow
+def test_logits_match_hf_top5():
+    ours = LlamaModel(cfg, TorchBackend())
+    load_hf_to_llama_model(ours, &quot;TinyLlama/...&quot;)
+    hf = LlamaForCausalLM.from_pretrained(&quot;TinyLlama/...&quot;)
+
+    prompt = [1, 15043, 29892, 1373, 526, 366, 2599, 29973]   # 8 tokens
+    our_top5 = topk(ours(prompt).logits[-1], 5)
+    hf_top5  = topk(hf(prompt).logits[0, -1], 5)
+    assert overlap(our_top5, hf_top5) &gt;= 4</code></pre>
+<p>实测 5/5 完全相同。<code>tests/test_llama_e2e.py</code> 进一步跑
+8-token greedy 生成对比,<strong>逐 token 8/8 完全一致</strong>(参见
+commit <code>fcc7bd6</code> 的实测输出)。</p>
+<p>这意味着我们的实现在数学上与 HF transformers
+等价。不是”接近”,是”位级精确”。</p>
+<h3 id="练习-3">练习</h3>
+<ul>
+<li>E4.1 — 改一下 <code>_fuse_qkv</code> 的顺序,把 v 放在最前面。重跑
+parity test,看哪个 assert 先 fail。</li>
+<li>E4.2 — 把 <code>LlamaRMSNorm</code> 的 fp32 cast 拿掉(全程 input
+dtype 计算)。在 fp16 下 parity 还成立吗?atol 需要放到多少?</li>
+<li>E4.3 — 加载 Qwen2.5-0.5B(架构相近,主要差 vocab_size 和
+max_pos)。需要改什么?</li>
+</ul>
+<hr />
+<h2 id="continuous-batching">§5. Continuous Batching</h2>
+<h3 id="朴素调度的瓶颈">朴素调度的瓶颈</h3>
+<p>§2 的 Scheduler 在 running 非空时拒绝接新请求。这意味着<strong>一个
+8K 长 prompt 占着不放,后到的 short prompts
+全都等着</strong>。在线服务里这是灾难:p99 TTFT 直接爆。</p>
+<h3
+id="改动enable_continuous_batchingtrue默认">改动:<code>enable_continuous_batching=True</code>(默认)</h3>
+<p><code>mini_vllm/scheduler.py</code> 的 <code>schedule()</code>
+主循环现在做两件事:</p>
+<ol type="1">
+<li>把 running 队列处理完(prefill 中的 → 继续 prefill,prefill 完的 →
+decode)</li>
+<li><strong>如果还有 token budget,从 waiting
+队首继续拉新请求加入这一步的 batch</strong></li>
+</ol>
+<pre class="python"><code>can_admit = self.enable_continuous_batching or not self.running
+if can_admit:
+    while self.waiting and budget &gt; 0:
+        seq = self.waiting[0]
+        if seq.num_prompt_tokens &gt; budget:
+            break    # FCFS:头大请求 budget 不够,后面小请求也等
+        ...allocate, admit, budget -= chunk_len</code></pre>
+<p><strong>Token
+budget</strong>:<code>max_num_batched_tokens</code>(默认 2048)。每个
+decode 占 1,每个 prefill 占其 chunk_len(Plan 4 = 整个 prompt)。一旦超
+budget 就 break。</p>
+<h3 id="模型层为什么不用动">模型层为什么不用动</h3>
+<p>我们在 §3 已经把 <code>prefill</code> kernel 设计成支持<strong>混合
+batch</strong>:<code>prefill_seq_lens</code> 是数组,可以同时容纳多条
+seq。这是为什么 continuous batching 只改 scheduler 一个文件 —— Plan 1
+接口已经为它准备好了。</p>
+<h3 id="bench-数据toy-gpt">Bench 数据(toy GPT)</h3>
+<pre><code>config                | tok/s   | TTFT p50
+naive (off)           | 2469.2  | 0.008
++ continuous batching | 2785.4  | 0.006</code></pre>
+<p>toy GPT 上提升不大(prompts 都很短);真实 LLM + 长尾 prompt
+上的差距能有数倍。bench.py 的价值是<strong>演示 flag
+切换的代码框架</strong>,不是绝对吞吐数字。</p>
+<h3 id="练习-4">练习</h3>
+<ul>
+<li>E5.1 — 把 <code>max_num_batched_tokens</code> 改成 4(极端小)。跑
+<code>examples/run_toy.py</code> 4 个
+prompt,观察一步只能跑得动多少。</li>
+<li>E5.2 —
+<code>tests/test_e2e.py::test_e2e_continuous_batching_vs_baseline_same_output</code>
+断言 flag on/off
+<strong>输出完全一致</strong>。如果生成结果依赖调度顺序(比如 token
+attention 数值受 batch 内其它 seq 影响),这个测试会怎么
+fail?为什么我们的实现不会?</li>
+<li>E5.3 — 实现 LCFS(Last-Come-First-Served)admission policy 替代
+FCFS,看 TTFT 中位数变化。</li>
+</ul>
+<hr />
+<h2 id="chunked-prefill">§6. Chunked Prefill</h2>
+<h3 id="长-prompt-阻塞-decode-的故事">长 prompt 阻塞 decode 的故事</h3>
+<p>scenario:已有 4 个 seq 在 decode,各 1 token/step。来了一个 8000 token
+的 prompt。Plan 4 调度会怎么做?</p>
+<ul>
+<li>Token budget 2048,8000 &gt; 2048 → 这个 prompt <strong>不被
+admit</strong></li>
+<li>那它就一直在 waiting 队列</li>
+<li>直到所有当前 running 都跑完它才开 prefill</li>
+<li><strong>它的 TTFT = 已有 seq 全部完成的时间</strong> —— 灾难</li>
+</ul>
+<p>vLLM 的解法:<strong>把长 prompt 切片</strong>。8000 token → 16 个
+chunk × 500。每个 step 只算 500 个 prefill token + 4 个 decode token(共
+504,fits budget)。decoding 用户感知不到长 prompt 的存在。</p>
+<h3 id="数学正确性的关键">数学正确性的关键</h3>
+<p>切片之后的第二个 chunk 必须能 attend 到第一个 chunk 已写入 cache 的
+K/V。这就是为什么 §3 的 <code>prefill</code> kernel 必须从 cache 读
+K/V。<strong>chunked prefill 在 kernel 层就是”上一个 chunk 已 cached +
+这个 chunk 是新写入”</strong>:</p>
+<pre class="python"><code># Step 1: prefill chunk 1(token 0-499)
+seq_lens = [500];  query_lens = [500]   # n_cached = 0
+# Step 2: prefill chunk 2(token 500-999)
+seq_lens = [1000]; query_lens = [500]   # n_cached = 500
+# Step 3: prefill chunk 3
+seq_lens = [1500]; query_lens = [500]   # n_cached = 1000
+...</code></pre>
+<p><code>tests/test_attention.py::test_prefill_chunked_matches_unchunked</code>
+验证:对一个 length=8 的 prompt,无论分 1+8 还是 5+3 还是
+1+1+1+…+1,<strong>逐位置输出完全相同</strong>。</p>
+<h3 id="scheduler-改动mini_vllmscheduler.py">Scheduler
+改动(<code>mini_vllm/scheduler.py</code>)</h3>
+<p>加一个 <code>_chunk_for(seq, budget)</code> 方法决定本步给这个 seq
+分多少 token:</p>
+<pre class="python"><code>def _chunk_for(self, seq, budget):
+    remaining = seq.num_prompt_tokens - seq.num_prefilled
+    chunk = remaining
+    if self.enable_chunked_prefill:
+        chunk = min(chunk, self.chunked_prefill_size)   # 默认 512
+    chunk = min(chunk, budget)
+    return max(0, chunk)</code></pre>
+<p><code>Sequence.scheduled_chunk_len</code>
+跟踪每步进度。<code>Sequence.num_prefilled</code> 在
+<code>Engine.step</code> 之后增加 chunk_len:</p>
+<pre class="python"><code>for seq in sched.prefill_seqs:
+    seq.num_prefilled += seq.scheduled_chunk_len</code></pre>
+<p>只有当 <code>num_prefilled == num_prompt_tokens</code> 时才 sample
+这个 seq 的 logit(中途 chunks 没有 logit 输出)。</p>
+<h3 id="练习-5">练习</h3>
+<ul>
+<li>E6.1 — <code>chunked_prefill_size=4</code>,跑
+<code>tests/test_e2e.py::test_e2e_chunked_prefill_matches_unchunked</code>(已存在),改
+prompt 到 50 token。测试还过吗?</li>
+<li>E6.2 — chunked prefill 增加了什么 overhead?数
+<code>Engine.step</code> 调用次数:不切片时 1 步搞定 prefill,切 16 片就要
+16 步。每步 KV gather + softmax 都重做,但每次的计算量约 1/16。绝对 cost
+多了多少?</li>
+<li>E6.3 — 把 chunked prefill
+写得”懒一点”:<code>chunked_prefill_size=∞</code> 但仍然受 budget
+约束。和当前实现等价吗?何时不等价?</li>
+</ul>
+<hr />
+<h2 id="prefix-caching-cow">§7. Prefix Caching + CoW</h2>
+<h3 id="问题相同-system-prompt-的-100-个请求">问题:相同 system prompt 的
+100 个请求</h3>
+<p>OpenAI API 上常见
+pattern:<code>messages=[{"role":"system","content":"You are..."}, {"role":"user","content":"..."}]</code>。100
+个并发请求的 system prompt 一字不差,user 部分各不相同。</p>
+<p>朴素 vLLM 会算 100 遍 system prompt 的 K/V,显存里 100 份。Prefix
+caching 能把这 100 份共享成 1 份。</p>
+<h3 id="实现block-hash-chain">实现:Block Hash Chain</h3>
+<p><code>mini_vllm/block_manager.py</code> 的核心:</p>
+<pre class="python"><code>def _hash_block(prev_hash, token_ids):
+    return hash((prev_hash, token_ids))
+
+# 注册:每当一个 block 被填满(block_size 个 token 写入),计 hash 入表
+def register_filled_blocks(self, seq):
+    for i in range(seq.seq_len // block_size):
+        pb = seq.block_table.physical_blocks[i]
+        tokens = tuple(seq.token_ids[i*bs:(i+1)*bs])
+        h = _hash_block(prev_hash, tokens)
+        if h not in self._hash_to_block:
+            self._hash_to_block[h] = pb
+        prev_hash = h
+
+# 查找:新 seq 来时按前缀扫
+def _lookup_cached_prefix(self, token_ids):
+    out = []
+    prev_hash = None
+    for i in range(len(token_ids) // block_size):
+        h = _hash_block(prev_hash, tuple(token_ids[i*bs:(i+1)*bs]))
+        pb = self._hash_to_block.get(h)
+        if pb is None: break
+        out.append(pb)
+        prev_hash = h
+    return out</code></pre>
+<p>只对 <strong>填满的</strong> block 计 hash —— 部分填的最后一个 block
+不参与共享(因为它的剩余 slot 内容未定)。</p>
+<h3 id="引用计数">引用计数</h3>
+<p><code>allocate(seq)</code> 命中 cached prefix 时:</p>
+<pre class="python"><code>cached = self._lookup_cached_prefix(seq.prompt_token_ids)
+for pb in cached:
+    pb.ref_count += 1   # 共享:多个 seq 持有同一个 block
+n_fresh = n_total - len(cached)
+fresh = [self._take_free_block() for _ in range(n_fresh)]
+seq.block_table = BlockTable(physical_blocks=cached + fresh)
+seq.num_prefilled = len(cached) * block_size   # ← 跳过这部分计算</code></pre>
+<p><strong>Scheduler 自动配合</strong>:<code>_chunk_for</code> 在
+<code>seq.num_prefilled</code> 已经被 allocate 设到非零时,只需要算剩余的
+<code>num_prompt_tokens - num_prefilled</code>。整套机制在
+<code>Engine.step</code> 的层面完全透明 —— 只是这个 seq 的”prefill
+起点”不再是 0。</p>
+<h3 id="evictable-cache">Evictable Cache</h3>
+<p>朴素实现里 ref_count → 0 的 block 立刻回 free pool,导致<strong>重复
+prompt 在第二次跑时 cache 已经被清掉</strong>。我们加了 evictable
+list:</p>
+<pre class="python"><code>def free(self, seq):
+    for pb in seq.block_table.physical_blocks:
+        pb.ref_count -= 1
+        if pb.ref_count == 0:
+            if self.enable_prefix_caching and pb.block_hash is not None:
+                self._evictable.append(pb.block_id)   # 留在 cache,可被驱逐
+            else:
+                self._free_block_ids.append(pb.block_id)
+                ...
+
+def _take_free_block(self):
+    if self._free_block_ids:
+        block_id = self._free_block_ids.pop()
+    elif self._evictable:
+        # FIFO 驱逐最老的 cached block
+        block_id = self._evictable.pop(0)
+        del self._hash_to_block[old.block_hash]
+    ...</code></pre>
+<p><code>_lookup_cached_prefix</code> 命中一个 evictable block 时,在
+<code>allocate</code> 里 <code>_rescue_from_evictable</code> 把它从
+evictable 列表中移出 + ref_count++。</p>
+<h3 id="保留至少-1-个-fresh-token-规则">“保留至少 1 个 fresh token”
+规则</h3>
+<p>如果 prompt 完全是 cached prefix(prompt_len 是 block_size
+整数倍且全命中),<code>num_prefilled</code> 会等于
+<code>num_prompt_tokens</code>,<strong>没有 token 走 forward,也就没有
+logit 用来 sample 下一个 token</strong>。</p>
+<p>解法:<code>allocate</code> 在全命中时主动丢掉最后一个 cached
+block,保证至少 1 个 fresh token 进 forward。</p>
+<pre class="python"><code>if cached and len(cached) * block_size &gt;= seq.num_prompt_tokens:
+    cached = cached[:-1]</code></pre>
+<h3 id="cowplumbing-完整plan-5-不触发">CoW(plumbing 完整,Plan 5
+不触发)</h3>
+<p><code>append_slot</code> 检测
+<code>physical_blocks[-1].ref_count &gt; 1</code> 时返回
+<code>(src, dst)</code> 让 runner 复制 K/V 数据。但 Plan 5 单 completion
+greedy 路径下,decode 写入的总是私有 block(cached blocks 在 prefix
+起点,decode 总在尾部)—— 所以<strong>测试里手动构造场景验证 CoW
+返回值正确</strong>(<code>test_prefix_cache.py::test_cow_triggered_when_appending_into_shared_block</code>),实际生成路径不会触发。Parallel
+sampling 或 beam search 才会真正用到 CoW。</p>
+<h3 id="练习-6">练习</h3>
+<ul>
+<li>E7.1 — 跑
+<code>tests/test_prefix_cache.py::test_e2e_prefix_cache_skips_compute_on_repeat_prompt</code>,加
+print 把第二次 admit 时的 <code>seq.num_prefilled</code>
+打出来。手算应该是几?</li>
+<li>E7.2 — <code>_hash_block</code> 用 Python 内置
+<code>hash()</code>(per-process salted)。在分布式 vLLM(多
+worker)下这会出问题吗?如何改成 deterministic hash?</li>
+<li>E7.3 — Evictable cache 当前 FIFO。改成 LRU 看哪些场景受益(hint:重复
+prompt 频率高时)。</li>
+</ul>
+<hr />
+<h2 id="swap-to-cpu-lru-抢占">§8. Swap to CPU + LRU 抢占</h2>
+<h3 id="显存超订阅">显存超订阅</h3>
+<p>GPU pool 默认 256 个 block。如果某一刻并发请求要 300 个 block,3
+个选择:</p>
+<ol type="1">
+<li><strong>Reject</strong> 后到的:简单粗暴,影响 SLA</li>
+<li><strong>Recompute</strong>:把某个 seq 的 KV 全丢掉,重新走
+prefill。短 prompt 场景下其实最便宜</li>
+<li><strong>Swap to CPU</strong>:把 GPU 上的 block 拷到 CPU pool
+暂存,等显存腾出再拷回来。CPU RAM 通常比 HBM 大 4-10 倍</li>
+</ol>
+<p>我们实现 swap 路径(spec 里 recompute 留作扩展)。</p>
+<h3 id="cacheengine-加-cpu-poolmini_vllmcache_engine.py">CacheEngine 加
+CPU pool(<code>mini_vllm/cache_engine.py</code>)</h3>
+<pre class="python"><code>if cache_cfg.num_cpu_blocks &gt; 0:
+    cpu_shape = (num_cpu_blocks, num_kv_heads, head_dim, block_size)
+    self.cpu_kv_caches = [(torch.zeros(cpu_shape, device=&#39;cpu&#39;), ...) ...]
+
+def swap_out(self, mapping):       # {gpu_id: cpu_id}
+    for layer in range(self.num_layers):
+        for g_id, c_id in mapping.items():
+            self.cpu_kv_caches[layer][0][c_id].copy_(self.kv_caches[layer][0][g_id].to(&#39;cpu&#39;))
+            self.cpu_kv_caches[layer][1][c_id].copy_(self.kv_caches[layer][1][g_id].to(&#39;cpu&#39;))</code></pre>
+<p>CPU pool 的 layout 与 GPU 完全一致(只是 device=‘cpu’)。tensor copy 走
+<code>.to('cpu')</code> / <code>.to(self.device)</code>(真实 vLLM 用
+<code>cudaMemcpyAsync</code> + 多 stream 重叠)。</p>
+<h3 id="blockmanager-双池mini_vllmblock_manager.py">BlockManager
+双池(<code>mini_vllm/block_manager.py</code>)</h3>
+<p>GPU/CPU 两个独立 id namespace。<code>PhysicalBlock.device</code>
+字段标记当前所在池。</p>
+<p><strong><code>can_swap_out(seq)</code> 关键约束</strong>:</p>
+<pre class="python"><code>def can_swap_out(self, seq):
+    gpu_blocks = [pb for pb in seq.block_table.physical_blocks if pb.device == &#39;gpu&#39;]
+    if any(pb.ref_count &gt; 1 for pb in gpu_blocks):
+        return False    # 共享 block 不能 swap(否则破坏 prefix cache 一致性)
+    return self.num_free_cpu_blocks &gt;= len(gpu_blocks)</code></pre>
+<p><strong>共享 block 不能 swap</strong> —— 这是 prefix caching 与 swap
+互动的关键不变量。如果允许 swap 共享 block,其它仍在 GPU 上 running 的
+seq 突然找不到自己的 K/V 了。</p>
+<h3 id="scheduler-自动抢占mini_vllmscheduler.py">Scheduler
+自动抢占(<code>mini_vllm/scheduler.py</code>)</h3>
+<p>每个 step 头部尝试 <code>_try_swap_in</code>(把 swapped
+队列里能装下的拉回 GPU)。每个 decode seq 在 <code>append_slot</code>
+之前调 <code>_ensure_room_for_append</code>:</p>
+<pre class="python"><code>def _ensure_room_for_append(self, decoding_seq, out):
+    extra = max(0, needed - have)              # 这个 seq 这步要扩几个 block
+    while extra &gt; self.bm.num_free_blocks:
+        victim = self._pick_swap_victim(exclude=decoding_seq)
+        if victim is None: break
+        mapping = self.bm.swap_out(victim)
+        out.swap_out.update(mapping)
+        self.running.remove(victim)
+        self.swapped.append(victim)</code></pre>
+<p>LRU 受害者选择:running 队尾(最近 admit 的)倒着走,跳过 ineligible
+的(共享 block 等)。</p>
+<h3 id="engine-应用-swapmini_vllmengine.py">Engine 应用
+swap(<code>mini_vllm/engine.py</code>)</h3>
+<pre class="python"><code>def step(self):
+    sched = self.scheduler.schedule()
+    if sched.swap_out:
+        self.cache_engine.swap_out(sched.swap_out)   # K/V tensor 拷到 CPU
+    if sched.swap_in:
+        self.cache_engine.swap_in(sched.swap_in)     # 拷回 GPU
+    # ...然后 forward</code></pre>
+<p>顺序很重要:swap 必须在 forward 之前完成,否则 attention 读到的
+block_id 对应不上 tensor 内容。</p>
+<h3 id="e2e-验证teststest_swap.py">E2E
+验证(<code>tests/test_swap.py</code>)</h3>
+<p>最严格的测试:</p>
+<pre class="python"><code>def test_e2e_swap_matches_no_swap_baseline():
+    # baseline: 大 GPU pool,swap 关
+    eng_big = build(num_gpu_blocks=64, num_cpu_blocks=0, enable_swap=False)
+    # 紧张场景: 小 GPU + 大 CPU,swap 自动触发
+    eng_small = build(num_gpu_blocks=8, num_cpu_blocks=32, enable_swap=True)
+    out_big   = eng_big.generate(prompts, sp)
+    out_small = eng_small.generate(prompts, sp)
+    assert out_big == out_small   # 输出 token 完全一致</code></pre>
+<p>Swap 改变的是<strong>时序</strong>(blocks 在 GPU/CPU
+之间搬运),不改变<strong>数学</strong>(K/V 内容 bit-identical 经过
+round-trip)。</p>
+<h3 id="练习-7">练习</h3>
+<ul>
+<li>E8.1 — 改 bench 加一行”+ swap on
+plenty”(<code>num_gpu_blocks=64, num_cpu_blocks=64, enable_swap=True</code>)。throughput
+下降多少?为什么(hint:swap 没必要触发,但代码路径多了什么?)。</li>
+<li>E8.2 — 实现 recompute 抢占策略:被抢占的 seq 重置
+<code>num_prefilled=0</code>、free 它的所有 GPU block,重新进 waiting
+队列。短 prompt(&lt;128 token)下 recompute vs swap
+哪个更快?写测试比对。</li>
+<li>E8.3 — 当前 <code>_ensure_room_for_append</code> 的”挑队尾”是 LIFO
+抢占。改成 LRU(running 队列里最久没产生 token 的 seq)。</li>
+</ul>
+<hr />
+<h2 id="从-mini-到真实-vllm">§9. 从 Mini 到真实 vLLM</h2>
+<h3 id="我们简化掉的东西">我们简化掉的东西</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>真实 vLLM</th>
+<th>mini-vLLM</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CUDA paged attention v1/v2 kernel</td>
+<td>Reference Python loop(慢但正确)</td>
+</tr>
+<tr>
+<td>Triton/Flash kernel for prefill</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>Async engine + AsyncLLMEngine</td>
+<td>同步 <code>step()</code>,无 asyncio</td>
+</tr>
+<tr>
+<td>Multi-worker(TP/PP)+ NCCL all-reduce</td>
+<td>单进程</td>
+</tr>
+<tr>
+<td>Ray cluster orchestration</td>
+<td>无</td>
+</tr>
+<tr>
+<td>OpenAI-compatible HTTP server</td>
+<td>无(只有 Python API + streaming generator)</td>
+</tr>
+<tr>
+<td>AWQ/GPTQ/FP8 量化</td>
+<td>无</td>
+</tr>
+<tr>
+<td>LoRA / multi-LoRA</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Speculative decoding(draft model / Medusa / EAGLE)</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Sliding window / ALiBi / linear attention</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Beam search / parallel sampling</td>
+<td>sampler 单 completion</td>
+</tr>
+<tr>
+<td>CUDA graph capture for decode</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Persistent batching with prefix cache aware admission ordering</td>
+<td>FCFS only</td>
+</tr>
+<tr>
+<td>Recompute preemption strategy</td>
+<td>仅 swap</td>
+</tr>
+<tr>
+<td>Prefetch / pipelining of swap_in/out</td>
+<td>同步阻塞拷贝</td>
+</tr>
+</tbody>
+</table>
+<h3 id="概念对照表读真实-vllm-源码时">概念对照表(读真实 vLLM
+源码时)</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>mini_vllm.X</th>
+<th>vllm.X(粗略)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>engine.LLMEngine</code></td>
+<td><code>vllm.engine.llm_engine.LLMEngine</code>(V0)/
+<code>vllm.v1.engine.core.EngineCore</code>(V1)</td>
+</tr>
+<tr>
+<td><code>scheduler.Scheduler</code></td>
+<td><code>vllm.core.scheduler.Scheduler</code> /
+<code>vllm.v1.core.scheduler.Scheduler</code></td>
+</tr>
+<tr>
+<td><code>block_manager.BlockManager</code></td>
+<td><code>vllm.core.block_manager.BlockSpaceManager</code> /
+<code>vllm.v1.core.kv_cache_manager.KVCacheManager</code></td>
+</tr>
+<tr>
+<td><code>model_runner.ModelRunner</code></td>
+<td><code>vllm.worker.model_runner.GPUModelRunner</code></td>
+</tr>
+<tr>
+<td><code>cache_engine.CacheEngine</code></td>
+<td><code>vllm.worker.cache_engine.CacheEngine</code></td>
+</tr>
+<tr>
+<td><code>backends.AttentionBackend</code></td>
+<td><code>vllm.attention.backends.abstract.AttentionBackend</code></td>
+</tr>
+<tr>
+<td><code>models.llama.LlamaModel</code></td>
+<td><code>vllm.model_executor.models.llama.LlamaModel</code></td>
+</tr>
+<tr>
+<td><code>models.llama_loader.load_hf_to_llama_model</code></td>
+<td><code>vllm.model_executor.model_loader.weight_utils</code> + 各
+model 的 <code>load_weights</code></td>
+</tr>
+<tr>
+<td><code>sampler.Sampler</code></td>
+<td><code>vllm.model_executor.layers.sampler.Sampler</code></td>
+</tr>
+<tr>
+<td><code>sequence.Sequence</code></td>
+<td><code>vllm.sequence.Sequence</code> /
+<code>vllm.v1.request.Request</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="哪些机制我们做对了">哪些机制我们做对了</h3>
+<p>如果你用 mini-vLLM 学完后再去看真实 vLLM
+源码,这些<strong>核心抽象一一对应</strong>:</p>
+<ul>
+<li><strong>Block table 间接寻址</strong> ——
+数据结构、<code>slot_mapping</code> 的含义、attention kernel
+的接口形态完全一致</li>
+<li><strong>Continuous batching 调度模型</strong> —— FCFS + token budget
++ admission policy</li>
+<li><strong>Prefix caching 的 hash chain + 引用计数 + evictable</strong>
+—— 算法等价</li>
+<li><strong>Chunked prefill 在 kernel 层的”prior cached + new
+chunk”统一表达</strong> —— 数学等价</li>
+<li><strong>Swap-to-CPU 双池 + LRU 抢占</strong> —— 简化但同构</li>
+</ul>
+<p>如果要扩展真实 vLLM 的某个 feature,你应该已经知道<strong>这个 feature
+影响哪几个文件、改动什么 API</strong>。这是这套教程最重要的产出。</p>
+<h3 id="哪些机制我们没做留作扩展">哪些机制我们没做(留作扩展)</h3>
+<ul>
+<li><strong>Triton/CUDA decode kernel</strong>(Plan 2 spec 已写,待 GPU
+机器):block_table 索引 + 在线 softmax(<code>m_i, l_i, acc</code>)+
+GQA-aware tile</li>
+<li><strong>Recompute preemption</strong>:相比 swap 更便宜的短 prompt
+路径</li>
+<li><strong>Async engine</strong>:<code>step()</code> 改成
+<code>asyncio.run(...)</code> 包一层,引入 producer/consumer queue</li>
+<li><strong>TP</strong>:每个 layer 的 weight 沿 head 切,attention 后
+all-reduce。最小实现 ~200 行</li>
+<li><strong>OpenAI server</strong>:FastAPI + SSE streaming,本质是把
+<code>generate_stream</code> 接到 HTTP</li>
+</ul>
+<h3 id="练习-8">练习</h3>
+<ul>
+<li>E9.1 — 选一个真实 vLLM 的 feature(比如
+<code>enable_prefix_caching</code> 在 V1 引擎里的实现),clone vllm
+仓库,grep 找到对应代码。它的复杂度是 mini-vLLM
+的几倍?多出来的复杂度服务于什么?</li>
+<li>E9.2 — 把 mini-vLLM 的 <code>sampler.py</code> 加上 repetition
+penalty(对已生成的 token logit 减 penalty)。需要传什么 state 到
+sampler?</li>
+<li>E9.3 — 设计一个 “chat template” wrapper:接受
+<code>messages=[{"role":..., "content":...}]</code>,生成正确的
+ChatML/Llama-style prompt 字符串,送进
+<code>engine.add_request</code>。</li>
+</ul>
+<hr />
+<h2 id="总结">总结</h2>
+<p>我们用 1500 行左右的纯 Python 实现了 vLLM
+的核心:<strong>PagedAttention 寻址、continuous batching、chunked
+prefill、prefix caching with CoW、swap-to-CPU、full
+sampler、streaming</strong>。每个 feature 通过 <code>EngineConfig</code>
+flag 切换,<strong>与 HF transformers 在 TinyLlama-1.1B 上 8/8 token
+greedy 完全一致</strong>。</p>
+<p>性能我们完全没追求 —— reference attention 比真实 CUDA kernel 慢
+50-100×。但<strong>架构对得上</strong>:你现在能在 PaperPaged 上读懂
+PagedAttention 论文里每个图,在 vLLM 源码里认出每个核心数据结构,在生产
+issue 里推断 metric 异常的可能根因。</p>
+<p>下一步: - 想跑性能?装 NVIDIA GPU,做 <a
+href="https://github.com/qxhy123/ai-infra-tutorial/blob/master/docs/superpowers/specs/2026-05-06-mini-vllm-paged-attention-design.md">Plan
+2(Triton kernel)</a> - 想理解更深?把上面 9 节的练习
+E<em>.1/E</em>.2/E*.3 全做一遍 - 想看真实生产形态?读 vLLM
+<code>v1/engine/core.py</code> 和
+<code>v1/core/scheduler.py</code>,带着我们的概念对照表</p>
+<p>代码、测试、bench 都在 <code>code/mini-vllm/</code>
+里。<code>pytest tests/ -m slow</code> 是最大的信任来源 ——
+如果它过了,你的实现与 HF 数学一致;如果它挂了,某个 kernel/loader
+写错了。</p>
+<hr />
+<h2 id="配套源码-commit-历史供索引">配套源码 commit 历史(供索引)</h2>
+<pre><code>9bcdcb0  Plan 7: streaming + sampler + bench
+9453c7f  Plan 6: swap to CPU + LRU preemption
+5ac4b4a  Plan 5: prefix caching + CoW + chunked prefill
+497b727  Plan 4: continuous batching + token budget
+0a07b0a  Plan 3: TinyLlama 1.1B + HF safetensors loader (8/8 greedy parity)
+6eb4b35  Plan 1: skeleton (toy GPT, Torch backend, naive scheduler)</code></pre>
+<p>每个 Plan 都有独立 spec/plan 文档在
+<code>docs/superpowers/{specs,plans}/</code>,可以追溯每一步的设计决策与执行细节。</p>
+</section>
+</main>
+<script src="../assets/nav.js"></script>
+</body>
+</html>
