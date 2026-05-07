@@ -788,3 +788,410 @@ H100 有 SXM5、PCIe、NVL（双卡 188GB）三个变体；A100 有 SXM4、PCIe�
 - **及格**：能区分三种技术
 - **良好**：能给出 18 个月内的边际收益排序
 - **优秀**：能讨论"对当前组织规模 / 业务方向"的具体影响并主动调整排序
+
+---
+
+## 26.3 训练基础设施与分布式训练
+
+### 26.3.1 单机 8 卡训练 step time 不稳，怎么定位
+
+**问题**
+
+8×H100 单机训练 13B 模型，每 step 时间从 1.2s 到 2.8s 抖动。GPU-Util 平均 90%，没有任何错误日志。请给出**你的诊断顺序**，至少要排除 4 类可能根因。
+
+**考察点**
+
+- 是否能用结构化方法排查训练性能不稳
+- 是否懂训练 step 的时间组成（forward / backward / all-reduce / data load）
+- 是否会用 profiler 工具
+
+**回答框架**
+
+- 第一步：profile 单 step 时间组成（torch.profiler / Nsight Systems），确定瓶颈是 compute / comm / data / memory
+- 排除 1：DataLoader 抖（CPU 抢占、磁盘 IO、num_workers 不够、prefetch 不够）→ 看 dataloader idle time
+- 排除 2：NCCL all-reduce 抖（PCIe 共享、温控降频、邻居进程）→ 看 all-reduce time variance
+- 排除 3：显存 fragmentation 触发 alloc / free 慢 → 看 cudaMalloc 调用次数
+- 排除 4：GPU 自身降频（功耗 / 散热）→ `nvidia-smi -q -d CLOCK,POWER,TEMP`
+- 排除 5：跨节点干扰（共享文件系统抖、邻居 Job）
+
+**追问**
+
+- DataLoader 和 GPU 计算 overlap 不足时，监控会出现什么特征？
+- 8 卡里偶尔 1 卡明显慢，最可能是什么？
+
+**评分要点**
+
+- **及格**：能列 3 类根因
+- **良好**：能给 profile 工具 + 时间组成拆解
+- **优秀**：能加上 GPU 降频 / 邻居 Job / 共享存储等"非显然"维度
+
+---
+
+### 26.3.2 ZeRO 1 / 2 / 3 与 FSDP 的关键区别
+
+**问题**
+
+新人问"为什么我们不直接全用 ZeRO-3 / FSDP？" 请说明 **ZeRO-1 / 2 / 3 与 PyTorch FSDP** 各自切了什么、通信代价多少倍、什么场景下用哪个最划算。
+
+**考察点**
+
+- 是否真的能数清楚每 stage 切了什么、通信多少
+- 是否能从模型规模 / 集群规模反推选择
+- 是否懂 FSDP 与 ZeRO-3 的工程差异（API、checkpoint、internal mesh）
+
+**回答框架**
+
+- ZeRO-1：切 optimizer states，all-reduce 通信不变（仍 ≈ 2× params/step），显存省最多
+- ZeRO-2：切 optimizer + gradient，通信仍 ≈ 2× params（reduce-scatter + all-gather）
+- ZeRO-3：切 optimizer + gradient + parameters，每 step 通信 ≈ 3× params（forward all-gather + backward all-gather + reduce-scatter）
+- FSDP：PyTorch 原生实现，与 ZeRO-3 等价，但 API 更"PyTorch-y"，支持 mixed precision / activation checkpointing 一体配置；HSDP 还能 hybrid sharding（机内全切，机间 DP）
+- 选择：13B 单机能放下 → ZeRO-1/2 即可；70B+ 必走 ZeRO-3/FSDP；多节点训练用 HSDP / 2D mesh 减少跨机 all-gather
+- 场景反例：通信带宽不够时 ZeRO-3 反而比 ZeRO-2 + activation checkpointing 慢
+
+**追问**
+
+- HSDP 的 hybrid 是怎么"机内全切机间 DP"的？
+- ZeRO-3 在 backward 时为什么还要再 all-gather 一次参数？
+
+**评分要点**
+
+- **及格**：能区分各 stage 切了什么
+- **良好**：能给出每 stage 的通信量量级
+- **优秀**：能讨论 HSDP / 2D mesh / 通信带宽与 stage 选择的耦合
+
+---
+
+### 26.3.3 张量并行（TP）什么时候比纯 DP 划算
+
+**问题**
+
+70B 模型训练，集群有 64 张 H100。请说明：**TP=2 / TP=4 / TP=8 与纯 DP 的取舍**，并解释为什么 TP 通常不跨机器。
+
+**考察点**
+
+- 是否懂 TP 的通信特性（每层 forward+backward 各一次 all-reduce）
+- 是否懂 TP 必须 NVLink 内、跨机会爆炸
+- 是否能算 TP × DP 的 mesh 怎么构造
+
+**回答框架**
+
+- TP 切的是单层矩阵：每层 2 次 all-reduce，频率高，对延迟极敏感
+- TP 跨机：跨机 200us 延迟 × 每层 N 次 = 不可接受；必须限制在 NVLink 内
+- 70B / 64 GPU：TP=4（节点内）+ DP=16（跨节点 ZeRO）较常见；若 NVSwitch 全互联 TP=8 可行
+- 与纯 DP 对比：纯 DP 显存放不下 70B；TP+DP 把"装下 + 高效跨机"两件事分开
+- 取舍：TP 越大单层吞吐越高但通信越多；超过 NVLink 域立即崩
+- 工具：3D parallelism（TP × PP × DP）才是 100B+ 的标准配置
+
+**追问**
+
+- TP=8 但 NVLink 出现 1 张卡掉线，会发生什么？
+- TP 切了 attention head 后，head 数不能整除 TP 怎么办？
+
+**评分要点**
+
+- **及格**：能讲 TP 的通信特性
+- **良好**：能解释"为什么 TP 不跨机"
+- **优秀**：能讨论 3D parallelism mesh 构造和 head 数整除限制
+
+---
+
+### 26.3.4 流水并行（PP）的 bubble 与微批划分
+
+**问题**
+
+8 stage 流水并行训练 175B 模型，micro-batch 数 = 8 时 bubble overhead ~50%，micro-batch 数 = 32 时 bubble ~12%。请解释：**bubble 是什么、为什么微批数能减少它、为什么不能无限增大微批数**。
+
+**考察点**
+
+- 是否懂 PP 调度（GPipe / 1F1B / Interleaved）
+- 是否能算 bubble 比例 = (P-1) / (P + M - 1)（GPipe）
+- 是否懂微批数受显存 / 数值稳定性限制
+
+**回答框架**
+
+- Bubble：流水线启动 / 排空阶段，部分 stage 空闲
+- GPipe bubble：P stage、M micro-batch，bubble 比例 ≈ (P-1)/(P+M-1)；M=8, P=8 → 7/15 ≈ 47%；M=32 → 7/39 ≈ 18%
+- 1F1B / Interleaved：稳态期间 forward / backward 交错，bubble 减半
+- 微批数上限：每 stage 显存 = micro_batch × activation；越多越占显存
+- 数值稳定性：grad accumulation 等价大 batch，但 batch norm / loss scale 要小心
+- 实战：DeepSpeed PP / Megatron PP 都用 1F1B，配合 activation checkpointing
+
+**追问**
+
+- Interleaved 1F1B 是怎么把 bubble 从 (P-1)/(P+M-1) 降到 (P-1)/(K(P+M-1)) 的（K 是 chunks）？
+- PP 出现某个 stage 显著慢，会引发什么？
+
+**评分要点**
+
+- **及格**：能解释 bubble 概念
+- **良好**：能给 GPipe bubble 公式 + 1F1B 改进
+- **优秀**：能讨论 Interleaved + chunks 公式 + stage 慢导致的整体崩
+
+---
+
+### 26.3.5 NCCL 调优：超时 / 死锁 / 性能差的常见原因
+
+**问题**
+
+训练突然卡住，NCCL 日志只有 `NCCL WARN Connect to ... failed`。请说明 **NCCL 常见故障类型**（超时 / 死锁 / 性能差）的诊断和处理思路，以及 `NCCL_DEBUG=INFO` 之外你会用的环境变量。
+
+**考察点**
+
+- 是否懂 NCCL 错误的常见模式
+- 是否会用 NCCL 调试 / 调优环境变量
+- 是否能区分"配置问题"和"硬件问题"
+
+**回答框架**
+
+- 超时：通常是 PCIe / IB 链路抖动 / NCCL_TIMEOUT 阈值低 / 一卡 hang 拖死全部 → `NCCL_TIMEOUT` 调大、`NCCL_BLOCKING_WAIT=1` 看哪卡先卡
+- 死锁：rank 间 collective 顺序不一致（控制流分歧 / hang 在不同 op）→ 检查代码所有 collective 是否对齐
+- 性能差：拓扑不对（`NCCL_TOPO_FILE` / `NCCL_ALGO`）、走错 NIC / 协议（`NCCL_IB_HCA`、`NCCL_NET_GDR_LEVEL`）、PXN 没开
+- 调试变量：`NCCL_DEBUG=INFO`、`NCCL_DEBUG_SUBSYS=ALL`、`NCCL_ASYNC_ERROR_HANDLING=1`、`TORCH_NCCL_TRACE_BUFFER_SIZE`
+- 硬件 vs 配置：相同代码换一台机器能跑 → 硬件 / 网络；换一台机器还挂 → 代码 / 配置
+
+**追问**
+
+- `NCCL_NET_GDR_LEVEL` 改大改小各有什么影响？
+- 一个 rank hang 导致全部 timeout，怎么定位是哪个 rank 先 hang？
+
+**评分要点**
+
+- **及格**：能讲三类故障
+- **良好**：能给环境变量 + 排查路径
+- **优秀**：能区分硬件 vs 配置 + 给出"先 hang"定位方法（NCCL flight recorder / py-spy）
+
+---
+
+### 26.3.6 梯度同步、梯度累积与 batch size 的耦合
+
+**问题**
+
+有人说"梯度累积 8 步 = 等价 batch size 放大 8 倍"，但实际 loss 曲线和 LR scheduler 会偏离。请解释**梯度累积对 batch size / LR / BN / dropout / log step 的真实影响**，并给出"梯度累积 + LR warmup + batch size scaling rule"如何同时正确。
+
+**考察点**
+
+- 是否懂梯度累积的语义
+- 是否懂 batch norm / dropout 与梯度累积的不同
+- 是否懂 linear scaling rule / sqrt scaling rule
+
+**回答框架**
+
+- 累积语义：N 个 micro-batch 各 forward+backward，梯度累加，第 N 步才 optimizer.step()
+- 等价：等价于 batch_size × N（仅对 grad / loss 而言）
+- BN 不等价：每个 micro-batch BN 独立 running stats，与真正大 batch BN 行为不同；用 SyncBN 或 GroupNorm 才等价
+- Dropout 不等价：每 micro-batch 独立 dropout mask，与大 batch 不同（影响小但要知道）
+- LR scaling：linear rule 用 batch_size_eff = batch_size × N × DP，warmup steps 也要按 N 缩放
+- Log step：步数变成原来 1/N，metric / scheduler 要按"effective step"计
+
+**追问**
+
+- 你怎么验证"梯度累积 N 步"和"实际 batch×N"的 loss 曲线一致？
+- 累积过程中显存 peak 比 batch×N 高还是低？
+
+**评分要点**
+
+- **及格**：知道累积等价 batch 放大
+- **良好**：能讲 BN / dropout 的差异
+- **优秀**：能讨论 scaling rule + step 计数 + peak memory 等多维细节
+
+---
+
+### 26.3.7 Activation checkpointing 何时是亏的
+
+**问题**
+
+Activation checkpointing 用 1.3-1.4× 计算换显存。请说明**什么场景下它反而是亏的**，并给出一个判断标准来决定每一层是否值得 checkpoint。
+
+**考察点**
+
+- 是否真的清楚 activation checkpointing 的计算 / 显存 trade-off
+- 是否能识别哪些层重算特别贵
+- 是否能用工具量化"显存收益 / 计算损失"
+
+**回答框架**
+
+- 划算：层 activation 占显存大、重算便宜（普通 Linear / LayerNorm）
+- 亏：注意力层 (FlashAttention 已经融合)、rematerialize 反而触发 recompute kernel 而不是融合 → 实际比"用更激进 ZeRO-3 + 多卡"更慢
+- Selective checkpointing：只 checkpoint 大头层（attention 输出、FFN 中间），不要无脑全切
+- 量化标准：activation_size_saved × seq_len × batch / extra_compute_time，得到"每秒省多少显存"
+- 工具：torch.utils.checkpoint + activation_size profile；与 ZeRO-3 + offload 对比真实 step time
+
+**追问**
+
+- FlashAttention 启用后还该 checkpoint attention 吗？
+- selective checkpoint 的"哪些层选"有自动化方法吗？
+
+**评分要点**
+
+- **及格**：知道 1.3× 计算开销
+- **良好**：能讲 selective checkpoint
+- **优秀**：能给量化标准 + 工具链
+
+---
+
+### 26.3.8 训练故障恢复：checkpoint 频率 / 容错 / 自动重启
+
+**问题**
+
+70B 训练预计跑 20 天，节点 MTBF 约 10 天（150 卡集群每天有故障概率）。请设计 **checkpoint 策略 + 自动恢复机制**，目标是单次故障损失不超过 30 分钟。
+
+**考察点**
+
+- 是否会算"checkpoint 间隔 vs 失败损失 vs IO 开销"
+- 是否懂分布式 checkpoint（async / shard）
+- 是否懂 K8s / scheduler 层 auto-restart
+
+**回答框架**
+
+- 频率：30 分钟为目标，则 checkpoint 间隔 ≤ 30 min 但不能太频繁（写 IO 阻塞训练）
+- 异步 checkpoint：参数同步切片到 host memory，后台写盘，训练继续
+- Sharded checkpoint：FSDP / DCP 各 rank 写自己的分片，避免单 rank 聚合瓶颈
+- 自动重启：scheduler（K8s + Volcano / Kubeflow）检测节点失败，gang restart 整个 Job 从最近 checkpoint
+- 健康检查：NCCL hang detector + heartbeat + topology check
+- 数据：DataLoader resume from sample index（不是从 epoch 头）
+
+**追问**
+
+- 节点失败但 NCCL 没报错（silent hang），怎么发现？
+- 30 min checkpoint 间隔，IO 占 step time 多少能接受？
+
+**评分要点**
+
+- **及格**：能给频率 + 异步 + 自动重启
+- **良好**：能讲 sharded checkpoint + DataLoader resume
+- **优秀**：能讨论 silent hang 检测 + 时间预算分配（IO / failure / recovery）
+
+---
+
+### 26.3.9 学习率 / Optimizer 状态在多卡下的一致性陷阱
+
+**问题**
+
+ZeRO-3 训练时，team 偶尔反馈"resume 后 loss 跳"。请列出**多卡训练时 LR / optimizer state / RNG state 的一致性陷阱**，以及如何在 checkpoint 中正确保存恢复。
+
+**考察点**
+
+- 是否懂 LR scheduler / optimizer 与 step 计数的耦合
+- 是否懂 RNG state（数据 shuffle / dropout）在分布式下的处理
+- 是否懂 ZeRO 切片 optimizer state 的恢复
+
+**回答框架**
+
+- LR scheduler：必须用 step 而非 epoch 计数；resume 后 scheduler.last_epoch 要正确
+- Optimizer state：ZeRO 切片后每 rank 只存自己的；恢复时按 rank 加载，DCP / FSDP 自动处理
+- RNG state：每 rank 保存自己的 torch / numpy / random / cuda RNG；DataLoader 的 sampler 也要保
+- AMP loss scaler：fp16 训练的 GradScaler 状态要保
+- 数据 sampler：DistributedSampler 在 epoch 内的 sample index 要保（用 stateful sampler）
+- 跳 loss 的常见根因：scheduler last_epoch 没保 / RNG 没保 / DataLoader 从头开始走了相同样本
+
+**追问**
+
+- 怎么验证"resume 后第一个 step 的输入和原来挂掉前的下一个 step 是同样数据"？
+- AMP scaler 不保会怎样？
+
+**评分要点**
+
+- **及格**：能列 LR / optimizer / RNG 三类
+- **良好**：能讲 scheduler last_epoch + sampler index
+- **优秀**：能给"resume 一致性"验证方法 + AMP 影响
+
+---
+
+### 26.3.10 训练资源排队：FCFS / 优先级 / Backfill 怎么选
+
+**问题**
+
+研究院 1000 张卡，训练任务从小（8 卡 / 1 天）到大（256 卡 / 30 天）都有，还要插急（VIP 项目 64 卡 / 立即）。请设计调度策略：**FCFS / Priority / Backfill / Gang scheduling 怎么组合**。
+
+**考察点**
+
+- 是否懂大型 HPC / AI 集群的调度模式
+- 是否能用 backfill 提升大 Job 等待期间的小 Job 利用率
+- 是否懂 gang scheduling 必要性（部分启动 = 死锁）
+
+**回答框架**
+
+- 基础：所有 AI 训练 Job 必须 gang scheduling（要么所有 worker 全启动要么全不启动）
+- 队列分层：高优先级（VIP / 在线服务）、中优先级（生产训练）、低优先级（探索 / spot）
+- FCFS within priority：同优先级先到先服务
+- Backfill：大 Job 排队时，放小 Job 进去填空，但不能让大 Job starvation（设最大延迟 SLA）
+- 抢占：高优先级到达时可抢低优先级，但要 checkpoint friendly（提前 5 min 通知）
+- 工具：Volcano、Kueue、Slurm、Ray Cluster
+
+**追问**
+
+- 大 Job 排队 7 天，一个研究员把它拆成 32 个小 Job 蒙混过关，平台怎么办？
+- 怎么测算"backfill 利用率提升"是否真有效？
+
+**评分要点**
+
+- **及格**：知道 gang + priority
+- **良好**：能讲 backfill / starvation / 抢占
+- **优秀**：能讨论拆任务作弊 + 利用率测算 + 工具选型
+
+---
+
+### 26.3.11 训练数据流水线的常见瓶颈
+
+**问题**
+
+70B 训练，dataset 12TB。GPU-Util 平均只有 65%，profile 显示有 30% 时间 GPU 在等数据。请说明**数据流水线的常见瓶颈**和系统级优化思路。
+
+**考察点**
+
+- 是否懂训练数据 pipeline 各阶段（read → decode → preprocess → tokenize → batch → host→device）
+- 是否能识别瓶颈层
+- 是否懂大数据集的 prefetch / shuffle / caching 策略
+
+**回答框架**
+
+- 阶段：source（S3/CephFS）→ DataLoader worker → CPU preprocess → tokenize → pin memory → host→device transfer
+- 常见瓶颈：S3 网络（每 epoch 重新拉）、tokenizer 慢（HF python tokenizer 单线程）、num_workers 太少
+- 系统级优化：预 tokenize 后存 parquet/webdataset；本地 NVMe 缓存层；num_workers = num_cpu_cores / num_gpus_per_node × 2；prefetch_factor 增加
+- 高级：streaming dataset（webdataset / mosaic-streaming）边下边训；多机间 data sharding 避免重复读
+- 工程陷阱：num_workers 过多反而 fork 慢、内存爆、CPU 抢占；pin_memory 没开导致 host→device 慢
+
+**追问**
+
+- 12TB 数据 epoch 用了 30 分钟读取，怎么估算"加 NVMe 缓存"是否值得？
+- 每 epoch 不同 shuffle，怎么保证 resume 数据顺序一致？
+
+**评分要点**
+
+- **及格**：能列 3+ 阶段 + 瓶颈
+- **良好**：能给 num_workers / prefetch / 预 tokenize 优化
+- **优秀**：能讨论 streaming dataset + cache 命中估算 + resume 一致性
+
+---
+
+### 26.3.12 LoRA / 全量 / continue pretraining：训练形态的资源差异
+
+**问题**
+
+公司业务现在做这三件事：base model 预训练（从零）、SFT 全量微调、LoRA 微调。请说明这三种形态在**显存 / 计算 / 数据 / checkpoint 体积 / 部署形态**上的差异，并解释为什么 LoRA 在生产里被广泛采用。
+
+**考察点**
+
+- 是否能区分三种训练形态的资源画像
+- 是否懂 LoRA 的"低秩"机制 + 推理时合并
+- 是否懂 LoRA 在 multi-tenant 推理下的优势
+
+**回答框架**
+
+- 预训练：100B+ token，万卡级别集群，数据 / 通信 / 容错全部拉满
+- SFT 全量：千万 token，几十-几百卡，所有参数都更新，checkpoint 全模型大小
+- LoRA：万-千万 token，单机或几卡，只更新低秩 adapter（几 MB-几百 MB），checkpoint 小
+- 推理部署：LoRA 可"base model + 多个 adapter 共存"，按请求切换 adapter；vLLM / Punica 支持 multi-LoRA serving
+- 优势：显存 + 训练成本低 1-2 个数量级；多任务共享 base；adapter 易分发 / 版本管理
+- 限制：能力上限受 LoRA rank；与 base 距离过远的领域适配性差
+
+**追问**
+
+- LoRA rank 选 8 / 16 / 64 各影响什么？
+- multi-LoRA serving 时 prefix cache 怎么处理？
+
+**评分要点**
+
+- **及格**：能区分三形态资源画像
+- **良好**：能讲 LoRA 推理部署优势
+- **优秀**：能讨论 multi-LoRA + prefix cache + rank 选择 + 局限性
