@@ -952,4 +952,5 @@ vllm serve TheBloke/Llama-3-70B-Instruct-GPTQ \
 - [第 14 章 · 在线推理架构](14-online-inference-architecture.md)：路由、副本、SLO 与 vLLM serving 的整体集成
 - [第 15 章 · 批处理、调度与 KV Cache](15-batching-scheduling-and-kv-cache.md)：本章的概念前置
 - [第 16 章 · 量化、编译与推理引擎](16-quantization-compilation-and-engines.md)：vLLM 与 TRT-LLM、SGLang、TGI 的横向对比
+- [第 16a-lab 章 · Mini-vLLM 实战](16a-lab-mini-vllm.md)：本章概念的**配套实战代码**，1500 行 Python 从零实现 PagedAttention / continuous batching / chunked prefill / prefix caching / swap / streaming，与 HF transformers 在 TinyLlama-1.1B 上 8/8 token greedy 完全一致
 - [第 17 章 · 多租户与成本治理](17-multitenancy-and-cost.md)：vLLM 在多租户平台中的隔离、配额与成本归因
