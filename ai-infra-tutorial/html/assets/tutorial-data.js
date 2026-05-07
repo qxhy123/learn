@@ -583,14 +583,14 @@ const TUTORIAL = [
         "path": "appendix/end-to-end-case.html"
       },
       {
-        "id": "version-matrix",
-        "title": "附录 G · 版本矩阵",
-        "path": "appendix/version-matrix.html"
-      },
-      {
         "id": "learning-map",
         "title": "附录 F · 全书知识地图",
         "path": "appendix/learning-map.html"
+      },
+      {
+        "id": "version-matrix",
+        "title": "附录 G · 版本矩阵",
+        "path": "appendix/version-matrix.html"
       },
       {
         "id": "incident-driven-learning",
@@ -606,6 +606,31 @@ const TUTORIAL = [
         "id": "diagrams",
         "title": "附录 J · Mermaid 图表资产",
         "path": "appendix/diagrams.html"
+      },
+      {
+        "id": "end-to-end-lab",
+        "title": "附录 K · 端到端可运行实验",
+        "path": "appendix/end-to-end-lab.html"
+      },
+      {
+        "id": "cost-model",
+        "title": "附录 L · AI Infra 成本模型",
+        "path": "appendix/cost-model.html"
+      },
+      {
+        "id": "incident-casebook",
+        "title": "附录 M · 事故复盘案例库",
+        "path": "appendix/incident-casebook.html"
+      },
+      {
+        "id": "seniority-roadmap",
+        "title": "附录 N · AI Infra 职级能力路线图",
+        "path": "appendix/seniority-roadmap.html"
+      },
+      {
+        "id": "metrics-dictionary",
+        "title": "附录 O · 指标字典与归因地图",
+        "path": "appendix/metrics-dictionary.html"
       }
     ]
   }
