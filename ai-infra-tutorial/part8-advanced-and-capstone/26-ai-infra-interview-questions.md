@@ -2854,3 +2854,410 @@ CFO 要 monthly cost report，按业务 / 租户 / 项目摊分。请设计**成
 - **及格**：能列审计对象
 - **良好**：能讨论防篡改 + 分级
 - **优秀**：能讨论合规对应 + 临时权限 + retention
+
+---
+
+## 26.8 综合系统设计与故障排查 Case
+
+### 26.8.1 设计：从零搭建支持 70B 模型 + 1000 QPS 的推理平台
+
+**问题**
+
+预算 6 个月、20 人团队、初期 200 张 H100。业务要求：支持 70B chat 模型、1000 QPS 峰值、p99 TTFT < 500ms、多租户 + 计费。请用 30 分钟做**端到端架构设计**。
+
+**考察点**
+
+- 是否能从约束反推架构
+- 是否能切分 6 个月里程碑
+- 是否能讨论关键 trade-off
+
+**回答框架**
+
+- 容量估算：70B FP16 单请求 1.34 GB KV，TP=8 副本能服务 ~300 并发；1000 QPS × p99 500ms TTFT → 约 500 in-flight → 需要 ~2 副本（保留 buffer 4 副本）；200 H100 / 8 = 25 副本，足够 4 副本 + 训练 + buffer
+- 引擎：vLLM 主，TRT-LLM 后续优化；FP8 量化
+- 平台：K8s + Volcano + custom CRD（InferenceService）+ Knative-style autoscaling；Service mesh 控制面 only
+- 数据：模型 registry + S3 + cross-region replication；prefix cache 共享
+- 多租户：namespace + quota + label 计费 + RBAC
+- 监控：Prometheus + Grafana + OpenTelemetry + 业务级 dashboard
+- 6 个月里程碑：M1（单租户单模型 PoC）→ M2（多副本 + autoscaling）→ M3（多租户 + 计费）→ M4（监控 + SLO）→ M5（quantization + multi-LoRA）→ M6（DR + 治理）
+- 关键 trade-off：vLLM vs TRT-LLM、FP8 vs FP16、多副本 vs TP=16、独立部署 vs 共享 base + LoRA
+
+**追问**
+
+- 第一个上线模型出现 prefix cache 命中率 30%（预期 70%），怎么 debug？
+- 第 4 个月 200 H100 不够了，怎么扩 / 哪种扩最值？
+
+**评分要点**
+
+- **及格**：能给容量 + 选型
+- **良好**：能给里程碑 + 关键决策
+- **优秀**：能讨论扩容路径 + 调优 case + trade-off
+
+---
+
+### 26.8.2 设计：训练平台支持 1000 研究员 + 2000 GPU
+
+**问题**
+
+研究院规模 1000 人，2000 GPU，从单卡微调到千卡预训练都要支持。请设计**训练平台**：用户接口、资源调度、checkpoint / registry、协作机制。
+
+**考察点**
+
+- 是否能给"灵活 vs 治理"平衡
+- 是否懂大集群调度复杂度
+- 是否能讲协作机制（数据 / 模型分享）
+
+**回答框架**
+
+- 用户接口：CRD（TrainingJob / Experiment）+ CLI/SDK + Web UI；自服务 + escape hatch
+- 调度：Volcano gang + queue + fairshare；4 队列（VIP / 生产 / 探索 / spot）
+- 资源池：节点物理切分大 Job 池（>=64 卡）+ 中小 Job 池（共享）+ 探索池（spot）
+- Checkpoint：DCP sharded + 自动 export full 到 registry；统一存储 backed by S3
+- Registry：统一 model + dataset registry，谱系追溯
+- 协作：项目空间 + 共享模型 + 共享数据集（带 license）
+- 治理：每 Job tag owner / project / cost-center；月度报表
+- Profiling：内置 torch.profiler + Nsight on demand
+- 易用：模板 / cookbook（"我要 SFT 70B" 一键模板）
+
+**追问**
+
+- 1000 研究员同时提 Job，scheduler 性能怎么扛？
+- 一个研究员训了 30 天但模型不收敛，平台能帮 catch 多早？
+
+**评分要点**
+
+- **及格**：能给接口 + 调度
+- **良好**：能讨论池切分 + 协作
+- **优秀**：能讨论性能扩展 + 早期诊断
+
+---
+
+### 26.8.3 设计：长 context（128K）+ 多租户 + 工具调用 Agent 平台
+
+**问题**
+
+新业务做"企业知识 Agent"：每用户 128K 文档上下文 + 检索 + 工具调用 + 长期记忆。请设计**支持这种 workload 的平台**，重点回答 KV cache 管理、prefix cache 跨用户、工具沙箱、成本分摊。
+
+**考察点**
+
+- 是否懂长 context 推理的工程压力
+- 是否懂 Agent runtime 与推理服务的分工
+- 是否能讲 cache + memory + cost 三维度
+
+**回答框架**
+
+- 推理：长 context → FP8 KV + chunked prefill 必开；分层 KV（最近 4K full precision + 远端量化）
+- KV cache：用户级 cache 持久化（同一用户多次会话复用 KV）；L1 显存 + L2 CPU + L3 SSD 三层
+- Prefix cache：跨用户共享只针对企业公共知识（非用户私有文档）；用户私有文档不共享
+- Agent runtime：vLLM 提供"单次推理"，runtime 编排多步 + 工具 + 状态；运行时挂起恢复 KV
+- Tools：沙箱执行（gVisor / Firecracker）；scoped credentials；超时 / 资源限制
+- 长期记忆：vector DB（per-user namespace）+ embedding model 共享
+- 成本：按 user × token + tool wall time + storage 综合计费；session 预算 envelope
+- 隔离：用户文档绝对隔离；共享 base model + 公共知识
+
+**追问**
+
+- 用户文档 100MB，怎么避免每次 prefill 都重新算？
+- 工具调用 wall time 5 秒，KV cache 期间怎么处理（释放？保留？）
+
+**评分要点**
+
+- **及格**：能讲 KV 分层 + 沙箱
+- **良好**：能讨论 prefix 共享边界 + session 预算
+- **优秀**：能讨论用户级 KV 持久化 + tool wall time KV 释放策略
+
+---
+
+### 26.8.4 故障：1500 卡训练 step 412 挂死
+
+**问题**
+
+175B 训练，1500 张 H100 跑了 6 天，step 412 突然 hang 住，NCCL 没报错。监控显示所有 GPU util 100%。请说明你**接下来 30 分钟的诊断步骤**，以及恢复策略。
+
+**考察点**
+
+- 是否懂 NCCL silent hang 模式
+- 是否会用 flight recorder / py-spy 定位
+- 是否能在不丢 6 天工作的前提下恢复
+
+**回答框架**
+
+- 第 1-5 min：确认 hang（看是否有任意 rank 在动）；查看每 rank 的 last log timestamp
+- 第 5-15 min：取 NCCL flight recorder dump（`TORCH_NCCL_TRACE_BUFFER_SIZE=1000`）找出哪 rank 没参与 collective
+- 第 15-25 min：py-spy 看 hang rank 的 stack；很可能是 PCIe / NIC / collective 顺序问题
+- 第 25-30 min：决定 abort：所有 rank kill -SIGTERM → trigger checkpoint export → restart from latest sharded checkpoint
+- 恢复：scheduler 检测 Job 失败自动重启；DataLoader resume from last sample index
+- 数据丢失：约 30 分钟（last checkpoint 到 step 412 之间）
+- 长期：分析 root cause（硬件 / 软件 / 代码 bug）；引入更多 hang detection（heartbeat）
+
+**追问**
+
+- 怎么判断是"代码 bug 死锁"还是"硬件抖断 collective"？
+- 重启后有没有可能再次同样 step hang？怎么 mitigate？
+
+**评分要点**
+
+- **及格**：能讲 abort + restart
+- **良好**：能用 flight recorder + py-spy
+- **优秀**：能讨论根因分类 + 防再发 + 数据损失最小化
+
+---
+
+### 26.8.5 故障：推理服务 OOM 半夜频繁重启
+
+**问题**
+
+70B vLLM 推理副本，凌晨 2-4 点频繁 OOM 被 K8s kill 重启，白天没事。请给出**诊断假设**和验证方法。
+
+**考察点**
+
+- 是否能从时间规律找特殊事件
+- 是否懂 vLLM 内存增长模式
+- 是否会查 prefix cache 增长 / KV fragmentation
+
+**回答框架**
+
+- 假设 1：凌晨流量类型变化（prompt 变长 / 用户变多）→ 看 prompt length 分布 / QPS / 租户分布
+- 假设 2：prefix cache 持续增长（evictable 没回收）→ 看 cache size metric
+- 假设 3：定时 batch job 占用同节点资源（K8s noisy neighbor）
+- 假设 4：模型 / 配置变更（凌晨自动 rollout）→ 看 deployment history
+- 假设 5：内存碎片化累积 → 看 cudaMalloc / fragmentation
+- 验证：grep 故障时间 vs prompt length / cache hit / queue depth；查节点其他 Pod；查 vLLM 日志看死前 stat
+- 修复：根据 root cause；典型 fix：限制 max_seq_len、调 prefix cache 容量、隔离 noisy neighbor
+
+**追问**
+
+- prefix cache evict 失败的可能根因？
+- 凌晨 batch Job 把 NIC 打满影响 KV swap，怎么发现？
+
+**评分要点**
+
+- **及格**：能列 3 个假设
+- **良好**：能给验证方法
+- **优秀**：能讨论 cache evict / fragmentation / noisy neighbor
+
+---
+
+### 26.8.6 故障：Prefix cache 命中率从 80% 跌到 20%
+
+**问题**
+
+prefix cache hit rate 突降，整套服务的 TTFT 从 200ms 涨到 1.5s。请给出**诊断步骤**和最可能的 5 个根因。
+
+**考察点**
+
+- 是否懂 prefix cache 命中条件
+- 是否能从应用层 / 平台层综合排查
+- 是否能给具体 fix
+
+**回答框架**
+
+- 步骤：先看 cache size 是否爆 / cache eviction rate；再看 token 序列分布是否变化
+- 根因 1：业务方改了 system prompt（差一个空格 / 时间戳）→ 看模板 hash 变化
+- 根因 2：tokenizer 版本变了 → 同一 prompt token id 不同
+- 根因 3：副本扩容（新副本 cache 冷）→ 看是否最近 scale up
+- 根因 4：cache 容量减小 / 配置降级
+- 根因 5：LoRA adapter 频繁切换 → 同一 prefix 不同 (base, adapter) 不复用
+- 修复：模板回滚 / cache 容量增加 / 副本 cache 预热 / adapter sticky 路由
+
+**追问**
+
+- 副本 scale up 后怎么让新副本快速预热 cache？
+- 业务方 system prompt 嵌时间戳，怎么帮他改？
+
+**评分要点**
+
+- **及格**：能列 3 个根因
+- **良好**：能给诊断 + fix
+- **优秀**：能讨论副本预热 + 模板设计指引
+
+---
+
+### 26.8.7 故障：成本月度账单突增 30%
+
+**问题**
+
+CFO 抱怨"AI 平台月度成本环比 +30%，业务量没变"。请给出**成本归因排查路径**：先看哪、再看哪、要解释什么差异。
+
+**考察点**
+
+- 是否能用归因数据切片定位
+- 是否能区分"用量 vs 单价"
+- 是否能给业务侧建议
+
+**回答框架**
+
+- 第 1 步：拉成本明细 dashboard 按维度切片：team / 模型 / 资源类型（GPU / storage / 网络）
+- 第 2 步：和上月对比，找环比增长 top 3 项
+- 第 3 步：如果是 GPU-hour 增长 → 哪个 team / 哪个 model / 哪类 Job 涨了
+- 第 4 步：如果是 token 增长 → 哪个业务 input/output token 涨了
+- 第 5 步：如果是 storage 增长 → 哪些 dataset / checkpoint 没清理
+- 常见根因：研究员训练失败但忘清理 / 推理 prompt 变长 / 评测频率改了 / 新加了 LoRA
+- 治理：通知 owner 处理 / 设 quota 报警 / 月度账单透明给 team
+- 业务建议：可能是用量增长合理 → 帮业务做 ROI 分析
+
+**追问**
+
+- 突然有人发现 "训练失败的 Job checkpoint 留在 S3 没删" 占了 1PB，怎么治理？
+- "环比 +30% 但其实是上月低估" 怎么避免？
+
+**评分要点**
+
+- **及格**：能讲分维度切片
+- **良好**：能列常见根因
+- **优秀**：能讨论治理 + 透明 + 误判预防
+
+---
+
+### 26.8.8 设计：跨地域多 region 部署 LLM 服务
+
+**问题**
+
+业务要在中国 / 美国 / 欧洲三地都提供 LLM 服务，要求数据本地化（中国数据不出境）+ 模型一致性 + 故障跨 region 切换。请设计**多 region 架构**。
+
+**考察点**
+
+- 是否懂数据合规对架构的硬约束
+- 是否能讲模型分发 + 一致性
+- 是否能讲跨 region 故障切换
+
+**回答框架**
+
+- 数据：每 region 独立数据中心 + 独立 storage；中国数据完全不出境（中国 region 自己用中国 base model 或 license）
+- 模型：模型 registry 跨 region replication；版本号同步；中国 region 单独审批 + 部署窗口
+- 路由：DNS / GSLB 按用户地域路由；用户 IP → 就近 region
+- 一致性：发布同步策略（all-region simultaneous vs leader-follower）
+- 故障切换：region A 挂 → 流量 spillover 到 B（中国除外，数据不能跨）
+- 控制面：多 region multi-master vs 单 region master + read replica
+- 监控：每 region 独立 + 全局 dashboard；alerts 按 region 分发
+- 合规：中国数据保护法 / GDPR / CCPA 各自执行；定期合规审计
+
+**追问**
+
+- 中国 region 模型版本和 US region 不一致是常态，怎么管？
+- 用户从中国出差到美国，他的 conversation history 怎么办？
+
+**评分要点**
+
+- **及格**：能讲数据隔离 + 路由
+- **良好**：能讨论故障切换 + 控制面
+- **优秀**：能讨论用户跨境 + 合规审计 + 一致性策略
+
+---
+
+## 模拟面试套餐
+
+下面 5 套是按典型岗位画像设计的整场面试题单。每场约 45-90 分钟，含 warm-up / deep-dive / 设计或排查 case / 强信号点。直接拿来当 onsite 题面即可，也可以候选人模式自练。
+
+### 套餐 1：推理平台工程师（60 分钟）
+
+**Warm-up（10 min）**
+- 26.5.1（prefill / decode 区分）
+- 26.5.2（KV cache 估算）
+
+**Deep-dive（30 min）**
+- 26.5.5（prefix cache 命中失效）
+- 26.5.7（推理引擎选型）
+- 26.5.12（SLO 设计）
+
+**Case / Design（20 min）**
+- 26.8.1（70B + 1000 QPS 平台设计）
+
+**强信号听点**
+- 能不能在不查文档的情况下算 KV cache 显存
+- 能不能根据业务约束反推选型而不是看 benchmark
+- 设计时能不能主动讨论扩容路径和监控指标
+
+---
+
+### 套餐 2：训练基础设施工程师（60 分钟）
+
+**Warm-up（10 min）**
+- 26.3.1（step 抖排查）
+- 26.3.2（ZeRO 1/2/3 + FSDP 区别）
+
+**Deep-dive（30 min）**
+- 26.3.4（PP bubble 公式）
+- 26.3.5（NCCL 调优）
+- 26.3.8（checkpoint + 容错）
+
+**Case / Design（20 min）**
+- 26.8.4（1500 卡训练 hang 排查）
+
+**强信号听点**
+- 看到 NCCL 日志能否快速分类故障
+- 能不能给 checkpoint 频率定量推导
+- 排查时能不能在限定时间内做出可执行决策
+
+---
+
+### 套餐 3：AI 平台工程师（60 分钟）
+
+**Warm-up（10 min）**
+- 26.1.3（系统分层）
+- 26.6.4（K8s 多租户隔离）
+
+**Deep-dive（30 min）**
+- 26.6.2（拓扑感知调度）
+- 26.6.7（autoscaling）
+- 26.6.11（用户友好抽象）
+
+**Case / Design（20 min）**
+- 26.8.2（研究院 1000 人 / 2000 GPU 平台）
+
+**强信号听点**
+- 能不能讲清"灵活 vs 治理" trade-off
+- 设计 CRD 时能不能想到 escape hatch
+- 能不能讨论"如何把坑做成默认值"
+
+---
+
+### 套餐 4：可靠性 / 故障排查专项（45 分钟）
+
+**Warm-up（5 min）**
+- 26.1.7（10 分钟告警排查思路）
+
+**Case 1（15 min）**
+- 26.8.5（凌晨 OOM）
+
+**Case 2（15 min）**
+- 26.8.6（prefix cache hit 突降）
+
+**Case 3（10 min）**
+- 26.8.7（成本环比 +30%）
+
+**强信号听点**
+- 排查时能不能区分"止血动作"vs"根因定位"
+- 能不能从监控数据切片定位
+- 能不能讲清楚"防止再发" 的工程化措施
+
+---
+
+### 套餐 5：AI Infra Tech Lead 综合系统设计（90 分钟）
+
+**Warm-up（10 min）**
+- 26.1.1（AI Infra 面试在考什么）
+- 26.1.4（训练 / 推理 / Agent 三类负载）
+
+**Deep-dive（30 min，从下面任选 3）**
+- 26.4.5（供应链投毒防御）
+- 26.5.13（量化推理决策）
+- 26.7.5（多租户隔离）
+- 26.7.8（SLO + error budget）
+
+**Case 1：业务侧设计（25 min）**
+- 26.8.3（128K context Agent 平台）
+
+**Case 2：故障 / 治理（15 min，从下面任选 1）**
+- 26.8.7（成本治理）
+- 26.7.9（配额超卖应急降级）
+
+**讨论收尾（10 min）**
+- 26.1.9（描述项目时如何对齐 AI Infra 视角）
+
+**强信号听点**
+- 设计时能不能从约束反推架构而不是堆组件
+- 能不能在 trade-off 取舍时给出"为什么这么选"
+- 排错时能不能从应急 → 根因 → 长期治理三层展开
+- 能不能讨论自己最遗憾的取舍 / 教训
+
