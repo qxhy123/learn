@@ -161,3 +161,8 @@
 - 看是否缺少配额与自动回收
 - 看是否把离线任务错误地放到高价在线集群
 - 是否记录 owner、phase、evidence、threshold、action 和 retest 字段，便于后续复盘和审计
+
+## 端到端案例使用方式
+
+- 需要把训练、制品、vLLM serving、autoscaling 和 incident 串成同一条证据链时，先读 [附录E：端到端主线案例](./end-to-end-case.md)。
+- 执行其中任一阶段前，回到本附录选择对应检查清单，并补齐 owner、phase、evidence、threshold、action 和 retest 字段。

@@ -68,6 +68,16 @@
 
 后续改稿必须先更新 Markdown 源稿，再由构建流程生成 HTML；发布前应通过链接检查脚本验证 Markdown 内部链接，以 Markdown 文件是否存在为准。若 HTML 构建或链接检查脚本尚未纳入仓库，当前 HTML 仍只视为发布产物，不应手工当源稿修改。
 
+## 质量门禁
+
+提交前建议在本地运行以下检查，确保公开源稿链接、生成 HTML 链接和 Markdown 基础质量都符合约定：
+
+```bash
+python3 scripts/check_local_links.py
+python3 scripts/check_local_links.py --html-only
+python3 scripts/check_markdown_quality.py
+```
+
 ---
 
 ## 章节导航目录
@@ -189,10 +199,12 @@
 
 | 附录 | 标题 | 内容说明 |
 |------|------|----------|
-| 附录A | [术语表](./appendix/glossary.md) | GPU、KV Cache、RDMA、Checkpoint 等核心术语 |
+| 附录A | [术语表](./appendix/glossary.md) | GPU、KV Cache、RDMA、Checkpoint 等核心术语；现在也可作为首次解释/深入章节索引 |
 | 附录B | [工具图谱](./appendix/tooling-map.md) | 常见 AI Infra 组件与典型职责 |
 | 附录C | [上线与排障检查清单](./appendix/checklists.md) | 训练、推理、RAG、成本治理的常用检查项 |
 | 附录D | [练习题详细参考解答](./appendix/answers.md) | 各章练习题的完整思路、结果与架构示意 |
+| 附录E | [端到端主线案例](./appendix/end-to-end-case.md) | LLaMA-7B/70B 从数据、训练、制品、服务到事故复盘的工程路线图 |
+| 附录F | [版本矩阵](./appendix/version-matrix.md) | 本文假设版本、核对日期、必须复测项与易漂移默认值 |
 
 ---
 
@@ -229,6 +241,16 @@
 ---
 
 ## 学习路径建议
+
+### 30 分钟快速读法
+
+如果你只是想先判断这套教程是否适合自己，可以按下面顺序快速扫读：
+
+1. 读 [前言](./00-preface.md) 和 [第 1 章](./part1-foundations/01-what-is-ai-infra.md)，确认本教程讨论的是资源、链路、平台和治理，而不只是部署模型。
+2. 读 [第 2 章](./part1-foundations/02-compute-storage-network.md) 的资源拆解和排障决策树，建立“算力 / 内存 / 网络 / 存储 / 调度”五类瓶颈入口。
+3. 如果关心训练，跳读 [第 7 章](./part3-training-infra/07-single-node-training.md)、[第 8 章](./part3-training-infra/08-data-parallel.md)、[第 10 章](./part3-training-infra/10-memory-checkpointing-and-recovery.md) 的小结和 worked example。
+4. 如果关心推理，跳读 [第 14 章](./part5-serving-infra/14-online-inference-architecture.md)、[第 15 章](./part5-serving-infra/15-batching-scheduling-and-kv-cache.md)、[第 16 章](./part5-serving-infra/16-quantization-compilation-and-engines.md) 的架构图、容量公式和排障表。
+5. 最后读 [第 21 章](./part7-reliability-security/21-observability-and-capacity.md) 和 [第 24 章](./part8-advanced-and-capstone/24-build-an-ai-platform.md)，确认你能把指标、容量、发布和事故处理放回同一张平台图。
 
 ### 路径一：工程师快速入门（2-3 周）
 

@@ -5,6 +5,7 @@
 > **目标读者:** 已经读过 [第 15 章](15-batching-scheduling-and-kv-cache.md) 和 [16a 主章](16a-vllm-internals.md),想"动手把这些机制串一遍"的人。本章不替代主章的概念解释,它是**带读者一步步加 feature 的实战手册**。
 >
 > **不期待:** 性能与真实 vLLM 对标(我们用纯 PyTorch reference attention,慢得多)。mini-vLLM 是 correctness-first reference，用来对齐语义，不代表真实 vLLM 的性能路径。期待的是看清每个机制如何在最小可运行代码里成立。
+> 默认 backend 是 correctness-first reference；Triton 只作为 opt-in 实验路径，需要显式设置 `MINI_VLLM_BACKEND=triton`，不能用默认路径的耗时推导真实 vLLM 性能。
 
 ---
 
@@ -57,6 +58,20 @@ mini_vllm/
 | §9 | 从 mini 到真实 vLLM | — | — |
 
 每节末尾 2-3 个练习,鼓励改代码自己验证。
+
+## 实验路线索引
+
+完整命令和观察点见 `code/mini-vllm/README.md` 的“实验路线”。这里给正文阅读索引,避免同一批命令在教程章里重复展开。
+
+| 实验 | 快速入口 | 正文章节 | 观察点 | 真实 vLLM 省略项 |
+|---|---|---|---|---|
+| PagedAttention / block table | `pytest tests/test_block_manager.py tests/test_attention.py -v` | §2-§3 | logical token 通过 block table 间接寻址到物理 KV block。 | 生产 CUDA paged-attention kernel、在线 softmax、真实 KV layout。 |
+| continuous batching | `pytest tests/test_scheduler.py tests/test_e2e.py::test_e2e_continuous_batching_vs_baseline_same_output -v` | §5 | decode 中途 admission 不改变 greedy 输出语义。 | async EngineCore、优先级调度、多 worker admission。 |
+| chunked prefill | `pytest tests/test_attention.py::test_prefill_chunked_matches_unchunked tests/test_e2e.py::test_e2e_chunked_prefill_matches_unchunked -v` | §6 | chunked 与 unchunked 输出一致,mask 覆盖 cached prefix + new chunk。 | 优化 ragged prefill kernel、prefill/decode overlap、生产 token budget。 |
+| prefix cache | `pytest tests/test_prefix_cache.py -v` | §7 | 重复完整 block 共享、ref count/CoW 防止共享写坏。 | V1 hash/eviction 策略、cache-aware scheduling、跨租户隔离。 |
+| swap / preemption | `pytest tests/test_swap.py -v` | §8 | CPU swap 往返不改变输出,共享 prefix block 不作为 victim。 | recompute preemption、异步 DMA、swap prefetch/pipeline。 |
+| streaming | `pytest tests/test_e2e.py::test_e2e_streaming_yields_same_tokens_as_generate -v` | §9 / 结尾 | `generate_stream()` token-by-token 输出与 `generate()` 对齐。 | OpenAI HTTP/SSE server、取消、背压、metrics。 |
+| HF smoke/parity | `pytest -m slow tests/test_llama_parity.py tests/test_llama_e2e.py -v` | §4 | TinyLlama loader、RoPE、fused QKV/gate-up 的 smoke/parity。 | 完整模型 zoo、TP/PP/EP、量化、LoRA、speculative decoding。 |
 
 ---
 

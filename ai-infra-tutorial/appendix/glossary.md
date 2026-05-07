@@ -4,6 +4,37 @@
 
 ---
 
+## 核心术语索引表
+
+| 术语 | 简要解释 | 首次解释 | 深入章节 |
+|------|----------|----------|----------|
+| GPU | 高吞吐并行计算加速器，是训练、推理和向量检索的核心算力资源 | [第2章](../part1-foundations/02-compute-storage-network.md) | [第4章](../part2-systems-stack/04-gpu-and-accelerators.md) |
+| HBM | GPU 上的高带宽显存，决定权重、激活、KV Cache 和 batch 能否放下 | [第4章](../part2-systems-stack/04-gpu-and-accelerators.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| NVLink/NVSwitch | GPU 间高带宽互联与交换结构，用于节点内或机柜级 GPU fabric | [第4章](../part2-systems-stack/04-gpu-and-accelerators.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| PCIe | CPU、GPU、NIC、NVMe 之间的通用 IO 总线，带宽和拓扑影响数据路径 | [第2章](../part1-foundations/02-compute-storage-network.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| NUMA | 多 socket / 多内存控制器下的非均匀内存访问结构 | [第0b章](../part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| Pinned Memory | 固定在物理内存中、可被 DMA/RDMA/GPU copy 路径直接访问的锁页内存 | [第0b章](../part0-foundations-of-systems/0b-memory-virtual-memory-and-io.md) | [第11d章](../part4-data-and-storage/11d-streaming-and-dataloader-engineering.md) |
+| RDMA/RoCE/InfiniBand | 绕过内核拷贝的远端内存访问能力及其以太网、IB 承载方式 | [第0d章](../part0-foundations-of-systems/0d-network-stack-fundamentals.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| GPUDirect RDMA | 网卡直接读写 GPU 显存的数据路径，减少 host staging | [第0d章](../part0-foundations-of-systems/0d-network-stack-fundamentals.md) | [第5章](../part2-systems-stack/05-memory-interconnect-io.md) |
+| NCCL | NVIDIA GPU 集合通信库，承载 AllReduce、broadcast 等训练通信 | [第0d章](../part0-foundations-of-systems/0d-network-stack-fundamentals.md) | [第8章](../part3-training-infra/08-data-parallel.md) |
+| DDP/FSDP/ZeRO | 从数据并行到参数、梯度、优化器状态分片的训练并行与显存优化技术 | [第8章](../part3-training-infra/08-data-parallel.md) | [第10章](../part3-training-infra/10-memory-checkpointing-and-recovery.md) |
+| TP/PP/EP/MoE | 张量并行、流水线并行、专家并行与稀疏专家模型的组合扩展方式 | [第9章](../part3-training-infra/09-model-pipeline-parallel.md) | [第9e章](../part3-training-infra/09e-moe-training-infrastructure.md) |
+| Checkpoint | 训练或服务状态的可恢复快照，常包含参数、优化器状态、step 和元数据 | [第0c章](../part0-foundations-of-systems/0c-filesystems-and-storage-internals.md) | [第10章](../part3-training-infra/10-memory-checkpointing-and-recovery.md) |
+| Model Registry | 管理模型版本、元数据、评测结果、发布状态和回滚目标的制品注册系统 | [第12章](../part4-data-and-storage/12-artifacts-and-checkpoints.md) | [第12a章](../part4-data-and-storage/12a-model-registry.md) |
+| KV Cache | LLM decode 阶段缓存历史 key/value，避免重复计算历史 token | [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | [第16a章](../part5-serving-infra/16a-vllm-internals.md) |
+| PagedAttention | 将 KV Cache 按块管理，降低显存碎片和预分配浪费 | [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | [第16a章](../part5-serving-infra/16a-vllm-internals.md) |
+| Prefix Cache | 复用相同 prompt 前缀的 KV Cache，减少重复 prefill 计算 | [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | [第16a章](../part5-serving-infra/16a-vllm-internals.md) |
+| Speculative Decoding | 用小模型生成草稿、大模型验证接受，从而提升 decode 吞吐 | [第15章](../part5-serving-infra/15-batching-scheduling-and-kv-cache.md) | [第16章](../part5-serving-infra/16-quantization-compilation-and-engines.md) |
+| Quantization | 用低精度表示权重、激活或 KV Cache，降低显存、带宽和成本 | [第10章](../part3-training-infra/10-memory-checkpointing-and-recovery.md) | [第16章](../part5-serving-infra/16-quantization-compilation-and-engines.md) |
+| vLLM/SGLang/TRT-LLM | 常见 LLM 推理引擎，分别强调 serving 调度、结构化生成与 TensorRT 优化路径 | [第16章](../part5-serving-infra/16-quantization-compilation-and-engines.md) | [第16a章](../part5-serving-infra/16a-vllm-internals.md) / [第16b章](../part5-serving-infra/16b-sglang-internals.md) / [第16c章](../part5-serving-infra/16c-trt-llm-internals.md) |
+| Kueue/Volcano | Kubernetes 上面向批任务、队列、配额和 gang scheduling 的调度组件 | [第19章](../part6-platform-and-orchestration/19-kubernetes-for-ai.md) | [第20章](../part6-platform-and-orchestration/20-queues-quotas-and-autoscaling.md) |
+| MIG/MPS | NVIDIA GPU 硬件分片与多进程共享机制，用于提高多租户利用率 | [第4章](../part2-systems-stack/04-gpu-and-accelerators.md) | [第20章](../part6-platform-and-orchestration/20-queues-quotas-and-autoscaling.md) |
+| SLO/Error Budget | 用服务目标和可消耗错误额度约束发布、告警、降级与冻结策略 | [第21章](../part7-reliability-security/21-observability-and-capacity.md) | [第22章](../part7-reliability-security/22-evaluation-release-and-incident.md) |
+| ReleaseUnit | 一次可审计发布的最小单元，绑定模型、镜像、引擎、路由、索引和回滚目标 | [第12c章](../part4-data-and-storage/12c-release-governance.md) | [第22章](../part7-reliability-security/22-evaluation-release-and-incident.md) |
+| SBOM/SLSA/Cosign | 供应链清单、可信构建分级和签名验证工具链 | [第12d章](../part4-data-and-storage/12d-supply-chain-and-signing.md) | [第23章](../part7-reliability-security/23-security-isolation-and-governance.md) |
+
+---
+
 ## A. 硬件与 GPU 体系
 
 | 术语 | 简要解释 |
