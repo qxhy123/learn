@@ -212,6 +212,11 @@ python3 scripts/audit_version_drift.py
 | 附录H | [事故驱动学习路径](./appendix/incident-driven-learning.md) | 从 GPU 利用率低、NCCL timeout、TTFT、KV OOM、RAG 和发布质量事故反查章节 |
 | 附录I | [AI Infra 面试与自测评分 Rubric](./appendix/interview-rubric.md) | 识别资源、画链路、给证据、定方案、说 rollback 的通用评分模板 |
 | 附录J | [Mermaid 图表资产](./appendix/diagrams.md) | 训练 step、推理 prefill/decode、KV Cache、NCCL topology 和平台控制面/数据面的可复用图表 |
+| 附录K | [端到端可运行实验](./appendix/end-to-end-lab.md) | 从数据加载瓶颈到训练 profiling、DDP、checkpoint、vLLM serving、量化、发布回滚和可观测性的生产式 lab spine |
+| 附录L | [AI Infra 成本模型](./appendix/cost-model.md) | 训练、推理与平台成本的公式、示例、反模式和决策检查清单 |
+| 附录M | [事故复盘案例库](./appendix/incident-casebook.md) | 12 个 AI Infra 值班事故案例，按症状、证据链、定位、修复、复测和预防复盘 |
+| 附录N | [AI Infra 职级能力路线图](./appendix/seniority-roadmap.md) | Junior、Mid、Senior、Staff 的能力、阅读章节、实战证据和常见差距 |
+| 附录O | [指标字典与归因地图](./appendix/metrics-dictionary.md) | 训练、推理、平台、数据/RAG 指标的定义、反证、下一跳检查与章节映射 |
 
 ---
 

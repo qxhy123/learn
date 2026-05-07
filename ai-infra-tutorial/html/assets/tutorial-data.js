@@ -578,9 +578,34 @@ const TUTORIAL = [
         "path": "appendix/answers.html"
       },
       {
+        "id": "end-to-end-case",
+        "title": "附录 E · 端到端主线案例",
+        "path": "appendix/end-to-end-case.html"
+      },
+      {
+        "id": "version-matrix",
+        "title": "附录 G · 版本矩阵",
+        "path": "appendix/version-matrix.html"
+      },
+      {
         "id": "learning-map",
         "title": "附录 F · 全书知识地图",
         "path": "appendix/learning-map.html"
+      },
+      {
+        "id": "incident-driven-learning",
+        "title": "附录 H · 事故驱动学习路径",
+        "path": "appendix/incident-driven-learning.html"
+      },
+      {
+        "id": "interview-rubric",
+        "title": "附录 I · AI Infra 面试与自测评分 Rubric",
+        "path": "appendix/interview-rubric.html"
+      },
+      {
+        "id": "diagrams",
+        "title": "附录 J · Mermaid 图表资产",
+        "path": "appendix/diagrams.html"
       }
     ]
   }

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>附录 J · Mermaid 图表资产 — AI Infra 教程</title>
+<link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body class="has-sidebar">
+<iframe id="sidebar" src="../sidebar.html?current=diagrams" class="sidebar-frame" loading="eager"></iframe>
+<main class="page">
+<nav class="topnav"></nav>
+
+<section class="hero">
+<h1>附录 J · Mermaid 图表资产</h1>
+<p class="sub">收集正文中可复用的 Mermaid 图表草稿，用于解释链路、瓶颈和责任边界。图表不替代指标、命令和事故证据。</p>
+<div class="chips"><span class="chip">训练 critical path</span><span class="chip">Prefill / Decode</span><span class="chip">KV block table</span><span class="chip">NCCL topology</span><span class="chip">控制面 / 数据面</span></div>
+</section>
+
+<section class="toc">
+<h2>图表目录</h2>
+<ol>
+<li><a class="anchor" href="#training-step">训练 step critical path</a></li>
+<li><a class="anchor" href="#prefill-decode">推理 prefill/decode</a></li>
+<li><a class="anchor" href="#kv-cache">KV cache block table</a></li>
+<li><a class="anchor" href="#nccl">NCCL topology / transport</a></li>
+<li><a class="anchor" href="#plane">平台控制面 / 数据面</a></li>
+</ol>
+</section>
+
+<section class="section" id="training-step">
+<h2>1. 训练 step critical path</h2>
+<p>用途：把一次训练 step 拆成数据、计算、通信、优化器和 checkpoint 等可观测阶段，定位 GPU idle、NCCL tail 或 IO 抖动来自哪里。</p>
+<div class="mermaid">
+flowchart LR
+  A[DataLoader read/decode] --&gt; B[Host collate and pin]
+  B --&gt; C[H2D copy]
+  C --&gt; D[Forward kernels]
+  D --&gt; E[Backward kernels]
+  E --&gt; F[Gradient buckets ready]
+  F --&gt; G[NCCL ReduceScatter or AllReduce]
+  G --&gt; H[Optimizer step]
+  H --&gt; I[Checkpoint or metrics async work]
+  I --&gt; A
+  D -. overlap window .-&gt; G
+  E -. overlap window .-&gt; G
+</div>
+<p>读图要点：先看关键路径上哪一段暴露在 step wall time 中，再看虚线 overlap 是否真的发生。NCCL kernel 长不一定等于网络慢，可能是某个 rank 晚进入 collective。</p>
+</section>
+
+<section class="section" id="prefill-decode">
+<h2>2. 推理 prefill/decode</h2>
+<p>用途：说明在线推理里 TTFT、TPOT/ITL 和吞吐分别受 prefill、decode、调度和 KV Cache 影响，避免只用单次 forward latency 解释线上体验。</p>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant R as Router
+  participant Q as Scheduler Queue
+  participant E as Engine
+  participant K as KV Cache
+  C-&gt;&gt;R: request(prompt, max_tokens)
+  R-&gt;&gt;Q: route by model/tenant/cache affinity
+  Q-&gt;&gt;E: prefill batch
+  E-&gt;&gt;K: allocate/write prompt KV blocks
+  E--&gt;&gt;C: first token
+  loop decode steps
+    Q-&gt;&gt;E: continuous batch next token
+    E-&gt;&gt;K: read previous KV, append new KV
+    E--&gt;&gt;C: streamed token
+  end
+</div>
+<p>读图要点：prefill 通常决定 TTFT，decode 循环决定 TPOT/ITL 和 tokens/s。路由如果打散 prefix cache 或让长 prompt 堆在同一队列，会同时影响首 token 和后续吞吐。</p>
+</section>
+
+<section class="section" id="kv-cache">
+<h2>3. KV cache block table</h2>
+<p>用途：展示 PagedAttention 类实现如何用 block table 把逻辑 token 序列映射到物理 KV block，从而减少连续大块显存分配和碎片。</p>
+<div class="mermaid">
+flowchart LR
+  subgraph Logical[Logical sequences]
+    S1[seq A tokens 0..95]
+    S2[seq B tokens 0..47]
+    S3[seq C tokens 0..79]
+  end
+  subgraph Table[Block table]
+    T1[A: 7, 3, 12]
+    T2[B: 5, 9]
+    T3[C: 7, 3, 18]
+  end
+  subgraph Physical[Physical KV blocks]
+    B3[block 3]
+    B5[block 5]
+    B7[block 7 shared prefix]
+    B9[block 9]
+    B12[block 12]
+    B18[block 18]
+  end
+  S1 --&gt; T1
+  S2 --&gt; T2
+  S3 --&gt; T3
+  T1 --&gt; B7
+  T1 --&gt; B3
+  T1 --&gt; B12
+  T2 --&gt; B5
+  T2 --&gt; B9
+  T3 --&gt; B7
+  T3 --&gt; B3
+  T3 --&gt; B18
+</div>
+<p>读图要点：逻辑上连续的上下文不要求物理上连续。共享 prefix、释放尾部 block、eviction 和租户限额都应围绕 block table 和物理 block 池观察。</p>
+</section>
+
+<section class="section" id="nccl">
+<h2>4. NCCL topology / transport</h2>
+<p>用途：把 NCCL 的拓扑选择、节点内 P2P、跨节点 RDMA/socket transport 和 bootstrap/control path 放在一张图里，辅助排查 timeout、socket fallback 和 rail 绑定错误。</p>
+<div class="mermaid">
+flowchart TB
+  subgraph NodeA[Node A]
+    A0[GPU0 rank0]
+    A1[GPU1 rank1]
+    AN[NIC mlx5_0]
+    AC[CPU socket]
+    A0 &lt;-- NVLink/PCIe P2P --&gt; A1
+    A0 --&gt; AN
+    A1 --&gt; AN
+    AC -. bootstrap socket .- AN
+  end
+  subgraph Fabric[Cluster fabric]
+    SW[IB/RoCE switches]
+  end
+  subgraph NodeB[Node B]
+    B0[GPU0 rank8]
+    B1[GPU1 rank9]
+    BN[NIC mlx5_0]
+    BC[CPU socket]
+    B0 &lt;-- NVLink/PCIe P2P --&gt; B1
+    BN --&gt; B0
+    BN --&gt; B1
+    BN -. bootstrap socket .- BC
+  end
+  AN == NET/IB or GDRDMA ==&gt; SW
+  SW == NET/IB or GDRDMA ==&gt; BN
+  AN -. NET/Socket fallback .-&gt; BN
+</div>
+<p>读图要点：数据面 transport 和 bootstrap/control path 可能不同。看到 <code>NET/Socket</code> fallback 时，优先查 HCA 可见性、GID、容器权限、net plugin 和 GPU/NIC/NUMA 绑定。</p>
+</section>
+
+<section class="section" id="plane">
+<h2>5. 平台控制面 / 数据面</h2>
+<p>用途：区分“声明目标和做决策”的控制面与“搬运数据和执行 workload”的数据面，方便讨论平台边界、责任归属和事故复盘。</p>
+<div class="mermaid">
+flowchart TB
+  subgraph Control[Control plane]
+    API[Platform API]
+    Sched[Scheduler and quota]
+    Release[ReleaseUnit and policy]
+    Obs[Observability rules]
+  end
+  subgraph Data[Data plane]
+    Train[Training jobs]
+    Serve[Inference pods]
+    Store[Dataset/artifact storage]
+    Net[GPU/NIC/network fabric]
+  end
+  API --&gt; Sched
+  API --&gt; Release
+  Sched --&gt; Train
+  Sched --&gt; Serve
+  Release --&gt; Serve
+  Obs --&gt; API
+  Train --&gt; Store
+  Serve --&gt; Store
+  Train --&gt; Net
+  Serve --&gt; Net
+  Net --&gt; Obs
+  Store --&gt; Obs
+</div>
+<p>读图要点：控制面负责 spec、准入、调度、发布状态和策略；数据面负责真实训练、推理、存储和网络流量。事故分析要同时问“决策是否正确”和“执行路径是否符合预期”。</p>
+</section>
+
+<nav class="bottomnav"></nav>
+<footer class="footer">AI Infra 教程 · 静态 HTML 版本</footer>
+</main>
+<script src="../assets/tutorial-data.js"></script>
+<script src="../assets/mermaid.min.js"></script>
+<script src="../assets/nav.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</body>
+</html>
