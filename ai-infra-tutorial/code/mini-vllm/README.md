@@ -61,4 +61,4 @@ TinyLlama-1.1B (downloads ~2.2 GB on first run, slow on CPU):
 - [x] Plan 5: prefix caching + CoW + chunked prefill
 - [x] Plan 6: swap to CPU + LRU preemption
 - [x] Plan 7: streaming + full sampler (temperature/top-p/top-k) + bench
-- [ ] Plan 8: tutorial chapter `16a-lab-mini-vllm.md`
+- [x] Plan 8: tutorial chapter `part5-serving-infra/16a-lab-mini-vllm.md`
