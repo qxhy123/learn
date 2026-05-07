@@ -55,8 +55,10 @@ def _hash_block(prev_hash: Optional[int], token_ids: Tuple[int, ...]) -> int:
 
 class BlockManager:
     def __init__(self, num_blocks: int, block_size: int,
+                 num_cpu_blocks: int = 0,
                  enable_prefix_caching: bool = False):
         self.num_blocks = num_blocks
+        self.num_cpu_blocks = num_cpu_blocks
         self.block_size = block_size
         self.enable_prefix_caching = enable_prefix_caching
         self._free_block_ids: List[int] = list(range(num_blocks))
@@ -67,12 +69,19 @@ class BlockManager:
         # Evictable list: block_ids whose ref_count is 0 but are still cached
         # (kept alive for prefix sharing). FIFO-evicted when out of fresh blocks.
         self._evictable: List[int] = []
+        # CPU swap pool (Plan 6). Disjoint id namespace from GPU.
+        self._free_cpu_ids: List[int] = list(range(num_cpu_blocks))
+        self._cpu_blocks: Dict[int, PhysicalBlock] = {}
 
     # ---- query ----
     @property
     def num_free_blocks(self) -> int:
-        # Both fresh and evictable blocks are available for reuse.
+        # GPU side: fresh + evictable.
         return len(self._free_block_ids) + len(self._evictable)
+
+    @property
+    def num_free_cpu_blocks(self) -> int:
+        return len(self._free_cpu_ids)
 
     def can_allocate(self, seq: "Sequence") -> AllocStatus:
         # Worst-case need: full prompt with no prefix hit.
@@ -193,6 +202,77 @@ class BlockManager:
                     self._free_block_ids.append(pb.block_id)
                     del self._all_blocks[pb.block_id]
         seq.block_table = None
+
+    # ---- swap (Plan 6) ----
+
+    def can_swap_out(self, seq: "Sequence") -> bool:
+        """Eligible iff (1) all GPU blocks are private (ref_count==1), and
+        (2) the CPU pool has room for them. Shared blocks (e.g. cached prefix
+        blocks held by other seqs) are NOT swap-eligible — swapping them
+        would invalidate other sequences' state."""
+        if seq.block_table is None:
+            return False
+        gpu_blocks = [pb for pb in seq.block_table.physical_blocks if pb.device == 'gpu']
+        if any(pb.ref_count > 1 for pb in gpu_blocks):
+            return False
+        return self.num_free_cpu_blocks >= len(gpu_blocks)
+
+    def can_swap_in(self, seq: "Sequence") -> bool:
+        if seq.block_table is None:
+            return False
+        cpu_blocks = [pb for pb in seq.block_table.physical_blocks if pb.device == 'cpu']
+        return self.num_free_blocks >= len(cpu_blocks)
+
+    def swap_out(self, seq: "Sequence") -> Dict[int, int]:
+        """Move all of `seq`'s GPU blocks to the CPU pool. Returns
+        {gpu_block_id: cpu_block_id} so the caller (CacheEngine) can copy
+        the K/V tensor data."""
+        assert self.can_swap_out(seq), "swap_out called on ineligible seq"
+        mapping: Dict[int, int] = {}
+        new_blocks: List[PhysicalBlock] = []
+        for pb in seq.block_table.physical_blocks:
+            if pb.device != 'gpu':
+                new_blocks.append(pb)
+                continue
+            cpu_id = self._free_cpu_ids.pop()
+            cpu_pb = PhysicalBlock(block_id=cpu_id, ref_count=1, device='cpu')
+            self._cpu_blocks[cpu_id] = cpu_pb
+            mapping[pb.block_id] = cpu_id
+            # Release the GPU block. `pb` had ref_count==1 (asserted above).
+            self._release_gpu_block(pb)
+            new_blocks.append(cpu_pb)
+        seq.block_table.physical_blocks = new_blocks
+        return mapping
+
+    def swap_in(self, seq: "Sequence") -> Dict[int, int]:
+        """Move all of `seq`'s CPU blocks back to GPU. Returns
+        {cpu_block_id: gpu_block_id}."""
+        assert self.can_swap_in(seq), "swap_in called when no room"
+        mapping: Dict[int, int] = {}
+        new_blocks: List[PhysicalBlock] = []
+        for pb in seq.block_table.physical_blocks:
+            if pb.device != 'cpu':
+                new_blocks.append(pb)
+                continue
+            gpu_pb = self._take_free_block()
+            mapping[pb.block_id] = gpu_pb.block_id
+            # Release the CPU block.
+            del self._cpu_blocks[pb.block_id]
+            self._free_cpu_ids.append(pb.block_id)
+            new_blocks.append(gpu_pb)
+        seq.block_table.physical_blocks = new_blocks
+        return mapping
+
+    def _release_gpu_block(self, pb: PhysicalBlock) -> None:
+        """Release a GPU block whose ref_count is currently 1 (caller asserted)."""
+        # Remove from hash registry if present.
+        if pb.block_hash is not None and self._hash_to_block.get(pb.block_hash) is pb:
+            del self._hash_to_block[pb.block_hash]
+        # If somehow in evictable list, remove (shouldn't happen for ref_count==1).
+        if pb.block_id in self._evictable:
+            self._evictable.remove(pb.block_id)
+        del self._all_blocks[pb.block_id]
+        self._free_block_ids.append(pb.block_id)
 
     def get_slot_mapping(self, seq: "Sequence", start: int, end: int) -> List[int]:
         mapping: List[int] = []
