@@ -1529,3 +1529,486 @@ ZeRO-3 训练时，team 偶尔反馈"resume 后 loss 跳"。请列出**多卡训
 - **及格**：能给分层 + 软删
 - **良好**：能讨论 tag 驱动 + 审计
 - **优秀**：能讨论恢复演练 + 成本测算 + 跨 region replication 策略
+
+---
+
+## 26.5 推理服务、KV Cache、Batching 与推理引擎
+
+### 26.5.1 Prefill 与 decode 为什么要分开看
+
+**问题**
+
+请用一段话说清楚：**prefill 和 decode 在计算密集度、延迟约束、batch 友好度、KV 写入模式上的本质差异**，并解释为什么生产推理引擎都把它们分开调度。
+
+**考察点**
+
+- 是否懂 prefill 计算密集（compute-bound）/ decode memory bound
+- 是否能讲 batch 友好度差异
+- 是否能讲分开调度的工程必要性
+
+**回答框架**
+
+- Prefill：Q × K × V 全长 attention，compute-bound（GPU SM 跑满）；高吞吐但单步慢；batch 友好（多请求合并大 GEMM 利用率高）
+- Decode：Q 长度恒为 1，K/V 散落 cache，memory-bound（HBM 带宽决定）；低延迟但 GPU 利用率低；batch 友好但收益递减
+- KV 写入：prefill 一次写 N 个 slot；decode 每步只写 1 个 slot（导致 fragmentation 问题）
+- 调度差异：prefill 长 → 一旦插入 batch 会拖慢 decode；chunked prefill 切片混入；continuous batching 让 decode 持续转
+- 引擎设计：vLLM 的 prefill / decode 阶段在同一个 step 但 budget 分开；分离部署（prefill cluster + decode cluster）也是高级形态
+
+**追问**
+
+- 为什么 chunked prefill 能改善 decode TTFT？
+- "prefill / decode disaggregation" 真实生产场景有什么收益？
+
+**评分要点**
+
+- **及格**：能讲两阶段计算特性差异
+- **良好**：能讲 batch + KV + chunked prefill
+- **优秀**：能讨论 disaggregation + 各自调度 budget
+
+---
+
+### 26.5.2 KV Cache 大小如何估算 + 显存预算
+
+**问题**
+
+70B 模型，bf16，num_layers=80，num_kv_heads=8，head_dim=128。请算一个**单请求 max_seq_len=4096 时 KV Cache 占多少 GB**，并说明在 80 GB H100 上 8 卡 TP=8 部署时，KV cache 池能给多少个并发请求用。
+
+**考察点**
+
+- 能否正确算 KV cache 公式：2 × layers × kv_heads × head_dim × seq_len × dtype_bytes
+- 能否算 TP 切分后单卡 KV 量
+- 能否预估剩余显存给 KV pool
+
+**回答框架**
+
+- 单请求 KV：2(K+V) × 80 × 8 × 128 × 4096 × 2(bf16) = 1.34 GB / request
+- TP=8 切 num_kv_heads（如果 kv_heads ≥ 8）：单卡 KV = 1.34 / 8 = 168 MB / request
+- 模型权重 TP=8 切：70B × 2 / 8 = 17.5 GB / 卡
+- 单卡剩余给 KV：80 - 17.5 - 5（activation/buffer）≈ 57 GB
+- 并发请求数：57 / 0.168 ≈ 339 请求 × 4096 token KV
+- 实际：还要扣除 prefix cache 的常驻占用、安全 margin、最长请求的尾部
+- 推论：max_seq_len 越长每请求显存涨线性，并发数掉线性
+
+**追问**
+
+- num_kv_heads=8 但 TP=16 时怎么切？
+- FP8 KV cache 能让并发数翻倍吗？
+
+**评分要点**
+
+- **及格**：能算单请求 KV
+- **良好**：能算 TP 切分后并发数
+- **优秀**：能讨论 head 数与 TP 整除约束 + FP8 + 实际 margin
+
+---
+
+### 26.5.3 PagedAttention 的核心机制和工程价值
+
+**问题**
+
+PagedAttention 论文宣称能把 KV Cache 显存利用率从 ~20% 提到 ~96%。请用 OS 虚拟内存的类比解释**它的核心机制**，并说明为什么这个看似只是"换个数据结构"的改动能带来这么大收益。
+
+**考察点**
+
+- 是否懂 block-based KV cache 的核心思想
+- 是否能用 OS 类比讲清楚（block table = page table）
+- 是否能识别"碎片化是真痛点"
+
+**回答框架**
+
+- 核心：把 KV cache 切成固定大小 block（默认 16 token），每请求维护 block table 间接寻址
+- OS 类比：block = 物理页，block table = 页表，block_size = 页大小，prefix sharing = page sharing with COW
+- 为什么大幅提升：传统按 max_seq_len 静态分配 → 99% 请求只用 5-10% 实际长度 → 巨大碎片；PagedAttention 按需分配 block，无内部碎片
+- 二次价值：block 是共享单位，prefix cache hit 时直接复用 block；多请求相同 system prompt → 显存复用
+- 工程含义：BlockManager 类比内存分配器，attention kernel 改造支持 block_table 寻址
+
+**追问**
+
+- 为什么 block_size 默认 16 而不是 1 或 256？
+- vLLM 的 paged attention CUDA kernel 比标准 attention kernel 多了什么？
+
+**评分要点**
+
+- **及格**：能讲 block + table 寻址
+- **良好**：能用 OS 类比 + 解释碎片
+- **优秀**：能讨论 block_size 选型 + 内核改动
+
+---
+
+### 26.5.4 Continuous batching 的最大价值和工程坑
+
+**问题**
+
+vLLM / TGI / TRT-LLM 都有 continuous batching。请说明**它相对静态 batching 的最大收益**（不是"提升 throughput X%"这种笼统说法），以及生产里**最容易踩的几个坑**。
+
+**考察点**
+
+- 是否懂 continuous batching 真正解的是什么问题（短请求等长请求）
+- 是否能列出生产坑（admission policy、长尾 prompt、token budget 配错）
+- 是否能给出一个具体场景说明
+
+**回答框架**
+
+- 最大价值：长请求 + 短请求混合时，传统静态 batch 必须等最长那个跑完才能解 batch；continuous 每完成一个就接新的，GPU 利用率持续高位
+- 反例：所有请求长度一样时收益小
+- 生产坑：admission policy 不对（队尾大请求一直进不来 / 高 priority 请求排长队）；token budget 算错（max_num_batched_tokens 太小→吞吐低；太大→TTFT 抖）
+- 长尾 prompt：8K 长 prompt 一进 batch，prefill 阶段独占 budget，已 decode 中的请求 latency 跳；用 chunked prefill 解
+- 与 prefix cache 互动：continuous + prefix sharing 时新请求 admit 看的是"扣除 cached prefix 后的实际 token"
+
+**追问**
+
+- 在线 chat scenario，continuous batching 和 chunked prefill 必须一起开吗？
+- max_num_batched_tokens 怎么定？
+
+**评分要点**
+
+- **及格**：能讲核心价值
+- **良好**：能列 2-3 个生产坑
+- **优秀**：能讨论与 chunked prefill / prefix cache 的耦合 + budget 决策方法
+
+---
+
+### 26.5.5 Prefix Cache 的命中条件与失效场景
+
+**问题**
+
+Prefix cache 听起来很美：相同 system prompt 复用 KV。但生产里常见"按理说该命中却没命中"。请列出**最容易让 prefix cache 命中失败的 5 个场景**，以及如何在监控里发现。
+
+**考察点**
+
+- 是否懂 prefix cache 的命中条件（token id 完全一致 + tokenizer 一致 + LoRA id 一致）
+- 是否能识别"模板差一个空格 / 时间戳"导致每次失败
+- 是否懂 cache eviction 模式（容量满 / TTL）
+
+**回答框架**
+
+- 失效 1：模板里嵌了时间戳 / 用户 ID / 会话 ID → 每次 token 序列不同
+- 失效 2：tokenizer 升级或不同 tokenizer 共用一个 cache → ID 空间不一致
+- 失效 3：LoRA adapter 切换 → KV 计算路径不同（有些引擎按 (base, adapter) 二元组分别 cache）
+- 失效 4：cache 容量小或 LRU 频繁 evict
+- 失效 5：随机 sampling 时第 1 个 token 不同导致后续无法复用（这个是"无法复用"不是"失效"）
+- 监控：prefix_cache_hit_rate（按租户、按模板）；cache eviction rate；不同模板版本的命中率分布
+
+**追问**
+
+- 怎么帮业务方"重新设计 system prompt 让命中率从 30% 升到 80%"？
+- 多个 LoRA adapter 共享 prefix cache 在工程上可行吗？
+
+**评分要点**
+
+- **及格**：能列 3 个失效场景
+- **良好**：能讲 tokenizer / LoRA / 模板设计
+- **优秀**：能给出可执行的命中率提升方法 + multi-LoRA 工程性讨论
+
+---
+
+### 26.5.6 Chunked prefill 解决什么真实问题
+
+**问题**
+
+Chunked prefill 把长 prompt 拆成多个 chunk 与 decode 混合 batch。请说明：**它对 TTFT 和 inter-token latency 的真实影响**（不是"减少 latency"这种泛泛说），以及什么场景反而不应该开。
+
+**考察点**
+
+- 是否真的懂 chunked prefill 改善的是哪些请求的延迟
+- 是否能讲"长 prompt 自身 TTFT 可能变长"
+- 是否能识别不该开的场景
+
+**回答框架**
+
+- 改善：已 decode 中的请求 inter-token latency 不被新长 prompt 干扰（短请求体感稳）
+- 不改善：长 prompt 自己的 TTFT 反而可能略长（被切片 + 共享 budget）
+- 不该开：如果工作负载全是短 prompt（API 调用、短问答），开 chunked 反而引入额外 overhead
+- 与 prefix cache 协同：chunked prefill 第 N 块需要前 N-1 块的 KV → 必须在 cache 里 → 共用同一个 kernel 路径
+- 工程：vLLM `enable_chunked_prefill=True`，`chunked_prefill_size` 默认 512 但要根据负载调
+- 监控：先看长尾请求 TTFT 分布是否改善 + 短请求 ITL 抖动是否降
+
+**追问**
+
+- chunked prefill_size 太大有什么影响？太小呢？
+- 如果一个长 prompt 一直在被 chunk 但又来了更多新请求，会被"插队"卡住吗？
+
+**评分要点**
+
+- **及格**：能讲 ITL 改善 + TTFT trade-off
+- **良好**：能讨论 size 调优 + 短请求场景
+- **优秀**：能讨论与 prefix cache kernel 共用 + 长 prompt 插队风险
+
+---
+
+### 26.5.7 推理引擎选型：vLLM / TGI / TRT-LLM / SGLang 怎么挑
+
+**问题**
+
+业务要 deploy Llama-3-70B chat 推理服务，要求 p99 < 1s 单 turn、支持 multi-LoRA、有量化、长 context（32K）。请给一份**引擎选型建议**：vLLM / TGI / TRT-LLM / SGLang 各自适合什么、不适合什么、最坑的差异在哪。
+
+**考察点**
+
+- 对四个主流引擎的真实差异有判断
+- 能从 LoRA / 量化 / context / 部署形态匹配业务需求
+- 能讲生产工程坑（兼容性 / 模型支持 / 调试难度）
+
+**回答框架**
+
+- vLLM：开源活跃、模型支持广、PagedAttention + prefix cache 强、multi-LoRA 用 Punica；新引擎 V1 重构
+- TGI：HuggingFace 系，model loading 方便，运营简单，性能稍弱；continuous batching + medusa
+- TRT-LLM：NVIDIA 优化最深，吞吐和延迟最佳；但 model 支持滞后、build 慢、调试难
+- SGLang：RadixAttention + structured output 强，prefix cache 设计精妙；模型支持还在追赶
+- 建议（70B + multi-LoRA + 32K context）：vLLM 是稳妥首选；如果延迟极致可考虑 TRT-LLM 但接受工程负担
+- 选型坑：模型支持名单（最新模型可能没 day-1 支持）；量化兼容（AWQ/GPTQ/FP8 各引擎进度不同）；K8s 集成（liveness、graceful drain）
+
+**追问**
+
+- 切换引擎时，prefix cache 命中率会重新预热多久？
+- TRT-LLM 的 build 流程为什么慢？
+
+**评分要点**
+
+- **及格**：能区分四引擎主要特点
+- **良好**：能根据业务需求给出建议
+- **优秀**：能讨论选型坑 + 切换成本
+
+---
+
+### 26.5.8 Speculative decoding 真实收益与 acceptance rate
+
+**问题**
+
+Speculative decoding（draft / Medusa / EAGLE）在 paper 里宣传 2-3× 加速。请说明：**真实生产里的收益期望、关键变量（acceptance rate）、何时不值得开**。
+
+**考察点**
+
+- 是否懂 spec decode 数学模型（acceptance rate × N draft tokens 决定收益）
+- 是否懂 draft 模型 / 多头 / EAGLE 的差异
+- 是否能识别"高并发场景反而亏"
+
+**回答框架**
+
+- 数学：每 verify step 期望接受 N_acc 个 token，平摊每 token 时间 = T_target/(1+N_acc)；acceptance 50% 时 N=4 期望提速 2x
+- Draft 路径：独立 draft 模型 / 多头（Medusa）/ tree-based（EAGLE）；draft 模型选型决定 acceptance
+- 生产收益：低并发场景（GPU 空闲）显著加速；高并发场景 batch 已经填满 GPU，spec 反而把单步变长 → 总吞吐下降
+- 不值得开：高吞吐 batch、acceptance < 30%、draft 模型本身重（draft cost > 节省）
+- 工程：vLLM / TRT-LLM 都支持，但 acceptance 监控必须做
+
+**追问**
+
+- "draft 用 base model 量化版"和"独立小 draft"哪个更好？
+- 多 LoRA 服务时 spec decode 怎么处理？
+
+**评分要点**
+
+- **及格**：能讲 acceptance rate 决定收益
+- **良好**：能讲不值得开的场景
+- **优秀**：能讨论 draft 选型 + multi-LoRA + 监控
+
+---
+
+### 26.5.9 长 context（128K+）推理的真实瓶颈
+
+**问题**
+
+新需求：支持 128K context 推理。请说明从 4K 到 128K，**计算 / 显存 / KV cache / 数据访问模式 / 用户感知**各自如何变化，以及生产怎么扛。
+
+**考察点**
+
+- 是否懂 attention 复杂度 O(n²) 在长 context 上的爆炸
+- 是否懂 KV cache 显存压力急剧上升
+- 是否懂长 context 实际是"prefill 慢 + KV 显存大 + 命中率低"复合问题
+
+**回答框架**
+
+- 计算：attention O(n²) → 4K→128K 计算量 1024× ；FlashAttention 仍要扫全部，但 IO 改善 → 实测 prefill 时间 50-100×
+- 显存：KV cache 线性增长，128K 单请求 KV 比 4K 大 32×（比例随 layer/head/dtype）
+- KV cache：长 context 下 prefix cache 命中率往往低（用户内容差异大）
+- 数据访问：prefill 时一次性巨大 attention，对 HBM 带宽要求极高
+- 用户感知：TTFT 从 100ms 到 5-10 秒（长 prompt 的硬伤）
+- 生产策略：FP8 KV cache 减半显存；分层 KV（最近 N token full precision，远端量化）；chunked prefill 必开；硬件升级到 H100/H200/B200
+- 算法：sliding window / Mamba-like alternative / context distillation
+
+**追问**
+
+- 用户给的 128K context 里只有最后 4K 是真问题，怎么优化？
+- 长 context 和 multi-LoRA 同时存在，哪个先牺牲？
+
+**评分要点**
+
+- **及格**：能讲 O(n²) + 显存线性
+- **良好**：能讲 FlashAttention + FP8 KV
+- **优秀**：能讨论分层 KV + sliding window + 硬件路线 + 业务级降级
+
+---
+
+### 26.5.10 Streaming token / SSE / WebSocket 的工程取舍
+
+**问题**
+
+OpenAI API 风格的 streaming 输出，前端可以用 SSE 或 WebSocket。请说明**两者在 AI Infra 场景的取舍**，以及 streaming 在网关 / 引擎 / 前端 三层各自的关键设计点。
+
+**考察点**
+
+- 是否懂 SSE vs WebSocket 在生产的差异
+- 是否懂 streaming 对 gateway / engine / 前端的不同要求
+- 是否能讲 token-level 流式的 backpressure 与超时
+
+**回答框架**
+
+- SSE：HTTP/1.1 单向流，简单、易代理、CDN 友好；浏览器原生支持
+- WebSocket：双向、可发中断信号、支持二进制；但需要 LB 配合、proxy 兼容性差
+- 选择：纯 token 输出走 SSE 即可；需要客户端中断 / 上传中流式数据用 WebSocket
+- Gateway：必须支持 chunked transfer / 不缓冲；HTTP/2 long-lived；超时配置（keep-alive）
+- Engine：generate_stream 接口；token 产生后立刻 push（不等到一行）
+- 前端：背压控制（前端慢时不要堆 buffer）；超时和中断处理（用户关闭 tab）
+- 中断：客户端断开 → engine 应该快速停止 generate（释放 GPU）
+
+**追问**
+
+- HTTPs/2 vs HTTPs/3 对 streaming 有差异吗？
+- 用户中断后 engine 能在多少 ms 内真正停？
+
+**评分要点**
+
+- **及格**：能讲 SSE vs WebSocket 选择
+- **良好**：能讲三层设计要点
+- **优秀**：能讨论中断响应延迟 + backpressure + 协议演进
+
+---
+
+### 26.5.11 推理服务的 Auto-scaling 怎么设计
+
+**问题**
+
+在线推理服务 QPS 早 8 点 100 高峰、深夜 5。GPU 资源贵。请设计**autoscaling 策略**：基于什么指标、扩缩容速度、怎么避免冷启动 latency 高、怎么处理 prefix cache 在扩缩容时的失效。
+
+**考察点**
+
+- 是否懂 GPU 推理服务的 autoscaling 不能像无状态服务那样简单
+- 是否懂 prefix cache 是"状态"，扩缩容会重置
+- 是否能讲冷启动模型加载 / cache 预热
+
+**回答框架**
+
+- 指标：QPS 不够（GPU 利用率不直接反映负载），用 token throughput / queue depth / p99 latency 综合
+- 扩容：detect → schedule → pull image → load model（10s-1min）→ warm cache → serve；冷启动可达分钟级
+- 缩容：先 drain 流量 + 等 in-flight 请求结束（graceful），不要直接 SIGKILL
+- 预热：pre-warm replica（启动后跑一段 dummy 请求），prefix cache 必要时 replicate
+- 反尖刺：max scale-up rate（每分钟最多 +N 副本）；最低保留副本数防雪崩
+- 反过敏：scale-down 滞后（连续 5 min 低负载才缩）
+
+**追问**
+
+- 模型加载 30 秒能否提前？（hot standby 池？lazy load？）
+- prefix cache 在副本间能否共享？
+
+**评分要点**
+
+- **及格**：能讲基本扩缩容策略
+- **良好**：能讲冷启动 + drain
+- **优秀**：能讨论 prefix cache 跨副本 + hot standby + max rate 防尖刺
+
+---
+
+### 26.5.12 推理 SLO 设计：TTFT / TPOT / E2E latency 怎么定
+
+**问题**
+
+业务说"我要 p99 latency < 1s"。请说明**这句话在 LLM 推理上为什么是有歧义的**，并给出你建议的 SLO 拆分（TTFT / TPOT / E2E）以及监控方式。
+
+**考察点**
+
+- 是否懂 LLM 推理 latency 不是单一数字
+- 是否能区分 TTFT / TPOT / E2E
+- 是否能讲不同业务场景对哪个 SLO 敏感
+
+**回答框架**
+
+- TTFT（Time To First Token）：用户感知"开始响应"的时间
+- TPOT（Time Per Output Token）/ ITL（Inter-Token Latency）：稳态吐字速度
+- E2E latency：完整请求总耗时，依赖 output token 数（无法单独 SLO）
+- 业务映射：chat 关心 TTFT + TPOT；批量摘要关心 E2E；长 reasoning 关心 TPOT 的稳定性
+- "p99 < 1s"歧义：1s TTFT？1s 总？1s 100 token？需要拆
+- SLO 草案：p99 TTFT < 500ms + p99 TPOT < 50ms（即 20 tok/s）+ p99 E2E < (TTFT + N×TPOT)
+- 监控：分位数监控 + 按租户 / 按 prompt length 分桶，避免长尾被平均
+
+**追问**
+
+- 上游网关也增加 latency，谁来 own"端到端 p99"？
+- streaming 场景"用户已经开始读"和"全部读完"哪个 SLO 重要？
+
+**评分要点**
+
+- **及格**：能讲 TTFT + TPOT
+- **良好**：能讨论业务映射 + 歧义
+- **优秀**：能讨论分桶监控 + 上下游 SLO 责任划分
+
+---
+
+### 26.5.13 量化推理（FP8 / INT8 / INT4 / AWQ / GPTQ）取舍
+
+**问题**
+
+70B 模型 fp16 单卡放不下、TP=2 又太贵。同事建议量化。请说明 **FP8 / INT8 / INT4、PTQ vs QAT、AWQ vs GPTQ** 的工程差异，以及生产里你会怎么选。
+
+**考察点**
+
+- 是否能区分量化级别 / 算法
+- 是否懂量化的精度 - 速度 - 显存权衡
+- 是否懂 KV cache 量化与 weight 量化的不同
+
+**回答框架**
+
+- 级别：FP16(2B) → FP8(1B) → INT8(1B) → INT4(0.5B) → INT2/3 实验性
+- PTQ（post-training quantization）：训练后量化，无需重训，最常用；AWQ / GPTQ 都是 PTQ
+- QAT（quantization-aware training）：训练时模拟量化，精度好但要重训，不常用
+- AWQ（activation-aware）：基于 activation 分布选 salient channel 保留高精度，对 LLM 友好
+- GPTQ：逐层最优量化（OBS 算法），精度好但 build 慢
+- KV cache 量化：FP8 KV 在 H100 原生支持；INT8 KV 需要专用 kernel
+- 选择：H100 + 70B → FP8 weight + FP8 KV cache 是甜点；A100 → AWQ INT4 weight + INT8 KV
+- 测：必须在业务评测集上跑量化模型与 FP16 对比，丢点 < 1% 才上线
+
+**追问**
+
+- 为什么 H100 的 FP8 比 A100 的 INT8 性能好？
+- AWQ 量化模型能再 fine-tune 吗？
+
+**评分要点**
+
+- **及格**：能讲 PTQ vs QAT + 量化级别
+- **良好**：能讲 AWQ vs GPTQ + KV 量化
+- **优秀**：能讨论硬件 + 业务测试 + fine-tune 影响
+
+---
+
+### 26.5.14 推理服务故障排查："吞吐忽高忽低"
+
+**问题**
+
+线上 vLLM 服务 QPS 平均 50，但偶尔掉到 10 又恢复，30 分钟一次。监控只看到 GPU-Util 平均 80%。请给出**你的排查路径**。
+
+**考察点**
+
+- 是否能用结构化方法排查推理性能波动
+- 是否能想到 prefix cache eviction / 长 prompt prefill / GC pause / 上游 burst
+- 是否会查 engine 内部 metrics
+
+**回答框架**
+
+- 第一步：确认是"QPS 实际下降"还是"QPS 显示数据问题"（看上游网关 outbound）
+- 第二步：vLLM metrics（prometheus）
+  - `running_seqs` / `waiting_seqs`：waiting 突增 = 上游 burst
+  - `swapped_seqs`：突增 = 显存压力
+  - `prefix_cache_hit_rate`：突降 = 模板换了或 cache evict
+  - `prefill_tokens` vs `decode_tokens`：长 prompt 涌入会让 prefill 占满
+- 第三步：节点层（GPU 降频 / 邻居 Job / 网络抖）
+- 第四步：客户端（prompt 长度分布 / 用户请求 burst）
+- 30 min 周期性：考虑定时任务（健康检查 / 监控采集 / batch job）
+
+**追问**
+
+- prefix cache hit rate 从 90% 掉到 30%，最可能什么原因？
+- swapped_seqs > 0 说明什么？
+
+**评分要点**
+
+- **及格**：能讲分层排查
+- **良好**：能查 vLLM 内部 metrics
+- **优秀**：能讨论周期性 root cause + cache 失效具体原因
