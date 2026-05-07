@@ -541,6 +541,11 @@ const TUTORIAL = [
         "id": "25",
         "title": "第 25 章 · AI Agent 与推理时计算基础设施",
         "path": "part8/25-agent-and-inference-time-compute.html"
+      },
+      {
+        "id": "26",
+        "title": "第 26 章 · AI Infra 面试题、自测与面试官题库",
+        "path": "part8/26-ai-infra-interview-questions.html"
       }
     ]
   },
