@@ -179,6 +179,7 @@
 | 第24章 | [构建一个 AI 平台](./part8-advanced-and-capstone/24-build-an-ai-platform.md) | 训练、评测、制品、部署、推理、观测的端到端蓝图与平台边界推导 | 形成系统设计能力 |
 | 第25章 | [AI Agent 与推理时计算基础设施](./part8-advanced-and-capstone/25-agent-and-inference-time-compute.md) | Agent 状态管理、thinking tokens 四模式、推理预算工程与推理服务集成 | 新范式下的推理系统设计 |
 | 第26章 | [AI Infra 面试题、自测与面试官题库](./part8-advanced-and-capstone/26-ai-infra-interview-questions.md) | 90 道面试题 + 5 套模拟面试组合，覆盖资源、链路、故障、治理四维度 | 面试表达与综合系统判断 |
+| 第27章 | [AI Infra 面试题、自测与面试官题库](./part8-advanced-and-capstone/27-ai-infra-interview-questions.md) | 90 道面试题 + 5 套模拟面试组合，覆盖资源、链路、故障、治理四维度 | 面试表达与综合系统判断 |
 
 ### 附录
 
