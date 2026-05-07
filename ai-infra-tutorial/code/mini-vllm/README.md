@@ -52,10 +52,27 @@ TinyLlama-1.1B (downloads ~2.2 GB on first run, slow on CPU):
     pytest tests/ -v               # fast suite (skips slow downloads)
     pytest -m slow tests/ -v       # parity tests against HF transformers (downloads weights)
 
+## Plan 2 caveat (Triton backend)
+
+`mini_vllm/backends/triton_backend.py` contains three Triton kernels
+(reshape_and_cache, paged decode, ragged prefill) implementing the same
+`AttentionBackend` interface as the Torch reference. **The kernels were
+written without a CUDA + Triton machine to test on**: math is mirrored
+from `backends/reference.py`, but expect 1-2 small fixes (typical: stride
+bug, mask off-by-one, fp16 numerics) on first real-GPU run. The validation
+contract is:
+
+    pytest tests/test_triton_backend.py -v   # gated; skips without CUDA + Triton
+
+Outputs must `allclose` the Torch reference at `atol=1e-2, rtol=1e-2`
+(fp16). The `make_backend(device)` factory in `mini_vllm/backends/__init__.py`
+auto-selects Triton on CUDA when available and falls back to Torch
+otherwise.
+
 ## Roadmap
 
 - [x] Plan 1: skeleton — Torch backend, naive scheduler, toy GPT
-- [ ] Plan 2: Triton paged-attention kernel (deferred — needs GPU machine)
+- [⚠️] Plan 2: Triton paged-attention kernel (code written but not runtime-verified — see caveat below)
 - [x] Plan 3: TinyLlama-1.1B + HF safetensors loader
 - [x] Plan 4: continuous batching (chunked prefill rolled into Plan 5 — shared kernel)
 - [x] Plan 5: prefix caching + CoW + chunked prefill
