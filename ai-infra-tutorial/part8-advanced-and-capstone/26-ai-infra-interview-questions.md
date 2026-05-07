@@ -2429,3 +2429,428 @@ K8s 标准 HPA 基于 CPU / memory 触发扩缩容。请说明**在 AI 推理场
 - **及格**：能列 3 个坑
 - **良好**：能给老手防御方案
 - **优秀**：能讨论"如何把坑产品化为默认值"
+
+---
+
+## 26.7 可观测性、发布、安全、成本与多租户治理
+
+### 26.7.1 AI 平台的"四个金信号"是什么
+
+**问题**
+
+Google SRE 提的 four golden signals（latency / traffic / errors / saturation）是给通用服务的。请说明 **AI 推理服务的"四金信号"应该是什么**，以及与传统服务有何不同。
+
+**考察点**
+
+- 能否把 AI 推理特有的指标抽象出来
+- 能否区分"业务可见信号"和"系统健康信号"
+- 能否讲分位数 / 分桶的重要性
+
+**回答框架**
+
+- TTFT / TPOT 分布（latency 不是单一数字）
+- Throughput（tokens/s 而非 QPS，因为请求长短差异大）
+- Errors（HTTP errors + content errors，模型输出无效 / safety filter 触发也是 error）
+- Saturation（GPU memory util / KV cache util / queue depth；CPU/mem 不是关键）
+- 与传统不同：
+  - latency 必须分 TTFT+TPOT
+  - traffic 必须按 token 而非 request
+  - errors 必须含语义层
+  - saturation 在 GPU 维度
+- 还应有：cost/token、prefix cache hit rate、抢占/swap rate
+
+**追问**
+
+- 用 P50 还是 P99？
+- 如何采样 trace 才能既覆盖长尾又不爆 storage？
+
+**评分要点**
+
+- **及格**：能给 AI 版四金信号
+- **良好**：能讲与传统差异
+- **优秀**：能讨论 trace sampling + 语义错误
+
+---
+
+### 26.7.2 训练任务的可观测：metric / log / trace 各管什么
+
+**问题**
+
+研究员提交的 70B 训练 Job 报"loss 不收敛"。请说明你的平台应该提供哪些**可观测能力**让研究员自己定位（不是次次找 oncall），覆盖 metric / log / trace / profile 四类。
+
+**考察点**
+
+- 是否懂训练任务可观测的差异（vs 推理）
+- 是否能讲 step-level metric / loss / gradient 暴露
+- 是否懂 profile（torch profiler / Nsight）的接入方式
+
+**回答框架**
+
+- Metric：每 N step 上报 loss / gradient norm / learning rate / step_time / GPU util / NCCL time / data_load_time
+- Log：每个 rank 的 stdout/stderr 集中收集（loki / fluent-bit）；按 Job 检索；rank 0 不够，要 all-rank
+- Trace：训练过程的事件（start, checkpoint, NaN, OOM, restart），时间线可看
+- Profile：torch.profiler 的输出文件存到对象存储 + UI（TensorBoard / Perfetto）；用户能 self-serve
+- 平台职责：把这四类标准化、零配置接入；研究员自己写代码不该额外集成监控
+- "loss 不收敛"自助路径：先看 loss 曲线 / gradient norm → 数据 / 模型 / LR / numerical → trace 找 NaN / step
+
+**追问**
+
+- 上千张卡训练，每 rank 都收 metric 太多怎么办？
+- 一个静态训练几小时后 hang，你期望平台能自动捕获什么？
+
+**评分要点**
+
+- **及格**：能讲 metric / log / trace
+- **良好**：能讲 profile + 自助
+- **优秀**：能讨论 metric 聚合 + hang 自动诊断
+
+---
+
+### 26.7.3 推理服务的发布：金丝雀 / 蓝绿 / 影子流量
+
+**问题**
+
+新版本模型要上线，可能有 regression。请说明 **金丝雀 / 蓝绿 / 影子流量** 三种发布模式在 AI 推理上的工程差异，以及为什么 AI 模型发布比一般服务更难做"自动判定"。
+
+**考察点**
+
+- 是否懂发布模式的语义
+- 是否懂模型发布的特殊性（输出无标准答案）
+- 是否能讲"质量门禁"如何自动化
+
+**回答框架**
+
+- 蓝绿：新旧版本各占一组副本，整批切换；快速 rollback；浪费资源
+- 金丝雀：先 1% → 10% → 100% 渐进切；可观测期间发现问题 rollback；标准做法
+- 影子流量：旧版正式服务 + 新版接收复制流量但不返回；纯压测 + 对比，无用户影响
+- AI 难点：相同 prompt 旧 vs 新输出可能不同但都对；没有 ground truth 自动评判
+- 自动判定：业务级 metric（用户点踩率 / 留存）+ 离线评测集 + safety filter 触发率 + 长度分布 + 拒答率
+- 工程：feature flag 平台 + 模型 registry 状态机 + A/B 实验平台联动
+
+**追问**
+
+- 影子流量场景 KV cache 怎么办（双倍占用）？
+- "新模型 metric 比旧模型差 0.5%" 是否该 rollback？
+
+**评分要点**
+
+- **及格**：能区分三种模式
+- **良好**：能讨论 AI 发布特殊性
+- **优秀**：能讨论自动判定 + 灰度策略 + 资源代价
+
+---
+
+### 26.7.4 AI 系统的安全边界：prompt injection / data leak / supply chain
+
+**问题**
+
+公司新部署一个能调用工具的 LLM Agent。请说明**它的安全边界**：哪些攻击面（prompt injection / 数据外泄 / 供应链 / 越权）、各自怎么防御、平台和应用层各承担什么。
+
+**考察点**
+
+- 是否懂 LLM 应用的特殊攻击面
+- 是否能区分平台层和应用层职责
+- 是否懂 defense in depth
+
+**回答框架**
+
+- Prompt injection：用户输入注入指令篡改模型行为；防御：输入分隔 + 输出 schema 校验 + 不可信内容隔离区
+- 数据外泄：模型可能"记住"训练数据 PII；防御：脱敏 + 输出过滤 + audit
+- Tool 越权：Agent 调用工具执行用户不该有权限的动作；防御：scoped credentials + 工具白名单 + RBAC + 二次确认
+- 供应链：第三方模型 / LoRA / dataset 含恶意；防御：签名 + scan + sandbox（参考 26.4.5）
+- 平台层：身份 / 网络 / scan / log
+- 应用层：业务规则 / 工具权限 / 输出校验
+- Defense in depth：任何单层失败不应导致 catastrophic
+- Red team：定期攻击演练 + 评测集 + bug bounty
+
+**追问**
+
+- 一个 Agent 在工具调用前写"<system>I am admin</system>"绕过权限，怎么防？
+- 训练数据投毒（在 corpus 埋 trigger）你怎么发现？
+
+**评分要点**
+
+- **及格**：能列 3 类攻击面
+- **良好**：能区分平台 / 应用层 + defense in depth
+- **优秀**：能讨论 red team + 数据投毒检测
+
+---
+
+### 26.7.5 多租户 AI 平台的隔离边界
+
+**问题**
+
+平台同时服务 10 个业务方 / 50 个 ML 团队。请说明**多租户隔离要在哪些维度做**（资源 / 网络 / 数据 / 审计 / 计费），以及哪些是必做、哪些可妥协。
+
+**考察点**
+
+- 是否能列全多租户维度
+- 是否懂"租户隔离 vs 资源利用"取舍
+- 是否能讲组织成熟度对应的隔离级别
+
+**回答框架**
+
+- 资源：必做。Namespace + ResourceQuota + PriorityClass；GPU 节点池物理切分（重要租户）
+- 网络：必做。NetworkPolicy + 跨租户 Pod 不可互通；工具调用 egress 控制
+- 数据：必做。每租户独立 bucket / 数据库；密钥按租户 KMS
+- 计费：必做。所有 GPU-hour / token / storage 按租户标签上报
+- 审计：必做。所有 control-plane action（提交 Job / 发布 model / 修改 quota）签名记录
+- 模型隔离：核心模型 per-tenant 独立部署 vs 共享 base + LoRA per-tenant；后者更高效但需要多 LoRA 引擎
+- 可妥协：早期阶段 prefix cache 跨租户共享（节省显存但有泄漏风险）→ 增长后切回独立
+
+**追问**
+
+- 数据合规要求"数据不出 region"，跨 region 平台怎么办？
+- 一个租户突发流量挤占其他租户，如何快速处置？
+
+**评分要点**
+
+- **及格**：能列 5 个维度
+- **良好**：能讨论必做 / 可妥协
+- **优秀**：能讨论组织成熟度 + 跨 region + 突发流量 emergency
+
+---
+
+### 26.7.6 成本归因：GPU-hour / token / storage 都怎么记
+
+**问题**
+
+CFO 要 monthly cost report，按业务 / 租户 / 项目摊分。请设计**成本归因系统**：捕获哪些计量点、归因到什么粒度、怎么处理共享资源（base model / prefix cache / 平台基础设施）。
+
+**考察点**
+
+- 是否懂 AI 平台的多种计量维度
+- 是否懂共享资源的摊分难题
+- 是否能讲业务可解释性
+
+**回答框架**
+
+- 计量点：训练 GPU-hour（按 Pod 实际占用）；推理 input/output tokens（按 request 累加）；storage GB-month；网络出口；评测 GPU-hour
+- 归因：每个 Pod / 每个 request 都带 owner label（team / project / cost center）；自动汇总
+- 共享资源：base model storage 按使用租户数平均分；prefix cache 显存按 hit 比例分（细，复杂）；平台 control-plane 按总用量比例分
+- 报表：按 owner 维度月度成本 + token / GPU-hour 占比
+- 业务可解释：每个 owner 能下钻到具体 Job / request；成本异常报警
+- 工具：基于 Prometheus + 数据仓库 + BI
+
+**追问**
+
+- 一个 Job 失败 5 次重试，用户愿意承担成本吗？
+- prefix cache 共享让某团队"白嫖"另一团队，怎么处理？
+
+**评分要点**
+
+- **及格**：能列计量点 + 标签
+- **良好**：能讨论共享资源摊分
+- **优秀**：能讨论失败重试 + 跨团队公平 + 异常报警
+
+---
+
+### 26.7.7 模型发布的回滚机制
+
+**问题**
+
+新模型上线后 30 分钟，发现 safety filter 触发率从 0.5% 涨到 5%，可能是新模型对边界 case 处理变差。请说明**完整 rollback 流程**：从决策到流量切回 / 显存回收 / 通知 / 复盘。
+
+**考察点**
+
+- 是否懂 rollback 不只是"切流量"
+- 是否懂 stateful 服务 rollback 的复杂度
+- 是否能讲事后复盘机制
+
+**回答框架**
+
+- 决策：oncall 用 dashboard + 自动告警 + runbook 决定 rollback；优先级"业务影响 > 工程完美"
+- 切流量：feature flag 切到旧版本副本（蓝绿则秒级，金丝雀则按比例反向）
+- 显存：新版本副本不立刻删（保留 5-10 min 防再 rollback），观察期过后再 scale down
+- 通知：业务方 / 同 oncall / 用户（status page）；事故等级标记
+- 数据：保留新版本期间的 trace / log（30 min）便于复盘
+- 复盘：5-Why；模型出现问题是数据 / 训练 / 评测 / 发布哪一环漏了
+- 修复后：评测集补充该 case → 不让相同问题再发
+- 自动化：把 safety filter 触发率作为发布门禁的硬指标
+
+**追问**
+
+- "新版本性能 +20% 但 safety 略差" 该 rollback 吗？
+- 数据库 schema 跟着模型变了，rollback 怎么办？
+
+**评分要点**
+
+- **及格**：能讲切流量 + 通知
+- **良好**：能讨论 stateful + 复盘
+- **优秀**：能讨论性能 / safety 取舍 + schema migration
+
+---
+
+### 26.7.8 SLO / Error budget 在 AI 推理的应用
+
+**问题**
+
+平台给业务方承诺 SLA 99.9% availability + p99 latency < 1s。请说明 **error budget** 在 AI 推理上怎么定义、怎么消耗、用什么决策（要不要 rollback / 要不要冻结发布）。
+
+**考察点**
+
+- 是否懂 SLO / SLI / error budget 的概念
+- 是否能把它应用到 AI 推理特殊性
+- 是否能讲"用 budget 推动决策"
+
+**回答框架**
+
+- SLI：可用率 + latency（TTFT / TPOT）+ 内容质量（safety filter / refuse rate）
+- SLO：99.9% availability + p99 TTFT < 500ms + safety < 1%
+- Error budget：每月 0.1% 不可用 = 43 min 容忍；超过则发布冻结
+- 消耗：每次告警 / 故障 / 失败请求扣减
+- 决策：budget 充裕 → 可激进发布；budget 不足 → 冻结风险大的变更
+- 工程：实时 budget dashboard + 自动冻结 / 解冻
+- AI 特殊：SLI 不只是 HTTP success，还包括"safety/quality"维度，需要独立预算
+
+**追问**
+
+- 一个新模型把 latency 改善 20% 但 quality 下降，如何用 budget 决定上线？
+- error budget 消耗速度突增，怎么 alert？
+
+**评分要点**
+
+- **及格**：能讲 SLO / budget
+- **良好**：能讨论 AI 特殊 SLI
+- **优秀**：能讨论自动化决策 + 多维 budget
+
+---
+
+### 26.7.9 配额超卖与紧急降级
+
+**问题**
+
+平台总 GPU 1000，分配给 5 个业务方 quota 总和 1200（超卖 20%）。某天峰值真的来了 1100 GPU 需求。请说明**紧急降级策略**：怎么决定谁让步、怎么执行、怎么通知。
+
+**考察点**
+
+- 是否懂超卖的工程逻辑（峰均比 < 1）
+- 是否能讲紧急降级的优先级 / 自动化
+- 是否能讲业务沟通
+
+**回答框架**
+
+- 超卖前提：业务峰值不重叠 + 历史峰均比 < 1
+- 紧急降级触发：监控发现 utilization > 95% + 仍有 pending Jobs
+- 优先级：在线推理 > 生产训练 > 探索 > spot；low-priority 立刻被 preempted
+- 执行：自动 preempt 低优 Pod（提前 5 min 通知 + checkpoint friendly）
+- 通知：业务 owner 自动消息（slack / 邮件） + 状态页
+- 业务沟通：事先签 SLA 写明"紧急时被 preempt"；事后 review 看是否需要扩容 / 调 quota
+- 防再发：监控 quota usage 趋势，提前预警
+- 极端：业务大 owner 临时申请扩容，平台留紧急 buffer 池
+
+**追问**
+
+- 业务方说"我从来没被 preempt 过，所以 SLA 没写明"——怎么办？
+- 超卖比例怎么定才安全？
+
+**评分要点**
+
+- **及格**：能讲优先级 + preempt
+- **良好**：能讨论自动化 + 通知
+- **优秀**：能讨论事先 SLA + buffer 池 + 比例决策
+
+---
+
+### 26.7.10 Trace / Log 的存储成本与采样
+
+**问题**
+
+每天 1 亿次推理请求，全量 trace 存 30 天 = PB 级。请设计**采样策略**：哪些必采、哪些采样、怎么平衡可观测能力与存储成本。
+
+**考察点**
+
+- 是否懂 trace 采样常见策略
+- 是否能识别"长尾 / 错误"场景必须采全
+- 是否懂 log 压缩 / 归档
+
+**回答框架**
+
+- 全量必采：errors / latency > p99 / safety filter 触发 / 用户反馈 thumbs-down → 100%
+- 采样：正常请求 1% 随机；按租户分层（VIP 10%，普通 1%）
+- 进阶：head-based sampling（trace 入口决定）+ tail-based sampling（结束后看延迟决定）
+- Log：原始日志只保 7 天 hot；30 天 warm（gzip 压缩）；3-12 month cold（Glacier）
+- Metric：分钟级保 30 天；小时级保 1 年；天级保多年
+- 工程：OpenTelemetry collector 做采样；ELK / ClickHouse 存 log；Prometheus + Thanos 存 metric
+- 节省：按 token 计采样而非按 request；同一 user 多次请求同 trace ID
+
+**追问**
+
+- 1% 采样下，怎么定位"某用户某时刻问题"？
+- tail-based sampling 实现的瓶颈是什么？
+
+**评分要点**
+
+- **及格**：能讲 head sampling
+- **良好**：能讨论 tail sampling + 必采集
+- **优秀**：能讨论存储分层 + OTel collector + 工程瓶颈
+
+---
+
+### 26.7.11 灾难恢复（DR）：训练 / 推理 / 数据 各自策略
+
+**问题**
+
+主 region 的整个 AZ 失效，你的平台要在多久内恢复？请分别给出**训练 / 推理 / 数据存储**的 DR 策略和 RTO / RPO 目标。
+
+**考察点**
+
+- 是否懂 DR 概念（RTO / RPO）
+- 是否能针对三种工作负载分别给方案
+- 是否懂跨 region 复制的成本
+
+**回答框架**
+
+- 推理：跨 region 多活（active-active）；DNS / GSLB 故障切换；RTO 5min RPO 0
+- 训练：单 region 主跑 + 跨 region checkpoint 备份；故障时另 region 重启 from latest checkpoint；RTO 1h RPO 30min（看 checkpoint 频率）
+- 数据：S3 cross-region replication（自动）；模型 registry 多 region 同步；RTO 实时 RPO 几分钟
+- 控制面：K8s control plane 跨 AZ HA；prometheus / grafana 高可用
+- 演练：每季度 DR 演练（关一个 AZ）；发现问题修复
+- 成本：active-active 推理双倍；training cross-region replication 网络费
+
+**追问**
+
+- 推理跨 region 多活时，prefix cache 怎么处理？
+- 一个 70B checkpoint 跨 region 同步要多久？
+
+**评分要点**
+
+- **及格**：能给三类 RTO/RPO
+- **良好**：能讨论 multi-active + replication
+- **优秀**：能讨论演练 + cache 多 region + 成本
+
+---
+
+### 26.7.12 安全合规审计：哪些动作必须有审计日志
+
+**问题**
+
+合规审计要求"所有重要动作可追溯"。请列出 AI 平台**必须有审计日志的动作类别**，以及审计日志本身应该如何防篡改。
+
+**考察点**
+
+- 是否能列全审计对象（控制面 / 数据面 / 模型 / 数据）
+- 是否懂审计日志防篡改（append-only / WORM / signing）
+- 是否懂合规对应（SOC2 / ISO27001 / GDPR）
+
+**回答框架**
+
+- 控制面：用户登录 / 提交 Job / 发布 model / 修改 quota / RBAC 变更 / 删除资源
+- 数据面：训练数据 / 用户输入 / 模型输出（按合规要求）
+- 模型：上传 / 下载 / 部署 / 撤回 / 量化
+- Secret：访问 / 修改 / 创建 token
+- 防篡改：append-only log（不能改写）；WORM 存储（S3 Object Lock）；定期签名 hash chain
+- 谁能查：分级 RBAC，敏感日志只有合规审计员能查
+- 合规对应：SOC2 要求审计 + retention；GDPR 要求"删除我"操作可证明
+- 工程：所有动作通过统一 control-plane 网关，自动写审计
+
+**追问**
+
+- 一个工程师为了调试线上 bug 临时给自己提了 admin 权限，审计应该 catch 到什么？
+- 审计日志保留多久合理？
+
+**评分要点**
+
+- **及格**：能列审计对象
+- **良好**：能讨论防篡改 + 分级
+- **优秀**：能讨论合规对应 + 临时权限 + retention
