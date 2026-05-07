@@ -2012,3 +2012,420 @@ OpenAI API 风格的 streaming 输出，前端可以用 SSE 或 WebSocket。请�
 - **及格**：能讲分层排查
 - **良好**：能查 vLLM 内部 metrics
 - **优秀**：能讨论周期性 root cause + cache 失效具体原因
+
+---
+
+## 26.6 Kubernetes、调度、队列、配额与平台化
+
+### 26.6.1 GPU 在 K8s 上的资源模型
+
+**问题**
+
+K8s 标准 resource 是 CPU + memory，GPU 怎么纳入？请说明 **NVIDIA device plugin / GPU operator / MIG / time-slicing** 各自做什么、什么场景用，以及"一个 Pod 占 1 块 GPU"和"两个 Pod 共享一块 GPU"在工程上要解决哪些问题。
+
+**考察点**
+
+- 是否懂 K8s extended resource 概念
+- 是否懂 device plugin 的工作机制
+- 是否懂 GPU 共享的几种方式（time-slicing / MPS / MIG）
+
+**回答框架**
+
+- Device plugin：把"GPU"注册成 extended resource（如 `nvidia.com/gpu: 1`），Pod request 时 kube-scheduler 按节点容量调度
+- GPU operator：自动部署 driver + container toolkit + device plugin + DCGM exporter 等组件
+- MIG（Multi-Instance GPU）：A100/H100 硬件级切片（最多 7 份），强隔离，每片当独立 GPU 用
+- Time-slicing：纯软件复用（device plugin 把 1 块 GPU 当 N 块上报），无隔离，互相影响
+- MPS（Multi-Process Service）：进程间共享 SM，效率比 time-slicing 高，但需协作
+- 共享要解决：显存隔离（time-slicing 没有 → 一个 Pod 写爆 OOM 全挂）、计算配额、优先级、failure 分离
+- 推荐：开发 / 推理低负载用 MIG；推理高负载独占；time-slicing 仅限测试
+
+**追问**
+
+- A100 MIG 切到 1g.10gb 时还能跑 70B 吗？
+- 一个 GPU operator 升级失败导致所有 GPU 节点掉线，怎么避免？
+
+**评分要点**
+
+- **及格**：能讲 device plugin + 共享 4 种方式
+- **良好**：能讨论隔离差异
+- **优秀**：能讨论 operator 升级风险 + 业务场景匹配
+
+---
+
+### 26.6.2 GPU 调度的 Topology-aware 与 Bin-packing
+
+**问题**
+
+集群有 100 个节点，每节点 8 张 H100。一个新 Job 要 32 卡 + NVLink 内全互联。请说明 **K8s 默认调度器为什么不够**，以及如何通过 topology-aware / gang scheduling / bin-packing 满足需求。
+
+**考察点**
+
+- 是否懂 K8s 默认调度器对 GPU 拓扑无感
+- 是否懂 gang + topology + bin-pack 的协同
+- 是否会用 Volcano / Kueue / scheduler plugin 实现
+
+**回答框架**
+
+- 默认 kube-scheduler：按节点资源容量调度，不知道 GPU 之间 NVLink/IB 拓扑
+- 拓扑感知：需要 node label（topology zone / island）+ Pod affinity + 自定义 scheduler plugin
+- Gang scheduling：32 卡要么全调度到 4 个相邻节点，要么 0 个；Volcano 的 PodGroup
+- Bin-packing：避免把 32 卡 Job 分散到 100 节点 → 用 NodeSelector + 优先选填得最满的节点
+- 实践：Volcano / Kueue + 自定义 scheduler-plugins / Topology-aware scheduling
+- 验证：训练 Job 启动后跑 NCCL test 看 ring/tree 算法选择是否最优
+
+**追问**
+
+- 一个 Job 已经 gang scheduled 但开始训练后发现一张卡降频，怎么处理？
+- 训练 Job 比推理 Job 优先吗？为什么不一定？
+
+**评分要点**
+
+- **及格**：能讲 gang + topology
+- **良好**：能讨论 bin-pack + scheduler plugin
+- **优秀**：能讨论运行时拓扑验证 + 优先级动态调整
+
+---
+
+### 26.6.3 K8s 上 stateful 推理服务怎么 deploy
+
+**问题**
+
+vLLM 推理服务有"状态"（KV cache、prefix cache）。请说明在 K8s 上 deploy 它**为什么不能简单用 Deployment + Service**，并给出推荐的 Workload 类型 + 流量管理方式。
+
+**考察点**
+
+- 是否懂 stateless vs stateful 工作负载在 K8s 上的差异
+- 是否懂 readiness / liveness / startup probe 配置
+- 是否懂 graceful shutdown 对推理服务的关键性
+
+**回答框架**
+
+- Deployment + Service 的问题：滚动更新会粗暴删 Pod，KV cache 立刻丢；新 Pod 冷启动慢
+- 推荐：StatefulSet 或 Deployment + 控制好 surge / unavailable + PreStop hook 实现 graceful drain
+- 探针：startup probe（模型加载阶段不杀）；readiness（drain 时摘流）；liveness（hang 时 kill）
+- Graceful drain：PreStop hook → 摘流 → 等 in-flight 请求结束 → 退出
+- 流量：Service + 多副本负载均衡；session affinity（按 user / conversation）能让 prefix cache 命中更稳
+- 高级：KServe / Knative serverless 推理，但 GPU 冷启动让 serverless 不那么直接
+
+**追问**
+
+- session affinity 和负载均衡如何平衡？
+- 模型加载 60 秒，K8s 怎么避免 startup probe 失败？
+
+**评分要点**
+
+- **及格**：能讲三种探针 + drain
+- **良好**：能讨论 session affinity + cache
+- **优秀**：能讨论 KServe / serverless 在 GPU 上的局限性
+
+---
+
+### 26.6.4 K8s 配额与多租户隔离
+
+**问题**
+
+公司 4 个业务团队共享一个 GPU 集群。请说明用 **Namespace + ResourceQuota + LimitRange + NetworkPolicy + PriorityClass** 怎么组合实现"配额 + 优先级 + 软隔离 + 硬隔离"。
+
+**考察点**
+
+- 是否能用 K8s 原生机制做多租户
+- 是否懂 ResourceQuota 与 GPU 的搭配限制
+- 是否懂软硬隔离差异
+
+**回答框架**
+
+- Namespace：每个团队一个，作为配额 + RBAC + 网络隔离的边界
+- ResourceQuota：限制 namespace 总 GPU / CPU / memory（注意 ResourceQuota 不能限制"哪类 GPU"，需要扩展）
+- LimitRange：单 Pod 资源 default + max，防止一个 Pod 把 quota 吃光
+- PriorityClass：高 / 中 / 低优先级 + 可抢占，结合 preemption 实现重要 Job 优先
+- NetworkPolicy：egress / ingress 规则，软隔离（K8s 原生）；硬隔离需要 SR-IOV / 节点池物理切分
+- RBAC：team A 不能 list team B 的 Pod
+- 监控：成本归因按 namespace + label
+
+**追问**
+
+- 4 团队 quota 总和 = 集群容量的 120%，超卖怎么管？
+- 一个 namespace 里 100 个 Pod 把 etcd 压崩了，怎么办？
+
+**评分要点**
+
+- **及格**：能用 namespace + quota
+- **良好**：能讨论 priority + 网络
+- **优秀**：能讨论超卖 + etcd 容量 + 软硬隔离边界
+
+---
+
+### 26.6.5 GPU 节点怎么 maintain（升级 / 替换 / 故障）
+
+**问题**
+
+一台 8 GPU 节点的 NIC driver 要升级，节点要重启。集群上正在跑训练 + 推理。请说明**完整的维护流程**：怎么 cordon / drain / 重启 / 验证 / 上线，以及 stateful 工作负载（训练 / 推理 prefix cache）怎么处理。
+
+**考察点**
+
+- 是否懂 K8s 节点维护标准流程
+- 是否懂训练 / 推理在节点维护时的不同处理
+- 是否会做"先验证再上线"
+
+**回答框架**
+
+- 准备：通知业务（训练 Job owner / 推理服务 oncall）；选低峰窗口
+- Cordon：节点不再接新 Pod
+- Drain：drive 现有 Pod
+  - 推理 Pod：通过 PreStop graceful drain，新流量切到其他副本
+  - 训练 Pod：触发 checkpoint，scheduler 重新调度（gang restart 整个 Job 到其他节点）
+- 重启 / 升级：driver / firmware / NIC / OS
+- 验证：跑 GPU 自检（dcgmi diag）+ NCCL test + 内部 ML benchmark
+- Uncordon：标记可调度，先小流量验证再放量
+- 自动化：Cluster API + node update operator + automated validation
+
+**追问**
+
+- 一个训练 Job gang scheduled 在 32 卡上，要 drain 1 个节点怎么处理？
+- 升级后跑 NCCL test 失败，怎么 rollback？
+
+**评分要点**
+
+- **及格**：能讲 cordon / drain / 重启
+- **良好**：能讨论训练 vs 推理的不同处理
+- **优秀**：能讨论自动化 + rollback + 验证级别
+
+---
+
+### 26.6.6 队列调度：Volcano / Kueue / Slurm / 自研
+
+**问题**
+
+新建训练平台需要 Job 队列。请对比 **Volcano、Kueue、Slurm、自研** 的取舍，给出在"K8s 原生 + 中等团队规模 + 需要 backfill / preemption / fairshare"约束下的选型建议。
+
+**考察点**
+
+- 是否对几个调度器的真实差异有判断
+- 是否懂 K8s native vs HPC native（Slurm）的边界
+- 是否能识别"自研"的真实成本
+
+**回答框架**
+
+- Volcano：CNCF 项目，K8s native，gang + queue + fairshare + preemption 都有，K8s AI 平台主流
+- Kueue：K8s SIG 官方项目，更简洁，资源借用 + 多集群，但 backfill / preemption 仍在演进
+- Slurm：HPC 标准，调度强大，但与 K8s 生态融合需要桥接（slurm-operator）；适合纯训练 HPC 集群
+- 自研：除非有非常特殊需求（合规 / 内部工具栈），否则不建议
+- 建议：K8s native + 中等团队 → Volcano 是甜点；如果未来要扩 multi-cluster 资源借用 → Kueue
+- 风险：调度器升级影响所有 Job；调度策略调参需要持续运营
+
+**追问**
+
+- 训练 + 推理混部，调度器需要支持什么？
+- Volcano gang + Kueue resource borrowing 能组合吗？
+
+**评分要点**
+
+- **及格**：能区分四者
+- **良好**：能给出选型建议 + 理由
+- **优秀**：能讨论混部 + 多集群 + 升级风险
+
+---
+
+### 26.6.7 Autoscaling for AI workloads：HPA / VPA / Cluster autoscaler 的局限
+
+**问题**
+
+K8s 标准 HPA 基于 CPU / memory 触发扩缩容。请说明**在 AI 推理场景为什么 HPA 不够**，以及实战中常用的扩缩容方案（KEDA / 自定义指标 / queue depth based / token throughput based）。
+
+**考察点**
+
+- 是否懂 HPA 在 AI 推理上的局限（GPU util 不直接反映负载）
+- 是否懂 KEDA / 自定义 metrics 路径
+- 是否懂 cluster autoscaler 与 GPU 节点的搭配（GPU 节点冷启动慢）
+
+**回答框架**
+
+- HPA 局限：CPU/memory 不能反映 GPU 推理压力；GPU util 也具有欺骗性（80% 不等于满载）
+- 自定义指标：通过 Prometheus adapter 暴露 token throughput / queue depth / running seqs / p99 latency 让 HPA 用
+- KEDA：基于事件 / 队列长度扩缩容；适合 batch / async 场景
+- VPA：垂直扩缩（改 Pod requests），但 GPU 资源不能动态改
+- Cluster autoscaler：触发节点增加，但 GPU 节点拉镜像 + 启动 + driver init 5-10 min；用 over-provisioning Pod 提前撑容量
+- 实战组合：Pod 级 KEDA 扩副本 + 节点级 cluster-autoscaler 扩节点 + 关键服务保留 hot standby
+
+**追问**
+
+- 推理服务希望 60s 内扩容，但 GPU 节点冷启动 5 min，怎么办？
+- queue depth 突涨能用 HPA 应对吗？
+
+**评分要点**
+
+- **及格**：能讲 HPA 的指标问题
+- **良好**：能讲 KEDA + custom metrics
+- **优秀**：能讨论冷启动 + over-provisioning + hot standby
+
+---
+
+### 26.6.8 GPU 碎片化：怎么避免 / 怎么治理
+
+**问题**
+
+集群跑 6 个月后，明明有 100 张空闲 GPU，但新提的 32 卡训练 Job 却起不来。请说明**GPU 碎片化在 K8s 上的根因**和**治理手段**（defrag / bin-packing / 抢占 / quota 限制小 Job）。
+
+**考察点**
+
+- 是否懂资源碎片化的工程模式
+- 是否能识别"卡数够但拓扑不连"的真实问题
+- 是否能给治理路径
+
+**回答框架**
+
+- 根因：小 Job 散落在多节点；每节点剩 1-2 卡；32 卡需要连续节点 / NVLink 内
+- 检测：定期统计"max contiguous GPU available" vs total free
+- 治理 1（短期）：bin-packing 调度 + node-fitting 算法（找最匹配的节点）
+- 治理 2（中期）：抢占小 Job 让大 Job 通过（preemption 必须配合 checkpoint）
+- 治理 3（长期）：quota 限制小 Job 数 + 周期性 defrag（migrate 小 Job 整理碎片）
+- 治理 4：节点池物理切分（小 Job 池 / 大 Job 池），避免互相干扰
+- 监控：每天 report"碎片度"指标（free GPU / max contiguous GPU）
+
+**追问**
+
+- 一个长跑训练 Job 占着 32 卡但只用 8 卡，怎么治理？
+- defrag 主动迁移会引发什么副作用？
+
+**评分要点**
+
+- **及格**：能讲根因 + bin-pack
+- **良好**：能讨论抢占 + quota
+- **优秀**：能讨论 defrag + 节点池切分 + 监控指标
+
+---
+
+### 26.6.9 K8s 网络：Service mesh / 直连 / SR-IOV
+
+**问题**
+
+推理服务从 gateway 流量进 → engine 副本 → 模型 registry / vector DB。请说明**这条链路在 K8s 上常见的网络方案**（kube-proxy + iptables / IPVS / Cilium / service mesh / SR-IOV）以及对推理 latency 的实际影响。
+
+**考察点**
+
+- 是否懂 K8s service 网络栈对延迟的影响
+- 是否懂 service mesh sidecar 的 trade-off
+- 是否懂 GPU 节点 SR-IOV / 直连方案
+
+**回答框架**
+
+- Kube-proxy + iptables：默认，规则多时（>1000 services）连接建立慢
+- IPVS：内核态 LB，规模大时优势明显
+- Cilium / eBPF：bypass kube-proxy，连接建立 + 转发都更快；提供 L7 policy
+- Service mesh（Istio / Linkerd）：sidecar 注入 mTLS + observability + traffic split；但每跳 +2-5ms latency；推理服务慎用
+- SR-IOV：物理网卡虚拟化，给 Pod 直接用 VF；训练 NCCL 大流量场景有用
+- 推理建议：gateway → engine 直连（不进 mesh）；mesh 仅在控制面；GPU 训练 NCCL 走 SR-IOV / GPUDirect RDMA
+
+**追问**
+
+- Service mesh sidecar 的 +5ms latency，在 inference 场景能接受吗？
+- SR-IOV 的 VF 数量是怎么决定 Pod 密度的？
+
+**评分要点**
+
+- **及格**：能讲 kube-proxy + service mesh
+- **良好**：能讨论 mesh 的延迟代价
+- **优秀**：能讨论 SR-IOV + GPUDirect + 直连决策
+
+---
+
+### 26.6.10 镜像 / 模型分发的工程问题
+
+**问题**
+
+一个 70B 模型容器镜像 200GB（base + model weights），新副本启动要 5-10 min 拉镜像。请说明 K8s 上**镜像分发的常见优化**（多阶段构建 / 分层 / lazy load / pre-pull / OCI artifact 解耦）。
+
+**考察点**
+
+- 是否懂大镜像的真实痛点
+- 是否懂 image pull 优化方案
+- 是否懂 model 与 image 解耦的设计
+
+**回答框架**
+
+- 拆开：base image（runtime + python + libs）vs model weights → 镜像 5GB + 模型挂载（PVC / sidecar download）
+- Lazy load：stargz / nydus 让镜像按需加载，启动时只拉 metadata
+- Pre-pull：用 DaemonSet 在节点启动时预拉 base image
+- 节点本地缓存：image pull 后保留，hot 节点再起 Pod 就秒级
+- Model weights as artifact：S3 / OCI artifact 单独管理，启动时 init container 拉到 emptyDir / hostPath
+- 跨 region：image registry 跨 region replication；模型用 CDN / edge cache
+- 进阶：模型 mmap from PVC，启动跳过加载（fork shared memory）
+
+**追问**
+
+- 模型 mmap from PVC 在 OOM 时会怎样？
+- pre-pull 占节点磁盘怎么治理？
+
+**评分要点**
+
+- **及格**：能讲拆 base / weights
+- **良好**：能讨论 lazy load + pre-pull
+- **优秀**：能讨论 mmap + 跨 region + 磁盘治理
+
+---
+
+### 26.6.11 平台化：从"能用 K8s"到"AI 工程师友好"
+
+**问题**
+
+新人 ML 工程师不该被 K8s 复杂度劝退。请说明你会**如何在 K8s 之上抽象出"训练 Job / 推理 Service / 评测 Run"等任务级 API**，以及为什么不能直接让用户写 YAML。
+
+**考察点**
+
+- 是否懂"用户体验 API"和"K8s 原生 API"的差异
+- 是否能讲 CRD + operator 抽象路径
+- 是否懂"灵活性 vs 易用性"取舍
+
+**回答框架**
+
+- 问题：用户写 K8s YAML 容易出错 + 不知道资源 / 调度 / 配额怎么填
+- 解：CRD（CustomResourceDefinition）封装"训练 Job"为高级对象，operator 翻译成底层 PodGroup / Pod / Service / PVC
+- 例子：`kind: TrainingJob` 字段是 model / dataset / GPU / NIC / checkpoint，operator 自动生成 200 行 YAML
+- 用户接口：CLI / SDK / Web UI；每种都基于同一套 CRD
+- 灵活性逃生：高级用户允许传 `extraSpec` 覆盖底层（escape hatch）
+- 治理：CRD 强制必填字段（owner / project / cost-center），平台自动注入 quota / priority / network policy
+
+**追问**
+
+- 这个抽象 6 个月后用户开始抱怨"不够灵活"，怎么平衡？
+- 你的 CRD schema 升级时怎么不破坏现有 Job？
+
+**评分要点**
+
+- **及格**：能讲 CRD + operator
+- **良好**：能讨论用户接口分层 + escape hatch
+- **优秀**：能讨论 schema 演进 + 用户抱怨平衡
+
+---
+
+### 26.6.12 K8s 调度新人最常踩的坑
+
+**问题**
+
+请列出**新人在 K8s 上跑 AI 工作负载最容易踩的 5 个坑**，以及给出"老手会怎么提前防"。
+
+**考察点**
+
+- 是否对 K8s + AI 工程坑有一手经验
+- 是否能讲解决方案而非只列问题
+- 是否能讲"为什么这个坑特别坑"
+
+**回答框架**
+
+- 坑 1：忘配 ImagePullPolicy → 用旧镜像；老手用 `IfNotPresent` + 镜像 tag 严格管理
+- 坑 2：requests = limits 没设好 → 资源争抢 / OOMKilled；老手用 LimitRange + 实测
+- 坑 3：忘 nodeSelector 限 GPU 节点 → Pod 调度到普通节点 GPU 资源不存在；老手 affinity 双重保险
+- 坑 4：训练 Pod 没设 restartPolicy: OnFailure → 失败后再不起；老手用 Job 而非 Pod
+- 坑 5：忘 PreStop hook → 推理服务被 SIGKILL；老手默认 30s grace + drain endpoint
+- 坑 6（bonus）：configmap / secret 改了但 Pod 没重启；老手用 reloader / hash annotation
+
+**追问**
+
+- 选一个坑详细讲一次故障复盘？
+- 怎么把这些"坑"做成 platform 默认值，让新人无法踩？
+
+**评分要点**
+
+- **及格**：能列 3 个坑
+- **良好**：能给老手防御方案
+- **优秀**：能讨论"如何把坑产品化为默认值"
