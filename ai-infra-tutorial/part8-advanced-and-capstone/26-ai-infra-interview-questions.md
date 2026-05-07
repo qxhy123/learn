@@ -1195,3 +1195,337 @@ ZeRO-3 训练时，team 偶尔反馈"resume 后 loss 跳"。请列出**多卡训
 - **及格**：能区分三形态资源画像
 - **良好**：能讲 LoRA 推理部署优势
 - **优秀**：能讨论 multi-LoRA + prefix cache + rank 选择 + 局限性
+
+---
+
+## 26.4 数据、制品、Checkpoint 与 Registry
+
+### 26.4.1 训练数据集 / Tokenized 数据 / 模型 checkpoint 各应该怎么版本化
+
+**问题**
+
+平台的训练流水线里有三类持久化制品：原始数据集、tokenized 数据、模型 checkpoint。请说明**各自合适的版本化方案**（git-lfs / DVC / S3 + manifest / OCI artifact 等），并解释为什么不能用同一种统一管理。
+
+**考察点**
+
+- 是否懂大文件版本化的工程边界
+- 是否懂"内容哈希 vs 语义版本"的差异
+- 是否能讲清楚为什么 git-lfs 不适合 PB 级数据集
+
+**回答框架**
+
+- 原始数据集：S3 + manifest 文件（按内容 hash 引用），用 DVC / lakeFS 管理"哪一版数据用哪些样本"
+- Tokenized 数据：webdataset / parquet shard + 版本目录；与 tokenizer hash 强绑定，tokenizer 变了 ID 空间就废
+- Checkpoint：注册到 model registry（MLflow / Vertex / Bento）；存对象存储；带 metadata（dataset version、code commit、metric、训练超参）
+- 不能统一原因：粒度差距（PB vs TB vs GB）、访问模式不同（数据顺序读、checkpoint 整体取）、生命周期不同
+- 共同要求：可追溯（任何一个 checkpoint 能回到精确的代码 + 数据 + 超参）
+
+**追问**
+
+- 数据脱敏前后如何区分两个版本？
+- 如果有人用错了 tokenizer，怎么从 checkpoint 反查这个错误？
+
+**评分要点**
+
+- **及格**：能给三类合适的工具
+- **良好**：能讲 hash + manifest + 元数据
+- **优秀**：能讨论 tokenizer 绑定、生命周期、可追溯性
+
+---
+
+### 26.4.2 Checkpoint sharded vs full：什么时候选哪个
+
+**问题**
+
+70B 模型 ZeRO-3 训练，写 checkpoint 时有两种策略：sharded（每 rank 写自己分片）和 full（rank 0 聚合写完整文件）。请说明**两种策略在写延迟 / 恢复方便 / 跨集群迁移**上的差异，以及生产实践应该混合使用。
+
+**考察点**
+
+- 是否懂 sharded checkpoint 的工程优势 / 缺点
+- 是否懂"训练 checkpoint vs 发布 checkpoint"是不同需求
+- 是否会用 PyTorch DCP / FSDP / DeepSpeed 的 checkpoint 接口
+
+**回答框架**
+
+- Sharded：每 rank 并行写自己的分片，写延迟低；恢复必须用相同 mesh shape；跨集群迁移困难
+- Full：rank 0 聚合所有分片，写延迟高（all-gather + 单节点 IO 瓶颈）；恢复方便；可直接发布
+- 训练用 sharded：高频 checkpoint 不阻塞训练
+- 发布用 full：模型仓库存的是完整 checkpoint，便于跨配置加载
+- 工具：DCP（PyTorch Distributed Checkpoint）支持 sharded ↔ full 转换；FSDP `state_dict_type` 可切换
+- 生产实践：训练时 sharded + 定期 export full（每 N hours / 评估通过）
+
+**追问**
+
+- 集群从 32 卡 ZeRO-3 切到 64 卡 ZeRO-3，sharded checkpoint 怎么用？
+- full checkpoint 写 30 分钟阻塞训练，怎么避免？
+
+**评分要点**
+
+- **及格**：能讲 sharded vs full 主要差异
+- **良好**：能讨论训练 / 发布两种用途
+- **优秀**：能讲 DCP 的转换 + 跨 mesh 迁移 + async export 实践
+
+---
+
+### 26.4.3 Model registry 应该存什么、不存什么
+
+**问题**
+
+新人想"把所有模型相关的东西都丢到 registry"——checkpoint、训练数据、评测结果、推理配置、prompt 模板。请说明**registry 的合理边界**：哪些必须在 registry 里，哪些必须在外部，哪些可以引用。
+
+**考察点**
+
+- 是否懂 registry 的核心职责（版本 / 谱系 / 发布）
+- 是否能区分"模型本体"和"使用模型的上下文"
+- 是否懂不同类型制品的存储成本
+
+**回答框架**
+
+- 必须在 registry：模型权重（reference 到对象存储 URL）、元数据（架构、size、quantization、license）、谱系（dataset version、code commit、parent model）、评测结果摘要、发布状态
+- 必须在外部：原始训练数据（太大、合规）、详细评测样本（追加多）、prompt 模板（迭代快）、推理配置（部署相关）
+- 可引用：dataset URL、tokenizer URL、训练 Job ID、A/B 实验结果
+- 边界原则：registry 是"模型这个对象的真相"，不是"所有 ML 工件的总仓库"
+
+**追问**
+
+- 一个客户问"这个模型在哪里训的、用什么数据"，registry 应该多快能答上？
+- 同一个 checkpoint 不同量化版本（FP16 / FP8 / INT4）怎么管？
+
+**评分要点**
+
+- **及格**：能讲 registry 存模型 + 元数据
+- **良好**：能讨论谱系 / 发布状态 / 引用 vs 内嵌
+- **优秀**：能讨论量化变体管理 + 合规追溯
+
+---
+
+### 26.4.4 Checkpoint 体积太大怎么办：压缩 / 量化 / 切片
+
+**问题**
+
+70B 模型 fp16 checkpoint 140 GB。请说明在**存储成本 / 加载时间 / 跨地域同步**三个维度上，可用的优化路径有哪些（量化、压缩、稀疏化、tensor parallel split），各自代价是什么。
+
+**考察点**
+
+- 是否懂量化级别（fp8 / int8 / int4 / GPTQ / AWQ）对体积和精度的影响
+- 是否懂通用压缩（zstd / lz4）在浮点 checkpoint 上效果有限
+- 是否能讲跨地域同步策略（multipart upload / cross-region replication / CDN）
+
+**回答框架**
+
+- 量化：fp16 → fp8（×0.5）→ int8（×0.25）→ int4（×0.125），精度损失递增；后训练量化 vs 量化感知训练
+- 通用压缩：浮点参数熵接近最大，zstd 通常只能省 5-15%；不要指望
+- 稀疏化：剪枝 + 稀疏存储，特定模型 50% 稀疏可节省 30-40%
+- TP split：每 rank 存自己分片，单文件小，但加载时必须按对应 rank 数
+- 跨地域：multipart upload + CRR + CDN 缓存；模型注册时 region affinity；按需懒加载
+- 取舍：体积优化必须配合"目标用途"——训练 checkpoint 不能量化，推理 checkpoint 才能
+
+**追问**
+
+- 量化后再训练（fine-tune）会怎样？
+- 一个东京的推理服务要拉一个旧金山的 checkpoint，最快的方案？
+
+**评分要点**
+
+- **及格**：知道量化是主要手段
+- **良好**：能区分量化级别 + 加载时机
+- **优秀**：能讨论 region affinity / multipart / 量化感知训练 trade-off
+
+---
+
+### 26.4.5 模型供应链与签名：怎么防"供应链投毒"
+
+**问题**
+
+你的平台允许第三方 partner 上传自己的 fine-tuned LoRA adapter 给客户使用。请说明**模型供应链的攻击面**（恶意权重 / 隐藏后门 / 注入恶意 prompt 行为），以及你会用什么机制（签名 / scan / sandbox / runtime guard）防御。
+
+**考察点**
+
+- 是否能识别模型供应链的攻击面
+- 是否懂 sigstore / OCI artifact signing
+- 是否能讲"上传时静态扫描 + 运行时 guard"组合
+
+**回答框架**
+
+- 攻击面：权重里嵌 trigger backdoor、推理时反复输出特定串、消耗预算无意义循环、隐式数据外泄
+- 静态扫描：weight diff（与公开 base model 比较）、known backdoor pattern、metadata 检查
+- 签名：每个上传制品 sigstore 签名，引用必须验签；OCI artifact + cosign
+- Sandbox：上传后先在隔离环境跑评测集（包括安全集），通过才发布
+- Runtime guard：output filter、abnormal token sequence detector、budget hard cap
+- 治理：partner 信任分级、违规通报机制、强制版本撤回
+
+**追问**
+
+- 你怎么定义"安全评测集"？
+- 如果一个 LoRA 在评测集上看起来好，但生产 1 个月后才触发 backdoor，怎么发现？
+
+**评分要点**
+
+- **及格**：能列攻击面 + 签名概念
+- **良好**：能讲静态 + 运行时双层
+- **优秀**：能讨论评测集设计 + 长期监控 + 撤回机制
+
+---
+
+### 26.4.6 数据合规：训练数据 / 用户输入 / 模型输出 各自怎么处理
+
+**问题**
+
+公司在欧盟和美国都有客户。请说明你的平台如何处理 GDPR / CCPA 等合规要求，**针对训练数据 / 用户在线输入 / 模型输出三类数据**分别给出策略。
+
+**考察点**
+
+- 是否懂训练数据 vs 在线数据合规要求差异
+- 是否懂"模型输出"也是合规对象
+- 是否能讲数据居留 / 删除权 / 审计
+
+**回答框架**
+
+- 训练数据：来源 license / consent 审查；脱敏（PII 去标识）；保留训练数据→模型版本追溯（合规要求"删除某用户数据"时能定位影响哪些模型）
+- 用户在线输入：按租户隔离 + 不持久化（除非租户同意）；EU 数据不出境（地域路由）；prompt 中的 PII 需要识别 + redact
+- 模型输出：可能反向推断训练数据（membership inference）→ 输出过滤；客户要求"忘记我"时同时清推理 cache + log + trace
+- 治理：数据流图（DPIA）；DPO 角色；定期合规审计；事件响应预案
+
+**追问**
+
+- 模型本身可能"记住"训练数据中的 PII，怎么办？
+- 一个 EU 用户要求删除他的所有数据，你的平台 30 天内能做到吗？
+
+**评分要点**
+
+- **及格**：能区分三类数据合规
+- **良好**：能讲地域路由 + 删除权
+- **优秀**：能讨论 membership inference + 模型遗忘 + DPIA 工程化
+
+---
+
+### 26.4.7 评测制品（Eval results）的版本化与回归
+
+**问题**
+
+每次发模型必须跑评测集。但评测集本身也在演进（新增样本、修复标注错误、增加安全集）。请设计**评测制品的版本化 + 回归对照机制**，让历史模型对比的数字可信。
+
+**考察点**
+
+- 是否懂"评测集变了 → 历史数字不可比"的根本问题
+- 是否能给评测集 / 模型 / 评测代码 三方版本化方案
+- 是否懂"快慢评测分层"
+
+**回答框架**
+
+- 三方版本化：模型 vN / 评测集 vM / 评测代码 vK；每次评测记录三元组
+- 不变量：发布报告必须明确写 (M, K)；同 (M, K) 对比的不同 N 才可信
+- 重跑机制：评测集升级到 vM+1 后，对最近 K 个模型重跑一次，让趋势图重新连续
+- 分层：快评测（每次提交，~10min）+ 慢评测（每次发布，几小时）+ 安全 / 红队评测（季度）
+- 数据：评测结果存为 parquet + manifest，可被 dashboard / A/B 工具消费
+- 漂移：定期重抽样评测集，识别 metric 漂移与样本漂移
+
+**追问**
+
+- 一个评测集发现标注错误，怎么处理已经发布的报告？
+- "新模型在 v2 评测集上分数高 5%，但 v1 评测集上低 3%"——你怎么解释给业务方？
+
+**评分要点**
+
+- **及格**：能讲版本化 + 重跑
+- **良好**：能讲三方版本化 + 分层
+- **优秀**：能讨论标注修复溯源 + 漂移识别
+
+---
+
+### 26.4.8 Feature store / Embedding store 与训练-推理一致性
+
+**问题**
+
+推荐系统场景，特征在训练和推理都用，但训练用历史数据离线计算，推理用实时数据在线计算。请说明**training-serving skew** 的来源和**feature store** 怎么保证一致性。
+
+**考察点**
+
+- 是否懂 train-serve skew 的根本原因
+- 是否懂 feature store 的双写 / 单源策略
+- 是否能讲离线 / 在线特征定义同源
+
+**回答框架**
+
+- Skew 来源：定义不同（训练用 SQL 离线计算，推理用代码在线计算）、时间不同（训练用 t 时刻特征，推理用 t-Δ）、数据不同（训练用 sampled，推理用 raw）
+- Feature store 解：单一定义（DSL / 代码生成 SQL + 在线服务）；双写到 offline store（训练读）+ online store（推理读）
+- 时间一致：point-in-time correctness——训练时取每条样本对应时间点的特征快照
+- 工具：Feast / Tecton / Hopsworks
+- 监控：定期比对 offline vs online 特征分布，发现 skew 报警
+
+**追问**
+
+- 一个新加的特征，怎么决定回填多久的历史 offline data？
+- Embedding 如何 train-serve 一致？
+
+**评分要点**
+
+- **及格**：能解释 skew 来源
+- **良好**：能讲 feature store 双写 + point-in-time
+- **优秀**：能讨论回填策略 + embedding 同步 + 漂移监控
+
+---
+
+### 26.4.9 制品仓库：OCI artifact 还是自建对象存储
+
+**问题**
+
+公司原有 docker registry 存镜像。新需求要存 model checkpoint / dataset / LoRA adapter。请说明**复用 OCI registry（artifact）vs 自建对象存储 + 元数据 DB** 各自的取舍。
+
+**考察点**
+
+- 是否懂 OCI artifact 概念（registry 不只是镜像）
+- 是否懂大对象在 OCI registry 上的工程局限
+- 是否能给出"什么场景该混用"
+
+**回答框架**
+
+- OCI artifact：复用现有 registry 基础设施（auth、rbac、scan、push/pull）；缺点是大对象（>10GB）push/pull 流式不友好、不便部分下载
+- 自建对象存储 + 元数据：S3 + PostgreSQL；适合 PB 级、partial download、跨 region replication；缺点是从零搭 auth / scan / lifecycle
+- 混用：小对象（< 1GB）走 OCI（LoRA / 量化模型）；大对象（>10GB）走 S3（base model checkpoint），由 registry 元数据 reference
+- 现实：OCI artifact 标准（ORAS）正在演进，但工具链对大对象支持仍弱
+
+**追问**
+
+- LoRA adapter 用 OCI artifact 比直接 S3 有什么实际好处？
+- 一个 200GB 的 base model 通过 OCI registry 拉取，会踩什么坑？
+
+**评分要点**
+
+- **及格**：能区分两种方案
+- **良好**：能讨论混用策略
+- **优秀**：能讨论 ORAS 工具链局限 + auth/scan/replication 对比
+
+---
+
+### 26.4.10 数据 / 制品的生命周期治理
+
+**问题**
+
+平台运行 2 年后，对象存储里堆了 50 PB 数据：训练数据集若干代、checkpoint 数千个、评测结果、log/trace。请设计**生命周期治理策略**：保留多久、按什么规则归档、怎么避免"删错了恢复不了"。
+
+**考察点**
+
+- 是否能给出基于"最后访问 / 业务用途"的多级保留策略
+- 是否懂归档（S3 Glacier）vs 删除
+- 是否懂软删 + 审计 + 恢复路径
+
+**回答框架**
+
+- 分层：hot（< 30 天，标准存储）/ warm（30-180 天，IA 存储）/ cold（>180 天，Glacier）/ delete
+- 规则：训练数据集 keep 5 年（法律/合规）；checkpoint 按"是否发布过 / 是否 referenced"分级保留；log/trace 30-90 天压缩归档；评测结果永久（很小）
+- 软删：先标记 deleted，30 天 grace period 才物理删；期间可恢复
+- 审计：所有删除动作必须签名 + 记录 + 通知 owner
+- 自动化：tag 驱动的 lifecycle policy（owner / project / lastAccessed）；定期 report"长期未访问但占地"的 top owners
+- 灾难预案：跨 region replication 高优先级数据；定期演练恢复
+
+**追问**
+
+- 误删一个发布过的 checkpoint，30 天内能恢复吗？31 天后呢？
+- 怎么估算"再保留 1 年"对成本的影响？
+
+**评分要点**
+
+- **及格**：能给分层 + 软删
+- **良好**：能讨论 tag 驱动 + 审计
+- **优秀**：能讨论恢复演练 + 成本测算 + 跨 region replication 策略
