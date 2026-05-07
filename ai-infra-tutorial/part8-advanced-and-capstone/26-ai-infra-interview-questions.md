@@ -386,3 +386,405 @@ AI 平台经常出现"控制面 / 数据面 / 监控面"这三个词。请定义
 - **及格**：能区分四岗职责
 - **良好**：能讲清交接点，举一个具体协作例子
 - **优秀**：能讨论"小团队该如何合并岗位"以及"合并带来的风险"——体现组织成熟度判断
+
+---
+
+## 26.2 硬件、GPU、内存、网络与存储基础
+
+### 26.2.1 同价位 H100 vs A100 vs L40S 选哪个
+
+**问题**
+
+预算 200 万人民币，要新增一批卡用于"70B 模型推理 + 偶尔 13B 微调"。供应商可选 H100 80GB SXM、A100 80GB SXM、L40S 48GB PCIe。请说明你**选哪一种、为什么**，并指出选错时一年内会先在哪个指标上痛。
+
+**考察点**
+
+- 是否真的理解三张卡的显存 / 算力 / 互联差异
+- 是否会用"工作负载特征"反推选型，而不是看 Spec 排名
+- 是否能预测错误选型的"先痛点"
+
+**回答框架**
+
+- 70B 推理首要约束：HBM ≥ 70 × dtype × 副本因子 + KV，bf16 大约 140 GB → 单卡 80 GB 必须 TP=2 或 FP8 量化
+- H100 强在 FP8 / TP2 NVLink 内带宽 / Hopper TMA，做 70B 推理性价比最高
+- A100 适合保守路线，但 FP8 缺失，TP2 必走 NVLink，13B 训练 OK，推理吞吐落后
+- L40S 显存 48GB 单卡跑 70B 力不从心，多卡 PCIe 互联通信成本高，更适合 13B 推理 / 中小模型并发服务
+- 选错的"先痛点"：选 L40S 半年内会因为 70B KV cache 容量被频繁 evict、prefix cache 命中率低、p99 抖动大；选 A100 一年内会被 FP8 推理性价比拉开
+
+**追问**
+
+- 如果加上"未来 6 个月内出现 200B 模型推理"概率 30%，你的选择会改吗？
+- "买 H100 但用 A100 镜像"会立刻丢哪些性能？
+
+**评分要点**
+
+- **及格**：能正确算 70B 显存、知道单卡放不下
+- **良好**：能从 FP8 / NVLink / TP 角度比较三卡
+- **优秀**：能从 TCO + 二手残值 + 未来工作负载角度给出风险加权选项
+
+---
+
+### 26.2.2 显存预算：训练 70B 时显存都花到哪里去了
+
+**问题**
+
+70B 模型用 bf16 + ZeRO-3 + activation checkpointing 训练。请用一张拆解表说明**显存占用的主要来源**（权重 / 优化器 / 梯度 / 激活 / 通信 buffer / cuDNN workspace 等），并指出哪一项最容易"看起来用不多但其实是 OOM 元凶"。
+
+**考察点**
+
+- 是否真的能列全各组成部分
+- 是否懂 ZeRO 各 stage 切分了什么
+- 是否能讲出 activation 与 micro-batch / sequence length 的关系
+
+**回答框架**
+
+- 权重：70 × 2 = 140 GB（bf16），ZeRO-3 后单 rank ~140/N
+- 优化器（Adam, fp32 states）：70 × 8 = 560 GB，ZeRO-3 切到 N
+- 梯度：70 × 2 = 140 GB（bf16，部分 impl 仍用 fp32 累积），ZeRO 切分
+- 激活：与 batch × seq² × hidden 有关，是 OOM 第一元凶；activation checkpointing 用 1.3-1.4× 计算换显存
+- 通信 buffer：NCCL all-reduce/all-gather 临时缓冲区，常被忽略
+- cuDNN / FlashAttention workspace：每层固定开销
+- 隐藏元凶：peak activation 在 backward 重新算时短暂双倍；fragmentation 让"还有 5GB 但 OOM"
+
+**追问**
+
+- ZeRO-2 vs ZeRO-3 在通信成本上差什么？
+- 如何在线判断 OOM 是 activation 还是 fragmentation？
+
+**评分要点**
+
+- **及格**：能给权重 / 优化器 / 梯度 / 激活四项数字
+- **良好**：能加上 buffer + workspace + ZeRO 切分逻辑
+- **优秀**：能识别 fragmentation / peak / 短暂双倍这种"隐性"显存压力，并给出排查工具（torch.cuda.memory_summary、nvidia-smi、py-spy）
+
+---
+
+### 26.2.3 NVLink / PCIe / IB / RoCE 各管什么
+
+**问题**
+
+新人问你："为什么我们机器内 GPU 通信用 NVLink，跨机用 InfiniBand？PCIe 不能跨机吗？" 请用一段 3 分钟的回答把**互联拓扑**讲清楚，明确每条链路的带宽量级、延迟量级、典型用途，并解释 RoCE 与 IB 的真实差异。
+
+**考察点**
+
+- 是否清楚带宽 / 延迟 / 拓扑分层（intra-GPU / intra-node / inter-node）
+- 是否懂 NCCL 在不同链路下走的协议差异
+- 是否能把 IB 和 RoCE 的工程差异讲准（不只是"IB 贵 RoCE 便宜"）
+
+**回答框架**
+
+- NVLink/NVSwitch：~900 GB/s（H100 NVL 4），同节点 GPU 间，All-reduce / TP 走它
+- PCIe Gen5 x16：~64 GB/s，CPU↔GPU、GPU↔NIC，跨节点必须经过它出 NIC
+- InfiniBand HDR/NDR：~200/400 Gbps 单 NIC，RDMA + 硬件流控，跨节点首选
+- RoCEv2：以太网上的 RDMA，便宜易部署，但要 PFC + ECN 治理拥塞，否则丢包毁灭性
+- NCCL 选路：单机 NVLink → P2P → SHM；跨机 IB/RoCE → ring/tree all-reduce
+- 拓扑感知：训练 Job 必须 topology-aware 调度，否则 8 卡 ring 跨机就退化
+
+**追问**
+
+- RoCE 出现 PFC storm 的根因是什么？
+- 没有 NVSwitch 时 8 卡 H100 的 all-reduce 走什么拓扑？
+
+**评分要点**
+
+- **及格**：能给四类链路带宽量级
+- **良好**：能解释 NCCL 在不同拓扑下的算法差异
+- **优秀**：能讲 RoCE 部署陷阱（PFC、buffer、leaf-spine 拥塞）以及 IB 的"贵在哪里值"
+
+---
+
+### 26.2.4 HBM vs DDR vs SSD：内存层次的真实代价
+
+**问题**
+
+KV Cache 越来越大，有人提出"用 SSD 当 GPU 显存的 swap 池"。请用一段话**否定或限定这个方案**，说明 HBM / DDR (CPU memory) / NVMe SSD 在带宽 / 延迟 / 颗粒度上的真实差距，并解释为什么 vLLM 的 swap 是 GPU↔CPU memory 而不是 GPU↔SSD。
+
+**考察点**
+
+- 是否清楚带宽数量级差距（HBM 2-3TB/s, DDR 60-100GB/s, NVMe 5-10GB/s）
+- 是否清楚延迟数量级差距（HBM ns, DDR 100s ns, NVMe 50-100us）
+- 是否能识别"颗粒度"问题——KV swap 的最小单位与设备 IO 大小不匹配
+
+**回答框架**
+
+- HBM：~3 TB/s，~100 ns，与计算同设备
+- CPU DDR：~80 GB/s，~100 ns 但要走 PCIe → 实测 GPU↔CPU 带宽 ~32 GB/s（PCIe Gen5 x16）
+- NVMe SSD：~7 GB/s 顺序，~80 us 随机延迟，块单位 4KB-128KB
+- vLLM swap：每 block 几 KB，需要细粒度搬运，CPU memory 是性价比甜点
+- SSD 方案的问题：单次 swap 80us 对 50ms 的 token-by-token decode 是灾难；NVMe 写擦放大缩短寿命；多请求并发 IO 抖动会让 p99 长尾爆炸
+- 例外：批量 prefix cache 的"温层"可以放在 NVMe（按 minute/hour 复用，不在热路径）
+
+**追问**
+
+- 那"CXL memory" 能不能改变这个判断？
+- 把 KV cache 全放 CPU 而不 swap 到 GPU，会怎样？
+
+**评分要点**
+
+- **及格**：能给三层带宽 / 延迟数量级
+- **良好**：能从颗粒度否定 SSD swap
+- **优秀**：能讨论"温分层 cache" 与 CXL 等未来变化的影响
+
+---
+
+### 26.2.5 GPU 利用率 90% 可能是个谎言
+
+**问题**
+
+监控显示 GPU 利用率 92%，但训练 step time 比同模型公开 benchmark 慢 30%。请说明 `nvidia-smi` 的 GPU-Util 指标到底**测的是什么、为什么会高估真实算力利用**，并给出更靠谱的"GPU 真在干活"的判断方法。
+
+**考察点**
+
+- 是否知道 GPU-Util 实质是"过去采样窗口里有 kernel 在跑的时间比"
+- 是否懂 SM occupancy / Tensor Core utilization / memory bandwidth 才是真实 metric
+- 是否能给出可执行排查路径
+
+**回答框架**
+
+- GPU-Util 是采样比例，只要有 kernel 在跑就算 100%（哪怕一个空 memcpy）
+- 真实"算力利用"：SM occupancy（Nsight Compute / DCGM 看 sm__cycles_active）、Tensor Core util、HBM 带宽利用、kernel 时间分布
+- 30% 慢的常见原因：CPU 数据加载 bottleneck（GPU idle 但有少量 kernel 拉满采样）、kernel launch overhead、Python / nccl 同步空隙、显存碎片导致 fragmenting alloc
+- 排查路径：`dcgmi dmon` 看 SM occupancy；`torch.profiler` / Nsight Systems 看 kernel timeline；DataLoader profile
+
+**追问**
+
+- DataLoader 拉满 CPU 但 GPU 空，监控会显示什么？
+- 单机 8 卡训练，1 张卡 GPU-Util 60% 其它 95%，怎么排查？
+
+**评分要点**
+
+- **及格**：能识别 GPU-Util 不等于算力利用
+- **良好**：能给出 SM occupancy / Tensor Core util 等真指标
+- **优秀**：能给出完整的排查工具链 + 具体 case 路径
+
+---
+
+### 26.2.6 NUMA 与 PCIe 拓扑对 AI 工作负载的影响
+
+**问题**
+
+8 GPU 单节点服务器，跑同一个训练任务，**绑定 NUMA 后**性能比不绑 NUMA 高 15%。请解释 NUMA 是什么、PCIe topology 怎么和它互动、为什么会影响训练性能，并给出生产上**可复用的绑核策略**。
+
+**考察点**
+
+- 是否懂 NUMA 节点、本地内存 vs 跨 socket 远程内存
+- 是否懂 GPU 与哪个 NUMA 节点 PCIe 直连
+- 是否懂 NCCL / DataLoader / pin memory 与 NUMA 的耦合
+
+**回答框架**
+
+- NUMA：多 socket CPU，每个 socket 有本地内存，访问对方 socket 内存慢 2-3x
+- GPU 通过 PCIe 接到某一个 socket（root complex），"GPU0-3 接 socket0，GPU4-7 接 socket1"是常见拓扑
+- 不绑 NUMA：DataLoader 进程可能在 socket1 跑但喂数据给 socket0 的 GPU0，每 batch 都跨 socket 拷贝
+- 绑核策略：`numactl --cpunodebind={socket} --membind={socket}` 把 worker / DataLoader / NCCL helper 都绑到对应 GPU 所在 socket
+- 验证：`nvidia-smi topo -m` 看 GPU↔CPU 关系，再用 `numastat` 观测 cross-node memory 访问
+
+**追问**
+
+- 推理服务什么时候反而不需要严格绑 NUMA？
+- 一台机器 NIC 接在 socket0，GPU 在 socket1，跨机 RDMA 怎么不踩坑？
+
+**评分要点**
+
+- **及格**：能讲清 NUMA + PCIe 拓扑
+- **良好**：能给出 numactl + topo 验证流程
+- **优秀**：能讨论"NIC 跨 socket"的进一步陷阱以及容器环境下的绑核难点
+
+---
+
+### 26.2.7 网络延迟 50us vs 200us 对训练的真实影响
+
+**问题**
+
+集群有两套 RoCE 配置：A 套 50us 延迟、200 Gbps 带宽；B 套 200us 延迟、400 Gbps 带宽。同样跑 175B 模型 ZeRO-3 训练，**哪一套快**？为什么？请给出基于 all-reduce / all-gather 量级的估算。
+
+**考察点**
+
+- 是否能用通信量 + 延迟 + 带宽算 step 时间
+- 是否知道 ZeRO-3 的通信特性是"很多次中等通信"
+- 是否能避免"带宽更高就一定快"的误区
+
+**回答框架**
+
+- ZeRO-3 通信量：每 step 大约 2× 模型参数（all-gather + reduce-scatter），175B bf16 = 350 GB
+- 延迟主导场景：参数切片很多 → 每片小消息 → 200us 延迟 × N 次 = 显著增加
+- 带宽主导场景：长消息聚合后，400 Gbps 优势大
+- 估算：如果 ZeRO-3 切成 1024 片，每片~340MB，A 套 50us+340MB/25GB/s=13.6ms，B 套 200us+340MB/50GB/s=6.8ms → B 仍可能更快
+- 但若 GPU 数 N 大（>256），延迟项放大 → A 反超
+- 结论：取决于"切片粒度 × GPU 数 × 拓扑"，NCCL 算法（ring vs tree）也会改变
+
+**追问**
+
+- A 套延迟 50us 但偶尔丢包 0.001%，对训练有什么影响？
+- 如果改成 175B 推理 TP=8，结论会变吗？
+
+**评分要点**
+
+- **及格**：能算 all-reduce 通信量
+- **良好**：能讨论延迟 vs 带宽的 trade-off 取决于消息大小
+- **优秀**：能引入 NCCL 算法 / 拓扑 / GPU 规模做加权判断
+
+---
+
+### 26.2.8 NIC 选型：单端口 200G vs 双端口 100G
+
+**问题**
+
+新建 GPU 集群，每节点 8 张 H100，NIC 预算只够装一种：A. 单端口 ConnectX-7 NDR 400G，B. 双端口 100G ×2，C. 四端口 25G ×4。请按"训练 / 推理 / 通用"三个用途分别**给推荐**并解释。
+
+**考察点**
+
+- 是否懂"NIC 数量与 GPU-NIC 拓扑亲和"对 NCCL 的影响
+- 是否懂 GPUDirect RDMA 要求 NIC 与 GPU 在同 NUMA / PCIe switch
+- 是否能避免"看起来 4×25G = 100G 等价"误区
+
+**回答框架**
+
+- 训练：A 优先（NDR 400G + GPUDirect RDMA 简化拓扑，所有 GPU 共享一根高速管道，all-reduce 性能最佳）
+- 推理：C 也能用（推理跨机通信少，多端口给副本隔离 / 多租户网络隔离方便）
+- 通用 / 混部：B 比较平衡，双端口可分别接两套 leaf 做冗余
+- 误区：4×25G 总带宽 100G 看似等于双 100G，但 NCCL 单流走单端口、GPUDirect 不支持端口聚合，实际 effective bandwidth 远低
+- 拓扑约束：NIC 应与对应 GPU 在同 PCIe switch / 同 NUMA，否则跨 socket 慢路径
+
+**追问**
+
+- 推理服务什么场景反而需要高带宽 NIC？
+- 双端口接两套 leaf 做冗余，怎么避免 ECMP hash 不均？
+
+**评分要点**
+
+- **及格**：能区分训练 / 推理对带宽的不同需求
+- **良好**：能讲 GPUDirect RDMA 的拓扑要求
+- **优秀**：能讨论多端口聚合的真实带宽利用 / hash 均衡 / 故障切换
+
+---
+
+### 26.2.9 存储分层：训练数据 / checkpoint / 推理日志 应该怎么放
+
+**问题**
+
+为一个 200 人 AI 研究院做存储规划：训练数据集 PB 级、checkpoint 每天 TB 级、在线推理日志每天 GB 级、模型 registry 全量 TB 级。**只能用三种存储介质**：本地 NVMe / 共享并行文件系统（Lustre/CephFS）/ 对象存储（S3 兼容）。请规划放置方案。
+
+**考察点**
+
+- 是否清楚四类数据的访问模式（顺序大块 / 随机小块 / 写多读少 / 写少读多）
+- 是否懂训练 IO 瓶颈在哪
+- 是否懂 checkpoint 的 lifecycle 与存储成本
+
+**回答框架**
+
+- 训练数据：对象存储（成本最低）+ 本地 NVMe 缓存层（每 epoch 预热）；并行 FS 仅当模型实在大且数据访问随机时用
+- Checkpoint：写在并行 FS 或对象存储 multipart upload；本地 NVMe 做 staging buffer 防写阻塞
+- 推理日志：对象存储（按租户分桶 + 生命周期策略）；热数据可短暂 ES/ClickHouse
+- Registry：对象存储 + 元数据 DB（PostgreSQL / etcd），不要把"模型文件 + 元数据"放同处
+- 关键陷阱：训练 DataLoader 直接打 S3 网络风暴；checkpoint 同步阻塞训练 step；推理日志写本地满磁盘
+
+**追问**
+
+- 一个 200GB checkpoint 写 30 秒会怎样？怎么用 async + zero-copy 优化？
+- 训练数据 PB 级但每 epoch 只用 10% 子集，怎么设计 cache 命中？
+
+**评分要点**
+
+- **及格**：能给四类数据各选一种存储
+- **良好**：能讨论本地 NVMe 缓存策略 + checkpoint async
+- **优秀**：能讨论"S3 网络风暴 / 多租户配额 / 数据生命周期"等运营层细节
+
+---
+
+### 26.2.10 一台 8×H100 节点的功耗 / 散热预算
+
+**问题**
+
+新建 100 台 8×H100 GPU 节点的训练集群。请说明：**单节点峰值功耗 / 平均功耗、散热方案、机柜密度** 大约多少，以及电力 / 冷量在采购时常被忽略的"卡脖子"点是什么。
+
+**考察点**
+
+- 是否对 GPU + CPU + NIC 整机功耗有量级感
+- 是否懂风冷 / 液冷的边界
+- 是否能识别"机柜空间够 GPU 但电力 / 冷量不够"
+
+**回答框架**
+
+- H100 SXM5 单卡 TDP ~700W，8 卡 5.6kW；CPU + 内存 + NIC + PSU 损耗加约 1-2 kW，整机峰值 6.5-8 kW
+- 风冷极限：标准 19" 机柜 12-15 kW，能塞 1-2 台 8×H100 节点；高密风冷可达 20-30 kW
+- 液冷：直触液冷 / 后门换热 50-80 kW/cabinet，能上 6-8 台节点
+- 机柜密度由"功率 + 冷量"主导，不是"U 数"
+- 卡脖子：很多机房 PDU 单路 3.6 kVA，1 台 8×H100 就要 2 路；冷却塔冷水温度 > 18°C 时高密风冷直接 throttle
+
+**追问**
+
+- 100 台节点跑训练，PUE 1.3 vs 1.5 一年差多少电费？
+- 你会同意"为了密度上液冷"还是"先用风冷过渡"？什么决策点？
+
+**评分要点**
+
+- **及格**：能给单节点功耗量级
+- **良好**：能区分风冷 vs 液冷的密度边界
+- **优秀**：能讨论 PUE / 电费 / PDU 路数 / 冷却塔水温这种运营约束
+
+---
+
+### 26.2.11 同代 GPU 的不同变体（SXM / PCIe / NVL）该怎么选
+
+**问题**
+
+H100 有 SXM5、PCIe、NVL（双卡 188GB）三个变体；A100 有 SXM4、PCIe、80GB / 40GB。请说明：**这些变体的真实工程差异**（不仅是 spec 差），各自最适合什么工作负载。
+
+**考察点**
+
+- 是否懂 SXM 必须配特定 baseboard、不能像 PCIe 一样灵活
+- 是否懂 NVL 对长 context / 大模型的优势
+- 是否懂二手市场 / 供应链对选型的影响
+
+**回答框架**
+
+- SXM：高带宽 NVLink 全互联、统一 baseboard 8/4 卡、TDP 高、必须供应商整机
+- PCIe：可插任意 PCIe 服务器、跨卡只有 PCIe 带宽、TDP 低 50-100W、灵活但通信弱
+- NVL（H100 NVL 188GB）：双卡通过 NVLink Bridge 共享 188GB，针对长 context 推理 / 大模型推理特别好
+- 选型：训练优先 SXM（NVLink 全互联）；推理 70B+ 长 context 选 NVL；中小模型推理 / 多租户 / 灵活上下电选 PCIe；冷启动多变量 / 二手市场选 PCIe
+- 工程差异：SXM baseboard 维修必须送供应商；PCIe 失败可独立替换
+
+**追问**
+
+- "买 SXM 但只用 4 卡"会浪费什么？
+- NVL 与 TP=2 是同一个东西吗？
+
+**评分要点**
+
+- **及格**：能区分三种变体
+- **良好**：能讲 NVL 的 188GB 共显存优势
+- **优秀**：能从供应链 / 维修 / 二手残值角度给出工程取舍
+
+---
+
+### 26.2.12 PCIe Gen5 / CXL / NVLink C2C 哪个先值得跟进
+
+**问题**
+
+老板给你一份"未来 18 个月新硬件评估"任务，候选包括 PCIe Gen5 普及、CXL 1.1/2.0 落地、NVLink C2C（Grace-Hopper 这类 GPU-CPU 一致性互联）。请按**"对你当前业务（推理为主 + 中等训练）的边际收益"** 排序并说明为什么。
+
+**考察点**
+
+- 是否对未来 18 个月新硬件路线有判断
+- 是否能区分"概念性新东西"和"立刻能产生收益"
+- 是否能用业务负载反推优先级
+
+**回答框架**
+
+- PCIe Gen5：已普及（H100/B100），新平台标配，主要影响 GPU↔NIC、CPU↔GPU 带宽，立刻有收益（GPUDirect RDMA + KV swap 都受益）
+- NVLink C2C / Grace Hopper：CPU-GPU 一致性内存大幅简化大模型推理 KV swap、Prefix cache 管理；对长 context 推理特别有价值，但要绑定 NVIDIA 整机方案
+- CXL：理念好（内存池化、跨节点共享），但 1.1 仅本机扩展，2.0 / 3.0 真正用起来需要 CPU + 设备 + OS 协同，未来 18 个月还不够成熟
+- 排序：PCIe Gen5（已落地，选型直接拿）> NVLink C2C（强相关业务方向，值得 POC）> CXL（关注但暂不投入）
+- 风险：把 CXL 当救命稻草，会比"早一年用上 NVL/Grace Hopper"亏更多
+
+**追问**
+
+- 如果业务是"超大 context（128K+）推理"，结论会变吗？
+- CXL memory pool 真正落地时，AI Infra 的哪些组件最先受益？
+
+**评分要点**
+
+- **及格**：能区分三种技术
+- **良好**：能给出 18 个月内的边际收益排序
+- **优秀**：能讨论"对当前组织规模 / 业务方向"的具体影响并主动调整排序
