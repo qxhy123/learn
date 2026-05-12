@@ -474,3 +474,6 @@ ls chuzhong_algebra/part2-polynomials
 - [ ] **Step 3: 标记 AM1 完成**
 
 在本计划末尾追加 `**AM1 完成于：YYYY-MM-DD**`，提交。
+
+---
+**AM1 完成于：2026-05-12**
