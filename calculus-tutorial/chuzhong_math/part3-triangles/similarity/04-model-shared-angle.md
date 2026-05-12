@@ -2,6 +2,8 @@
 
 > **一图速记**：两个三角形**共一个角**，且夹这个角的两边**成比例** → 相似（SAS 相似的可视化版本）。**关键**：比例方向决定对应关系。
 
+![共角共边相似（交叉对应）](../../figures/svg/model-shared-angle.svg)
+
 ## 一、引入
 
 $\triangle ABC$ 中，$D$ 在 $AB$ 上，$E$ 在 $AC$ 上。已知 $\dfrac{AD}{AC} = \dfrac{AE}{AB}$（注意：这是**交叉**比例，$D$ 配 $C$、$E$ 配 $B$，不是 $D$ 配 $B$）。证 $\triangle ADE \sim \triangle ACB$（注意 $\sim$ 后字母顺序是 $ACB$ 不是 $ABC$）。

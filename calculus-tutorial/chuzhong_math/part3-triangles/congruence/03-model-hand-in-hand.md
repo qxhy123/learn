@@ -2,6 +2,10 @@
 
 > **一图速记**：两个等腰三角形共顶点（顶角相等）→ 两腰端点的连线相等，两条连线之间的夹角 = 顶角。这就是手拉手。
 
+![手拉手模型基础形态](../../figures/svg/model-handshake-basic.svg)
+
+![手拉手等边特例](../../figures/svg/model-handshake-equilateral.svg)
+
 ## 一、引入：一道让你卡住的题
 
 > **题目**：$\triangle OAB$ 和 $\triangle OCD$ 都是等腰三角形，$OA = OB$，$OC = OD$，$\angle AOB = \angle COD = 50°$。点 $A, B, C, D$ 位置使得整个图形为标准"手拉手"形态（$\triangle OCD$ 在 $\triangle OAB$ 的内部或外部均可，$C$ 在 $\angle AOB$ 内部一侧）。求证：$AC = BD$。

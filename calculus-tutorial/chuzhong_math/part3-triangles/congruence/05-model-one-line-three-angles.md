@@ -2,6 +2,10 @@
 
 > **一图速记**：一条直线上出现三个相等的角，则直线两侧的两个三角形**相似**（特殊情况下全等）。形如字母 K。
 
+![一线三等角（K 字基础型）](../../figures/svg/model-k-shape-basic.svg)
+
+![一线三直角（K 字直角特例）](../../figures/svg/model-k-shape-right.svg)
+
 ## 一、引入
 
 > **题目**：直线 $l$ 上顺次有三点 $A, P, B$。在 $l$ 同侧作 $\angle PAC = \angle APD = \angle PBD = \alpha$（$C$ 与 $D$ 在 $l$ 同侧；$AC$、$PD$、$BD$ 分别是从 $A, P, B$ 引出的射线/线段）。求证：$\triangle PAC \sim \triangle BPD$。

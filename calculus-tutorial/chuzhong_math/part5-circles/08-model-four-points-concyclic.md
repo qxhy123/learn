@@ -2,6 +2,8 @@
 
 > **一图速记**：四个点 $A, B, C, D$ 在同一个圆上 $\Leftrightarrow$ 任一对"同侧同弧"角相等（$\angle BAC = \angle BDC$）或任一对对角互补（$\angle A + \angle C = 180^\circ$）。**等角同弧、对角互补——四点共圆**。
 
+![四点共圆（同弧等角）](../../figures/svg/model-four-points-concyclic.svg)
+
 ## 一、引入
 
 > 四边形 $ABCD$ 中，$\angle BAC = \angle BDC = 35^\circ$。求证：$A, B, C, D$ 四点在同一个圆上；并求 $\angle ABD$ 与 $\angle ACD$ 的关系。

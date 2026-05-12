@@ -2,6 +2,8 @@
 
 > **一图速记**：两条平行线被两条直线（共顶点）所截，形成两个相似三角形——共顶点在两平行线**同侧**时是 **A 字**；共顶点在两平行线**之间**时是 **X 字（或 8 字）**。
 
+![A 字型相似](../../figures/svg/model-a-shape.svg)
+
 ## 一、引入：一道最朴素的"平行线 + 三角形"题
 
 > **题目**：$\triangle ABC$ 中，$DE \parallel BC$，$D \in AB$、$E \in AC$。求证：$\triangle ADE \sim \triangle ABC$，并求 $\dfrac{AD}{AB} = \dfrac{AE}{AC} = \dfrac{DE}{BC}$。

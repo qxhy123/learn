@@ -2,6 +2,8 @@
 
 > **一图速记**：圆外一点 $P$ 引一条切线 $PA$（$A$ 是切点）和一条割线 $PBC$（依次交圆于 $B, C$，$B$ 在 $P$ 与 $C$ 之间）$\Rightarrow$ $PA^2 = PB \cdot PC$（**切割线定理**）。
 
+![切割线定理](../../figures/svg/model-tangent-secant.svg)
+
 ## 一、引入
 
 > 圆 $O$ 外一点 $P$，$PA$ 切圆 $O$ 于点 $A$，过 $P$ 的割线交圆 $O$ 于 $B, C$ 两点（$B$ 在 $P$ 与 $C$ 之间）。已知 $PA = 6$，$PB = 4$，求 $PC$ 的长度。
