@@ -845,3 +845,6 @@ git commit -m "docs(chuzhong_algebra): mark AM0 milestone complete"
 - **类型一致**：thinking-toolkit 各章节互相引用术语一致 ✓
 - **粒度**：每个 Task = 一个文件 = 一次提交 ✓
 - **基础设施**：figures 拷贝并加代数补充约定 ✓
+
+---
+**AM0 完成于：2026-05-12**
