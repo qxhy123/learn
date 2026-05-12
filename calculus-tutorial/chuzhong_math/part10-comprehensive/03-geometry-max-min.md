@@ -8,6 +8,8 @@
 
 > **将军饮马原型题**：已知直线 $l$ 及位于 $l$ 同侧的两定点 $A, B$。在 $l$ 上找一点 $P$，使 $PA + PB$ 最小。求 $P$ 的位置，并指出 $PA + PB$ 的最小值。
 
+![将军饮马模型：A 关于 l 的对称点 A'，A'B 与 l 的交点即最优 P](../figures/svg/model-junjun-yinma.svg)
+
 这是一道流传两千年的"将军饮马"题：将军骑马从军营 $A$ 出发到河边 $l$ 饮马后再到军营 $B$，怎样走总路程最短？看似复杂，背后却是**两点之间线段最短**这一最基本公理。
 
 ---
@@ -44,12 +46,16 @@
 
 **将军饮马**：仅靠"轴对称 + 两点之间线段最短"，最朴素也最常考。
 
+![胡不归模型：在 B 处作射线 l′ 与 BC 成 α 角（sinα=k），过 P 作 PH⊥l′，则 PH=k·PB](../figures/svg/model-hubugui.svg)
+
 **胡不归详解**（取名自传说：胡不归赶路过河滩与硬路两种地形，比例不同）：
 
 - 形式：在直线 $l$ 上找 $P$ 使 $PA + k\cdot PB$ 最小，$0 < k < 1$。
 - 难点：$k\cdot PB$ 这个**带系数**的距离不能直接和 $PA$ 看作"两段距离之和"。
 - 关键：在 $B$ 处作一条与 $l$ 成定角 $\alpha$ 的射线 $l'$，使 $\sin\alpha = k$。过 $P$ 向 $l'$ 作垂线 $PH$，则在 $\mathrm{Rt}\triangle PBH$ 中 $PH = PB\sin\alpha = k\cdot PB$。
 - 于是 $PA + k\cdot PB = PA + PH$ —— 这是"$A$ 到 $P$ 再到 $l'$"的折线，最短即 $A$ 直接向 $l'$ 作垂线时取到，最小值 $= $ 点 $A$ 到 $l'$ 的距离。
+
+![阿氏圆模型：P 在 ⊙O 上，B 在圆内、A 在圆外；构造 B′ 使 △OPB ∼ △OB′P，则 PB′=k·PB](../figures/svg/model-aposhi-circle.svg)
 
 **阿氏圆详解**：
 
@@ -91,6 +97,8 @@
 
 正方形 $ABCD$ 的边长为 $4$，$E$ 是 $AB$ 的中点，$P$ 是对角线 $BD$ 上一动点，求 $PA + PE$ 的最小值。
 
+![正方形 ABCD 中 A 关于 BD 的对称点为 C，PA+PE=PC+PE 取 CE 时最小](../figures/svg/ex-p10-03-1.svg)
+
 **解**：在正方形中，$A$ 关于 $BD$ 的对称点恰好是 $C$（$BD$ 是 $AC$ 的中垂线）。因此 $PA = PC$，$PA + PE = PC + PE \geq CE$，当 $P, C, E$ 共线时取等号。
 
 在 $\mathrm{Rt}\triangle CBE$ 中 $CB = 4, BE = 2$，故 $CE = \sqrt{16 + 4} = 2\sqrt{5}$。
@@ -100,6 +108,8 @@
 ### 例 2（胡不归 — 系数为 $\sin 30°$）
 
 如图，$\triangle ABC$ 中 $\angle B = 30°, AB = 6$，$P$ 是 $BC$ 边上的动点。求 $PA + \dfrac{1}{2}PB$ 的最小值。
+
+![△ABC 中 ∠B=30°, AB=6；过 B 作射线 l′ 与 BC 成 30°，A 到 l′ 的距离即为最小值](../figures/svg/ex-p10-03-2.svg)
 
 **解**：系数 $\dfrac{1}{2} = \sin 30°$，于是在 $B$ 处沿 $BA$ 方向（注意：要在 $BC$ 同侧）作射线，使其与 $BC$ 成 $30°$ 角——这条射线**恰好就是 $BA$ 本身**。过 $P$ 向 $BA$ 作垂线 $PH$，则 $PH = PB\sin 30° = \dfrac{1}{2}PB$。
 
