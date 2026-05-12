@@ -19,6 +19,8 @@
 - **性质 2（内错角）**：两直线平行，**内错角相等**。
 - **性质 3（同旁内角）**：两直线平行，**同旁内角互补**（和为 $180°$）。
 
+![三种平行性质：$a\parallel b$ 推出同位角相等 / 内错角相等 / 同旁内角互补](../figures/svg/thm-parallel-properties.svg)
+
 **推论（平行线间距离）**：两条平行线之间的**距离处处相等**。也就是说，若 $l_1 \parallel l_2$，在 $l_1$ 上任取两点 $A$、$B$，分别向 $l_2$ 作垂线，则两条垂线段长度相等。这一推论是后续梯形、平行四边形面积计算的几何基础。
 
 ## 三、由性质 1 推出性质 2、3
@@ -56,6 +58,8 @@ $$
 - 因 $PE \parallel AB$，由内错角相等（性质 2）：$\angle BAP = \angle APE$。
 - 因 $PE \parallel CD$，由内错角相等：$\angle DCP = \angle CPE$。
 
+![例 1 折线问题：过 $P$ 作 $PE\parallel AB$，把 $\angle APC$ 拆成两个内错角之和](../figures/svg/ex-p2-05-1.svg)
+
 两式相加：$\angle BAP + \angle DCP = \angle APE + \angle CPE = \angle APC$，命题得证。这正是 toolkit/02 中"在拐角处作平行线"的代表用法。
 
 **例 2（平行 + 角平分线）**：已知 $AB \parallel CD$，$AE$ 平分 $\angle BAC$，$CE$ 平分 $\angle ACD$，求证：$AE \perp CE$。
@@ -79,6 +83,8 @@ $$
 $$
 \angle A + \angle B + \angle C = 180°.
 $$
+
+![例 3 三角形内角和：过 $A$ 作 $BC$ 平行线，三角拼成平角](../figures/svg/ex-p2-05-3.svg)
 
 这是初中几何中"过顶点作对边的平行线"这一经典辅助线的源头，将在 part3 三角形章节中反复使用。
 

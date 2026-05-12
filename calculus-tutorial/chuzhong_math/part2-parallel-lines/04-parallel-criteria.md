@@ -24,6 +24,8 @@
 - **推论 1**：如果两条直线都与第三条直线平行，那么这两条直线平行（即 $a \parallel c, b \parallel c \Rightarrow a \parallel b$）。
 - **推论 2**：在同一平面内，垂直于同一条直线的两条直线平行（即 $a \perp l, b \perp l \Rightarrow a \parallel b$）。
 
+![三种平行判定示意：同位角相等 / 内错角相等 / 同旁内角互补](../figures/svg/thm-parallel-criteria.svg)
+
 判定 1 通常被视为最基本的判定（教材中作为公理或基本事实），判定 2、判定 3 都可以由判定 1 推出。
 
 ## 三、用判定 1 证判定 2

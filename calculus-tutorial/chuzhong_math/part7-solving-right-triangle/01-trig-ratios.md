@@ -12,6 +12,8 @@
 
 锐角三角函数就是用这三条边的**比值**来度量锐角 $\alpha$ 的"形状"。
 
+![直角三角形中相对锐角 α 的对边、邻边、斜边](../figures/svg/thm-trig-ratio-def.svg)
+
 ---
 
 ## 核心概念：三种比值的定义
@@ -76,6 +78,9 @@ $$\boxed{\tan\alpha = \frac{\sin\alpha}{\cos\alpha}.}$$
 
 ### 5. 互余关系
 
+![互余角关系：α 的对边正好是 β 的邻边](../figures/svg/thm-trig-complementary.svg)
+
+
 若 $\alpha + \beta = 90°$（即 $\beta = 90° - \alpha$），则在同一直角三角形中，$\alpha$ 的对边正好是 $\beta$ 的邻边，反之亦然。于是：
 
 $$\boxed{\sin(90° - \alpha) = \cos\alpha,\quad \cos(90° - \alpha) = \sin\alpha,\quad \tan(90°-\alpha) = \frac{1}{\tan\alpha}.}$$
@@ -89,6 +94,8 @@ $$\boxed{\sin(90° - \alpha) = \cos\alpha,\quad \cos(90° - \alpha) = \sin\alpha
 ### 例 1：基础——三边求三角函数
 
 > 直角三角形 $ABC$ 中，$\angle C = 90°$，$AC = 3$，$BC = 4$。求 $\sin A,\cos A,\tan A$ 与 $\sin B,\cos B,\tan B$。
+
+![Rt△ABC：AC=3, BC=4, AB=5](../figures/svg/ex-p7-01-1.svg)
 
 **思路**：先由勾股求斜边，再对照"对、邻、斜"代入。
 

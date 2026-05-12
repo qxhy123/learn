@@ -15,6 +15,8 @@
 
 **定义**：在 $\angle AOB$ 的内部有一条射线 $OC$，若 $\angle AOC = \angle COB$，则称射线 $OC$ 是 $\angle AOB$ 的平分线。
 
+![$OC$ 平分 $\angle AOB$，把角分为相等的两半](../figures/svg/def-angle-bisector.svg)
+
 **等价表达**：
 $$\angle AOC = \angle COB = \frac{1}{2}\angle AOB$$
 
@@ -25,6 +27,8 @@ $$\angle AOB = 2\angle AOC = 2\angle COB$$
 
 用符号表述：若 $OC$ 平分 $\angle AOB$，$P$ 是 $OC$ 上任一点，$PM \perp OA$ 于 $M$，$PN \perp OB$ 于 $N$，则
 $$PM = PN.$$
+
+![核心性质：$P$ 在 $\angle AOB$ 平分线上，$PM\perp OA$、$PN\perp OB$，则 $PM=PN$](../figures/svg/thm-angle-bisector-property.svg)
 
 **逆定理**：在角的内部，到角两边距离相等的点一定在这个角的平分线上。
 
@@ -88,6 +92,8 @@ $$DE = DF. \qquad \blacksquare$$
 $$d_{AB} = d_{AC} = d_{BC}.$$
 
 特别地 $d_{AC} = d_{BC}$，由角平分线**逆定理**，$I$ 在 $\angle C$ 的平分线上。故三条角平分线交于同一点 $I$，且 $I$ 到三边距离相等。 $\blacksquare$
+
+![三角形内心 $I$：三条内角平分线交于一点，$I$ 即内切圆圆心](../figures/svg/ex-p1-03-3.svg)
 
 ## 五、易错点
 
