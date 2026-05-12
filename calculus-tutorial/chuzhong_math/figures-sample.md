@@ -80,7 +80,11 @@
 
 更精细的几何图（part5/03 章圆周角定理）。Asymptote 在画圆和曲线时比 TikZ 表达力更强。
 
-```asymptote
+**注：** MPE 对 Asymptote 没有内置语言支持，需要用 **code chunk** 语法 (`{cmd=true args=...}`) 显式调用 `asy` 命令。下面三种写法依次尝试，找到能在你环境里工作的那一种。
+
+### 写法 A（MPE code chunk + SVG 输出，最推荐）
+
+```{cmd="asy" args=["-f", "svg", "-tex", "pdflatex"], hide=true, output="markdown"}
 size(8cm);
 import geometry;
 
@@ -115,6 +119,28 @@ label("$C$", C, N);
 
 // 关键文字
 label("圆周角 $\angle ACB$", (0, -2.6), S);
+```
+
+### 写法 B（最简 cmd 语法，无参数）
+
+```{cmd="asy"}
+size(8cm);
+pair O = (0, 0);
+real r = 2;
+draw(circle(O, r));
+pair A = r * dir(210);
+pair B = r * dir(330);
+pair C = r * dir(90);
+draw(A -- B); draw(A -- C); draw(B -- C);
+label("$O$", O, NE); label("$A$", A, SW); label("$B$", B, SE); label("$C$", C, N);
+```
+
+### 写法 C（用 asymptote 语言标签 + cmd=true）
+
+```asy {cmd=true args=["-f", "svg"]}
+size(8cm);
+draw(circle((0,0), 2));
+label("$O$", (0,0));
 ```
 
 ---
