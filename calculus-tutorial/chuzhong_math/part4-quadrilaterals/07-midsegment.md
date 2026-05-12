@@ -27,6 +27,8 @@ $$DE \parallel BC, \qquad DE = \tfrac{1}{2} BC.$$
 
 这条定理一次性给了**两条结论**——平行 + 半长——这也是它最值钱的地方：以后凡是看到"两个中点"，就立刻有两条性质可用。
 
+![三角形中位线 $DE$ 与倍长中位线构造：延长 $DE$ 到 $F$ 使 $EF=DE$](../figures/svg/thm-midsegment-triangle.svg)
+
 ### 证明（倍长中位线法，呼应 cong/06）
 
 **思路**：把中位线 $DE$ 延长一倍，构造平行四边形。
@@ -64,6 +66,8 @@ $$DE \parallel BC, \qquad DE = \tfrac{1}{2} BC. \qquad\blacksquare$$
 设梯形 $ABCD$ 中 $AD \parallel BC$（$AD = a$ 为上底，$BC = b$ 为下底），$M, N$ 分别是腰 $AB, CD$ 的中点，则中位线 $MN$ 满足
 
 $$MN \parallel AD \parallel BC, \qquad MN = \frac{a + b}{2}.$$
+
+![梯形中位线 $MN$ 连两腰中点，平行于两底，长度为两底之和的一半](../figures/svg/thm-midsegment-trapezoid.svg)
 
 ### 证明（化归为三角形中位线）
 
@@ -115,6 +119,8 @@ $\triangle ABC$ 中，$BC = 10$，$D, E$ 分别是 $AB, AC$ 的中点。求 $DE$
 
 四边形 $ABCD$ 中，$E, F$ 分别是对角线 $BD, AC$ 的中点，$M$ 是 $AB$ 的中点。证明：$ME = MF$（即 $M$ 到两对角线中点的距离相等），并且这两条线段都等于另一组对应线段的一半。
 
+![例 2 图：$E=BD$ 中点、$F=AC$ 中点、$M=AB$ 中点；$ME, MF$ 为两次嗅出的中位线](../figures/svg/ex-p4-07-2.svg)
+
 **思路**：$M$ 与 $E$ 分别是 $AB$ 与 $BD$ 的中点 —— 这是 $\triangle ABD$ 的中位线；$M$ 与 $F$ 分别是 $AB$ 与 $AC$ 的中点 —— 这是 $\triangle ABC$ 的中位线。两次套用定理。
 
 **证明**：在 $\triangle ABD$ 中，$M, E$ 分别是 $AB, BD$ 的中点，由三角形中位线定理：
@@ -134,6 +140,8 @@ $$MF \parallel BC, \qquad MF = \tfrac{1}{2} BC.$$
 ### 例 3（综合：中位线嵌套）
 
 $\triangle ABC$ 中，$BC = 16$。$D, E$ 分别是 $AB, AC$ 的中点；$F, G$ 分别是 $AD, AE$ 的中点。求 $FG$ 的长。
+
+![例 3 图：中位线嵌套，$BC=16, DE=8, FG=4$](../figures/svg/ex-p4-07-3.svg)
 
 **思路**：连续两次套用三角形中位线定理（"中位线的中位线"）。
 

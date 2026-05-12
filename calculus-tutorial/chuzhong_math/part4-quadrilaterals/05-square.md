@@ -36,6 +36,8 @@
 
 这意味着正方形对角线把它分成 **$4$ 个全等的等腰直角三角形**（$45°$–$45°$–$90°$）。
 
+![正方形：四边相等、对角线相等且垂直平分、对角线平分对角 45°](../figures/svg/thm-square-properties.svg)
+
 **性质 3：对角线与边的关系**
 
 设正方形边长 $a$，对角线长 $d$，则
@@ -76,6 +78,8 @@ $$d = a\sqrt{2},\quad a = \tfrac{\sqrt{2}}{2}\, d.$$
 
 正方形 $ABCD$ 的边长 $AB = 6$。求对角线 $AC$ 的长，以及对角线交点 $O$ 到各顶点的距离。
 
+![例 1 图：正方形 $ABCD$，$AB=6$，对角线 $AC=6\sqrt{2}$](../figures/svg/ex-p4-05-1.svg)
+
 **解**：由正方形对角线公式 $AC = AB \cdot \sqrt{2} = 6\sqrt{2}$。
 
 对角线互相平分，故 $OA = OC = \dfrac{AC}{2} = 3\sqrt{2}$；同理 $OB = OD = 3\sqrt{2}$。
@@ -87,6 +91,8 @@ $$d = a\sqrt{2},\quad a = \tfrac{\sqrt{2}}{2}\, d.$$
 ### 例 2（正方形中的"半角模型"）
 
 正方形 $ABCD$ 中，$E$ 在 $BC$ 上，$F$ 在 $CD$ 上，且 $\angle EAF = 45°$。证明：$EF = BE + DF$。
+
+![例 2 图：正方形中的半角模型，绕 $A$ 旋转 $90°$ 把 $\triangle ADF$ 拼到 $\triangle ABF'$](../figures/svg/model-half-angle.svg)
 
 **思路（呼应 cong/04 半角模型）**：正方形的"$90°$ 顶角 + 顶点处 $45°$ 半角"是经典的半角模型场景。处理方法：**绕顶点 $A$ 把 $\triangle ADF$ 旋转 $90°$ 到 $\triangle ABF'$ 的位置**（其中 $F'$ 落在 $CB$ 延长线上），使 $AD$ 与 $AB$ 重合。
 
@@ -107,6 +113,8 @@ $$d = a\sqrt{2},\quad a = \tfrac{\sqrt{2}}{2}\, d.$$
 ### 例 3（正方形 + 旋转：手拉手特例）
 
 正方形 $ABCD$ 与正方形 $AEFG$ 共顶点 $A$（$AEFG$ 由 $ABCD$ 绕 $A$ 旋转某个角度得到）。连接 $BE$、$DG$。证明：$BE = DG$ 且 $BE \perp DG$。
+
+![例 3 图：两正方形共顶点 $A$，连接 $BE$、$DG$](../figures/svg/ex-p4-05-3.svg)
 
 **思路（呼应 cong/03 手拉手模型）**：两个共顶点的正方形是"手拉手模型"的典型特例——$AB = AD$、$AE = AG$，且 $\angle BAE = \angle DAG$（都等于 $\angle BAD - \angle DAE = 90° - \angle DAE$ 或都等于 $90° + \angle DAE$，取决于旋转方向）。
 
