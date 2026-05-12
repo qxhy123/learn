@@ -17,6 +17,7 @@ OUT="$DIR/svg"
 mkdir -p "$OUT"
 
 render_tikz() {
+    # 用 xelatex 编译（支持中文 via ctex）
     local tex="$1"
     local name
     name="$(basename "$tex" .tex)"
@@ -24,9 +25,9 @@ render_tikz() {
     tmpdir="$(mktemp -d)"
     echo "  TikZ: $name"
     cp "$tex" "$tmpdir/$name.tex"
-    (cd "$tmpdir" && pdflatex -interaction=nonstopmode "$name.tex" >/dev/null 2>&1) || {
-        echo "    ✗ pdflatex failed for $name"
-        rm -rf "$tmpdir"
+    (cd "$tmpdir" && xelatex -interaction=nonstopmode "$name.tex" >/dev/null 2>&1) || {
+        echo "    ✗ xelatex failed for $name (检查 $tmpdir/$name.log)"
+        # 保留 tmpdir 便于调试
         return 1
     }
     pdf2svg "$tmpdir/$name.pdf" "$OUT/$name.svg"
