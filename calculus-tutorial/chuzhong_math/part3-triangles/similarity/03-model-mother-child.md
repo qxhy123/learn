@@ -87,6 +87,8 @@ $$b^2 + a^2 = pc + qc = (p+q)c = c \cdot c = c^2.$$
 ### 例 1（基础代入）
 已知直角 $\triangle ABC$ 中 $\angle C = 90°$，$CD \perp AB$ 于 $D$，$AD = p = 4$，$BD = q = 9$。求 $h$、$a$、$b$、$c$。
 
+![母子相似例1：p=4, q=9](../../figures/svg/ex-p3s03-1.svg)
+
 **【思路】** 直接套射影定理三式：
 - $h = \sqrt{pq} = \sqrt{4 \cdot 9} = 6$
 - $c = p + q = 13$
@@ -106,6 +108,8 @@ $$a^2 + b^2 = (p+q)c = c \cdot c = c^2. \qquad\blacksquare$$
 
 ### 例 3（圆中应用）
 圆 $O$ 的直径 $AB = 10$，$C$ 是圆上一点，$CD \perp AB$ 于 $D$，$AD = 2$。求 $CD$。
+
+![母子相似例3：圆中应用](../../figures/svg/ex-p3s03-3.svg)
 
 **【思路】** $\angle ACB$ 是直径 $AB$ 所对的圆周角，所以 $\angle ACB = 90°$。于是 $\triangle ACB$ 是直角三角形，$CD$ 是斜边 $AB$ 上的高，立刻构成母子相似。
 

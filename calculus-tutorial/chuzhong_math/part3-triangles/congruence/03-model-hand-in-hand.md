@@ -10,6 +10,8 @@
 
 > **题目**：$\triangle OAB$ 和 $\triangle OCD$ 都是等腰三角形，$OA = OB$，$OC = OD$，$\angle AOB = \angle COD = 50°$。点 $A, B, C, D$ 位置使得整个图形为标准"手拉手"形态（$\triangle OCD$ 在 $\triangle OAB$ 的内部或外部均可，$C$ 在 $\angle AOB$ 内部一侧）。求证：$AC = BD$。
 
+![手拉手引入题：两个顶角 50° 的等腰三角形共顶点 O](../../figures/svg/ex-p3c03-0.svg)
+
 请先停下来，自己动笔试一分钟。
 
 大多数读者会卡在这里：**条件给的是 $OA=OB$、$OC=OD$，要证的却是 $AC$ 和 $BD$。$AC$ 和 $BD$ "看起来"不在同一个明显的三角形里**，于是不知道该选哪两个三角形去套全等。
@@ -92,9 +94,13 @@
 
 **例 1（等边版）**：$\triangle OAB$ 和 $\triangle OCD$ 都是等边三角形，共顶点 $O$。求证：$AC = BD$，且 $AC$ 与 $BD$ 的夹角为 $60°$。
 
+![手拉手例1：两个等边三角形共顶点](../../figures/svg/ex-p3c03-1.svg)
+
 > **路标触发**："两个等边共顶点" → 手拉手（顶角 $60°$）。**思路**：$OA = OB$（等边），$OC = OD$（等边），$\angle AOC = \angle AOB + \angle BOC = 60° + \angle BOC = \angle COD + \angle BOC = \angle BOD$；SAS 得 $\triangle AOC \cong \triangle BOD$，故 $AC = BD$，夹角 $= \angle AOB = 60°$。
 
 **例 2（等腰直角版）**：$\triangle OAB$ 和 $\triangle OCD$ 都是等腰直角三角形，$\angle AOB = \angle COD = 90°$，共顶点 $O$。求证：$AC = BD$ 且 $AC \perp BD$。
+
+![手拉手例2：两个等腰直角三角形共顶点](../../figures/svg/ex-p3c03-2.svg)
 
 > **路标触发**："等腰直角共顶点 + 要证 $\perp$" → 手拉手 + 旋转 $90°$。**思路**：前半截同上，SAS 得 $\triangle AOC \cong \triangle BOD$，$AC = BD$。垂直怎么来？设 $AC$ 与 $BD$ 交于 $P$，由全等得 $\angle OAC = \angle OBD$；再在 $\triangle AOP$ 和 $\triangle BPQ$（$Q$ 为 $AC$ 与 $OB$ 的交点）中用"等角代换"得到夹角 $= \angle AOB = 90°$。
 

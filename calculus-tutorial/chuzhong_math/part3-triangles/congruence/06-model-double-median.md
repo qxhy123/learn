@@ -8,6 +8,8 @@
 
 > **题目**：在 $\triangle ABC$ 中，$D$ 是 $BC$ 的中点，$AB = 5$，$AC = 7$。求中线 $AD$ 的取值范围。
 
+![倍长中线引入：延长 AD 到 E，连 CE](../../figures/svg/ex-p3c06-0.svg)
+
 请先停下来，自己动笔试一分钟。
 
 大多数读者会卡在这里：**"求线段的取值范围"，脑子里第一反应是用"三角形三边关系"（任意两边之和大于第三边）；但 $AD$ 既不是 $\triangle ABC$ 的边，也不是任何明摆着的三角形的边——$AB, AC, AD$ 三段"散"在不同位置，定理用不上**。
@@ -109,13 +111,19 @@
 
 **例 1（求中线范围，同引入题）**：$\triangle ABC$ 中 $D$ 是 $BC$ 中点，$AB = 5$，$AC = 7$。求中线 $AD$ 的范围。
 
+![倍长中线例1：同引入题](../../figures/svg/ex-p3c06-0.svg)
+
 > **路标触发**："中点 + 要中线范围" → 倍长中线。**思路**：延长 $AD$ 到 $E$，$DE = AD$，连 $CE$；SAS 得 $\triangle ABD \cong \triangle ECD$，$CE = AB = 5$；在 $\triangle ACE$ 中三边关系 $|7-5| < 2AD < 7+5$，得 $1 < AD < 6$。
 
 **例 2（证两段相等）**：$\triangle ABC$ 中 $D$ 是 $BC$ 中点，$E$ 在 $AB$ 上，过 $E$ 作 $EF \parallel AC$ 交 $CD$ 的延长线于 $F$。求证：$CE = AF$。
 
+![倍长中线例2：EF∥AC 交 CD 延长线于 F](../../figures/svg/ex-p3c06-2.svg)
+
 > **路标触发**："中点 + 要证两段线段相等，且两段不在同一三角形" → 倍长中线类的全等。**思路**：注意 $D$ 是 $BC$ 中点，且 $EF \parallel AC$，可看出 $CD$ 的延长方向 $F$ 处与 $\triangle DCA$ 形成"倍长 $CD$ 至 $F$"的结构。利用 $D$ 是 $BC$ 中点 + $EF \parallel AC$ 推 $\angle F = \angle DCA$（内错角）、$\angle BDF = \angle CDA$（对顶角），配合 $BD = CD$，AAS 得 $\triangle BDF \cong \triangle CDA$（或类似的对照），从而 $BF = CA$、$DF = DA$。再在 $\triangle BEF$ 与 $\triangle ?$ 中或用平行四边形性质（$AECF$ 或 $AEFC$ 为平行四边形）推出 $CE = AF$。**核心还是利用中点把两个不相邻的三角形拉成全等。**
 
 **例 3（已知中线长求边）**：$\triangle ABC$ 中 $D$ 是 $BC$ 中点，$AD = 4$，$AB = 6$，且 $AD \perp AB$。求 $AC$。
+
+![倍长中线例3：AD⊥AB, AD=4, AB=6](../../figures/svg/ex-p3c06-3.svg)
 
 > **路标触发**："中点 + 已知中线长 + 边长 + 垂直" → 倍长中线 + 全等 + 勾股。**思路**：延长 $AD$ 到 $E$，$DE = AD = 4$，连 $CE$；SAS 得 $\triangle ABD \cong \triangle ECD$，故 $CE = AB = 6$，且 $\angle E = \angle BAD = 90°$（由全等的对应角；也可由 $AB \parallel CE$ + $AD \perp AB$ 推出 $AE \perp CE$）。这时 $\triangle AEC$ 是直角三角形，$AE = 2AD = 8$，$CE = 6$，由勾股 $AC = \sqrt{AE^2 + CE^2} = \sqrt{64 + 36} = 10$。
 

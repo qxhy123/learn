@@ -8,6 +8,8 @@
 
 > 四边形 $ABCD$ 中，$\angle BAC = \angle BDC = 35^\circ$。求证：$A, B, C, D$ 四点在同一个圆上；并求 $\angle ABD$ 与 $\angle ACD$ 的关系。
 
+![四点共圆引入：同侧等角 35°](../figures/svg/ex-p5-08-0.svg)
+
 这道题的难点在于"圆"根本没出现在条件里——只有四个点和两个相等的角。但只要我们意识到"看 $BC$ 这条线段被 $A$ 和 $D$ 张出相等的角"恰好是**圆周角定理的逆命题**，圆就被"召唤"出来了。一旦四点共圆，剩下的所有角关系都可以用圆周角、对角互补一口气解决。本节就来系统提炼这个"无圆生圆"的模型。
 
 ## 二、思维路径还原
@@ -68,17 +70,23 @@
 
 如引入题：四边形 $ABCD$ 中 $\angle BAC = \angle BDC = 35^\circ$，且 $A, D$ 在 $BC$ 同侧。求证 $A, B, C, D$ 共圆，并证 $\angle ABD = \angle ACD$。
 
+![四点共圆例1：同引入题](../figures/svg/ex-p5-08-0.svg)
+
 【思路】识别"同侧等角看同弦 $BC$" $\Rightarrow$ 由判定 1，$A, B, C, D$ 共圆。共圆后，$\angle ABD$ 与 $\angle ACD$ 同为弦 $AD$ 所对、且 $B, C$ 在 $AD$ 同侧 $\Rightarrow$ $\angle ABD = \angle ACD$（同弧圆周角相等）。
 
 ### 例 2（双直角共斜边）
 
 $\triangle ABC$ 中，$BD \perp AC$ 于 $D$，$CE \perp AB$ 于 $E$。求证 $B, C, D, E$ 四点共圆，并求 $\angle ADE$ 与 $\angle ABC$ 的关系。
 
+![四点共圆例2：双直角共斜边 BC](../figures/svg/ex-p5-08-2.svg)
+
 【思路】$\angle BDC = \angle BEC = 90^\circ$，两个直角共斜边 $BC$ $\Rightarrow$ 由判定 1（直角变形），$B, C, D, E$ 共圆于以 $BC$ 为直径的圆。共圆后，$BCDE$ 是圆内接四边形 $\Rightarrow$ $\angle ADE = \angle ABC$（圆内接四边形一外角 $\angle ADE$ 等于内对角 $\angle EBC = \angle ABC$，由判定 3 的正向用法）。
 
 ### 例 3（圆幂逆用）
 
 线段 $AC$ 与 $BD$ 相交于 $P$，已知 $PA = 2, PC = 6, PB = 3, PD = 4$。判断 $A, B, C, D$ 是否共圆。
+
+![四点共圆例3：圆幂逆用](../figures/svg/ex-p5-08-3.svg)
 
 【思路】计算 $PA \cdot PC = 12 = PB \cdot PD$ $\Rightarrow$ 由判定 4（相交弦逆定理），四点共圆。延伸：此时若再连 $AB, CD$，由共圆得 $\angle BAC = \angle BDC$（同弧 $BC$），可以反过来求其他角。
 

@@ -12,6 +12,8 @@
 
 （注：标准 K 字配置——$C$ 在线段 $AP$ 同侧的折线端，$D$ 也在 $l$ 同侧；线段 $CP$、$PD$ 在 $P$ 处构成"中间夹角" $\angle CPD$，但只要三个"贴 $l$"的角相等即可。）
 
+![K 字引入题：直线上三个相等角](../../figures/svg/ex-p3c05-0.svg)
+
 请先停下来，自己动笔试一分钟。看到题目里塞了三个"$=\alpha$"的角、又都贴在同一条直线上，先别急着列条件——**这种"三角同侧贴直线"的结构本身就在大喊它的名字：K 字**。
 
 ## 二、思维路径还原（解题者的内心独白）
@@ -101,13 +103,19 @@ K 字在中考里几乎从不"原样"出现，永远以下面这些**变形**面
 
 **例 1（基础 K 字相似 + 求线段比）**：$\alpha = 90°$，$PA = 3$，$PB = 4$，$AC = 2$，求 $BD$。
 
+![K 字例1：一线三直角](../../figures/svg/ex-p3c05-1.svg)
+
 > **路标触发**："一线三直角" → $\triangle PAC \sim \triangle BPD$。**思路**：对应关系 $P\leftrightarrow B$、$A\leftrightarrow P$、$C\leftrightarrow D$，列对应边比例 $\dfrac{PA}{BP} = \dfrac{AC}{PD}$，即 $\dfrac{3}{4} = \dfrac{2}{PD}$，得 $PD = \dfrac{8}{3}$；再由 $\dfrac{PA}{BP} = \dfrac{PC}{BD}$ 并用勾股得到 $PC = \sqrt{PA^2 + AC^2} = \sqrt{13}$，故 $BD = \dfrac{4\sqrt{13}}{3}$。
 
 **例 2（正方形内的一线三直角）**：正方形 $ABCD$ 边长 $4$，$E$ 在 $AB$ 上，$AE = 1$，$F$ 在 $BC$ 上，使得 $\angle DEF = 90°$。求 $BF$。
 
+![K 字例2：正方形内的一线三直角](../../figures/svg/ex-p3c05-2.svg)
+
 > **路标触发**："正方形 + 边上一点向两邻边构成 $90°$" → 一线三直角（直线就是 $AB$，三个直角是 $\angle DAE$、$\angle DEF$、$\angle EBF$）。**思路**：$\triangle ADE \sim \triangle BEF$，对应关系 $A\leftrightarrow B$、$D\leftrightarrow E$、$E\leftrightarrow F$。比例 $\dfrac{AD}{BE} = \dfrac{AE}{BF}$，即 $\dfrac{4}{3} = \dfrac{1}{BF}$，解得 $BF = \dfrac{3}{4}$。
 
 **例 3（动点版）**：矩形 $ABCD$ 中，$AB = 6$，$BC = 8$。动点 $P$ 在边 $BC$ 上滑动，过 $P$ 作 $\angle APQ = 90°$，$Q$ 在 $CD$ 上。求证：随着 $P$ 移动，$\triangle ABP \sim \triangle PCQ$ 始终成立；并求当 $BP = 2$ 时 $CQ$ 的值。
+
+![K 字例3：矩形内动点 + 直角](../../figures/svg/ex-p3c05-3.svg)
 
 > **路标触发**："动点 + 直角 + 矩形边" → 一线三直角（直线是 $BC$，三个直角是 $\angle B$、$\angle APQ$、$\angle C$）。**思路**：前半截照搬 K 字相似的证明（$\angle B = \angle APQ = \angle C = 90°$，外角定理推 $\angle BAP = \angle CPQ$，AA 即得）。$BP = 2$ 时，$PC = 6$；由 $\dfrac{AB}{PC} = \dfrac{BP}{CQ}$，即 $\dfrac{6}{6} = \dfrac{2}{CQ}$，得 $CQ = 2$。
 

@@ -8,6 +8,8 @@
 
 > **题目**：$\triangle ABC$ 中，$DE \parallel BC$，$D \in AB$、$E \in AC$。求证：$\triangle ADE \sim \triangle ABC$，并求 $\dfrac{AD}{AB} = \dfrac{AE}{AC} = \dfrac{DE}{BC}$。
 
+![A 字引入：三角形 + 一边平行线](../../figures/svg/ex-p3s02-0.svg)
+
 请你先合上书自己想一分钟。这道题"看上去太简单"，但它正是整章相似三角形的**起点**——把它彻底吃透，后面所有"比例线段""分点比""中位线""平行线分线段成比例"全都是它的影子。
 
 大多数人写不出来，**不是因为不会**，而是因为没意识到：
@@ -88,13 +90,19 @@ A / X 字相似一旦理解，立刻能延伸出初中阶段所有"比例线段"
 
 **例 1（基础 A 字）**：$\triangle ABC$ 中 $DE \parallel BC$，$D \in AB$、$E \in AC$，$AD = 3, DB = 2, BC = 10$。求 $DE$。
 
+![A 字例1：AD=3, DB=2, BC=10](../../figures/svg/ex-p3s02-1.svg)
+
 > **路标触发**："三角形 + 一边平行线" → A 字相似。**思路**：$AB = AD + DB = 5$；A 字相似得 $\dfrac{AD}{AB} = \dfrac{DE}{BC}$，即 $\dfrac{3}{5} = \dfrac{DE}{10}$，所以 $DE = 6$。
 
 **例 2（X 字）**：两直线相交于 $O$，分别交两条平行线 $l_1 \parallel l_2$ 于 $l_1$ 上的 $A, B$ 与 $l_2$ 上的 $C, D$（$A, C$ 在一条截线上，$B, D$ 在另一条截线上）。已知 $OA = 4, OC = 6, OB = 5$，求 $OD$。
 
+![X 字例2：两平行线 + 共顶点截线](../../figures/svg/ex-p3s02-2.svg)
+
 > **路标触发**："两直线交于一点 + 过此点的两平行线截出两个三角形" → X 字相似。**思路**：$\triangle OAB \sim \triangle OCD$（对顶角 + 内错角，AA），对应边 $\dfrac{OA}{OC} = \dfrac{OB}{OD}$ → $\dfrac{4}{6} = \dfrac{5}{OD}$ → $OD = \dfrac{15}{2}$。X 字相似比从来都是"**共顶点到 $l_1$ 的距离** : **共顶点到 $l_2$ 的距离**"。
 
 **例 3（梯形找 A 字）**：梯形 $ABCD$ 中 $AD \parallel BC$，延长 $BA$、$CD$ 交于 $P$。已知 $AD = 4, BC = 8, PA = 5$。求 $AB$。
+
+![A 字例3：梯形延长两腰交于 P](../../figures/svg/ex-p3s02-3.svg)
 
 > **路标触发**："梯形 + 延长两腰" → A 字相似（$\triangle PAD \sim \triangle PBC$）。**思路**：A 字得 $\dfrac{PA}{PB} = \dfrac{AD}{BC} = \dfrac{4}{8} = \dfrac{1}{2}$ → $PB = 2 PA = 10$ → $AB = PB - PA = 10 - 5 = 5$。**记住**：梯形里的"上底 : 下底"就是 A 字的相似比，这条等式背下来。
 

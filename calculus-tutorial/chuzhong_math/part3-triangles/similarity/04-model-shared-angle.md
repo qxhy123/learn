@@ -8,6 +8,8 @@
 
 $\triangle ABC$ 中，$D$ 在 $AB$ 上，$E$ 在 $AC$ 上。已知 $\dfrac{AD}{AC} = \dfrac{AE}{AB}$（注意：这是**交叉**比例，$D$ 配 $C$、$E$ 配 $B$，不是 $D$ 配 $B$）。证 $\triangle ADE \sim \triangle ACB$（注意 $\sim$ 后字母顺序是 $ACB$ 不是 $ABC$）。
 
+![共角共边引入：交叉比例](../../figures/svg/ex-p3s04-0.svg)
+
 这个题目乍一看和 A 字模型一模一样——同一张图，同样两点 $D, E$，同样涉及 $AD, AE, AB, AC$ 四条线段的比例。但**结论的字母顺序变了**：不是 $\triangle ADE \sim \triangle ABC$，而是 $\triangle ADE \sim \triangle ACB$。这种"形似神不似"的微妙差别，正是本节要厘清的核心。
 
 ## 二、思维路径还原
@@ -69,6 +71,8 @@ $\triangle ABC$ 中，$D$ 在 $AB$ 上，$E$ 在 $AC$ 上。已知 $\dfrac{AD}{A
 【思路】这是例 1 的逆命题。由 $\triangle ADE \sim \triangle ACB$，对应顶点 $A \leftrightarrow A, D \leftrightarrow C, E \leftrightarrow B$，故对应边 $AD \leftrightarrow AC, AE \leftrightarrow AB$，得 $\dfrac{AD}{AC} = \dfrac{AE}{AB}$，交叉相乘即 $AB \cdot AD = AC \cdot AE$。
 
 **例 3（圆中相交弦定理）**：圆 $O$ 中弦 $AB, CD$ 相交于 $P$。连 $AC, BD$。证 $\triangle PAC \sim \triangle PDB$，从而 $PA \cdot PB = PC \cdot PD$。
+
+![共角共边例3：圆中相交弦](../../figures/svg/ex-p3s04-3.svg)
 
 【思路】$\angle APC = \angle DPB$（对顶角），$\angle PAC = \angle PDB$（同弧 $\overarc{BC}$ 的圆周角，part5 内容预告）$\to$ AA 相似 $\to$ $\dfrac{PA}{PD} = \dfrac{PC}{PB}$ $\to$ $PA \cdot PB = PC \cdot PD$。注意这里"共角"是对顶角 $\angle APC = \angle DPB$，"共边比例"则是结论形式——可见共角共边模型在圆中以"对顶角型"出现，是相交弦定理的几何内核。
 

@@ -10,6 +10,8 @@
 
 > **引例**：正方形 $ABCD$ 内一点 $P$，已知 $PA = 1, PB = 2, PC = 3$。求 $\angle APB$ 的度数。
 
+![旋转构造引入：正方形内一点 PA=1 PB=2 PC=3](../figures/svg/ex-p6-07-0.svg)
+
 题目把三段长 $PA, PB, PC$ 分别挂在三个不同的三角形上：$\triangle PAB$、$\triangle PBC$、$\triangle PAB$ 与 $\triangle PBC$ 通过 $B$ 点连接。直接列方程很难——三段长各自孤立。但是图中藏着两个"信号"：
 - $BA = BC$（正方形相邻边）
 - $\angle ABC = 90°$（正方形内角）
@@ -89,6 +91,8 @@
 
 正方形 $ABCD$ 内一点 $P$，$PA = 1, PB = 2, PC = 3$，求 $\angle APB$。
 
+![旋转构造例1：同引入题](../figures/svg/ex-p6-07-0.svg)
+
 **思路**：把 $\triangle BPC$ 绕 $B$ 顺时针旋转 $90°$（$BA = BC$、$\angle ABC = 90°$），$C \to A$，$P \to P'$。
 
 **计算**：
@@ -101,6 +105,8 @@
 
 等边三角形 $\triangle ABC$ 内一点 $P$，$PA = 5, PB = 4, PC = 3$，求 $\angle BPC$。
 
+![旋转构造例2：等边三角形内一点 PA=5 PB=4 PC=3](../figures/svg/ex-p6-07-2.svg)
+
 **思路**：把 $\triangle BPA$ 绕 $B$ 顺时针旋转 $60°$（$BA = BC$、$\angle ABC = 60°$），$A \to C$，$P \to P'$。
 
 **计算**：
@@ -112,6 +118,8 @@
 ### 例 3（旋转构造规则图形求面积）
 
 四边形 $ABCD$ 中，$\angle ABC = 60°$，$AB = BC$，$\angle BAD = \angle BCD = 90°$，$AD = 3$，$CD = 5$。求四边形 $ABCD$ 的面积。
+
+![旋转构造例3：不规则四边形 + 60° 旋转拼成等边](../figures/svg/ex-p6-07-3.svg)
 
 **思路**：图形不规则（"风筝"形），但出现 $AB = BC$ + $\angle ABC = 60°$ → 等边信号。把 $\triangle ABD$ 绕 $B$ 旋转使 $A \to C$（旋转 $60°$）。
 

@@ -8,6 +8,8 @@
 
 > 圆 $O$ 外一点 $P$，$PA$ 切圆 $O$ 于点 $A$，过 $P$ 的割线交圆 $O$ 于 $B, C$ 两点（$B$ 在 $P$ 与 $C$ 之间）。已知 $PA = 6$，$PB = 4$，求 $PC$ 的长度。
 
+![切割线引入：PA=6, PB=4, 求 PC](../figures/svg/ex-p5-07-0.svg)
+
 这道题表面只是"圆外一点 + 一条切线 + 一条割线"的简单配置，但它背后藏着初中圆论里最重要的乘积关系之一——**切割线定理**。学完切线判定与切线长定理之后，是时候把"切线 + 割线"组合成一个能算长度的模型了。
 
 ## 二、思维路径还原
@@ -74,17 +76,23 @@
 
 如引入题：$PA$ 切圆 $O$ 于 $A$，割线 $PBC$ 中 $PA = 6, PB = 4$，求 $PC$。
 
+![切割线例1：同引入题](../figures/svg/ex-p5-07-0.svg)
+
 【思路】识别图形为切割线模型 $\Rightarrow$ $PA^2 = PB \cdot PC$ $\Rightarrow$ $36 = 4 PC$ $\Rightarrow$ $PC = 9$。注意 $BC = PC - PB = 9 - 4 = 5$。
 
 ### 例 2（两割线）
 
 从圆外一点 $P$ 引两条割线：第一条依次交圆于 $A$（近）、$B$（远），$PA = 4, PB = 9$；第二条依次交圆于 $C$（近）、$D$（远），$PC = 3$。求 $PD$。
 
+![切割线例2：两割线](../figures/svg/ex-p5-07-2.svg)
+
 【思路】图形为"圆外点 + 两割线" $\Rightarrow$ 割线-割线定理 $PA \cdot PB = PC \cdot PD$ $\Rightarrow$ $4 \times 9 = 3 \times PD$ $\Rightarrow$ $PD = 12$。
 
 ### 例 3（相交弦）
 
 圆内一点 $P$，过 $P$ 的弦 $AB$ 被 $P$ 分成 $PA = 2, PB = 6$；另一条过 $P$ 的弦 $CD$ 中 $PC = 3$。求 $PD$。
+
+![切割线例3：圆内相交弦](../figures/svg/ex-p5-07-3.svg)
 
 【思路】图形为"圆内点 + 两弦" $\Rightarrow$ 相交弦定理 $PA \cdot PB = PC \cdot PD$ $\Rightarrow$ $2 \times 6 = 3 \times PD$ $\Rightarrow$ $PD = 4$。
 
