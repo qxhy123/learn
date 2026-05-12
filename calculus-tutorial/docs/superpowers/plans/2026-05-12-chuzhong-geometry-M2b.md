@@ -339,3 +339,6 @@ Commit: `docs(chuzhong): add part3/special/03 (four centers of triangle)`
 - 一致性扫描：grep TBD/TODO
 - README 更新：part3 状态由"进行中"改为"✓"，附完整 similarity/right-triangle/special 链接
 - 在本计划末尾追加 `**M2b 完成于：YYYY-MM-DD**`
+
+---
+**M2b 完成于：2026-05-12**

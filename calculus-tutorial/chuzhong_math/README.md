@@ -39,7 +39,7 @@
   - [03. 三线八角](part2-parallel-lines/03-three-line-eight-angles.md)
   - [04. 平行线的判定](part2-parallel-lines/04-parallel-criteria.md)
   - [05. 平行线的性质与应用](part2-parallel-lines/05-parallel-properties.md)
-- Part 3：三角形 *(进行中)*
+- Part 3：三角形 ✓
   - basics/
     - [01. 三角形三边关系](part3-triangles/basics/01-triangle-inequality.md)
     - [02. 内角和与外角](part3-triangles/basics/02-angle-sum.md)
@@ -51,6 +51,19 @@
     - [04. 半角模型](part3-triangles/congruence/04-model-half-angle.md) ⭐️
     - [05. 一线三等角（K 字模型）](part3-triangles/congruence/05-model-one-line-three-angles.md) ⭐️
     - [06. 倍长中线模型](part3-triangles/congruence/06-model-double-median.md) ⭐️
+  - similarity/
+    - [01. 相似三角形判定](part3-triangles/similarity/01-similarity-criteria.md)
+    - [02. A 字/X 字/8 字相似模型](part3-triangles/similarity/02-model-A-and-X.md) ⭐️
+    - [03. 母子相似与射影定理](part3-triangles/similarity/03-model-mother-child.md) ⭐️
+    - [04. 共角共边相似模型](part3-triangles/similarity/04-model-shared-angle.md) ⭐️
+  - right-triangle/
+    - [01. 勾股定理](part3-triangles/right-triangle/01-pythagoras.md)
+    - [02. 勾股定理的逆定理](part3-triangles/right-triangle/02-pythagoras-converse.md)
+    - [03. 特殊直角三角形（30-60-90 / 45-45-90）](part3-triangles/right-triangle/03-special-right-triangles.md)
+  - special/
+    - [01. 等腰三角形](part3-triangles/special/01-isosceles.md)
+    - [02. 等边三角形](part3-triangles/special/02-equilateral.md)
+    - [03. 三角形的四心](part3-triangles/special/03-four-centers.md)
 - Part 4：四边形 *(待写)*
 - Part 5：圆 *(待写)*
 - Part 6：图形变换 *(待写)*
