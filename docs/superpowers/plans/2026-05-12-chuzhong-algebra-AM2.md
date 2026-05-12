@@ -382,3 +382,6 @@ git add docs/superpowers/plans/2026-05-12-chuzhong-algebra-AM2.md
 git commit -m "docs(chuzhong_algebra): mark AM2 milestone complete"
 git push origin master
 ```
+
+---
+**AM2 完成于：2026-05-12**
