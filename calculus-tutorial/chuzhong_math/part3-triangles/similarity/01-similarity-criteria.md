@@ -35,6 +35,8 @@ $$\frac{AB}{DE} = \frac{BC}{EF} = \frac{CA}{FD} = k$$
 - **SAS（两边成比例且夹角相等）**：若 $\dfrac{AB}{DE} = \dfrac{AC}{DF}$ 且 $\angle A = \angle D$，则 $\triangle ABC \sim \triangle DEF$。
 - **SSS（三边对应成比例）**：若 $\dfrac{AB}{DE} = \dfrac{BC}{EF} = \dfrac{CA}{FD}$，则 $\triangle ABC \sim \triangle DEF$。
 
+![相似三大判定：AA / SAS / SSS 示意](../../figures/svg/thm-similarity-criteria.svg)
+
 ### 3. 直角三角形的特殊推论
 
 对于直角三角形，由于已经有一组直角相等，只需再有**一组锐角相等**即可判定相似（这是 AA 判定的直接推论）。此外，直角三角形还有一个独特的判定：

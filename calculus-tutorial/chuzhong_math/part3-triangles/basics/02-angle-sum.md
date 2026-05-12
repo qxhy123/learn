@@ -29,6 +29,8 @@ $$\angle ACD > \angle A, \qquad \angle ACD > \angle B.$$
 
 **作辅助线**：过顶点 $A$ 作一条直线 $l$，使 $l \parallel BC$。
 
+![内角和定理证明：过 $A$ 作 $BC$ 平行线，三角拼成平角](../../figures/svg/thm-angle-sum-proof.svg)
+
 **找等角**：
 
 - 直线 $AB$ 是平行线 $l$ 与 $BC$ 的截线。把 $\angle B$（即 $\angle ABC$）看作 $AB$ 截 $BC$ 所成的内角，把 $l$ 上位于 $A$ 点一侧、$AB$ 另一侧的角记为 $\angle 1$；由 $l \parallel BC$、$AB$ 为截线，得**内错角相等**：$\angle 1 = \angle B$。
@@ -41,6 +43,8 @@ $$\angle 1 + \angle BAC + \angle 2 = 180°.$$
 $$\angle A + \angle B + \angle C = 180°. \qquad \blacksquare$$
 
 ## 四、外角定理的证明
+
+![外角 $\angle ACD$：把 $BC$ 延长到 $D$，与 $CA$ 夹的角](../../figures/svg/thm-exterior-angle.svg)
 
 设 $\angle ACD$ 是 $\triangle ABC$ 在顶点 $C$ 处的外角（$BC$ 延长到 $D$）。由外角与相邻内角组成平角，
 $$\angle ACD + \angle ACB = 180°.$$
@@ -70,6 +74,8 @@ $$\angle C = 180° - 40° - 70° = 70°.$$
 
 **例 2**　求五角星五个尖角的度数之和。
 
+![五角星：五个尖角 $\angle A_1, \dots, \angle A_5$](../../figures/svg/ex-p3b-02-2.svg)
+
 【思路】五角星每个尖角都是某个小三角形的一个内角，而该小三角形的另两个内角又分别是中央五边形相邻两顶点处的外角。利用**外角定理**把每个尖角"上传"为中央五边形某顶点处外角的一部分，再借助多边形外角和 $= 360°$ 反推；更直接的方法是：将五个尖角与五边形某些角通过外角定理建立等式后整体求和。
 
 **解**：设五角星的五个尖角依次为 $\angle A_1, \angle A_2, \angle A_3, \angle A_4, \angle A_5$，中央五边形的五个顶点依次为 $P_1, P_2, P_3, P_4, P_5$。
@@ -84,6 +90,8 @@ $$\angle A_1 + \angle A_2 + \angle A_3 + \angle A_4 + \angle A_5 = 180°.$$
 **结论**：五角星五尖角之和为 $\boxed{180°}$。
 
 **例 3**　在 $\triangle ABC$ 中，$BI, CI$ 分别平分 $\angle ABC$ 和 $\angle ACB$，且相交于点 $I$。求证：
+
+![内心角 $\angle BIC$：$BI, CI$ 是角平分线](../../figures/svg/ex-p3b-02-3.svg)
 $$\angle BIC = 90° + \frac{1}{2}\angle A.$$
 
 【思路】在 $\triangle BIC$ 中应用内角和定理：$\angle BIC = 180° - \angle IBC - \angle ICB$。由于 $BI, CI$ 是角平分线，$\angle IBC = \frac{1}{2}\angle B$、$\angle ICB = \frac{1}{2}\angle C$。再把 $\angle B + \angle C = 180° - \angle A$ 代入即得。

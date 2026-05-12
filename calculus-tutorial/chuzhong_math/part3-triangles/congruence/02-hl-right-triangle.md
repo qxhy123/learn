@@ -23,6 +23,8 @@
 $$\angle C = \angle F = 90^\circ,\quad AB = DE\ (\text{斜边}),\quad AC = DF\ (\text{一条直角边}),$$
 则 $\triangle ABC \cong \triangle DEF$（**HL**）。
 
+![HL：两个直角三角形，斜边与一条直角边对应相等](../../figures/svg/thm-hl.svg)
+
 需要特别强调：
 
 1. HL 只适用于**直角三角形**——必须先确认或证明两个三角形都有直角；
@@ -70,6 +72,8 @@ $$a^2 = c^2 - b^2,\qquad d^2 = f^2 - e^2.$$
 （呼应 part1/03 中关于角平分线的内容。）
 
 题目：设 $P$ 是 $\angle AOB$ 内部一点，过 $P$ 分别向 $OA$、$OB$ 作垂线，垂足为 $M, N$。若 $PM = PN$，求证：$OP$ 平分 $\angle AOB$。
+
+![$PM\perp OA$，$PN\perp OB$，$PM=PN$ ⇒ $OP$ 平分 $\angle AOB$](../../figures/svg/thm-angle-bisector-converse.svg)
 
 【思路】关键是构造出两个直角三角形并对它们用 HL。
 
