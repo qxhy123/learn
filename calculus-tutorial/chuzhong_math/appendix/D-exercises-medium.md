@@ -11,26 +11,42 @@
 **D.1** ☆☆（出题点：手拉手模型；模型：part5/03）
 如图，$\triangle ABC$ 与 $\triangle ADE$ 均为等边三角形，$B$、$C$、$D$ 三点不共线，连接 $BD$、$CE$。求证：$BD = CE$，并求 $BD$ 与 $CE$ 的夹角。
 
+![](../figures/svg/model-handshake-equilateral.svg)
+
 **D.2** ☆☆（出题点：一线三等角；模型：part5/04）
 如图，在 $\triangle ABC$ 中，$AB = AC$，$\angle BAC = 90°$，点 $D$ 在 $BC$ 上，过 $B$、$C$ 分别作 $AD$ 的延长线和反向延长线的垂线，垂足为 $E$、$F$。求证：$EF = BE + CF$。
+
+![](../figures/svg/q-d-02.svg)
 
 **D.3** ☆☆（出题点：截长补短；模型：part5/05）
 如图，在 $\triangle ABC$ 中，$AD$ 平分 $\angle BAC$，且 $AB = AC + CD$。求证：$\angle C = 2\angle B$。
 
+![](../figures/svg/q-d-03.svg)
+
 **D.4** ☆☆（出题点：倍长中线；模型：part5/06）
 在 $\triangle ABC$ 中，$AD$ 是 $BC$ 边上的中线，$AB = 5$，$AC = 7$。求 $AD$ 的取值范围。
+
+![](../figures/svg/model-double-median.svg)
 
 **D.5** ☆☆（出题点：等腰三角形 + 全等；模型：part5/02）
 如图，$AB = AC$，$D$、$E$ 分别在 $AB$、$AC$ 上，且 $BD = CE$，$BE$、$CD$ 相交于 $P$。求证：$PB = PC$。
 
+![](../figures/svg/q-d-05.svg)
+
 **D.6** ☆☆（出题点：垂直 + 全等（K 字形）；模型：part5/04）
 如图，$\triangle ABC$ 中 $\angle ACB = 90°$，$AC = BC$。过 $C$ 作直线 $l$，过 $A$、$B$ 分别作 $l$ 的垂线，垂足为 $M$、$N$。若 $AM = 3$，$BN = 5$，求 $MN$ 的长。
+
+![](../figures/svg/q-d-06.svg)
 
 **D.7** ☆☆（出题点：角平分线性质 + 全等；模型：part5/07）
 如图，$\angle BAC$ 的平分线 $AD$ 交 $BC$ 于 $D$，过 $D$ 作 $DE \perp AB$ 于 $E$，$DF \perp AC$ 于 $F$。若 $AB = 8$，$AC = 6$，$\triangle ABC$ 面积为 $21$，求 $DE$ 的长。
 
+![](../figures/svg/q-d-07.svg)
+
 **D.8** ☆☆（出题点：旋转构造全等；模型：part5/08）
 如图，正方形 $ABCD$ 中，$E$ 在 $BC$ 上，$F$ 在 $CD$ 上，$\angle EAF = 45°$。求证：$EF = BE + DF$。
+
+![](../figures/svg/model-half-angle.svg)
 
 ---
 
@@ -39,20 +55,32 @@
 **D.9** ☆☆（出题点：A 字形相似；模型：part6/01）
 如图，$\triangle ABC$ 中，$DE \parallel BC$，$AD : DB = 2 : 3$。若 $DE = 4$，求 $BC$ 的长。
 
+![](../figures/svg/model-a-shape.svg)
+
 **D.10** ☆☆（出题点：8 字形相似；模型：part6/02）
 如图，$AB$、$CD$ 相交于 $O$，且 $AC \parallel BD$。若 $AO = 4$，$OB = 6$，$CD = 15$，求 $OC$、$OD$。
+
+![](../figures/svg/q-d-10.svg)
 
 **D.11** ☆☆（出题点：母子相似（射影定理）；模型：part6/03）
 直角三角形 $ABC$ 中 $\angle BAC = 90°$，$AD \perp BC$ 于 $D$。若 $BD = 4$，$CD = 9$，求 $AD$、$AB$、$AC$。
 
+![](../figures/svg/model-mother-child.svg)
+
 **D.12** ☆☆（出题点：一线三等角相似；模型：part6/04）
 如图，等边三角形 $ABC$ 中，$D$ 在 $BC$ 上，$E$ 在 $AC$ 上，$\angle ADE = 60°$。求证：$\triangle ABD \sim \triangle DCE$。
+
+![](../figures/svg/q-d-12.svg)
 
 **D.13** ☆☆（出题点：相似比与面积比；模型：part6/05）
 $\triangle ABC$ 中 $DE \parallel BC$，$DE$ 将 $\triangle ABC$ 分成的两部分面积之比为 $4 : 5$。求 $AD : DB$。
 
+![](../figures/svg/q-d-13.svg)
+
 **D.14** ☆☆（出题点：相似 + 角平分线定理；模型：part6/06）
 $\triangle ABC$ 中 $AD$ 平分 $\angle BAC$ 交 $BC$ 于 $D$。若 $AB = 6$，$AC = 9$，$BC = 10$，求 $BD$ 与 $DC$。
+
+![](../figures/svg/q-d-14.svg)
 
 ---
 
@@ -61,20 +89,32 @@ $\triangle ABC$ 中 $AD$ 平分 $\angle BAC$ 交 $BC$ 于 $D$。若 $AB = 6$，$
 **D.15** ☆☆（出题点：平行四边形性质；模型：part4/01）
 平行四边形 $ABCD$ 中，$E$、$F$ 分别是 $AD$、$BC$ 的中点，$BE$、$DF$ 分别交 $AC$ 于 $M$、$N$。求证：$AM = MN = NC$。
 
+![](../figures/svg/q-d-15.svg)
+
 **D.16** ☆☆（出题点：矩形对角线；模型：part4/02）
 矩形 $ABCD$ 中，$AB = 6$，$BC = 8$，$P$ 在 $BC$ 上，$PE \perp AC$ 于 $E$，$PF \perp BD$ 于 $F$。求 $PE + PF$。
+
+![](../figures/svg/q-d-16.svg)
 
 **D.17** ☆☆（出题点：菱形对角线；模型：part4/03）
 菱形 $ABCD$ 中，对角线 $AC = 8$，$BD = 6$。求菱形的边长与高。
 
+![](../figures/svg/q-d-17.svg)
+
 **D.18** ☆☆（出题点：正方形对角线 + 旋转；模型：part4/04）
 如图，正方形 $ABCD$ 边长为 $4$，$E$ 是 $BC$ 中点，$F$ 在 $CD$ 上且 $CF = 1$。求 $\angle AEF$ 的度数。
+
+![](../figures/svg/q-d-18.svg)
 
 **D.19** ☆☆（出题点：梯形中位线；模型：part4/05）
 梯形 $ABCD$ 中 $AD \parallel BC$，$AD = 4$，$BC = 10$，$E$、$F$ 分别为 $AB$、$CD$ 中点，$EF$ 交对角线 $AC$、$BD$ 于 $M$、$N$。求 $MN$ 的长。
 
+![](../figures/svg/q-d-19.svg)
+
 **D.20** ☆☆（出题点：等腰梯形 + 辅助线；模型：part4/06）
 等腰梯形 $ABCD$ 中 $AD \parallel BC$，$AB = CD = 5$，$AD = 4$，$BC = 10$。求该梯形的高与面积。
+
+![](../figures/svg/q-d-20.svg)
 
 ---
 
@@ -83,26 +123,42 @@ $\triangle ABC$ 中 $AD$ 平分 $\angle BAC$ 交 $BC$ 于 $D$。若 $AB = 6$，$
 **D.21** ☆☆（出题点：垂径定理；模型：part8/01）
 $\odot O$ 半径为 $5$，弦 $AB = 8$，求圆心 $O$ 到弦 $AB$ 的距离；若 $P$ 是弦 $AB$ 上一点，$AP = 2$，求 $OP$。
 
+![](../figures/svg/q-d-21.svg)
+
 **D.22** ☆☆（出题点：圆周角定理；模型：part8/02）
 $\odot O$ 中 $AB$ 为直径，$C$、$D$ 在圆上，$\angle BAC = 35°$，$\angle ABD = 50°$。求 $\angle ADC$ 与 $\angle BCD$。
+
+![](../figures/svg/q-d-22.svg)
 
 **D.23** ☆☆（出题点：圆内接四边形；模型：part8/03）
 圆内接四边形 $ABCD$ 中，$\angle A : \angle C = 1 : 2$，$\angle B = 80°$。求 $\angle A$、$\angle C$、$\angle D$。
 
+![](../figures/svg/q-d-23.svg)
+
 **D.24** ☆☆（出题点：切线长定理；模型：part8/04）
 从圆外一点 $P$ 向 $\odot O$ 引切线 $PA$、$PB$，切点为 $A$、$B$，$\angle APB = 60°$，$OP = 6$。求 $\odot O$ 的半径及 $PA$ 的长。
+
+![](../figures/svg/q-d-24.svg)
 
 **D.25** ☆☆（出题点：弦切角 / 切线性质；模型：part8/05）
 $AB$ 是 $\odot O$ 的直径，$PA$ 切 $\odot O$ 于 $A$，过 $P$ 作割线交 $\odot O$ 于 $C$、$D$（$C$ 在 $PD$ 之间）。若 $PA = 6$，$PC = 4$，求 $PD$ 与 $CD$。
 
+![](../figures/svg/q-d-25.svg)
+
 **D.26** ☆☆（出题点：相交弦定理 / 切割线定理；模型：part8/06）
 $\odot O$ 中两弦 $AB$、$CD$ 交于 $P$，$PA = 3$，$PB = 8$，$PC : PD = 2 : 3$。求 $PC$、$PD$。
+
+![](../figures/svg/q-d-26.svg)
 
 **D.27** ☆☆（出题点：弧长与扇形面积；模型：part8/07）
 扇形半径 $R = 6$，圆心角 $120°$。求弧长、扇形面积；若用该扇形围成圆锥侧面，求圆锥底面半径与高。
 
+![](../figures/svg/q-d-27.svg)
+
 **D.28** ☆☆（出题点：三角形内切圆；模型：part8/08）
 直角三角形两直角边为 $6$、$8$。求其内切圆半径 $r$ 与外接圆半径 $R$。
+
+![](../figures/svg/q-d-28.svg)
 
 ---
 
@@ -111,14 +167,22 @@ $\odot O$ 中两弦 $AB$、$CD$ 交于 $P$，$PA = 3$，$PB = 8$，$PC : PD = 2 
 **D.29** ☆☆（出题点：轴对称最值（将军饮马）；模型：part9/01）
 直线 $l$ 同侧两点 $A$、$B$。$A$ 到 $l$ 距离为 $2$，$B$ 到 $l$ 距离为 $4$，$A$、$B$ 在 $l$ 上的投影距离为 $6$。求 $l$ 上一点 $P$ 使 $PA + PB$ 最小，并求最小值。
 
+![](../figures/svg/q-d-29.svg)
+
 **D.30** ☆☆（出题点：平移构造平行四边形；模型：part9/02）
 $\triangle ABC$ 中 $AB = 6$，$AC = 8$，$BC = 10$，将 $\triangle ABC$ 沿 $BC$ 方向平移 $4$ 个单位得到 $\triangle A'B'C'$。求重叠部分（四边形）的面积。
+
+![](../figures/svg/q-d-30.svg)
 
 **D.31** ☆☆（出题点：旋转 60° / 费马点雏形；模型：part9/03）
 等边三角形 $ABC$ 内一点 $P$ 满足 $PA = 3$，$PB = 4$，$PC = 5$。将 $\triangle APB$ 绕 $A$ 顺时针旋转 $60°$，求 $\angle APB$ 的度数。
 
+![](../figures/svg/q-d-31.svg)
+
 **D.32** ☆☆（出题点：折叠（轴对称）；模型：part9/04）
 矩形 $ABCD$ 中 $AB = 6$，$BC = 8$。将 $\triangle BCD$ 沿对角线 $BD$ 折叠，$C$ 落到 $C'$。$AC'$ 交 $BD$ 于 $E$。求 $AC'$ 与 $DE$ 的长。
+
+![](../figures/svg/q-d-32.svg)
 
 ---
 
@@ -127,14 +191,22 @@ $\triangle ABC$ 中 $AB = 6$，$AC = 8$，$BC = 10$，将 $\triangle ABC$ 沿 $B
 **D.33** ☆☆（出题点：仰角俯角；模型：part7/01）
 小明在地面 $A$ 点测得塔顶 $C$ 仰角为 $30°$，前进 $20$ 米至 $B$ 点测得仰角为 $45°$（$A$、$B$、塔基共线）。求塔高（保留根号）。
 
+![](../figures/svg/q-d-33.svg)
+
 **D.34** ☆☆（出题点：方位角 / 航海；模型：part7/02）
 轮船由 $A$ 出发沿北偏东 $30°$ 航行 $20$ 海里至 $B$，再沿北偏西 $60°$ 航行 $30$ 海里至 $C$。求 $A$、$C$ 之间距离及 $C$ 相对 $A$ 的方位角。
+
+![](../figures/svg/q-d-34.svg)
 
 **D.35** ☆☆（出题点：坡度坡比；模型：part7/03）
 某斜坡坡比 $i = 1 : \sqrt{3}$，坡面长 $20$ 米。求该坡的坡角、水平距离与垂直高度。
 
+![](../figures/svg/q-d-35.svg)
+
 **D.36** ☆☆（出题点：双直角三角形 + 公共边；模型：part7/04）
 如图，$\triangle ABC$ 中 $\angle B = 45°$，$\angle C = 30°$，$BC = 10 + 10\sqrt{3}$。过 $A$ 作 $AD \perp BC$ 于 $D$。求 $AD$ 与 $AB$、$AC$ 的长。
+
+![](../figures/svg/q-d-36.svg)
 
 ---
 
@@ -146,11 +218,17 @@ $\triangle ABC$ 中 $AB = 6$，$AC = 8$，$BC = 10$，将 $\triangle ABC$ 沿 $B
 **D.38** ☆☆（出题点：坐标系内三角形面积；模型：part3/03）
 $\triangle ABC$ 三顶点为 $A(1, 2)$、$B(5, 2)$、$C(3, 6)$。判断三角形形状并求其面积及 $AB$ 边上的高。
 
+![](../figures/svg/q-d-38.svg)
+
 **D.39** ☆☆（出题点：一次函数 + 几何（动点）；模型：part3/04）
 直线 $y = -\frac{3}{4}x + 3$ 与 $x$ 轴、$y$ 轴分别交于 $A$、$B$。点 $P$ 在线段 $AB$ 上运动，过 $P$ 作 $x$ 轴的垂线交 $x$ 轴于 $Q$。设 $OQ = t$，矩形 $OQPM$（$M$ 在 $y$ 轴上）面积为 $S$。求 $S$ 关于 $t$ 的函数关系式与最大值。
 
+![](../figures/svg/q-d-39.svg)
+
 **D.40** ☆☆（出题点：反比例 + 一次函数交点；模型：part3/05）
 反比例函数 $y = \frac{k}{x}$（$k > 0$）与一次函数 $y = x - 2$ 交于 $A$、$B$ 两点。若 $\triangle AOB$ 面积为 $6$（$O$ 为坐标原点），求 $k$ 的值及 $A$、$B$ 坐标。
+
+![](../figures/svg/q-d-40.svg)
 
 ---
 
