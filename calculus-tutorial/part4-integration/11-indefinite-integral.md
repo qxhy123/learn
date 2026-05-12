@@ -295,6 +295,298 @@ $$I = \frac{e^x(\cos x + \sin x)}{2} + C$$
 
 ---
 
+## 11.6 常用积分公式的完整推导
+
+本节把第 11.2 节列出的基本积分公式逐条推导。整体策略：
+
+1. **求导反推法**：积分 = 反向求导，直接验证 $F'(x)=f(x)$ 即可；
+2. **凑微分**：用第一类换元把目标化为已知形式；
+3. **三角代换 / 部分分式**：处理 $\sqrt{a^2\pm x^2}$、$\dfrac{1}{x^2-a^2}$ 等含根式或有理函数；
+4. **分部积分**：处理 $\ln x$、$\arctan x$ 这类反函数与对数。
+
+下面所有"$C$"均代表任意积分常数；为简洁起见，每条结论的验证步骤只写出关键一步求导。
+
+### 11.6.1 幂函数
+
+**公式**：$\displaystyle\int x^n\,dx=\frac{x^{n+1}}{n+1}+C$（$n\ne-1$）。
+
+**推导**：直接求导验证
+
+$$
+\left(\frac{x^{n+1}}{n+1}\right)'=\frac{(n+1)x^{n}}{n+1}=x^n.
+$$
+
+由原函数结构定理，全部原函数为 $\dfrac{x^{n+1}}{n+1}+C$。
+
+**$n=-1$ 例外**：此时 $\dfrac{x^{n+1}}{n+1}=\dfrac{x^0}{0}$ 无意义，必须单独处理（见 11.6.2）。
+
+### 11.6.2 倒数函数 $\displaystyle\int\frac{1}{x}\,dx=\ln|x|+C$
+
+**$x>0$**：由 $(\ln x)'=\dfrac{1}{x}$ 直接得 $\displaystyle\int\frac{1}{x}\,dx=\ln x+C$。
+
+**$x<0$**：令 $u=-x>0$，则 $du=-dx$，所以
+
+$$
+\int\frac{1}{x}\,dx=\int\frac{1}{-u}(-du)=\int\frac{1}{u}\,du=\ln u+C=\ln(-x)+C.
+$$
+
+合并两段：$\displaystyle\int\frac{1}{x}\,dx=\ln|x|+C$（$x\ne 0$）。
+
+> **注**：原函数只在不含 $x=0$ 的连通区间上"差一个常数"。$x>0$ 与 $x<0$ 上的两段，常数可以不同；上式中的 $C$ 应理解为分段常数。
+
+### 11.6.3 指数函数
+
+**$\displaystyle\int e^x\,dx=e^x+C$**：由 $(e^x)'=e^x$ 直接得。
+
+**$\displaystyle\int a^x\,dx=\dfrac{a^x}{\ln a}+C$**（$a>0,\ a\ne 1$）：
+
+$$
+\left(\frac{a^x}{\ln a}\right)'=\frac{a^x\ln a}{\ln a}=a^x.
+$$
+
+或等价地用 $a^x=e^{x\ln a}$ 与凑微分：
+
+$$
+\int a^x\,dx=\int e^{x\ln a}\,dx=\frac{1}{\ln a}\int e^{x\ln a}\,d(x\ln a)=\frac{e^{x\ln a}}{\ln a}+C=\frac{a^x}{\ln a}+C.
+$$
+
+### 11.6.4 基本三角函数
+
+| 公式 | 验证 |
+|:---|:---|
+| $\displaystyle\int\cos x\,dx=\sin x+C$ | $(\sin x)'=\cos x$ |
+| $\displaystyle\int\sin x\,dx=-\cos x+C$ | $(-\cos x)'=\sin x$ |
+| $\displaystyle\int\sec^2 x\,dx=\tan x+C$ | $(\tan x)'=\sec^2 x$ |
+| $\displaystyle\int\csc^2 x\,dx=-\cot x+C$ | $(-\cot x)'=\csc^2 x$ |
+| $\displaystyle\int\sec x\tan x\,dx=\sec x+C$ | $(\sec x)'=\sec x\tan x$ |
+| $\displaystyle\int\csc x\cot x\,dx=-\csc x+C$ | $(-\csc x)'=\csc x\cot x$ |
+
+### 11.6.5 $\tan,\cot,\sec,\csc$ 的积分
+
+**$\displaystyle\int\tan x\,dx$**：
+
+$$
+\int\tan x\,dx=\int\frac{\sin x}{\cos x}\,dx=-\int\frac{d(\cos x)}{\cos x}=-\ln|\cos x|+C=\ln|\sec x|+C.
+$$
+
+**$\displaystyle\int\cot x\,dx$**：
+
+$$
+\int\cot x\,dx=\int\frac{\cos x}{\sin x}\,dx=\int\frac{d(\sin x)}{\sin x}=\ln|\sin x|+C.
+$$
+
+**$\displaystyle\int\sec x\,dx=\ln|\sec x+\tan x|+C$**：
+
+经典技巧——分子分母乘以 $\sec x+\tan x$：
+
+$$
+\int\sec x\,dx=\int\frac{\sec x(\sec x+\tan x)}{\sec x+\tan x}\,dx=\int\frac{\sec^2 x+\sec x\tan x}{\sec x+\tan x}\,dx.
+$$
+
+注意到分子恰好是分母 $\sec x+\tan x$ 的导数，故
+
+$$
+=\int\frac{d(\sec x+\tan x)}{\sec x+\tan x}=\ln|\sec x+\tan x|+C.
+$$
+
+**$\displaystyle\int\csc x\,dx=-\ln|\csc x+\cot x|+C=\ln|\csc x-\cot x|+C$**：
+
+完全对应技巧——乘以 $\csc x-\cot x$ 后凑微分。
+
+### 11.6.6 反三角函数相关：$\frac{1}{\sqrt{1-x^2}}$ 与 $\frac{1}{1+x^2}$
+
+**$\displaystyle\int\frac{1}{\sqrt{1-x^2}}\,dx=\arcsin x+C$**：
+
+由 $(\arcsin x)'=\dfrac{1}{\sqrt{1-x^2}}$ 直接得。也可三角代换 $x=\sin t$ 验证（见 11.4.1 例 11.7）。
+
+**$\displaystyle\int\frac{1}{\sqrt{a^2-x^2}}\,dx=\arcsin\dfrac{x}{a}+C$**（$a>0$）：
+
+令 $x=au$，$dx=a\,du$：
+
+$$
+\int\frac{a\,du}{\sqrt{a^2-a^2u^2}}=\int\frac{du}{\sqrt{1-u^2}}=\arcsin u+C=\arcsin\frac{x}{a}+C.
+$$
+
+**$\displaystyle\int\frac{1}{1+x^2}\,dx=\arctan x+C$**：由 $(\arctan x)'=\dfrac{1}{1+x^2}$。
+
+**$\displaystyle\int\frac{1}{a^2+x^2}\,dx=\dfrac{1}{a}\arctan\dfrac{x}{a}+C$**：
+
+令 $x=au$：
+
+$$
+\int\frac{a\,du}{a^2+a^2u^2}=\frac{1}{a}\int\frac{du}{1+u^2}=\frac{1}{a}\arctan u+C=\frac{1}{a}\arctan\frac{x}{a}+C.
+$$
+
+### 11.6.7 含 $\sqrt{x^2\pm a^2}$ 的积分
+
+**$\displaystyle\int\frac{1}{\sqrt{x^2+a^2}}\,dx=\ln\!\left(x+\sqrt{x^2+a^2}\right)+C$**（$a>0$）：
+
+令 $x=a\tan t$，$t\in(-\tfrac\pi2,\tfrac\pi2)$，$dx=a\sec^2 t\,dt$，$\sqrt{x^2+a^2}=a\sec t$（取正）。
+
+$$
+\int\frac{a\sec^2 t}{a\sec t}\,dt=\int\sec t\,dt=\ln|\sec t+\tan t|+C.
+$$
+
+由 $\tan t=\dfrac{x}{a}$、$\sec t=\dfrac{\sqrt{x^2+a^2}}{a}$ 代回：
+
+$$
+=\ln\!\left|\frac{\sqrt{x^2+a^2}+x}{a}\right|+C=\ln\!\left(x+\sqrt{x^2+a^2}\right)+C'.
+$$
+
+（吸收了常数 $-\ln a$。）
+
+**$\displaystyle\int\frac{1}{\sqrt{x^2-a^2}}\,dx=\ln\!\left|x+\sqrt{x^2-a^2}\right|+C$**（$|x|>a>0$）：
+
+令 $x=a\sec t$，$dx=a\sec t\tan t\,dt$，$\sqrt{x^2-a^2}=a|\tan t|$。
+
+$$
+\int\frac{a\sec t\tan t}{a|\tan t|}\,dt=\pm\int\sec t\,dt=\pm\ln|\sec t+\tan t|+C.
+$$
+
+代回 $\sec t=\dfrac{x}{a}$，并合并常数得 $\ln|x+\sqrt{x^2-a^2}|+C$。
+
+两式合并写作
+
+$$
+\int\frac{1}{\sqrt{x^2\pm a^2}}\,dx=\ln\!\left|x+\sqrt{x^2\pm a^2}\right|+C.
+$$
+
+### 11.6.8 $\frac{1}{x^2-a^2}$ 与部分分式
+
+**$\displaystyle\int\frac{1}{x^2-a^2}\,dx=\frac{1}{2a}\ln\!\left|\frac{x-a}{x+a}\right|+C$**：
+
+因式分解 $x^2-a^2=(x-a)(x+a)$，部分分式分解：
+
+$$
+\frac{1}{(x-a)(x+a)}=\frac{1}{2a}\!\left(\frac{1}{x-a}-\frac{1}{x+a}\right).
+$$
+
+逐项积分：
+
+$$
+\int\frac{1}{x^2-a^2}\,dx=\frac{1}{2a}\bigl(\ln|x-a|-\ln|x+a|\bigr)+C=\frac{1}{2a}\ln\!\left|\frac{x-a}{x+a}\right|+C.
+$$
+
+**对应地**：$\displaystyle\int\frac{1}{a^2-x^2}\,dx=\frac{1}{2a}\ln\!\left|\frac{a+x}{a-x}\right|+C$。
+
+### 11.6.9 含根式：$\sqrt{a^2-x^2}$、$\sqrt{x^2+a^2}$、$\sqrt{x^2-a^2}$
+
+**$\displaystyle\int\sqrt{a^2-x^2}\,dx=\frac{x\sqrt{a^2-x^2}}{2}+\frac{a^2}{2}\arcsin\frac{x}{a}+C$**：
+
+令 $x=a\sin t$，$dx=a\cos t\,dt$，$\sqrt{a^2-x^2}=a\cos t$。
+
+$$
+\int a^2\cos^2 t\,dt=\frac{a^2}{2}\int(1+\cos 2t)\,dt=\frac{a^2}{2}\!\left(t+\frac{\sin 2t}{2}\right)+C=\frac{a^2}{2}(t+\sin t\cos t)+C.
+$$
+
+代回得结果（详见 11.4.1 例 11.8）。
+
+**$\displaystyle\int\sqrt{x^2+a^2}\,dx=\frac{x\sqrt{x^2+a^2}}{2}+\frac{a^2}{2}\ln\!\left(x+\sqrt{x^2+a^2}\right)+C$**：
+
+令 $x=a\tan t$，化为 $a^2\int\sec^3 t\,dt$，再用降阶公式（分部积分）求出
+
+$$
+\int\sec^3 t\,dt=\frac12\bigl(\sec t\tan t+\ln|\sec t+\tan t|\bigr)+C.
+$$
+
+代回即得。
+
+**$\displaystyle\int\sqrt{x^2-a^2}\,dx=\frac{x\sqrt{x^2-a^2}}{2}-\frac{a^2}{2}\ln\!\left|x+\sqrt{x^2-a^2}\right|+C$**：
+
+令 $x=a\sec t$，方法同上。
+
+### 11.6.10 反三角函数与对数函数的积分
+
+**$\displaystyle\int\ln x\,dx=x\ln x-x+C$**：分部积分，取 $u=\ln x$、$dv=dx$：
+
+$$
+\int\ln x\,dx=x\ln x-\int x\cdot\frac{1}{x}\,dx=x\ln x-x+C.
+$$
+
+**$\displaystyle\int\arctan x\,dx=x\arctan x-\frac12\ln(1+x^2)+C$**：取 $u=\arctan x$、$dv=dx$：
+
+$$
+=x\arctan x-\int\frac{x}{1+x^2}\,dx=x\arctan x-\frac12\ln(1+x^2)+C.
+$$
+
+**$\displaystyle\int\arcsin x\,dx=x\arcsin x+\sqrt{1-x^2}+C$**：取 $u=\arcsin x$、$dv=dx$：
+
+$$
+=x\arcsin x-\int\frac{x}{\sqrt{1-x^2}}\,dx=x\arcsin x+\sqrt{1-x^2}+C.
+$$
+
+最后一步用了 $\displaystyle\int\dfrac{x\,dx}{\sqrt{1-x^2}}=-\sqrt{1-x^2}+C$（凑微分 $d(1-x^2)=-2x\,dx$）。
+
+### 11.6.11 双曲函数
+
+**$\displaystyle\int\sinh x\,dx=\cosh x+C$**、**$\displaystyle\int\cosh x\,dx=\sinh x+C$**：由 $\sinh'=\cosh,\ \cosh'=\sinh$ 直接得。
+
+**$\displaystyle\int\operatorname{sech}^2 x\,dx=\tanh x+C$**：由 $(\tanh x)'=\operatorname{sech}^2 x$。
+
+**$\displaystyle\int\tanh x\,dx=\ln\cosh x+C$**：凑微分
+
+$$
+\int\tanh x\,dx=\int\frac{\sinh x}{\cosh x}\,dx=\int\frac{d(\cosh x)}{\cosh x}=\ln\cosh x+C.
+$$
+
+### 11.6.12 高斯积分
+
+**$\displaystyle\int_{-\infty}^{+\infty} e^{-x^2}\,dx=\sqrt\pi$**：
+
+这是**不能用初等函数表达不定积分**的标志性例子，$\int e^{-x^2}\,dx$ 没有初等闭形式（结果记为 $\dfrac{\sqrt\pi}{2}\operatorname{erf}(x)+C$）。但定积分有美丽的精确值，常见证法：
+
+设 $I=\displaystyle\int_{-\infty}^{+\infty}e^{-x^2}\,dx$，考虑
+
+$$
+I^2=\left(\int_{-\infty}^{+\infty}e^{-x^2}\,dx\right)\!\!\left(\int_{-\infty}^{+\infty}e^{-y^2}\,dy\right)=\iint_{\mathbb R^2}e^{-(x^2+y^2)}\,dx\,dy.
+$$
+
+转极坐标 $x=r\cos\theta,\ y=r\sin\theta$，$dx\,dy=r\,dr\,d\theta$：
+
+$$
+I^2=\int_0^{2\pi}\!\!\int_0^\infty e^{-r^2}r\,dr\,d\theta=2\pi\cdot\frac12=\pi.
+$$
+
+所以 $I=\sqrt\pi$。
+
+由此可得正态分布的归一化常数：
+
+$$
+\int_{-\infty}^{+\infty}\frac{1}{\sqrt{2\pi}\sigma}e^{-(x-\mu)^2/(2\sigma^2)}\,dx=1.
+$$
+
+### 11.6.13 完整公式表（含推导依据）
+
+| 积分 | 结果 | 推导依据 |
+|:---:|:---:|:---:|
+| $\displaystyle\int x^n\,dx$（$n\ne-1$） | $\dfrac{x^{n+1}}{n+1}+C$ | 求导反推 |
+| $\displaystyle\int\dfrac{1}{x}\,dx$ | $\ln\|x\|+C$ | $(\ln\|x\|)'=\dfrac{1}{x}$ |
+| $\displaystyle\int e^x\,dx$ | $e^x+C$ | 求导反推 |
+| $\displaystyle\int a^x\,dx$ | $\dfrac{a^x}{\ln a}+C$ | $a^x=e^{x\ln a}$ |
+| $\displaystyle\int\sin x\,dx$ | $-\cos x+C$ | 求导反推 |
+| $\displaystyle\int\cos x\,dx$ | $\sin x+C$ | 求导反推 |
+| $\displaystyle\int\tan x\,dx$ | $-\ln\|\cos x\|+C$ | 凑微分 $d(\cos x)$ |
+| $\displaystyle\int\cot x\,dx$ | $\ln\|\sin x\|+C$ | 凑微分 $d(\sin x)$ |
+| $\displaystyle\int\sec x\,dx$ | $\ln\|\sec x+\tan x\|+C$ | 乘 $(\sec x+\tan x)$ 凑微分 |
+| $\displaystyle\int\csc x\,dx$ | $\ln\|\csc x-\cot x\|+C$ | 乘 $(\csc x-\cot x)$ 凑微分 |
+| $\displaystyle\int\sec^2 x\,dx$ | $\tan x+C$ | 求导反推 |
+| $\displaystyle\int\csc^2 x\,dx$ | $-\cot x+C$ | 求导反推 |
+| $\displaystyle\int\dfrac{dx}{\sqrt{a^2-x^2}}$ | $\arcsin\dfrac{x}{a}+C$ | 三角代换 $x=a\sin t$ |
+| $\displaystyle\int\dfrac{dx}{a^2+x^2}$ | $\dfrac{1}{a}\arctan\dfrac{x}{a}+C$ | 代换 $x=au$ |
+| $\displaystyle\int\dfrac{dx}{\sqrt{x^2\pm a^2}}$ | $\ln\|x+\sqrt{x^2\pm a^2}\|+C$ | 三角代换 + $\int\sec t\,dt$ |
+| $\displaystyle\int\dfrac{dx}{x^2-a^2}$ | $\dfrac{1}{2a}\ln\left\|\dfrac{x-a}{x+a}\right\|+C$ | 部分分式 |
+| $\displaystyle\int\sqrt{a^2-x^2}\,dx$ | $\tfrac{x\sqrt{a^2-x^2}}{2}+\tfrac{a^2}{2}\arcsin\tfrac{x}{a}+C$ | 三角代换 + 倍角 |
+| $\displaystyle\int\sqrt{x^2+a^2}\,dx$ | $\tfrac{x\sqrt{x^2+a^2}}{2}+\tfrac{a^2}{2}\ln(x+\sqrt{x^2+a^2})+C$ | 三角代换 + $\int\sec^3 t\,dt$ |
+| $\displaystyle\int\ln x\,dx$ | $x\ln x-x+C$ | 分部积分 |
+| $\displaystyle\int\arctan x\,dx$ | $x\arctan x-\tfrac12\ln(1+x^2)+C$ | 分部积分 |
+| $\displaystyle\int\arcsin x\,dx$ | $x\arcsin x+\sqrt{1-x^2}+C$ | 分部积分 |
+| $\displaystyle\int\sinh x\,dx$ | $\cosh x+C$ | 求导反推 |
+| $\displaystyle\int\cosh x\,dx$ | $\sinh x+C$ | 求导反推 |
+| $\displaystyle\int\tanh x\,dx$ | $\ln\cosh x+C$ | 凑微分 |
+| $\displaystyle\int_{-\infty}^{+\infty}e^{-x^2}\,dx$ | $\sqrt\pi$ | 二维极坐标 |
+
+---
+
 ## 本章小结
 
 1. **原函数与不定积分**：若 $F'(x) = f(x)$，则 $F(x)$ 是 $f(x)$ 的原函数。$f(x)$ 的全部原函数构成不定积分 $\int f(x) \, dx = F(x) + C$。
@@ -316,7 +608,7 @@ $$I = \frac{e^x(\cos x + \sin x)}{2} + C$$
 
 不定积分不只是抽象的数学工具——在深度学习中，积分是概率论、信息论和变分推断的核心语言。本节展示积分如何出现在现代机器学习的关键概念中。
 
-### 11.6.1 概率密度函数与积分
+### 11.7.1 概率密度函数与积分
 
 概率密度函数 $p(x)$ 描述连续随机变量的分布，其核心约束是**归一化条件**：
 $$\int_{-\infty}^{\infty} p(x) \, dx = 1$$
@@ -329,7 +621,7 @@ $$p(x) = \frac{1}{\sigma\sqrt{2\pi}} \exp\!\left(-\frac{(x-\mu)^2}{2\sigma^2}\ri
 
 其中 $\sigma$ 正是保证 $\int_{-\infty}^{\infty} p(x) \, dx = 1$ 成立的归一化因子。
 
-### 11.6.2 期望的积分形式
+### 11.7.2 期望的积分形式
 
 随机变量函数的**期望**定义为：
 $$\mathbb{E}[f(X)] = \int_{-\infty}^{\infty} f(x) \, p(x) \, dx$$
@@ -340,7 +632,7 @@ $$\mathcal{L}(\theta) = \mathbb{E}_{(x,y) \sim p_{\text{data}}}\!\left[\|f_\thet
 其中 $p_{\text{data}}$ 是数据的真实分布。由于我们只能用有限样本近似，训练时将积分替换为样本均值（蒙特卡洛估计）：
 $$\mathcal{L}(\theta) \approx \frac{1}{N} \sum_{i=1}^{N} \|f_\theta(x_i) - y_i\|^2$$
 
-### 11.6.3 KL散度与交叉熵
+### 11.7.3 KL散度与交叉熵
 
 **KL散度**（Kullback-Leibler 散度）衡量分布 $q$ 与分布 $p$ 之间的差异：
 $$D_{\mathrm{KL}}(p \| q) = \int p(x) \log \frac{p(x)}{q(x)} \, dx$$
@@ -355,7 +647,7 @@ $$H(p, q) = -\int p(x) \log q(x) \, dx = H(p) + D_{\mathrm{KL}}(p \| q)$$
 
 分类任务的交叉熵损失正是对真实分布与模型预测分布之间交叉熵的蒙特卡洛估计。
 
-### 11.6.4 重参数化技巧
+### 11.7.4 重参数化技巧
 
 在变分自编码器（VAE）中，需要对 $z \sim q_\phi(z|x)$ 求期望的梯度：
 $$\nabla_\phi \mathbb{E}_{z \sim q_\phi(z|x)}[f(z)] = \nabla_\phi \int f(z) \, q_\phi(z|x) \, dz$$
@@ -370,7 +662,7 @@ $$\mathbb{E}_{z \sim \mathcal{N}(\mu_\phi, \sigma_\phi^2)}[f(z)] = \mathbb{E}_{\
 
 此时梯度可以移入期望内部，允许通过反向传播训练编码器参数。
 
-### 11.6.5 代码示例
+### 11.7.5 代码示例
 
 ```python
 import torch
