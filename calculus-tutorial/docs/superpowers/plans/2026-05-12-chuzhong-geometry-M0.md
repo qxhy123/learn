@@ -693,3 +693,6 @@ git commit -m "docs(chuzhong): mark M0 milestone complete"
 - **图形处理**：M0 不需要 TikZ / SVG 图（思维工具箱以文字描述为主）—— spec §4 允许这种处理 ✓
 - **粒度**：每个 Task = 一个文件 = 一次提交，符合 "frequent commits" 原则 ✓
 
+
+---
+**M0 完成于：2026-05-12**
