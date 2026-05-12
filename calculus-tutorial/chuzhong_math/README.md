@@ -18,9 +18,13 @@
 
 ## 目录
 
+### 年级标签说明
+
+`[初一上]` `[初一下]` `[初二上]` `[初二下]` `[初三上]` `[初三下]` 对应人教版教材的开课学期；`[初三复习]` 是中考综合题型（散见于各年级，初三集中训练）。同一章可能横跨多年级——以**该知识点首次系统教授**的学期为准。
+
 ### 方法论（先读这部分）
-- [序言：什么是几何思维](00-preface.md)
-- [思维工具箱](thinking-toolkit/)
+- [序言：什么是几何思维](00-preface.md) `[通用]`
+- [思维工具箱](thinking-toolkit/) `[通用 / 初三复习集中读]`
   - [01. 何时该作辅助线](thinking-toolkit/01-when-to-draw-auxiliary-line.md)
   - [02. 常见辅助线总目录](thinking-toolkit/02-auxiliary-line-catalog.md)
   - [03. 模型识别速查](thinking-toolkit/03-model-recognition.md)
@@ -28,87 +32,87 @@
   - [05. 开题前的自检清单](thinking-toolkit/05-checklist-before-solving.md)
 
 ### 知识章节（按需阅读）
-- Part 1：图形初步 ✓
+- Part 1：图形初步 ✓ `[初一上]`
   - [01. 点、线、面、体](part1-foundations/01-point-line-plane.md)
   - [02. 角](part1-foundations/02-angles.md)
   - [03. 角平分线](part1-foundations/03-angle-bisector.md)
   - [04. 余角与补角](part1-foundations/04-complementary-supplementary.md)
-- Part 2：相交线与平行线 ✓
+- Part 2：相交线与平行线 ✓ `[初一下]`
   - [01. 对顶角与邻补角](part2-parallel-lines/01-vertical-and-adjacent-angles.md)
   - [02. 垂线、点到直线的距离](part2-parallel-lines/02-perpendicular-line.md)
   - [03. 三线八角](part2-parallel-lines/03-three-line-eight-angles.md)
   - [04. 平行线的判定](part2-parallel-lines/04-parallel-criteria.md)
   - [05. 平行线的性质与应用](part2-parallel-lines/05-parallel-properties.md)
 - Part 3：三角形 ✓
-  - basics/
-    - [01. 三角形三边关系](part3-triangles/basics/01-triangle-inequality.md)
-    - [02. 内角和与外角](part3-triangles/basics/02-angle-sum.md)
-    - [03. 三角形的分类](part3-triangles/basics/03-classification.md)
-  - congruence/
-    - [01. 全等判定 SSS/SAS/ASA/AAS](part3-triangles/congruence/01-sss-sas-asa-aas.md)
-    - [02. 直角三角形 HL](part3-triangles/congruence/02-hl-right-triangle.md)
-    - [03. 手拉手模型](part3-triangles/congruence/03-model-hand-in-hand.md) ⭐️
-    - [04. 半角模型](part3-triangles/congruence/04-model-half-angle.md) ⭐️
-    - [05. 一线三等角（K 字模型）](part3-triangles/congruence/05-model-one-line-three-angles.md) ⭐️
-    - [06. 倍长中线模型](part3-triangles/congruence/06-model-double-median.md) ⭐️
-  - similarity/
-    - [01. 相似三角形判定](part3-triangles/similarity/01-similarity-criteria.md)
-    - [02. A 字/X 字/8 字相似模型](part3-triangles/similarity/02-model-A-and-X.md) ⭐️
-    - [03. 母子相似与射影定理](part3-triangles/similarity/03-model-mother-child.md) ⭐️
-    - [04. 共角共边相似模型](part3-triangles/similarity/04-model-shared-angle.md) ⭐️
-  - right-triangle/
-    - [01. 勾股定理](part3-triangles/right-triangle/01-pythagoras.md)
-    - [02. 勾股定理的逆定理](part3-triangles/right-triangle/02-pythagoras-converse.md)
-    - [03. 特殊直角三角形（30-60-90 / 45-45-90）](part3-triangles/right-triangle/03-special-right-triangles.md)
-  - special/
-    - [01. 等腰三角形](part3-triangles/special/01-isosceles.md)
-    - [02. 等边三角形](part3-triangles/special/02-equilateral.md)
-    - [03. 三角形的四心](part3-triangles/special/03-four-centers.md)
-- Part 4：四边形 ✓
-  - [01. 多边形的内角和与外角和](part4-quadrilaterals/01-polygon-angles.md)
-  - [02. 平行四边形](part4-quadrilaterals/02-parallelogram.md)
-  - [03. 矩形](part4-quadrilaterals/03-rectangle.md)
-  - [04. 菱形](part4-quadrilaterals/04-rhombus.md)
-  - [05. 正方形](part4-quadrilaterals/05-square.md)
-  - [06. 梯形与等腰梯形](part4-quadrilaterals/06-trapezoid.md)
-  - [07. 中位线定理](part4-quadrilaterals/07-midsegment.md)
-  - [08. 中点四边形模型](part4-quadrilaterals/08-model-midpoint-quadrilateral.md) ⭐️
-- Part 5：圆 ✓
-  - [01. 圆的基本概念](part5-circles/01-circle-basics.md)
-  - [02. 垂径定理](part5-circles/02-perpendicular-chord.md)
-  - [03. 圆周角定理](part5-circles/03-inscribed-angle.md)
-  - [04. 点、直线、圆与圆的位置关系](part5-circles/04-position-relations.md)
-  - [05. 切线的判定与性质](part5-circles/05-tangent-criteria.md)
-  - [06. 切线长定理与三角形的内切圆](part5-circles/06-tangent-length.md)
-  - [07. 切割线模型](part5-circles/07-model-tangent-secant.md) ⭐️
-  - [08. 四点共圆模型](part5-circles/08-model-four-points-concyclic.md) ⭐️
+  - basics/ `[初一下 / 初二上]`
+    - [01. 三角形三边关系](part3-triangles/basics/01-triangle-inequality.md) `[初一下]`
+    - [02. 内角和与外角](part3-triangles/basics/02-angle-sum.md) `[初一下]`
+    - [03. 三角形的分类](part3-triangles/basics/03-classification.md) `[初一下]`
+  - congruence/ `[初二上]`
+    - [01. 全等判定 SSS/SAS/ASA/AAS](part3-triangles/congruence/01-sss-sas-asa-aas.md) `[初二上]`
+    - [02. 直角三角形 HL](part3-triangles/congruence/02-hl-right-triangle.md) `[初二上 / 需勾股先行]`
+    - [03. 手拉手模型](part3-triangles/congruence/03-model-hand-in-hand.md) ⭐️ `[初二上 / 初三上深化]`
+    - [04. 半角模型](part3-triangles/congruence/04-model-half-angle.md) ⭐️ `[初二下 / 初三复习]`
+    - [05. 一线三等角（K 字模型）](part3-triangles/congruence/05-model-one-line-three-angles.md) ⭐️ `[初三下 / 初三复习]`
+    - [06. 倍长中线模型](part3-triangles/congruence/06-model-double-median.md) ⭐️ `[初二上]`
+  - similarity/ `[初三下]`
+    - [01. 相似三角形判定](part3-triangles/similarity/01-similarity-criteria.md) `[初三下]`
+    - [02. A 字/X 字/8 字相似模型](part3-triangles/similarity/02-model-A-and-X.md) ⭐️ `[初三下]`
+    - [03. 母子相似与射影定理](part3-triangles/similarity/03-model-mother-child.md) ⭐️ `[初三下]`
+    - [04. 共角共边相似模型](part3-triangles/similarity/04-model-shared-angle.md) ⭐️ `[初三下 / 初三复习]`
+  - right-triangle/ `[初二下]`
+    - [01. 勾股定理](part3-triangles/right-triangle/01-pythagoras.md) `[初二下]`
+    - [02. 勾股定理的逆定理](part3-triangles/right-triangle/02-pythagoras-converse.md) `[初二下]`
+    - [03. 特殊直角三角形（30-60-90 / 45-45-90）](part3-triangles/right-triangle/03-special-right-triangles.md) `[初二下 / 初三下衔接]`
+  - special/ `[初二上 / 初三复习]`
+    - [01. 等腰三角形](part3-triangles/special/01-isosceles.md) `[初二上]`
+    - [02. 等边三角形](part3-triangles/special/02-equilateral.md) `[初二上]`
+    - [03. 三角形的四心](part3-triangles/special/03-four-centers.md) `[初二上 + 初三上 / 初三复习]`
+- Part 4：四边形 ✓ `[初二下]`
+  - [01. 多边形的内角和与外角和](part4-quadrilaterals/01-polygon-angles.md) `[初二下]`
+  - [02. 平行四边形](part4-quadrilaterals/02-parallelogram.md) `[初二下]`
+  - [03. 矩形](part4-quadrilaterals/03-rectangle.md) `[初二下]`
+  - [04. 菱形](part4-quadrilaterals/04-rhombus.md) `[初二下]`
+  - [05. 正方形](part4-quadrilaterals/05-square.md) `[初二下]`
+  - [06. 梯形与等腰梯形](part4-quadrilaterals/06-trapezoid.md) `[初二下 / 各地区版本差异]`
+  - [07. 中位线定理](part4-quadrilaterals/07-midsegment.md) `[初二下]`
+  - [08. 中点四边形模型](part4-quadrilaterals/08-model-midpoint-quadrilateral.md) ⭐️ `[初二下 / 初三复习]`
+- Part 5：圆 ✓ `[初三上]`
+  - [01. 圆的基本概念](part5-circles/01-circle-basics.md) `[初三上]`
+  - [02. 垂径定理](part5-circles/02-perpendicular-chord.md) `[初三上]`
+  - [03. 圆周角定理](part5-circles/03-inscribed-angle.md) `[初三上]`
+  - [04. 点、直线、圆与圆的位置关系](part5-circles/04-position-relations.md) `[初三上]`
+  - [05. 切线的判定与性质](part5-circles/05-tangent-criteria.md) `[初三上]`
+  - [06. 切线长定理与三角形的内切圆](part5-circles/06-tangent-length.md) `[初三上]`
+  - [07. 切割线模型](part5-circles/07-model-tangent-secant.md) ⭐️ `[初三上 / 初三复习]`
+  - [08. 四点共圆模型](part5-circles/08-model-four-points-concyclic.md) ⭐️ `[初三复习 / 拓展内容]`
 - Part 6：图形变换 ✓
-  - [01. 轴对称](part6-transformations/01-axial-symmetry.md)
-  - [02. 平移](part6-transformations/02-translation.md)
-  - [03. 旋转](part6-transformations/03-rotation.md)
-  - [04. 中心对称](part6-transformations/04-central-symmetry.md)
-  - [05. 位似](part6-transformations/05-homothety.md)
-  - [06. 翻折模型](part6-transformations/06-model-fold.md) ⭐️
-  - [07. 旋转构造模型](part6-transformations/07-model-rotation-tricks.md) ⭐️
-- Part 7：解直角三角形 ✓
-  - [01. 锐角三角函数](part7-solving-right-triangle/01-trig-ratios.md)
-  - [02. 特殊角的三角函数值](part7-solving-right-triangle/02-special-angles.md)
-  - [03. 解直角三角形的应用](part7-solving-right-triangle/03-applications.md)
-- Part 8：视图与投影 ✓
-  - [01. 三视图](part8-views-and-projections/01-three-views.md)
-  - [02. 平行投影与中心投影](part8-views-and-projections/02-projections.md)
-  - [03. 立体图形的展开图](part8-views-and-projections/03-unfoldings.md)
+  - [01. 轴对称](part6-transformations/01-axial-symmetry.md) `[初二上]`
+  - [02. 平移](part6-transformations/02-translation.md) `[初一下]`
+  - [03. 旋转](part6-transformations/03-rotation.md) `[初三上]`
+  - [04. 中心对称](part6-transformations/04-central-symmetry.md) `[初三上]`
+  - [05. 位似](part6-transformations/05-homothety.md) `[初三下]`
+  - [06. 翻折模型](part6-transformations/06-model-fold.md) ⭐️ `[初二上 / 初三复习]`
+  - [07. 旋转构造模型](part6-transformations/07-model-rotation-tricks.md) ⭐️ `[初三上 / 初三复习]`
+- Part 7：解直角三角形 ✓ `[初三下]`
+  - [01. 锐角三角函数](part7-solving-right-triangle/01-trig-ratios.md) `[初三下]`
+  - [02. 特殊角的三角函数值](part7-solving-right-triangle/02-special-angles.md) `[初三下]`
+  - [03. 解直角三角形的应用](part7-solving-right-triangle/03-applications.md) `[初三下]`
+- Part 8：视图与投影 ✓ `[初三下]`
+  - [01. 三视图](part8-views-and-projections/01-three-views.md) `[初三下]`
+  - [02. 平行投影与中心投影](part8-views-and-projections/02-projections.md) `[初三下]`
+  - [03. 立体图形的展开图](part8-views-and-projections/03-unfoldings.md) `[初一上 + 初三下]`
 - Part 9：坐标系中的几何 ✓
-  - [01. 坐标与图形变换](part9-coordinate-geometry/01-coords-and-transforms.md)
-  - [02. 两点间距离公式](part9-coordinate-geometry/02-distance-formula.md)
-  - [03. 坐标几何中的常见模型](part9-coordinate-geometry/03-coord-geometry-models.md)
-- Part 10：中考综合题专题 ✓
-  - [01. 线上动点问题](part10-comprehensive/01-moving-point-on-line.md) ⭐️
-  - [02. 抛物线 / 坐标系动点问题](part10-comprehensive/02-moving-point-on-parabola.md) ⭐️
-  - [03. 几何最值：将军饮马、胡不归、阿氏圆](part10-comprehensive/03-geometry-max-min.md) ⭐️
-  - [04. 存在性问题](part10-comprehensive/04-existence-problems.md) ⭐️
-  - [05. 折叠综合问题](part10-comprehensive/05-fold-comprehensive.md) ⭐️
-  - [06. 旋转综合问题](part10-comprehensive/06-rotation-comprehensive.md) ⭐️
+  - [01. 坐标与图形变换](part9-coordinate-geometry/01-coords-and-transforms.md) `[初一下 + 初二上 + 初三上 跨年级整合]`
+  - [02. 两点间距离公式](part9-coordinate-geometry/02-distance-formula.md) `[初二下 / 初三复习]`
+  - [03. 坐标几何中的常见模型](part9-coordinate-geometry/03-coord-geometry-models.md) `[初三复习]`
+- Part 10：中考综合题专题 ✓ `[初三复习]`
+  - [01. 线上动点问题](part10-comprehensive/01-moving-point-on-line.md) ⭐️ `[初三复习]`
+  - [02. 抛物线 / 坐标系动点问题](part10-comprehensive/02-moving-point-on-parabola.md) ⭐️ `[初三复习 / 须二次函数]`
+  - [03. 几何最值：将军饮马、胡不归、阿氏圆](part10-comprehensive/03-geometry-max-min.md) ⭐️ `[初三复习 / 拓展]`
+  - [04. 存在性问题](part10-comprehensive/04-existence-problems.md) ⭐️ `[初三复习]`
+  - [05. 折叠综合问题](part10-comprehensive/05-fold-comprehensive.md) ⭐️ `[初三复习]`
+  - [06. 旋转综合问题](part10-comprehensive/06-rotation-comprehensive.md) ⭐️ `[初三复习]`
 
 ### 附录 ✓
 - [A. 公式定理速查表](appendix/A-formula-sheet.md)
