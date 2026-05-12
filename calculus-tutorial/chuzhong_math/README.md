@@ -94,8 +94,14 @@
   - [01. 锐角三角函数](part7-solving-right-triangle/01-trig-ratios.md)
   - [02. 特殊角的三角函数值](part7-solving-right-triangle/02-special-angles.md)
   - [03. 解直角三角形的应用](part7-solving-right-triangle/03-applications.md)
-- Part 8：视图与投影 *(待写)*
-- Part 9：坐标系中的几何 *(待写)*
+- Part 8：视图与投影 ✓
+  - [01. 三视图](part8-views-and-projections/01-three-views.md)
+  - [02. 平行投影与中心投影](part8-views-and-projections/02-projections.md)
+  - [03. 立体图形的展开图](part8-views-and-projections/03-unfoldings.md)
+- Part 9：坐标系中的几何 ✓
+  - [01. 坐标与图形变换](part9-coordinate-geometry/01-coords-and-transforms.md)
+  - [02. 两点间距离公式](part9-coordinate-geometry/02-distance-formula.md)
+  - [03. 坐标几何中的常见模型](part9-coordinate-geometry/03-coord-geometry-models.md)
 - Part 10：中考综合题专题 *(待写)*
 
 ### 附录

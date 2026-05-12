@@ -188,3 +188,6 @@ Commit: `docs(chuzhong): add part9/03 (coordinate geometry models)`
 - 一致性扫描
 - README 更新 part8 和 part9 状态 ✓
 - 标记 M5 完成
+
+---
+**M5 完成于：2026-05-12**
