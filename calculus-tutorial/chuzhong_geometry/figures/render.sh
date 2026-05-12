@@ -2,7 +2,7 @@
 # 批量渲染 figures/src/{tikz,asy}/*.{tex,asy} → figures/svg/*.svg
 #
 # 依赖：pdflatex (MacTeX), asy (asymptote), pdf2svg
-# 用法：在 chuzhong_math/figures 目录下运行 ./render.sh
+# 用法：在 chuzhong_geometry/figures 目录下运行 ./render.sh
 #       或指定单个文件：./render.sh src/asy/handshake.asy
 
 set -euo pipefail
