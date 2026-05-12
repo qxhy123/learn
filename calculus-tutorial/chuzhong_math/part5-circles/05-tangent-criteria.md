@@ -17,6 +17,8 @@
 >
 > 用符号：若直线 $\ell$ 切 $\odot O$ 于点 $A$，则 $OA \perp \ell$。
 
+![切线性质：切线 ⊥ 过切点的半径](../figures/svg/thm-p5-05-tangent-radius.svg)
+
 **为什么**：直线 $\ell$ 与圆相切意味着 $d(O, \ell) = r$。设圆心 $O$ 到 $\ell$ 的垂足为 $H$，则 $OH = r$，$H$ 在圆上；又 $\ell$ 与 $\odot O$ 只有一个公共点，所以这个公共点必为 $H$，即切点 $A = H$。因此 $OA = OH \perp \ell$。
 
 这条性质有两条常用**推论**：
@@ -99,6 +101,8 @@
 
 > **干净版本**：$\triangle ABC$ 中 $AB = AC$，$AD \perp BC$ 于 $D$。以 $A$ 为圆心、$AD$ 为半径作 $\odot A$。证明：$BC$ 是 $\odot A$ 的切线。
 
+![例 2：等腰 △ABC，以 A 为圆心 AD 为半径，BC 切于 D（情形 A）](../figures/svg/ex-p5-05-2.svg)
+
 **思路**：直线 $BC$ 与 $\odot A$ 是否有已知公共点？$D$ 在 $BC$ 上，且 $AD$ 是 $\odot A$ 的半径，$AD$ 的外端 $D$ 在圆上——所以 $D$ 就是切点候选。这是**情形 A**。
 
 **连半径证垂直**：半径 $AD$ 已经画好。要证 $AD \perp BC$——这正是题目给的条件 $AD \perp BC$！所以 $AD$ 是 $\odot A$ 过外端 $D$ 且垂直于 $BC$ 的半径，由判定定理 $BC$ 切 $\odot A$ 于 $D$。证毕。
@@ -108,6 +112,8 @@
 ### 例 3（作垂线证半径：情形 B）
 
 > 直角三角形 $\triangle ABC$ 中 $\angle C = 90°$，$AC = 3, BC = 4, AB = 5$。以 $AB$ 为直径作 $\odot O$（圆心 $O$ 是 $AB$ 中点，半径 $r = \tfrac{5}{2}$）。问：直线 $BC$ 是否与 $\odot O$ 相切？若不相切，是相交还是相离？
+
+![例 3：3-4-5 直角△，以 AB 为直径作圆，作 OD ⊥ BC 比较 d 与 r](../figures/svg/ex-p5-05-3.svg)
 
 **思路**：直线 $BC$ 与 $\odot O$ 的交点没明确给出（$B$ 在直径上即在圆上，$C$ 不一定在圆上）——其实 $B$ 在圆上是显然的，所以这里也可以走情形 A：候选切点 $B$，连半径 $OB$，看是否 $OB \perp BC$。$O$ 是 $AB$ 中点、$OB$ 沿 $AB$ 方向，$\angle ABC$ 是 $\triangle ABC$ 在 $B$ 处的内角，不是直角（$\angle C = 90°$ 才是直角），所以 $OB \not\perp BC$，**$BC$ 不是切线**。
 

@@ -16,6 +16,8 @@
 
 $$\angle ACB = \frac{1}{2} \angle AOB.$$
 
+![圆周角定理：同弧的圆心角 (sample-inscribed-angle)](../figures/svg/sample-inscribed-angle.svg)
+
 ### 证明（三种情形）
 
 证明的关键是注意 $C$ 与圆心 $O$ 的相对位置不同时，图形结构略有差别，需要分三种情形讨论。三种情形的共同工具是：$\triangle OAC, \triangle OBC$ 均为等腰三角形（$OA = OC = OB = r$），加上三角形**外角定理**（一个外角等于不相邻两内角之和）。
@@ -41,6 +43,8 @@ $$\angle ACD = \frac{1}{2}\angle AOD,\quad \angle DCB = \frac{1}{2}\angle DOB.$$
 同样连 $CO$ 延长交圆于 $D$。这时 $CD$ 不在 $\angle ACB$ 内部，而在某一边的外侧，于是 $\angle ACB = \angle ACD - \angle BCD$（或 $\angle BCD - \angle ACD$，看 $D$ 偏哪一侧）。对每一部分用情形 1，然后**相减**而非相加，同样得到 $\angle ACB = \frac{1}{2}\angle AOB$。
 
 证毕。
+
+![圆周角定理三种证明情形：圆心在角边上 / 角内 / 角外](../figures/svg/thm-p5-03-inscribed-cases.svg)
 
 ## 三、三条核心推论
 
@@ -82,6 +86,8 @@ $$\angle A + \angle C = 180°,\quad \angle B + \angle D = 180°.$$
 
 > $\triangle ABC$ 内接于圆 $O$，$AB$ 是圆 $O$ 的直径。求 $\angle ACB$。若进一步给出 $AC = 6, BC = 8$，求圆 $O$ 的半径。
 
+![例 2：直径所对圆周角为直角，AC=6、BC=8、AB=10](../figures/svg/ex-p5-03-2.svg)
+
 **思路**：由推论 2，直径 $AB$ 所对的圆周角 $\angle ACB = 90°$。所以 $\triangle ACB$ 是直角三角形，直角顶点在 $C$。
 
 由勾股定理，$AB = \sqrt{AC^2 + BC^2} = \sqrt{36 + 64} = 10$。$AB$ 是直径，所以半径 $r = \frac{AB}{2} = 5$。
@@ -93,6 +99,8 @@ $$\angle A + \angle C = 180°,\quad \angle B + \angle D = 180°.$$
 ### 例 3（圆内接四边形对角互补）
 
 > 圆内接四边形 $ABCD$ 中，$\angle A = 80°$，$\angle B = 110°$。求 $\angle C$ 与 $\angle D$。
+
+![例 3：圆内接四边形 ABCD 对角互补](../figures/svg/ex-p5-03-3.svg)
 
 **思路**：由推论 3，$\angle A + \angle C = 180° \Rightarrow \angle C = 100°$；$\angle B + \angle D = 180° \Rightarrow \angle D = 70°$。
 
