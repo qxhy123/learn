@@ -260,3 +260,6 @@ Commit: `docs(chuzhong): add part4/08 (midpoint quadrilateral model)`
 - 一致性扫描
 - README 更新 part4 状态为 ✓ + 8 个链接
 - 标记 M3a 完成
+
+---
+**M3a 完成于：2026-05-12**

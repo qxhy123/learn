@@ -64,7 +64,15 @@
     - [01. 等腰三角形](part3-triangles/special/01-isosceles.md)
     - [02. 等边三角形](part3-triangles/special/02-equilateral.md)
     - [03. 三角形的四心](part3-triangles/special/03-four-centers.md)
-- Part 4：四边形 *(待写)*
+- Part 4：四边形 ✓
+  - [01. 多边形的内角和与外角和](part4-quadrilaterals/01-polygon-angles.md)
+  - [02. 平行四边形](part4-quadrilaterals/02-parallelogram.md)
+  - [03. 矩形](part4-quadrilaterals/03-rectangle.md)
+  - [04. 菱形](part4-quadrilaterals/04-rhombus.md)
+  - [05. 正方形](part4-quadrilaterals/05-square.md)
+  - [06. 梯形与等腰梯形](part4-quadrilaterals/06-trapezoid.md)
+  - [07. 中位线定理](part4-quadrilaterals/07-midsegment.md)
+  - [08. 中点四边形模型](part4-quadrilaterals/08-model-midpoint-quadrilateral.md) ⭐️
 - Part 5：圆 *(待写)*
 - Part 6：图形变换 *(待写)*
 - Part 7：解直角三角形 *(待写)*
