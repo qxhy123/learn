@@ -407,8 +407,7 @@ $$
 f(x,y)\approx 0 + [0\ \ 1]
 \begin{bmatrix}
 x\\ y
-\end{bmatrix}
-+ \frac12
+\end{bmatrix} + \frac12
 \begin{bmatrix}
 x & y
 \end{bmatrix}
@@ -418,8 +417,7 @@ x & y
 \end{bmatrix}
 \begin{bmatrix}
 x\\ y
-\end{bmatrix}
-= y+xy.
+\end{bmatrix} = y+xy.
 $$
 
 因此在 $(0,0)$ 附近，
