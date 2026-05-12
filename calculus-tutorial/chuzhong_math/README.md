@@ -102,7 +102,13 @@
   - [01. 坐标与图形变换](part9-coordinate-geometry/01-coords-and-transforms.md)
   - [02. 两点间距离公式](part9-coordinate-geometry/02-distance-formula.md)
   - [03. 坐标几何中的常见模型](part9-coordinate-geometry/03-coord-geometry-models.md)
-- Part 10：中考综合题专题 *(待写)*
+- Part 10：中考综合题专题 ✓
+  - [01. 线上动点问题](part10-comprehensive/01-moving-point-on-line.md) ⭐️
+  - [02. 抛物线 / 坐标系动点问题](part10-comprehensive/02-moving-point-on-parabola.md) ⭐️
+  - [03. 几何最值：将军饮马、胡不归、阿氏圆](part10-comprehensive/03-geometry-max-min.md) ⭐️
+  - [04. 存在性问题](part10-comprehensive/04-existence-problems.md) ⭐️
+  - [05. 折叠综合问题](part10-comprehensive/05-fold-comprehensive.md) ⭐️
+  - [06. 旋转综合问题](part10-comprehensive/06-rotation-comprehensive.md) ⭐️
 
 ### 附录
 - A. 公式定理速查 *(待写)*

@@ -300,3 +300,6 @@ Commit: `docs(chuzhong): add part10/06 (rotation comprehensive)`
 - 一致性扫描
 - README 更新 part10 状态 ✓
 - 标记 M6 完成
+
+---
+**M6 完成于：2026-05-12**
