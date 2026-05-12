@@ -27,4 +27,4 @@ dot(D); label("$D$", D, S);
 label("$3$", (A+Cpt)/2, W);
 label("$4$", (B+Cpt)/2, S);
 label("$5$", (A+B)/2 + (0.15, 0.15), NE);
-label("$OD=\tfrac{3}{2}$", D + (0.1, 0.4), E, red);
+label("$OD=\frac{3}{2}$", D + (0.1, 0.4), E, red);

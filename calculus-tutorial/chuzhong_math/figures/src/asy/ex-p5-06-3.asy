@@ -30,5 +30,5 @@ dot(D); label("$D$", D, S);
 label("$5$", (A+B)/2, W);
 label("$5$", (A+Cpt)/2, E);
 label("$6$", (B+Cpt)/2, S);
-label("$r=\tfrac{3}{2}$", I + (0.4, 0), E);
+label("$r=\frac{3}{2}$", I + (0.4, 0), E);
 label("$4$", (A+D)/2, E, gray);
