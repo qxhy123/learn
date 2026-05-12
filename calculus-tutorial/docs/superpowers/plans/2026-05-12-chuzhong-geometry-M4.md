@@ -330,3 +330,6 @@ Commit: `docs(chuzhong): add part7/03 (solving right triangle applications)`
 - 一致性扫描
 - README 更新 part6 和 part7 状态为 ✓
 - 标记 M4 完成
+
+---
+**M4 完成于：2026-05-12**

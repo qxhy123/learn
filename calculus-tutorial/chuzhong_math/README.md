@@ -82,8 +82,18 @@
   - [06. 切线长定理与三角形的内切圆](part5-circles/06-tangent-length.md)
   - [07. 切割线模型](part5-circles/07-model-tangent-secant.md) ⭐️
   - [08. 四点共圆模型](part5-circles/08-model-four-points-concyclic.md) ⭐️
-- Part 6：图形变换 *(待写)*
-- Part 7：解直角三角形 *(待写)*
+- Part 6：图形变换 ✓
+  - [01. 轴对称](part6-transformations/01-axial-symmetry.md)
+  - [02. 平移](part6-transformations/02-translation.md)
+  - [03. 旋转](part6-transformations/03-rotation.md)
+  - [04. 中心对称](part6-transformations/04-central-symmetry.md)
+  - [05. 位似](part6-transformations/05-homothety.md)
+  - [06. 翻折模型](part6-transformations/06-model-fold.md) ⭐️
+  - [07. 旋转构造模型](part6-transformations/07-model-rotation-tricks.md) ⭐️
+- Part 7：解直角三角形 ✓
+  - [01. 锐角三角函数](part7-solving-right-triangle/01-trig-ratios.md)
+  - [02. 特殊角的三角函数值](part7-solving-right-triangle/02-special-angles.md)
+  - [03. 解直角三角形的应用](part7-solving-right-triangle/03-applications.md)
 - Part 8：视图与投影 *(待写)*
 - Part 9：坐标系中的几何 *(待写)*
 - Part 10：中考综合题专题 *(待写)*
