@@ -39,7 +39,18 @@
   - [03. 三线八角](part2-parallel-lines/03-three-line-eight-angles.md)
   - [04. 平行线的判定](part2-parallel-lines/04-parallel-criteria.md)
   - [05. 平行线的性质与应用](part2-parallel-lines/05-parallel-properties.md)
-- Part 3：三角形（含全等、相似、特殊三角形） *(待写)*
+- Part 3：三角形 *(进行中)*
+  - basics/
+    - [01. 三角形三边关系](part3-triangles/basics/01-triangle-inequality.md)
+    - [02. 内角和与外角](part3-triangles/basics/02-angle-sum.md)
+    - [03. 三角形的分类](part3-triangles/basics/03-classification.md)
+  - congruence/
+    - [01. 全等判定 SSS/SAS/ASA/AAS](part3-triangles/congruence/01-sss-sas-asa-aas.md)
+    - [02. 直角三角形 HL](part3-triangles/congruence/02-hl-right-triangle.md)
+    - [03. 手拉手模型](part3-triangles/congruence/03-model-hand-in-hand.md) ⭐️
+    - [04. 半角模型](part3-triangles/congruence/04-model-half-angle.md) ⭐️
+    - [05. 一线三等角（K 字模型）](part3-triangles/congruence/05-model-one-line-three-angles.md) ⭐️
+    - [06. 倍长中线模型](part3-triangles/congruence/06-model-double-median.md) ⭐️
 - Part 4：四边形 *(待写)*
 - Part 5：圆 *(待写)*
 - Part 6：图形变换 *(待写)*

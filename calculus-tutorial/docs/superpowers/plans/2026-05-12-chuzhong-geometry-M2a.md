@@ -453,3 +453,6 @@ ls chuzhong_math/part3-triangles/basics chuzhong_math/part3-triangles/congruence
 - [ ] **Step 3: 标记完成**
 
 在本计划文件末尾追加 `**M2a 完成于：YYYY-MM-DD**`，提交。
+
+---
+**M2a 完成于：2026-05-12**
