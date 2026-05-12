@@ -110,11 +110,13 @@
   - [05. 折叠综合问题](part10-comprehensive/05-fold-comprehensive.md) ⭐️
   - [06. 旋转综合问题](part10-comprehensive/06-rotation-comprehensive.md) ⭐️
 
-### 附录
-- A. 公式定理速查 *(待写)*
-- B. 模型图集 *(待写)*
-- C/D/E. 分级题库 *(待写)*
-- F. 题库详解 *(待写)*
+### 附录 ✓
+- [A. 公式定理速查表](appendix/A-formula-sheet.md)
+- [B. 模型图集](appendix/B-model-atlas.md)
+- [C. 基础题库（40 题 ☆）](appendix/C-exercises-basic.md)
+- [D. 中档题库（40 题 ☆☆）](appendix/D-exercises-medium.md)
+- [E. 压轴题库（20 题 ☆☆☆）](appendix/E-exercises-advanced.md)
+- [F. 全部 100 题详解](appendix/F-solutions.md)
 
 ## 怎么用这本书
 

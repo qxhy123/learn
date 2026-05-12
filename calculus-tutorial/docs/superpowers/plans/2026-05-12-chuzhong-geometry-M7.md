@@ -229,3 +229,10 @@ Commit: `docs(chuzhong): add appendix F (full solutions)` （可拆 3 次 commit
 - README 更新 appendix 状态 ✓
 - **更新 README 的"使用建议"小节**——附录题库已可用，调整冲刺路径建议
 - 标记 M7 + **整本教程**完成
+
+---
+**M7 完成于：2026-05-12**
+
+## 🎉 全部里程碑完成
+
+中考几何教程 M0-M7 全部完工，共 76 个 markdown 文件、100 道习题、12+ 个核心模型章节。
