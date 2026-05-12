@@ -20,11 +20,17 @@
 **C.4** ☆（出题点：邻补角与角平分线；模型：part1/04）
 如图，$\angle AOB$ 与 $\angle BOC$ 互为邻补角，$OD$ 平分 $\angle AOB$，$OE$ 平分 $\angle BOC$，求 $\angle DOE$ 的度数。
 
+![](../figures/svg/q-c-04.svg)
+
 **C.5** ☆（出题点：平行线性质（同位角、内错角）；模型：part2/03）
 如图，$AB \parallel CD$，直线 $EF$ 分别交 $AB$、$CD$ 于点 $G$、$H$。若 $\angle EGB = 65°$，求 $\angle GHD$ 与 $\angle GHC$ 的度数。
 
+![](../figures/svg/q-c-05.svg)
+
 **C.6** ☆（出题点：平行线判定；模型：part2/02）
 如图，已知 $\angle 1 + \angle 2 = 180°$，且 $\angle 1$ 与 $\angle 3$ 是同位角。试判断哪两条直线平行，并说明理由。
+
+![](../figures/svg/q-c-06.svg)
 
 ---
 
@@ -39,8 +45,12 @@
 **C.9** ☆（出题点：三角形外角定理；模型：part3/02）
 $\triangle ABC$ 中，$\angle A = 50°$，$\angle B = 60°$，延长 $BC$ 至 $D$，求外角 $\angle ACD$ 的度数。
 
+![](../figures/svg/q-c-09.svg)
+
 **C.10** ☆（出题点：等腰三角形性质（等边对等角）；模型：part3/09）
 等腰三角形 $\triangle ABC$ 中，$AB = AC$，顶角 $\angle A = 36°$，求两个底角的度数。
+
+![](../figures/svg/q-c-10.svg)
 
 **C.11** ☆（出题点：等腰三角形分类讨论；模型：part3/09）
 等腰三角形的一个内角为 $80°$，求另外两个内角的度数（请讨论所有情况）。
@@ -48,20 +58,30 @@ $\triangle ABC$ 中，$\angle A = 50°$，$\angle B = 60°$，延长 $BC$ 至 $D
 **C.12** ☆（出题点：等边三角形性质；模型：part3/10）
 等边三角形的边长为 $4$，求其高与面积。
 
+![](../figures/svg/q-c-12.svg)
+
 **C.13** ☆（出题点：全等三角形判定 SAS；模型：part3/03）
 如图，$AB = AD$，$\angle BAC = \angle DAC$，证明：$\triangle ABC \cong \triangle ADC$，并指出全等的判定方法。
+
+![](../figures/svg/q-c-13.svg)
 
 **C.14** ☆（出题点：全等三角形判定 ASA / AAS；模型：part3/03）
 如图，$\angle B = \angle D$，$\angle BCA = \angle DCA$，$AC$ 为公共边，证明 $\triangle ABC \cong \triangle ADC$。
 
+![](../figures/svg/q-c-14.svg)
+
 **C.15** ☆（出题点：勾股定理；模型：part3/07）
 直角三角形两条直角边长分别为 $6$ 与 $8$，求斜边长以及斜边上的高。
+
+![](../figures/svg/q-c-15.svg)
 
 **C.16** ☆（出题点：勾股定理逆定理；模型：part3/07）
 三角形三边长分别为 $7$、$24$、$25$，判断该三角形的形状（直角/锐角/钝角）。
 
 **C.17** ☆（出题点：30-60-90 边比；模型：part3/08）
 $\triangle ABC$ 是含 $30°$ 角的直角三角形，$\angle C = 90°$，$\angle A = 30°$，斜边 $AB = 10$，求另外两边 $BC$、$AC$ 的长。
+
+![](../figures/svg/q-c-17.svg)
 
 **C.18** ☆（出题点：相似三角形相似比；模型：part3/12）
 两个相似三角形的相似比为 $2 : 3$，已知较小三角形的周长为 $24$、面积为 $8$，求较大三角形的周长与面积。
@@ -76,23 +96,37 @@ $\triangle ABC$ 是含 $30°$ 角的直角三角形，$\angle C = 90°$，$\angl
 **C.20** ☆（出题点：平行四边形性质；模型：part4/02）
 在 $\square ABCD$ 中，$\angle A = 70°$，求 $\angle B$、$\angle C$、$\angle D$ 的度数。
 
+![](../figures/svg/q-c-20.svg)
+
 **C.21** ☆（出题点：平行四边形对角线互相平分；模型：part4/02）
 $\square ABCD$ 的对角线 $AC$、$BD$ 相交于 $O$，已知 $AC = 12$，$BD = 16$，$AB = 10$，求 $\triangle AOB$ 的周长。
+
+![](../figures/svg/q-c-21.svg)
 
 **C.22** ☆（出题点：矩形对角线；模型：part4/04）
 矩形 $ABCD$ 的两邻边长分别为 $3$ 与 $4$，求其对角线长，并求对角线交点到各顶点的距离。
 
+![](../figures/svg/q-c-22.svg)
+
 **C.23** ☆（出题点：菱形面积；模型：part4/05）
 菱形的两条对角线长分别为 $6$ 与 $8$，求其面积、边长以及周长。
+
+![](../figures/svg/q-c-23.svg)
 
 **C.24** ☆（出题点：正方形性质；模型：part4/06）
 正方形 $ABCD$ 的边长为 $2$，$E$ 为 $BC$ 中点，求 $AE$ 的长。
 
+![](../figures/svg/q-c-24.svg)
+
 **C.25** ☆（出题点：三角形中位线；模型：part4/07）
 $\triangle ABC$ 中，$D$、$E$ 分别为 $AB$、$AC$ 的中点，$BC = 10$，求 $DE$ 的长，并说明 $DE$ 与 $BC$ 的位置关系。
 
+![](../figures/svg/q-c-25.svg)
+
 **C.26** ☆（出题点：中点四边形；模型：part4/08）
 四边形 $ABCD$ 的四条边中点依次为 $E$、$F$、$G$、$H$，判断四边形 $EFGH$ 的形状并简要说明理由。
+
+![](../figures/svg/q-c-26.svg)
 
 ---
 
@@ -101,23 +135,37 @@ $\triangle ABC$ 中，$D$、$E$ 分别为 $AB$、$AC$ 的中点，$BC = 10$，�
 **C.27** ☆（出题点：垂径定理；模型：part5/03）
 $\odot O$ 的半径为 $5$，弦 $AB = 8$，求圆心 $O$ 到 $AB$ 的距离。
 
+![](../figures/svg/q-c-27.svg)
+
 **C.28** ☆（出题点：圆周角定理；模型：part5/04）
 如图，$\odot O$ 中，弧 $AB$ 所对的圆心角 $\angle AOB = 80°$，求弧 $AB$ 所对的圆周角 $\angle ACB$ 的度数（$C$ 在优弧上）。
+
+![](../figures/svg/q-c-28.svg)
 
 **C.29** ☆（出题点：直径所对圆周角为直角；模型：part5/04）
 $AB$ 是 $\odot O$ 的直径，$C$ 为圆上一点，$\angle BAC = 35°$，求 $\angle ABC$ 的度数。
 
+![](../figures/svg/q-c-29.svg)
+
 **C.30** ☆（出题点：切线性质；模型：part5/06）
 $PA$ 是 $\odot O$ 的切线，$A$ 为切点，$OA = 3$，$OP = 5$，求 $PA$ 的长。
+
+![](../figures/svg/q-c-30.svg)
 
 **C.31** ☆（出题点：切线长定理；模型：part5/06）
 从圆外一点 $P$ 引 $\odot O$ 的两条切线 $PA$、$PB$，$A$、$B$ 为切点，$\angle APB = 60°$，$PA = 4\sqrt{3}$，求 $\odot O$ 的半径。
 
+![](../figures/svg/q-c-31.svg)
+
 **C.32** ☆（出题点：弧长公式；模型：part5/09）
 $\odot O$ 的半径为 $6$，圆心角为 $120°$ 的扇形所对弧的弧长是多少？该扇形的面积是多少？
 
+![](../figures/svg/q-c-32.svg)
+
 **C.33** ☆（出题点：圆内接四边形对角互补；模型：part5/04）
 四边形 $ABCD$ 内接于 $\odot O$，$\angle A = 75°$，求 $\angle C$；若 $\angle B = 110°$，求 $\angle D$。
+
+![](../figures/svg/q-c-33.svg)
 
 ---
 
@@ -126,14 +174,20 @@ $\odot O$ 的半径为 $6$，圆心角为 $120°$ 的扇形所对弧的弧长是
 **C.34** ☆（出题点：轴对称的性质；模型：part6/02）
 点 $A(3, -2)$ 关于 $x$ 轴的对称点坐标是什么？关于 $y$ 轴的对称点坐标是什么？关于原点的对称点坐标是什么？
 
+![](../figures/svg/q-c-34.svg)
+
 **C.35** ☆（出题点：旋转的性质；模型：part6/04）
 将点 $P(2, 0)$ 绕原点 $O$ 顺时针旋转 $90°$，得到点 $P'$，求 $P'$ 的坐标。
+
+![](../figures/svg/q-c-35.svg)
 
 **C.36** ☆（出题点：特殊角三角函数值；模型：part7/02）
 计算：$\sin 30° + \cos 60° + \tan 45° - \sin 60° \cdot \cos 30°$。
 
 **C.37** ☆（出题点：解直角三角形；模型：part7/03）
 直角三角形 $\triangle ABC$ 中，$\angle C = 90°$，$\angle A = 30°$，$BC = 4$，求 $AC$ 与 $AB$。
+
+![](../figures/svg/q-c-37.svg)
 
 ---
 
@@ -145,8 +199,12 @@ $\odot O$ 的半径为 $6$，圆心角为 $120°$ 的扇形所对弧的弧长是
 **C.39** ☆（出题点：两点间距离公式；模型：part9/02）
 已知 $A(-1, 2)$，$B(3, -1)$，求线段 $AB$ 的长。
 
+![](../figures/svg/q-c-39.svg)
+
 **C.40** ☆（出题点：中点公式；模型：part9/02）
 已知 $A(-2, 3)$，$B(4, -5)$，求线段 $AB$ 的中点 $M$ 的坐标。
+
+![](../figures/svg/q-c-40.svg)
 
 ---
 
