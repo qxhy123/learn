@@ -108,6 +108,7 @@
 | 附录A | [公式速查表](./appendix/formula-sheet.md) | 导数、积分、级数、向量分析、矩阵微积分、概率积分公式 |
 | 附录B | [符号说明](./appendix/notation-guide.md) | 全书使用的数学符号与 AI 常用记号 |
 | 附录C | [练习答案汇总](./appendix/answers.md) | 28 章练习题完整解答、快速索引与统计 |
+| 附录D | [历年考研真题精选 100 题](./appendix/kaoyan-problems.md) | 极限、微分、积分、级数、多元、ODE 全覆盖，含完整解析 |
 
 ---
 
