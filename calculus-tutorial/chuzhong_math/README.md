@@ -28,8 +28,17 @@
   - [05. 开题前的自检清单](thinking-toolkit/05-checklist-before-solving.md)
 
 ### 知识章节（按需阅读）
-- Part 1：图形初步 *(待写)*
-- Part 2：相交线与平行线 *(待写)*
+- Part 1：图形初步 ✓
+  - [01. 点、线、面、体](part1-foundations/01-point-line-plane.md)
+  - [02. 角](part1-foundations/02-angles.md)
+  - [03. 角平分线](part1-foundations/03-angle-bisector.md)
+  - [04. 余角与补角](part1-foundations/04-complementary-supplementary.md)
+- Part 2：相交线与平行线 ✓
+  - [01. 对顶角与邻补角](part2-parallel-lines/01-vertical-and-adjacent-angles.md)
+  - [02. 垂线、点到直线的距离](part2-parallel-lines/02-perpendicular-line.md)
+  - [03. 三线八角](part2-parallel-lines/03-three-line-eight-angles.md)
+  - [04. 平行线的判定](part2-parallel-lines/04-parallel-criteria.md)
+  - [05. 平行线的性质与应用](part2-parallel-lines/05-parallel-properties.md)
 - Part 3：三角形（含全等、相似、特殊三角形） *(待写)*
 - Part 4：四边形 *(待写)*
 - Part 5：圆 *(待写)*

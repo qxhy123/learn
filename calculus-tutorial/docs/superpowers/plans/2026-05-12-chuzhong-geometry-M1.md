@@ -362,3 +362,6 @@ ls chuzhong_math/part1-foundations chuzhong_math/part2-parallel-lines
 ```
 
 提交：`docs(chuzhong): mark M1 milestone complete`
+
+---
+**M1 完成于：2026-05-12**
