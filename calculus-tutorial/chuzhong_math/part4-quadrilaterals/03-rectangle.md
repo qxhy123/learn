@@ -47,6 +47,8 @@ $$AB = DC \text{（矩形对边）},\quad \angle ABC = \angle DCB = 90°,\quad B
 
 此外，矩形是**轴对称图形**，对称轴为两组对边中点的连线（共 $2$ 条对称轴），同时仍保留平行四边形的中心对称性。
 
+![矩形 $ABCD$：四个角都是直角，对角线 $AC=BD$ 且互相平分于 $O$](../figures/svg/thm-rectangle-diagonals.svg)
+
 ---
 
 ## 三、判定方法
@@ -87,6 +89,8 @@ $$AC = \sqrt{AB^2 + BC^2} = \sqrt{36 + 64} = \sqrt{100} = 10.$$
 
 如图，$\mathrm{Rt}\triangle ABC$ 中 $\angle ABC = 90°$，$O$ 是斜边 $AC$ 的中点。求证：$BO = \dfrac{1}{2}AC$。
 
+![例 2：延长 $BO$ 到 $D$ 使 $OD=OB$，构造矩形 $ABCD$；由对角线相等得 $BD=AC$](../figures/svg/ex-p4-03-2.svg)
+
 **思路**：补出矩形即可。延长 $BO$ 到 $D$，使 $OD = OB$，连 $AD$、$CD$。则 $O$ 是 $BD$ 中点也是 $AC$ 中点，所以 $ABCD$ 对角线互相平分，是平行四边形；又 $\angle ABC = 90°$，故 $ABCD$ 是矩形。由矩形对角线相等：$BD = AC$，所以
 
 $$BO = \tfrac{1}{2}BD = \tfrac{1}{2}AC.$$
@@ -98,6 +102,8 @@ $$BO = \tfrac{1}{2}BD = \tfrac{1}{2}AC.$$
 ### 例 3（折叠问题 + 勾股）
 
 矩形 $ABCD$ 中，$AB = 6$，$AD = 10$。将矩形沿 $AE$ 折叠（$E$ 在 $CD$ 上），使点 $D$ 落在 $BC$ 边上的点 $F$ 处。求 $CE$ 的长。
+
+![例 3：沿 $AE$ 折叠，$D \to F$；$AF=AD=10$，$EF=ED$，$\angle AFE=90°$](../figures/svg/ex-p4-03-3.svg)
 
 **思路**：折叠的本质是**轴对称**——折叠前后对应线段、对应角相等。
 

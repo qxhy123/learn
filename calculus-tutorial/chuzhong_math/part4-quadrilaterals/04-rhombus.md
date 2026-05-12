@@ -49,6 +49,8 @@ $$AB = AD \text{（菱形邻边相等）},\quad OB = OD \text{（对角线互相
 
 两条对角线所在直线就是菱形的两条**对称轴**。这一点与矩形截然不同——矩形的对称轴是对边中点连线，菱形的对称轴是对角线。
 
+![菱形 $ABCD$：四边相等；对角线 $AC \perp BD$ 于 $O$，互相平分并平分对角](../figures/svg/thm-rhombus-properties.svg)
+
 ---
 
 ## 三、判定方法
@@ -90,6 +92,8 @@ $$AB = AD \text{（菱形邻边相等）},\quad OB = OD \text{（对角线互相
 
 菱形 $ABCD$ 中，对角线 $AC = 8$，$BD = 6$。求菱形的面积与边长。
 
+![例 1：$AC=8$、$BD=6$；对角线将菱形分成 $4$ 个全等直角三角形（直角边 $4,3$）](../figures/svg/ex-p4-04-1.svg)
+
 **解**：由对角线乘积公式：
 
 $$S = \tfrac{1}{2} \cdot AC \cdot BD = \tfrac{1}{2} \times 8 \times 6 = 24.$$
@@ -105,6 +109,8 @@ $$AB = \sqrt{OA^2 + OB^2} = \sqrt{16 + 9} = 5.$$
 ### 例 2（对角线分出四个全等直角三角形）
 
 菱形 $ABCD$ 中，$\angle BAD = 60°$，边长 $AB = 4$。求对角线 $AC$、$BD$ 的长。
+
+![例 2：$\angle BAD=60°$、$AB=4$；$\triangle AOB$ 为 $30°\text{-}60°\text{-}90°$ 直角三角形](../figures/svg/ex-p4-04-2.svg)
 
 **思路**：菱形对角线平分对角，所以 $AC$ 平分 $\angle BAD$，$\angle BAO = 30°$。又 $AC \perp BD$，所以 $\triangle AOB$ 是一个 $30°$–$60°$–$90°$ 的直角三角形（呼应 special 章节中的特殊直角三角形）。
 
@@ -123,6 +129,8 @@ $$BD = 2 OB = 4,\quad AC = 2 OA = 4\sqrt{3}.$$
 ### 例 3（综合：菱形 + 角度求边长）
 
 如图，菱形 $ABCD$ 中，$\angle ABC = 120°$，对角线 $BD = 6$。求菱形的边长与另一条对角线 $AC$ 的长。
+
+![例 3：$\angle ABC=120°$、$BD=6$；$OB=3$，$\triangle AOB$ 中 $\angle ABO=60°$](../figures/svg/ex-p4-04-3.svg)
 
 **思路**：$\angle ABC = 120°$，由对角线平分对角，$\angle ABO = 60°$；又 $\angle AOB = 90°$，所以 $\triangle AOB$ 是 $30°$–$60°$–$90°$ 直角三角形。
 
