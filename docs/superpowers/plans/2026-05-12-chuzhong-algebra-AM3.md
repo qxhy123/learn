@@ -396,3 +396,6 @@ git add docs/superpowers/plans/2026-05-12-chuzhong-algebra-AM3.md
 git commit -m "docs(chuzhong_algebra): mark AM3 milestone complete"
 git push origin master
 ```
+
+---
+**AM3 完成于：2026-05-12**
