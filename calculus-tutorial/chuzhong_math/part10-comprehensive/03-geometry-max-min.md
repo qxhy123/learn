@@ -123,23 +123,20 @@ $AH_0 = $ 点 $A$ 到 $l'$ 的距离 $= AB\sin(\angle ABl') = 6\sin 60° = 3\sqr
 
 ### 例 3（阿氏圆 — 反演化简）
 
-在 $\odot O$ 中半径 $r = 4$，$A$ 是圆外一定点 $OA = 8$，$B$ 在 $OA$ 上 $OB = 1$。$P$ 是 $\odot O$ 上动点，求 $PA + \dfrac{1}{2}PB$ 的最小值。
+$\odot O$ 半径 $r = 2$。定点 $A$、$B$ 在 $O$ 的同一条射线上，$OA = 5$，$OB = 4$（$A, B$ 均在圆外，$B$ 更近圆心）。$P$ 是 $\odot O$ 上动点，求 $PA + \dfrac{1}{2}PB$ 的最小值。
 
-**解**：注意 $\dfrac{OB}{OP} = \dfrac{1}{4} = \dfrac{OP}{OA'}$，其中 $OA' = 16$——这指出 $A$ 不是反演点。我们换一个角度：取 $B' $ 在 $OB$ 延长线上使 $OB' = ?$。
+![阿氏圆例题：在射线 OB 上取 B′ 使 OB′=r²/OB=1，则 PB′=½PB，原问题化为 PA+PB′≥AB′](../figures/svg/ex-p10-03-3.svg)
 
-我们想要 $\dfrac{1}{2}PB = PB''$ 对某个定点 $B''$ 成立。设 $B''$ 在直线 $OB$ 上 $OB'' = m$，由两边夹角相等（公共角 $\angle BOP$），需要 $\dfrac{OB''}{OP} = \dfrac{OP}{OB} \cdot \dfrac{1}{2}$？整理思路：
+**解**：在射线 $OB$ 上取一点 $B'$，使 $OB' = \dfrac{r^2}{OB} = \dfrac{4}{4} = 1$（$B'$ 在圆内）。
 
-构造 $\triangle OPB'' \sim \triangle OBP$（公共角 $\angle POB$），需 $\dfrac{OB''}{OP} = \dfrac{OP}{OB}$，即 $OB'' = \dfrac{OP^2}{OB} = \dfrac{16}{1} = 16$。相似比 $\dfrac{B''P}{BP} = \dfrac{OP}{OB} = 4$，即 $B''P = 4PB$，与系数 $\dfrac{1}{2}$ 不匹配。
+**关键相似**：对任意 $P \in \odot O$，由 $OP^2 = r^2 = OB \cdot OB' = 4 \cdot 1$，得 $\dfrac{OB'}{OP} = \dfrac{OP}{OB}$。又 $\angle B'OP = \angle POB$ 是同一个角，故 $\triangle OB'P \sim \triangle OPB$（两边夹角相等），相似比 $\dfrac{OB'}{OP} = \dfrac{1}{2}$，由此 $\dfrac{PB'}{PB} = \dfrac{1}{2}$，即 $PB' = \dfrac{1}{2} PB$。
 
-重新构造：要让 $PB'' = \dfrac{1}{2}PB$，相似比应为 $\dfrac{1}{2}$，即取 $OB'' = \dfrac{1}{2}OP \cdot \dfrac{OP}{OB} \cdot ?$。直接令 $\triangle OPB \sim \triangle OB''P$（对应关系反过来），需 $\dfrac{OB''}{OP} = \dfrac{OP}{OB} \cdot k^{?}$……此处省略繁琐推导，给出标准结论：
+代入原式：
+$$PA + \dfrac{1}{2} PB = PA + PB' \geq AB'.$$
 
-取 $B''$ 使 $OB'' = \dfrac{r}{k} \cdot \dfrac{OB}{r} \cdot \dfrac{1}{?}$。**记结论性方法**：设 $k = \dfrac{1}{2}$，则在射线 $OB$ 上取 $B''$ 使 $OB'' = \dfrac{r^2}{k\cdot OB} \cdot k^2 = \dfrac{OP^2 \cdot k}{OB}$。代入 $r = 4, OB = 1, k = \dfrac{1}{2}$ 得 $OB'' = \dfrac{16 \cdot \frac{1}{2}}{1} = 8$。
+而 $A$、$B'$ 都在过 $O$ 的同一条射线上，$AB' = OA - OB' = 5 - 1 = 4$。等号在 $P$ 落于线段 $AB'$ 与 $\odot O$ 的交点时取得（线段 $AB'$ 从外点 $A$ 到内点 $B'$ 必交圆于一点，即 $P_0 = (2, 0)$）。
 
-再验证 $\dfrac{1}{2}PB = PB''$：$\triangle OPB \sim \triangle OB''P$，相似比 $\dfrac{OP}{OB''} = \dfrac{4}{8} = \dfrac{1}{2}$，故 $\dfrac{PB}{B''P} = \dfrac{1}{2}$ 即 $PB'' = \dfrac{1}{2}PB$。✓
-
-于是 $PA + \dfrac{1}{2}PB = PA + PB'' \geq AB''$。$A, B''$ 都在直线 $OA$ 上，$OA = 8 = OB''$，所以 $A = B''$（共点），最小值 $= 0$？显然题目设错；调整 $OA = 10$ 重做：$AB'' = OA - OB'' = 10 - 8 = 2$。
-
-**结论**（取 $OA = 10$ 时）：最小值 $= 2$。读者重点掌握**反演构造相似**这一思路，数值依题目而变。
+**答**：最小值 $= 4$。**关键思想**：当 $P$ 在圆上、目标为 $PA + k \cdot PB$ 且 $k = \dfrac{r}{OB}$（或 $\dfrac{OB}{r}$，视 $B$ 在圆外/内）时，取反演点 $B'$ 使 $OB \cdot OB' = r^2$，可把 $k \cdot PB$ 化为 $PB'$，从而退化为两点间线段问题。
 
 ---
 

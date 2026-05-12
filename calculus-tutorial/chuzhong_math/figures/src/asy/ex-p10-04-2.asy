@@ -1,5 +1,7 @@
 // p10-04 例 2：y = -1/2 x^2 + 3/2 x + 2, A(-1,0) B(4,0) C(0,2)
 // 抛物线上 P 使 △PBC 直角：P1=(-5,-18) 太远；P3=(1,3)。这里只画 P3，并示意 P1 在远处
+settings.tex = "xelatex";
+texpreamble("\usepackage{ctex}");
 size(10cm);
 import graph;
 
@@ -34,4 +36,4 @@ pair u1 = unit(C - P3) * 0.22;
 pair u2 = unit(B - P3) * 0.22;
 draw(P3 + u1 -- P3 + u1 + u2 -- P3 + u2, red);
 
-label("$P_1(-5,-18)$ off-figure", (2.5, -1.2), gray+fontsize(8pt));
+label("$P_1(-5,-18)$ 在图外", (2.5, -1.2), gray+fontsize(8pt));
