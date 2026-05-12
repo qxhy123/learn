@@ -287,3 +287,6 @@ Commit: `docs(chuzhong): add part5/08 (four points concyclic model)`
 - 一致性扫描
 - README 更新 part5 状态 ✓ + 8 个链接
 - 标记 M3b 完成
+
+---
+**M3b 完成于：2026-05-12**

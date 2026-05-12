@@ -73,7 +73,15 @@
   - [06. 梯形与等腰梯形](part4-quadrilaterals/06-trapezoid.md)
   - [07. 中位线定理](part4-quadrilaterals/07-midsegment.md)
   - [08. 中点四边形模型](part4-quadrilaterals/08-model-midpoint-quadrilateral.md) ⭐️
-- Part 5：圆 *(待写)*
+- Part 5：圆 ✓
+  - [01. 圆的基本概念](part5-circles/01-circle-basics.md)
+  - [02. 垂径定理](part5-circles/02-perpendicular-chord.md)
+  - [03. 圆周角定理](part5-circles/03-inscribed-angle.md)
+  - [04. 点、直线、圆与圆的位置关系](part5-circles/04-position-relations.md)
+  - [05. 切线的判定与性质](part5-circles/05-tangent-criteria.md)
+  - [06. 切线长定理与三角形的内切圆](part5-circles/06-tangent-length.md)
+  - [07. 切割线模型](part5-circles/07-model-tangent-secant.md) ⭐️
+  - [08. 四点共圆模型](part5-circles/08-model-four-points-concyclic.md) ⭐️
 - Part 6：图形变换 *(待写)*
 - Part 7：解直角三角形 *(待写)*
 - Part 8：视图与投影 *(待写)*
