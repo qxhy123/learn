@@ -37,6 +37,9 @@
 | 第1章 | [集合与实数](./part1-foundations/01-sets-and-numbers.md) | 集合运算、实数系统、区间与邻域、确界原理 |
 | 第2章 | [函数](./part1-foundations/02-functions.md) | 函数定义、基本初等函数、函数性质、复合与反函数 |
 | 第3章 | [三角函数](./part1-foundations/03-trigonometry.md) | 单位圆定义、三角恒等式、反三角函数 |
+| 第4章 | [对数与指数函数](./part1-foundations/04-logarithm.md) | 指数/对数定义、运算律、自然底 $e$、Softmax 与 Log-Sum-Exp |
+| 第5章 | [指数函数](./part1-foundations/05-exponential.md) | 指数定义、自然底 $e$、双曲函数、Sigmoid/Tanh 与 EMA |
+| 第6章 | [齐次、线性、仿射与非线性](./part1-foundations/06-linearity-and-affinity.md) | 齐次性、线性映射、仿射映射、非线性、解结构定理与神经网络层 |
 
 ### 第二部分：极限与连续
 
