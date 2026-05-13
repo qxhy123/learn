@@ -139,3 +139,6 @@ git push origin master
 - B: 04 ⭐ 递推、05 ⭐ 求和、06 应用
 
 每章独立 commit。
+
+---
+**GM6 完成于：2026-05-13**
