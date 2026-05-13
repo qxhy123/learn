@@ -151,3 +151,6 @@ git push origin master
 - B: Task 3 (03 数乘) + Task 4 (04 ⭐ 基底坐标) + 对应 figures（2-3 张）
 
 每章 + 对应图独立 commit。
+
+---
+**GM1 完成于：2026-05-13**
