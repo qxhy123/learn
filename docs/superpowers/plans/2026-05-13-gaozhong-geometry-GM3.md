@@ -177,3 +177,6 @@ git push origin master
 - C: 05 综合应用
 
 每章独立 commit。
+
+---
+**GM3 完成于：2026-05-13**
