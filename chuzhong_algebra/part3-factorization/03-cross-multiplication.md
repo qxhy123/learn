@@ -69,6 +69,8 @@ $$\begin{array}{cc} x & p \\ x & q \end{array} \quad \xrightarrow{\text{交叉�
 
 左列两个 $x$ 相乘得首项 $x^2$，右列 $p \cdot q$ 得常数项 $c$，交叉相乘之和 $xq + xp$ 得中间项 $bx$。三个条件全部由一张"十字"覆盖——这就是"**十字相乘**"名字的来源。
 
+![十字相乘法图示：首项系数=1 与 ≠1 两种类型](../figures/svg/alg-p3-03.svg)
+
 ---
 
 ### $ax^2 + bx + c$ 型（首项系数 $a \neq 1$）
