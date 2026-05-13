@@ -35,6 +35,8 @@
 | $x < a$ | 在 $a$ 处画 $\circ$，向左画箭头 |
 | $x \leq a$ | 在 $a$ 处画 $\bullet$，向左画箭头 |
 
+![不等式解集数轴表示（四种情形）](../figures/svg/alg-p7-01.svg)
+
 **区间表示**：
 
 $$x > a \;\leftrightarrow\; (a, +\infty) \qquad x \geq a \;\leftrightarrow\; [a, +\infty)$$

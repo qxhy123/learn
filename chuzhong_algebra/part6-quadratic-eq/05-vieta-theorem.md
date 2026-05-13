@@ -61,6 +61,8 @@ $$x_1 \cdot x_2 = \frac{-b + \sqrt{\Delta}}{2a} \cdot \frac{-b - \sqrt{\Delta}}{
 
 **记忆口诀**：和等于 $-\dfrac{b}{a}$（注意负号！），积等于 $\dfrac{c}{a}$（直接是 $c/a$，无负号）。
 
+![韦达定理几何意义：两根与抛物线 x 轴交点](../figures/svg/alg-p6-05.svg)
+
 ### 常用对称表达式变形（必背）
 
 以下四个恒等式是韦达定理的标准配套工具：
