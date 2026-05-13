@@ -136,3 +136,6 @@ git push origin master
 - B: 03 直线圆 + 04 应用（+ 1 张图）
 
 每章独立 commit。
+
+---
+**GM2 完成于：2026-05-13**
