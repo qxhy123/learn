@@ -182,3 +182,6 @@ git push origin master
 - B: Part 12 随机变量 5 章（含 ⭐ 期望方差）
 
 每章独立 commit。
+
+---
+**GM8 完成于：2026-05-13**
