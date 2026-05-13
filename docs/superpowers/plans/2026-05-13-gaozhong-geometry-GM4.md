@@ -138,3 +138,6 @@ git push origin master
 - B: 03 圆与圆 + 04 综合（+ 2 张图）
 
 每章独立 commit。
+
+---
+**GM4 完成于：2026-05-13**
