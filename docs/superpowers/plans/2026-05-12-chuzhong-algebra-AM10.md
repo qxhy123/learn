@@ -229,3 +229,6 @@ git push origin master
 - F: Task 8 (F3) + Task 9 (F4)
 
 详解 subagent 需要读 C/D/E 题库（找该 part 范围的题号），所以必须等 Phase 1 完成。
+
+---
+**AM10 完成于：2026-05-13**
