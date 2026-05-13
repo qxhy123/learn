@@ -228,3 +228,6 @@ git push origin master
 - C: Part 8 概率（5 章：3 ⭐ 模板 D）
 
 每章写完立刻 commit。
+
+---
+**GM5 完成于：2026-05-13**
