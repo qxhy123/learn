@@ -110,6 +110,8 @@ $$\begin{cases} x + 1 \geq 0 \\ x - 3 \neq 0 \end{cases} \Rightarrow \begin{case
 
 ## 五、函数的三种表示法
 
+![函数图象示例——y=x 的图象（图象法）](../figures/svg/fn-p8-01.svg)
+
 ### （一）解析式法（公式法）
 
 用一个数学公式表示 $y$ 与 $x$ 的关系。
