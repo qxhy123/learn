@@ -137,3 +137,6 @@ git push origin master
 - D: Part 7 03+04 直线抛物线+应用（+ 2 张图）
 
 每章独立 commit。
+
+---
+**GM8 完成于：2026-05-14**
