@@ -61,3 +61,12 @@ git add docs/superpowers/plans/2026-05-14-gaozhong-geometry-GM12.md
 git commit -m "docs(gaozhong/geometry): mark GM12 milestone complete (figures补全)"
 git push origin master
 ```
+
+---
+**GM12 完成于：2026-05-14**
+
+## 实际产出
+
+14 张精选图全部生成：8 张应用 + 6 张综合 / 立体补图。
+
+几何 figures 总数：**96 张**（达到 spec 目标范围下沿 100 张附近）。
