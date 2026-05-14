@@ -1,5 +1,50 @@
 # 第26章 矩阵微积分
 
+> **一例速记：二次型求导 + trace 技巧 + 反向传播公式**
+>
+> | 对象 | 求导结果 | 记忆口诀 |
+> |------|---------|---------|
+> | $\nabla_x(a^\top x)$ | $a$ | 线性项梯度 = 系数 |
+> | $\nabla_x(x^\top Ax)$ | $(A+A^\top)x$（$A$ 对称时 $2Ax$） | 二次型，记住加转置 |
+> | $\partial\,\mathrm{tr}(AX)/\partial X$ | $A^\top$ | trace 技巧核心公式 |
+> | $\partial L/\partial W$（线性层） | $(\partial L/\partial y)\,x^\top$ | 上游梯度 $\times$ 输入转置 |
+
+---
+
+## 引入：求 $\frac{\partial}{\partial \mathbf{x}}(\mathbf{x}^\top A \mathbf{x})$
+
+> **题目**：设 $A\in\mathbb{R}^{n\times n}$，$\mathbf{x}\in\mathbb{R}^n$，求二次型 $f(\mathbf{x})=\mathbf{x}^\top A\mathbf{x}$ 对 $\mathbf{x}$ 的梯度。
+
+## 思维路径还原
+
+> "见到 $\mathbf{x}^\top A\mathbf{x}$，这是**二次型对向量**求导。套用矩阵微积分公式：
+>
+> **直接公式**：$\nabla_\mathbf{x}(\mathbf{x}^\top A\mathbf{x})=(A+A^\top)\mathbf{x}$。
+>
+> 若 $A$ 对称（$A=A^\top$），则 $\nabla_\mathbf{x}(\mathbf{x}^\top A\mathbf{x})=2A\mathbf{x}$。
+>
+> **完整推导**（用分量方法验证）：第 $i$ 个分量
+>
+> $$
+> f(\mathbf{x})=\sum_{j,k}A_{jk}x_jx_k,
+> $$
+>
+> 对 $x_i$ 求偏导（$x_i$ 出现在 $j=i$ 和 $k=i$ 两类项中）：
+>
+> $$
+> \frac{\partial f}{\partial x_i}
+> =\sum_{k}A_{ik}x_k+\sum_{j}A_{ji}x_j
+> =(A\mathbf{x})_i+(A^\top\mathbf{x})_i.
+> $$
+>
+> 写成向量形式：$\nabla_\mathbf{x} f=(A+A^\top)\mathbf{x}$。
+>
+> **当 $A$ 对称时**：$A=A^\top$，故 $\nabla_\mathbf{x} f=2A\mathbf{x}$。
+>
+> **AI 应用（Hessian 是 $A$）**：Ridge 回归损失 $L(w)=\frac12\|Xw-y\|_2^2+\frac\lambda2\|w\|_2^2$ 中，$\nabla_w L=X^\top(Xw-y)+\lambda w$，对应 Hessian $H=X^\top X+\lambda I$。由于 $X^\top X$ 半正定，加 $\lambda I$ 后严格正定，因此 $L$ 是严格凸函数，梯度为零点即唯一全局最优解 $w^\star=(X^\top X+\lambda I)^{-1}X^\top y$。"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -507,6 +552,52 @@ $$
    $$
 4. Softmax 的 Jacobian 体现了归一化带来的分量耦合。
 5. 自动微分不是数值近似，而是把链式法则系统化执行。
+
+---
+
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![Jacobian 线性近似](../figures/svg/calc-p8-26-1.svg) | **图 26-1**：Jacobian 矩阵 $J\in\mathbb{R}^{m\times n}$ 作为向量函数 $f:\mathbb{R}^n\to\mathbb{R}^m$ 的线性近似。标量输出时退化为梯度（列向量）；方阵时行列式给出换元 Jacobian |
+| ![反向传播链式法则](../figures/svg/calc-p8-26-2.svg) | **图 26-2**：神经网络中的矩阵链式法则。前向蓝色箭头传递激活值，反向红色虚线箭头传递梯度。参数梯度 $\partial L/\partial W=(\partial L/\partial y)x^\top$（上游梯度与输入的外积） |
+| ![矩阵导数速查表](../figures/svg/calc-p8-26-3.svg) | **图 26-3**：矩阵微积分常用公式速查表（分母布局）。左侧为导数公式，右侧为布局约定对比。混用布局约定是最常见的错误来源 |
+
+---
+
+## 思考路标（条件反射）
+
+> **见到以下特征，立即触发对应动作：**
+
+1. **标量对向量（梯度 $\nabla$）**：见到 $f(\mathbf{x})$ 对 $\mathbf{x}$ 求导，结果是列向量 $\nabla_\mathbf{x} f\in\mathbb{R}^n$（分母布局）。线性项：$\nabla(a^\top x)=a$；二次型：$\nabla(x^\top Ax)=(A+A^\top)x$。
+
+2. **向量对向量（Jacobian $J$）**：$\mathbf{y}=f(\mathbf{x})$ 的 Jacobian $J_{ij}=\partial y_i/\partial x_j$，大小为 $m\times n$。链式法则：$\nabla_\mathbf{x} L=J^\top\nabla_\mathbf{y} L$（上游梯度乘 Jacobian 转置）。
+
+3. **标量对矩阵**：$(\partial f/\partial A)_{ij}=\partial f/\partial A_{ij}$。常用：$\partial\,\mathrm{tr}(AX)/\partial X=A^\top$；$\partial\ln|A|/\partial A=A^{-T}$。
+
+4. **trace 技巧**：任何标量都等于自身的 trace。$x^\top Ax=\mathrm{tr}(Axx^\top)$。用 trace 的循环不变性和线性性简化复杂矩阵导数。
+
+5. **链式法则（矩阵版）**：上游梯度 $\times$ 本地 Jacobian 转置。线性层 $y=Wx+b$：$\partial L/\partial W=(\partial L/\partial y)x^\top$，$\partial L/\partial x=W^\top(\partial L/\partial y)$。
+
+6. **反向传播**：计算图中，每个节点只需：①接收上游梯度；②乘以本地 Jacobian 转置；③传给前面节点。不需要知道整体网络结构。
+
+7. **Layout 约定（分子布局 vs 分母布局）**：做题前必须确认约定。本书采用分母布局（梯度为列向量）。若参考其他资料，注意转置关系。
+
+8. **Hessian**：$H=\nabla^2 f$，大小 $n\times n$。线性层损失 $L=\frac12\|Wx-b\|_2^2$ 的 Hessian 关于 $W$ 不是简单的 $XX^\top$——需要 Kronecker 积工具处理矩阵参数的高阶结构。
+
+---
+
+## 易错点（⚠ 红色警报）
+
+1. **分子布局 vs 分母布局（行向量 vs 列向量）**：这是矩阵微积分最常见的错误。两种约定下 $\nabla_x f$ 互为转置。混用必然导致错误的链式法则顺序。做题前先明确约定，不要默默换算。
+
+2. **链式法则的乘法顺序**：矩阵乘法不可交换。$\nabla_x L=J^\top_{y/x}\nabla_y L$（分母布局），不能随意把 $J^\top$ 移到右边。维度不匹配是发现顺序错误的最快检验方法。
+
+3. **矩阵积导数不交换**：$\partial(AB)/\partial A\neq B^\top$（一般情形下）。$A$ 和 $B$ 都含参数时，必须用矩阵微分 $d(AB)=dA\cdot B+A\cdot dB$，再结合 trace 技巧读出梯度。
+
+4. **$d(X^{-1})=-X^{-1}dX\,X^{-1}$**：逆矩阵的微分不是 $-X^{-2}dX$。推导方式：$d(XX^{-1})=dI=0$，故 $dX\cdot X^{-1}+X\cdot d(X^{-1})=0$，解出 $d(X^{-1})=-X^{-1}dX\,X^{-1}$。
+
+5. **$X$ 对称时的修正**：若约束 $X=X^\top$，则 $\partial f/\partial X$ 需要对称化修正：非对角元的导数要乘以系数 2（因为 $X_{ij}=X_{ji}$ 是同一个自由度）。直接对不对称矩阵求导再对称化是正确做法。
 
 ---
 

@@ -398,6 +398,51 @@ print("sample variance proxy =", np.var(np.diff(path)))
 
 ---
 
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![布朗运动样本轨迹](../figures/svg/calc-p8-28-1.svg) | **图 28-1**：四条布朗运动样本轨迹，灰色虚线为 $\pm\sqrt{t}$（1 个标准差包络）。路径连续但极度不规则，无处可微；增量方差与时间成正比 $\mathrm{Var}(W_t-W_s)=t-s$ |
+| ![SDE 数值解](../figures/svg/calc-p8-28-2.svg) | **图 28-2**：左：OU 过程两条路径从不同初值均值回归到 0；右：Euler-Maruyama 方法在不同步长下的精度对比——步长越小越接近精确解，但计算量线性增加 |
+
+---
+
+## 思考路标（条件反射）
+
+> **见到以下特征，立即触发对应动作：**
+
+1. **随机过程 $X_t$**：看到"含时间的随机变量族"，区分确定性轨迹（ODE，给定初值后唯一确定）与随机轨迹（SDE，每次实现不同）。概率意义的"解"是分布族 $\{p_t(x)\}$。
+
+2. **布朗运动**：$W_0=0$，增量独立，$W_t-W_s\sim\mathcal{N}(0,t-s)$，路径连续但处处不可微。这决定了 $dW_t$ 不是普通微分，需要专门的 Itô 积分理论。
+
+3. **Itô 公式**：见到"对 $X_t$ 的函数 $f(X_t,t)$ 求微分"，立即套用：$df=f_t\,dt+f_x\,dX+\frac{1}{2}f_{xx}(dX)^2$。关键是 $(dX)^2=\sigma^2\,dt$（不为零！）。
+
+4. **SDE 标准型**：$dX=\mu(X,t)\,dt+\sigma(X,t)\,dW$。$\mu$ 是漂移（确定性部分），$\sigma$ 是扩散（随机强度）。Euler-Maruyama 离散化：$X_{n+1}=X_n+\mu\Delta t+\sigma\sqrt{\Delta t}\,\varepsilon_n$。
+
+5. **Itô vs Stratonovich**：两种随机积分约定。Itô 用左端点（前向适应），Stratonovich 用中点（更符合物理直觉，满足普通链式法则）。两者可相互转换，物理文献多用 Stratonovich，AI/概率文献多用 Itô。
+
+6. **Black-Scholes**：几何 Brownian 运动 $dS=\mu S\,dt+\sigma S\,dW$ 的显式解 $S_t=S_0\exp[(\mu-\sigma^2/2)t+\sigma W_t]$。注意漂移修正项 $-\sigma^2/2$，这是 Itô 公式二阶项的贡献。
+
+7. **OU 过程**：$dX=-\theta X\,dt+\sigma\,dW$，均值回归到 0，平稳分布为 $\mathcal{N}(0,\sigma^2/(2\theta))$。扩散模型中常用作噪声注入和正向过程的模板。
+
+8. **Fokker-Planck**：SDE 的"密度视角"。$\partial p/\partial t=-\partial(\mu p)/\partial x+\frac{1}{2}\partial^2(\sigma^2 p)/\partial x^2$。它描述分布而非单条轨迹，平稳分布令 $\partial p/\partial t=0$ 求解。
+
+---
+
+## 易错点（⚠ 红色警报）
+
+1. **Itô 公式中 $(dB)^2=dt$（不为零，区别于普通微积分）**：普通微积分里高阶小量 $(dx)^2\to 0$，但布朗运动的 $(dW)^2=dt$ 是一阶量，不能忽略。忘记这一项会导致 Itô 公式计算错误（少掉二阶修正项 $\frac{1}{2}\sigma^2 f_{xx}\,dt$）。
+
+2. **Itô 积分非对称**：Itô 积分 $\int_0^T W_t\,dW_t=\frac{1}{2}W_T^2-\frac{1}{2}T\neq\frac{1}{2}W_T^2$（普通积分结果）。多出来的 $-\frac{1}{2}T$ 项正是 Itô 修正，不能用 Newton-Leibniz 公式直接类比。
+
+3. **随机微分 $\neq$ 普通微分**：$dX=\mu\,dt+\sigma\,dW$ 是积分形式的简写，不代表路径可微。对 $X_t$ 的函数求"导数"必须用 Itô 公式，不能用普通链式法则。
+
+4. **平稳性 vs 各态历经**：平稳分布（$\partial p/\partial t=0$）说明分布不再变化，但不代表单条轨迹会遍历所有状态（各态历经性）。两者是不同概念，在扩散模型的理论分析中不能混用。
+
+5. **数值方法（Euler-Maruyama）的误差理解**：Euler-Maruyama 是强收敛阶 $1/2$、弱收敛阶 $1$ 的方法——前者控制路径误差，后者控制分布误差。步长减半不会使误差减半（强收敛阶仅 $1/2$）。需要更高阶方法（Milstein、RK SDE 格式）来提高精度。
+
+---
+
 ## 练习题
 
 **1.** ⭐ 通过模拟验证 Brownian 运动在时间长度 $\Delta t$ 上的增量方差约为 $\Delta t$。

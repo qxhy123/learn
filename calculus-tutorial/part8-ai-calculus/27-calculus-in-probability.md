@@ -512,8 +512,7 @@ $$
 
 $$
 \log p(x)\geq
-\mathbb{E}_{q_\phi}[\log p(x,z)]
-- \mathbb{E}_{q_\phi}[\log q_\phi(z|x)].
+\mathbb{E}_{q_\phi}[\log p(x,z)] - \mathbb{E}_{q_\phi}[\log q_\phi(z|x)].
 $$
 
 这就是 ELBO。最大化 ELBO 相当于最小化
@@ -566,6 +565,51 @@ $$
 3. 熵、KL 散度、交叉熵是信息论里的核心积分对象。
 4. Jacobian 决定分布换元，重参数化技巧让随机采样重新变得可导。
 5. 高维积分中，Monte Carlo 与变分推断是最重要的两条出路。
+
+---
+
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![PDF / CDF / 期望](../figures/svg/calc-p8-27-1.svg) | **图 27-1**：左：PDF 曲线下面积 $=1$（$f(x)$ 可大于 1，不是概率）；中：CDF 为 PDF 的积分，单调从 0 到 1，$F'(x)=f(x)$；右：期望是分布的"重心"，双峰分布中期望可落在两峰之间的低谷 |
+| ![KL 散度示意](../figures/svg/calc-p8-27-2.svg) | **图 27-2**：两个分布 $p$（窄高斯）与 $q$（宽高斯）的对比。KL 被积函数 $p\ln(p/q)$ 的面积即 $\mathrm{KL}(p\|q)$，始终非负；注意 $\mathrm{KL}(p\|q)\neq\mathrm{KL}(q\|p)$（非对称性） |
+
+---
+
+## 思考路标（条件反射）
+
+> **见到以下特征，立即触发对应动作：**
+
+1. **PDF 合法性检验**：见到函数 $f(x)$，验证 PDF 需检查两条：$f(x)\geq 0$（处处非负）和 $\int_{-\infty}^{+\infty}f(x)\,dx=1$（归一化）。两条缺一不可。
+
+2. **CDF 与 PDF 的互化**：$F(x)=\int_{-\infty}^x f(t)\,dt$；反过来 $F'(x)=f(x)$（微积分基本定理）。见到区间概率 $P(a\leq X\leq b)=F(b)-F(a)$。
+
+3. **期望 $E[X]=\int xf\,dx$**：连续随机变量的期望是"$x$ 乘以密度"的积分，是分布的"重心"。更一般地，$E[g(X)]=\int g(x)f(x)\,dx$（LOTUS 法则）。
+
+4. **方差**：$\mathrm{Var}(X)=E[X^2]-(E[X])^2$。见到方差，优先用这个展开形式；Jensen 不等式保证 $E[X^2]\geq(E[X])^2$。
+
+5. **KL 散度 $\int p\ln(p/q)$**：非负（Jensen 不等式），当且仅当 $p=q$ 时为零。最小化 KL 等价于最大化似然。注意 $\mathrm{KL}(p\|q)\neq\mathrm{KL}(q\|p)$（不对称）。
+
+6. **矩**：$k$ 阶矩 $E[X^k]=\int x^kf(x)\,dx$。矩母函数 $M_X(t)=E[e^{tX}}$，对 $t$ 求 $k$ 阶导再令 $t=0$ 得第 $k$ 阶矩。
+
+7. **特征函数**：$\varphi_X(t)=E[e^{itX}]$，对应 $f(x)$ 的 Fourier 变换。独立随机变量之和的特征函数是各自特征函数之积，是中心极限定理的核心工具。
+
+8. **重要分布速查**：正态 $\mathcal{N}(\mu,\sigma^2)$：$f=\frac{1}{\sqrt{2\pi\sigma^2}}e^{-(x-\mu)^2/(2\sigma^2)}$；指数分布：$f=\lambda e^{-\lambda x}$，$E[X]=1/\lambda$；Gamma 分布：$f\propto x^{\alpha-1}e^{-x/\beta}$，是指数和 $\chi^2$ 分布的推广。
+
+---
+
+## 易错点（⚠ 红色警报）
+
+1. **连续 vs 离散随机变量的积分 vs 求和**：离散用 $\sum$，连续用 $\int$。混用会导致归一化条件和期望公式形式错误。二者之间没有"直接类比"，要分别处理。
+
+2. **PDF $f(x)$ 可以大于 1（不是概率）**：$f(x)$ 是概率**密度**，不是概率。$f(x)\Delta x$ 才近似是小区间 $[x,x+\Delta x]$ 的概率。例如均匀分布 $U[0,0.1]$ 的密度 $f=10>1$，完全合法。
+
+3. **KL 不对称**：$\mathrm{KL}(p\|q)\neq\mathrm{KL}(q\|p)$。前向 KL（$p\|q$）倾向于 mode-covering，反向 KL（$q\|p$）倾向于 mode-seeking。VAE 使用反向 KL 作为正则项。
+
+4. **期望 $\int xf\,dx$ 的收敛性**：期望不总存在——若 $\int|x|f(x)\,dx=+\infty$，期望没有定义（如 Cauchy 分布）。遇到重尾分布要特别检查收敛性。
+
+5. **特征函数对应傅里叶变换**：$\varphi_X(t)=\int e^{itx}f(x)\,dx$ 是 $f(x)$ 的 Fourier 变换（差一个符号约定）。独立性可以通过特征函数相乘来验证，但不要把 MGF（$e^{tX}$）和特征函数（$e^{itX}$）混淆——前者实数参数，后者复数参数。
 
 ---
 
