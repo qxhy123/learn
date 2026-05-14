@@ -473,8 +473,8 @@ $$E[X] = 0,\quad E[XY] = E[X^3] = \int_{-1}^{1} x^3 \cdot \frac{1}{2} dx = 0$$
 | 边缘分布 | $p_X(x_i)=\sum_j p(x_i,y_j)$ | $f_X(x)=\int f(x,y)\,dy$ |
 | 条件分布 | $P(X=x_i\mid Y=y_j)=\dfrac{p(x_i,y_j)}{p_Y(y_j)}$ | $f_{X\mid Y}(x\mid y)=\dfrac{f(x,y)}{f_Y(y)}$ |
 | 独立性 | $p(x_i,y_j)=p_X(x_i)p_Y(y_j)$ | $f(x,y)=f_X(x)f_Y(y)$ |
-| 协方差 | \multicolumn{2}{c|}{$\text{Cov}(X,Y)=E[XY]-E[X]E[Y]$} |
-| 相关系数 | \multicolumn{2}{c|}{$\rho=\text{Cov}(X,Y)/(\sigma_X\sigma_Y)$，$\|\rho\|\leq 1$} |
+| 协方差 | $\text{Cov}(X,Y)=E[XY]-E[X]E[Y]$ | （离散 / 连续公式相同） |
+| 相关系数 | $\rho=\text{Cov}(X,Y)/(\sigma_X\sigma_Y)$，$\vert\rho\vert\leq 1$ | （离散 / 连续公式相同） |
 
 **核心要点**：
 - 联合分布包含两个变量的全部概率信息，边缘分布是联合分布的"投影"
