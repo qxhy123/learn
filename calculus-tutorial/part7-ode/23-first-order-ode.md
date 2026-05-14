@@ -591,20 +591,20 @@ $$
 - $\mathrm{Re}(\lambda)=0$：振荡或临界情况
 
 > **例题 23.13** 求解系统
-> $$
-> \frac{d}{dt}
-> \begin{bmatrix}
-> x\\y
-> \end{bmatrix}
-> =
-> \begin{bmatrix}
-> 0 & 1\\
-> -2 & -3
-> \end{bmatrix}
-> \begin{bmatrix}
-> x\\y
-> \end{bmatrix}.
-> $$
+ $$
+ \frac{d}{dt}
+ \begin{bmatrix}
+ x\\y
+ \end{bmatrix}
+ =
+ \begin{bmatrix}
+ 0 & 1\\
+ -2 & -3
+ \end{bmatrix}
+ \begin{bmatrix}
+ x\\y
+ \end{bmatrix}.
+ $$
 
 **解**：矩阵的特征方程为
 

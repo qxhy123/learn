@@ -103,13 +103,7 @@ $$
 且 $Y_t=f(X_t,t)$ 足够光滑，则
 
 $$
-dY_t
-= \left(
-\frac{\partial f}{\partial t}
-+ \mu \frac{\partial f}{\partial x}
-+ \frac12 \sigma^2 \frac{\partial^2 f}{\partial x^2}
-\right)dt
-+ \sigma \frac{\partial f}{\partial x}dW_t.
+dY_t = \left( \frac{\partial f}{\partial t} + \mu \frac{\partial f}{\partial x} + \frac12 \sigma^2 \frac{\partial^2 f}{\partial x^2} \right)dt + \sigma \frac{\partial f}{\partial x}dW_t.
 $$
 
 与经典链式法则相比，多出来的就是

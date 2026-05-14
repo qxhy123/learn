@@ -329,7 +329,7 @@ $\lim_{x\to0}\dfrac{e^x-1-x}{x^2}$（用两种方法）。
 | $\sec^2x$ | $\tan x+C$ | $\csc^2x$ | $-\cot x+C$ |
 | $\dfrac{1}{\sqrt{1-x^2}}$ | $\arcsin x+C$ | $\dfrac{1}{1+x^2}$ | $\arctan x+C$ |
 | $\dfrac{1}{a^2+x^2}$ | $\dfrac{1}{a}\arctan\dfrac{x}{a}+C$ | $\dfrac{1}{\sqrt{a^2-x^2}}$ | $\arcsin\dfrac{x}{a}+C$ |
-| $\dfrac{1}{\sqrt{x^2\pm a^2}}$ | $\ln|x+\sqrt{x^2\pm a^2}|+C$ | $\dfrac{1}{a^2-x^2}$ | $\dfrac{1}{2a}\ln\left|\dfrac{a+x}{a-x}\right|+C$ |
+| $\dfrac{1}{\sqrt{x^2\pm a^2}}$ | $\ln\|x+\sqrt{x^2\pm a^2}\|+C$ | $\dfrac{1}{a^2-x^2}$ | $\dfrac{1}{2a}\ln\left\|\dfrac{a+x}{a-x}\right\|+C$ |
 
 **凑微分技巧**：对 $\int f(ax+b)\,dx$，令 $u=ax+b$，结果多一个 $1/a$ 的因子。
 
@@ -417,7 +417,7 @@ $\displaystyle\int x\ln x\,dx$（L > A，$u=\ln x$，$dv=x\,dx$）。
 |:---:|:---:|:---:|:---|
 | $\sqrt{a^2-x^2}$ | $x=a\sin t$ | $t\in[-\pi/2,\pi/2]$ | $\sqrt{a^2-x^2}=a\cos t$（$\cos t\geq0$）|
 | $\sqrt{a^2+x^2}$ | $x=a\tan t$ | $t\in(-\pi/2,\pi/2)$ | $\sqrt{a^2+x^2}=a\sec t$（$\sec t>0$）|
-| $\sqrt{x^2-a^2}$ | $x=a\sec t$ | $t\in[0,\pi/2)\cup(\pi/2,\pi]$ | $\sqrt{x^2-a^2}=a|\tan t|$（注意绝对值）|
+| $\sqrt{x^2-a^2}$ | $x=a\sec t$ | $t\in[0,\pi/2)\cup(\pi/2,\pi]$ | $\sqrt{x^2-a^2}=a\|\tan t\|$（注意绝对值）|
 
 **回代步骤**：换元后积分得到以 $t$ 表示的结果，需用 $\sin t=x/a$、$\cos t=\sqrt{1-x^2/a^2}$（等）将 $t$ 还原为 $x$；作辅助直角三角形有助于快速读出各三角函数的值。
 
@@ -910,7 +910,7 @@ $$H=\nabla^2f=\begin{pmatrix}f_{x_1x_1}&f_{x_1x_2}&\cdots&f_{x_1x_n}\\f_{x_2x_1}
 | $\dfrac{\partial(x^Tx)}{\partial x}=2x$ | 二次型 $\|x\|^2$ 的梯度 |
 | $\dfrac{\partial(x^TAx)}{\partial x}=(A+A^T)x$（$A$ 对称时 $=2Ax$）| 二次型的梯度 |
 | $\dfrac{\partial\|Ax-b\|^2}{\partial x}=2A^T(Ax-b)$ | 最小二乘梯度（令其为零得 $A^TAx=A^Tb$）|
-| $\dfrac{\partial\ln|A|}{\partial A}=A^{-T}$ | 对数行列式 |
+| $\dfrac{\partial\ln\|A\|}{\partial A}=A^{-T}$ | 对数行列式 |
 
 **矩阵微积分的布局约定**：分子布局（梯度是行向量）vs 分母布局（梯度是列向量）；约定统一为分母布局，与梯度向量同维。
 

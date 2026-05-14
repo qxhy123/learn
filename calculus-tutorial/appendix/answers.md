@@ -2303,8 +2303,7 @@ $$
 
 代入可得
 $$
-p_1(\tau)
-=
+p_1(\tau) =
 \frac{1+\frac{z_1}{\tau}+O(\tau^{-2})}
 {\left(1+\frac{z_1}{\tau}+O(\tau^{-2})\right)+\left(1+\frac{z_2}{\tau}+O(\tau^{-2})\right)}.
 $$
@@ -3219,8 +3218,7 @@ $$
 \frac{d}{dt}
 \begin{bmatrix}
 x_1\\x_2
-\end{bmatrix}
-=
+\end{bmatrix} =
 \begin{bmatrix}
 0 & 1\\
 -6 & -5
@@ -3249,9 +3247,7 @@ $$
 $$
 \begin{bmatrix}
 x(t)\\y(t)
-\end{bmatrix}
-=
-\begin{bmatrix}
+\end{bmatrix} = \begin{bmatrix}
 C_1e^t\\C_2e^{-2t}
 \end{bmatrix}.
 $$
@@ -3602,10 +3598,7 @@ $$
 
 **4.** 一维高斯 KL 为
 $$
-\mathrm{KL}(\mathcal N_1\|\mathcal N_2)
-= \log\frac{\sigma_2}{\sigma_1}
-+ \frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}
-- \frac12.
+\mathrm{KL}(\mathcal N_1\|\mathcal N_2) = \log\frac{\sigma_2}{\sigma_1} + \frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2} - \frac12.
 $$
 
 ---
@@ -3666,9 +3659,7 @@ $$
 
 **3.** 对 OU 过程，$\mu(x,t)=-\theta x$，$\sigma(x,t)=\sigma$，因此
 $$
-\frac{\partial p}{\partial t}
-= -\frac{\partial}{\partial x}(-\theta x p)
-+ \frac{\sigma^2}{2}\frac{\partial^2 p}{\partial x^2}.
+\frac{\partial p}{\partial t} = -\frac{\partial}{\partial x}(-\theta x p) + \frac{\sigma^2}{2}\frac{\partial^2 p}{\partial x^2}.
 $$
 
 ---
