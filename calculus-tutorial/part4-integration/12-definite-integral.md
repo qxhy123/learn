@@ -822,3 +822,34 @@ $$r^2 + r'^2 = (1 + \cos\theta)^2 + \sin^2\theta = 2 + 2\cos\theta = 4\cos^2\fra
 $$L = 2\int_0^{\pi} 2\cos\frac{\theta}{2} \, d\theta = 4 \left[2\sin\frac{\theta}{2}\right]_0^{\pi} = 4 \cdot 2 = 8$$
 
 </details>
+
+
+
+## 几何示意
+
+![定积分几何意义：黎曼和](../figures/svg/calc-p4-12-1.svg)
+
+![牛顿-莱布尼茨公式](../figures/svg/calc-p4-12-2.svg)
+
+![定积分含正负面积](../figures/svg/calc-p4-12-3.svg)
+
+---
+
+## 思考路标（条件反射）
+
+- 看到 $\int_a^b f(x)\,dx$ → 牛顿-莱布尼茨 $F(b)-F(a)$
+- 看到"曲边梯形面积" → 定积分几何意义（含正负）
+- 看到 $\int_a^a$ → 直接 $0$
+- 看到 $\int_a^b + \int_b^c = \int_a^c$ → 区间可加
+- 看到 $\int_a^b f\,dx = -\int_b^a f\,dx$ → 上下限交换变号
+- 看到定积分含变上限 $\int_a^x f(t)\,dt$ → 求导得 $f(x)$（微积分基本定理）
+- 看到对称区间 $\int_{-a}^a$ → 奇函数为 0，偶函数为 $2\int_0^a$
+- 看到含 $\sin^n, \cos^n$ 在 $[0, \pi/2]$ → Wallis 公式
+
+## 易错点
+
+1. **变上限积分 $F(x)=\int_a^x f(t)\,dt$ 的导数是 $f(x)$**（不是 $f(t)$）。
+2. **定积分与不定积分区别**：前者是数，后者是函数族。
+3. **被积函数与积分变量混淆**：$\int_a^b f(t)\,dt$ 中 $t$ 是哑变量，与外层 $x$ 无关。
+4. **几何面积 vs 定积分**：$\int_a^b f$ 可正可负；总面积要 $\int|f|$。
+5. **变上限 + 复合**：$\frac{d}{dx}\int_a^{g(x)} f(t)\,dt = f(g(x))\cdot g'(x)$（含链式）。
