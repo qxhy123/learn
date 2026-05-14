@@ -170,3 +170,58 @@
 ---
 
 *如有建议或发现错误，欢迎提交 Issue 或 Pull Request。*
+
+---
+
+## 改造升级（2026-05-14）
+
+本教程已按 `calculus-tutorial/` 模式做了"包装式改造"：
+
+### 新增 thinking-toolkit（12 篇）
+
+`thinking-toolkit/` 目录是独立的"概率论思维方法论"小册子：
+
+| 编号 | 主题 |
+|---|---|
+| 01 | [概率公理与样本空间](./thinking-toolkit/01-probability-axioms.md) |
+| 02 | [条件概率与贝叶斯思维](./thinking-toolkit/02-conditional-bayes.md) |
+| 03 | [期望 / 方差 / 矩](./thinking-toolkit/03-expectation-variance-moments.md) |
+| 04 | [常见分布速查表](./thinking-toolkit/04-distributions-cheatsheet.md) |
+| 05 | [多元分布与协方差](./thinking-toolkit/05-multivariate-covariance.md) |
+| 06 | [极限定理（LLN + CLT）](./thinking-toolkit/06-limit-theorems.md) |
+| 07 | [估计量评价四标尺](./thinking-toolkit/07-estimator-evaluation.md) |
+| 08 | [MLE 求解套路](./thinking-toolkit/08-mle-patterns.md) |
+| 09 | [假设检验 7 步法](./thinking-toolkit/09-hypothesis-testing-7steps.md) |
+| 10 | [信息论核心三件套](./thinking-toolkit/10-information-theory.md) |
+| 11 | [Monte Carlo + MCMC](./thinking-toolkit/11-monte-carlo-mcmc.md) |
+| 12 | [概率论中的 AI 思维](./thinking-toolkit/12-probability-for-ai.md) |
+
+### 新增模板 D 包装
+
+每个**核心套路型章节**（⭐ 标记，共 10 章）在原正文之外，加上：
+- 一例速记：核心公式 + 最常用变形
+- 思维路径还原：作者第 1 秒怎么想的内心独白
+- 思考路标 ≥8 条：条件反射（看到 X 立刻想 Y）
+- 易错点 5 条
+
+⭐ 章节：条件概率 / 多元随机变量 / 连续分布 / 大数定律 / CLT / 点估计 / 贝叶斯估计 / 假设检验基础 / 信息论 / 概率图模型。
+
+### 新增题库（240 题 C/D/E 三档）
+
+`appendix/` 新增 C 80 + D 100 + E 60 = 240 题，F 详解按主题分 6-7 文件。
+
+### figures（~70 张）
+
+`figures/` 目录用 TikZ + Asymptote 渲染了约 70 张关键图（分布密度 / CLT 演示 / MLE 似然曲面 / 假设检验决策 / KL 散度 / MCMC 轨迹等）。
+
+---
+
+## 配套教程
+
+- [`chuzhong_algebra/`](../chuzhong_algebra/) — 中考代数
+- [`chuzhong_geometry/`](../chuzhong_geometry/) — 中考几何
+- [`gaozhong_math/algebra/`](../gaozhong_math/algebra/) — 高中代数（含概率初步）
+- [`gaozhong_math/geometry/`](../gaozhong_math/geometry/) — 高中几何
+- [`calculus-tutorial/`](../calculus-tutorial/) — 微积分（含 AI 微积分）
+
+5 套教程构成"初中 → 高中 → 微积分 → 概率统计 → AI"完整数学体系。
