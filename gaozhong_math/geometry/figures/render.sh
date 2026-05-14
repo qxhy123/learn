@@ -37,19 +37,21 @@ render_tikz() {
 
 render_asy() {
     # Homebrew 的 asy 3.10 直接出 SVG 需要 libgs（未链接），所以走 asy → PDF → pdf2svg
+    # 使用 xelatex 引擎（pdflatex 在 homebrew asy 中有路径问题）
     local src="$1"
     local name
     name="$(basename "$src" .asy)"
     echo "  Asy:  $name"
     local tmppdf
     tmppdf="$(mktemp -t asy-XXXXXX).pdf"
-    if asy -f pdf -tex pdflatex -o "$tmppdf" "$src" 2>&1 | grep -v "^$"; then :; fi
+    ASYMPTOTE_TEXPATH=/Library/TeX/texbin \
+    asy -texpath=/Library/TeX/texbin -f pdf -tex xelatex -o "$tmppdf" "$src" 2>&1 | grep -v "^$" || true
     # asy 会把输出文件名再追加 .pdf
     local realpdf="${tmppdf}.pdf"
     [[ -f "$realpdf" ]] || realpdf="$tmppdf"
     if [[ -f "$realpdf" ]]; then
         pdf2svg "$realpdf" "$OUT/$name.svg"
-        rm -f "$tmppdf" "$realpdf"
+        rm -f "$tmppdf" "$realpdf" "${tmppdf}__.ps"
         echo "    ✓ $OUT/$name.svg"
     else
         echo "    ✗ asy failed for $name (no PDF output)"
