@@ -83,8 +83,8 @@ $$\vec{a}\cdot\vec{b}=|\vec{a}||\vec{b}|\cos\theta \quad\Leftrightarrow\quad \co
 | 向量形式 | 三角形式 |
 |----------|----------|
 | $\vec{a}\cdot\vec{b}=0$ | $\cos\theta=0$，即 $\theta=\frac{\pi}{2}$ |
-| $|\vec{a}+\vec{b}|^2=|\vec{a}|^2+2\vec{a}\cdot\vec{b}+|\vec{b}|^2$ | 余弦定理 |
-| $|\vec{a}-\vec{b}|^2=|\vec{a}|^2-2\vec{a}\cdot\vec{b}+|\vec{b}|^2$ | 余弦定理（$\theta$ 换为 $\pi-\theta$） |
+| $\vert \vec{a}+\vec{b}\vert ^2=\vert \vec{a}\vert ^2+2\vec{a}\cdot\vec{b}+\vert \vec{b}\vert ^2$ | 余弦定理 |
+| $\vert \vec{a}-\vec{b}\vert ^2=\vert \vec{a}\vert ^2-2\vec{a}\cdot\vec{b}+\vert \vec{b}\vert ^2$ | 余弦定理（$\theta$ 换为 $\pi-\theta$） |
 | $\vec{a}=(\cos\alpha,\sin\alpha)$，$\vec{b}=(\cos\beta,\sin\beta)$，$\vec{a}\cdot\vec{b}$ | $=\cos(\alpha-\beta)$ |
 
 **用向量证三角恒等式**：
@@ -108,7 +108,7 @@ $$f(\theta)=\vec{u}\cdot\vec{v}\leq|\vec{u}||\vec{v}|=\sqrt{a^2+b^2}$$
 |----------|----------|----------|
 | $\overrightarrow{OA}\cdot\overrightarrow{OB}=0$ | $OA\perp OB$ | $x_1x_2+y_1y_2=0$ |
 | $\overrightarrow{MA}\cdot\overrightarrow{MB}=0$ | $\angle AMB=90°$ | $(x_1-m)(x_2-m)+(y_1-n)(y_2-n)=0$ |
-| $|\overrightarrow{PA}|=|\overrightarrow{PB}|$ | $P$ 在 $AB$ 垂直平分线上 | $(x_1-p_x)^2+(y_1-p_y)^2=(x_2-p_x)^2+(y_2-p_y)^2$ |
+| $\vert \overrightarrow{PA}\vert =\vert \overrightarrow{PB}\vert$ | $P$ 在 $AB$ 垂直平分线上 | $(x_1-p_x)^2+(y_1-p_y)^2=(x_2-p_x)^2+(y_2-p_y)^2$ |
 | $\overrightarrow{OA}+\overrightarrow{OB}=\vec{0}$ | $A,B$ 关于 $O$ 对称 | $x_1+x_2=0,y_1+y_2=0$ |
 | $k\overrightarrow{OA}+\overrightarrow{OB}=\vec{0}$ | 分向量关系 | $x_2=-kx_1,y_2=-ky_1$ |
 

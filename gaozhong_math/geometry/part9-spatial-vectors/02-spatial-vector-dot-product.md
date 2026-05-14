@@ -65,7 +65,7 @@ $$\boxed{\vec{a}\cdot\vec{b} = x_1x_2 + y_1y_2 + z_1z_2}$$
 | 量 | 公式 |
 |---|---|
 | 数量积 | $\vec{a}\cdot\vec{b} = x_1x_2+y_1y_2+z_1z_2$ |
-| 模长 | $|\vec{a}| = \sqrt{x_1^2+y_1^2+z_1^2}$ |
+| 模长 | $\vert \vec{a}\vert = \sqrt{x_1^2+y_1^2+z_1^2}$ |
 | 夹角余弦 | $\cos\theta = \dfrac{x_1x_2+y_1y_2+z_1z_2}{\sqrt{x_1^2+y_1^2+z_1^2}\cdot\sqrt{x_2^2+y_2^2+z_2^2}}$ |
 | 垂直条件 | $\vec{a}\perp\vec{b} \Leftrightarrow x_1x_2+y_1y_2+z_1z_2=0$ |
 

@@ -61,9 +61,9 @@
 
 | 角的类型 | 范围 | 向量公式 | 注意事项 |
 |---|---|---|---|
-| **线线角**（两直线夹角） | $\theta \in (0, \pi/2]$ | $\cos\theta = \left\|\dfrac{\vec{a}\cdot\vec{b}}{|\vec{a}||\vec{b}|}\right\|$ | **取绝对值**（异面线取锐角） |
-| **线面角**（直线与平面） | $\varphi \in [0, \pi/2]$ | $\sin\varphi = \left\|\dfrac{\vec{l}\cdot\vec{n}}{|\vec{l}||\vec{n}|}\right\|$ | **取绝对值**；用 $\sin$ 不用 $\cos$ |
-| **二面角**（两半平面） | $\psi \in [0, \pi]$ | $\cos\psi = \pm\dfrac{\vec{n_1}\cdot\vec{n_2}}{|\vec{n_1}||\vec{n_2}|}$ | **不取绝对值**；看图判符号 |
+| **线线角**（两直线夹角） | $\theta \in (0, \pi/2]$ | $\cos\theta = \left\vert \dfrac{\vec{a}\cdot\vec{b}}{\vert \vec{a}\vert \vert \vec{b}\vert }\right\vert$ | **取绝对值**（异面线取锐角） |
+| **线面角**（直线与平面） | $\varphi \in [0, \pi/2]$ | $\sin\varphi = \left\vert \dfrac{\vec{l}\cdot\vec{n}}{\vert \vec{l}\vert \vert \vec{n}\vert }\right\vert$ | **取绝对值**；用 $\sin$ 不用 $\cos$ |
+| **二面角**（两半平面） | $\psi \in [0, \pi]$ | $\cos\psi = \pm\dfrac{\vec{n_1}\cdot\vec{n_2}}{\vert \vec{n_1}\vert \vert \vec{n_2}\vert }$ | **不取绝对值**；看图判符号 |
 
 > **公式来源直觉**：
 > - 线线角：两方向向量夹角，取锐角故加绝对值。

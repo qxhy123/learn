@@ -54,9 +54,9 @@
 
 | 距离类型 | 公式 | 适用条件 |
 |---|---|---|
-| **点 $P$ 到平面 $\pi$** | $d = \dfrac{|\vec{AP}\cdot\vec{n}|}{|\vec{n}|}$ | $A$ 是 $\pi$ 内任意点；$\vec{n}$ 是 $\pi$ 的法向量 |
-| **点 $P$ 到直线 $l$** | $d = \sqrt{|\vec{AP}|^2 - \left(\dfrac{\vec{AP}\cdot\vec{l}}{|\vec{l}|}\right)^2}$ | $A$ 是 $l$ 上任意点；$\vec{l}$ 是 $l$ 的方向向量 |
-| **异面直线 $l_1, l_2$ 的距离** | $d = \dfrac{|\vec{AB}\cdot\vec{n}|}{|\vec{n}|}$ | $A\in l_1, B\in l_2$；$\vec{n}$ 是公共法向量（$\vec{n}\perp\vec{l_1}$ 且 $\vec{n}\perp\vec{l_2}$） |
+| **点 $P$ 到平面 $\pi$** | $d = \dfrac{\vert \vec{AP}\cdot\vec{n}\vert }{\vert \vec{n}\vert }$ | $A$ 是 $\pi$ 内任意点；$\vec{n}$ 是 $\pi$ 的法向量 |
+| **点 $P$ 到直线 $l$** | $d = \sqrt{\vert \vec{AP}\vert ^2 - \left(\dfrac{\vec{AP}\cdot\vec{l}}{\vert \vec{l}\vert }\right)^2}$ | $A$ 是 $l$ 上任意点；$\vec{l}$ 是 $l$ 的方向向量 |
+| **异面直线 $l_1, l_2$ 的距离** | $d = \dfrac{\vert \vec{AB}\cdot\vec{n}\vert }{\vert \vec{n}\vert }$ | $A\in l_1, B\in l_2$；$\vec{n}$ 是公共法向量（$\vec{n}\perp\vec{l_1}$ 且 $\vec{n}\perp\vec{l_2}$） |
 
 ### 3.2 公式来源的直觉
 

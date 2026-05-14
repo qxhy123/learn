@@ -331,7 +331,7 @@ $$\cos\theta = \dfrac{1-t}{\sqrt{2(1+t^2)}}$$
 |---|---|---|
 | 核心思想 | 平移一条直线，使两线共点，转化为相交直线夹角 | 用方向向量的点积计算夹角 |
 | 适用场景 | 图形对称性强，容易看出平行线（如正方体） | 坐标已知或容易建系，特别是含参数题 |
-| 关键步骤 | 找 $l_2' \parallel l_2$ 且 $l_2'$ 与 $l_1$ 相交 | $\cos\theta = \dfrac{|\vec{a}\cdot\vec{b}|}{|\vec{a}||\vec{b}|}$ |
+| 关键步骤 | 找 $l_2' \parallel l_2$ 且 $l_2'$ 与 $l_1$ 相交 | $\cos\theta = \dfrac{\vert \vec{a}\cdot\vec{b}\vert }{\vert \vec{a}\vert \vert \vec{b}\vert }$ |
 | 注意点 | 最后若得钝角需取补角 | 公式中必须取绝对值 |
 
 ---

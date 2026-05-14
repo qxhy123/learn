@@ -87,7 +87,7 @@ $$\text{proj}_{\vec{a}}\vec{b} = |\vec{b}|\cos\theta = \frac{\vec{a}\cdot\vec{b}
 | 交换律 | $\vec{a}\cdot\vec{b} = \vec{b}\cdot\vec{a}$ |
 | 分配律 | $\vec{a}\cdot(\vec{b}+\vec{c}) = \vec{a}\cdot\vec{b} + \vec{a}\cdot\vec{c}$ |
 | 数乘结合 | $(\lambda\vec{a})\cdot\vec{b} = \lambda(\vec{a}\cdot\vec{b})$ |
-| 自积 | $\vec{a}\cdot\vec{a} = |\vec{a}|^2 \geq 0$，等号当且仅当 $\vec{a} = \vec{0}$ |
+| 自积 | $\vec{a}\cdot\vec{a} = \vert \vec{a}\vert ^2 \geq 0$，等号当且仅当 $\vec{a} = \vec{0}$ |
 
 **注意：数量积不满足结合律！** 即一般地 $(\vec{a}\cdot\vec{b})\vec{c} \neq \vec{a}(\vec{b}\cdot\vec{c})$。
 

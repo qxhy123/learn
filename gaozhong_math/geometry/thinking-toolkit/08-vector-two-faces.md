@@ -31,7 +31,7 @@
 | 概念 | 几何含义 |
 |---|---|
 | 向量 $\vec{a}$ | 一段有方向的线段（起点 + 终点）|
-| 模长 $\|\vec{a}\|$ | 该线段的长度 |
+| 模长 $\vert \vec{a}\vert$ | 该线段的长度 |
 | 方向 | 该线段的指向 |
 | 零向量 $\vec{0}$ | 起点 = 终点的"退化"向量 |
 | 单位向量 | 模长为 $1$ 的向量 |
@@ -78,8 +78,8 @@ $$\vec{a} \cdot \vec{b} = |\vec{a}| \cdot |\vec{b}| \cdot \cos\theta$$
 | 加减 | $\vec{a} \pm \vec{b} = (x_1 \pm x_2, y_1 \pm y_2)$ |
 | 数乘 | $\lambda \vec{a} = (\lambda x, \lambda y)$ |
 | 数量积 | $\vec{a} \cdot \vec{b} = x_1 x_2 + y_1 y_2$ |
-| 模长 | $\|\vec{a}\| = \sqrt{x^2 + y^2}$ |
-| 夹角余弦 | $\cos\theta = \dfrac{\vec{a} \cdot \vec{b}}{\|\vec{a}\| \cdot \|\vec{b}\|} = \dfrac{x_1 x_2 + y_1 y_2}{\sqrt{x_1^2 + y_1^2} \cdot \sqrt{x_2^2 + y_2^2}}$ |
+| 模长 | $\vert \vec{a}\vert = \sqrt{x^2 + y^2}$ |
+| 夹角余弦 | $\cos\theta = \dfrac{\vec{a} \cdot \vec{b}}{\vert \vec{a}\vert \cdot \vert \vec{b}\vert } = \dfrac{x_1 x_2 + y_1 y_2}{\sqrt{x_1^2 + y_1^2} \cdot \sqrt{x_2^2 + y_2^2}}$ |
 | 共线 | $\vec{a} \parallel \vec{b} \Leftrightarrow x_1 y_2 - x_2 y_1 = 0$ |
 | 垂直 | $\vec{a} \perp \vec{b} \Leftrightarrow x_1 x_2 + y_1 y_2 = 0$ |
 

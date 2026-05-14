@@ -18,7 +18,7 @@
 |------|------|------|
 | 相等 | 模相同 + 方向相同 | 自由向量，起点无关 |
 | 共线 | 方向平行（含同向、反向） | $\vec{0}$ 与任意向量共线 |
-| 单位向量 | $\|\hat{a}\| = 1$ | $\hat{a} = \dfrac{\vec{a}}{\|\vec{a}\|}$ |
+| 单位向量 | $\vert \hat{a}\vert = 1$ | $\hat{a} = \dfrac{\vec{a}}{\vert \vec{a}\vert }$ |
 
 ### 1.2 向量加减法 `(part1/02)`
 
@@ -66,7 +66,7 @@ $$\vec{a} = \lambda_1\vec{e_1} + \lambda_2\vec{e_2}$$
 | 加法 | $\vec{a} + \vec{b} = (x_1+x_2,\; y_1+y_2)$ |
 | 减法 | $\vec{a} - \vec{b} = (x_1-x_2,\; y_1-y_2)$ |
 | 数乘 | $\lambda\vec{a} = (\lambda x_1,\; \lambda y_1)$ |
-| 模 | $\|\vec{a}\| = \sqrt{x_1^2 + y_1^2}$ |
+| 模 | $\vert \vec{a}\vert = \sqrt{x_1^2 + y_1^2}$ |
 | $\overrightarrow{AB}$ | $= (x_B - x_A,\; y_B - y_A)$ |
 | 共线判定 | $x_1 y_2 - x_2 y_1 = 0$（且 $\vec{a}, \vec{b}$ 不全为零向量） |
 
@@ -97,9 +97,9 @@ $$\boxed{\vec{a} \cdot \vec{b} = |\vec{a}||\vec{b}|\cos\theta = x_1 x_2 + y_1 y_
 
 | 用途 | 公式 | 说明 |
 |------|------|------|
-| 求夹角 | $\cos\theta = \dfrac{\vec{a} \cdot \vec{b}}{\|\vec{a}\|\|\vec{b}\|}$ | $\theta \in [0, \pi]$，注意分母不为零 |
+| 求夹角 | $\cos\theta = \dfrac{\vec{a} \cdot \vec{b}}{\vert \vec{a}\vert \vert \vec{b}\vert }$ | $\theta \in [0, \pi]$，注意分母不为零 |
 | 判垂直 | $\vec{a} \perp \vec{b} \Leftrightarrow \vec{a} \cdot \vec{b} = 0$ | 充要条件 |
-| 求投影 | $\vec{b}$ 在 $\vec{a}$ 上的投影 $= \dfrac{\vec{a} \cdot \vec{b}}{\|\vec{a}\|}$ | 有正负（取决于 $\cos\theta$ 正负） |
+| 求投影 | $\vec{b}$ 在 $\vec{a}$ 上的投影 $= \dfrac{\vec{a} \cdot \vec{b}}{\vert \vec{a}\vert }$ | 有正负（取决于 $\cos\theta$ 正负） |
 
 **模平方与展开**：
 
@@ -269,9 +269,9 @@ $$\boxed{(x_0 - a)(x - a) + (y_0 - b)(y - b) = r^2}$$
 |------|------|----------|
 | 外离 | $d > r_1 + r_2$ | $4$ 条 |
 | 外切 | $d = r_1 + r_2$ | $3$ 条 |
-| 相交 | $\|r_1 - r_2\| < d < r_1 + r_2$ | $2$ 条 |
-| 内切 | $d = \|r_1 - r_2\|$（$d \ne 0$） | $1$ 条 |
-| 内含 | $d < \|r_1 - r_2\|$ | $0$ 条 |
+| 相交 | $\vert r_1 - r_2\vert < d < r_1 + r_2$ | $2$ 条 |
+| 内切 | $d = \vert r_1 - r_2\vert$（$d \ne 0$） | $1$ 条 |
+| 内含 | $d < \vert r_1 - r_2\vert$ | $0$ 条 |
 
 **公共弦方程**（两圆相交时，两方程相减）：
 
@@ -316,7 +316,7 @@ $$\text{长对正（正视图与俯视图等宽）}\quad \text{高平齐（正�
 | 求法 | 步骤 |
 |------|------|
 | **综合法** | 平移一直线使两线相交，交角即为所求（取锐角）。 |
-| **向量法** | 设两直线方向向量 $\vec{u}, \vec{v}$，$\cos\theta = \dfrac{\|\vec{u} \cdot \vec{v}\|}{\|\vec{u}\|\|\vec{v}\|}$（绝对值保证取锐角）。 |
+| **向量法** | 设两直线方向向量 $\vec{u}, \vec{v}$，$\cos\theta = \dfrac{\vert \vec{u} \cdot \vec{v}\vert }{\vert \vec{u}\vert \vert \vec{v}\vert }$（绝对值保证取锐角）。 |
 
 ### 8.3 直线与平面的位置关系 `(part8/03)`
 
@@ -649,10 +649,10 @@ $$\vec{a} = (x,y,z)$$
 | 加法 | $(x_1+x_2,y_1+y_2,z_1+z_2)$ |
 | 减法 | $(x_1-x_2,y_1-y_2,z_1-z_2)$ |
 | 数乘 | $\lambda(x,y,z)=(\lambda x,\lambda y,\lambda z)$ |
-| 模长 | $|\vec{a}|=\sqrt{x^2+y^2+z^2}$ |
+| 模长 | $\vert \vec{a}\vert =\sqrt{x^2+y^2+z^2}$ |
 | 点积 | $\vec{a}\cdot\vec{b}=x_1x_2+y_1y_2+z_1z_2$ |
-| 夹角 | $\cos\theta=\dfrac{x_1x_2+y_1y_2+z_1z_2}{|\vec{a}||\vec{b}|}$ |
-| 两点距离 | $|AB|=\sqrt{(x_B-x_A)^2+(y_B-y_A)^2+(z_B-z_A)^2}$ |
+| 夹角 | $\cos\theta=\dfrac{x_1x_2+y_1y_2+z_1z_2}{\vert \vec{a}\vert \vert \vec{b}\vert }$ |
+| 两点距离 | $\vert AB\vert =\sqrt{(x_B-x_A)^2+(y_B-y_A)^2+(z_B-z_A)^2}$ |
 
 **中点公式**：$M=\left(\dfrac{x_A+x_B}{2},\dfrac{y_A+y_B}{2},\dfrac{z_A+z_B}{2}\right)$
 
@@ -834,7 +834,7 @@ $$x_1+x_2 = -\frac{b}{a} \qquad x_1 x_2 = \frac{c}{a}$$
 | 三点共线 | $\overrightarrow{OC} = \lambda\overrightarrow{OA}+(1-\lambda)\overrightarrow{OB}$ | 2.2 |
 | 直线 5 种形式 | 点斜 / 斜截 / 两点 / 截距 / 一般 | 3.2 |
 | 直线垂直 | $k_1 k_2 = -1$ 或 $A_1A_2+B_1B_2=0$ | 3.3 |
-| 点到直线距离 | $\dfrac{\|Ax_0+By_0+C\|}{\sqrt{A^2+B^2}}$ | 3.4 |
+| 点到直线距离 | $\dfrac{\vert Ax_0+By_0+C\vert }{\sqrt{A^2+B^2}}$ | 3.4 |
 | 圆标准方程 | $(x-a)^2+(y-b)^2=r^2$ | 4.1 |
 | 弦长公式 | $2\sqrt{r^2-d^2}$ | 4.2 |
 | 圆圆 5 位置 | $d$ vs $r_1 \pm r_2$ | 4.3 |
@@ -850,11 +850,11 @@ $$x_1+x_2 = -\frac{b}{a} \qquad x_1 x_2 = \frac{c}{a}$$
 | 双曲线中点弦斜率 | $+b^2x_0/(a^2y_0)$ | 6.3 |
 | 抛物线 4 种方程 | $y^2=\pm2px$，$x^2=\pm2py$ | 7.1 |
 | 抛物线焦半径 | $x_0+p/2$ | 7.2 |
-| 焦点弦调和关系 | $1/|AF|+1/|BF|=2/p$ | 7.3 |
+| 焦点弦调和关系 | $1/\vert AF\vert +1/\vert BF\vert =2/p$ | 7.3 |
 | 空间向量坐标运算 | 加减 / 数乘 / 点积 / 模 | 9.1 |
 | 法向量求法 | 两内向量列方程组 | 9.3 |
 | 线线 / 线面 / 二面角 | $\cos/\sin/\cos$，注意取绝对值 | 9.4 |
-| 点面距离 | $|\overrightarrow{AP}\cdot\vec{n}|/|\vec{n}|$ | 9.5 |
+| 点面距离 | $\vert \overrightarrow{AP}\cdot\vec{n}\vert /\vert \vec{n}\vert$ | 9.5 |
 | 圆锥曲线综合 5 套路 | 设→代→$\Delta$→韦达→代条件 | 10.1 |
 | 轨迹 5 方法 | 直接/定义/几何/参数/相关点 | 10.3 |
 | 定点问题 | 分离参数，令系数为零 | 10.4 |

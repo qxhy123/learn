@@ -126,7 +126,7 @@ $$P = (|OP_x|, |OP_y|, |OP_z|)$$
 
 | 需求 | 公式 |
 |------|------|
-| 两点距离 | $|AB| = \sqrt{(\Delta x)^2+(\Delta y)^2+(\Delta z)^2}$ |
+| 两点距离 | $\vert AB\vert = \sqrt{(\Delta x)^2+(\Delta y)^2+(\Delta z)^2}$ |
 | 向量坐标 | $\vec{AB} = (x_B-x_A,\;y_B-y_A,\;z_B-z_A)$ |
 | 点积（夹角/垂直） | $\vec{a}\cdot\vec{b} = x_1x_2+y_1y_2+z_1z_2$ |
 | 法向量 | 联立 $\vec{n}\cdot\vec{a}=0,\;\vec{n}\cdot\vec{b}=0$，令一分量为 1 解出 |

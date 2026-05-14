@@ -119,9 +119,9 @@ $$S = \frac{1}{2} \times |x_{\text{底右}} - x_{\text{底左}}| \times |y_P - y
 
 | 情形 | 等腰条件 | 建立方程 |
 |---|---|---|
-| $PM = PN$（$P$ 为等腰顶点）| $|PM|^2 = |PN|^2$ | 直接用距离公式，展开化简 |
-| $PM = MN$（$M$ 为等腰顶点）| $|PM|^2 = |MN|^2$ | 同上，$|MN|$ 是常数 |
-| $PN = MN$（$N$ 为等腰顶点）| $|PN|^2 = |MN|^2$ | 同上 |
+| $PM = PN$（$P$ 为等腰顶点）| $\vert PM\vert ^2 = \vert PN\vert ^2$ | 直接用距离公式，展开化简 |
+| $PM = MN$（$M$ 为等腰顶点）| $\vert PM\vert ^2 = \vert MN\vert ^2$ | 同上，$\vert MN\vert$ 是常数 |
+| $PN = MN$（$N$ 为等腰顶点）| $\vert PN\vert ^2 = \vert MN\vert ^2$ | 同上 |
 
 **类型 3：直角三角形**（3 情形分类讨论）
 

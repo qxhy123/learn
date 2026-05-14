@@ -128,10 +128,10 @@ $$|PF| = x_0 - \left(-\dfrac{p}{2}\right) = x_0 + \dfrac{p}{2}$$
 
 | 方程 | 焦半径公式 |
 |------|-----------|
-| $y^2 = 2px$ | $\|PF\| = x_0 + \dfrac{p}{2}$ |
-| $y^2 = -2px$ | $\|PF\| = -x_0 + \dfrac{p}{2} = \dfrac{p}{2} - x_0$（此时 $x_0 \leq 0$） |
-| $x^2 = 2py$ | $\|PF\| = y_0 + \dfrac{p}{2}$ |
-| $x^2 = -2py$ | $\|PF\| = -y_0 + \dfrac{p}{2} = \dfrac{p}{2} - y_0$（此时 $y_0 \leq 0$） |
+| $y^2 = 2px$ | $\vert PF\vert = x_0 + \dfrac{p}{2}$ |
+| $y^2 = -2px$ | $\vert PF\vert = -x_0 + \dfrac{p}{2} = \dfrac{p}{2} - x_0$（此时 $x_0 \leq 0$） |
+| $x^2 = 2py$ | $\vert PF\vert = y_0 + \dfrac{p}{2}$ |
+| $x^2 = -2py$ | $\vert PF\vert = -y_0 + \dfrac{p}{2} = \dfrac{p}{2} - y_0$（此时 $y_0 \leq 0$） |
 
 **统一口诀**：焦半径 $=$ 点在"开口方向坐标"$+$ $\dfrac{p}{2}$（开口右/上加横/纵坐标，开口左/下减横/纵坐标）。
 
@@ -251,11 +251,11 @@ $$|AF|\cdot|BF| = \dfrac{y_1^2+y_2^2+2p^2}{4} = \dfrac{(y_1+y_2)^2 - 2y_1y_2 + 2
 
 | 公式名 | 表达式（以 $y^2=2px$ 为例） |
 |--------|---------------------------|
-| 焦半径 | $\|PF\| = x_0 + \dfrac{p}{2}$ |
+| 焦半径 | $\vert PF\vert = x_0 + \dfrac{p}{2}$ |
 | 离心率 | $e = 1$ |
 | 通径 | $2p$ |
-| 弦长公式 | $\|AB\| = x_1 + x_2 + p$ |
-| 调和公式 | $\dfrac{1}{\|AF\|}+\dfrac{1}{\|BF\|}=\dfrac{2}{p}$ |
+| 弦长公式 | $\vert AB\vert = x_1 + x_2 + p$ |
+| 调和公式 | $\dfrac{1}{\vert AF\vert }+\dfrac{1}{\vert BF\vert }=\dfrac{2}{p}$ |
 | 纵坐标积 | $y_1 y_2 = -p^2$（焦点弦） |
 
 ---

@@ -192,9 +192,9 @@ $$y_1 + y_2 = \frac{2p}{k}, \qquad y_1 y_2 = \frac{2pm}{k}$$
 
 | 量 | 公式 | 说明 |
 |----|------|------|
-| 焦半径 | $\|AF\| = x_1 + p/2$ | $A$ 在抛物线上，$x_1 \geq 0$ |
-| 弦长 | $\|AB\| = x_1 + x_2 + p$ | $= \|AF\| + \|BF\|$ |
-| 调和关系 | $\dfrac{1}{\|AF\|}+\dfrac{1}{\|BF\|}=\dfrac{2}{p}$ | 等价于 $\|AB\| = \dfrac{p}{\sin^2\theta}$（$\theta$ 为弦与轴夹角） |
+| 焦半径 | $\vert AF\vert = x_1 + p/2$ | $A$ 在抛物线上，$x_1 \geq 0$ |
+| 弦长 | $\vert AB\vert = x_1 + x_2 + p$ | $= \vert AF\vert + \vert BF\vert$ |
+| 调和关系 | $\dfrac{1}{\vert AF\vert }+\dfrac{1}{\vert BF\vert }=\dfrac{2}{p}$ | 等价于 $\vert AB\vert = \dfrac{p}{\sin^2\theta}$（$\theta$ 为弦与轴夹角） |
 | 韦达关系 | $x_1 x_2 = p^2/4$ | 由方程 $(\star\star)$ 用 $x_1 x_2 = m^2/k^2$、$m=-p^2/(4k^2)\cdots$ 推出 |
 
 **调和关系推导**：

@@ -12,9 +12,9 @@
 
 | 条件 | 模长 | 方向 |
 |------|------|------|
-| $\lambda > 0$ | $|\lambda\vec{a}| = \lambda|\vec{a}|$ | 与 $\vec{a}$ **相同** |
-| $\lambda < 0$ | $|\lambda\vec{a}| = |\lambda||\vec{a}|$ | 与 $\vec{a}$ **相反** |
-| $\lambda = 0$ | $|0 \cdot \vec{a}| = 0$ | 零向量（方向不定） |
+| $\lambda > 0$ | $\vert \lambda\vec{a}\vert = \lambda\vert \vec{a}\vert$ | 与 $\vec{a}$ **相同** |
+| $\lambda < 0$ | $\vert \lambda\vec{a}\vert = \vert \lambda\vert \vert \vec{a}\vert$ | 与 $\vec{a}$ **相反** |
+| $\lambda = 0$ | $\vert 0 \cdot \vec{a}\vert = 0$ | 零向量（方向不定） |
 
 特别地：$\vec{a} = \vec{0}$ 时，对任意实数 $\lambda$，$\lambda\vec{0} = \vec{0}$。
 

@@ -155,7 +155,7 @@ $$\dfrac{y^2}{a^2} - \dfrac{x^2}{b^2} = 1 \quad (a>0,\; b>0)$$
 
 | 项目 | 椭圆 | 双曲线 |
 |------|------|--------|
-| **定义** | $\|PF_1\|+\|PF_2\|=2a$ | $\bigl\|\|PF_1\|-\|PF_2\|\bigr\|=2a$ |
+| **定义** | $\vert PF_1\vert +\vert PF_2\vert =2a$ | $\bigl\vert \vert PF_1\vert -\vert PF_2\vert \bigr\vert =2a$ |
 | **存在条件** | $2a > 2c$（$a > c > 0$） | $2a < 2c$（$0 < a < c$） |
 | **焦点在 $x$ 轴方程** | $\dfrac{x^2}{a^2}+\dfrac{y^2}{b^2}=1$，$a>b>0$ | $\dfrac{x^2}{a^2}-\dfrac{y^2}{b^2}=1$，$a>0,b>0$ |
 | **$a, b, c$ 关系** | $a^2 = b^2 + c^2$（$a$ 最大） | $c^2 = a^2 + b^2$（$c$ 最大） |

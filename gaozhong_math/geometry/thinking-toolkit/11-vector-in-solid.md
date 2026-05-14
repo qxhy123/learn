@@ -123,10 +123,10 @@ $$d = \frac{|\vec{AP} \cdot \vec{n}|}{|\vec{n}|}$$
 
 | 求什么 | 公式 | 取绝对值？ | 关键说明 |
 |---|---|---|---|
-| 线线角 | $\cos\theta = \dfrac{|\vec{a}\cdot \vec{b}|}{|\vec{a}||\vec{b}|}$ | **是** | 夹角范围 $(0, \pi/2]$ |
-| 线面角 | $\sin\theta = \dfrac{|\vec{l}\cdot \vec{n}|}{|\vec{l}||\vec{n}|}$ | **是** | 用 $\sin$ 不是 $\cos$ |
-| 二面角 | $\cos\theta = \dfrac{\vec{n_1}\cdot \vec{n_2}}{|\vec{n_1}||\vec{n_2}|}$ | **否** | 看图判正负 |
-| 点到平面距离 | $d = \dfrac{|\vec{AP}\cdot \vec{n}|}{|\vec{n}|}$ | **是** | 距离非负 |
+| 线线角 | $\cos\theta = \dfrac{\vert \vec{a}\cdot \vec{b}\vert }{\vert \vec{a}\vert \vert \vec{b}\vert }$ | **是** | 夹角范围 $(0, \pi/2]$ |
+| 线面角 | $\sin\theta = \dfrac{\vert \vec{l}\cdot \vec{n}\vert }{\vert \vec{l}\vert \vert \vec{n}\vert }$ | **是** | 用 $\sin$ 不是 $\cos$ |
+| 二面角 | $\cos\theta = \dfrac{\vec{n_1}\cdot \vec{n_2}}{\vert \vec{n_1}\vert \vert \vec{n_2}\vert }$ | **否** | 看图判正负 |
+| 点到平面距离 | $d = \dfrac{\vert \vec{AP}\cdot \vec{n}\vert }{\vert \vec{n}\vert }$ | **是** | 距离非负 |
 
 ---
 
