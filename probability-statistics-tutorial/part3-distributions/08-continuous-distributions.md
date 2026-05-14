@@ -1,5 +1,68 @@
 # 第8章：连续分布族
 
+> **难度**：★★★★☆（⭐ 核心章节）
+> **前置知识**：第5章连续随机变量、微积分（Gamma函数、换元积分）
+
+---
+
+> **一例速记**
+>
+> - **正态 $N(\mu,\sigma^2)$**：钟形对称，$P(\vert X-\mu\vert<\sigma)\approx 68\%$、$<2\sigma\approx 95\%$、$<3\sigma\approx 99.7\%$
+> - **指数 $\text{Exp}(\lambda)$**：$f(x)=\lambda e^{-\lambda x}$，$E=1/\lambda$，**无记忆性** $P(X>s+t\vert X>s)=P(X>t)$
+> - **Gamma$(\alpha,\beta)$**：$\alpha$ 个独立 $\text{Exp}(\beta)$ 之和；$\alpha=n/2,\beta=1/2$ 退化为 $\chi^2_n$
+> - **Beta$(\alpha,\beta)$**：定义在 $[0,1]$，概率论中作为概率的先验（二项分布共轭先验）
+> - **三大抽样分布**：$\chi^2_n=\sum_{i=1}^n Z_i^2$；$t_n=Z/\sqrt{\chi^2_n/n}$；$F_{m,n}=(\chi^2_m/m)/(\chi^2_n/n)$
+
+---
+
+## 引入题
+
+$X_1,\ldots,X_5\sim N(0,1)$ 独立同分布。
+
+1. 求 $Y=X_1^2+X_2^2+X_3^2+X_4^2+X_5^2$ 的分布。
+2. 求 $T=X_5/\sqrt{(X_1^2+X_2^2+X_3^2+X_4^2)/4}$ 的分布。
+
+## 思维路径还原
+
+> **第一步：识别 $Y$ 的结构**
+>
+> $Y=\sum_{i=1}^5 Z_i^2$，其中每个 $Z_i=X_i\sim N(0,1)$。
+>
+> **卡方分布的定义**：$n$ 个独立标准正态平方和 $\sim\chi^2_n$（自由度 $n$）。
+>
+> 因此 $Y\sim\chi^2_5$（自由度 5）。
+>
+> **第二步：识别 $T$ 的分子**
+>
+> $T$ 的分子 $X_5\sim N(0,1)$，即标准正态 $Z$。
+>
+> **第三步：识别 $T$ 的分母**
+>
+> 分母 $\sqrt{(X_1^2+X_2^2+X_3^2+X_4^2)/4}$。
+>
+> $X_1^2+X_2^2+X_3^2+X_4^2\sim\chi^2_4$（自由度 4），除以自由度 4 再开方，恰好是 $t$ 分布定义中的分母形式：$\sqrt{\chi^2_n/n}$（这里 $n=4$）。
+>
+> **第四步：确认独立性**
+>
+> 分子 $X_5$ 与分母中的 $X_1,X_2,X_3,X_4$ 相互独立（$X_i$ 独立同分布）。
+>
+> **第五步：写出结论**
+>
+> $t$ 分布定义：$t_n=Z/\sqrt{\chi^2_n/n}$，其中 $Z\sim N(0,1)$，$\chi^2_n$ 与 $Z$ 独立。
+>
+> 对应 $T=X_5/\sqrt{\chi^2_4/4}$，所以 $T\sim t_4$（自由度 4）。
+>
+> **关键观察**：分子分母必须独立，这里由 $X_i$ 独立保证。若分子 $X_5$ 同时出现在分母中，则 $t$ 分布结论不成立。
+>
+> **三大抽样分布的记忆线索**：
+> - $\chi^2$：平方和（"sum of squares"）
+> - $t$：正态 / 根号卡方均值（"normal over root chi-square-over-n"）
+> - $F$：两个卡方均值之比（"ratio of two chi-square-over-df"）
+>
+> 这三个分布是统计推断的基石：$t$ 用于小样本均值检验，$\chi^2$ 用于方差检验，$F$ 用于方差比 / ANOVA。
+
+---
+
 ## 学习目标
 
 学完本章后，你将能够：
@@ -857,3 +920,41 @@ $$= \frac{\theta^{\alpha+\beta}}{\Gamma(\alpha)\Gamma(\beta)} u^{\alpha-1}(1-u)^
 $$f_U(u) = \frac{\Gamma(\alpha+\beta)}{\Gamma(\alpha)\Gamma(\beta)} u^{\alpha-1}(1-u)^{\beta-1} = \frac{u^{\alpha-1}(1-u)^{\beta-1}}{B(\alpha,\beta)}$$
 
 这正是 $\text{Beta}(\alpha, \beta)$ 的 PDF。$\blacksquare$
+
+---
+
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![标准正态68-95-99.7](../figures/svg/prob-p3-08-1.svg) | 标准正态 PDF 与 68-95-99.7 经验法则阴影 |
+| ![正态对比](../figures/svg/prob-p3-08-2.svg) | 不同 $\mu,\sigma$ 正态曲线对比：位置与宽窄 |
+| ![指数分布](../figures/svg/prob-p3-08-3.svg) | 指数分布 PDF（$\lambda=0.5,1,2$）与无记忆性生存函数 |
+| ![Gamma分布](../figures/svg/prob-p3-08-4.svg) | Gamma$(\alpha,\beta)$ PDF：不同形状参数 |
+| ![Beta分布](../figures/svg/prob-p3-08-5.svg) | Beta$(\alpha,\beta)$ PDF：U形、钟形、偏斜形 |
+| ![卡方分布](../figures/svg/prob-p3-08-6.svg) | $\chi^2_n$ PDF：不同自由度 $n=1,3,5,10$ |
+| ![t分布](../figures/svg/prob-p3-08-7.svg) | $t_n$ 分布 vs 标准正态：自由度影响尾部厚度 |
+| ![连续分布关系](../figures/svg/prob-p3-08-8.svg) | 连续分布族关系图：正态 $\to$ 卡方 $\to$ $t$、$F$ |
+
+---
+
+## 思考路标（条件反射）
+
+1. **正态 $N(\mu,\sigma^2)$** → 中心极限定理极限；标准化 $Z=(X-\mu)/\sigma\sim N(0,1)$；68-95-99.7 法则
+2. **标准化** → 任何正态计算先做 $Z=(X-\mu)/\sigma$，化为标准正态查表
+3. **指数 $\text{Exp}(\lambda)$** → 唯一连续无记忆分布；$f(x)=\lambda e^{-\lambda x}$，$E=1/\lambda$；泊松过程等待时间
+4. **Gamma$(\alpha,\beta)$** → $\alpha$ 个独立 $\text{Exp}(\beta)$ 之和；形状参数 $\alpha$ 控制偏度
+5. **Beta$(\alpha,\beta)$** → 定义在 $[0,1]$；二项分布成功概率 $p$ 的共轭先验
+6. **卡方 $\chi^2_n$** → $n$ 个独立标准正态平方和；$=\text{Gamma}(n/2,1/2)$；方差检验
+7. **$t_n$ 分布** → 小样本均值检验；$t_n=Z/\sqrt{\chi^2_n/n}$；$n$ 大时趋近正态
+8. **$F_{m,n}$ 分布** → 两独立卡方之比；$F=(\chi^2_m/m)/(\chi^2_n/n)$；方差比 / ANOVA
+
+---
+
+## 易错点
+
+1. **对称性**：$\Phi(-x)=1-\Phi(x)$（标准正态 CDF），$P(Z>1.96)=P(Z<-1.96)$
+2. **指数无记忆性**：$P(X>s+t\vert X>s)=P(X>t)$——"已等待 $s$ 时间"不影响未来；指数**参数**是速率 $\lambda$ 不是均值
+3. **Gamma 退化**：$\alpha=1$ 时 Gamma$\to$ Exp；$\alpha=n/2,\beta=1/2$ 时 Gamma$\to\chi^2_n$
+4. **卡方自由度**：$\chi^2_n$ 的自由度 $n$ 是平方和项数，不是样本量减1（估计均值时才减1）
+5. **$t$ 分布自由度**：一样本 $t$ 检验自由度是 $n-1$（因估计均值损失1）；$n>30$ 近似标准正态

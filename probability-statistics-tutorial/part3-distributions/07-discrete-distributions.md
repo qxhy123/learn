@@ -761,4 +761,38 @@ $$\frac{\partial \ell}{\partial z} = \frac{\hat{p} - y}{\hat{p}(1-\hat{p})} \cdo
 
 ---
 
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![二项分布PMF](../figures/svg/prob-p3-07-1.svg) | 二项 $B(10,p)$ PMF：$p=0.3/0.5/0.7$ 三组对比 |
+| ![泊松分布PMF](../figures/svg/prob-p3-07-2.svg) | 泊松 $\text{Poisson}(\lambda)$ PMF：$\lambda=1,3,10$ |
+| ![几何与负二项](../figures/svg/prob-p3-07-3.svg) | 几何 $\text{Geom}(p)$ 与负二项 $\text{NB}(r,0.3)$ PMF 对比 |
+| ![离散分布关系图](../figures/svg/prob-p3-07-4.svg) | 离散分布族关系：Bernoulli $\to$ 二项 $\to$ 泊松 |
+
+---
+
+## 思考路标（条件反射）
+
+1. **Bernoulli$(p)$** → 单次二元结果，$E=p$，$\text{Var}=p(1-p)$
+2. **二项 $B(n,p)$** → $n$ 次独立重复 Bernoulli，$E=np$，$\text{Var}=np(1-p)$
+3. **Poisson$(\lambda)$** → 稀有事件计数（$\lambda=np$ 当 $n$ 大 $p$ 小）；期望 = 方差 = $\lambda$
+4. **几何 $\text{Geom}(p)$** → 首次成功等待次数，$E=1/p$；唯一离散无记忆分布
+5. **超几何 $\text{Hyp}(N,K,n)$** → 有限总体**不放回**抽样；$N\to\infty$ 趋近二项
+6. **负二项 $\text{NB}(r,p)$** → 第 $r$ 次成功等待次数，$E=r/p$；几何是 $r=1$ 的特例
+7. **离散均匀** → $P(X=k)=1/n$，$E=(n+1)/2$
+8. **分布关系**：Bernoulli $\xrightarrow{n\text{次叠加}}$ 二项 $\xrightarrow{n\to\infty,\,np=\lambda}$ Poisson；几何 $\xrightarrow{r\text{次叠加}}$ 负二项
+
+---
+
+## 易错点
+
+1. **放回 vs 不放回**：放回（或无限总体）$\to$ 二项；不放回（有限总体）$\to$ 超几何
+2. **Poisson 近似条件**：$n>20$ 且 $p<0.05$（或 $n>100$ 且 $p<0.1$）才能用 $\lambda=np$ 近似
+3. **几何 vs 负二项**：几何是"首次成功"（$r=1$）；负二项是"第 $r$ 次成功"
+4. **二项期望**：$E[X]=np$，不是 $p$；方差 $np(1-p)$，不是 $np$
+5. **参数顺序**：$B(n,p)$ 中 $n$ 是试验次数、$p$ 是成功概率；$\text{Hyp}(N,K,n)$ 中 $N$ 是总体、$K$ 是成功总数、$n$ 是抽取数
+
+---
+
 *本章完*

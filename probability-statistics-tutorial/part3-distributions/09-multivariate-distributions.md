@@ -912,3 +912,36 @@ KL 散度为零意味着 $q_\phi(\mathbf{z} \mid \mathbf{x}) = p(\mathbf{z}) = \
 **概率论角度**：KL 坍塌等价于后验完全被先验主导，数据未能更新潜在变量的后验。解决方案包括：$\beta$-VAE（动态调整 KL 权重）、Free Bits 方法（为每维 KL 设置下界），本质上是在先验正则化与数据编码能力之间寻求平衡。
 
 </details>
+
+---
+
+## 几何示意
+
+| 图示 | 说明 |
+|------|------|
+| ![多元正态3D](../figures/svg/prob-p3-09-1.svg) | 二元标准正态 PDF 曲面（$\rho=0$，独立） |
+| ![多元正态等高线](../figures/svg/prob-p3-09-2.svg) | 二元正态等高线：不同协方差结构（$\rho=0,0.7,-0.8$） |
+| ![PCA主成分](../figures/svg/prob-p3-09-3.svg) | PCA：数据散点、协方差椭圆与主成分方向 |
+
+---
+
+## 思考路标（条件反射）
+
+1. **联合分布** → 联合 PDF $f(\mathbf{x})$；边缘 $f_i(x_i)=\int\cdots\int f(\mathbf{x})\,d\mathbf{x}_{-i}$；条件 $f(\mathbf{x}_1\vert\mathbf{x}_2)=f(\mathbf{x})/f_2(\mathbf{x}_2)$
+2. **多元正态 $\mathcal{N}(\boldsymbol\mu,\boldsymbol\Sigma)$** → 由均值向量和协方差矩阵完全确定；等值面为椭球
+3. **协方差矩阵 $\boldsymbol\Sigma$** → 必须对称半正定（$\mathbf{v}^\top\boldsymbol\Sigma\mathbf{v}\geq 0$）；特征值 $\geq 0$
+4. **多元正态的边缘** → 任意子集仍服从多元正态（维度降低）
+5. **多元正态的条件** → $\mathbf{X}_1\vert\mathbf{X}_2=\mathbf{x}_2\sim\mathcal{N}(\boldsymbol\mu_{1\vert 2},\boldsymbol\Sigma_{1\vert 2})$（仍是正态）
+6. **仿射变换封闭** → $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol\mu+\mathbf{b},\mathbf{A}\boldsymbol\Sigma\mathbf{A}^\top)$
+7. **正态独立 iff $\rho=0$** → 多元正态中不相关等价于独立（一般分布中此结论不成立）
+8. **PCA 与协方差** → PCA 是协方差矩阵 $\boldsymbol\Sigma$ 的特征分解；PC1 方向 = 最大特征值的特征向量
+
+---
+
+## 易错点
+
+1. **协方差矩阵必须对称半正定** → 若构造的 $\boldsymbol\Sigma$ 有负特征值，不是合法分布参数
+2. **多元正态由 $(\boldsymbol\mu,\boldsymbol\Sigma)$ 完全确定** → 给定均值向量和协方差矩阵后，分布唯一确定
+3. **边缘正态 $\neq$ 联合正态** → 反例：$X,Y$ 各自边缘正态，但联合分布可能不是多元正态
+4. **不相关 $\neq$ 独立** → 一般分布中 $\text{Cov}=0$ 不代表独立；仅对多元正态，不相关 $\Leftrightarrow$ 独立
+5. **PCA 是协方差矩阵的特征分解** → 不是相关矩阵的特征分解（除非数据已标准化）；特征值是各主成分方向的方差
