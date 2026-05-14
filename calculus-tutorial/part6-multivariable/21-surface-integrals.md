@@ -577,6 +577,39 @@ $$
 =-4\pi\lambda R^3.
 $$
 
-结果为负，说明相对于外法向，净流量指向球内，也就是整个流场在把质量向原点收缩。这正符合扩散反演或收缩动力系统中的“向中心汇聚”直觉。
+结果为负，说明相对于外法向，净流量指向球内，也就是整个流场在把质量向原点收缩。这正符合扩散反演或收缩动力系统中的”向中心汇聚”直觉。
 
 </details>
+
+---
+
+## 几何示意
+
+**图 21-1**：曲面参数化 + 面积元 $dS$
+
+![曲面参数化与面积元](../figures/svg/calc-p6-21-1.svg)
+
+**图 21-2**：向量场穿过曲面（通量）
+
+![向量场通量积分](../figures/svg/calc-p6-21-2.svg)
+
+---
+
+## 思考路标（条件反射）
+
+- 看到曲面质量 / 面积加权积分 → 第一类曲面积分 $\iint_S f\,dS$，与法向量方向无关
+- 看到流量 / 向量场穿过曲面 → 第二类曲面积分 $\iint_S \mathbf{F}\cdot d\mathbf{S}$，**方向有关**
+- 看到曲面 $z=z(x,y)$ → $dS = \sqrt{1+z_x^2+z_y^2}\,dx\,dy$
+- 看到参数曲面 $\mathbf{r}(u,v)$ → 法向量 $\mathbf{n} = \mathbf{r}_u \times \mathbf{r}_v$，面积元 $dS = |\mathbf{r}_u\times\mathbf{r}_v|\,du\,dv$
+- 看到封闭曲面 + 体积分 → 优先用 Gauss 定理：$\oiint_S \mathbf{F}\cdot d\mathbf{S} = \iiint_V \nabla\cdot\mathbf{F}\,dV$
+- 看到曲面 + 边界曲线 → 考虑 Stokes 定理：$\iint_S (\nabla\times\mathbf{F})\cdot d\mathbf{S} = \oint_{\partial S} \mathbf{F}\cdot d\mathbf{r}$
+- 看到法向量反向 → 第一类积分不变号，**第二类积分变号**
+- 看到”上侧/外侧” → 确认法向量 $\mathbf{n}$ 朝向，外法向 $\mathbf{n}$ 的 $z$ 分量方向决定符号
+
+## 易错点
+
+1. **法向量方向影响符号**：第二类曲面积分 $\iint_S \mathbf{F}\cdot\mathbf{n}\,dS$ 的结果随法向量取向改变符号，翻转定向则结果变号。
+2. **定向曲面 vs 无定向**：$dS$（面积元）无方向，$d\mathbf{S} = \mathbf{n}\,dS$（向量面积元）有方向；莫比乌斯带不可定向，不能做第二类积分。
+3. **曲面参数化法向量方向**：$\mathbf{r}_u\times\mathbf{r}_v$ 的方向取决于参数顺序，若要外法向则需检查朝向，必要时取负。
+4. **投影到 $xOy$ 面的符号**：若曲面上侧法向量 $z$ 分量为正，则 $\iint_S R\,dx\,dy = \iint_D R\,dx\,dy$；若下侧则加负号。
+5. **Gauss 定理要求封闭曲面**：若曲面不封闭，需补充”盖子”曲面再用 Gauss，最后减去补充部分。

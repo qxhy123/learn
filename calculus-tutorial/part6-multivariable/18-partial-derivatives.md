@@ -1,5 +1,52 @@
 # 第18章 偏导数
 
+> **一例速记**：
+> **偏导→梯度→方向导数**：$f_x, f_y$ 各自"冻结另一变量"求导 → 拼成梯度 $\nabla f = (f_x, f_y)$ → 方向导数 $\frac{\partial f}{\partial \mathbf{l}} = \nabla f \cdot \mathbf{l}$ → 梯度方向就是上升最快方向。
+> **链式法则口诀**："沿所有中间路径求和"。$z=f(u,v)$，$u=u(x)$，$v=v(x)$ → $\frac{dz}{dx} = f_u u_x + f_v v_x$。
+> **可微判断三步**：①偏导存在 → ②线性化误差 $o(\rho)$ → ③若偏导连续则必可微。
+> **Hessian 判极值**：$\Delta=f_{xx}f_{yy}-f_{xy}^2$，$\Delta>0, f_{xx}>0$ 极小；$\Delta>0, f_{xx}<0$ 极大；$\Delta<0$ 鞍点。
+> **隐函数求导**：$F(x,y)=0 \Rightarrow y'=-F_x/F_y$，分母 $F_y\neq 0$ 是存在的保障。
+
+---
+
+## 引入：梯度与链式法则的综合应用
+
+> **题目**：设 $f(x, y) = e^{xy}\sin(x+y)$，求 $f$ 在点 $(\pi/4, \pi/4)$ 处的梯度 $\nabla f$，并求该点沿从 $(\pi/4, \pi/4)$ 指向 $(\pi/2, \pi/2)$ 方向的方向导数。
+
+请先停下来想一想：$f = e^{xy}\sin(x+y)$ 是两个函数的乘积，需要用**乘积法则** + **链式法则**。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "见到 $f(x,y) = e^{xy}\sin(x+y)$，这是乘积 $u \cdot v$，$u = e^{xy}$，$v = \sin(x+y)$。
+>
+> **第一步：求 $f_x$**。把 $y$ 看常数，用乘积法则：
+>
+> $$f_x = \frac{\partial}{\partial x}(e^{xy}) \cdot \sin(x+y) + e^{xy} \cdot \frac{\partial}{\partial x}(\sin(x+y))$$
+>
+> $$= ye^{xy}\sin(x+y) + e^{xy}\cos(x+y) = e^{xy}\bigl[y\sin(x+y) + \cos(x+y)\bigr]$$
+>
+> **第二步：求 $f_y$**。对称地，把 $x$ 看常数：
+>
+> $$f_y = e^{xy}\bigl[x\sin(x+y) + \cos(x+y)\bigr]$$
+>
+> **第三步：代入 $(\pi/4, \pi/4)$**。此时 $xy = \pi^2/16$，$x+y = \pi/2$，$\sin(\pi/2) = 1$，$\cos(\pi/2) = 0$：
+>
+> $$f_x = e^{\pi^2/16}\left[\frac{\pi}{4}\cdot 1 + 0\right] = \frac{\pi}{4}e^{\pi^2/16}$$
+>
+> $$f_y = e^{\pi^2/16}\left[\frac{\pi}{4}\cdot 1 + 0\right] = \frac{\pi}{4}e^{\pi^2/16}$$
+>
+> $$\nabla f = \frac{\pi}{4}e^{\pi^2/16}(1, 1)$$
+>
+> **第四步：方向导数**。方向向量 $(\pi/2-\pi/4, \pi/2-\pi/4) = (\pi/4, \pi/4)$，单位化得 $\mathbf{l} = (1/\sqrt{2}, 1/\sqrt{2})$：
+>
+> $$\frac{\partial f}{\partial \mathbf{l}} = \nabla f \cdot \mathbf{l} = \frac{\pi}{4}e^{\pi^2/16}(1, 1) \cdot \left(\frac{1}{\sqrt{2}}, \frac{1}{\sqrt{2}}\right) = \frac{\pi}{2\sqrt{2}}e^{\pi^2/16}$$
+>
+> **验证方向**：梯度为 $(1,1)$ 方向，而我们恰好沿 $(1,1)$ 方向前进，所以方向导数等于梯度的模 $|\nabla f| = \frac{\pi}{4}e^{\pi^2/16}\sqrt{2}$。一致！"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -1022,3 +1069,40 @@ $L = x^2 + y^2 + \lambda(xy - 1)$。$L_x = 2x + \lambda y = 0$，$L_y = 2y + \la
 最近点为 $(1, 1)$，距原点 $\sqrt{2}$。
 
 </details>
+
+---
+
+## 几何示意
+
+**图 18-1**：偏导数几何意义（3D 切面）
+
+![偏导数几何意义](../figures/svg/calc-p6-18-1.svg)
+
+**图 18-2**：梯度向量场 + 等高线（2D 投影）
+
+![梯度向量场](../figures/svg/calc-p6-18-2.svg)
+
+**图 18-3**：方向导数 / 最速下降方向
+
+![方向导数示意](../figures/svg/calc-p6-18-3.svg)
+
+---
+
+## 思考路标（条件反射）
+
+- 看到"对 $x$ 求偏导" → 将 $y$ 视为常数，用一元导数规则
+- 看到多元复合函数 $z=f(u,v)$，$u,v=u(x,y)$ → 链式法则：$\partial z/\partial x = f_u u_x + f_v v_x$
+- 看到梯度 $\nabla f$ → 指向上升最快方向；负梯度 = 最速下降（梯度下降法的依据）
+- 看到方向导数 $\partial f/\partial\mathbf{l}$ → 先求梯度，再内积单位方向向量
+- 看到全微分 → $dz = f_x\,dx + f_y\,dy$；偏导连续则可微
+- 看到隐函数 $F(x,y)=0$ → $dy/dx = -F_x/F_y$（分母 $F_y\neq 0$）
+- 看到驻点（$f_x=f_y=0$）→ 计算 Hessian 行列式 $\Delta = f_{xx}f_{yy}-f_{xy}^2$ 判断极值类型
+- 看到泰勒二阶展开 → $f(x_0+h, y_0+k) \approx f_0 + f_x h + f_y k + \frac{1}{2}(f_{xx}h^2+2f_{xy}hk+f_{yy}k^2)$
+
+## 易错点
+
+1. **偏导数存在 $\not\Rightarrow$ 可微**：经典反例 $f(x,y) = xy/(x^2+y^2)$（$(x,y)\neq(0,0)$），原点处偏导均为 $0$ 但函数不连续，更不可微。
+2. **混合偏导对称需 $C^2$ 条件**：$f_{xy} = f_{yx}$ 成立的前提是两者都连续，缺少连续性可能出现 $f_{xy}(0,0)\neq f_{yx}(0,0)$。
+3. **含参数复合的链式法则**：若 $z = f(x, g(x,y))$，不要忘记第二个分量也可能显式含 $x$，需要额外加 $f_u\cdot 1$（显式 $x$ 路径）+ $f_v\cdot g_x$（隐式路径）。
+4. **方向向量必须单位化**：$\partial f/\partial\mathbf{l} = \nabla f \cdot \mathbf{l}$ 要求 $|\mathbf{l}|=1$，否则结果会差一个缩放因子。
+5. **Hessian $\Delta=0$ 时判别法失效**：需用高阶分析或几何直觉，不能直接下结论。

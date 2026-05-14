@@ -1,5 +1,48 @@
 # 第22章 向量分析
 
+> **一例速记**：
+> **三大定理统一框架**：$\int_{\partial\Omega} = \int_\Omega d(\cdot)$，低维的"边界积分"等于高维的"微分积分"。
+> **Green**（2D）：$\oint_C P\,dx+Q\,dy = \iint_D (Q_x-P_y)\,dA$。
+> **Stokes**（3D 曲面）：$\oint_{\partial S}\mathbf{F}\cdot d\mathbf{r} = \iint_S (\nabla\times\mathbf{F})\cdot d\mathbf{S}$。
+> **Gauss**（3D 体积）：$\oiint_{\partial V}\mathbf{F}\cdot d\mathbf{S} = \iiint_V \nabla\cdot\mathbf{F}\,dV$。
+> **散度 = 源强度**；**旋度 = 涡旋强度**；梯度场无旋（$\nabla\times\nabla f = \mathbf{0}$）；旋度场无散（$\nabla\cdot\nabla\times\mathbf{F}=0$）。
+
+---
+
+## 引入：Green 定理简化环路积分
+
+> **题目**：用 Green 定理计算 $\displaystyle\oint_C (x^2y\,dx + xy^2\,dy)$，其中 $C$ 是单位圆 $x^2+y^2=1$ 逆时针方向。
+
+请先停下来想一想：封闭曲线 + 二维向量场 → **Green 定理**的标准信号。直接参数化算会很繁，Green 定理把它变成二重积分。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "看到 $\oint_C$ 沿闭合曲线的积分，$P = x^2y$，$Q = xy^2$。
+>
+> **第一步：验证 Green 条件**。$D$ 是单位圆盘，单连通区域；$P, Q$ 在 $D$ 内有连续偏导。Green 定理可用。
+>
+> **第二步：计算旋度密度** $Q_x - P_y$：
+>
+> $$Q_x = \frac{\partial(xy^2)}{\partial x} = y^2, \qquad P_y = \frac{\partial(x^2y)}{\partial y} = x^2$$
+>
+> $$Q_x - P_y = y^2 - x^2$$
+>
+> **第三步：应用 Green 定理**：
+>
+> $$\oint_C P\,dx + Q\,dy = \iint_D (y^2 - x^2)\,dA$$
+>
+> **第四步：对称性分析**。$D$ 关于 $x, y$ 轴对称，$y^2$ 和 $x^2$ 的积分值相同（由对称性），因此：
+>
+> $$\iint_D y^2\,dA = \iint_D x^2\,dA$$
+>
+> 所以 $\iint_D (y^2 - x^2)\,dA = 0$。
+>
+> **验证**：用极坐标也可直接算 $\int_0^{2\pi}\int_0^1 (r^2\sin^2\theta - r^2\cos^2\theta)r\,dr\,d\theta = \int_0^1 r^3\,dr\cdot\int_0^{2\pi}(-\cos 2\theta)\,d\theta = \frac{1}{4}\cdot 0 = 0$。结果一致！"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -746,6 +789,47 @@ $$
 \int_\gamma \omega.
 $$
 
-因此 1-形式可以理解为“线积分对象”的统一写法。
+因此 1-形式可以理解为”线积分对象”的统一写法。
 
 </details>
+
+---
+
+## 几何示意
+
+**图 22-1**：Green 定理（2D 区域 + 边界）
+
+![Green 定理](../figures/svg/calc-p6-22-1.svg)
+
+**图 22-2**：Stokes 定理（3D 曲面 + 边界曲线）
+
+![Stokes 定理](../figures/svg/calc-p6-22-2.svg)
+
+**图 22-3**：Gauss 散度定理（3D 体积 + 边界曲面）
+
+![Gauss 散度定理](../figures/svg/calc-p6-22-3.svg)
+
+**图 22-4**：散度 vs 旋度的物理直觉（流体 / 涡旋）
+
+![散度与旋度对比](../figures/svg/calc-p6-22-4.svg)
+
+---
+
+## 思考路标（条件反射）
+
+- 看到封闭曲线 + 2D 区域 → **Green 定理**：$\oint_C = \iint_D (Q_x - P_y)\,dA$
+- 看到有界曲面 + 3D 向量场旋转 → **Stokes 定理**：$\oint_{\partial S} = \iint_S (\nabla\times\mathbf{F})\cdot d\mathbf{S}$
+- 看到封闭曲面 + 3D 向量场穿透 → **Gauss 定理**：$\oiint_{\partial V} = \iiint_V \nabla\cdot\mathbf{F}\,dV$
+- 看到散度 $\nabla\cdot\mathbf{F}$ → 物理意义：源强度，正值发散（源），负值汇聚（汇）
+- 看到旋度 $\nabla\times\mathbf{F}$ → 物理意义：涡旋强度和轴方向（仅 3D）
+- 看到梯度场 $\mathbf{F}=\nabla f$ → 必然无旋（$\nabla\times\nabla f=\mathbf{0}$），对应势函数；路径无关
+- 看到 $\nabla\cdot(\nabla\times\mathbf{F})$ → 恒等于 $0$（旋度场无散）
+- 看到 Green 公式用于求面积 → $A = \frac{1}{2}\oint_C x\,dy - y\,dx$
+
+## 易错点
+
+1. **旋度仅 3D**：$\nabla\times\mathbf{F}$ 在 2D 中退化为标量 $Q_x - P_y$，这就是 Green 定理中的被积量；3D 旋度是向量。
+2. **Green = 2D Stokes 特例**：Green 定理是 Stokes 定理在平面区域的特例，法向量取 $(0,0,1)$（$z$ 轴方向）。
+3. **Gauss 要求封闭曲面**：散度定理的左边必须是封闭曲面（外法向），若曲面不封闭需补”盖子”再用 Gauss 再减去。
+4. **方向约定**：Stokes 定理中，曲面法向量 $\mathbf{n}$ 与边界曲线方向满足右手定则；Green 定理中边界逆时针为正方向。
+5. **势函数存在性**：$\nabla\times\mathbf{F}=\mathbf{0}$ 在单连通区域内才能保证势函数存在（全局无旋）；区域有洞时需要另行验证。
