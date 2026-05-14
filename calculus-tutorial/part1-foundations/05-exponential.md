@@ -757,6 +757,14 @@ $$
 
 ---
 
+## 几何示意
+
+![Sigmoid 与 tanh 激活函数](../figures/svg/calc-p1-05-1.svg)
+
+![双曲函数 sinh / cosh / tanh](../figures/svg/calc-p1-05-2.svg)
+
+---
+
 ## 思考路标（条件反射）
 
 - 看到 $a^x \cdot a^y$ → $a^{x+y}$（同底相加）
