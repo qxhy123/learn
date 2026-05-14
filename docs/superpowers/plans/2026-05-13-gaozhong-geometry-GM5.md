@@ -201,3 +201,6 @@ git push origin master
 - C: 05 表面积体积 + 06 综合（+ 3 张图）
 
 每章独立 commit。如 asy 渲染失败可降级用 TikZ。
+
+---
+**GM5 完成于：2026-05-14**
