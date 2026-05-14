@@ -187,3 +187,6 @@ git push origin master
 - B: appendix C（80 题题库）+ appendix F（80 题详解）
 
 每文件独立 commit。完成后报告：commit SHA、字数、题号分布。
+
+---
+**GM6 完成于：2026-05-14**
