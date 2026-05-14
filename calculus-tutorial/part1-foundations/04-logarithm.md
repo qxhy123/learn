@@ -814,3 +814,24 @@ $$
 直接计算 $\log\sum_i e^{z_i}$ 时，若某个 $z_i$ 很大（如 $1000$），$e^{z_i}$ 会溢出为 $+\infty$；若所有 $z_i$ 都很小（如 $-1000$），$e^{z_i}$ 全部下溢为 $0$，对数变为 $-\infty$。Log-Sum-Exp 通过减去最大值同时避免这两种情形。
 
 </details>
+
+---
+
+## 思考路标（条件反射）
+
+- 看到 $\log_a b = N$ → 等价 $a^N = b$（指数对数互逆）
+- 看到 $\log(MN)$ → $\log M + \log N$（积变和）
+- 看到 $\log(M/N)$ → $\log M - \log N$
+- 看到 $\log_a M^k$ → $k \log_a M$
+- 看到换底 → $\log_a b = \log_c b / \log_c a$
+- 看到 $\ln$ → 默认底为 $e$
+- 看到 $\log e^x$ 或 $\ln e^x$ → 直接化简为 $x$
+- 看到 $\log\sum e^{z_i}$ → 想 Log-Sum-Exp 减最大值的数值稳定技巧
+
+## 易错点
+
+1. **$\log_a M^k = k\log_a M$ 仅当 $M > 0$**；$\log(-1)^2 \neq 2\log(-1)$（左边 $=0$，右边无定义）。
+2. **$\log_a (M + N) \neq \log_a M + \log_a N$**：对数只对乘积分配，加法不分配。
+3. **$\log_a b$ 的换底 $\log_c b / \log_c a$**：不要写成 $\log_c (b/a)$（学生常错）。
+4. **Log-Sum-Exp 数值稳定**：直接 $\log\sum e^{z_i}$ 若 $z_i$ 大易上溢；正确：$m = \max z_i$，再算 $m + \log\sum e^{z_i - m}$。
+5. **底数限制**：$a > 0, a \neq 1$。$\log_1 b$ 无定义（因 $1^x = 1$ 不能取到其它值）。
