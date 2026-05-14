@@ -255,3 +255,57 @@ graph TD
 ---
 
 如有建议或发现错误，欢迎提交 Issue 或 Pull Request。
+
+---
+
+## 改造升级（2026-05-14）
+
+本教程已按 `gaozhong_math/algebra/` 模式做了"包装式改造"：
+
+### 新增 thinking-toolkit（12 篇）
+
+`thinking-toolkit/` 目录是独立的"微积分思维方法论"小册子：
+
+| 编号 | 主题 |
+|---|---|
+| 01 | [极限的 ε 语言](./thinking-toolkit/01-epsilon-language.md) |
+| 02 | [等价无穷小与小 o](./thinking-toolkit/02-equivalent-infinitesimals.md) |
+| 03 | [求导套路系统化](./thinking-toolkit/03-differentiation-rules.md) |
+| 04 | [积分技巧反 LIATE](./thinking-toolkit/04-integration-techniques.md) |
+| 05 | [级数判敛流程图](./thinking-toolkit/05-series-convergence.md) |
+| 06 | [Taylor 展开与误差](./thinking-toolkit/06-taylor-and-error.md) |
+| 07 | [多元链式与梯度](./thinking-toolkit/07-multivar-chain.md) |
+| 08 | [多元积分变换](./thinking-toolkit/08-multivar-integration.md) |
+| 09 | [ODE 类型识别](./thinking-toolkit/09-ode-classification.md) |
+| 10 | [凸性、单调与极值](./thinking-toolkit/10-convexity-extrema.md) |
+| 11 | [微积分中的不等式](./thinking-toolkit/11-inequality-techniques.md) |
+| 12 | [微积分中的 AI 思维](./thinking-toolkit/12-calculus-for-ai.md) |
+
+### 新增模板 D 包装
+
+每个**核心套路型章节**（⭐ 标记，共 15 章）在原正文之外，加上：
+- 一例速记：核心公式 + 最常用变形
+- 思维路径还原：作者第 1 秒怎么想的内心独白
+- 思考路标 ≥8 条：条件反射（看到 X 立刻想 Y）
+- 易错点 5 条
+
+⭐ 章节：函数极限 / 求导法则 / 导数应用 / Taylor / 积分技巧 / 数项级数 / 幂级数 / 偏导数 / 重积分 / 向量微积分 / 一阶 ODE / 二阶 ODE / 凸优化 / 矩阵微积分。
+
+### 新增题库（240 题 C/D/E 三档）
+
+`appendix/` 新增：C 80 + D 100 + E 60 = 240 题，按主题分 4 个 F 详解文件。
+
+### figures（~80 张）
+
+`figures/` 目录用 TikZ + Asymptote 渲染了 ~80 张关键图。
+
+---
+
+## 配套教程
+
+- [`chuzhong_algebra/`](../chuzhong_algebra/) — 中考代数
+- [`chuzhong_geometry/`](../chuzhong_geometry/) — 中考几何
+- [`gaozhong_math/algebra/`](../gaozhong_math/algebra/) — 高中代数
+- [`gaozhong_math/geometry/`](../gaozhong_math/geometry/) — 高中几何
+
+四套教程构成"初中 → 高中 → 微积分（含 AI）"完整数学体系。
