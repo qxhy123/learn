@@ -763,3 +763,222 @@ $$T_2(\sigma(T_1(\mathbf{x}))) \neq (W_2 W_1)\mathbf{x}$$
 **核的维数反映了丢失信息的维度**：至少 3 维的输入信息被"压缩成零"，无法从输出恢复。这是从 $\mathbb{R}^5$ 压缩到 $\mathbb{R}^2$ 的必然代价——自编码器、PCA 等降维方法的瓶颈层利用的正是这一机制，有意识地丢弃"低价值"维度。
 
 </details>
+
+---
+
+## 一例速记
+
+> **线性映射**：$T: V \to W$ 满足 $T(a\mathbf{u}+b\mathbf{v}) = aT(\mathbf{u})+bT(\mathbf{v})$；等价地，保线性组合。必有 $T(\mathbf{0})=\mathbf{0}$。
+> **核与像**：$\ker(T)=\{\mathbf{v}\mid T(\mathbf{v})=\mathbf{0}\}$（$V$ 的子空间）；$\text{Im}(T)=\{T(\mathbf{v})\}$（$W$ 的子空间）。
+> **秩-零化度定理**：$\dim(\ker T)+\dim(\text{Im}\,T)=\dim V$。核大 = 像小，"资源守恒"。
+> **单射 $\Leftrightarrow$ 核为零**；**满射 $\Leftrightarrow$ 像满 $W$**；**同构 = 单射+满射 $\Leftrightarrow$ 维数相等**。
+> **AI 关联**：全连接层 $W\mathbf{x}$ 是线性映射；激活函数打破线性性；核 = 被丢弃的特征方向。
+
+---
+
+## 引入：一道"判断是否线性"的速度题
+
+> **题目**：下列映射哪些是线性映射？
+> (A) $T\!\begin{pmatrix}x\\y\end{pmatrix}=\begin{pmatrix}2x-y\\x+3y\end{pmatrix}$；
+> (B) $f(x)=x+5$（$\mathbb{R}\to\mathbb{R}$）；
+> (C) $g\!\begin{pmatrix}x\\y\end{pmatrix}=\begin{pmatrix}x^2\\y\end{pmatrix}$。
+
+请先停下来想一想：**判断线性只需两步——(1) 是否 $T(\mathbf{0})=\mathbf{0}$；(2) 是否所有分量都是输入的线性（一次齐次）函数**。快速心算：(B) $f(0)=5\neq 0$，淘汰；(C) 含 $x^2$，非线性，淘汰；(A) 每个分量都是 $x,y$ 的一次线性组合，且 $T(\mathbf{0})=\mathbf{0}$，**是线性映射**。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "判断线性映射，我优先检查**零向量条件**：代入 $\mathbf{0}$ 看输出。如果输出不是零，立刻判否，不需要验证其余性质。
+>
+> **(B) $f(x)=x+5$**：$f(0)=5\neq 0$，直接否。它是仿射映射——线性部分 $x$ 加平移 $5$。
+>
+> **(C) $g\!\begin{pmatrix}x\\y\end{pmatrix}=\begin{pmatrix}x^2\\y\end{pmatrix}$**：$g(\mathbf{0})=\mathbf{0}$ 通过，但验证齐次性：$g\!\left(c\begin{pmatrix}1\\0\end{pmatrix}\right)=\begin{pmatrix}c^2\\0\end{pmatrix}$，而 $cg\!\begin{pmatrix}1\\0\end{pmatrix}=\begin{pmatrix}c\\0\end{pmatrix}$。当 $c=2$ 时 $4\neq 2$，否。非线性来自 $x^2$。
+>
+> **(A) $T\!\begin{pmatrix}x\\y\end{pmatrix}=\begin{pmatrix}2x-y\\x+3y\end{pmatrix}$**：每个输出分量都是 $x,y$ 的线性组合，等价于矩阵乘法 $\begin{pmatrix}2&-1\\1&3\end{pmatrix}\begin{pmatrix}x\\y\end{pmatrix}$。矩阵乘法天然满足可加性与齐次性，**是线性映射**。
+>
+> **核与像的快速计算**：对 (A)，矩阵 $A=\begin{pmatrix}2&-1\\1&3\end{pmatrix}$，$\det A=7\neq 0$，故满秩，$\ker T=\{\mathbf{0}\}$（单射），$\text{Im}T=\mathbb{R}^2$（满射），是同构。秩-零化度：$0+2=2=\dim\mathbb{R}^2$ ✓。"
+
+---
+
+## 抽象成方法（套路总结）
+
+### 判断线性映射 3 步速查
+
+| 步骤 | 内容 | 加速技巧 |
+|---|---|---|
+| **1. 检查零向量** | $T(\mathbf{0})=\mathbf{0}$ 否则直接否 | 代入 $\mathbf{0}$ 秒杀仿射映射 |
+| **2. 检查分量结构** | 每个输出分量是输入分量的一次线性组合 | 看到平方、绝对值、常数项立即否 |
+| **3. 形式验证** | $T(a\mathbf{u}+b\mathbf{v})=aT(\mathbf{u})+bT(\mathbf{v})$ | 步骤1、2通过后基本确定，形式验证收尾 |
+
+### 核与像标准 3 步
+
+| 目标 | 方法 |
+|---|---|
+| **求 $\ker T$** | 写出对应矩阵 $A$，解 $A\mathbf{x}=\mathbf{0}$（行化简），自由变量参数化 |
+| **求 $\text{Im}T$** | $\text{Im}T=\text{Col}(A)$，取行化简后的主元列对应的原列 |
+| **验证维数定理** | $\dim\ker T + \dim\text{Im}T = n$（$n=$ 列数） |
+
+### 单射 / 满射 / 同构 速查
+
+| 类型 | 等价条件（映射语言） | 等价条件（矩阵语言） |
+|---|---|---|
+| **单射** | $\ker T=\{\mathbf{0}\}$ | 列满秩 $\text{rank}(A)=n$ |
+| **满射** | $\text{Im}T=W$ | 行满秩 $\text{rank}(A)=m$ |
+| **同构** | 单射且满射 | 方阵且 $\det A\neq 0$ |
+
+---
+
+## 方法变形
+
+### 变形 1：非方阵的单射 / 满射
+
+$T:\mathbb{R}^n\to\mathbb{R}^m$，$m\neq n$：
+- $m>n$（"高"矩阵）：最多列满秩，**可以单射，不可能满射**。
+- $m<n$（"宽"矩阵）：最多行满秩，**可以满射，不可能单射**（核至少 $n-m$ 维）。
+- $m=n$（方阵）：单射 $\Leftrightarrow$ 满射 $\Leftrightarrow$ 同构（等价）。
+
+### 变形 2：秩-零化度定理的变形应用
+
+已知任意两个量，可以推第三个：
+$$\dim\ker T = \dim V - \text{rank}(A), \quad \text{rank}(A) = \dim V - \dim\ker T$$
+
+### 变形 3：复合映射的核 / 像估计
+
+$T_2\circ T_1$ 的秩满足 $\text{rank}(A_2 A_1)\leq\min(\text{rank}A_1, \text{rank}A_2)$。
+信息经多层"漏斗"只会越来越少，不会凭空变多。
+
+### 变形 4：函数空间上的线性映射
+
+微分 $D(p)=p'$：核 = 常数函数 $\{c\}$；积分 $I(f)=\int_0^1 f$：从无穷维到 $\mathbb{R}$，核极大（所有积分为零的函数）。线性性由微积分线性性保证，无需另行验证。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"判断线性映射" → 先代零向量，再查是否含非线性项（平方、绝对值、常数）
+2. 看到"仿射映射 $W\mathbf{x}+\mathbf{b}$" → 当 $\mathbf{b}\neq\mathbf{0}$ 时**不是**线性映射（原点不保）
+3. 看到"核" → 解 $A\mathbf{x}=\mathbf{0}$，核越大信息丢失越多
+4. 看到"像" → 等于列空间 $\text{Col}(A)$，秩 = 像的维数
+5. 看到"秩-零化度" → $\dim\ker+\dim\text{Im}=\dim V$，三量知二求一
+6. 看到"单射" → 等价 $\ker T=\{\mathbf{0}\}$，等价列满秩
+7. 看到"满射" → 等价 $\text{Im}T=W$，等价行满秩
+8. 看到"同构" → 双射线性映射，等价可逆方阵，等价维数相等
+9. 看到"复合两线性映射" → 仍线性，对应矩阵乘法（注意顺序：先作用在右）
+10. 看到"神经网络层" → 全连接层 $=$ 线性映射；加激活函数才有非线性；多层线性 $=$ 单层线性
+
+---
+
+## 易错点
+
+1. **仿射映射≠线性映射**：$f(x)=3x+2$ 是仿射不是线性；$f(0)=2\neq 0$。深度学习的全连接层 $W\mathbf{x}+\mathbf{b}$ 带偏置时也是仿射，不是严格线性映射。考试中不要把"包含常数项"的映射误认为线性。
+
+2. **线性性不等于单射**：$T(\mathbf{x})=\mathbf{0}$（零映射）是线性映射，但核是全空间，完全不单射。线性映射只保证结构相容，不保证信息无损。
+
+3. **核的基向量 $\neq$ 任意核向量**：$\ker T$ 的基可以有多个，求核时要给出**所有**自由变量的参数化，不能只写一个自由变量的情形。
+
+4. **"像是 $W$ 的子空间"不等于"满射"**：$\text{Im}T\subseteq W$ 总成立；满射要求 $\text{Im}T=W$（等号）。两者差一个等号，意义天壤之别。
+
+5. **秩-零化度定理的维数对象是定义域**：公式右边是 $\dim V$（定义域维数），不是目标域维数 $\dim W$。$T:\mathbb{R}^3\to\mathbb{R}^5$，则核 + 像 $= 3$，不是 $5$。
+
+---
+
+## 典型应用例题
+
+### 例 1：核与像 + 秩-零化度定理
+
+> **题目**：设 $T:\mathbb{R}^4\to\mathbb{R}^3$，对应矩阵 $A=\begin{pmatrix}1&2&0&-1\\0&0&1&3\\1&2&1&2\end{pmatrix}$。(1) 求 $\ker T$ 的基和维数；(2) 求 $\text{Im}T$ 的基和维数；(3) 验证秩-零化度定理；(4) 判断 $T$ 的单射/满射性。
+
+【思路】行化简求主元 → 核用自由变量参数化 → 像取主元对应列。
+
+【解】
+行化简：$R_3\leftarrow R_3-R_1$，得
+$$\begin{pmatrix}1&2&0&-1\\0&0&1&3\\0&0&1&3\end{pmatrix}\xrightarrow{R_3-R_2}\begin{pmatrix}1&2&0&-1\\0&0&1&3\\0&0&0&0\end{pmatrix}$$
+
+主元在第1、3列；自由变量 $x_2=s$，$x_4=t$。回代：$x_3=-3t$，$x_1=-2s+t$。
+
+(1) $\ker T=\text{span}\left\{\begin{pmatrix}-2\\1\\0\\0\end{pmatrix},\begin{pmatrix}1\\0\\-3\\1\end{pmatrix}\right\}$，$\dim\ker T=2$。
+
+(2) $\text{Im}T=\text{span}\left\{\begin{pmatrix}1\\0\\1\end{pmatrix},\begin{pmatrix}0\\1\\1\end{pmatrix}\right\}$（原矩阵主元列），$\dim\text{Im}T=2$。
+
+(3) $2+2=4=\dim\mathbb{R}^4$ ✓。
+
+(4) $\ker T\neq\{\mathbf{0}\}$，**不单射**；$\dim\text{Im}T=2<3$，**不满射**。
+
+【答案】$\boxed{\dim\ker T=2,\ \dim\text{Im}T=2;\ \text{不单射、不满射}}$。
+
+### 例 2：判断同构
+
+> **题目**：设 $T:\mathbb{R}^3\to\mathbb{R}^3$，$T(\mathbf{x})=A\mathbf{x}$，$A=\begin{pmatrix}1&0&2\\3&1&1\\0&1&-3\end{pmatrix}$。$T$ 是同构吗？
+
+【思路】同构 $\Leftrightarrow$ 方阵可逆 $\Leftrightarrow$ $\det A\neq 0$。
+
+【解】$\det A=1\cdot(1\cdot(-3)-1\cdot 1)-0+2\cdot(3\cdot 1-1\cdot 0)=1\cdot(-4)+2\cdot 3=-4+6=2\neq 0$。
+
+【答案】$\boxed{T \text{ 是同构}}$，$\ker T=\{\mathbf{0}\}$，$\text{Im}T=\mathbb{R}^3$。
+
+【注】行列式非零秒判同构，无需做行化简。
+
+### 例 3：复合映射与矩阵乘法
+
+> **题目**：$T_1:\mathbb{R}^3\to\mathbb{R}^2$，矩阵 $A_1=\begin{pmatrix}1&0&1\\2&1&0\end{pmatrix}$；$T_2:\mathbb{R}^2\to\mathbb{R}^2$，矩阵 $A_2=\begin{pmatrix}0&1\\1&0\end{pmatrix}$（交换两分量）。求 $T_2\circ T_1$ 的矩阵，并验证复合仍线性。
+
+【解】$A_2 A_1=\begin{pmatrix}0&1\\1&0\end{pmatrix}\begin{pmatrix}1&0&1\\2&1&0\end{pmatrix}=\begin{pmatrix}2&1&0\\1&0&1\end{pmatrix}$。
+
+验证线性：两线性映射的复合仍线性，矩阵乘法对应复合，无需再验证。
+
+【答案】$\boxed{[T_2\circ T_1]=\begin{pmatrix}2&1&0\\1&0&1\end{pmatrix}}$，$T_2\circ T_1:\mathbb{R}^3\to\mathbb{R}^2$。
+
+---
+
+## 自测题
+
+**自测 1**　$T:\mathbb{R}^2\to\mathbb{R}^2$，$T\!\begin{pmatrix}x\\y\end{pmatrix}=\begin{pmatrix}x-2y\\3x+y\end{pmatrix}$。(1) 验证线性性；(2) 写出矩阵；(3) 判断是否同构。
+
+> 提示：矩阵 $\begin{pmatrix}1&-2\\3&1\end{pmatrix}$，$\det=1+6=7\neq 0$，同构。
+
+**自测 2**　$T:\mathbb{R}^3\to\mathbb{R}^2$，$A=\begin{pmatrix}1&2&3\\4&5&6\end{pmatrix}$。求 $\ker T$ 的维数和 $\text{Im}T$ 的维数，无需给出基向量。
+
+> 提示：$\text{rank}(A)=2$（两行线性无关）；$\dim\ker T=3-2=1$，$\dim\text{Im}T=2$。
+
+**自测 3**　某线性映射 $T:V\to W$，$\dim V=5$，$\dim\ker T=2$。(1) $\text{rank}(T)=?$；(2) 若 $\dim W=3$，$T$ 是满射吗？
+
+> 提示：$\text{rank}=5-2=3$；$\dim W=3=\text{rank}$，故 $\text{Im}T=W$，**是满射**。
+
+**自测 4**　判断：多项式微分算子 $D:P_3\to P_2$，$D(p)=p'$，的单射满射性。
+
+> 提示：$\ker D=\{c\mid c\in\mathbb{R}\}$（常数函数），$\dim\ker D=1\neq 0$，不单射。$\dim\text{Im}D=3-1=2=\dim P_2$，满射。
+
+**自测 5**　设 $T_1$ 的矩阵是 $3\times 5$，$T_2$ 的矩阵是 $4\times 3$。(1) $T_2\circ T_1$ 的矩阵尺寸？(2) $T_2\circ T_1$ 能是单射吗？能是满射吗？
+
+> 提示：尺寸 $4\times 5$；$\text{rank}\leq\min(3,\text{rank}T_1)\leq 3<5$，不单射；若 $\text{rank}=4$ 则满射（可能，但有条件）。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 线性 $\Leftrightarrow$ 保线性组合 $\Leftrightarrow$ 每分量是输入的一次齐次函数。$T(\mathbf{0})=\mathbf{0}$ 是必要条件。
+> 核 = 被压为零的子空间；像 = 可达输出的子空间；两维数之和 $=$ 定义域维数。
+> 单射 $\Leftrightarrow$ 核为零；满射 $\Leftrightarrow$ 像满目标域；同构 $\Leftrightarrow$ 两者皆有。
+
+如果不看笔记能完成例 1 + 自测 3 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格定义 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 13.1–13.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

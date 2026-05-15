@@ -1,6 +1,49 @@
-# 第19章：特征值与特征向量
+# 第19章：特征值与特征向量（融合版）
 
-> 有些向量在矩阵作用下不会"转向"——它们只是被拉伸或压缩。这些特殊方向就是矩阵的**特征方向**，对应的缩放比例就是**特征值**。理解特征值与特征向量，就是读懂矩阵"最本质的行为模式"。
+> **难度**：★★★☆☆
+> **前置知识**：行列式、线性方程组、子空间基础
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **核心方程** $A\mathbf{v}=\lambda\mathbf{v}$：特征向量只被拉伸/压缩，不转向；$\lambda$ 是缩放比例。
+> **求特征值**：解 $\det(A-\lambda I)=0$（特征多项式）。**求特征向量**：对每个 $\lambda$ 解 $(A-\lambda I)\mathbf{v}=\mathbf{0}$ 的非零解。
+> **快速验算**：$\sum\lambda_i=\operatorname{tr}(A)$，$\prod\lambda_i=\det(A)$。
+> **重数**：代数重数（多项式根的重数）$\geq$ 几何重数（特征空间维数）$\geq 1$。
+> **AI 关联**：PageRank = 转移矩阵的主特征向量；图神经网络谱卷积 = 图拉普拉斯特征分解。
+
+---
+
+## 引入：PageRank 背后的特征向量
+
+> **题目**：设 3 个网页的简化 PageRank 转移矩阵为 $M = \begin{pmatrix}0 & 0.5 & 0 \\ 0.5 & 0 & 1 \\ 0.5 & 0.5 & 0\end{pmatrix}$。已知 $\lambda=1$ 是 $M$ 的一个特征值，求对应特征向量（即网页的稳定排名）。
+
+请先停下来想一想：为什么 Google 的网页排名算法要求解一个特征向量问题？
+
+答案是：PageRank 假设"网页重要性"向量 $\mathbf{r}$ 在无限次随机冲浪后趋于稳定，即满足 $M\mathbf{r}=\mathbf{r}$——这正是特征值 $\lambda=1$ 的特征向量方程。下面还原完整求解思路。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目给了矩阵 $M$ 和特征值 $\lambda=1$，让我求特征向量。
+>
+> **特征向量公式**：$(M - I)\mathbf{v} = \mathbf{0}$ 的非零解。
+>
+> **计算 $M - I$**：
+> $$M - I = \begin{pmatrix}-1 & 0.5 & 0 \\ 0.5 & -1 & 1 \\ 0.5 & 0.5 & -1\end{pmatrix}$$
+>
+> **行化简**（乘 $2$ 消小数，$R_1 \times 2$，$R_2 \times 2$，$R_3 \times 2$，再消元）：
+> $$\to \begin{pmatrix}-2 & 1 & 0 \\ 1 & -2 & 2 \\ 1 & 1 & -2\end{pmatrix} \xrightarrow{R_2+\frac{1}{2}R_1,\ R_3+\frac{1}{2}R_1} \begin{pmatrix}-2 & 1 & 0 \\ 0 & -3/2 & 2 \\ 0 & 3/2 & -2\end{pmatrix}$$
+>
+> $R_3 + R_2 = 0$，故秩为 2，自由变量 $v_3$。由第二行：$v_2 = \frac{4}{3}v_3$；由第一行：$v_1 = \frac{1}{2}v_2 = \frac{2}{3}v_3$。
+>
+> 取 $v_3 = 3$，得 $\mathbf{v} = (2, 4, 3)^T$（整数化）。
+>
+> **验证**：$M\mathbf{v} = \begin{pmatrix}0+2+0\\1+0+3\\1+2+0\end{pmatrix} = \begin{pmatrix}2\\4\\3\end{pmatrix} = \mathbf{v}$。✓
+>
+> **语义**：归一化后 $\mathbf{r} = \frac{1}{9}(2,4,3)^T$，网页 2 排名最高（权重 4/9），网页 3 居中（3/9），网页 1 最低（2/9）。这就是 PageRank 的核心计算。
+>
+> **延伸思考**：为什么一定有 $\lambda=1$ 的特征值？因为 $M$ 是列随机矩阵（每列和为 1），Perron-Frobenius 定理保证主特征值为 1，且对应唯一正特征向量——这才让排名有意义。"
 
 ---
 
@@ -574,6 +617,196 @@ print("\n图表已保存至 pca_demo.png")
 | 降维后的坐标 | $\tilde{\mathbf{x}}_i = Q_k^T (\mathbf{x}_i - \bar{\mathbf{x}})$ |
 | 方差解释率 | $\lambda_i / \sum_j \lambda_j$ |
 | 最优性保证 | Rayleigh 商的最大化点 = 最大特征向量 |
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 说明 |
+|---|---|---|
+| **特征方程** | $A\mathbf{v}=\lambda\mathbf{v}$，$\mathbf{v}\neq\mathbf{0}$ | 特征向量非零，特征值可为 0 |
+| **特征多项式** | $p(\lambda)=\det(A-\lambda I)=0$ | $n$ 次多项式，$n$ 个根（含重数） |
+| **特征空间** | $E_\lambda=\ker(A-\lambda I)$ | $(A-\lambda I)\mathbf{v}=\mathbf{0}$ 的解空间 |
+| **迹公式** | $\operatorname{tr}(A)=\sum_i\lambda_i$ | 快速验算 |
+| **行列式公式** | $\det(A)=\prod_i\lambda_i$ | 快速验算；$\det=0\Leftrightarrow$ 有零特征值 |
+| **重数不等式** | $1\leq m_g(\lambda)\leq m_a(\lambda)$ | $m_g<m_a$ 则不可对角化 |
+
+### 求特征值与特征向量标准 4 步
+
+1. **写特征多项式**：计算 $p(\lambda)=\det(A-\lambda I)$（注意是 $A-\lambda I$，不是 $\lambda I - A$，结果差符号但根相同）
+2. **解特征方程** $p(\lambda)=0$：得特征值 $\lambda_1,\lambda_2,\ldots$，记下各自的代数重数
+3. **对每个 $\lambda_k$，解方程** $(A-\lambda_k I)\mathbf{v}=\mathbf{0}$：行化简，写出通解（含自由变量）
+4. **验证**：将特征向量代回 $A\mathbf{v}=\lambda\mathbf{v}$ 确认正确；用迹/行列式公式抽查
+
+---
+
+## 方法变形
+
+### 变形 1：三角矩阵（上/下三角）
+特征值直接读对角元，不必展开行列式。对角矩阵特征值就是各对角元，特征向量是标准基向量。
+
+### 变形 2：重特征值（需检验几何重数）
+代数重数 $>1$ 时，需检验 $\dim\ker(A-\lambda I)$：
+- 若 $m_g = m_a$：该特征值"够用"，可能仍可对角化
+- 若 $m_g < m_a$：此矩阵缺陷，不可对角化（Jordan 块情形）
+
+### 变形 3：$2\times 2$ 矩阵快速公式
+$$\lambda = \frac{\operatorname{tr}(A)}{2} \pm \sqrt{\left(\frac{\operatorname{tr}(A)}{2}\right)^2 - \det(A)}$$
+
+先用迹和行列式凑二次方程，再用求根公式。
+
+### 变形 4：特征向量的线性组合仍是特征向量
+同一特征值 $\lambda$ 的两个特征向量 $\mathbf{v}_1,\mathbf{v}_2$，则 $c_1\mathbf{v}_1+c_2\mathbf{v}_2$（非零）也是 $\lambda$ 的特征向量——特征空间是子空间，对线性运算封闭。
+
+### 变形 5：矩阵幂与特征值
+若 $A\mathbf{v}=\lambda\mathbf{v}$，则 $A^k\mathbf{v}=\lambda^k\mathbf{v}$，$(A-cI)\mathbf{v}=(\lambda-c)\mathbf{v}$，$A^{-1}\mathbf{v}=\lambda^{-1}\mathbf{v}$（$\lambda\neq 0$）。
+
+---
+
+## 本章小结
+
+| 概念 | 定义 / 公式 | 关键要点 |
+|---|---|---|
+| 特征值 / 特征向量 | $A\mathbf{v}=\lambda\mathbf{v}$，$\mathbf{v}\neq\mathbf{0}$ | 向量方向不变，幅度缩放 $\lambda$ |
+| 特征多项式 | $p(\lambda)=\det(A-\lambda I)$ | $n$ 次，$n$ 个根（复数域含重数） |
+| 特征空间 | $E_\lambda=\ker(A-\lambda I)$ | 包含零向量 + 所有 $\lambda$-特征向量 |
+| 代数重数 $m_a$ | $\lambda_0$ 是 $p(\lambda)$ 的 $m_a$ 重根 | $\sum m_a = n$ |
+| 几何重数 $m_g$ | $\dim E_\lambda = \dim\ker(A-\lambda I)$ | $1\leq m_g\leq m_a$ |
+| 迹 | $\operatorname{tr}(A)=\sum\lambda_i$ | 验算工具 |
+| 行列式 | $\det(A)=\prod\lambda_i$ | 验算；$=0\Leftrightarrow$ 奇异 |
+| 谱 | $\sigma(A)=\{\lambda_1,\ldots,\lambda_n\}$（含重） | 特征值全体 |
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"特征值" → 先写 $\det(A-\lambda I)=0$，$n\times n$ 矩阵得 $n$ 次多项式
+2. 看到"特征向量" → 解 $(A-\lambda I)\mathbf{v}=\mathbf{0}$，答案是**非零**向量（自由变量≥1个）
+3. 看到"上/下三角" → 特征值 = 对角元，直接读不用展开
+4. 看到"代数重数 $>1$" → 必须检查 $\dim\ker(A-\lambda I)$，不能直接宣告"可对角化"
+5. 看到"验算" → 迹 $=\sum\lambda_i$，行列式 $=\prod\lambda_i$，两个都用
+6. 看到"$A$ 可逆" → 等价于"所有特征值非零"
+7. 看到"实对称矩阵" → 特征值全实，不同特征值的特征向量正交（第21章）
+8. 看到"$A^k\mathbf{v}$" → 用 $\lambda^k\mathbf{v}$，绕过矩阵幂直接算
+9. 看到"Cayley-Hamilton" → $p(A)=O$，可用来化简高次矩阵幂
+10. 看到"PageRank / 马尔可夫" → 找 $\lambda=1$ 对应的特征向量（主特征向量）
+
+---
+
+## 易错点
+
+1. **特征向量必须非零**：$\mathbf{v}=\mathbf{0}$ 满足 $A\mathbf{0}=\lambda\mathbf{0}$ 对任意 $\lambda$，故零向量不算特征向量；但 $(A-\lambda I)\mathbf{v}=\mathbf{0}$ 的解空间包含 $\mathbf{0}$，取解时须指定非零。
+
+2. **特征多项式符号**：$\det(A-\lambda I)$ 与 $\det(\lambda I-A)$ 根相同，但符号差 $(-1)^n$。考试时统一用 $\det(A-\lambda I)$，不要混用；常数项分别为 $\det(A)$ 和 $(-1)^n\det(A)$，注意区分。
+
+3. **同一特征值可有多个线性无关特征向量**：几何重数 $m_g>1$ 时，特征空间维数 $>1$，任意非零线性组合都是特征向量。不要误以为"每个特征值只有一个特征向量"。
+
+4. **重特征值不一定导致不可对角化**：$A=\lambda_0 I$ 的特征值只有 $\lambda_0$（代数重数 $n$），但 $E_{\lambda_0}=\mathbb{R}^n$（几何重数也是 $n$），完全可对角化。关键是 $m_g$ 是否等于 $m_a$。
+
+5. **实矩阵的特征值可能是复数**：旋转矩阵 $\begin{pmatrix}0&-1\\1&0\end{pmatrix}$ 特征值为 $\pm i$，在实数域无特征向量。复特征值总是共轭对出现 $(\lambda,\bar\lambda)$。
+
+---
+
+## 典型应用例题
+
+### 例 1：标准 4 步法
+
+> **题目**：$A=\begin{pmatrix}1 & 2 \\ 3 & 0\end{pmatrix}$，求特征值与特征向量。
+
+【思路】$2\times 2$ 矩阵，用迹/行列式凑二次方程。
+
+【解】
+$\operatorname{tr}(A)=1$，$\det(A)=-6$，特征多项式 $\lambda^2-\lambda-6=(\lambda-3)(\lambda+2)=0$。
+
+特征值 $\lambda_1=3$，$\lambda_2=-2$。
+
+对 $\lambda_1=3$：$(A-3I)\mathbf{v}=\mathbf{0}$，$\begin{pmatrix}-2&2\\3&-3\end{pmatrix}\to\begin{pmatrix}1&-1\\0&0\end{pmatrix}$，$v_1=v_2$，取 $\mathbf{v}_1=(1,1)^T$。
+
+对 $\lambda_2=-2$：$(A+2I)\mathbf{v}=\mathbf{0}$，$\begin{pmatrix}3&2\\3&2\end{pmatrix}\to\begin{pmatrix}3&2\\0&0\end{pmatrix}$，$3v_1+2v_2=0$，取 $\mathbf{v}_2=(2,-3)^T$。
+
+**验证**：$\lambda_1+\lambda_2=1=\operatorname{tr}(A)$，$\lambda_1\lambda_2=-6=\det(A)$。✓
+
+【答案】$\boxed{\lambda_1=3,\ \mathbf{v}_1=(1,1)^T;\ \lambda_2=-2,\ \mathbf{v}_2=(2,-3)^T}$。
+
+### 例 2：重特征值与几何重数判断
+
+> **题目**：$A=\begin{pmatrix}3 & 0 \\ 0 & 3\end{pmatrix}$，$B=\begin{pmatrix}3 & 1 \\ 0 & 3\end{pmatrix}$，各自的特征值与几何重数？
+
+【思路】两者特征多项式相同（$(\lambda-3)^2$），但 $A=3I$ 的特征空间是整个 $\mathbb{R}^2$，$B$ 的特征空间只有一维。
+
+【解】
+$A$：$A-3I=O$，$\ker(A-3I)=\mathbb{R}^2$，$m_g=2=m_a$，**可对角化**（就是对角矩阵）。
+
+$B$：$B-3I=\begin{pmatrix}0&1\\0&0\end{pmatrix}$，$\ker(B-3I)=\{(v_1,0)^T:v_1\in\mathbb{R}\}$，$m_g=1<2=m_a$，**不可对角化**（Jordan块）。
+
+【注】判断"重特征值是否可对角化"必须看 $m_g$，单看 $m_a$ 不够。
+
+### 例 3：利用特征值性质加速计算
+
+> **题目**：已知 $A$ 是 $3\times 3$ 矩阵，特征值为 $1, 2, 3$。求 $\det(A)$、$\operatorname{tr}(A)$、$\det(2A)$、$\operatorname{tr}(A^2)$。
+
+【思路】用公式 + 特征值的幂。
+
+【解】$\det(A)=1\times 2\times 3=6$，$\operatorname{tr}(A)=1+2+3=6$。
+
+$\det(2A)=2^3\det(A)=8\times 6=48$（$n$ 阶矩阵有 $2^n$ 因子）。
+
+$A^2$ 的特征值为 $1^2,2^2,3^2=1,4,9$，故 $\operatorname{tr}(A^2)=1+4+9=14$。
+
+【答案】$\boxed{\det=6,\ \operatorname{tr}=6,\ \det(2A)=48,\ \operatorname{tr}(A^2)=14}$。
+
+---
+
+## 自测题
+
+**自测 1**　设 $A=\begin{pmatrix}5 & -4 \\ 2 & -1\end{pmatrix}$。求特征值（用迹/行列式公式验证）与特征向量。
+
+> 提示：$\operatorname{tr}=4$，$\det=3$，特征多项式 $\lambda^2-4\lambda+3=(\lambda-1)(\lambda-3)$；特征值 $1,3$；特征向量 $(2,1)^T$，$(1,1)^T$ 方向。
+
+**自测 2**　矩阵 $A$ 有特征值 $\lambda_1=0,\lambda_2=2,\lambda_3=5$。$A$ 是否可逆？$A^{10}$ 的特征值？$\operatorname{tr}(A^{10})$？
+
+> 提示：$\lambda_1=0\Rightarrow\det(A)=0\Rightarrow$ 不可逆；$A^{10}$ 的特征值为 $0,2^{10},5^{10}$；$\operatorname{tr}(A^{10})=0+1024+9765625$。
+
+**自测 3**　证明：若 $\lambda$ 是 $A$ 的特征值，则 $\lambda^2$ 是 $A^2$ 的特征值，$1/\lambda$（$\lambda\neq 0$）是 $A^{-1}$ 的特征值。
+
+> 提示：$A\mathbf{v}=\lambda\mathbf{v}\Rightarrow A^2\mathbf{v}=A(\lambda\mathbf{v})=\lambda^2\mathbf{v}$；$A^{-1}(\lambda\mathbf{v})=\mathbf{v}\Rightarrow A^{-1}\mathbf{v}=\frac{1}{\lambda}\mathbf{v}$。
+
+**自测 4**　旋转矩阵 $R=\begin{pmatrix}\cos\theta & -\sin\theta \\ \sin\theta & \cos\theta\end{pmatrix}$。用迹和行列式说明在什么条件下 $R$ 有实特征值。
+
+> 提示：$\operatorname{tr}=2\cos\theta$，$\det=1$；特征多项式判别式 $\Delta=\operatorname{tr}^2-4\det=4\cos^2\theta-4=4(\cos^2\theta-1)\leq 0$；仅当 $\theta=0$ 或 $\pi$ 时 $\Delta=0$，有实特征值（分别为 $1$ 和 $-1$）。
+
+**自测 5**　$A$ 是 $4\times 4$ 矩阵，$\operatorname{tr}(A)=7$，$\det(A)=12$，已知三个特征值为 $1,2,3$。求第四个特征值。
+
+> 提示：设第四个为 $\lambda_4$，$1+2+3+\lambda_4=7\Rightarrow\lambda_4=1$；验证：$1\times 2\times 3\times 1=6\neq 12$——矛盾！题目数据不自洽，此为"陷阱题"，说明迹和行列式两个条件必须同时满足。若行列式改为 $6$，则 $\lambda_4=1$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> $A\mathbf{v}=\lambda\mathbf{v}$：特征方向不变，幅度缩放 $\lambda$。
+> 求特征值：$\det(A-\lambda I)=0$；求特征向量：解 $(A-\lambda I)\mathbf{v}=\mathbf{0}$。
+> 验算：迹 $=\sum\lambda_i$，行列式 $=\prod\lambda_i$；重数：$m_g\leq m_a$。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 |
+| 学习目标 + 19.1–19.6 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 原版 | 可视化 |
+| 抽象成方法 + 方法变形 | 融合版（后置） | 套路固化 |
+| 本章小结 | 原版 + 融合 | 公式速查 |
+| 思考路标 + 易错点 | 融合版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 融合版 | 演练精讲 |
+| 深度学习应用 + PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 自测题 5 题 | 融合版 | 额外验收 |
 
 ---
 

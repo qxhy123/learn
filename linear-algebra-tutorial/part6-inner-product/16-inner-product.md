@@ -1,10 +1,43 @@
-# 第16章：内积与正交性
+# 第16章：内积与正交性（融合版）
 
 > **前置知识**：第9章（向量空间）、第10章（线性相关与线性无关）、第11章（基与维数）、第13章（线性映射）
 >
 > **本章难度**：★★★★☆
 >
 > **预计学习时间**：4-5 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **内积公理**：正性 $\langle \mathbf{v},\mathbf{v}\rangle\geq 0$；正定性 $\langle \mathbf{v},\mathbf{v}\rangle=0\Leftrightarrow\mathbf{v}=\mathbf{0}$；对称性 $\langle \mathbf{u},\mathbf{v}\rangle=\langle \mathbf{v},\mathbf{u}\rangle$；第一变元线性性。
+> **诱导范数**：$\|\mathbf{v}\|=\sqrt{\langle \mathbf{v},\mathbf{v}\rangle}$，满足正性、齐次性、三角不等式。
+> **夹角 / 正交**：$\cos\theta=\dfrac{\langle \mathbf{u},\mathbf{v}\rangle}{\|\mathbf{u}\|\|\mathbf{v}\|}$；$\langle \mathbf{u},\mathbf{v}\rangle=0\Leftrightarrow\mathbf{u}\perp\mathbf{v}$。
+> **Cauchy-Schwarz**：$\vert\langle \mathbf{u},\mathbf{v}\rangle\vert\leq\|\mathbf{u}\|\|\mathbf{v}\|$，等号当且仅当线性相关。
+> **AI 关联**：余弦相似度 = 归一化后内积；Transformer 注意力分数 = $QK^T/\sqrt{d_k}$（即内积缩放）；正交初始化保持信号范数不变。
+
+---
+
+## 引入：为什么注意力机制用内积？
+
+> **题目**：在 Transformer 的自注意力机制中，查询向量 $\mathbf{q}=(1,0,1,0)^T$ 与键向量 $\mathbf{k}_1=(1,1,0,0)^T$、$\mathbf{k}_2=(0,0,1,1)^T$ 分别计算注意力分数（未归一化）。请用内积计算这两个分数，并判断"哪个键与查询更相关"。
+
+请先停下来想一想：注意力机制的核心是"查询与每个键的相似程度"。**内积天然度量对齐程度**——同向时最大，垂直时为零，反向时最小。下面还原完整推理。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目给了 $\mathbf{q}$、$\mathbf{k}_1$、$\mathbf{k}_2$，要算注意力分数。分数就是内积 $\langle \mathbf{q}, \mathbf{k}_i\rangle = \mathbf{q}^T\mathbf{k}_i$。
+>
+> **算 $\mathbf{q}^T\mathbf{k}_1$**：$1\times1+0\times1+1\times0+0\times0=1$。
+>
+> **算 $\mathbf{q}^T\mathbf{k}_2$**：$1\times0+0\times0+1\times1+0\times1=1$。
+>
+> 两个分数都是 $1$——在这个例子里两键"同等相关"。但如果改成 $\mathbf{k}_2=(1,0,1,0)^T$（与 $\mathbf{q}$ 完全同向），分数变为 $2$，远超 $\mathbf{k}_1$ 的 $1$——注意力会强烈集中在 $\mathbf{k}_2$ 上。
+>
+> **为什么要除以 $\sqrt{d_k}$？** 维度 $d_k$ 越大，内积的方差越大（各分量独立时方差累积），导致 softmax 的输出极端化（梯度消失）。除以 $\sqrt{d_k}$ 把方差控制在 $O(1)$，保持 softmax 区域有梯度。
+>
+> **延伸思考**：如果 $\mathbf{q}$ 与某 $\mathbf{k}_i$ 正交（内积为 $0$），注意力权重会在 softmax 后接近均匀——该键"不被关注"。这正是内积作为相似度的几何直觉：垂直 = 无关。"
 
 ---
 
@@ -886,3 +919,184 @@ $$n\sigma^2 = 1 \implies \sigma = \frac{1}{\sqrt{n}}$$
 这正是 **LeCun 初始化**的结论：$\sigma = \dfrac{1}{\sqrt{n}}$（$n$ 为输入维度）。在每层满足此条件时，期望意义下信号范数不发散。正交初始化从根本上保证了所有奇异值等于 1，比 LeCun 初始化更强。
 
 </details>
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键性质 |
+|---|---|---|
+| **内积（标准）** | $\langle \mathbf{u},\mathbf{v}\rangle=\sum_i u_i v_i$ | 四条公理：正性、正定性、对称性、线性性 |
+| **诱导范数** | $\|\mathbf{v}\|=\sqrt{\langle \mathbf{v},\mathbf{v}\rangle}$ | $\|\mathbf{v}\|\geq 0$；$\|c\mathbf{v}\|=\vert c\vert\|\mathbf{v}\|$ |
+| **夹角公式** | $\cos\theta=\dfrac{\langle \mathbf{u},\mathbf{v}\rangle}{\|\mathbf{u}\|\|\mathbf{v}\|}$ | $\theta\in[0,\pi]$；Cauchy-Schwarz 保证分式合法 |
+| **正交条件** | $\langle \mathbf{u},\mathbf{v}\rangle=0$ | 正交集中非零向量线性无关 |
+| **Cauchy-Schwarz** | $\vert\langle \mathbf{u},\mathbf{v}\rangle\vert\leq\|\mathbf{u}\|\|\mathbf{v}\|$ | 等号 $\Leftrightarrow$ 线性相关 |
+| **正交投影** | $\text{proj}_{\mathbf{u}}\mathbf{v}=\dfrac{\langle \mathbf{v},\mathbf{u}\rangle}{\|\mathbf{u}\|^2}\mathbf{u}$ | 残差 $\mathbf{v}-\text{proj}_{\mathbf{u}}\mathbf{v}\perp\mathbf{u}$ |
+| **正交补维数** | $\dim(W)+\dim(W^\perp)=\dim(V)$ | $V=W\oplus W^\perp$ |
+
+### 验证内积 4 步法
+
+1. **正性**：验证 $\langle \mathbf{v},\mathbf{v}\rangle\geq 0$（通常直接展开看平方和）
+2. **正定性**：验证 $\langle \mathbf{v},\mathbf{v}\rangle=0\Rightarrow\mathbf{v}=\mathbf{0}$
+3. **对称性**：交换两变元，结果不变
+4. **线性性**：分配律 + 标量提取（各项验证一遍）
+
+### 求夹角 3 步
+
+1. 算内积 $\langle \mathbf{u},\mathbf{v}\rangle$
+2. 算范数 $\|\mathbf{u}\|,\|\mathbf{v}\|$
+3. 相除取 $\arccos$：$\theta=\arccos\!\left(\dfrac{\langle \mathbf{u},\mathbf{v}\rangle}{\|\mathbf{u}\|\|\mathbf{v}\|}\right)$
+
+### 求正交补 3 步
+
+1. 设 $\mathbf{x}\in W^\perp$，对 $W$ 的每个生成向量写内积为 $0$ 的方程组
+2. 解方程组得参数自由度
+3. 写出 $W^\perp$ 的一组基
+
+---
+
+## 方法变形
+
+### 变形 1：加权内积
+
+$\langle \mathbf{u},\mathbf{v}\rangle_W=\sum_i w_i u_i v_i$（$w_i>0$）也是合法内积。**验证四条公理步骤不变**，只是把 $1$ 换成 $w_i$。注意：同样的两个向量在不同内积下夹角不同、正交条件不同。
+
+### 变形 2：函数内积
+
+$\langle f,g\rangle=\int_a^b f(x)g(x)\,dx$ 是无穷维内积空间的典型例子。Cauchy-Schwarz 在此变为积分不等式 $\left(\int fg\right)^2\leq\left(\int f^2\right)\!\left(\int g^2\right)$——与向量形式完全类比。
+
+### 变形 3：正交矩阵检验
+
+给定矩阵 $Q$，判断是否正交：只需验证 $Q^TQ=I$（列向量两两正交且单位长度）。等价地：$Q^{-1}=Q^T$。
+
+### 变形 4：余弦相似度 vs 欧氏距离
+
+余弦相似度 $=\langle\hat{\mathbf{u}},\hat{\mathbf{v}}\rangle$（归一化内积），只测量方向；欧氏距离 $\|\mathbf{u}-\mathbf{v}\|$ 兼测方向和幅度。**NLP 词向量比较用余弦**，因为词向量长度（频率效应）无关语义。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"内积空间" → 立刻检查四条公理是否全部满足，缺一不可
+2. 看到"诱导范数" → $\|\mathbf{v}\|=\sqrt{\langle \mathbf{v},\mathbf{v}\rangle}$，不要忘记开根号
+3. 看到"两向量正交" → 内积为 $0$；进一步，正交集中非零向量线性无关
+4. 看到"Cauchy-Schwarz" → 上界 $\|\mathbf{u}\|\|\mathbf{v}\|$；等号当且仅当两向量共线
+5. 看到"余弦相似度" → 先归一化再内积，范围 $[-1,1]$，$=0$ 表示正交无关
+6. 看到"正交补 $W^\perp$" → 写内积方程组，维数 $=\dim(V)-\dim(W)$
+7. 看到"正交矩阵" → $Q^TQ=I$，等距变换，$\det=\pm1$，条件数 $=1$
+8. 看到"Transformer 注意力" → 本质是内积（$QK^T$），除以 $\sqrt{d_k}$ 控制方差
+9. 看到"正交投影" → $\text{proj}_{\mathbf{u}}\mathbf{v}=\dfrac{\langle \mathbf{v},\mathbf{u}\rangle}{\|\mathbf{u}\|^2}\mathbf{u}$，残差与 $\mathbf{u}$ 垂直
+10. 看到"正交初始化" → 权重矩阵奇异值全为 $1$，梯度范数层间保持不变
+
+---
+
+## 易错点
+
+1. **验证内积时漏掉正定性**：正性（$\geq 0$）和正定性（$=0\Rightarrow\mathbf{0}$）是两条独立公理；只证 $\geq 0$ 不够，必须追加"等号仅在零向量时成立"。
+
+2. **范数是内积的平方根**：$\|\mathbf{v}\|^2=\langle \mathbf{v},\mathbf{v}\rangle$，但 $\|\mathbf{v}\|=\sqrt{\langle \mathbf{v},\mathbf{v}\rangle}$；混淆两者会导致 Cauchy-Schwarz 推导错误。
+
+3. **加权内积下的正交不等于标准内积下的正交**：$\langle \mathbf{u},\mathbf{v}\rangle_W=0$ 与 $\mathbf{u}^T\mathbf{v}=0$ 是不同条件，换内积后夹角和正交性都需重新计算。
+
+4. **正交集线性无关的前提是向量非零**：零向量与任何向量内积为 $0$，但零向量不属于正交集（会导致线性相关）；正式定义正交集时默认排除零向量。
+
+5. **正交补不是"把 $W$ 翻转"**：$W^\perp$ 是与 $W$ 中所有向量都正交的向量集合，维数为 $\dim(V)-\dim(W)$，不是简单的"去掉某些坐标方向"。
+
+---
+
+## 典型应用例题
+
+### 例 1：验证加权内积并计算夹角
+
+> **题目**：$\mathbb{R}^2$ 上定义 $\langle \mathbf{u},\mathbf{v}\rangle=3u_1v_1+u_2v_2$。(1) 验证这是合法内积；(2) 计算 $\mathbf{u}=(1,2)^T$ 和 $\mathbf{v}=(2,-1)^T$ 在此内积下的夹角。
+
+【思路】逐条验证四公理；然后套夹角公式。
+
+【解】
+(1) 正性：$3v_1^2+v_2^2\geq0$（$3,1>0$）。正定性：$=0\Rightarrow v_1=v_2=0$。对称性：$3u_1v_1+u_2v_2=3v_1u_1+v_2u_2$。线性性：展开验证。四条均成立，合法内积。
+
+(2) $\langle \mathbf{u},\mathbf{v}\rangle=3\cdot1\cdot2+2\cdot(-1)=6-2=4$。$\|\mathbf{u}\|=\sqrt{3+4}=\sqrt{7}$，$\|\mathbf{v}\|=\sqrt{12+1}=\sqrt{13}$。
+
+$\cos\theta=\dfrac{4}{\sqrt{7}\cdot\sqrt{13}}=\dfrac{4}{\sqrt{91}}\approx0.419$，$\theta\approx65.2°$。
+
+【答案】$\boxed{\theta=\arccos\!\left(4/\sqrt{91}\right)\approx65°}$。
+
+【注】标准内积下 $\mathbf{u}\cdot\mathbf{v}=2-2=0$（正交），但在加权内积下两者不正交——内积不同，几何结构不同。
+
+### 例 2：求正交补并验证直和分解
+
+> **题目**：$W=\text{span}\{(1,0,1)^T,(0,1,1)^T\}\subseteq\mathbb{R}^3$。求 $W^\perp$，并将 $\mathbf{b}=(2,1,3)^T$ 分解为 $\mathbf{w}+\mathbf{w}^\perp$。
+
+【思路】设 $\mathbf{x}\in W^\perp$，列内积方程组求解；再用投影法分解 $\mathbf{b}$。
+
+【解】
+$\mathbf{x}=(x_1,x_2,x_3)^T$ 满足 $x_1+x_3=0$ 且 $x_2+x_3=0$，令 $x_3=t$：$W^\perp=\text{span}\{(1,-1,1)^T/\sqrt{3}\}$（基取归一化前向量 $(1,-1,1)^T$，维数 1）。
+
+用 Gram-Schmidt 对 $W$ 建立标准正交基（略），或直接解线性方程组：设 $\mathbf{b}=\alpha(1,0,1)^T+\beta(0,1,1)^T+\gamma(1,-1,1)^T$，解得 $\gamma=\dfrac{(2-1+3)}{3}=\dfrac{4}{3}$，$\mathbf{w}^\perp=\dfrac{4}{3}(1,-1,1)^T$，$\mathbf{w}=\mathbf{b}-\mathbf{w}^\perp=(2/3,7/3,5/3)^T$。
+
+【答案】$W^\perp=\text{span}\{(1,-1,1)^T\}$，$\mathbf{b}=\underbrace{(2/3,7/3,5/3)^T}_{\in W}+\underbrace{(4/3,-4/3,4/3)^T}_{\in W^\perp}$。
+
+### 例 3：Cauchy-Schwarz 应用——证明算术几何不等式特例
+
+> **题目**：对任意正实数 $a,b$，利用 Cauchy-Schwarz 证明 $(a+b)^2\leq 2(a^2+b^2)$。
+
+【思路】取 $\mathbf{u}=(a,b)^T$，$\mathbf{v}=(1,1)^T$，直接应用。
+
+【解】Cauchy-Schwarz：$(\mathbf{u}\cdot\mathbf{v})^2\leq\|\mathbf{u}\|^2\|\mathbf{v}\|^2$，即 $(a+b)^2\leq(a^2+b^2)\cdot 2$。$\square$
+
+【注】等号成立当 $\mathbf{u}\parallel\mathbf{v}$，即 $a=b$——此时均值等式成立，符合直觉。
+
+---
+
+## 自测题
+
+**自测 1**　$\mathbb{R}^2$ 上定义 $f(\mathbf{u},\mathbf{v})=u_1v_1-u_1v_2-u_2v_1+4u_2v_2$。判断 $f$ 是否是合法内积（提示：检验正定性，令 $\mathbf{v}=(1,1)^T$）。
+
+> 提示：$f(\mathbf{v},\mathbf{v})=v_1^2-2v_1v_2+4v_2^2=(v_1-v_2)^2+3v_2^2\geq0$，正定性成立；对称性和线性性均满足。**是合法内积**（对应矩阵 $\begin{pmatrix}1&-1\\-1&4\end{pmatrix}$ 正定）。
+
+**自测 2**　$\mathbf{u}=(3,4,0)^T$，$\mathbf{v}=(0,4,3)^T$（标准内积）。求余弦相似度及夹角，并判断是否正交。
+
+> 提示：$\mathbf{u}\cdot\mathbf{v}=16$，$\|\mathbf{u}\|=\|\mathbf{v}\|=5$，$\cos\theta=16/25=0.64$，$\theta\approx50.2°$，**不正交**。
+
+**自测 3**　$W=\text{span}\{(1,2,3)^T\}\subseteq\mathbb{R}^3$。求 $W^\perp$，写出一组基，并验证 $\dim(W)+\dim(W^\perp)=3$。
+
+> 提示：$\mathbf{x}\in W^\perp$：$x_1+2x_2+3x_3=0$，一个平面，$\dim=2$。基可取 $(-2,1,0)^T$ 和 $(-3,0,1)^T$。$1+2=3$ ✓。
+
+**自测 4**　设 $\mathbf{q}=(1,1)^T/\sqrt{2}$ 是单位查询向量，键向量 $\mathbf{k}=(1,0)^T$。用内积计算注意力分数（未缩放），并给出余弦相似度。
+
+> 提示：$\mathbf{q}\cdot\mathbf{k}=1/\sqrt{2}\approx0.707$。由于 $\|\mathbf{q}\|=1$，$\|\mathbf{k}\|=1$，余弦相似度也 $=1/\sqrt{2}$，夹角 $45°$。
+
+**自测 5**　正交矩阵 $Q=\begin{pmatrix}\cos\theta&-\sin\theta\\\sin\theta&\cos\theta\end{pmatrix}$。(1) 验证 $Q^TQ=I$；(2) 计算 $Q$ 对 $\mathbf{v}=(1,0)^T$ 的作用并验证范数不变；(3) 解释正交矩阵在深度学习中保持梯度范数的原因。
+
+> 提示：(1) $Q^TQ=\begin{pmatrix}1&0\\0&1\end{pmatrix}$，直接计算；(2) $Q\mathbf{v}=(\cos\theta,\sin\theta)^T$，范数 $=1$ ✓；(3) 反向传播乘 $W^T$，若 $W$ 正交则 $\|W^T\mathbf{g}\|=\|\mathbf{g}\|$，梯度范数层间不变，避免爆炸/消失。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 四条内积公理（正性 / 正定性 / 对称性 / 线性性）；范数 $=\sqrt{\text{内积}}$；夹角 $=\arccos(\text{归一化内积})$。
+> 正交 $\Leftrightarrow$ 内积为零；Cauchy-Schwarz 上界 $\|\mathbf{u}\|\|\mathbf{v}\|$。
+> 余弦相似度 = 归一化内积；Transformer 注意力 = 内积缩放 softmax；正交矩阵 = 等距变换。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 4 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格公理化 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 16.1–16.7 严格正文 | 原版 | 完整推导与定理 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

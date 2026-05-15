@@ -571,3 +571,211 @@ $$[T]_{\mathcal{B}} = \begin{pmatrix}0&1\\-1&0\end{pmatrix}$$
 **几何含义：** 旋转 $90°$ 在非标准基 $\mathcal{B}$ 下的矩阵仍是旋转矩阵（反对称结构 $\begin{pmatrix}0&1\\-1&0\end{pmatrix}$），体现了旋转变换的内在几何结构与坐标选取无关。
 
 </details>
+
+---
+
+## 一例速记
+
+> **坐标向量**：向量 $v$ 在有序基 $\mathcal{B}$ 下的坐标 $[v]_\mathcal{B}=(c_1,\ldots,c_n)^T$，满足 $v=c_1 b_1+\cdots+c_n b_n$。坐标映射 $v\mapsto[v]_\mathcal{B}$ 是线性同构。
+> **变换矩阵**：$[T]_\mathcal{B}^\mathcal{C}$ 的**第 $j$ 列** $=$ $T(b_j)$ 在基 $\mathcal{C}$ 下的坐标。核心公式：$[T(v)]_\mathcal{C}=[T]_\mathcal{B}^\mathcal{C}\cdot[v]_\mathcal{B}$。
+> **复合 = 乘积**：$[T\circ S]_\mathcal{A}^\mathcal{C}=[T]_\mathcal{B}^\mathcal{C}\cdot[S]_\mathcal{A}^\mathcal{B}$（先作用在右）。矩阵乘法的几何本质就是线性变换的复合。
+> **可逆对应可逆**：$T$ 同构 $\Leftrightarrow$ $[T]_\mathcal{B}$ 可逆，且 $[T^{-1}]_\mathcal{B}=([T]_\mathcal{B})^{-1}$。
+> **AI 关联**：神经网络的每一全连接层 $W\mathbf{x}$ 是标准基下的矩阵表示；不同基下同一变换有不同矩阵，但描述的几何操作相同——这就是相似矩阵的本质。
+
+---
+
+## 引入：一道"矩阵哪来的"反问题
+
+> **题目**：已知线性变换 $T:\mathbb{R}^2\to\mathbb{R}^2$ 满足 $T\!\begin{pmatrix}1\\0\end{pmatrix}=\begin{pmatrix}2\\1\end{pmatrix}$，$T\!\begin{pmatrix}0\\1\end{pmatrix}=\begin{pmatrix}-1\\3\end{pmatrix}$。写出 $T$ 在标准基下的矩阵，并计算 $T\!\begin{pmatrix}3\\-2\end{pmatrix}$。
+
+请先停下来想一想：**为什么只要知道基向量的像，就能完全确定一个线性映射？** 因为任何向量都是基向量的线性组合，线性映射保持线性组合，所以基向量的像"决定一切"。矩阵的列就是基向量的像。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目给了两个基向量的像——这正是构造矩阵的直接输入！
+>
+> **第一步：写矩阵**。标准基下，矩阵 $A$ 的第 $j$ 列 $= T(\mathbf{e}_j)$（在标准基下的坐标，就是向量本身）：
+>
+> $$A=[T]_\mathcal{E}=\begin{pmatrix}2&-1\\1&3\end{pmatrix}$$
+>
+> **第二步：计算任意向量的像**。利用核心公式：$T(\mathbf{x})=A\mathbf{x}$：
+>
+> $$T\!\begin{pmatrix}3\\-2\end{pmatrix}=\begin{pmatrix}2&-1\\1&3\end{pmatrix}\begin{pmatrix}3\\-2\end{pmatrix}=\begin{pmatrix}6+2\\3-6\end{pmatrix}=\begin{pmatrix}8\\-3\end{pmatrix}$$
+>
+> **延伸思考**：如果基换成 $\mathcal{B}=\{b_1,b_2\}$，矩阵会变，但变换 $T$ 本身没变——同一个几何操作，在不同坐标系下有不同的数字表示。这正是"相似矩阵"的来源：换基 $\Leftrightarrow$ 相似变换 $A'=P^{-1}AP$。
+>
+> **关键认知**：矩阵是工具，变换是本质。选好基 = 选好坐标系 = 让矩阵尽可能简单（对角化 = 选特征向量为基）。"
+
+---
+
+## 抽象成方法（套路总结）
+
+### 构造变换矩阵 4 步
+
+| 步骤 | 操作 | 说明 |
+|---|---|---|
+| **1. 确定基** | 固定定义域基 $\mathcal{B}=\{b_1,\ldots,b_n\}$ 和值域基 $\mathcal{C}=\{c_1,\ldots,c_m\}$ | 标准基时最简单 |
+| **2. 计算基向量的像** | 对每个 $b_j$，算出 $T(b_j)\in W$ | 这是线性映射的"函数规则" |
+| **3. 坐标化** | 将每个 $T(b_j)$ 用基 $\mathcal{C}$ 表示，得坐标向量 $[T(b_j)]_\mathcal{C}$ | 解线性方程组 |
+| **4. 排列成列** | $[T]_\mathcal{B}^\mathcal{C}=[[T(b_1)]_\mathcal{C}\;\cdots\;[T(b_n)]_\mathcal{C}]$ | 第 $j$ 列对应第 $j$ 个基向量 |
+
+### 核心公式速查
+
+| 公式 | 含义 |
+|---|---|
+| $[T(v)]_\mathcal{C}=[T]_\mathcal{B}^\mathcal{C}\cdot[v]_\mathcal{B}$ | 变换 = 矩阵乘坐标向量 |
+| $[T\circ S]_\mathcal{A}^\mathcal{C}=[T]_\mathcal{B}^\mathcal{C}\cdot[S]_\mathcal{A}^\mathcal{B}$ | 复合 = 矩阵乘积（先作用在右） |
+| $[T^{-1}]_\mathcal{B}=([T]_\mathcal{B})^{-1}$ | 逆变换 = 逆矩阵 |
+| $[T]_{\mathcal{B}'}=P^{-1}[T]_\mathcal{B} P$ | 换基 = 相似变换（$P$ 为过渡矩阵） |
+
+---
+
+## 方法变形
+
+### 变形 1：标准基是特例
+
+当 $\mathcal{B}=\mathcal{C}=\mathcal{E}$（标准基）时，$[v]_\mathcal{E}=v$（坐标就是向量本身），$[T]_\mathcal{E}^\mathcal{E}$ 就是通常写的矩阵 $A$，$T(\mathbf{x})=A\mathbf{x}$。标准基是"默认坐标系"，记号省略 $\mathcal{E}$。
+
+### 变形 2：非标准基下的矩阵计算
+
+若基 $\mathcal{B}$ 不是标准基，求 $[T(b_j)]_\mathcal{C}$ 时，需先用 $T$ 算出 $T(b_j)$（在标准坐标下），再解方程 $\sum c_i e_i = T(b_j)$ 或 $C\mathbf{c}=T(b_j)$（$C$ 为 $\mathcal{C}$ 基矩阵）得坐标 $\mathbf{c}=[T(b_j)]_\mathcal{C}$。
+
+### 变形 3：同一变换 vs 不同矩阵
+
+同一线性变换 $T$，换基后矩阵 $A'=P^{-1}AP$（相似矩阵）。**相似的矩阵描述同一几何变换**，行列式、迹、特征值都不变（相似不变量）。选不同基只是换了"语言"，没有换"内容"。
+
+### 变形 4：复合顺序与矩阵乘法顺序
+
+复合 $T\circ S$ 表示"先作用 $S$，再作用 $T$"，对应矩阵乘积 $[T]\cdot[S]$（$[S]$ 在右）。记忆口诀：**先作用在右，后作用在左**——与中文阅读顺序相反，需刻意记忆。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"线性变换的矩阵" → 基向量的像排列为列，逐列填写
+2. 看到"在基 $\mathcal{B}$ 下计算 $T(v)$" → 先求 $[v]_\mathcal{B}$，再乘矩阵 $[T]_\mathcal{B}^\mathcal{C}$，得 $[T(v)]_\mathcal{C}$
+3. 看到"复合变换 $T\circ S$" → 矩阵乘积 $[T]\cdot[S]$，先作用在右
+4. 看到"同一变换换基" → 相似变换 $P^{-1}AP$，$P$ 的列是新基向量
+5. 看到"验证矩阵" → 用已知向量代入，检查坐标是否符合变换规则
+6. 看到"矩阵可逆" → 变换可逆（同构），$T^{-1}$ 对应 $A^{-1}$
+7. 看到"微分算子的矩阵" → 对每个基多项式求导，写出坐标，排列为列
+8. 看到"全连接层" → 标准基下的矩阵表示 $W\mathbf{x}$；不同基 = 不同坐标系的同一变换
+9. 看到"矩阵乘法的几何意义" → 线性变换的复合——乘法定义由此而来，不是凑巧
+10. 看到"恒等变换的矩阵" → 任意基下都是单位矩阵 $I$
+
+---
+
+## 易错点
+
+1. **矩阵的"列"对应"基向量的像"**，不是行：$[T]_\mathcal{B}^\mathcal{C}$ 的第 $j$ 列 $= [T(b_j)]_\mathcal{C}$。初学者常把行列搞反，导致计算完全错误。
+
+2. **坐标向量不是向量本身**：$[v]_\mathcal{B}$ 是 $v$ 在基 $\mathcal{B}$ 下的"编码"，只有在标准基 $\mathcal{E}$ 下 $[v]_\mathcal{E}=v$ 才成立。非标准基下需要解方程组求坐标，不能直接读取分量。
+
+3. **复合顺序：先作用在右**：$T\circ S$ 对应 $[T]\cdot[S]$，$[S]$ 在右。许多人写成 $[S]\cdot[T]$，顺序颠倒结果完全不同。
+
+4. **换基不改变变换，改变矩阵**：$A'=P^{-1}AP$ 描述的是同一个 $T$，只是坐标系不同。矩阵变了，但行列式、特征值、迹都不变——这些是"变换本身的属性"。
+
+5. **$\mathcal{L}(V,W)\cong\mathbb{R}^{m\times n}$ 依赖基的选取**：同构关系是在固定 $\mathcal{B},\mathcal{C}$ 之后才成立的，换基会得到不同的对应关系（尽管仍是同构）。
+
+---
+
+## 典型应用例题
+
+### 例 1：从"基向量的像"构造矩阵
+
+> **题目**：$T:P_2\to P_2$ 定义为 $T(p)(x)=p(2x)$（将 $p(x)$ 中 $x$ 换为 $2x$）。取标准基 $\mathcal{B}=\{1,x,x^2\}$，求 $[T]_\mathcal{B}$。
+
+【思路】逐一计算每个基多项式在 $T$ 下的像，用 $\mathcal{B}$ 表示，坐标排列为列。
+
+【解】
+- $T(1)=1=1\cdot 1+0\cdot x+0\cdot x^2$，坐标 $(1,0,0)^T$。
+- $T(x)=2x=0\cdot 1+2\cdot x+0\cdot x^2$，坐标 $(0,2,0)^T$。
+- $T(x^2)=(2x)^2=4x^2=0\cdot 1+0\cdot x+4\cdot x^2$，坐标 $(0,0,4)^T$。
+
+$$[T]_\mathcal{B}=\begin{pmatrix}1&0&0\\0&2&0\\0&0&4\end{pmatrix}$$
+
+【答案】$\boxed{[T]_\mathcal{B}=\text{diag}(1,2,4)}$——一个对角矩阵！
+
+【注】$T$ 将 $x^k$ 变为 $2^k x^k$，因此以 $\{1,x,x^2\}$ 为基，$T$ 直接对角化，特征值 $1,2,4$。
+
+### 例 2：非标准基下的坐标计算
+
+> **题目**：$\mathbb{R}^2$ 取基 $\mathcal{B}=\{b_1=(1,1)^T,\,b_2=(1,-1)^T\}$。$T:\mathbb{R}^2\to\mathbb{R}^2$，$T(\mathbf{x})=\begin{pmatrix}2&0\\0&-1\end{pmatrix}\mathbf{x}$（$y$ 分量翻转后缩放）。求 $[T]_\mathcal{B}$（以 $\mathcal{B}$ 为定义域和值域基）。
+
+【思路】计算 $T(b_1)$ 和 $T(b_2)$（在标准坐标下），再求各自在 $\mathcal{B}$ 下的坐标。
+
+【解】
+- $T(b_1)=\begin{pmatrix}2&0\\0&-1\end{pmatrix}\begin{pmatrix}1\\1\end{pmatrix}=\begin{pmatrix}2\\-1\end{pmatrix}$。解 $c_1(1,1)^T+c_2(1,-1)^T=(2,-1)^T$：$c_1+c_2=2$，$c_1-c_2=-1$，得 $c_1=1/2$，$c_2=3/2$。故 $[T(b_1)]_\mathcal{B}=(1/2,3/2)^T$。
+- $T(b_2)=\begin{pmatrix}2&0\\0&-1\end{pmatrix}\begin{pmatrix}1\\-1\end{pmatrix}=\begin{pmatrix}2\\1\end{pmatrix}$。解 $c_1+c_2=2$，$c_1-c_2=1$，得 $c_1=3/2$，$c_2=1/2$。故 $[T(b_2)]_\mathcal{B}=(3/2,1/2)^T$。
+
+$$[T]_\mathcal{B}=\begin{pmatrix}1/2&3/2\\3/2&1/2\end{pmatrix}$$
+
+【答案】$\boxed{[T]_\mathcal{B}=\begin{pmatrix}1/2&3/2\\3/2&1/2\end{pmatrix}}$（非对角，因 $\mathcal{B}$ 不是 $T$ 的特征向量基）。
+
+### 例 3：复合变换的矩阵
+
+> **题目**：标准基下，$S$ 的矩阵为 $A=\begin{pmatrix}1&1\\0&1\end{pmatrix}$（上三角错切），$T$ 的矩阵为 $B=\begin{pmatrix}0&-1\\1&0\end{pmatrix}$（旋转 $90°$）。求 (1) $T\circ S$ 的矩阵；(2) $S\circ T$ 的矩阵；(3) 两者是否相等？
+
+【解】
+(1) $[T\circ S]=BA=\begin{pmatrix}0&-1\\1&0\end{pmatrix}\begin{pmatrix}1&1\\0&1\end{pmatrix}=\begin{pmatrix}0&-1\\1&1\end{pmatrix}$。
+
+(2) $[S\circ T]=AB=\begin{pmatrix}1&1\\0&1\end{pmatrix}\begin{pmatrix}0&-1\\1&0\end{pmatrix}=\begin{pmatrix}1&-1\\1&0\end{pmatrix}$。
+
+(3) $\begin{pmatrix}0&-1\\1&1\end{pmatrix}\neq\begin{pmatrix}1&-1\\1&0\end{pmatrix}$，**不相等**——复合变换一般不满足交换律。
+
+【答案】$\boxed{[T\circ S]=\begin{pmatrix}0&-1\\1&1\end{pmatrix},\ [S\circ T]=\begin{pmatrix}1&-1\\1&0\end{pmatrix}}$，两者不同。
+
+---
+
+## 自测题
+
+**自测 1**　$T:\mathbb{R}^2\to\mathbb{R}^2$，$T(e_1)=(3,1)^T$，$T(e_2)=(0,2)^T$。写出 $[T]_\mathcal{E}$，并计算 $T(2,-1)^T$。
+
+> 提示：$[T]_\mathcal{E}=\begin{pmatrix}3&0\\1&2\end{pmatrix}$；$T(2,-1)^T=(6,0)^T$。
+
+**自测 2**　$T:P_1\to P_1$，$T(a+bx)=(a+b)+(a-b)x$。取基 $\{1,x\}$，求 $[T]_\mathcal{B}$。
+
+> 提示：$T(1)=1+x$，坐标 $(1,1)^T$；$T(x)=1-x$，坐标 $(1,-1)^T$。$[T]_\mathcal{B}=\begin{pmatrix}1&1\\1&-1\end{pmatrix}$。
+
+**自测 3**　标准基下 $A=\begin{pmatrix}2&1\\0&3\end{pmatrix}$，$B=\begin{pmatrix}1&0\\1&1\end{pmatrix}$。(1) 求 $[T_A\circ T_B]$；(2) 验证 $\det([T_A\circ T_B])=\det A\cdot\det B$。
+
+> 提示：$AB=\begin{pmatrix}3&1\\3&3\end{pmatrix}$；$\det(AB)=9-3=6=6\cdot 1=\det A\cdot\det B$ ✓。
+
+**自测 4**　$T:\mathbb{R}^2\to\mathbb{R}^2$ 在标准基下矩阵 $A=\begin{pmatrix}3&1\\1&3\end{pmatrix}$。若取基 $\mathcal{B}=\{(1,1)^T,(1,-1)^T\}$，则 $P=\begin{pmatrix}1&1\\1&-1\end{pmatrix}$，求 $[T]_\mathcal{B}=P^{-1}AP$。
+
+> 提示：$P^{-1}=\frac{1}{2}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$；$AP=\begin{pmatrix}4&2\\4&-2\end{pmatrix}$；$[T]_\mathcal{B}=\begin{pmatrix}4&0\\0&2\end{pmatrix}$——对角化！特征值 $4,2$。
+
+**自测 5**　$T_1:\mathbb{R}^3\to\mathbb{R}^2$，$T_2:\mathbb{R}^2\to\mathbb{R}^4$。$T_2\circ T_1:\mathbb{R}^3\to\mathbb{R}^4$ 对应的矩阵尺寸是多少？若 $\text{rank}(T_1)=2$，$\text{rank}(T_2)=2$，$T_2\circ T_1$ 的秩最大是多少？
+
+> 提示：尺寸 $4\times 3$；$\text{rank}(T_2\circ T_1)\leq\min(2,2)=2$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 矩阵第 $j$ 列 $=$ $T(b_j)$ 在值域基下的坐标。$[T(v)]_\mathcal{C}=[T]_\mathcal{B}^\mathcal{C}[v]_\mathcal{B}$。
+> 复合 $=$ 乘积，先作用在右。同构 $\Leftrightarrow$ 可逆矩阵。换基 $\Rightarrow$ 相似变换 $P^{-1}AP$。
+
+如果不看笔记能完成例 1 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格定义 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 14.1–14.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用（卷积矩阵形式） + 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

@@ -1,6 +1,40 @@
-# 第17章：正交化与QR分解
+# 第17章：正交化与QR分解（融合版）
 
 > 正交基是向量空间中最"舒适"的坐标系——每个方向都相互垂直，计算简洁，数值稳定。Gram-Schmidt正交化算法将任意基变换为正交基，而QR分解将这一过程编码成矩阵语言，成为数值线性代数的核心工具之一。
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **Gram-Schmidt 核心**：第 $j$ 步从 $a_j$ 中减去其在已有标准正交向量上的全部投影，剩余部分归一化得 $q_j$：$\mathbf{v}_j=a_j-\sum_{i<j}(a_j\cdot q_i)q_i$，$q_j=\mathbf{v}_j/\|\mathbf{v}_j\|$。
+> **QR 分解**：列满秩矩阵 $A=QR$；$Q$ 的列是标准正交基，$R$ 是正对角元的上三角矩阵；$R=Q^TA$。
+> **应用**：方程组 $A\mathbf{x}=\mathbf{b}$ → 回代 $R\mathbf{x}=Q^T\mathbf{b}$；最小二乘 $\min\|A\mathbf{x}-\mathbf{b}\|$ → 同样归结为 $R\hat{\mathbf{x}}=Q^T\mathbf{b}$。
+> **数值稳定性**：CGS 误差 $O(\epsilon\kappa^2)$；MGS 误差 $O(\epsilon\kappa)$；Householder 误差 $O(\epsilon)$——实践首选 Householder。
+> **AI 关联**：`nn.init.orthogonal_` 内部做 QR 分解取 $Q$；谱归一化用幂迭代估计最大奇异值再归一化。
+
+---
+
+## 引入：神经网络权重的正交初始化是怎么做的？
+
+> **题目**：用随机矩阵生成 $3\times2$ 的正交初始化权重矩阵。设随机矩阵 $A=\begin{pmatrix}1&2\\1&0\\0&1\end{pmatrix}$，请对其列向量做 Gram-Schmidt 正交化，写出标准正交基 $\{q_1,q_2\}$，并说明为何"取 $Q$ 作为初始权重"能保持前向传播信号范数不变。
+
+请先停下来想一想：正交化的每一步都在"消除已有方向的影子"——新向量只保留与所有已有方向无关的成分，再归一化到单位长度。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "目标：把 $a_1=(1,1,0)^T$、$a_2=(2,0,1)^T$ 正交化。
+>
+> **第一步**：$\mathbf{v}_1=a_1$，$\|\mathbf{v}_1\|=\sqrt{2}$，$q_1=(1,1,0)^T/\sqrt{2}$。完成。
+>
+> **第二步**：从 $a_2$ 中减去它在 $q_1$ 方向的投影。
+> 投影系数：$a_2\cdot q_1=(2\cdot1+0\cdot1+1\cdot0)/\sqrt{2}=2/\sqrt{2}=\sqrt{2}$。
+> $\mathbf{v}_2=a_2-\sqrt{2}\cdot q_1=(2,0,1)^T-\sqrt{2}\cdot(1,1,0)^T/\sqrt{2}=(2,0,1)^T-(1,1,0)^T=(1,-1,1)^T$。
+> $\|\mathbf{v}_2\|=\sqrt{3}$，$q_2=(1,-1,1)^T/\sqrt{3}$。
+>
+> **验证正交**：$q_1\cdot q_2=(1\cdot1+1\cdot(-1)+0\cdot1)/\sqrt{6}=0/\sqrt{6}=0$ ✓。
+>
+> **为什么取 $Q$ 作权重？** $Q=[q_1\vert q_2]$ 的列是标准正交的，于是 $Q^TQ=I_2$。前向传播时 $\|Q\mathbf{h}\|=\|\mathbf{h}\|$（等距变换），信号范数层间不变。梯度反传时经过 $Q^T$，$\|Q^T\mathbf{g}\|=\|\mathbf{g}\|$，梯度不爆炸不消失。这就是 `nn.init.orthogonal_` 的设计意图。"
 
 ---
 
@@ -803,3 +837,184 @@ $$\left\|\nabla_{\mathbf{x}^{(0)}} \mathcal{L}\right\| \leq \prod_{\ell=1}^{L} \
 因此，用正交矩阵初始化（或在训练中约束 $\|W_\ell\|_2 = 1$）能将每层的谱范数固定为1，使得梯度在 $L$ 层网络中传播时范数不放大也不缩小，从根本上解决梯度消失/爆炸问题。$\square$
 
 </details>
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键条件 |
+|---|---|---|
+| **向量在向量上的投影** | $\text{proj}_{\mathbf{b}}\mathbf{a}=\dfrac{\langle \mathbf{a},\mathbf{b}\rangle}{\|\mathbf{b}\|^2}\mathbf{b}$ | 残差 $\mathbf{a}-\text{proj}_{\mathbf{b}}\mathbf{a}\perp\mathbf{b}$ |
+| **Gram-Schmidt 第 $j$ 步** | $\mathbf{v}_j=a_j-\sum_{i<j}(a_j\cdot q_i)q_i$，$q_j=\mathbf{v}_j/\|\mathbf{v}_j\|$ | $a_j$ 线性无关 $\Rightarrow\mathbf{v}_j\neq\mathbf{0}$ |
+| **QR 分解** | $A=QR$，$Q^TQ=I$，$R$ 上三角正对角元 | $A$ 列满秩 |
+| **$R$ 的快速计算** | $R=Q^TA$ | 已知 $Q$ 后直接计算 |
+| **方程组求解** | $A\mathbf{x}=\mathbf{b}$ → $R\mathbf{x}=Q^T\mathbf{b}$ → 回代 | $A$ 方阵可逆 |
+| **最小二乘** | $\min\|A\mathbf{x}-\mathbf{b}\|$ → $R\hat{\mathbf{x}}=Q^T\mathbf{b}$ → 回代 | $A$ 列满秩（$m>n$） |
+
+### Gram-Schmidt 标准 3 步
+
+1. **初始化**：取 $\mathbf{v}_1=a_1$，归一化 $q_1=\mathbf{v}_1/\|\mathbf{v}_1\|$
+2. **逐步正交化**：对 $j=2,3,\ldots,k$，从 $a_j$ 中减去其在 $q_1,\ldots,q_{j-1}$ 上的全部投影，得到 $\mathbf{v}_j$，归一化
+3. **验证**：计算所有 $q_i\cdot q_j$（$i\neq j$），应为 $0$
+
+### 用 QR 解最小二乘 4 步
+
+1. 对 $A$（$m\times n$，$m>n$）做 QR 分解：$A=QR$
+2. 计算 $\mathbf{c}=Q^T\mathbf{b}$（取前 $n$ 行）
+3. 回代求解上三角方程组 $R\hat{\mathbf{x}}=\mathbf{c}$
+4. （可选）验证残差 $\mathbf{b}-A\hat{\mathbf{x}}$ 与 $A$ 的列正交
+
+---
+
+## 方法变形
+
+### 变形 1：投影到子空间
+
+若子空间 $W$ 有标准正交基 $\{q_1,\ldots,q_k\}$，$\mathbf{a}$ 在 $W$ 上的投影直接累加：$\text{proj}_W\mathbf{a}=\sum_{i=1}^k(a\cdot q_i)q_i=QQ^T\mathbf{a}$（$Q=[q_1\vert\cdots\vert q_k]$）。这是 Gram-Schmidt 结果的直接应用。
+
+### 变形 2：MGS vs CGS
+
+经典 GS（CGS）一次减去所有投影；修正 GS（MGS）每减一个投影后立即更新向量。数学等价，但在有限精度下 MGS 将正交性误差从 $O(\epsilon\kappa^2)$ 降至 $O(\epsilon\kappa)$。**对病态矩阵必须用 MGS 或 Householder**。
+
+### 变形 3：Householder 反射
+
+$H=I-2\mathbf{u}\mathbf{u}^T$（$\|\mathbf{u}\|=1$）是正交对称矩阵，将向量"反射"到坐标轴方向。依次施加 $n$ 个 Householder 反射把 $A$ 化为上三角，得 $H_n\cdots H_1 A=R$，$Q=H_1^T\cdots H_n^T$。LAPACK 默认用此方法。
+
+### 变形 4：QR 在 SVD 计算中的作用
+
+计算大矩阵 SVD 时，先对 $A$ 做 QR 分解 $A=QR$，再对小方阵 $R$ 做 SVD：$R=U_R\Sigma V^T$，最终 $A=(QU_R)\Sigma V^T$。这把计算规模从 $mn^2$ 量级中的大矩阵 SVD 转化为 $n^3$ 量级的小矩阵 SVD，大幅提升效率。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"Gram-Schmidt" → 每步先投影后减投影再归一化，顺序不可颠倒
+2. 看到"$a_j\cdot q_i$" → 这是"$a_j$ 在 $q_i$ 方向的分量"，要从 $a_j$ 中减去
+3. 看到"$\mathbf{v}_j=\mathbf{0}$" → 说明 $a_j$ 已经被前面向量线性表示，原始向量**线性相关**
+4. 看到"$Q^TQ=I$" → $Q$ 是列正交矩阵（不一定是方形正交矩阵）
+5. 看到"$R=Q^TA$" → 快速计算 $R$，不用手动追踪 GS 系数
+6. 看到"最小二乘 + QR" → 先做 QR，再回代 $R\hat{\mathbf{x}}=Q^T\mathbf{b}$，比法方程数值稳定
+7. 看到"Householder" → 精度最高（$O(\epsilon)$），LAPACK/NumPy 默认实现
+8. 看到"谱归一化" → 幂迭代估计最大奇异值 $\sigma_{\max}$，然后 $\hat{W}=W/\sigma_{\max}$
+9. 看到"正交初始化" → `nn.init.orthogonal_` 内部做随机矩阵 QR 分解取 $Q$
+10. 看到"GAN 判别器稳定" → SNGAN 用谱归一化控制每层 Lipschitz 常数为 1
+
+---
+
+## 易错点
+
+1. **Gram-Schmidt 步骤顺序错误**：必须先用**已归一化**的 $q_i$ 计算投影系数，再减去投影，最后归一化 $\mathbf{v}_j$ 得到 $q_j$；用未归一化的向量做投影会导致系数错误。
+
+2. **忘记检验 $\mathbf{v}_j$ 是否为零**：若输入向量线性相关，某步 $\mathbf{v}_j=\mathbf{0}$，此时无法归一化；这是线性相关的检测信号，不是算法 bug。
+
+3. **$Q^TQ=I$ 不等于 $QQ^T=I$**：对于非方形的 $m\times n$（$m>n$）矩阵 $Q$，$Q^TQ=I_n$（列正交），但 $QQ^T\neq I_m$（不是完整正交矩阵）。只有方形正交矩阵才满足 $QQ^T=Q^TQ=I$。
+
+4. **回代方向错误**：上三角方程组 $R\mathbf{x}=\mathbf{c}$ 应从**最后一行**（最简单的方程）往前回代，不能从第一行开始。
+
+5. **CGS 在病态矩阵上失效**：矩阵条件数 $\kappa(A)\gg1$ 时，经典 GS 的正交性误差 $\propto\kappa^2$，输出的 $q_j$ 可能严重不正交（$q_i\cdot q_j$ 偏离 $0$ 达 $10^{-3}$ 量级）。应改用 MGS 或 Householder。
+
+---
+
+## 典型应用例题
+
+### 例 1：二维 Gram-Schmidt + QR 分解
+
+> **题目**：$a_1=(1,1)^T$，$a_2=(3,1)^T$。(1) 做 Gram-Schmidt 正交化；(2) 写出 QR 分解；(3) 验证 $QR=A$。
+
+【思路】标准 3 步法：初始化 $q_1$ → 减投影得 $\mathbf{v}_2$ → 归一化 $q_2$ → 计算 $R=Q^TA$。
+
+【解】
+(1) $\mathbf{v}_1=(1,1)^T$，$\|\mathbf{v}_1\|=\sqrt{2}$，$q_1=(1,1)^T/\sqrt{2}$。
+$a_2\cdot q_1=(3+1)/\sqrt{2}=2\sqrt{2}$，$\mathbf{v}_2=(3,1)^T-2\sqrt{2}\cdot(1,1)^T/\sqrt{2}=(3,1)^T-(2,2)^T=(1,-1)^T$，$q_2=(1,-1)^T/\sqrt{2}$。
+验证：$q_1\cdot q_2=(1-1)/2=0$ ✓。
+
+(2) $Q=\dfrac{1}{\sqrt{2}}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$。$R=Q^TA=\dfrac{1}{\sqrt{2}}\begin{pmatrix}1&1\\1&-1\end{pmatrix}\begin{pmatrix}1&3\\1&1\end{pmatrix}=\begin{pmatrix}\sqrt{2}&2\sqrt{2}\\0&\sqrt{2}\end{pmatrix}$。
+
+(3) $QR=\dfrac{1}{\sqrt{2}}\begin{pmatrix}1&1\\1&-1\end{pmatrix}\begin{pmatrix}\sqrt{2}&2\sqrt{2}\\0&\sqrt{2}\end{pmatrix}=\begin{pmatrix}1&3\\1&1\end{pmatrix}=A$ ✓。
+
+【答案】$Q=\dfrac{1}{\sqrt{2}}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$，$R=\sqrt{2}\begin{pmatrix}1&2\\0&1\end{pmatrix}$，验证通过。
+
+### 例 2：用 QR 求最小二乘解
+
+> **题目**：数据点 $(0,2),(1,3),(2,5)$，用最小二乘拟合 $y=ax+b$。(1) 写出设计矩阵 $A$ 和右端向量 $\mathbf{b}$；(2) 对 $A$ 做 QR 分解（简要说明步骤）；(3) 通过回代得到 $\hat{a},\hat{b}$。
+
+【思路】标准最小二乘 4 步：建 $A$ 和 $\mathbf{b}$ → QR → 算 $Q^T\mathbf{b}$ → 回代。
+
+【解】
+(1) $A=\begin{pmatrix}0&1\\1&1\\2&1\end{pmatrix}$，$\mathbf{b}=(2,3,5)^T$。
+
+(2) $a_1=(0,1,2)^T$：$q_1=(0,1,2)^T/\sqrt{5}$。
+$a_2=(1,1,1)^T$：$a_2\cdot q_1=3/\sqrt{5}$，$\mathbf{v}_2=(1,1,1)^T-(3/5)(0,1,2)^T=(1,2/5,-1/5)^T$，$\|\mathbf{v}_2\|=\sqrt{1+4/25+1/25}=\sqrt{30}/5$，$q_2=5(1,2/5,-1/5)^T/\sqrt{30}=(5,2,-1)^T/\sqrt{30}$。
+
+$Q=[q_1\vert q_2]$，$R=Q^TA=\begin{pmatrix}\sqrt{5}&3/\sqrt{5}\\0&\sqrt{30}/5\end{pmatrix}$（数值可化简）。
+
+(3) $Q^T\mathbf{b}$：第1分量 $=(0\cdot2+1\cdot3+2\cdot5)/\sqrt{5}=13/\sqrt{5}$；第2分量 $=(5\cdot2+2\cdot3-1\cdot5)/\sqrt{30}=11/\sqrt{30}$。回代：$\hat{a}=\dfrac{11/\sqrt{30}}{\sqrt{30}/5}=\dfrac{11\cdot5}{30}=11/6\approx1.5$，$\hat{b}=\dfrac{13/\sqrt{5}-r_{12}\hat{a}}{\sqrt{5}}$（化简）$\approx5/3\approx1.67$。
+
+【答案】最小二乘拟合直线 $y\approx1.5x+1.67$（可用法方程验证）。
+
+### 例 3：Householder 变换的几何意义
+
+> **题目**：取单位向量 $\mathbf{u}=(1,1)^T/\sqrt{2}$，写出 Householder 矩阵 $H=I-2\mathbf{u}\mathbf{u}^T$，并验证 $H$ 是正交对称矩阵，计算 $H\mathbf{v}$ 对 $\mathbf{v}=(3,1)^T$ 的结果。
+
+【思路】直接展开 $H$，验证 $H^T=H$ 和 $H^TH=I$，再算乘积。
+
+【解】$\mathbf{u}\mathbf{u}^T=\dfrac{1}{2}\begin{pmatrix}1\\1\end{pmatrix}(1,1)=\dfrac{1}{2}\begin{pmatrix}1&1\\1&1\end{pmatrix}$，$H=\begin{pmatrix}1&0\\0&1\end{pmatrix}-\begin{pmatrix}1&1\\1&1\end{pmatrix}=\begin{pmatrix}0&-1\\-1&0\end{pmatrix}$。
+$H^T=H$（对称 ✓），$H^TH=H^2=\begin{pmatrix}1&0\\0&1\end{pmatrix}=I$（正交 ✓），$\det(H)=-1$（反射）。
+$H\mathbf{v}=\begin{pmatrix}0&-1\\-1&0\end{pmatrix}\begin{pmatrix}3\\1\end{pmatrix}=\begin{pmatrix}-1\\-3\end{pmatrix}$。
+
+【答案】$H=\begin{pmatrix}0&-1\\-1&0\end{pmatrix}$，$H\mathbf{v}=(-1,-3)^T$（即 $\mathbf{v}$ 关于方向 $\mathbf{u}=(1,-1)^T/\sqrt{2}$ 的反射）。
+
+---
+
+## 自测题
+
+**自测 1**　$a_1=(1,0,1)^T$，$a_2=(1,1,0)^T$。做 Gram-Schmidt 正交化，求 $q_1,q_2$，并验证 $q_1\cdot q_2=0$。
+
+> 提示：$q_1=(1,0,1)^T/\sqrt{2}$；$a_2\cdot q_1=1/\sqrt{2}$；$\mathbf{v}_2=(1,1,0)^T-(1/2)(1,0,1)^T=(1/2,1,-1/2)^T$；$\|\mathbf{v}_2\|=\sqrt{6}/2$；$q_2=(1,2,-1)^T/\sqrt{6}$；$q_1\cdot q_2=(1+0-1)/\sqrt{12}=0$ ✓。
+
+**自测 2**　已知 $Q=\dfrac{1}{3}\begin{pmatrix}2&-1\\2&2\\1&-2\end{pmatrix}$ 是某矩阵 QR 分解的 $Q$ 因子。验证 $Q^TQ=I_2$（计算 $Q$ 的列的内积）。
+
+> 提示：$q_1=(2,2,1)^T/3$，$q_2=(-1,2,-2)^T/3$。$\|q_1\|^2=(4+4+1)/9=1$ ✓；$\|q_2\|^2=(1+4+4)/9=1$ ✓；$q_1\cdot q_2=(-2+4-2)/9=0$ ✓。
+
+**自测 3**　设 $A=\begin{pmatrix}1&1\\0&1\end{pmatrix}$，对 $A$ 做 QR 分解（$A$ 列满秩，$2\times2$），用 $R\mathbf{x}=Q^T\mathbf{b}$ 解方程组 $A\mathbf{x}=\mathbf{b}=(2,1)^T$。
+
+> 提示：$q_1=(1,0)^T$，$a_2\cdot q_1=1$，$\mathbf{v}_2=(0,1)^T$，$q_2=(0,1)^T$；$R=\begin{pmatrix}1&1\\0&1\end{pmatrix}=A$；$Q^T\mathbf{b}=(2,1)^T$；回代：$x_2=1$，$x_1=2-1=1$；故 $\mathbf{x}=(1,1)^T$（验证：$A\mathbf{x}=(2,1)^T$ ✓）。
+
+**自测 4**　为什么 Householder 反射比 MGS 精度更高？用一句话，从误差阶的角度解释。
+
+> 提示：MGS 正交性误差 $O(\epsilon_{\text{mach}}\kappa(A))$ 仍与条件数相关；Householder 误差仅 $O(\epsilon_{\text{mach}})$，不受条件数放大，是后向稳定的。
+
+**自测 5**　PyTorch 中 `nn.init.orthogonal_(W)` 的内部原理是什么？假设 $W$ 是 $4\times3$ 的随机矩阵 $M$，最终输出的正交权重是什么形状？
+
+> 提示：内部做 $M=QR$ 的瘦 QR 分解（或对 $M^T$ 做 QR），取 $Q$（$4\times3$ 列正交矩阵）作为初始权重；$Q^TQ=I_3$，每列范数为 $1$，各列两两正交。形状仍为 $4\times3$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> Gram-Schmidt：每步减去在已有 $q$ 方向上的投影，再归一化。$A=QR$：$Q$ 列正交，$R$ 上三角正对角元，$R=Q^TA$。
+> 最小二乘：$A=QR$ → $R\hat{\mathbf{x}}=Q^T\mathbf{b}$ → 回代。数值稳定性：Householder $>$ MGS $>$ CGS。
+> AI 关联：正交初始化 $=$ QR 取 $Q$；谱归一化 $=$ 幂迭代估计 $\sigma_{\max}$ 再除。
+
+如果现在不看笔记，能独立完成例 1 + 自测 1 + 自测 3——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 17.1–17.5 严格正文 | 原版 | 完整推导与定理 |
+| 深度学习应用（SNGAN / 正交初始化）+ 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

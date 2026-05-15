@@ -1,10 +1,45 @@
-# 第21章：对称矩阵与谱定理
+# 第21章：对称矩阵与谱定理（融合版）
 
 > **前置知识**：第16章（内积与正交性）、第17章（正交化与QR分解）、第19章（特征值与特征向量）、第20章（对角化）
 >
 > **本章难度**：★★★★☆
 >
 > **预计学习时间**：5-6 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **谱定理** $A=Q\Lambda Q^T$（$A$ 实对称）：$Q$ 的列 = 标准正交特征向量；$\Lambda$ = 实特征值对角矩阵。
+> **正定判断**：特征值全 $>0$ / 顺序主子式全 $>0$ / 存在 $A=LL^T$ / 可写 $A=B^TB$（$B$ 列满秩）。
+> **谱分解** $A=\sum_i\lambda_i\mathbf{q}_i\mathbf{q}_i^T$：每项是秩 1 投影乘缩放系数。
+> **Rayleigh 商** $R_A(\mathbf{x})=\mathbf{x}^TA\mathbf{x}/\|\mathbf{x}\|^2$：最大值 $=\lambda_{\max}$，最小值 $=\lambda_{\min}$。
+> **AI 关联**：Hessian 正定 $\Rightarrow$ 局部极小值；条件数 $\kappa=\lambda_{\max}/\lambda_{\min}$ 决定梯度下降收敛速度；协方差矩阵 = 实对称半正定。
+
+---
+
+## 引入：损失函数的"碗形"判断
+
+> **题目**：神经网络在某参数点的 Hessian 矩阵为 $H=\begin{pmatrix}3 & -1 \\ -1 & 3\end{pmatrix}$。判断该点是局部极小值、极大值还是鞍点，并求梯度下降的最优学习率。
+
+请先停下来想一想：二阶条件如何"看穿"曲面形状？$H$ 的特征值如何决定每个方向的曲率？
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "$H=H^T$，实对称矩阵，谱定理保证特征值全实。
+>
+> **求特征值**：$\operatorname{tr}=6$，$\det=9-1=8$，特征多项式 $\lambda^2-6\lambda+8=(\lambda-2)(\lambda-4)=0$，特征值 $\lambda_1=2>0$，$\lambda_2=4>0$。
+>
+> **判断类型**：所有特征值 $>0\Rightarrow H\succ 0\Rightarrow$ 该点是**局部极小值**（碗形，各方向二阶导数均正）。
+>
+> **最优学习率**：$\eta^*=\frac{2}{\lambda_{\min}+\lambda_{\max}}=\frac{2}{2+4}=\frac{1}{3}$。
+>
+> **条件数与收敛率**：$\kappa=\lambda_{\max}/\lambda_{\min}=4/2=2$（条件良好！），最坏收敛率 $\rho^*=(\kappa-1)/(\kappa+1)=1/3$——约 $\lceil\log_{3}100\rceil\approx 5$ 步误差可缩小到 $1\%$。
+>
+> **谱分解直觉**：$\lambda_2=4$ 方向曲率大（步长敏感），$\lambda_1=2$ 方向曲率小（收敛慢）。对角化方法揭示了"最难"和"最易"下降的方向，Adam 等自适应优化器正是在隐式地均衡这两个方向的步长。
+>
+> **延伸**：若 $H$ 有负特征值，对应方向的二阶导数为负，沿该方向移动损失下降——这就是鞍点的特征，SGD 的随机噪声帮助跳过鞍点。"
 
 ---
 
@@ -541,6 +576,199 @@ for kappa in [1, 10, 100, 1000]:
 | 条件数 $\kappa = \lambda_{\max}/\lambda_{\min}$ | 优化难度 | $\kappa$ 越大收敛越慢 |
 | 谱分解 $H = Q\Lambda Q^T$ | 自然梯度方向 | Newton 步 $H^{-1}g$ 是最优更新方向 |
 | Rayleigh 商 | 梯度方向的曲率 | 决定该方向的更新步长 |
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 / 判断 | 关键性质 |
+|---|---|---|
+| **实对称矩阵** | $A^T=A$ | 特征值全实；不同特征值的特征向量正交 |
+| **谱定理** | $A=Q\Lambda Q^T$ | $Q$ 正交（$Q^TQ=I$），$\Lambda$ 实对角 |
+| **谱分解** | $A=\sum_i\lambda_i\mathbf{q}_i\mathbf{q}_i^T$ | 每项为秩 1 投影 |
+| **正定** $A\succ 0$ | 全部 $\lambda_i>0$ / 顺序主子式全 $>0$ / $\exists$ Cholesky $LL^T$ | 二次型碗形 |
+| **半正定** $A\succeq 0$ | 全部 $\lambda_i\geq 0$ / $\exists B:A=B^TB$ | 允许零特征值 |
+| **Rayleigh 商** | $R_A(\mathbf{x})=\dfrac{\mathbf{x}^TA\mathbf{x}}{\|\mathbf{x}\|^2}$ | $\min=\lambda_{\min}$（$\mathbf{x}=\mathbf{q}_1$），$\max=\lambda_{\max}$（$\mathbf{x}=\mathbf{q}_n$） |
+| **条件数** | $\kappa(A)=\lambda_{\max}/\lambda_{\min}$（$A\succ 0$）| 优化难度；$\kappa=1$ 最易 |
+
+### 正交对角化标准 3 步
+
+1. **求特征值**：解 $\det(A-\lambda I)=0$（实对称矩阵保证全为实数）
+2. **求标准正交特征向量**：对每个 $\lambda$，解 $(A-\lambda I)\mathbf{v}=\mathbf{0}$，再做 Gram-Schmidt 正交化并归一化（同一特征值对应多个特征向量时需正交化）
+3. **写出 $Q$ 和 $\Lambda$**：$Q=[\mathbf{q}_1\mid\cdots\mid\mathbf{q}_n]$，$\Lambda=\operatorname{diag}(\lambda_1,\ldots,\lambda_n)$，验证 $Q^TQ=I$
+
+### 正定性判断流程（优先级）
+
+1. 计算所有特征值（最直接，但计算量大）
+2. 检验顺序主子式（Sylvester 准则，适合手算 $3\times 3$）
+3. 尝试 Cholesky 分解（程序中最常用，失败则非正定）
+
+---
+
+## 方法变形
+
+### 变形 1：重特征值下的正交对角化
+重特征值 $\lambda_0$ 对应 $m_g>1$ 维特征空间（实对称矩阵保证 $m_g=m_a$）。需在该空间内用 Gram-Schmidt 选出正交基，再归一化，才能保证 $Q$ 是正交矩阵。
+
+### 变形 2：谱分解计算矩阵函数
+$f(A)=\sum_i f(\lambda_i)\mathbf{q}_i\mathbf{q}_i^T$。特殊情形：
+- $A^{-1}=\sum_i\frac{1}{\lambda_i}\mathbf{q}_i\mathbf{q}_i^T$（要求 $\lambda_i\neq 0$）
+- $A^{1/2}=\sum_i\sqrt{\lambda_i}\mathbf{q}_i\mathbf{q}_i^T$（要求 $\lambda_i\geq 0$，即半正定）
+- $\log A=\sum_i\ln(\lambda_i)\mathbf{q}_i\mathbf{q}_i^T$（要求 $\lambda_i>0$，即正定）
+
+### 变形 3：Gram 矩阵与协方差矩阵
+$G=B^TB$ 是实对称半正定矩阵；$G$ 正定 $\Leftrightarrow$ $B$ 列满秩。样本协方差 $\Sigma=\frac{1}{n-1}X^TX$ 对中心化数据恒为半正定，样本数 $>$ 特征数且无线性相关时为正定。
+
+### 变形 4：二次型标准化
+$\mathbf{x}^TA\mathbf{x}$ 在 $Q^T$ 坐标变换 $\mathbf{y}=Q^T\mathbf{x}$ 下变为 $\mathbf{y}^T\Lambda\mathbf{y}=\sum_i\lambda_iy_i^2$（标准形）——不含交叉项。这是"主轴定理"的本质：对角化消去交叉项。
+
+### 变形 5：PCA 与谱定理的联系
+PCA 找数据方差最大方向 = 最大化 Rayleigh 商 $\mathbf{q}^T\Sigma\mathbf{q}$（约束 $\|\mathbf{q}\|=1$），答案 = $\Sigma$ 的最大特征向量（谱定理直接给出）。前 $k$ 主成分 = 前 $k$ 大特征值对应的特征向量，方差解释率 $=\sum_{i=1}^k\lambda_i/\sum\lambda_i$。
+
+---
+
+## 本章小结（补充）
+
+| 情形 | 判断方式 | 几何图像 |
+|---|---|---|
+| 正定 $A\succ 0$ | $\lambda_i>0$ / 主子式全正 | 碗形，唯一极小 |
+| 半正定 $A\succeq 0$ | $\lambda_i\geq 0$ | 浅碗或退化，某方向平坦 |
+| 不定 $A$ | 特征值有正有负 | 马鞍面，有鞍点 |
+| 负定 $A\prec 0$ | $\lambda_i<0$ | 倒碗，唯一极大 |
+| 条件数 $\kappa$ 小 | $\lambda_{\max}/\lambda_{\min}\approx 1$ | 接近球形碗，收敛快 |
+| 条件数 $\kappa$ 大 | $\lambda_{\max}\gg\lambda_{\min}$ | 扁椭圆碗，收敛慢 |
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"实对称矩阵" → 特征值全实，不同特征值的特征向量正交；可正交对角化
+2. 看到"证明特征值为实数" → 用共轭内积技巧：$\lambda\|\mathbf{v}\|^2=\bar{\mathbf{v}}^TA\mathbf{v}=\bar{\lambda}\|\mathbf{v}\|^2$，得 $\lambda=\bar\lambda$
+3. 看到"证明特征向量正交" → $(\lambda_1-\lambda_2)\langle\mathbf{v}_1,\mathbf{v}_2\rangle=0$，$\lambda_1\neq\lambda_2\Rightarrow$ 正交
+4. 看到"正交对角化" → 谱定理：$A=Q\Lambda Q^T$；$Q$ 是正交矩阵，$Q^{-1}=Q^T$
+5. 看到"判断正定" → 优先用特征值；手算用顺序主子式；数值计算用 Cholesky 分解
+6. 看到"协方差矩阵" → 实对称半正定；特征值 = 各主成分方向的方差
+7. 看到"Rayleigh 商" → $\lambda_{\min}\leq R_A(\mathbf{x})\leq\lambda_{\max}$；最大/小值在特征向量方向取到
+8. 看到"Hessian 正定" → 临界点是局部极小值；$\kappa=\lambda_{\max}/\lambda_{\min}$ 决定收敛速度
+9. 看到"Hessian 有负特征值" → 鞍点；梯度下降可沿负特征值方向下降
+10. 看到"$B^TB$" → 半正定（Gram 矩阵）；$B$ 列满秩时正定
+
+---
+
+## 易错点
+
+1. **正交对角化 $\neq$ 普通对角化**：普通对角化 $A=P\Lambda P^{-1}$ 只需 $P$ 可逆；正交对角化额外要求 $P=Q$ 是正交矩阵，且只对实对称矩阵（或更一般的正规矩阵）成立。不能对任意矩阵直接写 $A=Q\Lambda Q^T$。
+
+2. **重特征值时需用 Gram-Schmidt**：同一特征值对应多个特征向量时，从特征空间选出的向量不一定正交，必须显式 Gram-Schmidt 正交化后才能放入 $Q$。直接用"任意基"会使 $Q$ 不正交。
+
+3. **正定与半正定的界限**：$A=\begin{pmatrix}1&0\\0&0\end{pmatrix}$ 是半正定（有零特征值），但不是正定——零特征值使存在非零向量 $(0,1)^T$ 使 $\mathbf{x}^TA\mathbf{x}=0$。判断时必须检查是否有零特征值。
+
+4. **顺序主子式 vs 所有主子式**：Sylvester 准则中只需检验"顺序"主子式（$1\times 1,2\times 2,\ldots,n\times n$ 左上角子矩阵）的行列式，不需要检验所有 $2^n$ 个子矩阵。但半正定需要"所有"主子式 $\geq 0$（更复杂）。
+
+5. **Rayleigh 商的范围**：$\lambda_{\min}\leq R_A(\mathbf{x})\leq\lambda_{\max}$ 只对实对称矩阵成立（特征值全实才有此不等式）。对一般矩阵，Rayleigh 商可能取复数，意义不同。
+
+---
+
+## 典型应用例题
+
+### 例 1：完整正交对角化
+
+> **题目**：$A=\begin{pmatrix}4 & -2 \\ -2 & 1\end{pmatrix}$，写出 $A=Q\Lambda Q^T$。
+
+【解】$\operatorname{tr}=5$，$\det=4-4=0$，特征多项式 $\lambda^2-5\lambda=\lambda(\lambda-5)=0$，特征值 $\lambda_1=0,\lambda_2=5$。
+
+对 $\lambda_1=0$：$(A-0I)\mathbf{v}=A\mathbf{v}=0$，$4v_1-2v_2=0$，$v_2=2v_1$，取 $(1,2)^T$，归一化 $\mathbf{q}_1=\frac{1}{\sqrt{5}}(1,2)^T$。
+
+对 $\lambda_2=5$：$(A-5I)\mathbf{v}=0$，$-v_1-2v_2=0$，取 $(2,-1)^T$，归一化 $\mathbf{q}_2=\frac{1}{\sqrt{5}}(2,-1)^T$。
+
+**验证正交**：$\mathbf{q}_1\cdot\mathbf{q}_2=\frac{1}{5}(2-2)=0$。✓
+
+$$Q=\frac{1}{\sqrt{5}}\begin{pmatrix}1&2\\2&-1\end{pmatrix},\quad\Lambda=\begin{pmatrix}0&0\\0&5\end{pmatrix}$$
+
+谱分解验证：$A=0\cdot\mathbf{q}_1\mathbf{q}_1^T+5\cdot\mathbf{q}_2\mathbf{q}_2^T=\frac{5}{5}\begin{pmatrix}4&-2\\-2&1\end{pmatrix}=\begin{pmatrix}4&-2\\-2&1\end{pmatrix}$。✓
+
+【注】$\lambda_1=0$ 说明 $A$ 奇异（秩 1 矩阵），$\lambda_2=5$ 是唯一非零特征值，谱分解仅有一项非零。
+
+### 例 2：正定判断 + 顺序主子式
+
+> **题目**：判断 $A=\begin{pmatrix}2 & 1 & 0 \\ 1 & 3 & 1 \\ 0 & 1 & 2\end{pmatrix}$ 是否正定。
+
+【解】用 Sylvester 准则（顺序主子式）：
+
+$\Delta_1=2>0$
+
+$\Delta_2=\det\begin{pmatrix}2&1\\1&3\end{pmatrix}=6-1=5>0$
+
+$\Delta_3=\det(A)=2(6-1)-1(2-0)+0=10-2=8>0$
+
+三个顺序主子式均正，$A\succ 0$，**正定**。
+
+【备选验证】特征多项式（省略）计算特征值均为正亦可。
+
+### 例 3：Rayleigh 商 + PCA 联系
+
+> **题目**：$\Sigma=\begin{pmatrix}3&1\\1&3\end{pmatrix}$（协方差矩阵），求第一主成分方向及其方差解释率。
+
+【解】$\operatorname{tr}=6$，$\det=8$，$\lambda^2-6\lambda+8=(\lambda-2)(\lambda-4)=0$，$\lambda_1=2,\lambda_2=4$。
+
+对 $\lambda_2=4$（最大，第一主成分）：$(\Sigma-4I)\mathbf{v}=0$，$-v_1+v_2=0$，取 $\mathbf{v}_2=(1,1)^T$，归一化 $\mathbf{q}_2=\frac{1}{\sqrt{2}}(1,1)^T$。
+
+方差解释率 $=\frac{\lambda_2}{\lambda_1+\lambda_2}=\frac{4}{6}=66.7\%$。
+
+【语义】第一主成分沿 $(1,1)^T$ 方向（两个特征等权求和），捕获数据 $66.7\%$ 的总方差；第二主成分沿 $(1,-1)^T$ 方向（差分），捕获剩余 $33.3\%$。
+
+---
+
+## 自测题
+
+**自测 1**　$A=\begin{pmatrix}5&2\\2&2\end{pmatrix}$，写出谱定理分解 $A=Q\Lambda Q^T$，并用谱分解公式验证 $A^2$。
+
+> 提示：$\lambda_1=1,\lambda_2=6$；特征向量 $(1,-2)^T/\sqrt{5}$，$(2,1)^T/\sqrt{5}$；$A^2=Q\operatorname{diag}(1,36)Q^T$，验算 $A^2=\begin{pmatrix}29&14\\14&8\end{pmatrix}$。
+
+**自测 2**　判断 $B=\begin{pmatrix}1&2&0\\2&8&0\\0&0&5\end{pmatrix}$ 是否正定。若是，写出理由；若不是，找出使 $\mathbf{x}^TB\mathbf{x}\leq 0$ 的非零向量 $\mathbf{x}$。
+
+> 提示：$\Delta_1=1>0$，$\Delta_2=8-4=4>0$，$\Delta_3=\det B=5\times 4=20>0$；正定。所有顺序主子式均正。
+
+**自测 3**　对 Rayleigh 商 $R_A(\mathbf{x})$ 其中 $A=\begin{pmatrix}3&0\\0&7\end{pmatrix}$，计算 $R_A\begin{pmatrix}1\\0\end{pmatrix}$，$R_A\begin{pmatrix}0\\1\end{pmatrix}$，$R_A\begin{pmatrix}1\\1\end{pmatrix}$，并验证均在 $[\lambda_{\min},\lambda_{\max}]=[3,7]$ 之间。
+
+> 提示：$R_A(1,0)^T=3$，$R_A(0,1)^T=7$，$R_A(1,1)^T/\sqrt{2}=\frac{(1,1)\begin{pmatrix}3&0\\0&7\end{pmatrix}(1,1)^T}{2}=\frac{3+7}{2}=5$；均在 $[3,7]$ 中。
+
+**自测 4**　协方差矩阵 $\Sigma=\begin{pmatrix}4&2\\2&1\end{pmatrix}$（半正定）。(1) 求特征值；(2) 能否做 Cholesky 分解？(3) 第一主成分方向是什么？
+
+> 提示：$\det\Sigma=0$，特征值 $\lambda_1=0,\lambda_2=5$；有零特征值，$\Sigma$ 半正定（不正定），不能做 Cholesky；第一主成分沿 $\lambda_2=5$ 的特征向量 $(2,1)^T/\sqrt{5}$，方差解释率 $=100\%$（秩 1，所有方差在一维）。
+
+**自测 5**　Hessian $H=\begin{pmatrix}4&-2\\-2&4\end{pmatrix}$。(1) 判断临界点类型；(2) 求最优学习率 $\eta^*$ 和条件数 $\kappa$；(3) 理论上需要多少步梯度下降使误差缩小至初始的 $1\%$？
+
+> 提示：$\lambda_1=2,\lambda_2=6$，均正，正定，局部极小值；$\eta^*=2/(2+6)=1/4$；$\kappa=6/2=3$；$\rho^*=2/4=0.5$；$0.5^N=0.01\Rightarrow N=\lceil\log_{0.5}0.01\rceil=\lceil 6.64\rceil=7$ 步。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 实对称矩阵 $\Rightarrow$ 特征值全实 + 不同特征值对应特征向量正交 + 可正交对角化 $A=Q\Lambda Q^T$。
+> 正定：$\lambda_i>0$ / 主子式全正 / Cholesky 存在；Rayleigh 商 $\in[\lambda_{\min},\lambda_{\max}]$。
+> Hessian 正定 $\Rightarrow$ 极小值；条件数 $\kappa$ 大 $\Rightarrow$ 收敛慢。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 |
+| 学习目标 + 21.1–21.5 严格正文 | 原版 | 完整推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 抽象成方法 + 方法变形 | 融合版（后置） | 套路固化 |
+| 本章小结（补充） | 融合版 | 情形对照 |
+| 思考路标 + 易错点 | 融合版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 融合版 | 演练精讲 |
+| 深度学习应用（Hessian）+ PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 自测题 5 题 | 融合版 | 额外验收 |
 
 ---
 

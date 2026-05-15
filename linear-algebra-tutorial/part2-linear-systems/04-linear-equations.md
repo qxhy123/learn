@@ -1,6 +1,41 @@
-# 第4章：线性方程组
+# 第4章：线性方程组（融合版）
 
-> 线性方程组是线性代数的核心问题——几乎所有重要理论都可以追溯到"方程组是否有解"这一根本追问。
+> **难度**：★★☆☆☆
+> **前置知识**：第1–3章（向量、矩阵、行列式基础）
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **矩阵方程**：$A\mathbf{x}=\mathbf{b}$，$A$ 是 $m\times n$ 系数矩阵；增广矩阵 $[A\mid\mathbf{b}]$ 是判断有解的核心工具。
+> **三种结果**：$\text{rank}(A)<\text{rank}([A\mid\mathbf{b}])$ → 无解；$=\text{rank}([A\mid\mathbf{b}])=n$ → 唯一解；$=\text{rank}([A\mid\mathbf{b}])<n$ → 无穷多解（自由变量 $n-\text{rank}(A)$ 个）。
+> **齐次 vs 非齐次**：$A\mathbf{x}=\mathbf{0}$ 必有零解；非齐次通解 = 特解 + 齐次通解。
+> **零空间**：$\ker(A)=\{\mathbf{x}:A\mathbf{x}=\mathbf{0}\}$ 是向量空间，维数 = $n-\text{rank}(A)$。
+> **AI 关联**：神经网络层 $\mathbf{y}=W\mathbf{x}+\mathbf{b}$ 是线性方程组；过参数化模型（$m<n$）对应欠定系统，梯度下降隐式选极小范数解。
+
+---
+
+## 引入：一道"几个解"的反直觉题
+
+> **题目**：下面两个方程组，哪个有唯一解，哪个有无穷多解，哪个无解？
+>
+> (A) $\begin{cases}x+y=3\\2x+2y=6\end{cases}$ &nbsp;&nbsp; (B) $\begin{cases}x+y=3\\2x+2y=7\end{cases}$ &nbsp;&nbsp; (C) $\begin{cases}x+y=3\\x-y=1\end{cases}$
+
+直觉上，两个方程解两个未知数应当有唯一解——但实际上三种情形都可能出现，而且线性方程组**永远不可能恰好有两个解**（这是线性结构的根本性质）。下面把解题者的内心独白完整还原。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "看到方程组，第一步写增广矩阵，通过行变换看矛盾行。
+>
+> **方程组 (A)**：增广矩阵 $\left(\begin{array}{cc\vert c}1&1&3\\2&2&6\end{array}\right)$，$R_2\leftarrow R_2-2R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&3\\0&0&0\end{array}\right)$。第二行全零——不是矛盾，只有 1 个独立方程，2 个未知量，自由变量 1 个 → **无穷多解**：$x=3-t,y=t$。
+>
+> **方程组 (B)**：同样操作得 $\left(\begin{array}{cc\vert c}1&1&3\\0&0&1\end{array}\right)$。第二行 $0=1$，矛盾 → **无解**。
+>
+> **方程组 (C)**：$\left(\begin{array}{cc\vert c}1&1&3\\1&-1&1\end{array}\right)$，$R_2\leftarrow R_2-R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&3\\0&-2&-2\end{array}\right)$，有两个主元，$n=\text{rank}=2$ → **唯一解** $y=1,x=2$。
+>
+> **关键认知**：三个方程组左边系数矩阵 (A)(B) 完全相同，只因常数项不同就从无穷多解变成无解——判断有解无解要看**增广矩阵的秩**，不能只看系数矩阵。
+>
+> **为何不能有恰好两个解**：若 $\mathbf{x}_1,\mathbf{x}_2$ 都是 $A\mathbf{x}=\mathbf{b}$ 的解，则 $A(\mathbf{x}_1-\mathbf{x}_2)=\mathbf{0}$，即 $\mathbf{x}_1-\mathbf{x}_2\in\ker(A)$。若 $\ker(A)$ 非零，它是向量空间，包含无穷多方向 → 解也无穷多；若 $\ker(A)=\{\mathbf{0}\}$ → 唯一解。两个结果之间没有中间状态。"
 
 ---
 
@@ -561,3 +596,181 @@ $$\mathbf{w} = (X^T X)^{-1} X^T \mathbf{y} = X^{-1}(X^T)^{-1} X^T \mathbf{y} = X
 退化为原方程组的精确解，与直接求解 $X\mathbf{w} = \mathbf{y}$ 等价。
 
 </details>
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 / 条件 | 说明 |
+|---|---|---|
+| **矩阵方程** | $A\mathbf{x}=\mathbf{b}$ | $A$ 为 $m\times n$，$\mathbf{x}\in\mathbb{R}^n$，$\mathbf{b}\in\mathbb{R}^m$ |
+| **增广矩阵** | $[A\mid\mathbf{b}]$，大小 $m\times(n+1)$ | 列分隔符为竖线，右边是常数列 |
+| **无解** | $\text{rank}(A)<\text{rank}([A\mid\mathbf{b}])$ | 出现 $[0\cdots 0\mid c]$，$c\ne 0$ |
+| **唯一解** | $\text{rank}(A)=\text{rank}([A\mid\mathbf{b}])=n$ | 主元数 = 未知量数，无自由变量 |
+| **无穷多解** | $\text{rank}(A)=\text{rank}([A\mid\mathbf{b}])<n$ | 自由变量 $n-\text{rank}(A)$ 个 |
+| **齐次方程组** | $A\mathbf{x}=\mathbf{0}$ 必有零解 | $\ker(A)$ 是向量空间 |
+| **通解结构** | $\mathbf{x}=\mathbf{x}_p+\mathbf{x}_h$ | 特解 + 齐次通解 |
+| **列视角** | $x_1\mathbf{a}_1+\cdots+x_n\mathbf{a}_n=\mathbf{b}$ | 求 $\mathbf{b}$ 能否被列线性表出 |
+
+### 判断解的类型：标准 3 步
+
+1. **写增广矩阵** $[A\mid\mathbf{b}]$
+2. **行变换化阶梯形**，数主元数 $r$
+3. **比较** $r$、$\text{rank}([A\mid\mathbf{b}])$、$n$：
+   - 出现 $0=c$（$c\ne 0$）→ 无解
+   - $r=n$ → 唯一解
+   - $r<n$ → 无穷多解，自由变量 $n-r$ 个
+
+---
+
+## 方法变形
+
+### 变形 1：齐次方程组求通解
+
+令自由变量依次为 $1,0,\ldots$ 或 $0,1,\ldots$，读出基础解系，通解 = 其线性组合。
+
+### 变形 2：非齐次方程组求通解
+
+先找一个特解（令自由变量 = 0，回代），再叠加齐次通解。
+
+### 变形 3：含参数的方程组
+
+对参数分情况讨论：参数使某主元为 0 时需单独处理，判断是无解还是自由变量增多。
+
+### 变形 4：列视角判断 $\mathbf{b}$ 是否在列空间内
+
+$A\mathbf{x}=\mathbf{b}$ 有解 $\Leftrightarrow$ $\mathbf{b}$ 在 $A$ 的列空间 $\text{Col}(A)$ 内 $\Leftrightarrow$ $\text{rank}(A)=\text{rank}([A\mid\mathbf{b}])$。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"线性方程组" → 立刻写 $A\mathbf{x}=\mathbf{b}$ + 增广矩阵 $[A\mid\mathbf{b}]$
+2. 看到"有解条件" → $\text{rank}(A)=\text{rank}([A\mid\mathbf{b}])$
+3. 看到增广矩阵出现 $[0\;\cdots\;0\mid c]$（$c\ne 0$）→ **无解**，停止
+4. 看到"唯一解" → 主元数 $=n$，无自由变量
+5. 看到"无穷多解" → 主元数 $<n$，需参数化自由变量
+6. 看到"齐次方程组" → 必有零解；非平凡解要求 $\text{rank}(A)<n$
+7. 看到"解空间 / 零空间" → $\ker(A)$ 是向量空间，维数 $=n-\text{rank}(A)$
+8. 看到"非齐次通解" → 特解 + 齐次通解，不能只写特解
+9. 看到"线性方程组解的个数" → 只有 0、1、$\infty$ 三种，不存在有限多个
+10. 看到 $m<n$（方程数 < 未知量数）→ 要么无解，要么无穷多解，**不可能唯一解**
+
+---
+
+## 易错点
+
+1. **把 $m<n$ 误解为"一定有无穷多解"**：方程数少于未知量数时，要么无解（出现矛盾行），要么无穷多解。不检查矛盾行直接下结论是错的。
+
+2. **忘记自由变量的存在**：主元列对应基本变量，非主元列对应自由变量。不把自由变量设为参数就直接回代会漏掉无穷多解。
+
+3. **非齐次通解只写特解**：$A\mathbf{x}=\mathbf{b}$ 有无穷多解时，完整通解是特解 + 齐次通解，光写一个特解不完整。
+
+4. **秩只看系数矩阵**：判断有解必须比较 $\text{rank}(A)$ 与 $\text{rank}([A\mid\mathbf{b}])$，只看 $A$ 的秩不够。
+
+5. **列视角与行视角混淆**：行视角每行对应一个方程（约束）；列视角 $A\mathbf{x}=x_1\mathbf{a}_1+\cdots+x_n\mathbf{a}_n$ 是列的线性组合。两种视角都有用，但不要用错场合。
+
+---
+
+## 典型应用例题
+
+### 例 1：判断解的类型 + 求通解
+
+> **题目**：讨论方程组解的情况，并在有解时求通解：
+> $$\begin{cases}x_1+2x_2-x_3=1\\2x_1+4x_2-2x_3=2\\x_1+2x_2+x_3=3\end{cases}$$
+
+【思路】写增广矩阵，行变换，观察主元数与矛盾行。
+
+【解】增广矩阵：
+$$\left(\begin{array}{ccc\vert c}1&2&-1&1\\2&4&-2&2\\1&2&1&3\end{array}\right)\xrightarrow{R_2-2R_1,R_3-R_1}\left(\begin{array}{ccc\vert c}1&2&-1&1\\0&0&0&0\\0&0&2&2\end{array}\right)\xrightarrow{R_2\leftrightarrow R_3}\left(\begin{array}{ccc\vert c}1&2&-1&1\\0&0&2&2\\0&0&0&0\end{array}\right)$$
+
+主元列：第1、3列；$x_2$ 是自由变量。$\text{rank}(A)=2=\text{rank}([A\mid\mathbf{b}])<3=n$ → **无穷多解**。
+
+回代：$x_3=1$，$x_1=1+x_3-2x_2=2-2x_2$。令 $x_2=t$：
+
+$$\mathbf{x}=\begin{pmatrix}2\\0\\1\end{pmatrix}+t\begin{pmatrix}-2\\1\\0\end{pmatrix},\quad t\in\mathbb{R}$$
+
+【答案】$\boxed{\mathbf{x}=(2,0,1)^T+t(-2,1,0)^T}$，特解 $+$ 齐次通解。
+
+### 例 2：含参数方程组的讨论
+
+> **题目**：$\begin{cases}x+y=1\\x+\lambda y=\lambda^2\end{cases}$，讨论 $\lambda$ 取何值时无解、唯一解、无穷多解。
+
+【思路】对增广矩阵行变换，分情况讨论使主元为零的 $\lambda$。
+
+【解】$R_2-R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&1\\0&\lambda-1&\lambda^2-1\end{array}\right)$。注意 $\lambda^2-1=(\lambda-1)(\lambda+1)$。
+
+- $\lambda\ne 1$：$x_2=\dfrac{(\lambda-1)(\lambda+1)}{\lambda-1}=\lambda+1$，$x_1=1-(\lambda+1)=-\lambda$。**唯一解** $(x_1,x_2)=(-\lambda,\lambda+1)$。
+- $\lambda=1$：$\left(\begin{array}{cc\vert c}1&1&1\\0&0&0\end{array}\right)$，**无穷多解** $x_1=1-t,x_2=t$。
+
+【答案】$\lambda\ne 1$ 唯一解；$\lambda=1$ 无穷多解；无参数值导致无解（因常数列 $\lambda^2-1=0$ 时 $\lambda=\pm 1$，$\lambda=1$ 已处理，$\lambda=-1$ 时 $\lambda-1=-2\ne 0$ 仍唯一解）。
+
+### 例 3：零空间基础解系
+
+> **题目**：求矩阵 $A=\begin{pmatrix}1&2&-1&0\\2&4&0&2\end{pmatrix}$ 的零空间基础解系。
+
+【思路】$A\mathbf{x}=\mathbf{0}$ → 对 $A$ 行变换，找自由变量，设参数。
+
+【解】$R_2-2R_1$：$\begin{pmatrix}1&2&-1&0\\0&0&2&2\end{pmatrix}$，$\frac{1}{2}R_2$：$\begin{pmatrix}1&2&-1&0\\0&0&1&1\end{pmatrix}$，$R_1+R_2$：$\begin{pmatrix}1&2&0&1\\0&0&1&1\end{pmatrix}$。
+
+主元列 1、3；自由变量 $x_2=s,x_4=t$。则 $x_3=-t$，$x_1=-2s-t$。
+
+$$\mathbf{x}=s\begin{pmatrix}-2\\1\\0\\0\end{pmatrix}+t\begin{pmatrix}-1\\0\\-1\\1\end{pmatrix}$$
+
+【答案】基础解系为 $\left\{(-2,1,0,0)^T,(-1,0,-1,1)^T\right\}$，零空间维数 = 2。
+
+---
+
+## 自测题
+
+**自测 1**　方程组 $\begin{cases}2x-y=3\\4x-2y=k\end{cases}$。$k$ 取何值时有无穷多解？$k$ 取何值时无解？
+
+> 💡 提示：$R_2-2R_1$ 得 $[0\mid k-6]$。$k=6$ 无穷多解；$k\ne 6$ 无解。注意两方程系数成比例，永远不会有唯一解。
+
+**自测 2**　$A=\begin{pmatrix}1&0&2\\0&1&-1\\2&1&3\end{pmatrix}$，判断 $A\mathbf{x}=\mathbf{0}$ 是否只有零解。
+
+> 💡 提示：$R_3-2R_1-R_2$ 得第三行全零，$\text{rank}(A)=2<3=n$ → 有非平凡解（零空间维数 1）。
+
+**自测 3**　设 $A\mathbf{x}_1=\mathbf{b},A\mathbf{x}_2=\mathbf{b}$，证明 $\mathbf{x}_1-\mathbf{x}_2\in\ker(A)$，并说明为何解集呈"仿射子空间"结构。
+
+> 💡 提示：$A(\mathbf{x}_1-\mathbf{x}_2)=A\mathbf{x}_1-A\mathbf{x}_2=\mathbf{b}-\mathbf{b}=\mathbf{0}$。所有解 = 特解 + 零空间（线性子空间），整体是仿射子空间（过特解的平移）。
+
+**自测 4**　神经网络中某层 $W\in\mathbb{R}^{3\times 5}$，$\mathbf{y}=W\mathbf{x}$ 给定 $\mathbf{y}\in\mathbb{R}^3$，方程 $W\mathbf{x}=\mathbf{y}$ 最多有几种解的情况？$\ker(W)$ 的维数至少是多少？
+
+> 💡 提示：$m=3<n=5$，方程组欠定。若相容（有解）则有无穷多解（自由变量 $\geq 2$）；若不相容则无解。$\ker(W)$ 维数 $= 5-\text{rank}(W)\geq 5-3=2$。
+
+**自测 5**　$A$ 是 $4\times 3$ 矩阵，$\text{rank}(A)=3$。对任意 $\mathbf{b}\in\mathbb{R}^4$，$A\mathbf{x}=\mathbf{b}$ 一定有唯一解吗？
+
+> 💡 提示：$\text{rank}(A)=3=n$，若有解则唯一（无自由变量）。但 $m=4>3$，不保证对所有 $\mathbf{b}$ 有解——当 $\mathbf{b}$ 不在列空间内时无解。**结论：有解则唯一，但不一定对所有 $\mathbf{b}$ 有解**。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> $A\mathbf{x}=\mathbf{b}$，增广矩阵 $[A\mid\mathbf{b}]$ 是钥匙。
+> 秩对比：小 → 无解；等且满 → 唯一；等且不满 → 无穷多。
+> 齐次必有零解；非齐次通解 = 特解 + 齐次通解。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格定义 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 4.1–4.4 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

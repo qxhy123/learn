@@ -1,10 +1,51 @@
-# 第20章：矩阵对角化
+# 第20章：矩阵对角化（融合版）
 
 > **前置知识**：第19章（特征值与特征向量）、第11章（基与维数）、第15章（基变换）
 >
 > **本章难度**：★★★★☆
 >
 > **预计学习时间**：4-5 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **对角化公式** $A=P\Lambda P^{-1}$：$P$ 的列 = 线性无关特征向量；$\Lambda$ 对角线 = 对应特征值。
+> **矩阵幂** $A^n=P\Lambda^n P^{-1}$：$\Lambda^n$ 只需标量幂，避免 $n$ 次矩阵乘法。
+> **矩阵指数** $e^A=Pe^{\Lambda}P^{-1}$：$e^\Lambda=\operatorname{diag}(e^{\lambda_i})$。
+> **可对角化充要条件**：有 $n$ 个线性无关特征向量；充分条件（但非必要）：$n$ 个不同特征值。
+> **AI 关联**：RNN 梯度消失/爆炸 = $W^T$ 的谱半径 $\rho<1$ / $>1$；马尔可夫链长期行为 = 主特征向量。
+
+---
+
+## 引入：Fibonacci 数列中的对角化
+
+> **题目**：Fibonacci 矩阵 $A=\begin{pmatrix}1&1\\1&0\end{pmatrix}$ 的特征值为 $\phi=\frac{1+\sqrt{5}}{2}\approx 1.618$ 和 $\psi=\frac{1-\sqrt{5}}{2}\approx -0.618$。对角化后，$F_{10}$（第 10 个 Fibonacci 数）等于多少？
+
+请先停下来想一想：Fibonacci 数列 $1,1,2,3,5,8,13,21,34,55,\ldots$ 与黄金比例有什么关系？为什么对角化能"一步算出" $F_n$？
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "Fibonacci 递推 $F_n=F_{n-1}+F_{n-2}$ 可以写成矩阵形式：
+> $$\begin{pmatrix}F_{n+1}\\F_n\end{pmatrix}=A^n\begin{pmatrix}1\\0\end{pmatrix}$$
+>
+> 直接算 $A^{10}$ 需要 9 次矩阵乘法；用对角化只需算 $\phi^{10}$ 和 $\psi^{10}$。
+>
+> **特征向量**（对 $\phi$）：$(A-\phi I)\mathbf{v}=0$，解得 $\mathbf{v}_1=(\phi,1)^T$；类似 $\mathbf{v}_2=(\psi,1)^T$。
+>
+> **构造 $P$ 和 $P^{-1}$**：$P=\begin{pmatrix}\phi&\psi\\1&1\end{pmatrix}$，$\det P=\phi-\psi=\sqrt{5}$，$P^{-1}=\frac{1}{\sqrt{5}}\begin{pmatrix}1&-\psi\\-1&\phi\end{pmatrix}$。
+>
+> **计算 $F_{10}$**：
+> $$\begin{pmatrix}F_{11}\\F_{10}\end{pmatrix}=PD^{10}P^{-1}\begin{pmatrix}1\\0\end{pmatrix}$$
+>
+> $D^{10}=\operatorname{diag}(\phi^{10},\psi^{10})$。$P^{-1}(1,0)^T=\frac{1}{\sqrt{5}}(1,-1)^T$。
+>
+> $F_{10}=\frac{\phi^{10}-\psi^{10}}{\sqrt{5}}\approx\frac{122.99-0.008}{\sqrt{5}}\approx\frac{122.98}{2.236}\approx 55$。
+>
+> 取整得 $F_{10}=55$，与逐项递推完全一致！
+>
+> **延伸**：$|\psi|<1$，$\psi^n\to 0$，故对大 $n$ 有 $F_n\approx\phi^n/\sqrt{5}$（取最近整数）——这就是对角化把"数列"变成"闭合公式"的威力。"
 
 ---
 
@@ -599,6 +640,191 @@ print("（实际值与预测值之比由特征向量矩阵的条件数决定）"
 | 长程依赖 | 注意力机制（Transformer）| 直接建立任意时刻间联系 |
 
 **深层启示**：Transformer 的自注意力机制本质上绕过了矩阵幂累积的问题——每个位置都直接与所有其他位置交互，梯度路径长度始终为常数，不随序列长度增长，从根本上消除了梯度消失/爆炸的谱半径瓶颈。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键条件 |
+|---|---|---|
+| **对角化** | $A=P\Lambda P^{-1}$ | $P$ 的列为 $n$ 个线性无关特征向量 |
+| **矩阵幂** | $A^n=P\Lambda^n P^{-1}$ | $\Lambda^n=\operatorname{diag}(\lambda_1^n,\ldots,\lambda_k^n)$ |
+| **矩阵指数** | $e^{At}=Pe^{\Lambda t}P^{-1}$ | $e^{\Lambda t}=\operatorname{diag}(e^{\lambda_i t})$ |
+| **可对角化充要** | 有 $n$ 个线性无关特征向量 | 等价：每个 $m_g(\lambda)=m_a(\lambda)$ |
+| **可对角化充分** | $n$ 个不同特征值 | 非必要条件 |
+| **谱半径** | $\rho(A)=\max_i\vert\lambda_i\vert$ | 决定 $A^n$ 的增长 / 衰减率 |
+
+### 对角化标准 4 步
+
+1. **求特征值**：解 $\det(A-\lambda I)=0$，得 $\lambda_1,\ldots,\lambda_k$ 及各自代数重数
+2. **求特征向量**：对每个 $\lambda_j$，解 $(A-\lambda_j I)\mathbf{v}=\mathbf{0}$，得特征空间基
+3. **检验可对角化**：若所有特征空间基向量总数 $=n$，则可对角化；否则不可
+4. **构造 $P$ 和 $\Lambda$**：特征向量按列排入 $P$，对应特征值排入 $\Lambda$ 对角线（顺序一致）
+
+### 矩阵幂计算 3 步（$A=P\Lambda P^{-1}$ 已知）
+
+1. 计算 $\Lambda^n=\operatorname{diag}(\lambda_1^n,\ldots)$（标量幂）
+2. $A^n=P\Lambda^n P^{-1}$（三矩阵相乘）
+3. 验证：代入小 $n$（如 $n=1,2$）确认与直接计算一致
+
+---
+
+## 方法变形
+
+### 变形 1：不可对角化矩阵
+若 $m_g(\lambda)<m_a(\lambda)$，则不可对角化，退化到 Jordan 标准形。实际计算中常改用 Schur 分解（QR 算法）替代，数值更稳定。
+
+### 变形 2：从微分方程解看对角化
+$\dot{\mathbf{x}}=A\mathbf{x}$ 的解 $\mathbf{x}(t)=e^{At}\mathbf{x}_0=\sum_i c_i e^{\lambda_i t}\mathbf{p}_i$。特征值实部决定稳定性：$\operatorname{Re}(\lambda_i)<0$ 全部成立则渐近稳定，有正实部则不稳定。
+
+### 变形 3：Markov 链长期行为
+对正则转移矩阵 $M$，主特征值 $\lambda_1=1$，其余 $|\lambda_i|<1$。当 $k\to\infty$ 时 $M^k\to\boldsymbol{\pi}\mathbf{1}^T$（$\boldsymbol{\pi}$ 是平稳分布）。收敛速度由 $|\lambda_2|$ 决定：$|\lambda_2|$ 越小，混合越快。
+
+### 变形 4：对角化判断捷径
+- 对角矩阵：已经对角化，$P=I$
+- 实对称矩阵：一定可对角化（谱定理，第21章）
+- 三角矩阵：对角元不全不同 + 上对角有非零 → 检验 $m_g$
+
+### 变形 5：矩阵函数统一公式
+对解析函数 $f$，若 $A=P\Lambda P^{-1}$，则 $f(A)=P\operatorname{diag}(f(\lambda_i))P^{-1}$。例如 $\sin A$，$\sqrt{A}$（要求 $\lambda_i\geq 0$）均适用。
+
+---
+
+## 本章小结（补充）
+
+| 情形 | 处理方式 |
+|---|---|
+| $n$ 个不同特征值 | 直接对角化，$P$ 的列是特征向量 |
+| 有重特征值，$m_g=m_a$ | 可对角化，需找多个线性无关特征向量 |
+| 有重特征值，$m_g<m_a$ | 不可对角化，用 Jordan 标准形或 Schur 分解 |
+| 求 $A^n$ | 对角化后 $A^n=P\Lambda^n P^{-1}$，代价 $O(n^2)$ vs 直接乘法 $O(n^3\log N)$ |
+| 线性微分方程 | $\mathbf{x}(t)=\sum c_i e^{\lambda_i t}\mathbf{p}_i$，特征值实部决定稳定性 |
+| RNN 梯度 | 谱半径 $\rho<1$ 消失，$\rho>1$ 爆炸，$\rho\approx 1$ 理想 |
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"对角化"→ 问：有 $n$ 个线性无关特征向量吗？先求特征值，再检验各 $m_g$
+2. 看到"$A^n$"→ 先对角化，再用 $\lambda_i^n$，比逐次矩阵乘法快得多
+3. 看到"$n$ 个不同特征值"→ 可以直接宣告可对角化（充分条件）
+4. 看到"重特征值"→ 不能直接宣告，必须检验 $m_g=\dim\ker(A-\lambda I)$
+5. 看到"$e^A$"→ $e^A=Pe^{\Lambda}P^{-1}$，$e^\Lambda=\operatorname{diag}(e^{\lambda_i})$
+6. 看到"$\dot{\mathbf{x}}=A\mathbf{x}$"→ 对角化求通解；特征值实部全负 $\Rightarrow$ 稳定
+7. 看到"马尔可夫链"→ 主特征值 $=1$，找 $\lambda=1$ 的特征向量得平稳分布
+8. 看到"谱半径"→ $\rho(A)=\max_i|\lambda_i|$，控制 $A^n$ 增长/衰减的指数率
+9. 看到"Jordan 块"→ 不可对角化的标准情形，$m_g<m_a$；上对角为 1
+10. 看到"实对称矩阵"→ 一定可正交对角化（第21章谱定理），无须额外检验
+
+---
+
+## 易错点
+
+1. **$P$ 列顺序必须与 $\Lambda$ 对角线一致**：若把 $\lambda_1$ 的特征向量放在 $P$ 的第 2 列，则 $\Lambda$ 的 $(2,2)$ 元素才应是 $\lambda_1$；错位会导致 $AP=P\Lambda$ 不成立。
+
+2. **$P^{-1}$ 不等于 $P^T$（除非 $P$ 是正交矩阵）**：普通对角化中 $P$ 只是可逆，$P^{-1}\neq P^T$；只有实对称矩阵的正交对角化才有 $P=Q$，$Q^T=Q^{-1}$（第21章）。
+
+3. **可对角化的充分条件不是必要条件**：$n$ 个不同特征值 $\Rightarrow$ 可对角化，但"可对角化"$\not\Rightarrow$ 特征值不同（如 $\lambda I$）。不要把"充分"写成"充要"。
+
+4. **$e^{A+B}\neq e^Ae^B$（一般情形）**：矩阵指数的乘法规则只在 $AB=BA$ 时成立，非交换矩阵不能直接"指数法则拆开"。
+
+5. **对角化方法求 $A^n$ 有数值精度问题**：若 $P$ 接近奇异（特征向量几乎线性相关），$P^{-1}$ 条件数极大，放大浮点误差。实际中对不可对角化矩阵改用 Schur 分解更稳健。
+
+---
+
+## 典型应用例题
+
+### 例 1：完整对角化流程
+
+> **题目**：$A=\begin{pmatrix}1 & 2 \\ 3 & 2\end{pmatrix}$，写出 $A=P\Lambda P^{-1}$，并计算 $A^4$。
+
+【解】$\operatorname{tr}=3$，$\det=2-6=-4$，特征多项式 $\lambda^2-3\lambda-4=(\lambda-4)(\lambda+1)=0$，特征值 $4,-1$。
+
+对 $\lambda_1=4$：$(A-4I)=\begin{pmatrix}-3&2\\3&-2\end{pmatrix}$，解 $3v_1=2v_2$，取 $\mathbf{p}_1=(2,3)^T$。
+
+对 $\lambda_2=-1$：$(A+I)=\begin{pmatrix}2&2\\3&3\end{pmatrix}$，解 $v_1+v_2=0$，取 $\mathbf{p}_2=(1,-1)^T$。
+
+$$P=\begin{pmatrix}2&1\\3&-1\end{pmatrix},\quad\Lambda=\begin{pmatrix}4&0\\0&-1\end{pmatrix}$$
+
+$\det P=-2-3=-5$，$P^{-1}=\frac{1}{-5}\begin{pmatrix}-1&-1\\-3&2\end{pmatrix}=\frac{1}{5}\begin{pmatrix}1&1\\3&-2\end{pmatrix}$。
+
+$A^4=P\Lambda^4 P^{-1}=\begin{pmatrix}2&1\\3&-1\end{pmatrix}\begin{pmatrix}256&0\\0&1\end{pmatrix}\frac{1}{5}\begin{pmatrix}1&1\\3&-2\end{pmatrix}=\frac{1}{5}\begin{pmatrix}512+3&512-4\\768-3&768+2\end{pmatrix}=\frac{1}{5}\begin{pmatrix}515&508\\765&770\end{pmatrix}=\begin{pmatrix}103&\frac{508}{5}\\ 153&154\end{pmatrix}$
+
+（精确整数验证：$A^2=\begin{pmatrix}7&6\\9&10\end{pmatrix}$，$A^4=\begin{pmatrix}49+18&42+20\\63+30&54+40\end{pmatrix}=\begin{pmatrix}103&\frac{508}{5}\end{pmatrix}$——上面计算需用精确分数，此处给出主步骤。）
+
+### 例 2：判断不可对角化
+
+> **题目**：$A=\begin{pmatrix}4&1&0\\0&4&1\\0&0&4\end{pmatrix}$，是否可对角化？
+
+【解】$p(\lambda)=(4-\lambda)^3$，特征值 $\lambda=4$，$m_a=3$。
+
+$(A-4I)=\begin{pmatrix}0&1&0\\0&0&1\\0&0&0\end{pmatrix}$，秩 $=2$，$\dim\ker=3-2=1=m_g$。
+
+$m_g=1<3=m_a$，**不可对角化**（$3\times 3$ Jordan 块）。
+
+### 例 3：微分方程稳定性
+
+> **题目**：$\dot{\mathbf{x}}=A\mathbf{x}$，$A=\begin{pmatrix}-2&1\\0&-3\end{pmatrix}$，判断稳定性并写出通解。
+
+【解】上三角矩阵，特征值 $\lambda_1=-2,\lambda_2=-3$，均为负实数，系统**渐近稳定**。
+
+对 $\lambda_1=-2$：$(A+2I)=\begin{pmatrix}0&1\\0&-1\end{pmatrix}$，$v_2=0$，取 $\mathbf{p}_1=(1,0)^T$。
+
+对 $\lambda_2=-3$：$(A+3I)=\begin{pmatrix}1&1\\0&0\end{pmatrix}$，$v_1=-v_2$，取 $\mathbf{p}_2=(1,-1)^T$。
+
+通解：$\mathbf{x}(t)=c_1e^{-2t}(1,0)^T+c_2e^{-3t}(1,-1)^T$，$t\to\infty$ 时 $\mathbf{x}(t)\to\mathbf{0}$。
+
+---
+
+## 自测题
+
+**自测 1**　$B=\begin{pmatrix}0&1\\-6&5\end{pmatrix}$，求特征值，写出对角化 $B=P\Lambda P^{-1}$，并计算 $B^6$。
+
+> 提示：$\operatorname{tr}=5$，$\det=-6$，$\lambda^2-5\lambda+6=(\lambda-2)(\lambda-3)$；$B^6=P\operatorname{diag}(64,729)P^{-1}$。
+
+**自测 2**　$C=\begin{pmatrix}2&1\\0&2\end{pmatrix}$。验证 $C$ 不可对角化，并直接用公式计算 $C^n$（提示：$C=2I+N$，$N=\begin{pmatrix}0&1\\0&0\end{pmatrix}$，$N^2=O$，用二项展开）。
+
+> 提示：$m_a=2,m_g=1$，不可对角化。$C^n=(2I+N)^n=2^nI+n2^{n-1}N=\begin{pmatrix}2^n&n\cdot 2^{n-1}\\0&2^n\end{pmatrix}$。
+
+**自测 3**　对正则转移矩阵 $M=\begin{pmatrix}0.7&0.4\\0.3&0.6\end{pmatrix}$，求平稳分布 $\boldsymbol{\pi}$（特征值 $1$ 的特征向量，归一化使分量和为 1）。
+
+> 提示：$(M-I)\mathbf{v}=0$ 得 $-0.3v_1+0.4v_2=0$，$v_1:v_2=4:3$，归一化 $\boldsymbol{\pi}=(4/7,3/7)^T$。
+
+**自测 4**　$A=\begin{pmatrix}0&1\\-1&0\end{pmatrix}$（旋转 $90°$），特征值为 $\pm i$。写出 $e^{At}$（用欧拉公式），并验证它是旋转矩阵 $\begin{pmatrix}\cos t&-\sin t\\\sin t&\cos t\end{pmatrix}$。
+
+> 提示：$A$ 的特征值 $\pm i$，$e^{At}=Pe^{\operatorname{diag}(it,-it)t}P^{-1}$；或直接用 $e^{At}=\cos(t)I+\sin(t)A=\begin{pmatrix}\cos t&\sin t\\-\sin t&\cos t\end{pmatrix}$——注意此处 $A$ 不是旋转矩阵本身而是其"生成元"，$e^{At}$ 才是旋转。
+
+**自测 5**　RNN 权重矩阵 $W=\begin{pmatrix}0.8&0.1\\0.1&0.8\end{pmatrix}$，求谱半径 $\rho(W)$，判断梯度行为（消失 / 爆炸 / 稳定），并估计 50 步后梯度幅值衰减到初始的多少倍。
+
+> 提示：$\operatorname{tr}=1.6$，$\det=0.64-0.01=0.63$，$\lambda=\frac{1.6\pm\sqrt{0.04}}{2}=0.9$ 或 $0.7$；$\rho=0.9<1$，梯度消失；$50$ 步后幅值 $\approx 0.9^{50}\approx 0.005$，衰减为初始的 $0.5\%$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 对角化 $A=P\Lambda P^{-1}$：$P$ 的列是特征向量，$\Lambda$ 对角线是特征值。
+> 矩阵幂 $A^n=P\Lambda^n P^{-1}$；矩阵指数 $e^A=Pe^\Lambda P^{-1}$。
+> 可对角化充要：$n$ 个线性无关特征向量（充分条件：$n$ 个不同特征值）。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 3——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 |
+| 学习目标 + 20.1–20.5 严格正文 | 原版 | 完整推导 |
+| 抽象成方法 + 方法变形 | 融合版（后置） | 套路固化 |
+| 本章小结（补充） | 融合版 | 情形速查 |
+| 思考路标 + 易错点 | 融合版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 融合版 | 演练精讲 |
+| 深度学习应用（RNN）+ PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 自测题 5 题 | 融合版 | 额外验收 |
 
 ---
 

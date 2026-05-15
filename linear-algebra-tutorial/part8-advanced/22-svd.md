@@ -1,10 +1,44 @@
-# 第22章：奇异值分解
+# 第22章：奇异值分解（融合版）
 
 > **前置知识**：第17章（正交化与QR分解）、第19章（特征值与特征向量）、第20章（对角化）、第21章（对称矩阵与谱定理）
 >
 > **本章难度**：★★★★★
 >
 > **预计学习时间**：6-8 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **SVD 分解**：任意 $A \in \mathbb{R}^{m\times n}$ 均可写为 $A = U\Sigma V^T$；$U$（左奇异向量，输出空间旋转）、$\Sigma$（奇异值对角，缩放）、$V$（右奇异向量，输入空间旋转）；奇异值 $\sigma_i = \sqrt{\lambda_i(A^TA)} \geq 0$ 降序排列。
+> **计算三步**：① 求 $A^TA$ 的特征值 $\lambda_i$ → 奇异值 $\sigma_i = \sqrt{\lambda_i}$；② $A^TA$ 的特征向量组成 $V$；③ $\mathbf{u}_i = A\mathbf{v}_i/\sigma_i$ 得 $U$。
+> **秩与近似**：$\text{rank}(A) =$ 正奇异值个数；截断 SVD $A_k = \sum_{i=1}^k \sigma_i \mathbf{u}_i\mathbf{v}_i^T$ 是最优秩-$k$ 近似（Eckart-Young）。
+> **AI 关联**：PCA = 数据矩阵 SVD；推荐系统 = 矩阵分解；LoRA = 低秩更新 $\Delta W = BA$；模型压缩 = 截断 SVD 剪枝。
+
+---
+
+## 引入：图像压缩与"信息量"
+
+> **题目**：一张灰度图像存为矩阵 $A \in \mathbb{R}^{100 \times 100}$（10000 个像素值）。我们用截断 SVD $A_k = \sum_{i=1}^k \sigma_i \mathbf{u}_i\mathbf{v}_i^T$ 来压缩存储。问：保留 $k=5$ 个奇异值时，存储量是原来的几分之一？图像质量由什么决定？
+
+请先停下来想一想：原矩阵有 $100 \times 100 = 10000$ 个数。截断 SVD 只需存 $k$ 个奇异值、$k$ 个左奇异向量（各 100 维）、$k$ 个右奇异向量（各 100 维），共 $k(1 + 100 + 100) = 201k$ 个数。$k=5$ 时只需 $1005$ 个数，是原来的约 $\mathbf{10\%}$。图像质量取决于被丢弃的奇异值有多小——奇异值越小，对应分量携带的"信息量"越少，舍弃损失越微。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目要求存储量比较，先数原矩阵和压缩后各有多少参数。
+>
+> **原矩阵**：$100 \times 100 = 10000$ 个实数。
+>
+> **截断 SVD $k=5$**：需要 $\mathbf{u}_1,\ldots,\mathbf{u}_5$（各 100 维），$\mathbf{v}_1,\ldots,\mathbf{v}_5$（各 100 维），$\sigma_1,\ldots,\sigma_5$（5 个标量）。
+>
+> 总参数：$5 \times 100 + 5 \times 100 + 5 = 1005$ 个。
+>
+> 压缩比：$1005/10000 \approx 10.05\%$——只需原来的十分之一！
+>
+> **图像质量**：用 Frobenius 范数衡量误差：$\|A - A_k\|_F^2 = \sum_{i=k+1}^r \sigma_i^2$。如果 $\sigma_6, \ldots, \sigma_r$ 很小（"能量"集中在前几个奇异值），截断误差就小，压缩后视觉效果良好。这正是 Eckart-Young 定理的含义：截断 SVD 是秩-$k$ 矩阵中 Frobenius 范数误差最小的近似。
+>
+> **延伸思考**：如果将 $k$ 增加到 $50$，参数量变为 $50 \times 201 = 10050 > 10000$，这时 SVD 反而没有"压缩效果"——说明秩-$k$ 近似只在 $k \ll \min(m,n)$ 时有价值，即矩阵具有**低秩结构**时才适用。"
 
 ---
 
@@ -1088,3 +1122,213 @@ LoRA：$96 \times 4 \times 2 \times 4096 \times 8 \approx 25.2\text{ M}$
 节省量 $\approx 6.44\text{ B} - 25.2\text{ M} \approx 6.41\text{ B}$，约节省 **99.6\%** 的参数——这正是 LoRA 使得在消费级 GPU 上微调超大模型成为可能的原因。
 
 </details>
+
+---
+
+## 抽象成方法（套路总结）
+
+### SVD 核心公式速查
+
+| 名称 | 公式 | 说明 |
+|---|---|---|
+| **完整 SVD** | $A = U\Sigma V^T$ | $U \in \mathbb{R}^{m\times m}$，$\Sigma \in \mathbb{R}^{m\times n}$，$V \in \mathbb{R}^{n\times n}$ |
+| **紧 SVD** | $A = U_r \Sigma_r V_r^T$ | 只保留 $r = \text{rank}(A)$ 个非零奇异值 |
+| **截断 SVD** | $A_k = \sum_{i=1}^k \sigma_i \mathbf{u}_i \mathbf{v}_i^T$ | 最优秩-$k$ 近似，误差 $\|A - A_k\|_F^2 = \sum_{i>k}\sigma_i^2$ |
+| **奇异值计算** | $\sigma_i = \sqrt{\lambda_i(A^TA)}$ | $A^TA$ 的特征值开根号 |
+| **左奇异向量** | $\mathbf{u}_i = A\mathbf{v}_i / \sigma_i$ | 由右奇异向量导出 |
+| **伪逆** | $A^+ = V\Sigma^+ U^T$ | $\Sigma^+$ 将非零 $\sigma_i$ 取倒数 |
+| **最小二乘解** | $\hat{\mathbf{x}} = A^+\mathbf{b}$ | 最小范数最小二乘解 |
+
+### 计算 SVD 的标准 4 步
+
+1. **计算 $A^TA$**（$n\times n$ 对称半正定矩阵）
+2. **求 $A^TA$ 的特征值**（降序排列）→ 奇异值 $\sigma_i = \sqrt{\lambda_i}$，确定 $r = \text{rank}(A)$
+3. **求 $A^TA$ 的标准正交特征向量**，按特征值降序排列得 $V = [\mathbf{v}_1 | \cdots | \mathbf{v}_n]$
+4. **计算 $\mathbf{u}_i = A\mathbf{v}_i/\sigma_i$**（$i = 1,\ldots,r$），扩充为 $\mathbb{R}^m$ 的正交基得 $U$
+
+### 快速判断秩与奇异值个数
+
+正奇异值个数 = $\text{rank}(A)$ = $\text{rank}(A^TA)$ = $\text{rank}(AA^T)$。零奇异值对应零空间方向，不含有效信息。
+
+---
+
+## 方法变形
+
+### 变形 1：从 $AA^T$ 出发（$m < n$ 时更高效）
+
+当 $m < n$ 时，$AA^T \in \mathbb{R}^{m\times m}$ 比 $A^TA \in \mathbb{R}^{n\times n}$ 更小。先对 $AA^T$ 特征分解得 $U$，再用 $\mathbf{v}_i = A^T\mathbf{u}_i/\sigma_i$ 得 $V$。两种路径等价，选更小的矩阵操作。
+
+### 变形 2：矩阵范数与奇异值
+
+- Frobenius 范数：$\|A\|_F = \sqrt{\sum_{i,j} a_{ij}^2} = \sqrt{\sum_i \sigma_i^2}$（奇异值的 $\ell_2$ 范数）
+- 谱范数（算子范数）：$\|A\|_2 = \sigma_1$（最大奇异值）
+- 核范数（nuclear norm）：$\|A\|_* = \sum_i \sigma_i$（奇异值之和，低秩正则化常用）
+
+### 变形 3：伪逆与方程组
+
+超定方程组（$m > n$，$A$ 列满秩）的最小二乘解：$\hat{\mathbf{x}} = (A^TA)^{-1}A^T\mathbf{b} = A^+\mathbf{b}$。
+
+欠定方程组（$m < n$，$A$ 行满秩）的最小范数解：$\hat{\mathbf{x}} = A^T(AA^T)^{-1}\mathbf{b} = A^+\mathbf{b}$。
+
+两种情形均统一为 $\hat{\mathbf{x}} = A^+\mathbf{b} = V\Sigma^+U^T\mathbf{b}$。
+
+### 变形 4：条件数与数值稳定性
+
+矩阵的条件数（对线性方程组）为 $\kappa(A) = \sigma_1/\sigma_r$（最大与最小正奇异值之比）。$\kappa$ 越大，系统越"病态"，数值误差放大越严重。工程中常用截断 SVD 或 Tikhonov 正则化处理病态系统。
+
+---
+
+## 本章小结
+
+| 概念 | 关键内容 |
+|---|---|
+| **SVD 定理** | $A = U\Sigma V^T$，$U,V$ 正交，$\Sigma$ 广义对角 |
+| **奇异值来源** | $\sigma_i = \sqrt{\lambda_i(A^TA)}$，$A^TA$ 的特征值开根号 |
+| **几何含义** | 旋转 $V^T$ → 缩放 $\Sigma$ → 旋转 $U$：任意线性变换分解为三步 |
+| **外积展开** | $A = \sum_{i=1}^r \sigma_i \mathbf{u}_i\mathbf{v}_i^T$，秩-1 分量的加权叠加 |
+| **秩与零空间** | $\text{rank}(A) =$ 正奇异值个数；$\ker(A) = $ $V$ 后 $n-r$ 列的张成 |
+| **最优近似** | Eckart-Young：$A_k$ 是最优秩-$k$ 近似，误差 $= \sum_{i>k}\sigma_i^2$ |
+| **伪逆** | $A^+ = V\Sigma^+U^T$，最小范数最小二乘解 $\hat{\mathbf{x}} = A^+\mathbf{b}$ |
+| **AI 应用** | PCA、推荐系统矩阵分解、LoRA、模型压缩 |
+
+**核心要点**：SVD 是谱定理从方阵到任意矩阵的终极推广；奇异值量化了矩阵各个"方向分量"的强度；截断 SVD 用最少信息（最大奇异值分量）最准确地重构矩阵。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"任意矩阵分解" → 想 SVD $A = U\Sigma V^T$（不必是方阵或对称阵）
+2. 看到"求奇异值" → 三步：$A^TA$ → 特征值 $\lambda_i$ → $\sigma_i = \sqrt{\lambda_i}$
+3. 看到"矩阵的秩" → 正奇异值的个数；零奇异值数 $= n - r$
+4. 看到"最优低秩近似" → 截断 SVD，误差是被舍弃奇异值的平方和
+5. 看到"矩阵谱范数" → $\|A\|_2 = \sigma_1$（最大奇异值）
+6. 看到"Frobenius 范数" → $\|A\|_F = \sqrt{\sum \sigma_i^2}$（奇异值的 $\ell_2$ 范数）
+7. 看到"超定 / 欠定方程组" → 伪逆 $A^+ = V\Sigma^+U^T$，最小范数最小二乘
+8. 看到"PCA" → 数据矩阵的 SVD；右奇异向量 = 主成分方向
+9. 看到"LoRA" → 低秩更新 $\Delta W = BA$，$B \in \mathbb{R}^{d\times r}$，$A \in \mathbb{R}^{r\times d}$，$r \ll d$
+10. 看到"数值病态" → 条件数 $\kappa = \sigma_1/\sigma_r$ 大，考虑截断或正则化
+
+---
+
+## 易错点
+
+1. **$U$ 和 $V$ 的维度混淆**：$U \in \mathbb{R}^{m\times m}$（左，$m$ 维输出空间），$V \in \mathbb{R}^{n\times n}$（右，$n$ 维输入空间）。$\Sigma \in \mathbb{R}^{m\times n}$ 与 $A$ 同形。不要把 $U$ 和 $V$ 的行列数搞反。
+
+2. **奇异值不是特征值**：$\sigma_i = \sqrt{\lambda_i(A^TA)} \geq 0$ 恒为非负；特征值可以为负、复数；两者只在 $A$ 是实对称正定矩阵时相等（此时 $\sigma_i = \lambda_i$）。
+
+3. **$A^TA$ 的特征值与 $AA^T$ 的特征值**：两者的非零特征值**完全相同**，只是多出的零特征值数量不同（由 $m, n$ 的大小决定）。因此计算奇异值时选较小的矩阵操作。
+
+4. **截断 SVD 的误差公式**：$\|A - A_k\|_F^2 = \sigma_{k+1}^2 + \cdots + \sigma_r^2$（不是 $\sigma_{k+1}$，要平方和）。谱范数误差则是 $\|A - A_k\|_2 = \sigma_{k+1}$（最大被丢弃奇异值）。
+
+5. **伪逆 $A^+$ 与 $(A^TA)^{-1}A^T$ 的区别**：只有当 $A$ 列满秩（$\text{rank}(A) = n$）时，$(A^TA)^{-1}$ 存在且 $(A^TA)^{-1}A^T = A^+$；若 $A$ 列不满秩，$(A^TA)$ 奇异，必须用 $A^+ = V\Sigma^+U^T$。
+
+---
+
+## 典型应用例题
+
+### 例 1：计算完整 SVD
+
+> **题目**：$A = \begin{pmatrix}2 & 0 \\ 0 & 3 \\ 0 & 0\end{pmatrix} \in \mathbb{R}^{3\times 2}$。求其 SVD。
+
+【思路】对角型矩阵，$A^TA$ 已经是对角的。
+
+【解】
+$A^TA = \begin{pmatrix}4 & 0 \\ 0 & 9\end{pmatrix}$，特征值 $\lambda_1 = 9, \lambda_2 = 4$（降序）。
+
+奇异值：$\sigma_1 = 3, \sigma_2 = 2$。
+
+右奇异向量：$\mathbf{v}_1 = (0,1)^T, \mathbf{v}_2 = (1,0)^T$（对应特征向量，注意降序）。
+
+左奇异向量：$\mathbf{u}_1 = A\mathbf{v}_1/3 = (0,1,0)^T$，$\mathbf{u}_2 = A\mathbf{v}_2/2 = (1,0,0)^T$，扩充 $\mathbf{u}_3 = (0,0,1)^T$。
+
+$$A = \begin{pmatrix}0&1&0\\1&0&0\\0&0&1\end{pmatrix}\begin{pmatrix}3&0\\0&2\\0&0\end{pmatrix}\begin{pmatrix}0&1\\1&0\end{pmatrix}$$
+
+【答案】$U = [\mathbf{e}_2 \vert \mathbf{e}_1 \vert \mathbf{e}_3]$，$\Sigma = \text{diag}(3,2,0)$（$3\times 2$），$V^T = \begin{pmatrix}0&1\\1&0\end{pmatrix}$。
+
+【注】注意奇异值降序排列决定了 $V$ 列的顺序，$\mathbf{v}_1$ 对应 $\sigma_1 = 3$，所以取 $(0,1)^T$ 而非 $(1,0)^T$。
+
+### 例 2：截断 SVD 与压缩误差
+
+> **题目**：矩阵 $A$ 的奇异值为 $\sigma = (10, 5, 1, 0.1)$。(1) 保留 $k=2$ 个奇异值时，Frobenius 范数近似误差是多少？(2) 此时保留了总"能量"的百分之几？
+
+【思路】误差 = 丢弃奇异值的平方和；总能量 = 所有奇异值的平方和。
+
+【解】
+(1) $\|A - A_2\|_F^2 = 1^2 + 0.1^2 = 1.01$，$\|A - A_2\|_F = \sqrt{1.01} \approx 1.005$。
+
+(2) 总能量：$\|A\|_F^2 = 100 + 25 + 1 + 0.01 = 126.01$。
+
+保留的能量：$100 + 25 = 125$，占比 $125/126.01 \approx 99.2\%$。
+
+【答案】近似误差约 $1.005$，保留了约 $\boxed{99.2\%}$ 的能量。
+
+【注】奇异值 $10, 5$ 远大于 $1, 0.1$，能量集中在前两个分量——这是矩阵具有低秩结构的典型信号，截断 SVD 非常有效。
+
+### 例 3：伪逆求最小二乘解
+
+> **题目**：$A = \begin{pmatrix}1&1\\1&-1\\0&1\end{pmatrix}$，$\mathbf{b} = \begin{pmatrix}2\\0\\1\end{pmatrix}$。方程组 $A\mathbf{x} = \mathbf{b}$ 无精确解，求最小二乘解 $\hat{\mathbf{x}} = A^+\mathbf{b}$。
+
+【思路】超定方程组（$3\times 2$），用正规方程 $(A^TA)\hat{\mathbf{x}} = A^T\mathbf{b}$（等价于伪逆）。
+
+【解】
+$A^TA = \begin{pmatrix}1+1+0 & 1-1+0 \\ 1-1+0 & 1+1+1\end{pmatrix} = \begin{pmatrix}2&0\\0&3\end{pmatrix}$
+
+$A^T\mathbf{b} = \begin{pmatrix}1\cdot2+1\cdot0+0\cdot1 \\ 1\cdot2+(-1)\cdot0+1\cdot1\end{pmatrix} = \begin{pmatrix}2\\3\end{pmatrix}$
+
+$(A^TA)\hat{\mathbf{x}} = A^T\mathbf{b}$：$\hat{x}_1 = 2/2 = 1$，$\hat{x}_2 = 3/3 = 1$。
+
+【答案】$\boxed{\hat{\mathbf{x}} = (1, 1)^T}$，残差 $A\hat{\mathbf{x}} - \mathbf{b} = (2-2, 0-0, 1-1)^T = \mathbf{0}$——此例恰好有精确解（$A^TA$ 可逆且 $\mathbf{b} \in \text{col}(A)$）。
+
+---
+
+## 自测题
+
+**自测 1**　设 $A = \begin{pmatrix}3 & 4\end{pmatrix} \in \mathbb{R}^{1\times 2}$（行向量）。求 $A$ 的奇异值和 SVD。
+
+> 提示：$A^TA = \begin{pmatrix}9&12\\12&16\end{pmatrix}$，$\text{rank} = 1$，唯一正特征值 $\lambda_1 = 25$，$\sigma_1 = 5$。$\mathbf{v}_1 = (3/5, 4/5)^T$，$\mathbf{u}_1 = A\mathbf{v}_1/5 = (3/5\cdot 3/5 + 4/5\cdot 4/5) = (1) \in \mathbb{R}^1$（即标量 $1$）。SVD：$A = (1)\begin{pmatrix}5 & 0\end{pmatrix}\begin{pmatrix}3/5&4/5\\-4/5&3/5\end{pmatrix}^T$，只有 $\sigma_1 = 5$。
+
+**自测 2**　若 $A \in \mathbb{R}^{m\times n}$ 是正交矩阵（$m = n$ 且 $A^TA = I$），其奇异值是什么？
+
+> 提示：$A^TA = I$，特征值全为 $1$，故所有奇异值 $\sigma_i = 1$。$\Sigma = I$，SVD 为 $A = U \cdot I \cdot V^T$（即 $U = A, V = I$，或其他正交分解形式）。**正交矩阵的所有奇异值均为 $1$**，这反映了正交变换不改变向量长度。
+
+**自测 3**　Eckart-Young 定理说明 $A_k$ 是最优秩-$k$ 近似。若 $A$ 的奇异值为 $(5, 3, 1)$，用秩-$1$ 近似 $A_1$ 的 Frobenius 误差是多少？用秩-$2$ 近似 $A_2$ 呢？
+
+> 提示：$\|A - A_1\|_F^2 = \sigma_2^2 + \sigma_3^2 = 9+1=10$，$\|A-A_1\|_F = \sqrt{10}$。$\|A-A_2\|_F^2 = \sigma_3^2 = 1$，$\|A-A_2\|_F = 1$。可见多保留一个奇异值（从 $\sigma_2=3$ 降到 $\sigma_3=1$），误差显著降低。
+
+**自测 4**　LoRA 中，更新矩阵 $\Delta W = BA$（$B \in \mathbb{R}^{d\times r}$，$A \in \mathbb{R}^{r\times d}$，$r=4$，$d=1024$）。若 $B, A$ 各有一个随机奇异值 $\sigma_B = 2, \sigma_A = 3$，$\Delta W$ 的最大奇异值大约是多少？参数量是原始 $d\times d$ 矩阵的几分之一？
+
+> 提示：$\Delta W = BA$ 的奇异值估计：最大 $\sigma_1(\Delta W) \leq \sigma_1(B)\sigma_1(A) = 2\times 3 = 6$（子乘法不等式）。参数量 $2 \times 4 \times 1024 = 8192$ vs 原始 $1024^2 = 1048576$，比例约 $0.78\%$。
+
+**自测 5**　矩阵 $A = \begin{pmatrix}2&0\\0&0\end{pmatrix}$。写出其伪逆 $A^+$，并用 $A^+$ 求方程 $A\mathbf{x} = \begin{pmatrix}4\\1\end{pmatrix}$ 的最小范数最小二乘解。
+
+> 提示：$A$ 秩为 1，$\Sigma = \begin{pmatrix}2&0\\0&0\end{pmatrix}$，$\Sigma^+ = \begin{pmatrix}1/2&0\\0&0\end{pmatrix}$，$U = V = I$，$A^+ = \begin{pmatrix}1/2&0\\0&0\end{pmatrix}$。最小二乘解 $\hat{\mathbf{x}} = A^+\mathbf{b} = (2, 0)^T$。验证：$A\hat{\mathbf{x}} = (4,0)^T \neq (4,1)^T$，存在残差 $(0,1)^T$，但 $\hat{\mathbf{x}}$ 使残差范数最小且是所有最小二乘解中范数最小的。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> SVD $A = U\Sigma V^T$：$U$ 左旋转，$\Sigma$ 缩放，$V^T$ 右旋转。
+> 奇异值 $\sigma_i = \sqrt{\lambda_i(A^TA)} \geq 0$，正奇异值个数 = 秩。
+> 截断 SVD 最优低秩近似；伪逆 $A^+ = V\Sigma^+U^T$ 解最小二乘。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 3 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 22.1–22.6 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 融合 | 公式速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

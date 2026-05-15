@@ -668,3 +668,219 @@ $B = D = 0$，显然 $B \sim D$。
 特征值不同，$A+B$ 与 $C+D$ 不相似。这说明**相似性对矩阵加法不具有"分配性"**：$A \sim C$ 且 $B \sim D$ 不能推出 $A+B \sim C+D$。$\square$
 
 </details>
+
+---
+
+## 一例速记
+
+> **过渡矩阵**：$P_{\mathcal{C}\leftarrow\mathcal{B}}=C^{-1}B$（第 $j$ 列是 $b_j$ 在基 $\mathcal{C}$ 下的坐标）。坐标变换：$[x]_\mathcal{C}=P\cdot[x]_\mathcal{B}$。
+> **构造方法**：对增广矩阵 $[C\vert B]$ 做行化简 $\to[I\vert P]$，右侧得 $P=C^{-1}B$。
+> **相似矩阵**：$A'=P^{-1}AP$，描述同一线性变换在不同基下的矩阵。$P$ 的列是新基向量。
+> **相似不变量**：$\det$，$\text{tr}$，特征多项式，特征值，$\text{rank}$——这些量刻画变换本质，换基不变。
+> **AI 关联**：PCA 用特征向量为基，将协方差矩阵对角化；特征空间 $=$ "最自然"的坐标系；Batch Normalization $\approx$ 对角过渡矩阵 $D^{-1}$。
+
+---
+
+## 引入：一道"同一个变换，不同的矩阵"题
+
+> **题目**：$T:\mathbb{R}^2\to\mathbb{R}^2$，在标准基下矩阵 $A=\begin{pmatrix}3&1\\1&3\end{pmatrix}$。若改用基 $\mathcal{B}=\{(1,1)^T,(1,-1)^T\}$，$T$ 在 $\mathcal{B}$ 下的矩阵是什么？
+
+请先停下来想一想：**同一个变换，换了坐标系后矩阵会变。但什么量会保持不变？** 特征值、迹、行列式都不变——这正是"相似不变量"的意义。下面用相似变换计算新矩阵。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "换基 = 相似变换：$A'=P^{-1}AP$，其中 $P$ 的列是新基向量（在旧坐标下的表示）。
+>
+> **第一步：写 $P$**。$\mathcal{B}=\{b_1=(1,1)^T,b_2=(1,-1)^T\}$，故 $P=\begin{pmatrix}1&1\\1&-1\end{pmatrix}$。
+>
+> **第二步：求 $P^{-1}$**。$\det P=-1-1=-2$，故 $P^{-1}=\frac{1}{-2}\begin{pmatrix}-1&-1\\-1&1\end{pmatrix}=\begin{pmatrix}1/2&1/2\\1/2&-1/2\end{pmatrix}$。
+>
+> **第三步：计算 $AP$**。$AP=\begin{pmatrix}3&1\\1&3\end{pmatrix}\begin{pmatrix}1&1\\1&-1\end{pmatrix}=\begin{pmatrix}4&2\\4&-2\end{pmatrix}$。
+>
+> **第四步：计算 $P^{-1}(AP)$**。$A'=\begin{pmatrix}1/2&1/2\\1/2&-1/2\end{pmatrix}\begin{pmatrix}4&2\\4&-2\end{pmatrix}=\begin{pmatrix}4&0\\0&2\end{pmatrix}$。
+>
+> **结论**：$A'=\begin{pmatrix}4&0\\0&2\end{pmatrix}$ 是对角矩阵！这说明 $(1,1)^T$ 和 $(1,-1)^T$ 正是 $A$ 的特征向量，对应特征值 $4$ 和 $2$。
+>
+> **验证相似不变量**：$\text{tr}(A)=6=\text{tr}(A')=6$ ✓；$\det(A)=9-1=8=\det(A')=8$ ✓；特征值均为 $4,2$ ✓。"
+
+---
+
+## 抽象成方法（套路总结）
+
+### 坐标变换标准步骤
+
+| 情形 | 方法 | 公式 |
+|---|---|---|
+| **已知 $[x]_\mathcal{B}$，求 $[x]_\mathcal{C}$** | 左乘过渡矩阵 | $[x]_\mathcal{C}=P_{\mathcal{C}\leftarrow\mathcal{B}}\cdot[x]_\mathcal{B}$ |
+| **已知 $x$（标准坐标），求 $[x]_\mathcal{B}$** | 解方程 $B\mathbf{c}=x$ | $[x]_\mathcal{B}=B^{-1}x$（$B$ 为 $\mathcal{B}$ 基矩阵）|
+| **求过渡矩阵 $P$** | 行化简增广矩阵 | $[C\vert B]\xrightarrow{\text{行化简}}[I\vert P]$ |
+
+### 相似矩阵 4 步计算
+
+1. **写 $P$**：$P$ 的列是新基向量（在旧基坐标下的表示）
+2. **求 $P^{-1}$**：用行化简或伴随矩阵法
+3. **算 $AP$**：矩阵乘法
+4. **算 $P^{-1}(AP)$**：得 $A'=P^{-1}AP$
+
+### 相似不变量速查
+
+| 不变量 | 公式 | 计算用途 |
+|---|---|---|
+| **行列式** | $\det A$ | 判断可逆、体积缩放 |
+| **迹** | $\text{tr}A=\sum a_{ii}$ | 特征值之和 |
+| **特征值** | 解 $\det(\lambda I-A)=0$ | 对角化、谱分析 |
+| **秩** | $\text{rank}(A)$ | 维数、信息量 |
+
+---
+
+## 方法变形
+
+### 变形 1：从标准基到非标准基（常考类型）
+
+$\mathcal{B}$ 为目标基，$\mathcal{E}$ 为标准基。则 $P_{\mathcal{B}\leftarrow\mathcal{E}}=B^{-1}$（$B$ 为 $\mathcal{B}$ 的基矩阵），$[x]_\mathcal{B}=B^{-1}x$。构造时只需对 $[B\vert I]$ 行化简得 $[I\vert B^{-1}]$。
+
+### 变形 2：对角化是特殊的相似变换
+
+当 $P$ 的列是 $A$ 的**特征向量**时，$P^{-1}AP=\Lambda=\text{diag}(\lambda_1,\ldots,\lambda_n)$（对角矩阵）。这是"最好的基"——变换在此坐标系下只有拉伸，没有混合。
+
+### 变形 3：利用相似不变量"排除法"
+
+若 $\text{tr}(A)\neq\text{tr}(B)$ 或 $\det(A)\neq\det(B)$，则 $A$ 与 $B$ **一定不相似**，无需求变换矩阵。反之，不变量相同只是相似的必要条件，不充分。
+
+### 变形 4：过渡矩阵的乘积性
+
+若有三组基 $\mathcal{A},\mathcal{B},\mathcal{C}$，则 $P_{\mathcal{A}\leftarrow\mathcal{C}}=P_{\mathcal{A}\leftarrow\mathcal{B}}\cdot P_{\mathcal{B}\leftarrow\mathcal{C}}$（过渡矩阵可以"串联"）。逆方向：$P_{\mathcal{B}\leftarrow\mathcal{A}}=(P_{\mathcal{A}\leftarrow\mathcal{B}})^{-1}$。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"坐标变换" → $[x]_\mathcal{C}=P\cdot[x]_\mathcal{B}$，$P=C^{-1}B$；增广矩阵行化简求 $P$
+2. 看到"在基 $\mathcal{B}$ 下的坐标" → 解方程 $B\mathbf{c}=x$（$B$ 为基矩阵）
+3. 看到"相似矩阵 $A'=P^{-1}AP$" → 同一变换换基；$P$ 的列是新基向量
+4. 看到"判断是否相似" → 先查相似不变量：$\text{tr}$，$\det$，特征多项式
+5. 看到"相似不变量" → 行列式、迹、特征值、秩不变；矩阵元素本身不是不变量
+6. 看到"对角化" → $P^{-1}AP=\Lambda$，$P$ 的列是特征向量，$\Lambda$ 的对角是特征值
+7. 看到"$n$ 个线性无关特征向量" → 可对角化
+8. 看到"$A^k$" → 先对角化 $A=P\Lambda P^{-1}$，则 $A^k=P\Lambda^k P^{-1}$（高效计算）
+9. 看到"PCA" → 协方差矩阵的特征向量为基，对角化 = 找到数据方差最大的方向
+10. 看到"迹" → $\text{tr}(AB)=\text{tr}(BA)$（循环性），用于证明相似矩阵迹相同
+
+---
+
+## 易错点
+
+1. **过渡矩阵 $P$ 的方向**：$P_{\mathcal{C}\leftarrow\mathcal{B}}$ 表示从 $\mathcal{B}$ 到 $\mathcal{C}$ 的变换，下标箭头方向容易搞反。记忆口诀：**箭头指向新基，下标格式 "新←旧"**。
+
+2. **相似变换中 $P$ 的含义**：$A'=P^{-1}AP$ 中，$P$ 的**列**是新基向量（在旧坐标下），不是行。新基向量排列为列，这与坐标矩阵的构造方式一致。
+
+3. **相似的必要条件 $\neq$ 充分条件**：特征值相同的矩阵不一定相似，例如 $I$ 和 $\begin{pmatrix}1&1\\0&1\end{pmatrix}$ 特征值都是 $1$，但前者可对角化，后者不能，两者不相似。
+
+4. **对角化要求 $n$ 个线性无关特征向量**，不只是 $n$ 个特征值：特征值有重数时，还需检查每个特征值的几何重数（特征空间维数）是否等于代数重数；若几何重数 $<$ 代数重数，则不可对角化。
+
+5. **换基不改变变换的"实质"**：$A$ 和 $A'=P^{-1}AP$ 描述的是同一个线性变换，"谁更好"取决于目的——对角矩阵最便于计算 $A^k$、解微分方程；单位矩阵 $I$ 则对应恒等变换在任何基下的表示。
+
+---
+
+## 典型应用例题
+
+### 例 1：过渡矩阵的计算与应用
+
+> **题目**：$\mathbb{R}^3$ 中，旧基 $\mathcal{B}=\{(1,0,0)^T,(0,1,0)^T,(0,0,1)^T\}=\mathcal{E}$，新基 $\mathcal{C}=\{(1,1,0)^T,(0,1,1)^T,(1,0,1)^T\}$。向量 $x=(3,2,1)^T$ 在 $\mathcal{C}$ 下的坐标是什么？
+
+【思路】$[x]_\mathcal{C}=C^{-1}x$，用增广矩阵 $[C\vert x]$ 行化简直接解。
+
+【解】
+$$\left[\begin{array}{ccc|c}1&0&1&3\\1&1&0&2\\0&1&1&1\end{array}\right]\xrightarrow{R_2-R_1}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&1&1&1\end{array}\right]\xrightarrow{R_3-R_2}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&0&2&2\end{array}\right]$$
+$$\xrightarrow{R_3/2}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&0&1&1\end{array}\right]\xrightarrow{R_1-R_3,R_2+R_3}\left[\begin{array}{ccc|c}1&0&0&2\\0&1&0&0\\0&0&1&1\end{array}\right]$$
+
+【答案】$\boxed{[x]_\mathcal{C}=(2,0,1)^T}$。验证：$2(1,1,0)^T+0(0,1,1)^T+1(1,0,1)^T=(3,2,1)^T$ ✓。
+
+### 例 2：验证相似不变量 + 排除相似
+
+> **题目**：判断 $A=\begin{pmatrix}2&1\\1&2\end{pmatrix}$ 与 $B=\begin{pmatrix}4&0\\0&1\end{pmatrix}$ 是否相似。
+
+【思路】先查相似不变量。
+
+【解】
+- $\text{tr}(A)=4$，$\text{tr}(B)=5$，$4\neq 5$。
+
+**迹不相等**，$A$ 与 $B$ **一定不相似**。
+
+【答案】$\boxed{A\not\sim B}$，因 $\text{tr}(A)=4\neq 5=\text{tr}(B)$（无需进一步计算）。
+
+【注】利用相似不变量"排除法"是最高效的做法，避免费力构造变换矩阵。
+
+### 例 3：对角化与矩阵幂
+
+> **题目**：$A=\begin{pmatrix}1&2\\2&1\end{pmatrix}$，求 $A^{10}$。
+
+【思路】对角化后用 $A^k=P\Lambda^k P^{-1}$。
+
+【解】特征多项式：$\det(\lambda I-A)=(\lambda-1)^2-4=(\lambda-3)(\lambda+1)$，特征值 $\lambda_1=3,\lambda_2=-1$。
+
+特征向量：$\lambda_1=3$ 对应 $(1,1)^T$；$\lambda_2=-1$ 对应 $(1,-1)^T$。
+
+$$P=\begin{pmatrix}1&1\\1&-1\end{pmatrix},\quad\Lambda=\begin{pmatrix}3&0\\0&-1\end{pmatrix},\quad P^{-1}=\frac{1}{2}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$$
+
+$$A^{10}=P\Lambda^{10}P^{-1}=\begin{pmatrix}1&1\\1&-1\end{pmatrix}\begin{pmatrix}3^{10}&0\\0&1\end{pmatrix}\frac{1}{2}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$$
+
+$$=\frac{1}{2}\begin{pmatrix}3^{10}+1&3^{10}-1\\3^{10}-1&3^{10}+1\end{pmatrix}=\begin{pmatrix}29525&29524\\29524&29525\end{pmatrix}$$
+
+【答案】$\boxed{A^{10}=\begin{pmatrix}29525&29524\\29524&29525\end{pmatrix}}$。
+
+---
+
+## 自测题
+
+**自测 1**　$\mathbb{R}^2$ 中，基 $\mathcal{B}=\{(2,1)^T,(1,3)^T\}$，$x=(5,7)^T$。求 $[x]_\mathcal{B}$（$x$ 在基 $\mathcal{B}$ 下的坐标）。
+
+> 提示：解 $\begin{pmatrix}2&1\\1&3\end{pmatrix}\mathbf{c}=\begin{pmatrix}5\\7\end{pmatrix}$，行化简得 $\mathbf{c}=(8/5,9/5)^T$。
+
+**自测 2**　$A=\begin{pmatrix}1&0\\0&-1\end{pmatrix}$，$B=\begin{pmatrix}-1&0\\0&1\end{pmatrix}$。判断 $A$ 与 $B$ 是否相似，给出理由。
+
+> 提示：$\text{tr}(A)=0=\text{tr}(B)$；$\det(A)=-1=\det(B)$；特征值均为 $\pm 1$。不变量全部相同，实际上 $B=P^{-1}AP$，其中 $P=\begin{pmatrix}0&1\\1&0\end{pmatrix}$（交换坐标轴），$A\sim B$。
+
+**自测 3**　$A=\begin{pmatrix}0&1\\-2&3\end{pmatrix}$。(1) 求特征值；(2) 是否可对角化？若可，写出 $P$。
+
+> 提示：特征多项式 $\lambda^2-3\lambda+2=(\lambda-1)(\lambda-2)$，特征值 $1,2$。两个不同特征值 $\Rightarrow$ 可对角化。特征向量：$\lambda=1$ 对应 $(1,1)^T$；$\lambda=2$ 对应 $(1,2)^T$；$P=\begin{pmatrix}1&1\\1&2\end{pmatrix}$。
+
+**自测 4**　利用对角化计算 $A=\begin{pmatrix}3&1\\0&2\end{pmatrix}$ 的 $A^5$（提示：上三角矩阵的特征值是对角元素 $3,2$）。
+
+> 提示：$\lambda_1=3$ 对应 $(1,0)^T$；$\lambda_2=2$ 对应 $(-1,1)^T$；$P=\begin{pmatrix}1&-1\\0&1\end{pmatrix}$，$P^{-1}=\begin{pmatrix}1&1\\0&1\end{pmatrix}$。$A^5=P\begin{pmatrix}243&0\\0&32\end{pmatrix}P^{-1}=\begin{pmatrix}243&211\\0&32\end{pmatrix}$。
+
+**自测 5**　PCA 中，数据协方差矩阵 $\Sigma=\begin{pmatrix}4&2\\2&1\end{pmatrix}$。(1) 特征值（主成分方差）是多少？(2) 特征向量对应什么几何意义？(3) 对角化后 $\Lambda$ 是什么？
+
+> 提示：$\text{tr}(\Sigma)=5$，$\det(\Sigma)=4-4=0$，特征值满足 $\lambda^2-5\lambda=0$，故 $\lambda_1=5,\lambda_2=0$。特征向量是数据方差最大（和为零）的方向。$\Lambda=\begin{pmatrix}5&0\\0&0\end{pmatrix}$，一个方向的方差为零，数据实际是一维的（降维）。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 过渡矩阵 $P=C^{-1}B$，第 $j$ 列是 $b_j$ 在 $\mathcal{C}$ 下的坐标；$[x]_\mathcal{C}=P[x]_\mathcal{B}$。
+> 相似 $A'=P^{-1}AP$：同一变换换基；行列式、迹、特征值不变。
+> 对角化 $=$ 选特征向量为基；$A^k=P\Lambda^k P^{-1}$，计算高效。
+
+如果不看笔记能完成例 1 + 例 3 + 自测 3——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格定义 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 15.1–15.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用（BN + 白化）+ 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
