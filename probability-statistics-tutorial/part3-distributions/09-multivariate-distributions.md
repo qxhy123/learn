@@ -927,11 +927,11 @@ KL 散度为零意味着 $q_\phi(\mathbf{z} \mid \mathbf{x}) = p(\mathbf{z}) = \
 
 ## 思考路标（条件反射）
 
-1. **联合分布** → 联合 PDF $f(\mathbf{x})$；边缘 $f_i(x_i)=\int\cdots\int f(\mathbf{x})\,d\mathbf{x}_{-i}$；条件 $f(\mathbf{x}_1\vert\mathbf{x}_2)=f(\mathbf{x})/f_2(\mathbf{x}_2)$
+1. **联合分布** → 联合 PDF $f(\mathbf{x})$；边缘 $f_i(x_i)=\int\cdots\int f(\mathbf{x})\,d\mathbf{x}_{-i}$；条件 $f(\mathbf{x}_1|\mathbf{x}_2)=f(\mathbf{x})/f_2(\mathbf{x}_2)$
 2. **多元正态 $\mathcal{N}(\boldsymbol\mu,\boldsymbol\Sigma)$** → 由均值向量和协方差矩阵完全确定；等值面为椭球
 3. **协方差矩阵 $\boldsymbol\Sigma$** → 必须对称半正定（$\mathbf{v}^\top\boldsymbol\Sigma\mathbf{v}\geq 0$）；特征值 $\geq 0$
 4. **多元正态的边缘** → 任意子集仍服从多元正态（维度降低）
-5. **多元正态的条件** → $\mathbf{X}_1\vert\mathbf{X}_2=\mathbf{x}_2\sim\mathcal{N}(\boldsymbol\mu_{1\vert 2},\boldsymbol\Sigma_{1\vert 2})$（仍是正态）
+5. **多元正态的条件** → $\mathbf{X}_1|\mathbf{X}_2=\mathbf{x}_2\sim\mathcal{N}(\boldsymbol\mu_{1| 2},\boldsymbol\Sigma_{1| 2})$（仍是正态）
 6. **仿射变换封闭** → $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol\mu+\mathbf{b},\mathbf{A}\boldsymbol\Sigma\mathbf{A}^\top)$
 7. **正态独立 iff $\rho=0$** → 多元正态中不相关等价于独立（一般分布中此结论不成立）
 8. **PCA 与协方差** → PCA 是协方差矩阵 $\boldsymbol\Sigma$ 的特征分解；PC1 方向 = 最大特征值的特征向量

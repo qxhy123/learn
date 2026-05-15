@@ -6,9 +6,9 @@
 
 > **一例速记**：
 > **马尔可夫不等式**：$X \geq 0$，$a > 0$ → $P(X \geq a) \leq \dfrac{\mathbb{E}[X]}{a}$。
-> **切比雪夫不等式**：$\varepsilon > 0$ → $P(\vert X - \mu\vert \geq \varepsilon) \leq \dfrac{\sigma^2}{\varepsilon^2}$（等价：$k$ 倍标准差 → $P \leq 1/k^2$）。
-> **弱大数定律（WLLN）**：i.i.d.，$\mathbb{E}[\vert X_1\vert] < \infty$ → $\bar{X}_n \xrightarrow{P} \mu$（依概率）。
-> **强大数定律（SLLN）**：i.i.d. → $\bar{X}_n \xrightarrow{a.s.} \mu$ **当且仅当** $\mathbb{E}[\vert X_1\vert] < \infty$（几乎处处）。
+> **切比雪夫不等式**：$\varepsilon > 0$ → $P(| X - \mu| \geq \varepsilon) \leq \dfrac{\sigma^2}{\varepsilon^2}$（等价：$k$ 倍标准差 → $P \leq 1/k^2$）。
+> **弱大数定律（WLLN）**：i.i.d.，$\mathbb{E}[| X_1|] < \infty$ → $\bar{X}_n \xrightarrow{P} \mu$（依概率）。
+> **强大数定律（SLLN）**：i.i.d. → $\bar{X}_n \xrightarrow{a.s.} \mu$ **当且仅当** $\mathbb{E}[| X_1|] < \infty$（几乎处处）。
 > **伯努利大数定律**：$m_n/n \xrightarrow{P} p$（频率依概率收敛到概率，$n\to\infty$）。
 
 ---
@@ -37,7 +37,7 @@
 
 ## 思维路径还原（如何用切比雪夫推导 WLLN）
 
-> "收到 WLLN 证明任务，我脑中第一个想法是：**需要证明 $P(\vert\bar{X}_n - \mu\vert \geq \varepsilon) \to 0$**。
+> "收到 WLLN 证明任务，我脑中第一个想法是：**需要证明 $P(|\bar{X}_n - \mu| \geq \varepsilon) \to 0$**。
 >
 > 看一眼左边，这是 $\bar{X}_n$ 偏离其均值 $\mu$ 的概率。**切比雪夫不等式**专门处理这类问题，只要给出方差就行。
 >
@@ -49,19 +49,19 @@
 >
 > **第二步：套切比雪夫不等式。**
 >
-> $P(\vert\bar{X}_n - \bar{\mu}_n\vert \geq \varepsilon) \leq \dfrac{\text{Var}(\bar{X}_n)}{\varepsilon^2} \leq \dfrac{C}{n\varepsilon^2}$。
+> $P(|\bar{X}_n - \bar{\mu}_n| \geq \varepsilon) \leq \dfrac{\text{Var}(\bar{X}_n)}{\varepsilon^2} \leq \dfrac{C}{n\varepsilon^2}$。
 >
 > **第三步：令 $n \to \infty$。**
 >
-> $\frac{C}{n\varepsilon^2} \to 0$。由夹逼定理，$P(\vert\bar{X}_n - \bar{\mu}_n\vert \geq \varepsilon) \to 0$，即依概率收敛。$\square$
+> $\frac{C}{n\varepsilon^2} \to 0$。由夹逼定理，$P(|\bar{X}_n - \bar{\mu}_n| \geq \varepsilon) \to 0$，即依概率收敛。$\square$
 >
 > 思路总结：WLLN 证明 = **算方差 → 切比雪夫 → $n \to \infty$**，三步走。
 >
 > **进阶：辛钦 WLLN 为什么不需要方差存在？**
 >
-> 因为改用了**特征函数**方法：$\varphi_{\bar{X}_n}(t) = [\varphi(t/n)]^n \to e^{i\mu t}$，后者是点质量 $\mu$ 的特征函数。由连续性定理得依概率收敛。整个证明不依赖方差，只需 $\mathbb{E}[\vert X_1\vert] < \infty$。
+> 因为改用了**特征函数**方法：$\varphi_{\bar{X}_n}(t) = [\varphi(t/n)]^n \to e^{i\mu t}$，后者是点质量 $\mu$ 的特征函数。由连续性定理得依概率收敛。整个证明不依赖方差，只需 $\mathbb{E}[| X_1|] < \infty$。
 >
-> **强/弱区别的直觉：** WLLN 说"固定任意 $\varepsilon$，$n$ 足够大后 $\vert\bar{X}_n - \mu\vert < \varepsilon$ 以高概率成立"——但允许偶尔越界。SLLN 更强，说"以概率 1，每一条样本轨道 $\bar{X}_n(\omega)$ 最终都永久进入 $\mu$ 的 $\varepsilon$ 邻域"——一次都不再越界。"
+> **强/弱区别的直觉：** WLLN 说"固定任意 $\varepsilon$，$n$ 足够大后 $|\bar{X}_n - \mu| < \varepsilon$ 以高概率成立"——但允许偶尔越界。SLLN 更强，说"以概率 1，每一条样本轨道 $\bar{X}_n(\omega)$ 最终都永久进入 $\mu$ 的 $\varepsilon$ 邻域"——一次都不再越界。"
 
 ---
 
@@ -448,7 +448,7 @@ $$
 
 ![切比雪夫不等式几何示意——钟形概率密度曲线、均值两侧 epsilon 带与尾部阴影面积](../figures/svg/prob-p4-10-1.svg)
 
-分布密度曲线以 $\mu$ 为中心，两侧各标出 $\varepsilon$ 边界；$\vert X - \mu\vert \geq \varepsilon$ 的尾部阴影面积即为 $P(\vert X - \mu\vert \geq \varepsilon)$，切比雪夫不等式给出其上界 $\sigma^2/\varepsilon^2$。
+分布密度曲线以 $\mu$ 为中心，两侧各标出 $\varepsilon$ 边界；$| X - \mu| \geq \varepsilon$ 的尾部阴影面积即为 $P(| X - \mu| \geq \varepsilon)$，切比雪夫不等式给出其上界 $\sigma^2/\varepsilon^2$。
 
 ### 图 10-2：硬币投掷频率收敛轨迹
 
@@ -480,7 +480,7 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 1. **识别目标**：确认需要证 $\bar{X}_n \xrightarrow{P} c$（某常数）或 $X_n \xrightarrow{P} X$。
 2. **计算方差**：若 $X_i$ 两两不相关，$\text{Var}(\bar{X}_n) = \frac{1}{n^2}\sum\sigma_i^2$；i.i.d. 时为 $\sigma^2/n$。
-3. **套切比雪夫**：$P(\vert\bar{X}_n - \mu\vert \geq \varepsilon) \leq \text{Var}(\bar{X}_n)/\varepsilon^2$。
+3. **套切比雪夫**：$P(|\bar{X}_n - \mu| \geq \varepsilon) \leq \text{Var}(\bar{X}_n)/\varepsilon^2$。
 4. **令 $n \to \infty$**：若右端 $\to 0$，收敛得证。若方差不存在，改用辛钦/特征函数方法。
 
 ---
@@ -498,7 +498,7 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 - **样本均值 $\bar{X}_n$**：直接套 WLLN/SLLN
 - **频率 $m_n/n$**：伯努利大数定律，$m_n/n \xrightarrow{P} p$
-- **任意函数的样本均值 $\frac{1}{n}\sum g(X_i)$**：令 $Y_i = g(X_i)$，若 $\mathbb{E}[\vert g(X_1)\vert] < \infty$，则 $\frac{1}{n}\sum g(X_i) \xrightarrow{a.s.} \mathbb{E}[g(X)]$（SLLN 对 i.i.d. 直接适用）
+- **任意函数的样本均值 $\frac{1}{n}\sum g(X_i)$**：令 $Y_i = g(X_i)$，若 $\mathbb{E}[| g(X_1)|] < \infty$，则 $\frac{1}{n}\sum g(X_i) \xrightarrow{a.s.} \mathbb{E}[g(X)]$（SLLN 对 i.i.d. 直接适用）
 - **经验分布函数**：Glivenko-Cantelli 定理，样本 CDF 一致收敛到总体 CDF
 
 ### 变形 3：弱大数定律的四种情形对比
@@ -567,7 +567,7 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 2. **弱收敛和强收敛的混用**：WLLN 成立不意味着 SLLN 成立。例如经典的 $X_n \xrightarrow{P} 0$ 但 $X_n \not\xrightarrow{a.s.} 0$ 的反例（在 $[0,1]$ 上滑动的指示函数）说明二者有本质差别，不可互换使用。
 
-3. **有限方差不是 WLLN/SLLN 的必要条件**：辛钦 WLLN 仅需 $\mathbb{E}[\vert X_1\vert] < \infty$，不需要方差存在。柯西分布均值不存在，LLN 不成立；但满足期望条件的分布（如部分厚尾分布）没有方差，辛钦定理依然适用。
+3. **有限方差不是 WLLN/SLLN 的必要条件**：辛钦 WLLN 仅需 $\mathbb{E}[| X_1|] < \infty$，不需要方差存在。柯西分布均值不存在，LLN 不成立；但满足期望条件的分布（如部分厚尾分布）没有方差，辛钦定理依然适用。
 
 4. **独立性 vs 同分布**：切比雪夫 WLLN 只要求两两不相关，不要求独立也不要求同分布；辛钦 WLLN 要求 i.i.d.。在实际应用中将"两两不相关"与"独立"混用，会导致错误地引用定理。
 
@@ -582,16 +582,16 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 ### 例 1：切比雪夫不等式估计尾概率
 
 > **题目**：某工厂零件质量 $X$（克）满足 $\mathbb{E}[X] = 100$，$\text{Var}(X) = 4$。
-> (1) 用切比雪夫不等式估计 $P(\vert X - 100\vert \geq 5)$ 的上界。
+> (1) 用切比雪夫不等式估计 $P(| X - 100| \geq 5)$ 的上界。
 > (2) 若 $X \sim N(100, 4)$，计算 (1) 的精确值并与切比雪夫界比较。
 
 **思路**：切比雪夫直接套公式；精确值用标准化 $Z = (X - 100)/2 \sim N(0,1)$。
 
 **解**：
 
-(1) $P(\vert X - 100\vert \geq 5) \leq \dfrac{\sigma^2}{\varepsilon^2} = \dfrac{4}{25} = 0.16$。
+(1) $P(| X - 100| \geq 5) \leq \dfrac{\sigma^2}{\varepsilon^2} = \dfrac{4}{25} = 0.16$。
 
-(2) $P(\vert X - 100\vert \geq 5) = P(\vert Z\vert \geq 2.5) = 2(1 - \Phi(2.5)) \approx 2 \times 0.0062 = 0.0124$。
+(2) $P(| X - 100| \geq 5) = P(| Z| \geq 2.5) = 2(1 - \Phi(2.5)) \approx 2 \times 0.0062 = 0.0124$。
 
 切比雪夫界（16%）比精确值（1.24%）宽松了约 13 倍——这体现了切比雪夫不等式对一般分布的"保守性"代价。
 
@@ -601,7 +601,7 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 ### 例 2：频率收敛与样本量估计
 
-> **题目**：某网站的点击率为 $p$（未知，$p \in [0,1]$）。要用频率估计 $p$，希望以至少 95% 的概率保证误差 $\vert\hat{p}_n - p\vert < 0.02$。
+> **题目**：某网站的点击率为 $p$（未知，$p \in [0,1]$）。要用频率估计 $p$，希望以至少 95% 的概率保证误差 $|\hat{p}_n - p| < 0.02$。
 > (1) 用切比雪夫不等式给出所需样本量 $n$。
 > (2) 用 Hoeffding 不等式给出更紧的样本量下界，并比较。
 
@@ -609,11 +609,11 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 **解**：
 
-(1) $P(\vert\hat{p}_n - p\vert \geq 0.02) \leq \dfrac{p(1-p)}{n \times 0.02^2} \leq \dfrac{1}{4n \times 0.0004} = \dfrac{1}{0.0016n}$。
+(1) $P(|\hat{p}_n - p| \geq 0.02) \leq \dfrac{p(1-p)}{n \times 0.02^2} \leq \dfrac{1}{4n \times 0.0004} = \dfrac{1}{0.0016n}$。
 
 要使此上界 $\leq 0.05$：$n \geq \dfrac{1}{0.0016 \times 0.05} = 12500$。
 
-(2) Hoeffding：$P(\vert\hat{p}_n - p\vert \geq 0.02) \leq 2\exp(-2n \times 0.02^2) = 2e^{-0.0008n}$。
+(2) Hoeffding：$P(|\hat{p}_n - p| \geq 0.02) \leq 2\exp(-2n \times 0.02^2) = 2e^{-0.0008n}$。
 
 令 $2e^{-0.0008n} \leq 0.05$：$n \geq \dfrac{\ln 40}{0.0008} \approx \dfrac{3.689}{0.0008} \approx 4612$。
 
@@ -636,7 +636,7 @@ WLLN（左）：对固定 $\varepsilon$，$n$ 足够大后概率带内的路径�
 
 (1) $\hat{I}_n = \frac{1}{n}\sum_{i=1}^n e^{-X_i^2}$，$X_i \sim U(0,1)$ i.i.d.。
 
-由 SLLN（$\mathbb{E}[\vert e^{-X^2}\vert] = I < \infty$），$\hat{I}_n \xrightarrow{a.s.} \mathbb{E}[e^{-X^2}] = I$。
+由 SLLN（$\mathbb{E}[| e^{-X^2}|] = I < \infty$），$\hat{I}_n \xrightarrow{a.s.} \mathbb{E}[e^{-X^2}] = I$。
 
 (2) $\text{Var}(\hat{I}_n) = \frac{1}{n}\text{Var}(e^{-X^2})$。数值计算：$\int_0^1 e^{-2x^2}\,dx \approx 0.6267$，$I \approx 0.7468$，
 故 $\text{Var}(e^{-X^2}) \approx 0.6267 - 0.7468^2 \approx 0.069$。
@@ -1220,17 +1220,17 @@ $\square$
 
 ## 自测题
 
-**自测 1**　$X$ 满足 $\mathbb{E}[X] = 2$，$\text{Var}(X) = 1$。求 $P(\vert X - 2\vert \geq 3)$ 的切比雪夫上界，以及 $P(X \geq 8)$ 的马尔可夫上界（设 $X \geq 0$）。
+**自测 1**　$X$ 满足 $\mathbb{E}[X] = 2$，$\text{Var}(X) = 1$。求 $P(| X - 2| \geq 3)$ 的切比雪夫上界，以及 $P(X \geq 8)$ 的马尔可夫上界（设 $X \geq 0$）。
 
 > 💡 提示：切比雪夫：$\sigma^2/\varepsilon^2 = 1/9$；马尔可夫：$\mathbb{E}[X]/8 = 1/4$。
 
-**自测 2**　$X_1, \ldots, X_n$ i.i.d.，$X_i \sim \text{Exp}(\lambda)$，$\lambda$ 已知。用辛钦弱大数定律写出 $\bar{X}_n$ 的依概率收敛目标，并用切比雪夫不等式定量说明需要多少个样本才能使 $P(\vert\bar{X}_n - 1/\lambda\vert \geq \varepsilon) \leq \delta$。
+**自测 2**　$X_1, \ldots, X_n$ i.i.d.，$X_i \sim \text{Exp}(\lambda)$，$\lambda$ 已知。用辛钦弱大数定律写出 $\bar{X}_n$ 的依概率收敛目标，并用切比雪夫不等式定量说明需要多少个样本才能使 $P(|\bar{X}_n - 1/\lambda| \geq \varepsilon) \leq \delta$。
 
 > 💡 提示：$\mathbb{E}[X_i] = 1/\lambda$，$\text{Var}(X_i) = 1/\lambda^2$；切比雪夫给 $n \geq \frac{1}{\lambda^2 \varepsilon^2 \delta}$。
 
 **自测 3**　证明：若 $X_n \xrightarrow{a.s.} X$，则 $X_n \xrightarrow{P} X$（即 a.s. 收敛蕴含依概率收敛）。
 
-> 💡 提示：令 $A_k = \bigcup_{n \geq k}\{\vert X_n - X\vert > \varepsilon\}$，$A_k \downarrow$；a.s. 收敛等价于 $P(\limsup A_k) = 0$，故 $P(A_k) \to 0$，而 $P(\vert X_k - X\vert > \varepsilon) \leq P(A_k) \to 0$。
+> 💡 提示：令 $A_k = \bigcup_{n \geq k}\{| X_n - X| > \varepsilon\}$，$A_k \downarrow$；a.s. 收敛等价于 $P(\limsup A_k) = 0$，故 $P(A_k) \to 0$，而 $P(| X_k - X| > \varepsilon) \leq P(A_k) \to 0$。
 
 **自测 4**　Rademacher 变量 $X_i \in \{-1,+1\}$ 等概率，设 $S_n = \sum_{i=1}^n X_i$。用 Hoeffding 不等式给出 $P(S_n \geq t\sqrt{n})$ 的指数上界，并与切比雪夫界比较（$t > 0$）。
 

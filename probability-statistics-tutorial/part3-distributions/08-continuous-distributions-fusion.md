@@ -94,7 +94,7 @@
 > 2. 转化边界：$a \to (a-\mu)/\sigma$，$b \to (b-\mu)/\sigma$
 > 3. 查 $\Phi$ 表：$P(a < X < b) = \Phi\!\left(\frac{b-\mu}{\sigma}\right) - \Phi\!\left(\frac{a-\mu}{\sigma}\right)$
 >
-> **对称性快捷键**：$\Phi(-x) = 1 - \Phi(x)$；$P(\vert Z\vert \le z) = 2\Phi(z) - 1$
+> **对称性快捷键**：$\Phi(-x) = 1 - \Phi(x)$；$P(| Z| \le z) = 2\Phi(z) - 1$
 
 ---
 
@@ -304,10 +304,10 @@ $$E[X] = \frac{\alpha}{\beta}, \quad \text{Var}(X) = \frac{\alpha}{\beta^2}$$
 **特殊情形：**
 
 | 参数取值 | 退化分布 |
-\vert----------|----------\vert
-\vert $\alpha = 1$ \vert $\text{Exp}(\beta)$（指数分布） \vert
-\vert $\alpha = n/2,\ \beta = 1/2$ \vert $\chi^2(n)$（卡方分布） \vert
-\vert $\alpha \in \mathbb{Z}^+$ \vert Erlang 分布（等待 $\alpha$ 个事件的时间） \vert
+|----------|----------|
+| $\alpha = 1$ | $\text{Exp}(\beta)$（指数分布） |
+| $\alpha = n/2,\ \beta = 1/2$ | $\chi^2(n)$（卡方分布） |
+| $\alpha \in \mathbb{Z}^+$ | Erlang 分布（等待 $\alpha$ 个事件的时间） |
 
 **直觉：** Gamma 分布是"等待第 $\alpha$ 个泊松事件所需时间"的分布，是指数分布的自然推广。
 
@@ -328,13 +328,13 @@ $$E[X] = \frac{\alpha}{\alpha+\beta}, \quad \text{Var}(X) = \frac{\alpha\beta}{(
 **形状变化：**
 
 | 参数关系 | 形状特征 |
-\vert----------\vert----------\vert
-\vert $\alpha = \beta = 1$ \vert 均匀分布 $\mathcal{U}(0,1)$ \vert
-\vert $\alpha = \beta > 1$ \vert 对称单峰，峰在 $x=0.5$ \vert
-\vert $\alpha = \beta < 1$ \vert U 形，两端密度高 \vert
-\vert $\alpha > \beta$ \vert 右偏，峰靠近 1 \vert
-\vert $\alpha < \beta$ \vert 左偏，峰靠近 0 \vert
-\vert $\alpha, \beta \gg 1$ \vert 趋近于正态分布 \vert
+|----------|----------|
+| $\alpha = \beta = 1$ | 均匀分布 $\mathcal{U}(0,1)$ |
+| $\alpha = \beta > 1$ | 对称单峰，峰在 $x=0.5$ |
+| $\alpha = \beta < 1$ | U 形，两端密度高 |
+| $\alpha > \beta$ | 右偏，峰靠近 1 |
+| $\alpha < \beta$ | 左偏，峰靠近 0 |
+| $\alpha, \beta \gg 1$ | 趋近于正态分布 |
 
 **为何 Beta 分布在贝叶斯统计中极为重要？**
 
@@ -375,9 +375,9 @@ $$f(x) = \frac{1}{\pi \gamma \left[1 + \left(\frac{x - x_0}{\gamma}\right)^2\rig
 
 **关键性质——期望和方差不存在**：
 
-$$\int_{-\infty}^{+\infty} \vert x\vert \cdot \frac{1}{\pi(1+x^2)} dx = \frac{2}{\pi}\int_0^{\infty} \frac{x}{1+x^2} dx = +\infty$$
+$$\int_{-\infty}^{+\infty} | x| \cdot \frac{1}{\pi(1+x^2)} dx = \frac{2}{\pi}\int_0^{\infty} \frac{x}{1+x^2} dx = +\infty$$
 
-因此 $E[\vert X\vert] = \infty$，柯西分布**没有期望**，方差更不存在。
+因此 $E[| X|] = \infty$，柯西分布**没有期望**，方差更不存在。
 
 **重要意义**：
 - 柯西分布是"期望不一定存在"的经典反例
@@ -449,7 +449,7 @@ $$\min(X_1, \ldots, X_n) \sim \text{Exp}(\lambda_1 + \cdots + \lambda_n)$$
 
 **4. 正态的绝对值**
 
-若 $Z \sim \mathcal{N}(0,1)$，则 $\vert Z\vert$ 服从**半正态分布（Half-Normal）**，$Z^2 \sim \chi^2(1) = \text{Gamma}(1/2, 1/2)$。
+若 $Z \sim \mathcal{N}(0,1)$，则 $| Z|$ 服从**半正态分布（Half-Normal）**，$Z^2 \sim \chi^2(1) = \text{Gamma}(1/2, 1/2)$。
 
 **5. 均匀 → 指数**
 
@@ -477,12 +477,12 @@ GMM 可以逼近任意连续分布（只要混合成分足够多），在聚类�
 ### 分布比较汇总
 
 | 分布 | 支撑 | 参数 | 均值 | 方差 | 特征 |
-\vert------\vert------\vert------\vert------\vert------\vert------\vert
-\vert $\mathcal{U}(a,b)$ \vert $[a,b]$ \vert $a,b$ \vert $\frac{a+b}{2}$ \vert $\frac{(b-a)^2}{12}$ \vert 等可能 \vert
-\vert $\mathcal{N}(\mu,\sigma^2)$ \vert $\mathbb{R}$ \vert $\mu,\sigma^2$ \vert $\mu$ \vert $\sigma^2$ \vert 对称钟形 \vert
-\vert $\text{Exp}(\lambda)$ \vert $[0,\infty)$ \vert $\lambda$ \vert $1/\lambda$ \vert $1/\lambda^2$ \vert 无记忆性 \vert
-\vert $\text{Gamma}(\alpha,\beta)$ \vert $(0,\infty)$ \vert $\alpha,\beta$ \vert $\alpha/\beta$ \vert $\alpha/\beta^2$ \vert 推广指数 \vert
-\vert $\text{Beta}(\alpha,\beta)$ \vert $(0,1)$ \vert $\alpha,\beta$ \vert $\frac{\alpha}{\alpha+\beta}$ \vert $\frac{\alpha\beta}{(\alpha+\beta)^2(\alpha+\beta+1)}$ \vert 概率先验 \vert
+|------|------|------|------|------|------|
+| $\mathcal{U}(a,b)$ | $[a,b]$ | $a,b$ | $\frac{a+b}{2}$ | $\frac{(b-a)^2}{12}$ | 等可能 |
+| $\mathcal{N}(\mu,\sigma^2)$ | $\mathbb{R}$ | $\mu,\sigma^2$ | $\mu$ | $\sigma^2$ | 对称钟形 |
+| $\text{Exp}(\lambda)$ | $[0,\infty)$ | $\lambda$ | $1/\lambda$ | $1/\lambda^2$ | 无记忆性 |
+| $\text{Gamma}(\alpha,\beta)$ | $(0,\infty)$ | $\alpha,\beta$ | $\alpha/\beta$ | $\alpha/\beta^2$ | 推广指数 |
+| $\text{Beta}(\alpha,\beta)$ | $(0,1)$ | $\alpha,\beta$ | $\frac{\alpha}{\alpha+\beta}$ | $\frac{\alpha\beta}{(\alpha+\beta)^2(\alpha+\beta+1)}$ | 概率先验 |
 
 ---
 
@@ -543,17 +543,17 @@ $t_n$ 分布 vs 标准正态：自由度越小尾部越厚；$n \ge 30$ 时与�
 ### 分布识别速查表（场景 → 分布 → 公式）
 
 | 场景 / 关键词 | 选用分布 | 核心公式 |
-\vert--------------\vert-----------\vert----------\vert
-\vert 等可能、无偏先验、随机数 \vert $\mathcal{U}(a,b)$ \vert $f=\frac{1}{b-a}$，$E=\frac{a+b}{2}$ \vert
-\vert 等待时间、无记忆、泊松间隔 \vert $\text{Exp}(\lambda)$ \vert $f=\lambda e^{-\lambda x}$，$E=1/\lambda$ \vert
-\vert 大量加和、测量误差、自然界 \vert $\mathcal{N}(\mu,\sigma^2)$ \vert 标准化 $Z=(X-\mu)/\sigma$ \vert
-\vert 等待第 $k$ 次事件、多个指数之和 \vert $\text{Gamma}(\alpha,\beta)$ \vert $E=\alpha/\beta$，含 $\Gamma(\alpha)$ \vert
-\vert 成功概率先验、比例建模 \vert $\text{Beta}(\alpha,\beta)$ \vert $E=\alpha/(\alpha+\beta)$，$[0,1]$ 上 \vert
-\vert 标准正态平方和 \vert $\chi^2_n$ \vert $=\text{Gamma}(n/2, 1/2)$，$E=n$ \vert
-\vert 小样本均值检验、$Z$/根号卡方 \vert $t_n$ \vert $t=Z/\sqrt{\chi^2_n/n}$ \vert
-\vert 两方差之比、ANOVA $F$ 统计量 \vert $F_{m,n}$ \vert $F=(\chi^2_m/m)/(\chi^2_n/n)$ \vert
-\vert 正值右偏数据（金融、生长） \vert $\text{LogNormal}(\mu,\sigma^2)$ \vert $\ln X \sim \mathcal{N}(\mu,\sigma^2)$ \vert
-\vert 元器件寿命、可靠性工程 \vert $\text{Weibull}(k,\lambda)$ \vert $k=1$ 退化为指数 \vert
+|--------------|-----------|----------|
+| 等可能、无偏先验、随机数 | $\mathcal{U}(a,b)$ | $f=\frac{1}{b-a}$，$E=\frac{a+b}{2}$ |
+| 等待时间、无记忆、泊松间隔 | $\text{Exp}(\lambda)$ | $f=\lambda e^{-\lambda x}$，$E=1/\lambda$ |
+| 大量加和、测量误差、自然界 | $\mathcal{N}(\mu,\sigma^2)$ | 标准化 $Z=(X-\mu)/\sigma$ |
+| 等待第 $k$ 次事件、多个指数之和 | $\text{Gamma}(\alpha,\beta)$ | $E=\alpha/\beta$，含 $\Gamma(\alpha)$ |
+| 成功概率先验、比例建模 | $\text{Beta}(\alpha,\beta)$ | $E=\alpha/(\alpha+\beta)$，$[0,1]$ 上 |
+| 标准正态平方和 | $\chi^2_n$ | $=\text{Gamma}(n/2, 1/2)$，$E=n$ |
+| 小样本均值检验、$Z$/根号卡方 | $t_n$ | $t=Z/\sqrt{\chi^2_n/n}$ |
+| 两方差之比、ANOVA $F$ 统计量 | $F_{m,n}$ | $F=(\chi^2_m/m)/(\chi^2_n/n)$ |
+| 正值右偏数据（金融、生长） | $\text{LogNormal}(\mu,\sigma^2)$ | $\ln X \sim \mathcal{N}(\mu,\sigma^2)$ |
+| 元器件寿命、可靠性工程 | $\text{Weibull}(k,\lambda)$ | $k=1$ 退化为指数 |
 
 ### 求 $P(a < X < b)$ 标准化 3 步
 
@@ -587,11 +587,11 @@ $\text{Exp}(\lambda) = \text{Exp}(\text{scale}=1/\lambda)$；$\text{Gamma}(\alph
 ### 变形 3：分布族关系（三大缩放定理）
 
 | 关系 | 表达式 | 自由度 / 参数条件 |
-\vert------\vert--------\vert-------\vert
-\vert $t \to N$ \vert $t_n \xrightarrow{d} \mathcal{N}(0,1)$ \vert $n \to \infty$ \vert
-\vert $\chi^2/k \to 1$ \vert $\chi^2_n/n \xrightarrow{p} 1$ \vert $n \to \infty$（大数定律） \vert
-\vert $F_{1,n} = t_n^2$ \vert $F_{1,n} \overset{d}{=} t_n^2$ \vert $m=1$ 的特殊情形 \vert
-\vert $\chi^2_n \to N$ \vert $(\chi^2_n - n)/\sqrt{2n} \to \mathcal{N}(0,1)$ \vert $n \to \infty$（CLT） \vert
+|------|--------|-------|
+| $t \to N$ | $t_n \xrightarrow{d} \mathcal{N}(0,1)$ | $n \to \infty$ |
+| $\chi^2/k \to 1$ | $\chi^2_n/n \xrightarrow{p} 1$ | $n \to \infty$（大数定律） |
+| $F_{1,n} = t_n^2$ | $F_{1,n} \overset{d}{=} t_n^2$ | $m=1$ 的特殊情形 |
+| $\chi^2_n \to N$ | $(\chi^2_n - n)/\sqrt{2n} \to \mathcal{N}(0,1)$ | $n \to \infty$（CLT） |
 
 ### 变形 4：混合分布的期望与方差
 
@@ -601,26 +601,26 @@ $$E[X] = \sum_i w_i \mu_i$$
 
 $$\text{Var}(X) = \underbrace{\sum_i w_i \sigma_i^2}_{\text{组内方差}} + \underbrace{\sum_i w_i (\mu_i - \bar\mu)^2}_{\text{组间方差（混合带来的额外方差）}}$$
 
-这是**全方差公式（Law of Total Variance）** 的直接应用：$\text{Var}(X) = E[\text{Var}(X\vert Z)] + \text{Var}(E[X\vert Z])$，其中 $Z$ 是混合成分指示变量。
+这是**全方差公式（Law of Total Variance）** 的直接应用：$\text{Var}(X) = E[\text{Var}(X| Z)] + \text{Var}(E[X| Z])$，其中 $Z$ 是混合成分指示变量。
 
 ---
 
 ## 本章小结
 
 | 概念 | 核心公式 | 关键意义 |
-\vert------\vert----------\vert----------\vert
-\vert 均匀分布 $\mathcal{U}(a,b)$ \vert $f(x)=\frac{1}{b-a}$ \vert 无信息先验；随机数基础 \vert
-\vert 正态分布 $\mathcal{N}(\mu,\sigma^2)$ \vert $f(x)=\frac{1}{\sigma\sqrt{2\pi}}e^{-\frac{(x-\mu)^2}{2\sigma^2}}$ \vert CLT 极限；自然界普遍存在 \vert
-\vert 指数分布 $\text{Exp}(\lambda)$ \vert $f(x)=\lambda e^{-\lambda x}$ \vert 等待时间；唯一连续无记忆分布 \vert
-\vert Gamma 分布 $\text{Gamma}(\alpha,\beta)$ \vert $f(x)=\frac{\beta^\alpha}{\Gamma(\alpha)}x^{\alpha-1}e^{-\beta x}$ \vert 多个指数之和；等待 $k$ 次事件 \vert
-\vert Beta 分布 $\text{Beta}(\alpha,\beta)$ \vert $f(x)=\frac{x^{\alpha-1}(1-x)^{\beta-1}}{B(\alpha,\beta)}$ \vert 概率的先验；共轭先验 \vert
-\vert 无记忆性 \vert $P(X>s+t\mid X>s)=P(X>t)$ \vert 指数分布的唯一性定理 \vert
-\vert 标准化 \vert $Z=(X-\mu)/\sigma$ \vert 正态计算的统一框架 \vert
-\vert Gamma-Beta 关系 \vert $\frac{X}{X+Y}\sim\text{Beta}(\alpha,\beta)$ \vert 分布族的内在统一性 \vert
-\vert 对数正态分布 \vert $\ln X \sim \mathcal{N}(\mu,\sigma^2)$ \vert 正值右偏数据；金融建模 \vert
-\vert 柯西分布 \vert $f(x)=\frac{1}{\pi\gamma[1+(x-x_0)^2/\gamma^2]}$ \vert 期望不存在的经典反例 \vert
-\vert 韦布尔分布 \vert $f(x)=\frac{k}{\lambda}(x/\lambda)^{k-1}e^{-(x/\lambda)^k}$ \vert 可靠性工程；推广指数分布 \vert
-\vert 混合分布 \vert $f(x)=\sum w_i f_i(x)$ \vert 建模多峰、复杂分布 \vert
+|------|----------|----------|
+| 均匀分布 $\mathcal{U}(a,b)$ | $f(x)=\frac{1}{b-a}$ | 无信息先验；随机数基础 |
+| 正态分布 $\mathcal{N}(\mu,\sigma^2)$ | $f(x)=\frac{1}{\sigma\sqrt{2\pi}}e^{-\frac{(x-\mu)^2}{2\sigma^2}}$ | CLT 极限；自然界普遍存在 |
+| 指数分布 $\text{Exp}(\lambda)$ | $f(x)=\lambda e^{-\lambda x}$ | 等待时间；唯一连续无记忆分布 |
+| Gamma 分布 $\text{Gamma}(\alpha,\beta)$ | $f(x)=\frac{\beta^\alpha}{\Gamma(\alpha)}x^{\alpha-1}e^{-\beta x}$ | 多个指数之和；等待 $k$ 次事件 |
+| Beta 分布 $\text{Beta}(\alpha,\beta)$ | $f(x)=\frac{x^{\alpha-1}(1-x)^{\beta-1}}{B(\alpha,\beta)}$ | 概率的先验；共轭先验 |
+| 无记忆性 | $P(X>s+t\mid X>s)=P(X>t)$ | 指数分布的唯一性定理 |
+| 标准化 | $Z=(X-\mu)/\sigma$ | 正态计算的统一框架 |
+| Gamma-Beta 关系 | $\frac{X}{X+Y}\sim\text{Beta}(\alpha,\beta)$ | 分布族的内在统一性 |
+| 对数正态分布 | $\ln X \sim \mathcal{N}(\mu,\sigma^2)$ | 正值右偏数据；金融建模 |
+| 柯西分布 | $f(x)=\frac{1}{\pi\gamma[1+(x-x_0)^2/\gamma^2]}$ | 期望不存在的经典反例 |
+| 韦布尔分布 | $f(x)=\frac{k}{\lambda}(x/\lambda)^{k-1}e^{-(x/\lambda)^k}$ | 可靠性工程；推广指数分布 |
+| 混合分布 | $f(x)=\sum w_i f_i(x)$ | 建模多峰、复杂分布 |
 
 ---
 
@@ -635,7 +635,7 @@ $$\text{Var}(X) = \underbrace{\sum_i w_i \sigma_i^2}_{\text{组内方差}} + \un
 7. **见"$t$ 统计量"** → $t_n = Z/\sqrt{\chi^2_n/n}$；分子分母必须独立；$n$ 大时趋近标准正态
 8. **见"$F$ 统计量"或"ANOVA"** → $F_{m,n} = (\chi^2_m/m)/(\chi^2_n/n)$；分子分母独立；$F_{1,n} = t_n^2$
 9. **见"正值且右偏"数据** → 候选：对数正态、Gamma、韦布尔；先看支撑集，再看偏度
-10. **见"期望不存在"反例** → 柯西分布；尾部太厚，$\int \vert x\vert f(x)dx = \infty$；$t_1 =$ 柯西
+10. **见"期望不存在"反例** → 柯西分布；尾部太厚，$\int | x| f(x)dx = \infty$；$t_1 =$ 柯西
 11. **见"混合分布方差"** → 不能直接用 $\sum w_i\sigma_i^2$；还要加组间方差 $\sum w_i(\mu_i-\bar\mu)^2$
 12. **见"分布族转化"** → 记住核心树：正态 $\to$ 卡方 $\to$ $t$、$F$；Gamma 包含指数和卡方；Beta 从两 Gamma 的比值来
 
@@ -960,13 +960,13 @@ print(f"  连续极限：等待时间 ~ Exp(λ = {1-p_keep})")
 ### 关键公式速查
 
 | 应用场景 | 所用分布 | 公式/规则 |
-\vert----------\vert----------\vert-----------\vert
-\vert Xavier 均匀初始化 \vert $\mathcal{U}(-a, a)$ \vert $a = \sqrt{6/(n_\text{in}+n_\text{out})}$ \vert
-\vert Xavier 正态初始化 \vert $\mathcal{N}(0, \sigma^2)$ \vert $\sigma = \sqrt{2/(n_\text{in}+n_\text{out})}$ \vert
-\vert Kaiming 初始化（ReLU）\vert $\mathcal{N}(0, \sigma^2)$ \vert $\sigma = \sqrt{2/n_\text{in}}$ \vert
-\vert 批归一化 \vert $\mathcal{N}(0, 1)$ \vert $\hat{z} = (z-\mu_B)/\sqrt{\sigma_B^2+\varepsilon}$ \vert
-\vert 准确率贝叶斯估计 \vert $\text{Beta}(\alpha, \beta)$ \vert 后验：$\text{Beta}(\alpha+k, \beta+n-k)$ \vert
-\vert Dropout 等待分布 \vert $\text{Exp}(\lambda)$ \vert $\lambda = 1 - p_\text{keep}$ \vert
+|----------|----------|-----------|
+| Xavier 均匀初始化 | $\mathcal{U}(-a, a)$ | $a = \sqrt{6/(n_\text{in}+n_\text{out})}$ |
+| Xavier 正态初始化 | $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/(n_\text{in}+n_\text{out})}$ |
+| Kaiming 初始化（ReLU）| $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/n_\text{in}}$ |
+| 批归一化 | $\mathcal{N}(0, 1)$ | $\hat{z} = (z-\mu_B)/\sqrt{\sigma_B^2+\varepsilon}$ |
+| 准确率贝叶斯估计 | $\text{Beta}(\alpha, \beta)$ | 后验：$\text{Beta}(\alpha+k, \beta+n-k)$ |
+| Dropout 等待分布 | $\text{Exp}(\lambda)$ | $\lambda = 1 - p_\text{keep}$ |
 
 ### 设计启示
 
@@ -1082,7 +1082,7 @@ $$P(0.3 \le X \le 0.7) = P\!\left(\frac{0.3-0.5}{0.2} \le Z \le \frac{0.7-0.5}{0
 
 $$0.9 = 0.5 + 2 \times 0.2 = \mu + 2\sigma$$
 
-由 68-95-99.7 法则：$P(\vert X - \mu\vert \le 2\sigma) \approx 95.45\%$，故 $P(X > \mu + 2\sigma) \approx (1 - 0.9545)/2 \approx 2.275\%$。
+由 68-95-99.7 法则：$P(| X - \mu| \le 2\sigma) \approx 95.45\%$，故 $P(X > \mu + 2\sigma) \approx (1 - 0.9545)/2 \approx 2.275\%$。
 
 **(d)** 期望超过 0.9 的神经元数 $\approx 1000 \times 2.275\% \approx 22.75 \approx 23$ 个。
 
@@ -1237,22 +1237,22 @@ $$f_U(u) = \frac{\Gamma(\alpha+\beta)}{\Gamma(\alpha)\Gamma(\beta)} u^{\alpha-1}
 本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（高中模板 D 速记 / 套路 / 例题 / 自测）** 融合：
 
 | 段落 | 来源 | 价值 |
-\vert---\vert---\vert---\vert
-\vert 一例速记（8 分布 PDF/期望/方差） \vert 重写版（前置） \vert 建立直觉 / 速查 \vert
-\vert 引入：68-95-99.7 + 无记忆性反直觉 \vert 重写版（前置） \vert 激活学习动机 \vert
-\vert 思维路径还原（场景 → 分布 → 公式） \vert 重写版（前置） \vert 建立条件反射 \vert
-\vert 学习目标 \vert 原版 \vert 明确学习方向 \vert
-\vert 8.1–8.6 严格正文 + 公式推导 \vert 原版 \vert 完整数学推导 \vert
-\vert 几何示意（8 张 SVG 图） \vert 原版配图 + 融合说明 \vert 可视化理解 \vert
-\vert 抽象成方法（速查表 + 3 步标准化） \vert 重写版（中间） \vert 套路总结 \vert
-\vert 方法变形（4 类） \vert 重写版（中间） \vert 边界情形覆盖 \vert
-\vert 本章小结 \vert 原版 \vert 公式速查 \vert
-\vert 思考路标（12 条） \vert 融合两版 \vert 条件反射训练 \vert
-\vert 易错点（5 条） \vert 融合两版 \vert 防错指南 \vert
-\vert 典型应用例题（正态 + 指数 + Gamma/Beta） \vert 重写版 \vert 方法演练 \vert
-\vert 深度学习应用 + PyTorch 代码 \vert 原版 \vert 工业实战 \vert
-\vert 练习题 + \<details\> 答案 \vert 原版 \vert 系统巩固 \vert
-\vert 自测题（5 题带提示） \vert 重写版 \vert 自我验收 \vert
-\vert 结尾速记回顾 + 融合版说明表 \vert 融合 \vert 闭环检验 \vert
+|---|---|---|
+| 一例速记（8 分布 PDF/期望/方差） | 重写版（前置） | 建立直觉 / 速查 |
+| 引入：68-95-99.7 + 无记忆性反直觉 | 重写版（前置） | 激活学习动机 |
+| 思维路径还原（场景 → 分布 → 公式） | 重写版（前置） | 建立条件反射 |
+| 学习目标 | 原版 | 明确学习方向 |
+| 8.1–8.6 严格正文 + 公式推导 | 原版 | 完整数学推导 |
+| 几何示意（8 张 SVG 图） | 原版配图 + 融合说明 | 可视化理解 |
+| 抽象成方法（速查表 + 3 步标准化） | 重写版（中间） | 套路总结 |
+| 方法变形（4 类） | 重写版（中间） | 边界情形覆盖 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标（12 条） | 融合两版 | 条件反射训练 |
+| 易错点（5 条） | 融合两版 | 防错指南 |
+| 典型应用例题（正态 + 指数 + Gamma/Beta） | 重写版 | 方法演练 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战 |
+| 练习题 + \<details\> 答案 | 原版 | 系统巩固 |
+| 自测题（5 题带提示） | 重写版 | 自我验收 |
+| 结尾速记回顾 + 融合版说明表 | 融合 | 闭环检验 |
 
 **适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

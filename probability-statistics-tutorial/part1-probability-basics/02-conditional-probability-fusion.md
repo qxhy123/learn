@@ -248,10 +248,10 @@ $$
 **三个关键量的统计学命名**：
 
 | 名称 | 符号 | 含义 |
-\vert---\vert---\vert---\vert
-\vert **先验概率**（prior） \vert $P(B_i)$ \vert 在观测到 $A$ 之前，对 $B_i$ 的初始判断 \vert
-\vert **似然**（likelihood） \vert $P(A \mid B_i)$ \vert 在 $B_i$ 为真时，观测到 $A$ 的概率 \vert
-\vert **后验概率**（posterior） \vert $P(B_i \mid A)$ \vert 观测到 $A$ 之后，对 $B_i$ 的更新判断 \vert
+|---|---|---|
+| **先验概率**（prior） | $P(B_i)$ | 在观测到 $A$ 之前，对 $B_i$ 的初始判断 |
+| **似然**（likelihood） | $P(A \mid B_i)$ | 在 $B_i$ 为真时，观测到 $A$ 的概率 |
+| **后验概率**（posterior） | $P(B_i \mid A)$ | 观测到 $A$ 之后，对 $B_i$ 的更新判断 |
 
 $$
 \underbrace{P(B_i \mid A)}_{\text{后验}} \propto \underbrace{P(A \mid B_i)}_{\text{似然}} \times \underbrace{P(B_i)}_{\text{先验}}
@@ -309,11 +309,11 @@ $$
 
 **注意**：独立性与互斥性是两个不同的概念！
 
-| \vert \vert 互斥（Mutually Exclusive） \vert 独立（Independent） \vert
-\vert---\vert---\vert---\vert
-\vert 定义 \vert $A \cap B = \emptyset$ \vert $P(A \cap B) = P(A)P(B)$ \vert
-\vert 含义 \vert 不能同时发生 \vert 互不影响 \vert
-\vert 关系 \vert 若 $P(A), P(B) > 0$，则互斥必不独立 \vert 独立的正概率事件必不互斥 \vert
+| | | 互斥（Mutually Exclusive） | 独立（Independent） |
+|---|---|---|
+| 定义 | $A \cap B = \emptyset$ | $P(A \cap B) = P(A)P(B)$ |
+| 含义 | 不能同时发生 | 互不影响 |
+| 关系 | 若 $P(A), P(B) > 0$，则互斥必不独立 | 独立的正概率事件必不互斥 |
 
 ### 两两独立 vs 相互独立
 
@@ -375,14 +375,14 @@ $$
 
 ### 5 大核心公式速查
 
-| 名称 \vert 公式 \vert 关键记忆点 \vert
-\vert---\vert---\vert---\vert
-\vert **条件概率** \vert $P(A \mid B) = P(AB)/P(B)$ \vert 分母 $P(B) > 0$，缩小样本空间 \vert
-\vert **乘法公式** \vert $P(AB) = P(B)\,P(A\mid B) = P(A)\,P(B\mid A)$ \vert 两种写法等价，选方便计算的 \vert
-\vert **链式法则** \vert $P(A_1 \cdots A_n) = P(A_1)\prod_{i=2}^{n}P(A_i\mid A_1\cdots A_{i-1})$ \vert 语言模型自回归分解 \vert
-\vert **全概率** \vert $P(B) = \sum_i P(A_i)\,P(B\mid A_i)$ \vert 按"原因"加权求和 \vert
-\vert **贝叶斯** \vert $P(A_k \mid B) = P(A_k)\,P(B\mid A_k) / P(B)$ \vert 后验 $\propto$ 似然 $\times$ 先验 \vert
-\vert **独立性** \vert $P(AB) = P(A)P(B)$ \vert 等价 $P(A\mid B) = P(A)$ \vert
+| 名称 | 公式 | 关键记忆点 |
+|---|---|---|
+| **条件概率** | $P(A \mid B) = P(AB)/P(B)$ | 分母 $P(B) > 0$，缩小样本空间 |
+| **乘法公式** | $P(AB) = P(B)\,P(A\mid B) = P(A)\,P(B\mid A)$ | 两种写法等价，选方便计算的 |
+| **链式法则** | $P(A_1 \cdots A_n) = P(A_1)\prod_{i=2}^{n}P(A_i\mid A_1\cdots A_{i-1})$ | 语言模型自回归分解 |
+| **全概率** | $P(B) = \sum_i P(A_i)\,P(B\mid A_i)$ | 按"原因"加权求和 |
+| **贝叶斯** | $P(A_k \mid B) = P(A_k)\,P(B\mid A_k) / P(B)$ | 后验 $\propto$ 似然 $\times$ 先验 |
+| **独立性** | $P(AB) = P(A)P(B)$ | 等价 $P(A\mid B) = P(A)$ |
 
 ### 贝叶斯解题 4 步流程
 
@@ -431,14 +431,14 @@ $$P(A \cap B \mid C) = P(A \mid C)\,P(B \mid C)$$
 
 ## 本章小结
 
-| 概念 \vert 公式 \vert 记忆要点 \vert
-\vert---\vert---\vert---\vert
-\vert 条件概率 \vert $P(A\mid B) = P(A\cap B)/P(B)$ \vert 缩小样本空间，重新归一化 \vert
-\vert 乘法公式 \vert $P(A\cap B) = P(A\mid B)P(B)$ \vert 由条件概率变形而来 \vert
-\vert 链式法则 \vert $P(\bigcap A_i) = \prod P(A_i \mid A_1\cdots A_{i-1})$ \vert 语言模型的核心分解 \vert
-\vert 全概率公式 \vert $P(A) = \sum P(A\mid B_i)P(B_i)$ \vert 按"原因"加权平均 \vert
-\vert 贝叶斯公式 \vert $P(B_i\mid A) \propto P(A\mid B_i)P(B_i)$ \vert 后验 ∝ 似然 × 先验 \vert
-\vert 独立性 \vert $P(A\cap B) = P(A)P(B)$ \vert 互不影响，注意区分互斥 \vert
+| 概念 | 公式 | 记忆要点 |
+|---|---|---|
+| 条件概率 | $P(A\mid B) = P(A\cap B)/P(B)$ | 缩小样本空间，重新归一化 |
+| 乘法公式 | $P(A\cap B) = P(A\mid B)P(B)$ | 由条件概率变形而来 |
+| 链式法则 | $P(\bigcap A_i) = \prod P(A_i \mid A_1\cdots A_{i-1})$ | 语言模型的核心分解 |
+| 全概率公式 | $P(A) = \sum P(A\mid B_i)P(B_i)$ | 按"原因"加权平均 |
+| 贝叶斯公式 | $P(B_i\mid A) \propto P(A\mid B_i)P(B_i)$ | 后验 ∝ 似然 × 先验 |
+| 独立性 | $P(A\cap B) = P(A)P(B)$ | 互不影响，注意区分互斥 |
 
 **核心思维方式**：贝叶斯公式提供了一种**理性更新信念**的框架——面对新证据，以先验为出发点，通过似然调整，得到后验。这是科学推断的数学基础。
 
@@ -591,11 +591,11 @@ $$
 
 **拉普拉斯先验** $P(\theta) \propto \exp(-|\theta|/b)$ 则对应 **L1 正则化**（稀疏解）。
 
-| 先验分布 \vert 对应正则化 \vert 效果 \vert
-\vert---\vert---\vert---\vert
-\vert 高斯 $\mathcal{N}(0, \sigma^2)$ \vert L2（权重衰减） \vert 参数趋近于零，平滑解 \vert
-\vert 拉普拉斯 $\text{Laplace}(0, b)$ \vert L1（LASSO） \vert 参数稀疏化 \vert
-\vert 均匀分布 \vert 无正则化 \vert 等价于 MLE \vert
+| 先验分布 | 对应正则化 | 效果 |
+|---|---|---|
+| 高斯 $\mathcal{N}(0, \sigma^2)$ | L2（权重衰减） | 参数趋近于零，平滑解 |
+| 拉普拉斯 $\text{Laplace}(0, b)$ | L1（LASSO） | 参数稀疏化 |
+| 均匀分布 | 无正则化 | 等价于 MLE |
 
 ### 预测与不确定性量化
 
@@ -940,20 +940,20 @@ $$
 
 本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（高中模板 D 速记 / 套路 / 例题 / 自测）** 融合：
 
-| 段落 \vert 来源 \vert 价值 \vert
-\vert---\vert---\vert---\vert
-\vert 一例速记 + 引入 + 思维路径还原 \vert 前置新增 \vert 建立直觉 / 条件反射 \vert
-\vert 学习目标 \vert 原版 \vert 明确学习方向 \vert
-\vert 2.1–2.5 严格正文 \vert 原版完整保留 \vert 公理化推导 \vert
-\vert 几何示意（SVG 图 × 2） \vert 配图 + 文字说明新增 \vert 可视化理解 \vert
-\vert 抽象成方法 + 方法变形 \vert 新增 \vert 套路提炼 \vert
-\vert 本章小结 \vert 原版 \vert 公式速查 \vert
-\vert 思考路标（10 条）+ 易错点（6 条） \vert 原版扩充 \vert 条件反射训练 \vert
-\vert 典型应用例题（3 例） \vert 新增（贝叶斯诊断 + 全概率 + 多次更新） \vert 演练 \vert
-\vert 深度学习应用 + PyTorch \vert 原版完整保留 \vert 工业实战 \vert
-\vert 练习题 + 详解（$<$details$>$） \vert 原版 \vert 巩固练习 \vert
-\vert 自测题（5 题 + 提示） \vert 新增 \vert 自我验收 \vert
-\vert 结尾激励 + 融合版说明表 \vert 新增 \vert 结构透明 \vert
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 前置新增 | 建立直觉 / 条件反射 |
+| 学习目标 | 原版 | 明确学习方向 |
+| 2.1–2.5 严格正文 | 原版完整保留 | 公理化推导 |
+| 几何示意（SVG 图 × 2） | 配图 + 文字说明新增 | 可视化理解 |
+| 抽象成方法 + 方法变形 | 新增 | 套路提炼 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标（10 条）+ 易错点（6 条） | 原版扩充 | 条件反射训练 |
+| 典型应用例题（3 例） | 新增（贝叶斯诊断 + 全概率 + 多次更新） | 演练 |
+| 深度学习应用 + PyTorch | 原版完整保留 | 工业实战 |
+| 练习题 + 详解（$<$details$>$） | 原版 | 巩固练习 |
+| 自测题（5 题 + 提示） | 新增 | 自我验收 |
+| 结尾激励 + 融合版说明表 | 新增 | 结构透明 |
 
 **适用**：一站式学习——先速记建立直觉，读严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
 

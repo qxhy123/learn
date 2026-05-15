@@ -9,7 +9,7 @@
 > **等价写法**：$\sqrt{n}(\bar{X}_n - \mu)/\sigma \xrightarrow{d} \mathcal{N}(0, 1)$；$\bar{X}_n \xrightarrow{d} \mathcal{N}(\mu,\, \sigma^2/n)$。
 > **De Moivre-Laplace**：$X \sim B(n, p)$ 时，$\dfrac{X - np}{\sqrt{npq}} \xrightarrow{d} \mathcal{N}(0,1)$；连续性修正：整数 $k$ 对应区间 $[k - 0.5,\ k + 0.5]$。
 > **Lindeberg 条件**（独立非同分布 CLT）：无单一项主导总方差，即 $L_n(\varepsilon) \to 0$。
-> **Berry-Esseen 误差**：$\sup_x \vert F_n(x) - \Phi(x)\vert \leq C\rho/(\sigma^3\sqrt{n})$，收敛速率 $O(1/\sqrt{n})$。
+> **Berry-Esseen 误差**：$\sup_x | F_n(x) - \Phi(x)| \leq C\rho/(\sigma^3\sqrt{n})$，收敛速率 $O(1/\sqrt{n})$。
 
 ---
 
@@ -548,7 +548,7 @@ $$
 
 **第 2 步——标准化**：构造 $Z_n = (S_n - n\mu)/(\sigma\sqrt{n})$，或对 $\bar{X}_n$ 使用 $Z = (\bar{X}_n - \mu)/(\sigma/\sqrt{n})$。明确所求概率对应 $Z$ 的范围。
 
-**第 3 步——查 $\Phi$ 表**：将概率表达式化为 $\Phi(b) - \Phi(a)$ 的形式。注意：$\Phi(-x) = 1 - \Phi(x)$；$P(Z > a) = 1 - \Phi(a)$；$P(\vert Z\vert \leq a) = 2\Phi(a) - 1$。
+**第 3 步——查 $\Phi$ 表**：将概率表达式化为 $\Phi(b) - \Phi(a)$ 的形式。注意：$\Phi(-x) = 1 - \Phi(x)$；$P(Z > a) = 1 - \Phi(a)$；$P(| Z| \leq a) = 2\Phi(a) - 1$。
 
 **第 4 步——反标准化（如需）**：若求分位数或样本量，从 $\Phi$ 分位数反推原始量：$x = \mu + z_p \cdot \sigma / \sqrt{n}$，或 $n \geq (z_{\alpha/2} \cdot \sigma / \varepsilon)^2$。
 
@@ -1318,15 +1318,15 @@ $$
 
 > 💡 提示：$np = 150$，$\sqrt{npq} = \sqrt{105} \approx 10.25$。含修正：$P(X \leq 140) \approx \Phi((140.5 - 150)/10.25) = \Phi(-0.927) \approx 1 - \Phi(0.93) \approx 0.176$。
 
-**自测 3**　$X_1, \ldots, X_n$ i.i.d.，$E X_i = 5$，$\operatorname{Var}(X_i) = 4$。要使 $P(\vert\bar{X}_n - 5\vert \leq 0.2) \geq 0.95$，至少需要多大 $n$？
+**自测 3**　$X_1, \ldots, X_n$ i.i.d.，$E X_i = 5$，$\operatorname{Var}(X_i) = 4$。要使 $P(|\bar{X}_n - 5| \leq 0.2) \geq 0.95$，至少需要多大 $n$？
 
-> 💡 提示：$P(\vert\bar{X}_n - 5\vert \leq 0.2) \approx 2\Phi(0.2\sqrt{n}/2) - 1 \geq 0.95$，即 $\Phi(0.1\sqrt{n}) \geq 0.975$，$0.1\sqrt{n} \geq 1.96$，$n \geq (19.6)^2 = 384.16$，故 $n \geq 385$。
+> 💡 提示：$P(|\bar{X}_n - 5| \leq 0.2) \approx 2\Phi(0.2\sqrt{n}/2) - 1 \geq 0.95$，即 $\Phi(0.1\sqrt{n}) \geq 0.975$，$0.1\sqrt{n} \geq 1.96$，$n \geq (19.6)^2 = 384.16$，故 $n \geq 385$。
 
 **自测 4**　设 $X_k$ 独立，$X_k \sim N(0, k^2)$，$k = 1, \ldots, n$。令 $S_n = \sum_{k=1}^n X_k$。$S_n / s_n$ 的极限分布是什么？（$s_n^2 = \sum k^2$）
 
-> 💡 提示：$X_k$ 独立正态，$s_n^2 = n(n+1)(2n+1)/6 \sim n^3/3$。用 Lyapunov 条件（$\delta = 1$）：$\mathbb{E}[\vert X_k\vert^3] = \sqrt{8/\pi} \cdot k^3$，$\sum k^3 \sim n^4/4$，$s_n^3 \sim n^{9/2}/3^{3/2}$，比值 $\sim n^4/(n^{9/2}) = n^{-1/2} \to 0$。故 $S_n/s_n \xrightarrow{d} \mathcal{N}(0,1)$。
+> 💡 提示：$X_k$ 独立正态，$s_n^2 = n(n+1)(2n+1)/6 \sim n^3/3$。用 Lyapunov 条件（$\delta = 1$）：$\mathbb{E}[| X_k|^3] = \sqrt{8/\pi} \cdot k^3$，$\sum k^3 \sim n^4/4$，$s_n^3 \sim n^{9/2}/3^{3/2}$，比值 $\sim n^4/(n^{9/2}) = n^{-1/2} \to 0$。故 $S_n/s_n \xrightarrow{d} \mathcal{N}(0,1)$。
 
-**自测 5**　指数分布 $X \sim \text{Exp}(2)$（$\mu = 0.5$，$\sigma = 0.5$）。设 $n = 100$，Berry-Esseen 定理保证正态近似的误差上界是多少（取 $C = 0.4748$，$\rho = \mathbb{E}[\vert X - 0.5\vert^3]$，可近似用 $\rho/\sigma^3 = 2$ 即指数分布偏度值）？
+**自测 5**　指数分布 $X \sim \text{Exp}(2)$（$\mu = 0.5$，$\sigma = 0.5$）。设 $n = 100$，Berry-Esseen 定理保证正态近似的误差上界是多少（取 $C = 0.4748$，$\rho = \mathbb{E}[| X - 0.5|^3]$，可近似用 $\rho/\sigma^3 = 2$ 即指数分布偏度值）？
 
 > 💡 提示：误差 $\leq C \cdot (\rho/\sigma^3) / \sqrt{n} = 0.4748 \times 2 / \sqrt{100} = 0.9496 / 10 \approx 0.095$。即对 $n = 100$ 的指数分布样本，正态近似误差最大约 $9.5\%$；若要误差 $\leq 1\%$，需 $n \geq (0.4748 \times 2 / 0.01)^2 = 94.96^2 \approx 9017$。
 

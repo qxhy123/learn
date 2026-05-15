@@ -7,8 +7,8 @@
 
 > **一例速记**
 >
-> - **正态 $N(\mu,\sigma^2)$**：钟形对称，$P(\vert X-\mu\vert<\sigma)\approx 68\%$、$<2\sigma\approx 95\%$、$<3\sigma\approx 99.7\%$
-> - **指数 $\text{Exp}(\lambda)$**：$f(x)=\lambda e^{-\lambda x}$，$E=1/\lambda$，**无记忆性** $P(X>s+t\vert X>s)=P(X>t)$
+> - **正态 $N(\mu,\sigma^2)$**：钟形对称，$P(| X-\mu|<\sigma)\approx 68\%$、$<2\sigma\approx 95\%$、$<3\sigma\approx 99.7\%$
+> - **指数 $\text{Exp}(\lambda)$**：$f(x)=\lambda e^{-\lambda x}$，$E=1/\lambda$，**无记忆性** $P(X>s+t| X>s)=P(X>t)$
 > - **Gamma$(\alpha,\beta)$**：$\alpha$ 个独立 $\text{Exp}(\beta)$ 之和；$\alpha=n/2,\beta=1/2$ 退化为 $\chi^2_n$
 > - **Beta$(\alpha,\beta)$**：定义在 $[0,1]$，概率论中作为概率的先验（二项分布共轭先验）
 > - **三大抽样分布**：$\chi^2_n=\sum_{i=1}^n Z_i^2$；$t_n=Z/\sqrt{\chi^2_n/n}$；$F_{m,n}=(\chi^2_m/m)/(\chi^2_n/n)$
@@ -954,7 +954,7 @@ $$f_U(u) = \frac{\Gamma(\alpha+\beta)}{\Gamma(\alpha)\Gamma(\beta)} u^{\alpha-1}
 ## 易错点
 
 1. **对称性**：$\Phi(-x)=1-\Phi(x)$（标准正态 CDF），$P(Z>1.96)=P(Z<-1.96)$
-2. **指数无记忆性**：$P(X>s+t\vert X>s)=P(X>t)$——"已等待 $s$ 时间"不影响未来；指数**参数**是速率 $\lambda$ 不是均值
+2. **指数无记忆性**：$P(X>s+t| X>s)=P(X>t)$——"已等待 $s$ 时间"不影响未来；指数**参数**是速率 $\lambda$ 不是均值
 3. **Gamma 退化**：$\alpha=1$ 时 Gamma$\to$ Exp；$\alpha=n/2,\beta=1/2$ 时 Gamma$\to\chi^2_n$
 4. **卡方自由度**：$\chi^2_n$ 的自由度 $n$ 是平方和项数，不是样本量减1（估计均值时才减1）
 5. **$t$ 分布自由度**：一样本 $t$ 检验自由度是 $n-1$（因估计均值损失1）；$n>30$ 近似标准正态

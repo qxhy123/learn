@@ -350,8 +350,8 @@ $$\binom{3}{1, 1, 1} = \frac{3!}{1!\,1!\,1!} = 6$$
 ### 变形 4：容斥原理
 
 计算 $P(A \cup B)$ 或多个集合并的大小时：
-$$\vert A \cup B \vert = \vert A \vert + \vert B \vert - \vert A \cap B \vert$$
-$$\vert A \cup B \cup C \vert = \vert A \vert + \vert B \vert + \vert C \vert - \vert A \cap B \vert - \vert A \cap C \vert - \vert B \cap C \vert + \vert A \cap B \cap C \vert$$
+$$| A \cup B | = | A | + | B | - | A \cap B |$$
+$$| A \cup B \cup C | = | A | + | B | + | C | - | A \cap B | - | A \cap C | - | B \cap C | + | A \cap B \cap C |$$
 概率版：$P(A \cup B) = P(A) + P(B) - P(AB)$。适用：被 3 整除**或**被 7 整除的正整数个数等。
 
 ---
@@ -409,7 +409,7 @@ $$\vert A \cup B \cup C \vert = \vert A \vert + \vert B \vert + \vert C \vert - 
 
 5. **几何概型的测度选择**：题目涉及两个随机变量时，样本空间是平面区域而非线段，要用面积而非长度。搞错测度维度则结果完全错误。
 
-6. **容斥原理漏项**：三个集合容斥有 7 项（3 个单项 $-$ 3 个双交 $+$ 1 个三交），常见错误是忘记加回三交项 $\vert A\cap B\cap C\vert$。
+6. **容斥原理漏项**：三个集合容斥有 7 项（3 个单项 $-$ 3 个双交 $+$ 1 个三交），常见错误是忘记加回三交项 $| A\cap B\cap C|$。
 
 ---
 
@@ -463,7 +463,7 @@ $$P_2 = \frac{30}{56} = \frac{15}{28} \approx 0.536$$
 
 样本空间为正方形 $\Omega = [0,60]\times[0,60]$，面积 $S_\Omega = 60^2 = 3600$。
 
-相遇条件：$\vert x - y\vert \leq 15$，即 $-15 \leq x - y \leq 15$。
+相遇条件：$| x - y| \leq 15$，即 $-15 \leq x - y \leq 15$。
 
 有利区域 $A$ 为正方形内两条平行线 $x - y = \pm 15$ 之间的面积：
 
@@ -744,13 +744,13 @@ $$120 \times 35 \times 1 = 4200 \checkmark$$
 **解题思路**：设事件 $A$ = "能被 3 整除"，$B$ = "能被 7 整除"。
 
 **计数**：
-- $\vert A\vert$：$\lfloor 100/3 \rfloor = 33$ 个（$3, 6, 9, \ldots, 99$）
-- $\vert B\vert$：$\lfloor 100/7 \rfloor = 14$ 个（$7, 14, \ldots, 98$）
-- $\vert A \cap B\vert$：能被 $\text{lcm}(3,7) = 21$ 整除的数，$\lfloor 100/21 \rfloor = 4$ 个（$21, 42, 63, 84$）
+- $| A|$：$\lfloor 100/3 \rfloor = 33$ 个（$3, 6, 9, \ldots, 99$）
+- $| B|$：$\lfloor 100/7 \rfloor = 14$ 个（$7, 14, \ldots, 98$）
+- $| A \cap B|$：能被 $\text{lcm}(3,7) = 21$ 整除的数，$\lfloor 100/21 \rfloor = 4$ 个（$21, 42, 63, 84$）
 
 由容斥原理（加法原理的推广）：
 
-$$\vert A \cup B\vert = \vert A\vert + \vert B\vert - \vert A \cap B\vert = 33 + 14 - 4 = 43$$
+$$| A \cup B| = | A| + | B| - | A \cap B| = 33 + 14 - 4 = 43$$
 
 **概率**：
 

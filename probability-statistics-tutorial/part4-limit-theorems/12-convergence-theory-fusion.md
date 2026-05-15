@@ -563,11 +563,11 @@ $$
 ### 收敛关系的反例汇总
 
 | 反例类型 | 构造 | 说明哪个蕴含不成立 |
-\vert---------|------|-----------------|
-\vert 打字机序列 | $X_n = \mathbf{1}_{[j/2^k,(j+1)/2^k]}$ | $\xrightarrow{P}$ 不蕴含 $\xrightarrow{a.s.}$ |
-\vert 尖峰序列 | $X_n = n \cdot \mathbf{1}_{[0,1/n]}$ | $\xrightarrow{a.s.}$ 不蕴含 $\xrightarrow{L^1}$ |
-\vert 分布收敛到非常数 | $X_n \sim \mathcal{N}(0,1)$（独立） | $\xrightarrow{d}$ 不蕴含 $\xrightarrow{P}$ |
-\vert 期望不收敛 | $P(X_n = n) = 1/n$，$P(X_n=0) = 1-1/n$ | $\xrightarrow{P}$ 不蕴含 $\xrightarrow{L^1}$ |
+|---------|------|-----------------|
+| 打字机序列 | $X_n = \mathbf{1}_{[j/2^k,(j+1)/2^k]}$ | $\xrightarrow{P}$ 不蕴含 $\xrightarrow{a.s.}$ |
+| 尖峰序列 | $X_n = n \cdot \mathbf{1}_{[0,1/n]}$ | $\xrightarrow{a.s.}$ 不蕴含 $\xrightarrow{L^1}$ |
+| 分布收敛到非常数 | $X_n \sim \mathcal{N}(0,1)$（独立） | $\xrightarrow{d}$ 不蕴含 $\xrightarrow{P}$ |
+| 期望不收敛 | $P(X_n = n) = 1/n$，$P(X_n=0) = 1-1/n$ | $\xrightarrow{P}$ 不蕴含 $\xrightarrow{L^1}$ |
 
 ---
 
@@ -592,11 +592,11 @@ $$
 ### 4 种收敛对照表
 
 | 收敛类型 | 符号 | 定义核心 | 强弱 | 典型应用 |
-\vert---------|------|---------|------|---------|
-\vert 几乎必然（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega)\to X(\omega))=1$（逐路径） | 最强 | 强大数定律 |
-\vert $L^r$ 收敛 | $X_n \xrightarrow{L^r} X$ | $E[\vert X_n-X\vert^r]\to 0$（矩层面） | 较强 | 均方误差、矩估计 |
-\vert 依概率（P） | $X_n \xrightarrow{P} X$ | $P(\vert X_n-X\vert>\varepsilon)\to 0$ | 中等 | 弱大数定律、相合估计 |
-\vert 依分布（d） | $X_n \xrightarrow{d} X$ | $F_n(x)\to F(x)$ 在连续点 | 最弱 | CLT、渐近理论 |
+|---------|------|---------|------|---------|
+| 几乎必然（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega)\to X(\omega))=1$（逐路径） | 最强 | 强大数定律 |
+| $L^r$ 收敛 | $X_n \xrightarrow{L^r} X$ | $E[| X_n-X|^r]\to 0$（矩层面） | 较强 | 均方误差、矩估计 |
+| 依概率（P） | $X_n \xrightarrow{P} X$ | $P(| X_n-X|>\varepsilon)\to 0$ | 中等 | 弱大数定律、相合估计 |
+| 依分布（d） | $X_n \xrightarrow{d} X$ | $F_n(x)\to F(x)$ 在连续点 | 最弱 | CLT、渐近理论 |
 
 ### 蕴含关系图（→ 图）
 
@@ -610,11 +610,11 @@ $$
 **附加条件下的逆方向**：
 
 | 逆蕴含 | 所需条件 |
-\vert--------|---------|
-\vert $\xrightarrow{P}\Rightarrow\xrightarrow{a.s.}$ | 可取子列（必存在 a.s. 收敛子列） |
-\vert $\xrightarrow{P}\Rightarrow\xrightarrow{L^1}$ | $\{X_n\}$ 一致可积 |
-\vert $\xrightarrow{d}\Rightarrow\xrightarrow{P}$ | 极限为常数 |
-\vert $\xrightarrow{a.s.}\Rightarrow\xrightarrow{L^p}$ | 一致可积（$p\ge1$）或 $\vert X_n\vert\le Y\in L^p$ |
+|--------|---------|
+| $\xrightarrow{P}\Rightarrow\xrightarrow{a.s.}$ | 可取子列（必存在 a.s. 收敛子列） |
+| $\xrightarrow{P}\Rightarrow\xrightarrow{L^1}$ | $\{X_n\}$ 一致可积 |
+| $\xrightarrow{d}\Rightarrow\xrightarrow{P}$ | 极限为常数 |
+| $\xrightarrow{a.s.}\Rightarrow\xrightarrow{L^p}$ | 一致可积（$p\ge1$）或 $| X_n|\le Y\in L^p$ |
 
 ### 选择收敛模式 3 步流程
 
@@ -661,11 +661,11 @@ $$
 ### 四种收敛的比较
 
 | 收敛类型 | 符号 | 定义核心 | 强弱排序 | 典型应用 |
-\vert---------|------|---------|---------|---------|
-\vert 几乎必然收敛（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega) \to X(\omega)) = 1$ | 最强（路径层面） | 强大数定律 |
-\vert $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[\vert X_n-X\vert^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
-\vert 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(\vert X_n-X\vert>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
-\vert 依分布收敛 | $X_n \xrightarrow{d} X$ | $F_n(x) \to F(x)$ 在连续点 | 最弱（分布层面） | 中心极限定理、渐近理论 |
+|---------|------|---------|---------|---------|
+| 几乎必然收敛（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega) \to X(\omega)) = 1$ | 最强（路径层面） | 强大数定律 |
+| $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[| X_n-X|^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
+| 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(| X_n-X|>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
+| 依分布收敛 | $X_n \xrightarrow{d} X$ | $F_n(x) \to F(x)$ 在连续点 | 最弱（分布层面） | 中心极限定理、渐近理论 |
 
 ### 蕴含关系总结
 
@@ -680,11 +680,11 @@ $$
 **附加条件下的逆方向**：
 
 | 逆蕴含 | 所需附加条件 |
-\vert--------|------------|
-\vert $\xrightarrow{P} \Rightarrow \xrightarrow{a.s.}$ | 可取子列（必存在几乎必然收敛子列） |
-\vert $\xrightarrow{P} \Rightarrow \xrightarrow{L^p}$ | 一致可积性（$p = 1$）或有界性 |
-\vert $\xrightarrow{d} \Rightarrow \xrightarrow{P}$ | 极限为常数 |
-\vert $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$|X_n| \leq Y \in L^p$） |
+|--------|------------|
+| $\xrightarrow{P} \Rightarrow \xrightarrow{a.s.}$ | 可取子列（必存在几乎必然收敛子列） |
+| $\xrightarrow{P} \Rightarrow \xrightarrow{L^p}$ | 一致可积性（$p = 1$）或有界性 |
+| $\xrightarrow{d} \Rightarrow \xrightarrow{P}$ | 极限为常数 |
+| $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$|X_n| \leq Y \in L^p$） |
 
 **子列原理**（常用工具）：$X_n \xrightarrow{P} X$ 当且仅当对 $X_n$ 的任意子列，存在进一步的子列几乎必然收敛到 $X$。
 
@@ -852,11 +852,11 @@ $$
 **与四种收敛的对应关系**：
 
 | 收敛类型 | 在 SGD 中对应 | 所需条件 |
-\vert---------|-------------|---------|
-\vert 依分布收敛 | 参数分布趋向平稳分布 | 学习率衰减 |
-\vert 依概率收敛 | $\theta_t$ 以高概率接近最优点 | 凸或PL条件，方差有界 |
-\vert 均方收敛 | $\mathbb{E}[\Vert\theta_t - \theta^*\Vert^2] \to 0$ | 强凸，常数学习率（有偏差） |
-\vert 几乎必然收敛 | 几乎所有训练路径都收敛 | 较强假设，如Polyak步长 |
+|---------|-------------|---------|
+| 依分布收敛 | 参数分布趋向平稳分布 | 学习率衰减 |
+| 依概率收敛 | $\theta_t$ 以高概率接近最优点 | 凸或PL条件，方差有界 |
+| 均方收敛 | $\mathbb{E}[\Vert\theta_t - \theta^*\Vert^2] \to 0$ | 强凸，常数学习率（有偏差） |
+| 几乎必然收敛 | 几乎所有训练路径都收敛 | 较强假设，如Polyak步长 |
 
 ### 12.6.2 PAC 学习理论中的收敛性
 
@@ -1061,13 +1061,13 @@ if __name__ == '__main__':
 ### 理论要点总结
 
 | 深度学习概念 | 对应收敛理论 | 数学表达 |
-\vert------------|------------|---------|
-\vert 训练损失趋向零 | $L^2$ 或依概率收敛 | $E[\ell(\theta_t)] \to 0$ 或 $\ell(\theta_t) \xrightarrow{P} 0$ |
-\vert 泛化误差收敛 | 一致大数定律（ULLN） | $\sup_h \Vert R(h) - \hat{R}_n(h)\Vert \xrightarrow{P} 0$ |
-\vert SGD 找到稳定点 | 依概率收敛 | $\Vert\nabla L(\theta_t)\Vert \xrightarrow{P} 0$ |
-\vert PAC 样本复杂度 | 依概率收敛速率 | $O_P(1/\sqrt{n})$ 泛化界 |
-\vert 批归一化（BN） | CLT（依分布收敛） | 批均值 $\xrightarrow{d} \mathcal{N}(\mu, \sigma^2/m)$ |
-\vert Dropout 正则化 | 依概率收敛（随机近似） | 期望网络 $\approx$ 集成均值 |
+|------------|------------|---------|
+| 训练损失趋向零 | $L^2$ 或依概率收敛 | $E[\ell(\theta_t)] \to 0$ 或 $\ell(\theta_t) \xrightarrow{P} 0$ |
+| 泛化误差收敛 | 一致大数定律（ULLN） | $\sup_h \Vert R(h) - \hat{R}_n(h)\Vert \xrightarrow{P} 0$ |
+| SGD 找到稳定点 | 依概率收敛 | $\Vert\nabla L(\theta_t)\Vert \xrightarrow{P} 0$ |
+| PAC 样本复杂度 | 依概率收敛速率 | $O_P(1/\sqrt{n})$ 泛化界 |
+| 批归一化（BN） | CLT（依分布收敛） | 批均值 $\xrightarrow{d} \mathcal{N}(\mu, \sigma^2/m)$ |
+| Dropout 正则化 | 依概率收敛（随机近似） | 期望网络 $\approx$ 集成均值 |
 
 ---
 
@@ -1282,7 +1282,7 @@ $$
 
 **自测 5**　$X_n\xrightarrow{L^2}X$ 且 $Y_n\xrightarrow{L^2}Y$（均在同一概率空间）。证明 $E[X_nY_n]\to E[XY]$。
 
-> 💡 提示：$\vert E[X_nY_n]-E[XY]\vert\le E[\vert X_nY_n-XY\vert]$。分解：$X_nY_n-XY=(X_n-X)Y_n+X(Y_n-Y)$。用 Hölder：$E[\vert(X_n-X)Y_n\vert]\le\Vert X_n-X\Vert_2\Vert Y_n\Vert_2\to 0$（$\Vert Y_n\Vert_2\to\Vert Y\Vert_2<\infty$），类似处理另一项。结论：$L^2$ 收敛保持内积收敛——这正是 Hilbert 空间 $L^2$ 的连续性。
+> 💡 提示：$| E[X_nY_n]-E[XY]|\le E[| X_nY_n-XY|]$。分解：$X_nY_n-XY=(X_n-X)Y_n+X(Y_n-Y)$。用 Hölder：$E[|(X_n-X)Y_n|]\le\Vert X_n-X\Vert_2\Vert Y_n\Vert_2\to 0$（$\Vert Y_n\Vert_2\to\Vert Y\Vert_2<\infty$），类似处理另一项。结论：$L^2$ 收敛保持内积收敛——这正是 Hilbert 空间 $L^2$ 的连续性。
 
 ---
 
@@ -1301,21 +1301,21 @@ $$
 本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 思维路径 / 套路 / 例题 / 自测）** 融合：
 
 | 段落 | 来源 | 价值 |
-\vert---|------|------|
-\vert 一例速记 + 引入（移动指示器） + 思维路径还原 | 融合版新增（前置） | 建立直觉 / 反例 / 条件反射 |
-\vert 学习目标 | 原版 | 明确目标 |
-\vert 12.1–12.5 严格正文（定义 + 定理 + 证明） | 原版完整保留 | 完整推导 |
-\vert 几何示意（2 张 SVG） | 配图新增 | 可视化蕴含关系与 Slutsky |
-\vert 抽象成方法（对照表 + 蕴含图 + 3 步流程） | 融合版新增（中间） | 套路总结 |
-\vert 方法变形（4 类变形） | 融合版新增 | 覆盖常见题型 |
-\vert 本章小结 | 原版保留 | 公式速查 |
-\vert 思考路标（12 条） | 融合两版 | 条件反射 |
-\vert 易错点（5 条） | 融合版新增 | 防坑 |
-\vert 典型应用例题（3 例） | 融合版新增 | 切比雪夫/特征函数/Slutsky 演练 |
-\vert 深度学习应用 + PyTorch | 原版保留 | 工业实战 |
-\vert 练习题 + 详解（5 题） | 原版保留 | 巩固 |
-\vert 自测题（5 题带提示） | 融合版新增 | 额外训练 |
-\vert 结尾 + 融合版说明表 | 融合版新增 | 导航 |
+|---|------|------|
+| 一例速记 + 引入（移动指示器） + 思维路径还原 | 融合版新增（前置） | 建立直觉 / 反例 / 条件反射 |
+| 学习目标 | 原版 | 明确目标 |
+| 12.1–12.5 严格正文（定义 + 定理 + 证明） | 原版完整保留 | 完整推导 |
+| 几何示意（2 张 SVG） | 配图新增 | 可视化蕴含关系与 Slutsky |
+| 抽象成方法（对照表 + 蕴含图 + 3 步流程） | 融合版新增（中间） | 套路总结 |
+| 方法变形（4 类变形） | 融合版新增 | 覆盖常见题型 |
+| 本章小结 | 原版保留 | 公式速查 |
+| 思考路标（12 条） | 融合两版 | 条件反射 |
+| 易错点（5 条） | 融合版新增 | 防坑 |
+| 典型应用例题（3 例） | 融合版新增 | 切比雪夫/特征函数/Slutsky 演练 |
+| 深度学习应用 + PyTorch | 原版保留 | 工业实战 |
+| 练习题 + 详解（5 题） | 原版保留 | 巩固 |
+| 自测题（5 题带提示） | 融合版新增 | 额外训练 |
+| 结尾 + 融合版说明表 | 融合版新增 | 导航 |
 
 **适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
 

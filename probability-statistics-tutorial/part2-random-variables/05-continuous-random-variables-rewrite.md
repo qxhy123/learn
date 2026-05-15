@@ -8,7 +8,7 @@
 > **PDF 与 CDF**：$f(x) \geq 0$，$\int_{-\infty}^{+\infty} f(x)\,dx = 1$；$F(x) = \int_{-\infty}^x f(t)\,dt$，$F$ 单调不减、右连续、$F(-\infty)=0,F(+\infty)=1$。
 > **区间概率**：$P(a < X \leq b) = F(b) - F(a) = \int_a^b f(x)\,dx$。**单点概率为零**：$P(X = a) = 0$。
 > **期望方差**：$E(X) = \int x f(x)\,dx$，$\text{Var}(X) = E(X^2) - (EX)^2 = \int (x - \mu)^2 f(x)\,dx$。
-> **函数变换**：$Y = g(X)$，$g$ 单调可微 → $f_Y(y) = f_X(g^{-1}(y)) \cdot \vert (g^{-1})'(y) \vert$（一维 Jacobian）。
+> **函数变换**：$Y = g(X)$，$g$ 单调可微 → $f_Y(y) = f_X(g^{-1}(y)) \cdot | (g^{-1})'(y) |$（一维 Jacobian）。
 > **三大姊妹**：标准正态 $Z \sim N(0,1)$；指数 $\text{Exp}(\lambda)$ 无记忆性；均匀 $U(a,b)$。
 
 ---
@@ -67,7 +67,7 @@
 3. **求 $f_Y(y) = F_Y'(y)$**：求导得密度
 
 **当 $g$ 严格单调可微**，可直接用公式：
-$$f_Y(y) = f_X(g^{-1}(y)) \cdot \vert (g^{-1})'(y) \vert$$
+$$f_Y(y) = f_X(g^{-1}(y)) \cdot | (g^{-1})'(y) |$$
 
 ---
 

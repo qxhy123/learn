@@ -5,8 +5,8 @@
 > **本文件**：融合"原版严格推导 + 重写版高中模板 D 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 9.1–9.5 / 深度学习应用 / 练习题）+ 在最前置速记 / 引入 / 思维路径还原 + 中间插入几何示意 / 抽象方法 / 方法变形 + 最后追加思维训练与自测。
 
 > **一例速记**：
-> **多元正态 PDF**：$f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}\vert\boldsymbol{\Sigma}\vert^{1/2}}\exp\!\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$，$\mathbf{X}\sim\mathcal{N}(\boldsymbol{\mu},\boldsymbol{\Sigma})$；协方差矩阵 $\boldsymbol{\Sigma}$ 必须对称半正定。
-> **线性变换封闭**：$\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol{\mu}+\mathbf{b},\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$；条件分布仍是正态：$\mathbf{X}_1\vert\mathbf{X}_2\sim\mathcal{N}(\boldsymbol{\mu}_{1\vert 2},\boldsymbol{\Sigma}_{1\vert 2})$。
+> **多元正态 PDF**：$f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}|\boldsymbol{\Sigma}|^{1/2}}\exp\!\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$，$\mathbf{X}\sim\mathcal{N}(\boldsymbol{\mu},\boldsymbol{\Sigma})$；协方差矩阵 $\boldsymbol{\Sigma}$ 必须对称半正定。
+> **线性变换封闭**：$\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol{\mu}+\mathbf{b},\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$；条件分布仍是正态：$\mathbf{X}_1|\mathbf{X}_2\sim\mathcal{N}(\boldsymbol{\mu}_{1| 2},\boldsymbol{\Sigma}_{1| 2})$。
 > **样本均值**：$X_i\stackrel{\text{i.i.d.}}{\sim}\mathcal{N}(\mu,\sigma^2)$ $\Rightarrow$ $\bar{X}\sim\mathcal{N}(\mu,\sigma^2/n)$；$E[\bar{X}]=\mu$，$\text{Var}(\bar{X})=\sigma^2/n$。
 > **样本方差**：$(n-1)S^2/\sigma^2\sim\chi^2(n-1)$；$\bar{X}$ 与 $S^2$ 独立（**仅正态总体**）。
 > **三大抽样分布**：$\chi^2(n)=\sum Z_i^2$（$Z_i$ 独立标准正态）；$T=\frac{Z}{\sqrt{\chi^2(n)/n}}\sim t(n)$；$F=\frac{\chi^2(m)/m}{\chi^2(n)/n}\sim F(m,n)$；$T^2\sim F(1,n)$。
@@ -23,7 +23,7 @@
 
 正态分布的对称性与旋转不变性，使得"均值方向"（$1/\sqrt{n}$ 方向）与"方差超平面"（正交补空间）天然解耦——这正是 Cochran 定理的核心。
 
-第二个反直觉：多元正态的条件分布 $\mathbf{X}_1\vert\mathbf{X}_2=\mathbf{x}_2$ 仍是正态，且条件均值是 $\mathbf{x}_2$ 的**线性函数**——这就是高斯过程、卡尔曼滤波、线性回归的理论基础。
+第二个反直觉：多元正态的条件分布 $\mathbf{X}_1|\mathbf{X}_2=\mathbf{x}_2$ 仍是正态，且条件均值是 $\mathbf{x}_2$ 的**线性函数**——这就是高斯过程、卡尔曼滤波、线性回归的理论基础。
 
 ---
 
@@ -123,12 +123,12 @@ $$P(5,3,2) = \frac{10!}{5!\,3!\,2!} \times 0.5^5 \times 0.3^3 \times 0.2^2 = 252
 
 $d$ 维随机向量 $\mathbf{X} = (X_1, \ldots, X_d)^\top$ 服从**多元正态分布**（Multivariate Normal Distribution），若其概率密度函数为：
 
-$$f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2} \vert\boldsymbol{\Sigma}\vert^{1/2}} \exp\!\left(-\frac{1}{2}(\mathbf{x} - \boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1} (\mathbf{x} - \boldsymbol{\mu})\right)$$
+$$f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2} |\boldsymbol{\Sigma}|^{1/2}} \exp\!\left(-\frac{1}{2}(\mathbf{x} - \boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1} (\mathbf{x} - \boldsymbol{\mu})\right)$$
 
 记作 $\mathbf{X} \sim \mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\Sigma})$，其中：
 - $\boldsymbol{\mu} \in \mathbb{R}^d$：均值向量
 - $\boldsymbol{\Sigma} \in \mathbb{R}^{d \times d}$：协方差矩阵（对称正定）
-- $\vert\boldsymbol{\Sigma}\vert$：$\boldsymbol{\Sigma}$ 的行列式
+- $|\boldsymbol{\Sigma}|$：$\boldsymbol{\Sigma}$ 的行列式
 
 ### 协方差矩阵的几何含义
 
@@ -141,10 +141,10 @@ $$\Sigma_{ij} = \text{Cov}(X_i, X_j) = E[(X_i - \mu_i)(X_j - \mu_j)]$$
 **三种典型情形**：
 
 | 协方差矩阵形式 | 含义 | 等值面形状 |
-\|--------------|------|----------|
-\| $\boldsymbol{\Sigma} = \sigma^2 \mathbf{I}$ | 各维独立且方差相同 | 球形 |
-\| $\boldsymbol{\Sigma} = \text{diag}(\sigma_1^2, \ldots, \sigma_d^2)$ | 各维独立但方差不同 | 轴对齐椭球 |
-\| 一般正定矩阵 | 各维相关 | 旋转椭球 |
+|--------------|------|----------|
+| $\boldsymbol{\Sigma} = \sigma^2 \mathbf{I}$ | 各维独立且方差相同 | 球形 |
+| $\boldsymbol{\Sigma} = \text{diag}(\sigma_1^2, \ldots, \sigma_d^2)$ | 各维独立但方差不同 | 轴对齐椭球 |
+| 一般正定矩阵 | 各维相关 | 旋转椭球 |
 
 ### 重要性质
 
@@ -158,13 +158,13 @@ $$\mathbf{X}_1 \sim \mathcal{N}(\boldsymbol{\mu}_1, \boldsymbol{\Sigma}_{11})$$
 
 **性质3（条件分布）**：给定 $\mathbf{X}_2 = \mathbf{x}_2$ 时，$\mathbf{X}_1$ 的条件分布仍是正态分布：
 
-$$\mathbf{X}_1 \mid \mathbf{X}_2 = \mathbf{x}_2 \sim \mathcal{N}\!\left(\boldsymbol{\mu}_{1\vert 2},\; \boldsymbol{\Sigma}_{1\vert 2}\right)$$
+$$\mathbf{X}_1 \mid \mathbf{X}_2 = \mathbf{x}_2 \sim \mathcal{N}\!\left(\boldsymbol{\mu}_{1| 2},\; \boldsymbol{\Sigma}_{1| 2}\right)$$
 
 其中：
 
-$$\boldsymbol{\mu}_{1\vert 2} = \boldsymbol{\mu}_1 + \boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2 - \boldsymbol{\mu}_2)$$
+$$\boldsymbol{\mu}_{1| 2} = \boldsymbol{\mu}_1 + \boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2 - \boldsymbol{\mu}_2)$$
 
-$$\boldsymbol{\Sigma}_{1\vert 2} = \boldsymbol{\Sigma}_{11} - \boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}\boldsymbol{\Sigma}_{21}$$
+$$\boldsymbol{\Sigma}_{1| 2} = \boldsymbol{\Sigma}_{11} - \boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}\boldsymbol{\Sigma}_{21}$$
 
 **性质4（独立性与不相关等价）**：对于正态分布，**不相关**等价于**独立**（这在一般分布中不成立）。
 
@@ -267,7 +267,7 @@ $$\mathbf{W} = \sum_{i=1}^{\nu} \mathbf{z}_i \mathbf{z}_i^\top$$
 
 ### 概率密度函数
 
-$$f(\mathbf{W}) = \frac{\vert\mathbf{W}\vert^{(\nu - d - 1)/2} \exp\!\left(-\frac{1}{2}\text{tr}(\boldsymbol{\Sigma}^{-1}\mathbf{W})\right)}{2^{\nu d/2} \vert\boldsymbol{\Sigma}\vert^{\nu/2} \Gamma_d(\nu/2)}$$
+$$f(\mathbf{W}) = \frac{|\mathbf{W}|^{(\nu - d - 1)/2} \exp\!\left(-\frac{1}{2}\text{tr}(\boldsymbol{\Sigma}^{-1}\mathbf{W})\right)}{2^{\nu d/2} |\boldsymbol{\Sigma}|^{\nu/2} \Gamma_d(\nu/2)}$$
 
 其中 $\Gamma_d(\cdot)$ 是多元 Gamma 函数，$\text{tr}(\cdot)$ 是矩阵的迹。
 
@@ -299,9 +299,9 @@ Wishart 分布在高斯过程、贝叶斯线性回归、多元时间序列等模
 
 设 $\mathbf{X} \sim f_{\mathbf{X}}(\mathbf{x})$，$\mathbf{Y} = g(\mathbf{X})$ 是可逆变换，令 $\mathbf{x} = g^{-1}(\mathbf{y})$，则 $\mathbf{Y}$ 的 PDF 为：
 
-$$\boxed{f_{\mathbf{Y}}(\mathbf{y}) = f_{\mathbf{X}}\!\left(g^{-1}(\mathbf{y})\right) \cdot \left\vert\det\mathbf{J}_{g^{-1}}(\mathbf{y})\right\vert}$$
+$$\boxed{f_{\mathbf{Y}}(\mathbf{y}) = f_{\mathbf{X}}\!\left(g^{-1}(\mathbf{y})\right) \cdot \left|\det\mathbf{J}_{g^{-1}}(\mathbf{y})\right|}$$
 
-其中 $\mathbf{J}_{g^{-1}}$ 是逆变换的 **Jacobian 矩阵**（各偏导数组成的矩阵），行列式的绝对值 $\vert\det \mathbf{J}\vert$ 是体积缩放因子。
+其中 $\mathbf{J}_{g^{-1}}$ 是逆变换的 **Jacobian 矩阵**（各偏导数组成的矩阵），行列式的绝对值 $|\det \mathbf{J}|$ 是体积缩放因子。
 
 **Jacobian 矩阵** 的具体形式：设 $\mathbf{x} = (x_1, \ldots, x_n)$，$\mathbf{y} = (y_1, \ldots, y_n)$，则：
 
@@ -315,7 +315,7 @@ $$\mathbf{J}_{g^{-1}} = \begin{pmatrix} \frac{\partial x_1}{\partial y_1} & \cdo
 
 逆变换：$X = (U+V)/2$，$Y = (U-V)/2$。Jacobian 行列式：
 
-$$\left\vert\det\begin{pmatrix} \partial x/\partial u & \partial x/\partial v \\ \partial y/\partial u & \partial y/\partial v \end{pmatrix}\right\vert = \left\vert\det\begin{pmatrix} 1/2 & 1/2 \\ 1/2 & -1/2 \end{pmatrix}\right\vert = \left\vert-\frac{1}{2}\right\vert = \frac{1}{2}$$
+$$\left|\det\begin{pmatrix} \partial x/\partial u & \partial x/\partial v \\ \partial y/\partial u & \partial y/\partial v \end{pmatrix}\right| = \left|\det\begin{pmatrix} 1/2 & 1/2 \\ 1/2 & -1/2 \end{pmatrix}\right| = \left|-\frac{1}{2}\right| = \frac{1}{2}$$
 
 $$f_{U,V}(u, v) = f_{X,Y}\!\left(\frac{u+v}{2}, \frac{u-v}{2}\right) \cdot \frac{1}{2}$$
 
@@ -372,7 +372,7 @@ $$\nabla_\phi E_{q_\phi}[f(\mathbf{z})] = \nabla_\phi E_{p(\boldsymbol{\epsilon}
 
 通过一系列可逆变换将简单分布（如高斯）变换为复杂分布。设 $\mathbf{z}_0 \sim p_0(\mathbf{z}_0)$，经过 $T$ 步变换 $\mathbf{z}_T = f_T \circ \cdots \circ f_1(\mathbf{z}_0)$，则：
 
-$$\ln p_T(\mathbf{z}_T) = \ln p_0(\mathbf{z}_0) - \sum_{t=1}^T \ln\left\vert\det\frac{\partial f_t}{\partial \mathbf{z}_{t-1}}\right\vert$$
+$$\ln p_T(\mathbf{z}_T) = \ln p_0(\mathbf{z}_0) - \sum_{t=1}^T \ln\left|\det\frac{\partial f_t}{\partial \mathbf{z}_{t-1}}\right|$$
 
 每步需要计算 Jacobian 行列式，实际设计中（如 RealNVP）通过特殊结构使其高效计算。
 
@@ -406,7 +406,7 @@ $$\ln p_T(\mathbf{z}_T) = \ln p_0(\mathbf{z}_0) - \sum_{t=1}^T \ln\left\vert\det
 
 | 名称 \| 公式 \| 关键性质 |
 \|---|---|---|
-\| **多元正态 PDF** \| $f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}\vert\boldsymbol{\Sigma}\vert^{1/2}}\exp\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$ \| $\boldsymbol{\Sigma}$ 对称半正定 |
+\| **多元正态 PDF** \| $f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}|\boldsymbol{\Sigma}|^{1/2}}\exp\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$ \| $\boldsymbol{\Sigma}$ 对称半正定 |
 \| **线性变换** \| $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol{\mu}+\mathbf{b},\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$ \| 仿射变换封闭 |
 \| **样本均值分布** \| $\bar{X}\sim\mathcal{N}(\mu,\sigma^2/n)$ \| $E[\bar{X}]=\mu$，$\text{Var}(\bar{X})=\sigma^2/n$ |
 \| **样本方差分布** \| $(n-1)S^2/\sigma^2\sim\chi^2(n-1)$ \| 自由度 $n-1$，与 $\bar{X}$ 独立（仅正态） |
@@ -442,7 +442,7 @@ $\boldsymbol{\Sigma}$ 有谱分解 $\boldsymbol{\Sigma} = Q\Lambda Q^\top$（$Q$
 
 $$\boldsymbol{\Sigma} = \begin{pmatrix}\boldsymbol{\Sigma}_{11} & \boldsymbol{\Sigma}_{12}\\ \boldsymbol{\Sigma}_{21} & \boldsymbol{\Sigma}_{22}\end{pmatrix}$$
 
-条件分布 $\mathbf{X}_1\vert\mathbf{X}_2=\mathbf{x}_2$ 的均值是 $\mathbf{x}_2$ 的线性函数（"线性预测"），条件协方差与 $\mathbf{x}_2$ 无关。**高斯过程**回归、**卡尔曼滤波**的更新步骤均基于此公式。
+条件分布 $\mathbf{X}_1|\mathbf{X}_2=\mathbf{x}_2$ 的均值是 $\mathbf{x}_2$ 的线性函数（"线性预测"），条件协方差与 $\mathbf{x}_2$ 无关。**高斯过程**回归、**卡尔曼滤波**的更新步骤均基于此公式。
 
 ### 变形3：抽样定理推广（两正态总体）
 
@@ -485,11 +485,11 @@ $$\frac{\bar{X}-\mu}{\sigma/\sqrt{n}}\xrightarrow{d}\mathcal{N}(0,1), \quad \fra
 
 ## 思考路标（条件反射）
 
-1. **联合分布** → 联合 PDF $f(\mathbf{x})$；边缘 $f_i(x_i)=\int\cdots\int f(\mathbf{x})\,d\mathbf{x}_{-i}$；条件 $f(\mathbf{x}_1\vert\mathbf{x}_2)=f(\mathbf{x})/f_2(\mathbf{x}_2)$
+1. **联合分布** → 联合 PDF $f(\mathbf{x})$；边缘 $f_i(x_i)=\int\cdots\int f(\mathbf{x})\,d\mathbf{x}_{-i}$；条件 $f(\mathbf{x}_1|\mathbf{x}_2)=f(\mathbf{x})/f_2(\mathbf{x}_2)$
 2. **多元正态 $\mathcal{N}(\boldsymbol\mu,\boldsymbol\Sigma)$** → 由均值向量和协方差矩阵完全确定；等值面为椭球；马氏距离度量"标准化距离"
 3. **协方差矩阵 $\boldsymbol\Sigma$** → 必须对称半正定（$\mathbf{v}^\top\boldsymbol\Sigma\mathbf{v}\geq 0$）；特征值 $\geq 0$；对角化 $\Leftrightarrow$ 主轴分解
 4. **多元正态的边缘** → 任意子集仍服从多元正态（维度降低，直接读 $\boldsymbol\mu_1$、$\boldsymbol\Sigma_{11}$）
-5. **多元正态的条件** → $\mathbf{X}_1\vert\mathbf{X}_2=\mathbf{x}_2\sim\mathcal{N}(\boldsymbol\mu_{1\vert 2},\boldsymbol\Sigma_{1\vert 2})$（仍是正态，均值是 $\mathbf{x}_2$ 的线性函数）
+5. **多元正态的条件** → $\mathbf{X}_1|\mathbf{X}_2=\mathbf{x}_2\sim\mathcal{N}(\boldsymbol\mu_{1| 2},\boldsymbol\Sigma_{1| 2})$（仍是正态，均值是 $\mathbf{x}_2$ 的线性函数）
 6. **仿射变换封闭** → $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol\mu+\mathbf{b},\mathbf{A}\boldsymbol\Sigma\mathbf{A}^\top)$
 7. **正态独立 iff $\rho=0$** → 多元正态中不相关等价于独立（一般分布中此结论不成立）
 8. **PCA 与协方差** → PCA 是协方差矩阵 $\boldsymbol\Sigma$ 的特征分解；PC1 方向 = 最大特征值的特征向量；解释方差比 = 特征值之比
@@ -512,7 +512,7 @@ $$\frac{\bar{X}-\mu}{\sigma/\sqrt{n}}\xrightarrow{d}\mathcal{N}(0,1), \quad \fra
 
 5. **边缘正态不等于联合正态** → 反例：$X,Y$ 各自边缘均为 $\mathcal{N}(0,1)$，但联合分布可能不是二元正态（如 $X,Y$ 是某种非线性依赖）；仅当$(X,Y)$的任意线性组合仍正态时才是联合正态
 
-6. **条件分布均值公式中 $\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$ 的顺序** → $\boldsymbol{\mu}_{1\vert 2}=\boldsymbol{\mu}_1+\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2-\boldsymbol{\mu}_2)$；$\boldsymbol{\Sigma}_{12}$ 在左，$\boldsymbol{\Sigma}_{22}^{-1}$ 在右；矩阵乘法不可交换
+6. **条件分布均值公式中 $\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$ 的顺序** → $\boldsymbol{\mu}_{1| 2}=\boldsymbol{\mu}_1+\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2-\boldsymbol{\mu}_2)$；$\boldsymbol{\Sigma}_{12}$ 在左，$\boldsymbol{\Sigma}_{22}^{-1}$ 在右；矩阵乘法不可交换
 
 ---
 
@@ -530,9 +530,9 @@ $$\boldsymbol{\mu} = \begin{pmatrix}1\\3\end{pmatrix}, \quad \boldsymbol{\Sigma}
 
 **解**：
 
-$$\mu_{1\vert 2} = 1 + 2 \cdot \frac{1}{9}(6 - 3) = 1 + \frac{6}{9} = \frac{5}{3}$$
+$$\mu_{1| 2} = 1 + 2 \cdot \frac{1}{9}(6 - 3) = 1 + \frac{6}{9} = \frac{5}{3}$$
 
-$$\sigma^2_{1\vert 2} = 4 - 2 \cdot \frac{1}{9} \cdot 2 = 4 - \frac{4}{9} = \frac{32}{9}$$
+$$\sigma^2_{1| 2} = 4 - 2 \cdot \frac{1}{9} \cdot 2 = 4 - \frac{4}{9} = \frac{32}{9}$$
 
 $$X_1 \mid X_2 = 6 \sim \mathcal{N}\!\left(\frac{5}{3},\; \frac{32}{9}\right)$$
 
@@ -626,7 +626,7 @@ $$q_\phi(\mathbf{z} \mid \mathbf{x}) = \mathcal{N}(\boldsymbol{\mu}_\phi(\mathbf
 
 由于真实后验 $p(\mathbf{z} \mid \mathbf{x})$ 不可解析计算，VAE 最大化**证据下界**（ELBO）：
 
-$$\mathcal{L}_{\text{ELBO}} = E_{q_\phi(\mathbf{z}\vert\mathbf{x})}\!\left[\log p_\theta(\mathbf{x} \mid \mathbf{z})\right] - D_{\text{KL}}\!\left(q_\phi(\mathbf{z} \mid \mathbf{x}) \;\|\; p(\mathbf{z})\right)$$
+$$\mathcal{L}_{\text{ELBO}} = E_{q_\phi(\mathbf{z}|\mathbf{x})}\!\left[\log p_\theta(\mathbf{x} \mid \mathbf{z})\right] - D_{\text{KL}}\!\left(q_\phi(\mathbf{z} \mid \mathbf{x}) \;\|\; p(\mathbf{z})\right)$$
 
 - **重构项**：解码器能从潜在编码重建输入
 - **KL 散度项**：近似后验向标准正态靠近，正则化潜在空间
@@ -993,7 +993,7 @@ $$\text{Cov}(X_1, X_2) = -np_1p_2 = -5 \times 0.4 \times 0.3 = -0.6$$
 
 $(4-\lambda)(1-\lambda) - 4 = \lambda^2 - 5\lambda = \lambda(\lambda-5) = 0$
 
-$\lambda_1 = 0$，$\lambda_2 = 5$。由于 $\lambda_1 = 0$，$\boldsymbol{\Sigma}$ **半正定而非正定**，行列式 $\vert\boldsymbol{\Sigma}\vert = 4 \times 1 - 2 \times 2 = 0$，$X_1$ 与 $X_2$ 完全线性相关（$X_2 = X_1/2$），此协方差矩阵对应退化的多元正态分布。
+$\lambda_1 = 0$，$\lambda_2 = 5$。由于 $\lambda_1 = 0$，$\boldsymbol{\Sigma}$ **半正定而非正定**，行列式 $|\boldsymbol{\Sigma}| = 4 \times 1 - 2 \times 2 = 0$，$X_1$ 与 $X_2$ 完全线性相关（$X_2 = X_1/2$），此协方差矩阵对应退化的多元正态分布。
 
 **(b)** 边缘分布：
 
@@ -1001,9 +1001,9 @@ $$X_1 \sim \mathcal{N}(1, 4), \quad X_2 \sim \mathcal{N}(2, 1)$$
 
 **(c)** 条件分布（使用公式）：
 
-$$\mu_{1\vert 2} = 1 + \frac{2}{1}(3 - 2) = 3$$
+$$\mu_{1| 2} = 1 + \frac{2}{1}(3 - 2) = 3$$
 
-$$\sigma^2_{1\vert 2} = 4 - \frac{2 \times 2}{1} = 0$$
+$$\sigma^2_{1| 2} = 4 - \frac{2 \times 2}{1} = 0$$
 
 $$X_1 \mid X_2 = 3 \sim \mathcal{N}(3, 0) \equiv 3 \quad \text{（退化，即 } X_1 = 2X_2 - 1\text{）}$$
 
@@ -1147,11 +1147,11 @@ $\sigma^2$ 未知时用样本标准差 $S$ 代替 $\sigma$，自由度为 $n-1=2
 
 **自测 4**　$T\sim t(5)$ 与 $Z\sim\mathcal{N}(0,1)$ 相比，哪个尾部更厚？为什么在小样本假设检验中需要 $t$ 分布而非正态？
 
-> 💡 提示：$t(5)$ 尾部更厚（峰度更高），$P(\vert T\vert>2)>P(\vert Z\vert>2)$。原因：用 $S$ 代替 $\sigma$ 引入了额外的随机性——$S$ 本身也是一个随机变量，放大了总不确定性。自由度越小，尾越厚；$n\to\infty$ 时 $t(n)\to\mathcal{N}(0,1)$（$S\to\sigma$）。
+> 💡 提示：$t(5)$ 尾部更厚（峰度更高），$P(| T|>2)>P(| Z|>2)$。原因：用 $S$ 代替 $\sigma$ 引入了额外的随机性——$S$ 本身也是一个随机变量，放大了总不确定性。自由度越小，尾越厚；$n\to\infty$ 时 $t(n)\to\mathcal{N}(0,1)$（$S\to\sigma$）。
 
-**自测 5**　多元正态的条件分布公式 $\boldsymbol{\mu}_{1\vert 2}=\boldsymbol{\mu}_1+\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2-\boldsymbol{\mu}_2)$ 与线性回归的最优线性预测有什么关系？
+**自测 5**　多元正态的条件分布公式 $\boldsymbol{\mu}_{1| 2}=\boldsymbol{\mu}_1+\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}(\mathbf{x}_2-\boldsymbol{\mu}_2)$ 与线性回归的最优线性预测有什么关系？
 
-> 💡 提示：令 $\mathbf{B}=\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$，则 $E[\mathbf{X}_1\vert\mathbf{X}_2]=\boldsymbol{\mu}_1+\mathbf{B}(\mathbf{X}_2-\boldsymbol{\mu}_2)$——这正是 $\mathbf{X}_1$ 对 $\mathbf{X}_2$ 的总体回归方程，回归系数矩阵 $\mathbf{B}=\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$。高斯过程回归、卡尔曼滤波的"更新"步骤均是此式的直接应用。
+> 💡 提示：令 $\mathbf{B}=\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$，则 $E[\mathbf{X}_1|\mathbf{X}_2]=\boldsymbol{\mu}_1+\mathbf{B}(\mathbf{X}_2-\boldsymbol{\mu}_2)$——这正是 $\mathbf{X}_1$ 对 $\mathbf{X}_2$ 的总体回归方程，回归系数矩阵 $\mathbf{B}=\boldsymbol{\Sigma}_{12}\boldsymbol{\Sigma}_{22}^{-1}$。高斯过程回归、卡尔曼滤波的"更新"步骤均是此式的直接应用。
 
 ---
 
