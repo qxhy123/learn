@@ -27,13 +27,13 @@
 
 > "写出增广矩阵，开始前向消元。
 >
-> **初始矩阵**：$\left(\begin{array}{ccc\vert c}1&2&1&4\\2&5&2&9\\1&3&2&6\end{array}\right)$
+> **初始矩阵**：$\left(\begin{array}{ccc| c}1&2&1&4\\2&5&2&9\\1&3&2&6\end{array}\right)$
 >
 > **第一步消第 1 列**：$R_2\leftarrow R_2-2R_1$，$R_3\leftarrow R_3-R_1$：
-> $$\left(\begin{array}{ccc\vert c}1&2&1&4\\0&1&0&1\\0&1&1&2\end{array}\right)$$
+> $$\left(\begin{array}{ccc| c}1&2&1&4\\0&1&0&1\\0&1&1&2\end{array}\right)$$
 >
 > **第二步消第 2 列**：$R_3\leftarrow R_3-R_2$：
-> $$\left(\begin{array}{ccc\vert c}1&2&1&4\\0&1&0&1\\0&0&1&1\end{array}\right)$$
+> $$\left(\begin{array}{ccc| c}1&2&1&4\\0&1&0&1\\0&0&1&1\end{array}\right)$$
 >
 > 已是行阶梯形，三个主元都在，无自由变量，无矛盾行 → **唯一解**。
 >
@@ -698,15 +698,15 @@ $$\mathbf{x}=\mathbf{x}_p+t_1\boldsymbol{\xi}_1+\cdots+t_k\boldsymbol{\xi}_k$$
 
 ### 例 2：无穷多解 + 基础解系
 
-> **题目**：对增广矩阵 $\left(\begin{array}{ccc\vert c}1&-2&1&0\\2&-3&1&-1\\0&1&-1&1\end{array}\right)$ 求完整解（即通解）。
+> **题目**：对增广矩阵 $\left(\begin{array}{ccc| c}1&-2&1&0\\2&-3&1&-1\\0&1&-1&1\end{array}\right)$ 求完整解（即通解）。
 
 【思路】消元至 REF，判断有自由变量，参数化。
 
 【解】$R_2-2R_1$，$R_3-R_2$（与原文练习 5.2 的矩阵相同，但这里我们假设它有无穷多解——注意原题实际无解，换常数列为 $\mathbf{b}=(0,-1,1)^T$ 时同理）。
 
-以第 5 章例题 5.2（$\mathbf{b}=(0,-1,1)^T$）为例：消元后得 $\left(\begin{array}{ccc\vert c}1&-2&1&0\\0&1&-1&-1\\0&0&0&2\end{array}\right)$——第三行 $0=2$，矛盾，**无解**。
+以第 5 章例题 5.2（$\mathbf{b}=(0,-1,1)^T$）为例：消元后得 $\left(\begin{array}{ccc| c}1&-2&1&0\\0&1&-1&-1\\0&0&0&2\end{array}\right)$——第三行 $0=2$，矛盾，**无解**。
 
-重新取 $\mathbf{b}=(0,0,0)^T$（齐次）：消元至 $\left(\begin{array}{ccc\vert c}1&-2&1&0\\0&1&-1&0\\0&0&0&0\end{array}\right)$，自由变量 $x_3=t$，$x_2=t$，$x_1=t$，通解 $\mathbf{x}=t(1,1,1)^T$。
+重新取 $\mathbf{b}=(0,0,0)^T$（齐次）：消元至 $\left(\begin{array}{ccc| c}1&-2&1&0\\0&1&-1&0\\0&0&0&0\end{array}\right)$，自由变量 $x_3=t$，$x_2=t$，$x_1=t$，通解 $\mathbf{x}=t(1,1,1)^T$。
 
 【关键操作】：判断零行 vs 矛盾行；自由变量设参数后逐行回代。
 
@@ -732,7 +732,7 @@ $$L=\begin{pmatrix}1&0&0\\-\tfrac{3}{2}&1&0\\-1&4&1\end{pmatrix},\quad U=\begin{
 
 > 💡 提示：$R_1\leftrightarrow R_2$（或 $R_1\leftrightarrow R_3$）使第1列主元非零，再正常消元。RREF = 单位矩阵（若行满秩），需验证。
 
-**自测 2**　设消元后 REF 为 $\left(\begin{array}{cccc\vert c}1&2&0&1&3\\0&0&1&-1&2\\0&0&0&0&0\end{array}\right)$。有几个自由变量？写出通解。
+**自测 2**　设消元后 REF 为 $\left(\begin{array}{cccc| c}1&2&0&1&3\\0&0&1&-1&2\\0&0&0&0&0\end{array}\right)$。有几个自由变量？写出通解。
 
 > 💡 提示：主元列 1、3；自由变量 $x_2=s,x_4=t$。$x_3=2+t,x_1=3-2s-t$。通解 $\mathbf{x}=(3,0,2,0)^T+s(-2,1,0,0)^T+t(-1,0,1,1)^T$。
 

@@ -27,11 +27,11 @@
 
 > "看到方程组，第一步写增广矩阵，通过行变换看矛盾行。
 >
-> **方程组 (A)**：增广矩阵 $\left(\begin{array}{cc\vert c}1&1&3\\2&2&6\end{array}\right)$，$R_2\leftarrow R_2-2R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&3\\0&0&0\end{array}\right)$。第二行全零——不是矛盾，只有 1 个独立方程，2 个未知量，自由变量 1 个 → **无穷多解**：$x=3-t,y=t$。
+> **方程组 (A)**：增广矩阵 $\left(\begin{array}{cc| c}1&1&3\\2&2&6\end{array}\right)$，$R_2\leftarrow R_2-2R_1$ 得 $\left(\begin{array}{cc| c}1&1&3\\0&0&0\end{array}\right)$。第二行全零——不是矛盾，只有 1 个独立方程，2 个未知量，自由变量 1 个 → **无穷多解**：$x=3-t,y=t$。
 >
-> **方程组 (B)**：同样操作得 $\left(\begin{array}{cc\vert c}1&1&3\\0&0&1\end{array}\right)$。第二行 $0=1$，矛盾 → **无解**。
+> **方程组 (B)**：同样操作得 $\left(\begin{array}{cc| c}1&1&3\\0&0&1\end{array}\right)$。第二行 $0=1$，矛盾 → **无解**。
 >
-> **方程组 (C)**：$\left(\begin{array}{cc\vert c}1&1&3\\1&-1&1\end{array}\right)$，$R_2\leftarrow R_2-R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&3\\0&-2&-2\end{array}\right)$，有两个主元，$n=\text{rank}=2$ → **唯一解** $y=1,x=2$。
+> **方程组 (C)**：$\left(\begin{array}{cc| c}1&1&3\\1&-1&1\end{array}\right)$，$R_2\leftarrow R_2-R_1$ 得 $\left(\begin{array}{cc| c}1&1&3\\0&-2&-2\end{array}\right)$，有两个主元，$n=\text{rank}=2$ → **唯一解** $y=1,x=2$。
 >
 > **关键认知**：三个方程组左边系数矩阵 (A)(B) 完全相同，只因常数项不同就从无穷多解变成无解——判断有解无解要看**增广矩阵的秩**，不能只看系数矩阵。
 >
@@ -691,7 +691,7 @@ $A\mathbf{x}=\mathbf{b}$ 有解 $\Leftrightarrow$ $\mathbf{b}$ 在 $A$ 的列空
 【思路】写增广矩阵，行变换，观察主元数与矛盾行。
 
 【解】增广矩阵：
-$$\left(\begin{array}{ccc\vert c}1&2&-1&1\\2&4&-2&2\\1&2&1&3\end{array}\right)\xrightarrow{R_2-2R_1,R_3-R_1}\left(\begin{array}{ccc\vert c}1&2&-1&1\\0&0&0&0\\0&0&2&2\end{array}\right)\xrightarrow{R_2\leftrightarrow R_3}\left(\begin{array}{ccc\vert c}1&2&-1&1\\0&0&2&2\\0&0&0&0\end{array}\right)$$
+$$\left(\begin{array}{ccc| c}1&2&-1&1\\2&4&-2&2\\1&2&1&3\end{array}\right)\xrightarrow{R_2-2R_1,R_3-R_1}\left(\begin{array}{ccc| c}1&2&-1&1\\0&0&0&0\\0&0&2&2\end{array}\right)\xrightarrow{R_2\leftrightarrow R_3}\left(\begin{array}{ccc| c}1&2&-1&1\\0&0&2&2\\0&0&0&0\end{array}\right)$$
 
 主元列：第1、3列；$x_2$ 是自由变量。$\text{rank}(A)=2=\text{rank}([A\mid\mathbf{b}])<3=n$ → **无穷多解**。
 
@@ -707,10 +707,10 @@ $$\mathbf{x}=\begin{pmatrix}2\\0\\1\end{pmatrix}+t\begin{pmatrix}-2\\1\\0\end{pm
 
 【思路】对增广矩阵行变换，分情况讨论使主元为零的 $\lambda$。
 
-【解】$R_2-R_1$ 得 $\left(\begin{array}{cc\vert c}1&1&1\\0&\lambda-1&\lambda^2-1\end{array}\right)$。注意 $\lambda^2-1=(\lambda-1)(\lambda+1)$。
+【解】$R_2-R_1$ 得 $\left(\begin{array}{cc| c}1&1&1\\0&\lambda-1&\lambda^2-1\end{array}\right)$。注意 $\lambda^2-1=(\lambda-1)(\lambda+1)$。
 
 - $\lambda\ne 1$：$x_2=\dfrac{(\lambda-1)(\lambda+1)}{\lambda-1}=\lambda+1$，$x_1=1-(\lambda+1)=-\lambda$。**唯一解** $(x_1,x_2)=(-\lambda,\lambda+1)$。
-- $\lambda=1$：$\left(\begin{array}{cc\vert c}1&1&1\\0&0&0\end{array}\right)$，**无穷多解** $x_1=1-t,x_2=t$。
+- $\lambda=1$：$\left(\begin{array}{cc| c}1&1&1\\0&0&0\end{array}\right)$，**无穷多解** $x_1=1-t,x_2=t$。
 
 【答案】$\lambda\ne 1$ 唯一解；$\lambda=1$ 无穷多解；无参数值导致无解（因常数列 $\lambda^2-1=0$ 时 $\lambda=\pm 1$，$\lambda=1$ 已处理，$\lambda=-1$ 时 $\lambda-1=-2\ne 0$ 仍唯一解）。
 
