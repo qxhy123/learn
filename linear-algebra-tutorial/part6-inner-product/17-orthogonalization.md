@@ -840,6 +840,17 @@ $$\left\|\nabla_{\mathbf{x}^{(0)}} \mathcal{L}\right\| \leq \prod_{\ell=1}^{L} \
 
 ---
 
+## 几何示意
+
+### 图 17-1：Gram-Schmidt 正交化过程
+
+![三步逐步正交化的几何展示](../figures/svg/la-p6-17-1.svg)
+
+### 图 17-2：QR 分解几何
+
+![$A = QR$：原列 = 正交单位向量 × 上三角](../figures/svg/la-p6-17-2.svg)
+
+---
 ## 抽象成方法（套路总结）
 
 ### 核心公式速查

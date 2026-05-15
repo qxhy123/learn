@@ -922,6 +922,17 @@ $$n\sigma^2 = 1 \implies \sigma = \frac{1}{\sqrt{n}}$$
 
 ---
 
+## 几何示意
+
+### 图 16-1：投影几何
+
+![向量在另一向量上的投影 + 正交分量](../figures/svg/la-p6-16-1.svg)
+
+### 图 16-2：Cauchy-Schwarz 不等式几何
+
+![$|\langle u,v \rangle|$ 与上界 $\|u\|\|v\|$ 的关系](../figures/svg/la-p6-16-2.svg)
+
+---
 ## 抽象成方法（套路总结）
 
 ### 核心公式速查

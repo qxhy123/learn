@@ -775,6 +775,13 @@ $$\hat{\mathbf{v}} = H^+ \mathbf{y} = H^T(HH^T)^{-1}\mathbf{y} \quad \text{（�
 
 ---
 
+## 几何示意
+
+### 图 18-1：最小二乘投影几何
+
+![$\mathbf{b}$ 投影到列空间 + 残差正交](../figures/svg/la-p6-18-1.svg)
+
+---
 ## 抽象成方法（套路总结）
 
 ### 核心公式速查

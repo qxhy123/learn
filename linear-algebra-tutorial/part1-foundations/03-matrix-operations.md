@@ -543,6 +543,13 @@ $$\underbrace{Y'}_{32 \times 64} + \underbrace{\mathbf{b}}_{(64,) \to 32 \times 
 
 ---
 
+## 几何示意
+
+### 图 3-1：矩阵乘法的列空间视角
+
+![$A\mathbf{x}$ 作为列向量的线性组合](../figures/svg/la-p1-03-1.svg)
+
+---
 ## 抽象成方法（套路总结）
 
 ### 矩阵运算核心速查

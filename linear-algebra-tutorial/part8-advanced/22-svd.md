@@ -1125,6 +1125,17 @@ LoRA：$96 \times 4 \times 2 \times 4096 \times 8 \approx 25.2\text{ M}$
 
 ---
 
+## 几何示意
+
+### 图 22-1：SVD 三步骤几何
+
+![$V^T$ 旋转 → $\Sigma$ 缩放 → $U$ 旋转](../figures/svg/la-p8-22-1.svg)
+
+### 图 22-2：截断 SVD 能量保留
+
+![奇异值衰减条形 + 累积能量曲线](../figures/svg/la-p8-22-2.svg)
+
+---
 ## 抽象成方法（套路总结）
 
 ### SVD 核心公式速查
