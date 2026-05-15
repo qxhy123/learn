@@ -601,6 +601,144 @@ $$
 
 ---
 
+## 抽象成方法（套路总结）
+
+### 矩阵求导 6 公式速查
+
+| 对象 | 公式 | 备注 |
+|------|------|------|
+| $\nabla_x(a^\top x)$ | $a$ | 线性项，系数即梯度 |
+| $\nabla_x(x^\top Ax)$ | $(A+A^\top)x$ | $A$ 对称时为 $2Ax$ |
+| $\partial\,\mathrm{tr}(AX)/\partial X$ | $A^\top$ | trace 技巧核心 |
+| $\partial\ln \vert A\vert /\partial A$ | $A^{-T}$ | 高斯模型常用 |
+| $\partial L/\partial W$（线性层） | $(\partial L/\partial y)\,x^\top$ | 上游梯度与输入外积 |
+| $\partial L/\partial x$（线性层） | $W^\top(\partial L/\partial y)$ | 上游梯度左乘 $W^\top$ |
+
+### 反向传播标准 4 步
+
+1. **前向**：确认 $y=Wx+b$，记录维度
+2. **定义上游梯度**：$g=\partial L/\partial y$（与 $y$ 同维度）
+3. **参数梯度**：$\partial L/\partial W=g\,x^\top$（上游 $\times$ 输入转置）
+4. **输入梯度**：$\partial L/\partial x=W^\top g$（权重转置 $\times$ 上游）
+
+### trace 技巧 3 步流程
+
+1. 把标量写成 $\mathrm{tr}(\cdot)$（任何标量等于自身的迹）
+2. 利用迹的循环不变性 $\mathrm{tr}(ABC)=\mathrm{tr}(CAB)$ 调整顺序
+3. 利用 $df=\mathrm{tr}(G^\top dX)$ 读出梯度 $G$
+
+---
+
+## 方法变形
+
+### 变形 1：矩阵参数高维求导（Kronecker 积）
+
+当 $L=f(W)$ 且 $W$ 是矩阵时，若需要 Hessian，用向量化 $\mathrm{vec}(W)$ 配合 Kronecker 积 $A\otimes B$：
+$\mathrm{vec}(AXB)=(B^\top\otimes A)\,\mathrm{vec}(X)$。
+实践中 PyTorch 的 `functorch.hessian` 可直接计算，不需手推。
+
+### 变形 2：激活函数非线性层
+
+Sigmoid $\sigma'(x)=\sigma(x)(1-\sigma(x))$，ReLU 次梯度为 $\mathbf{1}[x>0]$。链式法则：上游梯度 $\times$ 激活函数导数（元素积），再继续往前传。注意 ReLU 在 $x=0$ 处次梯度取 0（PyTorch 默认）。
+
+### 变形 3：批量维度（batch）
+
+实际训练里输入是 $X\in\mathbb{R}^{B\times n}$，输出 $Y=XW^\top\in\mathbb{R}^{B\times m}$。梯度 $\partial L/\partial W=(\partial L/\partial Y)^\top X$（在 batch 维度上自动求和）。维度不匹配时优先检查转置方向和 batch 求和是否缺失。
+
+### 变形 4：对称矩阵约束下的梯度
+
+若 $X=X^\top$ 是约束，直接对不对称 $X$ 求导得 $G$，再对称化修正：真正的梯度为 $\frac12(G+G^\top)$。这在协方差矩阵、Fisher 信息矩阵估计中经常出现。
+
+---
+
+## 典型应用例题
+
+### 例 1：最小二乘闭式解推导
+
+> **题目**：设 $L(w)=\frac12\|Xw-y\|_2^2$，$X\in\mathbb{R}^{m\times n}$，$y\in\mathbb{R}^m$。推导最优解 $w^\star$。
+
+【思路】展开为二次型，令梯度为零。
+
+【解】展开：$L=\frac12(Xw-y)^\top(Xw-y)=\frac12w^\top X^\top Xw - y^\top Xw+\frac12 y^\top y$。
+
+梯度：$\nabla_w L=X^\top Xw - X^\top y$。
+
+令 $\nabla_w L=0$：$X^\top Xw^\star=X^\top y$。
+
+【答案】$\boxed{w^\star=(X^\top X)^{-1}X^\top y}$（正规方程，当 $X^\top X$ 可逆时）。
+
+### 例 2：softmax + 交叉熵梯度化简
+
+> **题目**：$p=\mathrm{softmax}(z)$，$L=-\sum_i y_i\log p_i$（$y$ 为 one-hot）。求 $\nabla_z L$。
+
+【思路】链式法则：$\nabla_z L=J_{\mathrm{softmax}}^\top\nabla_p L$，但可直接化简。
+
+【解】$\nabla_{p_i} L=-y_i/p_i$。softmax Jacobian $\partial p_i/\partial z_j=p_i(\delta_{ij}-p_j)$。
+
+$$\frac{\partial L}{\partial z_j}=\sum_i\frac{\partial L}{\partial p_i}\frac{\partial p_i}{\partial z_j}=\sum_i\left(-\frac{y_i}{p_i}\right)p_i(\delta_{ij}-p_j)=-y_j+\left(\sum_i y_i\right)p_j=p_j-y_j.$$
+
+【答案】$\boxed{\nabla_z L = p - y}$。one-hot 标签时梯度极简——预测概率减去标签。
+
+### 例 3：trace 技巧求矩阵梯度
+
+> **题目**：$L=\mathrm{tr}(W^\top AW)$，$A$ 对称正定，$W\in\mathbb{R}^{n\times k}$。求 $\partial L/\partial W$。
+
+【思路】用 trace 技巧加矩阵微分。
+
+【解】$dL=\mathrm{tr}(dW^\top AW)+\mathrm{tr}(W^\top A\,dW)=\mathrm{tr}(W^\top A\,dW)+\mathrm{tr}((AW)^\top dW)$。
+
+利用 $\mathrm{tr}(B^\top dW)=\langle B,dW\rangle$，读出梯度：
+
+$$\frac{\partial L}{\partial W}=AW+A^\top W.$$
+
+因 $A=A^\top$，化简为 $\boxed{2AW}$。
+
+---
+
+## 自测题
+
+**自测 1**　$f(x)=c^\top Ax+\frac12 x^\top Bx$（$B$ 对称）。求 $\nabla_x f$。
+
+> 💡 提示：线性项梯度 $A^\top c$，二次项梯度 $Bx$，合并为 $A^\top c + Bx$。
+
+**自测 2**　线性层 $y=Wx+b$，损失 $L$，上游梯度 $g=\partial L/\partial y$。写出 $\partial L/\partial b$。
+
+> 💡 提示：$y$ 对 $b$ 是恒等映射，$\partial L/\partial b=g$（与 $b$ 同维度，不需转置）。
+
+**自测 3**　对 $A\in\mathbb{R}^{n\times n}$ 可逆，验证 $d(A^{-1})=-A^{-1}\,dA\,A^{-1}$。
+
+> 💡 提示：对 $AA^{-1}=I$ 两边取微分：$dA\cdot A^{-1}+A\cdot d(A^{-1})=0$，解出 $d(A^{-1})$。
+
+**自测 4**　为什么说 RNN 的梯度消失/爆炸与 Jacobian 矩阵连乘的谱半径有关？
+
+> 💡 提示：反向传播经过 $T$ 步时产生 $\prod_{t=1}^T J_t$。若谱半径 $<1$，乘积范数指数衰减；若 $>1$，指数增长。LSTM/GRU 通过门控机制缓解此问题。
+
+**自测 5**　$L=\frac12\|Wx-b\|_2^2$，求 $\partial^2 L/\partial W^2$（Hessian 关于 $W$）。
+
+> 💡 提示：$\partial L/\partial W=(Wx-b)x^\top$；再对 $W$ 求导需 Kronecker 积：Hessian 为 $xx^\top\otimes I_m$（大小 $mn\times mn$）。实践中不显式构造，用 Hessian-vector product 代替。
+
+---
+
+## 融合版说明
+
+本版 = **原版（矩阵微积分严格推导 + 反向传播 + 自动微分）** + **融合补充（套路速查 / 例题 / 自测）**：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 26.1–26.4 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 融合版 | 套路总结 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 融合版 | 演练 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 融合版 | 额外训练 |
+
+**适用**：先看速记建立矩阵求导直觉，看反向传播完整推导，做套路总结，最后例题 + 自测验收。掌握"二次型-trace 技巧-链式法则"三板斧，神经网络梯度推导游刃有余。
+
+---
+
 ## 练习题
 
 **1.** ⭐ 计算

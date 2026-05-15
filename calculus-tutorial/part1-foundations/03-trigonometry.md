@@ -1,5 +1,28 @@
 # 第3章 三角函数
 
+> **一例速记**：
+> **弧度制**：$\pi \text{ rad} = 180°$；弧长 $l = r\theta$；扇形面积 $S = \frac{1}{2}r^2\theta$（$\theta$ 必须为弧度）。
+> **单位圆定义**：$(\cos\theta, \sin\theta)$ 是终边交点；$\tan\theta = \sin\theta/\cos\theta$。符号记忆：第一象限全正，其余"ASTC"（All, Sin, Tan, Cos）。
+> **核心恒等式**：$\sin^2 x + \cos^2 x = 1$；倍角 $\sin 2x = 2\sin x\cos x$，$\cos 2x = 1 - 2\sin^2 x = 2\cos^2 x - 1$。
+> **反三角**：$\arcsin$ 值域 $[-\pi/2,\pi/2]$（奇函数）；$\arccos$ 值域 $[0,\pi]$；$\arctan$ 值域 $(-\pi/2,\pi/2)$（奇函数）。超出主值区间必须"折回"。
+> **参数变换**：$A\sin(Bx+C)+D$：振幅 $|A|$，周期 $2\pi/|B|$，相位移 $-C/B$，中心线 $y=D$。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目：求 $\sin\dfrac{5\pi}{6}$，$\cos\left(-\dfrac{2\pi}{3}\right)$，以及 $\arcsin\left(\sin\dfrac{5\pi}{6}\right)$。
+>
+> **第一问 $\sin\frac{5\pi}{6}$**：$\frac{5\pi}{6}$ 在 $[0, \pi]$ 里，是第二象限。参考角 $= \pi - \frac{5\pi}{6} = \frac{\pi}{6}$。第二象限 sin 为正，所以 $\sin\frac{5\pi}{6} = +\sin\frac{\pi}{6} = \frac{1}{2}$。
+>
+> **第二问 $\cos(-\frac{2\pi}{3})$**：余弦是偶函数，$\cos(-\frac{2\pi}{3}) = \cos\frac{2\pi}{3}$。$\frac{2\pi}{3}$ 在第二象限，参考角 $= \pi - \frac{2\pi}{3} = \frac{\pi}{3}$，cos 在第二象限为负，所以 $= -\cos\frac{\pi}{3} = -\frac{1}{2}$。
+>
+> **第三问 $\arcsin(\sin\frac{5\pi}{6})$**：从第一问知 $\sin\frac{5\pi}{6} = \frac{1}{2}$。于是问题变成 $\arcsin\frac{1}{2}$。反正弦的值域是 $[-\frac{\pi}{2}, \frac{\pi}{2}]$，在这个范围内 $\sin$ 值等于 $\frac{1}{2}$ 的角是 $\frac{\pi}{6}$，所以 $\arcsin(\sin\frac{5\pi}{6}) = \frac{\pi}{6}$。
+>
+> **关键警示**：$\arcsin(\sin\frac{5\pi}{6}) \neq \frac{5\pi}{6}$！因为 $\frac{5\pi}{6}$ 在主值区间 $[-\frac{\pi}{2}, \frac{\pi}{2}]$ 之外，必须把结果折回值域。反三角函数求值的固定模式是：先算内层 $\sin$ 值，再在主值区间内找到对应角。"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -1130,3 +1153,160 @@ $$
 3. **$\sin^{-1} x \neq 1/\sin x$**：前者是反函数，后者是倒数（即 $\csc x$）。
 4. **倍角公式选哪个 $\cos 2x$ 形式**：算积分通常用 $1 - 2\sin^2 x$ 或 $2\cos^2 x - 1$（便于消去某变量）。
 5. **诱导公式"奇变偶不变 + 符号看象限"**：$\sin(\pi/2 + x) = \cos x$（奇变）、$\sin(\pi + x) = -\sin x$（偶不变 + 第三象限）。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 三角函数核心公式速查
+
+| 类别 | 公式 | 说明 |
+|---|---|---|
+| 平方关系 | $\sin^2 x + \cos^2 x = 1$ | 最优先使用 |
+| 商关系 | $\tan x = \sin x / \cos x$ | 消去 tan |
+| 倍角（sin） | $\sin 2x = 2\sin x\cos x$ | 乘积变倍角 |
+| 倍角（cos） | $\cos 2x = 2\cos^2 x - 1 = 1 - 2\sin^2 x$ | 消去平方项 |
+| 和差角 | $\sin(\alpha\pm\beta) = \sin\alpha\cos\beta \pm \cos\alpha\sin\beta$ | 求特殊角精确值 |
+| 反正弦 | $\arcsin x \in [-\pi/2,\pi/2]$，奇函数 | 超出要折回 |
+| 反余弦 | $\arccos x \in [0,\pi]$，单调递减 | $\arcsin x + \arccos x = \pi/2$ |
+| 反正切 | $\arctan x \in (-\pi/2,\pi/2)$，奇函数 | 定义域 $\mathbb{R}$ |
+
+### 任意角求值标准四步
+
+1. 化为 $[0,2\pi)$ 内等终边角；
+2. 找参考角（与 $x$ 轴成的锐角）；
+3. 查特殊角值表（$\pi/6,\pi/4,\pi/3$）；
+4. 按象限确定符号（ASTC：第一全正，第二 sin，第三 tan，第四 cos）。
+
+---
+
+## 方法变形
+
+### 变形 1：辅助角公式
+
+$a\sin x + b\cos x = \sqrt{a^2+b^2}\sin(x+\varphi)$，其中 $\tan\varphi = b/a$。用于求最值或化简含两个三角函数的表达式。
+
+### 变形 2：积化和差 + 和差化积
+
+积分 $\int \sin mx\cos nx\,dx$ 必须先积化和差，否则无法直接积出。Fourier 级数的正交性也由积化和差推导。
+
+### 变形 3：反三角函数的复合
+
+$\arcsin(\sin x) = x$ 仅对 $x \in [-\pi/2,\pi/2]$ 成立；其余角必须先用对称性折回主值区间，再写结果。类似规则对 $\arccos,\arctan$ 成立。
+
+### 变形 4：含参数 $B$ 的周期
+
+$\sin(Bx+C)$ 的周期为 $2\pi/|B|$，不是 $2\pi$。变换 $A\sin(Bx+C)+D$ 的五量（振幅 $A$，周期 $2\pi/|B|$，相位移 $-C/B$，中心线 $D$，值域 $[D-|A|,D+|A|]$）要逐一读出。
+
+---
+
+## 典型应用例题
+
+### 例 1：任意角求值
+
+> **题目**：求 $\cos\dfrac{11\pi}{6}$ 和 $\tan\left(-\dfrac{5\pi}{4}\right)$。
+
+【思路】化到 $[0,2\pi)$，找参考角，看象限定符号。
+
+【解】
+$\frac{11\pi}{6} = 2\pi - \frac{\pi}{6}$，在第四象限，参考角 $\frac{\pi}{6}$，cos 在第四象限正，所以
+
+$$\cos\frac{11\pi}{6} = +\cos\frac{\pi}{6} = \frac{\sqrt{3}}{2}.$$
+
+$-\frac{5\pi}{4}$ 加 $2\pi$ 得 $\frac{3\pi}{4}$，在第二象限，参考角 $\frac{\pi}{4}$，tan 在第二象限负，所以
+
+$$\tan\left(-\frac{5\pi}{4}\right) = \tan\frac{3\pi}{4} = -1.$$
+
+【答案】$\boxed{\cos\frac{11\pi}{6} = \frac{\sqrt{3}}{2},\quad \tan(-\frac{5\pi}{4}) = -1}$。
+
+### 例 2：恒等式证明
+
+> **题目**：化简 $\dfrac{\sin 3x - \sin x}{\cos 3x + \cos x}$。
+
+【思路】分子和差化积，分母和差化积。
+
+【解】
+
+$$\text{分子} = 2\cos\frac{3x+x}{2}\sin\frac{3x-x}{2} = 2\cos 2x\sin x.$$
+
+$$\text{分母} = 2\cos\frac{3x+x}{2}\cos\frac{3x-x}{2} = 2\cos 2x\cos x.$$
+
+（要求 $\cos 2x \neq 0$ 且 $\cos x \neq 0$）
+
+$$\frac{\sin 3x - \sin x}{\cos 3x + \cos x} = \frac{2\cos 2x\sin x}{2\cos 2x\cos x} = \tan x.$$
+
+【答案】$\boxed{\tan x}$（在适当定义域上）。
+
+### 例 3：反三角函数"折回"
+
+> **题目**：求 $\arccos\!\left(\cos\dfrac{7\pi}{6}\right)$ 和 $\arctan\!\left(\tan\dfrac{4\pi}{3}\right)$。
+
+【思路】先算内层三角函数值，再在主值区间内找对应角。
+
+【解】
+
+$\cos\dfrac{7\pi}{6} = \cos(\pi + \dfrac{\pi}{6}) = -\cos\dfrac{\pi}{6} = -\dfrac{\sqrt{3}}{2}$。
+
+$\arccos$ 值域 $[0,\pi]$，在此区间内 $\cos$ 值为 $-\dfrac{\sqrt{3}}{2}$ 的角是 $\dfrac{5\pi}{6}$，故
+
+$$\arccos\!\left(\cos\frac{7\pi}{6}\right) = \frac{5\pi}{6}.$$
+
+$\tan\dfrac{4\pi}{3} = \tan(\pi + \dfrac{\pi}{3}) = \tan\dfrac{\pi}{3} = \sqrt{3}$。
+
+$\arctan$ 值域 $(-\dfrac{\pi}{2},\dfrac{\pi}{2})$，在此区间内 $\tan$ 值为 $\sqrt{3}$ 的角是 $\dfrac{\pi}{3}$，故
+
+$$\arctan\!\left(\tan\frac{4\pi}{3}\right) = \frac{\pi}{3}.$$
+
+【答案】$\boxed{\dfrac{5\pi}{6};\quad \dfrac{\pi}{3}}$。注：两结果都与原角不同——折回主值区间是反三角的核心操作。
+
+---
+
+## 自测题
+
+**自测 1**　求 $\sin\dfrac{7\pi}{4}$，$\cos\dfrac{5\pi}{3}$，$\tan\dfrac{2\pi}{3}$。
+
+> 💡 提示：$\sin\frac{7\pi}{4} = -\frac{\sqrt{2}}{2}$（第四象限）；$\cos\frac{5\pi}{3} = \frac{1}{2}$（第四象限）；$\tan\frac{2\pi}{3} = -\sqrt{3}$（第二象限）。
+
+**自测 2**　已知 $\cos\alpha = -\dfrac{3}{5}$，$\alpha \in (\pi/2, \pi)$，求 $\sin\alpha$，$\tan\alpha$，$\sin 2\alpha$。
+
+> 💡 提示：$\sin\alpha = \frac{4}{5}$（第二象限正）；$\tan\alpha = -\frac{4}{3}$；$\sin 2\alpha = 2 \cdot \frac{4}{5} \cdot (-\frac{3}{5}) = -\frac{24}{25}$。
+
+**自测 3**　化简 $A\sin x + A\cos x$（$A > 0$）为辅助角形式，求最大值。
+
+> 💡 提示：$= A\sqrt{2}\sin(x + \pi/4)$，最大值 $A\sqrt{2}$（当 $x = \pi/4$ 时取到）。
+
+**自测 4**　求 $\arcsin(\sin 2)$（$2$ 为弧度）。
+
+> 💡 提示：$2 \notin [-\pi/2, \pi/2]$（$\pi/2 \approx 1.57$），用对称性：$\sin 2 = \sin(\pi - 2)$，且 $\pi - 2 \approx 1.14 \in [-\pi/2, \pi/2]$，所以 $\arcsin(\sin 2) = \pi - 2$。
+
+**自测 5**　Transformer 位置编码中有 $PE_{pos,2i} = \sin(pos/10000^{2i/d})$。解释为什么用 $(\sin t, \cos t)$ 对而非只用 $\sin t$，来表示位置 $t$。
+
+> 💡 提示：单个 $\sin t$ 在一个周期内不是单射（同一值对应多个角），无法唯一区分位置；$(\sin t, \cos t)$ 对应单位圆上的唯一点，且对任意位移 $\delta$，可用线性旋转矩阵表示 $(\sin(t+\delta), \cos(t+\delta))$，让模型通过线性运算学相对位置。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 弧度 $\pi = 180°$；单位圆 $(\cos\theta, \sin\theta)$；$\sin^2+\cos^2=1$；反三角值域限制，超出必须折回。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 2——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习题）** + **重写版（速记 / 思维路径 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 3.1–3.8 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 原版配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 重写版（中间） | 套路总结 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 重写版 | 演练 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 答案 | 原版 | 巩固 |
+| 自测题 5 题 | 重写版 | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做练习巩固，自测验收。

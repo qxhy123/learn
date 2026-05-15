@@ -1,5 +1,43 @@
 # 第28章 随机微分方程入门
 
+> **一例速记：Itô 公式 + 几何布朗运动 + 反向 SDE**
+>
+> | 对象 | 公式 / 结论 | 记忆口诀 |
+> |------|------------|---------|
+> | 布朗运动增量 | $W_t-W_s\sim\mathcal{N}(0,t-s)$ | 增量正态，方差是时间差 |
+> | Itô 规则 | $(dW)^2=dt$，$dW\cdot dt=0$ | 比普通微积分多一阶项 |
+> | Itô 公式 | $df=f_t\,dt+f_x\,dX+\frac12 f_{xx}\sigma^2\,dt$ | 比链式法则多二阶修正 |
+> | 几何布朗运动 | $S_t=S_0\exp[(\mu-\sigma^2/2)t+\sigma W_t]$ | 对数取 Itô 公式，注意漂移修正 $-\sigma^2/2$ |
+> | 反向 SDE | $dx=[f-g^2\nabla_x\log p_t]\,dt+g\,d\bar{W}$ | 前向加噪→反向靠 score 导航 |
+
+---
+
+## 引入：$d(W_t^2)$ 为什么多了一项 $dt$？
+
+> **题目**：$W_t$ 是标准布朗运动。用 Itô 公式计算 $d(W_t^2)$，并与普通链式法则对比。
+
+先停下来想一想：普通链式法则给 $d(x^2)=2x\,dx$，但对布朗运动这样做会**漏掉一项**。为什么？
+
+## 思维路径还原
+
+> "看到 $W_t^2$，想到 $f(x)=x^2$，$f'=2x$，$f''=2$。
+>
+> **普通链式法则**：$d(W_t^2)\stackrel{?}{=}2W_t\,dW_t$——但这是错的！
+>
+> **Itô 公式登场**：$f(X_t,t)$，$dX=\mu\,dt+\sigma\,dW$。公式给出
+>
+> $$df=f_t\,dt+f_x\,dX+\frac12 f_{xx}(dX)^2.$$
+>
+> 对 $W_t$ 而言，$\mu=0$，$\sigma=1$，$(dW)^2=dt$（Itô 规则，不为零！）。
+>
+> $$d(W_t^2)=2W_t\,dW_t+\frac12\cdot 2\cdot(dW_t)^2=2W_t\,dW_t+dt.$$
+>
+> **两端取期望**：$\mathbb{E}[dW_t]=0$（Itô 积分期望为零），故 $\mathbb{E}[d(W_t^2)]=dt$，即 $\mathbb{E}[W_t^2]=t$。这与布朗运动方差定义 $\mathrm{Var}(W_t)=t$ 完全吻合。
+>
+> **多出 $dt$ 的物理直觉**：布朗路径的波动量级是 $\sqrt{dt}$，平方后变成 $dt$，是一阶量而非二阶小量，不可忽略。这是随机微积分与确定性微积分最根本的区别。"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -434,6 +472,149 @@ print("sample variance proxy =", np.var(np.diff(path)))
 4. **平稳性 vs 各态历经**：平稳分布（$\partial p/\partial t=0$）说明分布不再变化，但不代表单条轨迹会遍历所有状态（各态历经性）。两者是不同概念，在扩散模型的理论分析中不能混用。
 
 5. **数值方法（Euler-Maruyama）的误差理解**：Euler-Maruyama 是强收敛阶 $1/2$、弱收敛阶 $1$ 的方法——前者控制路径误差，后者控制分布误差。步长减半不会使误差减半（强收敛阶仅 $1/2$）。需要更高阶方法（Milstein、RK SDE 格式）来提高精度。
+
+---
+
+## 抽象成方法（套路总结）
+
+### SDE 核心 6 公式速查
+
+| 对象 | 公式 | 备注 |
+|------|------|------|
+| 布朗增量 | $\Delta W\sim\mathcal{N}(0,\Delta t)$ | $\Delta W=\sqrt{\Delta t}\,\varepsilon$，$\varepsilon\sim\mathcal{N}(0,1)$ |
+| Itô 规则 | $(dW)^2=dt$，$dW\,dt=0$，$(dt)^2=0$ | 三条代数规则，缺一不可 |
+| Itô 公式 | $df=f_t\,dt+f_x\mu\,dt+(f_x\sigma+\frac12 f_{xx}\sigma^2\,dt)\,dW$（简写） | 对比普通链式法则多 $\frac12 f_{xx}\sigma^2\,dt$ |
+| 几何布朗 | $S_t=S_0e^{(\mu-\sigma^2/2)t+\sigma W_t}$ | 取对数 + Itô 公式 |
+| Fokker-Planck | $\partial_t p=-\partial_x(\mu p)+\frac12\partial_{xx}(\sigma^2 p)$ | 分布视角，$\partial_t p=0$ 求平稳 |
+| 反向 SDE | $dx=[f-g^2\nabla_x\log p_t]\,dt+g\,d\bar{W}$ | score function 是"方向盘" |
+
+### Itô 公式 5 步应用法
+
+1. **识别 SDE**：写出 $dX=\mu\,dt+\sigma\,dW$，确认 $\mu,\sigma$
+2. **选函数**：$Y=f(X_t,t)$，求 $f_t,f_x,f_{xx}$
+3. **代入 Itô 公式**：$dY=f_t\,dt+f_x dX+\frac12 f_{xx}(dX)^2$
+4. **展开 $(dX)^2=\sigma^2\,dt$**（Itô 规则，不为零）
+5. **整理成 $a\,dt+b\,dW$ 标准形式**
+
+---
+
+## 方法变形
+
+### 变形 1：Euler-Maruyama 数值离散化
+
+连续 SDE $dX=\mu\,dt+\sigma\,dW$ → 离散步骤：
+$$X_{n+1}=X_n+\mu(X_n,t_n)\Delta t+\sigma(X_n,t_n)\sqrt{\Delta t}\,\varepsilon_n,\quad\varepsilon_n\sim\mathcal{N}(0,1).$$
+强收敛阶 $1/2$，弱收敛阶 1。步长减半，强误差仅减少 $1/\sqrt{2}$，不是减半。
+
+### 变形 2：Itô vs Stratonovich 转换
+
+Stratonovich 积分（中点规则）满足普通链式法则，物理文献常用。与 Itô 的关系：
+$$\int f\,\circ\,dW=\int f\,dW+\frac12\int f'\sigma\,dt.$$
+转换时加一个"修正漂移"$\frac12 \sigma\partial_x\sigma$。选哪种取决于应用背景，但结果等价。
+
+### 变形 3：平稳分布求解
+
+Fokker-Planck 令 $\partial_t p=0$，对一维 SDE $dX=-V'(X)\,dt+\sqrt{2}\,dW$（梯度流 + 噪声），平稳分布为 Boltzmann 分布：
+$$p^\star(x)\propto e^{-V(x)}.$$
+OU 过程 $dX=-\theta X\,dt+\sigma\,dW$ 的平稳分布：$\mathcal{N}(0,\sigma^2/(2\theta))$。
+
+### 变形 4：Score Matching 与去噪等价
+
+训练 score 网络 $s_\theta(x,t)\approx\nabla_x\log p_t(x)$ 时，直接最小化 Fisher 散度不可行（含未知 $p_t$）。用 denoising score matching 等价目标：
+$$\mathcal{L}=\mathbb{E}_{t,x_0,\varepsilon}\!\left[\|s_\theta(x_t,t)+\varepsilon/\sqrt{1-\bar\alpha_t}\|^2\right].$$
+预测噪声 $\varepsilon$ 与预测 score 在高斯加噪设定下完全等价，只差一个常数缩放。
+
+---
+
+## 典型应用例题
+
+### 例 1：Itô 公式计算 $d(e^{W_t})$
+
+> **题目**：$W_t$ 是标准布朗运动，$f(x)=e^x$。求 $d(e^{W_t})$ 并取期望。
+
+【思路】$f'=f''=e^x$，对 $X_t=W_t$（$\mu=0,\sigma=1$）用 Itô 公式。
+
+【解】$d(e^{W_t})=e^{W_t}\,dW_t+\frac12 e^{W_t}\,dt$。
+
+取期望：$\frac{d}{dt}\mathbb{E}[e^{W_t}]=\frac12\mathbb{E}[e^{W_t}]$（Itô 积分期望为零）。
+
+解 ODE：$\mathbb{E}[e^{W_t}]=e^{t/2}$。
+
+【答案】$\boxed{d(e^{W_t})=e^{W_t}\,dW_t+\frac12 e^{W_t}\,dt}$，期望 $\mathbb{E}[e^{W_t}]=e^{t/2}$（正态 MGF 在 $t=1$ 处恰为此值）。
+
+### 例 2：几何布朗运动的 Itô 推导
+
+> **题目**：$dS=\mu S\,dt+\sigma S\,dW$，求 $\ln S_t$ 的 SDE 并得出 $S_t$ 的显式解。
+
+【思路】令 $Y=\ln S$，Itô 公式。
+
+【解】$f(S)=\ln S$，$f'=1/S$，$f''=-1/S^2$。
+
+$$dY=\frac{1}{S}\,dS-\frac12\frac{1}{S^2}(dS)^2=\mu\,dt+\sigma\,dW-\frac12\sigma^2\,dt=\left(\mu-\frac{\sigma^2}{2}\right)dt+\sigma\,dW.$$
+
+积分：$Y_t=Y_0+(\mu-\sigma^2/2)t+\sigma W_t$，指数化得：
+
+$$\boxed{S_t=S_0\exp\left[\left(\mu-\frac{\sigma^2}{2}\right)t+\sigma W_t\right]}.$$
+
+【注】漂移修正项 $-\sigma^2/2$ 纯粹来自 Itô 公式的二阶项，普通链式法则会漏掉。
+
+### 例 3：OU 过程的平稳分布
+
+> **题目**：OU 过程 $dX=-\theta X\,dt+\sigma\,dW$（$\theta>0$）。写出其 Fokker-Planck 方程，并求平稳分布。
+
+【思路】直接代入 Fokker-Planck，令 $\partial_t p=0$ 求解。
+
+【解】Fokker-Planck：$\partial_t p=\theta\partial_x(xp)+\frac{\sigma^2}{2}\partial_{xx}p$。
+
+令 $\partial_t p=0$：$\theta\partial_x(xp)+\frac{\sigma^2}{2}\partial_{xx}p=0$，即 $\theta xp+\frac{\sigma^2}{2}\partial_x p=C$（$C=0$ 由边界条件）。
+
+解 ODE $\frac{d\ln p}{dx}=-\frac{2\theta}{\sigma^2}x$，得 $p(x)\propto e^{-\theta x^2/\sigma^2}$。
+
+【答案】$\boxed{p^\star(x)=\mathcal{N}\!\left(0,\frac{\sigma^2}{2\theta}\right)}$。方差随噪声增强而增大、随回归力增强而减小，直觉完全一致。
+
+---
+
+## 自测题
+
+**自测 1**　用 Itô 公式计算 $d(W_t^3)$，并验证 $\mathbb{E}[W_t^3]=0$。
+
+> 💡 提示：$f=x^3$，$f'=3x^2$，$f''=6x$。$d(W_t^3)=3W_t^2\,dW_t+3W_t\,dt$。期望：$\mathbb{E}[W_t^3]=3\int_0^t\mathbb{E}[W_s]\,ds=0$（布朗运动期望为零）。
+
+**自测 2**　DDPM 前向步 $q(x_t|x_0)=\mathcal{N}(\sqrt{\bar\alpha_t}x_0,(1-\bar\alpha_t)I)$。当 $\bar\alpha_T\to 0$ 时，$q(x_T|x_0)$ 趋向何分布？为什么这对生成模型有意义？
+
+> 💡 提示：$\bar\alpha_T\to 0$ 时，均值 $\to 0$，方差 $\to I$，即 $x_T\sim\mathcal{N}(0,I)$（纯噪声）。生成时从标准高斯采样开始，沿反向 SDE 去噪，使模型无需显式知道数据支撑。
+
+**自测 3**　几何布朗运动 $S_t=S_0e^{(\mu-\sigma^2/2)t+\sigma W_t}$。求 $\mathbb{E}[S_t]$ 和 $\mathrm{Var}(S_t)$。
+
+> 💡 提示：$W_t\sim\mathcal{N}(0,t)$，用对数正态分布公式：$\mathbb{E}[S_t]=S_0 e^{\mu t}$，$\mathrm{Var}(S_t)=S_0^2 e^{2\mu t}(e^{\sigma^2 t}-1)$。漂移修正 $-\sigma^2/2$ 使得期望增长速率是 $\mu$ 而不是 $\mu-\sigma^2/2$。
+
+**自测 4**　为什么说 DDIM 采样是对"概率流 ODE"的数值积分，而 DDPM 采样是对"反向 SDE"的数值积分？区别在哪里？
+
+> 💡 提示：概率流 ODE 去掉了随机项 $g\,d\bar W$，仅保留确定性漂移，因此同一初始值出发轨迹唯一（确定性）。反向 SDE 保留随机项，同一噪声输入每次生成结果不同（随机性）。两者边际分布相同，但轨迹统计性质不同；ODE 允许用更大步长，步数少、速度快。
+
+**自测 5**　Euler-Maruyama 对 $dX=-\theta X\,dt+\sigma\,dW$ 做离散化，步长 $\Delta t$。写出迭代格式，并说明什么条件下数值方法是稳定的。
+
+> 💡 提示：$X_{n+1}=(1-\theta\Delta t)X_n+\sigma\sqrt{\Delta t}\,\varepsilon_n$。稳定性要求漂移项系数 $\vert 1-\theta\Delta t\vert<1$，即 $\Delta t<2/\theta$。步长过大导致系数绝对值超过 1，数值解发散（即使真实解稳定）。
+
+---
+
+## 融合版说明
+
+本版 = **原版（SDE 严格理论 + Itô 公式 + 扩散模型推导）** + **融合补充（速记 / 路径 / 套路 / 例题 / 自测）**：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 28.1–28.5 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 融合版 | 套路总结 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 融合版 | 演练 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 融合版 | 额外训练 |
+
+**适用**：先看速记建立"布朗运动 → Itô 公式 → 扩散模型"直觉链，看严格推导，做套路总结，最后用例题 + 自测验收。掌握"Itô 规则-几何布朗-反向 SDE"三件套，扩散模型数学框架一览无余。
 
 ---
 

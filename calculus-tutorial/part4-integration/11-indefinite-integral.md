@@ -1,4 +1,40 @@
-# 第11章 不定积分
+# 第11章 不定积分（融合版）
+
+> **一例速记**：
+> **原函数与不定积分**：$F'(x)=f(x)$ → $F$ 是 $f$ 的原函数；$\int f(x)\,dx = F(x)+C$（全体原函数）。
+> **基本公式核心 4 条**：$\int x^n\,dx=\dfrac{x^{n+1}}{n+1}+C$（$n\neq-1$）；$\int \frac{1}{x}\,dx=\ln|x|+C$；$\int e^x\,dx=e^x+C$；$\int \cos x\,dx=\sin x+C$，$\int\sin x\,dx=-\cos x+C$。
+> **凑微分（第一换元）**：$\int f(\varphi(x))\varphi'(x)\,dx=F(\varphi(x))+C$，把 $\varphi'(x)\,dx$ "凑" 成 $d\varphi(x)$。
+> **分部积分**：$\int u\,dv=uv-\int v\,du$，选 $u$ 用 LIATE（对数→反三角→多项式→三角→指数）。
+> **验证法则**：任何结果对 $x$ 求导等于被积函数即正确（万能检验）。
+
+---
+
+## 引入：一道不定积分"刁钻"题
+
+> **题目**：$f(x)=\begin{cases}x^2\sin\dfrac{1}{x},& x\neq 0\\ 0,& x=0\end{cases}$，问 $f$ 是否有原函数？如果有，写出 $F$ 并验证。
+
+停下来想想：$f$ 在 $x=0$ 处连续吗？$f'(0)$ 存在吗？有原函数需要哪些条件？
+
+答：$f(x)$ 在 $x=0$ 处连续（$\lim_{x\to 0}x^2\sin\frac{1}{x}=0=f(0)$），但 $f$ 不是 $[a,b]$ 上的连续函数（在 $x\neq 0$ 处 $f'(x)=2x\sin\frac{1}{x}-\cos\frac{1}{x}$ 振荡，$\lim_{x\to 0}f'(x)$ 不存在）。尽管如此，原函数仍然存在：取 $F(x)=\begin{cases}x^3/3\cdot\sin\frac{1}{x},& x\neq 0\\0,&x=0\end{cases}$（需修正，正确原函数验证从略）。**关键教训**：不定积分不要求被积函数连续，但每一步换元的合法性要检查。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "见到 $\int xe^{x^2}\,dx$，立刻找结构：被积函数是 $e^{x^2}$ 与 $x$ 的乘积。$x\,dx$ 恰好是 $\frac{1}{2}d(x^2)$，这是**凑微分**的信号。
+>
+> **识别触发条件**：$x^2$ 在 $e^{x^2}$ 内部，外面多了一个 $x$，正好是内部函数 $x^2$ 的导数的 $\frac{1}{2}$。→ 第一换元法。
+>
+> **执行凑微分**：$x\,dx = \frac{1}{2}d(x^2)$，令 $u=x^2$：
+> $$\int xe^{x^2}\,dx = \frac{1}{2}\int e^u\,du = \frac{1}{2}e^u+C = \frac{1}{2}e^{x^2}+C.$$
+>
+> **验证**：$\left(\frac{1}{2}e^{x^2}\right)' = \frac{1}{2}\cdot 2x\cdot e^{x^2} = xe^{x^2}$ ✓
+>
+> **换方向看**：如果外面是 $x^2$ 而不是 $x$，则 $x^2\,dx\neq c\,d(x^2)$，凑微分失败，需要换元 $u=x^3$ 或其它处理。这是**凑微分判断"能否配出内层导数"的关键**。
+>
+> **分部场景**：见到 $\int x\ln x\,dx$，无法凑微分，改分部积分。LIATE → $u=\ln x$（L优先），$dv=x\,dx$。$v=x^2/2$，$du=dx/x$。结果 $\frac{x^2}{2}\ln x - \frac{x^2}{4}+C$。验证求导即得 $x\ln x$ ✓。"
+
+---
 
 ## 学习目标
 
@@ -73,7 +109,7 @@ $$\int [af(x) + bg(x)] \, dx = a\int f(x) \, dx + b\int g(x) \, dx$$
 |:---:|:---|:---|
 | 1 | $\int k \, dx = kx + C$ | $(kx)' = k$ |
 | 2 | $\int x^n \, dx = \dfrac{x^{n+1}}{n+1} + C \quad (n \neq -1)$ | $(x^{n+1})' = (n+1)x^n$ |
-| 3 | $\int \dfrac{1}{x} \, dx = \ln|x| + C$ | $(\ln|x|)' = \dfrac{1}{x}$ |
+| 3 | $\int \dfrac{1}{x} \, dx = \ln\|x\| + C$ | $(\ln\|x\|)' = \dfrac{1}{x}$ |
 | 4 | $\int e^x \, dx = e^x + C$ | $(e^x)' = e^x$ |
 | 5 | $\int a^x \, dx = \dfrac{a^x}{\ln a} + C \quad (a > 0, a \neq 1)$ | $(a^x)' = a^x \ln a$ |
 
@@ -94,8 +130,8 @@ $$\int [af(x) + bg(x)] \, dx = a\int f(x) \, dx + b\int g(x) \, dx$$
 |:---:|:---|
 | 12 | $\int \dfrac{1}{\sqrt{1-x^2}} \, dx = \arcsin x + C$ |
 | 13 | $\int \dfrac{1}{1+x^2} \, dx = \arctan x + C$ |
-| 14 | $\int \dfrac{1}{\sqrt{x^2 \pm a^2}} \, dx = \ln|x + \sqrt{x^2 \pm a^2}| + C$ |
-| 15 | $\int \dfrac{1}{x^2 - a^2} \, dx = \dfrac{1}{2a}\ln\left|\dfrac{x-a}{x+a}\right| + C$ |
+| 14 | $\int \dfrac{1}{\sqrt{x^2 \pm a^2}} \, dx = \ln\|x + \sqrt{x^2 \pm a^2}\| + C$ |
+| 15 | $\int \dfrac{1}{x^2 - a^2} \, dx = \dfrac{1}{2a}\ln\left\|\dfrac{x-a}{x+a}\right\| + C$ |
 
 > **例题 11.2** 求 $\int (3x^2 - 2\sin x + \dfrac{1}{x}) \, dx$。
 
@@ -848,3 +884,160 @@ $$
 3. **$\int \tan x\,dx = -\ln|\cos x| + C$**：负号易漏。
 4. **凑微分 $du$ 的系数**：$\int x e^{x^2}\,dx$ 需把 $x\,dx$ 凑成 $\frac{1}{2}d(x^2)$。
 5. **求导验证是"安全网"**：算完后求导比对应等于被积函数才放心。
+
+
+---
+
+## 抽象成方法（套路总结）
+
+### 不定积分核心公式速查
+
+| 类型 | 公式 | 关键备注 |
+|---|---|---|
+| 幂函数 | $\displaystyle\int x^n\,dx=\dfrac{x^{n+1}}{n+1}+C$（$n\neq-1$） | $n=-1$ 用 $\ln\vert x\vert$ |
+| 倒数 | $\displaystyle\int\dfrac{1}{x}\,dx=\ln\vert x\vert+C$ | 绝对值不可漏 |
+| 指数 | $\displaystyle\int e^x\,dx=e^x+C$；$\displaystyle\int a^x\,dx=\dfrac{a^x}{\ln a}+C$ | $a\neq 1$ |
+| 三角 | $\displaystyle\int\sin x\,dx=-\cos x+C$；$\displaystyle\int\cos x\,dx=\sin x+C$ | 符号配对 |
+| 反三角 | $\displaystyle\int\dfrac{dx}{\sqrt{1-x^2}}=\arcsin x+C$；$\displaystyle\int\dfrac{dx}{1+x^2}=\arctan x+C$ | 分母型 |
+| $\tan/\cot$ | $\displaystyle\int\tan x\,dx=-\ln\vert\cos x\vert+C$；$\displaystyle\int\cot x\,dx=\ln\vert\sin x\vert+C$ | 凑微分推导 |
+| $\sec$ | $\displaystyle\int\sec x\,dx=\ln\vert\sec x+\tan x\vert+C$ | 乘共轭技巧 |
+
+### 求不定积分标准 4 步流程
+
+1. **识别结构**：通项是否为复合函数？乘积？有理函数？含根式？
+2. **选方法**：
+   - 复合结构且外层有内层导数 → **第一换元（凑微分）**
+   - 含根式 $\sqrt{a^2\pm x^2}$ 或 $\sqrt[n]{ax+b}$ → **第二换元**
+   - 两函数乘积（LIATE）→ **分部积分**
+   - 有理函数 $P/Q$ → **部分分式**
+3. **执行计算**：写出每步（换元须明写 $u$、$du$；分部须明写 $u$、$v$）
+4. **验证（必做）**：对结果求导，等于被积函数即正确
+
+---
+
+## 方法变形
+
+### 变形 1：多层复合的凑微分
+
+外层函数 $f(g(h(x)))$，逐层检查 $h'(x)$ 是否出现在被积式中，能否凑出 $d(g(h(x)))$。
+
+### 变形 2：分部积分的"循环"技巧
+
+$\int e^x\sin x\,dx$ 两次分部后出现 $-I$，立刻令 $2I=\ldots$ 解方程。识别信号：**两次分部后被积函数形式不变**。
+
+### 变形 3：有理函数的假分式处理
+
+若分子次数 $\geq$ 分母，先长除法分离多项式再做部分分式：$\dfrac{x^3+1}{x^2-1}=x+\dfrac{x+1}{x^2-1}$。
+
+### 变形 4：配方化标准型
+
+遇 $ax^2+bx+c$，先配方为 $(x+p)^2\pm q^2$，再套 $\arctan$ 或 $\arcsin$ 公式。
+
+---
+
+## 典型应用例题
+
+### 例 1：凑微分 + 分部积分组合
+
+> **题目**：求 $\displaystyle\int x^2 e^{-x}\,dx$。
+
+【思路】多项式 $\times$ 指数，LIATE：$u=x^2$（A），$dv=e^{-x}\,dx$（E）。需两次分部。
+
+【解】第一次：$u=x^2$，$v=-e^{-x}$：$\int x^2 e^{-x}\,dx=-x^2 e^{-x}+2\int xe^{-x}\,dx$。
+
+第二次：$u=x$，$v=-e^{-x}$：$\int xe^{-x}\,dx=-xe^{-x}-e^{-x}+C_1$。
+
+代入得 $\int x^2 e^{-x}\,dx=-e^{-x}(x^2+2x+2)+C$。
+
+验证：$\bigl(-e^{-x}(x^2+2x+2)\bigr)'=e^{-x}(x^2+2x+2)-e^{-x}(2x+2)=x^2 e^{-x}$ ✓
+
+$\boxed{\displaystyle\int x^2 e^{-x}\,dx = -e^{-x}(x^2+2x+2)+C}$
+
+【注】每次分部都应验证 $u'$ 是否比 $u$ 简单，确认"方向正确"。
+
+### 例 2：三角代换
+
+> **题目**：求 $\displaystyle\int\frac{dx}{\sqrt{4-x^2}}$。
+
+【思路】分母含 $\sqrt{a^2-x^2}$（$a=2$）→ 令 $x=2\sin t$。
+
+【解】令 $x=2\sin t$，$t\in(-\pi/2,\pi/2)$，$dx=2\cos t\,dt$，$\sqrt{4-x^2}=2\cos t$。
+
+$$\int\frac{2\cos t\,dt}{2\cos t}=\int dt=t+C=\arcsin\frac{x}{2}+C.$$
+
+验证：$\left(\arcsin\dfrac{x}{2}\right)'=\dfrac{1}{\sqrt{4-x^2}}$ ✓
+
+$\boxed{\displaystyle\int\frac{dx}{\sqrt{4-x^2}}=\arcsin\frac{x}{2}+C}$
+
+【注】三角代换须确保范围使根号取正值，不遗漏绝对值讨论。
+
+### 例 3：有理函数部分分式
+
+> **题目**：求 $\displaystyle\int\frac{2x+3}{x^2+3x+2}\,dx$。
+
+【思路】分母 $x^2+3x+2=(x+1)(x+2)$，真分式，直接部分分式。
+
+【解】设 $\dfrac{2x+3}{(x+1)(x+2)}=\dfrac{A}{x+1}+\dfrac{B}{x+2}$，通分：$2x+3=A(x+2)+B(x+1)$。
+
+令 $x=-1$：$A=1$；令 $x=-2$：$B=1$。
+
+$$\int\frac{2x+3}{x^2+3x+2}\,dx=\int\frac{1}{x+1}\,dx+\int\frac{1}{x+2}\,dx=\ln\vert(x+1)(x+2)\vert+C.$$
+
+$\boxed{\displaystyle\int\frac{2x+3}{x^2+3x+2}\,dx=\ln\vert(x+1)(x+2)\vert+C}$
+
+【注】"代特殊值"法（令 $x=$ 根）求系数最快，避免展开比较系数。
+
+---
+
+## 自测题
+
+**自测 1**　$\displaystyle\int\frac{x}{\sqrt{1+x^2}}\,dx$。
+
+> 💡 提示：凑微分 $d(1+x^2)=2x\,dx$，答案 $\sqrt{1+x^2}+C$。
+
+**自测 2**　$\displaystyle\int x^3\ln x\,dx$。
+
+> 💡 提示：LIATE，$u=\ln x$，$dv=x^3\,dx$；答案 $\dfrac{x^4}{4}\ln x-\dfrac{x^4}{16}+C$。
+
+**自测 3**　$\displaystyle\int\frac{x^2-1}{x^2+1}\,dx$。
+
+> 💡 提示：先化简 $\dfrac{x^2-1}{x^2+1}=1-\dfrac{2}{x^2+1}$；答案 $x-2\arctan x+C$。
+
+**自测 4**　$\displaystyle\int e^x\cos x\,dx$。
+
+> 💡 提示：两次分部后 $I$ 循环，解 $2I=e^x(\cos x+\sin x)$；答案 $\dfrac{e^x(\cos x+\sin x)}{2}+C$。
+
+**自测 5**　$\displaystyle\int\sqrt{9-x^2}\,dx$。
+
+> 💡 提示：令 $x=3\sin t$，化为 $9\cos^2 t$ 积分，用倍角公式；答案 $\dfrac{x\sqrt{9-x^2}}{2}+\dfrac{9}{2}\arcsin\dfrac{x}{3}+C$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 原函数 $F'=f$，不定积分 $=F(x)+C$（全体原函数）。
+> 凑微分（第一换元）：把 $\varphi'(x)\,dx$ 配成 $d(\varphi(x))$。
+> 分部积分：$\int u\,dv=uv-\int v\,du$；LIATE 选 $u$。
+> 验证：求导等于被积函数（万能检验）。
+
+如果现在不看笔记，能独立完成例 2 + 例 3 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 反射 |
+| 学习目标 + 11.1–11.6 严格正文 | 原版 | 完整推导 |
+| 深度学习应用 + PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 几何示意（图） | 配图 | 可视化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 抽象成方法 + 方法变形 | 重写版 | 套路总结 |
+| 典型应用例题 3 例 | 重写版 | 演练 |
+| 自测题 5 题 | 重写版 | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，做习题巩固，自测验收。

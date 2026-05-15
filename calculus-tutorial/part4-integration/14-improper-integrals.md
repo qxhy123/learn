@@ -1,5 +1,43 @@
 # 第14章 广义积分
 
+> **一例速记**：
+> **无穷积分**：$\displaystyle\int_a^{+\infty} f\,dx = \lim_{b\to+\infty}\int_a^b f\,dx$；收敛则值存在，否则发散。
+> **p-积分**：$\displaystyle\int_1^{+\infty}\frac{1}{x^p}\,dx$：$p>1$ 收，$p\leq 1$ 散；$\displaystyle\int_0^1\frac{1}{x^p}\,dx$：$p<1$ 收，$p\geq 1$ 散（**两者临界值相反！**）。
+> **瑕积分**：被积函数在端点无界，令 $\varepsilon\to 0^+$ 避开奇点。
+> **Gamma 函数**：$\Gamma(s)=\displaystyle\int_0^{+\infty}x^{s-1}e^{-x}\,dx$；$\Gamma(n+1)=n!$；$\Gamma(1/2)=\sqrt{\pi}$。
+
+---
+
+## 引入：一道"发散还是收敛"的判断题
+
+> **题目**：判断 $\displaystyle\int_1^{+\infty}\frac{\sin x}{x}\,dx$ 是否收敛；若收敛，是绝对收敛还是条件收敛？
+
+请先停下来想一想：被积函数振荡且趋零——和交错级数很像。
+
+**关键观察**：$\int_1^{+\infty}\frac{\vert\sin x\vert}{x}\,dx\sim\int_1^{+\infty}\frac{1}{\pi x}\,dx=+\infty$（类比调和级数发散），所以**不绝对收敛**。但用 Dirichlet 判别法（$1/x$ 单调减到 0，$\int_1^b\sin x\,dx$ 有界）可知条件收敛。下面把思路还原。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "见到 $\int_1^{+\infty}\dfrac{\sin x}{x}\,dx$，先认清它是**无穷区间上的广义积分**（上限为 $+\infty$）。
+>
+> **第一步：判断绝对收敛性**。看 $\int_1^{+\infty}\dfrac{\vert\sin x\vert}{x}\,dx$。
+>
+> 因为 $\vert\sin x\vert \geq \sin^2 x = \dfrac{1-\cos 2x}{2}$，所以
+> $$\int_1^{N}\frac{\vert\sin x\vert}{x}\,dx \geq \int_1^N\frac{1-\cos 2x}{2x}\,dx.$$
+>
+> 右边含 $\int\frac{1}{2x}\,dx\sim\frac{\ln N}{2}\to+\infty$，故 $\int_1^{+\infty}\dfrac{\vert\sin x\vert}{x}\,dx$ **发散**，即**不绝对收敛**。
+>
+> **第二步：判断条件收敛性**。利用 Dirichlet 判别法：$g(x)=1/x$ 在 $[1,+\infty)$ 上单调递减趋零；$\left\vert\int_1^b\sin x\,dx\right\vert=\vert{-\cos b+\cos 1}\vert\leq 2$（有界）。故 $\int_1^{+\infty}\frac{\sin x}{x}\,dx$ **收敛**。
+>
+> **结论**：**条件收敛**（不绝对收敛）——与级数 $\sum(-1)^n/n$ 完全类比。
+>
+> **延伸思考**：p-积分的判断是广义积分的最基础参照——遇到不熟悉的被积函数，先估计其与 $1/x^p$ 的大小关系（极限比较法）。"
+
+---
+
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -913,3 +951,158 @@ $$
 3. **Cauchy 主值 ≠ 收敛**：$\int 1/x$ 主值为 0，但作为反常积分发散。
 4. **比较判敛要在尾部**：奇点附近的局部行为决定收 / 散，不是整个区间。
 5. **绝对收敛 + 条件收敛**：$\sum$ 与 $\int$ 类比；$\int_1^\infty \sin x / x$ 条件收敛但不绝对。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 广义积分核心公式速查
+
+| 类型 | 定义 | 收敛条件 |
+|---|---|---|
+| 无穷上限 | $\displaystyle\int_a^{+\infty}f\,dx=\lim_{b\to+\infty}\int_a^b f\,dx$ | 极限存在且有限 |
+| 无穷下限 | $\displaystyle\int_{-\infty}^b f\,dx=\lim_{a\to-\infty}\int_a^b f\,dx$ | 同上 |
+| 双无穷 | $\displaystyle\int_{-\infty}^{+\infty}f\,dx = \int_{-\infty}^c f + \int_c^{+\infty}f$ | 两段**都**收敛 |
+| 瑕积分（左瑕） | $\displaystyle\int_a^b f\,dx=\lim_{\varepsilon\to 0^+}\int_{a+\varepsilon}^b f\,dx$ | 极限存在且有限 |
+| **p-积分（无穷）** | $\displaystyle\int_1^{+\infty}\frac{dx}{x^p}=\frac{1}{p-1}$（$p>1$） | $p>1$ 收，$p\leq 1$ 散 |
+| **q-积分（瑕）** | $\displaystyle\int_0^1\frac{dx}{x^q}=\frac{1}{1-q}$（$q<1$） | $q<1$ 收，$q\geq 1$ 散 |
+| **Gamma 函数** | $\Gamma(s)=\displaystyle\int_0^{+\infty}x^{s-1}e^{-x}\,dx$ | $s>0$ 收；$\Gamma(n+1)=n!$ |
+
+### 判断广义积分收敛的标准 4 步流程
+
+1. **识别类型**：无穷积分还是瑕积分？奇点在端点还是内部？
+2. **直接计算**（若原函数可求）：代极限，极限存在则收敛
+3. **比较判别**（若积分复杂）：找参照 $1/x^p$ 或 $1/x^q$，用极限比较法
+4. **绝对 vs 条件**：先判 $\int\vert f\vert$；绝对收敛则条件收敛；反之不成立
+
+---
+
+## 方法变形
+
+### 变形 1：内部奇点的分拆
+
+奇点在积分区间**内部**（如 $\int_{-1}^1 1/x^2\,dx$，奇点为 $x=0$），必须拆成 $\int_{-1}^0 + \int_0^1$，两段**分别判断**，有一段发散则整体发散。
+
+### 变形 2：极限比较法的选参照
+
+若 $x\to+\infty$ 时 $f(x)\sim C/x^p$，则与 $\int_1^{+\infty} 1/x^p\,dx$ 同敛散。关键：**找主导项**（比如多项式除以多项式看最高次）。
+
+### 变形 3：Gamma 函数化简
+
+含 $\int_0^{+\infty} x^n e^{-ax}\,dx$ 型，令 $t=ax$，化为 $\Gamma(n+1)/a^{n+1}=n!/a^{n+1}$；含 $\int_0^{+\infty} x^{s-1}e^{-x^2}\,dx$ 型，令 $t=x^2$ 化为 $\Gamma$ 函数。
+
+### 变形 4：含参积分的 Leibniz 微分
+
+若 $I(\alpha)=\int_a^b f(x,\alpha)\,dx$ 且条件满足，则 $I'(\alpha)=\int_a^b \partial f/\partial\alpha\,dx$。常用于"对参数求导得到新积分"，然后积分回去。
+
+---
+
+## 典型应用例题
+
+### 例 1：p-积分与极限比较判别
+
+> **题目**：判断 $\displaystyle\int_1^{+\infty}\frac{2x+3}{x^3+x+1}\,dx$ 的收敛性。
+
+【思路】$x\to+\infty$ 时，被积函数 $\sim 2x/x^3 = 2/x^2$，与 $p=2>1$ 的 p-积分比较。
+
+【解】记 $f(x)=\dfrac{2x+3}{x^3+x+1}$，$g(x)=\dfrac{1}{x^2}$。
+
+$$\lim_{x\to+\infty}\frac{f(x)}{g(x)}=\lim_{x\to+\infty}\frac{(2x+3)x^2}{x^3+x+1}=\lim_{x\to+\infty}\frac{2x^3+3x^2}{x^3+x+1}=2.$$
+
+$0<2<+\infty$，与 $\int_1^{+\infty}1/x^2\,dx$（$p=2>1$，收敛）同敛散。
+
+$\boxed{\text{收敛}}$
+
+【注】极限比较法要求极限值严格为正有限数；等于 0 或 $+\infty$ 时有单边推论，需谨慎。
+
+### 例 2：瑕积分计算
+
+> **题目**：计算 $\displaystyle\int_0^1\frac{\ln x}{\sqrt{x}}\,dx$。
+
+【思路】$x=0$ 是瑕点（$\ln x\to-\infty$，$1/\sqrt{x}\to+\infty$）；令 $\varepsilon\to 0^+$ 取极限。
+
+【解】
+
+$$\int_0^1\frac{\ln x}{\sqrt{x}}\,dx = \lim_{\varepsilon\to 0^+}\int_\varepsilon^1 x^{-1/2}\ln x\,dx.$$
+
+用分部积分，$u=\ln x$，$dv=x^{-1/2}\,dx$，$v=2\sqrt{x}$：
+
+$$\int_\varepsilon^1 x^{-1/2}\ln x\,dx = \left[2\sqrt{x}\ln x\right]_\varepsilon^1 - \int_\varepsilon^1 2\sqrt{x}\cdot\frac{1}{x}\,dx = -2\sqrt{\varepsilon}\ln\varepsilon - 4[\sqrt{x}]_\varepsilon^1.$$
+
+$$= -2\sqrt{\varepsilon}\ln\varepsilon - 4(1-\sqrt{\varepsilon}).$$
+
+令 $\varepsilon\to 0^+$：$\sqrt{\varepsilon}\ln\varepsilon\to 0$（因为 $\lim_{t\to 0^+}t\ln t=0$），$\sqrt{\varepsilon}\to 0$。
+
+$$\int_0^1\frac{\ln x}{\sqrt{x}}\,dx = 0 - 4 = -4.$$
+
+$\boxed{-4}$
+
+【注】瑕积分的"分部"策略：先分部整理成可算极限的形式，再令 $\varepsilon\to 0^+$——顺序不可颠倒。
+
+### 例 3：Gamma 函数应用
+
+> **题目**：计算 $\displaystyle\int_0^{+\infty} x^3 e^{-2x}\,dx$。
+
+【思路】形如 $\int_0^{+\infty} x^n e^{-ax}\,dx$，令 $t=2x$，化为 $\Gamma$ 函数。
+
+【解】令 $t=2x$，$dt=2\,dx$，$x=t/2$：
+
+$$\int_0^{+\infty} x^3 e^{-2x}\,dx = \int_0^{+\infty}\left(\frac{t}{2}\right)^3 e^{-t}\frac{dt}{2} = \frac{1}{16}\int_0^{+\infty}t^3 e^{-t}\,dt = \frac{\Gamma(4)}{16} = \frac{3!}{16} = \frac{6}{16} = \frac{3}{8}.$$
+
+$\boxed{\dfrac{3}{8}}$
+
+【注】$\Gamma(n+1)=n!=\Gamma$ 最常用的形式；含 $e^{-ax}$ 时，代入后分母出现 $a^{n+1}$，即 $\int_0^{+\infty}x^n e^{-ax}\,dx = n!/a^{n+1}$。
+
+---
+
+## 自测题
+
+**自测 1**　判断 $\displaystyle\int_0^1\frac{dx}{x^{2/3}}$ 的收敛性；若收敛，求其值。
+
+> 💡 提示：瑕积分，$q=2/3<1$ 收敛；$\int_\varepsilon^1 x^{-2/3}\,dx=[3x^{1/3}]_\varepsilon^1\to 3$。
+
+**自测 2**　判断 $\displaystyle\int_2^{+\infty}\frac{1}{x(\ln x)^2}\,dx$ 的收敛性。
+
+> 💡 提示：令 $u=\ln x$，化为 $\int_{\ln 2}^{+\infty}u^{-2}\,du$，$p=2>1$，收敛；值为 $1/\ln 2$。
+
+**自测 3**　利用 Gamma 函数计算 $\displaystyle\int_0^{+\infty}\sqrt{x}e^{-x}\,dx$。
+
+> 💡 提示：$= \Gamma(3/2) = (1/2)\Gamma(1/2) = \sqrt{\pi}/2$。
+
+**自测 4**　判断 $\displaystyle\int_0^{+\infty}\frac{\sin x}{x^{3/2}}\,dx$ 是否绝对收敛。
+
+> 💡 提示：$\vert\sin x/x^{3/2}\vert\leq 1/x^{3/2}$，$\int_1^{+\infty}1/x^{3/2}\,dx$ 收敛；$\int_0^1\vert\sin x/x^{3/2}\vert\sim\int_0^1 x^{-1/2}\,dx$ 也收敛，故**绝对收敛**。
+
+**自测 5**　计算 $\displaystyle\int_{-\infty}^{+\infty}\frac{dx}{1+x^2}$。
+
+> 💡 提示：拆为 $\int_{-\infty}^0+\int_0^{+\infty}$，各为 $\pi/2$；全值 $\pi$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 无穷积分 = $\lim_{b\to+\infty}\int_a^b f$；瑕积分 = $\lim_{\varepsilon\to 0^+}\int_{a+\varepsilon}^b f$。
+> p-积分（无穷）$p>1$ 收；q-积分（瑕）$q<1$ 收——临界值**相反**。
+> Gamma：$\Gamma(n+1)=n!$；$\Gamma(1/2)=\sqrt{\pi}$。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 3——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置，新增） | 建立直觉 / 反射 |
+| 学习目标 + 14.1–14.6 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 抽象成方法 + 方法变形 | 重写版（新增） | 套路总结 |
+| 典型应用例题 3 例 | 重写版（新增） | 演练 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 重写版（新增） | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

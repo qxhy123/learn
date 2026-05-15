@@ -1,5 +1,52 @@
 # 第27章 概率论中的微积分
 
+> **一例速记：ELBO 推导 + 高斯积分 + KL 公式**
+>
+> | 对象 | 公式 / 结论 | 记忆口诀 |
+> |------|------------|---------|
+> | 高斯归一化 | $\int_{-\infty}^{+\infty}e^{-x^2/2}\,dx=\sqrt{2\pi}$ | 极坐标换元，$I^2=\pi$ |
+> | 正态 MGF | $M_X(t)=e^{\mu t+\sigma^2t^2/2}$ | 配方 + 积分 |
+> | 微分熵（高斯） | $h=\frac12\ln(2\pi e\sigma^2)$ | 方差固定时高斯熵最大 |
+> | KL（两高斯） | $\ln\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12$ | 三项：log 比 + 方差比 + 常数 |
+> | ELBO | $\log p(x)\geq\mathbb{E}_q[\log p(x,z)-\log q(z)]$ | Jensen + 对数凹，等号在 $q=p(\cdot\vert x)$ |
+
+---
+
+## 引入：从 PDF 积分到 ELBO——一道把三大工具串联起来的题
+
+> **题目**：设 $X\sim\mathcal{N}(\mu,\sigma^2)$，$q(z)=\mathcal{N}(z;0,1)$，$p(z)=\mathcal{N}(z;\mu_z,\sigma_z^2)$。
+> (1) 写出 $\mathbb{E}_X[X^2]$；(2) 计算 $\mathrm{KL}(q\|p)$；(3) 用 Jensen 不等式写出 $\log p(x)$ 的下界（ELBO 雏形）。
+
+先停下来想一想：三个子问题分别用**矩公式**、**KL 积分**、**Jensen 换向**——恰好是本章三把钥匙。
+
+## 思维路径还原
+
+> "看到正态分布的二阶矩：$\mathbb{E}[X^2]=\mathrm{Var}(X)+(E[X])^2=\sigma^2+\mu^2$。这是最快路径——不需要积分，直接展开即得。
+>
+> **第 (1) 问** $\mathbb{E}[X^2]=\sigma^2+\mu^2$。
+>
+> **第 (2) 问 KL 散度**：两个一维高斯之间有闭式
+>
+> $$\mathrm{KL}(q\|p)=\ln\frac{\sigma_z}{\sigma_q}+\frac{\sigma_q^2+\mu_q^2}{2\sigma_z^2}-\frac{1}{2}.$$
+>
+> 这里 $q=\mathcal{N}(0,1)$（$\mu_q=0,\sigma_q=1$），$p=\mathcal{N}(\mu_z,\sigma_z^2)$，代入得
+>
+> $$\mathrm{KL}(q\|p)=\ln\sigma_z+\frac{1+\mu_z^2}{2\sigma_z^2}-\frac{1}{2}.$$
+>
+> **第 (3) 问 ELBO**：目标是对 $\log\int p(x,z)\,dz$ 找下界。
+>
+> 引入任意分布 $q(z)$，把积分写成期望：$\log\mathbb{E}_q[p(x,z)/q(z)]$。
+>
+> $\log$ 是凹函数，Jensen 给 $\log\mathbb{E}[\cdot]\geq\mathbb{E}[\log\cdot]$，故
+>
+> $$\log p(x)\geq\mathbb{E}_q[\log p(x,z)]-\mathbb{E}_q[\log q(z)]=\mathrm{ELBO}.$$
+>
+> 等号在 $q(z)=p(z|x)$（真实后验）时成立。
+>
+> **核心串联**：PDF 积分给出期望 → MGF / 矩公式给出高阶矩 → KL 散度衡量分布差异 → Jensen 不等式建立 ELBO 下界。每一步都是'把期望变成积分，或把积分变成期望'的来回转换。"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -610,6 +657,143 @@ $$
 4. **期望 $\int xf\,dx$ 的收敛性**：期望不总存在——若 $\int|x|f(x)\,dx=+\infty$，期望没有定义（如 Cauchy 分布）。遇到重尾分布要特别检查收敛性。
 
 5. **特征函数对应傅里叶变换**：$\varphi_X(t)=\int e^{itx}f(x)\,dx$ 是 $f(x)$ 的 Fourier 变换（差一个符号约定）。独立性可以通过特征函数相乘来验证，但不要把 MGF（$e^{tX}$）和特征函数（$e^{itX}$）混淆——前者实数参数，后者复数参数。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 概率微积分 6 公式速查
+
+| 对象 | 公式 | 关键性质 |
+|------|------|---------|
+| PDF 归一化 | $\int_{-\infty}^{+\infty}f(x)\,dx=1$ | $f(x)\geq 0$，$f$ 可 $>1$ |
+| 期望（LOTUS） | $\mathbb{E}[g(X)]=\int g(x)f(x)\,dx$ | 不必先求 $f_Y$ |
+| 方差展开 | $\mathrm{Var}(X)=\mathbb{E}[X^2]-(\mathbb{E}[X])^2$ | Jensen 保证 $\geq 0$ |
+| KL 散度 | $\int p\ln(p/q)\,dx\geq 0$ | 非对称，$=0\Leftrightarrow p=q$ |
+| MGF | $M_X(t)=\mathbb{E}[e^{tX}]$，$M^{(n)}(0)=\mathbb{E}[X^n]$ | 对 $t$ 求导得矩 |
+| ELBO | $\log p(x)\geq\mathbb{E}_q[\log p(x,z)]-\mathbb{E}_q[\log q(z)]$ | Jensen + $\log$ 凹 |
+
+### ELBO 推导标准 3 步
+
+1. **引入辅助分布**：$\log p(x)=\log\int q(z)\frac{p(x,z)}{q(z)}\,dz=\log\mathbb{E}_q\!\left[\frac{p(x,z)}{q(z)}\right]$
+2. **Jensen 不等式**（$\log$ 凹）：$\log\mathbb{E}_q[Y]\geq\mathbb{E}_q[\log Y]$
+3. **分解**：$\mathrm{ELBO}=\mathbb{E}_q[\log p(x|z)]-\mathrm{KL}(q\|p(z))$（重构项 $-$ KL 正则）
+
+### KL 散度 2 个常用形式
+
+- **一维高斯**：$\mathrm{KL}(\mathcal{N}_1\|\mathcal{N}_2)=\ln\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac{1}{2}$
+- **VAE 中**（$q=\mathcal{N}(\mu,\sigma^2)$，$p=\mathcal{N}(0,1)$）：$\mathrm{KL}=-\frac{1}{2}\sum_j(1+\log\sigma_j^2-\mu_j^2-\sigma_j^2)$
+
+---
+
+## 方法变形
+
+### 变形 1：含参积分求导（Leibniz 规则）
+
+若积分限或被积函数含参数 $\theta$：
+$$\frac{d}{d\theta}\int_{a(\theta)}^{b(\theta)}f(x,\theta)\,dx=\int_{a}^{b}\frac{\partial f}{\partial\theta}\,dx+f(b,\theta)b'-f(a,\theta)a'.$$
+
+这是 REINFORCE 公式的本质：$\nabla_\theta\int f(x)p_\theta(x)\,dx=\int f(x)\nabla_\theta p_\theta(x)\,dx$，再除乘 $p_\theta$ 得 score function。
+
+### 变形 2：重参数化技巧
+
+当 $z=\mu+\sigma\varepsilon$，$\varepsilon\sim\mathcal{N}(0,1)$ 时，对参数的梯度可穿透采样步骤。关键：随机性移到与参数无关的 $\varepsilon$，计算图变得可微。不可重参数化分布（如 Bernoulli、Categorical）需用 Gumbel-Softmax 或 REINFORCE。
+
+### 变形 3：矩的计算技巧
+
+- **MGF 法**：$\mathbb{E}[X^n]=M_X^{(n)}(0)$，适合正态、指数、Gamma 等有闭式 MGF 的分布
+- **特征函数法**：$\varphi_X(t)=\mathbb{E}[e^{itX}]$，分布之和→特征函数相乘，独立性检验利器
+- **分部积分**：$\mathbb{E}[X]=\int_0^\infty P(X>x)\,dx$（非负随机变量）
+
+### 变形 4：高维积分的近似
+
+正则化分母 $p(x)=\int p(x,z)\,dz$ 高维不可算时：① 变分推断（ELBO 代替）；② MC 采样 + 重要性加权（IWAE）；③ Langevin / HMC（MCMC 类）。选哪种取决于分布结构与计算预算。
+
+---
+
+## 典型应用例题
+
+### 例 1：高斯积分与归一化验证
+
+> **题目**：证明标准正态 $f(x)=\frac{1}{\sqrt{2\pi}}e^{-x^2/2}$ 满足归一化，并求 $\mathbb{E}[X^2]$。
+
+【思路】高斯积分极坐标换元；二阶矩用分部积分或利用方差定义。
+
+【解】令 $I=\int_{-\infty}^{+\infty}e^{-x^2/2}\,dx$。$I^2=\int\!\int e^{-(x^2+y^2)/2}\,dx\,dy=2\pi\int_0^\infty e^{-r^2/2}r\,dr=2\pi$，故 $I=\sqrt{2\pi}$，归一化成立。
+
+$\mathbb{E}[X^2]=\int x^2\frac{e^{-x^2/2}}{\sqrt{2\pi}}\,dx$。分部积分：令 $u=x,dv=xe^{-x^2/2}dx$，得 $\mathbb{E}[X^2]=1=\mathrm{Var}(X)$（标准正态方差为 1）。
+
+【答案】$\boxed{\mathbb{E}[X^2]=1}$，与 $\mathrm{Var}(X)+(E[X])^2=1+0=1$ 一致。
+
+### 例 2：ELBO 推导与等号条件
+
+> **题目**：从边缘似然 $\log p(x)$ 出发推导 ELBO，并说明最大化 ELBO 等价于最小化何种散度。
+
+【思路】引入 $q_\phi(z|x)$，对 $\log$ 凹函数用 Jensen；将 ELBO 用 KL 表达。
+
+【解】$\log p(x)=\log\mathbb{E}_q[p(x,z)/q(z)]\geq\mathbb{E}_q[\log p(x,z)-\log q(z)]=\mathrm{ELBO}$。
+
+改写：$\log p(x)-\mathrm{ELBO}=\mathrm{KL}(q_\phi(z|x)\|p(z|x))\geq 0$。
+
+故最大化 ELBO $\Leftrightarrow$ 最小化 $\mathrm{KL}(q_\phi\|p(\cdot|x))$。
+
+【答案】$\boxed{\text{最大化 ELBO} \Leftrightarrow \text{最小化反向 KL}}$。等号在 $q_\phi=p(\cdot|x)$（真实后验）时成立。
+
+### 例 3：重参数化梯度估计
+
+> **题目**：$\mathcal{L}(\mu,\sigma)=\mathbb{E}_{z\sim\mathcal{N}(\mu,\sigma^2)}[f(z)]$。用重参数化技巧写出对 $\mu$ 和 $\sigma$ 的梯度。
+
+【思路】令 $z=\mu+\sigma\varepsilon$，$\varepsilon\sim\mathcal{N}(0,1)$，将期望改写为对 $\varepsilon$ 的期望。
+
+【解】$\mathcal{L}=\mathbb{E}_{\varepsilon}[f(\mu+\sigma\varepsilon)]$。
+
+$\frac{\partial\mathcal{L}}{\partial\mu}=\mathbb{E}_{\varepsilon}\!\left[\frac{\partial f}{\partial z}\right],\quad\frac{\partial\mathcal{L}}{\partial\sigma}=\mathbb{E}_{\varepsilon}\!\left[\frac{\partial f}{\partial z}\cdot\varepsilon\right].$
+
+【答案】$\boxed{\nabla_\mu\mathcal{L}=\mathbb{E}[f'(z)],\;\nabla_\sigma\mathcal{L}=\mathbb{E}[f'(z)\cdot\varepsilon]}$。梯度穿透采样，方差通常低于 REINFORCE。
+
+---
+
+## 自测题
+
+**自测 1**　$X\sim\mathrm{Exp}(\lambda)$。用积分直接算 $\mathbb{E}[X]$ 和 $\mathbb{E}[X^2]$，再用 MGF 验证。
+
+> 💡 提示：$\mathbb{E}[X]=1/\lambda$，$\mathbb{E}[X^2]=2/\lambda^2$，$\mathrm{Var}=1/\lambda^2$。MGF $M(t)=\lambda/(\lambda-t)$，$M''(0)=2/\lambda^2$。
+
+**自测 2**　设 $f(x)=cx^2(1-x)$，$x\in[0,1]$，其他为 0。求 $c$，$E(X)$，$\mathrm{Var}(X)$。
+
+> 💡 提示：归一化 $c\int_0^1 x^2(1-x)\,dx=c/12=1$，$c=12$。$E(X)=3/5$，$E(X^2)=2/5$，$\mathrm{Var}=2/5-9/25=1/25$。
+
+**自测 3**　为什么连续随机变量的熵 $h(f)$ 可以为负（而离散熵不能）？举例说明。
+
+> 💡 提示：$U(0,a)$ 的微分熵 $h=\ln a$。当 $a<1$ 时 $h<0$。离散熵 $-\sum p\log p\geq 0$（Jensen），但微分熵有量纲，不同单位度量下值会变，没有非负保证。
+
+**自测 4**　VAE 中若 $\sigma\to 0$（编码方差趋零），ELBO 的 KL 项和重构项分别趋向何处？
+
+> 💡 提示：KL 项 $\to\infty$（方差趋零，偏离先验 $\mathcal{N}(0,1)$）；重构项可能变好（近乎确定性编码）。训练目标平衡两者：过小 $\sigma$ 会被大 KL 惩罚，防止后验坍缩。
+
+**自测 5**　设 $p=\mathcal{N}(1,1)$，$q=\mathcal{N}(0,2)$。分别计算 $\mathrm{KL}(p\|q)$ 和 $\mathrm{KL}(q\|p)$，并比较大小。
+
+> 💡 提示：用一维高斯 KL 公式。$\mathrm{KL}(p\|q)=\ln\sqrt{2}+\frac{1+1}{4}-\frac12=\frac12\ln 2$；$\mathrm{KL}(q\|p)=\ln\frac{1}{\sqrt{2}}+\frac{4+1}{2}-\frac12=2-\frac12\ln 2$。非对称，$\mathrm{KL}(q\|p)>\mathrm{KL}(p\|q)$。
+
+---
+
+## 融合版说明
+
+本版 = **原版（概率微积分严格推导 + 信息论 + 变分推断）** + **融合补充（速记 / 路径 / 套路 / 例题 / 自测）**：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 27.1–27.5 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 融合版 | 套路总结 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 融合版 | 演练 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 融合版 | 额外训练 |
+
+**适用**：先看速记建立期望-KL-ELBO 三角直觉，看严格推导，做套路总结，最后用例题 + 自测验收。掌握"高斯积分-Jensen-重参数化"三件套，贝叶斯深度学习推导得心应手。
 
 ---
 

@@ -832,4 +832,148 @@ $$
 2. **Green = 2D Stokes 特例**：Green 定理是 Stokes 定理在平面区域的特例，法向量取 $(0,0,1)$（$z$ 轴方向）。
 3. **Gauss 要求封闭曲面**：散度定理的左边必须是封闭曲面（外法向），若曲面不封闭需补”盖子”再用 Gauss 再减去。
 4. **方向约定**：Stokes 定理中，曲面法向量 $\mathbf{n}$ 与边界曲线方向满足右手定则；Green 定理中边界逆时针为正方向。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 6 大公式速查
+
+| 算子 | 公式 | 物理含义 |
+|---|---|---|
+| 梯度 $\nabla f$ | $(f_x, f_y, f_z)$ | 最速上升方向；标量场变向量场 |
+| 散度 $\nabla\cdot\mathbf{F}$ | $P_x+Q_y+R_z$ | 源强度（正=发散，负=汇聚） |
+| 旋度 $\nabla\times\mathbf{F}$ | $3\times 3$ 行列式展开 | 涡旋强度（仅 3D） |
+| Green（2D） | $\oint_C P\,dx+Q\,dy = \iint_D(Q_x-P_y)\,dA$ | 边界环量 = 内部旋转强度 |
+| Gauss（3D体） | $\oiint_S \mathbf{F}\cdot d\mathbf{S} = \iiint_V \nabla\cdot\mathbf{F}\,dV$ | 封闭面通量 = 内部源强度 |
+| Stokes（3D面） | $\oint_{\partial S}\mathbf{F}\cdot d\mathbf{r} = \iint_S(\nabla\times\mathbf{F})\cdot d\mathbf{S}$ | 边界环量 = 曲面旋度通量 |
+
+### 恒等式速查（常用于化简）
+
+- $\nabla\times(\nabla f) = \mathbf{0}$（梯度场无旋）
+- $\nabla\cdot(\nabla\times\mathbf{F}) = 0$（旋度场无散）
+- $\nabla^2 f = \nabla\cdot(\nabla f) = f_{xx}+f_{yy}+f_{zz}$（调和算子）
+- 无旋 $\Leftrightarrow$ 保守场 $\Leftrightarrow$ 路径无关 $\Leftrightarrow$ 存在势函数（单连通域内）
+
+### 选定理流程
+
+1. **2D 封闭曲线积分** → Green 定理（化为二重积分）。
+2. **3D 封闭曲面通量** → Gauss 定理（化为三重积分，算散度）。
+3. **3D 曲线积分/环量** → Stokes 定理（化为曲面上旋度积分，选简单曲面）。
+4. **判断保守场** → 算旋度，若 $\nabla\times\mathbf{F}=\mathbf{0}$（单连通域）则保守，求势函数。
+
+---
+
+## 方法变形
+
+### 变形 1：向量恒等式化简散度
+
+$\nabla\cdot(f\mathbf{F}) = f\nabla\cdot\mathbf{F} + \mathbf{F}\cdot\nabla f$（乘积法则）。用于计算含标量因子的向量场散度，不必展开全部分量。
+
+### 变形 2：Helmholtz 分解
+
+任何 $C^2$ 衰减向量场可分解为无旋部分（梯度场）+ 无散部分（旋度场）：$\mathbf{F} = -\nabla\varphi + \nabla\times\mathbf{A}$。这是电磁场中电势 $\varphi$ 和向量势 $\mathbf{A}$ 的数学基础。
+
+### 变形 3：调和函数性质
+
+若 $\nabla^2 f = 0$（调和函数），则在区域内最大值和最小值都在边界取到（极值原理）。用 Gauss 定理可证：调和函数在封闭曲面内的法向导数积分为零（$\oiint_S \partial f/\partial n\,dS = 0$）。
+
+### 变形 4：Green 定理求面积
+
+$A = \frac{1}{2}\oint_C x\,dy - y\,dx$（等价于取 $P=-y/2$，$Q=x/2$，$Q_x-P_y=1$）。适用于参数方程给定边界的曲线区域面积计算。
+
+---
+
+## 典型应用例题
+
+### 例 1：散度和旋度计算
+
+> **题目**：$\mathbf{F} = (xy, yz, zx)$，求 $\nabla\cdot\mathbf{F}$ 和 $\nabla\times\mathbf{F}$。
+
+【解】散度：$\nabla\cdot\mathbf{F} = y+z+x$。
+
+旋度：
+
+$$\nabla\times\mathbf{F} = \begin{vmatrix}\mathbf{i}&\mathbf{j}&\mathbf{k}\\\partial_x&\partial_y&\partial_z\\xy&yz&zx\end{vmatrix} = (x-y)\mathbf{i}+(y-z)\mathbf{j}+(z-x)\mathbf{k}$$
+
+【答案】$\nabla\cdot\mathbf{F} = x+y+z$，$\nabla\times\mathbf{F} = (x-y, y-z, z-x)$。
+
+### 例 2：Gauss 定理计算通量
+
+> **题目**：计算 $\mathbf{F}=(x^2,y^2,z^2)$ 穿过长方体 $[0,1]\times[0,1]\times[0,1]$ 外侧的总通量。
+
+【思路】Gauss 定理：散度 $=2x+2y+2z$，在单位立方体上积分。
+
+【解】
+
+$$\oiint_S = \iiint_V 2(x+y+z)\,dV = 2\cdot 3\cdot\frac{1}{2} = 3$$
+
+【答案】$\boxed{3}$（三个坐标分量对称，各贡献 $\int_0^1\int_0^1\int_0^1 2x\,dV = 1$）。
+
+### 例 3：Stokes 定理转化
+
+> **题目**：计算 $\oint_C (z-y)\,dx+(x-z)\,dy+(y-x)\,dz$，其中 $C$ 是三角形 $x+y+z=1$（$x,y,z\geq 0$）的边界，法向量与 $(1,1,1)$ 同向。
+
+【解】$\mathbf{F}=(z-y, x-z, y-x)$，旋度：
+
+$$\nabla\times\mathbf{F} = \begin{vmatrix}\mathbf{i}&\mathbf{j}&\mathbf{k}\\\partial_x&\partial_y&\partial_z\\z-y&x-z&y-x\end{vmatrix} = (1+1)\mathbf{i}+(1+1)\mathbf{j}+(1+1)\mathbf{k} = 2(1,1,1)$$
+
+曲面 $\Sigma$（三角形），法向 $\mathbf{n}=\frac{1}{\sqrt{3}}(1,1,1)$，面积 $A=\frac{\sqrt{3}}{2}$。
+
+$$\oint_C = \iint_\Sigma 2(1,1,1)\cdot\frac{1}{\sqrt{3}}(1,1,1)\,dS = \frac{6}{\sqrt{3}}\cdot\frac{\sqrt{3}}{2} = 3$$
+
+【答案】$\boxed{3}$。
+
+---
+
+## 自测题
+
+**自测 1**　计算 $\mathbf{F}=(e^x\sin y, e^x\cos y, 0)$ 的散度和旋度。
+
+> 💡 提示：散度 $= e^x\sin y - e^x\sin y = 0$（无散场）；旋度 $= (0,0,e^x\cos y-e^x\cos y)=(0,0,0)$（无旋场，即保守场）。
+
+**自测 2**　用 Gauss 定理计算 $\oiint_S \mathbf{r}\cdot d\mathbf{S}$，$\mathbf{r}=(x,y,z)$，$S$ 为球面 $r=R$ 外侧。
+
+> 💡 提示：$\nabla\cdot\mathbf{r}=3$，$\iiint_V 3\,dV = 3\cdot\frac{4\pi R^3}{3}=4\pi R^3$。
+
+**自测 3**　判断 $\mathbf{F}=(yz,xz,xy)$ 是否为保守场；若是，求势函数。
+
+> 💡 提示：$\nabla\times\mathbf{F}=(x-x,y-y,z-z)=\mathbf{0}$，是保守场。$\varphi_x=yz$ 积分得 $\varphi=xyz+C$（满足所有分量）。
+
+**自测 4**　用 Green 定理计算椭圆 $x^2/4+y^2=1$ 的面积。
+
+> 💡 提示：$A=\frac{1}{2}\oint_C x\,dy-y\,dx$，参数化 $x=2\cos t,y=\sin t$，$t\in[0,2\pi]$，计算得 $A=2\pi$（$=\pi ab=\pi\cdot 2\cdot 1$）。
+
+**自测 5**　$f(x,y,z) = x^2+y^2+z^2$，计算 $\nabla^2 f$ 和 $\nabla f$ 的散度。
+
+> 💡 提示：$\nabla f = (2x,2y,2z)$，$\nabla\cdot\nabla f = 2+2+2 = 6$（与 $\nabla^2 f = f_{xx}+f_{yy}+f_{zz}=6$ 相同，即 Laplacian）。
+
+---
+
+**回头看一眼”一例速记”**：
+
+> Green（2D 封闭曲线）→ 二重积分；Gauss（3D 封闭曲面）→ 三重积分（散度）；Stokes（3D 曲线/曲面）→ 旋度面积分。
+> 梯度场无旋；旋度场无散。$\nabla\times\nabla f=\mathbf{0}$，$\nabla\cdot\nabla\times\mathbf{F}=0$。
+
+如果现在不看笔记，能独立完成例 2 + 例 3 + 自测 3——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 路径 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 原版（前置） | 建立直觉 / 反射 |
+| 学习目标 + 22.1–22.6 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 重写版（中间） | 套路总结 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 重写版 | 演练 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 重写版 | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
 5. **势函数存在性**：$\nabla\times\mathbf{F}=\mathbf{0}$ 在单连通区域内才能保证势函数存在（全局无旋）；区域有洞时需要另行验证。

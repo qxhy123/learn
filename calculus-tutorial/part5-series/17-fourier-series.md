@@ -1,5 +1,45 @@
 # 第17章 Fourier级数
 
+> **一例速记**：
+> **Fourier 展开四步走**：① 判断奇 / 偶性 → ② 写系数公式（$a_n$ 或 $b_n$，奇函数 $a_n=0$，偶函数 $b_n=0$）→ ③ 分部积分算系数 → ④ 用 Dirichlet 定理写收敛结论（间断点处收敛到左右极限平均值）。
+> **Parseval 速记**：$\dfrac{1}{\pi}\int_{-\pi}^{\pi}[f]^2\,dx = \dfrac{a_0^2}{2}+\sum(a_n^2+b_n^2)$——时域能量 = 频域能量，可用来求 $\sum 1/n^2, \sum 1/n^4$ 等。
+
+---
+
+## 引入：方波的 Fourier 展开
+
+> **题目**：设 $f(x)=\begin{cases}0,& -\pi\leq x<0\\1,& 0\leq x<\pi\end{cases}$，以 $2\pi$ 为周期延拓，求其 Fourier 级数，并在 $x=\pi/2$ 处代入求 $1-1/3+1/5-1/7+\cdots$。
+
+请先停下来想一想：$f(x)$ 既不是奇函数也不是偶函数，必须用完整 $a_n, b_n$ 公式；间断点处 Fourier 级数收敛到"左右极限平均"。
+
+**关键观察**：$f(x)=0$（$x<0$）与 $f(x)=1$（$x\geq 0$），积分区间可拆成 $[-\pi,0]$ 和 $[0,\pi]$。下面把内心独白完整还原。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "见到分段函数，先判奇偶：$f(-x)\neq f(x)$ 且 $f(-x)\neq -f(x)$，**不是奇/偶函数**，必须用完整公式。
+>
+> **求 $a_0$**：$a_0 = \dfrac{1}{\pi}\int_{-\pi}^{\pi}f(x)\,dx = \dfrac{1}{\pi}\int_0^{\pi}1\,dx = 1$。
+>
+> **求 $a_n$（$n\geq 1$）**：$a_n = \dfrac{1}{\pi}\int_0^{\pi}\cos nx\,dx = \dfrac{\sin nx}{n\pi}\Big|_0^{\pi} = 0$。
+>
+> **求 $b_n$**：$b_n = \dfrac{1}{\pi}\int_0^{\pi}\sin nx\,dx = \dfrac{1-\cos n\pi}{n\pi} = \dfrac{1-(-1)^n}{n\pi}$。
+>
+> $n$ 偶数时 $b_n = 0$；$n = 2k+1$ 奇数时 $b_n = \dfrac{2}{(2k+1)\pi}$。
+>
+> **Fourier 级数**：$f(x) \sim \dfrac{1}{2} + \dfrac{2}{\pi}\displaystyle\sum_{k=0}^{\infty}\dfrac{\sin(2k+1)x}{2k+1}$。
+>
+> **验收敛**：$x = \pi/2$ 是连续点，$f(\pi/2) = 1$：
+>
+> $$1 = \frac{1}{2} + \frac{2}{\pi}\sum_{k=0}^{\infty}\frac{(-1)^k}{2k+1}$$
+>
+> 故 $\sum_{k=0}^\infty\dfrac{(-1)^k}{2k+1} = \dfrac{\pi}{4}$（Leibniz 公式）。
+>
+> **反思**：$x=0$ 是间断点，Dirichlet 定理给出级数 $= \dfrac{f(0^-)+f(0^+)}{2} = \dfrac{0+1}{2} = \dfrac{1}{2}$ — 恰与常数项 $a_0/2 = 1/2$ 对应，符合期望。"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -523,9 +563,7 @@ $$
 分部积分得
 
 $$
-\mathcal F[f'](\omega)
-= \left[f(x)e^{-i\omega x}\right]_{-\infty}^{+\infty}
-+ i\omega \int_{-\infty}^{+\infty} f(x)e^{-i\omega x}\,dx.
+\mathcal F[f'](\omega) = \left[f(x)e^{-i\omega x}\right]_{-\infty}^{+\infty} + i\omega \int_{-\infty}^{+\infty} f(x)e^{-i\omega x}\,dx.
 $$
 
 若边界项消失，则
@@ -943,3 +981,164 @@ $$
 3. **正弦 / 余弦级数需先延拓**：原函数定义在 $[0, \pi]$，要奇延拓 / 偶延拓再展开。
 4. **复 Fourier 与实 Fourier 等价但记号不同**：$c_n e^{inx}$ vs $a_n\cos + b_n\sin$。
 5. **Parseval 仅对 $L^2$ 函数成立**：分段连续即可。
+
+---
+
+## 抽象成方法（套路总结）
+
+### Fourier 系数公式速查表
+
+| 情形 | $a_n$（$n\geq 0$）| $b_n$（$n\geq 1$）|
+|---|---|---|
+| 周期 $2\pi$ | $\dfrac{1}{\pi}\displaystyle\int_{-\pi}^{\pi}f(x)\cos nx\,dx$ | $\dfrac{1}{\pi}\displaystyle\int_{-\pi}^{\pi}f(x)\sin nx\,dx$ |
+| 周期 $2l$ | $\dfrac{1}{l}\displaystyle\int_{-l}^{l}f(x)\cos\dfrac{n\pi x}{l}\,dx$ | $\dfrac{1}{l}\displaystyle\int_{-l}^{l}f(x)\sin\dfrac{n\pi x}{l}\,dx$ |
+| 偶函数（余弦级数）| $\dfrac{2}{l}\displaystyle\int_{0}^{l}f(x)\cos\dfrac{n\pi x}{l}\,dx$ | $b_n=0$ |
+| 奇函数（正弦级数）| $a_n=0$ | $\dfrac{2}{l}\displaystyle\int_{0}^{l}f(x)\sin\dfrac{n\pi x}{l}\,dx$ |
+
+### 解题流程（5 步标准化）
+
+| 步骤 | 动作 | 注意 |
+|---|---|---|
+| 1 | 判奇偶性 | 偶 → 只含 $\cos$；奇 → 只含 $\sin$ |
+| 2 | 确定周期 $2l$，选公式 | $l=\pi$ 最常见；$[0,l]$ 定义域需先延拓 |
+| 3 | 积分求系数 $a_n, b_n$ | 分部积分；$\cos n\pi = (-1)^n$ 常用 |
+| 4 | 写 Fourier 级数（用 $\sim$）| 尚未确定收敛性，先用"$\sim$" |
+| 5 | Dirichlet 定理写收敛结论 | 连续点 $=f(x)$；间断点 $=\frac{f^-+f^+}{2}$ |
+
+---
+
+## 方法变形
+
+### 变形 1：利用 Fourier 展开求数项级数和
+
+**操作**：代特殊点 $x=x_0$ 使 $\cos(nx_0)$ 或 $\sin(nx_0)$ 取简单值（$0, \pm 1$）。常用点：$x=0$（余弦全为 $1$），$x=\pi$（余弦为 $(-1)^n$），$x=\pi/2$（正弦交错）。
+
+**例**：$f(x) = \vert x\vert$ 展开后令 $x=0$ → $\sum 1/(2k+1)^2 = \pi^2/8$；利用奇偶分拆再得 $\sum 1/n^2 = \pi^2/6$。
+
+### 变形 2：利用 Parseval 等式求 $\sum 1/n^{2k}$
+
+Parseval：$\dfrac{1}{\pi}\int_{-\pi}^{\pi}[f]^2\,dx = \dfrac{a_0^2}{2}+\sum(a_n^2+b_n^2)$。用 $f=x$ 得 $\sum 1/n^2 = \pi^2/6$；用 $f=x^2$ 得 $\sum 1/n^4 = \pi^4/90$。
+
+### 变形 3：$[0, l]$ 上函数展开为正弦或余弦级数
+
+要展成正弦级数 → 奇延拓（只用 $\int_0^l f\sin$ 算 $b_n$）；要展成余弦级数 → 偶延拓（只用 $\int_0^l f\cos$ 算 $a_n$）。两种展开的收敛结论不同，在端点处分别验证。
+
+### 变形 4：复指数形式与实数形式互化
+
+$c_n = (a_n - ib_n)/2$（$n\geq 1$），$c_{-n} = \overline{c_n}$，$c_0 = a_0/2$。频谱 $\vert c_n\vert  = \frac{1}{2}\sqrt{a_n^2+b_n^2} = A_n/2$（振幅一半）。做题时两种形式按需切换，无需死记，只需理解对应关系。
+
+---
+
+## 典型应用例题
+
+### 例 1：完整 Fourier 展开 + Parseval 求和
+
+> **题目**：设 $f(x) = x^2$（$-\pi\leq x\leq\pi$），以 $2\pi$ 为周期延拓。求 Fourier 级数，并利用 Parseval 恒等式求 $\displaystyle\sum_{n=1}^{\infty}\dfrac{1}{n^4}$。
+
+【思路】$x^2$ 是偶函数 → $b_n=0$，只算 $a_n$；展开后用 Parseval。
+
+【解】$a_0 = \dfrac{2}{\pi}\int_0^{\pi}x^2\,dx = \dfrac{2\pi^2}{3}$；分部积分两次得 $a_n = \dfrac{4(-1)^n}{n^2}$。
+
+Fourier 级数：$x^2 = \dfrac{\pi^2}{3}+4\displaystyle\sum_{n=1}^{\infty}\dfrac{(-1)^n\cos nx}{n^2}$。
+
+Parseval：$\dfrac{1}{\pi}\int_{-\pi}^{\pi}x^4\,dx = \dfrac{2\pi^4}{5} = \dfrac{a_0^2}{2}+\sum a_n^2 = \dfrac{2\pi^4}{9} + 16\sum\dfrac{1}{n^4}$。
+
+解得 $\displaystyle\sum_{n=1}^{\infty}\dfrac{1}{n^4} = \dfrac{\pi^4}{90}$（$\zeta(4)$ 经典结果）。
+
+【答案】$\boxed{\sum 1/n^4 = \pi^4/90}$。
+
+### 例 2：正弦级数展开（奇延拓）
+
+> **题目**：将 $f(x) = \cos x$（$0 < x < \pi$）展开为正弦级数。
+
+【思路】奇延拓后周期 $2\pi$，$a_n=0$，只计算 $b_n = \dfrac{2}{\pi}\int_0^{\pi}\cos x\sin nx\,dx$。
+
+【解】用积化和差：$\cos x\sin nx = \dfrac{1}{2}[\sin(n+1)x - \sin(n-1)x]$。
+
+$$b_n = \frac{1}{\pi}\int_0^{\pi}[\sin(n+1)x - \sin(n-1)x]\,dx$$
+
+$n=1$：$b_1 = \dfrac{1}{\pi}\int_0^{\pi}\sin 2x\,dx = 0$。
+
+$n\geq 2$：$b_n = \dfrac{1}{\pi}\left[\dfrac{1-\cos(n+1)\pi}{n+1} - \dfrac{1-\cos(n-1)\pi}{n-1}\right]$。
+
+当 $n$ 为奇数时（$n\geq 3$）：$\cos(n\pm 1)\pi = 1$，$b_n = 0$。
+
+当 $n$ 为偶数时：$\cos(n\pm 1)\pi = -1$，$b_n = \dfrac{4n}{\pi(n^2-1)}$。
+
+$$\cos x = \frac{8}{\pi}\sum_{k=1}^{\infty}\frac{k\sin 2kx}{4k^2-1} \quad (0 < x < \pi)$$
+
+【答案】$\boxed{b_{2k}=\dfrac{8k}{\pi(4k^2-1)},\ b_{2k+1}=0}$，正弦级数如上。
+
+### 例 3：Dirichlet 定理 + 求特殊级数和
+
+> **题目**：$f(x) = e^x$（$-\pi < x < \pi$），以 $2\pi$ 为周期延拓，求其 Fourier 级数，并求 $\displaystyle\sum_{n=1}^{\infty}\dfrac{1}{1+n^2}$。
+
+【思路】$e^x$ 非奇非偶，算全部 $a_n, b_n$；连续点处 Fourier 级数 $= f(x)$，令 $x=0$ 即可。
+
+【解】利用 $\int e^x\cos nx\,dx = e^x(\cos nx + n\sin nx)/(1+n^2)$：
+
+$$a_n = \frac{1}{\pi}\cdot\frac{e^x(\cos nx+n\sin nx)}{1+n^2}\Big|_{-\pi}^{\pi} = \frac{2(-1)^n\sinh\pi}{\pi(1+n^2)}$$
+
+类似地，$b_n = \dfrac{-2n(-1)^n\sinh\pi}{\pi(1+n^2)}$，$a_0 = \dfrac{2\sinh\pi}{\pi}$。
+
+Fourier 级数在 $x=0$（连续点）处 $= e^0 = 1$：
+
+$$1 = \frac{\sinh\pi}{\pi} + \frac{2\sinh\pi}{\pi}\sum_{n=1}^{\infty}\frac{(-1)^n}{1+n^2}$$
+
+解得 $\displaystyle\sum_{n=1}^\infty\dfrac{(-1)^n}{1+n^2} = \dfrac{\pi}{2\sinh\pi} - \dfrac{1}{2}$，从而 $\displaystyle\sum_{n=1}^\infty\dfrac{1}{1+n^2} = \dfrac{\pi\coth\pi - 1}{2}$（利用实部与虚部分离）。
+
+【答案】$\boxed{\displaystyle\sum_{n=1}^\infty\dfrac{1}{1+n^2} = \dfrac{\pi\coth\pi - 1}{2}}$。
+
+---
+
+## 自测题
+
+**自测 1**　将 $f(x)=1$（$0 < x < \pi$）展开为余弦级数。
+
+> 💡 提示：偶延拓，$a_0 = 2$，$a_n = \dfrac{2}{\pi}\int_0^\pi\cos nx\,dx = 0$（$n\geq 1$）。故余弦级数就是 $f(x) = 1$（$a_0/2 = 1$，其余项消失）。验证 Dirichlet：在 $[0,\pi]$ 处处连续，收敛到 $f$ 本身 ✓。
+
+**自测 2**　$f(x) = x$（$-\pi < x < \pi$）的 Fourier 级数在 $x = \pi/2$ 处等于多少？
+
+> 💡 提示：$x=\pi/2$ 是连续点，Fourier 级数 $=f(\pi/2)=\pi/2$。代入 $2\sum(-1)^{n+1}\sin(nx)/n$，令 $x=\pi/2$ → 得 $\sum(-1)^{n+1}\sin(n\pi/2)/n = \pi/4$，即 $1 - 1/3 + 1/5 - 1/7 + \cdots = \pi/4$ 。
+
+**自测 3**　利用 $\vert x\vert$ 的 Fourier 展开，令 $x=\pi$ 验证 $\sum_{n=0}^\infty 1/(2n+1)^2 = \pi^2/8$。
+
+> 💡 提示：$\vert x\vert = \pi/2 - (4/\pi)\sum_{k=0}^\infty\cos(2k+1)x/(2k+1)^2$。令 $x=\pi$：$\pi = \pi/2 + (4/\pi)\sum 1/(2k+1)^2$，故 $\sum 1/(2k+1)^2 = \pi^2/8$。
+
+**自测 4**　方波 $f(x) = \text{sgn}(x)$（$-\pi < x < \pi$，$x\neq 0$），以 $2\pi$ 延拓。在 $x=0$ 处 Fourier 级数收敛到什么？
+
+> 💡 提示：$x=0$ 是跳跃间断点，$f(0^-)=-1$，$f(0^+)=1$，Dirichlet 定理给出收敛到 $(-1+1)/2 = \boxed{0}$。
+
+**自测 5**　已知 $\sum_{n=1}^\infty 1/n^2 = \pi^2/6$。用 $f(x)=x^2$ 的 Fourier 展开在 $x=\pi$ 处代入，验证此结论。
+
+> 💡 提示：$x^2 = \pi^2/3 + 4\sum(-1)^n\cos nx/n^2$，令 $x=\pi$：$\pi^2 = \pi^2/3 + 4\sum 1/n^2$，故 $\sum 1/n^2 = (2\pi^2/3)/4 = \pi^2/6$ ✓。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> Fourier 展开四步：奇偶性 → 系数公式 → 分部积分 → Dirichlet 收敛结论。
+> Parseval = 时域能量等于频域能量；间断点收敛到左右极限平均值。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 3 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（高中模板 D 速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 反射 |
+| 学习目标 + 17.1–17.6 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 重写版（中间） | 套路总结 |
+| 本章小结 | 原版 | 公式速查 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 重写版 | 演练 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 重写版 | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

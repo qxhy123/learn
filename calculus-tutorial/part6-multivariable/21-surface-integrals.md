@@ -1,5 +1,39 @@
 # 第21章 曲面积分
 
+> **一例速记**：
+> **第一类**（面积型）：$\iint_S f\,dS$，$z=z(x,y)$ 时 $dS=\sqrt{1+z_x^2+z_y^2}\,dx\,dy$，与法向无关。
+> **第二类**（坐标型）：$\iint_\Sigma P\,dy\,dz+Q\,dz\,dx+R\,dx\,dy = \iint_\Sigma \mathbf{F}\cdot\mathbf{n}\,dS$，**法向反向则变号**。
+> **Gauss 定理**：$\oiint_{\partial V}\mathbf{F}\cdot d\mathbf{S} = \iiint_V \nabla\cdot\mathbf{F}\,dV$（封闭曲面，外法向）。
+> **Stokes 定理**：$\oint_{\partial S}\mathbf{F}\cdot d\mathbf{r} = \iint_S(\nabla\times\mathbf{F})\cdot d\mathbf{S}$（右手定则确定方向）。
+
+---
+
+## 引入：Gauss 定理一步算球面通量
+
+> **题目**：计算向量场 $\mathbf{F} = (x^3, y^3, z^3)$ 穿过球面 $x^2+y^2+z^2=1$ 外侧的通量。
+
+请先停下来想一想：封闭曲面 + 向量场通量 → **Gauss 定理**的信号。直接参数化球面算通量要分三个分量，极繁；Gauss 把它变成体积分。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "看到 $\oiint_S \mathbf{F}\cdot d\mathbf{S}$，$S$ 是封闭球面，立刻想 **Gauss 定理**。
+>
+> **第一步：计算散度**。$\nabla\cdot\mathbf{F} = \partial_x(x^3)+\partial_y(y^3)+\partial_z(z^3) = 3x^2+3y^2+3z^2$。
+>
+> **第二步：转化为体积分**。
+>
+> $$\oiint_S = \iiint_V 3(x^2+y^2+z^2)\,dV$$
+>
+> **第三步：用球坐标**。$V$ 是单位球，$x^2+y^2+z^2=\rho^2$，$dV=\rho^2\sin\varphi\,d\rho\,d\varphi\,d\theta$：
+>
+> $$= 3\int_0^{2\pi}d\theta\int_0^\pi\sin\varphi\,d\varphi\int_0^1\rho^2\cdot\rho^2\,d\rho = 3\cdot 2\pi\cdot 2\cdot\frac{1}{5} = \frac{12\pi}{5}$$
+>
+> **验证感觉**：散度 $3(x^2+y^2+z^2)$ 在单位球内平均值为 $3\cdot\frac{3}{5}=\frac{9}{5}$（球的 $\overline{r^2}=3/5$），乘以体积 $4\pi/3$ 得 $12\pi/5$。一致！"
+
+---
+
 ## 学习目标
 
 通过本章学习，你将能够：
@@ -613,3 +647,148 @@ $$
 3. **曲面参数化法向量方向**：$\mathbf{r}_u\times\mathbf{r}_v$ 的方向取决于参数顺序，若要外法向则需检查朝向，必要时取负。
 4. **投影到 $xOy$ 面的符号**：若曲面上侧法向量 $z$ 分量为正，则 $\iint_S R\,dx\,dy = \iint_D R\,dx\,dy$；若下侧则加负号。
 5. **Gauss 定理要求封闭曲面**：若曲面不封闭，需补充”盖子”曲面再用 Gauss，最后减去补充部分。
+
+---
+
+## 抽象成方法（套路总结）
+
+### 5 大公式速查
+
+| 积分类型 | 公式 | 关键要点 |
+|---|---|---|
+| 第一类面积 $\iint_S f\,dS$ | $\iint_D f(x,y,z(x,y))\sqrt{1+z_x^2+z_y^2}\,dx\,dy$ | 与法向无关 |
+| 面积元（$z=z(x,y)$） | $dS=\sqrt{1+z_x^2+z_y^2}\,dx\,dy$ | 投影到 $xOy$ 面 |
+| 第二类通量 $\iint_\Sigma R\,dx\,dy$ | 上侧 $=\iint_D R(x,y,z(x,y))\,dx\,dy$；下侧加 $-$ | 法向决定符号 |
+| Gauss 定理 | $\oiint_S \mathbf{F}\cdot d\mathbf{S} = \iiint_V \nabla\cdot\mathbf{F}\,dV$ | 封闭面外法向 |
+| Stokes 定理 | $\oint_{\partial S}\mathbf{F}\cdot d\mathbf{r} = \iint_S(\nabla\times\mathbf{F})\cdot d\mathbf{S}$ | 右手定则定向 |
+| 散度 | $\nabla\cdot\mathbf{F} = P_x+Q_y+R_z$ | 源强度 |
+
+### 解题流程（3 步判断法）
+
+1. **是第一类还是第二类？** 有 $dS$（面积元无方向）→ 第一类；有 $dx\,dy$ 或 $\mathbf{F}\cdot d\mathbf{S}$ → 第二类（方向有关）。
+2. **封闭曲面 + 体积分？** → 优先 **Gauss 定理**（算散度比算三个分量通量快得多）。
+3. **曲面 + 边界曲线？** → 考虑 **Stokes 定理**（旋度换通量，或通量换环量）。
+
+---
+
+## 方法变形
+
+### 变形 1：不封闭曲面用 Gauss——补盖法
+
+曲面 $\Sigma$ 不封闭时，补充”盖子” $\Sigma_0$ 构成封闭曲面，用 Gauss：$\oiint = \iint_\Sigma + \iint_{\Sigma_0}$，故 $\iint_\Sigma = \oiint - \iint_{\Sigma_0}$。盖子通常选平面，计算简单。
+
+### 变形 2：对称性消零
+
+若封闭区域 $V$ 关于坐标平面对称，且被积量关于对应变量为奇函数，则积分为零。如 $\iiint_V x\,dV = 0$（球关于 $yOz$ 对称）。
+
+### 变形 3：Stokes 转化曲面选取
+
+Stokes 定理中，具有相同边界 $\partial S$ 的任何曲面 $S$（同侧定向）积分值相同。选计算最简单的曲面（如平面区域）代替复杂曲面。
+
+### 变形 4：第一类曲面积分与面积公式
+
+当 $f=1$ 时，$\iint_S dS$ 等于曲面面积 $A = \iint_D \sqrt{1+z_x^2+z_y^2}\,dx\,dy$。面密度为 $\rho$ 时质量 $= \iint_S \rho\,dS$。
+
+---
+
+## 典型应用例题
+
+### 例 1：第一类曲面积分（面积型）
+
+> **题目**：计算 $\iint_S z\,dS$，其中 $S$ 是平面 $x+y+z=1$ 在第一卦限（$x,y,z\geq 0$）的部分。
+
+【思路】平面方程给出 $z = 1-x-y$，投影到 $xOy$，计算 $dS$。
+
+【解】$z_x = -1$，$z_y = -1$，$\sqrt{1+z_x^2+z_y^2} = \sqrt{3}$。
+
+投影区域 $D: x\geq 0,y\geq 0,x+y\leq 1$。
+
+$$\iint_S z\,dS = \iint_D (1-x-y)\sqrt{3}\,dx\,dy = \sqrt{3}\int_0^1\int_0^{1-x}(1-x-y)\,dy\,dx$$
+
+内层 $= \frac{(1-x)^2}{2}$，故 $= \sqrt{3}\int_0^1\frac{(1-x)^2}{2}\,dx = \sqrt{3}\cdot\frac{1}{6} = \frac{\sqrt{3}}{6}$。
+
+【答案】$\boxed{\dfrac{\sqrt{3}}{6}}$。
+
+### 例 2：Gauss 定理简化通量计算
+
+> **题目**：计算 $\oiint_S (x^2+y)\,dy\,dz+(y^2+z)\,dz\,dx+(z^2+x)\,dx\,dy$，$S$ 是单位立方体 $[0,1]^3$ 的外侧。
+
+【思路】封闭曲面 → Gauss 定理，散度比三分量通量容易算。
+
+【解】$\nabla\cdot\mathbf{F} = 2x+2y+2z$。
+
+$$\oiint_S = \iiint_V 2(x+y+z)\,dV = 2\int_0^1\int_0^1\int_0^1(x+y+z)\,dz\,dy\,dx = 2\cdot 3\cdot\frac{1}{2} = 3$$
+
+【答案】$\boxed{3}$。
+
+### 例 3：Stokes 定理转化
+
+> **题目**：计算 $\oint_C z\,dx+x\,dy+y\,dz$，$C$ 是平面 $x+y+z=1$ 截单位球的圆（正方向使法向量指向 $(1,1,1)$ 方向）。
+
+【思路】曲线积分 → Stokes 定理，将其转为曲面旋度积分。
+
+【解】$\mathbf{F}=(z,x,y)$，旋度 $\nabla\times\mathbf{F} = (1-0,1-0,1-0) = (-1+1,...) $，直接计算：
+
+$$\nabla\times\mathbf{F} = \begin{vmatrix}\mathbf{i}&\mathbf{j}&\mathbf{k}\\\partial_x&\partial_y&\partial_z\\z&x&y\end{vmatrix} = (1-0)\mathbf{i}+(1-0)\mathbf{j}+(1-0)\mathbf{k} = (1,1,1)$$
+
+取曲面 $\Sigma$ 为圆盘（$x+y+z=1$ 截球），法向量单位向量 $\mathbf{n}=\frac{1}{\sqrt{3}}(1,1,1)$，$(\nabla\times\mathbf{F})\cdot\mathbf{n} = \frac{3}{\sqrt{3}}=\sqrt{3}$，圆盘面积 $A$。
+
+圆盘是球面 $r=1$ 与平面 $x+y+z=1$ 的截面，圆心到平面距离 $d=\frac{1}{\sqrt{3}}$，半径 $r^2=1-\frac{1}{3}=\frac{2}{3}$，$A=\frac{2\pi}{3}$。
+
+$$\oint_C = \iint_\Sigma \sqrt{3}\,dS = \sqrt{3}\cdot\frac{2\pi}{3} = \frac{2\sqrt{3}\pi}{3}$$
+
+【答案】$\boxed{\dfrac{2\sqrt{3}\pi}{3}}$。
+
+---
+
+## 自测题
+
+**自测 1**　计算 $\iint_S (x^2+y^2)\,dS$，$S$ 是锥面 $z=\sqrt{x^2+y^2}$（$0\leq z\leq 1$）。
+
+> 💡 提示：$\sqrt{1+z_x^2+z_y^2}=\sqrt{2}$，极坐标积分，答案 $= \sqrt{2}\pi/2$。
+
+**自测 2**　用 Gauss 定理计算 $\oiint_S x^2\,dy\,dz+y^2\,dz\,dx+z^2\,dx\,dy$，$S$ 为球面 $x^2+y^2+z^2=R^2$ 外侧。
+
+> 💡 提示：散度 $=2(x+y+z)$，对称性 $\iiint_V x\,dV=0$，答案 $= 0$。
+
+**自测 3**　计算 $\iint_S z\,dx\,dy$，$S$ 是下半球面 $z=-\sqrt{1-x^2-y^2}$ 取下侧（法向量朝下）。
+
+> 💡 提示：下侧 $\iint_S R\,dx\,dy = -\iint_D R(x,y,z(x,y))\,dx\,dy = -\iint_D (-\sqrt{1-r^2})r\,dr\,d\theta$，极坐标积分得 $2\pi/3$。
+
+**自测 4**　$\mathbf{F}=(x,y,z)$，计算其穿过单位球面外侧的总通量。
+
+> 💡 提示：$\nabla\cdot\mathbf{F}=3$，$\iiint_V 3\,dV = 3\cdot\frac{4\pi}{3}=4\pi$。
+
+**自测 5**　$\mathbf{F}=(y,-x,0)$，用 Stokes 定理计算 $\oint_C \mathbf{F}\cdot d\mathbf{r}$，$C$ 是 $z=0$ 平面上的单位圆（逆时针）。
+
+> 💡 提示：$\nabla\times\mathbf{F} = (0,0,-1-1)=(0,0,-2)$，$d\mathbf{S}=(0,0,1)\,dA$（上侧），$\iint_D(-2)\,dA=-2\pi$。
+
+---
+
+**回头看一眼”一例速记”**：
+
+> 第一类 $dS = \sqrt{1+z_x^2+z_y^2}\,dx\,dy$，与法向无关。
+> Gauss：封闭曲面 → 散度体积分；Stokes：曲面边界 → 旋度面积分。
+> 法向取向反则第二类积分变号。
+
+如果现在不看笔记，能独立完成例 2 + 自测 2 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 路径 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 反射 |
+| 学习目标 + 21.1–21.4 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 抽象成方法 + 方法变形 | 重写版（中间） | 套路总结 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 典型应用例题 3 例 | 重写版 | 演练 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 自测题 5 题 | 重写版 | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

@@ -900,3 +900,159 @@ $$
 3. **三角换元别忘 $dx$ 换算**：$x=a\sin\theta$ → $dx=a\cos\theta\,d\theta$。
 4. **部分分式分解必须先化为真分式**：若分子次数 $\geq$ 分母，先做长除法。
 5. **换元后回代时**：要把 $\theta$ 表达式换回 $x$（用反三角或直接代回）。
+
+
+---
+
+## 抽象成方法（套路总结）
+
+### 积分技巧核心公式速查
+
+| 技巧 | 适用场景 | 关键操作 |
+|---|---|---|
+| **分部积分** | 两类函数乘积 | $\int u\,dv=uv-\int v\,du$；LIATE 选 $u$ |
+| **三角换元** $x=a\sin\theta$ | $\sqrt{a^2-x^2}$ | 消去根号；回代用 $\arcsin$ |
+| **三角换元** $x=a\tan\theta$ | $\sqrt{a^2+x^2}$ | 消去根号；回代用 $\arctan$ |
+| **三角换元** $x=a\sec\theta$ | $\sqrt{x^2-a^2}$ | 消去根号；注意 $\vert\tan\theta\vert$ |
+| **部分分式** | 有理函数 $P/Q$ | 先化真分式；按因式分解型展开 |
+| **万能代换** $t=\tan(x/2)$ | 三角有理式 | $\sin x=\frac{2t}{1+t^2}$，$\cos x=\frac{1-t^2}{1+t^2}$ |
+| **华里士公式** | $\int_0^{\pi/2}\sin^m\cos^n$ | 双阶乘公式 $I_{m,n}=\frac{(m-1)!!·(n-1)!!}{(m+n)!!}·[\pi/2]$ |
+
+### 选技巧的标准 4 步流程
+
+1. **识别结构**：含根式？两函数乘积？三角有理式？纯有理函数？
+2. **选主技巧**：
+   - 含 $\sqrt{a^2-x^2}$ 等 → 三角换元
+   - 乘积（LIATE 排列）→ 分部积分
+   - $P(x)/Q(x)$ → 部分分式（先检查是否真分式）
+   - $R(\sin x,\cos x)$ → 万能代换（或对称性）
+3. **执行换元**：明写 $u = \ldots$，$du = \ldots$，**$dx$ 的替换不可漏**
+4. **回代验证**：最终结果求导等于被积函数
+
+---
+
+## 方法变形
+
+### 变形 1：分部积分的"LIATE 失效"补救
+
+某些情形 LIATE 无法直接排出优先级（如 $\int\sec^3 x\,dx$），这时尝试**自身乘积分拆**：$\sec^3 x=\sec x\cdot\sec^2 x$，令 $u=\sec x$，$dv=\sec^2 x\,dx$，得到 $I = \sec x\tan x - \int\tan^2 x\sec x\,dx$，利用 $\tan^2=\sec^2-1$ 后出现 $-I$，解方程得封闭形式。
+
+### 变形 2：奇次三角的凑微分
+
+$\sin^m x\cos^n x$ 中若 $m$ 奇（或 $n$ 奇），分离一个 $\sin x\,dx = -d(\cos x)$（或 $\cos x\,dx = d(\sin x)$），剩余部分用 $\sin^2=1-\cos^2$ 转化——无需三角换元。
+
+### 变形 3：复杂根式的欧拉代换
+
+当 $\sqrt{ax^2+bx+c}$ 且 $a>0$，令 $\sqrt{ax^2+bx+c}=\sqrt{a}\,x+t$，可有理化（欧拉第一代换）。三角代换为特例。
+
+### 变形 4：区间再现法
+
+$\int_0^\pi f(x)\sin x\,dx$ 型：令 $t=\pi-x$，再与原积分求和，消去 $x$ 因子——常见于含 $x/(\sin x)$ 的定积分。
+
+---
+
+## 典型应用例题
+
+### 例 1：部分分式 + 对数
+
+> **题目**：求 $\displaystyle\int\frac{x+2}{x^2-x-2}\,dx$。
+
+【思路】分母 $x^2-x-2=(x-2)(x+1)$，真分式，部分分式分解。
+
+【解】设 $\dfrac{x+2}{(x-2)(x+1)}=\dfrac{A}{x-2}+\dfrac{B}{x+1}$。通分：$x+2=A(x+1)+B(x-2)$。
+
+令 $x=2$：$4=3A$，$A=4/3$；令 $x=-1$：$1=-3B$，$B=-1/3$。
+
+$$\int\frac{x+2}{x^2-x-2}\,dx=\frac{4}{3}\ln\vert x-2\vert-\frac{1}{3}\ln\vert x+1\vert+C=\frac{1}{3}\ln\left\vert\frac{(x-2)^4}{x+1}\right\vert+C.$$
+
+$\boxed{\dfrac{4}{3}\ln\vert x-2\vert-\dfrac{1}{3}\ln\vert x+1\vert+C}$
+
+【注】验证：$\left(\frac{4}{3}\ln\vert x-2\vert-\frac{1}{3}\ln\vert x+1\vert\right)'=\frac{4}{3(x-2)}-\frac{1}{3(x+1)}=\frac{x+2}{(x-2)(x+1)}$ ✓
+
+### 例 2：三角换元 + 分部积分
+
+> **题目**：求 $\displaystyle\int\frac{x^2}{\sqrt{1-x^2}}\,dx$。
+
+【思路】分母含 $\sqrt{1-x^2}$，令 $x=\sin\theta$（$a=1$）。
+
+【解】令 $x=\sin\theta$，$dx=\cos\theta\,d\theta$，$\sqrt{1-x^2}=\cos\theta$。
+
+$$\int\frac{\sin^2\theta}{\cos\theta}\cdot\cos\theta\,d\theta=\int\sin^2\theta\,d\theta=\int\frac{1-\cos 2\theta}{2}\,d\theta=\frac{\theta}{2}-\frac{\sin 2\theta}{4}+C.$$
+
+回代 $\theta=\arcsin x$，$\sin 2\theta=2\sin\theta\cos\theta=2x\sqrt{1-x^2}$：
+
+$$= \frac{\arcsin x}{2}-\frac{x\sqrt{1-x^2}}{2}+C.$$
+
+$\boxed{\dfrac{\arcsin x}{2}-\dfrac{x\sqrt{1-x^2}}{2}+C}$
+
+【注】回代时 $\cos\theta = \sqrt{1-x^2}\geq 0$（因为 $\theta\in[-\pi/2,\pi/2]$），无需加绝对值。
+
+### 例 3：分部积分 + 循环
+
+> **题目**：计算 $\displaystyle\int_0^{\pi/4} x\sec^2 x\,dx$。
+
+【思路】乘积型，$u=x$（A），$dv=\sec^2 x\,dx$（T）；$v=\tan x$。定积分直接代限。
+
+【解】
+
+$$\int_0^{\pi/4} x\sec^2 x\,dx = \left[x\tan x\right]_0^{\pi/4} - \int_0^{\pi/4}\tan x\,dx.$$
+
+$$= \frac{\pi}{4}\cdot 1 - [-\ln\vert\cos x\vert]_0^{\pi/4} = \frac{\pi}{4} - \ln\frac{1}{\cos(\pi/4)} = \frac{\pi}{4} - \frac{\ln 2}{2}.$$
+
+$\boxed{\dfrac{\pi}{4}-\dfrac{\ln 2}{2}}$
+
+【注】定积分的分部积分 $\int_a^b u\,dv = [uv]_a^b - \int_a^b v\,du$，无需回代变量，直接代限即可。
+
+---
+
+## 自测题
+
+**自测 1**　$\displaystyle\int\frac{3}{(x-1)(x+2)}\,dx$。
+
+> 💡 提示：部分分式，$A=1,B=-1$；答案 $\ln\vert x-1\vert-\ln\vert x+2\vert+C$。
+
+**自测 2**　$\displaystyle\int_0^{\pi/2}\sin^5 x\,dx$。
+
+> 💡 提示：奇次分离 $\sin x$，用 $\sin^4=(1-\cos^2)^2$；答案 $8/15$。
+
+**自测 3**　$\displaystyle\int\frac{dx}{\sqrt{x^2+9}}$。
+
+> 💡 提示：$x=3\tan\theta$；答案 $\ln\vert x+\sqrt{x^2+9}\vert+C$。
+
+**自测 4**　$\displaystyle\int_0^1 \arctan x\,dx$。
+
+> 💡 提示：LIATE，$u=\arctan x$，$dv=dx$；答案 $\pi/4-\ln 2/2$（参考 $\int\frac{x}{1+x^2}dx$）。
+
+**自测 5**　$\displaystyle\int\frac{1}{3+2\cos x}\,dx$。
+
+> 💡 提示：万能代换 $t=\tan(x/2)$，化为 $\int\frac{2}{5t^2+1}\,dt$；答案 $\dfrac{2}{\sqrt{5}}\arctan\left(\sqrt{5}\tan\dfrac{x}{2}\right)+C$。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 分部积分：$\int u\,dv=uv-\int v\,du$；LIATE 选 $u$；循环时解方程。
+> 三角换元：$\sqrt{a^2-x^2}\to x=a\sin$；$\sqrt{a^2+x^2}\to x=a\tan$；$\sqrt{x^2-a^2}\to x=a\sec$。
+> 有理函数：先真分式，再按因子类型写部分分式。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 2——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 反射 |
+| 学习目标 + 13.1–13.5 严格正文 | 原版 | 完整推导 |
+| 深度学习应用 + 代码 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 巩固 |
+| 几何示意（图） | 配图 | 可视化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 |
+| 抽象成方法 + 方法变形 | 重写版（新增） | 套路总结 |
+| 典型应用例题 3 例 | 重写版（新增） | 演练 |
+| 自测题 5 题 | 重写版（新增） | 额外训练 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
