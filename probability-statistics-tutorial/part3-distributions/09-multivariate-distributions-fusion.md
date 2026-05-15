@@ -404,21 +404,21 @@ $$\ln p_T(\mathbf{z}_T) = \ln p_0(\mathbf{z}_0) - \sum_{t=1}^T \ln\left|\det\fra
 
 ### 5 大核心公式速查
 
-| 名称 \| 公式 \| 关键性质 |
-\|---|---|---|
-\| **多元正态 PDF** \| $f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}|\boldsymbol{\Sigma}|^{1/2}}\exp\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$ \| $\boldsymbol{\Sigma}$ 对称半正定 |
-\| **线性变换** \| $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol{\mu}+\mathbf{b},\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$ \| 仿射变换封闭 |
-\| **样本均值分布** \| $\bar{X}\sim\mathcal{N}(\mu,\sigma^2/n)$ \| $E[\bar{X}]=\mu$，$\text{Var}(\bar{X})=\sigma^2/n$ |
-\| **样本方差分布** \| $(n-1)S^2/\sigma^2\sim\chi^2(n-1)$ \| 自由度 $n-1$，与 $\bar{X}$ 独立（仅正态） |
-\| **$t$ 统计量** \| $T=\frac{\bar{X}-\mu}{S/\sqrt{n}}\sim t(n-1)$ \| $\sigma$ 未知时用 $S$ 代替 |
+| 名称 | 公式 | 关键性质 |
+|---|---|---|
+| **多元正态 PDF** | $f(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}\vert\boldsymbol{\Sigma}\vert^{1/2}}\exp\bigl(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\bigr)$ | $\boldsymbol{\Sigma}$ 对称半正定 |
+| **线性变换** | $\mathbf{A}\mathbf{X}+\mathbf{b}\sim\mathcal{N}(\mathbf{A}\boldsymbol{\mu}+\mathbf{b},\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$ | 仿射变换封闭 |
+| **样本均值分布** | $\bar{X}\sim\mathcal{N}(\mu,\sigma^2/n)$ | $E[\bar{X}]=\mu$，$\text{Var}(\bar{X})=\sigma^2/n$ |
+| **样本方差分布** | $(n-1)S^2/\sigma^2\sim\chi^2(n-1)$ | 自由度 $n-1$，与 $\bar{X}$ 独立（仅正态） |
+| **$t$ 统计量** | $T=\frac{\bar{X}-\mu}{S/\sqrt{n}}\sim t(n-1)$ | $\sigma$ 未知时用 $S$ 代替 |
 
 ### 三大抽样分布定义速查
 
-| 分布 \| 定义 \| 期望 \| 方差 |
-\|---|---|---|---|
-\| $\chi^2(n)$ \| $\sum_{i=1}^n Z_i^2$，$Z_i\stackrel{\text{i.i.d.}}{\sim}\mathcal{N}(0,1)$ \| $n$ \| $2n$ |
-\| $t(n)$ \| $\frac{Z}{\sqrt{\chi^2(n)/n}}$，$Z\perp\chi^2$ \| $0$（$n>1$）\| $\frac{n}{n-2}$（$n>2$）|
-\| $F(m,n)$ \| $\frac{\chi^2(m)/m}{\chi^2(n)/n}$，两者独立 \| $\frac{n}{n-2}$（$n>2$）\| — |
+| 分布 | 定义 | 期望 | 方差 |
+|---|---|---|---|
+| $\chi^2(n)$ | $\sum_{i=1}^n Z_i^2$，$Z_i\stackrel{\text{i.i.d.}}{\sim}\mathcal{N}(0,1)$ | $n$ | $2n$ |
+| $t(n)$ | $\frac{Z}{\sqrt{\chi^2(n)/n}}$，$Z\perp\chi^2$ | $0$（$n>1$）| $\frac{n}{n-2}$（$n>2$）|
+| $F(m,n)$ | $\frac{\chi^2(m)/m}{\chi^2(n)/n}$，两者独立 | $\frac{n}{n-2}$（$n>2$）| — |
 
 ### 抽样分布构造 3 步
 
@@ -464,15 +464,15 @@ $$\frac{\bar{X}-\mu}{\sigma/\sqrt{n}}\xrightarrow{d}\mathcal{N}(0,1), \quad \fra
 
 ## 本章小结
 
-| 分布 \| 支撑集 \| 参数 \| 均值 \| 关键性质 |
-\|------|--------|------|------|---------|
-\| $\text{Multinomial}(n, \mathbf{p})$ \| 非负整数向量，和为 $n$ \| $n$, $\mathbf{p}$ \| $n\mathbf{p}$ \| 二项分布推广，$\text{Cov}(X_i,X_j) = -np_ip_j$ |
-\| $\mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\Sigma})$ \| $\mathbb{R}^d$ \| $\boldsymbol{\mu}$, $\boldsymbol{\Sigma}$ \| $\boldsymbol{\mu}$ \| 线性变换封闭，条件/边缘仍正态 |
-\| $\text{Dir}(\boldsymbol{\alpha})$ \| $k{-}1$ 维单纯形 \| $\boldsymbol{\alpha}$ \| $\alpha_i / \alpha_0$ \| 多项分布的共轭先验 |
-\| $\mathcal{W}_d(\nu, \boldsymbol{\Sigma})$ \| $d{\times}d$ 正定矩阵 \| $\nu$, $\boldsymbol{\Sigma}$ \| $\nu\boldsymbol{\Sigma}$ \| 精度矩阵的共轭先验 |
-\| $\chi^2(n)$ \| $(0,+\infty)$ \| $n$（自由度）\| $n$ \| $E=n$，$\text{Var}=2n$，右偏 |
-\| $t(n)$ \| $\mathbb{R}$ \| $n$（自由度）\| $0$ \| 对称，尾比正态厚；$n\to\infty\Rightarrow\mathcal{N}(0,1)$ |
-\| $F(m,n)$ \| $(0,+\infty)$ \| $m$,$n$（自由度）\| $\frac{n}{n-2}$ \| $T^2\sim F(1,n)$；$1/F\sim F(n,m)$ |
+| 分布 | 支撑集 | 参数 | 均值 | 关键性质 |
+|------|--------|------|------|---------|
+| $\text{Multinomial}(n, \mathbf{p})$ | 非负整数向量，和为 $n$ | $n$, $\mathbf{p}$ | $n\mathbf{p}$ | 二项分布推广，$\text{Cov}(X_i,X_j) = -np_ip_j$ |
+| $\mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\Sigma})$ | $\mathbb{R}^d$ | $\boldsymbol{\mu}$, $\boldsymbol{\Sigma}$ | $\boldsymbol{\mu}$ | 线性变换封闭，条件/边缘仍正态 |
+| $\text{Dir}(\boldsymbol{\alpha})$ | $k{-}1$ 维单纯形 | $\boldsymbol{\alpha}$ | $\alpha_i / \alpha_0$ | 多项分布的共轭先验 |
+| $\mathcal{W}_d(\nu, \boldsymbol{\Sigma})$ | $d{\times}d$ 正定矩阵 | $\nu$, $\boldsymbol{\Sigma}$ | $\nu\boldsymbol{\Sigma}$ | 精度矩阵的共轭先验 |
+| $\chi^2(n)$ | $(0,+\infty)$ | $n$（自由度）| $n$ | $E=n$，$\text{Var}=2n$，右偏 |
+| $t(n)$ | $\mathbb{R}$ | $n$（自由度）| $0$ | 对称，尾比正态厚；$n\to\infty\Rightarrow\mathcal{N}(0,1)$ |
+| $F(m,n)$ | $(0,+\infty)$ | $m$,$n$（自由度）| $\frac{n}{n-2}$ | $T^2\sim F(1,n)$；$1/F\sim F(n,m)$ |
 
 **核心要点**：
 - 多项分布是分类问题的基础，与 softmax 输出天然对应
@@ -1170,21 +1170,21 @@ $\sigma^2$ 未知时用样本标准差 $S$ 代替 $\sigma$，自由度为 $n-1=2
 
 本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（高中模板 D 速记 / 套路 / 例题 / 自测）** 融合：
 
-| 段落 \| 来源 \| 价值 |
-\|---|---|---|
-\| 一例速记 + 引入 + 思维路径还原 \| 重写版（前置）\| 建立直觉 / 反直觉 / 内心独白 |
-\| 学习目标（扩充）\| 原版 + 融合 \| 明确目标 |
-\| 9.1–9.5 严格正文 \| 原版 \| 完整推导（多项/多元正态/Dirichlet/Wishart/变换）|
-\| 几何示意（3 张 SVG）\| 配图 \| 可视化密度面/椭圆/抽样分布 |
-\| 抽象成方法 + 三大抽样分布速查 \| 重写版（中间）\| 公式速查 + 构造 3 步 |
-\| 方法变形（4 类）\| 融合两版 \| 推广应用 |
-\| 本章小结（扩充 $\chi^2/t/F$）\| 原版 + 融合 \| 公式速查 |
-\| 思考路标（12 条）\| 融合两版 \| 条件反射 |
-\| 易错点（6 条）\| 融合两版 \| 防坑 |
-\| 典型应用例题 3 例 \| 重写版 \| 演练（条件/均值/方差）|
-\| 深度学习应用（扩充 GMM/CLT）\| 原版 + 融合 \| 工业实战 |
-\| PyTorch 代码（扩充抽样分布验证）\| 原版 + 融合 \| 数值验证 |
-\| 练习题 6 题 + 详解 \| 原版（+练习9.6）\| 巩固 |
-\| 自测题 5 题 \| 重写版 \| 额外训练 |
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉 / 反直觉 / 内心独白 |
+| 学习目标（扩充）| 原版 + 融合 | 明确目标 |
+| 9.1–9.5 严格正文 | 原版 | 完整推导（多项/多元正态/Dirichlet/Wishart/变换）|
+| 几何示意（3 张 SVG）| 配图 | 可视化密度面/椭圆/抽样分布 |
+| 抽象成方法 + 三大抽样分布速查 | 重写版（中间）| 公式速查 + 构造 3 步 |
+| 方法变形（4 类）| 融合两版 | 推广应用 |
+| 本章小结（扩充 $\chi^2/t/F$）| 原版 + 融合 | 公式速查 |
+| 思考路标（12 条）| 融合两版 | 条件反射 |
+| 易错点（6 条）| 融合两版 | 防坑 |
+| 典型应用例题 3 例 | 重写版 | 演练（条件/均值/方差）|
+| 深度学习应用（扩充 GMM/CLT）| 原版 + 融合 | 工业实战 |
+| PyTorch 代码（扩充抽样分布验证）| 原版 + 融合 | 数值验证 |
+| 练习题 6 题 + 详解 | 原版（+练习9.6）| 巩固 |
+| 自测题 5 题 | 重写版 | 额外训练 |
 
 **适用**：一站式学习——先速记建立直觉，看反直觉引入，读严格正文，看几何示意，套方法变形，做典型例题，看代码验证，做习题巩固，自测验收。

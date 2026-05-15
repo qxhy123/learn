@@ -330,7 +330,7 @@ $$\gamma_2 = \frac{E[(X - \mu)^4]}{\sigma^4} - 3$$
 | 方差 | $\text{Var}(X) = E[X^2] - (E[X])^2$ |
 | 均匀分布 | $E[X] = \frac{a+b}{2}$，$\text{Var}(X) = \frac{(b-a)^2}{12}$ |
 | 指数分布 | $E[X] = \frac{1}{\lambda}$，$\text{Var}(X) = \frac{1}{\lambda^2}$ |
-| 变量变换（单调） | $f_Y(y) = f_X(g^{-1}(y)) \cdot \|dg^{-1}/dy\|$ |
+| 变量变换（单调） | $f_Y(y) = f_X(g^{-1}(y)) \cdot \vert dg^{-1}/dy\vert$ |
 | 矩母函数 | $M_X(t) = E[e^{tX}]$，$M_X^{(n)}(0) = E[X^n]$ |
 
 **核心要点**：

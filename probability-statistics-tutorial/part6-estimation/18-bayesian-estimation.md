@@ -240,7 +240,7 @@ $$
 | 损失函数 | 最优点估计 | 名称 |
 |---------|-----------|------|
 | 平方损失 $(\hat{\theta} - \theta)^2$ | 后验均值 $E[\theta \mid \mathbf{x}]$ | 贝叶斯估计量（MMSE） |
-| 绝对值损失 $|\hat{\theta} - \theta|$ | 后验中位数 $\text{Med}[\theta \mid \mathbf{x}]$ | 中位数估计 |
+| 绝对值损失 $\vert\hat{\theta} - \theta\vert$ | 后验中位数 $\text{Med}[\theta \mid \mathbf{x}]$ | 中位数估计 |
 | 0-1 损失 $\mathbf{1}[\hat{\theta} \neq \theta]$ | 后验众数 $\arg\max_\theta \pi(\theta \mid \mathbf{x})$ | MAP 估计 |
 
 ### 18.4.2 后验均值估计（MMSE）

@@ -28,8 +28,8 @@
 | 收敛类型 | 记号 | 定义 |
 |---|---|---|
 | 几乎必然收敛（a.s.）| $X_n \xrightarrow{a.s.} X$ | $P(\lim_{n\to\infty} X_n = X) = 1$ |
-| 依概率收敛 | $X_n \xrightarrow{P} X$ | $\forall\varepsilon>0$：$\lim_{n\to\infty} P(|X_n - X|>\varepsilon) = 0$ |
-| $L^p$ 收敛（均方收敛）| $X_n \xrightarrow{L^p} X$ | $\lim_{n\to\infty} E|X_n - X|^p = 0$ |
+| 依概率收敛 | $X_n \xrightarrow{P} X$ | $\forall\varepsilon>0$：$\lim_{n\to\infty} P(\vert X_n - X\vert>\varepsilon) = 0$ |
+| $L^p$ 收敛（均方收敛）| $X_n \xrightarrow{L^p} X$ | $\lim_{n\to\infty} E\vert X_n - X\vert^p = 0$ |
 | 依分布收敛 | $X_n \xrightarrow{d} X$ | $\lim_{n\to\infty} F_n(x) = F(x)$（$F$ 的连续点处）|
 
 ### 2.2 强弱关系

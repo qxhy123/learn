@@ -594,8 +594,8 @@ $$
 | 收敛类型 | 符号 | 定义核心 | 强弱 | 典型应用 |
 |---------|------|---------|------|---------|
 | 几乎必然（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega)\to X(\omega))=1$（逐路径） | 最强 | 强大数定律 |
-| $L^r$ 收敛 | $X_n \xrightarrow{L^r} X$ | $E[| X_n-X|^r]\to 0$（矩层面） | 较强 | 均方误差、矩估计 |
-| 依概率（P） | $X_n \xrightarrow{P} X$ | $P(| X_n-X|>\varepsilon)\to 0$ | 中等 | 弱大数定律、相合估计 |
+| $L^r$ 收敛 | $X_n \xrightarrow{L^r} X$ | $E[\vert X_n-X\vert^r]\to 0$（矩层面） | 较强 | 均方误差、矩估计 |
+| 依概率（P） | $X_n \xrightarrow{P} X$ | $P(\vert X_n-X\vert>\varepsilon)\to 0$ | 中等 | 弱大数定律、相合估计 |
 | 依分布（d） | $X_n \xrightarrow{d} X$ | $F_n(x)\to F(x)$ 在连续点 | 最弱 | CLT、渐近理论 |
 
 ### 蕴含关系图（→ 图）
@@ -614,7 +614,7 @@ $$
 | $\xrightarrow{P}\Rightarrow\xrightarrow{a.s.}$ | 可取子列（必存在 a.s. 收敛子列） |
 | $\xrightarrow{P}\Rightarrow\xrightarrow{L^1}$ | $\{X_n\}$ 一致可积 |
 | $\xrightarrow{d}\Rightarrow\xrightarrow{P}$ | 极限为常数 |
-| $\xrightarrow{a.s.}\Rightarrow\xrightarrow{L^p}$ | 一致可积（$p\ge1$）或 $| X_n|\le Y\in L^p$ |
+| $\xrightarrow{a.s.}\Rightarrow\xrightarrow{L^p}$ | 一致可积（$p\ge1$）或 $\vert X_n\vert\le Y\in L^p$ |
 
 ### 选择收敛模式 3 步流程
 
@@ -663,8 +663,8 @@ $$
 | 收敛类型 | 符号 | 定义核心 | 强弱排序 | 典型应用 |
 |---------|------|---------|---------|---------|
 | 几乎必然收敛（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega) \to X(\omega)) = 1$ | 最强（路径层面） | 强大数定律 |
-| $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[| X_n-X|^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
-| 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(| X_n-X|>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
+| $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[\vert X_n-X\vert^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
+| 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(\vert X_n-X\vert>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
 | 依分布收敛 | $X_n \xrightarrow{d} X$ | $F_n(x) \to F(x)$ 在连续点 | 最弱（分布层面） | 中心极限定理、渐近理论 |
 
 ### 蕴含关系总结
@@ -684,7 +684,7 @@ $$
 | $\xrightarrow{P} \Rightarrow \xrightarrow{a.s.}$ | 可取子列（必存在几乎必然收敛子列） |
 | $\xrightarrow{P} \Rightarrow \xrightarrow{L^p}$ | 一致可积性（$p = 1$）或有界性 |
 | $\xrightarrow{d} \Rightarrow \xrightarrow{P}$ | 极限为常数 |
-| $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$|X_n| \leq Y \in L^p$） |
+| $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$\vert X_n\vert \leq Y \in L^p$） |
 
 **子列原理**（常用工具）：$X_n \xrightarrow{P} X$ 当且仅当对 $X_n$ 的任意子列，存在进一步的子列几乎必然收敛到 $X$。
 

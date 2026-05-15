@@ -526,8 +526,8 @@ $$
 | 收敛类型 | 符号 | 定义核心 | 强弱排序 | 典型应用 |
 |---------|------|---------|---------|---------|
 | 几乎必然收敛（a.s.） | $X_n \xrightarrow{a.s.} X$ | $P(\omega: X_n(\omega) \to X(\omega)) = 1$ | 最强（路径层面） | 强大数定律 |
-| $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[|X_n-X|^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
-| 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(|X_n-X|>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
+| $L^p$ 收敛 | $X_n \xrightarrow{L^p} X$ | $\mathbb{E}[\vert X_n-X\vert^p] \to 0$ | 较强（矩层面） | 均方误差收敛、矩估计 |
+| 依概率收敛 | $X_n \xrightarrow{P} X$ | $P(\vert X_n-X\vert>\varepsilon) \to 0$ | 中等（概率层面） | 弱大数定律、相合估计 |
 | 依分布收敛 | $X_n \xrightarrow{d} X$ | $F_n(x) \to F(x)$ 在连续点 | 最弱（分布层面） | 中心极限定理、渐近理论 |
 
 ### 蕴含关系总结
@@ -547,7 +547,7 @@ $$
 | $\xrightarrow{P} \Rightarrow \xrightarrow{a.s.}$ | 可取子列（必存在几乎必然收敛子列） |
 | $\xrightarrow{P} \Rightarrow \xrightarrow{L^p}$ | 一致可积性（$p = 1$）或有界性 |
 | $\xrightarrow{d} \Rightarrow \xrightarrow{P}$ | 极限为常数 |
-| $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$|X_n| \leq Y \in L^p$） |
+| $\xrightarrow{a.s.} \Rightarrow \xrightarrow{L^p}$ | 一致可积（$p \geq 1$）或有界（$\vert X_n\vert \leq Y \in L^p$） |
 
 **子列原理**（常用工具）：$X_n \xrightarrow{P} X$ 当且仅当对 $X_n$ 的任意子列，存在进一步的子列几乎必然收敛到 $X$。
 
@@ -601,7 +601,7 @@ $$
 |---------|-------------|---------|
 | 依分布收敛 | 参数分布趋向平稳分布 | 学习率衰减 |
 | 依概率收敛 | $\theta_t$ 以高概率接近最优点 | 凸或PL条件，方差有界 |
-| 均方收敛 | $\mathbb{E}[\|\theta_t - \theta^*\|^2] \to 0$ | 强凸，常数学习率（有偏差） |
+| 均方收敛 | $\mathbb{E}[\vert\theta_t - \theta^*\vert^2] \to 0$ | 强凸，常数学习率（有偏差） |
 | 几乎必然收敛 | 几乎所有训练路径都收敛 | 较强假设，如Polyak步长 |
 
 ### 12.6.2 PAC 学习理论中的收敛性
@@ -969,8 +969,8 @@ if __name__ == '__main__':
 | 深度学习概念 | 对应收敛理论 | 数学表达 |
 |------------|------------|---------|
 | 训练损失趋向零 | $L^2$ 或依概率收敛 | $\mathbb{E}[\ell(\theta_t)] \to 0$ 或 $\ell(\theta_t) \xrightarrow{P} 0$ |
-| 泛化误差收敛 | 一致大数定律（ULLN） | $\sup_h \|R(h) - \hat{R}_n(h)\| \xrightarrow{P} 0$ |
-| SGD 找到稳定点 | 依概率收敛 | $\|\nabla L(\theta_t)\| \xrightarrow{P} 0$ |
+| 泛化误差收敛 | 一致大数定律（ULLN） | $\sup_h \vert R(h) - \hat{R}_n(h)\vert \xrightarrow{P} 0$ |
+| SGD 找到稳定点 | 依概率收敛 | $\vert\nabla L(\theta_t)\vert \xrightarrow{P} 0$ |
 | PAC 样本复杂度 | 依概率收敛速率 | $O_P(1/\sqrt{n})$ 泛化界 |
 | 批归一化（BN） | CLT（依分布收敛） | 批均值 $\xrightarrow{d} \mathcal{N}(\mu, \sigma^2/m)$ |
 | Dropout 正则化 | 依概率收敛（随机近似） | 期望网络 $\approx$ 集成均值 |

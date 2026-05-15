@@ -458,7 +458,7 @@ $$
 | i.i.d. CLT（定理 11.1） | i.i.d.，$\sigma^2 < \infty$ | $Z_n \xrightarrow{d} \mathcal{N}(0,1)$ | $O(1/\sqrt{n})$ |
 | Lindeberg CLT（定理 11.2） | 独立，Lindeberg 条件 | $Z_n \xrightarrow{d} \mathcal{N}(0,1)$ | — |
 | De Moivre-Laplace（定理 11.4） | $X \sim B(n,p)$ | $(X-np)/\sqrt{npq} \xrightarrow{d} \mathcal{N}(0,1)$ | $O(1/\sqrt{n})$ |
-| Berry-Esseen（定理 11.5） | i.i.d.，三阶矩有限 | $\sup_x|F_n - \Phi| \leq C\rho/(\sigma^3\sqrt{n})$ | 精确量化 |
+| Berry-Esseen（定理 11.5） | i.i.d.，三阶矩有限 | $\sup_x\vert F_n - \Phi\vert \leq C\rho/(\sigma^3\sqrt{n})$ | 精确量化 |
 
 **核心思维方式**：
 
