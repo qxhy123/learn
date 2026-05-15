@@ -1,8 +1,55 @@
-# 第23章：二阶方法与自然梯度
+# 第23章：二阶方法与自然梯度（融合版）
 
 > **前置章节**：第6章（牛顿法与拟牛顿法）、第16章（随机梯度下降）、第18章（自适应学习率）
 >
 > **难度**：★★★★★
+> **AI 定位**：大批量训练加速、大规模 Transformer 优化
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 23.1–23.5 / 深度学习应用 / 练习题）+ 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **为什么二阶**：一阶方法步长与曲率无关；Hessian $\mathbf{H}$ 给出曲率，但 $n^2$ 存储不可行（$n \sim 10^7 \sim 10^{11}$）。
+> **Gauss-Newton 替代**：$\mathbf{H} = \mathbf{G} + \mathbf{S}$，$\mathbf{G} = \mathbf{J}^\top\mathbf{J}$ 正半定；训练接近收敛时 $\mathbf{S}\approx0$，用 $\mathbf{G}$ 代替 $\mathbf{H}$。
+> **自然梯度**：$\tilde{\nabla}f = \mathbf{F}^{-1}\nabla f$，$\mathbf{F}$ 为 Fisher 信息矩阵；对参数化方式不变；信息几何视角——在 KL 球约束下的最速下降。
+> **K-FAC**：$\mathbf{F}_l \approx \mathbf{A}_{l-1} \otimes \mathbf{G}_l$（Kronecker 积分解），将 $d^4$ 存储降至 $2d^2$，求逆从 $O(d^6)$ 降至 $O(d^3)$。
+> **Shampoo**：$\Delta\mathbf{W} = -\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$，矩阵级预条件子，比 Adam（向量）更精细；Google 用于大规模 Transformer 训练。
+
+---
+
+## 引入：一阶方法的"方向性盲区"
+
+> **题目**：二维二次函数 $f(x_1, x_2) = 0.5x_1^2 + 50x_2^2$（条件数 $\kappa = 100$）。
+>
+> (1) 写出梯度下降（学习率 $\eta = 0.01$）从点 $(10, 1)$ 出发的一步更新后的新位置。
+>
+> (2) 写出牛顿方向（Hessian 的逆 $\times$ 梯度）从同一点出发的一步结果，并说明牛顿法一步到达极小值的原因。
+>
+> (3) K-FAC 近似牛顿法的核心思路是什么？为什么不直接用牛顿法？
+
+请先停下来想一想：梯度下降在这个病态函数上为什么会"震荡"？
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "这是经典的病态二次问题，$x_1$ 方向曲率 1，$x_2$ 方向曲率 100——差了 100 倍。
+>
+> **第 (1) 问——梯度下降**：$\nabla f = (x_1, 100x_2)^\top$。在点 $(10, 1)$ 处，梯度 $= (10, 100)^\top$。
+>
+> 更新：$(x_1', x_2') = (10, 1) - 0.01 \times (10, 100) = (9.9, 0)$。
+>
+> 但 $x_2$ 的最优解是 $x_2^* = 0$，所以 $x_2$ 方向一步**恰好**到达（因为我们选了正好合适的 $\eta$）。而 $x_1^* = 0$，从 10 移动到 9.9，还差得远。若换成更大的 $\eta$ 使 $x_1$ 方向收敛更快，则 $x_2$ 方向会震荡（$\eta \times 100 > 2$ 时 $x_2$ 发散）。这就是**条件数越大，梯度下降越难收敛**的本质。
+>
+> **第 (2) 问——牛顿方向**：Hessian $\mathbf{H} = \text{diag}(1, 100)$，逆 $\mathbf{H}^{-1} = \text{diag}(1, 0.01)$。
+>
+> 牛顿方向 $= -\mathbf{H}^{-1}\nabla f = -\text{diag}(1,0.01)\times(10,100)^\top = (-10, -1)^\top$。
+>
+> 一步更新（步长 $\alpha = 1$）：$(10, 1) + (-10, -1) = (0, 0)$。**一步到达极小值**！
+>
+> 原因：对二次函数，牛顿方向精确补偿了不同方向的曲率——曲率大的方向（$x_2$，曲率 100）步长除以 100 缩小；曲率小的方向（$x_1$，曲率 1）步长不变，从而各方向同步到达最优。
+>
+> **第 (3) 问——K-FAC 核心思路**：直接用牛顿法时，需要存储 $n \times n$ 的 Hessian（$n \sim 10^7$，不可行）并求逆（$O(n^3)$，更不可行）。K-FAC 的思路是：利用神经网络逐层结构，将每层的 Fisher 矩阵（$d_l^2 \times d_l^2$）近似为两个小矩阵的 Kronecker 积——输入激活协方差 $\mathbf{A}_{l-1}$（$d_l \times d_l$）和输出梯度协方差 $\mathbf{G}_l$（$d_l \times d_l$）的 Kronecker 积。
+>
+> 这样存储从 $O(d_l^4)$ 降至 $O(d_l^2)$，求逆从 $O(d_l^6)$ 降至 $O(d_l^3)$——在实践中可行，同时保留了大部分曲率信息，使 K-FAC 以接近自然梯度的收敛速度高效运行。"
 
 ---
 
@@ -504,6 +551,86 @@ $$\theta_{k+1} = \theta_k - \frac{\alpha}{\sqrt{\mathbf{v}_k} + \epsilon} \odot 
 - 内存开销：是 Adam 的约 $2\times$
 
 这表明即便在千亿参数规模，二阶信息的近似利用仍然物有所值。
+
+---
+
+## 23.6 二阶方法选型指南与工程实践
+
+### 23.6.1 计算预算与方法选择
+
+二阶方法的核心权衡是**额外计算代价 vs 步数节省**。以下框架帮助在实际任务中做出合理选择：
+
+**任务规模维度**：
+- **参数量 $n < 10^6$**（小模型，研究用）：可考虑全批次 L-BFGS；精度要求高时用完整 Gauss-Newton（加 damping）。
+- **参数量 $10^6 < n < 10^8$**（中等模型，如 ResNet-50/BERT-base）：K-FAC 或 Shampoo；每步代价约为 Adam 的 1.5–3×，但步数可以减少 3–10×。
+- **参数量 $n > 10^8$**（大模型，LLM）：Shampoo（TPU 友好）或 AdaHessian；K-FAC 的逐层矩阵在极大 FFN 层仍有开销。
+
+**训练阶段维度**：
+- **预训练（大量步数）**：Sophia 的对角 Hessian 节省 2× 步数，总 FLOP 有优势。
+- **微调（步数有限）**：Adam 或 AdamW 通常已足够；SFT/LoRA 微调中二阶方法收益边际下降。
+- **凸/近凸问题（线性回归、逻辑回归）**：L-BFGS 几乎总是最优；理论步数 $O(n\log(1/\epsilon))$（超线性收敛）。
+
+### 23.6.2 分布式训练中的二阶方法
+
+在分布式（数据并行）场景下，二阶方法面临额外挑战：
+
+**K-FAC 的 AllReduce 扩展**：
+- 统计量 $\hat{\mathbf{A}}_l$ 和 $\hat{\mathbf{G}}_l$ 需要跨 worker 同步（每层各做一次 AllReduce）。
+- 总额外通信量约 $2L(d_l^2 + d_{l-1}^2)$ 个元素——对于宽层（$d > 1000$），可能超过梯度本身的通信量。
+- **分布式 K-FAC** 的工程优化：每 $T_{\text{stat}}$ 步才同步统计量（默认每 10–100 步），降低通信频率。
+
+**Shampoo 的 SUMMA/XLA 优化**：
+Shampoo 中 $\mathbf{L}^{-1/4}$ 和 $\mathbf{R}^{-1/4}$ 的计算（矩阵幂）可以用 XLA 的 `linalg.matrix_power` 加速；在 TPU Pod 上，Google 的 Distributed Shampoo 通过跨 core 分片矩阵使大型 FFN 层的矩阵运算高效并行，成为 T5 和 PaLM 训练的生产优化器。
+
+### 23.6.3 超参数调优实践
+
+| 方法 | 关键超参数 | 推荐初值 | 调优建议 |
+|---|---|---|---|
+| **K-FAC** | damping $\lambda$，统计间隔 $T_{\text{stat}}$，逆更新 $T_{\text{inv}}$ | $\lambda=10^{-3}$，$T_{\text{stat}}=20$，$T_{\text{inv}}=200$ | 先调 $\lambda$（关系到步长稳定性），再调频率 |
+| **Shampoo** | $\epsilon$（数值稳定），更新频率 $T$ | $\epsilon=10^{-6}$，$T=100$ | $\epsilon$ 太大退化为 Adagrad |
+| **AdaHessian** | 历史 Hessian 的 EMA 系数 $\beta_H$ | $\beta_H = 0.999$ | 与 Adam $\beta_2$ 类比；$\beta_H$ 越大越平滑 |
+| **L-BFGS** | 历史步数 $m$，初始 Hessian 缩放 $H_0$ | $m=10$，$H_0 = I/\|g\|$ | $m$ 越大越精确但显存更大；$m=20$ 通常已足够 |
+
+### 23.6.4 二阶方法收敛速率对比（理论）
+
+**非凸函数**（$L$-光滑，无额外假设）：
+
+| 方法 | 收敛到一阶驻点（$\|\nabla f\| \leq \epsilon$） | 条件 |
+|---|---|---|
+| GD | $O(L\Delta/\epsilon^2)$ 步 | 固定步长 $\eta = 1/L$ |
+| Adam | $O(L\Delta/\epsilon^2)$ 步（常数可能更好） | 自适应步长 |
+| K-FAC | $O(\kappa_F\Delta/\epsilon^2)$（$\kappa_F \ll \kappa_H$） | 近似 Fisher 的条件数 |
+
+其中 $\Delta = f(\theta^0) - f^*$，$\kappa_F$ 为 Fisher 矩阵的有效条件数（通常远小于 Hessian 条件数 $\kappa_H$）。这正是 K-FAC 步数少的理论来源：通过减小有效条件数，每步做更大的有效进展。
+
+**强凸函数**（额外假设 $f$ 是 $\mu$-强凸的）：
+
+| 方法 | 收敛到最优解 | 收敛类型 |
+|---|---|---|
+| GD | $O(\kappa\log(1/\epsilon))$ 步 | 线性 |
+| L-BFGS | $O(\kappa_{\text{eff}}\log(1/\epsilon))$ 步（超线性） | 超线性 |
+| 牛顿法 | $O(\log\log(1/\epsilon))$ 步 | 二次 |
+| K-FAC | 介于 GD 和牛顿法之间 | 取决于近似质量 |
+
+超线性收敛（L-BFGS）意味着随着迭代，收敛速率本身在加快——这正是小批量场景下 L-BFGS 比 GD 强大的根本原因。
+
+### 23.6.5 二阶方法与一阶方法的本质差异总结
+
+从信息利用的角度看：
+
+**一阶方法（GD/Adam）** 只使用梯度信息 $g_t = \nabla f(\theta_t)$（含随机噪声），参数空间被隐含地假设为各向同性的欧氏空间——每个方向的"步长"等价。这在各向异性的损失曲面（不同参数有不同曲率）上是次优的。
+
+**二阶方法** 额外使用曲率信息，将参数空间赋予黎曼度量（Fisher 矩阵或 Hessian），按曲率缩放步长：
+- 高曲率方向（频繁更新、重要参数）：步长缩小（防止震荡）。
+- 低曲率方向（不敏感参数）：步长放大（加速收敛）。
+
+这正是 Adam 成功的原因——它通过梯度平方 EMA 近似了对角 Hessian，实现了"廉价的部分二阶信息"。而 K-FAC/Shampoo 则走得更远：利用矩阵级的曲率结构，捕捉了层内参数之间的相关性，比 Adam 的"逐参数独立"更精确。
+
+**实践选择哲学**：
+> 如果 Adam 已经够好（大多数任务），不要过度优化优化器。
+> 当训练步数本身是瓶颈（贵），考虑 K-FAC/Sophia/Shampoo。
+> 当显存是瓶颈，考虑 Lion（省 1/3 显存）或 Adafactor（低秩矩近似二阶矩）。
+> 当任务有强凸结构（线性/逻辑回归），L-BFGS 是理论上的最优选择。
 
 ---
 
@@ -1567,3 +1694,234 @@ $$\boxed{r < \frac{\eta}{100c}}$$
 ---
 
 *本章深入介绍了深度学习二阶方法的理论基础与实用算法。这些方法代表了一阶方法（SGD、Adam）与理想二阶方法（牛顿法）之间的重要折中。下一章将介绍优化理论前沿，包括非凸优化理论进展、隐式正则化、神经切线核等深度学习理论的最新研究方向。*
+
+---
+
+## 几何示意
+
+### 图 23-1：L-BFGS 与精确 Newton
+
+![三种方法收敛速度对比](../figures/svg/opt-p8-23-1.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 方法 | 更新方向 | 存储复杂度 | 典型收敛 |
+|---|---|---|---|
+| **SGD** | $-\eta\nabla f$ | $O(n)$ | $O(1/\sqrt{T})$ |
+| **牛顿法** | $-\mathbf{H}^{-1}\nabla f$ | $O(n^2)$（不可行） | 二次收敛 |
+| **L-BFGS** | $-\mathbf{H}_k^{-1}\nabla f$（$m$ 对向量近似） | $O(mn)$ | 超线性 |
+| **自然梯度** | $-\mathbf{F}^{-1}\nabla f$ | $O(n^2)$（不可行） | 参数化不变 |
+| **K-FAC** | $-(\hat{\mathbf{A}}^{-1} \otimes \hat{\mathbf{G}}^{-1})\nabla f$（逐层） | $O(nd)$ | 接近自然梯度 |
+| **Shampoo** | $-\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$ | $O(n(m+n))$ | 超越 Adam |
+
+### Fisher 信息矩阵关键等式
+
+$$\mathbf{F}(\theta) = \mathbb{E}_{x,y\sim p_\theta}\!\left[\nabla\log p_\theta(y|x)\,\nabla\log p_\theta(y|x)^\top\right] = -\mathbb{E}\!\left[\nabla^2\log p_\theta(y|x)\right]$$
+
+在模型匹配假设下（数据由 $p_\theta$ 生成），$\mathbf{F} = \mathbf{G}$（Gauss-Newton 矩阵）。
+
+### 自然梯度 2 步推导
+
+1. **目标**：在 KL 散度球 $\text{KL}(p_\theta \| p_{\theta+\delta}) \leq \epsilon$ 约束下，最大化损失下降量 $-\nabla\mathcal{L}^\top\delta$。
+2. **KL 约束线性化**：$\text{KL} \approx \frac{1}{2}\delta^\top\mathbf{F}\delta \leq \epsilon$；用 Lagrange 乘子法得 $\delta^* = -\alpha\mathbf{F}^{-1}\nabla\mathcal{L}$。
+
+### K-FAC 实现 4 步
+
+1. **前向传播**：记录每层输入激活 $\mathbf{a}_{l-1}$。
+2. **反向传播**：记录每层输出梯度 $\mathbf{g}_l = \frac{\partial\mathcal{L}}{\partial\mathbf{s}_l}$（预激活）。
+3. **更新统计量**（每隔 $T_{\text{stat}}$ 步）：$\hat{\mathbf{A}} \leftarrow (1-\rho)\hat{\mathbf{A}} + \rho\,\mathbf{a}_{l-1}\mathbf{a}_{l-1}^\top$；$\hat{\mathbf{G}} \leftarrow (1-\rho)\hat{\mathbf{G}} + \rho\,\mathbf{g}_l\mathbf{g}_l^\top$。
+4. **更新逆**（每隔 $T_{\text{inv}}$ 步）：$\hat{\mathbf{A}}^{-1}$、$\hat{\mathbf{G}}^{-1}$（Cholesky 分解）；自然梯度方向 $= (\hat{\mathbf{A}}^{-1}\nabla\mathbf{W}_l\hat{\mathbf{G}}^{-1})^\top$（reshape 后）。
+
+---
+
+## 方法变形
+
+### 变形 1：L-BFGS 用于小批量深度学习
+
+标准 L-BFGS 需要精确线搜索，不适合随机梯度。**随机 L-BFGS**（Pilanci & Wainwright, 2017）每步用足够大的批量（$O(\sqrt{n})$）确保 Hessian 近似质量。适用场景：损失曲面较光滑、批量可以较大（如全批次凸问题）。
+
+### 变形 2：AdaHessian（对角 Hessian 近似）
+
+AdaHessian（Yao et al., 2021）用**随机有限差分**估计 Hessian 对角线（Hutchinson 迹估计器）：
+$$[H]_{ii} \approx z^\top H z, \quad z \sim \{\pm1\}^n \text{（Rademacher）}$$
+每步只需一次额外前向/反向传播，计算量 $O(n)$；比 Adam（只用梯度一阶矩/二阶矩）精度更高，适合中等规模任务。
+
+### 变形 3：Shampoo 与 Adafactor
+
+**Shampoo**（Gupta et al., 2018）：矩阵预条件子 $\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$，Google 在 JAX/XLA 上有高效实现，用于 T5/PaLM 训练。
+**Adafactor**（Shazeer & Stern, 2018）：将 Adam 的二阶矩矩阵分解为秩-1 近似，显存需求从 $O(n)$ 降至 $O(\sqrt{n})$，T5 的默认优化器。
+
+### 变形 4：EK-FAC（Eigenvalue-corrected K-FAC）
+
+标准 K-FAC 的 Kronecker 近似有系统性偏差。EK-FAC 通过特征值修正（对 Kronecker 因子做 EVD）改进近似质量，在凸问题上可与精确自然梯度媲美。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"条件数大（$\kappa \gg 1$）训练慢" → 考虑预条件子（K-FAC/Shampoo）或自适应方法（Adam）
+2. 看到"Fisher 信息矩阵" → 它是梯度外积的期望；在模型匹配下等于 Gauss-Newton 矩阵
+3. 看到"自然梯度参数化不变" → $(\mathbf{J}^\top\mathbf{F}\mathbf{J})^{-1}\mathbf{J}^\top\nabla\mathcal{L}$ 与参数化方式 $\phi(\theta)$ 无关
+4. 看到"Kronecker 积 $\mathbf{A} \otimes \mathbf{B}$" → $(\mathbf{A} \otimes \mathbf{B})^{-1} = \mathbf{A}^{-1} \otimes \mathbf{B}^{-1}$，这正是 K-FAC 逆高效的关键
+5. 看到"Shampoo 更新 $\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$" → 指数 $-1/4$：两侧各分担一半，整体等效 $-1/2$ 次幂
+6. 看到"大批量训练（批量 > 8192）要快速收敛" → L-BFGS 或 K-FAC，比 Adam 步数少得多
+7. 看到"K-FAC 每 20 步才更新统计量" → 这是计算-精度折中；频率太高计算开销大，太低统计量过期
+8. 看到"Gauss-Newton 矩阵 $\mathbf{G} = \mathbf{J}^\top\mathbf{J}$" → 永远正半定（不像 Hessian 可能不定）；训练稳定的关键
+
+---
+
+## 易错点
+
+1. **Fisher 信息矩阵 $\neq$ Hessian**：两者仅在"模型匹配"假设下相等（数据由当前模型生成）；实际训练时数据由真实分布生成，两者存在差异。Fisher 永远正半定，Hessian 可能不定。
+
+2. **K-FAC 的统计量需要 EMA 更新，而非每步重算**：每步重算输入激活协方差计算量太大；EMA 滑动平均（衰减系数 $\rho$）在稳定训练中近似足够好，但对于分布漂移快的早期训练需更频繁更新。
+
+3. **K-FAC 更新频率**：$T_{\text{stat}}$（统计量更新间隔）和 $T_{\text{inv}}$（逆更新间隔）是超参数；实践中 $T_{\text{stat}} = 10$，$T_{\text{inv}} = 100$；设置不当会导致近似失效或计算浪费。
+
+4. **自然梯度步长与 damping**：$\mathbf{F}$ 在边缘接近奇异（某些方向曲率为零），直接求逆数值不稳定；必须加阻尼 $(\mathbf{F} + \lambda\mathbf{I})^{-1}$，$\lambda$ 的选取是实践中的关键超参数（Tikhonov 正则化）。
+
+5. **Shampoo 中 $\mathbf{L}$ 和 $\mathbf{R}$ 的维度**：对于权重矩阵 $\mathbf{W} \in \mathbb{R}^{m \times n}$，$\mathbf{L} \in \mathbb{R}^{m \times m}$，$\mathbf{R} \in \mathbb{R}^{n \times n}$；当 $m$ 或 $n$ 极大（如词表大小 32000）时，矩阵求逆代价很高，需要截断或低秩近似。
+
+---
+
+## 典型应用例题
+
+### 例 1：Fisher 信息矩阵计算（一维 Gaussian）
+
+> **题目**：设 $p_\theta(y) = \mathcal{N}(y; \mu, 1)$（均值参数 $\theta = \mu$，方差固定为 1）。计算 Fisher 信息矩阵。
+
+【思路】$F(\theta) = \mathbb{E}_{y \sim p_\theta}[(\partial_\theta \log p_\theta(y))^2]$。
+
+【解】
+$\log p_\theta(y) = -\frac{1}{2}(y-\mu)^2 - \frac{1}{2}\log(2\pi)$
+
+$\partial_\mu \log p_\mu(y) = y - \mu$
+
+$F(\mu) = \mathbb{E}_{y \sim \mathcal{N}(\mu,1)}[(y-\mu)^2] = \text{Var}[y] = 1$
+
+【答案】$F(\mu) = 1$。自然梯度方向 $= F^{-1}\nabla_\mu\mathcal{L} = \nabla_\mu\mathcal{L}$，退化为普通梯度——这在一维、单参数的 Gaussian 均值中是合理的（参数空间和概率空间的几何在此处恰好一致）。
+
+### 例 2：Kronecker 积逆的计算
+
+> **题目**：设 $\mathbf{A} = \begin{pmatrix}2&0\\0&4\end{pmatrix}$，$\mathbf{B} = \begin{pmatrix}1&0\\0&2\end{pmatrix}$。K-FAC 近似某层 Fisher 矩阵 $\hat{\mathbf{F}} = \mathbf{A} \otimes \mathbf{B}$。
+>
+> (1) 计算 $\hat{\mathbf{F}}^{-1}$。
+> (2) 若该层梯度（向量化）为 $\text{vec}(\mathbf{G}) = (1, 2, 3, 4)^\top$，计算 K-FAC 自然梯度更新方向。
+
+【解】
+(1) $\hat{\mathbf{F}}^{-1} = \mathbf{A}^{-1} \otimes \mathbf{B}^{-1} = \begin{pmatrix}0.5&0\\0&0.25\end{pmatrix} \otimes \begin{pmatrix}1&0\\0&0.5\end{pmatrix} = \text{diag}(0.5, 0.25, 0.25, 0.125)$
+
+（对角矩阵的 Kronecker 积仍是对角矩阵，对角元为各对角元之积。）
+
+(2) 自然梯度 $= \hat{\mathbf{F}}^{-1}\,\text{vec}(\mathbf{G}) = (0.5\times1, 0.25\times2, 0.25\times3, 0.125\times4)^\top = (0.5, 0.5, 0.75, 0.5)^\top$
+
+【说明】K-FAC 自然梯度方向将原梯度 $(1,2,3,4)$ 按各方向的曲率（Fisher 矩阵的特征值）进行了自适应缩放，曲率大的方向（Fisher 大，第 4 分量 $\hat{F}_{44}=8$）步长缩小到 $1/8$，曲率小的方向（第 1 分量 $\hat{F}_{11}=2$）步长缩小到 $1/2$。
+
+### 例 3：条件数与收敛速度的关系
+
+> **题目**：$f(\mathbf{x}) = \frac{1}{2}\mathbf{x}^\top\mathbf{H}\mathbf{x}$，$\mathbf{H} = \text{diag}(1, \kappa)$（条件数 $\kappa$）。梯度下降步长 $\eta = 2/(\lambda_{\min}+\lambda_{\max}) = 2/(1+\kappa)$。
+>
+> 证明：$\|x^{(t)} - x^*\| \leq \left(\frac{\kappa-1}{\kappa+1}\right)^t \|x^{(0)} - x^*\|$（$\kappa \gg 1$ 时收敛极慢），而牛顿法一步收敛。
+
+【证明思路】
+梯度下降更新：$\mathbf{x}^{(t+1)} = (\mathbf{I} - \eta\mathbf{H})\mathbf{x}^{(t)}$。
+
+$\mathbf{I} - \eta\mathbf{H} = \text{diag}(1 - \frac{2}{1+\kappa}, 1 - \frac{2\kappa}{1+\kappa}) = \text{diag}\!\left(\frac{\kappa-1}{\kappa+1}, \frac{1-\kappa}{1+\kappa}\right)$
+
+两个分量的收缩因子绝对值都等于 $(\kappa-1)/(\kappa+1)$（谱范数），故
+
+$$\|x^{(t)}\| \leq \left(\frac{\kappa-1}{\kappa+1}\right)^t\!\|x^{(0)}\|$$
+
+当 $\kappa = 100$ 时收缩因子 $\approx 0.98$，需约 $0.98^t \leq \epsilon$，即 $t \approx -\log\epsilon/0.02$ 步——收敛极慢。牛顿方向 $-\mathbf{H}^{-1}\nabla f = -\mathbf{x}$（对二次函数），步长 1 时一步到达 $\mathbf{0}$。$\square$
+
+---
+
+## 自测题
+
+**自测 1**　设二次函数 $f(x) = 3x_1^2 + 2x_1x_2 + 5x_2^2$。(1) 写出 Hessian 矩阵 $\mathbf{H}$。(2) 写出牛顿方向（不用计算逆，列出方程组）。
+
+> 💡 提示：$\mathbf{H} = \begin{pmatrix}6&2\\2&10\end{pmatrix}$；牛顿方向 $\mathbf{d}$ 满足 $\mathbf{H}\mathbf{d} = -\nabla f$，即解线性方程组。
+
+**自测 2**　K-FAC 中，若某层输入维度 $d_{\text{in}} = 512$，输出维度 $d_{\text{out}} = 1024$。(1) 完整 Fisher 矩阵大小（权重矩阵化为向量后）。(2) K-FAC 近似需要存储哪两个矩阵，各多大？节省多少倍存储？
+
+> 💡 提示：完整 Fisher $(512 \times 1024)^2 \approx 2.75 \times 10^{11}$ 元素；K-FAC 需 $\mathbf{A} \in \mathbb{R}^{512\times512}$ 和 $\mathbf{G} \in \mathbb{R}^{1024\times1024}$，共 $\approx 1.3 \times 10^6$ 元素；节省约 $2\times10^5$ 倍。
+
+**自测 3**　解释为什么自然梯度对参数化方式具有不变性，而普通梯度没有。
+
+> 💡 提示：普通梯度 $\partial\mathcal{L}/\partial\theta$ 依赖坐标系，换参数化 $\phi = g(\theta)$ 后梯度按 Jacobian 变换，方向不同。自然梯度 $\mathbf{F}^{-1}\nabla\mathcal{L}$ 中 $\mathbf{F}$ 也按 $\mathbf{J}^\top\mathbf{F}_\phi\mathbf{J}$ 变换，两者抵消，最终更新等价。
+
+**自测 4**　Shampoo 更新规则 $\Delta\mathbf{W} = -\eta\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$，其中 $\mathbf{L} = \sum_t \mathbf{G}_t\mathbf{G}_t^\top$，$\mathbf{R} = \sum_t \mathbf{G}_t^\top\mathbf{G}_t$。若 $\mathbf{W}$ 是 $2\times2$ 矩阵，$\mathbf{G}_1 = \begin{pmatrix}1&0\\0&2\end{pmatrix}$。写出 $\mathbf{L}$，$\mathbf{R}$，并说明 $\mathbf{L}^{-1/4}$ 的作用。
+
+> 💡 提示：$\mathbf{L} = \mathbf{G}_1\mathbf{G}_1^\top = \begin{pmatrix}1&0\\0&4\end{pmatrix}$；$\mathbf{L}^{-1/4} = \text{diag}(1,\,4^{-1/4}) = \text{diag}(1,\,0.707)$——第 2 行梯度历史较大，步长缩小约 $0.707$ 倍。
+
+**自测 5**　K-FAC 中 damping 参数 $\lambda$ 的作用是什么？$\lambda$ 太小和太大分别会发生什么？
+
+> 💡 提示：$(\hat{\mathbf{F}} + \lambda\mathbf{I})^{-1}$ 中 $\lambda$ 防止奇异；太小 → 近零特征值的方向步长极大 → 不稳定；太大 → 退化为普通梯度下降，失去二阶信息 → 过于保守，收敛慢。实践中常用 Levenberg-Marquardt 自适应调整。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合新增（前置） | 建立直觉 / 病态问题量化感知 |
+| 学习目标 + 23.1–23.5 严格正文 | 原版 | Fisher 矩阵 / K-FAC / Shampoo 完整推导 |
+| 深度学习应用 + PyTorch K-FAC 代码 | 原版 | 工业实战关联 |
+| 练习题 5 道 + 详解 | 原版 | 系统巩固 |
+| 套路总结 + 方法变形 | 融合新增（后置） | 二阶方法全景 + AdaHessian/EK-FAC 变体 |
+| 思考路标 + 易错点 | 融合新增 | 条件反射 + damping/统计量频率等易错细节 |
+| 典型应用例题 3 例 | 融合新增 | Fisher 计算 / Kronecker 逆 / 条件数分析 |
+| 自测题 5 题 | 融合新增 | 额外验收 |
+
+**AI 关联**：K-FAC 用于 Google Brain 的大批量训练加速（批量 $\geq 32768$ 时比 Adam 收敛步数少 5–10 倍）；Shampoo 是 Google 在 PaLM/T5 上的默认优化器之一；AdaHessian 在 BERT 微调上优于 Adam。
+
+---
+
+## 进阶阅读
+
+- **K-FAC 原始论文**：Martens & Grosse, "Optimizing Neural Networks with Kronecker-factored Approximate Curvature", ICML 2015。
+- **Shampoo**：Gupta et al., "Shampoo: Preconditioned Stochastic Tensor Optimization", ICML 2018；Anil et al., "Scalable Second Order Optimization for Deep Learning", arXiv 2020。
+- **AdaHessian**：Yao et al., "ADAHESSIAN: An Adaptive Second Order Optimizer for Machine Learning", AAAI 2021。
+- **自然梯度原始论文**：Amari, "Natural Gradient Works Efficiently in Learning", Neural Computation 1998。
+- **Fisher 信息与信息几何**：Amari & Nagaoka, "Methods of Information Geometry", AMS 2000。
+- **EK-FAC（特征值修正）**：George et al., "Fast Approximate Natural Gradient Descent in a Kronecker Factored Eigenbasis", NeurIPS 2018。
+- **随机 L-BFGS**：Pilanci & Wainwright, "Newton Sketch: A Near Linear-time Optimization Algorithm with Linear-quadratic Convergence", SIAM 2017。
+- **Sophia**：Liu et al., "Sophia: A Scalable Stochastic Second-order Optimizer for Language Model Pre-training", arXiv 2023。
+- **Gauss-Newton 矩阵**：Schraudolph, "Fast Curvature Matrix-Vector Products for Second-Order Gradient Descent", Neural Computation 2002。
+- **L-BFGS 在深度学习中的应用**：Berahas et al., "A Quasi-Newton Method for Nonconvex Stochastic Optimization", SIAM Optimization 2022。
+- **Adafactor（低秩二阶矩）**：Shazeer & Stern, "Adafactor: Adaptive Learning Rates with Sublinear Memory Cost", ICML 2018。
+- **信息几何与深度学习**：Martens, "New Insights and Perspectives on the Natural Gradient Method", JMLR 2020。（K-FAC 作者对自然梯度的综述性长文，强烈推荐。）
+- **Distributed Shampoo（Google 生产）**：Anil et al., "Scalable Second Order Optimization for Deep Learning", arXiv 2020。
+- **AdaHessian 与 Adam 对比**：Yao et al., "ADAHESSIAN: An Adaptive Second Order Optimizer", AAAI 2021；实验代码见 GitHub。
+- **K-FAC 在 ResNet 上的应用**：Grosse & Martens, "A Kronecker-factored Approximate Fisher Matrix for Convolution Layers", ICML 2016。
+- **大批量 BERT 训练（LAMB）**：You et al., "Large Batch Optimization for Deep Learning: Training BERT in 76 minutes", ICLR 2020。
+- **Hutchinson 迹估计**：Hutchinson, "A Stochastic Estimator of the Trace of the Influence Matrix for Laplacian Smoothing Splines", Communications in Statistics 1989。
+
+---
+
+*本章是优化理论与实践的深度融合——从 Fisher 信息矩阵的统计含义，到 K-FAC 的 Kronecker 分解技巧，再到 Shampoo 的矩阵预条件子工程实现。二阶方法正在从"理论上更优"走向"实践上可用"，推动下一代 LLM 预训练进入"二阶优化"时代。*
+
+---
+
+## 本章知识图谱
+
+```
+二阶优化体系
+├── 理论基础
+│   ├── Hessian 矩阵（二阶导数，非正半定，$O(n^2)$ 存储不可行）
+│   ├── Gauss-Newton 矩阵（正半定替代，$\mathbf{G} = \mathbf{J}^\top\mathbf{J}$）
+│   └── Fisher 信息矩阵（统计视角，$\mathbf{F} = \mathbb{E}[\nabla\log p \cdot \nabla\log p^\top]$）
+│       └── 自然梯度（黎曼流形上的最速下降，参数化不变）
+└── 实用算法
+    ├── K-FAC（Kronecker 分解，$O(Ld^3)$ 可行）
+    │   ├── 输入激活协方差 $\hat{\mathbf{A}}_{l-1}$
+    │   └── 输出梯度协方差 $\hat{\mathbf{G}}_l$
+    ├── Shampoo（矩阵预条件子，$\mathbf{L}^{-1/4}\mathbf{G}\mathbf{R}^{-1/4}$）
+    ├── AdaHessian（对角 Hessian + Hutchinson 估计，近 $O(n)$）
+    └── L-BFGS（$m$ 对 s-y 向量近似 Hessian，超线性收敛）
+```
+
+这张图谱展示了本章的逻辑主线：从不可行的精确二阶方法，通过各种近似策略（Kronecker 分解、矩阵外积累积、对角近似），最终得到计算代价与一阶方法相当（$O(n) \sim O(Ld^3)$）但保留关键曲率信息的实用算法。

@@ -1,10 +1,61 @@
-# 第2章：多元微分学
+# 第2章：多元微分学（融合版）
 
 > **前置知识**：单变量微积分、线性代数基础（向量、矩阵运算）
 >
 > **难度等级**：★★★☆☆
 >
 > **预计学习时间**：4–6 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **梯度**：$\nabla f(\mathbf{x}) = (\partial f/\partial x_1, \ldots, \partial f/\partial x_n)^\top \in \mathbb{R}^n$，方向 = 最速上升，垂直等高线。
+> **Hessian**：$H_f = \nabla^2 f \in \mathbb{R}^{n\times n}$，对称矩阵，描述曲率；$H \succ 0 \Rightarrow$ 极小值，$H$ 不定 $\Rightarrow$ 鞍点。
+> **链式法则**：$\nabla_\mathbf{x}(L\circ\mathbf{f}) = J_\mathbf{f}^\top \nabla_\mathbf{z} L$；反向传播 = 逐层乘 Jacobian 转置。
+> **Taylor 展开**：$f(\mathbf{x}_0+\Delta\mathbf{x}) \approx f(\mathbf{x}_0) + \nabla f^\top\Delta\mathbf{x} + \frac{1}{2}\Delta\mathbf{x}^\top H\Delta\mathbf{x}$；一阶 $\Rightarrow$ 梯度下降；二阶 $\Rightarrow$ 牛顿法。
+> **AI 关联**：反向传播 = 多层链式法则；Adam 用梯度一阶矩 + 二阶矩估计自适应步长；条件数 $\kappa(H) \gg 1 \Rightarrow$ 收敛慢。
+
+---
+
+## 引入：一道反向传播计算题
+
+> **题目**：设函数 $f(x_1, x_2) = (x_1 + x_2)^2 + x_2^2$。(1) 在点 $(1, 2)$ 处计算梯度 $\nabla f$；(2) 计算 Hessian 矩阵 $H_f$，并判断该点是极小值、极大值还是鞍点；(3) 写出从 $(1,2)$ 出发的 Taylor 二阶近似。
+
+请先停下来想一想：梯度是偏导数列向量；Hessian 是二阶偏导数对称矩阵；正定 Hessian 意味着局部极小。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目是三小问，依次是梯度 → Hessian → Taylor 展开。
+>
+> **第 (1) 问——梯度**：先求各偏导数。
+>
+> $\partial f/\partial x_1 = 2(x_1+x_2)\cdot 1 = 2(x_1+x_2)$；代入 $(1,2)$：$= 2\cdot 3 = 6$。
+>
+> $\partial f/\partial x_2 = 2(x_1+x_2)\cdot 1 + 2x_2$；代入 $(1,2)$：$= 6 + 4 = 10$。
+>
+> 故 $\nabla f(1,2) = (6, 10)^\top$。**方向**指向函数值增加最快的方向。
+>
+> **第 (2) 问——Hessian**：对各偏导数再求偏导。
+>
+> $\partial^2 f/\partial x_1^2 = 2$；$\partial^2 f/\partial x_1\partial x_2 = 2$；$\partial^2 f/\partial x_2^2 = 4$。
+>
+> $H_f = \begin{pmatrix}2 & 2 \\ 2 & 4\end{pmatrix}$，对称矩阵（验证 Schwarz 定理）。
+>
+> 判断正定：$\det(H) = 8-4 = 4 > 0$，$H_{11} = 2 > 0$ → Sylvester 准则满足 → **正定**。
+>
+> 正定 Hessian 且 $\nabla f \neq 0$ → 这不是极值点（极值点需 $\nabla f = 0$）。如果是驻点（$\nabla f = 0$），则正定 $\Rightarrow$ 严格局部极小。
+>
+> **第 (3) 问——Taylor 展开**：令 $\mathbf{x}_0 = (1,2)^\top$，$\Delta\mathbf{x} = (\delta_1, \delta_2)^\top$。
+>
+> $f(\mathbf{x}_0+\Delta\mathbf{x}) \approx f(1,2) + \nabla f(1,2)^\top\Delta\mathbf{x} + \frac{1}{2}\Delta\mathbf{x}^\top H\Delta\mathbf{x}$
+>
+> $= 9 + 6\delta_1 + 10\delta_2 + \frac{1}{2}(2\delta_1^2 + 4\delta_1\delta_2 + 4\delta_2^2)$
+>
+> $= 9 + 6\delta_1 + 10\delta_2 + \delta_1^2 + 2\delta_1\delta_2 + 2\delta_2^2$。
+>
+> **联系优化**：梯度下降每步沿 $-\nabla f$ 方向移动；Newton 法一步直接跳到二次近似的极小点 $\Delta\mathbf{x}^* = -H^{-1}\nabla f$。对二次函数 Newton 法**精确一步收敛**。"
 
 ---
 
@@ -520,6 +571,197 @@ print(f"数值微分 f'(2) ≈ {numerical.item():.4f}")
 深度学习中损失 $L$ 是标量（$m=1$），参数 $\boldsymbol{\theta}$ 维度极高（$n \gg 1$），因此**反向模式**（即反向传播）是唯一实用的选择。
 
 PyTorch 的 `torch.autograd` 使用**反向模式自动微分**，在前向传播时记录计算图（tape），反向传播时沿计算图逆向应用链式法则。
+
+---
+
+## 几何示意
+
+### 图 2-1：二阶 Taylor 展开几何
+
+![函数曲面 + 切线/切平面 + 二次近似](../figures/svg/opt-p1-02-1.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键性质 |
+|---|---|---|
+| **偏导数** | $\partial f/\partial x_j$：固定其余变量 | 算术上按单变量规则求导 |
+| **梯度** | $\nabla f = (\partial f/\partial x_1,\ldots,\partial f/\partial x_n)^\top$ | 列向量；指向最速上升方向 |
+| **方向导数** | $D_\mathbf{u}f = \nabla f^\top\mathbf{u}$（$\|\mathbf{u}\|=1$）| 最大值 $=\|\nabla f\|$，方向 $=\nabla f/\|\nabla f\|$ |
+| **Hessian** | $H_{ij} = \partial^2 f/\partial x_i\partial x_j$ | 对称矩阵（Schwarz 定理）；描述曲率 |
+| **Jacobian** | $J_{ij} = \partial f_i/\partial x_j$，$J \in \mathbb{R}^{m\times n}$ | 向量函数的最佳线性近似 |
+| **链式法则** | $J_h = J_g \cdot J_f$（$h = g\circ f$）| 矩阵相乘；反向传播的核心 |
+| **Taylor 一阶** | $f(\mathbf{x}_0) + \nabla f^\top\Delta\mathbf{x}$ | 梯度下降的出发点 |
+| **Taylor 二阶** | 一阶 $+ \frac{1}{2}\Delta\mathbf{x}^\top H\Delta\mathbf{x}$ | Newton 法的出发点；二次函数精确 |
+
+### 判断驻点类型的 3 步流程
+
+1. 求驻点：令 $\nabla f(\mathbf{x}^*) = \mathbf{0}$，解方程组
+2. 计算 $H_f(\mathbf{x}^*)$
+3. 判定：全正特征值 $\Rightarrow$ 极小；全负 $\Rightarrow$ 极大；正负混杂 $\Rightarrow$ 鞍点；有零特征值 $\Rightarrow$ 需高阶分析
+
+---
+
+## 方法变形
+
+### 变形 1：常用函数梯度公式（直接记）
+
+$\nabla(\mathbf{a}^\top\mathbf{x}) = \mathbf{a}$；$\nabla(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称）；$\nabla\|\mathbf{x}-\mathbf{a}\|^2 = 2(\mathbf{x}-\mathbf{a})$；$\nabla(\log\mathbf{a}^\top\mathbf{x}) = \mathbf{a}/(\mathbf{a}^\top\mathbf{x})$。
+
+### 变形 2：链式法则的标量形式
+
+对标量损失 $L = g(f(\mathbf{x}))$：$\nabla_\mathbf{x} L = g'(f(\mathbf{x}))\cdot\nabla_\mathbf{x} f(\mathbf{x})$（逐元素乘标量）。多层时依次右乘 Jacobian。
+
+### 变形 3：梯度下降 vs Newton 法
+
+梯度下降：$\mathbf{x} \leftarrow \mathbf{x} - \eta\nabla f$，不用 Hessian，每步 $O(n)$，线性收敛。Newton 法：$\mathbf{x} \leftarrow \mathbf{x} - H^{-1}\nabla f$，用 Hessian，每步 $O(n^3)$（需矩阵求逆），二次收敛。
+
+### 变形 4：条件数与自适应优化
+
+$\kappa(H) = \lambda_{\max}/\lambda_{\min}$ 衡量等值线"扁平度"。$\kappa \gg 1$ 时梯度下降"之"字振荡收敛慢。Adam 等自适应优化器用梯度历史估计每个参数的"局部曲率"，在高条件数问题上远快于纯梯度下降。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"求梯度 $\nabla f$" → 对每个 $x_i$ 分别求偏导，凑成列向量
+2. 看到 $\nabla(\mathbf{x}^\top\mathbf{A}\mathbf{x})$（$\mathbf{A}$ 对称）→ 答案直接是 $2\mathbf{A}\mathbf{x}$
+3. 看到"驻点判断极值还是鞍点" → 计算 Hessian，看特征值符号
+4. 看到"方向导数最大方向" → 梯度方向 $\nabla f/\|\nabla f\|$，最大值 $= \|\nabla f\|$
+5. 看到"反向传播" → 链式法则逐层乘 Jacobian 转置；损失是标量，反向模式最高效
+6. 看到"条件数 $\kappa \gg 1$" → 梯度下降慢；改用 Adam 或预条件共轭梯度
+7. 看到"二次函数 + Newton 法" → 一步精确收敛，因为 Taylor 展开精确
+8. 看到"混合偏导数" → 连续时可交换求导顺序（Schwarz 定理）
+9. 看到"Hessian 半正定" → 函数在该点是（局部）凸的；正定 → 严格凸
+10. 看到"Jacobian 行列式" → $\vert\det J\vert$ = 局部体积缩放比（变量替换公式）
+11. 看到 Adam / RMSprop 更新公式 → 本质是自适应估计每个参数的 Hessian 对角
+
+---
+
+## 易错点
+
+1. **$\nabla f$ 是列向量，不是行向量**：梯度 $\nabla f \in \mathbb{R}^n$ 是列向量；Jacobian $J \in \mathbb{R}^{m\times n}$ 的每**行**是输出分量的梯度（行向量形式）。写成行向量会导致链式法则维度错误。
+
+2. **二次型梯度系数 2**：$\nabla_\mathbf{x}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称）。类比 $(x^2)' = 2x$，但高维时不要忘记系数 2。若 $\mathbf{A}$ 不对称，结果是 $(\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。
+
+3. **Hessian 正定 $\neq$ 全局最小**：正定 Hessian 在驻点处 $\Rightarrow$ **局部极小**；全局最小还需要函数是凸的（全局 Hessian 半正定）。非凸函数有多个局部极小。
+
+4. **链式法则矩阵乘法顺序**：$J_h = J_g \cdot J_f$（从外到内）；维度必须相容。若 $\mathbf{f}: \mathbb{R}^n\to\mathbb{R}^k$，$\mathbf{g}: \mathbb{R}^k\to\mathbb{R}^m$，则 $J_f\in\mathbb{R}^{k\times n}$，$J_g\in\mathbb{R}^{m\times k}$，$J_h\in\mathbb{R}^{m\times n}$。
+
+5. **可微 $\neq$ 偏导数存在**：偏导数存在仅在各坐标方向上有导数；可微要求在所有方向上都有一致的线性近似。$f$ 在某点偏导数均存在但不可微的例子是存在的（如 $f(x,y)=xy/(x^2+y^2)$ 在原点）。
+
+---
+
+## 典型应用例题
+
+### 例 1：梯度 + 驻点分类
+
+> **题目**：$f(x_1, x_2) = x_1^4 + x_2^4 - 4x_1 x_2$。求所有驻点并判断类型。
+
+【思路】令 $\nabla f = \mathbf{0}$，求解方程组；计算 Hessian，判断正定性。
+
+【解】
+$\partial f/\partial x_1 = 4x_1^3 - 4x_2 = 0 \Rightarrow x_2 = x_1^3$
+
+$\partial f/\partial x_2 = 4x_2^3 - 4x_1 = 0 \Rightarrow x_1 = x_2^3$
+
+代入：$x_1 = x_1^9 \Rightarrow x_1 \in \{0, 1, -1\}$，驻点 $(0,0), (1,1), (-1,-1)$。
+
+$H_f = \begin{pmatrix}12x_1^2 & -4 \\ -4 & 12x_2^2\end{pmatrix}$
+
+在 $(0,0)$：$H = \begin{pmatrix}0&-4\\-4&0\end{pmatrix}$，特征值 $\pm 4$，**不定 $\Rightarrow$ 鞍点**。
+
+在 $(1,1)$ 和 $(-1,-1)$：$H = \begin{pmatrix}12&-4\\-4&12\end{pmatrix}$，$\det = 128 > 0$，迹 $= 24 > 0$，**正定 $\Rightarrow$ 极小值**。
+
+【答案】$\boxed{(0,0) \text{ 鞍点};\ (1,1),(-1,-1) \text{ 极小值},\ f = -2}$。
+
+### 例 2：链式法则 + 反向传播
+
+> **题目**：设 $L = \|\mathbf{y} - W\mathbf{x}\|^2$（$W \in \mathbb{R}^{m\times n}$，$\mathbf{x}\in\mathbb{R}^n$，$\mathbf{y}\in\mathbb{R}^m$）。用链式法则求 $\partial L/\partial\mathbf{x}$ 和 $\partial L/\partial W$。
+
+【思路】令 $\mathbf{r} = \mathbf{y} - W\mathbf{x}$，$L = \mathbf{r}^\top\mathbf{r}$，链式法则：$\partial L/\partial\mathbf{x} = J_\mathbf{r}^\top \cdot (\partial L/\partial\mathbf{r})$。
+
+【解】
+$\partial L/\partial\mathbf{r} = 2\mathbf{r} = 2(\mathbf{y}-W\mathbf{x})$；$J_\mathbf{r}^{\mathbf{x}} = -W$（$\mathbf{r}$ 对 $\mathbf{x}$ 的 Jacobian）。
+
+$\partial L/\partial\mathbf{x} = (-W)^\top \cdot 2(\mathbf{y}-W\mathbf{x}) = -2W^\top(\mathbf{y}-W\mathbf{x})$。
+
+$\partial L/\partial W = 2(\mathbf{y}-W\mathbf{x})\cdot(-\mathbf{x}^\top) = -2\boldsymbol{\delta}\mathbf{x}^\top$（其中 $\boldsymbol{\delta} = \mathbf{y}-W\mathbf{x}$）。
+
+【答案】$\boxed{\partial L/\partial\mathbf{x} = -2W^\top(\mathbf{y}-W\mathbf{x});\ \partial L/\partial W = -2(\mathbf{y}-W\mathbf{x})\mathbf{x}^\top}$。
+
+### 例 3：Taylor 展开 + Newton 步
+
+> **题目**：$f(\mathbf{x}) = x_1^2 + 4x_1 x_2 + 5x_2^2$，当前点 $\mathbf{x}_0 = (2, 1)^\top$。(1) 计算 $\nabla f(\mathbf{x}_0)$；(2) 计算 $H_f$；(3) 写出 Newton 更新步，并指出更新后的新点。
+
+【解】
+(1) $\nabla f = (2x_1+4x_2, 4x_1+10x_2)^\top$；代入 $(2,1)$：$\nabla f = (8, 18)^\top$。
+
+(2) $H_f = \begin{pmatrix}2 & 4 \\ 4 & 10\end{pmatrix}$（常数，与 $\mathbf{x}$ 无关，因为 $f$ 是二次函数）。
+
+(3) $H^{-1} = \frac{1}{20-16}\begin{pmatrix}10&-4\\-4&2\end{pmatrix} = \frac{1}{4}\begin{pmatrix}10&-4\\-4&2\end{pmatrix}$。
+
+$\Delta\mathbf{x} = -H^{-1}\nabla f = -\frac{1}{4}\begin{pmatrix}10&-4\\-4&2\end{pmatrix}\begin{pmatrix}8\\18\end{pmatrix} = -\frac{1}{4}\begin{pmatrix}8\\4\end{pmatrix} = (-2,-1)^\top$。
+
+新点：$(2,-1)^\top + (-2,-1)^\top = \mathbf{0}$。由于 $f$ 是二次函数，Newton 法**一步到达全局最小值 $\mathbf{0}$**。
+
+【答案】$\boxed{\Delta\mathbf{x} = (-2,-1)^\top,\ \mathbf{x}_{\text{new}} = (0,0)^\top}$。
+
+---
+
+## 自测题
+
+**自测 1**　$f(x_1,x_2) = x_1^2 x_2 + e^{x_1 x_2}$。求 $\partial f/\partial x_1$ 和 $\partial f/\partial x_2$，并在 $(1,0)$ 处计算梯度。
+
+> 💡 提示：$\partial f/\partial x_1 = 2x_1 x_2 + x_2 e^{x_1 x_2}$；$\partial f/\partial x_2 = x_1^2 + x_1 e^{x_1 x_2}$；代入 $(1,0)$：梯度 $= (0, 1+1)^\top = (0,2)^\top$（$e^0=1$）。
+
+**自测 2**　$f(\mathbf{x}) = \frac{1}{2}\mathbf{x}^\top A\mathbf{x} - \mathbf{b}^\top\mathbf{x}$（$A$ 正定对称）。求梯度 $\nabla f$，令其为零解出极小值点 $\mathbf{x}^*$。
+
+> 💡 提示：$\nabla f = A\mathbf{x} - \mathbf{b}$；令 $=\mathbf{0}$ 得 $\mathbf{x}^* = A^{-1}\mathbf{b}$（正规方程）。这是最小二乘的解析解，Newton 法对此问题一步收敛。
+
+**自测 3**　解释：为什么深度神经网络不用 Newton 法，而用梯度下降（SGD/Adam）？
+
+> 💡 提示：(1) 参数 $\theta$ 维数可达数十亿，存储和求逆 $n\times n$ Hessian 计算复杂度 $O(n^2)$ 存储 + $O(n^3)$ 求逆完全不可行；(2) 梯度下降每步 $O(n)$；(3) Adam 等方法用对角化 Hessian 近似（二阶矩），在实践中已经足够快。
+
+**自测 4**　$f(x,y) = x^2 - 4xy + 5y^2$。(1) 求所有驻点；(2) 计算 Hessian，判断驻点类型；(3) 这是强凸函数吗？
+
+> 💡 提示：$\nabla f = (2x-4y, -4x+10y)^\top = \mathbf{0} \Rightarrow$ 唯一驻点 $(0,0)$。$H = \begin{pmatrix}2&-4\\-4&10\end{pmatrix}$，$\det = 4 > 0$，迹 $> 0$，**正定**，驻点为极小值。最小特征值 $> 0$，故为强凸。
+
+**自测 5**　设 Rosenbrock 函数 $f(x_1,x_2) = (1-x_1)^2 + 100(x_2-x_1^2)^2$。(1) 直觉上全局最小在哪里？(2) 在起点 $(-1,1)$ 计算梯度（无需精确，估算量级）；(3) 为什么梯度下降在该函数上收敛极慢？
+
+> 💡 提示：(1) 令各项为 0：$x_1=1, x_2=1$，全局最小 $f(1,1)=0$。(2) 梯度第一分量 $\approx -4$，第二分量 $= 0$（因 $x_2-x_1^2 = 0$）。(3) Hessian 条件数约 2500（极扁等值线），梯度方向偏离最优路径，之字形振荡。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 梯度 = 列向量，偏导数构成；方向 = 最速上升，垂直等高线。
+> Hessian = 二阶偏导方阵；正定 $\Rightarrow$ 极小，不定 $\Rightarrow$ 鞍点，条件数大 $\Rightarrow$ 收敛慢。
+> 链式法则 = 矩阵乘法从外到内；反向传播 = 逐层乘 Jacobian 转置。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 2——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉 / 条件反射 |
+| 学习目标 + 2.1–2.5 严格正文 | 原版 | 完整推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置）| 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题，自测验收。
 
 ---
 

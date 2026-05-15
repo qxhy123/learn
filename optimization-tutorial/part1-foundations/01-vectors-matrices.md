@@ -1,4 +1,51 @@
-# 第一章：向量与矩阵
+# 第一章：向量与矩阵（融合版）
+
+> **难度**：★★☆☆☆
+> **前置知识**：高中数学、基本代数运算
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **梯度是列向量**：$\nabla f(\mathbf{x}) \in \mathbb{R}^n$，第 $i$ 分量为 $\partial f/\partial x_i$；梯度方向 = 函数增长最快方向，**垂直**等高线。
+> **矩阵是线性映射**：$\mathbf{A}\mathbf{x}$ 将 $\mathbf{x}$ 变换到新向量；特征向量方向不变，特征值是伸缩比。
+> **范数度量大小**：$\ell_2$（Euclidean）/ $\ell_1$（稀疏）/ $\ell_\infty$（最大值）；$\|\mathbf{A}\|_F = \sqrt{\sum a_{ij}^2}$（Frobenius）/ $\|\mathbf{A}\|_2 = \sigma_{\max}$（谱范数）。
+> **正定矩阵**：$\mathbf{A} \succ 0 \Leftrightarrow$ 所有特征值 $> 0 \Leftrightarrow$ Cholesky 分解存在；Hessian 正定 $\Rightarrow$ 强凸 $\Rightarrow$ 唯一全局极小。
+> **AI 关联**：神经网络权重 $\mathbf{W} \in \mathbb{R}^{m \times n}$；嵌入向量维度 768；谱范数 $= 1$ 保 Lipschitz；Xavier 初始化控制 Frobenius 范数。
+
+---
+
+## 引入：梯度向量与嵌入向量的运算
+
+> **题目**：设神经网络某层的嵌入向量 $\mathbf{e}_1 = (1, 2, 0)^\top$，$\mathbf{e}_2 = (0, 2, 1)^\top$（3维简化示意）。(1) 计算两向量的余弦相似度；(2) 设损失 $L = \|\mathbf{e}_1 - \mathbf{e}_2\|_2^2$，求 $\partial L / \partial \mathbf{e}_1$（即梯度列向量）。
+
+请先停下来想一想：余弦相似度衡量方向相似性而非绝对距离；梯度是列向量，对差范数求梯度会得到线性结果。下面还原完整内心独白。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目有两个小问，先处理余弦相似度，再处理梯度。
+>
+> **第 (1) 问——余弦相似度**：公式是 $\cos\theta = \mathbf{e}_1^\top \mathbf{e}_2 / (\|\mathbf{e}_1\|_2 \|\mathbf{e}_2\|_2)$，三步走。
+>
+> 内积：$\mathbf{e}_1^\top \mathbf{e}_2 = 1\times 0 + 2\times 2 + 0\times 1 = 4$。
+>
+> 两范数：$\|\mathbf{e}_1\|_2 = \sqrt{1+4+0} = \sqrt{5}$，$\|\mathbf{e}_2\|_2 = \sqrt{0+4+1} = \sqrt{5}$。
+>
+> 相除：$\cos\theta = 4/({\sqrt{5}\cdot\sqrt{5}}) = 4/5 = 0.8$，夹角约 $37°$，**方向高度相似**。
+>
+> **第 (2) 问——梯度列向量**：$L = \|\mathbf{e}_1 - \mathbf{e}_2\|_2^2 = (\mathbf{e}_1 - \mathbf{e}_2)^\top(\mathbf{e}_1 - \mathbf{e}_2)$，对 $\mathbf{e}_1$ 求导。
+>
+> 把 $\mathbf{e}_2$ 视为常数，展开 $L = \mathbf{e}_1^\top\mathbf{e}_1 - 2\mathbf{e}_2^\top\mathbf{e}_1 + \mathbf{e}_2^\top\mathbf{e}_2$。
+>
+> 逐项对 $\mathbf{e}_1$ 求梯度：$\nabla_{\mathbf{e}_1}(\mathbf{e}_1^\top\mathbf{e}_1) = 2\mathbf{e}_1$，$\nabla_{\mathbf{e}_1}(-2\mathbf{e}_2^\top\mathbf{e}_1) = -2\mathbf{e}_2$，常数项为 $\mathbf{0}$。
+>
+> 结果：$\nabla_{\mathbf{e}_1} L = 2(\mathbf{e}_1 - \mathbf{e}_2) = 2(1-0, 2-2, 0-1)^\top = (2, 0, -2)^\top$。
+>
+> **验证维度**：$\mathbf{e}_1 \in \mathbb{R}^3$，梯度也在 $\mathbb{R}^3$，维度匹配。梯度是**列向量**，优化器用它更新 $\mathbf{e}_1 \leftarrow \mathbf{e}_1 - \eta \cdot \nabla L$。
+>
+> **延伸**：余弦相似度 $0.8$ 说明两向量语义相近；而 MSE 损失 $L = \|(2,0,-2)\| = 2\sqrt{2}$ 的梯度方向是 $(1,0,-1)^\top$（归一化后），意味着梯度下降会把 $e_{1,1}$ 减小、把 $e_{1,3}$ 增大——恰好在拉近两向量距离。"
+
+---
 
 ## 学习目标
 
@@ -654,6 +701,183 @@ x = [3.0, -4.0, 0.0]
 ```
 
 > **线性代数视角**：深度网络的前向传播是一系列线性变换与非线性激活的复合。权重矩阵的谱（特征值集合）决定了信号在网络中的放大或衰减模式。参数初始化策略本质上是在控制权重矩阵的 Frobenius 范数，进而约束谱范数，使得梯度信号既不爆炸也不消失——这是线性代数与深度学习训练稳定性之间最直接的联系。
+
+---
+
+## 几何示意
+
+### 图 1-1：梯度作为列向量
+
+![等高线与梯度箭头垂直关系（梯度指向最速上升方向）](../figures/svg/opt-p1-01-1.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键性质 |
+|---|---|---|
+| **$\ell_2$ 范数** | $\|\mathbf{x}\|_2 = \sqrt{\sum x_i^2}$ | 非负、齐次、三角不等式 |
+| **$\ell_1$ 范数** | $\|\mathbf{x}\|_1 = \sum \vert x_i\vert$ | 稀疏正则化（Lasso） |
+| **$\ell_\infty$ 范数** | $\|\mathbf{x}\|_\infty = \max_i\vert x_i\vert$ | 最大分量绝对值 |
+| **Frobenius 范数** | $\|\mathbf{A}\|_F = \sqrt{\mathrm{tr}(\mathbf{A}^\top\mathbf{A})}$ | 矩阵 $\ell_2$，权重正则常用 |
+| **谱范数** | $\|\mathbf{A}\|_2 = \sigma_{\max}(\mathbf{A})$ | 最大奇异值；$\leq \|\mathbf{A}\|_F$ |
+| **内积（梯度视角）** | $\langle\mathbf{x},\mathbf{y}\rangle = \mathbf{x}^\top\mathbf{y}$ | 结果为标量；正交时为 0 |
+| **谱分解** | $\mathbf{A} = \mathbf{Q}\Lambda\mathbf{Q}^\top$（对称矩阵）| 特征值为实数，特征向量正交 |
+| **正定判定** | $\mathbf{A}\succ 0 \Leftrightarrow$ 所有特征值 $> 0$ | 也 $\Leftrightarrow$ Sylvester 准则 |
+
+### 判断矩阵正定的 3 步流程
+
+1. **计算特征多项式** $\det(\mathbf{A}-\lambda\mathbf{I})=0$，得到特征值 $\lambda_i$
+2. **检查符号**：全正 $\Rightarrow$ 正定；全非负 $\Rightarrow$ 半正定；有负 $\Rightarrow$ 不定
+3. **结论与应用**：正定 $\Rightarrow$ Hessian 正定 $\Rightarrow$ 函数严格凸 $\Rightarrow$ 唯一极小值
+
+---
+
+## 方法变形
+
+### 变形 1：高维向量运算
+
+$n$ 维情形与 2 维 / 3 维公式完全相同，只是求和项更多。BERT 词向量 $\in \mathbb{R}^{768}$，余弦相似度公式不变。
+
+### 变形 2：梯度公式的矩阵形式
+
+$f(\mathbf{x}) = \mathbf{x}^\top\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称）时 $\nabla f = 2\mathbf{A}\mathbf{x}$；$f(\mathbf{x}) = \mathbf{b}^\top\mathbf{x}$ 时 $\nabla f = \mathbf{b}$。线性组合：$\nabla(\alpha f + \beta g) = \alpha\nabla f + \beta\nabla g$。
+
+### 变形 3：不同范数的等价关系
+
+$\|\mathbf{x}\|_\infty \leq \|\mathbf{x}\|_2 \leq \|\mathbf{x}\|_1 \leq \sqrt{n}\|\mathbf{x}\|_2$。在有限维空间中所有范数等价，影响常数不影响收敛阶。
+
+### 变形 4：$\mathbf{B}^\top\mathbf{B}$ 的半正定性
+
+对任意 $\mathbf{B}$，$\mathbf{G} = \mathbf{B}^\top\mathbf{B} \succeq 0$（证明：$\mathbf{x}^\top\mathbf{G}\mathbf{x} = \|\mathbf{B}\mathbf{x}\|_2^2 \geq 0$）。神经网络的 Gram 矩阵、协方差矩阵均是此结构。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"梯度" → 立刻写列向量 $\nabla f \in \mathbb{R}^n$，第 $i$ 分量 $= \partial f/\partial x_i$
+2. 看到 $\nabla(\mathbf{x}^\top\mathbf{A}\mathbf{x})$（$\mathbf{A}$ 对称）→ 答案是 $2\mathbf{A}\mathbf{x}$，不是 $\mathbf{A}\mathbf{x}$
+3. 看到"范数" → 问清楚是 $\ell_1/\ell_2/\ell_\infty/F$/谱，默认是 $\ell_2$
+4. 看到"Hessian 正定" → $\Leftrightarrow$ 局部严格极小 $\Leftrightarrow$ 凸函数（强凸）
+5. 看到"对称矩阵" → 特征值实数 + 特征向量可正交化 → 谱分解 $\mathbf{Q}\Lambda\mathbf{Q}^\top$
+6. 看到"内积为 0" → 正交（垂直）；$\mathbf{x}^\top\mathbf{A}\mathbf{x} > 0$ 对所有非零 $\mathbf{x}$ → 正定
+7. 看到"谱范数" → 最大奇异值 $\sigma_{\max}$；梯度爆炸 / 消失与其直接相关
+8. 看到"权重矩阵 $\mathbf{W}$" → Frobenius 范数控制参数量级；谱范数控制 Lipschitz 常数
+9. 看到"$\mathbf{B}^\top\mathbf{B}$" → 必然半正定；$\mathbf{B}$ 列满秩时正定
+10. 看到"特征值全正" → 正定；"全非负" → 半正定；"有正有负" → 不定（鞍点相关）
+
+---
+
+## 易错点
+
+1. **梯度是列向量而非行向量**：$\nabla f(\mathbf{x}) \in \mathbb{R}^n$ 是列向量；Jacobian $J \in \mathbb{R}^{m\times n}$ 行是输出维，列是输入维。混淆导致反向传播维度错误。
+
+2. **$\|\mathbf{x}+\mathbf{y}\| \neq \|\mathbf{x}\| + \|\mathbf{y}\|$**：范数满足三角不等式（$\leq$），等号仅当 $\mathbf{x}, \mathbf{y}$ 同向时成立。不能直接"分配"范数到加法。
+
+3. **对称矩阵 $\mathbf{A}$ 的梯度：系数 2**：$\nabla_\mathbf{x}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称时）；若 $\mathbf{A}$ 不对称则 $= (\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。漏掉系数 2 是高频失误。
+
+4. **Frobenius 范数 $\neq$ 谱范数**：$\|\mathbf{A}\|_F$ 是所有元素平方和开根号；$\|\mathbf{A}\|_2 = \sigma_{\max}$。有 $\|\mathbf{A}\|_2 \leq \|\mathbf{A}\|_F$，但二者不等价，优化中不可互换。
+
+5. **半正定 $\neq$ 可逆**：$\mathbf{A}\succeq 0$ 允许有零特征值，此时 $\mathbf{A}$ 奇异不可逆。正定 $\mathbf{A}\succ 0$ 才保证可逆；牛顿法需要 Hessian 正定才能求逆。
+
+---
+
+## 典型应用例题
+
+### 例 1：梯度计算 + 正定判断
+
+> **题目**：设 $f(\mathbf{x}) = 3x_1^2 + 2x_1 x_2 + 5x_2^2$（$\mathbf{x} \in \mathbb{R}^2$）。(1) 将 $f$ 写成 $\mathbf{x}^\top\mathbf{A}\mathbf{x}$ 的形式，求矩阵 $\mathbf{A}$；(2) 求梯度 $\nabla f(\mathbf{x})$；(3) 判断 $\mathbf{A}$ 是否正定。
+
+【思路】先凑二次型，再用 $\nabla(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$，最后验证特征值。
+
+【解】
+(1) $f = 3x_1^2 + 2x_1 x_2 + 5x_2^2$，配成对称二次型：$\mathbf{A} = \begin{pmatrix}3 & 1 \\ 1 & 5\end{pmatrix}$（交叉项系数 2 对半拆）。
+
+(2) $\nabla f(\mathbf{x}) = 2\mathbf{A}\mathbf{x} = 2\begin{pmatrix}3 & 1 \\ 1 & 5\end{pmatrix}\begin{pmatrix}x_1 \\ x_2\end{pmatrix} = \begin{pmatrix}6x_1+2x_2 \\ 2x_1+10x_2\end{pmatrix}$。
+
+(3) 特征多项式：$(3-\lambda)(5-\lambda)-1=0 \Rightarrow \lambda^2-8\lambda+14=0$，$\lambda = 4 \pm \sqrt{2}$。两特征值均 $> 0$，故 $\mathbf{A} \succ 0$（**正定**）。
+
+【答案】$\boxed{\mathbf{A}=\begin{pmatrix}3&1\\1&5\end{pmatrix},\ \nabla f = (6x_1+2x_2,\ 2x_1+10x_2)^\top,\ \mathbf{A} \succ 0}$。
+
+### 例 2：谱分解 + 二次型最大值
+
+> **题目**：$\mathbf{A} = \begin{pmatrix}5 & 3 \\ 3 & 5\end{pmatrix}$。求在 $\|\mathbf{x}\|_2 = 1$ 约束下 $\mathbf{x}^\top\mathbf{A}\mathbf{x}$ 的最大值和最小值。
+
+【思路】用瑞利商定理：最大 = 最大特征值，最小 = 最小特征值。
+
+【解】特征多项式：$(5-\lambda)^2 - 9 = 0 \Rightarrow \lambda_{1} = 8,\ \lambda_2 = 2$。
+
+瑞利商定理：$\lambda_{\min} \leq \mathbf{x}^\top\mathbf{A}\mathbf{x} \leq \lambda_{\max}$，等号在对应特征向量处取到。
+
+最大特征向量：$\lambda=8$，解得 $\mathbf{v}_1 = (1,1)^\top/\sqrt{2}$；最小特征向量：$\lambda=2$，$\mathbf{v}_2 = (1,-1)^\top/\sqrt{2}$。
+
+【答案】$\boxed{\max = 8,\ \min = 2}$，分别在 $(1,1)^\top/\sqrt{2}$ 和 $(1,-1)^\top/\sqrt{2}$ 处取到。
+
+### 例 3：范数不等式 + 嵌入向量
+
+> **题目**：设词向量 $\mathbf{w} \in \mathbb{R}^4$，$\mathbf{w} = (3, -4, 0, 0)^\top$。(1) 计算 $\|\mathbf{w}\|_1,\|\mathbf{w}\|_2,\|\mathbf{w}\|_\infty$；(2) 验证 $\|\mathbf{w}\|_\infty \leq \|\mathbf{w}\|_2 \leq \|\mathbf{w}\|_1$；(3) 归一化 $\mathbf{w}$ 并解释语义含义。
+
+【解】
+(1) $\|\mathbf{w}\|_1 = 3+4+0+0 = 7$；$\|\mathbf{w}\|_2 = \sqrt{9+16} = 5$；$\|\mathbf{w}\|_\infty = 4$。
+(2) 验证：$4 \leq 5 \leq 7$，成立。
+(3) $\hat{\mathbf{w}} = \mathbf{w}/5 = (0.6, -0.8, 0, 0)^\top$，长度为 1，只保留方向。余弦相似度衡量方向，不受词向量长度（频率等）影响。
+
+【答案】$\boxed{\|\mathbf{w}\|_1=7,\ \|\mathbf{w}\|_2=5,\ \|\mathbf{w}\|_\infty=4;\ \hat{\mathbf{w}}=(0.6,-0.8,0,0)^\top}$。
+
+---
+
+## 自测题
+
+**自测 1**　设 $\mathbf{x} = (1,2,2)^\top$。求 $\|\mathbf{x}\|_2$，归一化向量 $\hat{\mathbf{x}}$，并验证 $\hat{\mathbf{x}}^\top\hat{\mathbf{x}}=1$。
+
+> 💡 提示：$\|\mathbf{x}\|_2 = 3$；$\hat{\mathbf{x}} = (1/3, 2/3, 2/3)^\top$；$1/9+4/9+4/9=1$。
+
+**自测 2**　设 $f(\mathbf{x}) = \|\mathbf{x}-\mathbf{a}\|_2^2$（$\mathbf{a}$ 为常数向量）。求梯度 $\nabla f(\mathbf{x})$，并说明梯度下降一步在几何上做了什么。
+
+> 💡 提示：展开后求导，$\nabla f = 2(\mathbf{x}-\mathbf{a})$；梯度下降 $\mathbf{x} \leftarrow \mathbf{x} - \eta\cdot 2(\mathbf{x}-\mathbf{a})$ 是将 $\mathbf{x}$ 向 $\mathbf{a}$ 靠近 $2\eta$ 倍的距离。
+
+**自测 3**　矩阵 $\mathbf{B} = \begin{pmatrix}2&1\\1&2\end{pmatrix}$。求特征值，判断正定性，并写出谱分解。
+
+> 💡 提示：$\lambda = 1, 3$（均正，正定）；特征向量 $(1,-1)^\top/\sqrt{2}$，$(1,1)^\top/\sqrt{2}$；谱分解 $\mathbf{B} = 1\cdot\mathbf{v}_1\mathbf{v}_1^\top + 3\cdot\mathbf{v}_2\mathbf{v}_2^\top$。
+
+**自测 4**　证明：对任意 $\mathbf{B}\in\mathbb{R}^{m\times n}$，$\mathbf{G}=\mathbf{B}^\top\mathbf{B}$ 半正定。
+
+> 💡 提示：对任意 $\mathbf{x}$，$\mathbf{x}^\top\mathbf{G}\mathbf{x} = \mathbf{x}^\top\mathbf{B}^\top\mathbf{B}\mathbf{x} = \|\mathbf{B}\mathbf{x}\|_2^2 \geq 0$。Gram 矩阵 / 协方差矩阵 / 神经网络 $\mathbf{W}^\top\mathbf{W}$ 均满足此性质。
+
+**自测 5**　设神经网络权重矩阵 $\mathbf{W} = \begin{pmatrix}3&0\\0&4\end{pmatrix}$（对角阵）。计算 $\|\mathbf{W}\|_F$，$\|\mathbf{W}\|_2$（谱范数），并判断是否需要做谱归一化（目标：谱范数 $\leq 1$）。
+
+> 💡 提示：$\|\mathbf{W}\|_F = \sqrt{9+16} = 5$；$\|\mathbf{W}\|_2 = 4$（最大奇异值 = 最大对角元素）；$4 > 1$，需要将 $\mathbf{W}$ 除以 4 做谱归一化。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 梯度 = 列向量，第 $i$ 分量 = $\partial f / \partial x_i$，方向指向最速上升，垂直等高线。
+> 矩阵 = 线性映射；特征向量方向不变，特征值是伸缩比。
+> 范数度量大小：$\ell_2$ 默认，$\ell_1$ 稀疏，$F$ 矩阵，谱范数控制 Lipschitz。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉 / 条件反射 |
+| 学习目标 + 1.1–1.5 严格正文 | 原版 | 完整推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置）| 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题，自测验收。
 
 ---
 

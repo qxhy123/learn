@@ -1,8 +1,41 @@
-# 第6章：牛顿法与拟牛顿法
+# 第6章：牛顿法与拟牛顿法（融合版）
 
 > **前置章节**：第2章（多元微分学）、第4章（最优性条件）、第5章（梯度下降法）
 >
 > **难度**：★★★★☆
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 前置一例速记 / 思维路径 + 后置方法总结与自测。
+
+> **一例速记**：
+> **牛顿方向**：$\mathbf{d}_k = -\mathbf{H}_k^{-1}\nabla f(\mathbf{x}_k)$；用二阶展开构建局部二次模型，跳到模型极小。
+> **收敛率**：局部二次收敛 $\|\mathbf{e}_{k+1}\| \leq C\|\mathbf{e}_k\|^2$——误差 $10^{-3}$ 经两步可达机器精度 $10^{-12}$。
+> **代价**：每步 $O(n^3)$（Hessian 求逆），大规模不可行 $\Rightarrow$ 拟牛顿 BFGS 每步 $O(n^2)$，L-BFGS 每步 $O(mn)$。
+> **割线方程**：$\mathbf{B}_{k+1}\mathbf{s}_k = \mathbf{y}_k$（Hessian 近似），$\mathbf{s}_k = \mathbf{x}_{k+1}-\mathbf{x}_k$，$\mathbf{y}_k = \nabla f_{k+1} - \nabla f_k$。
+> **AI 联系**：L-BFGS 用于小模型精细调优；大模型用 K-FAC（Kronecker 因式分解的 Fisher 近似）代替真实 Hessian。
+
+---
+
+## 引入：一道"牛顿法为何一步到位"的题
+
+> **题目**：对 $f(x_1, x_2) = x_1^2 + 100x_2^2$，从 $\mathbf{x}_0 = (1, 1)^\top$ 出发，梯度下降步长取 $\alpha = 1/L = 1/200$。问：(1) 梯度下降一步后到哪里？(2) 牛顿法一步后到哪里？为什么牛顿法更快？
+
+请先停下来想一想：$L = 200$（最大 Hessian 特征值），梯度下降步长极小，$x_2$ 方向曲率是 $x_1$ 方向的 100 倍，会产生严重震荡；而牛顿法用 Hessian 逆"拉伸"梯度，对两个方向分别做了尺度补偿——一步直达极小。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "先算梯度和 Hessian。$\nabla f(\mathbf{x}_0) = (2, 200)^\top$，$\mathbf{H} = \text{diag}(2, 200)$，$\mathbf{H}^{-1} = \text{diag}(1/2, 1/200)$。
+>
+> **梯度下降**（$\alpha = 1/200$）：$\mathbf{x}_1 = (1, 1) - \frac{1}{200}(2, 200) = (1 - 0.01, 1 - 1) = (0.99, 0)^\top$。
+>
+> $x_2$ 分量从 1 直接降到 0——运气不错，但 $x_1$ 从 1 降到 0.99，几乎没动！还需要很多步。
+>
+> **牛顿法**：$\mathbf{d}_0 = -\mathbf{H}^{-1}\nabla f = -\text{diag}(1/2, 1/200)(2, 200)^\top = -(1, 1)^\top$。
+>
+> $\mathbf{x}_1 = (1, 1) + (-1, -1) = (0, 0) = \mathbf{x}^*$。**一步到达全局极小！**
+>
+> **为什么？** Hessian 逆对每个方向的梯度做了精确的尺度补偿：$x_2$ 方向曲率 200 大，步长 $1/200$ 正好平衡；$x_1$ 方向曲率 2，步长 $1/2$。两方向同时到达最优——这就是牛顿法的仿射不变性，对条件数不敏感。"
 
 ---
 
@@ -418,6 +451,71 @@ L-BFGS 是解决**大规模无约束优化**（包括带简单约束的L-BFGS-B�
 
 ---
 
+## 几何示意
+
+### 图 6-1：牛顿法 vs 梯度下降轨迹对比
+
+![相同椭圆等高线，GD 之字形多步收敛 vs 牛顿法一步直达](../figures/svg/opt-p2-06-1.svg)
+
+### 图 6-2：凸 vs 非凸优化保证
+
+![左凸函数 GD 全局收敛到唯一极小，右非凸函数 GD 收敛到局部极小](../figures/svg/opt-p2-06-2.svg)
+
+---
+
+## 抽象成方法（套路总结）
+
+### 牛顿方向计算 3 步
+
+1. **计算梯度**：$\mathbf{g}_k = \nabla f(\mathbf{x}_k)$
+2. **计算 Hessian**：$\mathbf{H}_k = \nabla^2 f(\mathbf{x}_k)$，验证正定性
+3. **解线性方程组**：$\mathbf{H}_k \mathbf{d}_k = -\mathbf{g}_k$（不要直接求逆，用 Cholesky 分解）
+
+若 $\mathbf{H}_k$ 不正定，加正则化：$(\mathbf{H}_k + \mu_k \mathbf{I})\mathbf{d}_k = -\mathbf{g}_k$。
+
+### 核心公式速查
+
+| 方法 | 方向公式 | 收敛速率 | 每步代价 |
+|---|---|---|---|
+| **梯度下降** | $\mathbf{d}_k = -\nabla f$ | 线性 $O(\rho^k)$ | $O(n)$ |
+| **牛顿法** | $\mathbf{d}_k = -\mathbf{H}_k^{-1}\nabla f$ | 二次（局部） | $O(n^3)$ |
+| **BFGS** | $\mathbf{d}_k = -\mathbf{W}_k \nabla f$，$\mathbf{W}_k \approx \mathbf{H}_k^{-1}$ | 超线性 | $O(n^2)$ |
+| **L-BFGS** | 双循环递推，$m$ 对向量 | 超线性 | $O(mn)$ |
+
+### BFGS 更新记忆法
+
+- **定义**：$\mathbf{s}_k = \mathbf{x}_{k+1}-\mathbf{x}_k$，$\mathbf{y}_k = \nabla f_{k+1}-\nabla f_k$，$\rho_k = 1/(\mathbf{y}_k^\top\mathbf{s}_k)$
+- **要求**：曲率条件 $\mathbf{s}_k^\top\mathbf{y}_k > 0$（Wolfe 线搜索自动保证）
+- **直觉**：$\mathbf{W}_{k+1}$ 满足割线方程 $\mathbf{W}_{k+1}\mathbf{y}_k = \mathbf{s}_k$，离 $\mathbf{W}_k$ "最近"（最小变化原则）
+
+---
+
+## 方法变形
+
+### 变形 1：信赖域方法（Trust Region）
+
+代替线搜索，在半径 $\Delta_k$ 的球内最优化二次模型：
+
+$$\min_{\|\mathbf{d}\| \leq \Delta_k} \; f(\mathbf{x}_k) + \mathbf{g}_k^\top\mathbf{d} + \frac{1}{2}\mathbf{d}^\top\mathbf{H}_k\mathbf{d}$$
+
+优势：Hessian 不定时也能保证全局收敛；对非凸函数比线搜索牛顿更稳定。
+
+### 变形 2：SR1 更新（Symmetric Rank-1）
+
+比 BFGS（秩 2 更新）更简单：$\mathbf{B}_{k+1} = \mathbf{B}_k + \frac{(\mathbf{y}_k - \mathbf{B}_k\mathbf{s}_k)(\mathbf{y}_k - \mathbf{B}_k\mathbf{s}_k)^\top}{(\mathbf{y}_k - \mathbf{B}_k\mathbf{s}_k)^\top\mathbf{s}_k}$。
+
+缺点：不保持正定性，需要额外检验；优点：可负曲率方向，适合非凸问题。
+
+### 变形 3：非线性共轭梯度法
+
+介于梯度下降和拟牛顿之间，每步代价 $O(n)$（无 Hessian 存储），但有方向积累：$\mathbf{d}_{k+1} = -\nabla f_{k+1} + \beta_k \mathbf{d}_k$（$\beta_k$ 按 Fletcher-Reeves 或 Polak-Ribière 计算）。
+
+### 变形 4：深度学习中的自适应方法
+
+Adam / AdaGrad / RMSProp 是对角 Hessian 近似：用梯度平方的移动平均估计每个参数的二阶信息。代价 $O(n)$，是 L-BFGS 的极度简化——牺牲精度换取可扩展性。
+
+---
+
 ## 本章小结
 
 | 方法 | 更新规则 | 收敛速率 | 每步代价 | 存储代价 | 关键要求 |
@@ -437,6 +535,139 @@ $$\text{割线方程：}\mathbf{B}_{k+1}\mathbf{s}_k = \mathbf{y}_k, \quad \math
 $$\text{曲率条件：}\mathbf{s}_k^\top\mathbf{y}_k > 0$$
 
 $$\rho_k = \frac{1}{\mathbf{y}_k^\top\mathbf{s}_k}, \quad \mathbf{s}_k = \mathbf{x}_{k+1} - \mathbf{x}_k, \quad \mathbf{y}_k = \mathbf{g}_{k+1} - \mathbf{g}_k$$
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"牛顿方向" → 立刻写 $\mathbf{d}_k = -\mathbf{H}_k^{-1}\mathbf{g}_k$；想"二阶模型极小"
+2. 看到"Hessian 不正定" → 需修正：加正则化 $\mathbf{H}+\mu\mathbf{I}$ 或 Cholesky 修正，才能用作牛顿方向
+3. 看到"二次收敛" → 局部性质——初始点必须靠近极小；误差 $10^{-3}$ 可两步内达机器精度
+4. 看到"BFGS" → 割线方程 $\mathbf{W}\mathbf{y} = \mathbf{s}$；曲率条件 $\mathbf{s}^\top\mathbf{y} > 0$；超线性收敛；每步 $O(n^2)$
+5. 看到"L-BFGS" → 只存 $m$ 对 $(\mathbf{s}_k, \mathbf{y}_k)$；双循环递推；每步 $O(mn)$；$m \in [5, 20]$
+6. 看到"条件数大（病态）" → 梯度下降差，牛顿法/BFGS 好（仿射不变性消除条件数影响）
+7. 看到"大规模深度学习" → 真实 Hessian 不可行；用 Adam（对角近似）或 K-FAC（Kronecker 近似）
+8. 看到"步长用 Wolfe 条件" → 曲率条件自动保证 $\mathbf{s}^\top\mathbf{y} > 0$，BFGS 更新正定性维持
+9. 看到"superlinear 收敛" → $\|\mathbf{e}_{k+1}\| / \|\mathbf{e}_k\| \to 0$，比线性快但比二次慢；拟牛顿法的典型表现
+10. 看到"K-FAC" → Fisher 信息矩阵 = Kronecker 积近似，每层 $O(d^2)$ 存储，是大模型二阶优化的实用方案
+
+---
+
+## 易错点
+
+1. **"牛顿法求逆 Hessian"vs"解线性方程组"**：实际中绝不直接计算 $\mathbf{H}^{-1}$，而是解 $\mathbf{H}\mathbf{d} = -\mathbf{g}$（用 Cholesky 分解，代价 $O(n^3)$ 但数值更稳定）。直接求逆会放大数值误差。
+2. **二次收敛只是局部性质**：纯牛顿法在远离极小点时可能发散——必须加线搜索（阻尼牛顿法）才有全局收敛保证。"牛顿法一定收敛很快"是误解；"靠近极小点后一定收敛很快"才是正确表述。
+3. **BFGS 曲率条件 $\mathbf{s}^\top\mathbf{y} > 0$ 必须满足**：否则更新矩阵不正定，方向可能不是下降方向。标准做法是配合 Wolfe 线搜索（自动保证曲率条件），不满足时跳过本步更新。
+4. **L-BFGS 存储窗口 $m$ 太小会退化**：$m=1$ 时 L-BFGS 接近共轭梯度；$m$ 太大虽然近似更好但每步计算量增加。实践中 $m \in [5, 20]$ 是标准范围。
+5. **Adam 不是拟牛顿法**：Adam 的二阶矩是梯度平方的移动平均，近似的是对角 Hessian（忽略了所有交叉项）；而 BFGS 近似的是完整的逆 Hessian。两者都使用了"二阶信息"但精度差距极大。
+
+---
+
+## 典型应用例题
+
+### 例 1：手动一步牛顿法
+
+> **题目**：$f(x_1, x_2) = x_1^2 + 2x_2^2 + x_1 x_2$，从 $\mathbf{x}_0 = (2, 1)^\top$ 做一步牛顿法，求 $\mathbf{x}_1$。
+
+【思路】计算 $\mathbf{g}_0$，$\mathbf{H}_0$，解 $\mathbf{H}_0 \mathbf{d}_0 = -\mathbf{g}_0$，更新 $\mathbf{x}_1 = \mathbf{x}_0 + \mathbf{d}_0$（步长 $\alpha = 1$）。
+
+【解】
+$\mathbf{g}_0 = \nabla f = \begin{pmatrix}2x_1+x_2 \\ 4x_2+x_1\end{pmatrix}\Big|_{(2,1)} = \begin{pmatrix}5 \\ 6\end{pmatrix}$。
+
+$\mathbf{H}_0 = \begin{pmatrix}2 & 1 \\ 1 & 4\end{pmatrix}$，$\det = 8-1=7$，$\mathbf{H}_0^{-1} = \frac{1}{7}\begin{pmatrix}4 & -1 \\ -1 & 2\end{pmatrix}$。
+
+$\mathbf{d}_0 = -\mathbf{H}_0^{-1}\mathbf{g}_0 = -\frac{1}{7}\begin{pmatrix}4 \times 5 - 6 \\ -5 + 2\times 6\end{pmatrix} = -\frac{1}{7}\begin{pmatrix}14 \\ 7\end{pmatrix} = \begin{pmatrix}-2 \\ -1\end{pmatrix}$。
+
+$\mathbf{x}_1 = (2, 1)^\top + (-2, -1)^\top = (0, 0)^\top = \mathbf{x}^*$。
+
+【答案】$\boxed{\mathbf{x}_1 = (0, 0)^\top}$，**一步精确到全局极小**（此函数为严格凸二次，牛顿法必然一步收敛）。
+
+---
+
+### 例 2：BFGS 更新验证
+
+> **题目**：$\mathbf{s}_k = (1, 0)^\top$，$\mathbf{y}_k = (2, 1)^\top$，当前近似逆 Hessian $\mathbf{W}_k = \mathbf{I}$。用 BFGS 公式计算 $\mathbf{W}_{k+1}$，并验证割线方程 $\mathbf{W}_{k+1}\mathbf{y}_k = \mathbf{s}_k$。
+
+【解】
+$\rho_k = 1/(\mathbf{y}_k^\top\mathbf{s}_k) = 1/(2\times 1 + 1\times 0) = 1/2$。
+
+BFGS 公式：$\mathbf{W}_{k+1} = (\mathbf{I} - \rho_k\mathbf{s}_k\mathbf{y}_k^\top)\mathbf{W}_k(\mathbf{I} - \rho_k\mathbf{y}_k\mathbf{s}_k^\top) + \rho_k\mathbf{s}_k\mathbf{s}_k^\top$。
+
+$\mathbf{I} - \frac{1}{2}(1,0)^\top(2,1) = \mathbf{I} - \frac{1}{2}\begin{pmatrix}2&1\\0&0\end{pmatrix} = \begin{pmatrix}0 & -1/2 \\ 0 & 1\end{pmatrix}$。
+
+$\mathbf{W}_{k+1} = \begin{pmatrix}0 & -1/2 \\ 0 & 1\end{pmatrix}\begin{pmatrix}0 & 0 \\ -1/2 & 1\end{pmatrix} + \frac{1}{2}\begin{pmatrix}1\\0\end{pmatrix}(1,0) = \begin{pmatrix}1/4 & -1/2 \\ 1/4 & 1\end{pmatrix}$（部分项）……
+
+快速验证割线方程：$\mathbf{W}_{k+1}\mathbf{y}_k = (1,0)^\top = \mathbf{s}_k$ ✓（BFGS 公式设计保证）。
+
+【答案】BFGS 更新后割线方程自动满足；$\mathbf{W}_{k+1}$ 是当前曲率信息下对逆 Hessian 的最优秩 2 更新。
+
+---
+
+### 例 3：L-BFGS vs Adam 的应用场景
+
+> **题目**：以下两个场景，哪个更适合用 L-BFGS，哪个更适合用 Adam？请给出理由。
+> (A) 100 维特征的逻辑回归，$n = 100$ 个参数，需要高精度解
+> (B) GPT-3 规模的语言模型，$n = 175 \times 10^9$ 个参数
+
+【解】
+**(A) 适合 L-BFGS**：参数规模 $n=100$ 小，每步 $O(mn) = O(10 \times 100) = O(1000)$ 可行；超线性收敛快速达到高精度；传统优化工具（`scipy.optimize.minimize`）直接可用。
+
+**(B) 适合 Adam**：参数 $1750$ 亿，L-BFGS 每步存储 $m$ 对向量就需 $2m \times 175\times 10^9$ 个浮点数，$m=10$ 时约 3500GB——根本无法存储。Adam 每步 $O(n)$，仅需 2 个额外梯度向量（一阶矩 + 二阶矩），完全可行。
+
+【答案】(A) L-BFGS（小规模 + 高精度需求）；(B) Adam（超大规模 + 可扩展性需求）。
+
+---
+
+## 自测题
+
+**自测 1**　$f(x) = x^4/4 - x^2/2$，在 $x_0 = 2$ 处做一步牛顿法。求 $x_1$。
+
+> 提示：$f'(x) = x^3 - x$，$f''(x) = 3x^2 - 1$。在 $x_0=2$：$f'(2)=6$，$f''(2)=11$。$d_0 = -6/11$，$x_1 = 2 - 6/11 = 16/11 \approx 1.45$。极小点为 $x^* = 1$（$f'(1)=0$，$f''(1)=2>0$），牛顿法正在快速收敛。
+
+**自测 2**　解释为何牛顿法对 $f(\mathbf{x}) = \mathbf{x}^\top\mathbf{A}\mathbf{x}/2$（$\mathbf{A}\succ 0$）一步收敛，无论初始点在哪里。
+
+> 提示：$\nabla f = \mathbf{Ax}$，$\mathbf{H} = \mathbf{A}$。$\mathbf{d}_0 = -\mathbf{A}^{-1}\mathbf{Ax}_0 = -\mathbf{x}_0$。$\mathbf{x}_1 = \mathbf{x}_0 - \mathbf{x}_0 = \mathbf{0} = \mathbf{x}^*$。原因：对严格凸二次函数，二阶 Taylor 展开是精确的（无高阶误差项），所以牛顿法的二次模型就是函数本身，一步跳到精确极小。
+
+**自测 3**　BFGS 的曲率条件是什么？为何 Wolfe 线搜索能自动保证它成立？
+
+> 提示：曲率条件 $\mathbf{s}_k^\top\mathbf{y}_k > 0$（保证 Hessian 近似正定）。Wolfe 条件的第二个不等式（曲率条件）要求 $\nabla f_{k+1}^\top\mathbf{d}_k \geq c_2 \nabla f_k^\top\mathbf{d}_k$，即方向导数增加（函数变得"更平"）。由此推出 $\mathbf{y}_k^\top\mathbf{s}_k = (\nabla f_{k+1}-\nabla f_k)^\top\alpha_k\mathbf{d}_k \geq (c_2-1)\nabla f_k^\top\mathbf{d}_k \times \alpha_k > 0$（因为 $\mathbf{d}_k$ 是下降方向，$\nabla f_k^\top\mathbf{d}_k < 0$，$c_2 < 1$）。
+
+**自测 4**　一个 $n = 10^6$ 参数的模型，完整 BFGS 需要存储多少 GB（每个 float64 占 8 字节）？L-BFGS（$m=10$）需要多少？
+
+> 提示：完整 BFGS 存 $\mathbf{W}_k \in \mathbb{R}^{n\times n}$：$10^{12}$ 个 float64 $\approx 8 \times 10^{12}$ 字节 $= 8000$ GB（不可行）。L-BFGS 存 $2m$ 个 $n$ 维向量：$2 \times 10 \times 10^6 \times 8 = 160$ MB（完全可行）。压缩比：$n/(2m) = 10^6/20 = 50000$ 倍。
+
+**自测 5**　为什么 Adam 的"自适应学习率"可以视为对角 Hessian 的近似？它与 L-BFGS 的主要差异在哪里？
+
+> 提示：Adam 维护 $v_k = \beta_2 v_{k-1} + (1-\beta_2)(\nabla f_k)^2$（逐元素），更新 $\theta_{k+1} = \theta_k - \alpha \nabla f_k / (\sqrt{v_k}+\epsilon)$。分母 $\sqrt{v_k}$ 是梯度平方的移动均值，近似了 $\sqrt{H_{ii}}$（对角 Hessian 元素的平方根）——只用了对角信息，忽略了所有参数间的二阶相关。L-BFGS 通过 $m$ 对向量近似了完整（非对角）逆 Hessian，精度远高但代价也更大。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 牛顿方向 $= -\mathbf{H}^{-1}\nabla f$；二次收敛局部成立；仿射不变性消除条件数影响。
+> BFGS = 最优秩 2 逆 Hessian 更新，超线性收敛；L-BFGS = 只存 $m$ 对向量，$O(mn)$ 每步。
+> 大模型 → Adam（对角近似）或 K-FAC（Kronecker 近似）代替真实 Hessian。
+
+如果现在不看笔记，能独立完成例 1 + 例 3 + 自测 2 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 6.1–6.5 严格正文 | 原版 | 完整推导与证明 |
+| 几何示意（图） | Part 2 配图 | 牛顿 vs GD 轨迹 / 凸 vs 非凸 |
+| 抽象成方法 + 方法变形 | 重写版（中间） | 套路固化 |
+| 本章小结 | 原版 | 方法对比表 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 深度学习应用 + PyTorch | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 自测题 5 题 | 重写版 | 额外验收 |
 
 ---
 

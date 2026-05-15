@@ -1,8 +1,69 @@
-# 第15章：共轭梯度法
+# 第15章：共轭梯度法（融合版）
 
 > **前置章节**：第5章（梯度下降法）、第6章（牛顿法与拟牛顿法）、第1章（向量与矩阵）
 >
 > **难度**：★★★★☆
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **A-共轭**：$\mathbf{d}_i^\top\mathbf{A}\mathbf{d}_j = 0$（$i \neq j$）；椭球坐标系的"正交轴"；最多 $n$ 个。
+> **线性 CG 步**：$\alpha_k = \frac{\mathbf{r}_k^\top\mathbf{r}_k}{\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k}$；$\mathbf{r}_{k+1} = \mathbf{r}_k - \alpha_k\mathbf{A}\mathbf{d}_k$；$\beta_{k+1} = \frac{\|\mathbf{r}_{k+1}\|^2}{\|\mathbf{r}_k\|^2}$；$\mathbf{d}_{k+1} = \mathbf{r}_{k+1} + \beta_{k+1}\mathbf{d}_k$。
+> **有限终止**：$n$ 步内精确解（对正定二次函数）；条件数 $\kappa$ 大时慢，$\kappa$ 小时快。
+> **非线性 CG**：Fletcher-Reeves：$\beta_k^{\text{FR}} = \frac{\|\mathbf{g}_k\|^2}{\|\mathbf{g}_{k-1}\|^2}$；Polak-Ribière：$\beta_k^{\text{PR}} = \frac{\mathbf{g}_k^\top(\mathbf{g}_k-\mathbf{g}_{k-1})}{\|\mathbf{g}_{k-1}\|^2}$；PR+ 取 $\max(\beta_k^{\text{PR}}, 0)$ 防退化。
+> **AI 关联**：Hessian-free 优化（HF）= 用 CG 求解 Newton 方程 $\mathbf{H}\mathbf{d} = -\mathbf{g}$；Hessian-向量积 $\mathbf{H}\mathbf{v}$ 只需两次反向传播，无需存储 $n\times n$ Hessian；大规模神经网络二阶优化的核心工具。
+
+---
+
+## 引入：为什么梯度下降在椭圆等高线上会"走之字"？
+
+> **题目**：对二维二次函数 $f(\mathbf{x}) = x_1^2 + 25x_2^2$（条件数 $\kappa = 25$），从初始点 $\mathbf{x}_0 = (25, 1)^\top$ 出发，分别用梯度下降（步长 = $\frac{2}{\lambda_{\min}+\lambda_{\max}} = \frac{2}{26}$）和共轭梯度法运行前两步。
+>
+> (1) 梯度下降：计算 $\mathbf{x}_1$ 和 $\mathbf{x}_2$，观察收敛方向。
+> (2) 共轭梯度法：计算 $\mathbf{x}_1$（应在一步内到达最优解的 $x_2$ 分量），解释为何两步就能精确解。
+> (3) 从等高线的角度，解释"之字形"路径的几何原因。
+
+请先停下来想一想：梯度下降的搜索方向每步重置，不保留之前的"进展信息"；共轭梯度则通过 $\beta$ 系数"记住"历史方向。下面还原完整解题思路。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "函数 $f = x_1^2 + 25x_2^2$，矩阵 $\mathbf{A} = \begin{pmatrix}2&0\\0&50\end{pmatrix}$（注意 $f = \frac{1}{2}\mathbf{x}^\top\mathbf{A}\mathbf{x}$ 对应，但这里 $f = x_1^2+25x_2^2 = \frac{1}{2}\mathbf{x}^\top\mathbf{A}\mathbf{x}$ 需 $\mathbf{A} = \begin{pmatrix}2&0\\0&50\end{pmatrix}$）。最优解 $\mathbf{x}^* = \mathbf{0}$。
+>
+> **第 (1) 问：梯度下降两步。**
+>
+> 梯度：$\nabla f(\mathbf{x}) = (2x_1, 50x_2)^\top$。步长 $\alpha = 2/(\lambda_{\min}+\lambda_{\max}) = 2/(2+50) = 1/26$（$\lambda_{\min}=2$，$\lambda_{\max}=50$，即 Hessian $\mathbf{A}$ 的特征值）。
+>
+> $\mathbf{x}_0 = (25, 1)^\top$，$\nabla f(\mathbf{x}_0) = (50, 50)^\top$。
+>
+> $\mathbf{x}_1 = \mathbf{x}_0 - \frac{1}{26}(50, 50)^\top = (25 - 50/26, 1 - 50/26)^\top \approx (23.08, -0.923)^\top$。
+>
+> 注意 $x_2$ 方向从 $+1$ 变为 $-0.923$——过冲了！这是"之字"的根源：步长对 $x_1$（梯度小）来说太小，对 $x_2$（梯度大）来说太大，导致来回震荡。
+>
+> $\nabla f(\mathbf{x}_1) = (46.15, -46.15)^\top$。
+>
+> $\mathbf{x}_2 \approx (23.08 - 1.775, -0.923 + 1.775)^\top \approx (21.3, 0.852)^\top$。$x_2$ 又从负变正——确实是之字！
+>
+> **第 (2) 问：共轭梯度法两步。**
+>
+> CG 直接利用矩阵结构。初始：$\mathbf{r}_0 = -\nabla f(\mathbf{x}_0) = (-50, -50)^\top$（$\mathbf{b} = \mathbf{0}$，$\mathbf{r}_0 = \mathbf{b} - \mathbf{A}\mathbf{x}_0 = -\mathbf{A}\mathbf{x}_0$），$\mathbf{d}_0 = \mathbf{r}_0 = (-50, -50)^\top$。
+>
+> $\alpha_0 = \frac{\mathbf{r}_0^\top\mathbf{r}_0}{\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_0} = \frac{2500+2500}{(-50)(2)(-50)+(-50)(50)(-50)} = \frac{5000}{5000+125000} = \frac{5000}{130000} \approx 0.0385$。
+>
+> $\mathbf{x}_1 = (25,1)^\top + 0.0385(-50,-50)^\top \approx (23.08, -0.923)^\top$。（与梯度下降第一步相同——因为初始方向 $\mathbf{d}_0 = -\nabla f$！）
+>
+> $\mathbf{r}_1 = \mathbf{r}_0 - \alpha_0\mathbf{A}\mathbf{d}_0 = (-50,-50)^\top - 0.0385\begin{pmatrix}2&0\\0&50\end{pmatrix}(-50,-50)^\top = (-50,-50)^\top - 0.0385(-100,-2500)^\top \approx (-46.15, 46.15)^\top$。
+>
+> $\beta_1 = \|\mathbf{r}_1\|^2/\|\mathbf{r}_0\|^2 \approx (46.15^2\times2)/5000 \approx 0.854$。
+>
+> $\mathbf{d}_1 = \mathbf{r}_1 + \beta_1\mathbf{d}_0 \approx (-46.15,46.15)+0.854(-50,-50) \approx (-88.8, 3.4)^\top$。
+>
+> 这个方向更倾向于 $x_1$ 轴，修正了梯度下降在 $x_2$ 方向的过冲！再一步 CG 即可到达精确解（$n=2$，两步终止）。
+>
+> **第 (3) 问：几何原因。**
+>
+> 等高线是椭圆（$x_1^2 + 25x_2^2 = c$），$x_2$ 方向轴很短（曲率大），$x_1$ 方向轴很长（曲率小）。梯度方向垂直等高线，但在椭圆中梯度并不指向中心——它偏向曲率大的 $x_2$ 方向。固定步长梯度下降在 $x_2$ 上来回振荡，在 $x_1$ 上缓慢前进。CG 通过记录上一步方向（$\beta\mathbf{d}_{k-1}$ 项），构造出能"穿越椭圆"的方向，每步保留上一步沿一个'A-轴'的最优性，避免重蹈覆辙。"
 
 ---
 
@@ -1349,3 +1410,419 @@ $$\epsilon_r^{(k)} = \min\left(0.5, \sqrt{\|\mathbf{g}_k\|} / \|\mathbf{g}_k\|\r
 ---
 
 *本章系统介绍了共轭梯度法的理论基础与实用变体。下一章将讨论随机优化方法，探讨梯度噪声对收敛性的影响以及方差缩减技术。*
+
+---
+
+## 核心理论精要
+
+### CG、GD、牛顿法的收敛速率全景比较
+
+对强凸函数（强凸参数 $\mu$，Lipschitz 梯度参数 $L$，条件数 $\kappa = L/\mu$）：
+
+| 方法 | 每步计算量 | 收敛速率 | 到 $\epsilon$ 精度迭代次数 |
+|------|---------|---------|----------------------|
+| 梯度下降 | $O(n)$ | 线性，因子 $1-1/\kappa$ | $O(\kappa\log(1/\epsilon))$ |
+| 共轭梯度（线性问题） | $O(n^2)$ 或 $O(\text{nnz})$ | 线性，因子 $({\sqrt\kappa-1})/(\sqrt\kappa+1)$ | $O(\sqrt\kappa\log(1/\epsilon))$ |
+| 牛顿法（精确 Hessian） | $O(n^3)$ | 二次（局部） | $O(\log\log(1/\epsilon))$ |
+| L-BFGS（拟牛顿） | $O(mn)$ | 超线性（局部） | 介于 GD 和 Newton 之间 |
+| HF 优化（CG + Hessian-向量积） | $O(kn)$，$k=$ CG 步 | 超线性/线性（外层） | 依赖截断精度 |
+
+**关键洞察**：
+- CG 的 $\sqrt{\kappa}$ vs GD 的 $\kappa$：当 $\kappa = 10^4$ 时，CG 比 GD 快 $\sqrt{10^4} = 100$ 倍。
+- CG 有限终止：对 $n$ 维正定系统，CG 在**精确算术**下 $n$ 步终止，这是比任何一阶方法都更强的保证。
+- 特征值聚类加速：若 $\mathbf{A}$ 的特征值分为 $m$ 个聚类（$m \ll n$），CG 约 $m$ 步收敛（多项式近似原理）。
+
+### CG 与 Krylov 子空间的深层联系
+
+CG 的每一步在 Krylov 子空间 $\mathcal{K}_k = \text{span}\{\mathbf{r}_0, \mathbf{A}\mathbf{r}_0, \ldots, \mathbf{A}^{k-1}\mathbf{r}_0\}$ 中寻找最优解，这等价于：
+
+$$\mathbf{x}_k = \arg\min_{\mathbf{x} \in \mathbf{x}_0 + \mathcal{K}_k} \|\mathbf{x} - \mathbf{x}^*\|_\mathbf{A}$$
+
+即 $\mathbf{x}_k$ 是 $\mathbf{x}^*$ 在 $\mathbf{x}_0 + \mathcal{K}_k$ 上的 $\mathbf{A}$-范数投影——CG 是**最优 Krylov 子空间方法**。
+
+这也解释了为何 CG 在不同问题上的收敛速度差异很大：
+- $\mathbf{A}$ 的特征值分布越集中（聚类），Krylov 子空间越快"覆盖"真实解方向，收敛越快
+- $\mathbf{A} = \mathbf{I}$（单位矩阵，$\kappa = 1$）：CG 一步就收敛
+- $\mathbf{A}$ 有 $m$ 个不同特征值：CG $m$ 步精确（与 $n$ 无关！）
+
+### 深度学习中的二阶方法全景
+
+```
+二阶方法在深度学习中的应用层次：
+
+完全二阶（H^{-1}∇f）
+  ├── 优点：二次收敛，最快
+  └── 缺点：Hessian 存储 O(n^2)，求逆 O(n^3)，n=10^7 完全不可行
+
+Hessian-free（CG + Hv 乘积）
+  ├── HF 优化（Martens 2010）：每步 Hessian-向量积，CG 近似 Newton 步
+  ├── 优点：存储 O(n)，每步 O(kn)（k = CG 迭代次数，通常 20-50）
+  └── 适用：中等规模（10^5-10^7 参数），对批量大小敏感
+
+拟牛顿（L-BFGS）
+  ├── 用过去 m 步信息近似 H^{-1}，存储 O(mn)
+  ├── 适用：全批量/小规模问题；Adam 可视为随机版 L-BFGS
+  └── PyTorch: torch.optim.LBFGS（全批量）
+
+对角/块对角近似（K-FAC）
+  ├── Kronecker 分解 Fisher 矩阵，存储 O(n_layer^2)
+  ├── 在 ImageNet 训练中约 3-5x 加速 vs Adam
+  └── 实现复杂度高，工程挑战大
+
+自然梯度（NGD/TRPO/PPO）
+  ├── Fisher 矩阵近似 Hessian（等价于 KL 球信赖域）
+  ├── TRPO：精确 KL 约束，CG 求解线性系统（类 HF）
+  └── PPO：clip 近似替代 KL，O(n) 复杂度但失去严格保证
+```
+
+## 几何示意
+
+### 图 15-1：共轭梯度方向
+
+![之字形 GD vs 共轭方向直达](../figures/svg/opt-p5-15-1.svg)
+
+### 图 15-2：CG vs GD 收敛速度
+
+![半对数纵轴对比](../figures/svg/opt-p5-15-2.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 备注 |
+|---|---|---|
+| **A-共轭** | $\mathbf{d}_i^\top\mathbf{A}\mathbf{d}_j = 0\ (i\neq j)$ | $\mathbf{A}$-内积下的"正交"；至多 $n$ 个 |
+| **步长（线性 CG）** | $\alpha_k = \dfrac{\mathbf{r}_k^\top\mathbf{r}_k}{\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k}$ | 精确线搜索步长 |
+| **方向系数** | $\beta_{k+1} = \dfrac{\mathbf{r}_{k+1}^\top\mathbf{r}_{k+1}}{\mathbf{r}_k^\top\mathbf{r}_k}$ | 线性 CG 及 FR 公式 |
+| **残差更新** | $\mathbf{r}_{k+1} = \mathbf{r}_k - \alpha_k\mathbf{A}\mathbf{d}_k$ | 无需重算 $\mathbf{b}-\mathbf{A}\mathbf{x}$ |
+| **方向更新** | $\mathbf{d}_{k+1} = \mathbf{r}_{k+1} + \beta_{k+1}\mathbf{d}_k$ | 融合残差与历史方向 |
+| **FR 系数** | $\beta_k^{\text{FR}} = \|\mathbf{g}_k\|^2 / \|\mathbf{g}_{k-1}\|^2$ | 非线性 CG，比值总 $\geq 0$ |
+| **PR 系数** | $\beta_k^{\text{PR}} = \mathbf{g}_k^\top(\mathbf{g}_k - \mathbf{g}_{k-1})/\|\mathbf{g}_{k-1}\|^2$ | 可为负，自动重启效果 |
+| **PR+ 系数** | $\beta_k^{\text{PR+}} = \max(\beta_k^{\text{PR}}, 0)$ | 强制下降性 + 自动重启 |
+| **收敛上界** | $\|\mathbf{x}_k-\mathbf{x}^*\|_\mathbf{A}/\|\mathbf{x}_0-\mathbf{x}^*\|_\mathbf{A} \leq 2\rho^k$ | $\rho = (\sqrt{\kappa}-1)/(\sqrt{\kappa}+1)$ |
+| **PCG 步长** | $\alpha_k = \mathbf{r}_k^\top\mathbf{z}_k / (\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k)$ | $\mathbf{z}_k = \mathbf{P}^{-1}\mathbf{r}_k$（预处理步） |
+
+### 共轭梯度法的 5 步流程
+
+1. **初始化**：设 $\mathbf{r}_0 = \mathbf{b} - \mathbf{A}\mathbf{x}_0$（线性）或 $\mathbf{r}_0 = -\nabla f(\mathbf{x}_0)$（非线性），令 $\mathbf{d}_0 = \mathbf{r}_0$
+2. **计算步长**：$\alpha_k = \mathbf{r}_k^\top\mathbf{r}_k / (\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k)$；非线性时用 Wolfe 线搜索代替
+3. **更新点与残差**：$\mathbf{x}_{k+1} = \mathbf{x}_k + \alpha_k\mathbf{d}_k$；$\mathbf{r}_{k+1} = \mathbf{r}_k - \alpha_k\mathbf{A}\mathbf{d}_k$
+4. **计算方向系数并更新方向**：$\beta_{k+1} = \|\mathbf{r}_{k+1}\|^2/\|\mathbf{r}_k\|^2$（线性 CG 或 FR）；$\mathbf{d}_{k+1} = \mathbf{r}_{k+1} + \beta_{k+1}\mathbf{d}_k$
+5. **终止判断**：$\|\mathbf{r}_{k+1}\| \leq \epsilon$（线性）或 $\|\nabla f(\mathbf{x}_{k+1})\| \leq \epsilon$（非线性）；周期重启（每 $n$ 步或 Powell 条件）
+
+### 非线性 CG 变体对照表
+
+| 变体 | $\beta_k$ 公式 | $\beta_k$ 范围 | 全局收敛 | 实践速度 |
+|---|---|---|---|---|
+| Fletcher-Reeves (FR) | $\|\mathbf{g}_k\|^2 / \|\mathbf{g}_{k-1}\|^2$ | $\geq 0$ | 是（Wolfe）| 稳定，偶慢 |
+| Polak-Ribière (PR) | $\mathbf{g}_k^\top(\mathbf{g}_k-\mathbf{g}_{k-1})/\|\mathbf{g}_{k-1}\|^2$ | 任意 | 仅精确 LS | 通常快 |
+| PR+ | $\max(\beta_k^{\text{PR}}, 0)$ | $\geq 0$ | 是（Wolfe）| 最佳实践 |
+| Hestenes-Stiefel (HS) | $\mathbf{g}_k^\top(\mathbf{g}_k-\mathbf{g}_{k-1})/\mathbf{d}_{k-1}^\top(\mathbf{g}_k-\mathbf{g}_{k-1})$ | 任意 | 有限 | 中等 |
+| Dai-Yuan (DY) | $\|\mathbf{g}_k\|^2/\mathbf{d}_{k-1}^\top(\mathbf{g}_k-\mathbf{g}_{k-1})$ | $\geq 0$ | 是（Wolfe）| 稳定 |
+
+---
+
+## 方法变形
+
+### 变形 1：线性 CG 到非线性 CG 的推广
+
+线性 CG 的 $\alpha_k$ 是精确线搜索的解析表达式；非线性 CG 无法解析求 $\alpha_k$，需要用 Wolfe 条件线搜索近似替代。步长的不精确性使得各 $\beta_k$ 公式不再等价（FR / PR / HS / DY 行为各异），需要根据问题选择。
+
+### 变形 2：不同 $\beta_k$ 公式的适用场景
+
+FR 公式：稳定，$\beta_k \geq 0$ 恒成立，适合需要全局收敛保证的场景；但收敛速度可能慢（方向不自动重置）。PR+ 公式：实践中通常最快，$\beta_k$ 可为负意味着"自动识别坏方向并重启"，适合高度非线性问题。HS 公式：兼顾 FR 和 PR 的性质，适合中等非线性问题。
+
+### 变形 3：预处理 CG（PCG）
+
+将 $\mathbf{r}_k^\top\mathbf{r}_k$ 替换为 $\mathbf{r}_k^\top\mathbf{z}_k$（$\mathbf{z}_k = \mathbf{P}^{-1}\mathbf{r}_k$），其中 $\mathbf{P}$ 是预处理矩阵。效果：CG 在 $\kappa(\mathbf{P}^{-1}\mathbf{A})$ 而非 $\kappa(\mathbf{A})$ 决定的收敛速率下工作。代价：每步增加一次 $\mathbf{P}^{-1}$ 的计算（即解辅助方程 $\mathbf{P}\mathbf{z} = \mathbf{r}$）。
+
+### 变形 4：截断 CG 用于信赖域子问题（Steihaug-CG）
+
+将标准 CG 的终止条件扩展为两种：(a) 残差足够小（标准终止）；(b) 当前步超出信赖域边界（截断并投影）；(c) 遇到负曲率方向（$\mathbf{d}_k^\top\mathbf{H}\mathbf{d}_k \leq 0$，沿该方向走到边界）。这使得截断 CG 始终在信赖域内，且满足 Cauchy 点下降量界，是大规模优化的标准工具。
+
+### 变形 5：CG 用于最小二乘（CGLS / LSQR）
+
+对非方阵 $\mathbf{A} \in \mathbb{R}^{m\times n}$（$m > n$）的最小二乘 $\min \|\mathbf{A}\mathbf{x} - \mathbf{b}\|^2$，等价于对正规方程 $\mathbf{A}^\top\mathbf{A}\mathbf{x} = \mathbf{A}^\top\mathbf{b}$ 应用 CG（此时 $\mathbf{A}^\top\mathbf{A} \succeq 0$，CG 可能退化；用 CGLS 在原空间运行避免数值问题）。LSQR 是数值稳定的 CGLS 实现，大规模线性逆问题（CT 重建、图神经网络稀疏求解）的标准工具。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"A-共轭"→ 立刻写 $\mathbf{d}_i^\top\mathbf{A}\mathbf{d}_j = 0$；想到 $\mathbf{A}^{1/2}$ 变换后等高线由椭球变球，A-共轭 = 变换后正交
+2. 看到"线性 CG 步长"→ 公式 $\alpha_k = \mathbf{r}_k^\top\mathbf{r}_k / (\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k)$；分子是残差模平方，分母是方向曲率
+3. 看到"CG 有限终止"→ $n$ 步内精确解（精确算术）；但若 $\mathbf{A}$ 的特征值只有 $m$ 个不同值，则 $m$ 步终止
+4. 看到"条件数 $\kappa$ 大"→ CG 收敛因子 $\rho = (\sqrt{\kappa}-1)/(\sqrt{\kappa}+1) \to 1$，收敛慢；用预处理降低有效 $\kappa$
+5. 看到"FR vs PR"→ FR 更稳定但可能卡在坏方向；PR 自动重启（$\beta_k$ 可负），实践更快；PR+ 两者兼顾
+6. 看到"重启策略"→ Powell 条件 $\vert\mathbf{g}_k^\top\mathbf{g}_{k-1}\vert \geq 0.2\|\mathbf{g}_k\|^2$；或简单地每 $n$ 步重置 $\beta_k = 0$（回归梯度下降）
+7. 看到"预处理矩阵 $\mathbf{P}$"→ 好 $\mathbf{P}$：$\mathbf{P}^{-1}\mathbf{v}$ 快 + $\kappa(\mathbf{P}^{-1}\mathbf{A}) \ll \kappa(\mathbf{A})$；常用：Jacobi（对角）/ SSOR / 不完全 Cholesky（IC(0)）
+8. 看到"Hessian-free 优化"→ 每步 CG 迭代只需 $\mathbf{H}\mathbf{v}$（Hessian-向量积），用两次反向传播计算，无需存储 $n\times n$ 矩阵；适合 $n \sim 10^8$ 的神经网络
+9. 看到"截断 CG"→ 想到三种截断：残差小 / 超出信赖域 / 负曲率；所得步始终在信赖域内并满足 Cauchy 下降量界
+10. 看到"CG 相比梯度下降"→ 相同计算量，但收敛因子从 $(\kappa-1)/(\kappa+1)$ 降为 $(\sqrt{\kappa}-1)/(\sqrt{\kappa}+1)$；$\kappa=100$ 时梯度下降需 $\sim 700$ 步，CG 只需 $\sim 30$ 步
+11. 看到"Krylov 子空间"→ CG 第 $k$ 步在 $\mathbf{x}_0 + \mathcal{K}_k(\mathbf{A},\mathbf{r}_0)$ 中找能量范数最优解；这是 CG 最优性的根本来源
+12. 看到"PCG 的 $\beta_k$ 公式"→ 分子变为 $\mathbf{r}_{k+1}^\top\mathbf{z}_{k+1}$（$\mathbf{P}^{-1}$-内积），分母为 $\mathbf{r}_k^\top\mathbf{z}_k$；与标准 CG 结构完全一致，只是内积换了
+13. 看到"特征值聚集"→ 若 $\mathbf{A}$ 只有少数不同特征值（如 PDE 离散化矩阵），CG 步数 = 不同特征值个数，远少于 $n$；预处理的目标正是将特征值"压缩"到更少的聚集
+14. 看到"非线性 CG 发散或震荡"→ 先检查：(a) 是否使用 Wolfe 线搜索（仅 Armijo 不足以保证 PR 的全局收敛）；(b) 是否及时重启（方向共轭性退化）；(c) 是否 $\beta_k$ 计算中分母接近零（梯度极小但未收敛，数值问题）
+
+---
+
+## 易错点清单
+
+1. **CG 用于非 SPD 矩阵**：线性 CG 严格要求 $\mathbf{A}$ 对称正定。若 $\mathbf{A}$ 半正定（有零特征值），CG 可能在 $\mathbf{b}$ 不在值域内时不收敛；若 $\mathbf{A}$ 不对称，使用 GMRES 或 BiCGStab；若 $\mathbf{A}$ 不定（如鞍点矩阵），使用 MINRES 或 SYMMLQ。
+
+2. **$\beta_k$ 公式对线性 CG 的特殊性**：线性 CG 的 $\beta_k = \|\mathbf{r}_{k+1}\|^2/\|\mathbf{r}_k\|^2$ 在**精确算术**下等价于所有其他常见的 CG 公式（PR、FR、HS 等均相同），但在浮点精度下会有差异，影响数值稳定性。
+
+3. **非线性 CG 不能保证精确终止**：线性 CG 有 $n$ 步精确终止的保证（精确算术），但非线性 CG 没有这种保证，只能保证全局收敛（在强 Wolfe 条件下）。不要对非线性 CG 期待有限步收敛。
+
+4. **重启策略的必要性**：非线性 CG 在长期运行后，数值误差积累会导致 $\mathbf{d}_k$ 逐渐失去共轭性，方向质量下降，收敛速度退化为梯度下降。每 $n$ 步（或当 $|\mathbf{g}_k^\top\mathbf{g}_{k-1}|/\|\mathbf{g}_k\|^2 > 0.1$ 时）重启（$\mathbf{d}_k = -\mathbf{g}_k$）可缓解此问题。
+
+5. **PCG 的预处理矩阵选择**：好的预处理矩阵 $\mathbf{M}$ 应满足：(a) $\mathbf{M}^{-1}\mathbf{A}$ 的条件数远小于 $\mathbf{A}$ 的条件数；(b) $\mathbf{M}^{-1}\mathbf{v}$ 的计算代价远小于 $\mathbf{A}^{-1}\mathbf{v}$。对角预处理（$\mathbf{M} = \text{diag}(\mathbf{A})$）零计算成本但效果有限；不完全 Cholesky 预处理效果好但需要预先分解成本。
+
+6. **Hessian-free 中 Gauss-Newton 矩阵 vs Hessian**：HF 优化通常用 Gauss-Newton 矩阵 $\mathbf{G} = \mathbf{J}^\top\mathbf{J}$（正半定）代替 Hessian（可能不正定），再加阻尼 $\mathbf{G} + \lambda\mathbf{I}$（正定）。这避免了 CG 遇到负曲率的复杂处理，但损失了部分二阶信息。
+
+## 方法链接：CG 在不同领域的变体
+
+**线性代数（经典应用）**：求解大规模稀疏线性系统 $\mathbf{A}\mathbf{x} = \mathbf{b}$（结构力学、流体仿真、PDE 数值解），配合不完全 Cholesky 预处理，是科学计算中最重要的迭代求解器之一。
+
+**信号处理（压缩感知）**：LASSO 问题 $\min \|\mathbf{x}\|_1 + \lambda\|\mathbf{A}\mathbf{x}-\mathbf{b}\|^2$ 可用近端梯度法，其中光滑部分的梯度步可结合 CG 加速（FISTA 算法的变体）。
+
+**深度学习（HF 优化）**：Martens (2010) 将 HF 应用于深度网络，每步外层 Newton 迭代用截断 CG 近似求解 Newton 方向，单步收敛量远优于 SGD，但实现复杂度高，现已被 K-FAC 等更实用的方法部分替代。
+
+**强化学习（TRPO）**：TRPO 求解 KL 约束优化问题，其关键步骤是用 CG 求解 $\mathbf{F}\mathbf{v} = \nabla L$（$\mathbf{F}$ = Fisher 矩阵），再用线搜索确定步长。CG 每步需要一次 Fisher-向量积（类似 Hessian-向量积），是 TRPO 实现中最耗时的部分。
+
+**计算机图形学（物理仿真）**：布料、流体、弹性体的物理仿真涉及求解大规模线性系统（如隐式时间积分产生的刚度矩阵方程），CG 是首选方法，结合领域专用预处理（如多重网格）可大幅加速。
+
+## 典型应用例题
+
+### 例 1：线性 CG 完整手算（$3\times3$ 系统）
+
+> **题目**：用共轭梯度法求解 $\mathbf{A}\mathbf{x} = \mathbf{b}$，其中
+> $$\mathbf{A} = \begin{pmatrix}4&0&0\\0&2&0\\0&0&1\end{pmatrix}, \quad \mathbf{b} = \begin{pmatrix}4\\4\\3\end{pmatrix}, \quad \mathbf{x}_0 = \begin{pmatrix}0\\0\\0\end{pmatrix}$$
+> 精确解 $\mathbf{x}^* = \mathbf{A}^{-1}\mathbf{b} = (1,2,3)^\top$。
+
+【解】（对角矩阵，结构清晰，适合手算）
+
+**初始化**：$\mathbf{r}_0 = \mathbf{b} - \mathbf{A}\mathbf{x}_0 = (4,4,3)^\top$，$\mathbf{d}_0 = \mathbf{r}_0$，$\|\mathbf{r}_0\|^2 = 16+16+9 = 41$。
+
+---
+
+**第 0 步**：
+
+$\mathbf{A}\mathbf{d}_0 = (4\cdot4, 2\cdot4, 1\cdot3)^\top = (16, 8, 3)^\top$。
+
+$\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_0 = (4)(16)+(4)(8)+(3)(3) = 64+32+9 = 105$。
+
+$\alpha_0 = \|\mathbf{r}_0\|^2/(\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_0) = 41/105$。
+
+$\mathbf{x}_1 = \mathbf{x}_0 + \alpha_0\mathbf{d}_0 = \frac{41}{105}(4,4,3)^\top = \left(\frac{164}{105}, \frac{164}{105}, \frac{123}{105}\right)^\top \approx (1.562, 1.562, 1.171)^\top$。
+
+$\mathbf{r}_1 = \mathbf{r}_0 - \alpha_0\mathbf{A}\mathbf{d}_0 = (4,4,3)^\top - \frac{41}{105}(16,8,3)^\top$。
+
+$= \left(4-\frac{656}{105}, 4-\frac{328}{105}, 3-\frac{123}{105}\right)^\top = \left(-\frac{236}{105}, \frac{92}{105}, \frac{192}{105}\right)^\top$。
+
+$\|\mathbf{r}_1\|^2 = \frac{1}{105^2}(236^2 + 92^2 + 192^2) = \frac{55696+8464+36864}{11025} = \frac{101024}{11025} \approx 9.163$。
+
+$\beta_1 = \|\mathbf{r}_1\|^2/\|\mathbf{r}_0\|^2 = \frac{101024/11025}{41} = \frac{101024}{451025} \approx 0.224$。
+
+$\mathbf{d}_1 = \mathbf{r}_1 + \beta_1\mathbf{d}_0 \approx (-2.248, 0.876, 1.829)^\top + 0.224(4,4,3)^\top \approx (-1.352, 1.772, 2.501)^\top$。
+
+**验证 $\mathbf{A}$-共轭**：$\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_1 = (4)(-1.352\times4) + (4)(1.772\times2) + (3)(2.501\times1)$
+
+$= 4(-5.408) + 4(3.544) + 3(2.501) = -21.63 + 14.18 + 7.50 \approx 0.05 \approx 0$。✓（数值误差）
+
+---
+
+继续运行 2 步后，$\mathbf{x}_3 = \mathbf{x}^* = (1,2,3)^\top$（$n=3$ 步精确终止）。
+
+【关键观察】对角正定矩阵条件数 $\kappa = \lambda_{\max}/\lambda_{\min} = 4/1 = 4$，CG 上界 3 步收敛（$n=3$ 维），梯度下降需约 $\frac{1}{2}\sqrt{4}\ln(10^6) \approx 14$ 步才达到同等精度。
+
+### 例 2：非线性 CG 的 $\beta$ 计算比较
+
+> **题目**：对 Rosenbrock 函数 $f(x_1,x_2) = 100(x_2-x_1^2)^2 + (1-x_1)^2$，在某步：$\mathbf{x}_{k-1} = (0.5, 0.3)^\top$，$\mathbf{x}_k = (0.6, 0.35)^\top$。
+>
+> 计算 $\mathbf{g}_{k-1}$、$\mathbf{g}_k$，并比较 FR 和 PR+ 给出的 $\beta_k$。
+
+【解】
+
+$\nabla f(x_1, x_2) = \begin{pmatrix}-400x_1(x_2-x_1^2) - 2(1-x_1) \\ 200(x_2-x_1^2)\end{pmatrix}$。
+
+**在 $(0.5, 0.3)^\top$**：$x_2 - x_1^2 = 0.3 - 0.25 = 0.05$。
+
+$g_1 = -400\times0.5\times0.05 - 2\times0.5 = -10 - 1 = -11$，$g_2 = 200\times0.05 = 10$。
+
+$\mathbf{g}_{k-1} = (-11, 10)^\top$，$\|\mathbf{g}_{k-1}\|^2 = 121 + 100 = 221$。
+
+**在 $(0.6, 0.35)^\top$**：$x_2 - x_1^2 = 0.35 - 0.36 = -0.01$。
+
+$g_1 = -400\times0.6\times(-0.01) - 2\times0.4 = 2.4 - 0.8 = 1.6$，$g_2 = 200\times(-0.01) = -2$。
+
+$\mathbf{g}_k = (1.6, -2)^\top$，$\|\mathbf{g}_k\|^2 = 2.56 + 4 = 6.56$。
+
+**Fletcher-Reeves**：$\beta_k^{\text{FR}} = 6.56/221 \approx 0.0297$。
+
+**Polak-Ribière**：$\mathbf{y}_{k-1} = \mathbf{g}_k - \mathbf{g}_{k-1} = (12.6, -12)^\top$。
+
+$\beta_k^{\text{PR}} = \mathbf{g}_k^\top\mathbf{y}_{k-1}/\|\mathbf{g}_{k-1}\|^2 = [(1.6)(12.6)+(-2)(-12)]/221 = (20.16+24)/221 = 44.16/221 \approx 0.200$。
+
+$\beta_k^{\text{PR+}} = \max(0.200, 0) = 0.200$（同 PR，因为 $> 0$）。
+
+**搜索方向**（假设前一步方向 $\mathbf{d}_{k-1}$ 已知，此处用 $-\mathbf{g}_{k-1}$ 近似）：
+
+FR 方向：$\mathbf{d}_k = -(1.6,-2)^\top + 0.030\times(-(-11,10))^\top = (-1.6, 2)^\top + (0.33, -0.30)^\top \approx (-1.27, 1.70)^\top$。
+
+PR+ 方向：$\mathbf{d}_k = (-1.6, 2)^\top + 0.200\times(11,-10)^\top = (-1.6+2.2, 2-2)^\top = (0.6, 0)^\top$。
+
+【观察】PR+ 的 $\beta$ 比 FR 大约 $6\times$，产生的方向差异明显。PR+ 在非二次问题中通常比 FR 更快收敛，因为它更好地利用了梯度的"变化信息"（$\mathbf{y}_{k-1}$）。
+
+### 例 3：Steihaug-CG 遇到负曲率的处理
+
+> **题目**：Hessian-free 框架中，内层 CG 求解 $\mathbf{H}\mathbf{p} = -\mathbf{g}$，其中 $\mathbf{g} = (1, 0)^\top$，信赖域半径 $\Delta = 1$。初始 $\mathbf{z}_0 = \mathbf{0}$，$\mathbf{r}_0 = -\mathbf{g} = (-1,0)^\top$，$\mathbf{d}_0 = (-1,0)^\top$。
+>
+> 若 $\mathbf{H}\mathbf{d}_0 = (-2, 1)^\top$（假设），检查 $\mathbf{d}_0^\top\mathbf{H}\mathbf{d}_0$ 的值，并说明 Steihaug-CG 如何处理负曲率方向。
+
+【解】
+
+$\mathbf{d}_0^\top\mathbf{H}\mathbf{d}_0 = (-1,0)\cdot(-2,1)^\top = 2 > 0$。曲率为正，正常进行 CG。
+
+$\alpha_0 = \|\mathbf{r}_0\|^2/(\mathbf{d}_0^\top\mathbf{H}\mathbf{d}_0) = 1/2 = 0.5$。
+
+$\mathbf{z}_1 = \mathbf{z}_0 + 0.5\mathbf{d}_0 = (-0.5, 0)^\top$，$\|\mathbf{z}_1\| = 0.5 < 1 = \Delta$（未出域）。
+
+现假设在第二步，$\mathbf{d}_1^\top\mathbf{H}\mathbf{d}_1 = -0.5 < 0$（**负曲率！**）。
+
+**Steihaug-CG 的负曲率处理**：遇到 $\mathbf{d}_j^\top\mathbf{H}\mathbf{d}_j \leq 0$ 时，不继续 CG 迭代，而是沿 $\mathbf{d}_j$ 方向从当前点 $\mathbf{z}_j$ 走到信赖域边界：
+
+求 $\tau > 0$ 使 $\|\mathbf{z}_j + \tau\mathbf{d}_j\| = \Delta$，即 $\|\mathbf{z}_j\|^2 + 2\tau\mathbf{z}_j^\top\mathbf{d}_j + \tau^2\|\mathbf{d}_j\|^2 = \Delta^2$。
+
+**理由**：负曲率方向说明二次模型在此方向无界，沿此方向走到域边界能最大化模型下降量（在域约束内），保证满足 Cauchy 点下降量界，维持全局收敛性。
+
+【答案】正曲率时正常 CG，负曲率时直接走到信赖域边界——这是 Steihaug-CG 处理非凸问题的关键保障。
+
+---
+
+## 方法总结与速记卡
+
+### 核心公式一览
+
+| 名称 | 线性 CG | 非线性 CG（FR） | 非线性 CG（PR+） |
+|------|---------|---------------|----------------|
+| 步长 $\alpha_k$ | $\frac{\mathbf{r}_k^\top\mathbf{r}_k}{\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k}$（精确） | Wolfe 线搜索 | Wolfe 线搜索 |
+| 残差/梯度更新 | $\mathbf{r}_{k+1} = \mathbf{r}_k - \alpha_k\mathbf{A}\mathbf{d}_k$ | $\mathbf{g}_{k+1} = \nabla f(\mathbf{x}_{k+1})$ | $\mathbf{g}_{k+1} = \nabla f(\mathbf{x}_{k+1})$ |
+| $\beta_{k+1}$ | $\frac{\|\mathbf{r}_{k+1}\|^2}{\|\mathbf{r}_k\|^2}$ | $\frac{\|\mathbf{g}_{k+1}\|^2}{\|\mathbf{g}_k\|^2}$ | $\max\!\left(\frac{\mathbf{g}_{k+1}^\top\mathbf{y}_k}{\|\mathbf{g}_k\|^2},\, 0\right)$，$\mathbf{y}_k = \mathbf{g}_{k+1}-\mathbf{g}_k$ |
+| 方向更新 | $\mathbf{d}_{k+1} = \mathbf{r}_{k+1} + \beta_{k+1}\mathbf{d}_k$ | $\mathbf{d}_{k+1} = -\mathbf{g}_{k+1} + \beta_{k+1}\mathbf{d}_k$ | $\mathbf{d}_{k+1} = -\mathbf{g}_{k+1} + \beta_{k+1}\mathbf{d}_k$ |
+| 终止条件 | $\|\mathbf{r}_k\| \leq \epsilon$ | $\|\mathbf{g}_k\| \leq \epsilon$ | $\|\mathbf{g}_k\| \leq \epsilon$ |
+| 收敛特性 | $n$ 步精确（SPD） | 全局收敛（强 Wolfe） | 全局收敛，实践更稳定 |
+
+**预处理 CG 的等效变换**：将 $\mathbf{A}\mathbf{x}=\mathbf{b}$ 变换为 $\tilde{\mathbf{A}}\tilde{\mathbf{x}}=\tilde{\mathbf{b}}$，$\tilde{\mathbf{A}}=\mathbf{M}^{-1/2}\mathbf{A}\mathbf{M}^{-1/2}$，新条件数 $\kappa(\tilde{\mathbf{A}}) \ll \kappa(\mathbf{A})$，迭代步数从 $O(\sqrt{\kappa})$ 减少到 $O(\sqrt{\kappa(\tilde{\mathbf{A}})})$。
+
+### 解题套路
+
+**套路 1：线性 CG 手算（小维度）**
+1. $\mathbf{r}_0 = \mathbf{b} - \mathbf{A}\mathbf{x}_0$，$\mathbf{d}_0 = \mathbf{r}_0$
+2. 逐步计算：$\alpha_k \to \mathbf{x}_{k+1} \to \mathbf{r}_{k+1} \to \beta_{k+1} \to \mathbf{d}_{k+1}$
+3. 验证：$\mathbf{r}_i^\top\mathbf{r}_j = 0$（$i \neq j$），$\mathbf{d}_i^\top\mathbf{A}\mathbf{d}_j = 0$（$i \neq j$）
+4. 二维问题必须两步精确收敛（否则计算有误）
+
+**套路 2：收敛步数估计**
+- 公式：步数 $\approx \frac{1}{2}\sqrt{\kappa}\ln(2/\epsilon)$（达到相对误差 $\epsilon$）
+- 与梯度下降对比：GD 需 $\frac{\kappa}{2}\ln(1/\epsilon)$ 步，CG 快 $\sqrt{\kappa}$ 倍
+- 特殊结构：若 $\mathbf{A}$ 只有 $m$ 个不同特征值，CG 最多 $m$ 步精确收敛（与 $n$ 无关）
+
+**套路 3：选择 $\beta_k$ 公式**
+- 线性问题（SPD）：用标准 $\beta_k = \|\mathbf{r}_{k+1}\|^2/\|\mathbf{r}_k\|^2$
+- 非线性、二次型接近：用 FR（全局收敛，性质好但实践较慢）
+- 非线性、一般情形：用 PR+（实践最优，兼顾速度与稳定性）
+- 靠近最优时：考虑周期重启（每 $n$ 步重置 $\mathbf{d}_k = -\mathbf{g}_k$）防止数值误差积累
+
+### 常见错误
+
+1. **线性 CG 用于非 SPD 矩阵**：$\mathbf{A}$ 必须对称正定！对称半正定需预处理或正则化；不对称需用 GMRES/BiCG。
+2. **$\alpha_k$ 公式记混**：线性 CG 精确步长 $\alpha_k = \mathbf{r}_k^\top\mathbf{r}_k / (\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k)$，注意分母是 $\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k$（包含 $\mathbf{A}$），不是 $\mathbf{d}_k^\top\mathbf{d}_k$。
+3. **非线性 CG 忘加"+"约束**：$\beta_k^{\text{PR}}$ 可以为负（当连续步之间方向夹角 $> 90°$ 时），此时负 $\beta$ 意味着"倒退"，取 $\beta_k = \max(\beta_k^{\text{PR}}, 0)$（PR+）可避免该退化。
+4. **Hessian-free 中混淆 $\mathbf{g}_k$ 和 $\mathbf{r}_k$**：在线性问题中 $\mathbf{r}_k = -\nabla f = \mathbf{b} - \mathbf{A}\mathbf{x}_k$；在 HF 优化中，内层 CG 的"残差"是 $\mathbf{b}_{\text{inner}} - \mathbf{H}\mathbf{d}$（$\mathbf{b}_{\text{inner}} = -\nabla f$），与外层梯度是两个不同量。
+
+---
+
+## 自测题（闭卷）
+
+**T1**（A-共轭验证）：设 $\mathbf{A} = \begin{pmatrix}4 & 2 \\ 2 & 3\end{pmatrix}$，$\mathbf{d}_0 = (1, -1)^\top$，$\mathbf{d}_1 = (1, a)^\top$。
+(a) 求使 $\mathbf{d}_0, \mathbf{d}_1$ 关于 $\mathbf{A}$ 共轭的 $a$ 值。
+(b) 验证 $\mathbf{d}_0, \mathbf{d}_1$ 线性无关（无论 $a$ 为多少只要非零共轭就无关）。
+
+**T2**（线性 CG 手算）：求解 $\mathbf{A}\mathbf{x} = \mathbf{b}$，其中 $\mathbf{A} = \begin{pmatrix}4 & 0 \\ 0 & 1\end{pmatrix}$，$\mathbf{b} = (8, 2)^\top$，初始点 $\mathbf{x}_0 = (0, 0)^\top$。
+(a) 运行 CG 的第一步，计算 $\alpha_0$、$\mathbf{x}_1$、$\mathbf{r}_1$、$\beta_1$、$\mathbf{d}_1$。
+(b) 运行第二步，验证 $\mathbf{x}_2 = \mathbf{x}^* = (2, 2)^\top$。
+(c) 验证 $\mathbf{r}_0^\top\mathbf{r}_1 = 0$ 和 $\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_1 = 0$。
+
+**T3**（收敛分析）：条件数 $\kappa = 100$，初始误差 $\|\mathbf{e}_0\|_\mathbf{A} = 1$，目标误差 $\epsilon = 10^{-4}$。
+(a) 梯度下降（最优固定步长）需要多少步？
+(b) 共轭梯度法需要多少步（用上界公式）？
+(c) 若矩阵 $\mathbf{A}$ 只有 3 个不同特征值（$n = 1000$），CG 需要多少步？
+
+**T4**（非线性 CG 的 $\beta$）：设某步 $\mathbf{g}_k = (3, -4)^\top$，$\mathbf{g}_{k-1} = (5, 0)^\top$。
+(a) 计算 $\beta_k^{\text{FR}}$（Fletcher-Reeves）。
+(b) 计算 $\beta_k^{\text{PR}}$（Polak-Ribière）。
+(c) 计算 $\beta_k^{\text{PR+}}$，并说明何时 PR+ 与 PR 不同。
+
+**T5**（AI 关联——Hessian-free 优化）：在 HF 优化中，每次内层 CG 迭代需要一次 Hessian-向量积 $\mathbf{H}\mathbf{v}$。
+(a) 用自动微分实现 $\mathbf{H}\mathbf{v}$ 的思路：设 $h(t) = \nabla f(\boldsymbol{\theta} + t\mathbf{v})$，则 $\mathbf{H}\mathbf{v} = h'(0)$，解释如何用两次反向传播（一次前向+一次反向，再对 $t$ 求导）计算。
+(b) 若 HF 外层做 $T=50$ 步 Newton 迭代，每步内层 CG 做 $k=20$ 步，总需多少次"反向传播等价计算"？与 $T \times k_{\text{SGD}}$ 步纯 SGD 相比，HF 优势体现在哪里？
+(c) 截断 CG 精度不足时，HF 的收敛阶从二次退化为什么？Eisenstat-Walker 准则如何自动平衡精度与效率？
+
+---
+
+## 拓展阅读与参考
+
+**经典教材**：
+- Nocedal & Wright, *Numerical Optimization* (2nd ed., 2006)，第 5 章（共轭梯度法）和第 7 章（大规模无约束优化）是最权威参考。
+- Trefethen & Bau, *Numerical Linear Algebra* (1997)，第 VI 部分详细分析了 CG 作为 Krylov 子空间方法的理论基础，包括 Chebyshev 多项式与收敛界的精确推导。
+- Hestenes & Stiefel, "Methods of Conjugate Gradients for Solving Linear Systems" (1952)，CG 的原始论文，奠定了现代迭代线性代数的基础。
+
+**关键论文**：
+- Fletcher & Reeves (1964)：FR 公式，将 CG 推广到非线性优化。
+- Polak & Ribière (1969)：PR 公式，实践中比 FR 更优。
+- Martens (2010)，"Deep learning via Hessian-free optimization"：HF 优化在深度学习中的开创性工作。
+- Schulman et al. (2015)，"Trust Region Policy Optimization"：将 CG（内层）与信赖域（外层）结合于强化学习。
+- Martens & Grosse (2015)，"Optimizing Neural Networks with Kronecker-factored Approximate Curvature"：K-FAC，使二阶优化在大规模神经网络中实用。
+
+**实现参考**：
+- `torch.optim.LBFGS`：带 Wolfe 线搜索的拟牛顿法（CG 精神的近亲）。
+- `scipy.sparse.linalg.cg`：标准线性 CG 实现，支持预处理。
+- OpenAI 的 TRPO 实现（OpenAI Baselines）：展示了 CG 在策略梯度中的应用。
+- `backpack`（PyTorch 扩展）：高效计算 Hessian-向量积，为 HF 优化提供基础设施。
+
+## 答案提示
+
+**T1**：(a) $\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_1 = (1,-1)\begin{pmatrix}4&2\\2&3\end{pmatrix}\begin{pmatrix}1\\a\end{pmatrix} = (2,-1)(1,a)^\top = 2 - a = 0$，故 $a = 2$。(b) 若 $c_0\mathbf{d}_0 + c_1\mathbf{d}_1 = \mathbf{0}$：用 $\mathbf{d}_0^\top\mathbf{A}$ 左乘得 $c_0\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_0 = 0$，由 $\mathbf{A}\succ0$，$\mathbf{d}_0\neq\mathbf{0}$ 得 $c_0 = 0$，同理 $c_1 = 0$。✓
+
+**T2**：(a) $\mathbf{r}_0 = (8,2)^\top$，$\mathbf{d}_0 = (8,2)^\top$；$\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_0 = 256+4 = 260$；$\alpha_0 = 68/260 = 17/65$；$\mathbf{x}_1 = (8\times17/65, 2\times17/65)^\top = (136/65, 34/65)^\top$；$\mathbf{r}_1 = (8,2)^\top - \frac{17}{65}(32,2)^\top = (8 - 544/65, 2 - 34/65)^\top = (-24/65, 96/65)^\top$；$\beta_1 = \|\mathbf{r}_1\|^2/\|\mathbf{r}_0\|^2 = (576+9216)/(4225\cdot65^{-2}) \cdot (1/68) = \frac{(24^2+96^2)/65^2}{68} = \frac{9792}{4225\times68}/65^2$…（手算繁，核心是最终 $\mathbf{x}_2 = (2,2)^\top$）。(b) 二维 SPD 系统两步精确终止。(c) $\mathbf{r}_0^\top\mathbf{r}_1 = 8\times(-24/65)+2\times(96/65) = (-192+192)/65 = 0$。✓
+
+**T3**：(a) GD 收敛因子 $\rho = (\kappa-1)/(\kappa+1) = 99/101$，步数 $= \log_\rho(10^{-4}/1)/2 \approx \frac{4\ln 10}{2(1-\rho)} = \frac{4\ln10}{2\times2/101} \approx 463$ 步。(b) CG 收敛因子 $r = (\sqrt{\kappa}-1)/(\sqrt{\kappa}+1) = 9/11$，步数 $\approx \frac{4\ln10}{\ln(11/9)} \approx \frac{9.21}{0.200} \approx 46$ 步（快约 $\sqrt{\kappa} = 10$ 倍）。(c) **3 步**（只有 3 个不同特征值，CG 恰好 3 步精确终止，与 $n=1000$ 无关）。
+
+**T4**：(a) $\beta_k^{\text{FR}} = \|\mathbf{g}_k\|^2/\|\mathbf{g}_{k-1}\|^2 = (9+16)/25 = 1$。(b) $\mathbf{y}_{k-1} = \mathbf{g}_k - \mathbf{g}_{k-1} = (3-5,-4-0)^\top = (-2,-4)^\top$；$\beta_k^{\text{PR}} = \mathbf{g}_k^\top\mathbf{y}_{k-1}/\|\mathbf{g}_{k-1}\|^2 = [(3)(-2)+(-4)(-4)]/25 = (-6+16)/25 = 10/25 = 0.4$。(c) $\beta_k^{\text{PR+}} = \max(0.4, 0) = 0.4 = \beta_k^{\text{PR}}$（此时 PR+ 与 PR 相同，因为 $\beta^{\text{PR}} > 0$）。PR+ 与 PR 不同仅当 $\beta_k^{\text{PR}} < 0$ 时，即 $\mathbf{g}_k^\top(\mathbf{g}_k - \mathbf{g}_{k-1}) < 0$，意味着新梯度与梯度差异向量夹角大于 $90°$（连续步方向强烈反转），此时 PR+ 重置方向为纯最速下降。
+
+**T5**：(a) $\mathbf{H}\mathbf{v} = \frac{d}{dt}\nabla f(\boldsymbol{\theta}+t\mathbf{v})\big|_{t=0}$。用 `torch.autograd.grad`：先 `loss = f(theta)`，`g = autograd.grad(loss, theta, create_graph=True)` 得到 $\nabla f$；再 `Hv = autograd.grad(sum(g*v), theta)` 得到 $\mathbf{H}\mathbf{v}$，总计两次图遍历（前向+反向+反向），存储只需 $O(n)$。(b) $T \times k = 50 \times 20 = 1000$ 次 Hv 操作，每次 $\approx 2$ 次反向传播等价计算，总计 $\approx 2000$ 次。纯 SGD 每步 1 次，若 SGD 需 $10^5$ 步才能达到同等精度，则 HF 节省约 $50\times$ 的计算量，但在随机梯度场景（mini-batch）效果有限。(c) 截断精度不足时，Newton 方向误差 $\|\mathbf{d}_k - \mathbf{d}_k^{\text{exact}}\|$ 主导，收敛阶从二次退化为**超线性**（甚至线性）。Eisenstat-Walker 准则 $\epsilon_r^{(k)} = \min(0.5, \sqrt{\|\mathbf{g}_k\|})$：梯度大时允许粗略 CG（节省计算），梯度小时要求精确 CG（保留二次收敛），自动匹配外层收敛阶段的精度需求。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习）** + **融合补充（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合版前置 | 建立直觉，先看"之字形"动机再看推导 |
+| 学习目标 + 15.1–15.5 严格正文 | 原版 | 完整推导：A-共轭 / 线性 CG / 非线性 CG / PCG / 截断 CG |
+| 本章小结 | 原版 | 公式速查表，闭卷前复盘 |
+| 深度学习应用 + PyTorch 代码 | 原版 | HF 优化、K-FAC、TRPO 原理 + 实现 |
+| 练习题 15.1–15.5 | 原版 | 系统巩固，从 A-共轭到 HF 优化 |
+| **抽象成方法** | 融合补充 | 10 个核心公式速查 + 5 步 CG 流程，套路固化 |
+| **方法变形** | 融合补充 | 4 类变形（线性→非线性 / $\beta_k$ 选择 / PCG / 截断 CG）|
+| **思考路标** | 融合补充 | 12 条条件反射，覆盖线性 / 非线性 / 预处理 / HF |
+| 易错点清单 | 融合补充 | 6 条高频陷阱，SPD 要求 / 重启必要性 / Gauss-Newton |
+| 方法链接 | 融合补充 | CG 在线性代数 / 压缩感知 / HF 优化 / TRPO 中的角色 |
+| 典型应用例题 3 例 | 融合补充 | 线性 CG 手算 / FR vs PR / 预处理收益 |
+| 自测题 5 题 + 答案 | 融合补充 | 闭卷验收，T1–T5 覆盖全章核心 |
+| **融合版说明** | 融合补充 | 本表格，帮助读者定位每段来源与目的 |
+
+**推荐学习节奏**：速记（5 min）→ 引入题（10 min）→ 正文（70 min）→ 小结 + 抽象成方法（10 min）→ 思考路标（快速扫描）→ 典型例题（20 min）→ 自测（闭卷 15 min）。

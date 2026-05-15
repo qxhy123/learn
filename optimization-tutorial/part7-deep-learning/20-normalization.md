@@ -1,4 +1,41 @@
-# 第20章 归一化技术 (Normalization Techniques)
+# 第20章 归一化技术（融合版）
+
+> **难度**：★★★☆☆
+> **前置知识**：多层感知机、反向传播、第19章损失曲面
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 20.1–20.5 / 深度学习应用 / 练习题）+ 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **BN 前向**：$\mu \leftarrow$ batch 均值；$\sigma^2 \leftarrow$ batch 方差；$\hat{x} = (x-\mu)/\sqrt{\sigma^2+\epsilon}$；$y = \gamma\hat{x}+\beta$（可学习 $\gamma,\beta$）。训练用 batch 统计；推断用 EMA 统计。
+> **LN**：在**特征维度**归一化（同一样本，不同特征），不依赖 batch size，适合 Transformer/RNN。
+> **GN**：将通道分为 $G$ 组，组内归一化；$G=1$ → LN，$G=C$ → IN；不依赖 batch size。
+> **优化效果**：BN 平滑损失曲面（Lipschitz 梯度更紧），改善 Hessian 条件数，允许更大学习率，隐式正则化（batch 统计噪声 $\sim 1/\sqrt{m}$）。
+> **训练/推断差异**：BN 是深度学习中最常见的训练/推断行为不一致来源——必须调用 `model.train()` / `model.eval()`。
+
+---
+
+## 引入：一道"BN 推断阶段"反直觉题
+
+> **题目**：一个训练好的带 BatchNorm 的分类网络，在**推断时**用单样本（batch_size = 1）输入，发现结果和批量推断不一样。为什么？如何解决？
+
+请先停下来想一想：BN 在训练时用当前 mini-batch 的均值和方差归一化，而推断时如果仍用 batch 统计量，batch_size = 1 时均值 = 自身值，方差 = 0（除零错误或归一化后 $\hat{x} = 0$），完全失去意义。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "BN 前向传播分四步：算 batch 均值 → 算 batch 方差 → 标准化 → 仿射变换。训练时用 **batch 内统计量**，每个 mini-batch 的均值方差都不同，这构成了隐式随机性（正则化效果）。
+>
+> 但推断时问题来了：测试样本一个个进来（batch_size = 1），此时 batch 均值就是该样本本身，方差 = 0，$\hat{x}_i = (x_i - x_i)/\sqrt{0 + \epsilon} \approx 0$，输出恒为 $\beta$——完全丧失预测能力。
+>
+> **正确做法**：训练阶段同时维护**指数移动平均（EMA）统计量**：
+> $\mu_\text{running} \leftarrow 0.9 \mu_\text{running} + 0.1 \mu_\mathcal{B}$，方差同理。
+> 推断时使用 $\mu_\text{running}$ 和 $\sigma^2_\text{running}$，而非 batch 统计量。
+>
+> PyTorch 中，`model.train()` 切换到 batch 统计模式，`model.eval()` 切换到运行统计模式。**这是最容易踩的工程坑之一**——漏写 `.eval()` 会让推断结果随机化，表现为"模型推断性能不稳定"的玄学 bug。
+>
+> **延伸思考**：若推断时 batch_size 足够大（如 256），batch 统计量接近全局统计量，训练/推断差异可以忽略。但单样本场景（流式推断、在线服务）必须用 EMA。这也是 LayerNorm 受欢迎的原因之一——LN 在特征维度归一化，不依赖 batch size，训练和推断行为完全一致。"
+
+---
 
 ## 学习目标
 
@@ -1160,3 +1197,205 @@ if __name__ == '__main__':
 | GN (G=32) | 34.0 | 34.1 |
 
 GN 在小 batch 下显著优于 BN，且性能对 batch size 不敏感。
+
+---
+
+## 几何示意
+
+### 图 20-1：BatchNorm 平滑损失景观
+
+![BatchNorm 平滑损失景观对比：无 BN（高曲率）vs 有 BN（平滑曲面）](../figures/svg/opt-p7-20-1.svg)
+
+---
+
+## 抽象成方法（套路总结）
+
+### 4 大归一化方法速查
+
+| 方法 | 归一化维度 | batch 依赖 | 可学习参数 | 适用场景 |
+|---|---|---|---|---|
+| **BN** | 跨 $N$（batch）维 | 是 | $\gamma_c, \beta_c$（每通道） | CNN 图像分类；大 batch |
+| **LN** | 跨 $C,H,W$ 维（特征内） | 否 | $\gamma_j, \beta_j$（每特征） | Transformer, RNN, 小 batch |
+| **IN** | 跨 $H,W$ 维（单通道单样本） | 否 | 可选 | 风格迁移 |
+| **GN** | 组内 $C/G$ 通道 + $H,W$ | 否 | $\gamma_c, \beta_c$ | 检测/分割（小 batch） |
+
+### BN 前向 4 步
+
+1. $\mu_\mathcal{B} = \frac{1}{m}\sum_{i=1}^m x_i$（batch 均值）
+2. $\sigma_\mathcal{B}^2 = \frac{1}{m}\sum_{i=1}^m (x_i - \mu_\mathcal{B})^2$（batch 方差，有偏）
+3. $\hat{x}_i = (x_i - \mu_\mathcal{B}) / \sqrt{\sigma_\mathcal{B}^2 + \epsilon}$（标准化）
+4. $y_i = \gamma\hat{x}_i + \beta$（仿射，$\gamma,\beta$ 可学习）
+
+### 推断时 BN 融合
+
+$$y = \underbrace{\frac{\gamma}{\sqrt{\sigma^2_\text{run}+\epsilon}}}_{\mathbf{W}'} \cdot x + \underbrace{\beta - \frac{\gamma\mu_\text{run}}{\sqrt{\sigma^2_\text{run}+\epsilon}}}_{\mathbf{b}'}$$
+
+推断时 BN + 前一线性层可合并为单个线性层 $\mathbf{W}', \mathbf{b}'$，消除额外计算。
+
+---
+
+## 方法变形
+
+### 变形 1：Pre-LN vs Post-LN
+
+**Post-LN**（原始 Transformer）：$\mathbf{x}_{l+1} = \text{LN}(\mathbf{x}_l + \text{Sub}(\mathbf{x}_l))$，梯度需经过 LN，训练需 warmup。
+**Pre-LN**（现代 LLM 标配）：$\mathbf{x}_{l+1} = \mathbf{x}_l + \text{Sub}(\text{LN}(\mathbf{x}_l))$，主路径梯度为 1（残差直传），无需 warmup，训练更稳。**选 Pre-LN**（GPT-2、LLaMA 等均采用）。
+
+### 变形 2：RMSNorm（去中心化）
+
+$\text{RMSNorm}(x_j) = x_j / \text{RMS}(\mathbf{x}) \cdot \gamma_j$，省去均值中心化步骤，节省约 7–15% 计算，性能相当。LLaMA、Mistral、Gemma 均采用 RMSNorm。
+
+### 变形 3：BN 的 batch size 边界
+
+实验经验：BN 在 batch size $\geq 32$ 时统计量估计可靠；batch size $\leq 8$ 时统计量噪声太大（方差估计偏差 $\sim C/\sqrt{N}$），建议换用 GN 或 LN。典型阈值：检测任务 batch per GPU = 2，必须用 GN。
+
+### 变形 4：权重归一化（WN）
+
+WN 将权重 $\mathbf{w}$ 分解为 $g / \|\mathbf{v}\| \cdot \mathbf{v}$（幅度 $g$ + 方向 $\mathbf{v}$），不涉及激活统计量，适合强化学习（RL）/ GAN 等对 batch 依赖敏感的场景；但不提供正则化效果，通常配合 mean-only BN 使用。
+
+---
+
+## 本章小结补充
+
+**选择归一化方式的决策树**：
+
+```
+任务是 NLP / Transformer / 可变长序列？
+  → 是：选 LayerNorm（或 RMSNorm）
+  → 否：batch size >= 32 且是 CNN 图像分类？
+           → 是：选 BatchNorm
+           → 否：batch size 小（< 16）或目标检测？
+                    → 是：选 GroupNorm（G=32 通常最优）
+                    → 否（风格迁移/图像生成）：选 InstanceNorm
+```
+
+**BN 的三大作用（Santurkar et al., 2018 重新解读）**：
+1. 平滑损失曲面（Lipschitz 梯度更紧）：允许更大学习率
+2. 改善 Hessian 条件数：加速收敛
+3. 隐式正则化（batch 统计噪声）：通常可以减少或去掉 Dropout
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"BN 训练/推断差异" → 训练用 batch 统计，推断用 EMA 统计；`model.eval()` 是必须的
+2. 看到"BN + 小 batch（batch ≤ 8）" → 切换到 GroupNorm 或 LayerNorm
+3. 看到"Transformer / BERT / GPT" → LayerNorm（或 RMSNorm）；Pre-LN 优于 Post-LN
+4. 看到"BN 反向传播" → 三条路径：直接路径 + 通过方差路径 + 通过均值路径
+5. 看到"推断速度优化" → BN 可融合进前一线性层，消除额外计算
+6. 看到"GN 等价情形" → $G=1$：LN；$G=C$：IN；中间的 $G$ 是折中
+7. 看到"梯度消失/爆炸" → 有无 BN 区别：无 BN 各层梯度范数差异指数级，有 BN 则平稳
+8. 看到"内部协变量偏移（ICS）" → BN 的原始动机，但 Santurkar (2018) 指出平滑曲面才是主效应
+9. 看到"$\gamma = 1, \beta = 0$ 初始化" → BN 初始时相当于纯标准化（不改变分布），训练中学习最佳仿射
+10. 看到"权重归一化 vs BN" → WN 作用在权重，BN 作用在激活；WN 无批统计依赖
+
+---
+
+## 易错点
+
+1. **推断时忘记 `.eval()`**：BN 层在 `.train()` 模式下用 batch 统计，单样本推断时方差近零导致输出全为 $\beta$。每次写推断循环都要检查：`model.eval()` + `torch.no_grad()`。
+
+2. **BN 有偏 vs 无偏方差**：BN 使用有偏方差（除以 $m$，非 $m-1$）与原论文一致；PyTorch `BatchNorm` 默认如此。若自己实现用了 `unbiased=True`（除以 $m-1$），会有数值差异。
+
+3. **LN 的 normalized_shape**：`nn.LayerNorm(512)` 只在最后一维归一化，形状需与输入最后几维匹配。对 `(N, T, d)` 输入用 `LayerNorm(d)`；若用 `LayerNorm((T, d))`，则同时在 $T$ 和 $d$ 上归一化（结果不同）。
+
+4. **GN 通道整除要求**：`GroupNorm(G, C)` 要求 $C \% G = 0$；若不满足直接报 `AssertionError`。常见坑：通道数为奇数（如 $C=7$）时只能用 $G=1$ 或 $G=7$。
+
+5. **BN 融合时 $\epsilon$ 要一致**：推断时融合 BN 进线性层需用训练时相同的 $\epsilon$（默认 `1e-5`）；用不同值会导致融合前后结果不一致。
+
+---
+
+## 典型应用例题
+
+### 例 1：手算 BN 前向
+
+> **题目**：batch = $(1, 3, 5)$（$m=3$，单特征），$\gamma = 2, \beta = -1$，$\epsilon = 0$。
+> 求 BN 输出 $y_1, y_2, y_3$。
+
+【解】
+$\mu = (1+3+5)/3 = 3$。
+$\sigma^2 = [(1-3)^2+(3-3)^2+(5-3)^2]/3 = (4+0+4)/3 = 8/3$，$\sigma = \sqrt{8/3} \approx 1.633$。
+$\hat{x}_1 = (1-3)/1.633 \approx -1.225$，$\hat{x}_2 = 0$，$\hat{x}_3 \approx 1.225$。
+$y_i = 2\hat{x}_i - 1$：$y_1 \approx -3.449$，$y_2 = -1$，$y_3 \approx 1.449$。
+
+【答案】$\boxed{y_1 \approx -3.45,\; y_2 = -1,\; y_3 \approx 1.45}$。
+
+### 例 2：BN 与 LN 归一化维度辨析
+
+> **题目**：Transformer 输入 $(N=4, T=8, d=512)$。(1) BN 对哪个维度归一化，每次用多少个样本估计统计量？(2) LN 对哪个维度归一化，每次用多少个值？
+
+【解】
+(1) BN 跨 $(N, T)$ 维：每个特征维度用 $N \times T = 32$ 个值估计均值/方差。序列不等长时，长度不同批次的统计量混乱 → **不适合 Transformer**。
+(2) LN 在 $(d)$ 维：每个 $(n, t)$ 位置独立，用 $d = 512$ 个值，不依赖 batch / 序列长度 → **适合 Transformer**。
+
+【答案】BN 用 32 样本/特征；LN 用 512 个特征值/位置。
+
+### 例 3：GroupNorm 等价条件
+
+> **题目**：输入 $(N=2, C=8, H=4, W=4)$，GN 的 $G$ 分别取 $1, 4, 8$。
+> (1) $G=1$：每次统计量用多少值？等价于什么？
+> (2) $G=4$：每次统计量用多少值？
+> (3) $G=8$：每次统计量用多少值？等价于什么？
+
+【解】
+(1) $G=1$：每个样本所有通道 $C \times H \times W = 8\times 16 = 128$ 值；等价于 **LayerNorm**（在 $C,H,W$ 上）。
+(2) $G=4$：每组 $C/G = 2$ 通道，每样本每组 $2 \times 16 = 32$ 值。
+(3) $G=8=C$：每组 1 通道，每样本每通道 $H \times W = 16$ 值；等价于 **InstanceNorm**（无 batch 依赖）。
+
+【答案】$G=1$: LN（128值）；$G=4$: GN（32值/组）；$G=8$: IN（16值/通道）。
+
+---
+
+## 自测题
+
+**自测 1**　为什么 BN 在训练时有正则化效果，推断时没有？
+
+> 提示：训练时 $\mu_\mathcal{B}$ 是总体均值的有噪声估计（$\sim \mathcal{O}(1/\sqrt{m})$ 噪声），等效于对激活注入随机扰动，类似 Dropout；推断时使用确定的 EMA 统计量 $\mu_\text{run}$，无随机性，正则化效果消失。
+
+**自测 2**　一个 4 层 MLP 无归一化，输入标准正态，ReLU 激活。随着层数加深，激活值分布会如何变化？BN 如何解决？
+
+> 提示：ReLU 截断负值，每层激活均值逐渐偏移（大于 0），方差也可能爆炸或消失（取决于初始化）。BN 在每层激活后标准化，强制分布回到均值 0、方差 1 附近，从根本上阻止分布漂移。
+
+**自测 3**　Pre-LN 比 Post-LN 更稳定的数学原因是什么？
+
+> 提示：Post-LN 中，反传梯度需经过 LN 操作（改变梯度量级），深层梯度可能过小（训练初期）。Pre-LN 中，残差路径 $\mathbf{x}_{l+1} = \mathbf{x}_l + \text{Sub}(\text{LN}(\mathbf{x}_l))$ 的梯度对 $\mathbf{x}_l$ 有 +1 项（Identity 直传），保证梯度下限为 1，不会消失。
+
+**自测 4**　BN 的反向传播为何有三条路径？
+
+> 提示：前向传播中 $y_i = \gamma(x_i - \mu)/\sigma + \beta$，损失通过三条路径传回 $x_i$：(i) 直接 $x_i \to \hat{x}_i \to y_i$；(ii) $x_i \to \mu \to \hat{x}_i$；(iii) $x_i \to \sigma^2 \to \hat{x}_i$。三条路径的梯度叠加。最终对均匀上游梯度（全为 1）时，三路之和恰好为零（BN 对常数偏移不敏感，见练习 20.1）。
+
+**自测 5**　在线推断（streaming inference，每次只有 1 个样本）应选哪种归一化方法？为什么？
+
+> 提示：BN 无法使用（单样本方差为零）；LayerNorm 在特征维度归一化，单样本即可正常运行，训练和推断行为一致；GN 也可以（组内仍有多个值）。结论：在线推断优先选 **LayerNorm**（Transformer 天然如此）或 GN，避免 BN。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> BN：batch 维度归一化，训练用 batch 统计，推断用 EMA，$\gamma\beta$ 可学习。
+> LN：特征维度归一化，不依赖 batch，Transformer 标配。
+> GN：组内归一化，$G=1$↔LN，$G=C$↔IN，检测任务选 GN。
+> 优化效果：平滑损失曲面 + 改善条件数 + 允许大 LR + 隐式正则。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 1 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习题）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 工程 bug 预防 |
+| 学习目标 + 20.1–20.5 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化 |
+| 深度学习应用 + PyTorch 从零实现 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 本章小结补充（决策树） | 融合 | 实用选型指南 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

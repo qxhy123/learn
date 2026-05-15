@@ -1,8 +1,45 @@
-# 第7章：等式约束优化
+# 第7章：等式约束优化（融合版）
 
 > **前置章节**：第2章（多元微分学）、第3章（凸集与凸函数）、第4章（最优性条件）
 >
 > **难度**：★★★★☆
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **等式约束的本质**：在约束曲线 $g(\mathbf{x})=0$ 上极小化 $f$，最优解处 $\nabla f$ 与 $\nabla g$ 必须**平行**（共线）——否则沿约束切方向走一步还能降低 $f$。
+> **Lagrange 函数**：$L(\mathbf{x},\lambda) = f(\mathbf{x}) + \lambda g(\mathbf{x})$；驻点条件 $\nabla f = -\lambda \nabla g$，即 $\nabla_\mathbf{x} L = 0$。
+> **乘子的经济学意义**：$\lambda^* = -\partial p^*/\partial c$，约束右端松弛一单位，目标值改变 $|\lambda^*|$（影子价格）。
+> **LICQ**：约束梯度 $\nabla h_i(\mathbf{x}^*)$ 线性无关 $\Leftrightarrow$ 乘子唯一存在。
+> **AI 关联**：深度学习软约束损失 $= f + \beta \|h(\theta)\|^2$，当 $\beta \to \infty$ 时逼近硬等式约束的 Lagrange 解。
+
+---
+
+## 引入：圆上距离最远点
+
+> **题目**：在圆 $x^2 + y^2 = 1$ 上，哪一点离直线 $x + y = 0$ 的（有向）距离 $f(x,y) = x + y$ 最大？
+
+请先停下来想一想：圆上的点有无穷多，直接枚举不可行。**目标函数的等高线**是直线 $x+y=c$；约束是单位圆。最大化 $c$ 等于问：等高线族中最高的那条与单位圆的交点在哪里？
+
+直觉答案：当等高线恰好与圆**相切**时，$c$ 达到最大——切点就是最优解。这正是拉格朗日乘数法的几何灵魂。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "我认出了这是等式约束问题：目标 $f = x+y$，约束 $g = x^2+y^2-1=0$。
+>
+> **第一步：写 Lagrange 函数**。$L = (x+y) + \lambda(x^2+y^2-1)$。
+>
+> **第二步：令偏导为零**。$\partial L/\partial x = 1 + 2\lambda x = 0$，$\partial L/\partial y = 1 + 2\lambda y = 0$。
+> 两式相除：$x = y$（乘子消掉了！）。
+>
+> **第三步：回代约束**。$x^2 + x^2 = 1 \Rightarrow x = \pm 1/\sqrt{2}$。
+> 得两个候选点：$(\frac{1}{\sqrt{2}}, \frac{1}{\sqrt{2}})$ 对应 $f = \sqrt{2}$；$(-\frac{1}{\sqrt{2}}, -\frac{1}{\sqrt{2}})$ 对应 $f = -\sqrt{2}$。
+>
+> **第四步：判断极大 / 极小**。最大值 $f^* = \sqrt{2}$，最小值 $-\sqrt{2}$。
+>
+> **几何验证**：等高线 $x+y = \sqrt{2}$ 与单位圆恰好相切于 $(1/\sqrt{2}, 1/\sqrt{2})$——梯度 $\nabla f = (1,1)$ 与 $\nabla g = (2x,2y)|_{(1/\sqrt{2}, 1/\sqrt{2})} = (\sqrt{2}, \sqrt{2})$ 方向相同，互相平行。✓"
 
 ---
 
@@ -1119,3 +1156,186 @@ $$\frac{dp^*}{d\epsilon} = \frac{\partial L(\mathbf{x}^*(\epsilon), \lambda^*(\e
 ---
 
 *本章建立了等式约束优化的完整理论框架。下一章将把结果推广至不等式约束，引入 KKT 条件的完整形式和互补松弛条件。*
+
+---
+
+## 几何示意
+
+### 图 7-1：Lagrange 乘子几何
+
+![梯度共线 $\nabla f = \lambda\nabla g$](../figures/svg/opt-p3-07-1.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 拉格朗日乘数法标准 4 步
+
+1. **写 Lagrange 函数**：$L(\mathbf{x}, \boldsymbol{\lambda}) = f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})$
+2. **令 $\nabla_\mathbf{x} L = 0$**：得 $\nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0}$（$n$ 个方程）
+3. **加上约束 $\mathbf{h}(\mathbf{x}) = \mathbf{0}$**：共 $n + m$ 个方程，解 $n + m$ 个未知数 $(\mathbf{x}, \boldsymbol{\lambda})$
+4. **筛选候选点**：代入比较函数值，必要时用二阶条件判断极小 / 极大
+
+### 核心公式速查
+
+| 名称 | 公式 | 关键点 |
+|---|---|---|
+| **Lagrange 函数** | $L = f + \boldsymbol{\lambda}^\top \mathbf{h}$ | 乘子 $\boldsymbol{\lambda} \in \mathbb{R}^m$ 无符号限制 |
+| **一阶必要条件** | $\nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0},\ \mathbf{h} = \mathbf{0}$ | 需 LICQ（约束梯度线性无关） |
+| **梯度平行条件** | $\nabla f \parallel \nabla g$（单约束） | 等高线与约束曲线相切 |
+| **影子价格** | $\lambda^* = -\partial p^*/\partial c$ | 约束右端松弛的边际收益 |
+| **二阶充分条件** | $\mathbf{Z}^\top \nabla^2_{\mathbf{xx}} L\, \mathbf{Z} \succ 0$ | $\mathbf{Z}$ 为约束切空间的基矩阵 |
+
+---
+
+## 方法变形
+
+### 变形 1：多个等式约束（$m > 1$）
+
+每个约束引入一个乘子 $\lambda_i$。$\nabla_\mathbf{x} L = \mathbf{0}$ 给出 $n$ 个方程，$m$ 个约束再给出 $m$ 个方程，共 $n+m$ 个方程解 $n+m$ 个未知数。**关键**：LICQ 要求所有约束梯度线性无关，否则乘子不唯一。
+
+### 变形 2：含参数的约束（求极值关于参数的敏感性）
+
+$\lambda^* = -dp^*/dc$（影子价格）：约束 $g(\mathbf{x}) = c$ 中，$c$ 增大一单位（约束松弛），最优目标值变化 $-\lambda^*$。可用于快速估计约束扰动的影响，无需重解优化问题。
+
+### 变形 3：深度学习中的软约束
+
+硬约束 $h(\theta) = 0$ 难以直接优化；常用**拉格朗日松弛**：$\min_\theta f(\theta) + \beta \|h(\theta)\|^2$。当惩罚参数 $\beta \to \infty$ 时，解趋向满足约束的 Lagrange 解。实践中取有限 $\beta$，称为软约束惩罚法（Penalty Method）。
+
+### 变形 4：消元与 Lagrange 的选择
+
+- **消元法**：适合约束简单（可显式解出变量）的低维问题。如 $x + y = 1$ 直接令 $y = 1-x$。
+- **Lagrange 法**：适合约束复杂、对称性强的问题；高维时优势更明显。两者在可行点处给出相同结果。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"在曲线/曲面上极值" → 等式约束，立即写 Lagrange 函数
+2. 看到 $\nabla f \parallel \nabla g$ → 梯度共线条件，即 $\nabla f = -\lambda \nabla g$（单约束）
+3. 看到"驻点方程无解 / 矛盾" → 检查 LICQ，可能约束退化（如两约束梯度平行）
+4. 看到乘子 $\lambda^*$ → 记住它是**影子价格** $-\partial p^*/\partial c$；正负号看是极小还是极大
+5. 看到"二阶条件" → 投影到约束切空间 $\ker(\mathbf{J}_h)$，检验约束 Hessian 正定性
+6. 看到多个候选点 → 比较 $f$ 值，结合边界情况（有界闭集上极值存在定理）
+7. 看到"预算约束极大化效用" → 标准消费者问题，$\lambda^* = $ 货币的边际效用
+8. 看到正交约束 $\mathbf{W}^\top \mathbf{W} = \mathbf{I}$ → 矩阵 Lagrange 乘子，梯度变为矩阵方程
+9. 看到"软约束" $\beta h^2$ → 拉格朗日松弛，$\beta$ 控制约束的"硬度"
+10. 看到等式约束下凸目标 → 极小值唯一，Lagrange 条件直接给出全局最优
+
+---
+
+## 易错点
+
+1. **忘记 LICQ**：直接写一阶条件而不验证约束梯度是否线性无关。若 LICQ 不满足，乘子可能不存在或不唯一，Lagrange 条件失效。
+2. **方程数目不对**：$n$ 个变量 $+$ $m$ 个约束 $=$ $n+m$ 个未知数，必须有 $n+m$ 个方程（$n$ 个驻点方程 $+$ $m$ 个约束方程）；少写一个方程就无法确定全部未知数。
+3. **混淆极大与极小**：Lagrange 一阶条件给出**候选点**（驻点），不能直接判断极大 / 极小。需用二阶条件或比较函数值。
+4. **乘子符号理解错误**：等式约束乘子 $\lambda$ 无符号限制（可正可负），与不等式约束乘子 $\mu \geq 0$ 截然不同。混用会在 KKT 问题中犯致命错误。
+5. **影子价格符号**：$\lambda^* = -\partial p^*/\partial c$。若 $\lambda^* > 0$，松弛约束（增大 $c$）会让极小值减小（变好）；若 $\lambda^* < 0$，则反之。别把绝对值当成方向。
+
+---
+
+## 典型应用例题
+
+### 例 1：二元函数在椭圆上的极值
+
+> **题目**：求 $f(x,y) = xy$ 在约束 $x^2/4 + y^2 = 1$ 上的最大值和最小值。
+
+【思路】等式约束，写 Lagrange 函数，令偏导为零，联立约束。
+
+【解】
+$L = xy + \lambda(x^2/4 + y^2 - 1)$。
+
+$\partial L/\partial x = y + \lambda x/2 = 0 \Rightarrow \lambda = -2y/x$。
+$\partial L/\partial y = x + 2\lambda y = 0 \Rightarrow \lambda = -x/(2y)$。
+
+两式联立：$-2y/x = -x/(2y) \Rightarrow 4y^2 = x^2 \Rightarrow x = \pm 2y$。
+
+代入约束：$4y^2/4 + y^2 = 2y^2 = 1 \Rightarrow y = \pm 1/\sqrt{2}$，$x = \pm \sqrt{2}$。
+
+四个候选点：$(\sqrt{2}, 1/\sqrt{2})$，$(-\sqrt{2}, -1/\sqrt{2})$ 对应 $f = 1$；$(\sqrt{2}, -1/\sqrt{2})$，$(-\sqrt{2}, 1/\sqrt{2})$ 对应 $f = -1$。
+
+【答案】$\boxed{f_{\max} = 1,\ f_{\min} = -1}$。
+
+### 例 2：三变量球面极值
+
+> **题目**：求 $f(x,y,z) = 2x + 3y - z$ 在约束 $x^2 + y^2 + z^2 = 14$ 上的最大值。
+
+【思路】球面等式约束，Lagrange 4 步法。
+
+【解】
+$L = 2x+3y-z + \lambda(x^2+y^2+z^2-14)$。
+
+$2 + 2\lambda x = 0,\ 3 + 2\lambda y = 0,\ -1 + 2\lambda z = 0$。
+
+解得 $x = -1/\lambda,\ y = -3/(2\lambda),\ z = 1/(2\lambda)$。
+
+代入约束：$1/\lambda^2 + 9/(4\lambda^2) + 1/(4\lambda^2) = 14 \Rightarrow 14/(4\lambda^2) = 14 \Rightarrow \lambda = \pm 1/2$。
+
+$\lambda = -1/2$：$x=2, y=3, z=-1$，$f = 4+9+1 = 14$。
+$\lambda = 1/2$：$f = -14$（最小值）。
+
+【答案】$\boxed{f_{\max} = 14}$（在点 $(2,3,-1)$ 处）。
+
+### 例 3：软约束损失与 Lagrange 的关系（AI 应用）
+
+> **题目**：设深度学习中目标为 $\min_\theta \mathcal{L}(\theta)$ 并希望满足约束 $\|\theta\|^2 = r^2$（权重范数固定）。写出 Lagrange 一阶条件，并说明软约束惩罚 $\mathcal{L}(\theta) + \beta(\|\theta\|^2 - r^2)^2$ 的近似意义。
+
+【解】
+硬约束 Lagrange：$L = \mathcal{L}(\theta) + \lambda(\|\theta\|^2 - r^2)$，一阶条件 $\nabla \mathcal{L}(\theta) + 2\lambda\theta = 0$，即梯度与 $\theta$ 共线（类似 L2 正则化但乘子由约束确定）。
+
+软约束：$\partial/\partial\theta[\mathcal{L} + \beta(\|\theta\|^2 - r^2)^2] = \nabla\mathcal{L} + 4\beta(\|\theta\|^2 - r^2)\theta = 0$。
+
+当解趋于满足约束时 $(\|\theta\|^2 \to r^2)$，令 $\lambda_\beta = 2\beta(\|\theta\|^2 - r^2)$，软约束一阶条件趋向 $\nabla\mathcal{L} + 2\lambda_\beta\theta = 0$，与硬约束乘子条件形式一致。
+
+【答案】软约束通过令 $\beta \to \infty$ 逼近硬约束的 Lagrange 解；实践中取有限 $\beta$ 是硬约束的光滑近似，避免了求解约束方程组的困难。
+
+---
+
+## 自测题
+
+**自测 1**　$f(x,y) = x^2 + y^2$ 在约束 $x + 2y = 5$ 上的最小值。
+
+> 提示：$L = x^2+y^2+\lambda(x+2y-5)$，令 $2x+\lambda=0,\ 2y+2\lambda=0$，解得 $y=2x$，代入约束 $5x=5$，$x=1, y=2$，$f_{\min} = 5$。
+
+**自测 2**　求 Lagrange 乘子 $\lambda^*$ 并解释其经济学含义：$\min x^2 + 2y^2$，约束 $x + y = 3$。
+
+> 提示：$2x = \lambda, 4y = \lambda$，故 $x = 2y$，代入约束 $3y=3$，$y=1, x=2$，$\lambda^* = 4$。含义：若约束改为 $x+y=4$，最优值从 $6$ 增加约 $4$（影子价格为正，松弛约束使最优值增大）。
+
+**自测 3**　说明为何等式约束 $h(x,y) = x^2 - x^2 = 0$ 不满足 LICQ，并给出后果。
+
+> 提示：$\nabla h = (2x - 2x, 0) = (0,0)$，约束梯度为零向量，不满足满行秩，无法保证 Lagrange 乘子唯一存在。该约束对于任何点 $(x,y)$ 都恒成立（空约束），无实际限制。
+
+**自测 4**　$f(x,y) = e^x + e^y$ 在约束 $x + y = 1$ 上极小，乘子 $\lambda^*$ 等于多少？
+
+> 提示：$e^x + \lambda = 0,\ e^y + \lambda = 0 \Rightarrow x = y = 1/2$，$\lambda^* = -e^{1/2} \approx -1.649$。极小值 $2e^{1/2} \approx 3.30$。
+
+**自测 5**　正交约束 $\mathbf{w}^\top \mathbf{w} = 1$（单位向量约束）下极小化 $-\mathbf{w}^\top \mathbf{A} \mathbf{w}$（$A$ 对称），写出 Lagrange 一阶条件，并说明最优解与 $A$ 的什么有关？
+
+> 提示：$L = -\mathbf{w}^\top A\mathbf{w} + \lambda(\mathbf{w}^\top\mathbf{w}-1)$，$\nabla L = -2A\mathbf{w} + 2\lambda\mathbf{w} = 0 \Rightarrow A\mathbf{w} = \lambda\mathbf{w}$。最优解是 $A$ 的**特征向量**，乘子 $\lambda$ 是对应**特征值**（极小对应最小特征值，极大对应最大特征值）。这正是主成分分析（PCA）的数学基础。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 等式约束极值 → 梯度平行 $\nabla f = -\lambda \nabla g$；写 Lagrange 函数 $L = f + \lambda g$。
+> 一阶条件：$n$ 个驻点方程 $+$ $m$ 个约束方程 = $n+m$ 个方程。
+> 乘子 $\lambda^* = $ 影子价格；LICQ 保证乘子唯一。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 7.1–7.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

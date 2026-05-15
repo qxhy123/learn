@@ -1,4 +1,40 @@
-# 第21章 学习率调度 (Learning Rate Scheduling)
+# 第21章 学习率调度（融合版）
+
+> **难度**：★★☆☆☆
+> **前置知识**：SGD（第16章）、Adam（第18章）、损失曲面基础（第19章）
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 21.1–21.x / 深度学习应用 / 练习题）+ 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **余弦退火**：$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})(1 + \cos(\pi t / T))$；从 $\eta_{\max}$ 平滑衰减到 $\eta_{\min}$，避免阶梯衰减的突变。
+> **Warmup**：训练前 $T_w$ 步线性从 $0$（或极小值）升到 $\eta_{\max}$，然后接衰减调度。防止初始梯度噪声大时使用大步长导致的发散/振荡。
+> **Cosine with restarts（SGDR）**：多个周期，每个周期末重启（恢复 $\eta_{\max}$），每个周期可递增长度。支持"快照集成"——周期末参数是不同极小，集成效果好。
+> **指数衰减**：$\eta_t = \eta_0 \cdot \gamma^t$（$\gamma < 1$），简单但衰减过快；Cosine 更平滑稳定。
+> **选择原则**：大多数现代任务用 **Cosine + Warmup**；视觉大模型（ResNet）阶梯衰减历史遗产；LLM 预训练 Cosine；微调 linear decay 或 constant。
+
+---
+
+## 引入：一道"为什么 warmup 是必要的"反直觉题
+
+> **题目**：用 Adam 优化器（$\eta = 3 \times 10^{-4}$）训练一个 Transformer，前 5 epoch 使用固定学习率，后 95 epoch 使用 Cosine annealing。实验发现前 5 epoch 训练 loss 震荡严重，甚至某些 batch 后 loss 突然跳升，但 5 epoch 后逐渐稳定。
+> 问：为什么前期会震荡？加入 warmup（前 5 epoch 线性从 $0$ 升到 $3\times 10^{-4}$）能解决吗？
+
+请先停下来想一想：Adam 的自适应学习率依赖历史梯度的一、二阶矩估计（$m_t$ 和 $v_t$）。训练开始时这两个统计量还未"预热"，偏差修正后的有效步长可能不稳定，加上梯度本身噪声大，大步长会让参数剧烈跳动。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "Adam 的参数更新是 $\theta_{t+1} = \theta_t - \eta \cdot \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)$，其中 $\hat{m}_t = m_t/(1-\beta_1^t)$，$\hat{v}_t = v_t/(1-\beta_2^t)$。
+>
+> 训练开始时 $m_0 = v_0 = \mathbf{0}$，前几步偏差修正分母很小（$1-\beta_1^1 = 0.1$，$1-\beta_2^1 \approx 0.001$），$\hat{m}_1 = g_1$（无偏），$\hat{v}_1 = g_1^2 / 0.001 = 1000 g_1^2$（方差被放大了 1000 倍）。等等——$\hat{v}_t$ 初期被**放大**，实际步长 $\approx \eta \cdot \hat{m}_1 / \sqrt{1000} g_1 = \eta / \sqrt{1000} \approx 0.03 \eta$，步长反而**很小**？
+>
+> 这说明 Adam 对 warmup 需求不如 SGD 强，但 **Transformer 架构** 有另一原因：各层参数梯度尺度差异极大（尤其是 Attention 的 softmax 温度问题），初始大步长会使 softmax 过早饱和（注意力集中在少数 token），难以恢复。因此**即使用 Adam，Transformer 仍需 warmup**。
+>
+> **Warmup 的本质**：让优化器在梯度统计未稳定之前使用小步长，避免早期的高噪声梯度把参数推到不可恢复的区域。线性 warmup $T_w$ 步后，$m_t$ 和 $v_t$ 已经积累了足够的样本，步长估计可靠，再切换到目标学习率。
+>
+> **实验验证**：前 5 epoch 线性从 0 升到 $3\times 10^{-4}$，loss 从一开始就平滑下降，不再震荡。Warmup 的代价是前期训练略慢（步长小），但稳定性换来更好的最终解质量。"
+
+---
 
 ## 学习目标
 
@@ -1822,3 +1858,243 @@ def compare_with_standard_sgdr(epochs=100, device='cpu'):
 ---
 
 *本章涵盖了学习率调度的核心理论与实践。掌握这些调度策略，结合 LR Range Test 等诊断工具，可以在不增加模型参数的前提下显著提升训练效率和最终性能。下一章将介绍分布式优化，探讨数据并行、模型并行、通信效率优化以及大批量训练技术。*
+
+---
+
+## 几何示意
+
+### 图 21-1：LR 调度策略对比（常数 / 指数衰减 / Cosine / Cosine+Warmup）
+
+![4条学习率调度曲线对比：常数、指数衰减、余弦退火、Cosine带Warmup](../figures/svg/opt-p7-21-1.svg)
+
+### 图 21-2：Warmup 必要性（有/无 Warmup 的 loss 对比）
+
+![Warmup 必要性：无 warmup（早期震荡）vs 有 warmup（平滑下降）](../figures/svg/opt-p7-21-2.svg)
+
+---
+
+## 抽象成方法（套路总结）
+
+### 5 种调度方法公式速查
+
+| 方法 | 公式 | 关键参数 |
+|---|---|---|
+| **常数** | $\eta_t = \eta_0$ | $\eta_0$（需靠 LR Range Test 确定） |
+| **指数衰减** | $\eta_t = \eta_0 \cdot \gamma^t$ | $\gamma \in (0.9, 0.999)$ 按 step/epoch |
+| **阶梯衰减** | $\eta_t = \eta_0 \cdot \gamma^{\lfloor t/s \rfloor}$ | $s$（步长），$\gamma = 0.1$（常用） |
+| **余弦退火** | $\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\tfrac{\pi t}{T})$ | $T$（总周期），$\eta_{\min}$（通常取 0 或 $10^{-6}$） |
+| **线性 Warmup** | $\eta_t = \eta_{\max} \cdot t/T_w$（$t \leq T_w$），之后接衰减 | $T_w$（warmup 步数，通常总步数的 1–10%） |
+
+### SGDR（Cosine with Restarts）参数
+
+$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\tfrac{\pi (t - T_i)}{T_i})$，每 $T_i$ 步重启；$T_{i+1} = T_\text{mult} \times T_i$（$T_\text{mult} > 1$ 则周期递增）。
+
+### 调度方法选择决策树
+
+```
+LLM 预训练（大模型）？
+  → Cosine decay + Linear warmup（主流：GPT、LLaMA）
+NLP 微调（BERT-style）？
+  → Linear decay + warmup（HuggingFace 默认）
+视觉 ResNet（ImageNet）？
+  → Step decay（每 30 epoch ×0.1）或 Cosine（新版）
+需要快照集成？
+  → SGDR（Cosine with warm restarts）
+资源有限 / 快速实验？
+  → Cosine（单周期，简单有效）
+```
+
+---
+
+## 方法变形
+
+### 变形 1：Warmup + Cosine 组合（最常用模板）
+
+```
+[warmup: 0 → η_max，线性，T_w 步]
+→ [Cosine decay: η_max → η_min，(T - T_w) 步]
+```
+
+PyTorch 实现：
+
+```python
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+warmup = LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=T_w)
+cosine = CosineAnnealingLR(optimizer, T_max=(T - T_w), eta_min=eta_min)
+scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[T_w])
+```
+
+### 变形 2：LR Range Test（找最优学习率）
+
+从极小的 $\eta$ 开始指数增长，记录每步 loss，找 loss 开始稳定下降前的区域作为目标 $\eta_{\max}$。Smith (2017) 提出，现已成为超参数调试标配：
+
+```python
+# 从 eta_min=1e-7 到 eta_max=1e-1，100步指数扫描
+for step in range(100):
+    eta = 1e-7 * (1e-1 / 1e-7) ** (step / 100)
+    ...
+```
+
+### 变形 3：Cyclical LR（CLR）
+
+不单调衰减，而是在 $[\eta_{\min}, \eta_{\max}]$ 之间**周期性振荡**（锯齿形或三角形）。好处：定期大步长帮助逃鞍点，定期小步长帮助精确收敛。PyTorch: `CyclicLR(mode='triangular2')`。
+
+### 变形 4：ReduceLROnPlateau（自适应触发）
+
+不按 epoch 衰减，而是监控 val_loss：若连续 `patience` 个 epoch 无改善，则 $\eta \leftarrow \eta \times \text{factor}$（通常 0.5 或 0.1）。适合不确定总训练步数或损失平台不可预测的场景。
+
+---
+
+## 本章小结补充
+
+**为什么 Cosine 优于指数衰减？**
+
+| 特性 | 指数衰减 | 余弦退火 |
+|---|---|---|
+| 衰减速度 | 早期快，后期指数趋零 | 中期慢，两端快（类正弦斜率） |
+| 早停风险 | 学习率可能过早趋零 | 自然到达终点后接近零 |
+| 平滑性 | 连续但斜率单调 | 平滑，斜率先增后减 |
+| 周期扩展 | 不自然 | SGDR 自然延伸 |
+
+**为什么 Warmup 重要？**
+
+Transformer 等深度模型训练早期：梯度噪声极大 + Adam 矩估计未稳定 + 参数与激活分布未对齐。Warmup 用小步长让系统"预热"，避免初始大步长把参数推到平坦区之外，之后才逐步加速。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"训练初期 loss 震荡/发散" → 加 warmup；检查学习率是否过大
+2. 看到"余弦退火" → $\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\frac{\pi t}{T})$；从大到小平滑
+3. 看到"Cosine with restarts / SGDR" → 周期重启；周期末保存快照用于集成
+4. 看到"线性缩放规则（batch size × k）" → 同时将 $\eta$ 放大 $k$ 倍；warmup 必须同时延长
+5. 看到"LR Range Test" → 指数扫描找 loss 拐点，作为 $\eta_{\max}$ 的上界
+6. 看到"Robbins-Monro 收敛条件" → $\sum \eta_t = \infty$，$\sum \eta_t^2 < \infty$；$\eta_t = \eta_0/t$ 满足
+7. 看到"ReduceLROnPlateau" → 监控 val_loss，plateau 时减小 LR；适合不确定总 epoch 的场景
+8. 看到"PyTorch scheduler.step()" → 必须在 `optimizer.step()` 之后调用；否则警告/结果错误
+9. 看到"Cyclical LR" → 三角波/正弦波振荡；有助于逃鞍点（大步长阶段）
+10. 看到"快照集成" → SGDR 每个周期末 $\eta$ 接近 $\eta_{\min}$，参数处于不同局部极小，集成提升精度
+
+---
+
+## 易错点
+
+1. **scheduler.step() 顺序错误**：PyTorch 中必须先 `optimizer.step()` 再 `scheduler.step()`，否则 `get_last_lr()` 返回错误值，且某些 scheduler 会发出 `UserWarning`。
+
+2. **Warmup 步数单位混淆**：`T_w` 可能是 epoch 数或 batch 数，需要统一。以 batch 为单位更细粒度；LLM 预训练通常以 token 数为单位（如 warmup 2000 steps）。
+
+3. **Cosine 的 T_max 设置**：`CosineAnnealingLR(optimizer, T_max=T)` 中 $T$ 是**半个周期**（从 $\eta_{\max}$ 到 $\eta_{\min}$），不是总 epoch 数。若 `T_max = 100` 且训练 200 epoch，会有第二个余弦周期（从 $\eta_{\min}$ 反弹到 $\eta_{\max}$），可能意外有用（相当于 SGDR）。
+
+4. **ReduceLROnPlateau 与 Cosine 混用**：两者逻辑冲突——Cosine 是时间驱动，ReduceLROnPlateau 是条件驱动，同时使用可能互相覆盖学习率。选一种即可。
+
+5. **初始学习率与 warmup 起点**：warmup 通常从接近 0 或 $\eta_{\max}/100$ 开始，不是从 $\eta_{\max}$ 本身，否则 warmup 失去意义。检查 `start_factor` 参数。
+
+---
+
+## 典型应用例题
+
+### 例 1：余弦退火计算
+
+> **题目**：$\eta_{\max} = 0.1$，$\eta_{\min} = 0$，总 epoch $T = 100$。计算第 $t = 0, 25, 50, 75, 100$ epoch 时的学习率。
+
+【解】公式 $\eta_t = \frac{1}{2}\eta_{\max}(1 + \cos\frac{\pi t}{T})$。
+
+| $t$ | $\cos(\pi t/100)$ | $\eta_t$ |
+|---|---|---|
+| 0 | $\cos(0) = 1$ | $0.1$ |
+| 25 | $\cos(\pi/4) \approx 0.707$ | $0.0854$ |
+| 50 | $\cos(\pi/2) = 0$ | $0.05$ |
+| 75 | $\cos(3\pi/4) \approx -0.707$ | $0.0146$ |
+| 100 | $\cos(\pi) = -1$ | $0$ |
+
+【答案】$\boxed{\eta_0=0.1,\ \eta_{25}\approx 0.0854,\ \eta_{50}=0.05,\ \eta_{75}\approx 0.0146,\ \eta_{100}=0}$。
+
+【注】余弦函数使中期（$t=50$）衰减速度最快（斜率最大），早期和后期衰减慢，形成"慢-快-慢"的平滑调度。
+
+### 例 2：线性 Warmup + Cosine 的 LR 轨迹
+
+> **题目**：总训练 $T = 10000$ 步，warmup $T_w = 1000$ 步（线性从 0 到 $\eta_{\max} = 0.01$），之后 Cosine 衰减至 $\eta_{\min} = 0$。
+> (1) 第 500 步的学习率；(2) 第 5500 步的学习率；(3) 第 10000 步的学习率。
+
+【解】
+(1) Warmup 阶段（$t \leq 1000$）：$\eta_t = 0.01 \times 500/1000 = 0.005$。
+(2) Cosine 阶段（$t > 1000$）：令 $t' = t - T_w = 5500 - 1000 = 4500$，$T' = 9000$：
+$\eta_{5500} = \frac{1}{2} \times 0.01 \times (1 + \cos\frac{\pi \times 4500}{9000}) = 0.005 \times (1 + \cos\frac{\pi}{2}) = 0.005 \times 1 = 0.005$。
+(3) $t' = 9000$，$\eta = 0.005 \times (1 + \cos\pi) = 0.005 \times 0 = 0$。
+
+【答案】$\boxed{\eta_{500}=0.005,\ \eta_{5500}=0.005,\ \eta_{10000}=0}$。
+
+### 例 3：大批量训练的 LR 线性缩放
+
+> **题目**：baseline 用 batch_size = 256，$\eta_0 = 0.1$，warmup 5 epoch。现将 batch_size 扩大到 4096（线性缩放 $\times 16$）。
+> (1) 新的目标 $\eta_{\max}$ 是多少？(2) warmup 是否需要调整？(3) 若不调整 warmup 的 epoch 数（仍然 5 epoch）会有什么问题？
+
+【解】
+(1) 线性缩放：$\eta_{\max}' = 16 \times 0.1 = 1.6$。
+(2) Warmup **需要相应延长或调整**。原 5 epoch warmup 对应 baseline 的 $5 \times (N/256)$ 步；新 batch 下同样 5 epoch 步数减少为 $5 \times (N/4096)$，warmup 更短但步长 $\eta'$ 更大。建议 warmup 步数（按样本数）保持不变，即 epoch 数可适当缩短，或保持 5 epoch 同时调整起始 factor。
+(3) 若不调整 warmup：每步学习率从 0 线性升到 1.6，早期步长仍可能过大（step 1 时 $\eta = 1.6/5\text{epoch} \times 1\text{step}$ 不为零），震荡风险高，需仔细评估。一般推荐 warmup 按步数（而非 epoch 数）对应 baseline 的 warmup 步数。
+
+【答案】$\boxed{\eta_{\max}' = 1.6}$；warmup 按步数对齐；5 epoch 不调整可能早期不稳定。
+
+---
+
+## 自测题
+
+**自测 1**　余弦退火调度与指数衰减调度，哪个在训练中期（$t \approx T/2$）的衰减速度更快？
+
+> 提示：余弦退火斜率 $= -\frac{\pi}{2T}(\eta_{\max}-\eta_{\min})\sin(\frac{\pi t}{T})$，在 $t = T/2$ 时 $\sin(\pi/2) = 1$，斜率最大，衰减最快。指数衰减 $\frac{d\eta}{dt} = -\ln(1/\gamma)\eta_t$，在训练中期指数衰减斜率较小（$\eta$ 已经下降）。因此余弦退火在**中期衰减更快**，而指数衰减在早期衰减快、后期趋近零更慢。
+
+**自测 2**　SGDR 的快照集成为什么效果好？每个快照取在什么时机？
+
+> 提示：每个余弦周期末，学习率接近 $\eta_{\min}$，参数几乎收敛到当前周期的局部极小；下一个周期从 $\eta_{\max}$ 重启，参数被"弹出"并落入不同极小。因此各周期末的快照处于**不同的低损失极小**，集成（平均预测）可降低方差，比单个模型性能更好。
+
+**自测 3**　Robbins-Monro 条件 $\sum \eta_t = \infty$，$\sum \eta_t^2 < \infty$ 的直觉含义是什么？$\eta_t = 1/t$ 和 $\eta_t = 1/\sqrt{t}$ 哪个满足？
+
+> 提示：$\sum \eta_t = \infty$ 保证优化器"走得足够远"（能到达任意距离的解）；$\sum \eta_t^2 < \infty$ 保证"噪声累积有界"（不因每步噪声无限积累而发散）。$\eta_t = 1/t$：$\sum 1/t = \infty$（调和级数），$\sum 1/t^2 = \pi^2/6 < \infty$ ✓，满足。$\eta_t = 1/\sqrt{t}$：$\sum 1/\sqrt{t} = \infty$ ✓，但 $\sum 1/t = \infty$，**不满足**第二条。
+
+**自测 4**　用 PyTorch 实现 1000 步线性 warmup + 余弦退火调度，写出关键代码（只需关键 scheduler 部分）。
+
+> 提示：
+> ```python
+> warmup = LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=1000)
+> cosine = CosineAnnealingLR(optimizer, T_max=9000, eta_min=0)
+> scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[1000])
+> # 训练循环中：optimizer.step(); scheduler.step()
+> ```
+> 注意：`SequentialLR` 的 `milestones` 单位是调度步数，不是 epoch。
+
+**自测 5**　某次训练发现：使用 Cosine 调度，前 20 epoch loss 下降正常，但 20-30 epoch 突然 loss 反弹到很高水平后再下降。可能的原因是什么？
+
+> 提示：最可能的原因是 `T_max` 设置为 20（半周期），第 20 epoch 后余弦进入回升阶段（学习率从 $\eta_{\min}$ 回升到 $\eta_{\max}$），相当于意外触发了 SGDR 的重启。解决：确认 `CosineAnnealingLR(T_max=总epoch数)`，或显式使用 `CosineAnnealingWarmRestarts`。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 余弦退火：$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\frac{\pi t}{T})$，慢-快-慢，平滑优雅。
+> Warmup：前 $T_w$ 步线性升温，防止早期高噪声大步跳。
+> SGDR：余弦 + 周期重启，快照集成，找更好的平坦极小。
+
+如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 1 + 自测 4——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + 深度学习应用 + 练习题）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / warmup 机制理解 |
+| 学习目标 + 21.1–21.x 严格正文 | 原版 | 完整推导 |
+| 几何示意（图） | 配图 | 可视化调度曲线 |
+| 深度学习应用 + PyTorch 实现 | 原版 | 工业实战 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 本章小结补充 | 融合 | Cosine vs 指数 / warmup 原理 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

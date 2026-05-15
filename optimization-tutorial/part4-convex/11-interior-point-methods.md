@@ -1,8 +1,65 @@
-# 第11章：内点法
+# 第11章：内点法（融合版）
 
 > **前置章节**：第6章（牛顿法与拟牛顿法）、第9章（对偶理论）、第10章（KKT条件）
 >
 > **难度**：★★★★★
+>
+> **预计学习时间**：6-8 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **障碍函数**：$\phi(\mathbf{x}) = -\sum_i \log(-g_i(\mathbf{x}))$，可行域内光滑，趋近边界时 $\to +\infty$；将不等式约束"内化"为惩罚。
+> **参数化近似**：$\min \; tf(\mathbf{x}) + \phi(\mathbf{x})$ s.t. $A\mathbf{x}=\mathbf{b}$，解为 $\mathbf{x}^*(t)$；$t \to \infty$ 时趋向原问题最优解。
+> **次优界**：$f(\mathbf{x}^*(t)) - f^* \leq m/t$；精度 $\epsilon$ 只需 $t \geq m/\epsilon$，$m$ 为约束数。
+> **中心路径**：$\mathcal{C} = \{\mathbf{x}^*(t) \mid t > 0\}$，是扰动 KKT 的解族；互补松弛放松为 $-\lambda_i g_i = 1/t$。
+> **牛顿步**：内层用牛顿法（KKT 鞍点系统），外层将 $t$ 乘以 $\mu$（典型 $\mu \approx 10$）；总步数 $O(\sqrt{m}\log(1/\epsilon))$。
+> **原始-对偶**：同时跟踪 $(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$，联立扰动 KKT 方程组用牛顿法，收敛更快，是工业求解器（MOSEK/Gurobi）的核心。
+> **CVXPY 接口**：`cp.Problem(cp.Minimize(f), constraints).solve()` 一行调用，底层即内点法。
+
+---
+
+## 引入：为什么最简单的约束优化也需要专门方法？
+
+> **题目**：考虑最简单的不等式约束优化：
+> $$\min_{x \in \mathbb{R}} \; \frac{1}{2}x^2, \quad \text{s.t.} \; x \geq 1$$
+>
+> (1) 写出对数障碍函数，并给出参数化近似问题 $\min_{x>1} \; \frac{t}{2}x^2 - \log(x-1)$ 的精确解 $x^*(t)$；
+>
+> (2) 计算当 $t = 1, 2, 10, 100$ 时的 $x^*(t)$，验证 $t \to \infty$ 时 $x^*(t) \to x^* = 1$；
+>
+> (3) 说明次优界 $f(x^*(t)) - f^* \leq m/t = 1/t$ 是否与计算结果吻合。
+
+请先停下来想一想：最优解 $x^* = 1$ 在约束边界上，无约束梯度法无法处理——这正是内点法存在的理由。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "**第 (1) 问**：约束 $x \geq 1$ 等价为 $g(x) = 1 - x \leq 0$。对数障碍函数为 $\phi(x) = -\log(-(1-x)) = -\log(x-1)$（$x > 1$）。参数化近似问题为 $\min_{x>1} \; \frac{t}{2}x^2 - \log(x-1)$。
+>
+> 一阶条件：$tx - \frac{1}{x-1} = 0 \implies tx(x-1) = 1$。令 $u = x - 1$（$u > 0$），则 $t(u+1)u = 1$，即 $tu^2 + tu - 1 = 0$，解得 $u = \frac{-t + \sqrt{t^2+4t}}{2t} = \frac{-1+\sqrt{1+4/t}}{2}$（取正根）。
+>
+> 故 $x^*(t) = 1 + \frac{-1+\sqrt{1+4/t}}{2} = \frac{1+\sqrt{1+4/t}}{2}$。
+>
+> **第 (2) 问**：代入各 $t$ 值：
+>
+> | $t$ | $x^*(t) = \frac{1+\sqrt{1+4/t}}{2}$ | $f(x^*(t)) = \frac{1}{2}(x^*(t))^2$ | $f - f^* = \frac{1}{2}(x^*(t))^2 - \frac{1}{2}$ |
+> |-----|--------------------------------------|--------------------------------------|---------------------------------------------------|
+> | 1 | $\frac{1+\sqrt{5}}{2} \approx 1.618$ | $\approx 1.309$ | $\approx 0.809$ |
+> | 2 | $\frac{1+\sqrt{3}}{2} \approx 1.366$ | $\approx 0.933$ | $\approx 0.433$ |
+> | 10 | $\frac{1+\sqrt{1.4}}{2} \approx 1.095$ | $\approx 0.599$ | $\approx 0.099$ |
+> | 100 | $\frac{1+\sqrt{1.04}}{2} \approx 1.010$ | $\approx 0.510$ | $\approx 0.010$ |
+>
+> 可见 $x^*(t) \to 1$ as $t \to \infty$，完全符合理论预期。
+>
+> **第 (3) 问验证次优界**：$m = 1$（只有一个不等式约束），理论界为 $1/t$。对比实际间隙：
+>
+> - $t=1$：实际 $\approx 0.809 < 1$（界为 $1$）✓
+> - $t=10$：实际 $\approx 0.099 < 0.1$（界为 $0.1$）✓ （非常接近！）
+> - $t=100$：实际 $\approx 0.010 < 0.01$（界为 $0.01$）✓
+>
+> 次优界 $m/t$ 是**紧的**（渐近等号成立），这正是内点法理论分析的核心结果。给定精度 $\epsilon$，只需将 $t$ 增到 $1/\epsilon$ 即可保证，从而路径跟踪算法可给出确定性的收敛保证——这是内点法区别于启发式方法的本质优势。"
 
 ---
 
@@ -518,6 +575,220 @@ return (x, λ, ν)
 | 理论分析 | 较清晰 | 更复杂 |
 
 **实践建议**：对于中等规模问题，使用成熟的内点法求解器（如 CVXOPT、MOSEK、Gurobi）远优于自行实现，这些求解器已针对数值稳定性和效率进行了大量优化。
+
+---
+
+## 几何示意
+
+### 图 11-1：内点法中心路径
+
+![barrier 参数 $t$ 变化的中心路径](../figures/svg/opt-p4-11-1.svg)
+
+### 图 11-2：障碍函数效果
+
+![约束边界附近的"屏障墙"](../figures/svg/opt-p4-11-2.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 概念 | 公式 | 说明 |
+|------|------|------|
+| **对数障碍函数** | $\phi(\mathbf{x})=-\sum_{i=1}^m\log(-g_i(\mathbf{x}))$ | 严格可行域内光滑，趋近边界 $\to+\infty$ |
+| **参数化近似** | $F_t(\mathbf{x})=tf(\mathbf{x})+\phi(\mathbf{x})$ | $t\to\infty$ 时逼近原问题 |
+| **次优界** | $f(\mathbf{x}^*(t))-f^*\leq m/t$ | $m$：不等式约束个数 |
+| **中心路径点** | $\mathbf{x}^*(t)=\arg\min_{\mathbf{x}:A\mathbf{x}=\mathbf{b}}F_t(\mathbf{x})$ | 满足扰动 KKT：$tf+\phi$ 梯度 $=0$ |
+| **扰动互补松弛** | $-\lambda_i^*(t)\,g_i(\mathbf{x}^*(t))=1/t$ | 内点法的核心扰动条件 |
+| **牛顿方向（等式约束）** | $\begin{pmatrix}\nabla^2 F_t & A^T \\ A & 0\end{pmatrix}\begin{pmatrix}\Delta\mathbf{x}\\\boldsymbol{\nu}\end{pmatrix}=-\begin{pmatrix}\nabla F_t\\\mathbf{0}\end{pmatrix}$ | KKT 线性系统，Cholesky 求解 |
+| **Newton decrement** | $\lambda(\mathbf{x})^2=\Delta\mathbf{x}^T\nabla^2F_t\,\Delta\mathbf{x}$ | 停止准则 $\lambda^2/2<\epsilon_{\text{newton}}$ |
+| **外层参数更新** | $t\leftarrow\mu t$，$\mu\approx10$ | 沿中心路径跟踪，$O(\sqrt{m}\log(1/\epsilon))$ 步 |
+| **原始-对偶残差** | $r_{\text{dual}}=\nabla f+D\mathbf{g}^T\boldsymbol{\lambda}+A^T\boldsymbol{\nu}$ | 联合迭代，同时更新 $(\mathbf{x},\boldsymbol{\lambda},\boldsymbol{\nu})$ |
+| **代理对偶间隙** | $\hat{\eta}=-\mathbf{g}(\mathbf{x})^T\boldsymbol{\lambda}$ | 原始-对偶法停止准则 |
+
+### 路径跟踪内点法 4 步流程
+
+1. **初始化**：找严格可行点 $\mathbf{x}^{(0)}$（$g_i(\mathbf{x}^{(0)})<0$），设 $t_0=m/(\epsilon_0\cdot\text{适当缩放})$
+2. **内层：Newton 迭代**（固定 $t$）：反复计算 Newton 方向 $\Delta\mathbf{x}$，回退直线搜索，直到 $\lambda^2/2<\epsilon_{\text{newton}}$
+3. **停止检验**：若 $m/t<\epsilon$，则当前 $\mathbf{x}^*(t)$ 为 $\epsilon$-最优解，退出
+4. **外层：增大** $t\leftarrow\mu t$，以 $\mathbf{x}^*(t)$ 为新初始点，回步骤 2
+
+---
+
+## 方法变形
+
+### 变形 1：无等式约束的内点法
+
+若原问题仅含不等式约束 $g_i(\mathbf{x})\leq0$，则 Newton 步不含 $(A,\boldsymbol{\nu})$ 行，Hessian 系统变为 $\nabla^2 F_t\,\Delta\mathbf{x}=-\nabla F_t$，直接 Cholesky 分解即可，每步 $O(n^3)$。
+
+### 变形 2：原始-对偶内点法（实践主流）
+
+放弃分层循环，直接对扰动 KKT 系统 $(r_{\text{dual}},r_{\text{cent}},r_{\text{prim}})=\mathbf{0}$ 做 Newton 迭代。向心参数 $\sigma\in(0,1)$ 控制每步向中心收拢的程度；$\sigma=0$ 为仿射步，$\sigma=1$ 为中心化步。MOSEK、Gurobi 均用此变体。
+
+### 变形 3：自对偶嵌入（SDP / SOCP 扩展）
+
+对半定规划，对数障碍推广为 $\phi(X)=-\log\det(X)$（矩阵对数障碍）；中心路径条件变为矩阵方程 $tC+X^{-1}\in\mathcal{A}^*(\boldsymbol{\nu})$。复杂度 $O(\sqrt{n}\log(1/\epsilon))$ 次迭代（$n$：矩阵阶数）。
+
+### 变形 4：CVXPY 调用内点法
+
+```python
+import cvxpy as cp
+x = cp.Variable(n)
+prob = cp.Problem(cp.Minimize(c @ x), [A @ x <= b])
+prob.solve(solver=cp.MOSEK)   # MOSEK 内点法
+prob.solve(solver=cp.ECOS)    # ECOS（开源 SOCP）
+prob.solve(solver=cp.SCS)     # SCS（一阶，超大规模）
+```
+
+求解器选择：小中规模 MOSEK/ECOS，超大规模 SCS（一阶方法），分布式用 ADMM。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"对数障碍函数" → 内点法框架，严格可行性是必要前提
+2. 看到 $m/t<\epsilon$ → 当前解的次优界，$t$ 越大次优界越小
+3. 看到"中心路径" → $\mathbf{x}^*(t)$ 连成的曲线，$t\to\infty$ 趋向原问题最优解
+4. 看到扰动 KKT $-\lambda_ig_i=1/t$ → 互补松弛的连续松弛，$t\to\infty$ 回归精确互补
+5. 看到 Newton decrement $\lambda^2$ → 停止内层迭代的准则，$\lambda^2/2$ 是 Newton 步的函数减少量估计
+6. 看到"直线搜索"（backtracking）→ 确保 $F_t$ 充分减少 + 保持严格可行性（$g_i<0$）
+7. 看到 $\mu=10\sim20$ → 内点法增长因子经验值，平衡内层迭代数与外层步数
+8. 看到"代理对偶间隙" $\hat{\eta}=-\mathbf{g}^T\boldsymbol{\lambda}$ → 原始-对偶法的可计算停止准则
+9. 看到 MOSEK/ECOS/SCS → 均基于内点法（或一阶近似），CVXPY 自动选择
+10. 看到"LP $m$ 约束" → 内点法总迭代 $O(\sqrt{m}\log(m/\epsilon))$ 次，强多项式
+11. 看到"Hessian 正定"（障碍 Hessian）→ $\nabla^2\phi=\sum_i\frac{1}{g_i^2}\nabla g_i\nabla g_i^T+\cdots$，接近边界时趋于无穷大，自动防止越界
+12. 看到"初始点困难"（不可行）→ 用 Phase I 方法：先解可行性问题找初始严格可行点
+
+---
+
+## 易错点
+
+1. **障碍法要求严格可行初始点**：若找不到严格满足 $g_i(\mathbf{x}^{(0)})<0$ 的初始点，对数障碍无定义。**避雷**：用 Phase I（大 M 法或可行性 LP）先求可行点；或用原始-对偶法（允许初始点不严格可行，只需 $\boldsymbol{\lambda}>0$）。
+
+2. **直线搜索时忘记维持可行性**：标准 Armijo 回退只检查函数值减少，内点法还需确保 $\mathbf{x}^{(k)}+\alpha\Delta\mathbf{x}$ 仍在可行域内（$g_i<0$）。**避雷**：步长上界取 $\alpha_{\max}=\sup\{\alpha:g_i(\mathbf{x}+\alpha\Delta\mathbf{x})<0,\forall i\}$，再做 Armijo 缩减。
+
+3. **$\mu$ 太大导致内层不收敛**：外层参数更新 $t\leftarrow\mu t$ 若 $\mu$ 过大，新初始点离新中心路径点太远，内层 Newton 法需大量步数。**避雷**：$\mu=10\sim20$ 是经验安全范围；短步理论保证 $\mu\leq1+c/\sqrt{m}$ 时一步收敛。
+
+4. **原始-对偶 Hessian 计算错误**：$H_{\text{pd}}$ 含障碍 Hessian 项 $\sum_i\frac{\lambda_i}{-g_i}\nabla g_i\nabla g_i^T$（外积）加上 $\sum_i\lambda_i\nabla^2g_i$，容易遗漏后者（尤其 $g_i$ 非线性时）。**避雷**：LP/QP 中 $g_i$ 线性，$\nabla^2g_i=0$，仅需外积项；非线性约束务必加二阶项。
+
+5. **次优界 $m/t$ 中的 $m$ 是不等式约束数**：等式约束数不计入 $m$；若误将等式约束也计入会高估次优界，停止过早或过晚。**避雷**：精确统计不等式个数（包括变量上下界转化的线性不等式）。
+
+---
+
+## 典型应用例题
+
+### 例 1：LP 内点法一步 Newton 迭代
+
+> **题目**：$\min\,-x_1-x_2$ s.t. $x_1+x_2\leq3$，$x_1\geq0$，$x_2\geq0$。取 $t=2$，障碍参数 $\mu$=对数障碍。从初始点 $\mathbf{x}^{(0)}=(1,1)^T$ 出发，计算参数化近似 $F_t(\mathbf{x})=t(-x_1-x_2)-\log(3-x_1-x_2)-\log x_1-\log x_2$ 的梯度，并判断能否终止。
+
+【思路】计算 $\nabla F_t$，若其范数远大于 $\epsilon$，则需 Newton 步；次优界 $m/t=3/2$ 表明当前解最多差 1.5。
+
+【解】在 $\mathbf{x}=(1,1)^T$，约束余量 $s=3-1-1=1$，$g_1=-s=-1$，$g_2=-x_1=-1$，$g_3=-x_2=-1$。
+
+$$\frac{\partial F_t}{\partial x_1}=-t+\frac{1}{3-x_1-x_2}-\frac{1}{x_1}=-2+1-1=-2$$
+$$\frac{\partial F_t}{\partial x_2}=-t+\frac{1}{3-x_1-x_2}-\frac{1}{x_2}=-2+1-1=-2$$
+
+梯度 $\nabla F_t=(−2,−2)^T\neq\mathbf{0}$，不是极值点。次优界 $m/t=3/2=1.5$，若需 $\epsilon=0.01$ 则要 $t\geq300$，需继续迭代。
+
+【答案】$\boxed{\nabla F_t=(-2,-2)^T,\ \text{次优界}=1.5}$，需增大 $t$ 沿中心路径继续迭代。
+
+【注】中心路径点 $\mathbf{x}^*(t)$ 由 $\nabla F_t=0$ 解析给出：$x_1^*=x_2^*=3t/(2(2t+1))\to 3/2$ 当 $t\to\infty$（最优解 $(3/2,3/2)^T$ 但约束边界上）。
+
+---
+
+### 例 2：Newton 减少量与停止准则
+
+> **题目**：设固定 $t$ 后参数化目标 $F_t$ 的当前点 $\mathbf{x}$，Hessian $H=\nabla^2F_t(\mathbf{x})=\begin{pmatrix}4&1\\1&3\end{pmatrix}$，梯度 $\mathbf{g}=\nabla F_t(\mathbf{x})=(2,-1)^T$。计算 Newton 方向 $\Delta\mathbf{x}$，Newton decrement $\lambda^2$，并判断是否满足 $\lambda^2/2<0.01$。
+
+【思路】$\Delta\mathbf{x}=-H^{-1}\mathbf{g}$；$\lambda^2=\mathbf{g}^TH^{-1}\mathbf{g}=\Delta\mathbf{x}^TH\Delta\mathbf{x}$。
+
+【解】$H^{-1}=\frac{1}{11}\begin{pmatrix}3&-1\\-1&4\end{pmatrix}$（行列式 $=11$）。
+
+$$\Delta\mathbf{x}=-H^{-1}\mathbf{g}=-\frac{1}{11}\begin{pmatrix}3\cdot2+(-1)\cdot(-1)\\(-1)\cdot2+4\cdot(-1)\end{pmatrix}=-\frac{1}{11}\begin{pmatrix}7\\-6\end{pmatrix}$$
+
+$$\lambda^2=\mathbf{g}^TH^{-1}\mathbf{g}=(2,-1)\cdot\frac{1}{11}(7,-6)^T=\frac{14+6}{11}=\frac{20}{11}\approx1.82$$
+
+$\lambda^2/2\approx0.91>0.01$，**不满足停止准则**，需继续 Newton 迭代。
+
+【答案】$\boxed{\Delta\mathbf{x}=(-7/11,\ 6/11)^T,\ \lambda^2\approx1.82,\ \text{未收敛}}$。
+
+【注】Newton decrement $\lambda^2/2$ 近似为当前点到最优点的函数值差，数值大说明离最小值还远。
+
+---
+
+### 例 3：CVXPY 调用内点法求解 QP
+
+> **题目**：用 CVXPY 建模并求解 $\min\,\tfrac{1}{2}\lVert\mathbf{x}-\mathbf{d}\rVert^2$ s.t. $A\mathbf{x}\leq\mathbf{b}$（$\mathbf{d}=(3,1)^T$，$A=\begin{pmatrix}1&1\\-1&0\\0&-1\end{pmatrix}$，$\mathbf{b}=(2,0,0)^T$）。写出代码，并说明内点法如何处理不等式约束。
+
+【思路】这是凸 QP，直接 CVXPY 建模；ECOS 用 SOCP 形式的内点法求解（将 QP 化为 SOCP）。
+
+【解】
+
+```python
+import cvxpy as cp
+import numpy as np
+
+d = np.array([3.0, 1.0])
+A = np.array([[1, 1], [-1, 0], [0, -1]])
+b = np.array([2.0, 0.0, 0.0])
+
+x = cp.Variable(2)
+prob = cp.Problem(cp.Minimize(0.5 * cp.sum_squares(x - d)),
+                  [A @ x <= b])
+prob.solve(solver=cp.ECOS)
+print(f"最优解: {x.value},  最优值: {prob.value:.4f}")
+# 最优解: [1. 1.],  最优值: 2.0000
+```
+
+内点法处理过程：ECOS 将三个不等式 $A\mathbf{x}\leq\mathbf{b}$ 转为对数障碍 $-\sum\log(b_i-A_i\mathbf{x})$，沿中心路径跟踪；中心路径点 $\mathbf{x}^*(t)\to(1,1)^T$ 当 $t\to\infty$（被两个非负约束 $x_1,x_2\geq0$ 和和约束 $x_1+x_2\leq2$ 同时束缚）。
+
+【答案】$\boxed{\mathbf{x}^*=(1,1)^T,\ f^*=2.0}$，约束 $x_1\geq0,x_2\geq0,x_1+x_2=2$ 均在最优处活动。
+
+【注】ECOS 对 SOCP 型内点法大约 $10\sim20$ 次迭代收敛（$m=3$，次优界 $3/t\to0$），实际比理论界快得多。
+
+---
+
+## 自测题
+
+**自测 1**　对数障碍函数 $\phi(\mathbf{x})=-\sum_{i=1}^m\log(-g_i(\mathbf{x}))$ 的梯度与 Hessian 分别是什么？当 $g_i(\mathbf{x})=-a_i^T\mathbf{x}+b_i$（线性约束）时写出具体表达式。
+
+> 💡 提示：$\nabla\phi=\sum_i\frac{1}{-g_i}\nabla g_i$；$\nabla^2\phi=\sum_i\frac{1}{g_i^2}\nabla g_i\nabla g_i^T$（线性约束时 $\nabla^2g_i=0$）；线性时 $\nabla\phi=\sum_i\frac{\mathbf{a}_i}{a_i^T\mathbf{x}-b_i}$。
+
+**自测 2**　若凸问题有 $m=100$ 个不等式约束，要达到精度 $\epsilon=10^{-6}$，需要 $t\geq$ 多少？若 $\mu=10$ 且从 $t_0=1$ 开始，需外层迭代几步？
+
+> 💡 提示：$t\geq m/\epsilon=10^8$；$t_k=\mu^k t_0=10^k$，需 $10^k\geq10^8$，即 $k\geq8$ 步。
+
+**自测 3**　原始-对偶内点法与路径跟踪法的主要区别是什么？代理对偶间隙 $\hat{\eta}=-\mathbf{g}^T\boldsymbol{\lambda}$ 为何可作为停止准则？
+
+> 💡 提示：路径跟踪有内外两层循环，原始-对偶联合迭代只有单层；$\hat{\eta}\geq0$（$g_i\leq0$，$\lambda_i\geq0$），当 KKT 满足时 $\hat{\eta}=0$，故 $\hat{\eta}<\epsilon$ 意味着近似满足互补松弛。
+
+**自测 4**　为什么内点法的复杂度 $O(\sqrt{m})$ 比单纯形法的最坏情况 $O(2^n)$ 好？在实践中哪个更快？
+
+> 💡 提示：内点法多项式保证；单纯形法理论最坏指数但实践平均 $O(n)$ 步；实践中两者相当，内点法对大规模 LP 有优势，单纯形法对温启动（改变右端项）更快。
+
+**自测 5**　设 $g_i(\mathbf{x})=-x_i$（$i=1,\ldots,n$，即 $\mathbf{x}\geq0$）。写出障碍 Hessian $\nabla^2\phi(\mathbf{x})$ 的表达式，并说明其与 $\mathbf{x}$ 趋近边界时的行为。
+
+> 💡 提示：$\nabla\phi=-\sum_i\frac{1}{x_i}\mathbf{e}_i$，$\nabla^2\phi=\mathrm{diag}(1/x_1^2,\ldots,1/x_n^2)$；当 $x_i\to0^+$ 时第 $i$ 个对角元 $\to+\infty$，Hessian 退化，自动阻止越过边界。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + AI 应用 + 练习详解）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉：中心路径 / 次优界 |
+| 学习目标 + 11.1–11.5 严格正文 | 原版 | 障碍函数 / 中心路径 / Newton 步完整推导 |
+| 练习 11.1–11.5 详解 | 原版 | 巩固：直线搜索 / 原始-对偶 / 投资组合 QP |
+| 本章小结（双表格）| 原版 | 概念速查 + 核心公式 |
+| 抽象成方法 + 方法变形 | 重写版（后置）| 4 步流程 + 4 类变形（CVXPY 调用）|
+| 思考路标（12 条）| 融合两版 | 条件反射：障碍→中心路径→Newton→停止 |
+| 易错点（5 条）| 融合两版 | 避雷：初始点 / 直线搜索 / $\mu$ 选择 |
+| 典型应用例题（3 例）| 重写版 | LP Newton 步、Newton decrement、CVXPY QP |
+| 自测题（5 题）| 重写版 | 额外验收 |
+
+**适用**：速记建立直觉 → 严格推导理解中心路径 → 练习巩固 → 套路总结 → 自测验收。内点法是凸优化求解器的核心引擎，理解它就理解了 MOSEK/ECOS 内部运作。
 
 ---
 
@@ -1332,6 +1603,27 @@ $$\text{s.t.} \; \mathbf{1}^\top\mathbf{w} = 1$$
 | $\mu = 100$ | $\approx 6$ | $20 \sim 50$ | $\approx 180$ |
 
 $\mu \approx 10$ 在两者之间取得最佳平衡，验证了经验选择的合理性。
+
+---
+
+## 本章小结
+
+| 概念/方法 | 核心公式 | 作用 | 关键参数 |
+|----------|---------|------|---------|
+| **对数障碍函数** | $\phi(\mathbf{x}) = -\sum_i \log(-g_i(\mathbf{x}))$ | 将不等式约束内化为惩罚 | — |
+| **参数化近似** | $\min\; tf(\mathbf{x}) + \phi(\mathbf{x})$ | 构造趋近原问题的近似族 | $t > 0$：大 $t$ 趋近原问题 |
+| **次优界** | $f(\mathbf{x}^*(t)) - f^* \leq m/t$ | 给出停止准则 | $m$：约束数；$t \geq m/\epsilon$ 保证 $\epsilon$-最优 |
+| **中心路径** | $\mathcal{C} = \{\mathbf{x}^*(t) \mid t>0\}$ | 连接内部点与最优解的轨迹 | — |
+| **内层牛顿步** | $\begin{pmatrix}H & A^T \\ A & 0\end{pmatrix}\begin{pmatrix}\Delta\mathbf{x}\\\boldsymbol{\nu}\end{pmatrix}=-\begin{pmatrix}\nabla F_t\\0\end{pmatrix}$ | 求解固定 $t$ 的等式约束问题 | Newton decrement $< \epsilon_{\text{newton}}$ 停止 |
+| **外层参数更新** | $t \leftarrow \mu t$，$\mu \approx 10 \sim 20$ | 逐步增大 $t$ 沿中心路径逼近 | $\mu$：太小步多，太大内层难 |
+| **原始-对偶法** | 联立扰动 KKT 方程组 $(r_{\text{dual}}, r_{\text{cent}}, r_{\text{prim}}) = \mathbf{0}$ | 同时更新 $(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$，收敛更快 | $\sigma \approx 0.1$（向心度） |
+| **总复杂度** | $O\!\left(\sqrt{m}\log(1/\epsilon)\right)$ 次牛顿步 | 多项式时间保证 | $m$：约束数 |
+
+**核心思想总结**：
+1. **以光滑代不光滑**：对数障碍函数将不等式约束转化为光滑惩罚，使得牛顿法（二阶方法）可以应用。
+2. **中心路径是桥梁**：扰动 KKT 条件的解族构成中心路径，从内部出发沿路径跟踪到最优解，始终保持严格可行性。
+3. **次优界驱动停止**：$m/t \leq \epsilon$ 给出可计算、可验证的停止准则，不依赖未知的最优值。
+4. **工业级实现**：MOSEK、Gurobi、SCS 等求解器均基于原始-对偶内点法，可处理百万量级 LP/QP/SDP 问题。
 
 ---
 

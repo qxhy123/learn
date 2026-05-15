@@ -1,4 +1,49 @@
-# 第16章：随机梯度下降
+# 第16章：随机梯度下降（融合版）
+
+> **难度**：★★★☆☆
+> **前置知识**：第5章（梯度下降基础）、微积分、概率论基础
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 16.1–16.5 / 深度学习应用 / 练习题）+ 在最前置一例速记 / 思维路径 + 最后追加套路总结与自测。
+
+> **一例速记**：
+> **SGD 更新**：$\theta_{t+1} = \theta_t - \alpha_t \nabla f_{i_t}(\theta_t)$，每步只用**一个**随机样本的梯度，代价 $O(1)$ vs 全梯度 $O(n)$。
+> **无偏性**：$\mathbb{E}_{i_t}[\nabla f_{i_t}(\theta_t)] = \nabla \hat{R}_n(\theta_t)$，期望意义下方向正确。
+> **方差**：$\text{Var}[\tilde{g}] \leq \sigma^2$；Mini-batch $B$ 个样本后方差变为 $\sigma^2/B$。
+> **收敛率**：凸函数 $O(1/\sqrt{T})$，强凸 $O(1/T)$；均为最优下界（信息论）。
+> **Robbins-Monro**：精确收敛需 $\sum \alpha_t = \infty$，$\sum \alpha_t^2 < \infty$（典型：$\alpha_t = c/t$）。
+> **AI 关联**：神经网络训练 = 大规模非凸随机优化；Mini-batch SGD 是事实标准；批量越大方差越小但泛化可能变差。
+
+---
+
+## 引入：学习率对 SGD 收敛的双刃效应
+
+> **题目**：在单变量强凸函数 $f(\theta) = \frac{1}{2}\theta^2$ 上运行 SGD，随机梯度为 $\tilde{g}_t = \theta_t + \xi_t$，其中 $\xi_t \sim \mathcal{N}(0, \sigma^2)$（噪声独立同分布）。
+>
+> 取固定学习率 $\alpha \in (0,1)$，初始点 $\theta_0 \neq 0$。
+>
+> (1) 写出 $\theta_{t+1}$ 关于 $\theta_t$ 的递推式，计算 $\mathbb{E}[\theta_t]$；
+> (2) 当 $t \to \infty$ 时，$\mathbb{E}[\theta_t^2]$ 是否收敛到 $0$？若否，稳态误差是多少？
+> (3) 若要将稳态误差控制在 $\epsilon$ 以内，$\alpha$ 应如何选取？
+
+请先停下来想一想：**固定学习率的 SGD 能精确收敛到最优解吗？**
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "函数是 $f(\theta)=\frac{1}{2}\theta^2$，梯度是 $\theta$，SGD 更新：$\theta_{t+1} = \theta_t - \alpha\tilde{g}_t = \theta_t - \alpha(\theta_t + \xi_t) = (1-\alpha)\theta_t - \alpha\xi_t$。
+>
+> **第 (1) 问：期望**。由线性性：$\mathbb{E}[\theta_{t+1}] = (1-\alpha)\mathbb{E}[\theta_t]$（因 $\mathbb{E}[\xi_t]=0$），归纳得 $\mathbb{E}[\theta_t] = (1-\alpha)^t \theta_0 \to 0$。好，期望收敛到最优解 $\theta^*=0$。
+>
+> **第 (2) 问：二阶矩**。但期望收敛不等于参数收敛！算 $\mathbb{E}[\theta_t^2]$：
+> $$\mathbb{E}[\theta_{t+1}^2] = \mathbb{E}[(1-\alpha)^2\theta_t^2 + 2(1-\alpha)\theta_t(-\alpha\xi_t) + \alpha^2\xi_t^2]$$
+> $= (1-\alpha)^2\mathbb{E}[\theta_t^2] + \alpha^2\sigma^2$（交叉项为零，因 $\xi_t \perp \theta_t$）。
+> 这是一个等比递推：稳态时令 $\mathbb{E}[\theta_\infty^2] = v$，则 $v = (1-\alpha)^2 v + \alpha^2\sigma^2$，解得：
+> $$v = \frac{\alpha^2\sigma^2}{1-(1-\alpha)^2} = \frac{\alpha^2\sigma^2}{2\alpha-\alpha^2} = \frac{\alpha\sigma^2}{2-\alpha} \approx \frac{\alpha\sigma^2}{2}$$
+> **结论**：固定学习率 SGD **不精确收敛**！稳态误差 $\propto \alpha\sigma^2$——学习率越大、噪声越大，误差越大。
+>
+> **第 (3) 问：选学习率**。要 $\frac{\alpha\sigma^2}{2-\alpha} \leq \epsilon$，即 $\alpha \leq \frac{2\epsilon}{\sigma^2+\epsilon}$。当 $\epsilon \ll \sigma^2$ 时，$\alpha \lesssim \frac{2\epsilon}{\sigma^2}$。精度越高，学习率上界越小。
+>
+> **关键洞察**：这正是 Robbins-Monro 条件 $\sum\alpha_t^2 < \infty$（衰减率）的必要性——必须让学习率逐渐衰减，才能同时做到"走得到"（$\sum\alpha_t=\infty$）和"收得住"（$\sum\alpha_t^2<\infty$）。"
 
 ---
 
@@ -1092,5 +1137,277 @@ $$\frac{D\sigma}{\sqrt{BT}} = \frac{D\sigma}{\sqrt{B \cdot (C/B)}} = \frac{D\sig
 实验曲线的初始阶段通常比理论率更快（常数因子有利），后期（固定学习率时）会在稳态误差处饱和。
 
 ---
+
+## 几何示意
+
+### 图 16-1：GD vs SGD vs Mini-batch SGD 轨迹对比
+
+下图展示在椭圆等高线上三种方法的下降路径：
+- **GD**（蓝色实线）：光滑确定性路径，沿梯度方向直线前进，无抖动
+- **SGD**（橙色折线）：随机噪声导致路径曲折，整体趋势向极小值但有大幅抖动
+- **Mini-batch SGD**（绿色线）：平滑度居中，噪声减半（$B=4$）
+
+![图16-1 GD vs SGD vs Mini-batch SGD](../figures/svg/opt-p6-16-1.svg)
+
+---
+
+## 抽象成方法（套路总结）
+
+### 核心算法速查
+
+| 场景 | 算法 | 更新公式 | 收敛率 |
+|:----:|:----:|:-------:|:------:|
+| 小数据集 | 批量 GD | $\theta \leftarrow \theta - \frac{\alpha}{n}\sum\nabla f_i$ | $O(1/T)$（凸）|
+| 大数据集 | SGD | $\theta \leftarrow \theta - \alpha \nabla f_{i_t}$ | $O(1/\sqrt{T})$（凸）|
+| 深度学习标准 | Mini-batch SGD | $\theta \leftarrow \theta - \frac{\alpha}{B}\sum_{i\in\mathcal{B}}\nabla f_i$ | $O(1/\sqrt{BT})$（凸）|
+
+### 5 步推导框架（凸函数 SGD 收敛）
+
+**Step 1**：$L$-光滑下降引理 $\Rightarrow$ $f(\theta_{t+1}) \leq f(\theta_t) - \alpha\|\nabla f\|^2 + \frac{L\alpha^2}{2}\|\tilde{g}\|^2$
+
+**Step 2**：对随机性取期望，利用无偏性 $\mathbb{E}[\tilde{g}] = \nabla f$
+
+**Step 3**：展开 $\|\theta_{t+1}-\theta^*\|^2$（一步下降递推式）
+
+**Step 4**：利用凸性 $f(\theta_t)-f^* \leq \langle\nabla f(\theta_t),\theta_t-\theta^*\rangle$
+
+**Step 5**：对 $t=0,\ldots,T-1$ 求和（望远镜），代入 $\alpha = D/(\sigma\sqrt{T})$
+
+### 学习率选择决策树
+
+```
+是否需要精确收敛？
+    │
+    ├── 是 → 用衰减学习率 αt = c/t（满足 Robbins-Monro）
+    │
+    └── 否（近似收敛即可）→ 用固定学习率
+           │
+           ├── 稳态误差 ≈ ασ²/（2μ），精度 ε → α ≤ 2με/σ²
+           └── 深度学习实践：余弦退火 / 分段常数衰减
+```
+
+---
+
+## 方法变形
+
+### 变形 1：方差减小技术（Variance Reduction）
+
+**SVRG（2013）**：每隔 $m$ 步计算一次精确全梯度 $\tilde{\nabla}$，随机梯度修正为：
+
+$$\hat{g}_t = \nabla f_{i_t}(\theta_t) - \nabla f_{i_t}(\tilde{\theta}) + \tilde{\nabla}$$
+
+**好处**：随迭代次数增加，方差趋向零，强凸函数可达 $O(\rho^T)$ 线性收敛（无需衰减学习率）。
+**代价**：每轮额外一次全梯度计算，适合中小规模数据集。
+
+### 变形 2：随机平均梯度（SAG/SAGA）
+
+SAG 维护每个样本的最新梯度缓存 $g_i^{(\text{old})}$，每步更新选中样本的缓存并用均值更新参数。SAGA 将缓存的利用改为无偏形式，收敛保证更强。**记忆代价** $O(nd)$，适合 $d$ 小的场景。
+
+### 变形 3：在线 SGD 的自适应扩展
+
+Adagrad / RMSProp / Adam（见第 18 章）可以视为带自适应步长的 Mini-batch SGD，在稀疏梯度（NLP 词嵌入）上远优于标准 SGD。
+
+---
+
+## 思考路标（条件反射）
+
+- 看到"随机梯度"→ 想到无偏性 $\mathbb{E}[\tilde{g}]=\nabla f$ + 方差 $\sigma^2$，两者缺一不可
+- 看到"Mini-batch 大小 $B$"→ 想到方差缩减 $\sigma^2/B$，有效步长线性缩放规则 $\alpha \propto \sqrt{B}$
+- 看到"SGD 收敛率 $O(1/\sqrt{T})$"→ 想到这是有界方差一阶随机方法的**信息论下界**，无法突破（不引入方差减小）
+- 看到"Robbins-Monro 条件"→ 想到两个不等式：$\sum\alpha_t=\infty$（走得到）+ $\sum\alpha_t^2<\infty$（收得住），两者缺一必失
+- 看到"多项式衰减 $\alpha_t=c/t$"→ 想到实践中早期步长极小，常配合**学习率预热**（warm-up）再衰减
+- 看到"稳态误差"→ 想到固定学习率下 $\mathbb{E}\|\theta_\infty-\theta^*\|^2 \approx \alpha\sigma^2/(2\mu)$，要减小误差只能减小 $\alpha$ 或 $\sigma^2$
+- 看到"SVRG / SARAH"→ 想到方差减小：每轮额外一次全梯度 $\tilde{g}_{\text{full}}$，把随机方差压到 $O(\sigma^2/n)$，在强凸函数上实现线性收敛
+- 看到"大批量训练（$B\!>\!512$）"→ 想到大批量泛化陷阱（sharp minima）+ 线性缩放 + 学习率预热，三者同时要做
+- 看到"梯度裁剪（gradient clipping）"→ 想到 SGD 方差控制手段之一：若 $\|\tilde{g}\|>\tau$ 则缩至 $\tau$，以牺牲无偏性换稳定性（引入偏差）
+- 看到"凸 vs 非凸收敛保证"→ 想到凸：$O(1/\sqrt{T})$ 函数间隙；非凸：$O(1/\sqrt{T})$ 梯度范数平方均值，目标物理量不同，不可混淆
+
+---
+
+## 易错点
+
+**易错 1**：混淆"SGD 收敛"与"SGD 期望收敛"。SGD 的输出通常是**运行均值** $\bar{\theta}_T = \frac{1}{T}\sum\theta_t$（凸函数）或**最后一步** $\theta_T$（强凸+衰减率），而非某次迭代的 $\theta_T$。
+
+**易错 2**：认为批量越大越好。固定总计算量 $C=BT$ 时，收敛率 $O(1/\sqrt{C})$ 与 $B$ 无关；但过大批量导致泛化性能下降（大批量泛化陷阱）。
+
+**易错 3**：Robbins-Monro 条件只给出"最终收敛"的保证，实践中 $\alpha_t = c/t$ 在早期迭代步长极小，收敛非常慢。常见替代：先预热（大步长探索）再衰减。
+
+**易错 4**：把"无偏"等同于"准确"。无偏只说期望相等，方差 $\sigma^2$ 可以很大。高方差的无偏估计在有限步数内给出的参数估计可能很差。
+
+**易错 5**：忽略随机洗牌的必要性。不洗牌时相邻 batch 高度相关，等效方差远大于 $\sigma^2/B$，破坏收敛分析的独立性假设。
+
+---
+
+## 典型应用例题
+
+### 例 1：Mini-batch 方差缩减与最优批量大小
+
+> **题目**：设训练集共 $n=1000$ 个样本，全梯度方差（$B=1$）为 $\sigma^2=4$，当前处理时间使得每步可运行批量 $B\in\{1,4,16,64\}$ 之一。给定总步数预算 $T=500$，凸且 $L$-光滑（$L=10$），初始间隙 $f(\theta_0)-f^*=20$。(1) 写出Mini-batch SGD 期望误差上界（凸，固定 $\alpha$）的表达式；(2) 对每个 $B$ 选择最优学习率并估算收敛误差，指出最优批量；(3) 若改用总样本数固定（$C=BT=\text{const}$），结论如何？
+
+【思路】直接代入定理 16.1 上界，最优 $\alpha$ 由平衡两项（初始间隙项 vs 方差项）确定；再以总计算量 $C$ 为尺度重新分析。
+
+【解】
+
+**(1) 上界公式**
+
+由定理 16.1（凸，$L$-光滑，Mini-batch，固定学习率），$T$ 步后：
+
+$$\mathbb{E}[f(\bar\theta_T)] - f^* \leq \frac{\|\theta_0-\theta^*\|^2}{2\alpha T} + \frac{\alpha L \sigma^2}{2B}$$
+
+令 $D^2 = \|\theta_0-\theta^*\|^2$，由初始间隙估算（凸 + $L$-光滑 $\Rightarrow$ $D \leq \sqrt{2(f_0-f^*)/L}$ ）：
+$D^2 \leq 2\times20/10 = 4$，即 $D=2$。
+
+**(2) 最优学习率与各批量误差**
+
+对固定 $B$，对 $\alpha$ 求导令两项相等：
+
+$$\alpha^*(B) = \frac{D}{\sqrt{T} \cdot \sigma/\sqrt{B}} \cdot \frac{1}{\sqrt{L}} = \frac{D\sqrt{B}}{\sigma\sqrt{LT}}$$
+
+代入上界（两项相等时总误差 = 2 × 单项）：
+
+$$\text{误差}(B) = \frac{D\sigma\sqrt{L}}{\sqrt{BT}}$$
+
+代入数值 $D=2,\sigma=2,L=10,T=500$：
+
+$$\text{误差}(B) = \frac{2\times2\times\sqrt{10}}{\sqrt{500B}} = \frac{4\sqrt{10}}{\sqrt{500B}} = \frac{4\sqrt{10}}{10\sqrt{5B}} = \frac{4\sqrt{2}}{10\sqrt{B}} = \frac{4\sqrt{2}}{10\sqrt{B}}$$
+
+| $B$ | $\sqrt{B}$ | 误差上界 |
+|:---:|:----------:|:-------:|
+| 1 | 1 | $4\sqrt{2}/10 \approx 0.566$ |
+| 4 | 2 | $4\sqrt{2}/20 \approx 0.283$ |
+| 16 | 4 | $4\sqrt{2}/40 \approx 0.141$ |
+| 64 | 8 | $4\sqrt{2}/80 \approx 0.071$ |
+
+批量越大，上界越小；$B=64$ 时误差约 0.071，**最优批量 $B=64$**（在给定 $T$ 下）。
+
+**(3) 固定总计算量 $C=BT$**
+
+设 $C=500$（$B=1,T=500$），此时 $T=C/B$，代入：
+
+$$\text{误差}(B,C) = \frac{D\sigma\sqrt{L}}{\sqrt{B \cdot C/B}} = \frac{D\sigma\sqrt{L}}{\sqrt{C}}$$
+
+**结论：误差与 $B$ 无关！** 固定总样本量时，Mini-batch SGD 的收敛率 $O(1/\sqrt{C})$ 与批量大小无关——这正是"线性缩放规则"的理论基础，大批量只能缩短墙钟时间，不能提高样本效率。
+
+【答案】$\boxed{\text{固定}T\text{下最优}B=64;\text{ 固定}C=BT\text{下收敛率与}B\text{无关，均为}O(1/\sqrt{C})}$
+
+---
+
+### 例 2：Robbins-Monro 学习率衰减 schedule 设计
+
+> **题目**：对强凸函数（强凸参数 $\mu=0.05$），某工程师设计了三种衰减 schedule：(A) $\alpha_t = 0.1$（固定）；(B) $\alpha_t = 1/t$；(C) $\alpha_t = 0.5/\sqrt{t}$。(1) 逐一验证是否满足 Robbins-Monro 条件；(2) 对满足条件的 schedule，说明强凸函数上的收敛速率；(3) 工程实践中哪种 schedule 最常用？为什么？
+
+【思路】逐条验证 $\sum\alpha_t=\infty$ 和 $\sum\alpha_t^2<\infty$；强凸函数下选多项式衰减可得线性收敛速率。
+
+【解】
+
+**(1) Robbins-Monro 验证**
+
+**Schedule A**（固定步长 $\alpha_t=0.1$）：
+- $\sum_{t=1}^\infty 0.1 = \infty$ ✓（满足第一条）
+- $\sum_{t=1}^\infty 0.1^2 = \infty$ ✗（不满足第二条）
+
+→ **不满足**：固定步长导致稳态误差 $\approx \alpha\sigma^2/(2\mu)=0.1\sigma^2/0.1=\sigma^2>0$，无法精确收敛。
+
+**Schedule B**（$\alpha_t=1/t$）：
+- $\sum_{t=1}^\infty 1/t = \infty$ ✓（调和级数发散）
+- $\sum_{t=1}^\infty 1/t^2 = \pi^2/6 < \infty$ ✓
+
+→ **满足** Robbins-Monro 条件。
+
+**Schedule C**（$\alpha_t=0.5/\sqrt{t}$）：
+- $\sum_{t=1}^\infty 0.5/\sqrt{t} = \infty$ ✓（$p$-级数 $p=1/2<1$，发散）
+- $\sum_{t=1}^\infty (0.5)^2/t = 0.25\sum 1/t = \infty$ ✗
+
+→ **不满足**：$\sum\alpha_t^2=\infty$，梯度噪声持续积累，参数在 $\theta^*$ 附近随机游走。
+
+**(2) 满足条件的 schedule B 的收敛速率**
+
+对强凸函数 $\mu>0$，取 $\alpha_t=c/t$（$c>1/\mu$），可证：
+
+$$\mathbb{E}\|\theta_T - \theta^*\|^2 = O\!\left(\frac{1}{T}\right)$$
+
+这比凸函数的 $O(1/\sqrt{T})$ 更快（强凸利用了曲率信息）。
+
+**(3) 实践推荐**
+
+工程中最常用 **Schedule A 变体**（带余弦退火或分段常数衰减）：先大步长（如余弦预热到峰值），再余弦衰减到 $\alpha_{\min}$。原因：纯 $O(1/t)$ 衰减在 $t=1$ 时步长 $=c$ 但随即迅速缩小，前期探索不足；现代训练更偏好在早期用较大步长充分探索，收敛后再精细调整。
+
+【答案】$\boxed{\text{Schedule B}\ (\alpha_t=1/t)\ \text{满足 R-M 条件；强凸下收敛}O(1/T)；\text{实践常用余弦退火}}$
+
+---
+
+### 例 3：SVRG 方差减小改进量估算
+
+> **题目**：设目标函数为 $f(\theta)=\frac{1}{n}\sum_{i=1}^n f_i(\theta)$，$n=100$，$\mu$-强凸（$\mu=0.01$），$L$-光滑（$L=1$），条件数 $\kappa=L/\mu=100$。(1) 标准 SGD（固定步长 $\alpha$，方差 $\sigma^2=1$）的稳态误差估算；(2) SVRG 每个外循环（epoch）计算一次全梯度 $\tilde{g}$，内循环 $m=2n=200$ 步，估算 SVRG 的等效梯度计算量与收敛速率；(3) 两者达到 $\epsilon=0.01$ 精度所需的梯度计算次数对比。
+
+【思路】SGD 用稳态误差公式；SVRG 利用方差减小后线性收敛（每外循环代价 $O(n+m)$）。
+
+【解】
+
+**(1) 标准 SGD 稳态误差**
+
+固定步长 SGD 在强凸函数上：稳态误差 $\approx \frac{\alpha\sigma^2}{2\mu}$。
+
+若取最优固定步长（平衡收敛速度与稳态误差，实践取 $\alpha\sim \mu/(L\sigma^2)\cdot\epsilon$），稳态误差 $\approx 0.01/(2\times0.01)=0.5$（取 $\alpha=0.01$）。要降至 $\epsilon=0.01$，需取极小 $\alpha=0.0002$，此时收敛速率极慢，有效步数 $\sim 1/(\mu\alpha)=50000$ 步。
+
+**(2) SVRG 等效代价与收敛速率**
+
+SVRG 每个外循环（epoch）：
+
+- 计算全梯度：$n=100$ 次梯度计算
+- 内循环 $m=200$ 步：每步 1 次梯度 $= 200$ 次梯度计算
+- 每 epoch 总代价：$100+200=300$ 次梯度计算
+
+SVRG 在强凸函数上的线性收敛率（每 epoch）：
+
+$$\mathbb{E}[f(\tilde\theta_{s+1}) - f^*] \leq \rho \cdot \mathbb{E}[f(\tilde\theta_s) - f^*], \quad \rho = \frac{L}{\mu m} = \frac{100}{0.01\times200} = 0.5$$
+
+即每 epoch 误差减半（$\rho=0.5<1$，线性收敛）。
+
+**(3) 精度对比**
+
+| 算法 | 收敛到 $\epsilon=0.01$ | 梯度计算次数 |
+|:----:|:---------------------:|:----------:|
+| SGD（$\alpha=0.0002$）| $T \sim 50000$ 步 | $50000$ 次 |
+| SVRG | $s$ 个 epoch 满足 $\rho^s\leq \epsilon/f_0$（$f_0=1$）$\Rightarrow$ $s\geq \lceil\log_{0.5}0.01\rceil = 7$ | $7\times300=2100$ 次 |
+
+**结论**：SVRG 总梯度计算次数约为 2100，比 SGD 的 50000 节省约 **24 倍**；代价是需要存储全梯度快照（内存 $O(d)$）以及每轮额外的全梯度计算。
+
+【答案】$\boxed{\text{SVRG 约 2100 次梯度计算达到} \epsilon=0.01,\text{ 比 SGD（约 50000 次）节省约 24 倍}}$
+
+---
+
+## 自测题（补充自测）
+
+**Q1**（填空）：对凸 $L$-光滑函数，Mini-batch SGD（批量 $B$）取最优学习率时，$T$ 步后函数间隙的期望上界为 $O(\ \_\_\_\_\ )$。
+
+**Q2**（判断）：SGD 在凸函数上的 $O(1/\sqrt{T})$ 收敛率可以被更好的一阶算法超越。（对/错，说明理由）
+
+**Q3**（计算）：设 $\sigma^2 = 1$，$\mu = 0.1$（强凸参数），$\alpha = 0.1$，稳态误差 $\mathbb{E}\|\theta_\infty - \theta^*\|^2 \approx$ ？
+
+**Q4**（分析）：批量从 $B=32$ 增至 $B=128$，应如何调整学习率？调整后收敛率（以 $BT$ 为总样本量计）如何变化？
+
+**Q5**（概念）：Robbins-Monro 条件的两个不等式各自对应什么物理含义？为何缺少任一条件都会导致 SGD 失败（给出具体反例）？
+
+<details>
+<summary>参考答案</summary>
+
+**Q1**：$O\!\left(\dfrac{1}{\sqrt{BT}}\right)$（将 $\sigma$ 替换为 $\sigma/\sqrt{B}$ 代入定理 16.1）。
+
+**Q2**：错。$O(1/\sqrt{T})$ 是有界方差一阶随机方法的信息论下界（见定理 16.3），任何仅使用随机梯度的方法均无法突破此界（不引入额外结构，如方差减小）。
+
+**Q3**：稳态误差 $\approx \alpha\sigma^2/(2\mu) = 0.1 \times 1 / (2 \times 0.1) = 0.5$。
+
+**Q4**：应按线性缩放规则将学习率从 $\alpha$ 调至 $4\alpha$（批量增 4 倍，步长增 4 倍）。收敛率以总样本量计仍为 $O(1/\sqrt{C})$（不变）；以迭代次数计，收敛加速 $\sqrt{4}=2$ 倍（$O(1/\sqrt{BT})$ 中 $B$ 增大）。
+
+**Q5**：$\sum\alpha_t=\infty$ 保证"走得到"——若步长过早趋零（如 $\alpha_t = 1/t^2$，$\sum = \pi^2/6 < \infty$），参数在初始点附近原地踏步，无法到达远处的最优解。$\sum\alpha_t^2 < \infty$ 保证"收得住"——若步长不衰减（固定 $\alpha$），梯度噪声持续驱动参数，在 $\theta^*$ 附近随机游走，无法精确收敛（稳态误差 $\sim \alpha\sigma^2/2 > 0$）。
+
+</details>
+
+---
+
+## 融合版说明
+
+本文件在原版基础上新增：**融合版标题与元数据** / **一例速记** / **引入题目** / **思维路径还原** / **几何示意** / **套路总结** / **方法变形** / **思考路标** / **易错点** / **典型应用例题** / **自测题**，共 11 段融合内容。原版正文（16.1–16.5 节 + 深度学习应用 + 练习题 + 答案）保持不变。
 
 *本章结束。下一章：[动量方法与加速梯度下降](./17-momentum-methods.md)*

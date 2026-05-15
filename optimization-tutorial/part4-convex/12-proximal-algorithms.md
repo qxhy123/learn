@@ -1,4 +1,53 @@
-# 第12章：近端算法
+# 第12章：近端算法（融合版）
+
+> **前置章节**：第10章（凸优化问题）、第7章（梯度下降法）
+>
+> **难度**：★★★★☆
+>
+> **预计学习时间**：5-7 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **近端算子**：$\text{prox}_{\alpha f}(\mathbf{x}) = \arg\min_\mathbf{u}\{f(\mathbf{u}) + \frac{1}{2\alpha}\|\mathbf{u}-\mathbf{x}\|^2\}$；$\alpha$ 越大越向 $f$ 的极小值靠近，$\alpha \to 0$ 退化为恒等映射。
+> **软阈值**（$\ell_1$ 的近端算子）：$[\mathcal{S}_{\alpha\lambda}(\mathbf{x})]_i = \text{sign}(x_i)\max(|x_i|-\alpha\lambda, 0)$；绝对值小于阈值的分量精确置零。
+> **ISTA**：梯度步 + 近端步，$\mathbf{x}_{k+1} = \text{prox}_{\alpha g}(\mathbf{x}_k - \alpha\nabla f(\mathbf{x}_k))$；收敛率 $O(1/k)$，步长 $\alpha \leq 1/L$。
+> **FISTA**：ISTA + Nesterov 动量外推；收敛率 $O(1/k^2)$，计算量几乎不变——多维护 $\mathbf{y}_k, t_k$ 两个辅助变量。
+> **ADMM**：$\min f(\mathbf{x})+g(\mathbf{z})$ s.t. $A\mathbf{x}+B\mathbf{z}=\mathbf{c}$；三步交替（$\mathbf{x}$-步/$\mathbf{z}$-步/对偶更新），收敛率 $O(1/k)$，可分解可分布式。
+> **AI 关联**：LASSO 用 ISTA/FISTA/ADMM；神经网络 L1 稀疏训练 = SGD 后接软阈值；结构性剪枝用 ADMM。
+
+---
+
+## 引入：软阈值算子为何能产生精确零？
+
+> **题目**：考虑一维 LASSO 问题：
+> $$\min_{x \in \mathbb{R}} \; \frac{1}{2}(x - a)^2 + \lambda|x|, \quad a = 2, \; \lambda = 0.5$$
+>
+> (1) 写出目标函数 $F(x) = \frac{1}{2}(x-2)^2 + 0.5|x|$，画出其大致形状并找出最优解 $x^*$；
+>
+> (2) 验证 $x^* = \mathcal{S}_\lambda(a) = \text{sign}(a)\max(|a|-\lambda, 0) = \text{sign}(2)\max(2-0.5, 0) = 1.5$；
+>
+> (3) 若 $a = 0.3$（比 $\lambda=0.5$ 小），说明为何 $x^* = 0$（精确零），并对比 L2 正则化 $\min_x \frac{1}{2}(x-0.3)^2 + 0.5x^2$ 的最优解（不为零）。
+
+请先停下来想一想：L1 和 L2 正则化的本质区别——次梯度条件决定了一个能产生精确零、另一个只能"接近零"。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "**第 (1) 问**：$F(x) = \frac{1}{2}(x-2)^2 + 0.5|x|$，它是两个凸函数的和，是凸函数，有唯一全局最小值。大致形状：在 $x > 0$ 时，$F(x) = \frac{1}{2}(x-2)^2 + 0.5x$，是向右平移的抛物线向上加了正斜率；在 $x < 0$ 时，加了负斜率。最小值应在 $x = 0$ 到 $x = 2$ 之间，通过次梯度条件确定。
+>
+> **第 (2) 问：次梯度最优性条件**。最优点 $x^*$ 满足 $0 \in \partial F(x^*) = (x^* - 2) + 0.5 \partial|x^*|$。
+>
+> 尝试 $x^* > 0$：$x^* - 2 + 0.5 = 0 \implies x^* = 1.5$，且 $1.5 > 0$ ✓，故 $x^* = 1.5$。
+>
+> 验证软阈值公式：$\mathcal{S}_{0.5}(2) = \text{sign}(2)\max(|2|-0.5, 0) = 1 \cdot 1.5 = 1.5$。完全吻合！
+>
+> **第 (3) 问：精确零的产生机制**。当 $a = 0.3 < \lambda = 0.5$ 时，尝试 $x^* = 0$：次梯度条件为 $0 \in (0 - 0.3) + 0.5 \cdot [-1, 1] = [-0.3 + 0.5(-1), -0.3 + 0.5(1)] = [-0.8, 0.2]$。因为 $0 \in [-0.8, 0.2]$，所以 $x^* = 0$ 是最优解！
+>
+> 关键洞察：L1 正则化在 $x=0$ 处有一个"折角"，次梯度区间 $[-\lambda, \lambda]$ 足以包含数据项的梯度 $-a$，当 $|a| \leq \lambda$ 时 $x^* = 0$ 精确成立。
+>
+> 对比 **L2 正则化**：$\min_x \frac{1}{2}(x-0.3)^2 + 0.5x^2$，导数为 $(x-0.3) + x = 2x - 0.3 = 0$，解 $x^* = 0.15 \neq 0$。L2 正则化将 $x$ 收缩但永远不为零——这是 L1 与 L2 的根本区别，也是 LASSO 能做特征选择而 Ridge 不能的原因。"
 
 ---
 
@@ -408,6 +457,209 @@ PR 分裂在问题严格凸时收敛更快，但需要严格的假设（$A$ 或 
 | Peaceman-Rachford | $\min f + g$，严格凸 | $\text{prox}_f$ + $\text{prox}_g$ | $O(n)$ |
 | ADMM | $\min f + g$ s.t. $Ax+Bz=c$ | $\text{prox}_f$ + $\text{prox}_g$ + 对偶更新 | 依赖子问题 |
 | FISTA | $\min f + g$，$f$ 光滑 | $\nabla f$ + $\text{prox}_g$ + 动量 | $O(n)$ |
+
+---
+
+## 几何示意
+
+### 图 12-1：软阈值算子
+
+![$\text{prox}_{\lambda\|\cdot\|_1}$ 三段折线](../figures/svg/opt-p4-12-1.svg)
+
+### 图 12-2：ISTA vs FISTA 收敛
+
+![$O(1/k)$ vs $O(1/k^2)$ 对比](../figures/svg/opt-p4-12-2.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 名称 | 公式 | 说明 |
+|------|------|------|
+| **近端算子** | $\mathrm{prox}_{\alpha g}(\mathbf{v})=\arg\min_\mathbf{u}\bigl\{g(\mathbf{u})+\tfrac{1}{2\alpha}\lVert\mathbf{u}-\mathbf{v}\rVert^2\bigr\}$ | 近端映射，处理不可微 $g$ |
+| **软阈值（L1）** | $\mathcal{S}_\lambda(v)=\mathrm{sign}(v)\max(\lvert v\rvert-\lambda,0)$ | $g=\lambda\lVert\cdot\rVert_1$ 的近端算子 |
+| **投影（指示函数）** | $\mathrm{prox}_{\delta_C}(\mathbf{v})=\Pi_C(\mathbf{v})$ | $g=\delta_C$ 时退化为凸投影 |
+| **Moreau 分解** | $\mathbf{v}=\mathrm{prox}_{\alpha g}(\mathbf{v})+\alpha\,\mathrm{prox}_{g^*/\alpha}(\mathbf{v}/\alpha)$ | 将一个近端算子转化为其共轭的近端算子 |
+| **ISTA** | $\mathbf{x}_{k+1}=\mathrm{prox}_{\alpha g}(\mathbf{x}_k-\alpha\nabla f(\mathbf{x}_k))$ | 梯度步 + 近端步，$O(1/k)$ |
+| **FISTA 动量** | $t_{k+1}=\tfrac{1+\sqrt{1+4t_k^2}}{2}$，$\mathbf{y}_{k+1}=\mathbf{x}_k+\tfrac{t_k-1}{t_{k+1}}(\mathbf{x}_k-\mathbf{x}_{k-1})$ | Nesterov 动量，$O(1/k^2)$ |
+| **ADMM x-步** | $\mathbf{x}_{k+1}=\arg\min_\mathbf{x}\bigl\{f(\mathbf{x})+\tfrac{\rho}{2}\lVert A\mathbf{x}+B\mathbf{z}_k-\mathbf{c}+\mathbf{u}_k\rVert^2\bigr\}$ | 通常为线性系统或近端算子 |
+| **ADMM z-步** | $\mathbf{z}_{k+1}=\mathrm{prox}_{g/\rho}(A\mathbf{x}_{k+1}+B^{-1}(\mathbf{c}-\mathbf{u}_k))$（可分）| 独立近端算子（可并行）|
+| **ADMM 对偶步** | $\mathbf{u}_{k+1}=\mathbf{u}_k+A\mathbf{x}_{k+1}+B\mathbf{z}_{k+1}-\mathbf{c}$ | 缩放对偶变量更新 |
+| **Lasso 软阈值** | $\mathbf{x}^*=\mathcal{S}_{\lambda/L}(\mathbf{x}-\tfrac{1}{L}\nabla f(\mathbf{x}))$，$L=\lVert A^TA\rVert_2$ | ISTA 用于 Lasso，步长 $1/L$ |
+
+### 近端算法选择 4 步流程
+
+1. **分解目标**：将 $F(\mathbf{x})$ 写成 $f(\mathbf{x})+g(\mathbf{x})$，$f$ 光滑（有梯度），$g$ 不可微
+2. **计算近端算子**：查表（L1→软阈值，非负约束→截断，L2 球→缩放投影）
+3. **选择算法**：有约束耦合 → ADMM；无约束 → ISTA（快速原型）/ FISTA（要精度）
+4. **设置参数**：ISTA/FISTA 步长 $\alpha=1/L$（$L=$ Lipschitz 常数）；ADMM 增广参数 $\rho\approx1\sim10$
+
+---
+
+## 方法变形
+
+### 变形 1：Lasso 的 ISTA/FISTA
+
+目标 $\min\,\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2+\lambda\lVert\mathbf{x}\rVert_1$，$f=\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2$（光滑，$\nabla f=A^T(A\mathbf{x}-\mathbf{b})$，$L=\lVert A^TA\rVert_2$），$g=\lambda\lVert\cdot\rVert_1$（近端算子为软阈值）。ISTA 每步 $O(mn)$，FISTA 加速至 $O(1/k^2)$ 收敛。
+
+### 变形 2：Group Lasso 的近端算子
+
+$g(\mathbf{x})=\lambda\sum_{\ell}\lVert\mathbf{x}_{G_\ell}\rVert_2$（按组 L2 范数）。组 $G_\ell$ 的近端算子为 **块软阈值**：$\mathrm{prox}(v_{G_\ell})=\max(1-\lambda\alpha/\lVert v_{G_\ell}\rVert_2,0)\cdot v_{G_\ell}$，整组归零或整组缩放，实现结构稀疏。
+
+### 变形 3：ADMM 分布式 Lasso
+
+将样本分片 $A=\begin{pmatrix}A_1\\\vdots\\A_K\end{pmatrix}$，每台机器持有 $A_k,\mathbf{b}_k$，ADMM 中 $\mathbf{x}$-步并行执行，$\mathbf{z}$-步在中心节点做软阈值，对偶更新广播。通信量 $O(pK)$（$p$：特征维度）每轮，可横向扩展到大规模数据。
+
+### 变形 4：近端梯度 + 动量用于神经网络稀疏化
+
+将每步 SGD 后接软阈值（`prox` 步），实现权重精确稀疏（ISTA 精神）；结合 Adam 动量：先 Adam 更新，再对权重做软阈值，称为 **ProxAdam**，用于稀疏神经网络训练和神经架构搜索。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到 $\lVert\mathbf{x}\rVert_1$ 惩罚项 → 近端算子 = 软阈值 $\mathcal{S}_\lambda$，ISTA 直接可用
+2. 看到非负约束 $\mathbf{x}\geq0$ → 近端算子 = 截断（ReLU）$\max(\cdot,0)$
+3. 看到球约束 $\lVert\mathbf{x}\rVert_2\leq r$ → 近端算子 = 投影，$\mathbf{v}\cdot\min(1,r/\lVert\mathbf{v}\rVert_2)$
+4. 看到 Moreau 分解 → 求共轭 $g^*$ 的近端算子，用于对偶问题
+5. 看到 ISTA $O(1/k)$ 收敛 → 加动量变 FISTA，$O(1/k^2)$ 不增加每步复杂度
+6. 看到 FISTA 动量系数 $(t_k-1)/t_{k+1}$ → $t_k\approx k/2$，系数趋近 $1$，动量越来越强
+7. 看到两个不可微函数相加 $f+g$ → ADMM 或 Douglas-Rachford 分裂
+8. 看到增广参数 $\rho$ → ADMM 收敛速度对 $\rho$ 敏感，自适应调整策略：残差比大时增大 $\rho$
+9. 看到 Elastic Net $\lambda_1\lVert\mathbf{x}\rVert_1+\lambda_2\lVert\mathbf{x}\rVert_2^2$ → $g=\lambda_1\lVert\cdot\rVert_1$（近端=软阈值），$f$ 中加入 $\lambda_2\lVert\mathbf{x}\rVert_2^2$（光滑），ISTA 直接可用
+10. 看到"稀疏性"要求 → 精确稀疏用近端算子（软阈值），次梯度法只能趋近零不能精确为零
+11. 看到 ADMM x-步含 $(A^TA+\rho I)$ → 正定线性系统，预分解（Cholesky）一次后每步 $O(n^2)$ 回代
+12. 看到 CVXPY + SCS → SCS 内部是 ADMM 一阶方法，适合大规模稀疏问题（$n\sim10^6$）
+
+---
+
+## 易错点
+
+1. **步长 $\alpha>1/L$ 导致 ISTA 发散**：ISTA 要求 $\alpha\leq1/L$（$L=\lVert A^TA\rVert_2$）才能保证收敛；步长太大时目标值可能振荡上升。**避雷**：用最大奇异值估计 $L$（`np.linalg.norm(A, ord=2)**2`），或用 backtracking 确定步长。
+
+2. **FISTA 动量项的索引混淆**：FISTA 更新需要 $\mathbf{x}_{k-1}$ 和 $\mathbf{x}_k$，动量步是 $\mathbf{y}_{k+1}=\mathbf{x}_k+\frac{t_k-1}{t_{k+1}}(\mathbf{x}_k-\mathbf{x}_{k-1})$，而**不是** $\mathbf{x}_{k+1}-\mathbf{x}_k$。**避雷**：保存两步历史 `x_prev, x_curr`，先近端步更新 `x_new`，再更新 $\mathbf{y}$。
+
+3. **ADMM 增广参数 $\rho$ 选择不当**：$\rho$ 太小收敛慢（原始残差难以缩小），太大对偶残差慢。**避雷**：自适应调整：若原始残差 $>10\times$ 对偶残差则增大 $\rho$，反之减小 $\rho$（Boyd 2011 建议）。
+
+4. **软阈值对向量的逐分量应用**：标量软阈值 $\mathcal{S}_\lambda(v)=\mathrm{sign}(v)\max(\lvert v\rvert-\lambda,0)$ 对向量是**逐分量**应用，不是整体缩放（那是 Group Lasso）。**避雷**：L1 惩罚 → 逐分量；L2 范数惩罚 → 整体缩放；分清楚。
+
+5. **近端算子对强凸函数唯一性**：$g$ 凸时 $\mathrm{prox}_{\alpha g}$ 存在但可能非唯一（$g$ 不严格凸时）；$g$ 强凸时唯一且连续。对于 $g=\delta_C$（闭凸集的指示函数），近端算子 = 投影算子，只要 $C$ 非空则存在唯一。**避雷**：$g$ 非强凸时验证解唯一性（如 L1 在原点处次梯度不唯一，但近端算子仍唯一）。
+
+---
+
+## 典型应用例题
+
+### 例 1：Lasso 的 ISTA 实现与收敛
+
+> **题目**：$\min_{\mathbf{x}\in\mathbb{R}^3}\,\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2+0.1\lVert\mathbf{x}\rVert_1$，其中 $A=I_3$（单位矩阵），$\mathbf{b}=(1.5,-0.05,0.5)^T$。写出 ISTA 迭代格式，手算第一步，并说明哪些分量被置零。
+
+【思路】$A=I$ 时 $L=\lVert A^TA\rVert_2=1$，梯度 $\nabla f=A^T(A\mathbf{x}-\mathbf{b})=\mathbf{x}-\mathbf{b}$，步长 $\alpha=1$。ISTA 一步 = 软阈值直接作用于 $\mathbf{b}$。
+
+【解】$\mathbf{x}_0=(0,0,0)^T$，梯度步 $\tilde{\mathbf{x}}=\mathbf{x}_0-1\cdot(\mathbf{x}_0-\mathbf{b})=\mathbf{b}=(1.5,-0.05,0.5)^T$。
+
+软阈值（$\alpha\lambda=1\times0.1=0.1$）：
+$$x_1^*=\mathcal{S}_{0.1}(1.5)=1.4,\quad x_2^*=\mathcal{S}_{0.1}(-0.05)=0,\quad x_3^*=\mathcal{S}_{0.1}(0.5)=0.4$$
+
+**第二分量被置零**（$\lvert -0.05\rvert=0.05<0.1=\lambda$）。
+
+【答案】$\boxed{\mathbf{x}_1=(1.4,\ 0,\ 0.4)^T}$，一步收敛至最优（$A=I$ 时恰好一步）。
+
+【注】稀疏比例：3 个分量中 1 个为零（稀疏度 33%）。$\lambda$ 越大阈值越高，更多分量归零，模型越稀疏。
+
+---
+
+### 例 2：ADMM 求解 Elastic Net
+
+> **题目**：用 ADMM 求解 Elastic Net：$\min\,\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2+\lambda_1\lVert\mathbf{z}\rVert_1+\tfrac{\lambda_2}{2}\lVert\mathbf{x}\rVert^2$ s.t. $\mathbf{x}=\mathbf{z}$。写出 $\mathbf{x}$-步和 $\mathbf{z}$-步的闭形解。
+
+【思路】将 $\lambda_2$ 的岭惩罚放入 $\mathbf{x}$-步，L1 惩罚通过 $\mathbf{z}$ 变量分离，$\mathbf{z}$-步为软阈值。
+
+【解】增广拉格朗日（缩放形式）：$L_\rho=\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2+\tfrac{\lambda_2}{2}\lVert\mathbf{x}\rVert^2+\lambda_1\lVert\mathbf{z}\rVert_1+\tfrac{\rho}{2}\lVert\mathbf{x}-\mathbf{z}+\mathbf{u}\rVert^2$。
+
+**$\mathbf{x}$-步**（对 $\mathbf{x}$ 求梯度令为零）：
+
+$$\underbrace{(A^TA+(\lambda_2+\rho)I)}_{\text{正定，预分解}}\mathbf{x}=A^T\mathbf{b}+\rho(\mathbf{z}-\mathbf{u})$$
+
+**$\mathbf{z}$-步**（软阈值）：
+
+$$\mathbf{z}_{k+1}=\mathcal{S}_{\lambda_1/\rho}(\mathbf{x}_{k+1}+\mathbf{u}_k)$$
+
+对偶更新：$\mathbf{u}_{k+1}=\mathbf{u}_k+\mathbf{x}_{k+1}-\mathbf{z}_{k+1}$。
+
+【答案】$\boxed{\mathbf{x}\text{-步}=(A^TA+(\lambda_2+\rho)I)^{-1}(A^T\mathbf{b}+\rho(\mathbf{z}-\mathbf{u})),\ \mathbf{z}\text{-步}=\mathcal{S}_{\lambda_1/\rho}(\mathbf{x}+\mathbf{u})}$。
+
+【注】系数矩阵 $A^TA+(\lambda_2+\rho)I$ 仅需 Cholesky 分解一次（$O(p^3)$），后续每步仅需回代 $O(p^2)$，ADMM 对稀疏 $A$ 可用迭代求解器。
+
+---
+
+### 例 3：神经网络权重稀疏化（ISTA 精神）
+
+> **题目**：设单层神经网络权重 $\mathbf{w}\in\mathbb{R}^3$，当前值 $\mathbf{w}_0=(0.8,-0.03,0.15)^T$，梯度 $\nabla_{\mathbf{w}}\mathcal{L}=(0.1,-0.02,0.05)^T$，学习率 $\eta=0.1$，L1 正则系数 $\lambda=0.05$。分别用（A）次梯度法和（B）近端梯度法（ISTA）更新权重，比较稀疏性。
+
+【思路】次梯度法把 $\lambda\,\mathrm{sign}(\mathbf{w})$ 加入梯度直接更新；ISTA 先梯度步再软阈值。
+
+【解】
+
+**(A) 次梯度法**：$\mathbf{w}_1=\mathbf{w}_0-\eta(\nabla\mathcal{L}+\lambda\,\mathrm{sign}(\mathbf{w}_0))$
+
+$$=\begin{pmatrix}0.8\\-0.03\\0.15\end{pmatrix}-0.1\left(\begin{pmatrix}0.1\\-0.02\\0.05\end{pmatrix}+0.05\begin{pmatrix}1\\-1\\1\end{pmatrix}\right)=\begin{pmatrix}0.8-0.015\\-0.03+0.007\\0.15-0.01\end{pmatrix}=\begin{pmatrix}0.785\\-0.023\\0.14\end{pmatrix}$$
+
+无分量精确为零。
+
+**(B) 近端梯度法（ISTA）**：梯度步 $\tilde{\mathbf{w}}=\mathbf{w}_0-\eta\nabla\mathcal{L}=(0.79,-0.028,0.145)^T$；软阈值参数 $\eta\lambda=0.005$：
+
+$$w_1=\mathcal{S}_{0.005}(0.79)=0.785,\ w_2=\mathcal{S}_{0.005}(-0.028)=-0.023,\ w_3=\mathcal{S}_{0.005}(0.145)=0.14$$
+
+此例 $\lvert\tilde{w}_i\rvert>\eta\lambda$ 对所有分量，故无分量归零。若 $\lambda=0.3$（$\eta\lambda=0.03$），则 $w_2=\mathcal{S}_{0.03}(-0.028)=0$（精确为零）。
+
+【答案】$\boxed{\text{次梯度法：}(0.785,-0.023,0.14)^T;\ \text{ISTA：相同，但}\ \lambda\uparrow\ \text{时 ISTA 精确置零而次梯度不能}}$。
+
+【注】PyTorch 实现 ISTA 只需在 `optimizer.step()` 后接一行 `w.data = torch.sign(w.data) * (w.data.abs() - eta*lam).clamp(min=0)`。
+
+---
+
+## 自测题
+
+**自测 1**　计算 $\mathrm{prox}_{\alpha g}(\mathbf{v})$，其中 $g(\mathbf{x})=\lVert\mathbf{x}\rVert_2$（L2 范数，不是 L2 平方）。$\mathbf{v}=(3,4)^T$，$\alpha=2$。
+
+> 💡 提示：$\mathrm{prox}_{\alpha\lVert\cdot\rVert_2}(\mathbf{v})=\max(1-\alpha/\lVert\mathbf{v}\rVert_2,0)\mathbf{v}$；$\lVert\mathbf{v}\rVert_2=5$，结果 $=(1-2/5)(3,4)^T=0.6(3,4)^T=(1.8,2.4)^T$。
+
+**自测 2**　FISTA 的 $t_k$ 序列满足 $t_{k+1}=(1+\sqrt{1+4t_k^2})/2$，$t_1=1$。计算 $t_2,t_3$，并验证 $t_k\sim k/2$（$k$ 大时）的渐近行为。
+
+> 💡 提示：$t_2=(1+\sqrt{5})/2\approx1.618$；$t_3\approx2.058$；精确递推 $t_k^2-t_k\leq t_{k-1}^2$，可证 $t_k\geq(k+1)/2$，故动量系数 $(t_k-1)/t_{k+1}\to1$。
+
+**自测 3**　ADMM 处理 Lasso $\min\,\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert^2+\lambda\lVert\mathbf{z}\rVert_1$ s.t. $\mathbf{x}=\mathbf{z}$。当 $A=I$，$\rho=1$，$\lambda=0.5$，$\mathbf{b}=(2,0.3,-1)^T$ 时，从 $\mathbf{x}_0=\mathbf{z}_0=\mathbf{u}_0=\mathbf{0}$ 手算一轮 ADMM（x-步、z-步、u-步）。
+
+> 💡 提示：$\mathbf{x}_1=(I+I)^{-1}(\mathbf{b}+\rho(\mathbf{z}_0-\mathbf{u}_0))=\mathbf{b}/2=(1,0.15,-0.5)^T$；$\mathbf{z}_1=\mathcal{S}_{0.5}(\mathbf{x}_1+\mathbf{u}_0)=\mathcal{S}_{0.5}(1,0.15,-0.5)=(0.5,0,-0)$；$\mathbf{u}_1=\mathbf{u}_0+\mathbf{x}_1-\mathbf{z}_1=(0.5,0.15,-0.5)^T$。
+
+**自测 4**　说明为什么 ISTA 对 Lasso 的收敛速度是 $O(1/k)$，而 FISTA 是 $O(1/k^2)$。关键差异在哪里？
+
+> 💡 提示：ISTA 是普通次梯度法的加速版（近端步），收敛 $O(1/k)$；FISTA 用 Nesterov 动量（利用历史信息），达到凸函数一阶方法的最优下界 $O(1/k^2)$；关键差异是**动量外推步**（利用前两步信息而非仅当前步）。
+
+**自测 5**　解释 Douglas-Rachford 分裂与 ADMM 的关系：ADMM 可以看作对偶空间中的 DR 分裂，是什么意思？
+
+> 💡 提示：对原问题 $\min f+g$ s.t. $A\mathbf{x}+B\mathbf{z}=\mathbf{c}$ 的对偶问题做 DR 分裂，DR 的反射近端步对应原始空间的 ADMM x-步和 z-步；本质上 ADMM = 对偶上的近端点法（augmented Lagrangian 的交替极小化）。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + AI 应用 + 练习详解）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉：软阈值 / ISTA / ADMM |
+| 学习目标 + 12.1–12.5 严格正文 | 原版 | 近端算子 / ISTA / FISTA / ADMM 完整推导 |
+| 练习 12.1–12.5 详解 | 原版 | 巩固：Moreau 分解 / FISTA 收敛 / 稀疏神经网络 |
+| 本章小结（算法对比表）| 原版 | 5 种算法速查 |
+| 抽象成方法 + 方法变形 | 重写版（后置）| 4 步选择流程 + 4 类变形（Lasso/Group/分布式/神经网络）|
+| 思考路标（12 条）| 融合两版 | 条件反射：L1→软阈值→ISTA→FISTA→ADMM |
+| 易错点（5 条）| 融合两版 | 避雷：步长 / 动量索引 / $\rho$ 选择 / 逐分量 vs. 整体 |
+| 典型应用例题（3 例）| 重写版 | Lasso ISTA、Elastic Net ADMM、神经网络稀疏化 |
+| 自测题（5 题）| 重写版 | 额外验收 |
+
+**适用**：速记建立直觉 → 严格推导 → 练习巩固 → 套路总结 → 自测验收。近端算法是稀疏学习与大规模优化的核心工具，"梯度步 + 近端步"的框架贯穿 Lasso、神经网络稀疏化和联邦学习。
 
 ---
 

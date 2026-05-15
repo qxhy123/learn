@@ -1,10 +1,46 @@
-# 第10章：凸优化问题
+# 第10章：凸优化问题（融合版）
 
 > **前置知识**：第3章（凸集与凸函数）、第8章（不等式约束优化）、第9章（对偶理论）
 >
 > **本章难度**：★★★★☆
 >
 > **预计学习时间**：6-8 小时
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **凸优化标准形**：目标 $f_0$ 凸、不等式约束 $f_i$ 凸、等式约束仿射 → 局部最优 = 全局最优。
+> **层级**：$\text{LP} \subset \text{QP} \subset \text{SOCP} \subset \text{SDP}$；LP 最简单，SDP 最通用，均可多项式时间求解。
+> **LP**：目标线性，可行域多面体，最优在顶点。L1 回归 / Chebyshev 逼近均可化为 LP。
+> **QP**：目标二次 $\frac{1}{2}\mathbf{x}^TQ\mathbf{x}+\mathbf{q}^T\mathbf{x}$，$Q \succeq 0$ 保凸。SVM 硬/软间隔均是凸 QP。
+> **SOCP**：约束 $\|A_i\mathbf{x}+\mathbf{b}_i\|_2 \leq \mathbf{c}_i^T\mathbf{x}+d_i$；鲁棒优化 / 范数约束的标准归宿。
+> **SDP**：$\min \mathbf{c}^T\mathbf{x}$ s.t. $F_0+\sum x_i F_i \succeq 0$；AI 场景：谱范数正则、矩阵补全、SDP 松弛。
+> **强对偶**：Slater 条件成立 → $p^* = d^*$，KKT 充要。
+
+---
+
+## 引入：L1 正则化为什么产生稀疏解？
+
+> **题目**：考虑 L1 正则化线性回归（LASSO）：
+> $$\min_{\mathbf{x} \in \mathbb{R}^n} \|\mathbf{A}\mathbf{x} - \mathbf{b}\|_2^2 + \lambda\|\mathbf{x}\|_1$$
+> 试说明：(1) 这是一个凸优化问题；(2) 它能等价改写为一个 LP（当 $A$ 为线性时）或保持原形直接求解；(3) 从几何角度直觉解释为何 L1 正则化倾向于产生稀疏解（部分分量为零），而 L2 正则化（$\lambda\|\mathbf{x}\|_2^2$）不产生稀疏解。
+
+请先停下来想一想：L1 球（正方形）与 L2 球（圆形）和等值线相切时，接触点在哪里？
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "**第 (1) 问：凸性验证**。目标函数是两个凸函数之和：$\|\mathbf{A}\mathbf{x}-\mathbf{b}\|_2^2$ 是凸函数（二次型，Hessian $= 2\mathbf{A}^T\mathbf{A} \succeq 0$），$\lambda\|\mathbf{x}\|_1$ 是凸函数（凸函数的正倍数仍为凸函数）。两个凸函数之和是凸函数。没有额外约束，可行域 $\mathbb{R}^n$ 是凸集。故这是凸优化问题，任何局部最优即全局最优。
+>
+> **第 (2) 问：改写为 QP 或保持复合形式**。$\|\mathbf{x}\|_1 = \sum_i |x_i|$ 不可微，但可引入辅助变量 $\mathbf{t} \geq \mathbf{0}$，使得 $-\mathbf{t} \leq \mathbf{x} \leq \mathbf{t}$，等价地最小化 $\|\mathbf{A}\mathbf{x}-\mathbf{b}\|_2^2 + \lambda\mathbf{1}^T\mathbf{t}$（二次目标加线性约束），这是一个**凸 QP**。若进一步线性化 $\|\mathbf{A}\mathbf{x}-\mathbf{b}\|_2^2$（引入 $\|\cdot\|$ 的 epigraph 变量），最终可退化为 SOCP（因 $\|\cdot\|_2^2$ 是二阶锥约束）。在 CVXPY 中直接写 `cp.norm1` 即可，无需手工变换。
+>
+> **第 (3) 问：几何直觉**。在二维中，L1 球 $\{|\mathbf{x}|_1 \leq r\}$ 是正方形（角在坐标轴上），L2 球是圆形。最小化 $\|\mathbf{A}\mathbf{x}-\mathbf{b}\|_2^2$ 的等值线是椭圆族，从大到小向最优点 $\mathbf{x}^*$ 收缩。
+>
+> - **L1 正则**：等值椭圆与 L1 球第一次相切时，极大概率切在 L1 球的**顶角**（坐标轴上），对应某个分量为零——稀疏解。
+> - **L2 正则**：等值椭圆与 L2 球（圆）相切，切点可以在圆上任意位置，通常不在坐标轴上——无稀疏性。
+>
+> **一句话总结**：L1 球的"尖角"吸引最优解到坐标轴上，产生稀疏性；这是 LASSO 比 Ridge 更适合特征选择的几何根源，也是凸优化形状决定解结构的典型范例。"
 
 ---
 
@@ -894,6 +930,200 @@ if Y_sdp.value is not None:
 
 ---
 
+## 几何示意
+
+### 图 10-1：凸问题层级嵌套
+
+![LP ⊂ QP ⊂ SOCP ⊂ SDP ⊂ 凸优化](../figures/svg/opt-p4-10-1.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 问题类型 | 标准形 | 约束锥 | 关键判断依据 |
+|---------|-------|-------|------------|
+| **LP** | $\min\,\mathbf{c}^T\mathbf{x},\ A\mathbf{x}\preceq\mathbf{b},\ C\mathbf{x}=\mathbf{d}$ | $\mathbb{R}^n_+$ | 目标线性 + 约束线性 |
+| **QP** | $\min\,\tfrac{1}{2}\mathbf{x}^TP\mathbf{x}+\mathbf{q}^T\mathbf{x},\ P\succeq 0$，线性约束 | $\mathbb{R}^n_+$ | 目标含 $\mathbf{x}^T P\mathbf{x}$，$P\succeq0$ |
+| **SOCP** | $\min\,\mathbf{c}^T\mathbf{x},\ \lVert A_i\mathbf{x}+\mathbf{b}_i\rVert_2\leq\mathbf{c}_i^T\mathbf{x}+d_i$ | $\mathcal{K}_{n_i}$（二阶锥）| 约束含范数 $\lVert\cdot\rVert_2$ |
+| **SDP** | $\min\,\mathrm{tr}(C X),\ \mathcal{A}(X)=\mathbf{b},\ X\succeq 0$ | $\mathbb{S}^n_+$ | 决策变量/约束含矩阵正半定 |
+| **QCQP→SOCP** | 二次约束 $\mathbf{x}^TQ\mathbf{x}+\mathbf{r}^T\mathbf{x}\leq s$ | 二阶锥（$Q\succeq0$）| Cholesky 因子化后变二阶锥 |
+| **Schur 补** | $\begin{pmatrix}A & B \\ B^T & C\end{pmatrix}\succeq0\iff A\succeq0, C-B^TA^{-1}B\succeq0$ | LMI | 将二次不等式线性化 |
+| **强对偶（Slater）** | $\exists\,\mathbf{x}$：$g_i(\mathbf{x})<0$ → $p^*=d^*$，KKT 充要 | — | 可行域内部非空即可 |
+
+### 凸优化问题标准化 5 步流程
+
+1. **判断目标凸性**：线性 → LP；二次 $P\succeq0$ → QP；其他 → 检查 Hessian 半正定
+2. **判断约束类型**：线性 → 保持；范数 → SOCP；矩阵不等式 → SDP；二次 $Q\succeq0$ → SOCP
+3. **验证 Slater 条件**：找一个严格满足所有不等式约束的可行点
+4. **写出 KKT 条件**：稳定性 + 原始可行 + 对偶可行（$\boldsymbol{\lambda}\geq\mathbf{0}$）+ 互补松弛（$\lambda_i g_i=0$）
+5. **调用求解器**：CVXPY 建模 → 选择 MOSEK/ECOS/SCS 内点求解器
+
+---
+
+## 方法变形
+
+### 变形 1：L1 正则化转 LP
+
+$\min\,\lVert A\mathbf{x}-\mathbf{b}\rVert_1$ 等价于 $\min\,\mathbf{1}^T\mathbf{t}\ \text{s.t.}\ -\mathbf{t}\preceq A\mathbf{x}-\mathbf{b}\preceq\mathbf{t},\ \mathbf{t}\geq\mathbf{0}$，是标准 LP，线性规划求解器直接适用。
+
+### 变形 2：SVM 对偶 QP
+
+硬间隔 SVM 原问题 $\min\,\tfrac{1}{2}\lVert\mathbf{w}\rVert^2$ s.t. $y_i(\mathbf{w}^T\mathbf{x}_i+b)\geq1$ 是 QP。对偶变为 $\max\,\sum\alpha_i - \tfrac{1}{2}\sum_{i,j}\alpha_i\alpha_j y_iy_j\mathbf{x}_i^T\mathbf{x}_j$ s.t. $\alpha_i\geq0$，可换核函数（核技巧）。
+
+### 变形 3：鲁棒线性规划 → SOCP
+
+约束系数 $\bar{\mathbf{a}}_i$ 有椭球不确定集 $\mathcal{U}_i = \{\bar{\mathbf{a}}_i+P_i\mathbf{u}:\lVert\mathbf{u}\rVert_2\leq1\}$ 时，最坏情形约束 $\max_{\mathbf{u}}\mathbf{a}^T\mathbf{x}\leq b_i$ 化为 SOCP 约束 $\bar{\mathbf{a}}_i^T\mathbf{x}+\lVert P_i^T\mathbf{x}\rVert_2\leq b_i$。
+
+### 变形 4：核范数最小化 → SDP
+
+矩阵补全中 $\min\,\lVert X\rVert_*$ 等价于 $\min\,\tfrac{1}{2}(\mathrm{tr}(W_1)+\mathrm{tr}(W_2))$ s.t. $\begin{pmatrix}W_1&X\\X^T&W_2\end{pmatrix}\succeq0$，是标准 SDP，约束秩结构映射到正半定锥。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到 $\min\,\mathbf{c}^T\mathbf{x}$ + 线性约束 → 立刻想 LP，复杂度 $O(n^{3.5})$，单纯形或内点法
+2. 看到目标含 $\mathbf{x}^TP\mathbf{x}$ → 检验 $P\succeq0$，是则为凸 QP；$P$ 不定则非凸，需放松
+3. 看到约束含 $\lVert\cdot\rVert_2\leq$ → SOCP，引入辅助变量 $t$，写成二阶锥标准形
+4. 看到矩阵正半定约束 $F(\mathbf{x})\succeq0$ → SDP，用 LMI 表示
+5. 看到"LP $\subset$ QP $\subset$ SOCP $\subset$ SDP" → 向更高层级转化时表达能力增强，代价也增大
+6. 看到 Slater 条件 → 凸问题 + 严格可行点 → 强对偶成立 → KKT 充要条件
+7. 看到互补松弛 $\lambda_i g_i(\mathbf{x}^*)=0$ → 非零乘子 ↔ 紧活动约束，零乘子 ↔ 非活动约束
+8. 看到 SVM 的间隔约束 $y_i(\mathbf{w}^T\mathbf{x}_i+b)\geq1$ → QP，对偶是核 SVM 的入口
+9. 看到 L1 惩罚 $\lVert\mathbf{x}\rVert_1$ → 引入辅助向量 $\mathbf{t}$ 转 LP（或用 ISTA 近端算子）
+10. 看到"Schur 补" → 将 $\mathbf{x}^TP\mathbf{x}\leq t$ 改写为 $2\times2$ 分块 LMI，用 SDP 求解
+11. 看到核范数 $\lVert X\rVert_*$ → SDP 松弛，矩阵补全 / 低秩逼近的凸代理
+12. 看到两个约束同时活动 → 计算顶点（基本可行解），LP 最优解在顶点取到
+
+---
+
+## 易错点
+
+1. **LP 最优在顶点，但忘记退化情形**：多个顶点同时最优（目标平行某条边）时返回任一顶点，但求解器不一定返回"最直觉"的那个；检验时要用 KKT 而非单看顶点位置。**避雷**：用对偶间隙 $=0$ 验证全局最优，而非单靠目标值比较。
+
+2. **QP 中 $P$ 半正定 vs. 正定混淆**：$P\succeq0$ 保证凸性（存在全局最小，可能非唯一）；$P\succ0$ 保证强凸（唯一最小）。当 $P$ 有零特征值时目标可能沿零空间方向无穷延伸，需加等式约束或检查可行集有界性。**避雷**：遇到 $P$ 奇异时先检查可行域是否有界。
+
+3. **SOCP 约束方向写反**：标准形 $\lVert A_i\mathbf{x}+\mathbf{b}_i\rVert_2\leq\mathbf{c}_i^T\mathbf{x}+d_i$ 要求右侧 $\geq0$；若 $\mathbf{c}_i^T\mathbf{x}+d_i$ 可负，该约束集不是二阶锥。**避雷**：CVXPY 会自动检查；手动推导时加约束 $\mathbf{c}_i^T\mathbf{x}+d_i\geq0$。
+
+4. **SDP 中忘记对称性**：LMI $F_0+\sum x_i F_i\succeq0$ 中每个 $F_i$ 必须对称（或选对称化 $\frac{F_i+F_i^T}{2}$），否则正半定判断无意义。矩阵变量 $X\succeq0$ 也需声明对称。**避雷**：CVXPY 的 `cp.Variable((n,n), symmetric=True)`。
+
+5. **Slater 条件仅适用于凸问题**：非凸问题即使 Slater 条件满足也不能保证强对偶；等式约束版本要求约束矩阵满秩（线性无关）而非仅仅等式存在。**避雷**：每次用 Slater 之前先确认问题是凸的，等式约束是线性的。
+
+---
+
+## 典型应用例题
+
+### 例 1：L1 正则化问题转化为 LP
+
+> **题目**：设 $A\in\mathbb{R}^{m\times n}$，$\mathbf{b}\in\mathbb{R}^m$。将问题 $\min_{\mathbf{x}}\,\lVert A\mathbf{x}-\mathbf{b}\rVert_1$ 改写为标准 LP 形式，并指出变量个数与约束个数。
+
+【思路】$\ell_1$ 范数 $=\sum_i\lvert(A\mathbf{x}-\mathbf{b})_i\rvert$；对每个绝对值引入辅助变量 $t_i\geq\lvert r_i\rvert$，等价于线性约束 $t_i\geq r_i$ 且 $t_i\geq-r_i$。
+
+【解】令 $\mathbf{r}=A\mathbf{x}-\mathbf{b}$，引入 $\mathbf{t}\in\mathbb{R}^m$，改写为：
+
+$$
+\min_{\mathbf{x},\,\mathbf{t}}\;\mathbf{1}^T\mathbf{t} \quad\text{s.t.}\quad A\mathbf{x}-\mathbf{b}\preceq\mathbf{t},\quad -(A\mathbf{x}-\mathbf{b})\preceq\mathbf{t},\quad \mathbf{t}\geq\mathbf{0}
+$$
+
+合并约束矩阵：决策变量 $(\mathbf{x},\mathbf{t})\in\mathbb{R}^{n+m}$，约束 $2m$ 个不等式 + $m$ 个非负约束，共 $3m$ 个线性不等式。目标 $\mathbf{1}^T\mathbf{t}$ 为线性，**这是标准 LP**。
+
+【答案】$\boxed{n+m \text{ 个变量，} 3m \text{ 个线性不等式约束}}$，LP 可用单纯形法或内点法在多项式时间内求解。
+
+【注】Lasso 回归 $\min\,\tfrac{1}{2}\lVert A\mathbf{x}-\mathbf{b}\rVert_2^2+\lambda\lVert\mathbf{x}\rVert_1$ 中的 $\ell_1$ 惩罚同理引入辅助变量转 QP，或用近端算子（ISTA）直接处理。
+
+---
+
+### 例 2：SVM 硬间隔 QP 及其对偶
+
+> **题目**：给定二分类训练集 $\{(\mathbf{x}_i,y_i)\}_{i=1}^N$（$y_i\in\{-1,+1\}$）。写出硬间隔 SVM 的 QP 标准形，并导出对偶问题，指出哪些训练点是支撑向量。
+
+【思路】原问题最大化间隔 $\Leftrightarrow$ 最小化 $\lVert\mathbf{w}\rVert^2/2$；对偶通过 Lagrangian 取偏导消去 $\mathbf{w},b$，得到仅含 $\alpha_i$ 的 QP。
+
+【解】
+
+**原问题（凸 QP）**：
+$$\min_{\mathbf{w},b}\;\tfrac{1}{2}\lVert\mathbf{w}\rVert^2 \quad\text{s.t.}\quad y_i(\mathbf{w}^T\mathbf{x}_i+b)\geq1,\quad i=1,\ldots,N$$
+
+变量 $d+1$ 个（$\mathbf{w}\in\mathbb{R}^d$，$b\in\mathbb{R}$），约束 $N$ 个线性不等式。
+
+**对偶问题（对偶 QP）**：消去 $\mathbf{w}=\sum_i\alpha_i y_i\mathbf{x}_i$，$\sum_i\alpha_i y_i=0$，得：
+$$\max_{\boldsymbol{\alpha}\geq0}\;\sum_{i=1}^N\alpha_i - \tfrac{1}{2}\sum_{i,j}\alpha_i\alpha_j y_iy_j\mathbf{x}_i^T\mathbf{x}_j \quad\text{s.t.}\quad \sum_i\alpha_i y_i=0$$
+
+**支撑向量**：互补松弛 $\alpha_i(y_i(\mathbf{w}^T\mathbf{x}_i+b)-1)=0$，故 $\alpha_i>0 \Leftrightarrow y_i(\mathbf{w}^T\mathbf{x}_i+b)=1$（在间隔边界上）。
+
+【答案】$\boxed{\text{支撑向量} = \{\mathbf{x}_i:\alpha_i^*>0\},\ \mathbf{w}^* = \sum_{i:\alpha_i^*>0}\alpha_i^*y_i\mathbf{x}_i}$。
+
+【注】内积 $\mathbf{x}_i^T\mathbf{x}_j$ 换成核函数 $K(\mathbf{x}_i,\mathbf{x}_j)$ 即得核 SVM，无需显式特征映射。
+
+---
+
+### 例 3：谱范数约束建模为 SDP
+
+> **题目**：神经网络权重矩阵 $W\in\mathbb{R}^{m\times n}$，要求谱范数（最大奇异值）$\lVert W\rVert_2\leq1$。将此约束改写为 LMI，并说明如何嵌入 SDP。
+
+【思路】$\lVert W\rVert_2\leq1 \Leftrightarrow \sigma_{\max}(W)\leq1 \Leftrightarrow W^TW\preceq I \Leftrightarrow I-W^TW\succeq0$；用 Schur 补将后者线性化。
+
+【解】
+
+Schur 补引理：$I-W^TW\succeq0 \Leftrightarrow \begin{pmatrix}I & W^T \\ W & I\end{pmatrix}\succeq0$（$2\times2$ 分块矩阵，维度 $(n+m)\times(n+m)$）。
+
+嵌入 SDP：设目标为 $\min\,f(W)$（如 Frobenius 范数正则），则：
+
+$$\min_{W}\;f(W)\quad\text{s.t.}\quad\begin{pmatrix}I_n & W^T \\ W & I_m\end{pmatrix}\succeq0$$
+
+这是标准 SDP（矩阵变量 $W$ 出现在 LMI 中线性，目标可取线性或加辅助变量处理）。
+
+【答案】$\boxed{\lVert W\rVert_2\leq1 \Leftrightarrow \begin{pmatrix}I_n & W^T \\ W & I_m\end{pmatrix}\succeq0}$，直接作为 SDP 约束嵌入。
+
+【注】谱归一化（Spectral Normalization）是上述 SDP 约束的一阶近似：每步梯度更新后除以 $\lVert W\rVert_2$，用于 GAN 训练稳定化。
+
+---
+
+## 自测题
+
+**自测 1**　将问题 $\min_\mathbf{x}\,\lVert\mathbf{x}\rVert_\infty$ s.t. $A\mathbf{x}=\mathbf{b}$ 改写为 LP 标准形，给出变量数与约束数（$A\in\mathbb{R}^{m\times n}$）。
+
+> 💡 提示：引入标量 $t$，$\lVert\mathbf{x}\rVert_\infty\leq t \Leftrightarrow -t\mathbf{1}\preceq\mathbf{x}\preceq t\mathbf{1}$；变量 $(\mathbf{x},t)\in\mathbb{R}^{n+1}$，约束 $2n$ 个不等式 + $m$ 个等式。
+
+**自测 2**　设 $Q\succ0$，证明 $\lVert Q^{1/2}\mathbf{x}\rVert_2\leq t \Leftrightarrow \mathbf{x}^TQ\mathbf{x}\leq t^2$（$t\geq0$），并说明这对应哪种锥约束。
+
+> 💡 提示：$\lVert Q^{1/2}\mathbf{x}\rVert_2^2=\mathbf{x}^TQ\mathbf{x}$；$t\geq0$ 时两侧平方等价；这是二阶锥约束 $(\mathbf{x},t)\in\mathcal{K}_{n+1}$（椭球二阶锥）。
+
+**自测 3**　写出软间隔 SVM 的 QP：目标 $\tfrac{1}{2}\lVert\mathbf{w}\rVert^2+C\sum\xi_i$，约束 $y_i(\mathbf{w}^T\mathbf{x}_i+b)\geq1-\xi_i$，$\xi_i\geq0$。共几个变量、几个约束？
+
+> 💡 提示：变量 $\mathbf{w}\in\mathbb{R}^d$，$b\in\mathbb{R}$，$\boldsymbol{\xi}\in\mathbb{R}^N$，共 $d+1+N$ 个；约束 $N$ 个间隔 + $N$ 个非负，共 $2N$ 个。目标是凸（$P=\mathrm{diag}(I_d,0,0)\succeq0$）的 QP。
+
+**自测 4**　用 Schur 补将约束 $x_1^2+x_2^2\leq x_3$（$x_3>0$）改写为 LMI 形式。
+
+> 💡 提示：$x_1^2+x_2^2\leq x_3 \Leftrightarrow \begin{pmatrix}x_3 & x_1 & x_2 \\ x_1 & 1 & 0 \\ x_2 & 0 & 1\end{pmatrix}\succeq0$（验证：Schur 补 $x_3-[x_1,x_2]\cdot I^{-1}\cdot[x_1,x_2]^T=x_3-x_1^2-x_2^2\geq0$）。
+
+**自测 5**　LP 最优解为什么一定在可行多面体的顶点处取到（若有界）？若目标函数与某条边平行，会发生什么？
+
+> 💡 提示：LP 目标面为超平面，沿可行集边界扫描时，最大值在边界顶点取到（极点定理）；若目标平行某条边，则该边上所有点均为最优，有无穷多最优解（求解器返回某端点）。
+
+---
+
+## 融合版说明
+
+本版 = **原版（严格推导 + AI 应用 + 练习详解）** + **重写版（速记 / 套路 / 例题 / 自测）** 融合：
+
+| 段落 | 来源 | 价值 |
+|------|------|------|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置）| 建立直觉 / 条件反射 |
+| 学习目标 + 10.1–10.5 严格正文 | 原版 | LP/QP/SOCP/SDP 完整推导 |
+| 练习 10.1–10.5 详解 | 原版 | 系统巩固 Slater / Schur 补 / SDP |
+| 本章小结（双表格）| 原版 | 层级速查 + 复杂度对比 |
+| 抽象成方法 + 方法变形 | 重写版（后置）| 套路固化，5 步流程 + 4 类变形 |
+| 思考路标（12 条）| 融合两版 | 条件反射，LP→QP→SOCP→SDP 映射 |
+| 易错点（5 条）| 融合两版 | 避雷：正定性 / 方向 / Slater 适用范围 |
+| 典型应用例题（3 例）| 重写版 | L1→LP、SVM QP 对偶、谱范数 SDP |
+| 自测题（5 题）| 重写版 | 额外验收 |
+
+**适用**：速记建立直觉 → 严格推导 → 练习巩固 → 套路总结 → 自测验收。凸优化层级 LP⊂QP⊂SOCP⊂SDP 是本章骨架，所有变形都在这条线上延伸。
+
+---
+
 ## 本章小结
 
 | 问题类型 | 标准形式（核心特征）| 约束锥 | 层次关系 | 典型应用 |
@@ -1427,6 +1657,25 @@ $$
 若 $m \times n$ 矩阵 $M$（不妨 $m \leq n$）的秩为 $r$，且满足**非相干性条件**（矩阵的奇异向量与标准基不太对齐），则当随机观测数 $|\Omega| \geq C \cdot \mu r n \log n$（$\mu$ 为非相干参数，$C$ 为常数）时，以高概率可精确恢复 $M$。
 
 **直觉**：秩越低（更多结构），所需观测越少；矩阵越"扩散"（非相干性好），信息分布均匀，从部分观测恢复越容易。这是**随机矩阵感知**的矩阵版本，对应信号处理中的压缩感知理论。
+
+---
+
+## 本章小结
+
+| 问题类型 | 目标函数 | 约束形式 | 典型 AI 应用 | 求解复杂度 |
+|---------|---------|---------|------------|-----------|
+| **LP**（线性规划） | 线性 $\mathbf{c}^T\mathbf{x}$ | 线性 $A\mathbf{x} \preceq \mathbf{b}$ | L1 回归、网络流 | $O(n^{3.5})$（内点法） |
+| **QP**（二次规划） | 二次 $\frac{1}{2}\mathbf{x}^TQ\mathbf{x}+\mathbf{q}^T\mathbf{x}$ | 线性不等式 | SVM（硬/软间隔）、Markowitz | $O(n^3)$ |
+| **SOCP**（二阶锥） | 线性 | 二阶锥 $\|A_i\mathbf{x}+\mathbf{b}_i\|_2 \leq \mathbf{c}_i^T\mathbf{x}+d_i$ | 鲁棒优化、范数约束 | $O(n^{3.5})$ |
+| **SDP**（半定规划） | 线性 $\mathbf{c}^T\mathbf{x}$ | LMI $F_0+\sum x_i F_i \succeq 0$ | 谱范数正则、矩阵补全 | $O(n^{6.5})$ |
+
+**层级关系总结**：LP $\subset$ QP $\subset$ SOCP $\subset$ SDP。越靠右表达能力越强，建模越灵活，但求解代价越高。
+
+**核心原则总结**：
+1. **凸性保障全局最优**：满足三要素（凸目标 + 凸不等式约束 + 仿射等式约束）即可保证局部最优 = 全局最优。
+2. **Slater 条件触发强对偶**：存在严格可行点则 $p^* = d^*$，KKT 是充要条件，可用对偶求解或验证。
+3. **问题归一化流程**：先判断目标和约束的凸性 → 匹配 LP/QP/SOCP/SDP 标准形 → 调用 CVXPY/MOSEK 等求解器。
+4. **AI 中的凸优化**：SVM 是 QP、稀疏回归是 QP/SOCP、谱范数正则是 SDP——凸性不仅理论优美，更带来可靠高效的全局求解。
 
 ---
 

@@ -1,4 +1,44 @@
-# 第9章：对偶理论
+# 第9章：对偶理论（融合版）
+
+> **前置知识**：第7章（等式约束优化）、第8章（KKT 条件）
+>
+> **本章难度**：★★★★★
+>
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **拉格朗日对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$，对 $(\boldsymbol{\lambda}, \boldsymbol{\nu})$ 恒为**凹函数**（仿射族的下确界）。
+> **弱对偶**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) \leq p^*$ 对所有 $\boldsymbol{\lambda} \geq 0$ 恒成立；对偶问题给出原始最优值的**下界**。
+> **强对偶**：$d^* = p^*$（对偶间隙为零）；凸问题 + Slater 条件 $\Rightarrow$ 强对偶成立。
+> **Slater 条件**：存在严格可行点（所有不等式约束严格满足），是凸问题强对偶的充分条件。
+> **AI 关联**：SVM / LP 对偶问题可高效求解，核技巧通过对偶形式引入；GAN 的极小极大博弈是鞍点问题的应用。
+
+---
+
+## 引入：对偶间隙的"三明治"比喻
+
+> **题目**：为什么求解对偶问题有时比求解原始问题更容易？对偶间隙为零意味着什么？
+
+请先停下来想一想：原始问题 $\min f(x)$ s.t. $g(x) \leq 0$ 可能是非凸的，难以全局求解。但**对偶函数** $g(\lambda) = \inf_x [f(x) + \lambda g(x)]$ 始终是关于 $\lambda$ 的凹函数——**即使原始问题非凸**！
+
+这就像三明治定理：对偶问题提供原始最优值 $p^*$ 的下界 $d^*$。弱对偶保证 $d^* \leq p^*$；强对偶（Slater 条件满足时）保证 $d^* = p^*$，此时通过对偶问题可以精确恢复原始最优解。
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "来了一道简单的带约束二次规划：$\min x^2$，约束 $x \geq 1$（即 $1-x \leq 0$）。
+>
+> **构造 Lagrangian**：$L(x, \lambda) = x^2 + \lambda(1-x)$，$\lambda \geq 0$。
+>
+> **求对偶函数**：$g(\lambda) = \inf_x [x^2 - \lambda x + \lambda]$。对 $x$ 求极小：$2x - \lambda = 0 \Rightarrow x^* = \lambda/2$。代入：$g(\lambda) = \lambda^2/4 - \lambda^2/2 + \lambda = -\lambda^2/4 + \lambda$。
+>
+> **对偶问题**：$\max_{\lambda \geq 0} g(\lambda) = \max_{\lambda \geq 0} (-\lambda^2/4 + \lambda)$。
+> $g'(\lambda) = -\lambda/2 + 1 = 0 \Rightarrow \lambda^* = 2$，$g(2) = -1 + 2 = 1$。
+>
+> **检验强对偶**：原始最优 $x^* = 1$（约束活跃），$p^* = 1$。$d^* = g(\lambda^*) = 1 = p^*$。强对偶成立，对偶间隙 $= 0$！
+>
+> **几何直觉**：Lagrangian $L(x, \lambda^*)  = x^2 + 2(1-x) = (x-1)^2 - 1 + 2 = (x-1)^2 + 1$，在 $x=1$ 处取极小，恰好等于原始最优值——鞍点的意义所在。"
 
 ---
 
@@ -1182,5 +1222,196 @@ $$\mathbf{b}^\top \boldsymbol{\lambda}^* = 4 \cdot 3 + 3 \cdot 0 = 12$$
 **(e) 影子价格解释**
 
 $\lambda_1^* = 3$：约束 $x_1 + x_2 \leq 4$ 的影子价格——若将右端项从4增加到5（即松弛约束1），原始最优值将改善约3（从-12变为约-15）。直觉上，多一单位的"总资源"，最优生产可以多增加 $3x_2$，即额外收益3。
+
+---
+
+## 几何示意
+
+### 图 9-1：强弱对偶与对偶 gap
+
+![弱对偶下界 + 强对偶相等](../figures/svg/opt-p3-09-1.svg)
+
+### 图 9-2：Lagrangian 鞍点
+
+![$\min_x \max_\lambda L(x,\lambda)$ 几何](../figures/svg/opt-p3-09-2.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 构造对偶问题 4 步法
+
+1. **写 Lagrangian**：$L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu}) = f_0(\mathbf{x}) + \sum_i \lambda_i f_i(\mathbf{x}) + \sum_j \nu_j h_j(\mathbf{x})$，其中 $\lambda_i \geq 0$
+2. **求对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$（对 $\mathbf{x}$ 极小化，无约束）
+3. **写对偶问题**：$\max_{\boldsymbol{\lambda} \geq 0, \boldsymbol{\nu}} g(\boldsymbol{\lambda}, \boldsymbol{\nu})$（凸优化问题！）
+4. **判断强对偶**：若凸问题 + Slater 条件满足，则 $d^* = p^*$；否则 $d^* \leq p^*$（弱对偶）
+
+### 核心概念速查
+
+| 概念 | 数学表达 | 关键性质 |
+|---|---|---|
+| **Lagrangian** | $L = f_0 + \sum\lambda_i f_i + \sum\nu_j h_j$ | 松弛约束到目标函数 |
+| **对偶函数** | $g(\boldsymbol{\lambda},\boldsymbol{\nu}) = \inf_\mathbf{x} L$ | 恒凹（即使原始非凸） |
+| **对偶问题** | $\max_{\boldsymbol{\lambda}\geq 0,\boldsymbol{\nu}} g(\boldsymbol{\lambda},\boldsymbol{\nu})$ | 恒为凸优化 |
+| **弱对偶** | $d^* \leq p^*$ 恒成立 | $g$ 提供 $p^*$ 的下界 |
+| **强对偶** | $d^* = p^*$ | 凸问题 + Slater $\Rightarrow$ 成立 |
+| **对偶间隙** | $p^* - d^* \geq 0$ | 零 $\Leftrightarrow$ 强对偶 |
+| **Slater 条件** | $\exists\tilde{\mathbf{x}}:\ f_i(\tilde{\mathbf{x}}) < 0\ \forall i$ | 严格可行点，凸问题强对偶的充分条件 |
+| **鞍点** | $L(\mathbf{x}^*, \boldsymbol{\lambda}, \boldsymbol{\nu}) \leq L(\mathbf{x}^*, \boldsymbol{\lambda}^*, \boldsymbol{\nu}^*) \leq L(\mathbf{x}, \boldsymbol{\lambda}^*, \boldsymbol{\nu}^*)$ | 等价于强对偶 + KKT |
+
+---
+
+## 方法变形
+
+### 变形 1：线性规划对偶（标准形式）
+
+原始 LP：$\min \mathbf{c}^\top\mathbf{x}$ s.t. $A\mathbf{x}=\mathbf{b}$，$\mathbf{x}\geq 0$。
+
+对偶 LP：$\max \mathbf{b}^\top\boldsymbol{\nu}$ s.t. $A^\top\boldsymbol{\nu} \leq \mathbf{c}$。
+
+LP 对偶总满足强对偶（若原始和对偶均可行）。**原始约束 $\leftrightarrow$ 对偶变量**，**原始变量 $\leftrightarrow$ 对偶约束**——结构完美对称。
+
+### 变形 2：SVM 对偶推导
+
+SVM 原始问题的对偶（无等式约束简化版）：$\max_{\boldsymbol{\alpha}} \sum_i \alpha_i - \frac{1}{2}\sum_{i,j}\alpha_i\alpha_j y_i y_j \mathbf{x}_i^\top\mathbf{x}_j$ s.t. $0 \leq \alpha_i \leq C$，$\sum_i \alpha_i y_i = 0$。
+
+对偶形式的优势：只需计算内积 $\mathbf{x}_i^\top\mathbf{x}_j$，用核函数 $K(\mathbf{x}_i, \mathbf{x}_j)$ 替换即可引入**核技巧**，无需显式特征映射。
+
+### 变形 3：用弱对偶证明下界
+
+即使无法求解原始问题，只要找到任何对偶可行点 $(\boldsymbol{\lambda}, \boldsymbol{\nu})$（$\boldsymbol{\lambda} \geq 0$），即有 $g(\boldsymbol{\lambda}, \boldsymbol{\nu}) \leq p^*$。这在整数规划（LP 松弛）中广泛应用：LP 松弛的最优值是 IP 最优值的下界。
+
+### 变形 4：鞍点与极小极大博弈
+
+强对偶等价于存在鞍点 $(\mathbf{x}^*, \boldsymbol{\lambda}^*, \boldsymbol{\nu}^*)$ 使得：
+
+$$\max_{\boldsymbol{\lambda}\geq 0} \min_\mathbf{x} L = \min_\mathbf{x} \max_{\boldsymbol{\lambda}\geq 0} L$$
+
+GAN 训练的极小极大目标 $\min_G \max_D V(D,G)$ 从结构上类似于此，但 $V$ 非凸，无强对偶保证，训练不稳定性来源于此。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"对偶问题" → 写 Lagrangian，对 $\mathbf{x}$ 求 $\inf$，得凹函数 $g$，再极大化 $g$
+2. 看到"弱对偶" → $d^* \leq p^*$ 恒成立，无条件（无须凸性）
+3. 看到"强对偶" → 需凸问题 + Slater 条件（严格可行点）；LP 总满足强对偶
+4. 看到 Slater 条件 → 找一个使所有不等式约束严格满足（$f_i(\tilde{\mathbf{x}}) < 0$）的可行点
+5. 看到"对偶间隙" → $p^* - d^* \geq 0$，等于零时强对偶成立；非零时有优化余地
+6. 看到"SVM 对偶" → $\alpha_i$ 是 KKT 乘子；支持向量 $\alpha_i > 0$；核技巧替换内积
+7. 看到"LP 对偶" → 原始等式约束 $\leftrightarrow$ 对偶变量无符号限制；原始不等式 $\leftrightarrow$ 对偶变量有符号
+8. 看到"鞍点" → 对偶变量上极大、原始变量下极小；极小极大等于极大极小
+9. 看到"GAN 极小极大" → 鞍点问题，但非凸，无强对偶保证，训练需特殊技巧
+10. 看到"影子价格" → 对偶变量 $\lambda_i^*$ 量化约束松弛对目标的边际影响
+
+---
+
+## 易错点
+
+1. **对偶函数 $g$ 可以取 $-\infty$**：若 $\lambda$ 选择使 Lagrangian 关于 $\mathbf{x}$ 无下界（如线性项主导），则 $g = -\infty$，该点对对偶无用。对偶问题的隐性约束就是 $g(\boldsymbol{\lambda}, \boldsymbol{\nu}) > -\infty$。
+2. **Slater 条件仅是充分条件**：不满足 Slater 条件不意味着强对偶不成立；只是失去了一个便于验证的充分条件。LP 无须 Slater 条件即满足强对偶。
+3. **弱对偶不需要凸性，强对偶需要**：初学者常将两者混淆。弱对偶 $d^* \leq p^*$ 对任何问题都成立；强对偶 $d^* = p^*$ 需要额外条件（凸性 + Slater 或 LP 结构）。
+4. **对偶变量的符号**：不等式约束 $f_i \leq 0$ 对应乘子 $\lambda_i \geq 0$（对偶可行性）；等式约束 $h_j = 0$ 对应乘子 $\nu_j$ 无符号限制。将 $\nu_j$ 限制为非负会丢失解。
+5. **LP 对偶不对称的来源**：原始取 $\min$，对偶取 $\max$；原始不等式 $\leq$ 对应对偶变量 $\geq 0$，原始等式对应对偶变量无限制。理解这一对称性来自 Lagrangian 的构造。
+
+---
+
+## 典型应用例题
+
+### 例 1：构造并求解对偶问题
+
+> **题目**：原始问题 $\min x^2 + y^2$ s.t. $x + y \geq 1$（即 $1-x-y \leq 0$）。构造对偶函数，求对偶最优值，验证强对偶。
+
+【解】
+$L(x, y, \lambda) = x^2+y^2 + \lambda(1-x-y)$，$\lambda \geq 0$。
+
+对偶函数：$\frac{\partial L}{\partial x} = 2x - \lambda = 0,\ \frac{\partial L}{\partial y} = 2y - \lambda = 0 \Rightarrow x=y=\lambda/2$。
+
+$g(\lambda) = 2\cdot\frac{\lambda^2}{4} + \lambda(1-\lambda) = \frac{\lambda^2}{2} - \lambda^2 + \lambda = -\frac{\lambda^2}{2} + \lambda$。
+
+$\max g$：$g'(\lambda) = -\lambda + 1 = 0 \Rightarrow \lambda^* = 1$，$d^* = g(1) = 1/2$。
+
+原始最优：约束活跃 $x+y=1$，由 $x=y$ 得 $x^*=y^*=1/2$，$p^*=1/2$。$d^*=p^*=1/2$，强对偶成立。
+
+### 例 2：弱对偶下界的应用
+
+> **题目**：证明 $\min_{x} e^x$ s.t. $x \geq 2$ 的最优值 $p^* \geq e^2$（用弱对偶）。
+
+【解】
+$L(x,\lambda) = e^x + \lambda(2-x)$，$\lambda \geq 0$。
+
+$g(\lambda) = \inf_x [e^x - \lambda x + 2\lambda]$。对 $x$ 求极小：$e^x = \lambda \Rightarrow x^* = \ln\lambda$（若 $\lambda > 0$）。
+
+$g(\lambda) = \lambda - \lambda\ln\lambda + 2\lambda = \lambda(3-\ln\lambda)$。
+
+取 $\lambda=e^2$：$g(e^2) = e^2(3-2) = e^2$。
+
+由弱对偶：$p^* \geq g(e^2) = e^2$。（实际上 $p^* = e^2$，即强对偶成立。）
+
+### 例 3：SVM 对偶形式与核技巧
+
+> **题目**：简述 SVM 对偶的优势，并说明核技巧如何通过对偶引入。
+
+【解】
+SVM 原始（硬间隔）：$\min_{\mathbf{w},b} \frac{1}{2}\|\mathbf{w}\|^2$ s.t. $y_i(\mathbf{w}^\top\mathbf{x}_i+b) \geq 1$。
+
+对偶推导后（Slater 条件满足，强对偶成立）：
+
+$$\max_{\boldsymbol{\alpha}\geq 0} \sum_i\alpha_i - \frac{1}{2}\sum_{i,j}\alpha_i\alpha_j y_i y_j \langle\mathbf{x}_i, \mathbf{x}_j\rangle \quad \text{s.t.}\ \sum_i\alpha_i y_i = 0$$
+
+**关键**：对偶目标只依赖于样本内积 $\langle\mathbf{x}_i, \mathbf{x}_j\rangle$。用核函数 $K(\mathbf{x}_i, \mathbf{x}_j) = \phi(\mathbf{x}_i)^\top\phi(\mathbf{x}_j)$ 替换内积，即可在**高维特征空间中工作而无需显式计算 $\phi(\mathbf{x})$**——这是核技巧的数学基础，完全依赖于对偶形式。
+
+【答案】对偶优势：①问题规模从 $d$（维度）缩减到 $n$（样本数）；②内积结构允许核化；③对偶变量 $\alpha_i$ 直接给出支持向量。
+
+---
+
+## 自测题
+
+**自测 1**　对问题 $\min x^2$ s.t. $x \geq 3$，手动推导对偶函数 $g(\lambda)$ 并求 $d^*$，验证强对偶。
+
+> 提示：$L = x^2 + \lambda(3-x)$，$g(\lambda) = -\lambda^2/4 + 3\lambda$；$\lambda^* = 6$，$d^* = 9 = p^*$（原始最优 $x^*=3$，$f=9$）。
+
+**自测 2**　说明为何 LP 对偶的原始问题是极小化、对偶问题是极大化，以及这与弱对偶的关系。
+
+> 提示：弱对偶 $d^* \leq p^*$：对偶（极大化）给出原始（极小化）的下界；强对偶时两者相等，可互换求解。LP 总有强对偶（若均可行），所以可以通过求解对偶 LP 来确认原始 LP 的最优值。
+
+**自测 3**　给出一个满足 Slater 条件的凸问题例子，并验证 Slater 条件。
+
+> 提示：$\min x^2+y^2$ s.t. $x+y \leq 2$，$x,y \geq 0$（凸目标，线性约束）。Slater 点：$(\tilde{x},\tilde{y}) = (0.5, 0.5)$：$0.5+0.5=1 < 2$ ✓，$0.5>0$ ✓，$0.5>0$ ✓，严格可行，Slater 条件满足，强对偶成立。
+
+**自测 4**　对偶函数 $g(\lambda) = -\lambda^2 + 4\lambda$（$\lambda \geq 0$）。求对偶最优值 $d^*$，并说明原始最优值 $p^* \geq d^*$。
+
+> 提示：$g'(\lambda) = -2\lambda + 4 = 0 \Rightarrow \lambda^* = 2$，$d^* = g(2) = -4+8 = 4$。由弱对偶，原始最优值 $p^* \geq 4$（若强对偶成立，则 $p^*=4$）。
+
+**自测 5**　GAN 的极小极大目标与鞍点问题的对比：为何 GAN 训练比 SVM 对偶求解更困难？
+
+> 提示：SVM 对偶是凸二次规划，满足强对偶，鞍点存在且唯一；最优解可由 KKT 条件给出。GAN 目标关于 $G$（生成器参数）非凸，关于 $D$（判别器参数）也不一定是凹函数，故极小极大顺序不可互换，鞍点不保证存在，训练时容易出现模式崩溃或不收敛。
+
+---
+
+**回头看一眼"一例速记"**：
+
+> 对偶函数 $g = \inf_\mathbf{x} L$ 恒凹；弱对偶 $d^* \leq p^*$ 无条件成立。
+> 强对偶：凸问题 + Slater 条件 $\Rightarrow$ $d^*=p^*$，对偶间隙为零。
+> SVM 对偶：$\alpha_i$ 是 KKT 乘子，内积结构允许核技巧。
+
+如果现在不看笔记，能独立完成例 1 + 自测 1 + 自测 5——本章，你拿下了。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 条件反射 |
+| 学习目标 + 9.1–9.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结 | 原版 | 公式速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联 |
+| 练习题 + 详解 | 原版 | 系统巩固 |
+| 抽象成方法 + 方法变形 | 重写版（后置） | 套路固化 |
+| 思考路标 + 易错点 | 融合两版 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 重写版 | 演练精讲 |
+| 自测题 5 题 | 重写版 | 额外验收 |
+
+**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。
 
 $\lambda_2^* = 0$：约束 $x_1 \leq 3$ 的影子价格为零——该约束在最优解处不活跃（$x_1^* = 0 < 3$），所以放松它对最优值没有改善。

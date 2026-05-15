@@ -1,4 +1,61 @@
-# 第22章 分布式优化
+# 第22章 分布式优化（融合版）
+
+> **难度**：★★★★☆
+> **前置知识**：第16章（随机梯度下降）、第18章（自适应学习率）、线性代数基础
+> **AI 定位**：大模型训练（GPT/LLaMA 系列的工程基础）
+> **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文（学习目标 / 22.1–22.5 / 深度学习应用 / 练习题）+ 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
+
+> **一例速记**：
+> **数据并行**：每节点持有完整模型副本，处理数据分片；梯度通过 AllReduce 聚合后同步更新。等效全局批量 $B = Nb$。
+> **Ring-AllReduce**：节点组成环形，通信量 $\approx 2d$（与节点数 $N$ 无关），优于参数服务器的 $O(Nd)$。
+> **异步 SGD**：延迟梯度引入偏差 $\leq L\eta\tau G$；有界延迟 $\tau \leq \tau_{\max}$ 下收敛；SSP 折中方案。
+> **大批量训练**：线性缩放规则 $\eta_B = (B/b)\eta_b$；Warmup 稳定初期；LARS 逐层自适应 $\eta_l = \lambda\|\theta_l\|/(\|g_l\|+\beta\|\theta_l\|)$；LAMB = LARS + Adam。
+> **Federated Learning**：本地训练 → 上传梯度/模型 → 服务器聚合（FedAvg）→ 下发更新，数据不离本地。
+
+---
+
+## 引入：Ring-AllReduce 为什么比参数服务器更好
+
+> **题目**：4 个 GPU 用数据并行训练 ResNet-50（参数量 $d = 2.5\times10^7$，FP32，每个参数 4 字节）。
+>
+> (1) 用**参数服务器**架构（1 台 PS + 4 台 Worker）：每步每台 Worker 向 PS 推梯度 + 拉参数，计算每步的**总通信量**。
+>
+> (2) 用 **Ring-AllReduce**：计算每步每台 Worker 的总发送量，以及系统**总通信量**。
+>
+> (3) 对比结论：节点数从 4 扩展到 256 时，哪种架构的总通信量更大？
+
+请先停下来想一想：参数服务器的通信量是否随节点数线性增长？Ring-AllReduce 呢？
+
+---
+
+## 思维路径还原（解题者的内心独白）
+
+> "题目要比较两种通信架构。先弄清楚每种架构的通信模式，再算数。
+>
+> **第 (1) 问——参数服务器**：每台 Worker 做两件事：①推梯度（发送 $d$ 个浮点数给 PS）；②拉参数（从 PS 接收 $d$ 个浮点数）。4 台 Worker 各自推拉，共产生通信量：
+>
+> $$C_{\text{PS}} = 2 \times 4 \times d \times 4 = 8d \text{ 字节}$$
+>
+> 代入 $d = 2.5\times10^7$：$C_{\text{PS}} = 8 \times 2.5\times10^7 \times 4 = 800 \text{ MB}$。
+>
+> 注意 PS 端是**瓶颈**——它要同时接收 4 路梯度并发送 4 路参数，PS 的入/出带宽各消耗 $4d$ 字节，总计 $800 \text{ MB}$。
+>
+> **第 (2) 问——Ring-AllReduce**：Ring-AllReduce 的公式是：每个节点发送 $(N-1)/N \times d$ 个元素（Reduce-Scatter 阶段）+ 再发 $(N-1)/N \times d$ 个元素（AllGather 阶段）。每台 Worker 总发送量：
+>
+> $$\text{每台发送} = 2 \times \frac{N-1}{N} \times d = 2 \times \frac{3}{4} \times 2.5\times10^7 \times 4 \approx 150 \text{ MB}$$
+>
+> 系统总通信量（4 台各发送一份）$\approx 4 \times 150 = 600 \text{ MB}$。
+>
+> **但注意**：Ring-AllReduce 中通信是**流水线式并行**的，不像 PS 有单点瓶颈。
+>
+> **第 (3) 问——扩展到 256 节点**：
+>
+> - 参数服务器：$C_{\text{PS}} = 2 \times 256 \times d \times 4 = 512d \text{ 字节}$，随节点数**线性增长**，PS 带宽需求猛增 64 倍。
+> - Ring-AllReduce：每台 Worker 发送量 $\approx 2d$（$(N-1)/N \to 1$），总量 $\approx 2 \times 256 \times d \times 4$——数值相近，但**不存在单点带宽瓶颈**，每条链路负载均匀。
+>
+> **结论**：Ring-AllReduce 的**每节点**通信量与 $N$ 无关（当 $N$ 大时趋于 $2d$），而参数服务器的 PS 带宽需求随 $N$ 线性增长——这正是大规模分布式训练普遍采用 AllReduce 而非 PS 的根本原因。"
+
+---
 
 ## 学习目标
 
@@ -320,6 +377,110 @@ $$\theta_l^{t+1} = \theta_l^t - \eta \cdot \phi_l \cdot r_l^t$$
 **中等批量（Batch Size 64-8192）**：线性缩放规则有效，可以通过增加并行度线性加速训练，收敛到与小批量相近的精度。
 
 **超大批量（Batch Size > 8192）**：即使使用LARS/LAMB，也会出现泛化性能下降的现象，称为**泛化间隙（Generalization Gap）**。其根本原因在于大批量梯度估计噪声小，优化器倾向于收敛到损失函数的"锋利极小值"（sharp minima），其泛化能力弱于小批量找到的"平坦极小值"（flat minima）。
+
+---
+
+## 22.6 联邦学习（Federated Learning）
+
+### 22.6.1 联邦学习的动机
+
+传统分布式训练假设数据可以集中到数据中心。然而，在医疗影像、金融风控、手机键盘预测等场景中，数据涉及隐私、受监管约束或物理上分散在边缘设备，无法集中传输。**联邦学习（Federated Learning, FL）**通过在数据本地训练模型、仅上传梯度或模型参数，实现"数据不动，模型动"。
+
+联邦学习的三大特征：
+1. **数据异构（Non-IID）**：各参与方（client）的数据分布不同，如不同医院的疾病谱差异、不同用户的文本风格差异。
+2. **通信受限**：client 通常通过移动网络与中央服务器通信，带宽远低于数据中心内部互联（数 Mbps vs 数百 Gbps）。
+3. **隐私保护**：即使梯度也可能泄露原始数据（梯度反演攻击），需要额外的隐私机制。
+
+### 22.6.2 FedAvg 算法
+
+**FedAvg**（McMahan et al., 2017）是联邦学习的奠基性算法：
+
+**算法流程**（第 $r$ 轮）：
+
+1. **服务器广播**：服务器将当前全局模型 $\theta^r$ 发送给随机选取的 $K$ 个 client（$K \ll M$，$M$ 为总 client 数）。
+
+2. **本地训练**：每个参与 client $k$ 在本地数据 $\mathcal{D}_k$ 上执行 $E$ 个 epoch 的 SGD：
+   $$\theta_k^{r+1} = \theta^r - \eta \sum_{e=1}^{E} \nabla\mathcal{L}_k(\theta; \mathcal{B}_{k,e})$$
+
+3. **聚合**：服务器收集所有参与 client 的本地模型，按数据量加权平均：
+   $$\theta^{r+1} = \sum_{k=1}^{K} \frac{n_k}{\sum_{j=1}^K n_j} \theta_k^{r+1}$$
+   其中 $n_k = |\mathcal{D}_k|$ 为 client $k$ 的数据量。
+
+**FedSGD vs FedAvg**：FedSGD 等价于 $E = 1$（每轮只做一步梯度更新），通信轮次与中心化 SGD 相当但延迟大；FedAvg 通过增大 $E$ 减少通信轮次，但引入客户端漂移问题。
+
+### 22.6.3 Non-IID 数据与客户端漂移
+
+**客户端漂移（Client Drift）**：当各 client 数据分布不同时，本地 SGD 优化的是 $\mathcal{L}_k$（本地损失），而非全局损失 $\bar{\mathcal{L}} = \sum_k \frac{n_k}{N}\mathcal{L}_k$。多步本地训练后，$\theta_k^{r+1}$ 会"偏向"本地数据分布，偏离全局最优。
+
+**理论分析**：设全局最优解为 $\theta^*$，本地最优解为 $\theta_k^*$。在 $E$ 步本地 SGD 后：
+
+$$\|\theta_k^{r+1} - \theta^*\| \leq \|\theta_k^{r+1} - \theta_k^*\| + \|\theta_k^* - \theta^*\|$$
+
+第一项随本地训练收缩，第二项为**偏移偏差**（heterogeneity bias），当 $E$ 增大时不消失。
+
+**FedProx 解决方案**（Li et al., 2018）：在本地目标函数中加入近端项，将本地优化约束在全局模型附近：
+
+$$\min_{\theta_k} \mathcal{L}_k(\theta_k) + \frac{\mu}{2}\|\theta_k - \theta^r\|^2$$
+
+其中 $\mu > 0$ 是近端参数，使 client 无法离全局模型太远。
+
+### 22.6.4 隐私机制
+
+**梯度反演攻击（Gradient Inversion Attack）**（Zhu et al., 2019）：攻击者持有模型参数，通过观察梯度 $g = \nabla\mathcal{L}(\theta; x)$，可以通过优化反推输入数据 $x$：
+
+$$\hat{x} = \arg\min_{x'} \|\nabla\mathcal{L}(\theta; x') - g\|^2$$
+
+实验表明，对于小批量（$\leq 8$）图像数据，攻击者可以高精度地重建原始图像。这说明**即使只上传梯度，隐私仍可能泄露**。
+
+**差分隐私（Differential Privacy, DP）**：在上传梯度前，每个 client 对梯度进行裁剪并添加高斯噪声：
+
+$$\tilde{g}_k = \text{clip}(g_k, C) + \mathcal{N}(0, \sigma^2 C^2 \mathbf{I})$$
+
+DP 提供 $(\epsilon, \delta)$-差分隐私保证：任意相邻数据集产生的输出分布差异有界，形式化为：
+
+$$\Pr[\mathcal{M}(\mathcal{D}) \in S] \leq e^\epsilon \Pr[\mathcal{M}(\mathcal{D}') \in S] + \delta$$
+
+代价是精度下降（噪声增大），$\epsilon$ 越小（隐私越强），精度损失越大。
+
+**安全聚合（Secure Aggregation）**：使用密码学协议（加法秘密共享）使服务器只能看到 $\sum_k \tilde{g}_k$，而无法看到单个 client 的梯度 $\tilde{g}_k$——既防止服务器推断单个 client 数据，又保证聚合正确。
+
+### 22.6.5 联邦学习的通信效率优化
+
+联邦学习中通信往往是比计算更大的瓶颈，主要优化方向包括：
+
+**客户端选择策略**：
+- **随机选择**（FedAvg 原版）：每轮均匀随机选 $K$ 个 client，期望梯度无偏，但方差大（有的 client 可能多轮不被选中）。
+- **重要性采样**：优先选择损失高或梯度范数大的 client，加速收敛，但需要服务器对 client 的某种估计。
+- **损失感知选择**（Oort, OSDI 2021）：服务器维护每个 client 的统计信息，选择"统计效用"（梯度信息量）和"系统效用"（响应速度）的综合最优子集。
+
+**模型压缩与量化**：
+与数据中心分布式训练类似，联邦学习也可以在上传前压缩梯度，但联邦场景的约束更严：
+- 量化（FP16 或 INT8）节省 2–4× 带宽；
+- Top-K 稀疏化需要将稀疏格式（值 + 索引）序列化，移动端的序列化开销不可忽视；
+- **随机压缩（Random Sketching）**：用 Count Sketch 或 Johnson-Lindenstrauss 投影压缩梯度，保证期望无偏，不需要索引传输。
+
+**异步联邦学习**：
+标准 FedAvg 是同步的——服务器等待所有选中 client 完成后才聚合。在移动设备场景下，某些 client 可能因网络原因或用户活跃度下线（掉线率可达 20–30%）。
+- **容错 FedAvg**：设置等待超时，超时后仅用已返回的 client 梯度聚合，接受一定的统计噪声。
+- **异步 FedAsync**（Xie et al., 2019）：引入类似异步 SGD 的延迟容忍机制，server 收到梯度即刻更新，延迟较大的梯度用较小权重混合：
+  $$\theta^{r+1} = (1-\alpha)\theta^r + \alpha\theta_k^{r_k}$$
+  其中 $r_k < r$ 为 client $k$ 出发时的服务器版本号，$\alpha = \alpha_0/(r - r_k + 1)^\rho$ 随延迟衰减。
+
+### 22.6.6 联邦学习的工程实践要点
+
+**数据预处理不出本地**：联邦学习框架（如 TensorFlow Federated / PySyft / Flower）的核心原则是：特征工程、数据增广等预处理**在 client 本地完成**，服务器永远不见原始数据甚至预处理后的特征。
+
+**模型压缩与量化在边缘端**：边缘设备（手机、嵌入式芯片）通常只有 CPU 或小型 NPU，模型推断效率至关重要。联邦微调（FedPeft）：服务器分发大型预训练模型，client 只微调小的适配模块（如 LoRA Adapter），本地更新量极小（几 MB vs 几 GB），通信效率大幅提升。
+
+**跨孤岛联邦（Cross-silo FL）vs 跨设备联邦（Cross-device FL）**：
+
+| 维度 | 跨孤岛（医院/企业） | 跨设备（手机/IoT）|
+|---|---|---|
+| client 数量 | $10 \sim 100$ | $10^6 \sim 10^8$ |
+| 稳定性 | 高（服务器级机器） | 低（随时掉线）|
+| 数据量/client | 大（数万至数百万条）| 小（数十至数百条）|
+| 隐私要求 | 中（机构数据有法规）| 高（个人隐私敏感）|
+| 典型场景 | 医疗联合建模、金融风控 | 输入法预测、健康监测 |
 
 ---
 
@@ -970,3 +1131,225 @@ $$\eta_2^{\text{LARS}} = 0.01 \times \frac{0.1}{0.001 + 0.0001 \times 0.1} = 0.0
 - 第2层：$\|\Delta\theta_2\| \approx 0.99 \times 0.001 \approx 0.001$，相对更新量 $0.001/0.1 = 1\%$（与第1层相当）
 
 LARS使两层的**相对更新量**趋于一致（约1%），避免了统一学习率下第1层更新过猛、第2层更新停滞的问题。
+
+---
+
+## 几何示意
+
+### 图 22-1：分布式 SGD 拓扑
+
+![Parameter Server vs AllReduce 环形](../figures/svg/opt-p8-22-1.svg)
+
+### 图 22-2：Federated Learning 流程
+
+![中央服务器 + 多 client 训练循环](../figures/svg/opt-p8-22-2.svg)
+
+---
+## 抽象成方法（套路总结）
+
+### 核心公式速查
+
+| 方案 | 通信量（每节点） | 扩展性 | 典型框架 |
+|---|---|---|---|
+| **参数服务器** | $2d$（PS 成瓶颈） | $O(N)$ 带宽 | MXNet PS-Lite |
+| **Ring-AllReduce** | $2(N-1)d/N \approx 2d$ | 与 $N$ 无关 | PyTorch DDP / Horovod |
+| **Federated Avg** | 模型大小（按轮次） | 通信轮次多 | PySyft / Flower |
+
+| 技术 | 关键公式 | 注意事项 |
+|---|---|---|
+| **线性缩放规则** | $\eta_B = (B/b)\cdot\eta_b$ | 超大批量失效，需 Warmup |
+| **LARS 学习率** | $\eta_l = \lambda\|\theta_l\|/(\|g_l\|+\beta\|\theta_l\|)$ | 每层独立；SGD 专用 |
+| **LAMB** | Adam 方向 + LARS 逐层缩放 | BERT/Transformer 专用 |
+| **梯度延迟偏差** | $\leq L\eta\tau G$ | $\tau$ 越大偏差越大 |
+| **DGC 压缩比** | $100\!\sim\!600\times$（Top-K + 误差反馈） | 索引开销降低实际压缩比 |
+
+### 分布式训练设计 4 步
+
+1. **选并行策略**：单卡装不下 → 模型/流水线并行；单卡装得下 → 数据并行。
+2. **选通信原语**：数据中心同质硬件 → Ring-AllReduce；异构/跨数据中心 → PS 或 Federated。
+3. **调超参数**：按线性缩放规则设学习率；加 Warmup（5–10 epoch）；Batch > 8192 用 LARS/LAMB。
+4. **降通信开销**（通信是瓶颈时）：梯度量化（FP16/INT8）→ Top-K 稀疏化 + 误差反馈 → 梯度累积替代扩卡。
+
+---
+
+## 方法变形
+
+### 变形 1：梯度累积代替数据并行
+
+显存不足时，用梯度累积模拟大批量：累积 $K$ 步后做一次 optimizer.step()，等效批量 $Kb$。代价：$K$ 倍更新周期；好处：无需多卡通信。
+
+### 变形 2：ZeRO（Zero Redundancy Optimizer）
+
+DeepSpeed 的 ZeRO 将**参数、梯度、优化器状态**分别切片到各卡，每卡只保存 $1/N$；需要时动态 AllGather。ZeRO-3 能在 8 卡训练 1750 亿参数模型，显存需求降低 64 倍。
+
+### 变形 3：异步 SGD 适用场景
+
+数据中心同质 GPU（速度相近）→ 同步 DDP 即可；跨机构 Federated Learning（速度差异大）→ 异步 + SSP 限制最大延迟；在线学习（流式数据）→ 完全异步。
+
+### 变形 4：Federated Learning 与隐私
+
+FedAvg 上传的**梯度**仍可能泄露原始数据（梯度反演攻击）。差分隐私（DP）：在梯度中加噪声 $\xi \sim \mathcal{N}(0, \sigma^2)$ 后上传，以精度换隐私；安全聚合（Secure Aggregation）：用密码学协议让服务器只见聚合结果而非单个梯度。
+
+---
+
+## 思考路标（条件反射）
+
+1. 看到"$N$ 个 GPU 数据并行" → 每卡本地批量 $b$，等效全局批量 $Nb$，学习率 $\times N$（线性缩放）
+2. 看到"AllReduce 通信量" → $2(N-1)d/N \approx 2d$，与 $N$ 无关
+3. 看到"梯度延迟 $\tau$" → 偏差 $\leq L\eta\tau G$；$\eta$ 越大、$\tau$ 越大偏差越大；应降 $\eta$ 或限制 $\tau$
+4. 看到"批量 > 8192 训练不稳定" → 先检查 Warmup；若仍不稳定 → 换 LARS/LAMB
+5. 看到"梯度压缩 100×" → Top-K 稀疏化；**必须**配误差反馈，否则小梯度永久丢失
+6. 看到"Federated Learning" → 数据不离本地；通信轮次 = 墙钟时间瓶颈；Non-IID 数据 → 客户端漂移
+7. 看到"DDP vs DP"（PyTorch）→ DDP（多进程，每卡一个进程，AllReduce）总是优于 DP（单进程，参数服务器）
+8. 看到"梯度裁剪在分布式训练中的位置" → AllReduce **之后**，optimizer.step() **之前**
+
+---
+
+## 易错点
+
+1. **线性缩放失效区间**：批量 $B > 8192$ 时泛化间隙出现；即使加 LARS 也可能有精度损失；不能无限扩大批量替代更多训练步。
+
+2. **DDP 保存检查点用 `model.module`**：`model.state_dict()` 保存的是 DDP 包装后的权重，加载时也需 DDP；若要裸模型权重，用 `model.module.state_dict()`。
+
+3. **误差反馈不能跨节点**：Top-K 稀疏化时，每个节点自己维护本地误差反馈，不应将未传输的梯度与其他节点共享——否则破坏了稀疏化的意义。
+
+4. **梯度累积与 BatchNorm**：使用梯度累积时，BatchNorm 的统计量（均值/方差）仍按微批量大小计算，不随累积步数扩大；若要等效大批量 BN，需改用 SyncBN 或 GroupNorm。
+
+5. **Federated Learning 的 Non-IID 问题**：各 client 数据分布不同时，FedAvg 的聚合等价性（等同中心化 SGD）**不成立**；FedProx、SCAFFOLD 等算法专门解决此问题。
+
+---
+
+## 典型应用例题
+
+### 例 1：Ring-AllReduce 通信轮次分析
+
+> **题目**：8 个 GPU 组成 Ring-AllReduce，梯度向量维度 $d = 8\times10^6$。(1) Reduce-Scatter 阶段每轮每节点发送多少元素？共几轮？(2) AllGather 阶段类似。(3) 总计每节点发送量（以 FP32 字节计）。
+
+【思路】Ring-AllReduce = Reduce-Scatter（$N-1$ 轮，每轮发 $d/N$）+ AllGather（$N-1$ 轮，每轮发 $d/N$）。
+
+【解】
+(1) 每轮发送 $d/N = 8\times10^6/8 = 10^6$ 元素；共 $N-1 = 7$ 轮。Reduce-Scatter 阶段每节点总发送：$7 \times 10^6$ 元素。
+
+(2) AllGather 阶段完全对称：$7 \times 10^6$ 元素。
+
+(3) 总发送量 $= 14 \times 10^6$ 元素 $\times 4$ 字节 $= 56 \text{ MB}$。
+
+（作为验证：Ring-AllReduce 公式 $\approx 2d \times (N-1)/N = 2 \times 8\times10^6 \times 7/8 = 14\times10^6$ 元素，与上面一致。）
+
+【答案】$\boxed{56 \text{ MB}}$（每节点总发送）。
+
+### 例 2：LARS 学习率计算
+
+> **题目**：某层参数范数 $\|\theta\| = 5.0$，梯度范数 $\|g\| = 50.0$，权重衰减 $\beta = 10^{-4}$，全局基础学习率 $\lambda = 0.01$。求 LARS 有效学习率，并与"不用 LARS 直接用 $\lambda = 0.01$"的情形对比相对更新量。
+
+【解】
+$$\eta_{\text{LARS}} = \lambda \cdot \frac{\|\theta\|}{\|g\| + \beta\|\theta\|} = 0.01 \times \frac{5.0}{50.0 + 10^{-4} \times 5.0} = 0.01 \times \frac{5.0}{50.0005} \approx 0.001$$
+
+相对更新量（LARS）：$\|\Delta\theta\|/\|\theta\| \approx \eta_{\text{LARS}} \times \|g\| / \|\theta\| = 0.001 \times 50/5 = 1\%$。
+
+相对更新量（直接 $\lambda = 0.01$）：$\lambda \times \|g\| / \|\theta\| = 0.01 \times 50/5 = 10\%$——更新步长是参数范数的 10%，容易不稳定。
+
+【答案】LARS 学习率 $\approx 0.001$；相对更新量从 $10\%$ 降至 $1\%$，训练更稳定。
+
+### 例 3：Federated Learning 通信效率
+
+> **题目**：100 个 client，每个 client 本地数据 1000 条，每轮选 10% 的 client 参与，本地训练 5 个 epoch，全局模型大小 100 MB。问：(1) 每轮全局通信量（上传 + 下载）；(2) 若中心化训练同等通信量需要多少轮 SGD（每步传梯度 100 MB）？
+
+【解】
+(1) 每轮参与 client 数 $= 100 \times 10\% = 10$；每个 client 上传模型 100 MB，下载聚合模型 100 MB。
+总通信量 $= 10 \times (100 + 100) = 2000 \text{ MB}$。
+
+(2) 中心化 SGD 每步通信 100 MB（梯度），等效 2000 MB 需要 20 步。但 Federated 每轮相当于 $10 \times 5 \times \lceil 1000/B \rceil$ 步本地 SGD，数据利用率远高于 20 步中心化 SGD。**Federated Learning 以较少通信轮次换取大量本地计算，适合通信受限场景。**
+
+---
+
+## 自测题
+
+**自测 1**　使用 Ring-AllReduce，$N = 4$ 个节点，梯度维度 $d = 4\times10^6$（FP32）。计算每个节点在完整 AllReduce 过程中的总发送字节数。
+
+> 💡 提示：每节点发送 $2 \times (N-1)/N \times d \times 4 = 2\times(3/4)\times4\times10^6\times4 = 24 \text{ MB}$。
+
+**自测 2**　批量大小 $b = 512$，学习率 $\eta = 0.05$。现扩展至 $N = 16$ 卡数据并行，批量从 $512$ 线性扩大为 $8192$。按线性缩放规则，新学习率是多少？
+
+> 💡 提示：批量扩大 $8192/512 = 16$ 倍，学习率 $= 0.05 \times 16 = 0.8$。
+
+**自测 3**　异步 SGD 中，梯度延迟 $\tau = 10$，函数 Lipschitz 常数 $L = 1$，学习率 $\eta = 0.01$，梯度范数上界 $G = 5$。估计延迟引入的梯度偏差上界。
+
+> 💡 提示：$L\eta\tau G = 1 \times 0.01 \times 10 \times 5 = 0.5$。若梯度典型值为 1，延迟偏差占 50%，说明需降低学习率或限制延迟。
+
+**自测 4**　解释为什么梯度稀疏化（Top-K）中**不使用误差反馈**会导致训练停滞。给出反例。
+
+> 💡 提示：某参数每步梯度为 $0.001$（低于阈值），无误差反馈则每步丢弃，参数永远不更新。有误差反馈后，$0.001$ 逐步累积，经过足够多步后超过阈值被传输。
+
+**自测 5**　Federated Learning 中，若各 client 数据分布 Non-IID（例如每个手机用户只有自己语言的文本），FedAvg 的哪个假设会被破坏？
+
+> 💡 提示：FedAvg 假设各 client 梯度是全局梯度的无偏估计，Non-IID 下本地梯度方向与全局方向存在系统性偏差（"client drift"），聚合后的全局模型偏向于数据量大的 client 的分布。
+
+---
+
+## 融合版说明
+
+| 段 | 来源 | 价值 |
+|---|---|---|
+| 一例速记 + 引入 + 思维路径还原 | 融合新增（前置） | 建立直觉 / 通信量量化感知 |
+| 学习目标 + 22.1–22.5 严格正文 | 原版 | 完整定义与推导 |
+| 本章小结表格 | 原版 | 方法对比速查 |
+| 深度学习应用 + PyTorch 代码 | 原版 | 工业实战关联（DDP / 梯度累积）|
+| 练习题 5 道 + 详解 | 原版 | 系统巩固 |
+| 套路总结 + 方法变形 | 融合新增（后置） | 套路固化（ZeRO / FL / 异步变体）|
+| 思考路标 + 易错点 | 融合新增 | 条件反射 + 避雷 |
+| 典型应用例题 3 例 | 融合新增 | 演练精讲 |
+| 自测题 5 题 | 融合新增 | 额外验收 |
+
+**AI 关联**：本章是 GPT/LLaMA/PaLM 等大模型工程化训练的基础——数据并行 + AllReduce 是主干，模型并行 + 流水线并行用于超大规模，Federated Learning 在手机端侧推断/个性化中兴起。
+
+---
+
+## 进阶阅读
+
+- **Ring-AllReduce 原始论文**：Baidu Research, "Bringing HPC Techniques to Deep Learning", 2017。
+- **PyTorch DDP 设计**：Li et al., "PyTorch Distributed: Experiences on Accelerating Data Parallel Training", VLDB 2020。
+- **Deep Gradient Compression (DGC)**：Lin et al., "Deep Gradient Compression: Reducing the Communication Bandwidth for Distributed Training", ICLR 2018。
+- **Federated Learning 基础**：McMahan et al., "Communication-Efficient Learning of Deep Networks from Decentralized Data", AISTATS 2017。
+- **FedProx**：Li et al., "Federated Optimization in Heterogeneous Networks", MLSys 2020。
+- **差分隐私 + FL**：Abadi et al., "Deep Learning with Differential Privacy", CCS 2016。
+- **LARS**：You et al., "Large Batch Training of Convolutional Networks", arXiv 2017。
+- **LAMB**：You et al., "Large Batch Optimization for Deep Learning: Training BERT in 76 minutes", ICLR 2020。
+- **ZeRO（DeepSpeed）**：Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models", SC 2020。
+- **Megatron-LM（模型并行）**：Shoeybi et al., "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism", arXiv 2019。
+- **GPipe（流水线并行）**：Huang et al., "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism", NeurIPS 2019。
+- **Oort（客户端选择）**：Lai et al., "Oort: Efficient Federated Learning via Guided Participant Selection", OSDI 2021。
+- **SCAFFOLD（Non-IID 联邦）**：Karimireddy et al., "SCAFFOLD: Stochastic Controlled Averaging for Federated Learning", ICML 2020。
+- **Horovod（工程框架）**：Sergeev & Del Balso, "Horovod: Fast and Easy Distributed Deep Learning in TensorFlow", arXiv 2018。
+- **1-Bit Adam（通信压缩）**：Tang et al., "1-bit Adam: Communication Efficient Large-Scale Training with Adam's Convergence Speed", ICML 2021。
+
+---
+
+*本章涵盖了分布式优化的完整体系：从基础的数据并行与AllReduce（工业主流），到梯度压缩与通信优化（节省带宽），再到大批量训练技巧（LARS/LAMB）和联邦学习（数据隐私）。理解这些内容是参与大模型工程开发的必要前提——真正的 LLM 训练是数百乃至数千 GPU 的协同优化工程。*
+
+---
+
+## 本章知识图谱
+
+```
+分布式优化体系
+├── 并行策略
+│   ├── 数据并行（每卡完整模型 + 数据分片 → AllReduce）
+│   ├── 模型并行（模型分层 → 跨卡前向/反向）
+│   ├── 流水线并行（微批次 + GPipe/PipeDream）
+│   └── 张量并行（矩阵乘法分割 → AllGather）
+├── 通信原语
+│   ├── 参数服务器（PS）：灵活但 PS 单点瓶颈，$O(Nd)$ 通信量
+│   └── Ring-AllReduce：环形均衡，$O(d)$ 通信量（与 $N$ 无关）
+├── 通信优化
+│   ├── 梯度量化（1-bit / FP16 / INT8）+ 误差反馈
+│   └── 梯度稀疏化（Top-K / DGC）+ 误差反馈
+├── 大批量训练
+│   ├── 线性缩放规则（$\eta_B = (B/b)\eta_b$）+ Warmup
+│   ├── LARS（逐层 SGD 自适应）
+│   └── LAMB（逐层 Adam 自适应）
+└── 联邦学习
+    ├── FedAvg（本地多步 SGD + 加权平均聚合）
+    ├── FedProx（近端项约束 client 漂移）
+    └── 隐私（DP + 安全聚合）
+```
