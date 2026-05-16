@@ -961,12 +961,12 @@ print(f"  连续极限：等待时间 ~ Exp(λ = {1-p_keep})")
 
 | 应用场景 | 所用分布 | 公式/规则 |
 |----------|----------|-----------|
-| Xavier 均匀初始化 | $\mathcal{U}(-a, a)$ | $a = \sqrt{6/(n_\text{in}+n_\text{out})}$ |
-| Xavier 正态初始化 | $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/(n_\text{in}+n_\text{out})}$ |
-| Kaiming 初始化（ReLU）| $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/n_\text{in}}$ |
+| Xavier 均匀初始化 | $\mathcal{U}(-a, a)$ | $a = \sqrt{6/(n_{\text{in}}+n_{\text{out}})}$ |
+| Xavier 正态初始化 | $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/(n_{\text{in}}+n_{\text{out}})}$ |
+| Kaiming 初始化（ReLU）| $\mathcal{N}(0, \sigma^2)$ | $\sigma = \sqrt{2/n_{\text{in}}}$ |
 | 批归一化 | $\mathcal{N}(0, 1)$ | $\hat{z} = (z-\mu_B)/\sqrt{\sigma_B^2+\varepsilon}$ |
 | 准确率贝叶斯估计 | $\text{Beta}(\alpha, \beta)$ | 后验：$\text{Beta}(\alpha+k, \beta+n-k)$ |
-| Dropout 等待分布 | $\text{Exp}(\lambda)$ | $\lambda = 1 - p_\text{keep}$ |
+| Dropout 等待分布 | $\text{Exp}(\lambda)$ | $\lambda = 1 - p_{\text{keep}}$ |
 
 ### 设计启示
 
@@ -1142,7 +1142,7 @@ $$E[X] = \frac{3}{10} = 0.3, \quad \text{Var}(X) = \frac{3 \times 7}{10^2 \times
 
 后验：$\text{Beta}(3+12,\ 7+(60-12)) = \text{Beta}(15,\ 55)$
 
-$$E[X_\text{后验}] = \frac{15}{70} \approx 0.214$$
+$$E[X_{\text{后验}}] = \frac{15}{70} \approx 0.214$$
 
 先验期望 $= 0.3$，观测频率 $= 12/60 = 0.2$，后验期望 $0.214$ 是两者的**加权平均**，向观测数据方向移动，体现了贝叶斯更新的"先验 + 数据 → 后验"逻辑。
 

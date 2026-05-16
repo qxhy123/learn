@@ -7,7 +7,7 @@
 > **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
 
 > **一例速记**：
-> **拉格朗日对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$，对 $(\boldsymbol{\lambda}, \boldsymbol{\nu})$ 恒为**凹函数**（仿射族的下确界）。
+> **拉格朗日对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_{\mathbf{x}} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$，对 $(\boldsymbol{\lambda}, \boldsymbol{\nu})$ 恒为**凹函数**（仿射族的下确界）。
 > **弱对偶**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) \leq p^*$ 对所有 $\boldsymbol{\lambda} \geq 0$ 恒成立；对偶问题给出原始最优值的**下界**。
 > **强对偶**：$d^* = p^*$（对偶间隙为零）；凸问题 + Slater 条件 $\Rightarrow$ 强对偶成立。
 > **Slater 条件**：存在严格可行点（所有不等式约束严格满足），是凸问题强对偶的充分条件。
@@ -1241,7 +1241,7 @@ $\lambda_1^* = 3$：约束 $x_1 + x_2 \leq 4$ 的影子价格——若将右端�
 ### 构造对偶问题 4 步法
 
 1. **写 Lagrangian**：$L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu}) = f_0(\mathbf{x}) + \sum_i \lambda_i f_i(\mathbf{x}) + \sum_j \nu_j h_j(\mathbf{x})$，其中 $\lambda_i \geq 0$
-2. **求对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$（对 $\mathbf{x}$ 极小化，无约束）
+2. **求对偶函数**：$g(\boldsymbol{\lambda}, \boldsymbol{\nu}) = \inf_{\mathbf{x}} L(\mathbf{x}, \boldsymbol{\lambda}, \boldsymbol{\nu})$（对 $\mathbf{x}$ 极小化，无约束）
 3. **写对偶问题**：$\max_{\boldsymbol{\lambda} \geq 0, \boldsymbol{\nu}} g(\boldsymbol{\lambda}, \boldsymbol{\nu})$（凸优化问题！）
 4. **判断强对偶**：若凸问题 + Slater 条件满足，则 $d^* = p^*$；否则 $d^* \leq p^*$（弱对偶）
 
@@ -1250,7 +1250,7 @@ $\lambda_1^* = 3$：约束 $x_1 + x_2 \leq 4$ 的影子价格——若将右端�
 | 概念 | 数学表达 | 关键性质 |
 |---|---|---|
 | **Lagrangian** | $L = f_0 + \sum\lambda_i f_i + \sum\nu_j h_j$ | 松弛约束到目标函数 |
-| **对偶函数** | $g(\boldsymbol{\lambda},\boldsymbol{\nu}) = \inf_\mathbf{x} L$ | 恒凹（即使原始非凸） |
+| **对偶函数** | $g(\boldsymbol{\lambda},\boldsymbol{\nu}) = \inf_{\mathbf{x}} L$ | 恒凹（即使原始非凸） |
 | **对偶问题** | $\max_{\boldsymbol{\lambda}\geq 0,\boldsymbol{\nu}} g(\boldsymbol{\lambda},\boldsymbol{\nu})$ | 恒为凸优化 |
 | **弱对偶** | $d^* \leq p^*$ 恒成立 | $g$ 提供 $p^*$ 的下界 |
 | **强对偶** | $d^* = p^*$ | 凸问题 + Slater $\Rightarrow$ 成立 |
@@ -1284,7 +1284,7 @@ SVM 原始问题的对偶（无等式约束简化版）：$\max_{\boldsymbol{\al
 
 强对偶等价于存在鞍点 $(\mathbf{x}^*, \boldsymbol{\lambda}^*, \boldsymbol{\nu}^*)$ 使得：
 
-$$\max_{\boldsymbol{\lambda}\geq 0} \min_\mathbf{x} L = \min_\mathbf{x} \max_{\boldsymbol{\lambda}\geq 0} L$$
+$$\max_{\boldsymbol{\lambda}\geq 0} \min_{\mathbf{x}} L = \min_{\mathbf{x}} \max_{\boldsymbol{\lambda}\geq 0} L$$
 
 GAN 训练的极小极大目标 $\min_G \max_D V(D,G)$ 从结构上类似于此，但 $V$ 非凸，无强对偶保证，训练不稳定性来源于此。
 
@@ -1390,7 +1390,7 @@ $$\max_{\boldsymbol{\alpha}\geq 0} \sum_i\alpha_i - \frac{1}{2}\sum_{i,j}\alpha_
 
 **回头看一眼"一例速记"**：
 
-> 对偶函数 $g = \inf_\mathbf{x} L$ 恒凹；弱对偶 $d^* \leq p^*$ 无条件成立。
+> 对偶函数 $g = \inf_{\mathbf{x}} L$ 恒凹；弱对偶 $d^* \leq p^*$ 无条件成立。
 > 强对偶：凸问题 + Slater 条件 $\Rightarrow$ $d^*=p^*$，对偶间隙为零。
 > SVM 对偶：$\alpha_i$ 是 KKT 乘子，内积结构允许核技巧。
 

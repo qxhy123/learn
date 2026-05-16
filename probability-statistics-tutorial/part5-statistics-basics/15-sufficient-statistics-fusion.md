@@ -472,7 +472,7 @@ $$
 | **Rao-Blackwell** | $\hat{\theta}=\mathbb{E}[\tilde{\theta}\mid T]$，$\operatorname{Var}(\hat{\theta})\leq\operatorname{Var}(\tilde{\theta})$ | 条件化降低方差 |
 | **UMVUE（L-S）** | 完备充分 + 无偏 = UMVUE | 最优无偏估计 |
 | **指数族充分量** | $\mathbf{T}=\bigl(\sum T_1(X_i),\ldots,\sum T_k(X_i)\bigr)$ | 正则族同时完备 |
-| **Fisher 信息保持** | $I_T(\theta)=I_\mathbf{X}(\theta)$ | 充分量无信息损失 |
+| **Fisher 信息保持** | $I_T(\theta)=I_{\mathbf{X}}(\theta)$ | 充分量无信息损失 |
 
 ### 用因子分解判充分性：4 步流程
 

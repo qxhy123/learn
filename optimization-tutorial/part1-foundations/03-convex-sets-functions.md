@@ -1004,7 +1004,7 @@ $f(\mathbb{E}[X])\leq\mathbb{E}[f(X)] \Rightarrow -\log\frac{a+b}{2}\leq\frac{-\
 
 (b) 在深度学习中，批训练损失 $\mathcal{L}(\mathbf{w}) = \frac{1}{N}\sum_{i=1}^N \ell(\mathbf{w}; \mathbf{x}_i, y_i)$，其中每个样本损失 $\ell(\mathbf{w}; \mathbf{x}_i, y_i)$ 对 $\mathbf{w}$ 是凸的。用 (a) 的结论说明 $\mathcal{L}(\mathbf{w})$ 的凸性。
 
-(c) 若 $\ell$ 是平方损失 $\ell(\mathbf{w}; \mathbf{x}, y) = (\mathbf{w}^T\mathbf{x} - y)^2$，计算 $\nabla^2_\mathbf{w} \mathcal{L}(\mathbf{w})$ 并验证其半正定性。
+(c) 若 $\ell$ 是平方损失 $\ell(\mathbf{w}; \mathbf{x}, y) = (\mathbf{w}^T\mathbf{x} - y)^2$，计算 $\nabla^2_{\mathbf{w}} \mathcal{L}(\mathbf{w})$ 并验证其半正定性。
 
 **练习 3.4**（强凸性与条件数）
 
@@ -1100,9 +1100,9 @@ $$f(\theta\mathbf{x} + (1-\theta)\mathbf{y}) = \sum_i w_i f_i(\theta\mathbf{x}+(
 
 **(b)** 批训练损失 $\mathcal{L}(\mathbf{w}) = \frac{1}{N}\sum_{i=1}^N \ell_i(\mathbf{w})$，其中 $w_i = 1/N > 0$，$\sum w_i = 1$，每个 $\ell_i$ 凸。由 (a) 知 $\mathcal{L}$ 是凸函数。这说明：**即使整体网络是非凸的，线性模型的批损失仍具有良好的凸性结构**。
 
-**(c)** 平方损失 $\ell(\mathbf{w}; \mathbf{x}, y) = (\mathbf{w}^T\mathbf{x} - y)^2$，$\nabla_\mathbf{w} \ell = 2(\mathbf{w}^T\mathbf{x} - y)\mathbf{x}$，$\nabla^2_\mathbf{w} \ell = 2\mathbf{x}\mathbf{x}^T$（秩 1 半正定矩阵）。
+**(c)** 平方损失 $\ell(\mathbf{w}; \mathbf{x}, y) = (\mathbf{w}^T\mathbf{x} - y)^2$，$\nabla_{\mathbf{w}} \ell = 2(\mathbf{w}^T\mathbf{x} - y)\mathbf{x}$，$\nabla^2_{\mathbf{w}} \ell = 2\mathbf{x}\mathbf{x}^T$（秩 1 半正定矩阵）。
 
-$$\nabla^2_\mathbf{w} \mathcal{L} = \frac{1}{N}\sum_{i=1}^N 2\mathbf{x}_i\mathbf{x}_i^T = \frac{2}{N} X^T X \succeq 0$$
+$$\nabla^2_{\mathbf{w}} \mathcal{L} = \frac{1}{N}\sum_{i=1}^N 2\mathbf{x}_i\mathbf{x}_i^T = \frac{2}{N} X^T X \succeq 0$$
 
 其中 $X^TX$ 是 Gram 矩阵，总是半正定的（因为 $\mathbf{v}^T X^T X \mathbf{v} = \|X\mathbf{v}\|^2 \geq 0$）。
 

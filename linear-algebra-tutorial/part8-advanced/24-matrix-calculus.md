@@ -10,7 +10,7 @@
 
 > **一例速记**：
 > **Jacobian**：$\mathbf{f}: \mathbb{R}^n\to\mathbb{R}^m$，$J_{ij} = \partial f_i/\partial x_j$，$J \in \mathbb{R}^{m\times n}$（分子布局：行由输出维度决定）。
-> **梯度**：$f:\mathbb{R}^n\to\mathbb{R}$，$\nabla_\mathbf{x} f \in \mathbb{R}^n$（列向量）；链式法则：$\nabla_\mathbf{x} f = J_\mathbf{g}^T \nabla_\mathbf{g} f$（反向传播）。
+> **梯度**：$f:\mathbb{R}^n\to\mathbb{R}$，$\nabla_{\mathbf{x}} f \in \mathbb{R}^n$（列向量）；链式法则：$\nabla_{\mathbf{x}} f = J_{\mathbf{g}}^T \nabla_{\mathbf{g}} f$（反向传播）。
 > **核心公式**：$\partial(\mathbf{a}^T\mathbf{x})/\partial\mathbf{x} = \mathbf{a}$；$\partial(\mathbf{x}^TA\mathbf{x})/\partial\mathbf{x} = 2A\mathbf{x}$（$A$ 对称）；$\partial\text{tr}(AB)/\partial A = B^T$；$\partial\log\det(A)/\partial A = A^{-T}$。
 > **迹技巧**：任何矩阵标量函数的梯度都可用 $df = \text{tr}(G^T dA)$ 识别，其中 $G = \partial f/\partial A$。
 > **AI 关联**：神经网络反向传播 = 多层 Jacobian 链式乘积；梯度下降 = $\theta \leftarrow \theta - \eta\nabla_\theta\mathcal{L}$；Adam = 自适应矩估计。
@@ -892,10 +892,10 @@ $$\max_{\mathbf{w}:\,\|\mathbf{w}\|=1,\, \mathbf{w} \perp \mathbf{w}_1^*, \ldots
 
 **正向**：计算 $\mathbf{z} = \mathbf{f}(\mathbf{x})$，再算 $L = g(\mathbf{z})$。
 
-**反向**：$\nabla_\mathbf{x} L = J_\mathbf{f}^T \cdot \nabla_\mathbf{z} L$（Jacobian 转置乘以"下游梯度"）。
+**反向**：$\nabla_{\mathbf{x}} L = J_{\mathbf{f}}^T \cdot \nabla_{\mathbf{z}} L$（Jacobian 转置乘以"下游梯度"）。
 
 多层叠加时，从后往前依次左乘 Jacobian 转置：
-$$\nabla_\mathbf{x} L = J_{\mathbf{f}_1}^T \cdot J_{\mathbf{f}_2}^T \cdots J_{\mathbf{f}_k}^T \cdot \nabla_{\mathbf{z}_k} L$$
+$$\nabla_{\mathbf{x}} L = J_{\mathbf{f}_1}^T \cdot J_{\mathbf{f}_2}^T \cdots J_{\mathbf{f}_k}^T \cdot \nabla_{\mathbf{z}_k} L$$
 
 ### 迹技巧（Trace Trick）4 步流程
 
@@ -914,7 +914,7 @@ $$\nabla_\mathbf{x} L = J_{\mathbf{f}_1}^T \cdot J_{\mathbf{f}_2}^T \cdots J_{\m
 - **向量 $\mathbf{f}(\mathbf{x})$ 对向量 $\mathbf{x}$**：结果是**矩阵**（Jacobian），维度 $= $ 输出维度 $\times$ 输入维度
 - **标量 $f(A)$ 对矩阵 $A$**：结果是**与 $A$ 同形的矩阵**（梯度矩阵），各元素是偏导
 
-容易搞混的关键：分子布局下，梯度 $\nabla_\mathbf{x} f$ 是列向量，Jacobian 行数对应输出维度。
+容易搞混的关键：分子布局下，梯度 $\nabla_{\mathbf{x}} f$ 是列向量，Jacobian 行数对应输出维度。
 
 ### 变形 2：对非对称矩阵的二次型
 
@@ -935,11 +935,11 @@ PyTorch 的 `loss.backward()` 计算的是对所有 `requires_grad=True` 张量�
 | 概念 | 关键内容 |
 |---|---|
 | **Jacobian 矩阵** | $J \in \mathbb{R}^{m\times n}$，$J_{ij} = \partial f_i/\partial x_j$；线性映射的 Jacobian $= A$ |
-| **梯度向量** | $\nabla_\mathbf{x} f \in \mathbb{R}^n$（列向量），指向最陡上升方向 |
+| **梯度向量** | $\nabla_{\mathbf{x}} f \in \mathbb{R}^n$（列向量），指向最陡上升方向 |
 | **梯度矩阵** | $\partial f/\partial A \in \mathbb{R}^{m\times n}$，$(i,j)$ 元素 $= \partial f/\partial a_{ij}$ |
 | **核心公式** | $\partial(\mathbf{a}^T\mathbf{x}) = \mathbf{a}$；$\partial(\mathbf{x}^TA\mathbf{x}) = 2A\mathbf{x}$；$\partial\text{tr}(AB)/\partial A = B^T$ |
 | **迹技巧** | $df = \text{tr}(G^T dA)$ 识别梯度矩阵 $G$ |
-| **链式法则** | $\nabla_\mathbf{x} L = J^T \nabla_\mathbf{z} L$（反向传播的数学基础）|
+| **链式法则** | $\nabla_{\mathbf{x}} L = J^T \nabla_{\mathbf{z}} L$（反向传播的数学基础）|
 | **Hessian** | $H = J(\nabla f)$，实对称；正定 → 极小，不定 → 鞍点 |
 | **AI 应用** | 反向传播 = 多层 Jacobian 链乘；梯度下降 = $\theta \leftarrow \theta - \eta\nabla\mathcal{L}$；Adam |
 
@@ -950,10 +950,10 @@ PyTorch 的 `loss.backward()` 计算的是对所有 `requires_grad=True` 张量�
 ## 思考路标（条件反射）
 
 1. 看到"向量对向量的导数" → Jacobian 矩阵 $J \in \mathbb{R}^{m\times n}$，行对应输出，列对应输入
-2. 看到"标量对向量的导数" → 梯度列向量 $\nabla_\mathbf{x} f \in \mathbb{R}^n$（分子布局下）
+2. 看到"标量对向量的导数" → 梯度列向量 $\nabla_{\mathbf{x}} f \in \mathbb{R}^n$（分子布局下）
 3. 看到"$\partial(\mathbf{a}^T\mathbf{x})/\partial\mathbf{x}$" → $= \mathbf{a}$（线性函数梯度是系数向量）
 4. 看到"$\partial(\mathbf{x}^TA\mathbf{x})/\partial\mathbf{x}$" → $= 2A\mathbf{x}$（$A$ 对称）；不对称时是 $(A+A^T)\mathbf{x}$
-5. 看到"链式法则（反向传播）" → $\nabla_\mathbf{x} L = J^T \nabla_\mathbf{z} L$，注意是 Jacobian 的**转置**
+5. 看到"链式法则（反向传播）" → $\nabla_{\mathbf{x}} L = J^T \nabla_{\mathbf{z}} L$，注意是 Jacobian 的**转置**
 6. 看到"标量对矩阵 $A$ 的导数" → 迹技巧：写成 $\text{tr}(G^T dA)$ 的形式识别 $G$
 7. 看到"$\partial\text{tr}(AB)/\partial A$" → $= B^T$；"$\partial\log\det(A)/\partial A$" → $= A^{-T}$
 8. 看到"Hessian 矩阵 $H$" → 梯度的 Jacobian，实对称；符号差决定临界点类型
@@ -968,7 +968,7 @@ PyTorch 的 `loss.backward()` 计算的是对所有 `requires_grad=True` 张量�
 
 2. **对称矩阵公式用于非对称矩阵**：$\partial(\mathbf{x}^TA\mathbf{x})/\partial\mathbf{x} = 2A\mathbf{x}$ **仅在 $A$ 对称时成立**。若 $A$ 不对称，结果是 $(A+A^T)\mathbf{x}$。注意检查矩阵是否对称。
 
-3. **链式法则的 Jacobian 转置**：标量损失 $L$ 反向传播时，梯度是 $J^T \nabla_\mathbf{z} L$（转置乘以下游梯度），而不是 $J \nabla_\mathbf{z} L$。漏掉转置导致维度不匹配或梯度错误。
+3. **链式法则的 Jacobian 转置**：标量损失 $L$ 反向传播时，梯度是 $J^T \nabla_{\mathbf{z}} L$（转置乘以下游梯度），而不是 $J \nabla_{\mathbf{z}} L$。漏掉转置导致维度不匹配或梯度错误。
 
 4. **迹技巧的微分与求导混淆**：$df = \text{tr}(G^T dA)$ 中的 $dA$ 是无穷小微分（矩阵），不是普通的矩阵乘法；识别 $G$ 的步骤需要将 $df$ 严格整理成此形式后"读取"。
 
@@ -1071,7 +1071,7 @@ ReLU 层的 Jacobian：$\partial\mathbf{h}/\partial(W_1\mathbf{x}) = \text{diag}
 **回头看一眼"一例速记"**：
 
 > Jacobian $J_{ij} = \partial f_i/\partial x_j$，行是输出维度，列是输入维度。
-> 梯度 $\nabla_\mathbf{x} f$ 是列向量；链式法则反向时乘 $J^T$。
+> 梯度 $\nabla_{\mathbf{x}} f$ 是列向量；链式法则反向时乘 $J^T$。
 > 迹技巧：$df = \text{tr}(G^T dA)$ 识别 $G = \partial f/\partial A$。
 
 如果现在不看笔记，能独立完成例 1 + 例 2 + 自测 1 + 自测 2——本章，你拿下了。

@@ -36,17 +36,17 @@
 >
 > **第 (1) 问——去掉 KL 惩罚**：奖励函数 $r(x, y)$ 是用人类偏好数据训练的一个模型，必然是不完美的（过拟合、分布外泛化差）。当 $\beta = 0$ 时，优化器会将 $\pi_\theta$ 推向奖励模型**评分最高**的输出，而这些输出往往是'奖励黑客'（reward hacking）行为——比如极长但实际质量差的文本、重复特定关键词、或钻奖励模型评判漏洞的输出。
 >
-> 这种现象称为**奖励过拟合**（reward hacking / Goodhart's law：当指标成为目标，它就不再是好指标）。KL 惩罚项 $\beta\,\text{KL}(\pi_\theta \| \pi_\text{ref})$ 通过惩罚 $\pi_\theta$ 远离参考策略 $\pi_\text{ref}$（SFT 模型），防止策略"跑偏"太远。
+> 这种现象称为**奖励过拟合**（reward hacking / Goodhart's law：当指标成为目标，它就不再是好指标）。KL 惩罚项 $\beta\,\text{KL}(\pi_\theta \| \pi_{\text{ref}})$ 通过惩罚 $\pi_\theta$ 远离参考策略 $\pi_{\text{ref}}$（SFT 模型），防止策略"跑偏"太远。
 >
-> **第 (2) 问——KL 方向**：$\text{KL}(\pi_\theta \| \pi_\text{ref}) = \sum_y \pi_\theta(y|x)\log\frac{\pi_\theta(y|x)}{\pi_\text{ref}(y|x)}$。
+> **第 (2) 问——KL 方向**：$\text{KL}(\pi_\theta \| \pi_{\text{ref}}) = \sum_y \pi_\theta(y|x)\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$。
 >
-> 当 $\pi_\text{ref}(y|x) \approx 0$ 但 $\pi_\theta(y|x) > 0$ 时，该项趋于 $+\infty$——这正是我们想要的！它惩罚 $\pi_\theta$ 在参考策略概率极低的输出上分配质量（防止生成"奇怪"内容）。
+> 当 $\pi_{\text{ref}}(y|x) \approx 0$ 但 $\pi_\theta(y|x) > 0$ 时，该项趋于 $+\infty$——这正是我们想要的！它惩罚 $\pi_\theta$ 在参考策略概率极低的输出上分配质量（防止生成"奇怪"内容）。
 >
-> 若用 $\text{KL}(\pi_\text{ref} \| \pi_\theta) = \sum_y \pi_\text{ref}(y|x)\log\frac{\pi_\text{ref}(y|x)}{\pi_\theta(y|x)}$，则当 $\pi_\theta(y|x) \to 0$（但 $\pi_\text{ref}(y|x) > 0$）时该项变大——这惩罚的是 $\pi_\theta$ **遗忘**参考策略的输出，不是我们主要关心的方向。
+> 若用 $\text{KL}(\pi_{\text{ref}} \| \pi_\theta) = \sum_y \pi_{\text{ref}}(y|x)\log\frac{\pi_{\text{ref}}(y|x)}{\pi_\theta(y|x)}$，则当 $\pi_\theta(y|x) \to 0$（但 $\pi_{\text{ref}}(y|x) > 0$）时该项变大——这惩罚的是 $\pi_\theta$ **遗忘**参考策略的输出，不是我们主要关心的方向。
 >
-> **第 (3) 问——DPO 的关键推导**：RLHF 需要两个独立模型（奖励模型 + RL 策略），计算量大且不稳定。DPO 的洞见：最优策略 $\pi^*(y|x)$ 与 $\pi_\text{ref}$ 的关系为 $\pi^*(y|x) \propto \pi_\text{ref}(y|x)\exp(r(y,x)/\beta)$，因此 $r(y,x) = \beta\log\frac{\pi^*(y|x)}{\pi_\text{ref}(y|x)} + \beta Z(x)$（$Z(x)$ 为归一化项）。将此代入 Bradley-Terry 人类偏好模型并最大化对数似然，可以消去 $r$ 和 $Z$，直接得到只含 $\pi_\theta$ 的损失：
+> **第 (3) 问——DPO 的关键推导**：RLHF 需要两个独立模型（奖励模型 + RL 策略），计算量大且不稳定。DPO 的洞见：最优策略 $\pi^*(y|x)$ 与 $\pi_{\text{ref}}$ 的关系为 $\pi^*(y|x) \propto \pi_{\text{ref}}(y|x)\exp(r(y,x)/\beta)$，因此 $r(y,x) = \beta\log\frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} + \beta Z(x)$（$Z(x)$ 为归一化项）。将此代入 Bradley-Terry 人类偏好模型并最大化对数似然，可以消去 $r$ 和 $Z$，直接得到只含 $\pi_\theta$ 的损失：
 >
-> $$\mathcal{L}_{\text{DPO}}(\pi_\theta) = -\mathbb{E}\!\left[\log\sigma\!\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_\text{ref}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_\text{ref}(y_l|x)}\right)\right]$$
+> $$\mathcal{L}_{\text{DPO}}(\pi_\theta) = -\mathbb{E}\!\left[\log\sigma\!\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right]$$
 >
 > 这就是 DPO 的全部——无奖励模型，无 RL loop，只需偏好对 $(y_w, y_l)$ 数据做监督学习。"
 
@@ -436,17 +436,17 @@ $$\theta_{t+1} = \theta_t - \eta \cdot \text{clip}\!\left(\frac{m_t}{\max(\hat{h
 
 **DPO 的推导回顾**（与引入节呼应）：最优 RLHF 策略为：
 
-$$\pi^*(y|x) = \frac{\pi_\text{ref}(y|x)\exp(r(y,x)/\beta)}{Z(x)}$$
+$$\pi^*(y|x) = \frac{\pi_{\text{ref}}(y|x)\exp(r(y,x)/\beta)}{Z(x)}$$
 
 代入 Bradley-Terry 模型（$\Pr[y_w \succ y_l] = \sigma(r(y_w,x) - r(y_l,x))$）并最大化对数似然，消去 $Z(x)$，得：
 
-$$\mathcal{L}_\text{DPO}(\pi_\theta) = -\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\!\left[\log\sigma\!\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_\text{ref}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_\text{ref}(y_l|x)}\right)\right]$$
+$$\mathcal{L}_{\text{DPO}}(\pi_\theta) = -\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\!\left[\log\sigma\!\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right]$$
 
 这是一个标准的二元交叉熵损失，可以直接用 AdamW 优化，无需 PPO 的 clip 机制和 KL 约束的动态调整。
 
 **DPO 的局限性与 IPO**（Azar et al., 2023）：当偏好数据不满足 Bradley-Terry 假设（如存在循环偏好：A > B > C > A）时，DPO 理论不成立。**IPO**（Identity Preference Optimization）直接最小化偏好差的均方误差：
 
-$$\mathcal{L}_\text{IPO} = \mathbb{E}\!\left[\left(\log\frac{\pi_\theta(y_w|x)}{\pi_\text{ref}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_\text{ref}(y_l|x)} - \frac{1}{2\beta}\right)^2\right]$$
+$$\mathcal{L}_{\text{IPO}} = \mathbb{E}\!\left[\left(\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} - \frac{1}{2\beta}\right)^2\right]$$
 
 目标是让偏好差的对数比恒为 $1/(2\beta)$（固定边距），而非用 sigmoid 压缩，对噪声标注更鲁棒。
 
@@ -1376,8 +1376,8 @@ $$\mu_\phi(d\lambda) = \frac{\sqrt{(\lambda_+ - \lambda)(\lambda - \lambda_-)}}{
 | 方法 | 目标 / 关键公式 | 代表论文 |
 |---|---|---|
 | **MAML** | $\min_\theta \sum_\tau \mathcal{L}_\tau(\theta - \alpha\nabla\mathcal{L}_\tau(\theta))$ | Finn et al., 2017 |
-| **RLHF** | $\max_{\pi_\theta}\mathbb{E}[r(x,y)] - \beta\text{KL}(\pi_\theta\|\pi_\text{ref})$ | Ouyang et al., 2022 |
-| **DPO** | $-\mathbb{E}\log\sigma[\beta(\log\pi_\theta(y_w|x)/\pi_\text{ref} - \log\pi_\theta(y_l|x)/\pi_\text{ref})]$ | Rafailov et al., 2023 |
+| **RLHF** | $\max_{\pi_\theta}\mathbb{E}[r(x,y)] - \beta\text{KL}(\pi_\theta\|\pi_{\text{ref}})$ | Ouyang et al., 2022 |
+| **DPO** | $-\mathbb{E}\log\sigma[\beta(\log\pi_\theta(y_w|x)/\pi_{\text{ref}} - \log\pi_\theta(y_l|x)/\pi_{\text{ref}})]$ | Rafailov et al., 2023 |
 | **Lion** | $\theta \leftarrow \theta - \eta\,\text{sign}(\beta_1 m + (1-\beta_1)g)$；$m \leftarrow \beta_2 m + (1-\beta_2)g$ | Chen et al., 2023 |
 | **Sophia** | $\theta \leftarrow \theta - \eta\,\text{clip}(g/\max(\hat{h},\epsilon),\rho)$；$\hat{h}$ 为对角 Hessian 估计 | Liu et al., 2023 |
 | **PAC-Bayes** | $\mathbb{E}_Q[L_{\text{test}}] \leq \mathbb{E}_Q[L_{\text{train}}] + \sqrt{(\text{KL}(Q\|P)+\ln(1/\delta))/(2n)}$ | McAllester, 1999 |
@@ -1408,7 +1408,7 @@ $$\mu_\phi(d\lambda) = \frac{\sqrt{(\lambda_+ - \lambda)(\lambda - \lambda_-)}}{
 
 ### 变形 2：SimPO（偏好优化的简化）
 
-SimPO（Simple Preference Optimization, 2024）：DPO 的参考策略 $\pi_\text{ref}$ 是固定的 SFT 模型，需要同时加载两个模型（一个可训练，一个冻结）。SimPO 直接用序列长度归一化对数概率代替，去掉 $\pi_\text{ref}$，显存节省约 30%：
+SimPO（Simple Preference Optimization, 2024）：DPO 的参考策略 $\pi_{\text{ref}}$ 是固定的 SFT 模型，需要同时加载两个模型（一个可训练，一个冻结）。SimPO 直接用序列长度归一化对数概率代替，去掉 $\pi_{\text{ref}}$，显存节省约 30%：
 
 $$\mathcal{L}_{\text{SimPO}} = -\mathbb{E}\!\left[\log\sigma\!\left(\frac{\beta}{|y_w|}\log\pi_\theta(y_w|x) - \frac{\beta}{|y_l|}\log\pi_\theta(y_l|x) - \gamma\right)\right]$$
 
@@ -1429,7 +1429,7 @@ NTK 理论仅对无限宽网络精确成立。有限宽网络中训练时 kernel
 1. 看到"少样本学习 / N-way K-shot" → 元学习（MAML / Prototypical Networks）；MAML = 找好的初始化，快速适应
 2. 看到"RLHF 训练不稳定" → 检查 KL 惩罚系数 $\beta$（太小 → 奖励黑客；太大 → 策略不更新）
 3. 看到"偏好对数据 $(y_w, y_l)$" → DPO 或 SimPO；不需要奖励模型；只需监督学习
-4. 看到"DPO 梯度消失" → 检查 $\pi_\theta$ 是否与 $\pi_\text{ref}$ 差异太小；可增大 $\beta$ 或加 margin $\gamma$
+4. 看到"DPO 梯度消失" → 检查 $\pi_\theta$ 是否与 $\pi_{\text{ref}}$ 差异太小；可增大 $\beta$ 或加 margin $\gamma$
 5. 看到"Lion 优化器" → 比 Adam 显存省 1/3（无二阶矩）；学习率通常设为 Adam 的 $1/3$（因符号操作无量纲）
 6. 看到"Sophia 对角 Hessian" → Hutchinson 估计：$\hat{h} = z^\top H z$，$z \sim \{\pm1\}^n$；每隔 $k$ 步更新一次
 7. 看到"PAC-Bayes 泛化界" → 平坦极小值（大 $\sigma$）→ 小 KL → 紧泛化界；SAM 直接优化最坏扰动损失
@@ -1439,7 +1439,7 @@ NTK 理论仅对无限宽网络精确成立。有限宽网络中训练时 kernel
 
 ## 易错点
 
-1. **DPO 需要同时加载两个模型**：训练中 $\pi_\theta$ 可更新，$\pi_\text{ref}$（SFT 模型）冻结；若两者权重相同（初始化时），梯度仍不为零——因为更新后 $\pi_\theta$ 与 $\pi_\text{ref}$ 分离。SimPO 才是真正去掉 $\pi_\text{ref}$ 的方案。
+1. **DPO 需要同时加载两个模型**：训练中 $\pi_\theta$ 可更新，$\pi_{\text{ref}}$（SFT 模型）冻结；若两者权重相同（初始化时），梯度仍不为零——因为更新后 $\pi_\theta$ 与 $\pi_{\text{ref}}$ 分离。SimPO 才是真正去掉 $\pi_{\text{ref}}$ 的方案。
 
 2. **Lion 学习率与 Adam 不能直接互换**：Lion 的更新量是 $\text{sign}(\cdot)$，绝对值恒为 1，因此对学习率的选择更敏感；实验发现 Lion 的最优学习率约为 Adam 的 $1/3 \sim 1/10$。
 
@@ -1455,7 +1455,7 @@ NTK 理论仅对无限宽网络精确成立。有限宽网络中训练时 kernel
 
 ### 例 1：DPO 梯度方向分析
 
-> **题目**：DPO 损失对 $\pi_\theta$ 的梯度隐含了什么优化方向？设 $r_\theta(x,y) = \beta\log\frac{\pi_\theta(y|x)}{\pi_\text{ref}(y|x)}$（隐式奖励），推导 DPO 损失对 $r_\theta$ 的梯度方向。
+> **题目**：DPO 损失对 $\pi_\theta$ 的梯度隐含了什么优化方向？设 $r_\theta(x,y) = \beta\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}$（隐式奖励），推导 DPO 损失对 $r_\theta$ 的梯度方向。
 
 【解】令 $\Delta r = r_\theta(x, y_w) - r_\theta(x, y_l)$，DPO 损失 $= -\log\sigma(\Delta r)$。
 
@@ -1508,9 +1508,9 @@ PAC-Bayes 界的泛化误差项 $\propto \sqrt{\text{KL}/n}$：A 约 $\sqrt{2.3\
 
 > 💡 提示：$\nabla_\theta\mathcal{L}_\tau(\theta') = (\mathbf{I} - \alpha\nabla^2_\theta\mathcal{L}_\tau(\theta))\nabla_{\theta'}\mathcal{L}_\tau(\theta')$；包含 Hessian $\nabla^2$，所以是二阶。FOMAML 令 $\mathbf{I} - \alpha\nabla^2 \approx \mathbf{I}$。
 
-**自测 2**　DPO 中，若 $\pi_\theta = \pi_\text{ref}$（模型未微调），DPO 损失的梯度是否为零？
+**自测 2**　DPO 中，若 $\pi_\theta = \pi_{\text{ref}}$（模型未微调），DPO 损失的梯度是否为零？
 
-> 💡 提示：$r_\theta(x,y) = \beta\log(\pi_\theta/\pi_\text{ref}) = 0$ 时，$\Delta r = 0$，$\sigma(\Delta r) = 0.5$，梯度 $= -0.5(\nabla r_\theta(x,y_w) - \nabla r_\theta(x,y_l)) \neq 0$（除非 $y_w$ 和 $y_l$ 的梯度方向恰好相同）。因此未微调时**梯度不为零**，训练可以继续推进。
+> 💡 提示：$r_\theta(x,y) = \beta\log(\pi_\theta/\pi_{\text{ref}}) = 0$ 时，$\Delta r = 0$，$\sigma(\Delta r) = 0.5$，梯度 $= -0.5(\nabla r_\theta(x,y_w) - \nabla r_\theta(x,y_l)) \neq 0$（除非 $y_w$ 和 $y_l$ 的梯度方向恰好相同）。因此未微调时**梯度不为零**，训练可以继续推进。
 
 **自测 3**　Lion 和 Adam 的核心差别是什么？Lion 在什么情形下可能比 Adam 差？
 

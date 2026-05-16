@@ -28,8 +28,8 @@
 > 但推断时问题来了：测试样本一个个进来（batch_size = 1），此时 batch 均值就是该样本本身，方差 = 0，$\hat{x}_i = (x_i - x_i)/\sqrt{0 + \epsilon} \approx 0$，输出恒为 $\beta$——完全丧失预测能力。
 >
 > **正确做法**：训练阶段同时维护**指数移动平均（EMA）统计量**：
-> $\mu_\text{running} \leftarrow 0.9 \mu_\text{running} + 0.1 \mu_\mathcal{B}$，方差同理。
-> 推断时使用 $\mu_\text{running}$ 和 $\sigma^2_\text{running}$，而非 batch 统计量。
+> $\mu_{\text{running}} \leftarrow 0.9 \mu_{\text{running}} + 0.1 \mu_{\mathcal{B}}$，方差同理。
+> 推断时使用 $\mu_{\text{running}}$ 和 $\sigma^2_{\text{running}}$，而非 batch 统计量。
 >
 > PyTorch 中，`model.train()` 切换到 batch 统计模式，`model.eval()` 切换到运行统计模式。**这是最容易踩的工程坑之一**——漏写 `.eval()` 会让推断结果随机化，表现为"模型推断性能不稳定"的玄学 bug。
 >
@@ -97,15 +97,15 @@ $$\sigma'(z) = \sigma(z)(1 - \sigma(z))$$
 
 **第一步：计算 mini-batch 均值**
 
-$$\mu_\mathcal{B} = \frac{1}{m} \sum_{i=1}^{m} x_i$$
+$$\mu_{\mathcal{B}} = \frac{1}{m} \sum_{i=1}^{m} x_i$$
 
 **第二步：计算 mini-batch 方差**
 
-$$\sigma_\mathcal{B}^2 = \frac{1}{m} \sum_{i=1}^{m} (x_i - \mu_\mathcal{B})^2$$
+$$\sigma_{\mathcal{B}}^2 = \frac{1}{m} \sum_{i=1}^{m} (x_i - \mu_{\mathcal{B}})^2$$
 
 **第三步：标准化**
 
-$$\hat{x}_i = \frac{x_i - \mu_\mathcal{B}}{\sqrt{\sigma_\mathcal{B}^2 + \epsilon}}$$
+$$\hat{x}_i = \frac{x_i - \mu_{\mathcal{B}}}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}}$$
 
 其中 $\epsilon$ 是防止除以零的小常数（通常取 $10^{-5}$）。
 
@@ -117,7 +117,7 @@ $$y_i = \gamma \hat{x}_i + \beta$$
 
 **向量形式总结：**
 
-$$\text{BN}_{\gamma,\beta}(\mathbf{x}) = \gamma \cdot \frac{\mathbf{x} - \mu_\mathcal{B}}{\sqrt{\sigma_\mathcal{B}^2 + \epsilon}} + \beta$$
+$$\text{BN}_{\gamma,\beta}(\mathbf{x}) = \gamma \cdot \frac{\mathbf{x} - \mu_{\mathcal{B}}}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}} + \beta$$
 
 ### 20.2.3 反向传播推导
 
@@ -135,15 +135,15 @@ $$\frac{\partial \mathcal{L}}{\partial \hat{x}_i} = \frac{\partial \mathcal{L}}{
 
 **对方差的梯度：**
 
-$$\frac{\partial \mathcal{L}}{\partial \sigma_\mathcal{B}^2} = \sum_{i=1}^{m} \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot (x_i - \mu_\mathcal{B}) \cdot \left(-\frac{1}{2}\right)(\sigma_\mathcal{B}^2 + \epsilon)^{-3/2}$$
+$$\frac{\partial \mathcal{L}}{\partial \sigma_{\mathcal{B}}^2} = \sum_{i=1}^{m} \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot (x_i - \mu_{\mathcal{B}}) \cdot \left(-\frac{1}{2}\right)(\sigma_{\mathcal{B}}^2 + \epsilon)^{-3/2}$$
 
 **对均值的梯度：**
 
-$$\frac{\partial \mathcal{L}}{\partial \mu_\mathcal{B}} = \left(\sum_{i=1}^{m} \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot \frac{-1}{\sqrt{\sigma_\mathcal{B}^2 + \epsilon}}\right) + \frac{\partial \mathcal{L}}{\partial \sigma_\mathcal{B}^2} \cdot \frac{-2}{m}\sum_{i=1}^{m}(x_i - \mu_\mathcal{B})$$
+$$\frac{\partial \mathcal{L}}{\partial \mu_{\mathcal{B}}} = \left(\sum_{i=1}^{m} \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot \frac{-1}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}}\right) + \frac{\partial \mathcal{L}}{\partial \sigma_{\mathcal{B}}^2} \cdot \frac{-2}{m}\sum_{i=1}^{m}(x_i - \mu_{\mathcal{B}})$$
 
 **对输入的梯度（链式法则汇总）：**
 
-$$\frac{\partial \mathcal{L}}{\partial x_i} = \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot \frac{1}{\sqrt{\sigma_\mathcal{B}^2 + \epsilon}} + \frac{\partial \mathcal{L}}{\partial \sigma_\mathcal{B}^2} \cdot \frac{2(x_i - \mu_\mathcal{B})}{m} + \frac{\partial \mathcal{L}}{\partial \mu_\mathcal{B}} \cdot \frac{1}{m}$$
+$$\frac{\partial \mathcal{L}}{\partial x_i} = \frac{\partial \mathcal{L}}{\partial \hat{x}_i} \cdot \frac{1}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}} + \frac{\partial \mathcal{L}}{\partial \sigma_{\mathcal{B}}^2} \cdot \frac{2(x_i - \mu_{\mathcal{B}})}{m} + \frac{\partial \mathcal{L}}{\partial \mu_{\mathcal{B}}} \cdot \frac{1}{m}$$
 
 这三项分别对应：直接路径、通过方差的路径、通过均值的路径。
 
@@ -152,21 +152,21 @@ $$\frac{\partial \mathcal{L}}{\partial x_i} = \frac{\partial \mathcal{L}}{\parti
 批量归一化在训练和推断时行为不同，这是实际使用中的重要细节。
 
 **训练阶段：**
-- 使用当前 mini-batch 的均值 $\mu_\mathcal{B}$ 和方差 $\sigma_\mathcal{B}^2$
-- 梯度通过 $\mu_\mathcal{B}$ 和 $\sigma_\mathcal{B}^2$ 反向传播
+- 使用当前 mini-batch 的均值 $\mu_{\mathcal{B}}$ 和方差 $\sigma_{\mathcal{B}}^2$
+- 梯度通过 $\mu_{\mathcal{B}}$ 和 $\sigma_{\mathcal{B}}^2$ 反向传播
 - 同时使用指数移动平均（EMA）维护运行统计量：
 
-$$\mu_\text{running} \leftarrow (1 - \alpha)\mu_\text{running} + \alpha \mu_\mathcal{B}$$
+$$\mu_{\text{running}} \leftarrow (1 - \alpha)\mu_{\text{running}} + \alpha \mu_{\mathcal{B}}$$
 
-$$\sigma^2_\text{running} \leftarrow (1 - \alpha)\sigma^2_\text{running} + \alpha \sigma_\mathcal{B}^2$$
+$$\sigma^2_{\text{running}} \leftarrow (1 - \alpha)\sigma^2_{\text{running}} + \alpha \sigma_{\mathcal{B}}^2$$
 
 其中 $\alpha$ 为动量参数（通常取 $0.1$）。
 
 **推断阶段：**
-- 使用训练阶段积累的运行统计量 $\mu_\text{running}$ 和 $\sigma^2_\text{running}$
+- 使用训练阶段积累的运行统计量 $\mu_{\text{running}}$ 和 $\sigma^2_{\text{running}}$
 - 归一化操作成为确定性的仿射变换：
 
-$$y = \frac{\gamma}{\sqrt{\sigma^2_\text{running} + \epsilon}} \cdot x + \left(\beta - \frac{\gamma \mu_\text{running}}{\sqrt{\sigma^2_\text{running} + \epsilon}}\right)$$
+$$y = \frac{\gamma}{\sqrt{\sigma^2_{\text{running}} + \epsilon}} \cdot x + \left(\beta - \frac{\gamma \mu_{\text{running}}}{\sqrt{\sigma^2_{\text{running}} + \epsilon}}\right)$$
 
 这意味着推断时 BN 层可以被融合（fold）进前一个线性层，消除额外计算开销。
 
@@ -327,7 +327,7 @@ Santurkar 等人（2018）从理论上证明，BN 的主要优化作用并非直
 
 **定理（非正式）：** 加入批量归一化后，损失函数 $\mathcal{L}$ 关于网络参数的梯度满足更强的 Lipschitz 条件：
 
-$$\|\nabla_\mathbf{w} \mathcal{L}_\text{BN}\| \leq \|\nabla_\mathbf{w} \mathcal{L}_\text{no-BN}\|$$
+$$\|\nabla_{\mathbf{w}} \mathcal{L}_{\text{BN}}\| \leq \|\nabla_{\mathbf{w}} \mathcal{L}_{\text{no-BN}}\|$$
 
 更平滑的曲面意味着：
 1. 梯度更稳定，步长估计更准确
@@ -340,7 +340,7 @@ $$\|\nabla_\mathbf{w} \mathcal{L}_\text{BN}\| \leq \|\nabla_\mathbf{w} \mathcal{
 
 **条件数（Condition Number）：** 对于优化问题，Hessian 矩阵 $\mathbf{H}$ 的条件数定义为：
 
-$$\kappa(\mathbf{H}) = \frac{\lambda_\max(\mathbf{H})}{\lambda_\min(\mathbf{H})}$$
+$$\kappa(\mathbf{H}) = \frac{\lambda_{\max}(\mathbf{H})}{\lambda_{\min}(\mathbf{H})}$$
 
 条件数过大意味着不同方向上的曲率差异极大，梯度下降会产生"锯齿"轨迹，收敛极慢。
 
@@ -364,9 +364,9 @@ $$\theta \leftarrow \theta - \eta \frac{\partial \mathcal{L}}{\partial \theta} \
 
 批量归一化还有隐式的正则化效果：
 
-**噪声注入：** 由于使用 mini-batch 统计量，每次训练时 $\mu_\mathcal{B}$ 和 $\sigma_\mathcal{B}^2$ 都是真实总体统计量的有噪声估计：
+**噪声注入：** 由于使用 mini-batch 统计量，每次训练时 $\mu_{\mathcal{B}}$ 和 $\sigma_{\mathcal{B}}^2$ 都是真实总体统计量的有噪声估计：
 
-$$\mu_\mathcal{B} = \mu + \xi_\mu, \quad \xi_\mu \sim \mathcal{O}(1/\sqrt{m})$$
+$$\mu_{\mathcal{B}} = \mu + \xi_\mu, \quad \xi_\mu \sim \mathcal{O}(1/\sqrt{m})$$
 
 这种随机性类似于 Dropout，起到正则化作用。这也是为什么使用 BN 后通常可以减少 Dropout 的使用。
 
@@ -938,7 +938,7 @@ $$x_1 = 1, \quad x_2 = 3, \quad x_3 = 5$$
 当前参数：$\gamma = 1, \beta = 0$。上游梯度为 $\frac{\partial \mathcal{L}}{\partial y_1} = \frac{\partial \mathcal{L}}{\partial y_2} = \frac{\partial \mathcal{L}}{\partial y_3} = 1$。
 
 请计算：
-(a) $\mu_\mathcal{B}$，$\sigma_\mathcal{B}^2$，$\hat{x}_1, \hat{x}_2, \hat{x}_3$（取 $\epsilon = 0$）
+(a) $\mu_{\mathcal{B}}$，$\sigma_{\mathcal{B}}^2$，$\hat{x}_1, \hat{x}_2, \hat{x}_3$（取 $\epsilon = 0$）
 (b) $\frac{\partial \mathcal{L}}{\partial \gamma}$，$\frac{\partial \mathcal{L}}{\partial \beta}$
 (c) $\frac{\partial \mathcal{L}}{\partial x_1}, \frac{\partial \mathcal{L}}{\partial x_2}, \frac{\partial \mathcal{L}}{\partial x_3}$
 
@@ -958,7 +958,7 @@ $$x_1 = 1, \quad x_2 = 3, \quad x_3 = 5$$
 
 **练习 20.3（中级）** 推断阶段 BatchNorm 的融合
 
-设某层线性变换权重为 $\mathbf{W} \in \mathbb{R}^{C_\text{out} \times C_\text{in}}$，偏置为 $\mathbf{b} \in \mathbb{R}^{C_\text{out}}$，后接 BatchNorm，BN 参数为 $\gamma, \beta, \mu_\text{running}, \sigma^2_\text{running}$。
+设某层线性变换权重为 $\mathbf{W} \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}}}$，偏置为 $\mathbf{b} \in \mathbb{R}^{C_{\text{out}}}$，后接 BatchNorm，BN 参数为 $\gamma, \beta, \mu_{\text{running}}, \sigma^2_{\text{running}}$。
 
 推断时，BN 可以融合进线性层，形成等效的 $\mathbf{W}'$ 和 $\mathbf{b}'$。
 
@@ -999,11 +999,11 @@ $$x_1 = 1, \quad x_2 = 3, \quad x_3 = 5$$
 
 **(a) 前向传播：**
 
-$$\mu_\mathcal{B} = \frac{1+3+5}{3} = 3$$
+$$\mu_{\mathcal{B}} = \frac{1+3+5}{3} = 3$$
 
-$$\sigma_\mathcal{B}^2 = \frac{(1-3)^2 + (3-3)^2 + (5-3)^2}{3} = \frac{4+0+4}{3} = \frac{8}{3}$$
+$$\sigma_{\mathcal{B}}^2 = \frac{(1-3)^2 + (3-3)^2 + (5-3)^2}{3} = \frac{4+0+4}{3} = \frac{8}{3}$$
 
-$$\sqrt{\sigma_\mathcal{B}^2} = \sqrt{8/3} \approx 1.633$$
+$$\sqrt{\sigma_{\mathcal{B}}^2} = \sqrt{8/3} \approx 1.633$$
 
 $$\hat{x}_1 = \frac{1-3}{1.633} \approx -1.225, \quad \hat{x}_2 = \frac{3-3}{1.633} = 0, \quad \hat{x}_3 = \frac{5-3}{1.633} \approx 1.225$$
 
@@ -1019,11 +1019,11 @@ $$\frac{\partial \mathcal{L}}{\partial \beta} = \sum_{i=1}^{3} \frac{\partial \m
 
 首先，$\frac{\partial \mathcal{L}}{\partial \hat{x}_i} = \frac{\partial \mathcal{L}}{\partial y_i} \cdot \gamma = 1 \cdot 1 = 1$，对所有 $i$。
 
-$$\frac{\partial \mathcal{L}}{\partial \sigma_\mathcal{B}^2} = \sum_{i=1}^{3} 1 \cdot (x_i - 3) \cdot \left(-\frac{1}{2}\right)\left(\frac{8}{3}\right)^{-3/2}$$
+$$\frac{\partial \mathcal{L}}{\partial \sigma_{\mathcal{B}}^2} = \sum_{i=1}^{3} 1 \cdot (x_i - 3) \cdot \left(-\frac{1}{2}\right)\left(\frac{8}{3}\right)^{-3/2}$$
 
 $$= \left[(-2) + 0 + 2\right] \cdot \left(-\frac{1}{2}\right) \cdot \left(\frac{3}{8}\right)^{3/2} = 0$$
 
-$$\frac{\partial \mathcal{L}}{\partial \mu_\mathcal{B}} = \sum_{i=1}^{3} 1 \cdot \frac{-1}{\sqrt{8/3}} + 0 = \frac{-3}{\sqrt{8/3}} \approx -1.837$$
+$$\frac{\partial \mathcal{L}}{\partial \mu_{\mathcal{B}}} = \sum_{i=1}^{3} 1 \cdot \frac{-1}{\sqrt{8/3}} + 0 = \frac{-3}{\sqrt{8/3}} \approx -1.837$$
 
 对输入梯度（以 $x_1$ 为例）：
 
@@ -1060,7 +1060,7 @@ LN 在 $d$ 维度上计算统计量，每个位置（每个样本每个时间步
 
 推断阶段的完整计算为：
 
-$$y = \gamma \cdot \frac{\mathbf{W}x + \mathbf{b} - \mu_\text{running}}{\sqrt{\sigma^2_\text{running} + \epsilon}} + \beta$$
+$$y = \gamma \cdot \frac{\mathbf{W}x + \mathbf{b} - \mu_{\text{running}}}{\sqrt{\sigma^2_{\text{running}} + \epsilon}} + \beta$$
 
 令 $s_c = \frac{\gamma_c}{\sqrt{\sigma^2_{\text{running},c} + \epsilon}}$（对每个输出通道 $c$），则：
 
@@ -1075,7 +1075,7 @@ $$b'_c = \beta_c + \gamma_c \cdot \frac{b_c - \mu_{\text{running},c}}{\sqrt{\sig
 
 **(b) 融合的影响：**
 
-- **推断速度**：消除了 BN 层的额外计算（均值/方差计算和归一化），每层节省约 $2 \times C_\text{out}$ 次浮点运算，对大批量推断有显著加速
+- **推断速度**：消除了 BN 层的额外计算（均值/方差计算和归一化），每层节省约 $2 \times C_{\text{out}}$ 次浮点运算，对大批量推断有显著加速
 - **内存使用**：不需要存储 BN 层的中间激活（均值、方差、标准化输出），减少推断时的内存占用；但 $\gamma, \beta, \mu, \sigma^2$ 四个缓冲区可以合并进 $\mathbf{W}', \mathbf{b}'$，参数量净减少
 
 ---
@@ -1221,14 +1221,14 @@ GN 在小 batch 下显著优于 BN，且性能对 batch size 不敏感。
 
 ### BN 前向 4 步
 
-1. $\mu_\mathcal{B} = \frac{1}{m}\sum_{i=1}^m x_i$（batch 均值）
-2. $\sigma_\mathcal{B}^2 = \frac{1}{m}\sum_{i=1}^m (x_i - \mu_\mathcal{B})^2$（batch 方差，有偏）
-3. $\hat{x}_i = (x_i - \mu_\mathcal{B}) / \sqrt{\sigma_\mathcal{B}^2 + \epsilon}$（标准化）
+1. $\mu_{\mathcal{B}} = \frac{1}{m}\sum_{i=1}^m x_i$（batch 均值）
+2. $\sigma_{\mathcal{B}}^2 = \frac{1}{m}\sum_{i=1}^m (x_i - \mu_{\mathcal{B}})^2$（batch 方差，有偏）
+3. $\hat{x}_i = (x_i - \mu_{\mathcal{B}}) / \sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}$（标准化）
 4. $y_i = \gamma\hat{x}_i + \beta$（仿射，$\gamma,\beta$ 可学习）
 
 ### 推断时 BN 融合
 
-$$y = \underbrace{\frac{\gamma}{\sqrt{\sigma^2_\text{run}+\epsilon}}}_{\mathbf{W}'} \cdot x + \underbrace{\beta - \frac{\gamma\mu_\text{run}}{\sqrt{\sigma^2_\text{run}+\epsilon}}}_{\mathbf{b}'}$$
+$$y = \underbrace{\frac{\gamma}{\sqrt{\sigma^2_{\text{run}}+\epsilon}}}_{\mathbf{W}'} \cdot x + \underbrace{\beta - \frac{\gamma\mu_{\text{run}}}{\sqrt{\sigma^2_{\text{run}}+\epsilon}}}_{\mathbf{b}'}$$
 
 推断时 BN + 前一线性层可合并为单个线性层 $\mathbf{W}', \mathbf{b}'$，消除额外计算。
 
@@ -1350,7 +1350,7 @@ $y_i = 2\hat{x}_i - 1$：$y_1 \approx -3.449$，$y_2 = -1$，$y_3 \approx 1.449$
 
 **自测 1**　为什么 BN 在训练时有正则化效果，推断时没有？
 
-> 提示：训练时 $\mu_\mathcal{B}$ 是总体均值的有噪声估计（$\sim \mathcal{O}(1/\sqrt{m})$ 噪声），等效于对激活注入随机扰动，类似 Dropout；推断时使用确定的 EMA 统计量 $\mu_\text{run}$，无随机性，正则化效果消失。
+> 提示：训练时 $\mu_{\mathcal{B}}$ 是总体均值的有噪声估计（$\sim \mathcal{O}(1/\sqrt{m})$ 噪声），等效于对激活注入随机扰动，类似 Dropout；推断时使用确定的 EMA 统计量 $\mu_{\text{run}}$，无随机性，正则化效果消失。
 
 **自测 2**　一个 4 层 MLP 无归一化，输入标准正态，ReLU 激活。随着层数加深，激活值分布会如何变化？BN 如何解决？
 

@@ -8,7 +8,7 @@
 
 > **一例速记**：
 > **等式约束的本质**：在约束曲线 $g(\mathbf{x})=0$ 上极小化 $f$，最优解处 $\nabla f$ 与 $\nabla g$ 必须**平行**（共线）——否则沿约束切方向走一步还能降低 $f$。
-> **Lagrange 函数**：$L(\mathbf{x},\lambda) = f(\mathbf{x}) + \lambda g(\mathbf{x})$；驻点条件 $\nabla f = -\lambda \nabla g$，即 $\nabla_\mathbf{x} L = 0$。
+> **Lagrange 函数**：$L(\mathbf{x},\lambda) = f(\mathbf{x}) + \lambda g(\mathbf{x})$；驻点条件 $\nabla f = -\lambda \nabla g$，即 $\nabla_{\mathbf{x}} L = 0$。
 > **乘子的经济学意义**：$\lambda^* = -\partial p^*/\partial c$，约束右端松弛一单位，目标值改变 $|\lambda^*|$（影子价格）。
 > **LICQ**：约束梯度 $\nabla h_i(\mathbf{x}^*)$ 线性无关 $\Leftrightarrow$ 乘子唯一存在。
 > **AI 关联**：深度学习软约束损失 $= f + \beta \|h(\theta)\|^2$，当 $\beta \to \infty$ 时逼近硬等式约束的 Lagrange 解。
@@ -176,7 +176,7 @@ $$\lambda_i^* = \frac{\partial f^*}{\partial c_i}, \quad \text{其中} \quad f^*
 
 设 $f, \mathbf{h}$ 连续可微，$\mathbf{x}^*$ 是约束优化问题的局部极小值点，且在 $\mathbf{x}^*$ 处满足 LICQ。则存在唯一的 $\boldsymbol{\lambda}^* \in \mathbb{R}^m$，使得：
 
-$$\nabla_\mathbf{x} L(\mathbf{x}^*, \boldsymbol{\lambda}^*) = \nabla f(\mathbf{x}^*) + \mathbf{J}_h(\mathbf{x}^*)^\top \boldsymbol{\lambda}^* = \mathbf{0}$$
+$$\nabla_{\mathbf{x}} L(\mathbf{x}^*, \boldsymbol{\lambda}^*) = \nabla f(\mathbf{x}^*) + \mathbf{J}_h(\mathbf{x}^*)^\top \boldsymbol{\lambda}^* = \mathbf{0}$$
 
 $$\nabla_{\boldsymbol{\lambda}} L(\mathbf{x}^*, \boldsymbol{\lambda}^*) = \mathbf{h}(\mathbf{x}^*) = \mathbf{0}$$
 
@@ -410,7 +410,7 @@ $$\mathbf{x}_B = \mathbf{B}^{-1}(\mathbf{b} - \mathbf{N}\mathbf{x}_N)$$
 
 则在 $\mathbf{x}_0$ 的邻域内，可以将对应的 $m$ 个变量 $\mathbf{y}$ 表示为其余 $n-m$ 个变量 $\mathbf{z}$ 的光滑函数 $\mathbf{y} = \boldsymbol{\phi}(\mathbf{z})$，满足：
 1. $\mathbf{h}(\boldsymbol{\phi}(\mathbf{z}), \mathbf{z}) = \mathbf{0}$（约束自动满足）
-2. $\nabla_\mathbf{z} \boldsymbol{\phi} = -\mathbf{J}_B^{-1} \mathbf{J}_N$（雅可比由链式法则给出）
+2. $\nabla_{\mathbf{z}} \boldsymbol{\phi} = -\mathbf{J}_B^{-1} \mathbf{J}_N$（雅可比由链式法则给出）
 
 其中 $\mathbf{J}_N$ 是 $\mathbf{J}_h$ 中对应 $\mathbf{z}$ 的列构成的子矩阵。
 
@@ -418,9 +418,9 @@ $$\mathbf{x}_B = \mathbf{B}^{-1}(\mathbf{b} - \mathbf{N}\mathbf{x}_N)$$
 
 设 $\mathbf{y} = \boldsymbol{\phi}(\mathbf{z})$ 满足约束，$\tilde{f}(\mathbf{z}) = f(\boldsymbol{\phi}(\mathbf{z}), \mathbf{z})$。由链式法则：
 
-$$\nabla_\mathbf{z} \tilde{f} = \nabla_\mathbf{y} f \cdot \nabla_\mathbf{z} \boldsymbol{\phi} + \nabla_\mathbf{z} f = \nabla_\mathbf{y} f \cdot (-\mathbf{J}_B^{-1} \mathbf{J}_N) + \nabla_\mathbf{z} f$$
+$$\nabla_{\mathbf{z}} \tilde{f} = \nabla_{\mathbf{y}} f \cdot \nabla_{\mathbf{z}} \boldsymbol{\phi} + \nabla_{\mathbf{z}} f = \nabla_{\mathbf{y}} f \cdot (-\mathbf{J}_B^{-1} \mathbf{J}_N) + \nabla_{\mathbf{z}} f$$
 
-令 $\nabla_\mathbf{z} \tilde{f} = \mathbf{0}$，可以证明此方程与 KKT 方程等价（乘数 $\boldsymbol{\lambda}^* = \mathbf{J}_B^{-\top} \nabla_\mathbf{y} f$），两种方法殊途同归。
+令 $\nabla_{\mathbf{z}} \tilde{f} = \mathbf{0}$，可以证明此方程与 KKT 方程等价（乘数 $\boldsymbol{\lambda}^* = \mathbf{J}_B^{-\top} \nabla_{\mathbf{y}} f$），两种方法殊途同归。
 
 ### 7.5.5 消元法与拉格朗日法的比较
 
@@ -468,7 +468,7 @@ $$x_1 = \sin\theta\cos\phi, \quad x_2 = \sin\theta\sin\phi, \quad x_3 = \cos\the
 
 $$\text{拉格朗日函数：} L(\mathbf{x}, \boldsymbol{\lambda}) = f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})$$
 
-$$\text{一阶条件：} \nabla_\mathbf{x} L = \nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0}, \quad \mathbf{h}(\mathbf{x}) = \mathbf{0}$$
+$$\text{一阶条件：} \nabla_{\mathbf{x}} L = \nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0}, \quad \mathbf{h}(\mathbf{x}) = \mathbf{0}$$
 
 $$\text{约束切空间：} \mathcal{T} = \ker(\mathbf{J}_h), \quad \dim \mathcal{T} = n - m$$
 
@@ -979,7 +979,7 @@ $$\mathbf{Q} = \begin{pmatrix} 4 & 1 \\ 1 & 2 \end{pmatrix}, \quad \mathbf{c} = 
 
 （b）写出拉格朗日函数（引入对称矩阵乘数 $\boldsymbol{\Lambda}$）：$L = \text{tr}(\mathbf{C}^\top \mathbf{W}) + \text{tr}(\boldsymbol{\Lambda}^\top (\mathbf{W}^\top \mathbf{W} - \mathbf{I}))$。
 
-（c）令 $\nabla_\mathbf{W} L = \mathbf{0}$，推导一阶条件为 $\mathbf{C} + 2\mathbf{W}\boldsymbol{\Lambda} = \mathbf{0}$。
+（c）令 $\nabla_{\mathbf{W}} L = \mathbf{0}$，推导一阶条件为 $\mathbf{C} + 2\mathbf{W}\boldsymbol{\Lambda} = \mathbf{0}$。
 
 （d）说明最优解 $\mathbf{W}^*$ 与 $\mathbf{C}$ 的 SVD 的关系（提示：$\mathbf{C} = \mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$，$\mathbf{W}^* = \mathbf{U}\mathbf{V}^\top$）。
 
@@ -987,7 +987,7 @@ $$\mathbf{Q} = \begin{pmatrix} 4 & 1 \\ 1 & 2 \end{pmatrix}, \quad \mathbf{c} = 
 
 **练习 7.5**（提高）等式约束与拉格朗日对偶。
 
-（a）**对偶函数**：对于 $\min f(\mathbf{x})\ \text{s.t.}\ \mathbf{h}(\mathbf{x}) = \mathbf{0}$，定义对偶函数 $g(\boldsymbol{\lambda}) = \min_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda})$。证明 $g(\boldsymbol{\lambda})$ 是凹函数（无论 $f$ 和 $h$ 是否凸）。
+（a）**对偶函数**：对于 $\min f(\mathbf{x})\ \text{s.t.}\ \mathbf{h}(\mathbf{x}) = \mathbf{0}$，定义对偶函数 $g(\boldsymbol{\lambda}) = \min_{\mathbf{x}} L(\mathbf{x}, \boldsymbol{\lambda})$。证明 $g(\boldsymbol{\lambda})$ 是凹函数（无论 $f$ 和 $h$ 是否凸）。
 
 （b）**强对偶**：对于凸问题（$f$ 凸，$h$ 仿射），若 Slater 条件满足（可行集非空），则强对偶成立：$\min f = \max_{\boldsymbol{\lambda}} g(\boldsymbol{\lambda})$。验证：例 7.6 中原始最优值 $= 1/2$，对偶最优值 $= g(\lambda^*) = 1/2$。
 
@@ -1107,9 +1107,9 @@ $$D\mathbf{h}(\mathbf{W})[\Delta \mathbf{W}] = (\Delta \mathbf{W})^\top \mathbf{
 
 $$L(\mathbf{W}, \boldsymbol{\Lambda}) = \text{tr}(\mathbf{C}^\top \mathbf{W}) + \text{tr}\left(\boldsymbol{\Lambda}^\top (\mathbf{W}^\top \mathbf{W} - \mathbf{I})\right)$$
 
-（c）对 $\mathbf{W}$ 求梯度并令其为零（利用矩阵微分 $\nabla_\mathbf{W} \text{tr}(\mathbf{C}^\top \mathbf{W}) = \mathbf{C}$，$\nabla_\mathbf{W} \text{tr}(\boldsymbol{\Lambda}^\top \mathbf{W}^\top \mathbf{W}) = 2\mathbf{W}\boldsymbol{\Lambda}$）：
+（c）对 $\mathbf{W}$ 求梯度并令其为零（利用矩阵微分 $\nabla_{\mathbf{W}} \text{tr}(\mathbf{C}^\top \mathbf{W}) = \mathbf{C}$，$\nabla_{\mathbf{W}} \text{tr}(\boldsymbol{\Lambda}^\top \mathbf{W}^\top \mathbf{W}) = 2\mathbf{W}\boldsymbol{\Lambda}$）：
 
-$$\nabla_\mathbf{W} L = \mathbf{C} + 2\mathbf{W}\boldsymbol{\Lambda} = \mathbf{0}$$
+$$\nabla_{\mathbf{W}} L = \mathbf{C} + 2\mathbf{W}\boldsymbol{\Lambda} = \mathbf{0}$$
 
 （d）由 $\mathbf{C} = -2\mathbf{W}\boldsymbol{\Lambda}$，且 $\mathbf{W}^\top \mathbf{W} = \mathbf{I}$（正交），从右乘 $\mathbf{W}^\top$：
 
@@ -1127,7 +1127,7 @@ $$f(\mathbf{W}^*) = \text{tr}(\mathbf{C}^\top \mathbf{U}\mathbf{V}^\top) = \text
 
 （a）**$g(\boldsymbol{\lambda})$ 是凹函数**：
 
-$$g(\boldsymbol{\lambda}) = \inf_\mathbf{x} L(\mathbf{x}, \boldsymbol{\lambda}) = \inf_\mathbf{x} [f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})]$$
+$$g(\boldsymbol{\lambda}) = \inf_{\mathbf{x}} L(\mathbf{x}, \boldsymbol{\lambda}) = \inf_{\mathbf{x}} [f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})]$$
 
 对任意 $\mathbf{x}$，$\boldsymbol{\lambda} \mapsto f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})$ 是关于 $\boldsymbol{\lambda}$ 的仿射函数（凹），故其下确界（逐点取 $\inf$）也是凹函数。$\square$
 
@@ -1171,7 +1171,7 @@ $$\frac{dp^*}{d\epsilon} = \frac{\partial L(\mathbf{x}^*(\epsilon), \lambda^*(\e
 ### 拉格朗日乘数法标准 4 步
 
 1. **写 Lagrange 函数**：$L(\mathbf{x}, \boldsymbol{\lambda}) = f(\mathbf{x}) + \boldsymbol{\lambda}^\top \mathbf{h}(\mathbf{x})$
-2. **令 $\nabla_\mathbf{x} L = 0$**：得 $\nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0}$（$n$ 个方程）
+2. **令 $\nabla_{\mathbf{x}} L = 0$**：得 $\nabla f + \mathbf{J}_h^\top \boldsymbol{\lambda} = \mathbf{0}$（$n$ 个方程）
 3. **加上约束 $\mathbf{h}(\mathbf{x}) = \mathbf{0}$**：共 $n + m$ 个方程，解 $n + m$ 个未知数 $(\mathbf{x}, \boldsymbol{\lambda})$
 4. **筛选候选点**：代入比较函数值，必要时用二阶条件判断极小 / 极大
 
@@ -1191,7 +1191,7 @@ $$\frac{dp^*}{d\epsilon} = \frac{\partial L(\mathbf{x}^*(\epsilon), \lambda^*(\e
 
 ### 变形 1：多个等式约束（$m > 1$）
 
-每个约束引入一个乘子 $\lambda_i$。$\nabla_\mathbf{x} L = \mathbf{0}$ 给出 $n$ 个方程，$m$ 个约束再给出 $m$ 个方程，共 $n+m$ 个方程解 $n+m$ 个未知数。**关键**：LICQ 要求所有约束梯度线性无关，否则乘子不唯一。
+每个约束引入一个乘子 $\lambda_i$。$\nabla_{\mathbf{x}} L = \mathbf{0}$ 给出 $n$ 个方程，$m$ 个约束再给出 $m$ 个方程，共 $n+m$ 个方程解 $n+m$ 个未知数。**关键**：LICQ 要求所有约束梯度线性无关，否则乘子不唯一。
 
 ### 变形 2：含参数的约束（求极值关于参数的敏感性）
 

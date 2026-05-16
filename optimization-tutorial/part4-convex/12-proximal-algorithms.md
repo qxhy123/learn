@@ -9,7 +9,7 @@
 > **本文件**：融合"原版严格推导 + 速记 / 套路 / 自测"。保留原版完整正文 + 在最前置一例速记 / 思维路径 + 最后追加方法总结与自测。
 
 > **一例速记**：
-> **近端算子**：$\text{prox}_{\alpha f}(\mathbf{x}) = \arg\min_\mathbf{u}\{f(\mathbf{u}) + \frac{1}{2\alpha}\|\mathbf{u}-\mathbf{x}\|^2\}$；$\alpha$ 越大越向 $f$ 的极小值靠近，$\alpha \to 0$ 退化为恒等映射。
+> **近端算子**：$\text{prox}_{\alpha f}(\mathbf{x}) = \arg\min_{\mathbf{u}}\{f(\mathbf{u}) + \frac{1}{2\alpha}\|\mathbf{u}-\mathbf{x}\|^2\}$；$\alpha$ 越大越向 $f$ 的极小值靠近，$\alpha \to 0$ 退化为恒等映射。
 > **软阈值**（$\ell_1$ 的近端算子）：$[\mathcal{S}_{\alpha\lambda}(\mathbf{x})]_i = \text{sign}(x_i)\max(|x_i|-\alpha\lambda, 0)$；绝对值小于阈值的分量精确置零。
 > **ISTA**：梯度步 + 近端步，$\mathbf{x}_{k+1} = \text{prox}_{\alpha g}(\mathbf{x}_k - \alpha\nabla f(\mathbf{x}_k))$；收敛率 $O(1/k)$，步长 $\alpha \leq 1/L$。
 > **FISTA**：ISTA + Nesterov 动量外推；收敛率 $O(1/k^2)$，计算量几乎不变——多维护 $\mathbf{y}_k, t_k$ 两个辅助变量。
@@ -374,7 +374,7 @@ $$\begin{aligned}
 
 ### 12.4.5 ADMM 求解 LASSO
 
-对 LASSO 问题 $\min_\mathbf{x} \frac{1}{2}\|A\mathbf{x} - \mathbf{b}\|^2 + \lambda\|\mathbf{x}\|_1$，引入分裂变量 $\mathbf{z} = \mathbf{x}$：
+对 LASSO 问题 $\min_{\mathbf{x}} \frac{1}{2}\|A\mathbf{x} - \mathbf{b}\|^2 + \lambda\|\mathbf{x}\|_1$，引入分裂变量 $\mathbf{z} = \mathbf{x}$：
 
 $$\min_{\mathbf{x}, \mathbf{z}} \frac{1}{2}\|A\mathbf{x} - \mathbf{b}\|^2 + \lambda\|\mathbf{z}\|_1 \quad \text{s.t.} \quad \mathbf{x} = \mathbf{z}$$
 
@@ -477,13 +477,13 @@ PR 分裂在问题严格凸时收敛更快，但需要严格的假设（$A$ 或 
 
 | 名称 | 公式 | 说明 |
 |------|------|------|
-| **近端算子** | $\mathrm{prox}_{\alpha g}(\mathbf{v})=\arg\min_\mathbf{u}\bigl\{g(\mathbf{u})+\tfrac{1}{2\alpha}\lVert\mathbf{u}-\mathbf{v}\rVert^2\bigr\}$ | 近端映射，处理不可微 $g$ |
+| **近端算子** | $\mathrm{prox}_{\alpha g}(\mathbf{v})=\arg\min_{\mathbf{u}}\bigl\{g(\mathbf{u})+\tfrac{1}{2\alpha}\lVert\mathbf{u}-\mathbf{v}\rVert^2\bigr\}$ | 近端映射，处理不可微 $g$ |
 | **软阈值（L1）** | $\mathcal{S}_\lambda(v)=\mathrm{sign}(v)\max(\lvert v\rvert-\lambda,0)$ | $g=\lambda\lVert\cdot\rVert_1$ 的近端算子 |
 | **投影（指示函数）** | $\mathrm{prox}_{\delta_C}(\mathbf{v})=\Pi_C(\mathbf{v})$ | $g=\delta_C$ 时退化为凸投影 |
 | **Moreau 分解** | $\mathbf{v}=\mathrm{prox}_{\alpha g}(\mathbf{v})+\alpha\,\mathrm{prox}_{g^*/\alpha}(\mathbf{v}/\alpha)$ | 将一个近端算子转化为其共轭的近端算子 |
 | **ISTA** | $\mathbf{x}_{k+1}=\mathrm{prox}_{\alpha g}(\mathbf{x}_k-\alpha\nabla f(\mathbf{x}_k))$ | 梯度步 + 近端步，$O(1/k)$ |
 | **FISTA 动量** | $t_{k+1}=\tfrac{1+\sqrt{1+4t_k^2}}{2}$，$\mathbf{y}_{k+1}=\mathbf{x}_k+\tfrac{t_k-1}{t_{k+1}}(\mathbf{x}_k-\mathbf{x}_{k-1})$ | Nesterov 动量，$O(1/k^2)$ |
-| **ADMM x-步** | $\mathbf{x}_{k+1}=\arg\min_\mathbf{x}\bigl\{f(\mathbf{x})+\tfrac{\rho}{2}\lVert A\mathbf{x}+B\mathbf{z}_k-\mathbf{c}+\mathbf{u}_k\rVert^2\bigr\}$ | 通常为线性系统或近端算子 |
+| **ADMM x-步** | $\mathbf{x}_{k+1}=\arg\min_{\mathbf{x}}\bigl\{f(\mathbf{x})+\tfrac{\rho}{2}\lVert A\mathbf{x}+B\mathbf{z}_k-\mathbf{c}+\mathbf{u}_k\rVert^2\bigr\}$ | 通常为线性系统或近端算子 |
 | **ADMM z-步** | $\mathbf{z}_{k+1}=\mathrm{prox}_{g/\rho}(A\mathbf{x}_{k+1}+B^{-1}(\mathbf{c}-\mathbf{u}_k))$（可分）| 独立近端算子（可并行）|
 | **ADMM 对偶步** | $\mathbf{u}_{k+1}=\mathbf{u}_k+A\mathbf{x}_{k+1}+B\mathbf{z}_{k+1}-\mathbf{c}$ | 缩放对偶变量更新 |
 | **Lasso 软阈值** | $\mathbf{x}^*=\mathcal{S}_{\lambda/L}(\mathbf{x}-\tfrac{1}{L}\nabla f(\mathbf{x}))$，$L=\lVert A^TA\rVert_2$ | ISTA 用于 Lasso，步长 $1/L$ |
@@ -1108,7 +1108,7 @@ $$\boxed{\text{prox}_{\alpha f}(\mathbf{x}) = \frac{1}{1+\alpha}\mathbf{x}}$$
 
 **（c）** $f(\mathbf{x}) = \lambda\|\mathbf{x}\|^2$ 时，$\text{prox}_{\alpha f}(\mathbf{x}) = \frac{1}{1+2\alpha\lambda}\mathbf{x}$。
 
-岭回归联系：求解 $\min_\mathbf{x} \frac{1}{2}\|A\mathbf{x}-\mathbf{b}\|^2 + \lambda\|\mathbf{x}\|^2$，最优解为 $(A^\top A + 2\lambda I)^{-1}A^\top \mathbf{b}$，即对 $A^\top \mathbf{b}$ 应用 $f(\mathbf{x}) = \lambda\|\mathbf{x}\|^2$ 的近端算子后再做线性变换。
+岭回归联系：求解 $\min_{\mathbf{x}} \frac{1}{2}\|A\mathbf{x}-\mathbf{b}\|^2 + \lambda\|\mathbf{x}\|^2$，最优解为 $(A^\top A + 2\lambda I)^{-1}A^\top \mathbf{b}$，即对 $A^\top \mathbf{b}$ 应用 $f(\mathbf{x}) = \lambda\|\mathbf{x}\|^2$ 的近端算子后再做线性变换。
 
 ---
 
@@ -1183,7 +1183,7 @@ $$\underbrace{(A^\top A + (\lambda_2 + \rho)I)}_{\text{系数矩阵}} \mathbf{x}
 
 **（c）** $\mathbf{z}$-步：对 $\mathbf{z}$ 求导（$\frac{\rho}{2}\|\mathbf{x} - \mathbf{z} + \mathbf{u}\|^2 + \lambda_1\|\mathbf{z}\|_1$ 关于 $\mathbf{z}$）：
 
-$$\mathbf{z}_{k+1} = \arg\min_\mathbf{z} \left\{ \lambda_1\|\mathbf{z}\|_1 + \frac{\rho}{2}\|\mathbf{z} - (\mathbf{x}_{k+1} + \mathbf{u}_k)\|^2 \right\} = \mathcal{S}_{\lambda_1/\rho}(\mathbf{x}_{k+1} + \mathbf{u}_k)$$
+$$\mathbf{z}_{k+1} = \arg\min_{\mathbf{z}} \left\{ \lambda_1\|\mathbf{z}\|_1 + \frac{\rho}{2}\|\mathbf{z} - (\mathbf{x}_{k+1} + \mathbf{u}_k)\|^2 \right\} = \mathcal{S}_{\lambda_1/\rho}(\mathbf{x}_{k+1} + \mathbf{u}_k)$$
 
 阈值参数为 $\lambda_1/\rho$。
 

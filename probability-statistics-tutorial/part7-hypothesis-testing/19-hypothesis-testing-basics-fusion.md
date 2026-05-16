@@ -39,9 +39,9 @@ $$1 - (1 - 0.05)^{30} \approx 1 - 0.95^{30} \approx 1 - 0.215 = 0.785$$
 >
 > **第 3 步：找分布 / 确定自由度**。t 检验自由度 $\nu = n-1$（单样本）或 $m+n-2$（两样本等方差）；配对 t 检验 $\nu = k-1$（k 对）。
 >
-> **第 4 步：计算检验统计量的观测值**。代入数据，算出 $z_\text{obs}$ 或 $t_\text{obs}$。
+> **第 4 步：计算检验统计量的观测值**。代入数据，算出 $z_{\text{obs}}$ 或 $t_{\text{obs}}$。
 >
-> **第 5 步：算 p 值（或确定拒绝域）**。双侧检验 $p = 2P(T \geq |t_\text{obs}|)$；右侧 $p = P(T \geq t_\text{obs})$；左侧 $p = P(T \leq t_\text{obs})$。临界值法：查表得 $z_{\alpha/2}$ 或 $t_{\alpha/2}(\nu)$，看统计量是否落入拒绝域。
+> **第 5 步：算 p 值（或确定拒绝域）**。双侧检验 $p = 2P(T \geq |t_{\text{obs}}|)$；右侧 $p = P(T \geq t_{\text{obs}})$；左侧 $p = P(T \leq t_{\text{obs}})$。临界值法：查表得 $z_{\alpha/2}$ 或 $t_{\alpha/2}(\nu)$，看统计量是否落入拒绝域。
 >
 > **第 6 步：比较 α、作出决策**。$p \leq \alpha$ 则拒绝 $H_0$；否则不拒绝。**注意：不拒绝 $\neq$ 接受**。
 >
@@ -475,7 +475,7 @@ $$\Lambda^*(\mathbf{x}) = \frac{\sup_{\theta \in \Theta_0} L(\theta; \mathbf{x})
 
 ![p值几何示意：观测统计量位置与单侧、双侧p值对应的阴影区域](../figures/svg/prob-p7-19-3.svg)
 
-> 上图展示了给定观测统计量 $t_\text{obs}$ 时，双侧 p 值（两尾阴影之和）和单侧 p 值（单侧尾部面积）的几何含义。p 值越小，观测点越靠近分布尾部，数据与 $H_0$ 的偏差越难用随机性解释。
+> 上图展示了给定观测统计量 $t_{\text{obs}}$ 时，双侧 p 值（两尾阴影之和）和单侧 p 值（单侧尾部面积）的几何含义。p 值越小，观测点越靠近分布尾部，数据与 $H_0$ 的偏差越难用随机性解释。
 
 ---
 
@@ -488,7 +488,7 @@ $$\Lambda^*(\mathbf{x}) = \frac{\sup_{\theta \in \Theta_0} L(\theta; \mathbf{x})
 | **第一类错误** | $\alpha = P(\text{拒绝}H_0 \mid H_0\text{真})$ | 预先设定，不可事后调整 |
 | **第二类错误** | $\beta = P(\text{不拒绝}H_0 \mid H_0\text{假})$ | 与 $\alpha$ 此消彼长 |
 | **检验功效** | $\text{Power} = 1 - \beta$ | 目标 $\geq 0.8$，靠增大 $n$ 提升 |
-| **p 值（双侧）** | $p = 2P(T \geq \vert t_\text{obs}\vert \mid H_0)$ | $p \leq \alpha$ 才拒绝 $H_0$ |
+| **p 值（双侧）** | $p = 2P(T \geq \vert t_{\text{obs}}\vert \mid H_0)$ | $p \leq \alpha$ 才拒绝 $H_0$ |
 | **样本量（双侧 z）** | $n \geq \left(\frac{(z_{\alpha/2}+z_\beta)\sigma}{\delta}\right)^2$ | 功效分析必用 |
 
 ### 假设检验 7 步流程框图
@@ -523,7 +523,7 @@ $$\Lambda^*(\mathbf{x}) = \frac{\sup_{\theta \in \Theta_0} L(\theta; \mathbf{x})
 
 同时进行 $m$ 次检验时，Bonferroni 校正将每次检验的显著性水平设为 $\alpha/m$，控制家族错误率（FWER）。更灵活的方法是 Benjamini-Hochberg 程序，控制错误发现率（FDR）而非 FWER——在基因组学、机器学习超参数搜索等大规模比较场景中广泛使用。
 
-$$\text{Bonferroni 校正：} \alpha_\text{corrected} = \frac{\alpha}{m}$$
+$$\text{Bonferroni 校正：} \alpha_{\text{corrected}} = \frac{\alpha}{m}$$
 
 ### 变形 4：贝叶斯因子
 
@@ -608,11 +608,11 @@ $$p = P(Z > 7.5) \approx 3 \times 10^{-14} \ll 0.05$$
 
 **第 5 步：决策**
 
-$z_\text{obs} = 7.5 \gg 1.645$，$p \approx 0$，**拒绝 $H_0$**。
+$z_{\text{obs}} = 7.5 \gg 1.645$，$p \approx 0$，**拒绝 $H_0$**。
 
 **结论**：在 $\alpha = 0.05$ 下，有极强统计证据表明新模型准确率显著优于基线。但效应量仅 1.5 个百分点，实际意义取决于具体应用场景。
 
-**【答案】** $\boxed{z_\text{obs} = 7.5,\ p \approx 0,\ \text{拒绝 } H_0}$
+**【答案】** $\boxed{z_{\text{obs}} = 7.5,\ p \approx 0,\ \text{拒绝 } H_0}$
 
 ---
 
@@ -1275,7 +1275,7 @@ $$\text{Cohen's } d = \frac{\bar{d}}{S_d} = \frac{0.015}{0.01022} \approx 1.468$
 
 **自测 4** 某团队同时测试了 50 种超参数组合，发现其中 4 种在 $\alpha = 0.05$ 下显著优于基线。他们宣称"发现了4种有效配置"。请指出统计问题并给出正确的处理方法。
 
-> 💡 提示：多重检验！在 50 次独立检验中，即使全部无效，期望显著次数 $= 50 \times 0.05 = 2.5$，得到 4 次完全在随机波动范围内。应使用 Bonferroni 校正（$\alpha_\text{new} = 0.05/50 = 0.001$）或 BH-FDR 校正后重新判断，并在独立验证集上确认。
+> 💡 提示：多重检验！在 50 次独立检验中，即使全部无效，期望显著次数 $= 50 \times 0.05 = 2.5$，得到 4 次完全在随机波动范围内。应使用 Bonferroni 校正（$\alpha_{\text{new}} = 0.05/50 = 0.001$）或 BH-FDR 校正后重新判断，并在独立验证集上确认。
 
 **自测 5** 以下两个陈述有何区别？(A) "$p = 0.03$，我们证明了新模型更好"。(B) "在 $\alpha = 0.05$ 下，$p = 0.03 < \alpha$，有统计显著证据表明新模型性能优于基线（效应量 Cohen's $d = 0.45$，95% CI [0.12, 0.78]）"。
 

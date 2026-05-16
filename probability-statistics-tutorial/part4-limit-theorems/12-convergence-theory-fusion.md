@@ -17,7 +17,7 @@
 
 ## 引入：4 种收敛为什么不等价？
 
-**题目**：构造一个 $X_n\xrightarrow{P}0$ 但 $X_n\not\xrightarrow{a.s.}0$ 的例子，并解释其"反直觉"所在。
+**题目**：构造一个 $X_n\xrightarrow{P}0$ 但 $X_n\not\to{a.s.}0$ 的例子，并解释其"反直觉"所在。
 
 请先停下来想一想：**"依概率趋于 0"和"逐点趋于 0"有什么区别？**
 
@@ -32,7 +32,7 @@ $$X_1=\mathbf{1}_{[0,1]},\quad X_2=\mathbf{1}_{[0,1/2]},\quad X_3=\mathbf{1}_{[1
 一般地第 $2^k+j$（$0\le j<2^k$）项为 $\mathbf{1}_{[j/2^k,(j+1)/2^k]}$。
 
 - 依概率：$P(X_n=1)=$ 对应区间长度 $\to 0$，故 $X_n\xrightarrow{P}0$。
-- 几乎必然：对任意 $\omega\in[0,1]$，存在无穷多个 $n$ 使 $\omega$ 落入第 $n$ 个区间，故 $X_n(\omega)=1$ 无穷次出现，$X_n(\omega)\not\to 0$，$X_n\not\xrightarrow{a.s.}0$。
+- 几乎必然：对任意 $\omega\in[0,1]$，存在无穷多个 $n$ 使 $\omega$ 落入第 $n$ 个区间，故 $X_n(\omega)=1$ 无穷次出现，$X_n(\omega)\not\to 0$，$X_n\not\to{a.s.}0$。
 
 **反直觉所在**：即使 $P(\text{犯错})\to 0$，同一样本点仍可被无穷多个区间轮番覆盖——这是依概率与几乎必然在"时间维度"上的本质差异。
 
@@ -330,7 +330,7 @@ $$
 一般地，第 $2^k + j$（$0 \leq j < 2^k$）个随机变量为 $\mathbf{1}_{[j/2^k, (j+1)/2^k]}$。
 
 - **依概率**：$P(|X_n - 0| > \varepsilon) = P(X_n = 1) = $ 相应区间长度 $\to 0$，故 $X_n \xrightarrow{P} 0$。
-- **几乎必然**：对任意 $\omega \in [0,1]$，$X_n(\omega)$ 无穷次等于 $1$（每次 $\omega$ 被某个区间覆盖），故数列 $\{X_n(\omega)\}$ 不收敛到 $0$，$X_n \not\xrightarrow{a.s.} 0$。
+- **几乎必然**：对任意 $\omega \in [0,1]$，$X_n(\omega)$ 无穷次等于 $1$（每次 $\omega$ 被某个区间覆盖），故数列 $\{X_n(\omega)\}$ 不收敛到 $0$，$X_n \not\to{a.s.} 0$。
 
 这个例子清晰地展示：**依概率收敛不蕴含几乎必然收敛**。
 
@@ -717,7 +717,7 @@ $$
 
 4. **Slutsky 定理条件**：$Y_n$ 必须依概率收敛到**常数**，不能是随机变量。若 $Y_n\xrightarrow{d}Y$（$Y$ 非常数），则 $X_n+Y_n$ 的极限分布取决于 $X_n,Y_n$ 的**联合分布**，仅知边际分布不够。反例：$X_n=Z$（固定 $N(0,1)$），$Y_n=-Z$，则 $Y_n\xrightarrow{d}N(0,1)=X_n$ 的分布，但 $X_n+Y_n=0$ 依概率趋于 0，而非 $N(0,1)+N(0,1)$ 的卷积。
 
-5. **连续映射定理的连续性要求**：$g$ 必须在极限 $X$ 几乎必然取值的点处连续。若 $g$ 在 $X$ 的正概率点处有间断，则 CMT 失效。标准例子：$g(x)=\mathbf{1}_{x>0}$（在 $0$ 处不连续），若 $P(X=0)>0$，则 $g(X_n)\not\xrightarrow{d}g(X)$ 一般不成立。
+5. **连续映射定理的连续性要求**：$g$ 必须在极限 $X$ 几乎必然取值的点处连续。若 $g$ 在 $X$ 的正概率点处有间断，则 CMT 失效。标准例子：$g(x)=\mathbf{1}_{x>0}$（在 $0$ 处不连续），若 $P(X=0)>0$，则 $g(X_n)\not\to{d}g(X)$ 一般不成立。
 
 ---
 
@@ -1274,7 +1274,7 @@ $$
 
 **自测 3**　$X_n=n^{-1/2}Z_n$，其中 $Z_n\sim N(0,n)$（即 $X_n\sim N(0,1)$ 固定）。用定义验证 $X_n\xrightarrow{d}N(0,1)$，但 $X_n\xrightarrow{P}0$ 是否成立？
 
-> 💡 提示：$X_n\sim N(0,1)$ 对所有 $n$，故 $F_n(x)=\Phi(x)$ 不随 $n$ 变，$X_n\xrightarrow{d}N(0,1)$（极限非常数）。依概率：$P(|X_n|>\varepsilon)=2(1-\Phi(\varepsilon))>0$ 对任意 $\varepsilon>0$ 不趋于 0，故 $X_n\not\xrightarrow{P}0$。说明 d 收敛到非常数时**不等价于** P 收敛。
+> 💡 提示：$X_n\sim N(0,1)$ 对所有 $n$，故 $F_n(x)=\Phi(x)$ 不随 $n$ 变，$X_n\xrightarrow{d}N(0,1)$（极限非常数）。依概率：$P(|X_n|>\varepsilon)=2(1-\Phi(\varepsilon))>0$ 对任意 $\varepsilon>0$ 不趋于 0，故 $X_n\not\to{P}0$。说明 d 收敛到非常数时**不等价于** P 收敛。
 
 **自测 4**　设 $\bar X_n\xrightarrow{d}N(\mu,\sigma^2/n)$（CLT 未标准化版本），$g(x)=x^2$，用 Delta 方法求 $\sqrt n(\bar X_n^2-\mu^2)$ 的渐近分布。
 

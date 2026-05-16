@@ -652,7 +652,7 @@ $$\tilde\tau^2 = \frac{1}{1/\tau^2+n/\sigma^2}, \qquad \tilde\mu = \tilde\tau^2\
 | 细致平衡：$\pi(x)T(x'\mid x)=\pi(x')T(x\mid x')$ | 平稳分布充分条件 |
 | Gibbs：轮流从 $p(x_i\mid\mathbf{x}_{-i})$ 采样，接受率恒为 1 | Gibbs 采样 |
 | $H(\mathbf{x},\boldsymbol\rho)=-\log p(\mathbf{x})+\dfrac{1}{2}\boldsymbol\rho^\top M^{-1}\boldsymbol\rho$ | HMC 哈密顿量 |
-| Leapfrog 步：$\boldsymbol\rho_{t+\epsilon/2}=\boldsymbol\rho_t-\frac{\epsilon}{2}\nabla_\mathbf{x}\log p(\mathbf{x}_t)$，等 | HMC 积分步 |
+| Leapfrog 步：$\boldsymbol\rho_{t+\epsilon/2}=\boldsymbol\rho_t-\frac{\epsilon}{2}\nabla_{\mathbf{x}}\log p(\mathbf{x}_t)$，等 | HMC 积分步 |
 | 自归一化重要性采样：$\hat\mu^{\mathrm{SIS}}=\dfrac{\sum_i w_i f(X_i)}{\sum_i w_i}$ | 无需知道归一化常数 |
 | 有效样本量（ESS）：$\text{ESS}=\dfrac{(\sum_i w_i)^2}{\sum_i w_i^2}$ | 衡量重要性权重的均匀程度 |
 
@@ -691,7 +691,7 @@ d-分离规则（路径 $X-m-Y$，观测集 $\mathbf{Z}$）：
 | 公式 | 说明 |
 |---|---|
 | $P(\mathbf{X})=\dfrac{1}{Z}\prod_{c\in\mathcal{C}}\psi_c(\mathbf{X}_c)$ | 吉布斯分布，势函数乘积 |
-| $Z=\sum_\mathbf{x}\prod_c\psi_c(\mathbf{x}_c)$ | 配分函数（归一化常数） |
+| $Z=\sum_{\mathbf{x}}\prod_c\psi_c(\mathbf{x}_c)$ | 配分函数（归一化常数） |
 | Hammersley-Clifford：MRF $\Leftrightarrow$ Gibbs 分布 | 团势分解等价于马尔可夫性 |
 
 #### 因子图 & 信念传播

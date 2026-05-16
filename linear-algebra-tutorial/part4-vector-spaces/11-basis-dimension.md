@@ -35,7 +35,7 @@
 > **增广矩阵行化简**：
 > $$\begin{pmatrix}1&3&7\\2&5&11\end{pmatrix} \xrightarrow{R_2-2R_1} \begin{pmatrix}1&3&7\\0&-1&-3\end{pmatrix} \xrightarrow{-R_2} \begin{pmatrix}1&3&7\\0&1&3\end{pmatrix} \xrightarrow{R_1-3R_2} \begin{pmatrix}1&0&-2\\0&1&3\end{pmatrix}$$
 >
-> 故 $c_1 = -2$，$c_2 = 3$，即 $[\mathbf{x}]_\mathcal{B} = (-2, 3)^T$。
+> 故 $c_1 = -2$，$c_2 = 3$，即 $[\mathbf{x}]_{\mathcal{B}} = (-2, 3)^T$。
 >
 > **验证**：$-2(1,2)^T + 3(3,5)^T = (-2,-4)^T + (9,15)^T = (7,11)^T$ ✓
 >
@@ -203,7 +203,7 @@ $$\mathcal{B} = \left\{\begin{pmatrix}1\\1\\0\end{pmatrix}, \begin{pmatrix}1\\0\
 
 $$x = c_1 b_1 + c_2 b_2 + \cdots + c_n b_n$$
 
-**定义（坐标）：** 上述表示中的系数 $c_1, c_2, \ldots, c_n$ 称为 $x$ 在基 $\mathcal{B}$ 下的**坐标**（Coordinates），列向量 $[x]_\mathcal{B} = (c_1, c_2, \ldots, c_n)^T$ 称为 $x$ 的**坐标向量**。
+**定义（坐标）：** 上述表示中的系数 $c_1, c_2, \ldots, c_n$ 称为 $x$ 在基 $\mathcal{B}$ 下的**坐标**（Coordinates），列向量 $[x]_{\mathcal{B}} = (c_1, c_2, \ldots, c_n)^T$ 称为 $x$ 的**坐标向量**。
 
 ### 11.4.2 计算坐标
 
@@ -219,7 +219,7 @@ $$\begin{pmatrix}1&3\\2&5\end{pmatrix}\begin{pmatrix}c_1\\c_2\end{pmatrix} = \be
 
 $$\begin{pmatrix}1&3&7\\2&5&11\end{pmatrix} \xrightarrow{R_2-2R_1} \begin{pmatrix}1&3&7\\0&-1&-3\end{pmatrix} \xrightarrow{-R_2} \begin{pmatrix}1&3&7\\0&1&3\end{pmatrix} \xrightarrow{R_1-3R_2} \begin{pmatrix}1&0&-2\\0&1&3\end{pmatrix}$$
 
-故 $c_1 = -2, c_2 = 3$，即 $[x]_\mathcal{B} = \begin{pmatrix}-2\\3\end{pmatrix}$。
+故 $c_1 = -2, c_2 = 3$，即 $[x]_{\mathcal{B}} = \begin{pmatrix}-2\\3\end{pmatrix}$。
 
 **验证：** $-2 \begin{pmatrix}1\\2\end{pmatrix} + 3\begin{pmatrix}3\\5\end{pmatrix} = \begin{pmatrix}-2+9\\-4+15\end{pmatrix} = \begin{pmatrix}7\\11\end{pmatrix}$ ✓
 
@@ -384,7 +384,7 @@ $$v_1 = \begin{pmatrix}1\\0\\-1\end{pmatrix}, \quad v_2 = \begin{pmatrix}2\\1\\0
 
 **练习 3（坐标计算）**
 
-设 $\mathbb{R}^2$ 中的基 $\mathcal{B} = \left\{b_1 = \begin{pmatrix}2\\-1\end{pmatrix}, b_2 = \begin{pmatrix}-3\\4\end{pmatrix}\right\}$，求向量 $x = \begin{pmatrix}4\\-5\end{pmatrix}$ 在基 $\mathcal{B}$ 下的坐标向量 $[x]_\mathcal{B}$。
+设 $\mathbb{R}^2$ 中的基 $\mathcal{B} = \left\{b_1 = \begin{pmatrix}2\\-1\end{pmatrix}, b_2 = \begin{pmatrix}-3\\4\end{pmatrix}\right\}$，求向量 $x = \begin{pmatrix}4\\-5\end{pmatrix}$ 在基 $\mathcal{B}$ 下的坐标向量 $[x]_{\mathcal{B}}$。
 
 **练习 4（秩-零化度定理）**
 
@@ -451,7 +451,7 @@ $$\begin{pmatrix}2&-3\\-1&4\end{pmatrix}^{-1} = \frac{1}{5}\begin{pmatrix}4&3\\1
 
 $$\begin{pmatrix}c_1\\c_2\end{pmatrix} = \frac{1}{5}\begin{pmatrix}4&3\\1&2\end{pmatrix}\begin{pmatrix}4\\-5\end{pmatrix} = \frac{1}{5}\begin{pmatrix}16-15\\4-10\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1\\-6\end{pmatrix} = \begin{pmatrix}1/5\\-6/5\end{pmatrix}$$
 
-故 $[x]_\mathcal{B} = \begin{pmatrix}1/5\\-6/5\end{pmatrix}$。
+故 $[x]_{\mathcal{B}} = \begin{pmatrix}1/5\\-6/5\end{pmatrix}$。
 
 **验证：** $\frac{1}{5}\begin{pmatrix}2\\-1\end{pmatrix} + \left(-\frac{6}{5}\right)\begin{pmatrix}-3\\4\end{pmatrix} = \begin{pmatrix}2/5+18/5\\-1/5-24/5\end{pmatrix} = \begin{pmatrix}4\\-5\end{pmatrix}$ ✓
 
@@ -536,7 +536,7 @@ $$\dim(V+W) = \dim(V) + \dim(W) - \dim(V \cap W) = 6 - \dim(V \cap W)$$
 
 设基为 $\mathcal{B} = \{b_1, \ldots, b_n\}$，求 $\mathbf{x}$ 在 $\mathcal{B}$ 下的坐标：
 
-$$[b_1 \mid b_2 \mid \cdots \mid b_n \mid \mathbf{x}] \xrightarrow{\text{行化简}} [I \mid [x]_\mathcal{B}]$$
+$$[b_1 \mid b_2 \mid \cdots \mid b_n \mid \mathbf{x}] \xrightarrow{\text{行化简}} [I \mid [x]_{\mathcal{B}}]$$
 
 即用增广矩阵行化简到 RREF，右列即为坐标向量。
 
@@ -571,7 +571,7 @@ $$[b_1 \mid b_2 \mid \cdots \mid b_n \mid \mathbf{x}] \xrightarrow{\text{行化�
 3. 看到"求行空间的基" → 行化简后**非零行**构成行空间基
 4. 看到"求零空间的基" → 解 $A\mathbf{x}=\mathbf{0}$，参数化自由变量，写出基向量
 5. 看到"$\dim(\text{Null}(A))$" → 秩-零化度：$n - \text{rank}(A)$，无需真正求解
-6. 看到"求坐标 $[x]_\mathcal{B}$" → 增广矩阵 $[B \mid x]$ 行化简到 RREF，右列即坐标
+6. 看到"求坐标 $[x]_{\mathcal{B}}$" → 增广矩阵 $[B \mid x]$ 行化简到 RREF，右列即坐标
 7. 看到"$k$ 个向量的 Span 的维数" → 等于 $\text{rank}([v_1\vert\cdots\vert v_k])$
 8. 看到"PCA 降维" → 找协方差矩阵的前 $k$ 个特征向量（正交基），投影即新坐标
 9. 看到"维数 $= n$，$n$ 个线性无关向量" → 直接是基，无需验证张成
@@ -587,7 +587,7 @@ $$[b_1 \mid b_2 \mid \cdots \mid b_n \mid \mathbf{x}] \xrightarrow{\text{行化�
 
 3. **秩-零化度定理中 $n$ 是列数**：$\text{rank}(A) + \text{nullity}(A) = n$，$n$ 是矩阵的**列数**（输入维数），不是行数。对 $m \times n$ 矩阵，行数 $m$ 不出现在这个等式里（它出现在对 $A^T$ 的类似公式中）。
 
-4. **坐标与向量本身混淆**：$[\mathbf{x}]_\mathcal{B} = (c_1, \ldots, c_n)^T$ 是坐标向量，不是 $\mathbf{x}$ 本身。换一个基，坐标就变了，但 $\mathbf{x}$ 不变。"坐标是描述工具，向量是客观存在"。
+4. **坐标与向量本身混淆**：$[\mathbf{x}]_{\mathcal{B}} = (c_1, \ldots, c_n)^T$ 是坐标向量，不是 $\mathbf{x}$ 本身。换一个基，坐标就变了，但 $\mathbf{x}$ 不变。"坐标是描述工具，向量是客观存在"。
 
 5. **张成验证遗漏**：检验一组向量是否为基时，除了验证线性无关，还要确认其张成等于整个空间。对 $n$ 维空间中 $n$ 个向量，线性无关自动保证张成（这是一个定理，不是公理）——但对维数未知的子空间，两个条件都需要明确验证。
 
@@ -615,7 +615,7 @@ $$\begin{pmatrix}1&1&0&2\\1&0&1&1\\0&1&1&3\end{pmatrix} \xrightarrow{R_2-R_1} \b
 
 验证：$0\cdot b_1 + 2\cdot b_2 + 1\cdot b_3 = (0,0,0)^T + (2,0,2)^T + (0,1,1)^T = (2,1,3)^T$ ✓
 
-【答案】$\mathcal{B}$ 是 $\mathbb{R}^3$ 的基；$[\mathbf{x}]_\mathcal{B} = (0, 2, 1)^T$。
+【答案】$\mathcal{B}$ 是 $\mathbb{R}^3$ 的基；$[\mathbf{x}]_{\mathcal{B}} = (0, 2, 1)^T$。
 
 ### 例 2：用秩-零化度定理求子空间维数
 
@@ -657,9 +657,9 @@ $\dim(\text{Col}(A)) = \text{rank}(A) = 3$。
 
 > 提示：$\dim(\text{Col}) = 3$；$\dim(\text{Row}) = 3$；$\dim(\text{Null}) = 6-3=3$（秩-零化度，$n=6$）；$\dim(\text{Null}(A^T)) = 4-3=1$（对 $A^T$ 用秩-零化度，列数 $= m = 4$）。
 
-**自测 3**　设 $\mathcal{B} = \{(2,-1)^T, (-3,4)^T\}$，向量 $\mathbf{x} = (4,-5)^T$。不需行化简，用 Cramer 法则或逆矩阵直接求 $[\mathbf{x}]_\mathcal{B}$。
+**自测 3**　设 $\mathcal{B} = \{(2,-1)^T, (-3,4)^T\}$，向量 $\mathbf{x} = (4,-5)^T$。不需行化简，用 Cramer 法则或逆矩阵直接求 $[\mathbf{x}]_{\mathcal{B}}$。
 
-> 提示：系数矩阵行列式 $= 8-3=5$；逆矩阵 $= \frac{1}{5}\begin{pmatrix}4&3\\1&2\end{pmatrix}$；$[\mathbf{x}]_\mathcal{B} = \frac{1}{5}\begin{pmatrix}4&3\\1&2\end{pmatrix}\begin{pmatrix}4\\-5\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1\\-6\end{pmatrix} = (1/5, -6/5)^T$。
+> 提示：系数矩阵行列式 $= 8-3=5$；逆矩阵 $= \frac{1}{5}\begin{pmatrix}4&3\\1&2\end{pmatrix}$；$[\mathbf{x}]_{\mathcal{B}} = \frac{1}{5}\begin{pmatrix}4&3\\1&2\end{pmatrix}\begin{pmatrix}4\\-5\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1\\-6\end{pmatrix} = (1/5, -6/5)^T$。
 
 **自测 4**　PCA 对 100 维数据进行降维，发现协方差矩阵的特征值为 $\lambda_1=50, \lambda_2=30$，其余 98 个为 0.01 或更小。建议保留几个主成分？保留信息比例约为多少？
 

@@ -658,7 +658,7 @@ Dirichlet 过程（DP）是分布的分布：$G \sim DP(\alpha, G_0)$，其中 $
 
 (a) 叙述置换检验（Permutation Test）的完整步骤，证明在 $H_0$ 下交换性成立时，检验的精确水平为 $\alpha$（有限样本精确性）；
 
-(b) 推导置换 p 值：$p_\text{perm} = \#\{(\mathbf{x}, \mathbf{y}) \text{ 的置换}: T \geq t_\text{obs}\} / \binom{m+n}{m}$，说明计算时如何用 Monte Carlo 近似（随机置换检验）；
+(b) 推导置换 p 值：$p_{\text{perm}} = \#\{(\mathbf{x}, \mathbf{y}) \text{ 的置换}: T \geq t_{\text{obs}}\} / \binom{m+n}{m}$，说明计算时如何用 Monte Carlo 近似（随机置换检验）；
 
 (c) Fisher 精确检验用于 $2 \times 2$ 列联表——证明在边际固定的条件下，检验统计量服从超几何分布，写出精确 p 值公式；
 
@@ -701,7 +701,7 @@ Dirichlet 过程（DP）是分布的分布：$G \sim DP(\alpha, G_0)$，其中 $
 
 (b) 在已知 $R(0), R(1), \ldots, R(p)$ 的条件下，最大熵谱估计（Burg 算法）最大化微分熵 $h = \int \log S(f) df$——证明最优谱为有理谱（自回归 AR(p) 过程的谱）；
 
-(c) 在 MCMC 中，链的自相关函数影响有效样本量（ESS）$n_\text{eff} = n/(1 + 2\sum_{k=1}^\infty \rho(k))$——推导此公式，并解释为何高自相关（如随机游走 Metropolis 在高维问题中）导致 ESS 极低；
+(c) 在 MCMC 中，链的自相关函数影响有效样本量（ESS）$n_{\text{eff}} = n/(1 + 2\sum_{k=1}^\infty \rho(k))$——推导此公式，并解释为何高自相关（如随机游走 Metropolis 在高维问题中）导致 ESS 极低；
 
 (d) Hamiltonian Monte Carlo（HMC）通过引入动量变量消除随机游走行为——写出 HMC 的 Hamiltonian $H(\mathbf{q}, \mathbf{p}) = -\log p(\mathbf{q}) + \mathbf{p}^\top\mathbf{p}/2$，解释 Leapfrog 积分器的保体积性（Liouville 定理），以及 NUTS（No-U-Turn Sampler）如何自适应调整步长和路径长度。
 
@@ -712,7 +712,7 @@ Dirichlet 过程（DP）是分布的分布：$G \sim DP(\alpha, G_0)$，其中 $
 
 (a) 证明自归一化重要性采样估计量 $\hat{\mu}_{SNIS} = \sum w(X_i) f(X_i)/\sum w(X_i)$ 是有偏但相合的估计量；
 
-(b) 推导有效样本量（ESS）$\hat{n}_\text{eff} = (\sum w_i)^2/\sum w_i^2$，并证明当 $q = \pi$ 时 $n_\text{eff} = n$，当权重退化时 $n_\text{eff} \to 1$；
+(b) 推导有效样本量（ESS）$\hat{n}_{\text{eff}} = (\sum w_i)^2/\sum w_i^2$，并证明当 $q = \pi$ 时 $n_{\text{eff}} = n$，当权重退化时 $n_{\text{eff}} \to 1$；
 
 (c) 序列重要性重采样（SIR）/ 粒子滤波：设隐状态马尔可夫链 $X_t \sim p(x_t \vert x_{t-1})$，观测 $Y_t \sim p(y_t \vert x_t)$——推导过滤分布 $p(x_t \vert y_{1:t})$ 的粒子近似递推公式（含权重更新与重采样步骤）；
 
@@ -740,7 +740,7 @@ Dirichlet 过程（DP）是分布的分布：$G \sim DP(\alpha, G_0)$，其中 $
 
 (b) 证明 Metropolis-Hastings 算法的接受概率 $\alpha(x,y) = \min\!\left(1, \frac{\pi(y)q(y,x)}{\pi(x)q(x,y)}\right)$ 使得细致平衡成立；
 
-(c) 定义混合时间 $t_\text{mix}(\varepsilon) = \min\{t: \max_x \|P^t(x,\cdot) - \pi\|_{TV} \leq \varepsilon\}$，证明 $t_\text{mix} \leq \log(1/\varepsilon\pi_\text{min})/\text{Gap}$，其中 $\text{Gap} = 1 - \lambda_2$ 为谱隙；
+(c) 定义混合时间 $t_{\text{mix}}(\varepsilon) = \min\{t: \max_x \|P^t(x,\cdot) - \pi\|_{TV} \leq \varepsilon\}$，证明 $t_{\text{mix}} \leq \log(1/\varepsilon\pi_{\text{min}})/\text{Gap}$，其中 $\text{Gap} = 1 - \lambda_2$ 为谱隙；
 
 (d) 在大语言模型的自回归采样（Ancestral Sampling）中，token 序列生成可视为马尔可夫链——分析温度参数 $T$ 对谱隙（混合速度）的影响：$T \to 0$ 使链混合变慢（卡在局部极值），$T \to \infty$ 使链混合加快但输出随机——推导最优温度的权衡准则（最大化有效信息率）。
 
@@ -753,7 +753,7 @@ Dirichlet 过程（DP）是分布的分布：$G \sim DP(\alpha, G_0)$，其中 $
 
 (b) 证明树结构图上 BP 的精确性（有限步内收敛到精确边际），并分析循环图（Loopy BP）的不精确性来源；
 
-(c) Bethe 自由能近似：$F_\text{Bethe} = -\sum_f E_{\hat{b}_f}[\log f] + \sum_f H(\hat{b}_f) - \sum_v (d_v - 1) H(\hat{b}_v)$——证明树图上 $F_\text{Bethe}$ 等于精确自由能，并解释循环图上 BP 不动点对应 Bethe 自由能的驻点；
+(c) Bethe 自由能近似：$F_{\text{Bethe}} = -\sum_f E_{\hat{b}_f}[\log f] + \sum_f H(\hat{b}_f) - \sum_v (d_v - 1) H(\hat{b}_v)$——证明树图上 $F_{\text{Bethe}}$ 等于精确自由能，并解释循环图上 BP 不动点对应 Bethe 自由能的驻点；
 
 (d) 在深度学习的结构化预测（如 CRF + Neural Network）中，Loopy BP 用于序列标注和图像分割——分析神经 CRF（如 CRFasRNN、DeepLab v2 的 DenseCRF）中均场推断的迭代方程，说明均场推断为何能以 RNN 形式嵌入端到端训练。
 

@@ -99,7 +99,7 @@ $$\boxed{\mathbf{d}_i^\top \mathbf{A} \mathbf{d}_j = 0}$$
 
 若向量组 $\{\mathbf{d}_0, \mathbf{d}_1, \ldots, \mathbf{d}_k\}$ 两两关于 $\mathbf{A}$ 共轭，则称其为 **A-共轭方向组**。
 
-**几何直觉**：$\mathbf{A}$-内积 $\langle \mathbf{u}, \mathbf{v} \rangle_\mathbf{A} = \mathbf{u}^\top \mathbf{A} \mathbf{v}$ 定义了一个新的内积空间。A-共轭相当于在以 $\mathbf{A}^{1/2}$ 变换后的坐标系中的正交性：令 $\tilde{\mathbf{u}} = \mathbf{A}^{1/2}\mathbf{u}$，则 $\mathbf{u}^\top \mathbf{A} \mathbf{v} = \tilde{\mathbf{u}}^\top \tilde{\mathbf{v}}$。变换后的椭球变成球，共轭方向变成正交方向。
+**几何直觉**：$\mathbf{A}$-内积 $\langle \mathbf{u}, \mathbf{v} \rangle_{\mathbf{A}} = \mathbf{u}^\top \mathbf{A} \mathbf{v}$ 定义了一个新的内积空间。A-共轭相当于在以 $\mathbf{A}^{1/2}$ 变换后的坐标系中的正交性：令 $\tilde{\mathbf{u}} = \mathbf{A}^{1/2}\mathbf{u}$，则 $\mathbf{u}^\top \mathbf{A} \mathbf{v} = \tilde{\mathbf{u}}^\top \tilde{\mathbf{v}}$。变换后的椭球变成球，共轭方向变成正交方向。
 
 **例题 15.1**：设 $\mathbf{A} = \begin{pmatrix} 2 & 0 \\ 0 & 8 \end{pmatrix}$，求与 $\mathbf{d}_0 = (1, 1)^\top$ 关于 $\mathbf{A}$ 共轭的向量。
 
@@ -244,9 +244,9 @@ $$\text{span}\{\mathbf{r}_0, \ldots, \mathbf{r}_k\} = \text{span}\{\mathbf{d}_0,
 
 **定理 15.2（CG收敛上界）**：设 $\mathbf{A} \succ 0$，条件数 $\kappa = \lambda_{\max}/\lambda_{\min}$，则CG第 $k$ 步的误差满足：
 
-$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_\mathbf{A}} \leq 2\left(\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}\right)^k$$
+$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_{\mathbf{A}}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_{\mathbf{A}}} \leq 2\left(\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}\right)^k$$
 
-其中 $\|\mathbf{e}\|_\mathbf{A} = \sqrt{\mathbf{e}^\top \mathbf{A} \mathbf{e}}$（$\mathbf{A}$-范数，也称能量范数）。
+其中 $\|\mathbf{e}\|_{\mathbf{A}} = \sqrt{\mathbf{e}^\top \mathbf{A} \mathbf{e}}$（$\mathbf{A}$-范数，也称能量范数）。
 
 **与梯度下降的对比**：梯度下降的收敛因子是 $\frac{\kappa - 1}{\kappa + 1}$，而CG的收敛因子是 $\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}$。
 
@@ -259,7 +259,7 @@ $$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}}{\|\mathbf{x}_0 - \mathbf{x}^
 
 **更精细的收敛界（Chebyshev多项式）**：
 
-$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_\mathbf{A}} \leq \frac{2\rho^k}{1 + \rho^{2k}}, \quad \rho = \frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}$$
+$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_{\mathbf{A}}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_{\mathbf{A}}} \leq \frac{2\rho^k}{1 + \rho^{2k}}, \quad \rho = \frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}$$
 
 这一界来自 Chebyshev 多项式的最优逼近理论：CG 第 $k$ 步的误差等于在 $\mathbf{A}$ 的特征值集合 $\{\lambda_1, \ldots, \lambda_n\}$ 上次数 $\leq k$ 的首一多项式的最小最大范数。
 
@@ -426,7 +426,7 @@ return x_k
 
 **PCG 收敛率**：
 
-$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_\mathbf{A}} \leq 2\left(\frac{\sqrt{\kappa(\mathbf{P}^{-1}\mathbf{A})} - 1}{\sqrt{\kappa(\mathbf{P}^{-1}\mathbf{A})} + 1}\right)^k$$
+$$\frac{\|\mathbf{x}_k - \mathbf{x}^*\|_{\mathbf{A}}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_{\mathbf{A}}} \leq 2\left(\frac{\sqrt{\kappa(\mathbf{P}^{-1}\mathbf{A})} - 1}{\sqrt{\kappa(\mathbf{P}^{-1}\mathbf{A})} + 1}\right)^k$$
 
 ### 15.4.3 常用预处理矩阵
 
@@ -632,7 +632,7 @@ $$\text{FR系数：} \beta_k^{\text{FR}} = \frac{\|\nabla f(\mathbf{x}_k)\|^2}{\
 
 $$\text{PR系数：} \beta_k^{\text{PR}} = \frac{\nabla f(\mathbf{x}_k)^\top(\nabla f(\mathbf{x}_k) - \nabla f(\mathbf{x}_{k-1}))}{\|\nabla f(\mathbf{x}_{k-1})\|^2}$$
 
-$$\text{CG收敛界：} \frac{\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_\mathbf{A}} \leq 2\left(\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}\right)^k$$
+$$\text{CG收敛界：} \frac{\|\mathbf{x}_k - \mathbf{x}^*\|_{\mathbf{A}}}{\|\mathbf{x}_0 - \mathbf{x}^*\|_{\mathbf{A}}} \leq 2\left(\frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1}\right)^k$$
 
 ---
 
@@ -1436,7 +1436,7 @@ $$\epsilon_r^{(k)} = \min\left(0.5, \sqrt{\|\mathbf{g}_k\|} / \|\mathbf{g}_k\|\r
 
 CG 的每一步在 Krylov 子空间 $\mathcal{K}_k = \text{span}\{\mathbf{r}_0, \mathbf{A}\mathbf{r}_0, \ldots, \mathbf{A}^{k-1}\mathbf{r}_0\}$ 中寻找最优解，这等价于：
 
-$$\mathbf{x}_k = \arg\min_{\mathbf{x} \in \mathbf{x}_0 + \mathcal{K}_k} \|\mathbf{x} - \mathbf{x}^*\|_\mathbf{A}$$
+$$\mathbf{x}_k = \arg\min_{\mathbf{x} \in \mathbf{x}_0 + \mathcal{K}_k} \|\mathbf{x} - \mathbf{x}^*\|_{\mathbf{A}}$$
 
 即 $\mathbf{x}_k$ 是 $\mathbf{x}^*$ 在 $\mathbf{x}_0 + \mathcal{K}_k$ 上的 $\mathbf{A}$-范数投影——CG 是**最优 Krylov 子空间方法**。
 
@@ -1500,7 +1500,7 @@ Hessian-free（CG + Hv 乘积）
 | **FR 系数** | $\beta_k^{\text{FR}} = \|\mathbf{g}_k\|^2 / \|\mathbf{g}_{k-1}\|^2$ | 非线性 CG，比值总 $\geq 0$ |
 | **PR 系数** | $\beta_k^{\text{PR}} = \mathbf{g}_k^\top(\mathbf{g}_k - \mathbf{g}_{k-1})/\|\mathbf{g}_{k-1}\|^2$ | 可为负，自动重启效果 |
 | **PR+ 系数** | $\beta_k^{\text{PR+}} = \max(\beta_k^{\text{PR}}, 0)$ | 强制下降性 + 自动重启 |
-| **收敛上界** | $\|\mathbf{x}_k-\mathbf{x}^*\|_\mathbf{A}/\|\mathbf{x}_0-\mathbf{x}^*\|_\mathbf{A} \leq 2\rho^k$ | $\rho = (\sqrt{\kappa}-1)/(\sqrt{\kappa}+1)$ |
+| **收敛上界** | $\|\mathbf{x}_k-\mathbf{x}^*\|_{\mathbf{A}}/\|\mathbf{x}_0-\mathbf{x}^*\|_{\mathbf{A}} \leq 2\rho^k$ | $\rho = (\sqrt{\kappa}-1)/(\sqrt{\kappa}+1)$ |
 | **PCG 步长** | $\alpha_k = \mathbf{r}_k^\top\mathbf{z}_k / (\mathbf{d}_k^\top\mathbf{A}\mathbf{d}_k)$ | $\mathbf{z}_k = \mathbf{P}^{-1}\mathbf{r}_k$（预处理步） |
 
 ### 共轭梯度法的 5 步流程
@@ -1754,7 +1754,7 @@ $\mathbf{z}_1 = \mathbf{z}_0 + 0.5\mathbf{d}_0 = (-0.5, 0)^\top$，$\|\mathbf{z}
 (b) 运行第二步，验证 $\mathbf{x}_2 = \mathbf{x}^* = (2, 2)^\top$。
 (c) 验证 $\mathbf{r}_0^\top\mathbf{r}_1 = 0$ 和 $\mathbf{d}_0^\top\mathbf{A}\mathbf{d}_1 = 0$。
 
-**T3**（收敛分析）：条件数 $\kappa = 100$，初始误差 $\|\mathbf{e}_0\|_\mathbf{A} = 1$，目标误差 $\epsilon = 10^{-4}$。
+**T3**（收敛分析）：条件数 $\kappa = 100$，初始误差 $\|\mathbf{e}_0\|_{\mathbf{A}} = 1$，目标误差 $\epsilon = 10^{-4}$。
 (a) 梯度下降（最优固定步长）需要多少步？
 (b) 共轭梯度法需要多少步（用上界公式）？
 (c) 若矩阵 $\mathbf{A}$ 只有 3 个不同特征值（$n = 1000$），CG 需要多少步？

@@ -145,7 +145,7 @@ $$\mathcal{L}(\mathbf{x}, \boldsymbol{\mu}, \boldsymbol{\lambda}) = f(\mathbf{x}
 
 $$\nabla f(\mathbf{x}^*) + \sum_{i=1}^{m} \mu_i^* \nabla g_i(\mathbf{x}^*) + \sum_{j=1}^{p} \lambda_j^* \nabla h_j(\mathbf{x}^*) = \mathbf{0}$$
 
-即 $\nabla_\mathbf{x} \mathcal{L}(\mathbf{x}^*, \boldsymbol{\mu}^*, \boldsymbol{\lambda}^*) = \mathbf{0}$。
+即 $\nabla_{\mathbf{x}} \mathcal{L}(\mathbf{x}^*, \boldsymbol{\mu}^*, \boldsymbol{\lambda}^*) = \mathbf{0}$。
 
 **（二）原始可行性（Primal Feasibility）：**
 
@@ -406,7 +406,7 @@ $\nabla^2 \mathcal{L}$ 正定，SOSC 成立，故 $(1, 0)$ 是严格局部极小
 | **标准不等式约束问题** | $\min f(\mathbf{x})$ s.t. $g_i \leq 0$, $h_j = 0$ | 约束优化的统一框架 |
 | **活跃约束集** | $\mathcal{A}(\mathbf{x}^*) = \{i \mid g_i(\mathbf{x}^*) = 0\}$ | 识别在极小点处"起作用"的约束 |
 | **Lagrange 函数** | $\mathcal{L} = f + \sum \mu_i g_i + \sum \lambda_j h_j$ | KKT 条件的统一表达载体 |
-| **梯度条件** | $\nabla_\mathbf{x} \mathcal{L} = \mathbf{0}$ | 一阶稳定性：梯度由约束法向平衡 |
+| **梯度条件** | $\nabla_{\mathbf{x}} \mathcal{L} = \mathbf{0}$ | 一阶稳定性：梯度由约束法向平衡 |
 | **原始可行性** | $g_i(\mathbf{x}^*) \leq 0$，$h_j(\mathbf{x}^*) = 0$ | 解在可行域内 |
 | **对偶可行性** | $\mu_i^* \geq 0$ | 不等式乘子非负 |
 | **互补松弛** | $\mu_i^* g_i(\mathbf{x}^*) = 0$ | 非活跃约束的乘子为零 |
@@ -1120,7 +1120,7 @@ $$\mathcal{P}_{\sqrt{2}}(\mathbf{y}) = \begin{cases} \mathbf{y} & \text{若 } \|
 ### KKT 条件验证 5 步法
 
 1. **写 Lagrange 函数**：$\mathcal{L} = f(\mathbf{x}) + \sum_i \mu_i g_i(\mathbf{x}) + \sum_j \lambda_j h_j(\mathbf{x})$
-2. **驻点条件**：$\nabla_\mathbf{x} \mathcal{L} = \mathbf{0}$（$n$ 个方程）
+2. **驻点条件**：$\nabla_{\mathbf{x}} \mathcal{L} = \mathbf{0}$（$n$ 个方程）
 3. **原始可行**：所有 $g_i(\mathbf{x}) \leq 0$，$h_j(\mathbf{x}) = 0$
 4. **对偶可行**：所有 $\mu_i \geq 0$
 5. **互补松弛**：$\mu_i g_i(\mathbf{x}) = 0$，$\forall i$（活跃约束 $g_i=0$ 或乘子 $\mu_i=0$）

@@ -489,13 +489,13 @@ $$
 **第一步：计算批均值和批方差**
 
 $$
-\mu_\mathcal{B}^{(j)} = \frac{1}{m} \sum_{i=1}^{m} x_i^{(j)}, \qquad \sigma_{\mathcal{B}}^{2(j)} = \frac{1}{m} \sum_{i=1}^{m} \left(x_i^{(j)} - \mu_\mathcal{B}^{(j)}\right)^2
+\mu_{\mathcal{B}}^{(j)} = \frac{1}{m} \sum_{i=1}^{m} x_i^{(j)}, \qquad \sigma_{\mathcal{B}}^{2(j)} = \frac{1}{m} \sum_{i=1}^{m} \left(x_i^{(j)} - \mu_{\mathcal{B}}^{(j)}\right)^2
 $$
 
 **第二步：标准化**
 
 $$
-\hat{x}_i^{(j)} = \frac{x_i^{(j)} - \mu_\mathcal{B}^{(j)}}{\sqrt{\sigma_{\mathcal{B}}^{2(j)} + \varepsilon}}
+\hat{x}_i^{(j)} = \frac{x_i^{(j)} - \mu_{\mathcal{B}}^{(j)}}{\sqrt{\sigma_{\mathcal{B}}^{2(j)} + \varepsilon}}
 $$
 
 **第三步：可学习的仿射变换**
@@ -515,7 +515,7 @@ BatchNorm 的统计理论基础与 CLT 密切相关，体现在以下几个层�
 BatchNorm 对每个特征做的标准化
 
 $$
-\hat{x}^{(j)} = \frac{x^{(j)} - \mu_\mathcal{B}^{(j)}}{\sigma_\mathcal{B}^{(j)}}
+\hat{x}^{(j)} = \frac{x^{(j)} - \mu_{\mathcal{B}}^{(j)}}{\sigma_{\mathcal{B}}^{(j)}}
 $$
 
 正是 CLT 中的**标准化**变换 $Z_n = (S_n - n\mu)/(\sigma\sqrt{n})$，将任意均值和方差的分布映射到零均值单位方差的空间。
@@ -525,7 +525,7 @@ $$
 由 CLT，若 mini-batch 中样本 i.i.d. 地来自分布 $\mathcal{D}$（均值 $\mu$，方差 $\sigma^2$），则批均值
 
 $$
-\mu_\mathcal{B} = \frac{1}{m}\sum_{i=1}^m x_i \approx \mathcal{N}\!\left(\mu,\, \frac{\sigma^2}{m}\right) \quad \text{（由 CLT）}
+\mu_{\mathcal{B}} = \frac{1}{m}\sum_{i=1}^m x_i \approx \mathcal{N}\!\left(\mu,\, \frac{\sigma^2}{m}\right) \quad \text{（由 CLT）}
 $$
 
 这意味着：**批大小 $m$ 越大，批统计量的估计越稳定**，BatchNorm 的归一化效果越好。这也是实践中 BatchNorm 要求足够大的批大小（通常 $\geq 32$）的数学原因。

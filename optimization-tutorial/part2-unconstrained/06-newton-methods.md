@@ -1135,7 +1135,7 @@ $$\mathbf{x}_1 = \mathbf{x}_0 + \mathbf{d}_0 = \mathbf{A}^{-1}\mathbf{b} = \math
 
 最优步长：$\alpha^* = \frac{2}{\lambda_{\max}(\mathbf{A}) + \lambda_{\min}(\mathbf{A})}$
 
-收敛速率：$\|\mathbf{x}_{k+1} - \mathbf{x}^*\|_\mathbf{A} \leq \frac{\kappa - 1}{\kappa + 1}\|\mathbf{x}_k - \mathbf{x}^*\|_\mathbf{A}$
+收敛速率：$\|\mathbf{x}_{k+1} - \mathbf{x}^*\|_{\mathbf{A}} \leq \frac{\kappa - 1}{\kappa + 1}\|\mathbf{x}_k - \mathbf{x}^*\|_{\mathbf{A}}$
 
 其中 $\kappa = \lambda_{\max}/\lambda_{\min}$ 为条件数。当 $\kappa \gg 1$ 时（病态矩阵），梯度下降极慢，而牛顿法始终一步收敛。
 

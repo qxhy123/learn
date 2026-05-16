@@ -509,7 +509,7 @@ plt.show()
 在神经网络训练中，**批归一化**（Batch Normalization）本质上是对每个特征计算批次内的均值和标准差，然后进行标准化：
 
 $$
-\hat{x}_i = \frac{x_i - \mu_\mathcal{B}}{\sqrt{\sigma_\mathcal{B}^2 + \epsilon}}, \quad y_i = \gamma \hat{x}_i + \beta
+\hat{x}_i = \frac{x_i - \mu_{\mathcal{B}}}{\sqrt{\sigma_{\mathcal{B}}^2 + \epsilon}}, \quad y_i = \gamma \hat{x}_i + \beta
 $$
 
 下面的代码展示如何手动实现 BatchNorm 并与 PyTorch 内置版本对比，加深对其统计含义的理解：

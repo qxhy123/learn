@@ -984,7 +984,7 @@ BCE 损失是负对数似然的均值，最小化 BCE $\Leftrightarrow$ 最大�
 
 > 💡 提示：$P(X > k) = (1-p)^k$（几何级数尾概率），代入条件概率公式直接化简。直觉：每次试验独立，过去 $m$ 次失败不提供关于未来的任何信息，"重新开始"的等价性。
 
-**自测 5**　某二分类模型预测概率 $\hat{p} = 0.9$，真实标签 $y = 0$（预测严重错误）。(1) 计算 BCE 损失值。(2) 计算 MSE 损失值。(3) BCE 梯度 $\partial\mathcal{L}_\text{BCE}/\partial z$ 与 MSE 梯度 $\partial\mathcal{L}_\text{MSE}/\partial z$ 各是多少？哪个梯度更利于训练？
+**自测 5**　某二分类模型预测概率 $\hat{p} = 0.9$，真实标签 $y = 0$（预测严重错误）。(1) 计算 BCE 损失值。(2) 计算 MSE 损失值。(3) BCE 梯度 $\partial\mathcal{L}_{\text{BCE}}/\partial z$ 与 MSE 梯度 $\partial\mathcal{L}_{\text{MSE}}/\partial z$ 各是多少？哪个梯度更利于训练？
 
 > 💡 提示：BCE $= -\log(1-0.9) = -\log(0.1) \approx 2.303$；MSE $= (0.9-0)^2 = 0.81$。BCE 梯度 $= 0.9 - 0 = 0.9$（大）；MSE 梯度 $= (0.9-0) \times 0.9 \times 0.1 = 0.081$（小，因 $\hat{p}(1-\hat{p})$ 衰减）。BCE 梯度更大，训练更有效。
 

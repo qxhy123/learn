@@ -775,7 +775,7 @@ $\|\mathbf{x}\|_\infty \leq \|\mathbf{x}\|_2 \leq \|\mathbf{x}\|_1 \leq \sqrt{n}
 
 2. **$\|\mathbf{x}+\mathbf{y}\| \neq \|\mathbf{x}\| + \|\mathbf{y}\|$**：范数满足三角不等式（$\leq$），等号仅当 $\mathbf{x}, \mathbf{y}$ 同向时成立。不能直接"分配"范数到加法。
 
-3. **对称矩阵 $\mathbf{A}$ 的梯度：系数 2**：$\nabla_\mathbf{x}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称时）；若 $\mathbf{A}$ 不对称则 $= (\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。漏掉系数 2 是高频失误。
+3. **对称矩阵 $\mathbf{A}$ 的梯度：系数 2**：$\nabla_{\mathbf{x}}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称时）；若 $\mathbf{A}$ 不对称则 $= (\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。漏掉系数 2 是高频失误。
 
 4. **Frobenius 范数 $\neq$ 谱范数**：$\|\mathbf{A}\|_F$ 是所有元素平方和开根号；$\|\mathbf{A}\|_2 = \sigma_{\max}$。有 $\|\mathbf{A}\|_2 \leq \|\mathbf{A}\|_F$，但二者不等价，优化中不可互换。
 

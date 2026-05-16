@@ -272,7 +272,7 @@ $$
 一般地，第 $2^k + j$（$0 \leq j < 2^k$）个随机变量为 $\mathbf{1}_{[j/2^k, (j+1)/2^k]}$。
 
 - **依概率**：$P(|X_n - 0| > \varepsilon) = P(X_n = 1) = $ 相应区间长度 $\to 0$，故 $X_n \xrightarrow{P} 0$。
-- **几乎必然**：对任意 $\omega \in [0,1]$，$X_n(\omega)$ 无穷次等于 $1$（每次 $\omega$ 被某个区间覆盖），故数列 $\{X_n(\omega)\}$ 不收敛到 $0$，$X_n \not\xrightarrow{a.s.} 0$。
+- **几乎必然**：对任意 $\omega \in [0,1]$，$X_n(\omega)$ 无穷次等于 $1$（每次 $\omega$ 被某个区间覆盖），故数列 $\{X_n(\omega)\}$ 不收敛到 $0$，$X_n \not\to{a.s.} 0$。
 
 这个例子清晰地展示：**依概率收敛不蕴含几乎必然收敛**。
 
@@ -1155,8 +1155,8 @@ $$
 
 - **a.s. 收敛**：对 $\omega \in (0,1]$，当 $n > 1/\omega$ 时 $X_n(\omega) = 0$，故 $X_n(\omega) \to 0$。在 $\omega = 0$ 处 $X_n(0) = n \to \infty$，但 $P(\omega = 0) = 0$。故 $X_n \xrightarrow{a.s.} 0$。
 - **依概率收敛**：$P(|X_n| > \varepsilon) = P(X_n = n) = 1/n \to 0$（对 $\varepsilon < n$ 时），故 $X_n \xrightarrow{P} 0$。
-- **$L^2$ 收敛**：$\mathbb{E}[X_n^2] = n^2 \cdot \frac{1}{n} = n \to \infty$，故 $X_n \not\xrightarrow{L^2} 0$。
-- **$L^1$ 收敛**：$\mathbb{E}[|X_n|] = n \cdot \frac{1}{n} = 1 \not\to 0$，故 $X_n \not\xrightarrow{L^1} 0$。
+- **$L^2$ 收敛**：$\mathbb{E}[X_n^2] = n^2 \cdot \frac{1}{n} = n \to \infty$，故 $X_n \not\to{L^2} 0$。
+- **$L^1$ 收敛**：$\mathbb{E}[|X_n|] = n \cdot \frac{1}{n} = 1 \not\to 0$，故 $X_n \not\to{L^1} 0$。
 
 结论：**a.s. 和依概率收敛成立；$L^p$（$p \geq 1$）收敛不成立**。这是 a.s. 收敛不蕴含 $L^1$ 收敛的典型例子（不满足一致可积）。
 
@@ -1164,7 +1164,7 @@ $$
 
 - **依分布收敛**：$P(X_n \leq x) \to \frac{1}{\pi} \arcsin(x) + \frac{1}{2}$（$x \in [-1,1]$），即收敛到弧正弦分布。
 - **a.s. 收敛**：由 Weyl 等分定理，对几乎所有 $\omega$，$\{n\omega\}$（小数部分）在 $[0,1]$ 上均匀分布，故 $\sin(2\pi n\omega)$ **不**收敛（在 $[-1,1]$ 内稠密振荡）。
-- **依概率收敛**：若依概率收敛到某极限 $X$，则 $X_n \xrightarrow{d} X$，但 $X_n$ 依分布收敛到弧正弦分布（非常数），故 $X$ 只能是弧正弦分布，而 $X_n \not\xrightarrow{P} X$（路径层面不收敛）。实际上 $X_n \not\xrightarrow{P}$ 任何极限（反证：若收到常数 $c$，则依分布极限为 $c$，矛盾）。
+- **依概率收敛**：若依概率收敛到某极限 $X$，则 $X_n \xrightarrow{d} X$，但 $X_n$ 依分布收敛到弧正弦分布（非常数），故 $X$ 只能是弧正弦分布，而 $X_n \not\to{P} X$（路径层面不收敛）。实际上 $X_n \not\to{P}$ 任何极限（反证：若收到常数 $c$，则依分布极限为 $c$，矛盾）。
 - **$L^2$ 收敛**：$\mathbb{E}[\sin^2(2\pi n\omega)] = 1/2$ 不趋于零，故不 $L^2$ 收敛到 $0$。
 
 结论：**仅依分布收敛成立（到弧正弦分布）；a.s.、依概率、$L^p$ 均不收敛**。

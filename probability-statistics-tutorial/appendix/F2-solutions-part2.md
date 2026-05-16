@@ -1117,11 +1117,11 @@ $$f_{X_2\vert X_1}(x_2\vert x_1) \propto \exp\!\left(-\frac{(x_2-\rho x_1)^2}{2(
 
 **(b) 线性变换 $\mathbf{Y}=\mathbf{A}\mathbf{X}+\mathbf{b}$**：
 
-Jacobian 变换公式：$f_\mathbf{Y}(\mathbf{y})=f_\mathbf{X}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))\cdot|\det\mathbf{A}|^{-1}$。
+Jacobian 变换公式：$f_{\mathbf{Y}}(\mathbf{y})=f_{\mathbf{X}}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))\cdot|\det\mathbf{A}|^{-1}$。
 
 代入正态密度：
 
-$$f_\mathbf{Y}(\mathbf{y}) \propto \exp\!\left(-\frac{1}{2}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))^\top\boldsymbol{\Sigma}^{-1}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))\right)$$
+$$f_{\mathbf{Y}}(\mathbf{y}) \propto \exp\!\left(-\frac{1}{2}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))^\top\boldsymbol{\Sigma}^{-1}(\mathbf{A}^{-1}(\mathbf{y}-\mathbf{b}))\right)$$
 
 $$= \exp\!\left(-\frac{1}{2}(\mathbf{y}-\mathbf{b})^\top(\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)^{-1}(\mathbf{y}-\mathbf{b})\right)$$
 

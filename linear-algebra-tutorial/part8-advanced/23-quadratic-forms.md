@@ -841,7 +841,7 @@ $\lambda_1 = \dfrac{7-\sqrt{17}}{2} \approx 1.44$（最小特征值），$\lambd
 
 Lagrangian：$\mathcal{L} = \mathbf{x}^T A \mathbf{x} - \lambda(\mathbf{x}^T \mathbf{x} - 1)$
 
-KKT 条件：$\nabla_\mathbf{x} \mathcal{L} = 2A\mathbf{x} - 2\lambda \mathbf{x} = 0$，即 $A\mathbf{x} = \lambda \mathbf{x}$
+KKT 条件：$\nabla_{\mathbf{x}} \mathcal{L} = 2A\mathbf{x} - 2\lambda \mathbf{x} = 0$，即 $A\mathbf{x} = \lambda \mathbf{x}$
 
 这正是 $A$ 的特征方程！乘子 $\lambda$ 就是特征值，最优点 $\mathbf{x}^*$ 就是对应特征向量。约束 $\|\mathbf{x}\|=1$ 要求特征向量归一化。
 

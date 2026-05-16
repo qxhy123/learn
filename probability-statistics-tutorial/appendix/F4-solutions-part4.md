@@ -125,7 +125,7 @@ $\dfrac{5}{\sqrt{24}}\approx1.021$，故结果 $\approx 2\Phi(1.02)-1$。
 
 2. **错误**。依概率收敛 $\not\Rightarrow$ a.s. 收敛。反例：$[0,1]$ 上均匀测度的"走马灯"序列——$X_n=\mathbf{1}_{[(k-2^j)/(2^j),(k+1-2^j)/(2^j)]}$（按 $j,k$ 遍历）依概率收敛到 0，但几乎处处不收敛。
 
-3. **错误**。依分布收敛 $\not\Rightarrow$ 依概率收敛（极限为随机变量时）。若极限为常数 $c$ 则等价，但一般不然。反例：$X_n\stackrel{d}{=}X\sim N(0,1)$ 互相独立，则 $X_n\xrightarrow{d}X$ 但 $X_n\not\xrightarrow{P}X$。
+3. **错误**。依分布收敛 $\not\Rightarrow$ 依概率收敛（极限为随机变量时）。若极限为常数 $c$ 则等价，但一般不然。反例：$X_n\stackrel{d}{=}X\sim N(0,1)$ 互相独立，则 $X_n\xrightarrow{d}X$ 但 $X_n\not\to{P}X$。
 
 **答案**：命题 1 $\boxed{\text{正确}}$，命题 2 $\boxed{\text{错误}}$，命题 3 $\boxed{\text{错误}}$。
 

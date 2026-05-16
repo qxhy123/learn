@@ -1887,7 +1887,7 @@ def compare_with_standard_sgdr(epochs=100, device='cpu'):
 
 ### SGDR（Cosine with Restarts）参数
 
-$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\tfrac{\pi (t - T_i)}{T_i})$，每 $T_i$ 步重启；$T_{i+1} = T_\text{mult} \times T_i$（$T_\text{mult} > 1$ 则周期递增）。
+$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max}-\eta_{\min})(1+\cos\tfrac{\pi (t - T_i)}{T_i})$，每 $T_i$ 步重启；$T_{i+1} = T_{\text{mult}} \times T_i$（$T_{\text{mult}} > 1$ 则周期递增）。
 
 ### 调度方法选择决策树
 

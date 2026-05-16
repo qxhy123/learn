@@ -845,11 +845,11 @@ MCMC 样本自相关为 $\rho(k)=\text{Corr}(X_t,X_{t+k})$，则：
 
 $$\text{Var}(\bar{X}_n) = \frac{\sigma^2}{n}\left(1 + 2\sum_{k=1}^{n-1}\left(1-\frac{k}{n}\right)\rho(k)\right) \xrightarrow{n\to\infty} \frac{\sigma^2}{n}\left(1+2\sum_{k=1}^\infty\rho(k)\right)$$
 
-等效 i.i.d. 样本量 $n_\text{eff}$ 满足 $\text{Var}(\bar{X}_n) = \sigma^2/n_\text{eff}$，故：
+等效 i.i.d. 样本量 $n_{\text{eff}}$ 满足 $\text{Var}(\bar{X}_n) = \sigma^2/n_{\text{eff}}$，故：
 
-$$n_\text{eff} = \frac{n}{1+2\sum_{k=1}^\infty\rho(k)}$$
+$$n_{\text{eff}} = \frac{n}{1+2\sum_{k=1}^\infty\rho(k)}$$
 
-若 $\rho(k)=\rho^k$（指数衰减），则 $\sum\rho^k = \rho/(1-\rho)$，$n_\text{eff} = n(1-\rho)/(1+\rho)$。高维随机游走 MH 中 $\rho\to1$，$n_\text{eff}\to0$，效率极低。
+若 $\rho(k)=\rho^k$（指数衰减），则 $\sum\rho^k = \rho/(1-\rho)$，$n_{\text{eff}} = n(1-\rho)/(1+\rho)$。高维随机游走 MH 中 $\rho\to1$，$n_{\text{eff}}\to0$，效率极低。
 
 **(d) HMC 与 NUTS**
 
@@ -869,7 +869,7 @@ $$\mathbf{p}_{t+\epsilon} = \mathbf{p}_{t+\epsilon/2} + \frac{\epsilon}{2}\nabla
 
 **NUTS**：通过"不掉头"条件自适应确定路径长度（停止于 $\mathbf{p}\cdot(\mathbf{q}-\mathbf{q}_0)<0$ 时），避免手动调 $L$，同时满足细致平衡（通过 slice 采样）。
 
-HMC 消除随机游走：每次提议沿 Hamiltonian 轨迹移动，大步长 + 高接受率，$n_\text{eff}/n$ 接近 1，远优于随机游走 MH。
+HMC 消除随机游走：每次提议沿 Hamiltonian 轨迹移动，大步长 + 高接受率，$n_{\text{eff}}/n$ 接近 1，远优于随机游走 MH。
 
 ---
 
@@ -893,10 +893,10 @@ $$\hat{\mu}_{SNIS} = \frac{\sum_{i=1}^n w_i f(X_i)}{\sum_{i=1}^n w_i}$$
 
 归一化权重 $\bar{w}_i = w_i/\sum_j w_j$，类比 i.i.d. 加权平均的等效样本量：
 
-$$\hat{n}_\text{eff} = \frac{(\sum_i w_i)^2}{\sum_i w_i^2} = \frac{1}{\sum_i\bar{w}_i^2}$$
+$$\hat{n}_{\text{eff}} = \frac{(\sum_i w_i)^2}{\sum_i w_i^2} = \frac{1}{\sum_i\bar{w}_i^2}$$
 
-- 当 $q=\pi$：所有 $w_i=1$，$\hat{n}_\text{eff} = n^2/n = n$（最大）。
-- 权重退化：若某 $\bar{w}_j\to1$，其余 $\to0$，则 $\sum\bar{w}_i^2\to1$，$n_\text{eff}\to1$（最差）。
+- 当 $q=\pi$：所有 $w_i=1$，$\hat{n}_{\text{eff}} = n^2/n = n$（最大）。
+- 权重退化：若某 $\bar{w}_j\to1$，其余 $\to0$，则 $\sum\bar{w}_i^2\to1$，$n_{\text{eff}}\to1$（最差）。
 
 **(c) 粒子滤波（SIR）**
 
@@ -1049,7 +1049,7 @@ LLM 生成 token 的转移概率：$P_T(w|w_{<t}) \propto \exp(\text{logit}(w)/T
 - $T\to\infty$：均匀分布，谱隙最大（$\sim 1-1/V$，$V$=词表大小），混合最快，但输出无意义（随机）。
 - $T=1$：标准 softmax，谱隙与模型概率差异相关。
 
-**最优温度权衡**：最大化**有效信息率** $= I(\text{context}; \text{token}) \times n_\text{eff}/n$（互信息乘以混合效率）。实践中 $T\in[0.7, 1.0]$ 在流畅性与多样性间取得平衡。
+**最优温度权衡**：最大化**有效信息率** $= I(\text{context}; \text{token}) \times n_{\text{eff}}/n$（互信息乘以混合效率）。实践中 $T\in[0.7, 1.0]$ 在流畅性与多样性间取得平衡。
 
 > ⚠️ 温度参数仅改变 logit 的尺度，不改变模型的知识，但显著影响输出分布的熵和采样链的混合速度。
 
@@ -1087,13 +1087,13 @@ $$\mu_{f\to v}(x_v) = \sum_{\mathbf{x}_f\setminus x_v} f(\mathbf{x}_f)\prod_{u\i
 
 Bethe 近似用信念 $\{b_f, b_v\}$（满足局部一致性约束）参数化，Bethe 自由能为：
 
-$$F_\text{Bethe} = -\sum_f\sum_{\mathbf{x}_f}b_f(\mathbf{x}_f)\log\frac{f(\mathbf{x}_f)}{b_f(\mathbf{x}_f)} - \sum_v(d_v-1)\sum_{x_v}b_v(x_v)\log b_v(x_v)$$
+$$F_{\text{Bethe}} = -\sum_f\sum_{\mathbf{x}_f}b_f(\mathbf{x}_f)\log\frac{f(\mathbf{x}_f)}{b_f(\mathbf{x}_f)} - \sum_v(d_v-1)\sum_{x_v}b_v(x_v)\log b_v(x_v)$$
 
 其中 $d_v=|\text{ne}(v)|$ 为变量 $v$ 的度数，$(d_v-1)$ 是对边际重叠的修正。
 
-**树图上 $F_\text{Bethe} = F_\text{exact}$**：树图上所有变量度数 $d_v$，对应的"重计数"修正恰好使 Bethe 等于精确值（可通过精确信念代入验证等号）。
+**树图上 $F_{\text{Bethe}} = F_{\text{exact}}$**：树图上所有变量度数 $d_v$，对应的"重计数"修正恰好使 Bethe 等于精确值（可通过精确信念代入验证等号）。
 
-**循环图**：BP 不动点恰好是 $F_\text{Bethe}$ 的驻点（Yedidia 等，2001），但不保证是全局最小，且 $F_\text{Bethe}\neq F_\text{exact}$。
+**循环图**：BP 不动点恰好是 $F_{\text{Bethe}}$ 的驻点（Yedidia 等，2001），但不保证是全局最小，且 $F_{\text{Bethe}}\neq F_{\text{exact}}$。
 
 **(d) 神经 CRF 与均场推断**
 
@@ -1278,7 +1278,7 @@ $T$ 步后贝叶斯遗憾：$BR_T = E\!\left[\sum_{t=1}^T(f(\mathbf{x}^*)-f(\mat
 
 $$BR_T \leq O(\sqrt{T\gamma_T\log T})$$
 
-其中最大信息增益 $\gamma_T = \max_{|\mathcal{A}|=T} I(f_\mathcal{A};\mathbf{y}_\mathcal{A})$（前 $T$ 个点的信息增益上界）。
+其中最大信息增益 $\gamma_T = \max_{|\mathcal{A}|=T} I(f_{\mathcal{A}};\mathbf{y}_{\mathcal{A}})$（前 $T$ 个点的信息增益上界）。
 
 对常见核：SE 核 $\gamma_T = O((\log T)^{d+1})$；Matérn 核 $\gamma_T = O(T^{d/(2\nu+d)})$（$\nu$ 为平滑参数）。
 
@@ -1372,4 +1372,4 @@ $$\mathbb{P}^{2k+1} = \text{proj}_{\mathcal{P}(\cdot,\nu)}\mathbb{P}^{2k}, \quad
 
 **I2SB（Image-to-Image Schrödinger Bridge，Liu 等 2023）**：用 SB 实现两个图像域间的转换（超分辨率、去雨、修复），无需先退化到高斯噪声，直接在图像对之间插值，训练效率更高。
 
-**Score Matching 联系**：DDPM 的去噪 score $s_\theta(x_t,t)\approx\nabla_{x_t}\log q(x_t)$ 对应 SB 的后向 SDE 漂移项（Nelson 公式），两者在 $\mu=p_\text{data}$，$\nu=\mathcal{N}(0,\mathbf{I})$ 时完全一致，SB 是 DDPM 的推广（允许 $\nu$ 非高斯，允许非对称端点）。
+**Score Matching 联系**：DDPM 的去噪 score $s_\theta(x_t,t)\approx\nabla_{x_t}\log q(x_t)$ 对应 SB 的后向 SDE 漂移项（Nelson 公式），两者在 $\mu=p_{\text{data}}$，$\nu=\mathcal{N}(0,\mathbf{I})$ 时完全一致，SB 是 DDPM 的推广（允许 $\nu$ 非高斯，允许非对称端点）。

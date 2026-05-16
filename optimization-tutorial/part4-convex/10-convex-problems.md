@@ -1082,7 +1082,7 @@ $$\min_{W}\;f(W)\quad\text{s.t.}\quad\begin{pmatrix}I_n & W^T \\ W & I_m\end{pma
 
 ## 自测题
 
-**自测 1**　将问题 $\min_\mathbf{x}\,\lVert\mathbf{x}\rVert_\infty$ s.t. $A\mathbf{x}=\mathbf{b}$ 改写为 LP 标准形，给出变量数与约束数（$A\in\mathbb{R}^{m\times n}$）。
+**自测 1**　将问题 $\min_{\mathbf{x}}\,\lVert\mathbf{x}\rVert_\infty$ s.t. $A\mathbf{x}=\mathbf{b}$ 改写为 LP 标准形，给出变量数与约束数（$A\in\mathbb{R}^{m\times n}$）。
 
 > 💡 提示：引入标量 $t$，$\lVert\mathbf{x}\rVert_\infty\leq t \Leftrightarrow -t\mathbf{1}\preceq\mathbf{x}\preceq t\mathbf{1}$；变量 $(\mathbf{x},t)\in\mathbb{R}^{n+1}$，约束 $2n$ 个不等式 + $m$ 个等式。
 

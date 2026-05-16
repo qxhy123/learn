@@ -11,7 +11,7 @@
 > **一例速记**：
 > **梯度**：$\nabla f(\mathbf{x}) = (\partial f/\partial x_1, \ldots, \partial f/\partial x_n)^\top \in \mathbb{R}^n$，方向 = 最速上升，垂直等高线。
 > **Hessian**：$H_f = \nabla^2 f \in \mathbb{R}^{n\times n}$，对称矩阵，描述曲率；$H \succ 0 \Rightarrow$ 极小值，$H$ 不定 $\Rightarrow$ 鞍点。
-> **链式法则**：$\nabla_\mathbf{x}(L\circ\mathbf{f}) = J_\mathbf{f}^\top \nabla_\mathbf{z} L$；反向传播 = 逐层乘 Jacobian 转置。
+> **链式法则**：$\nabla_{\mathbf{x}}(L\circ\mathbf{f}) = J_{\mathbf{f}}^\top \nabla_{\mathbf{z}} L$；反向传播 = 逐层乘 Jacobian 转置。
 > **Taylor 展开**：$f(\mathbf{x}_0+\Delta\mathbf{x}) \approx f(\mathbf{x}_0) + \nabla f^\top\Delta\mathbf{x} + \frac{1}{2}\Delta\mathbf{x}^\top H\Delta\mathbf{x}$；一阶 $\Rightarrow$ 梯度下降；二阶 $\Rightarrow$ 牛顿法。
 > **AI 关联**：反向传播 = 多层链式法则；Adam 用梯度一阶矩 + 二阶矩估计自适应步长；条件数 $\kappa(H) \gg 1 \Rightarrow$ 收敛慢。
 
@@ -248,7 +248,7 @@ $$\mathbf{f}(\mathbf{x}) = \begin{pmatrix} f_1(x_1, \ldots, x_n) \\ f_2(x_1, \ld
 
 其 **Jacobian 矩阵**（雅可比矩阵）是 $m \times n$ 矩阵：
 
-$$J_\mathbf{f}(\mathbf{x}) = \frac{\partial \mathbf{f}}{\partial \mathbf{x}} = \begin{pmatrix}
+$$J_{\mathbf{f}}(\mathbf{x}) = \frac{\partial \mathbf{f}}{\partial \mathbf{x}} = \begin{pmatrix}
 \frac{\partial f_1}{\partial x_1} & \frac{\partial f_1}{\partial x_2} & \cdots & \frac{\partial f_1}{\partial x_n} \\
 \frac{\partial f_2}{\partial x_1} & \frac{\partial f_2}{\partial x_2} & \cdots & \frac{\partial f_2}{\partial x_n} \\
 \vdots & \vdots & \ddots & \vdots \\
@@ -261,24 +261,24 @@ $$J_\mathbf{f}(\mathbf{x}) = \frac{\partial \mathbf{f}}{\partial \mathbf{x}} = \
 
 Jacobian 矩阵是函数 $\mathbf{f}$ 在 $\mathbf{x}$ 处的**最佳线性近似（微分）**：
 
-$$\mathbf{f}(\mathbf{x} + \Delta\mathbf{x}) \approx \mathbf{f}(\mathbf{x}) + J_\mathbf{f}(\mathbf{x}) \Delta\mathbf{x}$$
+$$\mathbf{f}(\mathbf{x} + \Delta\mathbf{x}) \approx \mathbf{f}(\mathbf{x}) + J_{\mathbf{f}}(\mathbf{x}) \Delta\mathbf{x}$$
 
-$|{\det(J_\mathbf{f})}|$ 表示函数在 $\mathbf{x}$ 附近的**局部体积缩放比**。
+$|{\det(J_{\mathbf{f}})}|$ 表示函数在 $\mathbf{x}$ 附近的**局部体积缩放比**。
 
 ### 2.4.3 链式法则的矩阵形式
 
 设 $\mathbf{h} = \mathbf{g} \circ \mathbf{f}$，即 $\mathbf{h}(\mathbf{x}) = \mathbf{g}(\mathbf{f}(\mathbf{x}))$，其中：
 
-- $\mathbf{f}: \mathbb{R}^n \to \mathbb{R}^k$，Jacobian 为 $J_\mathbf{f} \in \mathbb{R}^{k \times n}$
-- $\mathbf{g}: \mathbb{R}^k \to \mathbb{R}^m$，Jacobian 为 $J_\mathbf{g} \in \mathbb{R}^{m \times k}$
+- $\mathbf{f}: \mathbb{R}^n \to \mathbb{R}^k$，Jacobian 为 $J_{\mathbf{f}} \in \mathbb{R}^{k \times n}$
+- $\mathbf{g}: \mathbb{R}^k \to \mathbb{R}^m$，Jacobian 为 $J_{\mathbf{g}} \in \mathbb{R}^{m \times k}$
 
 则复合函数的 Jacobian 为矩阵乘积：
 
-$$J_\mathbf{h}(\mathbf{x}) = J_\mathbf{g}(\mathbf{f}(\mathbf{x})) \cdot J_\mathbf{f}(\mathbf{x}) \in \mathbb{R}^{m \times n}$$
+$$J_{\mathbf{h}}(\mathbf{x}) = J_{\mathbf{g}}(\mathbf{f}(\mathbf{x})) \cdot J_{\mathbf{f}}(\mathbf{x}) \in \mathbb{R}^{m \times n}$$
 
 对于标量损失函数 $L: \mathbb{R}^n \to \mathbb{R}$ 通过中间层 $\mathbf{z} = \mathbf{f}(\mathbf{x})$，梯度链式法则为：
 
-$$\frac{\partial L}{\partial \mathbf{x}} = J_\mathbf{f}(\mathbf{x})^\top \frac{\partial L}{\partial \mathbf{z}}$$
+$$\frac{\partial L}{\partial \mathbf{x}} = J_{\mathbf{f}}(\mathbf{x})^\top \frac{\partial L}{\partial \mathbf{z}}$$
 
 这正是**反向传播算法**的核心数学结构。
 
@@ -286,7 +286,7 @@ $$\frac{\partial L}{\partial \mathbf{x}} = J_\mathbf{f}(\mathbf{x})^\top \frac{\
 
 对于全连接层 $\mathbf{z} = W\mathbf{x} + \mathbf{b}$：
 
-$$J_\mathbf{z} = \frac{\partial \mathbf{z}}{\partial \mathbf{x}} = W \in \mathbb{R}^{m \times n}$$
+$$J_{\mathbf{z}} = \frac{\partial \mathbf{z}}{\partial \mathbf{x}} = W \in \mathbb{R}^{m \times n}$$
 
 $$\frac{\partial \mathbf{z}}{\partial W} = \mathbf{x}^\top \otimes I_m \quad \text{（Kronecker 积形式）}$$
 
@@ -357,9 +357,9 @@ $$\mathbf{x}_{k+1} = \mathbf{x}_k - H_f(\mathbf{x}_k)^{-1} \nabla f(\mathbf{x}_k
 |:---:|:---:|:---:|:---:|
 | 偏导数 $\frac{\partial f}{\partial x_j}$ | 固定其余变量，对 $x_j$ 求导 | 标量 | 函数对单一变量的敏感度 |
 | 梯度 $\nabla f(\mathbf{x})$ | $\left(\frac{\partial f}{\partial x_1}, \ldots, \frac{\partial f}{\partial x_n}\right)^\top$ | $\mathbb{R}^n$ 向量 | 函数增加最快的方向 |
-| 方向导数 $D_\mathbf{u}f$ | $\nabla f^\top \mathbf{u}$ | 标量 | 沿任意方向的变化率 |
+| 方向导数 $D_{\mathbf{u}}f$ | $\nabla f^\top \mathbf{u}$ | 标量 | 沿任意方向的变化率 |
 | Hessian $H_f$ | 二阶偏导数构成的对称矩阵 | $\mathbb{R}^{n\times n}$ 矩阵 | 曲率信息，判断驻点类型 |
-| Jacobian $J_\mathbf{f}$ | $\frac{\partial \mathbf{f}}{\partial \mathbf{x}}$，一阶偏导数矩阵 | $\mathbb{R}^{m\times n}$ 矩阵 | 向量函数的线性近似，链式法则 |
+| Jacobian $J_{\mathbf{f}}$ | $\frac{\partial \mathbf{f}}{\partial \mathbf{x}}$，一阶偏导数矩阵 | $\mathbb{R}^{m\times n}$ 矩阵 | 向量函数的线性近似，链式法则 |
 | Taylor 展开（一阶） | $f(\mathbf{x}_0) + \nabla f^\top \Delta\mathbf{x}$ | — | 梯度下降的理论基础 |
 | Taylor 展开（二阶） | 一阶 $+ \frac{1}{2}\Delta\mathbf{x}^\top H \Delta\mathbf{x}$ | — | 牛顿法的理论基础 |
 
@@ -589,7 +589,7 @@ PyTorch 的 `torch.autograd` 使用**反向模式自动微分**，在前向传�
 |---|---|---|
 | **偏导数** | $\partial f/\partial x_j$：固定其余变量 | 算术上按单变量规则求导 |
 | **梯度** | $\nabla f = (\partial f/\partial x_1,\ldots,\partial f/\partial x_n)^\top$ | 列向量；指向最速上升方向 |
-| **方向导数** | $D_\mathbf{u}f = \nabla f^\top\mathbf{u}$（$\|\mathbf{u}\|=1$）| 最大值 $=\|\nabla f\|$，方向 $=\nabla f/\|\nabla f\|$ |
+| **方向导数** | $D_{\mathbf{u}}f = \nabla f^\top\mathbf{u}$（$\|\mathbf{u}\|=1$）| 最大值 $=\|\nabla f\|$，方向 $=\nabla f/\|\nabla f\|$ |
 | **Hessian** | $H_{ij} = \partial^2 f/\partial x_i\partial x_j$ | 对称矩阵（Schwarz 定理）；描述曲率 |
 | **Jacobian** | $J_{ij} = \partial f_i/\partial x_j$，$J \in \mathbb{R}^{m\times n}$ | 向量函数的最佳线性近似 |
 | **链式法则** | $J_h = J_g \cdot J_f$（$h = g\circ f$）| 矩阵相乘；反向传播的核心 |
@@ -612,7 +612,7 @@ $\nabla(\mathbf{a}^\top\mathbf{x}) = \mathbf{a}$；$\nabla(\mathbf{x}^\top\mathb
 
 ### 变形 2：链式法则的标量形式
 
-对标量损失 $L = g(f(\mathbf{x}))$：$\nabla_\mathbf{x} L = g'(f(\mathbf{x}))\cdot\nabla_\mathbf{x} f(\mathbf{x})$（逐元素乘标量）。多层时依次右乘 Jacobian。
+对标量损失 $L = g(f(\mathbf{x}))$：$\nabla_{\mathbf{x}} L = g'(f(\mathbf{x}))\cdot\nabla_{\mathbf{x}} f(\mathbf{x})$（逐元素乘标量）。多层时依次右乘 Jacobian。
 
 ### 变形 3：梯度下降 vs Newton 法
 
@@ -644,7 +644,7 @@ $\kappa(H) = \lambda_{\max}/\lambda_{\min}$ 衡量等值线"扁平度"。$\kappa
 
 1. **$\nabla f$ 是列向量，不是行向量**：梯度 $\nabla f \in \mathbb{R}^n$ 是列向量；Jacobian $J \in \mathbb{R}^{m\times n}$ 的每**行**是输出分量的梯度（行向量形式）。写成行向量会导致链式法则维度错误。
 
-2. **二次型梯度系数 2**：$\nabla_\mathbf{x}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称）。类比 $(x^2)' = 2x$，但高维时不要忘记系数 2。若 $\mathbf{A}$ 不对称，结果是 $(\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。
+2. **二次型梯度系数 2**：$\nabla_{\mathbf{x}}(\mathbf{x}^\top\mathbf{A}\mathbf{x}) = 2\mathbf{A}\mathbf{x}$（$\mathbf{A}$ 对称）。类比 $(x^2)' = 2x$，但高维时不要忘记系数 2。若 $\mathbf{A}$ 不对称，结果是 $(\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$。
 
 3. **Hessian 正定 $\neq$ 全局最小**：正定 Hessian 在驻点处 $\Rightarrow$ **局部极小**；全局最小还需要函数是凸的（全局 Hessian 半正定）。非凸函数有多个局部极小。
 
@@ -681,10 +681,10 @@ $H_f = \begin{pmatrix}12x_1^2 & -4 \\ -4 & 12x_2^2\end{pmatrix}$
 
 > **题目**：设 $L = \|\mathbf{y} - W\mathbf{x}\|^2$（$W \in \mathbb{R}^{m\times n}$，$\mathbf{x}\in\mathbb{R}^n$，$\mathbf{y}\in\mathbb{R}^m$）。用链式法则求 $\partial L/\partial\mathbf{x}$ 和 $\partial L/\partial W$。
 
-【思路】令 $\mathbf{r} = \mathbf{y} - W\mathbf{x}$，$L = \mathbf{r}^\top\mathbf{r}$，链式法则：$\partial L/\partial\mathbf{x} = J_\mathbf{r}^\top \cdot (\partial L/\partial\mathbf{r})$。
+【思路】令 $\mathbf{r} = \mathbf{y} - W\mathbf{x}$，$L = \mathbf{r}^\top\mathbf{r}$，链式法则：$\partial L/\partial\mathbf{x} = J_{\mathbf{r}}^\top \cdot (\partial L/\partial\mathbf{r})$。
 
 【解】
-$\partial L/\partial\mathbf{r} = 2\mathbf{r} = 2(\mathbf{y}-W\mathbf{x})$；$J_\mathbf{r}^{\mathbf{x}} = -W$（$\mathbf{r}$ 对 $\mathbf{x}$ 的 Jacobian）。
+$\partial L/\partial\mathbf{r} = 2\mathbf{r} = 2(\mathbf{y}-W\mathbf{x})$；$J_{\mathbf{r}}^{\mathbf{x}} = -W$（$\mathbf{r}$ 对 $\mathbf{x}$ 的 Jacobian）。
 
 $\partial L/\partial\mathbf{x} = (-W)^\top \cdot 2(\mathbf{y}-W\mathbf{x}) = -2W^\top(\mathbf{y}-W\mathbf{x})$。
 
@@ -861,7 +861,7 @@ $$\nabla f(1,0,1) = \left(\frac{1}{2}, 2, \frac{1}{2}\right)^\top$$
 
 **(c)** 方向导数：
 
-$$D_\mathbf{u}f(1,0,1) = \nabla f(1,0,1)^\top \mathbf{u} = \left(\frac{1}{2}, 2, \frac{1}{2}\right) \cdot \frac{1}{\sqrt{3}}\begin{pmatrix}1\\1\\1\end{pmatrix} = \frac{1}{\sqrt{3}}\left(\frac{1}{2} + 2 + \frac{1}{2}\right) = \frac{3}{\sqrt{3}} = \sqrt{3}$$
+$$D_{\mathbf{u}}f(1,0,1) = \nabla f(1,0,1)^\top \mathbf{u} = \left(\frac{1}{2}, 2, \frac{1}{2}\right) \cdot \frac{1}{\sqrt{3}}\begin{pmatrix}1\\1\\1\end{pmatrix} = \frac{1}{\sqrt{3}}\left(\frac{1}{2} + 2 + \frac{1}{2}\right) = \frac{3}{\sqrt{3}} = \sqrt{3}$$
 
 ---
 

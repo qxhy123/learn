@@ -109,7 +109,7 @@ $$\boxed{m_k(\mathbf{p}) = f_k + \mathbf{g}_k^\top \mathbf{p} + \frac{1}{2}\math
 - $\mathbf{H}_k$ 是 Hessian 矩阵 $\nabla^2 f(\mathbf{x}_k)$ 或其正定近似（如 BFGS 矩阵）
 - $\mathbf{p} = \mathbf{x} - \mathbf{x}_k$ 是从当前点出发的步向量
 
-注意，模型满足 $m_k(\mathbf{0}) = f_k$ 且 $\nabla_\mathbf{p} m_k(\mathbf{0}) = \mathbf{g}_k$，即在原点处与真实函数的零阶和一阶信息精确吻合。
+注意，模型满足 $m_k(\mathbf{0}) = f_k$ 且 $\nabla_{\mathbf{p}} m_k(\mathbf{0}) = \mathbf{g}_k$，即在原点处与真实函数的零阶和一阶信息精确吻合。
 
 ### 14.1.4 与线搜索方法的对比
 
@@ -966,7 +966,7 @@ $$\text{自然梯度步} = \arg\min_{\Delta\theta} \nabla L^\top\Delta\theta \qu
 
 ### 变形 1：范数的选择
 
-标准信赖域用 $\ell_2$ 范数（球约束）；Levenberg-Marquardt 等价于椭球约束（加权范数 $\|\mathbf{p}\|_\mathbf{D}$）；TRPO / PPO 用 KL 散度代替 $\ell_2$ 范数，适应策略空间的非欧几何。不同范数导致不同形状的"信赖域"，但核心 $\rho_k$ 判断机制完全相同。
+标准信赖域用 $\ell_2$ 范数（球约束）；Levenberg-Marquardt 等价于椭球约束（加权范数 $\|\mathbf{p}\|_{\mathbf{D}}$）；TRPO / PPO 用 KL 散度代替 $\ell_2$ 范数，适应策略空间的非欧几何。不同范数导致不同形状的"信赖域"，但核心 $\rho_k$ 判断机制完全相同。
 
 ### 变形 2：Hessian 的替换
 

@@ -26,9 +26,9 @@
 
 $$\mathcal{B} = \{b_1, b_2, \ldots, b_n\}, \quad \mathcal{C} = \{c_1, c_2, \ldots, c_n\}$$
 
-向量 $x \in V$ 在两组基下的坐标分别记为 $[x]_\mathcal{B}$ 和 $[x]_\mathcal{C}$。
+向量 $x \in V$ 在两组基下的坐标分别记为 $[x]_{\mathcal{B}}$ 和 $[x]_{\mathcal{C}}$。
 
-**问题：** 已知 $[x]_\mathcal{B}$，如何求 $[x]_\mathcal{C}$？
+**问题：** 已知 $[x]_{\mathcal{B}}$，如何求 $[x]_{\mathcal{C}}$？
 
 ### 15.1.2 几何直觉
 
@@ -40,7 +40,7 @@ $$\mathcal{B} = \{b_1, b_2, \ldots, b_n\}, \quad \mathcal{C} = \{c_1, c_2, \ldot
 
 在 $\mathbb{R}^n$ 中，设标准基为 $\mathcal{E} = \{e_1, \ldots, e_n\}$。
 
-任意向量 $x$ 在标准基下的坐标就是其分量本身：$[x]_\mathcal{E} = x$。
+任意向量 $x$ 在标准基下的坐标就是其分量本身：$[x]_{\mathcal{E}} = x$。
 
 设基 $\mathcal{B} = \{b_1, \ldots, b_n\}$，构造**基矩阵**（将基向量排列为列）：
 
@@ -48,11 +48,11 @@ $$B = [b_1 \mid b_2 \mid \cdots \mid b_n]$$
 
 则 $x$ 在基 $\mathcal{B}$ 下的坐标满足：
 
-$$x = B \cdot [x]_\mathcal{B} \quad \Longleftrightarrow \quad [x]_\mathcal{B} = B^{-1} x$$
+$$x = B \cdot [x]_{\mathcal{B}} \quad \Longleftrightarrow \quad [x]_{\mathcal{B}} = B^{-1} x$$
 
 类似地，若基 $\mathcal{C}$ 的基矩阵为 $C = [c_1 \mid \cdots \mid c_n]$，则：
 
-$$[x]_\mathcal{C} = C^{-1} x = C^{-1} B \cdot [x]_\mathcal{B}$$
+$$[x]_{\mathcal{C}} = C^{-1} x = C^{-1} B \cdot [x]_{\mathcal{B}}$$
 
 这就是**坐标变换公式**。
 
@@ -68,7 +68,7 @@ $$P_{\mathcal{C} \leftarrow \mathcal{B}} = C^{-1} B$$
 
 其中 $B, C$ 分别是 $\mathcal{B}, \mathcal{C}$ 的基矩阵。坐标变换公式为：
 
-$$[x]_\mathcal{C} = P_{\mathcal{C} \leftarrow \mathcal{B}} \cdot [x]_\mathcal{B}$$
+$$[x]_{\mathcal{C}} = P_{\mathcal{C} \leftarrow \mathcal{B}} \cdot [x]_{\mathcal{B}}$$
 
 **逆变换：** 从 $\mathcal{C}$ 回到 $\mathcal{B}$ 的过渡矩阵是其逆：
 
@@ -78,7 +78,7 @@ $$P_{\mathcal{B} \leftarrow \mathcal{C}} = \left(P_{\mathcal{C} \leftarrow \math
 
 $P_{\mathcal{C} \leftarrow \mathcal{B}}$ 的第 $j$ 列正是 $\mathcal{B}$ 的第 $j$ 个基向量 $b_j$ 在基 $\mathcal{C}$ 下的坐标：
 
-$$P_{\mathcal{C} \leftarrow \mathcal{B}} = \bigl[[b_1]_\mathcal{C} \mid [b_2]_\mathcal{C} \mid \cdots \mid [b_n]_\mathcal{C}\bigr]$$
+$$P_{\mathcal{C} \leftarrow \mathcal{B}} = \bigl[[b_1]_{\mathcal{C}} \mid [b_2]_{\mathcal{C}} \mid \cdots \mid [b_n]_{\mathcal{C}}\bigr]$$
 
 这给出了**构造过渡矩阵的实际方法**：将每个旧基向量用新基表示，所得坐标向量排列为列。
 
@@ -94,7 +94,7 @@ $$[C \mid B] \xrightarrow{\text{行化简}} [I \mid C^{-1}B] = [I \mid P]$$
 
 $$\mathcal{B} = \left\{b_1 = \begin{pmatrix}1\\1\end{pmatrix},\ b_2 = \begin{pmatrix}1\\-1\end{pmatrix}\right\}, \quad \mathcal{C} = \left\{c_1 = \begin{pmatrix}2\\0\end{pmatrix},\ c_2 = \begin{pmatrix}0\\3\end{pmatrix}\right\}$$
 
-求从 $\mathcal{B}$ 到 $\mathcal{C}$ 的过渡矩阵，并将 $[x]_\mathcal{B} = \begin{pmatrix}2\\1\end{pmatrix}$ 转换到 $\mathcal{C}$ 下的坐标。
+求从 $\mathcal{B}$ 到 $\mathcal{C}$ 的过渡矩阵，并将 $[x]_{\mathcal{B}} = \begin{pmatrix}2\\1\end{pmatrix}$ 转换到 $\mathcal{C}$ 下的坐标。
 
 **解：** 构造增广矩阵 $[C \mid B]$ 并行化简：
 
@@ -106,13 +106,13 @@ $$P_{\mathcal{C} \leftarrow \mathcal{B}} = \begin{pmatrix}\frac{1}{2} & \frac{1}
 
 坐标转换：
 
-$$[x]_\mathcal{C} = P \cdot [x]_\mathcal{B} = \begin{pmatrix}\frac{1}{2} & \frac{1}{2}\\[4pt]\frac{1}{3} & -\frac{1}{3}\end{pmatrix}\begin{pmatrix}2\\1\end{pmatrix} = \begin{pmatrix}\frac{3}{2}\\[4pt]\frac{1}{3}\end{pmatrix}$$
+$$[x]_{\mathcal{C}} = P \cdot [x]_{\mathcal{B}} = \begin{pmatrix}\frac{1}{2} & \frac{1}{2}\\[4pt]\frac{1}{3} & -\frac{1}{3}\end{pmatrix}\begin{pmatrix}2\\1\end{pmatrix} = \begin{pmatrix}\frac{3}{2}\\[4pt]\frac{1}{3}\end{pmatrix}$$
 
 **验证：** $x = 2b_1 + b_2 = \begin{pmatrix}3\\1\end{pmatrix}$，而 $\frac{3}{2}c_1 + \frac{1}{3}c_2 = \begin{pmatrix}3\\0\end{pmatrix} + \begin{pmatrix}0\\1\end{pmatrix} = \begin{pmatrix}3\\1\end{pmatrix}$ ✓
 
 ### 15.2.4 线性变换在不同基下的矩阵
 
-设线性变换 $T: V \to V$，在基 $\mathcal{B}$ 下的矩阵为 $A$（即 $[Tv]_\mathcal{B} = A[v]_\mathcal{B}$），在基 $\mathcal{C}$ 下的矩阵为 $A'$。
+设线性变换 $T: V \to V$，在基 $\mathcal{B}$ 下的矩阵为 $A$（即 $[Tv]_{\mathcal{B}} = A[v]_{\mathcal{B}}$），在基 $\mathcal{C}$ 下的矩阵为 $A'$。
 
 从 $\mathcal{B}$ 到 $\mathcal{C}$ 的过渡矩阵为 $P = P_{\mathcal{C} \leftarrow \mathcal{B}}$，则：
 
@@ -297,7 +297,7 @@ $$P = \begin{pmatrix}1&1\\1&-2\end{pmatrix}, \quad \Lambda = \begin{pmatrix}5&0\
 
 ## 本章小结
 
-- **坐标变换：** 已知 $[x]_\mathcal{B}$，用过渡矩阵 $P = C^{-1}B$ 计算 $[x]_\mathcal{C} = P[x]_\mathcal{B}$
+- **坐标变换：** 已知 $[x]_{\mathcal{B}}$，用过渡矩阵 $P = C^{-1}B$ 计算 $[x]_{\mathcal{C}} = P[x]_{\mathcal{B}}$
 
 - **过渡矩阵的构造：** 对增广矩阵 $[C \mid B]$ 行化简，左侧变为 $I$，右侧得 $P$；或直接将每个旧基向量用新基表示，得到 $P$ 的列
 
@@ -309,7 +309,7 @@ $$P = \begin{pmatrix}1&1\\1&-2\end{pmatrix}, \quad \Lambda = \begin{pmatrix}5&0\
 
 - **核心公式速查：**
 
-$$[x]_\mathcal{C} = P^{-1}_\mathcal{C} P_\mathcal{B} \cdot [x]_\mathcal{B}, \quad A_\mathcal{C} = P^{-1} A_\mathcal{B} P, \quad A = P\Lambda P^{-1}$$
+$$[x]_{\mathcal{C}} = P^{-1}_{\mathcal{C}} P_{\mathcal{B}} \cdot [x]_{\mathcal{B}}, \quad A_{\mathcal{C}} = P^{-1} A_{\mathcal{B}} P, \quad A = P\Lambda P^{-1}$$
 
 ---
 
@@ -488,7 +488,7 @@ $$\mathcal{B} = \left\{b_1 = \begin{pmatrix}3\\1\end{pmatrix}, b_2 = \begin{pmat
 
 (a) 求从 $\mathcal{B}$ 到标准基 $\mathcal{E}$ 的过渡矩阵 $P_{\mathcal{E} \leftarrow \mathcal{B}}$。
 
-(b) 向量 $x$ 在基 $\mathcal{B}$ 下的坐标为 $[x]_\mathcal{B} = \begin{pmatrix}2\\-1\end{pmatrix}$，求 $[x]_\mathcal{E}$（即 $x$ 的标准坐标）。
+(b) 向量 $x$ 在基 $\mathcal{B}$ 下的坐标为 $[x]_{\mathcal{B}} = \begin{pmatrix}2\\-1\end{pmatrix}$，求 $[x]_{\mathcal{E}}$（即 $x$ 的标准坐标）。
 
 **练习 2（坐标变换）**
 
@@ -496,7 +496,7 @@ $$\mathcal{B} = \left\{b_1 = \begin{pmatrix}3\\1\end{pmatrix}, b_2 = \begin{pmat
 
 $$\mathcal{B} = \left\{\begin{pmatrix}1\\0\\0\end{pmatrix}, \begin{pmatrix}0\\1\\0\end{pmatrix}, \begin{pmatrix}0\\0\\1\end{pmatrix}\right\} = \mathcal{E}, \quad \mathcal{C} = \left\{\begin{pmatrix}1\\1\\0\end{pmatrix}, \begin{pmatrix}0\\1\\1\end{pmatrix}, \begin{pmatrix}1\\0\\1\end{pmatrix}\right\}$$
 
-向量 $x = \begin{pmatrix}3\\2\\1\end{pmatrix}$ 在标准基下的坐标已知，求 $[x]_\mathcal{C}$（$x$ 在基 $\mathcal{C}$ 下的坐标）。
+向量 $x = \begin{pmatrix}3\\2\\1\end{pmatrix}$ 在标准基下的坐标已知，求 $[x]_{\mathcal{C}}$（$x$ 在基 $\mathcal{C}$ 下的坐标）。
 
 **练习 3（相似不变量验证）**
 
@@ -539,11 +539,11 @@ $$\mathcal{B} = \left\{\begin{pmatrix}1\\0\\0\end{pmatrix}, \begin{pmatrix}0\\1\
 
 $$P_{\mathcal{E} \leftarrow \mathcal{B}} = E^{-1} B = I^{-1} \begin{pmatrix}3&1\\1&2\end{pmatrix} = \begin{pmatrix}3&1\\1&2\end{pmatrix} = B$$
 
-即从 $\mathcal{B}$ 到标准基的过渡矩阵恰好就是 $\mathcal{B}$ 的基矩阵本身。这符合直觉：$[x]_\mathcal{E} = x = B \cdot [x]_\mathcal{B}$。
+即从 $\mathcal{B}$ 到标准基的过渡矩阵恰好就是 $\mathcal{B}$ 的基矩阵本身。这符合直觉：$[x]_{\mathcal{E}} = x = B \cdot [x]_{\mathcal{B}}$。
 
 **(b)** 代入计算：
 
-$$[x]_\mathcal{E} = P_{\mathcal{E} \leftarrow \mathcal{B}} \cdot [x]_\mathcal{B} = \begin{pmatrix}3&1\\1&2\end{pmatrix}\begin{pmatrix}2\\-1\end{pmatrix} = \begin{pmatrix}6-1\\2-2\end{pmatrix} = \begin{pmatrix}5\\0\end{pmatrix}$$
+$$[x]_{\mathcal{E}} = P_{\mathcal{E} \leftarrow \mathcal{B}} \cdot [x]_{\mathcal{B}} = \begin{pmatrix}3&1\\1&2\end{pmatrix}\begin{pmatrix}2\\-1\end{pmatrix} = \begin{pmatrix}6-1\\2-2\end{pmatrix} = \begin{pmatrix}5\\0\end{pmatrix}$$
 
 验证：$x = 2b_1 + (-1)b_2 = 2\begin{pmatrix}3\\1\end{pmatrix} - \begin{pmatrix}1\\2\end{pmatrix} = \begin{pmatrix}5\\0\end{pmatrix}$ ✓
 
@@ -552,7 +552,7 @@ $$[x]_\mathcal{E} = P_{\mathcal{E} \leftarrow \mathcal{B}} \cdot [x]_\mathcal{B}
 <details>
 <summary><strong>练习 2 答案</strong></summary>
 
-求 $[x]_\mathcal{C}$ 需要求解线性方程组 $C \cdot [x]_\mathcal{C} = x$：
+求 $[x]_{\mathcal{C}}$ 需要求解线性方程组 $C \cdot [x]_{\mathcal{C}} = x$：
 
 $$C = \begin{pmatrix}1&0&1\\1&1&0\\0&1&1\end{pmatrix}, \quad x = \begin{pmatrix}3\\2\\1\end{pmatrix}$$
 
@@ -562,7 +562,7 @@ $$\left[\begin{array}{ccc|c}1&0&1&3\\1&1&0&2\\0&1&1&1\end{array}\right] \xrighta
 
 $$\xrightarrow{R_3/2} \left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&0&1&1\end{array}\right] \xrightarrow{R_1-R_3,\; R_2+R_3} \left[\begin{array}{ccc|c}1&0&0&2\\0&1&0&0\\0&0&1&1\end{array}\right]$$
 
-故 $[x]_\mathcal{C} = \begin{pmatrix}2\\0\\1\end{pmatrix}$。
+故 $[x]_{\mathcal{C}} = \begin{pmatrix}2\\0\\1\end{pmatrix}$。
 
 验证：$2\begin{pmatrix}1\\1\\0\end{pmatrix} + 0\begin{pmatrix}0\\1\\1\end{pmatrix} + 1\begin{pmatrix}1\\0\\1\end{pmatrix} = \begin{pmatrix}3\\2\\1\end{pmatrix}$ ✓
 
@@ -673,7 +673,7 @@ $B = D = 0$，显然 $B \sim D$。
 
 ## 一例速记
 
-> **过渡矩阵**：$P_{\mathcal{C}\leftarrow\mathcal{B}}=C^{-1}B$（第 $j$ 列是 $b_j$ 在基 $\mathcal{C}$ 下的坐标）。坐标变换：$[x]_\mathcal{C}=P\cdot[x]_\mathcal{B}$。
+> **过渡矩阵**：$P_{\mathcal{C}\leftarrow\mathcal{B}}=C^{-1}B$（第 $j$ 列是 $b_j$ 在基 $\mathcal{C}$ 下的坐标）。坐标变换：$[x]_{\mathcal{C}}=P\cdot[x]_{\mathcal{B}}$。
 > **构造方法**：对增广矩阵 $[C\vert B]$ 做行化简 $\to[I\vert P]$，右侧得 $P=C^{-1}B$。
 > **相似矩阵**：$A'=P^{-1}AP$，描述同一线性变换在不同基下的矩阵。$P$ 的列是新基向量。
 > **相似不变量**：$\det$，$\text{tr}$，特征多项式，特征值，$\text{rank}$——这些量刻画变换本质，换基不变。
@@ -724,8 +724,8 @@ $B = D = 0$，显然 $B \sim D$。
 
 | 情形 | 方法 | 公式 |
 |---|---|---|
-| **已知 $[x]_\mathcal{B}$，求 $[x]_\mathcal{C}$** | 左乘过渡矩阵 | $[x]_\mathcal{C}=P_{\mathcal{C}\leftarrow\mathcal{B}}\cdot[x]_\mathcal{B}$ |
-| **已知 $x$（标准坐标），求 $[x]_\mathcal{B}$** | 解方程 $B\mathbf{c}=x$ | $[x]_\mathcal{B}=B^{-1}x$（$B$ 为 $\mathcal{B}$ 基矩阵）|
+| **已知 $[x]_{\mathcal{B}}$，求 $[x]_{\mathcal{C}}$** | 左乘过渡矩阵 | $[x]_{\mathcal{C}}=P_{\mathcal{C}\leftarrow\mathcal{B}}\cdot[x]_{\mathcal{B}}$ |
+| **已知 $x$（标准坐标），求 $[x]_{\mathcal{B}}$** | 解方程 $B\mathbf{c}=x$ | $[x]_{\mathcal{B}}=B^{-1}x$（$B$ 为 $\mathcal{B}$ 基矩阵）|
 | **求过渡矩阵 $P$** | 行化简增广矩阵 | $[C\vert B]\xrightarrow{\text{行化简}}[I\vert P]$ |
 
 ### 相似矩阵 4 步计算
@@ -750,7 +750,7 @@ $B = D = 0$，显然 $B \sim D$。
 
 ### 变形 1：从标准基到非标准基（常考类型）
 
-$\mathcal{B}$ 为目标基，$\mathcal{E}$ 为标准基。则 $P_{\mathcal{B}\leftarrow\mathcal{E}}=B^{-1}$（$B$ 为 $\mathcal{B}$ 的基矩阵），$[x]_\mathcal{B}=B^{-1}x$。构造时只需对 $[B\vert I]$ 行化简得 $[I\vert B^{-1}]$。
+$\mathcal{B}$ 为目标基，$\mathcal{E}$ 为标准基。则 $P_{\mathcal{B}\leftarrow\mathcal{E}}=B^{-1}$（$B$ 为 $\mathcal{B}$ 的基矩阵），$[x]_{\mathcal{B}}=B^{-1}x$。构造时只需对 $[B\vert I]$ 行化简得 $[I\vert B^{-1}]$。
 
 ### 变形 2：对角化是特殊的相似变换
 
@@ -768,7 +768,7 @@ $\mathcal{B}$ 为目标基，$\mathcal{E}$ 为标准基。则 $P_{\mathcal{B}\le
 
 ## 思考路标（条件反射）
 
-1. 看到"坐标变换" → $[x]_\mathcal{C}=P\cdot[x]_\mathcal{B}$，$P=C^{-1}B$；增广矩阵行化简求 $P$
+1. 看到"坐标变换" → $[x]_{\mathcal{C}}=P\cdot[x]_{\mathcal{B}}$，$P=C^{-1}B$；增广矩阵行化简求 $P$
 2. 看到"在基 $\mathcal{B}$ 下的坐标" → 解方程 $B\mathbf{c}=x$（$B$ 为基矩阵）
 3. 看到"相似矩阵 $A'=P^{-1}AP$" → 同一变换换基；$P$ 的列是新基向量
 4. 看到"判断是否相似" → 先查相似不变量：$\text{tr}$，$\det$，特征多项式
@@ -801,13 +801,13 @@ $\mathcal{B}$ 为目标基，$\mathcal{E}$ 为标准基。则 $P_{\mathcal{B}\le
 
 > **题目**：$\mathbb{R}^3$ 中，旧基 $\mathcal{B}=\{(1,0,0)^T,(0,1,0)^T,(0,0,1)^T\}=\mathcal{E}$，新基 $\mathcal{C}=\{(1,1,0)^T,(0,1,1)^T,(1,0,1)^T\}$。向量 $x=(3,2,1)^T$ 在 $\mathcal{C}$ 下的坐标是什么？
 
-【思路】$[x]_\mathcal{C}=C^{-1}x$，用增广矩阵 $[C\vert x]$ 行化简直接解。
+【思路】$[x]_{\mathcal{C}}=C^{-1}x$，用增广矩阵 $[C\vert x]$ 行化简直接解。
 
 【解】
 $$\left[\begin{array}{ccc|c}1&0&1&3\\1&1&0&2\\0&1&1&1\end{array}\right]\xrightarrow{R_2-R_1}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&1&1&1\end{array}\right]\xrightarrow{R_3-R_2}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&0&2&2\end{array}\right]$$
 $$\xrightarrow{R_3/2}\left[\begin{array}{ccc|c}1&0&1&3\\0&1&-1&-1\\0&0&1&1\end{array}\right]\xrightarrow{R_1-R_3,R_2+R_3}\left[\begin{array}{ccc|c}1&0&0&2\\0&1&0&0\\0&0&1&1\end{array}\right]$$
 
-【答案】$\boxed{[x]_\mathcal{C}=(2,0,1)^T}$。验证：$2(1,1,0)^T+0(0,1,1)^T+1(1,0,1)^T=(3,2,1)^T$ ✓。
+【答案】$\boxed{[x]_{\mathcal{C}}=(2,0,1)^T}$。验证：$2(1,1,0)^T+0(0,1,1)^T+1(1,0,1)^T=(3,2,1)^T$ ✓。
 
 ### 例 2：验证相似不变量 + 排除相似
 
@@ -846,7 +846,7 @@ $$=\frac{1}{2}\begin{pmatrix}3^{10}+1&3^{10}-1\\3^{10}-1&3^{10}+1\end{pmatrix}=\
 
 ## 自测题
 
-**自测 1**　$\mathbb{R}^2$ 中，基 $\mathcal{B}=\{(2,1)^T,(1,3)^T\}$，$x=(5,7)^T$。求 $[x]_\mathcal{B}$（$x$ 在基 $\mathcal{B}$ 下的坐标）。
+**自测 1**　$\mathbb{R}^2$ 中，基 $\mathcal{B}=\{(2,1)^T,(1,3)^T\}$，$x=(5,7)^T$。求 $[x]_{\mathcal{B}}$（$x$ 在基 $\mathcal{B}$ 下的坐标）。
 
 > 提示：解 $\begin{pmatrix}2&1\\1&3\end{pmatrix}\mathbf{c}=\begin{pmatrix}5\\7\end{pmatrix}$，行化简得 $\mathbf{c}=(8/5,9/5)^T$。
 
@@ -870,7 +870,7 @@ $$=\frac{1}{2}\begin{pmatrix}3^{10}+1&3^{10}-1\\3^{10}-1&3^{10}+1\end{pmatrix}=\
 
 **回头看一眼"一例速记"**：
 
-> 过渡矩阵 $P=C^{-1}B$，第 $j$ 列是 $b_j$ 在 $\mathcal{C}$ 下的坐标；$[x]_\mathcal{C}=P[x]_\mathcal{B}$。
+> 过渡矩阵 $P=C^{-1}B$，第 $j$ 列是 $b_j$ 在 $\mathcal{C}$ 下的坐标；$[x]_{\mathcal{C}}=P[x]_{\mathcal{B}}$。
 > 相似 $A'=P^{-1}AP$：同一变换换基；行列式、迹、特征值不变。
 > 对角化 $=$ 选特征向量为基；$A^k=P\Lambda^k P^{-1}$，计算高效。
 

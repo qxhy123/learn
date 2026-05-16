@@ -209,7 +209,7 @@ $$\mathbf{F}(\theta) = -\mathbb{E}\left[\nabla^2_\theta \log p(y|\mathbf{x};\the
 
 $$\mathbb{E}\left[\nabla^2 \log p\right] = -\mathbb{E}\left[(\nabla \log p)(\nabla \log p)^\top\right] = -\mathbf{F}$$
 
-即 $\mathbf{F} = -\mathbb{E}[\mathbf{H}_{\log p}]$。在负对数似然损失下，$\mathcal{L} = -\log p$，故 $\mathbf{F} = \mathbb{E}[\mathbf{H}_\mathcal{L}]$。$\square$
+即 $\mathbf{F} = -\mathbb{E}[\mathbf{H}_{\log p}]$。在负对数似然损失下，$\mathcal{L} = -\log p$，故 $\mathbf{F} = \mathbb{E}[\mathbf{H}_{\mathcal{L}}]$。$\square$
 
 ### 23.2.3 Fisher 矩阵与 Gauss-Newton 矩阵的关系
 
@@ -238,7 +238,7 @@ $$\mathbf{F}_\phi = \mathbf{J}_T^{-\top} \mathbf{F}_\theta \mathbf{J}_T^{-1}$$
 
 **性质 3（与 KL 散度的关系）**：Fisher 矩阵是参数空间上 KL 散度的黎曼度量张量。具体地：
 
-$$D_\text{KL}(p(\cdot;\theta) \| p(\cdot;\theta + \delta)) \approx \frac{1}{2} \delta^\top \mathbf{F}(\theta) \delta + O(\|\delta\|^3)$$
+$$D_{\text{KL}}(p(\cdot;\theta) \| p(\cdot;\theta + \delta)) \approx \frac{1}{2} \delta^\top \mathbf{F}(\theta) \delta + O(\|\delta\|^3)$$
 
 这个性质是自然梯度的理论基础（下一节详述）。
 
@@ -331,15 +331,15 @@ $$\tilde{\nabla} \mathcal{L} = \mathbf{F}^{-1} \nabla \mathcal{L} = \begin{pmatr
 
 ### 23.4.1 动机：全连接层的 Fisher 矩阵结构
 
-考虑神经网络的某一全连接层，输入激活为 $\mathbf{a} \in \mathbb{R}^{d_\text{in}}$，输出为 $\mathbf{s} = \mathbf{W}\mathbf{a}$，反向传播到该层输出的梯度为 $\mathbf{g} \in \mathbb{R}^{d_\text{out}}$（即 $\partial \mathcal{L} / \partial \mathbf{s}$）。
+考虑神经网络的某一全连接层，输入激活为 $\mathbf{a} \in \mathbb{R}^{d_{\text{in}}}$，输出为 $\mathbf{s} = \mathbf{W}\mathbf{a}$，反向传播到该层输出的梯度为 $\mathbf{g} \in \mathbb{R}^{d_{\text{out}}}$（即 $\partial \mathcal{L} / \partial \mathbf{s}$）。
 
-参数矩阵 $\mathbf{W} \in \mathbb{R}^{d_\text{out} \times d_\text{in}}$ 展平为向量 $\text{vec}(\mathbf{W}) \in \mathbb{R}^{d_\text{out} \cdot d_\text{in}}$，其梯度为：
+参数矩阵 $\mathbf{W} \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ 展平为向量 $\text{vec}(\mathbf{W}) \in \mathbb{R}^{d_{\text{out}} \cdot d_{\text{in}}}$，其梯度为：
 
-$$\nabla_\mathbf{W} \mathcal{L} = \mathbf{g} \mathbf{a}^\top, \quad \text{vec}(\nabla_\mathbf{W} \mathcal{L}) = \mathbf{a} \otimes \mathbf{g}$$
+$$\nabla_{\mathbf{W}} \mathcal{L} = \mathbf{g} \mathbf{a}^\top, \quad \text{vec}(\nabla_{\mathbf{W}} \mathcal{L}) = \mathbf{a} \otimes \mathbf{g}$$
 
 其中 $\otimes$ 是 Kronecker 积（外积）。该层的 Fisher 矩阵（经验版本）为：
 
-$$\mathbf{F}_\mathbf{W} = \mathbb{E}\left[(\mathbf{a} \otimes \mathbf{g})(\mathbf{a} \otimes \mathbf{g})^\top\right] = \mathbb{E}\left[(\mathbf{a}\mathbf{a}^\top) \otimes (\mathbf{g}\mathbf{g}^\top)\right]$$
+$$\mathbf{F}_{\mathbf{W}} = \mathbb{E}\left[(\mathbf{a} \otimes \mathbf{g})(\mathbf{a} \otimes \mathbf{g})^\top\right] = \mathbb{E}\left[(\mathbf{a}\mathbf{a}^\top) \otimes (\mathbf{g}\mathbf{g}^\top)\right]$$
 
 利用混合积性质 $(\mathbf{A} \otimes \mathbf{B})(\mathbf{C} \otimes \mathbf{D}) = (\mathbf{AC}) \otimes (\mathbf{BD})$，这里有：
 
@@ -352,11 +352,11 @@ $$(\mathbf{a} \otimes \mathbf{g})(\mathbf{a} \otimes \mathbf{g})^\top = (\mathbf
 $$\mathbb{E}\left[(\mathbf{a}\mathbf{a}^\top) \otimes (\mathbf{g}\mathbf{g}^\top)\right] \approx \mathbb{E}[\mathbf{a}\mathbf{a}^\top] \otimes \mathbb{E}[\mathbf{g}\mathbf{g}^\top]$$
 
 定义：
-$$\mathbf{A} = \mathbb{E}[\mathbf{a}\mathbf{a}^\top] \in \mathbb{R}^{d_\text{in} \times d_\text{in}}, \quad \mathbf{G} = \mathbb{E}[\mathbf{g}\mathbf{g}^\top] \in \mathbb{R}^{d_\text{out} \times d_\text{out}}$$
+$$\mathbf{A} = \mathbb{E}[\mathbf{a}\mathbf{a}^\top] \in \mathbb{R}^{d_{\text{in}} \times d_{\text{in}}}, \quad \mathbf{G} = \mathbb{E}[\mathbf{g}\mathbf{g}^\top] \in \mathbb{R}^{d_{\text{out}} \times d_{\text{out}}}$$
 
 则 **K-FAC 近似**为：
 
-$$\boxed{\mathbf{F}_\mathbf{W} \approx \mathbf{A} \otimes \mathbf{G}}$$
+$$\boxed{\mathbf{F}_{\mathbf{W}} \approx \mathbf{A} \otimes \mathbf{G}}$$
 
 ### 23.4.3 Kronecker 积逆的高效计算
 
@@ -364,23 +364,23 @@ Kronecker 积的逆满足：
 
 $$(\mathbf{A} \otimes \mathbf{G})^{-1} = \mathbf{A}^{-1} \otimes \mathbf{G}^{-1}$$
 
-这将原本 $(d_\text{in} \cdot d_\text{out})^2$ 维的矩阵求逆，分解为两个独立的小矩阵求逆：
-- $\mathbf{A}^{-1}$：$d_\text{in} \times d_\text{in}$ 矩阵，复杂度 $O(d_\text{in}^3)$
-- $\mathbf{G}^{-1}$：$d_\text{out} \times d_\text{out}$ 矩阵，复杂度 $O(d_\text{out}^3)$
+这将原本 $(d_{\text{in}} \cdot d_{\text{out}})^2$ 维的矩阵求逆，分解为两个独立的小矩阵求逆：
+- $\mathbf{A}^{-1}$：$d_{\text{in}} \times d_{\text{in}}$ 矩阵，复杂度 $O(d_{\text{in}}^3)$
+- $\mathbf{G}^{-1}$：$d_{\text{out}} \times d_{\text{out}}$ 矩阵，复杂度 $O(d_{\text{out}}^3)$
 
 **K-FAC 自然梯度更新**：
 
 对于权重矩阵 $\mathbf{W}$，K-FAC 更新为：
 
-$$\text{vec}(\Delta\mathbf{W}) = -\alpha (\mathbf{A} \otimes \mathbf{G})^{-1} \text{vec}(\nabla_\mathbf{W} \mathcal{L})$$
+$$\text{vec}(\Delta\mathbf{W}) = -\alpha (\mathbf{A} \otimes \mathbf{G})^{-1} \text{vec}(\nabla_{\mathbf{W}} \mathcal{L})$$
 
-$$= -\alpha (\mathbf{A}^{-1} \otimes \mathbf{G}^{-1}) \text{vec}(\nabla_\mathbf{W} \mathcal{L})$$
+$$= -\alpha (\mathbf{A}^{-1} \otimes \mathbf{G}^{-1}) \text{vec}(\nabla_{\mathbf{W}} \mathcal{L})$$
 
 利用 $(\mathbf{A}^{-1} \otimes \mathbf{G}^{-1})\text{vec}(\mathbf{X}) = \text{vec}(\mathbf{G}^{-1}\mathbf{X}\mathbf{A}^{-1})$，得到矩阵形式的更新：
 
-$$\boxed{\mathbf{W} \leftarrow \mathbf{W} - \alpha \, \mathbf{G}^{-1} \nabla_\mathbf{W} \mathcal{L} \cdot \mathbf{A}^{-1}}$$
+$$\boxed{\mathbf{W} \leftarrow \mathbf{W} - \alpha \, \mathbf{G}^{-1} \nabla_{\mathbf{W}} \mathcal{L} \cdot \mathbf{A}^{-1}}$$
 
-**直觉**：梯度矩阵 $\nabla_\mathbf{W} \mathcal{L}$ 从**右侧**被输入协方差的逆 $\mathbf{A}^{-1}$ "白化"（去除输入特征相关性），从**左侧**被梯度协方差的逆 $\mathbf{G}^{-1}$ "白化"（去除输出梯度相关性）。
+**直觉**：梯度矩阵 $\nabla_{\mathbf{W}} \mathcal{L}$ 从**右侧**被输入协方差的逆 $\mathbf{A}^{-1}$ "白化"（去除输入特征相关性），从**左侧**被梯度协方差的逆 $\mathbf{G}^{-1}$ "白化"（去除输出梯度相关性）。
 
 ### 23.4.4 K-FAC 算法伪代码
 
@@ -416,7 +416,7 @@ for k = 1, 2, ..., T:
 
 ### 23.4.5 计算复杂度分析
 
-对于有 $L$ 层的全连接网络，每层维度 $d_\text{in} \times d_\text{out}$（假设均为 $d \times d$）：
+对于有 $L$ 层的全连接网络，每层维度 $d_{\text{in}} \times d_{\text{out}}$（假设均为 $d \times d$）：
 
 | 操作 | 标准 SGD | K-FAC | 全 Fisher |
 |:----:|:-------:|:-----:|:---------:|
@@ -441,7 +441,7 @@ $$\tilde{\mathbf{F}}^{-1} \approx (\mathbf{A} + \pi\sqrt{\lambda}\mathbf{I})^{-1
 
 **要点2：更新频率解耦**
 
-统计量更新（$\mathbf{A}$，$\mathbf{G}$）可以每步做，而矩阵逆更新代价更高，通常每 $T_\text{inv} \approx 20 \sim 100$ 步更新一次。
+统计量更新（$\mathbf{A}$，$\mathbf{G}$）可以每步做，而矩阵逆更新代价更高，通常每 $T_{\text{inv}} \approx 20 \sim 100$ 步更新一次。
 
 **要点3：与动量结合**
 
@@ -463,7 +463,7 @@ $$\mathbf{W}_{k+1} = \mathbf{W}_k - \alpha \mathbf{m}_k$$
 
 $$\mathbf{L}_k = \sum_{t=1}^k \mathbf{G}_t \mathbf{G}_t^\top \in \mathbb{R}^{m \times m}, \quad \mathbf{R}_k = \sum_{t=1}^k \mathbf{G}_t^\top \mathbf{G}_t \in \mathbb{R}^{n \times n}$$
 
-其中 $\mathbf{G}_t = \nabla_\mathbf{W} \mathcal{L}_t$ 是第 $t$ 步的梯度矩阵。
+其中 $\mathbf{G}_t = \nabla_{\mathbf{W}} \mathcal{L}_t$ 是第 $t$ 步的梯度矩阵。
 
 **Shampoo 更新规则**：
 
@@ -539,7 +539,7 @@ $$\theta_{k+1} = \theta_k - \frac{\alpha}{\sqrt{\mathbf{v}_k} + \epsilon} \odot 
 | K-FAC | Fisher 的 Kronecker 近似 | $O(Ld^2)$ | 少量矩阵运算 | 全连接/卷积网络 |
 | Shampoo | 梯度外积的 Kronecker 预条件子 | $O(Ld^2)$ | 矩阵幂运算 | 任意参数矩阵 |
 | AdaHessian | Hessian 对角的随机估计 | $O(n)$ | 1次额外反向传播 | 通用，代价低 |
-| Hessian-Free | 共轭梯度求解牛顿方程 | $O(n)$ | $O(n_\text{CG})$ 次 Hv 乘积 | 全批量优化 |
+| Hessian-Free | 共轭梯度求解牛顿方程 | $O(n)$ | $O(n_{\text{CG}})$ 次 Hv 乘积 | 全批量优化 |
 | L-BFGS | 存储 $m$ 对向量近似 Hessian | $O(mn)$ | $O(mn)$ | 全批量/小批量 |
 
 ### 23.5.4 分布式 Shampoo 与大规模训练
@@ -642,7 +642,7 @@ Shampoo 中 $\mathbf{L}^{-1/4}$ 和 $\mathbf{R}^{-1/4}$ 的计算（矩阵幂）
 | 牛顿法 | $\theta \leftarrow \theta - \alpha \mathbf{H}^{-1} \nabla \mathcal{L}$ | Hessian $\mathbf{H}$ | 否 | $O(n^3)$，不可行 | 二阶 Taylor 近似 |
 | Gauss-Newton | $\theta \leftarrow \theta - \alpha (\mathbf{G}+\lambda\mathbf{I})^{-1} \nabla \mathcal{L}$ | $\mathbf{G} = \mathbf{J}^\top\Lambda\mathbf{J}$ | 是 | 近似后可行 | 残差二阶近似 |
 | 自然梯度 | $\theta \leftarrow \theta - \alpha \mathbf{F}^{-1} \nabla \mathcal{L}$ | Fisher $\mathbf{F}$ | 是 | $O(n^3)$，直接不可行 | 黎曼流形最速下降 |
-| K-FAC | $\mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{G}^{-1} \nabla_\mathbf{W} \mathcal{L} \cdot \mathbf{A}^{-1}$ | $\mathbf{A} \otimes \mathbf{G}$ | 是 | $O(Ld^3)$，实用 | 独立性假设下的自然梯度 |
+| K-FAC | $\mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{G}^{-1} \nabla_{\mathbf{W}} \mathcal{L} \cdot \mathbf{A}^{-1}$ | $\mathbf{A} \otimes \mathbf{G}$ | 是 | $O(Ld^3)$，实用 | 独立性假设下的自然梯度 |
 | Shampoo | $\mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{L}^{-1/4} \nabla \mathbf{W} \mathbf{R}^{-1/4}$ | 梯度外积累积 | 是 | $O(Ld^3)$，实用 | Kronecker Adagrad 预条件子 |
 | AdaHessian | $\theta \leftarrow \theta - \frac{\alpha}{\sqrt{v}+\epsilon} \nabla \mathcal{L}$（$v$用Hessian对角） | 对角 Hessian | 是 | $O(n)$（+1次反传） | 随机 Hessian 对角估计 |
 
@@ -652,11 +652,11 @@ $$\text{Fisher 矩阵：} \mathbf{F}(\theta) = \mathbb{E}\left[(\nabla_\theta \l
 
 $$\text{自然梯度：} \tilde{\nabla}\mathcal{L} = \mathbf{F}^{-1}\nabla\mathcal{L}$$
 
-$$\text{K-FAC 近似：} \mathbf{F}_\mathbf{W} \approx \mathbf{A} \otimes \mathbf{G}，\quad (\mathbf{A} \otimes \mathbf{G})^{-1} = \mathbf{A}^{-1} \otimes \mathbf{G}^{-1}$$
+$$\text{K-FAC 近似：} \mathbf{F}_{\mathbf{W}} \approx \mathbf{A} \otimes \mathbf{G}，\quad (\mathbf{A} \otimes \mathbf{G})^{-1} = \mathbf{A}^{-1} \otimes \mathbf{G}^{-1}$$
 
-$$\text{K-FAC 更新：} \mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{G}^{-1}\nabla_\mathbf{W}\mathcal{L} \cdot \mathbf{A}^{-1}$$
+$$\text{K-FAC 更新：} \mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{G}^{-1}\nabla_{\mathbf{W}}\mathcal{L} \cdot \mathbf{A}^{-1}$$
 
-$$\text{Shampoo 更新：} \mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{L}^{-1/4} \nabla_\mathbf{W}\mathcal{L} \cdot \mathbf{R}^{-1/4}$$
+$$\text{Shampoo 更新：} \mathbf{W} \leftarrow \mathbf{W} - \alpha \mathbf{L}^{-1/4} \nabla_{\mathbf{W}}\mathcal{L} \cdot \mathbf{R}^{-1/4}$$
 
 $$\text{Hutchinson 估计：} [\mathbf{H}]_{ii} \approx \mathbb{E}_{z}[z_i (\mathbf{H}z)_i]，\quad z \sim \{\pm 1\}^n \text{ 或 } \mathcal{N}(0, \mathbf{I})$$
 
@@ -1433,7 +1433,7 @@ print_method_comparison()
 
 (a) 写出负对数似然损失 $\ell(\mathbf{w}) = -\log p(y|\mathbf{x};\mathbf{w})$ 对 $\mathbf{w}$ 的梯度。
 
-(b) 计算单个样本 $(\mathbf{x}, y)$ 对应的 Fisher 信息矩阵 $\mathbf{F}(\mathbf{w}) = \mathbb{E}_{y|x}[(\nabla_\mathbf{w} \log p)(\nabla_\mathbf{w} \log p)^\top]$。
+(b) 计算单个样本 $(\mathbf{x}, y)$ 对应的 Fisher 信息矩阵 $\mathbf{F}(\mathbf{w}) = \mathbb{E}_{y|x}[(\nabla_{\mathbf{w}} \log p)(\nabla_{\mathbf{w}} \log p)^\top]$。
 
 (c) 证明 $\mathbf{F}(\mathbf{w}) = \sigma(\mathbf{w}^\top\mathbf{x})(1-\sigma(\mathbf{w}^\top\mathbf{x})) \cdot \mathbf{x}\mathbf{x}^\top$，并说明这与 Hessian 矩阵的关系。
 
@@ -1441,15 +1441,15 @@ print_method_comparison()
 
 **练习 23.2**（基础）K-FAC 的 Kronecker 分解验证
 
-设 $\mathbf{A} = \begin{pmatrix} 2 & 1 \\ 1 & 3 \end{pmatrix}$，$\mathbf{G} = \begin{pmatrix} 4 & 0 \\ 0 & 1 \end{pmatrix}$，梯度矩阵 $\nabla_\mathbf{W} = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$（此时 $d_\text{in} = 2, d_\text{out} = 2$）。
+设 $\mathbf{A} = \begin{pmatrix} 2 & 1 \\ 1 & 3 \end{pmatrix}$，$\mathbf{G} = \begin{pmatrix} 4 & 0 \\ 0 & 1 \end{pmatrix}$，梯度矩阵 $\nabla_{\mathbf{W}} = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$（此时 $d_{\text{in}} = 2, d_{\text{out}} = 2$）。
 
 (a) 计算 $\mathbf{A}^{-1}$ 和 $\mathbf{G}^{-1}$。
 
-(b) 计算 K-FAC 自然梯度 $\tilde{\nabla} = \mathbf{G}^{-1} \nabla_\mathbf{W} \mathbf{A}^{-1}$。
+(b) 计算 K-FAC 自然梯度 $\tilde{\nabla} = \mathbf{G}^{-1} \nabla_{\mathbf{W}} \mathbf{A}^{-1}$。
 
-(c) 计算 $\text{vec}(\tilde{\nabla}) = (\mathbf{A}^{-1} \otimes \mathbf{G}^{-1})\text{vec}(\nabla_\mathbf{W})$，验证与 (b) 的一致性（其中 $\text{vec}(\mathbf{X})$ 按列堆叠 $\mathbf{X}$ 的列）。
+(c) 计算 $\text{vec}(\tilde{\nabla}) = (\mathbf{A}^{-1} \otimes \mathbf{G}^{-1})\text{vec}(\nabla_{\mathbf{W}})$，验证与 (b) 的一致性（其中 $\text{vec}(\mathbf{X})$ 按列堆叠 $\mathbf{X}$ 的列）。
 
-(d) 若标准梯度更新为 $\mathbf{W} \leftarrow \mathbf{W} - 0.1 \cdot \nabla_\mathbf{W}$，K-FAC 更新为 $\mathbf{W} \leftarrow \mathbf{W} - 0.1 \cdot \tilde{\nabla}$，从 $\mathbf{W}_0 = \mathbf{0}$ 出发，比较一步后两种方法得到的 $\mathbf{W}_1$。
+(d) 若标准梯度更新为 $\mathbf{W} \leftarrow \mathbf{W} - 0.1 \cdot \nabla_{\mathbf{W}}$，K-FAC 更新为 $\mathbf{W} \leftarrow \mathbf{W} - 0.1 \cdot \tilde{\nabla}$，从 $\mathbf{W}_0 = \mathbf{0}$ 出发，比较一步后两种方法得到的 $\mathbf{W}_1$。
 
 ---
 
@@ -1513,9 +1513,9 @@ $$\ell(\mathbf{w}) = -y\log\sigma(\mathbf{w}^\top\mathbf{x}) - (1-y)\log(1-\sigm
 
 利用 $\sigma'(z) = \sigma(z)(1-\sigma(z))$，梯度为：
 
-$$\nabla_\mathbf{w} \ell = (\sigma(\mathbf{w}^\top\mathbf{x}) - y) \mathbf{x}$$
+$$\nabla_{\mathbf{w}} \ell = (\sigma(\mathbf{w}^\top\mathbf{x}) - y) \mathbf{x}$$
 
-得分函数 $\nabla_\mathbf{w} \log p(y|\mathbf{x};\mathbf{w}) = (y - \sigma(\mathbf{w}^\top\mathbf{x}))\mathbf{x}$。
+得分函数 $\nabla_{\mathbf{w}} \log p(y|\mathbf{x};\mathbf{w}) = (y - \sigma(\mathbf{w}^\top\mathbf{x}))\mathbf{x}$。
 
 **(b)** Fisher 信息矩阵：
 
@@ -1531,9 +1531,9 @@ $$\mathbb{E}_{y|x}[(y-\sigma)^2] = \sigma - \sigma^2 = \sigma(1-\sigma)$$
 
 $$\mathbf{F}(\mathbf{w}) = \sigma(\mathbf{w}^\top\mathbf{x})(1-\sigma(\mathbf{w}^\top\mathbf{x})) \cdot \mathbf{x}\mathbf{x}^\top$$
 
-直接计算 Hessian $\nabla^2_\mathbf{w} \ell$：
+直接计算 Hessian $\nabla^2_{\mathbf{w}} \ell$：
 
-$$\nabla^2_\mathbf{w} \ell = \sigma(\mathbf{w}^\top\mathbf{x})(1-\sigma(\mathbf{w}^\top\mathbf{x})) \cdot \mathbf{x}\mathbf{x}^\top = \mathbf{F}(\mathbf{w})$$
+$$\nabla^2_{\mathbf{w}} \ell = \sigma(\mathbf{w}^\top\mathbf{x})(1-\sigma(\mathbf{w}^\top\mathbf{x})) \cdot \mathbf{x}\mathbf{x}^\top = \mathbf{F}(\mathbf{w})$$
 
 即对于逻辑回归，**Fisher 矩阵等于 Hessian 矩阵**，这验证了定理 23.1（此时 $\mathcal{L}$ 是凸的，模型类包含真实分布）。$\checkmark$
 
@@ -1547,19 +1547,19 @@ $\mathbf{G}$ 是对角矩阵，$\mathbf{G}^{-1} = \begin{pmatrix}1/4&0\\0&1\end{
 
 **(b)** K-FAC 自然梯度（矩阵形式）：
 
-$$\tilde{\nabla} = \mathbf{G}^{-1} \nabla_\mathbf{W} \mathbf{A}^{-1} = \begin{pmatrix}1/4&0\\0&1\end{pmatrix}\begin{pmatrix}1&2\\3&4\end{pmatrix}\frac{1}{5}\begin{pmatrix}3&-1\\-1&2\end{pmatrix}$$
+$$\tilde{\nabla} = \mathbf{G}^{-1} \nabla_{\mathbf{W}} \mathbf{A}^{-1} = \begin{pmatrix}1/4&0\\0&1\end{pmatrix}\begin{pmatrix}1&2\\3&4\end{pmatrix}\frac{1}{5}\begin{pmatrix}3&-1\\-1&2\end{pmatrix}$$
 
-先计算 $\nabla_\mathbf{W} \mathbf{A}^{-1} = \frac{1}{5}\begin{pmatrix}1&2\\3&4\end{pmatrix}\begin{pmatrix}3&-1\\-1&2\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1&3\\5&5\end{pmatrix}$
+先计算 $\nabla_{\mathbf{W}} \mathbf{A}^{-1} = \frac{1}{5}\begin{pmatrix}1&2\\3&4\end{pmatrix}\begin{pmatrix}3&-1\\-1&2\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1&3\\5&5\end{pmatrix}$
 
 再左乘 $\mathbf{G}^{-1}$：
 
 $$\tilde{\nabla} = \frac{1}{5}\begin{pmatrix}1/4 & 0 \\ 0 & 1\end{pmatrix}\begin{pmatrix}1&3\\5&5\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1/4&3/4\\5&5\end{pmatrix} = \begin{pmatrix}0.05&0.15\\1.0&1.0\end{pmatrix}$$
 
-**(c)** $\text{vec}(\nabla_\mathbf{W})$ 按列堆叠：$\text{vec}(\nabla_\mathbf{W}) = (1, 3, 2, 4)^\top$（第一列、第二列）。
+**(c)** $\text{vec}(\nabla_{\mathbf{W}})$ 按列堆叠：$\text{vec}(\nabla_{\mathbf{W}}) = (1, 3, 2, 4)^\top$（第一列、第二列）。
 
 $\mathbf{A}^{-1} \otimes \mathbf{G}^{-1} = \frac{1}{5}\begin{pmatrix}3&-1\\-1&2\end{pmatrix} \otimes \begin{pmatrix}1/4&0\\0&1\end{pmatrix} = \frac{1}{5}\begin{pmatrix}3/4&0&-1/4&0\\0&3&0&-1\\-1/4&0&2/4&0\\0&-1&0&2\end{pmatrix}$
 
-计算 $\text{vec}(\tilde{\nabla}) = (\mathbf{A}^{-1}\otimes\mathbf{G}^{-1})\text{vec}(\nabla_\mathbf{W})$：
+计算 $\text{vec}(\tilde{\nabla}) = (\mathbf{A}^{-1}\otimes\mathbf{G}^{-1})\text{vec}(\nabla_{\mathbf{W}})$：
 
 $$= \frac{1}{5}\begin{pmatrix}3/4\cdot1+(-1/4)\cdot2\\3\cdot1+(-1)\cdot2\\(-1/4)\cdot1+2/4\cdot2\\(-1)\cdot1+2\cdot2\end{pmatrix} = \frac{1}{5}\begin{pmatrix}1/4\\1\\3/4\\3\end{pmatrix} = \begin{pmatrix}0.05\\0.2\\0.15\\0.6\end{pmatrix}$$
 
@@ -1673,19 +1673,19 @@ $\mathbf{L}_3^{-1/4}$ 通过 $\mathbf{Q}\text{diag}(\lambda_1^{-1/4}, \lambda_2^
 
 **(e)** 设 K-FAC 每步实现了完整自然梯度 $\eta\%$ 的收敛量，每步代价是 SGD 的 $c$ 倍。
 
-设达到目标损失需要自然梯度走 $T_\text{NG}$ 步，SGD 走 $T_\text{SGD}$ 步。K-FAC 需要 $T_\text{KFAC} = T_\text{NG} / (\eta/100)$ 步。
+设达到目标损失需要自然梯度走 $T_{\text{NG}}$ 步，SGD 走 $T_{\text{SGD}}$ 步。K-FAC 需要 $T_{\text{KFAC}} = T_{\text{NG}} / (\eta/100)$ 步。
 
 总计算量对比：
-- SGD 总 FLOP：$T_\text{SGD} \cdot C_\text{SGD}$
-- K-FAC 总 FLOP：$T_\text{KFAC} \cdot c \cdot C_\text{SGD}$
+- SGD 总 FLOP：$T_{\text{SGD}} \cdot C_{\text{SGD}}$
+- K-FAC 总 FLOP：$T_{\text{KFAC}} \cdot c \cdot C_{\text{SGD}}$
 
 K-FAC 优于 SGD 的条件：
 
-$$\frac{T_\text{NG}}{\eta/100} \cdot c < T_\text{SGD}$$
+$$\frac{T_{\text{NG}}}{\eta/100} \cdot c < T_{\text{SGD}}$$
 
-$$\Rightarrow \quad \frac{T_\text{NG}}{T_\text{SGD}} < \frac{\eta}{100 c}$$
+$$\Rightarrow \quad \frac{T_{\text{NG}}}{T_{\text{SGD}}} < \frac{\eta}{100 c}$$
 
-设 $T_\text{NG}/T_\text{SGD} = r$（自然梯度步数节省比），则 K-FAC 合算的条件为：
+设 $T_{\text{NG}}/T_{\text{SGD}} = r$（自然梯度步数节省比），则 K-FAC 合算的条件为：
 
 $$\boxed{r < \frac{\eta}{100c}}$$
 

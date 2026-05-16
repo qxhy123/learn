@@ -990,7 +990,7 @@ $$\mathcal{I}_\ell \approx A_\ell\otimes G_\ell$$
 
 多元正态 $\mathbf{X}$ 的特征函数：
 
-$$\varphi_\mathbf{X}(\mathbf{t}) = \exp\!\left(i\mathbf{t}^\top\boldsymbol{\mu}-\tfrac{1}{2}\mathbf{t}^\top\boldsymbol{\Sigma}\mathbf{t}\right)$$
+$$\varphi_{\mathbf{X}}(\mathbf{t}) = \exp\!\left(i\mathbf{t}^\top\boldsymbol{\mu}-\tfrac{1}{2}\mathbf{t}^\top\boldsymbol{\Sigma}\mathbf{t}\right)$$
 
 令 $\mathbf{t}=(\mathbf{s},\mathbf{0})$（仅 $\mathbf{X}_1$ 方向非零）：
 
@@ -1381,11 +1381,11 @@ $$\boldsymbol{\Sigma}_k^{\text{new}} = \frac{\sum_i r_{ik}(\mathbf{x}_i-\boldsym
 
 定义 $Q(\boldsymbol{\theta}\mid\boldsymbol{\theta}^{\text{old}})=E_{\mathbf{Z}\mid\mathbf{X},\boldsymbol{\theta}^{\text{old}}}[\log p(\mathbf{X},\mathbf{Z}\mid\boldsymbol{\theta})]$，
 
-$$\log p(\mathbf{X}\mid\boldsymbol{\theta}) = Q(\boldsymbol{\theta}\mid\boldsymbol{\theta}^{\text{old}})-\underbrace{\sum_\mathbf{z}q(\mathbf{z})\log\frac{q(\mathbf{z})}{p(\mathbf{z}\mid\mathbf{X},\boldsymbol{\theta})}}_{=\,\mathrm{KL}(q\,\|\,p(\cdot\mid\mathbf{X},\boldsymbol{\theta}))\,\ge\,0} + \text{const}$$
+$$\log p(\mathbf{X}\mid\boldsymbol{\theta}) = Q(\boldsymbol{\theta}\mid\boldsymbol{\theta}^{\text{old}})-\underbrace{\sum_{\mathbf{z}}q(\mathbf{z})\log\frac{q(\mathbf{z})}{p(\mathbf{z}\mid\mathbf{X},\boldsymbol{\theta})}}_{=\,\mathrm{KL}(q\,\|\,p(\cdot\mid\mathbf{X},\boldsymbol{\theta}))\,\ge\,0} + \text{const}$$
 
 E 步令 $q(\mathbf{z})=p(\mathbf{z}\mid\mathbf{X},\boldsymbol{\theta}^{\text{old}})$（KL $=0$），
 
-M 步令 $\boldsymbol{\theta}^{\text{new}}=\arg\max_\boldsymbol{\theta}Q(\boldsymbol{\theta}\mid\boldsymbol{\theta}^{\text{old}})$（$Q$ 不减），
+M 步令 $\boldsymbol{\theta}^{\text{new}}=\arg\max_{\boldsymbol{\theta}}Q(\boldsymbol{\theta}\mid\boldsymbol{\theta}^{\text{old}})$（$Q$ 不减），
 
 故 $\log p(\mathbf{X}\mid\boldsymbol{\theta}^{\text{new}})\ge\log p(\mathbf{X}\mid\boldsymbol{\theta}^{\text{old}})$。$\square$
 
