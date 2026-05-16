@@ -56,6 +56,17 @@
 
 ---
 
+## 几何示意
+
+### 图 可变滑窗（LC 3）
+
+![abcabcbb 窗扩缩 4 步](../../figures/svg/lc-sliding-window-1.svg)
+
+### 图 可变滑窗 + 哈希（LC 76）
+
+![Min Window Substring 收缩到最小](../../figures/svg/lc-sliding-window-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：可变窗口（数值聚合）

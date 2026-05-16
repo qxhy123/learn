@@ -80,6 +80,21 @@
 
 ---
 
+## 几何示意
+
+### 图 二维路径 DP（LC 62）
+
+![3x3 网格 dp 填表](../../figures/svg/lc-dp-multidim-1.svg)
+
+### 图 编辑距离（LC 72）
+
+![6x4 dp 表 + min 三方向](../../figures/svg/lc-dp-multidim-2.svg)
+
+### 图 LCS（LC 1143）
+
+![6x4 dp 表 + 回溯路径](../../figures/svg/lc-dp-multidim-3.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 模板 1：二维 DP grid（自底向上递推）

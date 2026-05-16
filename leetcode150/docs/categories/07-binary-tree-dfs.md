@@ -68,6 +68,21 @@
 
 ---
 
+## 几何示意
+
+### 图 三种 DFS 遍历对比
+
+![前/中/后序访问顺序对比](../../figures/svg/lc-bt-dfs-1.svg)
+
+### 图 最大深度（LC 104）
+
+![叶子返回 1 + 内部 max+1](../../figures/svg/lc-bt-dfs-2.svg)
+
+### 图 LCA 最近公共祖先（LC 236）
+
+![递归从底向上找到 LCA](../../figures/svg/lc-bt-dfs-3.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### TreeNode 定义（所有二叉树题共用）

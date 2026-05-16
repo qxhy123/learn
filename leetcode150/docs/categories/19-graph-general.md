@@ -58,6 +58,17 @@
 
 ---
 
+## 几何示意
+
+### 图 DFS 连通分量（LC 200 岛屿）
+
+![4x5 网格 + 4 色岛屿](../../figures/svg/lc-graph-general-1.svg)
+
+### 图 Union-Find 路径压缩
+
+![5 节点链 → 扁平化 + parent/rank](../../figures/svg/lc-graph-general-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：DFS 连通分量（岛屿计数）

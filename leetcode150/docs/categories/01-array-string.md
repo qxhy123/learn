@@ -69,6 +69,21 @@
 
 ---
 
+## 几何示意
+
+### 图 read/write 双指针（LC 26）
+
+![read/write 双指针 4 步演化示意](../../figures/svg/lc-array-string-1.svg)
+
+### 图 Boyer-Moore 投票（LC 169）
+
+![7 步投票演化表](../../figures/svg/lc-array-string-2.svg)
+
+### 图 接雨水双指针（LC 42）
+
+![柱状图 + left/right 指针 + 阴影蓄水](../../figures/svg/lc-array-string-3.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：read/write 双指针（去重 / 移除）

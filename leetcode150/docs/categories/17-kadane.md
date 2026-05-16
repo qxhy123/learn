@@ -57,6 +57,13 @@
 
 ---
 
+## 几何示意
+
+### 图 Kadane 最大子数组（LC 53）
+
+![cur_max / global_max 折线 + 红色子数组](../../figures/svg/lc-kadane-1.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：标准 Kadane（最大子数组和）

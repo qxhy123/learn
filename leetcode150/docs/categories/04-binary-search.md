@@ -64,6 +64,17 @@
 
 ---
 
+## 几何示意
+
+### 图 标准二分迭代（LC 35）
+
+![l/r/mid 三指针演化](../../figures/svg/lc-binary-search-1.svg)
+
+### 图 找左右边界（LC 34）
+
+![lower_bound + upper_bound 双子图](../../figures/svg/lc-binary-search-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：lower_bound — 标准左边界二分

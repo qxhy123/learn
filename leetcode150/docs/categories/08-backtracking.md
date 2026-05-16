@@ -63,6 +63,21 @@
 
 ---
 
+## 几何示意
+
+### 图 排列回溯决策树（LC 46）
+
+![完整 3 层决策树 6 叶子](../../figures/svg/lc-backtracking-1.svg)
+
+### 图 组合回溯（LC 77）
+
+![递增组合决策树 + 剪枝](../../figures/svg/lc-backtracking-2.svg)
+
+### 图 N-Queens（LC 52）
+
+![4x4 棋盘 + 攻击线 + 三集合](../../figures/svg/lc-backtracking-3.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 回溯通用骨架

@@ -69,6 +69,17 @@
 
 ---
 
+## 几何示意
+
+### 图 哈希查找（LC 1 Two Sum）
+
+![hash dict 4 步演化 + target 互补](../../figures/svg/lc-hash-1.svg)
+
+### 图 哈希分组（LC 49 Group Anagrams）
+
+![排序 key 分组哈希表](../../figures/svg/lc-hash-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：两数之和模式

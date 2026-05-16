@@ -62,6 +62,17 @@
 
 ---
 
+## 几何示意
+
+### 图 XOR 单数（LC 136）
+
+![5 步累计 XOR + 二进制 + 真值](../../figures/svg/lc-bit-1.svg)
+
+### 图 Brian Kernighan 位计数（LC 191）
+
+![n & (n-1) 每步消最低位 1](../../figures/svg/lc-bit-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：XOR 消消乐（Single Number I）

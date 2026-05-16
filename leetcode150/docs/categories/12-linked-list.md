@@ -87,6 +87,21 @@
 
 ---
 
+## 几何示意
+
+### 图 链表反转（LC 206）
+
+![prev/curr/next 三指针 4 步](../../figures/svg/lc-linked-list-1.svg)
+
+### 图 快慢指针找中点（LC 876）
+
+![6 节点链表 slow/fast 追及](../../figures/svg/lc-linked-list-2.svg)
+
+### 图 LRU 缓存（LC 146）
+
+![哈希表 + 双向链表 + 3 操作](../../figures/svg/lc-linked-list-3.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### ListNode 定义（所有链表题共用）

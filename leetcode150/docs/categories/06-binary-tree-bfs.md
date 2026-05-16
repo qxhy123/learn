@@ -48,6 +48,17 @@
 
 ---
 
+## 几何示意
+
+### 图 层序遍历（LC 102）
+
+![队列演化 4 步](../../figures/svg/lc-bt-bfs-1.svg)
+
+### 图 右视图 vs 层序 vs zigzag
+
+![三种 BFS 输出对比](../../figures/svg/lc-bt-bfs-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### TreeNode 定义（所有二叉树题共用）

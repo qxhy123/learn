@@ -62,6 +62,17 @@
 
 ---
 
+## 几何示意
+
+### 图 对撞双指针（LC 167 Two Sum II）
+
+![left/right 头尾收敛 3 步](../../figures/svg/lc-two-pointers-1.svg)
+
+### 图 快慢指针检测环（LC 141）
+
+![slow 1 步 fast 2 步追上](../../figures/svg/lc-two-pointers-2.svg)
+
+---
 ## 抽象成方法（标准模板代码）
 
 ### 套路 1：对撞双指针（基础）
