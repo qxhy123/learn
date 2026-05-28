@@ -134,6 +134,8 @@ $$= \frac{\pi}{16} \left[10\sqrt{5} - \frac{10\sqrt{5}}{3} + \frac{4}{15}\right]
 - **上侧**：法向量与 $z$ 轴正向夹角为锐角（$\cos\gamma > 0$）
 - **下侧**：法向量与 $z$ 轴正向夹角为钝角（$\cos\gamma < 0$）
 
+![曲面的定向：非封闭曲面的上侧/下侧与封闭曲面的外侧/内侧](../figures/svg/calc-p6-21-3.svg)
+
 ### 21.2.3 定义
 
 **定义**：设 $\Sigma$ 是光滑的有向曲面，$\mathbf{n} = (\cos\alpha, \cos\beta, \cos\gamma)$ 是 $\Sigma$ 上指定侧的单位法向量，$\mathbf{F}(x, y, z) = P\mathbf{i} + Q\mathbf{j} + R\mathbf{k}$ 是定义在 $\Sigma$ 上的向量场。**第二类曲面积分**定义为
@@ -211,6 +213,8 @@ $$\iiint_\Omega \text{div}\,\mathbf{F}\,dv = \oiint_\Sigma \mathbf{F} \cdot d\ma
 
 Gauss 公式表明：向量场穿过封闭曲面的总通量等于曲面所围区域内的源强度之和。
 
+![Gauss 散度定理：内部源积分 = 边界通量](../figures/svg/calc-p6-21-4.svg)
+
 ### 21.3.3 应用
 
 > **例题 21.4**（用 Gauss 公式重做例题 21.3）计算 $\iint_\Sigma x^2\,dy\,dz + y^2\,dz\,dx + z^2\,dx\,dy$，其中 $\Sigma$ 是球面 $x^2 + y^2 + z^2 = 1$ 的外侧。
@@ -250,6 +254,8 @@ $$= \oint_{\partial\Sigma} P\,dx + Q\,dy + R\,dz$$
 
 其中 $\partial\Sigma$ 的方向与 $\Sigma$ 的定向符合**右手法则**：右手四指沿 $\partial\Sigma$ 的方向，拇指指向 $\Sigma$ 的正侧。
 
+![Stokes 旋度定理与右手法则：曲面旋度积分 = 边界环量](../figures/svg/calc-p6-21-5.svg)
+
 **向量形式**：定义**旋度**
 
 $$\text{curl}\,\mathbf{F} = \nabla \times \mathbf{F} = \begin{vmatrix} \mathbf{i} & \mathbf{j} & \mathbf{k} \\ \dfrac{\partial}{\partial x} & \dfrac{\partial}{\partial y} & \dfrac{\partial}{\partial z} \\ P & Q & R \end{vmatrix}$$
@@ -274,6 +280,10 @@ $$\iint_\Sigma (\nabla \times \mathbf{F}) \cdot d\mathbf{S} = \oint_{\partial\Si
 $$\iint_D \left(\frac{\partial Q}{\partial x} - \frac{\partial P}{\partial y}\right)dx\,dy = \oint_{\partial D} P\,dx + Q\,dy$$
 
 因此，Green 公式是 Stokes 公式在平面上的特例。
+
+![Newton-Leibniz / Green / Stokes / Gauss 四大定理的统一视角](../figures/svg/calc-p6-21-6.svg)
+
+**统一原理**：Newton-Leibniz、Green、Stokes、Gauss 四个公式都是**同一个深层定理在不同维度下的具体化**——广义 Stokes 定理 $\displaystyle\int_{\partial M}\omega = \int_M d\omega$，即"边界上低维积分 = 内部高一维的'外微分'积分"。这正是微积分体系最深刻、最简洁的统一表达。
 
 > **例题 21.6** 用 Stokes 公式计算 $\oint_C y\,dx + z\,dy + x\,dz$，其中 $C$ 是平面 $x + y + z = 1$ 与三个坐标面围成的三角形边界，从 $z$ 轴正向看去为逆时针方向。
 

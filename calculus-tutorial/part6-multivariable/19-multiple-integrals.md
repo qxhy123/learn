@@ -325,6 +325,314 @@ $$\iint_D e^{\frac{y-x}{y+x}}\,dx\,dy = \iint_{D'} e^{\frac{u}{v}} \cdot \frac{1
 
 $$= \frac{1}{2}\int_0^1 \left[v \cdot e^{\frac{u}{v}}\right]_{-v}^{v} dv = \frac{1}{2}\int_0^1 v(e - e^{-1})\,dv = \frac{e - e^{-1}}{2} \cdot \frac{1}{2} = \frac{e - e^{-1}}{4}$$
 
+### 19.4.3 重积分运算规则体系（完整推导）
+
+到目前为止，本章使用了多条"运算规则"——线性性、区域可加性、Fubini 定理（累次积分）、极/柱/球坐标变换、一般 Jacobi 换元、对称性化简——但只给出了**结论**，未给出推导。本小节系统、不跳步地补全所有规则的论证。
+
+#### 全景导览
+
+```
+第 0 层：Riemann 和定义 + 极限
+   ↓
+第 1 层（基本性质）：线性性 / 区域可加性 / 单调性 / 估值 / 中值
+   ↓
+第 2 层（化为累次积分）：Fubini–Tonelli 定理
+   ↓
+第 3 层（坐标变换）：换元公式 |J| du dv → 极/柱/球坐标
+   ↓
+第 4 层（对称化简）：奇偶对称、轮换对称
+```
+
+下面逐条不跳步推导。
+
+---
+
+#### 规则 1：二重积分的线性性
+
+**定理**：设 $f, g$ 在 $D$ 上可积，$\alpha, \beta$ 为常数，则
+
+$$\iint_D[\alpha f + \beta g]\,d\sigma = \alpha\iint_D f\,d\sigma + \beta\iint_D g\,d\sigma.$$
+
+**推导**（直接从 Riemann 和定义）：
+
+**第一步**：取任意分割 $\{\Delta\sigma_i\}$ 与样本点 $(\xi_i, \eta_i)$，记 Riemann 和：
+$$S_{f}(\mathcal{P}) = \sum_i f(\xi_i,\eta_i)\Delta\sigma_i,\quad S_g(\mathcal{P}) = \sum_i g(\xi_i,\eta_i)\Delta\sigma_i.$$
+
+**第二步**：对 $\alpha f + \beta g$ 的 Riemann 和直接展开：
+$$S_{\alpha f + \beta g}(\mathcal{P}) = \sum_i [\alpha f(\xi_i,\eta_i) + \beta g(\xi_i,\eta_i)]\Delta\sigma_i = \alpha S_f(\mathcal{P}) + \beta S_g(\mathcal{P}).$$
+
+**第三步**：取分割直径 $\lambda\to 0$，由极限线性性：
+$$\iint_D(\alpha f+\beta g) = \alpha\iint_D f + \beta\iint_D g.\quad\square$$
+
+---
+
+#### 规则 2：区域可加性
+
+**定理**：设 $D = D_1\cup D_2$，$D_1\cap D_2$ 面积为零，$f$ 在 $D$ 上可积，则
+$$\iint_D f\,d\sigma = \iint_{D_1} f\,d\sigma + \iint_{D_2} f\,d\sigma.$$
+
+**推导**：
+
+**第一步**（构造特殊分割）：取 $D$ 的分割使每一小块要么完全落在 $D_1$ 内，要么完全落在 $D_2$ 内（边界小块面积可忽略，因 $D_1\cap D_2$ 面积为零）。
+
+**第二步**（拆和）：把 Riemann 和按归属拆成两部分：
+$$\sum_i f(\xi_i,\eta_i)\Delta\sigma_i = \sum_{i:\Delta\sigma_i\subset D_1} + \sum_{i:\Delta\sigma_i\subset D_2}.$$
+
+**第三步**：每部分分别是 $D_1, D_2$ 上的 Riemann 和。取极限即得。$\square$
+
+> **应用**：当区域形状复杂时（如 L 形、带洞），先把它拆成几个简单子区域再用 Fubini 定理。
+
+---
+
+#### 规则 3：单调性 / 估值 / 中值定理
+
+**单调性**：若 $f\le g$ 在 $D$ 上成立，则 $\iint_D f \le \iint_D g$。
+
+**推导**：每一项 Riemann 和满足 $f(\xi_i,\eta_i)\Delta\sigma_i \le g(\xi_i,\eta_i)\Delta\sigma_i$（$\Delta\sigma_i\ge 0$），求和后取极限保号。$\square$
+
+**估值**：$m\le f\le M$ 时，$mS\le\iint_D f\le MS$（$S$ 为 $D$ 面积）。**推导**：用单调性，对 $f$ 上下夹估即可。
+
+**中值定理**：$f$ 在有界闭区域 $D$ 上连续 $\Rightarrow$ 存在 $(\xi,\eta)\in D$，使 $\iint_D f\,d\sigma = f(\xi,\eta)\cdot S$。
+
+**推导**：
+
+**第一步**：由估值定理 $mS\le \iint_D f\le MS$，故
+$$m\le \frac{1}{S}\iint_D f\,d\sigma\le M.$$
+
+**第二步**：$m, M$ 分别是 $f$ 在 $D$ 上的最小、最大值。$f$ 连续 + $D$ 连通 $\Rightarrow$ 介值定理：存在 $(\xi,\eta)\in D$ 使 $f(\xi,\eta) = \dfrac{1}{S}\iint_D f$。$\square$
+
+---
+
+#### 规则 4：Fubini 定理——重积分 = 累次积分
+
+**定理**（Fubini 定理 / 直角坐标版本）：设 $f(x,y)$ 在矩形 $R = [a,b]\times[c,d]$ 上连续，则
+$$\iint_R f(x,y)\,d\sigma = \int_a^b\left[\int_c^d f(x,y)\,dy\right]dx = \int_c^d\left[\int_a^b f(x,y)\,dx\right]dy.$$
+
+**直觉推导**（不跳步，几何 + Riemann 和视角）：
+
+**第一步**（切片法）：把 $R$ 沿 $x$ 方向等分成 $m$ 列、$y$ 方向等分成 $n$ 行，得 $mn$ 个小矩形 $R_{ij} = [x_{i-1},x_i]\times[y_{j-1},y_j]$，面积 $\Delta x_i\Delta y_j$。
+
+**第二步**（Riemann 和）：取样本点 $(\xi_i,\eta_j)$（行列交点），
+$$S = \sum_{i=1}^m\sum_{j=1}^n f(\xi_i,\eta_j)\Delta x_i\Delta y_j.$$
+
+**第三步**（按 $i$ 内层先求和）：固定 $i$，把 $j$ 的求和提到内层：
+$$S = \sum_{i=1}^m\left[\sum_{j=1}^n f(\xi_i,\eta_j)\Delta y_j\right]\Delta x_i.$$
+
+**第四步**（识别内层为对 $y$ 的 Riemann 和）：固定 $\xi_i$，内层 $\sum_j f(\xi_i,\eta_j)\Delta y_j$ 是一元函数 $y\mapsto f(\xi_i, y)$ 在 $[c,d]$ 上的 Riemann 和。$f$ 连续 $\Rightarrow$ 一元可积，当 $\max\Delta y_j\to 0$：
+$$\sum_j f(\xi_i,\eta_j)\Delta y_j\to \int_c^d f(\xi_i, y)\,dy =: I(\xi_i).$$
+
+**第五步**（外层取极限）：记 $I(x) = \int_c^d f(x,y)\,dy$。$f$ 连续蕴含 $I(x)$ 是 $x$ 的连续函数（一致连续性 + 控制收敛）。故
+$$S\to \int_a^b I(x)\,dx = \int_a^b\left[\int_c^d f(x,y)\,dy\right]dx.$$
+
+**第六步**：另一边同理（先 $x$ 后 $y$）。两次次序相等，因为它们都等于二重积分本身。$\square$
+
+#### 一般区域上的 Fubini
+
+对 X-型区域 $D = \{(x,y): a\le x\le b, \varphi_1(x)\le y\le \varphi_2(x)\}$，用"延拓 + 矩形 Fubini"技巧：
+
+**第一步**：把 $f$ 延拓到包围 $D$ 的最小矩形 $R$，在 $R\setminus D$ 上定义为 $0$；记为 $\tilde f$。
+
+**第二步**（关键）：$\iint_D f = \iint_R \tilde f$（在 $D$ 外被积函数为零）。
+
+**第三步**：对 $\iint_R \tilde f$ 用矩形 Fubini，内层对 $y$ 积分时只有 $\varphi_1(x)\le y\le\varphi_2(x)$ 部分非零：
+$$\iint_R \tilde f = \int_a^b\left[\int_{\varphi_1(x)}^{\varphi_2(x)} f(x,y)\,dy\right]dx.\quad\square$$
+
+> **注意**：Fubini 定理对一般可积函数有连续性的要求；非连续情形（如带跳跃间断或瑕点）需更小心，参考 Lebesgue 理论中的 Fubini–Tonelli 定理。
+
+---
+
+#### 规则 5：换元公式的几何推导（二重积分版）
+
+**定理**：设 $T:(u,v)\mapsto (x(u,v), y(u,v))$ 是 $D'$ 到 $D$ 的一一映射，$x, y$ 有连续偏导，$f$ 在 $D$ 上可积，则
+$$\iint_D f(x,y)\,dx\,dy = \iint_{D'} f(x(u,v),y(u,v))\,|J(u,v)|\,du\,dv,$$
+其中 $J = \dfrac{\partial(x,y)}{\partial(u,v)}$ 是 Jacobi 行列式。
+
+**不跳步几何推导**：
+
+**第一步**（小矩形像的形状）：在 $uv$ 平面取小矩形 $\Delta R = [u_0, u_0+\Delta u]\times[v_0, v_0+\Delta v]$。其顶点经 $T$ 映射到 $xy$ 平面的四点。**关键观察**：当 $\Delta u, \Delta v$ 很小时，像近似为**小平行四边形**。
+
+**第二步**（用 Taylor 展开求像的顶点）：以 $P_0 = (x(u_0,v_0), y(u_0,v_0))$ 为基点，
+- $T(u_0+\Delta u, v_0) - P_0 \approx (x_u, y_u)\,\Delta u$，
+- $T(u_0, v_0+\Delta v) - P_0 \approx (x_v, y_v)\,\Delta v$。
+
+故像近似平行四边形由两个向量
+$$\vec{a} = (x_u\Delta u, y_u\Delta u),\quad \vec{b} = (x_v\Delta v, y_v\Delta v)$$
+张成。
+
+**第三步**（求平行四边形面积——叉积公式）：二维平面两向量 $\vec{a}, \vec{b}$ 张成的平行四边形面积为
+$$\text{Area} = |a_1 b_2 - a_2 b_1| = |x_u\Delta u\cdot y_v\Delta v - y_u\Delta u\cdot x_v\Delta v| = |x_u y_v - x_v y_u|\,\Delta u\Delta v.$$
+
+**第四步**（识别为 Jacobi 行列式）：
+$$x_u y_v - x_v y_u = \det\begin{pmatrix} x_u & x_v \\ y_u & y_v\end{pmatrix} = J.$$
+
+故像的面积 $\approx |J|\,\Delta u\Delta v$。
+
+**第五步**（面积元的对应）：$dx\,dy = |J|\,du\,dv$，这就是**面积元变换公式**。
+
+**第六步**（Riemann 和上代换）：把 $D$ 上的 Riemann 和按 $T$ 的逆映射改写——每个像小块面积 $\approx |J|\,\Delta u\Delta v$，被积函数值 $f(T(u,v))$ 不变：
+$$\iint_D f\,dx\,dy = \lim\sum f(P_i)\Delta\sigma_i = \lim\sum f(T(u_i,v_i))\,|J(u_i,v_i)|\Delta u_i\Delta v_i = \iint_{D'} f\circ T\cdot |J|\,du\,dv.\quad\square$$
+
+> **为什么需要绝对值** $|J|$ ？$J$ 的符号反映**定向**：$J>0$ 时 $T$ 保持定向，$J<0$ 时反转。但面积非负，故取绝对值。
+
+---
+
+#### 规则 6：极坐标 Jacobi $J = r$ 的不跳步推导
+
+**变换**：$x = r\cos\theta, y = r\sin\theta$。
+
+**第一步**（写出偏导）：
+$$x_r = \cos\theta,\quad x_\theta = -r\sin\theta,\quad y_r = \sin\theta,\quad y_\theta = r\cos\theta.$$
+
+**第二步**（行列式）：
+$$J = \det\begin{pmatrix}\cos\theta & -r\sin\theta\\ \sin\theta & r\cos\theta\end{pmatrix} = \cos\theta\cdot r\cos\theta - (-r\sin\theta)\cdot\sin\theta = r(\cos^2\theta + \sin^2\theta) = r.$$
+
+**第三步**（几何直观）：极坐标下小面积元由 $dr$ 与 $r\,d\theta$（圆弧长）围成的小矩形，面积 $= dr\cdot r\,d\theta = r\,dr\,d\theta$。两种方法殊途同归。
+
+#### 几何法直接推 $dA = r\,dr\,d\theta$（避开 Jacobi 行列式）
+
+在 $(r,\theta)$ 平面取小矩形 $[r, r+\Delta r]\times[\theta, \theta+\Delta\theta]$。它在 $xy$ 平面的像是**环扇形**：
+
+**外环扇形面积** $= \frac{1}{2}(r+\Delta r)^2\Delta\theta$，**内环扇形面积** $= \frac{1}{2}r^2\Delta\theta$。
+
+环扇形面积 $= \frac{1}{2}[(r+\Delta r)^2 - r^2]\Delta\theta = \frac{1}{2}(2r\Delta r + (\Delta r)^2)\Delta\theta = r\Delta r\Delta\theta + \frac{(\Delta r)^2}{2}\Delta\theta$。
+
+当 $\Delta r, \Delta\theta\to 0$，主项为 $r\Delta r\Delta\theta$，高阶项 $(\Delta r)^2\Delta\theta$ 可略。故 $dA = r\,dr\,d\theta$。$\square$
+
+---
+
+#### 规则 7：柱坐标 Jacobi $J = r$ 的推导
+
+**变换**：$x = r\cos\theta, y = r\sin\theta, z = z$。
+
+**第一步**：写出 $3\times 3$ Jacobi 矩阵
+$$\begin{pmatrix} \cos\theta & -r\sin\theta & 0\\ \sin\theta & r\cos\theta & 0\\ 0 & 0 & 1\end{pmatrix}.$$
+
+**第二步**（按第三列展开）：第三列除 $(3,3)=1$ 外全为 $0$，按列展开
+$$J = 1\cdot\det\begin{pmatrix}\cos\theta & -r\sin\theta\\ \sin\theta & r\cos\theta\end{pmatrix} = r.\quad\square$$
+
+**直觉**：柱坐标 = 极坐标 + $z$ 方向不变，故体积元 $dV = (r\,dr\,d\theta)\cdot dz = r\,dr\,d\theta\,dz$。
+
+---
+
+#### 规则 8：球坐标 Jacobi $J = \rho^2\sin\varphi$ 的不跳步推导
+
+**变换**：$x = \rho\sin\varphi\cos\theta, y = \rho\sin\varphi\sin\theta, z = \rho\cos\varphi$。
+
+**第一步**（求 $9$ 个偏导）：
+$$\begin{aligned}
+x_\rho &= \sin\varphi\cos\theta, & x_\varphi &= \rho\cos\varphi\cos\theta, & x_\theta &= -\rho\sin\varphi\sin\theta,\\
+y_\rho &= \sin\varphi\sin\theta, & y_\varphi &= \rho\cos\varphi\sin\theta, & y_\theta &= \rho\sin\varphi\cos\theta,\\
+z_\rho &= \cos\varphi, & z_\varphi &= -\rho\sin\varphi, & z_\theta &= 0.
+\end{aligned}$$
+
+**第二步**（写 Jacobi 矩阵 $J$）：
+$$J = \det\begin{pmatrix}
+\sin\varphi\cos\theta & \rho\cos\varphi\cos\theta & -\rho\sin\varphi\sin\theta\\
+\sin\varphi\sin\theta & \rho\cos\varphi\sin\theta & \rho\sin\varphi\cos\theta\\
+\cos\varphi & -\rho\sin\varphi & 0
+\end{pmatrix}.$$
+
+**第三步**（沿第三行展开）：第三行 $(\cos\varphi, -\rho\sin\varphi, 0)$。
+$$J = \cos\varphi\cdot M_{31} - (-\rho\sin\varphi)\cdot M_{32} + 0\cdot M_{33},$$
+其中 $M_{3k}$ 是去掉第 $3$ 行第 $k$ 列后的 $2\times 2$ 子式。
+
+**第四步**（计算 $M_{31}$）：
+$$M_{31} = \det\begin{pmatrix}\rho\cos\varphi\cos\theta & -\rho\sin\varphi\sin\theta\\ \rho\cos\varphi\sin\theta & \rho\sin\varphi\cos\theta\end{pmatrix} = \rho^2\sin\varphi\cos\varphi(\cos^2\theta + \sin^2\theta) = \rho^2\sin\varphi\cos\varphi.$$
+
+**第五步**（计算 $M_{32}$）：
+$$M_{32} = \det\begin{pmatrix}\sin\varphi\cos\theta & -\rho\sin\varphi\sin\theta\\ \sin\varphi\sin\theta & \rho\sin\varphi\cos\theta\end{pmatrix} = \rho\sin^2\varphi(\cos^2\theta + \sin^2\theta) = \rho\sin^2\varphi.$$
+
+**第六步**（合并）：
+$$J = \cos\varphi\cdot \rho^2\sin\varphi\cos\varphi + \rho\sin\varphi\cdot \rho\sin^2\varphi = \rho^2\sin\varphi\cos^2\varphi + \rho^2\sin^3\varphi.$$
+
+**第七步**（用 $\cos^2\varphi + \sin^2\varphi = 1$ 提取）：
+$$J = \rho^2\sin\varphi(\cos^2\varphi + \sin^2\varphi) = \rho^2\sin\varphi.\quad\square$$
+
+**几何直觉**：球坐标小立方体由三段长度
+- $d\rho$（径向）
+- $\rho\,d\varphi$（极角圆弧）
+- $\rho\sin\varphi\,d\theta$（方位角圆弧，半径为 $\rho\sin\varphi$ 的圆周）
+
+围成，正交相乘 $dV = \rho^2\sin\varphi\,d\rho\,d\varphi\,d\theta$。
+
+> **常见错误**：把球坐标 $\theta$ 的圆弧半径写成 $\rho$ 而不是 $\rho\sin\varphi$——这就丢了 $\sin\varphi$ 因子。**记住**：$\theta$ 是在 $xy$ 投影面上的方位角，所在圆的半径是 $\rho\sin\varphi$（不是 $\rho$）。
+
+---
+
+#### 规则 9：对称性原理的严格推导
+
+**定理（关于 $y$ 轴对称的二重积分）**：设 $D$ 关于 $y$ 轴对称（即 $(x,y)\in D\Leftrightarrow (-x,y)\in D$），$D^+ = \{(x,y)\in D: x\ge 0\}$。则：
+
+- 若 $f(-x,y) = -f(x,y)$（关于 $x$ 奇），$\iint_D f = 0$。
+- 若 $f(-x,y) = f(x,y)$（关于 $x$ 偶），$\iint_D f = 2\iint_{D^+}f$。
+
+**完整推导**：
+
+**第一步**：用区域可加性把 $D$ 拆为 $D^+$ 与 $D^- = \{(x,y)\in D: x\le 0\}$：
+$$\iint_D f = \iint_{D^+} f + \iint_{D^-} f.$$
+
+**第二步**（对 $D^-$ 上作变量替换 $u = -x, v = y$）：因 $D$ 关于 $y$ 轴对称，$(x,y)\in D^- \Leftrightarrow (u,v) = (-x,y)\in D^+$。Jacobi 行列式：
+$$J = \det\begin{pmatrix}\partial x/\partial u & \partial x/\partial v\\ \partial y/\partial u & \partial y/\partial v\end{pmatrix} = \det\begin{pmatrix}-1 & 0\\ 0 & 1\end{pmatrix} = -1.$$
+
+取绝对值 $|J| = 1$。故
+$$\iint_{D^-} f(x,y)\,dx\,dy = \iint_{D^+} f(-u, v)\cdot 1\,du\,dv = \iint_{D^+} f(-x,y)\,dx\,dy.$$
+
+（最后步换回 $x, y$ 哑变量。）
+
+**第三步**：
+- 奇：$f(-x,y) = -f(x,y) \Rightarrow \iint_{D^-} f = -\iint_{D^+}f \Rightarrow \iint_D f = 0$。
+- 偶：$f(-x,y) = f(x,y) \Rightarrow \iint_{D^-} f = \iint_{D^+}f \Rightarrow \iint_D f = 2\iint_{D^+}f$。$\square$
+
+**对称性的高维推广**（三重积分版）：若 $\Omega$ 关于 $xy$ 平面对称且 $f$ 关于 $z$ 为奇 $\Rightarrow \iiint_\Omega f\,dv = 0$。证法完全类似（用 $(x,y,z)\mapsto(x,y,-z)$ 的换元）。
+
+#### 轮换对称性
+
+若 $\Omega$ 在 $x\leftrightarrow y\leftrightarrow z$ 置换下不变（如球、立方体），则
+$$\iiint_\Omega x^2\,dv = \iiint_\Omega y^2\,dv = \iiint_\Omega z^2\,dv = \frac{1}{3}\iiint_\Omega(x^2+y^2+z^2)\,dv.$$
+
+**推导**：用变量替换 $(x,y,z)\to(y,x,z)$（Jacobi 绝对值 = 1）。$\square$
+
+> **威力**：求 $\iiint_{x^2+y^2+z^2\le R^2} x^2\,dv$。直接算需积分 $r^2\sin^2\varphi\cos^2\theta$；用轮换对称得 $\dfrac{1}{3}\iiint(x^2+y^2+z^2)dv = \dfrac{1}{3}\int_0^{2\pi}\int_0^\pi\int_0^R\rho^2\cdot \rho^2\sin\varphi\,d\rho\,d\varphi\,d\theta = \dfrac{4\pi R^5}{15}$。
+
+---
+
+#### 规则 10：高维换元（一般 $n$ 重积分）
+
+设 $T:U'\to U$ 是 $\mathbb{R}^n$ 中开集的可微一一映射，$|J| = |\det DT|\neq 0$，$f$ 可积，则
+
+$$\int\cdots\int_U f(\mathbf{x})\,d\mathbf{x} = \int\cdots\int_{U'} f(T(\mathbf{u}))\,|J(\mathbf{u})|\,d\mathbf{u}.$$
+
+**推导思路**（要点）：仿照二维几何推导——用 $T$ 的局部线性化 $DT(\mathbf{u}_0)$ 把小盒映为小平行多面体，其体积为 $|\det DT|\cdot$（原盒体积）。这是**线性变换的体积缩放因子 = 行列式绝对值**这一线性代数事实在微分几何上的应用。
+
+> **应用提示**：维数 $n\ge 4$ 时几乎只出现在概率论 / 物理学的多维高斯积分；标准技巧仍是球面坐标的高维推广 + Jacobi 行列式。
+
+---
+
+#### 19.4.3 末：重积分计算的决策树
+
+```
+拿到 ∫∫f(x,y)dσ（或三重）
+   ↓
+第 0 步：被积函数有对称性吗？
+   关于坐标轴/平面有奇偶 → 直接 0 或折半（规则 9）
+   轮换对称 → 平均化（轮换规则）
+   ↓
+第 1 步：区域形状如何？
+   矩形/X型/Y型      → 直接 Fubini，直角坐标累次积分（规则 4）
+   圆/扇形/含 x²+y²   → 极坐标（规则 6）
+   柱形/含 x²+y² + z无关 → 柱坐标（规则 7）
+   球/含 x²+y²+z²     → 球坐标（规则 8）
+   斜形/被积变量耦合 → 一般换元（规则 5），找合适 (u,v)
+   ↓
+第 2 步：积分次序难算？
+   遇 e^{x²}, sin(x²) 等内层不可初等积分
+   → 交换积分次序（用 Fubini 双向）
+   ↓
+第 3 步：复杂时拆区域（规则 2）→ 分段计算
+   ↓
+第 4 步：实在算不出 → 数值积分 / Monte Carlo（见 19.7）
+```
+
 ---
 
 ## 19.5 利用对称性简化计算

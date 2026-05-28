@@ -219,6 +219,8 @@ $$\int_L y\,dx + x\,dy = \int_0^1 [x + x]\,dx = \int_0^1 2x\,dx = x^2\Big|_0^1 =
 
 **观察**：例题 20.3 和 20.4 中，沿不同路径但积分值相同，这与路径无关性有关（见 20.4 节）。
 
+![第一类（方向无关）vs 第二类（方向相关）曲线积分对比](../figures/svg/calc-p6-20-3.svg)
+
 ### 20.2.4 两类曲线积分的关系
 
 设有向曲线 $L$ 在点 $(x, y)$ 处的单位切向量为 $\mathbf{T} = (\cos\alpha, \cos\beta)$，则
@@ -234,6 +236,8 @@ $$\int_L P\,dx + Q\,dy = \int_L (P\cos\alpha + Q\cos\beta)\,ds$$
 ---
 
 ## 20.3 Green 公式
+
+![Green 公式几何示意：边界环量 = 内部"旋度"积分](../figures/svg/calc-p6-20-4.svg)
 
 ### 20.3.1 公式陈述
 
@@ -310,6 +314,8 @@ $$S = \frac{1}{2}\oint_L x\,dy - y\,dx = \frac{1}{2}\int_0^{2\pi} [a\cos t \cdot
 
 $$= \frac{1}{2}\int_0^{2\pi} ab(\cos^2 t + \sin^2 t)\,dt = \frac{ab}{2}\int_0^{2\pi} 1\,dt = \pi ab$$
 
+![挖洞法：环路积分依赖被绕奇点（留数定理雏形）](../figures/svg/calc-p6-20-5.svg)
+
 ### 20.3.5 多连通区域的 Green 公式
 
 前面讨论的 Green 公式适用于单连通区域（无"洞"的区域）。对于**多连通区域**（有一个或多个洞的区域），需要将公式作适当推广。
@@ -382,6 +388,292 @@ $$\oint_C \frac{-y\,dx + x\,dy}{x^2+y^2} = 2\pi$$
 
 ---
 
+### 20.3.6 曲线积分运算规则体系（完整推导）
+
+本章已介绍了第一类、第二类曲线积分的定义、参数化计算法、Green 公式等。本节系统、不跳步地补全所有运算规则的推导，包括两类积分之间的转换、参数化公式的来源、Green 公式的完整两步证明、与方向相关的化简等。
+
+#### 全景导览
+
+```
+第 0 层：Riemann 和 + 极限
+   ↓
+第 1 层（基本性质）：线性 / 路径可加 / 方向（仅第二类）
+   ↓
+第 2 层（化为一元定积分）：参数化公式
+   - 第一类：ds = √(x'² + y'²) dt
+   - 第二类：dx = x'(t)dt, dy = y'(t)dt
+   ↓
+第 3 层（两类关系）：第二类 = ∫(P cosα + Q cosβ) ds
+   ↓
+第 4 层（区域-边界对偶）：Green 公式（连接二重积分与第二类曲线积分）
+   ↓
+第 5 层（路径无关）：保守场、势函数、全微分
+```
+
+下面逐条不跳步推导。
+
+---
+
+#### 规则 1：第一类曲线积分的参数化公式（不跳步推导）
+
+**定理**：设光滑曲线 $L$ 的参数方程为 $x = x(t), y = y(t)$，$t\in[\alpha,\beta]$，$f$ 在 $L$ 上连续，则
+
+$$\int_L f(x,y)\,ds = \int_\alpha^\beta f(x(t),y(t))\sqrt{[x'(t)]^2 + [y'(t)]^2}\,dt.$$
+
+**完整推导**：
+
+**第一步**（分割对应）：取 $[\alpha,\beta]$ 的分割 $\alpha = t_0 < t_1 < \cdots < t_n = \beta$。每段 $[t_{i-1}, t_i]$ 对应曲线上一段弧 $\Delta s_i$。
+
+**第二步**（弧长微元的来源）：从 $t_{i-1}$ 到 $t_i$ 一段弧的长度为
+$$\Delta s_i = \int_{t_{i-1}}^{t_i}\sqrt{[x'(t)]^2 + [y'(t)]^2}\,dt.$$
+
+由积分中值定理，存在 $\tau_i\in[t_{i-1}, t_i]$ 使
+$$\Delta s_i = \sqrt{[x'(\tau_i)]^2 + [y'(\tau_i)]^2}\cdot \Delta t_i.$$
+
+**第三步**（样本点选取）：在第 $i$ 段弧上取样本点 $(\xi_i, \eta_i) = (x(\tau_i), y(\tau_i))$。
+
+**第四步**（Riemann 和改写）：
+$$\sum_i f(\xi_i,\eta_i)\Delta s_i = \sum_i f(x(\tau_i), y(\tau_i))\sqrt{[x'(\tau_i)]^2 + [y'(\tau_i)]^2}\,\Delta t_i.$$
+
+**第五步**（识别为一元 Riemann 和并取极限）：右端正是函数
+$$g(t) := f(x(t), y(t))\sqrt{[x'(t)]^2 + [y'(t)]^2}$$
+在 $[\alpha,\beta]$ 上的一元 Riemann 和。$f, x', y'$ 连续 $\Rightarrow g$ 连续 $\Rightarrow$ 可积。取 $\max\Delta t_i\to 0$：
+$$\int_L f\,ds = \int_\alpha^\beta g(t)\,dt.\quad\square$$
+
+#### 弧长微元 $ds = \sqrt{x'^2 + y'^2}\,dt$ 的几何起源
+
+考察两点 $(x(t), y(t))$ 与 $(x(t+dt), y(t+dt))$ 之间的"直线距离"（一阶近似为弧长）：
+
+$$ds^2 \approx (dx)^2 + (dy)^2 = [x'(t)\,dt]^2 + [y'(t)\,dt]^2 = ([x']^2 + [y']^2)\,dt^2.$$
+
+开方得 $ds = \sqrt{[x']^2 + [y']^2}\,dt$。这正是 Pythagoras 定理在微分意义下的应用。
+
+---
+
+#### 规则 2：第一类曲线积分与方向无关的严格证明
+
+**定理**：设 $L$ 为一条光滑曲线，$L^-$ 为 $L$ 的反向。则
+$$\int_{L^-} f\,ds = \int_L f\,ds.$$
+
+**推导**：
+
+**第一步**：设 $L$ 用 $t\in[\alpha,\beta]$ 参数化为 $(x(t), y(t))$。
+
+**第二步**：$L^-$ 可用 $s = \alpha + \beta - t$ 反向参数化为 $(x(\alpha+\beta-s), y(\alpha+\beta-s))$，$s\in[\alpha,\beta]$。
+
+**第三步**（计算反向弧长微元）：记 $\tilde x(s) = x(\alpha+\beta-s)$，链式法则 $\tilde x'(s) = -x'(\alpha+\beta-s)$，同理 $\tilde y'(s) = -y'(\alpha+\beta-s)$。故
+$$\sqrt{\tilde x'^2 + \tilde y'^2} = \sqrt{x'^2 + y'^2}\quad(\text{平方消去负号}).$$
+
+**第四步**（积分换元 $u = \alpha+\beta-s$）：
+$$\int_{L^-}f\,ds = \int_\alpha^\beta f(\tilde x(s),\tilde y(s))\sqrt{\tilde x'^2 + \tilde y'^2}\,ds = \int_\alpha^\beta f(x(u),y(u))\sqrt{x'^2 + y'^2}\,du = \int_L f\,ds.\quad\square$$
+
+**关键**：弧长微元 $\sqrt{x'^2+y'^2}$ **取平方根**——所以反向时的负号被消去；这是第一类积分"与方向无关"的根本原因。
+
+---
+
+#### 规则 3：第二类曲线积分的参数化公式
+
+**定理**：设有向光滑曲线 $L$ 的参数方程为 $x = x(t), y = y(t)$，$t$ 从 $\alpha$ 单调变到 $\beta$（按 $L$ 的方向），$P, Q$ 在 $L$ 上连续，则
+$$\int_L P\,dx + Q\,dy = \int_\alpha^\beta [P(x(t),y(t))\,x'(t) + Q(x(t),y(t))\,y'(t)]\,dt.$$
+
+**不跳步推导**：
+
+**第一步**（拆分）：分别对 $\int_L P\,dx$ 和 $\int_L Q\,dy$ 处理，再相加。
+
+**第二步**（$\int_L P\,dx$ 的 Riemann 和）：取 $[\alpha,\beta]$ 分割 $\{t_i\}$，相应曲线上分段。第 $i$ 段在 $x$ 轴上投影为
+$$\Delta x_i = x(t_i) - x(t_{i-1}).$$
+
+由中值定理（$x(t)$ 可导），存在 $\tau_i\in[t_{i-1}, t_i]$ 使
+$$\Delta x_i = x'(\tau_i)\,\Delta t_i.$$
+
+**第三步**（取样本点 $(\xi_i,\eta_i) = (x(\tau_i), y(\tau_i))$）：
+$$\sum_i P(\xi_i,\eta_i)\Delta x_i = \sum_i P(x(\tau_i),y(\tau_i))\,x'(\tau_i)\,\Delta t_i.$$
+
+**第四步**（识别一元 Riemann 和 + 取极限）：右端是函数 $t\mapsto P(x(t),y(t))\,x'(t)$ 在 $[\alpha,\beta]$ 的 Riemann 和。连续可积，故
+$$\int_L P\,dx = \int_\alpha^\beta P(x(t),y(t))\,x'(t)\,dt.$$
+
+同理 $\int_L Q\,dy = \int_\alpha^\beta Q\,y'(t)\,dt$。相加即得公式。$\square$
+
+**与方向的关系**：若 $L$ 反向，则 $t$ 从 $\beta$ 变到 $\alpha$。由定积分定义 $\int_\beta^\alpha = -\int_\alpha^\beta$，故 $\int_{L^-}P\,dx = -\int_L P\,dx$——这就是**第二类积分与方向相关**的根本原因。
+
+> **第一类 vs 第二类的根本差别**：弧长微元 $ds = \sqrt{x'^2+y'^2}\,dt$ 始终非负（开平方），故方向无关；坐标微元 $dx = x'(t)\,dt$ 带符号（$x'$ 的符号即方向），故方向相关。
+
+---
+
+#### 规则 4：两类曲线积分的转换公式
+
+**定理**：设 $L$ 为有向光滑曲线，单位切向量为 $\mathbf{T} = (\cos\alpha, \cos\beta)$（沿 $L$ 方向）。则
+$$\int_L P\,dx + Q\,dy = \int_L (P\cos\alpha + Q\cos\beta)\,ds.$$
+
+**完整推导**：
+
+**第一步**（参数化下表示切向量）：在 $t$ 处切向量为 $(x'(t), y'(t))$，其模长 $\sqrt{x'^2+y'^2}$。故**单位切向量**：
+$$\mathbf{T} = \left(\frac{x'(t)}{\sqrt{x'^2+y'^2}},\,\frac{y'(t)}{\sqrt{x'^2+y'^2}}\right) = (\cos\alpha, \cos\beta).$$
+
+**第二步**（导出 $dx, dy$ 与 $ds$ 的关系）：$ds = \sqrt{x'^2+y'^2}\,dt$，故
+$$dx = x'(t)\,dt = \cos\alpha\cdot \sqrt{x'^2+y'^2}\,dt = \cos\alpha\,ds.$$
+同理 $dy = \cos\beta\,ds$。
+
+**第三步**（直接代入）：
+$$\int_L P\,dx + Q\,dy = \int_L P\cos\alpha\,ds + Q\cos\beta\,ds = \int_L(P\cos\alpha + Q\cos\beta)\,ds.\quad\square$$
+
+> **应用**：转换为第一类积分后，可用第一类积分的对称性化简（例如周期性、轮换性）。
+
+---
+
+#### 规则 5：Green 公式的完整两步证明
+
+**定理**：设 $D$ 是由分段光滑闭曲线 $L$（正向）围成的有界闭区域，$P, Q\in C^1$ 在 $D\cup L$ 上，则
+$$\oint_L P\,dx + Q\,dy = \iint_D\left(\frac{\partial Q}{\partial x} - \frac{\partial P}{\partial y}\right)dx\,dy.$$
+
+**不跳步证明**（X-型 + Y-型简单区域）：
+
+##### A 部分：证明 $\displaystyle\iint_D\frac{\partial P}{\partial y}\,dx\,dy = -\oint_L P\,dx$
+
+**第一步**（设 X-型区域）：$D = \{(x,y): a\le x\le b, \varphi_1(x)\le y\le\varphi_2(x)\}$。
+
+**第二步**（Fubini 化为累次积分）：
+$$\iint_D\frac{\partial P}{\partial y}\,dx\,dy = \int_a^b\left[\int_{\varphi_1(x)}^{\varphi_2(x)}\frac{\partial P}{\partial y}\,dy\right]dx.$$
+
+**第三步**（内层用 N-L 公式）：$\dfrac{\partial P}{\partial y}$ 对 $y$ 的原函数即 $P$ 本身：
+$$\int_{\varphi_1(x)}^{\varphi_2(x)}\frac{\partial P}{\partial y}\,dy = P(x,\varphi_2(x)) - P(x,\varphi_1(x)).$$
+
+**第四步**（代回）：
+$$\iint_D\frac{\partial P}{\partial y}\,dx\,dy = \int_a^b P(x,\varphi_2(x))\,dx - \int_a^b P(x,\varphi_1(x))\,dx.\quad(\star)$$
+
+**第五步**（计算 $\oint_L P\,dx$）：边界 $L$ 由四段构成（正向 = 逆时针）：
+- $L_1$：下边界 $y=\varphi_1(x)$，$x: a\to b$；
+- $L_2$：右垂直边界 $x = b$，$y$ 变化（但 $dx = 0$，对 $\int P\,dx$ 无贡献）；
+- $L_3$：上边界 $y=\varphi_2(x)$，$x: b\to a$（注意方向反！）；
+- $L_4$：左垂直边界 $x = a$，$dx = 0$，无贡献。
+
+故
+$$\oint_L P\,dx = \int_a^b P(x,\varphi_1(x))\,dx + \int_b^a P(x,\varphi_2(x))\,dx = \int_a^b P(x,\varphi_1(x))\,dx - \int_a^b P(x,\varphi_2(x))\,dx.$$
+
+**第六步**（与 ($\star$) 对比）：
+$$\oint_L P\,dx = -\iint_D \frac{\partial P}{\partial y}\,dx\,dy.\quad\square_A$$
+
+##### B 部分：证明 $\displaystyle\iint_D\frac{\partial Q}{\partial x}\,dx\,dy = \oint_L Q\,dy$
+
+**第一步**（设 Y-型区域）：$D = \{(x,y): c\le y\le d, \psi_1(y)\le x\le\psi_2(y)\}$。
+
+**第二步**（Fubini）：
+$$\iint_D\frac{\partial Q}{\partial x}\,dx\,dy = \int_c^d\left[\int_{\psi_1(y)}^{\psi_2(y)}\frac{\partial Q}{\partial x}\,dx\right]dy = \int_c^d[Q(\psi_2(y),y) - Q(\psi_1(y),y)]\,dy.$$
+
+**第三步**（边界曲线积分）：边界包含左右两段（$dy$ 非零部分）：
+- 右边界 $x=\psi_2(y)$，$y: c\to d$（正向上行）；
+- 左边界 $x=\psi_1(y)$，$y: d\to c$（正向下行）。
+
+$$\oint_L Q\,dy = \int_c^d Q(\psi_2(y),y)\,dy + \int_d^c Q(\psi_1(y),y)\,dy = \int_c^d[Q(\psi_2(y),y) - Q(\psi_1(y),y)]\,dy.$$
+
+**第四步**（对比）：
+$$\oint_L Q\,dy = \iint_D\frac{\partial Q}{\partial x}\,dx\,dy.\quad\square_B$$
+
+##### 合并 A + B
+
+$$\oint_L P\,dx + Q\,dy = -\iint_D\frac{\partial P}{\partial y}\,dx\,dy + \iint_D\frac{\partial Q}{\partial x}\,dx\,dy = \iint_D\left(\frac{\partial Q}{\partial x} - \frac{\partial P}{\partial y}\right)dx\,dy.\quad\square$$
+
+#### 推广：一般区域
+
+对既非 X-型又非 Y-型的复杂区域，用**区域可加性**——将 $D$ 拆为若干同时是 X-型与 Y-型的简单子区域，分别应用 Green 公式。子区域间的公共边界被经过两次（方向相反），积分相互抵消，最终只剩外边界的贡献。$\square$
+
+---
+
+#### 规则 6：Green 公式的"挖洞"推广（多连通区域）
+
+**问题**：$P, Q$ 在 $D$ 内某些点（"奇点"）不满足 $C^1$ 条件，Green 公式不能直接用。
+
+**挖洞法的不跳步推导**：
+
+**第一步**（构造环形区域）：设奇点 $z_0$ 在 $C$ 内部。以 $z_0$ 为圆心作小圆 $l$（半径 $\varepsilon$），使 $l$ 完全包含于 $C$ 内部。环形区域 $D = C$ 内部 $\setminus l$ 内部。
+
+**第二步**（应用 Green 于环形 $D$）：环形边界由外 $C$（正向逆时针）+ 内 $l$（正向**顺时针**，使 $D$ 在左侧）组成。$P, Q$ 在 $D$（不含奇点）上 $C^1$：
+$$\iint_D\left(\frac{\partial Q}{\partial x} - \frac{\partial P}{\partial y}\right)dx\,dy = \oint_C P\,dx + Q\,dy + \oint_{l^-} P\,dx + Q\,dy.$$
+
+**第三步**（特殊情形 $Q_x - P_y\equiv 0$）：环形上二重积分为 $0$：
+$$0 = \oint_C P\,dx + Q\,dy - \oint_l P\,dx + Q\,dy,$$
+
+故 $\oint_C = \oint_l$。
+
+**结论**：**当 $Q_x = P_y$ 在奇点外处处成立时，环路积分值只依赖于"被绕进的奇点数"**——这正是辐角函数 $\arctan(y/x)$ 沿绕原点闭路增加 $2\pi$ 的根本原因，也是复分析中**留数定理**的雏形。
+
+---
+
+#### 规则 7：路径无关的四等价条件——完整推导
+
+**定理**：设 $D$ 单连通，$P, Q\in C^1(D)$。下列四条件等价：
+
+1. $\int_L P\,dx + Q\,dy$ 路径无关。
+2. 任意闭曲线 $C\subset D$ 上 $\oint_C = 0$。
+3. $\dfrac{\partial Q}{\partial x} = \dfrac{\partial P}{\partial y}$ 在 $D$ 上处处成立。
+4. 存在 $u\in C^2(D)$ 使 $du = P\,dx + Q\,dy$。
+
+**循环证明**（$(1)\Rightarrow(2)\Rightarrow(3)\Rightarrow(4)\Rightarrow(1)$）：
+
+**(1) ⇒ (2)**：取闭曲线 $C$ 上两点 $A, B$，将 $C$ 看作 $A\to B$ 两条不同路径 $L_1, L_2$ 的合并（$L_2$ 反向）：$\oint_C = \int_{L_1} - \int_{L_2} = 0$（路径无关）。$\square$
+
+**(2) ⇒ (3)**：反证。若某点 $P_0$ 处 $Q_x - P_y \neq 0$（不妨设 $> 0$），由连续性，存在 $P_0$ 的小邻域 $U$ 上 $Q_x - P_y > 0$。取 $\partial U$ 为正向闭曲线：
+$$\oint_{\partial U} P\,dx + Q\,dy = \iint_U(Q_x - P_y)\,dx\,dy > 0,$$
+与 (2) 矛盾。$\square$
+
+**(3) ⇒ (4)**：构造势函数。固定 $(x_0,y_0)\in D$，对任意 $(x,y)\in D$，定义
+$$u(x,y) := \int_{(x_0,y_0)}^{(x,y)}P\,dx + Q\,dy,$$
+积分沿**任意路径**（这里我们要证明路径无关，但暂时取一条折线路径 → 沿 $x$ 方向到 $(x,y_0)$，再沿 $y$ 方向到 $(x,y)$）：
+$$u(x,y) = \int_{x_0}^x P(s,y_0)\,ds + \int_{y_0}^y Q(x,s)\,ds.$$
+
+**求偏导**：
+- 对 $y$：第一项不依赖 $y$，导数为 $0$；第二项用变上限积分求导，得 $Q(x,y)$。故 $\dfrac{\partial u}{\partial y} = Q$。✓
+- 对 $x$：用 (3) 与 Leibniz 法则；第一项导数 $P(x,y_0)$，第二项 $\int_{y_0}^y \dfrac{\partial Q}{\partial x}\,ds = \int_{y_0}^y \dfrac{\partial P}{\partial y}\,ds = P(x,y) - P(x,y_0)$。合计 $P(x,y_0) + P(x,y) - P(x,y_0) = P(x,y)$。✓
+
+故 $du = P\,dx + Q\,dy$。$\square$
+
+**(4) ⇒ (1)**：若 $du = P\,dx + Q\,dy$，则
+$$\int_L P\,dx + Q\,dy = \int_L du = u(B) - u(A),$$
+仅依赖端点。$\square$
+
+> **本节核心洞察**：**在单连通区域上，$Q_x = P_y$ 是势函数存在的充要条件**——这正是物理中"保守力⇔有势函数"的数学根据；在场论里被推广为 Poincaré 引理。
+
+---
+
+#### 规则 8：势函数求法的两种等价路线
+
+(a) **折线法**：$u(x,y) = \int_{x_0}^x P(s,y_0)\,ds + \int_{y_0}^y Q(x,s)\,ds$（推导见 (3)⇒(4)）。
+
+(b) **不定积分法**（与折线法等价）：
+
+**第一步**：由 $u_x = P$，对 $x$ 不定积分得 $u(x,y) = \int P(x,y)\,dx + \varphi(y)$，$\varphi$ 待定。
+
+**第二步**：对 $y$ 求偏导：$u_y = \int P_y\,dx + \varphi'(y) = Q$。由 (3) 知 $P_y = Q_x$，故 $\int P_y\,dx = \int Q_x\,dx + C(y)$。
+
+**第三步**：解出 $\varphi'(y)$，再积分得 $\varphi(y)$。$\square$
+
+**两路线等价性**：折线法对应"先在 $x$ 方向积满 $P$，再在 $y$ 方向积 $Q$"；不定积分法以同样的累积顺序整理代数表达式。
+
+---
+
+#### 20.3.6 末：曲线积分计算的决策树
+
+```
+看到 ∫_L 形式
+   ↓
+是 ∫_L f ds（弧长型）还是 ∫_L Pdx+Qdy（坐标型）?
+   ↓
+==【第一类】================
+   • 参数化 → ds = √(x'² + y'²) dt → 一元定积分
+   • 方向无关 → 可任意选参数化方向
+   • 周期/对称 → 用第一类的对称性化简
+==【第二类】================
+   • 闭曲线 + P, Q 平面有 C¹ → Green 公式
+       Q_x - P_y = 0 → 直接 0（路径无关）
+       否则 → 化为二重积分
+   • 非闭路径 + Q_x = P_y → 求势函数 u → u(B) - u(A)
+   • 非闭路径 + 一般 → 参数化 + 一元积分
+   • 闭曲线 + 内部含奇点 → 挖洞法（绕奇点小圆替代）
+   • 形式有对称结构 → 转为第一类（cosα ds, cosβ ds）再化简
+```
+
+---
+
 ## 20.4 路径无关与保守场
 
 ### 20.4.1 路径无关的概念
@@ -405,6 +697,8 @@ $$\oint_C \frac{-y\,dx + x\,dy}{x^2+y^2} = 2\pi$$
 - $(1) \Leftrightarrow (2)$：由定义直接可得
 - $(2) \Leftrightarrow (3)$：由 Green 公式
 - $(3) \Leftrightarrow (4)$：$du = P\,dx + Q\,dy$ 意味着 $\dfrac{\partial u}{\partial x} = P$，$\dfrac{\partial u}{\partial y} = Q$，故 $\dfrac{\partial P}{\partial y} = \dfrac{\partial^2 u}{\partial y\partial x} = \dfrac{\partial^2 u}{\partial x\partial y} = \dfrac{\partial Q}{\partial x}$
+
+![保守场势函数 $u=xy$ 的等高线：三条路径从 A 到 B 给出相同积分值](../figures/svg/calc-p6-20-6.svg)
 
 ### 20.4.3 势函数
 

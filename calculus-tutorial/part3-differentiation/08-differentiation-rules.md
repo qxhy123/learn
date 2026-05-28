@@ -49,7 +49,30 @@
 
 ---
 
-## 8.1 导数的四则运算
+## 8.0 求导法则全景导览
+
+求导法则可分为 **5 大类**，按依赖层级排列：
+
+```
+第 0 层（基础）：导数定义 f'(x) = lim_{h→0} (f(x+h)-f(x))/h
+   ↓
+第 1 层（线性）：和差法则 (f±g)' = f'±g'，数乘 (cf)' = cf'
+   ↓
+第 2 层（双线性）：乘积法则 (fg)' = f'g+fg'
+   ↓                商法则  (f/g)' = (f'g-fg')/g²
+   ↓
+第 3 层（复合）：链式法则 [f(g(x))]' = f'(g(x))·g'(x)
+   ↓
+第 4 层（衍生）：反函数法则、隐函数求导、对数求导、参数式求导
+   ↓
+第 5 层（高阶）：Leibniz 公式 / Faà di Bruno 高阶链式
+```
+
+每条法则都源于**导数定义 + 极限的代数性质 + 连续性**。下面按层级逐条给出**不跳步**的完整推导。
+
+---
+
+## 8.1 导数的四则运算（线性 + 双线性）
 
 ### 8.1.1 和差法则
 
@@ -73,53 +96,89 @@ $$(f_1 \pm f_2 \pm \cdots \pm f_n)' = f_1' \pm f_2' \pm \cdots \pm f_n'$$
 
 $$y' = (x^3)' + (2x^2)' - (5x)' + (1)' = 3x^2 + 4x - 5$$
 
-### 8.1.2 积的法则
+### 8.1.2 积的法则（Leibniz 法则）
 
-**定理**（乘积法则/Leibniz 法则）：若 $f(x)$ 和 $g(x)$ 在点 $x$ 处可导，则 $f(x) \cdot g(x)$ 也在 $x$ 处可导，且
+**定理**（乘积法则 / Leibniz 法则）：若 $f, g$ 在 $x$ 处可导，则 $fg$ 在 $x$ 处可导，且
 
-$$(f \cdot g)'(x) = f'(x) g(x) + f(x) g'(x)$$
+$$(fg)'(x) = f'(x)g(x) + f(x)g'(x).$$
 
-**证明**：
+#### 不跳步的完整推导
 
-$$\begin{aligned}
-(fg)'(x) &= \lim_{h \to 0} \frac{f(x+h)g(x+h) - f(x)g(x)}{h} \\
-&= \lim_{h \to 0} \frac{f(x+h)g(x+h) - f(x)g(x+h) + f(x)g(x+h) - f(x)g(x)}{h} \\
-&= \lim_{h \to 0} \frac{[f(x+h) - f(x)]g(x+h)}{h} + \lim_{h \to 0} \frac{f(x)[g(x+h) - g(x)]}{h} \\
-&= f'(x) \cdot \lim_{h \to 0} g(x+h) + f(x) \cdot g'(x) \\
-&= f'(x) g(x) + f(x) g'(x)
-\end{aligned}$$
+**第一步**（写定义）：
+$$(fg)'(x) = \lim_{h\to 0}\frac{f(x+h)g(x+h) - f(x)g(x)}{h}.$$
 
-其中用到了可导必连续：$\lim_{h \to 0} g(x+h) = g(x)$。 $\square$
+**第二步**（关键代数技巧——"加一减一"）：在分子中加入 $\pm f(x)g(x+h)$：
 
-**推论**：$(cf)' = cf'$，其中 $c$ 是常数。
+$$f(x+h)g(x+h) - f(x)g(x) = \underbrace{[f(x+h)-f(x)]g(x+h)}_{\text{差分 }f \text{ 乘以 }g\text{ 的新值}} + \underbrace{f(x)[g(x+h)-g(x)]}_{f\text{ 的旧值乘以差分 }g}.$$
 
-> **例题 8.2** 求 $y = x^2 e^x$ 的导数。
+> **直觉**：把 $fg$ 的变化拆成"先变 $f$ 后看 $g$"+"$f$ 不变只变 $g$"两部分——正是积分中的"乘积变化分解"。
 
-**解**：设 $f(x) = x^2$，$g(x) = e^x$，则
+**第三步**（除以 $h$ 并分项取极限）：
+$$\frac{f(x+h)g(x+h)-f(x)g(x)}{h} = \frac{f(x+h)-f(x)}{h}\cdot g(x+h) + f(x)\cdot\frac{g(x+h)-g(x)}{h}.$$
 
-$$y' = (x^2)' e^x + x^2 (e^x)' = 2x e^x + x^2 e^x = (x^2 + 2x)e^x$$
+**第四步**（利用可导 → 连续）：因 $g$ 在 $x$ 可导，$g$ 在 $x$ 连续，故 $\lim_{h\to 0}g(x+h) = g(x)$。
 
-**推广**：对于三个函数的乘积，
-
-$$(fgh)' = f'gh + fg'h + fgh'$$
-
-### 8.1.3 商的法则
-
-**定理**（商的法则）：若 $f(x)$ 和 $g(x)$ 在点 $x$ 处可导，且 $g(x) \neq 0$，则 $\dfrac{f(x)}{g(x)}$ 也在 $x$ 处可导，且
-
-$$\left(\frac{f}{g}\right)'(x) = \frac{f'(x)g(x) - f(x)g'(x)}{[g(x)]^2}$$
-
-**证明**：
-
-$$\begin{aligned}
-\left(\frac{f}{g}\right)'(x) &= \lim_{h \to 0} \frac{\frac{f(x+h)}{g(x+h)} - \frac{f(x)}{g(x)}}{h} = \lim_{h \to 0} \frac{f(x+h)g(x) - f(x)g(x+h)}{h \cdot g(x+h)g(x)} \\
-&= \lim_{h \to 0} \frac{[f(x+h) - f(x)]g(x) - f(x)[g(x+h) - g(x)]}{h \cdot g(x+h)g(x)} \\
-&= \frac{f'(x)g(x) - f(x)g'(x)}{[g(x)]^2}
-\end{aligned}$$
+**第五步**（极限的乘积法则）：
+$$\lim_{h\to 0}\frac{f(x+h)-f(x)}{h}\cdot \lim_{h\to 0}g(x+h) + f(x)\cdot \lim_{h\to 0}\frac{g(x+h)-g(x)}{h} = f'(x)g(x) + f(x)g'(x).$$
 
 $\square$
 
-**特例**：$\left(\dfrac{1}{g}\right)' = -\dfrac{g'}{g^2}$
+**推论 1**（数乘）：$(cf)' = cf'$。
+**证明**：在乘积法则中取 $g(x) \equiv c$，则 $g'(x) = 0$。$\square$
+
+**推论 2**（三函数乘积）：$(fgh)' = f'gh + fg'h + fgh'$。
+
+**证明**（视 $fg$ 为一个函数）：
+$$(fgh)' = ((fg)h)' = (fg)'h + (fg)h' = (f'g + fg')h + fgh' = f'gh + fg'h + fgh'.\quad\square$$
+
+**推论 3**（$n$ 函数乘积，归纳）：
+
+$$\left(\prod_{i=1}^n f_i\right)' = \sum_{i=1}^n f_1\cdots f_{i-1}\cdot f_i'\cdot f_{i+1}\cdots f_n.$$
+
+**证明**（数学归纳）：$n=2$ 即乘积法则。设对 $n-1$ 个函数成立，则
+$$\left(\prod_{i=1}^n f_i\right)' = \left(\Big(\prod_{i=1}^{n-1}f_i\Big)\cdot f_n\right)' = \left(\prod_{i=1}^{n-1}f_i\right)'\cdot f_n + \left(\prod_{i=1}^{n-1}f_i\right)\cdot f_n'.$$
+
+把归纳假设代入第一项即得。$\square$
+
+> **例题 8.2** 求 $y = x^2 e^x$ 的导数。
+
+**解**：$y' = (x^2)'e^x + x^2(e^x)' = 2xe^x + x^2 e^x = (x^2+2x)e^x.\quad\square$
+
+> **例题 8.2'** 求 $y = x\sin x\cos x$ 的导数。
+
+**解**（三函数乘积法则）：
+$$y' = \sin x\cos x + x\cos x\cos x + x\sin x(-\sin x) = \sin x\cos x + x(\cos^2 x - \sin^2 x) = \frac{1}{2}\sin 2x + x\cos 2x.\quad\square$$
+
+### 8.1.3 商的法则
+
+**定理**（商法则）：若 $f, g$ 在 $x$ 处可导，且 $g(x)\neq 0$，则 $\dfrac{f}{g}$ 在 $x$ 处可导，且
+
+$$\left(\frac{f}{g}\right)'(x) = \frac{f'(x)g(x) - f(x)g'(x)}{[g(x)]^2}.$$
+
+#### 不跳步的完整推导
+
+**第一步**（写定义）：
+$$\left(\frac{f}{g}\right)'(x) = \lim_{h\to 0}\frac{1}{h}\left[\frac{f(x+h)}{g(x+h)} - \frac{f(x)}{g(x)}\right].$$
+
+**第二步**（通分）：
+$$\frac{f(x+h)}{g(x+h)} - \frac{f(x)}{g(x)} = \frac{f(x+h)g(x) - f(x)g(x+h)}{g(x+h)g(x)}.$$
+
+**第三步**（"加一减一" $\pm f(x)g(x)$，与乘积法则同款技巧）：
+
+$$f(x+h)g(x) - f(x)g(x+h) = [f(x+h) - f(x)]g(x) - f(x)[g(x+h) - g(x)].$$
+
+**第四步**（除 $h$ 并分项）：
+$$\frac{1}{h}\left[\frac{f(x+h)}{g(x+h)} - \frac{f(x)}{g(x)}\right] = \frac{1}{g(x+h)g(x)}\left[\frac{f(x+h)-f(x)}{h}g(x) - f(x)\frac{g(x+h)-g(x)}{h}\right].$$
+
+**第五步**（取极限，用 $g$ 在 $x$ 连续）：当 $h\to 0$，$g(x+h)\to g(x)$，所以 $g(x+h)g(x)\to [g(x)]^2$（由 $g(x)\neq 0$ 保证不为 0），两个差商分别趋于 $f'(x), g'(x)$：
+
+$$\left(\frac{f}{g}\right)'(x) = \frac{f'(x)g(x) - f(x)g'(x)}{[g(x)]^2}.\quad\square$$
+
+**记忆口诀**：分子"**先正后负**"——**导分子**乘分母 减 分子乘**导分母**，再除以**分母平方**。颠倒一定错。
+
+**特例 1**（倒数法则）：$\left(\dfrac{1}{g}\right)' = -\dfrac{g'}{g^2}$。**证明**：取 $f\equiv 1$，$f' = 0$，代入得证。$\square$
+
+**特例 2**（商法则 = 乘积法则 + 倒数法则）：$\dfrac{f}{g} = f\cdot \dfrac{1}{g}$，对 $f\cdot g^{-1}$ 用乘积法则即得商法则——展示**法则之间不是孤立的**。
 
 > **例题 8.3** 求 $y = \tan x$ 的导数。
 
@@ -133,21 +192,58 @@ $$(\tan x)' = \left(\frac{\sin x}{\cos x}\right)' = \frac{(\sin x)' \cos x - \si
 
 ### 8.2.1 复合函数的导数
 
-**定理**（链式法则）：设 $y = f(u)$，$u = g(x)$。若 $g(x)$ 在点 $x$ 可导，$f(u)$ 在点 $u = g(x)$ 可导，则复合函数 $y = f(g(x))$ 在点 $x$ 可导，且
+**定理**（链式法则）：设 $y = f(u)$，$u = g(x)$。若 $g$ 在 $x_0$ 处可导，$f$ 在 $u_0 = g(x_0)$ 处可导，则 $y = f(g(x))$ 在 $x_0$ 处可导，且
 
-$$\frac{dy}{dx} = \frac{dy}{du} \cdot \frac{du}{dx} = f'(g(x)) \cdot g'(x)$$
+$$\boxed{\frac{dy}{dx}\bigg|_{x_0} = f'(g(x_0))\cdot g'(x_0) = \frac{dy}{du}\bigg|_{u_0}\cdot \frac{du}{dx}\bigg|_{x_0}.}$$
 
-**证明**：令 $\Delta u = g(x + \Delta x) - g(x)$。由于 $g$ 可导（从而连续），当 $\Delta x \to 0$ 时，$\Delta u \to 0$。
+#### 朴素推导（演示思路，但有漏洞）
 
-当 $\Delta u \neq 0$ 时，
+记 $\Delta u = g(x_0 + \Delta x) - g(x_0)$，$\Delta y = f(u_0+\Delta u) - f(u_0)$。若 $\Delta u \neq 0$，则
+$$\frac{\Delta y}{\Delta x} = \frac{\Delta y}{\Delta u}\cdot \frac{\Delta u}{\Delta x}.$$
 
-$$\frac{\Delta y}{\Delta x} = \frac{\Delta y}{\Delta u} \cdot \frac{\Delta u}{\Delta x}$$
+令 $\Delta x\to 0$，由 $g$ 连续 $\Delta u\to 0$，故 $\Delta y/\Delta u\to f'(u_0)$，$\Delta u/\Delta x\to g'(x_0)$，得结论。
 
-当 $\Delta x \to 0$ 时，$\Delta u \to 0$，从而
+**但有漏洞**：当 $\Delta x$ 很小时，$\Delta u$ 可能恰为 $0$（例如 $g(x)\equiv\text{常数}$ 附近），此时 $\Delta y/\Delta u$ 没定义。下面给出严格证明，**完美绕开这一漏洞**。
 
-$$\frac{dy}{dx} = \lim_{\Delta x \to 0} \frac{\Delta y}{\Delta x} = \lim_{\Delta u \to 0} \frac{\Delta y}{\Delta u} \cdot \lim_{\Delta x \to 0} \frac{\Delta u}{\Delta x} = f'(u) \cdot g'(x)$$
+#### 不跳步的严格证明（Carathéodory 写法）
 
-$\square$
+**第一步**（构造辅助函数）：对 $u$ 在 $u_0$ 附近，定义
+
+$$\varphi(u) = \begin{cases} \dfrac{f(u) - f(u_0)}{u - u_0}, & u\neq u_0, \\ f'(u_0), & u = u_0. \end{cases}$$
+
+**第二步**（验证 $\varphi$ 在 $u_0$ 处连续）：由 $f$ 在 $u_0$ 可导的定义，
+$$\lim_{u\to u_0}\varphi(u) = \lim_{u\to u_0}\frac{f(u)-f(u_0)}{u-u_0} = f'(u_0) = \varphi(u_0).$$
+
+故 $\varphi$ 在 $u_0$ 连续。
+
+**第三步**（关键恒等式）：对**所有** $u$（无论 $u = u_0$ 与否）：
+$$f(u) - f(u_0) = \varphi(u)\cdot (u - u_0).$$
+
+（当 $u = u_0$，两端都为 0；当 $u\neq u_0$，由 $\varphi$ 定义直接成立。）
+
+**第四步**（代入 $u = g(x), u_0 = g(x_0)$）：
+$$f(g(x)) - f(g(x_0)) = \varphi(g(x))\cdot [g(x) - g(x_0)].$$
+
+**这一步无论 $g(x) = g(x_0)$ 与否都成立**——避开了朴素推导的漏洞。
+
+**第五步**（除以 $x - x_0$ 取极限）：
+$$\frac{f(g(x)) - f(g(x_0))}{x - x_0} = \varphi(g(x))\cdot \frac{g(x) - g(x_0)}{x - x_0}.$$
+
+令 $x\to x_0$：
+- $g(x)\to g(x_0) = u_0$（$g$ 连续），$\varphi$ 在 $u_0$ 连续 $\Rightarrow \varphi(g(x))\to \varphi(u_0) = f'(u_0)$。
+- $\dfrac{g(x) - g(x_0)}{x - x_0} \to g'(x_0)$。
+
+故
+$$[f\circ g]'(x_0) = f'(g(x_0))\cdot g'(x_0).\quad\square$$
+
+**为什么这个证明优雅？** 它把"商可能除以 0"的麻烦封装到了 $\varphi$ 的定义里（在 $u_0$ 处用极限值补上），从而恒等式 $f(u)-f(u_0) = \varphi(u)(u-u_0)$ 对所有 $u$ 成立。这种"用辅助函数消除奇点"的思路在分析里反复出现。
+
+#### Leibniz 记号的优势
+
+$$\frac{dy}{dx} = \frac{dy}{du}\cdot \frac{du}{dx}.$$
+
+形式上像"分数约分"——但这只是**记号上的便利**，本质是上面那个严格证明。然而它确实方便：多层复合 $y\to u\to v\to w\to x$ 可立即写成
+$$\frac{dy}{dx} = \frac{dy}{du}\cdot\frac{du}{dv}\cdot\frac{dv}{dw}\cdot\frac{dw}{dx}.$$
 
 ### 8.2.2 链式法则的直观理解
 
@@ -180,7 +276,35 @@ $$\frac{dy}{dx} = \frac{dy}{du} \cdot \frac{du}{dv} \cdot \frac{dv}{dx} = f'(u) 
 $$y' = \frac{1}{u} \cdot (-\sin v) \cdot e^x = \frac{-\sin(e^x) \cdot e^x}{\cos(e^x)} = -e^x \tan(e^x)$$
 
 > ⚠️ **常见陷阱**
-> 链式法则里最容易漏掉的是“中间变量本身还依赖 $x$”。尤其在多路径依赖里，$\dfrac{\partial f}{\partial x}$ 与 $\dfrac{df}{dx}$ 不是一回事：若还有其它变量依赖于 $x$，全导数必须把所有路径贡献都加上。
+> 链式法则里最容易漏掉的是"中间变量本身还依赖 $x$"。尤其在多路径依赖里，$\dfrac{\partial f}{\partial x}$ 与 $\dfrac{df}{dx}$ 不是一回事：若还有其它变量依赖于 $x$，全导数必须把所有路径贡献都加上。
+
+### 8.2.4 多元链式法则（全导数）
+
+**定理**（多元链式法则）：设 $z = f(u, v)$ 在 $(u_0, v_0)$ 处可微，$u = u(t), v = v(t)$ 在 $t_0$ 处可导，$u(t_0)=u_0, v(t_0)=v_0$。则 $z(t) = f(u(t), v(t))$ 在 $t_0$ 处可导，且
+
+$$\frac{dz}{dt} = \frac{\partial f}{\partial u}\cdot \frac{du}{dt} + \frac{\partial f}{\partial v}\cdot \frac{dv}{dt}.$$
+
+#### 推导（要点）
+
+**第一步**（多元函数可微性的定义）：$f$ 在 $(u_0, v_0)$ 可微意味着存在 $f_u(u_0,v_0), f_v(u_0,v_0)$ 和"小 $o$"项 $\varepsilon(\Delta u,\Delta v)$，使得
+
+$$\Delta f = f_u(u_0,v_0)\Delta u + f_v(u_0,v_0)\Delta v + \varepsilon(\Delta u,\Delta v),$$
+
+其中 $\varepsilon = o(\sqrt{\Delta u^2 + \Delta v^2})$（即 $\dfrac{|\varepsilon|}{\sqrt{\Delta u^2+\Delta v^2}}\to 0$）。
+
+**第二步**：令 $\Delta u = u(t_0+\Delta t) - u_0$，$\Delta v = v(t_0+\Delta t) - v_0$。除以 $\Delta t$：
+
+$$\frac{\Delta f}{\Delta t} = f_u\cdot \frac{\Delta u}{\Delta t} + f_v\cdot \frac{\Delta v}{\Delta t} + \frac{\varepsilon}{\Delta t}.$$
+
+**第三步**（估计余项）：由 $\Delta u, \Delta v = O(\Delta t)$，所以 $\sqrt{\Delta u^2+\Delta v^2} = O(\Delta t)$，从而 $\varepsilon = o(\Delta t)$，故 $\varepsilon/\Delta t\to 0$。
+
+**第四步**：取 $\Delta t\to 0$ 极限即得定理。$\square$
+
+**特例**：若 $z = f(x, y)$ 且 $y = y(x)$（即 $x$ 既是直接变量、又通过 $y$ 间接影响 $z$）：
+
+$$\frac{dz}{dx} = \frac{\partial f}{\partial x} + \frac{\partial f}{\partial y}\cdot \frac{dy}{dx}.$$
+
+注意 $\dfrac{\partial f}{\partial x}$（偏导，把 $y$ 当常数）与 $\dfrac{dz}{dx}$（全导，承认 $y$ 依赖 $x$）的区别——这是链式法则最容易混淆的地方，第 16 章会深入。
 
 ---
 
@@ -207,6 +331,18 @@ $$[f^{-1}]'(y) = \lim_{\Delta y \to 0} \frac{\Delta x}{\Delta y} = \lim_{\Delta 
 $\square$
 
 **直观理解**：若 $y$ 关于 $x$ 的变化率为 $f'(x)$，那么 $x$ 关于 $y$ 的变化率自然是其倒数 $\dfrac{1}{f'(x)}$。条件 $f'(x) \neq 0$ 保证了倒数有意义。
+
+#### 推导补全：为什么需要 $f'(x)\neq 0$ ？
+
+**第一**（必要性）：若 $f'(x_0) = 0$，则切线水平，反函数在 $y_0 = f(x_0)$ 处切线竖直，即 $[f^{-1}]'(y_0) = \infty$，无定义。例如 $f(x) = x^3$ 在 $x=0$ 处 $f'(0)=0$，反函数 $f^{-1}(y) = y^{1/3}$ 在 $y=0$ 处确实不可导。
+
+**第二**（充分性的"另证"——用链式法则推导）：在 $f^{-1}(f(x)) = x$ 两边对 $x$ 求导，左边用链式法则：
+
+$$[f^{-1}]'(f(x))\cdot f'(x) = 1 \quad\Longrightarrow\quad [f^{-1}]'(y) = \frac{1}{f'(x)}.$$
+
+这是一行得到反函数法则——**但前提是已知 $f^{-1}$ 可导**。原始证明（用 $\Delta y \to 0 \Leftrightarrow \Delta x \to 0$）才是建立可导性的根本。
+
+#### 应用拓展：双曲函数的反函数
 
 ### 8.3.2 应用：反三角函数的导数
 
@@ -268,6 +404,19 @@ $$y' = \frac{1}{1 + \left(\dfrac{1}{x}\right)^2} \cdot \left(-\frac{1}{x^2}\righ
 
 **注**：当 $x > 0$ 时，$\arctan x + \arctan\dfrac{1}{x} = \dfrac{\pi}{2}$，两边求导即得上述结果。
 
+### 8.3.3 反三角函数导数完整速查表
+
+| 函数 | 导数 | 定义域 |
+|---|---|---|
+| $\arcsin x$ | $\dfrac{1}{\sqrt{1-x^2}}$ | $\vert x\vert<1$ |
+| $\arccos x$ | $-\dfrac{1}{\sqrt{1-x^2}}$ | $\vert x\vert<1$ |
+| $\arctan x$ | $\dfrac{1}{1+x^2}$ | $\mathbb{R}$ |
+| $\operatorname{arccot} x$ | $-\dfrac{1}{1+x^2}$ | $\mathbb{R}$ |
+| $\operatorname{arcsec} x$ | $\dfrac{1}{\vert x\vert\sqrt{x^2-1}}$ | $\vert x\vert>1$ |
+| $\operatorname{arccsc} x$ | $-\dfrac{1}{\vert x\vert\sqrt{x^2-1}}$ | $\vert x\vert>1$ |
+
+**记忆要点**：成对出现的反三角函数（$\arcsin/\arccos$、$\arctan/\operatorname{arccot}$、$\operatorname{arcsec}/\operatorname{arccsc}$）的导数互为相反数——因为它们的和恒为 $\pi/2$。
+
 ---
 
 ## 8.4 隐函数求导
@@ -283,6 +432,24 @@ $$y' = \frac{1}{1 + \left(\dfrac{1}{x}\right)^2} \cdot \left(-\frac{1}{x^2}\righ
 ### 8.4.2 隐函数求导法
 
 **方法**：将方程 $F(x, y) = 0$ 两边对 $x$ 求导，把 $y$ 看作 $x$ 的函数，利用链式法则，然后解出 $\dfrac{dy}{dx}$。
+
+#### 为什么可以这样做？——隐函数定理（直觉版）
+
+**隐函数定理**（简化版）：设 $F(x, y)$ 在 $(x_0, y_0)$ 邻域有连续偏导数，且 $F(x_0, y_0) = 0$，$F_y(x_0, y_0) \neq 0$，则方程 $F(x, y) = 0$ 在 $x_0$ 附近确定唯一连续可导函数 $y = y(x)$，且
+
+$$\frac{dy}{dx} = -\frac{F_x(x, y)}{F_y(x, y)}.$$
+
+**公式推导**（不跳步）：
+
+**第一步**：在 $F(x, y(x)) = 0$ 两边对 $x$ 求导。注意 $y$ 依赖 $x$，用多元链式法则（即 8.2.4）：
+$$\frac{d}{dx}F(x, y(x)) = F_x(x, y) + F_y(x, y)\cdot \frac{dy}{dx} = 0.$$
+
+**第二步**：解 $\dfrac{dy}{dx}$（需 $F_y\neq 0$）：
+$$\frac{dy}{dx} = -\frac{F_x(x, y)}{F_y(x, y)}.\quad\square$$
+
+> **例**：$x^2 + y^2 = 1 \Rightarrow F = x^2+y^2-1$，$F_x = 2x, F_y = 2y$，故 $y' = -x/y$，与例题 8.9 一致。
+
+**实际做题**：可直接用"两边对 $x$ 求导 + 链式"，不必先写 $F$。理论支持来自隐函数定理。
 
 > **例题 8.9** 设 $x^2 + y^2 = 1$，求 $\dfrac{dy}{dx}$。
 
@@ -312,10 +479,30 @@ $$e \cdot y'(0) + 1 + 0 = 0$$
 
 对于形如 $y = f(x)^{g(x)}$ 或多个因式乘除的函数，可以先取对数再求导。
 
+#### 理论依据（为什么对数求导法成立）
+
+**第一**：$\ln$ 是严格单调可导函数，$y = e^{\ln y}$ 是恒等变换（$y > 0$）。
+
+**第二**：$\ln y$ 把"乘除变加减、幂变乘积"——这是对数的代数性质：
+- $\ln(fg) = \ln f + \ln g$（乘 → 加）
+- $\ln(f/g) = \ln f - \ln g$（除 → 减）
+- $\ln(f^g) = g\ln f$（幂 → 乘）
+
+**第三**：对 $\ln y$ 求导用链式法则，得 $\dfrac{1}{y}\cdot y'$，所以一旦得到 $\ln y$ 的导数，乘回 $y$ 即得 $y'$。
+
+**第四**（关键洞察）：对 $y = f^g$，**直接**用幂法则 $(x^n)' = nx^{n-1}$ 是**错的**——因为指数 $g$ 不是常数。同样**直接**用指数法则 $(a^x)' = a^x\ln a$ 也是**错的**——因为底数 $f$ 不是常数。**两者都变**时只能取对数。
+
 **步骤**：
 1. 两边取对数：$\ln y = g(x) \ln f(x)$
 2. 两边对 $x$ 求导：$\dfrac{y'}{y} = \ldots$
 3. 解出 $y'$
+
+#### 等价做法：写成 $e^{g\ln f}$ 再链式
+
+$y = f^g = e^{g\ln f}$，则
+$$y' = e^{g\ln f}\cdot \left(g\ln f\right)' = f^g\cdot \left(g'\ln f + g\cdot \frac{f'}{f}\right).$$
+
+与对数求导法所得结果**完全一致**——只是计算路径不同。
 
 > **例题 8.11** 求 $y = x^x$（$x > 0$）的导数。
 
@@ -377,11 +564,19 @@ $$\frac{dy}{dx} = \frac{a\sin t}{a(1 - \cos t)} = \frac{\sin t}{1 - \cos t} = \f
 
 ### 8.5.2 参数方程的二阶导数
 
-$$\frac{d^2y}{dx^2} = \frac{d}{dx}\left(\frac{dy}{dx}\right) = \frac{\frac{d}{dt}\left(\frac{dy}{dx}\right)}{\frac{dx}{dt}}$$
+**核心思路**：把 $\dfrac{dy}{dx}$ 视为 $t$ 的函数 $p(t) = \psi'(t)/\varphi'(t)$，再对 $x$ 求导——但 $x$ 也是 $t$ 的函数，所以再用一次参数式求导公式：
 
-设 $\dfrac{dy}{dx} = \dfrac{\psi'(t)}{\varphi'(t)}$，则
+$$\frac{d^2y}{dx^2} = \frac{d}{dx}\left(\frac{dy}{dx}\right) = \frac{d}{dx}\,p(t) = \frac{dp/dt}{dx/dt}.$$
 
-$$\frac{d^2y}{dx^2} = \frac{\psi''(t)\varphi'(t) - \psi'(t)\varphi''(t)}{[\varphi'(t)]^3}$$
+#### 化简公式的完整推导
+
+**第一步**（求 $dp/dt$，用商法则）：
+$$\frac{dp}{dt} = \frac{d}{dt}\frac{\psi'(t)}{\varphi'(t)} = \frac{\psi''(t)\varphi'(t) - \psi'(t)\varphi''(t)}{[\varphi'(t)]^2}.$$
+
+**第二步**（除以 $dx/dt = \varphi'(t)$）：
+$$\frac{d^2y}{dx^2} = \frac{1}{\varphi'(t)}\cdot \frac{\psi''(t)\varphi'(t) - \psi'(t)\varphi''(t)}{[\varphi'(t)]^2} = \frac{\psi''(t)\varphi'(t) - \psi'(t)\varphi''(t)}{[\varphi'(t)]^3}.$$
+
+**最容易错的点**：忘了**再除一次 $\varphi'(t)$**——直接把 $\dfrac{dp}{dt}$ 当成 $\dfrac{d^2y}{dx^2}$。**记住**：每一次对 $x$ 求导都要除一次 $\dfrac{dx}{dt}$。
 
 > **例题 8.15** 对于摆线 $x = a(t - \sin t)$，$y = a(1 - \cos t)$，求 $\dfrac{d^2y}{dx^2}$。
 
@@ -431,15 +626,64 @@ $$(\cos x)^{(n)} = \cos\left(x + \frac{n\pi}{2}\right)$$
 
 ### 8.6.2 莱布尼茨公式
 
-**定理**（Leibniz 公式）：若 $f(x)$ 和 $g(x)$ 都有 $n$ 阶导数，则
+**定理**（Leibniz 公式）：若 $f, g$ 都有 $n$ 阶导数，则
 
-$$(fg)^{(n)} = \sum_{k=0}^{n} \binom{n}{k} f^{(k)}(x) g^{(n-k)}(x)$$
+$$(fg)^{(n)} = \sum_{k=0}^{n}\binom{n}{k} f^{(k)}(x)\, g^{(n-k)}(x),$$
 
-其中 $\binom{n}{k} = \dfrac{n!}{k!(n-k)!}$ 是二项式系数，$f^{(0)} = f$。
+其中 $\binom{n}{k} = \dfrac{n!}{k!(n-k)!}$，$f^{(0)} = f$。
+
+#### 不跳步的归纳证明
+
+**基础情形** $n = 1$：即乘积法则 $(fg)' = f'g + fg' = \binom{1}{0}f^{(0)}g^{(1)} + \binom{1}{1}f^{(1)}g^{(0)}$，✓。
+
+**归纳假设**：设 $(fg)^{(n)} = \sum_{k=0}^n \binom{n}{k}f^{(k)}g^{(n-k)}$ 成立。
+
+**归纳步**：对 $(fg)^{(n)}$ 再求一次导：
+$$(fg)^{(n+1)} = \sum_{k=0}^n \binom{n}{k}\left[f^{(k+1)}g^{(n-k)} + f^{(k)}g^{(n-k+1)}\right].$$
+
+把求和拆成两部分：
+
+$$= \underbrace{\sum_{k=0}^n \binom{n}{k}f^{(k+1)}g^{(n-k)}}_{S_1} + \underbrace{\sum_{k=0}^n \binom{n}{k}f^{(k)}g^{(n-k+1)}}_{S_2}.$$
+
+**在 $S_1$ 中作 $j = k+1$**（$k=0\Rightarrow j=1$；$k=n\Rightarrow j=n+1$）：
+$$S_1 = \sum_{j=1}^{n+1}\binom{n}{j-1}f^{(j)}g^{(n+1-j)}.$$
+
+**在 $S_2$ 中保持 $j = k$**：
+$$S_2 = \sum_{j=0}^n \binom{n}{j}f^{(j)}g^{(n+1-j)}.$$
+
+**合并**（把 $S_2$ 的 $j=0$ 项 $\binom{n}{0}f g^{(n+1)} = f g^{(n+1)}$ 和 $S_1$ 的 $j=n+1$ 项 $\binom{n}{n}f^{(n+1)}g = f^{(n+1)}g$ 单独取出，中间 $j=1,\ldots,n$ 项合并）：
+
+$$(fg)^{(n+1)} = fg^{(n+1)} + \sum_{j=1}^n\left[\binom{n}{j-1} + \binom{n}{j}\right]f^{(j)}g^{(n+1-j)} + f^{(n+1)}g.$$
+
+**用 Pascal 恒等式** $\binom{n}{j-1} + \binom{n}{j} = \binom{n+1}{j}$：
+
+$$(fg)^{(n+1)} = \binom{n+1}{0}fg^{(n+1)} + \sum_{j=1}^n \binom{n+1}{j}f^{(j)}g^{(n+1-j)} + \binom{n+1}{n+1}f^{(n+1)}g = \sum_{j=0}^{n+1}\binom{n+1}{j}f^{(j)}g^{(n+1-j)}.$$
+
+即对 $n+1$ 成立。由归纳法定理得证。$\square$
+
+**记忆要点**：Leibniz 公式与**二项式定理** $(a+b)^n = \sum\binom{n}{k}a^k b^{n-k}$ 形式上完全一致——把 $a, b$ 换成 $f$ 的 $k$ 阶导和 $g$ 的 $n-k$ 阶导即可。
 
 展开形式：
 
-$$(fg)^{(n)} = f^{(n)}g + nf^{(n-1)}g' + \frac{n(n-1)}{2!}f^{(n-2)}g'' + \cdots + fg^{(n)}$$
+$$(fg)^{(n)} = f^{(n)}g + nf^{(n-1)}g' + \frac{n(n-1)}{2!}f^{(n-2)}g'' + \cdots + fg^{(n)}.$$
+
+#### 高阶链式：Faà di Bruno 公式（进阶）
+
+对一阶链式 $[f(g(x))]' = f'(g)\cdot g'$，二阶就复杂了：
+$$[f(g(x))]'' = f''(g)\cdot (g')^2 + f'(g)\cdot g''.$$
+
+三阶：
+$$[f(g(x))]''' = f'''(g)\cdot (g')^3 + 3 f''(g)\cdot g'\cdot g'' + f'(g)\cdot g'''.$$
+
+**Faà di Bruno 公式**（一般形式）：
+
+$$[f(g(x))]^{(n)} = \sum \frac{n!}{m_1!m_2!\cdots m_n!}\, f^{(m_1+m_2+\cdots+m_n)}(g)\prod_{k=1}^n\left(\frac{g^{(k)}}{k!}\right)^{m_k},$$
+
+求和范围是所有非负整数解 $(m_1,\ldots,m_n)$ 满足 $\sum_{k=1}^n k m_k = n$。
+
+> **直觉**：每项对应 $n$ 元素的一种**分拆方式**——把 $n$ 阶导按"先做几个一阶层、几个二阶层、…"的方式拼装。$m_k$ 表示选取 $k$ 阶导数的次数。
+
+> **实践提示**：考试中通常 $n\le 3$，不必死背公式——按"再求一次导，每个 $f^{(k)}(g)$ 项再用一次链式"逐次得到即可。
 
 > **例题 8.18** 求 $y = x^2 e^x$ 的 $n$ 阶导数（$n \geq 2$）。
 
@@ -465,6 +709,238 @@ $$y^{(n)} = e^x \cdot x^2 + n \cdot e^x \cdot 2x + \frac{n(n-1)}{2} \cdot e^x \c
 
 ---
 
+## 8.7 微分及其运算规则
+
+到目前为止，我们一直在讨论"导数"——函数变化率的精确值。本节引入与导数密切相关、但概念上**独立**的对象：**微分**。微分回答的不是"变化率多大"，而是"在 $x$ 处给定一个微小自变量增量 $dx$，函数会近似变化多少 $dy$"。
+
+> **核心关系**：$\boxed{dy = f'(x)\, dx.}$ 微分是导数与自变量增量的乘积。导数是**比率**（斜率），微分是**乘积**（线性增量）。
+
+下面我们从定义、几何意义、运算规则、形式不变性、应用五个角度系统讲解。
+
+---
+
+### 8.7.1 微分的定义
+
+**定义**（可微）：设 $y = f(x)$ 在 $x_0$ 的邻域有定义。给 $x_0$ 一个增量 $\Delta x$，对应函数增量 $\Delta y = f(x_0 + \Delta x) - f(x_0)$。若存在与 $\Delta x$ **无关**的常数 $A$，使得
+
+$$\Delta y = A\cdot \Delta x + o(\Delta x)\quad (\Delta x\to 0),$$
+
+则称 $f$ 在 $x_0$ 处**可微**，并称 $A\cdot \Delta x$ 为 $f$ 在 $x_0$ 处对应于增量 $\Delta x$ 的**微分**，记作
+
+$$dy\big|_{x_0} = A\cdot \Delta x.$$
+
+其中 $o(\Delta x)$ 表示比 $\Delta x$ 更高阶的无穷小，即 $\lim_{\Delta x\to 0}\dfrac{o(\Delta x)}{\Delta x} = 0$。
+
+#### 可微 ⇔ 可导（一元函数）
+
+**定理**：一元函数 $f$ 在 $x_0$ 可微 $\iff$ $f$ 在 $x_0$ 可导，且 $A = f'(x_0)$。
+
+**完整推导**：
+
+**（⇒）** 设可微，即 $\Delta y = A\Delta x + o(\Delta x)$。两边除以 $\Delta x$：
+
+$$\frac{\Delta y}{\Delta x} = A + \frac{o(\Delta x)}{\Delta x}.$$
+
+取 $\Delta x\to 0$：右端第二项 $\to 0$，故 $\lim_{\Delta x\to 0}\dfrac{\Delta y}{\Delta x} = A$，即 $f'(x_0) = A$ 存在。
+
+**（⇐）** 设可导，$f'(x_0) = \lim_{\Delta x\to 0}\dfrac{\Delta y}{\Delta x}$。记 $\alpha(\Delta x) = \dfrac{\Delta y}{\Delta x} - f'(x_0)$，则 $\alpha\to 0$（$\Delta x\to 0$），且
+
+$$\Delta y = f'(x_0)\Delta x + \alpha(\Delta x)\cdot \Delta x.$$
+
+第二项是 $o(\Delta x)$（因为 $\alpha\to 0$），故可微，$A = f'(x_0)$。$\square$
+
+**结论**：一元函数下"可微"与"可导"是**同一回事**，只是侧重点不同——可导强调"导数存在"，可微强调"局部线性近似"。多元函数则不等价（可微 ⇒ 可偏导，反之不真，见第 16 章）。
+
+#### 自变量的微分
+
+约定 $dx := \Delta x$（自变量的"微分"就是它自己的增量）。这样微分公式统一写成
+
+$$\boxed{dy = f'(x)\, dx,}$$
+
+进而得到
+
+$$\boxed{f'(x) = \frac{dy}{dx}.}$$
+
+这正是 **Leibniz 记号**的来源——$\dfrac{dy}{dx}$ 真的可以理解为"两个微分之比"。
+
+---
+
+### 8.7.2 微分的几何意义
+
+考察曲线 $y = f(x)$ 上点 $P(x_0, f(x_0))$ 的切线 $T$，斜率为 $f'(x_0)$。
+
+| 量 | 含义 | 表达式 |
+|---|---|---|
+| $\Delta x$ | 自变量增量 | $dx$ |
+| $\Delta y$ | **函数值**真实增量 | $f(x_0+\Delta x) - f(x_0)$ |
+| $dy$ | **切线**纵坐标增量 | $f'(x_0)\cdot \Delta x$ |
+| $\Delta y - dy$ | 真实曲线与切线偏差 | $o(\Delta x)$ |
+
+**几何图景**：在 $P$ 点附近，切线 $T$ 紧贴曲线。当 $\Delta x$ 足够小时，曲线的纵坐标增量 $\Delta y$ 几乎等于切线的纵坐标增量 $dy$——二者只差一个高阶无穷小。
+
+> **直观比喻**：在足够小的尺度下，**曲线被切线代替**——这就是"局部线性化"。整个微积分（特别是泰勒展开、牛顿法、神经网络优化）都建立在这个思想之上。
+
+---
+
+### 8.7.3 微分的运算规则（完整推导）
+
+由 $dy = f'(x)\,dx$，每条求导规则都自动给出一条微分规则。下面逐条推导。
+
+#### (1) 基本微分公式表
+
+由基本求导公式直接平移：
+
+| 函数 | 微分 |
+|---|---|
+| $y = C$（常数） | $dy = 0$ |
+| $y = x^\alpha$ | $dy = \alpha x^{\alpha-1}\,dx$ |
+| $y = a^x$ | $dy = a^x\ln a\,dx$ |
+| $y = e^x$ | $dy = e^x\,dx$ |
+| $y = \log_a x$ | $dy = \dfrac{1}{x\ln a}\,dx$ |
+| $y = \ln x$ | $dy = \dfrac{1}{x}\,dx$ |
+| $y = \sin x$ | $dy = \cos x\,dx$ |
+| $y = \cos x$ | $dy = -\sin x\,dx$ |
+| $y = \tan x$ | $dy = \sec^2 x\,dx$ |
+| $y = \arcsin x$ | $dy = \dfrac{1}{\sqrt{1-x^2}}\,dx$ |
+| $y = \arctan x$ | $dy = \dfrac{1}{1+x^2}\,dx$ |
+
+#### (2) 微分四则运算法则
+
+设 $u = u(x), v = v(x)$ 可微，$C$ 为常数：
+
+| 法则 | 公式 | 推导依据 |
+|---|---|---|
+| **常数因子** | $d(Cu) = C\,du$ | $(Cu)' = Cu'$，两边乘 $dx$ |
+| **和差** | $d(u\pm v) = du \pm dv$ | $(u\pm v)' = u' \pm v'$ |
+| **乘积** | $d(uv) = u\,dv + v\,du$ | $(uv)' = u'v + uv'$ |
+| **商** | $d\!\left(\dfrac{u}{v}\right) = \dfrac{v\,du - u\,dv}{v^2}$（$v\neq 0$） | 商法则 |
+
+**乘积法则的微分形式推导**（不跳步）：
+
+**第一步**：由乘积法则 $(uv)' = u'v + uv'$。
+
+**第二步**：两边乘 $dx$：
+$$(uv)'\,dx = u'v\,dx + uv'\,dx.$$
+
+**第三步**：根据微分定义 $du = u'\,dx$，$dv = v'\,dx$，$d(uv) = (uv)'\,dx$：
+$$d(uv) = v\cdot u'\,dx + u\cdot v'\,dx = v\,du + u\,dv.\quad\square$$
+
+**商法则微分形式**类推（两边乘 $dx$ 即得）。
+
+#### (3) 一阶微分形式的不变性（核心性质）
+
+**定理**（一阶微分形式不变性）：无论 $u$ 是**自变量**还是**中间变量**（即 $u = g(x)$），微分公式
+
+$$dy = f'(u)\,du$$
+
+**形式上完全相同**。
+
+#### 不跳步推导
+
+**情形 A**（$u$ 是自变量）：根据微分定义，$dy = f'(u)\,du$，这是定义。
+
+**情形 B**（$u = g(x)$ 是中间变量）：复合函数 $y = f(g(x))$。
+
+**第一步**：用链式法则求 $y$ 对 $x$ 的导数：
+$$\frac{dy}{dx} = f'(g(x))\cdot g'(x) = f'(u)\cdot g'(x).$$
+
+**第二步**：由微分定义 $dy = \dfrac{dy}{dx}\,dx$：
+$$dy = f'(u)\cdot g'(x)\,dx.$$
+
+**第三步**：注意 $g'(x)\,dx = du$（$u = g(x)$ 的微分）：
+$$dy = f'(u)\,du.$$
+
+**两个情形结果完全相同**——这就是"形式不变性"。$\square$
+
+> **直觉**：写出 $dy = f'(u)\,du$ 时，**不必关心 $u$ 是不是自变量**——链式法则已经"自动"把内层导数 $g'(x)\,dx$ 折叠到了 $du$ 里。
+
+> **威力示范**：求 $y = \sin(3x+1)$ 的微分。
+> - 套用 $d(\sin u) = \cos u\,du$（不管 $u$ 是不是 $x$）；
+> - $u = 3x+1 \Rightarrow du = 3\,dx$；
+> - 代回：$dy = \cos(3x+1)\cdot 3\,dx = 3\cos(3x+1)\,dx$。
+>
+> **整个过程不显式写"链式法则"——它隐藏在了 $du$ 里**。这是不定积分"凑微分"的理论基础。
+
+#### (4) 微分形式不变性 → 凑微分法的等价性
+
+不定积分的"凑微分法"（第一类换元）本质就是反向使用形式不变性：
+
+$$\int f(u(x))\cdot u'(x)\,dx = \int f(u)\,du.$$
+
+把 $u'(x)\,dx$ "凑"成 $du$，即用了 $du = u'(x)\,dx$ 这条规则。这一推导链条在 12.4.2 节有完整展开。
+
+#### (5) 多层复合的微分链式
+
+复合 $y = f(u), u = g(v), v = h(x)$：
+
+$$dy = f'(u)\,du = f'(u)\,g'(v)\,dv = f'(u)\,g'(v)\,h'(x)\,dx.$$
+
+**形式上**就像分数连乘 $\dfrac{dy}{du}\cdot \dfrac{du}{dv}\cdot \dfrac{dv}{dx}$——又一次证实 Leibniz 记号的优雅。
+
+---
+
+### 8.7.4 高阶微分（简介）
+
+二阶微分定义为 $d^2 y = d(dy)$。注意：高阶微分**没有形式不变性**！
+
+**当 $x$ 是自变量**（$dx$ 是常数）：
+$$d^2 y = d(f'(x)\,dx) = f''(x)\,dx\cdot dx = f''(x)\,(dx)^2.$$
+
+记作 $d^2 y = f''(x)\,dx^2$（约定 $dx^2 := (dx)^2$，不要与 $d(x^2) = 2x\,dx$ 混淆）。
+
+**当 $u = g(x)$ 是中间变量**（$du$ 不再是常数，依赖 $x$）：
+$$d^2 y = d(f'(u)\,du) = d(f'(u))\,du + f'(u)\,d^2 u = f''(u)\,(du)^2 + f'(u)\,d^2 u.$$
+
+多出一项 $f'(u)\,d^2 u$——所以**二阶微分形式不再不变**。这正是 Faà di Bruno 公式（见 8.6.2 末）反映的事实。
+
+---
+
+### 8.7.5 微分的应用：线性近似与误差估计
+
+#### (1) 函数值的线性近似
+
+由 $\Delta y \approx dy = f'(x_0)\,\Delta x$：
+
+$$\boxed{f(x_0 + \Delta x)\approx f(x_0) + f'(x_0)\,\Delta x.}$$
+
+这是**一阶 Taylor 展开**（第 10 章）。
+
+> **例题 8.18'** 估算 $\sqrt{4.05}$。
+
+**解**：取 $f(x) = \sqrt{x}$，$x_0 = 4$，$\Delta x = 0.05$。$f'(x) = \dfrac{1}{2\sqrt{x}}$，$f'(4) = \dfrac{1}{4}$。
+
+$$\sqrt{4.05}\approx \sqrt{4} + \frac{1}{4}\cdot 0.05 = 2 + 0.0125 = 2.0125.$$
+
+真实值 $\sqrt{4.05}\approx 2.01246$——误差不到 $4\times 10^{-5}$。$\square$
+
+#### (2) 误差传播
+
+若一个量 $y = f(x)$，而 $x$ 的测量有绝对误差 $\Delta x$，则 $y$ 的绝对误差近似为
+
+$$|\Delta y|\approx |f'(x)|\cdot |\Delta x|.$$
+
+**相对误差**：$\dfrac{|\Delta y|}{|y|}\approx \left|\dfrac{f'(x)\cdot x}{f(x)}\right|\cdot \dfrac{|\Delta x|}{|x|}$，系数 $\left|\dfrac{f'(x)x}{f(x)}\right|$ 称为 $f$ 在 $x$ 的**弹性系数**（经济学常用）。
+
+> **例题 8.18''** 测量圆球半径 $r$ 有 1% 的相对误差，问体积 $V = \dfrac{4}{3}\pi r^3$ 的相对误差大约多少？
+
+**解**：$dV = 4\pi r^2\,dr$，故 $\dfrac{dV}{V} = \dfrac{4\pi r^2\,dr}{\dfrac{4}{3}\pi r^3} = 3\cdot\dfrac{dr}{r}$。所以体积的相对误差约为 $3\times 1\% = 3\%$。$\square$
+
+---
+
+### 8.7.6 与导数的概念区别（总结）
+
+| 角度 | 导数 $f'(x)$ | 微分 $dy$ |
+|---|---|---|
+| 类型 | 标量（变化率） | 线性函数 $\Delta x \mapsto f'(x)\Delta x$ |
+| 几何 | 切线斜率 | 切线纵坐标增量 |
+| 单位 | $[y]/[x]$ | $[y]$（与 $y$ 同单位） |
+| 记号 | $f'(x), \dfrac{dy}{dx}, Df$ | $dy$ |
+| 计算 | 极限 $\lim \Delta y/\Delta x$ | $f'(x)\,dx$ |
+
+**核心口诀**：**导数是斜率，微分是切线纵坐标增量；导数是数，微分是线性映射**。
+
+---
+
 ## 本章小结
 
 1. **四则运算法则**：
@@ -486,9 +962,9 @@ $$y^{(n)} = e^x \cdot x^2 + n \cdot e^x \cdot 2x + \frac{n(n-1)}{2} \cdot e^x \c
 
 ---
 
-## 深度学习应用
+## 8.8 深度学习应用
 
-### 8.7.1 链式法则与反向传播
+### 8.8.1 链式法则与反向传播
 
 深度学习中最核心的训练算法——反向传播（Backpropagation）——其数学本质正是多重复合函数的链式法则。
 
@@ -507,7 +983,7 @@ $$\frac{\partial L}{\partial x} = \frac{\partial L}{\partial f} \cdot \frac{\par
 1. **前向传播**：依次计算 $h = h(x)$，$g = g(h)$，$f = f(g)$，得到 $L$
 2. **反向传播**：依次计算 $\dfrac{\partial L}{\partial f}$，$\dfrac{\partial L}{\partial g} = \dfrac{\partial L}{\partial f} \cdot \dfrac{\partial f}{\partial g}$，$\dfrac{\partial L}{\partial h} = \dfrac{\partial L}{\partial g} \cdot \dfrac{\partial g}{\partial h}$，$\dfrac{\partial L}{\partial x} = \dfrac{\partial L}{\partial h} \cdot \dfrac{\partial h}{\partial x}$
 
-### 8.7.2 自动微分（AutoDiff）
+### 8.8.2 自动微分（AutoDiff）
 
 手动推导梯度公式既繁琐又容易出错，自动微分技术通过程序化地追踪计算过程来自动求导。
 
@@ -526,7 +1002,7 @@ PyTorch 通过构建**计算图**（Computational Graph）来实现反向模式�
 - `.grad`：存储累积梯度
 - `create_graph=True`：保留计算图以支持高阶导数
 
-### 8.7.3 高阶导数在深度学习中的应用
+### 8.8.3 高阶导数在深度学习中的应用
 
 **Hessian 矩阵与二阶优化**：
 
@@ -548,7 +1024,7 @@ $$\mathbf{F} = \mathbb{E}\left[\nabla \log p(x|\theta) \cdot \nabla \log p(x|\th
 
 自然梯度法（Natural Gradient）使用 Fisher 信息矩阵代替 Hessian，在参数空间的黎曼几何意义下进行最优化，在强化学习（如 TRPO、PPO）和变分推断中有重要应用。
 
-### 8.7.4 代码示例：自动微分演示
+### 8.8.4 代码示例：自动微分演示
 
 ```python
 import torch

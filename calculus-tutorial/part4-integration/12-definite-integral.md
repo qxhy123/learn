@@ -244,83 +244,420 @@ $\square$
 
 ---
 
-## 12.4 定积分的计算
+## 12.4 定积分的运算规则（完整推导）
 
-### 12.4.1 换元法
+本节系统讲解定积分的全部主要运算规则。每一条规则都给出**完整推导**——为什么成立、在什么条件下成立、如何应用——以及**典型例题**演示。整体结构如下：
 
-**定理**（定积分的换元法）：设 $f(x)$ 在 $[a, b]$ 上连续，若函数 $x = \varphi(t)$ 满足：
+- 12.4.1 Newton-Leibniz 公式的再审视——为什么"求原函数"就够了
+- 12.4.2 第一类换元法（凑微分法）——理论与推导
+- 12.4.3 第二类换元法（变量替换法）——理论与三角/双曲替换
+- 12.4.4 分部积分法——推导、选择策略与"循环型"
+- 12.4.5 对称性技巧——奇偶、平移、镜像、区间再现
+- 12.4.6 周期函数的定积分
+- 12.4.7 含参数的定积分与参数求导法（Leibniz 法则）
+- 12.4.8 递推公式与 Wallis 公式
+
+---
+
+### 12.4.1 Newton-Leibniz 公式的再审视
+
+虽然 N-L 公式已在 12.3.3 给出推导，本节将其作为定积分**所有运算规则的总入口**，再次明确：
+
+$$\int_a^b f(x)\,dx = F(b) - F(a),\qquad F'(x) = f(x).$$
+
+**为什么 N-L 公式是后续所有规则的"母规则"？** 因为定积分的换元法、分部积分法本质上都是**不定积分对应规则 + N-L 公式**的产物：
+
+- 不定积分的换元法 + N-L → 定积分的换元法
+- 不定积分的分部积分 + N-L → 定积分的分部积分
+- 不定积分的线性性 + N-L → 定积分的线性性
+
+**适用前提**：N-L 公式要求 $f$ 在 $[a,b]$ 上**连续**（或可积且原函数处处可导）。若 $f$ 在某点有跳跃间断，必须用**区间可加性**将积分拆开后分别使用 N-L。
+
+> **反例警示**：考虑 $\int_{-1}^1 \dfrac{1}{x^2}\,dx$。若盲目套 $F(x) = -\dfrac{1}{x}$，得 $F(1)-F(-1) = -1 - 1 = -2$。**错误**！因为 $\dfrac{1}{x^2}$ 在 $x=0$ 不连续且无界，定积分发散（属于广义积分，第 14 章讲）。**结论**：用 N-L 前先验证连续性。
+
+---
+
+### 12.4.2 第一类换元法（凑微分法）
+
+**定理**（第一类换元法 / 凑微分法）：设 $f(u)$ 在区间 $I$ 上连续，$u = \varphi(x)$ 在 $[a,b]$ 上有连续导数且 $\varphi([a,b]) \subset I$，则
+
+$$\boxed{\int_a^b f(\varphi(x))\varphi'(x)\,dx = \int_{\varphi(a)}^{\varphi(b)} f(u)\,du.}$$
+
+**完整推导**（一步不省）：
+
+**第一步**：设 $F$ 是 $f$ 的一个原函数，即 $F'(u) = f(u)$。
+
+**第二步**：由链式法则，复合函数 $F(\varphi(x))$ 对 $x$ 的导数为
+$$\frac{d}{dx} F(\varphi(x)) = F'(\varphi(x))\cdot \varphi'(x) = f(\varphi(x))\cdot \varphi'(x).$$
+
+这表明 $F(\varphi(x))$ 是 $f(\varphi(x))\varphi'(x)$ 的一个原函数。
+
+**第三步**：对左端应用 N-L 公式（被积函数为 $f(\varphi(x))\varphi'(x)$，原函数为 $F(\varphi(x))$）：
+$$\int_a^b f(\varphi(x))\varphi'(x)\,dx = F(\varphi(x))\Big|_a^b = F(\varphi(b)) - F(\varphi(a)).$$
+
+**第四步**：对右端应用 N-L 公式（被积函数为 $f(u)$，原函数为 $F(u)$，积分限为 $\varphi(a)$ 到 $\varphi(b)$）：
+$$\int_{\varphi(a)}^{\varphi(b)} f(u)\,du = F(u)\Big|_{\varphi(a)}^{\varphi(b)} = F(\varphi(b)) - F(\varphi(a)).$$
+
+**第五步**：两端相等，定理得证。$\square$
+
+**核心要点**：
+
+1. **方向是从复杂到简单**：把 $f(\varphi(x))\varphi'(x)$ 这种"内含复合"的形式，**凑**成关于新变量 $u$ 的简单形式。
+2. **积分限同步变换**：$x: a\to b$ 时 $u: \varphi(a)\to \varphi(b)$。换元后**直接代入新积分限计算**，**不必换回原变量**。
+3. **凑微分的关键识别**：被积函数中出现"某函数 $\varphi(x)$ 及其导数 $\varphi'(x)$ 相乘"的结构。
+
+**常用凑微分模板**：
+
+| 被积形式 | 凑出的微分 | 新积分 |
+|---|---|---|
+| $f(ax+b)\,dx$ | $du = a\,dx$ | $\dfrac{1}{a}\int f(u)\,du$ |
+| $f(x^n)\cdot x^{n-1}\,dx$ | $du = nx^{n-1}\,dx$ | $\dfrac{1}{n}\int f(u)\,du$ |
+| $f(\ln x)\cdot \dfrac{dx}{x}$ | $du = \dfrac{dx}{x}$ | $\int f(u)\,du$ |
+| $f(e^x)\cdot e^x\,dx$ | $du = e^x\,dx$ | $\int f(u)\,du$ |
+| $f(\sin x)\cdot \cos x\,dx$ | $du = \cos x\,dx$ | $\int f(u)\,du$ |
+| $f(\tan x)\cdot \sec^2 x\,dx$ | $du = \sec^2 x\,dx$ | $\int f(u)\,du$ |
+
+> **例题 12.7** 计算 $\displaystyle\int_0^4 \sqrt{x}(1 + \sqrt{x}) \, dx$。
+
+**解**：设 $u = \sqrt{x}$，则 $du = \dfrac{1}{2\sqrt{x}}\,dx$，即 $\sqrt{x}\,dx = 2x \cdot \dfrac{du}{2} \cdot \dots$（此处用第二类换元更清晰，见下例）。这里直接做。或者：注意到 $\sqrt{x}(1+\sqrt{x}) = \sqrt{x} + x = x^{1/2} + x$，直接积分：
+
+$$\int_0^4 (x^{1/2} + x)\,dx = \left[\frac{2}{3}x^{3/2} + \frac{x^2}{2}\right]_0^4 = \frac{2}{3}\cdot 8 + 8 = \frac{16}{3} + 8 = \frac{40}{3}. \quad\square$$
+
+> **例题 12.7'** 计算 $\displaystyle\int_0^{\pi/2} \sin^3 x \cos x\,dx$。
+
+**解**：识别结构——出现 $\sin x$ 和它的导数 $\cos x$。凑微分：$d(\sin x) = \cos x\,dx$。
+
+令 $u = \sin x$，$du = \cos x\,dx$。$x=0\Rightarrow u=0$；$x=\pi/2\Rightarrow u=1$。
+
+$$\int_0^{\pi/2}\sin^3 x\cos x\,dx = \int_0^1 u^3\,du = \frac{u^4}{4}\Big|_0^1 = \frac{1}{4}.\quad\square$$
+
+---
+
+### 12.4.3 第二类换元法（变量替换法）
+
+**定理**（第二类换元法）：设 $f(x)$ 在 $[a, b]$ 上连续，若函数 $x = \varphi(t)$ 满足：
+
 1. $\varphi(\alpha) = a$，$\varphi(\beta) = b$
-2. $\varphi(t)$ 在 $[\alpha, \beta]$（或 $[\beta, \alpha]$）上有连续导数，且值域包含于 $[a, b]$
+2. $\varphi(t)$ 在 $[\alpha, \beta]$（或 $[\beta, \alpha]$）上有连续导数
+3. 值域 $\varphi([\alpha,\beta]) \subset [a,b]$（一般还要求 $\varphi$ 单调，使一一对应）
 
 则
-$$\int_a^b f(x) \, dx = \int_\alpha^\beta f[\varphi(t)] \varphi'(t) \, dt$$
 
-**注意**：换元后，积分限也要相应改变；计算完毕后无需换回原变量。
+$$\boxed{\int_a^b f(x)\,dx = \int_\alpha^\beta f(\varphi(t))\,\varphi'(t)\,dt.}$$
 
-> **例题 12.7** 计算 $\int_0^4 \sqrt{x}(1 + \sqrt{x}) \, dx$。
+**推导**：这其实是**第一类换元法反向使用**。把右端视为 $\int_\alpha^\beta g(t)\,dt$，其中 $g(t) = f(\varphi(t))\varphi'(t)$，由第一类换元法（推导见 12.4.2），它等于 $\int_{\varphi(\alpha)}^{\varphi(\beta)} f(u)\,du = \int_a^b f(u)\,du$。$\square$
 
-**解**：设 $t = \sqrt{x}$，则 $x = t^2$，$dx = 2t \, dt$。当 $x = 0$ 时 $t = 0$，当 $x = 4$ 时 $t = 2$。
-$$\int_0^4 \sqrt{x}(1 + \sqrt{x}) \, dx = \int_0^2 t(1 + t) \cdot 2t \, dt = 2\int_0^2 (t^2 + t^3) \, dt$$
-$$= 2\left[\frac{t^3}{3} + \frac{t^4}{4}\right]_0^2 = 2\left(\frac{8}{3} + 4\right) = 2 \cdot \frac{20}{3} = \frac{40}{3}$$
+**与第一类的区别**：
 
-$\square$
+| 角度 | 第一类（凑微分） | 第二类（变量替换） |
+|---|---|---|
+| 方向 | 把原变量 $x$ 凑成 $u=\varphi(x)$ | 把原变量 $x$ 设为新变量函数 $x=\varphi(t)$ |
+| 适用 | 被积函数已含 $\varphi(x)$ 与 $\varphi'(x)$ 结构 | 通过引入新变量消除根号、三角函数等障碍 |
+| 典型场景 | $\int f(\sin x)\cos x\,dx$ | $\int \sqrt{a^2-x^2}\,dx$ |
 
-> **例题 12.8** 计算 $\int_0^1 \sqrt{1 - x^2} \, dx$。
+**三角替换的三大类型**（消根号利器）：
 
-**解**：设 $x = \sin t$，则 $dx = \cos t \, dt$，$\sqrt{1 - x^2} = \cos t$。当 $x = 0$ 时 $t = 0$，当 $x = 1$ 时 $t = \dfrac{\pi}{2}$。
-$$\int_0^1 \sqrt{1 - x^2} \, dx = \int_0^{\pi/2} \cos t \cdot \cos t \, dt = \int_0^{\pi/2} \cos^2 t \, dt$$
-$$= \int_0^{\pi/2} \frac{1 + \cos 2t}{2} \, dt = \frac{1}{2}\left[t + \frac{\sin 2t}{2}\right]_0^{\pi/2} = \frac{1}{2} \cdot \frac{\pi}{2} = \frac{\pi}{4}$$
+| 被积函数中的形式 | 替换 | 用到的恒等式 |
+|---|---|---|
+| $\sqrt{a^2 - x^2}$ | $x = a\sin t$，$t\in[-\pi/2,\pi/2]$ | $1-\sin^2 t = \cos^2 t$ |
+| $\sqrt{a^2 + x^2}$ | $x = a\tan t$，$t\in(-\pi/2,\pi/2)$ | $1+\tan^2 t = \sec^2 t$ |
+| $\sqrt{x^2 - a^2}$ | $x = a\sec t$，$t\in[0,\pi/2)\cup[\pi,3\pi/2)$ | $\sec^2 t - 1 = \tan^2 t$ |
 
-几何意义：这正是单位圆在第一象限部分的面积。$\square$
+> **例题 12.8** 计算 $\displaystyle\int_0^1 \sqrt{1 - x^2} \, dx$。
 
-### 12.4.2 分部积分法
+**解**：根号 $\sqrt{1-x^2}$ → 用三角替换 $x = \sin t$，$dx = \cos t\,dt$，$\sqrt{1-x^2} = \sqrt{\cos^2 t} = \cos t$（$t\in[0,\pi/2]$ 时非负）。
 
-**定理**（定积分的分部积分法）：设 $u(x)$、$v(x)$ 在 $[a, b]$ 上有连续导数，则
-$$\int_a^b u \, dv = uv \Big|_a^b - \int_a^b v \, du$$
+积分限：$x=0\Rightarrow t=0$；$x=1\Rightarrow t=\pi/2$。
 
-> **例题 12.9** 计算 $\int_0^1 x e^x \, dx$。
+$$\int_0^1 \sqrt{1-x^2}\,dx = \int_0^{\pi/2} \cos t\cdot \cos t\,dt = \int_0^{\pi/2}\cos^2 t\,dt.$$
 
-**解**：取 $u = x$，$dv = e^x \, dx$，则 $du = dx$，$v = e^x$。
-$$\int_0^1 x e^x \, dx = x e^x \Big|_0^1 - \int_0^1 e^x \, dx = e - (e^x \Big|_0^1) = e - (e - 1) = 1$$
+用降幂公式 $\cos^2 t = \dfrac{1+\cos 2t}{2}$：
 
-$\square$
+$$= \int_0^{\pi/2}\frac{1+\cos 2t}{2}\,dt = \frac{1}{2}\left[t + \frac{\sin 2t}{2}\right]_0^{\pi/2} = \frac{1}{2}\cdot\frac{\pi}{2} = \frac{\pi}{4}.$$
 
-> **例题 12.10** 计算 $\int_0^{\pi/2} e^x \sin x \, dx$。
+**几何验证**：这正是单位圆在第一象限的面积 $\dfrac{\pi}{4}$。$\square$
 
-**解**：设 $I = \int_0^{\pi/2} e^x \sin x \, dx$。分部积分两次：
+> **例题 12.8'** 计算 $\displaystyle\int_0^1 \dfrac{dx}{1+x^2}$。
 
-第一次：$u = \sin x$，$dv = e^x \, dx$
-$$I = e^x \sin x \Big|_0^{\pi/2} - \int_0^{\pi/2} e^x \cos x \, dx = e^{\pi/2} - \int_0^{\pi/2} e^x \cos x \, dx$$
+**解**：设 $x = \tan t$，$dx = \sec^2 t\,dt$，$1+x^2 = \sec^2 t$。$x=0\Rightarrow t=0$；$x=1\Rightarrow t=\pi/4$。
 
-第二次：$u = \cos x$，$dv = e^x \, dx$
-$$\int_0^{\pi/2} e^x \cos x \, dx = e^x \cos x \Big|_0^{\pi/2} + \int_0^{\pi/2} e^x \sin x \, dx = -1 + I$$
+$$\int_0^1 \frac{dx}{1+x^2} = \int_0^{\pi/4} \frac{\sec^2 t}{\sec^2 t}\,dt = \int_0^{\pi/4}dt = \frac{\pi}{4}.\quad\square$$
 
-代入：$I = e^{\pi/2} - (-1 + I) = e^{\pi/2} + 1 - I$
+（当然，直接套 $\arctan x$ 更快——但这演示了三角替换的统一框架。）
 
-解得：$I = \dfrac{e^{\pi/2} + 1}{2}$ $\square$
+---
 
-### 12.4.3 对称性的利用
+### 12.4.4 分部积分法
 
-**定理**（奇偶函数的定积分）：设 $f(x)$ 在 $[-a, a]$ 上连续，则：
+**定理**（定积分的分部积分法）：设 $u(x), v(x)$ 在 $[a,b]$ 上有连续导数，则
 
-1. 若 $f(x)$ 为**偶函数**，则 $\int_{-a}^a f(x) \, dx = 2\int_0^a f(x) \, dx$
-2. 若 $f(x)$ 为**奇函数**，则 $\int_{-a}^a f(x) \, dx = 0$
+$$\boxed{\int_a^b u(x)v'(x)\,dx = u(x)v(x)\Big|_a^b - \int_a^b v(x)u'(x)\,dx,}$$
 
-**证明**：由区间可加性，$\int_{-a}^a f(x) \, dx = \int_{-a}^0 f(x) \, dx + \int_0^a f(x) \, dx$
+或写成微分形式 $\int_a^b u\,dv = uv\big|_a^b - \int_a^b v\,du$。
 
-对 $\int_{-a}^0 f(x) \, dx$，设 $x = -t$，则
-$$\int_{-a}^0 f(x) \, dx = -\int_a^0 f(-t) \, dt = \int_0^a f(-t) \, dt$$
+**完整推导**：
 
-若 $f$ 为偶函数，$f(-t) = f(t)$，则 $\int_{-a}^0 f(x) \, dx = \int_0^a f(t) \, dt$，故 $\int_{-a}^a f(x) \, dx = 2\int_0^a f(x) \, dx$。
+**第一步**：由乘积求导法则，
+$$\frac{d}{dx}[u(x)v(x)] = u'(x)v(x) + u(x)v'(x).$$
 
-若 $f$ 为奇函数，$f(-t) = -f(t)$，则 $\int_{-a}^0 f(x) \, dx = -\int_0^a f(t) \, dt$，故 $\int_{-a}^a f(x) \, dx = 0$。$\square$
+**第二步**：移项得
+$$u(x)v'(x) = \frac{d}{dx}[u(x)v(x)] - u'(x)v(x).$$
 
-> **例题 12.11** 计算 $\int_{-1}^1 (x^3 + x^4) \, dx$。
+**第三步**：两端在 $[a,b]$ 上积分：
+$$\int_a^b u(x)v'(x)\,dx = \int_a^b \frac{d}{dx}[u(x)v(x)]\,dx - \int_a^b u'(x)v(x)\,dx.$$
 
-**解**：$x^3$ 是奇函数，$x^4$ 是偶函数。
-$$\int_{-1}^1 (x^3 + x^4) \, dx = \int_{-1}^1 x^3 \, dx + \int_{-1}^1 x^4 \, dx = 0 + 2\int_0^1 x^4 \, dx = 2 \cdot \frac{x^5}{5}\Big|_0^1 = \frac{2}{5}$$
+**第四步**：对第一个积分应用 N-L 公式（被积函数是 $[uv]'$，原函数即 $uv$）：
+$$\int_a^b \frac{d}{dx}[u(x)v(x)]\,dx = u(x)v(x)\Big|_a^b.$$
 
-$\square$
+**第五步**：综上即得定理。$\square$
+
+**选择 $u$ 与 $dv$ 的策略（"反对幂指三"法则）**：
+
+按下表中"反"在前的顺序选 $u$（其余作 $dv$），通常能让分部积分简化：
+
+| 优先级 | 类别 | 例子 |
+|---|---|---|
+| 1（最优先选 $u$） | **反**三角函数 | $\arcsin x,\ \arctan x$ |
+| 2 | **对**数函数 | $\ln x,\ \log x$ |
+| 3 | **幂**函数 | $x,\ x^2,\ x^n$ |
+| 4 | **指**数函数 | $e^x,\ a^x$ |
+| 5（最末选 $u$） | **三**角函数 | $\sin x,\ \cos x$ |
+
+口诀：**反对幂指三**——前面的当 $u$，后面的当 $dv$。
+
+> **例题 12.9** 计算 $\displaystyle\int_0^1 xe^x\,dx$。
+
+**解**：幂 vs 指：选 $u = x$（幂在前），$dv = e^x\,dx$。则 $du = dx$，$v = e^x$。
+
+$$\int_0^1 xe^x\,dx = xe^x\Big|_0^1 - \int_0^1 e^x\,dx = e - (e^x\big|_0^1) = e - (e-1) = 1.\quad\square$$
+
+> **例题 12.9'** 计算 $\displaystyle\int_1^e \ln x\,dx$。
+
+**解**：对 vs 幂（隐含 1=幂）：选 $u = \ln x$（对在前），$dv = dx$。则 $du = \dfrac{dx}{x}$，$v = x$。
+
+$$\int_1^e \ln x\,dx = x\ln x\Big|_1^e - \int_1^e x\cdot\frac{1}{x}\,dx = e - 0 - \int_1^e dx = e - (e-1) = 1.\quad\square$$
+
+**循环型分部积分**：当连续两次分部积分后，原积分 $I$ 重新出现在右端，则可解出 $I$。
+
+> **例题 12.10** 计算 $\displaystyle I = \int_0^{\pi/2} e^x\sin x\,dx$。
+
+**解**：
+
+**第一次分部**：$u = \sin x$，$dv = e^x\,dx$；$du = \cos x\,dx$，$v = e^x$：
+$$I = e^x\sin x\Big|_0^{\pi/2} - \int_0^{\pi/2}e^x\cos x\,dx = e^{\pi/2} - J,$$
+其中 $J = \int_0^{\pi/2} e^x\cos x\,dx$。
+
+**第二次分部**（对 $J$）：$u = \cos x$，$dv = e^x\,dx$；$du = -\sin x\,dx$，$v = e^x$：
+$$J = e^x\cos x\Big|_0^{\pi/2} - \int_0^{\pi/2} e^x\cdot(-\sin x)\,dx = (0 - 1) + I = -1 + I.$$
+
+**代回**：$I = e^{\pi/2} - (-1 + I) = e^{\pi/2} + 1 - I$，故 $2I = e^{\pi/2} + 1$，即
+
+$$\boxed{I = \frac{e^{\pi/2} + 1}{2}.}\quad\square$$
+
+**关键**：两次分部要选**同类**（这里都把指数函数作 $dv$），否则会绕回原状态而无法解出。
+
+---
+
+### 12.4.5 对称性技巧
+
+#### (a) 奇偶函数在对称区间
+
+**定理**：设 $f$ 在 $[-a,a]$ 上连续，则
+
+$$\int_{-a}^a f(x)\,dx = \begin{cases} 2\int_0^a f(x)\,dx, & f\text{ 为偶函数}, \\ 0, & f\text{ 为奇函数}. \end{cases}$$
+
+**完整推导**：
+
+**第一步**：由区间可加性
+$$\int_{-a}^a f(x)\,dx = \int_{-a}^0 f(x)\,dx + \int_0^a f(x)\,dx.$$
+
+**第二步**：对 $\int_{-a}^0 f(x)\,dx$ 作变量替换 $x = -t$，$dx = -dt$。当 $x = -a$ 时 $t = a$；当 $x = 0$ 时 $t = 0$：
+$$\int_{-a}^0 f(x)\,dx = \int_a^0 f(-t)\cdot(-dt) = \int_0^a f(-t)\,dt.$$
+
+**第三步**：
+- 若 $f$ 偶：$f(-t) = f(t)$，则 $\int_{-a}^0 f\,dx = \int_0^a f(t)\,dt$，相加得 $2\int_0^a f$。
+- 若 $f$ 奇：$f(-t) = -f(t)$，则 $\int_{-a}^0 f\,dx = -\int_0^a f(t)\,dt$，相加得 $0$。$\square$
+
+> **例题 12.11** 计算 $\displaystyle\int_{-1}^1 (x^3 + x^4)\,dx$。
+
+**解**：$x^3$ 奇 → 积分为 0；$x^4$ 偶 → $2\int_0^1 x^4\,dx = 2\cdot\dfrac{1}{5} = \dfrac{2}{5}$。结果 $\dfrac{2}{5}$。$\square$
+
+#### (b) 区间再现公式（"补对称"技巧）
+
+**定理**（区间再现）：设 $f$ 在 $[a,b]$ 上连续，则
+
+$$\boxed{\int_a^b f(x)\,dx = \int_a^b f(a+b-x)\,dx.}$$
+
+**推导**：令 $t = a + b - x$，则 $dt = -dx$。当 $x=a\Rightarrow t=b$；$x=b\Rightarrow t=a$：
+
+$$\int_a^b f(x)\,dx = \int_b^a f(a+b-t)\cdot(-dt) = \int_a^b f(a+b-t)\,dt.$$
+
+把哑变量 $t$ 改回 $x$ 即得。$\square$
+
+**应用威力**：当 $f(x) + f(a+b-x)$ 简化时，把两式相加再除以 2。
+
+> **典型应用**：$\displaystyle\int_0^{\pi/2}\frac{\sin x}{\sin x + \cos x}\,dx$。
+
+**解**：设 $I = \int_0^{\pi/2}\dfrac{\sin x}{\sin x+\cos x}\,dx$。由区间再现（$a+b=\pi/2$）：
+$$I = \int_0^{\pi/2}\frac{\sin(\pi/2 - x)}{\sin(\pi/2-x)+\cos(\pi/2-x)}\,dx = \int_0^{\pi/2}\frac{\cos x}{\cos x + \sin x}\,dx.$$
+
+两式相加：
+$$2I = \int_0^{\pi/2}\frac{\sin x + \cos x}{\sin x + \cos x}\,dx = \int_0^{\pi/2}1\,dx = \frac{\pi}{2},$$
+
+故 $I = \dfrac{\pi}{4}$。$\square$
+
+#### (c) $\int_0^\pi xf(\sin x)\,dx$ 公式
+
+**定理**：若 $f$ 连续，则
+
+$$\int_0^\pi xf(\sin x)\,dx = \frac{\pi}{2}\int_0^\pi f(\sin x)\,dx.$$
+
+**推导**：令 $t = \pi - x$，$dt = -dx$。$x=0\Rightarrow t=\pi$；$x=\pi\Rightarrow t=0$；$\sin x = \sin(\pi - t) = \sin t$：
+$$\int_0^\pi xf(\sin x)\,dx = \int_\pi^0 (\pi - t)f(\sin t)\cdot(-dt) = \int_0^\pi (\pi - t)f(\sin t)\,dt.$$
+
+把右端拆开（哑变量统一写作 $x$）：
+$$\int_0^\pi xf(\sin x)\,dx = \pi\int_0^\pi f(\sin x)\,dx - \int_0^\pi xf(\sin x)\,dx.$$
+
+移项：$2\int_0^\pi xf(\sin x)\,dx = \pi\int_0^\pi f(\sin x)\,dx$，即得证。$\square$
+
+---
+
+### 12.4.6 周期函数的定积分
+
+**定理**：设 $f$ 是周期为 $T$ 的连续函数，则
+
+1. 在任意一个长度为 $T$ 的区间上的积分都相等：
+$$\int_a^{a+T} f(x)\,dx = \int_0^T f(x)\,dx,\quad \forall a\in\mathbb{R}.$$
+
+2. 对任意正整数 $n$：
+$$\int_a^{a+nT} f(x)\,dx = n\int_0^T f(x)\,dx.$$
+
+**推导**（第 1 式）：定义 $\Phi(a) = \int_a^{a+T} f(x)\,dx$。由 N-L 公式（设 $F$ 为 $f$ 的原函数）：
+$$\Phi(a) = F(a+T) - F(a).$$
+
+求导（注意 $f$ 周期 $T$ 意味着 $F(a+T) - F(a)$ 是常数？需验证）：
+$$\Phi'(a) = f(a+T) - f(a) = 0 \quad(\text{因 } f \text{ 周期 } T).$$
+
+故 $\Phi(a)$ 与 $a$ 无关，恒等于 $\Phi(0) = \int_0^T f(x)\,dx$。$\square$
+
+（第 2 式由可加性反复用第 1 式即得。）
+
+> **例**：$\int_0^{100\pi}|\sin x|\,dx = 100\int_0^\pi \sin x\,dx = 100\cdot 2 = 200$。
+
+---
+
+### 12.4.7 含参数的定积分与参数求导法（Leibniz 法则）
+
+很多积分本身难算，但加一个参数 $\alpha$ 后**对 $\alpha$ 求导**反而变简单——这就是 Feynman 最爱的"参数求导法"。
+
+**定理**（Leibniz 积分法则 / 含参积分求导）：设 $f(x, \alpha)$ 与 $\dfrac{\partial f}{\partial \alpha}$ 在矩形 $[a,b]\times[\alpha_1,\alpha_2]$ 上连续，则
+
+$$\boxed{\frac{d}{d\alpha}\int_a^b f(x,\alpha)\,dx = \int_a^b \frac{\partial f(x,\alpha)}{\partial \alpha}\,dx.}$$
+
+即"求导与积分可以交换次序"。
+
+**完整推导**（要点）：
+
+**第一步**：设 $I(\alpha) = \int_a^b f(x,\alpha)\,dx$。
+
+**第二步**：考察增量
+$$\frac{I(\alpha+h) - I(\alpha)}{h} = \int_a^b \frac{f(x,\alpha+h) - f(x,\alpha)}{h}\,dx.$$
+
+**第三步**：由中值定理，存在 $\theta \in (0,1)$ 使被积函数 = $\dfrac{\partial f}{\partial\alpha}(x, \alpha + \theta h)$。
+
+**第四步**：由 $\dfrac{\partial f}{\partial \alpha}$ 在闭矩形上一致连续，当 $h\to 0$ 时被积函数一致收敛到 $\dfrac{\partial f}{\partial\alpha}(x,\alpha)$，可在积分号下取极限。$\square$
+
+**更一般的 Leibniz 法则**（积分限也依赖于 $\alpha$）：
+
+$$\frac{d}{d\alpha}\int_{a(\alpha)}^{b(\alpha)} f(x,\alpha)\,dx = f(b(\alpha),\alpha)\cdot b'(\alpha) - f(a(\alpha),\alpha)\cdot a'(\alpha) + \int_{a(\alpha)}^{b(\alpha)}\frac{\partial f}{\partial\alpha}\,dx.$$
+
+> **例题 12.11'**（Feynman 经典题）：用参数求导法计算 $\displaystyle I(\alpha) = \int_0^1 \frac{x^\alpha - 1}{\ln x}\,dx$，$\alpha > -1$。
+
+**解**：直接对 $\alpha$ 求导：
+$$I'(\alpha) = \int_0^1 \frac{\partial}{\partial\alpha}\left(\frac{x^\alpha - 1}{\ln x}\right)\,dx = \int_0^1 \frac{x^\alpha \ln x}{\ln x}\,dx = \int_0^1 x^\alpha\,dx = \frac{1}{\alpha + 1}.$$
+
+故 $I(\alpha) = \ln(\alpha+1) + C$。又 $I(0) = 0 \Rightarrow C = 0$。
+
+$$\boxed{I(\alpha) = \ln(\alpha + 1).}\quad\square$$
+
+---
+
+### 12.4.8 递推公式与 Wallis 公式
+
+**记号**：$I_n = \displaystyle\int_0^{\pi/2}\sin^n x\,dx$。
+
+**递推公式推导**：对 $n\ge 2$，
+
+**第一步**：写
+$$I_n = \int_0^{\pi/2}\sin^{n-1}x\cdot \sin x\,dx.$$
+
+**第二步**：分部，取 $u = \sin^{n-1}x$，$dv = \sin x\,dx$。则 $du = (n-1)\sin^{n-2}x\cos x\,dx$，$v = -\cos x$：
+$$I_n = -\sin^{n-1}x\cos x\Big|_0^{\pi/2} + (n-1)\int_0^{\pi/2}\sin^{n-2}x\cos^2 x\,dx.$$
+
+**第三步**：边界项 = 0（$\sin 0 = 0$，$\cos(\pi/2)=0$）。用 $\cos^2 x = 1 - \sin^2 x$：
+$$I_n = (n-1)\int_0^{\pi/2}\sin^{n-2}x(1-\sin^2 x)\,dx = (n-1)I_{n-2} - (n-1)I_n.$$
+
+**第四步**：移项得**递推公式**：
+
+$$\boxed{I_n = \frac{n-1}{n}I_{n-2},\quad n\ge 2.}$$
+
+**初值**：$I_0 = \int_0^{\pi/2}dx = \dfrac{\pi}{2}$；$I_1 = \int_0^{\pi/2}\sin x\,dx = 1$。
+
+**展开得 Wallis 公式**：
+
+$$I_n = \begin{cases} \dfrac{(n-1)!!}{n!!}\cdot\dfrac{\pi}{2}, & n\text{ 偶}, \\ \dfrac{(n-1)!!}{n!!}, & n\text{ 奇}. \end{cases}$$
+
+其中双阶乘 $n!! = n(n-2)(n-4)\cdots$。
+
+**例**：
+
+- $I_4 = \dfrac{3}{4}\cdot\dfrac{1}{2}\cdot\dfrac{\pi}{2} = \dfrac{3\pi}{16}$；
+- $I_5 = \dfrac{4}{5}\cdot\dfrac{2}{3}\cdot 1 = \dfrac{8}{15}$。
+
+**对 $\cos^n x$ 同样成立**：由区间 $[0,\pi/2]$ 上的余角变换 $x \mapsto \pi/2 - x$，$\int_0^{\pi/2}\cos^n x\,dx = I_n$。
+
+---
+
+### 12.4.9 综合运用：三步法决策树
+
+面对一个具体定积分，按以下顺序检查可能套路：
+
+```
+Step 1: 检查对称性
+   ├─ [-a, a] 上是否奇偶？      → 12.4.5(a)
+   ├─ 区间端点和与被积有关？   → 12.4.5(b) 区间再现
+   └─ 周期函数 + 整周期区间？   → 12.4.6
+        否 ↓
+Step 2: 检查是否能凑微分
+   ├─ 含 φ(x)与φ'(x)结构？     → 12.4.2 第一类换元
+   └─ 含 √(a²±x²) 等根号？    → 12.4.3 第二类换元（三角替换）
+        否 ↓
+Step 3: 分部积分
+   ├─ "反对幂指三" 选 u, dv   → 12.4.4
+   └─ 出现循环 → 解方程
+        否 ↓
+Step 4: 高级技巧
+   ├─ 加参数 α，对 α 求导     → 12.4.7
+   ├─ 递推/Wallis            → 12.4.8
+   └─ 数值积分               → 12.6
+```
+
+> **例题 12.11''**（综合运用）：计算 $\displaystyle\int_{-\pi/2}^{\pi/2}\frac{\cos x}{1+e^x}\,dx$。
+
+**解**：表面看是分式 + 三角函数，难。**先查对称性**：区间 $[-\pi/2, \pi/2]$ 关于 0 对称——用区间再现 $x \to -x$：
+
+$$I = \int_{-\pi/2}^{\pi/2}\frac{\cos(-x)}{1+e^{-x}}\,dx = \int_{-\pi/2}^{\pi/2}\frac{\cos x}{1+e^{-x}}\,dx.$$
+
+把分母通分：$\dfrac{1}{1+e^{-x}} = \dfrac{e^x}{1+e^x}$，所以
+
+$$I = \int_{-\pi/2}^{\pi/2}\frac{e^x\cos x}{1+e^x}\,dx.$$
+
+与原式相加：
+$$2I = \int_{-\pi/2}^{\pi/2}\frac{(1+e^x)\cos x}{1+e^x}\,dx = \int_{-\pi/2}^{\pi/2}\cos x\,dx = 2\sin\frac{\pi}{2} = 2.$$
+
+故 $\boxed{I = 1}$。$\square$
+
+**注**：这道题的核心在第一步——若不识别对称性而硬算，几乎无路可走。这正是 12.4 各种技巧的价值：选对工具，难题秒解。
 
 ---
 
