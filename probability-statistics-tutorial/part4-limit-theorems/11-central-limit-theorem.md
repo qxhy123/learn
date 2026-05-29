@@ -77,6 +77,8 @@ $$
 \bar{X}_n \xrightarrow{d} \mathcal{N}\!\left(\mu,\, \frac{\sigma^2}{n}\right)
 $$
 
+> **符号 $\xrightarrow{d}$（依分布收敛）先给最小定义**：$Z_n \xrightarrow{d} Z$ **不是**说随机变量 $Z_n$ 本身趋于某个数或某个随机变量，而是说 $Z_n$ 的**分布函数**逐点趋于目标分布函数——在目标 $F$ 的每个连续点 $x$ 处 $P(Z_n\le x)\to F(x)$。上面方框里的极限式 $P\!\big(\tfrac{S_n-n\mu}{\sigma\sqrt n}\le x\big)\to\Phi(x)$ 正是这个定义在本定理中的展开。"为什么随机序列的收敛要这样定义、它和大数定律里的'依概率收敛'有何不同"——见 [第三部分前的导论《什么是收敛与极限定理》](./09b-what-is-convergence.md)，严格定义与等价刻画见 [第12章 §12.2](./12-convergence-theory.md)。
+
 ### 证明思路（特征函数方法）
 
 **定义**：随机变量 $X$ 的**特征函数**（characteristic function）为：

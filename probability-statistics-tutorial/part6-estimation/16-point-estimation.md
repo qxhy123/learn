@@ -362,6 +362,24 @@ $$
 
 $I(\theta)$ 度量了样本中关于参数 $\theta$ 所含信息的多少——$I(\theta)$ 越大，参数越"可估"。
 
+**为什么偏偏是这个量？（直觉 + 推导）** 记 **得分函数**（score function）$S(\theta) = \dfrac{\partial}{\partial\theta}\log f(X;\theta)$，它衡量"对数似然随 $\theta$ 变化的敏感度"。在正则条件下它的**均值为零**：
+
+$$
+E[S(\theta)] = \int \frac{\partial_\theta f}{f}\, f\,dx = \frac{\partial}{\partial\theta}\int f(x;\theta)\,dx = \frac{\partial}{\partial\theta}\,1 = 0.
+$$
+
+既然得分均值为零，它的"波动幅度"就由方差刻画，而 $I(\theta) = \operatorname{Var}\big(S(\theta)\big) = E[S(\theta)^2]$ ——这正是第一个表达式。**直觉**：若 $\theta$ 稍变就让对数似然剧烈起伏（得分波动大），数据就能敏锐地"分辨"出 $\theta$，信息量大。
+
+**两种形式为何相等？** 把恒等式 $\int (\partial_\theta\log f)\,f\,dx = 0$ 再对 $\theta$ 求一次导：
+
+$$
+\int \Big[\big(\partial_\theta^2\log f\big)\,f + \big(\partial_\theta\log f\big)\big(\partial_\theta f\big)\Big]dx = 0
+\;\Longrightarrow\;
+E\big[\partial_\theta^2\log f\big] + E\big[(\partial_\theta\log f)^2\big] = 0,
+$$
+
+（第二项用了 $\partial_\theta f = (\partial_\theta\log f)\,f$），于是 $E[(\partial_\theta\log f)^2] = -E[\partial_\theta^2\log f]$，即两式相等。后一形式（对数似然的**负曲率**）说明：似然峰越"尖"，信息越多。以上推导依赖 §16.5.4 列出的正则条件（积分与求导可交换等）。
+
 **Cramér-Rao 下界定理**：对任意无偏估计量 $\hat{\theta}$，有
 
 $$

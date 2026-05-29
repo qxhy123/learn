@@ -373,6 +373,8 @@ $$
 
 其中 $\mathbf{I}(\boldsymbol{\eta})$ 是 **Fisher 信息矩阵**。这一关系揭示了指数族的深刻结构：**充分统计量的期望完全刻画了参数的信息**。
 
+> **Fisher 信息（先给最小定义）**：单参数情形下，$I(\theta) = \operatorname{Var}_\theta\!\big[\partial_\theta\log f(X;\theta)\big] = E\big[(\partial_\theta\log f)^2\big] = -E\big[\partial_\theta^2\log f\big]$，度量"样本中关于参数 $\theta$ 的信息量"——对数似然随 $\theta$ 变化越敏感（峰越尖），信息越多。多参数时把一阶导数换成梯度、方差换成协方差矩阵，即得 $\mathbf{I}(\boldsymbol\eta)$。其完整动机与"两种形式为何相等"的推导见 [第16章 §16.4.2](../part6-estimation/16-point-estimation.md)；本章只需知道它是一个可由分布算出的、衡量信息量的量。
+
 ### 15.5.5 充分统计量与 Fisher 信息
 
 **定理 15.7（充分统计量的 Fisher 信息保持性）**
