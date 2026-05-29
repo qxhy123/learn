@@ -136,6 +136,18 @@ $$\mathcal{L}(\mathbf{x}, \boldsymbol{\mu}, \boldsymbol{\lambda}) = f(\mathbf{x}
 
 对于活跃约束 $g_i(\mathbf{x}^*) = 0$，情况类似于等式约束，但需额外考虑可行下降方向。直觉上，若存在方向 $\mathbf{d}$ 使得 $f$ 减小（$\nabla f^\top \mathbf{d} < 0$）且不违反活跃约束（$\nabla g_i^\top \mathbf{d} \leq 0$），则 $\mathbf{x}^*$ 不是极小点。
 
+**从"无可行下降方向"到乘子非负（Farkas 引理）**：把上面的直觉变成推导。$\mathbf{x}^*$ 是局部极小的必要条件，就是**不存在**可行下降方向——即不存在 $\mathbf{d}$ 同时满足
+
+$$\nabla f(\mathbf{x}^*)^\top \mathbf{d} < 0, \qquad \nabla g_i(\mathbf{x}^*)^\top \mathbf{d} \leq 0 \ \ (i \in \mathcal{A}).$$
+
+（先只看活跃不等式约束；等式约束 $h_j=0$ 可拆成 $h_j\le0$ 与 $-h_j\le0$ 两个不等式同理纳入。）"该线性不等式组无解"恰能由 **Farkas 引理**（择一定理）翻译成"存在非负组合"：
+
+> **Farkas 引理（择一形式）**：给定向量 $\mathbf{a}$ 与一组 $\{\mathbf{b}_i\}$，以下两命题**恰有一个**成立：
+> ① 存在 $\mathbf{d}$ 使 $\mathbf{a}^\top\mathbf{d}<0$ 且对所有 $i$ 有 $\mathbf{b}_i^\top\mathbf{d}\le0$；
+> ② 存在 $\mu_i\ge0$ 使 $\mathbf{a}+\sum_i\mu_i\mathbf{b}_i=\mathbf{0}$（即 $-\mathbf{a}$ 是 $\{\mathbf{b}_i\}$ 的**非负**线性组合）。
+
+取 $\mathbf{a}=\nabla f(\mathbf{x}^*)$、$\mathbf{b}_i=\nabla g_i(\mathbf{x}^*)$。既然 $\mathbf{x}^*$ 是极小点，命题 ① 不成立，故 ② 必成立：存在 $\mu_i\ge0$ 使 $\nabla f(\mathbf{x}^*)+\sum_{i\in\mathcal{A}}\mu_i\nabla g_i(\mathbf{x}^*)=\mathbf{0}$。对非活跃约束补充令 $\mu_i=0$，即同时得到**梯度条件**与**互补松弛** $\mu_i g_i=0$；而 ② 中的 $\mu_i\ge0$ **正是对偶可行性（$\mu_i^*\ge0$）的来源**——这解释了为什么不等式约束的乘子必须非负、而等式约束乘子无符号限制（等式约束的可行方向双向均可走，对应乘子可正可负）。该推导以活跃约束梯度满足约束规范（如 LICQ，见 8.4 节）为前提。
+
 ### 8.2.3 KKT 条件（一阶必要条件）
 
 **定理 8.1（KKT 必要条件）**
@@ -170,7 +182,11 @@ $$\nabla f(\mathbf{x}^*) = -\sum_{i \in \mathcal{A}} \mu_i^* \nabla g_i(\mathbf{
 
 表明：**在极小点处，目标函数的梯度必须可以用活跃约束梯度的非负线性组合（加上等式约束梯度的线性组合）来表示**。
 
-几何上，$-\nabla f(\mathbf{x}^*)$ 必须在活跃不等式约束梯度和等式约束梯度张成的**法锥**（normal cone）内。
+几何上，$-\nabla f(\mathbf{x}^*)$ 必须在活跃不等式约束梯度和等式约束梯度张成的**法锥**（normal cone）内。这里的法锥定义为
+
+$$N(\mathbf{x}^*) = \Big\{\, \sum_{i\in\mathcal{A}}\mu_i\,\nabla g_i(\mathbf{x}^*) + \sum_{j=1}^{p}\lambda_j\,\nabla h_j(\mathbf{x}^*)\ :\ \mu_i\ge 0,\ \lambda_j\in\mathbb{R} \,\Big\},$$
+
+即活跃约束梯度的"非负锥"再加上等式约束梯度张成的子空间——它正是可行域在 $\mathbf{x}^*$ 处所有"向外法向"的集合。梯度条件 $-\nabla f(\mathbf{x}^*)\in N(\mathbf{x}^*)$ 说的就是：目标函数的下降方向 $-\nabla f$ 被约束的法向完全"顶住"，再无可行的下降余地。
 
 **一维直觉：** 若在可行域边界 $g(\mathbf{x}^*) = 0$ 处极小，则 $\nabla f$ 必须指向约束外侧（否则可沿约束内侧继续减小 $f$），即 $\nabla f = -\mu \nabla g$，$\mu > 0$。
 
