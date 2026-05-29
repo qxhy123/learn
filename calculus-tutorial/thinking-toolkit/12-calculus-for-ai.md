@@ -329,7 +329,10 @@ $$L(w_t) - L(w^*) \leq \left(1 - \frac{\eta \lambda_{\min}(H)}{\lambda_{\max}(H)
 
 $$\text{KL}(q_\phi(z|x) \| p(z)) = \frac{1}{2}\sum_{j=1}^d \left(\mu_j^2 + \sigma_j^2 - \ln\sigma_j^2 - 1\right)$$
 
-**微积分推导**：代入 $\text{KL}(p\|q) = \int p\ln(p/q)\,dz$，利用 $\ln$ 的线性性和高斯的对称性，展开求积分（每个维度独立）。结果由 $\mathbb{E}[\mu^2 + z^2 - \ln\sigma^2 - z^2/\sigma^2]$ 化简得到。
+**微积分推导**（单维，$q = \mathcal{N}(\mu, \sigma^2)$，$p = \mathcal{N}(0, 1)$，多维各维独立求和）：代入对数差
+$$\ln\frac{q(z)}{p(z)} = -\tfrac{1}{2}\ln\sigma^2 - \frac{(z-\mu)^2}{2\sigma^2} + \frac{z^2}{2},$$
+对 $z \sim q$ 取期望，用 $\mathbb{E}[(z-\mu)^2] = \sigma^2$、$\mathbb{E}[z^2] = \sigma^2 + \mu^2$：
+$$\text{KL} = \mathbb{E}_q\!\left[\ln\frac{q}{p}\right] = -\tfrac{1}{2}\ln\sigma^2 - \tfrac{1}{2} + \tfrac{1}{2}(\sigma^2 + \mu^2) = \tfrac{1}{2}\big(\sigma^2 + \mu^2 - 1 - \ln\sigma^2\big).$$
 
 **意义**：KL 项作为正则化，使编码器的输出分布贴近先验 $\mathcal{N}(0, I)$，确保隐空间的连续性（可以从先验采样然后解码生成新样本）。
 
@@ -362,7 +365,7 @@ $$\text{KL}(q_\phi(z|x) \| p(z)) = \frac{1}{2}\sum_{j=1}^d \left(\mu_j^2 + \sigm
 
 **第 3 题**：解释为什么 $\text{KL}(p\|q) \neq \text{KL}(q\|p)$（举一个具体的概率分布对），并说明在 VAE 中为什么选用 $\text{KL}(q\|p)$ 而不是 $\text{KL}(p\|q)$。
 
-> 提示：取 $p = \mathcal{N}(3, 1)$，$q = \mathcal{N}(0, 1)$，$\text{KL}(p\|q) = 9/2$，$\text{KL}(q\|p) = 9/2$（此例对称，换 $p = \mathcal{N}(0, 1)$，$q$ 为混合高斯可以有明显差异）。VAE 中最大化 ELBO 自然导出 $\text{KL}(q_\phi(z|x)\|p(z))$（KL 是对 $q$ 的期望，而 $q$ 是编码器输出的可采样分布）；$\text{KL}(p(z)\|q_\phi)$ 要求对 $p$ 积分，而 $p(z|x)$（真后验）是无法直接计算的。
+> 提示：取 $p = \mathcal{N}(0, 1)$，$q = \mathcal{N}(0, 4)$（方差不同），由单维高斯 KL 闭式 $\text{KL}(\mathcal{N}(m_1,s_1^2)\|\mathcal{N}(m_2,s_2^2)) = \ln\dfrac{s_2}{s_1} + \dfrac{s_1^2 + (m_1-m_2)^2}{2s_2^2} - \dfrac{1}{2}$，得 $\text{KL}(p\|q) = \ln 2 - \dfrac{3}{8} \approx 0.318$，而 $\text{KL}(q\|p) = \dfrac{3}{2} - \ln 2 \approx 0.807$，两者不等，故 KL 不对称。VAE 中最大化 ELBO 自然导出 $\text{KL}(q_\phi(z|x)\|p(z))$（KL 是对 $q$ 的期望，而 $q$ 是编码器输出的可采样分布）；$\text{KL}(p(z)\|q_\phi)$ 要求对 $p$ 积分，而 $p(z|x)$（真后验）是无法直接计算的。
 
 **第 4 题**：Newton 法在 $f(x) = x^2$ 上从 $x_0 = 3$ 出发，一步到达最优解 $x^* = 0$。验证这一点，并解释为什么 Newton 法对二次函数恰好一步收敛。
 

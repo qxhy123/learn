@@ -144,11 +144,17 @@ $$= \int_0^{\arctan 2} \frac{\tan^2\theta}{4} \cdot \sec\theta \cdot \frac{1}{2}
 
 $$= \frac{1}{8}\int_0^{\arctan 2} (\sec^2\theta - 1)\sec^3\theta\,d\theta = \frac{1}{8}\int_0^{\arctan 2} (\sec^5\theta - \sec^3\theta)\,d\theta$$
 
-利用递推公式或查表，最终得
+利用递推公式 $\int\sec^3\theta\,d\theta = \dfrac{1}{2}(\sec\theta\tan\theta + \ln|\sec\theta+\tan\theta|)$ 与 $\int\sec^5\theta\,d\theta = \dfrac{1}{4}\sec^3\theta\tan\theta + \dfrac{3}{4}\int\sec^3\theta\,d\theta$，得
 
-$$\int_L y\,ds = \frac{1}{24}\left[(2 + \sqrt{5})\sqrt{5} - \ln(2 + \sqrt{5})\right] = \frac{5\sqrt{5} + 1}{24} - \frac{\ln(2 + \sqrt{5})}{24}$$
+$$\int_0^{\arctan 2}(\sec^5\theta - \sec^3\theta)\,d\theta = \frac{1}{4}\sec^3\theta\tan\theta - \frac{1}{4}\cdot\frac{1}{2}(\sec\theta\tan\theta + \ln|\sec\theta+\tan\theta|)\Big|_0^{\arctan 2}$$
 
-化简：$\int_L y\,ds = \dfrac{5\sqrt{5} + 1 - \ln(2 + \sqrt{5})}{24}$
+在 $\theta = \arctan 2$ 处 $\tan\theta = 2$，$\sec\theta = \sqrt{5}$；在 $\theta = 0$ 处 $\tan\theta = 0$，$\sec\theta = 1$，代入得
+
+$$\int_0^{\arctan 2}(\sec^5\theta - \sec^3\theta)\,d\theta = \frac{1}{4}\cdot 10\sqrt{5} - \frac{1}{8}\left(2\sqrt{5} + \ln(2+\sqrt{5})\right) = \frac{9\sqrt{5}}{4} - \frac{\ln(2+\sqrt{5})}{8}$$
+
+因此
+
+$$\int_L y\,ds = \frac{1}{8}\left(\frac{9\sqrt{5}}{4} - \frac{\ln(2+\sqrt{5})}{8}\right) = \frac{9\sqrt{5}}{32} - \frac{\ln(2+\sqrt{5})}{64} = \frac{18\sqrt{5} - \ln(2+\sqrt{5})}{64}$$
 
 ---
 
@@ -1242,23 +1248,3 @@ $$\oint_C = \iint_D (1+m)\,dA = (1+m)\pi a^2$$
 > Green：闭合曲线 → $\iint_D(Q_x-P_y)\,dA$；路径无关 $\Leftrightarrow$ $Q_x=P_y$ $\Leftrightarrow$ 存在势函数。
 
 如果现在不看笔记，能独立完成例 2 + 例 3 + 自测 2——本章，你拿下了。
-
----
-
-## 融合版说明
-
-本版 = **原版（严格大学教材 + 深度学习应用）** + **重写版（速记 / 路径 / 套路 / 例题 / 自测）** 融合：
-
-| 段落 | 来源 | 价值 |
-|---|---|---|
-| 一例速记 + 引入 + 思维路径还原 | 重写版（前置） | 建立直觉 / 反射 |
-| 学习目标 + 20.1–20.4 严格正文 | 原版 | 完整推导 |
-| 几何示意（图） | 配图 | 可视化 |
-| 抽象成方法 + 方法变形 | 重写版（中间） | 套路总结 |
-| 思考路标 + 易错点 | 融合两版 | 条件反射 |
-| 典型应用例题 3 例 | 重写版 | 演练 |
-| 深度学习应用 + 代码 | 原版 | 工业实战 |
-| 练习题 + 详解 | 原版 | 巩固 |
-| 自测题 5 题 | 重写版 | 额外训练 |
-
-**适用**：一站式学习——先速记建立直觉，看严格推导，做套路总结，看代码实战，做习题巩固，自测验收。

@@ -9,6 +9,8 @@
 > | 微分熵（高斯） | $h=\frac12\ln(2\pi e\sigma^2)$ | 方差固定时高斯熵最大 |
 > | KL（两高斯） | $\ln\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12$ | 三项：log 比 + 方差比 + 常数 |
 > | ELBO | $\log p(x)\geq\mathbb{E}_q[\log p(x,z)-\log q(z)]$ | Jensen + 对数凹，等号在 $q=p(\cdot\vert x)$ |
+>
+> **记号约定**：本书 $\mathcal N(\mu,\sigma^2)$ 的第二参数恒为**方差**；KL 公式中 $\sigma$ 表标准差（$=\sqrt{\text{方差}}$）。
 
 ---
 
@@ -773,27 +775,7 @@ $\frac{\partial\mathcal{L}}{\partial\mu}=\mathbb{E}_{\varepsilon}\!\left[\frac{\
 
 **自测 5**　设 $p=\mathcal{N}(1,1)$，$q=\mathcal{N}(0,2)$。分别计算 $\mathrm{KL}(p\|q)$ 和 $\mathrm{KL}(q\|p)$，并比较大小。
 
-> 💡 提示：用一维高斯 KL 公式。$\mathrm{KL}(p\|q)=\ln\sqrt{2}+\frac{1+1}{4}-\frac12=\frac12\ln 2$；$\mathrm{KL}(q\|p)=\ln\frac{1}{\sqrt{2}}+\frac{4+1}{2}-\frac12=2-\frac12\ln 2$。非对称，$\mathrm{KL}(q\|p)>\mathrm{KL}(p\|q)$。
-
----
-
-## 融合版说明
-
-本版 = **原版（概率微积分严格推导 + 信息论 + 变分推断）** + **融合补充（速记 / 路径 / 套路 / 例题 / 自测）**：
-
-| 段落 | 来源 | 价值 |
-|------|------|------|
-| 一例速记 + 引入 + 思维路径还原 | 融合版（前置） | 建立直觉 / 条件反射 |
-| 学习目标 + 27.1–27.5 严格正文 | 原版 | 完整推导 |
-| 几何示意（图） | 配图 | 可视化 |
-| 抽象成方法 + 方法变形 | 融合版 | 套路总结 |
-| 本章小结 | 原版 | 公式速查 |
-| 思考路标 + 易错点 | 融合两版 | 条件反射 |
-| 典型应用例题 3 例 | 融合版 | 演练 |
-| 练习题 + 详解 | 原版 | 巩固 |
-| 自测题 5 题 | 融合版 | 额外训练 |
-
-**适用**：先看速记建立期望-KL-ELBO 三角直觉，看严格推导，做套路总结，最后用例题 + 自测验收。掌握"高斯积分-Jensen-重参数化"三件套，贝叶斯深度学习推导得心应手。
+> 💡 提示：用一维高斯 KL 公式。$\mathrm{KL}(p\|q)=\ln\sqrt{2}+\frac{1+1}{4}-\frac12=\frac12\ln 2$；$\mathrm{KL}(q\|p)=\ln\frac{1}{\sqrt{2}}+\frac{2+1}{2}-\frac12=1-\frac12\ln 2\approx0.653$。非对称，$\mathrm{KL}(q\|p)>\mathrm{KL}(p\|q)$。
 
 ---
 

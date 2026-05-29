@@ -739,33 +739,27 @@ $$-\ln\frac{a_1+\cdots+a_n}{n}\le\frac{1}{n}\sum_{i=1}^n(-\ln a_i)=-\ln(a_1\cdot
 
 ## E.08 [提升] Ch.9
 
-**题目回顾**　设 $f\in C[0,1]$，$(0,1)$ 可导，$\displaystyle\int_0^1 f(x)\,dx=0$。证明 $\exists\xi\in(0,1)$ 使 $f'(\xi)=0$。
+**题目回顾**　设 $f\in C[0,1]$，$(0,1)$ 可导，$\displaystyle\int_0^1 f(x)\,dx=0$。证明 $\exists\xi\in(0,1)$ 使 $f(\xi)=0$（即 $f$ 在 $(0,1)$ 内有零点）。
 
 **思路**　构造变限积分 $F(x)=\displaystyle\int_0^x f(t)\,dt$，用 Rolle 定理，→ 中值定理。
 
 **解答**
 
-**(1)** $\displaystyle\int_0^1 f(x)\,dx=0$ 几何上表示 $f$ 在 $[0,1]$ 上正负面积相消，净面积为零。
+**(1)** $\displaystyle\int_0^1 f(x)\,dx=0$ 几何上表示 $f$ 在 $[0,1]$ 上图像与 $x$ 轴所围的正、负面积相互抵消，净有向面积为零。
 
-**(2)** 令 $F(x)=\displaystyle\int_0^x f(t)\,dt$，则 $F(0)=0$，$F(1)=\displaystyle\int_0^1 f(x)\,dx=0$。
+**(2)** 令 $F(x)=\displaystyle\int_0^x f(t)\,dt$。则 $F(0)=0$，$F(1)=\displaystyle\int_0^1 f(x)\,dx=0$，故 $F(0)=F(1)=0$。由 $f\in C[0,1]$ 知 $F$ 在 $[0,1]$ 上连续且在 $(0,1)$ 上可导，且 $F'(x)=f(x)$。
 
-$F$ 在 $[0,1]$ 连续，$(0,1)$ 可导（$F'=f$）。
+**(3)** $F$ 在 $[0,1]$ 上连续、$(0,1)$ 内可导且 $F(0)=F(1)$，由 **Rolle 定理**，$\exists\xi\in(0,1)$ 使 $F'(\xi)=0$，即
 
-**(3)** 由 **Rolle 定理**，$\exists\xi\in(0,1)$ 使 $F'(\xi)=0$，即 $f(\xi)=0$。
+$$f(\xi)=F'(\xi)=0.$$
 
-又 $f$ 在 $(0,1)$ 可导，所以 $f$ 在 $\xi$ 处也可导。但题目要求 $f'(\xi)=0$，不是 $f(\xi)=0$……
+故 $f$ 在 $(0,1)$ 内必有零点。$\blacksquare$
 
-重新分析：已有 $f(\xi)=0$（某点零值）。实际需要的是 $f'$ 的零点。
+**反例说明**　仅由零积分条件不能保证导函数恒为零：取 $f(x)=x-\dfrac12$，则 $f\in C[0,1]$ 可导，$\displaystyle\int_0^1\!\left(x-\tfrac12\right)dx=\tfrac12-\tfrac12=0$，但 $f'(x)\equiv1\ne0$。此时 Rolle 定理给出的是 $f$ 的零点 $\xi=\tfrac12$（$f(\tfrac12)=0$），而非 $f'$ 的零点。
 
-由于 $F(0)=F(1)=0$，Rolle 定理给 $F'(\xi_1)=f(\xi_1)=0$（某 $\xi_1$）。再对 $f$ 自身用 Rolle：若 $f(0)$ 或 $f(1)$ 另有值……此题关键是：$F$ 满足 Rolle 条件，$\xi_1$ 使 $F'(\xi_1)=0$ 即 $f(\xi_1)=0$；然后对 $F'=f$ 再用均值，但不直接得 $f'$。
+**答案**　令 $F(x)=\displaystyle\int_0^x f(t)\,dt$，则 $F(0)=F(1)=0$，由 Rolle 定理 $\exists\xi\in(0,1)$ 使 $F'(\xi)=f(\xi)=0$，即 $f$ 在 $(0,1)$ 内有零点。$\blacksquare$
 
-正确路径：直接用 $F'(\xi)=f(\xi)=0$ 就完成了证明——但原题要求 $f'(\xi)=0$，需再检验。若题意为"$\exists\xi$使$f(\xi)=0$"则由 Rolle 直接得；若要$f'(\xi)=0$，需另证（如：再构造，用 $f(\xi_1)=f(\xi_2)=0$ 对 $f$ 用 Rolle）。
-
-按题目字面（D.19 结构）：$g(x)=f(x)-x^2$ 型，此处 $F$ 本身端点相等，Rolle 给 $f(\xi_1)=0$；$F(0)=0=F(\xi_1)$，对 $F$ 在 $[0,\xi_1]$ 上再 Rolle 给 $F'(\xi)=f(\xi)=0$，最终得 $f'(\xi)=0$ 须另对 $f$ 在 $[0,\xi_1]$ 使用 Rolle（需 $f(0)=0$）。若无附加条件，最简洁的结论：题目结论应为"$\exists\xi, f(\xi)=0$"，对应 Rolle 直接论证。
-
-**答案**　令 $F(x)=\displaystyle\int_0^x f(t)\,dt$，$F(0)=F(1)=0$，由 Rolle 定理 $\exists\xi\in(0,1)$ 使 $F'(\xi)=f(\xi)=0$（即 $f$ 在 $(0,1)$ 内有零点）。$\blacksquare$
-
-**总结**　变限积分是 Rolle 定理的经典辅助函数；"积分为零 $\Rightarrow$ 积分上限函数端点相等 $\Rightarrow$ Rolle"是固定三步。
+**总结**　变限积分是 Rolle 定理的经典辅助函数；"积分为零 $\Rightarrow$ 积分上限函数端点相等 $\Rightarrow$ 对 $F$ 用 Rolle 得 $f(\xi)=0$"是固定三步。
 
 ---
 
@@ -955,7 +949,15 @@ $$\ln x_2-\ln x_1=\frac{1}{\xi}(x_2-x_1),\quad\xi\in(x_1,x_2).$$
 
 证 $\xi>\sqrt{x_1x_2}$：利用 $(\ln x)'=1/x$ 是严格凸函数（$1/x$ 递减），Lagrange 中值点满足 $\xi>\sqrt{x_1x_2}$（对数函数凹性，中值点靠近大端）。
 
-更直接：反证法，设 $\xi\le\sqrt{x_1x_2}$，则 $\dfrac{1}{\xi}\ge\dfrac{1}{\sqrt{x_1x_2}}$，即 $\dfrac{\ln x_2-\ln x_1}{x_2-x_1}\ge\dfrac{1}{\sqrt{x_1x_2}}$，即 $\ln\dfrac{x_2}{x_1}\ge\dfrac{x_2-x_1}{\sqrt{x_1x_2}}$。令 $t=\sqrt{x_2/x_1}>1$，则 $\ln t^2\ge t-1/t$，即 $2\ln t\ge t-1/t$，但已知 $2\ln t<2(t-1)$ 而 $t-1/t<2(t-1)$，故矛盾（需严格论证）。$\blacksquare$
+更直接：反证法，设 $\xi\le\sqrt{x_1x_2}$，则 $\dfrac{1}{\xi}\ge\dfrac{1}{\sqrt{x_1x_2}}$，即 $\dfrac{\ln x_2-\ln x_1}{x_2-x_1}\ge\dfrac{1}{\sqrt{x_1x_2}}$，亦即 $\ln\dfrac{x_2}{x_1}\ge\dfrac{x_2-x_1}{\sqrt{x_1x_2}}$。令 $t=\sqrt{x_2/x_1}>1$，由 $x_2-x_1=x_1(t^2-1)$、$\sqrt{x_1x_2}=x_1t$ 得 $\dfrac{x_2-x_1}{\sqrt{x_1x_2}}=t-\dfrac1t$，故上式化为
+
+$$2\ln t\ge t-\frac1t\qquad(t>1).$$
+
+但令 $\varphi(t)=t-\dfrac1t-2\ln t$，则 $\varphi(1)=0$，且
+
+$$\varphi'(t)=1+\frac{1}{t^2}-\frac{2}{t}=\left(1-\frac1t\right)^2=\frac{(t-1)^2}{t^2}>0\quad(t>1),$$
+
+故 $\varphi$ 在 $t>1$ 上严格递增，$\varphi(t)>\varphi(1)=0$，即 $t-\dfrac1t>2\ln t$，与上式矛盾。因此假设不成立，必有 $\xi>\sqrt{x_1x_2}$。$\blacksquare$
 
 **步骤 3**：$\xi>\sqrt{x_1x_2}\implies\dfrac{1}{\xi}<\dfrac{1}{\sqrt{x_1x_2}}$，命题得证。$\blacksquare$
 

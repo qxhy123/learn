@@ -90,7 +90,7 @@ $$\mu y = \int \mu(x)\,q(x)\,dx + C \quad \Rightarrow \quad y = \frac{1}{\mu}\le
 
 代入原方程，两边除以 $y^n$，得：
 
-$$\frac{u'}{1-n} + p(x)u^{1/(1-n)} \cdot \frac{1}{u^{?}} \to \frac{u'}{1-n} + p(x)u = q(x)$$
+$$y^{-n}y' + p(x)y^{1-n} = q(x) \ \xrightarrow{\,u = y^{1-n}\,}\ \frac{u'}{1-n} + p(x)u = q(x).$$
 
 整理为 $u' + (1-n)p(x)u = (1-n)q(x)$——这是关于 $u$ 的**一阶线性方程**，用积分因子法解。
 

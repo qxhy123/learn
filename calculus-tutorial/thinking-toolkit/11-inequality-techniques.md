@@ -87,9 +87,9 @@ $$f(x) \geq f(a) + f'(a)(x - a) \quad \text{（}f \text{ 是凸函数）}$$
 
 **切线放缩的威力**在于：把复杂的非线性函数替换为线性函数，大幅简化后续计算，特别适用于累积乘积不等式（取对数后变成求和，再用 $\ln(1+x) \leq x$）。
 
-**例**：证明 $\prod_{k=1}^n\!\left(1 + \dfrac{1}{k^2}\right) < e$。
+**例**：证明 $\prod_{k=1}^n\!\left(1 + \dfrac{1}{k^2}\right) < e^{\pi^2/6}$。
 
-取对数：$\sum_{k=1}^n \ln\!\left(1 + \dfrac{1}{k^2}\right) < \sum_{k=1}^n \dfrac{1}{k^2} < \dfrac{\pi^2}{6} < 2 < \infty$（只需估计上界）；由于 $\ln(1+t) \leq t$，得 $\sum \ln(1+1/k^2) \leq \sum 1/k^2 = \pi^2/6 \approx 1.645 < 2$，故乘积 $< e^2$（实际上可进一步缩紧）。
+取对数并用 $\ln(1+t) \leq t$：$\sum_{k=1}^n \ln\!\left(1 + \dfrac{1}{k^2}\right) \leq \sum_{k=1}^n \dfrac{1}{k^2} < \dfrac{\pi^2}{6} \approx 1.645$，故乘积 $< e^{\pi^2/6} \approx 5.18$。
 
 ---
 
@@ -309,6 +309,12 @@ $$\left(\int_0^1 f(x) \cdot 1\,dx\right)^2 \leq \int_0^1 [f(x)]^2\,dx \cdot \int
 
 > 提示：由 Cauchy-Schwarz（Titu 引理 / Engel 形式）：$\dfrac{x_1^2}{y_1} + \dfrac{x_2^2}{y_2} + \dfrac{x_3^2}{y_3} \geq \dfrac{(x_1+x_2+x_3)^2}{y_1+y_2+y_3}$。取 $x_1 = a, x_2 = b, x_3 = c$，$y_1 = b, y_2 = c, y_3 = a$，得 $\dfrac{a^2}{b} + \dfrac{b^2}{c} + \dfrac{c^2}{a} \geq \dfrac{(a+b+c)^2}{a+b+c} = a+b+c$。
 
-**第 5 题**：利用切线放缩 $e^x \geq 1 + x$，证明对任意 $n$ 个正数 $a_1, \ldots, a_n$ 满足 $\sum a_i = 1$，有 $\prod_{i=1}^n a_i^{a_i} \geq e^{-1}$（即带权幂积的下界）。
+**第 5 题**：利用切线放缩 $e^x \geq 1 + x$（等价于 $\ln t \leq t - 1$），证明对任意 $n$ 个正数 $a_1, \ldots, a_n$ 满足 $\sum a_i = 1$，有 $\prod_{i=1}^n a_i^{a_i} \geq \dfrac{1}{n}$（均匀分布 $a_i = 1/n$ 时取等）。
 
-> 提示：取对数，需证 $\sum a_i \ln a_i \geq -1$（注意 $\sum a_i = 1$）。对每个 $i$：由 $\ln a_i \leq a_i - 1$（即 $e^x \geq 1 + x$ 的对数版本），有 $a_i \ln a_i \leq a_i(a_i - 1) = a_i^2 - a_i$，求和得 $\sum a_i \ln a_i \leq \sum a_i^2 - \sum a_i = \sum a_i^2 - 1$，方向是给上界不是下界！要改用：对 $a_i \in (0, 1]$，$\ln a_i \geq 1 - 1/a_i$ 不成立……正确路线：直接用 $x\ln x \geq -1/e$（每项 $a_i \ln a_i \geq -1/e$，$n$ 项求和 $\geq -n/e$，但需精确到 $-1$）。更好的方法：注意 $\sum a_i \ln a_i$ 是负熵，直接用 Jensen（$f(x) = x\ln x$ 是凸函数）：$\sum a_i (a_i \ln a_i) \geq \left(\sum a_i^2\right)\ln\left(\sum a_i^2\right)$——此路较复杂；或直接引用 Gibbs 不等式（熵最大在均匀分布）给出下界 $\sum a_i \ln a_i \geq -\ln n > -\infty$，但 $-1$ 的精确界来自 $xe^{x-1} \geq x$ 的变形。这是一道有深度的练习题，完整证明需要 Gibbs/熵相关引理。
+> 提示：取对数，即证 $\sum a_i \ln a_i \geq -\ln n$，亦即 $\sum a_i \ln(n a_i) \geq 0$。对每项用 $\ln t \leq t - 1$（$e^x \geq 1+x$ 的对数形式），令 $t = \dfrac{1}{n a_i}$：
+> $$\ln\frac{1}{n a_i} \leq \frac{1}{n a_i} - 1.$$
+> 两边乘 $a_i\,(>0)$ 并对 $i$ 求和，注意 $a_i\ln\dfrac{1}{na_i} = -a_i\ln(na_i)$：
+> $$-\sum_i a_i \ln(n a_i) \leq \sum_i \left(\frac{1}{n} - a_i\right) = n\cdot\frac{1}{n} - \sum_i a_i = 1 - 1 = 0,$$
+> 即 $\sum_i a_i \ln(n a_i) \geq 0$。展开 $\ln(na_i)=\ln a_i+\ln n$ 并用 $\sum a_i = 1$，得 $\sum_i a_i \ln a_i \geq -\ln n$。取指数即 $\prod_i a_i^{a_i} = e^{\sum a_i\ln a_i} \geq e^{-\ln n} = \dfrac{1}{n}$，均匀分布 $a_i=1/n$ 时取等。$\blacksquare$
+>
+> （注：此即"熵不超过 $\ln n$"的等价形式；原来想要的常数下界 $e^{-1}$ 并不成立——例如 $n=3$ 均匀分布给 $\prod a_i^{a_i}=1/3<e^{-1}$。正确的普适下界是与 $n$ 有关的 $1/n$。）

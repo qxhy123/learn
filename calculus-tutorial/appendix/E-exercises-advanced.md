@@ -178,7 +178,7 @@
 
 （1）令 $t = \tan(x/2)$，写出 $\sin x = \dfrac{2t}{1+t^2}$，$\cos x = \dfrac{1-t^2}{1+t^2}$，$dx = \dfrac{2\,dt}{1+t^2}$ 的代换公式；
 （2）代入后化简被积函数为 $t$ 的有理式；
-（3）完成积分并回代 $t = \tan(x/2)$，给出最终结果 $\ln\left|\tan\dfrac{x}{2}\right| + C$（或等价形式）。
+（3）完成积分并回代 $t = \tan(x/2)$，给出最终结果 $\ln\left|1+\tan\dfrac{x}{2}\right| + C$。
 
 **E.20** [提升] Ch.11–12 [分部积分 + 循环]
 
@@ -321,7 +321,7 @@
 
 （1）用 Weierstrass M-判别：$\left|\dfrac{\sin nx}{n^2}\right| \le \dfrac{1}{n^2}$，$\displaystyle\sum \dfrac{1}{n^2}$ 收敛，故一致收敛；
 （2）由一致收敛推出和函数 $S(x) = \displaystyle\sum_{n=1}^\infty \dfrac{\sin nx}{n^2}$ 在 $\mathbb{R}$ 上连续；
-（3）逐项积分 $\displaystyle\int_0^\pi S(x)\,dx = \displaystyle\sum_{n=1}^\infty \dfrac{1-\cos(n\pi)}{n^3} = 2\displaystyle\sum_{k=0}^\infty \dfrac{1}{(2k+1)^3} = \dfrac{7\pi^3}{32}\cdot\cdots$（给出计算过程）。
+（3）逐项积分 $\displaystyle\int_0^\pi S(x)\,dx = \displaystyle\sum_{n=1}^\infty \dfrac{1-\cos(n\pi)}{n^3} = 2\displaystyle\sum_{k=0}^\infty \dfrac{1}{(2k+1)^3} = \dfrac{7}{4}\zeta(3)$（Apéry 常数，给出计算过程）。
 
 ---
 

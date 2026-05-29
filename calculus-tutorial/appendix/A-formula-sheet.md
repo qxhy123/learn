@@ -126,7 +126,7 @@ $$\int u\,dv = uv - \int v\,du$$
 | $\cos x$ | $\displaystyle\sum_{n=0}^{\infty} \frac{(-1)^n x^{2n}}{(2n)!} = 1 - \frac{x^2}{2!} + \frac{x^4}{4!} - \cdots$ | $(-\infty, +\infty)$ |
 | $\ln(1+x)$ | $\displaystyle\sum_{n=1}^{\infty} \frac{(-1)^{n-1} x^n}{n} = x - \frac{x^2}{2} + \frac{x^3}{3} - \cdots$ | $(-1, 1]$ |
 | $(1+x)^\alpha$ | $\displaystyle\sum_{n=0}^{\infty} \binom{\alpha}{n} x^n = 1 + \alpha x + \frac{\alpha(\alpha-1)}{2!}x^2 + \cdots$ | $(-1, 1)^*$ |
-| $\dfrac{1}{1-x}$ | $\displaystyle\sum_{n=0}^{\infty} x^n = 1 + x + x^2 + x^3 + \cdots$ | $(-1, 1)$ |
+| $\arctan x$ | $\displaystyle\sum_{n=0}^{\infty} \frac{(-1)^n x^{2n+1}}{2n+1} = x - \frac{x^3}{3} + \frac{x^5}{5} - \cdots$ | $[-1, 1]$ |
 
 > $^*$ 当 $\alpha > 0$ 时在 $x = -1$ 收敛；当 $\alpha > -1$ 时在 $x = 1$ 收敛
 
@@ -296,7 +296,7 @@ $$\sinh x = \frac{e^x - e^{-x}}{2}, \quad \cosh x = \frac{e^x + e^{-x}}{2}$$
 | 不等式 | 形式 |
 |:---|:---|
 | AM-GM | $\displaystyle \frac{a+b}{2} \ge \sqrt{ab}$ |
-| Cauchy-Schwarz | $\displaystyle \|\langle x,y\rangle\| \le \|x\|\,\|y\|$ |
+| Cauchy-Schwarz | $\displaystyle |\langle x,y\rangle| \le \|x\|\,\|y\|$ |
 | Jensen | $\displaystyle f(\mathbb E[X]) \le \mathbb E[f(X)]$（$f$ 为凸函数） |
 | Young | $\displaystyle ab \le \frac{a^p}{p} + \frac{b^q}{q}, \quad \frac{1}{p}+\frac{1}{q}=1$ |
 | Hölder | $\displaystyle \|fg\|_1 \le \|f\|_p\,\|g\|_q, \quad \frac{1}{p}+\frac{1}{q}=1$ |

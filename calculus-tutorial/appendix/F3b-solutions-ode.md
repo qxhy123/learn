@@ -561,7 +561,7 @@ $$\boxed{y = C_1 e^x + C_2 e^{2x} - xe^x}$$
 计算导数：
 
 $$y_p' = 2Axe^{2x} + 2Ax^2 e^{2x} = 2Ax(1+x)e^{2x}$$
-$$y_p'' = 2A(1+x)e^{2x} + 2A\cdot 2x(1+x)e^{2x} + 2Axe^{2x}\cdot 2 \cdot \cdots$$
+$$y_p'' = 2A(1+2x)e^{2x} + 2A(x+x^2)\cdot 2e^{2x} = 2A(1 + 4x + 2x^2)e^{2x}$$
 
 更系统地，令 $y_p = Ax^2 e^{2x}$，利用算符方法或直接展开：
 
