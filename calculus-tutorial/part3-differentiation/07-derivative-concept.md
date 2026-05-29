@@ -286,6 +286,12 @@ $$(x + h)^n = x^n + nx^{n-1}h + \binom{n}{2}x^{n-2}h^2 + \cdots + h^n$$
 
 $$\lim_{h \to 0} \frac{(x+h)^n - x^n}{h} = \lim_{h \to 0} \left[nx^{n-1} + \binom{n}{2}x^{n-2}h + \cdots + h^{n-1}\right] = nx^{n-1} \quad \square$$
 
+**推广到任意实数 $n$**（$x>0$）：利用指数与对数函数的导数（见 §7.4.3–7.4.4），把幂写成 $x^n=e^{n\ln x}$，由链式法则
+
+$$(x^n)'=e^{n\ln x}\cdot\frac{n}{x}=x^n\cdot\frac{n}{x}=nx^{n-1},$$
+
+故幂函数求导公式对一切实数 $n$ 成立。
+
 **常用幂函数导数**：
 
 - $(x)' = 1$
@@ -352,337 +358,21 @@ $$= \cos x \cdot 1 = \cos x \quad \square$$
 - $(\arctan x)' = \dfrac{1}{1+x^2}$
 - $(\text{arccot}\, x)' = -\dfrac{1}{1+x^2}$
 
-### 7.4.7 导数公式表
+### 7.4.7 双曲函数的导数
 
-| 函数 $f(x)$ | 导数 $f'(x)$ |
-|:---:|:---:|
-| $c$（常数） | $0$ |
-| $x^n$ | $nx^{n-1}$ |
-| $e^x$ | $e^x$ |
-| $a^x$ | $a^x \ln a$ |
-| $\ln x$ | $\dfrac{1}{x}$ |
-| $\log_a x$ | $\dfrac{1}{x \ln a}$ |
-| $\sin x$ | $\cos x$ |
-| $\cos x$ | $-\sin x$ |
-| $\tan x$ | $\sec^2 x$ |
-| $\cot x$ | $-\csc^2 x$ |
-| $\arcsin x$ | $\dfrac{1}{\sqrt{1-x^2}}$ |
-| $\arccos x$ | $-\dfrac{1}{\sqrt{1-x^2}}$ |
-| $\arctan x$ | $\dfrac{1}{1+x^2}$ |
+由定义 $\sinh x=\dfrac{e^x-e^{-x}}{2}$、$\cosh x=\dfrac{e^x+e^{-x}}{2}$ 直接求导：
 
----
+$$(\sinh x)'=\frac{e^x+e^{-x}}{2}=\cosh x,\qquad (\cosh x)'=\frac{e^x-e^{-x}}{2}=\sinh x.$$
 
-## 7.5 常用导数公式的完整推导
+$$(\tanh x)'=\left(\frac{\sinh x}{\cosh x}\right)'=\frac{\cosh^2 x-\sinh^2 x}{\cosh^2 x}=\frac{1}{\cosh^2 x}=\operatorname{sech}^2 x=1-\tanh^2 x.$$
 
-本节把所有"基本初等函数 + 四则运算 + 复合 + 反函数"的导数公式按照**依赖关系**逐条推出，避免循环论证。整体结构是：
+反双曲函数（用反函数法则，过程同反三角，详见第 8 章）：
 
-1. 先证四则运算法则（基于差商）；
-2. 再证复合法则与反函数法则（基于差商 + 连续性）；
-3. 由极限定义证 $(x^n)'$（正整数 $n$）、$(\sin x)'$、$(\cos x)'$、$(e^x)'$、$(\ln x)'$；
-4. 由这五条核心 + 法则推出其余所有公式。
+$$(\operatorname{arsinh}x)'=\frac{1}{\sqrt{1+x^2}},\quad (\operatorname{arcosh}x)'=\frac{1}{\sqrt{x^2-1}}\ (x>1),\quad (\operatorname{artanh}x)'=\frac{1}{1-x^2}\ (|x|<1).$$
 
-> **使用的重要极限**：
-> $$
-> \lim_{x\to 0}\frac{\sin x}{x}=1,\quad
-> \lim_{x\to 0}\frac{1-\cos x}{x}=0,
-> $$
-> $$
-> \lim_{x\to 0}\frac{e^x-1}{x}=1,\quad
-> \lim_{x\to 0}\frac{\ln(1+x)}{x}=1.
-> $$
-> 这四个极限将在第 5 章证明，此处直接使用。
+### 7.4.8 导数公式表
 
-### 7.5.1 求导法则的推导
-
-**法则 1（线性性）**：若 $f,g$ 在 $x$ 可导，$\alpha,\beta\in\mathbb R$，则
-
-$$
-(\alpha f+\beta g)'(x)=\alpha f'(x)+\beta g'(x).
-$$
-
-**证明**：由差商极限的线性性，
-
-$$
-\begin{aligned}
-\lim_{h\to 0}\frac{[\alpha f(x+h)+\beta g(x+h)]-[\alpha f(x)+\beta g(x)]}{h}
-&=\alpha\lim_{h\to 0}\frac{f(x+h)-f(x)}{h}+\beta\lim_{h\to 0}\frac{g(x+h)-g(x)}{h}\\
-&=\alpha f'(x)+\beta g'(x).\ \square
-\end{aligned}
-$$
-
-**法则 2（乘法法则 / Leibniz 法则）**：
-
-$$
-(fg)'(x)=f'(x)g(x)+f(x)g'(x).
-$$
-
-**证明**：在分子加减 $f(x+h)g(x)$，
-
-$$
-\begin{aligned}
-\frac{f(x+h)g(x+h)-f(x)g(x)}{h}
-&=\frac{f(x+h)-f(x)}{h}\,g(x+h)+f(x)\,\frac{g(x+h)-g(x)}{h}.
-\end{aligned}
-$$
-
-因为 $g$ 在 $x$ 可导故连续，$g(x+h)\to g(x)$。令 $h\to 0$ 得 $f'(x)g(x)+f(x)g'(x)$。 $\square$
-
-**法则 3（除法法则）**：若 $g(x)\ne 0$，
-
-$$
-\left(\frac{f}{g}\right)'(x)=\frac{f'(x)g(x)-f(x)g'(x)}{g(x)^2}.
-$$
-
-**证明**：先证 $\left(\dfrac1g\right)'=-\dfrac{g'}{g^2}$。
-
-$$
-\frac{1}{h}\left[\frac{1}{g(x+h)}-\frac{1}{g(x)}\right]
-=\frac{g(x)-g(x+h)}{h\,g(x+h)g(x)}
-\xrightarrow{h\to 0}\frac{-g'(x)}{g(x)^2}.
-$$
-
-再用乘法法则：$\left(\dfrac{f}{g}\right)'=\left(f\cdot\dfrac1g\right)'=f'\cdot\dfrac1g+f\cdot\left(-\dfrac{g'}{g^2}\right)=\dfrac{f'g-fg'}{g^2}$。 $\square$
-
-**法则 4（链式法则）**：若 $u=g(x)$ 在 $x$ 可导，$y=f(u)$ 在 $u=g(x)$ 可导，则
-
-$$
-\bigl(f\circ g\bigr)'(x)=f'\!\bigl(g(x)\bigr)\cdot g'(x).
-$$
-
-**证明**（标准 Carathéodory 形式以避免 $g(x+h)=g(x)$ 时分母为零的问题）：
-
-由 $f$ 在 $u_0=g(x)$ 可导，存在在 $u_0$ 连续的函数 $\varphi$ 使
-
-$$
-f(u)-f(u_0)=\varphi(u)(u-u_0),\qquad \varphi(u_0)=f'(u_0).
-$$
-
-代入 $u=g(x+h)$、$u_0=g(x)$：
-
-$$
-\frac{f(g(x+h))-f(g(x))}{h}=\varphi(g(x+h))\cdot\frac{g(x+h)-g(x)}{h}.
-$$
-
-由 $g$ 可导（故连续）与 $\varphi$ 在 $u_0$ 连续，令 $h\to 0$ 得 $f'(g(x))\cdot g'(x)$。 $\square$
-
-**法则 5（反函数法则）**：设 $y=f(x)$ 在 $x_0$ 可导且 $f'(x_0)\ne 0$，$f$ 在 $x_0$ 邻域严格单调连续。记 $x=f^{-1}(y)$，则
-
-$$
-\bigl(f^{-1}\bigr)'(y_0)=\frac{1}{f'(x_0)},\qquad y_0=f(x_0).
-$$
-
-**证明**：由严格单调连续，$y\ne y_0\Leftrightarrow x\ne x_0$ 且 $y\to y_0\Leftrightarrow x\to x_0$。于是
-
-$$
-\lim_{y\to y_0}\frac{f^{-1}(y)-f^{-1}(y_0)}{y-y_0}
-=\lim_{x\to x_0}\frac{x-x_0}{f(x)-f(x_0)}
-=\frac{1}{f'(x_0)}.\ \square
-$$
-
-### 7.5.2 幂函数 $(x^n)'$
-
-**推导一（正整数 $n$，二项式定理）**：
-
-$$
-(x+h)^n=\sum_{k=0}^n\binom{n}{k}x^{n-k}h^k=x^n+nx^{n-1}h+\binom{n}{2}x^{n-2}h^2+\cdots+h^n.
-$$
-
-所以
-
-$$
-\frac{(x+h)^n-x^n}{h}=nx^{n-1}+\binom{n}{2}x^{n-2}h+\cdots+h^{n-1}\xrightarrow{h\to 0}nx^{n-1}.
-$$
-
-**推导二（负整数 $n=-m$，$m>0$）**：用除法法则于 $\dfrac{1}{x^m}$：
-
-$$
-\left(\frac{1}{x^m}\right)'=\frac{0\cdot x^m-1\cdot mx^{m-1}}{x^{2m}}=-mx^{-m-1}=nx^{n-1}.
-$$
-
-**推导三（有理数 $n=p/q$，$q\in\mathbb Z^+$，$x>0$）**：令 $y=x^{p/q}$，则 $y^q=x^p$。两边对 $x$ 求导（隐函数 + 链式法则）：
-
-$$
-qy^{q-1}\,y'=px^{p-1}
-\Rightarrow y'=\frac{p}{q}\,\frac{x^{p-1}}{y^{q-1}}=\frac{p}{q}\,x^{p-1-\frac{p}{q}(q-1)}=\frac{p}{q}x^{p/q-1}=nx^{n-1}.
-$$
-
-**推导四（实数 $n\in\mathbb R$，$x>0$）**：写 $x^n=e^{n\ln x}$，由链式法则与后面 7.5.4、7.5.5：
-
-$$
-(x^n)'=e^{n\ln x}\cdot\frac{n}{x}=x^n\cdot\frac{n}{x}=nx^{n-1}.\ \square
-$$
-
-**特例**：
-
-- $(x)'=1$；
-- $(\sqrt x)'=\tfrac12 x^{-1/2}=\dfrac{1}{2\sqrt x}$；
-- $\bigl(\tfrac1x\bigr)'=-x^{-2}=-\dfrac{1}{x^2}$。
-
-### 7.5.3 三角函数
-
-**$\sin x$ 与 $\cos x$**：由和差化积，
-
-$$
-\sin(x+h)-\sin x=2\cos\!\left(x+\tfrac{h}{2}\right)\sin\tfrac{h}{2}.
-$$
-
-所以
-
-$$
-\frac{\sin(x+h)-\sin x}{h}=\cos\!\left(x+\tfrac{h}{2}\right)\cdot\frac{\sin(h/2)}{h/2}\xrightarrow{h\to 0}\cos x\cdot 1=\cos x.
-$$
-
-类似地用 $\cos(x+h)-\cos x=-2\sin\!\left(x+\tfrac{h}{2}\right)\sin\tfrac{h}{2}$ 得 $(\cos x)'=-\sin x$。
-
-**或者直接用和角公式**：
-
-$$
-\frac{\sin(x+h)-\sin x}{h}=\sin x\cdot\frac{\cos h-1}{h}+\cos x\cdot\frac{\sin h}{h}\to \sin x\cdot 0+\cos x\cdot 1=\cos x.
-$$
-
-**$\tan x$**：用除法法则，
-
-$$
-(\tan x)'=\left(\frac{\sin x}{\cos x}\right)'=\frac{\cos x\cdot\cos x-\sin x\cdot(-\sin x)}{\cos^2 x}=\frac{1}{\cos^2 x}=\sec^2 x.
-$$
-
-**$\cot x$**：
-
-$$
-(\cot x)'=\left(\frac{\cos x}{\sin x}\right)'=\frac{-\sin^2 x-\cos^2 x}{\sin^2 x}=-\frac{1}{\sin^2 x}=-\csc^2 x.
-$$
-
-**$\sec x$**：$\sec x=\dfrac{1}{\cos x}$，
-
-$$
-(\sec x)'=\left(\frac{1}{\cos x}\right)'=\frac{\sin x}{\cos^2 x}=\sec x\tan x.
-$$
-
-**$\csc x$**：
-
-$$
-(\csc x)'=\left(\frac{1}{\sin x}\right)'=-\frac{\cos x}{\sin^2 x}=-\csc x\cot x.
-$$
-
-### 7.5.4 指数函数
-
-**$(e^x)'$**：
-
-$$
-\frac{e^{x+h}-e^x}{h}=e^x\cdot\frac{e^h-1}{h}\xrightarrow{h\to 0}e^x\cdot 1=e^x.
-$$
-
-**$(a^x)'$**（$a>0,\ a\ne 1$）：$a^x=e^{x\ln a}$，由链式法则
-
-$$
-(a^x)'=e^{x\ln a}\cdot\ln a=a^x\ln a.
-$$
-
-### 7.5.5 对数函数
-
-**$(\ln x)'$**（$x>0$）：
-
-$$
-\frac{\ln(x+h)-\ln x}{h}=\frac{1}{h}\ln\!\left(1+\frac{h}{x}\right).
-$$
-
-令 $t=h/x$，
-
-$$
-=\frac{1}{x}\cdot\frac{\ln(1+t)}{t}\xrightarrow{t\to 0}\frac{1}{x}\cdot 1=\frac{1}{x}.
-$$
-
-**$(\log_a x)'$**：由换底 $\log_a x=\dfrac{\ln x}{\ln a}$，
-
-$$
-(\log_a x)'=\frac{1}{x\ln a}.
-$$
-
-**$(\ln|x|)'=\dfrac{1}{x}$**（$x\ne 0$）：$x<0$ 时用 $\ln|x|=\ln(-x)$ 并由链式法则 $(\ln(-x))'=\dfrac{-1}{-x}=\dfrac{1}{x}$。
-
-### 7.5.6 反三角函数
-
-**$(\arcsin x)'$**（$|x|<1$）：设 $y=\arcsin x$，则 $\sin y=x$，$y\in[-\tfrac\pi2,\tfrac\pi2]$。两边对 $x$ 求导：
-
-$$
-\cos y\cdot y'=1\Rightarrow y'=\frac{1}{\cos y}.
-$$
-
-由于 $y\in[-\tfrac\pi2,\tfrac\pi2]$ 有 $\cos y\ge 0$，所以 $\cos y=\sqrt{1-\sin^2 y}=\sqrt{1-x^2}$。故
-
-$$
-(\arcsin x)'=\frac{1}{\sqrt{1-x^2}}.
-$$
-
-**$(\arccos x)'$**：由 $\arcsin x+\arccos x=\dfrac\pi2$ 直接得
-
-$$
-(\arccos x)'=-\frac{1}{\sqrt{1-x^2}}.
-$$
-
-**$(\arctan x)'$**：设 $y=\arctan x$，则 $\tan y=x$，$y\in(-\tfrac\pi2,\tfrac\pi2)$。两边求导：
-
-$$
-\sec^2 y\cdot y'=1\Rightarrow y'=\frac{1}{\sec^2 y}=\frac{1}{1+\tan^2 y}=\frac{1}{1+x^2}.
-$$
-
-**$(\operatorname{arccot} x)'$**：由 $\arctan x+\operatorname{arccot}x=\dfrac\pi2$ 得 $-\dfrac{1}{1+x^2}$。
-
-**$(\operatorname{arcsec}x)'$**（$|x|>1$）：设 $y=\operatorname{arcsec}x$，$\sec y=x$，
-
-$$
-\sec y\tan y\cdot y'=1\Rightarrow y'=\frac{1}{\sec y\tan y}=\frac{1}{|x|\sqrt{x^2-1}}.
-$$
-
-绝对值的出现是因为主值约定下 $\sec y\tan y$ 总取正号。
-
-### 7.5.7 双曲函数与反双曲函数
-
-由 $\sinh x=\dfrac{e^x-e^{-x}}{2}$、$\cosh x=\dfrac{e^x+e^{-x}}{2}$ 直接求导：
-
-$$
-(\sinh x)'=\frac{e^x+e^{-x}}{2}=\cosh x,
-\qquad
-(\cosh x)'=\frac{e^x-e^{-x}}{2}=\sinh x.
-$$
-
-$$
-(\tanh x)'=\left(\frac{\sinh x}{\cosh x}\right)'=\frac{\cosh^2 x-\sinh^2 x}{\cosh^2 x}=\frac{1}{\cosh^2 x}=\operatorname{sech}^2 x=1-\tanh^2 x.
-$$
-
-反双曲函数（用反函数法则，过程同反三角）：
-
-$$
-(\operatorname{arsinh}x)'=\frac{1}{\sqrt{1+x^2}},
-\quad
-(\operatorname{arcosh}x)'=\frac{1}{\sqrt{x^2-1}}\ (x>1),
-\quad
-(\operatorname{artanh}x)'=\frac{1}{1-x^2}\ (|x|<1).
-$$
-
-### 7.5.8 对数求导法与一般幂指函数
-
-对 $y=f(x)^{g(x)}$（$f>0$），两边取对数 $\ln y=g(x)\ln f(x)$，对 $x$ 求导：
-
-$$
-\frac{y'}{y}=g'(x)\ln f(x)+g(x)\frac{f'(x)}{f(x)},
-$$
-
-所以
-
-$$
-\bigl(f^g\bigr)'=f(x)^{g(x)}\!\left[g'(x)\ln f(x)+\frac{g(x)f'(x)}{f(x)}\right].
-$$
-
-**特例**：
-
-- $g$ 是常数：退化为 $(f^n)'=nf^{n-1}f'$（广义幂法则）；
-- $f$ 是常数：退化为 $(a^{g(x)})'=a^{g(x)}\ln a\cdot g'(x)$；
-- $f=g=x$：$(x^x)'=x^x(\ln x+1)$。
-
-### 7.5.9 完整公式表（含基础导数）
-
-下表把上述所有推导汇总，按"输入函数 → 导数 → 适用条件"组织，可作为后续章节的查阅参考。
+下表汇总基本初等函数的导数，可作为后续章节的查阅参考。其中需要求导法则才能推得的条目（$\tan/\cot/\sec/\csc$、反三角、一般幂、双曲）的严格推导见**第 8 章**。
 
 | 函数 | 导数 | 条件 |
 |:---:|:---:|:---:|
@@ -691,7 +381,7 @@ $$
 | $e^x$ | $e^x$ | — |
 | $a^x$ | $a^x\ln a$ | $a>0,\ a\ne 1$ |
 | $\ln x$ | $\dfrac{1}{x}$ | $x>0$ |
-| $\ln\|x\|$ | $\dfrac{1}{x}$ | $x\ne 0$ |
+| $\ln\vert x\vert$ | $\dfrac{1}{x}$ | $x\ne 0$ |
 | $\log_a x$ | $\dfrac{1}{x\ln a}$ | $x>0$ |
 | $\sin x$ | $\cos x$ | — |
 | $\cos x$ | $-\sin x$ | — |
@@ -699,17 +389,17 @@ $$
 | $\cot x$ | $-\csc^2 x$ | $\sin x\ne 0$ |
 | $\sec x$ | $\sec x\tan x$ | $\cos x\ne 0$ |
 | $\csc x$ | $-\csc x\cot x$ | $\sin x\ne 0$ |
-| $\arcsin x$ | $\dfrac{1}{\sqrt{1-x^2}}$ | $\|x\|<1$ |
-| $\arccos x$ | $-\dfrac{1}{\sqrt{1-x^2}}$ | $\|x\|<1$ |
+| $\arcsin x$ | $\dfrac{1}{\sqrt{1-x^2}}$ | $\vert x\vert<1$ |
+| $\arccos x$ | $-\dfrac{1}{\sqrt{1-x^2}}$ | $\vert x\vert<1$ |
 | $\arctan x$ | $\dfrac{1}{1+x^2}$ | — |
 | $\operatorname{arccot}x$ | $-\dfrac{1}{1+x^2}$ | — |
-| $\operatorname{arcsec}x$ | $\dfrac{1}{\|x\|\sqrt{x^2-1}}$ | $\|x\|>1$ |
+| $\operatorname{arcsec}x$ | $\dfrac{1}{\vert x\vert\sqrt{x^2-1}}$ | $\vert x\vert>1$ |
 | $\sinh x$ | $\cosh x$ | — |
 | $\cosh x$ | $\sinh x$ | — |
 | $\tanh x$ | $1-\tanh^2 x$ | — |
 | $\operatorname{arsinh}x$ | $\dfrac{1}{\sqrt{1+x^2}}$ | — |
 | $\operatorname{arcosh}x$ | $\dfrac{1}{\sqrt{x^2-1}}$ | $x>1$ |
-| $\operatorname{artanh}x$ | $\dfrac{1}{1-x^2}$ | $\|x\|<1$ |
+| $\operatorname{artanh}x$ | $\dfrac{1}{1-x^2}$ | $\vert x\vert<1$ |
 | $f(x)^{g(x)}$ | $f^g\!\left[g'\ln f+\dfrac{gf'}{f}\right]$ | $f>0$ |
 
 ---
