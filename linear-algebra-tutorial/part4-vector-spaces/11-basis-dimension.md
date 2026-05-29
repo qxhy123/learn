@@ -117,7 +117,13 @@ $$\mathcal{B}_1 = \left\{\begin{pmatrix}1\\0\end{pmatrix}, \begin{pmatrix}0\\1\e
 
 **定理（基的等势性）：** 有限维向量空间 $V$ 的任意两个基包含相同数量的向量。
 
-这保证了维数定义是良好的。
+这保证了维数定义是良好的——否则"维数"取决于挑了哪个基，就毫无意义。下面给出证明（这是线代里少数"必须认真证一次"的结论之一）。
+
+**关键工具——替换引理（Steinitz 交换引理）：** *若 $\{\mathbf{w}_1,\dots,\mathbf{w}_m\}$ 张成 $V$，而 $\{\mathbf{u}_1,\dots,\mathbf{u}_p\}$ 线性无关，则必有 $p\le m$。*
+
+> **证明（逐个替换）：** 因 $\{\mathbf{w}_i\}$ 张成 $V$，可把 $\mathbf{u}_1$ 写成它们的线性组合；$\mathbf{u}_1\ne\mathbf{0}$ 故其中某个 $\mathbf{w}$ 的系数非零，用 $\mathbf{u}_1$ 替换掉那个 $\mathbf{w}$，所得集合仍张成 $V$。再把 $\mathbf{u}_2$ 用这个新集合表示——由 $\{\mathbf{u}_i\}$ 线性无关，表示式中必有某个剩余"$\mathbf{w}$"的系数非零（否则 $\mathbf{u}_2$ 只由 $\mathbf{u}_1$ 线性表示，与无关矛盾），再用 $\mathbf{u}_2$ 替换它。如此每一步换进一个 $\mathbf{u}$、换出一个 $\mathbf{w}$，且集合始终张成 $V$。倘若 $p>m$，则 $m$ 个 $\mathbf{w}$ 会先被换完，此时 $\mathbf{u}_{m+1}$ 将成为已换入的 $\mathbf{u}_1,\dots,\mathbf{u}_m$ 的线性组合，与 $\{\mathbf{u}_i\}$ 线性无关矛盾。故 $p\le m$。$\square$
+
+**由替换引理推出等势性：** 设 $\mathcal{B}_1$ 有 $m$ 个向量、$\mathcal{B}_2$ 有 $p$ 个向量。基既**张成**空间又**线性无关**：把 $\mathcal{B}_1$ 当作张成集、$\mathcal{B}_2$ 当作无关集，得 $p\le m$；反过来把 $\mathcal{B}_2$ 当张成集、$\mathcal{B}_1$ 当无关集，得 $m\le p$。两式合起来即 $m=p$——**任意两个基大小相同，维数因此良定义**。$\blacksquare$
 
 **推论与常用性质：**
 

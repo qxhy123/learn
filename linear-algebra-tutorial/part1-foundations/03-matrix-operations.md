@@ -113,6 +113,24 @@ $$\underbrace{A}_{m \times k} \cdot \underbrace{B}_{k \times n} = \underbrace{C}
 
 $$C_{ij} = \sum_{l=1}^{k} A_{il} \cdot B_{lj}$$
 
+### 两个更深的视角：列的线性组合 与 映射的复合
+
+上面的"行点乘列"是计算口径，但它**从哪来、为什么这样定义**？下面两个视角回答这个问题，也是后续章节真正依赖的理解。
+
+**视角一：$A\mathbf{x}$ 是 $A$ 各列的线性组合。** 先看最简单的情形——矩阵乘**向量** $A\mathbf{x}$（即 $B$ 只有一列）。设 $A$ 的列为 $\mathbf{a}_1, \ldots, \mathbf{a}_k$，$\mathbf{x} = (x_1, \ldots, x_k)^T$，按定义逐分量展开即得
+
+$$A\mathbf{x} = x_1\mathbf{a}_1 + x_2\mathbf{a}_2 + \cdots + x_k\mathbf{a}_k.$$
+
+也就是说，**$A\mathbf{x}$ 就是以 $\mathbf{x}$ 的分量为系数、对 $A$ 的列做线性组合**。这是贯穿全书的核心视角：方程组 $A\mathbf{x}=\mathbf{b}$ 有解 $\iff$ $\mathbf{b}$ 落在 $A$ 各列张成的空间（**列空间**）内（第12章），秩、列空间、可解性都建立在它之上。一般的矩阵乘积 $AB$ 不过是把 $B$ 的每一列分别这样变换：$AB = A\,[\mathbf{b}_1\ \cdots\ \mathbf{b}_n] = [A\mathbf{b}_1\ \cdots\ A\mathbf{b}_n]$。
+
+![矩阵乘法的列空间视角：$A\mathbf{x}$ 作为 $A$ 各列的线性组合](../figures/svg/la-p1-03-1.svg)
+
+**视角二：矩阵乘法 = 线性映射的复合（行·列规则的来源）。** 为什么乘法偏偏定义成"行点乘列"、还不可交换？因为矩阵代表**线性映射**，而矩阵乘积代表映射的**复合**。设 $B$ 把 $\mathbf{x}$ 映到 $\mathbf{y}=B\mathbf{x}$，$A$ 再把 $\mathbf{y}$ 映到 $\mathbf{z}=A\mathbf{y}$。要让"先 $B$ 后 $A$"这个复合映射 $\mathbf{x}\mapsto A(B\mathbf{x})$ 也由某个矩阵 $C$ 表示，即 $C\mathbf{x}=A(B\mathbf{x})$，把两式代入逐分量计算：
+
+$$z_i = \sum_{l} A_{il}\,y_l = \sum_{l} A_{il}\Big(\sum_{j} B_{lj}\,x_j\Big) = \sum_{j}\Big(\underbrace{\sum_{l} A_{il}B_{lj}}_{C_{ij}}\Big)x_j,$$
+
+于是 $C_{ij}=\sum_{l} A_{il}B_{lj}$——**正是上面的乘法定义**。所以"行·列求和"不是凭空规定，而是"复合两个线性映射"逼出来的结果；又因为映射复合讲先后（先穿袜子再穿鞋 $\ne$ 先穿鞋再穿袜子），这正是 $AB \ne BA$ 的根源。第14章会把这一对应关系讲得更完整。
+
 ### 计算示例
 
 设
@@ -543,13 +561,6 @@ $$\underbrace{Y'}_{32 \times 64} + \underbrace{\mathbf{b}}_{(64,) \to 32 \times 
 
 ---
 
-## 几何示意
-
-### 图 3-1：矩阵乘法的列空间视角
-
-![$A\mathbf{x}$ 作为列向量的线性组合](../figures/svg/la-p1-03-1.svg)
-
----
 ## 抽象成方法（套路总结）
 
 ### 矩阵运算核心速查

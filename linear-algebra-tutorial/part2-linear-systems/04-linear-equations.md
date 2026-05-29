@@ -208,7 +208,7 @@ $$\text{rank}(A) = \text{rank}([A \mid \mathbf{b}])$$
 
 即，增广矩阵与系数矩阵的秩相同——增加常数列不增加新的约束。若 $\text{rank}(A) < \text{rank}([A \mid \mathbf{b}])$，则无解。
 
-> 秩（rank）的严格定义见第6章，此处直觉理解为"矩阵中独立行（或列）的数目"即可。
+> **秩（rank）先给可操作定义**：矩阵 $A$ 的**秩** $\text{rank}(A)$ 是把 $A$ 用初等行变换化为**行阶梯形**后**非零行的个数**，等价地就是**主元（pivot）的个数**（行阶梯形与主元见第5章）。直观上它度量"矩阵中真正独立的行/列有多少"——这正是它能判定方程组解的存在与个数的原因。秩还有一个等价定义 $\text{rank}(A)=\dim(\text{Col}(A))$（列空间的维数），以及"行秩 = 列秩"这一关键事实，其证明见第12章。
 
 当方程组有解时：
 - 若 $\text{rank}(A) = n$（未知量个数），则解**唯一**
@@ -267,6 +267,13 @@ $$A(c\mathbf{u} + d\mathbf{v}) = cA\mathbf{u} + dA\mathbf{v} = c\mathbf{0} + d\m
 > **对比非齐次方程组：** $A\mathbf{x} = \mathbf{b}$（$\mathbf{b} \ne \mathbf{0}$）的解集**不是**向量空间，因为 $\mathbf{0}$ 不是其解。非齐次方程组的完整解可以表示为：一个**特解** $\mathbf{x}_p$（满足 $A\mathbf{x}_p = \mathbf{b}$）加上对应齐次方程组的通解：
 >
 > $$\mathbf{x} = \mathbf{x}_p + \mathbf{x}_h, \quad A\mathbf{x}_h = \mathbf{0}$$
+
+**为什么通解恰是"特解 + 齐次通解"（两个方向都要验）**：设 $\mathbf{x}_p$ 是任取的一个特解（$A\mathbf{x}_p=\mathbf{b}$）。
+
+- **每个 $\mathbf{x}_p+\mathbf{x}_h$ 都是解**：$A(\mathbf{x}_p+\mathbf{x}_h)=A\mathbf{x}_p+A\mathbf{x}_h=\mathbf{b}+\mathbf{0}=\mathbf{b}$。✓
+- **每个解都形如 $\mathbf{x}_p+\mathbf{x}_h$**：设 $\mathbf{x}$ 是任一解，令 $\mathbf{x}_h := \mathbf{x}-\mathbf{x}_p$，则 $A\mathbf{x}_h=A\mathbf{x}-A\mathbf{x}_p=\mathbf{b}-\mathbf{b}=\mathbf{0}$，即 $\mathbf{x}_h$ 是齐次解，且 $\mathbf{x}=\mathbf{x}_p+\mathbf{x}_h$。✓
+
+两个方向合起来即得：**非齐次方程组的解集 $=\mathbf{x}_p+\ker(A)$**（把齐次解集整体平移一个特解 $\mathbf{x}_p$）。几何上，齐次解集是过原点的子空间，而非齐次解集是与它平行、但不过原点的"仿射子空间"——这也解释了为什么后者不构成向量空间（不含 $\mathbf{0}$）。
 
 **零空间的维数**（称为矩阵的**零化度**，nullity）等于 $n - \text{rank}(A)$，这是秩-零化度定理的结论，将在后续章节严格证明。
 

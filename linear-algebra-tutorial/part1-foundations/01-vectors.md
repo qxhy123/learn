@@ -183,6 +183,20 @@ $$\mathbf{u} - \mathbf{v} = \begin{pmatrix} u_1 - v_1 \\ u_2 - v_2 \\ \vdots \\ 
 
 向量差在深度学习中频繁出现，例如损失函数中的**残差**（预测值与真实值的差）：$\mathbf{e} = \hat{\mathbf{y}} - \mathbf{y}$，其范数 $\|\mathbf{e}\|$ 反映了预测的误差大小。
 
+### 线性组合
+
+把"标量乘法"和"向量加法"合起来，就得到线性代数中最基础、也最重要的操作——**线性组合**。
+
+**定义**：给定向量 $\mathbf{v}_1, \mathbf{v}_2, \ldots, \mathbf{v}_k \in \mathbb{R}^n$ 和标量 $c_1, c_2, \ldots, c_k \in \mathbb{R}$，形如
+
+$$c_1\mathbf{v}_1 + c_2\mathbf{v}_2 + \cdots + c_k\mathbf{v}_k$$
+
+的向量称为 $\mathbf{v}_1, \ldots, \mathbf{v}_k$ 的一个**线性组合**（linear combination），其中 $c_i$ 称为组合**系数**。
+
+直观说，线性组合就是"把一组向量各自缩放后再相加"。它是后续几乎所有核心概念的基石：**张成空间**与**线性相关/无关**（第10章）建立在"哪些向量能由其他向量线性组合得到"之上；**矩阵乘向量** $A\mathbf{x}$（第3章）本质就是"用 $\mathbf{x}$ 的分量作系数、对 $A$ 的各列做线性组合"；**向量空间**（第9章）的定义则要求集合对线性组合封闭。
+
+**例**：$2\begin{pmatrix}1\\0\end{pmatrix} + 3\begin{pmatrix}0\\1\end{pmatrix} = \begin{pmatrix}2\\3\end{pmatrix}$，即 $(2,3)$ 是标准基向量的线性组合。
+
 ### 运算性质
 
 设 $\mathbf{u}$、$\mathbf{v}$、$\mathbf{w} \in \mathbb{R}^n$，$a, b \in \mathbb{R}$，向量运算满足以下性质：
