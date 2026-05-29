@@ -555,9 +555,9 @@ $$
 
 **7.** ⭐⭐⭐ 用幂级数方法求微分方程
 $$
-y'=y,\qquad y(0)=1
+y'=1+y^2,\qquad y(0)=0
 $$
-的解。
+的解（提示：用 Cauchy 乘积处理 $y^2$）。
 
 **8.** ⭐⭐⭐ 在温度 softmax 中，二分类概率可写为
 $$
@@ -686,27 +686,20 @@ y=\sum_{n=0}^{\infty} a_n x^n,
 y'=\sum_{n=1}^{\infty} n a_n x^{n-1}.
 $$
 
-由方程 $y'=y$，把 $y'$ 改写为同次幂形式：
+代入 $y'=1+y^2$，其中 $y^2$ 用 **Cauchy 乘积**：$y^2=\sum_{n=0}^{\infty}\left(\sum_{k=0}^{n}a_k a_{n-k}\right)x^n$。由 $y(0)=0$ 得 $a_0=0$，逐阶比较系数：
 $$
-\sum_{n=0}^{\infty}(n+1)a_{n+1}x^n=\sum_{n=0}^{\infty} a_n x^n.
+x^0:\ a_1=1+a_0^2=1;\qquad x^1:\ 2a_2=2a_0a_1=0\Rightarrow a_2=0;
 $$
-
-比较系数得
 $$
-(n+1)a_{n+1}=a_n,
-\qquad
-a_{n+1}=\frac{a_n}{n+1}.
-$$
-
-由初值条件 $y(0)=1$，得 $a_0=1$。于是
-$$
-a_1=1,\quad a_2=\frac{1}{2!},\quad a_3=\frac{1}{3!},\ \ldots,\ a_n=\frac{1}{n!}.
+x^2:\ 3a_3=a_1^2+2a_0a_2=1\Rightarrow a_3=\tfrac{1}{3};\qquad x^4:\ 5a_5=2a_1a_3+a_2^2=\tfrac{2}{3}\Rightarrow a_5=\tfrac{2}{15}.
 $$
 
 故
 $$
-y=\sum_{n=0}^{\infty}\frac{x^n}{n!}=e^x.
+y=x+\frac{x^3}{3}+\frac{2x^5}{15}+\cdots
 $$
+
+识别：由 $(\tan x)'=\sec^2 x=1+\tan^2 x$ 且 $\tan 0=0$，知 $y=\tan x$（上式正是 $\tan x$ 的 Maclaurin 展开）。
 
 ---
 

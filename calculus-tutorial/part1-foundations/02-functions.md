@@ -414,7 +414,7 @@ class SimpleNN(nn.Module):
 
 **3.** ⭐ 设 $f(x) = 2^x$，$g(x) = x^2 - 1$，求 $(f \circ g)(x)$ 和 $(g \circ f)(x)$，并说明复合函数的顺序是否可交换。
 
-**4.** ⭐⭐ 求函数 $f(x) = \frac{e^x - 1}{e^x + 1}$ 的反函数。
+**4.** ⭐⭐ 求函数 $f(x) = \dfrac{1-x}{1+x}$（$x \neq -1$）的反函数。
 
 **5.** ⭐⭐ 设 $f(x)$ 在 $\mathbb{R}$ 上满足 $f(x + 2) = -f(x)$，且 $f(x)$ 在 $[0, 2]$ 上的表达式为 $f(x) = x(2-x)$。求 $f(x)$ 在 $[-2, 0]$ 上的表达式，并说明 $f(x)$ 的周期。
 
@@ -467,21 +467,21 @@ $(g \circ f)(x) = g(f(x)) = (2^x)^2 - 1 = 2^{2x} - 1$
 
 ---
 
-**4.** 设 $y = \frac{e^x - 1}{e^x + 1}$，解出 $x$。
+**4.** 设 $y = \dfrac{1-x}{1+x}$，解出 $x$。
 
-$y(e^x + 1) = e^x - 1$
+$y(1 + x) = 1 - x$
 
-$ye^x + y = e^x - 1$
+$y + yx = 1 - x$
 
-$y + 1 = e^x - ye^x = e^x(1 - y)$
+$x(y + 1) = 1 - y$
 
-$e^x = \frac{1 + y}{1 - y}$（要求 $y \neq 1$）
-
-$x = \ln\frac{1 + y}{1 - y}$
+$x = \dfrac{1 - y}{1 + y}$（要求 $y \neq -1$）
 
 将 $x$ 与 $y$ 互换，反函数为：
 
-$$f^{-1}(x) = \ln\frac{1 + x}{1 - x}, \quad x \in (-1, 1)$$
+$$f^{-1}(x) = \frac{1 - x}{1 + x}, \quad x \neq -1$$
+
+可见 $f^{-1}=f$，即 $f$ 是**自反函数（对合）**：直接代入可验证 $f(f(x))=x$。
 
 ---
 
@@ -693,23 +693,23 @@ $f(x)$ 周期为 $T$，求 $f(1000)$：先做整除 $1000 \div T$，余数即等
 
 ### 例 3：求反函数
 
-> **题目**：求 $f(x) = \dfrac{e^x - 1}{e^x + 1}$ 的反函数。
+> **题目**：求 $f(x) = \ln\left(x + \sqrt{x^2+1}\right)$ 的反函数。
 
-【思路】令 $y = f(x)$，解出 $x$，再交换 $x \leftrightarrow y$，最后写定义域。
+【思路】令 $y = f(x)$，从 $e^y$ 入手解出 $x$，再交换 $x \leftrightarrow y$。
 
-【解】由 $y(e^x+1) = e^x - 1$，整理得 $e^x(y-1) = -(1+y)$，即
+【解】由 $y=\ln\left(x+\sqrt{x^2+1}\right)$ 得 $e^y = x+\sqrt{x^2+1}$。注意到
 
-$$e^x = \frac{1+y}{1-y} \quad (\text{需 } y \neq 1)$$
+$$\left(x+\sqrt{x^2+1}\right)\left(\sqrt{x^2+1}-x\right)=(x^2+1)-x^2=1,$$
 
-取对数：$x = \ln\dfrac{1+y}{1-y}$。
+故 $e^{-y}=\sqrt{x^2+1}-x$。两式相减消去根号：$e^y-e^{-y}=2x$，即 $x=\dfrac{e^y-e^{-y}}{2}$。
 
-原函数值域：$y \in (-1,1)$（$e^x > 0$ 恒成立，分析单调性可得）。
+交换 $x\leftrightarrow y$，得反函数：
 
-反函数：$f^{-1}(x) = \ln\dfrac{1+x}{1-x}$，$x \in (-1, 1)$。
+$$f^{-1}(x)=\frac{e^x-e^{-x}}{2}=\sinh x,\quad x\in\mathbb{R}.$$
 
-【答案】$\boxed{f^{-1}(x) = \ln\frac{1+x}{1-x},\ x \in (-1,1)}$。
+【答案】$\boxed{f^{-1}(x)=\sinh x=\dfrac{e^x-e^{-x}}{2},\ x\in\mathbb{R}}$。
 
-【注】这正是 Sigmoid 反函数 logit 的形式，在机器学习中无处不在。
+【注】$f$ 就是**反双曲正弦** $\operatorname{arsinh}$（定义域、值域均为 $\mathbb{R}$），其反函数恰为 $\sinh$；"取对数解出指数再消根号"是求这类反函数的通用套路。
 
 ---
 
