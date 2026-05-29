@@ -249,11 +249,51 @@ $$e^y = e^x + C$$
 
 通解为 $y = \ln(e^x + C)$，其中 $e^x + C > 0$。 $\square$
 
+### 23.2.4 齐次方程（可化为可分离变量）
+
+有些方程本身无法直接分离变量，但通过换元可化成可分离方程。最典型的就是**齐次方程**。
+
+**定义**：若一阶方程可写成
+$$\frac{dy}{dx}=f\!\left(\frac{y}{x}\right),$$
+即右端只依赖于比值 $\dfrac{y}{x}$，则称为**齐次方程**。
+
+> **注**：此处的"齐次"指右端是 $\dfrac{y}{x}$ 的函数，与下一节 §23.3.1 中的**齐次线性方程**（指 $y'+P(x)y=0$，右端为 $0$）是两个不同的概念，切勿混淆。
+>
+> **识别技巧**：把 $y'=\dfrac{M(x,y)}{N(x,y)}$ 的分子分母同除以 $x$ 的适当幂，若能整理成只含 $\dfrac{y}{x}$ 的式子，即为齐次方程。例如 $\dfrac{dy}{dx}=\dfrac{x+y}{x-y}$，上下同除 $x$ 得 $\dfrac{1+y/x}{1-y/x}$。
+
+**求解方法（令 $u=\dfrac{y}{x}$）**：由 $y=ux$ 得 $\dfrac{dy}{dx}=u+x\dfrac{du}{dx}$，代入 $\dfrac{dy}{dx}=f(u)$：
+
+$$u+x\frac{du}{dx}=f(u)\quad\Longrightarrow\quad x\frac{du}{dx}=f(u)-u,$$
+
+这就是关于 $u$ 的**可分离变量方程**：
+
+$$\frac{du}{f(u)-u}=\frac{dx}{x}.$$
+
+两边积分解出 $u$，再用 $u=\dfrac{y}{x}$ **换回** $y$ 即可。（若某 $u_0$ 使 $f(u_0)=u_0$，则 $y=u_0x$ 也是一条直线解。）
+
+> **例题 23.8** 求方程 $\dfrac{dy}{dx}=\dfrac{x^2+y^2}{xy}$ 的通解。
+
+**解**：分子分母同除 $x^2$，右端 $=\dfrac{1+(y/x)^2}{y/x}$，只含 $\dfrac{y}{x}$，是齐次方程。
+
+令 $u=\dfrac{y}{x}$，则 $\dfrac{dy}{dx}=u+x\dfrac{du}{dx}$，代入：
+
+$$u+x\frac{du}{dx}=\frac{1+u^2}{u}\quad\Longrightarrow\quad x\frac{du}{dx}=\frac{1+u^2}{u}-u=\frac{1}{u}.$$
+
+分离变量并积分：
+
+$$\int u\,du=\int\frac{dx}{x}\quad\Longrightarrow\quad \frac{u^2}{2}=\ln|x|+C_1.$$
+
+换回 $u=\dfrac{y}{x}$，得通解
+
+$$y^2=x^2\bigl(2\ln|x|+C\bigr)\qquad(C=2C_1\ \text{为任意常数}).$$
+
+（可对结果隐式求导验证 $y'=\dfrac{x^2+y^2}{xy}$。）$\square$
+
 ---
 
 ## 23.3 一阶线性方程
 
-### 23.3.1 齐次方程
+### 23.3.1 齐次线性方程
 
 **定义**：形如
 
@@ -271,7 +311,7 @@ $$y = Ce^{-\int P(x) \, dx}$$
 
 其中 $C$ 为任意常数。
 
-### 23.3.2 非齐次方程
+### 23.3.2 非齐次线性方程
 
 **定义**：形如
 
@@ -314,7 +354,7 @@ $$\boxed{y = e^{-\int P(x) \, dx} \left[ \int Q(x) \cdot e^{\int P(x) \, dx} \, 
 - 当 $Q(x) \equiv 0$ 时，通解退化为 $y = Ce^{-\int P(x) \, dx}$（齐次方程的通解）
 - 非齐次方程的通解 $=$ 齐次方程的通解 $+$ 非齐次方程的一个特解
 
-> **例题 23.8** 求方程 $y' + \dfrac{y}{x} = x^2$ 的通解。
+> **例题 23.9** 求方程 $y' + \dfrac{y}{x} = x^2$ 的通解。
 
 **解**：这是一阶线性方程，$P(x) = \dfrac{1}{x}$，$Q(x) = x^2$。
 
@@ -334,7 +374,7 @@ $$y = \frac{1}{x} \left[ \int x^3 \, dx + C \right] = \frac{1}{x} \left[ \frac{x
 
 通解为 $y = \dfrac{x^3}{4} + \dfrac{C}{x}$。 $\square$
 
-> **例题 23.9** 求初值问题 $\begin{cases} y' - 2xy = x \\ y(0) = 1 \end{cases}$ 的解。
+> **例题 23.10** 求初值问题 $\begin{cases} y' - 2xy = x \\ y(0) = 1 \end{cases}$ 的解。
 
 **解**：$P(x) = -2x$，$Q(x) = x$。
 
@@ -386,7 +426,7 @@ $$z' + (1-n)P(x) z = (1-n)Q(x)$$
 
 这是关于 $z$ 的一阶线性方程，可用通解公式求解。
 
-> **例题 23.10** 求方程 $y' + \dfrac{y}{x} = x^2 y^2$ 的通解。
+> **例题 23.11** 求方程 $y' + \dfrac{y}{x} = x^2 y^2$ 的通解。
 
 **解**：这是 Bernoulli 方程，$n = 2$，$P(x) = \dfrac{1}{x}$，$Q(x) = x^2$。
 
@@ -456,7 +496,7 @@ $$u(x, y) = \int_{(x_0, y_0)}^{(x, y)} M \, dx + N \, dy$$
 
 通常取 $(x_0, y_0) = (0, 0)$ 并沿折线积分。
 
-> **例题 23.11** 求方程 $(2x + y) \, dx + (x + 2y) \, dy = 0$ 的通解。
+> **例题 23.12** 求方程 $(2x + y) \, dx + (x + 2y) \, dy = 0$ 的通解。
 
 **解**：$M = 2x + y$，$N = x + 2y$。
 
@@ -491,7 +531,7 @@ $$\mu M \, dx + \mu N \, dy = 0$$
 - 若 $\dfrac{\frac{\partial M}{\partial y} - \frac{\partial N}{\partial x}}{N}$ 仅是 $x$ 的函数 $g(x)$，则 $\mu = e^{\int g(x) \, dx}$
 - 若 $\dfrac{\frac{\partial N}{\partial x} - \frac{\partial M}{\partial y}}{M}$ 仅是 $y$ 的函数 $h(y)$，则 $\mu = e^{\int h(y) \, dy}$
 
-> **例题 23.12** 求方程 $y \, dx - x \, dy = 0$ 的通解。
+> **例题 23.13** 求方程 $y \, dx - x \, dy = 0$ 的通解。
 
 **解**：$M = y$，$N = -x$。
 
@@ -590,7 +630,7 @@ $$
 - $\mathrm{Re}(\lambda)>0$：增长，系统不稳定
 - $\mathrm{Re}(\lambda)=0$：振荡或临界情况
 
-> **例题 23.13** 求解系统
+> **例题 23.14** 求解系统
  $$
  \frac{d}{dt}
  \begin{bmatrix}
@@ -711,7 +751,7 @@ $$
 
 2. **可分离变量**：$y'=f(x)g(y)$——见到"$x$ 的函数"乘"$y$ 的函数"，立即分离：$\frac{dy}{g(y)}=f(x)\,dx$，两边积分。
 
-3. **齐次方程换元 $u=y/x$**：见到 $y'=f(y/x)$ 或分子分母均为 $x,y$ 的同次多项式，令 $u=y/x$，$y=ux$，$y'=u+xu'$，化为可分离方程。
+3. **齐次方程换元 $u=y/x$**：见到 $y'=f(y/x)$ 或分子分母均为 $x,y$ 的同次多项式，令 $u=y/x$，$y=ux$，$y'=u+xu'$，化为可分离方程（详见 §23.2.4）。
 
 4. **一阶线性积分因子**：见到 $y'+p(x)y=q(x)$，立即算 $\mu=e^{\int p\,dx}$，乘以 $\mu$ 后左边自动变成 $(\mu y)'$，右边积分即可。
 
