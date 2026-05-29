@@ -277,6 +277,166 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：已知 $\sin x=\dfrac{3}{5}$，且 $x$ 为锐角，求 $\sin 2x$ 与 $\cos 2x$。
+
+**解**：先由平方关系补出 $\cos x$。因 $x$ 为锐角，余弦为正：
+
+$$
+\cos x=\sqrt{1-\sin^2x}=\sqrt{1-\frac{9}{25}}=\frac{4}{5}
+$$
+
+代入倍角公式：
+
+$$
+\sin 2x=2\sin x\cos x=2\cdot\frac{3}{5}\cdot\frac{4}{5}=\frac{24}{25}
+$$
+
+$$
+\cos 2x=1-2\sin^2x=1-2\cdot\frac{9}{25}=\frac{7}{25}
+$$
+
+**点评**：倍角求值的标准两步——先用平方关系把缺的那个函数值补齐（并由象限定符号），再代入倍角公式。$\cos 2x$ 有三种形式，这里选 $1-2\sin^2x$ 是因为题目直接给了 $\sin x$，最省事。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：不查表，求 $\tan 105^\circ$ 的精确值。
+
+**解**：把 $105^\circ$ 拆成 $60^\circ+45^\circ$，用正切和角公式：
+
+$$
+\tan 105^\circ=\tan(60^\circ+45^\circ)=\frac{\tan 60^\circ+\tan 45^\circ}{1-\tan 60^\circ\tan 45^\circ}=\frac{\sqrt3+1}{1-\sqrt3\cdot1}
+$$
+
+即
+
+$$
+\tan 105^\circ=\frac{\sqrt3+1}{1-\sqrt3}
+$$
+
+分母有理化，分子分母同乘 $1+\sqrt3$：
+
+$$
+=\frac{(\sqrt3+1)(1+\sqrt3)}{(1-\sqrt3)(1+\sqrt3)}=\frac{\sqrt3+3+1+\sqrt3}{1-3}=\frac{4+2\sqrt3}{-2}=-(2+\sqrt3)
+$$
+
+故 $\tan 105^\circ=-2-\sqrt3$。
+
+**点评**：拆角法对正切同样有效。结果为负与 $105^\circ$ 在第二象限（正切为负）一致，是一个天然的自检。有理化分母后务必验证符号，避免漏掉负号。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：化简 $\sqrt3\sin x+\cos x$ 为单一正弦 $R\sin(x+\varphi)$ 的形式。
+
+**解**：设 $\sqrt3\sin x+\cos x=R\sin(x+\varphi)=R\sin x\cos\varphi+R\cos x\sin\varphi$。对照系数：
+
+$$
+R\cos\varphi=\sqrt3,\qquad R\sin\varphi=1
+$$
+
+两式平方相加，用平方关系消去 $\varphi$：
+
+$$
+R^2(\cos^2\varphi+\sin^2\varphi)=(\sqrt3)^2+1^2=4\ \Rightarrow\ R=2
+$$
+
+再由两式相除得
+
+$$
+\tan\varphi=\frac{R\sin\varphi}{R\cos\varphi}=\frac{1}{\sqrt3}\ \Rightarrow\ \varphi=\frac{\pi}{6}
+$$
+
+（因 $\cos\varphi,\sin\varphi$ 均为正，$\varphi$ 在第一象限。）故
+
+$$
+\sqrt3\sin x+\cos x=2\sin\left(x+\frac{\pi}{6}\right)
+$$
+
+**点评**：这是 $a\sin x+b\cos x$ 合一的标准前置变形，本质是和角公式的逆用：$R=\sqrt{a^2+b^2}$，$\varphi$ 由 $\cos\varphi=a/R,\ \sin\varphi=b/R$ 同时确定。务必用两个方程联立定 $\varphi$ 的象限，单靠 $\tan\varphi$ 会丢象限信息。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：已知 $\cos x=-\dfrac{3}{5}$，且 $x\in\left(\dfrac{\pi}{2},\pi\right)$，求 $\sin\dfrac{x}{2}$ 与 $\cos\dfrac{x}{2}$。
+
+**解**：由半角公式
+
+$$
+\sin^2\frac{x}{2}=\frac{1-\cos x}{2}=\frac{1-(-3/5)}{2}=\frac{8/5}{2}=\frac{4}{5}
+$$
+
+$$
+\cos^2\frac{x}{2}=\frac{1+\cos x}{2}=\frac{1+(-3/5)}{2}=\frac{2/5}{2}=\frac{1}{5}
+$$
+
+定符号：由 $x\in\left(\dfrac{\pi}{2},\pi\right)$ 得 $\dfrac{x}{2}\in\left(\dfrac{\pi}{4},\dfrac{\pi}{2}\right)$，落在第一象限，故 $\sin\dfrac{x}{2},\cos\dfrac{x}{2}$ 均为正：
+
+$$
+\sin\frac{x}{2}=\frac{2}{\sqrt5}=\frac{2\sqrt5}{5},\qquad \cos\frac{x}{2}=\frac{1}{\sqrt5}=\frac{\sqrt5}{5}
+$$
+
+**点评**：半角公式最大的陷阱是开方的正负号。务必先由 $x$ 的范围推出 $\dfrac{x}{2}$ 的范围，再据其象限定号——本题 $x$ 在第二象限，但 $\dfrac{x}{2}$ 却在第一象限，二者所在象限并不相同，正是高频出错点。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：用万能代换求 $\dfrac{\sin x}{1+\cos x}$ 的最简形式（用 $t=\tan\dfrac{x}{2}$ 表示）。
+
+**解**：代入万能代换 $\sin x=\dfrac{2t}{1+t^2}$，$\cos x=\dfrac{1-t^2}{1+t^2}$：
+
+$$
+\frac{\sin x}{1+\cos x}=\frac{\dfrac{2t}{1+t^2}}{1+\dfrac{1-t^2}{1+t^2}}
+$$
+
+分母通分：$1+\dfrac{1-t^2}{1+t^2}=\dfrac{(1+t^2)+(1-t^2)}{1+t^2}=\dfrac{2}{1+t^2}$。于是
+
+$$
+\frac{\sin x}{1+\cos x}=\frac{\dfrac{2t}{1+t^2}}{\dfrac{2}{1+t^2}}=\frac{2t}{2}=t=\tan\frac{x}{2}
+$$
+
+**点评**：万能代换把同时含 $\sin x,\cos x$ 的式子统一成关于 $t$ 的有理式，约分后得到了一个漂亮的半角恒等式 $\dfrac{\sin x}{1+\cos x}=\tan\dfrac{x}{2}$。这正是“统一有理化入口”的威力。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：已知 $\sin x+\cos x=\dfrac{1}{5}$，且 $x\in(0,\pi)$，求 $\sin 2x$、$\sin x-\cos x$ 与 $\tan x$。
+
+**解**：将已知式两边平方，左边出现倍角结构：
+
+$$
+(\sin x+\cos x)^2=\sin^2x+\cos^2x+2\sin x\cos x=1+\sin 2x
+$$
+
+故 $1+\sin 2x=\dfrac{1}{25}$，得
+
+$$
+\sin 2x=\frac{1}{25}-1=-\frac{24}{25}
+$$
+
+由 $\sin 2x<0$ 且 $x\in(0,\pi)$，知 $2x\in(\pi,2\pi)$，即 $x\in\left(\dfrac{\pi}{2},\pi\right)$，此时 $\sin x>0,\cos x<0$，故 $\sin x-\cos x>0$。再用平方：
+
+$$
+(\sin x-\cos x)^2=1-\sin 2x=1-\left(-\frac{24}{25}\right)=\frac{49}{25}
+$$
+
+取正根：$\sin x-\cos x=\dfrac{7}{5}$。与已知联立：
+
+$$
+\sin x=\frac{1}{2}\left(\frac{1}{5}+\frac{7}{5}\right)=\frac{4}{5},\qquad \cos x=\frac{1}{2}\left(\frac{1}{5}-\frac{7}{5}\right)=-\frac{3}{5}
+$$
+
+故
+
+$$
+\tan x=\frac{\sin x}{\cos x}=\frac{4/5}{-3/5}=-\frac{4}{3}
+$$
+
+**点评**：“和已知、平方求积”是处理 $\sin x\pm\cos x$ 一类问题的核心套路——平方后 $\sin^2x+\cos^2x=1$ 与 $2\sin x\cos x=\sin 2x$ 同时现身。求 $\sin x-\cos x$ 时取正根的依据来自象限分析，绝不能随手取正，这是本题最考验功力的一步。
+
+---
+
 ## 练习题
 
 1. 为什么倍角公式可以看成和差公式的特殊情形？

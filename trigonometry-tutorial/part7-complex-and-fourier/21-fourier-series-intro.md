@@ -167,6 +167,126 @@ Fourier 级数不是脱离三角变换的新世界，它其实高度依赖：
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高中核心与高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：验证正交关系 $\displaystyle\int_{-\pi}^{\pi}\cos x\,\cos 2x\,dx=0$。
+
+**解**：用积化和差 $\cos A\cos B=\dfrac{1}{2}\left[\cos(A-B)+\cos(A+B)\right]$：
+
+$$\cos x\cos2x=\frac{1}{2}\left[\cos(-x)+\cos3x\right]=\frac{1}{2}\left(\cos x+\cos3x\right).$$
+
+逐项积分，$\cos kx$（$k\neq0$）在整周期 $[-\pi,\pi]$ 上积分为零：
+
+$$\int_{-\pi}^{\pi}\cos x\,dx=\left[\sin x\right]_{-\pi}^{\pi}=0,\qquad \int_{-\pi}^{\pi}\cos3x\,dx=\left[\frac{\sin3x}{3}\right]_{-\pi}^{\pi}=0.$$
+
+故原积分为 $0$。
+
+**点评**：正交性正是傅里叶级数能“逐频率提取系数”的根基。积化和差把两个频率的乘积拆成单频率之和，而每个非零频率的整周期积分都为零——不同频率“互不干扰”由此得到验证。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：判断下列函数的傅里叶级数只含正弦项还是只含余弦项：（a）$f(x)=x^2$；（b）$g(x)=x^3$；（c）$h(x)=x\cos x$。（均视为周期 $2\pi$ 的函数。）
+
+**解**：关键是判断奇偶性。
+
+（a）$f(-x)=(-x)^2=x^2=f(x)$，偶函数 → 只含余弦项（含常数项 $\tfrac{a_0}{2}$）。
+
+（b）$g(-x)=(-x)^3=-x^3=-g(x)$，奇函数 → 只含正弦项。
+
+（c）$h(-x)=(-x)\cos(-x)=-x\cos x=-h(x)$，奇函数（奇 × 偶 = 奇）→ 只含正弦项。
+
+**点评**：动手算积分前先看对称性能省一半工作量。偶函数 $b_n=0$，奇函数 $a_n=0$。判断 (c) 时用到“奇函数乘偶函数为奇函数”，$x$ 是奇、$\cos x$ 是偶，乘积仍为奇。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：求函数 $f(x)=x$（$-\pi<x<\pi$，周期 $2\pi$）的傅里叶正弦系数 $b_n$。
+
+**解**：$f(x)=x$ 是奇函数，故所有 $a_n=0$，只需算
+
+$$b_n=\frac{1}{\pi}\int_{-\pi}^{\pi}x\sin nx\,dx=\frac{2}{\pi}\int_0^{\pi}x\sin nx\,dx$$
+
+（被积函数 $x\sin nx$ 为偶函数，故用两倍半区间）。分部积分，令 $u=x,\ dv=\sin nx\,dx$，则 $v=-\dfrac{\cos nx}{n}$：
+
+$$\int_0^{\pi}x\sin nx\,dx=\left[-\frac{x\cos nx}{n}\right]_0^{\pi}+\frac{1}{n}\int_0^{\pi}\cos nx\,dx=-\frac{\pi\cos n\pi}{n}+\frac{1}{n}\left[\frac{\sin nx}{n}\right]_0^{\pi}.$$
+
+末项 $\sin n\pi=0$ 故为零，而 $\cos n\pi=(-1)^n$，于是
+
+$$b_n=\frac{2}{\pi}\cdot\left(-\frac{\pi(-1)^n}{n}\right)=-\frac{2(-1)^n}{n}=\frac{2(-1)^{n+1}}{n}.$$
+
+即 $f(x)=x\sim\displaystyle\sum_{n=1}^{\infty}\frac{2(-1)^{n+1}}{n}\sin nx=2\left(\sin x-\frac{\sin2x}{2}+\frac{\sin3x}{3}-\cdots\right)$。
+
+**点评**：这是经典的“锯齿波”展开。先用奇偶性砍掉 $a_n$，再对 $x\sin nx$ 分部积分。注意 $\cos n\pi=(-1)^n$ 是处理这类积分的常用结果，符号交替正源于此。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：求偶函数锯齿 $f(x)=|x|$（$-\pi\le x\le\pi$，周期 $2\pi$）的傅里叶级数。
+
+**解**：$f(x)=|x|$ 是偶函数，故 $b_n=0$。先求常数项相关的 $a_0$：
+
+$$a_0=\frac{1}{\pi}\int_{-\pi}^{\pi}|x|\,dx=\frac{2}{\pi}\int_0^{\pi}x\,dx=\frac{2}{\pi}\cdot\frac{\pi^2}{2}=\pi.$$
+
+再求 $a_n$（$n\ge1$），同样用偶函数化为两倍半区间：
+
+$$a_n=\frac{1}{\pi}\int_{-\pi}^{\pi}|x|\cos nx\,dx=\frac{2}{\pi}\int_0^{\pi}x\cos nx\,dx.$$
+
+分部积分（$u=x,\ dv=\cos nx\,dx,\ v=\tfrac{\sin nx}{n}$）：
+
+$$\int_0^{\pi}x\cos nx\,dx=\left[\frac{x\sin nx}{n}\right]_0^{\pi}-\frac{1}{n}\int_0^{\pi}\sin nx\,dx=0+\frac{1}{n}\left[\frac{\cos nx}{n}\right]_0^{\pi}=\frac{\cos n\pi-1}{n^2}.$$
+
+（首项含 $\sin n\pi=0$。）故
+
+$$a_n=\frac{2}{\pi}\cdot\frac{(-1)^n-1}{n^2}=\begin{cases}-\dfrac{4}{\pi n^2}, & n\text{ 为奇数}\\[2mm] 0, & n\text{ 为偶数}.\end{cases}$$
+
+于是
+
+$$|x|=\frac{\pi}{2}-\frac{4}{\pi}\left(\frac{\cos x}{1^2}+\frac{\cos3x}{3^2}+\frac{\cos5x}{5^2}+\cdots\right).$$
+
+**点评**：偶函数只剩余弦项与常数项 $\tfrac{a_0}{2}=\tfrac{\pi}{2}$。在连续点处令 $x=0$ 可得 $0=\dfrac{\pi}{2}-\dfrac{4}{\pi}\left(1+\dfrac{1}{9}+\dfrac{1}{25}+\cdots\right)$，从而 $\displaystyle\sum_{k\ge0}\frac{1}{(2k+1)^2}=\frac{\pi^2}{8}$——傅里叶级数顺手给出一个著名级数和。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：用复指数形式的傅里叶级数 $f(x)=\displaystyle\sum_{n=-\infty}^{\infty}c_n e^{inx}$（其中 $c_n=\dfrac{1}{2\pi}\displaystyle\int_{-\pi}^{\pi}f(x)e^{-inx}\,dx$）求 $f(x)=e^x$（$-\pi<x<\pi$，周期 $2\pi$）的复系数 $c_n$。
+
+**解**：直接代入积分：
+
+$$c_n=\frac{1}{2\pi}\int_{-\pi}^{\pi}e^x\,e^{-inx}\,dx=\frac{1}{2\pi}\int_{-\pi}^{\pi}e^{(1-in)x}\,dx=\frac{1}{2\pi}\cdot\frac{e^{(1-in)x}}{1-in}\Bigg|_{-\pi}^{\pi}.$$
+
+代入上下限：
+
+$$=\frac{1}{2\pi(1-in)}\left(e^{(1-in)\pi}-e^{-(1-in)\pi}\right)=\frac{1}{2\pi(1-in)}\left(e^{\pi}e^{-in\pi}-e^{-\pi}e^{in\pi}\right).$$
+
+由于 $e^{\pm in\pi}=(-1)^n$（整数 $n$），两项的指数因子相同：
+
+$$=\frac{(-1)^n}{2\pi(1-in)}\left(e^{\pi}-e^{-\pi}\right)=\frac{(-1)^n\sinh\pi}{\pi(1-in)}.$$
+
+可进一步把分母有理化为 $\dfrac{(-1)^n\sinh\pi}{\pi}\cdot\dfrac{1+in}{1+n^2}$。
+
+**点评**：复指数形式把 $a_n,b_n$ 两套系数合并成一套 $c_n$，且积分 $\int e^{(1-in)x}dx$ 一步完成，远比对 $e^x\cos nx$ 反复分部积分简洁。关键化简是 $e^{in\pi}=e^{-in\pi}=(-1)^n$ 以及 $e^{\pi}-e^{-\pi}=2\sinh\pi$。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：利用 Parseval 等式 $\dfrac{1}{\pi}\displaystyle\int_{-\pi}^{\pi}\left[f(x)\right]^2dx=\dfrac{a_0^2}{2}+\displaystyle\sum_{n=1}^{\infty}\left(a_n^2+b_n^2\right)$，对例题 3 的锯齿波 $f(x)=x$ 求 $\displaystyle\sum_{n=1}^{\infty}\frac{1}{n^2}$。
+
+**解**：先算左边。$f(x)=x$ 在 $[-\pi,\pi]$ 上
+
+$$\frac{1}{\pi}\int_{-\pi}^{\pi}x^2\,dx=\frac{1}{\pi}\cdot\frac{2\pi^3}{3}=\frac{2\pi^2}{3}.$$
+
+右边：由例题 3 知 $a_0=0,\ a_n=0,\ b_n=\dfrac{2(-1)^{n+1}}{n}$，故 $b_n^2=\dfrac{4}{n^2}$。于是 Parseval 等式给出
+
+$$\frac{2\pi^2}{3}=\sum_{n=1}^{\infty}\frac{4}{n^2}=4\sum_{n=1}^{\infty}\frac{1}{n^2}.$$
+
+解得
+
+$$\sum_{n=1}^{\infty}\frac{1}{n^2}=\frac{1}{4}\cdot\frac{2\pi^2}{3}=\frac{\pi^2}{6}.$$
+
+**点评**：Parseval 等式说“时域的能量等于各频率分量能量之和”，是正交性的终极体现。它把一个看似与 $\pi$ 无关的级数 $\sum\frac{1}{n^2}$ 与函数的平方积分挂钩，给出 Basel 问题的经典结果 $\dfrac{\pi^2}{6}$。
+
+---
+
 ## 练习题
 
 1. 为什么说 Fourier 级数的核心是“分解频率”而不是“写公式”？

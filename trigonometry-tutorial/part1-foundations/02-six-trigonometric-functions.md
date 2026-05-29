@@ -178,6 +178,153 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：在直角三角形中，锐角 $A$ 的对边为 $3$，邻边为 $4$。求 $\sin A$、$\cos A$、$\tan A$。
+
+**解**：
+
+先求斜边，由勾股定理：
+
+$$
+c=\sqrt{3^2+4^2}=\sqrt{9+16}=\sqrt{25}=5
+$$
+
+按定义“对边比斜边、邻边比斜边、对边比邻边”：
+
+$$
+\sin A=\frac{3}{5},\qquad \cos A=\frac{4}{5},\qquad \tan A=\frac{3}{4}
+$$
+
+**点评**：在锐角范围内，单位圆定义与“边之比”定义一致；记牢 $3$-$4$-$5$ 这组勾股数能快速算斜边。
+
+### 例题精练 2（★ 初中基础）
+
+**题目**：判断下列各三角函数值的正负号（不求具体值）：$\sin\dfrac{2\pi}{3}$、$\cos\dfrac{5\pi}{4}$、$\tan\dfrac{7\pi}{4}$。
+
+**解**：
+
+由象限符号表（符号由终边交点坐标 $x,y$ 决定）逐一判断：
+
+- $\dfrac{2\pi}{3}$ 在第二象限，$y>0$，故 $\sin\dfrac{2\pi}{3}>0$。
+- $\dfrac{5\pi}{4}$ 在第三象限，$x<0$，故 $\cos\dfrac{5\pi}{4}<0$。
+- $\dfrac{7\pi}{4}$ 在第四象限，$\tan=\dfrac{y}{x}=\dfrac{-}{+}<0$，故 $\tan\dfrac{7\pi}{4}<0$。
+
+**点评**：符号问题先定象限，再回到 $x,y$ 的正负，不必记“一全二正三切四余”口诀也能现推。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：已知 $\cos\theta=-\dfrac{12}{13}$，且 $\theta$ 在第三象限，求其余五个三角函数值。
+
+**解**：
+
+由平方关系 $\sin^2\theta=1-\cos^2\theta$：
+
+$$
+\sin^2\theta=1-\frac{144}{169}=\frac{25}{169}
+$$
+
+第三象限正弦为负，故 $\sin\theta=-\dfrac{5}{13}$。
+
+再由商数与倒数关系：
+
+$$
+\tan\theta=\frac{\sin\theta}{\cos\theta}=\frac{-5/13}{-12/13}=\frac{5}{12},\qquad
+\cot\theta=\frac{12}{5}
+$$
+
+$$
+\sec\theta=\frac{1}{\cos\theta}=-\frac{13}{12},\qquad
+\csc\theta=\frac{1}{\sin\theta}=-\frac{13}{5}
+$$
+
+**点评**：难点不在开平方，而在用象限定符号；第三象限 $\sin,\cos$ 均负，故 $\tan,\cot$ 为正。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：已知 $\tan\theta=2$，且 $\theta$ 在第三象限，求 $\sin\theta$ 与 $\cos\theta$。
+
+**解**：
+
+由 $\tan\theta=\dfrac{\sin\theta}{\cos\theta}=2$ 得 $\sin\theta=2\cos\theta$。代入平方关系：
+
+$$
+\sin^2\theta+\cos^2\theta=1\ \Longrightarrow\ (2\cos\theta)^2+\cos^2\theta=1
+$$
+
+$$
+5\cos^2\theta=1\ \Longrightarrow\ \cos^2\theta=\frac15
+$$
+
+第三象限 $\cos\theta<0$，故 $\cos\theta=-\dfrac{1}{\sqrt5}=-\dfrac{\sqrt5}{5}$，于是：
+
+$$
+\sin\theta=2\cos\theta=-\frac{2}{\sqrt5}=-\frac{2\sqrt5}{5}
+$$
+
+**点评**：把问题化回 $\sin,\cos$ 是通用策略；已知 $\tan$ 求 $\sin,\cos$ 时，用 $\sin=\tan\cdot\cos$ 代入平方关系最稳妥。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：已知 $\sin\theta=\dfrac{4}{5}$，化简 $\dfrac{\sec\theta-\cos\theta}{\tan\theta}$ 并求值（设 $\theta$ 为第一象限角）。
+
+**解**：
+
+先把整体化回 $\sin,\cos$。分子：
+
+$$
+\sec\theta-\cos\theta=\frac{1}{\cos\theta}-\cos\theta=\frac{1-\cos^2\theta}{\cos\theta}=\frac{\sin^2\theta}{\cos\theta}
+$$
+
+除以 $\tan\theta=\dfrac{\sin\theta}{\cos\theta}$：
+
+$$
+\frac{\sec\theta-\cos\theta}{\tan\theta}=\frac{\sin^2\theta}{\cos\theta}\cdot\frac{\cos\theta}{\sin\theta}=\sin\theta
+$$
+
+所以原式恒等于 $\sin\theta$，代入得：
+
+$$
+\frac{\sec\theta-\cos\theta}{\tan\theta}=\sin\theta=\frac45
+$$
+
+**点评**：先化简再代值远胜于直接代入；本题化简后竟与象限无关，结果就是 $\sin\theta$。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：设 $\theta$ 为第二象限角且 $\sin\theta=a$（$0<a<1$）。用 $a$ 表示 $\cos\theta$、$\tan\theta$、$\sec\theta$，并讨论 $a\to 1^-$ 时 $\tan\theta$ 的变化趋势。
+
+**解**：
+
+由平方关系 $\cos^2\theta=1-a^2$。第二象限 $\cos\theta<0$，故：
+
+$$
+\cos\theta=-\sqrt{1-a^2}
+$$
+
+进一步：
+
+$$
+\tan\theta=\frac{\sin\theta}{\cos\theta}=\frac{a}{-\sqrt{1-a^2}}=-\frac{a}{\sqrt{1-a^2}},\qquad
+\sec\theta=\frac{1}{\cos\theta}=-\frac{1}{\sqrt{1-a^2}}
+$$
+
+当 $a\to 1^-$ 时，$\theta\to\dfrac{\pi}{2}^+$，分母 $\sqrt{1-a^2}\to 0^+$，分子 $a\to1$，故：
+
+$$
+\tan\theta=-\frac{a}{\sqrt{1-a^2}}\to -\infty
+$$
+
+这与 $\tan$ 在 $\theta=\dfrac{\pi}{2}$ 处无定义、左右极限分别趋于 $\pm\infty$ 的事实吻合：从第二象限一侧（$\theta$ 略大于 $\dfrac{\pi}{2}$）趋近时，$\tan\theta\to-\infty$。
+
+**点评**：含字母时务必带着象限条件给 $\cos$ 定号；极限趋势可直接从“分母趋零、符号由象限决定”读出。
+
+---
+
 ## 练习题
 
 1. 为什么六个三角函数并不是六套彼此独立的定义？

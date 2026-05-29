@@ -182,6 +182,165 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：直角三角形中，一锐角为 $30^\circ$，其对边长为 $4$。求斜边长。
+
+**解**：
+
+设斜边为 $c$。$30^\circ$ 角的对边为 $4$，由正弦定义（也是正弦定理在直角三角形的特例）：
+
+$$
+\sin30^\circ=\frac{4}{c}
+$$
+
+由 $\sin30^\circ=\dfrac12$，得：
+
+$$
+c=\frac{4}{\sin30^\circ}=\frac{4}{\tfrac12}=8
+$$
+
+**点评**：直角三角形里“对边比斜边等于该角正弦”，正是正弦定理的最简形态。$30^\circ$ 所对边恰为斜边一半，是常用结论。
+
+### 例题精练 2（★ 初中基础）
+
+**题目**：一个三角形三边长分别为 $3$、$4$、$5$。判断它是不是直角三角形；若是，最大角是多少度？
+
+**解**：
+
+最大边 $5$ 所对的角最大，设为 $C$。由余弦定理：
+
+$$
+\cos C=\frac{3^2+4^2-5^2}{2\times3\times4}=\frac{9+16-25}{24}=\frac{0}{24}=0
+$$
+
+故 $C=90^\circ$，是直角三角形，最大角为 $90^\circ$。
+
+**点评**：余弦定理求出 $\cos C=0$ 直接判定直角，这正是余弦定理作为勾股定理推广的体现：$\cos C=0\iff c^2=a^2+b^2$。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：在 $\triangle ABC$ 中，$a=8$、$b=6$、$C=120^\circ$。求边 $c$ 及角 $A$。
+
+**解**：
+
+由余弦定理求 $c$：
+
+$$
+c^2=a^2+b^2-2ab\cos C=64+36-2\times8\times6\times\cos120^\circ
+$$
+
+由 $\cos120^\circ=-\dfrac12$：
+
+$$
+c^2=100-96\times\left(-\frac12\right)=100+48=148
+$$
+
+$$
+c=\sqrt{148}=2\sqrt{37}
+$$
+
+再由正弦定理求 $A$：
+
+$$
+\frac{a}{\sin A}=\frac{c}{\sin C}\ \Rightarrow\ \sin A=\frac{a\sin C}{c}=\frac{8\times\sin120^\circ}{2\sqrt{37}}=\frac{8\times\tfrac{\sqrt3}{2}}{2\sqrt{37}}=\frac{4\sqrt3}{2\sqrt{37}}=\frac{2\sqrt3}{\sqrt{37}}
+$$
+
+即 $\sin A=\dfrac{2\sqrt3}{\sqrt{37}}=\dfrac{2\sqrt{111}}{37}\approx0.5694$，故 $A\approx34.7^\circ$。
+
+因为 $C=120^\circ$ 已是钝角，$A$ 必为锐角，故取 $A\approx34.7^\circ$（不取钝角解）。
+
+**点评**：先余弦定理求第三边，再正弦定理求角，是“两边夹角”题的标准两步走。已知有钝角时其余两角必为锐角，可直接排除正弦定理的钝角解。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：在 $\triangle ABC$ 中，$A=45^\circ$、$B=75^\circ$，边 $a=6$。求边 $b$ 与边 $c$。
+
+**解**：
+
+先求 $C=180^\circ-45^\circ-75^\circ=60^\circ$。
+
+由正弦定理 $\dfrac{a}{\sin A}=\dfrac{b}{\sin B}=\dfrac{c}{\sin C}$，先算公共比值：
+
+$$
+\frac{a}{\sin A}=\frac{6}{\sin45^\circ}=\frac{6}{\tfrac{\sqrt2}{2}}=\frac{12}{\sqrt2}=6\sqrt2
+$$
+
+于是：
+
+$$
+b=6\sqrt2\cdot\sin75^\circ,\qquad c=6\sqrt2\cdot\sin60^\circ
+$$
+
+其中 $\sin75^\circ=\sin(45^\circ+30^\circ)=\dfrac{\sqrt6+\sqrt2}{4}$，故：
+
+$$
+b=6\sqrt2\cdot\frac{\sqrt6+\sqrt2}{4}=\frac{6(\sqrt{12}+2)}{4}=\frac{6(2\sqrt3+2)}{4}=3(\sqrt3+1)
+$$
+
+$$
+c=6\sqrt2\cdot\frac{\sqrt3}{2}=3\sqrt6
+$$
+
+即 $b=3(\sqrt3+1)\approx8.20$，$c=3\sqrt6\approx7.35$。
+
+**点评**：两角一边（AAS）必用正弦定理。先补全第三角，再用同一个公共比值 $a/\sin A$ 一次性求出其余各边，效率最高。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：在 $\triangle ABC$ 中，已知 $a=\sqrt2$、$b=2$、$A=30^\circ$。判断三角形解的个数，并求出角 $B$。
+
+**解**：
+
+由正弦定理：
+
+$$
+\sin B=\frac{b\sin A}{a}=\frac{2\times\sin30^\circ}{\sqrt2}=\frac{2\times\tfrac12}{\sqrt2}=\frac{1}{\sqrt2}=\frac{\sqrt2}{2}
+$$
+
+故 $B=45^\circ$ 或 $B=135^\circ$。
+
+检验：因为 $a<b$，所以 $A<B$，两个解 $45^\circ$、$135^\circ$ 都大于 $A=30^\circ$，需进一步看角和是否成立。
+
+- 若 $B=45^\circ$：$C=180^\circ-30^\circ-45^\circ=105^\circ>0$，成立。
+- 若 $B=135^\circ$：$C=180^\circ-30^\circ-135^\circ=15^\circ>0$，也成立。
+
+故有**两解**：$B=45^\circ$ 或 $B=135^\circ$。
+
+**点评**：这是 SSA 双解的典型。判别标准是：当 $a<b$ 且 $b\sin A<a$（即 $\sin B<1$）时可能有两解，再用“两角之和小于 $180^\circ$”逐一验证。本题两个解都通过验证，故为双解。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：在 $\triangle ABC$ 中，已知 $2\cos A(b\cos C+c\cos B)=a$。判断角 $A$ 的大小。
+
+**解**：
+
+观察括号内 $b\cos C+c\cos B$。由射影定理（或对 $b\cos C$、$c\cos B$ 各用余弦定理展开），有恒等式：
+
+$$
+b\cos C+c\cos B=a
+$$
+
+（几何意义：边 $a$ 被高的垂足分成两段，分别等于 $b\cos C$ 与 $c\cos B$。）
+
+代入原式：
+
+$$
+2\cos A\cdot a=a
+$$
+
+由 $a>0$，两边约去 $a$：
+
+$$
+2\cos A=1\ \Rightarrow\ \cos A=\frac12\ \Rightarrow\ A=60^\circ
+$$
+
+**点评**：本题核心是识别并使用射影定理 $a=b\cos C+c\cos B$，它本身可由余弦定理推出：$b\cos C+c\cos B=b\cdot\dfrac{a^2+b^2-c^2}{2ab}+c\cdot\dfrac{a^2+c^2-b^2}{2ac}=\dfrac{a^2+b^2-c^2}{2a}+\dfrac{a^2+c^2-b^2}{2a}=\dfrac{2a^2}{2a}=a$。看到“边角混合的对称结构”应优先尝试射影定理化简，往往能一步消去复杂项。
+
 ## 练习题
 
 1. 为什么说余弦定理是勾股定理的推广？

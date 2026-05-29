@@ -237,6 +237,153 @@ $$\cos(\arctan 2) = \frac{1}{\sqrt{5}} = \frac{\sqrt{5}}{5}$$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：直接写出 $\sin30^\circ$、$\cos45^\circ$、$\tan60^\circ$ 的值，并说明各自来自哪类标准三角形。
+
+**解**：
+
+$$
+\sin30^\circ=\frac12,\qquad \cos45^\circ=\frac{\sqrt2}{2},\qquad \tan60^\circ=\sqrt3
+$$
+
+来源：
+
+- $\sin30^\circ$、$\tan60^\circ$ 来自**等边三角形**作高得到的 $30^\circ$-$60^\circ$-$90^\circ$ 直角三角形（边比 $1:\sqrt3:2$）。
+- $\cos45^\circ$ 来自**等腰直角三角形**（两直角边为 $1$，斜边 $\sqrt2$）。
+
+其中 $\tan60^\circ=\dfrac{\sin60^\circ}{\cos60^\circ}=\dfrac{\sqrt3/2}{1/2}=\sqrt3$。
+
+**点评**：特殊角值不必硬背，两类标准三角形的边长比就能现场推出。
+
+### 例题精练 2（★ 初中基础）
+
+**题目**：利用奇偶性求 $\sin(-30^\circ)$ 与 $\cos(-60^\circ)$。
+
+**解**：
+
+正弦是奇函数 $\sin(-x)=-\sin x$，余弦是偶函数 $\cos(-x)=\cos x$：
+
+$$
+\sin(-30^\circ)=-\sin30^\circ=-\frac12
+$$
+
+$$
+\cos(-60^\circ)=\cos60^\circ=\frac12
+$$
+
+**点评**：负角先用奇偶性“甩掉”负号，把问题转回熟悉的正角。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：用参考角方法求 $\sin\dfrac{13\pi}{6}$ 与 $\cos\left(-\dfrac{5\pi}{4}\right)$。
+
+**解**：
+
+对 $\sin\dfrac{13\pi}{6}$，先减整圈归约到 $[0,2\pi)$：
+
+$$
+\frac{13\pi}{6}-2\pi=\frac{13\pi-12\pi}{6}=\frac{\pi}{6}
+$$
+
+由周期性 $\sin\dfrac{13\pi}{6}=\sin\dfrac{\pi}{6}=\dfrac12$。
+
+对 $\cos\left(-\dfrac{5\pi}{4}\right)$，余弦为偶函数，先去负号：$\cos\left(-\dfrac{5\pi}{4}\right)=\cos\dfrac{5\pi}{4}$。$\dfrac{5\pi}{4}$ 在第三象限，参考角为 $\dfrac{5\pi}{4}-\pi=\dfrac{\pi}{4}$，第三象限余弦为负：
+
+$$
+\cos\dfrac{5\pi}{4}=-\cos\frac{\pi}{4}=-\frac{\sqrt2}{2}
+$$
+
+**点评**：流程固定——先归约到 $[0,2\pi)$（或用奇偶去负号），再取参考角，最后用象限定号。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：化简 $\dfrac{\sin\left(\dfrac{\pi}{2}+\theta\right)\cdot\tan(\pi-\theta)}{\cos(-\theta)}$。
+
+**解**：
+
+逐项用诱导公式与奇偶性：
+
+$$
+\sin\left(\frac{\pi}{2}+\theta\right)=\cos\theta,\qquad
+\tan(\pi-\theta)=-\tan\theta,\qquad
+\cos(-\theta)=\cos\theta
+$$
+
+代入：
+
+$$
+\frac{\cos\theta\cdot(-\tan\theta)}{\cos\theta}=-\tan\theta
+$$
+
+（其中 $\cos\theta\ne0$。）
+
+**点评**：诱导公式的统一口诀“奇变偶不变、符号看象限”，但更稳的是逐个查、化回 $\sin/\cos$。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：求函数 $f(x)=\sin\left(2x+\dfrac{\pi}{3}\right)$ 的最小正周期，并判断 $g(x)=x\cos x$ 的奇偶性。
+
+**解**：
+
+对 $f(x)$：正弦的最小正周期是 $2\pi$，自变量系数为 $2$，故周期被压缩为：
+
+$$
+T=\frac{2\pi}{2}=\pi
+$$
+
+对 $g(x)=x\cos x$：$x$ 是奇函数，$\cos x$ 是偶函数，奇×偶 = 奇。验证：
+
+$$
+g(-x)=(-x)\cos(-x)=-x\cos x=-g(x)
+$$
+
+故 $g$ 是奇函数。
+
+**点评**：复合 $\sin(\omega x+\varphi)$ 周期是 $\dfrac{2\pi}{|\omega|}$；判奇偶可用“奇偶相乘”规律，但回到定义 $g(-x)$ 验证最可靠。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：综合运用周期、奇偶与象限符号，求 $\cos\left(-\dfrac{31\pi}{6}\right)+\sin\dfrac{25\pi}{4}$。
+
+**解**：
+
+**第一项** $\cos\left(-\dfrac{31\pi}{6}\right)$：余弦为偶，先去负号得 $\cos\dfrac{31\pi}{6}$。减整圈归约：
+
+$$
+\frac{31\pi}{6}-4\pi=\frac{31\pi-24\pi}{6}=\frac{7\pi}{6}
+$$
+
+$\dfrac{7\pi}{6}$ 在第三象限，参考角 $\dfrac{\pi}{6}$，余弦为负：
+
+$$
+\cos\frac{7\pi}{6}=-\cos\frac{\pi}{6}=-\frac{\sqrt3}{2}
+$$
+
+**第二项** $\sin\dfrac{25\pi}{4}$：减整圈，
+
+$$
+\frac{25\pi}{4}-6\pi=\frac{25\pi-24\pi}{4}=\frac{\pi}{4}
+$$
+
+故 $\sin\dfrac{25\pi}{4}=\sin\dfrac{\pi}{4}=\dfrac{\sqrt2}{2}$。
+
+**合计**：
+
+$$
+\cos\left(-\frac{31\pi}{6}\right)+\sin\frac{25\pi}{4}=-\frac{\sqrt3}{2}+\frac{\sqrt2}{2}=\frac{\sqrt2-\sqrt3}{2}
+$$
+
+数值上约为 $\dfrac{1.414-1.732}{2}\approx-0.159$。
+
+**点评**：大角先用奇偶去负、再用周期减整圈是“减负担”的关键；归约后剩下的都是特殊角，符号交给象限。
+
+---
+
 ## 练习题
 
 1. 为什么正切函数的最小正周期是 $\pi$ 而不是 $2\pi$？

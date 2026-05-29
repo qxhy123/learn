@@ -208,6 +208,194 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：求 $y=3\sin x-1$ 的最大值与最小值。
+
+**解**：
+
+由于 $\sin x\in[-1,1]$，
+
+- 当 $\sin x=1$ 时，$y=3\cdot1-1=2$，取最大值；
+- 当 $\sin x=-1$ 时，$y=3\cdot(-1)-1=-4$，取最小值。
+
+故最大值为 $2$，最小值为 $-4$，值域为 $[-4,2]$。
+
+**点评**：最基本的最值思想——先锁定 $\sin x$ 的取值范围 $[-1,1]$，再代入端点。系数 $3>0$，故 $\sin x$ 最大时 $y$ 最大；常数项 $-1$ 只平移不改变振幅。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：求 $5\sin x-12\cos x$ 的值域。
+
+**解**：
+
+用辅助角公式压缩。振幅
+
+$$
+R=\sqrt{5^2+(-12)^2}=\sqrt{25+144}=\sqrt{169}=13
+$$
+
+故可写成 $5\sin x-12\cos x=13\sin(x+\varphi)$（其中 $\varphi$ 满足 $\cos\varphi=\dfrac{5}{13},\ \sin\varphi=-\dfrac{12}{13}$）。由 $\sin(x+\varphi)\in[-1,1]$，
+
+$$
+5\sin x-12\cos x\in[-13,\ 13]
+$$
+
+即值域为 $[-13,13]$。
+
+**点评**：$a\sin x+b\cos x$ 的值域恒为 $[-\sqrt{a^2+b^2},\sqrt{a^2+b^2}]$，与相位 $\varphi$ 无关。求值域时**只需算 $R$**；相位 $\varphi$ 只在需要确定取最值的具体 $x$ 时才求。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：求 $f(x)=\sin^2 x+\sqrt3\sin x\cos x$ 的最大值。
+
+**解**：
+
+用降幂与倍角公式化为单一三角函数：
+
+$$
+\sin^2 x=\frac{1-\cos 2x}{2},
+\qquad
+\sqrt3\sin x\cos x=\frac{\sqrt3}{2}\sin 2x
+$$
+
+故
+
+$$
+f(x)=\frac12-\frac12\cos 2x+\frac{\sqrt3}{2}\sin 2x
+=\frac12+\left(\frac{\sqrt3}{2}\sin 2x-\frac12\cos 2x\right)
+$$
+
+括号内用辅助角，$R=\sqrt{\left(\tfrac{\sqrt3}{2}\right)^2+\left(\tfrac12\right)^2}=\sqrt{\tfrac34+\tfrac14}=1$：
+
+$$
+\frac{\sqrt3}{2}\sin 2x-\frac12\cos 2x=\sin\!\left(2x-\frac\pi6\right)
+$$
+
+于是 $f(x)=\dfrac12+\sin\!\left(2x-\dfrac\pi6\right)$，由 $\sin(\cdot)\in[-1,1]$ 得
+
+$$
+f_{\max}=\frac12+1=\frac32
+$$
+
+**点评**：含 $\sin^2x$、$\sin x\cos x$ 的式子先**降幂、倍角**压成 $A\sin2x+B\cos2x+C$，再辅助角合并，最后读值域——这是把“看似二次”的式子标准化的主线。本题 $R=1$，最大值即 $C+R=\dfrac32$。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：求 $f(x)=2\cos\!\left(x+\dfrac\pi3\right)+1$ 在 $x\in\left[0,\dfrac\pi2\right]$ 上的最大值与最小值。
+
+**解**：
+
+当 $x\in\left[0,\dfrac\pi2\right]$ 时，内层角
+
+$$
+u=x+\frac\pi3\in\left[\frac\pi3,\ \frac{5\pi}{6}\right]
+$$
+
+在此区间上 $\cos u$ 单调**递减**（$[\tfrac\pi3,\tfrac{5\pi}{6}]\subset[0,\pi]$），故
+
+- 最大值在左端 $u=\dfrac\pi3$：$\cos\dfrac\pi3=\dfrac12$，$f=2\cdot\dfrac12+1=2$（在 $x=0$）；
+- 最小值在右端 $u=\dfrac{5\pi}{6}$：$\cos\dfrac{5\pi}{6}=-\dfrac{\sqrt3}{2}$，$f=2\cdot\left(-\dfrac{\sqrt3}{2}\right)+1=1-\sqrt3$（在 $x=\dfrac\pi2$）。
+
+故最大值 $2$，最小值 $1-\sqrt3$。
+
+**点评**：限定区间求最值要先确定内层角范围 $u\in\left[\dfrac\pi3,\dfrac{5\pi}{6}\right]$，再判断 $\cos u$ 在该范围内**是否单调**。这里全程递减且不含 $\cos u$ 的极值点 $u=0$，故最值都在端点取得，不能直接套 $[-2,2]+1$。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：设 $f(x)=\cos 2x-2a(1+\cos x)$ 的最小值为 $g(a)$，求 $g(a)$ 关于参数 $a$ 的表达式。
+
+**解**：
+
+用倍角 $\cos 2x=2\cos^2 x-1$ 化为关于 $\cos x$ 的二次：
+
+$$
+f(x)=2\cos^2 x-1-2a-2a\cos x
+$$
+
+令 $t=\cos x\in[-1,1]$，得
+
+$$
+h(t)=2t^2-2at-(1+2a)
+$$
+
+这是开口向上的抛物线，对称轴 $t=\dfrac{a}{2}$。在闭区间 $[-1,1]$ 上的最小值按对称轴位置分类讨论：
+
+- 若 $\dfrac a2<-1$，即 $a<-2$：在 $[-1,1]$ 上递增，最小值在 $t=-1$：
+$$
+h(-1)=2+2a-1-2a=1.
+$$
+- 若 $-1\le\dfrac a2\le1$，即 $-2\le a\le2$：最小值在顶点 $t=\dfrac a2$：
+$$
+h\!\left(\frac a2\right)=2\cdot\frac{a^2}{4}-2a\cdot\frac a2-(1+2a)=\frac{a^2}{2}-a^2-1-2a=-\frac{a^2}{2}-2a-1.
+$$
+- 若 $\dfrac a2>1$，即 $a>2$：在 $[-1,1]$ 上递减，最小值在 $t=1$：
+$$
+h(1)=2-2a-1-2a=1-4a.
+$$
+
+故
+
+$$
+g(a)=
+\begin{cases}
+1, & a<-2,\\[4pt]
+-\dfrac{a^2}{2}-2a-1, & -2\le a\le2,\\[6pt]
+1-4a, & a>2.
+\end{cases}
+$$
+
+**点评**：含参最值的核心套路是“化同名 $\to$ 换元 $t=\cos x\in[-1,1]$ $\to$ 闭区间上二次函数最值的**轴动区间定**型讨论”。对称轴 $t=\dfrac a2$ 随 $a$ 移动，是否落在 $[-1,1]$ 内决定最小值取在顶点还是端点，三段必须分清。可在分界 $a=\pm2$ 处验证两侧表达式连续（如 $a=2$：中段 $-2-4-1=-7$，下段 $1-8=-7$，吻合）。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：关于 $x$ 的方程 $\sin x+\cos x+\sin x\cos x=a$ 在 $[0,2\pi)$ 内有解，求 $a$ 的取值范围。
+
+**解**：
+
+设 $u=\sin x+\cos x$，则两边平方得 $u^2=1+2\sin x\cos x$，故
+
+$$
+\sin x\cos x=\frac{u^2-1}{2}
+$$
+
+代入原式，左边记为
+
+$$
+F=u+\frac{u^2-1}{2}=\frac12 u^2+u-\frac12
+$$
+
+关键是确定 $u$ 的取值范围。由辅助角 $u=\sin x+\cos x=\sqrt2\sin\!\left(x+\dfrac\pi4\right)$，当 $x$ 取遍 $[0,2\pi)$ 时 $\sin\!\left(x+\dfrac\pi4\right)$ 取遍 $[-1,1]$，故
+
+$$
+u\in[-\sqrt2,\ \sqrt2]
+$$
+
+于是问题化为：求二次函数 $F(u)=\dfrac12 u^2+u-\dfrac12$ 在 $u\in[-\sqrt2,\sqrt2]$ 上的值域。
+
+$F(u)$ 开口向上，对称轴 $u=-1\in[-\sqrt2,\sqrt2]$，故
+
+- 最小值在顶点 $u=-1$：$F(-1)=\dfrac12-1-\dfrac12=-1$；
+- 最大值在离对称轴更远的端点 $u=\sqrt2$：
+$$
+F(\sqrt2)=\frac12\cdot2+\sqrt2-\frac12=1+\sqrt2-\frac12=\frac12+\sqrt2.
+$$
+（另一端 $F(-\sqrt2)=1-\sqrt2-\dfrac12=\dfrac12-\sqrt2<F(\sqrt2)$，舍。）
+
+因此 $F(u)$ 的值域为 $\left[-1,\ \dfrac12+\sqrt2\right]$，方程有解当且仅当
+
+$$
+a\in\left[-1,\ \frac12+\sqrt2\right]
+$$
+
+**点评**：这是经典的 $\sin x\pm\cos x$ 与 $\sin x\cos x$ 联动换元题。要点有三：(1) 令 $u=\sin x+\cos x$ 后由平方关系把 $\sin x\cos x$ 用 $u$ 表示；(2) 用辅助角定出 $u\in[-\sqrt2,\sqrt2]$ 这一**关键约束**（不可放成全体实数）；(3) 把“方程有解”转化为二次函数在该闭区间上的值域，顶点在区间内故取顶点为最小、较远端点为最大。
+
+---
+
 ## 练习题
 
 1. 为什么参数最值问题最怕直接分类讨论，而最适合先压缩结构？

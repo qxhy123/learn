@@ -287,6 +287,219 @@ e0$。在本题中这没有丢掉解，但在其它题里未必安全。
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：在 $[0,2\pi)$ 内解方程 $\cos x=-\dfrac12$。
+
+**解**：
+
+在 $[0,2\pi)$ 内寻找余弦值为 $-\dfrac12$ 的角。参考角满足 $\cos\alpha=\dfrac12$，即 $\alpha=\dfrac\pi3$。余弦为负，对应第二、第三象限：
+
+$$
+x=\pi-\frac\pi3=\frac{2\pi}{3},
+\qquad
+x=\pi+\frac\pi3=\frac{4\pi}{3}
+$$
+
+故在 $[0,2\pi)$ 内解集为
+
+$$
+\left\{\frac{2\pi}{3},\ \frac{4\pi}{3}\right\}
+$$
+
+**点评**：先用参考角定“值”，再用象限定“位置”，是基本方程在限定区间内求解的标准两步。本题没有要求通解，因此**不写** $+2k\pi$；区间限定与通解二者不要混淆。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：求 $\tan\!\left(2x-\dfrac\pi3\right)=\sqrt3$ 的通解。
+
+**解**：
+
+令 $u=2x-\dfrac\pi3$，则 $\tan u=\sqrt3$。正切的主值为 $\dfrac\pi3$，由于正切周期为 $\pi$，
+
+$$
+u=\frac\pi3+k\pi,\qquad k\in\mathbb{Z}
+$$
+
+代回 $u=2x-\dfrac\pi3$：
+
+$$
+2x-\frac\pi3=\frac\pi3+k\pi
+\ \Longrightarrow\
+2x=\frac{2\pi}{3}+k\pi
+\ \Longrightarrow\
+x=\frac\pi3+\frac{k\pi}{2},\qquad k\in\mathbb{Z}
+$$
+
+**点评**：正切方程只有**一族**解，周期是 $\pi$ 而不是 $2\pi$，这是与正弦、余弦的关键差别。整体换元后注意：解出 $u$ 时周期是 $\pi$，回代除以系数 $2$ 后，$x$ 的间隔变成 $\dfrac\pi2$，$k\in\mathbb{Z}$ 必须保留。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：解方程 $2\cos^2 x+\sin x-1=0$，写出通解。
+
+**解**：
+
+利用 $\cos^2 x=1-\sin^2 x$ 化为同名函数：
+
+$$
+2(1-\sin^2 x)+\sin x-1=0
+\ \Longrightarrow\
+-2\sin^2 x+\sin x+1=0
+$$
+
+整理为 $2\sin^2 x-\sin x-1=0$。令 $t=\sin x$（$-1\le t\le1$）：
+
+$$
+2t^2-t-1=0
+\ \Longrightarrow\
+(2t+1)(t-1)=0
+\ \Longrightarrow\
+t=-\frac12\ \text{或}\ t=1
+$$
+
+二者均在 $[-1,1]$ 内，逐一回代：
+
+- $\sin x=1\Rightarrow x=\dfrac\pi2+2k\pi$；
+- $\sin x=-\dfrac12\Rightarrow x=-\dfrac\pi6+2k\pi$ 或 $x=\pi+\dfrac\pi6+2k\pi=\dfrac{7\pi}{6}+2k\pi$。
+
+故通解为
+
+$$
+x=\frac\pi2+2k\pi,\quad
+x=-\frac\pi6+2k\pi,\quad
+x=\frac{7\pi}{6}+2k\pi,\qquad k\in\mathbb{Z}
+$$
+
+**点评**：先“化同名”把方程压成关于 $\sin x$ 的二次型，是处理混合方程的主线。换元后须检查 $t$ 是否落在 $[-1,1]$ 内（本题都满足），再把**每个** $t$ 完整展开成三角解集——漏掉 $\sin x=-\dfrac12$ 的第二族是常见失分点。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：解方程 $\sin x-\sqrt3\cos x=1$，写出通解。
+
+**解**：
+
+用辅助角公式压缩左边。$R=\sqrt{1^2+(\sqrt3)^2}=2$，提取后
+
+$$
+\sin x-\sqrt3\cos x
+=2\left(\frac12\sin x-\frac{\sqrt3}{2}\cos x\right)
+=2\sin\!\left(x-\frac\pi3\right)
+$$
+
+（因为 $\cos\dfrac\pi3=\dfrac12,\ \sin\dfrac\pi3=\dfrac{\sqrt3}{2}$。）方程化为
+
+$$
+2\sin\!\left(x-\frac\pi3\right)=1
+\ \Longrightarrow\
+\sin\!\left(x-\frac\pi3\right)=\frac12
+$$
+
+故 $x-\dfrac\pi3=\dfrac\pi6+2k\pi$ 或 $x-\dfrac\pi3=\dfrac{5\pi}{6}+2k\pi$，解得
+
+$$
+x=\frac\pi2+2k\pi
+\quad\text{或}\quad
+x=\frac{7\pi}{6}+2k\pi,\qquad k\in\mathbb{Z}
+$$
+
+**点评**：$a\sin x+b\cos x=c$ 型方程的标准解法是辅助角压成单一正弦。本题 $b=-\sqrt3<0$，相位取 $-\dfrac\pi3$，展开后逐项核对系数可避免符号错误。化成 $\sin(\cdot)=\dfrac12$ 后仍是基本方程，两族解都要写。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：求方程 $\cos 2x+3\sin x-2=0$ 在 $[0,2\pi)$ 内的所有解。
+
+**解**：
+
+用倍角公式 $\cos 2x=1-2\sin^2 x$ 化同名：
+
+$$
+1-2\sin^2 x+3\sin x-2=0
+\ \Longrightarrow\
+-2\sin^2 x+3\sin x-1=0
+\ \Longrightarrow\
+2\sin^2 x-3\sin x+1=0
+$$
+
+令 $t=\sin x$：$(2t-1)(t-1)=0$，得 $t=\dfrac12$ 或 $t=1$（均在 $[-1,1]$ 内）。在 $[0,2\pi)$ 内回代：
+
+- $\sin x=\dfrac12\Rightarrow x=\dfrac\pi6$ 或 $x=\dfrac{5\pi}{6}$；
+- $\sin x=1\Rightarrow x=\dfrac\pi2$。
+
+故在 $[0,2\pi)$ 内解集为
+
+$$
+\left\{\frac\pi6,\ \frac\pi2,\ \frac{5\pi}{6}\right\}
+$$
+
+**点评**：含 $\cos 2x$ 与 $\sin x$ 混合时，选 $\cos 2x=1-2\sin^2 x$ 这一形式可一步化成只含 $\sin x$ 的二次型（若选 $\cos2x=2\cos^2x-1$ 反而引入 $\cos x$）。选对倍角恒等式的“方向”是关键技巧。题目限定区间，故只取 $[0,2\pi)$ 内的解，不加周期。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：已知关于 $x$ 的方程 $2\sin^2 x+2\sin x\cos x=k$（其中 $k$ 为实数）有解，求 $k$ 的取值范围；并求当 $k=2$ 时方程在 $[0,2\pi)$ 内的解。
+
+**解**：
+
+先把左边压成“振幅 + 相位 + 常数”的标准形。用降幂与倍角：
+
+$$
+2\sin^2 x=1-\cos 2x,\qquad 2\sin x\cos x=\sin 2x
+$$
+
+故
+
+$$
+2\sin^2 x+2\sin x\cos x
+=1-\cos 2x+\sin 2x
+=1+\sin 2x-\cos 2x
+$$
+
+再用辅助角合并 $\sin 2x-\cos 2x$，其中 $R=\sqrt{1^2+(-1)^2}=\sqrt2$：
+
+$$
+\sin 2x-\cos 2x=\sqrt2\sin\!\left(2x-\frac\pi4\right)
+$$
+
+于是左边 $=1+\sqrt2\sin\!\left(2x-\dfrac\pi4\right)$。由于 $\sin\!\left(2x-\dfrac\pi4\right)\in[-1,1]$，左边的值域为
+
+$$
+\bigl[1-\sqrt2,\ 1+\sqrt2\bigr]
+$$
+
+**方程有解当且仅当** $k\in[1-\sqrt2,\ 1+\sqrt2]$。
+
+当 $k=2$ 时：
+
+$$
+1+\sqrt2\sin\!\left(2x-\frac\pi4\right)=2
+\ \Longrightarrow\
+\sin\!\left(2x-\frac\pi4\right)=\frac{1}{\sqrt2}=\frac{\sqrt2}{2}
+$$
+
+由于 $\dfrac{\sqrt2}{2}\in[1-\sqrt2,1+\sqrt2]$ 对应的右端值合法，令 $u=2x-\dfrac\pi4$：
+
+$$
+u=\frac\pi4+2k\pi
+\quad\text{或}\quad
+u=\frac{3\pi}{4}+2k\pi
+$$
+
+由 $u=\dfrac\pi4+2k\pi$：$2x=\dfrac\pi2+2k\pi\Rightarrow x=\dfrac\pi4+k\pi$；
+由 $u=\dfrac{3\pi}{4}+2k\pi$：$2x=\pi+2k\pi\Rightarrow x=\dfrac\pi2+k\pi$。
+
+在 $[0,2\pi)$ 内取 $k=0,1$，得解集
+
+$$
+\left\{\frac\pi4,\ \frac\pi2,\ \frac{5\pi}{4},\ \frac{3\pi}{2}\right\}
+$$
+
+**点评**：含参方程“有解条件”的本质是**参数落入左边值域**——把 $2\sin^2x+2\sin x\cos x$ 经降幂、倍角、辅助角压成 $1+\sqrt2\sin(2x-\tfrac\pi4)$ 后，值域 $[1-\sqrt2,1+\sqrt2]$ 一目了然。求具体解时注意内层角是 $2x-\dfrac\pi4$，回代后 $x$ 的周期由 $2\pi$ 缩成 $\pi$，在 $[0,2\pi)$ 内每族各有两个解，共四个，切勿漏取 $k=1$。
+
+---
+
 ## 练习题
 
 1. 为什么三角方程必须区分主值解和通解？

@@ -198,6 +198,156 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★ 初中基础）
+
+**题目**：用和差化积公式，把 $\cos 50^\circ+\cos 10^\circ$ 写成乘积形式。
+
+**解**：套用余弦和的和差化积公式
+
+$$
+\cos A+\cos B=2\cos\frac{A+B}{2}\cos\frac{A-B}{2}
+$$
+
+取 $A=50^\circ,\ B=10^\circ$，则 $\dfrac{A+B}{2}=30^\circ$，$\dfrac{A-B}{2}=20^\circ$，故
+
+$$
+\cos 50^\circ+\cos 10^\circ=2\cos 30^\circ\cos 20^\circ=2\cdot\frac{\sqrt3}{2}\cdot\cos 20^\circ=\sqrt3\cos 20^\circ
+$$
+
+**点评**：和差化积把两项之和压成“两余弦之积”。本题中 $\dfrac{A+B}{2}=30^\circ$ 恰是特殊角，于是能算出系数 $\sqrt3$，剩下 $\cos 20^\circ$ 无法再化简，保留即可。识别“半和”是否为特殊角，是这类题能否进一步求值的关键。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：用积化和差公式求 $\cos 75^\circ\cos 15^\circ$ 的精确值。
+
+**解**：套用
+
+$$
+\cos A\cos B=\frac12[\cos(A+B)+\cos(A-B)]
+$$
+
+取 $A=75^\circ,\ B=15^\circ$：
+
+$$
+\cos 75^\circ\cos 15^\circ=\frac12[\cos 90^\circ+\cos 60^\circ]=\frac12\left[0+\frac12\right]=\frac14
+$$
+
+**点评**：把乘积拆成“和频 + 差频”后，$\cos 90^\circ=0$ 直接清掉一项，差频 $\cos 60^\circ$ 又是特殊角，于是精确值一步到位。比起分别求 $\cos 75^\circ,\cos 15^\circ$ 再相乘，积化和差要干净得多。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：化简 $\dfrac{\sin 5x+\sin x}{\cos 5x+\cos x}$。
+
+**解**：分子分母分别用和差化积。分子：
+
+$$
+\sin 5x+\sin x=2\sin\frac{5x+x}{2}\cos\frac{5x-x}{2}=2\sin 3x\cos 2x
+$$
+
+分母：
+
+$$
+\cos 5x+\cos x=2\cos\frac{5x+x}{2}\cos\frac{5x-x}{2}=2\cos 3x\cos 2x
+$$
+
+相除，约去公因子 $2\cos 2x$（在 $\cos 2x\ne0$ 时）：
+
+$$
+\frac{\sin 5x+\sin x}{\cos 5x+\cos x}=\frac{2\sin 3x\cos 2x}{2\cos 3x\cos 2x}=\frac{\sin 3x}{\cos 3x}=\tan 3x
+$$
+
+**点评**：和差化积让分子分母都析出公共因子 $\cos 2x$，约掉后剩下的 $\dfrac{\sin 3x}{\cos 3x}$ 正是“半和角”的正切。凡是“同名函数之和 / 之和”或“之和 / 同名之和”的比值，都值得先试和差化积。
+
+### 例题精练 4（★★ 高中核心）
+
+**题目**：证明 $\sin x+\sin 3x+\sin 5x=\sin 3x\,(1+2\cos 2x)$。
+
+**解**：把首末两项 $\sin x+\sin 5x$ 先用和差化积配对（它们关于 $\sin 3x$ 对称）：
+
+$$
+\sin x+\sin 5x=2\sin\frac{x+5x}{2}\cos\frac{5x-x}{2}=2\sin 3x\cos 2x
+$$
+
+于是左边
+
+$$
+\sin x+\sin 3x+\sin 5x=2\sin 3x\cos 2x+\sin 3x=\sin 3x(2\cos 2x+1)
+$$
+
+即得右边，证毕。
+
+**点评**：处理等差排列的多项正弦和（这里频率成等差 $1,3,5$），把对称的两端配对是通用技巧——配对后必然出现以中间项为半和角的因子 $\sin 3x$，从而能提取公因式。这正是和差化积在“求和 / 证明”中的巧用。
+
+### 例题精练 5（★★ 高中核心）
+
+**题目**：求和 $\cos\dfrac{\pi}{7}+\cos\dfrac{3\pi}{7}+\cos\dfrac{5\pi}{7}$ 的值。
+
+**解**：用“乘以 $2\sin\dfrac{\pi}{7}$ 制造望远镜（裂项相消）”的手法。记 $S=\cos\dfrac{\pi}{7}+\cos\dfrac{3\pi}{7}+\cos\dfrac{5\pi}{7}$，两边乘 $2\sin\dfrac{\pi}{7}$，对每项用积化和差 $2\sin\theta\cos\phi=\sin(\theta+\phi)-\sin(\phi-\theta)$（即 $2\cos\phi\sin\theta=\sin(\phi+\theta)-\sin(\phi-\theta)$）：
+
+$$
+2\sin\frac{\pi}{7}\cos\frac{\pi}{7}=\sin\frac{2\pi}{7}-\sin 0=\sin\frac{2\pi}{7}
+$$
+
+$$
+2\sin\frac{\pi}{7}\cos\frac{3\pi}{7}=\sin\frac{4\pi}{7}-\sin\frac{2\pi}{7}
+$$
+
+$$
+2\sin\frac{\pi}{7}\cos\frac{5\pi}{7}=\sin\frac{6\pi}{7}-\sin\frac{4\pi}{7}
+$$
+
+三式相加，中间项两两相消（望远镜求和）：
+
+$$
+2\sin\frac{\pi}{7}\cdot S=\sin\frac{6\pi}{7}
+$$
+
+而 $\sin\dfrac{6\pi}{7}=\sin\left(\pi-\dfrac{\pi}{7}\right)=\sin\dfrac{\pi}{7}$，故
+
+$$
+2\sin\frac{\pi}{7}\cdot S=\sin\frac{\pi}{7}\ \Rightarrow\ S=\frac12
+$$
+
+**点评**：积化和差的另一类高阶用途是“制造裂项相消”。乘一个公共的 $2\sin\dfrac{\pi}{7}$ 后，每个乘积都被拆成相邻两项之差，中间整齐对消，只剩首尾——这是处理等差角余弦（或正弦）求和的经典套路。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：化简乘积 $\cos 20^\circ\cos 40^\circ\cos 80^\circ$。
+
+**解**：注意三个角 $20^\circ,40^\circ,80^\circ$ 成倍增（每次乘 $2$），适合“乘以 $2\sin$ 再反复用倍角”的手法。但这里改用积化和差逐层展开，先处理后两个因子：
+
+$$
+\cos 40^\circ\cos 80^\circ=\frac12[\cos 120^\circ+\cos 40^\circ]=\frac12\left[-\frac12+\cos 40^\circ\right]=-\frac14+\frac12\cos 40^\circ
+$$
+
+于是
+
+$$
+\cos 20^\circ\cos 40^\circ\cos 80^\circ=\cos 20^\circ\left(-\frac14+\frac12\cos 40^\circ\right)=-\frac14\cos 20^\circ+\frac12\cos 20^\circ\cos 40^\circ
+$$
+
+对后一项再用积化和差：
+
+$$
+\cos 20^\circ\cos 40^\circ=\frac12[\cos 60^\circ+\cos 20^\circ]=\frac12\left[\frac12+\cos 20^\circ\right]=\frac14+\frac12\cos 20^\circ
+$$
+
+代回：
+
+$$
+=-\frac14\cos 20^\circ+\frac12\left(\frac14+\frac12\cos 20^\circ\right)=-\frac14\cos 20^\circ+\frac18+\frac14\cos 20^\circ=\frac18
+$$
+
+故 $\cos 20^\circ\cos 40^\circ\cos 80^\circ=\dfrac18$。
+
+**点评**：连乘积可以靠积化和差“逐层降级”：每用一次就把一个乘积变成和差，含 $\cos 20^\circ$ 的项最终神奇地两两抵消，只留常数 $\dfrac18$。这与用 $2\sin 20^\circ$ 配合倍角公式得到的 $\dfrac{\sin 160^\circ}{8\sin 20^\circ}=\dfrac18$ 完全一致，可互为验算。
+
+---
+
 ## 练习题
 
 1. 为什么积化和差和和差化积是“表示切换”而不只是技巧？

@@ -145,6 +145,194 @@ $$= -\frac{2}{1+t} + C = -\frac{2}{1+\tan(x/2)} + C$$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高中核心与高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：用万能代换 $t=\tan\dfrac{x}{2}$ 把 $\dfrac{1+\sin x}{1+\cos x}$ 化成关于 $t$ 的有理式，并尽量化简。
+
+**解**：
+
+代入 $\sin x=\dfrac{2t}{1+t^2}$，$\cos x=\dfrac{1-t^2}{1+t^2}$：
+
+分子
+
+$$
+1+\sin x=1+\frac{2t}{1+t^2}=\frac{1+t^2+2t}{1+t^2}=\frac{(1+t)^2}{1+t^2}
+$$
+
+分母
+
+$$
+1+\cos x=1+\frac{1-t^2}{1+t^2}=\frac{1+t^2+1-t^2}{1+t^2}=\frac{2}{1+t^2}
+$$
+
+相除（$1+t^2$ 约去）：
+
+$$
+\frac{1+\sin x}{1+\cos x}=\frac{(1+t)^2}{2}=\frac{(1+\tan\frac x2)^2}{2}
+$$
+
+**点评**：万能代换把含 $\sin,\cos$ 的分式整体降为 $t$ 的有理式，公因子 $1+t^2$ 通常会成片约掉。注意 $1+\cos x=\dfrac{2}{1+t^2}$ 这一干净结果其实等价于半角公式 $1+\cos x=2\cos^2\dfrac x2$，两条路殊途同归。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：用万能代换解方程 $3\sin x+4\cos x=5$（在 $[0,2\pi)$ 上）。
+
+**解**：
+
+令 $t=\tan\dfrac x2$，代入：
+
+$$
+3\cdot\frac{2t}{1+t^2}+4\cdot\frac{1-t^2}{1+t^2}=5
+$$
+
+两边乘 $1+t^2$：
+
+$$
+6t+4(1-t^2)=5(1+t^2)
+$$
+
+$$
+6t+4-4t^2=5+5t^2
+$$
+
+$$
+9t^2-6t+1=0\ \Rightarrow\ (3t-1)^2=0\ \Rightarrow\ t=\frac13
+$$
+
+回代 $\tan\dfrac x2=\dfrac13$，得 $\dfrac x2=\arctan\dfrac13+k\pi$，即 $x=2\arctan\dfrac13+2k\pi$。在 $[0,2\pi)$ 内的解为
+
+$$
+x=2\arctan\frac13\approx 0.6435\ \text{rad}
+$$
+
+**点评**：方程合成后右边等于振幅 $\sqrt{3^2+4^2}=5$，恰是最大值，故只有一个解（重根 $t=\frac13$ 对应相切）。要警惕万能代换的隐患：$t=\tan\dfrac x2$ 在 $x=\pi$ 处无定义，相当于预设 $x\ne\pi$，解题后须单独验证 $x=\pi$ 是否为解（此处 $3\sin\pi+4\cos\pi=-4\ne5$，不是解，无遗漏）。
+
+### 例题精练 3（★★★ 高阶拓展）
+
+**题目**：计算不定积分 $\displaystyle\int\frac{dx}{2+\cos x}$。
+
+**解**：
+
+令 $t=\tan\dfrac x2$，则 $\cos x=\dfrac{1-t^2}{1+t^2}$，$dx=\dfrac{2}{1+t^2}\,dt$。分母
+
+$$
+2+\cos x=2+\frac{1-t^2}{1+t^2}=\frac{2(1+t^2)+(1-t^2)}{1+t^2}=\frac{3+t^2}{1+t^2}
+$$
+
+于是
+
+$$
+\int\frac{1}{\frac{3+t^2}{1+t^2}}\cdot\frac{2}{1+t^2}\,dt=\int\frac{2}{3+t^2}\,dt
+$$
+
+用 $\displaystyle\int\frac{dt}{t^2+b^2}=\frac1b\arctan\frac tb$，取 $b=\sqrt3$：
+
+$$
+=2\cdot\frac{1}{\sqrt3}\arctan\frac{t}{\sqrt3}+C=\frac{2}{\sqrt3}\arctan\frac{\tan\frac x2}{\sqrt3}+C
+$$
+
+**点评**：形如 $\displaystyle\int\dfrac{dx}{a+b\cos x}$ 的积分是万能代换的标准战场——它把三角分式精确化为有理函数 $\dfrac{2}{3+t^2}$，再套反正切公式。$1+t^2$ 在分子分母同时出现并约去，是这类问题的典型化简节奏。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：证明三角多项式恒等式 $\cos 3x=4\cos^3x-3\cos x$，并由此说明 $\cos 3x$ 是 $\cos x$ 的三次多项式（Chebyshev 多项式 $T_3$）。
+
+**解**：
+
+由三倍角分解 $\cos 3x=\cos(2x+x)=\cos 2x\cos x-\sin 2x\sin x$。代入 $\cos 2x=2\cos^2x-1$，$\sin 2x=2\sin x\cos x$：
+
+$$
+\cos 3x=(2\cos^2x-1)\cos x-2\sin^2x\cos x
+$$
+
+把 $\sin^2x=1-\cos^2x$ 代入第二项：
+
+$$
+=2\cos^3x-\cos x-2(1-\cos^2x)\cos x=2\cos^3x-\cos x-2\cos x+2\cos^3x
+$$
+
+$$
+=4\cos^3x-3\cos x
+$$
+
+令 $u=\cos x$，则 $\cos 3x=4u^3-3u=T_3(u)$，确为 $\cos x$ 的三次多项式。
+
+**点评**：这说明 $\cos(nx)$ 总能写成 $\cos x$ 的 $n$ 次多项式 $T_n(\cos x)$，即 Chebyshev 多项式。这类「三角多项式恒等式」是把三角问题转为代数多项式问题的另一座桥梁，与万能代换互补：前者以 $\cos x$ 为变量，后者以 $\tan\dfrac x2$ 为变量。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：求方程 $8\cos^3x-6\cos x=1$ 在 $[0,2\pi)$ 上的所有解。
+
+**解**：
+
+注意左边 $8\cos^3x-6\cos x=2(4\cos^3x-3\cos x)=2\cos 3x$（用例题 4 的恒等式）。方程化为
+
+$$
+2\cos 3x=1\ \Rightarrow\ \cos 3x=\frac12
+$$
+
+解 $3x=\pm\dfrac\pi3+2k\pi$，即
+
+$$
+3x=\frac\pi3+2k\pi\ \text{或}\ 3x=-\frac\pi3+2k\pi
+$$
+
+$$
+x=\frac\pi9+\frac{2k\pi}{3}\quad\text{或}\quad x=-\frac\pi9+\frac{2k\pi}{3}
+$$
+
+在 $[0,2\pi)$ 内（$k=0,1,2$）逐一取值：
+
+第一族：$\dfrac\pi9,\ \dfrac\pi9+\dfrac{2\pi}{3}=\dfrac{7\pi}{9},\ \dfrac\pi9+\dfrac{4\pi}{3}=\dfrac{13\pi}{9}$。
+
+第二族：$-\dfrac\pi9+\dfrac{2\pi}{3}=\dfrac{5\pi}{9},\ -\dfrac\pi9+\dfrac{4\pi}{3}=\dfrac{11\pi}{9},\ -\dfrac\pi9+2\pi=\dfrac{17\pi}{9}$。
+
+共 6 个解：
+
+$$
+\boxed{\frac\pi9,\ \frac{5\pi}{9},\ \frac{7\pi}{9},\ \frac{11\pi}{9},\ \frac{13\pi}{9},\ \frac{17\pi}{9}}
+$$
+
+**点评**：本题的巧思在于反向使用三倍角恒等式，把一个三次三角多项式方程压回成 $\cos 3x=\dfrac12$。识别出 $8\cos^3-6\cos=2\cos 3x$ 后，难题瞬间变成最基础的余弦方程。三次方程在 $[0,2\pi)$ 上给出 $3\times2=6$ 个解，与次数相符。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：计算定积分 $\displaystyle\int_0^{\pi/2}\frac{dx}{1+\sin x+\cos x}$。
+
+**解**：
+
+令 $t=\tan\dfrac x2$。换限：$x=0\Rightarrow t=0$；$x=\dfrac\pi2\Rightarrow t=\tan\dfrac\pi4=1$。代入
+
+$$
+\sin x=\frac{2t}{1+t^2},\quad\cos x=\frac{1-t^2}{1+t^2},\quad dx=\frac{2}{1+t^2}\,dt
+$$
+
+分母
+
+$$
+1+\sin x+\cos x=\frac{(1+t^2)+2t+(1-t^2)}{1+t^2}=\frac{2+2t}{1+t^2}=\frac{2(1+t)}{1+t^2}
+$$
+
+于是被积式
+
+$$
+\frac{1}{\frac{2(1+t)}{1+t^2}}\cdot\frac{2}{1+t^2}=\frac{1+t^2}{2(1+t)}\cdot\frac{2}{1+t^2}=\frac{1}{1+t}
+$$
+
+故
+
+$$
+\int_0^{\pi/2}\frac{dx}{1+\sin x+\cos x}=\int_0^{1}\frac{dt}{1+t}=\big[\ln(1+t)\big]_0^1=\ln 2
+$$
+
+**点评**：这是万能代换的最佳广告：原本含 $\sin x+\cos x$ 的复杂分式，代换后竟约简成最简单的 $\dfrac{1}{1+t}$，积分一步得 $\ln 2$。定积分换元时同步换限（$0\to0$、$\dfrac\pi2\to1$），避免最后回代，是处理这类问题的标准做法。
+
+---
+
 ## 练习题
 
 1. 为什么万能代换被称为“统一入口”？
