@@ -168,6 +168,130 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**基础入门 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高中核心与高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：用基本极限 $\lim\limits_{x\to 0}\dfrac{\ln(1+x)}{x}=1$ 求 $\lim\limits_{x\to 0}\dfrac{\ln(1+5x)}{x}$。
+
+**解**：把分子里的"小量"和分母配成同一个量。乘除 $5$：
+
+$$
+\frac{\ln(1+5x)}{x}=5\cdot\frac{\ln(1+5x)}{5x}.
+$$
+
+令 $u=5x$，当 $x\to 0$ 时 $u\to 0$，故 $\dfrac{\ln(1+5x)}{5x}=\dfrac{\ln(1+u)}{u}\to 1$。于是
+
+$$
+\lim_{x\to 0}\frac{\ln(1+5x)}{x}=5\cdot 1=5.
+$$
+
+**点评**：套用 $\dfrac{\ln(1+\square)}{\square}\to 1$ 的诀窍是让分母与括号内的小量完全一致。本题靠"乘 $5$ 除 $5$"把分母补成 $5x$，多出来的因子 $5$ 就是答案。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：判断 $\lim\limits_{x\to+\infty}\dfrac{\ln x}{\sqrt{x}}$，并说明它体现了什么增长比较。
+
+**解**：把分母写成幂 $\sqrt{x}=x^{1/2}$，即 $\alpha=\dfrac12>0$。由增长比较公式
+
+$$
+\lim_{x\to+\infty}\frac{\ln x}{x^{\alpha}}=0\quad(\alpha>0),
+$$
+
+取 $\alpha=\dfrac12$ 立即得
+
+$$
+\lim_{x\to+\infty}\frac{\ln x}{\sqrt{x}}=0.
+$$
+
+**点评**：很多同学误以为 $\sqrt x$ 增长"也很慢"，所以与 $\ln x$ 难分胜负。其实只要幂指数 $\alpha>0$（哪怕只有 $\tfrac12$），幂函数终将彻底压过对数。这正是层级 $\ln x\ll x^{\alpha}$ 的含义。
+
+### 例题精练 3（★★ 高中核心）
+
+**题目**：求 $\lim\limits_{x\to 0^{+}}x\ln x$。
+
+**解**：这是 $0\cdot(-\infty)$ 型。令 $x=\dfrac1t$，当 $x\to 0^{+}$ 时 $t\to+\infty$，则
+
+$$
+x\ln x=\frac1t\ln\frac1t=\frac{-\ln t}{t}=-\frac{\ln t}{t}.
+$$
+
+由基本极限 $\lim\limits_{t\to+\infty}\dfrac{\ln t}{t}=0$，得
+
+$$
+\lim_{x\to 0^{+}}x\ln x=-\lim_{t\to+\infty}\frac{\ln t}{t}=0.
+$$
+
+**点评**：$x\to 0^+$ 时 $\ln x\to-\infty$，但前面乘了趋于 $0$ 的 $x$，胜负未定。换元 $x=1/t$ 把它转化为熟悉的 $\dfrac{\ln t}{t}$，由"对数远慢于幂"知极限为 $0$——即 $x$ 趋于零的速度压过了 $\ln x$ 趋于无穷的速度。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：用洛必达法则求 $\lim\limits_{x\to+\infty}\dfrac{\ln x}{x^{\alpha}}$（$\alpha>0$），从而严格验证增长层级 $\ln x\ll x^{\alpha}$。
+
+**解**：当 $x\to+\infty$ 时分子分母都趋于 $+\infty$，是 $\dfrac{\infty}{\infty}$ 型，可用洛必达法则。对分子分母分别求导：
+
+$$
+\frac{d}{dx}\ln x=\frac1x,\qquad \frac{d}{dx}x^{\alpha}=\alpha x^{\alpha-1}.
+$$
+
+于是
+
+$$
+\lim_{x\to+\infty}\frac{\ln x}{x^{\alpha}}
+=\lim_{x\to+\infty}\frac{1/x}{\alpha x^{\alpha-1}}
+=\lim_{x\to+\infty}\frac{1}{\alpha x^{\alpha}}=0,
+$$
+
+因为 $\alpha>0$ 时 $x^{\alpha}\to+\infty$。故 $\ln x\ll x^{\alpha}$ 得证。
+
+**点评**：洛必达法则把"对数比幂"一步化简成"常数比幂"，直观看出对数求导后变成 $1/x$ 这个衰减量，正是它增长慢的根源。注意使用洛必达前必须先确认是 $\frac00$ 或 $\frac{\infty}{\infty}$ 未定式。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：求 $\lim\limits_{x\to+\infty}\left(\ln(x+1)-\ln x\right)\cdot x$。
+
+**解**：先用对数运算把差合并：
+
+$$
+\ln(x+1)-\ln x=\ln\frac{x+1}{x}=\ln\left(1+\frac1x\right).
+$$
+
+于是原式为
+
+$$
+x\ln\left(1+\frac1x\right).
+$$
+
+令 $u=\dfrac1x$，当 $x\to+\infty$ 时 $u\to 0^{+}$，且 $x=\dfrac1u$，故
+
+$$
+x\ln\left(1+\frac1x\right)=\frac{\ln(1+u)}{u}\to 1.
+$$
+
+所以极限为 $1$。
+
+**点评**：两步走——先用 $\ln A-\ln B=\ln\frac AB$ 把对数差变成单个 $\ln(1+\text{小量})$，再换元套基本极限 $\dfrac{\ln(1+u)}{u}\to 1$。这一结果也说明：当 $x$ 很大时 $\ln(x+1)-\ln x\approx\dfrac1x$，与 $(\ln x)'=\dfrac1x$ 的微分含义一致。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：求 $\lim\limits_{x\to+\infty}\dfrac{x^{2}}{e^{x}}$，并将它纳入层级 $\ln x\ll x^{\alpha}\ll a^{x}$ 加以解释。
+
+**解**：当 $x\to+\infty$ 时为 $\dfrac{\infty}{\infty}$ 型，连用两次洛必达法则：
+
+$$
+\lim_{x\to+\infty}\frac{x^{2}}{e^{x}}
+=\lim_{x\to+\infty}\frac{2x}{e^{x}}
+=\lim_{x\to+\infty}\frac{2}{e^{x}}=0.
+$$
+
+每求一次导，分子的幂降一阶而分母 $e^x$ 不变，两次之后分子变成常数 $2$，而分母仍趋于 $+\infty$，故极限为 $0$。
+
+**点评**：这正是层级 $x^{\alpha}\ll a^{x}$（取 $\alpha=2$、$a=e$）的实例：指数函数最终压过任意幂函数。把本章的两条层级 $\ln x\ll x^{\alpha}$ 与 $x^{\alpha}\ll a^{x}$ 串起来，就得到完整的"对数 $\ll$ 幂 $\ll$ 指数"图景。
+
+---
+
 ## 练习题
 
 1. 说明 $\lim_{x\to0^+}\ln x$ 的结果。
