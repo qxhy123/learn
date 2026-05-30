@@ -78,6 +78,10 @@ $$
 
 所以它不是近似，不是技巧性补丁，而是一个**严格恒等变形**。
 
+顺带一提，log-sum-exp 还有一个几何含义：它是 $\max$ 的**光滑近似**。以两项 $\mathrm{LSE}(x,0)=\ln(e^x+1)$（即 softplus）为例，它把 $\max(x,0)$（ReLU 折线）的尖锐拐角磨成一条光滑曲线，而在两端又紧贴折线：
+
+![log-sum-exp 是 max 的光滑近似：$\mathrm{LSE}(x,0)=\ln(e^x+1)$（softplus）把 $\max(x,0)$（ReLU 折线）的拐角磨圆，两端贴合折线](../figures/svg/log-p5-17-1.svg)
+
 ### 17.5 与 softmax 和交叉熵的关系
 
 softmax 定义为：
