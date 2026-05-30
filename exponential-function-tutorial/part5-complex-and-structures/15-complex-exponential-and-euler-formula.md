@@ -488,6 +488,199 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：用 Euler 公式直接求 $e^{i\pi/2}$、$e^{i\pi}$、$e^{i3\pi/2}$ 的值，并说明它们在单位圆上的位置。
+
+**解**：由 Euler 公式 $e^{i\theta}=\cos\theta+i\sin\theta$，逐个代入：
+
+$$
+e^{i\pi/2}=\cos\frac{\pi}{2}+i\sin\frac{\pi}{2}=0+i\cdot 1=i
+$$
+
+$$
+e^{i\pi}=\cos\pi+i\sin\pi=-1+i\cdot 0=-1
+$$
+
+$$
+e^{i3\pi/2}=\cos\frac{3\pi}{2}+i\sin\frac{3\pi}{2}=0+i\cdot(-1)=-i
+$$
+
+它们的模长都满足 $|e^{i\theta}|=\sqrt{\cos^2\theta+\sin^2\theta}=1$，所以三点都落在单位圆上，辐角分别是 $\frac{\pi}{2}$、$\pi$、$\frac{3\pi}{2}$，正好是圆上“上、左、下”三个方向。
+
+**点评**：这是欧拉公式最基础的用法——把角度代进去，分别读出实部 $\cos\theta$ 与虚部 $\sin\theta$。记住“$e^{i\theta}$ 始终在单位圆上”，就能把代数值和几何方向对应起来。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：把 $z_1=1+i$ 与 $z_2=1-\sqrt3\,i$ 化成极形式 $re^{i\theta}$，并用极形式求乘积 $z_1z_2$ 与商 $\dfrac{z_1}{z_2}$。
+
+**解**：先求 $z_1$。模长 $|z_1|=\sqrt{1^2+1^2}=\sqrt2$，因实部、虚部都为正且相等，辐角为 $\frac{\pi}{4}$，故
+
+$$
+z_1=\sqrt2\,e^{i\pi/4}
+$$
+
+再求 $z_2$。模长 $|z_2|=\sqrt{1^2+(\sqrt3)^2}=\sqrt{1+3}=2$，实部为正、虚部为负，辐角为 $-\frac{\pi}{3}$，故
+
+$$
+z_2=2e^{-i\pi/3}
+$$
+
+乘积“模长相乘、角度相加”：
+
+$$
+z_1z_2=\sqrt2\cdot 2\;e^{i(\pi/4-\pi/3)}=2\sqrt2\,e^{-i\pi/12}
+$$
+
+商“模长相除、角度相减”：
+
+$$
+\frac{z_1}{z_2}=\frac{\sqrt2}{2}\,e^{i(\pi/4-(-\pi/3))}=\frac{\sqrt2}{2}\,e^{i7\pi/12}
+$$
+
+**点评**：极形式把乘除变成了“模长做乘除、辐角做加减”的简单算术。注意 $z_2$ 在第四象限，辐角取负值 $-\frac{\pi}{3}$；求商时是减去 $z_2$ 的辐角，即 $\frac{\pi}{4}-(-\frac{\pi}{3})=\frac{7\pi}{12}$，符号别弄反。
+
+### 例题精练 3（★★★ 高阶拓展）
+
+**题目**：用 De Moivre 公式把 $\cos 3\theta$ 与 $\sin 3\theta$ 用 $\cos\theta,\sin\theta$ 表示出来。
+
+**解**：由 De Moivre 公式
+
+$$
+(\cos\theta+i\sin\theta)^3=\cos 3\theta+i\sin 3\theta
+$$
+
+左边按二项式展开（记 $c=\cos\theta,\ s=\sin\theta$）：
+
+$$
+(c+is)^3=c^3+3c^2(is)+3c(is)^2+(is)^3
+$$
+
+利用 $i^2=-1,\ i^3=-i$：
+
+$$
+=c^3+3ic^2 s-3cs^2-is^3=(c^3-3cs^2)+i(3c^2 s-s^3)
+$$
+
+比较实部与虚部：
+
+$$
+\cos 3\theta=\cos^3\theta-3\cos\theta\sin^2\theta,\qquad
+\sin 3\theta=3\cos^2\theta\sin\theta-\sin^3\theta
+$$
+
+若再用 $\sin^2\theta=1-\cos^2\theta$ 与 $\cos^2\theta=1-\sin^2\theta$，可整理为常见形式
+
+$$
+\cos 3\theta=4\cos^3\theta-3\cos\theta,\qquad
+\sin 3\theta=3\sin\theta-4\sin^3\theta
+$$
+
+**点评**：这是复指数威力的典型展示——三倍角公式不必死记，把 $(\cos\theta+i\sin\theta)^n$ 展开后比较实虚部即可现场推出。同样的方法对任意 $n$ 都成立。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：用复指数求和 $S=\cos\theta+\cos 2\theta+\cos 3\theta+\cdots+\cos n\theta$（设 $\theta$ 不是 $2\pi$ 的整数倍）。
+
+**解**：把每个余弦看成复指数的实部，$\cos k\theta=\operatorname{Re}\,e^{ik\theta}$，于是
+
+$$
+S=\operatorname{Re}\sum_{k=1}^{n}e^{ik\theta}=\operatorname{Re}\sum_{k=1}^{n}\left(e^{i\theta}\right)^k
+$$
+
+括号内是公比 $q=e^{i\theta}\neq 1$ 的等比数列，求和：
+
+$$
+\sum_{k=1}^{n}q^k=q\,\frac{q^n-1}{q-1}=e^{i\theta}\,\frac{e^{in\theta}-1}{e^{i\theta}-1}
+$$
+
+为取实部，用“提半角”技巧。分子 $e^{in\theta}-1=e^{in\theta/2}\!\left(e^{in\theta/2}-e^{-in\theta/2}\right)=e^{in\theta/2}\cdot 2i\sin\frac{n\theta}{2}$，分母 $e^{i\theta}-1=e^{i\theta/2}\cdot 2i\sin\frac{\theta}{2}$，故
+
+$$
+\sum_{k=1}^{n}e^{ik\theta}
+=e^{i\theta}\cdot\frac{e^{in\theta/2}\,2i\sin\frac{n\theta}{2}}{e^{i\theta/2}\,2i\sin\frac{\theta}{2}}
+=e^{i(n+1)\theta/2}\,\frac{\sin\frac{n\theta}{2}}{\sin\frac{\theta}{2}}
+$$
+
+取实部，$\operatorname{Re}\,e^{i(n+1)\theta/2}=\cos\frac{(n+1)\theta}{2}$，得
+
+$$
+\boxed{\;S=\frac{\sin\frac{n\theta}{2}}{\sin\frac{\theta}{2}}\cos\frac{(n+1)\theta}{2}\;}
+$$
+
+**点评**：把三角求和转成等比数列，是复指数最实用的招式之一。关键技巧是分子分母同时“提出半角因子” $e^{i\cdot(\text{半角})}$，让剩下的部分凑成 $2i\sin(\cdot)$，从而把模长与辐角彻底分离。同理取虚部即得 $\sum\sin k\theta$。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：求方程 $z^3=-8i$ 的全部复数解，写成极形式并指出几何分布。
+
+**解**：先把右端写成极形式。$-8i$ 的模长为 $8$，辐角为 $-\frac{\pi}{2}$（在负虚轴上），故
+
+$$
+-8i=8\,e^{i(-\pi/2+2k\pi)},\qquad k\in\mathbb Z
+$$
+
+设 $z=re^{i\varphi}$，则 $z^3=r^3 e^{i3\varphi}$。比较模长得 $r^3=8$，即 $r=2$；比较辐角得
+
+$$
+3\varphi=-\frac{\pi}{2}+2k\pi\ \Longrightarrow\ \varphi=-\frac{\pi}{6}+\frac{2k\pi}{3},\qquad k=0,1,2
+$$
+
+逐个代入：
+
+$$
+z_0=2e^{-i\pi/6}=2\!\left(\cos\frac{\pi}{6}-i\sin\frac{\pi}{6}\right)=\sqrt3-i
+$$
+
+$$
+z_1=2e^{i\pi/2}=2i
+$$
+
+$$
+z_2=2e^{i7\pi/6}=2\!\left(-\frac{\sqrt3}{2}-\frac{1}{2}i\right)=-\sqrt3-i
+$$
+
+**点评**：开 $n$ 次方的标准流程是“模长开 $n$ 次方、辐角除以 $n$ 并加上 $\frac{2k\pi}{n}$ 的分支”。三个解模长都是 $2$，辐角两两相差 $\frac{2\pi}{3}$，所以它们落在半径 $2$ 的圆上，构成等边三角形的三个顶点。务必把所有 $k$ 分支取齐，不能只写主值。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：利用 Euler 公式证明积化和差公式 $\cos\alpha\cos\beta=\dfrac{1}{2}\big[\cos(\alpha-\beta)+\cos(\alpha+\beta)\big]$。
+
+**解**：由 Euler 公式可把余弦写成复指数的对称组合：
+
+$$
+\cos\alpha=\frac{e^{i\alpha}+e^{-i\alpha}}{2},\qquad
+\cos\beta=\frac{e^{i\beta}+e^{-i\beta}}{2}
+$$
+
+相乘：
+
+$$
+\cos\alpha\cos\beta
+=\frac{1}{4}\left(e^{i\alpha}+e^{-i\alpha}\right)\left(e^{i\beta}+e^{-i\beta}\right)
+$$
+
+展开四项并按指数运算律 $e^{i\alpha}e^{i\beta}=e^{i(\alpha+\beta)}$ 合并：
+
+$$
+=\frac{1}{4}\left(e^{i(\alpha+\beta)}+e^{i(\alpha-\beta)}+e^{-i(\alpha-\beta)}+e^{-i(\alpha+\beta)}\right)
+$$
+
+把共轭成对的两项各自合成余弦，$e^{i\gamma}+e^{-i\gamma}=2\cos\gamma$：
+
+$$
+=\frac{1}{4}\left(2\cos(\alpha+\beta)+2\cos(\alpha-\beta)\right)
+=\frac{1}{2}\big[\cos(\alpha-\beta)+\cos(\alpha+\beta)\big]
+$$
+
+**点评**：把 $\cos$ 拆成 $\frac{1}{2}(e^{i\theta}+e^{-i\theta})$ 后，积化和差就退化成指数相乘再合并的纯代数操作，无需记忆任何三角技巧。同样地，$\sin\theta=\frac{1}{2i}(e^{i\theta}-e^{-i\theta})$ 可用来推导含正弦的积化和差，这正体现了复指数“统一三角语言”的价值。
+
+---
+
 ## 练习题
 
 1. 用第14章的级数思路解释为什么 Euler 公式不是突然出现的。

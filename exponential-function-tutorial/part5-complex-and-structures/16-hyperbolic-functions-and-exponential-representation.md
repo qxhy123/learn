@@ -311,6 +311,155 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：已知 $\sinh x=\dfrac{3}{4}$，求 $\cosh x$ 与 $\tanh x$。
+
+**解**：由基本恒等式 $\cosh^2 x-\sinh^2 x=1$，得
+
+$$
+\cosh^2 x=1+\sinh^2 x=1+\left(\frac{3}{4}\right)^2=1+\frac{9}{16}=\frac{25}{16}
+$$
+
+因为对任意实数 $x$ 都有 $\cosh x=\dfrac{e^x+e^{-x}}{2}>0$，所以取正根：
+
+$$
+\cosh x=\frac{5}{4}
+$$
+
+于是
+
+$$
+\tanh x=\frac{\sinh x}{\cosh x}=\frac{3/4}{5/4}=\frac{3}{5}
+$$
+
+**点评**：双曲恒等式 $\cosh^2-\sinh^2=1$ 的用法和三角里的 $\sin^2+\cos^2=1$ 类似，但关键差别是 $\cosh x$ **恒为正**，不必像三角函数那样讨论符号——这正源于它是两个正指数的平均。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：直接用定义求 $\sinh(\ln 2)$ 与 $\cosh(\ln 2)$，并验证恒等式 $\cosh^2-\sinh^2=1$。
+
+**解**：注意 $e^{\ln 2}=2$，$e^{-\ln 2}=\dfrac{1}{2}$。代入定义：
+
+$$
+\sinh(\ln 2)=\frac{e^{\ln 2}-e^{-\ln 2}}{2}=\frac{2-\frac{1}{2}}{2}=\frac{3/2}{2}=\frac{3}{4}
+$$
+
+$$
+\cosh(\ln 2)=\frac{e^{\ln 2}+e^{-\ln 2}}{2}=\frac{2+\frac{1}{2}}{2}=\frac{5/2}{2}=\frac{5}{4}
+$$
+
+验证：
+
+$$
+\cosh^2(\ln 2)-\sinh^2(\ln 2)=\frac{25}{16}-\frac{9}{16}=\frac{16}{16}=1\ \checkmark
+$$
+
+**点评**：双曲函数在 $x=\ln a$ 这类点上特别好算，因为 $e^{\ln a}=a$ 把指数“解开”了。这道题也从具体数值上印证了例题 1 的结果——恒等式不是空话，可逐点检验。
+
+### 例题精练 3（★★★ 高阶拓展）
+
+**题目**：证明双曲正弦的加法公式 $\sinh(x+y)=\sinh x\cosh y+\cosh x\sinh y$。
+
+**解**：从右端出发，把四个双曲函数全部写成指数定义：
+
+$$
+\sinh x\cosh y=\frac{e^x-e^{-x}}{2}\cdot\frac{e^y+e^{-y}}{2}
+=\frac{e^{x+y}+e^{x-y}-e^{-x+y}-e^{-x-y}}{4}
+$$
+
+$$
+\cosh x\sinh y=\frac{e^x+e^{-x}}{2}\cdot\frac{e^y-e^{-y}}{2}
+=\frac{e^{x+y}-e^{x-y}+e^{-x+y}-e^{-x-y}}{4}
+$$
+
+两式相加，中间的 $e^{x-y}$ 与 $e^{-x+y}$ 两项符号相反、恰好抵消：
+
+$$
+\sinh x\cosh y+\cosh x\sinh y=\frac{2e^{x+y}-2e^{-x-y}}{4}=\frac{e^{x+y}-e^{-(x+y)}}{2}=\sinh(x+y)
+$$
+
+得证。
+
+**点评**：双曲加法公式与三角加法公式 $\sin(x+y)=\sin x\cos y+\cos x\sin y$ 形式完全一致（且这里全是加号，没有三角里的符号陷阱）。证明的核心就是把定义代入、展开、让交叉项相消——这是所有双曲恒等式的通用证法。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：求 $\tanh x$ 的导数，并由此说明 $\tanh x$ 为何呈“饱和”形状。
+
+**解**：由 $\tanh x=\dfrac{\sinh x}{\cosh x}$ 及商法则，结合 $(\sinh x)'=\cosh x$、$(\cosh x)'=\sinh x$：
+
+$$
+(\tanh x)'=\frac{(\sinh x)'\cosh x-\sinh x(\cosh x)'}{\cosh^2 x}
+=\frac{\cosh^2 x-\sinh^2 x}{\cosh^2 x}
+$$
+
+分子正是恒等式 $\cosh^2 x-\sinh^2 x=1$，所以
+
+$$
+(\tanh x)'=\frac{1}{\cosh^2 x}=\operatorname{sech}^2 x
+$$
+
+由于 $\cosh x=\dfrac{e^x+e^{-x}}{2}\ge 1$，导数满足 $0<(\tanh x)'\le 1$，且当 $|x|$ 增大时 $\cosh x$ 指数式增大，导数趋于 $0$。这说明 $\tanh x$ 处处递增、但增长率越来越小，曲线逐渐变平并贴近水平渐近线 $y=\pm 1$，呈现典型的“饱和型响应”。
+
+**点评**：导数恒正解释了单调性，导数趋零解释了渐近饱和。$\operatorname{sech}^2 x=1-\tanh^2 x$ 这一形式在微分方程与神经网络反向传播中都很常用。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：推导反双曲正弦的对数表达式 $\operatorname{arsinh} x=\ln\!\big(x+\sqrt{x^2+1}\big)$，并求 $\dfrac{d}{dx}\operatorname{arsinh} x$。
+
+**解**：设 $y=\operatorname{arsinh} x$，即 $x=\sinh y=\dfrac{e^y-e^{-y}}{2}$。令 $t=e^y>0$，则 $2x=t-\dfrac{1}{t}$，两边乘 $t$：
+
+$$
+t^2-2xt-1=0\ \Longrightarrow\ t=\frac{2x\pm\sqrt{4x^2+4}}{2}=x\pm\sqrt{x^2+1}
+$$
+
+因 $t=e^y>0$，而 $x-\sqrt{x^2+1}<0$，必须取正根 $t=x+\sqrt{x^2+1}$，故
+
+$$
+y=\ln t=\ln\!\big(x+\sqrt{x^2+1}\big)
+$$
+
+对其求导：
+
+$$
+\frac{d}{dx}\operatorname{arsinh} x=\frac{1}{x+\sqrt{x^2+1}}\cdot\left(1+\frac{x}{\sqrt{x^2+1}}\right)
+=\frac{1}{x+\sqrt{x^2+1}}\cdot\frac{\sqrt{x^2+1}+x}{\sqrt{x^2+1}}=\frac{1}{\sqrt{x^2+1}}
+$$
+
+**点评**：反双曲函数能写成对数，正是“指数与对数互逆”的又一次体现。导数 $\dfrac{1}{\sqrt{x^2+1}}$ 也解释了积分表里 $\int\dfrac{dx}{\sqrt{x^2+1}}=\operatorname{arsinh} x+C$ 的来历，与三角代换形成漂亮的类比。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：双曲函数与三角函数的复数桥梁——证明 $\cos(ix)=\cosh x$ 与 $\sin(ix)=i\sinh x$。
+
+**解**：用第 15 章的 Euler 公式，余弦与正弦可写成复指数形式：
+
+$$
+\cos z=\frac{e^{iz}+e^{-iz}}{2},\qquad \sin z=\frac{e^{iz}-e^{-iz}}{2i}
+$$
+
+把 $z=ix$ 代入第一式，注意 $i\cdot(ix)=i^2 x=-x$，故 $e^{i(ix)}=e^{-x}$、$e^{-i(ix)}=e^{x}$：
+
+$$
+\cos(ix)=\frac{e^{-x}+e^{x}}{2}=\frac{e^x+e^{-x}}{2}=\cosh x
+$$
+
+代入第二式：
+
+$$
+\sin(ix)=\frac{e^{-x}-e^{x}}{2i}=\frac{-(e^x-e^{-x})}{2i}
+=\frac{-(e^x-e^{-x})}{2i}\cdot\frac{i}{i}=\frac{-i(e^x-e^{-x})}{2i^2}=\frac{e^x-e^{-x}}{2}\,i=i\sinh x
+$$
+
+**点评**：这两条公式揭示了“双曲函数其实是三角函数在虚轴方向的化身”，也解释了为何双曲恒等式与三角恒等式形式如此相似——把 $\cos^2 z+\sin^2 z=1$ 中令 $z=ix$，立刻得到 $\cosh^2 x-\sinh^2 x=1$。三角的“圆”与双曲的“双曲线”，在复数世界里本是一家。
+
+---
+
 ## 练习题
 
 1. 计算 $\sinh 0$ 与 $\cosh 0$。

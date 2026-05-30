@@ -555,6 +555,148 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：设 $A=\begin{pmatrix}3&0\\0&-1\end{pmatrix}$，求 $e^{At}$，并写出系统 $\mathbf x'=A\mathbf x$ 在初值 $\mathbf x_0=\begin{pmatrix}2\\5\end{pmatrix}$ 下的解。
+
+**解**：$A$ 是对角矩阵，对角矩阵的指数就是逐个对角元取指数：
+
+$$
+e^{At}=\begin{pmatrix}e^{3t}&0\\0&e^{-t}\end{pmatrix}
+$$
+
+于是解为
+
+$$
+\mathbf x(t)=e^{At}\mathbf x_0=\begin{pmatrix}e^{3t}&0\\0&e^{-t}\end{pmatrix}\begin{pmatrix}2\\5\end{pmatrix}=\begin{pmatrix}2e^{3t}\\5e^{-t}\end{pmatrix}
+$$
+
+**点评**：对角情形下，矩阵指数完全退化成两个独立的标量指数。第一分量按 $e^{3t}$ 增长，第二分量按 $e^{-t}$ 衰减——同一系统里不同方向呈现完全不同的命运，这正是“矩阵指数给整个状态空间分配演化方式”的最简单写照。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：设 $N=\begin{pmatrix}0&2\\0&0\end{pmatrix}$，用级数定义求 $e^{Nt}$。
+
+**解**：先算 $N$ 的幂。直接相乘：
+
+$$
+N^2=\begin{pmatrix}0&2\\0&0\end{pmatrix}\begin{pmatrix}0&2\\0&0\end{pmatrix}=\begin{pmatrix}0&0\\0&0\end{pmatrix}
+$$
+
+所以 $N^2=0$，更高次幂也全为零。级数 $e^{Nt}=I+Nt+\dfrac{(Nt)^2}{2!}+\cdots$ 在第二项后截断：
+
+$$
+e^{Nt}=I+Nt=\begin{pmatrix}1&0\\0&1\end{pmatrix}+\begin{pmatrix}0&2t\\0&0\end{pmatrix}=\begin{pmatrix}1&2t\\0&1\end{pmatrix}
+$$
+
+**点评**：幂零矩阵（$N^k=0$）让无穷级数变成有限和，这是矩阵指数最干净的一类。结果是一个**剪切变换**：随 $t$ 增大，第一分量混入 $2t$ 倍的第二分量，而不是指数爆炸——提醒我们 $e^{At}$ 不总是 $e^{\lambda t}$ 的形状。
+
+### 例题精练 3（★★★ 高阶拓展）
+
+**题目**：设 $A=\begin{pmatrix}1&2\\0&3\end{pmatrix}$，用对角化法求 $e^{At}$。
+
+**解**：$A$ 上三角，特征值为对角元 $\lambda_1=1,\lambda_2=3$，互异故可对角化。
+
+求特征向量。对 $\lambda_1=1$：解 $(A-I)\mathbf v=0$，即 $\begin{pmatrix}0&2\\0&2\end{pmatrix}\mathbf v=0$，得 $v_2=0$，取 $\mathbf v_1=\begin{pmatrix}1\\0\end{pmatrix}$。
+
+对 $\lambda_2=3$：解 $(A-3I)\mathbf v=0$，即 $\begin{pmatrix}-2&2\\0&0\end{pmatrix}\mathbf v=0$，得 $v_1=v_2$，取 $\mathbf v_2=\begin{pmatrix}1\\1\end{pmatrix}$。
+
+于是
+
+$$
+P=\begin{pmatrix}1&1\\0&1\end{pmatrix},\qquad P^{-1}=\begin{pmatrix}1&-1\\0&1\end{pmatrix},\qquad D=\begin{pmatrix}1&0\\0&3\end{pmatrix}
+$$
+
+（$P$ 是上三角且对角元为 $1$，其逆只需把上三角的 $1$ 变号。）由 $e^{At}=Pe^{Dt}P^{-1}$：
+
+$$
+e^{At}=\begin{pmatrix}1&1\\0&1\end{pmatrix}\begin{pmatrix}e^{t}&0\\0&e^{3t}\end{pmatrix}\begin{pmatrix}1&-1\\0&1\end{pmatrix}
+$$
+
+先算前两个矩阵之积：$\begin{pmatrix}e^t&e^{3t}\\0&e^{3t}\end{pmatrix}$，再右乘 $P^{-1}$：
+
+$$
+e^{At}=\begin{pmatrix}e^t&e^{3t}\\0&e^{3t}\end{pmatrix}\begin{pmatrix}1&-1\\0&1\end{pmatrix}=\begin{pmatrix}e^{t}&-e^{t}+e^{3t}\\0&e^{3t}\end{pmatrix}
+$$
+
+**验证**：令 $t=0$ 应得单位阵——$\begin{pmatrix}1&-1+1\\0&1\end{pmatrix}=I\ \checkmark$。
+
+**点评**：对角化三步走：求特征值、求特征向量拼成 $P$、套 $e^{At}=Pe^{Dt}P^{-1}$。三角矩阵的 $P^{-1}$ 容易写，是练手好例。最后用 $e^{A\cdot 0}=I$ 自检，是必养成的习惯。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：设 $A=\begin{pmatrix}0&-2\\2&0\end{pmatrix}$，求 $e^{At}$，并描述对应系统 $\mathbf x'=A\mathbf x$ 的轨迹。
+
+**解**：写 $A=2J$，其中 $J=\begin{pmatrix}0&-1\\1&0\end{pmatrix}$ 满足 $J^2=-I$。于是 $e^{At}=e^{(2t)J}$，套用旋转矩阵指数公式 $e^{\theta J}=\cos\theta\,I+\sin\theta\,J$，令 $\theta=2t$：
+
+$$
+e^{At}=\cos(2t)\,I+\sin(2t)\,J=\begin{pmatrix}\cos 2t&-\sin 2t\\\sin 2t&\cos 2t\end{pmatrix}
+$$
+
+这是角速度为 $2$ 的旋转矩阵。对任意初值 $\mathbf x_0$，解 $\mathbf x(t)=e^{At}\mathbf x_0$ 的模长 $|\mathbf x(t)|=|\mathbf x_0|$ 保持不变（旋转不改变长度），所以轨迹是以原点为圆心、半径 $|\mathbf x_0|$ 的圆，状态点以角速度 $2$ 逆时针匀速绕圈。
+
+**点评**：特征值为纯虚数 $\pm 2i$，对应无衰减的振荡/旋转。这与第 15 章 $e^{i\theta}$ 在单位圆上旋转的图景完全呼应——矩阵指数把复指数的旋转推广到了二维实平面的线性系统。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：求解二阶方程 $y''-y'-2y=0$，初值 $y(0)=1,\ y'(0)=0$，方法是先化成一阶系统 $\mathbf x'=A\mathbf x$ 再用矩阵指数。
+
+**解**：令 $x_1=y,\ x_2=y'$，则 $x_1'=x_2$，$x_2'=y''=y'+2y=x_2+2x_1$，故
+
+$$
+A=\begin{pmatrix}0&1\\2&1\end{pmatrix},\qquad \mathbf x_0=\begin{pmatrix}y(0)\\y'(0)\end{pmatrix}=\begin{pmatrix}1\\0\end{pmatrix}
+$$
+
+特征值由 $\det(A-\lambda I)=\lambda^2-\lambda-2=(\lambda-2)(\lambda+1)=0$ 得 $\lambda_1=2,\lambda_2=-1$。
+
+特征向量：对 $\lambda_1=2$，解 $\begin{pmatrix}-2&1\\2&-1\end{pmatrix}\mathbf v=0$，得 $v_2=2v_1$，取 $\mathbf v_1=\begin{pmatrix}1\\2\end{pmatrix}$；对 $\lambda_2=-1$，解 $\begin{pmatrix}1&1\\2&2\end{pmatrix}\mathbf v=0$，得 $v_2=-v_1$，取 $\mathbf v_2=\begin{pmatrix}1\\-1\end{pmatrix}$。
+
+通解为两特征模式的线性组合：
+
+$$
+\mathbf x(t)=c_1 e^{2t}\begin{pmatrix}1\\2\end{pmatrix}+c_2 e^{-t}\begin{pmatrix}1\\-1\end{pmatrix}
+$$
+
+代入初值 $\mathbf x(0)=\begin{pmatrix}1\\0\end{pmatrix}$：
+
+$$
+c_1+c_2=1,\qquad 2c_1-c_2=0
+$$
+
+解得 $c_1=\dfrac{1}{3},\ c_2=\dfrac{2}{3}$。第一分量即所求：
+
+$$
+\boxed{\;y(t)=\frac{1}{3}e^{2t}+\frac{2}{3}e^{-t}\;}
+$$
+
+**验证**：$y(0)=\frac{1}{3}+\frac{2}{3}=1\ \checkmark$；$y'(t)=\frac{2}{3}e^{2t}-\frac{2}{3}e^{-t}$，$y'(0)=\frac{2}{3}-\frac{2}{3}=0\ \checkmark$。
+
+**点评**：高阶常系数线性 ODE 通过引入“函数及其导数”作为状态向量，统一化为一阶系统 $\mathbf x'=A\mathbf x$，再用特征值/特征向量（即对角化下的 $e^{At}$）求解。这正是矩阵指数把标量指数解法系统化的威力所在，两个特征值 $2,-1$ 直接对应解中的 $e^{2t}$ 与 $e^{-t}$。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**：设 $A=\begin{pmatrix}2&1\\0&2\end{pmatrix}$（不可对角化），用拆分 $A=2I+N$ 求 $e^{At}$。
+
+**解**：写 $A=2I+N$，其中 $N=\begin{pmatrix}0&1\\0&0\end{pmatrix}$。因为 $2I$ 与 $N$ 可交换（数量矩阵 $2I$ 与任何矩阵都可交换），所以满足 $e^{X+Y}=e^Xe^Y$ 的条件：
+
+$$
+e^{At}=e^{(2I)t}\,e^{Nt}=e^{2t}I\cdot e^{Nt}
+$$
+
+其中 $e^{(2I)t}=e^{2t}I$（数量矩阵的指数），而 $N^2=0$ 给出 $e^{Nt}=I+Nt=\begin{pmatrix}1&t\\0&1\end{pmatrix}$。于是
+
+$$
+e^{At}=e^{2t}\begin{pmatrix}1&t\\0&1\end{pmatrix}=\begin{pmatrix}e^{2t}&te^{2t}\\0&e^{2t}\end{pmatrix}
+$$
+
+**点评**：当 $A$ 有重特征值且不可对角化时，标准技巧是拆成“数量矩阵 + 幂零矩阵”这两个**可交换**的部分，分别取指数再相乘。注意此处用 $e^{A+B}=e^Ae^B$ 是**合法的**，因为已验证 $2I$ 与 $N$ 可交换——这正是第 17.8 节强调的前提条件。结果中出现的因子 $te^{2t}$，是重特征值（Jordan 块）特有的“多项式 × 指数”形态。
+
+---
+
 ## 练习题
 
 1. 说明为什么矩阵指数必须用幂级数定义，而不能简单理解为“每个元素分别取指数”。

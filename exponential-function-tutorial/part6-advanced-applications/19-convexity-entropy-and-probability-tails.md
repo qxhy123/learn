@@ -402,6 +402,171 @@ $$
 
 ---
 
+## 分级例题精练
+
+> 本节精选 6 道例题，分三档难度：**初中基础 ★** / **高中核心 ★★** / **高阶拓展 ★★★**（本章侧重高阶拓展）。每题含【题目】【解】【点评】，建议先自行尝试再看解。
+
+### 例题精练 1（★★ 高中核心）
+
+**题目**：利用指数函数的凸性，证明对一切实数 $x$ 都有 $e^x\ge 1+x$，并指出等号何时成立。再用它估计 $e^{0.1}$ 的一个下界。
+
+**解**：令 $g(x)=e^x-(1+x)$。求导：
+
+$$
+g'(x)=e^x-1,\qquad g''(x)=e^x>0.
+$$
+
+由 $g''>0$ 知 $g$ 严格凸；由 $g'(x)=0$ 解得唯一驻点 $x=0$，因严格凸故为全局最小点。代入得最小值
+
+$$
+g(0)=e^0-(1+0)=0.
+$$
+
+所以 $g(x)\ge g(0)=0$，即 $e^x\ge 1+x$ 对一切实数成立，**等号仅在 $x=0$**。
+
+取 $x=0.1$：$e^{0.1}\ge 1+0.1=1.1$（真值约 $1.1052$，下界成立）。
+
+**点评**：这是全章不等式的源头——“$e^x$ 严格凸 ⇒ 任一切线在图像下方”，在 $x=0$ 处切线恰为 $y=1+x$。证法的要害是**用二阶导确认凸、用一阶导定位切点、代回得最小值为 0**，三步缺一不可。等号唯一性来自“严格”凸。
+
+### 例题精练 2（★★ 高中核心）
+
+**题目**：设连续型随机变量 $X$ 服从参数 $\lambda>0$ 的指数分布，密度为 $p(x)=\lambda e^{-\lambda x}\ (x\ge0)$。（1）验证密度归一化 $\int_0^\infty p(x)\,dx=1$；（2）求期望 $\mathbb{E}[X]$。
+
+**解**：（1）归一化：
+
+$$
+\int_0^\infty \lambda e^{-\lambda x}\,dx=\lambda\left[-\frac{1}{\lambda}e^{-\lambda x}\right]_0^\infty=\lambda\cdot\frac{1}{\lambda}\big(1-0\big)=1.
+$$
+
+（2）期望用分部积分（$u=x,\ dv=\lambda e^{-\lambda x}dx$，则 $du=dx,\ v=-e^{-\lambda x}$）：
+
+$$
+\mathbb{E}[X]=\int_0^\infty x\,\lambda e^{-\lambda x}\,dx=\Big[-x e^{-\lambda x}\Big]_0^\infty+\int_0^\infty e^{-\lambda x}\,dx.
+$$
+
+边界项在 $x\to\infty$ 时因 $e^{-\lambda x}$ 衰减快于 $x$ 增长而为 0，在 $x=0$ 处为 0；剩下
+
+$$
+\mathbb{E}[X]=\int_0^\infty e^{-\lambda x}\,dx=\frac{1}{\lambda}.
+$$
+
+**点评**：指数分布是“指数衰减”最直接的概率化身。归一化里的 $\lambda$ 恰好抵消积分给出的 $1/\lambda$；期望 $1/\lambda$ 说明速率 $\lambda$ 越大、平均等待时间越短。分部积分中“多项式 × 指数衰减”的边界项总趋于 0，是这类计算的通用要点。
+
+### 例题精练 3（★★★ 高阶拓展）
+
+**题目**：求标准正态变量 $X\sim N(0,1)$ 的矩母函数 $M(t)=\mathbb{E}[e^{tX}]$，并由它读出 $\mathbb{E}[X]$ 与 $\mathbb{E}[X^2]$。
+
+**解**：按定义
+
+$$
+M(t)=\mathbb{E}[e^{tX}]=\int_{-\infty}^{\infty}e^{tx}\cdot\frac{1}{\sqrt{2\pi}}e^{-x^2/2}\,dx
+=\frac{1}{\sqrt{2\pi}}\int_{-\infty}^{\infty}e^{-\frac{x^2}{2}+tx}\,dx.
+$$
+
+对指数配方：$-\dfrac{x^2}{2}+tx=-\dfrac12\big(x-t\big)^2+\dfrac{t^2}{2}$。于是
+
+$$
+M(t)=e^{t^2/2}\cdot\frac{1}{\sqrt{2\pi}}\int_{-\infty}^{\infty}e^{-\frac12(x-t)^2}\,dx=e^{t^2/2}\cdot 1=e^{t^2/2},
+$$
+
+其中积分是均值为 $t$ 的正态密度积分，等于 1。该 MGF 对一切实 $t$ 收敛。
+
+读矩：$M'(t)=t\,e^{t^2/2}$，故 $\mathbb{E}[X]=M'(0)=0$；$M''(t)=(1+t^2)e^{t^2/2}$，故 $\mathbb{E}[X^2]=M''(0)=1$，即方差为 1。
+
+**点评**：正态 MGF $e^{t^2/2}$ 是高阶概率的基石——它本身又是一个指数，体现“配方把高斯积分转回归一化形式”。MGF 在 $t=0$ 处的各阶导数依次给出各阶矩，这是“矩母”二字的来历。注意正态 MGF 对所有 $t$ 都有限，这一点在下一题的 Chernoff 优化里至关重要。
+
+### 例题精练 4（★★★ 高阶拓展）
+
+**题目**：设 $X\sim N(0,1)$。用 Chernoff 方法证明对 $a>0$ 的尾界 $\Pr(X\ge a)\le e^{-ta}M(t)$，并通过对 $t$ 取最优值得到 $\Pr(X\ge a)\le e^{-a^2/2}$。
+
+**解**：对任意 $t>0$，由 $\{X\ge a\}\Leftrightarrow\{tX\ge ta\}\Leftrightarrow\{e^{tX}\ge e^{ta}\}$，再用 Markov 不等式（$e^{tX}>0$）：
+
+$$
+\Pr(X\ge a)=\Pr\!\big(e^{tX}\ge e^{ta}\big)\le \frac{\mathbb{E}[e^{tX}]}{e^{ta}}=e^{-ta}M(t).
+$$
+
+代入上一题的 $M(t)=e^{t^2/2}$：
+
+$$
+\Pr(X\ge a)\le e^{-ta}e^{t^2/2}=\exp\!\Big(\tfrac{t^2}{2}-ta\Big).
+$$
+
+右端是关于 $t$ 的指数，**对指数内部 $\varphi(t)=\tfrac{t^2}{2}-ta$ 取最小值**：$\varphi'(t)=t-a=0\Rightarrow t^\*=a>0$（落在 $t>0$ 的允许范围内），且 $\varphi''=1>0$ 确为极小。代回 $\varphi(a)=\tfrac{a^2}{2}-a^2=-\tfrac{a^2}{2}$，得
+
+$$
+\boxed{\ \Pr(X\ge a)\le e^{-a^2/2}\quad(a>0).\ }
+$$
+
+**点评**：Chernoff 界是“先指数化、再取 $\inf_t$”这一策略的范本。三个关键点：（1）Markov 只对非负量成立，所以先把事件搬进 $e^{tX}$；（2）参数 $t>0$ 是自由的，所以对上界**逐点取下确界**才得最紧结果；（3）这里最优 $t^\*=a$ 恰好把指数压到 $-a^2/2$，给出正态尾的高斯型衰减。若 $t$ 不优化，只能得到更松的界。
+
+### 例题精练 5（★★★ 高阶拓展）
+
+**题目**：设 $X$ 为 Bernoulli 变量，$\Pr(X=1)=p,\ \Pr(X=0)=1-p$。（1）求 MGF $M(t)=\mathbb{E}[e^{tX}]$；（2）由 Jensen 不等式与 $e^x$ 的凸性证明 $\mathbb{E}[e^{tX}]\ge e^{t\,\mathbb{E}[X]}$，并对本例直接验证。
+
+**解**：（1）按定义对两个取值求和：
+
+$$
+M(t)=\mathbb{E}[e^{tX}]=(1-p)\,e^{t\cdot0}+p\,e^{t\cdot1}=(1-p)+p\,e^{t}.
+$$
+
+（2）因 $e^x$ 凸，Jensen 不等式给出 $\mathbb{E}[\phi(X)]\ge \phi(\mathbb{E}[X])$（凸函数方向，下凸取“$\ge$”），取 $\phi(x)=e^{tx}$（对固定 $t$ 仍是凸函数）：
+
+$$
+\mathbb{E}[e^{tX}]\ge e^{t\,\mathbb{E}[X]}.
+$$
+
+本例 $\mathbb{E}[X]=p$，右端为 $e^{tp}$。需验证 $(1-p)+p\,e^t\ge e^{tp}$。把左端看作 $e^{0}$ 与 $e^{t}$ 以权重 $1-p,\,p$ 的加权平均，右端是把权重平均后的自变量 $0\cdot(1-p)+t\cdot p=tp$ 代入 $e^{\cdot}$——这正是 Jensen 对“两点 + 凸函数”的图示：弦在曲线上方，故 $\ge$ 成立，等号当 $t=0$ 或 $p\in\{0,1\}$（退化）时取得。
+
+**点评**：本题把 MGF 与 Jensen 串起来。**Jensen 方向务必记牢：凸函数（如 $e^x$）满足 $\mathbb{E}[\phi(X)]\ge\phi(\mathbb{E}[X])$**，即“先取指数再平均 ≥ 先平均再取指数”，恰与 19.2 节“指数放大波动”的直觉一致。Bernoulli 的 MGF $(1-p)+pe^t$ 是离散 MGF 的最简范例，也是后续二项分布 MGF $\big((1-p)+pe^t\big)^n$ 的单步因子。
+
+### 例题精练 6（★★★ 高阶拓展）
+
+**题目**（综合压轴）：设 $X_1,\dots,X_n$ 独立同分布于参数 $1/2$ 的 Bernoulli（即取 $0$ 或 $1$ 各半），记 $S_n=\sum_{i=1}^n X_i$。用 Chernoff 方法证明上偏差尾界
+
+$$
+\Pr\!\Big(S_n\ge \frac{n}{2}+n\varepsilon\Big)\le e^{-2n\varepsilon^2}\qquad(0<\varepsilon\le\tfrac12).
+$$
+
+**解**：对任意 $t>0$，由独立性 MGF 相乘，单个因子由第 5 题（$p=1/2$）为 $M(t)=\tfrac12(1+e^t)$，故
+
+$$
+\mathbb{E}[e^{tS_n}]=\prod_{i=1}^n\mathbb{E}[e^{tX_i}]=\Big(\tfrac12(1+e^t)\Big)^n.
+$$
+
+设阈值 $a=\tfrac n2+n\varepsilon$。Chernoff：
+
+$$
+\Pr(S_n\ge a)\le e^{-ta}\,\mathbb{E}[e^{tS_n}]=\exp\!\Big(-t a+n\ln\tfrac{1+e^t}{2}\Big).
+$$
+
+为得到干净的界，用 Hoeffding 对单个有界变量 $X_i\in[0,1]$ 的 MGF 引理：对均值 $\mu=\mathbb{E}[X_i]=\tfrac12$，有
+
+$$
+\mathbb{E}\big[e^{t(X_i-\mu)}\big]\le e^{t^2/8},
+$$
+
+（因 $X_i-\mu\in[-\tfrac12,\tfrac12]$，区间长度为 1，Hoeffding 引理给出 $e^{t^2(b-a)^2/8}=e^{t^2/8}$）。于是对中心化和 $S_n-\tfrac n2=\sum(X_i-\mu)$：
+
+$$
+\Pr\!\Big(S_n-\tfrac n2\ge n\varepsilon\Big)\le e^{-t n\varepsilon}\,\mathbb{E}\big[e^{t(S_n-n/2)}\big]\le e^{-tn\varepsilon}\,e^{n t^2/8}=\exp\!\Big(\tfrac{n t^2}{8}-tn\varepsilon\Big).
+$$
+
+对指数内部 $\psi(t)=\tfrac{nt^2}{8}-tn\varepsilon$ 取最小：$\psi'(t)=\tfrac{nt}{4}-n\varepsilon=0\Rightarrow t^\*=4\varepsilon>0$，$\psi''=\tfrac n4>0$ 确为极小。代回：
+
+$$
+\psi(4\varepsilon)=\frac{n(4\varepsilon)^2}{8}-4\varepsilon\cdot n\varepsilon=2n\varepsilon^2-4n\varepsilon^2=-2n\varepsilon^2.
+$$
+
+故
+
+$$
+\boxed{\ \Pr\!\Big(S_n\ge \tfrac n2+n\varepsilon\Big)\le e^{-2n\varepsilon^2}.\ }
+$$
+
+**点评**：这是 Hoeffding 不等式的完整推导，把本章方法全部联用：**独立 ⇒ MGF 相乘（指数把和变积）→ 有界变量的 MGF 上界（凸性 / Hoeffding 引理）→ Chernoff 取 $\inf_t$（最优 $t^\*=4\varepsilon$）→ 高斯型尾界 $e^{-2n\varepsilon^2}$**。结论的意义极强：样本均值偏离真值 $\varepsilon$ 的概率随样本量 $n$ 指数下降，这正是大数定律“为何收敛得这么快”的定量版本，也是 19.5 节“指数尾控制极端事件”的顶点应用。
+
+---
+
 ## 练习题
 
 1. 用“切线在图像下方”的语言解释为什么对所有实数 $x$ 都有 $e^x\ge1+x$。
