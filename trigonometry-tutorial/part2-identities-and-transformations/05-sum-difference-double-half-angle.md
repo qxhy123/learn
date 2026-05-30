@@ -52,6 +52,8 @@ $$|P'Q'|^2 = (\cos(\alpha-\beta)-1)^2+\sin^2(\alpha-\beta) = 2-2\cos(\alpha-\bet
 
 $$\boxed{\cos(\alpha-\beta) = \cos\alpha\cos\beta + \sin\alpha\sin\beta}$$
 
+![单位圆上两点 $P_1(\cos\alpha,\sin\alpha)$、$P_2(\cos\beta,\sin\beta)$，夹角为 $\alpha-\beta$；用两点距离公式 $|P_1P_2|^2=2-2\cos(\alpha-\beta)$ 导出余弦差角公式](../figures/svg/trig-p2-05-1.svg)
+
 用 $-\beta$ 替换 $\beta$（利用 $\cos(-\beta)=\cos\beta$，$\sin(-\beta)=-\sin\beta$）得到和角公式。正弦的和差公式由 $\sin\theta = \cos(\pi/2-\theta)$ 推出。
 
 ### 公式汇总

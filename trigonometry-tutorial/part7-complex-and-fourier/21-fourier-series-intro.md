@@ -116,6 +116,10 @@ $$b_n = \frac{1}{\pi}\int_{-\pi}^{\pi}f(x)\sin nx\,dx = \frac{2}{\pi}\int_0^\pi 
 
 $$f(x) = \frac{4}{\pi}\left(\sin x + \frac{\sin 3x}{3} + \frac{\sin 5x}{5} + \cdots\right)$$
 
+下图把 $N=1,3,5$（取奇次谐波）的部分和曲线与方波叠加，可以看到随着项数增加，部分和逐步逼近方波（间断点附近的过冲即 Gibbs 现象）：
+
+![方波的傅里叶部分和逼近：$N=1,3,5$ 三条部分和曲线与方波叠加，展示逐步逼近](../figures/svg/trig-p7-21-1.svg)
+
 令 $x = \pi/2$：$1 = \frac{4}{\pi}\left(1 - \frac{1}{3} + \frac{1}{5} - \cdots\right)$，即 **Leibniz 公式** $\frac{\pi}{4} = 1 - \frac{1}{3} + \frac{1}{5} - \frac{1}{7} + \cdots$。
 
 ---

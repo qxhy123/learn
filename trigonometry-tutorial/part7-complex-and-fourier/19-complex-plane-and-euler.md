@@ -46,6 +46,8 @@ $$= \underbrace{\left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\rig
 
 $$\boxed{e^{i\theta} = \cos\theta + i\sin\theta}$$
 
+![复平面单位圆上 $e^{i\theta}$ 的位置，辐角 $\theta$，实部 $\cos\theta$ 与虚部 $\sin\theta$ 分别投影到两轴](../figures/svg/trig-p7-19-1.svg)
+
 **特殊值**：令 $\theta = \pi$，得到被称为"最美数学公式"的 **Euler 恒等式**：$e^{i\pi} + 1 = 0$。
 
 ---

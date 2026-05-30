@@ -78,6 +78,8 @@ x\in\left[\frac\pi6+2k\pi,\frac{5\pi}{6}+2k\pi
 ight],\qquad k\in\mathbb Z
 $$
 
+![左图：单位圆上 $\sin x\ge\tfrac12$ 对应位于 $y=\tfrac12$ 上方的弧段（$\tfrac\pi6$ 到 $\tfrac{5\pi}6$）；右图：正弦曲线上 $y\ge\tfrac12$ 的区间阴影，及其在数轴上的解集 $\big[\tfrac\pi6+2k\pi,\tfrac{5\pi}6+2k\pi\big]$](../figures/svg/trig-p4-11-1.svg)
+
 ---
 
 ## 11.3 余弦不等式的图像读法

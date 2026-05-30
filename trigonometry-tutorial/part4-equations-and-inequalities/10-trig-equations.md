@@ -138,6 +138,8 @@ $$
 
 就是正弦曲线与直线 $y=\frac12$ 的交点横坐标。
 
+![左图：单位圆上 $\sin x=\tfrac12$ 的两个终边解 $x=\tfrac\pi6$ 与 $x=\tfrac{5\pi}6$；右图：正弦曲线与水平线 $y=\tfrac12$ 的无穷多交点，对应通解 $x=\tfrac\pi6+2k\pi$ 或 $x=\tfrac{5\pi}6+2k\pi$](../figures/svg/trig-p4-10-1.svg)
+
 这种视角的好处是：
 
 - 解的个数更直观
