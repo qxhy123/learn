@@ -49,14 +49,22 @@ export type Question =
   | JudgeQuestion
   | MatchQuestion
 
-/** 学新知环节的一张讲解卡片（练习前的概念引入）。 */
+/** 学新知环节的一张讲解卡片（练习前的概念引入，可较丰富）。 */
 export interface IntroCard {
-  /** 卡片小标题，如“概念”“关键公式”“看个例子”“易错点” */
+  /** 卡片小标题，如“为什么”“核心概念”“推导”“例题精讲”“易错点”“小结” */
   title?: string
-  /** 讲解正文，可含行内公式 $...$ */
+  /** 讲解正文；用 \n\n 分段，可含行内公式 $...$ 与 **加粗** */
   body: string
   /** 需要重点突出的公式（居中大号显示，写纯 LaTeX，不含 $） */
   formula?: string
+  /** 分步推导 / 例题分步过程（带序号显示），每步可含 $...$ 与 **加粗** */
+  steps?: string[]
+  /** 配图文件名（位于 public/figures/ 下，如 'trig-p1-01-1.svg'） */
+  image?: string
+  /** 配图说明 */
+  imageCaption?: string
+  /** 易错点 / 提示（黄色高亮 callout），可含 $...$ */
+  tip?: string
   /** 互动：先抛出一个小问题，点击“看答案”再揭示，引导思考 */
   reveal?: { q: string; a: string }
 }

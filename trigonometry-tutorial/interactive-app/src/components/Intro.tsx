@@ -52,19 +52,60 @@ export function Intro({ title, color, cards, onStart, onQuit }: Props) {
   )
 }
 
+const FIG_BASE = import.meta.env.BASE_URL + 'figures/'
+
 function IntroCardView({ card, color }: { card: IntroCard; color: string }) {
   const [shown, setShown] = useState(false)
+  const paras = card.body.split(/\n\n+/).filter((s) => s.trim() !== '')
   return (
     <div className="intro-card">
       {card.title && <h3 className="intro-title" style={{ color }}>{card.title}</h3>}
-      <p className="intro-body">
-        <RichText text={card.body} />
-      </p>
+
+      {paras.map((p, i) => (
+        <p className="intro-body" key={i}>
+          <RichText text={p} />
+        </p>
+      ))}
+
+      {card.image && (
+        <figure className="intro-figure">
+          <img src={FIG_BASE + card.image} alt={card.imageCaption ?? ''} loading="lazy" />
+          {card.imageCaption && (
+            <figcaption>
+              <RichText text={card.imageCaption} />
+            </figcaption>
+          )}
+        </figure>
+      )}
+
       {card.formula && (
         <div className="intro-formula" style={{ borderColor: color }}>
           <BlockMath tex={card.formula} />
         </div>
       )}
+
+      {card.steps && card.steps.length > 0 && (
+        <ol className="intro-steps">
+          {card.steps.map((s, i) => (
+            <li key={i}>
+              <span className="step-no" style={{ background: color }}>{i + 1}</span>
+              <span className="step-body">
+                <RichText text={s} />
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {card.tip && (
+        <div className="intro-tip">
+          <span className="tip-icon">💡</span>
+          <span>
+            <RichText text={card.tip} />
+          </span>
+        </div>
+      )}
+
       {card.reveal && (
         <div className="intro-reveal">
           <div className="reveal-q">
