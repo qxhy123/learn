@@ -17,11 +17,27 @@ export function RichText({ text }: { text: string }) {
             dangerouslySetInnerHTML={{ __html: renderInline(p.value) }}
           />
         ) : (
-          <span key={i}>{p.value}</span>
+          <span key={i}>{renderBold(p.value)}</span>
         )
       )}
     </>
   )
+}
+
+/** 把非公式文本里的 **加粗** 渲染为 <strong>。 */
+function renderBold(text: string) {
+  const out: (string | JSX.Element)[] = []
+  const re = /\*\*([^*]+)\*\*/g
+  let last = 0
+  let m: RegExpExecArray | null
+  let k = 0
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index))
+    out.push(<strong key={k++}>{m[1]}</strong>)
+    last = m.index + m[0].length
+  }
+  if (last < text.length) out.push(text.slice(last))
+  return out
 }
 
 function renderInline(tex: string): string {
@@ -33,6 +49,17 @@ function renderInline(tex: string): string {
   } catch {
     return tex
   }
+}
+
+/** 居中大号公式（display 模式），用于学新知卡片的“关键公式”。 */
+export function BlockMath({ tex }: { tex: string }) {
+  let html = tex
+  try {
+    html = katex.renderToString(tex, { throwOnError: false, displayMode: true })
+  } catch {
+    /* keep raw */
+  }
+  return <div className="block-math" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 function splitMath(text: string): { math: boolean; value: string }[] {

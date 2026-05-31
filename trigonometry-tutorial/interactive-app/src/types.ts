@@ -49,11 +49,25 @@ export type Question =
   | JudgeQuestion
   | MatchQuestion
 
+/** 学新知环节的一张讲解卡片（练习前的概念引入）。 */
+export interface IntroCard {
+  /** 卡片小标题，如“概念”“关键公式”“看个例子”“易错点” */
+  title?: string
+  /** 讲解正文，可含行内公式 $...$ */
+  body: string
+  /** 需要重点突出的公式（居中大号显示，写纯 LaTeX，不含 $） */
+  formula?: string
+  /** 互动：先抛出一个小问题，点击“看答案”再揭示，引导思考 */
+  reveal?: { q: string; a: string }
+}
+
 export interface Lesson {
   id: string
   title: string
   /** 一句话副标题 */
   subtitle?: string
+  /** 学新知：练习前的讲解卡片（按顺序翻看） */
+  intro?: IntroCard[]
   questions: Question[]
 }
 

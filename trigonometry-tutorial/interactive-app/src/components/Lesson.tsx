@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react'
 import { UNITS } from '../content/units'
+import { INTROS } from '../content/intros'
 import { useProgress } from '../progress'
 import type { Question } from '../types'
 import { RichText } from './Math'
+import { Intro } from './Intro'
 import { TopBar } from './TopBar'
 import { FeedbackBar } from './FeedbackBar'
 import { LessonComplete } from './LessonComplete'
@@ -21,12 +23,19 @@ interface Props {
 
 export function Lesson({ lessonId, onExit }: Props) {
   const { finishLesson } = useProgress()
-  const lesson = useMemo(
-    () => UNITS.flatMap((u) => u.lessons).find((l) => l.id === lessonId)!,
+  const unit = useMemo(
+    () => UNITS.find((u) => u.lessons.some((l) => l.id === lessonId))!,
     [lessonId]
   )
+  const lesson = useMemo(() => unit.lessons.find((l) => l.id === lessonId)!, [unit, lessonId])
   const questions = lesson.questions
   const total = questions.length
+  const introCards = lesson.intro ?? INTROS[lessonId]
+
+  // 阶段：先“学新知”（若有讲解卡片），再进入练习
+  const [stage, setStage] = useState<'intro' | 'quiz'>(
+    introCards && introCards.length ? 'intro' : 'quiz'
+  )
 
   const [index, setIndex] = useState(0)
   const [hearts, setHearts] = useState(MAX_HEARTS)
@@ -39,6 +48,18 @@ export function Lesson({ lessonId, onExit }: Props) {
   const [done, setDone] = useState<null | { passed: boolean }>(null)
 
   const q = questions[index]
+
+  if (stage === 'intro' && introCards && introCards.length) {
+    return (
+      <Intro
+        title={lesson.title}
+        color={unit.color}
+        cards={introCards}
+        onStart={() => setStage('quiz')}
+        onQuit={onExit}
+      />
+    )
+  }
 
   if (done) {
     const accuracy = Math.round((correctCount / total) * 100)
