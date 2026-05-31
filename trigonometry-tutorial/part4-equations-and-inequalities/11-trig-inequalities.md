@@ -67,18 +67,16 @@ $$
 因此在一个周期内解集为：
 
 $$
-x\in\left[\frac\pi6,\frac{5\pi}{6}
-ight]
+x\in\left[\frac\pi6,\frac{5\pi}{6}\right]
 $$
 
 推广到全体实数：
 
 $$
-x\in\left[\frac\pi6+2k\pi,\frac{5\pi}{6}+2k\pi
-ight],\qquad k\in\mathbb Z
+x\in\left[\frac\pi6+2k\pi,\frac{5\pi}{6}+2k\pi\right],\qquad k\in\mathbb Z
 $$
 
-![左图：单位圆上 $\sin x\ge\tfrac12$ 对应位于 $y=\tfrac12$ 上方的弧段（$\tfrac\pi6$ 到 $\tfrac{5\pi}6$）；右图：正弦曲线上 $y\ge\tfrac12$ 的区间阴影，及其在数轴上的解集 $\big[\tfrac\pi6+2k\pi,\tfrac{5\pi}6+2k\pi\big]$](../figures/svg/trig-p4-11-1.svg)
+![左图：单位圆上 sinx≥1/2 对应位于 y=1/2 上方的弧段（π/6 到 5π/6）；右图：正弦曲线上 y≥1/2 的区间阴影，及其在数轴上的解集](../figures/svg/trig-p4-11-1.svg)
 
 ---
 
@@ -99,8 +97,7 @@ $$
 所以完整解集为：
 
 $$
-x\in \left(\frac\pi2+2k\pi,\frac{3\pi}{2}+2k\pi
-ight)
+x\in \left(\frac\pi2+2k\pi,\frac{3\pi}{2}+2k\pi\right)
 $$
 
 这类题里最常见的错误是：
@@ -135,8 +132,7 @@ $$
 再结合定义区间得到：
 
 $$
-x\in\left(\frac\pi4+k\pi,\frac\pi2+k\pi
-ight)
+x\in\left(\frac\pi4+k\pi,\frac\pi2+k\pi\right)
 $$
 
 这说明正切不等式不能简单照搬正弦余弦的“整周期图像块”思路，而要结合每个单调区间处理。

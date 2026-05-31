@@ -209,15 +209,13 @@ $$
 可以先平方，也可以先写成：
 
 $$
-\sqrt2\sin\left(x+\frac\pi4
-ight)=1
+\sqrt2\sin\left(x+\frac\pi4\right)=1
 $$
 
 于是化为：
 
 $$
-\sin\left(x+\frac\pi4
-ight)=\frac{1}{\sqrt2}=\frac{\sqrt2}{2}
+\sin\left(x+\frac\pi4\right)=\frac{1}{\sqrt2}=\frac{\sqrt2}{2}
 $$
 
 从而得到解集。
@@ -248,8 +246,7 @@ $$
 \tan x=1
 $$
 
-这一步默认了 $\cos x
-e0$。在本题中这没有丢掉解，但在其它题里未必安全。 
+这一步默认了 $\cos x \neq 0$。在本题中这没有丢掉解，但在其它题里未必安全。 
 所以每次除法变形都要明确：分母是否可能为零？
 
 ---

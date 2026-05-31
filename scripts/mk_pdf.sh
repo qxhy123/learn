@@ -103,6 +103,11 @@ PY
 REMAINING=$(grep -c '\.svg)' "$COMBINED" || echo 0)
 echo "→ 剩余 SVG 引用: $REMAINING"
 
+# 让 ★ ☆ 等符号走 CJK 字体（Songti SC 含这些字形，否则会被路由到缺字形的 Times 而丢失）
+cat > "$WORK/symfix.tex" <<'TEX'
+\xeCJKDeclareCharClass{CJK}{"2605, "2606, "25C6, "25CF, "2713, "2714, "2717, "2718, "2260, "2261, "2080 -> "2089, "2070 -> "2079, "00B2, "00B3, "00B9}
+TEX
+
 pandoc -s --toc --toc-depth=2 \
   --pdf-engine=xelatex --from=markdown-yaml_metadata_block-bracketed_spans-link_attributes-fenced_code_attributes-header_attributes \
   -V documentclass=ctexart \
@@ -110,6 +115,7 @@ pandoc -s --toc --toc-depth=2 \
   -V title="$TITLE" \
   -V CJKmainfont="Songti SC" \
   -V mainfont="Times New Roman" \
+  --include-in-header="$WORK/symfix.tex" \
   -o "$OUT_PDF" \
   "$COMBINED" 2>&1 | tail -5
 

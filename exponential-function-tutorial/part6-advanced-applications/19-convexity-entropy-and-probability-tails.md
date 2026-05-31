@@ -495,13 +495,13 @@ $$
 \Pr(X\ge a)\le e^{-ta}e^{t^2/2}=\exp\!\Big(\tfrac{t^2}{2}-ta\Big).
 $$
 
-右端是关于 $t$ 的指数，**对指数内部 $\varphi(t)=\tfrac{t^2}{2}-ta$ 取最小值**：$\varphi'(t)=t-a=0\Rightarrow t^\*=a>0$（落在 $t>0$ 的允许范围内），且 $\varphi''=1>0$ 确为极小。代回 $\varphi(a)=\tfrac{a^2}{2}-a^2=-\tfrac{a^2}{2}$，得
+右端是关于 $t$ 的指数，**对指数内部 $\varphi(t)=\tfrac{t^2}{2}-ta$ 取最小值**：$\varphi'(t)=t-a=0\Rightarrow t^*=a>0$（落在 $t>0$ 的允许范围内），且 $\varphi''=1>0$ 确为极小。代回 $\varphi(a)=\tfrac{a^2}{2}-a^2=-\tfrac{a^2}{2}$，得
 
 $$
 \boxed{\ \Pr(X\ge a)\le e^{-a^2/2}\quad(a>0).\ }
 $$
 
-**点评**：Chernoff 界是“先指数化、再取 $\inf_t$”这一策略的范本。三个关键点：（1）Markov 只对非负量成立，所以先把事件搬进 $e^{tX}$；（2）参数 $t>0$ 是自由的，所以对上界**逐点取下确界**才得最紧结果；（3）这里最优 $t^\*=a$ 恰好把指数压到 $-a^2/2$，给出正态尾的高斯型衰减。若 $t$ 不优化，只能得到更松的界。
+**点评**：Chernoff 界是“先指数化、再取 $\inf_t$”这一策略的范本。三个关键点：（1）Markov 只对非负量成立，所以先把事件搬进 $e^{tX}$；（2）参数 $t>0$ 是自由的，所以对上界**逐点取下确界**才得最紧结果；（3）这里最优 $t^*=a$ 恰好把指数压到 $-a^2/2$，给出正态尾的高斯型衰减。若 $t$ 不优化，只能得到更松的界。
 
 ### 例题精练 5（★★★ 高阶拓展）
 
@@ -555,7 +555,7 @@ $$
 \Pr\!\Big(S_n-\tfrac n2\ge n\varepsilon\Big)\le e^{-t n\varepsilon}\,\mathbb{E}\big[e^{t(S_n-n/2)}\big]\le e^{-tn\varepsilon}\,e^{n t^2/8}=\exp\!\Big(\tfrac{n t^2}{8}-tn\varepsilon\Big).
 $$
 
-对指数内部 $\psi(t)=\tfrac{nt^2}{8}-tn\varepsilon$ 取最小：$\psi'(t)=\tfrac{nt}{4}-n\varepsilon=0\Rightarrow t^\*=4\varepsilon>0$，$\psi''=\tfrac n4>0$ 确为极小。代回：
+对指数内部 $\psi(t)=\tfrac{nt^2}{8}-tn\varepsilon$ 取最小：$\psi'(t)=\tfrac{nt}{4}-n\varepsilon=0\Rightarrow t^*=4\varepsilon>0$，$\psi''=\tfrac n4>0$ 确为极小。代回：
 
 $$
 \psi(4\varepsilon)=\frac{n(4\varepsilon)^2}{8}-4\varepsilon\cdot n\varepsilon=2n\varepsilon^2-4n\varepsilon^2=-2n\varepsilon^2.
@@ -567,7 +567,7 @@ $$
 \boxed{\ \Pr\!\Big(S_n\ge \tfrac n2+n\varepsilon\Big)\le e^{-2n\varepsilon^2}.\ }
 $$
 
-**点评**：这是 Hoeffding 不等式的完整推导，把本章方法全部联用：**独立 ⇒ MGF 相乘（指数把和变积）→ 有界变量的 MGF 上界（凸性 / Hoeffding 引理）→ Chernoff 取 $\inf_t$（最优 $t^\*=4\varepsilon$）→ 高斯型尾界 $e^{-2n\varepsilon^2}$**。结论的意义极强：样本均值偏离真值 $\varepsilon$ 的概率随样本量 $n$ 指数下降，这正是大数定律“为何收敛得这么快”的定量版本，也是 19.5 节“指数尾控制极端事件”的顶点应用。
+**点评**：这是 Hoeffding 不等式的完整推导，把本章方法全部联用：**独立 ⇒ MGF 相乘（指数把和变积）→ 有界变量的 MGF 上界（凸性 / Hoeffding 引理）→ Chernoff 取 $\inf_t$（最优 $t^*=4\varepsilon$）→ 高斯型尾界 $e^{-2n\varepsilon^2}$**。结论的意义极强：样本均值偏离真值 $\varepsilon$ 的概率随样本量 $n$ 指数下降，这正是大数定律“为何收敛得这么快”的定量版本，也是 19.5 节“指数尾控制极端事件”的顶点应用。
 
 ---
 
