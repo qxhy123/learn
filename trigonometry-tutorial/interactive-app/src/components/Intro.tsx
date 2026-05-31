@@ -59,7 +59,11 @@ function IntroCardView({ card, color }: { card: IntroCard; color: string }) {
   const paras = card.body.split(/\n\n+/).filter((s) => s.trim() !== '')
   return (
     <div className="intro-card">
-      {card.title && <h3 className="intro-title" style={{ color }}>{card.title}</h3>}
+      {card.title && (
+        <h3 className="intro-title" style={{ color }}>
+          <RichText text={card.title} />
+        </h3>
+      )}
 
       {paras.map((p, i) => (
         <p className="intro-body" key={i}>
