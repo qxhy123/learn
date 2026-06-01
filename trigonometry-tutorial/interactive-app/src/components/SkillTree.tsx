@@ -1,5 +1,6 @@
 import { UNITS, LESSON_ORDER } from '../content/units'
 import { useProgress } from '../progress'
+import { CONFIG } from '../config'
 import { RichText } from './Math'
 
 interface Props {
@@ -11,6 +12,7 @@ export function SkillTree({ onStart }: Props) {
 
   const isCompleted = (id: string) => Boolean(progress.completed[id])
   const isUnlocked = (id: string) => {
+    if (CONFIG.unlockAll) return true
     const idx = LESSON_ORDER.indexOf(id)
     if (idx <= 0) return true
     return isCompleted(LESSON_ORDER[idx - 1])
