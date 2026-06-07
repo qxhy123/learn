@@ -1,0 +1,107 @@
+[
+  {
+    "id": "u5c15",
+    "title": "向量索引算法",
+    "subtitle": "HNSW / IVF / PQ / DiskANN：在召回率、延迟、内存之间找到最合适的取舍点",
+    "intro": [
+      {
+        "title": "动机：精确搜索不可承受，维度诅咒让树结构失效",
+        "body": "在 768 维、1 亿向量的库上做精确 Top-K 搜索，时间复杂度是 O(N×d)——约 768 亿次浮点运算，在 100 GFLOPS CPU 上需要约 768ms。这在交互式 RAG 场景下完全不可接受，P99 延迟目标通常在 10-100ms。\n\n**维度诅咒（Curse of Dimensionality）**：高维空间中，几乎所有点的两两距离都集中在一个极小区间内，KD-tree 依赖的\"超平面剪枝\"无法有效排除远点。768 维时，KD-tree 搜索的节点比例约为 99%，接近暴力扫描，完全失去意义。\n\n因此，所有主流 ANN 算法都在做同一件事：**用精心设计的数据结构，把大多数不相关向量排除在比较之外，用可控的召回损失（`recall@k` < 1.0）换取可用的延迟。**"
+      },
+      {
+        "title": "三条推导路径：图 / 分区 / 量化",
+        "body": "**图索引路径 → `HNSW`**：为每个向量预先记录最近邻，查询时从入口点沿边贪心跳跃，O(log N) 跳数到达近邻区域。加入层级结构（上层稀疏做全局导航，下层稠密做精细定位）就是 HNSW。\n\n**空间分区路径 → `IVF`**：用 K-Means 聚类把向量空间分成 nlist 个 Voronoi 格，查询时只搜索最近的 nprobe 个格。把比较次数从 N 压缩到 N/nlist × nprobe。\n\n**向量压缩路径 → `PQ`（Product Quantization）**：把 768 维向量拆成 M 个子空间，对每个子空间独立聚类得到 256 个 codebook 条目，用 M 个字节表示一个向量（例如 M=32 时 32 字节，压缩比 96:1）。内存降低使 CPU cache 命中率大幅提升，实际比较速度提高 10 倍以上，代价是量化误差。\n\n**组合** → `IVF-PQ`（粗粒度分区 + 细粒度压缩）是大规模向量库的标准选择；`SQ-HNSW`（int8 标量量化 + 图索引）是内存与精度的折中首选。"
+      },
+      {
+        "title": "HNSW 关键参数与调优",
+        "body": "| 参数 | 含义 | 典型值 | 调大的效果 | 调大的代价 |\n|------|------|--------|-----------|----------|\n| M | 每节点最大连接数（Layer 0） | 16-64 | 召回率提升，图更密 | 内存线性增加 |\n| efConstruction | 构建时候选集大小 | 100-500 | 构建质量更好 | 构建时间线性增加 |\n| ef（efSearch） | **查询时**候选集大小 | 50-1000 | 召回率提升 | 延迟线性增加 |\n\n**调参优先级**：优先调 `ef`（运行时热更新，不影响构建）→ 召回率仍不满足再增大 M（需重建索引）→ efConstruction 通常设为 ef 的 2-4 倍即可。\n\n**HNSW 的更新痛点**：删除通常通过软删除（tombstone）实现，高频更新会导致图结构逐渐退化，召回率随时间下降。监控指标：定期用 golden queries 测 `recall@10`，相比构建时下降 >5% 则考虑触发部分重建。"
+      },
+      {
+        "title": "IVF 详解：聚类 + 倒排",
+        "body": "`IVF`（Inverted File Index）**有训练阶段**：必须先对数据集运行 K-Means，生成 nlist 个聚类中心（centroid），才能构建倒排桶。\n\n**核心参数**：\n- `nlist`：聚类桶数，经验值约 `√N`（N 为向量数），每桶平均向量数也约 `√N`\n- `nprobe`：查询时搜索的桶数；nprobe=32 时召回约 92%，nprobe=128 时约 97%，但延迟提高 4x\n\n**训练集大小要求**：至少 30 × nlist 条向量才能得到稳定的 centroid。\n\n**何时失效**：embedding 模型或数据分布变化时，旧 centroid 失效，必须重新训练 centroid 并重建索引。"
+      },
+      {
+        "title": "PQ 乘积量化与 DiskANN",
+        "body": "**PQ 内存压缩比**（768 维 float32）：\n- M=32 子空间：32 字节/向量，压缩比 96:1\n- M=64 子空间：64 字节/向量，压缩比 48:1\n\n**PQ 也有训练阶段**：codebook 需要预先训练，embedding 模型切换后 codebook 必须重训，否则量化误差急剧增大。\n\n**SQ（Scalar Quantization）**：比 PQ 更简单——对每个维度线性映射到 uint8（int8）。压缩比 4:1，精度损失极小（<1%），是 HNSW 内存优化的首选：`SQ-HNSW int8` 在 100M 768d 场景下，内存从 307GB（float32）降到约 80GB，同时 SIMD 计算加速使 QPS 反而更高。\n\n**DiskANN**：超过内存容量时的答案。内存只存 PQ 压缩向量（用于初步候选过滤），精确向量存在 NVMe SSD 上，每次查询约 20-40 次 SSD 随机读。100M 768d 场景：内存 ~3.2GB，P99 约 5-20ms，`recall@10` ~95%。**必须使用 NVMe SSD**，SATA SSD 上 P99 可能超过 100ms。"
+      },
+      {
+        "title": "三维权衡矩阵：在约束集合内找合适的取舍点",
+        "body": "100M 768d 场景下三种方案对比（口径注意：HNSW 若保留 float32 原始向量，307GB 已超过 256GB 服务器）：\n\n| 索引 | 召回率 | 内存需求 | P99 延迟 | QPS（32核）| 最适场景 |\n|------|--------|---------|---------|----------|----------|\n| HNSW float32 | ~97% | >307GB（原始向量）| ~8ms | ~800 | 内存充足、延迟极敏感 |\n| SQ-HNSW int8 | ~96% | ~80GB（4x压缩）| ~6ms | ~1500 | 256GB 服务器的首选折中 |\n| IVF-PQ | ~91% | ~3.5GB | ~6ms | ~2500 | 内存极度受限、高 QPS |\n| DiskANN | ~95% | ~3.2GB（RAM）| ~15ms | ~400 | 内存极小、NVMe SSD 可用 |\n\n**调参方向**：\n- 提高召回率（不重建）：增大 ef（HNSW）或 nprobe（IVF），延迟线性上升\n- 降低内存（需重建）：切换到 IVF-PQ 或 SQ 量化\n- 提高召回率上限（需重建）：增大 M（HNSW）或 nlist（IVF）",
+        "tip": "`SQ-HNSW int8` 是 100M-1B 规模、内存有限场景下最好的折中：4x 内存压缩，召回损失 <1%，SIMD 加速使 QPS 比 float32 HNSW 更高，不需要 NVMe SSD。"
+      },
+      {
+        "title": "Filter 策略与索引重建边界",
+        "body": "**Filter 与 ANN 的配合**：\n- `Pre-filter`（先过滤后 ANN）：适合过滤选择率 >10%；高选择性（<1% 候选）时召回可能不足\n- `Post-filter`（先 ANN 后过滤）：适合低选择性；高选择性时过滤后有效结果远少于 topK\n- `Native filter`（向量库原生支持）：Qdrant 的 payload index + HNSW 结合最成熟\n\n**必须全量重建的触发条件**：\n- Embedding 模型版本变更\n- 距离度量变更\n- Chunk 规则变更（文档边界改变）\n- IVF centroid 训练集分布大幅偏移\n- 大规模软删除（tombstone 累积）\n\n**双索引蓝绿切换**：后台构建新索引 → golden queries（≥100 条）回归验证 recall@K / P99 / ACL 过滤准确率 → 按流量比例灰度（5%→20%→50%→100%）→ 保留旧索引 24-72 小时备用回滚。",
+        "reveal": {
+          "q": "为什么 IVF 索引的召回率上限由聚类质量决定，而不是 nprobe 参数决定？",
+          "a": "IVF 的召回上限取决于真正最近邻的向量是否落在 query 最近的 nprobe 个聚类桶里。如果 nlist 太小（每桶平均向量数过多），桶内向量很分散，即使搜索全部 nlist 个桶也会有漏召。如果 nlist 太大（每桶平均 <50 向量），K-Means 聚类质量差，centroid 不稳定，向量分配不准确。因此，召回率上限由聚类质量决定，nprobe 只能在这个上限内调整召回率与延迟的权衡。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "HNSW 的三个参数 M、efConstruction、ef（efSearch）中，哪个是查询时热更新、不需要重建索引的运行时参数？",
+        "options": ["M", "efConstruction", "ef（efSearch）", "三个都需要重建"],
+        "answer": 2,
+        "explain": "ef（efSearch）是查询时的动态候选集大小，可以热更新而无需重建索引。M 决定图连接数、efConstruction 决定构建质量，两者都需要重建索引。调大 ef 会提高召回率，但延迟线性增加。"
+      },
+      {
+        "type": "judge",
+        "prompt": "KD-tree 在 768 维向量空间中的搜索效率接近 O(log N)，比暴力搜索快得多。",
+        "answer": false,
+        "explain": "维度诅咒使 KD-tree 在高维空间（维度 >20-30）退化到接近线性扫描。768 维时，KD-tree 需要搜索约 99% 的节点，几乎等于暴力搜索，完全失去意义。高维 ANN 必须使用图索引（HNSW）或分区索引（IVF）等不依赖超平面剪枝的方法。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PQ（乘积量化）中，768 维 float32 向量采用 M=32 子空间时，每个向量压缩后的大小是？",
+        "options": ["32 字节（压缩比 96:1）", "96 字节（压缩比 32:1）", "3072 字节（未压缩）", "256 字节（压缩比 12:1）"],
+        "answer": 0,
+        "explain": "PQ 用 M 个字节表示一个向量（每子空间 256 个 codebook 条目 = 1 字节）。M=32 时，每向量 32 字节。原始 768 维 float32 = 768×4 = 3072 字节，压缩比 3072/32 = 96:1。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 ANN 索引与其最适合的场景匹配：",
+        "left": ["HNSW float32", "SQ-HNSW int8", "IVF-PQ", "DiskANN"],
+        "right": ["内存极度受限（3.5GB）、高 QPS、可接受 91% 召回", "超大规模向量库、内存受限但有 NVMe SSD", "256GB RAM 服务器、延迟敏感、召回 96%、4x 内存节省", "内存充足（>307GB）、延迟极敏感、要求 97% 召回"],
+        "explain": "HNSW float32 需要原始向量全量保留在内存中（307GB+），适合内存充足场景；SQ-HNSW int8 压缩 4x 到约 80GB，是内存受限时的首选；IVF-PQ 内存仅 3.5GB，高 QPS；DiskANN 内存只存 PQ 码，精确向量存 NVMe SSD。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在多租户 RAG 系统中，租户 B 只有 500 个文档，而全局索引有 100 万向量，使用 Post-filter 策略会出现什么问题？",
+        "options": [
+          "过滤 B 租户文档后，ANN 搜索的准确率会提高",
+          "ANN 搜索 top-20 后，过滤掉 99.95% 的结果，实际有效候选可能远少于所需的 topK",
+          "Post-filter 会导致 B 租户看到其他租户的文档",
+          "Post-filter 在小租户场景下延迟会更低"
+        ],
+        "answer": 1,
+        "explain": "B 租户只有 500 文档，占总 100 万的 0.05%。Post-filter 先做 ANN 搜索取 top-20，然后过滤，概率上这 20 个结果几乎全是其他租户的文档，过滤后有效结果可能为 0。高选择性过滤场景应使用 Pre-filter 或为每个租户建立独立的 collection/index。"
+      },
+      {
+        "type": "judge",
+        "prompt": "DiskANN 在 SATA SSD（随机读 IOPS 约 100k）上的查询 P99 延迟与 NVMe SSD（约 500k IOPS）相差不大，都可以满足交互式 RAG 的延迟要求。",
+        "answer": false,
+        "explain": "DiskANN 每次查询需要约 20-40 次 SSD 随机读。NVMe SSD（500k IOPS）下 P99 约 5-20ms，可接受；SATA SSD（100k IOPS）下延迟是 NVMe 的 5 倍左右，P99 可能达到 100ms 以上，对交互式 RAG 完全不可用。生产部署 DiskANN 必须使用 NVMe SSD。"
+      },
+      {
+        "type": "input",
+        "prompt": "描述 IVF 索引中，控制召回率与查询延迟权衡的核心运行时参数名称（填写参数的英文名）",
+        "accept": ["nprobe", "n_probe"],
+        "explain": "nprobe 是 IVF 查询时搜索的聚类桶数。增大 nprobe 会搜索更多的桶，召回率提升，但延迟也随之线性增加。nprobe=8 时召回约 80%，nprobe=128 时召回约 97%，但延迟增加 16 倍。这是不需要重建索引的运行时参数。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种情况需要全量重建向量索引（而不是增量更新）？",
+        "options": [
+          "新增了 0.5% 的文档（相对于总量）",
+          "对部分文档的 ACL 元数据字段进行了更新",
+          "更换了距离度量从 cosine 到 inner product",
+          "调整了 HNSW 的 ef（efSearch）参数"
+        ],
+        "answer": 2,
+        "explain": "距离度量变更意味着索引内部的排序含义完全改变，旧索引在新度量下无效，必须全量重建。新增少量文档可增量写入；ACL 元数据更新只需更新 metadata 字段，不改变向量语义；ef 是运行时参数，不影响索引结构。"
+      }
+    ]
+  }
+]

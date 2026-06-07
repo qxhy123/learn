@@ -1,0 +1,131 @@
+[
+  {
+    "id": "u1c18",
+    "title": "存储语义：fsync、Direct IO 与 Checkpoint 协议",
+    "subtitle": "从 write() 到稳定存储：AI 训练的安全发布状态机",
+    "intro": [
+      {
+        "title": "write() 成功意味着什么",
+        "body": "`write(fd, buf, len)` 返回成功，**最小含义**是内核接受了字节进入 Page Cache，相关页被标记 dirty。\n\n它**不**表示：\n- 数据已写到 SSD/HDD\n- 设备的易失 write cache 已 flush\n- checkpoint 可以安全恢复\n\n`write()` 还可能**短写**（返回值小于请求长度），网络文件系统、配额、ENOSPC、信号中断都可能导致。可靠写入必须循环直到全部写完，并检查错误。\n\n`close()` 也可能返回错误——之前的 writeback 失败可能延迟到 `close()` 或 `fsync()` 才暴露。**忽略 close 错误会把坏 checkpoint 标记为成功。**",
+        "tip": "write 返回快 = Page Cache 吸收了脏页。checkpoint 质量不看文件名是否出现，而看 crash 后 reader 会看到什么状态。"
+      },
+      {
+        "title": "fsync / fdatasync / syncfs 的语义边界",
+        "body": "| 调用 | 能保证什么 | 不能保证什么 |\n|---|---|---|\n| `write()` | 内核接受了字节 | 字节已持久化 |\n| `fsync(file)` | 文件内容 + 恢复所需元数据已持久化 | 父目录项一定持久化 |\n| `fdatasync(file)` | 文件数据 + 必要元数据（含 size 变化）已持久化 | 所有元数据（如 mtime）都持久化 |\n| `close()` | fd 被释放，可能报告延迟错误 | 自动完成正确发布协议 |\n| `syncfs(fd)` | 文件系统级同步请求 | 单文件原子发布 |\n\n`fdatasync` 和 `fsync` 的实际差异：对 append-only 日志或固定大小覆盖写，`fdatasync` 可以跳过 mtime/atime 更新，少一次 journal commit。但只要文件大小或 block mapping 变化，`fdatasync` 仍必须同步这些元数据。"
+      },
+      {
+        "title": "rename 的原子性与限制",
+        "body": "**POSIX 保证**：`rename(old, new)` 在同一挂载的同一文件系统内是**命名原子操作**——reader 要么看到旧名字，要么看到新名字，不会看到半个目录项。若 new 已存在，替换也是原子的。\n\n**两个关键限制**：\n1. `rename` 的原子性 ≠ 已持久化。Crash 后磁盘上目录项是否保留了 rename 结果，必须 `fsync(parent_dir)` 才有保证\n2. 跨文件系统 `rename` 失败为 `EXDEV`，退化成 copy + unlink，不再是原子操作\n\n**对象存储（S3 等）没有原子 rename**，通常是 copy + delete，中间有窗口，见 0c4。\n\n`renameat2()` 额外选项：\n- `RENAME_NOREPLACE`：目标存在则失败，避免无意覆盖\n- `RENAME_EXCHANGE`：原子交换两个名字，可实现\"上线新版本同时把旧版本挪到 .prev\"",
+        "tip": "rename 原子性保证的是可见性切换，不保证新文件内容已落盘，也不保证目录项在 crash 后持久化。"
+      },
+      {
+        "title": "父目录 fsync：最常被遗忘的步骤",
+        "body": "创建文件、unlink、rename 都会改变**父目录**的目录项。`fsync(file)` 只关注文件内容和该文件自身元数据，**不保证**父目录的命名更新持久化。\n\n**安全发布模板**：\n```\nopen tmp_file\nwrite all bytes（循环，处理短写）\nfsync(tmp_fd)          # 文件内容持久化\nclose(tmp_fd)          # 检查返回值！\nrename(tmp, final)\nopen parent_dir\nfsync(parent_dir)      # 目录项更新持久化\nclose(parent_dir)\n```\n\n**文件系统差异**：\n- ext4（data=ordered）：`fsync(file)` 通常顺带持久化父目录项——这是实现细节，不是协议保证\n- XFS：`fsync(file)` 只关心文件自身，目录项需显式 `fsync(parent_dir)`\n- 网络文件系统：目录 fsync 语义高度依赖客户端实现，常见 \"返回成功但实际没同步\"\n\n可移植协议**永远显式 fsync 父目录**，不依赖任何 FS 的隐式同步。",
+        "tip": "把 'rename 是原子的' 和 'rename 后不用 fsync 目录' 混为一谈，是训练系统最常见的 checkpoint 安全漏洞。"
+      },
+      {
+        "title": "标准 checkpoint 发布协议与 crash matrix",
+        "body": "**单文件安全协议**（7 步）：\n1. 写临时文件 `model.safetensors.tmp.<pid>`\n2. 处理所有短写和错误\n3. `fsync(tmp_fd)`\n4. `close(tmp_fd)` 并检查返回值\n5. `rename(tmp, final)`\n6. `fsync(parent_dir)`\n7. 更新 manifest/latest 指针：重复 temp + fsync + rename + dir fsync\n\n**Crash matrix（reader 应只相信 manifest）**：\n\n| 失败点 | 目录里可能有什么 | Reader 如何处理 |\n|---|---|---|\n| 写 tmp 中 | 残缺 .tmp 文件 | 忽略 .tmp，后台清理 |\n| fsync(tmp) 后、rename 前 | 完整 tmp，未发布 | 忽略 tmp |\n| rename 后、dir fsync 前 | final 可能可见，crash 后可能回退 | 只相信 manifest |\n| manifest rename + dir fsync 后 | latest.json 指向完整文件集 | 按 manifest 校验后读取 |\n\n**关键原则**：reader 不扫描\"看起来像 checkpoint 的目录\"，只读已发布且通过校验的 manifest。",
+        "tip": "多 rank checkpoint 推荐先各自 fsync 各自的 shard，再由 rank0 写 metadata.json，最后 rename 临时目录并发布 latest.json。"
+      },
+      {
+        "title": "O_DIRECT、O_SYNC、io_uring 对语义的影响",
+        "body": "**O_DIRECT**：绕过 Page Cache，减少内存复制和 cache 污染，适合大 checkpoint 写入。但：\n- 不自动提供持久化保证，写完仍需 `fsync()`\n- buffer 地址、长度、offset 必须对齐（ext4/XFS 不对齐返回 `EINVAL`，不会自动退化）\n- 混用 buffered IO 和 Direct IO 访问同一文件会引入一致性复杂度\n\n**O_SYNC / O_DSYNC**：每次 write 等待数据/元数据同步完成。小 tensor 逐次同步会极慢；推荐批量写完后一次 `fsync()`。\n\n**io_uring**：改变提交和完成模型（SQE → CQE），减少系统调用次数，但**不改变持久化语义**。\n- 需要 durable publish，仍要提交 fsync SQE，在 fsync CQE 成功后才能 rename 或发布 manifest\n- `IOSQE_IO_LINK` 把 write SQE 和 fsync SQE 链接，保证 fsync 在 write 完成后执行，比应用等 CQE 再提交少一轮 round-trip\n- CQE error 必须进入失败路径，不能只统计成功吞吐"
+      },
+      {
+        "title": "设备 cache、FUA、PLP 与 crash 演练",
+        "body": "**NVMe 持久化原语**：\n- **FLUSH 命令**：把设备 volatile write cache 推到 NAND，耗时几百微秒到几毫秒\n- **FUA**（Force Unit Access）：单条写命令直接落 NAND，不进 cache\n\nLinux 文件系统 fsync 路径默认走 FLUSH（除非关掉 barrier）。**关掉 barrier/flush 换 benchmark 数字 = 把 crash 恢复能力换成漂亮数字，生产绝对不要。**\n\n**PLP（掉电保护电容）是关键差异**：\n- 有 PLP（数据中心 SSD）：volatile cache 掉电由电容保证写完，FLUSH 几乎是 no-op，fsync 延迟极低（几十微秒）\n- 无 PLP（消费级 SSD）：FLUSH 真的推 NAND，延迟几毫秒\n\n**fsync p50 参考（合理性校验）**：\n- 数据中心 NVMe + PLP 写 1GB：5~30 ms\n- 消费级 NVMe 无 PLP 写 1GB：50~200 ms\n- AWS EBS gp3 写 1GB：100~500 ms\n\n**crash 演练必须包括\"硬掉电\"**（拉电源/虚机 instance kill），不能只测 `kill -9`——kill -9 不暴露设备 cache 问题。",
+        "reveal": {
+          "q": "为什么 rename 是原子的，但 checkpoint 发布后仍然需要 fsync(parent_dir)？",
+          "a": "rename 的原子性是指从其他进程的内存视图看，目录项切换是瞬间完成的，不会看到中间状态。但这只是内存中的 VFS 状态，并不保证磁盘上的目录项已经持久化。如果在 rename 后、fsync(parent_dir) 前发生掉电，磁盘上的目录项可能还是旧状态（rename 结果丢失），reader 就看不到新文件。fsync(parent_dir) 是把目录项的更新推到稳定存储的必要步骤。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "在 checkpoint 写入流程中，`rename(tmp, final)` 之后还需要做什么才能保证目录项在 crash 后持久化？",
+        "options": [
+          "不需要额外操作，POSIX rename 已保证持久化",
+          "调用 syncfs() 同步整个文件系统",
+          "打开父目录并调用 fsync(parent_dir)",
+          "对 final 文件再调用一次 fsync()"
+        ],
+        "answer": 2,
+        "explain": "rename 的原子性只保证从其他进程的内存视角切换是原子的，不保证磁盘上目录项已持久化。crash 后目录项是否保留了 rename 结果，必须通过 fsync(parent_dir) 明确持久化目录项更新。syncfs 代价太大且语义不精确。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`write()` 系统调用返回成功，说明数据已写到 NVMe 稳定存储中。",
+        "answer": false,
+        "explain": "write() 对 buffered IO 只把用户数据复制进 Page Cache 并标记为 dirty，然后就返回了。数据落到稳定存储需要后台 writeback 加上设备 FLUSH，或者显式调用 fsync()/fdatasync()。write 返回快通常只是 Page Cache 吸收了脏页。"
+      },
+      {
+        "type": "choice",
+        "prompt": "相比 `fsync()`，`fdatasync()` 跳过哪类元数据同步？",
+        "options": [
+          "文件大小（size）的更新",
+          "block mapping（extent 分配）的更新",
+          "atime/mtime 等纯时间戳更新（在文件内容未变时）",
+          "目录项的更新"
+        ],
+        "answer": 2,
+        "explain": "fdatasync 只同步恢复文件数据所必需的元数据。纯时间戳更新（如 atime/mtime）不影响数据可达性，fdatasync 可以跳过。但 size 变化（append/truncate）和 block mapping 变化（新 extent 分配）必须同步，否则 crash 后数据不可达。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 checkpoint 协议步骤与其对应的目的匹配：",
+        "left": ["写临时文件而非直接写目标路径", "fsync(tmp_fd)", "rename(tmp, final)", "fsync(parent_dir)"],
+        "right": [
+          "持久化目录项的命名切换，防止 crash 后 rename 结果丢失",
+          "防止 reader 看到写入中的半成品文件",
+          "把文件内容推到稳定存储，防止 crash 后数据丢失",
+          "原子切换可见名字，reader 要么看旧要么看新"
+        ],
+        "explain": "写临时文件防止读到半成品；fsync(tmp) 持久化内容；rename 原子切换名字；fsync(parent_dir) 持久化目录项更新。四步缺一不可，共同构成安全发布协议。"
+      },
+      {
+        "type": "judge",
+        "prompt": "使用 `O_DIRECT` 写入的文件，写操作完成后数据已经落到稳定存储，不需要额外的 fsync()。",
+        "answer": false,
+        "explain": "O_DIRECT 绕过 Page Cache，让数据直接在用户 buffer 和设备之间传输。但设备本身可能有 volatile write cache，数据可能还在设备 cache 中。O_DIRECT 不自动触发 FLUSH，如果没有 fsync() 或 FUA 标志，仍然不能保证数据落到稳定存储（NAND）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "有 PLP（掉电保护电容）的数据中心 NVMe 和没有 PLP 的消费级 NVMe，在 fsync 延迟上主要差异来自哪里？",
+        "options": [
+          "数据中心 NVMe 顺序写带宽更高，所以 fsync 更快",
+          "有 PLP 的盘 FLUSH 几乎是 no-op（电容保证掉电时写完），消费级必须真的推 NAND",
+          "数据中心 NVMe 使用更快的 NAND 颗粒类型",
+          "有 PLP 的盘禁用了 write cache，数据直写 NAND 所以更快"
+        ],
+        "answer": 1,
+        "explain": "有 PLP 的盘可以放心保留 volatile write cache 来提速，因为掉电时电容会保证 cache 数据写完。FLUSH 命令在这种情况下几乎是 no-op，fsync 延迟极低（几十微秒）。无 PLP 的消费级 SSD 执行 FLUSH 必须真的把 cache 推到 NAND，可能需要几毫秒。"
+      },
+      {
+        "type": "input",
+        "prompt": "使用 io_uring 时，要让 fsync 操作在 write 操作完成之后才执行，应使用哪个 SQE 标志把它们链接起来？（写出标志名称）",
+        "accept": ["IOSQE_IO_LINK"],
+        "explain": "IOSQE_IO_LINK 标志把一个 SQE 链接到下一个，内核保证链中前一个操作完成后才执行下一个。用来链接 write SQE 和 fsync SQE，可以保证 fsync 在 write 完成后执行，同时比应用等 CQE 再提交 fsync 减少一轮 round-trip。"
+      },
+      {
+        "type": "judge",
+        "prompt": "crash 演练只需要测试 `kill -9` 进程，不需要做硬掉电测试，因为两者对文件系统的影响相同。",
+        "answer": false,
+        "explain": "kill -9 终止进程，但操作系统内核和设备仍在运行，设备 write cache 可以正常 flush。硬掉电（拉电源、虚机 instance kill）会让设备 volatile write cache 里的数据有丢失风险（无 PLP 时）。只测 kill -9 无法暴露设备 cache 问题，必须包括硬掉电场景。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种情况最适合使用 `O_DSYNC` 而非 buffered write + 最后一次 fsync？",
+        "options": [
+          "一次写入 50GB 大型 checkpoint 文件",
+          "顺序读取 dataset tar shard",
+          "写入追加型事务日志，每条记录需要立即持久化",
+          "多 rank 并行写入不同 shard 文件"
+        ],
+        "answer": 2,
+        "explain": "O_DSYNC 让每次 write 完成后等待数据同步，适合每条记录需要立即持久化的场景（如事务日志）。大 checkpoint 由许多小 tensor 写组成，逐次同步会极慢；推荐批量写完后一次 fsync()。dataset 读取完全不需要写同步语义。"
+      }
+    ]
+  }
+]

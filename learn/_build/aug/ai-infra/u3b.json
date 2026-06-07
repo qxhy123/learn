@@ -1,0 +1,647 @@
+{
+  "u3-l9": [
+    {
+      "type": "choice",
+      "prompt": "GPUDirect RDMA 相对于普通 RDMA 的额外价值是什么？",
+      "options": [
+        "允许 CPU 直接写入远端 GPU 寄存器",
+        "让 NIC 直接访问 GPU HBM，避免先把数据拷到 host DRAM",
+        "提供比 InfiniBand 更低的链路延迟",
+        "让多个 NCCL collective 并发执行"
+      ],
+      "answer": 1,
+      "explain": "普通 RDMA 绕过 CPU 内核协议栈但仍在 host DRAM 中转；GPUDirect RDMA 进一步让 NIC 直接读写 GPU HBM，省去 GPU→host→NIC 的额外一跳，对 GPU 间大块数据传输收益明显。"
+    },
+    {
+      "type": "judge",
+      "prompt": "训练集群采用 RoCE v2 时，只要物理链路带宽足够，不需要专门配置 PFC/ECN/QoS 就能保证稳定的 NCCL collective 性能。",
+      "answer": false,
+      "explain": "RoCE v2 在以太网上承载 RDMA，以太网天然有丢包；RDMA 对丢包极为敏感，丢包会触发 go-back-N 重传，导致严重性能抖动。必须配置 lossless 网络（PFC 防止拥塞丢包，ECN+DCQCN 做拥塞控制，QoS 隔离训练流量）才能稳定运行。"
+    },
+    {
+      "type": "input",
+      "prompt": "256 卡 ring AllReduce，梯度 tensor 大小 4 GB，集群聚合有效带宽 400 GB/s。理论传输时间下限约为多少毫秒？（ring AllReduce 传输量 = 2(N-1)/N × data，N 很大时约等于 2× data；只算带宽，结果取整）",
+      "accept": ["20", "20ms", "20 ms"],
+      "explain": "ring AllReduce 传输量 ≈ 2 × 4 GB = 8 GB；时间 ≈ 8 GB / 400 GB/s = 0.02 s = 20 ms。这是纯带宽下限，实际因延迟、协议开销会更高。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 NCCL collective 操作与其典型训练用途对应：",
+      "left": ["AllReduce", "ReduceScatter", "AllGather", "Send/Recv"],
+      "right": ["FSDP/ZeRO 参数重建，每个 rank 收齐全量参数", "DDP 梯度同步，所有 rank 拿到相同的聚合梯度", "ZeRO/FSDP 梯度分片，每 rank 只保留一片", "Pipeline Parallel 相邻 stage 传 microbatch activation"],
+      "explain": "AllReduce→DDP 梯度同步；ReduceScatter→ZeRO 梯度分片；AllGather→参数重建；Send/Recv→PP stage 间点对点传 activation。"
+    },
+    {
+      "type": "choice",
+      "prompt": "rail-optimized 拓扑中「所有节点 NIC0 进 rail0」的核心好处是什么？",
+      "options": [
+        "消除跨 spine 的 oversubscription",
+        "让 NCCL 多 rail 并行更可控，GPU-NIC 对齐关系清晰，减少跨 rail 拥塞",
+        "允许单 rail 承载任意 collective，其他 rail 冗余备份",
+        "自动平衡 InfiniBand 和 RoCE 两种协议的流量"
+      ],
+      "answer": 1,
+      "explain": "rail-optimized 的价值在于：NCCL 能感知到哪些 rank 共享哪条 rail，将 intra-rail 流量和 inter-rail 流量分离，实现更可预测的多 rail 并行。GPU-NIC 对齐清晰也有助于诊断性能问题。"
+    },
+    {
+      "type": "judge",
+      "prompt": "训练任务中，「所有 rank 在 ncclAllReduce 处同步变慢」与「少数 rank 比其他 rank 慢」两类现象的根因通常是相同的。",
+      "answer": false,
+      "explain": "「所有 rank 同步变慢」通常指向全局事件：共享 spine 拥塞、checkpoint 风暴、集群级别网络事件；「少数 rank 变慢」则指向单点问题：某节点 NIC 异常、坏线、GPU-NIC locality 错配、PCIe 降级。两类根因指向不同的排查路径。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DragonFly+ 拓扑中，多个大作业被分散到不同 group 时会出现什么问题？",
+      "options": [
+        "group 内 NVLink 带宽不足",
+        "作业之间争抢稀缺的 global links，导致跨 group 通信带宽下降且相互影响",
+        "NCCL 无法感知 DragonFly+ 拓扑，自动退回到 ring 算法",
+        "节点内 NVSwitch fabric 会被 group 间流量占用"
+      ],
+      "answer": 1,
+      "explain": "DragonFly+ 的 global links（group 间链路）是稀缺资源，数量有限。多个作业同时跨 group 通信时，global links 成为竞争瓶颈，导致带宽下降和抖动。最佳实践是让单个大作业尽量留在同一 group。"
+    },
+    {
+      "type": "input",
+      "prompt": "pre-flight 检查中，验证单条 RDMA rail 是否达到健康基线的命令叫什么？（只写命令名，不带参数）",
+      "accept": ["ib_write_bw", "ib_read_bw", "ibv_rc_pingpong"],
+      "explain": "`ib_write_bw` 是 perftest 套件中常用的单 rail RDMA 带宽基准工具，可以逐条 rail 单独测量，判断是否达到 baseline 的 85%。`ib_read_bw` 同属该套件，也是常见答案。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练时 NCCL timeout 频率升高，但 `ping` 和 `iperf3` 都显示节点间网络正常。下一步最有价值的排查动作是？",
+      "options": [
+        "立即重启所有训练 rank",
+        "把 NCCL timeout 时长加倍",
+        "查看 NCCL 日志中实际选择的 HCA 和 rail，并检查交换机端口错误计数器",
+        "换用 TCP 模式重跑训练确认是 RDMA 问题"
+      ],
+      "answer": 2,
+      "explain": "ping/iperf3 走的是控制面或 TCP，无法反映 RDMA 数据面状态。NCCL timeout 多数时候是症状而非根因：应先检查 NCCL 是否选用了预期的 HCA 和 rail，再查交换机端口错误计数（FEC、symbol error、CRC），定位慢路径或坏端口。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 Fat-tree 集群中，oversubscription 比率从 1:1 升到 3:1，对大规模训练最主要的影响是什么？",
+      "options": [
+        "节点内 NVLink 带宽减半",
+        "多个大作业跨 pod 通信时会共享上联带宽，相互影响，集合通信尾延迟上升",
+        "NCCL 切换为更慢的 tree 算法",
+        "GPU 的 HBM 带宽被网络流量占用"
+      ],
+      "answer": 1,
+      "explain": "oversubscription 意味着 spine 层带宽小于 leaf 层聚合带宽。多个大作业同时跨 pod 时，上联链路成为共享瓶颈，collective 尾延迟升高，严重时一个作业的 checkpoint 风暴会拖慢其他作业的 AllReduce。"
+    }
+  ],
+  "u3-l10": [
+    {
+      "type": "choice",
+      "prompt": "一个完整的可恢复训练 checkpoint 中，以下哪项通常是体积最大的组成部分？",
+      "options": [
+        "代码 git sha 和配置文件",
+        "DataLoader/sampler 的 global step 和 shuffle seed",
+        "优化器状态（Adam 的动量 m 和方差 v）",
+        "RNG 状态"
+      ],
+      "answer": 2,
+      "explain": "以 BF16 Adam 训练为例，模型权重占 2 bytes/param，而 Adam 的 m 和 v 各占 4 bytes/param（通常以 FP32 存储），两者合计 8 bytes/param，是权重的 4 倍。对于大模型，优化器状态通常是 checkpoint 中占比最大的部分。"
+    },
+    {
+      "type": "judge",
+      "prompt": "checkpoint 原子提交协议中，判断一个 checkpoint 是否完整的依据应该是「对应目录是否存在」。",
+      "answer": false,
+      "explain": "目录存在只说明写入曾经开始，不说明写入是否完整。正确做法是以 manifest.json 的原子 rename 作为提交点：只有 manifest 存在且所有 shard 通过校验，才视为完整 checkpoint；未完成的目录一律视为无效。"
+    },
+    {
+      "type": "input",
+      "prompt": "DataLoader 元数据风暴中，把每个样本单独一文件改为「打包成 shard」，最常用的两种打包格式是什么？（任写其中一种即可）",
+      "accept": ["WebDataset", "TFRecord", "Arrow", "tar", "Parquet"],
+      "explain": "常见 shard 格式：WebDataset（tar 打包）、TFRecord（TensorFlow 生态）、Arrow/Parquet（表格数据）。它们都能把大量小文件合成大文件，降低 MDS/MDT 元数据压力，提升顺序读吞吐。"
+    },
+    {
+      "type": "match",
+      "prompt": "将存储层角色与典型问题症状对应：",
+      "left": ["热层（并行文件系统）元数据节点高负载", "缓存层（本地 NVMe）冷启动", "冷层（对象存储）做训练热层", "checkpoint staging 缺少原子提交"],
+      "right": ["恢复时读到写了一半的 shard，训练崩溃", "大量 worker 并发 stat/open 小文件，GPU 利用率锯齿", "首次训练前缓存为空，前几步数据加载极慢", "大量并发随机 open 导致吞吐极低且抖动严重"],
+      "explain": "MDS 高负载→小文件元数据风暴；NVMe 冷启动→缓存未预热；对象存储做热层→不适合高并发随机访问；缺少原子提交→读到半成品 checkpoint。"
+    },
+    {
+      "type": "choice",
+      "prompt": "Checkpoint storm 削峰最根本的思路是什么？",
+      "options": [
+        "增大 checkpoint 周期，减少保存频率",
+        "让不同 rank group 或不同作业在时间上错峰，避免并发写入同时到达文件系统",
+        "改用对象存储替代并行文件系统，对象存储天然支持高并发写",
+        "用更快的 NVMe SSD 替代机械硬盘"
+      ],
+      "answer": 1,
+      "explain": "checkpoint storm 的本质是大量并发写入在同一时刻涌入文件系统。削峰的根本思路是时间错峰：分组写入、随机化各作业的 checkpoint 时间偏移、或者限速——让写入压力在时间轴上展开，而不是同时到达。"
+    },
+    {
+      "type": "judge",
+      "prompt": "并行文件系统 Lustre 非常适合被上千 DataLoader worker 并发随机 stat/open 小文件，因为它专为 HPC 大规模并发设计。",
+      "answer": false,
+      "explain": "Lustre 的强项是大文件顺序吞吐和条带化并发写；但 MDT（Metadata Target）在面对海量小文件并发 stat/open/create 时容易成为瓶颈，CPU 打满、目录风暴是常见问题。解决方案是打包数据集，减少元数据操作。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练任务在 IO 诊断中发现「每 N step 周期性掉速，掉速期间 iostat await 出现尖刺」，与此最吻合的根因是？",
+      "options": [
+        "DataLoader 队列为空，worker CPU 不足",
+        "GPU kernel launch 开销过高",
+        "checkpoint 写入阻塞，manifest rename 或 shard flush 引起文件系统峰值",
+        "allocator fragmentation 导致 OOM"
+      ],
+      "answer": 2,
+      "explain": "周期性掉速且 iostat await 同步尖刺，是 checkpoint 写入风暴的典型特征：checkpoint 以固定步数间隔触发，大批 shard 同时写入，文件系统 IO 等待飙升，GPU 空等 checkpoint 完成。"
+    },
+    {
+      "type": "input",
+      "prompt": "训练 checkpoint 策略中，为防止用旧配置代码恢复新 checkpoint 产生静默错误，通常应在 checkpoint 里保存什么信息？（答案包含两个词即可：git + config）",
+      "accept": ["git sha", "git commit", "config", "配置摘要", "git sha和config"],
+      "explain": "checkpoint 应保存 git commit sha（代码版本）和训练 config 文件快照/哈希。恢复时校验这两项，确保代码和参数与 checkpoint 匹配，防止用错误版本训练代码恢复模型后出现静默的精度或行为偏差。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某训练集群多个作业的 DataLoader 出现间歇性数据加载超时，文件系统总读带宽未打满，但 MDT CPU 接近 100%。最直接的缓解措施是？",
+      "options": [
+        "增加 DataLoader worker 数量",
+        "增大 batch size 以降低 IO 频率",
+        "将数据集从小文件格式打包成大 shard 文件（如 WebDataset/TFRecord）",
+        "把数据集迁移到对象存储以提升带宽"
+      ],
+      "answer": 2,
+      "explain": "MDT CPU 高、带宽未满是元数据风暴的典型表现，问题在 stat/open/readdir 的 inode 操作，不在数据传输带宽。将小文件打包成 shard 是最直接的治本方法：每个 shard 只需一次 open，内部多个样本顺序读取，MDT 压力大幅下降。"
+    },
+    {
+      "type": "judge",
+      "prompt": "异步 checkpoint（训练推进同时后台写状态副本）与同步 checkpoint 相比，完全不需要额外的 GPU 显存开销。",
+      "answer": false,
+      "explain": "异步 checkpoint 需要在后台写入期间保留一份状态副本（通常在 CPU 内存或 GPU 显存临时缓冲），直到写入完成才能释放。这意味着需要额外的内存来同时保存「在训练的状态」和「正在写入的快照」，是用内存换 wall time 的设计权衡。"
+    }
+  ],
+  "u3-l11": [
+    {
+      "type": "choice",
+      "prompt": "在 GPU 执行栈中，CUDA runtime 和 CUDA driver 的分工是什么？",
+      "options": [
+        "runtime 负责 kernel 在 SM 上的执行，driver 负责 tensor 内存分配",
+        "runtime 提供高级 API（如 cudaMalloc、kernel launch 提交），driver 负责实际的内核态操作和设备通信",
+        "runtime 负责多 GPU 通信，driver 负责单 GPU 执行",
+        "两者职责相同，driver 是 runtime 的旧版本"
+      ],
+      "answer": 1,
+      "explain": "CUDA runtime（libcudart）提供 cudaMalloc、cudaMemcpy、kernel launch 等用户态 API；CUDA driver（libcuda）负责实际的内核态操作：设备初始化、context 管理、向 GPU 硬件提交命令。框架通过 runtime API 提交，runtime 再通过 driver 与设备通信。"
+    },
+    {
+      "type": "judge",
+      "prompt": "caching allocator 的存在使得 `torch.cuda.memory_reserved()` 始终等于 `torch.cuda.memory_allocated()`。",
+      "answer": false,
+      "explain": "caching allocator 向 CUDA 申请大块内存后缓存在内存池中（reserved），供后续 tensor 复用。已分配给 tensor 的部分是 allocated。tensor 释放后内存回到 pool 但不立即还给 CUDA，所以 reserved 通常 >= allocated。两者不相等是正常现象。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 eager 模式下，`loss = F.cross_entropy(logits, labels)` 后紧接着 `print(loss.item())`，这行 print 会触发什么类型的操作？（用两个词回答，含「同步」和「D2H」）",
+      "accept": ["隐式同步", "D2H同步", "同步和D2H", "D2H拷贝和同步", "隐式同步和D2H"],
+      "explain": "`.item()` 需要把 GPU 上的标量搬到 CPU（D2H），这要求 GPU 先完成之前所有提交的计算（隐式同步），然后把结果拷贝到 host。这会破坏 overlap、插入同步点，是训练热路径中常见的性能陷阱。"
+    },
+    {
+      "type": "match",
+      "prompt": "将执行栈层级与其典型性能问题匹配：",
+      "left": ["Python / API 层", "framework dispatcher 层", "ATen / 算子选择层", "CUDA runtime / driver 层"],
+      "right": ["每次 launch 有固定 CPU 成本，小 kernel 多时积累显著", "逐元素小循环、每步 .item() 同步、Python 对象创建开销", "算子路由到 CPU fallback 或走非预期的低效实现路径", "non-contiguous tensor 触发额外 transpose，或 workspace 过大"],
+      "explain": "Python层→小循环/同步；dispatcher层→fallback/路由错误；ATen层→layout/workspace问题；runtime/driver层→每次launch固定开销。"
+    },
+    {
+      "type": "choice",
+      "prompt": "`torch.compile` 遇到以下哪种情况会触发 graph break，回退到 eager 模式？",
+      "options": [
+        "使用 `F.relu` 激活函数",
+        "模型权重是 BF16 精度",
+        "模型前向中有 Python 副作用，如写文件或调用外部库对象方法",
+        "batch size 等于 1"
+      ],
+      "answer": 2,
+      "explain": "TorchDynamo 捕获 Python 字节码时，遇到无法静态分析的 Python 副作用（写文件、外部 C 扩展调用、动态 dispatch 等）会在该处切断计算图，之后回退到 eager 模式执行。F.relu、BF16 和 batch=1 都是正常的 compiled 路径。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个推理服务将所有 `model.eval()` 的 forward 都包在 `torch.no_grad()` 里，但发现 CPU 侧还有明显的 autograd metadata 开销。下一步应该优先改用什么？",
+      "options": [
+        "`torch.cuda.synchronize()` 后再执行 forward",
+        "`torch.inference_mode()` 代替 `no_grad()`",
+        "`torch.jit.script()` 转换模型",
+        "关闭 `torch.backends.cudnn.benchmark`"
+      ],
+      "answer": 1,
+      "explain": "`no_grad()` 只关闭梯度追踪，但仍然维护 tensor 的 version counter 等 autograd metadata 开销。`inference_mode()` 更彻底：完全绕过 autograd 机制，tensor 标记为不需要 grad 且不维护 version counter，CPU 侧开销更低，适合纯推理路径。"
+    },
+    {
+      "type": "judge",
+      "prompt": "两个独立的小 elementwise kernel 融合成一个 fused kernel 后，端到端推理时间一定会缩短。",
+      "answer": false,
+      "explain": "融合减少了 launch 开销和中间 HBM 读写，通常能提速；但融合也可能增加 register pressure，降低 occupancy，甚至触发 register spill。如果 occupancy 下降幅度大于节省的 HBM 流量，融合后可能反而更慢。融合效果必须用 profiler 验证，不能假设一定有收益。"
+    },
+    {
+      "type": "input",
+      "prompt": "用 `torch.cuda.memory_summary()` 的输出判断显存问题时，allocated 和 reserved 两个指标分别代表什么？（答案包含「tensor 占用」和「缓存池」即可）",
+      "accept": ["tensor占用和缓存池", "allocated是tensor占用reserved是缓存池", "已分配给tensor和缓存池保留", "tensor占用，缓存池保留"],
+      "explain": "allocated：当前活跃 tensor 实际占用的显存；reserved：caching allocator 向 CUDA 申请并保留在内存池中的总量（包含 allocated 和空闲缓存块）。reserved - allocated = 可复用的空闲缓存池。"
+    },
+    {
+      "type": "choice",
+      "prompt": "执行排障时，应该在什么条件下才用 `ncu` 下钻单个 kernel？",
+      "options": [
+        "发现任何 GPU utilization 低于 80% 时",
+        "每次推理请求延迟超过 SLO 时",
+        "`nsys` 显示 GPU 几乎连续忙，且少数几个 kernel 占据大部分 CUDA time",
+        "任何新 kernel 上线前都必须先跑 ncu"
+      ],
+      "answer": 2,
+      "explain": "`ncu` 有很高的 profiling 开销（慢 10-100x），且只分析单 kernel 内部，不适合作为首要工具。正确顺序是：先用 `nsys` 确认 GPU 是否真的在持续忙，找到占大头的少数 kernel，再用 `ncu` 下钻这些 kernel 的 Tensor Core、warp stall、register pressure 等细节。"
+    },
+    {
+      "type": "choice",
+      "prompt": "换用算力更强的 GPU 后，launch-bound 场景（小 kernel 多）加速效果远不如大 GEMM 场景的根本原因是？",
+      "options": [
+        "更强的 GPU 兼容性更差，部分 kernel 无法运行",
+        "launch 固定开销（μs 量级的 CPU 侧路径）不随 GPU 算力提升而缩短，占总时间比例反而上升",
+        "更强的 GPU HBM 带宽更低，导致数据传输成为新瓶颈",
+        "小 kernel 在更强 GPU 上触发更多 warp divergence"
+      ],
+      "answer": 1,
+      "explain": "launch 固定开销属于 CPU 侧路径（Python→dispatcher→runtime→driver），与 GPU 算力无关，不会随 GPU 升级缩短。大 GEMM 场景 GPU 执行时间长，launch 开销占比小，换更强 GPU 收益明显；小 kernel 场景 kernel 执行时间变短但 launch 开销不变，launch 占比升高，换卡收益越来越小。"
+    }
+  ],
+  "u3-l12": [
+    {
+      "type": "choice",
+      "prompt": "`torch.matmul` 在 dispatcher 路由时，什么条件会导致走 `CompositeImplicitAutograd` 路径？",
+      "options": [
+        "tensor 在 CUDA 且 requires_grad=True",
+        "操作由多个基础 op 组合实现，缺少对应 device 的专用实现",
+        "dtype 为 FP8",
+        "batch 维度超过 4"
+      ],
+      "answer": 1,
+      "explain": "CompositeImplicitAutograd 路径用于那些没有专用 device kernel、由多个更基础 op 组合实现的算子。走这条路径意味着该操作会展开成多个小 kernel，增加 launch 次数和中间 HBM 读写。确保常用算子有 CUDA 专用实现是避免此路径的关键。"
+    },
+    {
+      "type": "judge",
+      "prompt": "推理服务中，只要模型调用了 `model.eval()`，autograd 就会被完全关闭，不会有任何 autograd 元数据开销。",
+      "answer": false,
+      "explain": "`model.eval()` 只切换 BN/Dropout 等层的行为（使用 running stats），并不关闭 autograd。要关闭 autograd 元数据开销，需要显式使用 `torch.no_grad()` 或更彻底的 `torch.inference_mode()`。"
+    },
+    {
+      "type": "input",
+      "prompt": "ATen 层选择 `matmul` 实现时，如果输入 tensor 的 stride 不连续（non-contiguous），会触发什么操作使性能变差？（答案包含「拷贝」或「contiguous」）",
+      "accept": ["contiguous拷贝", "contiguous", "额外拷贝", "transpose拷贝", "隐式contiguous"],
+      "explain": "ATen 检测到 non-contiguous tensor 时，通常会调用 `.contiguous()` 先做一次显存拷贝（将 tensor 整理为连续布局），再送入 cuBLAS。这次额外拷贝消耗 HBM 带宽和时间，且产生额外中间 tensor，是常见的性能陷阱。"
+    },
+    {
+      "type": "choice",
+      "prompt": "推理热路径中以下哪种代码写法开销最大？",
+      "options": [
+        "用 `F.silu(x)` 代替手写 `x * torch.sigmoid(x)`",
+        "在每个 token 生成后调用 `logits.cpu().numpy()` 取样",
+        "用 `torch.cat([a, b], dim=-1)` 拼接两个 tensor",
+        "对 batch 维度用 `torch.arange` 生成 position ids"
+      ],
+      "answer": 1,
+      "explain": "每个 token 生成后调用 `.cpu().numpy()` 会触发 D2H 数据拷贝和隐式 GPU 同步，每次生成都会打断 GPU pipeline，使 GPU 等待 CPU 处理完毕才能继续。这对 decode 阶段的 TPOT 影响极大。其他选项不涉及跨设备同步。"
+    },
+    {
+      "type": "match",
+      "prompt": "将框架层级职责与其主要产生的开销类型匹配：",
+      "left": ["Autograd 包装层", "framework dispatcher 层", "ATen / native op 层", "CUDA runtime / driver 层"],
+      "right": ["每次 kernel 提交的固定 CPU 驱动路径成本", "记录反向图、保存中间 tensor 引用，增加内存和引用管理开销", "shape 检查、临时 workspace 分配、算法选择", "每个 eager op 的固定路由和 dispatch key 匹配成本"],
+      "explain": "Autograd→反向图记录；dispatcher→每 op 路由成本；ATen→workspace/shape检查；runtime/driver→每 launch 固定驱动开销。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某推理服务发现 GPU 利用率只有 35%，`torch.profiler` 显示 `aten::` 事件密集且时间短、数量多。最优先的优化动作是？",
+      "options": [
+        "换用更多 Tensor Core 的 GPU",
+        "增大 batch size 到 128",
+        "用 `torch.compile` 或已有 fused op 减少 eager op 数量",
+        "开启 CUDA_LAUNCH_BLOCKING=1 精确定位慢 kernel"
+      ],
+      "answer": 2,
+      "explain": "aten:: 事件密集且短，是典型的 launch-bound + dispatcher overhead 表现，GPU 利用率低是因为 CPU 来不及提交足够的 kernel。优先用 `torch.compile` 融合 elementwise op 或直接换用成熟的 fused kernel，减少 dispatch 次数。CUDA_LAUNCH_BLOCKING=1 会强制同步，让问题更严重，不适合用来优化。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`view` 和 `transpose` 操作不产生 CUDA kernel，因此对后续依赖这些 tensor 的算子性能完全没有影响。",
+      "answer": false,
+      "explain": "`view` 和 `transpose` 本身不 launch kernel（只修改 stride/offset 元数据），但会产生 non-contiguous tensor。后续算子（如 matmul）若需要 contiguous 布局，会触发隐式 `.contiguous()` 拷贝，消耗 HBM 带宽。因此 layout 操作对后续性能有间接但真实的影响。"
+    },
+    {
+      "type": "choice",
+      "prompt": "对于一个主要由超过 1000 个小 elementwise op 组成、shape 稳定的推理 hot path，按优先级选择优化手段，最优先的应该是？",
+      "options": [
+        "手写自定义 CUDA kernel",
+        "用 `torch.jit.trace` 导出 TorchScript",
+        "用 `torch.compile(mode='reduce-overhead')` 或已有 fused op",
+        "降低模型精度到 INT4"
+      ],
+      "answer": 2,
+      "explain": "shape 稳定且小 op 多，正是 `torch.compile` 的最佳适用场景：TorchDynamo 捕获稳定图，Inductor 融合 elementwise/reduction，消除大量 dispatch 和中间 HBM 往返。自写 kernel 开发成本极高且维护难，应作为最后手段。"
+    },
+    {
+      "type": "input",
+      "prompt": "框架调度路径中，ATen 算子选择到非预期实现（如 CPU fallback）的最常见触发条件是什么？（答案包含「device」或「dtype」）",
+      "accept": ["dtype不匹配", "device不对", "tensor在CPU", "dtype或device不匹配", "non-contiguous"],
+      "explain": "ATen 根据 dispatch key 选实现，dispatch key 包含 device（CPU/CUDA）和 dtype。若 tensor 意外在 CPU（如 position ids 未移到 GPU）或 dtype 不受支持，会路由到 CPU fallback 或 CompositeImplicitAutograd 路径，性能大幅下降。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某模型从 eager 切换到 `torch.compile` 后，第一次 forward 明显变慢，之后稳定。这是什么原因？",
+      "options": [
+        "compiled 模式 GPU 内存分配比 eager 更保守",
+        "第一次 forward 触发 TorchDynamo 捕获和 Inductor 编译，之后 replay 已编译的 kernel",
+        "compiled 模式不支持 batch size 变化，第一次会自动重置",
+        "compiled 模式在首次运行时做完整精度验证"
+      ],
+      "answer": 1,
+      "explain": "torch.compile 采用 JIT 编译：第一次执行时 TorchDynamo 捕获 Python 图，Inductor 生成并编译融合 kernel（编译时间可达数十秒）。之后相同 shape 的输入直接 replay 已编译的 kernel，性能才体现出来。这是 compiled 模式的预热成本，应与稳态性能分开衡量。"
+    }
+  ],
+  "u3-l13": [
+    {
+      "type": "choice",
+      "prompt": "以下关于 CUDA stream 排序语义的描述，哪项正确？",
+      "options": [
+        "不同 stream 内的命令永远并发执行，不存在任何顺序关系",
+        "同一 stream 内命令按提交顺序串行执行；不同 stream 命令在满足依赖条件时可并发",
+        "默认 stream 内的命令与所有其他 stream 并发，没有任何约束",
+        "GPU 有统一的全局命令队列，所有 stream 共享同一执行顺序"
+      ],
+      "answer": 1,
+      "explain": "CUDA stream 的核心语义：同一 stream 内命令 FIFO 有序，保证提交顺序即执行顺序；不同 stream 之间无隐式顺序，只要硬件资源允许且没有显式依赖（event），命令可以并发执行。"
+    },
+    {
+      "type": "judge",
+      "prompt": "H2D 传输要与 compute kernel 真正重叠，必须使用 pinned（page-locked）host memory 并通过 non-blocking async copy 提交。",
+      "answer": true,
+      "explain": "H2D overlap 的两个必要条件：①host 内存必须是 pinned memory（page-locked），DMA 引擎才能独立工作而无需 CPU 参与；②必须使用 async/non-blocking copy 提交到不同 stream，不阻塞 CPU，让 GPU compute engine 和 copy engine 并行工作。缺任一条件，overlap 都不会发生。"
+    },
+    {
+      "type": "input",
+      "prompt": "H2D t=20ms，compute t=80ms，NCCL allreduce t=25ms。三阶段串行 step 时间多少 ms？理想完全 overlap 下的下界是多少 ms？",
+      "accept": ["125和80", "串行125 overlap80", "125ms和80ms", "125,80"],
+      "explain": "串行：20+80+25=125 ms。理想 overlap：H2D 与 compute 重叠（compute 掩盖 H2D），NCCL 与 compute 后段重叠；下界取最长路径 = max(H2D, compute, NCCL) = 80 ms（compute 主导）。"
+    },
+    {
+      "type": "match",
+      "prompt": "将同步/依赖机制与最适合的使用场景匹配：",
+      "left": ["cudaEventRecord + cudaStreamWaitEvent", "cudaDeviceSynchronize()", "cudaStreamSynchronize(stream)", "stream.wait_stream(other)"],
+      "right": ["CPU 必须等某特定 stream 完成才能进行下一步处理", "PyTorch 中跨 stream 简单等待，other 的已提交工作", "跨 stream 局部数据依赖，避免等整个 GPU 空闲", "等待所有 stream 完成，调试或作业结束时使用"],
+      "explain": "EventRecord+StreamWaitEvent→跨stream局部依赖；DeviceSynchronize→等所有stream（调试/结束）；StreamSynchronize→等特定stream完成；wait_stream→PyTorch跨stream简洁等待。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DDP 训练中，为什么在 backward 结束时就立即对每个 bucket 启动 allreduce（而不是等全部 backward 完成再启动）？",
+      "options": [
+        "提前启动可以减少每个 bucket 的数据量",
+        "将 allreduce 通信与剩余 backward 计算重叠，隐藏通信延迟",
+        "NCCL 要求按 bucket 顺序提交，不能批量一次性启动",
+        "提前启动可以触发 GPU 的 power boost 模式"
+      ],
+      "answer": 1,
+      "explain": "DDP 设计的核心技巧：某个 bucket 的梯度在 backward 中就绪后，立即在 NCCL stream 上异步启动该 bucket 的 allreduce，同时 compute stream 继续做剩余参数的 backward。两者在不同 stream 上并发，通信被计算掩盖，有效降低每 step 总时间。"
+    },
+    {
+      "type": "judge",
+      "prompt": "CUDA Graph 捕获后，可以在不重新 capture 的情况下，向图中的 static buffer 写入新的输入数据，然后 replay 执行新数据。",
+      "answer": true,
+      "explain": "这正是 CUDA Graph 的正确使用方式：capture 时确定操作、依赖和内存地址；replay 前通过 `.copy_()` 等操作把新数据写入固定地址的 static buffer；replay 重用相同地址执行相同命令序列，实现低 overhead 的重复推理。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种代码写法最容易破坏同一 step 内 compute 与 H2D 的 overlap？",
+      "options": [
+        "在 copy stream 上用 `non_blocking=True` 发起 H2D",
+        "在数据真正被 compute 消费前，调用 `compute_stream.wait_event(copy_event)`",
+        "在 H2D 提交后立即调用 `torch.cuda.synchronize()` 来「确认数据已到 GPU」",
+        "使用 pinned memory 的 DataLoader"
+      ],
+      "answer": 2,
+      "explain": "H2D 提交后立即调用 `synchronize()` 等待其完成，会让 CPU 和 GPU 都停下来等 copy engine，破坏 H2D/compute 的并发关系，等价于串行执行。正确做法是用 event 在消费点（而不是生产点）等待：compute stream wait copy_event，然后继续。"
+    },
+    {
+      "type": "input",
+      "prompt": "LLM 推理使用 CUDA Graph + shape bucket 策略时，「bucket 数量过多」最直接导致什么资源问题？（答案包含「显存」）",
+      "accept": ["显存增加", "static buffer显存", "显存开销增大", "显存不足", "显存占用高"],
+      "explain": "每个 (batch_size, seq_len) bucket 对应一个 captured graph，每个 graph 持有一套 static buffer（权重指针、KV cache、输出 buffer 的固定地址）。bucket 越多，static buffer 总显存越大。bucket 数量失控时，graph pool 显存成本可能超过模型权重本身，导致可用 KV cache 空间减少。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练 step 时间线中发现：每步 backward 结束时有一段明显空洞，随后才开始 allreduce。最可能的原因是什么？",
+      "options": [
+        "allreduce bucket 过大，NCCL 需要更多准备时间",
+        "存在显式或隐式同步点（如 `.item()` 或自定义 hook 里的 `synchronize()`）阻断了 backward 与 allreduce 的 overlap",
+        "GPU 的 NCCL stream 优先级低于 compute stream",
+        "backward 计算量太大，导致 compute engine 占满"
+      ],
+      "answer": 1,
+      "explain": "backward 结束时有空洞，说明 allreduce 没有及时在 NCCL stream 上启动，compute stream 和 NCCL stream 未能重叠。最常见原因是热路径中有隐式同步点（`.item()`、D2H、自定义 hook 里的 `synchronize()`），导致 CPU 等待 GPU 完成，延迟了 NCCL 提交时机。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下关于 `cudaEventRecord` + `cudaStreamWaitEvent` 与 `cudaDeviceSynchronize` 的对比，哪项描述最准确？",
+      "options": [
+        "两者等价，只是 API 不同",
+        "cudaDeviceSynchronize 更精确，因为它等待所有 GPU 工作完成",
+        "Event 机制只等待「event 之前该 stream 的工作」，不阻塞其他 stream；DeviceSynchronize 等待所有 stream 完成，是全局屏障",
+        "Event 只适用于同一进程内，跨进程必须用 DeviceSynchronize"
+      ],
+      "answer": 2,
+      "explain": "Event 实现局部依赖：StreamWaitEvent 让某 stream 等待「event 记录时刻」之前的特定工作完成，其他 stream 不受影响，可继续执行。DeviceSynchronize 是全局屏障，CPU 阻塞直到所有 stream 上所有提交的工作完成，会消灭所有并发。高性能代码优先用 Event 实现最小化同步。"
+    }
+  ],
+  "u3-l14": [
+    {
+      "type": "choice",
+      "prompt": "cuBLAS 和 cuBLASLt 的核心区别是什么？",
+      "options": [
+        "cuBLAS 支持 FP16，cuBLASLt 只支持 FP32",
+        "cuBLASLt 是 cuBLAS 的轻量版本，性能更差",
+        "cuBLASLt 支持更灵活的 GEMM，可在 GEMM 后附加 epilogue（如 bias/activation/quantize）",
+        "cuBLAS 用于训练，cuBLASLt 用于推理"
+      ],
+      "answer": 2,
+      "explain": "cuBLAS 提供标准 GEMM API；cuBLASLt 提供更灵活的 GEMM，支持 epilogue fusion（GEMM 后紧接着做 bias add、activation、quantize 等），减少额外 kernel launch 和 HBM 中间读写。但 epilogue 过重时，主 GEMM kernel 的 occupancy 可能下降。"
+    },
+    {
+      "type": "judge",
+      "prompt": "FlashAttention 相比朴素 attention 的主要优势在于减少了总 FLOPs（浮点运算量），从而更快。",
+      "answer": false,
+      "explain": "FlashAttention 的 FLOPs 与朴素 attention 相近（tile 化分块计算，总数值操作量相差不多）。其优势来自内存访问模式的改变：避免 materialize 完整的 $O(seq^2)$ 中间矩阵（S 和 P），用 tiling + 在线 softmax 将 HBM 读写从 $O(seq^2)$ 降到 $O(seq)$，是 IO 复杂度而非 FLOPs 的改善。"
+    },
+    {
+      "type": "input",
+      "prompt": "SM 内 register pressure 过高时，编译器会把临时变量溢出到哪里？（用一个英文词回答）",
+      "accept": ["local memory", "local", "L2", "HBM"],
+      "explain": "当线程 register 用量超过 SM register file 容量时，编译器将溢出的临时变量放到 local memory。虽然名字叫「local」，实际上 local memory 走的是 HBM 路径（通过 L2 cache 访问），延迟比 register 高得多，是 register spill 严重影响性能的原因。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个 kernel 的 occupancy 从 25% 提升到 85%，但 `ncu` 显示 Tensor Core utilization 没有提高，端到端时间也没有缩短。最合理的解释是？",
+      "options": [
+        "occupancy 提升没有实际意义，需要换 GPU",
+        "该 kernel 是 compute-bound，Tensor Core 已经饱和，不需要更高 occupancy",
+        "occupancy 是诊断维度之一，提升 occupancy 不自动等于提升性能；真正的瓶颈可能是 Tensor Core 利用率或内存带宽",
+        "占用率提升说明有 register spill，反而变慢了"
+      ],
+      "answer": 2,
+      "explain": "occupancy 是诊断指标，不是目标。提高 occupancy 只说明 SM 上驻留了更多 warp，但如果 warp 都在等内存或 Tensor Core 已满载，更多 warp 不能带来更多吞吐。分析应看 Tensor Core utilization、warp stall 原因和 roofline，而不是单纯追求高 occupancy。"
+    },
+    {
+      "type": "match",
+      "prompt": "将算子融合的收益或成本与其机制对应：",
+      "left": ["减少 HBM 中间读写", "增加 register pressure", "降低 kernel 调度次数", "可能触发 warp divergence"],
+      "right": ["融合后包含 mask/branch 逻辑，同一 warp 内线程走不同分支", "中间 tensor 留在 register/shared memory，不写回 HBM", "多个小 kernel 合并，减少固定调度开销", "融合后每线程需要更多临时变量，占用更多 register file"],
+      "explain": "减少HBM读写→中间tensor留在寄存器；register pressure增加→临时变量增多；降低调度次数→launch减少；warp divergence→mask/branch融合进来。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种场景最适合使用 Triton 编写自定义 kernel，而不是直接使用 cuBLAS 或 FlashAttention？",
+      "options": [
+        "标准 GEMM，输入为 BF16，shape 规整",
+        "标准 multi-head attention，seq_len 固定为 2048",
+        "MoE 中自定义 expert dispatch + compute + combine 的融合算子，语义特殊无成熟库",
+        "ResNet 的标准 convolution"
+      ],
+      "answer": 2,
+      "explain": "cuBLAS/FlashAttention 覆盖了标准 GEMM 和 attention，应优先使用。Triton 适合那些语义特殊（如 MoE dispatch/combine）、没有成熟库覆盖、需要定制 tile 和 memory pattern 的 kernel，开发效率比 CUTLASS 模板高，比 raw CUDA 更易维护。"
+    },
+    {
+      "type": "judge",
+      "prompt": "HBM 带宽很高（如 3.35 TB/s），因此 warp 内线程的内存访问顺序不影响实际吞吐——反正带宽足够。",
+      "answer": false,
+      "explain": "HBM 高带宽的前提是 memory coalescing：warp 内相邻线程访问相邻、对齐的地址，硬件合并成少量 memory transaction。若访问不连续（stride 访问、scatter/gather），每个线程产生独立 transaction，实际带宽可能只有理论峰值的几分之一，即使 HBM 硬件能力很强也无法体现。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某 fused kernel 融合了 10 个 elementwise op，`ncu` 显示 `local memory load store transactions` 从 0 增加到 800M，`achieved occupancy` 从 75% 降到 40%。最可能的根因是？",
+      "options": [
+        "HBM 带宽被打满",
+        "shared memory 容量不足，溢出到 L2",
+        "融合后 registers per thread 过高，编译器把溢出的临时变量放到 local memory（走 HBM 路径），occupancy 随之下降",
+        "kernel grid 配置错误，SM 数量未充分利用"
+      ],
+      "answer": 2,
+      "explain": "融合 10 个 elementwise 后，每线程需要保存更多中间结果，register 用量可能从 40 增到 120+。超出 SM register file 容量后编译器将溢出值写入 local memory（实际走 HBM），local memory transaction 大幅增加；同时 registers/thread 上升导致每 SM 驻留 warp 数下降，occupancy 降低。"
+    },
+    {
+      "type": "input",
+      "prompt": "cuDNN 做卷积时，哪种 tensor layout 通常比 NCHW 对 Tensor Core 更友好，在现代 GPU 上性能更好？",
+      "accept": ["NHWC", "channels_last"],
+      "explain": "cuDNN 的隐式 GEMM 实现在 NHWC（channels_last）layout 下能更好地对齐 Tensor Core 的 tile 要求，减少额外 transpose，在 Ampere/Hopper 上通常比 NCHW 快。PyTorch 中用 `.to(memory_format=torch.channels_last)` 转换。"
+    },
+    {
+      "type": "choice",
+      "prompt": "关于算子融合上线的工程准则，以下哪项最正确？",
+      "options": [
+        "融合减少 HBM 读写，因此只要融合就能提速，无需验证",
+        "新 fused kernel 必须通过数值精度验证（与参考实现对比）+ 在目标 GPU/shape 上的性能实测，才能上线",
+        "使用知名库（如 FlashAttention）的 fused kernel 不需要精度验证",
+        "在开发机上验证通过即可，生产 GPU 型号不影响结果"
+      ],
+      "answer": 1,
+      "explain": "算子融合上线需要两层验证：①数值精度——与参考实现（非融合版本）对比，确认输出误差在可接受范围内（尤其是低精度融合）；②性能实测——在与生产相同的 GPU 型号、shape、dtype 下测 profiler，因为 register pressure、occupancy、coalescing 行为随 GPU 微架构不同。两者缺一不可。"
+    }
+  ],
+  "u3-l15": [
+    {
+      "type": "choice",
+      "prompt": "性能排障 SOP 中「先用 nsys 看时间线，最后才用 ncu」的最主要原因是？",
+      "options": [
+        "ncu 只能在 Linux 上使用",
+        "nsys 输出格式比 ncu 更易读",
+        "ncu 开销极大（慢 10–100x），且只分析单 kernel 内部，在未确认问题在 kernel 内部前用 ncu 是浪费且可能误导",
+        "ncu 无法与 NCCL 同时使用"
+      ],
+      "answer": 2,
+      "explain": "ncu 通过在每条指令边界注入测量点实现精确 kernel 微结构分析，但带来极高 overhead（通常慢 10–100x）。若先用 ncu 盲扫，不仅耗时极长，而且改变了时序关系，分析结果可能不代表真实生产行为。正确顺序是：nsys 确认宏观时间线 → 找最慢 kernel → ncu 下钻。"
+    },
+    {
+      "type": "judge",
+      "prompt": "推理服务的平均 TPOT（每 token 平均生成时间）达到 SLO，说明 P99 延迟也一定正常，不需要额外 profile P99。",
+      "answer": false,
+      "explain": "平均值（P50）和尾延迟（P99）可以相差数倍。平均值低可能是大多数请求很快，但少数长上下文或并发碰撞的请求产生极长尾延迟，用户体验极差。线上服务必须分别监控 P50/P95/P99，平均达标不等于尾延迟达标。"
+    },
+    {
+      "type": "input",
+      "prompt": "使用 nsys 采集时间线时，为了在 Nsight Systems GUI 里快速区分 forward/backward/optimizer 各阶段，通常插入什么类型的标注？（英文缩写即可）",
+      "accept": ["NVTX", "nvtx"],
+      "explain": "NVTX（NVIDIA Tools Extension）允许在代码中插入 range_push/range_pop 标注，nsys 会把这些标注渲染为 Nsight Systems 时间线上的彩色区域，方便快速定位各阶段（forward、backward、optimizer step、checkpoint 等）的时间边界。"
+    },
+    {
+      "type": "match",
+      "prompt": "将性能问题病态时间线特征与首要排查方向匹配：",
+      "left": ["CUDA HW 上 kernel 之间有大量空洞，kernel 本身很短", "H2D 与 compute kernel 交替出现（阶梯式串行）", "backward 后段有明显 NCCL 尾巴，持续时间不稳定", "每 N step 出现一次 GPU 长空洞，其余 step 正常"],
+      "right": ["多 rank nsys 对比，检查 NCCL 日志和 rank 计算均衡性", "检查 checkpoint 写入时机、manifest flush 和文件系统 IO", "检查 DataLoader pinned memory、non_blocking 设置、是否有默认 stream 依赖", "torch.profiler 找小 op 热点，尝试 torch.compile 减少 dispatch 次数"],
+      "explain": "kernel间空洞→launch-bound→torch.profiler+compile；H2D串行→copy设置问题→pinned/async；NCCL尾巴→rank不均衡→多rank trace；周期空洞→checkpoint风暴→IO诊断。"
+    },
+    {
+      "type": "choice",
+      "prompt": "分布式训练中，某 rank 每步都比其他 rank 晚 200ms 完成 backward。以下哪项最不可能是根因？",
+      "options": [
+        "该 rank 对应的 GPU 存在 ECC 错误或时钟降速（clock throttle）",
+        "该 rank 的 NIC 端口与交换机之间存在物理链路降速",
+        "该 rank 处理的 data shard 中有更多长序列（dynamic shape 导致计算量更大）",
+        "NCCL 默认使用的通信算法从 ring 切换到 tree"
+      ],
+      "answer": 3,
+      "explain": "ECC错误、clock throttle→单卡变慢；NIC降速→该rank通信变慢；长序列data shard→计算量更大，backward更慢——这三项都能解释单 rank 持续落后。NCCL 算法切换（ring→tree）是全局变化，影响所有 rank，不会导致特定 rank 持续落后，因此最不可能是根因。"
+    },
+    {
+      "type": "choice",
+      "prompt": "性能回归测试中，PR smoke 测试将 fail 阈值设为「P50 退化 > 8% 且连续 3 次」而不是「退化 > 0.1% 立即 fail」的原因是？",
+      "options": [
+        "0.1% 的退化对用户体验无影响，不值得阻塞 PR",
+        "测试环境有噪声，单次小幅退化可能是偶发波动而非真实回归；过低阈值导致大量误报，开发者习惯性忽视，失去护栏作用",
+        "性能回归测试的目的只是发现灾难性故障，不需要精细粒度",
+        "P50 指标对用户不重要，应该只看 P99"
+      ],
+      "answer": 1,
+      "explain": "测试环境有运行噪声（温度、其他进程、调度抖动），单次 P50 波动 ±3–5% 是正常的。阈值设太低会产生大量误报，开发者逐渐忽视 CI 报警，护栏失效。「连续 3 次超阈值」要求稳定复现，大幅减少误报，同时保证真实回归能被发现。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`CUDA_LAUNCH_BLOCKING=1` 模式下测出的 step time 代表真实生产性能，可以用来评估优化效果。",
+      "answer": false,
+      "explain": "`CUDA_LAUNCH_BLOCKING=1` 让每次 kernel launch 强制同步，消灭了所有异步重叠（H2D/compute/NCCL overlap）。测出的 step time 是串行化的上界，远大于正常异步执行时间，不能代表生产性能。该模式只用于定位报错位置，不能用于性能测量。"
+    },
+    {
+      "type": "choice",
+      "prompt": "`ncu --set full` 在生产训练任务全量运行的主要风险是什么？",
+      "options": [
+        "ncu 会覆盖已有的 nsys trace 文件",
+        "ncu 只支持单 GPU，无法在多卡任务上运行",
+        "ncu 的 instrumentation overhead 使训练慢 10–100x，持续运行会超时、触发 NCCL timeout、或让看门狗杀掉进程",
+        "ncu 采集期间 GPU 显存会增加 50%"
+      ],
+      "answer": 2,
+      "explain": "ncu 通过在指令间插桩（replay 每条指令多次）实现精确 counter 采集，overhead 极高（10–100x 甚至更多）。生产训练中长时间使用 ncu 会导致：NCCL heartbeat 超时（其他 rank 等待超时）、训练框架的看门狗触发、checkpoint 周期异常等。ncu 只能在隔离的短时间窗口内对少量 kernel 使用。"
+    },
+    {
+      "type": "input",
+      "prompt": "按照规范，性能排障的 BenchmarkProtocol 要求分别记录 P50、P95、P99，而不只看均值。在什么情况下 P99 退化但 P50 正常，且最容易被均值掩盖？（答案包含「长上下文」或「偶发」）",
+      "accept": ["长上下文", "偶发", "长尾", "偶发尖刺", "周期性抖动"],
+      "explain": "典型场景：长上下文请求（seq_len 很长）处理时间远高于普通请求，但在大量短请求中被均值稀释；或偶发的 checkpoint 写入、GC、NCCL 尾延迟在少数 step 中产生尖刺（P99 退化），但 P50 几乎不受影响。只看均值会错过这类高影响但低频的退化。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某推理服务 P50 TPOT 良好，但每隔约 30 分钟出现一次 P99 突刺，突刺期间 GPU compute 已完成但 CPU 线程在等待 IO。最可能的根因是？",
+      "options": [
+        "GPU kernel 性能退化，需要 ncu 下钻",
+        "NCCL allreduce 出现周期性拥塞",
+        "定期 checkpoint 写入（或日志 flush）阻塞了 response 路径，对应 IO 等待",
+        "CUDA Graph 每 30 分钟自动 recapture"
+      ],
+      "answer": 2,
+      "explain": "GPU compute 已完成但 CPU 线程在等 IO，且现象周期性（约 30 分钟），是定期 checkpoint 写入的典型特征。checkpoint 写入时 response 回调被阻塞或 IO 队列满，导致 P99 尖刺。修复方向：异步 checkpoint（后台线程写，与 response 路径解耦）或错峰写入。"
+    }
+  ]
+}

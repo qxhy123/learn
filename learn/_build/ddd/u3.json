@@ -1,0 +1,949 @@
+[
+  {
+    "title": "实体与值对象",
+    "subtitle": "用标识还是用值来区分——这是建模的第一个岔路口",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "建模时最常遇到的第一个问题是：这个概念该怎么设计成类？直接用数据类加一堆属性，还是加个 ID 字段？\n\n这背后有两种截然不同的思路。银行账户即使余额变了，它还是「你那个账户」——我们靠标识来追踪它；但钱包里的两张 100 元，对你来说没有任何区别——你靠「值本身」来判断。\n\nDDD 把这两种思路分别叫做**实体（Entity）**和**值对象（Value Object）**。把该用值对象的东西建成实体，或者反过来，都会让模型变得冗余或出现意外的 Bug。"
+      },
+      {
+        "title": "实体：靠标识来区分",
+        "body": "实体（Entity）的核心特征是**唯一标识**（Identity）。生命周期内属性可以变，但标识不变，只要标识相同就是「同一个东西」。\n\n`__eq__` 只比较标识，这是实体和值对象在代码上最直接的区别：\n\n```python\nclass BankAccount:\n    def __init__(self, account_id, owner):\n        self._id = account_id\n        self._owner = owner\n        self._balance = Money(0, \"CNY\")\n    def __eq__(self, other):\n        if not isinstance(other, BankAccount):\n            return False\n        return self._id == other._id  # 只比标识\n    def __hash__(self):\n        return hash(self._id)\n    def deposit(self, amount):\n        self._balance = self._balance + amount\n```\n\n标识设计建议用不可变的人工 ID（UUID），而不是邮箱、手机号这类可能变化的自然键。"
+      },
+      {
+        "title": "值对象：靠值本身来区分",
+        "body": "值对象（Value Object）没有唯一标识，两个值对象只要所有属性值相同，就是「同一个东西」。它的另一个核心特征是**不可变性**——所有操作都返回新对象，而不是修改自身。\n\nPython 里用 `@dataclass(frozen=True)` 实现，验证逻辑放在 `__post_init__`：\n\n```python\nfrom dataclasses import dataclass\nfrom decimal import Decimal\n@dataclass(frozen=True)\nclass Money:\n    amount: Decimal\n    currency: str\n    def __post_init__(self):\n        if self.amount < 0:\n            raise ValueError(\"金额不能为负\")\n    def __add__(self, other):\n        if self.currency != other.currency:\n            raise ValueError(\"货币不一致\")\n        return Money(self.amount + other.amount, self.currency)\n    def __mul__(self, factor):\n        return Money(\n            (self.amount * factor).quantize(Decimal(\"0.01\")),\n            self.currency\n        )\n```\n\n`Money(100, \"CNY\") == Money(100, \"CNY\")` 结果是 `True`——这正是值对象按值比较的体现。"
+      },
+      {
+        "title": "为什么值对象必须不可变",
+        "body": "为什么值对象要不可变？因为可变的值对象会制造很难排查的 Bug。\n\n想象 `price` 和 `order_total` 共享同一个可变的 Money 对象。某处代码修改了 `price.amount`，`order_total` 也跟着变了——但你完全不知道是谁改的。不可变值对象彻底消除了这类问题：\n\n```python\n# 可变值对象：危险\nclass MutableMoney:\n    def __init__(self, amount, currency):\n        self.amount = amount\nprice = MutableMoney(100, \"CNY\")\norder_total = price   # 共享同一对象\nprice.amount = 200    # 意外地也改了 order_total！\n# 不可变值对象：安全\nprice = Money(Decimal(\"100\"), \"CNY\")\ndiscount = Money(Decimal(\"20\"), \"CNY\")\nfinal = price - discount  # 返回新对象，price 不变\n```\n\n不可变还带来另一个好处：值对象可以安全地在多个对象间共享，不需要防御性拷贝。"
+      },
+      {
+        "title": "如何判断：实体还是值对象",
+        "body": "实践中最常遇到的问题是：这个概念该建成哪个？用三个问题来判断：\n\n**问题 1：两个「相同」的实例可以互换吗？**\n- 可以（如两张 100 元）→ 值对象\n- 不可以（如两笔订单，即使内容相同也不同）→ 实体\n\n**问题 2：这个概念有独立的生命周期吗？**\n- 有（用户、订单、账户）→ 实体\n- 没有，依附于某实体存在 → 考虑值对象\n\n**问题 3：需要追踪它的历史变化吗？**\n- 需要 → 实体；不需要 → 值对象\n\n一个典型的「取决于上下文」案例：地址在电商场景是值对象（一个属性值，可替换），在地理信息系统里是实体（有唯一 ID，需被追踪）。同一个概念，上下文不同，建模结论不同。"
+      },
+      {
+        "title": "订单中的商品快照：值对象的实际用途",
+        "body": "订单里的商品不应该持有 `Product` 实体的引用。原因很简单：商品的名称和价格可能会变，但历史订单不应该跟着变。解决办法是用商品快照——一个值对象，记录下单那一刻的商品信息：\n\n```python\n@dataclass(frozen=True)\nclass ProductSnapshot:\n    \"\"\"下单时的商品快照（值对象）\"\"\"\n    product_id: str\n    name: str\n    unit_price: Money\nclass OrderItem:\n    def __init__(self, product: ProductSnapshot, quantity: int):\n        if quantity <= 0:\n            raise ValueError(\"数量必须大于 0\")\n        self._product = product\n        self._quantity = quantity\n    @property\n    def subtotal(self):\n        return self._product.unit_price * Decimal(self._quantity)\n```\n\n`ProductSnapshot` 是不可变的值对象，即使商品后来涨价，历史订单的小计不受影响。这是值对象在真实业务中最常见的一种用途。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **贫血实体**：实体只有 getter/setter，业务规则全散在 Service 层。正确做法是把「取消订单」「确认支付」这类业务操作封装在实体方法里，同时在方法内部验证不变量。\n- **用自然键做标识**：邮箱、手机号都可能变化，用它们做 ID 迟早出问题。推荐用 UUID 构建强类型 ID。\n- **把值对象建成实体**：`Money` 加一个 `id` 字段毫无意义，还带来额外的持久化负担。\n- **忘记验证**：值对象的验证应该在 `__post_init__` 里做，让「金额为负」「无效手机号」这类数据根本无法被创建出来。\n- **上下文无关地判断**：「地址是实体还是值对象」这个问题离开具体上下文没有答案。"
+      },
+      {
+        "title": "小结",
+        "body": "有唯一标识、生命周期内状态可变的是**实体**，`__eq__` 只比较标识；没有标识、靠值判断相等、不可变的是**值对象**，`__eq__` 比较全部属性。\n\n优先考虑值对象——它更简单、更安全、更容易测试。只有当一个概念需要被独立追踪时，才建模为实体。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "下面哪个说法最准确地描述了「实体」和「值对象」的核心区别？",
+        "options": [
+          "实体有方法，值对象没有方法",
+          "实体靠唯一标识区分，值对象靠属性值区分",
+          "实体存在数据库里，值对象只在内存里",
+          "实体可以有多个属性，值对象只能有一个属性"
+        ],
+        "answer": 1,
+        "explain": "区分实体和值对象的唯一标准是「用什么来判断两个实例是否是同一个东西」——实体靠标识，值对象靠值。有没有方法、存不存数据库都不是区分依据。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么实体的 `__eq__` 方法只比较标识，而不比较所有属性？",
+        "options": [
+          "为了提高比较的性能",
+          "因为实体的属性是私有的，无法访问",
+          "因为即使属性变化，同一个标识代表的仍然是「同一个东西」",
+          "这是 Python 的强制要求"
+        ],
+        "answer": 2,
+        "explain": "实体的本质是「通过标识来追踪」。银行账户余额从 100 变成 10000，它仍然是「你那个账户」——标识没变，就是同一个实体。如果比较所有属性，余额不同的两个账户快照就会被认为是不同实体，这违背了实体的语义。"
+      },
+      {
+        "type": "judge",
+        "prompt": "订单中的商品信息应该直接持有 `Product` 实体的引用，这样可以随时获取最新价格。",
+        "answer": false,
+        "explain": "历史订单应当记录下单那一刻的价格，不应随商品后续变更而改变。正确做法是用 `ProductSnapshot` 值对象捕捉快照——不可变，与商品实体的后续状态隔离。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个场景下「地址」应该建模为实体而不是值对象？",
+        "options": [
+          "电商平台的用户收货地址",
+          "订单的配送地址快照",
+          "地理信息系统中需要被唯一追踪和更新的地址记录",
+          "表单中填写的临时地址"
+        ],
+        "answer": 2,
+        "explain": "实体 vs 值对象的判断取决于上下文。收货地址和配送快照都是「可替换的属性值」，适合值对象；地理信息系统中的地址有独立生命周期、需要被唯一追踪，应建为实体。"
+      },
+      {
+        "type": "judge",
+        "prompt": "值对象的操作方法（如 `Money.add()`）应该修改自身的 `amount` 字段并返回 `self`。",
+        "answer": false,
+        "explain": "值对象必须不可变。任何操作都应该返回一个新的值对象，而不是修改自身。`frozen=True` 的 dataclass 会在运行时阻止修改，从根本上保证不变性。"
+      },
+      {
+        "type": "input",
+        "prompt": "DDD 中把「没有唯一标识、通过属性值判断相等、不可变」的对象叫做什么？（中文或英文均可）",
+        "accept": ["值对象", "Value Object", "value object"],
+        "explain": "值对象（Value Object）是 DDD 战术设计的两大基本构件之一，另一个是实体（Entity）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面哪种情况最适合把一个概念建模为值对象？",
+        "options": [
+          "需要追踪它整个生命周期内的状态变化",
+          "两个「相同」的实例可以完全互换，且没有独立生命周期",
+          "它会被多个上下文独立引用",
+          "它需要在数据库中有自己的主键"
+        ],
+        "answer": 1,
+        "explain": "「可以互换 + 没有独立生命周期」是值对象的典型特征。Money、Address、DateRange 都满足这两个条件。"
+      },
+      {
+        "type": "match",
+        "prompt": "把下列概念与它们的建模方式配对：",
+        "left": [
+          "银行账户",
+          "货币金额（如 100 元人民币）",
+          "订单中记录的商品价格快照",
+          "用户（有唯一用户 ID）"
+        ],
+        "right": [
+          "实体——有唯一账户号，余额变化但账户不变",
+          "值对象——100 元 CNY == 100 元 CNY，可互换",
+          "值对象——不可变快照，不随商品后续变化",
+          "实体——有唯一用户 ID，邮箱可变但仍是同一用户"
+        ],
+        "explain": "按标识追踪的是实体，按值判断的是值对象。账户和用户靠 ID 区分；Money 和商品快照靠值区分且不可变。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 Python 中，用哪个装饰器参数可以让 dataclass 成为不可变的值对象？（写出完整的 decorator 写法）",
+        "accept": ["@dataclass(frozen=True)", "frozen=True"],
+        "explain": "`@dataclass(frozen=True)` 会让 dataclass 的所有字段在创建后不可修改，任何赋值操作都会抛出 `FrozenInstanceError`，从语言层面保证不可变性。"
+      },
+      {
+        "type": "choice",
+        "prompt": "「贫血模型」（Anemic Domain Model）的主要症状是什么？",
+        "options": [
+          "实体的属性太少",
+          "实体只有 getter/setter，业务规则全部散落在 Service 层",
+          "值对象没有实现 `__eq__`",
+          "聚合根没有发布领域事件"
+        ],
+        "answer": 1,
+        "explain": "贫血模型指实体只是数据容器，没有封装任何业务行为。「取消订单」「确认支付」这类操作全部写在 Service 方法里，导致领域模型名存实亡。"
+      },
+      {
+        "type": "judge",
+        "prompt": "使用邮箱地址作为用户实体的唯一标识是一个好的设计。",
+        "answer": false,
+        "explain": "邮箱是可变的自然键——用户可能更换邮箱。用自然键做标识，一旦键值变化就会造成标识失效。推荐使用 UUID 这类不可变的人工标识。"
+      }
+    ]
+  },
+  {
+    "title": "聚合与聚合根",
+    "subtitle": "一致性边界：谁来保护业务不变量",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "有了实体和值对象，下一个问题是：多个对象之间的业务规则谁来保护？\n\n比如「订单总价必须等于所有订单项小计之和」——如果直接让外部代码随意修改订单项，这条规则随时可能被破坏。并发场景下更糟：操作 A 添加商品、操作 B 同时应用折扣，两个操作各自读取了同一份订单、各自保存，后保存的那个会覆盖前一个的修改，数据不一致。\n\n**聚合（Aggregate）** 解决的正是这个问题：它定义一个强一致性边界，边界内所有对象作为一个整体来修改，业务不变量（Business Invariant）由聚合来统一保护。"
+      },
+      {
+        "title": "聚合根：唯一的入口",
+        "body": "每个聚合有且只有一个**聚合根（Aggregate Root）**，它是聚合对外的唯一入口。外部代码只能持有聚合根的引用，不能直接访问聚合内的其他对象。\n\n```python\n# 聚合根保护不变量\nclass Order:  # 聚合根\n    def update_item_quantity(\n        self, product_id: str, new_qty: int\n    ) -> None:\n        if self._status not in (\n            OrderStatus.DRAFT, OrderStatus.PLACED\n        ):\n            raise OrderException(\"当前状态不允许修改\")\n        item = self._find_item(product_id)\n        item.update_quantity(new_qty)  # 委托给内部对象\n        self._validate_total_price()  # 重新验证不变量\n# 外部代码：\norder = order_repo.get(order_id)\norder.update_item_quantity(\"p-001\", 5)  # 通过根操作\n# order.items[0].quantity = 5  # 错！绕过了聚合根\n```\n\n`OrderItem` 是聚合内的实体，但它不是聚合根——外部不能直接拿到它的引用并修改。"
+      },
+      {
+        "title": "四条核心规则",
+        "body": "Vaughn Vernon 总结的聚合四条黄金规则：\n\n**规则 1：通过聚合根修改内部对象**——所有写操作必须经过聚合根，不能绕过。\n\n**规则 2：跨聚合只用标识引用**——`Order` 里存 `customer_id`（字符串），而不是 `Customer` 实例。持有对象引用会把两个聚合耦合成一个大聚合，事务边界随之扩大。\n\n**规则 3：每次事务只修改一个聚合**——一个业务操作只允许改一个聚合并提交事务。需要改多个？用领域事件触发后续操作。\n\n**规则 4：通过最终一致性实现边界外的更新**——跨聚合的联动用领域事件 + 异步处理实现，不用同步事务强行绑在一起。"
+      },
+      {
+        "title": "为什么每次事务只改一个聚合",
+        "body": "为什么一个事务只能修改一个聚合？因为事务边界就是一致性边界，扩大事务就是扩大风险。\n\n```python\n# 错误：一个事务改两个聚合\nwith transaction():\n    order = order_repo.get(order_id)\n    order.place()\n    inventory = inventory_repo.get(product_id)\n    inventory.reserve(quantity)  # 同时改库存\n    # 若库存服务挂了，订单操作也失败？这不合理\n# 正确：通过领域事件实现最终一致性\nclass Order:\n    def place(self):\n        self._status = OrderStatus.PLACED\n        self._record_event(OrderPlaced(\n            order_id=str(self._id),\n            items=[(i.product_id, i.quantity)\n                   for i in self._items]\n        ))\n# 库存上下文独立订阅，独立事务处理\nclass InventoryEventHandler:\n    def on_order_placed(self, event):\n        with transaction():\n            for pid, qty in event.items:\n                inv = self._repo.get(pid)\n                inv.reserve(qty)\n                self._repo.save(inv)\n```\n\n这样订单和库存各自有独立事务，库存服务暂时不可用也不会阻断下单。"
+      },
+      {
+        "title": "聚合大小的权衡",
+        "body": "聚合太大和太小都有问题。\n\n**太大**：把所有相关东西堆进来（订单、支付、发货、评价、客服工单都放 `Order` 里）。结果是并发冲突频繁、每次加载数据量巨大、边界模糊。\n\n**太小**：把本该内聚的东西拆开（`Order` 没有 `OrderItem`，用外键关联）。结果是保护不变量变得困难——「订单总价」这条规则需要横跨两个聚合才能验证。\n\n判断标准：**包含保护不变量所需的最小集合**。\n\n```python\nclass Order:  # 合理大小\n    _id: OrderId\n    _customer_id: str   # 只引用 ID，不持有 Customer\n    _items: list        # 需要维护总价不变量，必须包含\n    _status: OrderStatus\n    # 不包含 Payment、Shipment——它们是独立聚合\nclass Payment:          # 独立聚合\n    _order_id: OrderId  # 只引用订单 ID\nclass Shipment:         # 独立聚合\n    _order_id: OrderId\n```"
+      },
+      {
+        "title": "易错点",
+        "body": "- **聚合过大**：把「和订单有关的一切」都塞进 `Order`。每次操作都加载庞大的对象图，并发冲突激增。\n- **直接持有跨聚合的对象引用**：`Order._customer = customer_instance` 是典型错误，应改为 `_customer_id`。\n- **一个事务改多个聚合**：用同步事务强行保证跨聚合一致性，等于把两个聚合合并成了一个，失去了边界划分的意义。\n- **为聚合内部实体单独建仓储**：`OrderItemRepository` 是错误的。内部实体通过聚合根访问，不需要独立仓储。\n- **不清楚「不变量」是什么就划边界**：先明确哪些业务规则需要在一次操作里原子保证，再划聚合边界。"
+      },
+      {
+        "title": "小结",
+        "body": "聚合是**业务不变量的边界**，也是**事务的边界**。聚合根是唯一入口，所有外部操作都经过它。跨聚合的联动用领域事件 + 最终一致性实现，不用同步事务。聚合的大小原则：保护不变量所需的最小集合，不多也不少。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "聚合（Aggregate）在 DDD 中最核心的作用是什么？",
+        "options": [
+          "把所有相关实体放到一个类里以方便管理",
+          "定义一个强一致性边界，统一保护业务不变量",
+          "作为数据库事务的映射单位，每个聚合对应一张表",
+          "把领域对象和数据库行一一对应"
+        ],
+        "answer": 1,
+        "explain": "聚合的本质是一致性边界：边界内的所有对象作为一个整体进行修改，业务不变量（如「订单总价等于所有项小计之和」）由聚合统一保护。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`Order` 聚合里可以直接持有 `Customer` 实体实例，这样方便获取客户信息。",
+        "answer": false,
+        "explain": "跨聚合应该只用标识引用（`customer_id`），而不是持有对象实例。持有实例会把两个聚合耦合在一起，加载时会拉起整个对象图，事务边界随之扩大，并发冲突增加。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下单后需要同时锁定库存，以下哪种做法符合聚合设计原则？",
+        "options": [
+          "在一个数据库事务中同时修改 `Order` 和 `Inventory` 两个聚合",
+          "`Order.place()` 发布 `OrderPlaced` 领域事件，库存上下文订阅该事件并在独立事务中锁定库存",
+          "在应用服务里先保存订单再保存库存，用 try/except 捕获失败",
+          "把库存信息直接放进 `Order` 聚合，这样一个事务就够了"
+        ],
+        "answer": 1,
+        "explain": "「每次事务只修改一个聚合」是核心规则。跨聚合的联动通过领域事件 + 最终一致性实现：`Order.place()` 发事件，库存上下文独立消费，各自有独立事务。"
+      },
+      {
+        "type": "input",
+        "prompt": "聚合中唯一可以被外部直接引用、作为所有外部操作入口的实体叫做什么？（中文）",
+        "accept": ["聚合根", "Aggregate Root", "aggregate root"],
+        "explain": "聚合根（Aggregate Root）是聚合的「大门」，外部代码只能持有聚合根的引用，不能直接访问或修改聚合内的其他实体。"
+      },
+      {
+        "type": "choice",
+        "prompt": "判断一个对象 X 是否应该放入聚合 Y，最关键的判断标准是什么？",
+        "options": [
+          "X 和 Y 的名字在业务上听起来相关",
+          "X 的数据经常和 Y 一起查询",
+          "修改 X 时，Y 的某个业务不变量需要被重新验证",
+          "X 没有自己的 ID 字段"
+        ],
+        "answer": 2,
+        "explain": "聚合边界的划定依据是「保护不变量」。只有当修改 X 会影响 Y 的不变量时，X 才应该属于 Y 的聚合。查询关系、命名相似都不是依据。"
+      },
+      {
+        "type": "judge",
+        "prompt": "可以为聚合内部的 `OrderItem` 实体单独建一个 `OrderItemRepository`，方便按商品 ID 查询。",
+        "answer": false,
+        "explain": "仓储只面向聚合根。`OrderItem` 是聚合内部实体，只能通过 `Order`（聚合根）访问。为内部实体单独建仓储意味着外部可以绕过聚合根直接操作，破坏了一致性边界。"
+      },
+      {
+        "type": "match",
+        "prompt": "把聚合的四条核心规则与各自的目的配对：",
+        "left": [
+          "通过聚合根修改内部对象",
+          "跨聚合只用标识引用",
+          "每次事务只修改一个聚合",
+          "通过最终一致性实现边界外更新"
+        ],
+        "right": [
+          "保证所有写操作都经过不变量验证的入口",
+          "避免把两个聚合耦合成一个大聚合",
+          "让每个聚合有独立的事务边界，降低并发冲突",
+          "用领域事件解耦跨聚合联动，提升系统弹性"
+        ],
+        "explain": "四条规则各有侧重：入口唯一保护不变量、标识引用保持边界独立、单事务单聚合控制并发、最终一致性实现弹性解耦。"
+      },
+      {
+        "type": "choice",
+        "prompt": "「聚合过大」会带来什么直接问题？",
+        "options": [
+          "领域事件数量减少",
+          "仓储接口方法变少",
+          "并发冲突增加、每次加载数据量大、事务边界扩大",
+          "值对象的不变性被破坏"
+        ],
+        "answer": 2,
+        "explain": "聚合越大，加载的数据越多，同时操作同一聚合的并发请求越多，事务冲突概率越高。把支付、发货、评价全放进 `Order` 是典型的过大聚合。"
+      },
+      {
+        "type": "input",
+        "prompt": "跨聚合的「最终一致性」通常通过发布什么来触发另一个聚合的异步更新？（中文）",
+        "accept": ["领域事件", "Domain Event", "domain event"],
+        "explain": "领域事件是实现「每次事务只修改一个聚合」规则的关键机制：聚合 A 完成操作后发布领域事件，聚合 B 在独立事务中响应，从而实现最终一致性。"
+      },
+      {
+        "type": "judge",
+        "prompt": "博客文章（Post）和它的评论（Comment）应该放在同一个聚合里，因为评论依附于文章存在。",
+        "answer": false,
+        "explain": "「依附关系」不是划聚合的唯一依据，还要看并发和不变量。评论数量可能很大，并发写入频繁，如果都放 `Post` 聚合，写评论就会锁整个帖子。通常 `Comment` 是独立聚合，通过 `post_id` 引用文章。"
+      }
+    ]
+  },
+  {
+    "title": "领域事件",
+    "subtitle": "把「已经发生的业务事实」建模成一等公民",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "用一个事务同时修改多个聚合是违反规则的，但业务上又真的需要「下单后锁库存、发邮件、扣积分」——怎么办？\n\n答案是：用**领域事件（Domain Event）**把这些操作解耦。聚合自己只负责一件事，把「已经发生的事实」记录成事件，其他上下文各自订阅、各自在独立事务中响应。\n\n领域事件不是技术上的消息，它是对业务事实的建模。`OrderPlaced`（订单已下单）描述的是一件已经发生的、对业务有意义的事情，这和 `on_database_row_updated` 这类技术通知有本质区别。"
+      },
+      {
+        "title": "领域事件的四个设计原则",
+        "body": "**原则 1：不可变**——事件已经发生，不能被修改，用 `frozen=True` 的 dataclass 实现。\n\n**原则 2：过去时命名**——命名格式是「领域概念 + 动词过去时」，反映业务事实而非技术操作：`OrderPlaced`、`PaymentFailed`、`UserEmailVerified`。`StatusChanged`、`DatabaseRowInserted` 都不是领域事件。\n\n**原则 3：包含足够的上下文**——事件里应包含订阅者处理所需的全部信息，避免订阅者再去查询（查询有时序问题）。\n\n**原则 4：事件是事实，不是命令**——命令（`PlaceOrder`）可能被拒绝；事件（`OrderPlaced`）已经发生，不能被「拒绝」，只能被响应。"
+      },
+      {
+        "title": "推荐的发布机制：聚合收集，应用服务发布",
+        "body": "聚合内部用列表收集事件，不直接发布；应用服务保存聚合后再统一发布。这样保证了「先持久化，再通知」的正确顺序：\n\n```python\nfrom dataclasses import dataclass, field\nfrom datetime import datetime\nfrom decimal import Decimal\nfrom uuid import UUID, uuid4\n@dataclass(frozen=True)\nclass OrderPlaced:\n    order_id: str\n    customer_id: str\n    total_amount: Decimal\n    occurred_at: datetime = field(\n        default_factory=datetime.now\n    )\nclass Order:\n    def __init__(self):\n        self._events = []\n    def place(self):\n        self._status = \"PLACED\"\n        self._events.append(OrderPlaced(\n            order_id=str(self._id),\n            customer_id=self._customer_id,\n            total_amount=self.total.amount,\n        ))\n    def collect_events(self):\n        events = list(self._events)\n        self._events.clear()\n        return events\nclass OrderAppService:\n    def place_order(self, cmd):\n        order = self._repo.get(cmd.order_id)\n        order.place()\n        self._repo.save(order)    # 先保存\n        for e in order.collect_events():\n            self._event_bus.publish(e)  # 再发布\n```"
+      },
+      {
+        "title": "为什么先保存再发布事件",
+        "body": "为什么必须先保存聚合，再发布事件？因为顺序反了会造成数据不一致。\n\n如果先发布事件再保存聚合：事件已经发出去，订阅者开始处理；但此时数据库保存失败了——订单没有实际创建，但库存已经被锁定，邮件已经发出。这种「幻象通知」很难修复。\n\n正确顺序：先提交事务（订单确实保存了），再发布事件。如果发布这步失败，可以用**发件箱模式（Outbox Pattern）**补救——把事件和聚合存在同一个事务里，由后台进程扫描并重新投递未发布的事件。这样即使消息队列暂时挂掉，事件也不会丢失。"
+      },
+      {
+        "title": "跨聚合协调的完整例子",
+        "body": "用户注册后，需要发欢迎邮件、初始化积分账户、发推送通知——三件事用三个独立的事件处理器来做：\n\n```python\n# 用户聚合发布事件\nclass User:\n    @classmethod\n    def register(cls, email, password):\n        user = cls(UserId(), email, password)\n        user._events.append(UserRegistered(\n            user_id=str(user._id),\n            email=str(email),\n        ))\n        return user\n# 各上下文独立响应，互不影响\ndef send_welcome_email(event):\n    email_svc.send_welcome(event.email)\ndef init_points_account(event):\n    points_svc.create_account(event.user_id)\ndef send_push_notification(event):\n    push_svc.notify(event.user_id)\n```\n\n邮件服务挂了不影响用户注册成功，积分初始化失败可以重试——各自独立，互不阻断。"
+      },
+      {
+        "title": "幂等处理：分布式环境的必备",
+        "body": "在分布式系统中，消息可能因为网络问题被重复投递。事件处理器必须是**幂等**的——同一个事件处理多次，结果和处理一次相同：\n\n```python\nclass StockReservationHandler:\n    def handle(self, event):\n        # 用事件 ID 作为幂等键\n        if self._processed.exists(str(event.event_id)):\n            return  # 已处理，直接返回\n        for item in event.items:\n            inv = self._repo.get(item[\"product_id\"])\n            inv.reserve(item[\"quantity\"])\n            self._repo.save(inv)\n        self._processed.add(str(event.event_id))\n```\n\n幂等键通常用事件的唯一 ID，处理完后记录「已处理」，下次看到同一个 ID 直接跳过。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **用技术事件冒充领域事件**：`on_field_changed`、`on_cache_invalidated` 不是领域事件，它们没有业务语义。\n- **命名用现在时或命令式**：`PlaceOrder` 是命令，`OrderPlace` 不规范。领域事件必须用过去时：`OrderPlaced`。\n- **事件信息不足**：事件里只放一个 ID，订阅者还得去查——这造成时序问题，应该在事件里包含处理所需的全部上下文。\n- **先发布事件再保存聚合**：顺序错误会导致「通知了但没保存」的数据不一致。\n- **处理器不幂等**：重复消费同一事件会重复扣库存、重复发邮件。"
+      },
+      {
+        "title": "小结",
+        "body": "领域事件是「已经发生的业务事实的记录」，不可变、过去时命名、包含足够上下文。它是实现「每次事务只改一个聚合」规则的关键机制，也是跨上下文解耦集成的核心手段。发布顺序：先保存聚合，再发布事件；生产环境用发件箱模式保证最终投递；处理器必须幂等。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪个是合格的领域事件命名？",
+        "options": [
+          "UpdateOrderStatus",
+          "DatabaseRowInserted",
+          "OrderCancelled",
+          "OnStatusChange"
+        ],
+        "answer": 2,
+        "explain": "`OrderCancelled` 符合「领域概念 + 动词过去时」的规范，表达了一个已发生的业务事实。其他三个要么是命令式、要么是技术事件，没有业务语义。"
+      },
+      {
+        "type": "judge",
+        "prompt": "可以先发布领域事件，再保存聚合到数据库，这样订阅者能更快收到通知。",
+        "answer": false,
+        "explain": "必须先保存聚合再发布事件。如果先发事件再保存，一旦保存失败，事件已发出但聚合未持久化，造成「通知了但没有实际发生」的数据不一致，且很难修复。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么领域事件里应该包含足够的上下文信息，而不是只放一个聚合 ID？",
+        "options": [
+          "减少网络传输次数",
+          "避免订阅者再去查询——查询有时序问题，事件发出时的状态与查询时的状态可能不同",
+          "让事件体积更大，更容易被消息队列识别",
+          "这样可以避免使用发件箱模式"
+        ],
+        "answer": 1,
+        "explain": "事件发出后，订阅者可能在一段时间后才处理，此时聚合状态可能已经改变。如果订阅者收到事件后再去查询，拿到的可能是更新后的状态，而不是触发事件时的状态，导致逻辑错误。"
+      },
+      {
+        "type": "input",
+        "prompt": "在分布式环境中，同一个领域事件可能被重复投递，为了保证处理结果正确，事件处理器需要具备什么特性？（一个词）",
+        "accept": ["幂等", "幂等性", "idempotent", "idempotency"],
+        "explain": "幂等性意味着同一个事件被处理一次和处理多次的结果相同。通常用事件 ID 作为幂等键，处理前检查是否已处理过。"
+      },
+      {
+        "type": "choice",
+        "prompt": "「发件箱模式（Outbox Pattern）」解决的是什么问题？",
+        "options": [
+          "如何让事件处理器并发处理多个事件",
+          "如何在应用层缓存领域事件",
+          "如何保证聚合保存和事件发布的原子性，防止事件丢失",
+          "如何避免领域事件里存放过多信息"
+        ],
+        "answer": 2,
+        "explain": "发件箱模式把事件和聚合状态存在同一个数据库事务里（保存到「发件箱」表），由后台进程扫描并投递未发布的事件。即使消息队列暂时不可用，事件也不会丢失。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`on_database_row_updated` 是一个合格的领域事件，因为数据库更新意味着业务状态发生了变化。",
+        "answer": false,
+        "explain": "领域事件必须具备业务语义，表达的是「业务上发生了什么」。`on_database_row_updated` 是技术事件，没有业务含义——到底是哪个业务规则触发的更新、对业务意味着什么，完全看不出来。"
+      },
+      {
+        "type": "match",
+        "prompt": "把领域事件的四个设计原则与各自的理由配对：",
+        "left": [
+          "不可变（frozen=True）",
+          "过去时命名",
+          "包含足够的上下文",
+          "先保存聚合再发布"
+        ],
+        "right": [
+          "事件代表已经发生的事实，不能被修改",
+          "强调这是已发生的事实而非待执行的命令",
+          "避免订阅者因时序问题查到错误状态",
+          "防止「通知了但未持久化」的数据不一致"
+        ],
+        "explain": "四个原则围绕「领域事件是已经发生的业务事实」这一核心展开：不可变、过去时表达事实性，充足信息保证订阅者独立处理，发布顺序保证数据一致性。"
+      },
+      {
+        "type": "input",
+        "prompt": "用户注册后需要发邮件和初始化积分，这两个操作不应该放在注册的同一个事务里。应该在 `User.register()` 里记录什么，让其他上下文异步响应？（中文）",
+        "accept": ["领域事件", "Domain Event", "domain event", "UserRegistered 事件"],
+        "explain": "在 `User.register()` 里记录 `UserRegistered` 领域事件，应用服务保存 User 后发布该事件，邮件和积分上下文各自订阅、各自在独立事务中处理，互不阻断。"
+      },
+      {
+        "type": "choice",
+        "prompt": "命令（Command）和领域事件（Domain Event）的本质区别是什么？",
+        "options": [
+          "命令由用户发出，事件由系统发出",
+          "命令描述待做的事且可能被拒绝，事件描述已发生的事实不可拒绝",
+          "命令有返回值，事件没有返回值",
+          "命令在领域层处理，事件在应用层处理"
+        ],
+        "answer": 1,
+        "explain": "命令（`PlaceOrder`）是「请求做某件事」，执行者可以因为业务规则拒绝它；事件（`OrderPlaced`）是「某件事已经发生」的记录，订阅者只能响应它，无法「拒绝」。"
+      },
+      {
+        "type": "judge",
+        "prompt": "同一个领域事件可以有多个订阅者，每个订阅者在自己的事务中独立处理。",
+        "answer": true,
+        "explain": "这正是领域事件解耦的核心价值。`UserRegistered` 可以同时被邮件服务、积分服务、推送服务订阅，三者各自独立处理、互不依赖，任何一个失败都不影响其他两个。"
+      }
+    ]
+  },
+  {
+    "title": "仓储",
+    "subtitle": "让领域层「感觉不到」持久化的存在",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "没有仓储时，领域代码会直接写 SQL：`db.execute('SELECT * FROM orders WHERE id=?', id)`，然后手动把数据库行拼装成领域对象，再手动把领域对象的字段更新回数据库。\n\n这带来四个问题：领域层与数据库强耦合；换数据库要改业务代码；单元测试必须连真实数据库；重建领域对象的代码散落各处，很容易不一致。\n\n**仓储（Repository）** 的核心思想是：给聚合根提供一个类似「内存集合」的持久化抽象，让领域层感觉自己在操作一个装满对象的集合，而不需要知道背后是 MySQL、PostgreSQL 还是 Redis。"
+      },
+      {
+        "title": "集合语义：仓储的接口设计",
+        "body": "仓储的接口要体现「集合操作」，而不是 SQL 操作：\n\n```python\nfrom abc import ABC, abstractmethod\nfrom typing import Optional, List\nclass OrderRepository(ABC):\n    @abstractmethod\n    def get(self, order_id) -> \"Order\":\n        \"\"\"根据 ID 获取，不存在则抛异常\"\"\"\n        ...\n    @abstractmethod\n    def find(self, order_id) -> Optional[\"Order\"]:\n        \"\"\"根据 ID 查找，不存在返回 None\"\"\"\n        ...\n    @abstractmethod\n    def save(self, order: \"Order\") -> None:\n        \"\"\"保存（新增或更新）\"\"\"\n        ...\n    @abstractmethod\n    def remove(self, order: \"Order\") -> None:\n        \"\"\"删除\"\"\"\n        ...\n    @abstractmethod\n    def find_by_customer(\n        self, customer_id: str\n    ) -> List[\"Order\"]:\n        ...\n```\n\n注意：接口是抽象类，定义在**领域层**；SQL 实现、内存实现都在**基础设施层**。这样领域层只依赖自己定义的接口，不依赖任何具体的持久化框架。"
+      },
+      {
+        "title": "四条设计原则",
+        "body": "**原则 1：每个聚合根一个仓储**——`OrderRepository`、`CustomerRepository`，但绝对不要 `OrderItemRepository`（内部实体通过聚合根访问）。\n\n**原则 2：接口在领域层，实现在基础设施层**——`domain/repository/order_repository.py` 只放抽象类；`infrastructure/persistence/` 放具体实现。\n\n**原则 3：仓储只操作聚合根**——`get`、`save`、`find` 都以聚合根为单位，不暴露内部实体的 CRUD。\n\n**原则 4：查询方法有节制**——复杂查询（多字段组合过滤、分页、聚合统计）不要堆在仓储里，用专门的查询服务或读模型处理。"
+      },
+      {
+        "title": "为什么接口要放在领域层",
+        "body": "为什么仓储接口要放在领域层，而不是基础设施层？因为依赖方向必须是「基础设施层依赖领域层」，反过来就错了。\n\n领域层定义「我需要什么操作」（接口）；基础设施层实现「怎么做到」（SQL、缓存、文件）。这样领域层对持久化技术零依赖，可以随时换掉 MySQL、加上 Redis 缓存，领域代码一行不改。\n\n```\ndomain/\n  repository/\n    order_repository.py   # 抽象接口（领域层）\ninfrastructure/\n  persistence/\n    sqlalchemy_order_repository.py  # SQL 实现\n    in_memory_order_repository.py   # 内存实现（测试用）\n```\n\n内存实现是单元测试的关键：测试时注入内存仓储，不需要启动数据库，测试跑得又快又可靠。"
+      },
+      {
+        "title": "内存仓储：让测试不依赖数据库",
+        "body": "内存仓储是仓储模式最直接的好处之一：\n\n```python\nclass InMemoryOrderRepository(OrderRepository):\n    def __init__(self):\n        self._store = {}\n    def get(self, order_id):\n        order = self._store.get(str(order_id))\n        if order is None:\n            raise OrderNotFoundError(str(order_id))\n        return order\n    def find(self, order_id):\n        return self._store.get(str(order_id))\n    def save(self, order):\n        self._store[str(order.id)] = order\n    def remove(self, order):\n        self._store.pop(str(order.id), None)\n    def find_by_customer(self, customer_id):\n        return [\n            o for o in self._store.values()\n            if o.customer_id == customer_id\n        ]\ndef test_order_can_be_placed():\n    repo = InMemoryOrderRepository()\n    order = Order(OrderId(), \"customer-001\")\n    order.add_item(snapshot, 1)\n    repo.save(order)\n    repo.get(order.id).place()\n    assert repo.get(order.id).status == OrderStatus.PLACED\n```"
+      },
+      {
+        "title": "仓储 vs DAO",
+        "body": "DAO（Data Access Object）和仓储经常被混淆，但它们的出发点完全不同：\n\nDAO 以**数据库表**为中心，方法对应 SQL 操作（`insert`、`update_email`、`delete_by_id`），返回数据传输对象或行记录，不理解领域规则。\n\n仓储以**聚合**为中心，方法对应集合操作（`get`、`save`、`find`、`remove`），返回领域对象，理解领域边界（只暴露聚合根）。\n\n```\nUserDAO.update_email(id, email)  → 直接改字段\nUserRepository.save(user)        → 保存整个聚合\n```\n\n仓储的 `save` 方法内部会处理新增/更新的判断，对调用方透明——调用方只需要「保存这个聚合」，不需要知道底层是 INSERT 还是 UPDATE。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **把仓储当 DAO 用**：在仓储里加 `update_status`、`update_email` 这种字段级方法，这是 DAO 的风格，不是仓储。\n- **在领域层 import 具体 ORM 框架**：`from sqlalchemy import ...` 出现在领域层，说明接口/实现没有分离。\n- **查询方法无节制膨胀**：仓储里堆了几十个 `find_by_X_and_Y_and_Z`，复杂查询应该走读模型或查询服务。\n- **为聚合内部实体建仓储**：`OrderItemRepository` 是常见错误，破坏了聚合边界。\n- **仓储直接返回 ORM 对象**：`_to_domain()` 方法做 ORM → 领域对象的转换是仓储的核心职责之一，不能省。"
+      },
+      {
+        "title": "小结",
+        "body": "仓储为聚合根提供「内存集合」语义的持久化抽象，让领域层与具体数据库技术解耦。接口定义在领域层，实现在基础设施层；每个聚合根一个仓储；内存实现让单元测试无需数据库。仓储和 DAO 的核心区别：仓储以聚合为中心，DAO 以数据库表为中心。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "仓储模式的核心比喻是什么？",
+        "options": [
+          "数据库连接池",
+          "类似内存中的集合，对调用方隐藏持久化细节",
+          "SQL 查询构建器",
+          "ORM 框架的封装层"
+        ],
+        "answer": 1,
+        "explain": "仓储让领域层「感觉」自己在操作一个装满领域对象的集合（`get`、`save`、`find`、`remove`），完全不需要知道背后用的是哪种数据库技术。"
+      },
+      {
+        "type": "judge",
+        "prompt": "仓储接口应该定义在基础设施层，因为它与持久化相关。",
+        "answer": false,
+        "explain": "仓储接口必须定义在**领域层**，实现才在基础设施层。这样依赖方向是「基础设施层依赖领域层」，领域层对具体持久化技术零依赖。反过来会导致领域层依赖 ORM 框架，违反分层原则。"
+      },
+      {
+        "type": "input",
+        "prompt": "为了让单元测试不依赖真实数据库，通常会为仓储提供哪种实现？（中文）",
+        "accept": ["内存仓储", "内存实现", "InMemoryRepository", "in-memory repository"],
+        "explain": "内存仓储用一个字典存储聚合对象，测试时注入内存仓储，完全不需要启动数据库，测试速度快且可靠。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个仓储方法设计违反了「仓储只操作聚合根」的原则？",
+        "options": [
+          "`OrderRepository.get(order_id) -> Order`",
+          "`OrderRepository.save(order: Order) -> None`",
+          "`OrderRepository.find_order_item(item_id: str) -> OrderItem`",
+          "`OrderRepository.find_by_customer(customer_id) -> List[Order]`"
+        ],
+        "answer": 2,
+        "explain": "`OrderItem` 是聚合内部实体，不应该通过仓储直接访问。需要 `OrderItem` 时，应该先通过 `OrderRepository.get(order_id)` 加载聚合根，再通过聚合根方法访问内部对象。"
+      },
+      {
+        "type": "judge",
+        "prompt": "仓储的 `save` 方法内部会自动判断是新增还是更新，调用方不需要区分。",
+        "answer": true,
+        "explain": "这正是仓储「集合语义」的体现——就像往集合里 add 一个对象，不需要知道底层是 INSERT 还是 UPDATE。仓储实现内部根据 ID 是否已存在来决定操作类型。"
+      },
+      {
+        "type": "match",
+        "prompt": "把仓储与 DAO 的特征分别配对：",
+        "left": [
+          "以聚合为中心，返回领域对象",
+          "以数据库表为中心，返回数据行",
+          "方法名：`get`、`save`、`find`、`remove`",
+          "方法名：`insert`、`update_email`、`delete_by_id`"
+        ],
+        "right": [
+          "仓储（Repository）",
+          "DAO（Data Access Object）",
+          "仓储（Repository）",
+          "DAO（Data Access Object）"
+        ],
+        "explain": "仓储用集合语义操作领域对象；DAO 用 SQL 语义操作数据库字段。两者的出发点和返回类型都不同。"
+      },
+      {
+        "type": "choice",
+        "prompt": "仓储中出现大量 `find_by_status_and_customer_and_date_range_gt_amount` 这类方法，正确的处理方式是什么？",
+        "options": [
+          "继续在仓储里加，越全越好",
+          "把这些方法移到应用服务里用循环过滤",
+          "复杂查询应该用专门的查询服务或读模型，不堆在仓储里",
+          "为每个组合条件新建一个仓储子类"
+        ],
+        "answer": 2,
+        "explain": "仓储里的查询方法应该保持克制，只放聚合根级别的基础查询。复杂的多条件过滤、分页、聚合统计，应该走独立的查询服务或 CQRS 读模型。"
+      },
+      {
+        "type": "input",
+        "prompt": "DDD 中，「以聚合为中心、对调用方隐藏持久化细节、接口在领域层」的这种模式叫什么？（中文）",
+        "accept": ["仓储", "仓储模式", "Repository", "repository"],
+        "explain": "仓储（Repository）模式是 DDD 战术设计的核心组件之一，专门为聚合根提供持久化抽象。"
+      },
+      {
+        "type": "judge",
+        "prompt": "仓储实现里可以直接把 ORM 对象（如 SQLAlchemy 的 model）返回给调用方，这样更简洁。",
+        "answer": false,
+        "explain": "仓储的核心职责之一是做 ORM 对象和领域对象之间的转换。直接返回 ORM 对象会让领域层依赖基础设施，破坏分层隔离。`_to_domain()` 方法不能省略。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种做法体现了仓储模式和 DAO 模式的本质差异？",
+        "options": [
+          "仓储用抽象类定义接口，DAO 不用",
+          "仓储的 `save` 对应聚合整体，DAO 的 `update_email` 对应单个字段",
+          "仓储放在基础设施层，DAO 放在领域层",
+          "仓储不支持删除操作，DAO 支持"
+        ],
+        "answer": 1,
+        "explain": "最本质的区别在操作粒度和返回类型：仓储以聚合为操作单位，保存/加载整个领域对象；DAO 以数据库字段为单位，操作具体的列。"
+      }
+    ]
+  },
+  {
+    "title": "领域服务",
+    "subtitle": "不属于任何单个实体的领域逻辑，该放在哪里",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "有些领域逻辑放在实体里很别扭：转账的扣款逻辑属于来源账户，入账逻辑属于目标账户，但「转账」这个动作本身——包括校验余额、检查单笔上限——不自然属于任何一个账户。\n\n类似的情况还有：计算订单最终价格需要订单、定价规则、优惠券三方协作；检查用户名唯一性需要查询仓储，但 `User` 实体不应该依赖仓储（违反分层）。\n\n这类「不属于任何单个实体、需要协调多个领域对象的领域逻辑」，放在**领域服务（Domain Service）**里。"
+      },
+      {
+        "title": "领域服务的本质：无状态的领域操作",
+        "body": "领域服务（Domain Service）的定义：表达领域概念、协调多个领域对象、**无状态**的操作。\n\n无状态是关键。领域服务不保存任何实例变量（非依赖注入的那种）：\n\n```python\nclass TransferDomainService:\n    def transfer(\n        self,\n        source,\n        target,\n        amount\n    ):\n        if source.balance < amount:\n            raise InsufficientFundsError(\"余额不足\")\n        if source.id == target.id:\n            raise TransferException(\"不能向自己转账\")\n        MAX = Money(Decimal(\"100000\"), \"CNY\")\n        if amount > MAX:\n            raise TransferException(\"单笔转账超限\")\n        source.debit(amount)\n        target.credit(amount)\n```\n\n无状态带来两个好处：整个应用可以共享同一个实例（单例安全）；每次调用独立，不需要重置状态，测试简单。"
+      },
+      {
+        "title": "领域服务 vs 应用服务：最重要的区别",
+        "body": "这是最容易混淆的一对概念，必须区分清楚：\n\n**领域服务**在领域层，只依赖领域层的对象（实体、值对象、其他领域服务），包含领域规则，无需 Mock 基础设施就能测试。\n\n**应用服务**在应用层，可以依赖仓储、消息队列、外部服务，职责是编排用例（协调领域对象和基础设施），本身不包含业务规则。\n\n```python\n# 领域服务：包含领域规则\nclass UserRegistrationDomainService:\n    def __init__(self, user_repo):\n        self._repo = user_repo\n    def validate_registration(self, email, password):\n        if self._repo.exists_by_email(email):\n            raise UserAlreadyExistsError(\n                f\"{email} 已被注册\"\n            )\n# 应用服务：编排，不含业务规则\nclass UserApplicationService:\n    def register(self, cmd):\n        email = Email(cmd.email)       # 值对象验证格式\n        password = Password(cmd.password)\n        self._domain_svc.validate_registration(\n            email, password\n        )                               # 调用领域服务\n        user = User.register(email, password)\n        self._repo.save(user)\n        for e in user.collect_events():\n            self._event_bus.publish(e)\n        return str(user.id)\n```"
+      },
+      {
+        "title": "四种典型场景",
+        "body": "**场景 1：协调两个聚合的操作**——账户转账，扣款/入账分属两个账户，「转账」本身是领域服务。\n\n**场景 2：复杂计算涉及多个对象**——订单定价需要订单 + 定价规则 + 优惠券协作，定价逻辑在领域服务 `OrderPricingService` 里。\n\n**场景 3：需要查询仓储的领域规则**——用户名唯一性检查是明确的领域规则，但 `User` 实体不应该依赖仓储，所以放在 `UsernameUniquenessChecker` 领域服务里。\n\n**场景 4：复杂的多聚合决策**——贷款审批需要客户信用评分 + 还款历史 + 现有贷款三方数据，审批逻辑在 `LoanApprovalService` 里。\n\n共同特征：逻辑是领域逻辑（不是基础设施操作），但不自然属于任何单个实体。"
+      },
+      {
+        "title": "命名要体现业务角色",
+        "body": "领域服务的命名应该反映它在业务中的角色，不要都叫 `XxxService`（太通用，无法区分领域服务和应用服务）：\n\n```python\n# 太通用，看不出是干什么的\nclass UserService: ...\nclass OrderService: ...\n# 清晰的业务角色\nclass UsernameUniquenessChecker: ...   # 检查器\nclass OrderPricingCalculator: ...      # 计算器\nclass LoanApprovalDecisionMaker: ...   # 决策器\nclass FraudDetector: ...               # 检测器\nclass AccountTransferCoordinator: ...  # 协调器\n```\n\n好的名字让人一眼知道这个类在业务上是做什么的，而不需要打开代码才能理解。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **把领域逻辑放进应用服务**：应用服务里出现 `if len(items) > 50` 这类业务判断，说明逻辑应该下沉到领域服务或实体。\n- **给领域服务加状态**：`self._last_calculated_price = price` 是典型错误，领域服务必须无状态。\n- **依赖了基础设施**：领域服务里 `import redis` 或直接调用 HTTP 接口，违反了「只依赖领域层」的原则。\n- **命名过于通用**：`OrderService` 既可能是领域服务也可能是应用服务，项目里两种都有时会造成混乱。\n- **分不清什么逻辑该放哪里**：区分关键是「这个规则是业务规则还是技术操作」。业务规则下沉领域层；加载聚合、持久化、发布事件等技术协调在应用层。"
+      },
+      {
+        "title": "小结",
+        "body": "当某段领域逻辑不自然属于任何单个实体或值对象时，放入**领域服务**：无状态、在领域层、只依赖领域对象。领域服务和应用服务的核心区别：领域服务包含业务规则，应用服务只编排用例。命名要体现业务角色（Checker、Calculator、Coordinator），不要都叫 `XxxService`。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪种情况最适合引入领域服务？",
+        "options": [
+          "把数据从数据库加载出来并返回给前端",
+          "一段领域逻辑需要协调多个聚合，但不自然属于任何单一实体",
+          "管理事务边界，保证聚合保存后发布事件",
+          "接收 HTTP 请求并转换为命令对象"
+        ],
+        "answer": 1,
+        "explain": "领域服务的使用场景是「领域逻辑不自然属于任何单个实体」。加载数据、管理事务、处理 HTTP 请求都是应用层或基础设施层的职责。"
+      },
+      {
+        "type": "judge",
+        "prompt": "领域服务可以保存实例状态（如缓存上次计算结果），这样可以提高性能。",
+        "answer": false,
+        "explain": "领域服务必须是无状态的。保存状态会让领域服务变成有副作用的对象，两次相同输入可能返回不同结果，难以测试和推理。性能优化应该在基础设施层（如缓存层）实现。"
+      },
+      {
+        "type": "choice",
+        "prompt": "「检查用户名是否已被占用」这条规则为什么适合放在领域服务而不是 `User` 实体？",
+        "options": [
+          "因为 User 实体不允许有方法",
+          "因为唯一性检查需要查询仓储，而实体不应该依赖仓储",
+          "因为唯一性检查不是业务规则",
+          "因为 User 实体的代码已经太长了"
+        ],
+        "answer": 1,
+        "explain": "唯一性检查是明确的领域规则，但执行它需要访问仓储（查询数据库）。实体不能依赖仓储（违反分层），所以这条规则放在领域服务里，由领域服务持有仓储依赖来执行查询。"
+      },
+      {
+        "type": "match",
+        "prompt": "把下列职责分别归到领域服务或应用服务：",
+        "left": [
+          "两个账户之间的转账规则（校验余额、单笔上限）",
+          "加载订单聚合、调用 `order.cancel()`、保存并发布事件",
+          "计算订单最终价格（涉及会员折扣 + 优惠券选择）",
+          "从 HTTP 请求构建命令对象，调用领域层，返回 HTTP 响应"
+        ],
+        "right": [
+          "领域服务——协调两个聚合的领域规则",
+          "应用服务——编排用例，不含业务规则",
+          "领域服务——复杂计算涉及多个领域对象",
+          "应用服务（或接口层）——技术协调，无业务逻辑"
+        ],
+        "explain": "判断标准：含业务规则且协调多个领域对象 → 领域服务；编排流程、技术协调 → 应用服务/接口层。"
+      },
+      {
+        "type": "input",
+        "prompt": "领域服务的一个关键设计特征是什么？（一个词，描述它没有持久化状态这一特性）",
+        "accept": ["无状态", "stateless"],
+        "explain": "无状态意味着领域服务不保存任何实例变量形式的状态（仅依赖注入的仓储等除外）。相同输入总是得到相同输出，可以安全地在整个应用中共享同一实例。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个领域服务的命名方式最清晰？",
+        "options": [
+          "`OrderService`",
+          "`DomainService`",
+          "`OrderPricingCalculator`",
+          "`ServiceManager`"
+        ],
+        "answer": 2,
+        "explain": "`OrderPricingCalculator` 清晰地表达了这个服务在业务中的角色——计算订单价格。`OrderService` 过于通用，无法区分领域服务和应用服务；`DomainService` 和 `ServiceManager` 根本没有业务含义。"
+      },
+      {
+        "type": "judge",
+        "prompt": "应用服务里可以直接写 `if order.total > 100000: raise ValueError(...)` 来验证订单金额上限。",
+        "answer": false,
+        "explain": "这是业务规则，应该在领域层（实体方法或领域服务）里实现，而不是在应用服务里。应用服务只编排用例，调用领域方法，本身不包含业务判断。"
+      },
+      {
+        "type": "choice",
+        "prompt": "领域服务和应用服务的最本质区别是什么？",
+        "options": [
+          "领域服务有状态，应用服务无状态",
+          "领域服务包含业务规则，应用服务只编排用例",
+          "领域服务依赖数据库，应用服务不依赖",
+          "领域服务由 REST API 调用，应用服务由领域层调用"
+        ],
+        "answer": 1,
+        "explain": "领域服务里有「余额不足拒绝转账」「单笔上限」这类业务判断；应用服务里只有「加载聚合 → 调用方法 → 保存 → 发布事件」这类技术流程，不含业务 if/else。"
+      },
+      {
+        "type": "input",
+        "prompt": "贷款审批需要综合客户信用评分、还款历史、现有贷款进行决策，这段逻辑应该放在哪一层？（中文，具体到哪类对象）",
+        "accept": ["领域服务", "domain service", "Domain Service"],
+        "explain": "贷款审批规则是明确的领域逻辑（不是技术操作），且需要协调多个聚合（客户、信用历史、贷款记录），不自然属于任何单个实体，所以放在领域服务里。"
+      },
+      {
+        "type": "judge",
+        "prompt": "领域服务可以直接调用外部 HTTP API 来完成它的业务逻辑，比如实时查询汇率。",
+        "answer": false,
+        "explain": "领域服务只能依赖领域层的对象（实体、值对象、其他领域服务）。直接调用 HTTP API 是基础设施层的操作。正确做法是定义一个领域层的接口（如 `ExchangeRateService`），由基础设施层提供 HTTP 实现，通过依赖注入传入领域服务。"
+      }
+    ]
+  },
+  {
+    "title": "应用服务",
+    "subtitle": "用例的编排层——协调领域和基础设施，自己不含业务规则",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "领域对象有了完整的业务逻辑，仓储负责持久化，领域事件负责通知——但谁来把这一切串起来？谁来接收一个「下单」请求，加载订单聚合，调用 `order.place()`，保存，发布事件，然后返回结果？\n\n这就是**应用服务（Application Service）**的职责：它是用例（Use Case）的入口，负责编排整个操作流程。关键在于——应用服务本身不包含任何业务规则，业务规则在领域层。应用服务只负责「按正确的顺序，调用正确的对象」。"
+      },
+      {
+        "title": "应用服务的六步模板",
+        "body": "一个典型的应用服务方法遵循固定的步骤顺序：\n\n1. 接收外部请求（Command 对象）\n2. 加载领域对象（通过仓储）\n3. 调用领域方法（业务规则在这里执行）\n4. 持久化变更（保存聚合）\n5. 发布领域事件\n6. 返回结果（ID 或 DTO）\n\n```python\nclass OrderApplicationService:\n    def cancel_order(self, cmd):\n        # 1. 加载聚合\n        order = self._order_repo.get(\n            OrderId(cmd.order_id)\n        )\n        # 2. 调用领域方法（规则在 Order 里）\n        order.cancel(cmd.reason)\n        # 3. 持久化\n        self._order_repo.save(order)\n        # 4. 发布事件\n        for e in order.collect_events():\n            self._event_bus.publish(e)\n```\n\n注意这里完全没有 `if`/`else` 业务判断——「当前状态不允许取消」这条规则在 `order.cancel()` 内部。"
+      },
+      {
+        "title": "命令与查询分离（CQS）",
+        "body": "应用服务的方法分两类：**命令（Command）** 改变系统状态，**查询（Query）** 读取数据但不改变状态。\n\n命令对象和查询对象分别用不同的类表示：\n\n```python\nfrom dataclasses import dataclass\nfrom typing import Optional\n@dataclass(frozen=True)\nclass PlaceOrderCommand:\n    customer_id: str\n    items: tuple\n    shipping_address: dict\n@dataclass(frozen=True)\nclass CancelOrderCommand:\n    order_id: str\n    reason: str\n@dataclass(frozen=True)\nclass GetOrderQuery:\n    order_id: str\n@dataclass(frozen=True)\nclass ListCustomerOrdersQuery:\n    customer_id: str\n    status: Optional[str] = None\n    page: int = 1\n    page_size: int = 20\n```\n\n分离的好处：命令方法清楚地表达「这个操作会改变状态」；查询方法可以直接走读模型，不需要加载完整聚合，性能更好；两类方法的测试策略也不同。"
+      },
+      {
+        "title": "事务管理：应用服务是边界",
+        "body": "事务边界在应用服务里管理，不在领域层。通常一个应用服务方法对应一个事务：\n\n```python\nclass OrderApplicationService:\n    @transactional  # 整个方法在一个事务中\n    def place_order(self, cmd):\n        order = Order(OrderId(), cmd.customer_id)\n        for item in cmd.items:\n            product = self._catalog.get_snapshot(\n                item[\"product_id\"]\n            )\n            order.add_item(product, item[\"quantity\"])\n        order.place()\n        self._order_repo.save(order)\n        # 事务在方法结束时提交\n        return str(order.id)\n    # 事务提交后再发布事件（在事务外）\n```\n\n为什么事务不能放在领域层？领域层不应该依赖数据库事务这类基础设施概念。把事务管理放在应用层，领域层保持纯粹。"
+      },
+      {
+        "title": "为什么先提交事务再发布事件",
+        "body": "事务和事件发布的顺序错了会出大问题：\n\n```python\n# 错误顺序：先发事件再保存\ndef place_order_wrong(self, cmd):\n    order = Order(...)\n    order.place()\n    # 先发事件——事件已发出！\n    for e in order.collect_events():\n        self._event_bus.publish(e)\n    # 再保存——如果这里失败，\n    # 事件发出了但订单没有保存，数据不一致\n    self._order_repo.save(order)\n# 正确顺序：先保存再发事件\ndef place_order(self, cmd):\n    order = Order(...)\n    order.place()\n    self._order_repo.save(order)  # 先提交\n    # 保存成功后再发布\n    for e in order.collect_events():\n        self._event_bus.publish(e)\n    return str(order.id)\n```\n\n如果发布事件失败，用发件箱模式兜底——事件已经和聚合一起持久化了，后台进程会重试投递。"
+      },
+      {
+        "title": "应用服务不该做的事",
+        "body": "应用服务里出现以下内容，说明逻辑放错了位置：\n\n```python\n# 错误：应用服务里有业务逻辑\nclass OrderApplicationService:\n    def place_order(self, cmd):\n        # 这些是业务规则，应该在领域层\n        if len(cmd.items) > 50:\n            raise ValueError(\"商品不能超过50种\")\n        total = sum(\n            i[\"price\"] * i[\"qty\"] for i in cmd.items\n        )\n        if total > 100000:\n            raise ValueError(\"单笔不能超过10万\")\n        # 手动计算总价也是业务逻辑\n        order._total = total\n```\n\n「订单商品不超过 50 种」是业务不变量，应该在 `Order.add_item()` 里验证；「单笔上限」也是业务规则，属于领域层。应用服务只管「加载 → 调用 → 保存 → 发布」，不做任何业务判断。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **应用服务里写 if/else 业务判断**：发现这类代码，把它下沉到领域层（实体方法或领域服务）。\n- **事务和事件发布顺序搞反**：先发事件再提交事务，一旦保存失败就造成「幻象通知」。\n- **应用服务直接返回领域对象**：应该把领域对象转换为 DTO 再返回，避免外部代码依赖领域模型的内部结构。\n- **命令/查询混合**：一个方法又改状态又返回复杂数据，职责模糊，也难以优化（查询可以走缓存，改状态不能）。\n- **在应用服务里手动操作聚合内部**：`order._status = 'PAID'` 直接赋值，绕过了聚合根的不变量保护。"
+      },
+      {
+        "title": "小结",
+        "body": "应用服务是用例的编排层，按「加载 → 调用领域方法 → 保存 → 发布事件 → 返回」的顺序协调一切，自身不含业务规则。命令/查询分离让意图更清晰；事务在应用服务管理，先提交再发布事件。黄金原则：如果应用服务里出现了业务 if/else，把它下沉到领域层。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "应用服务的核心职责是什么？",
+        "options": [
+          "包含复杂的业务规则和领域逻辑",
+          "编排用例流程（加载聚合、调用领域方法、保存、发布事件），自身不含业务规则",
+          "直接操作数据库，避免通过仓储的抽象层",
+          "把领域事件路由到对应的处理器"
+        ],
+        "answer": 1,
+        "explain": "应用服务是「协调者」而非「决策者」。业务规则全部在领域层（实体、领域服务），应用服务只负责按正确顺序把各个部件串起来。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在应用服务里写 `if order.total > 100000: raise ValueError('超出限额')` 是合理的，因为这是简单的校验。",
+        "answer": false,
+        "explain": "「单笔订单不能超过某个金额」是业务规则，应该在领域层实现（Order 的方法或领域服务），不应出现在应用服务里。应用服务里出现业务 if/else 是典型的「领域逻辑泄漏到应用层」。"
+      },
+      {
+        "type": "choice",
+        "prompt": "命令（Command）和查询（Query）分离的主要好处是什么？",
+        "options": [
+          "减少类的数量，让代码更简洁",
+          "让意图更清晰，命令方法明确改状态，查询方法可走缓存/读模型优化",
+          "避免使用数据库事务",
+          "让领域服务可以直接调用应用服务"
+        ],
+        "answer": 1,
+        "explain": "分离命令和查询让「这个操作会改变状态」这一意图变得显式。查询走读模型或缓存，不需要加载完整聚合；命令走写路径，有事务保护。两者可以独立优化和测试。"
+      },
+      {
+        "type": "input",
+        "prompt": "应用服务中，事务的提交和领域事件的发布哪个在前？（填「事务提交」或「事件发布」）",
+        "accept": ["事务提交", "先提交事务", "保存聚合"],
+        "explain": "必须先提交事务（保存聚合），再发布领域事件。如果先发事件，保存失败后会造成「事件已发出但聚合未持久化」的数据不一致，且难以修复。"
+      },
+      {
+        "type": "choice",
+        "prompt": "应用服务返回结果时，应该返回什么类型的对象？",
+        "options": [
+          "直接返回领域实体（如 `Order` 对象），方便调用方使用",
+          "返回 DTO（数据传输对象），避免外部依赖领域模型内部结构",
+          "返回 ORM 对象，这样可以直接序列化为 JSON",
+          "什么都不返回，调用方自己去查询"
+        ],
+        "answer": 1,
+        "explain": "直接返回领域对象会让外部代码依赖领域模型的内部结构，改动领域模型就会影响所有调用方。应该把领域对象转换为 DTO（如 `OrderDTO`）再返回，隔离内外边界。"
+      },
+      {
+        "type": "judge",
+        "prompt": "事务管理（开启/提交/回滚）的逻辑应该放在领域层，因为事务保护的是领域数据。",
+        "answer": false,
+        "explain": "事务管理是基础设施概念，不应该出现在领域层。正确位置是应用服务——每个应用服务方法通常对应一个事务边界，用装饰器（`@transactional`）或 Unit of Work 模式管理。"
+      },
+      {
+        "type": "match",
+        "prompt": "把应用服务的操作步骤与各自的目的配对：",
+        "left": [
+          "通过仓储 `get` 加载聚合",
+          "调用 `order.cancel(reason)`",
+          "调用 `order_repo.save(order)`",
+          "调用 `event_bus.publish(event)`"
+        ],
+        "right": [
+          "把持久化的数据还原为领域对象",
+          "在领域对象内部执行业务规则",
+          "把聚合的最新状态写回数据库",
+          "通知其他上下文发生了什么"
+        ],
+        "explain": "应用服务的四个核心动作各有分工：加载（还原状态）、调用领域方法（执行规则）、保存（持久化）、发布事件（解耦通知）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个应用服务方法既修改了订单状态，又返回了订单的完整详情。这样的设计有什么问题？",
+        "options": [
+          "没有问题，这样调用方更方便",
+          "违反了命令/查询分离原则，混淆了意图，也难以分别优化",
+          "性能会变差",
+          "会导致领域事件被重复发布"
+        ],
+        "answer": 1,
+        "explain": "命令方法应该只改变状态（返回 ID 或 void），查询方法只读取数据。混在一起让意图模糊，也阻碍了独立优化——比如查询可以走缓存，但改状态的操作不应该走缓存。"
+      },
+      {
+        "type": "input",
+        "prompt": "应用服务里接收外部请求的不可变数据对象（用于传递操作参数）叫做什么？（中文）",
+        "accept": ["命令", "命令对象", "Command", "command"],
+        "explain": "命令（Command）对象封装了一次操作所需的全部参数，是不可变的（`frozen=True`），表达「请求做某件事」的意图。对应地，只读操作用查询（Query）对象。"
+      },
+      {
+        "type": "judge",
+        "prompt": "查询方法（获取订单详情）可以不经过聚合根，直接查询数据库表，用专门的查询模型返回数据。",
+        "answer": true,
+        "explain": "这正是 CQRS（命令查询职责分离）的核心思想。读操作不需要保护不变量，不需要加载完整聚合，可以直接查询数据库或读模型，性能更好。聚合根的「唯一入口」原则只约束写操作。"
+      }
+    ]
+  },
+  {
+    "title": "工厂",
+    "subtitle": "封装复杂的对象创建逻辑，让构造函数保持简单",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "当对象的创建逻辑变得复杂——需要调用外部服务获取数据、有多种不同的创建方式、创建时要触发领域事件——把这些逻辑全塞进构造函数会让构造函数变成一个巨型方法，职责不清，也难以测试。\n\n**工厂（Factory）**的作用是把复杂的创建逻辑封装起来，让构造函数只做基本赋值，让创建的语义清晰可见。`User.register(email, password)` 比 `User(user_id, email, password_hash, status, events)` 更能表达业务意图。"
+      },
+      {
+        "title": "形式 1：工厂方法（最常用）",
+        "body": "在聚合根上定义 `@classmethod` 工厂方法，语义清晰，适合有多种创建方式的场景：\n\n```python\nclass User:\n    def __init__(self, user_id, email, password_hash):\n        self._id = user_id\n        self._email = email\n        self._password_hash = password_hash\n        self._status = \"INACTIVE\"\n        self._events = []\n    @classmethod\n    def register(cls, email, password):\n        \"\"\"工厂方法：注册新用户\"\"\"\n        user = cls(\n            user_id=UserId(),\n            email=email,\n            password_hash=password.hash()\n        )\n        user._events.append(UserRegistered(\n            user_id=str(user._id),\n            email=str(email),\n        ))\n        return user\n    @classmethod\n    def create_admin(cls, email, created_by):\n        \"\"\"工厂方法：创建管理员（不同语义）\"\"\"\n        user = cls(\n            UserId(), email,\n            Password.generate_temporary().hash()\n        )\n        user._status = \"ACTIVE\"  # 管理员直接激活\n        return user\n```\n\n`register` 和 `create_admin` 的创建逻辑不同，但构造函数保持简洁统一。"
+      },
+      {
+        "title": "形式 2：工厂类（创建逻辑复杂时）",
+        "body": "当创建聚合需要调用多个外部服务时，用独立的工厂类，通过依赖注入传入所需服务：\n\n```python\nclass MortgageLoanFactory:\n    def __init__(\n        self, valuator, credit_bureau, risk_calc\n    ):\n        self._valuator = valuator\n        self._credit_bureau = credit_bureau\n        self._risk_calc = risk_calc\n    def create_application(\n        self, applicant, property, amount\n    ):\n        # 1. 评估房产价值\n        prop_value = self._valuator.valuate(property)\n        max_loan = prop_value * Decimal(\"0.7\")\n        if amount > max_loan:\n            raise LoanException(\"申请超出可贷额度\")\n        # 2. 查询征信\n        credit = self._credit_bureau.query(\n            applicant.id_number\n        )\n        # 3. 计算初始风险评分\n        risk = self._risk_calc.calculate(\n            applicant, credit, amount, prop_value\n        )\n        return MortgageLoanApplication(\n            application_id=LoanApplicationId(),\n            applicant_id=applicant.id,\n            requested_amount=amount,\n            initial_risk_score=risk,\n        )\n```\n\n工厂类把「创建一个贷款申请需要哪些外部信息」这个复杂流程集中在一处，测试时可以 Mock 三个依赖。"
+      },
+      {
+        "title": "工厂 vs 仓储：创建 vs 重建",
+        "body": "工厂和仓储都会「产出」领域对象，但职责截然不同：\n\n**工厂**：创建**全新**的对象——生成新 ID、初始状态、可能触发领域事件（如 `UserRegistered`）。输入是业务数据（命令）。\n\n**仓储**：**重建**已存在的对象——使用已有 ID、从持久化数据恢复状态、不触发事件。输入是数据库行/文档。\n\n```python\n# 工厂：新对象\nclass OrderFactory:\n    def create(self, customer_id, items):\n        order_id = OrderId()   # 新 ID\n        order = Order(order_id, customer_id)\n        for item in items:\n            order.add_item(item[\"product\"], item[\"qty\"])\n        return order  # DRAFT 状态，没有历史\n# 仓储：重建已有对象\nclass OrderRepository:\n    def get(self, order_id):\n        orm = self._db.find(str(order_id))\n        return Order.reconstitute(\n            order_id=OrderId(UUID(orm.id)),\n            customer_id=orm.customer_id,\n            status=OrderStatus(orm.status),\n            items=[...],\n        )\n```\n\n`reconstitute` 工厂方法专门用于仓储重建，它绕过正常构造流程，不触发领域事件，直接恢复持久化状态。"
+      },
+      {
+        "title": "测试中的工厂：Test Builder 模式",
+        "body": "工厂的思想在测试里也很有用。Test Builder 模式让构造测试对象变得优雅：\n\n```python\nclass OrderBuilder:\n    def __init__(self):\n        self._order_id = OrderId()\n        self._customer_id = \"test-customer\"\n        self._items = []\n        self._status = OrderStatus.DRAFT\n    def with_customer(self, cid):\n        self._customer_id = cid\n        return self\n    def with_item(self, product_id, price, qty=1):\n        snap = ProductSnapshot(\n            product_id, f\"Product\", Money(price)\n        )\n        self._items.append(\n            OrderItem(f\"item-{len(self._items)}\",\n                      snap, qty)\n        )\n        return self\n    def paid(self):\n        self._status = OrderStatus.PAID\n        return self\n    def build(self):\n        return Order.reconstitute(\n            self._order_id, self._customer_id,\n            self._status, self._items\n        )\ndef test_paid_order_cannot_be_cancelled():\n    order = (\n        OrderBuilder()\n        .with_item(\"iphone\", Decimal(\"7999\"))\n        .paid()\n        .build()\n    )\n    with pytest.raises(OrderException):\n        order.cancel(\"changed mind\")\n```"
+      },
+      {
+        "title": "什么时候不需要工厂",
+        "body": "不是所有对象的创建都需要工厂。以下情况直接用构造函数：\n\n- 简单的值对象：`Money(Decimal('99.99'), 'CNY')` 直接构造，不需要工厂。\n- 只有一种创建方式且逻辑很简单：三行以内的初始化不值得引入工厂。\n- 测试辅助对象：用 Builder 或直接构造就够了。\n\n需要工厂的信号：\n- 创建逻辑超过 3-5 行（有多个步骤）\n- 需要调用外部服务才能准备创建所需数据\n- 有多种不同的创建语义（注册用户、导入用户、管理员创建）\n- 创建时要触发领域事件\n\n工厂是「让创建变简单且语义清晰」的工具，不是必须到处用的模式。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **构造函数里调用外部服务**：构造函数里出现 HTTP 调用、数据库查询，测试时根本没法 Mock，应该移到工厂类。\n- **混淆工厂方法和仓储的 reconstitute**：`register()` 创建新对象（有事件），`reconstitute()` 恢复已有对象（无事件），两者不能互换。\n- **工厂类变成上帝类**：把所有对象的创建都放进一个 `Factory` 类，职责膨胀。每种聚合有自己的工厂。\n- **创建逻辑很简单却引入工厂**：过度设计。`Address(province, city, detail)` 直接构造即可，加一层 `AddressFactory` 只是增加复杂度。"
+      },
+      {
+        "title": "小结",
+        "body": "工厂封装复杂的创建逻辑，让构造函数保持简单，让创建的业务语义可见。三种形式：工厂方法（classmethod）适合多种创建语义；工厂类适合创建需要外部服务；抽象工厂适合创建一族相关对象。工厂和仓储的核心区别：工厂创建全新对象（新 ID + 新状态 + 可能有事件），仓储重建已有对象（旧 ID + 恢复状态 + 无事件）。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "什么情况下应该引入工厂，而不是直接用构造函数？",
+        "options": [
+          "任何时候都应该用工厂，这是 DDD 的最佳实践",
+          "只有创建值对象时才需要工厂",
+          "创建逻辑复杂（多步骤、调用外部服务、有多种创建语义）时",
+          "只有当团队人数超过 5 人时"
+        ],
+        "answer": 2,
+        "explain": "工厂不是必须到处用的模式，它是解决「创建逻辑复杂」问题的工具。简单的值对象直接构造；只有创建逻辑超过 3-5 行、需要外部服务或有多种语义时，才值得引入工厂。"
+      },
+      {
+        "type": "judge",
+        "prompt": "工厂方法（`@classmethod` 形式）和仓储的 `reconstitute` 方法都会创建一个聚合对象，它们的区别只是名字不同。",
+        "answer": false,
+        "explain": "两者有本质区别：工厂方法（如 `User.register()`）创建全新对象，生成新 ID，可能触发领域事件；`reconstitute` 用于仓储重建，使用已有 ID，从持久化状态恢复，绝对不触发领域事件。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`User.register(email, password)` 和 `User.create_admin(email, created_by)` 是同一个类上的两个工厂方法，这种设计的主要优势是什么？",
+        "options": [
+          "减少了代码行数",
+          "让构造函数的参数列表更短",
+          "清晰表达了不同的业务创建语义，每种方式有自己的初始化逻辑",
+          "避免了继承关系"
+        ],
+        "answer": 2,
+        "explain": "注册用户和创建管理员的业务语义不同（初始状态、触发的事件、验证规则都不同），用两个命名清晰的工厂方法来表达，比用一个带 `is_admin=False` 参数的构造函数清晰得多。"
+      },
+      {
+        "type": "input",
+        "prompt": "DDD 中，仓储从数据库重建聚合对象时通常调用聚合根上的哪个工厂方法？（英文方法名）",
+        "accept": ["reconstitute", "reconstitute()"],
+        "explain": "`reconstitute`（重建）是专门给仓储用的工厂方法，绕过正常构造流程，不触发领域事件，直接把持久化数据恢复为领域对象的状态。"
+      },
+      {
+        "type": "choice",
+        "prompt": "创建抵押贷款申请需要调用房产估值服务、征信查询、风险计算三个外部服务，最合适的工厂形式是？",
+        "options": [
+          "在 `MortgageLoanApplication` 的构造函数里直接调用三个服务",
+          "在 `MortgageLoanApplication` 上定义 `@classmethod create()`",
+          "独立的工厂类 `MortgageLoanFactory`，通过依赖注入接收三个服务",
+          "在应用服务里直接写创建逻辑"
+        ],
+        "answer": 2,
+        "explain": "当创建逻辑需要依赖多个外部服务时，用独立的工厂类。通过依赖注入接收服务，便于测试时 Mock；把复杂的创建流程封装在一处，构造函数保持简单。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Test Builder 模式（如 `OrderBuilder().with_item(...).paid().build()`）也是工厂思想的一种应用。",
+        "answer": true,
+        "explain": "Test Builder 把测试对象的构造逻辑集中封装，用流式 API 表达「我需要一个处于已支付状态、有这些商品的订单」，避免在每个测试里重复写大量构造代码。本质上它是工厂模式在测试领域的应用。"
+      },
+      {
+        "type": "match",
+        "prompt": "把三种工厂形式与各自适用的场景配对：",
+        "left": [
+          "工厂方法（@classmethod）",
+          "工厂类（独立 Factory 类）",
+          "抽象工厂（Abstract Factory）"
+        ],
+        "right": [
+          "聚合上有多种创建语义（注册/管理员创建/导入）",
+          "创建需要依赖多个外部服务，逻辑复杂",
+          "需要创建一族相关对象（如不同渠道的通知对象）"
+        ],
+        "explain": "三种工厂形式解决不同复杂度的创建问题：工厂方法适合同一聚合的多种语义；工厂类适合需要外部依赖的复杂创建；抽象工厂适合创建一整族相关对象。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种对象最不需要引入工厂，直接用构造函数就够了？",
+        "options": [
+          "抵押贷款申请聚合（需要外部估值和征信）",
+          "用户聚合（有「注册」「管理员创建」两种方式）",
+          "Money 值对象（`Money(Decimal('99.99'), 'CNY')`）",
+          "订单聚合（创建时需要验证商品可用性）"
+        ],
+        "answer": 2,
+        "explain": "简单的值对象直接用构造函数，不需要工厂。`Money` 的构造只需要金额和货币两个参数，逻辑简单，加一层 `MoneyFactory` 只是增加不必要的复杂度。"
+      },
+      {
+        "type": "input",
+        "prompt": "工厂和仓储都能「产出」领域对象。工厂产出的是新对象，仓储产出的是什么？（两个字）",
+        "accept": ["重建", "已有", "恢复", "重建对象"],
+        "explain": "仓储从持久化数据中「重建」（reconstitute）已经存在的聚合对象，使用数据库里的 ID 和状态，不生成新 ID，也不触发领域事件。"
+      },
+      {
+        "type": "judge",
+        "prompt": "工厂方法 `User.register()` 在创建用户的同时，可以向聚合内部添加 `UserRegistered` 领域事件。",
+        "answer": true,
+        "explain": "工厂方法是创建新对象的入口，创建时触发领域事件是合理的——「用户注册」这件事在对象被创建的那一刻发生，在工厂方法里记录 `UserRegistered` 事件，语义非常清晰。这正是工厂方法比普通构造函数更有表达力的地方之一。"
+      }
+    ]
+  }
+]

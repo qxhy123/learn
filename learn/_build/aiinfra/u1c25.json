@@ -1,0 +1,138 @@
+[
+  {
+    "id": "u1c25",
+    "title": "RoCE/InfiniBand、无损网络与拥塞控制",
+    "subtitle": "从 GID/PFC/ECN 到 pause storm：让 RDMA packet 安全穿越 fabric",
+    "intro": [
+      {
+        "title": "为什么 RDMA 对 fabric 要求这么高",
+        "body": "TCP 可以靠丢包后重传来恢复；RDMA RC QP 也有重试，但重试次数有限，且丢包或长时延会导致 `retry exceeded`，让整个通信连接进入 ERR 状态。**分布式训练是同步系统**，一个 QP 的 retry 会让所有 rank 的 AllReduce 卡住。\n\n因此 RDMA fabric 必须具备：近无损的 priority 队列、拥塞在丢包前的提前反馈、合理的路由和缓冲区设计，以及对异常的快速止损机制。",
+        "tip": "排障时不要只问\"网络通不通\"，要问：GID 对不对、MTU 一致吗、PFC 是否只对 RDMA priority 开启、ECN 是否早于 PFC 触发。"
+      },
+      {
+        "title": "RoCE v2 的数据面：从 verbs 到以太网",
+        "body": "应用提交 verbs WR，落到 RoCE v2 数据面后，包会变成：\n\n`verbs WR → HCA QP context → RoCE BTH/RETH/AETH → UDP dst port 4791 → IPv4/IPv6 → DSCP/ECN bits → Ethernet VLAN + PCP → switch queue → PFC/ECN/ECMP`\n\n**GID index 不是装饰项**：它选择的是 HCA 端口 GID 表中的某一条目，不同条目可能对应不同 VLAN、地址族、RoCE version 或 netdev。配置 `NCCL_IB_GID_INDEX=3` 不等于所有节点的 index 3 都对应同一业务 VLAN，GID 表在不同镜像/固件/VLAN 配置下顺序可能不同。"
+      },
+      {
+        "title": "PFC：逐跳暂停，不是端到端可靠性",
+        "body": "**PFC（IEEE 802.1Qbb）** 允许接收端按 priority 发 pause frame，让对端停止发送该 priority 流量，在短时 buffer 压力下避免 lossless priority 丢包。它是**逐跳机制**，不是端到端拥塞控制。\n\n**PFC 的副作用：** 下游端口拥塞 → 上游被 pause → 上游积压再 pause 更上游，拥塞沿 fabric **反向传播**。多个业务共享 lossless priority，互不相关的流会被一起停，这是 **pause storm 和 head-of-line blocking** 的根源。\n\n**PFC watchdog 必须配置：** 交换机和 NIC 都支持检测异常持续 pause 后强制恢复。`detection_time` 通常设 100-200ms，`action=drop`（让该 priority 临时变 lossy 而非永久死锁）。没有 watchdog 的 RoCE 集群在 incast/热点场景几乎必然遇到无法自愈的 fabric 死锁。",
+        "reveal": {
+          "q": "PFC pause counter 快速增长，是否说明网络没有丢包所以没问题？",
+          "a": "不是。PFC 频繁增长说明拥塞控制闭环太晚或队列隔离错误；pause 本身会导致 HOL blocking 和 pause storm，让与拥塞无关的流量也被暂停，最终体现为训练 timeout。"
+        }
+      },
+      {
+        "title": "ECN、CNP 与 DCQCN：在丢包前反馈",
+        "body": "正确的 RoCE 拥塞控制是 **ECN → CNP → DCQCN** 的闭环，而非依赖 PFC：\n\n1. **ECN mark**：交换机队列超过阈值后对经过的 packet 标记 ECN（在 IP header 中），不丢包\n2. **CNP（Congestion Notification Packet）**：接收端 HCA 收到带 ECN 的 RoCE packet 后生成 CNP 发回发送端\n3. **DCQCN**：发送端 HCA 收到 CNP 后降低注入速率，按算法逐步恢复\n\n**健康信号：** ECN mark 和 CNP 在 burst 早期出现，PFC 低频且局部，drop/retry 极低。\n\n**危险信号：** PFC 比 ECN 更早频繁触发（拥塞反馈太晚）；ECN marks 多但 CNP 少（接收端 CNP 被阻塞或 priority 映射错误）；CNP 多但速率不降（DCQCN profile 未启用）。"
+      },
+      {
+        "title": "MTU：多层不一致是常见故障根源",
+        "body": "RoCE 有多层 MTU：Linux netdev MTU、交换机 L2 MTU、RoCE QP path MTU、HCA port active MTU。**任一层不一致**，可能表现为吞吐低、retry、timeout 或只在大消息出错。\n\nRoCE v2 实际帧包含 Ethernet + VLAN + IP + UDP + RoCE headers。要承载 4096 byte RDMA payload，交换机 L2 MTU 不能只按 IP MTU 等值理解。混合 VLAN、overlay 或交换机端口 profile 中 MTU 不一致尤其常见。\n\n验证：`ip link show <iface>` 和 `ibv_devinfo | grep active_mtu`",
+        "tip": "ECMP hash 若不包含 UDP source port，少量 QP 可能极化到同一 spine link，出现\"某些节点组合慢，其余正常\"。"
+      },
+      {
+        "title": "InfiniBand：SM、LID、PKey 与链路质量",
+        "body": "IB 排障不从 ping 开始，而从 **fabric 状态**开始：\n\n- **SM（Subnet Manager）**：分配 LID、维护路由，SM 缺失或不稳定导致 LID/路由异常\n- **LID**：IB subnet 内的转发地址，`base lid` 为零说明 SM 未分配\n- **PKey**：分区机制，通信双方必须在相容 PKey；PKey 不一致表现为连接失败或 `retry exceeded`\n- **link width/speed**：x4 降到 x2 带宽直接减半；`iblinkinfo | grep -i reduced` 发现降速链路\n\n**关键命令：** `ibstat`、`sminfo`、`ibnetdiscover`、`iblinkinfo`、`perfquery -x`\n\n`ibstat` 显示 `Active` 只说明端口起来了，不代表 GID/PKey/MTU/路由都正确。",
+        "reveal": {
+          "q": "IB 集群中同一 job 节点的 PKey index 都是 1，是否就意味着 PKey 配置正确？",
+          "a": "不一定。相同的 PKey index 在不同节点上可能对应不同的 PKey 值；必须校验 PKey 值本身一致，而非只看 index。"
+        }
+      },
+      {
+        "title": "GID index 错误：最常见的跨节点故障之一",
+        "body": "**故障场景：** 节点 A 的 `mlx5_0 port 1 index 3` 是业务 VLAN 的 RoCE v2 GID；节点 B 的同一 index 却对应管理网 IP，业务 GID 在 index 4。集群统一配置了 `NCCL_IB_GID_INDEX=3`，导致节点 B 实际走管理网，跨节点不通或走错 VLAN。\n\n**根本原因：** GID index 是本机 HCA 端口 GID 表下标，不是 fabric 全局语义。不同节点上同一 index 的含义可能因镜像、固件、VLAN 子接口顺序不同而不同。\n\n**诊断：** `show_gids`、`ibdev2netdev`、`ip -br addr`\n\n**修复：** 统一 netdev/VLAN/GID 表生成规则；入池验收逐节点校验 index 对应的 RoCE version、IPv4、netdev、VLAN。"
+      },
+      {
+        "title": "RoCE 变更 SOP 与健康目标",
+        "body": "**健康 RoCE fabric 的目标不是 pause counter 永远为零**，而是：\n- ECN/CNP 在 burst 早期出现\n- PFC 低频且局部\n- drop/retry 极低\n- 作业带宽方差可控\n\n**变更前必须记录的 baseline：**\n- `show_gids`、`rdma link`、`ethtool -S` 输出\n- 交换机 QoS、PFC、ECN threshold、ECMP hash 配置\n- 选 canary 节点，覆盖同 leaf、跨 leaf、跨 rack\n\n**验收矩阵：** 每次变更后跑 `ib_write_bw`、`ib_read_bw`、`ib_send_bw` 的节点矩阵 + `nccl-tests` 覆盖小消息和大消息，同步采集主机和交换机 counter delta。",
+        "tip": "不在同一变更窗口同时修改 GID、MTU、PFC、ECN、DCQCN 多类参数，一次只验证一个假设。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下关于 PFC 的描述，哪项最准确？",
+        "options": [
+          "PFC 是端到端的拥塞控制协议，类似 TCP 拥塞控制",
+          "PFC 是逐跳暂停机制，用于短时保护 lossless priority 避免丢包",
+          "PFC 触发后拥塞信号不会向上游传播",
+          "PFC 可以替代 ECN/DCQCN 作为 RoCE 的唯一拥塞控制机制"
+        ],
+        "answer": 1,
+        "explain": "PFC 是逐跳机制，不是端到端控制；它的副作用是拥塞可以沿 fabric 反向传播，形成 pause storm 和 HOL blocking，因此不能单独替代 ECN/DCQCN。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 RoCE 拥塞控制组件与其角色配对：",
+        "left": ["ECN", "CNP", "DCQCN", "PFC watchdog"],
+        "right": [
+          "发送端 HCA 收到信号后降低注入速率",
+          "交换机队列超阈值后在 IP header 标记，不丢包",
+          "接收端 HCA 检测到 ECN mark 后生成并发回发送端",
+          "检测到异常持续 pause 后强制中断死锁"
+        ],
+        "explain": "ECN 由交换机标记，CNP 由接收端 HCA 生成，DCQCN 是发送端速率控制算法，PFC watchdog 是止损机制。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 RoCE 集群中，应该对所有 priority 都开启 PFC，以确保最大程度的无损传输。",
+        "answer": false,
+        "explain": "只应对真正需要 near-lossless 的 RDMA traffic class 开 PFC；全局 lossless 会放大 HOL blocking 和拥塞扩散，把管理流量、存储流量和训练流量共享同一 lossless priority 是典型配置错误。"
+      },
+      {
+        "type": "choice",
+        "prompt": "多节点 NCCL 训练在 64 节点出现周期性 step time 尖刺，32 节点正常，日志显示 NET/IB 和 GDRDMA 启用。主机 `ethtool -S` 显示 RDMA priority 的 `rx_prio3_pause` 快速增长，ECN mark 很少。最可能的原因是？",
+        "options": [
+          "nvidia_peermem 未加载",
+          "GID index 在部分节点选错",
+          "ECN 阈值设置过高，拥塞控制闭环太晚，PFC 成为主要控制机制",
+          "链路 MTU 不一致"
+        ],
+        "answer": 2,
+        "explain": "ECN mark 少但 PFC pause 多，说明 ECN 阈值高于 PFC XOFF 阈值，DCQCN 来不及降速就触发 PFC；随着规模扩大 incast 加重，pause storm 扩散导致 timeout。"
+      },
+      {
+        "type": "judge",
+        "prompt": "InfiniBand 中，`ibstat` 显示端口状态为 Active，说明该端口的 PKey、路由和 MTU 配置都正确。",
+        "answer": false,
+        "explain": "ibstat Active 只说明端口物理链路起来了；PKey 值、LID 分配、路由、MTU、SM 状态都需要单独验证。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 IB 集群中，`perfquery -x` 显示某端口 `PortXmitWait` 值持续增长，symbol error 为零，最可能的原因是？",
+        "options": [
+          "物理线缆损坏",
+          "下游端口拥塞或 credit 不足，导致发送等待",
+          "SM 未分配 LID",
+          "PKey 不一致"
+        ],
+        "answer": 1,
+        "explain": "`PortXmitWait` 表示端口因下游 credit 不足而等待；symbol error 为零排除物理链路问题，说明是流量拥塞或下游处理慢。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 RoCE 节点上列出 HCA 端口所有 GID 条目（包含设备、端口、index、IP、RoCE 版本）的命令是什么？",
+        "accept": ["show_gids"],
+        "explain": "`show_gids` 列出每个 HCA 端口的完整 GID 表，是诊断 GID index 选错、VLAN 混淆和 RoCE version 不匹配的起点。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RoCE v2 中 ECN threshold、PFC XOFF threshold、drop threshold 的正确触发顺序应该是？",
+        "options": [
+          "drop → PFC XOFF → ECN",
+          "PFC XOFF → ECN → drop",
+          "ECN → PFC XOFF → drop",
+          "三者同时触发"
+        ],
+        "answer": 2,
+        "explain": "理想顺序：ECN 最早标记（DCQCN 降速），PFC XOFF 是短时 burst 兜底，drop 是最后防线。这样可以在丢包前通过软件控制回路缓解拥塞。"
+      },
+      {
+        "type": "judge",
+        "prompt": "PFC watchdog 配置 `action=drop` 意味着触发后直接丢弃所有流量，比 pause storm 更危险。",
+        "answer": false,
+        "explain": "`action=drop` 让该 priority 临时变 lossy（允许丢包）而不是永久死锁；这是主动止损，比 pause storm 导致所有流量全部卡死更安全，RDMA 可以通过重试恢复，而死锁需要手工 reset。"
+      }
+    ]
+  }
+]

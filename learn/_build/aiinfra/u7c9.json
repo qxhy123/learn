@@ -1,0 +1,108 @@
+[
+  {
+    "id": "u7c9",
+    "title": "AI CRD 与 Operator",
+    "subtitle": "TorchJob、RayJob、KServe 与 reconciliation loop",
+    "intro": [
+      {
+        "title": "为什么原生对象不够：AI 语义无法用 Pod 和 Job 说清楚",
+        "body": "一个 64 卡 PyTorch 训练任务至少包含这些约束，原生 Kubernetes 对象无法完整表达：\n\n- **角色**：master、worker、launcher\n- **协议**：rendezvous 地址、rank、world size、NCCL 网卡\n- **生命周期**：等待所有 rank、训练、checkpoint、失败重启、成功归档\n- **失败语义**：单 worker 失败时是全局重启、弹性缩容还是直接失败\n- **观测语义**：用户看到的是「等待 gang 调度」，不是「某个 Pod Pending」\n\n不可化简的问题：**如何把 AI 任务的高层语义声明为稳定 API，并持续把真实集群状态推进到期望状态。**"
+      },
+      {
+        "title": "CRD、Controller、Operator 的边界",
+        "body": "| 名称 | 核心职责 | 例子 |\n|---|---|---|\n| `CRD` | 向 API Server 注册新资源类型，让 `kubectl get pytorchjob` 合法 | PyTorchJob、RayJob、InferenceService |\n| `Custom Resource` | CRD 的实例，包含 `spec`（用户意图）和 `status`（控制器观察结果） | 具体的 train-reranker 对象 |\n| `Controller` | 通用控制循环：watch 变化 → 比较期望/真实 → 执行修正 | Deployment controller |\n| `Operator` | 带领域语义的控制器，理解 rank、checkpoint、模型 revision | Kubeflow Training Operator、KubeRay |\n| `Admission Webhook` | 创建/更新前的校验、默认值注入、策略拦截 | 校验 GPU 请求、注入 runtimeClass |\n\n**关键区别**：Operator 不是「Helm 的升级版」。Helm 在提交前渲染 YAML；Operator 在运行中持续 reconcile，面对失败、重试、并发、删除和状态漂移。",
+        "tip": "没有 Controller 时，CRD 对象只是 etcd 里的声明，不会自动创建任何 Pod。"
+      },
+      {
+        "title": "Reconciliation Loop：持续收敛而非一次性执行",
+        "body": "Operator 的核心循环每次都从 API Server 重新读取事实：\n\n`desired = read(cr.spec)`\n`actual = list_owned_resources(cr)`\n`plan = diff(desired, actual)`\n`apply(plan)`\n`patch_status(observed(actual))`\n\n**为什么必须幂等**：同一对象可能被 reconcile 几十次（watch event + 10 分钟 resync）。不能依赖「上次执行成功」，必须每次从头算 desired。\n\n**spec 与 status 的边界**：`spec` 是用户输入（期望状态），`status` 是控制器输出（观察结果）。把运行时状态写进 `spec` 会破坏声明式 API。\n\n**ownerReference**：Operator 创建的 Pod、Service 带上 ownerReference，删除父对象时 Kubernetes 垃圾回收器级联删除子对象。\n\n**finalizer**：删除时阻止对象立刻消失，让控制器先清理外部资源（云端 endpoint、checkpoint lease），再移除 finalizer。"
+      },
+      {
+        "title": "常见 AI CRD 的核心语义",
+        "body": "**PyTorchJob（TorchJob）**：表达 PyTorch 分布式训练\n- 角色：`Master`（1 个）+ `Worker`（N 个），自动注入 `MASTER_ADDR`、`RANK`、`WORLD_SIZE`\n- 生产必须配合 Kueue/Volcano gang scheduling，否则 worker 不齐导致 rendezvous 超时\n\n**RayJob**：提交 Ray driver，KubeRay Operator 管理 RayCluster（head + workers）\n- Pod Running 只是 Ray runtime 在跑，不代表 driver 成功\n- 排障需看 RayJob status + driver logs，不只看 Pod 状态\n\n**MPIJob**：launcher + worker slots，适合 Horovod / OpenMPI / 传统 HPC\n- launcher 先启动，worker 未齐时连接超时是常见故障\n\n**InferenceService（KServe）**：模型服务控制面\n- 每次模型/配置变化生成新 Revision，支持流量切分（灰度/金丝雀）\n- storageUri + model agent 负责模型下载，runtime（vLLM、Triton）负责推理",
+        "reveal": {
+          "q": "RayJob 的所有 Pod 都 Running，但任务失败了。为什么不能只看 Pod 状态判断成功？",
+          "a": "Pod Running 只表示 Ray runtime 容器在运行，不代表 Ray driver 成功完成任务。Ray 任务可能在 driver 内部失败（runtime env 错误、依赖缺失、脚本逻辑错误）而 Pod 仍然 Running。必须查看 RayJob status 中的 driver 状态和 driver logs。"
+        }
+      },
+      {
+        "title": "Status 设计：让用户看到有价值的信息",
+        "body": "一个有工程质量的 CRD status 应该回答三个问题：\n1. 当前阶段是什么\n2. 卡住或失败的直接原因是什么\n3. 系统下一步是否会自动处理\n\n**关键字段**：\n- `observedGeneration`：status 对应的 spec generation，判断 status 是否新鲜\n- `conditions`：每个条件有 `type`、`status`、`reason`、`message`，例如 `WaitingForGangResources`\n- `replicaStatuses`：每个角色的 desired / active / failed 数量\n\n**常见状态机阶段**：Created → Admitting（等队列）→ Pending（等 Pod 就绪）→ Initializing（模型加载/rendezvous）→ Running → Succeeded/Failed → Terminating\n\n**反模式**：status 只有 `Running` / `Failed`，用户无法知道卡在调度、镜像、模型加载还是应用 bug。"
+      },
+      {
+        "title": "LeaderWorkerSet：大模型多机推理的专用 CRD",
+        "body": "LWS（LeaderWorkerSet）专为「一组 Pod 共同服务一个推理副本」设计，适合 vLLM / SGLang / TRT-LLM 把 70B-405B 模型切到多机多卡。\n\n**核心字段**：\n- `replicas`：推理副本数（每个副本是 leader + N worker 的 Pod 组）\n- `leaderWorkerTemplate.size`：单副本内 Pod 总数\n- `restartPolicy: RecreateGroupOnPodRestart`：任一 Pod 重启则整组重启（否则 NCCL 状态不一致）\n- `rolloutStrategy`：副本级滚动升级（不能像 Deployment 按单 Pod 滚）\n\n**为什么不用 Deployment 或 StatefulSet**：Deployment 没有 gang 语义，Pod 个体重启让 NCCL 链路死锁；StatefulSet 缺少「组级 ready」和「组级重启」语义。LWS 是 Kubernetes SIGs 官方路径，被 vLLM/NVIDIA 官方文档推荐。",
+        "tip": "LWS 和 Volcano/Kueue 解决不同问题：调度层确保「一组 Pod 同时拿到 GPU」，LWS 确保「已分配的 Pod 一起启动且组级管理」。两者通常一起用。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下关于 CRD 的描述，哪个是正确的？",
+        "options": [
+          "CRD 是一个调度器扩展，负责 AI Pod 的节点选择",
+          "CRD 向 API Server 注册新资源类型，但没有 Controller 时对象只是 etcd 里的声明",
+          "CRD 会自动生成 Pod，不需要 Operator",
+          "CRD 和 Helm Chart 功能等价"
+        ],
+        "answer": 1,
+        "explain": "CRD 是 API 扩展机制，让 API Server 接受、校验和存储自定义对象。没有 Controller 时，对象不会自动产生任何副作用。Operator（带领域语义的 Controller）才是把声明翻译成 Pod 等底层对象的执行者。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Operator 的 reconciliation loop 只在对象首次创建时执行一次。",
+        "answer": false,
+        "explain": "Reconciliation loop 持续运行：watch 到对象变化时触发，定期 resync（默认 10 分钟）也会触发。Pod 失败、用户修改 spec、Operator 重启后都会重新执行。因此 reconcile 函数必须是幂等的。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PyTorchJob 训练的 5 个 worker 已 Running，3 个 worker 仍 Pending，导致训练卡在 rendezvous。根本原因是什么？",
+        "options": [
+          "PyTorchJob CRD 版本太旧",
+          "没有配置 gang scheduling，调度器逐个绑定 Pod",
+          "NCCL 环境变量配置错误",
+          "节点 driver 版本不一致"
+        ],
+        "answer": 1,
+        "explain": "没有 gang scheduling（Kueue Workload 或 Volcano PodGroup），调度器会逐个绑定 Pod。先启动的 5 个 worker 等待 rendezvous，剩余 3 个因 GPU 碎片化无法调度，非 elastic 训练卡死。需要配置 gang：要么全部 8 个 worker 同时调度成功，要么全部不调度。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 AI CRD 与其适合的场景配对：",
+        "left": ["PyTorchJob", "RayJob", "MPIJob", "InferenceService"],
+        "right": ["Horovod / OpenMPI launcher+worker 训练", "在线模型服务、流量切分、灰度发布", "PyTorch DDP/FSDP 多机训练", "Ray 数据处理、强化学习、批推理"],
+        "explain": "PyTorchJob 对应 DDP/FSDP；RayJob 对应 Ray 生态；MPIJob 对应 MPI launcher 模式；InferenceService 对应在线服务控制面。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`spec` 字段由控制器写入，`status` 字段由用户或平台声明。",
+        "answer": false,
+        "explain": "恰好相反：`spec` 是用户或平台声明的期望状态（输入），`status` 是控制器观察到的真实状态（输出）。用户改 spec，控制器改 status。把运行时状态写进 spec 会破坏声明式 API 的边界。"
+      },
+      {
+        "type": "input",
+        "prompt": "删除带 finalizer 的 Kubernetes 对象时，API Server 会设置对象的哪个字段来阻止立即删除？（填字段名）",
+        "accept": ["deletionTimestamp", "metadata.deletionTimestamp"],
+        "explain": "API Server 设置 `metadata.deletionTimestamp`，对象在 API 中仍然存在。Operator 检测到该字段后执行清理逻辑（释放外部资源），完成后移除 finalizer，对象才真正从 API Server 消失。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于 LeaderWorkerSet（LWS）的描述，哪个是正确的？",
+        "options": [
+          "LWS 等价于 StatefulSet，只是换了个名字",
+          "LWS 专为「多 Pod 共同服务一个推理副本」设计，支持组级重启和滚动升级",
+          "LWS 完全替代 Volcano/Kueue，不需要调度层配合",
+          "LWS 只支持单机多卡推理，不支持多机"
+        ],
+        "answer": 1,
+        "explain": "LWS 的核心是「组级语义」：一组 leader+worker Pod 共同服务一个推理副本，任一 Pod 重启则整组重启（保证 NCCL 状态一致），并支持副本级滚动升级。它和 Volcano/Kueue 解决不同问题，通常配合使用而非替代。"
+      },
+      {
+        "type": "judge",
+        "prompt": "一个带 finalizer 的 PyTorchJob 删除时卡在 Terminating，且 Operator 已离线，可以安全地手工移除 finalizer 来解除卡住。",
+        "answer": false,
+        "explain": "手工移除 finalizer 前必须确认外部资源（云端 endpoint、checkpoint lease、queue admission）已清理干净。直接移除 finalizer 可能导致外部资源泄漏。正确做法是先恢复 Operator，让其完成清理逻辑；确认无泄漏风险后才考虑手工干预。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,118 @@
+[
+  {
+    "id": "u5c12",
+    "title": "制品供应链与签名",
+    "subtitle": "信任不能靠来源声明——AI 制品需要密码学证据链",
+    "intro": [
+      {
+        "title": "动机：为什么\"从官方渠道下载\"不够",
+        "body": "传统的信任模型是\"来自可信仓库就可信\"，但这个假设在以下情况全部崩溃：\n- CI/CD 凭证泄漏 → 攻击者用受信身份推送恶意构建产物\n- 构建环境被注入（build-time 供应链攻击）\n- 模型权重在中转存储时被替换（MitM 或内部攻击者）\n- tokenizer 配置被篡改（不改权重只改词表映射）\n- 依赖库在语义版本范围内被劫持（dependency confusion）\n\nAI 制品的特殊威胁在于：模型权重（`.pt`、`.bin`）使用 pickle 格式，**pickle 反序列化过程是图灵完备的**——加载时可以执行任意 Python 代码，即使文件名看起来正确也无法保证内容安全。\n\n**解决方案的三个必要条件**：签名（谁签的、签名时 digest 是什么）+ attestation（怎么构建的——哪段代码、哪些输入、什么命令）+ 策略执行（部署时自动验证，拒绝不满足条件的产物）。三者缺一不可。"
+      },
+      {
+        "title": "AI 制品供应链威胁分类",
+        "body": "| 威胁类型 | 具体手段 | 检测难度 |\n|---------|---------|----------|\n| **模型权重投毒** | 在权重文件中嵌入 pickle 可执行代码 | 高：不解析执行不可见 |\n| **Tokenizer 后门** | 修改词表映射或特殊 token，使特定输入触发特定输出 | 极高：需要专项测试集 |\n| **容器镜像植入** | 在镜像层注入恶意二进制或脚本 | 中：Trivy 可发现已知恶意 |\n| **依赖库劫持** | PyPI 同名包、依赖混淆、typosquatting | 中：锁文件可降低风险 |\n| **CI/CD 凭证泄漏** | 窃取 GitHub Actions secret、registry token | 低（初始），高（利用后）|\n| **训练数据投毒** | 注入恶意样本（后门攻击）| 极高：需要专项安全评测 |\n\n**关键洞察**：攻击者不需要攻击所有环节，只需找到一个没有密码学验证的环节。如果部署时只检查 tag 而不验证 digest，攻击者可以在 registry 层替换镜像而不改变 tag。"
+      },
+      {
+        "title": "cosign 签名与 Rekor 透明日志",
+        "body": "**cosign（Sigstore 项目）** 是目前最适合 AI 制品的签名工具，支持 OCI 镜像和任意 blob（文件）签名。\n\n**Keyless 签名原理**：\n1. CI 向 Fulcio CA 提交 OIDC token（如 GitHub Actions job 身份）\n2. Fulcio 颁发短时 x.509 证书（TTL 10 分钟）\n3. CI 用证书私钥对 artifact digest 签名（私钥在内存，不落盘）\n4. 签名 + 证书 + artifact digest 提交到 Rekor 透明日志\n5. 验证时从 Rekor 检索证书并验证 OIDC claims（如 `job_workflow_ref` 是否为受信 workflow）\n\n**Rekor 透明日志**：append-only 的公共签名日志，所有提交记录进 Merkle Tree，链上可验证，不可被篡改。攻击者无法在不留痕迹的情况下伪造签名时间戳。\n\n**Public vs Private Rekor**：开源项目用公共 Rekor；企业私有模型和内部构建用 Private Rekor，避免内部 CI/CD workflow 路径信息泄露。"
+      },
+      {
+        "title": "SLSA 等级框架",
+        "body": "SLSA（Supply chain Levels for Software Artifacts）把构建系统的可信度分为 4 级：\n\n| 等级 | 要求摘要 | AI 场景 | 实施代价 |\n|------|---------|---------|----------|\n| **L1** | 基本 provenance：记录构建过程并产生文档 | CI 生成 build log + artifact hash | 低（~1 天）|\n| **L2** | 托管构建服务：provenance 由构建服务生成（不可被构建脚本修改）| GitHub Actions attestation、Google Cloud Build | 低-中（~3 天）|\n| **L3** | 强化来源：构建隔离、来源可验证、禁止网络出站 | 隔离构建环境、参数化构建 | 中（~2 周）|\n| **L4** | Hermetic build：完全封闭、bit-for-bit 可复现 | 完全离线构建 | 高（数月+）|\n\n**工程建议**：大多数 AI 基础设施团队以 **SLSA L2** 为目标（使用 GitHub Actions `attest` 动作或 GCB 内置 provenance），在高风险对外发布制品上推进到 L3。L4 对 ML 工作负载（需要 CUDA、大量 Python 依赖）实施成本极高，且收益边际递减。"
+      },
+      {
+        "title": "SBOM 与漏洞扫描",
+        "body": "**SBOM（Software Bill of Materials）** 是制品的\"成分表\"，列出所有组件、版本、依赖关系和许可证。\n\n**主流格式**：\n- `CycloneDX`（OWASP 维护）：适合安全分析、漏洞管理，支持 ML 模型组件扩展\n- `SPDX`（Linux Foundation）：适合许可证合规和法律审计\n\n**生成工具**：`syft` 生成 SBOM → `trivy`/`grype` 扫描 CVE → 漏洞报告 → 策略决策（阻断/豁免/接受）。\n\n**关键区别**：\n- SBOM 描述产物成分（`什么`）\n- 漏洞扫描发现已知 CVE（`有什么已知问题`）\n- SBOM 不存档 → 新 CVE 发布时无法快速查询哪些已部署产物受影响\n\n**扫描局限**：漏洞扫描只发现**已知**漏洞，不能发现新型恶意代码注入、logic bomb、训练数据投毒、tokenizer 后门。扫描通过 ≠ 制品安全。"
+      },
+      {
+        "title": "模型权重特有威胁：pickle vs SafeTensors",
+        "body": "**pickle 反序列化攻击原理**：pickle 的 `__reduce__` 机制允许被序列化的对象在反序列化时执行任意 Python 代码。攻击者只需在文件头部几 KB 注入 payload，其余权重数据完全正常——传统的文件大小检查和格式验证无法发现。\n\n**SafeTensors 格式**（HuggingFace 开发）：固定头部（JSON metadata）+ 连续张量数据，**完全没有可执行语义**，不存在函数调用，只有类型+形状+数据描述。\n\n| 维度 | `.pt`/`.bin`（pickle）| `.safetensors` |\n|------|---------------------|----------------|\n| 可执行语义 | 是（`__reduce__` 可执行任意代码）| 否 |\n| 加载速度 | 中 | 快（mmap 友好，零拷贝）|\n| 训练恢复 | 完整（含 optimizer state）| 仅权重 |\n| 推荐用途 | 训练内部 checkpoint | 模型发布、推理部署 |\n\n**SafeTensors 的局限**：消除了加载时代码执行的风险，但不能证明模型没有训练数据后门、不能防止 tokenizer 配置被篡改、不能保证模型行为安全。**格式安全 ≠ 模型安全的全集**。\n\n**权重签名**：使用 `cosign sign-blob` 对 `.safetensors` 文件做 blob 签名，生成 bundle 文件随模型一起发布，serving 拉取时验证签名。"
+      },
+      {
+        "title": "Kyverno 准入控制与全链路 Attestation Chain",
+        "body": "**准入控制（Admission Control）**：Kubernetes admission webhook 在 Pod 创建时拦截请求，调用 Kyverno 或 OPA Gatekeeper 验证镜像签名，拒绝不满足策略的部署。\n\nKyverno 策略核心字段：`verifyImages.attestors.keyless.subject`（指定受信 CI workflow URL）、`issuer`（OIDC provider）、`rekor.url`（透明日志地址）。\n\n**端到端 Attestation Chain**：\n`git commit` → `CI build`（SLSA provenance）→ `SBOM 生成` → `漏洞扫描` → `cosign 签名` → `推送到 Registry` → `Kyverno 准入验证` → `生产部署`。\n\n每个节点产生的密码学证据被连接起来，形成完整的\"可验证意图链\"——从源码提交到生产 Pod 运行，任意环节的篡改都会在下一个验证节点被发现。\n\n**注意事项**：\n- Kyverno 需要网络访问 Rekor；网络受限环境需配置 Private Rekor 或使用 long-lived key\n- admission webhook 失败需配置 failurePolicy 和降级策略，避免 webhook 故障阻断所有部署\n- 权重签名验证应在 initContainer 中执行（Pod 启动时），确保运行时使用的权重与签名匹配",
+        "tip": "常见反模式：用 tag 代替 digest 做准入验证（tag 可随时被覆盖）；只签名不验证（验证端不强制执行则签名无意义）；把 SafeTensors 等同于\"模型安全\"（仅解决加载时代码执行，不解决模型行为安全）。",
+        "reveal": {
+          "q": "SBOM 如何帮助快速响应新 CVE 的影响范围评估？如果没有 SBOM，有什么差别？",
+          "a": "当新 CVE（如 CVSS 9.8）发布时，如果所有历史版本的 SBOM 已存档（如 S3 + Athena 可查询），可以直接查询哪些已部署的服务版本包含受影响的组件，几分钟内完成影响范围评估并触发紧急修复。如果没有 SBOM 存档，只能逐一检查每个在跑服务的组件清单，过程耗时且不可靠——新 CVE 发布的窗口期内，受影响服务可能持续暴露。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "cosign Keyless 签名中，签名者的身份来自哪里？",
+        "options": [
+          "签名者预先生成并长期保存的 PEM 私钥文件",
+          "OIDC provider 颁发的短时 x.509 证书（绑定 CI job 身份）",
+          "Rekor 透明日志服务器颁发的证书",
+          "Harbor/ECR 等 Container Registry 分配的 token"
+        ],
+        "answer": 1,
+        "explain": "cosign Keyless 签名通过 OIDC token 换取 Fulcio CA 颁发的短时 x.509 证书（TTL 10 分钟），用证书私钥完成签名，私钥在内存中不落盘。验证时从 Rekor 检索证书并验证 OIDC claims（如 GitHub Actions workflow URL），不需要签名者持有长期私钥。"
+      },
+      {
+        "type": "judge",
+        "prompt": "SafeTensors 格式彻底解决了模型权重的安全问题，使用 SafeTensors 格式的模型不需要签名验证。",
+        "answer": false,
+        "explain": "SafeTensors 只解决了\"加载时执行任意代码\"这一层风险（消除 pickle 反序列化漏洞）。它不能证明权重没有训练数据后门、不能防止 tokenizer 配置被篡改、不能保证权重来自可信的训练过程。仍然需要 cosign 签名 + provenance attestation 来保证来源可信和内容未被篡改。"
+      },
+      {
+        "type": "choice",
+        "prompt": "大多数 AI 基础设施团队应优先追求的 SLSA 等级目标是什么？",
+        "options": ["SLSA L1（基本 provenance）", "SLSA L2（托管构建服务生成 provenance）", "SLSA L3（隔离构建环境）", "SLSA L4（Hermetic build，bit-for-bit 可复现）"],
+        "answer": 1,
+        "explain": "SLSA L2 可通过 GitHub Actions `attest` 动作或 Google Cloud Build 内置 provenance 实现，实施代价约 3 天。L4 的 hermetic build 对 ML 工作负载（需要 CUDA 和大量 Python 依赖）实施成本极高（数月以上），且收益边际递减，是极少数团队实际需要的等级。"
+      },
+      {
+        "type": "match",
+        "prompt": "将供应链安全工具与其解决的问题匹配：",
+        "left": ["cosign 签名", "SBOM（syft 生成）", "Trivy/Grype 扫描", "Kyverno 准入控制"],
+        "right": ["在 K8s 层强制执行签名策略，拒绝不满足条件的 Pod", "证明产物在某时刻由某可信身份签署", "已知 CVE 发现（基于 SBOM 和 CVE 数据库匹配）", "列出产物所有组件、版本和许可证（成分表）"],
+        "explain": "cosign 签名→证明产物来源和完整性；SBOM→成分表；Trivy/Grype→已知 CVE 扫描（漏洞报告）；Kyverno→策略强制执行（admission webhook）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "pickle 格式的权重文件大小与普通权重文件相同，因此无法通过文件大小检查发现恶意 payload。",
+        "answer": true,
+        "explain": "攻击者只需在 pickle 文件头部几 KB 注入 payload，其余权重数据完全正常，因此文件大小与正常权重文件基本相同。传统的文件大小检查、格式验证都无法发现此类攻击，必须使用签名验证 + SafeTensors 格式迁移来防御。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 cosign Keyless 签名流程中，Fulcio CA 颁发的短时 x.509 证书的 TTL（有效期）是多少分钟？",
+        "accept": ["10", "10分钟", "10 分钟"],
+        "explain": "Fulcio CA 颁发的短时证书 TTL 为 10 分钟。这个极短的有效期意味着即使证书泄露，攻击窗口极小；同时签名和证书已被记录到 Rekor 透明日志，验证时不依赖证书本身的有效性，而是从 Rekor 检索并验证 OIDC claims。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 Kubernetes 准入控制中，以下哪种做法会让镜像签名验证形同虚设？",
+        "options": [
+          "使用 Private Rekor 而不是公共 Rekor",
+          "将 admission webhook 配置为 failurePolicy: Ignore",
+          "在 initContainer 中验证权重签名",
+          "要求所有 production 命名空间的 Pod 必须有签名"
+        ],
+        "answer": 1,
+        "explain": "如果 admission webhook 以 `failurePolicy: Ignore` 运行，当 webhook 失败（如网络超时）时会直接放行所有 Pod，包括未签名的恶意镜像。签名的价值完全在于验证端的强制执行，`failurePolicy: Ignore` 使整个机制形同虚设。"
+      },
+      {
+        "type": "judge",
+        "prompt": "SBOM 应该只在制品发布时生成一次，不需要存档，需要时重新生成即可。",
+        "answer": false,
+        "explain": "SBOM 的核心价值在于事后：当新 CVE 发布时，能快速查询哪些已部署产物受影响。如果不存档，就无法回溯。重新生成 SBOM 会得到当前版本的成分，而不是历史版本的成分——如果依赖库有更新，重新生成的 SBOM 与原始部署时的 SBOM 不同，无法用于漏洞影响范围分析。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种威胁，供应链签名体系（cosign + SLSA + SBOM）无法有效防御？",
+        "options": [
+          "CI/CD 凭证泄漏导致的恶意构建产物上传",
+          "模型权重在中转存储时被替换",
+          "训练数据中注入的恶意样本（后门攻击）导致的模型行为异常",
+          "容器镜像在 Registry 中被未授权篡改"
+        ],
+        "answer": 2,
+        "explain": "训练数据投毒（后门攻击）在签名体系中无法被检测：模型权重是用被污染的训练数据正常训练出来的，签名证明了来源可信，SBOM 也没有异常，但模型在特定输入下会输出恶意内容。这类威胁需要专项安全评测（对抗样本测试、后门检测）来防御，而不是供应链签名。"
+      }
+    ]
+  }
+]

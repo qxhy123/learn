@@ -1,0 +1,116 @@
+[
+  {
+    "id": "u5c17",
+    "title": "RAG 工程化",
+    "subtitle": "从朴素 RAG 到可运营系统：Chunking、混合检索、Reranker、评测闭环与成本控制",
+    "intro": [
+      {
+        "title": "动机：RAG 不是\"把向量库接进 prompt\"",
+        "body": "RAG 是检索系统、推理系统和评测系统的混合工程。每个子系统都有自己的失败模式，三者版本边界不对齐就足以让线上效果与离线评测完全脱节。\n\n**两条不可化简的约束**：\n1. 注入上下文的质量决定生成质量——检索管线最弱的环节决定最终输出质量，不是 LLM 越强就越好。\n2. 检索的代价（延迟/token 成本/infra 复杂度）和收益（召回率/答案质量）之间有真实的工程权衡——**不是所有场景都值得做 RAG**。\n\n**何时不值得做 RAG**：文档总量 <50 页且更新 <月（直接塞 system prompt）；需要复杂多步数学/代码推理（离散 chunk 打断推理链）；长上下文模型够用（先测基线再引入复杂度）。"
+      },
+      {
+        "title": "Chunking 策略：RAG 的根基",
+        "body": "**Chunk 太小（<100 token）的问题**：语义不完整、索引规模膨胀 10x、reranker 候选碎片化。\n**Chunk 太大（>1200 token）的问题**：单 chunk 噪声多、LLM 注意力稀释、token 预算浪费。\n**经验起点**：300-600 token + 10% overlap 建基线，用 `context recall` 和 `context relevance` 两个指标同时评估。\n\n| 策略 | 典型参数 | 适用场景 |\n|------|---------|----------|\n| Fixed-size | size=512, overlap=64 | 早期原型、结构松散纯文本 |\n| Recursive Character | size=400, overlap=50 | 通用 markdown/txt 文档 |\n| Semantic | threshold=0.85 | 高质量知识库、长报告（构建成本高）|\n| Structure-Aware | heading_level=h2 | 结构化 Markdown/PDF 文档库 |\n| Code-Aware | unit=function | 代码库 RAG |\n\n**元数据是免费增强**：ingestion 时注入 `source_url`、`page`、`section`、`acl`、`doc_version`、`chunk_policy_version`，不做在排查时后悔。**ACL 字段必须在 ingestion 时写入，检索时做 pre-filter**，不是 post-filter。"
+      },
+      {
+        "title": "混合检索与 Query 改写",
+        "body": "**Dense（语义）+ Sparse（BM25）+ RRF 融合**是工程默认选择：\n- Dense：语义理解强，精确关键词（产品型号/数字）召回率差\n- BM25：精确关键词极好，换说法就找不到\n- `RRF`（`score = Σ 1/(60 + rank_i)`）：只看排名不看绝对分数，无需归一化，是默认首选\n\n**Query 改写**（适合 query 质量差或文档语言风格差异大时）：\n- `Multi-Query`：LLM 生成 3-5 个改写 query，分别召回后去重合并，代价是 N 次 embedding + 1 次 LLM 调用\n- `HyDE`：让 LLM 先生成\"假设答案文档\"，用其 embedding 检索真实文档；风险是假设文档包含幻觉会拉偏方向\n- `Step-Back`：先生成更抽象的背景问题，检索后连同原始 query 一起回答\n\n改写的收益必须用 `context recall` 指标量化验证，每次额外 LLM 调用增加 200-800ms 延迟，延迟敏感场景慎用。"
+      },
+      {
+        "title": "Reranker：召回质量的放大器，不是修补工具",
+        "body": "**Reranker 只在候选集内精排，不能弥补召回层的漏召。** 加 reranker 之前，先确认 `context recall >= 70%`（正确答案所需事实片段在 top-K 候选里出现的概率）。\n\n| 类型 | 代表实现 | 延迟（top-20 候选）| 优势 |\n|------|---------|-------------------|------|\n| Cross-Encoder | BGE-reranker-large | 50-200ms（GPU）| 最准，直接建模 query-chunk 交互 |\n| ColBERT | ColBERT-v2 | 20-80ms（GPU）| 精度接近 Cross-Encoder，更快 |\n| Cohere Rerank API | Cohere Rerank v3 | 100-400ms | 无需部署，效果好，数据出境 |\n\n**决策逻辑**：召回 top-20 命中率 <60% → 先修召回层；命中率 ≥60% + 延迟 SLA <200ms + 有 GPU → 自托管 ColBERT/轻量 Cross-Encoder；延迟 SLA ≥200ms + 数据允许出境 → Cohere/Jina API 快速上线。\n\n上线前用 `answer_correctness` 指标验证 reranker 的边际收益 > 成本。"
+      },
+      {
+        "title": "评测框架：四维度缺一不可",
+        "body": "没有自动化评测的 RAG 是会随时漂移的黑盒。四个核心指标，缺任何一个都会导致评测失真：\n\n| 指标 | 测量什么 | 低分说明什么 |\n|------|---------|-------------|\n| `context_relevance` | 召回 chunk 与 query 的相关度（精度视角）| 召回噪声多，chunk 太大或 ANN 参数不当 |\n| `context_recall` | 参考答案所需事实是否在召回 chunk 中（召回率视角）| 漏召，topK 太小或 chunk 太碎 |\n| `faithfulness` | 生成答案是否忠实于 chunk，不幻觉 | LLM 幻觉，或 chunk 信息不足 |\n| `answer_correctness` | 生成答案与参考答案的语义匹配（端到端质量）| 端到端质量差，需分解排查 |\n\n**Ragas** 是开箱即用的评测框架，支持无参考答案版本。\n\n**CI 评测门禁建议**：每次 PR 推送触发小规模 golden 集测试（50-100 条），context_recall ≥0.70 + faithfulness ≥0.85 才允许合并；周度全量评测 answer_correctness。\n\n**Citation 验证**：约 15-30% 的 LLM 会产生引用幻觉（声称事实来自某 chunk，但该 chunk 实际不含该信息），必须在 eval 中专门测 `citation_accuracy`。"
+      },
+      {
+        "title": "成本控制：Semantic Cache 与 Prefix 复用",
+        "body": "RAG 的主要成本：LLM prefill tokens（检索 chunk 注入 prompt）占 60-80%，embedding API 调用 3-8%，reranker 5-15%。\n\n**Semantic Cache**（`GPTCache` 等）：对语义相似（但字面不同）的 query 命中同一缓存条目，跳过整个 RAG+LLM 流程。\n\n**Cache key 必须包含**：query embedding + tenant_id + user_acl_hash + index_version + model_id + model_revision + generation_params_hash + tool_schema_version + policy_version。**任何维度缺失都可能导致越权或过期答案被复用**。\n\n**时效性 query 的例外处理**：带\"今天\"/\"最新\"/\"促销\"等词的 query，即使语义相似度极高也不能命中缓存，需要在 key 设计或过滤规则里加入时效性判断。\n\n**SGLang RadixAttention 与 RAG 的协同**：RAG prompt 结构中，system prompt（~200 token）和 RAG 指令模板（~100 token）高度共享，RadixAttention 只 prefill 一次，后续复用 KV Cache，在高并发场景下减少 15-30% prefill 计算。\n\n**关键设计原则**：把检索结果放入 `user message`，保持 system prompt 稳定——不要把检索结果注入 system prompt，否则破坏 prefix 共享，让 RadixAttention 完全失效。",
+        "reveal": {
+          "q": "为什么在 context recall >= 70% 之前，加 reranker 通常没有意义？",
+          "a": "Reranker 只能对已召回的候选集内部重新排序，无法召回候选集之外的文档。如果正确答案所需的事实片段根本不在 top-K 候选里（context recall <70%），reranker 无论多好都找不到它。这种情况下应该先修召回层（调大 topK、改善 chunking、加 hybrid search），而不是加 reranker。"
+        }
+      },
+      {
+        "title": "全量重建 vs 增量更新与 Graph RAG",
+        "body": "**更新策略选择**：\n- 新增 <1% 文档：增量写入（幂等，避免重复 chunk）\n- 删除文档：增量 tombstone + 物理删除，**同时失效 retrieval cache**\n- ACL 更新：立即增量更新，flush 优先（权限变更不能等重建）\n- Embedding 模型升级/chunk 规则变更/距离度量变更：**全量重建**，双索引灰度\n\n**Graph RAG（Microsoft GraphRAG 等）** 适用场景：多跳关系推理（\"A 下属 B，B 负责 C\"）；高实体密度文档；需要全局总结。\n\n**Graph RAG 的工程代价**：构建成本是普通 RAG 的 50-200 倍（LLM 抽取实体和关系数千次）；检索延迟 100-500ms；知识图谱不能自动随文档更新，每次增量更新都要重新抽取受影响部分。适合静态知识库，**不适合每日更新的文档流**。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "在 RAG 系统中，context recall 指标测量的是什么？",
+        "options": [
+          "召回 chunk 与 query 的语义相关度（精度视角）",
+          "参考答案所需的事实片段是否出现在召回的 top-K 候选中（召回率视角）",
+          "生成答案是否仅依赖给定的 chunk，没有产生幻觉",
+          "生成答案与参考答案的语义匹配度（端到端质量）"
+        ],
+        "answer": 1,
+        "explain": "context recall 从召回率视角测量：参考答案所需的所有事实片段，是否都出现在召回的 top-K chunk 候选中。低 context recall 说明存在漏召——正确答案被索引覆盖，但没有被 ANN 搜索找到（topK 太小/chunk 太碎/ANN 参数不当）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "HyDE（Hypothetical Document Embeddings）将 query 改写为假设答案文档，可以100%提高召回率，无任何风险。",
+        "answer": false,
+        "explain": "HyDE 如果让 LLM 生成的假设文档包含幻觉或错误方向，会拉偏 embedding 方向，反而召回到错误文档，降低召回率。HyDE 在领域专业文档场景（法律、医学）通常有效，但必须用 context recall 指标量化验证，而不是盲目上线。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RAG 的 Semantic Cache 命中率意外地高达 90%，但同时用户投诉答案质量下降，最可能的根因是什么？",
+        "options": [
+          "Semantic Cache 的 similarity 阈值过低，把语义不同的问题判定为相同，复用了错误答案",
+          "Semantic Cache 命中率高说明召回层效率提升，答案质量下降是 LLM 问题",
+          "Semantic Cache 命中率过高导致 Redis 内存不足",
+          "向量库索引构建出错，导致缓存命中时序混乱"
+        ],
+        "answer": 0,
+        "explain": "相似度阈值过低（如 0.75）会把语义不同但向量相近的问题（如\"北京天气\"和\"上海天气\"）判定为相同 query，把错误答案复用给用户。高命中率可能是阈值过低导致的误判，而不是真正的相似 query。Semantic Cache 的阈值必须通过 A/B 测试在自有数据上确定，通常 0.90-0.95 较为合理。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 RAG 反模式与其修复方向匹配：",
+        "left": ["只用 dense retrieval", "Chunk 太小（<100 token）", "Post-filter 权限", "不做 eval 就改参数"],
+        "right": ["改为 ANN pre-filter，确保无权限文档不参与 ANN 计算", "加 BM25 sparse retrieval，用 RRF 融合", "建 golden 集，接入 Ragas/TruLens 评测", "增大 chunk size，检查 context recall 指标"],
+        "explain": "只用 dense retrieval 无法召回精确关键词；chunk 太小导致语义不完整、索引膨胀；post-filter 让无权限文档参与 ANN 计算后才过滤，有安全风险且过滤后有效候选可能不足；不做 eval 无法可靠迭代系统。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 RAG 系统中，为了最大化 SGLang RadixAttention 的 prefix 复用收益，检索到的文档 chunk 应该放在 prompt 的哪个部分？",
+        "options": [
+          "放入 system message，在 role 定义之后",
+          "放入 user message，保持 system message 稳定不变",
+          "放入 assistant message 作为 few-shot 示例",
+          "单独作为第四种 message role 注入"
+        ],
+        "answer": 1,
+        "explain": "RadixAttention 对共享公共前缀的请求复用 KV Cache。如果把检索结果注入 system message，每次检索结果不同会导致 system message 变化，破坏前缀共享，RadixAttention 完全失效。应该让 system message（角色定义、RAG 指令模板）保持稳定，检索到的 chunk 放入每次变化的 user message 部分。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Graph RAG（如 Microsoft GraphRAG）由于引入了知识图谱，可以实时随文档更新自动重建知识图谱，维护成本与普通 RAG 相当。",
+        "answer": false,
+        "explain": "Graph RAG 的知识图谱不能自动随文档更新。每次文档增量，都需要重新用 LLM 抽取受影响部分的实体和关系，这个维护管道比普通增量 embed 复杂 5-10 倍，构建成本是普通 RAG 的 50-200 倍。Graph RAG 适合静态或低频更新的知识库，不适合每日更新的文档流。"
+      },
+      {
+        "type": "input",
+        "prompt": "RAG 评测中，衡量\"召回 chunk 是否与 query 相关（精度视角）\"的 Ragas 指标叫什么？（填英文指标名，下划线连接）",
+        "accept": ["context_relevance", "context relevance"],
+        "explain": "context_relevance 测量召回 chunk 与 query 的相关度（精度视角），低分说明召回噪声多（chunk 太大或 ANN 参数不当，检索到大量无关 chunk）。与 context_recall（召回率视角）、faithfulness（幻觉检测）、answer_correctness（端到端质量）共同构成四维评测体系。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项是 RAG 系统中 ACL 字段的正确处理方式？",
+        "options": [
+          "ACL 字段在 ingestion 后通过周期性任务批量更新，不影响实时查询",
+          "ACL 字段在 ingestion 时写入 chunk 元数据，检索时作为 ANN pre-filter 条件，变更后立即 flush 并失效 retrieval cache",
+          "ACL 字段只需在应用层由调用方传入，向量库本身不需要存储权限信息",
+          "ACL 字段用 post-filter 实现，先召回再过滤，效率更高"
+        ],
+        "answer": 1,
+        "explain": "ACL 字段必须在 ingestion 时写入，检索时作为 pre-filter（不是 post-filter），确保无权限文档根本不参与 ANN 计算。ACL 变更（如员工离职、权限调整）属于安全事件，需立即 flush 并失效 retrieval cache，不能等到下次定期批量更新。"
+      }
+    ]
+  }
+]

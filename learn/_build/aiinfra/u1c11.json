@@ -1,0 +1,138 @@
+[
+  {
+    "id": "u1c11",
+    "title": "虚拟内存、页表与 TLB",
+    "subtitle": "进程看到的连续地址只是幻觉——page fault、mmap、COW 的工程影响",
+    "intro": [
+      {
+        "title": "虚拟内存：地址空间是幻觉，但这个幻觉很有用",
+        "body": "每个 Linux 进程都拥有一片看似连续、私有的虚拟地址空间——但这只是操作系统制造的幻觉。CPU 访问内存时，MMU（内存管理单元）把虚拟地址翻译成真实的物理地址，这个翻译需要借助**页表**。\n\n虚拟内存提供了四个关键能力：\n- **隔离**：进程间互不干扰\n- **稀疏地址空间**：可以拥有巨大的虚拟范围而不必立即分配物理内存\n- **文件映射**：`mmap` 让文件像内存一样访问\n- **共享与 COW**：多进程共享物理页，写入时再复制\n\n**工程陷阱**：虚拟地址连续不等于物理页连续。一个 20 GB tensor 在虚拟地址上连续，底层可能由大量分散的 4KB 物理页组成。设备 DMA、TLB、NUMA locality 都受真实物理布局影响。",
+        "tip": "训练进程的虚拟地址空间通常包含：代码段（共享）、堆（PyTorch 对象）、匿名 mmap（大 tensor）、文件 mmap（safetensors 权重、dataset index）、shared memory（DataLoader IPC 队列）。"
+      },
+      {
+        "title": "页表与 TLB：普通 load 背后的隐藏成本",
+        "body": "Linux 默认使用 4KB 页。每次内存访问，MMU 都要把虚拟页号翻译成物理页框号：\n\n| 翻译结果 | 发生条件 | 典型延迟 |\n|---|---|---|\n| TLB hit | 地址翻译在 TLB 缓存中 | ~1 cycle |\n| TLB miss + 页表在 cache | 需要 page walk 但数据在 cache | 数十 ns |\n| TLB miss + 页表不在 cache | page walk 需访问 DRAM | 可达 100ns+ |\n| minor fault | 页在内存但未建映射，进内核处理 | 微秒级 |\n| major fault | 页不在内存，需从磁盘读入 | 毫秒级 |\n\nx86-64 常用 4 级页表（PML4 → PUD → PMD → PTE），TLB miss 时硬件 page walker 可能访问 4 次内存。对大数组随机访问来说，慢点可能不是数据本身，而是地址翻译。\n\n**AI Infra 常见 TLB 压力场景**：大 embedding table 随机访问、巨大 NumPy/PyTorch CPU tensor、大规模 dataset index memmap、多进程 DataLoader 共享大量 VMA。",
+        "tip": "用 `perf stat -e dTLB-loads,dTLB-load-misses -p <pid>` 观察 TLB miss 率；用 `cat /proc/<pid>/status | grep VmPTE` 看页表本身的内存开销。VmPTE 达到 GiB 级时，页表已是容量问题。"
+      },
+      {
+        "title": "Page Fault：不是所有 fault 都是错误",
+        "body": "Page fault 只是「当前访问的虚拟页无法直接完成翻译」，可以是正常机制也可以是性能问题：\n\n| 类型 | 发生原因 | 需要磁盘 IO | 代价 | AI 常见场景 |\n|---|---|---|---|---|\n| **minor fault** | 页已在内存但未建映射，或需新分配 | 否 | 微秒级 | 首次 touch 匿名页、COW 分配 |\n| **major fault** | 页不在内存，需从文件/磁盘读入 | 是 | 毫秒级 | mmap 权重首次访问、内存压力后重读 |\n| **COW fault** | 共享只读页被写入，需复制私有页 | 否（但要拷贝） | 微秒级 | fork worker 修改父进程对象 |\n\n**关键区别**：`perf stat page-faults` 包含 minor + major，必须分开看：\n```\nperf stat -e minor-faults,major-faults -p <pid> -- sleep 30\npidstat -r -p <pid> 1\n```\n\n训练启动时 minor fault 很高不一定是坏事（首次 touch 大数组）；但线上服务接流量后 major fault 很高则是严重问题，每次 major fault 可能把单个请求 p99 拉高数毫秒。",
+        "steps": [
+          "用 `pidstat -r -p <pid> 1` 实时看 minflt/s 和 majflt/s",
+          "如果 major fault 高：查是否有 mmap 未预热、内存压力是否驱逐了文件页",
+          "如果 minor fault 高：查是否是大数组首次 touch 或 COW 触发",
+          "查 `/proc/<pid>/smaps_rollup` 看 RssFile（文件页）和 RssAnon（匿名页）比例",
+          "生产服务 readiness 后，接流量窗口内 major-faults 应为 0"
+        ]
+      },
+      {
+        "title": "mmap：把文件变成地址空间",
+        "body": "`mmap` 让文件内容映射到进程地址空间——访问映射区时，如果页不在内存，内核自动把对应文件页读入 Page Cache 并建立映射。大模型权重加载（safetensors、NumPy memmap）普遍使用这个机制。\n\n**两种加载策略对比**：\n\n| 策略 | 做法 | 优点 | 风险 |\n|---|---|---|---|\n| eager read | 启动时显式读完整权重到 buffer | 延迟集中在启动期，接流量后稳定 | 启动峰值内存高 |\n| mmap lazy | 映射文件，访问时按页 fault | 启动 RSS 低，多进程可共享 | 首次访问延迟分散到请求路径 |\n\n**生产推理的重要原则**：不希望第一个真实用户请求承担 major fault。即使用 mmap，也必须在接流量前做 warmup——按实际访问路径执行一次 dummy prefill/decode，让权重页、tokenizer、CUDA Graph 都进入稳态。readiness probe 应只在 warmup 完成后通过。\n\n**注意**：mmap 不等于零拷贝到 GPU。把权重放到 GPU HBM 仍需要显式的 H2D 传输（`cudaMemcpy`）。",
+        "tip": "多进程共享同一 mmap 权重文件的前提：映射同一 inode 的 clean file-backed 页。发布模型时，避免原地覆盖写文件（这会破坏 inode），改用内容哈希路径 + 原子符号链接切换。"
+      },
+      {
+        "title": "fork 与 Copy-on-Write：DataLoader 的隐形内存账",
+        "body": "Linux `fork()` 后，子进程不立刻复制父进程物理页——父子共享同一批页，页表标为只读；任一方写入时触发 COW fault，内核复制一份私有页。\n\n**DataLoader 场景的常见误判**：\n- 父进程加载 12 GB dataset metadata，启动 16 个 fork worker 后，`ps` 显示每个 worker RSS ≈ 12 GB → 看起来需要 192 GB！\n- 实际上初始 PSS（按共享比例分摊）每个 worker 只有约 800 MB，大部分是 `Shared_Clean`\n- 但 worker 如果修改父对象（写入 decode cache、打乱列表），就会触发 COW，`Private_Dirty` 随之增长\n\n**隐蔽的 COW 触发**：CPython 对象有引用计数，「只读遍历」也可能更新对象头，导致整个 4KB 页变为 worker 私有。嵌套 Python list/dict 特别容易触发大量 COW。\n\n| 问题 | 低质量做法 | 更稳做法 |\n|---|---|---|\n| 巨大样本列表 | 父进程 Python list 存所有路径 | manifest + mmap offset table |\n| worker 修改状态 | worker 写父对象缓存字段 | worker 本地 cache，不写父对象 |\n| 内存评估 | 累加所有 worker RSS | 用 PSS 和 Private_Dirty |",
+        "tip": "监控多 worker 内存，用 `smem -p -P 'python|train'` 看 PSS；用 `cat /proc/<worker>/smaps_rollup | grep Private_Dirty` 监控真实复制量。"
+      },
+      {
+        "title": "内存指标：VMS / RSS / PSS / USS 不能混用",
+        "body": "| 指标 | 含义 | 什么时候有用 | 常见误用 |\n|---|---|---|---|\n| **VMS / VmSize** | 虚拟地址空间大小 | 看 mmap / 地址预留 | 误认为等于物理占用 |\n| **RSS / VmRSS** | 当前驻留物理内存总量 | 看单进程工作集 | 多进程时重复计算共享页 |\n| **PSS** | 按共享比例分摊后的 RSS | 多进程共享场景 | 计算复杂，需要工具支持 |\n| **USS / Private** | 进程独占内存 | 判断真实泄漏 | 缺少 mmap 共享的全局视角 |\n| **RssFile** | file-backed 驻留页 | mmap 权重、Page Cache 映射 | - |\n| **RssAnon** | 匿名驻留页 | heap、tensor、COW 私有页 | - |\n| **VmPTE** | 页表占用 | 大 VMA / 小页映射压力 | 常被忽略 |\n\n**常见结论速查**：\n- VMS 大、RSS 小 → 可能只是 mmap 或地址预留\n- RSS 大、PSS 小 → 大量共享页，不一定是泄漏\n- Private_Dirty 持续增长 → 更像真实独占内存增长（COW 或泄漏）\n- VmPTE 异常大 → 页表开销，考虑 Huge Pages",
+        "reveal": {
+          "q": "某训练节点内存报警，`top` 显示训练进程 RSS = 80 GB。但节点总 DRAM 只有 96 GB，其他进程加起来 RSS 已有 60 GB，理论上应该 OOM。实际上系统运行正常。如何解释这个现象？",
+          "a": "RSS 会把共享页重复计算到每个进程。如果训练进程和 DataLoader worker 共享了大量 file-backed 页（如 mmap 权重文件的 Shared_Clean 页），这些页在每个进程的 RSS 中都被计入，但实际上物理 DRAM 只存了一份。应该用 PSS（按共享比例分摊）来评估真实占用，或者看 `free -m` 中的 used（已用物理内存）。只要 `MemAvailable` 足够，系统就不会 OOM。"
+        }
+      },
+      {
+        "title": "实战：mmap 权重冷启动 p99 尖刺的定位与修复",
+        "body": "**现象**：推理服务使用 mmap 加载 70B 权重，进程启动很快，健康检查通过，但第一批线上请求 p99 高达 8 秒，之后稳定在 500ms。\n\n**定位**：\n```\npidstat -r -p <pid> 1\nperf stat -e minor-faults,major-faults -p <pid> -- sleep 30\n```\n压测首请求期间看到 `majflt/s` 飙升，`RssFile` 快速增长 → 首请求触发大量 major fault，等待文件页从 NVMe 读入。\n\n**根因**：mmap 建立了虚拟地址映射但没有预热物理页，首个真实用户请求在替服务触碰冷页。\n\n**修复清单**：\n1. 发布后、接流量前执行 dummy prefill/decode（按实际访问路径预热权重、tokenizer、CUDA Graph）\n2. readiness probe 只在 warmup 完成后通过\n3. 多副本滚动发布时限制并发 warmup，避免打爆文件系统\n4. 监控：接流量窗口内 major-faults 应接近 0\n\n**验收标准**：连续压测窗口内 `major-faults` 不再增长，`RssFile` 在接流量前达到预期，首轮与稳态 p99 差距 < 2x。",
+        "tip": "不要用 `dd if=model.safetensors of=/dev/null` 来预热——这只预热文件页，不预热 CUDA Graph 和 tokenizer 的 I-cache。必须按实际推理路径做 dummy 请求。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "进程虚拟地址空间中，用 `mmap` 映射了一个 10 GB 的 safetensors 文件。此时进程的 VmSize 增加了约 10 GB，但 RSS 几乎没变。这说明：",
+        "options": [
+          "mmap 出了 bug，映射没有成功",
+          "mmap 只建立了虚拟地址范围，物理页还未分配——访问时才会触发 page fault 并真正读入内存",
+          "OS 已经把整个文件读入了 DRAM，只是 RSS 统计有延迟",
+          "GPU 已经通过 DMA 把文件读走了，所以 CPU 侧 RSS 没变"
+        ],
+        "answer": 1,
+        "explain": "mmap 是懒加载（lazy）的：系统调用只建立虚拟地址到文件的映射（VMA），不立即分配物理页或读取文件内容。VmSize 增加，RSS 不变。只有当程序实际访问某个虚拟地址时，才触发 page fault，内核把对应文件页读入 Page Cache 并建立页表映射，RSS 才增长。"
+      },
+      {
+        "type": "judge",
+        "prompt": "major fault 和 minor fault 都需要进入内核态处理，但 major fault 比 minor fault 慢主要是因为 major fault 需要从磁盘读取数据。",
+        "answer": true,
+        "explain": "minor fault 指页已经在物理内存中（如 Page Cache 中或需要新分配匿名页），只需要建立页表映射，代价约微秒级。major fault 指页不在内存中，需要从磁盘/文件系统读取，受磁盘 IO 延迟影响（SSD 约 0.1ms，HDD 约 10ms，远端文件系统更慢），代价通常达毫秒级。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DataLoader 父进程加载了 12 GB dataset metadata（Python dict），fork 16 个 worker 后，`ps` 显示每个 worker RSS ≈ 12 GB。下面哪个解释最准确？",
+        "options": [
+          "每个 worker 确实各自复制了 12 GB，总共占用 192 GB 物理内存",
+          "RSS 重复计算了共享页；父子进程初期共享同一批物理页（Shared_Clean），PSS 才是真实分摊值",
+          "这是 Linux kernel 的 bug，应该升级内核",
+          "Python dict 的内存是写时分配的，fork 后 worker 尚未实际使用这些内存"
+        ],
+        "answer": 1,
+        "explain": "RSS 把每个进程持有的共享页都单独计入，不管物理上有多少份。fork 后父子共享 Shared_Clean 页，每个 worker 的 RSS 都包含这 12 GB，但物理内存只存了一份。PSS（Proportional Set Size）按共享进程数分摊，才是真实的每进程占用。只有当 worker 写入（触发 COW）后，对应页才变成 worker 私有，Private_Dirty 才增长。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看某进程页表自身占用内存大小的 /proc 字段叫什么？（格式如 VmXXX）",
+        "accept": ["VmPTE"],
+        "explain": "VmPTE 记录进程页表（Page Table Entries）自身占用的内存大小。一个拥有大量 VMA 或大量 4KB 小页映射的进程，页表本身可能占用数百 MB 甚至 GiB，成为容量问题。解决方法包括合并 VMA、减少小对象碎映射，或使用 Huge Pages 减少页表项数量。"
+      },
+      {
+        "type": "match",
+        "prompt": "将内存指标与其最准确的含义匹配：",
+        "left": [
+          "VMS / VmSize",
+          "RSS / VmRSS",
+          "PSS",
+          "Private_Dirty"
+        ],
+        "right": [
+          "进程独占且已被写过的物理页，是判断真实 COW 复制量的指标",
+          "按共享进程数比例分摊后的驻留内存，多进程场景更准确",
+          "进程虚拟地址空间总大小，包含 mmap 预留的未映射区域",
+          "当前驻留物理内存总量，多进程时会重复计算共享页"
+        ],
+        "explain": "VmSize 是虚拟地址空间大小（含 mmap 预留）；RSS 是驻留物理内存但会重复计算共享页；PSS 是按比例分摊的更真实指标；Private_Dirty 是进程独占且被写过的页，COW 发生后增长。"
+      },
+      {
+        "type": "judge",
+        "prompt": "生产推理服务使用 mmap 加载模型权重，只要 readiness probe 通过（HTTP 200），就可以立即接收线上流量，第一个用户请求的延迟和后续请求相当。",
+        "answer": false,
+        "explain": "readiness probe 通过只代表服务进程正常启动，不代表模型权重页已预热到 Page Cache。若 readiness probe 在 warmup 完成前通过，第一个真实用户请求会触发大量 major fault（需要从 NVMe 读文件页），延迟可能比稳态高 10-100 倍。正确做法是：先做 dummy prefill/decode 预热权重和 CUDA Graph，warmup 完成后才允许 readiness probe 通过。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种 DataLoader 父进程 metadata 格式，在 fork 多个 worker 后最不容易触发大量 COW？",
+        "options": [
+          "Python dict，键为样本 ID，值为包含路径和 metadata 的嵌套 dict",
+          "Python list of dataclass，每个元素包含多个字段",
+          "只读 mmap 的 NumPy 数组，存储 offset 和 length 信息",
+          "pickle 序列化的 Python 对象图，保存到 /dev/shm"
+        ],
+        "answer": 2,
+        "explain": "只读 mmap 的 NumPy 数组不会触发 COW，因为：① 数组是 file-backed 的 Shared_Clean 页，父子共享同一物理页；② 访问 NumPy 数组不会修改 CPython 对象引用计数（NumPy 数据存储在 C 层）；③ 只读访问不触发写入，不产生 Private_Dirty 页。Python dict 和 dataclass 的每次访问可能更新引用计数，导致包含这些对象的 4KB 页变为 worker 私有副本。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某推理服务发现 `perf stat` 显示 `dTLB-load-misses` 很高，性能下降。最可能的原因是什么，最合适的优化方向是什么？",
+        "options": [
+          "CPU 缓存太小，应该升级到更大 L3 cache 的 CPU",
+          "进程访问的数据（如大 embedding table）跨越大量不连续的 4KB 页，TLB 无法缓存足够的翻译项；可以考虑使用 Huge Pages（2MB 或 1GB）减少 TLB 项数量",
+          "进程存在内存泄漏，应该用 valgrind 检查",
+          "NUMA 跨 socket 访问导致远端内存延迟增加，应该绑核"
+        ],
+        "answer": 1,
+        "explain": "dTLB-load-misses 高说明 TLB 无法缓存足够的地址翻译，每次 miss 都需要 page walk（访问 4 级页表，可能多次访问 DRAM）。根本原因通常是工作集太大且访问模式随机（如大 embedding table lookup），4KB 页粒度太小导致需要大量 TLB 项。Huge Pages（2MB 页）可以让同样工作集只需要 1/512 的 TLB 项，显著降低 TLB miss 率。"
+      }
+    ]
+  }
+]

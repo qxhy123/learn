@@ -1,0 +1,130 @@
+[
+  {
+    "id": "u1c7",
+    "title": "MESI 一致性协议",
+    "subtitle": "多核缓存一致性、RFO/HITM、跨 socket 代价与 AI Infra coherence 热点",
+    "intro": [
+      {
+        "title": "为什么多核 CPU 需要缓存一致性协议？",
+        "body": "**根本冲突**：每个核有私有 L1/L2 cache，但软件模型假设「内存只有一份」。\n\n**具体问题**：Core 0 把 `x=5` 写进自己的 L1 cache，Core 1 读 `x` 时仍从自己的 L1 读到旧值 `0`——这打破了「共享内存」的基本抽象。\n\n**为什么不能靠软件解决？** Cache coherence 必须由硬件协议解决，原因：\n1. 强制每次写都同步回 DRAM = 关闭 cache，性能塌方（store 从 1 cycle 变 100ns）\n2. 取消私有 cache = 每次 load/store 都访问远端内存，同样不可接受\n3. 原子操作（`lock cmpxchg`）的语义依赖于硬件保证「执行期间独占 cache line」\n\n**MESI 是最小可行解**：用 4 个状态记录「我手上这条 line 是不是最新、是不是别人也有」，用总线消息（read/invalidate/writeback）维护所有核的不变式。",
+        "tip": "Cache coherence 不等于 memory ordering。MESI 保证「同一地址的多份副本最终一致」，但不规定「不同地址的写顺序在不同核看来是否一致」——后者需要 memory fence/barrier。"
+      },
+      {
+        "title": "MESI 四状态详解",
+        "body": "每条 cache line 有一个 2-bit 状态字段：\n\n| 状态 | 独占性 | 与 DRAM 关系 | 其他核副本 | 含义 |\n|---|---|---|---|---|\n| **Modified（M）** | 本核独占 | DRAM 是旧值（脏） | 无 | 独占 + 脏：我改过，DRAM 过时 |\n| **Exclusive（E）** | 本核独占 | DRAM 与 cache 一致 | 无 | 独占 + 净：只有我有，还没改 |\n| **Shared（S）** | 多核共享 | DRAM 一致 | 至少一个其他核 | 共享 + 净：大家都能读 |\n| **Invalid（I）** | 无效 | 无关系 | 任意 | 无效：这条 line 不可用 |\n\n**最重要的区别**：\n- **E vs M**：都独占，但 E 还没改过（DRAM 仍是最新），M 已改过（DRAM 已过时）。从 E 写入不需要任何总线消息（直接升 M），非常高效。\n- **E vs S**：都干净，但 E 独占、S 共享。read miss 时，如果 snoop 发现无其他 sharer 进 E；有 sharer 则进 S。\n\n**记忆口诀**：M=独占+脏，E=独占+净，S=共享+净，I=无效。MOESI 的 O 补上「共享+脏」的第四种组合。"
+      },
+      {
+        "title": "MESI 状态机：关键状态转换",
+        "body": "**关键状态转换路径**（从 AI Infra 工程师视角最重要的几条）：\n\n| 触发 | 转换 | 总线事件 | 工程含义 |\n|---|---|---|---|\n| 本核 load miss，无其他 sharer | I → E | BusRd | 后续写可「静默升级」到 M，最快路径 |\n| 本核 load miss，有其他 sharer | I → S | BusRd | 后续写需要 Invalidate 其他核 |\n| 本核 store miss | I → M | BusRdX（RFO） | Read for Ownership：最贵操作之一 |\n| 本核 store，已在 E 状态 | E → M | **无总线消息** | 静默升级，性能关键路径 |\n| 本核 store，在 S 状态 | S → M | BusUpgr（Invalidate all） | 让所有 sharer 失效，等待 ack |\n| 远程核 read，我持 M | M → S | **writeback + supply data** | HITM：最慢的 cache-to-cache transfer |\n\n**RFO（Read for Ownership）** 是写操作的核心代价：当写入一条不在 M/E 状态的 line，必须先向其他核广播「我要独占这条 line」，等所有 ack 回来才能写。跨 socket 时延迟可达 200–500ns。",
+        "steps": [
+          "Core 1 发出 RFO 请求：「我要写 line A，请其他核让出」",
+          "Home Agent（目录服务）向所有持有 S 状态的核发 Invalidate",
+          "各核确认 Invalidate，回复 Ack",
+          "Home Agent 把数据转发给 Core 1",
+          "Core 1 进入 M 状态，执行写操作"
+        ]
+      },
+      {
+        "title": "Snoop 总线 vs Directory 协议",
+        "body": "MESI 状态机要在多核之间传播，需要一种事件传播机制：\n\n| 机制 | 原理 | 可扩展性 | 延迟 | 现代 AI Infra 使用？ |\n|---|---|---|---|---|\n| **Snoop-based** | 所有核共享总线，事件广播给所有人 | 4–16 核 | 低（一跳） | 几乎不存在 |\n| **Directory-based** | 每条 line 由 home node 维护 sharer 列表，点对点通信 | 数十–数百核 | 略高（多跳） | 所有现代多 socket 服务器 |\n| **Snoop filter** | 在 home agent 旁加滤波器，减少不必要的 snoop | 中等 | 中 | 单 socket 优化 |\n\n**现代 AI Infra 服务器全是 Directory-based**：\n- Intel Skylake-SP 起的 Mesh 架构：CHA（Caching/Home Agent）承担 directory 角色\n- AMD EPYC：LLC 按 CCX/CCD 切分，跨 CCX 走 Infinity Fabric 路由\n\n**工程影响**：directory 协议下，跨 socket 写一条 line 至少需要「本 socket home → UPI → 远 socket home → 远 socket owner → 数据返回」多跳，代价远高于同 socket 操作。",
+        "tip": "从软件视角：你写了一个被多核频繁写的全局变量，在 4 核笔记本上可能看不出问题；迁到 32 核双 socket 训练服务器，吞吐可能直接崩溃——这就是 directory protocol + UPI 的现实代价。"
+      },
+      {
+        "title": "MOESI 和 MESIF：针对不同痛点的变种",
+        "body": "MESI 在某些场景浪费资源，两种变种针对性优化：\n\n**MOESI（AMD 广泛使用）**：加入 **Owned（O）** 状态\n- 问题：M 状态 line 被远程 read 时，MESI 必须先 writeback 到 DRAM，再从 DRAM 提供数据——浪费 DRAM 带宽。\n- O 状态语义：「我持有最新值（DRAM 是旧的），但允许其他核以 Shared 状态共享我」。M 被 remote read 时直接 forward，自己降为 O，无需 writeback。\n- 适合：producer-consumer 场景（Core 0 持续写，Core 1 持续读，O 状态作为 owner 连续 forward 给 consumer）\n\n**MESIF（Intel QPI/UPI 使用）**：加入 **Forward（F）** 状态\n- 问题：多个 S 状态的 cache 同时收到 snoop，都试图响应，造成总线竞争。\n- F 是 Shared 的子集：被指定为「唯一 forwarder」，其他 S 状态 cache 收到 snoop 后沉默，只由 F 响应。\n- 适合：多核读同一只读配置表，指定一个 forwarder 避免总线争抢\n\n| 协议 | 解决的问题 | 使用场景 |\n|---|---|---|\n| MESI | 基础一致性 | 所有多核 CPU |\n| MOESI | 减少 M→S 时的 writeback | AMD、producer-consumer |\n| MESIF | 减少多 S sharer 的响应竞争 | Intel UPI，多核共读 |"
+      },
+      {
+        "title": "跨 Socket 代价：UPI 与 Infinity Fabric",
+        "body": "单 socket 内 coherence 走片内 mesh，延迟约 10–30ns。跨 socket 走 UPI（Intel）或 Infinity Fabric（AMD），代价大得多：\n\n| 操作 | 单 socket L3 hit | 同 socket 跨核 HITM | **跨 socket HITM** |\n|---|---|---|---|\n| 延迟量级 | 30–80ns | 50–100ns | **200–500ns** |\n| 带宽消耗 | 片内 mesh | 片内 mesh | 占 UPI/IF 带宽 |\n\n**跨 socket HITM 的完整路径**：\n1. Core 1（socket 0）发 RFO 给 home agent\n2. Home agent 经 UPI 联系 socket 1 的 home agent\n3. Socket 1 home agent 找到 owner（Core 5 持 M 状态）\n4. Core 5 的 dirty line 返回（经 UPI）\n5. Core 1 拿到数据，延迟累计 200–500ns\n\n**实测工具**：`sudo pcm.x 1` 查看 UPI utilization（> 50% 接近饱和）；`perf c2c report` 的 Remote HITM 列专门统计跨 socket HITM 次数。",
+        "reveal": {
+          "q": "为什么同样的代码在 8 核单 socket 服务器上跑得很好，扩展到 32 核双 socket 时吞吐反而下降？",
+          "a": "两个因素叠加：1）多 socket 共享变量的写操作从「同 socket HITM（50–100ns）」变成「跨 socket HITM（200–500ns）」，代价升 3–5 倍；2）UPI 互连带宽有限，大量 coherence 流量会饱和 UPI，进一步放大每次操作的等待时间。这不是 CPU 算力不足，而是 coherence 协议在跨 socket 场景下的固有代价。"
+        }
+      },
+      {
+        "title": "AI Infra 的 Coherence 热点：哪里藏着 RFO 风暴",
+        "body": "以下是 AI Infra 代码中最常见的 coherence 踩坑点：\n\n| 场景 | 高频写变量 | 问题类型 | 优化方向 |\n|---|---|---|---|\n| **训练 metric aggregator** | `total_samples`、`total_loss`（atomic） | 32 核×每批更新 = 数万次 RFO/秒 | thread-local 累加 + 周期 reduce |\n| **推理 connection pool** | free list head 指针 | 每次 push/pop 触发 RFO | per-CPU 子池、work-stealing |\n| **work-stealing 队列** | head 和 tail 指针 | 同一 cache line 的 false sharing | head/tail 各自 padding 到独立 line |\n| **全局日志 ring buffer** | write head 指针 | 所有线程 RFO 同一 line | per-thread ring + 异步合并 |\n| **KV cache 元数据** | block free list | 多请求线程争用 | 批量预留 + per-request 局部状态 |\n\n**关键认知**：原子操作慢不是因为「原子指令贵」——无争用时 `lock add` 只比普通 add 略慢。真正贵的是「争用时的 RFO + 等 invalidate ack」，本质是 coherence 流量。",
+        "tip": "识别 coherence 热点的通用思路：找出「被很多线程高频写、且不可避免共享」的变量，问能不能改成 per-thread/per-CPU + 异步合并。如果不能，考虑降低写频率（采样、批量）。"
+      },
+      {
+        "title": "诊断工具：perf c2c 与 intel-pcm",
+        "body": "**perf c2c：找 HITM 热点（定位到 cache line）**\n\n采集：`sudo perf c2c record -ag -- sleep 30`\n报告：`sudo perf c2c report --stdio | head -100`\n\n关键输出字段：\n\n| 字段 | 含义 | 排障关注点 |\n|---|---|---|\n| LLC Load HITM | LLC 命中 + 来源是 Modified | False sharing 核心指标 |\n| Local HITM | 同 socket HITM | 同 socket false sharing |\n| Remote HITM | 跨 socket HITM | 跨 socket coherence 问题 |\n| Tot offset | line 内偏移分布 | 多个不同 offset 高频 → false sharing |\n| Symbol | 函数/数据符号 | 定位到具体代码 |\n\n**false sharing 典型特征**：同一 cacheline 的多个 offset 都有高 HITM，且这些 offset 对应逻辑上独立的变量。\n\n**intel-pcm：验证 UPI 流量（socket 级）**\n- `sudo pcm.x 1`：UPI utilization > 30% 有显著跨 socket 流量，> 50% 接近饱和\n- non-data 流量占大头 → coherence 消息主导，而非真正的数据传输\n\n**Worked Example**：32 核双 socket 训练节点，3 个 metric atomic（total_samples/tokens/loss）共 24B 落同一 cache line，perf c2c 显示这条 line 占全机 HITM 80%，UPI utilization 60%。改为 thread-local + 每 64 batch flush 一次后，UPI 降到 8%，吞吐比 8 worker 时高 1.8 倍。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "MESI 中的 Exclusive（E）状态与 Modified（M）状态的最大区别是什么？",
+        "options": [
+          "E 状态可以被多个核同时持有，而 M 状态只能被一个核持有",
+          "E 状态意味着 DRAM 仍是最新值，从 E 写入不需要总线消息；M 状态意味着 DRAM 已过时",
+          "E 状态下这条 line 已经被修改，而 M 状态下还没有被修改",
+          "E 状态只存在于 L1 cache，M 状态只存在于 L3 cache"
+        ],
+        "answer": 1,
+        "explain": "Exclusive（E）：本核独占，但还没有修改过，DRAM 与 cache 一致。从 E 状态写入是「静默升级」到 M，不需要任何总线消息，是写操作最快的路径。Modified（M）：本核独占且已修改，DRAM 是旧值。E 是「独占+净」，M 是「独占+脏」。"
+      },
+      {
+        "type": "choice",
+        "prompt": "当一个 cache line 处于 Shared（S）状态时，本核执行 store 操作（写该 line），会触发什么事件？",
+        "options": [
+          "直接静默升级到 Modified 状态，不需要任何总线通信",
+          "先 writeback 到 DRAM，然后重新以 Exclusive 状态获取",
+          "发送 Invalidate 消息（BusUpgr）给所有其他持有 S 状态的核，等待 ack 后升为 Modified",
+          "状态保持 Shared，但本核可以继续写入，其他核不受影响"
+        ],
+        "answer": 2,
+        "explain": "S → M 的转换需要 BusUpgr（BusUpgrade/Invalidate）：通知所有其他 S 状态的 sharer「我要独占了，请失效你的副本」，等待所有 Invalidate Ack 回来后，本核才能安全进入 M 状态写入。这与 E → M 的「静默升级」不同，S → M 必须等待 N 个 ack，N 越大越慢。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在现代多 socket 服务器上，cache coherence 是基于 snoop bus（广播）实现的，所有核都能监听到其他核的 cache 操作。",
+        "answer": false,
+        "explain": "现代多 socket 服务器（训练/推理节点）全部使用 Directory-based 协议：每条 cache line 由一个 home node 维护 sharer 列表，通过点对点消息（而非广播）路由 invalidate/forward 请求。snoop bus 只在早期 4–16 核的单 socket 系统中使用，随着核数增加，广播流量无法扩展。"
+      },
+      {
+        "type": "choice",
+        "prompt": "32 个工作线程共享一个全局 `std::atomic<uint64_t> total_samples`，每个 batch 结束时每个线程调用 `fetch_add`。`perf c2c` 显示这个变量所在的 cache line HITM 计数占全机 80%。最有效的修复方法是什么？",
+        "options": [
+          "把 `total_samples` 改为 `memory_order_seq_cst`，确保操作顺序一致",
+          "增加 CPU 核数，让更多线程并行处理，分摊 atomic 操作开销",
+          "改为 thread-local 累加器，每 N 个 batch 才将本地值 flush 到全局 atomic",
+          "在 `total_samples` 后面填充 56 字节 padding，把它单独放在一条 cache line"
+        ],
+        "answer": 2,
+        "explain": "核心问题是「高频 RFO」：32 个线程每 batch 都写同一 cache line，每次写都要做 RFO（Read for Ownership）+ 等待其他核的 Invalidate Ack。thread-local 累加器让 99% 的写操作不离开本核 cache，只有周期性 flush 时才触发一次 RFO，RFO 频率降低 N 倍（N = flush 间隔）。仅仅 padding 只能解决 false sharing，但这里是真共享（真的在更新同一个值）。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 MESI coherence 事件与其定义配对：",
+        "left": ["RFO（Read for Ownership）", "HITM（Hit Modified）", "Invalidate", "Writeback"],
+        "right": ["M 状态 line 被驱逐或降级时，dirty 数据写回 DRAM", "写操作时获取 cache line 独占所有权的请求，最贵", "通知其他核某 cache line 副本失效的消息", "snoop 时发现另一核以 M 状态持有该 line，是最慢的 cache-to-cache 传输"],
+        "explain": "RFO 是「我要独占」的请求，触发于写操作时；HITM 是「我发请求时发现另一核持有脏数据」，需要 dirty data 先传输再提供，代价最高；Invalidate 是「请你失效你的副本」消息；Writeback 是「脏数据写回 DRAM」操作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "MOESI 协议中的 Owned（O）状态，允许持有 dirty 数据的 cache 直接 forward 给其他请求者，而不需要先 writeback 到 DRAM，从而减少 DRAM 写带宽消耗。",
+        "answer": true,
+        "explain": "这正是 MOESI 的 Owned 状态的设计目的。在 MESI 中，M 状态 line 被远程 read 时必须先 writeback 到 DRAM，再由 DRAM 提供数据——producer-consumer 场景下这非常浪费。MOESI 的 O 状态让 dirty line 可以直接 forward 给请求者，自身降为 O（表示「我是最新且唯一的干净来源，但 DRAM 是旧的」），避免了一次 DRAM 写操作。AMD 平台广泛采用 MOESI。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在双 socket 服务器上，`perf c2c report` 显示某 cache line 的 Remote HITM = 8000（远大于 Local HITM = 500）。这最可能说明什么问题？",
+        "options": [
+          "该 cache line 频繁被替换出 L3，说明 working set 超出 LLC 容量",
+          "该 cache line 对应的数据被跨两个 socket 的线程频繁写，触发大量跨 socket HITM",
+          "分支预测失败率过高，speculative 操作污染了该 cache line",
+          "该 cache line 所在的内存地址未对齐，导致跨 cache line 访问"
+        ],
+        "answer": 1,
+        "explain": "Remote HITM 远高于 Local HITM，说明这条 cache line 的争用主要发生在跨 socket 之间：线程在 socket 0 写入，然后 socket 1 的线程也写入，每次写都要通过 UPI 做跨 socket HITM 操作（200–500ns）。修复方向：把频繁写该变量的线程绑到同一 socket（`numactl --cpunodebind`），或者从代码层面消除跨 socket 写共享（per-socket shard + 周期 merge）。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 MESI 协议中，从 Exclusive（E）状态直接写入（store），会转变为哪个状态？（填状态名，中英文均可）",
+        "accept": ["M", "Modified", "M（Modified）", "Modified（M）"],
+        "explain": "从 Exclusive 状态写入是「静默升级」：因为本核已经独占该 cache line（无其他 sharer），写入时不需要发送任何总线消息，直接从 E 升级到 M（Modified），将 line 标记为 dirty。这是写操作最快的路径（E → M），比从 I 或 S 状态写入（需要 RFO 或 Invalidate）要快得多。"
+      }
+    ]
+  }
+]

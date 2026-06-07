@@ -1,0 +1,144 @@
+[
+  {
+    "id": "u1c1",
+    "title": "CPU 微架构总览",
+    "subtitle": "从第一性原理理解流水线、缓存、分支预测与 AI Infra 性能",
+    "intro": [
+      {
+        "title": "为什么 AI Infra 工程师需要懂 CPU 微架构？",
+        "body": "GPU kernel 性能再好，也需要 CPU 准备数据、调度请求、执行控制面逻辑。\n\nDataLoader worker 解码图片、tokenizer 把字符串转 token、推理服务拼 batch、训练框架做 rendezvous——这些都吃 CPU 微架构。\n\n**核心问题**：当 GPU 很忙时，训练为什么仍会被 host-side 代码拖住？答案藏在 CPU 微架构的三个不可化简的物理约束里：\n- 单条指令的 latency 不能被消除\n- 内存比计算单元慢几百倍\n- 控制流的未来无法预知",
+        "tip": "\"CPU 利用率 800%\" 不等于 \"CPU 够用\"——IPC（每周期指令数）才是衡量真实效率的指标。"
+      },
+      {
+        "title": "三大核心问题与对应机制",
+        "body": "CPU 微架构所有机制，本质上在回答同一个问题：**当计算、访存、控制流都存在物理延迟时，怎样让有限晶体管保持有用工作？**\n\n| 核心问题 | 对应机制 |\n|---|---|\n| 如何利用指令级并行（ILP）？ | 流水线、乱序执行（OoO）、寄存器重命名、ROB |\n| 如何减少等待内存？ | L1/L2/L3 Cache、Cache Line 64B、MESI 一致性协议 |\n| 如何提前做事不做错太多？ | 分支预测器、BTB、推测执行（Speculative Execution）|",
+        "steps": [
+          "流水线：把取指、译码、执行、访存、写回切成不同工位，让多条指令重叠",
+          "乱序执行：只要语义不破坏依赖，后面的指令可以先执行",
+          "Cache：利用局部性，把最近和相邻的数据放在离核心更近的位置",
+          "分支预测：假设控制流的未来可由历史模式估计，预测失败则冲刷流水线"
+        ]
+      },
+      {
+        "title": "从第一性原理推导每个机制",
+        "body": "理解微架构的最佳方式是「推导」而不是「背名词」：\n\n- 从「单指令存在延迟」推出**流水线**（Pipeline）\n- 从「流水线会遇到依赖」推出**冒险检测、forwarding 和 stall**\n- 从「程序中存在可重排的独立指令」推出**乱序执行（OoO）**\n- 从「寄存器名字造成假依赖」推出**寄存器重命名（Register Renaming）**\n- 从「乱序必须看起来像顺序」推出 **ROB（Reorder Buffer）**\n- 从「标量执行浪费数据并行机会」推出 **SIMD**\n- 从「内存比执行单元慢很多」推出 **Cache 层级**\n- 从「多核各有私有缓存」推出 **MESI 协议**\n- 从「一致性以 cache line 为粒度」推出**伪共享（False Sharing）**",
+        "tip": "每个机制都是为了解决上一层机制带来的新问题——这是一条因果推导链，不是孤立的名词列表。"
+      },
+      {
+        "title": "流水线与 IPC：最基础的性能指标",
+        "body": "**IPC（Instructions Per Cycle）** 是衡量 CPU 执行效率的核心指标，与 CPI（Cycles Per Instruction）互为倒数。\n\n理论上 5 段流水线 CPI = 1.0，现代超标量 CPU 理论 CPI 可低至 0.2（4-6 宽发射）。但真实 AI Infra 程序的 IPC 差异巨大：\n\n| 工作负载 | 典型 IPC | 主要 stall 类型 |\n|---|---:|---|\n| LLM tokenizer | 0.5–0.9 | load-use 链、分支不规则 |\n| DataLoader（图片解码） | 0.7–1.2 | cache miss、Python 对象遍历 |\n| LLM 推理 scheduler | 0.7–1.3 | 分支 miss、锁争用 |\n| 训练主循环（NCCL 等待中） | 0.2–0.4 | 设计如此，不是问题 |\n| FMA 浮点矩阵运算 | 2.5–3.5 | 几乎无 stall |\n\n**工程直觉**：IPC < 1.0 说明流水线大量时间在等待（stall），而不是在执行有用工作。"
+      },
+      {
+        "title": "Cache 层级与 MESI：多核时代的内存访问",
+        "body": "DRAM 延迟约 60–100ns，而 CPU 每个周期只有 0.2–0.3ns。这个巨大的鸿沟由 Cache 层级填补：\n\n| 层级 | 容量（典型） | 延迟（典型） | 共享范围 |\n|---|---|---|---|\n| L1 I/D Cache | 32–64KB | 4–5 cycles | 每核私有 |\n| L2 Cache | 256KB–1MB | 10–15 cycles | 每核私有 |\n| L3（LLC） | 8–64MB | 30–50 cycles | 所有核心共享 |\n| DRAM | GB 级 | ~200 cycles | 全系统 |\n\nCache line 通常是 64B——硬件假设你访问一个地址后很可能访问附近地址（空间局部性）。\n\n**MESI 协议**用 Modified/Exclusive/Shared/Invalid 四种状态维护多核缓存一致性。一致性流量会消耗互连带宽，多 socket 机器上尤为明显。",
+        "tip": "Cache line 是硬件操作的最小单位。两个核心改的是不同变量，但如果落在同一条 64B cache line 上，硬件仍会把对方的缓存行打成 Invalid——这就是「伪共享（False Sharing）」。"
+      },
+      {
+        "title": "Top-down 分析：四象限定位瓶颈",
+        "body": "Intel TMA（Top-down Microarchitecture Analysis）把每个 cycle 归类到四个象限，是最实用的 CPU 瓶颈定位框架：\n\n| 象限 | 含义 | 典型根因 | 排查方向 |\n|---|---|---|---|\n| **Retiring** | 流水线在做有用工作 | 已经很好 | 看 SIMD 利用率 |\n| **Front-end Bound** | 前端没把 uop 送进 backend | I-cache miss、解码瓶颈 | 减小代码热路径 |\n| **Back-end Bound** | 后端处理不过来 | cache miss、长延迟 ALU | 改数据布局 |\n| **Bad Speculation** | 误预测浪费 cycle | 分支模式不规则 | 改控制流 |\n\n使用 `perf stat -M TopdownL1 -- ./your_program` 即可获取四象限分布。",
+        "reveal": {
+          "q": "Frontend Bound > 20%、Backend Bound > 50%、Bad Speculation 8%，优先处理哪个？",
+          "a": "优先处理 Backend Bound（占比最高），重点查 cache miss 和数据布局；再处理 Frontend Bound（查 I-cache 和代码体积）；Bad Speculation 8% 属于次要问题。"
+        }
+      },
+      {
+        "title": "AI Infra 推导链：从 CPU 微架构到训练/推理瓶颈",
+        "body": "GPU kernel 性能再好，也有 CPU host-side 这道关卡。常见瓶颈路径：\n\n- **DataLoader 慢** → worker 数量 > L3 容量可容纳的工作集 → L3 miss 率高 → IPC 低 → GPU intermittently idle\n- **Tokenizer 慢** → 状态机查表 load-use 依赖链 → backend stall → IPC 0.5–0.9\n- **加线程吞吐反降** → 多线程写同一 cache line → 伪共享 → coherence traffic 激增 → 吞吐崩\n- **推理 p99 抖动** → cold path 分支不规则 → 误预测 18 cycle × 高频 → p99 被拉长\n\n**排障节奏**：先用 `perf stat` 看 IPC 和 Top-down，再按象限深挖，不要凭直觉猜。",
+        "steps": [
+          "采集：perf stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses",
+          "定象限：perf stat -M TopdownL1（或 --topdown）",
+          "细分：按 Backend/Frontend/Bad Speculation 深入对应工具",
+          "对照业务指标：GPU SM util、HFU（Host Feeding Utilization）、QPS、p99"
+        ]
+      },
+      {
+        "title": "关键决策规则（CapacityLedger）",
+        "body": "在决定是否加 worker、加线程之前，先写出资源预算：\n\n- `IPC < 1.0` 且 `Backend Bound > 50%`：先查 LLC/DRAM/NUMA，**不要加 worker**\n- `branch-misses / branches > 5%` 或 `Bad Speculation > 10%`：先查 cold path，看分支预测\n- `perf c2c` 单条 line HITM 占比 > 5%：先查 false sharing\n- `LLC miss rate > 30%`：不要继续加 worker，先缩 working set、分 NUMA、改布局\n\n**经验公式**：`LLC_budget_per_worker = LLC_effective_capacity / active_workers_per_socket`。每增加一个 worker，每人能用的 LLC 容量就缩小一份。",
+        "tip": "只看 \"CPU 利用率\" 不足以做结论。同样是 CPU% 100%，IPC 0.6 和 IPC 2.0 之间性能相差 3 倍以上。"
+      },
+      {
+        "title": "各深挖章节导航",
+        "body": "本单元按以下顺序深入每个机制：\n\n| 关卡 | 核心主题 | 何时优先读 |\n|---|---|---|\n| 关2：流水线 | 5 段经典流水、冒险与 forwarding、CPI 推算 | DataLoader/tokenizer IPC 偏低 |\n| 关3：乱序执行 | OoO 引擎结构、ROB、LSQ、退役吞吐 | perf 显示 ROB stall / backend bound |\n| 关4：分支预测 | BTB/RAS、TAGE、误预测代价 | 推理服务 p99 抖动 |\n| 关5：SIMD | SSE/AVX/AVX-512、自动向量化 | tokenizer 加速可行性评估 |\n| 关6：Cache 层级 | L1/L2/L3 延迟带宽、prefetcher | worker 数量与 LLC 容量关系 |\n| 关7：MESI 协议 | 四状态机、coherence traffic | 多线程 atomic 吞吐崩盘 |",
+        "reveal": {
+          "q": "加 worker 反而变慢，第一个排查方向应该是？",
+          "a": "先用 perf c2c 查 false sharing（HITM 集中在少数 cache line），再看 LLC 容量是否被超额分配，而不是直接减少 worker 数或加锁。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "AI Infra 工程师需要理解 CPU 微架构，最直接的原因是什么？",
+        "options": [
+          "GPU kernel 性能受 CPU 微架构限制，两者共享同一物理核心",
+          "DataLoader、tokenizer、推理调度等 host-side 代码的性能瓶颈来自 CPU 微架构",
+          "只有理解 CPU 才能编写 CUDA kernel",
+          "CPU 微架构决定了 GPU 显存带宽"
+        ],
+        "answer": 1,
+        "explain": "GPU kernel 很忙时，训练仍会被 host-side 代码（DataLoader、tokenizer、batch 拼装、调度逻辑）拖住，这些都运行在 CPU 上，受流水线、cache、分支预测等微架构机制约束。"
+      },
+      {
+        "type": "choice",
+        "prompt": "LLM tokenizer 的 IPC 通常只有 0.5–0.9，最主要的原因是什么？",
+        "options": [
+          "tokenizer 代码编写质量差，没有使用 SIMD",
+          "状态机查表形成 load-use 依赖链，下次访存地址依赖上次 load 结果，forwarding 无法解决",
+          "tokenizer 运行时分支预测准确率太高，CPU 不进行推测执行",
+          "tokenizer 工作集太小，无法有效利用 L3 Cache"
+        ],
+        "answer": 1,
+        "explain": "`state = table[state][char]` 是典型 load-use 链：每次访存的地址依赖上次 load 的结果，形成串行依赖，乱序执行窗口无法并行，每步至少等待 L1/L2 hit 的延迟（4–12 cycles）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练主循环等待 NCCL allreduce 时，CPU 端 IPC = 0.3，这表明 CPU 流水线存在严重性能问题，需要立即优化。",
+        "answer": false,
+        "explain": "这个低 IPC 是「设计如此」：CPU 在 spin 等待 GPU 完成，故意让出有用工作。排障时要区分「低 IPC 因为等待 GPU」和「低 IPC 因为 cache miss / 分支误预测」，前者不是问题，后者才需要优化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Top-down 分析显示：Retiring 28%、Frontend Bound 18%、Backend Bound 46%、Bad Speculation 8%。下一步应该优先排查什么？",
+        "options": [
+          "Frontend Bound：减小代码体积，优化 I-cache",
+          "Bad Speculation：改进分支预测，减少 cold path",
+          "Backend Bound：查 cache miss 和数据布局",
+          "Retiring：检查 SIMD 指令使用情况"
+        ],
+        "answer": 2,
+        "explain": "Backend Bound 46% 是四个象限中占比最高的，应优先处理。典型手段：改数据布局（SoA、连续内存）、降低工作集大小、分块处理以提高 cache 命中率。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 CPU 微架构机制与其解决的核心问题配对：",
+        "left": ["流水线（Pipeline）", "MESI 协议", "分支预测（BTB）", "寄存器重命名"],
+        "right": ["消除寄存器名字造成的假依赖（WAR/WAW）", "让多条指令的不同阶段重叠，提升吞吐", "维护多核缓存数据一致性", "预测分支方向避免流水线停顿"],
+        "explain": "流水线解决「单指令延迟」带来的吞吐问题；MESI 解决多核各有私有缓存的一致性问题；分支预测解决「控制流未来未知」的停顿问题；寄存器重命名消除 WAR/WAW 假依赖，是 OoO 执行的前提。"
+      },
+      {
+        "type": "input",
+        "prompt": "Cache line 的典型大小是多少字节？（填数字）",
+        "accept": ["64", "64B", "64 字节", "64bytes"],
+        "explain": "现代 x86（Intel/AMD）和 ARM 处理器的 cache line 通常是 64 字节。这意味着即使只读 1 字节，硬件也会把相邻 64 字节一起加载进 cache。伪共享的根源也在于此：两个变量只要落在同一个 64B cache line 内，多核写操作就会互相失效对方的缓存行。"
+      },
+      {
+        "type": "judge",
+        "prompt": "当 LLC miss rate 超过 30% 时，增加 DataLoader worker 数量通常可以提高训练吞吐量。",
+        "answer": false,
+        "explain": "LLC miss rate > 30% 说明当前 working set 已经超出 L3 Cache 容量。增加 worker 不会解决问题，反而会让每个 worker 能分到的 LLC 容量更小（LLC_budget_per_worker = LLC_capacity / active_workers），进一步加剧 LLC miss。正确做法是先缩小 working set、按 NUMA 绑核或改数据布局。"
+      },
+      {
+        "type": "choice",
+        "prompt": "多个线程分别更新各自的计数器变量，但测试发现加线程后吞吐反而下降。最可能的根因是什么？",
+        "options": [
+          "线程创建开销太大，操作系统调度延迟增加",
+          "计数器变量落在同一条 64B cache line 上，形成伪共享（False Sharing）",
+          "L3 Cache 容量不足，需要升级硬件",
+          "分支预测器无法处理多线程并发场景"
+        ],
+        "answer": 1,
+        "explain": "典型的伪共享（False Sharing）场景：各线程操作的是语义上独立的变量，但物理上共处同一 cache line（64B）。每次一个线程写操作，都会把其他核心的缓存行标记为 Invalid，强迫其他线程重新从 LLC 或 DRAM 加载——这叫 HITM（Hit Modified）流量，会导致吞吐随线程数增加反而下降。修复方法是 `alignas(64)` 把变量对齐到独立的 cache line。"
+      }
+    ]
+  }
+]

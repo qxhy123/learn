@@ -1,0 +1,620 @@
+[
+  {
+    "title": "Mock 与打桩",
+    "subtitle": "用可控替代品隔离外部依赖，让测试快速且稳定",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "真实系统里，一段代码几乎从不单独运行。它会调用数据库、发 HTTP 请求、发邮件、读取当前时间……这些外部依赖带来三个测试难题：**速度慢**（网络延迟）、**不稳定**（服务挂了就失败）、**有副作用**（真的发了邮件、扣了钱）。\n\n本章的答案是**测试替身（test double）**——在测试期间用可控的假对象代替真实依赖，让你专注测试「自己写的那段逻辑」，而不是整条外部链路。Python 标准库的 `unittest.mock` 模块提供了完整的工具。"
+      },
+      {
+        "title": "MagicMock：万能替代品",
+        "body": "`MagicMock` 是 `unittest.mock` 里最常用的对象。它的特点是「随用随有」：访问任意属性都返回一个新的 `MagicMock`，调用它也不会报错，还会自动记录每一次调用的参数。\n\n```python\nfrom unittest.mock import MagicMock\nmock = MagicMock()\nmock.return_value = 42\nprint(mock())         # 42\nmock.side_effect = [10, 20, 30]\nprint(mock())         # 10\nprint(mock())         # 20\nmock.side_effect = ValueError(\"connection refused\")\nmock()                # 抛出 ValueError\n```\n\n`return_value` 控制调用返回什么；`side_effect` 可以是一个列表（依次返回）或一个异常（每次调用都抛出）。"
+      },
+      {
+        "title": "断言 Mock 的调用",
+        "body": "Mock 不只是「假对象」，它还记录了所有调用，让你验证代码是否按预期与依赖交互——这叫**行为验证（behavior verification）**。\n\n```python\nfrom unittest.mock import MagicMock, call\ngateway = MagicMock()\ngateway.charge(\"card_123\", 50.0)\ngateway.charge(\"card_456\", 30.0)\ngateway.charge.assert_called()                      # 至少调用过一次\ngateway.charge.assert_called_with(\"card_456\", 30.0) # 最后一次的参数\ngateway.charge.assert_any_call(\"card_123\", 50.0)    # 任意一次含这些参数\nassert gateway.charge.call_count == 2\ngateway.refund.assert_not_called()                  # 从未调用\n```\n\n`assert_called_once()` 要求恰好一次；`assert_called_with()` 只看最后一次调用，不是「任意一次」。"
+      },
+      {
+        "title": "patch：在正确的地方打桩",
+        "body": "`patch` 是把代码里某个名字临时替换成 Mock 的工具。关键原则：**patch 必须应用在被测模块导入的位置，而不是定义位置**。\n\n为什么？因为 Python import 之后，`myapp.order` 的命名空间里已经有了 `send_email` 这个名字；patch 只有替换掉这个名字，才能让被测代码在调用时拿到 Mock。\n\n```python\n# send_email 在 myapp/email.py 里定义，但在 myapp/order.py 里被导入\n# 错误：patch 定义位置，被测代码拿不到这个 Mock\n# @patch('myapp.email.send_email')\n# 正确：patch 使用位置\n@patch('myapp.order.send_email')\ndef test_order_sends_email(self, mock_send_email):\n    OrderService().place_order(user_id=1, items=[\"apple\"])\n    mock_send_email.assert_called_once()\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么要用 Mock 而不直接调用真实依赖？因为测试的目标是验证「你的代码逻辑」，而不是「第三方服务是否在线」。如果支付网关超时，你的测试失败——但失败的原因和你的代码无关，这叫**假阴性**，让人抓狂。\n\n为什么 patch 要在「使用位置」而不是「定义位置」？因为 Python 是按名字查找的。当 `order.py` 执行 `from myapp.email import send_email` 之后，`order` 模块里就有了自己的 `send_email` 引用；你去 patch `myapp.email.send_email` 只是换掉了源头，`order` 里那份拷贝一点没变，测试根本拿不到 Mock。\n\n为什么推荐 `addCleanup(patcher.stop)` 而不是 `tearDown`？因为 `tearDown` 在测试抛出未捕获异常时可能不执行，而 `addCleanup` 总会执行，不会留下「patch 没关掉」的残留状态。"
+      },
+      {
+        "title": "patch 的三种用法",
+        "body": "```python\nfrom unittest.mock import patch, MagicMock\nimport unittest\nclass TestOrderService(unittest.TestCase):\n    # 用法一：装饰器（多个装饰器：从下到上，参数从左到右）\n    @patch('myapp.order.send_email')\n    @patch('myapp.order.PaymentGateway')\n    def test_place_order(self, MockGateway, mock_send_email):\n        MockGateway.return_value.charge.return_value = {\"status\": \"success\"}\n        OrderService().place_order(user_id=1, items=[\"apple\"])\n        mock_send_email.assert_called_once()\n    # 用法二：上下文管理器（推荐，作用域清晰）\n    def test_payment_failure(self):\n        with patch('myapp.order.PaymentGateway') as MockGateway:\n            MockGateway.return_value.charge.side_effect = RuntimeError(\"declined\")\n            with self.assertRaises(RuntimeError):\n                OrderService().place_order(user_id=1, items=[\"apple\"])\n    # 用法三：setUp 手动管理（适合多个测试共享同一个 patch）\n    def setUp(self):\n        patcher = patch('myapp.order.PaymentGateway')\n        self.MockGateway = patcher.start()\n        self.addCleanup(patcher.stop)\n```"
+      },
+      {
+        "title": "spec 参数：防止 Mock 过度宽松",
+        "body": "默认 `MagicMock` 允许访问任意属性，即使真实类根本没有那个方法。这会让你在 Mock 上调用了一个拼错的方法名，测试却依然通过，埋下隐患。\n\n`spec` 参数让 Mock 只暴露真实类上存在的接口。\n\n```python\nfrom myapp.payment import PaymentGateway\nfrom unittest.mock import MagicMock\nmock_gateway = MagicMock(spec=PaymentGateway)\nmock_gateway.charge(\"card\", 50.0)   # OK：charge 是真实方法\nmock_gateway.nonexistent()          # AttributeError！\n# spec_set 更严格：连属性赋值也拦\nmock_strict = MagicMock(spec_set=PaymentGateway)\nmock_strict.new_attr = \"value\"      # AttributeError！\n```"
+      },
+      {
+        "title": "常见 Mock 反模式",
+        "body": "- **Mock 了但没断言**：创建了 Mock、调用了被测代码，却忘记写 `assert_called_once()` 之类的断言。测试一直是绿的，但什么都没验证。\n- **过度 Mock**：把被测函数自己的核心逻辑也 Mock 掉了，相当于测试在验证「Mock 返回了 Mock 的值」，没有任何意义。\n- **Mock 私有实现**：patch 了 `_internal_helper` 这类私有方法，一旦重构内部实现，测试就崩了——测试应该验证行为，不应该绑定内部细节。\n- **patch 位置错误**：patch 了定义位置而非使用位置，Mock 根本没生效，被测代码仍在调用真实依赖。"
+      },
+      {
+        "title": "小结",
+        "body": "Mock 的核心目的是**隔离依赖**：让测试只验证自己写的那段逻辑，不受外部服务状态影响。记住三件事：`MagicMock` 是默认选择；`patch` 打在**使用命名空间**；用 `spec` 避免接口漂移，用 `addCleanup` 安全清理。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Mock 测试的主要目的是什么？",
+        "options": [
+          "让测试代码更短",
+          "隔离外部依赖，使测试只验证被测单元本身的逻辑",
+          "绕过代码里的 if 分支",
+          "让测试能在没有 Python 环境的机器上运行"
+        ],
+        "answer": 1,
+        "explain": "Mock 替换掉数据库、网络、邮件等外部依赖，使测试不受它们的状态影响，专注验证你写的那段业务逻辑。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`patch` 应该应用在依赖被**定义**的模块路径（如 `smtplib.SMTP`），而不是被**使用**的模块路径。",
+        "answer": false,
+        "explain": "patch 必须应用在被测模块导入并使用该名字的位置。Python import 之后各模块持有各自的引用，patch 定义位置无法替换使用方那份拷贝。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面哪条断言用来验证 Mock **从未被调用过**？",
+        "options": [
+          "`mock.assert_not_called()`",
+          "`mock.assert_called_once()`",
+          "`mock.call_count == 0`",
+          "`mock.assert_never_called()`"
+        ],
+        "answer": 0,
+        "explain": "`assert_not_called()` 是标准方法；`call_count == 0` 也能工作但不是断言方法；`assert_never_called()` 不存在。"
+      },
+      {
+        "type": "input",
+        "prompt": "想让 Mock 对象每次被调用时都**抛出**一个异常，应该设置哪个属性？（属性名）",
+        "accept": [
+          "side_effect",
+          "side effect"
+        ],
+        "explain": "`side_effect` 设为异常实例或异常类，每次调用 Mock 时就会抛出该异常。"
+      },
+      {
+        "type": "choice",
+        "prompt": "使用 `MagicMock(spec=PaymentGateway)` 的好处是什么？",
+        "options": [
+          "Mock 的调用速度更快",
+          "Mock 只允许访问真实类上存在的方法，防止拼错方法名也不报错",
+          "Mock 会自动记录更详细的调用日志",
+          "可以不用 patch，直接替换真实类"
+        ],
+        "answer": 1,
+        "explain": "没有 spec 时，访问任意不存在的属性都悄悄返回新的 MagicMock，测试不会报错。有了 spec，访问不在真实类上的方法会立即抛 AttributeError。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用 `@patch` 装饰器叠加两个 patch 时，下面哪种说法正确？",
+        "options": [
+          "装饰器从上到下，参数从左到右",
+          "装饰器从下到上，参数从左到右",
+          "装饰器从上到下，参数从右到左",
+          "装饰器顺序不影响参数顺序"
+        ],
+        "answer": 1,
+        "explain": "Python 装饰器是由内向外（下到上）应用的，最靠近函数的装饰器对应第一个参数，依此类推。"
+      },
+      {
+        "type": "judge",
+        "prompt": "把被测函数自己的核心计算逻辑也 Mock 掉，可以让测试更简单，是推荐做法。",
+        "answer": false,
+        "explain": "这是「过度 Mock」反模式——测试变成了验证 Mock 返回 Mock 值，没有任何有效断言，完全失去测试价值。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 `setUp` 里用 `patcher.start()` 启动 patch 后，推荐用哪个方法注册清理，而不是在 `tearDown` 里手动 `stop`？（方法名，不含括号内参数）",
+        "accept": [
+          "addCleanup",
+          "self.addCleanup"
+        ],
+        "explain": "`addCleanup` 即使测试抛出未捕获异常也会执行，比 `tearDown` 更安全，能保证 patch 一定被停止。"
+      },
+      {
+        "type": "match",
+        "prompt": "将每个 Mock 相关概念与其对应说明配对：",
+        "left": [
+          "`return_value`",
+          "`side_effect`",
+          "`assert_called_once()`",
+          "`spec=SomeClass`"
+        ],
+        "right": [
+          "设置 Mock 被调用时返回的固定值",
+          "设置 Mock 被调用时的动态行为（列表依次返回或抛出异常）",
+          "断言 Mock 被调用了恰好一次",
+          "限制 Mock 只暴露真实类上存在的接口"
+        ],
+        "explain": "四个属性/方法各司其职：控制返回值、控制副作用、验证调用次数、约束接口范围。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下代码中，`mock_send.assert_called_once()` 会通过还是失败？\n```python\ndef test_bad(self):\n    with patch('myapp.email.send') as mock_send:\n        place_order(...)\n```",
+        "options": [
+          "通过，因为 patch 成功了",
+          "这段代码根本没有 `assert_called_once()`，所以测试永远是绿的——但什么都没验证",
+          "失败，因为 patch 路径写错了",
+          "失败，因为缺少 `return_value`"
+        ],
+        "answer": 1,
+        "explain": "代码里根本没写任何断言，测试当然是绿的，但它没有验证任何行为——这就是「Mock 了但没断言」反模式。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 `patch.object(obj, 'cache')` 可以替换某个**实例**上的特定属性，不影响同类的其他实例。",
+        "answer": true,
+        "explain": "`patch.object` 精准替换指定对象上的属性，作用域局限于该实例，不会影响其他实例或类本身。"
+      }
+    ]
+  },
+  {
+    "title": "异常与错误场景测试",
+    "subtitle": "验证异常类型、消息、属性及 cleanup 行为",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "功能测试验证「正常路径」，但代码的契约还包括「出错时怎么办」。如果 `parse_age(-1)` 应该抛出 `ValueError`，那么：不抛出是一个 bug（静默接受了非法输入）；抛出 `TypeError` 是另一个 bug（错误类型，调用方的 `except ValueError` 捕获不到）；抛出了对的类型但消息含糊，调用方分不清是哪种原因出错。\n\n完整的异常测试要覆盖：**异常类型、异常消息、异常对象属性、异常链、cleanup 是否执行、异常不被吞噬**。`unittest` 为此提供了 `assertRaises`、`assertRaisesRegex` 以及上下文管理器用法。"
+      },
+      {
+        "title": "assertRaises 的三层用法",
+        "body": "```python\nimport unittest\nclass TestAgeParser(unittest.TestCase):\n    # 基础：只验证异常类型\n    def test_negative_age_raises_value_error(self):\n        with self.assertRaises(ValueError):\n            parse_age(-1)\n    # 中级：同时验证消息（正则）\n    def test_negative_age_error_message(self):\n        with self.assertRaisesRegex(ValueError, r\"age.*must be.*positive\"):\n            parse_age(-1)\n    # 高级：检查异常对象的属性\n    def test_validation_error_has_field_info(self):\n        with self.assertRaises(ValidationError) as ctx:\n            validate_user_form({\"age\": -1, \"name\": \"\"})\n        exc = ctx.exception\n        self.assertIn(\"age\", exc.fields)\n        self.assertEqual(exc.error_count, 2)\n```\n\n`ctx.exception` 拿到捕获到的异常对象，可以进一步断言它的属性——这对**自定义异常**特别有用。"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么要验证异常**消息**，而不只是类型？因为异常消息是调用方区分错误原因的依据。如果 `ValueError` 的消息是「age must be positive」和「age exceeds maximum」，调用方的 `except ValueError as e` 里需要根据消息决定下一步——消息变了，调用方的逻辑就会静默地走错分支。\n\n为什么要测试**异常链**（`__cause__`）？因为底层异常通常来自第三方库（如 `DatabaseError`），上层代码应该把它包装成业务异常（如 `ServiceError`）并用 `raise X from Y` 保留原始原因。测试链的存在，既确认了包装行为，也确认了原始信息没有丢失。\n\n为什么要测试**异常不被吞噬**？最危险的 bug 不是抛出了错的异常，而是本该传播的异常被 `except Exception: return None` 静默掉了，调用方以为操作成功，实际上已经出错。"
+      },
+      {
+        "title": "异常链与异常吞噬",
+        "body": "```python\n# 生产代码：用 raise...from 建立异常链\ndef fetch_user(user_id):\n    try:\n        return db.query(f\"SELECT * FROM users WHERE id={user_id}\")\n    except DatabaseError as e:\n        raise ServiceError(f\"Cannot fetch user {user_id}\") from e\n# 测试：验证链是否正确建立\nclass TestFetchUser(unittest.TestCase):\n    def test_db_error_wrapped_in_service_error(self):\n        with patch('myapp.db.query') as mock_query:\n            mock_query.side_effect = DatabaseError(\"connection lost\")\n            with self.assertRaises(ServiceError) as ctx:\n                fetch_user(42)\n        exc = ctx.exception\n        self.assertIn(\"42\", str(exc))\n        self.assertIsInstance(exc.__cause__, DatabaseError)\n        self.assertIn(\"connection lost\", str(exc.__cause__))\n```\n\n`exc.__cause__` 就是 `from e` 那个 `e`。如果用 `raise X from None`，则 `__cause__` 为 `None`，`__suppress_context__` 为 `True`。"
+      },
+      {
+        "title": "用 subTest 验证多个异常场景",
+        "body": "当一个函数对多种非法输入都有异常行为时，用 `subTest` 可以在一个测试方法里覆盖所有情况，且一个子测试失败不会中断其余。\n\n```python\nclass TestParseQuantity(unittest.TestCase):\n    INVALID_INPUTS = [\n        (None,         TypeError,  \"None\"),\n        (\"5\",          TypeError,  \"int\"),\n        (-1,           ValueError, \"non-negative\"),\n        (10000,        ValueError, \"9999\"),\n    ]\n    def test_invalid_inputs_raise_expected_errors(self):\n        for value, exc_type, msg_fragment in self.INVALID_INPUTS:\n            with self.subTest(value=value):\n                with self.assertRaisesRegex(exc_type, msg_fragment):\n                    parse_quantity(value)\n```"
+      },
+      {
+        "title": "测试 finally 和 cleanup 行为",
+        "body": "```python\nclass TestResourceCleanup(unittest.TestCase):\n    def test_connection_closed_even_if_query_fails(self):\n        \"\"\"即使查询失败，连接也应该被关闭\"\"\"\n        mock_conn = MagicMock()\n        mock_conn.execute.side_effect = QueryError(\"syntax error\")\n        with patch('myapp.db.get_connection', return_value=mock_conn):\n            with self.assertRaises(QueryError):\n                execute_safe_query(\"INVALID SQL\")\n        mock_conn.close.assert_called_once()\n    def test_failed_transaction_rolls_back(self):\n        db = MockDatabase()\n        db.execute.side_effect = IntegrityError(\"duplicate key\")\n        with self.assertRaises(IntegrityError):\n            with Transaction(db) as tx:\n                tx.execute(\"INSERT INTO users VALUES (1, 'Dup')\")\n        db.rollback.assert_called_once()\n        db.commit.assert_not_called()\n```\n\n关键在于：抛出异常**之后**再断言 cleanup 方法是否被调用——这才能证明 `finally` 块或上下文管理器的 `__exit__` 确实执行了。"
+      },
+      {
+        "title": "自定义异常的测试",
+        "body": "自定义异常往往携带结构化信息（属性），这些属性也是公开契约，需要测试。\n\n```python\nclass InsufficientFundsError(ValueError):\n    def __init__(self, balance, amount):\n        self.balance = balance\n        self.amount = amount\n        self.shortfall = amount - balance\n        super().__init__(\n            f\"Cannot charge {amount:.2f}: balance is only {balance:.2f}\"\n        )\nclass TestInsufficientFundsError(unittest.TestCase):\n    def test_shortfall_calculation(self):\n        exc = InsufficientFundsError(balance=10.0, amount=50.0)\n        self.assertAlmostEqual(exc.shortfall, 40.0)\n    def test_is_value_error_subclass(self):\n        exc = InsufficientFundsError(10.0, 50.0)\n        self.assertIsInstance(exc, ValueError)\n    def test_raised_with_correct_attributes(self):\n        account = BankAccount(balance=10.0)\n        with self.assertRaises(InsufficientFundsError) as ctx:\n            account.charge(50.0)\n        self.assertAlmostEqual(ctx.exception.shortfall, 40.0)\n```"
+      },
+      {
+        "title": "小结",
+        "body": "异常是系统契约的一部分，和返回值一样重要。验证要覆盖四层：**类型**（`assertRaises`）、**消息**（`assertRaisesRegex`）、**属性**（`ctx.exception`）、**链**（`__cause__`）。额外别忘两件事：**cleanup 在异常后是否执行**（断言 `close`/`rollback` 被调用），以及**异常有没有被吞噬**（应该传播的错误不能静默返回 `None`）。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "想同时验证异常**类型**和异常**消息**，应该用哪个方法？",
+        "options": [
+          "`assertRaises`",
+          "`assertRaisesRegex`",
+          "`assertIn`",
+          "`assertIsInstance`"
+        ],
+        "answer": 1,
+        "explain": "`assertRaisesRegex(ExcType, pattern)` 既检查异常类型，又用正则验证消息字符串，是中级异常测试的标准做法。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 `with self.assertRaises(ValueError):` 捕获异常后，可以通过 `ctx.exception` 进一步检查异常对象的属性。",
+        "answer": true,
+        "explain": "需要写成 `with self.assertRaises(ValueError) as ctx:`，之后 `ctx.exception` 就是捕获到的异常对象，可断言它的任意属性。"
+      },
+      {
+        "type": "input",
+        "prompt": "Python 中用 `raise ServiceError(...) from e` 建立异常链后，捕获到的 `ServiceError` 实例通过哪个属性可以访问到原始的 `e`？（属性名含双下划线）",
+        "accept": [
+          "__cause__",
+          "exc.__cause__"
+        ],
+        "explain": "`raise X from Y` 将 Y 存入 X 的 `__cause__` 属性，测试时用 `ctx.exception.__cause__` 访问并断言其类型和内容。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面代码里，`process_payment` 返回了 `None` 而没有抛出异常——这说明什么问题？\n```python\nwith assertRaises((NetworkError, PaymentError)):\n    process_payment(50.0)\n```",
+        "options": [
+          "测试写错了，应该用 `assertIsNone`",
+          "网关异常被 `except Exception: return None` 静默吞噬，没有传播给调用方",
+          "没问题，`None` 就是支付失败的正常返回值",
+          "`assertRaises` 不支持元组，需要分两次测"
+        ],
+        "answer": 1,
+        "explain": "这是「异常被吞噬」的典型场景：生产代码过度捕获了所有异常并返回 None，调用方看不到错误，是危险的 bug。"
+      },
+      {
+        "type": "choice",
+        "prompt": "使用 `subTest` 验证多个异常场景的关键优势是什么？",
+        "options": [
+          "运行速度更快",
+          "一个子测试失败，其余子测试仍会继续执行",
+          "不需要写 `assertRaises`",
+          "自动生成测试方法名"
+        ],
+        "answer": 1,
+        "explain": "如果直接用循环而不包 `subTest`，一旦某次 `assertRaises` 失败，整个测试立即中断，你看不到其他输入的情况。`subTest` 允许所有分支都跑完，一次报告所有失败。"
+      },
+      {
+        "type": "judge",
+        "prompt": "测试「连接在查询失败后仍然被关闭」时，应该在 `assertRaises` 之前就断言 `close` 被调用。",
+        "answer": false,
+        "explain": "必须先让异常发生（用 `assertRaises` 包住调用），异常之后再断言 `mock_conn.close.assert_called_once()`——这才能验证 finally/cleanup 确实执行了。"
+      },
+      {
+        "type": "input",
+        "prompt": "验证「valid_age(25) 不抛出任何异常」的最简单做法是什么？（用一个词描述：直接……）",
+        "accept": [
+          "直接调用",
+          "调用",
+          "直接执行"
+        ],
+        "explain": "不抛出异常就意味着通过：直接调用 `result = parse_age(25)` 并可选地断言返回值即可，不需要 `assertRaises`。"
+      },
+      {
+        "type": "match",
+        "prompt": "将异常测试场景与对应的工具配对：",
+        "left": [
+          "只验证异常类型",
+          "验证类型 + 消息正则",
+          "验证异常对象的自定义属性",
+          "验证多个输入各自触发不同异常"
+        ],
+        "right": [
+          "`assertRaises(ExcType)`",
+          "`assertRaisesRegex(ExcType, pattern)`",
+          "`assertRaises(ExcType) as ctx` + `ctx.exception`",
+          "`subTest` + `assertRaises`"
+        ],
+        "explain": "四种场景对应四种工具，层层递进：类型 → 类型+消息 → 类型+属性 → 多输入批量验证。"
+      },
+      {
+        "type": "choice",
+        "prompt": "自定义异常 `InsufficientFundsError` 继承自 `ValueError` 并增加了 `shortfall` 属性。为什么要测试 `assertIsInstance(exc, ValueError)` 这条？",
+        "options": [
+          "只是为了凑测试数量",
+          "确认继承关系正确，调用方用 `except ValueError` 能捕获到它",
+          "因为 `assertRaises(InsufficientFundsError)` 不够用",
+          "Python 不会自动保留继承链"
+        ],
+        "answer": 1,
+        "explain": "自定义异常继承哪个基类是接口契约的一部分。如果以后误改了继承，调用方的 `except ValueError` 就会漏掉这个异常，这个测试能及时发现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`assertRaisesRegex(ValueError, r\"positive\")` 只要消息里出现字符串 `positive` 就能通过，不要求完整匹配。",
+        "answer": true,
+        "explain": "第二个参数是正则模式，用 `re.search` 而不是 `re.fullmatch`，只要消息中包含该模式就通过，不需要完整匹配整条消息。"
+      },
+      {
+        "type": "choice",
+        "prompt": "测试一个上下文管理器「成功时提交、失败时回滚」，需要写几个测试方法？",
+        "options": [
+          "一个，把两种情况放同一个方法里",
+          "至少两个：一个测成功路径（commit 被调用），一个测失败路径（rollback 被调用）",
+          "不需要测，Python 的 with 语句自动保证",
+          "三个：成功、失败、以及特定异常被抑制的情况"
+        ],
+        "answer": 1,
+        "explain": "每个测试应只覆盖一条路径。成功路径和失败路径是两种独立行为，分开写让失败原因一目了然。如果还有异常抑制场景，可按需添加第三个。"
+      }
+    ]
+  },
+  {
+    "title": "参数化测试",
+    "subtitle": "用数据驱动消除重复，让一个测试覆盖多种输入",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "同一段逻辑，你需要验证它对 10 种输入都正确。最直接的做法是写 10 个几乎一模一样的测试方法，只有输入数据不同。这样做测试数量爆炸，而且每次想加新的测试用例就要复制一整个方法。\n\n参数化测试的思路是：**把「什么数据」和「怎么测」分开**。逻辑只写一遍，数据列成表，框架负责把每行数据都跑一遍。结果是代码量减少，覆盖范围反而更广，新增一个边界情况只需要在表里加一行。"
+      },
+      {
+        "title": "subTest：最简单的参数化",
+        "body": "`subTest` 是 `unittest` 内置的参数化方式，不需要安装任何库。\n\n```python\nclass TestEmailValidator(unittest.TestCase):\n    VALID_CASES = [\n        \"user@example.com\",\n        \"user+tag@example.com\",\n        \"user@sub.domain.co.uk\",\n    ]\n    INVALID_CASES = [\n        (\"not-an-email\",  \"missing @\"),\n        (\"@example.com\",  \"missing local part\"),\n        (\"user@\",         \"missing domain\"),\n    ]\n    def test_valid_emails_accepted(self):\n        for email in self.VALID_CASES:\n            with self.subTest(email=email):\n                self.assertTrue(is_valid_email(email))\n    def test_invalid_emails_rejected(self):\n        for email, reason in self.INVALID_CASES:\n            with self.subTest(email=email, reason=reason):\n                self.assertFalse(is_valid_email(email))\n```\n\n`subTest` 的关键优势：**一个子测试失败，其余照样继续运行**，失败报告里会带上传给 `subTest` 的参数，方便定位。"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么要把测试数据定义为类属性而不是局部变量？因为类属性让数据和测试逻辑在视觉上清晰分离：读者一眼看到「这个测试覆盖了哪些用例」，修改测试数据也不需要找进方法里。\n\n为什么 `subTest` 比单纯的循环好？单纯的 `for` 循环里，第一个失败的断言就会抛出异常，后面的数据根本不会跑到。`subTest` 把每次迭代隔离成独立的子测试，失败后继续，最终给出一份完整的失败报告。\n\n为什么 `parameterized.expand` 比 `subTest` 更适合某些场景？`expand` 会把每个参数组合展开成独立的测试方法（方法名包含参数名），测试运行器能单独重跑某一个失败的用例，`subTest` 则做不到这一点。"
+      },
+      {
+        "title": "测试表格：结构化组织测试数据",
+        "body": "当一个函数既有正常输出也可能抛出异常时，可以把所有情况放进一张表。\n\n```python\nclass TestAgeParser(unittest.TestCase):\n    # (输入, 期望输出, 期望异常) None 表示「不适用」\n    TEST_TABLE = [\n        (0,    0,    None),\n        (25,   25,   None),\n        (150,  150,  None),\n        (-1,   None, ValueError),\n        (151,  None, ValueError),\n        (None, None, TypeError),\n    ]\n    def test_parse_age(self):\n        for age_input, expected_result, expected_exc in self.TEST_TABLE:\n            with self.subTest(input=age_input):\n                if expected_exc:\n                    with self.assertRaises(expected_exc):\n                        parse_age(age_input)\n                else:\n                    self.assertEqual(parse_age(age_input), expected_result)\n```\n\n一张表同时覆盖正常值和异常值，结构清晰，新增边界用例只加一行。"
+      },
+      {
+        "title": "parameterized 库：装饰器方式",
+        "body": "第三方库 `parameterized` 提供 `@parameterized.expand`，把每组参数展开成独立的测试方法。\n\n```python\nfrom parameterized import parameterized\nimport unittest\nclass TestCalculator(unittest.TestCase):\n    @parameterized.expand([\n        (\"add_positives\",  2, 3,  5),\n        (\"add_negatives\", -2, -3, -5),\n        (\"add_mixed\",     -2, 3,  1),\n        (\"add_zeros\",      0, 0,  0),\n    ])\n    def test_add(self, name, a, b, expected):\n        # 展开为 test_add_0_add_positives、test_add_1_add_negatives 等\n        self.assertEqual(a + b, expected)\n    @parameterized.expand([\n        (10, 0),\n        (-5, 0),\n    ])\n    def test_divide_by_zero_raises(self, dividend, divisor):\n        with self.assertRaises(ZeroDivisionError):\n            divide(dividend, divisor)\n```\n\n展开后的方法名包含参数描述，`pytest` 或 `unittest` 运行器都能单独重跑某一个失败的子测试。"
+      },
+      {
+        "title": "动态生成测试方法",
+        "body": "当不想引入第三方库时，可以用 `setattr` 在运行时把测试方法「挂」到类上。\n\n```python\ndef generate_tests(test_class):\n    test_cases = [\n        (\"zero\",     0,    0),\n        (\"one\",      1,    1),\n        (\"negative\", -5,   5),\n        (\"large\",    1000, 1000),\n    ]\n    def make_test(n, expected):\n        def test(self):\n            self.assertEqual(abs(n), expected)\n        return test\n    for name, n, expected in test_cases:\n        setattr(test_class, f\"test_abs_{name}\", make_test(n, expected))\n    return test_class\n@generate_tests\nclass TestAbsoluteValue(unittest.TestCase):\n    pass\n# 自动生成：test_abs_zero, test_abs_one, test_abs_negative, test_abs_large\n```\n\n`make_test` 用闭包捕获 `n` 和 `expected`，避免循环变量被最后一次赋值覆盖的经典陷阱。"
+      },
+      {
+        "title": "测试数据的组织原则",
+        "body": "测试数据越来越多时，可以按**失败原因**分组，而不是全部堆在一个列表里：\n\n```python\nclass TestPasswordValidator(unittest.TestCase):\n    VALID_PASSWORDS = [\n        \"Abc123!@#\",\n        \"P@ssw0rd\",\n        \"A\" * 8 + \"1!\",   # 最短有效长度\n    ]\n    INVALID_TOO_SHORT = [\"Ab1!\", \"Abc12!\", \"Abc1234\"]\n    INVALID_NO_UPPERCASE = [\"abc123!@\", \"password1!\"]\n    def test_valid_passwords_accepted(self):\n        for pwd in self.VALID_PASSWORDS:\n            with self.subTest(password=f\"{pwd[:4]}...\"):\n                self.assertTrue(validate_password(pwd))\n    def test_short_passwords_rejected(self):\n        for pwd in self.INVALID_TOO_SHORT:\n            with self.subTest(password=pwd):\n                result = validate_password(pwd)\n                self.assertFalse(result.is_valid)\n                self.assertIn(\"length\", result.errors)\n```\n\n按原因分组的好处：一个分组失败能直接告诉你是哪条规则没实现，不用从一堆失败里猜原因。"
+      },
+      {
+        "title": "小结",
+        "body": "参数化的核心价值是**把「逻辑」和「数据」分开**，一次写好测试逻辑，用数据表驱动。首选 `subTest`（内置，失败后继续）；需要独立重跑某个失败用例时用 `parameterized.expand`；无第三方库时用动态 `setattr`。测试数据按失败原因分组，让报告清晰指向具体规则。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "用简单的 `for` 循环做参数化（不加 `subTest`），和用 `subTest` 相比，最大的区别是什么？",
+        "options": [
+          "用 subTest 运行更快",
+          "用 subTest 一个子测试失败后，其余子测试仍会继续运行",
+          "用 for 循环不能断言",
+          "用 subTest 不需要 setUp"
+        ],
+        "answer": 1,
+        "explain": "裸 `for` 循环里第一次断言失败就抛出异常，后面的数据跑不到。`subTest` 把每次迭代隔离，失败后继续，最终报告所有失败的子测试。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`@parameterized.expand` 会把每组参数展开成独立的测试方法，这些方法可以被测试运行器单独重跑。",
+        "answer": true,
+        "explain": "`expand` 在类上生成多个方法（如 `test_add_0_add_positives`），每个都是独立的测试方法，运行器可以只重跑某一个失败的用例。"
+      },
+      {
+        "type": "input",
+        "prompt": "`unittest` 内置的参数化机制叫什么？（方法名，不含括号）",
+        "accept": [
+          "subTest",
+          "self.subTest"
+        ],
+        "explain": "`subTest` 是 `unittest.TestCase` 内置的上下文管理器，不需要安装第三方库。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在动态生成测试方法时，为什么要用 `make_test(n, expected)` 闭包而不是直接在 `for` 循环体内定义函数？",
+        "options": [
+          "为了让代码看起来更复杂",
+          "避免循环变量被最后一次赋值覆盖——如果直接定义，所有生成的测试都会用循环结束时 n 的最终值",
+          "setattr 不接受在循环里定义的函数",
+          "闭包运行速度更快"
+        ],
+        "answer": 1,
+        "explain": "Python 闭包按引用捕获变量；循环结束后 `n` 和 `expected` 都指向最后一次迭代的值，所有测试都会用同一份数据。用 `make_test` 把参数以默认参数或函数参数的形式固定下来，每个测试才有自己的数据。"
+      },
+      {
+        "type": "choice",
+        "prompt": "把测试数据按「失败原因」分组（如 `INVALID_TOO_SHORT`、`INVALID_NO_UPPERCASE`）的主要好处是什么？",
+        "options": [
+          "减少测试方法的总数量",
+          "一个分组失败能直接指明是哪条验证规则没实现，不用从大量失败里猜原因",
+          "让测试文件更短",
+          "避免使用 subTest"
+        ],
+        "answer": 1,
+        "explain": "分组让失败报告语义清晰：「test_short_passwords_rejected 失败」直接告诉你长度检查有问题，而不是在一个混合列表里猜哪条数据触发了哪条规则。"
+      },
+      {
+        "type": "judge",
+        "prompt": "测试表格里同时放「有效值（期望正常返回）」和「无效值（期望抛出异常）」是合理的，通过 `if expected_exc:` 分支处理两种情况。",
+        "answer": true,
+        "explain": "这是「数据驱动测试表格」的标准写法：用 `None` 表示该字段不适用，`if expected_exc` 分支决定用 `assertRaises` 还是 `assertEqual`，一张表覆盖全部用例。"
+      },
+      {
+        "type": "input",
+        "prompt": "`parameterized` 库里，用于对**整个测试类**进行参数化（比如同一套测试在三种存储后端上跑）的装饰器叫什么？（只写装饰器名，不含 `@`）",
+        "accept": [
+          "parameterized_class",
+          "parameterized.parameterized_class"
+        ],
+        "explain": "`@parameterized_class([...])` 为每组参数创建一个派生测试类，适合「用同一套测试验证多种实现」的场景。"
+      },
+      {
+        "type": "match",
+        "prompt": "将参数化方式与其特点配对：",
+        "left": [
+          "`subTest`",
+          "`@parameterized.expand`",
+          "动态 `setattr` 生成",
+          "测试数据定义为类属性"
+        ],
+        "right": [
+          "内置，失败后继续执行其余子测试",
+          "展开为独立方法，可单独重跑某个失败用例",
+          "无需第三方库，用闭包避免循环变量捕获问题",
+          "数据与逻辑分离，集中管理，易于添加新用例"
+        ],
+        "explain": "四种机制各有适用场景：subTest 内置最简单；expand 支持单独重跑；setattr 无依赖；类属性集中管理数据。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面哪段写法最能体现「把逻辑和数据分开」的参数化原则？",
+        "options": [
+          "写 10 个 `test_validate_email_valid_1`...`test_validate_email_valid_10` 方法，每个方法里硬编码一个邮件地址",
+          "把所有邮件地址放进类属性 `VALID_CASES`，在一个方法里用 `subTest` 遍历",
+          "把所有逻辑和数据混在 `setUp` 里",
+          "只写一个测试方法，用 `random.choice` 随机取一个邮件地址测试"
+        ],
+        "answer": 1,
+        "explain": "类属性存数据、测试方法写逻辑，两者清晰分离：读数据不需要看方法体，加新用例不需要复制整个方法。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`subTest` 传入的关键字参数（如 `with self.subTest(email=email)`）只是装饰用，不影响失败报告的内容。",
+        "answer": false,
+        "explain": "这些关键字参数会出现在失败报告里，告诉你是哪个具体的输入值导致了失败。传入有意义的参数是 `subTest` 的核心用法，能大幅减少调试时间。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用 `parameterized.expand` 为 `test_add` 方法传入 4 组参数后，测试运行器会看到几个测试方法？",
+        "options": [
+          "1 个（原来的 `test_add`）",
+          "4 个（每组参数一个）",
+          "5 个（原来的 + 4 个展开的）",
+          "取决于 `parameterized` 版本"
+        ],
+        "answer": 1,
+        "explain": "`expand` 把原方法展开为 4 个独立方法（如 `test_add_0_add_positives` 等），原始的 `test_add` 不再单独出现。"
+      }
+    ]
+  },
+  {
+    "title": "IO 与数据库测试",
+    "subtitle": "文件、数据库、HTTP、环境变量的测试策略与分层",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "IO 操作（文件读写、数据库查询、HTTP 请求）是代码里最难测试的部分：速度慢、状态难清理、依赖外部环境。本章给出一套**分层策略**：\n\n- **单元层**：Mock 掉 IO，极快，验证业务逻辑\n- **集成层**：用临时文件或内存数据库，验证 IO 逻辑本身\n- **端到端层**：少量，用真实环境，验证整条链路\n\n绝大多数测试应该在单元层解决；只有在验证「文件格式解析是否正确」「SQL 语句是否能运行」等情况下，才升到集成层。"
+      },
+      {
+        "title": "文件 IO：三种方案",
+        "body": "```python\nimport unittest\nfrom unittest.mock import patch, mock_open\nimport io\n# 方案一：mock_open（单元测试，最快）\nclass TestConfigLoader(unittest.TestCase):\n    def test_loads_json_config(self):\n        config_content = '{\"host\": \"localhost\", \"port\": 5432}'\n        with patch('builtins.open', mock_open(read_data=config_content)):\n            config = load_config(\"config.json\")\n        self.assertEqual(config[\"host\"], \"localhost\")\n        self.assertEqual(config[\"port\"], 5432)\n    def test_missing_file_raises_config_error(self):\n        with patch('builtins.open', side_effect=FileNotFoundError):\n            with self.assertRaises(ConfigError):\n                load_config(\"nonexistent.json\")\n# 方案三：io.StringIO（无需 patch，直接注入流对象）\nclass TestReportGenerator(unittest.TestCase):\n    def test_report_format(self):\n        output = io.StringIO()\n        generate_report(data=[{\"name\": \"Alice\", \"score\": 95}], stream=output)\n        content = output.getvalue()\n        self.assertIn(\"Alice\", content)\n        self.assertIn(\"95\", content)\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么用 `mock_open` 而不是真的创建一个文件？因为 `mock_open` 让你完全控制「文件里有什么内容」，不需要管文件系统权限、路径分隔符差异、测试后清理等问题，而且速度快得多。\n\n为什么 `io.StringIO` 有时比 `mock_open` 更好？如果生产代码的接口接受「任意可写流」而不是「文件路径」，直接注入 `StringIO` 比 patch `builtins.open` 更简洁，也更体现「依赖注入（dependency injection）」的设计思路：把 IO 依赖从函数内部移到参数里，让测试不需要 patch 就能替换它。\n\n为什么数据库测试推荐内存 SQLite 而不是事务回滚策略？内存 SQLite 不依赖任何外部进程，速度极快，表结构可以在 `setUp` 里用 `executescript` 创建，`addCleanup(conn.close)` 关闭后自动消失，完全隔离，无需担心测试间干扰。"
+      },
+      {
+        "title": "临时文件：集成测试文件 IO",
+        "body": "当需要测试真实文件格式解析时，用 `tempfile` 创建真实但隔离的文件。\n\n```python\nimport tempfile, os, unittest\nclass TestCSVProcessor(unittest.TestCase):\n    def setUp(self):\n        import shutil\n        self.temp_dir = tempfile.mkdtemp()\n        self.addCleanup(shutil.rmtree, self.temp_dir)\n    def _write_csv(self, filename, content):\n        path = os.path.join(self.temp_dir, filename)\n        with open(path, 'w') as f:\n            f.write(content)\n        return path\n    def test_process_valid_csv(self):\n        csv_path = self._write_csv(\"data.csv\", \"name,age\\nAlice,30\\nBob,25\\n\")\n        result = process_csv(csv_path)\n        self.assertEqual(len(result), 2)\n        self.assertEqual(result[0][\"name\"], \"Alice\")\n    def test_process_empty_csv(self):\n        csv_path = self._write_csv(\"empty.csv\", \"name,age\\n\")\n        result = process_csv(csv_path)\n        self.assertEqual(result, [])\n```\n\n`addCleanup(shutil.rmtree, self.temp_dir)` 保证测试结束后临时目录被删除，即使测试失败也不例外。"
+      },
+      {
+        "title": "数据库测试：内存 SQLite",
+        "body": "```python\nimport sqlite3, unittest\nclass TestUserRepository(unittest.TestCase):\n    def setUp(self):\n        self.conn = sqlite3.connect(\":memory:\")\n        self.conn.row_factory = sqlite3.Row\n        self.conn.executescript(\"\"\"\n            CREATE TABLE users (\n                id     INTEGER PRIMARY KEY AUTOINCREMENT,\n                name   TEXT    NOT NULL,\n                email  TEXT    NOT NULL UNIQUE,\n                active INTEGER NOT NULL DEFAULT 1\n            );\n        \"\"\")\n        self.addCleanup(self.conn.close)\n        self.repo = UserRepository(self.conn)\n    def test_create_user_assigns_id(self):\n        user = self.repo.create(name=\"Alice\", email=\"alice@example.com\")\n        self.assertIsNotNone(user.id)\n        self.assertGreater(user.id, 0)\n    def test_duplicate_email_raises(self):\n        self.repo.create(name=\"Alice\", email=\"same@example.com\")\n        with self.assertRaises(Exception):\n            self.repo.create(name=\"Alice2\", email=\"same@example.com\")\n```\n\n`\":memory:\"` 让数据库只存在于内存里，测试结束自动消失，天然隔离。"
+      },
+      {
+        "title": "HTTP API 测试",
+        "body": "```python\nfrom unittest.mock import patch, MagicMock\nimport unittest\nclass TestWeatherService(unittest.TestCase):\n    def setUp(self):\n        self.service = WeatherService(api_key=\"test_key\")\n    def test_get_weather_returns_temperature(self):\n        mock_response = MagicMock()\n        mock_response.status_code = 200\n        mock_response.json.return_value = {\n            \"main\": {\"temp\": 25.5},\n            \"weather\": [{\"description\": \"sunny\"}]\n        }\n        with patch('requests.get', return_value=mock_response):\n            weather = self.service.get_weather(\"London\")\n        self.assertAlmostEqual(weather.temperature, 25.5)\n    def test_network_timeout_raises_service_exception(self):\n        import requests\n        with patch('requests.get', side_effect=requests.Timeout):\n            with self.assertRaises(WeatherServiceError) as ctx:\n                self.service.get_weather(\"London\")\n            self.assertIn(\"timeout\", str(ctx.exception).lower())\n```\n\nMock `requests.get` 同样要 patch 被测模块使用的那个名字，不是 `requests` 本身的位置（如果 `WeatherService` 直接 `import requests`，就 patch `myapp.weather.requests.get` 或 `requests.get`）。"
+      },
+      {
+        "title": "环境变量与 Mock Repository",
+        "body": "```python\nimport os, unittest\nfrom unittest.mock import patch, MagicMock\n# 环境变量：用 patch.dict\nclass TestDatabaseConfig(unittest.TestCase):\n    def test_config_from_env(self):\n        env = {\"DB_HOST\": \"prod.example.com\", \"DB_PORT\": \"5432\", \"DB_NAME\": \"myapp\"}\n        with patch.dict(os.environ, env):\n            config = DatabaseConfig.from_env()\n        self.assertEqual(config.host, \"prod.example.com\")\n        self.assertEqual(config.port, 5432)\n    def test_missing_env_raises(self):\n        with patch.dict(os.environ, {}, clear=True):\n            with self.assertRaises(ConfigError) as ctx:\n                DatabaseConfig.from_env()\n            self.assertIn(\"DB_HOST\", str(ctx.exception))\n# Mock Repository：纯单元测试业务逻辑\nclass TestOrderService(unittest.TestCase):\n    def setUp(self):\n        self.user_repo = MagicMock()\n        self.order_repo = MagicMock()\n        self.service = OrderService(user_repo=self.user_repo, order_repo=self.order_repo)\n    def test_place_order_for_nonexistent_user_raises(self):\n        self.user_repo.find_by_id.return_value = None\n        with self.assertRaises(UserNotFoundError):\n            self.service.place_order(user_id=999, items=[\"apple\"])\n```"
+      },
+      {
+        "title": "小结",
+        "body": "IO 测试的核心原则：**能 Mock 就 Mock，必须真实才上集成**。文件单元测试用 `mock_open` 或 `io.StringIO`；文件集成测试用 `tempfile` + `addCleanup` 保证清理；数据库首选内存 SQLite；HTTP 用 `patch('requests.get')`；环境变量用 `patch.dict(os.environ, ...)`。每种 IO 都有一套「快、隔离、可控」的替代方案，按需选用。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "测试「从文件读取 JSON 配置」的业务逻辑，优先应该用哪种方案？",
+        "options": [
+          "在磁盘上创建真实的 JSON 文件",
+          "`mock_open(read_data=...)` 配合 `patch('builtins.open')`",
+          "用 `tempfile` 创建临时文件",
+          "直接跳过，用集成测试覆盖"
+        ],
+        "answer": 1,
+        "explain": "单元测试首选 `mock_open`：不需要文件系统权限，没有清理问题，速度极快。`tempfile` 适合集成测试，验证真实文件格式解析。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 `io.StringIO` 注入可写流，比 patch `builtins.open` 更体现「依赖注入」的设计思路。",
+        "answer": true,
+        "explain": "依赖注入是把 IO 依赖从函数内部移到参数里，测试时直接传入 `StringIO` 对象，不需要 patch 任何东西，更干净也更灵活。"
+      },
+      {
+        "type": "input",
+        "prompt": "SQLite 连接字符串里用什么值可以创建一个只存在于内存里的数据库？（写出完整字符串，含引号）",
+        "accept": [
+          "\":memory:\"",
+          "':memory:'",
+          ":memory:"
+        ],
+        "explain": "`sqlite3.connect(\":memory:\")` 创建的数据库完全存于内存，测试结束（或连接关闭）后自动消失，天然隔离。"
+      },
+      {
+        "type": "choice",
+        "prompt": "测试 HTTP 服务时，想验证网络超时会被正确包装成业务异常，应该怎么做？",
+        "options": [
+          "等待真实网络超时（设一个很短的超时时间）",
+          "用 `patch('requests.get', side_effect=requests.Timeout)` 模拟超时",
+          "用 `time.sleep` 让测试等足够长的时间",
+          "在路由器上断网"
+        ],
+        "answer": 1,
+        "explain": "把 `requests.get` 的 `side_effect` 设为 `requests.Timeout` 可立即触发超时异常，不需要真正等待网络，测试可以在毫秒内完成。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用真实数据库测试时，「事务回滚」策略的核心思路是什么？",
+        "options": [
+          "每个测试后清空所有表",
+          "每个测试开始时开启一个事务，结束时无论成功与否都回滚，不写入任何持久数据",
+          "使用只读数据库，防止写入",
+          "每个测试用独立的数据库文件"
+        ],
+        "answer": 1,
+        "explain": "事务回滚策略：setUp 里 `begin` 一个事务，addCleanup 里 `rollback`，测试里所有写操作都在这个事务里，测试结束后回滚，数据库恢复到测试前状态。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`patch.dict(os.environ, {}, clear=True)` 会清除进程里所有现有的环境变量，只留下你指定的那些。",
+        "answer": true,
+        "explain": "`clear=True` 参数会先清空 `os.environ`，再加入你指定的键值对，适合测试「没有某个必要环境变量时是否正确报错」。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 IO 测试场景与推荐方案配对：",
+        "left": [
+          "文件读写（单元测试）",
+          "文件读写（集成测试）",
+          "数据库（单元测试）",
+          "数据库（集成测试）"
+        ],
+        "right": [
+          "`mock_open` + `patch('builtins.open')`",
+          "`tempfile.mkdtemp` + `addCleanup(shutil.rmtree, ...)`",
+          "Mock Repository（`MagicMock` 替代数据库层）",
+          "SQLite `:memory:` + `addCleanup(conn.close)`"
+        ],
+        "explain": "单元层用 Mock 隔离 IO；集成层用轻量级真实 IO（临时文件或内存数据库），按场景选用能让测试最快、最干净。"
+      },
+      {
+        "type": "input",
+        "prompt": "测试写文件逻辑时，用 `mock_open()` 后，通过 `m()` 拿到文件句柄，再调用哪个属性/方法列表可以获取所有实际写入的调用？（属性名）",
+        "accept": [
+          "write.call_args_list",
+          "call_args_list"
+        ],
+        "explain": "`handle.write.call_args_list` 是所有 `write(...)` 调用的参数列表，可以把它们拼接起来还原出完整的写入内容，再做断言。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Mock Repository 模式（用 `MagicMock` 替代真实数据库层）的主要作用是什么？",
+        "options": [
+          "测试 SQL 语句是否正确",
+          "隔离数据库层，让测试专注于业务逻辑，不依赖真实数据库",
+          "检查数据库连接池配置",
+          "验证数据库事务是否提交"
+        ],
+        "answer": 1,
+        "explain": "Mock Repository 把数据库替换成 MagicMock，让业务逻辑测试完全不依赖数据库。SQL 的正确性属于数据库层自己的测试，不是业务层的责任。"
+      },
+      {
+        "type": "judge",
+        "prompt": "集成测试用 `tempfile` 创建的临时文件，必须在 `tearDown` 里手动删除，不能用 `addCleanup`。",
+        "answer": false,
+        "explain": "`addCleanup(shutil.rmtree, self.temp_dir)` 是更推荐的方式，它在测试失败、setUp 异常等各种情况下都会执行，比 `tearDown` 更可靠。"
+      },
+      {
+        "type": "choice",
+        "prompt": "测试分层策略中，哪一层应该数量最多、运行最快？",
+        "options": [
+          "E2E 端到端测试",
+          "集成测试",
+          "单元测试",
+          "性能测试"
+        ],
+        "answer": 2,
+        "explain": "测试金字塔：单元测试在底层，数量最多、速度最快（Mock 掉 IO，毫秒级）；集成测试适量；E2E 最少。这样既保证覆盖率，又让整套测试能快速运行。"
+      }
+    ]
+  }
+]

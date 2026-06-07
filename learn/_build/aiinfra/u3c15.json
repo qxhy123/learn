@@ -1,0 +1,128 @@
+[
+  {
+    "id": "u3c15",
+    "title": "Profiling、Debugging 与性能排障 SOP",
+    "subtitle": "从宏观时间线到 kernel 微结构的可执行排查链",
+    "intro": [
+      {
+        "title": "性能排障的核心问题",
+        "body": "GPU utilization、tokens/s、step time 只是症状，不告诉你慢在哪一层。一次训练 step 或推理请求的端到端时间，是 CPU 发命令、数据搬运、GPU kernel、NCCL 通信、同步、IO、日志和 allocator 串起来的结果。\n\n三层约束：\n\n1. **可见性约束**：症状和根因可以在不同层（看到 GPU util 低，不代表要优化 kernel 内部）\n2. **时间尺度约束**：一个 kernel 几十 μs，一次 checkpoint 可能几秒，一次 GC 每几百 step 抖一次——只看平均值会抹平尖刺\n3. **归因约束**：profiling 工具本身有开销，环境噪声会污染结果，微观 kernel 指标不自动等于端到端收益\n\n**SOP 的核心不是「打开某个 profiler 看图」**，而是建立从宏观到微观的排查链：确认现象稳定 → `nsys` 定位时间线形态 → `torch.profiler` 映射到 op/module → `ncu` 下钻少数 kernel → 回到端到端基准验证。"
+      },
+      {
+        "title": "工具分层：三个视角，不要互相替代",
+        "body": "| 工具 | 主要视角 | 最适合回答 | 不适合回答 |\n|---|---|---|---|\n| `nsys` | 全系统时间线 | GPU 空洞、H2D/NCCL/kernel 是否重叠、周期抖动 | 单个 kernel 的 register 和 stall |\n| `torch.profiler` | PyTorch op/module | 哪个 op/module 触发小 kernel 或同步，CPU self time 分布 | 跨进程 NCCL 拓扑和 kernel 微结构 |\n| `ncu` | 单 kernel 微结构 | occupancy、Tensor Core 利用率、warp stall、register pressure | 端到端是否变快 |\n| `CUDA_LAUNCH_BLOCKING=1` | 同步 debug | 定位异步报错、确认隐式同步影响 | 真实性能（会破坏 overlap）|\n\n**推荐顺序**：`端到端指标 → nsys 时间线 → torch.profiler op 映射 → ncu 下钻少数 kernel → 端到端验证`\n\n大多数性能问题不是「某个 kernel 写得差」，而是工作没有连续喂给 GPU。先看 `ncu` 容易把时间花在只占 2% 的 kernel 上，而真正问题是前后各有 300 μs 空洞。"
+      },
+      {
+        "title": "BenchmarkProtocol：先固定输入，再看图",
+        "body": "性能排障最常见的失败方式：拿着一张 profiler 截图直接问「哪里慢」。正确顺序：\n\n1. **定义工作负载**：训练 or 推理，prefill or decode，单机 or 多机\n2. **固定输入**：batch、seq len、hidden size、精度、并行策略\n3. **固定环境**：GPU、driver、CUDA、cuDNN、NCCL、PyTorch、FlashAttention 版本\n4. **区分阶段**：编译预热、Graph capture、cache warmup 与稳态分开\n5. **记录分布**：P50/P95/P99，不要只看均值\n\n**retest threshold（写在改动之前）**：\n```\nP50 step/request 改善 >= 5%\nP95/P99 不退化超过 3%\nmemory peak 不超出 CapacityLedger 预算\n数值一致性在容忍范围内\n同一窗口重复 3 次，变异系数低于团队阈值\n```\n没有 threshold 的 profile 只能说明「看过图」，不能说明「修复有效」。",
+        "tip": "`torch.cuda.synchronize()` 适合放在 benchmark 边界（warmup 结束后、稳态采样前后），不能插进生产训练循环。要测设备侧时间用 CUDA event（`torch.cuda.Event(enable_timing=True)`）。"
+      },
+      {
+        "title": "nsys 时间线：先看空洞，再看忙碌",
+        "body": "**nsys 常用命令**：\n`nsys profile -t cuda,nvtx,osrt,cudnn,cublas,nccl -o trace python train.py`\n\n**建议加 NVTX range 切分阶段**：`nvtx.range_push(\"forward\")` / `nvtx.range_pop()`\n\n**读时间线看这些轨道**：\n\n| 轨道 | 看什么 |\n|---|---|\n| CUDA HW | GPU 是否连续执行，kernel 之间是否有空洞 |\n| CUDA API | 是否有长时间 `cudaDeviceSynchronize` / `cudaStreamSynchronize` |\n| Memcpy HtoD | 是否和 compute 重叠，还是阶梯式串行 |\n| NCCL | 是否和 backward compute 重叠，是否有明显尾巴 |\n| NVTX ranges | forward/backward/optimizer/checkpoint 哪段异常 |\n| CPU threads | DataLoader、logger、Python 主线程是否阻塞 |\n\n**第一原则：先看空洞，再看忙碌**。GPU 空时慢 → CPU、IO、同步、NCCL 等待；GPU 忙时慢 → kernel 效率。空洞位置决定排查方向：step 开头多半是 H2D；backward 中后段多半是 NCCL；每隔固定 step 多半是日志/checkpoint/GC。"
+      },
+      {
+        "title": "五类病态时间线与速查",
+        "body": "| 症状 | 时间线特征 | 常见根因 | 下一步 |\n|---|---|---|---|\n| Launch 稀疏 | CUDA HW 上短 kernel 之间有大量空洞 | Python/dispatcher、小 op 太多、graph break | `torch.profiler` 找小 op，尝试 `torch.compile` |\n| H2D 串行 | H2D 与 kernel 像阶梯轮流出现 | 未用 pinned memory、`non_blocking=False`、默认 stream 依赖 | 检查 DataLoader、copy stream、NUMA |\n| NCCL 尾巴 | backward 后段或 step 末尾有长 NCCL | bucket 不合理、rank 计算不均、overlap 失败 | 多 rank `nsys`、NCCL 日志、拓扑检查 |\n| Kernel 慢 | GPU 连续忙，少数 kernel 占大头 | 算子实现低效、shape 不友好、register/coalescing 问题 | `ncu` 下钻，检查库版本 |\n| 周期抖动 | 每 N step 出现 100ms-数秒尖刺 | GC、logger flush、checkpoint、eval | 日志时间戳、NVTX、逐一关闭定位 |",
+        "tip": "周期抖动最容易误导团队——NCCL 变长通常是结果不是根因。最慢 rank 被 checkpoint IO 卡住后，后续 collective 只能等它。要看「尾巴前面发生了什么」，而不是直接查网络。"
+      },
+      {
+        "title": "ncu 下钻：什么时候才进入 kernel 微观",
+        "body": "**ncu 适合使用的条件**：`nsys` 显示 GPU 几乎连续忙，且少数 kernel 占大部分 CUDA time\n\n**ncu 常用命令**：`ncu --set full --kernel-name regex:attention --launch-skip 100 --launch-count 10 -o ncu_out python train.py`\n\n**读 ncu 优先看这些问题**：\n\n| 问题 | 相关指标 |\n|---|---|\n| 是否吃到 Tensor Core | Tensor pipe utilization、HMMA 指令 |\n| 是算力还是带宽限制 | SM throughput、memory throughput + roofline |\n| warp 在等什么 | Warp stall reasons（memory、barrier、dependency、pipe busy）|\n| occupancy 是否受限 | Achieved occupancy、active warps |\n| register pressure 是否高 | registers per thread、local memory load/store |\n| shared memory 是否冲突 | shared load/store、bank conflict |\n\n**ncu 的 overhead 警告**：`--set full` 每个被采样的 kernel 会被 replay 多次，单 kernel 时间可能放大 5-50×。只在专用 profile job 上跑，不要在生产训练中使用。先用 `--set default` 看大方向，确认问题后才用 `--set full`。",
+        "reveal": {
+          "q": "一个分布式训练任务，GPU 利用率只有 45%，`nsys` 显示大量 10-30 μs 短 kernel 之间有 50-150 μs 空洞，Memcpy H2D 占比很小，NCCL 没有明显尾巴。你会先用哪个工具、排查哪个层级？",
+          "a": "症状是 launch 稀疏（短 kernel 之间有大空洞），不是 H2D、NCCL 或 kernel 内部问题。第一步：用 `torch.profiler` 按 CPU self time 排序，找哪些 `aten::` op/module 产生了大量小 kernel；同时检查是否有 `.item()`、`.cpu()`、debug metric 等隐式同步。第二步：临时关闭 metric 和同步 logger 做 A/B，确认是否是同步拉平了流水。第三步：尝试 `torch.compile(mode=\"reduce-overhead\")` 并固定 shape bucket。此阶段不需要 `ncu`——问题不在 kernel 内部，而在 CPU 发命令的路径上。"
+        }
+      },
+      {
+        "title": "性能回归测试：把经验变成护栏",
+        "body": "性能修复没有回归测试，很快会被下一次改动破坏。推荐分层：\n\n| 层级 | 运行频率 | 负载 | 发现什么 |\n|---|---|---|---|\n| PR smoke | 每个 PR | 小模型、固定 shape | 明显 step time 退化、同步点、op 数爆炸 |\n| Nightly | 每晚 | 代表模型、真实数据子集 | H2D、NCCL、compile、dataloader 回归 |\n| Release | 发版前 | 生产形状、长窗口 | P99、checkpoint、eval、长期抖动 |\n\n**阈值设计**：\n```\nPR smoke: P50 退化 > 8% 且连续 3 次 → fail；kernel count 增 > 30% → warning\nNightly:  P50 退化 > 5% → warning；P99 退化 > 15% → warning\nRelease:  生产代表负载不允许超过签入基线阈值\n```\n\n**升级边界（不在本层继续猜）**：\n\n| 升级对象 | 触发条件 | 必须带的证据 |\n|---|---|---|\n| 模型/框架 owner | `torch.profiler` 指向 module 的小 op、同步、graph break | op 表、调用栈、最小复现 |\n| CUDA kernel owner | `ncu` 显示占比显著的 kernel 有 spill/coalescing 异常 | ncu report、shape/dtype/layout |\n| 网络/集群 owner | 多 rank `nsys` 显示 NCCL tail 或 rank skew | rank 对比、NCCL_DEBUG、拓扑 |\n| 平台/SRE | DCGM 显示 clock throttle、ECC/XID 或邻居干扰 | DCGM/nvidia-smi dmon、节点版本 |"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "性能 SOP 推荐先用 `nsys` 看时间线，最后才用 `ncu` 下钻 kernel。这个顺序最主要的原因是？",
+        "options": [
+          "`ncu` 不支持分布式训练场景",
+          "大多数性能问题不是 kernel 写得差，而是工作没有连续喂给 GPU；先看空洞能快速排除主要矛盾",
+          "`nsys` 的采集开销比 `ncu` 小，应该先跑开销小的",
+          "`ncu` 只能分析 cuBLAS kernel，不支持 Triton"
+        ],
+        "answer": 1,
+        "explain": "大多数 GPU 利用率低的问题根因在上层：launch 稀疏、H2D 串行、NCCL 尾巴、隐式同步等。先跑 ncu 容易把时间花在只占 2% 的 kernel 上，而真正问题是上层的 300 μs 空洞。nsys 先看形态，再按需下钻，才能不在错误层次优化。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`CUDA_LAUNCH_BLOCKING=1` 模式下测出的 step time 可以代表真实生产性能，因为它让错误位置更准确。",
+        "answer": false,
+        "explain": "`CUDA_LAUNCH_BLOCKING=1` 强制每个 launch 同步完成，会破坏 H2D/compute/NCCL overlap，让 step time 远高于正常生产值。它只适合定位异步错误的真实出错位置（debug），不能用于性能结论。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某训练任务 P50 step time 800 ms，但每 100 step 有一次 6 秒尖刺。`nsys` 显示尖刺前 GPU compute 已结束，随后 CPU 线程进入一段 IO。最可能的根因是？",
+        "options": [
+          "某个 kernel 有 register spill，每 100 step 触发一次",
+          "DataLoader worker 每 100 step 重新 shuffle 数据",
+          "checkpoint 或 logger flush 周期性卡住 CPU，后续 collective 只能等最慢 rank",
+          "NCCL allreduce 算法每 100 step 切换一次"
+        ],
+        "answer": 2,
+        "explain": "症状是固定间隔的尖刺，nsys 显示尖刺前 GPU 已完成，随后 CPU 进入 IO。这是典型的 checkpoint/logger flush 周期性抖动。NCCL 变长通常是结果不是根因——最慢 rank 被 checkpoint IO 卡住后，所有 collective 等它。应把 checkpoint 改为后台异步写入，或把 logger 上传迁出训练主线程。"
+      },
+      {
+        "type": "input",
+        "prompt": "设计 PR 级性能回归测试的 fail 阈值时，为什么不能设「P50 退化 > 0.1% 立即 fail」？（答案需包含「噪声」「复现」两词）",
+        "accept": ["噪声", "复现", "环境", "抖动", "变异"],
+        "explain": "性能测量受环境噪声影响（邻居作业、内存状态、GPU 时钟抖动），单次测量可能有 1-3% 的随机变异。阈值设太严格会产生大量误报，浪费工程师时间。正确做法是设合理阈值（如 P50 退化 > 8%）且要求连续 3 次复现，确保结论是真实退化而不是随机噪声。"
+      },
+      {
+        "type": "match",
+        "prompt": "将时间线病态症状与首要排查工具匹配：",
+        "left": [
+          "GPU HW 上短 kernel 之间大量空洞（launch 稀疏）",
+          "H2D 与 kernel 阶梯式轮流出现（串行）",
+          "少数 kernel 占 GPU time 大头（kernel 慢）",
+          "每 N step 固定出现 1-5 秒尖刺（周期抖动）"
+        ],
+        "right": [
+          "torch.profiler 按 CPU self time 排序，找小 op/同步/graph break",
+          "nsys 看 Memcpy row、DataLoader timing、检查 pinned memory/non_blocking/copy stream",
+          "ncu 看 Tensor Core、memory throughput、warp stall、register",
+          "日志时间戳 + NVTX range，逐一关闭 checkpoint/logger/eval 做 A/B"
+        ],
+        "explain": "launch 稀疏 → torch.profiler 找 CPU 侧小 op；H2D 串行 → nsys Memcpy row + DataLoader 检查；kernel 慢 → ncu 微结构；周期尖刺 → 日志时间戳 + NVTX 定位周期性任务。"
+      },
+      {
+        "type": "judge",
+        "prompt": "一个推理服务平均 TPOT（每 token 生成时间）很低，说明 P99 延迟也正常，不需要额外 profile。",
+        "answer": false,
+        "explain": "平均 TPOT 是均值，掩盖了尾延迟。P99 抖动可能来自 tokenizer 线程池、日志写入、请求 trace、KV cache eviction、GC 或 CPU 限流，与平均 TPOT 无关。生产推理必须分别看 P50/P95/P99，并按请求分桶（prefill/decode、输出长度、batch occupancy）分析。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`ncu --set full` 在生产训练上全量运行的主要风险是？",
+        "options": [
+          "会修改模型权重，导致训练结果不正确",
+          "每个被采样的 kernel 会被 replay 多次，step time 可能放大 5-50×，甚至超时被 driver kill",
+          "只能分析 attention kernel，无法分析 GEMM",
+          "会自动关闭 CUDA Graph，导致 replay 失效"
+        ],
+        "answer": 1,
+        "explain": "ncu full set 通过 kernel replay 收集所有计数器，每个被采样的 kernel 会运行多次。在长训练上全量使用会让 step time 飙升甚至超时。正确做法是用 --launch-skip 跳过 warmup、--launch-count 限制采样数（5-10 个）、--kernel-name 只采目标 kernel，在专用 profile job 而非生产训练上运行。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某分布式训练 rank 7 总是比其他 rank 晚 300 ms 进入 allreduce。以下哪项最不可能是根因？",
+        "options": [
+          "rank 7 的 sequence batch 更长，backward 计算时间更多",
+          "rank 7 所在节点 GPU 有热降频",
+          "所有 rank 共用同一个 NCCL allreduce 算法",
+          "rank 7 的 DataLoader worker 在该 step 读取了更多数据"
+        ],
+        "answer": 2,
+        "explain": "allreduce 算法所有 rank 共用，不会导致 rank 7 单独晚到。其他三项都可能让 rank 7 的计算或数据准备时间更长：sequence 更长 → backward 时间更多；GPU 降频 → 计算变慢；DataLoader 读更多数据 → 数据准备时间长。NCCL 的特点是「大家等最慢的那个」，所以尾巴根因通常是某个 rank 的前置工作，不是 NCCL 算法本身。"
+      }
+    ]
+  }
+]

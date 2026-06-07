@@ -1,0 +1,122 @@
+[
+  {
+    "id": "u7c13",
+    "title": "GPU 分区与共享",
+    "subtitle": "整卡、MIG、MPS、time-slicing 的隔离边界与碎片治理",
+    "intro": [
+      {
+        "title": "为什么 GPU 不能像 CPU 那样连续分配",
+        "body": "CPU 可以相对连续地按 core 和 memory 分配。GPU 不行。影响 GPU 可用性的因素很多：\n\n- **型号差异**：H100、A100、L40S、L4 性能和能力完全不同\n- **显存大小**：40GB、80GB、94GB 不是同一种资源\n- **切分方式**：整卡、`MIG`、`MPS`、`time-slicing` 的隔离语义根本不同\n- **拓扑约束**：同机 8 卡、跨机 8 卡、NVLink 路径差异很大\n- **状态**：是否已加载权重、构建推理 engine、预热 KV cache\n\n平台不能只暴露 `nvidia.com/gpu: 1`，它必须回答「这 1 个 GPU 到底是什么形状、什么隔离、什么性能承诺」。",
+        "tip": "从不同需求推导机制：大模型需要完整显存 → 整卡；小模型独占整卡浪费 → MIG；同信任域轻量进程想共享 → MPS；开发和教学只需先跑起来 → time-slicing。"
+      },
+      {
+        "title": "四种切分方式的核心对比",
+        "body": "| 维度 | 整卡 | `MIG` | `MPS`（Volta+）| `time-slicing` |\n|---|---|---|---|---|\n| 隔离粒度 | 独占 | GPC 硬件分区 | SM 硬件配额 | 时间片（无空间隔离）|\n| 显存隔离 | 是 | 是（独立 HBM 段）| 否（共享）| 否（共享）|\n| 故障隔离 | 是 | 是 | 否 | 否 |\n| 性能确定性 | 最强 | 强 | 中 | 弱 |\n| 重配代价 | 不涉及 | 必须停所有进程约 10s | 启动 daemon 即可 | 无 |\n| 跨租户安全 | 安全 | 安全 | 不安全 | 不安全 |\n\n**核心原则**：强 SLA 在线推理和大模型训练用整卡；小模型固定规格用 `MIG`；同团队轻量批处理可用 `MPS`；开发/教学用 `time-slicing`。",
+        "reveal": {
+          "q": "为什么 MPS 不适合跨租户生产服务？",
+          "a": "MPS 显存共享而非隔离。一个租户的 CUDA 进程发生 OOM 或异常 kernel，可能影响同卡其他租户的进程。Volta+ MPS 虽然有 SM 硬件配额限制，但显存仍共享，一个 client OOM 会让其他 client 的 cudaMalloc 失败。"
+        }
+      },
+      {
+        "title": "MIG 的硬件原理：为什么只有固定 profile",
+        "body": "`MIG`（Multi-Instance GPU）把 GPU 切成固定形状，根源在于硬件结构。以 H100 SXM 80GB 为例：\n\n- 内部有 **8 个 GPC**（GPU Processing Cluster），每 GPC 18 个 SM\n- **1 个 GPC** 留给 GPU engine 和系统控制路径，用户可分配最多 **7 个 GPC**\n- L2 cache 按 GPC 边界分 slice，HBM 控制器按 GPC 边界路由\n\n因此 H100 最多切 **7 个 `1g.10gb`** 实例（每实例 1 GPC + 10GB HBM），不能任意比例切分——L2 slice 和 HBM 控制器都必须按整数 GPC 分配。\n\n**重切代价**：必须先停所有使用该 GPU 的进程，destroy GI/CI 再 create，耗时约 5-10 秒，且必须走维护窗口（节点 cordon + drain）。",
+        "tip": "MIG 碎片化的本质：集群里 5 个节点全切成 1g.10gb，总算力够，但没有任何节点上有连续 3 个未占用 GPC 来满足 3g.40gb 请求。"
+      },
+      {
+        "title": "time-slicing 的实现：Device Plugin 把 1 张 GPU 报成 N 个",
+        "body": "`time-slicing` 的实现比想象中简单粗暴：NVIDIA Device Plugin 在 `ListAndWatch` 里对单个物理 GPU 报告 N 份虚拟 device ID。\n\n配置示例（将 1 张 GPU 报成 4 份）：\n\n```\nsharing:\n  timeSlicing:\n    resources:\n      - name: nvidia.com/gpu\n        replicas: 4\n        rename: nvidia.com/gpu.shared\n```\n\n**关键后果**：\n- 4 个 Pod 全部看到同一张物理 GPU（同一 UUID）\n- **没有任何隔离**：共享显存、共享 SM、共享 L2\n- **没有性能配额**：谁跑大 kernel 就占满 GPU，其他 Pod 排队\n- 一个 Pod `cudaMalloc` 80GB 会让其他 Pod 的 `cudaMalloc` 失败\n\n生产上建议用 `rename` 改资源名（`nvidia.com/gpu.shared`），把 time-slicing 池与整卡池隔离，避免普通作业误入。"
+      },
+      {
+        "title": "Warm pool：热的是路径，不是容量",
+        "body": "推理扩容慢常常不是没有 GPU，而是**启动路径长**：\n\n`节点加入 → 镜像拉取 → 权重下载 → engine 构建 → 显存分配 → 预热 → readiness`\n\nWarm pool 在不同层次截断这条路径：\n\n| 深度 | 已经准备好什么 | 成本 |\n|---|---|---|\n| 热节点 | 节点 Ready、驱动正常 | 空闲节点费用 |\n| 热镜像 | 镜像已缓存 | 更新治理 |\n| 热权重 | 权重在本地盘 | 磁盘和版本管理 |\n| 热 engine | 推理框架初始化完成 | 版本和硬件绑定 |\n| 热副本 | 完成 warmup 随时入池 | GPU 常驻成本 |\n\n**关键认知**：warm pool 不增加总容量，它用长期占用成本换启动速度。且必须按模型、卡型、MIG profile 和版本管理——H100 整卡热副本不能替代 `3g.40gb` MIG 热副本。",
+        "tip": "只热节点不够，70B 模型权重加载可能需要 4 分钟，engine 构建又需要 3 分钟。warm pool 的目标是让冷启动时间小于业务允许的扩容反应时间。"
+      },
+      {
+        "title": "碎片化与 Bin Packing",
+        "body": "碎片化不是「GPU 利用率不高」，而是**账面有空闲容量，但没有某个工作负载所需的完整资源形状**。\n\n例子：4 台 8xH100 节点，总空闲 10 张 GPU，但没有 1 台完整 8 卡节点。用户说「还有 10 张空闲卡」，平台说「没有 8 卡节点」，两者都对——差异在资源形状。\n\n**Bin packing 的目标不是把每张卡都塞满，而是保留关键形状**：\n- 8 卡训练作业：保留完整 8 卡节点\n- 小模型推理：compact 到 MIG 池，不污染整卡训练池\n- 开发任务：优先填共享池\n- 可抢占任务：填将来可回收的位置\n\n低峰 defrag（整理碎片）需要 checkpoint 和维护窗口配合，不能只靠调度器自动完成。",
+        "reveal": {
+          "q": "小模型推理服务需要 3g.40gb 的 MIG 实例，但集群剩余的都是 1g.10gb 的 MIG 实例。为什么无法满足需求？",
+          "a": "MIG profile 固定，1g.10gb 和 3g.40gb 分别对应 1 个和 3 个 GPC，不能合并。必须重切 MIG profile 才能释放出 3g.40gb 形状，但重切需要停止所有使用该 GPU 的进程，需要走维护窗口。"
+        }
+      },
+      {
+        "title": "易错点：GPU 共享的典型反模式",
+        "body": "**生产中最常见的 8 个反模式：**\n\n1. **把所有 GPU 当一种 SKU**：调度解释困难，作业性能差异巨大 → 按型号、显存、拓扑、共享方式建 ResourceFlavor\n2. **为利用率全开 MIG**：大模型和 8 卡训练长期无卡 → 保留整卡池和重切窗口\n3. **跨租户默认 MPS**：一个租户影响另一个 → 跨租户优先 MIG 或整卡\n4. **time-slicing 跑生产推理**：P99 抖动，用户投诉 → 只用于开发和低优先级\n5. **只看总空闲 GPU**：「有卡但 Pending」反复发生 → 看关键形状可用数\n6. **warm pool 只热节点**：扩容仍慢在权重和 engine → 热到 readiness 层\n7. **小任务随意 spread**：破坏完整 8 卡节点 → 小任务 compact 到专用池\n8. **MIG profile 长期不复盘**：idle 和 pending 同时存在 → 根据需求重切和拆池"
+      }
+    ],
+    "questions": [
+      {
+        "type": "match",
+        "prompt": "将四种 GPU 切分方式与其最适合的场景对应：",
+        "left": ["整卡", "MIG", "MPS", "time-slicing"],
+        "right": [
+          "同团队轻量批处理，可容忍互扰",
+          "70B 在线推理，强 SLA 跨租户",
+          "开发、教学、notebook，目标是可获得性",
+          "7B 小模型推理，固定规格强隔离"
+        ],
+        "explain": "整卡适合强 SLA 大模型；MIG 适合固定规格小模型；MPS 适合同信任域轻量任务；time-slicing 适合开发教学。"
+      },
+      {
+        "type": "judge",
+        "prompt": "H100 最多可以切出任意比例的 MIG 实例，例如将 80GB 显存按 30%:70% 切成两个实例。",
+        "answer": false,
+        "explain": "MIG 只能使用硬件支持的固定 profile（如 1g.10gb、2g.20gb、3g.40gb 等），因为 L2 cache 必须按 GPC 整数倍分配，HBM 控制器也在 GPC 边界路由，不支持任意比例切分。"
+      },
+      {
+        "type": "choice",
+        "prompt": "time-slicing 的 Device Plugin 配置 replicas: 4 后，4 个 Pod 各申请 nvidia.com/gpu: 1，实际会发生什么？",
+        "options": [
+          "每个 Pod 获得独立的 1/4 显存和 1/4 SM 算力",
+          "4 个 Pod 全部看到同一张物理 GPU，共享显存、SM、L2，靠 GPU 硬件时间片轮转",
+          "Device Plugin 会为每个 Pod 创建独立的 CUDA context",
+          "超过物理 GPU 数量的申请会被 scheduler 拒绝"
+        ],
+        "answer": 1,
+        "explain": "time-slicing 只是 Device Plugin 报告虚拟 device ID，没有任何隔离机制。4 个 Pod 共享完整的物理 GPU，包括全部显存、所有 SM 和 L2 cache，完全依赖 GPU 硬件的 context switch 轮转。"
+      },
+      {
+        "type": "input",
+        "prompt": "warm pool 的核心价值是缩短从「需要扩容」到「可以接流量」的路径。这个路径上最耗时的两个阶段通常是哪两类？（回答英文关键词，用逗号分隔）",
+        "accept": ["weight load,engine init", "engine init,weight load", "weight,engine", "engine,weight"],
+        "explain": "对大模型而言，权重加载（weight load，70B 模型可能 4 分钟）和 engine 初始化/CUDA graph capture（engine init，可能 3 分钟）是冷启动中最主要的耗时来源，远超镜像拉取和 warmup。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某集群有 5 个节点，每节点 8 张 H100 全部切成 1g.10gb，总共 280 个 MIG 实例。此时来了一个需要 3g.40gb 的请求，会发生什么？",
+        "options": [
+          "系统自动将 3 个 1g.10gb 合并成 1 个 3g.40gb",
+          "调度器从多个节点各取 1 个 MIG 实例拼凑请求",
+          "请求 Pending，因为没有节点上有连续 3 个未占用 GPC",
+          "系统自动重切离请求最近节点的 MIG profile"
+        ],
+        "answer": 2,
+        "explain": "这是 MIG 碎片化的典型场景。MIG profile 不能合并，3g.40gb 需要 3 个连续 GPC。若所有 GPC 都切成 1g.10gb 且全部占用，就无法满足 3g.40gb 请求，必须通过维护窗口重切 profile。"
+      },
+      {
+        "type": "judge",
+        "prompt": "warm pool 保留 2 个热副本（权重和 engine 已就绪）等于增加了 2 倍的总 GPU 容量。",
+        "answer": false,
+        "explain": "warm pool 不增加总容量，它只是让现有 GPU 处于更热的启动状态，使扩容时间缩短。热副本本身会持续占用 GPU（包括显存和算力），实际上是用常驻成本换启动速度。"
+      },
+      {
+        "type": "choice",
+        "prompt": "关于 MPS（Multi-Process Service）在 Volta+ GPU 上的 SM 配额，以下哪个描述正确？",
+        "options": [
+          "MPS 通过时间片轮转让多进程共享所有 SM，无法限制单进程用量",
+          "通过 CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 可以限制某 client 的 SM 使用比例，这是硬件层面的真实分配",
+          "MPS 的 SM 配额等价于 MIG 的 GPC 隔离，显存也同样隔离",
+          "SM 配额是 CUDA driver 的软件限制，不涉及硬件"
+        ],
+        "answer": 1,
+        "explain": "Volta+ GPU 硬件支持 multi-context concurrent execution，CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 设置后，GPU 硬件层面把该 client 的 thread block 限制在指定比例的 SM 上，而不是靠时间错峰——这是 Volta MPS 与旧版 MPS 的根本区别。但显存仍然共享，与 MIG 不同。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Bin packing 的目标是把每张 GPU 都利用到最高，以提升整体 GPU utilization。",
+        "answer": false,
+        "explain": "Bin packing 的目标是保留关键形状（如完整 8 卡节点、成对整卡），而不是盲目塞满。把所有空间塞满小任务会破坏大训练所需的拓扑形状，反而让最重要的工作负载无法启动。"
+      }
+    ]
+  }
+]

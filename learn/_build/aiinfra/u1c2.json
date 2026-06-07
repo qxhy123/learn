@@ -1,0 +1,141 @@
+[
+  {
+    "id": "u1c2",
+    "title": "流水线（Pipeline）",
+    "subtitle": "IF/ID/EX/MEM/WB、冒险、Forwarding 与 IPC 推算",
+    "intro": [
+      {
+        "title": "为什么需要流水线？",
+        "body": "**核心约束**：一条指令从取指到写回，必须经过取指（IF）→ 译码（ID）→ 执行（EX）→ 访存（MEM）→ 写回（WB）。在任何工艺下，这条路径都有最小不可消除的传播时延。\n\n- **单周期设计**：取一条、做一条、再取下一条。时钟周期必须覆盖全程，频率被压死，IPC 最多 1。\n- **流水线设计**：把路径切成 N 段，每段加一个 pipeline register。时钟周期只需覆盖最长那段，频率可升 N 倍；多条指令的不同阶段同时进行，吞吐理论上达到「1 条/周期」。\n\n**唯一要回答的问题**：单条指令的 latency 既然不能消除，能不能让多条指令的不同阶段重叠，从而把吞吐提高 N 倍？",
+        "tip": "流水线提升的是「吞吐量」，不是单条指令的延迟。单条指令还是要经过完整的 5 个周期。"
+      },
+      {
+        "title": "5 段经典流水线：IF/ID/EX/MEM/WB",
+        "body": "经典 MIPS 5 段流水线，也是所有现代深流水的基线：\n\n| 段 | 名称 | 做什么 |\n|---|---|---|\n| IF | Instruction Fetch | 用 PC 从 I-cache 取指令 |\n| ID | Instruction Decode | 译码、读寄存器、生成控制信号 |\n| EX | Execute | ALU 计算、地址生成、分支条件判断 |\n| MEM | Memory Access | load 读 D-cache、store 写 D-cache |\n| WB | Write Back | 把结果写回寄存器堆 |\n\n每两段之间有 pipeline register 在时钟上升沿采样上一段的输出。\n\n填满流水线后（Cycle 5 之后），每个 cycle 都有一条指令完成 WB——这就是 **CPI = 1** 的物理来源。",
+        "steps": [
+          "Cycle 1: i 在 IF",
+          "Cycle 2: i 在 ID，i+1 在 IF",
+          "Cycle 3: i 在 EX，i+1 在 ID，i+2 在 IF",
+          "Cycle 4: i 在 MEM，i+1 在 EX，i+2 在 ID，i+3 在 IF",
+          "Cycle 5: i 在 WB，i+1 在 MEM，i+2 在 EX，i+3 在 ID，i+4 在 IF",
+          "Cycle 6+: 每周期一条指令完成 WB，吞吐 = 1 条/cycle"
+        ]
+      },
+      {
+        "title": "现代深流水：为什么 Skylake 要 14–19 段？",
+        "body": "教学用 5 段，工业界用 14–19 段。Intel Skylake 约 14–19 段，AMD Zen3/Zen4 量级相近，Pentium 4 Prescott 做到 31 段被证明失败。\n\n**加深的收益**：每段更短 → 时钟周期更短 → 频率升到 4–5GHz；更细粒度的资源调度（更宽的解码、更深的 ROB）让 IPC 也同步提升。\n\n**加深的代价**：\n- 分支误预测代价随深度线性增长：5 段约 2–3 cycle，14–19 段约 15–20 cycle，Prescott 31 段达 30+ cycle\n- 每段的 pipeline register、时钟分发、能耗增加\n- 函数调用、中断、上下文切换都要重新填满流水线\n\n| 流水线深度 | 典型误预测代价 | 代表微架构 |\n|---|---:|---|\n| 5 段 | 2–3 cycle | 教学 / 嵌入式 |\n| 14–19 段 | 15–20 cycle | Skylake / Zen4 |\n| 31 段 | 30+ cycle | Pentium 4（失败案例）|",
+        "tip": "AI Infra 工程师无法选 CPU 的流水线深度，但可以选「代码的流水线友好程度」。不规则分支堆在热循环里，等于每次都让深流水帮你浪费 18 个 cycle。"
+      },
+      {
+        "title": "数据冒险：RAW/WAR/WAW 与 Forwarding",
+        "body": "流水线内多条指令重叠时，指令之间可能存在依赖冲突，称为「数据冒险」（Data Hazard）：\n\n| 类型 | 全称 | 例子 | 是真依赖？ |\n|---|---|---|---|\n| RAW | Read After Write | `add r1,r2,r3` 后 `sub r4,r1,r5` | 是 |\n| WAR | Write After Read | `add r4,r1,r5` 后 `add r1,r2,r3` | 否（假依赖） |\n| WAW | Write After Write | `mov r1,a` 后 `mov r1,b` | 否（假依赖） |\n\n顺序 5 段流水线只会遇到 RAW。WAR/WAW 是乱序执行才暴露的假依赖，由寄存器重命名消除（见关3）。\n\n**Forwarding/Bypass**：i 的 EX 段产生结果后，直接通过旁路线送到 i+1 的 EX 段输入，不必等 WB 写完寄存器堆。ALU-to-ALU forwarding 完全消灭「add 后立刻 add」的 RAW stall。\n\n**Load-use stall**：load 结果到 MEM 段末才出来，下一条指令 EX 段却需要在那个 cycle 初就拿到输入，时间上对不上——即使有 forwarding 也至少插 **1 个 bubble**。"
+      },
+      {
+        "title": "控制冒险与结构冒险",
+        "body": "**控制冒险**：分支条件在 EX 段才计算完毕，但 IF 段每周期都要给出下一条 PC。分支进入 IF 到知道真实方向之间，已经取了「假定顺序执行」的指令——分支 taken 时这些指令要被冲掉，形成 bubble。\n\n5 段流水线误预测代价 2–3 cycle，14–19 段深流水代价 15–20 cycle。分支预测器的详细机制见关4。\n\n**结构冒险**：两条指令同时需要同一硬件资源。典型解法：\n- 取指 + 访存撞内存端口 → 分离 I-cache 和 D-cache（哈佛架构）\n- 写回 + 读寄存器撞寄存器堆端口 → 多端口寄存器堆\n- 多个长延迟指令争 ALU → 独立的整数 / 浮点 / 向量执行单元\n\n现代超标量 CPU（如 Skylake 8 个 execution port）把「端口」抽象出来，scheduler 把就绪 uop 送到合适且空闲的端口，结构冒险在软件层面几乎透明。",
+        "tip": "Load-use stall 是流水线最常见的性能杀手之一。编译器会主动把 load 提前一两条指令，中间插独立工作。这就是 -O2 汇编中「load 后跟无关 ALU」的原因。"
+      },
+      {
+        "title": "CPI 推算与真实 IPC 数据",
+        "body": "**理论 CPI = 1.0**，真实程序的 CPI 受多类 stall 叠加：\n\n`CPI_total = base_CPI + load_use_rate × 1 + branch_miss_rate × miss_penalty + cache_miss_rate × miss_penalty`\n\n真实 AI Infra 工作负载的 IPC 对比：\n\n| 工作负载 | 典型 IPC | 主要 stall 类型 |\n|---|---:|---|\n| LLM tokenizer | 0.5–0.9 | load-use 链、frontend bound |\n| DataLoader（图片解码） | 0.7–1.2 | backend bound, cache miss |\n| LLM 推理 scheduler | 0.7–1.3 | branch miss、lock 争用 |\n| simdjson（SIMD JSON 解析） | 2.0–3.0 | SIMD 友好，几乎无 stall |\n| FMA 浮点矩阵运算 | 2.5–3.5 | 几乎无 stall |\n| 训练主循环（NCCL 等待中） | 0.2–0.4 | 设计如此，不是问题 |\n\n**诊断节奏**：IPC > 2.0 → 已经不错；IPC 1.0–2.0 → 看具体 stall 类别；IPC < 1.0 → 大概率 backend stall（cache miss 或长依赖链），值得排查。",
+        "reveal": {
+          "q": "tokenizer IPC = 0.625，branch-misses 贡献 0.09，L2-miss 贡献 0.028，但 CPI 比 base 多了 0.6，还有 ~0.48 未解释，下一步查什么？",
+          "a": "load-use 链造成的 stall 是最可能的「剩余金矿」。应当用 Top-down 分析或 `perf record` 找具体热点指令，重点看 cycle_activity.stalls_mem_any 和 L1D/L2 miss stall 比例。"
+        }
+      },
+      {
+        "title": "用 perf stat 诊断流水线：Top-down 四象限",
+        "body": "**Top-down 分析（Intel TMA）** 把每个 cycle 归类到四个象限：\n\n| 象限 | 含义 | 排查方向 |\n|---|---|---|\n| Retiring | 流水线在做有用工作 | 看 SIMD 利用率 |\n| Front-end Bound | 前端没把 uop 送进 backend | I-cache miss、uop cache miss |\n| Back-end Bound | 后端处理不过来 | cache miss、长延迟 ALU |\n| Bad Speculation | 误预测浪费 cycle | 改控制流、PGO |\n\n常用命令：\n- 基础 IPC 概览：`perf stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -- ./prog`\n- Top-down 四象限：`perf stat -M TopdownL1 -- ./prog`\n- 细分 backend：`perf stat -e cycle_activity.stalls_total,cycle_activity.stalls_l1d_miss,cycle_activity.stalls_l2_miss,cycle_activity.stalls_l3_miss -- ./prog`\n\n**快速决策**：Frontend Bound > 20% 查 I-cache；Backend Bound > 50% 查 cache 和数据布局；Bad Speculation > 10% 查分支；Retiring > 70% 但 IPC < 2 查 SIMD。",
+        "steps": [
+          "先跑 perf stat 看 IPC = instructions / cycles",
+          "用 TopdownL1 定象限：哪个象限占比最高？",
+          "按象限深挖：backend → 查 cache miss；frontend → 查 I-cache；bad speculation → 查分支",
+          "最小修改 A/B 测试，确认 IPC 提升后复测端到端业务指标"
+        ]
+      },
+      {
+        "title": "Worked Example：tokenizer 流水线排障",
+        "body": "**场景**：LLM 推理服务 tokenizer 占端到端 25%，IPC = 0.625，GPU 利用率 70%。\n\n**诊断过程**：\n- Top-down：Backend Bound 46%，Bad Speculation 8%，优先查 backend\n- 细分 backend：L1D miss stall 22%，L2 miss stall 14%\n- 根因：BPE merge 哈希表（30MB）+ 状态查找表（4MB）远超 L1D，cache miss 主导\n\n**优化路径**：\n\n| 修改 | IPC | tokenizer 时间 |\n|---|---:|---:|\n| baseline | 0.625 | 45ms |\n| pre-tokenize 缓存 + LRU | 0.71 | 38ms |\n| 常用 token perfect hash | 0.92 | 28ms |\n| worker batch 化（32 请求） | 1.05 | 22ms |\n| 三者叠加 + AVX2 字符分类 | 1.42 | 14ms |\n\n**复盘**：整个过程没有改算法逻辑，只改了数据结构和访问模式。IPC 从 0.625 提升到 1.42，端到端 p99 从 180ms 降到 145ms，GPU 利用率提到 85%。",
+        "reveal": {
+          "q": "为什么 tokenizer 状态机 `state = table[state][char]` 即使有 forwarding 也 IPC 很低？",
+          "a": "这是串行依赖链：每次查表的地址（state 索引）依赖上次 load 的结果。下次 load 必须等上次结果出来后才能知道地址，forwarding 无法帮助——因为 forwarding 消除的是「已知结果」到「下一条执行」之间的等待，但这里下一条的地址就是未知的。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "5 段流水线填满后，理论上 CPI 接近 1 的物理原因是什么？",
+        "options": [
+          "每条指令只需 1 个 cycle 就能完成执行",
+          "5 个段同时各执行不同指令，每周期都有一条指令完成 WB",
+          "pipeline register 把指令的 latency 从 5 cycle 缩短到 1 cycle",
+          "CPU 频率提高了 5 倍，所以相对而言每条指令只用 1/5 时间"
+        ],
+        "answer": 1,
+        "explain": "流水线填满后，IF/ID/EX/MEM/WB 五个段同时各处理不同指令——一条在取指、另一条在译码、另一条在执行……每个周期都有一条指令走完 WB，因此吞吐 = 1 条/cycle，即 CPI ≈ 1。单条指令的 latency 仍是 5 cycle，不变。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种冒险类型，在顺序 5 段流水线中 Forwarding 也无法完全消除，至少需要插 1 个 bubble？",
+        "options": [
+          "ALU 指令后紧跟另一条 ALU 指令（RAW，距离 1）",
+          "load 指令后紧跟使用 load 结果的指令（load-use RAW，距离 1）",
+          "先写寄存器后读同一寄存器（WAR）",
+          "两条指令都写同一个寄存器（WAW）"
+        ],
+        "answer": 1,
+        "explain": "load 结果在 MEM 段末（cycle 4）才出来，而 i+1 指令在 cycle 4 初就需要进入 EX 读取操作数。即使从 MEM 输出拉 forwarding 线到下一条 EX 输入，时序上也晚一拍，必须插 1 cycle bubble 让 i+1 推迟。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Pentium 4 Prescott 把流水线加深到 31 段，是成功提升 CPU 性能的设计案例。",
+        "answer": false,
+        "explain": "Prescott 是失败案例。流水线深度 31 段使分支误预测代价高达 30+ cycle，而频率提升的边际收益已经很小，导致能耗暴增、性能不达预期。现代设计稳定在 14–19 段，把投资转向更宽的乱序窗口和更智能的预测器。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对一段 LLM tokenizer 热点运行 Top-down 分析得到：Retiring 28%、Frontend Bound 18%、Backend Bound 46%、Bad Speculation 8%，IPC = 0.625。下一步最应该优先排查什么？",
+        "options": [
+          "Frontend Bound：减小代码体积，优化 I-cache 命中",
+          "Bad Speculation：改进分支预测，添加 likely/unlikely 提示",
+          "Backend Bound：查 cache miss 和数据布局问题",
+          "Retiring：检查是否有未使用的 SIMD 机会"
+        ],
+        "answer": 2,
+        "explain": "Backend Bound 46% 是四象限中占比最高的，应优先处理。Backend Bound 主要来自 cache miss 或长延迟 ALU。IPC 0.625 配合 Backend Bound > 40%，高度怀疑是 load-use 链或 L1D/L2 miss 主导。"
+      },
+      {
+        "type": "match",
+        "prompt": "将流水线冒险类型与其解决方案配对：",
+        "left": ["RAW（ALU-ALU，距离 1）", "RAW（load-use，距离 1）", "结构冒险（取指 + 访存撞内存）", "控制冒险（分支）"],
+        "right": ["分支预测器 + 误预测时 flush 流水线", "分离 I-cache 和 D-cache（哈佛架构）", "EX-to-EX Forwarding，0 bubble", "必须插 1 cycle bubble + MEM-to-EX Forwarding"],
+        "explain": "ALU-ALU RAW 可以通过 EX-to-EX forwarding 完全消除；load-use RAW 即使有 forwarding 也需要 1 bubble；取指/访存的结构冲突通过分离 I/D Cache 解决；控制冒险通过分支预测 + flush 机制处理。"
+      },
+      {
+        "type": "input",
+        "prompt": "某 tokenizer 热点：每 1000 条指令有 30 次分支误预测（每次 17 cycle）、20 次 L2 miss（每次 14 cycle），base CPI = 0.9。只考虑这两项 stall，估算总 CPI（保留两位小数）。",
+        "accept": ["1.69", "1.7", "约 1.69", "约 1.7"],
+        "explain": "branch miss 贡献 = (30/1000) × 17 = 0.51 cycle/instr；L2 miss 贡献 = (20/1000) × 14 = 0.28 cycle/instr；CPI_total = 0.9 + 0.51 + 0.28 = 1.69。这说明分支误预测是主要额外 stall 来源，应优先优化。"
+      },
+      {
+        "type": "judge",
+        "prompt": "WAR（Write After Read）和 WAW（Write After Write）是真实的数据依赖，在顺序 5 段流水线中会导致 bubble。",
+        "answer": false,
+        "explain": "WAR 和 WAW 是「假依赖」（name dependence），只是寄存器名字复用造成的冲突。在顺序流水线中，因为指令按顺序执行，WAR/WAW 天然不会造成问题。它们只在乱序执行（OoO）时才需要关注，通过寄存器重命名（register renaming）消除。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`perf stat` 显示 `cycle_activity.stalls_l3_miss` 占 cycles 的 42%，这最可能说明什么？",
+        "options": [
+          "分支预测失败率过高，需要优化 cold path",
+          "程序的工作集超出了 L3 Cache 容量，频繁访问 DRAM",
+          "流水线前端（Frontend）送指不足，需要减少代码体积",
+          "SIMD 指令使用不足，标量路径占主导"
+        ],
+        "answer": 1,
+        "explain": "`cycle_activity.stalls_l3_miss` 表示因为 L3 Cache miss（需要访问 DRAM）导致的 stall cycle 数。占 cycles 42% 说明接近一半的时间 CPU 都在等 DRAM 返回数据，这是「working set 超出 LLC 容量」的典型信号，应优先改数据布局或缩小工作集。"
+      }
+    ]
+  }
+]

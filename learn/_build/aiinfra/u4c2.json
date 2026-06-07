@@ -1,0 +1,130 @@
+[
+  {
+    "id": "u4c2",
+    "title": "数据并行：DDP、FSDP 与 ZeRO",
+    "subtitle": "复制计算、同步梯度、切分状态",
+    "intro": [
+      {
+        "title": "数据并行的第一性原理",
+        "body": "数据并行的核心矛盾只有一句话：\n\n**复制计算者以提高样本吞吐，同时让所有计算者在 optimizer step 前重新达成参数一致。**\n\n这推出四个必然后果：\n1. 每个 rank 必须知道自己处理哪一份数据（sampler 分片）\n2. 每个 rank 必须使用等价的模型状态（init broadcast）\n3. backward 产生的局部梯度必须变成全局平均梯度（AllReduce 或 ReduceScatter）\n4. 任意 rank 变慢都会拖慢整个同步组（straggler 效应）\n\n数据并行不是「加卡就加速」，而是把单节点瓶颈延伸到通信和状态路径。"
+      },
+      {
+        "title": "DDP vs FSDP vs ZeRO：各自切什么",
+        "body": "一句话总结：**DP 切样本，FSDP/ZeRO 切训练状态，TP 切层内张量，PP 切层段。**\n\n| 策略 | 复制 | 切分 | 主要通信 | 适用场景 |\n|---|---|---|---|---|\n| DDP | params + grads + optimizer state | 数据 | Gradient AllReduce | 完整副本能放进单卡 |\n| ZeRO-1 | params + grads | optimizer state | AllGather/partition | Adam state 顶显存 |\n| ZeRO-2 | params | grad + optimizer state | ReduceScatter | gradient 也太大 |\n| ZeRO-3 / FSDP FULL_SHARD | 按需临时完整参数 | params + grad + optimizer | AllGather + ReduceScatter | 完整副本放不下 |\n\nLLaMA-7B BF16 + AdamW FP32：DDP 每卡 params+grad+Adam 约 100 GiB，H100 80GB 放不下——这就是为什么必须用 FSDP/ZeRO-3。"
+      },
+      {
+        "title": "ZeRO 真实节省倍数（不要被误导）",
+        "body": "ZeRO 节省幅度常被高估。以 8 个 DP rank、BF16 训练 + Adam FP32 为例，每参数单卡字节数是 2（params）+2（grad）+12（master+m+v）= **16 bytes**：\n\n| 阶段 | 单卡字节/参数 | 端到端 reduction（N=8）|\n|---|---|---|\n| DDP | 16 | 1× |\n| ZeRO-1 | 4 + 12/8 = 5.5 | **~2.9×**（不是 8×）|\n| ZeRO-2 | 2 + 14/8 = 3.75 | **~4.3×**（不是 8×）|\n| ZeRO-3 | 16/8 = 2 | **≈ N = 8×** |\n\n常见错误：把「optimizer state 内部切了 8 份」误读成「整体省了 8 倍」，导致容量估算错误。\n\n另外 ZeRO 不切 activation，只有 CP/SP 才切；activation 随 batch/seq/layer 大幅变化。",
+        "tip": "N 越大 ZeRO 收益越大，但 ZeRO-3 每层 forward/backward 都要 AllGather + ReduceScatter，对跨节点带宽极度敏感。100Gbps 以太网环境慎用大 world ZeRO-3。"
+      },
+      {
+        "title": "DDP backward overlap 机制",
+        "body": "DDP 不等 backward 全部完成后才一次性通信，而是用 **gradient bucket** 实现 backward compute 与 AllReduce 重叠：\n\n1. 参数梯度按 bucket 分组（默认 `bucket_cap_mb=25`）\n2. 某 bucket 内所有梯度 ready → 立即启动 async AllReduce\n3. 理想情况下，早期 bucket 的通信被后续 backward compute 掩盖\n4. optimizer step 前等待所有 in-flight bucket 完成\n\n调优不靠直觉，靠 profiler timeline：\n- bucket 太小：大量小 collective，launch overhead 高\n- bucket 太大：backward 结束后 tail NCCL 仍在运行，暴露通信长\n\nGradient accumulation 的中间 microstep 必须用 `no_sync()` 跳过 AllReduce，只在最后一个 microstep 同步；否则每步都触发 AllReduce，通信量扩大 `grad_accum_steps` 倍。"
+      },
+      {
+        "title": "FSDP FULL_SHARD 的生命周期",
+        "body": "FSDP/ZeRO-3 每层的显存生命周期：\n\n- **稳态**：每 rank 只持有 `flat_param_shard[i]`、optimizer shard\n- **forward 前**：AllGather 所有 rank 的 shard → 临时拼出完整参数\n- **forward 后**：`reshard_after_forward` 释放完整参数，保留 shard\n- **backward 前**：`backward_prefetch` 提前 AllGather 下一层参数\n- **backward 后**：ReduceScatter 梯度，每 rank 保留自己的 grad shard\n- **optimizer**：每 rank 只更新自己拥有的 shard\n\nHBM 峰值常出现在「当前层完整参数 + prefetch 层完整参数 + activation」叠加瞬间，而不是稳态 shard 大小。`limit_all_gathers=True` 可降低峰值但可能减少 overlap。",
+        "tip": "FSDP 的 wrap 粒度很重要：粒度太粗单次 AllGather 太大，粒度太细 collective 次数过多。通常以 Transformer Block 为单位 wrap。"
+      },
+      {
+        "title": "暴露通信：真正影响吞吐的指标",
+        "body": "训练中真正伤害吞吐的不是总通信量，而是没有被计算覆盖的部分：\n\n`exposed_communication = max(comm_time - overlap_with_compute, 0)`\n\n`step_time ≈ data_visible + compute + exposed_communication + optimizer + misc`\n\n被 compute 覆盖的通信不需要优化；未被覆盖的才影响 tokens/s。\n\n8 节点 64 GPU FSDP 示例：\n- AllGather + ReduceScatter 总计 1405 ms，overlap 1125 ms\n- 暴露通信仅 280 ms P50，约占 step time 的 4.6%\n- 若 NCCL 退化到 socket（无 RDMA），暴露通信可飙到 1030 ms，step time 变慢 ~9%\n\nNon-pad tokens/s 的弱扩展效率 = `throughput_64GPU / (8 × throughput_8GPU)`，健康值应 ≥ 85%。"
+      },
+      {
+        "title": "Straggler 与 data skew：两种根因，诊断路径不同",
+        "body": "同步训练的 step time 由**最慢 rank** 决定。当某个 rank 持续慢时，要区分两种根因：\n\n**data skew**：rank 收到的样本 token 数差异大 → `rank_step_skew_p95` 与 `sample_token_skew_p95` 同时上升\n- 根因：shard 按样本数均分，但没按 token 数平衡\n- 修复：按 non-pad token budget 分配 shard\n\n**硬件/网络 straggler**：rank step skew 高，但 token skew 正常 → 查 GPU 降频、ECC/XID、CPU steal、NUMA 错、NIC 拥塞\n\n诊断顺序：\n1. 先看 per-rank step time P50/P95\n2. 看 sample_token_skew：若 skew > 1.1，优先看 data path\n3. 若 token skew 正常，查 DCGM/IB counters/`nvidia-smi`\n\n每条日志必须带 `rank`、`dataset_shard`、`sample_tokens` 才能做此诊断。",
+        "tip": "NCCL timeout 不一定是「网络慢」，有时是某 rank 因 data skew 晚进入 collective 导致其他 rank 超时等待。"
+      },
+      {
+        "title": "何时从 DP 切换到 TP/PP/CP",
+        "body": "数据并行家族（DDP/FSDP/ZeRO）解决的是**训练状态太大**和**样本吞吐不足**，但有三类问题它解决不了：\n\n1. **单层矩阵放不下** → 需要 Tensor Parallel（TP），优先节点内 NVLink\n2. **整网层数/深度超 HBM** → 需要 Pipeline Parallel（PP）\n3. **超长序列 attention/KV 占满 HBM** → 需要 Context/Sequence Parallel（CP/SP）\n\n决策流程：\n- DDP 状态 > HBM admission → 切 FSDP/ZeRO\n- FSDP 后单层仍 OOM → 加 TP\n- 模型太深需要跨 stage → PP + TP + DP/FSDP\n- 序列长度超长 → CP/SP + hybrid\n\n每增加一个并行维度，就增加更多 process group、rank placement 规则、checkpoint metadata 和排障复杂度。**应以最小满足约束的组合为原则。**",
+        "reveal": {
+          "q": "为什么 64-way FSDP FULL_SHARD 的 admission 不能只做 HBM/64 心算？",
+          "a": "FSDP 在 forward/backward 时 AllGather 完整参数（live_allgather_params）临时驻留在 HBM，加上 prefetch、reduce-scatter buffer、activation 和 fragmentation，峰值远高于 shard 大小除以 world_size。必须用 profiler 或 memory snapshot 验证 P95 HBM，而不是静态心算。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "ZeRO-1 在 N=8 的 DP 场景下，7B BF16+Adam FP32 训练状态的端到端显存 reduction 约为多少？",
+        "options": ["约 8×（optimizer state 切了 8 份）", "约 2.9×", "约 4×", "约 6×"],
+        "answer": 1,
+        "explain": "每参数 16 bytes：ZeRO-1 只切 optimizer state（12 bytes），单卡剩 2+2+12/8=5.5 bytes，端到端 reduction = 16/5.5 ≈ 2.9×。常见错误是把「optimizer state 内部节省 8 倍」误读成整体节省 8 倍。"
+      },
+      {
+        "type": "judge",
+        "prompt": "DDP gradient accumulation 的每个 microstep 都应该触发一次 AllReduce，以保证梯度同步。",
+        "answer": false,
+        "explain": "中间 microstep 应使用 `no_sync()` 跳过 AllReduce，只在最后一个 microstep 触发同步。否则通信量扩大 grad_accum_steps 倍，严重影响吞吐且没有训练语义收益。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 FSDP FULL_SHARD 阶段与其发生的通信操作匹配",
+        "left": ["forward 开始前", "backward 结束后", "optimizer step", "backward 开始前（prefetch）"],
+        "right": [
+          "AllGather：拼出当前层完整参数",
+          "ReduceScatter：每 rank 保留自己的 grad shard",
+          "本地更新：只更新自己持有的 param/Adam shard",
+          "AllGather：预取下一层参数"
+        ],
+        "explain": "FSDP FULL_SHARD 的生命周期：forward 前 AllGather 完整参数，backward 后 ReduceScatter 梯度，optimizer 本地更新 shard，prefetch 在 backward 期间提前 AllGather 下一层参数。"
+      },
+      {
+        "type": "choice",
+        "prompt": "训练中真正影响吞吐的通信量是哪个指标？",
+        "options": [
+          "NCCL 总通信时间",
+          "AllReduce 消息大小",
+          "暴露通信 = max(comm - overlap, 0)",
+          "AllGather 调用次数"
+        ],
+        "answer": 2,
+        "explain": "被 backward compute 覆盖的通信不需要优化。真正伤害 step time 的是没有被计算覆盖的「暴露通信」= max(comm_time - overlap, 0)。总 NCCL 时间高但暴露少，对吞吐影响有限。"
+      },
+      {
+        "type": "input",
+        "prompt": "DDP 中 `no_sync()` 的作用是什么？（填核心功能，不超过 15 字）",
+        "accept": ["跳过中间 microstep 的 AllReduce 通信", "gradient accumulation 时跳过 AllReduce", "推迟 AllReduce 到最后一个 microstep", "中间步骤跳过梯度同步"],
+        "explain": "`no_sync()` 让 DDP 在 gradient accumulation 的中间 microstep 跳过 AllReduce，只在最后一个 microstep 触发同步。这样通信次数从 grad_accum_steps 次降到 1 次。"
+      },
+      {
+        "type": "judge",
+        "prompt": "如果 rank step skew P95 高，而 sample_token_skew P95 正常，应优先检查 dataset shard 的 token 分布不均。",
+        "answer": false,
+        "explain": "两者同时上升才优先查 data skew。若 rank step skew 高但 token skew 正常，说明样本长度分布均匀，应优先查硬件/网络问题：GPU 降频、ECC/XID、CPU steal、NUMA 错误、NIC 拥塞等。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪种场景最适合引入 Tensor Parallel（TP）而不是继续扩展 FSDP 的 world size？",
+        "options": [
+          "7B 模型 optimizer state 太大放不进单卡",
+          "FSDP 后单层 GEMM 的 activation 仍超 HBM",
+          "跨节点 NCCL 暴露通信超过 step time 的 20%",
+          "dataset shard token 分布不均"
+        ],
+        "answer": 1,
+        "explain": "TP 解决的是「单层矩阵/activation 放不下」的问题，通过在层内切分 tensor dimension 减少单卡峰值。FSDP 解决训练状态冗余，但不切单层 activation。NCCL 暴露通信高应先调 bucket/overlap/topology，dataset skew 应修 shard 策略。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧症状与最可能的根因匹配",
+        "left": ["rank_step_skew 和 sample_token_skew 同时高", "NCCL timeout，日志 NET/Socket", "backward 后 180ms NCCL tail", "OOM 只在多节点出现"],
+        "right": [
+          "dataset shard 按样本数均分，未按 token 数平衡",
+          "RDMA 未注入容器，NCCL fallback 到 socket",
+          "bucket 太大，最后一个 bucket 延迟高；或有 rank straggler 破坏 overlap",
+          "live AllGather 参数增多或 prefetch 导致 HBM 峰值超限"
+        ],
+        "explain": "四种典型 DP 故障的根因各不相同：data skew 表现为 token/rank skew 同时升，socket fallback 表现为 NCCL 日志和 busbw 低，bucket 问题表现为 backward 后 tail，多节点 OOM 常来自 AllGather 瞬时峰值。"
+      },
+      {
+        "type": "choice",
+        "prompt": "64 GPU FSDP 训练从 8 GPU baseline 做弱扩展，理想情况下 non-pad tokens/s 应提高约多少倍？",
+        "options": ["无限接近 8 倍，因为 FSDP 理论效率 100%", "接近 8 倍，但实际因通信暴露和 straggler 会略低", "固定 2 倍，因为状态切分带来额外开销", "与 GPU 数量无关"],
+        "answer": 1,
+        "explain": "弱扩展（每卡 batch 不变）理想下 non-pad tokens/s 应线性增长约 8 倍（64/8）。实际因跨节点通信暴露、straggler、prefetch 开销等，弱扩展效率通常在 85%~100% 之间。"
+      }
+    ]
+  }
+]

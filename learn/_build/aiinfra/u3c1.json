@@ -1,0 +1,131 @@
+[
+  {
+    "id": "u3c1",
+    "title": "GPU 与加速器导览",
+    "subtitle": "从第一性原理拆解 GPU 平台问题",
+    "intro": [
+      {
+        "title": "为什么 GPU 问题不能只看 utilization",
+        "body": "工程师说\"GPU 不够快\"时，指的可能是完全不同的五类问题：\n\n- **执行**：SM 没被 Tensor Core 喂满，kernel 碎、shape 差\n- **容量**：权重、激活、KV Cache、optimizer state 放不下\n- **带宽**：HBM、PCIe、NVLink 成为搬运瓶颈\n- **互联**：多卡拓扑不匹配通信图，跨节点延迟爆炸\n- **治理**：MIG、异构加速器、调度无法表达资源形状\n\n这五类问题共享\"GPU\"这个名字，但排查工具和修复手段完全不同。先归类，再进入子章。",
+        "tip": "看到性能问题，先问：是执行、容量、带宽、互联还是治理？不要直接跳到换硬件。"
+      },
+      {
+        "title": "五个不可化简的基本量",
+        "body": "AI 加速器要在有限功耗和有限硅面积下，让海量矩阵状态在正确时间出现在正确计算单元旁边。拆开后只有五个基本量：\n\n| 基本量 | 具体内容 |\n|--------|----------|\n| **计算槽** | SM、Tensor Core 每秒能发出多少有效乘加 |\n| **状态字节** | 权重、梯度、优化器、激活、KV Cache 真实占用 HBM |\n| **搬运路径** | HBM、L2、PCIe、NVLink、NIC、存储把字节送到计算旁边 |\n| **并行距离** | 单 GPU / 节点内 / 跨节点的延迟、带宽、同步成本 |\n| **治理边界** | GPU selection、MIG、MPS、调度标签、故障域 |",
+        "tip": "每次选型或排障，先定位问题在哪个基本量上，再找对应工具。"
+      },
+      {
+        "title": "四个子章的问题边界",
+        "body": "本章是导览，详细内容按症状分流到四个子章：\n\n| 子章 | 核心问题 | 进入时机 |\n|------|----------|----------|\n| **04a** 执行模型与 Tensor Core | SM、SIMT、warp、occupancy、低精度口径 | `nsys` 看到 launch 空洞，Tensor Core 利用低 |\n| **04b** HBM 与 Roofline | CapacityLedger、KV Cache、arithmetic intensity | OOM，或 decode 慢不是算力问题 |\n| **04c** 互联与系统形态 | PCIe、NVLink、NVSwitch、NCCL、拓扑调度 | 多卡训练慢，跨节点扩展差 |\n| **04d** 选型虚拟化异构 | GPU selection、MIG、MPS、非 NVIDIA 生态 | 采购、资源池规划、多租户切分 |",
+        "tip": "一次排障可能跨多个边界，先在本章归类，再进入子章深挖。"
+      },
+      {
+        "title": "EvidenceBundle：先收证据，再下结论",
+        "body": "第 4 章所有子章都使用同一个证据包。没有以下证据，不能把问题归因给某个硬件部件：\n\n| 证据类别 | 最小采集项 | 归属子章 |\n|----------|------------|----------|\n| 端到端时间线 | `nsys profile`、`torch.profiler`、step time、TTFT/TPOT | 04a / 第6章 |\n| 单 kernel 细节 | `ncu` occupancy、warp stall、tensor pipe、register spill | 04a |\n| 容量账本 | CapacityLedger：权重、激活、optimizer、KV Cache、workspace | 04b |\n| Roofline 信号 | ops、bytes moved、有效 HBM 带宽、Tensor Core 利用 | 04b |\n| 拓扑证据 | `nvidia-smi topo -m`、`nccl-tests`、NCCL topology dump | 04c |\n| 健康旁证 | DCGM、ECC/Xid、温度、功耗、NVLink counters | 04c / 04d |\n| 选型基准 | BenchmarkProtocol：GEMM、HBM bandwidth、真实负载回放 | 04d |"
+      },
+      {
+        "title": "CapacityLedger：把字节写清楚再说",
+        "body": "容量判断必须先写出 CapacityLedger，不能凭经验说\"70B 应该能放下\"：\n\n**训练峰值显存 =**\n`权重 + 梯度 + optimizer_state + master_weights + activations + workspace + comm_buffers + framework_reserved + fragmentation_headroom`\n\n**推理峰值显存 =**\n`resident_weights + KV_cache + paged_kv_metadata + runtime_workspace + cuda_graph_pool + fragmentation_headroom`\n\n三种 threshold 要分清：\n- **硬上限**：显存、HBM 带宽、PCIe lane 是否物理不足\n- **稳态**：长期运行 p95/p99 watermark 是否达标\n- **安全余量**：训练留 10%-20% headroom；在线推理还要给长请求和 paged KV 碎片留空间",
+        "tip": "训练通常保留 10%-20% 显存余量；`reserved >> allocated` 时先查 fragmentation，不要直接采购更大 GPU。"
+      },
+      {
+        "title": "BenchmarkProtocol：datasheet 数字折算成平台可承诺数字",
+        "body": "一次 GPU 选型或性能修复，至少覆盖以下 benchmark：\n\n| 测试 | 必须固定的变量 | 通过条件示例 |\n|------|----------------|---------------|\n| GEMM / attention microbench | dtype、shape、layout、batch、driver、库版本 | 与同 SKU 内部基线偏差 < 10%-15% |\n| HBM bandwidth | 访问模式、读写比例、clock/power cap | 有效带宽接近同型号健康节点 |\n| NCCL collective | GPU 数、rank 绑定、NIC rail、消息大小 | all-reduce 达到集群基线 |\n| 训练 smoke test | 100-1000 step、loss、显存峰值、checkpoint | step time 稳定，无 Xid/NCCL timeout |\n| 推理回放 | prompt/output 长度分布、并发、cache 策略 | TTFT/TPOT/P99/goodput 达到 SLO |",
+        "tip": "Retest 规则：driver、引擎版本、MIG profile、power cap、拓扑、模型结构或 dtype 变化后，旧结论自动失效，必须重跑。"
+      },
+      {
+        "title": "四个总问题：判断瓶颈归属",
+        "body": "无论哪个子章，最终都围绕这四个问题：\n\n1. **算得动吗？** 算子形状是否能把 SM、Tensor Core、低精度路径用起来。证据来自 `nsys`、`ncu`、`torch.profiler`。\n\n2. **放得下吗？** 权重、激活、梯度、optimizer state、KV Cache 和 buffer 是否装进显存。证据来自 CapacityLedger、OOM 前的 allocator snapshot。\n\n3. **喂得满吗？** HBM、PCIe、NVLink、NIC 能否持续供给 GPU。证据来自 Roofline、HBM bandwidth、DCGM counters。\n\n4. **连得快吗？** 多 GPU / 多节点互联是否匹配通信图。证据来自 `nvidia-smi topo -m`、NCCL topology dump、`nccl-tests`。",
+        "reveal": {
+          "q": "H100 服务 7B 模型 decode 阶段 SM 利用率只有 5%，这说明 GPU 没调好吗？",
+          "a": "不一定。decode 阶段每步计算量小，极低 SM 利用率是正常现象——decode 常是 memory-bound，限制来自 HBM 带宽而不是算力。应先看 Roofline（每 token 需要读多少权重和 KV），而不是盯着 SM 利用率。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪项最准确地描述了 AI 加速器要解决的\"不可化简问题\"？",
+        "options": [
+          "让 GPU 频率尽可能高",
+          "在有限功耗和硅面积下，让大量矩阵状态在正确时间出现在正确计算单元旁边，并在吞吐、延迟、成本、隔离间做可验证的取舍",
+          "让 CUDA kernel 数量最少",
+          "保证所有 GPU 都能跑 FP4 推理"
+        ],
+        "answer": 1,
+        "explain": "AI 加速器的核心约束是有限功耗与硅面积下的状态调度与取舍，不是单一指标最大化。"
+      },
+      {
+        "type": "match",
+        "prompt": "把症状与应首先进入的子章对应起来：",
+        "left": [
+          "`nsys` 显示大量 launch 空洞，Tensor Core 利用低",
+          "HBM 水位接近上限或 OOM",
+          "NCCL collective 尾延迟大、跨节点扩展差",
+          "资源池切分、MIG/MPS 问题"
+        ],
+        "right": [
+          "04b HBM 与 Roofline",
+          "04a 执行模型与 Tensor Core",
+          "04d 选型虚拟化异构",
+          "04c 互联与系统形态"
+        ],
+        "explain": "04a → 执行/kernel；04b → 容量/带宽；04c → 互联/拓扑；04d → 选型/治理。"
+      },
+      {
+        "type": "judge",
+        "prompt": "CapacityLedger 中，推理场景只需要计算权重占用的显存，KV Cache 不需要单独预算。",
+        "answer": false,
+        "explain": "KV Cache 是推理显存中随并发和上下文长度动态增长的部分，必须单独预算；高并发长上下文时 KV Cache 常成为主角。"
+      },
+      {
+        "type": "choice",
+        "prompt": "BenchmarkProtocol 中哪种情况必须重新跑基线？",
+        "options": [
+          "只改了模型的学习率",
+          "driver 或 CUDA 版本升级",
+          "增加了 CPU 内存",
+          "修改了日志打印频率"
+        ],
+        "answer": 1,
+        "explain": "driver/CUDA 版本变化会改变 kernel 选择和通信库行为，旧基线结论自动失效，必须重新跑 BenchmarkProtocol。"
+      },
+      {
+        "type": "input",
+        "prompt": "EvidenceBundle 中，用来证明 GPU-GPU 拓扑和 NVLink 链路健康的命令是什么？（回答命令名，不含参数）",
+        "accept": ["nvidia-smi topo", "nvidia-smi", "nccl-tests"],
+        "explain": "`nvidia-smi topo -m` 展示 GPU-GPU/GPU-NIC 距离，`nvidia-smi nvlink -s` 查 NVLink 状态，`nccl-tests` 验证 collective 带宽。"
+      },
+      {
+        "type": "choice",
+        "prompt": "训练时 CapacityLedger 中\"安全余量\"的推荐做法是？",
+        "options": [
+          "不需要留，装满最好",
+          "保留 1%-2% 即可",
+          "通常保留 10%-20% headroom",
+          "必须保留 50% 以上"
+        ],
+        "answer": 2,
+        "explain": "训练通常保留 10%-20% 显存 headroom，以应对不同 batch shape 的 workspace 峰值、allocator 碎片和 eval 混跑。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`reserved >> allocated` 且出现 OOM 时，应该优先采购更大显存的 GPU。",
+        "answer": false,
+        "explain": "`reserved >> allocated` 通常表明 allocator fragmentation，大块申请失败。应先固定 shape、调整 allocator 配置，而不是直接采购硬件。"
+      },
+      {
+        "type": "choice",
+        "prompt": "decode 阶段 SM 利用率极低（如 5%）时，最应该首先检查的是？",
+        "options": [
+          "换更多 Tensor Core 的 GPU",
+          "增大 batch size 到 512",
+          "用 Roofline 判断是否 memory-bound，每 token 需要读多少权重和 KV Cache",
+          "降低模型精度到 INT4"
+        ],
+        "answer": 2,
+        "explain": "decode 阶段每步计算量小，极低 SM 利用率可能完全正常，问题在 HBM 带宽。Roofline 能帮你判断瓶颈是算力还是带宽，再决定优化方向。"
+      }
+    ]
+  }
+]

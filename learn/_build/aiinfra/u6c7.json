@@ -1,0 +1,142 @@
+[
+  {
+    "id": "u6c7",
+    "title": "TensorRT-LLM 内部机制深入",
+    "subtitle": "先编译后执行：Engine Artifact、Plugin 架构、Inflight Batching 与量化路径",
+    "intro": [
+      {
+        "title": "TRT-LLM 的核心立场：先编译，后执行",
+        "body": "`TensorRT-LLM` 是 NVIDIA 官方的「先编译后执行」推理栈。它不是一个通用 Python serving 框架，而是把模型在 build 期就专门化成一个绑定 GPU 型号、精度、并行度、batch/sequence 范围的 `engine artifact`，然后由 C++ runtime executor 在 inflight batching 模式下运行。\n\n**与 vLLM 的根本差异**：\n\n| 维度 | vLLM | TRT-LLM |\n|---|---|---|\n| 模型如何变成可执行物 | 直接加载 HF 权重，运行时 PyTorch + CUDA graph | build 期生成 `.engine`，绑定 GPU/CUDA/TRT 版本 |\n| 调度位置 | Python Scheduler（V1 子进程）| C++ BatchManager/Executor |\n| 参数变更成本 | 改配置重启，秒级 | 改 BuildConfig 必须 rebuild，十分钟到小时级 |\n| 调试难度 | Python 易调试 | C++ plugin 源码调试，门槛高 |\n| 适合场景 | 通用、迭代快 | 固定 NVIDIA 集群 + 极致单位成本 |\n\n一句话总结：**TRT-LLM 是 GPU 的 AOT（Ahead-of-Time）编译器 + 运行时 dispatcher，engine 是带强 shape contract 的二进制制品，不是通用 Python runtime。**",
+        "tip": "很多团队做完 vLLM 替换实验发现「性能没有传说中的 2x，但运维复杂度高很多」——原因往往是没有走完 build 期所有专门化（量化、shape bucket、custom all-reduce），engine 没有真正发挥优势。"
+      },
+      {
+        "title": "Engine 构建全流程：BuildConfig 与 plugin_config",
+        "body": "TRT-LLM 的 build 流程分三步：**HF checkpoint → ModelOpt 量化 → trtllm-build → .engine**。\n\n`BuildConfig` 的关键字段在 build 期固化，运行时无法修改：\n\n| 字段 | 物理含义 | 注意 |\n|---|---|---|\n| `max_batch_size` | 运行时最大并发请求数 | 设太大让 autotune 时间翻倍，KV 预算保守 |\n| `max_input_len` | 单请求最大 prompt 长度 | 超限请求被拒；过大则 KV 预算保守 |\n| `max_num_tokens` | 单 iteration 内总 token 预算 | 类似 vLLM `max_num_batched_tokens` |\n| `paged_kv_cache` | 是否开启 paged KV cache | **忘记开这个是最常见踩坑点**，不开则退化为静态 batch |\n| `use_paged_context_fmha` | chunked context 模式 | 长 prompt 服务必开 |\n| `tp_size` / `pp_size` | TP/PP 并行度 | 改了必须 rebuild |\n\n`plugin_config` 控制注入 TensorRT 图的自定义 CUDA op：\n- `gpt_attention_plugin = \"auto\"` — 最重要的 plugin，必须开\n- `gemm_plugin = \"auto\"` — FP8/INT4 GEMM 必须开对应 plugin\n- `paged_kv_cache = True` — 支持 inflight batching 的前提\n- `use_fp8_context_fmha = True` — H100 FP8 attention 专用路径\n\n**build 参数不要为未来留 buffer**：`max_batch_size = 1024` 会让 builder autotune 时间从几十分钟变几小时，且 KV 预算保守估计，反而损失运行时容量。应按业务真实分布定上限。"
+      },
+      {
+        "title": "Plugin 架构：为什么 TRT-LLM 大量使用自定义 CUDA kernel",
+        "body": "TensorRT 是通用神经网络编译器，原生 op 集合**不包含** LLM 特有的算子：paged KV 寻址、variable-length attention、FP8 GEMM with per-token scale。TRT-LLM 通过 plugin 机制把这些自定义 CUDA kernel 注册到 TensorRT 图里。\n\n| Plugin | 职责 | 与 vLLM 对应 |\n|---|---|---|\n| `gpt_attention` | prefill/decode/chunked context，含 paged KV 寻址 | AttentionBackend (FlashAttn/FlashInfer) |\n| `gemm` | FP16/BF16/FP8/FP4 GEMM，按 dtype autotune | torch.compile 后的 GEMM |\n| `kv_cache` | KV block 分配、寻址、release（C++ 侧）| BlockManager + AttentionBackend |\n| `custom_all_reduce` | NVLink 拓扑下小消息专用 all-reduce | 类似 vLLM custom_all_reduce |\n| `lora` | LoRA adapter 应用 | punica 集成 |\n| `moe` | MoE expert dispatch 与 GEMM | vLLM MoE layer |\n\n**GPT attention plugin 是最重要的**：它在内部完成 prefill 的 variable-length flash attention（H100 走 FA3）、decode 的 paged attention 读取非连续 KV block、chunked context、KV append、RoPE/ALiBi 位置编码——全部在一个 plugin 内，省去多次 kernel launch，共享 HBM 访问。\n\n**plugin 的工程边界**：builder 无法跨 plugin 边界做融合，也无法 autotune plugin 内部。custom_all_reduce plugin 只在 NVLink 全连接拓扑（单机 8×H100/A100 SXM）下生效，PCIe 或跨机会自动回退到 NCCL。",
+        "tip": "忘记开 `paged_kv_cache` 的 engine 在运行时退化为静态 batch，所有动态调度优势消失，吞吐可能比 vLLM 还低。这是 TRT-LLM 上线最常见的踩坑点。"
+      },
+      {
+        "title": "Inflight Batching：与 vLLM Continuous Batching 的实现差异",
+        "body": "Inflight batching 与 vLLM 的 continuous batching 思想同源（iteration-level scheduling、动态请求出入、prefill/decode 混排），但实现路径不同：\n\n| 维度 | vLLM | TRT-LLM |\n|---|---|---|\n| 调度位置 | Python Scheduler（V1 子进程）| C++ BatchManager/Executor |\n| Token budget | `max_num_batched_tokens` | `max_num_tokens` |\n| 抢占语义 | swap 或 recompute | 默认无 swap，靠 KV 预留 + 拒绝新请求 |\n| Python overhead | V1 后约 1–2 ms | < 1 ms（纯 C++）|\n| 调度策略可定制性 | Python 可改 | 需修改 C++ 源码并 rebuild |\n\n**抢占模型的差异**：vLLM 在 KV 不足时 swap 或 recompute；TRT-LLM 默认不 swap，靠 BuildConfig 的 max_batch + KvCacheConfig 把 OOM 风险压在 admission 阶段。这使 TRT-LLM 更「保守可预测」，但需要前期把容量算准。\n\n**调度可观测性**：TRT-LLM 调度循环全在 C++，调试门槛高；vLLM V1 仍有 Python 边界但 Prometheus metrics 更易观测。\n\nInflight batching 的关键 Triton 配置：`batching_strategy = inflight_fused_batching`（推荐）。用 `static` 会让所有动态调度优势消失。"
+      },
+      {
+        "title": "KvCacheConfig：paged KV、block reuse 与 host offload",
+        "body": "`KvCacheConfig` 是 TRT-LLM 运行时唯一可独立调整的「内存预算与复用策略」配置，重要程度等同于 vLLM 的 `gpu_memory_utilization + kv_cache_dtype + enable_prefix_caching` 之和。\n\n| 字段 | 物理含义 | 调整建议 |\n|---|---|---|\n| `enable_block_reuse` | prefix block 复用（类似 vLLM prefix caching）| 永远开启，除非 prompt 几乎无重复 |\n| `free_gpu_memory_fraction` | 剩余显存给 KV 池的比例（默认 0.9）| 0.85–0.92 较稳，0.95 会导致 NCCL workspace OOM |\n| `host_cache_size` | CPU 上的二级 KV cache 字节数 | 长会话 + 多轮对话回归开 8–32 GiB 收益明显 |\n| `kv_cache_dtype` | KV 存储精度（fp8/fp16/bf16）| H100 上 FP8 KV 几乎免费 2x 容量 |\n\n**三层 KV cache 层次**：GPU KV pool → CPU host cache → 重新 prefill。host cache 让「刚被踢出 GPU 的会话 KV」仍可从 CPU 回填，而不必重算。\n\n**与 vLLM prefix cache 的区别**：TRT-LLM 的 `tokens_per_block` 默认更大（32/64/128，而非 vLLM 的 16），且 `tokens_per_block` 是 build 期参数（改它要 rebuild），内置 host cache offload 是 vLLM 目前没有的。\n\n**工程数字**：在长会话服务上开 `host_cache_size = 16 GiB`，prefix hit rate 从 68% 提到 84%，多轮 TTFT P99 从 380 ms 降到 220 ms。",
+        "reveal": {
+          "q": "为什么 `free_gpu_memory_fraction = 0.95` 可能导致 OOM，而不是让 KV pool 更大？",
+          "a": "free_gpu_memory_fraction 只控制「剩余显存中给 KV 的比例」，但 NCCL workspace、CUDA graph pool、临时 activation 也需要占用 GPU 内存。设置 0.95 会让这些组件没有剩余空间，在 warmup 后或长 prompt burst 时触发 OOM。生产上 0.85–0.92 是更安全的区间。"
+        }
+      },
+      {
+        "title": "量化路径：ModelOpt + build 期专门化",
+        "body": "TRT-LLM 的量化不是「runtime 切换」，而是**build 期专门化**：先用 `ModelOpt` 在 HF 模型上做校准，输出含 scale 的 TRT-LLM checkpoint，再由 `trtllm-build` 编译进 engine。\n\n| 方案 | 权重/激活精度 | 推荐 GPU | 端到端加速（vs BF16）| 质量损失 |\n|---|---|---|---|---|\n| BF16 | 16/16 bit | A100/H100 | 1.0x | 0% |\n| FP8 W8A8 | 8/8 bit | H100/B200 | 1.6–2.0x | < 1% |\n| AWQ INT4 (W4A16) | 4/16 bit | A100/H100 | 1.4–1.8x | 1–2% |\n| GPTQ INT4 (W4A16) | 4/16 bit | A100/H100 | 1.4–1.7x | 1–2% |\n| NVFP4 (Blackwell) | 4/4 bit | B200 | 2.5–3.5x | 1–3% |\n\n**关键边界**：\n- Ampere（A100）不支持 FP8 计算，FP8 GEMM 回退到 BF16；但 FP8 KV 仍可启用（节省容量）\n- H100 的 FP8 GEMM 走 TensorCore E4M3 + FlashAttention V3 + WGMMA，真正获得 2x 计算加速\n- AWQ 与 GPTQ 不能同时用（两者都映射到 weight-only INT4）\n- GPTQ 与 FP8 KV 可叠加（INT4 权重 + FP8 KV 是 H100 上常见高性价比组合）\n\n**校准集必须从生产 prompt 采样**：用 wikitext 这种通用数据做校准，domain mismatch 会让线上质量比离线 benchmark 差很多。校准集质量是 FP8 质量损失从 2% 降到 0.6% 的关键。\n\n量化变更必然 rebuild engine，**「量化方案 + 校准集版本 + ModelOpt 版本」必须作为 engine artifact 元数据管理**，否则线上质量回归后无法溯源。"
+      },
+      {
+        "title": "多 GPU 并行与 Triton 集成",
+        "body": "TRT-LLM 把 TP/PP 拓扑固化进 engine：N 张卡的部署对应 N 份 engine 文件（rank0 ~ rankN-1）。切换 TP 拓扑不只是改一个数字，而是产出一份全新的 engine artifact，发布链必须把 engine 版本、TP 拓扑、GPU 型号、Triton 配置一起 pin。\n\n**custom_all_reduce plugin**：NVLink 全连接拓扑（单机 8×H100/A100 SXM）下，对小消息比 NCCL 快 30–50%。PCIe 或跨机自动回退 NCCL，开启也无收益。\n\n**Triton 集成**：TRT-LLM 自身只提供 C++ executor 与 Python binding，不提供 OpenAI 兼容 HTTP server。生产部署通过 `tensorrtllm_backend` 挂到 Triton Inference Server，获得：\n\n| Triton 提供的能力 | 说明 |\n|---|---|\n| Dynamic batching | 多客户端请求合并送入 executor |\n| Health check / readiness | k8s 探针适配 |\n| Prometheus metrics | active_requests、kv_cache_block_count 等 |\n| Model repository 热加载 | 切换 engine 版本不需要重启 Triton |\n| Ensemble | tokenize → llm → detokenize 链路 |\n\n生产 Triton 的 `model_repository` 结构：`preprocessing`（tokenize）→ `tensorrt_llm`（真正跑 engine）→ `postprocessing`（detokenize），由 `ensemble` 串联。\n\n**跳过 Triton 自己写 HTTP server** 会缺少：动态 batching、多实例、健康检查、metrics、模型热加载。短期看似简化，长期会重新发明 Triton 的轮子。"
+      },
+      {
+        "title": "工程数字与选型决策",
+        "body": "**LLaMA-70B × 8×H100 实战对比**（FP8 + FP8 KV + chunked context vs vLLM INT4 + FP8 KV）：\n\n| 指标 | vLLM baseline (INT4) | TRT-LLM (FP8) | Δ |\n|---|---|---|---|\n| Throughput | 4,500 tps | 6,800 tps | +51% |\n| P99 TTFT | 750 ms | 420 ms | -44% |\n| P99 TPOT | 65 ms | 42 ms | -35% |\n| GPU SM util | 88% | 93% | +5pp |\n| 离线 MMLU 质量损失 | -1.2%（vs BF16）| -0.6%（vs BF16）| FP8 质量优于 INT4 |\n\n**什么场景 TRT-LLM 一定胜出**：固定 NVIDIA 集群（H100/B200）+ 模型稳定（几个月才动）+ 高 QPS + 团队能承担 engine artifact 治理。\n\n**什么场景不该用 TRT-LLM**：\n\n| 场景 | 替代方案 |\n|---|---|\n| 模型每周迭代 | vLLM |\n| 需要复杂结构化输出/grammar | SGLang |\n| 需要快速接多 LoRA/频繁切换 | vLLM 多 LoRA |\n| CPU/边缘/非 NVIDIA GPU | llama.cpp |\n| 团队没有 C++ 调试能力 | vLLM |\n\n**稳健的迁移路径**：vLLM 做基线 + 对长期稳定的高 QPS 模型单独 build TRT-LLM 副本，两条路线并存几个月，用真实数据收敛。「传说中的 2–3x」通常是把 vLLM 没开优化的对照组与 TRT-LLM 全量优化的实验组比较，公平对比下 1.5x 是现实区间。",
+        "reveal": {
+          "q": "TRT-LLM 在 H100 上 FP8 相对 BF16 能接近 2x 加速，在 A100 上为什么拿不到同样的收益？",
+          "a": "H100（Hopper）原生支持 FP8 TensorCore（E4M3），FP8 GEMM 算力约是 BF16 的 2x，且 FP8 权重带宽减半；还有 TMA、WGMMA、FlashAttention V3 的配合。A100（Ampere）没有 FP8 TensorCore，FP8 GEMM 会回退到 BF16 路径，只有 FP8 KV Cache 节省容量的收益，没有计算加速。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "TRT-LLM 与 vLLM 在「模型如何变成可执行物」这一步最根本的差异是什么？",
+        "options": [
+          "TRT-LLM 使用 Python 调度器，vLLM 使用 C++ 调度器",
+          "TRT-LLM 必须先 build 生成绑定 GPU 型号的 .engine 文件，vLLM 直接加载 HF 权重运行",
+          "TRT-LLM 只支持 FP8 精度，vLLM 支持所有精度",
+          "TRT-LLM 不支持 paged KV Cache，vLLM 通过 PagedAttention 支持"
+        ],
+        "answer": 1,
+        "explain": "TRT-LLM 必须先通过 trtllm-build 把模型编译成绑定 GPU 型号、CUDA 版本、TP/PP 拓扑、精度的 .engine 文件（AOT 编译），任何变更都需要 rebuild。vLLM 直接加载 HF 权重，运行时使用 PyTorch + CUDA graph，参数变更只需重启。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 TRT-LLM 中，`paged_kv_cache` 是运行时可以动态开关的参数，不影响 engine 的性能。",
+        "answer": false,
+        "explain": "`paged_kv_cache` 是 BuildConfig（build 期）参数，必须在 trtllm-build 时指定。如果忘记开，engine 退化为静态 batch，所有动态调度优势消失，吞吐可能比 vLLM 还低。这是 TRT-LLM 上线最常见的踩坑点之一。"
+      },
+      {
+        "type": "choice",
+        "prompt": "TRT-LLM 大量使用 plugin（如 gpt_attention_plugin）而不是纯 TensorRT 图的根本原因是什么？",
+        "options": [
+          "TensorRT 速度太慢，plugin 可以绕过 TensorRT 直接调用 CUDA kernel",
+          "TensorRT 原生 op 集合不包含 paged KV 寻址、variable-length attention 等 LLM 特有算子",
+          "plugin 可以让 builder 跨 plugin 边界做融合，性能更好",
+          "plugin 是 NVIDIA 收费功能，必须通过 plugin 才能使用 TensorCore"
+        ],
+        "answer": 1,
+        "explain": "TensorRT 是通用神经网络编译器，原生 op 不包含 paged KV 寻址、variable-length attention、FP8 GEMM with per-token scale 等 LLM 特有算子。TRT-LLM 通过 plugin 把这些自定义 CUDA kernel 注册到 TensorRT 图里。注意：builder 无法跨 plugin 边界做融合，这是 plugin 的代价而非收益。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 TRT-LLM 的 KvCacheConfig 字段与其物理含义匹配：",
+        "left": [
+          "enable_block_reuse",
+          "free_gpu_memory_fraction",
+          "host_cache_size",
+          "kv_cache_dtype"
+        ],
+        "right": [
+          "CPU 上的二级 KV cache，长会话场景减少重复 prefill",
+          "KV 存储精度，H100 上设 fp8 几乎免费获得 2x 容量",
+          "prefix block 复用开关，类似 vLLM prefix caching",
+          "加载 engine 后剩余显存中给 KV 池的比例"
+        ],
+        "explain": "enable_block_reuse → prefix block 复用；free_gpu_memory_fraction → 剩余显存给 KV 池的比例；host_cache_size → CPU 二级 KV cache；kv_cache_dtype → KV 存储精度（FP8 在 H100 上 2x 容量）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 H100 上，TRT-LLM 的 FP8 W8A8 量化相对 BF16 能获得约 2x 加速，主要来自哪两方面？",
+        "options": [
+          "FP8 精度降低了模型质量，减少了计算量；FP8 数值范围更小，减少了内存访问",
+          "H100 FP8 TensorCore 算力约是 BF16 的 2x；FP8 权重从 HBM 读出的字节数是 BF16 的一半",
+          "FP8 省去了 softmax 计算；FP8 KV Cache 减少了 attention 的 O(n²) 复杂度",
+          "FP8 让 batch size 翻倍；FP8 量化消除了 layer normalization 的开销"
+        ],
+        "answer": 1,
+        "explain": "H100 FP8 TensorCore 算力（不带稀疏）约 1979 TFLOPS，BF16 约 989 TFLOPS，算力接近 2x。同时 FP8 权重每次从 HBM 读出的字节数是 BF16 的一半，decode 阶段（带宽受限）几乎线性提速。这两点叠加使 FP8 在 H100 上接近 2x 端到端加速。"
+      },
+      {
+        "type": "judge",
+        "prompt": "TRT-LLM 的 `custom_all_reduce` plugin 在所有多 GPU 拓扑下都能比 NCCL 更快。",
+        "answer": false,
+        "explain": "custom_all_reduce plugin 只在 NVLink 全连接拓扑（单机 8×H100/A100 SXM）下对小消息有效（快 30–50%）。PCIe 拓扑或跨机 InfiniBand 情况下会自动回退到 NCCL，开启也无收益，可能还有回退开销。"
+      },
+      {
+        "type": "input",
+        "prompt": "TRT-LLM 生产部署通常通过哪个推理服务框架提供 HTTP/gRPC 接口和 Prometheus metrics？（填英文名）",
+        "accept": ["Triton", "triton", "NVIDIA Triton", "Triton Inference Server"],
+        "explain": "TRT-LLM 自身只提供 C++ executor 与 Python binding，不提供 OpenAI 兼容的 HTTP server。生产部署通过 `tensorrtllm_backend` 挂到 Triton Inference Server，由 Triton 提供 HTTP/gRPC、健康检查、Prometheus metrics、模型热加载等服务化能力。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在高并发 chatbot 场景（200 QPS）中，TRT-LLM 开启 Lookahead speculative decoding 后吞吐下降 9%，TPOT 略有改善。最可能的原因是什么？",
+        "options": [
+          "Lookahead 实现有 bug，生成了错误的 draft token",
+          "Lookahead 需要额外训练 draft head，没有训练的模型无法受益",
+          "高并发下 verify batch 总 token 数被 draft 的 k 倍占满，token budget 撑爆导致整体 goodput 下降",
+          "Lookahead 只适合代码生成，不适合对话场景的词汇分布"
+        ],
+        "answer": 2,
+        "explain": "speculative decoding 是「用算力换 latency」的工具：高并发时 verify 使 batch 总 token 数翻倍，token budget 被撑爆，其他请求等待时间上升，整体 goodput 下降。speculative decoding 只在有富余算力的低并发长输出场景下有正收益，高并发 chatbot 几乎一定是负优化。"
+      },
+      {
+        "type": "judge",
+        "prompt": "将 TRT-LLM 从 A100（TP=8）迁移到 H100（TP=8）时，可以直接复用原来的 .engine 文件，只需更新 GPU 驱动即可。",
+        "answer": false,
+        "explain": "TRT-LLM 的 engine artifact 强绑定 GPU 型号（GPU arch）、CUDA 版本、TensorRT 版本、TP/PP 拓扑、精度。A100 的 engine 不能在 H100 上运行，需要重新做 convert_checkpoint → trtllm-build，产出 H100 专用的新 engine artifact。"
+      }
+    ]
+  }
+]

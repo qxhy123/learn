@@ -1,0 +1,117 @@
+[
+  {
+    "id": "u5c18",
+    "title": "Embedding 工程与缓存层",
+    "subtitle": "从 MTEB 选型到 Matryoshka 截断、ColBERT、四级缓存 key 设计与失效策略",
+    "intro": [
+      {
+        "title": "动机：Embedding 是多系统的共享坐标系",
+        "body": "所有需要\"找相似\"的任务——RAG、推荐召回、语义搜索、意图分类、风控判别——都共享同一个底层假设：**两个语义相近的对象在向量空间里也彼此靠近**。这个假设能否成立，完全取决于你选了哪个 embedding 模型、用在哪个领域、是否和索引保持同一版本。\n\n**三层不可化简的难点**：\n1. **版本控制**：换模型意味着所有旧向量失效，必须全量重建索引，没有例外。\n2. **维度与成本权衡**：高维（3072）表达力强但存储/延迟/量化损失都更大；低维（256）速度快成本低但细粒度语义可能丢失。\n3. **缓存越激进风险越高**：四类缓存（Embedding Cache / Semantic Cache / Output Cache / KV Prefix Cache）各有不同的失效策略和权限风险，混为一谈是数据泄露的根源。"
+      },
+      {
+        "title": "Embedding 模型选型：MTEB 是起点，领域评测是终点",
+        "body": "| 类别 | 代表模型 | 适用场景 | 局限 |\n|------|---------|---------|------|\n| 通用语义 | OpenAI text-embedding-3-large（3072维）、Voyage-3-large | 文档检索、通用 RAG | 专业领域可能被领域模型超越 |\n| 中文特化 | BGE-large-zh、GTE-Qwen2-7B | 中文 RAG、中文电商 | 英文能力弱 |\n| 多语言 | BGE-M3（1024维）、Jina v3（1024维，89语言）| 多语种混合文档 | 英文精度略低于英文特化模型 |\n| 高效小模型 | nomic-embed-text-v1.5（768维，支持 Matryoshka）| 低延迟、边缘推理 | 精度低于大模型 |\n| 多模态 | CLIP、Jina CLIP v2 | 图文混合检索 | 模型更大，serving 成本高 |\n\n**选型流程**：先看 MTEB Leaderboard → 在自有领域数据（1000-5000 条 query-document 对）评测 `recall@1/5/10` → 考虑 API 依赖/数据隐私/运维成本 → 最终选型。\n\n**商业模型 vs 开源模型**：商业模型（OpenAI/Cohere/Voyage）有 API 依赖和数据出境风险；开源模型（BGE/E5/GTE/Nomic）自托管更可控但需运维。"
+      },
+      {
+        "title": "Matryoshka Embedding：一个模型服务两种精度",
+        "body": "**MRL（Matryoshka Representation Learning）** 训练时同时优化多个维度截断的向量质量，截断后的前 D 维子向量仍是高质量语义表示。\n\nOpenAI text-embedding-3-large（3072 维 → 可截断到 256）的精度损失：\n- 1536 维：MTEB 均分损失约 0.8%\n- 512 维：损失约 2%\n- 256 维：损失约 4%，存储压缩 12x\n\n**工程价值**：两阶段检索（低维粗筛 + 高维精排）用一个模型实现，无需维护两套索引。例如：256 维 ANN 快速粗筛 top-200，再用 1536 维精排取 top-10，既节省内存又保持召回精度。\n\n**支持 Matryoshka 的主流模型**：OpenAI text-embedding-3 系列、nomic-embed-text-v1.5、Jina Embeddings v3。"
+      },
+      {
+        "title": "量化：从 fp32 到 binary 的精度-成本折中",
+        "body": "| 量化级别 | 存储压缩比（vs fp32）| Recall 损失（参考）| 适用条件 |\n|---------|---------------------|---------------------|----------|\n| fp16/bf16 | 2x | <0.5% | 生产默认，几乎无损 |\n| int8（SQ）| 4x | 1-3% | 大规模索引，recall@K >90% 可接受 |\n| binary | 32x | 5-15%，**必须配 rerank**| 超大规模粗筛，两阶段检索 |\n\n**工程边界**：量化后必须在自有 query 集上测 recall@K，不能只依赖论文数据。binary 量化通常结合粗筛 + 精排：先用 binary 向量快速过滤 top-N，再用原始 fp32 向量对候选重新打分。量化版本要写入索引元数据。\n\n**SQ-HNSW int8** 是最常用的生产方案：4x 内存压缩，recall 损失 <1%（配合 rescoring），SIMD 计算加速使 QPS 反而比 float32 更高。"
+      },
+      {
+        "title": "ColBERT Late Interaction：多向量表示",
+        "body": "传统 bi-encoder 把整段文本压缩成一个向量，会丢失 token 级别的匹配信号。\n\n**ColBERT** 保留每个 token 的向量，打分时用 **MaxSim**：对 query 的每个 token，找 document 所有 token 中最相似的那个，累加所有 query token 的 MaxSim 得分。\n\n| 对比维度 | Bi-Encoder（单向量）| ColBERT（多向量）|\n|---------|---------------------|------------------|\n| 文档存储 | 1 向量/文档 | N_tokens 向量/文档 |\n| 检索计算量 | 极低（点积）| 中等（MaxSim 矩阵乘法）|\n| 召回精度 | 中高 | 高（细粒度匹配）|\n| 适用规模 | 亿级以上 | 千万级以内（或需 PLAID 压缩索引）|\n\n**适用场景**：精度要求极高的法律文档检索、学术论文检索；规模超过 1 亿向量时需要 PLAID 专用压缩索引控制存储。"
+      },
+      {
+        "title": "四类缓存的精确 key 设计与失效策略",
+        "body": "| 缓存类型 | 命中条件 | 失效触发 | 越权风险 |\n|---------|---------|---------|----------|\n| **Embedding Cache** | 完全相同输入 + model_id + tokenizer_version + preprocess_version | 模型版本升级、预处理规则变更 | 低（向量本身不含业务数据）|\n| **Semantic Cache** | 语义相近（余弦相似度 > 阈值）+ 权限/模型/策略一致 | 文档更新、模型变更、策略变化、时效性内容 | 中（相似问题但答案依权限而异）|\n| **Output Cache** | 完全相同的 prompt + model_id + chat_template_version + generation_params + tool_schema_version + policy_version | 任何 key 维度变化 | 高（必须按 user/tenant 隔离）|\n| **KV Prefix Cache** | 前缀 token 完全相同 + model_id + tokenizer + LoRA adapter + policy_version | 前缀内容变化、模型/tokenizer/策略升级 | 极高（必须按租户/权限隔离，不跨租户共享）|\n\n**Semantic Cache 阈值设定**：阈值 <0.85 会把语义不同的问题混为一谈；阈值 >0.95 则命中率接近精确匹配，失去语义扩展价值。典型生产值 0.90-0.93，需通过 A/B 测试确定。\n\n**时效性 query 的例外**：带\"今天\"/\"最新\"/\"实时\"等词的 query，即使相似度极高也不命中 Semantic Cache。",
+        "tip": "升级 embedding 模型后，不能只重建索引，**还必须 flush 所有 Embedding Cache 和 Semantic Cache**，否则旧版本向量被复用，后续检索结果悄悄退化，且没有显式报错。"
+      },
+      {
+        "title": "Drift Detection 与 Reindex 决策",
+        "body": "**必须全量 Reindex 的条件**：换 embedding 模型、更新 tokenizer 或预处理规则、官方无法声明向量兼容时。\n\n**可能不需要全量 Reindex**：同一模型的仅权重微更新，且官方声明向量兼容 → 抽样 500 条 golden queries 评测 recall@K 变化，未超过阈值则保持现有索引。\n\n**Drift Detection 监控维度**：\n- Query embedding 分布漂移：每日计算新 query 嵌入均值与基线余弦距离，>0.05 触发评估\n- 高 OOV 率：tokenizer OOV token 比例 >5% 触发评估\n- 召回率下降：每日 golden queries recall@5 下降 >3% 触发告警\n- 用户反馈信号：搜索 CTR 或答案采纳率下降 >10% 触发评估\n\n**双索引灰度流程**：后台构建新索引 → golden queries 全量回归 → 达标后按比例切流（5%→20%→50%→100%）→ 保留旧索引 7-14 天备用回滚。",
+        "reveal": {
+          "q": "为什么 Output Cache 和 KV Prefix Cache 的越权风险比 Embedding Cache 高得多？",
+          "a": "Embedding Cache 只存向量本身，不包含业务数据，不同用户即使输入相同文本，共享同一个向量也没有安全问题。而 Output Cache 存储的是完整的 LLM 回答，包含从有权限文档中检索到的业务信息；KV Prefix Cache 存储的是包含这些信息的 KV 状态。如果这两类缓存跨用户或跨租户共享，A 用户有权限的文档内容会通过缓存泄露给 B 用户。因此 Output Cache 和 KV Prefix Cache 必须严格按 user/tenant 隔离，而不能跨租户共享。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Matryoshka Representation Learning（MRL）的核心工程价值是什么？",
+        "options": [
+          "使同一个 embedding 模型能同时处理文本和图像",
+          "训练时同时优化多个维度截断的向量质量，使截断后的低维子向量仍保持语义一致性，支持两阶段检索",
+          "通过量化将 float32 向量压缩到 int8，降低 4x 内存",
+          "支持在不重建索引的情况下增量更新 embedding"
+        ],
+        "answer": 1,
+        "explain": "MRL 使截断后的前 D 维子向量仍是高质量语义表示，工程上实现\"低维粗筛 + 高维精排\"两阶段检索，用一个模型覆盖两种精度需求，无需维护两套独立模型和索引，是内存/延迟/精度三角中最优雅的折中方案。"
+      },
+      {
+        "type": "judge",
+        "prompt": "升级 embedding 模型后，只需全量重建向量索引，Embedding Cache 和 Semantic Cache 不需要清除，因为 cache key 中包含了模型版本信息会自动失效。",
+        "answer": false,
+        "explain": "虽然正确设计的 Embedding Cache key 包含 model_id + tokenizer_version，换模型后新 key 不会命中旧缓存条目（旧条目自然过期）。但如果 cache key 设计有遗漏（如只用 text hash 没有包含模型版本），旧向量会被错误复用。实际工程中更安全的做法是升级模型后主动 flush 相关缓存，而不是依赖 key 设计自动隔离——cache key 设计错误是真实发生的 bug。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ColBERT 的 MaxSim 打分机制相比单向量 bi-encoder 的主要优势是？",
+        "options": [
+          "ColBERT 的推理速度比 bi-encoder 快 10 倍以上",
+          "ColBERT 保留 token 级向量，通过对每个 query token 找最相似的 document token 累加，捕捉细粒度匹配信号",
+          "ColBERT 不需要 GPU 就能达到同等精度",
+          "ColBERT 支持跨语言检索，而 bi-encoder 不支持"
+        ],
+        "answer": 1,
+        "explain": "单向量 bi-encoder 把整段文本压缩成一个向量，丢失了 token 级别的匹配细节。ColBERT 保留每个 token 的向量，通过 MaxSim（query 每个 token 找 document 所有 token 中最相似的那个，累加）保留细粒度语义匹配，召回精度接近 Cross-Encoder，但比 Cross-Encoder 快，代价是存储和计算量是 bi-encoder 的 N_tokens 倍。"
+      },
+      {
+        "type": "match",
+        "prompt": "将四类缓存与其对应的越权风险级别匹配：",
+        "left": ["Embedding Cache", "Semantic Cache", "Output Cache", "KV Prefix Cache"],
+        "right": ["极高（必须按租户/权限隔离，包含 LLM KV 状态）", "低（向量本身不含业务数据）", "中（相似问题但答案可能因权限不同而不同）", "高（包含完整 LLM 回答，必须按 user/tenant 隔离）"],
+        "explain": "Embedding Cache 只存向量，无业务数据，越权风险最低；Semantic Cache 存储的答案可能包含权限相关内容，中等风险；Output Cache 存储完整回答，高风险；KV Prefix Cache 包含 LLM 内部状态，权限风险最高，必须严格按租户隔离。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某电商搜索系统的 Query Embedding Cache TTL 设置为 7 天，但 embedding 模型每 5 天有小版本更新。这个配置会导致什么问题？",
+        "options": [
+          "没有问题，cache key 中包含了 model_version，旧版本 key 不会命中新模型的条目",
+          "如果 cache key 没有包含 model_version，旧版本向量会被复用到新模型生成的查询，导致 ANN 检索结果悄悄退化",
+          "TTL 7 天导致 Redis 内存不足，影响系统稳定性",
+          "小版本更新不会改变向量空间，不需要清除缓存"
+        ],
+        "answer": 1,
+        "explain": "如果 Embedding Cache key 没有包含 model_version（只用了 text hash），模型升级后新查询的 embedding 会命中旧版本的缓存向量，然后用这个错误向量去 ANN 检索。查询向量和文档索引向量来自不同模型版本，召回质量下降但没有显式报错。正确做法是 key 必须包含 model_id + model_revision + tokenizer_version，模型升级后旧条目自然成为无效 key 不会被命中，或主动 flush。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对于 query 中含有\"今天\"、\"最新\"等时效性词汇的请求，Semantic Cache 应当直接跳过相似度计算，不参与缓存命中逻辑。",
+        "answer": true,
+        "explain": "时效性 query（含\"今天\"/\"最新\"/\"实时\"等词）即使与历史 query 的向量相似度很高（如\"今天北京天气\"和昨天的同类 query），答案也可能完全不同。这类 query 必须在 Semantic Cache 命中逻辑之前过滤掉，直接走完整 RAG+LLM 流程，防止过期答案被复用。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 Embedding 工程中，用于监测查询分布是否发生系统性变化，以决定是否需要触发 reindex 评估的机制叫什么？（填英文短语，两个单词）",
+        "accept": ["drift detection", "drift detect"],
+        "explain": "Drift Detection 监测 query embedding 分布漂移（每日计算新 query 嵌入均值与基线余弦距离）、高 OOV 率、golden queries 召回率变化和用户反馈信号，当超过阈值时触发 reindex 评估或模型升级评估，防止索引质量悄悄退化而无人知晓。"
+      },
+      {
+        "type": "choice",
+        "prompt": "768 维 float32 向量采用 int8 SQ 量化后，每个向量的存储大小从多少字节变为多少字节？",
+        "options": [
+          "从 3072 字节变为 768 字节（4x 压缩）",
+          "从 3072 字节变为 384 字节（8x 压缩）",
+          "从 3072 字节变为 96 字节（32x 压缩）",
+          "从 3072 字节变为 48 字节（64x 压缩）"
+        ],
+        "answer": 0,
+        "explain": "768 维 float32 = 768 × 4 字节 = 3072 字节。int8 标量量化（SQ）每个维度用 1 字节表示，768 维 int8 = 768 × 1 字节 = 768 字节，压缩比 4:1。384 字节是 int4（8:1），96 字节是 PQ M=24（128:1），48 字节是 PQ M=12。"
+      }
+    ]
+  }
+]

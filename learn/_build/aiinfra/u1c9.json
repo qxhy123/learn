@@ -1,0 +1,149 @@
+[
+  {
+    "id": "u1c9",
+    "title": "CPU 微架构端到端排障",
+    "subtitle": "Top-Down 方法 + 三个真实剧本：从 GPU 抖动到 cache line 定位",
+    "intro": [
+      {
+        "title": "排障的核心挑战：数百个 counter → 1-2 个根因",
+        "body": "现代 CPU 暴露的 PMU（性能监控单元）事件多达数百个：cycles、IPC、各级 cache miss、DTLB miss、branch-miss、HITM……面对这些数字，新手容易「看到 cache miss 就改数据布局，看到 branch miss 就加 `likely/unlikely`」——但改完没效果，因为没有先回答一个更基本的问题：**当前最严重的瓶颈类别是哪一类？**\n\nAI Infra 排障还有一个特殊难点：**现象在 GPU（util 抖动），根因可能在第 5 跳之外的某个 8 字节 atomic counter 的内存对齐**。只盯 GPU 会得出「换更快的 GPU」的错误结论。本关围绕三个真实剧本，演示完整的「现象 → 假设 → 工具 → 数据 → 根因 → 修复 → 复测」闭环。",
+        "tip": "一个合格的 AI Infra 工程师要能在 2 小时内完成完整排障闭环，而不是花两周把锅踢给业务方。"
+      },
+      {
+        "title": "Top-Down 方法：把数百 counter 压缩为 4 个百分比",
+        "body": "Intel Top-Down 方法把 CPU 流水线的每个 issue slot 强制分配到 4 个互斥类别，4 个百分比之和 = 100%：\n\n| 类别 | 含义 | AI Infra 常见来源 |\n|---|---|---|\n| **Front-End Bound** | 前端没把 uop 喂给后端 | I-cache miss、ITLB miss、分支预测延迟 |\n| **Bad Speculation** | uop 被取了但因预测错误被冲刷 | 分支误预测、cold path |\n| **Back-End Bound** | 后端执行单元或访存不可用 | cache miss、DRAM、port 饱和 |\n| **Retiring** | 成功完成有用工作 | 算术、SIMD、tight loop |\n\n**告警阈值**：Front-End > 30%、Bad Speculation > 15%、Back-End Memory > 30% 均需深挖；Retiring > 60% 说明流水线健康。\n\nBack-End Bound 还可进一步 drill-down：Memory Bound（L1/L2/L3/DRAM bound）vs Core Bound（divider、port 饱和、串行 ops）。",
+        "steps": [
+          "先跑 `perf stat -a sleep 30`，看 IPC、cache-miss-rate、branch-miss-rate 三个数字做粗判",
+          "IPC < 1.0 且 cache-miss > 15% → Back-End Memory Bound 优先",
+          "跑 `toplev --level 2` 得到 4 大类百分比，确认主瓶颈类别",
+          "按类别选工具：Memory Bound → `perf c2c`；Bad Speculation → `perf annotate`；Front-End → 火焰图",
+          "定位代码符号，最小修复，再用同样命令复测"
+        ]
+      },
+      {
+        "title": "剧本一：DataLoader 16 worker 反而比 8 worker 慢",
+        "body": "**现象**：8 卡 H100 训练节点，`num_workers=8` 时 6400 samples/s、GPU util 91-95%；`num_workers=16` 时吞吐反降至 5300 samples/s，GPU util 周期性掉到 65-70%。NVMe 带宽 2.1 GB/s（远低于 7 GB/s 上限），网卡无异常。\n\n**排查过程**：\n- `perf stat`：16 worker 时 IPC 从 1.35 降到 0.72，cache-miss rate 从 8.1% 升到 22.4%，branch-miss rate 仅微升 → 强烈指向 **Back-End Memory Bound**\n- `perf c2c`：HITM 集中在 `WorkerStats::processed_samples` 和 `WorkerStats::processed_bytes`，Remote HITM ≈ Local HITM → cache line 在两个 socket 间反复迁移\n\n**根因**：`struct WorkerStats { atomic<u64> samples; atomic<u64> bytes; }` 共 16 字节，4 个 worker 的 stats 落同一 64B line，16 worker 跨 2 socket 高频 atomic 写，ownership 在 socket 间反复迁移。\n\n**修复**：`alignas(64)` + 尾部 padding + 每 64 sample 批量 flush + `numactl --interleave=all`。\n\n**结果**：吞吐从 5300 → 7350 samples/s，GPU util 恢复 92-95%，纯靠改内存对齐，没换硬件。",
+        "tip": "\"GPU 利用率掉\" ≠ \"GPU 是瓶颈\"；\"线程多了变慢\"几乎一定是某种 contention（false sharing、锁、coherence traffic）。"
+      },
+      {
+        "title": "剧本二：tokenizer 服务 P99 抖动",
+        "body": "**现象**：LLM 推理网关的 CPU 侧 tokenizer，QPS 8000，P50 latency 1.2ms，P99 latency 12ms（SLA 要求 < 5ms）。CPU 利用率 65%，看起来「有余量」。水平扩容无效。\n\n**关键线索**：约 1.5% 的请求延迟在 8-15ms，其余正常 → P50 正常 + P99 抖动 = **cold path 问题**，不是容量问题。\n\n**排查**：按请求类型分桶采集，`schema_fallback` 路径的 branch-miss rate 达 6.76%（正常路径 0.96%），比正常高 7 倍。`perf annotate` 找到具体分支：`if !c.is_ascii()` 这类「99% false」的冷分支不断被训练成 hot，污染 I-cache 和 BTB。\n\n**修复**：① 给 cold path 函数加 `#[cold] #[inline(never)]` 属性，让编译器把 cold code 推到代码段尾部；② 用 `unlikely()` 提示编译器优化 hot path；③ 特殊字符查找表改为编译期常量，避免 cold path 的 L2 miss。\n\n**结果**：P99 从 12ms → 4ms（-67%），cold path branch-miss rate 从 6.8% → 1.2%，I-cache miss rate 从 4.2% → 1.5%。",
+        "tip": "CPU 利用率 65% 不代表「有余量」，可能是 stall 占了 35%。`#[cold]` / `__attribute__((cold))` 不是装饰，是给编译器和 CPU 前端的真实指令。"
+      },
+      {
+        "title": "剧本三：vLLM continuous batching 调度循环吞吐瓶颈",
+        "body": "**现象**：vLLM 单机 8 卡 A100，开启 continuous batching，期望 QPS 250+ 实际只有 200，SM utilization 60-70%。增大 `max_num_seqs` 无明显改善，调度循环每秒被调用约 4000 次。\n\n**排查**：`py-spy` 发现调度线程单核 95%，但 GIL 持有仅 40% → 大头在 C++ 扩展。火焰图显示 `update_request_stats` 占 22%。`perf c2c` 发现 HITM 集中在 `RequestStats[i]::tokens_processed` 等字段——每个 `RequestStats` 32 字节，2 个共享一条 line，调度线程写 + metrics 线程读，MESI Modified ↔ Shared 反复转，写 stats[0] 连带使 stats[1] 失效。\n\n**修复**：① `alignas(64)` + 尾部 padding 让每个 RequestStats 独占一条 line；② metrics 线程改为读「快照」，调度线程每 100ms 把所有 stats `memcpy` 到独立 buffer，彻底切断双向 cache line bouncing。\n\n**结果**：QPS 200 → 250（+25%），`Scheduler::step` 单次耗时 380μs → 150μs（-60%），SM util 从 60-70% 升到 85-92%。",
+        "tip": "读线程也会触发 MESI 抖动（Modified → Shared 转换），不只是「多个写者」。用快照机制切断读写线程的直接共享，比 padding 更彻底。"
+      },
+      {
+        "title": "工具选型：什么时候用什么工具",
+        "body": "| 工具 | 角色 | 适用场景 |\n|---|---|---|\n| `perf stat` | PMU 总览 | 第一时间看 IPC、cache-miss、branch-miss 健康度 |\n| `toplev` (pmu-tools) | Top-Down 自动分类 | 得到 4 大类百分比，指导下一步 |\n| `perf c2c` | cache-to-cache HITM | false sharing 排查的「显微镜」 |\n| `perf record` + 火焰图 | 采样 profile | 找 hot symbol，生成调用图 |\n| `perf annotate` | 逐指令分析 | 找具体分支、cold path |\n| `py-spy` | Python 侧 profile | GIL 持有率、Python 调用栈，Python 服务必先用 |\n| `Nsight Systems` | GPU + CPU 联合 trace | 看 CUDA stream 与 CPU 关系，GPU/CPU 联调 |\n\n**选型原则**：Python 服务先跑 `py-spy` 排除 GIL；IPC < 1.0 再上 `toplev`；Memory Bound 确认后才上 `perf c2c`。避免直接上重工具浪费时间。",
+        "tip": "在花时间做 SIMD / cache 对齐之前，先做 5 分钟的「是不是 CPU 瓶颈」快查（mpstat + py-spy + iostat），避免方向性错误。"
+      },
+      {
+        "title": "反模式：看起来像 CPU 瓶颈，其实不是",
+        "body": "以下是 AI Infra 最常见的「CPU 背锅」误判：\n\n| 现象 | 误判 | 实际根因 | 正确诊断 |\n|---|---|---|---|\n| CPU util 100% 但吞吐低 | CPU 是瓶颈 | iowait 高（等 IO） | `mpstat -P ALL` 看 %iowait |\n| 多线程加了仍慢 | cache 不够 | kernel spinlock 竞争 | `perf lock` 看 `_raw_spin_lock` |\n| Python 服务怎么改都不快 | OoO 不发挥 | GIL 持有率 > 80% | `py-spy --gil`，改多进程 |\n| GPU util 抖动 | host-side CPU 瓶颈 | NCCL all-reduce 等慢节点 | Nsight Systems 看 NCCL bar |\n| 推理服务定期卡 100ms | GC | OS huge page compaction | `cat /proc/vmstat`，dmesg |\n| 加 worker 越多越慢 | false sharing | 单卡显存 OOM 触发 swap | `nvidia-smi` + `dmesg` 看 OOM |\n\n**最常见误判**：GPU util 抖动时，第一反应是「CPU 喂不够数据」，但实际上 NCCL 慢节点或网络丢包也会产生完全相同的 GPU idle 现象。先用 Nsight Systems 区分 NCCL bar 长度，再决定是否查 CPU 侧。",
+        "reveal": {
+          "q": "某服务 perf stat 显示：IPC = 0.65，cache-miss-rate = 18%，branch-miss-rate = 1.2%。按 Top-Down 方法，最可能的瓶颈类别是什么？下一步应该用哪个工具？",
+          "a": "IPC 0.65 远低于健康值（> 1.0），cache-miss-rate 18% 显著偏高（正常 < 10%），branch-miss-rate 1.2% 正常，这组数字强烈指向 Back-End Memory Bound。下一步应该跑 `toplev --level 2` 确认 Memory Bound 百分比，然后用 `perf c2c record` 和 `perf c2c report` 找 HITM 集中的 cache line，定位到具体结构体字段。"
+        }
+      },
+      {
+        "title": "值班 SOP 与综合 checklist",
+        "body": "**30 分钟排障 SOP**：\n1. 排除 GPU 本身（温度/ECC/显存/PCIe/NCCL）\n2. `pidstat -t` 定位高 CPU 线程\n3. `perf stat -a sleep 30` 粗判 IPC + cache-miss + branch-miss\n4. `toplev --level 2` 得到 4 大类百分比\n5. 按类别选工具深挖（Memory Bound → `perf c2c`；Bad Speculation → `perf annotate`）\n6. 代码定位 → 最小修复 → 同样命令复测\n7. 写 RCA：现象/假设/证据/根因/修复/验证/教训\n\n**上线前必查**：\n- 所有高频写 stats 结构体已 `alignas(64)` + `static_assert(sizeof == 64)`\n- cold path 函数已加 `#[cold]` / `__attribute__((cold))`\n- `perf c2c report` 无 HITM > 1000 的 cache line\n- CPU 绑核策略明确，不让 worker 跨 socket 漂移\n- 有 IPC/cache-miss-rate/branch-miss-rate 的常态监控（Prometheus）",
+        "tip": "把修复前后的 perf stat 数值表写入 PR description。没有 before/after 数据，不算修完。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Intel Top-Down 方法把 CPU 流水线 slot 分为 4 类，其中「多个核心并发 atomic 写同一 cache line 导致的 ownership 反复迁移」属于哪类？",
+        "options": [
+          "Front-End Bound",
+          "Bad Speculation",
+          "Back-End Memory Bound",
+          "Retiring"
+        ],
+        "answer": 2,
+        "explain": "cache line ownership 反复迁移属于 cache coherence traffic，导致内存访问延迟，使后端（Back-End）等待内存访问完成，属于 Back-End Memory Bound。Front-End Bound 是取指/译码瓶颈；Bad Speculation 是分支误预测冲刷；Retiring 是成功完成的工作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "perf c2c report 中，Remote HITM 远高于 Local HITM，说明 cache line 主要在同一 socket 内不同核心之间迁移。",
+        "answer": false,
+        "explain": "Remote HITM 指跨 socket（跨 NUMA node）的 Hit Modified 事件，Local HITM 指同 socket 内的。Remote HITM >> Local HITM 说明 cache line 在两个 socket 之间反复迁移，走 UPI/Infinity Fabric 互连，代价是同 socket 的 3-10 倍。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某 LLM 推理服务 P50 latency 正常（1ms），但 P99 latency 高达 12ms，CPU 利用率 65%。下面哪个诊断方向最优先？",
+        "options": [
+          "加 CPU 核数，因为 65% 利用率说明接近瓶颈",
+          "查 cold path 分支误预测，P50 正常 + P99 异常是 cold path 的经典模式",
+          "查 false sharing，因为 P99 高说明有 cache line bouncing",
+          "查网络延迟，P99 抖动常来自外部依赖"
+        ],
+        "answer": 1,
+        "explain": "P50 正常 + P99 异常的组合几乎一定是 cold path 问题：少数请求触发了低频路径，该路径有分支误预测（BTB 未训练好）+ I-cache miss（cold code 不在 L1I）。CPU 利用率 65% 不代表余量不足，stall 也会消耗 CPU 时间。false sharing 通常导致 P50 也变差，而不是只影响 P99。"
+      },
+      {
+        "type": "input",
+        "prompt": "Top-Down 方法中，用于「自动给出 4 大类百分比并支持 drill-down」的开源工具叫什么？（填工具名即可）",
+        "accept": ["toplev", "pmu-tools", "toplev.py"],
+        "explain": "toplev 是 Andi Kleen 开发的 pmu-tools 套件的一部分，基于 Intel Top-Down 方法自动采集 PMU 事件并计算 4 大类（Front-End Bound / Bad Speculation / Back-End Bound / Retiring）百分比，支持 --level 2 进一步 drill-down 到 Memory Bound / Core Bound 等子类。"
+      },
+      {
+        "type": "match",
+        "prompt": "将排障场景与最合适的第一步工具匹配：",
+        "left": [
+          "Python 推理服务吞吐上不去",
+          "C++ DataLoader 加线程反而变慢",
+          "GPU SM util 周期性掉到 60%",
+          "推理服务 P99 出现 ms 级长尾"
+        ],
+        "right": [
+          "nvidia-smi dmon + Nsight Systems 先排除 GPU 本身和 NCCL",
+          "py-spy --gil 排除 GIL 瓶颈",
+          "perf stat 看 IPC + cache-miss-rate，再上 perf c2c",
+          "按请求类型分桶，对比 normal vs cold path 的 branch-miss-rate"
+        ],
+        "explain": "Python 服务先排 GIL；C++ 多线程变慢先看 IPC + cache-miss，再用 perf c2c 找 HITM；GPU util 抖动先排 GPU 本身和 NCCL；P99 长尾先分桶分析 cold path。"
+      },
+      {
+        "type": "judge",
+        "prompt": "vLLM 调度循环中，给 RequestStats 结构体加 alignas(64) 后，metrics 线程读取这些 stats 就不会再触发 cache line 迁移了。",
+        "answer": false,
+        "explain": "alignas(64) 消除了不同 RequestStats 之间的伪共享（每个独占一条 line），但如果调度线程写 + metrics 线程读同一个 RequestStats，仍然存在 MESI Modified ↔ Shared 的转换：调度线程写时需要 Modified 状态，使 metrics 线程的 Shared 副本失效；metrics 线程读时需要重新取回数据。彻底解决需要用快照机制（调度线程每 100ms memcpy 到独立 buffer，metrics 只读 buffer）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某服务 GPU util 抖动，运维认为是 CPU 侧 DataLoader 喂数据不够快。以下哪个操作应该最先做？",
+        "options": [
+          "直接增加 DataLoader num_workers 到最大值",
+          "给所有 stats 结构体加 alignas(64)",
+          "先用 nvidia-smi dmon 和 Nsight Systems 排除 GPU 本身（温度、ECC、NCCL）",
+          "给 DataLoader 进程绑核到单一 NUMA node"
+        ],
+        "answer": 2,
+        "explain": "GPU util 抖动的原因很多：NCCL all-reduce 等慢节点、GPU 温度触发降频、ECC 错误、显存压力、PCIe 带宽不足，都会产生和 CPU DataLoader 不足相同的现象。盲目加 worker 或改对齐可能没有效果，甚至产生新的 false sharing。应该先用 nvidia-smi dmon 和 Nsight Systems 排除 GPU 侧原因，确认 GPU 正常后再查 CPU 侧。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`perf stat` 输出显示：IPC = 0.72，cache-miss-rate = 22%，branch-miss-rate = 4%，frontend-bound = 11%。下一步最合适的工具是：",
+        "options": [
+          "perf annotate，因为 branch-miss-rate 4% 是主要问题",
+          "perf c2c，因为 IPC 低且 cache-miss 高强烈指向 Memory Bound",
+          "py-spy，查 Python GIL",
+          "Nsight Systems，查 GPU 侧 CUDA kernel 间隙"
+        ],
+        "answer": 1,
+        "explain": "IPC 0.72 远低于健康值，cache-miss-rate 22% 显著偏高，branch-miss-rate 4% 偏高但不是主因（branch-miss-rate > 10% 才算严重），frontend-bound 11% 正常。这组数字强烈指向 Back-End Memory Bound，最合适的下一步是 perf c2c 找 HITM 集中的 cache line，定位 false sharing 或 cache thrash 的具体位置。"
+      },
+      {
+        "type": "judge",
+        "prompt": "修复伪共享之后，如果 perf c2c 显示 HITM 显著下降，但业务 QPS 没有变化，说明修复方向正确，问题已经解决。",
+        "answer": false,
+        "explain": "HITM 下降说明 false sharing 得到了修复，但 QPS 没有改善说明 false sharing 不是当前的主要瓶颈，或者修复没在关键路径上。此时应该重跑 EvidenceBundle（perf stat + toplev + 火焰图），重新排序假设，找出次级瓶颈。只有 PMU counter 改善「且」业务指标同步改善，才算真正修复。"
+      }
+    ]
+  }
+]

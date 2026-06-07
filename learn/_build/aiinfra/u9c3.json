@@ -1,0 +1,128 @@
+[
+  {
+    "id": "u9c3",
+    "title": "AI Infra 面试题精选（一）",
+    "subtitle": "硬件、训练、推理系统的高频面试考点梳理与考查",
+    "intro": [
+      {
+        "title": "AI Infra 面试考什么",
+        "body": "AI Infra 面试不主要考「你能不能背组件名」，而考「你能不能在真实约束下，把资源、链路、故障和治理串起来推理」。\n\n一场有效的 AI Infra 面试沿四条线展开：\n\n- **资源线**：GPU、HBM、CPU、网络、存储、队列和预算\n- **链路线**：数据、训练、checkpoint、registry、评测、发布、推理和观测\n- **故障线**：从吞吐下降、p99 升高、训练挂起、恢复失败走到根因\n- **治理线**：多租户、公平性、成本、安全、发布门禁和审计\n\n按岗位侧重：推理岗优先看 KV Cache / batching / SLO；训练岗优先看并行策略 / checkpoint / 恢复；平台岗优先看队列 / 配额 / 发布治理。\n\n**回答框架**：结论 → 分类 → 取舍 → 案例（带数字）。",
+        "tip": "「会用 vLLM」和「会做推理平台」差在哪里？前者只会配置，后者能解释容量、成本、SLA 和故障路径。"
+      },
+      {
+        "title": "硬件层：GPU 选型与显存预算",
+        "body": "**GPU 选型核心判断**：先看 HBM 容量（70B bf16 权重约 140GB，单卡 80GB 必须 TP=2 或量化），再看互联（NVLink vs PCIe），最后看算力精度（FP8 支持）。\n\n- **H100 SXM**：FP8 + NVLink 全互联，70B 推理性价比最高\n- **A100**：无 FP8，NVLink TP2 有优势，推理吞吐落后 H100\n- **L40S**：48GB 单卡跑 70B 吃力，PCIe 互联通信成本高，适合中小模型\n\n**显存预算拆解（70B bf16 训练）**：\n- 权重：140GB（ZeRO-3 后单 rank ÷N）\n- 优化器（Adam fp32）：560GB（÷N）\n- 梯度：140GB（÷N）\n- 激活：与 batch × seq² × hidden 有关，是 OOM 第一元凶\n- 通信 buffer + workspace：常被忽略\n\n**隐藏元凶**：peak activation 在 backward 重新算时短暂双倍；显存碎片（fragmentation）让「还有 5GB 但 OOM」。\n\n**互联拓扑**：NVLink ≈ 900 GB/s（机内）；PCIe Gen5 ≈ 64 GB/s；IB NDR ≈ 400 Gbps（跨机）；RoCEv2 便宜但需 PFC+ECN 治理拥塞，否则丢包毁灭性。",
+        "tip": "GPU-Util 92% 不等于「GPU 在高效干活」。SM occupancy、Tensor Core 利用率、HBM 带宽利用才是真实指标。"
+      },
+      {
+        "title": "分布式训练：并行策略与 checkpoint",
+        "body": "**ZeRO 各 stage 切了什么**：\n- ZeRO-1：切 optimizer states，通信不变（≈ 2× params/step）\n- ZeRO-2：切 optimizer + gradient，通信仍 ≈ 2× params\n- ZeRO-3 / FSDP：切 optimizer + gradient + parameters，通信 ≈ 3× params（forward all-gather + backward all-gather + reduce-scatter）\n\n**Tensor Parallel（TP）**：切单层矩阵，每层 2 次 all-reduce，频率高对延迟极敏感 → 必须限制在 NVLink 域内，不跨机。70B 推理常用 TP=4 或 TP=8。\n\n**Pipeline Parallel（PP）**：bubble 比例 ≈ (P-1)/(P+M-1)（GPipe），M 是 micro-batch 数。M 越大 bubble 越小，但显存占用越高。1F1B 调度使稳态期 bubble 减半。\n\n**Checkpoint 策略**：\n- 训练用 **sharded checkpoint**：每 rank 并行写分片，写延迟低；恢复必须用相同 mesh shape\n- 发布用 **full checkpoint**：聚合后存模型仓库，便于跨配置加载\n- 生产实践：训练时 sharded + 定期 async export full（每 N 小时或评估通过后）",
+        "tip": "ZeRO-3 省显存，但通信量是 ZeRO-1/2 的 1.5 倍。网络带宽不够时反而比 ZeRO-2 + activation checkpointing 慢。"
+      },
+      {
+        "title": "推理系统：KV Cache、Batching 与引擎",
+        "body": "**KV Cache 大小估算**（单请求）：\n`2 × num_layers × num_kv_heads × head_dim × seq_len × dtype_bytes`\n\n例如 70B（80层、8 kv_heads、head_dim 128、seq 4096、bf16）：单请求约 1.34 GB，TP=8 后单卡约 168 MB/request。\n\n**PagedAttention**：把 KV Cache 切成固定大小 block（默认 16 token），按需分配，类比 OS 虚拟内存的页表机制，消除内部碎片，使显存利用率从 ~20% 提到 ~96%。\n\n**Prefill vs Decode 差异**：\n- Prefill：compute-bound（跑满 SM），batch 友好，一次性写 N 个 KV slot\n- Decode：memory-bound（HBM 带宽决定），每步写 1 个 KV slot\n\n**Continuous batching**：最大价值是长短请求混合时，短请求完成就接新的，GPU 持续高利用。核心坑：长 prompt 进入 batch 会让已 decode 请求的 inter-token latency 跳 → 用 `chunked prefill` 解。\n\n**Prefix Cache 失效的常见场景**：模板嵌了时间戳/用户 ID；tokenizer 升级；LoRA adapter 切换；cache 容量小频繁 LRU evict。\n\n**引擎选型**：vLLM（模型支持广、multi-LoRA 用 Punica）；TRT-LLM（延迟吞吐最优但调试难）；SGLang（prefix cache 设计精妙）；TGI（HF 生态方便）。",
+        "tip": "KV Cache 估算公式记住：2（K+V）× layers × kv_heads × head_dim × seq_len × dtype_bytes。TP 切 kv_heads，单卡 KV 随 TP 倍数等比例减少。"
+      },
+      {
+        "title": "故障诊断框架：凌晨 3 点 p99 翻倍怎么看",
+        "body": "**结构化排障顺序**（10 分钟内收敛假设）：\n\n1. **确认范围**：全局 vs 单租户 vs 单实例 vs 某区域\n2. **流量层**（2-3 分钟）：QPS、token 长度分布、prompt 是否突变\n3. **服务层**（4-5 分钟）：队列长度、batching 命中、KV evict 率、prefill/decode 比例\n4. **资源层**（6-7 分钟）：GPU util、HBM、PCIe、节点温度、邻居训练 Job 是否抢占带宽\n5. **依赖层**（8-9 分钟）：gateway → engine → registry → 数据库 / 向量库 / external API\n6. **初判**（第 10 分钟）：归类为「流量打飞 / 实例打挂 / 资源被抢 / 依赖故障」再采取动作\n\n**重要原则**：「应急动作 vs 根因定位」分阶段处理，不要在 10 分钟内既想止血又想定位。\n\n**GPU 利用率是个谎言**：`nvidia-smi` 的 GPU-Util 只要有任意 kernel 在跑就计 100%（哪怕一个空 memcpy）。真正反映算力的是 SM occupancy、Tensor Core util、HBM 带宽利用。单机 8 卡中 1 张卡 GPU-Util 60% 其它 95%，最可能是那张卡的 DataLoader 线程抖或 PCIe 共享。",
+        "reveal": {
+          "q": "GPU 利用率 92%，但训练 step time 比同模型公开 benchmark 慢 30%，最可能的根因是什么？",
+          "a": "GPU-Util 高不等于算力利用率高。慢 30% 的常见根因包括：DataLoader 慢（CPU 抢占/磁盘 IO）让 GPU 等数据，虽然有 kernel 在跑但 SM occupancy 低；NCCL all-reduce 抖动；显存碎片导致 alloc/free 慢；GPU 自身降频（功耗/散热）。需要用 torch.profiler / Nsight Systems 看 kernel timeline，用 dcgmi dmon 看 SM occupancy 才能精确定位。"
+        }
+      },
+      {
+        "title": "数据、制品与 Registry 的版本化",
+        "body": "**三类制品的版本化方案**：\n- 原始数据集：S3 + manifest（按内容 hash 引用），用 DVC / lakeFS 管理「哪一版数据用哪些样本」\n- Tokenized 数据：webdataset / parquet shard + 版本目录；与 tokenizer hash 强绑定\n- Checkpoint：注册到 model registry；存对象存储；带 metadata（dataset version、code commit、metric、超参）\n\n**Registry 的合理边界**：\n- 必须在 registry 内：模型权重引用 URL、元数据（架构/size/量化/license）、谱系（dataset version/code commit/parent model）、评测结果摘要、发布状态\n- 必须在外部：原始训练数据（太大/合规）、详细评测样本、prompt 模板\n- Registry 是「模型这个对象的真相」，不是「所有 ML 工件的总仓库」\n\n**评测制品三方版本化**：模型 vN / 评测集 vM / 评测代码 vK；同一 (M, K) 对比不同 N 才可信；评测集升级后需对最近 K 个模型重跑一次让趋势图重新连续。",
+        "tip": "checkpoint 写成功 ≠ 可恢复。必须同时验证 manifest 完整性和 restore smoke test。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "同样 200 万预算用于「70B 模型推理 + 偶尔 13B 微调」，在 H100 SXM / A100 SXM / L40S 三种卡中，性价比最优的是哪个？",
+        "options": [
+          "L40S 48GB PCIe，性价比最高，48GB 够 70B 推理",
+          "A100 80GB SXM，最稳定可靠",
+          "H100 80GB SXM，FP8 + NVLink 让 70B 推理吞吐和成本最优",
+          "三种卡性能相近，选最便宜的即可"
+        ],
+        "answer": 2,
+        "explain": "70B bf16 权重约 140GB，单卡 80GB 必须 TP=2。H100 有 FP8 支持（比 bf16 少一半显存）、NVLink 高带宽 TP 通信、Hopper TMA，是 70B 推理性价比最优选择。L40S 48GB 单卡跑 70B 力不从心，PCIe 多卡通信弱；A100 没有 FP8，一年后会被 H100 FP8 推理性价比拉开。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Tensor Parallel（TP）可以跨多台机器使用，因为它和数据并行（DP）一样不受物理拓扑限制。",
+        "answer": false,
+        "explain": "TP 每层需要 2 次 all-reduce，通信频率极高，对延迟极敏感。跨机延迟（200us）× 每层 N 次 = 不可接受的开销。TP 必须限制在 NVLink 域内（单机 NVSwitch 全互联）。跨节点并行只能用 DP / ZeRO 或 PP（流水并行）。"
+      },
+      {
+        "type": "input",
+        "prompt": "PagedAttention 把 KV Cache 切成固定大小的 block（默认 16 token），通过 block table 间接寻址。这个机制类比 OS 中的哪个概念？",
+        "accept": ["虚拟内存", "页表", "page table", "virtual memory", "分页内存"],
+        "explain": "PagedAttention 的 block 类比 OS 的物理页，block table 类比页表（page table），block_size 类比页大小。按需分配 block 消除了传统「按 max_seq_len 静态分配」导致的内部碎片，使 KV Cache 显存利用率从约 20% 提到约 96%。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Pipeline Parallel 中，8 个 stage（P=8）、micro-batch 数 M=8 时，GPipe 调度的 bubble 比例约是多少？",
+        "options": ["约 12%", "约 25%", "约 47%", "约 75%"],
+        "answer": 2,
+        "explain": "GPipe bubble 比例公式是 (P-1)/(P+M-1)。P=8, M=8 时：(8-1)/(8+8-1) = 7/15 ≈ 47%。当 M 增大到 32 时：7/39 ≈ 18%，bubble 大幅减少。1F1B 调度在稳态期 forward/backward 交错，bubble 比 GPipe 减少约一半。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 ZeRO stage 与其切分对象匹配",
+        "left": ["ZeRO-1", "ZeRO-2", "ZeRO-3 / FSDP"],
+        "right": [
+          "切 optimizer states + gradient + parameters（通信 ≈ 3× params/step）",
+          "切 optimizer states（通信量不变，仍 ≈ 2× params/step）",
+          "切 optimizer states + gradient（通信 ≈ 2× params/step）"
+        ],
+        "explain": "ZeRO-1 只切 optimizer states，通信量和纯 DP 一样；ZeRO-2 再切 gradient；ZeRO-3 / FSDP 还切 parameters，forward 和 backward 时各需要 all-gather 一次参数，reduce-scatter 一次梯度，总通信约 3× params。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练时 Prefix Cache 命中率突然从 70% 降到 20%，最可能的原因是工程师把 `timestamp` 字段加进了 system prompt。",
+        "answer": true,
+        "explain": "Prefix Cache 的命中条件是：token ID 序列完全一致 + tokenizer 一致 + LoRA id 一致。把时间戳、用户 ID、会话 ID 等动态内容嵌入 system prompt，会让每次请求的 token 序列都不同，导致 cache 永远无法命中。应把动态内容移到 user turn，保持 system prompt 稳定。"
+      },
+      {
+        "type": "choice",
+        "prompt": "训练数据集的版本化最推荐使用哪种方案？",
+        "options": [
+          "git-lfs，像代码一样版本化",
+          "直接用时间戳命名文件夹",
+          "S3 + manifest 文件（按内容 hash 引用），配合 DVC / lakeFS",
+          "把所有数据打包成一个大 tar 文件存版本号"
+        ],
+        "answer": 2,
+        "explain": "PB 级数据集不适合 git-lfs（大文件版本化有上限，push/pull 慢）。时间戳命名无法保证内容不变。正确做法是 S3 存储 + manifest 文件，manifest 按内容 hash 引用每个 shard，配合 DVC / lakeFS 管理「哪一版数据用哪些样本」，实现任意 checkpoint 都能回溯到精确的数据版本。"
+      },
+      {
+        "type": "input",
+        "prompt": "Continuous batching 相对静态 batching 最大的价值是什么？（简述核心场景）",
+        "accept": ["长短请求混合", "短请求不等长请求", "长短混合批次", "每完成一个就接新的"],
+        "explain": "Continuous batching 最大价值是：长短请求混合时，传统静态 batch 必须等最长那个跑完才能解 batch，短请求被「绑架」；continuous batching 每完成一个就接新的，GPU 利用率持续高位。如果所有请求长度一样，收益很小。"
+      },
+      {
+        "type": "choice",
+        "prompt": "凌晨告警：在线推理 p99 latency 5 倍上涨。你 10 分钟内第一步应该做什么？",
+        "options": [
+          "立即重启所有 inference engine 实例",
+          "确认告警范围（全局 vs 单租户 vs 单实例 vs 某区域）",
+          "先看 GPU 利用率是否下降",
+          "立即回滚到上一个模型版本"
+        ],
+        "answer": 1,
+        "explain": "结构化排障的第一步是「确认范围」，而不是直接采取动作。全局 p99 上涨和单个实例 p99 上涨的根因、处理方式完全不同。在没有收敛假设之前就重启或回滚，可能掩盖真正根因，甚至加剧问题（如回滚导致新版本的修复失效）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "模型 Registry 应该直接存储原始训练数据集，这样方便从 Registry 一站式查到模型的所有来源信息。",
+        "answer": false,
+        "explain": "Registry 是「模型这个对象的真相」，不是「所有 ML 工件的总仓库」。原始训练数据集体积 PB 级，且有合规约束，不应放在 Registry 里。Registry 应存储数据集的引用（dataset URL / version hash），让每个 checkpoint 能追溯到精确的数据版本，实际数据留在专门的数据存储（S3 + manifest）中。"
+      }
+    ]
+  }
+]

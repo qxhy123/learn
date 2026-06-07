@@ -1,0 +1,122 @@
+[
+  {
+    "id": "u3c12",
+    "title": "框架调度、运行时与 Kernel Launch",
+    "subtitle": "model(x) 的每一层翻译成本与优化策略",
+    "intro": [
+      {
+        "title": "不可化简的问题",
+        "body": "GPU 只能接收已编译的设备代码、参数地址、grid/block 配置和执行队列命令。AI 框架必须把上层 tensor 表达逐层翻译成设备命令流。这条路径有三个硬约束：\n\n1. **语义约束**：`model(x)` 包含模块、张量、动态控制流、autograd、dtype、layout 和广播语义；GPU kernel 看到的是指针、shape、stride 和执行配置\n2. **固定开销约束**：每次 kernel launch 都要经过 Python/API → dispatcher → ATen → runtime → driver，即使 kernel 本身只跑 5 μs，launch 路径可能消耗 15–20 μs\n3. **生命周期约束**：算子还要分配临时 tensor、申请 workspace、记录 autograd 边、维护异步语义——性能问题经常藏在这些「非数学 FLOPs」里"
+      },
+      {
+        "title": "层级职责：从 Python 到 SM",
+        "body": "| 层 | 负责什么 | 常见开销 | 典型问题 |\n|---|---|---|---|\n| Python / API | 模型组织、控制流 | Python 调用、对象创建 | 循环里逐元素调用、小 batch 大量 Python |\n| Autograd 包装 | 记录反向图、保存 tensor | metadata、引用生命周期 | eval 忘记 `no_grad`，保存中间 tensor |\n| framework dispatcher | 按 dispatch key 选后端 | 每 op 固定选择成本 | 大量小 op、fallback、dtype/device 不对 |\n| ATen / native op | 调用 kernel 或库 | shape 检查、临时 buffer、算法选择 | non-contiguous 慢路径、workspace 过大 |\n| CUDA runtime | 提交 launch、event、stream | launch 固定成本 | kernel 太碎，CPU enqueue 跟不上 |\n| GPU 执行 | kernel 在 SM 上执行 | 实际计算/访存时间 | kernel 本身低效，需 ncu 下钻 |"
+      },
+      {
+        "title": "Dispatcher 的价值与代价",
+        "body": "`torch.matmul`、`layer_norm`、`torch.add` 不是单一函数，而是多后端入口。dispatcher 按 dispatch key（device、dtype、layout、requires_grad 等）选择实现路径：\n\n| dispatch 路径 | 触发条件 | 注意 |\n|---|---|---|\n| CUDA | tensor 在 CUDA，有 native 实现 | 通常正常路径 |\n| AutogradCUDA | `requires_grad=True` | eval/inference 要用 `no_grad` |\n| CompositeImplicitAutograd | 由多个基础 op 组合 | 可能展开成多个小 kernel |\n| CPU | tensor 在 CPU | 检查 `.device`，防止意外 CPU tensor |\n\n**代价**：eager 模式下每个 op 都要做一次路由。op 很大时可忽略；op 很小且数量多时，这个固定成本和 kernel launch 一起成为主要开销。\n\n**排查信号**：`torch.profiler` 中 `aten::` 事件数量远大于预期，且 CPU self time 高 → 考虑减少小 op、`torch.compile` 或 fusion。"
+      },
+      {
+        "title": "ATen 算子选择：同一 API 性能可能差一个数量级",
+        "body": "ATen 决定「这个 tensor 形状/dtype/layout 下，用什么实现最合适」。同一个数学操作，实现路径可能相差巨大：\n\n| 算子 | 可能实现 | 选择依据 | 风险 |\n|---|---|---|---|\n| `matmul/linear` | cuBLAS、cuBLASLt、batched GEMM | shape、dtype、stride | 小矩阵 launch 多、layout 不适配 |\n| `layer_norm` | native CUDA、fused kernel、Triton | hidden size、dtype、contiguous | fallback 为多个 op |\n| elementwise | TensorIterator、specialized kernel | 广播、stride、dtype | 每个 elementwise 单独 launch |\n\n**常见失败原因**：\n- dtype 不匹配 → 额外 cast 或慢路径\n- non-contiguous → 需要 copy 或低效 stride\n- shape 太小 → launch 主导，填不满 GPU\n- 特殊 mask → fused attention 后端不可用，退回多个 kernel\n\n**关键点**：`view`、`transpose` 不一定 launch kernel，但改变 stride 状态后，可能让后续算子落到慢路径。"
+      },
+      {
+        "title": "Launch 固定开销与「小 kernel 慢」的五个原因",
+        "body": "「小 kernel 多」慢，不是一句经验，而是五类固定成本叠加：\n\n| 原因 | 机制 | profile 表现 |\n|---|---|---|\n| Launch 固定开销 | 每个 kernel 都要 CPU 提交 | kernel 很短，间隙明显 |\n| Dispatcher 固定开销 | 每个 eager op 都要路由 | CPU `aten::` event 密集 |\n| 中间 HBM 流量 | 每个 op 写出再读入中间 tensor | memory bandwidth 高但 FLOPs 低 |\n| Allocator 压力 | 临时 tensor 多 | 分配事件、reserved 增长、step 抖动 |\n| GPU 填不满 | 小 grid / 小 shape 并行度不足 | GPU util 低，SM 活跃不足 |\n\n**工程估算**：1200 个 kernel，launch 18 μs、执行 12 μs → 36 ms。降到 300 个 kernel，执行 35 μs → 15.9 ms。减少 kernel 数后单 kernel 变长是正常的，要看端到端，不是单 kernel 时间。",
+        "tip": "小 kernel 多的常见来源：unfused elementwise（bias、gelu、dropout 分开）、mask/index 碎片操作、小 batch decode（每 token 小矩阵）、频繁 .item()/.cpu() 触发 D2H 同步。"
+      },
+      {
+        "title": "Eager vs Compiled：何时用哪种模式",
+        "body": "**Eager 适合**：调试、研究、动态控制流多、错误定位阶段\n\n**Compiled（`torch.compile`）适合**：稳定 shape、重复执行、elementwise/reduction 较多的热路径\n\n**Compiled 的工作原理**：TorchDynamo 捕获 Python 层图 → AOTAutograd 处理训练图 → Inductor 生成融合 kernel 或调用库 → 减少 Python/dispatcher/launch 和中间 HBM 流量\n\n**Compiled 不适合**：完全由大 GEMM 主导（收益小）、shape 高度动态（频繁重编译）、Python 副作用多的代码\n\n| 维度 | Eager | Compiled |\n|---|---|---|\n| 调试体验 | 最直观 | graph break 增加复杂度 |\n| 小 kernel 开销 | 容易暴露 | fusion 后明显减少 |\n| 首次运行 | 无编译成本 | 可能有编译 warmup |\n| 失败模式 | 慢但可解释 | graph break、fallback、重编译 |",
+        "reveal": {
+          "q": "推理服务换了 H200（比 H100 算力高约 2 倍）后，大 GEMM 延迟减少了 50%，但端到端推理 P50 只减少了 12%。用 launch 固定开销模型解释一种可能原因。",
+          "a": "launch 开销来自 CPU→runtime→driver 路径，不随 GPU Tensor Core 算力提升而减少。H200 让 kernel 执行更短，但 launch 时间（~18-20 μs）基本不变。若模型有大量小 kernel，新 GPU 执行时间下降后，launch 在每次「launch+execute」中的占比升高，整体提速不如单 GEMM。需要用 torch.compile 或 CUDA Graph 来减少 launch 次数，才能让新硬件的算力真正体现到端到端上。"
+        }
+      },
+      {
+        "title": "常用动作优先级",
+        "body": "面对「GPU 利用率低、kernel 很碎、CPU 很忙」的场景，按优先级处理：\n\n1. **去掉 `.item()`、`.cpu()`、逐步日志** — 成本高且常被忽略，一行日志可能把整个 step 同步\n2. **推理使用 `inference_mode()`** — 去掉 autograd 包装，减少 metadata 和引用管理\n3. **批量化 Python 循环里的 tensor op** — 直接减少 dispatcher 和 launch 次数\n4. **尝试 `torch.compile` 或已有 fused op** — 通常收益大、维护成本低\n5. **约束 shape bucket 和 layout** — 提高编译缓存和 allocator 稳定性\n6. **切换成熟推理引擎** — 复用专业优化路径\n7. **写自定义 kernel** — 只有语义特殊或成熟路径不足时\n\n**不建议跳过前几步直接写自定义 kernel**。多数性能问题不在 kernel 内部，而在上层路径。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "framework dispatcher 的核心职责是什么？",
+        "options": [
+          "把 Python tensor 复制到 GPU 显存",
+          "按 dispatch key 把同一个算子 API 路由到正确的后端实现",
+          "管理 CUDA stream 的排队和依赖",
+          "优化 kernel 内部的寄存器分配"
+        ],
+        "answer": 1,
+        "explain": "dispatcher 按 tensor 的 dispatch key（device、dtype、layout、requires_grad 等）选择后端实现，让同一个 `torch.add` 能自动路由到 CPU、CUDA、Autograd、AMP 等不同路径。代价是每个 eager op 都要做一次路由。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`view`、`transpose` 这类操作不 launch CUDA kernel，所以对后续算子的性能没有影响。",
+        "answer": false,
+        "explain": "view/transpose 改变 tensor 的 stride 和 contiguous 状态，不一定 launch kernel。但后续算子若需要 contiguous 数据，可能触发隐式 copy，或选到 non-contiguous 的慢路径实现。一次便宜的 metadata 操作，可能让后续昂贵算子落到低效路径。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某模型从 A100 迁移到 H100 后，大矩阵乘明显变快，但推理 P50 只快了 10%。以下哪个原因最可能解释这一现象？",
+        "options": [
+          "H100 的 NCCL 通信比 A100 慢",
+          "H100 的显存带宽低于 A100",
+          "launch 固定开销不随 GPU 算力提升而下降，小 kernel 多的图优化收益受限",
+          "H100 的 cuBLAS 版本不支持 BF16"
+        ],
+        "answer": 2,
+        "explain": "launch 开销来自 CPU→runtime→driver 路径，与 GPU Tensor Core 算力无关。新 GPU 让 kernel 执行更短，launch 占比反而升高。大 GEMM 执行时间长，launch 占比小，加速明显；小 kernel 多的图，launch 成为瓶颈，即使换更强 GPU 也收益有限。"
+      },
+      {
+        "type": "input",
+        "prompt": "`torch.compile` 之后出现 graph break 时，会发生什么？用「暴露」「eager」两个词回答。",
+        "accept": ["暴露", "eager", "重新", "断图", "开销"],
+        "explain": "graph break 把本可融合的区域切断，断点处的代码重新回退到 eager 执行，暴露回 Python/dispatcher/launch 开销。不是错误，但会抵消编译收益。需要检查编译日志和 profiler 同时确认断点位置。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理服务热路径中出现以下哪种写法，会对性能影响最大？",
+        "options": [
+          "使用 `torch.no_grad()` 包裹 forward",
+          "每个 step 调用 `loss_val = loss.item()` 并打印",
+          "使用 `model.eval()` 切换推理模式",
+          "使用 `tensor.half()` 转换精度"
+        ],
+        "answer": 1,
+        "explain": "`.item()` 需要把 GPU 标量搬到 CPU Python 数值，会触发同步等待所有前序 GPU 工作完成。每 step 调用一次，会把本来可以流水的异步执行拉成串行，破坏 H2D/compute overlap，是典型的隐式同步问题。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 ATen 算子实现选择的失败原因与后果匹配：",
+        "left": ["dtype 不匹配", "non-contiguous tensor", "shape 太小", "特殊 mask"],
+        "right": [
+          "需要额外 cast 或落到慢路径",
+          "需要隐式 copy 或使用低效 stride 访问路径",
+          "launch 开销主导，GPU 并行度不足",
+          "fused attention 后端不可用，退回多个分散 kernel"
+        ],
+        "explain": "dtype 不匹配导致 cast；non-contiguous 导致 copy 或 stride 慢路径；shape 太小导致 launch 主导；特殊 mask 让 fused attention kernel 无法使用，展开成普通 softmax/matmul 等多个 kernel。"
+      },
+      {
+        "type": "judge",
+        "prompt": "caching allocator 的 `reserved` 远大于 `allocated`，说明显存被泄漏了，需要立即排查。",
+        "answer": false,
+        "explain": "reserved 高于 allocated 是 caching allocator 的正常工作状态：已释放的 tensor 显存块被放回缓存池（reserved），等待下次复用，不立刻归还 CUDA。只有 allocated 持续增长、或 reserved 内部碎片导致无法分配大块时才需要排查。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对一个主要由大 GEMM 组成、shape 高度动态的训练任务，`torch.compile` 的预期收益是？",
+        "options": [
+          "明显减少 launch 开销和中间 HBM 流量",
+          "收益可能较小，甚至被编译成本和频繁重编译抵消",
+          "自动解决 NCCL overlap 问题",
+          "降低 GPU 显存峰值至少 50%"
+        ],
+        "answer": 1,
+        "explain": "compiled 模式最适合稳定 shape、重复执行、elementwise/reduction 较多的区域。对完全由大 GEMM 主导的任务，GEMM 本身已经调用成熟库（cuBLAS），compilation 额外收益小；shape 高度动态会导致频繁重编译（guard 不稳定），编译成本可能超过收益。"
+      }
+    ]
+  }
+]

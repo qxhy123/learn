@@ -1,0 +1,158 @@
+[
+  {
+    "id": "u1c8",
+    "title": "伪共享（False Sharing）",
+    "subtitle": "写得对、跑得慢——cache line 粒度差引发的隐性性能杀手",
+    "intro": [
+      {
+        "title": "为什么代码正确却变慢？",
+        "body": "伪共享（False Sharing）是一种「写得对、跑得慢」的典型性能 Bug。代码逻辑没有共享变量，没有锁竞争，ThreadSanitizer 也不报任何错误——但加线程不增吞吐，CPU 占用高得离谱，p99 抖动严重。\n\n根因在于：**硬件以 64 字节 cache line 为粒度维护缓存一致性，而程序员的共享语义以单变量为粒度**。两个核心分别写同一 cache line 上的不同变量，硬件看不出区别，必须反复在核心间搬运整条 line。",
+        "tip": "伪共享不是 data race，不会被 ASan/TSan 发现；也不是普通 cache miss，不会被普通 cache-misses 指标直接定位。它是介于两者之间的「物理层浪费」。"
+      },
+      {
+        "title": "MESI 协议的 cache line 粒度",
+        "body": "理解伪共享需要先理解 MESI 协议的基本规则：**任何写操作都必须把整条 64B cache line 升级到 Modified 状态**，并让其他核心的副本失效（Invalidate）。\n\n当 Core 0 写 `counter[0]`、Core 1 写 `counter[1]`，如果两个变量落在同一条 64B line 上：\n\n- Core 0 写 → 发 RFO（Read For Ownership），让 Core 1 的副本失效\n- Core 1 写 → 反过来让 Core 0 的副本失效\n- 两核反复夺取 line 所有权，形成 **cache line bouncing**\n\n代价随拓扑距离急剧放大：同 socket 约 30–80 cycles，跨 socket 约 150–400 cycles，跨 NUMA 可达 300–800 cycles。",
+        "steps": [
+          "Core 0 写 counter[0]，必须先拿到整条 64B line 的 Modified 权",
+          "MESI 广播 Invalidate，Core 1 持有的副本变为 Invalid",
+          "Core 1 写 counter[1]，发起 RFO 从 Core 0 取回整条 line",
+          "Core 0 的副本变为 Invalid，下次写再重复以上流程",
+          "两个核心反复迁移同一条 line，吞吐被序列化"
+        ]
+      },
+      {
+        "title": "真共享 / 伪共享 / data race：三者区别",
+        "body": "这三个概念在值班和 code review 时经常被混用：\n\n| 概念 | 物理层 | 程序正确性 | 能否被工具检出 | atomic 有用吗 |\n|---|---|---|---|---|\n| **真共享** | 多核读写同一变量、同一 line | 正确（有同步） | 不报警 | 必要 |\n| **伪共享** | 多核写不同变量、同一 line | 正确 | 不报警 | 无效甚至更糟 |\n| **Data Race** | 多核无序读写同一变量 | 错误 | TSan 可检测 | 必要 |\n\n**关键误区**：给紧凑布局的 counter 数组加 `std::atomic`，反而让伪共享更糟——因为 atomic RMW（如 `lock xadd`）**强制把 line 拉到 Modified 状态**，没有任何 store buffer 批量化空间，是伪共享的最坏情况。",
+        "tip": "先做 padding 消除伪共享，再根据正确性需要决定是否加 atomic。顺序反了，只加 atomic 会让吞吐更差。"
+      },
+      {
+        "title": "三类经典反例：AI Infra 高发场景",
+        "body": "以下三类数据结构在 AI Infra 代码中出现频率最高：\n\n**反例 1：worker stats 紧凑数组**\n`struct WorkerStats { uint64_t samples; uint64_t bytes; uint64_t errors; };` 共 24 字节。`std::vector<WorkerStats>(N)` 连续布局，2–3 个 worker 的 stats 落同一 64B line。每个 worker 写自己的字段都会使邻居 line 失效。\n\n**反例 2：ring buffer 的 head 和 tail 紧邻**\n生产者写 `head`，消费者写 `tail`，两者各 8 字节紧挨放置，必然在同一 64B line。无锁 SPSC queue 的所有性能优势被这两个字段抵消。\n\n**反例 3：原子计数器紧凑数组**\n`std::array<std::atomic<uint64_t>, 64>` 每个 8 字节，8 个 counter 落同一 line。即使每个线程只操作「自己的」下标，相邻下标的线程仍共享同一 line。",
+        "tip": "ring buffer head/tail 的伪共享极为经典——folly 的 `ProducerConsumerQueue`、Linux kernel 的 `kfifo` 都显式给 head 和 tail 各自 padding 到独立 line。"
+      },
+      {
+        "title": "检测：perf c2c 与 HITM 信号",
+        "body": "伪共享没有专属的「是/否」开关，必须从多个信号交叉确认。\n\n**最直接的信号：HITM（Hit Modified）**\n本核访问 cache line 时命中，但发现该 line 在远端核心处于 Modified 状态，必须先把数据从远端取回。HITM 集中在少数地址，几乎一定是真/伪共享。\n\n**工具：`perf c2c`**\n```\nperf c2c record -F 4000 -ag -- sleep 30\nperf c2c report --stdio | head -120\n```\n关键字段：`Cacheline`（物理 line 地址）、`Tot-Hitm`（占比）、`Symbol + Offset`（定位具体字段）。\n**单条 line HITM 占全机 5% 以上**，就值得深挖。\n\n**间接信号组合**：CPU 利用率高 + IPC < 1.0 + cache-miss-rate > 20% + 加线程吞吐反降 → 进入伪共享排查流程。",
+        "tip": "throughput vs cores 曲线是最便宜的初筛：从 1 扫到 32 线程，如果曲线过拐点反降，IPC 同时下降，基本锁定伪共享方向。"
+      },
+      {
+        "title": "修复：padding、alignas、per-thread 累加",
+        "body": "定位到 hot line 后，修复有三个层次：\n\n**层次 1：结构体对齐 + 尾部 padding（最小修复）**\n给高频写结构体加 `alignas(64)` 并手动填充到整数倍 line 大小，使每个对象独占一条 line。加 `static_assert(sizeof(T) == 64)` 防止后续添加字段悄悄破坏对齐。\n\n**层次 2：thread-local 累加 + 周期 flush**\n每个线程本地累加，每 32–256 次批量写入全局 atomic。全局 RMW 频率降低 N 倍，cache line 迁移随之减少。代价是监控指标有滞后（最多滞后 N 个 sample）。\n\n**层次 3：分片计数（sharded counter）**\n每个 CPU 维护一个独立 counter，读时求和。适合写多读少场景（监控指标、请求计数）。Linux kernel 的 `percpu_counter`、folly 的 sharded counter 都是这个套路。\n\n各语言推荐写法：C++ 用 `alignas(64)` + 手动 padding；Rust 用 `crossbeam_utils::CachePadded<T>`；Java 用 `@Contended`；Linux kernel 用 `____cacheline_aligned_in_smp`。",
+        "tip": "padding 把 16B 撑到 64B 是 4 倍内存放大。只对「高频写、跨核竞争」的小对象 padding；对只读、低频写、已经远超 line 的大对象不要无脑加。"
+      },
+      {
+        "title": "NUMA 叠加：跨 socket 让代价放大 5–10 倍",
+        "body": "双路服务器（NUMA）场景下，伪共享的代价远不止跨核的 50 cycles——跨 socket 一次 cache line 迁移需走 UPI/Infinity Fabric 互连，代价约 150–400 cycles；若远端 line 已被驱逐回 DRAM，可达 600 cycles 以上。\n\n若 DataLoader 16 个 worker 分布在两个 socket，每秒发生 1 亿次 counter 更新，跨 socket 伪共享能吃掉数百毫秒 wall time，足以让 GPU 周期性空转。\n\n**修复优先级**：① 先 padding 消除伪共享本身；② 再用 `numactl --cpunodebind=N --membind=N` 把 worker 钉到同一 socket；③ 最后考虑每 socket 一份本地结构 + 周期同步。\n\n容器场景额外注意：K8s 的 `cpuset` 如果跨 socket 分配，或 CPU 配额是分数（如 `cpus: 2.5`）导致线程漂移，都会把伪共享代价放大，甚至在没有代码 bug 的情况下产生 noisy neighbor 效应。",
+        "tip": "用 `numactl --hardware` 查看 NUMA 拓扑，用 `numastat -p <pid>` 看进程的远端内存访问比例。跨 socket 的 Remote HITM 比同 socket 贵 3–10 倍。"
+      },
+      {
+        "title": "AI Infra 实战：Multi-LoRA counter 事故复盘",
+        "body": "**场景**：32 个 LoRA adapter 的推理服务，每路请求随机命中某 adapter，需要统计 `req_count`、`tok_count`、`latency_sum_ns` 用于 billing。\n\n**初始代码**：`struct AdapterStats { atomic<u64> req; atomic<u64> tok; atomic<u64> lat; };` 共 24 字节，连续数组 32 个 = 768 字节 = 12 条 line。2–3 个 adapter 共享一条 line。\n\n**现象**：32 并发吞吐仅达理想值 46%，效率随并发数下降明显。`perf c2c` 报告该数组 HITM 占全机 31%。\n\n**修复**：① `alignas(64)` + 尾部 `char _pad[64 - 3*8]` 让每个 adapter 独占一条 line；② 推理线程本地累加，每 64 token flush 一次全局 atomic。\n\n**结果**：32 并发 throughput 提升 30.5%，p99 从 88ms 降至 71ms，HITM 占比从 31% 降到 3%，内存从 768B 涨到 2KB（可忽略），监控滞后最多 0.8s（可接受）。",
+        "reveal": {
+          "q": "为什么给 AdapterStats 加了 alignas(64) 之后，还需要加 thread-local 累加？两者分别解决什么问题？",
+          "a": "alignas(64) 解决「伪共享」——让每个 adapter 的 stats 独占一条 cache line，消除不同 adapter 之间的 line 争夺。thread-local 累加解决「写频率过高」——即使每个 adapter 独占一条 line，32 路并发仍会高频争夺同一个 adapter 的 line（真共享）。两者组合：padding 消除跨 adapter 的伪共享，thread-local 累加减少同 adapter 的真共享写频率，共同把全局 atomic RMW 频率降低 64 倍。"
+        }
+      },
+      {
+        "title": "值班 SOP：30 分钟内从告警到定位",
+        "body": "**触发条件**（满足任一进入此流程）：加 worker 后吞吐不升反降；CPU 全核 > 80% 但业务进展慢；p99 在并发提升后恶化；GPU utilization 周期性 < 70% 但磁盘/网络未饱和。\n\n**排查步骤**：\n1. `perf stat` 看 IPC 和 cache-miss-rate（IPC < 1.0 且 miss-rate > 20% → 继续）\n2. `perf c2c record/report` 看单条 line HITM 是否 > 5%（是 → 伪共享/真共享）\n3. 看 `Symbol + Offset`：同结构体不同字段 → 伪共享；同一字段 → 真共享\n4. 伪共享：`alignas(64)` + 尾部 padding + `static_assert`\n5. 高频 atomic：加 thread-local 累加（周期 32–256）\n6. 跨 socket：叠加 `numactl --cpunodebind=N --membind=N`\n7. 复测：throughput 曲线 + `perf c2c` HITM 应降至 < 10%，IPC 回升 > 1.5\n\n**回滚条件**：内存增长 > 100MB 且 throughput 提升 < 10% → 回滚 padding，改 thread-local 方案。",
+        "tip": "把 alignas/padding 和复测数据写入 PR description，防止后续重构者无意删除 padding，导致性能退化而无人察觉。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "一条 64B cache line 上放了 8 个相邻的 `uint64_t` counter（下标 0–7），8 个线程各自只写自己的下标。从 MESI 协议角度看，会发生什么？",
+        "options": [
+          "每个线程只写 8 字节，其他 7 个 counter 不受影响",
+          "硬件检测到写的是不同字节，自动按字节粒度维护一致性",
+          "任意一个线程写自己的 counter 都会导致整条 line 在所有线程间迁移",
+          "只有使用 atomic 的线程才会触发 cache line 迁移"
+        ],
+        "answer": 2,
+        "explain": "MESI 协议以 cache line（64B）为最小粒度维护一致性。任何核心写 line 上任意字节都必须先获取 Modified 权，触发 Invalidate 广播，使其他持有该 line 的核心副本失效。硬件无法感知「只写了 8 字节中的哪 8 字节」，这正是伪共享的根源。"
+      },
+      {
+        "type": "judge",
+        "prompt": "给伪共享问题中的 counter 数组加上 `std::atomic`，可以同时解决正确性和性能问题。",
+        "answer": false,
+        "explain": "atomic 解决的是 data race（正确性问题），对伪共享（性能问题）无效甚至更糟。atomic RMW（如 `lock xadd`）强制把 cache line 拉到 Modified 状态，没有 store buffer 批量化的空间，反而让 cache line bouncing 更频繁。正确做法是先用 padding 消除伪共享，再按需决定是否加 atomic。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个场景是「伪共享」而非「真共享」？",
+        "options": [
+          "8 个线程并发对同一个 `std::atomic<int>` 做 fetch_add",
+          "生产者和消费者共同读写一个全局队列的 size 字段",
+          "ring buffer 的 head（生产者写）和 tail（消费者写）紧邻放在同一结构体，各自 8 字节",
+          "多线程共享同一个互斥锁保护的链表头指针"
+        ],
+        "answer": 2,
+        "explain": "head 和 tail 是逻辑上独立的字段（生产者只写 head，消费者只写 tail），程序语义上不需要共享。但紧邻放置导致两者落在同一 64B cache line 上，硬件必须按 line 维护一致性，形成伪共享。其他选项都是多核在操作同一个逻辑变量，属于真共享。"
+      },
+      {
+        "type": "input",
+        "prompt": "`perf c2c report` 输出中，用于判断是否存在伪共享的最直接硬件事件叫什么？（英文缩写即可）",
+        "accept": [
+          "HITM",
+          "hitm",
+          "Hit Modified"
+        ],
+        "explain": "HITM（Hit Modified）表示本核访问某 cache line 时，发现该 line 在远端核心处于 Modified 状态，必须先把数据取回。大量 HITM 集中在少数地址是伪共享/真共享的强信号。单条 line HITM 占全机 5% 以上值得深挖。"
+      },
+      {
+        "type": "match",
+        "prompt": "将伪共享修复手段与其主要解决的问题匹配：",
+        "left": [
+          "alignas(64) + 尾部 padding",
+          "thread-local 累加 + 周期 flush",
+          "numactl --cpunodebind + --membind",
+          "crossbeam_utils::CachePadded<T>"
+        ],
+        "right": [
+          "Rust 语言中将变量独占一条 cache line 的标准方式",
+          "消除同 socket 内不同对象共享同一 cache line",
+          "降低全局 atomic RMW 写频率，减少 line 迁移次数",
+          "减少跨 socket NUMA 远端内存访问代价"
+        ],
+        "explain": "alignas(64)+padding 让每个对象独占一条 line，消除同 socket 内的伪共享；thread-local 累加降低写频率；numactl 把进程绑到同一 NUMA node；CachePadded 是 Rust 的标准 padding 工具。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在双路 NUMA 服务器上，如果 16 个 DataLoader worker 分布在两个 socket，且 stats 数组存在伪共享，跨 socket cache line 迁移的代价与同 socket 跨核迁移的代价基本相当。",
+        "answer": false,
+        "explain": "跨 socket 的 cache line 迁移需要经过 UPI（Intel）或 Infinity Fabric（AMD）互连，代价约 150–400 cycles（~50–130ns）；同 socket 跨核约 30–80 cycles（~10–26ns）。跨 NUMA 叠加远端 DRAM 访问可达 600 cycles 以上，是同 socket 的 5–10 倍，不是「基本相当」。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某推理服务将 `struct AdapterStats { atomic<u64> req; atomic<u64> tok; atomic<u64> lat; }` 的 32 个实例放在连续数组中（每个 24 字节）。修复伪共享最小且正确的 C++ 改法是：",
+        "options": [
+          "把 3 个字段改成 volatile，避免编译器缓存",
+          "给结构体加 alignas(64) 并在字段后补充 char _pad[40] 使 sizeof == 64",
+          "把 std::array 改成 std::list，让每个元素单独分配到不同页",
+          "把 3 个 atomic 改成普通 uint64_t，用全局锁保护"
+        ],
+        "answer": 1,
+        "explain": "alignas(64) 保证每个 AdapterStats 对象的起始地址对齐到 64 字节边界，尾部 char _pad[40] 把对象大小补至 64 字节，使每个 adapter 独占一条 cache line。volatile 不影响 cache 一致性；std::list 会有大量小分配和指针追踪开销；换全局锁会引入锁竞争，性能更差。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对 1000 个 tenant 各维护 req_count，写频率 10 万次/秒（所有 tenant 总和），读频率 1 次/秒（监控）。以下哪种方案在「内存占用」和「写吞吐」之间取得最合理的平衡？",
+        "options": [
+          "1000 个 alignas(64) 结构体紧凑数组，共 64KB，每次写直接原子加",
+          "thread_local 为每个线程维护 1000 个本地计数，每 100ms flush 一次到全局原子变量",
+          "每次写都加全局互斥锁，保证精确实时性",
+          "只在监控拉取时才统计，平时不维护任何计数"
+        ],
+        "answer": 1,
+        "explain": "thread-local 累加 + 周期 flush 是写多读少场景的经典解法：写路径完全 thread-local，无跨核竞争；flush 周期 100ms 对 1 次/秒的监控已足够精确；内存占用为 线程数 × 1000 × 8 字节，通常几十 KB 可接受。alignas(64) 方案对 1000 个对象每个 64B 共 64KB 可接受，但高并发时仍有 atomic 竞争；全局锁方案写性能最差；按需统计无法支持实时监控。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 K8s 中将 pod 的 cpuset 配置为跨两个 NUMA socket 的 CPU（如 0,1,2,3,32,33,34,35），即使代码本身已经用 alignas(64) 消除了伪共享，仍可能出现性能问题。",
+        "answer": true,
+        "explain": "cpuset 跨 socket 会导致部分 worker 在 socket B 上运行，但访问 socket A 的内存（若内存绑定到 node 0），产生跨 NUMA 远端内存访问。即使伪共享已消除，远端 DRAM 访问本身就比本地慢 2–3 倍。此外，不连续的 CPU 分配可能导致两个逻辑上独立的线程仍然竞争跨 socket 的 cache line，放大性能损耗。"
+      }
+    ]
+  }
+]

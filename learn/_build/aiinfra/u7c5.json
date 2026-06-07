@@ -1,0 +1,119 @@
+[
+  {
+    "id": "u7c5",
+    "title": "容器运行时故障排除",
+    "subtitle": "分层证据链：从症状到根因的系统方法",
+    "intro": [
+      {
+        "title": "排障的第一原则：先定层，再找组件",
+        "body": "AI 容器运行时故障的本质是**多层系统契约被破坏**。一个「GPU 看不见」的症状可能来自十个不同的层：Pod 未申请 `nvidia.com/gpu`、Scheduler 没把 Pod 放到 GPU 节点、Device Plugin 未注册、RuntimeClass 错误、NVIDIA runtime hook 未执行、容器无 `/dev/nvidia*`、宿主机 Driver 异常、MIG UUID 映射错误、`CUDA_VISIBLE_DEVICES` 被覆盖、框架 wheel 与 CUDA/GPU arch 不兼容。\n\n同样，「NCCL timeout」可能来自 RDMA 设备未注入、verbs 不可用、memlock 太小、NCCL 选错 NIC、RoCE GID/MTU 不一致、某 rank 已经 OOM 退出……\n\n**第一原则**：先定位层，再定位组件；先收证据，再做解释；先比较成功和失败样本，再改配置。",
+        "tip": "只看应用最后一行日志很容易把平台问题误判为代码问题。排障要从 Pod event 开始，逐层往下，不要跳步骤。"
+      },
+      {
+        "title": "容器启动控制路径与每层的关键证据",
+        "body": "完整启动控制路径：`kubectl 创建 Pod → scheduler 选节点 → kubelet 看到 Pod → image service 拉镜像 → device manager 请求 Device Plugin 分配设备 → kubelet 生成 CRI 请求 → containerd 准备 snapshot 和 OCI spec → NVIDIA runtime hook 注入设备和库 → runc 创建 namespaces/cgroups/mounts → 进程启动 → 框架初始化 CUDA/NCCL`\n\n每个阶段的关键证据：\n\n| 阶段 | 关键证据 |\n|---|---|\n| API/调度 | Pod spec、events、nodeName、资源请求、RuntimeClass |\n| 镜像拉取 | `kubectl describe pod` events、containerd 日志、registry audit |\n| 设备分配 | node allocatable、Device Plugin 日志、allocated resources |\n| runtime hook | containerd runtime 配置、NVIDIA toolkit 日志、容器内 device nodes |\n| 宿主机 Driver | 节点 `nvidia-smi`、driver version、MIG 状态 |\n| 容器内运行 | `/dev/nvidia*`、`/dev/infiniband`、env、mount、`ldconfig` |\n| 框架初始化 | `torch.cuda.is_available()`、`ldd`、`strace`、应用日志 |\n| 通信 | `ibv_devinfo`、NCCL debug、rank 日志、拓扑 |"
+      },
+      {
+        "title": "GPU 看不见 vs 库加载失败：两类高频问题",
+        "body": "**GPU 看不见**：优先按层检查：→ 确认 Pod 请求了 `nvidia.com/gpu` → 确认节点 allocatable 包含该资源 → 确认 Pod 调度到 GPU 节点 → 确认 RuntimeClass 正确 → 宿主机 `nvidia-smi` → 容器内 `ls -l /dev/nvidia*` → `env | grep NVIDIA` → `torch.cuda.is_available()`。\n\n`nvidia-smi` 成功但 torch 失败：说明设备注入正确，问题在镜像 CUDA/框架兼容层（回到 18a 矩阵）。\n\n**库加载失败**：常见报错与根因：\n\n| 报错 | 更可能的层 | 处理 |\n|---|---|---|\n| `libcuda.so.1` 缺失 | runtime hook/Driver library mount | 修 runtime hook，不要把宿主机 Driver 硬塞进镜像 |\n| `libcudart.so` 缺失 | 镜像 CUDA userspace | 换正确 runtime 基础镜像或补 runtime 包 |\n| `libnccl.so` 缺失 | 镜像依赖/路径 | 固定 NCCL 包，修 `LD_LIBRARY_PATH` 或 ldconfig |\n| `undefined symbol` | ABI 不匹配 | 在目标矩阵内重建 extension |\n| `GLIBCXX not found` | C++ runtime | 升级基础镜像或降低构建基线 |\n\n**关键工具**：`ldd path/to/module.so`（看哪些库 missing 或解析到异常路径）、`ldconfig -p | grep cuda`（看动态链接缓存）、`strace -f -e file python -c 'import ...'`（看进程实际查找了哪些路径）。不要用追加 `LD_LIBRARY_PATH` 掩盖问题。"
+      },
+      {
+        "title": "NCCL/RDMA 故障：verbs 优先，再看 NCCL",
+        "body": "NCCL timeout 不是根因，是症状。排障必须先证明底层事实：\n\n**最小测试顺序**：\n1. `ls -l /dev/infiniband`：RDMA 设备是否注入容器\n2. `ulimit -l`：memlock 是否足够\n3. `ibv_devinfo`：verbs userspace 是否可用\n4. `nvidia-smi topo -m`：GPU/NIC 拓扑是否满足\n5. `NCCL_DEBUG=INFO` 运行最小 all-reduce 测试：NCCL 选了哪个接口\n6. 每个 rank 的独立日志：是否有 rank 早退出\n\n**不要在 verbs 不可用时调 NCCL 参数**。先证明底层设备和库存在，再优化 NCCL。\n\n| 根因 | 证据 | 处理 |\n|---|---|---|\n| RDMA 设备未注入 | 容器无 `/dev/infiniband` | 修 Pod device request、RDMA Device Plugin |\n| memlock 过小 | `ulimit -l` 太小 | 添加 `IPC_LOCK` capability |\n| NCCL 选错网卡 | NCCL debug 显示 socket/错误 NIC | 设置 `NCCL_SOCKET_IFNAME` |\n| 某 rank 早失败 | rank 日志先 OOM | 先修 rank 应用错误，再看通信 |"
+      },
+      {
+        "title": "节点差异 SOP 与冷启动拆解",
+        "body": "**节点差异排障**：「同一镜像在 A 节点成功、B 节点失败」最快路径是并排对比。对比项包括：image digest/imageID、OS/kernel、containerd/runc 版本、NVIDIA Driver 版本、NVIDIA Container Toolkit 版本、Device Plugin 版本、GPU 型号/MIG 状态、RDMA/NVMe 设备、RuntimeClass、`/dev/nvidia*`、torch smoke test。找到差异后只改一项，不要边查边改破坏证据。修复后把节点准入检查更新为自动化测试。\n\n**冷启动拆解**：\n\n| 阶段 | 典型原因 | 优化 |\n|---|---|---|\n| Scheduling | GPU 不足、taint/affinity 过窄 | 容量、队列 |\n| Image pull | 大镜像、缓存未命中 | 预热、mirror、镜像瘦身 |\n| Container create | runtime hook 慢、mount 多 | 修 runtime 配置 |\n| Model download | 对象存储慢、权重太大 | 本地缓存、分片 |\n| Engine build | TensorRT/vLLM 编译 | 预构建 engine |\n| GPU warmup | 首次显存分配 | 显式 warmup |\n| Health probe | startupProbe 太紧 | 调整 startupProbe |\n\n**事故中最有价值的排障原则**：固定 digest（避免 tag 漂移导致排障对象变化）；先 smoke test 缩小范围；临时权限（`privileged`、`hostPID`）调试后必须恢复；修复回写基线，不停留在单个 Pod。",
+        "reveal": {
+          "q": "一个 Pod 请求了 GPU，宿主机 `nvidia-smi` 正常，但容器内没有 `/dev/nvidia*`，`NVIDIA_VISIBLE_DEVICES` 有值。下一步最应该检查什么？",
+          "a": "检查 containerd 的 runtime 配置是否正确注册了 NVIDIA runtime handler，以及 Pod 的 `runtimeClassName` 是否设置为 `nvidia`。`NVIDIA_VISIBLE_DEVICES` 有值说明 Device Plugin 分配了设备，但设备节点未出现说明 NVIDIA Container Toolkit 的 hook（或 CDI 路径）未执行。查看 `journalctl -u containerd` 和 `kubectl describe pod` 中的容器创建事件。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "容器内 `nvidia-smi` 成功但 `torch.cuda.is_available()` 为 False，最可能的根因在哪一层？",
+        "options": [
+          "Device Plugin 未分配设备",
+          "runtime hook 未执行",
+          "镜像 CUDA/框架兼容问题（CUDA userspace 与 Driver/GPU arch 不匹配）",
+          "cgroup v2 BPF 权限未配置"
+        ],
+        "answer": 2,
+        "explain": "`nvidia-smi` 成功说明设备注入正确，Driver 可访问。torch 失败则指向镜像层的 CUDA/框架兼容问题：PyTorch wheel 编译时的 CUDA 版本、cuDNN/NCCL 版本或 GPU compute capability 可能与当前环境不匹配，需回到 18a 兼容矩阵排查。"
+      },
+      {
+        "type": "match",
+        "prompt": "将报错信息与应该优先排查的层对应：",
+        "left": [
+          "`libcuda.so.1: cannot open shared object file`",
+          "`libcudart.so.12: cannot open shared object file`",
+          "`GLIBCXX_3.4.xx not found`",
+          "`undefined symbol` in custom op"
+        ],
+        "right": [
+          "extension 与 torch/CUDA/Python ABI 不一致，需在矩阵内重建",
+          "C++ runtime 版本过旧，构建时 libstdc++ 比运行时新",
+          "镜像 CUDA userspace 缺 runtime 库，基础镜像类型错误",
+          "NVIDIA runtime hook 未注入 Driver userspace library"
+        ],
+        "explain": "`libcuda.so.1` 由 runtime hook 注入，缺失是注入问题；`libcudart.so` 在镜像 CUDA userspace 中，缺失是基础镜像问题；`GLIBCXX` 是 C++ ABI 问题；`undefined symbol` 是 extension ABI 不一致。"
+      },
+      {
+        "type": "judge",
+        "prompt": "NCCL timeout 时，最有效的第一步是调整 NCCL_* 环境变量参数。",
+        "answer": false,
+        "explain": "NCCL timeout 是症状不是根因。必须先证明底层事实：RDMA 设备是否注入容器、verbs 是否可用（`ibv_devinfo`）、memlock 是否足够、所有 rank 是否都启动了。在 verbs 不可用时调 NCCL 参数完全无效，只会浪费时间。"
+      },
+      {
+        "type": "choice",
+        "prompt": "「同一镜像在 A 节点成功、B 节点失败」的最快排障路径是什么？",
+        "options": [
+          "在失败节点 B 上反复试错调整参数",
+          "重新构建镜像再试",
+          "用同一组命令并排对比成功节点 A 和失败节点 B 的宿主机层、运行时层和框架层信息",
+          "给失败节点 Pod 加 privileged: true"
+        ],
+        "answer": 2,
+        "explain": "节点差异问题最快路径是「并排对比」：对两个节点执行同一组命令，记录 Driver 版本、NVIDIA Container Toolkit 版本、containerd 版本、GPU 型号/MIG 状态等，找出差异项。边查边改会破坏证据，应找到差异后只改一项并复测。"
+      },
+      {
+        "type": "input",
+        "prompt": "排障一个动态库问题时，想知道进程在运行时实际打开了哪些文件路径，应该使用哪个命令？（填写命令名）",
+        "accept": ["strace", "strace -e file"],
+        "explain": "用 `strace -f -e file python -c 'import ...'` 可以追踪进程实际尝试打开的所有文件路径，包括动态库查找失败的路径。这比只看 `ldd` 更能发现运行时动态链接器的实际行为。"
+      },
+      {
+        "type": "choice",
+        "prompt": "冷启动 12 分钟，其中镜像拉取 2 分钟，剩余 10 分钟不明。下一步应该怎么做？",
+        "options": [
+          "继续优化镜像体积",
+          "把剩余 10 分钟拆成容器创建、模型下载、engine build、GPU warmup、健康检查等阶段分别观测",
+          "给 Pod 增加更多 CPU limit",
+          "改用更小的基础镜像"
+        ],
+        "answer": 1,
+        "explain": "冷启动优化必须先量化各阶段。镜像拉取只是其中一段，模型下载、engine build（TensorRT/vLLM 编译）、GPU warmup 和健康检查探针都可能是瓶颈。要先拆时间线才能有针对性地优化。"
+      },
+      {
+        "type": "judge",
+        "prompt": "调试完 GPU 问题后，应该保留 `privileged: true` 以防未来再出问题。",
+        "answer": false,
+        "explain": "`privileged: true` 是高权限配置，基本绕开容器隔离，在生产工作负载中持续保留会扩大攻击面。调试完成后必须恢复最小权限配置，并把发现的最小必要设备/capability 写入 Pod spec 和安全基线。"
+      },
+      {
+        "type": "choice",
+        "prompt": "排障时发现根因是节点的 NVIDIA Container Toolkit 版本过旧，修复完成后最重要的后续动作是什么？",
+        "options": [
+          "只重启该节点上的 Pod",
+          "删除该节点上的所有容器重建",
+          "把版本要求写入节点准入检查，防止类似漂移再次发生",
+          "发邮件通知相关工程师"
+        ],
+        "answer": 2,
+        "explain": "单个 Pod 的修复只是临时措施。正确的做法是把发现写回平台基线：将 NVIDIA Container Toolkit 的最低版本要求加入节点准入检查（如节点加入资源池前的自动化验证），防止版本漂移导致同类问题在其他节点或未来重现。"
+      }
+    ]
+  }
+]

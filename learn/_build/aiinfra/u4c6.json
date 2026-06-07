@@ -1,0 +1,119 @@
+[
+  {
+    "id": "u4c6",
+    "title": "对齐训练与后训练基础设施",
+    "subtitle": "SFT、RLHF/PPO、DPO、GRPO 的系统形态与多模型版本治理",
+    "intro": [
+      {
+        "title": "后训练的不可化简问题",
+        "body": "预训练把通用能力写进参数，后训练把能力塑造成可交付行为。它的核心矛盾是：**偏好信号不在原始语料里**，来自示范数据、chosen/rejected 偏好对、Reward Model、规则 reward、LLM judge、红队集和线上策略。\n\nPPO/RLHF 不是「换一个 loss 的训练脚本」，而是一个同时运行**推理、打分、训练、评测、checkpoint 和发布门禁**的多模型系统。系统中心是闭环控制，而不是高吞吐训练 step。\n\n三条并行路径：\n- **生成路径**：actor/policy 对 prompt 生成 response（rollout）\n- **反馈路径**：reference 计算 KL 锚点，RM 打分，critic 估 advantage\n- **更新路径**：training engine 消费带 reward 的样本更新 actor，再同步权重回 rollout engine\n\n**闭环版本一致性是核心**：actor checkpoint 是 A，reference artifact 是 B，RM prompt template 是 C，rollout buffer 却来自旧 actor——这种系统能继续跑，但曲线和发布结论都不可信。"
+      },
+      {
+        "title": "各后训练形态的系统特征",
+        "body": "判断一个作业是「SFT 类」还是「RL 类」的最简标准：**是否需要当前 policy 生成新 response**。\n\n| 形态 | 系统中心 | 模型数 | 主要瓶颈 | 典型 checkpoint |\n|---|---|---|---|---|\n| SFT | 离线监督训练 | 1 | 数据质量、显存 | model + tokenizer + chat_template + data_version |\n| DPO | 离线偏好优化 | policy + frozen reference | reference 一致性、beta | policy + frozen ref artifact hash |\n| RM 训练 | pairwise/ranking 训练 | 1 | 标注噪声、长度偏差 | reward model + reward head + label schema |\n| PPO/RLHF | 在线 rollout + RL update | actor + reference + reward + critic | rollout 吞吐、RM 延迟、KL 稳定性 | 多模型 manifest + buffer + controller state |\n| GRPO | 在线 group rollout + 相对 update | actor + reference + reward/rule | rollout 大 batch、reward 方差 | actor + reference hash + group sample state |"
+      },
+      {
+        "title": "PPO 多模型版本 Manifest",
+        "body": "PPO checkpoint 必须是一个**事务 manifest**，而不是「actor.pt + critic.pt + 一堆外部路径」。\n\n最低要求的 manifest 字段：\n- `actor`：weight_version、optimizer、scheduler、distributed_state（strategy/shards）\n- `critic`：同上\n- `reference`：artifact hash + frozen=true\n- `reward_model`：artifact hash + prompt_template hash\n- `tokenizer`：artifact + chat_template hash\n- `buffer`：policy_version、accepted_policy_versions\n- `controllers`：kl_coef、reward_norm version\n- `rng`、`data cursor`\n- `eval`：last_passed_step、eval suite version\n\n**阶段关系要严格**：`after_ppo_update` 时 actor 已更新到 step 820，但 buffer 只能包含 step 819 的 actor 生成样本，因为这些样本是在 update 前 rollout 的。rollout 权重同步到 820 后，新 prompt 才能写 `policy_version=actor_820_hash`。\n\n恢复时必须同时校验 actor、reference、RM、critic、tokenizer、prompt template、buffer policy_version、optimizer、scheduler 的版本关系。只恢复 actor 权重而丢掉 KL controller 或 buffer policy_version，会让 advantage、KL 和 reward 分布不再对应同一轮 rollout。",
+        "tip": "RM 版本固定非常关键：不同 RM artifact hash 会产生不同的 reward 分布。一个 RM worker rolling update 到新版本、另一半还在旧版本，会让同一批 rollout 样本被两个模板打分，导致 reward 方差异常升高。"
+      },
+      {
+        "title": "Buffer 状态机：PPO 的数据契约",
+        "body": "replay/buffer 不是 append-only 表，而是 PPO 控制 loop 的状态机：\n\n`ReservedPrompt → RolloutInFlight → Generated → ScoringPending → Ready → TrainerLeased → ConsumedAck`\n\n关键约束：\n1. **版本绑定**：每个 sample 在 `ReservedPrompt` 时就绑定 actor_hash、RM_hash、template_hash、decoding_config_hash\n2. **trainer lease 谓词**：`next_ready_batch(actor_hash, rm_hash, template_hash, decoding_config_hash, count)`——不能跨版本混 batch\n3. **actor too old expire**：`Ready` 样本来自过旧 actor 时必须 expire，PPO on-policy 假设被破坏\n4. **fail closed**：rollout/scoring 返回的 hash 与 reservation 不一致时，sample 进入 quarantine，不能「修字段」后继续训练\n5. **RM retry 只能在同一 hash 下**：换 RM hash = 换训练目标，必须开新 run\n\n`old_logprobs_response` 必须来自 rollout 时的 actor，不能在 update 前临时重算——它是 PPO ratio 的分母。"
+      },
+      {
+        "title": "DPO 的平台复杂度：reference cache 与长度偏差",
+        "body": "DPO 不需要在线 rollout，对平台最友好——但不代表可以省掉数据契约和 logprob 版本治理。\n\n**Reference logprob cache**：DPO 每个 step 用当前 policy 重算 chosen/rejected logprob，但 reference logprob 只需计算一次并 cache。cache key 必须覆盖 `reference_hash:tokenizer_hash:chat_template_hash:truncation_policy_hash:pair_id:chosen_hash:rejected_hash`。reference、tokenizer、template 任一 hash 变化，旧 cache 必须 stale invalidated，不能「用到本 epoch 结束」。\n\n**长度偏差**是 DPO 最大的数据质量风险：若 chosen 系统性更长，`sum_logprob` margin 会把长度差带进训练目标，最终 actor 会学会变长而不是变好。平台必须按 chosen/rejected token length bucket 监控 margin 和 win-rate，并做 beta sweep。\n\n**chosen/rejected 完整性检查**：pair 的 prompt_hash 必须一致；tokenization 后 mask 长度和 logprob 长度必须匹配；两者须来自同一 prompt group。",
+        "tip": "beta 太小会弱化偏好信号，太大会把 noisy pair 和长度偏置放大。平台必须记录 beta 值作为 training manifest 的一部分。"
+      },
+      {
+        "title": "GRPO vs PPO：权衡比较",
+        "body": "GRPO 的核心思想：去掉 critic，用**同一 prompt 的多条 response 组内 reward 均值**作为 baseline。\n\n| 维度 | PPO | GRPO |\n|---|---|---|\n| 模型数量 | actor + reference + RM + critic | actor + reference + reward/rule |\n| 组内样本 | 1 个 response/prompt | G 个 response/prompt（典型 G=8-32）|\n| Baseline | critic value 估计 | 同 group reward 均值 |\n| 主要瓶颈 | RM 延迟、critic 稳定性 | rollout 吞吐（G 倍扩大）|\n| checkpoint 简化 | 无 | 去掉 critic weight/optimizer/checkpoint |\n| 平台复杂度转移 | critic 训练 | rollout 吞吐、组内样本聚合 |\n\n**GRPO 的 batch 不能把 group 当普通样本 shuffle**：每个 group 必须保持完整性（同一 prompt 的 G 条 response 必须在同一 minibatch 内），otherwise advantage 计算无意义。\n\n**数学 reward（规则 reward）**是 GRPO 常用场景：数学/代码的正确性可用规则判断，不依赖 RM，简化系统复杂度但要求 reward 函数确定性强、无歧义。",
+        "reveal": {
+          "q": "为什么 PPO 的 old_logprobs_response 必须来自 rollout 时的 actor，而不能在 update 前重算？",
+          "a": "old_logprobs_response 是 PPO ratio 的分母：ratio = exp(new_logprob - old_logprob)。如果用 update 后的 actor 重算 old_logprobs，ratio 会偏离真实的策略变化幅度，clip 机制失效，PPO 的 on-policy 保证被破坏。rollout 时记录的 logprob 是固定的历史快照，必须与 response 一起保存在 buffer 中。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "判断一个后训练作业是「SFT 类」还是「RL 类」的核心依据是什么？",
+        "options": [
+          "是否使用 PPO loss",
+          "是否有 Reward Model",
+          "是否需要当前 policy 生成新 response（在线 rollout）",
+          "是否有 KL 散度约束"
+        ],
+        "answer": 2,
+        "explain": "判断依据是系统形态：若训练过程不需要当前 policy 生成新 response，大概率是 SFT/DPO 类离线训练；若需要当前 policy 生成并被打分，就是 RL 系统，必须按推理和训练混合平台设计，处理 rollout engine、buffer、多模型版本等问题。"
+      },
+      {
+        "type": "judge",
+        "prompt": "PPO 的 `after_ppo_update` 阶段，buffer 可以立即包含 step 820 actor 生成的样本，因为 actor 已经更新到 820。",
+        "answer": false,
+        "explain": "rollout 必须等 actor 权重同步完成后才能使用新版本。`after_ppo_update` 时 actor 已更新到 820，但 rollout engine 仍在使用 819 的权重。必须等 rollout_weight_sync（清理旧 KV cache，加载 820 hash，校验后）完成，新 prompt 才能写 policy_version=actor_820_hash。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 PPO buffer 状态与其含义匹配",
+        "left": ["ReservedPrompt", "ScoringPending", "Ready", "TrainerLeased"],
+        "right": [
+          "prompt cursor 已预留，actor/RM/template/decoding 版本已绑定，等待 rollout",
+          "response 完整，等待 reference logprob、RM 分数、critic values 计算完成",
+          "所有字段齐全，可被 trainer 按版本谓词 lease",
+          "trainer 持有 lease_id，正在用于 PPO minibatch update"
+        ],
+        "explain": "buffer 状态机按顺序推进，每个状态有严格的进入和退出条件。版本绑定在 ReservedPrompt 时就固定，后续各阶段不能修改 actor/RM/template hash。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DPO reference logprob cache 的 cache key 不需要包含哪个字段？",
+        "options": [
+          "reference_hash",
+          "tokenizer_hash",
+          "pair_id（具体的 chosen/rejected 对）",
+          "当前 policy 的 weight_version"
+        ],
+        "answer": 3,
+        "explain": "reference logprob 只取决于 reference 模型、tokenizer、template、truncation policy 和输入数据，与当前 policy 权重无关。cache key 包含这些固定因子即可。policy weight 每步都在变，不能放进 ref cache key，否则 cache 每步都失效。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GRPO 去掉了 critic，因此比 PPO 更适合需要稳定 value 估计的复杂多步推理任务。",
+        "answer": false,
+        "explain": "GRPO 用同 group 的 reward 均值作 baseline，简化了系统但也失去了 critic 对 value 的精确估计。对于复杂多步推理（如代码执行、多轮对话），critic 的 value 估计可以显著降低 advantage 方差，提高训练效率。GRPO 更适合 reward 明确、同 prompt 可生成多条独立 response 的场景（如数学、代码正确性判断）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PPO 训练中，RM worker 对同一批 rollout 样本用了两个不同的 template hash 打分，最合适的处理方式是？",
+        "options": [
+          "取两个 template 打分的平均值作为 final reward",
+          "用 hash 较新的 template 分数覆盖旧版本分数",
+          "将 template hash 不一致的样本标记为 quarantine，不进入训练",
+          "记录日志后继续训练，下次更新时修复"
+        ],
+        "answer": 2,
+        "explain": "版本不一致的样本不能进入训练，必须 quarantine。不同 template 产生的 reward 分布不同，混批会让训练目标被污染。RM retry 只能在同一 rm_hash + template_hash 下进行；换 template = 换训练目标，不能「修字段」后继续训练。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧后训练形态与其主要系统瓶颈匹配",
+        "left": ["SFT", "DPO", "PPO/RLHF", "GRPO"],
+        "right": [
+          "数据质量和 chat template 版本一致性，tokenizer 绑定",
+          "reference logprob cache 一致性和长度偏差（length bias）",
+          "rollout 生成吞吐、RM 延迟、actor/ref/RM 多版本协调",
+          "rollout 吞吐（G 倍扩大）和 reward 方差控制"
+        ],
+        "explain": "每种形态的系统瓶颈不同：SFT 是离线数据质量，DPO 是 reference 一致性，PPO 是多模型实时协调，GRPO 是大规模 rollout 和 reward 稳定性。"
+      },
+      {
+        "type": "judge",
+        "prompt": "PPO 中，如果某个 rollout sample 的 old_logprobs_response 是在 update 前用当前 actor 重新计算的，PPO clip 机制仍然能正常工作。",
+        "answer": false,
+        "explain": "old_logprobs_response 必须来自生成 response 时的 actor（rollout 时记录），是 PPO ratio = exp(new_logprob - old_logprob) 的分母。若用 update 后的 actor 重算，ratio 偏离真实策略变化幅度，clip 失效，on-policy 保证被破坏，训练可能发散或 reward hacking。"
+      }
+    ]
+  }
+]

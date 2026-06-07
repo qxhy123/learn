@@ -1,0 +1,657 @@
+[
+ {
+  "title": "BERT原理与实现",
+  "subtitle": "用掩码语言模型实现深层双向编码，确立预训练+微调范式",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "在 BERT 之前，预训练语言模型基本是单向的。GPT 从左到右建模，每个位置只能看到它前面的词；ELMo 虽然号称双向，但其实是把两个独立的单向 LSTM 拼起来，并没有在每一层真正融合左右信息。\n\n问题是：对于「理解类」任务（分类、命名实体识别、问答），只看左边的上下文是一种浪费。判断「我爱北京[?]安门」中间是什么字，右边的「安门」明明能提供强烈的线索。\n\n2018 年 Google 发布的 BERT（Bidirectional Encoder Representations from Transformers）就是来解决这件事的：它要在预训练阶段就让每一层都同时利用左右上下文。本关讲清楚三件事——它为什么能做到真正的双向、靠什么预训练任务做到、以及怎么从零把它实现出来。"
+   },
+   {
+    "title": "双向为什么不能直接训练",
+    "body": "单向语言模型的目标很自然，就是预测下一个词：\n\n$$P(w_1,\\ldots,w_n)=\\prod_{i=1}^{n}P(w_i\\mid w_1,\\ldots,w_{i-1})$$\n\n你可能会想：那双向不就是让模型同时看左右两边、预测中间那个词吗？\n\n这里有个致命问题：如果模型在预测位置 $i$ 时，输入里本来就包含 $w_i$（因为它要「同时看左右」，而 $w_i$ 在序列正中间），那它直接把答案抄过来就行了，任务毫无意义。这就是所谓的「信息泄露」——双向的注意力会让每个词通过若干层之后「看到自己」。\n\nBERT 的解法是：先把要预测的词换成一个特殊占位符 $\\text{[MASK]}$，让模型根据剩下的左右上下文去还原它。这样既保留了双向，又堵住了泄露。这个任务就叫掩码语言模型（Masked Language Model，MLM）。"
+   },
+   {
+    "title": "输入表示：三种嵌入相加",
+    "body": "BERT 的输入不是单纯的词嵌入，而是三种嵌入逐元素相加：\n\n$$\\text{Input}=\\text{TokenEmb}+\\text{SegmentEmb}+\\text{PositionEmb}$$\n\n- **Token Embedding**：词嵌入。BERT 用 WordPiece 分词，词表 30522，把 `playing` 拆成 `play`、`##ing`，`##` 表示这是某个词的后续部分。\n- **Segment Embedding**：BERT 输入可以是一对句子，用 $E_A$ 和 $E_B$ 区分句子 A 和句子 B；单句任务全用 $E_A$。\n- **Position Embedding**：和原始 Transformer 的正弦编码不同，BERT 用可学习的位置嵌入，矩阵形状是 $[512,H]$（最大长度 512）。\n\n三个特殊 token 各有分工：$\\text{[CLS]}$ 永远放在第一位，它经过所有层后的输出当作整句的聚合表示（用于句子级分类）；$\\text{[SEP]}$ 分隔两个句子；$\\text{[MASK]}$ 只在预训练时出现，用来遮盖被选中的词。",
+    "tip": "记住一个张量演算：输入 ids 形状 (B, T)，经过嵌入层后变成 (B, T, H)，BERT-Base 的 H=768。"
+   },
+   {
+    "title": "MLM 的掩码策略：为什么不全用 [MASK]",
+    "body": "MLM 随机选取 15% 的 token 来处理。但被选中的 token 并不是都换成 $\\text{[MASK]}$，而是按比例分三种情况：80% 换成 $\\text{[MASK]}$，10% 换成词表里的随机词，10% 保持原词不变。\n\n为什么要这么折腾？这是本关最该想透的设计。\n\n**为什么不全用 $\\text{[MASK]}$？** 因为微调和推理时输入里根本没有 $\\text{[MASK]}$ 这个 token。如果预训练时模型总是看到大量 $\\text{[MASK]}$，它会学得高度依赖这个标记，到了微调阶段输入分布突变，性能就会下降。这叫「预训练-微调不一致」。\n\n**为什么加 10% 随机替换？** 让模型不能走捷径。如果只有 $\\text{[MASK]}$ 需要预测，模型会学成「看到 $\\text{[MASK]}$ 才认真，其他位置随便」。随机替换迫使它对每一个位置都建立可靠的上下文表示，因为任何一个看起来正常的词都可能是被替换进来的、需要被纠正的。\n\n**为什么保留 10% 原词？** 让模型学会把真实词的表示锚定在它本身的语义附近，而不是只会处理 $\\text{[MASK]}$。",
+    "tip": "最终真正被改动的位置约 15%×90%=13.5%，仍有 15%×10%=1.5% 是原词参与预测。"
+   },
+   {
+    "title": "MLM 的损失函数",
+    "body": "MLM 的损失只在被掩码的位置上计算，没被选中的位置不参与损失：\n\n$$\\mathcal{L}_{\\text{MLM}}=-\\sum_{i\\in\\mathcal{M}}\\log P(w_i\\mid \\tilde{w}_1,\\ldots,\\tilde{w}_n)$$\n\n其中 $\\mathcal{M}$ 是被选中掩码的位置集合，$\\tilde{w}$ 是掩码处理后的序列。\n\n工程上的实现技巧很关键：把没被选中的位置的标签设为 $-100$，再用 `CrossEntropyLoss(ignore_index=-100)`，损失就会自动跳过这些位置。这比手动挑出掩码位置再算损失要干净得多。"
+   },
+   {
+    "title": "PyTorch 实现：构造 MLM 掩码",
+    "body": "下面是从零构造 MLM 掩码的核心逻辑，对照前面 80/10/10 的策略来看。\n\n```python\ndef create_mlm_mask(input_ids, vocab_size, mask_token_id=103, mlm_probability=0.15):\n    labels = input_ids.clone()\n    prob = torch.full(labels.shape, mlm_probability)\n    special = input_ids < 5\n    prob.masked_fill_(special, value=0.0)\n    selected = torch.bernoulli(prob).bool()\n    labels[~selected] = -100\n    masked = input_ids.clone()\n    replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & selected\n    masked[replaced] = mask_token_id\n    rand = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & selected & ~replaced\n    words = torch.randint(vocab_size, labels.shape, dtype=torch.long)\n    masked[rand] = words[rand]\n    return masked, labels\n```\n\n注意 `labels[~selected] = -100` 这一步：未被选中的位置标签置为 $-100$，配合 `ignore_index` 就实现了「只在掩码位置算损失」。`replaced` 占被选中的 80%，`rand` 在剩下 20% 里再取一半（即 10%），剩下 10% 什么都不做、保持原词。"
+   },
+   {
+    "title": "NSP 任务与 [CLS] 的分类",
+    "body": "BERT 还有第二个预训练任务 NSP（Next Sentence Prediction）：给定句子 A 和 B，判断 B 是不是 A 的真实下一句。构造数据时，50% 用真实下一句作正例，50% 从语料里随机采一句作负例。\n\nNSP 用 $\\text{[CLS]}$ 位置的输出向量作句子对的聚合表示，过一个线性层做二分类：\n\n$$\\text{logits}=W_{\\text{NSP}}\\cdot h_{\\text{[CLS]}}+b_{\\text{NSP}}$$\n\n总训练目标是两个损失相加：$\\mathcal{L}=\\mathcal{L}_{\\text{MLM}}+\\mathcal{L}_{\\text{NSP}}$。\n\n不过后续研究对 NSP 颇有质疑。RoBERTa 的消融实验发现，去掉 NSP 反而能提升下游性能。原因是 NSP 太简单了：负例来自不同文档，模型靠主题差异就能轻松判断，根本不需要真正理解句子间的逻辑关系。ALBERT 改用更难的 SOP（句子顺序预测），负例是同一文档里被交换顺序的两句，主题一致，模型必须理解逻辑顺序才能做对。"
+   },
+   {
+    "title": "PyTorch 实现：BERT 主干一层",
+    "body": "BERT 主体就是标准的 Transformer 编码器层堆叠。每层 = 多头自注意力 + FFN，每个子层后接残差和层归一化（BERT 用的是 Post-Norm）。\n\n```python\nclass BertLayer(nn.Module):\n    def __init__(self, hidden_size=768, num_heads=12, intermediate_size=3072, dropout=0.1):\n        super().__init__()\n        self.attention = BertSelfAttention(hidden_size, num_heads, dropout)\n        self.attn_norm = nn.LayerNorm(hidden_size, eps=1e-12)\n        self.ffn = BertFFN(hidden_size, intermediate_size, dropout)\n        self.ffn_norm = nn.LayerNorm(hidden_size, eps=1e-12)\n        self.dropout = nn.Dropout(dropout)\n    def forward(self, hidden, attention_mask=None):\n        attn = self.attention(hidden, attention_mask)\n        hidden = self.attn_norm(hidden + self.dropout(attn))\n        ffn = self.ffn(hidden)\n        hidden = self.ffn_norm(hidden + self.dropout(ffn))\n        return hidden\n```\n\n注意这里的 `attention_mask` 是 padding 掩码（屏蔽补齐位置），而不是因果掩码——BERT 是双向的，每个位置都能看到序列里所有真实 token。padding 位置在加性掩码里被设成 $-10^9$，softmax 后权重趋近 0。"
+   },
+   {
+    "title": "BERT 变体一览",
+    "body": "BERT 之后衍生出一系列改进版，核心思路各不相同：\n\n- **RoBERTa**：去掉 NSP，改用动态掩码（每次喂数据重新生成掩码，而非预处理时固定），并大幅加数据和 batch。结论是「BERT 其实训练不充分」。\n- **ALBERT**：词嵌入因式分解（先映射到小维度 $E$ 再升到 $H$，参数从 $V\\times H$ 降到 $V\\times E+E\\times H$）+ 跨层参数共享（所有层共用一套参数），用 SOP 替代 NSP，参数量大降。\n- **ELECTRA**：换了个全新任务——替换 Token 检测（RTD）。一个小生成器把 $\\text{[MASK]}$ 填成「合理但可能不对」的词，主模型（判别器）对每个位置判断「原始还是被替换」。\n\nELECTRA 的关键优势是信号密度：MLM 只在 15% 的位置算损失，RTD 对所有位置算损失，相同算力下训练更高效。",
+    "tip": "RoBERTa、ALBERT、ELECTRA 三者分别代表三个改进方向：训练更充分、参数更省、信号更密。"
+   },
+   {
+    "title": "易错点与小结",
+    "body": "几个常见的坑：\n\n- **以为被选中的 15% 全换成 $\\text{[MASK]}$**：实际是 80% $\\text{[MASK]}$ + 10% 随机词 + 10% 原词。\n- **以为 BERT 用因果掩码**：BERT 是编码器、双向，只有 padding 掩码，没有下三角因果掩码。\n- **MLM 损失算在所有位置上**：只在被掩码位置算，其余置 $-100$ 忽略。\n- **把 NSP 当成 BERT 不可或缺的部分**：RoBERTa 证明去掉它反而更好。\n- **混淆 Token/Segment/Position 三种嵌入的作用**：分别管「是什么词」「属于哪句」「在第几位」。\n\n小结：BERT 用 MLM 实现了真正的深层双向编码，确立了「大规模无监督预训练 + 少量微调」的范式；它是编码器架构（encoder-only）的代表，擅长理解类任务。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "BERT 实现「真正的深层双向」靠的是哪种预训练任务？",
+    "options": [
+     "从左到右预测下一个词",
+     "掩码语言模型（MLM）：遮盖部分 token 让模型根据左右上下文还原",
+     "把两个单向 LSTM 的输出拼接",
+     "预测句子的情感极性"
+    ],
+    "answer": 1,
+    "explain": "直接训练双向会信息泄露（模型能看到自己）。MLM 先把目标词换成 [MASK]，让模型靠剩下的左右上下文还原，既保留双向又堵住泄露。"
+   },
+   {
+    "type": "choice",
+    "prompt": "MLM 中被选中的 15% token，正确的处理比例是？",
+    "options": [
+     "100% 替换为 [MASK]",
+     "80% [MASK] + 10% 随机词 + 10% 保持原词",
+     "50% [MASK] + 50% 随机词",
+     "90% [MASK] + 10% 删除"
+    ],
+    "answer": 1,
+    "explain": "80/10/10 是 BERT 的关键设计：全用 [MASK] 会造成预训练-微调不一致，随机替换防止走捷径，保留原词让表示锚定真实语义。"
+   },
+   {
+    "type": "judge",
+    "prompt": "BERT 在自注意力中使用因果（下三角）掩码，每个位置只能看到它之前的 token。",
+    "answer": false,
+    "explain": "这是 GPT 的做法。BERT 是双向编码器，只用 padding 掩码屏蔽补齐位置，每个位置都能看到序列里所有真实 token。"
+   },
+   {
+    "type": "judge",
+    "prompt": "MLM 的损失只在被掩码的位置上计算，未被选中的位置通过把标签设为 -100 来忽略。",
+    "answer": true,
+    "explain": "未选中位置标签置 -100，配合 CrossEntropyLoss(ignore_index=-100) 自动跳过，实现「只在掩码位置算损失」。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么 MLM 不能把被选中的 token 全部替换成 [MASK]？",
+    "options": [
+     "会让训练速度变慢",
+     "微调和推理时输入里没有 [MASK]，全用会造成预训练-微调分布不一致，损害迁移性能",
+     "[MASK] 占用太多词表空间",
+     "会让模型无法收敛"
+    ],
+    "answer": 1,
+    "explain": "下游微调/推理的输入不含 [MASK]。若预训练时模型高度依赖 [MASK]，到微调阶段分布突变，性能会下降。"
+   },
+   {
+    "type": "choice",
+    "prompt": "RoBERTa 相比原始 BERT 的核心改动，下面哪一项是对的？",
+    "options": [
+     "增加了一个比 NSP 更难的句子任务",
+     "去掉 NSP，改用动态掩码，并大幅增加数据和 batch",
+     "引入了因果掩码使其支持文本生成",
+     "用跨层参数共享把模型变小"
+    ],
+    "answer": 1,
+    "explain": "RoBERTa 发现 BERT 训练不充分：去掉 NSP、动态掩码（每次重新生成）、更多数据更大 batch。跨层共享是 ALBERT 的做法。"
+   },
+   {
+    "type": "judge",
+    "prompt": "ELECTRA 的替换 Token 检测（RTD）对序列所有位置计算损失，因此相同算力下训练信号比 MLM（只对 15% 位置）更密集。",
+    "answer": true,
+    "explain": "MLM 只在约 15% 的位置算损失，RTD 对所有位置做「原始/替换」二分类，信号密度约高 6.7 倍，这是 ELECTRA 高效的核心原因。"
+   },
+   {
+    "type": "input",
+    "prompt": "BERT-Base 的隐藏维度 H=768。一个 batch=4、序列长 32 的输入，经过嵌入层后输出张量的形状是 (4, 32, ?)，问号是多少？",
+    "accept": ["768", "H", "768维", "h"],
+    "explain": "嵌入层把 (B, T) 的 ids 映射到 (B, T, H)。H=768，所以形状是 (4, 32, 768)。"
+   },
+   {
+    "type": "input",
+    "prompt": "BERT 的输入表示由三种嵌入相加得到，分别管「是什么词」「在第几位」，以及区分句子 A/B 的那一种叫什么嵌入？（中文或英文均可）",
+    "accept": ["Segment Embedding", "段嵌入", "segment", "Segment", "句子嵌入", "段落嵌入", "分段嵌入"],
+    "explain": "Token 管词、Position 管位置、Segment（段嵌入）区分句子 A 和 B（用 E_A / E_B）。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 BERT 的三个特殊 token 与各自作用配对：",
+    "left": ["[CLS]", "[SEP]", "[MASK]"],
+    "right": [
+     "放在序列第一位，其输出向量作整句的聚合表示，用于句子级分类",
+     "分隔两个句子，标记句子边界",
+     "预训练时替换被选中的 token，微调时不出现"
+    ],
+    "explain": "[CLS] 聚合句子级表示，[SEP] 分隔句子，[MASK] 用于 MLM 遮盖。三者各司其职。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 BERT 的三个变体与各自的核心改进配对：",
+    "left": ["RoBERTa", "ALBERT", "ELECTRA"],
+    "right": [
+     "去掉 NSP、动态掩码、更多数据，证明 BERT 训练不充分",
+     "嵌入因式分解 + 跨层参数共享 + SOP，大幅减少参数量",
+     "替换 Token 检测（RTD），对所有位置算损失，信号更密"
+    ],
+    "explain": "RoBERTa 训练更充分，ALBERT 参数更省，ELECTRA 信号更密。三条改进路线各不相同。"
+   },
+   {
+    "type": "choice",
+    "prompt": "后续研究（如 RoBERTa）为什么质疑 NSP 任务？",
+    "options": [
+     "NSP 计算量太大，拖慢训练",
+     "NSP 太简单：负例来自不同文档，靠主题差异就能判断，无需真正理解句间逻辑",
+     "NSP 会导致 MLM 无法收敛",
+     "NSP 需要额外的标注数据"
+    ],
+    "answer": 1,
+    "explain": "NSP 负例来自不同文档，主题差异明显，模型不需理解句间逻辑关系。ALBERT 用同文档交换顺序的 SOP 来提高难度。"
+   }
+  ]
+ },
+ {
+  "title": "GPT系列——自回归语言模型",
+  "subtitle": "只用解码器 + 因果掩码，靠规模涌现出上下文学习能力",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "上一关的 BERT 是编码器、双向，擅长理解；但它不能直接生成文本，因为它没有「从左到右逐词产出」的机制。\n\n这一关的 GPT（Generative Pre-Training）走的是另一条路：自回归语言模型。它的目标和人类写字一样自然——从左到右，每个词的生成只依赖它前面已经写出来的内容。这条路线天生适合文本生成。\n\n本关讲三件事：自回归建模的数学本质和它为什么需要因果掩码；GPT 的架构为什么选「只用解码器」、并改用 Pre-LN 和 GELU；以及 GPT-1 到 GPT-3 的演进如何揭示了「规模即能力」，催生了上下文学习（In-Context Learning）这种全新范式。"
+   },
+   {
+    "title": "自回归建模：链式法则",
+    "body": "语言模型要给一个词序列赋予联合概率 $P(w_1,\\ldots,w_n)$。自回归分解用链式法则把它拆成一串条件概率的乘积：\n\n$$P(w_1,\\ldots,w_n)=\\prod_{i=1}^{n}P(w_i\\mid w_{<i})$$\n\n其中 $w_{<i}=(w_1,\\ldots,w_{i-1})$ 是位置 $i$ 之前的所有词。这个分解的直觉很贴切：每个词的生成只依赖它之前的上下文，对应我们从左到右逐词书写的过程。\n\n训练目标是最大化训练语料的对数似然，等价于最小化负对数似然（交叉熵）：\n\n$$\\mathcal{L}_{\\text{LM}}=-\\frac{1}{n}\\sum_{i=1}^{n}\\log P(w_i\\mid w_{<i};\\theta)$$\n\n和 BERT 对比就很清楚：GPT 单向、目标是预测下一词、序列信息完整利用、天然支持生成；BERT 双向、目标是 MLM、每次只预测约 15% 的词、不直接支持生成。"
+   },
+   {
+    "title": "因果掩码：为什么必须有",
+    "body": "训练时 GPT 一次性接收整个序列，并行算出所有位置的预测——这很高效。但有个约束：位置 $i$ 的预测只能基于 $w_{<i}$，绝不能「偷看」未来的词，否则预测下一词的任务就作弊了。\n\n**因果掩码（Causal Mask，也叫下三角掩码）** 就是用来强制这个约束的。它把注意力矩阵的上三角部分设为 $-\\infty$，softmax 之后这些位置的权重变成 0：\n\n$$\\text{Mask}[i,j]=\\begin{cases}0 & j\\le i\\\\ -\\infty & j>i\\end{cases}$$\n\n带掩码的注意力是：\n\n$$\\text{Attention}(Q,K,V)=\\text{softmax}\\!\\left(\\frac{QK^T}{\\sqrt{d_k}}+M\\right)V$$\n\n以 4 个词为例，位置 $i$ 只能注意到第 $0\\sim i$ 列：第 0 行只看第 0 列，第 3 行能看第 0~3 列。这样既保证训练并行高效，又保证推理时的因果一致性。",
+    "tip": "长度为 5 的序列里，位置 3（从 0 开始）能注意到位置 0、1、2、3，但看不到位置 4。"
+   },
+   {
+    "title": "GPT 架构：为什么只用解码器",
+    "body": "原始 Transformer 有编码器和解码器两部分。GPT 的核心决策是**只用解码器，并去掉其中的交叉注意力层**。\n\n为什么能这么砍？因为语言建模根本不需要编码器——输入和输出是同一个序列，不存在「另一段要编码的源序列」。去掉交叉注意力后，每层只剩自注意力 + 前馈网络。再配上因果掩码，每个位置只能注意自己及之前的位置，这恰好就是自回归。\n\n所以 GPT 的一层是：因果自注意力 → 残差 → 前馈网络 → 残差，堆叠 $N$ 层，最后接一个线性层投影到词表，softmax 得到下一词的概率分布。整个结构比完整的 Transformer 简洁得多，却足以支撑强大的生成能力。"
+   },
+   {
+    "title": "为什么改用 Pre-LN 和 GELU",
+    "body": "GPT-2 起做了两处关键改动，都是为了训练更稳。\n\n**Pre-LN vs Post-LN。** 原始 Transformer 是 Post-LN，归一化放在残差相加之后：$x_{l+1}=\\text{LayerNorm}(x_l+\\text{Sublayer}(x_l))$。GPT-2 改成 Pre-LN，归一化放在子层之前：$x_{l+1}=x_l+\\text{Sublayer}(\\text{LayerNorm}(x_l))$。\n\n为什么 Pre-LN 更稳？因为残差路径 $x_l$ 这条「高速公路」没有经过任何归一化，梯度可以直接传到底层，不容易爆炸或消失。深层网络尤其受益——GPT-3 有 96 层，Post-LN 的累积效应会让底层几乎收不到梯度信号，而 Pre-LN 能让深层训练成为可能，甚至不需要学习率预热（warm-up）。\n\n**GELU vs ReLU。** GPT 用 GELU 替代 ReLU：$\\text{GELU}(x)=x\\cdot\\Phi(x)$，其中 $\\Phi$ 是标准正态的累积分布函数。相比 ReLU 在 0 处的硬拐角，GELU 在负值区有平滑的梯度、0 附近不突变，实践中通常带来更好的性能。",
+    "tip": "GPT 用的是可学习的位置嵌入（不是正弦编码），这也是它和原始 Transformer 解码器的一处区别。"
+   },
+   {
+    "title": "PyTorch 实现：因果自注意力",
+    "body": "下面是带因果掩码的多头自注意力的核心。因果掩码用 `torch.tril` 预先注册成 buffer，前向时把上三角位置填成 $-\\infty$。\n\n```python\nclass CausalSelfAttention(nn.Module):\n    def __init__(self, config):\n        super().__init__()\n        self.n_head = config.n_head\n        self.head_size = config.n_embd // config.n_head\n        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)\n        self.c_proj = nn.Linear(config.n_embd, config.n_embd)\n        self.register_buffer('bias',\n            torch.tril(torch.ones(config.block_size, config.block_size))\n            .view(1, 1, config.block_size, config.block_size))\n    def forward(self, x):\n        B, T, C = x.size()\n        q, k, v = self.c_attn(x).split(C, dim=2)\n        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)\n        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)\n        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)\n        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_size)\n        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))\n        att = F.softmax(att, dim=-1)\n        out = (att @ v).transpose(1, 2).contiguous().view(B, T, C)\n        return self.c_proj(out)\n```\n\n关键一行是 `masked_fill(self.bias[...] == 0, float('-inf'))`：下三角（含对角）为 1 的位置保留，上三角为 0 的位置填 $-\\infty$，softmax 后这些未来位置的权重归零。"
+   },
+   {
+    "title": "PyTorch 实现：Pre-LN 的 Block",
+    "body": "GPT 的一个 Transformer Block 用 Pre-LN 写出来非常简洁，注意归一化在子层「里面」、残差在「外面」。\n\n```python\nclass Block(nn.Module):\n    def __init__(self, config):\n        super().__init__()\n        self.ln_1 = nn.LayerNorm(config.n_embd)\n        self.attn = CausalSelfAttention(config)\n        self.ln_2 = nn.LayerNorm(config.n_embd)\n        self.mlp = MLP(config)\n    def forward(self, x):\n        x = x + self.attn(self.ln_1(x))\n        x = x + self.mlp(self.ln_2(x))\n        return x\n```\n\n对比 Post-LN 的写法 `x = ln(x + sublayer(x))`：这里是 `x = x + sublayer(ln(x))`，残差加法的那条路径上没有任何归一化，梯度直通。另外 GPT-2 还有个小技巧——把 token 嵌入和最后的 LM 头权重绑定（weight tying），既省参数又通常提升效果。"
+   },
+   {
+    "title": "GPT-1 到 GPT-3：规模即能力",
+    "body": "GPT 三代的演进，本质是推理范式随规模而变：\n\n- **GPT-1（2018，117M）**：确立「无监督预训练 + 有监督微调」。每个下游任务仍需微调参数，靠输入变换把不同任务统一成序列。\n- **GPT-2（2019，最大 1.5B）**：核心假设是「足够强的语言模型不微调也能做下游任务」。展示了 Zero-shot——只给任务描述、不给示例。\n- **GPT-3（2020，175B）**：系统研究了上下文学习（In-Context Learning），把 Few-shot 推到极致。\n\n训练计算量有个经验公式 $C\\approx 6\\,N\\,D$（$N$ 是参数量，$D$ 是训练 token 数）。GPT 系列揭示的核心规律是：随着规模和数据增长，新能力会「涌现」——这正是后续 ChatGPT、GPT-4 的基础。"
+   },
+   {
+    "title": "上下文学习与三种范式",
+    "body": "In-Context Learning（ICL）的神奇之处在于：在**推理阶段**通过 prompt 里的示例适配新任务，完全不更新任何参数。按给的示例数分三种：\n\n- **Zero-shot**：只给任务指令，不给示例。\n- **One-shot**：给 1 个示例。\n- **Few-shot**：给若干示例（通常 3~100 个，称为 demonstrations）。\n\n「为什么不更新参数也能学会？」目前有几种假说：一是 Transformer 的前向传播在数学上等价于对示例做了一次隐式的梯度下降；二是模型其实是从示例中「识别出任务」，再调用预训练时已学到的技能（示例主要起任务定位作用）；三是从贝叶斯角度看作对任务先验的后验更新。机制尚无定论，但 ICL 在大模型上确实有效。\n\n还有「涌现能力」：某些能力（多步推理、代码生成、指令跟随）在小模型几乎没有，模型规模过某个阈值后才突然出现。这也是 Scaling Laws 研究的重要动机。",
+    "tip": "Chain-of-Thought（思维链）提示——让模型「一步步想」——能大幅提升推理任务的表现。"
+   },
+   {
+    "title": "采样策略与小结",
+    "body": "生成质量很大程度取决于采样策略：\n\n- **贪心搜索**：每步取概率最高的词，确定快，但容易陷入重复。\n- **Temperature 采样**：用温度 $T$ 调分布尖锐度，$T\\to 0$ 退化为贪心，$T>1$ 更随机更有创意，$0<T<1$ 更保守。\n- **Top-k**：只从概率最高的 $k$ 个词里采样，但 $k$ 固定、不能自适应。\n- **Top-p（Nucleus）**：选累积概率刚超过 $p$ 的最小词集，能自适应——分布尖锐时选少量词，平坦时选更多。\n- **Beam Search**：维护 $B$ 个最优候选，适合翻译、摘要这类有标准答案的任务，但开放生成时重复性高。\n\n**易错点**：① 别忘了 GPT 是单向、用因果掩码；② Pre-LN 是 `x + sublayer(ln(x))` 不是 `ln(x + sublayer(x))`；③ ICL 不更新参数，纯靠 prompt；④ 因果掩码加在 softmax 之前（作为加性 $-\\infty$）。\n\n小结：GPT 是解码器架构（decoder-only）的代表，靠因果掩码做自回归生成，靠规模涌现出上下文学习能力。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "自回归语言模型用链式法则把联合概率分解成什么？",
+    "options": [
+     "每个词同时依赖左右上下文的乘积",
+     "每个词只依赖它之前所有词的条件概率的乘积",
+     "所有词独立的边缘概率的乘积",
+     "只依赖前一个词的条件概率的乘积"
+    ],
+    "answer": 1,
+    "explain": "自回归分解是 P(w1..wn)=∏ P(wi | w<i)，每个词的概率只依赖它之前的所有词，对应从左到右逐词生成。"
+   },
+   {
+    "type": "judge",
+    "prompt": "因果掩码把注意力矩阵的上三角部分设为 -∞，softmax 后这些位置权重为 0，从而禁止每个位置注意到未来的词。",
+    "answer": true,
+    "explain": "Mask[i,j]=-∞（当 j>i），加到 QK^T/√d_k 上后 softmax 把未来位置压成 0，保证位置 i 只能依赖 w<i。"
+   },
+   {
+    "type": "choice",
+    "prompt": "GPT 为什么可以「只用解码器并去掉交叉注意力」？",
+    "options": [
+     "因为解码器比编码器参数更少",
+     "因为语言建模输入输出是同一个序列，不存在另一段要编码的源序列",
+     "因为交叉注意力会破坏因果性",
+     "因为编码器不支持反向传播"
+    ],
+    "answer": 1,
+    "explain": "交叉注意力是用来关注编码器输出的源序列。语言建模没有独立的源序列（输入输出同一序列），所以去掉交叉注意力，每层只剩自注意力+FFN。"
+   },
+   {
+    "type": "choice",
+    "prompt": "关于 Pre-LN（GPT-2 起采用），下面哪个公式和说法是对的？",
+    "options": [
+     "x_{l+1}=LayerNorm(x_l+Sublayer(x_l))，残差后归一化，深层更稳",
+     "x_{l+1}=x_l+Sublayer(LayerNorm(x_l))，残差路径不经过归一化，梯度直通，深层更稳",
+     "Pre-LN 必须配合学习率预热才能训练",
+     "Pre-LN 只能用于编码器"
+    ],
+    "answer": 1,
+    "explain": "Pre-LN 是 x + Sublayer(LayerNorm(x))，残差这条路径不经过归一化，梯度可直达底层，深层网络训练更稳，常常不需要 warm-up。第一个选项是 Post-LN。"
+   },
+   {
+    "type": "judge",
+    "prompt": "In-Context Learning（Few-shot）会在推理时根据 prompt 里的示例更新模型参数，从而适配新任务。",
+    "answer": false,
+    "explain": "ICL 完全不更新参数。它只是在前向传播中利用 prompt 里的示例完成任务适配，模型权重保持不变。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Top-p（Nucleus）采样相比 Top-k 的主要优势是什么？",
+    "options": [
+     "速度更快",
+     "能自适应：分布尖锐时选少量词，分布平坦时选更多词",
+     "总是选概率最高的那个词",
+     "不需要计算 softmax"
+    ],
+    "answer": 1,
+    "explain": "Top-k 的 k 是固定的，无法适应分布形状；Top-p 选累积概率刚超过 p 的最小词集，分布尖锐选得少、平坦选得多，更灵活。"
+   },
+   {
+    "type": "judge",
+    "prompt": "GPT 系列从 GPT-1 到 GPT-3 的演进表明：随着参数和数据规模增长，会涌现出小模型几乎不具备的新能力（如多步推理）。",
+    "answer": true,
+    "explain": "这就是「规模即能力」与涌现能力：某些能力在规模超过阈值后才突然出现，是 Scaling Laws 研究的重要动机。"
+   },
+   {
+    "type": "input",
+    "prompt": "在长度为 5 的序列里（下标从 0 开始），因果掩码下位置 3 最多能注意到几个位置（包括它自己）？",
+    "accept": ["4", "四", "4个"],
+    "explain": "位置 3 能注意到 0、1、2、3 共 4 个位置，看不到位置 4（未来）。"
+   },
+   {
+    "type": "input",
+    "prompt": "GPT 用哪种激活函数替代了原始 Transformer 的 ReLU？（英文缩写即可）",
+    "accept": ["GELU", "gelu", "Gelu", "高斯误差线性单元"],
+    "explain": "GPT 用 GELU（Gaussian Error Linear Unit），在负值区有平滑梯度、0 附近不突变，通常优于 ReLU。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 GPT 三代与各自确立的核心推理范式配对：",
+    "left": ["GPT-1", "GPT-2", "GPT-3"],
+    "right": [
+     "预训练 + 有监督微调（每个任务都要微调参数）",
+     "Zero-shot（不微调，只给任务描述）",
+     "Few-shot / In-Context Learning（prompt 里给少量示例，不更新参数）"
+    ],
+    "explain": "GPT-1 确立预训练+微调，GPT-2 展示 Zero-shot，GPT-3 系统化了 Few-shot 上下文学习。"
+   },
+   {
+    "type": "match",
+    "prompt": "把采样策略与其特点配对：",
+    "left": ["贪心搜索", "Temperature 采样", "Top-p（Nucleus）采样", "Beam Search"],
+    "right": [
+     "每步取概率最高的词，确定但易重复",
+     "用温度 T 调节分布尖锐度，T>1 更随机",
+     "选累积概率刚超过 p 的最小词集，自适应候选数量",
+     "维护 B 个最优候选，适合翻译/摘要等有标准答案的任务"
+    ],
+    "explain": "贪心确定、Temperature 调随机度、Top-p 自适应、Beam 保持多个候选。逐项对应。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下面关于 GPT 和 BERT 的对比，哪一项是正确的？",
+    "options": [
+     "GPT 双向、擅长理解；BERT 单向、擅长生成",
+     "GPT 单向自回归、天然支持生成；BERT 双向、擅长理解类任务",
+     "两者都用因果掩码",
+     "两者预训练目标都是 MLM"
+    ],
+    "answer": 1,
+    "explain": "GPT 单向（因果掩码）、目标是预测下一词、天然支持生成；BERT 双向（无因果掩码）、目标是 MLM、擅长分类/NER/QA 等理解任务。"
+   }
+  ]
+ },
+ {
+  "title": "T5与统一框架",
+  "subtitle": "把所有 NLP 任务变成「文本到文本」，用编码器-解码器 + Span Corruption 统一一切",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "BERT 擅长理解但要为每个任务加不同的输出头（分类头、CRF、span 起止预测……）；GPT 擅长生成但理解类任务表现一般。整个领域呈现出「任务特化」的碎片化：每种任务都有自己的结构和损失函数。\n\n2020 年 Google 的 T5（Text-to-Text Transfer Transformer）提出了一个统一的思维框架：**把所有 NLP 任务都变成「输入一段文本，输出一段文本」**。翻译是文本到文本，摘要是文本到文本，分类也是——只不过输出是「positive」这样的词而已。\n\n统一之后，同一套架构、同一个损失函数、同一种解码策略就能处理几乎所有任务，多任务学习也变得异常自然。本关讲清楚 Text-to-Text 框架、T5 的编码器-解码器架构（含相对位置偏置、RMSNorm）、它独特的 Span Corruption 预训练任务，以及多任务学习的采样策略。"
+   },
+   {
+    "title": "Text-to-Text 框架与任务前缀",
+    "body": "Text-to-Text 的核心思想极简：无论什么任务，都格式化成「输入文本 → 输出文本」。\n\n那模型怎么知道当前该做什么任务？答案是**任务前缀（Task Prefix）**——在输入前加一段描述任务的文字：\n\n- 翻译：`translate English to German: The house is wonderful.` → `Das Haus ist wunderbar.`\n- 摘要：`summarize: ...` → 摘要文本\n- 情感分类：`sst2 sentence: The movie is great!` → `positive`\n- 自然语言推理：`mnli premise: ... hypothesis: ...` → `entailment`\n\n甚至回归任务（输出连续数值）也被转成「生成一个数字字符串」，比如语义相似度输出 `3.8`。任务前缀的妙处在于：它不依赖任何特殊结构，纯靠文本传达任务信息，推理时改个前缀就能切换任务。这也是早期提示工程（Prompt Engineering）的雏形。",
+    "tip": "任务前缀的写法会显著影响性能：明确的 translate English to German: 比含糊的 EN to DE: 效果好。"
+   },
+   {
+    "title": "为什么选编码器-解码器架构",
+    "body": "T5 采用标准的编码器-解码器架构，这和原始 Transformer 一致。为什么是这个选择？\n\n因为对 Text-to-Text 任务来说，这个架构天然匹配：**编码器负责双向地理解整段输入文本，解码器负责自回归地生成输出文本**。编码器里的自注意力是全连接（双向，像 BERT），解码器里的自注意力带因果掩码（单向，像 GPT），解码器还多一层交叉注意力去关注编码器的输出。\n\n这正好把 BERT 的理解能力和 GPT 的生成能力合在了一个模型里。所以本章小结里的三方对比很清晰：BERT 是 encoder-only（双向、强理解、弱生成），GPT 是 decoder-only（单向、强生成、中等理解），T5 是 encoder-decoder（编码器双向 + 解码器单向、理解和生成都强）。",
+    "tip": "解码器比编码器多一个组件：交叉注意力层，用来关注编码器对输入的编码结果。"
+   },
+   {
+    "title": "相对位置偏置：为什么不用绝对位置编码",
+    "body": "原始 Transformer 用绝对位置编码（正弦或可学习），但它有两个问题：无法外推到训练时没见过的长度；位置信息和 token 内容混在同一个嵌入向量里。\n\nT5 改用**相对位置偏置**：在计算注意力分数时，直接加一个只依赖相对距离 $i-j$ 的偏置值：\n\n$$\\text{Attention}(Q,K,V)=\\text{softmax}\\!\\left(\\frac{QK^T}{\\sqrt{d_k}}+b_{i-j}\\right)V$$\n\n关键设计是**分桶（bucketing）**：小距离用线性划分（每个近距离都有独立偏置，精确建模句法），大距离用对数划分（把很远的距离压到少数几个桶里）。\n\n为什么这样分？因为对注意力来说，近距离关系细粒度且重要（相邻 token 的关系对句法很关键），而远距离关系可以粗略处理（位置 100 和 101 的差别，与位置 200 和 201 的差别，对模型几乎没区别——都只是「相距很远」）。对数分桶既省参数，又能泛化到更长序列。此外 T5 还**跨所有层共享**这套位置偏置参数，进一步减少参数量。"
+   },
+   {
+    "title": "RMSNorm 与其它简化",
+    "body": "T5 把原始 LayerNorm 简化成了 RMSNorm（Root Mean Square Normalization），去掉了减均值的中心化，只保留均方根缩放：\n\n$$\\text{RMSNorm}(x)=\\frac{x}{\\text{RMS}(x)}\\cdot\\gamma,\\quad \\text{RMS}(x)=\\sqrt{\\frac{1}{n}\\sum_{i=1}^{n}x_i^2}$$\n\n对比 LayerNorm 的 $\\frac{x-\\mu}{\\sqrt{\\sigma^2+\\epsilon}}\\cdot\\gamma+\\beta$，RMSNorm 既不算均值 $\\mu$，也没有偏置 $\\beta$，更简洁高效，实践效果相当。\n\nT5 相对原始 Transformer 的其它改动：归一化放在子层之前（Pre-Norm，训练更稳）；去掉所有偏置项（线性层 bias=False）；激活函数从 ReLU 改为 GELU（后续版本进一步用 GeGLU 门控）；以及**词嵌入三方共享**——编码器输入嵌入、解码器输入嵌入、解码器输出的线性投影层共用同一套参数矩阵，既省参数又让输入输出空间一致。",
+    "tip": "RMSNorm 这个组件会在下一关的现代 LLM（LLaMA）里再次出现，可以提前记住它「去掉了减均值」。"
+   },
+   {
+    "title": "Span Corruption：与 MLM 的区别",
+    "body": "T5 的预训练任务叫 **Span Corruption（片段损坏）**，是 BERT MLM 的改进版。\n\n对比一下三点区别：\n\n- **掩盖粒度**：MLM 掩盖单个 token；Span Corruption 掩盖连续的**片段（span）**，默认平均长度 3。\n- **哨兵 token**：MLM 每个掩盖位置都用一个 $\\text{[MASK]}$；Span Corruption 整个 span 只用一个唯一的哨兵 token（`<extra_id_0>`、`<extra_id_1>`……）替换，哨兵 token 在输出端还充当分隔符。\n- **目标序列长度**：MLM 输出与输入等长；Span Corruption 的目标序列远短于输入，因为只需生成被掩盖的片段内容。\n\n例子：原句 `Thank you for inviting me to your party last week.`，输入端变成 `Thank you <extra_id_0> me to your party <extra_id_1> week.`，目标输出是 `<extra_id_0> for inviting <extra_id_1> last <extra_id_2>`。\n\nSpan Corruption 的好处：目标序列短，训练效率高；既要双向理解上下文（编码器），又要学会生成（解码器）。T5 论文系统比较多种目标后，它的 GLUE 平均分最高且速度快。"
+   },
+   {
+    "title": "PyTorch 实现：RMSNorm 与位置偏置查表",
+    "body": "先看 RMSNorm，对照公式它只有「除以 RMS，再乘可学习权重」两步：\n\n```python\nclass T5RMSNorm(nn.Module):\n    def __init__(self, hidden_size, eps=1e-6):\n        super().__init__()\n        self.weight = nn.Parameter(torch.ones(hidden_size))\n        self.eps = eps\n    def forward(self, x):\n        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()\n        return self.weight * (x / rms)\n```\n\n相对位置偏置的核心是把相对距离映射到桶，再查表得到每个头的偏置：\n\n```python\nclass T5RelativePositionBias(nn.Module):\n    def __init__(self, num_heads, num_buckets=32, max_distance=128):\n        super().__init__()\n        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)\n        self.num_buckets = num_buckets\n        self.max_distance = max_distance\n    def forward(self, q_len, k_len):\n        q_pos = torch.arange(q_len).unsqueeze(1)\n        k_pos = torch.arange(k_len).unsqueeze(0)\n        rel = k_pos - q_pos\n        bucket = self._bucket(rel, self.num_buckets, self.max_distance)\n        vals = self.relative_attention_bias(bucket)\n        return vals.permute(2, 0, 1).unsqueeze(0)\n```\n\n查表得到的偏置形状是 (1, num_heads, q_len, k_len)，直接加到注意力分数上即可。"
+   },
+   {
+    "title": "PyTorch 实现：T5 Block 的 Pre-Norm 结构",
+    "body": "T5 的一个块依次是：Pre-Norm 自注意力 → 残差 →（仅解码器）Pre-Norm 交叉注意力 → 残差 → Pre-Norm GeGLU 前馈 → 残差。注意所有线性层都 bias=False。\n\n```python\nclass T5Block(nn.Module):\n    def __init__(self, hidden_size, num_heads, intermediate_size, is_decoder=False):\n        super().__init__()\n        self.is_decoder = is_decoder\n        self.self_attn_norm = T5RMSNorm(hidden_size)\n        self.ff_norm = T5RMSNorm(hidden_size)\n        self.wi_0 = nn.Linear(hidden_size, intermediate_size, bias=False)\n        self.wi_1 = nn.Linear(hidden_size, intermediate_size, bias=False)\n        self.wo = nn.Linear(intermediate_size, hidden_size, bias=False)\n    def forward(self, x):\n        normed = self.self_attn_norm(x)\n        x = x + self.self_attn(normed)\n        normed = self.ff_norm(x)\n        gate = torch.nn.functional.gelu(self.wi_0(normed))\n        proj = self.wi_1(normed)\n        x = x + self.wo(gate * proj)\n        return x\n```\n\n这里的前馈是 GeGLU：`gelu(W0·x) ⊙ (W1·x)` 再过 `wo`，用门控提升表达力，这也是后续 SwiGLU 的近亲。"
+   },
+   {
+    "title": "多任务学习与温度采样",
+    "body": "Text-to-Text 让多任务联合训练变得自然：把不同任务的数据混在同一个 batch，每条都带任务前缀，用同一套参数、同一个交叉熵损失训练。\n\n但任务间数据量差异很大时，怎么采样是关键。T5 用**温度采样**：\n\n$$p_i\\propto\\left(\\frac{n_i}{\\sum_j n_j}\\right)^{1/T}$$\n\n温度 $T$ 控制均匀程度：$T=1$ 按数据量比例采样（大任务主导，小任务欠拟合）；$T\\to\\infty$ 趋向均匀（每个任务等概率，但大任务被稀释）；T5 默认 $T=2$，在两者之间取平衡。\n\n举例：任务 A 有 100 万条、任务 B 有 1 万条。$T=1$ 时 B 只占约 1%，严重欠拟合；$T=2$ 时各任务权重开根号后重新归一化，B 升到约 9%，得到更充分的训练。这就是为什么 $T=2$ 实践更好：小任务有足够曝光，大任务的优势也没被完全抹掉。"
+   },
+   {
+    "title": "T5 变体与小结",
+    "body": "T5 衍生出几个重要变体：\n\n- **mT5**：多语言版本，支持 101 种语言，词表扩到 25 万。重要发现是跨语言零样本迁移——在英文上微调后能直接处理其它语言的同类任务。\n- **FLAN-T5**：指令微调版本，用 1836 个含自然语言指令的任务微调。关键发现是指令微调的收益随规模增大而显著增强，FLAN-T5-XXL（11B）在多项任务上甚至超过未指令微调的 GPT-3（175B）。\n- **UL2**：定义 R/S/X 三类去噪器（短 span、长 span、极端损坏），推理时用前缀切换「工作模式」，兼顾理解与生成。\n\n**易错点**：① Span Corruption 是掩盖连续片段并用一个哨兵 token，不是逐 token 加 [MASK]；② T5 目标序列远短于输入；③ RMSNorm 去掉的是减均值（不是去掉缩放）；④ T5 是 encoder-decoder，不是只有编码器。\n\n小结：T5 最大的贡献是思维范式——把一切 NLP 任务统一为文本到文本，用编码器-解码器 + Span Corruption 同时兼顾理解和生成。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "Text-to-Text 框架的核心思想是什么？",
+    "options": [
+     "为每个任务设计专门的输出头和损失函数",
+     "把所有 NLP 任务都统一成「输入一段文本，输出一段文本」的生成问题",
+     "只处理文本生成类任务",
+     "用双向编码器对所有任务做分类"
+    ],
+    "answer": 1,
+    "explain": "T5 的核心是把分类、翻译、摘要、问答甚至回归都转成文本到文本，用同一套架构、损失和解码策略处理。"
+   },
+   {
+    "type": "choice",
+    "prompt": "T5 采用编码器-解码器架构的主要理由是什么？",
+    "options": [
+     "为了减少参数量",
+     "编码器双向理解输入、解码器自回归生成输出，天然匹配 Text-to-Text 任务",
+     "因为它不需要注意力机制",
+     "为了避免使用位置编码"
+    ],
+    "answer": 1,
+    "explain": "编码器双向理解输入文本（像 BERT），解码器自回归生成输出文本（像 GPT），还有交叉注意力连接两者，正好兼顾理解与生成。"
+   },
+   {
+    "type": "judge",
+    "prompt": "T5 的 Span Corruption 会把每个被掩盖的连续片段（span）整体替换成一个唯一的哨兵 token（如 <extra_id_0>），而不是逐 token 加 [MASK]。",
+    "answer": true,
+    "explain": "这是 Span Corruption 与 MLM 的关键区别：掩盖连续片段、整段用一个哨兵 token，哨兵在输出端还当分隔符。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 Span Corruption 中，目标序列（模型要生成的输出）与输入序列等长。",
+    "answer": false,
+    "explain": "目标序列远短于输入，因为只需生成被掩盖的片段内容（加哨兵分隔符），这也是它训练效率高的原因之一。"
+   },
+   {
+    "type": "choice",
+    "prompt": "T5 的相对位置偏置为什么对相对距离做「小距离线性、大距离对数」的分桶？",
+    "options": [
+     "为了让所有距离都有同样精度",
+     "近距离关系细粒度且重要需精确建模，远距离可粗略处理，对数分桶省参数并利于泛化到更长序列",
+     "为了让模型只能处理短序列",
+     "因为线性和对数计算量相同"
+    ],
+    "answer": 1,
+    "explain": "相邻 token 关系对句法关键、需精确；位置 100 与 200 的「很远」对模型几乎无差别，对数分桶把远距离压到少数桶，省参数又能外推。"
+   },
+   {
+    "type": "choice",
+    "prompt": "T5 用 RMSNorm 替代 LayerNorm，主要简化了什么？",
+    "options": [
+     "去掉了缩放参数 γ",
+     "去掉了减均值的中心化步骤（以及偏置 β），只做均方根缩放",
+     "去掉了对最后一维的归一化",
+     "把归一化改成了批归一化"
+    ],
+    "answer": 1,
+    "explain": "RMSNorm 不算均值 μ、也没有偏置 β，只用 RMS 做缩放，更简洁高效，实践效果与 LayerNorm 相当。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 T5 的温度采样中，温度 T=1 表示按各任务数据量比例采样，T 越大则越接近各任务等概率（均匀）采样。",
+    "answer": true,
+    "explain": "p_i ∝ (n_i/Σn)^(1/T)。T=1 按比例，T→∞ 趋向均匀。T5 默认 T=2 在两者间取平衡，让小任务获得足够曝光。"
+   },
+   {
+    "type": "input",
+    "prompt": "在三大架构路线里，T5 属于哪一种？（中文「编码器-解码器」或英文 encoder-decoder 均可）",
+    "accept": ["编码器-解码器", "encoder-decoder", "编码器解码器", "encoder decoder", "seq2seq", "编解码器"],
+    "explain": "BERT 是 encoder-only，GPT 是 decoder-only，T5 是 encoder-decoder（编码器-解码器）。"
+   },
+   {
+    "type": "input",
+    "prompt": "T5 的预训练任务叫什么？（中文「片段损坏」或英文 Span Corruption 均可）",
+    "accept": ["Span Corruption", "片段损坏", "span corruption", "片段破坏", "跨度损坏", "spancorruption"],
+    "explain": "T5 的预训练任务是 Span Corruption（片段损坏）：掩盖连续片段、用哨兵 token 替换、由解码器生成被掩盖内容。"
+   },
+   {
+    "type": "match",
+    "prompt": "把三大架构与其预训练目标配对：",
+    "left": ["BERT（encoder-only）", "GPT（decoder-only）", "T5（encoder-decoder）"],
+    "right": [
+     "MLM（掩码单个 token，双向预测）",
+     "下一个 token 预测（自回归）",
+     "Span Corruption（掩盖连续片段并生成）"
+    ],
+    "explain": "BERT→MLM、GPT→自回归下一词、T5→Span Corruption。三种架构对应三种预训练目标。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 T5 的三个变体与各自特点配对：",
+    "left": ["mT5", "FLAN-T5", "UL2"],
+    "right": [
+     "多语言版本，支持 101 种语言，能跨语言零样本迁移",
+     "指令微调版本，规模够大时甚至超过未指令微调的 GPT-3",
+     "定义 R/S/X 三类去噪器，推理时用前缀切换工作模式"
+    ],
+    "explain": "mT5 多语言、FLAN-T5 指令微调、UL2 统一多种去噪范式。逐项对应。"
+   },
+   {
+    "type": "choice",
+    "prompt": "T5 的「任务前缀」（如 summarize:、translate English to German:）起什么作用？",
+    "options": [
+     "作为分类头的参数",
+     "纯靠文本告诉模型当前要执行哪种任务，无需改动模型结构，改前缀即可切换任务",
+     "用来分隔训练集和验证集",
+     "替代位置编码"
+    ],
+    "answer": 1,
+    "explain": "任务前缀不依赖特殊结构，仅通过文本传达任务信息，推理时改前缀就能切任务——这也是早期提示工程的雏形。"
+   }
+  ]
+ },
+ {
+  "title": "现代大模型",
+  "subtitle": "LLaMA 的细节改良（RoPE/RMSNorm/GQA/SwiGLU）与 Flash Attention 的工程基础",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "前三关讲了三大预训练路线。这一关进入 2023 年以来真正把大模型推向千家万户的开源浪潮，以 LLaMA 为代表。\n\nLLaMA 并没有颠覆 Transformer。它做的是另一件更朴素的事：**在每一个细节上把次优的选择换成更稳、更高效的组件**——用 Pre-RMSNorm 替 LayerNorm、用 SwiGLU 替 ReLU、用 RoPE 替绝对位置编码、用 GQA 替标准多头注意力。这些看似微小的改动叠加起来，带来了显著的训练稳定性和推理效率提升。\n\n与此同时，工程创新同样关键：Flash Attention 重新设计注意力的计算顺序，把显存占用从 $O(n^2)$ 降到 $O(n)$。本关逐一讲透这些技术的原理和实现：RoPE 怎么用旋转编码相对位置、GQA 怎么解决 KV Cache 内存、Flash Attention 怎么靠 IO 感知加速。"
+   },
+   {
+    "title": "LLaMA 的改良清单",
+    "body": "先看 LLaMA 相对原始 GPT 架构改了哪些组件，本关后面会逐个展开：\n\n- **归一化位置**：Post-LN → Pre-RMSNorm（残差前归一化）。\n- **归一化类型**：LayerNorm → RMSNorm（去掉减均值）。\n- **激活函数**：GELU → SwiGLU（门控线性单元）。\n- **位置编码**：可学习的绝对位置编码 → RoPE（旋转位置编码）。\n- **注意力类型**：MHA（多头）→ GQA（分组查询注意力，LLaMA 2 起）。\n- **偏置项**：大部分线性层去掉 bias。\n\n其中 Pre-RMSNorm 我们在上一关 T5 已经见过 RMSNorm 了（去掉减均值、没有 β），放在子层之前是为了梯度直通、深层更稳。SwiGLU 是 $\\text{Swish}(xW_1)\\otimes(xW_2)$，需要三个矩阵；为了让参数量和标准 FFN 相当，LLaMA 把隐藏维度从 $4d$ 调成约 $\\frac{2}{3}\\times 4d$。",
+    "tip": "这些改动大多是正交的——可以同时使用，它们的组合构成了现代 LLM 的标准配方。"
+   },
+   {
+    "title": "RoPE：为什么用旋转编码相对位置",
+    "body": "绝对位置编码有个根本局限：它编码的是绝对位置，而注意力真正需要的是**相对位置**——两个 token 相距多远，往往比它们各自在第几位更重要。\n\nRoPE（Rotary Position Embedding）的洞见是：**通过旋转操作，把相对位置信息隐式编码进注意力的点积里**。它要求经过变换后的内积只依赖相对距离：\n\n$$\\langle f(q,m),f(k,n)\\rangle=g(q,k,m-n)$$\n\n做法是给位置 $m$ 的向量旋转 $m\\theta$ 角度。二维旋转矩阵 $R(\\theta)$ 满足 $R(m\\theta)^T R(n\\theta)=R((n-m)\\theta)$，于是：\n\n$$\\langle R(m\\theta)q,\\,R(n\\theta)k\\rangle=q^T R((n-m)\\theta)\\,k$$\n\n内积只剩相对位置 $(n-m)$，绝对位置 $m,n$ 消失了——这正是我们想要的。对 $d$ 维向量，把它分成 $d/2$ 对，每对独立旋转，第 $i$ 对频率 $\\theta_i=10000^{-2i/d}$（沿用原始 Transformer 的频率设计）。"
+   },
+   {
+    "title": "RoPE 的复数实现与长度外推",
+    "body": "RoPE 有个优雅的复数表示：把二维 $(x_1,x_2)$ 看成复数 $x_1+ix_2$，旋转就等价于乘以 $e^{im\\theta}=\\cos(m\\theta)+i\\sin(m\\theta)$。实现时把实数向量重新解释成复数、乘以旋转因子、再转回实数。\n\n```python\ndef apply_rotary_emb(xq, xk, freqs_cis):\n    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))\n    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))\n    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)\n    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)\n    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)\n    return xq_out.type_as(xq), xk_out.type_as(xk)\n```\n\nRoPE 的一大优势是**长度外推**：因为编码的是相对位置（旋转角度差），训练时只见过长度 $L$ 的序列，推理处理更长序列时相对位置关系仍然有意义。在此基础上又发展出位置插值（PI）、YaRN、LongRoPE 等方法，把 LLaMA 2 的 4096 上下文扩展到 128K 甚至更长。",
+    "tip": "RoPE 只作用在 Q 和 K 上（不作用在 V 上），因为它要影响的是注意力分数 QK^T。"
+   },
+   {
+    "title": "GQA：从 MHA 到 MQA 到 GQA",
+    "body": "标准多头注意力（MHA）里每个头都有独立的 Q、K、V 投影，质量最好但 KV Cache 内存大。\n\n- **MHA**：$H$ 个 Q 头，各自独立的 $H$ 组 K、V。\n- **MQA（多查询注意力）**：保留 $H$ 个 Q 头，但所有头**共享同一组** K、V。KV Cache 大幅减小、推理更快，但质量有所下降。\n- **GQA（分组查询注意力）**：折中方案——把 $H$ 个 Q 头分成 $G$ 组，每组共享一对 K、V 头。\n\n为什么需要 GQA？关键在 **KV Cache**：自回归解码时，每生成一个新 token 都要和所有历史 token 算注意力。KV Cache 是空间换时间——缓存每层所有历史 token 的 K、V，避免重复计算。但它的内存随序列长度和层数线性增长，很快成为瓶颈。\n\nGQA 直接削减 KV 头数：以 LLaMA-13B 规格、序列 4096、32 层为例，MHA（32 个 KV 头）的 KV Cache 约 4GB，GQA 用 8 个 KV 头就降到约 1GB（即 $8/32=25\\%$），MQA 用 1 个 KV 头降到约 3%。质量上 GQA 接近 MHA，远好于 MQA，是个甜点。"
+   },
+   {
+    "title": "PyTorch 实现：GQA 与 repeat_kv",
+    "body": "GQA 实现的关键是把共享的 KV 头「展开」到和 Q 头一样多，用 `repeat_kv` 完成，且靠广播（expand）不产生真实数据复制。\n\n```python\ndef repeat_kv(x, n_rep):\n    if n_rep == 1:\n        return x\n    B, S, n_kv, hd = x.shape\n    return (x[:, :, :, None, :]\n            .expand(B, S, n_kv, n_rep, hd)\n            .reshape(B, S, n_kv * n_rep, hd))\n```\n\nGQA 模块本身的投影层定义：\n\n```python\nclass GroupedQueryAttention(nn.Module):\n    def __init__(self, dim, n_heads, n_kv_heads):\n        super().__init__()\n        assert n_heads % n_kv_heads == 0\n        self.n_heads = n_heads\n        self.n_kv_heads = n_kv_heads\n        self.n_rep = n_heads // n_kv_heads\n        self.head_dim = dim // n_heads\n        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)\n        self.wk = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)\n        self.wv = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)\n        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)\n```\n\n注意 `wk`、`wv` 的输出维度是 `n_kv_heads * head_dim`（比 `wq` 小），这正是 GQA 省 KV 参数和 KV Cache 的来源。`n_rep = n_heads // n_kv_heads` 是每个 KV 头要服务的 Q 头数。"
+   },
+   {
+    "title": "PyTorch 实现：SwiGLU 与 LLaMA Block",
+    "body": "SwiGLU 用三个矩阵：gate 投影、up 投影、down 投影，门控函数是 Swish（即 SiLU）。\n\n```python\nclass SwiGLUFFN(nn.Module):\n    def __init__(self, dim, hidden_dim=None):\n        super().__init__()\n        if hidden_dim is None:\n            hidden_dim = int(2 * (4 * dim) / 3)\n            hidden_dim = ((hidden_dim + 255) // 256) * 256\n        self.w1 = nn.Linear(dim, hidden_dim, bias=False)\n        self.w2 = nn.Linear(hidden_dim, dim, bias=False)\n        self.w3 = nn.Linear(dim, hidden_dim, bias=False)\n    def forward(self, x):\n        return self.w2(F.silu(self.w1(x)) * self.w3(x))\n```\n\n把组件拼成一个 LLaMA 解码器块，就是 Pre-RMSNorm + GQA（含 RoPE）+ 残差，再 Pre-RMSNorm + SwiGLU + 残差：\n\n```python\nclass LlamaDecoderBlock(nn.Module):\n    def __init__(self, dim, n_heads, n_kv_heads, norm_eps=1e-6):\n        super().__init__()\n        self.attention = GroupedQueryAttention(dim, n_heads, n_kv_heads)\n        self.feed_forward = SwiGLUFFN(dim)\n        self.attention_norm = RMSNorm(dim, eps=norm_eps)\n        self.ffn_norm = RMSNorm(dim, eps=norm_eps)\n    def forward(self, x, freqs_cis, mask=None):\n        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)\n        return h + self.feed_forward(self.ffn_norm(h))\n```\n\n这就是现代 LLM 的标准积木：归一化在子层前、注意力含 RoPE 与 GQA、前馈用 SwiGLU、全程 Pre-Norm 加残差。"
+   },
+   {
+    "title": "Flash Attention：IO 感知的设计",
+    "body": "标准注意力 $\\text{softmax}(QK^T/\\sqrt{d_k})V$ 要算出一个 $n\\times n$ 的注意力矩阵。这带来两个问题：一是内存，$n\\times n$ 矩阵要存进 HBM（高带宽显存），$n=8192$ 时约 128MB，长序列极易 OOM；二是 IO 瓶颈，GPU 计算单元极快但从 HBM 读写带宽有限，标准注意力反复读写这个大矩阵，大量时间花在搬数据而非算数。\n\nFlash Attention 的核心思想：**重新组织计算顺序，避免把 $n\\times n$ 矩阵写进 HBM**。它利用 GPU 的 SRAM（片上缓存，约 20MB，极快）做**分块（tiling）**计算，把数据块留在 SRAM 里算完，只把最终结果写回 HBM。\n\n能这么做的数学基础是 **online softmax**：softmax 可以增量计算，分块时维护运行中的最大值 $m$ 和归一化和 $\\ell$，每来一块就更新这两个统计量，无需见到完整的一行就能得到正确结果。\n\n效果：FLOP 没减少（仍是 $O(n^2 d)$），但 HBM 访问大幅下降，空间从 $O(n^2)$ 降到 $O(n)$，在 A100 上约 2~4 倍加速。Flash Attention 2 进一步调整循环顺序、减少非矩阵乘操作、加强并行，可达 2~9 倍。"
+   },
+   {
+    "title": "其它现代技术",
+    "body": "现代 LLM 还有一批正交的技术：\n\n- **滑动窗口注意力（Mistral）**：每个 token 只关注前 $W$ 个 token，把复杂度从 $O(n^2)$ 降到线性。靠多层堆叠让信息跨窗口传播，第 $k$ 层感受野约 $k\\times W$。\n- **混合专家 MoE（Mixtral）**：不同输入由不同「专家」FFN 处理，每次只激活 TopK 个（通常 2 个）。Mixtral 8x7B 等效约 46B 参数，但每次只激活约 13B，质量接近更大的稠密模型。挑战是负载均衡、通信开销、所有专家都要进显存。\n- **长上下文扩展**：位置插值（PI）把超长位置压回训练范围；YaRN 对不同频率维度分别处理；ALiBi 不用位置编码，而在注意力分数上加与距离成正比的负偏置，天然支持外推。\n- **量化**：GPTQ、AWQ 等训练后量化把权重压到 4bit，显存和带宽需求大降；还可以量化 KV Cache。",
+    "tip": "MoE 的「等效参数量」和「激活参数量」是两回事：前者是总容量，后者决定单次前向的计算量。"
+   },
+   {
+    "title": "易错点与小结",
+    "body": "几个容易混的点：\n\n- **RoPE 编码的是相对位置**，靠旋转角度差让内积只依赖 $(n-m)$，不是绝对位置；它只作用在 Q、K 上。\n- **GQA 介于 MHA 和 MQA 之间**：$G=H$ 退化为 MHA，$G=1$ 退化为 MQA；它削减的是 KV 头数，省的是 KV Cache 和 KV 参数。\n- **Flash Attention 不减少 FLOP**，减少的是 HBM 读写次数和峰值显存（$O(n^2)\\to O(n)$）。\n- **RMSNorm 去掉的是减均值**，不是去掉归一化本身。\n- **MoE 稀疏激活**：总参数大但单次只激活一部分，计算量远小于等效稠密模型。\n\n小结：现代 LLM = 在解码器架构上把每个组件换成更优选择（Pre-RMSNorm、SwiGLU、RoPE、GQA）+ IO 感知的工程优化（Flash Attention）。这些正交技术的组合，让大模型能在有限硬件上服务更长上下文、更大批量。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "RoPE（旋转位置编码）通过旋转操作让注意力点积满足什么性质？",
+    "options": [
+     "点积只依赖两个 token 的绝对位置 m 和 n",
+     "点积只依赖相对距离 m-n，与绝对位置无关",
+     "点积与位置完全无关",
+     "点积只依赖 token 的内容"
+    ],
+    "answer": 1,
+    "explain": "RoPE 给位置 m 的向量旋转 mθ，利用 R(mθ)^T R(nθ)=R((n-m)θ)，使变换后内积只依赖相对距离 (n-m)，这正是注意力真正需要的相对位置信息。"
+   },
+   {
+    "type": "judge",
+    "prompt": "RoPE 同时作用在 Q、K、V 三个张量上。",
+    "answer": false,
+    "explain": "RoPE 只作用在 Q 和 K 上，因为它要影响的是注意力分数 QK^T；V 不参与位置相关的点积，不需要旋转。"
+   },
+   {
+    "type": "choice",
+    "prompt": "GQA（分组查询注意力）主要解决什么问题？",
+    "options": [
+     "训练时的梯度消失",
+     "自回归解码时 KV Cache 的内存占用过大",
+     "位置编码的长度外推",
+     "激活函数的表达力不足"
+    ],
+    "answer": 1,
+    "explain": "GQA 让多个 Q 头共享一组 KV 头，削减 KV 头数，从而大幅减小 KV Cache 内存（也减少 KV 参数），同时质量接近 MHA。"
+   },
+   {
+    "type": "choice",
+    "prompt": "关于 MHA、MQA、GQA 三者的关系，哪一项正确？",
+    "options": [
+     "GQA 的 KV 头数 G 满足 1<G<H，是 MHA（G=H）与 MQA（G=1）的折中",
+     "MQA 的 KV 头比 MHA 还多",
+     "GQA 让每个 Q 头都有独立的 KV 头",
+     "三者的 KV Cache 大小完全相同"
+    ],
+    "answer": 0,
+    "explain": "MHA 是 G=H（每头独立 KV），MQA 是 G=1（所有头共享一组 KV），GQA 取 1<G<H 折中，质量接近 MHA、内存接近 MQA。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Flash Attention 通过减少浮点运算次数（FLOP）来加速注意力计算。",
+    "answer": false,
+    "explain": "Flash Attention 的 FLOP 和标准注意力相同（仍是 O(n²d)）。它靠分块+online softmax 避免把 n×n 矩阵写入 HBM，减少的是 HBM 读写次数和峰值显存（O(n²)→O(n)），从而加速。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Flash Attention 能在不存完整 n×n 矩阵的情况下算出正确结果，依赖的数学基础是？",
+    "options": [
+     "矩阵的低秩分解",
+     "online softmax：softmax 可增量计算，分块时维护运行中的最大值 m 和归一化和 ℓ",
+     "把 softmax 换成线性函数",
+     "傅里叶变换"
+    ],
+    "answer": 1,
+    "explain": "online softmax 让 softmax 能分块增量计算：每来一块就更新全局最大值 m 和归一化和 ℓ，无需见到完整一行即可得到正确的 softmax 结果。"
+   },
+   {
+    "type": "judge",
+    "prompt": "MoE（混合专家）的等效参数量很大，但每次前向只激活一部分专家，因此实际计算量远小于同等参数量的稠密模型。",
+    "answer": true,
+    "explain": "如 Mixtral 8x7B 等效约 46B 参数，但每次只激活约 2 个专家（约 13B），计算量与 13B 稠密模型相当，质量却接近更大模型。这就是稀疏激活的价值。"
+   },
+   {
+    "type": "input",
+    "prompt": "LLaMA 用哪种归一化替代了 LayerNorm？（英文缩写即可）",
+    "accept": ["RMSNorm", "rmsnorm", "RMS Norm", "rms norm", "RMSnorm", "均方根归一化"],
+    "explain": "LLaMA 用 RMSNorm（去掉减均值、没有 β 偏置），并放在子层之前（Pre-RMSNorm），训练更稳。"
+   },
+   {
+    "type": "input",
+    "prompt": "LLaMA-13B 规格、序列 4096、32 层，MHA（32 个 KV 头）的 KV Cache 约 4GB。改用 GQA 的 8 个 KV 头后，KV Cache 降到约多少 GB？",
+    "accept": ["1", "1GB", "1 GB", "约1", "1.0", "1.07"],
+    "explain": "KV Cache 与 KV 头数成正比，8/32=25%，4GB×25%≈1GB。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 LLaMA 的每个组件替换与它替代的旧组件配对：",
+    "left": ["RMSNorm", "SwiGLU", "RoPE", "GQA"],
+    "right": [
+     "替代 LayerNorm（去掉减均值）",
+     "替代 GELU/ReLU（门控线性单元）",
+     "替代可学习的绝对位置编码（旋转编码相对位置）",
+     "替代标准 MHA（多个 Q 头共享 KV 头）"
+    ],
+    "explain": "RMSNorm↔LayerNorm、SwiGLU↔激活函数、RoPE↔绝对位置编码、GQA↔MHA。逐项对应。"
+   },
+   {
+    "type": "match",
+    "prompt": "把现代 LLM 技术与其解决的问题配对：",
+    "left": ["GQA", "Flash Attention", "滑动窗口注意力", "MoE"],
+    "right": [
+     "KV Cache 内存占用过大",
+     "注意力的内存瓶颈与 HBM IO（峰值显存 O(n²)）",
+     "长序列下注意力的 O(n²) 计算复杂度",
+     "在低计算成本下扩展模型容量"
+    ],
+    "explain": "GQA 省 KV 内存、Flash Attention 解决 IO/显存瓶颈、滑动窗口降复杂度、MoE 稀疏扩容。逐项对应。"
+   },
+   {
+    "type": "choice",
+    "prompt": "RoPE 相比绝对位置编码，在长上下文上的一个重要优势是什么？",
+    "options": [
+     "完全不需要任何位置信息",
+     "较好的长度外推能力：编码相对位置，推理处理更长序列时相对关系仍有意义",
+     "可以减少注意力的 FLOP",
+     "让模型不再需要注意力机制"
+    ],
+    "answer": 1,
+    "explain": "RoPE 编码相对位置（旋转角度差），训练只见过长度 L 也能在更长序列上保持相对位置语义，配合 PI/YaRN 等可扩展到 128K+。"
+   }
+  ]
+ }
+]

@@ -1,0 +1,124 @@
+[
+  {
+    "id": "u5c4",
+    "title": "Tokenization 与数据集格式",
+    "subtitle": "从文本到整数序列：BPE、Sequence Packing 与存储格式选型",
+    "intro": [
+      {
+        "title": "两道鸿沟：文本 → 整数，可变长 → 固定形状",
+        "body": "训练语言模型面对两个不可化简的约束：\n\n**约束 1**：模型只消费离散整数序列，文本是连续字符，中间必须有 `tokenizer` 做映射。这个「查表」在 1TB 语料规模下变成严肃的工程问题。\n\n**约束 2**：GPU 需要固定形状的 batch，但文本长度天然参差不齐（p25≈50 token，p75≈800 token，p95≈3000 token）。如果用 padding 对齐，短文档大量浪费算力；如果截断，信息丢失。\n\n**约束 3**：存储格式决定读取效率。1TB 文本经过 `tokenizer` 处理后变成约 280B token id（按 3.5 字节/token 估算）。格式选型直接决定随机访问成本、shard 分配方式、多节点读取吞吐和断点续训能力。\n\n**任何一个约束处理不当，都会导致训练效率损失、loss 数值不准或训练不可恢复。**"
+      },
+      {
+        "title": "BPE、SentencePiece、Tiktoken：三种实现的核心差异",
+        "body": "**BPE（Byte-Pair Encoding）**：从字节出发，统计高频相邻 token pair，合并成新 token，迭代直到词表达到目标大小（如 50,257）。GPT-2 使用 byte-level BPE，天然支持任意 Unicode，无 OOV。\n\n**SentencePiece**：C++ 实现，速度比 Python BPE 快约 20×。把空格作为特殊符号 `▁` 纳入词表，编码结果与分词边界无关。支持 BPE 和 Unigram 两种算法。LLaMA 1/2 使用 SentencePiece（32K 词表）。\n\n**Tiktoken**：Rust 实现编码推理路径，专注推理速度，单线程比 Python BPE 快约 3-5×。GPT-4、LLaMA 3+（128K 词表）使用 Tiktoken-based BPE。\n\n| 维度 | SentencePiece | Tiktoken | HF Tokenizers |\n|------|---------------|----------|---------------|\n| 大语料训练 | 快（C++，分钟级） | 不支持训练 | 快（Rust，分钟级） |\n| 单线程编码吞吐 | ~200 MB/s | ~500 MB/s | ~400 MB/s |\n| 并行批量编码 | 部分支持 | 原生支持 | 原生支持 |",
+        "tip": "复现已有模型时，必须以对应 checkpoint 发布的 tokenizer 文件为准，不能只按模型家族名推断——LLaMA 1/2 用 SentencePiece，LLaMA 3+ 改为 Tiktoken-based BPE。"
+      },
+      {
+        "title": "词表大小的工程取舍",
+        "body": "词表大小是 tokenizer 最核心的超参，影响面极广：\n\n| 词表大小 | 典型模型 | 序列长度 | Embedding 矩阵（BF16, 4096 dim） | 多语言覆盖 |\n|---------|---------|---------|--------------------------------|----------|\n| 32K | LLaMA 1/2, Mistral | 较长 | ~512 MB | 亚洲语言弱 |\n| 50K | GPT-2, RoBERTa | 中 | ~800 MB | 英语为主 |\n| 128K | GPT-4, LLaMA 3+ | 短 | ~1.6 GB | 较好多语言 |\n| 256K | Gemma-2 | 更短 | ~4 GB | 强多语言 |\n\n**关键权衡**：词表越大，同样文本用更少 token 表示（注意力计算省），但 Embedding 矩阵更大（显存开销高）。对 attention O(n²) 的模型，序列长度增加比 Embedding 矩阵增大代价更敏感。\n\n**经验法则**：英语为主 32K-65K；强多语言需求 100K+；代码为主 50K-100K 并加 byte-fallback。"
+      },
+      {
+        "title": "Sequence Packing：消除 Padding 浪费",
+        "body": "**问题**：自然语言文档长度分布极不均匀。若 seq_len=4096，平均文档 200 token，不 packing 时 padding 比例高达 95%。\n\n**解决方案**：把多条文档的 token 流首尾拼接填满固定长度窗口，几乎无 padding 浪费。\n\n**新问题**：默认 causal attention 中，后一个文档的 token 会 attend 到前一个文档（跨文档 attention 污染）。\n\n**两种解法**：\n1. **Document boundary mask**：构建 `[seq_len × seq_len]` 的 mask 矩阵，同文档内 causal，跨文档屏蔽。额外显存开销 O(seq_len²)\n2. **Flash Attention `cu_seqlens` 接口**：用累积序列长度向量标记文档边界，完全在 CUDA kernel 内处理，**无额外显存开销**，是大规模预训练的推荐方案",
+        "tip": "document boundary mask 在 seq_len=4096 时约占 16MB/sample 额外显存。Flash Attention cu_seqlens 方式零额外开销，首选。"
+      },
+      {
+        "title": "token-level vs sample-level loss：Packing 改变 loss 语义",
+        "body": "**Sample-level loss**：每个文档先在文档内平均，再跨文档平均。长文档和短文档权重相同。\n\n**Token-level loss**：所有 token 等权，长文档自然获得更多权重。这是 packing 时的自然形式。\n\n**实际影响**：\n- 语料混合短文档（新闻）和长文档（书籍）时，token-level 偏向长文档，可能导致模型对长格式内容过拟合\n- 代码预训练中，大文件获得更多权重，小函数/短脚本学习不足\n- 指令微调中，需要只对 response 部分计算 loss（prompt 部分加 loss mask 置 0）\n\n**工程陷阱**：预训练和微调如果混用不同 loss 语义，会导致 loss scale 突变，使学习率超参失效。必须全程保持 loss 语义一致。"
+      },
+      {
+        "title": "Dataset 格式选型：从调试到大规模预训练",
+        "body": "| 格式 | 随机访问 | 压缩比 | 多节点友好 | 适用场景 |\n|------|----------|--------|------------|----------|\n| `JSONL` | 差（扫全文） | 低 | 差 | < 10GB 调试 |\n| `Parquet` | 较好（row group） | 高（数值列 2-4×） | 好 | 灵活查询、HF datasets |\n| `Arrow` mmap | 极好（零拷贝） | 中 | 中 | SSD 上的训练集 |\n| `WebDataset` .tar | 差 | 可选 | 好 | 流式读取、多模态 |\n| `MosaicML Streaming` .mds | 好（shard index） | 高 | 极好 | 大规模预训练首选 |\n| `litdata` .bin | 好（offset index） | 高 | 好 | 接近 .mds |\n\n**关键数据**：在 64 节点 × 32 workers 测试中，JSONL + 在线 tokenization 读取吞吐约 2.1 GB/s（tokenization 成为瓶颈），.mds 格式达到 13.8 GB/s（CPU 占用仅 20%），GPU 利用率稳定在 90%+。",
+        "tip": "大规模预训练（>100GB 数据）应选离线 tokenization + .mds 或 .bin 格式；在线 tokenization 会让 DataLoader CPU 成为瓶颈，GPU 利用率可能跌至 60% 以下。"
+      },
+      {
+        "title": "Sharding 策略与 Resume 设计",
+        "body": "**Sharding 的必要性**：单文件无法并行读取，失败恢复粒度太粗，无法均匀分配到多节点。\n\n**推荐策略——按 token 数 sharding**：每 shard 含约 10M token（约 40MB 未压缩，zstd 压缩后 ~15-20MB）。1TB 文本约 280B token，产生约 28,000 个 shard。\n\n**Shard 大小的工程边界**：\n- 太小（< 16MB）：open/stat 开销大，对象存储请求数多，TLS 握手频繁\n- 太大（> 2GB）：失败重试代价大，shard 内 shuffle 灵活性差\n- **推荐 64MB-1GB**\n\n**Resume-friendly 要求**：\n1. 相同 seed + epoch + rank → 产生相同 shard 序列（deterministic）\n2. 不同 rank 的 shard 集合不重叠\n3. checkpoint 记录 epoch + step + 每个 shard 已消费 sample 数\n4. 重启时用相同 shuffle seed 重建 shard 顺序，跳过已消费部分",
+        "reveal": {
+          "q": "1TB 原始文本，使用 LLaMA-3 tokenizer（平均 3.5 字节/token），按 10M token/shard 切分，大约会产生多少个 shard？",
+          "a": "约 28,000 个 shard。计算：1TB ÷ 3.5 字节/token ≈ 286B token，286B ÷ 10M = 28,600 个 shard。每个 shard 未压缩约 40MB（10M × 4 字节/int32），zstd 压缩后约 15-20MB。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "LLaMA 3 相比 LLaMA 1/2 把词表从 32K 扩展到约 128K，最直接的工程收益是什么？",
+        "options": [
+          "减少了 Embedding 矩阵的显存占用",
+          "同样的文本用更少 token 表示，注意力计算的序列长度更短",
+          "提高了单线程编码推理速度",
+          "消除了 OOV（out-of-vocabulary）问题"
+        ],
+        "answer": 1,
+        "explain": "词表越大，同样文本用更少 token 表示（序列更短），attention 计算（O(n²)）代价更低。这是 LLaMA 3 扩大词表的核心动机，尤其对多语言场景（中文、日文等每字节需要更多 token 的语言）收益显著。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Sequence Packing 把多个文档 token 首尾拼接，默认 causal attention 下不会产生任何问题。",
+        "answer": false,
+        "explain": "默认 causal attention 允许后一文档的 token attend 到前一文档，产生跨文档 attention 污染。需要通过 document boundary mask 或 Flash Attention 的 cu_seqlens 参数来隔离文档边界。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Flash Attention 的 `cu_seqlens` 参数相比显式构建 document boundary mask 矩阵的优势是？",
+        "options": [
+          "支持更长的序列长度",
+          "无额外显存开销，边界处理完全在 CUDA kernel 内完成",
+          "不需要知道文档边界的位置",
+          "可以让不同文档的 token 相互 attend 提升模型能力"
+        ],
+        "answer": 1,
+        "explain": "document boundary mask 需要 O(seq_len²) 的额外显存（seq_len=4096 时约 16MB/sample）。Flash Attention cu_seqlens 在 CUDA kernel 内处理边界，无额外显存开销，是大规模预训练的推荐方案。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Dataset 格式与其最适合的场景匹配：",
+        "left": ["JSONL", "Parquet", "MosaicML Streaming .mds", "WebDataset .tar"],
+        "right": [
+          "< 10GB 的小数据集调试，人类可读",
+          "多节点大规模预训练，支持断点续训",
+          "图像/音频/文本混合的流式读取",
+          "需要灵活列过滤和查询，如 HuggingFace datasets"
+        ],
+        "explain": "JSONL 最简单适合小数据调试；Parquet 列式存储支持灵活查询和高压缩比；.mds 专为分布式训练设计，支持 resume；WebDataset .tar 适合流式读取多模态数据。"
+      },
+      {
+        "type": "choice",
+        "prompt": "大规模预训练（1TB 数据，512 GPU）应该选择什么 tokenization 策略？",
+        "options": [
+          "在线 tokenization：DataLoader 每次读取时动态处理，保持灵活性",
+          "离线预处理：训练前一次性 tokenize，存为 .mds 格式，训练时只做数组读取",
+          "混合策略：前 50% 数据在线，后 50% 离线",
+          "使用 Python BPE 库在线处理，多线程加速"
+        ],
+        "answer": 1,
+        "explain": "大规模预训练首选离线预处理：训练时 DataLoader 只做 IO + 类型转换，CPU 几乎空闲（约 20% 使用率）。在线 tokenization 会让 DataLoader CPU 成为瓶颈，GPU 利用率可能跌至 60% 以下。实测 .mds 格式读取吞吐达 13.8 GB/s，JSONL 在线 tokenize 仅 2.1 GB/s。"
+      },
+      {
+        "type": "judge",
+        "prompt": "指令微调时，对 prompt 部分和 response 部分计算 loss 的权重应该相同，因为两者都是有效文本。",
+        "answer": false,
+        "explain": "指令微调通常只对 response 部分计算 loss，prompt 部分加 loss mask 置 0。原因：模型需要学习「给定 prompt 生成正确 response」，而不是「生成 prompt」。若对 prompt 也计算 loss，会导致模型学习复制 prompt 模式，微调效果下降。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Sharding 策略中，大规模语言模型预训练首选哪种切分方式？",
+        "options": [
+          "按文档数：每 N 个文档一个 shard，实现简单",
+          "按文件大小：每 N MB 一个 shard，shard 大小均匀",
+          "按 token 数：每 N 个 token 一个 shard，step 数可预测",
+          "按 hash：文档 ID hash 到 shard，确定性强"
+        ],
+        "answer": 2,
+        "explain": "按 token 数 sharding 使 shard 内 token 数均匀，每个训练 step 消费的 token 数可预测，DataLoader 分配均匀。1TB 文本约 280B token，按 10M token/shard 产生约 28,000 个 shard，是大规模预训练的推荐策略。"
+      },
+      {
+        "type": "input",
+        "prompt": "Tiktoken 的编码推理是用哪种编程语言实现的（核心路径）？",
+        "accept": ["Rust", "rust"],
+        "explain": "Tiktoken 的核心编码推理逻辑用 Rust 实现，提供 Python bindings 调用。Rust 实现避免了 Python GIL 和 GC 开销，单线程吞吐约 500 MB/s，比 Python BPE 实现快约 5-10 倍，比 SentencePiece C++ 实现也快约 2-3 倍。"
+      }
+    ]
+  }
+]

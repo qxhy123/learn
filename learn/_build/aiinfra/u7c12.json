@@ -1,0 +1,122 @@
+[
+  {
+    "id": "u7c12",
+    "title": "队列配额、优先级与公平调度",
+    "subtitle": "谁先跑、谁保底、谁能被抢占，以及如何恢复",
+    "intro": [
+      {
+        "title": "动机：资源分配的四类不可化简约束",
+        "body": "AI 集群同时面对多重张力：\n\n- **资源离散**：一个 32 GPU 作业通常不能用分散在 32 台机器的单卡拼出来\n- **租户竞争**：线上、研究、评测、数据生成和 notebook 争同一批卡\n- **作业整体性**：分布式训练只启动一半 worker，通常没有有效训练进度\n- **恢复成本**：抢占一个没有 checkpoint 的训练任务，可能浪费数百 GPU-hour\n\n于是需要一套机制把资源分配决策变成**可预测、可审计、可恢复的准入过程**，而不是先到先得的抢占战场。",
+        "tip": "从「提交到达是随机的」推出队列；从「强势租户挤占弱势租户」推出配额；从「不同业务价值」推出优先级；从「已满载时高优先级不能只是标签」推出抢占。"
+      },
+      {
+        "title": "配额三件套：保底、上限、借用",
+        "body": "一个只有上限的配额系统会让集群在 A 团队空闲时仍拒绝 B 团队作业，利用率和体验都差。生产可用的配额模型需要三字段同时存在：\n\n| 字段 | 含义 | 作用 |\n|---|---|---|\n| `nominal quota` | 名义配额/保底 | 正常情况下的资源权利 |\n| `hard cap` | 绝对上限 | 防止一个租户无限扩张 |\n| `borrowing limit` | 可借用上限 | 提高闲时利用率 |\n\n**借用/借出的核心规则**：借来的资源必须能被收回，收回时要有明确顺序、通知和恢复语义。优先级高的队列不能突破 `hard cap`，借用资源也必须能被回收。",
+        "reveal": {
+          "q": "为什么优先级不能替代配额？",
+          "a": "优先级表达冲突时谁更重要，但不限制绝对消耗量。没有配额，高优先级队列会吃掉整个集群。配额表达保底和上限，解决的是「有多少」，优先级解决的是「谁更重要」，两者解决不同问题。"
+        }
+      },
+      {
+        "title": "DRF：多资源公平比单 GPU 计数更诚实",
+        "body": "DRF（Dominant Resource Fairness）比较每个租户在「占比最高的那类资源」上的使用份额，而不是只看 GPU 数。\n\n假设集群有 100 GPU、1000 vCPU：\n\n| 队列 | GPU 占比 | CPU 占比 | Dominant share |\n|---|---|---|---|\n| online | 20% | 12% | 20% |\n| research | 35% | 18% | 35% |\n| data | 5% | 42% | **42%** |\n\n只看 GPU，`data` 队列看起来很节省；但它占了 42% CPU。`DRF` 把 `data` 的 dominant share 视为 42%，防止继续给它 CPU-heavy 作业加剧不公平。\n\n带权重 DRF 的公式：`effective_share = dominant_share / weight`，生产队列权重为 2 时，20% dominant share 变成 10% effective share，优先级更高但仍受约束。",
+        "tip": "DRF 的工程前提是 request 可信。用户低报 CPU 或内存需求会让公平计算失真，平台需要通过历史画像和 chargeback 修正。"
+      },
+      {
+        "title": "Gang scheduling：防止分布式作业半启动浪费",
+        "body": "`gang scheduling` 表达「一组 Pod 必须作为整体被准入」。如果 8-worker 分布式训练只启动 5 个 worker，已启动的 5 个可能只是在 rendezvous 阶段空等，占着卡不产生训练进度。\n\n常见实现：\n- `Volcano` PodGroup 的 `minMember` / `minResources`\n- `Kueue` Workload 对 PyTorchJob/RayJob 等的准入\n- Kubernetes JobSet / Indexed Job 提供稳定 worker 身份\n\nGang 的本质是把「Pod 级可运行」提升为「作业级可运行」。代价是作业可能等更久，但避免半启动造成的资源浪费。"
+      },
+      {
+        "title": "Kueue vs Volcano：准入控制器 vs 批调度器",
+        "body": "两者解决相邻但不同的问题：\n\n**`Kueue`** 是准入控制器，不替代 scheduler。核心 trick 是用 `spec.suspend: true` 暂停 Pod 创建，直到 Workload 通过配额校验才 patch 为 `suspend: false`，让 Job controller 创建 Pod。适合多团队 quota、borrow/lend、ResourceFlavor 治理。\n\n**`Volcano`** 是批调度器，直接参与 Pod 调度，表达强 gang、preempt、binpack 语义。适合 HPC、MPI、强 gang 训练平台。\n\n| 场景 | 倾向 |\n|---|---|\n| 强 gang 训练、MPI | Volcano |\n| 多团队 quota、borrow/lend | Kueue |\n| 两者同时用处理同一批 Job | 避免——双重决策会冲突 |",
+        "tip": "Kueue 的抢占叫「borrowing reclaim」，操作的是 Workload；scheduler 操作的是 Pod。两层抢占互不替代。"
+      },
+      {
+        "title": "抢占必须绑定恢复契约",
+        "body": "抢占不是「杀掉低优先级 Pod」，而是执行一份可解释的资源回收协议。\n\n**kube-scheduler 的抢占流程（PostFilter 阶段）**：\n1. 找到能让高优 Pod fit 的最小 victim 子集\n2. 优先选 PDB 违反次数最少、victim 优先级最低、运行时间最短的方案\n3. 删除 victim（gracePeriod 默认 30s）并设置 `nominatedNodeName`\n4. 高优 Pod 等待 victim 终止后下一轮调度才真正 bind\n\n**关键误解**：\n- PDB 不能阻止抢占——`preemptionPolicy: Never` 才能让高优 Pod 不触发抢占\n- 抢占不是同步的，从触发到可运行典型需要 30-60 秒\n\n**恢复契约要素**：checkpoint 路径和年龄、terminationGracePeriod、resumePolicy、重入队优先级和补偿策略。",
+        "reveal": {
+          "q": "为什么 PodDisruptionBudget（PDB）不能阻止 kube-scheduler 的抢占？",
+          "a": "PDB 只能阻止 voluntary disruption（如 drain、cluster autoscaler 缩容），不能阻止 involuntary disruption。抢占属于 involuntary，K8s 哲学是高优先级工作负载胜出。算法只是「尽量」选不违反 PDB 的方案，若所有方案都违反 PDB，仍会执行抢占。"
+        }
+      },
+      {
+        "title": "易错点：常见反模式",
+        "body": "**七个最容易踩的坑：**\n\n1. **只有 FIFO**：长作业堵住短作业，生产修复排队 → 加入配额、优先级、backfill\n2. **高优先级无上限**：一个队列吃光全池 → 优先级受 `hard cap` 和预算约束\n3. **抢占无 checkpoint**：训练反复重跑，GPU-hour 浪费 → 抢占前校验恢复契约\n4. **配额不能借用**：A 队列空闲，B 队列排爆 → nominal + borrowing + 回收规则\n5. **只按 GPU 公平**：CPU/内存先被吃光 → 引入 `DRF` 和资源画像\n6. **gang 作业拆成普通 Pod**：worker 占卡空等 rendezvous → 使用 PodGroup 或 Workload 准入\n7. **规则只在代码里**：用户不知为何 Pending → 暴露事件、原因、审计和解释页"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下关于 DRF（Dominant Resource Fairness）的描述，哪个是正确的？",
+        "options": [
+          "DRF 只统计 GPU 数量来判断公平性",
+          "DRF 比较每个租户在占比最高的那类资源上的使用份额",
+          "DRF 是业务优先级系统，可以替代配额",
+          "DRF 需要用户手动申报 dominant resource"
+        ],
+        "answer": 1,
+        "explain": "DRF 取每个租户各类资源占比中最大的那个（dominant share）进行比较，而不是只看 GPU。这样 CPU-heavy 的作业即使 GPU 用得少，也会被公平计算发现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Kueue 是一个批调度器，它直接替换 kube-scheduler 来决定 Pod 的节点放置。",
+        "answer": false,
+        "explain": "Kueue 是准入控制器，不参与调度。它通过控制 spec.suspend 字段决定 Job 是否创建 Pod，Pod 一旦创建，仍由 kube-scheduler 负责节点放置。"
+      },
+      {
+        "type": "match",
+        "prompt": "将概念与其解决的核心问题对应：",
+        "left": ["Queue", "nominal quota", "Gang scheduling", "DRF"],
+        "right": [
+          "分布式作业必须整体启动，防止半启动空等",
+          "多资源场景下的公平计算",
+          "租户在资源紧张时的保底权利",
+          "作业等待和准入规则的治理边界"
+        ],
+        "explain": "Queue 管理等待和准入规则；nominal quota 是保底资源；Gang scheduling 保证分布式作业整体准入；DRF 解决多资源公平计算。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个训练作业被抢占后没有自动恢复，最可能的第一排查点是？",
+        "options": [
+          "kube-scheduler 版本过旧",
+          "checkpoint 缺失、路径错误或间隔过长",
+          "DRF 权重配置不合理",
+          "ResourceFlavor 与节点标签不匹配"
+        ],
+        "answer": 1,
+        "explain": "抢占后恢复失败最常见根因是恢复契约缺失：checkpoint 没写、路径错误、checkpoint 年龄超过策略阈值导致被判为不可安全恢复，或 requeue 状态机卡住。"
+      },
+      {
+        "type": "input",
+        "prompt": "Kueue 通过在 Job spec 中设置哪个字段为 true 来暂停 Pod 创建，直到 Workload 通过配额校验？",
+        "accept": ["suspend", "spec.suspend"],
+        "explain": "Kueue webhook 拦截 Job 提交后自动设置 spec.suspend: true，阻止 Job controller 创建 Pod。只有 Workload 通过 ClusterQueue 配额校验后，Kueue 才把 suspend 改回 false，Job controller 才开始创建 Pod。"
+      },
+      {
+        "type": "judge",
+        "prompt": "PodDisruptionBudget（PDB）设置 disruptionsAllowed: 0 后，可以阻止 kube-scheduler 对该 Pod 发起抢占。",
+        "answer": false,
+        "explain": "PDB 只阻止 voluntary disruption（drain、cluster autoscaler 缩容等），不能阻止抢占这种 involuntary disruption。抢占算法优先选不违反 PDB 的方案，但若无选择，仍会执行抢占。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 Kueue 的 cohort 中，ClusterQueue A 从 B 借用了资源，当 B 有高优先级 Workload 到来时，Kueue 如何回收借出资源？",
+        "options": [
+          "直接删除 A 上运行的所有 Pod",
+          "通过 kube-scheduler 驱逐 A 的 Pod",
+          "撤销 A 某个 Workload 的 admission（suspend: true），让 Job controller 删除对应 Pod",
+          "修改 A 队列的 hard cap 配额"
+        ],
+        "answer": 2,
+        "explain": "Kueue 的抢占叫 borrowing reclaim，操作层是 Workload：撤销 admission，把 spec.suspend 改回 true，Job controller 看到后删除 Pod，资源释放给 B 的高优 Workload 使用。"
+      },
+      {
+        "type": "judge",
+        "prompt": "gang scheduling 能让分布式训练作业更快启动，因为它允许部分 worker 先跑。",
+        "answer": false,
+        "explain": "Gang scheduling 的作用恰恰相反：它要求一组 Pod 必须整体准入，宁可多等，也不允许只启动部分 worker。这样避免了「半启动」占卡却无法产生有效训练进度的浪费。"
+      }
+    ]
+  }
+]

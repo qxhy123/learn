@@ -1,0 +1,467 @@
+[
+  {
+    "title": "中断与现场保护",
+    "subtitle": "手头工作没做完，但必须切换上下文——怎么选 stash、临时提交还是 worktree",
+    "intro": [
+      {
+        "title": "这一关解决什么问题",
+        "body": "你正在开发一个功能，文件改到一半，测试还没跑完，线上突然需要处理 hotfix，或者同事让你马上切到 `main` 验证一个问题。这时工作区既不干净，改动又不适合直接提交到正式历史。\n\n直接 `git stash` 然后 `git stash pop` 不是唯一出路，也不总是最安全的选择。本关的目标是建立一个中断处理决策：先观察状态，再根据中断时长、改动完整度、是否需要并行运行选对工具，最后用可验证的恢复路径回到原任务。"
+      },
+      {
+        "title": "先看状态",
+        "body": "处理中断前，先固定运行这四条观察命令：\n\n```bash\ngit status -sb\ngit diff --stat\ngit diff --cached --stat\ngit stash list\n```\n\n看完后回答四个问题：\n- 当前改动能否形成一个可解释的小提交？能提交就优先提交，不要为了\"看起来干净\"把长期工作塞进 stash。\n- 中断预计持续多久？几分钟可以 stash；几小时以上考虑临时分支；需要持续多天或并行测试时优先 worktree。\n- 是否有 staged、unstaged、untracked 三类内容混在一起？stash 默认只保存已跟踪文件的改动，未跟踪文件需要显式 `-u`。\n- 切换过去后是否需要两个目录同时存在？如果新任务也要跑服务或构建，用 worktree 避免来回切分支。"
+      },
+      {
+        "title": "短期收纳：带说明的 stash",
+        "body": "```bash\n# stash push 把工作区和暂存区的改动打包成一个栈帧，改的是 stash 栈（引用层）\ngit stash push -m \"wip: pause checkout validation\"\ngit stash list\ngit stash show --stat stash@{0}\n```\n\n如果现场有新建但尚未跟踪的文件，需要加 `-u` 才会一起保存：\n\n```bash\ngit stash push -u -m \"wip: include new validation fixture\"\n```\n\n不建议只写裸 `git stash`，几天后很难从 `WIP on branch-name` 判断这个 stash 是否还重要。`-m` 说明是区分多个 stash 的关键。"
+      },
+      {
+        "title": "为什么优先 apply 而不是 pop",
+        "body": "为什么恢复 stash 时优先用 `git stash apply` 而不是 `git stash pop`？因为 `pop` 是\"应用成功后尝试删除 stash\"的合并操作，一旦应用产生冲突，stash 记录的去留就不明确；而 `apply` 只做应用，stash 记录始终保留，你可以确认改动、测试、diff 都正确后，再手动 `git stash drop stash@{0}` 删除。拆开两步能保留更多判断空间。\n\n```bash\n# apply 只动工作区和暂存区，stash 栈不变\ngit stash apply stash@{0}\ngit status -sb\n# 确认文件、测试和 diff 都正确后再删除栈帧\ngit stash drop stash@{0}\n```\n\n如果 apply 时发生冲突，处理方式和 merge 冲突相同：编辑文件、`git add`，确认后再继续，不要在冲突未解决时继续操作其他 stash。"
+      },
+      {
+        "title": "长期并行：worktree 独立工作目录",
+        "body": "当两条任务都需要运行测试或服务时，反复 stash 会让现场越来越混乱。这时用 `git worktree add` 创建另一个工作目录：\n\n```bash\n# 列出当前所有 worktree，改的是文件系统，共享同一个仓库对象库\ngit worktree list\n# 在相邻目录创建独立工作区，指向 main 分支的状态\ngit worktree add ../project-hotfix main\n# 进入新工作区后创建 hotfix 分支\ncd ../project-hotfix\ngit switch -c hotfix/login-timeout\n```\n\n每个 worktree 有自己的工作区和当前分支，但共享同一套 Git 对象库。清理前必须先检查工作区：\n\n```bash\ngit status -sb\ncd -\ngit worktree remove ../project-hotfix\n```\n\n不要为了省事用 `git worktree remove --force`，除非已确认里面没有需要保存的改动。"
+      },
+      {
+        "title": "清理未跟踪文件：clean 必须先 dry-run",
+        "body": "构建产物、临时日志、实验目录常常是未跟踪文件。清理前必须先预览：\n\n```bash\n# -n / --dry-run 只打印将被删除的路径，不执行\ngit clean -nd\n```\n\n确认每一项都可以删除后，才执行真正的清理：\n\n```bash\n# -f 强制删除，-d 包含目录；改的是文件系统（未跟踪层），通常无法通过 Git 恢复\ngit clean -fd\n```\n\n`git clean -fd` 删除的是未跟踪文件和目录，这些内容通常不在 Git 历史里。能否恢复取决于编辑器、本机文件系统或备份，不应把它当成可逆命令。"
+      },
+      {
+        "title": "常见错误与恢复路径",
+        "body": "几个最容易踩坑的场景：\n\n**stash pop 产生冲突后不知所措**：运行 `git status -sb` 确认冲突文件，按 merge 冲突流程解决，不要继续操作其他 stash。\n\n**stash 不含未跟踪文件**：普通 `git stash push` 不会保存未跟踪文件，导致新文件仍留在工作区或后续被 `git clean` 删除。解决方法是加 `-u`。\n\n**stash drop 后想找回**：立即停止写入，尝试 `git fsck --lost-found` 从悬挂对象里查找，成功率有限；重要 stash 应在删除前 `git stash show -p stash@{n} > ../stash-rescue.patch` 导出。\n\n**git clean -fd 删掉重要文件**：Git 通常帮不上忙，查编辑器本地历史、系统回收站或备份；这就是 dry-run 必须先跑的原因。\n\n**worktree remove --force 删掉未提交工作**：若目录还在，先复制文件；若已删，按文件系统备份处理。"
+      },
+      {
+        "title": "验收：学完这关你能做什么",
+        "body": "给出三个中断案例时，你能说明为什么选 stash、临时提交还是 worktree。你能区分 `git stash apply` 和 `git stash pop`，并说明为什么冲突场景优先用 `apply`。你能演示 stash 包含和不包含未跟踪文件的差异，在 `git clean -fd` 前用 `git clean -nd` 预测删除范围，安全创建和移除一个 worktree，并说出本章至少三条危险命令及其恢复路径。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "当前工作区有 staged、unstaged 改动，还有一个新建但未跟踪的文件。运行 `git stash push -m \"wip\"` 后，那个未跟踪文件的状态是什么？",
+        "options": [
+          "被保存进 stash，工作区里消失了",
+          "仍然留在工作区，stash 里没有它",
+          "被自动提交到当前分支",
+          "变成了已暂存状态"
+        ],
+        "answer": 1,
+        "explain": "stash 默认只保存已跟踪文件的改动（工作区和暂存区），未跟踪文件需要显式加 `-u` 才会一起被包含。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪个命令可以让 stash 同时保存未跟踪文件？",
+        "options": [
+          "`git stash push -a`",
+          "`git stash push -u -m \"wip\"`",
+          "`git stash push --include-staged`",
+          "`git stash save --all`"
+        ],
+        "answer": 1,
+        "explain": "`-u`（或 `--include-untracked`）让 stash 把未跟踪文件也一起打包。`-a` 会额外包含 .gitignore 忽略的文件，一般不建议随意使用。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`git stash pop` 和 `git stash apply` 的区别在于：`pop` 在应用成功后会自动删除 stash 记录，而 `apply` 不删除。",
+        "answer": true,
+        "explain": "正确。`pop` = apply + drop（仅在应用成功时）。在复杂或有冲突的场景中，拆开 `apply` + 手动确认后 `drop` 能保留更多判断空间。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`git stash apply stash@{0}` 改的是仓库的哪一层？",
+        "options": [
+          "只改提交历史，工作区不变",
+          "工作区和暂存区（把 stash 里的改动还原回来），stash 栈本身不变",
+          "stash 栈（弹出栈顶），工作区不变",
+          "远程跟踪分支"
+        ],
+        "answer": 1,
+        "explain": "`git stash apply` 把 stash 记录的改动还原到工作区和暂存区，但 stash 栈本身保持不变；要删除 stash 记录需另外运行 `git stash drop`。"
+      },
+      {
+        "type": "choice",
+        "prompt": "两条任务都需要持续跑编译服务，反复 stash 会污染现场。这种情况最合适的工具是？",
+        "options": [
+          "创建多个 stash 条目，通过 `stash@{n}` 管理",
+          "`git worktree add` 创建独立工作目录",
+          "`git branch` 创建临时分支，然后 `git switch` 来回切换",
+          "`git commit --amend` 把 WIP 追加进上一个提交"
+        ],
+        "answer": 1,
+        "explain": "`git worktree add` 让同一仓库在多个目录里各自独立运行，每个 worktree 有自己的工作区和当前分支，适合需要并行编译或服务的场景。"
+      },
+      {
+        "type": "input",
+        "prompt": "在执行 `git clean -fd` 清理未跟踪文件之前，应该先运行哪个命令预览将被删除的内容？（写出完整命令）",
+        "accept": ["git clean -nd", "git clean -n", "git clean --dry-run -d", "git clean -n -d"],
+        "explain": "`git clean -nd` 中 `-n` 表示 dry-run（只打印，不执行），`-d` 表示包含目录，可以预览 `-fd` 将删除哪些文件，避免误删重要内容。"
+      },
+      {
+        "type": "input",
+        "prompt": "要安全地把 stash 对应位置的改动恢复到工作区、同时保留 stash 记录不删除，应该用哪个命令？（命令前两个词，如 `git xxx`）",
+        "accept": ["git stash apply", "stash apply"],
+        "explain": "`git stash apply stash@{n}` 只做应用，不删除 stash 记录；确认改动正确后再手动 `git stash drop stash@{n}`。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`git clean -fd` 删除的未跟踪文件通常可以通过 `git reflog` 找回。",
+        "answer": false,
+        "explain": "`git reflog` 记录的是分支引用的移动历史，与未跟踪文件无关。未跟踪文件从未进入 Git 对象库，被 `git clean -fd` 删除后 Git 无法恢复，只能依赖编辑器本地历史或系统备份。"
+      },
+      {
+        "type": "match",
+        "prompt": "把每个工具和它最适合的中断场景配对：",
+        "left": [
+          "`git stash push -m`",
+          "临时提交到任务分支",
+          "`git worktree add`",
+          "`git clean -nd`"
+        ],
+        "right": [
+          "几分钟内切走再回来，改动还不成形",
+          "改动已能说明意图，希望保留可审查历史",
+          "两条任务都需要持续运行编译或服务",
+          "清理构建产物前预览将被删除的文件"
+        ],
+        "explain": "四个工具各有适用场景：stash 适合短期低风险收纳；临时提交保留了更好的历史；worktree 让两个任务并行互不污染；dry-run 保护未跟踪文件不被误删。"
+      },
+      {
+        "type": "choice",
+        "prompt": "移除一个 worktree 前，下列哪个步骤是必须的？",
+        "options": [
+          "先运行 `git stash clear` 清空该 worktree 里的所有 stash",
+          "先进入该 worktree 运行 `git status -sb`，确认没有未提交改动",
+          "先用 `git push --force` 把该 worktree 的所有分支推上去",
+          "直接运行 `git worktree remove --force` 最安全"
+        ],
+        "answer": 1,
+        "explain": "移除前必须确认 worktree 里没有未提交的工作；`--force` 会跳过检查并强制删除目录，可能丢失尚未保存的改动。"
+      },
+      {
+        "type": "choice",
+        "prompt": "运行 `git stash drop stash@{0}` 后想找回这个 stash，最有可能提供线索的方法是？",
+        "options": [
+          "`git log --all`",
+          "`git reflog`",
+          "`git fsck --lost-found` 查找悬挂对象",
+          "`git stash list` 还能看到它"
+        ],
+        "answer": 2,
+        "explain": "stash drop 删除的是引用，但对象库里的数据可能还没被 GC 回收。`git fsck --lost-found` 可以找到没有被任何引用指向的悬挂对象，有时能定位 stash 内容，但成功率有限，因此重要 stash 应在删除前先导出 patch。"
+      }
+    ]
+  },
+  {
+    "title": "标签发布与 Hotfix",
+    "subtitle": "把发布点固定成可审计坐标，并能从标签切 hotfix、打补丁版本、回流主干",
+    "intro": [
+      {
+        "title": "这一关解决什么问题",
+        "body": "团队准备发布 `v1.2.0`，一周后线上发现严重问题，需要从已发布版本切出最小修复，而不是把 `main` 上尚未发布的新功能一起带上线。事故复盘时还要回答：线上包到底来自哪个提交？谁创建了发布点？hotfix 是否已经合回主干？\n\n如果只说\"应该是 main 上某个位置\"，发布就没有稳定坐标。分支会继续移动，提交哈希不便于人类沟通，而标签可以把一个提交永久命名为版本。本关的目标是建立发布前后的判断顺序：先确认状态，再创建不可随意移动的发布标签；需要补丁时，从标签开分支，修复后打新版本标签，把修复合回主干。"
+      },
+      {
+        "title": "分支和标签的区别",
+        "body": "分支名表示一条持续演进的开发线——`main`、`release/1.2`、`hotfix/v1.2.1` 的指针会随新提交不断移动。标签表示某个固定提交，例如 `v1.2.0`，发布后它不应该再移动。\n\n附注标签和轻量标签的区别：\n\n```bash\n# 轻量标签：只是一个引用指针，没有额外信息\ngit tag v1.2.0-light\n# 附注标签：是一个独立对象，带标签作者、日期、说明\ngit tag -a v1.2.0 -m \"Release v1.2.0\"\ngit show v1.2.0\n```\n\n正式发布推荐附注标签，因为它包含了谁打标签、什么时候打、说明是什么，这些都是事后审计的依据。轻量标签适合临时本地标记，不适合作为团队正式发布方案。"
+      },
+      {
+        "title": "打标签前先观察",
+        "body": "发布和 hotfix 都要先观察，不要先打标签。建议固定运行：\n\n```bash\ngit status -sb\ngit branch -vv\ngit log --oneline --graph --decorate --all -n 16\ngit tag --list --sort=version:refname\ngit show --stat HEAD\n```\n\n打标签前要回答：工作区是否干净？当前提交是否就是要发布的提交（用 `git log --decorate` 和 CI 记录核对）？当前分支是否符合团队发布策略？同名标签是否已经存在（`git tag --list v1.2.0`）？测试和构建是否已经通过？标签是否已经推送或被流水线监听？\n\n同名标签存在时不要覆盖，先确认原因。"
+      },
+      {
+        "title": "发布流程：创建、推送、验证标签",
+        "body": "一个可复用的发布前检查和推送流程：\n\n```bash\n# 先同步远端标签，避免本地不知道远端已有同名标签\ngit fetch --tags origin\ngit tag --list v1.2.0\ngit log --oneline --decorate -n 5\ngit show --stat HEAD\n# 确认以上全部无误后创建附注标签\ngit tag -a v1.2.0 -m \"Release v1.2.0\"\n# 推送标签（push 不自动推送标签，需要显式指定）\ngit push origin v1.2.0\n# 推送后验证远端\ngit ls-remote --tags origin v1.2.0\n```\n\n`git push` 默认不推送本地标签，必须显式 `git push origin <tag>` 或 `git push --tags`（后者推送所有本地标签，一般不推荐）。"
+      },
+      {
+        "title": "为什么不能移动已发布标签",
+        "body": "为什么发布后不能用 `git tag -f` 移动同名标签？因为标签一旦推送，CI/CD 流水线、制品仓库、其他团队成员和客户可能已经消费了这个版本。移动标签会让不同机器看到不同的\"同名版本\"内容，制品一致性就被破坏了。\n\n正确做法是版本号递增：`v1.2.0` 有问题，就发布 `v1.2.1`。新版本号比移动旧标签更容易被团队、制品仓库和客户理解。\n\n如果标签错误还没有推送，可以本地修复：\n\n```bash\n# 删除本地错误标签\ngit tag -d v1.2.0\n# 在正确提交上重新创建\ngit tag -a v1.2.0 -m \"Release v1.2.0\"\n```"
+      },
+      {
+        "title": "从发布标签切 Hotfix 分支",
+        "body": "线上版本有问题时，先从已发布标签创建补丁分支，而不是从当前 `main` 开始（`main` 可能已经有未发布的新功能）：\n\n```bash\ngit fetch --tags origin\n# 从 v1.2.0 标签创建 hotfix 分支，不带 main 上的新内容\ngit switch -c hotfix/v1.2.1 v1.2.0\n# 编辑文件，添加或更新回归测试\ngit status -sb\ngit diff --stat\ngit add <fixed-files>\ngit commit -m \"fix: patch login timeout in v1.2.1\"\n# 打补丁版本标签\ngit tag -a v1.2.1 -m \"Release v1.2.1 hotfix\"\ngit push origin hotfix/v1.2.1 v1.2.1\n```\n\n注意：从标签 checkout 后如果不先建分支（`git switch -c`），就会进入 detached HEAD 状态；在 detached HEAD 上的提交没有分支名保护，后续切走就找不到了。"
+      },
+      {
+        "title": "把 Hotfix 回流主干",
+        "body": "补丁上线后，工作还没结束。必须让主干也包含这个修复，否则下个常规版本可能重新引入问题。\n\n```bash\ngit switch main\ngit pull --ff-only\n# 把 hotfix 分支合回主干（保留合并历史）\ngit merge --no-ff hotfix/v1.2.1\n# 或按团队策略 cherry-pick 修复提交\ngit log --oneline --decorate -n 8\ngit status -sb\n```\n\n如果 `main` 已经重构过，直接 merge 可能冲突；这时用 PR、代码评审和测试来完成回流，不要因为补丁已上线就跳过主干验证。完成后记录四件事：受影响版本、补丁版本、修复分支、回流方式。"
+      },
+      {
+        "title": "常见错误与恢复路径",
+        "body": "**打标签前没有确认工作区干净、目标提交正确**：发布标签应该指向已提交已验证的状态，打标签前必须 `git status -sb` 和 `git show --stat HEAD`。\n\n**没有先 `git fetch --tags`**：导致本地不知道远端已有同名标签，打完才发现冲突。\n\n**从当前 `main` 切 hotfix**：会把未发布的新功能一起带进补丁版本，应从已发布标签 `git switch -c hotfix/v1.2.1 v1.2.0`。\n\n**detached HEAD 上直接提交**：立刻 `git switch -c rescue/hotfix-work` 或记录提交哈希后建分支，再整理。\n\n**发布 hotfix 后忘记合回主干**：导致下个版本丢失补丁，必须在发布流程里把\"回流主干\"作为强制检查项。\n\n**已推送错误标签后直接删除或强推**：先冻结自动化，通知团队停止消费该版本，记录下游影响，确认后再操作。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "附注标签（annotated tag）和轻量标签（lightweight tag）最关键的区别是什么？",
+        "options": [
+          "附注标签可以推送到远端，轻量标签不能",
+          "附注标签是一个独立对象，包含标签作者、日期和说明；轻量标签只是一个引用指针",
+          "附注标签只能指向 `main` 分支的提交",
+          "轻量标签可以被 CI 触发构建，附注标签不行"
+        ],
+        "answer": 1,
+        "explain": "附注标签用 `-a` 创建，本身是一个 Git 对象，带有标签作者、日期和说明，适合审计和正式发布。轻量标签只是指向某个提交的引用，没有额外元数据。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`git push origin main` 会把本地所有标签也一起推送到远端。",
+        "answer": false,
+        "explain": "`git push` 默认只推送分支，不推送标签。标签需要显式指定，如 `git push origin v1.2.0`，或用 `git push --tags` 推送所有本地标签（一般不推荐）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "线上 `v1.2.0` 发现严重问题，需要最小修复。应该从哪里切出 hotfix 分支？",
+        "options": [
+          "从当前 `main` 分支切出，这样代码最新",
+          "从 `v1.2.0` 标签切出，避免带入 `main` 上未发布的新功能",
+          "从上一个 `main` 合并点切出",
+          "在当前工作区直接修改，不需要新建分支"
+        ],
+        "answer": 1,
+        "explain": "从已发布标签 `git switch -c hotfix/v1.2.1 v1.2.0` 切出 hotfix 分支，保证修复只基于 `v1.2.0` 的真实发布内容，不会带入 `main` 上尚未发布的新功能。"
+      },
+      {
+        "type": "input",
+        "prompt": "要创建一个名为 `v2.0.0`、带说明 \"Release v2.0.0\" 的附注标签，完整命令是什么？（写出完整命令）",
+        "accept": [
+          "git tag -a v2.0.0 -m \"Release v2.0.0\"",
+          "git tag -a v2.0.0 -m 'Release v2.0.0'"
+        ],
+        "explain": "`git tag -a` 创建附注标签，`-m` 指定标签说明。不加 `-a` 就是轻量标签，不会要求说明也不会创建标签对象。"
+      },
+      {
+        "type": "choice",
+        "prompt": "从 `v1.2.0` 标签检出后，不先创建分支直接提交，会进入什么状态？",
+        "options": [
+          "自动创建名为 `v1.2.0-fix` 的新分支",
+          "HEAD 指向提交而不是分支名（detached HEAD），切走后提交难以找回",
+          "提交会直接追加到 `v1.2.0` 标签上",
+          "提交失败，必须先创建分支才能提交"
+        ],
+        "answer": 1,
+        "explain": "从标签或提交哈希检出后，HEAD 直接指向提交而非分支（detached HEAD）。在此状态提交产生的记录没有分支名保护，一旦切走，引用就找不到了。应立刻 `git switch -c rescue/<name>` 建分支保护。"
+      },
+      {
+        "type": "input",
+        "prompt": "打完 `v1.2.0` 标签后，如何验证该标签已经成功推送到远端 `origin`？（写出命令关键词，如 `git xxx yyy`）",
+        "accept": [
+          "git ls-remote --tags origin v1.2.0",
+          "git ls-remote --tags origin"
+        ],
+        "explain": "`git ls-remote --tags origin v1.2.0` 查询远端 `origin` 上是否存在该标签，比单纯查本地 `git tag --list` 更可靠，因为本地和远端标签可能不同步。"
+      },
+      {
+        "type": "judge",
+        "prompt": "发现 `v1.2.0` 打错了提交，直接运行 `git tag -f v1.2.0 <correct-commit>` 然后强推远端是标准修复流程。",
+        "answer": false,
+        "explain": "错误。已推送的标签可能已被 CI/CD、制品仓库和团队成员消费，强推会让不同机器看到不同内容，破坏制品一致性。正确做法是发布新的版本号（如 `v1.2.1`），冻结自动化，公告团队，而不是移动旧标签。"
+      },
+      {
+        "type": "match",
+        "prompt": "把每个命令和它在发布/hotfix 流程中的作用配对：",
+        "left": [
+          "`git tag -a v1.2.0 -m \"...\"`",
+          "`git switch -c hotfix/v1.2.1 v1.2.0`",
+          "`git push origin v1.2.0`",
+          "`git merge --no-ff hotfix/v1.2.1`"
+        ],
+        "right": [
+          "创建带元数据的附注标签，固定发布坐标",
+          "从发布标签切出 hotfix 分支，避免带入未发布新功能",
+          "把标签推送到远端，可能触发 CI/CD 流水线",
+          "把 hotfix 修复合回主干，保留合并历史"
+        ],
+        "explain": "四个命令串联成完整的发布和 hotfix 流程：打标签→从标签切分支→推送标签→回流主干。left[i] 与 right[i] 逐项对应。"
+      },
+      {
+        "type": "choice",
+        "prompt": "打标签前运行 `git fetch --tags origin` 的目的是什么？",
+        "options": [
+          "把本地标签推送到远端",
+          "把本地工作区的改动下载到暂存区",
+          "把远端的标签同步到本地，避免本地不知道远端已有同名标签",
+          "触发 CI 对当前提交重新构建"
+        ],
+        "answer": 2,
+        "explain": "`git fetch --tags` 把远端所有标签下载到本地。如果跳过这步，本地可能不知道远端已有 `v1.2.0`，打完才发现冲突，甚至需要强推覆盖。"
+      },
+      {
+        "type": "choice",
+        "prompt": "hotfix 上线后，如果忘记把 `hotfix/v1.2.1` 合回 `main`，会有什么风险？",
+        "options": [
+          "`v1.2.1` 标签会自动失效",
+          "下一个常规版本发布时可能重新引入同样的问题",
+          "`git log` 会报错找不到 hotfix 历史",
+          "远端的 hotfix 分支会被自动删除"
+        ],
+        "answer": 1,
+        "explain": "如果 hotfix 只停留在 `hotfix/v1.2.1` 分支而未合回 `main`，下次从 `main` 发布新版本时，这个修复就不在里面，同样的 bug 可能重现。回流主干是 hotfix 流程的强制收尾步骤。"
+      }
+    ]
+  },
+  {
+    "title": "历史排障：Blame 与 Bisect",
+    "subtitle": "用 git blame 和 git bisect 把\"什么时候坏的\"变成可验证证据",
+    "intro": [
+      {
+        "title": "这一关解决什么问题",
+        "body": "线上刚发布后出现回归：用户保存设置时偶尔失败。你知道 `v1.4.0` 没问题，当前 `main` 有问题，但两者之间有几十个提交。同事指出某行超时配置\"看起来可疑\"，于是团队想运行 `git blame` 看是谁改的。\n\n这类排障最容易走偏：把 `blame` 当成追责工具，或在没有稳定复现步骤时就启动 `bisect`，最后得到一个不可信的\"坏提交\"。本关的目标是建立更工程化的路径：先把问题变成可重复检查，再用历史命令收集上下文，最后用 bisect 定位第一个引入回归的提交。历史排障回答四个问题：症状是什么、从哪里开始坏、哪次改动解释了变化、下一步修复或回滚怎么做。"
+      },
+      {
+        "title": "排障前先看状态",
+        "body": "历史排障前，先不要急着 blame，也不要直接 reset 到旧提交。建议固定观察：\n\n```bash\ngit status -sb\ngit branch -vv\ngit log --oneline --graph --decorate --all -n 24\ngit tag --list --sort=-creatordate | head -20\n```\n\n工作区是否干净？`bisect` 会不断切换提交，未提交改动会让切换失败甚至污染结果。坏现象是否能稳定复现？如果复现步骤不稳定，先修复测试方法，不要让随机失败驱动 good/bad 标记。已知好版本和坏版本分别是什么？如果当前目录有未完成工作，优先用 `git worktree` 建一个干净排障目录再开始。"
+      },
+      {
+        "title": "从关键词和文件建立上下文",
+        "body": "先把\"感觉可疑\"变成可查看的历史证据，再决定下一步用哪个工具：\n\n```bash\n# 在当前代码库里搜索关键词，找到它在哪个文件哪行\ngit grep \"timeout\"\n# 查某个文件的历史提交列表\ngit log --oneline --decorate -- src/config.ts\n# 从提交说明搜索关键词\ngit log --oneline --grep=\"timeout\"\n# 看某个提交改了哪些文件\ngit show --stat <commit>\n```\n\n看提交时至少关注：改动是否真的影响当前症状；提交说明是否描述了业务背景；同一提交是否改了测试、配置、迁移脚本或依赖版本；后续是否又有修复提交覆盖了同一区域。不要只看单个 diff，一个提交可能只是重命名或格式化，真正的根因在更早的提交里。"
+      },
+      {
+        "title": "正确使用 blame：找上下文，不找替罪羊",
+        "body": "对可疑行使用范围化 blame，避免整屏噪音：\n\n```bash\n# -L 指定行号范围，只看 40~80 行\ngit blame -L 40,80 src/config.ts\n# 看到可疑提交后，查看完整改动\ngit show <blame-commit>\n# 看该提交前后几次针对同一文件的改动\ngit log --oneline --decorate <blame-commit>~5..<blame-commit> -- src/config.ts\n```\n\n如果文件经历过大规模格式化，可以加 `-w` 忽略纯空白差异：\n\n```bash\ngit blame -w -L 40,80 src/config.ts\n```\n\n使用 blame 的沟通原则：说\"这行最后由某提交引入或修改\"，不要说\"某人导致事故\"。紧接着看 `git show`、测试和 PR 讨论，确认当时的上下文。blame 只能提供线索，不能单独证明根因或责任。"
+      },
+      {
+        "title": "为什么 bisect 需要先定义可靠边界",
+        "body": "为什么 bisect 开始前必须先验证好版本确实好、坏版本确实坏？因为 `git bisect` 的整个逻辑建立在二分搜索上——如果已知\"好版本\"其实也坏，那么好/坏边界本身就错了，bisect 的最终结论就没有意义。\n\n开始前在当前坏版本验证症状：\n\n```bash\n./run-regression-check.sh\necho $?\n```\n\n然后切到已知好版本（推荐在干净的 worktree 里做）验证：\n\n```bash\ngit worktree add ../project-bisect main\ncd ../project-bisect\ngit switch --detach v1.4.0\n./run-regression-check.sh\n```\n\n退出码约定：`0` 表示 good，非 `0` 表示 bad，无法判断时用 `git bisect skip`，不要硬标。"
+      },
+      {
+        "title": "手动 bisect：逐步定位首个坏提交",
+        "body": "验证好/坏边界后，开始二分定位：\n\n```bash\n# 启动 bisect\ngit bisect start\n# 标记当前状态为坏提交\ngit bisect bad HEAD\n# 标记已知好版本\ngit bisect good v1.4.0\n# Git 会自动切到中间的候选提交，然后运行检查并标记\n./run-regression-check.sh\n# 通过则标 good，失败则标 bad，Git 继续缩小范围\ngit bisect good\n# 或\ngit bisect bad\n```\n\nGit 输出首个坏提交后，先查看它：\n\n```bash\ngit show --stat --summary <first-bad-commit>\ngit show <first-bad-commit>\n```\n\n最后一定要恢复工作区：\n\n```bash\n# reset 会回到 bisect 开始前的位置（改的是分支引用和工作区）\ngit bisect reset\ngit status -sb\n```\n\n不要在 bisect 中间状态提交修复或切换无关分支。"
+      },
+      {
+        "title": "自动 bisect 与排障结论",
+        "body": "当复现步骤能写成退出码可靠的脚本时，可以让 Git 自动二分：\n\n```bash\ngit bisect start\ngit bisect bad HEAD\ngit bisect good v1.4.0\n# run 会自动运行脚本并根据退出码标记 good/bad\ngit bisect run ./run-regression-check.sh\ngit bisect reset\n```\n\n自动 bisect 的前提：脚本自己构造输入，不依赖本机临时状态；退出码可靠；对历史提交不兼容或环境缺失的情况，改用手动 `skip` 而不是误标。\n\n定位完成后，排障记录应包含：症状和复现命令、已知好版本、已知坏版本、首个坏提交、`git show` 证据、处理路线（revert、hotfix 还是修配置）。首个坏提交不等于修复方案，还需要判断回滚风险和业务影响。"
+      },
+      {
+        "title": "常见错误与恢复路径",
+        "body": "**工作区不干净就开始 bisect**：bisect 切换提交时会因未提交改动失败，或者改动污染测试结果。先 `git stash push` 或建干净 worktree。\n\n**好版本没有先验证**：导致 good/bad 边界本身错误，bisect 结论不可信。开始前必须分别在已知好版本和坏版本上运行检查命令。\n\n**在 bisect 中间状态直接修改代码提交修复**：排障现场和修复现场混在一起，排障结束后问题更难追溯。bisect 只用于定位，修复回到正常分支后进行。\n\n**误标 good/bad**：运行 `git bisect reset` 重置 bisect，从可信边界重新开始。\n\n**找到首个坏提交后忘记 `git bisect reset`**：继续停留在 detached HEAD 上，下一步操作容易污染历史。`git bisect reset` 会回到开始 bisect 前的位置。\n\n**排障脚本里使用 `git clean -fd`**：只在一次性练习仓库或干净 worktree 中使用，避免误删未跟踪文件。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "`git blame -L 40,80 src/config.ts` 命令的作用是什么？",
+        "options": [
+          "查看整个文件每一行的最后修改者",
+          "查看 40 到 80 行范围内每行最后是哪个提交引入或修改的",
+          "删除 40 到 80 行的内容",
+          "把第 40 到 80 行的改动还原到暂存区"
+        ],
+        "answer": 1,
+        "explain": "`-L` 参数指定行号范围，只显示该范围内每行对应的最近一次提交信息，避免整屏噪音，便于聚焦到可疑区域。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`git blame` 的输出可以直接证明某人是事故责任人。",
+        "answer": false,
+        "explain": "`git blame` 只能告诉你某行最后由哪次提交引入或修改。当时的上下文、业务背景、测试情况需要通过 `git show`、PR 讨论等补充，blame 只是历史索引，不是责任证明。"
+      },
+      {
+        "type": "choice",
+        "prompt": "启动 `git bisect` 前，最关键的准备步骤是什么？",
+        "options": [
+          "把所有分支都推送到远端",
+          "分别在已知好版本和坏版本上运行检查命令，确认边界本身正确",
+          "先运行 `git tag -d` 删除所有临时标签",
+          "先用 `git stash clear` 清空所有 stash"
+        ],
+        "answer": 1,
+        "explain": "bisect 的整个逻辑建立在好/坏边界的可信度上。如果\"好版本\"其实也坏，bisect 结论就没有意义。必须先分别验证两个边界，再开始二分。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 `git bisect` 过程中，遇到某个历史提交无法编译（环境不兼容），应该如何处理？",
+        "options": [
+          "强制标记为 `git bisect bad`",
+          "强制标记为 `git bisect good`",
+          "运行 `git bisect skip`，跳过该提交，让 Git 选其他候选",
+          "直接运行 `git bisect reset` 结束整个过程"
+        ],
+        "answer": 2,
+        "explain": "`git bisect skip` 告诉 Git 跳过该提交，无法判断，Git 会从其他候选中继续二分。硬标 bad 会把\"环境坏\"误判为\"产品坏\"，导致结论不可信。"
+      },
+      {
+        "type": "input",
+        "prompt": "bisect 结束后，要把工作区恢复到 bisect 开始前的状态，应该运行哪个命令？（写出完整命令）",
+        "accept": ["git bisect reset", "bisect reset"],
+        "explain": "`git bisect reset` 会回到开始 bisect 前所在的分支和提交，退出 bisect 模式，工作区恢复正常。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`git bisect run ./check.sh` 中，检查脚本应该用什么方式表达\"当前提交是好的\"？",
+        "options": [
+          "输出字符串 `GOOD` 到标准输出",
+          "退出码为 `0`",
+          "退出码为 `1`",
+          "输出字符串 `BAD` 到标准错误"
+        ],
+        "answer": 1,
+        "explain": "`git bisect run` 根据脚本退出码判断 good/bad：退出码 `0` 表示 good，非 `0` 表示 bad。这和 shell 约定一致（`0` = 成功），与输出内容无关。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 bisect 进行中可以直接修改代码并提交修复，这样效率更高。",
+        "answer": false,
+        "explain": "在 bisect 中间状态修改或提交会混淆排障现场和修复现场，影响后续的证据追溯。bisect 只用于定位首个坏提交；定位完成、`git bisect reset` 恢复后，再切到正常分支创建修复分支。"
+      },
+      {
+        "type": "input",
+        "prompt": "在当前代码库里搜索字符串 `\"timeout\"` 出现在哪些文件和行，应该用哪个命令？（写出命令关键词）",
+        "accept": ["git grep \"timeout\"", "git grep timeout", "git grep"],
+        "explain": "`git grep` 在当前工作树（或指定提交）里搜索关键词，比 `git log --grep` 更直接——后者搜索的是提交说明文本，而 `git grep` 搜索的是文件内容。"
+      },
+      {
+        "type": "match",
+        "prompt": "把每个历史排障命令和它的主要用途配对：",
+        "left": [
+          "`git grep \"keyword\"`",
+          "`git blame -L 40,80 path`",
+          "`git bisect start` / `git bisect bad` / `git bisect good`",
+          "`git bisect reset`"
+        ],
+        "right": [
+          "在当前代码库里搜索关键词，找到它出现在哪些文件",
+          "查看指定行范围内每行最后是哪个提交引入的",
+          "启动二分定位，标记好/坏边界，让 Git 自动缩小范围",
+          "退出 bisect 模式，把工作区恢复到 bisect 开始前的位置"
+        ],
+        "explain": "四个命令各有分工：grep 找当前代码位置；blame 找某行的历史来源；bisect 三件套启动二分并标记边界；reset 清场恢复现场。left[i] 与 right[i] 逐项对应。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`git bisect` 找到首个坏提交后，下列哪种处理路线最不合适？",
+        "options": [
+          "如果提交很小且只引入回归，考虑 `git revert <commit>`",
+          "如果提交包含多个业务改动，用 hotfix 补丁而不是直接 revert",
+          "如果根因在配置或环境，修配置并补监控",
+          "立刻在当前 detached HEAD 状态提交修复，再推送到主干"
+        ],
+        "answer": 3,
+        "explain": "在 bisect 结束后的 detached HEAD 状态直接提交修复，提交没有分支保护，切走就找不到了。正确做法是先 `git bisect reset` 回到正常分支，再创建修复分支提交修复。"
+      },
+      {
+        "type": "choice",
+        "prompt": "使用 `git blame -w` 时，`-w` 选项的作用是什么？",
+        "options": [
+          "只显示当前工作区（working tree）的改动",
+          "忽略纯空白差异，有助于穿过格式化提交找到实质改动",
+          "以宽格式输出，显示完整提交哈希",
+          "只查看上一周内的提交记录"
+        ],
+        "answer": 1,
+        "explain": "`-w` 让 blame 忽略只改空白的差异，有助于在文件经历过大规模格式化后找到真正改变逻辑的提交。但它也可能隐藏\"空白确实有语义\"的场景（如 Python 或 YAML），只作为辅助视角使用。"
+      },
+      {
+        "type": "choice",
+        "prompt": "排障记录中\"首个坏提交\"一项应该包含什么内容？",
+        "options": [
+          "只写提交哈希，其他内容保密",
+          "提交哈希 + `git show` 证据 + 说明该提交为什么解释了症状",
+          "作者姓名和联系方式",
+          "该提交之后所有提交的列表"
+        ],
+        "answer": 1,
+        "explain": "只写哈希没有说服力；好的排障记录需要附上 `git show` 的 diff 证据，并解释该提交里的哪个改动解释了回归症状，让团队能独立复核结论。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,126 @@
+[
+  {
+    "id": "u1c21",
+    "title": "Linux 网络栈、TCP 与 MTU",
+    "subtitle": "从 send() 到链路帧：吞吐、窗口、MTU 与 ECMP",
+    "intro": [
+      {
+        "title": "从应用到网卡的完整路径",
+        "body": "应用调用 `send()` 只是把字节交给了 socket，距离真正上线还有很多层：\n\n```\nsend()\n  user buffer → copy_from_user\n  socket send buffer → tcp_sendmsg\n  TCP write queue → tcp_transmit_skb\n  skb → IP route → neighbor（ARP/ND）\n  qdisc → driver ndo_start_xmit\n  TX descriptor → NIC DMA read\n  wire frame → switch port queue\n```\n\n**每层都有\"满\"的含义**：\n- `socket send buffer` 满 → 应用 `send()` 阻塞\n- TCP 未确认队列满（`cwnd` 限制）→ TCP 停止发包等 ACK\n- `qdisc backlog` 满 → 本机发送排队，可能丢包\n- `driver ring` 满 → `requeue`，NIC counter 报错\n\n`SO_SNDBUF` 调大只是把等待从应用转移到内核，不等于提高网络吞吐。",
+        "tip": "send-q 高 + cwnd 小 → TCP 等 ACK，不是应用慢。send-q 高 + cwnd 大 → 对端应用读不够快，rwnd 在缩小。"
+      },
+      {
+        "title": "TCP 窗口：rwnd、cwnd 与 BDP",
+        "body": "TCP 同时受两个窗口限制，**有效 in-flight 数据量 ≈ min(rwnd, cwnd) × MSS**：\n\n- **`rwnd`（receive window）**：接收端告诉发送端\"我还能收多少\"。保护接收端内存和应用读取速度。应用读不够快 → receive queue 满 → rwnd 缩小 → 发送端被流控。\n- **`cwnd`（congestion window）**：发送端根据网络反馈估计\"我现在能向网络里放多少未确认数据\"。保护共享网络。丢包 → cwnd 缩小 → 吞吐下降。\n\n**BDP（带宽延迟积）**：`BDP = 带宽 × RTT`，表示\"填满管道\"需要多少数据在路上。\n- 100 Gbit/s，RTT = 120 μs → BDP ≈ 1.5 MB\n- 400 Gbit/s，RTT = 90 μs → BDP ≈ 4.5 MB\n\n如果 socket buffer、cwnd 或 pacing 不能达到 BDP 量级，长流吞吐就上不去。",
+        "tip": "`ss -tinm dst <peer>` 看 rtt、cwnd、retrans、send-q。cwnd 乘以 MSS 就是当前 in-flight 上限。"
+      },
+      {
+        "title": "短流与长流的不同排障逻辑",
+        "body": "**短流（推理 RPC、metadata、控制面）**：主要成本不是带宽，而是：\n- TCP 三次握手 RTT（1~5ms）\n- TLS 握手\n- 慢启动（前几个 RTT cwnd 很小）\n- 连接池耗尽等待\n- RSS 分配不均导致某核 softirq 过载\n\n**长流（checkpoint、dataset shard、AllReduce fallback TCP）**：主要成本是：\n- BDP vs 窗口大小\n- 丢包触发 fast retransmit 或 RTO（RTO 代价极高）\n- ECMP 哈希不均导致局部拥塞\n- PMTU 黑洞（大包被静默丢弃）\n\n| 流类型 | 典型场景 | 核心指标 | 常见优化 |\n|---|---|---|---|\n| 短流 | 推理 RPC | P99、连接建立时间 | 连接池、keepalive、SO_REUSEPORT |\n| 长流 | checkpoint、shard 传输 | 吞吐、重传率 | BDP、MTU、ECMP、pacing |"
+      },
+      {
+        "title": "MTU、MSS 与 PMTU 黑洞",
+        "body": "**MTU（Maximum Transmission Unit）**：链路层一帧能承载的最大 IP 包大小。以太网标准 MTU = 1500B；jumbo frame MTU = 9000B。\n\n**MSS（Maximum Segment Size）**：TCP payload 的最大段大小 ≈ MTU - IP头（20B）- TCP头（20B）。\n- MTU 1500 → MSS 1460\n- MTU 9000 → MSS 8960\n\n**TSO/GSO 的抓包陷阱**：开启 TSO 后，本机抓包可能看到 64KB\"大包\"（skb 在 TSO 之前），但链路上的实际帧仍受 MTU 限制。不能用本机抓包的包大小判断链路 MTU。\n\n**PMTU 黑洞**：路径上某设备静默丢弃超过其 MTU 的大包（不发 ICMP too big），表现为\"小包通、大包卡、重传增长\"。\n\n**诊断命令**：\n- `ping -M do -s 1472 <peer>`：测以太网 MTU 1500（1472 + 20 IP + 8 ICMP = 1500）\n- `ping -M do -s 8972 <peer>`：测 jumbo MTU 9000\n- `tracepath <peer>`：查路径估计 MTU",
+        "tip": "jumbo frame 必须端到端一致：主机接口、bond、VLAN、bridge、overlay、ToR、spine、对端都要能承载。路径上一段不一致就可能表现为大包丢、小包通。"
+      },
+      {
+        "title": "qdisc、ECMP 与多流 vs 单流",
+        "body": "**qdisc（排队规则）**：位于协议栈和 driver 之间，决定包如何排队、整形和丢弃。\n\n| 现象 | 含义 |\n|---|---|\n| `backlog` 长期不为零 | 本机发送侧排队，看 cwnd/NIC queue/对端 ACK |\n| `drops` 增长 | 本机已经丢包（TCP 会当成拥塞信号）|\n| `overlimits` 增长 | 整形策略触发，检查 tc filter/class |\n\n**ECMP（等价多路径）**：交换机按五元组哈希把流量分配到多条等价链路。**不是按字节负载均衡**，而是按流哈希。少数长流哈希到同一链路 → 局部拥塞，其他链路空闲。\n\n**单流慢、多流快的诊断**：\n1. 计算 BDP，看单流 cwnd 是否达到 BDP\n2. 检查 RSS/softirq 是否单核热点\n3. 用 `iperf3 -P 8` 验证总路径容量确实存在\n4. 看交换机 per-uplink counter，不要只看主机总吞吐\n\n**PMTU 黑洞判断树**：小包通 + 大包失败 + 无明显接口错误 → 先用 `ping -M do` 找 MTU，再看 ICMP too big 是否被防火墙丢弃。"
+      },
+      {
+        "title": "读懂 ss -tinm 输出",
+        "body": "**`ss -tinm dst <peer>` 的关键字段**：\n\n```\nESTAB 0 0 10.0.0.1:51522 10.0.0.2:5201\n  cubic wscale:7,7 rto:204 rtt:120/10 ato:40 mss:8948\n  cwnd:80 bytes_acked:123456789 segs_out:45678 retrans:0/12\n```\n\n- `rtt:120/10`：估计 RTT 120μs，抖动 10μs\n- `cwnd:80`：拥塞窗口 80 个 MSS → in-flight 上限 ≈ 80 × 8948 ≈ 715KB\n- `mss:8948`：当前 MSS（对应 MTU 9000）\n- `retrans:0/12`：当前重传 0，累计 12——增长才是信号\n- `bytes_acked` 持续推进 → ACK 正常回来\n\n**诊断步骤**：\n1. 算 BDP：100 Gbit/s × 120μs ≈ 1.5MB，当前窗口 715KB 只填满一半管道\n2. 看 `tc -s qdisc` backlog 趋势，不是一次快照\n3. 看 `ethtool -S` 的 tx/rx drop、err 统计\n4. 路由问题：`ip route get <peer>` 确认出口接口，避免走管理网",
+        "reveal": {
+          "q": "为什么单流 iperf3 只有 20 Gbit/s，但 iperf3 -P 8（8 个并行流）能达到 80 Gbit/s？",
+          "a": "单流慢的原因通常不是链路坏，而是：1）BDP 决定需要约 1.5MB 数据在路上，但单流 cwnd 还在 CUBIC/BBR 增长阶段没到这个量；2）单流只用一个 TCP 连接，RSS 哈希到同一个 CPU 核/NIC 队列，单队列成为瓶颈；3）pacing 限制了 burst 发送速率。多流通过多个独立 cwnd 和不同的 RSS 队列分散负载，合计能填满管道。排查应先算 BDP，看 ss -tinm 的 cwnd，再看 softirq 和 RSS 队列分布。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "计算 100 Gbit/s 网络、RTT = 100μs 的 BDP，结果是多少？",
+        "options": [
+          "约 125KB",
+          "约 1.25MB",
+          "约 12.5MB",
+          "约 125MB"
+        ],
+        "answer": 1,
+        "explain": "BDP = 带宽 × RTT = (100 × 10^9 bit/s) × (100 × 10^-6 s) = 10^7 bit = 10Mb = 1.25MB。这是\"填满管道\"所需的 in-flight 数据量。如果 cwnd × MSS < BDP，长流吞吐就上不去。"
+      },
+      {
+        "type": "judge",
+        "prompt": "本机用 tcpdump 抓到超过 MTU（如 64KB）的 TCP 包，说明链路上实际传输了超 MTU 的以太帧。",
+        "answer": false,
+        "explain": "开启 TSO（TCP Segmentation Offload）时，内核把大 skb 交给网卡，由网卡硬件按 MSS 切分发送。tcpdump 在 TSO 之前的位置抓包，看到的是切分前的大 skb；真实链路上的帧仍受 MTU 限制。这是使用抓包排查 MTU 问题时的常见误判。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 TCP 指标与其含义匹配：",
+        "left": ["rwnd（接收端窗口）", "cwnd（拥塞窗口）", "RTO（超时重传）", "BDP（带宽延迟积）"],
+        "right": [
+          "带宽 × RTT，填满管道所需的 in-flight 数据量",
+          "发送端根据网络反馈估计的\"当前可向网络注入的未确认数据量\"",
+          "接收端通告发送端\"我还能接多少字节\"，保护接收端内存",
+          "超时触发的重传，代价远高于 fast retransmit，会让吞吐显著下降"
+        ],
+        "explain": "rwnd 保护接收端（接收端慢时缩小）；cwnd 保护网络（丢包时缩小）；两者共同限制 in-flight；BDP 是填满管道所需的数据量，决定理想窗口大小；RTO 是超时重传，每次触发会让拥塞窗口重置。"
+      },
+      {
+        "type": "choice",
+        "prompt": "MTU 为 9000B（jumbo frame）时，TCP over IPv4 的 MSS 大约是多少？",
+        "options": [
+          "1460B",
+          "8948B",
+          "8960B",
+          "9000B"
+        ],
+        "answer": 2,
+        "explain": "MSS = MTU - IP头（20B）- TCP头（20B）= 9000 - 40 = 8960B。不过考虑 TCP 选项（timestamps 等通常 12B），实际协商的 MSS 可能是 8948B 或更小。标准以太网 MTU 1500B 对应 MSS 1460B，jumbo MTU 9000B 对应 MSS 约 8960B。"
+      },
+      {
+        "type": "judge",
+        "prompt": "ECMP（等价多路径）会按字节做完美负载均衡，确保每条链路利用率相同。",
+        "answer": false,
+        "explain": "ECMP 按流（五元组）哈希分配，不是按字节。同一条 TCP/RDMA 连接的所有包始终走同一条路径（保证顺序）。少数长流如果哈希到同一条链路，会造成局部拥塞；其他链路可能很空。排查时要看交换机 per-uplink 计数器，不能只看总带宽利用率。"
+      },
+      {
+        "type": "choice",
+        "prompt": "发现某 TCP 连接 `ss -tinm` 显示 send-q 很高，cwnd 很大，应该优先排查什么？",
+        "options": [
+          "本机 qdisc drop，说明本机发送排队已经溢出",
+          "对端接收端应用读取速度（rwnd 可能在缩小）",
+          "交换机 ECMP 哈希不均",
+          "本机 TSO/GSO 配置是否正确"
+        ],
+        "answer": 1,
+        "explain": "send-q 高表示 socket 发送缓冲区有积压数据。cwnd 大说明不是拥塞窗口限制（那会导致 send-q 高 + cwnd 小）。cwnd 大但 send-q 仍高，说明受 rwnd 限制——对端应用读数据慢，receive queue 满，rwnd 缩小，发送端被流控。应检查对端进程是否在 GC、阻塞或 CPU 饥饿。"
+      },
+      {
+        "type": "input",
+        "prompt": "用不分片 ping 探测到对端是否支持 MTU 9000，发送 8972 字节 payload，应使用什么命令？（只写命令名及最关键的参数标志）",
+        "accept": ["ping -M do", "ping"],
+        "explain": "`ping -M do -s 8972 <peer>` 发送 8972B payload（+20B ICMP头+20B IP头=9012B，考虑 GRE 等 overlay 需减去封装头），且设置 DF 位禁止分片。如果路径 MTU < 9000，会收到 ICMP Fragmentation Needed 或请求超时。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PMTU 黑洞的典型表现是什么？",
+        "options": [
+          "所有大小的包都无法通过，ping 完全失败",
+          "小包（如标准 ping）正常，大包（如大文件传输）超时或重传增长，但接口物理错误不增长",
+          "连接建立失败，TCP 握手无响应",
+          "吞吐平稳但延迟大幅升高"
+        ],
+        "answer": 1,
+        "explain": "PMTU 黑洞发生时，路径上某设备静默丢弃超过其 MTU 的包（不发 ICMP too big）。小包（< MTU）正常通过；大包（设了 DF 位不允许分片）被丢弃，表现为超时或 retrans 增长，但物理接口错误计数不变（因为丢包发生在路径中间，不在本机接口）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "调大 SO_SNDBUF（socket 发送缓冲区大小）可以解决 TCP 长流因 cwnd 小而吞吐上不去的问题。",
+        "answer": false,
+        "explain": "SO_SNDBUF 调大只是让更多数据可以进入 socket 发送缓冲区等待，不改变 TCP 向网络注入未确认数据的速率（由 cwnd 限制）。如果瓶颈是 cwnd 小（还在慢启动或因丢包缩减），调大 SO_SNDBUF 只是把等待从应用转移到内核，吞吐不会提高。需要的是让 cwnd 增长到 BDP 量级。"
+      }
+    ]
+  }
+]

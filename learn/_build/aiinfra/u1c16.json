@@ -1,0 +1,131 @@
+[
+  {
+    "id": "u1c16",
+    "title": "VFS、inode/dentry 与 Block Layer",
+    "subtitle": "从 open() 到 NVMe：Linux 文件 IO 的完整内核路径",
+    "intro": [
+      {
+        "title": "为什么需要 VFS",
+        "body": "应用只看到路径、fd 和字节流。内核却要同时支持 ext4、XFS、ZFS、NFS、FUSE、overlayfs……它们的实现完全不同，但应用的 `open/read/write` 不变。\n\n**VFS（Virtual File System）** 是 Linux 内核给所有文件系统套上的统一对象模型。它把\"通用路径\"和\"具体 FS 实现\"分开——每个 VFS 对象上挂一组**操作表**（函数指针），具体 FS 在 mount 时填进去，这就是纯 C 的\"虚函数 dispatch\"。\n\n同一行 `read(fd, ...)` 会跳到 ext4 或 NFS 的完全不同实现，调用者无感。",
+        "tip": "VFS 统一 API 不代表统一性能，也不代表统一持久化语义。ext4 的 fsync 和 NFS 的 fsync 语义差异极大。"
+      },
+      {
+        "title": "VFS 核心对象一览",
+        "body": "| 对象 | 含义 | miss 代价 | AI 诊断信号 |\n|---|---|---|---|\n| `superblock` | 一个挂载实例的全局状态 | mount 协商 | `findmnt` 挂载参数不一致 |\n| `dentry` | 路径分量 → inode 的解析结果（可 negative） | 目录块读取或 MDS RPC | `open/stat` 慢、MDS busy |\n| `inode` | 文件身份：权限、大小、时间戳、block mapping | inode 读取或 getattr | `df -ih` 紧张、slab 膨胀 |\n| `file` | 进程打开后的视图，保存 offset 和 flags | `open()` 分配 | fd 泄漏、`lsof` 爆炸 |\n| `address_space` | 文件页缓存索引，key = (address_space, offset) | 设备/网络读取 | 首轮 epoch 慢、第二轮快 |\n\n**inode 是身份，不是名字**。hard link 让多个 dentry 指向同一 inode；`unlink` 只减 link count，只要有进程持有 file object，数据块仍然存在。"
+      },
+      {
+        "title": "一次 open/read 的完整路径",
+        "body": "**`openat()` 关键路径：**\n- 解析 `dirfd` 和 mount namespace\n- `namei` 逐级解析路径分量（每级查 dentry cache，miss 则读目录块或发 RPC）\n- 权限检查\n- 分配 `file` 对象，安装 fd\n\n**`read()` buffered 路径：**\n- 从 `file` 对象找 inode 和 offset\n- Page Cache 查找 `(address_space, offset)`\n- **命中**：直接 copy 到用户 buffer\n- **未命中**：FS 把 offset 映射到 block，构造 `bio`，走 Block Layer → 设备 → 填 Page Cache → copy\n\n**`write()` buffered 路径：**\n- copy 用户数据到 Page Cache，标记 dirty\n- **立即返回**（不等落盘）\n- 后台 writeback 或显式 `fsync` 才提交 IO",
+        "tip": "write() 快 = 脏页吸收；第二轮 epoch 快 = Page Cache 命中。两者都不代表设备快。"
+      },
+      {
+        "title": "路径解析为什么可能比 read 更贵",
+        "body": "路径 `/mnt/dataset/train/n01440764/img001.jpg` 需要逐级解析 7 个分量，每级都可能触发：\n- dentry cache miss → 读目录块\n- mount namespace 切换\n- 权限检查（每级目录都要校验 execute 权限）\n- symlink 展开\n- NFS/FUSE 的远端 lookup RPC\n\nLinux 有两条 walk 路径：\n- **RCU walk（快路径）**：不拿锁、不改引用计数，多核并发解析同一路径几乎零干扰。仅当所有分量都命中 dentry cache 且无需 revalidate 时成立。\n- **Ref walk（慢路径）**：每个 dentry 做原子 `dget/dput`，需要 FS `lookup`、可调 revalidate。多核并发时在 dentry 引用计数上 ping-pong cache line。\n\n**小文件 DataLoader 的真正代价**：不是磁盘慢，是每次 `open` 都走 ref walk，多核 worker 在公共目录 dentry 上互相打。"
+      },
+      {
+        "title": "Block Layer 与 blk-mq",
+        "body": "文件系统把读写映射成 **`bio`**（block IO），描述\"对哪些 sector 读写、数据来自/去往哪些内存页\"。\n\nBlock Layer 做的事：\n1. **plug 合并**：`blk_start_plug/blk_finish_plug` 把相邻 sector 的 bio 合并成大 request，这是 writeback 时看到大块 IO 的原因\n2. **调度器合并**：`mq-deadline` 还会做 front/back merge；NVMe 推荐 `none`——跳过合并，直接派发\n3. **blk-mq 两层队列**：per-CPU 软件队列（零锁竞争）→ per-hctx 硬件队列 → NVMe SQ\n\n| 调度器 | 适合场景 |\n|---|---|\n| `none` | NVMe 单租户训练，设备自己并行处理 |\n| `mq-deadline` | 需要稳定尾延迟的块设备 |\n| `bfq` | 交互公平性，训练吞吐场景不优先 |",
+        "tip": "`iostat -x` 的 `aqu-sz` 是软件+硬件队列里的 request 总数；NVMe 健康吞吐下到几百是正常的。"
+      },
+      {
+        "title": "Direct IO 与 O_DIRECT 的陷阱",
+        "body": "`O_DIRECT` 绕过 Page Cache，直接在用户 buffer 和设备之间传输。适合：大 checkpoint 写入、避免双重缓存、控制 IO 并发。\n\n**关键约束**：buffer 地址、长度、offset 必须与设备逻辑扇区或 FS 块对齐（通常 512B 或 4KB）。\n- ext4/XFS 在 Linux 上对不对齐请求直接返回 `EINVAL`，**不会自动退化为 buffered IO**（高频误传）\n- Linux 6.1+ 提供 `statx(STATX_DIOALIGN)` 可查最小对齐要求\n\n`O_DIRECT` 不自动保证持久化——是否落盘仍需 `fsync()` 配合。",
+        "tip": "fio --direct=0 测的是内存带宽；用 --direct=1 才能测到真实设备持续写入能力。"
+      },
+      {
+        "title": "小文件 DataLoader 抖动 case + 排障 SOP",
+        "body": "**典型现象**：8 卡训练 GPU util 35%~95% 剧烈抖动，本地 NVMe 未满但 `iostat` 吞吐只有 300MB/s，数据集是 1200 万张 JPEG 散文件。\n\n**诊断层次**：\n1. `pidstat -d / strace -c`：是 `openat/stat` 次数远多于 `read()`，还是 `read()` 阻塞？\n2. `slabtop | grep dentry`：dentry slab 是否频繁增长？\n3. `iostat -x` 的 `r/s` 高但 `rkB/s` 不高 → 小 IO、元数据路径\n\n**结论**：瓶颈是**IO 形状**（海量小 open/stat），不是顺序带宽。\n\n**修复方向**：\n- 打包成 WebDataset / tar shard，每 shard 256MB~2GB\n- 预生成 index，训练时不做递归 `listdir/stat`\n- 节点本地 SSD 做只读 shard cache\n- 各 rank 读不同 shard，减少目录并发",
+        "reveal": {
+          "q": "同一个文件被两个进程 buffered read，为什么能共享 Page Cache？",
+          "a": "Page Cache 的 key 是 (address_space, file_offset)，address_space 挂在 inode 上，与具体 file object 无关。两个进程打开同一个文件，会有两个 file object（各自保存 offset），但它们的 f_path.dentry → inode → address_space 都指向同一个对象，因此 Page Cache 里的页可以被两个 file object 共享读取。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "VFS 让 ext4 和 NFS 共享同一套系统调用的核心机制是什么？",
+        "options": [
+          "内核为每种文件系统维护独立的系统调用入口",
+          "每个 VFS 对象挂一组函数指针操作表，具体 FS 在 mount 时填入",
+          "所有文件系统的实现代码在编译时合并到同一个 C 文件",
+          "内核通过进程的 ulimit 判断该调用哪个 FS 实现"
+        ],
+        "answer": 1,
+        "explain": "VFS 使用操作表（如 file_operations、inode_operations、address_space_operations）存放函数指针。具体文件系统在 mount 时把自己的实现填入这些表，VFS dispatch 时调用表里的函数指针，实现\"同一套 syscall，不同 FS 实现\"的多态。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`unlink` 删除文件路径后，只要还有进程持有该文件的 fd，数据块就不会被立即释放。",
+        "answer": true,
+        "explain": "unlink 只减少 inode 的 link count（i_nlink）。当 i_nlink 为 0 且所有 file object 也关闭（引用计数归零）时，iput 才真正触发 FS 释放磁盘空间。所以已删除但仍被打开的文件仍占用磁盘，用 `lsof +L1` 可以找到。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DataLoader 小文件场景，`iostat r/s` 很高但 `rkB/s` 很低，最可能的原因是？",
+        "options": [
+          "Page Cache 命中率高，数据都从内存读取",
+          "设备顺序带宽不足，需要更换更快的 NVMe",
+          "大量小文件的 open/stat 系统调用导致元数据路径瓶颈",
+          "blk-mq 硬件队列数量不足"
+        ],
+        "answer": 2,
+        "explain": "r/s 高表示读请求频繁，rkB/s 低表示每次读取量极小——这是小文件场景的典型特征。大量 open/stat/close 造成 dentry miss 和小 IO，瓶颈在元数据路径和 IO 形状，而非顺序带宽。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 VFS 对象与其主要职责匹配：",
+        "left": ["dentry", "inode", "file object", "address_space"],
+        "right": [
+          "记录打开后进程的 offset 和 flags",
+          "缓存路径分量到 inode 的解析结果（含 negative lookup）",
+          "Page Cache 的索引，key 为 (对象, file offset)",
+          "文件身份：权限、大小、时间戳、block mapping"
+        ],
+        "explain": "dentry 缓存路径解析结果；inode 是文件身份；file object 是每次 open 的进程视图，保存独立 offset；address_space 是 Page Cache 的索引，挂在 inode 上，被多个 file object 共享。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 Linux 上对 ext4 文件使用 `O_DIRECT` 且 buffer 未对齐时，内核会自动退化为 buffered IO。",
+        "answer": false,
+        "explain": "ext4 和 XFS 在 Linux 上对不对齐的 O_DIRECT 请求直接返回 EINVAL，不会自动退化为 buffered IO。应用必须自行保证 buffer 地址、长度、offset 的对齐（通常 512B 或 4KB）。这是高频误传。"
+      },
+      {
+        "type": "choice",
+        "prompt": "NVMe 设备推荐使用哪种 blk-mq 调度器？原因是什么？",
+        "options": [
+          "`bfq`，因为它的公平性算法最适合高 IOPS 设备",
+          "`mq-deadline`，因为它能保证每条请求的最大等待时间",
+          "`none`，因为 NVMe 本身能并行处理大量请求，CPU 上额外合并只是浪费",
+          "`cfq`，因为传统完全公平调度在多队列设备上最稳定"
+        ],
+        "answer": 2,
+        "explain": "NVMe 拥有几十到上百个硬件队列，自身就能并发处理大量请求。使用 `none` 调度器跳过软件层的合并与重排，减少 CPU 开销，让请求直接派发到硬件队列，获得最低延迟和最高吞吐。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看进程级实时读写字节数，应使用什么命令？（只写命令名）",
+        "accept": ["pidstat"],
+        "explain": "`pidstat -d -p <pid> 1` 每秒输出指定进程的读写字节数，是排查进程是否真正在做 IO 的第一步。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RCU walk 相比 Ref walk 的核心优势是什么？",
+        "options": [
+          "可以处理 dentry miss，在磁盘上查找路径分量",
+          "不拿锁、不改引用计数，多核并发解析同一路径几乎零干扰",
+          "可以跟随 symlink 并做完整的权限检查",
+          "能在 NFS 的 d_revalidate 失效时自动刷新 dentry"
+        ],
+        "answer": 1,
+        "explain": "RCU walk 依靠 RCU 读侧保护，不拿 dentry 引用计数，不持锁，多核并发解析同一 hot path 时几乎无 cache line 争用。但只有所有分量都命中 dentry cache 且无需 revalidate 时才能保持在 RCU walk；遇到 miss 或 NFS revalidate 就退出到 ref walk。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 `fio --direct=0` 跑出高吞吐，代表本地 NVMe 设备具备同等的持续写入能力。",
+        "answer": false,
+        "explain": "--direct=0 是 buffered IO，写入先进 Page Cache，fio 实际测的是内存带宽。只有 --direct=1 才绕过 Page Cache，直接测到设备持续写入能力。两者结果可能差 10 倍以上。"
+      }
+    ]
+  }
+]

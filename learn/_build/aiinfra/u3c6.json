@@ -1,0 +1,133 @@
+[
+  {
+    "id": "u3c6",
+    "title": "内存、互联与 IO 总览",
+    "subtitle": "字节驻留在哪、如何移动、移动是否挡住计算",
+    "intro": [
+      {
+        "title": "为什么 GPU 会空转",
+        "body": "很多性能问题被归因为\"GPU 不够快\"或\"网络慢\"。第一性原理上，**GPU 只能计算已经驻留在设备侧、格式正确、依赖满足的字节**。多节点训练只能在所有 rank 完成通信后推进；训练恢复只能从完整且可验证的 checkpoint 继续。\n\n因此，真正不可化简的问题是：**每一份字节必须在正确时间驻留在正确层级，并且跨边界移动的代价不能超过计算、通信或恢复窗口。**"
+      },
+      {
+        "title": "四个核心学习问题",
+        "body": "可以把整个问题拆成四个维度：",
+        "steps": [
+          "**驻留**：训练样本、权重、KV Cache、optimizer state、checkpoint 分别应该留在 HBM、DRAM、NVMe、并行文件系统，还是对象存储？",
+          "**路径**：字节是否跨 PCIe、NUMA、NVLink、NIC、RDMA fabric、文件系统元数据层、对象存储 API？",
+          "**窗口**：读取、H2D、collective、checkpoint flush 是否能隐藏在 compute、prefetch 或异步后台窗口内？",
+          "**证据**：结论是否能被 `fio`、`iostat`、`ib_write_bw`、`nccl-tests`、`nvidia-smi topo -m` 和训练 profiler 复测？"
+        ]
+      },
+      {
+        "title": "子章节的边界划分",
+        "body": "第 5 章拆分为四个独立子章，边界清晰：\n\n| 子章 | 主题 | 不展开的内容 |\n|------|------|------|\n| 05a | 数据驻留与存储层级 | PCIe 时序细节 |\n| 05b | 主机设备 IO、PCIe、NUMA、overlap | 跨节点 collective |\n| 05c | RDMA、NCCL、集群拓扑 | checkpoint 存储 |\n| 05d | 训练存储、checkpoint、IO 诊断 | 泛化存储产品理论 |\n\n不同症状对应不同子章：GPU 空洞看 05b，多节点扩展效率低看 05c，checkpoint 抖动看 05d，数据驻留和冷启动看 05a。"
+      },
+      {
+        "title": "每份字节都要回答四个问题",
+        "body": "建立稳定排查习惯的核心框架：\n\n1. **现在在哪里？** HBM、DRAM、page cache、NVMe、并行文件系统、对象存储还是远端服务？\n2. **下一步去哪里？** 进入 GPU 计算、跨 GPU 通信、写 checkpoint，还是归档发布？\n3. **经过什么边界？** PCIe、NUMA、NVLink、NIC、RDMA fabric、文件系统元数据层、对象存储 API？\n4. **是否必须移动？** 能否缓存、分片、压缩、预取、重叠、设备侧保留或异步归档？\n\n**不要先问\"哪个组件慢\"，先画出数据路径；不要只看平均吞吐，要看容量、延迟、带宽、语义、抖动和复测证据。**"
+      },
+      {
+        "title": "EvidenceBundle：先收证据再下结论",
+        "body": "每次排查前，先按症状选择最短证据链。任何「慢」的结论都要至少包含一条**用户体验指标**和一条**资源侧指标**：\n\n| 症状类别 | 关键证据命令 | 指向子章 |\n|----------|------------|------|\n| 数据驻留与热层 | `df -h`、`du -sh`、cache hit ratio | 05a |\n| 本地 IO 基线 | `fio` 顺序读写、`iostat -x 1` | 05a、05d |\n| 主机设备路径 | `nvidia-smi topo -m`、`lspci -vv`、`numactl --hardware` | 05b |\n| RDMA 基线 | `ib_write_bw`、`ibv_devinfo` | 05c |\n| Collective 基线 | `nccl-tests all_reduce_perf` | 05c |\n| Checkpoint IO | checkpoint 日志、`fio` 写入基线、`iostat` | 05d |\n\n例如：「step time P99 上升」加「DataLoader queue 为空」才能初步指向数据供给问题，而不是 GPU 算子问题。"
+      },
+      {
+        "title": "四个容量账本",
+        "body": "容量不只是\"磁盘还有多少\"，需要分别计算四类：\n\n- **数据驻留账本**：`hot_bytes = 活跃 shard + 模型缓存 + dataloader 队列 + checkpoint staging + page cache reserve`；热层可用容量 ≥ `hot_bytes * 1.3`\n- **H2D overlap 账本**：`t_h2d_min = batch_bytes / effective_pcie_bandwidth`；可见拷贝空洞不超过 step 的 10%\n- **RDMA collective 账本**：`t_allreduce ≈ 2 * (ranks-1)/ranks * message_bytes / fabric_bw`；`nccl-tests` busbw ≥ baseline 的 80%\n- **Checkpoint IO 账本**：`required_ckpt_bw = checkpoint_bytes / allowed_pause_seconds`；`fio` 聚合写入 ≥ `required_ckpt_bw * 1.3`\n\n这些 threshold 是**平台验收线**，新硬件入池、驱动升级、文件系统参数变更时都要复测。",
+        "tip": "账本里没有数字就无法判断热层是否足够。提交大作业前必须把每一行填完，否则不能把\"先跑看看\"当作判断依据。"
+      },
+      {
+        "title": "常见故障入口总表",
+        "body": "| 症状 | 最小证据 | 可能根因 | 动作 |\n|------|---------|---------|------|\n| GPU 利用率每 batch 前掉 | profiler 显示 H2D 或 batch wait | DataLoader 慢、小文件、pinned memory 缺失 | 按 05a/05b 治理格式、缓存、pinned queue |\n| 多节点扩卡效率低 | `t_sync/t_step` 上升；`nccl-tests` 低 | rank placement、rail 不均、RDMA 配置 | 按 05c 修正拓扑感知放置、端口隔离 |\n| Checkpoint 周期性拖慢全平台 | checkpoint time 与 `iostat await` 同步尖刺 | checkpoint storm、归档抢带宽 | 按 05d 做分组写、jitter、限速、异步归档 |\n| 模型冷启动或恢复慢 | 分段指标显示下载、读盘、H2D 各阶段时间 | 权重未预热、CPU DRAM 峰值、H2D 串行 | 节点缓存、分片流式加载、恢复预取 |",
+        "reveal": {
+          "q": "一个训练任务 GPU 利用率周期性锯齿，而 profiler 显示主要 kernel 本身没有问题。你会首先画哪条数据路径？",
+          "a": "从对象存储/热层到 DataLoader 到 GPU 的数据供给路径。先用 EvidenceBundle 查 DataLoader queue 深度和 H2D 时间，判断是数据驻留问题（05a）还是主机设备 IO 问题（05b）。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "第 5 章总框架里，「字节必须在正确时间驻留在正确层级」的问题可以拆成哪四个维度？",
+        "options": [
+          "驻留、路径、窗口、证据",
+          "带宽、延迟、容量、成本",
+          "计算、通信、存储、调度",
+          "HBM、DRAM、NVMe、对象存储"
+        ],
+        "answer": 0,
+        "explain": "四个维度是：驻留问题（字节在哪里）、路径问题（经过什么边界）、窗口问题（是否能被隐藏）、证据问题（能否用工具复测）。其他选项是存储属性或硬件层级，不是该框架的核心拆分。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPU 利用率低时，应该先问\"哪个算子慢\"，再根据答案决定查哪条数据路径。",
+        "answer": false,
+        "explain": "正确做法是先画出数据路径，再收 EvidenceBundle，最后下结论。先问\"哪个算子慢\"可能会把 DataLoader、H2D 或 checkpoint 等数据供给问题误判为 GPU 算子问题。"
+      },
+      {
+        "type": "match",
+        "prompt": "将症状与对应的主要子章匹配：",
+        "left": [
+          "GPU 每 batch 前空转，DataLoader queue 经常为空",
+          "64 卡扩展效率低，t_sync/t_step 超过 30%",
+          "模型冷启动慢，权重从对象存储每次重新下载",
+          "每 30 分钟全平台 step time 同步尖刺"
+        ],
+        "right": [
+          "05c：RDMA、Collective 与集群拓扑",
+          "05b：主机设备 IO、PCIe、NUMA 与 overlap",
+          "05a：内存与存储层级、数据驻留",
+          "05d：训练存储、Checkpoint 与 IO 诊断"
+        ],
+        "explain": "DataLoader 空转和数据路径上的供给不足主要属于 05b（H2D 和 pinned memory）；多节点扩展效率低属于 05c；模型冷启动慢属于 05a（热层预热）；周期性全平台抖动属于 05d（checkpoint storm）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "数据驻留容量账本里，`hot_bytes * 1.3` 中的 1.3 代表什么？",
+        "options": [
+          "GPU 理论算力的 1.3 倍超配",
+          "覆盖文件系统块对齐、临时文件、压缩展开、manifest 更新和并发清理滞后的最低工程余量",
+          "NCCL AllReduce 效率因子",
+          "checkpoint 与 dataset 的存储比例"
+        ],
+        "answer": 1,
+        "explain": "1.3 是最低工程余量，用于覆盖块对齐、临时文件、压缩展开、manifest 更新和清理滞后等实际开销。多租户或历史抖动明显的池子建议提高到 1.5-2.0。"
+      },
+      {
+        "type": "input",
+        "prompt": "EvidenceBundle 要求任何「慢」的结论至少包含哪两类指标？（用中文回答两类指标的名称）",
+        "accept": ["用户体验指标和资源侧指标", "体验指标和资源指标", "用户侧指标和资源侧指标"],
+        "explain": "必须同时有用户体验指标（如 step P99 上升、checkpoint time 翻倍）和资源侧指标（如 DataLoader queue 为空、iostat await 超过基线 2 倍），单侧指标不足以确认根因。"
+      },
+      {
+        "type": "judge",
+        "prompt": "H2D overlap 容量账本要求：可见拷贝空洞不超过 step time 的 10% 或 compute time 的 20%。",
+        "answer": true,
+        "explain": "这是 H2D overlap CapacityLedger 的 threshold：`visible_copy_gap <= max(0.1 * t_step, 0.2 * t_compute)`。超过这个阈值说明 H2D 进入了计算关键路径，需要优化 pinned memory、async copy 或 prefetch。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RDMA collective 容量账本里，AllReduce 时间下限公式 `t_allreduce ≈ 2*(ranks-1)/ranks * message_bytes / effective_fabric_bw` 中，随着 ranks 增加，`(ranks-1)/ranks` 会趋近于什么？",
+        "options": [
+          "0",
+          "0.5",
+          "1",
+          "ranks 本身"
+        ],
+        "answer": 2,
+        "explain": "当 ranks 很大时，`(ranks-1)/ranks` 趋近于 1，因此 AllReduce 理论时间下限约为 `2 * message_bytes / fabric_bw`，与 ranks 的数量关系不大。这说明集群越大，fabric 带宽的影响比 ranks 数量更重要。"
+      },
+      {
+        "type": "choice",
+        "prompt": "新硬件入池时，以下哪项操作是必须要做的？",
+        "options": [
+          "只需要 ping 测试网络连通性",
+          "用同一套 BenchmarkProtocol 复测并更新 baseline",
+          "只要 NCCL 能跑通就可以",
+          "等到实际训练出现问题再排查"
+        ],
+        "answer": 1,
+        "explain": "容量账本的 threshold 是平台验收线，新硬件入池、驱动/固件升级、文件系统参数变更、调度规则变更、大作业启动前，都要用同一套 BenchmarkProtocol 复测并更新 baseline，不能依赖历史数据或简单连通测试。"
+      }
+    ]
+  }
+]

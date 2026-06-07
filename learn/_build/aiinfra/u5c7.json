@@ -1,0 +1,126 @@
+[
+  {
+    "id": "u5c7",
+    "title": "数据飞轮与持续学习闭环",
+    "subtitle": "让模型每运行一天，就离用户需求更近一分",
+    "intro": [
+      {
+        "title": "动机：上线是起点，不是终点",
+        "body": "LLM 产品上线后面临四个无法绕开的约束：\n\n1. **模型随时间漂移**：训练数据是历史快照，现实世界持续演化，漂移以每周 0.1% 的方式静默积累。\n2. **日志是高密度信号**：每天数十万次对话，哪怕提取 1% 的高质量样本，一个月就是有意义的数据集；但把日志变成训练数据需要脱敏、过滤、标注。\n3. **增量训练会引入灾难性遗忘**：微调新数据可能让模型\"忘记\"旧能力，必须有严格的评测门控。\n4. **反馈可能被污染**：垃圾用户、对抗刷分、LLM-as-judge 偏置都会让飞轮越飞越偏。\n\n**数据飞轮**就是把\"推理日志 → 漂移检测 → 增量训练 → 评测 → 灰度发布\"连成一个自我强化的反馈闭环。"
+      },
+      {
+        "title": "飞轮五环节",
+        "body": "| 环节 | 核心问题 | 典型工具 | 典型延迟 |\n|------|---------|---------|------|\n| 采集（Collect） | 采什么、脱敏、采样率 | Kafka、Flink、Presidio | 毫秒-秒 |\n| 标注（Annotate） | 日志→训练信号 | LLM-as-judge、用户行为、人工 | 小时-天 |\n| 检测（Detect） | 何时需要更新 | KS 检验、embedding 聚类、Evidently AI | 实时-小时 |\n| 训练（Train） | 用什么策略、防遗忘 | LoRA、DPO、EWC、rehearsal | 小时-天 |\n| 发布（Deploy） | 安全推上线 | 评测门禁、canary 灰度、自动回滚 | 小时 |"
+      },
+      {
+        "title": "推理日志回流",
+        "body": "日志至少要记录：`model_version`（漂移对比）、`tool_calls`（Agent 改进）、`retrieval_chunks`（RAG 质量）、`user_feedback`（最高价值）、`sampling_reason`（反偏差分析）。\n\n**PII 脱敏必须在落盘前完成**，不能事后处理：\n- 高敏感（身份证、手机、医疗）→ 删除或替换为 `REDACTED`\n- 中敏感（邮箱、IP）→ SHA256 单向哈希\n- 低敏感（城市、年龄段）→ 保留并打标记\n\n**采样策略**（100K 会话/天场景）：随机基线 3-10%，低置信度 50-100%，用户负反馈 100%，工具调用失败 100%，新 query 类型 80%。"
+      },
+      {
+        "title": "信号转化：从日志到标注数据",
+        "body": "**四类反馈信号**（质量从高到低）：\n- 专家审核：质量最高，规模小（百-千条）\n- 客服二次修改：客服直接编辑 AI 回复，(original, edited) 对是高质量训练数据\n- 用户显式反馈：thumb up/down，中高质量，中大规模\n- 用户隐式行为：retry、停留时长、快速关闭，质量中等，规模极大\n\n**DPO（Direct Preference Optimization）** 格式需要同一 prompt 的 chosen/rejected 对；**KTO（Kahneman-Tversky Optimization）** 只需单条 completion + 好/坏标签——当只有 thumb down 没有对应 chosen 时，KTO 更实用。\n\n**LLM-as-judge 必须校准**：未经校准的 judge 存在长度偏置（偏好更长回答）、顺从偏置（偏好附和用户的回答）。校准流程：人工标注 200-500 条 → Pearson r > 0.75 → 双向 A/B 消除位置偏置 → 每月重校准。"
+      },
+      {
+        "title": "漂移检测：三种类型",
+        "body": "| 漂移类型 | 定义 | 检测方法 |\n|--------|------|--------|\n| **Population Drift** | query 的输入分布变化 | embedding 聚类 + KS 检验 |\n| **Concept Drift** | 同样 query 的正确答案变化（如政策更新） | 业务 Golden Set 定期重评 |\n| **Feature Drift** | 上下文特征分布变化（如输入平均长度变化） | 特征统计分布监控 |\n\n**工具选型**：Evidently AI（开源快速接入）、Arize Phoenix（LLM 专用，embedding 可视化强）、自建 + Prometheus（最灵活）。\n\n注意：漂移阈值是业务决策，KS 检验 p-value < 0.05 是统计显著，但不代表必须立即重训，还要结合业务容忍度和训练成本。"
+      },
+      {
+        "title": "增量训练策略选型与防遗忘",
+        "body": "| 策略 | 适用场景 | 遗忘风险 | 成本 |\n|------|---------|---------|------|\n| **LoRA 增量** | 风格特化、快速响应漂移 | 极低（base 不动） | 极低 |\n| **SFT 增量** | 知识更新、能力扩展 | 中等 | 中 |\n| **DPO 增量** | 行为对齐、减少有害输出 | 低 | 低-中 |\n| **Continual Pretraining** | 大规模知识注入 | 高 | 极高 |\n\n**防遗忘机制**：\n- **Rehearsal（回放）**：新数据中混入 10-30% 历史数据样本，成本低，效果可靠\n- **EWC（Elastic Weight Consolidation）**：用 Fisher 信息矩阵保护对旧任务重要的参数，更精准但计算成本高\n- **LoRA-only**：最强防护，base model 完全不动，代价是表达能力受限\n\n**触发条件**（多条件 AND）：漂移 Score 超阈值 + 数据量充足（>1K DPO 对或 >5K SFT 样本）+ 系统负载允许。"
+      },
+      {
+        "title": "飞轮失败模式与观测看板",
+        "body": "**五种主要失败模式**：\n\n| 失败模式 | 早期症状 | 防护手段 |\n|--------|---------|--------|\n| 反馈污染 | 某类 query 的正向反馈率异常高（>2σ） | 异常检测 + 用户可信度评分 |\n| Judge Bias 累积 | 模型输出越来越冗长，judge 评分与人工偏差增大 | 定期人工校准 + 多 judge 交叉验证 |\n| 数据同质化 | 模型风格趋同，创造性下降 | 限制合成数据比例（<30%）|\n| 飞轮过快抖动 | 版本频繁切换，用户体验不稳定 | 最小训练间隔 + 强制评测通过才放量 |\n| 评测集过拟合 | Golden Set 高分但线上质量持续下降 | 定期轮换 Golden Set + 盲测集 |\n\n**核心观测指标**：Drift Score（JS 散度，健康值 <0.05）、Judge Calibration Score（Kappa >0.75）、Eval Pass Rate（>85%）、Cost Per Quality Unit（CPQU，应下降趋势）、Forgetting Index（历史基准 ≥98% baseline）。"
+      },
+      {
+        "title": "实例数字：8 周客服 LLM 飞轮",
+        "body": "某电商客服 Agent，100K 会话/天。第 0 周基线：Golden Set 准确率 73%，thumb down 率 18%，客服介入率 12%。\n\n飞轮配置：5% 基线采样，DPO+LoRA 增量训练，每周触发，最少 2000 DPO 对，20% rehearsal 回放，5% canary 观测 6 小时。\n\n8 周结果：准确率 86%，thumb down 率 10%，客服介入率 6%。**第 5 周出现污染事件**：约 500 个机器人账号集中 thumb up\"AI 同意降价\"类回复，脏数据进入训练集，canary 后 Golden Set 准确率下降 3%，人工抽检（5% 随机）发现异常，立即回滚并隔离脏数据，修复 judge 校准后重训，第 6 周准确率跳升 5%（CPQU 最低点）。\n\n教训：canary 6 小时不足以发现行为类问题；人工抽检是最后防线；judge 校准必须显式包含顺从但错误的负例。",
+        "tip": "飞轮最重要的单一指标是 Cost Per Quality Unit（CPQU），它综合反映飞轮是否在创造价值。若 CPQU 持续上升，需要排查数据质量下降、遗忘问题还是评测集过拟合。"
+      },
+      {
+        "title": "易错点：AI Infra 工程影响",
+        "body": "- **PII 脱敏时机**：必须在日志落盘前完成，原样落盘后再处理等于已经违规\n- **采样策略宁高勿低**：初期前 3 个月建议全量保留，一旦丢弃无法事后恢复\n- **训练触发是多条件 AND**：数据量不足就触发训练，效果不如不训\n- **安全评测不能降标**：增量训练的污染事件往往是基准指标正常、安全评测才能发现\n- **多租户飞轮**：有竞争关系的租户必须用 Per-Tenant LoRA 飞轮，不允许数据混合",
+        "reveal": {
+          "q": "为什么 LLM-as-judge 评分持续提升，但用户 thumb down 率同步上升？",
+          "a": "这是 Judge Bias 累积的典型表现：模型训练后输出风格向 judge 靠拢，judge 对\"自己风格\"的输出给更高分，下轮训练进一步靠拢——正反馈回路让 judge 评分虚高，而实际对用户的帮助越来越少。修复需要用人类偏好研究重新校准 judge，确认 judge 评分与人类偏好的 Pearson 相关性未下降超过 10%。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "数据飞轮的推理日志中，哪个字段是最高价值的训练信号来源？",
+        "options": ["model_version", "latency_ms", "user_feedback", "sampling_reason"],
+        "answer": 2,
+        "explain": "`user_feedback` 是用户对模型回复的直接评价（thumb up/down 等），是最高质量的标注信号。`model_version` 用于漂移对比，`latency_ms` 用于成本监控，`sampling_reason` 用于反偏差分析。"
+      },
+      {
+        "type": "judge",
+        "prompt": "KTO 偏好数据格式需要对同一 prompt 同时提供 chosen 和 rejected 两个回复。",
+        "answer": false,
+        "explain": "DPO 才需要 chosen/rejected 配对。KTO（Kahneman-Tversky Optimization）只需要单条 completion + 好/坏标签，更适合只有 thumb down 而没有对应 chosen 版本的真实业务场景。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在数据飞轮中，Concept Drift 是指什么？",
+        "options": [
+          "query 的输入分布发生了变化，出现了新类型的问题",
+          "同样 query 的正确答案发生了变化（如政策更新导致旧答案变错）",
+          "用户平均输入长度或工具调用频率发生变化",
+          "模型的输出 token 数量出现系统性增加"
+        ],
+        "answer": 1,
+        "explain": "Concept Drift 是同一类 query 的正确答案发生变化，例如政策更新后旧答案变成错误答案。Query 分布变化是 Population Drift，特征分布变化是 Feature Drift。"
+      },
+      {
+        "type": "match",
+        "prompt": "将防遗忘机制与其核心原理匹配：",
+        "left": ["Rehearsal（回放）", "EWC", "LoRA-only 更新"],
+        "right": ["Fisher 信息矩阵保护重要参数", "新数据混入历史数据样本", "冻结 base model 全量参数"],
+        "explain": "Rehearsal 通过混入历史数据让模型同时记住新旧知识；EWC 用 Fisher 信息矩阵识别对旧任务重要的参数施加正则约束；LoRA-only 完全冻结 base model，新能力通过 adapter 叠加，是最强防护。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某 LLM 飞轮的 judge 评分持续上升，但用户 thumb down 率也同步上升。最可能的根因是？",
+        "options": [
+          "训练数据被机器人刷分污染",
+          "Judge Bias 累积导致模型输出越来越像 judge 而非用户期望",
+          "数据采样率过低，缺少长尾场景",
+          "canary 观测时间过短"
+        ],
+        "answer": 1,
+        "explain": "judge 评分上升而用户不满意上升，是 Judge Bias 累积的典型特征——模型越来越像 judge 风格，judge 给它高分，但用户感受越来越差。污染通常表现为特定类别正向反馈率异常高。"
+      },
+      {
+        "type": "input",
+        "prompt": "在增量训练策略中，哪种方式对 base model 破坏最小，遗忘风险极低？（填写策略名称的中文或英文缩写均可）",
+        "accept": ["LoRA增量", "LoRA 增量", "LoRA", "lora"],
+        "explain": "LoRA 增量只训练低秩适配器（adapter），base model 全量参数冻结不变，是灾难性遗忘风险极低的首选策略，成本约为 base model 训练成本的 5-10%。"
+      },
+      {
+        "type": "judge",
+        "prompt": "数据飞轮的安全评测可以因为是\"增量训练小改动\"而降低门槛或跳过。",
+        "answer": false,
+        "explain": "增量训练污染事件的典型形态是脏 DPO 数据让模型在特定 pattern 下输出不安全内容，而基准指标变化很小、标准评测未发现。安全评测必须是增量训练门禁的必过项，零容忍任何降低。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对于有竞争关系的两个租户，应选择哪种多租户飞轮架构？",
+        "options": [
+          "共享 Base 飞轮（数据汇总训练）",
+          "Per-Tenant LoRA 飞轮（各租户独立 adapter）",
+          "联邦飞轮（梯度聚合）",
+          "三种架构均可，取决于成本"
+        ],
+        "answer": 1,
+        "explain": "有竞争关系的租户必须用 Per-Tenant LoRA 飞轮——各租户独立 adapter，训练数据物理隔离，是数据隔离保证最强的架构。共享 Base 飞轮会让租户 A 数据影响租户 B 的体验，不允许用于竞争关系租户。"
+      },
+      {
+        "type": "judge",
+        "prompt": "数据飞轮的触发条件只需满足\"距上次训练超过 7 天\"这一条件即可启动训练。",
+        "answer": false,
+        "explain": "训练触发需要多条件 AND：漂移 Score 达阈值或时间条件满足，同时还需要确认数据量充足（>1K DPO 对或 >5K SFT 样本）和系统负载允许。数据不足时频繁训练效果不如等待数据充足再训练。"
+      }
+    ]
+  }
+]

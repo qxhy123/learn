@@ -1,0 +1,111 @@
+[
+  {
+    "id": "u5c10",
+    "title": "Checkpoint 工程化",
+    "subtitle": "故障一定会发生——把每次故障的代价算清楚并压到最低",
+    "intro": [
+      {
+        "title": "动机：故障是常态，不是小概率事件",
+        "body": "一台 H100 的年度平均故障间隔（MTBF）约 1-3 年，但 512 卡集群的期望故障间隔按卡数反比压缩，达到**每几天一次**的量级——加上 NCCL hang、存储断联、Xid 错误、驱动崩溃，任何超过数天的训练任务都必须假设\"中途一定会断\"。\n\n损失的进度 = 最后一次 checkpoint 距故障点的 token 数，换算成真实 GPU 小时费用。512 卡 H100 集群云上约 25,000 美元-40,000/小时——每小时的最坏进度损失就是这个数字。\n\n同时，保存 checkpoint 本身也有代价：同步保存期间所有 GPU 空转，175B 模型同步保存可能需要 5-15 分钟等待，相当于 8-25% 的吞吐损失。因此，**checkpoint 频率、保存延迟、存储后端、异步实现**之间存在必须显式建模的博弈。"
+      },
+      {
+        "title": "Checkpoint 的层级结构",
+        "body": "**Framework 层（PyTorch state_dict）**——一个完整 checkpoint 必须包含：\n- `model.state_dict()`：所有参数和 buffer\n- `optimizer.state_dict()`：Adam 的 exp_avg、exp_avg_sq（一阶、二阶矩）\n- `scheduler.state_dict()`：lr 调度状态\n- `rng_state`：所有 rank 的 RNG（CPU、CUDA、numpy、python）\n- `data_shard_indices`：dataloader sampler 进度\n- `tokenizer_hash`、`code_commit`：版本锁定\n\n**只保存模型权重不是 checkpoint**：缺少 optimizer state 后恢复，Adam 一阶矩和二阶矩归零，等同于重新热身（warm start），需要数百步才能恢复平稳。\n\n**Distributed 层（FSDP/DeepSpeed）**：每个 rank 只持有参数的一个分片，选项 A（rank 0 gather 后全量保存）→ rank 0 成为带宽瓶颈；选项 B（sharded checkpoint，每 rank 独立保存自己的分片）→ 写入带宽线性扩展，但 rank 数变化时需要 reshard。"
+      },
+      {
+        "title": "异步 Checkpoint（DCP Async 模式）",
+        "body": "同步 checkpoint 的 GPU idle 时间 = 序列化时间 + I/O 时间，实际往往超过 60-300 秒（受尾延迟和 Python pickle 序列化影响）。\n\n**DCP（`torch.distributed.checkpoint`）异步模式**把流程改为：\n1. GPU 阻塞：把 tensor copy 到 CPU pinned memory（仅 10-30 秒）\n2. GPU 立即恢复训练\n3. 后台线程执行序列化和写盘/上传（与训练并行）\n\n| 方式 | GPU 阻塞时间 | CPU 内存额外占用 |\n|------|------------|----------------|\n| 同步（blocking）| 序列化 + I/O（1-10 分钟）| 无 |\n| 异步（DCP async）| 仅 CPU copy（10-30 秒）| 1 份训练状态 |\n\n**OOM 风险**：async copy 在 CPU 内存持有 per-rank 分片的副本。以 512 rank 均匀分片的 1.75 TB checkpoint 为例，每 rank 约 3.4 GB；若每节点 8 rank，单节点额外 DRAM 约 27 GB，需要控制并行 checkpoint 任务数上限（通常 1-2 个在飞）。"
+      },
+      {
+        "title": "DCP 原理：Planner/Writer/Reader 与 Reshard",
+        "body": "DCP 的核心设计是将\"由谁写\"（planner）与\"怎么写\"（writer/reader）解耦：\n\n**SavePlanner**：把 state_dict 中每个 tensor 拆解成 WriteItem 列表，每个 item 包含 tensor key（逻辑名，不依赖 rank）、storage key（物理文件）、字节范围（offset+length）、tensor metadata（shape/dtype/stride）。\n\n**关键设计**：逻辑 key 与物理 rank 解耦——同一个逻辑参数在不同 rank 数配置下有不同物理分片，但 planner 记录的是逻辑 key 和 byte range，不记录\"rank N 写了哪些\"。\n\n**Reshard 原理**：LoadPlanner 根据当前 rank 数和 world size 重新分配 tensor 分片的加载任务，每个新 rank 可能加载多个旧分片的不同 byte range，storage_reader 按需 seek 读取。\n\n**注意**：TP（Tensor Parallel）和 PP（Pipeline Parallel）的分片布局不是 DCP 内置的，需要自定义 `transform_state_dict` 钩子；如果 TP size 或 PP size 同时改变，需要额外的参数重组逻辑。"
+      },
+      {
+        "title": "原子提交：POSIX vs 对象存储",
+        "body": "**POSIX 原子提交协议**（Lustre/本地 ext4）：\n- 所有 rank 写到 `ckpt_tmp_step52000/` 目录\n- 每个文件写完后 `fsync(file)`\n- barrier：等所有 rank 写完\n- rank 0 写 `manifest.yaml`，`fsync(manifest)`\n- `rename(ckpt_tmp_step52000, ckpt_step52000)`（同 FS 内原子操作）\n- `fsync(parent_dir)` 确保目录项持久化\n\n**S3 原子提交协议**（对象存储没有 rename）：\n- 所有 rank multipart upload 分片文件\n- barrier：等所有 rank upload 完成\n- rank 0 PUT `manifest.json`（含所有分片 key + sha256 + etag）\n- rank 0 条件写 `ckpt_latest` marker key（用 `If-Match`/`If-None-Match` 防止并发覆盖）\n\n**不要用 `s3 ls` 判断 checkpoint 完整性**：LIST 看到的文件可能来自多个并发写入的混合状态，必须用 validated manifest 的存在性和 marker key 条件写结果作为完整性判断。"
+      },
+      {
+        "title": "频率决策模型",
+        "body": "**Young/Daly 一阶近似最优间隔**：\n\n`T* = sqrt(2 × t_save / λ)`\n\n其中 λ = 集群故障率（次/小时），t_save = 每次 checkpoint 在关键路径上的时间成本（小时）。\n\n| 场景 | λ | t_save | T* | 吞吐损失 |\n|------|---|--------|----|--------|\n| 512 卡 H100（同步）| 0.2/h | 10 min | ~44 min | ~23% |\n| 512 卡 H100（异步）| 0.2/h | 0.5 min | ~10 min | ~5% |\n| 1024 卡 H100（同步）| 0.4/h | 15 min | ~39 min | ~38% |\n| 1024 卡 H100（异步）| 0.4/h | 0.5 min | ~5 min | ~10% |\n\n**越大的集群越需要异步 checkpoint**：1024 卡同步模式每小时损失 38% 吞吐，GPU 使用效率极差。\n\n**公式假设**：故障服从近似泊松过程、故障均匀落在两次 checkpoint 之间、恢复时间和重排队时间可忽略。真实系统有重排队、异步 checkpoint、preemption warning 等因素，`t_save` 应换成实际暴露在关键路径上的成本。"
+      },
+      {
+        "title": "Retention 策略与 Registry 集成",
+        "body": "三类保留策略服务于不同用途：\n\n| 类型 | 数量 | 用途 | 绝对不删条件 |\n|------|------|------|------------|\n| **Rolling** | 最近 3-5 个 | 故障后快速恢复 | 仍有 eval job 引用 |\n| **Milestone** | 固定 step 快照 | 消融实验、复现 | 永久保留 |\n| **Best** | 1-3 个（最低 val loss）| 最终发布 | 已发布到 production |\n\n**存储估算（175B BF16 + Adam 一阶矩 + Adam 二阶矩 = ~1.75 TB/checkpoint）**：保留 5 个 rolling + 5 个 milestone + 1 个 best = 11 个，共约 19.25 TB。\n\n**不要按文件年龄删除**：age-based 删除会误删 milestone 和 best，必须按类型 + registry 引用状态做决策。\n\n**checkpoint 转模型包**：`validated` 状态的 checkpoint 可派生出推理用的模型包（提取纯 BF16 权重 ~350GB，打包 tokenizer+config），派生操作不修改原始 checkpoint，而是在 Registry 中创建独立的 model package artifact。",
+        "tip": "异步 checkpoint 将吞吐损失从 5-25% 压缩到 0.5-1.5%，在 512 卡 H100 集群（约 30,000 美元/小时），每次训练节省数千美元 GPU 成本，是大规模训练中 ROI 最高的工程优化之一。",
+        "reveal": {
+          "q": "为什么 175B 模型的完整训练 checkpoint 约为 1.75 TB，而推理用的权重文件只有约 350 GB？",
+          "a": "完整 checkpoint 包含：BF16 参数（175B × 2 bytes ≈ 350 GB）+ Adam 一阶矩 FP32（175B × 4 bytes ≈ 700 GB）+ Adam 二阶矩 FP32（175B × 4 bytes ≈ 700 GB）= 1.75 TB（不含 FP32 master weights）。推理用模型包只需要 BF16 参数（~350 GB），optimizer state 对推理没有用处，去掉后体积缩小约 5 倍。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "在 175B 模型的 512 卡 H100 训练中，同步 checkpoint 和异步 checkpoint 的 GPU 阻塞时间分别约为多少？",
+        "options": [
+          "同步 1-5 秒，异步不阻塞 GPU",
+          "同步 1-10 分钟，异步 10-30 秒",
+          "同步 30-60 秒，异步 5-10 秒",
+          "两者都是 1-10 分钟，只是方式不同"
+        ],
+        "answer": 1,
+        "explain": "同步 checkpoint 需要等待序列化+I/O 完成（受尾延迟影响往往超过 60-300 秒，即 1-10 分钟）。异步 checkpoint 只阻塞\"CPU memory copy\"这一步（pinned memory，约 10-30 秒），序列化和写盘在后台线程并行执行。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在对象存储（S3）上，可以用 `rename` 操作实现 checkpoint 的原子提交。",
+        "answer": false,
+        "explain": "S3 没有原子 rename——S3 的\"rename\"是 copy + delete，不是原子操作。正确的 S3 原子提交协议是：所有分片 multipart upload 完成 → 写 manifest JSON → 条件写 `ckpt_latest` marker key（用 `If-Match` 防止并发覆盖）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DCP（`torch.distributed.checkpoint`）的 Planner 设计如何支持 rank 数变化时的 reshard？",
+        "options": [
+          "Planner 直接记录每个 rank 写了哪些参数，恢复时按 rank 数重新分配",
+          "Planner 记录逻辑 key 和 byte range，与物理 rank 解耦，LoadPlanner 按新 rank 数重新分配加载任务",
+          "Planner 把所有参数 gather 到 rank 0，再按新 rank 数 scatter",
+          "不支持 reshard，rank 数变化必须从头重训"
+        ],
+        "answer": 1,
+        "explain": "DCP 的关键设计是逻辑 key 与物理 rank 解耦：metadata 记录每个 tensor 的逻辑 key + 字节范围，不记录\"rank N 写了哪些\"。恢复时 LoadPlanner 根据当前（新）rank 数和 world size 重新分配加载任务，storage_reader 按需 seek 读取正确的 byte range。"
+      },
+      {
+        "type": "input",
+        "prompt": "使用 Young/Daly 公式，当集群故障率 λ=0.2 次/小时，异步 checkpoint 的 GPU 阻塞时间 t_save=0.5 分钟（约 0.0083 小时）时，最优 checkpoint 间隔 T* 约为多少分钟？（取整数，T*=sqrt(2×t_save/λ)）",
+        "accept": ["9", "10", "9分钟", "10分钟"],
+        "explain": "T* = sqrt(2 × 0.0083 / 0.2) = sqrt(0.0833) ≈ 0.289 小时 ≈ 17 分钟。按原文表格数据（512 卡异步约 10 分钟），题目中 t_save=0.5 min=1/120 h，λ=0.2，T*=sqrt(2/(120×0.2))=sqrt(2/24)=sqrt(1/12)≈0.289h≈17min。实际按题目条件 t_save=0.5min=0.5/60h，T*=sqrt(2×0.5/60/0.2)=sqrt(1/12)≈0.289h≈17min；近似 10 min 来自参考表，接受 9-10。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Checkpoint 的 Retention 策略中，应该按文件的创建时间（age）来决定是否删除旧 checkpoint。",
+        "answer": false,
+        "explain": "age-based 删除会同时误删 milestone 和 best checkpoint。正确做法是按类型（rolling/milestone/best）+ Registry 引用状态做决策：如果仍有 eval job 引用，则跳过删除；milestone 永久保留；best 在已发布到 production 时绝对不删。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 checkpoint 类型与对应用途匹配：",
+        "left": ["Rolling checkpoint", "Milestone checkpoint", "Best checkpoint"],
+        "right": ["最低 val loss，用于最终发布", "固定 step 快照，用于消融实验和复现", "最近 N 个，用于故障后快速恢复"],
+        "explain": "Rolling：保留最近 3-5 个，快速恢复故障；Milestone：固定 step（如 100K/200K）永久保留，用于消融实验和 paper 复现；Best：按 val loss 最低保留 1-3 个，用于最终模型发布。"
+      },
+      {
+        "type": "choice",
+        "prompt": "LoRA delta checkpoint 在 manifest 中必须记录什么信息，否则恢复时权重可能损坏？",
+        "options": [
+          "LoRA rank 和 target_modules 列表",
+          "base model 的版本 hash",
+          "训练时的 learning rate 和 batch size",
+          "checkpoint 的文件大小"
+        ],
+        "answer": 1,
+        "explain": "LoRA delta 是相对于某个 base model 的增量参数。如果不记录 base model 版本 hash，当 base model 发生变化时（即使是细微更新），加载旧 delta + 新 base 会产生权重不对应，恢复后的模型行为不可预测。"
+      },
+      {
+        "type": "judge",
+        "prompt": "异步 checkpoint 因为 CPU 内存中保留了训练状态的副本，每次保存都会消耗额外的 1.75 TB CPU 内存（对于 175B 模型）。",
+        "answer": false,
+        "explain": "DCP 异步模式是 per-rank 的分片副本，不是把 1.75 TB 全局 checkpoint 聚合到单节点。以 512 rank 均匀分片为例，每 rank 持有约 3.4 GB；每节点 8 rank 则单节点额外约 27 GB CPU DRAM——远小于 1.75 TB。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,130 @@
+[
+  {
+    "id": "u1c19",
+    "title": "对象存储、并行文件系统与 Dataset IO",
+    "subtitle": "Manifest、Stripe、MDS 与小文件治理",
+    "intro": [
+      {
+        "title": "对象存储不是 POSIX 文件系统",
+        "body": "对象存储（S3、GCS、OSS）的基本单位是 **object**，有 key、bytes、metadata、etag/version。所谓\"目录\"只是 key 前缀约定，没有本地文件系统的 inode、hard link、目录 fd、跨对象原子 rename。\n\n| 操作 | 与 POSIX 的差异 |\n|---|---|\n| PUT object | 不是流式可见；未 complete 前不应读取 |\n| LIST prefix | 不是目录 inode 遍历，成本高且历史上弱一致 |\n| Multipart complete | 完成后 object 才可见 |\n| Copy + delete | 模拟 rename，非原子，中间有窗口 |\n\n**S3 一致性**：S3 自 2020 年 12 月起才提供 strong read-after-write + strong list。FUSE 挂载层（s3fs、goofys）会重新引入弱一致性窗口（默认元数据缓存几秒到几十秒）。"
+      },
+      {
+        "title": "Multipart Upload 与 Manifest 发布",
+        "body": "大对象通过 **Multipart upload** 上传：initiate → upload parts → complete。complete 前，最终 object 不应被 reader 使用。**未完成的 multipart 不会自动清理，必须配 lifecycle rule 在 N 天后 abort，否则持续产生存储费用。**\n\n**S3 硬约束**：单 part 5MB~5GB；最多 10000 parts；单 object 最大 5TB。常见选择是 part 16~128MB，shard 1~50GB。\n\n**Manifest 是发布入口**——不是递归 LIST：\n1. 上传所有 shard，完成 multipart，记录每个 shard 的 size 和 checksum\n2. 上传 manifest（含 shard 列表、版本、index 路径）到不可变 key\n3. 更新 `current.json` 小指针（只含当前 manifest key）\n4. reader 读 `current.json` → manifest → 按 manifest 读 shard\n\n这样即使前缀下有临时对象、旧版本或失败残留，reader 也不会错误纳入训练。",
+        "tip": "Content-addressed key（CAS）模式：key 包含内容 sha256，天然幂等，跨 dataset 去重，cache invalidation 简单。"
+      },
+      {
+        "title": "LIST 的成本与陷阱",
+        "body": "LIST 适合管理和审计，**不适合作为每个训练 job 的启动路径**。\n\n5000 万对象的 dataset，每个 job 启动都分页 LIST：\n- 高延迟、高费用、控制面压力\n- 分页过程中有写入/删除，需处理重复、遗漏、continuation token\n\n**稳定模式**：\n- 数据生产时生成 manifest 和 index（样本 ID → shard + offset + length）\n- 训练时只读 manifest，不做实时 LIST\n- 定期**离线**审计 LIST 与 manifest 是否一致\n- 清理任务只删 manifest 不再引用的对象\n\n**Range GET**：worker 根据 index 定位 shard 和 byte range，只拉取需要的片段，不下载整个 shard。\n\n**PyTorch DataLoader + 对象存储常见坑**：\n- boto3 client 在 `fork` 后不可重用，`num_workers > 0` 时必须在 `worker_init_fn` 里重新创建\n- 默认连接池上限 10，需显式设 `max_pool_connections=64`\n- 重试区分 404（立刻失败）/ 429（指数退避）/ 5xx（短重试），一律重试会把限流问题放大成雪崩"
+      },
+      {
+        "title": "并行文件系统：MDS 是元数据瓶颈",
+        "body": "Lustre、GPFS、BeeGFS 等并行文件系统把元数据路径和数据路径拆开：\n\n| 组件 | 职责 | 典型瓶颈 |\n|---|---|---|\n| MDS/MDT | lookup、create、unlink、stat、rename | 小文件、目录扫描、LDLM 锁竞争 |\n| OSS/OST | 数据读写 | 顺序带宽、热点 OST |\n| client | VFS 接入、RPC、cache | CPU、网络、缓存失效 |\n\n**LDLM 锁（Lustre）**：client 写文件拿 PW 锁，另一个 client 来要 EX 锁时，server 必须先 revoke 前者——触发 BL_AST，client 必须先 flush dirty page 才释放锁。多 rank 写同一文件/目录是尾延迟抖动的根源。\n\n**`fsync(parent_dir)` 在 Lustre 上是一次到 MDS 的同步 RPC**——512 个 rank 同时 fsync 同一目录 = 把 MDS 当串行队列。",
+        "tip": "MDS CPU 高、OST 带宽低 → 元数据瓶颈（小文件 or 目录 fsync 风暴）。OST 带宽满、MDS 空闲 → 数据路径瓶颈，调 stripe 和 worker 并发。"
+      },
+      {
+        "title": "Stripe 策略与 Lustre 现代布局",
+        "body": "**stripe count**：文件数据分布到多少个 OSS/OST。越高，大文件并行带宽越大，但小文件增加 RPC 和锁开销。\n\n| 文件类型 | stripe count | stripe size |\n|---|---|---|\n| 10GB+ checkpoint shard | 多 OST（8~16）| 16~64MB |\n| 512MB tar shard | 中等（4~8）| 4~16MB |\n| 小文件 / manifest | 1 | 默认 |\n\n**PFL（Progressive File Layout）**：同一文件在不同 offset 区间用不同 stripe 策略。例如 0~1MB 用 count=1，1MB~1GB 用 count=4，1GB+ 用 count=16。小文件不浪费 OST，大文件自动展开。\n```\nlfs setstripe -E 1M -c 1 -E 1G -c 4 -E -1 -c 16 /mnt/lustre/checkpoints\n```\n\n**DoM（Data on MDT）**：小文件（< 64KB）数据直接存在 MDT inode 上，open + read 一次 MDS RPC 完成，不触达 OST。适合 manifest、index 等小热文件。",
+        "tip": "`lfs getstripe /path` 查看文件 stripe 配置；`lfs df -h` 查看各 OST 使用率，检测 OST 热点。"
+      },
+      {
+        "title": "FUSE 挂载假装 POSIX 的代价",
+        "body": "**症状**：用 s3fs/goofys 把 S3 bucket FUSE 挂为 `/mnt/dataset`，DataLoader 直接读小图，GPU 利用率 < 30%，batch wait 是本地 NVMe 的 10× 以上。\n\n**逐层拆解**：\n1. **每次 `open()` 触发一次 HEAD 请求**（约 30ms）：1 万张图 = 5 分钟纯元数据\n2. **FUSE 上下文切换**：每个 syscall 从内核跳到用户态 daemon 再跳回，2~5× 延迟惩罚\n3. **元数据缓存弱一致**：写后立刻读可能拿到旧值，short TTL 进一步放大请求量\n4. **没有 prefetch / Range 优化**：每张图一次完整 GET\n5. **被 throttle**：高频 GET 触发 5xx，默认重试放大请求\n\n**正确做法**：FUSE 适合管理工具，不适合训练热路径。改用 manifest + shard + 节点本地 NVMe cache，训练用 boto3 SDK 直接 Range GET。"
+      },
+      {
+        "title": "小文件治理与 Dataset IO 架构",
+        "body": "**小文件问题本质是 IO 形状不匹配**，不是文件系统不够快。每个样本一个文件时，元数据、TLS、RPC、Python overhead 可能超过数据本身。\n\n**治理方向**：\n- 打包成 tar/WebDataset/Parquet 等 shard\n- 为 shard 建 index：sample ID → (shard, offset, length)\n- 本地 cache 以 shard 为单位，不以单样本为单位\n- shard 保持不可变，用 manifest 发布版本\n- 随机性放在 index/sampler 层，不依赖随机小文件读取\n\n**四层架构**：\n```\nmanifest/current.json\n  → shard manifest + index\n    → 对象存储/并行 FS 的 shard bytes\n      → 节点本地 NVMe cache\n        → worker prefetch + decode\n```\n\n训练 worker 只需知道本 epoch 分到哪些 sample/shard，不在热路径做全量 LIST 或递归 stat。",
+        "reveal": {
+          "q": "为什么对象存储中 rename 操作和本地 POSIX rename 语义完全不同？",
+          "a": "POSIX rename 是内核中的原子命名切换，代价是 O(1)，不涉及数据移动。对象存储没有目录 inode 和原子 rename 原语，实现方式是 copy object 到新 key + delete 旧 key，代价是 O(文件大小)，且两步之间有窗口——中途失败时新旧 key 同时存在或都不存在。这就是为什么对象存储上必须用 manifest 发布协议而不是靠 rename 来做原子切换。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "为什么不应该把对象存储的 LIST prefix 操作作为训练 job 启动时的 dataset 发现方式？",
+        "options": [
+          "LIST 操作在所有对象存储上都是弱一致的，结果不可信",
+          "LIST 成本高、分页复杂、过程中有写入时有重复/遗漏风险，且在大规模 dataset 时制造控制面尖峰",
+          "LIST 不支持并发，无法在多 rank 环境下正确工作",
+          "LIST 操作需要特殊权限，普通训练账号无法使用"
+        ],
+        "answer": 1,
+        "explain": "LIST 在现代对象存储上语义已经较强，但成本仍然高（5000 万对象需要大量分页请求），分页过程中有写入/删除时需处理重复、遗漏和 continuation token，且多个 job 同时启动会打出控制面流量尖峰。正确做法是用 manifest 文件作为发现入口。"
+      },
+      {
+        "type": "judge",
+        "prompt": "使用 s3fs FUSE 挂载 S3 bucket 后，训练代码无需修改就能获得接近本地文件系统的 IO 性能。",
+        "answer": false,
+        "explain": "FUSE 挂载的每次 syscall 都要跨越内核/用户态边界到 s3fs daemon，再发出 HTTP 请求。每次 open() 触发一次 HEAD 请求（约 30ms），FUSE 上下文切换带来 2~5× 延迟，没有 prefetch 和 Range 优化。训练小图场景下 GPU 利用率常 < 30%，batch wait 是本地 NVMe 的 10 倍以上。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Lustre 并行文件系统中，MDS CPU 很高但 OST 带宽很低，最可能的原因是什么？",
+        "options": [
+          "网络带宽不足，无法把数据从 OST 传到 client",
+          "stripe count 太高，导致 OST 并发过多",
+          "大量小文件 open/stat 或所有 rank 同时 fsync 同一目录，元数据操作打满 MDS",
+          "OST 磁盘 IOPS 不足，所有请求在 OST 队列等待"
+        ],
+        "answer": 2,
+        "explain": "MDS CPU 高、OST 带宽低是典型的元数据路径瓶颈。常见原因是大量小文件触发海量 open/stat RPC 到 MDS，或所有 rank 同时 fsync 同一父目录（每次 dir fsync 是一次到 MDS 的同步 RPC）。修复方向是减少小文件元数据操作，预创建分层目录，协调 rank 分批发布。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Lustre 的 layout 特性与其主要用途匹配：",
+        "left": ["DoM（Data on MDT）", "PFL（Progressive File Layout）", "stripe count", "LDLM 锁 BL_AST"],
+        "right": [
+          "多 rank 共写或访问同一资源时触发的锁回收通知，是尾延迟抖动来源",
+          "小文件数据存在 MDT inode，open+read 一次 MDS RPC 完成，不触达 OST",
+          "同一文件在不同 offset 区间用不同 stripe 策略，兼顾小文件和大文件",
+          "文件数据分布到多少个 OST，控制大文件并行带宽"
+        ],
+        "explain": "DoM 让小热文件（manifest、index）完全在 MDS 服务，避免 OST 压力；PFL 让同一文件的不同 offset 段用不同 stripe，小段省 OST，大段展开带宽；stripe count 决定并行度；BL_AST 是 LDLM 锁回收通知，触发 flush + release，是并发写尾延迟的根源。"
+      },
+      {
+        "type": "judge",
+        "prompt": "S3 multipart upload 中，未调用 complete 的 part 会在几天后自动清理，不会产生额外存储费用。",
+        "answer": false,
+        "explain": "未 complete 的 multipart upload 不会自动清理。这些\"半成品\"会持续占用存储并产生费用，但在 bucket 的普通 LIST 中通常不可见。必须配置 lifecycle rule（如 abort incomplete multipart uploads after N days）才能自动清理。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 PyTorch DataLoader 中，`num_workers > 0` 使用 boto3 读取 S3 时，必须怎么处理 S3 client？",
+        "options": [
+          "在主进程创建一个全局 client，所有 worker 共享使用",
+          "在 `worker_init_fn` 里为每个 worker 重新创建 S3 client，因为 client 在 fork 后不可重用",
+          "使用 threading.local() 让多个线程共享同一个进程内的 client",
+          "创建后立即 pickle 序列化，在 worker 启动时反序列化"
+        ],
+        "answer": 1,
+        "explain": "boto3 client 内部持有连接池、TLS 状态等，在 fork 后不可安全重用（会出现 BotoCoreError 或随机 hang）。正确做法是在 worker_init_fn 里为每个 worker 独立创建 client，同时建议将连接池大小设为 64（默认仅 10）以支持高并发 Range GET。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看 Lustre 文件的 stripe count 和 stripe size，应使用什么命令？（只写命令名）",
+        "accept": ["lfs"],
+        "explain": "`lfs getstripe /path/to/file` 显示文件的 stripe count、stripe size、stripe offset 和各 stripe 所在 OST。`lfs setstripe` 可设置目录的默认 stripe 策略。"
+      },
+      {
+        "type": "choice",
+        "prompt": "将 2000 万个平均 80KB 的小图片从单文件目录结构迁移到 shard-based 结构，最主要的收益是什么？",
+        "options": [
+          "存储空间占用减少，因为 shard 格式有更高压缩率",
+          "每 epoch 读取请求数从数千万次 open/stat/GET 降低到少量 shard GET/Range，彻底改变 IO 形状",
+          "图片分辨率可以在 shard 中统一，减少 decode 时间",
+          "改变存储格式后训练代码可以直接并行化，无需 DataLoader"
+        ],
+        "answer": 1,
+        "explain": "小图片目录的瓶颈不是数据带宽而是 IO 形状：海量 open/stat/GET 把元数据路径（MDS、dentry cache、对象存储控制面）打满，GPU 在等 batch。打包成 shard 后每个 epoch 只需少量大块顺序读，IO 形状从\"海量小请求\"变成\"少量大请求\"，吞吐和延迟都大幅改善。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对象存储上的 `rename` 和本地 POSIX 文件系统的 `rename` 都是 O(1) 的原子操作，可以安全用于 checkpoint 的原子发布。",
+        "answer": false,
+        "explain": "POSIX 本地 rename 是内核级原子命名切换，O(1)，不涉及数据移动。对象存储没有原子 rename，实现是 copy object 到新 key + delete 旧 key，代价是 O(文件大小)，中途失败时状态复杂。对象存储上的 checkpoint 必须用 manifest 发布协议（complete multipart → 发布 manifest → 更新指针）而非 rename 语义。"
+      }
+    ]
+  }
+]

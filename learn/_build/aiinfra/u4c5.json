@@ -1,0 +1,113 @@
+[
+  {
+    "id": "u4c5",
+    "title": "显存优化、Checkpoint 与恢复",
+    "subtitle": "从 activation checkpointing 到 true resume 的生产可靠性控制面",
+    "intro": [
+      {
+        "title": "训练是一个长时间运行的状态机",
+        "body": "长训练任务不是「一次跑完」的程序，而是持续数天到数月的分布式状态机。它一定会遇到 GPU、网络、存储、节点或代码发布失败。\n\nCheckpoint 不是「文件保存动作」，而是**恢复协议**。它必须回答：\n- 状态有哪些（params、grads、optimizer、scheduler、loss scaler、RNG、dataset cursor、global step、parallel metadata）\n- 状态在哪里（HBM、CPU DRAM、NVMe、对象存储）\n- 谁拥有写入权（每个 rank 写 shard vs coordinator 聚合）\n- 何时可见（半成品不能被 `latest` 指针暴露）\n- 如何验证（shape、dtype、checksum、world size、parallel layout）\n- 如何清理（retention 不能删掉最后一个可恢复版本）"
+      },
+      {
+        "title": "显存预算的六项",
+        "body": "训练峰值显存 = `params + grads + optimizer_states + activations + comm_buffers + ckpt_buffer + fragmentation`\n\n常见遗漏：\n- `M_ckpt_buffer`：async checkpoint staging 在大规模作业里经常被遗忘\n- `M_frag`：allocator fragmentation 可使 reserved >> allocated，让「理论能放下」的作业实际 OOM\n\n**Activation checkpointing 的代价模型**：\n- 收益：activation 内存约降低 30%-70%（取决于 granularity）\n- 代价：step time 增加 5%-30%（重算 forward）\n- 适用：activation 是峰值主因、GPU compute 有余量\n- 不适用：step 已被 compute 打满，或重算破坏 kernel overlap\n\n**Offload 的边界**：PCIe Gen4 单向 ~32 GB/s，NVMe 更低，只有在计算能掩盖搬运延迟时才划算。offload 后 step time 从 1.2s 变 4.8s 是常见「解决 OOM 但 GPU duty cycle 只有 35%」的反例。"
+      },
+      {
+        "title": "Checkpoint Schema：最小真实恢复集",
+        "body": "「只保存 model.state_dict()」= warm start，不是 true resume。True resume 需要：\n\n| 状态 | 不保存的后果 |\n|---|---|\n| model params | 权重回退 |\n| optimizer states（Adam m/v）| loss 短期跳变，收敛轨迹改变 |\n| scheduler | LR 重复 warmup 或提前 decay |\n| RNG（CPU/CUDA/sampler/worker）| dropout/数据增强轨迹变化 |\n| dataset cursor | 重复或跳过样本 |\n| global step | 日志、LR、eval、checkpoint cadence 错位 |\n| parallel metadata | shard 无法映射或静默错位 |\n| precision state（GradScaler/FP8 amax）| scale 错误，FP8 冷启动 |\n\n生产 checkpoint 目录结构：写入临时路径 `step_N.tmp/`，所有 shard 完整后 coordinator 原子 rename 到 `step_N/`，最后更新 `latest.json` 的 CAS generation。对象存储没有 POSIX rename 时，用 `latest.json` 的 compare-and-swap 原子暴露版本。",
+        "tip": "Dataset cursor 必须保存 per-DP-rank sampler epoch/position、streaming shard offset、packing residual 和 gradient accumulation substep，而不只是全局 consumed_tokens。"
+      },
+      {
+        "title": "Atomic Visibility：两阶段写入",
+        "body": "Checkpoint 可见性必须是原子的，否则部分写入会被恢复流程读到：\n\n1. 所有 writer 写临时 shard，`fsync` 文件和目录\n2. coordinator 验证 shard count、size、checksum、tensor name/shape/dtype\n3. POSIX 文件系统：`rename(step_N.tmp, step_N)` + `fsync(ckpt_dir)`\n4. 对象存储：写不可变 step prefix，`latest.json` 用 CAS/generation 条件更新\n5. post-publish barrier：所有 rank 必须观察到同一个 latest pointer 才能继续训练\n\n**绝不能** 让部分 rank 的写入被暴露，也不能让 `latest.json` 指向 `status=writing` 或 `status=failed` 的 manifest。",
+        "tip": "任一 rank 写入失败必须让整个 checkpoint 标记 failed，不能只记日志。async checkpoint 的后台失败必须回传给训练进程，阻止 latest 更新。"
+      },
+      {
+        "title": "RPO/RTO：可靠性量化",
+        "body": "**RPO（Recovery Point Objective）**：故障后最多丢失多少训练进度。\n**RTO（Recovery Time Objective）**：从故障检测到恢复训练吞吐达标最多多久。\n\nRPO 计算基准是已验证且被 pointer 暴露的 checkpoint，不是「开始写 checkpoint 的时间」：\n\n`RPO(t_fail) = t_fail - capture_time(last_validated_capture_step(t_fail))`\n\n**常见 RPO 失效场景**：保存间隔 30 min，step_B 在 03:30 capture、03:38 仍未更新 latest pointer，03:35 故障 → RPO = 35 min（不是 5 min）。若 step_B validation 失败，52 min 后故障 RPO = 52 min。\n\n**Async checkpoint 的正确状态链**：\n`StepCommitted → FenceStreams → SnapshotStaged → TrainMayAdvance → FlushAttempt → Validate → PublishCAS → PostPublishBarrier`\n\n`last_validated_capture_step` 只能在 `PostPublishBarrier` 后更新。\n\n保存间隔建议：百卡训练 30-60 min，千卡预训练按 tokens+wall clock 双触发，checkpoint pause 控制在 step time budget 的 1%-3%。"
+      },
+      {
+        "title": "跨并行策略恢复支持矩阵",
+        "body": "恢复时最危险的不是立即报错，而是静默降级成 warm start。平台需要明确支持矩阵：\n\n| 变化类型 | True Resume | Warm Start | 需要工具 |\n|---|---|---|---|\n| 只替换物理节点，world size 不变 | 支持 | 支持 | 不需要 |\n| DP degree 变化，TP/PP/FSDP 不变 | 有条件 | 支持 | optimizer reshard |\n| TP degree 变化 | 通常不支持 optimizer | 支持权重 | tensor reshard |\n| PP degree 变化 | 通常不支持 optimizer | 支持权重 | layer/stage remap |\n| FSDP wrap policy 变化 | 不支持 | 支持权重 | unflatten/reshard |\n| EP/MoE expert parallel 变化 | 不支持 | 有条件支持权重 | offline conversion |\n\n**核心原则**：平台不能在不满足 true resume 条件时静默降级成 warm start。恢复校验失败要 quarantine 当前 checkpoint 并回退到 previous validated。",
+        "tip": "FP8 checkpoint 必须包含 amax history、scale、scale_inv 和 FP8 recipe。恢复时丢失这些 metadata 会导致前几步用错误 scale，表现为 silent loss parity drift。"
+      },
+      {
+        "title": "Allocator Fragmentation：理论容量与实际 OOM 的差距",
+        "body": "PyTorch CUDA allocator 会缓存显存块，常见现象：\n- `allocated` 不高，但 `reserved` 很高（碎片化）\n- `nvidia-smi` 显示还有空闲，但大块 allocation 失败\n- 训练到某个 sequence length 或 eval step 才 OOM\n\n诊断命令：\n`torch.cuda.memory_summary(device=0, abbreviated=False)`\n\n常见动作：\n- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256` 做 A/B 验证\n- 固定 sequence length bucket，减少动态 shape 抖动\n- checkpoint/eval 前释放不再使用的引用\n- 避免在 hot path 反复创建不同大小的临时 tensor",
+        "reveal": {
+          "q": "为什么 `last_validated_capture_step` 只能在 PostPublishBarrier 后更新，而不是在 SnapshotStaged 后？",
+          "a": "SnapshotStaged 只表示 GPU tensor 已经转移到 staging buffer，但 flush 到存储、checksum 验证、manifest 发布和 latest pointer 更新都还没完成。只有 PublishCAS 成功且 PostPublishBarrier 让所有 rank 观察到同一个 latest pointer 后，该 checkpoint 才真正可以被恢复流程使用。此前任何阶段失败都可能产生不完整的 checkpoint，不能作为 RPO 计算基准。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "judge",
+        "prompt": "只保存 model.state_dict() 就足以实现 true resume（完整恢复），因为模型权重包含了所有训练进度。",
+        "answer": false,
+        "explain": "只保存 model.state_dict() 是 warm start，不是 true resume。恢复后 optimizer momentum（Adam m/v）会丢失导致 loss 跳变，LR schedule 重新从头开始，RNG 不连续导致 dropout/数据增强轨迹变化，dataset cursor 重置导致样本重复或跳过。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个 checkpoint 状态可以被 latest pointer 暴露给恢复流程？",
+        "options": ["status=writing（仍在写入）", "status=validated（所有 shard 校验通过）", "status=failed（写入失败）", "status=quarantined（恢复校验失败）"],
+        "answer": 1,
+        "explain": "只有 status=validated 的 checkpoint 才能被 latest pointer 暴露。writing 表示还未完成，failed 表示写入校验失败，quarantined 表示恢复时失败。恢复流程必须 fail closed 拒绝这三种状态。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧显存优化手段与其主要收益匹配",
+        "left": ["Activation checkpointing", "Optimizer state sharding（ZeRO）", "CPU offload（ZeRO-Offload）", "Allocator expandable_segments"],
+        "right": [
+          "用重算 forward 换取 activation 显存降低 30-70%",
+          "降低 optimizer state 的单卡常驻量，端到端约 2.9×-N× reduction",
+          "将 optimizer state 移到 CPU DRAM，GPU 容量手段但可能大幅降低 GPU duty cycle",
+          "减少 CUDA allocator 的内存碎片，缓解 reserved >> allocated 问题"
+        ],
+        "explain": "四种手段解决不同问题：activation checkpointing 换算力换显存，ZeRO 分片状态，offload 把状态搬到慢设备，expandable_segments 减少 allocator 碎片。选择时必须考虑各自的代价。"
+      },
+      {
+        "type": "input",
+        "prompt": "保存间隔 30 分钟，step_B 在 03:30 capture，03:38 尚未更新 latest pointer，03:35 发生故障，RPO 是多少分钟？",
+        "accept": ["35", "35 分钟"],
+        "explain": "RPO = t_fail - capture_time(last_validated_capture_step(t_fail))。03:35 故障时，step_B 尚未被 latest pointer 暴露，last_validated 是上一个已发布的 checkpoint（假设在 03:00 capture），RPO = 35 - 0 = 35 分钟，不是 5 分钟。"
+      },
+      {
+        "type": "judge",
+        "prompt": "TP degree 从 8 改为 4 后，如果权重 shape 能对上，可以直接做 true resume（包括 optimizer state）而无需离线 reshard 工具。",
+        "answer": false,
+        "explain": "TP degree 变化会改变 tensor shard axis，optimizer state（Adam m/v）与参数 shard 一一对应，shard 重新分配后无法直接映射。通常只支持权重的 warm start，true resume 需要专门的 tensor reshard 工具链，且必须经过测试才能使用。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种情况 activation checkpointing 最不划算？",
+        "options": [
+          "训练大型 LLM 时 HBM 主要被 activation 占满",
+          "长上下文（128K token）训练，activation 随 seq 二次增长",
+          "训练 step 已经被 compute 完全打满，MFU 接近上限",
+          "batch size 受限于显存，无法增大"
+        ],
+        "answer": 2,
+        "explain": "activation checkpointing 用重算 forward 换显存，代价是增加 compute 时间 5%-30%。如果 step 已经被 compute 完全打满，额外的重算会直接线性拉长 step time，MFU 下降，得不偿失。前三种情况（activation 是峰值主因）才是它的适用场景。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 async checkpoint 状态与其含义匹配",
+        "left": ["SnapshotStaged", "TrainMayAdvance", "PublishCAS", "PostPublishBarrier"],
+        "right": [
+          "GPU tensor 已转移到 staging buffer，但 flush 尚未完成",
+          "训练可进入下一 step，但 checkpoint 仍在后台 flush",
+          "manifest validated，latest.json 以 CAS/generation 原子更新",
+          "所有 rank 观察到同一 latest pointer，该 step 计入 last_validated_capture_step"
+        ],
+        "explain": "async checkpoint 的状态链要严格按顺序推进。SnapshotStaged 只是 staging 完成，PublishCAS 是发布，PostPublishBarrier 是所有 rank 确认可见。只有 PostPublishBarrier 后才能更新 last_validated_capture_step。"
+      },
+      {
+        "type": "judge",
+        "prompt": "FP8 训练的 checkpoint 只需保存模型权重和 optimizer state，FP8 的 amax history 和 scale 可以在恢复后重新冷启动。",
+        "answer": false,
+        "explain": "FP8 的 amax history、scale、scale_inv 是训练状态。恢复时如果丢失这些 metadata，前几步会用错误的 scale，产生 silent loss parity drift——训练能继续跑，但数值轨迹已经偏离。生产 checkpoint 必须保存完整的 FP8 precision state。"
+      }
+    ]
+  }
+]

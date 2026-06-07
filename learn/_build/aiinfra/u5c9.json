@@ -1,0 +1,117 @@
+[
+  {
+    "id": "u5c9",
+    "title": "Model Registry 体系",
+    "subtitle": "AI Infra 的控制平面核心：让训练权重可被发现、可解释、可治理、可回滚",
+    "intro": [
+      {
+        "title": "动机：对象存储加目录约定为何不够",
+        "body": "训练出的权重只是字节流。对象存储能存文件，但它没有\"当前 production 版本是哪个\"的语义。没有 Model Registry，团队只能靠 Slack 消息通知服务节点去哪里拉模型——在节点动态扩缩容时必然出错。\n\nModel Registry 要解决四个不可化简的约束：\n- **服务发现**：serving 启动时知道去哪取哪个版本\n- **可解释性**：事故时能回答\"这个模型从哪段代码、哪份数据产生，通过了哪些评测\"\n- **可治理性**：Stage 状态机控制谁能把版本推到 production，渐进发布不停机\n- **可回滚性**：5 分钟内定位上一个 production 版本并切换，tokenizer 和 config 版本必须匹配"
+      },
+      {
+        "title": "五大核心实体",
+        "body": "| 实体 | 职责 | 类比 |\n|------|------|------|\n| **Model** | 模型的逻辑身份，跨版本稳定（如 `llama3-8b-instruct`） | Git 仓库 |\n| **Version** | 同一模型的一次具体迭代，是发布单元 | Git commit |\n| **Artifact** | Version 对应的物理文件集合（weights、config、tokenizer） | Release bundle |\n| **Stage** | Version 在发布流程中的当前状态 | Git branch 角色 |\n| **Lineage** | Version 的来源追踪：训练 job、数据集、代码、父版本 | Git blame + provenance |\n\n扩展实体：**Tag**（键值对，支持自由检索）、**Metric**（评测指标快照，支持版本间比较）、**Alias**（Model 级别的别名指针，如 `production`/`canary`，serving 通过 Alias 解析版本避免硬编码）。"
+      },
+      {
+        "title": "Metadata Schema：生产必备字段",
+        "body": "Version 元数据不是可选注释，而是审计和合规的法律证据：\n\n| 字段分类 | 关键字段 | 用途 |\n|---------|---------|------|\n| 模型规格 | `framework`、`precision`（bf16/fp16/int8）、`parameter_count`、`context_length`、`architecture` | serving 加载兼容性检查 |\n| 血缘追踪 | `training_job_id`、`code_revision`、`training_data_ref`、`image_digest` | 可追溯性和复现性 |\n| 评测结果 | `eval_results`（JSONB 快照）、`calibration_data`（量化模型必填） | 发布决策依据 |\n| LoRA 专用 | `base_model_name`、`base_model_version`、`lora_rank`、`target_modules` | 兼容性检查和 serving 绑定 |\n\n注意：`hidden_size`、`num_layers` 是 LoRA 兼容性检查的必需字段；`inference_signature` 让 serving 在加载前做 tensor shape/dtype 兼容性检查。"
+      },
+      {
+        "title": "Stage 状态机",
+        "body": "Stage 是 Registry 治理能力的核心，是严格的有限状态机，不是自由打标签：\n\n| Stage | 含义 | 流量 | 可回滚候选 |\n|-------|------|------|----------|\n| `staging` | 评测通过，等待灰度 | 无 | 否 |\n| `canary` | 接受 1-5% 真实流量，观察指标 | 小比例 | 否 |\n| `production` | 承载全量流量 | 全量 | 是 |\n| `archived` | 已退役，保留权重用于回滚、复盘 | 无 | 是（降级回滚用）|\n| `rejected` | 未通过门禁或被显式拒绝 | 无 | 否 |\n\n**跳转规则**：同一 Model 最多只有一个 `production` 版本。`archived` 版本保留权重至少 30 天（大模型至少 7 天），元数据永久保留。`staging → canary` 可 CI 自动或人工触发；`canary → production` 需要人工确认 canary 指标健康。"
+      },
+      {
+        "title": "主流 Registry 选型",
+        "body": "| Registry | 优势 | 劣势 | 大模型支持 | LoRA 支持 |\n|----------|------|------|-----------|----------|\n| **MLflow** | 轻量、易集成 CI/CD | 分发能力弱，Stage 概念简化 | 勉强（需自配 S3）| 无原生支持 |\n| **HuggingFace Hub** | 生态最大，safetensors 标准 | 治理能力弱，无 Stage 状态机 | 支持（LFS）| 社区规范，非强制 |\n| **Vertex AI / SageMaker** | 与云生态深度集成 | 强云绑定，费用高 | 支持 | 需自定义 |\n| **自建 Postgres + S3** | 完全控制 schema 和 Stage 逻辑 | 初期维护成本高 | 最优（自定义 chunk upload）| 可完全定制 |\n\n**选型建议**：初期（<10 个模型版本）用 MLflow；中期叠加 HuggingFace Hub on-prem 或迁移到托管服务；大规模平台（多 region、多 LoRA、严格治理）自建 Postgres + S3 是唯一能满足所有约束的方案。"
+      },
+      {
+        "title": "100GB+ 权重管理：分发与缓存",
+        "body": "标准文件上传在大权重场景下必然失败，需要：\n\n**上传**：S3 Multipart Upload（每 part 建议 512MB）+ 断点续传（查询已完成 part 列表跳过）+ 并行下载（8-16 线程）。\n\n**分发模式**：\n- **Pull 模式**：serving 节点启动/热更新时主动拉模型，适合大模型（>10GB）、更新频率低\n- **Push 模式**：Registry 在版本提升时主动推送，适合小 adapter（<1GB）、要求零延迟上线\n- **预热缓存**：发布前提前推到节点本地，适合计划内发布\n\n**本地缓存**：production 版本常驻（pin），LRU 驱逐最久未访问的版本；LoRA 版本更新时只下载 adapter shard，base model 复用缓存。\n\n**Alias 解耦原则**：serving 只关注 `production` alias 指向哪个版本，Registry 在 Stage 迁移时原子更新 Alias，serving 每 30 秒轮询一次，实现无停机发布。"
+      },
+      {
+        "title": "LoRA Registry 与兼容性检查",
+        "body": "LoRA adapter 是大模型生产环境中变化最频繁的组件，必须强制绑定 base model：\n\n**LoRA Version 额外必填字段**：`base_model_name`、`base_model_version`（不能是 rejected/archived 状态）、`lora_rank`、`target_modules`（必须在 base model 架构中存在）。\n\n**兼容性检查流程**：上传 LoRA adapter → 检查 base model 是否存在 → 检查 base model stage 是否有效 → 检查 `hidden_size` 匹配 → 检查 `target_modules` 在 base model 中存在 → 注册成功（stage=staging）。\n\n**与 vLLM 集成**：serving 通过 Alias API 获取 `base_model_name` 和 adapter 的 `storage_uri`，自动选择已加载的 base model 引擎实例；base model 升级时自动触发对所有绑定 adapter 的兼容性回归测试。",
+        "tip": "反模式：LoRA adapter 不记录 base model 版本，当 base model 升级时（如 attention heads 从 32 变为 40），无法自动检测哪些 adapter 不兼容，必须靠人工检查——通常在生产事故后才发现。"
+      },
+      {
+        "title": "关键反模式",
+        "body": "- **用目录日期做版本**：`s3://bucket/models/llama3/2026-05-01/` 无法表达 Stage 和血缘，回滚靠猜\n- **Schema 过度灵活**：全是 JSONB 无必填约束，10 个团队有 10 种命名惯例，搜索失效\n- **Stage 用注释代替状态机**：把 `production` 写在描述文字里，serving 无法自动解析当前版本\n- **Alias 直接是 S3 路径**：每次发布必须重启 serving 节点更新配置\n- **权重上传没有校验和**：网络中断后部分文件被误认为完整版本推到 production\n- **archived 版本立即删除权重**：发现需要回滚时权重已被清理",
+        "reveal": {
+          "q": "为什么 serving 应通过 Alias 解析版本而不是直接引用 Version ID？",
+          "a": "如果 serving 硬编码 Version ID，每次发布都要修改所有 serving 节点的配置并重启。通过 Alias（如 `production`）解耦后，Registry 在 Stage 迁移时原子更新 Alias 指针，serving 每 30 秒轮询一次 Alias 解析接口即可感知版本切换，实现无停机发布和快速回滚。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Model Registry 中，`Version` 实体的类比是什么？",
+        "options": ["Git 仓库", "Git commit", "Release bundle", "Git branch"],
+        "answer": 1,
+        "explain": "Model（逻辑命名空间）类比 Git 仓库；Version（可发布单元）类比 Git commit；Artifact（物理文件集合）类比 Release bundle；Stage（当前状态）类比 Git branch 角色。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`archived` 状态的模型版本权重可以在归档后立即删除，以节省存储成本。",
+        "answer": false,
+        "explain": "`archived` 版本保留权重至少 30 天（大模型至少 7 天），元数据永久保留。这是因为紧急回滚时需要直接把 archived 版本提升为 production，如果权重已被删除则无法回滚，可能导致更严重的事故。"
+      },
+      {
+        "type": "choice",
+        "prompt": "同一个 Model 最多允许几个 `production` 状态的 Version？",
+        "options": ["无限制，按需", "最多 1 个", "最多 2 个", "最多 5 个"],
+        "answer": 1,
+        "explain": "同一 Model 最多只有一个 `production` 版本（多 LoRA 场景例外）。这保证了 serving 层通过 `production` alias 解析时结果唯一确定，避免歧义。canary 最多两个。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Registry 分发模式与适用场景匹配：",
+        "left": ["Pull 模式", "Push 模式", "预热缓存"],
+        "right": ["计划内发布，发布时已就绪", "大模型（>10GB），更新频率低", "小 adapter（<1GB），要求零延迟上线"],
+        "explain": "Pull 模式：serving 启动时主动拉，适合大模型低频更新；Push 模式：Registry 主动推，适合小 adapter 零延迟需求；预热缓存：发布前提前推到节点，适合有计划的版本切换。"
+      },
+      {
+        "type": "input",
+        "prompt": "LoRA adapter 在 Registry 中必须记录哪个字段，以确保 serving 时能找到对应的 base model？（填写字段名，不含引号）",
+        "accept": ["base_model_name", "base_model_version"],
+        "explain": "LoRA adapter 必须记录 `base_model_name`（base model 的 Model 名，必须存在于 Registry）和 `base_model_version`（Version ID，stage 不能是 rejected）。serving 通过这两个字段确定使用哪个已加载的 base model 引擎实例。"
+      },
+      {
+        "type": "judge",
+        "prompt": "使用 S3 Multipart Upload 上传权重时，如果某个 part 上传失败，必须从头重新上传整个文件。",
+        "answer": false,
+        "explain": "Multipart Upload 支持断点续传：client 先查询已完成的 part 列表，跳过已上传的 part，只重传失败的 part。这是处理大文件（100GB+）上传中断的标准机制。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种情况是 Registry 中 Stage 流转的反模式？",
+        "options": [
+          "从 staging 自动提升到 canary（CI 触发）",
+          "从 canary 回退到 staging（指标异常）",
+          "从 production 直接跳到 rejected（发现严重问题）",
+          "从 archived 直接跳到 canary（跳过 staging）"
+        ],
+        "answer": 3,
+        "explain": "archived 状态仅在紧急情况下可直接提升回 production（不是 canary），且有严格条件。正常发布路径要走完整的 staging → canary → production。从 production 直接到 rejected 是合法的强制退出操作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对于量化模型（INT8/INT4），`calibration_data` 字段是可选的 metadata 字段。",
+        "answer": false,
+        "explain": "量化模型的 `calibration_data` 字段是条件必填：指向用于量化校准的数据集。缺少此字段意味着无法复现量化过程，也无法验证量化结果的质量，违反可复现性约束。"
+      },
+      {
+        "type": "choice",
+        "prompt": "serving 节点每 30 秒轮询 Registry Alias 接口的核心目的是什么？",
+        "options": [
+          "检查模型文件的 sha256 完整性",
+          "感知版本切换并触发热加载，实现无停机发布",
+          "更新本地 LRU 缓存，驱逐旧版本",
+          "上报推理延迟指标给 Registry"
+        ],
+        "answer": 1,
+        "explain": "serving 节点通过定期轮询 Alias 解析接口（如 `GET /models/llama3/aliases/production`）检测 version_id 是否变化，变化时自动下载新版本并热加载。这实现了无停机发布：发布时只需更新 Registry 的 Alias 指针，serving 节点在下一个轮询周期自动完成切换。"
+      }
+    ]
+  }
+]

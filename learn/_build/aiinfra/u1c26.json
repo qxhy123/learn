@@ -1,0 +1,129 @@
+[
+  {
+    "id": "u1c26",
+    "title": "GPUDirect RDMA、GPU/NIC 拓扑与诊断",
+    "subtitle": "从 nvidia_peermem 到容器权限：让 NIC 直接访问 GPU 显存",
+    "intro": [
+      {
+        "title": "GPUDirect RDMA 不只是一个环境变量",
+        "body": "GPUDirect RDMA 让 RDMA NIC 直接 DMA 访问 GPU HBM，避免先把 GPU 数据复制到 host pinned memory 做 staging。\n\n**普通跨节点路径（host staging）：**\n`GPU HBM → host pinned memory → NIC → network → peer NIC → host pinned memory → peer GPU HBM`\n\n**GPUDirect RDMA 快路径：**\n`GPU HBM ↔ NIC RDMA engine ↔ network ↔ peer NIC ↔ peer GPU HBM`\n\n这不只是 NCCL 的一个开关；它要求 GPU driver、RDMA driver、`nvidia_peermem`、HCA、IOMMU/ACS/ATS、PCIe P2P、BAR/BAR1 映射、容器设备权限和通信库**全部配合**。任何一层不成立，通信库可能接受 CUDA pointer 但实际退回 host staging 或 socket fallback。",
+        "tip": "CUDA-aware NCCL 能接受 CUDA device pointer，不保证一定走 GPUDirect RDMA；要用 `NCCL_DEBUG=INFO` 日志和 `ib_write_bw --use_cuda` 确认。"
+      },
+      {
+        "title": "nvidia_peermem 与 peer memory 机制",
+        "body": "`nvidia_peermem` 是 NVIDIA GPU driver 与 RDMA core/OFED 之间的桥梁模块，让 verbs registration 遇到 GPU memory 时，可以调用 NVIDIA driver 完成 pin、map、unmap、invalidate。\n\n**检查 peermem：**\n- `lsmod | grep nvidia_peermem` — 确认模块已加载\n- `dmesg | grep -i nvidia_peermem` — 确认加载无异常\n- `modinfo nvidia_peermem` — 查看版本\n\n**常见失败表现：**\n\n| 组件缺失 | 现象 |\n|---|---|\n| `nvidia_peermem` 未加载 | `ib_write_bw --use_cuda` 失败或退到 host staging |\n| `mlx5_core/mlx5_ib` 未加载 | 没有 RDMA device，NCCL 退到 socket |\n| RDMA core/OFED ABI 不匹配 | `ibv_reg_mr` 失败 |\n| 容器缺 `/dev/infiniband` | `ibv_devinfo` 报 No IB devices found |"
+      },
+      {
+        "title": "PCIe 拓扑：nvidia-smi topo -m 怎么读",
+        "body": "`nvidia-smi topo -m` 展示 GPU 与 NIC 之间的 PCIe 路径关系，是绑定 rank/GPU/HCA 的关键依据：\n\n| 标记 | 含义 | 对 GPUDirect RDMA 的影响 |\n|---|---|---|\n| `PIX` | 经过一个 PCIe switch | 通常优先绑定，P2P 路径最短 |\n| `PXB` | 经过多个 PCIe bridge/switch | 可用但 latency/带宽可能差 |\n| `PHB` | 经过 PCIe host bridge | 需谨慎验证 |\n| `NODE` | 跨同 NUMA node 内互连 | 可用但不如近邻 |\n| `SYS` | 跨 NUMA socket | 高风险，带宽低、抖动大 |\n\n**正确绑定原则：** 每个 rank 的 GPU 应绑定到 topo label 最近的 HCA（优先 `PIX`），所有 rank 跨 socket 使用 HCA 是常见配置错误。",
+        "reveal": {
+          "q": "8 GPU + 8 HCA 节点中，如果所有 rank 都配置 `NCCL_IB_HCA=mlx5_4`，会产生什么问题？",
+          "a": "mlx5_4 通常绑定 socket1，GPU0-3 在 socket0 与之通信需要跨 socket；PCIe P2P transaction 必须经过 CPU root port 和 UPI，带宽下降且 latency 抖动；collective 由最慢 rank 决定，拖慢全局。"
+        }
+      },
+      {
+        "title": "IOMMU、ACS 与 ATS 对 GPUDirect RDMA 的影响",
+        "body": "- **IOMMU**：设备 DMA 地址转换，提供隔离但增加 mapping 成本；passthrough 模式降低开销但隔离弱\n- **ACS（Access Control Services）**：控制 PCIe P2P 是否能在 switch 内直达或必须经过 root complex；ACS 启用可能禁止或绕远 P2P\n- **ATS（Address Translation Services）**：设备缓存地址翻译，减少 IOMMU 压力，需要平台端到端支持\n\n**排障原则：** 不要先改 BIOS；先用拓扑和性能测试**证明**路径问题，再由平台团队评估 IOMMU/ACS 策略。`lspci -vv -s <bdf>` 可查看 ACS、ATS 状态。"
+      },
+      {
+        "title": "如何判断 GPUDirect RDMA 真的启用（证据强度排序）",
+        "body": "1. **最强证据：** `ib_write_bw --use_cuda=0 -d mlx5_0 <peer>` 成功，带宽接近 HCA line rate，host DRAM 带宽和 CPU memcpy 不随通信线性升高\n2. **NCCL 日志：** `NCCL_DEBUG=INFO` 显示 `NET/IB`、GDRDMA 相关路径，`nccl-tests` busbw 达到平台预期\n3. **UCX 日志：** `UCX_LOG_LEVEL=info` 显示 CUDA memory registration 走 RDMA transport\n4. **间接线索：** `nvidia_peermem` 已加载，HCA/GPU topo 近，BAR1 usage 有变化\n\n**fallback 线索：** NCCL 日志出现 `NET/Socket`；`cuda_copy` transport；host DRAM 带宽随通信增加；同节点不同 GPU/HCA 组合性能差异巨大。",
+        "tip": "UCX_TLS=cuda_copy 不能证明 GPUDirect RDMA 启用；cuda_copy 指用 CUDA copy engine 做 host/device staging，与 NIC 直接访问 GPU memory 是不同路径。"
+      },
+      {
+        "title": "容器与 Kubernetes：最常见的 GPUDirect RDMA 退化原因",
+        "body": "裸机正常、容器异常是 GPUDirect RDMA 的高频故障。容器需要同时满足：\n\n| 条件 | 验证命令 |\n|---|---|\n| GPU device 可见 | `ls -l /dev/nvidia*` |\n| RDMA device 可见 | `ls -l /dev/infiniband` |\n| verbs library 可用 | `ldconfig -p | grep libibverbs` |\n| 足够的锁页权限 | `ulimit -l` |\n| IPC_LOCK capability | `grep Cap /proc/self/status` |\n\nKubernetes 中需要 NVIDIA device plugin（注入 GPU）和 RDMA device plugin（注入 `/dev/infiniband/*`）同时工作；缺少任一项，NCCL 即使 `NET/IB` 正常也会因 peer memory 注册失败退回 fallback。\n\n**容器内能 `nvidia-smi` 不代表能 GPUDirect RDMA；容器内能 `ibv_devinfo` 不代表 CUDA peer memory 注册成功——二者都要验证。**"
+      },
+      {
+        "title": "GPUDirect RDMA 验收 SOP",
+        "body": "**单机阶段：**\n1. 记录 `nvidia-smi topo -m`、`lspci -tv`、GPU/HCA/NUMA locality 矩阵\n2. 确认 `nvidia_peermem`、`mlx5_core`、`mlx5_ib`、`ib_uverbs` 已加载\n3. 确认 HCA port active、rate 正确\n4. 检查 memlock、IPC_LOCK、容器 device 权限\n\n**两节点阶段：**\n1. 先跑 host memory `ib_write_bw` 建立 baseline\n2. 再跑 CUDA memory `ib_write_bw --use_cuda=0` 验证 peer memory\n3. 对 GPU/HCA locality 组合（closest/remote socket）分别采样\n\n**NCCL 验收：** 从单节点到两节点到多节点，保存 `NCCL_DEBUG=INFO` 日志、topo dump、版本矩阵。\n\n**上线门槛：** 目标 GPU/HCA 组合通过 CUDA RDMA microbenchmark + 跨节点 busbw 达到平台预期 + 无 socket fallback + 容器与宿主机行为一致 + 重启后可复现。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "`nvidia-smi topo -m` 中，GPU 与 NIC 的 topo 标记为 `SYS` 时，对 GPUDirect RDMA 性能意味着什么？",
+        "options": [
+          "P2P 路径最短，性能最优",
+          "跨 NUMA socket，带宽低、latency 抖动大，高风险",
+          "与节点内 NVLink 通信",
+          "与 host staging 性能相当"
+        ],
+        "answer": 1,
+        "explain": "`SYS` 表示跨 NUMA socket，PCIe P2P 需要经过 CPU root port 和 UPI/Infinity Fabric，带宽明显下降且 latency 抖动大，是高风险配置。"
+      },
+      {
+        "type": "judge",
+        "prompt": "容器内能成功运行 `nvidia-smi`，说明 GPUDirect RDMA 所需的所有条件都已满足。",
+        "answer": false,
+        "explain": "`nvidia-smi` 只验证 GPU device 可见；GPUDirect RDMA 还需要 RDMA device（/dev/infiniband）可见、libibverbs 可用、nvidia_peermem 加载、足够的 memlock 和 IPC_LOCK capability。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 GPUDirect RDMA 组件与其作用配对：",
+        "left": ["nvidia_peermem", "BAR1", "ACS", "IOMMU passthrough"],
+        "right": [
+          "降低 DMA 地址转换开销，保留部分 IOMMU 框架",
+          "连接 NVIDIA GPU driver 与 RDMA peer memory 注册路径",
+          "控制 PCIe P2P 是否能在 switch 内直达或必须上行到 root complex",
+          "GPU 向 peer device 暴露 memory 的 PCIe BAR aperture 窗口"
+        ],
+        "explain": "nvidia_peermem 是 GPU driver 和 RDMA 的接口；BAR1 是 GPU memory 的 PCIe 访问窗口；ACS 控制 P2P 路径；IOMMU passthrough 降低地址转换开销。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个命令可以最直接地验证 GPUDirect RDMA 路径是否真的启用（而非 host staging fallback）？",
+        "options": [
+          "`nvidia-smi -q` 查看 BAR1 usage",
+          "`lsmod | grep nvidia_peermem` 确认模块加载",
+          "`ib_write_bw --use_cuda=0 -d mlx5_0 <peer>` 测量 CUDA buffer RDMA Write 带宽",
+          "`NCCL_IB_DISABLE=0` 设置环境变量"
+        ],
+        "answer": 2,
+        "explain": "`ib_write_bw --use_cuda` 直接使用 CUDA device memory 做 RDMA 测试；成功且带宽接近 HCA line rate、host DRAM 压力不随之升高，是 GPUDirect RDMA 真实启用的最强证据。"
+      },
+      {
+        "type": "judge",
+        "prompt": "UCX_TLS 配置为 `cuda_copy` 说明跨节点通信走了 GPUDirect RDMA。",
+        "answer": false,
+        "explain": "`cuda_copy` 表示使用 CUDA copy engine 在 host 和 device 之间拷贝，是 host staging 路径；`gdr_copy` 才与 GPUDirect 相关；真正的跨节点 RDMA direct 需要 `rc_x` 或 `dc_x` 配合 peer memory 注册。"
+      },
+      {
+        "type": "choice",
+        "prompt": "NCCL 日志显示 `NET/Socket` 而非 `NET/IB`，容器内 `ls /dev/infiniband` 显示 No such file or directory，最直接的修复方向是？",
+        "options": [
+          "重新安装 NCCL",
+          "在 Kubernetes Pod 中通过 RDMA device plugin 注入 /dev/infiniband/* 设备",
+          "增大 GPU 显存",
+          "调整 NCCL_IB_GID_INDEX"
+        ],
+        "answer": 1,
+        "explain": "RDMA device 在容器内不可见是最常见的 socket fallback 原因；需要通过 RDMA device plugin 将 /dev/infiniband/* 注入容器，同时确保 verbs library 和 securityContext 配置正确。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看训练节点 GPU 与 NIC 之间完整拓扑关系矩阵的命令是什么？",
+        "accept": ["nvidia-smi topo -m"],
+        "explain": "`nvidia-smi topo -m` 展示所有 GPU 和 NIC 之间的 PCIe/NVLink 拓扑关系，是制定 rank/GPU/HCA 绑定策略的必备工具。"
+      },
+      {
+        "type": "choice",
+        "prompt": "GPUDirect RDMA 中，host staging 路径的有效带宽上界由哪些因素决定？",
+        "options": [
+          "只取决于 NIC line rate",
+          "取决于 GPU D2H copy、host DRAM、NIC line rate 和 H2D copy 中的最小值",
+          "只取决于 PCIe 带宽",
+          "取决于 NCCL 版本"
+        ],
+        "answer": 1,
+        "explain": "host staging 路径包含 GPU→host D2H copy、NIC DMA read host memory、对端 NIC DMA write host memory、host→GPU H2D copy 四段，有效带宽被其中最慢的一段限制。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 RoCE 集群中，GPUDirect RDMA 正常工作后，fabric 层（MTU、PFC、ECN、GID）的配置就不再需要关注了。",
+        "answer": false,
+        "explain": "GPUDirect RDMA 只优化 GPU/NIC 内存路径，不替代 fabric 层配置；MTU 不一致、GID 错误、PFC/ECN 配置问题仍会导致 RDMA 传输 timeout 和 retry exceeded，两层需要独立验证。"
+      }
+    ]
+  }
+]

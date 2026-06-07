@@ -1,0 +1,123 @@
+[
+  {
+    "id": "u5c5",
+    "title": "流式读取与 DataLoader 工程化",
+    "subtitle": "GPU 不能等数据：五层流水线协调与瓶颈消除",
+    "intro": [
+      {
+        "title": "不可化简问题：GPU 不能等数据",
+        "body": "DataLoader 工程化的核心只有一句话：**GPU 不能等数据**。\n\n现代 A100/H100 在 1-5ms 内完成一个 batch 的前向+后向计算。如果下一个 batch 在这段时间内没有出现在 GPU 显存里，GPU 就空转。GPU 空转不是「慢一点」——是固定成本的浪费：租用一张 H100 每小时数美元，每个 idle 周期都在消耗真实金钱却没有产出梯度。\n\n**DataLoader 调优的本质**：识别五层流水线中哪一层最慢，让该层的吞吐至少等于 GPU 计算所需的 batch/s，再用 prefetch 把剩余的时间不确定性吸收掉。\n\n五层流水线：磁盘/对象存储读取 → CPU 解码/预处理 → CPU→GPU 数据搬运（H2D）→ GPU 前向+后向计算 → shuffle/collate。任何一层成为瓶颈，GPU 都会等。"
+      },
+      {
+        "title": "多进程 Worker 模型与 prefetch_factor",
+        "body": "PyTorch DataLoader 在 `num_workers > 0` 时启动 N 个独立 worker 进程（完整 Python 解释器，不受 GIL 限制），通过共享内存（`/dev/shm`）把解码好的张量传回主进程。\n\n**`prefetch_factor` 的实际含义**：每个 worker 预先解码 `prefetch_factor` 个 batch，总 in-flight batch 数 = `num_workers × prefetch_factor`。`num_workers=4, prefetch_factor=2` → 始终有 8 个 batch 在飞行中。\n\n**`persistent_workers=True` 的价值**：每 epoch 重建 worker 进程时，tokenizer（200-400MB 词表）要重新加载。16 workers × 400MB = 6.4GB 额外内存分配释放，并产生大量 GC 压力。`persistent_workers=True` 让 worker 进程在 epoch 间保持存活，只重置 dataset state。\n\n**fork vs spawn 的陷阱**：主进程初始化 CUDA 后使用 `fork`，会导致 worker 中 CUDA 上下文损坏，产生难以调试的 segfault。有 CUDA 的场景必须用 `spawn`。",
+        "tip": "NLP 训练推荐组合：persistent_workers=True + num_workers=8~16 + prefetch_factor=2~4。超过物理核数后，调度开销和 cache 竞争会让吞吐下降。"
+      },
+      {
+        "title": "pin_memory + non_blocking：消除 H2D 中间拷贝",
+        "body": "默认情况下，CUDA H2D 传输前必须先把可分页内存（pageable memory）拷贝到固定内存（pinned memory），再做 DMA 传输——额外一次 CPU 内存拷贝。\n\n**`pin_memory=True`**：DataLoader 直接在 pinned memory 中申请 collate 结果，CUDA 可以直接 DMA 传输，省去中间拷贝。\n\n**`tensor.cuda(non_blocking=True)`**：H2D 传输在 CUDA stream 上异步执行，不阻塞 CPU 主循环——CPU 立即开始准备下一步（下一个 batch 的 collate），GPU 继续接收数据。\n\n**注意**：pinned memory 是不可换出的物理内存，过度分配会增加 OS 内存压力。建议每张 H100 卡预留 2-4GB 给 pinned memory 缓冲区。不要在 `non_blocking=True` 后立即在 CPU 上访问该张量（会强制同步）。"
+      },
+      {
+        "title": "num_workers 的调优上界与伪共享陷阱",
+        "body": "**num_workers 经验法则**：\n- 图像任务（JPEG 解码）：从「物理核数 / 卡数」开始，CPU 密集可吃满\n- NLP 任务（tokenization）：4-16，tokenizer 进程膨胀限制上界\n- S3 对象存储：8-32，网络 IO 密集可多些\n- 本地 NVMe：物理核数 / 2，磁盘带宽通常先饱和\n\n**伪共享陷阱（§0a-7 所述真实场景）**：DataLoader worker stats 数组（如 `std::vector<WorkerStats>` 紧凑布局，每个结构体 16-24B）会让多个 worker 的统计字段共享同一条 cache line（64B）。16 worker 高频写各自字段 → cache line 在核间反复 invalidate → **16 worker 吞吐反低于 8 worker**。\n\n**修复**：对 worker 粒度统计结构加 `alignas(64)`，用 thread-local 累加 + 每 64 样本 flush 一次，降低 atomic 写频率。"
+      },
+      {
+        "title": "IterableDataset vs MapDataset：shuffle 语义的差异",
+        "body": "| 维度 | MapDataset | IterableDataset |\n|------|------------|------------------|\n| 访问语义 | 随机访问（任意 index） | 顺序流（只支持 next） |\n| shuffle | 全局 index 打乱（完美随机） | shuffle buffer（近似随机） |\n| 适合存储 | 本地文件、内存映射 | 对象存储、网络流、shard 文件 |\n| resume | 保存 sampler index 即可 | 需记录 shard index + shard 内 offset |\n\n**shuffle buffer 的近似程度**：维护大小为 `buffer_size` 的内存缓冲区，每次随机选一个样本返回，从流中补充新样本。`buffer_size=1000` 对 NLP 通常够用；`buffer_size=10000` 接近全局随机。\n\n**大规模训练的实际方案**：shard 级 shuffle + shard 内顺序读 + 小 shuffle buffer，牺牲少量统计随机性换取实际可行的 IO 效率。完美全局 shuffle 在 1T token 规模本身需要数 TB 内存，工程上不可行。",
+        "tip": "Collate_fn 默认在主进程执行，如果 collate 很重（如在 collate 中做 tokenization），主进程 CPU 会成为瓶颈。解决方案：把 tokenization 移到 Dataset.__getitem__，在 worker 中执行。"
+      },
+      {
+        "title": "三大流式框架：WebDataset、MosaicML Streaming、litdata",
+        "body": "| 维度 | WebDataset | MosaicML Streaming | litdata |\n|------|-----------|--------------------|---------|\n| 格式 | `.tar` 流 | `.mds` 二进制 | 自定义 chunked binary |\n| 全局 shuffle | 弱（shard 级 + buffer） | 强（跨 shard 随机化） | epoch 级 + buffer |\n| Resume | 弱（需手动记录） | 强（内建 epoch+sample offset） | 强（checkpoint 即可） |\n| 多机分片 | 手动配置 | 内建自动分片 | 内建 |\n| 典型用户 | 学术界、中小规模 | 大规模工业预训练 | PyTorch Lightning 生态 |\n\n**实测吞吐对比（64 节点 × 32 workers）**：\n- JSONL + 在线 tokenization：~2.1 GB/s（tokenization 成瓶颈）\n- WebDataset .tar：~11.2 GB/s\n- MosaicML Streaming .mds：**~13.8 GB/s**，CPU 使用率仅 20%\n\n大规模预训练首选 MosaicML Streaming：全局 shuffle + resume + 最高吞吐。"
+      },
+      {
+        "title": "GPU 利用率调优：从 45% 到 93% 的逐步过程",
+        "body": "以 LLaMA-7B 单节点 8×A100 为例，DataLoader 从瓶颈调到非瓶颈的完整过程：\n\n| 调优步骤 | 变更内容 | GPU util avg | DataLoader wait |\n|---------|----------|--------------|------------------|\n| 基线 | num_workers=2, 无 pin_memory | 45% | 280ms/step |\n| 增加 workers | num_workers=8 | 68% | 95ms |\n| pin_memory | pin_memory=True + non_blocking | 74% | 75ms |\n| persistent_workers | persistent_workers=True | 76% | 68ms |\n| 更大 prefetch | prefetch_factor=4 | 80% | 45ms |\n| 本地 NVMe cache | 预缓存 20GB shard | 88% | 18ms |\n| bucket batching | 按序列长度分桶 | 91% | 18ms |\n| num_workers 精调 | 8→12（刚好不超核数/卡数） | **93%** | **12ms** |\n\n**关键原则**：每次只改一个变量，用 GPU util + DataLoader wait time 两个指标同步确认。过度增加 workers 或 prefetch_factor 会引发内存压力和伪共享，反而让吞吐下降。",
+        "reveal": {
+          "q": "训练时发现 NCCL AllReduce 等待时间突然变长，但通信带宽正常，应该优先排查什么？",
+          "a": "优先排查各 rank 的 DataLoader wait time（data_time 指标）。DDP/FSDP 是全局同步的，一个 rank 因 S3 GET 抖动、解码慢或 cache miss 卡住，其他 rank 会在梯度 collective 处等待，表现为 nccl_wait 变长。根因是慢 rank 的数据输入，而不是通信问题。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "PyTorch DataLoader 使用多进程 worker 而不是多线程，最根本的原因是什么？",
+        "options": [
+          "多进程的内存隔离比多线程更安全",
+          "Python 的 GIL 会让多线程 CPU 密集型任务无法真正并行",
+          "多进程可以使用更多物理核心",
+          "多线程不支持 shared memory 传输"
+        ],
+        "answer": 1,
+        "explain": "Python 的 GIL（Global Interpreter Lock）让多线程在 CPU 密集型任务（如 JPEG 解码、tokenization）中无法真正并行——同一时刻只有一个线程能执行 Python 字节码。多进程每个 worker 有独立的 Python 解释器，不受 GIL 限制，能真正并行利用多核。"
+      },
+      {
+        "type": "judge",
+        "prompt": "num_workers 越大，DataLoader 吞吐越高，应该尽量设置到最大值。",
+        "answer": false,
+        "explain": "num_workers 超过物理核数（或物理核数/GPU数）后，线程调度开销、LLC cache 竞争（包括伪共享）会让吞吐下降。一个常见的现象是 16 worker 吞吐反低于 8 worker。正确做法是从「物理核数/GPU数」开始，逐步增加直到 GPU 不再 idle 或 CPU 打满为止。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`pin_memory=True` + `tensor.cuda(non_blocking=True)` 组合的核心优势是？",
+        "options": [
+          "减少 GPU 显存占用",
+          "允许 H2D 传输在 CUDA stream 上异步执行，CPU 不需要等待传输完成就能继续下一步",
+          "压缩传输的数据体积",
+          "使 DataLoader worker 可以直接向 GPU 显存写入"
+        ],
+        "answer": 1,
+        "explain": "pin_memory=True 把 collate 结果申请在 pinned memory 中，CUDA 可以直接 DMA 传输（省去中间拷贝）。non_blocking=True 让 H2D 传输异步执行，CPU 立即返回继续准备下一个 batch。两者组合实现 CPU 准备 batch N+1 与 GPU 接收 batch N 并行的流水线效果。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 DataLoader 瓶颈层与其对应的诊断信号匹配：",
+        "left": ["存储 IO 层", "CPU 解码层", "H2D 传输层", "Collate 层"],
+        "right": [
+          "CPU 主进程 100%，worker 空闲，DataLoader wait 均匀偏高",
+          "iostat IO wait > 20%，DataLoader wait 有偶发尖峰",
+          "nvidia-smi dmon 显示 PCIe TX 带宽接近上限",
+          "worker 进程 CPU 100%，IO wait < 5%"
+        ],
+        "explain": "存储 IO 瓶颈表现为 IO wait 高；CPU 解码瓶颈表现为 worker CPU 满而 IO 低；H2D 瓶颈表现为 PCIe TX 带宽饱和；Collate 瓶颈表现为主进程 CPU 满而 worker 空闲。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练 DataLoader 和评测 DataLoader 可以共用同一套配置，只要数据集不同即可。",
+        "answer": false,
+        "explain": "训练 DataLoader 需要 shuffle=True（影响模型质量）、可以 drop_last=True、可以 num_workers 最大化。评测 DataLoader 需要 shuffle=False（保证结果可复现）、drop_last=False（不能丢弃样本）、固定 seed，与训练配置完全不同。混用会导致评测结果不一致。"
+      },
+      {
+        "type": "choice",
+        "prompt": "大规模预训练（1T token，512 GPU）中，MosaicML Streaming 相比 WebDataset 的核心优势是？",
+        "options": [
+          "支持更多文件格式（JPEG、JSON、Parquet）",
+          "安装包更小，依赖更少",
+          "内建真正的跨 shard 全局 shuffle + 强 resume 支持（epoch+sample offset）",
+          "可以从 HTTP URL 直接流式读取"
+        ],
+        "answer": 2,
+        "explain": "MosaicML Streaming 最大的工程特点是真正的跨 shard 全局 shuffle（按 epoch+seed 生成全局随机 permutation）和强 resume 支持（内建 epoch+sample offset 记录）。WebDataset 的 shuffle 只有 shard 级别 + 内存 buffer 两级近似。对于大规模生产预训练，全局 shuffle 和精确 resume 是关键需求。"
+      },
+      {
+        "type": "input",
+        "prompt": "DataLoader 在 `num_workers=8, prefetch_factor=4` 时，同时在内存中有多少个 batch 处于「飞行中」（in-flight）状态？",
+        "accept": ["32", "32个"],
+        "explain": "in-flight batch 数 = num_workers × prefetch_factor = 8 × 4 = 32。这 32 个 batch 处于不同阶段（正在解码、已解码等待传输、正在 H2D 传输），确保 GPU 始终有下一个 batch 可用。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DDP 训练时，一个 rank 的 DataLoader 因 S3 GET 延迟卡住，其他 rank 的监控会显示什么异常？",
+        "options": [
+          "只有卡住的 rank 显示 GPU util 下降，其他 rank 不受影响",
+          "所有 rank 的 NCCL AllReduce 等待时间（nccl_wait）变长，看起来像通信问题",
+          "训练自动跳过慢 rank，继续运行",
+          "NCCL 会超时并触发错误恢复流程"
+        ],
+        "answer": 1,
+        "explain": "DDP/FSDP 的 step 是全局同步的，所有 rank 必须等最慢的那个 rank 才能进行梯度 AllReduce。慢 rank 的 DataLoader 抖动会让其他 rank 在 collective 处等待，表现为 nccl_wait 变长——看起来像通信问题，实际根因是数据读取慢。排查时要同时看 per-rank 的 data_time 指标。"
+      }
+    ]
+  }
+]

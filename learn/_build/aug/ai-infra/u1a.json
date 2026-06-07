@@ -1,0 +1,716 @@
+{
+  "u1-l1": [
+    {
+      "type": "choice",
+      "prompt": "在 Intel TMA（Top-down Microarchitecture Analysis）框架中，「Retiring」象限代表什么？",
+      "options": [
+        "流水线正在退休（retire）错误预测的指令，属于浪费",
+        "流水线在做有用的有效工作，uop 正常提交",
+        "CPU 进入了省电状态，频率降低",
+        "后端执行单元空闲，等待前端送指"
+      ],
+      "answer": 1,
+      "explain": "Retiring 象限表示流水线在真正做有用工作——uop 被正确提交（retire）。Retiring 占比越高越好，理想情况下应接近 100%，而其余三个象限（Frontend Bound、Backend Bound、Bad Speculation）都代表各类浪费。"
+    },
+    {
+      "type": "judge",
+      "prompt": "现代超标量 CPU 的理论最低 CPI 可以低于 1（例如 0.2），这是因为每个 cycle 可以同时发射多条 uop（宽发射）。",
+      "answer": true,
+      "explain": "超标量 CPU 每 cycle 可发射 4–6 条 uop（宽发射），理论 CPI 可低至 1/4 = 0.25 甚至更低。IPC 与 CPI 互为倒数，宽发射让 IPC 理论上远高于 1。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 CPU 微架构术语中，IPC 是哪三个单词的缩写？（填全称，英文）",
+      "accept": ["Instructions Per Cycle", "instructions per cycle"],
+      "explain": "IPC = Instructions Per Cycle，表示 CPU 每个时钟周期平均完成多少条指令，是衡量流水线执行效率的核心指标。与 CPI（Cycles Per Instruction）互为倒数。"
+    },
+    {
+      "type": "match",
+      "prompt": "将以下 AI Infra 工作负载场景与其最主要的 CPU 瓶颈类型配对：",
+      "left": [
+        "训练主循环等待 NCCL allreduce",
+        "LLM 推理 tokenizer（UTF-8 状态机）",
+        "DataLoader 16 worker 并行图像解码",
+        "推理服务遇到大量 Unicode 特殊字符请求"
+      ],
+      "right": [
+        "Bad Speculation（分支误预测率暴涨）",
+        "设计如此，IPC 低不代表流水线有问题",
+        "Backend Bound（load-use 链，Cache miss）",
+        "Backend Bound（LLC miss，多 worker 互相 evict）"
+      ],
+      "explain": "等待 NCCL 时 CPU 本身就是在轮询等待，IPC 低属预期行为。tokenizer 状态机以 load-use 链为主要瓶颈。DataLoader 多 worker 导致 LLC 容量争抢。Unicode 特殊字符破坏分支预测稳定模式，触发 Bad Speculation。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个 `perf stat` 指标最直接反映「CPU 实际有效工作占比」？",
+      "options": [
+        "`cache-misses / cache-references`",
+        "`branch-misses / branches`",
+        "`instructions / cycles`（即 IPC）",
+        "`context-switches / time`"
+      ],
+      "answer": 2,
+      "explain": "`instructions / cycles` 即 IPC，是衡量流水线有效执行效率的最直接指标。IPC 高说明每个 cycle 都在完成有用工作；其他指标只反映特定瓶颈（cache、分支等），不是整体效率的综合反映。"
+    },
+    {
+      "type": "input",
+      "prompt": "Apple Silicon M 系列 CPU 的 cache line 大小与 x86 不同，是多少字节？（填数字）",
+      "accept": ["128", "128B", "128字节", "128 字节"],
+      "explain": "Apple Silicon（M 系列）采用 128B cache line，而 x86 标准是 64B。更大的 cache line 能提升流式访问的带宽，但同时增加了伪共享（False Sharing）的风险——一条 line 上可以容纳更多互相干扰的变量。"
+    },
+    {
+      "type": "choice",
+      "prompt": "工程师发现 LLM 推理服务的 GPU 利用率只有 65%，但 `top` 显示 CPU 也很忙。下列哪个排查思路最符合「Top-down 分析」节奏？",
+      "options": [
+        "立刻增加 GPU 数量，假设 GPU 不够用",
+        "先用 `perf stat` 看 IPC 和 Top-down 四象限，再按象限深挖，不要凭直觉猜根因",
+        "直接换更高主频的 CPU，因为 CPU 看起来是瓶颈",
+        "检查网络带宽，GPU 利用率低通常是网络 IO 问题"
+      ],
+      "answer": 1,
+      "explain": "Top-down 分析的正确节奏是「先看 IPC 和四象限定位大方向，再按方向深挖」，不要跳过全局数据直接假设根因。增加硬件或换 CPU 在没有数据支撑时是无效的。"
+    },
+    {
+      "type": "judge",
+      "prompt": "寄存器重命名（Register Renaming）是在软件编译阶段由编译器完成的，CPU 硬件不参与这一过程。",
+      "answer": false,
+      "explain": "寄存器重命名是 CPU 硬件在运行时（rename/allocate 阶段）完成的，由 Register Alias Table（RAT）维护架构寄存器到物理寄存器的映射。编译器可以做静态寄存器分配，但无法做到硬件 rename 所消除的运行时 WAR/WAW 假依赖消除。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪条「决策规则」在 AI Infra 性能优化中是**错误**的？",
+      "options": [
+        "IPC < 1.0 且 Backend Bound > 50% 时，先查 LLC/DRAM，不要急着加 worker",
+        "branch-misses/branches > 5% 时，优先排查 cold path 分支",
+        "LLC miss rate > 30% 时，继续增加 DataLoader worker 数量可以继续提升吞吐",
+        "perf c2c 单条 line HITM 占比 > 5% 时，先查 false sharing"
+      ],
+      "answer": 2,
+      "explain": "LLC miss rate > 30% 时继续加 worker 会适得其反：每个 worker 的有效 LLC 配额更小，互相 evict 更严重，导致 miss rate 进一步上升。正确做法是先缩 working set、分 NUMA、改数据布局，不要继续加 worker。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 CPU 微架构「第一性原理推导链」中的问题与对应机制配对：",
+      "left": [
+        "单指令 latency 不能消除，但能让多条指令重叠",
+        "乱序执行必须对外表现成「程序顺序」",
+        "多核各有私有 cache，但软件假设内存只有一份",
+        "标量指令执行时数据并行机会被浪费"
+      ],
+      "right": [
+        "MESI 一致性协议",
+        "ROB（Reorder Buffer）",
+        "SIMD（Single Instruction Multiple Data）",
+        "流水线（Pipeline）"
+      ],
+      "explain": "流水线让多条指令的不同阶段重叠提升吞吐；ROB 保证乱序执行下的顺序提交（精确异常）；MESI 协议维护多核 cache 一致性；SIMD 让一条指令同时处理多个数据元素。"
+    }
+  ],
+  "u1-l2": [
+    {
+      "type": "choice",
+      "prompt": "经典 5 段流水线中，「ID」（Instruction Decode）阶段主要完成哪些工作？",
+      "options": [
+        "从 I-cache 用 PC 取出指令字节",
+        "ALU 执行算术运算，计算内存地址",
+        "译码指令、读取寄存器堆、生成控制信号",
+        "把执行结果写回架构寄存器堆"
+      ],
+      "answer": 2,
+      "explain": "ID（Instruction Decode）阶段负责：(1) 译码——解析指令格式、操作码、操作数；(2) 读寄存器堆，获取源操作数；(3) 生成后续阶段所需的控制信号。IF 是取指，EX 是执行，WB 是写回。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在顺序 5 段流水线中，RAW（Read After Write）数据冒险总是可以通过 Forwarding（旁路）完全消除，不需要插入任何 bubble。",
+      "answer": false,
+      "explain": "Forwarding 可以消除大多数 RAW 冒险，但 load-use RAW（load 后紧跟使用其结果的指令）无法完全消除：load 要到 MEM 段结束才拿到数据，而下一条 EX 需要数据在 EX 开始时就已就绪，两者时序差 1 cycle，必须插 1 个 bubble。"
+    },
+    {
+      "type": "match",
+      "prompt": "将流水线各段与其在经典 5 段 MIPS 流水线中使用的主要硬件资源配对：",
+      "left": [
+        "IF（取指）",
+        "EX（执行）",
+        "MEM（访存）",
+        "WB（写回）"
+      ],
+      "right": [
+        "ALU、地址加法器、分支比较器",
+        "架构寄存器堆（写端口）",
+        "指令 Cache（I-Cache）",
+        "数据 Cache（D-Cache）"
+      ],
+      "explain": "IF 访问 I-Cache 取指；EX 使用 ALU 做算术/地址计算；MEM 访问 D-Cache 做 load/store；WB 把结果写回寄存器堆。每段对应不同的硬件单元，这也是「结构冒险」的根源——两条指令同时争用同一硬件资源。"
+    },
+    {
+      "type": "input",
+      "prompt": "Pentium 4 Prescott 流水线深度约为多少段？（填数字）",
+      "accept": ["31", "31段", "31 段"],
+      "explain": "Pentium 4 Prescott 采用 31 段超深流水线，目标是通过缩短每段路径来提高频率。但这导致分支误预测代价超过 30 cycle，加上功耗问题，被证明是失败的设计。相比之下，Skylake 约 14–19 段是更平衡的折中。"
+    },
+    {
+      "type": "choice",
+      "prompt": "「结构冒险」（Structural Hazard）在经典 5 段流水线中最典型的表现是什么？",
+      "options": [
+        "一条 load 指令后紧跟使用其结果的 ALU 指令，形成 RAW",
+        "IF 阶段取指和 MEM 阶段访存同时需要访问内存端口，造成冲突",
+        "两条指令写同一个寄存器，形成 WAW 假依赖",
+        "分支指令在 EX 段才能确定真实目标，导致 bubble"
+      ],
+      "answer": 1,
+      "explain": "结构冒险是两条指令同时争用同一硬件资源。经典案例是 IF（取指）和 MEM（访存）同时需要内存：如果 I-Cache 和 D-Cache 合一，两者就会冲突。现代解法是分离 I-Cache 和 D-Cache（哈佛架构）。"
+    },
+    {
+      "type": "input",
+      "prompt": "某程序每 1000 条指令有 50 次 load-use RAW（每次插 1 cycle bubble），base CPI = 1.0。计算总 CPI（保留两位小数）。",
+      "accept": ["1.05", "1.05 cycle", "约1.05"],
+      "explain": "load-use 每次插 1 cycle bubble，每 1000 条指令有 50 次，stall 贡献 = 50/1000 × 1 = 0.05 CPI。总 CPI = 1.0 + 0.05 = 1.05。公式：CPI_total = base_CPI + stall_per_k / 1000 × penalty。"
+    },
+    {
+      "type": "choice",
+      "prompt": "深流水线（如 Skylake 的 14–19 段）相比浅流水线（5 段）最主要的工程代价是什么？",
+      "options": [
+        "深流水线每段的逻辑门延迟更大，所以频率反而更低",
+        "分支误预测代价随深度线性增长，从约 3 cycle 增加到 15–20 cycle",
+        "深流水线会产生更多 RAW 数据冒险，Forwarding 逻辑更复杂",
+        "深流水线的 cache 容量更小，更容易发生 cache miss"
+      ],
+      "answer": 1,
+      "explain": "加深流水线的收益是每段路径缩短、时钟频率提高；代价是分支误预测代价等比增大——流水线越深，要 flush 和重填的阶段数越多。Prescott 31 段导致误预测代价 30+ cycle，最终被证明是失败案例。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Forwarding（数据旁路）可以让 EX 阶段的结果在同一 cycle 内直接送给下一条指令的 EX 阶段，从而消除 ALU-to-ALU RAW 冒险而无需 bubble。",
+      "answer": true,
+      "explain": "Forwarding 通过旁路线把 EX 段（或更晚）产出的结果直接送回 EX 段的输入 mux。对于 ALU-ALU RAW（距离 1），EX-to-EX 旁路可以做到 0 bubble。这是现代流水线的标配设计。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下关于「控制冒险」（Control Hazard）的描述，哪个是**正确**的？",
+      "options": [
+        "控制冒险只在条件分支指令中出现，无条件跳转（JMP）不产生控制冒险",
+        "控制冒险可以通过 Forwarding 完全消除，不需要插 bubble 或预测",
+        "控制冒险是因为 IF 阶段在分支真值确定前必须给出下一条 PC，取错的指令需要被冲掉",
+        "控制冒险在 5 段流水线中的代价固定为 5 cycle"
+      ],
+      "answer": 2,
+      "explain": "控制冒险的本质是：IF 每周期都要取指，但分支条件在 EX 才算出，取指阶段不知道下一条真实 PC。Forwarding 只解数据依赖，不解控制冒险。无条件跳转同样有控制冒险（需要等 BTB 或 EX 解析目标）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "`perf stat` 显示某程序 `instructions = 5 × 10^9`，`cycles = 8 × 10^9`。则该程序的 IPC 是多少？",
+      "options": [
+        "IPC = 1.6",
+        "IPC = 0.625",
+        "IPC = 1.0",
+        "IPC = 8.0"
+      ],
+      "answer": 1,
+      "explain": "IPC = instructions / cycles = 5×10^9 / 8×10^9 = 0.625。CPI = cycles / instructions = 8/5 = 1.6。IPC < 1 说明流水线存在大量 stall，每个 cycle 平均不到一条指令完成——属于需要关注的偏低水平。"
+    }
+  ],
+  "u1-l3": [
+    {
+      "type": "choice",
+      "prompt": "在 OoO 引擎中，「Issue Queue」（Reservation Station）的主要职责是什么？",
+      "options": [
+        "按程序顺序把指令分发给执行单元，不允许乱序",
+        "等待 uop 的所有源操作数就绪且目标执行端口空闲后，才将 uop 发射执行",
+        "记录程序中所有内存操作的地址，检测 store-load 别名",
+        "分配物理寄存器，更新 Register Alias Table"
+      ],
+      "answer": 1,
+      "explain": "Issue Queue（也称 Reservation Station 或 Scheduler）监控每个 uop 的操作数是否就绪（通过 wakeup/select 机制），当操作数全部准备好且目标执行端口空闲时，才将其发射——这就是「乱序」的来源：谁先就绪谁先发。"
+    },
+    {
+      "type": "input",
+      "prompt": "x86-64 架构有多少个通用整数寄存器（架构可见的，不含 IP/FLAGS）？（填数字）",
+      "accept": ["16", "16个", "16 个"],
+      "explain": "x86-64 有 16 个通用整数寄存器（RAX、RBX、RCX、RDX、RSI、RDI、RBP、RSP 以及 R8–R15）。相比 32 位 x86 的 8 个，x86-64 扩展到 16 个，但仍远少于现代 CPU 的物理寄存器堆（200+ 个），这正是寄存器重命名存在的原因。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 OoO CPU 中，两条指令在 Issue Queue 中乱序发射执行，它们在 ROB 中也可以乱序提交（retire）。",
+      "answer": false,
+      "explain": "乱序执行的「乱序」只体现在执行（issue）阶段。提交（retire）必须严格按程序顺序进行，由 ROB 头部指针控制——只有 ROB 队头的指令完成且无异常时才能 retire。这是「精确异常」（precise exception）的硬件保证。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 OoO 引擎三大区域与其所执行操作的「顺序性」配对：",
+      "left": [
+        "Frontend（Fetch → Decode → Rename/Dispatch）",
+        "Backend Issue Queue → Execute",
+        "Retire（ROB 头部 commit）",
+        "Store Buffer → 内存写出"
+      ],
+      "right": [
+        "按程序顺序提交，精确异常的保证",
+        "按程序顺序处理，维护 rename 和 ROB 队列",
+        "乱序执行，谁的操作数先就绪谁先发射",
+        "commit 后才真正将 store 排放到 cache/内存（延迟写出）"
+      ],
+      "explain": "Frontend 按序处理（rename 需要顺序维护 RAT）；Issue Queue 允许乱序（OoO 的核心）；Retire 必须按序（精确异常）；Store 在 commit 后才真正写出（Store Buffer 排空），确保 speculative store 不污染内存状态。"
+    },
+    {
+      "type": "choice",
+      "prompt": "现代服务器 CPU（如 Sapphire Rapids）的 ROB 容量约为多少条 uop？",
+      "options": [
+        "约 32–64 条",
+        "约 80–100 条",
+        "约 320–512 条",
+        "约 2000–4000 条"
+      ],
+      "answer": 2,
+      "explain": "Sapphire Rapids 的 ROB 容量约 512，Zen4 约 320。这决定了 CPU 可以同时维持多少 in-flight uop——ROB 越大，越能在长延迟（如 DRAM miss 200 cycle）期间发现并执行更多独立工作，从而隐藏延迟。"
+    },
+    {
+      "type": "choice",
+      "prompt": "什么是「Memory Disambiguation」（内存消歧义），为什么 OoO CPU 需要它？",
+      "options": [
+        "一种 cache 一致性协议，用于消除多核之间的内存访问冲突",
+        "编译器的静态别名分析，判断两个指针是否可能指向同一内存",
+        "预测「一条 load 是否与前面未解析的 store 地址冲突」，允许 load 提前投机执行，事后核验",
+        "把内存地址映射到物理 cache line 的硬件逻辑"
+      ],
+      "answer": 2,
+      "explain": "store 的目标地址可能要到 EX 段才解析完。如果后面的 load 要等所有前面的 store 地址都解析完才能执行，会大量丢失 MLP。Memory Disambiguation Predictor 预测两者不冲突，允许 load 提前执行；如果预测错误（真的冲突）则触发 `machine_clears.memory_ordering` 并重新执行。"
+    },
+    {
+      "type": "judge",
+      "prompt": "当 ROB 满载时，CPU `top` 命令仍会显示接近 100% 的 CPU 利用率，但实际有效计算吞吐可能极低。",
+      "answer": true,
+      "explain": "ROB 满时，rename 阶段被迫 stall，整个前端冻结，实际 IPC 可能从 2.0 跌到 0.5 以下。但 `top` 统计的是「CPU 非 idle 时间」，只要流水线没有完全 halted（仍有 in-flight uop），就显示高利用率。这是 `top` 无法诊断微架构瓶颈的原因。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 OoO 引擎中，管理「可用物理寄存器列表」的结构叫什么？（填缩写或全称，英文）",
+      "accept": ["Free List", "free list", "Free list", "Physical Register Free List"],
+      "explain": "Free List 维护所有当前未使用的物理寄存器。每次 rename 从 Free List 分配一个新物理寄存器；每次 retire 时，被替换掉的旧物理寄存器映射（不再需要）归还给 Free List。Free List 耗尽时，rename 阶段被迫 stall。"
+    },
+    {
+      "type": "choice",
+      "prompt": "「指针追逐」（pointer chasing，如遍历链表）场景为什么对 OoO CPU 特别不友好？",
+      "options": [
+        "链表节点不能存放在 cache 里，所以每次访问都是 DRAM 访问",
+        "每次 load 的地址依赖上次 load 的结果，形成串行依赖链，MLP = 1，OoO 无法发现并行机会",
+        "链表遍历会导致大量 WAW 假依赖，寄存器重命名不能消除",
+        "链表结构触发大量结构冒险，执行端口被占满"
+      ],
+      "answer": 1,
+      "explain": "链表遍历的核心模式是 `next = load(current->next)`，下一次 load 的地址依赖这次 load 的结果（RAW 真依赖链）。OoO 无法在不知道地址的情况下发起下一次 load，MLP 退化到 1，cache miss 延迟被串行化，无法隐藏。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个指标异常最直接表明「ROB 接近满载，OoO 引擎发现不了新的并行工作」？",
+      "options": [
+        "`branch-misses / branches` > 8%",
+        "`topdown-be-bound` > 60% 且 `cycle_activity.stalls_l3_miss / cycles` > 30%",
+        "`fp_arith_inst_retired.256b_packed_single` 计数为零",
+        "`context-switches` 每秒 > 10000 次"
+      ],
+      "answer": 1,
+      "explain": "Backend Bound 高意味着后端（执行/访存）处理不过来；`stalls_l3_miss` 高意味着大量 cycle 在等 L3 miss 完成。两者结合说明长延迟 miss 占满 ROB，rename 被迫 stall，是 ROB 满载 → IPC 崩溃的经典特征。"
+    }
+  ],
+  "u1-l4": [
+    {
+      "type": "choice",
+      "prompt": "BTB（Branch Target Buffer）主要解决分支预测中的哪个子问题？",
+      "options": [
+        "预测条件分支是 taken 还是 not-taken",
+        "预测间接跳转（如虚函数调用）的目标地址",
+        "在 EX 段分支条件计算出来之前，预测跳转的目标地址",
+        "管理函数调用和返回的地址栈"
+      ],
+      "answer": 2,
+      "explain": "BTB 记录「某条分支指令上次跳到哪里」，从而在 IF 阶段（此时 EX 段还没算出目标）就能预测目标 PC，避免前端取指停顿。方向预测器（判断 taken/not-taken）是另一个独立结构；RAS 专门处理 `ret`；ITTAGE 专处理间接跳转目标。"
+    },
+    {
+      "type": "judge",
+      "prompt": "TAGE（TAgged GEometric history length）预测器使用多张历史长度按几何级数增长的 tagged 表，自适应选择合适的历史长度，是现代高性能 CPU 的主流方向预测器方案。",
+      "answer": true,
+      "explain": "TAGE 使用多张表，每张表用不同长度的全局历史记录（按几何级数递增，如 4、8、16、32、64 位）XOR PC 索引。预测时取最长匹配（tagged hit）的表的预测结果。这让它能同时捕捉短程和长程的分支规律，准确率远优于 GShare/Tournament。"
+    },
+    {
+      "type": "input",
+      "prompt": "Intel Skylake 分支误预测代价约为多少 cycle？（填一个代表性数值或区间，如「15」或「15-17」）",
+      "accept": ["15", "15-17", "15–17", "约15", "约 15", "15~17", "14-19", "14–19"],
+      "explain": "Skylake 的误预测代价约为 15–17 cycle（部分文献引用 14–19 cycle，取决于具体流水线配置和分支类型）。这意味着：若分支密度 0.2、误预测率 5%，ΔCPI ≈ 0.2 × 0.05 × 16 = 0.16，吞吐可能降低 10% 以上。"
+    },
+    {
+      "type": "match",
+      "prompt": "将分支预测相关的 `perf` 事件与其含义配对：",
+      "left": [
+        "`branch-misses`",
+        "`branches`",
+        "`topdown-bad-spec`",
+        "MPKI"
+      ],
+      "right": [
+        "每千条指令的误预测次数，= branch-misses / instructions × 1000",
+        "所有退出流水线的分支指令数（taken + not-taken）",
+        "分支误预测（和 machine clear）浪费的 cycle 占比，属 TMA 框架",
+        "预测错误的分支次数，是最直接的误预测计数器"
+      ],
+      "explain": "`branch-misses` 是原始误预测计数；`branches` 是总分支数；`topdown-bad-spec` 是 TMA 框架中因误预测浪费的 cycle 占比；MPKI = branch-misses / instructions × 1000，是规范化后更易于跨程序比较的指标。"
+    },
+    {
+      "type": "choice",
+      "prompt": "PGO（Profile-Guided Optimization）在改善分支预测相关性能时，最主要的作用是什么？",
+      "options": [
+        "直接修改 CPU 硬件预测器的状态机，让特定分支永远预测正确",
+        "根据真实运行 profile 重排代码布局，把 hot path 做成 fall-through，把 cold path 挪到函数末尾，减少 I-cache 污染",
+        "自动插入 `__builtin_expect` 提示，让编译器知道每个分支的概率",
+        "在运行时动态修改 `.text` 段，把预测器历史记录写入代码"
+      ],
+      "answer": 1,
+      "explain": "PGO 用真实 profile 数据指导编译器做代码布局优化：hot path 变 fall-through（不需要跳转，顺序执行），cold path 放到函数末尾或 `.text.cold` section。这减少了 I-cache 污染、改善了硬件预测器的训练质量，但不能直接控制 CPU 预测器硬件。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某 LLM 推理服务，平常处理英文请求时 branch-miss = 1.5%，上线多语言支持后 branch-miss 升到 9.8%，p99 抖动明显增大。下列分析最准确的是？",
+      "options": [
+        "多语言支持增加了代码量，导致 I-cache 容量不足，是 Frontend Bound 问题",
+        "多语言输入破坏了 tokenizer 分支的历史模式，TAGE 历史训练失效，导致 Bad Speculation 上升",
+        "p99 抖动是网络延迟变化导致的，与分支预测无关",
+        "branch-miss 上升是正常现象，多语言字符集更大，需要更多分支处理"
+      ],
+      "answer": 1,
+      "explain": "tokenizer 的分支（如 ASCII/CJK/emoji 判断）在英文场景下规律稳定，TAGE 能训练出高精度预测。多语言输入破坏了这一规律，第一层分支 miss 率从 0.5% 涨到 20%+，TAGE 无法自适应，Bad Speculation 随之上升，直接拉高 p99。"
+    },
+    {
+      "type": "judge",
+      "prompt": "RAS（Return Address Stack）在发生深层递归（递归深度超过 RAS 容量 16–32 项）时，返回地址预测准确率会显著下降。",
+      "answer": true,
+      "explain": "RAS 是专用的小型硬件栈，容量通常只有 16–32 项。当递归深度超过 RAS 容量时，最早压栈的返回地址会被覆盖，那些层次的 `ret` 指令只能靠 BTB 猜目标，预测准确率大幅下降，产生大量 flush。"
+    },
+    {
+      "type": "input",
+      "prompt": "某程序 branch-misses = 2×10^6，总 instructions = 4×10^8。MPKI 是多少？（填数字）",
+      "accept": ["5", "5.0", "5 MPKI", "5.00"],
+      "explain": "MPKI = (branch-misses / instructions) × 1000 = (2×10^6 / 4×10^8) × 1000 = 0.005 × 1000 = 5。MPKI > 10 通常认为分支误预测是显著瓶颈；< 3 属于健康范围；5 处于需要关注但不算严重的水平。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种代码改写方式最能从根本上降低 tokenizer 里「逐字符 if-else 链」的分支误预测代价？",
+      "options": [
+        "把 if-else 链里每个分支都加 `[[likely]]` 属性",
+        "在函数入口用 SIMD 整段检测字节类型，消除逐字符的控制流分支",
+        "把 tokenizer 函数拆分成多个小函数，减少单函数的代码体积",
+        "增加 L1I 缓存容量，防止 tokenizer 代码被 evict"
+      ],
+      "answer": 1,
+      "explain": "逐字符 if-else 的问题是每字节都产生一次分支，一旦输入模式不规则就批量误预测。用 SIMD 整段扫描（如 `vpcmpeqb` 同时比较 32 字节）可以把每字节一次分支变成每 32 字节一次，大幅减少分支密度，从根本上降低误预测代价。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在「2-bit 饱和计数器」方向预测器中，分支需要连续**几次**预测错误才会翻转预测方向？",
+      "options": [
+        "1 次",
+        "2 次",
+        "4 次",
+        "取决于当前计数器状态，最少 1 次，最多 3 次"
+      ],
+      "answer": 1,
+      "explain": "2-bit 饱和计数器有 4 个状态：Strongly Not-Taken（00）、Weakly NT（01）、Weakly Taken（10）、Strongly Taken（11）。只有当前是 Strongly Taken 时才预测 taken；翻转到预测 NT 需要连续 2 次 NT 才能从 10 → 01 → NT。因此「需要连续 2 次错」是正确说法。"
+    }
+  ],
+  "u1-l5": [
+    {
+      "type": "choice",
+      "prompt": "SSE4.2 引入的 `pcmpestri` 指令最适合用于哪类 AI Infra 场景？",
+      "options": [
+        "fp32 矩阵乘法加速",
+        "URL 解析、HTTP header 扫描、tokenizer 字符分类等字符串操作",
+        "int8 量化推理的点积（dot product）",
+        "bf16 与 fp32 之间的精度转换"
+      ],
+      "answer": 1,
+      "explain": "`pcmpestri` 是 SSE4.2 的显式长度字符串比较指令，专为字节级字符分类设计，能一次比较最多 16 字节，适合 URL 解析、JSON 扫描、tokenizer 字符分类等场景。int8 点积用 VNNI 的 `vpdpbusd`；bf16 转换用位操作 intrinsic；fp32 矩阵乘法用 AVX/FMA。"
+    },
+    {
+      "type": "judge",
+      "prompt": "AVX2 把整数 SIMD 也扩展到了 256-bit，而 AVX（2011）只把浮点 SIMD 扩展到了 256-bit，整数 SIMD 仍然只有 128-bit。",
+      "answer": true,
+      "explain": "AVX（2011）引入 256-bit ymm 寄存器，但整数操作指令（如 `vpaddw` 等）实际上在 ymm 的高 128-bit 上有限制——直到 AVX2（2013）才真正把整数 SIMD 操作扩展到完整的 256-bit。对于 tokenizer 这类整数密集型场景，AVX 和 AVX2 的差距不可忽视。"
+    },
+    {
+      "type": "input",
+      "prompt": "一条 `vaddps ymm0, ymm1, ymm2` 指令（AVX2，256-bit，fp32）同时处理多少个 fp32 加法？（填数字）",
+      "accept": ["8", "8个", "8 个", "8个fp32"],
+      "explain": "ymm 寄存器宽度 256-bit，fp32 每个 4 字节（32-bit），256 / 32 = 8。所以 `vaddps ymm` 一次处理 8 个 fp32 加法，而标量 `addss` 只处理 1 个。这就是 SIMD 的「前端开销摊薄」：8 个加法只占 1 条指令的取指/译码开销。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 x86 SIMD 指令集代与其关键新增能力配对：",
+      "left": [
+        "SSE2（2001）",
+        "AVX2（2013）",
+        "AVX-512（2016+）",
+        "VNNI（Vector Neural Network Instructions，2019+）"
+      ],
+      "right": [
+        "int8 点积融合指令 `vpdpbusd`，专为神经网络量化推理设计",
+        "512-bit zmm 寄存器 + k0–k7 mask 寄存器，支持 per-lane 掩码操作",
+        "x86-64 基线，双精度浮点 + 整数 SIMD（128-bit）",
+        "整数 SIMD 扩展到完整 256-bit，新增 gather load"
+      ],
+      "explain": "SSE2 是 x86-64 必备基线（128-bit）；AVX2 真正把整数 SIMD 扩展到 256-bit 并加入 gather；AVX-512 引入 512-bit 和 mask 寄存器；VNNI 专为 int8 量化推理的 dot product 设计，是 AI 推理加速的重要扩展。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下关于 AVX-512 频率降级问题的描述，哪个最准确？",
+      "options": [
+        "所有支持 AVX-512 的 CPU 都会有严重降频，降幅均为 25%，持续整个程序运行期间",
+        "Skylake-SP/Cascade Lake 时期降级最严重（10–25%），Ice Lake 后明显改善，Sapphire Rapids 几乎消除",
+        "只有在超过 10 个 zmm 寄存器同时使用时才会触发降频",
+        "AVX-512 降频只影响 FP 运算，整数 AVX-512 指令不会触发"
+      ],
+      "answer": 1,
+      "explain": "AVX-512 降频是代际演进的问题：Skylake-SP/Cascade Lake 最严重（10–25%，持续几百微秒到 2ms）；Ice Lake 后改善（5–10%，几十微秒）；Sapphire Rapids 进一步减小。现代代际的 AVX-512 降频已不再是主要顾虑，但 Skylake 时代的旧机器仍需谨慎。"
+    },
+    {
+      "type": "judge",
+      "prompt": "使用 `__restrict__` 关键字声明两个指针不重叠（不别名），可以帮助编译器消除因指针别名假设而导致的自动向量化失败。",
+      "answer": true,
+      "explain": "C 语言编译器默认假设两个 `float*` 指针可能重叠（指向同一内存），这会阻止自动向量化——因为向量化需要确认跨迭代访问不依赖。`__restrict__` 告诉编译器「这两个指针的内存范围不重叠」，使编译器可以安全地生成 SIMD 代码。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个工具/方法可以最直接确认「C 循环是否真的被自动向量化了」？",
+      "options": [
+        "看程序运行时间变快了，推测已向量化",
+        "用 GCC `-fopt-info-vec` 或 Clang `-Rpass=loop-vectorize` 查看编译器向量化报告，或用 `perf annotate` 检查汇编",
+        "检查 `perf stat` 中的 `cache-misses` 计数下降了",
+        "在代码里 `#pragma GCC optimize(\"O3\")` 后重新编译"
+      ],
+      "answer": 1,
+      "explain": "最直接的方法是看编译器报告（`-fopt-info-vec` 或 `-Rpass=loop-vectorize` 会告知哪些循环被向量化，哪些未被向量化及原因）或用 `perf annotate` 看汇编是否出现 `vpcmpeqb`、`vmovdqu` 等 SIMD 指令。运行时间和 cache-misses 是间接指标。"
+    },
+    {
+      "type": "input",
+      "prompt": "ARM SVE（Scalable Vector Extension）支持的最大寄存器宽度是多少 bit？（填数字）",
+      "accept": ["2048", "2048bit", "2048 bit", "2048-bit"],
+      "explain": "ARM SVE 支持 128-bit 到 2048-bit 的可变向量宽度（以 128-bit 为步进）。实际硬件宽度由具体实现决定：AWS Graviton 3 是 256-bit SVE，富岳超算的 A64FX 是 512-bit SVE。程序用 VLA（Vector Length Agnostic）模型编写，一次编译可以在任意宽度的硬件上正确运行。"
+    },
+    {
+      "type": "choice",
+      "prompt": "手写 AVX2 intrinsic 扫描 ASCII 字节（找第一个 >= 128 的字节）时，哪个指令最关键？",
+      "options": [
+        "`_mm256_add_ps`（浮点加法）",
+        "`_mm256_cmpeq_epi8` + `_mm256_movemask_epi8`（字节比较 + 掩码提取）",
+        "`_mm256_fmadd_ps`（融合乘加）",
+        "`_mm256_shuffle_epi8`（shuffle 重排）"
+      ],
+      "answer": 1,
+      "explain": "扫描 ASCII 的核心是：用 `_mm256_cmpgt_epi8` 或 sign bit 技巧判断哪些字节 >= 128，再用 `_mm256_movemask_epi8` 把每字节的结果提取成 32-bit 掩码，最后用 `_tzcnt_u32` 找第一个非 ASCII 字节的位置。这是 3–5x 加速的关键路径。"
+    },
+    {
+      "type": "judge",
+      "prompt": "AVX-512 引入的 mask 寄存器（k0–k7）允许对向量操作进行 per-lane（每元素）的掩码控制，可以在不用 blend 的情况下有条件地写入结果，是 AVX2 没有的能力。",
+      "answer": true,
+      "explain": "AVX-512 的 k0–k7 是专用 mask 寄存器，可以附加到大多数 zmm 操作上，指定哪些 lane 写入结果、哪些保持原值（merging masking）或清零（zeroing masking）。AVX2 没有 mask 寄存器，条件写入只能通过 `vblendvps` 等 blend 指令实现，效率较低。"
+    }
+  ],
+  "u1-l6": [
+    {
+      "type": "choice",
+      "prompt": "「Write-back + Write-allocate」策略是现代 CPU L1D Cache 的标准配置，其核心优势是什么？",
+      "options": [
+        "写 hit 时立即写回 DRAM，保证一致性且不需要 dirty bit",
+        "写 miss 时先把 line 拉进 cache，后续连续写命中率高；写 hit 只更新 cache（dirty），被驱逐才写 DRAM，带宽友好",
+        "所有写操作绕过 cache 直接写 DRAM，避免污染 cache",
+        "写操作只更新 LLC，不更新 L1/L2，降低 coherence 流量"
+      ],
+      "answer": 1,
+      "explain": "Write-back（写 hit 只更新 cache，dirty 标记，被驱逐才写 DRAM）+ Write-allocate（写 miss 先把 line 拉进来再写）是带宽最友好的策略，适合大量随机/半随机写入。相比之下，Write-through 每次写都打 DRAM，带宽消耗大。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Non-temporal Store（如 `_mm256_stream_si256`）告诉硬件「这块数据写后不会被再次读取」，绕过 cache 直接写 DRAM，适合流式写出大块数据。",
+      "answer": true,
+      "explain": "Non-temporal Store 使用 WC（Write Combining）缓冲区，绕过 L1/L2/L3 cache 直接写 DRAM，避免把「写了就丢」的大块数据污染 cache。典型场景：大 tensor 写出、checkpoint 序列化。与 Write-back 相比节省了 read-for-ownership 带宽。"
+    },
+    {
+      "type": "input",
+      "prompt": "一个 16KB、4-way set-associative、64B cache line 的 cache，共有多少个 set？（填数字）",
+      "accept": ["64", "64个", "64 个", "64 sets"],
+      "explain": "set 数 = 总容量 / (way 数 × cache line 大小) = 16KB / (4 × 64B) = 16384 / 256 = 64 个 set。Index 域位数 = log2(64) = 6 位。offset 域位数 = log2(64B) = 6 位。这是 cache 地址解码的基本计算。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 Cache 写策略/访问模式与其适合的 AI Infra 使用场景配对：",
+      "left": [
+        "Write-back + Write-allocate",
+        "Non-temporal Store（NT Store）",
+        "Software Prefetch（`__builtin_prefetch`）",
+        "Tiling（分块）"
+      ],
+      "right": [
+        "矩阵乘法等大规模计算中，把工作集切小以适应 L1/L2 Cache 容量",
+        "训练 checkpoint 序列化写出大 tensor，写后不再读",
+        "链表遍历等指针追逐场景，提前触发 prefetch 隐藏延迟",
+        "大多数随机读写场景，平衡 cache 利用率与 DRAM 带宽"
+      ],
+      "explain": "Write-back+Write-allocate 是通用场景最优选；NT Store 适合一次性大块流式写出；Software Prefetch 可以在地址已知但硬件 prefetcher 无法预测时提前触发；Tiling 把大工作集分块使其适应 Cache，是矩阵运算的核心优化手段。"
+    },
+    {
+      "type": "choice",
+      "prompt": "对于 32KB、8-way、64B line 的 L1D cache，地址的「Offset」域（cache line 内偏移）占几位？",
+      "options": [
+        "3 位",
+        "5 位",
+        "6 位",
+        "8 位"
+      ],
+      "answer": 2,
+      "explain": "Offset 域大小 = log2(cache line 大小) = log2(64) = 6 位。这与 way 数和总容量无关——Offset 仅由 cache line 大小决定，用于寻址 line 内的具体字节。x86 标准 64B line → 6 位 Offset。"
+    },
+    {
+      "type": "choice",
+      "prompt": "AMD EPYC 处理器的 LLC（L3 Cache）与 Intel Skylake-SP 的 LLC 在物理结构上最大的区别是什么？",
+      "options": [
+        "AMD EPYC 的 LLC 是统一的单块 SRAM，Intel 的是分片的",
+        "AMD EPYC 的 LLC 按 CCX/CCD 切分，每个 CCD 有独立的 LLC；Intel Skylake-SP 也是切片但通过 mesh 互连，hash 映射到 slice",
+        "AMD EPYC 没有 L3 Cache，直接用 DRAM 替代",
+        "Intel Skylake-SP 使用 DRAM 作为 L4 Cache，AMD EPYC 没有此设计"
+      ],
+      "answer": 1,
+      "explain": "AMD EPYC 采用 chiplet 设计，LLC 随 CCX/CCD 划分，每个 CCD 有自己的 L3；跨 CCD 访问延迟更高。Intel Skylake-SP 的 LLC 是分片（slice）结构，通过片内 mesh 互连，地址用 CBoH hash 映射到 slice。两者都不是单块 SRAM，但拓扑不同。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「Conflict Miss（冲突 miss）」在全相联（Fully Associative）Cache 中不会发生，因为任意 line 可以放到任意位置。",
+      "answer": true,
+      "explain": "Conflict Miss 的定义是：Cache 容量够用，但因为组相联度不足，两条映射到同一 set 的 line 互相驱逐。在全相联 Cache 中，任意 line 可以放任意位置，set 只有 1 个（所有 way 共用），Conflict Miss 在理论上消失。但全相联 Cache 的比较电路成本太高，只在 TLB 等小容量结构使用。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DataLoader 工程师测试发现：单 worker 时 LLC miss rate 12%，但 32 worker 时 LLC miss rate 暴增到 65%，且继续加 worker 吞吐不再增加。最正确的优化方向是？",
+      "options": [
+        "给每个 worker 配更多 CPU 核心，让单 worker 计算更快",
+        "检查 32 workers 的总 working set 是否超出 LLC 容量，考虑 NUMA 绑核、减少单 worker working set 或降低并发数",
+        "启用 AVX-512 向量化，提升 worker 的计算吞吐",
+        "增加分支预测提示，减少 worker 内部的控制流 miss"
+      ],
+      "answer": 1,
+      "explain": "LLC miss rate 从 12% 涨到 65% 是典型的「多 worker 工作集超出 LLC 容量」症状——每个 worker evict 其他 worker 的数据，形成恶性循环。正确方向：计算 LLC_budget_per_worker = LLC容量 / worker数，若不够则降低并发、NUMA 绑核隔离、或减少单 worker working set（如缩小 batch 大小）。"
+    },
+    {
+      "type": "input",
+      "prompt": "Intel Skylake-SP 单 socket 的 L3 Cache 容量量级大约是多少 MB？（填一个大致范围，如「30-60」）",
+      "accept": ["30-60", "30–60", "约30-60", "约 30-60MB", "30到60", "24-60", "24–60"],
+      "explain": "Intel Skylake-SP 单 socket 的 LLC 容量根据 SKU 不同从约 24MB（低端）到 60MB（高端）不等，典型服务器配置约在 30–60MB 范围。这是评估 DataLoader worker 数量上限的关键参数：LLC_budget_per_worker = LLC / active_workers_per_socket。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「Pseudo-LRU（PLRU）」替换策略在 N-way 组相联 cache 中只需要 N-1 个 bit 来近似 LRU 决策，比精确 LRU 硬件代价低得多，是 L1/L2 的常用选择。",
+      "answer": true,
+      "explain": "精确 LRU 需要记录所有 way 的访问顺序，N-way 需要 log2(N!) 位，硬件代价高。Pseudo-LRU 用一棵 N-1 节点的二叉树来近似，每次访问只更新沿路的 bit，驱逐时选「树指向的那条路」——不完全准确但足够好，硬件代价极低，是 L1/L2 的标配。"
+    }
+  ],
+  "u1-l7": [
+    {
+      "type": "choice",
+      "prompt": "MESI 协议中，当一个 cache line 处于「Invalid（I）」状态时，本核执行 load（读）操作会发生什么？",
+      "options": [
+        "直接读本核 L1 cache，因为 Invalid 状态的 line 数据仍在 cache 中",
+        "触发 cache miss，发送 BusRd 请求，根据其他核是否持有该 line，转为 Exclusive 或 Shared 状态",
+        "触发 cache miss，直接发送 RFO（Read for Ownership）请求，转为 Modified 状态",
+        "产生 page fault，操作系统介入填充内存"
+      ],
+      "answer": 1,
+      "explain": "I 状态的 line 不在本核 cache 中（或已失效），load miss 会发送 BusRd。如果没有其他核持有该 line，转为 E（Exclusive）状态——这是最优路径，后续 store 可以静默升级到 M 而无需总线消息。如果有其他核以 S 或 M 持有，则转为 S 状态。"
+    },
+    {
+      "type": "judge",
+      "prompt": "MESIF 协议（Intel QPI/UPI 使用）中的 Forward（F）状态，指定一个 Shared 状态的 cache 为 forwarding 节点，专门响应远程 snoop 请求，避免所有 Shared 副本同时响应造成流量浪费。",
+      "answer": true,
+      "explain": "在 MESI 中，多个 S 状态副本收到 snoop 时都可能响应，产生流量浪费。MESIF 引入 F 状态：在多个 Shared 副本中指定一个为 Forward 节点（通常是最近获取的那个），只有 F 节点响应 snoop 请求，其他保持 S 状态静默，有效减少 snoop 响应带宽。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 MESI 协议中，「RFO」是哪三个词的缩写？（填全称，英文）",
+      "accept": ["Read for Ownership", "read for ownership"],
+      "explain": "RFO = Read for Ownership。当一个核要写一条目前处于 Invalid 状态（或 Shared 状态）的 cache line 时，它需要获取「独占所有权」——发送 BusRdX（RFO）请求，先把 line 读进来，同时令其他核的副本全部 Invalidate，然后转为 Modified 状态。RFO 是 coherence 流量中最昂贵的操作。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 MESI 协议变体与其解决的具体问题配对：",
+      "left": [
+        "MOESI（AMD 广泛使用）",
+        "MESIF（Intel QPI/UPI）",
+        "Directory-based 协议",
+        "Snoop Filter"
+      ],
+      "right": [
+        "减少多 S 状态副本同时响应 snoop 的流量浪费",
+        "支持数十–数百核扩展，替代广播式 snoop 总线",
+        "在 Home Agent 旁过滤不必要的 snoop，单 socket 优化",
+        "M 状态 line 被远程 read 时直接 forward，无需先写回 DRAM"
+      ],
+      "explain": "MOESI 的 O 状态避免 M→writeback→DRAM→read 的冗余写回；MESIF 的 F 状态指定唯一 forwarding 节点；Directory-based 替换广播式 snoop 解决可扩展性问题；Snoop Filter 在 Home Agent 旁缓存 sharer 信息，减少不必要的 snoop 广播。"
+    },
+    {
+      "type": "choice",
+      "prompt": "「False Sharing」（伪共享）的根本原因是什么？",
+      "options": [
+        "多个核读同一个共享变量，造成 cache line 的 Shared 状态频繁切换",
+        "两个变量逻辑上独立（不同线程各自读写），但物理上落在同一条 64B cache line，导致 coherence 协议把它们当成「共享数据」处理",
+        "多核同时写同一个变量，造成数据竞争（data race）",
+        "cache line 大小不匹配导致的对齐问题，需要 padding 才能正确访问"
+      ],
+      "answer": 1,
+      "explain": "False Sharing 的「假」在于：逻辑上两个变量完全独立（如线程 A 写 counter_a，线程 B 写 counter_b），但如果它们共享一条 cache line，MESI 协议看到的是「这条 line 被多个核写」，持续触发 RFO → Invalidate → RFO 的流量，性能塌方。解法：用 `alignas(64)` 把变量对齐到独立 cache line。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 `perf c2c report` 输出中，「Local HITM」和「Remote HITM」分别代表什么？",
+      "options": [
+        "Local HITM = 命中 L1 cache 的 Modified 行；Remote HITM = 命中 L3 cache 的 Modified 行",
+        "Local HITM = 同 socket 内核间的 Modified 行命中；Remote HITM = 跨 socket 的 Modified 行命中",
+        "Local HITM = 程序逻辑内的内存冲突；Remote HITM = 网络传输导致的缓存失效",
+        "Local HITM = 单线程 self-modifying code 触发；Remote HITM = 多线程并发写触发"
+      ],
+      "answer": 1,
+      "explain": "HITM = Hit Modified，指 snoop 时发现该 line 在另一核以 Modified 状态持有——需要先 writeback 才能提供数据，是最贵的 cache miss 类型。Local HITM = 同 socket 内跨核的 HITM（走片内 mesh，约 50–100ns）；Remote HITM = 跨 socket 的 HITM（走 UPI/Infinity Fabric，约 200–500ns）。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 MESI 协议中，cache line 从 Shared（S）状态直接 store（写入），不需要先 Invalidate 其他核的副本就可以转为 Modified（M）状态。",
+      "answer": false,
+      "explain": "S 状态意味着有一个或多个其他核也持有该 line 的副本（clean）。本核要 store 时，必须先发送 Invalidate（BusUpgr）消息通知所有持有 S 副本的核将其置为 I，等待所有 ack 后才能升级为 M。否则其他核的副本还是旧数据，违反 coherence 语义。"
+    },
+    {
+      "type": "choice",
+      "prompt": "AI 推理服务中，有一个全局 `std::atomic<int> active_requests` 计数器，所有线程在每个请求开始/结束时各调用一次 `fetch_add`/`fetch_sub`。这会产生什么 coherence 问题，最佳修复方案是什么？",
+      "options": [
+        "产生 False Sharing；修复方案是给 `active_requests` 后面加 56 字节 padding",
+        "产生高频 RFO 风暴：每次写都需要独占所有权，N 个线程竞争同一 cache line；修复方案是使用 per-CPU 近似计数 + 定期汇总",
+        "产生 DRAM 带宽瓶颈；修复方案是增加 DRAM 容量",
+        "不会产生性能问题，`std::atomic` 的 lock-free 语义保证了高效并发"
+      ],
+      "answer": 1,
+      "explain": "这是「全局 atomic 热点」问题：N 个线程同时竞争同一条 cache line 的独占所有权（RFO），形成序列化——每次 fetch_add 都需要等前一个持有 M 状态的核让出，延迟 × 线程数倍增。最佳修复是 per-CPU/per-thread 本地计数器 + 周期性 reduce 到全局，大幅减少 RFO 频率。padding 只解决 False Sharing，不解决 True Sharing 的 RFO 竞争。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 MESI 协议中，一条处于 Shared（S）状态的 cache line，其数据与 DRAM 中的数据关系是？（填：一致/不一致/可能不一致，选一个）",
+      "accept": ["一致", "相同", "与DRAM一致", "与 DRAM 一致", "clean", "和DRAM一致"],
+      "explain": "S（Shared）状态的定义是：line 是 clean 的，即 cache 中的数据与 DRAM 一致；同时可能有多个核以 S 状态共享该 line。对比：M（Modified）状态表示数据已被修改，DRAM 是旧值（不一致）；E（Exclusive）状态也与 DRAM 一致，但只有本核有副本。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练任务中，8 个线程各自有一个独立的 `float loss_local` 局部变量，但它们都在同一个 64B 对齐的 struct 里相邻排列。`perf c2c` 显示这个 struct 的 HITM 很高。正确的修复方式是什么？",
+      "options": [
+        "把 8 个 `float` 换成 8 个 `double`，精度提升后减少访问频次",
+        "给每个 `float loss_local` 用 `alignas(64)` 使其单独占一条 cache line，彻底隔离",
+        "改用 `std::atomic<float>`，保证写入原子性",
+        "增加线程的调度优先级，减少线程切换导致的 cache 失效"
+      ],
+      "answer": 1,
+      "explain": "8 个相邻 float（共 32B）落在同一条 64B cache line，8 个线程各写各的但共用同一 line，触发 False Sharing。`alignas(64)` 让每个变量独占一条 cache line，写操作不再相互 Invalidate。换 double 或加 atomic 都无法解决 False Sharing 的根本——需要空间隔离而非精度或原子性。"
+    }
+  ]
+}

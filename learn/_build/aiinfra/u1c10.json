@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u1c10",
+    "title": "内存与 IO 全景导览",
+    "subtitle": "每个 byte 都有地址、位置、路径和语义——AI Infra 内存 IO 知识地图",
+    "intro": [
+      {
+        "title": "为什么内存与 IO 在 AI Infra 如此关键",
+        "body": "训练和推理不只是「GPU 在算」。程序看到连续私有的虚拟地址空间，硬件拥有的却是分散、共享、分层且速度差异巨大的物理资源：L1/L2/L3 cache、DRAM、NVMe、HBM、PCIe 总线……\n\nAI Infra 的「内存与 IO」是一组共享资源边界，每个 byte 都要同时满足：\n- **地址正确**：虚拟地址是否正确映射到物理页（页表/TLB/page fault）\n- **位置合适**：数据在哪里——Page Cache、DRAM、NVMe 还是 GPU HBM\n- **路径可达**：数据经过 CPU/PCIe/DMA/NIC/GPU 哪条路径，NUMA 是否亲和\n- **语义可靠**：write() 返回是否代表数据落盘（fsync、Page Cache、writeback 的区别）\n\n**任意一项缺证据，性能结论都可能是错的。**",
+        "tip": "看到「训练慢」「抖动」「OOM」「第二轮更快」「H2D 上不去」，先问这个 byte 现在在哪里、通过什么地址访问、是否经过内核，再选对应工具。"
+      },
+      {
+        "title": "四条主线：按排障入口而非 Linux 名词组织",
+        "body": "这个领域有四条独立主线，排障入口完全不同：\n\n**主线 1：虚拟内存（0b1）**\n进程看到的地址不是物理地址。页表、TLB、page fault、`mmap`、fork/COW 影响大模型权重加载和 DataLoader 的冷启动时间。\n\n**主线 2：Page Cache 与 Huge Pages（0b2）**\n文件页被 DRAM 缓存，写入会延迟落盘。Page Cache、脏页回写、`fsync`、THP 影响 dataset 第二轮读取、checkpoint 尾延迟和大数组 TLB miss。\n\n**主线 3：NUMA、PCIe、DMA、Pinned Memory（0b3）**\n设备 DMA 要求物理页稳定且拓扑近。NUMA first-touch、PCIe topology、pinned memory、GPUDirect 影响 H2D 带宽和 GPU/NIC 通信效率。\n\n**主线 4：Syscall、Epoll、io_uring（0b4）**\n服务必须通过 syscall 向内核请求 IO，context switch 和事件模型影响高并发 dataset service 和模型网关的延迟。",
+        "steps": [
+          "遇到 page-fault storm、mmap 冷启动、COW RSS 暴涨 → 查 0b1（虚拟内存）",
+          "遇到 dataset 第二轮变快、checkpoint 卡住、TLB miss → 查 0b2（Page Cache + Huge Pages）",
+          "遇到 H2D 带宽低、GPU 亲和问题、RDMA fallback → 查 0b3（NUMA + PCIe + DMA）",
+          "遇到 service IO 延迟高、event loop 卡顿、高并发控制面 → 查 0b4（Syscall + io_uring）"
+        ]
+      },
+      {
+        "title": "关键问题：一个慢 batch 在等谁？",
+        "body": "AI 训练一个 batch 慢下来，可能是以下任何一个环节在等待：\n\n| 等待原因 | 现象 | 对应主线 |\n|---|---|---|\n| page fault（首次访问权重/数据） | 冷启动慢，first batch 远慢于后续 | 虚拟内存（0b1） |\n| Page Cache miss（数据从 NVMe 读入） | 第一轮慢，第二轮快 | Page Cache（0b2） |\n| dirty writeback（checkpoint 触发大量落盘） | 训练周期性卡顿 | Page Cache + writeback（0b2） |\n| H2D stall（CPU → GPU 数据传输） | GPU idle，DataLoader 不够快 | NUMA + PCIe + DMA（0b3） |\n| NUMA 远端内存访问 | 某些 worker 特别慢 | NUMA（0b3） |\n| syscall 频率过高 | CPU 大量时间在 user/kernel 切换 | Syscall（0b4） |\n| IO 队列积压 | dataset service 背压，batch ready 延迟高 | epoll/io_uring（0b4） |\n\n**诊断的关键是先定位 byte 在等哪个环节，再选对工具**，而不是无差别地「都优化一遍」。",
+        "tip": "dataset 「第二轮变快」是 Page Cache 的典型信号——用 `free -m` 看 buff/cache 增长，用 `cachestat` 或 `vmstat` 看 cache hit rate。"
+      },
+      {
+        "title": "容量预算：四条主线各自的关键数值",
+        "body": "每条主线都有需要提前预算的容量数字，超出就会出问题：\n\n**虚拟内存（0b1）**\n- 页表内存 = (virtual address range) / 4K × 8B，大 mmap 时可达数百 MB\n- major page fault cost ≈ 数 ms（需从 NVMe 读），warm-up 阶段的 fault 总量决定冷启动时间\n\n**Page Cache（0b2）**\n- hot file working set 必须 ≤ `MemAvailable - anon - pinned - kernel_reserve`\n- dirty bytes 必须 ≤ `write_bw × allowed_tail_seconds`（否则 checkpoint 时触发同步 writeback，卡几秒）\n\n**NUMA + DMA（0b3）**\n- pinned memory footprint ≈ `ranks × workers × prefetch × batch_bytes × buffers`（容易超过系统限制 `ulimit -l`）\n- H2D 带宽需求 = `bytes_per_step / copy_budget`，要 ≤ PCIe 实际带宽\n\n**Syscall/IO（0b4）**\n- syscall rate ≈ `throughput / chunk_size`，过高则 context switch 成为瓶颈\n- event loop 队列深度超过 backpressure 阈值会导致连接堆积",
+        "tip": "pinned memory 是最容易超账的资源——它占用的物理页不能被换出，过量会让系统 OOM 或让其他进程的 Page Cache 被驱逐，间接拖慢 DataLoader。"
+      },
+      {
+        "title": "证据采集速查：每条主线的第一步命令",
+        "body": "| 主线 | 第一步命令 | 关键指标 |\n|---|---|---|\n| 虚拟内存 | `cat /proc/<pid>/smaps_rollup`；`perf stat -e minor-faults,major-faults` | RSS、PSS、major-faults、`VmPTE` |\n| Page Cache | `free -m`；`cat /proc/meminfo`；`iostat -x` | Cached、Dirty、Writeback、await |\n| NUMA + DMA | `numastat -p <pid>`；`nvidia-smi topo -m`；`numactl --hardware` | remote 访问比例、PCIe topology、H2D 带宽 |\n| Syscall/IO | `perf trace -p <pid>`；`strace -c -p <pid>`；`cat /proc/<pid>/status` 看 `voluntary_ctxt_switches` | syscall 频率、context switch 次数、io_uring CQ depth |\n\n共同原则：**同窗采集**——所有证据必须在同一压测阶段、同一流量分布、同一 worker 数下采集，否则不同窗的指标无法对照。",
+        "tip": "先用最轻的工具（free、numastat、perf stat）快速排除大类，再用重工具（perf record、Nsight Systems）精确定位。"
+      },
+      {
+        "title": "与前后章节的关联",
+        "body": "本导览章是理解后续四个子章（0b1–0b4）的框架地图：\n\n- **0a（CPU 微架构）→ 0b（内存与 IO）**：CPU 微架构的 cache miss 问题在 0b 延伸到更宏观的内存层次——TLB miss（0b1）、Page Cache miss（0b2）、NUMA 远端访问（0b3）都是「cache miss 链」的不同层级。\n- **0b → 0c（文件系统与存储）**：0b2 的 Page Cache 和 writeback 是 0c 文件系统的基础——ext4、XFS 的 fsync 语义建立在 Page Cache 之上。\n- **0b → 0d（网络栈）**：0b4 的 syscall/epoll/io_uring 是 0d 网络 IO 的基础——TCP socket 的读写本质是一种特殊的 IO syscall。\n- **0b → Part 5（AI 数据搬运链路）**：训练数据的 DataLoader → Page Cache → H2D → GPU HBM 完整链路需要 0b 全部四条主线的知识。\n\n学习建议：按排障需要选读子章，不必串行全读。如果当前最紧迫的问题是 H2D 慢，直接读 0b3；如果 checkpoint 卡顿，直接读 0b2。",
+        "reveal": {
+          "q": "一台 8 GPU 训练机，发现 GPU0 的 H2D 吞吐是 GPU7 的 60%。应该先查哪条主线？",
+          "a": "这是 NUMA/PCIe 拓扑问题（主线 3，0b3）。8 GPU 机器通常有 2 个 NUMA socket，GPU0-3 连到一个 socket，GPU4-7 连到另一个。DataLoader worker 若跑在「远」socket 上，其数据经 UPI 跨 socket 再过 PCIe 到 GPU，带宽降低、延迟升高。先用 `nvidia-smi topo -m` 看 PCIe 拓扑，再用 `numastat` 看内存访问的本地/远端比例，最后用 `numactl` 把 DataLoader worker 绑到与目标 GPU 同 socket 的 NUMA node。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "match",
+        "prompt": "将「AI 训练慢」的现象与最可能对应的主线匹配：",
+        "left": [
+          "第一轮 batch 慢，第二轮快，NVMe 无大流量",
+          "checkpoint 写入时训练周期性卡顿数秒",
+          "DataLoader worker 数加到 16 后 H2D 吞吐反而下降",
+          "dataset server 在高并发时 p99 latency 升到 50ms"
+        ],
+        "right": [
+          "Page Cache（0b2）：第二轮数据已在内存，首轮需从 NVMe 加载",
+          "syscall/epoll（0b4）：高并发下 context switch 或 event loop 积压",
+          "dirty writeback（0b2）：checkpoint 触发大量脏页同步落盘",
+          "NUMA/PCIe/DMA（0b3）：worker 跨 socket 导致 H2D 路径变长"
+        ],
+        "explain": "第二轮变快是 Page Cache 命中的经典信号；checkpoint 卡顿是脏页回写触发的尾延迟；H2D 随 worker 数变差常是 NUMA 亲和问题（worker 在远端 socket）；dataset server p99 高是 IO 服务模型问题。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个 AI 训练进程，`perf stat` 显示 `major-faults` 计数很高，但 `minor-faults` 正常。这说明：",
+        "options": [
+          "Page Cache 命中率很高，数据从内存中读取",
+          "进程大量访问不在 Page Cache 中的文件页，触发磁盘 IO",
+          "虚拟内存地址映射出错，需要内核重新分配物理页",
+          "NUMA 远端内存访问次数很多"
+        ],
+        "answer": 1,
+        "explain": "major fault 发生在访问的页不在物理内存中（Page Cache 中也没有），需要从磁盘（NVMe/SSD）读入，代价约几毫秒。minor fault 发生在页已在内存但页表未映射，代价仅约 1μs。高 major-faults 说明 working set 无法完全放入 Page Cache，文件读取需要频繁 IO。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`write()` 系统调用成功返回，代表数据已经安全地写入磁盘，checkpoint 已持久化。",
+        "answer": false,
+        "explain": "`write()` 成功只代表数据写入了 Page Cache（内存中的文件缓存页），不代表落盘。只有调用 `fsync()` 后，内核才会把对应的脏页强制 flush 到磁盘。这就是为什么 checkpoint 代码必须在 `write()` 后显式调用 `fsync()`，否则机器宕机可能丢失数据。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个命令最适合快速查看某进程的 NUMA 内存访问本地/远端比例？",
+        "options": [
+          "perf stat -e cache-misses",
+          "numastat -p <pid>",
+          "cat /proc/<pid>/smaps_rollup",
+          "iostat -x"
+        ],
+        "answer": 1,
+        "explain": "`numastat -p <pid>` 显示指定进程在各 NUMA node 上分配的内存量和远端访问统计，是判断进程是否受 NUMA 不亲和影响的最直接工具。perf stat 看的是 CPU cache；smaps_rollup 看的是进程虚拟内存布局；iostat 看的是磁盘 IO。"
+      },
+      {
+        "type": "input",
+        "prompt": "DataLoader 使用 `pin_memory=True`，对应的 Linux 内存类型叫做什么？（两个字，英文或中文均可）",
+        "accept": ["pinned memory", "pinned", "锁定内存", "固定内存", "locked memory"],
+        "explain": "pin_memory=True 让 DataLoader 在 CPU 侧分配「锁定内存」（pinned memory / locked memory）——这些物理页不会被换出到 swap，可以被 GPU DMA 直接读取，从而让 cudaMemcpyAsync 的 H2D 传输走 DMA，不占用 CPU，大幅提高 H2D 吞吐。但过量 pinned memory 会让系统无法 swap，导致 OOM。"
+      },
+      {
+        "type": "judge",
+        "prompt": "同一台 8 GPU 机器上，所有 GPU 的 H2D 带宽应该完全相同，因为它们连接的是同一个 PCIe 总线。",
+        "answer": false,
+        "explain": "8 GPU 机器通常采用双 socket + 多个 PCIe root complex 的拓扑。GPU0-3 可能连接到 socket A 的 PCIe，GPU4-7 连接到 socket B 的 PCIe。DataLoader worker 若在 socket A 运行，给 GPU7（socket B）做 H2D 时，数据需要跨 UPI 到 socket B 再过 PCIe 到 GPU，路径更长，带宽更低。用 `nvidia-smi topo -m` 可以查看 GPU 间和 CPU-GPU 的拓扑关系。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某训练节点 pinned memory 用量已达 `ulimit -l` 上限，新的 DataLoader worker 申请 `pin_memory=True` 失败。最直接的影响是什么？",
+        "options": [
+          "DataLoader 报错崩溃，训练中断",
+          "H2D 传输自动 fallback 到普通（pageable）内存，带宽降低，GPU 利用率下降",
+          "pinned memory 超限会触发系统 OOM，整机宕机",
+          "GPU 无法访问该内存，必须手动 cudaFree"
+        ],
+        "answer": 1,
+        "explain": "pinned memory 申请失败时，PyTorch DataLoader 会 fallback 到普通 pageable 内存。Pageable 内存的 H2D 传输需要 CUDA 驱动先把数据拷贝到临时 pinned buffer 再 DMA，多了一次 CPU 拷贝，带宽降低（通常降 30-50%），GPU 等待数据时间变长，利用率下降。不会直接崩溃或 OOM。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪个问题「不需要」查 Page Cache 或脏页回写，而应该直接查虚拟内存/页表？",
+        "options": [
+          "训练第二轮读取 dataset 比第一轮快 3 倍",
+          "checkpoint 写入时每隔 5 分钟卡顿 2-3 秒",
+          "模型服务刚启动时前几个请求延迟 100ms+，之后恢复正常",
+          "大规模 mmap 加载模型权重后 RSS 突然暴涨"
+        ],
+        "answer": 3,
+        "explain": "大规模 mmap 加载权重后 RSS 暴涨是典型的虚拟内存/页表问题：mmap 建立了虚拟地址映射，但物理页只在实际访问时分配（lazy allocation），首次访问触发 page fault，内核分配物理页并更新页表，RSS 随之增长。这属于 0b1（虚拟内存）范畴。其他三个：第二轮变快是 Page Cache 命中（0b2）；checkpoint 卡顿是 dirty writeback（0b2）；服务冷启动慢可能是 major fault + Page Cache 加热（0b1/0b2 边界）。"
+      }
+    ]
+  }
+]

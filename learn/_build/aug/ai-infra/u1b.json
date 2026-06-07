@@ -1,0 +1,761 @@
+{
+  "u1-l8": [
+    {
+      "type": "judge",
+      "prompt": "伪共享（False Sharing）会导致 ThreadSanitizer（TSan）报告数据竞争警告，因此可以用 TSan 来定位伪共享问题。",
+      "answer": false,
+      "explain": "伪共享是纯粹的硬件层性能问题——多核写不同变量却落在同一 cache line，程序逻辑上没有并发错误，TSan/ASan 均不会报警。TSan 检测的是多线程无同步地访问同一变量（data race），与伪共享是两个完全不同的层次。"
+    },
+    {
+      "type": "input",
+      "prompt": "C++ 中，要让结构体起始地址对齐到 64 字节 cache line 边界，应使用哪个关键字？（填 C++11 标准关键字即可）",
+      "accept": [
+        "alignas",
+        "alignas(64)"
+      ],
+      "explain": "C++11 引入 `alignas(N)` 指定对象或类型的对齐要求。`alignas(64)` 保证结构体实例分配时起始地址是 64 的倍数，使其独占整条 cache line，消除与相邻对象的伪共享。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列哪个操作最能直接确认某结构体在后续代码修改后仍然独占一条 64B cache line？",
+      "options": [
+        "在单元测试里用 perf c2c 录制 HITM",
+        "在头文件里加 `static_assert(sizeof(T) == 64)` 或 `static_assert(sizeof(T) % 64 == 0)`",
+        "在 Valgrind 下运行并检查 cache miss",
+        "给结构体加 `__attribute__((packed))` 压缩布局"
+      ],
+      "answer": 1,
+      "explain": "`static_assert` 是编译期断言：只要有人在结构体里新加字段导致大小超过 64 字节，编译就会失败，从而防止后续修改「悄悄」破坏对齐。perf c2c 是运行期工具，无法在开发阶段给出即时反馈；`packed` 反而会取消对齐，加剧伪共享。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个无锁 SPSC（Single-Producer Single-Consumer）环形队列，head 由生产者写、tail 由消费者写，两者各 8 字节紧邻放在同一结构体内。现需要把它们分到不同 cache line。以下哪个方案最小且正确？",
+      "options": [
+        "在 head 和 tail 之间插入 `char _pad[56]`，使 head 和 tail 各自所在 8 字节加填充共 64 字节",
+        "把 head 和 tail 改为 `volatile uint64_t`",
+        "把 head 和 tail 都改为 `std::atomic<uint64_t>`，强制总线锁",
+        "给整个队列结构体加 `__attribute__((packed))`"
+      ],
+      "answer": 0,
+      "explain": "在 head 后插入 56 字节填充，使 head（8B）+ pad（56B）= 64B，恰好一条 cache line；tail 从下一条 line 起始分配。这是最小侵入性的 padding 方案，消除了生产者与消费者之间的伪共享。volatile/atomic 不解决伪共享，packed 会破坏对齐。"
+    },
+    {
+      "type": "match",
+      "prompt": "将以下现象与其最可能的诊断结论匹配（均为多核并发写 counter 场景）：",
+      "left": [
+        "IPC < 1.0，cache-miss-rate > 20%，加线程吞吐反降",
+        "perf c2c 报告某数组 Remote HITM >> Local HITM",
+        "加 alignas(64) 后 HITM 降到接近 0，但 QPS 仍未改善",
+        "TSan 报告同一地址的 data race"
+      ],
+      "right": [
+        "存在数据竞争（data race），根因是缺少同步原语，与伪共享无关",
+        "伪共享已消除，但存在其他主要瓶颈（需重新 perf 分析）",
+        "伪共享 + Back-End Memory Bound，进入 perf c2c 排查流程",
+        "cache line 主要在两个 NUMA socket 之间弹跳，需叠加 numactl 绑核"
+      ],
+      "explain": "IPC低+miss高+加线程反降是进入伪共享排查的组合信号；Remote HITM >> Local HITM 说明跨socket弹跳；HITM消除但QPS不变说明伪共享不是主要瓶颈；TSan告警是data race不是伪共享。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列哪个结构体定义能让每个 `SlotStat` 独占一条 64B cache line，同时让编译器在布局错误时报错？",
+      "options": [
+        "`struct SlotStat { uint64_t hit; uint64_t miss; };`",
+        "`struct alignas(64) SlotStat { uint64_t hit; uint64_t miss; char _pad[48]; }; static_assert(sizeof(SlotStat)==64);`",
+        "`struct SlotStat { volatile uint64_t hit; volatile uint64_t miss; };`",
+        "`struct __attribute__((packed)) SlotStat { uint64_t hit; uint64_t miss; };`"
+      ],
+      "answer": 1,
+      "explain": "`alignas(64)` 保证起始地址对齐，`char _pad[48]` 使总大小 = 8+8+48 = 64B，`static_assert` 编译期校验防止后续新增字段破坏对齐。其他选项无法同时满足对齐+大小+编译保障三个条件。"
+    },
+    {
+      "type": "judge",
+      "prompt": "分片计数（Sharded Counter）策略——每个 CPU 维护独立计数、读时求和——适合「写极多、读极少」的场景，但对需要实时精确值的监控指标不适合。",
+      "answer": true,
+      "explain": "Sharded Counter 把写分散到各 CPU，极大减少 cache line 竞争，写吞吐接近线性扩展。但「读时求和」意味着读操作需要遍历所有 shard，且在读的瞬间各 shard 之间存在时间差，读出的值不是某一时刻的精确原子快照。对需要精确实时值的场景（如计费），需要全局同步屏障，会牺牲写吞吐；对监控这类可接受近似值的场景则非常合适。"
+    },
+    {
+      "type": "input",
+      "prompt": "用 perf c2c 定位伪共享时，report 输出里哪一列字段能精确指出发生 HITM 的变量在结构体内的字节偏移？（填写列名，忽略大小写）",
+      "accept": [
+        "Symbol + Offset",
+        "Offset",
+        "offset",
+        "symbol+offset",
+        "Symbol+Offset"
+      ],
+      "explain": "`perf c2c report` 的 `Symbol + Offset` 列同时显示所在符号（函数/变量名）和 cache line 内的字节偏移，可以直接定位到是结构体的哪个字段在发生 HITM，是从 line 地址到源码字段的关键一跳。"
+    },
+    {
+      "type": "choice",
+      "prompt": "AI Infra 场景中，32 个 LoRA adapter 各维护 3 个 `atomic<uint64_t>` 统计字段（共 24 字节/adapter），连续数组存放。修复伪共享后，吞吐从理想值 46% 升到 89%。若进一步要让监控指标采集不影响推理线程，下一步最合适的方案是：",
+      "options": [
+        "把 3 个 atomic 全部改成 mutex 保护的普通 uint64_t",
+        "推理线程每 64 token 把本地累加写入全局 atomic，监控只读全局 atomic 快照，彻底分离写路径和读路径",
+        "把 AdapterStats 数组改成 std::list，让每个元素各自分配到独立页",
+        "给监控线程设置最低优先级，让它在推理线程空闲时才读数据"
+      ],
+      "answer": 1,
+      "explain": "推理线程使用本地累加再批量 flush 到全局 atomic，监控只读全局 atomic 快照：这样推理线程写路径完全 thread-local（无跨核竞争），监控读路径独立，互不干扰。mutex 会引入阻塞；list 无关且浪费内存；优先级调度不能消除共享 cache line 竞争。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种说法描述了「同 socket 跨核」与「跨 socket NUMA」伪共享代价的量级差异？",
+      "options": [
+        "两者代价相当，约 40–80 cycles",
+        "跨 socket 代价约为同 socket 跨核的 5–10 倍，同 socket 约 30–80 cycles，跨 socket 约 150–400 cycles",
+        "跨 socket 代价略高，约为同 socket 的 1.5 倍，因为 UPI 带宽与 ring bus 相似",
+        "跨 socket 代价更低，因为 NUMA 硬件有专用 cache line 路由加速"
+      ],
+      "answer": 1,
+      "explain": "同 socket 跨核的 cache line 迁移通过 ring bus 或 mesh 互连，约 30–80 cycles（10–26ns）。跨 socket 需走 UPI（Intel）或 Infinity Fabric（AMD），约 150–400 cycles；若远端 line 已被驱逐回 DRAM，可超过 600 cycles。跨 NUMA 的代价是同 socket 的 5–10 倍，是 AI Infra 双路服务器伪共享必须额外考虑的放大因素。"
+    }
+  ],
+  "u1-l9": [
+    {
+      "type": "choice",
+      "prompt": "Top-Down 方法的 `toplev --level 2` 进一步把 Back-End Bound 拆分为两个子类，分别是：",
+      "options": [
+        "Cache Bound 和 DRAM Bound",
+        "Memory Bound 和 Core Bound",
+        "Store Bound 和 Load Bound",
+        "L1 Bound 和 L2 Bound"
+      ],
+      "answer": 1,
+      "explain": "Back-End Bound 在 Level 2 细分为 Memory Bound（等待数据从 cache/DRAM 到来，执行单元有活可干但数据没到）和 Core Bound（执行端口饱和、端口竞争或数据依赖链，数据已就绪但没有空闲执行端口）。正确区分这两类决定了下一步是优化数据布局还是优化指令级并行。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 Python 推理服务中，`perf stat` 显示 IPC 很低，直接进行 `perf c2c` 分析是排查的正确第一步。",
+      "answer": false,
+      "explain": "Python 服务首先应用 `py-spy --gil` 排查 GIL 持有率。GIL 持有率 > 80% 时，Python 线程大部分时间在等 GIL 而非真正执行 CPU 工作，IPC 低是 GIL 序列化造成的，与 cache 布局无关。跳过 GIL 排查直接上 perf c2c 会得出错误结论。正确顺序：py-spy → 确认非 GIL 后 → perf stat → toplev → perf c2c/annotate。"
+    },
+    {
+      "type": "input",
+      "prompt": "排障 vLLM 调度循环时，用于定位 Python 侧 CPU 热点和 GIL 持有率的工具叫什么？（填工具名，小写）",
+      "accept": [
+        "py-spy",
+        "pyspy"
+      ],
+      "explain": "`py-spy` 是 Python 采样 profiler，支持 `--gil` 标志显示 GIL 持有率，可以在不修改代码的情况下对线上进程采样并生成火焰图，是 Python 服务「CPU 高但吞吐上不去」场景的第一手工具。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某 C++ DataLoader 服务修复伪共享后，CPU 上 perf stat 显示 IPC 从 0.72 升到 1.45，cache-miss 率从 22% 降到 7%，但 `toplev --level 2` 依然显示 Front-End Bound = 38%。下一步最合适的工具是：",
+      "options": [
+        "继续用 perf c2c，因为 cache-miss 还有 7%",
+        "用 perf annotate 或 perf record + 火焰图，定位 I-cache miss 或 BTB 污染的具体热点",
+        "用 numactl 绑核，减少跨 socket 访问",
+        "用 py-spy 查 GIL，因为 Front-End Bound 是 Python 侧问题"
+      ],
+      "answer": 1,
+      "explain": "Front-End Bound = 38% 说明 CPU 前端（取指/译码）是主要瓶颈，常见于 I-cache miss（大代码体积）、BTB（分支目标缓冲器）污染、ITLB miss 或 cold path 代码干扰热路径。`perf annotate` 可以找到具体分支和 I-cache miss 位置。perf c2c 解决的是 Back-End Memory Bound，numactl 解决 NUMA 问题，与 Front-End Bound 不对应。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 Top-Down 4 大类与 AI Infra 中最典型的触发来源匹配：",
+      "left": [
+        "Front-End Bound",
+        "Bad Speculation",
+        "Back-End Memory Bound",
+        "Retiring"
+      ],
+      "right": [
+        "SIMD 矩阵运算、向量内积等算术密集内核，执行效率高",
+        "MESI cache line bouncing、DRAM stall、DTLB miss 导致数据等待",
+        "tokenizer 中频率极低的 schema fallback 分支污染 BTB，导致预测错误冲刷",
+        "大模型服务代码体积超 I-cache，热路径被 cold code 碎片化"
+      ],
+      "explain": "Front-End Bound 对应 I-cache/BTB/ITLB 不足；Bad Speculation 对应分支误预测；Back-End Memory Bound 对应 cache miss 和 DRAM 等待；Retiring 对应高效有用计算。"
+    },
+    {
+      "type": "judge",
+      "prompt": "给 cold path 函数加上 `__attribute__((cold))` 或 Rust 的 `#[cold]` 属性，编译器会把该函数的机器码放在较冷的代码段，减少其对热路径 I-cache 的污染。",
+      "answer": true,
+      "explain": "`cold` 属性提示编译器：该函数执行频率极低。编译器（GCC/Clang）会把标记为 cold 的函数放置在代码段的「冷区」，与热路径代码物理分离。这样热路径代码在 I-cache 里更紧凑，发生 I-cache miss 的概率更低。同时 `inline(never)` 防止 cold 代码被内联到热路径，进一步减小热路径代码大小。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某服务火焰图显示 `update_request_stats` 占 CPU 22%，但该函数逻辑很简单（仅 3 个原子加）。perf c2c 发现相关数组 HITM 占全机 18%。最有效的修复方案是：",
+      "options": [
+        "把 atomic 改为 mutex 保护的普通整型，降低原子指令开销",
+        "给 RequestStats 数组元素加 alignas(64) + padding，再考虑线程本地批量积累 + 周期 flush",
+        "把 update_request_stats 移到 GPU 侧执行",
+        "增加 CPU 核心数量，让更多核并发写入"
+      ],
+      "answer": 1,
+      "explain": "HITM 18% 是伪共享的强信号。`alignas(64)` + padding 使每个 RequestStats 独占一条 cache line，消除不同请求之间的 cache line bouncing。进一步，线程本地批量积累减少 atomic RMW 频率，从根本上降低 cache line 迁移次数。增加核心不能消除竞争，反而加剧 bouncing。"
+    },
+    {
+      "type": "input",
+      "prompt": "完整排障闭环的最后一步，应当产出一份包含「现象/假设/证据/根因/修复/验证/教训」的文档，业界通常称其为什么？（英文缩写，3个字母）",
+      "accept": [
+        "RCA",
+        "rca"
+      ],
+      "explain": "RCA（Root Cause Analysis，根因分析）是排障闭环的最终产物，要求完整记录：触发现象、初始假设、收集的 PMU/日志证据、确认的根因、修复方案、复测验证结果和预防教训。没有 RCA 的修复是「靠运气」，有 RCA 才能在组织内积累排障知识。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列哪个现象是「CPU 背锅误判」的典型案例，实际根因不在 CPU 侧？",
+      "options": [
+        "多路 GPU 训练，GPU SM utilization 周期性下降，发现 NCCL all-reduce 某节点慢",
+        "推理服务 IPC = 0.6，cache-miss 28%，进行 perf c2c 排查发现 HITM 集中",
+        "DataLoader 加 16 workers 后，perf c2c 显示 WorkerStats 数组 HITM 升高",
+        "tokenizer 服务 P99 高，按路径分桶后发现 schema_fallback 路径 branch-miss 率 7 倍于正常"
+      ],
+      "answer": 0,
+      "explain": "GPU SM utilization 周期性掉是典型的「GPU 背锅或 CPU 背锅误判」场景：实际根因是 NCCL all-reduce 中的慢节点（stragglers）导致所有 GPU 在 barrier 处等待同步，与 CPU DataLoader 速度和 cache 布局无关。正确诊断需先用 Nsight Systems 排除 GPU 本身，再看 NCCL 通信 timeline。"
+    },
+    {
+      "type": "judge",
+      "prompt": "排障 SOP 中，`perf stat -a sleep 30` 里 `-a` 参数的作用是对所有 CPU 进行系统级采样，而不是只采样特定 PID。",
+      "answer": true,
+      "explain": "`perf stat -a` 是 system-wide 模式，采集所有 CPU 的 PMU 计数，可以捕捉到多进程/多线程场景的整体 IPC、cache-miss、branch-miss 等指标。相比 `-p <pid>` 只关注单个进程，`-a` 更适合系统整体健康度判断——尤其在不确定瓶颈在哪个进程时，先做全局快照再缩小范围。"
+    }
+  ],
+  "u1-l10": [
+    {
+      "type": "judge",
+      "prompt": "`free -h` 输出中，`buff/cache` 列代表被浪费的内存，减少它可以给业务进程腾出更多可用内存。",
+      "answer": false,
+      "explain": "`buff/cache` 是 Linux 的 Page Cache 和 buffer cache，是操作系统为了加速文件 IO 而使用的内存缓存。它是「可回收的」——当进程需要更多内存时，内核会自动回收这部分 cache。因此 `buff/cache` 大不是浪费，而是 Linux 在充分利用空闲内存。判断真实可用内存应看 `MemAvailable` 字段，而非 `free`。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种「AI 训练慢」的症状与「高 major-fault 率」最直接对应？",
+      "options": [
+        "checkpoint 写入时训练每隔 5 分钟卡顿 2–3 秒",
+        "模型服务刚启动的前 10 个请求延迟 300ms，之后恢复到 50ms",
+        "DataLoader 16 worker 时 H2D 带宽比 8 worker 时下降 30%",
+        "dataset 服务在高并发下 p99 latency 升到 50ms"
+      ],
+      "answer": 1,
+      "explain": "前几个请求延迟高、之后恢复正常，是典型的「首次访问触发 major fault」模式：mmap 加载权重时只建立虚拟映射，首次请求触发访问未在 Page Cache 中的文件页，需从 NVMe 读入（毫秒级代价），之后页已在内存故恢复正常。卡顿周期性是 dirty writeback，H2D 下降是 NUMA 或 pinned，p99 升是 syscall/IO 问题。"
+    },
+    {
+      "type": "input",
+      "prompt": "查看系统全局内存使用（含 Page Cache、swap、可用内存）最常用的命令是什么？（填命令名，不含参数）",
+      "accept": [
+        "free",
+        "vmstat",
+        "cat /proc/meminfo"
+      ],
+      "explain": "`free` 命令一行显示总内存、已用、空闲、共享、buff/cache 和 MemAvailable，是了解系统内存整体状况的最快工具。`/proc/meminfo` 提供更细的字段（Cached、Dirty、Writeback、Slab 等），`vmstat` 还能看 swap 活动。"
+    },
+    {
+      "type": "match",
+      "prompt": "将四条主线（0b1–0b4）与「第一步诊断命令」匹配：",
+      "left": [
+        "虚拟内存与页表（0b1）",
+        "Page Cache 与脏页（0b2）",
+        "NUMA 与 DMA（0b3）",
+        "Syscall 与 IO 事件（0b4）"
+      ],
+      "right": [
+        "perf trace -p <pid> 或 strace -c -p <pid>",
+        "cat /proc/<pid>/smaps_rollup；perf stat -e minor-faults,major-faults",
+        "numastat -p <pid>；nvidia-smi topo -m",
+        "free -m；cat /proc/meminfo；iostat -x"
+      ],
+      "explain": "0b1 用 smaps_rollup 看 RSS/PSS/VmPTE 和 fault 计数；0b2 用 free+meminfo+iostat 看 Cached/Dirty；0b3 用 numastat 看 NUMA 亲和、topo 看 PCIe 拓扑；0b4 用 perf trace/strace 看 syscall 形态。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个 8 GPU 训练节点，`/proc/meminfo` 显示 `MemAvailable` 只剩 12 GB，其中 `pinned memory` 占用 180 GB（合计 8 个 GPU rank，每个 22.5 GB）。此时若再启动一个 DataLoader worker 使用 `pin_memory=True`，最可能发生的问题是：",
+      "options": [
+        "GPU 显存溢出，训练崩溃",
+        "可用 Page Cache 空间极度压缩，数据集文件页被频繁驱逐，导致读 dataset 时 major fault 率升高",
+        "pinned memory 自动 fallback 到 swap，不会有性能问题",
+        "NUMA 亲和性丧失，但 H2D 带宽不受影响"
+      ],
+      "answer": 1,
+      "explain": "pinned memory 锁定物理页不可回收，消耗大量 DRAM 后，Page Cache 可用空间被严重压缩。DataLoader 需要读取的数据集文件页容易被内核 LRU 回收，导致下一轮读取时不命中 Page Cache，需要从 NVMe 重新读入，major fault 率升高，吞吐下降。这是 pinned memory 与 Page Cache 之间的经典容量竞争。"
+    },
+    {
+      "type": "judge",
+      "prompt": "一台训练机上，CPU 侧进程调用 `write()` 写 checkpoint 文件后，就可以认为该 checkpoint 数据已经在 DRAM 中，不会因内存压力丢失。",
+      "answer": false,
+      "explain": "`write()` 把数据写入 Page Cache（内存中的文件缓存页）并标记为 dirty。在调用 `fsync()` 之前，这些脏页随时可能因内存压力被 flusher 异步写入存储——但在 `fsync()` 完成前，系统崩溃或内核 bug 均可能导致脏页丢失。正确做法是 `write()` 后调 `fsync()` 才能保证持久性。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列四个命令，哪个能同时观察到「NUMA 远端内存访问比例」和「物理内存在各 NUMA node 上的分布」？",
+      "options": [
+        "perf stat -e LLC-loads,LLC-load-misses -p <pid>",
+        "numastat -p <pid>",
+        "cat /proc/<pid>/smaps_rollup",
+        "mpstat -P ALL 1"
+      ],
+      "answer": 1,
+      "explain": "`numastat -p <pid>` 显示指定进程在每个 NUMA node 上分配的内存页数（numa_hit/numa_miss）以及本地/远端访问统计，同时也显示进程内存在各 node 的分布。这是 NUMA 不亲和问题的核心诊断工具。perf stat 看 CPU 缓存；smaps_rollup 看虚拟内存布局；mpstat 看 CPU 使用率。"
+    },
+    {
+      "type": "input",
+      "prompt": "评估某进程「真实内存泄漏」时，最应该关注的内存指标是什么？（填指标名，可填英文缩写）",
+      "accept": [
+        "USS",
+        "Private",
+        "Private_Dirty",
+        "uss"
+      ],
+      "explain": "USS（Unique Set Size，即 Private 内存）是进程独占且不与任何其他进程共享的物理页。内存泄漏导致进程独占内存单调增长，USS 能精确反映这部分增长，不受共享页变化干扰。RSS 会随 mmap/共享内存波动；PSS 虽更准确但不能排除共享页影响。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练节点出现「首 batch 比后续 batch 慢 5 倍，且 NVMe 在首 batch 期间有大量读 IO」。根据四条主线框架，最可能的根因是哪条主线的哪个机制？",
+      "options": [
+        "主线 0b3（NUMA/DMA）：首次 H2D 需要初始化 DMA mapping",
+        "主线 0b1（虚拟内存）：首次访问 mmap 权重/数据触发大量 major page fault，需从 NVMe 读入文件页",
+        "主线 0b4（Syscall）：首 batch 的 open/stat syscall 次数多，内核初始化开销大",
+        "主线 0b2（Page Cache）：Page Cache 有 write-through 机制，首 batch 需要同步写入"
+      ],
+      "answer": 1,
+      "explain": "首 batch 慢 + NVMe 有大量读 IO = 主线 0b1（虚拟内存）的 major page fault。模型权重或数据集以 mmap 方式映射，首次触碰时物理页不在内存，触发 major fault 从 NVMe 读入，代价毫秒级。后续 batch 这些页已在 Page Cache，只需 minor fault 建映射，速度恢复正常。"
+    },
+    {
+      "type": "judge",
+      "prompt": "容量预算公式 `pinned memory footprint ≈ ranks × workers × prefetch × batch_bytes` 表明，多机训练场景中 pinned memory 用量与 rank 数量成线性关系，每增加一台机器（一个 rank）都会相应增加 pinned memory 压力。",
+      "answer": true,
+      "explain": "每个 rank（训练进程）都需要独立的 pinned memory 缓冲区来做 H2D 传输，多个 DataLoader worker 预取多个 batch，每个 batch 都需要 pinned 物理页。因此总 pinned footprint 与 ranks 数量成正比。当单机 rank 数从 1 增到 8（8 GPU），pinned 需求也 8 倍。这是多 GPU 场景必须提前预算 pinned 上限的原因。"
+    }
+  ],
+  "u1-l11": [
+    {
+      "type": "choice",
+      "prompt": "x86-64 架构上，Linux 常用 4 级页表（PML4→PUD→PMD→PTE）。当发生 TLB miss 时，硬件 page walker 在最坏情况下需要访问几次内存？",
+      "options": [
+        "1 次",
+        "2 次",
+        "4 次",
+        "8 次"
+      ],
+      "answer": 2,
+      "explain": "4 级页表每一级都是一个内存中的数组，TLB miss 时硬件 page walker 依次访问 PML4[vpn4] → PUD[vpn3] → PMD[vpn2] → PTE[vpn1]，共 4 次内存访问才能得到物理页帧号（PFN）。若这些页表页本身不在 L1/L2/L3 cache 中，每次访问都会到 DRAM，累计延迟可达 400ns+。这正是 Huge Page 能显著降低 TLB miss 代价的原因——2MB 页只需 3 级翻译，1GB 页只需 2 级。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Linux 进程调用 `fork()` 之后，子进程立即拥有父进程所有数据的独立物理副本，这就是 Copy-on-Write 机制。",
+      "answer": false,
+      "explain": "COW（Copy-on-Write）的核心是「懒复制」：fork() 后父子进程共享同一批物理页，页表标记为只读；只有当父或子进程尝试写入某个共享页时，内核才会在那一刻复制出私有副本（触发 COW fault）。这样大多数只读共享数据（如代码段、dataset metadata）永远不会被实际复制，节省大量内存和时间。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Linux 进程的 /proc/PID/smaps 输出中，`Shared_Clean` 行表示什么类型的页？（填简短描述，含「共享」和「未修改」或「只读」即可；或填 file-backed）",
+      "accept": [
+        "Shared_Clean",
+        "file-backed shared",
+        "共享且未被修改的页",
+        "shared file-backed",
+        "clean shared"
+      ],
+      "explain": "`Shared_Clean` 表示与其他进程共享、且尚未被修改（clean，即与存储上一致）的物理页。典型例子：fork() 后父子进程共享的代码段、mmap 共享的只读文件页（如 NumPy memmap 的数据区）。这类页随时可被内核回收（re-read from file），不算「真实内存占用」，计算 PSS 时按进程数分摊。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DataLoader 父进程持有 12 GB Python list（嵌套 dict），fork 16 个 worker 后，worker 对这个 list 进行「只读遍历」，却发现 Private_Dirty 逐渐增长。最可能的原因是：",
+      "options": [
+        "worker 读 list 触发了 major fault，NVMe 读入导致 dirty 页增加",
+        "CPython 对象有引用计数（refcount），访问 Python 对象时会递增 refcount，修改对象头，触发 COW 把含该对象的 4KB 页变为 worker 私有",
+        "Linux 内核对所有 fork 后的读操作强制 COW，这是设计原则",
+        "list 是 mutable 类型，Python 运行时会在遍历时加锁并标记 dirty"
+      ],
+      "answer": 1,
+      "explain": "CPython 的对象头部包含引用计数字段（`ob_refcnt`），每次读取对象（哪怕只是 for 循环触碰），Python 运行时都会对该对象的引用计数 +1/-1（在 local scope 内）。这个修改发生在共享的只读页上，触发 COW，内核为该 worker 分配物理副本，Private_Dirty 增加。解决方法是把不可变数据改用 `bytes`、NumPy 数组等非 refcount 结构，或使用 `multiprocessing.Array`/`mmap`。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 page fault 类型与其典型代价和场景匹配：",
+      "left": [
+        "major fault",
+        "minor fault（匿名页首次分配）",
+        "COW fault",
+        "minor fault（mmap 页已在内存）"
+      ],
+      "right": [
+        "页已在 Page Cache，只需建立页表映射，微秒级，mmap 热文件访问的典型情形",
+        "需从磁盘/NVMe 读取文件页，毫秒级，mmap 权重冷启动的根因",
+        "内核复制父进程的只读物理页给子进程，微秒级，涉及一次物理页分配和内存拷贝",
+        "新分配匿名物理页并清零（zero-fill），微秒级，heap malloc 首次写入的典型情形"
+      ],
+      "explain": "major fault 需磁盘IO最慢；COW fault 需物理复制但不涉及IO；匿名页首分配需zero-fill；mmap热页只建映射最快。"
+    },
+    {
+      "type": "choice",
+      "prompt": "推理服务使用 `safetensors` + `mmap` 加载 70B 权重，warmup 策略是「启动后等待 10 秒再接流量」。以下哪个 warmup 策略最能防止首批用户请求触发 major fault？",
+      "options": [
+        "等待 10 秒，因为 NVMe 读速度足够快，10 秒内权重会自动预加载",
+        "启动后立即执行 dummy prefill+decode（按实际访问路径），等 readiness probe 通过再接流量",
+        "把 `mmap` 改为 `read()` 加载权重到匿名内存，就不需要 warmup",
+        "把 readiness probe 超时设为 1 秒，加快滚动发布速度"
+      ],
+      "answer": 1,
+      "explain": "mmap 是懒加载，10 秒计时器不能保证任何页被预热。正确做法是执行 dummy prefill+decode——这会按实际推理路径触碰所有必要的权重页（attention、FFN 等），使其通过 major fault 被读入并留在 Page Cache；同时预热 CUDA Graph。readiness probe 在 warmup 完成后才通过，确保第一个真实请求面对的是已预热的稳态。"
+    },
+    {
+      "type": "judge",
+      "prompt": "进程虚拟地址空间中，用 `mmap(MAP_ANONYMOUS | MAP_PRIVATE)` 分配的内存区域（匿名私有映射）在 fork 后，子进程访问时不会触发 COW fault。",
+      "answer": false,
+      "explain": "匿名私有映射（`MAP_ANONYMOUS | MAP_PRIVATE`）在 fork 后和文件映射一样适用 COW 机制：父子进程共享物理页，页表标为只读。子进程第一次写入某个匿名页时，内核分配新物理页并复制，触发 COW fault。只有 `MAP_SHARED` 的共享映射才允许父子直接共享写入，且写入对彼此可见。"
+    },
+    {
+      "type": "input",
+      "prompt": "对于随机访问 100GB embedding table 的推理服务，减少 dTLB miss 的最常用内核级手段是使用多大的 Huge Page？（填页大小，含单位，如 2MB 或 1GB）",
+      "accept": [
+        "2MB",
+        "2 MB",
+        "2mb",
+        "1GB",
+        "1 GB",
+        "1gb"
+      ],
+      "explain": "标准 Huge Page 为 2MB（比 4KB 大 512 倍），使用 2MB 页后，同等 working set 所需的 TLB 条目数减少 512 倍，dTLB miss 率大幅下降。对超大 embedding table 也可以用 1GB 页进一步减少条目（1GB = 512 个 2MB），但 1GB 页需要提前通过 HugeTLB 预留，灵活性较低。生产上 2MB 通过 THP（madvise 模式）是最常见选择。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列关于 `VmSize` 和 `RSS` 的说法，哪个是正确的？",
+      "options": [
+        "VmSize 总是大于等于 RSS，因为虚拟地址空间包含了所有已映射但未必驻留的区域",
+        "RSS 总是大于 VmSize，因为 RSS 还包含了被 swap 出去的页",
+        "对 AI 推理服务来说，VmSize 等于 RSS 是正常状态",
+        "VmSize 反映实际物理内存占用，是判断 OOM 风险的核心指标"
+      ],
+      "answer": 0,
+      "explain": "VmSize 是进程虚拟地址空间的总大小，包括所有 mmap 预留区域（不管有没有物理页）、代码段、堆、栈、共享库等。RSS（驻留集）只统计当前实际在物理内存中的页。因为 mmap 是懒加载，VmSize >> RSS 是正常状态，大模型服务 VmSize 可能数百 GB，RSS 只有实际加载的权重部分。判断 OOM 风险应看 RSS（或更准确的 PSS）与 MemAvailable 的关系。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个推理服务在 64 GB DRAM 机器上 mmap 了多个大模型权重（合计约 55 GB），服务刚启动不久就 OOM 被杀。以下哪个是最可能的直接原因？",
+      "options": [
+        "mmap 本身导致内核把 55 GB 全部立即读入物理内存，DRAM 不够",
+        "操作系统在建立 mmap VMA 时为每个 4KB 页分配了页表项，VmPTE 占用过多物理内存，直接导致 OOM",
+        "服务在 warmup 阶段触碰了所有权重页（major fault 填充），55 GB 权重 + 进程其他内存（堆、GPU buffer、pinned memory 等）超过 64 GB 总量",
+        "mmap 在权重文件修改时会触发写时拷贝，导致内存占用翻倍"
+      ],
+      "answer": 2,
+      "explain": "mmap 本身是懒加载，不立即分配物理内存（VmSize 大、RSS 小）。warmup 预热时，进程触碰所有权重页→major fault→内核把 55 GB 权重文件页读入 Page Cache 并建立映射，55 GB 文件页 + 进程堆/栈/GPU driver buffer/pinned memory + 其他进程的内存，可能超过 64 GB 可用 DRAM，触发 OOM Killer。VmPTE 过大在极端情况下也可占用数 GB，但首要根因通常是 working set 超限。"
+    }
+  ],
+  "u1-l12": [
+    {
+      "type": "choice",
+      "prompt": "训练节点的 `/proc/vmstat` 中，`workingset_refault_file` 计数在第二个 epoch 开始后持续快速增长。这最可能说明：",
+      "options": [
+        "Page Cache 空间充足，文件预读（readahead）工作良好",
+        "Page Cache 有效工作集被挤压，已回收的文件页又频繁被重新访问，等效于 cache miss 增加",
+        "文件系统元数据（inode/dentry）占用了过多内存，导致 slab 压力",
+        "第二个 epoch 的数据集文件与第一个不同，触发了新的文件页加载"
+      ],
+      "answer": 1,
+      "explain": "`workingset_refault_file` 记录「刚被回收的文件页又被访问」的次数，增长快说明 Page Cache 的工作集被不断驱逐又重读，是 Page Cache 容量不足或被其他 job 污染的关键信号。配合 pgscan/pgsteal 增长和存储读带宽升高，可以确认 Page Cache 被挤压导致性能下降。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` 可以在顺序读取大 shard 文件完成后，主动告知内核丢弃这些文件页，减少对其他 job Page Cache 的污染。",
+      "answer": true,
+      "explain": "`POSIX_FADV_DONTNEED` 提示内核「这段文件范围的数据近期不再需要，可以回收对应 Page Cache 页」。大顺序扫描（如 dataset 单轮遍历）完成后立即调用它，可以主动释放不再需要的 cache 页，避免把其他 job 的热文件（权重、索引）挤出 Page Cache。这是多 job 共存节点的 Page Cache 礼貌策略。"
+    },
+    {
+      "type": "input",
+      "prompt": "Linux 控制「后台脏页回写触发阈值」（脏页比例达到多少时 flusher 开始异步回写）的内核参数叫什么？（填参数名，含命名空间前缀 vm.）",
+      "accept": [
+        "vm.dirty_background_ratio",
+        "vm.dirty_background_bytes",
+        "dirty_background_ratio",
+        "dirty_background_bytes"
+      ],
+      "explain": "`vm.dirty_background_ratio`（或 `vm.dirty_background_bytes`）控制后台异步 flusher 的启动阈值：脏页超过该比例时后台开始回写，不阻塞进程。而 `vm.dirty_ratio`（`vm.dirty_bytes`）是同步阻塞阈值，超过它时进程写入会被阻塞等待回写。大内存机器建议改用 bytes 形式以避免比例带来的超大脏页积压。"
+    },
+    {
+      "type": "choice",
+      "prompt": "Huge Pages 的 HugeTLB 方式与 THP（Transparent Huge Pages）的核心区别是：",
+      "options": [
+        "HugeTLB 只支持 2MB 页，THP 支持 2MB 和 1GB 页",
+        "HugeTLB 需要预先分配固定的大页池，内存被锁死不可回收；THP 由内核透明地运行时合并，可以按需拆分回收",
+        "THP 只对 GPU 内存有效，HugeTLB 对 CPU 内存有效",
+        "HugeTLB 性能更差，因为需要专用 syscall（mmap with MAP_HUGETLB）分配"
+      ],
+      "answer": 1,
+      "explain": "HugeTLB 通过 `nr_hugepages` 预留固定数量大页，保证分配确定性和无 compaction 抖动，但这些页永久锁死不可回收；THP 让内核在运行时自动合并 4KB 页为 2MB 页，应用无需修改，但 khugepaged 后台合并和 page fault 路径的同步 compaction 可能引入延迟尖刺（尤其是 always 模式下的大内存节点）。"
+    },
+    {
+      "type": "match",
+      "prompt": "将内核参数 / 配置与其主要作用匹配：",
+      "left": [
+        "vm.dirty_bytes",
+        "vm.dirty_background_bytes",
+        "echo madvise > /sys/kernel/mm/transparent_hugepage/enabled",
+        "posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)"
+      ],
+      "right": [
+        "提示内核对该文件激进预读（readahead），适用于顺序扫描大 shard 场景",
+        "控制同步阻塞回写的脏页字节上限，超过时进程写入被 throttle",
+        "把 THP 限定在应用显式调用 madvise(MADV_HUGEPAGE) 的区域，避免全局 compaction 抖动",
+        "后台 flusher 的启动阈值（字节），脏页超过时开始异步回写，不阻塞进程"
+      ],
+      "explain": "dirty_bytes 是同步阻塞上限；dirty_background_bytes 是后台异步触发阈值；madvise 模式 THP 只对显式标记区域生效；POSIX_FADV_SEQUENTIAL 提升预读。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个 checkpoint 协议步骤是「可以省略的」（即省略后不影响数据完整性）？",
+      "options": [
+        "写临时文件（rank-N.tmp）而非直接写最终目标文件",
+        "写完临时文件后调用 fsync(rank-N.tmp)",
+        "使用 rename() 原子切换临时文件到最终名",
+        "coordinator 写完 manifest 后对 checkpoint 目录本身调用 fsync()"
+      ],
+      "answer": 3,
+      "explain": "这里考察的是哪一步安全性最低。写 tmp 文件保护上一个 checkpoint；fsync(tmp) 确保数据落盘；rename() 保证名称切换原子性；而 `fsync(checkpoint_directory)` 确保目录项（rename 带来的目录项变化）本身在崩溃后对文件系统可见——在某些情况下（不需要严格保证目录可见性）确实可以省略，但正确协议应包含它。题目考察「哪一步重要性相对最低」：目录 fsync 在某些实现中被省略，其他三步缺失会直接导致数据损坏或写到一半的文件。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 THP `madvise` 模式下，调用 `madvise(addr, length, MADV_HUGEPAGE)` 可以让内核对指定范围尽量使用 2MB 大页，但不能保证立即完成合并，合并由 `khugepaged` 后台线程异步完成。",
+      "answer": true,
+      "explain": "`MADV_HUGEPAGE` 是对内核的「意向声明」而非同步命令。内核会把该范围加入 khugepaged 的处理队列，由后台线程在适当时机合并 4KB 页为 2MB 大页（需要找到连续的 4KB 页组成 2MB 对齐区域）。想要更确定性地使用大页，可以预分配 HugeTLB 页并用 `mmap(MAP_HUGETLB)` 直接分配，或者在分配后立即 `mlock()` 触发即时合并。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种场景最适合配置 THP 为 `never`（完全禁用 THP）？",
+      "options": [
+        "70B 模型推理服务，权重 mmap 访问连续，内存充足",
+        "大批量矩阵乘法训练，大 tensor 访问连续，TLB miss 是瓶颈",
+        "高频交易或 p99 延迟要求 < 1ms 的低延迟服务，不容忍任何 compaction stall",
+        "DataLoader 顺序读 shard，每次读 256 KB 块"
+      ],
+      "answer": 2,
+      "explain": "THP `never` 完全禁用大页合并，消除了 khugepaged 和 compaction 带来的延迟尖刺，以牺牲 TLB 效率换取延迟确定性。这适合 p99 < 1ms 的严格低延迟场景（如 HFT）。大模型推理和训练访问连续大 tensor，THP madvise 模式可以带来明显的 TLB 收益；DataLoader 顺序读 block，Page Cache 的预读效果更显著。"
+    },
+    {
+      "type": "input",
+      "prompt": "检测物理内存中某文件有多少页（page）当前在 Page Cache 中、哪些页存在，最常用的命令行工具叫什么？（填工具名）",
+      "accept": [
+        "vmtouch",
+        "mincore",
+        "fincore"
+      ],
+      "explain": "`vmtouch` 是一个专门用于检查和控制文件在 Page Cache 中驻留情况的工具：`vmtouch <file>` 显示文件有多少页驻留在内存中，`vmtouch -l <file>` 锁定文件页，`vmtouch -e <file>` 驱逐文件页。它是验证「第二轮读取加速是否来自 Page Cache」的直观工具。`mincore()` 是底层 syscall，`fincore` 是基于 mincore 的前端。"
+    },
+    {
+      "type": "input",
+      "prompt": "要对某段大数组内存区域启用 THP 的 madvise 模式，应该传给 madvise() 的 advice 参数值叫什么？（全大写）",
+      "accept": [
+        "MADV_HUGEPAGE",
+        "madv_hugepage"
+      ],
+      "explain": "`madvise(addr, length, MADV_HUGEPAGE)` 告知内核对这段地址范围尽量使用 2MB Huge Page。在 THP 为 madvise 模式时，只有被显式标记了 MADV_HUGEPAGE 的区域才会被 khugepaged 合并为大页，其他区域保持 4KB 普通页。这样可以精确控制哪些大连续数组（如 embedding table、权重 tensor）使用大页，避免全局 compaction 抖动。"
+    }
+  ],
+  "u1-l13": [
+    {
+      "type": "choice",
+      "prompt": "双路服务器中，DataLoader worker 跑在 socket 1 上，GPU 0 挂在 socket 0 的 PCIe root complex 下。worker 写好 batch（numpy array）后调用 `pin_memory` 并做 H2D。GPU 0 的 DMA 读取这批数据的物理路径是：",
+      "options": [
+        "GPU 0 DMA 直接从 socket 0 的 DRAM 读，因为 pin_memory 会把数据迁移到 socket 0",
+        "GPU 0 DMA 经 PCIe root complex → UPI/Infinity Fabric → socket 1 DRAM 读取数据，路径远，带宽低",
+        "pin_memory 会在 socket 0 创建数据副本，DMA 读副本",
+        "OS 调度器会自动把 worker 迁移到 socket 0 以优化 DMA 路径"
+      ],
+      "answer": 1,
+      "explain": "pin_memory 锁定页但不迁移 NUMA 位置——数据在哪个 socket first-touch 就在哪个 node。worker 在 socket 1 写数据，页 first-touch 到 node 1。GPU 0 在 socket 0，其 DMA engine 经过 PCIe root complex 0 → UPI/Infinity Fabric → socket 1 DRAM 读取，是最远路径，带宽只有本地路径的 50-70%，这就是 NUMA first-touch 错位导致 H2D 带宽不足的根因。"
+    },
+    {
+      "type": "judge",
+      "prompt": "对于 8 GPU 双路训练机，`NCCL_IB_HCA` 应该为所有 GPU rank 设为同一块 InfiniBand NIC，以简化配置。",
+      "answer": false,
+      "explain": "双路 8 GPU 机（GPU 0-3 在 node 0，GPU 4-7 在 node 1）应做 rail 对齐：GPU 0-3 的 rank 配置用 node 0 上的 NIC（mlx5_0），GPU 4-7 的 rank 用 node 1 上的 NIC（mlx5_1）。统一用同一块 NIC 会让一半 GPU 的 RDMA 流量跨 socket（SYS 距离）传输，带宽大幅下降，并可能 fallback 到 host staging，严重影响 all-reduce 效率。"
+    },
+    {
+      "type": "input",
+      "prompt": "PyTorch 中，要让 H2D copy 异步进行（不阻塞主线程），除了 `pin_memory=True` 之外，`tensor.to()` 需要设置的参数名和值是什么？（填 Python keyword argument，如 key=value）",
+      "accept": [
+        "non_blocking=True",
+        "non_blocking = True"
+      ],
+      "explain": "`tensor.to('cuda', non_blocking=True)` 指示 PyTorch 将 copy 提交到 CUDA 复制引擎而不等待完成，前提是源 tensor 在 pinned memory 中。若缺少 non_blocking=True，即使 tensor 在 pinned memory，to() 默认也会同步等待 copy 完成，阻塞主线程并破坏 DataLoader 与 compute 的 overlap。"
+    },
+    {
+      "type": "choice",
+      "prompt": "GPUDirect RDMA（GDRDMA）成立的必要条件不包括以下哪项？",
+      "options": [
+        "GPU 和 RDMA NIC 在 PCIe 拓扑上足够近（如 PIX 距离）",
+        "`nvidia_peermem` 内核模块已加载",
+        "GPU 和 NIC 都支持 GDRDMA 且 BIOS/IOMMU 配置允许",
+        "GPU 之间必须通过 NVLink 互连"
+      ],
+      "answer": 3,
+      "explain": "GDRDMA 是 GPU 与 RDMA NIC 之间的直接内存访问路径，不涉及 NVLink（NVLink 是 GPU-GPU 互连）。GDRDMA 的必要条件是：GPU+NIC 硬件支持、`nvidia_peermem` 加载（让内核 RDMA 驱动能访问 GPU 显存）、PCIe 拓扑亲和（PIX 比 SYS 好）、BIOS/IOMMU/ACS 配置允许 P2P 访问。NVLink 的有无与 GDRDMA 是否成立无关。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 H2D 优化手段与其解决的具体问题匹配：",
+      "left": [
+        "pin_memory=True + persistent_workers=True",
+        "numactl --cpunodebind=N --membind=N 绑定 worker 到 GPU 同侧 socket",
+        "NCCL_IB_HCA 按 GPU 所在 socket 分别配置不同 NIC",
+        "去掉每 step 的 loss.item() 调用"
+      ],
+      "right": [
+        "消除隐式 GPU→CPU 同步，让 H2D copy 和计算真正 overlap",
+        "消除 pageable memory 的 driver staging 拷贝，让 DMA 直接访问 pinned 页",
+        "让 RDMA 流量走拓扑近的 NIC，避免跨 socket 带宽损耗",
+        "让 batch 页 first-touch 到 GPU 所在 NUMA node，DMA 读本地 DRAM"
+      ],
+      "explain": "pin_memory 消除 staging；numactl 修复 NUMA first-touch；HCA rail 对齐消除跨 socket RDMA；去 item() 消除同步破坏 overlap。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个命令最能直接展示「单机 8 GPU + 2 NIC 的 PCIe 拓扑和设备间距离」？",
+      "options": [
+        "lspci -tv",
+        "nvidia-smi topo -m",
+        "numactl --hardware",
+        "cat /proc/cpuinfo"
+      ],
+      "answer": 1,
+      "explain": "`nvidia-smi topo -m` 显示所有 GPU、NIC（mlx5_x）之间的拓扑距离矩阵，标记 PIX/PXB/PHB/NODE/SYS/NV# 等距离，是判断 GPU-NIC rail 对齐、GPU-GPU NVLink 连接以及 H2D/RDMA 路径的核心工具。`lspci -tv` 显示 PCIe 树形结构但不展示设备间距离矩阵；`numactl --hardware` 显示 NUMA 节点间内存距离，不显示 GPU/NIC。"
+    },
+    {
+      "type": "judge",
+      "prompt": "IOMMU 对 DMA 的作用与 MMU 对 CPU 的作用类似：它为设备提供地址转换（IOVA → 物理地址），并限制设备只能访问被授权的内存范围，提供 DMA 隔离。",
+      "answer": true,
+      "explain": "IOMMU（Input-Output Memory Management Unit）为 DMA 设备提供地址翻译和访问控制：设备使用 IOVA（IO Virtual Address），IOMMU 把 IOVA 翻译成物理地址并只允许访问已映射的范围，防止恶意或有 bug 的驱动 DMA 越权访问其他进程内存。这与 CPU MMU 把虚拟地址翻译成物理地址并实现进程隔离的作用类比相同。IOMMU 也会带来一定的 DMA 地址转换开销，这是为什么某些高性能场景要评估 passthrough 模式。"
+    },
+    {
+      "type": "input",
+      "prompt": "`nvidia-smi topo -m` 输出中，表示两个设备经过同一个 PCIe switch（最多一个 bridge）、距离最近的标记是什么？（两字母或三字母）",
+      "accept": [
+        "PIX",
+        "pix"
+      ],
+      "explain": "PIX（PCIe host bridge - Switch）表示两个设备通过最多一个 PCIe bridge/switch 直接互连，是 nvidia-smi topo 中距离最近的非 NVLink 标记。PIX 拓扑下，GPU 与同 switch 上的 NIC 做 RDMA 或 GPU 间 P2P，带宽最高、延迟最低，是 GDRDMA 和 GPUDirect 成立的最佳条件。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某训练节点使用 `cudaHostAlloc`（pinned memory）预分配了每 rank 4 个 batch 的 prefetch buffer，共 8 rank，每 batch 512 MB。该节点 pinned memory 总占用约是多少 GB？",
+      "options": [
+        "4 GB",
+        "8 GB",
+        "16 GB",
+        "32 GB"
+      ],
+      "answer": 2,
+      "explain": "pinned footprint = ranks × prefetch_batches × batch_bytes = 8 × 4 × 512 MB = 16384 MB = 16 GB。这 16 GB 物理页被锁定，不可回收，会压缩 Page Cache 可用空间。在 512 GB 内存机器上尚可接受，但如果还有多个其他服务或数据集 working set 需要 Page Cache，需要提前规划 pinned 上限（ulimit -l）。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 K8s 中，将 GPU pod 的 cpuset 设置为跨两个 NUMA socket 的 CPU（如 CPU 0-3 加上 CPU 32-35），即使 DataLoader 已开启 pin_memory=True，仍可能出现 H2D 带宽不足的问题。",
+      "answer": true,
+      "explain": "pin_memory 锁定物理页但不控制 NUMA first-touch 位置。若 cpuset 跨 socket，DataLoader worker 可能在 socket 1 的 CPU 上运行，first-touch batch 数据到 node 1；而 GPU 0 在 socket 0，H2D DMA 需跨 UPI 读 node 1 的 DRAM，带宽只有本地路径的 50-70%。正确配置应将 GPU pod 的 cpuset 限定在 GPU 所在 socket 的 CPU 上，并配合 memory affinity 确保内存也分配在同 socket。"
+    }
+  ],
+  "u1-l14": [
+    {
+      "type": "choice",
+      "prompt": "以下哪种操作会让 io_uring 的 `IORING_SETUP_SQPOLL` 模式下的内核轮询线程退出休眠并开始消费 SQE？",
+      "options": [
+        "用户态调用 `io_uring_enter()` 并设置 IORING_ENTER_SQ_WAKEUP 标志",
+        "用户态直接向 SQ 写入新 SQE，内核轮询线程会自动检测到",
+        "用户态调用 `epoll_wait()` 通知内核",
+        "用户态调用 `write()` 到 eventfd"
+      ],
+      "answer": 0,
+      "explain": "SQPOLL 模式下内核轮询线程会在 idle 一段时间后进入休眠状态以节省 CPU。若用户进程写 SQE 时内核线程已休眠，需要显式调用 `io_uring_enter()` 并设置 `IORING_ENTER_SQ_WAKEUP` 标志来唤醒它。liburing 封装了这个细节（`io_uring_submit()` 在需要时自动唤醒）。直接写 SQE 无法唤醒休眠的内核线程。"
+    },
+    {
+      "type": "judge",
+      "prompt": "epoll 的 edge-trigger（ET）模式下，收到 EPOLLIN 事件后，如果只读了 1024 字节就返回 epoll_wait，剩余数据会在下次 epoll_wait 时再次触发 EPOLLIN。",
+      "answer": false,
+      "explain": "ET 模式只在 socket 状态「从不可读变为可读」时通知一次，而不是「只要有数据就持续通知」（那是 LT 的语义）。若收到 EPOLLIN 后没有 drain 到 EAGAIN（读到数据耗尽），内核不会再发 EPOLLIN，剩余数据会永久卡在 socket buffer 中，连接表现为「停止响应」。ET 模式必须配合循环读直到 EAGAIN。"
+    },
+    {
+      "type": "input",
+      "prompt": "io_uring 中，应用层向内核提交操作请求的 ring 结构叫做什么？（填全称或缩写，英文）",
+      "accept": [
+        "SQ",
+        "Submission Queue",
+        "submission queue"
+      ],
+      "explain": "SQ（Submission Queue）是用户态与内核共享的提交环，用户态填写 SQE（Submission Queue Entry）描述要执行的操作，内核从 SQ 读取并执行。对应的完成环是 CQ（Completion Queue），内核填写 CQE（Completion Queue Entry）通知用户态操作完成。两个 ring 共享内存，提交和收割都无需 copy。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个 model serving gateway 使用 epoll + ET 模式处理大量 SSE（Server-Sent Events）连接，压测时发现部分连接在客户端读取慢时「卡住」，其他正常连接也被拖慢。最可能的根因是：",
+      "options": [
+        "ET 模式不支持大并发连接，应该换成 LT 模式",
+        "慢客户端的 socket send buffer 已满，ET 模式的 drain loop 在 write() 遇到 EAGAIN 时没有注册 EPOLLOUT，占用了 event loop 时间导致饥饿",
+        "epoll 本身有 bug，应该迁移到 io_uring",
+        "SSE 协议不支持 non-blocking IO，需要为每个连接创建独立线程"
+      ],
+      "answer": 1,
+      "explain": "慢客户端读取慢 → socket send buffer 满 → write() 返回 EAGAIN → 若 drain loop 没有正确注册 EPOLLOUT 并退出，而是在 event loop 主线程里同步等待或持续重试写入，就会阻塞处理其他连接的时间片。正确做法：write() 遇到 EAGAIN → 把未写完数据保存到 per-connection buffer → 注册 EPOLLOUT → 返回 event loop → EPOLLOUT 触发时继续写。同时必须对 per-connection pending bytes 设上限，防止慢客户端无限积压。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 IO 模型关键概念与其定义匹配：",
+      "left": [
+        "Level-Trigger（LT）",
+        "Edge-Trigger（ET）",
+        "Completion 模型",
+        "Readiness 模型"
+      ],
+      "right": [
+        "内核告知「你提交的这次操作已经完成」，应用处理结果（io_uring 的语义）",
+        "只要条件满足（如 buffer 有数据）就持续通知，漏读有补救机会（epoll 默认）",
+        "状态发生变化时只通知一次，必须一次性 drain 到 EAGAIN（epoll ET 模式）",
+        "内核告知「这个 fd 现在可能可读/可写」，应用自己去调 read/write（epoll 总体语义）"
+      ],
+      "explain": "LT 持续通知只要条件满足；ET 只通知状态变化一次；Readiness 告知「可以尝试」；Completion 告知「已经完成」。"
+    },
+    {
+      "type": "choice",
+      "prompt": "dataset service 每秒需要并发读取 10000 个 4KB 的小文件（共 40 MB/s），CPU `strace -c` 显示 `pread64` 调用数占总 syscall 数的 92%。以下哪个方案能最根本地降低 syscall 频率？",
+      "options": [
+        "把每个 pread64 改为 io_uring 提交，减少 syscall 开销",
+        "把 10000 个小文件预先合并成大 shard 文件（如 tar 或 parquet），每次读取粒度从 4KB 提升到 256KB-4MB",
+        "把 DataLoader worker 数从 8 增加到 32，分摊 syscall 压力",
+        "把文件系统从 ext4 换成 tmpfs，减少磁盘 IO"
+      ],
+      "answer": 1,
+      "explain": "syscall 频率 = 数据量 / 单次读取粒度。10000 个 4KB 文件 → 10000 次 pread64；合并成大 shard 后每次读 1MB，读取同样 40MB 数据只需约 40 次 syscall，降低 250 倍。io_uring 可以减少每次 syscall 的固定开销，但减不了次数。增加 worker 分摊的是时间，总 syscall 数不变。换 tmpfs 只影响延迟不影响 syscall 次数。先解决格式问题再评估 io_uring 是正确顺序。"
+    },
+    {
+      "type": "judge",
+      "prompt": "对于 QPS 低于 1000 的控制面 API 服务，使用传统 blocking thread pool 通常比 epoll 或 io_uring 更合适，因为 epoll 在低 QPS 下的事件循环管理开销超过其收益。",
+      "answer": true,
+      "explain": "epoll 和 io_uring 的优势在于高并发（大量 fd）时以极少系统调用处理大量事件，减少线程切换开销。低 QPS（< 1000）服务：单线程处理开销低，blocking thread pool 代码更简单、调试更直接，等待期间线程阻塞不浪费 CPU（QPS 低时线程大部分在阻塞等待，这是正常的）。引入 epoll 的状态机复杂度、EAGAIN 处理、partial write 管理等，在低 QPS 场景属于过度设计，反而增加 bug 风险。"
+    },
+    {
+      "type": "input",
+      "prompt": "快速统计某进程发出的各类系统调用次数和耗时占比，最适合用哪个命令？（填命令名，不含路径）",
+      "accept": [
+        "strace",
+        "perf trace"
+      ],
+      "explain": "`strace -c -p <pid>` 统计所有 syscall 的调用次数、耗时、错误次数并排序，是分析「服务到底在调哪些 syscall、哪类 syscall 是耗时主体」的最直接工具。`-c` 是 count 模式，不打印每次调用详情，适合在线采样。`perf trace` 也有类似功能但开销更低，适合生产环境。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个 log agent 向日志后端推送数据，后端偶尔变慢（写入成功率降低）。以下哪个设计能在后端变慢时保护 agent 本身不 OOM，同时不丢弃最新的关键日志？",
+      "options": [
+        "无限缓冲队列 + 超时重试，确保每条日志都被送达",
+        "固定大小的内存队列（bounded queue）+ 本地 spool 到磁盘 + 当 spool 也满时按策略丢弃最旧的日志",
+        "禁用缓冲，每条日志同步等待后端确认，超时则丢弃",
+        "扩容 agent 机器内存到 256 GB，给队列足够大的缓冲空间"
+      ],
+      "answer": 1,
+      "explain": "正确的 backpressure 设计：内存有界队列防止无限积压 OOM；后端慢时溢出到本地磁盘 spool（磁盘比内存便宜，容量大）；spool 满时按策略丢弃（优先丢旧日志，保留最新告警）。无限队列会在后端持续慢时导致 OOM；纯同步丢弃会让正常日志也丢失；扩容内存治标不治本且成本高。这是日志 agent 的经典 backpressure 三层设计。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某 LLM 推理 gateway 使用 epoll 处理 streaming token 输出，并发 SSE 连接超过 2 万时，epoll_wait 每轮返回事件数不多，但 event loop 处理耗时从 2ms 增长到 40ms。以下哪个诊断方向最优先？",
+      "options": [
+        "epoll 本身在超过 2 万 fd 时性能下降，应该换为 io_uring",
+        "event loop 单线程内存在耗时操作（如 token decode、日志格式化、同步 flush），阻塞了其他连接的事件处理",
+        "socket buffer 太大，导致 epoll_wait 每次返回事件需要等待更多数据",
+        "2 万连接的 fd table 占用过多内存，导致 epoll 事件分发变慢"
+      ],
+      "answer": 1,
+      "explain": "epoll 本身的 O(1) 事件通知性能在 2 万 fd 下不会显著退化。event loop 耗时从 2ms 涨到 40ms 的典型原因是：loop 单线程内混入了 CPU 重活（token decode、正则处理、同步 JSON 序列化、阻塞 flush 日志等），阻塞了其他连接的事件轮询。修复方向：把 CPU 密集操作移到 worker thread pool，event loop 只做 IO 分发和轻量路由；排查是否有同步日志或阻塞调用混在 loop 里。"
+    }
+  ]
+}

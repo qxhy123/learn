@@ -1,0 +1,143 @@
+[
+  {
+    "id": "u1c22",
+    "title": "NIC Offload、队列与服务网络 IO",
+    "subtitle": "从 TSO/GRO 到 RSS 热点：掌控 NIC 到 CPU 的并行结构",
+    "intro": [
+      {
+        "title": "为什么 CPU 照看包会成为瓶颈",
+        "body": "100G/200G/400G 网卡每秒可以产生数百万甚至数千万个包。如果每个包都要 CPU 做分段、校验、中断、队列选择，服务 CPU 会大量消耗在\"照看包\"而非业务上。NIC offload 的本质就是把**可机械执行、重复度高、每包成本高**的工作下推给网卡或驱动层，从而让 CPU 聚焦业务逻辑。",
+        "tip": "offload 不改变 TCP 的可靠性语义，也不让链路 MTU 失效；它只是改变了\"谁来做这件事\"。"
+      },
+      {
+        "title": "发送侧 Offload：TSO 与 GSO",
+        "body": "**TSO（TCP Segmentation Offload）**：内核把大 skb 交给 NIC，由 NIC 按 MSS 切成线速帧，CPU 无需逐段准备头和 checksum。**GSO（Generic Segmentation Offload）**：TSO 的软件版本，在 TSO 不可用时由内核统一分段。两者的共同收益是减少 CPU 的分段开销；代价是打开 TSO 后本机抓包看到的是大 skb，而非真实链路帧。\n\n验证命令：`ethtool -k <iface> | grep tcp-segmentation`",
+        "reveal": {
+          "q": "TSO 打开后，在发送端用 tcpdump 看到一个 65KB 的 TCP segment，这说明链路上真的发出了一个超 MTU 的帧吗？",
+          "a": "不是。tcpdump 抓到的是 NIC 填充和切段之前的 skb；真实链路上 NIC 会把它按 MSS 切成多个合法帧。"
+        }
+      },
+      {
+        "title": "接收侧 Offload：GRO 与 LRO",
+        "body": "**GRO（Generic Receive Offload）**：把同一流的多个连续小包合并成一个大 skb，再交给协议栈上层，降低每包协议处理和内存分配成本。**LRO（Large Receive Offload）**：更激进的硬件/驱动层合并，不适合转发、路由、虚拟化等会改变包头的场景。\n\n对 token streaming 推理网关：GRO 在接收大响应时有收益，但**不能替代应用层的 write/flush 策略**，合并会让接收侧观测粒度变粗。",
+        "tip": "关闭 GRO 后 CPU 升高但 P99 改善，需要权衡服务目标，不要盲目认为 offload 一定更快。"
+      },
+      {
+        "title": "Checksum Offload 与抓包误判",
+        "body": "发送端抓包常见 `bad checksum` 告警，这**几乎总是**因为 tcpdump 抓到的是 NIC 填 checksum 之前的 skb。判断线上 checksum 错误要看：\n\n- 对端抓包\n- 交换机 counter\n- `ethtool -S <iface> | grep -E 'csum|err|crc'`\n\n不要只看发送端抓包就断定有校验错误。"
+      },
+      {
+        "title": "Multi-Queue 与 RSS：多流如何利用多核",
+        "body": "现代 NIC 把收发路径拆成多组 RX/TX queue。**RSS（Receive Side Scaling）** 根据五元组 hash 把流量分到不同 RX queue，每个 queue 通常对应一个 MSI-X interrupt vector，再绑定到某个 CPU 做 NAPI poll。\n\n关键限制：\n- **单个 TCP 流**通常仍落在一个 RX queue，RSS 不能自动把单流分到多核\n- 五元组熵不足（如 NAT 后源端口相同）→ 多连接集中到少数 queue → 某个 CPU `NET_RX` 单核热点\n\n验证：`ethtool -S <iface> | grep rx_queue`",
+        "reveal": {
+          "q": "总 CPU 只有 35%，但 P99 偶发 300ms，最可能的网络层原因是什么？",
+          "a": "RSS 热点：某个 RX queue 被大量连接打满，对应 IRQ CPU 和 softirq 成为瓶颈；平均 CPU 不能反映单核热点。"
+        }
+      },
+      {
+        "title": "RPS、RFS、XPS：软件层的队列补充",
+        "body": "- **RPS**：在软件层把接收处理分发到其他 CPU，弥补硬件 RSS queue 不足\n- **RFS**：把包送到消费该 socket 的 CPU，提高 cache locality\n- **XPS**：发送侧控制由哪个 TX queue 发包，与发送线程 CPU/NUMA 对齐\n\n这些机制能解决分布问题，但也可能增加跨核 IPI 和 cache 迁移。**启用前要知道应用 worker 在哪些 CPU、NIC 属于哪个 NUMA node。**",
+        "tip": "对双 socket 机器，把 NIC0 的 IRQ 打到远端 socket，每个包都多跨一次 UPI/QPI。"
+      },
+      {
+        "title": "IRQ Affinity、NAPI 与 Softirq",
+        "body": "低流量时中断让包尽快被处理；高流量时每包中断会压垮 CPU，NAPI 切换到 poll 模式，poll 工作在 softirq 上下文执行。\n\n**观测命令：**\n- `cat /proc/softirqs | grep NET_RX` — `NET_RX` 单核高是接收热点的核心信号\n- `cat /proc/interrupts | grep mlx` — 查看 MSI-X vector 到 CPU 的分布\n- `mpstat -P ALL 1` — 查看 per-CPU 使用率\n\nIRQ affinity 的目标不是均匀撒到所有 CPU，而是让**网络处理、应用 worker、NUMA 内存和 NIC PCIe locality 尽量一致**。",
+        "reveal": {
+          "q": "什么情况下可以允许 IRQ CPU 和 event loop worker 在同一核？",
+          "a": "通常不推荐，IRQ 和 worker 争核会加剧应用调度延迟；低延迟服务往往把 IRQ 放在独立 CPU。但高吞吐服务可能允许两者在同核以减少 cache miss，需结合实测 P99 决定。"
+        }
+      },
+      {
+        "title": "Ring Buffer、Drop 与服务 IO 设计",
+        "body": "NIC driver 通过 RX/TX ring 与硬件交换 descriptor。RX ring 太小会在突发流量下丢包；太大可能增加排队延迟。\n\n验证：`ethtool -g <iface>`，查看 `rx.*drop|rx.*miss` counter。\n\n**推理网关 P99 设计要点：**\n\n| 现象 | 网络层原因 | 应对 |\n|---|---|---|\n| P99 尖刺 | 单 IRQ CPU softirq 热 | IRQ 移到独立 CPU |\n| 长连接分布不均 | RSS hash 熵不足 | 调 indirection table 或 SO_REUSEPORT |\n| send-q 持续升高 | 慢客户端/下游拥塞 | pending bytes 上限 |\n| CPU 总体不高但延迟高 | 单 queue 热点 | 看 per-CPU 而非平均 |",
+        "tip": "Queue 调优顺序：证明热点 → 解释热点 → 移动热点 → 复测尾延迟，每次只改一个变量。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "TSO（TCP Segmentation Offload）打开后，发送端 tcpdump 看到的包大小超过 MTU，这表明什么？",
+        "options": [
+          "链路上真的发出了超 MTU 的帧",
+          "tcpdump 抓到的是 NIC 切段之前的 skb，并非真实链路帧",
+          "对端会因 MTU 不一致而丢包",
+          "TSO 把 MTU 自动提高了"
+        ],
+        "answer": 1,
+        "explain": "TSO 让 NIC 负责按 MSS 切段；tcpdump 在驱动层之前抓包，因此看到大 skb，但真实链路帧仍符合 MTU。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于 GRO 和 LRO 的描述，哪项正确？",
+        "options": [
+          "GRO 在发送侧合并小包，LRO 在接收侧合并小包",
+          "GRO 和 LRO 都在接收侧合并包，但 LRO 更激进，不适合转发/路由场景",
+          "开启 GRO 后接收侧每包 CPU 成本上升",
+          "LRO 是 GRO 的软件实现，功能完全相同"
+        ],
+        "answer": 1,
+        "explain": "GRO 是接收侧软件合并（内核），LRO 是更激进的驱动/硬件合并；LRO 可能破坏转发语义，不适合路由/虚拟化场景。"
+      },
+      {
+        "type": "judge",
+        "prompt": "RSS 可以把单个 TCP 长连接的流量自动分散到多个 RX queue，充分利用多核。",
+        "answer": false,
+        "explain": "RSS 基于五元组 hash，同一五元组的包哈希到同一 RX queue；单个 TCP 连接通常仍落在一个 queue，无法自动多核并行。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理网关 P99 从 30ms 偶发升至 300ms，总 CPU 35%，带宽未打满。以下哪个观测命令最能定位问题？",
+        "options": [
+          "`free -h` 查看内存",
+          "`cat /proc/softirqs | grep NET_RX` + `ethtool -S <iface> | grep rx_queue`",
+          "`iotop` 查看磁盘 IO",
+          "`ping` 测量平均 RTT"
+        ],
+        "answer": 1,
+        "explain": "P99 尖刺配合总 CPU 不高，典型是单 RX queue 或单 IRQ CPU 的 NET_RX softirq 热点；per-CPU softirqs 和 per-queue counter 是最直接证据。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 NIC offload 能力与其主要节省对象配对：",
+        "left": ["TSO", "GRO", "RSS", "Checksum offload"],
+        "right": [
+          "接收侧降低每包协议处理成本",
+          "发送侧减少 CPU 按 MSS 切段开销",
+          "IP/TCP/UDP 校验和计算交给网卡",
+          "多流并行利用多个 RX queue"
+        ],
+        "explain": "TSO 节省发送侧分段；GRO 节省接收侧每包处理；RSS 让多流并行；Checksum offload 节省校验和计算。"
+      },
+      {
+        "type": "input",
+        "prompt": "用 `ethtool` 查看某个网卡接口 offload 状态的命令标志是什么（填写标志字母）？",
+        "accept": ["-k"],
+        "explain": "`ethtool -k <iface>` 列出接口所有 offload 能力的当前状态，是排查 TSO/GSO/GRO/checksum 变更的起点。"
+      },
+      {
+        "type": "judge",
+        "prompt": "发送端 tcpdump 显示 `bad checksum`，说明线路上确实发生了 checksum 错误，需要立即排查链路问题。",
+        "answer": false,
+        "explain": "发送端 checksum offload 打开时，tcpdump 在 NIC 填充 checksum 之前抓包，因此看到 bad checksum 是正常的；判断真实错误应看对端抓包和 NIC error counter。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项描述 IRQ affinity 调优目标最准确？",
+        "options": [
+          "把中断均匀分配到所有 CPU，避免任何一个 CPU 过热",
+          "让 NIC IRQ、softirq、应用 worker 和 NUMA 内存尽量在同一 locality",
+          "把所有 IRQ 绑定到 CPU 0，集中处理",
+          "让 IRQ 固定在远端 NUMA socket，避免和应用争核"
+        ],
+        "answer": 1,
+        "explain": "IRQ affinity 的目标是让网络处理与应用 worker、NUMA 内存、NIC PCIe locality 保持一致，减少跨 NUMA 和 cache 迁移开销。"
+      },
+      {
+        "type": "judge",
+        "prompt": "增大 RX ring buffer 一定能降低 P99 延迟。",
+        "answer": false,
+        "explain": "增大 RX ring 可以吸收突发减少 drop，但同时会增加排队延迟；drop 降低而 P99 反而升高是常见权衡，需结合服务目标测试。"
+      }
+    ]
+  }
+]

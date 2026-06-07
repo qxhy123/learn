@@ -1,0 +1,144 @@
+[
+  {
+    "id": "u1c27",
+    "title": "NCCL Collective 与网络诊断",
+    "subtitle": "从 ring/tree 算法到 socket fallback：端到端读懂 NCCL 日志",
+    "intro": [
+      {
+        "title": "NCCL 要解决的不只是点对点传输",
+        "body": "NCCL 要解决的核心问题是：**一组 GPU 分布在不同 PCIe/NVLink/NIC/交换机路径上，训练语义要求它们像同步机器一样前进。** NCCL 负责把 tensor 切片、选择算法、选择 transport、安排 channel，并在任意 rank 变慢时暴露足够证据。\n\nNCCL 慢的原因可以来自：算法选择、消息大小、rank 没进 collective、GPU kernel 阻塞、P2P 被禁、GDRDMA fallback、HCA 选错、GID 错、MTU 不一致、PFC pause、ECMP 不均、容器权限、驱动/CUDA/NCCL 版本组合。**NCCL 日志只是入口，不是结论。**",
+        "tip": "NCCL 排障的第一问：实际 transport 是什么？`grep -E 'NET/Socket|NET/IB|GDR|P2P|SHM' nccl.log` — 如果期望 RDMA 却看到 NET/Socket，先查容器权限和 HCA 可见性，不要急着调 NCCL 算法。"
+      },
+      {
+        "title": "Collective 语义：AllReduce 只是其中一种",
+        "body": "| Collective | 输入输出语义 | 常见训练位置 | 性能敏感点 |\n|---|---|---|---|\n| AllReduce | 所有 rank 输入，所有 rank 得到 reduce 结果 | DDP 梯度同步 | 带宽、慢 rank |\n| ReduceScatter | reduce 后每个 rank 得到一片 | FSDP/ZeRO 梯度分片 | 分片布局、bucket 粒度 |\n| AllGather | 每个 rank 的分片收集成全量 | FSDP 参数重建、TP | 峰值显存、带宽 |\n| Broadcast | root 发给所有 rank | 初始化、权重同步 | root 路径、树形 fanout |\n| AllToAll | 每个 rank 给每个 rank 不同数据 | MoE expert dispatch | 小消息、ECMP、incast |\n\nFSDP/ZeRO 把参数和梯度分片后，通信模式从\"每步一个大 AllReduce\"变成多次 bucket 化的 ReduceScatter/AllGather；MoE 的 AllToAll 对网络队列和 ECMP 更敏感。"
+      },
+      {
+        "title": "算法与 Transport：ring/tree 和 NET/IB/Socket",
+        "body": "**算法选择：**\n- **Ring**：reduce-scatter + all-gather，大消息带宽效率高，延迟随 rank 数增长\n- **Tree**：小消息延迟更低，树根路径压力可能更高\n- **CollNet/Hierarchical**：节点内先规约再跨节点，利用 NVLink/NVSwitch\n- **NVLS**：配合 NVLink Switch，H100 等 GPU 代际专属\n\n**Transport：**\n- `P2P`：GPU-GPU 直接路径（NVLink 或 PCIe P2P），节点内主路径\n- `SHM`：host shared memory，节点内 fallback\n- `NET/Socket`：TCP socket，跨节点低速路径或 fallback\n- `NET/IB`：verbs over InfiniBand/RoCE，跨节点训练主路径，配合 GPUDirect RDMA\n\n**不要手工固定算法当长期默认。** 正确做法：先记录 NCCL 自动选择，用 `nccl-tests` 按消息大小画曲线，只在明确复现退化时做最小约束，且约束绑定版本和机型。",
+        "reveal": {
+          "q": "训练改了 FSDP bucket 大小后 NCCL 性能变化，最可能的原因是什么？",
+          "a": "bucket 大小改变了单次 collective 的消息大小，NCCL 可能选择不同的 algorithm/protocol（例如从 LL 切到 Simple），进而影响算法效率和通信带宽特性。"
+        }
+      },
+      {
+        "title": "NCCL 日志分阶段读法",
+        "body": "开启详细日志：`NCCL_DEBUG=INFO`、`NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,COLL`、`NCCL_TOPO_DUMP_FILE=/tmp/nccl-topo.xml`\n\n**四个阶段：**\n1. **Bootstrap**：control plane，rank 互相发现，通常走 TCP socket；看 interface、rank/world size、防火墙、容器网络\n2. **Graph/Topology**：GPU/NIC/CPU 距离、ring/tree 构造、channel 数；topo dump 对排查很有价值\n3. **NET**：`NET/Socket` 还是 `NET/IB`，HCA、port、GID、GDRDMA 状态、网卡插件\n4. **COLL**：具体 collective、算法、protocol、消息大小；结合框架 profiler 看 bucket 切分\n\n快速过滤：`grep -E 'Bootstrap|NET/|GDR|Channel|Ring|Tree|WARN|ERROR|socket|mlx5|GID' nccl-*.log`"
+      },
+      {
+        "title": "nccl-tests：怎么跑才有意义",
+        "body": "只跑单节点最大带宽不足以证明集群健康。**有意义的 nccl-tests 矩阵：**\n\n- **单节点**：验证 P2P/NVLink/NVSwitch/SHM 基线\n- **两节点**：验证 HCA、GID、MTU、GPUDirect RDMA、跨节点基本带宽\n- **阶梯规模**（2/4/8/16/32/目标节点）：很多 RoCE/ECMP/PFC 问题只在规模上来后出现\n- **节点矩阵**：发现慢节点、慢 ToR、慢 rail、慢 uplink\n\n**读指标：**\n- `algbw`：collective 语义下的有效数据带宽\n- `busbw`：按算法通信量折算后的总线带宽（更接近链路利用率）\n- `time`：小消息延迟和尾部\n- **方差**：平均值好但方差大仍危险\n\n**不同 collective 的 busbw 不能直接横比。**",
+        "tip": "理论带宽只能给上限。400GbE 单 rail 单向约 50 GB/s；实际还受 collective 算法、协议开销、GPU 数影响。应用同机型历史基线，不用宣传带宽当标准。"
+      },
+      {
+        "title": "常见故障模式与快速定位",
+        "body": "| 现象 | 高概率原因 | 快速证据 |\n|---|---|---|\n| 带宽只有预期 10-20% | socket fallback | `NET/Socket` 日志、容器无 RDMA device |\n| 单节点正常，两节点慢 | HCA/GID/MTU/GPUDirect | `NET/IB` 日志、GID、PMTU、topo |\n| 小规模正常，大规模慢 | ECMP/PFC/ECN/incast | 交换机 counter、阶梯测试 |\n| 某些节点组合慢 | 坏链路/坏 NIC/拓扑 | 节点矩阵、端口 error |\n| timeout 指向某 rank | rank stall 或路径故障 | rank enter time + fabric counter |\n| 训练慢但 nccl-tests 正常 | bucket/overlap/data stall | profiler、per-rank timeline |\n| 升级后变慢 | 版本/插件/变量变化 | 版本矩阵、日志 diff |",
+        "reveal": {
+          "q": "NCCL timeout 总指向同一个 rank，但该节点的 nccl-tests 两节点测试正常，最可能的原因是什么？",
+          "a": "rank stall：该 rank 在训练步中比其他 rank 晚进入 collective（可能被 checkpoint 压缩、dataloader、GC 等阻塞），其他 rank 被动等待直到 timeout；通过在 all_reduce 前后打印 per-rank enter time 可以确认。"
+        }
+      },
+      {
+        "title": "环境变量：诊断工具而非魔法咒语",
+        "body": "| 变量 | 主要用途 | 常见误用 |\n|---|---|---|\n| `NCCL_DEBUG` | 打开日志 | 长期开 INFO，日志过大 |\n| `NCCL_DEBUG_SUBSYS` | 限定 INIT/NET/GRAPH 等 | 只开 WARN，错过初始化证据 |\n| `NCCL_TOPO_DUMP_FILE` | 输出拓扑 | 只保存一台机器，缺全局对比 |\n| `NCCL_IB_HCA` | 约束 RDMA HCA | 拓扑变化后选错 NIC |\n| `NCCL_IB_GID_INDEX` | 选择 RoCE GID | GID index 跨节点不一致 |\n| `NCCL_IB_DISABLE` | 验证 socket fallback | 忘记恢复，长期走 TCP |\n| `NCCL_P2P_DISABLE` | 验证节点内 P2P 问题 | 生产默认禁用致节点内退化 |\n\n**推荐使用方式：** 不加约束记录 baseline → 一次只改一个变量验证假设 → 只固化已证明有收益的变量，约束绑定版本和机型。"
+      },
+      {
+        "title": "NCCL 验收 SOP 与 hard gate",
+        "body": "**验收顺序：**\n1. 收集硬件/软件版本矩阵（driver、CUDA、NCCL、OFED、kernel、镜像）\n2. 验证基础：`nvidia-smi topo -m`、`ibv_devinfo`、`show_gids`、MTU、容器设备\n3. 单节点 `nccl-tests`（AllReduce/AllGather/ReduceScatter）\n4. 两节点验证 `NET/IB`、GDRDMA、HCA/GID\n5. 阶梯规模 2/4/8/16/目标节点\n6. 节点矩阵定位慢节点/慢 ToR\n7. 同步采集主机和交换机 counter\n\n**Hard gate（直接阻止入池）：**\n- 期望 RDMA 却出现 `NET/Socket`\n- MTU 在主机/bond/VLAN/容器/交换机之间不一致\n- `nccl-tests` 出现 timeout、unhandled system error、WC retry exceeded\n- 交换机端口有持续 drop/discard/CRC/symbol error\n- NCCL/CUDA/driver/OFED 版本不在兼容矩阵",
+        "tip": "NCCL 调优顺序：先看 transport 是什么 → 看 topo 和 fabric → 看 per-rank 时间线 → 最后才用环境变量实验。一看到慢就复制网上的 NCCL_* 参数会掩盖真实问题。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "NCCL 日志显示 `NET/Socket` 而非 `NET/IB`，且集群 RDMA 宿主机正常，排查优先级最高的方向是？",
+        "options": [
+          "检查并调整 NCCL_ALGO 算法参数",
+          "增加 GPU 显存",
+          "检查容器内 /dev/infiniband 是否存在、libibverbs 是否可用",
+          "检查 NCCL 版本是否最新"
+        ],
+        "answer": 2,
+        "explain": "NET/Socket 说明 NCCL 找不到 RDMA device；宿主机正常但容器异常，最常见原因是 /dev/infiniband 未注入容器，或 verbs library 不可见。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 NCCL transport 与其路径配对：",
+        "left": ["NET/IB", "NET/Socket", "P2P", "SHM"],
+        "right": [
+          "节点内 GPU 间直接路径，可经 NVLink 或 PCIe",
+          "verbs over InfiniBand/RoCE，跨节点训练主路径",
+          "host shared memory，节点内 fallback",
+          "TCP socket，无 RDMA 或 fallback"
+        ],
+        "explain": "NET/IB 是跨节点 RDMA 主路径，NET/Socket 是 TCP fallback，P2P 是节点内 GPU 直连，SHM 是节点内共享内存。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`busbw` 和 `algbw` 的数值越接近，说明 AllReduce 的带宽利用率越高。",
+        "answer": false,
+        "explain": "`busbw` 是按算法通信量折算的总线带宽，`algbw` 是 collective 语义的有效带宽；两者的比值取决于 collective 类型和算法，不同 collective 的数值不能直接横比，也不代表接近就好。"
+      },
+      {
+        "type": "choice",
+        "prompt": "MoE（Mixture of Experts）训练中，AllToAll 比普通 AllReduce 更容易触发 ECMP 和队列问题，主要原因是？",
+        "options": [
+          "AllToAll 消息更大",
+          "AllToAll 是 N 对 N 通信，产生大量小消息和 incast，对 ECMP hash 和队列缓冲更敏感",
+          "AllToAll 不支持 GPUDirect RDMA",
+          "AllToAll 只在 CPU 上执行"
+        ],
+        "answer": 1,
+        "explain": "AllToAll 是每个 rank 给其他所有 rank 发送不同数据，产生 N^2 个消息流，消息通常较小；大量小流会暴露 ECMP 路径不均和队列 incast 问题，比单一大流 AllReduce 对 fabric 更敏感。"
+      },
+      {
+        "type": "choice",
+        "prompt": "64 节点训练偶发 timeout，32 节点正常；NCCL 日志确认 NET/IB 和 GPUDirect 启用；`ethtool -S` 显示 RDMA priority PFC pause 增长，ECN mark 很少。最可能的原因是？",
+        "options": [
+          "nvidia_peermem 未加载",
+          "GID index 跨节点不一致",
+          "ECN 阈值高于 PFC 触发阈值，拥塞控制闭环太晚，规模扩大后 pause storm",
+          "NCCL_ALGO 选择了不合适的算法"
+        ],
+        "answer": 2,
+        "explain": "NET/IB 和 GPUDirect 正常排除了 verbs/peermem 问题；规模扩大才出现、PFC 频繁而 ECN 少，典型是 ECN 阈值配置过高，拥塞控制依赖 PFC 而非 ECN/DCQCN，规模增大后 incast 引发 pause storm 扩散。"
+      },
+      {
+        "type": "judge",
+        "prompt": "单节点 `nccl-tests all_reduce_perf` 达到 NVLink 理论带宽，说明跨节点训练的 RDMA 路径也一定正常。",
+        "answer": false,
+        "explain": "单节点 nccl-tests 测的是节点内 P2P/NVLink/NVSwitch 路径；跨节点 RDMA 路径（NET/IB、GPUDirect RDMA、MTU、GID、PFC/ECN）需要独立的两节点和多节点测试验证。"
+      },
+      {
+        "type": "input",
+        "prompt": "在两节点 nccl-tests 中，用于观察 NCCL 选择的 transport、HCA 和 GPUDirect RDMA 状态的核心环境变量名是什么（填写变量名）？",
+        "accept": ["NCCL_DEBUG"],
+        "explain": "`NCCL_DEBUG=INFO` 开启详细日志，配合 `NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH` 可以看到 transport 选择（NET/IB vs NET/Socket）、HCA/GID 信息和 GPUDirect RDMA 启用状态。"
+      },
+      {
+        "type": "choice",
+        "prompt": "NCCL timeout 持续指向 rank 37，两节点 nccl-tests 正常，其他 rank 正常，rank 37 所在节点 checkpoint 压缩同时 CPU 飙高。最可能的原因是什么？",
+        "options": [
+          "rank 37 所在 NIC 有物理故障",
+          "rank 37 的 GID index 配置错误",
+          "rank 37 因 checkpoint 压缩导致比其他 rank 晚进入 collective，其他 rank 等待超时",
+          "rank 37 的 PFC pause 过多"
+        ],
+        "answer": 2,
+        "explain": "这是典型的 rank stall：rank 37 被 CPU 密集的 checkpoint 压缩阻塞，晚于其他 rank 进入 collective，其他 rank 等待直到 NCCL timeout；网络层（nccl-tests）正常，问题在应用/系统侧。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项是 NCCL 上线验收的 hard gate（应直接阻止入池）？",
+        "options": [
+          "busbw 比历史基线低 5%",
+          "PFC pause counter 接近阈值",
+          "`nccl-tests` 期望 RDMA 却出现 NET/Socket",
+          "ECMP uplink 利用率轻微不均"
+        ],
+        "answer": 2,
+        "explain": "期望 RDMA 却走 socket fallback 意味着跨节点训练带宽只有正常的 10-20%，直接影响训练可行性，是 hard gate；其他选项属于 soft gate，需要人工复核但不必立即阻止。"
+      }
+    ]
+  }
+]

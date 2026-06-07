@@ -1,0 +1,133 @@
+[
+  {
+    "id": "u9c2",
+    "title": "Agent 与推理时计算",
+    "subtitle": "从 session 并发模型到预算管控，理解 inference-time compute 的工程治理",
+    "intro": [
+      {
+        "title": "为什么 Agent 打破了传统推理假设",
+        "body": "传统在线推理的基础抽象是 **request**：有输入 token、输出 token、prefill、decode、结束，容量估算近似为 `QPS × latency`。\n\nBut Agent 任务的真实单位更接近 **session**：用户提出一个目标，系统先规划，再调用检索 / 工具 / 代码执行，拿到观察结果后继续推理，必要时生成多个候选、做验证、重试、压缩上下文，最后才给出答案。\n\n这个过程可能只用 2 次模型调用，也可能走到 8 步、20 次工具请求、几十秒 wall-clock 时间。基础设施的难点不是「模型能不能调用工具」，而是**每一步都可能占用 GPU、KV Cache、工具池、网络连接、credential、trace 存储和租户预算**。\n\n| 被打破的假设 | 传统推理的近似 | Agent 下的新现实 |\n|---|---|---|\n| 会话持续时间 | 请求在一次生成内结束 | 任务持续数十秒到数分钟，多次挂起恢复 |\n| token 消耗可预测性 | 由 `max_tokens` 控制 | 隐式推理、候选采样、验证会让 token 与 GPU 时间同时波动 |\n| 并发模型 | 主要看 QPS、batch size | 取决于并发 session、每个 session 的模型调用次数和工具等待时间 |",
+        "tip": "把 Agent 理解为「带预算、带工具、带回退条件的多步计算过程」，而不是一次长请求。"
+      },
+      {
+        "title": "从 QPS 到 Session：新的并发模型",
+        "body": "传统推理系统把压力近似成：\n\n`QPS × request latency`\n\nAgent 更接近：\n\n`concurrent sessions × session duration × model calls per session`\n\n容量规划的关键拆法：\n\n- `active_gpu_work = concurrent_sessions × avg_model_calls × avg_gpu_seconds_per_call / avg_session_wall_time`\n- `tool_pool_concurrency = concurrent_sessions × avg_tool_calls × avg_tool_wall_time / avg_session_wall_time`\n\n这个公式故意把 **GPU 工作和工具工作拆开**。工具等待期间 GPU 不应被 session 独占；但 state、预算、trace 和权限 token 仍然存在。因此 runtime 必须支持挂起和恢复。\n\n**工程边界**：`session 并发 ≠ GPU 并发`。一个 10,000 并发 session 的系统，如果每个 session 平均只有 15% 时间在模型 decode，其 GPU 活跃并发可能远低于 10,000；但 metadata store、trace pipeline、tool worker 和 KV / prefix cache 的压力可能先到瓶颈。",
+        "tip": "容量规划时，GPU 工作、工具工作、session 元数据三类压力要分开估算。"
+      },
+      {
+        "title": "推理时计算的 4 种工程模式",
+        "body": "`inference-time compute` 的通用定义是：**任何在推理阶段为了提高任务成功率而主动消耗额外计算的技术**。`thinking tokens` 只是其中一种表现形式。工程上可归为 4 种模式：\n\n| 模式 | 典型技术 | 主要成本 | 预算控制 |\n|---|---|---|---|\n| 隐式推理预算 | Chain-of-Thought、thinking tokens | reasoning tokens、decode 时间 | `max_reasoning_tokens`，接近阈值触发 finalizer |\n| 多候选与搜索 | Best-of-N、self-consistency、tree search | 候选数 ≈ N 倍，树搜索随深度膨胀 | `max_candidates`、`max_branch_depth`、早停 |\n| 验证与反思 | verifier-guided generation、critic、rerank | verifier 调用、测试执行、失败重试 | `max_verify_rounds`、独立 verifier 队列 |\n| 工具增强执行 | Retrieval、browser、code interpreter | tool wall time、回注 token、权限成本 | `max_tool_calls`、`max_tool_wall_time`、白名单 |\n\n4 种模式可以组合，但组合越多，**成本乘法越明显**。例如 Best-of-N=4 加上 2 轮 verifier，总调用次数可达 8 次以上。",
+        "tip": "先理解「这次任务用了哪种推理时计算模式」，再决定预算怎么设。"
+      },
+      {
+        "title": "预算 envelope：控制面强制执行",
+        "body": "Agent 成本模型不能只看平均 token，控制面需要生成**预算 envelope**，每一步扣减：\n\n`classify → quote → reserve → execute → settle → decide → degrade`\n\n关键预算字段及执行位置：\n\n| 预算字段 | 执行位置 | 超预算降级策略 |\n|---|---|---|\n| `max_reasoning_tokens` | 模型网关 / decoder | 截断隐式推理，要求基于当前状态给出最短可用答案 |\n| `max_output_tokens` | 模型网关 | 改用摘要式输出，附上「不完整」状态 |\n| `per_step_gpu_second_budget` | scheduler | 停止扩展新分支，切小模型 summarizer |\n| `max_model_calls_per_session` | agent runtime | 跳过下一轮反思，直接 final answer 或人工接管 |\n| `max_tool_wall_time` | tool runner | 返回工具不可用的可解释失败，禁止无限重试 |\n| `max_context_tokens` | agent runtime / gateway | 触发 summarization 或丢弃低价值观察 |\n| `tenant_budget_remaining` | billing / quota 服务 | 降级到低预算策略，拒绝非关键工具调用 |\n\n**工程边界**：预算系统不能依赖模型「自觉遵守」。prompt 可以提示模型节省步骤，但真正的上限必须由 gateway、scheduler、tool runner 和 quota 服务**强制执行**。",
+        "tip": "预算 envelope 是控制面能力，不是 prompt 能力。"
+      },
+      {
+        "title": "Agent Runtime 与推理服务的分工",
+        "body": "Agent session 不是 vLLM / TRT-LLM / SGLang 里的一个超长请求，而是：\n\n`agent session → model call 1: plan → tool call / retrieval → model call 2: observe + continue → verifier call → model call 3: final answer`\n\n清晰的边界：\n\n| 组件 | 负责范围 |\n|---|---|\n| Agent runtime | 任务拆分、工具执行、状态管理、预算扣减、安全边界、step trace |\n| 推理服务（vLLM 等） | 单次模型调用的 batching、prefill、decode、KV block、prefix cache |\n| quota / billing | 预算管理 |\n| tool runner | 外部动作（沙箱执行、权限、幂等 retry） |\n\n为什么长 session 不应直接映射为超长请求：把整个 session 塞进一个超长请求会破坏调度效率，工具等待期间 GPU 无法高效复用。更合理的映射是多次短模型调用，中间由 runtime 挂起、恢复、压缩、回注观察结果，并把可复用前缀交给推理服务命中 prefix cache。",
+        "tip": "runtime 管流程和状态，serving engine 管模型执行，不要混用。"
+      },
+      {
+        "title": "工具调用的信任边界必须先于优化",
+        "body": "很多团队做 Agent 时，先补预算、trace 和 retry，却把真正危险的边界留到最后。这个顺序是反的。\n\n对工具调用型 Agent，最低限度控制必须包含：\n\n| 控制项 | 失效后会怎样 |\n|---|---|\n| 工具白名单 | 模型可能调用高风险或无关工具 |\n| 隔离执行环境（沙箱） | 单次任务故障会污染宿主或其他会话 |\n| Scoped credentials | 工具泄露会扩大成租户级事故 |\n| Egress 限制 | 过度联网或读写会绕过业务边界 |\n| Approval gate | 模型可能在无确认下执行破坏性操作 |\n\n工具沙箱常见方案（隔离强度从低到高）：`subprocess（无隔离）< Docker container < gVisor < Firecracker microVM`\n\n**只读工具和写工具必须分级**。所有有副作用的工具都应该具备审批、幂等 key、回滚方案和审计事件。",
+        "tip": "先定义 trust boundary，再谈推理优化。顺序反了会让系统不可运营。"
+      },
+      {
+        "title": "什么时候 inference-time compute 真值得",
+        "body": "不是所有任务都值得把更多算力放在推理时：\n\n| 任务类型 | 更可能值得 | 原因 |\n|---|---|---|\n| 数学、代码、规划 | 是 | 额外搜索和验证能显著提升成功率 |\n| 实时问答 / 检索增强 | 视情况 | tool use 通常有收益，但步数不宜太多 |\n| 低价值、高 QPS 文本生成 | 否 | 成本放大快于质量收益 |\n| 强 SLA 在线客服 | 通常谨慎 | 多步链路容易放大尾延迟 |\n\n**实用判断**：如果多花 2–3 倍推理成本，不能带来明显更高成功率或更少人工返工，就不值得。\n\nAgent 成本应拆成三部分：**模型 cost + 工具 cost + 人工接管 cost**，才能真正做经营决策。",
+        "reveal": {
+          "q": "Best-of-N 从 1 提高到 8，成功率从 62% 提到 78%，但 P95 延迟从 3s 变成 11s，你会对所有租户开启吗？",
+          "a": "不会无差别开启。成功率提升 16pp 有价值，但 P95 延迟从 3s 到 11s 对强 SLA 场景无法接受。更合理的做法是：对高价值任务（数学/代码）的特定租户开启，同时设置独立队列防止 P95 影响其他短请求；对高 QPS 低价值任务继续用 N=1，配合两段式回答（先快速草答）。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Agent 容量规划时，下面哪个公式比传统 `QPS × request latency` 更准确描述 GPU 活跃并发？",
+        "options": [
+          "concurrent_sessions × avg_session_wall_time",
+          "concurrent_sessions × avg_model_calls × avg_gpu_seconds_per_call / avg_session_wall_time",
+          "total_token_budget / max_reasoning_tokens",
+          "QPS × session_duration × tool_count"
+        ],
+        "answer": 1,
+        "explain": "Agent 的 GPU 工作需要把 session 并发、每个 session 的模型调用次数和每次调用的 GPU 时间都考虑在内，再除以 session 总时长（因为 session 大部分时间在等工具，不占 GPU）。工具池并发则单独用另一个公式估算。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Agent 的预算控制（如 `max_reasoning_tokens`、`max_tool_calls`）只需要在 system prompt 里告知模型，模型会自觉遵守。",
+        "answer": false,
+        "explain": "这个说法不正确。Prompt 可以提示模型节省步骤，但模型本身不能强制停止生成或拒绝工具调用。真正的预算上限必须由 gateway、scheduler、tool runner 和 quota 服务强制执行。否则高并发时会把租户预算打成负数或制造虚假拒绝。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理时计算的 4 种工程模式中，哪种模式主要把压力施加到「并发峰值 GPU」而不是「单请求 decode 时间」？",
+        "options": [
+          "隐式推理预算（thinking tokens）",
+          "多候选与搜索（Best-of-N / tree search）",
+          "工具增强执行（tool use / retrieval）",
+          "验证与反思（verifier / critic）"
+        ],
+        "answer": 1,
+        "explain": "多候选与搜索（Best-of-N、tree search）会并行生成多个候选，制造 GPU burst；而 thinking tokens 主要让单请求的 decode 时间变长；tool use 主要增加 wall-clock 等待时间；verifier 则引入额外队列和反压。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Agent 系统的组件与其核心职责匹配",
+        "left": ["Agent runtime", "推理服务（vLLM 等）", "Tool runner", "quota / billing 服务"],
+        "right": [
+          "单次模型调用的 batching、prefill、decode、KV Cache",
+          "在沙箱中执行工具，设置超时、权限、网络和文件边界",
+          "任务拆分、工具执行、状态管理、预算扣减、step trace",
+          "每步前 reservation，完成后 settle，失败时释放未用额度"
+        ],
+        "explain": "Agent runtime 管流程和状态；推理服务管模型执行；tool runner 管外部动作（沙箱/权限/幂等）；quota/billing 管预算会计。四者职责清晰分离是可运营 agent 系统的基础。"
+      },
+      {
+        "type": "judge",
+        "prompt": "工具调用型 Agent 应该先做好预算控制和 trace，再考虑 trust boundary（工具白名单、沙箱、scoped credentials）。",
+        "answer": false,
+        "explain": "顺序正好相反。trust boundary（白名单、沙箱、scoped credentials、egress 限制、approval gate）必须先于优化存在。一个预算控制完美但权限全开的 agent，仍然不可运营——模型可能调用高风险工具、执行破坏性操作或泄露 credentials。"
+      },
+      {
+        "type": "choice",
+        "prompt": "代码执行工具沙箱中，为什么超时不能只靠 Python 的 `signal.alarm` 实现？",
+        "options": [
+          "signal.alarm 精度不够，误差超过 100ms",
+          "被执行代码可以捕获或忽略 SIGALRM，从而绕过超时",
+          "signal.alarm 在多线程场景下会自动失效",
+          "Python 3.12 已经删除了 signal.alarm"
+        ],
+        "answer": 1,
+        "explain": "被执行的代码可以调用 `signal.signal(signal.SIGALRM, signal.SIG_IGN)` 来忽略 SIGALRM，从而绕过 Python 内部超时。超时必须由容器外层的 orchestrator 通过发送 SIGTERM → 等待 30s → SIGKILL 的信号链来强制终止，不能依赖被执行代码自己管理超时。"
+      },
+      {
+        "type": "input",
+        "prompt": "Agent 预算耗尽时，推荐的有序降级步骤的第一步是什么？（答案填降级顺序的第一个动作）",
+        "accept": ["停止新增搜索分支", "停止扩展新分支", "停止扩展分支", "stop expanding branches"],
+        "explain": "推荐降级顺序是：停止新增搜索分支 → 降低候选数和 verifier 轮数 → 截断隐式推理 → 压缩上下文或切小模型 → partial result / 人工接管。预算耗尽不应表现为随机断流，而要按有序降级让用户看到可预期的行为。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对于下面哪类任务，引入 inference-time compute（多候选搜索 + verifier）最可能带来明显收益？",
+        "options": [
+          "低价值、高 QPS 文本摘要生成",
+          "强 SLA 要求的在线客服问答（p99 < 1s）",
+          "数学题求解和代码 bug 修复",
+          "简单的文档格式转换"
+        ],
+        "answer": 2,
+        "explain": "数学题和代码修复这类任务有「可验证的正确答案」，额外的搜索（Best-of-N）和验证（unit test 作为 verifier）能显著提升成功率。低价值高 QPS 场景成本放大快于收益，强 SLA 场景多步链路会放大尾延迟。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 Agent trace schema 中，`trace_id` 在同一 session 的所有 step span 中应保持相同。",
+        "answer": true,
+        "explain": "正确。`trace_id` 是整个 session 的唯一标识（UUID），从 root request 传递到所有子步骤，所有 step span 都挂在同一个 root trace 下。这是跨 agent 成本归因和失败定位的基础。`step_id` 才是每个步骤的唯一标识（格式通常为 `{trace_id}_{step_index}`）。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,373 @@
+[
+ {
+  "title": "推理优化工程实践",
+  "subtitle": "把一千步去噪的模型，压进消费级显卡、跑出可接受的延迟",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "前面我们一直在意「生成质量对不对」，这一章换一个视角：**同一个模型，怎样在真实硬件上跑得又快又省显存**。\n\n扩散推理有两个天然的痛点。第一是**步数多**：一次采样要把 U-Net 前向几十次（DDIM 50 步、DPM-Solver 20 步），每一步都是一次完整的网络计算。第二是**显存大**：SD1.5 的 U-Net 约 860M 参数，FP32 权重就要约 6GB，再加上注意力矩阵和激活值，很容易在小卡上 OOM。\n\n本章的优化分三类：**降精度**（FP16/BF16/INT8 把权重和计算变小）、**改算子**（Flash Attention 把注意力从 $O(N^2)$ 显存降到 $O(N)$、torch.compile 把动态图编译成静态图）、**扩散特有的省计算**（CFG 批量合并、步骤缓存 TGATE/TeaCache）。再加上显存层面的 CPU Offload 和 VAE 切片。目标是：理论模型 → 能部署的服务。"
+   },
+   {
+    "title": "降精度：用更少的位表示同一个数",
+    "body": "最便宜的优化是把权重和计算从 32 位浮点换成更窄的格式。一个浮点数由「指数位」（管动态范围）和「尾数位」（管精度）组成，位数越少占的显存越少、算得越快，但精度也越低。\n\n几个关键格式：\n- **FP32**（8 指数 + 23 尾数）：训练基准，显存基准。\n- **BF16**（8 指数 + 7 尾数）：指数范围和 FP32 一样，所以**动态范围大、不易溢出**，但尾数少、精度低。\n- **FP16**（5 指数 + 10 尾数）：精度比 BF16 高，但动态范围小，大梯度容易溢出。\n- **INT8 / INT4 / FP8**：把权重量化成整数或极窄浮点，显存降到 25% 甚至 12.5%。\n\n推理时 BF16 和 FP16 效果接近，显存都减半；INT8 再省一半但精度有损。一句话规律：**指数位决定能表示多大的数，尾数位决定表示得多准**。",
+    "tip": "BF16 比 FP16 更稳，本质就在「指数位和 FP32 一样宽」——所以训练里更偏好 BF16，它不容易因为某个大梯度直接变成 inf。"
+   },
+   {
+    "title": "为什么半精度推理几乎是免费的午餐",
+    "body": "为什么把模型直接 `.to(torch.bfloat16)` 就能显存减半、还提速约 30%，而生成质量几乎看不出差别？\n\n因为**推理不需要训练那么高的数值精度**。训练时要累积成千上万个小梯度，尾数不够会让更新「消失」；但推理只是做一次前向，每个数只参与有限次乘加，BF16 的 7 位尾数带来的相对误差大约在千分之几，对最终图像而言远低于可感知阈值——实测最大绝对误差通常 < 0.01。\n\n速度提升则来自两头：权重小了一半，**显存带宽**（搬数据）压力减半；现代 GPU 的 Tensor Core 对 16 位矩阵乘有专门的高吞吐通路，**算力**也更高。所以这是少数「改一行代码、显存和速度双赢、质量几乎不掉」的优化，应当作为默认起点。\n\n两种写法：整模型转换 `model.to(torch.bfloat16)`，或用 `torch.autocast` 在前向时局部自动混合精度。"
+   },
+   {
+    "title": "Flash Attention：不把那个 N×N 矩阵存下来",
+    "body": "注意力是扩散 U-Net 里的显存大户。标准实现要先算出完整的注意力分数矩阵 $QK^\\top$，它的形状是 $(B, h, N, N)$——对 $512\\times512$ 图像，潜空间 patch 化后 $N=4096$，单这一个矩阵就可能要几十 GB。显存随序列长度 $N$ 平方增长，即 $O(N^2)$。\n\n**Flash Attention**（Dao et al. 2022）的核心洞察：注意力的最终输出其实不需要把整个 $N\\times N$ 矩阵物化出来。它把 $Q,K,V$ 分块（Tiling）搬进片上高速内存 SRAM，**逐块计算**，并用「在线 softmax（Online Softmax）」一边遍历块一边正确地累积 softmax 结果。\n\n在线 softmax 的关键是维护每块的当前最大值 $m$ 和指数和 $\\ell$，合并两块时：$m_{new}=\\max(m_i,m_{i+1})$，$\\ell_{new}=\\ell_i e^{m_i-m_{new}}+\\ell_{i+1}e^{m_{i+1}-m_{new}}$。这样不必同时持有所有分数，就能算出和「先全算再 softmax」完全一致的结果。\n\n效果：显存从 $O(N^2)$ 降到 $O(N)$（只存输入输出），速度快 2–4 倍（主要省的是 HBM 读写）。",
+    "formula": "\\text{显存}: O(N^2) \\;\\longrightarrow\\; O(N)"
+   },
+   {
+    "title": "PyTorch 里怎么用 Flash Attention",
+    "body": "PyTorch 2.0+ 把 Flash Attention 内置成了 `scaled_dot_product_attention`（SDPA），最省心的用法是直接调用，它会自动在 flash / mem-efficient / math 三种后端里选最优的。注意 Flash 是**精确**注意力，不是近似，结果和标准实现一致，只是更省显存、更快。\n\n```python\nimport torch.nn.functional as F\nclass FlashAttention(nn.Module):\n    def __init__(self, dim, n_heads=8):\n        super().__init__()\n        self.n_heads = n_heads\n        self.head_dim = dim // n_heads\n        self.qkv = nn.Linear(dim, dim * 3, bias=False)\n        self.proj = nn.Linear(dim, dim)\n    def forward(self, x):\n        B, N, C = x.shape\n        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim)\n        qkv = qkv.permute(2, 0, 3, 1, 4)\n        Q, K, V = qkv.unbind(0)\n        out = F.scaled_dot_product_attention(Q, K, V)\n        out = out.transpose(1, 2).reshape(B, N, C)\n        return self.proj(out)\n```\n\n要强制选某个后端，可以用 `torch.backends.cuda.sdp_kernel(enable_flash=True, ...)` 上下文；diffusers 里则常用 `pipe.enable_xformers_memory_efficient_attention()` 走 xFormers。",
+    "tip": "把标准注意力换成 SDPA 通常只是把 `attn = (Q@K.transpose(-2,-1)).softmax(-1); out = attn@V` 这三行替换成一行 `F.scaled_dot_product_attention(Q,K,V)`。"
+   },
+   {
+    "title": "torch.compile 与扩散模型的动态形状坑",
+    "body": "`torch.compile`（PyTorch 2.0）把原本逐 Python 算子执行的动态图，编译成融合、优化过的静态图，减少 Python 调度开销和 kernel 启动次数。SD1.5 在 A100 上实测能从约 3s/张降到约 2s/张（约 1.5x）。\n\n常见模式：`torch.compile(model, mode='reduce-overhead')`。模式的取舍：`default` 均衡；`reduce-overhead` 减少 Python 开销、适合生产但需热身；`max-autotune` 性能最高但编译可能要 5–10 分钟。\n\n**扩散特有的坑**：每一步时间步 $t$ 都不同。如果模型里有依赖 $t$ 的 Python 控制流（if/分支），或输入分辨率会变，编译器会因「动态形状」反复触发重新编译，反而更慢。\n\n两个解法：一是 `torch.compile(dynamic=True)` 让编译器接受动态形状；二是把 $t$ 通过正弦嵌入注入网络（而不是用它写分支），从根上消除控制流对 $t$ 的依赖——这也是为什么从零实现里时间步总是走 `SinusoidalEmbed`。"
+   },
+   {
+    "title": "扩散特有优化：CFG 批量合并与步骤缓存",
+    "body": "**CFG 批量合并**：标准无分类器引导每步要算两次前向——条件 $\\epsilon_\\theta(x_t,t,c)$ 和无条件 $\\epsilon_\\theta(x_t,t,\\varnothing)$。可以把它们在 batch 维拼起来一次前向算完，减少 Python 调度开销。代价是**显存翻倍**（batch×2）。\n\n```python\nx_in = torch.cat([x] * 2)\nt_in = torch.cat([t] * 2)\ncond_in = torch.cat([uncond, cond])\neps_out = unet(x_in, t_in, cond_in)\neps_uncond, eps_cond = eps_out.chunk(2)\n```\n\n**步骤缓存**利用一个观察：相邻去噪步的某些中间输出高度相似，可以复用。\n- **TGATE**（Ma et al. 2024）：前 $K$ 步正常算所有注意力，后 $T-K$ 步**缓存交叉注意力输出**、只重算自注意力——因为文本条件的影响在后期已基本稳定。省约 25% 计算，质量几乎不变。\n- **TeaCache**（Feng et al. 2024）：用相邻步时间步嵌入的相似度预测输出差异，相似度超阈值就复用上一步的中间特征、跳过部分计算。",
+    "tip": "TGATE 缓存的是「交叉注意力」（文本条件那部分），不是自注意力——因为图像内容在去噪后期还在精修（自注意力要算），但文本对齐早已定型（交叉注意力可缓存）。"
+   },
+   {
+    "title": "显存优化：Offload 与 VAE 切片",
+    "body": "当显存实在不够，可以用空间换显存：\n\n- **CPU Offload**：把暂时不用的模块放回 CPU，用到再搬上 GPU。diffusers 里 `pipe.enable_model_cpu_offload()` 是逐模块 offload（较慢但省显存），`pipe.enable_sequential_cpu_offload()` 是逐层 offload（最省显存、最慢）。代价是反复搬数据导致速度下降。\n- **VAE 切片 / Tiled VAE**：高分辨率图像的 VAE 解码很吃显存。`enable_vae_slicing()` 在 batch 维切片逐张解码；`enable_vae_tiling()` 在空间维把大图切成块分别解码再拼接，专治高分辨率 OOM。\n- **梯度检查点**：只在**训练**时用（推理不需要），用重算换显存。\n\n这些都是「速度或时间换显存」的手段，只在显存受限时才开。",
+    "tip": "推理时不要开梯度检查点——它是训练里为了存下反向所需激活而做的「前向重算」，推理没有反向，开了纯属白白增加计算。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **推理误用梯度检查点**：那是训练省显存的手段，推理无反向，开了只会变慢。\n- **以为 INT8/INT4 总是更快**：量化主要省**显存**，速度未必提升，有时（缺乏对应 kernel 时）反而略降；半精度才是稳定的提速手段。\n- **torch.compile 不热身就计时**：首次调用要花时间编译，必须先跑几次热身再测速，否则把编译时间算进了推理。\n- **compile 遇到依赖 $t$ 的控制流反复重编译**：要么 `dynamic=True`，要么把 $t$ 做成嵌入而非分支。\n- **CFG 批量合并忘了显存翻倍**：batch×2 会让显存翻倍，小卡上可能直接 OOM。\n- **把 Flash Attention 当成近似**：SDPA/Flash 是精确注意力，结果与标准实现一致，不是损质量的近似。\n- **混淆 BF16 与 FP16**：BF16 动态范围大更稳，FP16 精度高但易溢出；别张冠李戴。"
+   },
+   {
+    "title": "小结",
+    "body": "推理优化的优先级大致是：先上 **BF16**（一行、双赢）和 **Flash Attention/SDPA**（一行、注意力省显存提速），再视情况加 **torch.compile**（需热身、固定分辨率最划算）和 **CFG 批量**（省调度、费显存）；要进一步省计算上 **TGATE/TeaCache** 步骤缓存；显存极限时才动用 **INT8 量化 / CPU Offload / VAE 切片**。核心心法：分清每个手段省的是**显存**还是**时间**，按瓶颈对症下药。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "为什么训练时常偏好 BF16 而不是 FP16？",
+    "options": [
+     "BF16 的尾数位更多，所以数值更精确",
+     "BF16 的指数位和 FP32 一样宽，动态范围大、大梯度不易溢出",
+     "BF16 占的显存比 FP16 更少",
+     "FP16 在 GPU 上没有硬件支持"
+    ],
+    "answer": 1,
+    "explain": "BF16 是 8 指数 + 7 尾数，指数范围和 FP32 相同，所以动态范围大、训练时梯度不易溢出；它尾数更少（精度更低），显存和 FP16 一样都是 50%。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Flash Attention 把注意力的显存复杂度从 $O(N^2)$ 降到 $O(N)$，靠的核心机制是什么？",
+    "options": [
+     "用低秩近似替代完整注意力矩阵",
+     "分块计算 + 在线 softmax，永不物化完整的 $N\\times N$ 分数矩阵",
+     "把注意力换成卷积",
+     "丢弃远距离的注意力权重，只保留局部窗口"
+    ],
+    "answer": 1,
+    "explain": "Flash Attention 把 Q/K/V 分块进 SRAM，用在线 softmax 逐块累积，最终结果和标准实现完全一致（精确，非近似），但无需存下整个 N×N 矩阵，显存随 N 线性增长。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Flash Attention 是一种近似注意力，会让生成质量略有下降以换取速度。",
+    "answer": false,
+    "explain": "Flash Attention 是精确注意力，输出与标准实现一致，只改变了计算方式（分块 + 在线 softmax）来省显存提速，不损质量。"
+   },
+   {
+    "type": "judge",
+    "prompt": "推理时为了省显存，应该开启梯度检查点（gradient checkpointing）。",
+    "answer": false,
+    "explain": "梯度检查点是训练手段：它用前向重算换取存下反向所需的激活。推理没有反向传播，开了只会徒增计算、拖慢速度。"
+   },
+   {
+    "type": "choice",
+    "prompt": "对扩散模型用 torch.compile 时，常见的「动态形状」问题来自哪里？",
+    "options": [
+     "每步时间步 $t$ 不同，若模型有依赖 $t$ 的控制流或分辨率会变，会反复触发重新编译",
+     "compile 不支持卷积层",
+     "BF16 与 compile 不兼容",
+     "U-Net 的跳跃连接无法被编译"
+    ],
+    "answer": 0,
+    "explain": "采样每步 t 不同，若存在依赖 t 的 if 分支或输入分辨率变化，编译器会因动态形状反复重编译反而变慢。解法是 dynamic=True，或把 t 做成正弦嵌入注入、消除对 t 的控制流依赖。"
+   },
+   {
+    "type": "choice",
+    "prompt": "CFG 批量合并（把条件与无条件拼在 batch 维一次前向）的主要代价是什么？",
+    "options": [
+     "生成质量下降",
+     "显存翻倍（batch×2）",
+     "需要重新训练模型",
+     "无法使用 Flash Attention"
+    ],
+    "answer": 1,
+    "explain": "把两次前向合并成一次能省 Python 调度开销、略微提速，但同时要把 batch 扩成 2 倍，显存随之翻倍，小卡上可能 OOM。"
+   },
+   {
+    "type": "judge",
+    "prompt": "TGATE 步骤缓存在去噪后期缓存的是「交叉注意力」输出，而不是自注意力。",
+    "answer": true,
+    "explain": "文本对齐（交叉注意力）在去噪后期已基本稳定，可缓存复用；而图像内容仍在精修，自注意力还需重算。所以 TGATE 缓存交叉注意力、约省 25% 计算，质量几乎不变。"
+   },
+   {
+    "type": "input",
+    "prompt": "在线 softmax 合并两块时，新的最大值 $m_{new}$ 由两块最大值 $m_i, m_{i+1}$ 怎样得到？（填运算名，如「最大值」/「求和」）",
+    "accept": [
+     "最大值",
+     "max",
+     "取最大",
+     "取最大值"
+    ],
+    "explain": "$m_{new}=\\max(m_i, m_{i+1})$。维护逐块最大值是在线 softmax 数值稳定的关键，配合指数和 $\\ell$ 的重新缩放，就能在不存完整矩阵的情况下算出正确 softmax。"
+   },
+   {
+    "type": "input",
+    "prompt": "PyTorch 2.0+ 中内置 Flash Attention、会自动选最优后端的那个函数（写函数名即可）是 ____ 。",
+    "accept": [
+     "scaled_dot_product_attention",
+     "F.scaled_dot_product_attention",
+     "SDPA",
+     "sdpa"
+    ],
+    "explain": "F.scaled_dot_product_attention（SDPA）会在 flash / mem-efficient / math 后端中自动选最优，是最省心的 Flash Attention 用法。"
+   },
+   {
+    "type": "input",
+    "prompt": "SD1.5 的 U-Net 约 860M 参数。若改用 BF16（每参数 2 字节）存权重，仅权重约占多少 GB？（数字即可，单位 GB）",
+    "accept": [
+     "1.72",
+     "1.7",
+     "约1.72",
+     "1.72GB",
+     "1.7GB"
+    ],
+    "explain": "860,000,000 × 2 字节 ≈ 1.72 GB。相比 FP32 的约 3.44GB 减半，这正是半精度推理显存减半的来源。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种推理优化手段，和它最主要省下的资源/特点配对：",
+    "left": [
+     "BF16 推理",
+     "Flash Attention / SDPA",
+     "torch.compile",
+     "CPU Offload"
+    ],
+    "right": [
+     "显存减半且略提速，几乎免费",
+     "注意力显存降到 $O(N)$、速度 2–4x",
+     "图优化提速约 1.3–2x，但需热身",
+     "把模块搬到 CPU 省 GPU 显存，速度变慢"
+    ],
+    "explain": "BF16 是显存+速度双赢；Flash 专省注意力显存并提速；compile 提整体速度但要热身；Offload 用速度换 GPU 显存。"
+   },
+   {
+    "type": "match",
+    "prompt": "把扩散特有的省计算技术，和它的核心做法配对：",
+    "left": [
+     "CFG 批量合并",
+     "TGATE",
+     "TeaCache",
+     "VAE Tiling"
+    ],
+    "right": [
+     "条件与无条件拼 batch，一次前向算完",
+     "后期缓存交叉注意力，只重算自注意力",
+     "时间步嵌入相似度超阈值就复用上步特征",
+     "空间维切块解码大图，缓解高分辨率 OOM"
+    ],
+    "explain": "CFG 批量靠拼 batch 省调度；TGATE 缓存交叉注意力；TeaCache 靠时间步嵌入相似度跳算；VAE Tiling 在空间维切片解码。"
+   }
+  ]
+ },
+ {
+  "title": "完整项目：文本到图像生成系统",
+  "subtitle": "把前 23 章拼成一条能跑通的管线：从零训练迷你扩散，再用 Diffusers 跑 SD",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "前面 23 章把扩散模型的每个零件都拆讲过了：正向加噪、噪声预测、U-Net 骨干、DDIM/DPM 采样、CFG、潜在扩散、LoRA、ControlNet、推理优化……这一章把它们**拼成一条完整管线**，并走两条路径落地。\n\n路径一是**从零实现一个迷你扩散模型**：在 FashionMNIST（上采样到 32×32 灰度图）上训练一个约 5M 参数的类别条件 U-Net，单 GPU 约 30 分钟收敛，亲手把「调度器 + U-Net + 训练循环 + DDIM/CFG 采样」串起来。路径二是**用 🤗 Diffusers 跑工业级 SD**：加载预训练管线、换更快的采样器、做 LoRA 微调、用 ControlNet 加结构控制。\n\n目标不是再造一个新算法，而是建立「一个完整文生图系统由哪些组件、按什么顺序拼起来」的全局图景，并理解从玩具实现到工业实现之间隔着什么。"
+   },
+   {
+    "title": "一个完整文生图系统的数据流",
+    "body": "把组件按数据流串起来，一条文生图管线长这样：\n\n文本 prompt → **文本编码器**（CLIP/T5）得到文本嵌入 $(B,L,d)$ → 送入 **U-Net / DiT**，同时注入**时间步嵌入**；采样从潜在噪声 $x_T$ 开始 → **噪声调度器 + 采样算法**（DDIM / DPM-Solver++）迭代去噪得到潜在样本 $x_0$ → **VAE 解码器**把潜在表示还原成像素 → 输出 512×512 或 1024×1024 图像。\n\n几个要点：文本通过**交叉注意力**进入 U-Net；时间步通过正弦嵌入相加注入；如果是图像条件（如 img2img），还会用 **VAE 编码器**把参考图压进潜空间。整条链路里，U-Net 被前向几十次（采样步数），每次都吃同样的文本嵌入、不同的 $t$ 和当前 $x_t$。\n\n本章迷你版会把潜空间换成像素空间、文本编码器换成类别 Embedding，但**骨架完全一致**。"
+   },
+   {
+    "title": "迷你扩散的三个核心零件",
+    "body": "从零实现里，三个零件撑起整个系统：\n\n**1. 噪声调度器**：用余弦调度算出 $\\bar\\alpha_t$，提供两件事——正向加噪 `q_sample`（$x_t=\\sqrt{\\bar\\alpha_t}\\,x_0+\\sqrt{1-\\bar\\alpha_t}\\,\\epsilon$）和 DDIM 采样步 `ddim_step`。\n\n**2. 迷你 U-Net（含类别条件）**：时间步走 `SinusoidalEmbed` → MLP；类别走 `Embedding`，且**多留一个 null 类别**（索引 10）专供 CFG 的无条件分支。两者相加成 `cond`，注入每个 ResBlock。编码器三级下采样、中间块、解码器三级上采样并接跳跃连接，输出同尺寸噪声预测。\n\n**3. 训练 + 采样**：训练时随机采 $t$、加噪、以概率 $p_{uncond}$ 把标签换成 null（CFG 条件 Dropout），MSE 回归噪声；同时维护 EMA 权重。采样时 DDIM + CFG 把条件/无条件预测按引导强度混合。\n\n```python\nclass DDPMScheduler:\n    def __init__(self, T=1000, s=0.008):\n        self.T = T\n        t = torch.arange(T + 1, dtype=torch.float32) / T\n        f = torch.cos((t + s) / (1 + s) * torch.pi / 2) ** 2\n        alpha_bars = (f / f[0]).clamp(min=1e-8)\n        self.alpha_bars = alpha_bars[:T]\n        ab_prev = torch.cat([torch.tensor([1.0]), self.alpha_bars[:-1]])\n        self.alphas = self.alpha_bars / ab_prev\n        self.betas = (1.0 - self.alphas).clamp(max=0.999)\n```"
+   },
+   {
+    "title": "为什么 null 类别和条件 Dropout 是 CFG 的关键",
+    "body": "为什么类别 Embedding 要从 `n_classes` 多扩一个、训练时还要随机把标签替换成这个 null？因为 CFG（无分类器引导）要求**同一个网络既能做有条件预测、又能做无条件预测**。\n\nCFG 采样公式是 $\\epsilon=\\epsilon_{uncond}+w(\\epsilon_{cond}-\\epsilon_{uncond})$，它需要 $\\epsilon_{cond}=\\epsilon_\\theta(x_t,t,c)$ 和 $\\epsilon_{uncond}=\\epsilon_\\theta(x_t,t,\\varnothing)$ 两个量。如果网络从没见过「无条件」这种输入，$\\epsilon_{uncond}$ 就无从谈起。\n\n做法就是：给类别表多加一个 null 槽位代表 $\\varnothing$；训练时以概率 $p_{uncond}$（如 0.1）把真实标签替换成 null，让网络在约 10% 的样本上学「不看条件该预测什么噪声」。于是同一套权重同时掌握了有条件和无条件两种行为，采样时只要分别喂真实标签和 null，就能取出 CFG 需要的两个预测——这正是「无分类器」之名的由来：不需要单独训一个分类器。\n\n```python\ny_input = y.clone()\nmask = torch.rand(B, device=device) < p_uncond\ny_input[mask] = 10\neps_pred = model(x_t, t, y_input)\nloss = F.mse_loss(eps_pred, noise)\n```"
+   },
+   {
+    "title": "训练循环与 EMA",
+    "body": "训练循环很标准：取一批 $(x,y)$，随机时间步 $t$，`q_sample` 加噪得到 $(x_t,\\text{noise})$，对部分样本做条件 Dropout，前向预测噪声，MSE 回归真实噪声，反传更新。两个工程细节值得记住：**梯度裁剪**（`clip_grad_norm_` 防梯度爆炸）和 **EMA**。\n\n**为什么用 EMA（指数移动平均）？** 训练后期参数仍在小幅震荡，瞬时权重未必是最稳的那组。EMA 维护一份「权重的滑动平均」$\\theta_{ema}\\leftarrow d\\cdot\\theta_{ema}+(1-d)\\cdot\\theta$（$d$ 如 0.995），相当于对最近若干步的权重做平滑，采样时用它通常比瞬时权重更稳、FID 更低 1–2 点。\n\n```python\nema_model.load_state_dict(model.state_dict())\nema_decay = 0.995\nfor p, p_ema in zip(model.parameters(), ema_model.parameters()):\n    p_ema.data.lerp_(p.data, 1 - ema_decay)\n```\n\n关键一句：**采样要用 EMA 模型**，而不是训练用的瞬时模型——这是个很常见的疏漏。",
+    "tip": "`p_ema.data.lerp_(p.data, 1 - decay)` 就是 $\\theta_{ema}=\\theta_{ema}+(1-d)(\\theta-\\theta_{ema})=d\\,\\theta_{ema}+(1-d)\\theta$，等价于按 decay 做指数平滑。"
+   },
+   {
+    "title": "DDIM + CFG 采样",
+    "body": "采样从纯噪声 $x_T\\sim\\mathcal{N}(0,I)$ 开始，沿一个稀疏的时间步序列（如把 1000 步切成 50 步）逐步去噪。每步做两件事：先取**条件**和**无条件**两个噪声预测，按引导强度混合 $\\epsilon=\\epsilon_{uncond}+w(\\epsilon_{cond}-\\epsilon_{uncond})$；再用 DDIM 确定性更新走到上一时间步。\n\nDDIM 步内部先反解出对 $x_0$ 的估计 $\\hat x_0=(x_t-\\sqrt{1-\\bar\\alpha_t}\\,\\epsilon)/\\sqrt{\\bar\\alpha_t}$（并 clamp 到 $[-1,1]$），再用 $x_{prev}=\\sqrt{\\bar\\alpha_{prev}}\\,\\hat x_0+\\sqrt{1-\\bar\\alpha_{prev}}\\,\\epsilon$ 走下一步。\n\n```python\n@torch.no_grad()\ndef sample_ddim_cfg(model, scheduler, labels, w=7.5, num_steps=50, device='cpu'):\n    B = labels.shape[0]\n    x = torch.randn(B, 1, 32, 32, device=device)\n    T = scheduler.T\n    timesteps = list(range(T - 1, 0, -(T // num_steps)))\n    for i, t_val in enumerate(timesteps):\n        t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else 0\n        t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)\n        eps_cond = model(x, t_batch, labels)\n        eps_uncond = model(x, t_batch, None)\n        eps = eps_uncond + w * (eps_cond - eps_uncond)\n        x = scheduler.ddim_step(x, t_val, t_prev, eps)\n    return x\n```"
+   },
+   {
+    "title": "工业路径：Diffusers、LoRA、ControlNet",
+    "body": "工业上很少从零写，而是用 🤗 Diffusers 加载预训练管线。几行就能跑通：`StableDiffusionPipeline.from_pretrained(...)` 加载，把调度器换成 `DPMSolverMultistepScheduler`（20 步出图），`enable_xformers_memory_efficient_attention()` 开 Flash，再传 prompt / negative_prompt / num_inference_steps / guidance_scale 出图。\n\n**LoRA**（Hu et al. 2021）：把权重更新写成低秩乘积 $W=W_0+BA$，$B\\in\\mathbb{R}^{d\\times r}$、$A\\in\\mathbb{R}^{r\\times k}$、$r\\ll\\min(d,k)$。原始 $W$ 有 $dk$ 个参数，LoRA 只有 $r(d+k)$ 个。$r=16,\\,d=k=768$ 时从约 590K 降到约 24K（约 4%）。常对 U-Net 注意力的 $W_Q,W_V$ 加 LoRA，用百来张图就能学一种风格或一个人物。\n\n**ControlNet**（Zhang et al. 2023）：复制一份 U-Net 编码器作为可训练副本，接收结构条件（Canny 边缘、深度、姿态），副本输出经 **Zero Convolution**（权重初始化为零）加回主网络。零卷积让训练初始时副本输出为零、完全等于原始 SD，随训练逐渐学会注入控制信号，从而**不破坏预训练权重**。",
+    "formula": "W = W_0 + \\Delta W = W_0 + BA, \\quad r \\ll \\min(d, k)"
+   },
+   {
+    "title": "玩具实现 vs 工业实现",
+    "body": "把本章两条路径并排，能看清「能跑通」和「能上线」之间隔着什么：\n\n| 维度 | 迷你实现 | 工业实现 |\n|------|----------|----------|\n| 数据 | FashionMNIST 32×32 | LAION-5B 512×512 |\n| 文本条件 | 类别 Embedding | CLIP/T5 文本编码器 |\n| 模型 | 迷你 U-Net 5M | SD U-Net 860M / DiT |\n| 空间 | 像素空间 | VAE 潜空间（×8 压缩） |\n| 采样 | DDIM+CFG 50 步 | DPM-Solver++ 20 步 |\n| 训练 | 单 GPU 30 分钟 | 256 GPU × 数天 |\n\n骨架是同一套（调度器 + 条件 U-Net + 采样 + CFG），差别在规模、潜空间、文本编码器和采样器。再往上是部署层：FastAPI + 异步推理队列、动态批处理、文本嵌入缓存、延迟/OOM 监控、NSFW 安全过滤等。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **采样用了瞬时模型而非 EMA**：EMA 通常更稳、FID 更低，采样时要切到 EMA 权重。\n- **忘了 CFG 的 null 类别 / 条件 Dropout**：网络没学过无条件，采样时 $\\epsilon_{uncond}$ 就是垃圾，CFG 失效。\n- **DDIM 里漏 clamp $\\hat x_0$**：预测的 $x_0$ 不裁剪到 $[-1,1]$ 容易越界、放大伪影。\n- **ControlNet 不用 Zero Convolution**：副本一上来就大幅扰动主网络，会破坏预训练权重、训练不稳。\n- **LoRA 的 $B$ 没初始化为零**：初始 $\\Delta W=BA$ 非零，开训瞬间就偏离原模型。\n- **采样分辨率/数据归一化不一致**：训练把图像归一化到 $[-1,1]$，采样/解码若不还原同样区间，颜色会偏。\n- **以为换 Diffusers 就不需要懂原理**：调度器选择、CFG 强度、步数权衡仍要靠前面学的原理来调。"
+   },
+   {
+    "title": "小结",
+    "body": "一个完整文生图系统 = 文本编码器 + 条件 U-Net/DiT + 噪声调度器 + 采样器 + VAE，再加 CFG、（可选）LoRA 风格定制、ControlNet 结构控制，外层套部署与安全。从零实现让你看清每个零件怎么咬合（尤其 null 类别支撑 CFG、EMA 稳采样、DDIM 反解 $x_0$）；Diffusers 让你站在巨人肩上快速落地。记住主线：**骨架不变，规模与组件升级**。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "在迷你 U-Net 里，类别 Embedding 为什么要从 `n_classes` 多扩一个槽位（null 类别）？",
+    "options": [
+     "为了让模型支持比数据集更多的类别",
+     "为了给 CFG 提供「无条件」分支，让同一网络也能做无条件预测",
+     "为了在多出来的槽位里存时间步信息",
+     "为了对齐 VAE 的潜空间维度"
+    ],
+    "answer": 1,
+    "explain": "CFG 需要同一网络同时给出有条件和无条件预测。null 类别代表「无条件」$\\varnothing$，训练时以概率 p_uncond 把标签换成它，网络就学会了无条件行为，采样时才能取到 $\\epsilon_{uncond}$。"
+   },
+   {
+    "type": "choice",
+    "prompt": "训练里 `mask = torch.rand(B) < p_uncond; y_input[mask] = 10` 这段做的是什么？",
+    "options": [
+     "数据增强：随机翻转图像",
+     "CFG 的条件 Dropout：以概率 p_uncond 把标签替换成 null 类别",
+     "梯度裁剪",
+     "EMA 权重更新"
+    ],
+    "answer": 1,
+    "explain": "这是 CFG 的条件 Dropout：随机选约 p_uncond 比例的样本，把它们的类别标签替换成 null（索引 10），让网络在这些样本上学习无条件预测。"
+   },
+   {
+    "type": "judge",
+    "prompt": "采样时应该使用 EMA 模型的权重，而不是训练用的瞬时模型权重。",
+    "answer": true,
+    "explain": "EMA 对最近若干步的权重做指数平滑，比仍在震荡的瞬时权重更稳定，采样质量通常更好（FID 低 1–2 点）。采样用瞬时模型是常见疏漏。"
+   },
+   {
+    "type": "judge",
+    "prompt": "LoRA 通过低秩分解 $W=W_0+BA$ 减少可训练参数，初始化时把 $B$ 设为零可以保证开训瞬间 $\\Delta W=0$、不扰动原模型。",
+    "answer": true,
+    "explain": "令 B=0 则 ΔW=BA=0，模型初始等价于原始 W_0，训练从「不改变原模型」平滑出发，逐步学习增量。这是 LoRA 稳定微调的关键初始化。"
+   },
+   {
+    "type": "choice",
+    "prompt": "ControlNet 里 Zero Convolution（权重初始化为零）的作用是什么？",
+    "options": [
+     "压缩控制图像，节省显存",
+     "训练初始时副本输出为零、完全等于原始 SD，随训练逐渐注入控制信号，避免破坏预训练权重",
+     "把彩色控制图转成灰度",
+     "替代 VAE 做潜空间编码"
+    ],
+    "answer": 1,
+    "explain": "零卷积让 ControlNet 副本初始输出为零，主网络起步时完全等于原始 SD；训练中副本逐步学会注入边缘/深度等控制，整个过程不破坏预训练权重。"
+   },
+   {
+    "type": "choice",
+    "prompt": "DDIM 采样步里，为什么要对反解出的 $\\hat x_0$ 做 `clamp(-1, 1)`？",
+    "options": [
+     "为了加速计算",
+     "图像被归一化到 $[-1,1]$，裁剪可防止预测越界、抑制伪影",
+     "为了让 CFG 引导强度生效",
+     "因为 DDIM 要求确定性，必须裁剪"
+    ],
+    "answer": 1,
+    "explain": "训练时图像归一化到 [-1,1]，合法的 x_0 应落在此区间。反解的 \\hat x_0 可能越界，clamp 到 [-1,1] 能抑制越界带来的伪影、让采样更稳。"
+   },
+   {
+    "type": "input",
+    "prompt": "DDPM 调度器用哪种调度（cosine / linear）来计算 $\\bar\\alpha_t$？本章迷你实现用的是 ____ 调度。",
+    "accept": [
+     "余弦",
+     "cosine",
+     "余弦调度",
+     "cos"
+    ],
+    "explain": "本章 DDPMScheduler 用余弦调度：$f=\\cos^2((t+s)/(1+s)\\cdot\\pi/2)$，再归一化得到 $\\bar\\alpha_t$。余弦调度相比线性在高噪声端信噪比下降更平缓。"
+   },
+   {
+    "type": "input",
+    "prompt": "LoRA 取 $r=16$、$d=k=768$ 时，单个权重矩阵的可训练参数从原始的 $768\\times768$ 降到 $r(d+k)$，即约多少 K？（数字即可）",
+    "accept": [
+     "24",
+     "24K",
+     "24k",
+     "约24",
+     "24576"
+    ],
+    "explain": "LoRA 参数量 = r(d+k) = 16×(768+768) = 16×1536 = 24576 ≈ 24K，相比原始 768×768=590K 约为 4%。"
+   },
+   {
+    "type": "input",
+    "prompt": "CFG 采样公式 $\\epsilon=\\epsilon_{uncond}+w(\\epsilon_{cond}-\\epsilon_{uncond})$ 里，控制「条件引导强度」的标量是哪个符号？",
+    "accept": [
+     "w",
+     "引导强度",
+     "guidance_scale",
+     "引导尺度"
+    ],
+    "explain": "w（guidance_scale，常取 7.5）控制条件引导强度：w 越大越贴合条件但易过饱和，w=1 退化为普通条件预测，w=0 为纯无条件。"
+   },
+   {
+    "type": "match",
+    "prompt": "把迷你扩散实现里的每个组件，和它负责的事配对：",
+    "left": [
+     "DDPMScheduler.q_sample",
+     "SinusoidalEmbed",
+     "EMA 权重",
+     "ddim_step"
+    ],
+    "right": [
+     "正向加噪：由 $x_0,t$ 得到 $x_t$ 和噪声",
+     "把时间步 $t$ 编码成正弦嵌入注入网络",
+     "权重滑动平均，采样时更稳",
+     "DDIM 确定性更新，由 $x_t$ 走到上一步"
+    ],
+    "explain": "q_sample 管正向加噪；SinusoidalEmbed 编码时间步；EMA 平滑权重；ddim_step 做确定性反向采样更新。"
+   },
+   {
+    "type": "match",
+    "prompt": "把「迷你实现」与对应的「工业实现」配对：",
+    "left": [
+     "类别 Embedding",
+     "迷你 U-Net 5M",
+     "像素空间",
+     "DDIM 50 步"
+    ],
+    "right": [
+     "CLIP/T5 文本编码器",
+     "SD U-Net 860M / DiT",
+     "VAE 潜空间（×8 压缩）",
+     "DPM-Solver++ 20 步"
+    ],
+    "explain": "玩具到工业的对应升级：条件从类别 ID 到文本编码器、模型从 5M 到 860M、像素空间到 VAE 潜空间、DDIM 50 步到 DPM-Solver++ 20 步；骨架不变、组件升级。"
+   },
+   {
+    "type": "judge",
+    "prompt": "用了 🤗 Diffusers 这类高层库后，就不必再理解调度器选择、CFG 强度和步数权衡等原理了。",
+    "answer": false,
+    "explain": "高层库只是封装了实现，调多大的 guidance_scale、用哪个采样器、几步出图这些质量/速度权衡仍要靠前面学的原理来判断。懂原理才能调好。"
+   }
+  ]
+ }
+]

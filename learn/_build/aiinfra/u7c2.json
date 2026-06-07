@@ -1,0 +1,125 @@
+[
+  {
+    "id": "u7c2",
+    "title": "AI 镜像与 CUDA 兼容矩阵",
+    "subtitle": "GPU userspace 合同：镜像、Driver、运行时各司其职",
+    "intro": [
+      {
+        "title": "AI 镜像到底在解决什么问题",
+        "body": "AI 镜像要解决的不可化简问题是：**把一个依赖 GPU 的软件栈变成可重复拉取、可重复运行、可审计、可回滚的文件系统快照，同时不把宿主机 Driver 这类应该由节点提供的能力错误地封进镜像。**\n\n一个可运行的 AI 镜像同时依赖多层：OS userspace（glibc、openssl）、CUDA userspace（libcudart、cuBLAS、cuDNN、NCCL）、框架（PyTorch、JAX）、推理引擎（vLLM、TensorRT-LLM、SGLang）、自定义扩展（FlashAttention、自研 CUDA op）以及应用层（entrypoint、健康检查、配置）。\n\n可以用一句话概括设计原则：**镜像锁定 userspace，节点锁定 Driver，平台锁定兼容矩阵，运行时负责设备与驱动能力注入。**",
+        "tip": "Driver 不应该由业务 Dockerfile 安装或升级。它应由节点镜像、驱动安装器或 GPU Operator 管理。"
+      },
+      {
+        "title": "CUDA/Driver 兼容为什么是矩阵问题",
+        "body": "GPU 程序调用路径大致是：\n\n`PyTorch / TensorRT` → `CUDA runtime / cuDNN / cuBLAS / NCCL` → `libcuda.so + driver userspace` → `NVIDIA kernel driver` → `GPU hardware`\n\n镜像里通常包含上半部分的 userspace 库；宿主机提供下半部分的 Driver 和硬件。CUDA userspace 会调用 Driver 提供的接口——**如果 userspace 需要的 Driver 能力比宿主机 Driver 新，就会失败**。\n\n粗规则：较新的 Driver 通常能运行较旧的 CUDA userspace；反过来则通常不行。但这只是方向，不是发布依据。生产平台必须以 NVIDIA、框架、推理引擎的 release note 和内部验证结果为准，把可用组合**固化成矩阵**。\n\n| 维度 | 镜像里 | 宿主机上 |\n|---|---|---|\n| CUDA runtime / cuDNN / NCCL | 是 | 否 |\n| NVIDIA kernel driver | 否 | 是 |\n| GPU device node | 否 | 是，由 runtime 注入 |"
+      },
+      {
+        "title": "base / runtime / devel：选哪个基础镜像",
+        "body": "`nvidia/cuda` 官方镜像分三档，职责不同：\n\n| 类型 | 包含 | 适合 | 不适合 |\n|---|---|---|---|\n| `base` | 最小 CUDA userspace 基础组件 | 自行精确安装、极简服务 | 直接运行复杂 PyTorch/vLLM 服务 |\n| `runtime` | CUDA runtime 动态库和常见运行依赖 | 生产推理、预编译 wheel 的运行环境 | 编译 CUDA extension |\n| `devel` | `runtime` + nvcc + headers + 开发工具链 | builder 阶段、编译自定义算子 | 生产最终镜像长期运行 |\n\n**选择顺序**：先确认目标 GPU 和节点 Driver → 框架/引擎支持范围 → CUDA userspace 版本 → 是否需要编译 CUDA extension → OS 发行版 → 体积/安全/冷启动要求。\n\n不要从「最新版 CUDA」开始选。最新版通常意味着更高 Driver 要求、更少 wheel 支持、更长验证周期。",
+        "tip": "生产推理镜像应用 `runtime` 基础镜像，不应长期保留 `devel` 中的 nvcc 和 headers——它们是漏洞面和体积的来源。"
+      },
+      {
+        "title": "版本矩阵：从文档表格变成发布控制面",
+        "body": "一个可运营的平台至少维护以下字段：**平台基线名、基础镜像 digest、OS 发行版、GPU 型号、Driver 最低版本、CUDA userspace 版本、cuDNN 版本、NCCL 版本、Python 版本、框架版本、推理引擎版本、支持状态、支持到期日、验证套件链接。**\n\n矩阵不能只存在 Wiki 里，至少要影响这些环节：\n- 镜像构建：只允许从矩阵内基础镜像构建生产镜像\n- CI 测试：自动运行 CUDA/framework/NCCL smoke test\n- 发布门禁：不在矩阵内的 digest 默认阻断\n- 节点准入：Driver/GPU/runtime 版本打标签并校验\n- 漏洞治理：按基线更新基础镜像，通知下游重建\n\n**升级策略**：新建 canary baseline，不直接覆盖 stable baseline。不要在一个发布窗口里同时升级 Driver、CUDA、PyTorch、推理引擎、模型权重和服务代码，出问题时无法归因。"
+      },
+      {
+        "title": "训练镜像 vs 推理镜像：为什么必须拆分",
+        "body": "长期共用「大而全」镜像的代价：推理服务背着训练工具上线、漏洞报告里充满生产不用的包、扩容时拉取巨大镜像、排障时无法判断某个库是否属于运行路径。\n\n| 维度 | 训练镜像 | 推理镜像 |\n|---|---|---|\n| 依赖范围 | 宽，含训练框架、数据工具、debug 工具 | 窄，只含服务运行路径 |\n| 体积容忍度 | 中等偏高 | 低 |\n| 启动路径 | 作业启动、分布式 launcher、checkpoint resume | 服务启动、模型加载、warmup、health check |\n| 验收标准 | 训练 smoke、NCCL、checkpoint | SLA、冷启动、吞吐、延迟、回滚 |\n\n推理镜像生产最终层：不含 notebook、compiler、git、vim；engine/plugin/wheel 预构建；启动路径禁止 `pip install` 和编译核心产物；默认非 root。",
+        "tip": "多阶段构建是实现训练/推理分层的关键工具：`devel` 阶段编译 wheel 和 extension，`runtime` 阶段只复制产物，最终镜像不应依赖 build cache。"
+      },
+      {
+        "title": "冷启动拆解与镜像体积治理",
+        "body": "AI 服务冷启动要拆成 7 个阶段，不要只看总耗时：\n\n| 阶段 | 观测点 | 优化方向 |\n|---|---|---|\n| 调度等待 | scheduler event | 容量、优先级、节点池 |\n| image pull | kubelet/containerd event | 缩小镜像、registry mirror、预拉取 |\n| 容器创建 | runtime 日志 | 减少 mount、修 hook、优化权限 |\n| Python import | 应用启动日志 | 裁剪依赖、lazy import |\n| 模型下载 | 对象存储指标 | 本地缓存、并行下载 |\n| engine build | TensorRT/vLLM 日志 | 预构建 engine、持久缓存 |\n| GPU warmup | metrics、首请求延迟 | 显式 warmup、CUDA graph 预热 |\n\n**镜像体积治理**：使用 `runtime` 而非 `devel`；合并安装与清理；固定依赖并裁剪 extras；预构建 wheel；外置大模型权重；分层复用 golden image；单独发布 debug 镜像。\n\n镜像治理只能解决 image pull 阶段。模型下载和 engine 构建如果仍在启动路径里，镜像变小也无法让服务快速 ready。",
+        "reveal": {
+          "q": "某推理服务 GPU 型号从 A100 迁移到 H100，上线后出现 `no kernel image is available for execution on the device`。最可能的根因是什么？",
+          "a": "自定义 CUDA extension 或 wheel 编译时的 `TORCH_CUDA_ARCH_LIST` 未覆盖 H100 的 GPU compute capability（sm_90）。需要在矩阵中把 H100 纳入验证，并重新构建覆盖 sm_90 的 wheel/extension。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "生产推理镜像应该使用 nvidia/cuda 的哪种基础镜像？",
+        "options": [
+          "devel，因为它包含最多工具",
+          "runtime，因为它只包含运行所需 CUDA 动态库",
+          "base，因为体积最小",
+          "framework 官方镜像，因为已预装 PyTorch"
+        ],
+        "answer": 1,
+        "explain": "`runtime` 包含 CUDA runtime 动态库和常见运行依赖，适合生产推理场景。`devel` 包含 nvcc 和开发工具，会增加体积和漏洞面，不适合生产最终镜像。"
+      },
+      {
+        "type": "judge",
+        "prompt": "可以在业务 Dockerfile 里安装 NVIDIA Driver 来解决 CUDA 兼容问题。",
+        "answer": false,
+        "explain": "宿主机 NVIDIA Driver（内核态驱动）不应由业务 Dockerfile 安装或升级。驱动由节点镜像、驱动安装器或 GPU Operator 管理；镜像只负责 CUDA userspace。在 Dockerfile 里塞 Driver 会造成镜像/节点责任混乱，且通常无法正确工作。"
+      },
+      {
+        "type": "match",
+        "prompt": "将报错症状与最可能的根因层对应：",
+        "left": [
+          "`libcuda.so.1` 找不到",
+          "`libcudart.so` 找不到",
+          "`no kernel image is available`",
+          "自定义 op import 失败 `undefined symbol`"
+        ],
+        "right": [
+          "wheel/extension 编译时未包含目标 GPU arch",
+          "runtime hook 未注入 Driver userspace library",
+          "镜像 CUDA runtime 基础镜像类型错误（如用了 base 而非 runtime）",
+          "extension 与 torch/CUDA/Python ABI 不匹配，需在矩阵内重建"
+        ],
+        "explain": "`libcuda.so.1` 来自宿主机 Driver 注入，缺失说明 runtime hook 问题；`libcudart.so` 来自镜像 CUDA userspace，缺失说明基础镜像类型或包缺失；`no kernel image` 说明编译架构未覆盖目标 GPU；`undefined symbol` 说明 ABI 不一致。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项是版本矩阵必须落到工程系统的正确做法？",
+        "options": [
+          "把矩阵存在内部 Wiki 文档中，工程师自行查阅",
+          "矩阵只影响镜像构建，不需要影响部署和节点",
+          "矩阵影响构建门禁、CI 测试、发布门禁、节点准入和调度策略",
+          "每个团队自己维护一份矩阵，互不干扰"
+        ],
+        "answer": 2,
+        "explain": "版本矩阵必须同时影响镜像构建、CI 测试、发布门禁、节点准入和调度策略，才能真正阻止不兼容组合进入生产。只存在 Wiki 里的矩阵是「文档摆设」，无法自动执行。"
+      },
+      {
+        "type": "input",
+        "prompt": "多阶段构建中，`devel` 阶段编译产出的 wheel 应该如何进入最终镜像？（填写关键操作指令，两个词）",
+        "accept": ["COPY --from", "COPY--from"],
+        "explain": "用 `COPY --from=builder` 把编译产物从 builder 阶段复制到 runtime 阶段。编译环境（nvcc、headers、源码）不应出现在最终镜像，只复制产物。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练镜像和推理镜像可以长期共用同一个「大而全」镜像，只要定期扫描漏洞就足够了。",
+        "answer": false,
+        "explain": "共用大镜像会导致推理服务背着训练工具上线、漏洞报告充满不相关包、扩容时拉取巨大镜像、排障时无法判断某个库是否属于运行路径。推荐拆分训练和推理镜像，共用底层 golden image，但不共用上层工具集合。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理容器冷启动共 12 分钟，缩小镜像体积后缩短到 10 分钟，但仍然很慢。最可能是因为？",
+        "options": [
+          "镜像体积优化还不够，需要继续缩小",
+          "应该换成更快的 Python 版本",
+          "冷启动中模型下载或 engine build 阶段未优化，这两段不受镜像体积影响",
+          "Pod 的 CPU limit 设置太低"
+        ],
+        "answer": 2,
+        "explain": "镜像治理只能优化 image pull 阶段。如果模型下载或 TensorRT/vLLM engine 构建仍在启动路径里，镜像变小后这些阶段依然耗时。需要引入本地模型缓存、预构建 engine 和 CUDA graph 预热等手段。"
+      },
+      {
+        "type": "choice",
+        "prompt": "关于 CUDA userspace 与宿主机 Driver 兼容性，下面哪个说法最准确？",
+        "options": [
+          "只要 CUDA 版本号相同就一定兼容",
+          "较新的 Driver 通常能运行较旧的 CUDA userspace；反之通常不行",
+          "较旧的 Driver 可以运行任意版本的 CUDA userspace",
+          "两者版本必须完全一致才能运行"
+        ],
+        "answer": 1,
+        "explain": "向后兼容规则：较新的 NVIDIA Driver 通常能运行较旧的 CUDA userspace。但这只是方向，不是发布依据。生产必须以 NVIDIA 官方 release note 和内部验证结果为准，固化成矩阵。"
+      }
+    ]
+  }
+]

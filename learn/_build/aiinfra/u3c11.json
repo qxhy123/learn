@@ -1,0 +1,118 @@
+[
+  {
+    "id": "u3c11",
+    "title": "CUDA 运行时与内核执行导览",
+    "subtitle": "从 model(x) 到 GPU 执行的三条路径",
+    "intro": [
+      {
+        "title": "为什么需要学这一关？",
+        "body": "GPU 不理解 Python，也不理解「模型」这个对象。从 `model(x)` 到 GPU 实际执行，中间有一条多层翻译链路。这条链路里每一层都有固定开销，任何一层出问题都会让端到端变慢——但症状看起来都像「GPU 慢」。\n\n本关建立三条分析路径：\n\n- **control path**：`model(x)` 如何经过 Python → framework dispatcher → ATen → CUDA runtime → driver → kernel launch → stream queue，变成 GPU work\n- **data path**：输入 batch、权重、中间 tensor、KV cache 如何在 host memory / device memory / register / shared memory 之间流动\n- **failure path**：固定 launch 开销、隐式同步、overlap 失败、CUDA Graph 回退、occupancy 压力如何让端到端吞吐下降"
+      },
+      {
+        "title": "执行栈速览：五层职责",
+        "body": "| 层 | 负责什么 | 典型问题 |\n|---|---|---|\n| Python / API | 模型组织、控制流、tensor API | 逐 token 小循环、每步 `.item()` |\n| framework dispatcher | 按 dispatch key 路由到后端 | 大量小 op、fallback 路径 |\n| ATen / 算子选择 | 选择 cuBLAS / cuDNN / native kernel | dtype 不匹配、non-contiguous 慢路径 |\n| CUDA runtime / driver | 提交 kernel launch、memcpy、event | 每次 launch 有固定 CPU 成本 |\n| GPU 执行 | kernel 在 SM 上运行 | kernel 本身低效，需要 `ncu` 下钻 |\n\n**关键判断**：不要把所有慢都叫「GPU 慢」。只有 GPU 时间线上 kernel 连续且占主导时，才进入 kernel 内部优化。"
+      },
+      {
+        "title": "Launch 固定开销：为什么小 kernel 多会慢？",
+        "body": "每次 kernel launch 不只是「GPU 开始执行」。CPU 侧要经过 Python/API → dispatcher → 算子实现 → CUDA runtime → driver 提交。即使 kernel 本身只跑 8 微秒，launch 路径也可能消耗 15–20 微秒。\n\n**估算模型**：`端到端时间 ≈ Python/dispatcher 开销 + kernel_count × launch_overhead + GPU 执行时间 + 同步等待`\n\n**数字例子**：一个 forward 有 2000 个小 kernel，平均 launch 20 μs、执行 8 μs：\n- 2000 × (20 + 8) = **56 ms**\n\n融合后降到 300 个 kernel，平均执行 35 μs：\n- 300 × (20 + 35) = **16.5 ms**\n\n**判断规则**：若 `kernel_count × median_launch_time / step_time ≥ 10%`，且 `nsys` 有 CUDA HW 空洞，先按 launch-bound 处理，不要先优化 kernel 内部。",
+        "tip": "更快的 GPU 不会消除 launch 固定开销——新 GPU 让 kernel 执行更短，反而让 launch 占比更突出。A100 → H100 后大 GEMM 明显加速，但小 batch 推理可能只快 10%。"
+      },
+      {
+        "title": "Eager vs Compiled：逐 op 执行 vs 生成执行计划",
+        "body": "**Eager 模式**：每个 tensor op 立即执行，调试直观，但每个 op 都要经过 Python → dispatcher → runtime，小 kernel 多时开销明显。\n\n**Compiled 模式**（如 `torch.compile`）：捕获一段稳定计算，融合多个 elementwise/reduction，减少 dispatch 次数和中间 HBM 读写。\n\n```\n# Eager: 4 个 kernel\nadd → gelu → mul → add\n\n# Compiled: 1 个 fused kernel\nadd+gelu+mul+add\n```\n\n融合不只减少 launch，也减少中间 tensor 写 HBM 再读回的往返流量。\n\n**Graph break**：`torch.compile` 遇到 `.item()`、Python 副作用、动态 shape 时会断图，暴露回 Python/dispatcher 开销。"
+      },
+      {
+        "title": "Caching Allocator：显存分配也在这条路径上",
+        "body": "框架用 caching allocator 管理 GPU 显存：\n1. 向 CUDA 申请大块显存\n2. 切分给 tensor 使用\n3. tensor 释放后放回缓存池，供后续复用\n4. 结合 stream/event 语义，避免复用仍在 GPU 上使用的块\n\n**常见误区**：\n- `nvidia-smi` 显存高 ≠ 泄漏，可能只是缓存池（reserved > allocated 是正常的）\n- allocated 不高但 OOM：reserved 内部碎片或无法找到足够大的连续块\n- 小 kernel 多 → 中间 tensor 多 → allocator 压力大、显存峰值高\n\n**查看方式**：`torch.cuda.memory_summary()` 区分 allocated / reserved / peak。",
+        "tip": "动态 shape 会让 allocator 反复申请不同大小的块，加速碎片积累。shape bucketing 能同时帮助编译缓存和 allocator 稳定性。"
+      },
+      {
+        "title": "失败路径速查表",
+        "body": "| 症状 | 首要假设 | 证据 | 修复方向 |\n|---|---|---|---|\n| GPU util 低，kernel 短且稀疏 | CPU dispatch / launch 主导 | `nsys` HW 空洞，`torch.profiler` op count | 减少 op、`torch.compile`、fusion |\n| 换更强 GPU 后加速不明显 | launch 固定占比随 GPU 算力提升而升高 | launch_overhead_ratio 上升 | CUDA Graph、compiled reduce-overhead |\n| 每步 `.item()` / `.cpu()` | 隐式同步，破坏 overlap | `nsys` 同步前后 CUDA HW 空洞 | 延迟日志、批量汇总、异步回传 |\n| 训练 step 抖动 | 动态 shape → allocator 碎片 | allocated/reserved/peak 与 step time 相关 | shape bucketing、预分配 |",
+        "reveal": {
+          "q": "某推理服务 forward 有 1200 个 kernel，平均 launch 18 μs、执行 12 μs。请估算端到端设备路径时间，以及融合到 300 个 kernel（平均执行 40 μs）后的改善幅度。",
+          "a": "原始：1200 × (18 + 12) = 36 ms。融合后：300 × (18 + 40) = 17.4 ms。改善约 52%。注意此估算只计了 launch + execute，实际还要加同步、allocator 和 H2D 开销。"
+        }
+      },
+      {
+        "title": "排障顺序：先判层，再下钻",
+        "body": "面对「GPU 利用率低」或「模型推理慢」，按层级排查：\n\n1. **时间线是否连续？** 用 `nsys` 看 CUDA HW row。有空洞 → 查 CPU 提交、同步、H2D\n2. **CPU self time 高？** 用 `torch.profiler` 找 `aten::` 事件。多且碎 → 减少 eager op、`torch.compile`\n3. **有频繁 D2H/同步？** 移除 `.item()`、`.cpu()`、逐步日志\n4. **GPU 连续忙但少数 kernel 占大头？** 这才用 `ncu` 下钻 kernel 内部\n\n**常用动作优先级**：\n1. 去掉热路径里的 `.item()` / `.cpu()` / 逐步日志\n2. 推理使用 `inference_mode()` 去掉 autograd 包装\n3. 批量化 Python 循环里的 tensor op\n4. 尝试 `torch.compile` 或已有 fused op\n5. 约束 shape bucket 和 layout",
+        "tip": "不要因为「已经包了 torch.compile」就认为没有 dispatch 开销。Graph break 会让断图区域重新暴露 Python/dispatcher 成本——要看编译日志和 profiler 结合。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "一个 forward 有 500 个 kernel，平均 launch 开销 20 μs、平均执行时间 5 μs。哪个比值最能判断是否 launch-bound？",
+        "options": [
+          "GPU utilization 百分比",
+          "kernel_count × median_launch_time / step_time",
+          "HBM 带宽利用率",
+          "单个最大 kernel 的执行时间"
+        ],
+        "answer": 1,
+        "explain": "launch-bound 的核心判断是 launch 固定开销在端到端时间中的占比。若 kernel_count × launch_time / step_time ≥ 10% 且有 HW 空洞，先按 launch-bound 处理。GPU util 和 HBM 带宽是结果，不是根因判断直接指标。"
+      },
+      {
+        "type": "judge",
+        "prompt": "换用更快的 GPU 后，launch 固定开销（μs 量级）会随 GPU 算力成比例下降，所以小 kernel 多的场景加速比和大 GEMM 场景一样好。",
+        "answer": false,
+        "explain": "launch 开销来自 CPU → runtime → driver 提交路径，主要由 CPU 端决定，不随 GPU Tensor Core 算力翻倍而减少。新 GPU 让 kernel 执行变短，反而使 launch 占比升高，小 kernel 多的场景加速比反而更差。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 eager 模式下执行 `y = gelu(x + bias); z = y * scale + residual`，最可能产生几个独立 CUDA kernel launch？",
+        "options": [
+          "1 个（框架自动融合）",
+          "2 个（gelu 和 residual 各一个）",
+          "4 个（add、gelu、mul、add 各一个）",
+          "0 个（全部在 CPU 执行）"
+        ],
+        "answer": 2,
+        "explain": "Eager 模式逐 op 执行，add、gelu、mul、add 各自触发一次 kernel launch 和中间 tensor 分配。只有经过 torch.compile 或手写 fused op 才能合成一个 kernel。"
+      },
+      {
+        "type": "input",
+        "prompt": "framework dispatcher 的职责是什么？用一句话说明（包含「dispatch key」「后端」两个词）。",
+        "accept": ["dispatch key", "后端", "路由", "选择"],
+        "explain": "dispatcher 根据 tensor 的 dispatch key（device、dtype、layout、requires_grad 等属性集合）把同一个算子 API 路由到对应后端实现（如 CPU、CUDA、AutogradCUDA、AMP 等）。这是框架统一语义的核心机制，代价是每个 eager op 都有一次选择开销。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`nvidia-smi` 显示 GPU 显存占用 20 GB，而 `torch.cuda.memory_allocated()` 只返回 8 GB，这说明存在显存泄漏。",
+        "answer": false,
+        "explain": "caching allocator 会保留已释放 tensor 的显存块在缓存池（reserved）中供复用，不立刻归还给 CUDA。因此 reserved（nvidia-smi 看到的）通常高于 allocated（当前活跃 tensor 占用）。真正的泄漏判断需要看 allocated 是否持续增长。"
+      },
+      {
+        "type": "match",
+        "prompt": "将排障工具与最适合回答的问题匹配：",
+        "left": ["nsys", "torch.profiler", "ncu", "CUDA_LAUNCH_BLOCKING=1"],
+        "right": [
+          "GPU HW 时间线空洞、H2D/NCCL 是否重叠",
+          "哪个 PyTorch op/module 触发了小 kernel 或同步",
+          "单个 kernel 的 occupancy、寄存器压力、warp stall",
+          "定位异步错误的真实出错位置（不用于性能结论）"
+        ],
+        "explain": "nsys 看全系统时间线（GPU 空洞、H2D、NCCL）；torch.profiler 把 PyTorch op/module 与 CUDA kernel 关联；ncu 下钻单 kernel 微结构；CUDA_LAUNCH_BLOCKING=1 强制同步让错误栈更准，但会破坏 overlap，不能用于性能测量。"
+      },
+      {
+        "type": "choice",
+        "prompt": "关于 `torch.compile` 的 graph break，下列哪项描述正确？",
+        "options": [
+          "graph break 是编译错误，会导致训练崩溃",
+          "graph break 把一段本可融合的区域切开，暴露回 Python 和 dispatcher 开销",
+          "graph break 后编译器会自动重新尝试捕获所有代码",
+          "graph break 只影响 backward，不影响 forward"
+        ],
+        "answer": 1,
+        "explain": "graph break 不是错误，而是编译器遇到无法捕获的 Python 行为（如 .item()、动态控制流、不支持的 op）时的降级策略。断点处的区域回退到 eager 执行，重新暴露 Python/dispatcher/launch 开销。需要同时看编译日志和 profiler 才能发现。"
+      },
+      {
+        "type": "input",
+        "prompt": "control path 中，CUDA runtime 和 CUDA driver 各自的主要职责是什么？（各用 10 字以内描述）",
+        "accept": ["runtime", "driver", "launch", "context", "提交", "命令"],
+        "explain": "CUDA runtime 负责 launch、memcpy、event、stream 等简化的应用侧 API；CUDA driver 负责 context 管理、module 加载、device memory 和底层命令 buffer 提交。应用通常通过 runtime API 间接调用，runtime 再转交给 driver。"
+      }
+    ]
+  }
+]

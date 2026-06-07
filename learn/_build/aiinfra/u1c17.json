@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u1c17",
+    "title": "本地文件系统：ext4、XFS、ZFS",
+    "subtitle": "Journal、Extent、CoW 与 AI 训练场景选型",
+    "intro": [
+      {
+        "title": "本地文件系统要解决什么",
+        "body": "文件系统在块设备上维护五类状态：\n\n| 状态 | 内容 | AI 场景风险 |\n|---|---|---|\n| 命名 | 目录项、link count | rename/unlink 后目录不一致 |\n| 身份 | inode、权限、大小 | inode 泄漏或耗尽 |\n| 空间 | free block、extent | 碎片、分配锁竞争 |\n| 数据 | file block 内容 | torn write、旧数据暴露 |\n| 恢复 | journal/log/checkpoint | crash 后 replay 失败 |\n\nAI workload 把设计点推到极端：checkpoint 是少量大文件 + 失败恢复敏感；dataset cache 是大量读 + 多进程共享；预处理临时目录是大量 rename/delete，元数据压力高。",
+        "tip": "选型不是\"哪个文件系统最快\"，而是 IO 形状与文件系统机制是否匹配。"
+      },
+      {
+        "title": "ext4：三种 journal 模式的语义边界",
+        "body": "ext4 用 **jbd2** journal 保护元数据，有三种模式：\n\n| 模式 | journal 内容 | 崩溃保证 |\n|---|---|---|\n| `data=journal` | 元数据 + 用户数据 | 最强，但写两次，吞吐最差 |\n| `data=ordered`（默认） | 仅元数据；用户数据先落盘 | 不会指向未初始化旧块 |\n| `data=writeback` | 仅元数据；顺序不保证 | crash 后可能暴露旧用户数据，**训练场景不用** |\n\n**`data=ordered` 精确承诺**：crash 后已出现在目录里的新文件不会指向未初始化磁盘块。它**不保证** `write()` 已落盘、不保证文件大小是最终值、不保证父目录更新可见——这些都需要 `fsync(file)` 和 `fsync(parent_dir)`。\n\n**ext4 新特性**：`fast_commit`（5.10+）把 fsync 从写完整 transaction 简化为只 log 受影响 inode 的 delta，对 checkpoint workload 可降 p99 数倍。新盘建议格式化时开启。",
+        "tip": "ext4 block group 在 mkfs 时固定 inode 总数。inode 耗尽时 df -h 还很空，但 df -ih 显示 100%。"
+      },
+      {
+        "title": "XFS：Allocation Group 与延迟分配",
+        "body": "XFS 把分区切成多个 **Allocation Group（AG）**，每个 AG 有自己的空闲空间 B+tree 和 inode B+tree，可以独立加锁——多核分配可以同时操作不同 AG，这是 XFS 高并发吞吐的根本来源。\n\n**inode 动态分配**：XFS 不像 ext4 在 mkfs 时定死 inode 数，按需分配 inode chunk，几乎不会\"inode 满\"。\n\n**延迟分配（Delayed allocation）**：`write()` 进入 Page Cache 时，XFS 只在内存里登记 delalloc reservation，不分配物理块。到 writeback 时，一次找到最合适的**连续大段**——多次小 write 合并成一次大分配，顺序大文件 extent 数极少。\n\n**XFS reflink**（新版默认开启）：`cp --reflink=always src dst` 是 metadata-only 的 CoW clone，TB 级 checkpoint 也是毫秒返回。可用于训练完立刻 clone 一份给评测流程，主训练继续推进。",
+        "tip": "XFS xlog 是纯物理 redo log（记录元数据块的 delta），和 ext4 jbd2 逻辑不同。log size 太小会在高并发 fsync 场景导致 FS 暂停，用 xfs_info 检查。"
+      },
+      {
+        "title": "ZFS：CoW、校验和、ARC",
+        "body": "ZFS 的核心：**写不覆盖旧块，写新块后更新指针树**（CoW），整个元数据树是 Merkle tree，每个 block pointer 记录子节点 checksum。任何位翻转在读取时都能被发现。\n\n**ARC（Adaptive Replacement Cache）**：ZFS 不用 Linux Page Cache，自管内存缓存，分 MRU（最近访问）和 MFU（多次访问）两个 list，对大顺序扫描污染有抵抗力。但 ARC 不显示在 `free -h` 的 available 里，**必须显式设置上限**：\n```\noptions zfs zfs_arc_max=68719476736   # 64 GiB 上限\n```\n\n**ZIL/SLOG**：同步写（`fsync`）走 ZIL（ZFS Intent Log）路径，只有 ZIL 写完才返回。若无专用 SLOG 设备，ZIL 写在主 pool 上——raidz pool 同步写慢的核心原因。\n\n**`sync=disabled`**：让 fsync 立即返回，落盘异步——**绝不要**用于 checkpoint，crash 后丢最近 5 秒所有写入。\n\n**recordsize**：默认 128KB，是 CoW 单位。随机 4KB 覆盖写实际读改写 128KB，写放大 32×。大文件顺序写调到 1M；数据库/向量索引调到 16K~32K。",
+        "tip": "ZFS snapshot 因 CoW 几乎免费（O(1) 创建），TB 级 dataset 快照 < 1 秒。`zfs send | zfs recv` 做增量同步比 rsync 更高效。"
+      },
+      {
+        "title": "Journal vs CoW：语义差异对 checkpoint 的影响",
+        "body": "| 机制 | 保护重点 | 对 checkpoint 的含义 | 常见误解 |\n|---|---|---|---|\n| ext4 jbd2 | 元数据事务 | rename 可恢复，文件数据仍需 fsync | write 返回 = 落盘 |\n| XFS xlog | 元数据 redo log | 大文件并发写好，发布仍需文件+目录 fsync | XFS 不需要 fsync |\n| ZFS CoW | 指针树一致性+校验 | 快照强，sync 写延迟看 ZIL/SLOG | CoW 自动解决应用协议 |\n\n三者都**不能替代应用层的 fsync + rename 原子发布协议**。"
+      },
+      {
+        "title": "NVMe SLC cache 悬崖",
+        "body": "消费级和部分入门企业级 NVMe（QLC/TLC + SLC cache）存在一个常被忽视的现象：**前 30~60 秒写入速度很高，之后跌到 1/3 甚至 1/10**。\n\n原因：设备把空闲 NAND 暂时当 SLC 用（1 bit/cell），写快；SLC 区填满后直写 TLC/QLC（3~4 bit/cell）并做 GC，吞吐断崖下跌。\n\ncheckpoint 影响：单 rank 写 50GB，前 5GB 体感 5 GB/s，后续 45GB 可能只有 800 MB/s。\n\n**暴露方法**：`fio --runtime=300` 或写满设备一半以上容量，看 bw 随时间曲线，断崖即 SLC 耗尽点。\n\n**选盘指标**：看 DWPD（每日写入次数）和 sustained write spec，不是峰值；空间水位保持 < 70%。",
+        "tip": "企业级 NVMe（U.2/E1.S，有掉电保护 PLP）一般无 SLC cache 设计，吞吐曲线平稳，是训练节点首选。"
+      },
+      {
+        "title": "AI 选型：按 workload 决策",
+        "body": "| 场景 | 推荐 | 关键设计点 |\n|---|---|---|\n| 单机临时训练 cache | ext4 或 XFS | shard 格式、清理、容量水位 |\n| 大 checkpoint 顺序写 | XFS（多并发更稳）| 发布协议、fsync、并发 rank |\n| 海量小文件 dataset | 任何 FS 都不够 | 打包成 shard、manifest、index |\n| 数据版本快照 | ZFS（dataset 级）或 XFS reflink（文件级）| 快照策略、恢复演练 |\n| 静默损坏敏感 | ZFS（数据+元数据 checksum）| scrub、备份 |\n| 容器 overlay 底层 | ext4 或 XFS（需 ftype=1）| overlay 兼容性 |\n\n保守建议：通用节点选 ext4/XFS；多并发大文件本地 NVMe 优先评估 XFS；有快照/校验需求才评估 ZFS，并把 ARC 内存和运维成本一起算。",
+        "reveal": {
+          "q": "为什么 ZFS 的 ARC 上限必须显式设置，而不是让系统自动管理？",
+          "a": "ARC 是 ZFS 内核模块管理的缓存，绕过了 Linux 内存管理。free -h 的 available 不包含 ARC，OOM killer 也不会主动回收它（或回收很慢）。如果不设 zfs_arc_max，ARC 可能占满大部分 RAM，导致训练框架、NCCL buffer、Page Cache 全部内存不足，出现 OOM 或严重交换。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "ext4 `data=ordered` 模式能保证什么？",
+        "options": [
+          "write() 返回即数据已落到稳定存储",
+          "crash 后已在目录中的新文件不会指向未初始化的旧磁盘块",
+          "父目录的命名更新在 crash 后一定可见",
+          "所有用户数据和元数据都进入 journal，保证完整恢复"
+        ],
+        "answer": 1,
+        "explain": "data=ordered 只保证用户数据先于元数据 commit 落盘，防止新文件指向旧的未初始化块。它不保证 write() 落盘，不保证文件大小最终值，也不保证父目录更新——这些都需要显式的 fsync。"
+      },
+      {
+        "type": "judge",
+        "prompt": "XFS 在 mkfs 时固定了 inode 数量，小文件多时可能出现 inode 耗尽而磁盘空间仍充足的情况。",
+        "answer": false,
+        "explain": "ext4 在 mkfs 时固定 inode 数。XFS 的 inode 是动态分配的（按需分配 inode chunk），几乎不会\"inode 满\"，用尽磁盘空间才是上限。这是 XFS 相对 ext4 的优势之一。"
+      },
+      {
+        "type": "match",
+        "prompt": "将文件系统特性与其所属的文件系统匹配：",
+        "left": ["block group + inode bitmap", "Allocation Group + B+tree", "CoW + Merkle tree checksum", "ARC（MRU + MFU）"],
+        "right": [
+          "ZFS 的读缓存，不使用 Linux Page Cache",
+          "ext4 的空间与 inode 管理单元",
+          "XFS 的多核并发分配结构",
+          "ZFS 的写机制，任何写入都分配新块"
+        ],
+        "explain": "block group + inode bitmap 是 ext4 的结构；AG + B+tree 是 XFS 实现高并发分配的方式；CoW + Merkle tree 是 ZFS 保证数据完整性的核心；ARC 是 ZFS 自管的读缓存。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ZFS 上配置 `sync=disabled` 会有什么后果？",
+        "options": [
+          "fsync() 调用会等待 ZIL 写完才返回，延迟提高",
+          "所有写操作变成只读，防止数据损坏",
+          "fsync() 立即返回，落盘变为异步，crash 后最近 5 秒写入会丢失",
+          "写入绕过 ARC 直接到 pool，减少内存占用"
+        ],
+        "answer": 2,
+        "explain": "sync=disabled 让 fsync() 几乎立即返回而不等 ZIL，写入实质变成异步。crash 发生时，当前 TXG 尚未 commit 的数据（最多约 5 秒）会全部丢失。绝不能用于 checkpoint 等需要持久性保证的场景。"
+      },
+      {
+        "type": "judge",
+        "prompt": "XFS 的延迟分配（delayed allocation）可能导致：write() 返回时文件已有大小，但 crash 后内容是任意的。",
+        "answer": true,
+        "explain": "延迟分配让 write() 进入 Page Cache 但不分配物理块，文件大小立即更新（inode 内存视图）。fsync 前发生 crash，数据既未在 journal 也未在最终位置，文件大小可能被记录但内容未定义。这强调了 checkpoint 必须先 fsync 数据再发布 rename 的重要性。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ZFS 的 recordsize 默认 128KB，对随机 4KB 覆盖写的写放大倍数是多少？",
+        "options": ["2×", "8×", "32×", "128×"],
+        "answer": 2,
+        "explain": "ZFS CoW 的最小写入单元是 recordsize。修改 4KB 数据需要读出整个 128KB record、修改 4KB、写回新的 128KB record——即 128KB / 4KB = 32× 写放大。这是随机覆盖写场景 ZFS 性能差的根本原因。"
+      },
+      {
+        "type": "input",
+        "prompt": "检查 XFS 文件系统的 AG 数量和 log 大小，应使用什么命令？（只写命令名）",
+        "accept": ["xfs_info"],
+        "explain": "`xfs_info /mount/point` 输出文件系统参数，包括 agcount（AG 数量）、log 段大小等，是 XFS 运维的基本命令。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用 `fio --runtime=10` 测试 NVMe 写入吞吐，发现结果很高。但实际 checkpoint 写入远慢于此，最可能的原因是？",
+        "options": [
+          "fio 版本太旧，不支持新 NVMe 协议",
+          "测试时间太短，没有触发 SLC cache 耗尽后的持续写入性能下降",
+          "checkpoint 使用了 O_DIRECT，绕过了 fio 的缓存优化",
+          "fio 的 iodepth 设置过低，未能打满设备队列"
+        ],
+        "answer": 1,
+        "explain": "消费级/入门企业级 NVMe 有 SLC cache，短时测试命中 SLC 区域会得到峰值速度。SLC 耗尽后直写 TLC/QLC 吞吐断崖下跌。checkpoint 写入量大、持续时间长，会进入低吞吐区间。必须用 --runtime=300 或写满半块盘才能暴露真实持续性能。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 ext4 上 mkfs 格式化后，即使磁盘空间仍然充足，创建新文件也可能因 inode 耗尽而失败。",
+        "answer": true,
+        "explain": "ext4 的 inode 总数在 mkfs 时固定（默认每 16KB 数据分配一个 inode）。百万小文件场景可以先耗尽 inode 配额。用 `df -ih` 可以查看 inode 使用率；`df -h` 只看块空间，不显示 inode 状态。"
+      }
+    ]
+  }
+]

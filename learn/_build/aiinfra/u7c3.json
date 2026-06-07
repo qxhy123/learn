@@ -1,0 +1,120 @@
+[
+  {
+    "id": "u7c3",
+    "title": "容器运行时与设备注入",
+    "subtitle": "OCI、NVIDIA Container Toolkit 与最小权限边界",
+    "intro": [
+      {
+        "title": "运行时的核心矛盾：隔离 vs 硬件访问",
+        "body": "容器运行时要解决的不可化简问题是：**把进程放进受限的文件系统、进程空间、网络空间、挂载空间和资源配额里，同时只暴露它运行 AI 工作负载所需的硬件设备、驱动接口和内核能力。**\n\n普通服务容器主要依赖 CPU、内存、网络和文件系统。AI 容器还可能需要 `/dev/nvidia*` GPU 设备节点、MIG compute instance、NVIDIA Driver userspace library、`/dev/infiniband/*` RDMA 设备、NVMe 本地盘、大 `/dev/shm`、memlock/HugePages/IPC 能力，以及拓扑信息和 NUMA 亲和。\n\n**隔离太强**，容器看不到设备；**权限太大**，容器接近宿主机；**注入不完整**，应用报出的却可能只是 `CUDA unknown error`、`NCCL timeout` 或 `operation not permitted`。"
+      },
+      {
+        "title": "OCI、containerd、runc：各层职责",
+        "body": "Kubernetes 中容器创建的常见路径：`kubelet → CRI → containerd → OCI runtime spec → runc → container process`\n\nAI 设备注入通常插在「生成 OCI spec 到 runc 创建进程」这条路径里：\n\n| 组件 | 职责 | AI 相关注意 |\n|---|---|---|\n| `containerd` | 管理镜像、快照、容器生命周期和 runtime 调用 | runtime 配置、NVIDIA handler |\n| `runc` | 按 OCI spec 创建 Linux 容器进程 | devices、mounts、cgroup、caps |\n| `NVIDIA Container Toolkit` | 计算并注入 NVIDIA 设备、库和配置 | hook/CDI、`nvidia-container-cli` |\n| `Device Plugin` | 向 Kubernetes 报告和分配设备资源 | 资源名、MIG strategy |\n\n**最重要的混淆点**：Device Plugin 和 NVIDIA Container Toolkit 不是一件事。Device Plugin 是「告诉 Kubernetes 节点有哪些设备并分配」；runtime hook 是「容器创建时把分配到的设备节点、驱动库、环境变量放进 OCI spec」。两者都必须正确。",
+        "tip": "runc 只按 OCI spec 创建进程，不理解 `nvidia.com/gpu` 资源语义。GPU Pod 能跑，需要 Device Plugin（编排层）和 NVIDIA Container Toolkit（执行层）都工作。"
+      },
+      {
+        "title": "NVIDIA Container Toolkit 内部：四个二进制 + 一个库",
+        "body": "NVIDIA Container Toolkit 实际由多个组件组成，调试时必须分清是哪一层失败：\n\n| 组件 | 职责 | 可独立调用 |\n|---|---|---|\n| `libnvidia-container` | C 库，mount 设备、注入 driver 库、配置 cgroup | 否 |\n| `nvidia-container-cli` | 命令行入口，所有实际注入动作都通过它 | 是（最有用的调试工具） |\n| `nvidia-container-runtime-hook` | OCI prestart hook，被 runc 调用 | 由 runc 自动调 |\n| `nvidia-container-runtime` | runc 的薄 wrapper，通过 containerd runtime_handler 选择 | 由 containerd 自动调 |\n| `nvidia-ctk` | 生成 CDI spec、配置 containerd | 是（运维工具） |\n\ncontainerd 配置中通过 `runtimeClassName: nvidia` 触发 NVIDIA runtime handler。如果 RuntimeClass 没配、BinaryName 路径错、或 wrapper 不存在，整条链就走不通——这是「GPU Pod 启动后 nvidia-smi 找不到」事故的常见根因之一。\n\n**关键环境变量**：`NVIDIA_VISIBLE_DEVICES`（控制可见设备）、`NVIDIA_DRIVER_CAPABILITIES`（控制暴露能力，缺 `utility` 会导致 nvidia-smi 不可用）、`CUDA_VISIBLE_DEVICES`（框架层重映射，覆盖后设备数量可能不对）。"
+      },
+      {
+        "title": "CDI vs 旧 hook 路径：注入机制的演进",
+        "body": "**OCI hook（旧路径）**：每次容器创建时跑 `nvidia-container-runtime-hook` 二进制，由它动态计算该挂什么、改 OCI spec。调试靠 hook 日志，失败模式是 hook crash 导致容器启动失败。\n\n**CDI（新路径）**：Container Device Interface 是 Kubernetes 1.27+ GA 的标准。Device Plugin 的 Allocate response 返回 CDI device 名称，containerd 读 `/etc/cdi/nvidia.yaml`（由 `nvidia-ctk cdi generate` 在节点启动时生成一次），把 deviceNodes/mounts/env/hooks 合并进 OCI spec。\n\n| 维度 | OCI hook | CDI |\n|---|---|---|\n| 注入决策何时做 | 每次容器创建时跑 user binary | 节点启动时生成一次 spec 文件 |\n| 调试方式 | 看 hook 日志 + 试运行 | 直接看 spec 文件 |\n| 审计 | 每次都要 trace | spec 文件可静态扫描签名 |\n\n**重要陷阱**：Driver 升级后必须重新生成 CDI spec（`nvidia-ctk cdi generate`），否则 spec 里引用旧路径的 `libcuda.so` 会导致容器启动失败。",
+        "tip": "containerd 1.7+ + nvidia-container-toolkit 1.14+ 已走 CDI 优先路径。旧节点（containerd 1.6 或更早）只能走 hook 路径。混合集群要验证两条路径的一致性。"
+      },
+      {
+        "title": "MIG、RDMA、/dev/shm 与最小权限",
+        "body": "**MIG 注入**：MIG 把 GPU 切成隔离的 compute instance，资源名如 `nvidia.com/mig-1g.10gb: 1`，设备标识用 MIG UUID。`cuda:0` 只是容器内可见设备序号，不代表固定 MIG 实例。生产日志应记录 UUID，而不是只记录 index。\n\n**RDMA 注入**：需要 `/dev/infiniband/*` 设备节点、rdma-core userspace 库、足够 memlock、正确网络接口/GID/MTU，以及 NCCL 能选对 NIC。RDMA 不通时，不要只调 NCCL 参数，先证明 verbs 在容器内可用。\n\n**`/dev/shm`**：Docker 默认值往往很小。AI 场景（dataloader、多进程推理、NCCL、Ray）可能需要更大共享内存，通过 `emptyDir: {medium: Memory, sizeLimit: 16Gi}` 挂载，会占用节点内存，需结合 memory limit 设计。\n\n**最小权限设计**：正确顺序是先列出 workload 需要的设备、library mount、写入路径、Linux capability 和 namespace 放宽，再对每一项写明证据，默认拒绝未列出的 hostPath、capability 和 `privileged: true`。生产工作负载应：capabilities drop all + 只加必需项；`readOnlyRootFilesystem: true`；`allowPrivilegeEscalation: false`；`runAsNonRoot: true`。",
+        "reveal": {
+          "q": "容器内 `/dev/nvidia0` 存在，但访问时得到 `Operation not permitted`，最可能是什么原因？",
+          "a": "cgroup device allowlist 未正确设置。设备节点存在（mount 成功）但 cgroup 不允许访问。在 cgroup v2 节点上，如果 `libnvidia-container` 版本低于 1.10，它只会 echo `devices.allow` 文件（这在 v2 上无效），不会写 BPF 程序，导致设备挂载但访问被拒。需升级 toolkit 到 1.10+，或检查 `bpftool cgroup show`。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Device Plugin 和 NVIDIA Container Toolkit 最核心的职责差异是什么？",
+        "options": [
+          "Device Plugin 负责构建镜像，NVIDIA Toolkit 负责推送镜像",
+          "Device Plugin 负责在编排层发现和分配设备；NVIDIA Toolkit 负责在容器创建时把设备节点、驱动库和 env 注入容器",
+          "两者功能完全相同，可以互相替代",
+          "Device Plugin 负责管理 cgroup，NVIDIA Toolkit 负责管理 namespace"
+        ],
+        "answer": 1,
+        "explain": "Device Plugin 是编排层控制面：告诉 Kubernetes 节点有哪些设备，并在 Pod 请求资源时分配。NVIDIA Container Toolkit 是执行面：在容器创建时把分配到的设备节点、driver library 和环境变量放进 OCI spec。两者必须都正确，GPU Pod 才能正常工作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在生产 AI 容器中，为了确保 GPU 可用，应该默认设置 `privileged: true`。",
+        "answer": false,
+        "explain": "`privileged: true` 基本绕开容器隔离，暴露大量设备并放宽 seccomp/cgroup/capability 限制，是高风险配置。生产 GPU 容器通过 Device Plugin 资源声明 + NVIDIA runtime handler 就能访问 GPU，不需要 privileged。正确做法是最小权限：capabilities drop all，只加必需项。"
+      },
+      {
+        "type": "match",
+        "prompt": "将容器内症状与最可能的根因层对应：",
+        "left": [
+          "Pod 一直 Pending",
+          "容器内没有 /dev/nvidia*",
+          "/dev/nvidia0 存在但访问 EPERM",
+          "nvidia-smi 失败但宿主机正常"
+        ],
+        "right": [
+          "cgroup device allowlist 未配置（v2 节点可能是 BPF 程序未写入）",
+          "GPU 资源不足、资源名错误、taint/affinity 阻挡",
+          "NVIDIA runtime hook 未执行或 ContainerRuntime 配置缺少 NVIDIA handler",
+          "容器内 NVIDIA_DRIVER_CAPABILITIES 缺 utility 能力或 driver library 注入失败"
+        ],
+        "explain": "Pending 是调度/资源问题；无 device node 是 hook 未执行；device 存在但 EPERM 是 cgroup 权限；nvidia-smi 失败是 utility capability 或 driver library 注入问题。"
+      },
+      {
+        "type": "choice",
+        "prompt": "CDI（Container Device Interface）相比旧 OCI hook 路径的主要优势是什么？",
+        "options": [
+          "CDI 可以让容器直接安装 NVIDIA Driver",
+          "CDI 在节点启动时生成一次声明式 spec 文件，容器创建时直接读文件，不需要每次跑外部程序",
+          "CDI 会自动管理 MIG 切分策略",
+          "CDI 是 Docker 专属特性，不支持 containerd"
+        ],
+        "answer": 1,
+        "explain": "CDI 把设备注入信息做成静态声明文件，由 containerd 直接读取解析，无需每次容器创建时跑 hook 二进制。优点是可静态审计、失败更易排查、启动路径上无外部进程依赖。containerd 1.7+ 原生支持。"
+      },
+      {
+        "type": "input",
+        "prompt": "多机训练 Pod 需要 RDMA 内存注册能力，应该在 securityContext 中添加哪个 Linux capability？（填写 capability 名）",
+        "accept": ["IPC_LOCK"],
+        "explain": "RDMA 内存注册通常需要 `IPC_LOCK` capability 来允许锁定内存页。这比 `privileged: true` 权限范围小很多，是最小权限原则的体现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 cgroup v2 节点上，只要 `/dev/nvidia0` 设备节点存在于容器内，进程就一定能读写该设备。",
+        "answer": false,
+        "explain": "设备节点存在（mount 成功）不等于 cgroup 允许访问。cgroup v2 用 eBPF 程序控制设备访问，没有旧的 `devices.allow` 文件。如果 `libnvidia-container` 版本低于 1.10，BPF 程序未正确写入，设备文件存在但访问会得到 `Operation not permitted`。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Kubernetes 中扩大容器 /dev/shm 的正确方式是什么？",
+        "options": [
+          "设置 hostNetwork: true",
+          "使用 medium: Memory 的 emptyDir volume 挂载到 /dev/shm 并设置 sizeLimit",
+          "在容器启动命令里 mount tmpfs",
+          "设置 privileged: true 自动扩大 shm"
+        ],
+        "answer": 1,
+        "explain": "在 Kubernetes 中正确做法是定义 `emptyDir: {medium: Memory, sizeLimit: 16Gi}` 并挂载到 `/dev/shm`。注意这会占用节点内存，应结合容器 memory limit 设计，不能无上限。"
+      },
+      {
+        "type": "choice",
+        "prompt": "升级 NVIDIA Driver 后，如果使用 CDI 路径，必须执行哪个操作？",
+        "options": [
+          "重启 Kubernetes API Server",
+          "重新构建所有业务镜像",
+          "重新生成 CDI spec 文件（nvidia-ctk cdi generate）",
+          "重置 cgroup 配置"
+        ],
+        "answer": 2,
+        "explain": "CDI spec 内容包含 Driver 版本相关的 `libcuda.so` 等库的宿主机路径。升级 Driver 后路径会变化，如果不重新生成 CDI spec（`nvidia-ctk cdi generate`），spec 仍引用旧路径的库文件，会导致容器启动失败。"
+      }
+    ]
+  }
+]

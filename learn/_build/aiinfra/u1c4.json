@@ -1,0 +1,133 @@
+[
+  {
+    "id": "u1c4",
+    "title": "分支预测",
+    "subtitle": "BTB、RAS、TAGE 与 AI 推理服务的 cold path 误预测",
+    "intro": [
+      {
+        "title": "为什么分支预测是物理必然？",
+        "body": "**根本问题**：CPU 流水线是几十个工位的传送带。当指令 i 还在 EX 阶段计算 `cmp r1, r2; jne L` 的真值时，IF（取指）阶段已经在装载 i+10、i+11、i+12。\n\n如果硬件等到 EX 真值出来才决定取指地址，从 IF 到 EX 之间所有 cycle 的工位就只能空转——浪费等于流水线深度（14–19 cycle）。这在物理上是不可接受的。\n\n**唯一出路**：用历史信息估计未来分支行为。这就是分支预测器存在的全部理由——不是市场技巧，而是物理必然。\n\n**误预测代价量化**：`ΔCPI_branch ≈ 分支密度 × 误预测率 × miss_penalty`。若分支密度 0.20、误预测率 5%、penalty 18 cycle，则 ΔCPI ≈ 0.18，等价于吞吐降 15%。",
+        "tip": "真实程序的分支不是随机的：循环回跳几乎总是 taken，空指针检查几乎总是 not-taken，热路径分支可预测性常 > 95%。这就是预测器有意义的统计基础。"
+      },
+      {
+        "title": "BTB、RAS 与方向预测器：三个并行查询",
+        "body": "分支预测前端在每个 cycle 同时执行三个查询：\n\n| 结构 | 回答的问题 | 容量量级 | 失败后果 |\n|---|---|---|---|\n| **方向预测器** | taken 还是 not-taken？ | KB 级 history table | 错则 flush，15–20 cycle |\n| **BTB**（Branch Target Buffer） | 跳转目标地址是什么？ | 数千项 | miss 则 stall 至 EX 解析目标 |\n| **RAS**（Return Address Stack） | `ret` 要跳回哪里？ | 16–32 项专用栈 | 深递归或异常 unwind 会破坏 |\n\n**为什么 RAS 不能用通用 BTB 替代？** `ret` 的目标由 `call` 的调用点决定，同一个函数可能被几十个地方调用，每次返回目标都不同。BTB 只记上次返回目标，调用点一变就错。RAS 用「call push / ret pop」的栈语义，只要配对正确几乎 100% 命中。",
+        "tip": "AI Infra 注意：Python 解释器、PyTorch op dispatcher、TorchScript 解释执行都是大量 indirect dispatch 的路径，属于 ITTAGE（间接跳转预测器）的压力来源。"
+      },
+      {
+        "title": "从 2-bit 计数器到 TAGE：预测器演化路径",
+        "body": "预测器发展沿一条清晰的因果链演进：\n\n- **1-bit**：记上次方向。问题：循环每轮进出各错一次。\n- **2-bit Smith 饱和计数器**：4 个状态（Strongly/Weakly Taken/Not-Taken），需连续两次错才翻转方向，抗瞬时扰动。循环每轮只错一次。\n- **GShare**：用全局历史寄存器（GHR）XOR PC 索引表。捕捉跨分支相关性，但不同分支可能 hash 到同一项，产生 aliasing 互相污染。\n- **PShare（局部历史）**：每个分支 PC 维护自己的历史模式，适合捕捉单分支内部的周期性规律。\n- **Tournament/Hybrid**：元预测器选择 GShare 或 PShare，综合两者优点。\n- **TAGE（TAgged GEometric history length）**：现代高端核心的事实标准。多张表，历史长度按几何级数（4、10、25、64、160 cycle），每项带 tag，命中时选最长历史的表，自适应历史长度，准确率在 SPEC 上 > 97%。",
+        "steps": [
+          "几何历史长度：同时维护短（4 cycle）和长（160 cycle）历史，不同分支用不同长度",
+          "Tag 匹配：每项带 tag，避免 aliasing，只有 PC+GHR hash 匹配才使用该项",
+          "优先用最长命中：多张表都命中时，选历史最长的，准确度最高",
+          "Base predictor fallback：所有表都 miss 时退化到 bimodal，保持低错误率"
+        ]
+      },
+      {
+        "title": "误预测恢复：15–25 cycle 的代价从哪里来？",
+        "body": "误预测一旦被检测到（在 EX 段），CPU 必须完成以下步骤：\n\n1. **Squash**：丢弃 ROB 中所有 younger（更晚）的 micro-op\n2. **回滚 rename**：把 Register Alias Table 恢复到分支那一刻的 checkpoint\n3. **Redirect**：把正确目标 PC 送回前端\n4. **Refill**：前端 IF/ID/Decode 重新从正确 PC 开始填充流水线\n\n每一步都消耗 cycle，加总约 15–25 cycle（Skylake 约 15–17，Zen4 约 17–19）。如果 L1I cache 也 miss，refill 还要额外加几十 cycle。\n\n**MPKI（Mispredictions Per Kilo-Instructions）** 是最实用的衡量指标：\n\n| MPKI | 含义 |\n|---|---|\n| < 5 | 健康，分支预测不是主要瓶颈 |\n| 5–10 | 值得排查热点函数 |\n| > 15 | 严重，cold path 或 indirect-heavy，需重构 |",
+        "reveal": {
+          "q": "分支密度 0.22、误预测率 4.5%、penalty 18 cycle，ΔCPI 是多少？",
+          "a": "ΔCPI = 0.22 × 0.045 × 18 ≈ 0.178。若 base CPI = 0.9，则总 CPI ≈ 1.08，IPC ≈ 0.93。若误预测率涨到 9%，ΔCPI 翻倍到 0.356，总 CPI ≈ 1.26，IPC 从 0.93 跌到 0.79，吞吐下降约 15%。"
+        }
+      },
+      {
+        "title": "AI Infra 的分支预测敌人：cold path 四大场景",
+        "body": "LLM 推理服务 host-side 路径里，分支预测的「敌人」集中在四个场景：\n\n| 场景 | 触发条件 | 主要影响 | 缓解策略 |\n|---|---|---|---|\n| **Input length 分支** | 流量分布漂移（突然大量长 prompt） | branch-miss 率暴涨，p99 抖动 | 按长度 bucket 路由，warmup |\n| **JSON schema fallback** | 1% 请求缺字段走校验分支 | cold path 污染 hot path PHT | fast/slow path 物理分离 |\n| **Tokenizer unknown byte** | 多语言、emoji、罕见 CJK | per-char 分支密集，TAGE 学不到 | 预归一化 + UTF-8 SIMD 检测 |\n| **动态 batch padding mask** | 变长 batch，每 batch mask 模式不同 | element-wise if 分支密度极高 | SIMD blendv 消除分支 |\n\n**核心规律**：不是预测器「不行」，是 cold path 流量污染了 hot path 的预测器表项（PHT/BTB 工作集）。解决方案是物理隔离，而不是加 `__builtin_expect` 提示。"
+      },
+      {
+        "title": "静态提示与编译器优化：`__builtin_expect` 的真实作用",
+        "body": "很多工程师误以为 `__builtin_expect` 直接告诉硬件预测器「这个分支更可能走这边」。实际上它影响的是**编译器的代码布局**：\n\n- 把「likely」分支变成 fall-through（顺序执行，不需要跳转）\n- 把「unlikely」分支的代码块挪到函数末尾或 `.text.cold` section，减少 I-cache 污染\n- 暗示寄存器分配偏向 hot path\n\n**硬件动态预测器一旦稳定后，hint 的边际收益接近零。** 真正有用的场景：\n1. 极少进入的错误处理路径（避免污染 I-cache hot region）\n2. 编译器无法静态判断的极不平衡分支（如 99.9% vs 0.1%）\n\n**更强大的工具**：PGO（Profile-Guided Optimization）和 BOLT/AutoFDO，用真实 profile 自动重排代码。Google/Meta 把 BOLT 用在 tokenizer 库上，分支预测和 I-cache 改善是主要来源之一，收益比手写 hint 大一个数量级。",
+        "tip": "日常业务代码乱加 `[[likely]]` 反而会误导代码维护者，且通常没有 perf 收益。把精力放在「把 cold path 函数物理分离」上，效果更确定。"
+      },
+      {
+        "title": "Worked Example：Unicode 输入导致 tokenizer p99 翻倍",
+        "body": "**现象**：推理服务上线新业务后，p99 从 220ms 涨到 480ms，GPU 利用率 88% 无异常，nvidia-smi 无报警。\n\n**定位**：`perf stat -e topdown-bad-spec` 从 2% 涨到 11%，`branch-misses/branches` 从 1.8% 涨到 6.3%。`perf record -e branch-misses` 指向 tokenizer 的 `process()` 函数。\n\n**根因**：tokenizer 用 if-else 链处理 ASCII/CJK/emoji/fallback，正常流量 95% 走 ASCII 分支，TAGE 训练稳定。新业务混入大量特殊 Unicode，第一个 if 错预测率从 0.5% 涨到 22%，每个字符额外浪费 ~36 cycle。\n\n**修复**：\n- 函数入口检测整段是否为纯 ASCII（SIMD 检测，一次扫 32 字节）\n- 纯 ASCII → `process_ascii_fast()`：SIMD 扫描无 per-char 分支\n- 非纯 ASCII → `process_general_slow()`：独立函数，不污染 fast path 的 BTB/PHT\n\n**结果**：p99 从 480ms 降到 240ms，branch-miss-rate 从 6.3% → 2.4%，IPC 从 0.95 → 1.45。",
+        "reveal": {
+          "q": "为什么把 cold path 拆成独立函数，比在同一函数里加 `[[unlikely]]` 效果更好？",
+          "a": "独立函数拥有独立的代码地址，对应独立的 BTB/PHT 条目，cold path 的误预测不会污染 hot path 的预测器状态。而同一函数内的 `[[unlikely]]` 只影响代码布局（basic block 顺序），hot/cold 的 PHT 条目仍可能 hash 到同一项，互相干扰。"
+        }
+      },
+      {
+        "title": "用 perf 定位分支预测问题",
+        "body": "分支预测健康度诊断工具链：\n\n**第一步：全局概览**\n- `perf stat -e cycles,instructions,branches,branch-misses,topdown-bad-spec -- ./prog`\n- 关注：`branch-misses/branches`（> 5% 值得查）和 `topdown-bad-spec`（> 10% 说明分支是主要瓶颈）\n\n**第二步：定位到函数**\n- `perf record -e branch-misses -c 30000 -g -- ./prog`\n- `perf report --stdio --sort symbol,dso | head -40`\n- 找出哪些函数/行的 branch-miss 占大头\n\n**第三步：按请求类型分桶**（AI 推理服务关键）\n- 分别测「正常请求」和「特殊 Unicode 请求」的 branch-MPKI\n- 全局 branch miss rate 会把长尾冲淡，需要按业务类型隔离\n\n**决策阈值**：`ΔCPI_branch > 0.15`、`branch-MPKI > 10` 或 `topdown-bad-spec > 10%` 时，分支可以解释一个主要瓶颈，值得专项优化。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "分支预测器必须存在的根本原因是什么？",
+        "options": [
+          "分支预测器可以提高 CPU 频率，让每条指令执行更快",
+          "在分支真值算出前，流水线前端必须立即决定下一条指令地址，否则流水线工位空转",
+          "分支预测器可以消除程序中的数据依赖，提高 IPC",
+          "分支预测器专门处理虚函数调用，是面向对象语言的硬件支持"
+        ],
+        "answer": 1,
+        "explain": "流水线深度 14–19 段，分支真值在 EX 段（中间位置）才算出。如果等 EX 真值才取指，从 IF 到 EX 之间所有 cycle 的工位都空转，浪费等于流水线深度的 cycle。分支预测器的唯一目的是用历史信息预测未来方向，让前端不停顿。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么 RAS（Return Address Stack）不能用通用 BTB 替代来处理函数返回？",
+        "options": [
+          "BTB 的查询延迟比 RAS 更长，会拖慢流水线",
+          "同一函数可能被多个地方调用，每次 `ret` 的目标不同，BTB 只记上次目标，调用点变了就预测错",
+          "BTB 只能处理条件分支，无法处理无条件跳转",
+          "RAS 可以缓存更多条目，容量比 BTB 大得多"
+        ],
+        "answer": 1,
+        "explain": "函数 f 可能被地址 A、B、C 三处调用，返回目标分别是 A+4、B+4、C+4。BTB 记的是「上次 ret 跳到哪」，如果最近从 A 调用，BTB 认为 ret → A+4；下次从 B 调用时 ret 应该到 B+4，但 BTB 仍然给出 A+4，预测错误。RAS 用 call-push/ret-pop 的栈语义，天然处理这种情况。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在代码里加 `__builtin_expect(cond, 1)` 可以直接控制 CPU 硬件预测器，告诉它「这个分支更可能是 taken」。",
+        "answer": false,
+        "explain": "`__builtin_expect` 影响的是编译器的代码布局：把 likely 分支变成 fall-through，把 unlikely 代码挪到函数末尾或 cold section。硬件动态预测器（TAGE 等）有自己的在线学习机制，一旦稳定后，编译器 hint 对预测准确率几乎没有额外影响。hint 真正的价值是减少 I-cache 污染和改善代码局部性。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某 LLM 推理服务 `topdown-bad-spec` 从 2% 暴涨到 11%，IPC 从 1.6 降到 0.95。用 `perf record -e branch-misses` 定位到 tokenizer 的 `process()` 函数。最有效的修复方向是什么？",
+        "options": [
+          "给 `process()` 函数里的每个 if 分支添加 `[[likely]]` 或 `[[unlikely]]` 属性",
+          "增加 CPU 核数，让更多 tokenizer 线程并行工作",
+          "把 ASCII fast path 拆成独立函数，与处理特殊字符的 slow path 物理分离",
+          "启用更激进的编译器优化级别（如 -O3 -march=native）"
+        ],
+        "answer": 2,
+        "explain": "问题的根因是 cold path（特殊 Unicode）污染了 hot path（ASCII）的 BTB/PHT 条目。物理分离成独立函数后，两者在不同代码地址，对应不同 BTB/PHT 条目，互不干扰。加 `[[likely]]` 只影响代码布局不隔离预测器状态；加 CPU 核数无法解决单核预测器污染；编译器优化不能改变运行时流量分布带来的污染。"
+      },
+      {
+        "type": "match",
+        "prompt": "将分支预测器类型与其核心特点配对：",
+        "left": ["2-bit 饱和计数器", "GShare", "TAGE", "ITTAGE"],
+        "right": ["预测间接跳转目标地址（虚函数、switch）", "用几何历史长度的多张 tagged 表，自适应历史长度", "用全局历史寄存器 XOR PC 索引，捕捉跨分支相关性", "4 个状态需连续两次错才翻转方向，抗瞬时扰动"],
+        "explain": "2-bit 计数器的核心是「惯性」（4 状态/需连续两次错）；GShare 用 GHR XOR PC 索引捕捉跨分支相关；TAGE 是现代标准，几何历史长度自适应；ITTAGE 专门预测间接跳转目标地址。"
+      },
+      {
+        "type": "input",
+        "prompt": "某热点分支密度 0.20，误预测率 5%，每次误预测代价 18 cycle，base CPI = 0.9。总 CPI 是多少？（保留两位小数）",
+        "accept": ["1.08", "约 1.08"],
+        "explain": "ΔCPI_branch = 0.20 × 0.05 × 18 = 0.18；总 CPI = base CPI + ΔCPI = 0.9 + 0.18 = 1.08，IPC ≈ 0.93。这说明分支误预测让吞吐降低了约 17%，值得专项优化。"
+      },
+      {
+        "type": "judge",
+        "prompt": "LLM 推理服务的分支预测问题通常可以通过查全局 branch miss rate 来准确定位，不需要按请求类型分桶分析。",
+        "answer": false,
+        "explain": "全局 branch miss rate 会把长尾请求（如含特殊 Unicode 的少量请求）的影响冲淡。正常请求可能 miss rate 1%，特殊请求 miss rate 22%，但如果特殊请求只占 5% 流量，全局平均可能只有 2%，看起来健康。必须按请求类型（normal/long_prompt/schema_fallback/non_ascii）分桶采集，才能看到真实问题。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Branch MPKI（Mispredictions Per Kilo-Instructions）> 15 时，最可能的根因是什么？",
+        "options": [
+          "CPU 时钟频率过低，导致分支预测器训练样本不足",
+          "L3 Cache 容量不足，分支历史表频繁被替换",
+          "程序存在大量 cold path 或 indirect-heavy 代码，预测器无法建立稳定模式",
+          "SIMD 向量指令和标量指令混用导致预测器混乱"
+        ],
+        "answer": 2,
+        "explain": "MPKI > 15 通常意味着程序有大量「难以预测」的分支：cold path（很少走但走了预测器没学好）或 indirect-heavy（虚函数/switch，目标变化频繁）。这种情况需要代码重构（hot/cold 分离、去虚化、枚举 fast path），而不是硬件级调优。"
+      }
+    ]
+  }
+]

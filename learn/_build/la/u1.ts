@@ -1,0 +1,1044 @@
+export const UNIT = {
+  id: 'u1',
+  title: '向量与矩阵',
+  color: '#58cc02',
+  icon: '🧮',
+  blurb:
+    '从有向线段到 $\\mathbf{u}\\cdot\\mathbf{v}=\\|\\mathbf{u}\\|\\|\\mathbf{v}\\|\\cos\\theta$，再到矩阵乘法与迹——六关打通线性代数最基础的语言。',
+  lessons: [
+    // ─────────────────────────────────────────
+    // 关 1  向量与运算
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l1',
+      title: '向量与运算',
+      subtitle: '定义·加法·标量乘法·线性组合',
+      intro: [
+        // 卡 1：为什么需要向量？
+        {
+          title: '为什么需要向量？',
+          body:
+            '温度 25°C、体重 70 kg——只需一个数字就能完整描述，这类量叫**标量**。\n\n' +
+            '但"向正北行驶 60 km"和"向正南行驶 60 km"是完全不同的两件事。仅有数字不够，还要知道**方向**。' +
+            '既有大小又有方向的量，就是**向量（vector）**。\n\n' +
+            '在深度学习里，一张 $28\\times28$ 的手写数字图片可以展平成 784 个数字组成的向量；' +
+            '词向量（Word Embedding）将语义压缩进一个高维实数向量——**向量是机器学习数据的基本载体**。',
+          tip: '向量用粗体小写字母表示：$\\mathbf{v}$，或带箭头：$\\vec{v}$。',
+        },
+        // 卡 2：代数表示与维度
+        {
+          title: '向量的代数表示',
+          body:
+            '在坐标系中，$n$ 维向量 $\\mathbf{v}$ 是 $n$ 个有序实数组成的列。\n\n' +
+            '**列向量**（默认形式）和**行向量**（列向量的转置 $\\mathbf{v}^T$）通过转置互换。' +
+            '本课默认向量为列向量。\n\n' +
+            '**具体例子**：$\\mathbf{v}=\\begin{pmatrix}3\\\\4\\end{pmatrix}\\in\\mathbb{R}^2$，表示"沿 $x$ 轴 3，沿 $y$ 轴 4"。' +
+            '$\\mathbf{w}=\\begin{pmatrix}1\\\\-2\\\\5\\end{pmatrix}\\in\\mathbb{R}^3$，负分量表示沿负轴方向。',
+          formula:
+            '\\mathbf{v} = \\begin{pmatrix}v_1 \\\\ v_2 \\\\ \\vdots \\\\ v_n\\end{pmatrix} \\in \\mathbb{R}^n',
+          tip: '$\\mathbb{R}^n$ 读作"R-n"，表示所有 $n$ 维实数向量构成的空间。',
+        },
+        // 卡 3：向量加法
+        {
+          title: '向量加法：对应分量相加',
+          body:
+            '两个维度相同的向量 $\\mathbf{u},\\mathbf{v}\\in\\mathbb{R}^n$，对应分量相加得到它们的和。\n\n' +
+            '**几何含义——首尾相接**：把 $\\mathbf{v}$ 的起点移到 $\\mathbf{u}$ 的终点，从 $\\mathbf{u}$ 起点到 $\\mathbf{v}$ 新终点就是 $\\mathbf{u}+\\mathbf{v}$。\n\n' +
+            '**具体例子**：$\\begin{pmatrix}1\\\\2\\end{pmatrix}+\\begin{pmatrix}3\\\\-1\\end{pmatrix}=\\begin{pmatrix}4\\\\1\\end{pmatrix}$。\n\n' +
+            '**易错点**：只有维度相同的向量才能相加——$\\mathbb{R}^2$ 的向量不能和 $\\mathbb{R}^3$ 的向量相加！',
+          formula:
+            '\\mathbf{u}+\\mathbf{v}=\\begin{pmatrix}u_1+v_1\\\\u_2+v_2\\\\\\vdots\\\\u_n+v_n\\end{pmatrix}',
+        },
+        // 卡 4：标量乘法
+        {
+          title: '标量乘法：缩放与翻转',
+          body:
+            '标量 $c\\in\\mathbb{R}$ 乘以向量 $\\mathbf{v}$，将每个分量都乘以 $c$。\n\n' +
+            '$c>1$：拉长；$0<c<1$：缩短；$c=-1$：翻转方向，长度不变；$c=0$：变为零向量。\n\n' +
+            '**具体例子**：$3\\begin{pmatrix}1\\\\2\\end{pmatrix}=\\begin{pmatrix}3\\\\6\\end{pmatrix}$（长度变为 3 倍，方向不变）；' +
+            '$(-1)\\begin{pmatrix}2\\\\-1\\end{pmatrix}=\\begin{pmatrix}-2\\\\1\\end{pmatrix}$（方向翻转）。',
+          formula:
+            'c\\mathbf{v}=\\begin{pmatrix}cv_1\\\\cv_2\\\\\\vdots\\\\cv_n\\end{pmatrix}',
+          tip: '齐次性：$\\|c\\mathbf{v}\\|=|c|\\cdot\\|\\mathbf{v}\\|$，缩放量取绝对值。',
+        },
+        // 卡 5：向量减法
+        {
+          title: '向量减法与残差',
+          body:
+            '$\\mathbf{u}-\\mathbf{v}$ 等价于 $\\mathbf{u}+(-1)\\mathbf{v}$，对应分量相减。\n\n' +
+            '**几何含义**：当两向量共起点时，$\\mathbf{u}-\\mathbf{v}$ 是从 $\\mathbf{v}$ 的终点指向 $\\mathbf{u}$ 的终点的向量。\n\n' +
+            '**深度学习应用**：损失函数中的**残差** $\\mathbf{e}=\\hat{\\mathbf{y}}-\\mathbf{y}$（预测值与真实值之差），其范数 $\\|\\mathbf{e}\\|$ 量化预测误差大小。\n\n' +
+            '**例子**：$\\begin{pmatrix}5\\\\3\\end{pmatrix}-\\begin{pmatrix}2\\\\-1\\end{pmatrix}=\\begin{pmatrix}3\\\\4\\end{pmatrix}$。',
+          formula:
+            '\\mathbf{u}-\\mathbf{v}=\\begin{pmatrix}u_1-v_1\\\\u_2-v_2\\\\\\vdots\\\\u_n-v_n\\end{pmatrix}',
+        },
+        // 卡 6：线性组合
+        {
+          title: '线性组合：标量乘法与加法的结合',
+          body:
+            '给定向量 $\\mathbf{v}_1,\\dots,\\mathbf{v}_k\\in\\mathbb{R}^n$ 和标量 $c_1,\\dots,c_k$，形如 $c_1\\mathbf{v}_1+c_2\\mathbf{v}_2+\\cdots+c_k\\mathbf{v}_k$ 的向量称为一个**线性组合**，$c_i$ 称为系数。\n\n' +
+            '**直观含义**：把一组向量各自缩放后再相加。\n\n' +
+            '**例子**：$2\\begin{pmatrix}1\\\\0\\end{pmatrix}+3\\begin{pmatrix}0\\\\1\\end{pmatrix}=\\begin{pmatrix}2\\\\3\\end{pmatrix}$，即 $(2,3)^T$ 是标准基向量的线性组合，系数为 2 和 3。\n\n' +
+            '**重要性**：矩阵乘向量 $A\\mathbf{x}$ 本质就是以 $\\mathbf{x}$ 的分量为系数，对 $A$ 的各列做线性组合——这是贯穿整个线性代数的核心视角。',
+          formula:
+            'c_1\\mathbf{v}_1+c_2\\mathbf{v}_2+\\cdots+c_k\\mathbf{v}_k',
+        },
+        // 卡 7：运算性质汇总 + reveal
+        {
+          title: '运算性质汇总',
+          body:
+            '向量运算满足以下基本性质（$\\mathbf{u},\\mathbf{v},\\mathbf{w}\\in\\mathbb{R}^n$，$a,b\\in\\mathbb{R}$）：\n\n' +
+            '**加法**：交换律 $\\mathbf{u}+\\mathbf{v}=\\mathbf{v}+\\mathbf{u}$；结合律 $(\\mathbf{u}+\\mathbf{v})+\\mathbf{w}=\\mathbf{u}+(\\mathbf{v}+\\mathbf{w})$；' +
+            '零向量 $\\mathbf{v}+\\mathbf{0}=\\mathbf{v}$；逆元 $\\mathbf{v}+(-\\mathbf{v})=\\mathbf{0}$。\n\n' +
+            '**标量乘法**：$a(\\mathbf{u}+\\mathbf{v})=a\\mathbf{u}+a\\mathbf{v}$；$(a+b)\\mathbf{v}=a\\mathbf{v}+b\\mathbf{v}$；$(ab)\\mathbf{v}=a(b\\mathbf{v})$；$1\\cdot\\mathbf{v}=\\mathbf{v}$。\n\n' +
+            '这 8 条性质是**向量空间（vector space）**的公理，任何满足它们的集合都可以用线性代数的整套工具研究。',
+          reveal: {
+            q: '设 $\\mathbf{u}=(2,-1,3)^T$，$\\mathbf{v}=(-1,4,2)^T$，计算 $3\\mathbf{u}-2\\mathbf{v}$。',
+            a: '$3\\mathbf{u}=(6,-3,9)^T$，$2\\mathbf{v}=(-2,8,4)^T$，$3\\mathbf{u}-2\\mathbf{v}=(8,-11,5)^T$。',
+          },
+        },
+      ],
+      questions: [
+        // 题 1：choice — 加法维度条件
+        {
+          id: 'u1-l1-q1',
+          type: 'choice',
+          prompt:
+            '设 $\\mathbf{u}\\in\\mathbb{R}^3$，$\\mathbf{v}\\in\\mathbb{R}^2$。下列说法正确的是？',
+          options: [
+            '$\\mathbf{u}+\\mathbf{v}$ 有意义，结果在 $\\mathbb{R}^5$',
+            '$\\mathbf{u}+\\mathbf{v}$ 无意义，因为维度不同',
+            '$\\mathbf{u}+\\mathbf{v}$ 有意义，结果在 $\\mathbb{R}^3$',
+            '$\\mathbf{u}+\\mathbf{v}$ 有意义，结果在 $\\mathbb{R}^2$',
+          ],
+          answer: 1,
+          explain:
+            '向量加法要求两向量维度完全相同。$\\mathbf{u}\\in\\mathbb{R}^3$，$\\mathbf{v}\\in\\mathbb{R}^2$，维度不同，相加无定义。',
+        },
+        // 题 2：input — 向量加法
+        {
+          id: 'u1-l1-q2',
+          type: 'input',
+          prompt:
+            '设 $\\mathbf{u}=\\begin{pmatrix}1\\\\2\\end{pmatrix}$，$\\mathbf{v}=\\begin{pmatrix}3\\\\-1\\end{pmatrix}$，$\\mathbf{u}+\\mathbf{v}$ 的第二个分量是多少？',
+          accept: ['1', '1.0'],
+          placeholder: '输入整数',
+          explain:
+            '$(\\mathbf{u}+\\mathbf{v})_2=2+(-1)=1$。向量加法对应分量相加。',
+        },
+        // 题 3：judge — 标量乘法方向
+        {
+          id: 'u1-l1-q3',
+          type: 'judge',
+          prompt: '标量 $c<0$ 与向量 $\\mathbf{v}$ 的乘积 $c\\mathbf{v}$，方向与 $\\mathbf{v}$ 相同。',
+          answer: false,
+          explain:
+            '$c<0$ 时，$c\\mathbf{v}$ 的方向与 $\\mathbf{v}$ **相反**（翻转），长度为 $|c|\\cdot\\|\\mathbf{v}\\|$。只有 $c>0$ 时方向不变。',
+        },
+        // 题 4：choice — 线性组合计算
+        {
+          id: 'u1-l1-q4',
+          type: 'choice',
+          prompt:
+            '计算 $2\\begin{pmatrix}1\\\\0\\end{pmatrix}+3\\begin{pmatrix}0\\\\1\\end{pmatrix}$ 的结果。',
+          options: [
+            '$\\begin{pmatrix}2\\\\3\\end{pmatrix}$',
+            '$\\begin{pmatrix}3\\\\2\\end{pmatrix}$',
+            '$\\begin{pmatrix}5\\\\5\\end{pmatrix}$',
+            '$\\begin{pmatrix}2\\\\0\\end{pmatrix}$',
+          ],
+          answer: 0,
+          explain:
+            '$2\\begin{pmatrix}1\\\\0\\end{pmatrix}=\\begin{pmatrix}2\\\\0\\end{pmatrix}$，$3\\begin{pmatrix}0\\\\1\\end{pmatrix}=\\begin{pmatrix}0\\\\3\\end{pmatrix}$，两者相加得 $\\begin{pmatrix}2\\\\3\\end{pmatrix}$。',
+        },
+        // 题 5：input — 向量减法
+        {
+          id: 'u1-l1-q5',
+          type: 'input',
+          prompt:
+            '设 $\\mathbf{u}=(5,3)^T$，$\\mathbf{v}=(2,-1)^T$，计算 $\\mathbf{u}-\\mathbf{v}$ 的第一个分量。',
+          accept: ['3'],
+          placeholder: '输入整数',
+          explain:
+            '$(\\mathbf{u}-\\mathbf{v})_1=5-2=3$。向量减法对应分量相减。',
+        },
+        // 题 6：judge — 零向量是加法单位元
+        {
+          id: 'u1-l1-q6',
+          type: 'judge',
+          prompt: '对任意向量 $\\mathbf{v}$，有 $\\mathbf{v}+\\mathbf{0}=\\mathbf{v}$，其中 $\\mathbf{0}$ 是同维度的零向量。',
+          answer: true,
+          explain:
+            '零向量（所有分量为 0）是向量加法的单位元：任意向量加上零向量等于自身。这是向量空间公理之一。',
+        },
+        // 题 7：match — 标量取值与效果
+        {
+          id: 'u1-l1-q7',
+          type: 'match',
+          prompt: '将标量 $c$ 的取值范围与 $c\\mathbf{v}$ 的几何效果对应。',
+          left: ['$c>1$', '$c=0$', '$c=-1$'],
+          right: ['方向不变，长度拉长', '变为零向量', '方向翻转，长度不变'],
+        },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // 关 2  范数与内积
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l2',
+      title: '范数与内积',
+      subtitle: '欧几里得范数·归一化·内积·余弦相似度',
+      intro: [
+        // 卡 1：范数定义
+        {
+          title: '向量的长度：$\\ell_2$ 范数',
+          body:
+            '向量 $\\mathbf{v}=(v_1,v_2,\\dots,v_n)^T$ 的**欧几里得范数**（$\\ell_2$ 范数），记作 $\\|\\mathbf{v}\\|$，是勾股定理的高维推广：\n\n' +
+            '**具体例子**：$\\|(3,4)^T\\|=\\sqrt{9+16}=5$（经典 3-4-5 勾股数）；$\\|(1,1,1)^T\\|=\\sqrt{3}\\approx1.732$；$\\|(0,0)^T\\|=0$（只有零向量长度为 0）。\n\n' +
+            '三大性质：① 非负性 $\\|\\mathbf{v}\\|\\geq0$；② 齐次性 $\\|c\\mathbf{v}\\|=|c|\\cdot\\|\\mathbf{v}\\|$；③ 三角不等式 $\\|\\mathbf{u}+\\mathbf{v}\\|\\leq\\|\\mathbf{u}\\|+\\|\\mathbf{v}\\|$。',
+          formula: '\\|\\mathbf{v}\\| = \\sqrt{v_1^2+v_2^2+\\cdots+v_n^2}=\\sqrt{\\sum_{i=1}^{n}v_i^2}',
+          tip: '重要关系：$\\mathbf{v}\\cdot\\mathbf{v}=\\|\\mathbf{v}\\|^2$，范数的平方等于自身内积，取长度还需开根。',
+        },
+        // 卡 2：归一化
+        {
+          title: '归一化：只保留方向',
+          body:
+            '将任意非零向量 $\\mathbf{v}$ 除以自身的长度，得到与它**同方向的单位向量**（长度为 1）：\n\n' +
+            '**例子**：$\\mathbf{v}=(3,4)^T$，$\\|\\mathbf{v}\\|=5$，归一化得 $\\hat{\\mathbf{v}}=(0.6,0.8)^T$。\n\n' +
+            '验证：$\\|\\hat{\\mathbf{v}}\\|=\\sqrt{0.36+0.64}=1$ ✓\n\n' +
+            '**为什么归一化？** 两个词向量，长度可能因频率差异而悬殊。归一化后只比较"方向"，剔除长度干扰——这正是余弦相似度的核心思想。\n\n' +
+            '**易错点**：零向量不能归一化（分母为 0）；归一化会丢失长度信息，若后续需要长度需另行保存。',
+          formula: '\\hat{\\mathbf{v}}=\\dfrac{\\mathbf{v}}{\\|\\mathbf{v}\\|}',
+        },
+        // 卡 3：内积定义
+        {
+          title: '内积（点积）：代数与几何的桥梁',
+          body:
+            '两个相同维度向量 $\\mathbf{u},\\mathbf{v}\\in\\mathbb{R}^n$ 的**内积**（点积），定义为对应分量乘积之和。**结果是标量，不是向量！**\n\n' +
+            '矩阵记号：$\\mathbf{u}\\cdot\\mathbf{v}=\\mathbf{u}^T\\mathbf{v}$。\n\n' +
+            '**具体例子**：$\\begin{pmatrix}1\\\\2\\\\3\\end{pmatrix}\\cdot\\begin{pmatrix}4\\\\5\\\\6\\end{pmatrix}=1\\times4+2\\times5+3\\times6=4+10+18=32$。\n\n' +
+            '**易错点**：内积是标量（$\\in\\mathbb{R}$），不要写成向量；$\\mathbf{v}\\cdot\\mathbf{v}=\\|\\mathbf{v}\\|^2$，还需开根号才是长度。',
+          formula:
+            '\\mathbf{u}\\cdot\\mathbf{v}=\\mathbf{u}^T\\mathbf{v}=\\sum_{i=1}^{n}u_iv_i',
+        },
+        // 卡 4：内积与夹角
+        {
+          title: '内积与夹角的关系',
+          body:
+            '内积最优美的特性是与几何角度的联系：$\\mathbf{u}\\cdot\\mathbf{v}=\\|\\mathbf{u}\\|\\cdot\\|\\mathbf{v}\\|\\cdot\\cos\\theta$，其中 $\\theta\\in[0,\\pi]$ 是两向量的夹角。\n\n' +
+            '内积衡量"两向量在多大程度上指向同一方向"：\n\n' +
+            '$\\theta=0°$：$\\cos\\theta=1$，内积正最大（完全同向）。\n\n' +
+            '$\\theta=90°$：$\\cos\\theta=0$，内积为 0（垂直）。\n\n' +
+            '$\\theta=180°$：$\\cos\\theta=-1$，内积负最小（完全反向）。\n\n' +
+            '**例子**：$\\mathbf{u}=(1,0)^T$ 与 $\\mathbf{v}=(1,1)^T$，$\\cos\\theta=\\dfrac{1}{\\sqrt{2}}$，$\\theta=45°$，与直觉一致。',
+          formula:
+            '\\mathbf{u}\\cdot\\mathbf{v}=\\|\\mathbf{u}\\|\\|\\mathbf{v}\\|\\cos\\theta \\implies \\cos\\theta=\\frac{\\mathbf{u}\\cdot\\mathbf{v}}{\\|\\mathbf{u}\\|\\|\\mathbf{v}\\|}',
+        },
+        // 卡 5：正交向量
+        {
+          title: '正交：内积为 0',
+          body:
+            '若 $\\mathbf{u}\\cdot\\mathbf{v}=0$，则称两向量**正交**（$\\mathbf{u}\\perp\\mathbf{v}$），几何上即垂直（$\\theta=90°$）。\n\n' +
+            '**为什么正交重要？** 正交向量之间没有"重叠"的信息成分，彼此独立——就像 $x$ 轴和 $y$ 轴互不干扰。\n\n' +
+            '**标准基两两正交**：$\\mathbf{e}_1=(1,0,0)^T$，$\\mathbf{e}_2=(0,1,0)^T$，$\\mathbf{e}_3=(0,0,1)^T$，任意两者内积均为 0。\n\n' +
+            '**PCA 应用**：主成分分析要求主成分方向两两正交，确保各成分捕获独立的方差方向。\n\n' +
+            '**注意**：零向量与所有向量的内积均为 0，但这是平凡情形，正交讨论默认向量非零。',
+          formula: '\\mathbf{u}\\perp\\mathbf{v}\\iff\\mathbf{u}\\cdot\\mathbf{v}=0',
+          tip: '三步判断正交：① 确认维度相同；② 计算内积 $\\sum u_iv_i$；③ 等于 0 则正交。',
+        },
+        // 卡 6：余弦相似度
+        {
+          title: '余弦相似度：衡量方向的相似性',
+          body:
+            '由内积夹角公式，直接导出**余弦相似度**，取值范围 $[-1,1]$：\n\n' +
+            '接近 1 → 方向高度相似；接近 0 → 近乎正交（无关）；接近 −1 → 方向相反。\n\n' +
+            '**例题**："猫" $\\mathbf{u}=(1,2,0)^T$，"狗" $\\mathbf{v}=(0,2,1)^T$。\n\n' +
+            '步骤一（内积）：$\\mathbf{u}\\cdot\\mathbf{v}=0+4+0=4$。\n\n' +
+            '步骤二（范数）：$\\|\\mathbf{u}\\|=\\sqrt{5}$，$\\|\\mathbf{v}\\|=\\sqrt{5}$。\n\n' +
+            '步骤三（相除）：$\\cos\\theta=4/5=0.8$，两词语义相近！\n\n' +
+            '**重要特性**：把 $\\mathbf{u}$ 乘以正标量 $k$，分子分母同乘 $k$ 约掉，余弦相似度不变——这正是归一化剔除长度干扰的数学本质。',
+          formula: '\\cos\\theta=\\dfrac{\\mathbf{u}\\cdot\\mathbf{v}}{\\|\\mathbf{u}\\|\\|\\mathbf{v}\\|}\\in[-1,1]',
+          tip: '求余弦相似度三步法：① 算内积；② 分别算两个范数；③ 内积除以两范数之积。',
+        },
+        // 卡 7：易错点汇总 + reveal
+        {
+          title: '易错点汇总与自测',
+          body:
+            '**易错点一**：内积结果写成向量——内积是标量 $\\in\\mathbb{R}$，不是向量。\n\n' +
+            '**易错点二**：忘记开根号——$\\mathbf{v}\\cdot\\mathbf{v}=\\|\\mathbf{v}\\|^2$ 是长度的**平方**，取范数还需开根。\n\n' +
+            '**易错点三**：余弦相似度与欧氏距离混用——NLP 中统一用余弦相似度，不受缩放影响；几何距离问题才用欧氏距离。\n\n' +
+            '**易错点四**：正交不等于线性无关——两非零正交向量一定线性无关，但线性无关不要求正交。',
+          reveal: {
+            q: '设 $\\mathbf{a}=(3,0,4)^T$，$\\mathbf{b}=(0,5,0)^T$。$\\mathbf{a}$ 的长度是多少？$\\mathbf{a}$ 与 $\\mathbf{b}$ 正交吗？',
+            a: '$\\|\\mathbf{a}\\|=\\sqrt{9+0+16}=5$；内积 $\\mathbf{a}\\cdot\\mathbf{b}=0+0+0=0$，内积为 0，所以 $\\mathbf{a}\\perp\\mathbf{b}$，正交。',
+          },
+        },
+      ],
+      questions: [
+        // 题 1：input — 计算范数
+        {
+          id: 'u1-l2-q1',
+          type: 'input',
+          prompt:
+            '计算向量 $\\mathbf{v}=\\begin{pmatrix}3\\\\4\\end{pmatrix}$ 的欧几里得范数 $\\|\\mathbf{v}\\|$（填数字）。',
+          accept: ['5', '5.0'],
+          placeholder: '输入数字',
+          explain: '$\\|\\mathbf{v}\\|=\\sqrt{3^2+4^2}=\\sqrt{9+16}=\\sqrt{25}=5$。这是经典的 3-4-5 勾股数。',
+        },
+        // 题 2：judge — 内积是标量
+        {
+          id: 'u1-l2-q2',
+          type: 'judge',
+          prompt: '两个向量的内积（点积）的结果是一个向量。',
+          answer: false,
+          explain:
+            '内积的结果是**标量**（普通数字），不是向量。$\\mathbf{u}\\cdot\\mathbf{v}=\\sum_i u_iv_i\\in\\mathbb{R}$。',
+        },
+        // 题 3：input — 计算内积
+        {
+          id: 'u1-l2-q3',
+          type: 'input',
+          prompt:
+            '计算 $\\mathbf{u}=\\begin{pmatrix}1\\\\2\\\\3\\end{pmatrix}$ 与 $\\mathbf{v}=\\begin{pmatrix}4\\\\5\\\\6\\end{pmatrix}$ 的内积 $\\mathbf{u}\\cdot\\mathbf{v}$。',
+          accept: ['32'],
+          placeholder: '输入整数',
+          explain:
+            '$\\mathbf{u}\\cdot\\mathbf{v}=1\\times4+2\\times5+3\\times6=4+10+18=32$。',
+        },
+        // 题 4：choice — 正交条件
+        {
+          id: 'u1-l2-q4',
+          type: 'choice',
+          prompt:
+            '向量 $\\mathbf{u}=(1,0)^T$ 与 $\\mathbf{v}=(0,1)^T$ 的关系是？',
+          options: [
+            '内积为 1，平行',
+            '内积为 0，正交',
+            '内积为 2，斜交',
+            '内积为 1，正交',
+          ],
+          answer: 1,
+          explain:
+            '$\\mathbf{u}\\cdot\\mathbf{v}=1\\times0+0\\times1=0$，内积为 0，两向量正交（垂直）——这正是 $x$ 轴与 $y$ 轴方向向量的关系。',
+        },
+        // 题 5：choice — 余弦相似度计算
+        {
+          id: 'u1-l2-q5',
+          type: 'choice',
+          prompt:
+            '设 $\\mathbf{p}=(1,1,0)^T$，$\\mathbf{q}=(1,0,1)^T$，求它们的余弦相似度 $\\cos\\theta$。',
+          options: ['$0$', '$\\dfrac{1}{2}$', '$\\dfrac{\\sqrt{2}}{2}$', '$1$'],
+          answer: 1,
+          explain:
+            '内积：$\\mathbf{p}\\cdot\\mathbf{q}=1+0+0=1$。范数：$\\|\\mathbf{p}\\|=\\sqrt{2}$，$\\|\\mathbf{q}\\|=\\sqrt{2}$。' +
+            '余弦相似度：$\\cos\\theta=\\dfrac{1}{\\sqrt{2}\\cdot\\sqrt{2}}=\\dfrac{1}{2}$，夹角为 $60°$。',
+        },
+        // 题 6：judge — 归一化不影响余弦相似度
+        {
+          id: 'u1-l2-q6',
+          type: 'judge',
+          prompt:
+            '把向量 $\\mathbf{u}$ 乘以正标量 $k$（即变成 $k\\mathbf{u}$），与 $\\mathbf{v}$ 的余弦相似度不变。',
+          answer: true,
+          explain:
+            '余弦相似度 $\\cos\\theta=\\dfrac{\\mathbf{u}\\cdot\\mathbf{v}}{\\|\\mathbf{u}\\|\\|\\mathbf{v}\\|}$。将 $\\mathbf{u}$ 换成 $k\\mathbf{u}$（$k>0$），分子变为 $k(\\mathbf{u}\\cdot\\mathbf{v})$，分母变为 $k\\|\\mathbf{u}\\|\\cdot\\|\\mathbf{v}\\|$，$k$ 约掉，结果不变。',
+        },
+        // 题 7：match — 夹角与内积符号
+        {
+          id: 'u1-l2-q7',
+          type: 'match',
+          prompt: '将夹角范围与内积的符号或大小对应。',
+          left: ['$\\theta=0°$（完全同向）', '$\\theta=90°$（垂直）', '$\\theta=180°$（完全反向）'],
+          right: ['内积为正最大', '内积为 0', '内积为负最小'],
+        },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // 关 3  矩阵与特殊矩阵
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l3',
+      title: '矩阵与特殊矩阵',
+      subtitle: '定义·形状·元素索引·零/单位/对角/三角矩阵',
+      intro: [
+        // 卡 1：为什么需要矩阵？
+        {
+          title: '为什么需要矩阵？',
+          body:
+            '一个向量是一列数字；把多个向量并排，就得到**矩阵**——按矩形阵列排列的数表。\n\n' +
+            '在深度学习里，矩阵无处不在：全连接层的权重 $W\\in\\mathbb{R}^{d_{out}\\times d_{in}}$；' +
+            'Mini-batch 的 $N$ 个样本排成 $X\\in\\mathbb{R}^{N\\times d}$；' +
+            'Transformer 的注意力分数矩阵 $QK^T$ 记录每对 token 的相关度。\n\n' +
+            '读懂矩阵的形状，是调试神经网络的第一步。',
+          tip: '矩阵用大写字母表示：$A$、$W$、$B$。元素 $a_{ij}$ 在第 $i$ 行第 $j$ 列（先行后列！）。',
+        },
+        // 卡 2：形状与元素索引
+        {
+          title: '矩阵的形状：$m$ 行 $n$ 列',
+          body:
+            '$m\\times n$ 矩阵 $A$ 有 $m$ 行、$n$ 列，共 $mn$ 个元素。\n\n' +
+            '**具体例子**：$B=\\begin{pmatrix}1&0&-3\\\\2&5&7\\end{pmatrix}\\in\\mathbb{R}^{2\\times3}$，' +
+            '$b_{12}=0$（第 1 行第 2 列），$b_{23}=7$（第 2 行第 3 列）。\n\n' +
+            '**易错点一**：下标顺序——$a_{ij}$ 先行 $i$ 后列 $j$，与坐标 $(x,y)$ 先列后行**相反**，初学时要特别注意。\n\n' +
+            '**易错点二**：维度描述"$m\\times n$"中，$m$ 是行数，$n$ 是列数。记住"行在前，列在后"——与中文"横行竖列"一致。',
+          formula:
+            'A=\\begin{pmatrix}a_{11}&a_{12}&\\cdots&a_{1n}\\\\a_{21}&a_{22}&\\cdots&a_{2n}\\\\\\vdots&\\vdots&\\ddots&\\vdots\\\\a_{m1}&a_{m2}&\\cdots&a_{mn}\\end{pmatrix}\\in\\mathbb{R}^{m\\times n}',
+        },
+        // 卡 3：方阵与零矩阵
+        {
+          title: '方阵与零矩阵',
+          body:
+            '**方阵**：行数 $=$ 列数（$m=n$），记为 $n$ 阶方阵。行列式、特征值等概念只对方阵定义。\n\n' +
+            '**零矩阵** $O$（或 $\\mathbf{0}_{m\\times n}$）：所有元素为 0，是矩阵加法的单位元（$A+O=A$）。\n\n' +
+            '**矩阵相等**的条件缺一不可：① 维度相同；② 所有对应元素相等。$2\\times2$ 的矩阵与 $1\\times4$ 的行向量虽然有相同 4 个数，但它们是**不同**的数学对象，不相等。\n\n' +
+            '**应用**：矩阵相等可用于列方程。例如 $\\begin{pmatrix}x+y&2\\\\3&x-y\\end{pmatrix}=\\begin{pmatrix}5&2\\\\3&1\\end{pmatrix}$ 逐元素对应，得 $x=3,y=2$。',
+        },
+        // 卡 4：单位矩阵与对角矩阵
+        {
+          title: '单位矩阵与对角矩阵',
+          body:
+            '**单位矩阵** $I_n$：对角线全为 1，其余全为 0，是矩阵乘法的单位元（$AI_n=A$）。\n\n' +
+            '**对角矩阵** $\\mathrm{diag}(d_1,\\dots,d_n)$：非对角元素全为 0。两个同阶对角矩阵相乘，结果仍是对角矩阵，对角元素逐一相乘——比一般矩阵乘法简单得多。\n\n' +
+            '单位矩阵是对角元素全为 1 的特殊对角矩阵：$I_n=\\mathrm{diag}(1,1,\\dots,1)$。',
+          formula: 'I_3=\\begin{pmatrix}1&0&0\\\\0&1&0\\\\0&0&1\\end{pmatrix},\\quad\\mathrm{diag}(2,-1,3)=\\begin{pmatrix}2&0&0\\\\0&-1&0\\\\0&0&3\\end{pmatrix}',
+        },
+        // 卡 5：上下三角矩阵
+        {
+          title: '上三角矩阵与下三角矩阵',
+          body:
+            '**上三角矩阵**：对角线以下的元素全为 0（$i>j\\Rightarrow a_{ij}=0$）。\n\n' +
+            '**下三角矩阵**：对角线以上的元素全为 0（$i<j\\Rightarrow a_{ij}=0$）。\n\n' +
+            '**具体例子**：\n\n' +
+            '$U=\\begin{pmatrix}2&3&1\\\\0&-1&4\\\\0&0&5\\end{pmatrix}$（上三角）；$L=\\begin{pmatrix}1&0&0\\\\2&3&0\\\\-1&4&7\\end{pmatrix}$（下三角）。\n\n' +
+            '**工程价值**：LU 分解将一般方阵分解为下三角矩阵 $L$ 与上三角矩阵 $U$ 的乘积，是求解线性方程组的高效基础。',
+          tip: '记忆口诀：上三角 $=$ 左下角全为 0；下三角 $=$ 右上角全为 0。',
+        },
+        // 卡 6：AI 关联
+        {
+          title: '矩阵形状与深度学习的关联',
+          body:
+            '**全连接层**权重矩阵 $W\\in\\mathbb{R}^{d_{out}\\times d_{in}}$（行 $=$ 输出维度，列 $=$ 输入维度），' +
+            '元素个数 $=d_{out}\\times d_{in}$，这就是该层的可训练参数量。\n\n' +
+            '**例**：MNIST 输出层 $W\\in\\mathbb{R}^{10\\times784}$，有 $7840$ 个权重参数。\n\n' +
+            '**批数据矩阵**：$N$ 个样本，每个 $d$ 维，排成 $X\\in\\mathbb{R}^{N\\times d}$（每行是一个样本）。GPU 可以一次性处理整个批次。\n\n' +
+            '**注意力分数**：$QK^T\\in\\mathbb{R}^{L\\times L}$ 是方阵（$L$ 为序列长度），记录每对 token 的相关度。',
+          reveal: {
+            q: '矩阵 $A\\in\\mathbb{R}^{5\\times3}$ 是方阵吗？有多少个元素？',
+            a: '不是方阵（$5\\neq3$）。元素个数 $=5\\times3=15$。',
+          },
+        },
+        // 卡 7：元素读取综合练习
+        {
+          title: '综合练习：读取元素与判断类型',
+          body:
+            '**例 1**：$M=\\begin{pmatrix}4&0&0\\\\0&-2&0\\\\0&0&7\\end{pmatrix}$。\n\n' +
+            '分析：$m=n=3$（方阵）；非对角元全 0（对角矩阵）；$M^T=M$（也是对称矩阵）。$m_{22}=-2$，$m_{13}=0$。\n\n' +
+            '**例 2**：$N=\\begin{pmatrix}1&4&7\\\\0&2&5\\\\0&0&3\\end{pmatrix}$。\n\n' +
+            '分析：方阵；$n_{21}=0,n_{31}=0,n_{32}=0$（对角线以下全为 0）→ 上三角矩阵；$n_{12}=4\\neq n_{21}=0$，不对称。\n\n' +
+            '**易错速记**：索引 $a_{ij}$——先 $i$ 行，后 $j$ 列，从左上角数起；行列式、特征值只对方阵有意义。',
+        },
+      ],
+      questions: [
+        // 题 1：choice — 读形状与元素数
+        {
+          id: 'u1-l3-q1',
+          type: 'choice',
+          prompt:
+            '矩阵 $W\\in\\mathbb{R}^{10\\times784}$，它有多少个元素？',
+          options: ['794', '7840', '784', '10'],
+          answer: 1,
+          explain:
+            '$10\\times784=7840$ 个元素。$m=10$ 行，$n=784$ 列，元素总数 $=m\\times n$。这就是 MNIST 手写数字识别输出层权重的参数量。',
+        },
+        // 题 2：judge — 方阵条件
+        {
+          id: 'u1-l3-q2',
+          type: 'judge',
+          prompt: '矩阵 $A\\in\\mathbb{R}^{10\\times784}$ 是方阵。',
+          answer: false,
+          explain:
+            '方阵要求行数 $=$ 列数。这里 $10\\neq784$，不是方阵。只有方阵才能计算行列式和特征值。',
+        },
+        // 题 3：choice — 元素索引
+        {
+          id: 'u1-l3-q3',
+          type: 'choice',
+          prompt:
+            '矩阵 $B=\\begin{pmatrix}1&0&-3\\\\2&5&7\\end{pmatrix}$，元素 $b_{23}$ 等于多少？',
+          options: ['$0$', '$-3$', '$7$', '$5$'],
+          answer: 2,
+          explain:
+            '$b_{23}$ 是第 2 行第 3 列的元素。第 2 行为 $(2,5,7)$，第 3 列取 $7$。注意下标先行后列。',
+        },
+        // 题 4：match — 特殊矩阵类型
+        {
+          id: 'u1-l3-q4',
+          type: 'match',
+          prompt: '将矩阵类型与其定义特征对应。',
+          left: ['单位矩阵 $I_n$', '零矩阵 $O$', '上三角矩阵'],
+          right: [
+            '对角线全 1，其余全 0',
+            '所有元素为 0，加法单位元',
+            '$i>j$ 时 $a_{ij}=0$',
+          ],
+        },
+        // 题 5：judge — 对角矩阵乘法
+        {
+          id: 'u1-l3-q5',
+          type: 'judge',
+          prompt: '两个同阶对角矩阵的乘积仍是对角矩阵，且对角元素等于对应位置的对角元素之积。',
+          answer: true,
+          explain:
+            '设 $D_1=\\mathrm{diag}(d_1,\\dots,d_n)$，$D_2=\\mathrm{diag}(e_1,\\dots,e_n)$，则 $D_1D_2=\\mathrm{diag}(d_1e_1,\\dots,d_ne_n)$。对角矩阵的乘法极为简单。',
+        },
+        // 题 6：input — 元素个数
+        {
+          id: 'u1-l3-q6',
+          type: 'input',
+          prompt:
+            '神经网络隐藏层权重矩阵 $W_1\\in\\mathbb{R}^{256\\times784}$，它有多少个参数（整数）？',
+          accept: ['200704'],
+          placeholder: '输入整数',
+          explain:
+            '$256\\times784=200704$ 个参数。读法：256 行（输出维度），784 列（输入维度）。',
+        },
+        // 题 7：choice — 矩阵相等条件
+        {
+          id: 'u1-l3-q7',
+          type: 'choice',
+          prompt:
+            '下列关于矩阵相等的说法，正确的是？',
+          options: [
+            '只需所有对应元素相等即可',
+            '只需维度相同即可',
+            '必须维度相同且所有对应元素相等',
+            '元素数相同就相等',
+          ],
+          answer: 2,
+          explain:
+            '矩阵相等的两个条件缺一不可：① 维度相同（$m$ 行 $n$ 列）；② 所有对应元素 $a_{ij}=b_{ij}$。$2\\times2$ 与 $1\\times4$ 的矩阵虽然都有 4 个元素，但不相等。',
+        },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // 关 4  对称与转置
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l4',
+      title: '对称与转置',
+      subtitle: '对称矩阵·反对称矩阵·对称分解',
+      intro: [
+        // 卡 1：转置定义
+        {
+          title: '转置：行列互换',
+          body:
+            '矩阵 $A\\in\\mathbb{R}^{m\\times n}$ 的**转置** $A^T\\in\\mathbb{R}^{n\\times m}$，将行与列互换：$(A^T)_{ij}=A_{ji}$。\n\n' +
+            '**具体例子**：$A=\\begin{pmatrix}1&2&3\\\\4&5&6\\end{pmatrix}_{2\\times3}$，$A^T=\\begin{pmatrix}1&4\\\\2&5\\\\3&6\\end{pmatrix}_{3\\times2}$。\n\n' +
+            '行向量转置得列向量，列向量转置得行向量——这正是第一章中行向量与列向量互换的数学定义。\n\n' +
+            '**双重转置**：$(A^T)^T=A$，转置两次恢复原矩阵。',
+          formula: '(A^T)_{ij}=A_{ji},\\quad (A^T)^T=A',
+        },
+        // 卡 2：对称矩阵
+        {
+          title: '对称矩阵：$A^T=A$',
+          body:
+            '方阵 $A$ 满足 $A^T=A$（即 $a_{ij}=a_{ji}$）时，称为**对称矩阵**。\n\n' +
+            '沿主对角线"镜像对称"——对角线左下侧与右上侧互为镜像。\n\n' +
+            '**常见对称矩阵**：协方差矩阵 $C=\\frac{1}{n}X^TX$（因为 $(X^TX)^T=X^TX$）；Gram 矩阵 $G=X^TX$；注意力分数矩阵当 $Q=K$ 时也对称。\n\n' +
+            '**例**：$S=\\begin{pmatrix}1&2&3\\\\2&5&-1\\\\3&-1&4\\end{pmatrix}$，验证 $s_{12}=2=s_{21}$，$s_{13}=3=s_{31}$，$s_{23}=-1=s_{32}$，对称 ✓。',
+          formula: 'A\\text{ 对称}\\iff A^T=A\\iff a_{ij}=a_{ji}',
+          tip: '构造对称矩阵的万能方法：对任意矩阵 $B$，$BB^T$ 和 $B^TB$ 都是对称矩阵。',
+        },
+        // 卡 3：反对称矩阵
+        {
+          title: '反对称矩阵：$A^T=-A$',
+          body:
+            '方阵 $A$ 满足 $A^T=-A$（即 $a_{ij}=-a_{ji}$）时，称为**反对称矩阵**（或斜对称矩阵）。\n\n' +
+            '**关键推论**：对角线元素必须全为 0。由 $a_{ii}=-a_{ii}$ 得 $2a_{ii}=0$，即 $a_{ii}=0$。\n\n' +
+            '**例**：$K=\\begin{pmatrix}0&-2&1\\\\2&0&-3\\\\-1&3&0\\end{pmatrix}$，' +
+            '验证 $k_{12}=-2=-(-2)=-k_{21}$ ✓，对角线全为 0 ✓。\n\n' +
+            '**易错点**：如果一个矩阵的对角线不全为 0，它不可能是反对称矩阵。',
+          formula: 'A\\text{ 反对称}\\iff A^T=-A\\iff a_{ij}=-a_{ji}\\Rightarrow a_{ii}=0',
+        },
+        // 卡 4：对称分解定理
+        {
+          title: '分解定理：任意方阵 $=$ 对称部分 $+$ 反对称部分',
+          body:
+            '**任意方阵** $A$ 都可以**唯一**分解为对称部分 $S$ 与反对称部分 $K$ 之和：\n\n' +
+            '验证对称部分：$S^T=\\dfrac{(A+A^T)^T}{2}=\\dfrac{A^T+A}{2}=S$ ✓\n\n' +
+            '验证反对称部分：$K^T=\\dfrac{(A-A^T)^T}{2}=\\dfrac{A^T-A}{2}=-K$ ✓\n\n' +
+            '这个分解在物理（旋转分量）、机器学习（注意力矩阵分析）中都有应用。',
+          formula: 'A=\\underbrace{\\dfrac{A+A^T}{2}}_{S,\\;S^T=S}+\\underbrace{\\dfrac{A-A^T}{2}}_{K,\\;K^T=-K}',
+        },
+        // 卡 5：对称分解例题
+        {
+          title: '例题：对称分解计算',
+          body:
+            '**将 $M=\\begin{pmatrix}3&5\\\\1&7\\end{pmatrix}$ 分解为对称部分 $S$ 与反对称部分 $K$。**\n\n' +
+            '步骤一：$M^T=\\begin{pmatrix}3&1\\\\5&7\\end{pmatrix}$。\n\n' +
+            '步骤二：$S=\\dfrac{M+M^T}{2}=\\dfrac{1}{2}\\begin{pmatrix}6&6\\\\6&14\\end{pmatrix}=\\begin{pmatrix}3&3\\\\3&7\\end{pmatrix}$，验证 $S^T=S$ ✓。\n\n' +
+            '步骤三：$K=\\dfrac{M-M^T}{2}=\\dfrac{1}{2}\\begin{pmatrix}0&4\\\\-4&0\\end{pmatrix}=\\begin{pmatrix}0&2\\\\-2&0\\end{pmatrix}$，验证 $K^T=-K$ ✓。\n\n' +
+            '验证：$S+K=\\begin{pmatrix}3&5\\\\1&7\\end{pmatrix}=M$ ✓。',
+        },
+        // 卡 6：协方差矩阵的对称性
+        {
+          title: '协方差矩阵永远对称',
+          body:
+            '数据矩阵 $X\\in\\mathbb{R}^{n\\times d}$，协方差矩阵 $C=\\dfrac{1}{n}X^TX\\in\\mathbb{R}^{d\\times d}$。\n\n' +
+            '**证明对称性**：$(X^TX)^T=X^T(X^T)^T=X^TX$，故 $C^T=C$ ✓。\n\n' +
+            '**面试标准答案**：协方差矩阵具有**对称 + 半正定**两大性质。\n\n' +
+            '**扩展**：任意矩阵 $B$，$BB^T$ 和 $B^TB$ 都是对称矩阵（且半正定）——这是构造协方差矩阵、Gram 矩阵的理论基础。',
+          reveal: {
+            q: '矩阵 $M=\\begin{pmatrix}2&6\\\\4&8\\end{pmatrix}$ 的对称分解中，$S_{12}$（第 1 行第 2 列）等于多少？',
+            a: '$M^T=\\begin{pmatrix}2&4\\\\6&8\\end{pmatrix}$，$S=\\dfrac{M+M^T}{2}=\\begin{pmatrix}2&5\\\\5&8\\end{pmatrix}$，故 $S_{12}=5$。',
+          },
+        },
+        // 卡 7：类型识别综合
+        {
+          title: '综合识别：矩阵类型快速判断',
+          body:
+            '**判断流程**：① 看形状是否 $m=n$（方阵条件）→ ② 看元素规律。\n\n' +
+            '对角线全 1 且其余全 0 → 单位矩阵；非对角元全 0 → 对角矩阵；' +
+            '对角线以下全 0 → 上三角；对角线以上全 0 → 下三角；$a_{ij}=a_{ji}$ → 对称；$a_{ij}=-a_{ji}$ → 反对称。\n\n' +
+            '**例**：$P=\\begin{pmatrix}4&1\\\\1&4\\end{pmatrix}$。方阵 ✓；$p_{12}=1=p_{21}$ → 对称矩阵 ✓；$p_{11}=p_{22}=4$ → 也是数量矩阵（对角元素相同）。\n\n' +
+            '**注意**：方阵 $\\neq$ 对称矩阵——方阵只要求 $m=n$，对称还要求 $a_{ij}=a_{ji}$，是更强的条件。',
+          tip: '看到协方差矩阵、Gram 矩阵、$BB^T$、$B^TB$ → 一定是对称矩阵且半正定。',
+        },
+      ],
+      questions: [
+        // 题 1：judge — 反对称矩阵对角线
+        {
+          id: 'u1-l4-q1',
+          type: 'judge',
+          prompt: '反对称矩阵（$A^T=-A$）的主对角线元素必须全为 0。',
+          answer: true,
+          explain:
+            '由 $A^T=-A$，对 $i=j$：$a_{ii}=-a_{ii}$，故 $2a_{ii}=0$，即 $a_{ii}=0$。反对称矩阵对角线必须全为零。',
+        },
+        // 题 2：input — 对称分解元素
+        {
+          id: 'u1-l4-q2',
+          type: 'input',
+          prompt:
+            '将 $M=\\begin{pmatrix}2&6\\\\4&8\\end{pmatrix}$ 分解为对称部分 $S$ 与反对称部分 $K$。$S_{12}$ 等于多少？',
+          accept: ['5', '5.0'],
+          placeholder: '输入数字',
+          explain:
+            '$M^T=\\begin{pmatrix}2&4\\\\6&8\\end{pmatrix}$，$S=\\dfrac{M+M^T}{2}=\\dfrac{1}{2}\\begin{pmatrix}4&10\\\\10&16\\end{pmatrix}=\\begin{pmatrix}2&5\\\\5&8\\end{pmatrix}$。故 $S_{12}=5$。',
+        },
+        // 题 3：choice — 协方差矩阵性质
+        {
+          id: 'u1-l4-q3',
+          type: 'choice',
+          prompt:
+            '数据矩阵 $X\\in\\mathbb{R}^{n\\times d}$，其协方差矩阵 $C=\\dfrac{1}{n}X^TX$ 的形状是什么？',
+          options: ['$n\\times n$', '$d\\times d$', '$n\\times d$', '$d\\times n$'],
+          answer: 1,
+          explain:
+            '$X^T\\in\\mathbb{R}^{d\\times n}$，$X\\in\\mathbb{R}^{n\\times d}$，乘积 $X^TX\\in\\mathbb{R}^{d\\times d}$。协方差矩阵是 $d\\times d$ 的对称半正定方阵。',
+        },
+        // 题 4：judge — BB^T 对称
+        {
+          id: 'u1-l4-q4',
+          type: 'judge',
+          prompt: '对任意矩阵 $B$，$BB^T$ 一定是对称矩阵。',
+          answer: true,
+          explain:
+            '$(BB^T)^T=(B^T)^TB^T=BB^T$，满足 $A^T=A$，所以 $BB^T$ 是对称矩阵。这也是协方差矩阵天然对称的原因。',
+        },
+        // 题 5：match — 矩阵类型与定义
+        {
+          id: 'u1-l4-q5',
+          type: 'match',
+          prompt: '将矩阵类型与其核心判断条件对应。',
+          left: ['对称矩阵', '反对称矩阵', '对角矩阵'],
+          right: ['$a_{ij}=a_{ji}$（$A^T=A$）', '$a_{ij}=-a_{ji}$，对角线全 0', '非对角元素全为 0'],
+        },
+        // 题 6：choice — 对称矩阵例子
+        {
+          id: 'u1-l4-q6',
+          type: 'choice',
+          prompt:
+            '判断 $B=\\begin{pmatrix}4&1\\\\1&4\\end{pmatrix}$ 的类型。',
+          options: [
+            '反对称矩阵',
+            '对称矩阵',
+            '上三角矩阵',
+            '零矩阵',
+          ],
+          answer: 1,
+          explain:
+            '$b_{12}=1=b_{21}$，满足 $B^T=B$，故 $B$ 是对称矩阵（也是方阵）。',
+        },
+        // 题 7：input — 对称分解的反对称部分
+        {
+          id: 'u1-l4-q7',
+          type: 'input',
+          prompt:
+            '将 $M=\\begin{pmatrix}3&5\\\\1&7\\end{pmatrix}$ 分解为对称部分 $S$ 与反对称部分 $K$，$K_{12}$（第 1 行第 2 列）等于多少？',
+          accept: ['2', '2.0'],
+          placeholder: '输入数字',
+          explain:
+            '$M^T=\\begin{pmatrix}3&1\\\\5&7\\end{pmatrix}$，$K=\\dfrac{M-M^T}{2}=\\dfrac{1}{2}\\begin{pmatrix}0&4\\\\-4&0\\end{pmatrix}=\\begin{pmatrix}0&2\\\\-2&0\\end{pmatrix}$，故 $K_{12}=2$。',
+        },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // 关 5  加法·数乘·矩阵乘法
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l5',
+      title: '加法·数乘·矩阵乘法',
+      subtitle: '逐元素运算·内维消去·列视角·不满足交换律',
+      intro: [
+        // 卡 1：矩阵加法与数乘
+        {
+          title: '矩阵加法与数乘：逐元素操作',
+          body:
+            '**矩阵加法**：两矩阵形状相同时，对应元素相加——与向量加法完全类似。\n\n' +
+            '**数乘**：标量乘以矩阵，每个元素都乘以该标量。\n\n' +
+            '**例子**：$\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}+\\begin{pmatrix}5&6\\\\7&8\\end{pmatrix}=\\begin{pmatrix}6&8\\\\10&12\\end{pmatrix}$；' +
+            '$3\\begin{pmatrix}1&-2\\\\0&4\\end{pmatrix}=\\begin{pmatrix}3&-6\\\\0&12\\end{pmatrix}$。\n\n' +
+            '运算性质：交换律、结合律、零矩阵（加法单位元）、标量分配律——与向量运算相同。\n\n' +
+            '**注意**：形状不同的矩阵不能相加，与向量加法一样严格。',
+          formula:
+            '(A+B)_{ij}=A_{ij}+B_{ij},\\quad(cA)_{ij}=c\\cdot A_{ij}',
+        },
+        // 卡 2：矩阵乘法条件与形状
+        {
+          title: '矩阵乘法：内维消去，外维保留',
+          body:
+            '矩阵乘法是本关最核心的操作，**不是逐元素相乘**！\n\n' +
+            '**条件**：$A$ 的列数必须等于 $B$ 的行数（内维匹配）。\n\n' +
+            '**结果形状口诀**："内维消去，外维保留"——$(m\\times\\mathbf{k})\\cdot(\\mathbf{k}\\times n)=m\\times n$。\n\n' +
+            '**定义**：乘积 $C=AB$ 的第 $i$ 行第 $j$ 列元素，等于 $A$ 第 $i$ 行与 $B$ 第 $j$ 列的内积：\n\n' +
+            '$C_{ij}=\\sum_{l=1}^{k}A_{il}B_{lj}$\n\n' +
+            '检查矩阵乘法维度三步：① 写出每个矩阵形状；② 检查内维是否相等；③ 外维就是结果形状。',
+          formula:
+            '\\underbrace{A}_{m\\times k}\\cdot\\underbrace{B}_{k\\times n}=\\underbrace{C}_{m\\times n},\\quad C_{ij}=\\sum_{l=1}^{k}A_{il}B_{lj}',
+          tip: '深度学习警示：神经网络中 $W\\mathbf{x}$ 与 $\\mathbf{x}W$ 语义完全不同，乘法顺序写错是最常见的维度 bug。',
+        },
+        // 卡 3：矩阵乘法计算演练
+        {
+          title: '矩阵乘法计算演练',
+          body:
+            '**具体计算**：$A=\\begin{pmatrix}1&2&3\\\\4&5&6\\end{pmatrix}$（$2\\times3$），$B=\\begin{pmatrix}7&8\\\\9&10\\\\11&12\\end{pmatrix}$（$3\\times2$），结果 $C=AB$ 形状 $2\\times2$。\n\n' +
+            '$C_{11}=1\\times7+2\\times9+3\\times11=7+18+33=58$\n\n' +
+            '$C_{12}=1\\times8+2\\times10+3\\times12=8+20+36=64$\n\n' +
+            '$C_{21}=4\\times7+5\\times9+6\\times11=28+45+66=139$\n\n' +
+            '$C_{22}=4\\times8+5\\times10+6\\times12=32+50+72=154$\n\n' +
+            '故 $AB=\\begin{pmatrix}58&64\\\\139&154\\end{pmatrix}$。',
+        },
+        // 卡 4：矩阵乘法不满足交换律
+        {
+          title: '矩阵乘法不满足交换律',
+          body:
+            '**矩阵乘法中最重要的非直觉性质**：$AB\\neq BA$（一般情况下）。\n\n' +
+            '**原因一**：维度不对称——若 $A$：$2\\times3$，$B$：$3\\times4$，则 $AB$：$2\\times4$ 有定义，但 $BA$ 要求 $4=2$，**无定义**。\n\n' +
+            '**原因二**：即使形状允许，结果也通常不同。\n\n' +
+            '**具体反例**：$A=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$，$B=\\begin{pmatrix}0&1\\\\1&0\\end{pmatrix}$。\n\n' +
+            '$AB=\\begin{pmatrix}2&1\\\\4&3\\end{pmatrix}$，$BA=\\begin{pmatrix}3&4\\\\1&2\\end{pmatrix}$，两者不同。\n\n' +
+            '**几何理由**：矩阵代表线性映射，矩阵乘法代表映射的复合——先穿袜子再穿鞋 $\\neq$ 先穿鞋再穿袜子。',
+        },
+        // 卡 5：列视角——Ax 是各列的线性组合
+        {
+          title: '列视角：$A\\mathbf{x}$ 是 $A$ 各列的线性组合',
+          body:
+            '矩阵乘向量 $A\\mathbf{x}$ 有一个极其重要的理解方式——**列视角**：\n\n' +
+            '设 $A$ 的列为 $\\mathbf{a}_1,\\mathbf{a}_2,\\dots,\\mathbf{a}_k$，$\\mathbf{x}=(x_1,x_2,\\dots,x_k)^T$，则 $A\\mathbf{x}=x_1\\mathbf{a}_1+x_2\\mathbf{a}_2+\\cdots+x_k\\mathbf{a}_k$。\n\n' +
+            '以 $\\mathbf{x}$ 的分量为系数，对 $A$ 的各列做线性组合。\n\n' +
+            '**具体例子**：$\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}\\begin{pmatrix}2\\\\-1\\end{pmatrix}=2\\begin{pmatrix}1\\\\3\\end{pmatrix}+(-1)\\begin{pmatrix}2\\\\4\\end{pmatrix}=\\begin{pmatrix}0\\\\2\\end{pmatrix}$。\n\n' +
+            '这个视角贯穿整个线性代数：方程组 $A\\mathbf{x}=\\mathbf{b}$ 有解 $\\Leftrightarrow$ $\\mathbf{b}$ 能写成 $A$ 各列的线性组合。',
+          formula: 'A\\mathbf{x}=x_1\\mathbf{a}_1+x_2\\mathbf{a}_2+\\cdots+x_k\\mathbf{a}_k',
+        },
+        // 卡 6：深度学习中的矩阵乘法
+        {
+          title: '深度学习中的矩阵乘法',
+          body:
+            '**全连接层前向传播**（单样本）：$\\mathbf{y}=W\\mathbf{x}+\\mathbf{b}$，$W\\in\\mathbb{R}^{d_{out}\\times d_{in}}$。\n\n' +
+            '**批处理**：$N$ 个样本组成 $X\\in\\mathbb{R}^{N\\times d_{in}}$，输出 $Y=XW^T+\\mathbf{b}$，注意 $W$ 存储形式是 $(d_{out}\\times d_{in})$，批处理时需转置。\n\n' +
+            '**注意力机制**：$QK^T\\in\\mathbb{R}^{L\\times L}$ 是方阵，记录每对 token 的相关度。\n\n' +
+            '**反向传播**：$\\partial L/\\partial\\mathbf{x}=W^T(\\partial L/\\partial\\mathbf{y})$，转置矩阵把梯度从输出空间投回输入空间。',
+          reveal: {
+            q: '若 $A\\in\\mathbb{R}^{3\\times4}$，$B\\in\\mathbb{R}^{4\\times2}$，$AB$ 的形状是什么？$BA$ 有定义吗？',
+            a: '$AB$ 形状为 $3\\times2$（内维 4 消去，外维 3 和 2 保留）。$BA$：$B$ 的列数 $=2$，$A$ 的行数 $=3$，$2\\neq3$，**无定义**。',
+          },
+        },
+        // 卡 7：结合律、分配律与单位矩阵
+        {
+          title: '矩阵乘法的性质：结合律与单位矩阵',
+          body:
+            '矩阵乘法满足**结合律**（$ABC=(AB)C=A(BC)$）和**分配律**（$A(B+C)=AB+AC$），但**不满足交换律**。\n\n' +
+            '单位矩阵 $I_n$ 是乘法单位元：$AI_n=A$，$I_mA=A$（维度对应即可）。\n\n' +
+            '**标量兼容性**：$c(AB)=(cA)B=A(cB)$，标量可以随意提到外面。\n\n' +
+            '**方阵的幂**：只有方阵才能定义 $A^k$（$k$ 个 $A$ 相乘）；$(AB)^k\\neq A^kB^k$（不可交换，所以不能分配）。\n\n' +
+            '**易错点**：矩阵乘法不是逐元素相乘（那是 Hadamard 积 $A\\odot B$，代码中是 `A*B`）。',
+          tip: '计算 $AB$ 前先验证维度：$A$ 的列数 $=$ $B$ 的行数，否则无定义。',
+        },
+      ],
+      questions: [
+        // 题 1：choice — 乘法维度
+        {
+          id: 'u1-l5-q1',
+          type: 'choice',
+          prompt:
+            '设 $A\\in\\mathbb{R}^{2\\times3}$，$B\\in\\mathbb{R}^{3\\times4}$，乘积 $AB$ 的形状是什么？',
+          options: ['$2\\times4$', '$3\\times3$', '$2\\times3$', '$4\\times2$'],
+          answer: 0,
+          explain:
+            '$(2\\times\\mathbf{3})\\cdot(\\mathbf{3}\\times4)=2\\times4$。内维 3 匹配并消去，外维 2 和 4 保留。',
+        },
+        // 题 2：judge — 交换律
+        {
+          id: 'u1-l5-q2',
+          type: 'judge',
+          prompt: '矩阵乘法满足交换律，即对任意矩阵 $A,B$，$AB=BA$ 总是成立。',
+          answer: false,
+          explain:
+            '矩阵乘法**不满足**交换律。$AB$ 有定义时 $BA$ 可能无定义；即使都有定义，形状或数值通常也不同。',
+        },
+        // 题 3：input — 矩阵乘法元素
+        {
+          id: 'u1-l5-q3',
+          type: 'input',
+          prompt:
+            '计算乘积 $AB$ 中的 $C_{12}$，其中 $A=\\begin{pmatrix}1&2&3\\\\4&5&6\\end{pmatrix}$，$B=\\begin{pmatrix}7&8\\\\9&10\\\\11&12\\end{pmatrix}$。',
+          accept: ['64'],
+          placeholder: '输入整数',
+          explain:
+            '$C_{12}=A$ 第 1 行 $\\cdot$ $B$ 第 2 列 $=1\\times8+2\\times10+3\\times12=8+20+36=64$。',
+        },
+        // 题 4：choice — 矩阵乘向量列视角
+        {
+          id: 'u1-l5-q4',
+          type: 'choice',
+          prompt:
+            '计算 $\\begin{pmatrix}1&0\\\\0&1\\\\1&1\\end{pmatrix}\\begin{pmatrix}3\\\\2\\end{pmatrix}$，结果是什么？',
+          options: [
+            '$\\begin{pmatrix}3\\\\2\\\\5\\end{pmatrix}$',
+            '$\\begin{pmatrix}3\\\\2\\\\1\\end{pmatrix}$',
+            '$\\begin{pmatrix}1\\\\1\\\\6\\end{pmatrix}$',
+            '$\\begin{pmatrix}3\\\\2\\\\6\\end{pmatrix}$',
+          ],
+          answer: 0,
+          explain:
+            '列视角：$3\\begin{pmatrix}1\\\\0\\\\1\\end{pmatrix}+2\\begin{pmatrix}0\\\\1\\\\1\\end{pmatrix}=\\begin{pmatrix}3\\\\0\\\\3\\end{pmatrix}+\\begin{pmatrix}0\\\\2\\\\2\\end{pmatrix}=\\begin{pmatrix}3\\\\2\\\\5\\end{pmatrix}$。',
+        },
+        // 题 5：judge — 矩阵加法形状条件
+        {
+          id: 'u1-l5-q5',
+          type: 'judge',
+          prompt: '形状不同的矩阵不能相加。',
+          answer: true,
+          explain:
+            '矩阵加法要求两矩阵形状完全相同（行数和列数均相等），才能对应元素相加。形状不同则加法无定义。',
+        },
+        // 题 6：match — 矩阵运算性质
+        {
+          id: 'u1-l5-q6',
+          type: 'match',
+          prompt: '将矩阵运算与其关键性质对应。',
+          left: ['矩阵加法', '矩阵乘法', '数乘矩阵'],
+          right: [
+            '满足交换律，需相同形状',
+            '不满足交换律，内维须匹配',
+            '标量与每个元素相乘，无形状限制',
+          ],
+        },
+        // 题 7：choice — 维度不匹配判断
+        {
+          id: 'u1-l5-q7',
+          type: 'choice',
+          prompt:
+            '设 $A\\in\\mathbb{R}^{3\\times4}$，$B\\in\\mathbb{R}^{4\\times2}$，$C\\in\\mathbb{R}^{2\\times3}$。下列哪个乘积**无定义**？',
+          options: ['$AB$', '$BC$', '$BA$', '$CA$'],
+          answer: 2,
+          explain:
+            '$BA$：$B$ 的列数 $=2$，$A$ 的行数 $=3$，$2\\neq3$，**内维不匹配，无定义**。' +
+            '$AB$：$3\\times4$ 乘 $4\\times2$，内维匹配；$BC$：$4\\times2$ 乘 $2\\times3$，匹配；$CA$：$2\\times3$ 乘 $3\\times4$，匹配。',
+        },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // 关 6  转置与迹
+    // ─────────────────────────────────────────
+    {
+      id: 'u1-l6',
+      title: '转置与迹',
+      subtitle: '$(AB)^T=B^TA^T$·$\\mathrm{tr}(AB)=\\mathrm{tr}(BA)$·Frobenius 范数',
+      intro: [
+        // 卡 1：乘积转置公式
+        {
+          title: '乘积转置：顺序反转',
+          body:
+            '矩阵转置的核心性质汇总：\n\n' +
+            '① 双重转置：$(A^T)^T=A$\n\n' +
+            '② 加法转置：$(A+B)^T=A^T+B^T$（线性性）\n\n' +
+            '③ 数乘转置：$(cA)^T=cA^T$\n\n' +
+            '④ **乘积转置反转顺序**：$(AB)^T=B^TA^T$（不是 $A^TB^T$！）\n\n' +
+            '记忆口诀：脱外套的顺序与穿上时相反——后穿的先脱。推广：$(ABC)^T=C^TB^TA^T$。',
+          formula:
+            '(AB)^T=B^TA^T,\\qquad(ABC)^T=C^TB^TA^T',
+          tip: '构造对称矩阵的万能方法：对任意矩阵 $B$，$BB^T$ 和 $B^TB$ 都是对称矩阵。',
+        },
+        // 卡 2：乘积转置公式推导
+        {
+          title: '乘积转置公式：推导',
+          body:
+            '**为什么 $(AB)^T=B^TA^T$ 而不是 $A^TB^T$？**\n\n' +
+            '推导：设 $C=AB$，则\n\n' +
+            '$((AB)^T)_{ij}=C_{ji}=\\sum_l A_{jl}B_{li}=\\sum_l(B^T)_{il}(A^T)_{lj}=(B^TA^T)_{ij}$ ✓\n\n' +
+            '**深度学习应用**：前向传播 $\\mathbf{y}=W\\mathbf{x}$；反向传播梯度为 $W^T(\\partial L/\\partial\\mathbf{y})$，把梯度从输出空间投回输入空间——维度匹配的保证。\n\n' +
+            '$W^T\\in\\mathbb{R}^{d_{in}\\times d_{out}}$，梯度 $\\partial L/\\partial\\mathbf{y}\\in\\mathbb{R}^{d_{out}}$，乘积维度 $d_{in}\\times1$，与 $\\mathbf{x}$ 一致 ✓。',
+        },
+        // 卡 3：迹的定义
+        {
+          title: '矩阵的迹：对角元素之和',
+          body:
+            '方阵 $A\\in\\mathbb{R}^{n\\times n}$ 的**迹**（trace）定义为主对角线元素之和：\n\n' +
+            '**例子**：$A=\\begin{pmatrix}1&0\\\\2&3\\end{pmatrix}$，$\\mathrm{tr}(A)=1+3=4$；\n\n' +
+            '$B=\\begin{pmatrix}3&1&2\\\\0&-1&4\\\\5&2&7\\end{pmatrix}$，$\\mathrm{tr}(B)=3+(-1)+7=9$。\n\n' +
+            '**迹与特征值的关系**：$\\mathrm{tr}(A)=\\sum_i\\lambda_i$（所有特征值之和）——学习特征分解后，这将成为一个非常有用的恒等式。',
+          formula:
+            '\\mathrm{tr}(A)=\\sum_{i=1}^n a_{ii}',
+        },
+        // 卡 4：迹的性质
+        {
+          title: '迹的三大性质',
+          body:
+            '**性质一（线性）**：$\\mathrm{tr}(aA+bB)=a\\,\\mathrm{tr}(A)+b\\,\\mathrm{tr}(B)$\n\n' +
+            '**性质二（循环置换不变）**：$\\mathrm{tr}(AB)=\\mathrm{tr}(BA)$；推广：$\\mathrm{tr}(ABC)=\\mathrm{tr}(BCA)=\\mathrm{tr}(CAB)$\n\n' +
+            '**重要**：只能**循环**置换，不能任意重排！$\\mathrm{tr}(ABC)\\neq\\mathrm{tr}(ACB)$（一般不等）。\n\n' +
+            '**性质三（Frobenius 范数）**：$\\|A\\|_F^2=\\mathrm{tr}(A^TA)$——矩阵所有元素平方和。\n\n' +
+            '**验证**：$M=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$，$\\|M\\|_F^2=1+4+9+16=30$；$M^TM=\\begin{pmatrix}10&14\\\\14&20\\end{pmatrix}$，$\\mathrm{tr}(M^TM)=10+20=30$ ✓。',
+          formula:
+            '\\mathrm{tr}(AB)=\\mathrm{tr}(BA),\\qquad\\|A\\|_F^2=\\mathrm{tr}(A^TA)',
+        },
+        // 卡 5：迹技巧
+        {
+          title: '迹技巧：将标量写成迹',
+          body:
+            '**重要恒等式**：$\\mathbf{x}^TA\\mathbf{x}=\\mathrm{tr}(A\\mathbf{x}\\mathbf{x}^T)$。\n\n' +
+            '**推导**：$\\mathbf{x}^TA\\mathbf{x}\\in\\mathbb{R}$（标量），标量的迹等于自身。\n\n' +
+            '利用循环置换（令 $P=\\mathbf{x}^T,Q=A,R=\\mathbf{x}$）：\n\n' +
+            '$\\mathrm{tr}(\\mathbf{x}^TA\\mathbf{x})=\\mathrm{tr}(\\mathbf{x}\\mathbf{x}^TA)=\\mathrm{tr}(A\\mathbf{x}\\mathbf{x}^T)$ ✓\n\n' +
+            '**应用**：矩阵微积分中，将标量写成迹的形式，可用矩阵求导公式处理。例如推导二次型 $\\mathbf{x}^TA\\mathbf{x}$ 对 $\\mathbf{x}$ 的梯度时，迹技巧是标准套路。',
+          formula:
+            '\\mathbf{x}^TA\\mathbf{x}=\\mathrm{tr}(\\mathbf{x}^TA\\mathbf{x})=\\mathrm{tr}(A\\mathbf{x}\\mathbf{x}^T)',
+        },
+        // 卡 6：综合演练
+        {
+          title: '综合演练：转置与迹',
+          body:
+            '**例 1**：验证 $(MM^T)^T=MM^T$，其中 $M=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$。\n\n' +
+            '$MM^T=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}\\begin{pmatrix}1&3\\\\2&4\\end{pmatrix}=\\begin{pmatrix}5&11\\\\11&25\\end{pmatrix}$，' +
+            '对称（上下三角互等），故 $(MM^T)^T=MM^T$ ✓。\n\n' +
+            '**例 2**：验证 $\\mathrm{tr}(AB)=\\mathrm{tr}(BA)$，其中 $A=\\begin{pmatrix}1&0\\\\2&3\\end{pmatrix}$，$B=\\begin{pmatrix}4&5\\\\0&1\\end{pmatrix}$。\n\n' +
+            '$AB=\\begin{pmatrix}4&5\\\\8&13\\end{pmatrix}$，$\\mathrm{tr}(AB)=4+13=17$；\n\n' +
+            '$BA=\\begin{pmatrix}14&20\\\\2&3\\end{pmatrix}$，$\\mathrm{tr}(BA)=14+3=17$ ✓。',
+          reveal: {
+            q: '若 $A\\in\\mathbb{R}^{3\\times4}$，$B\\in\\mathbb{R}^{4\\times3}$，$(AB)^T$ 的形状是什么？',
+            a: '$AB\\in\\mathbb{R}^{3\\times3}$，$(AB)^T\\in\\mathbb{R}^{3\\times3}$（方阵转置形状不变）。也可用 $(AB)^T=B^TA^T$：$B^T\\in\\mathbb{R}^{3\\times4}$，$A^T\\in\\mathbb{R}^{4\\times3}$，乘积形状 $3\\times3$ ✓。',
+          },
+        },
+        // 卡 7：易错点汇总
+        {
+          title: '易错点汇总',
+          body:
+            '**易错点一**：转置乘积反转顺序忘了——$(AB)^T=B^TA^T$，不是 $A^TB^T$。三个矩阵 $(ABC)^T=C^TB^TA^T$，每次都要反转。\n\n' +
+            '**易错点二**：迹的循环置换用错——$\\mathrm{tr}(ABC)=\\mathrm{tr}(BCA)=\\mathrm{tr}(CAB)$（循环），但 $\\mathrm{tr}(ABC)\\neq\\mathrm{tr}(ACB)$（任意重排不成立）。\n\n' +
+            '**易错点三**：混淆矩阵乘法和 Hadamard 积——矩阵乘法 $AB$ 是行乘列求和；Hadamard 积 $A\\odot B$ 才是逐元素相乘（PyTorch 中 `A*B`）。\n\n' +
+            '**易错点四**：迹只对方阵定义——$m\\times n$ 矩阵（$m\\neq n$）没有迹的概念。',
+          tip: '口诀：乘积转置"后穿先脱"；迹的循环"三人转圈可以，乱跑不行"。',
+        },
+      ],
+      questions: [
+        // 题 1：choice — 转置公式
+        {
+          id: 'u1-l6-q1',
+          type: 'choice',
+          prompt: '$(AB)^T$ 等于什么？',
+          options: ['$A^TB^T$', '$B^TA^T$', '$BA$', '$A^{-1}B^{-1}$'],
+          answer: 1,
+          explain:
+            '乘积转置公式：$(AB)^T=B^TA^T$，顺序**反转**。可类比"脱外套的顺序与穿上时相反"。推广：$(ABC)^T=C^TB^TA^T$。',
+        },
+        // 题 2：judge — BB^T 对称
+        {
+          id: 'u1-l6-q2',
+          type: 'judge',
+          prompt: '对任意矩阵 $B$，$BB^T$ 一定是对称矩阵。',
+          answer: true,
+          explain:
+            '$(BB^T)^T=(B^T)^TB^T=BB^T$，满足 $A^T=A$，所以 $BB^T$ 是对称矩阵。这也是协方差矩阵天然对称的原因。',
+        },
+        // 题 3：input — 迹的计算
+        {
+          id: 'u1-l6-q3',
+          type: 'input',
+          prompt:
+            '矩阵 $A=\\begin{pmatrix}3&1&2\\\\0&-1&4\\\\5&2&7\\end{pmatrix}$，计算 $\\mathrm{tr}(A)$。',
+          accept: ['9'],
+          placeholder: '输入整数',
+          explain:
+            '$\\mathrm{tr}(A)=a_{11}+a_{22}+a_{33}=3+(-1)+7=9$。迹是主对角线元素之和。',
+        },
+        // 题 4：judge — 迹的循环置换
+        {
+          id: 'u1-l6-q4',
+          type: 'judge',
+          prompt:
+            '对任意维度兼容的矩阵 $A,B,C$，$\\mathrm{tr}(ABC)=\\mathrm{tr}(ACB)$ 成立。',
+          answer: false,
+          explain:
+            '迹的循环置换只允许**循环移位**：$\\mathrm{tr}(ABC)=\\mathrm{tr}(BCA)=\\mathrm{tr}(CAB)$。$\\mathrm{tr}(ACB)$ 是任意重排，一般不等于 $\\mathrm{tr}(ABC)$。',
+        },
+        // 题 5：input — Frobenius 范数
+        {
+          id: 'u1-l6-q5',
+          type: 'input',
+          prompt:
+            '计算 $M=\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$ 的 Frobenius 范数的平方 $\\|M\\|_F^2$。',
+          accept: ['30'],
+          placeholder: '输入整数',
+          explain:
+            '$\\|M\\|_F^2=1^2+2^2+3^2+4^2=1+4+9+16=30$。也可用 $\\mathrm{tr}(M^TM)=\\mathrm{tr}\\begin{pmatrix}10&14\\\\14&20\\end{pmatrix}=10+20=30$。',
+        },
+        // 题 6：match — 矩阵运算与性质
+        {
+          id: 'u1-l6-q6',
+          type: 'match',
+          prompt: '将运算与其关键性质对应。',
+          left: ['矩阵转置', '矩阵的迹', 'Frobenius 范数'],
+          right: [
+            '乘积转置反转顺序：$(AB)^T=B^TA^T$',
+            '循环置换不变：$\\mathrm{tr}(AB)=\\mathrm{tr}(BA)$',
+            '$\\|A\\|_F^2=\\mathrm{tr}(A^TA)$，所有元素平方和',
+          ],
+        },
+        // 题 7：choice — 反向传播中的转置
+        {
+          id: 'u1-l6-q7',
+          type: 'choice',
+          prompt:
+            '前向传播 $\\mathbf{y}=W\\mathbf{x}$（$W\\in\\mathbb{R}^{d_{out}\\times d_{in}}$），反向传播梯度 $\\partial L/\\partial\\mathbf{x}$ 等于什么？',
+          options: [
+            '$W\\cdot(\\partial L/\\partial\\mathbf{y})$',
+            '$W^T\\cdot(\\partial L/\\partial\\mathbf{y})$',
+            '$(\\partial L/\\partial\\mathbf{y})\\cdot W$',
+            '$W^{-1}\\cdot(\\partial L/\\partial\\mathbf{y})$',
+          ],
+          answer: 1,
+          explain:
+            '由链式法则，$\\partial L/\\partial\\mathbf{x}=W^T(\\partial L/\\partial\\mathbf{y})$。' +
+            '$W^T\\in\\mathbb{R}^{d_{in}\\times d_{out}}$ 将梯度从 $d_{out}$ 维输出空间投回 $d_{in}$ 维输入空间，维度匹配 $(d_{in}\\times\\mathbf{d_{out}})\\cdot(\\mathbf{d_{out}}\\times1)=d_{in}\\times1$ ✓。',
+        },
+      ],
+    },
+  ],
+}

@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u3c10",
+    "title": "训练存储、Checkpoint 与 IO 诊断",
+    "subtitle": "写入峰值、原子提交、异步归档、小文件治理",
+    "intro": [
+      {
+        "title": "训练不只消耗算力，还消耗 IO",
+        "body": "训练不是只消耗 GPU 算力，它还**持续读取样本、加载权重、写入状态、恢复状态、归档制品**。这些 IO 动作会在时间上聚集、在文件系统上共享、在失败时决定能否继续训练。\n\n三层约束：\n1. **吞吐约束**：1024 卡训练可能同时有上千进程读数据、周期性写 checkpoint、重启时并发加载模型\n2. **一致性约束**：checkpoint 写完前不能被恢复逻辑误读，元数据更新不能让其他 rank 看到半成品\n3. **平台约束**：一个作业的 checkpoint storm 可能拖慢另一个作业的 dataloader，让 GPU 利用率同时锯齿化\n\n**四个核心问题**：热数据放在哪里？写入峰值如何削平？恢复路径是否可预测？冷归档是否不干扰训练主路径？任何一个没设计好，都会出现 step time 变长、GPU 空洞、checkpoint 卡住、重启慢等症状。"
+      },
+      {
+        "title": "训练存储的三层角色",
+        "body": "训练平台需要三种存储角色：\n\n1. **热层**：服务正在训练的作业，低抖动、高并发、POSIX 或近似 POSIX 语义，典型是 `Lustre`、`GPFS`、`BeeGFS`、`WekaFS` 等并行文件系统\n2. **缓存层**：减少重复远端读取，典型是本地 NVMe、节点级 cache、数据集预热目录\n3. **冷层**：长期保存，典型是对象存储（`S3`、`GCS`）\n\n**关键原则**：不要把对象存储直接当训练热层（不擅长被上千 worker 随机 stat/open/read 小文件）；也不要把并行文件系统当无限归档仓库（热层容量昂贵）。\n\n**分层路径**：`对象存储/数据湖 → 数据整理 → 热层（并行文件系统）→ 节点缓存（NVMe/page cache）→ DataLoader 队列 → GPU 计算 → Checkpoint staging（热层临时目录）→ 原子发布 latest → 后台异步归档（对象存储）`"
+      },
+      {
+        "title": "并行文件系统：平台视角的选型逻辑",
+        "body": "选型不是「哪个最好」，而是「能否稳定服务你的访问形状」：\n\n| 文件系统 | 平台优势 | 主要关注点 |\n|---------|---------|----------|\n| `Lustre` | HPC 生态成熟，大文件顺序吞吐强，stripe 控制明确 | MDT 小文件和目录风暴容易爆、客户端内核版本管理重要 |\n| `GPFS` (IBM Spectrum Scale) | 企业级治理完整，多协议和策略管理强 | 部署和运维复杂度高 |\n| `BeeGFS` | 部署轻量，调优直观，适合通用服务器搭建 | 大规模治理按规模和经验验证 |\n| `WekaFS` | 低延迟高吞吐，云和对象分层能力强 | 成本、专有栈、网络与客户端要求 |\n\n**真正验收时**必须用你的 workload 做基准：大文件顺序读（模拟打包数据集和模型加载）、大文件并发写（模拟 checkpoint shard 写入）、小文件元数据（模拟未打包样本）、混合读写（模拟多作业共享）、恢复读取（模拟故障后并发加载）。"
+      },
+      {
+        "title": "Checkpoint 的第一性原理",
+        "body": "checkpoint 不只是\"把权重保存成文件\"。一个完整 checkpoint 需要包含：\n\n- **模型权重**：恢复参数\n- **优化器状态**：Adam 需要动量、方差等，通常比权重更大\n- **LR scheduler 状态**：保持训练曲线连续\n- **RNG 状态**：每 rank 各自状态，保证 dropout、采样可复现\n- **DataLoader/sampler 状态**：global step、epoch、shuffle seed，避免重复或跳过样本\n- **并行策略元数据**：TP/PP/DP/FSDP/ZeRO 分片方式\n- **代码和配置摘要**：git sha、config，防止用错误代码恢复\n\n**最常见错误**：只保存权重。权重能用于推理初始化，但不能恢复训练。训练恢复需要优化器状态、数据位置、并行拓扑和随机状态匹配，否则表面上「load 成功」，实际训练曲线可能跳变或重复消费数据。",
+        "tip": "70B BF16 权重约 140GB，Adam 优化器状态是权重的数倍。算容量账本时必须用完整 checkpoint 大小，不能只按权重估算。"
+      },
+      {
+        "title": "Checkpoint Storm 与削峰策略",
+        "body": "**Checkpoint storm**：假设 512 个 rank 同时写 4GB shard，总写入量 2TB，所有 rank 同秒开始写，热层同时面对大量并发写、大量 rename/create、元数据突发、GPU 等待空洞。若多个作业 checkpoint 周期对齐，平台会出现周期性全局 step time 尖刺。\n\n**削峰策略**：\n\n| 策略 | 作用 | 代价 |\n|------|-----|-----|\n| rank 分片写 | 避免单文件瓶颈，匹配分布式状态 | 文件数量增加，manifest 更重要 |\n| 分组错峰 | 不同 rank group 分批写入 | checkpoint wall time 可能变长 |\n| 限速写入 | 给作业/客户端设置写入上限 | 单作业保存变慢 |\n| 异步 checkpoint | 训练推进，后台写状态副本 | 需额外内存，语义复杂 |\n| 保留窗口 | 只保留最近 K 个热 checkpoint | 需要可靠归档 |\n\n**Checkpoint IO CapacityLedger**：`required_ckpt_bw = ckpt_bytes / allowed_pause_seconds`；`fio` 聚合写入 ≥ `required_ckpt_bw * 1.3`；多作业并发峰值不超过热层写入 baseline 的 70%。"
+      },
+      {
+        "title": "原子提交：让恢复逻辑不读半成品",
+        "body": "checkpoint 的原子性不来自文件系统事务，而来自 **manifest 作为提交点**：\n\n1. 写所有 shard 到临时文件名（`rank-00042.pt.tmp`）\n2. 记录每个 shard 的大小、校验和、rank\n3. shard 写完并 flush 后 rename 为正式文件名\n4. 写 `manifest.json.tmp`，包含所有 shard 列表和训练状态\n5. flush manifest\n6. 原子 rename 为 `manifest.json`\n7. 更新 `latest` 指针\n\n**恢复逻辑只做一件事**：读取已正式发布的 manifest，按 manifest 校验 shard。没有 manifest 的目录一律视为未完成；manifest 中缺 shard 或校验失败，一律视为不可恢复。\n\n**绝对不要**：把「目录存在」当 checkpoint 完成；让 rank 0 在其他 rank 未确认完成时提前更新 `latest`。",
+        "reveal": {
+          "q": "某作业每 30 分钟保存 2TB checkpoint，希望同步暂停不超过 120 秒。所需写带宽是多少？加上 1.3 倍余量后，目标热层对这个作业的可用写入能力至少是多少？",
+          "a": "required_ckpt_bw = 2TB / 120s ≈ 16.7 GB/s。加 1.3 倍余量后约 21.7 GB/s。如果平台有 6 个类似作业周期对齐，瞬时需求超过 100 GB/s，平均带宽看起来充足也会出现 checkpoint storm。"
+        }
+      },
+      {
+        "title": "小文件与 DataLoader 元数据风暴",
+        "body": "训练 IO 瓶颈常来自小文件元数据，而不是大文件带宽。DataLoader worker 每取一个样本都在做：`stat → open → read small range → close → decode → collate`\n\n**元数据风暴症状**：GPU 利用率锯齿；DataLoader queue 经常为空；CPU worker 在 `open/stat/readdir` 上等待；文件系统 MDS/MDT CPU 高；单节点正常，多节点一扩就慢。\n\n**治理方式**：\n\n| 问题 | 优先治理 |\n|------|--------|\n| 每样本多个小文件 | 打包成 shard（WebDataset tar、TFRecord、Arrow） |\n| 随机读太碎 | 建索引并顺序预取 |\n| 重复解码昂贵 | 缓存预处理结果（注意数据增强语义） |\n| 远端读取抖动 | 本地 NVMe warmup |\n| 多作业抢元数据 | 数据集目录隔离和配额 |\n\n**常见误区**：盲目增加 `num_workers`。当瓶颈是元数据服务时，增加 worker 只会放大压力。正确做法是同时看 DataLoader queue、worker CPU、文件系统 metadata ops、读吞吐和 GPU idle。"
+      },
+      {
+        "title": "IO 诊断链：从 GPU 空洞往回追",
+        "body": "遇到「GPU 利用率低」时，从三类症状入手：\n\n- **每 N step 周期性掉速** → 看 checkpoint time、manifest publish、FS 写 flush → 查 MDS create/rename、`iostat await` 是否与 checkpoint 同步尖刺\n- **每个 batch 都抖** → 看 DataLoader queue、worker CPU、小文件 stat/open ops → 查 dataset 格式和本地缓存\n- **启动/恢复慢** → 看 model/checkpoint load、cache hit、object restore 各阶段时间\n\n**诊断原则**：\n1. 把 step time、checkpoint start/end、data wait、GPU idle、文件系统指标放到同一时间轴\n2. 判断访问形状：大文件顺序读写 vs 小文件元数据；持续慢 vs 周期性尖刺\n3. 单节点→少量节点→全规模分别复现\n4. 区分客户端（某些节点慢）和服务端（所有节点慢）\n5. 验证热层与冷层边界：训练主路径是否直接依赖对象存储\n6. 定期做恢复演练：能写不代表能恢复",
+        "tip": "fio 达标不等于真实 checkpoint 没问题。fio 用大块顺序写；真实 checkpoint 可能有大量小 shard、rename、fsync。需要用真实 shard 大小、文件数、目录结构和并发 writer 重跑 BenchmarkProtocol。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪项是 checkpoint 原子提交协议中的关键步骤？",
+        "options": [
+          "rank 0 写完 shard 后立即更新 latest 指针",
+          "所有 shard 写入临时文件名，全部 flush 并 rename 后，再原子 rename manifest，最后更新 latest",
+          "使用文件系统的事务 API 提交所有 shard 为一个事务",
+          "只要 checkpoint 目录存在，恢复逻辑就认为该 checkpoint 可用"
+        ],
+        "answer": 1,
+        "explain": "正确的原子提交协议：shard 写入 .tmp → flush → rename 为正式名 → 写 manifest.tmp → flush → rename 为 manifest.json → 更新 latest。恢复逻辑只认已发布的 manifest，没有 manifest 或 manifest 缺 shard 的目录一律不可恢复。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练 checkpoint 只需要保存模型权重，因为权重包含了训练的全部状态。",
+        "answer": false,
+        "explain": "checkpoint 需要包含：模型权重、优化器状态（Adam 动量/方差，通常比权重更大）、LR scheduler 状态、每 rank 的 RNG 状态、DataLoader/sampler 状态（global step、epoch、shuffle seed）、并行策略元数据。只保存权重只能用于推理初始化，无法真正恢复训练。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某视觉训练集群从 32 卡扩到 256 卡后，GPU 利用率从 85% 降到 45%，文件系统总读带宽没有打满，但 MDS CPU 接近满载。最可能的根因是什么？",
+        "options": [
+          "DataLoader num_workers 不够多",
+          "256 卡的计算量超过了 GPU 的算力",
+          "数据集包含海量小文件，元数据风暴在多节点下被放大",
+          "训练热层的网络带宽不足"
+        ],
+        "answer": 2,
+        "explain": "症状组合（GPU 利用率低、带宽未满、MDS CPU 高、单节点正常多节点慢）典型地指向小文件元数据风暴。扩卡后 worker 数线性增加，stat/open 请求先把元数据服务打爆。根本治理方法是把小样本打包成大 shard。"
+      },
+      {
+        "type": "match",
+        "prompt": "将并行文件系统与其典型应用场景匹配：",
+        "left": [
+          "Lustre",
+          "GPFS（IBM Spectrum Scale）",
+          "BeeGFS",
+          "WekaFS"
+        ],
+        "right": [
+          "用通用 NVMe 服务器快速搭建高吞吐热层，调优直观",
+          "AI 热层与对象存储透明分层，商业 AI 平台常见",
+          "大规模训练热数据和 checkpoint 大文件，HPC 生态成熟",
+          "多租户企业 AI 平台，细粒度配额、快照、策略迁移能力强"
+        ],
+        "explain": "Lustre 在 HPC 集群大文件顺序吞吐上成熟；GPFS 企业级治理完整；BeeGFS 部署轻量快速；WekaFS 在 AI 场景的热层和对象分层打通上有优势。"
+      },
+      {
+        "type": "input",
+        "prompt": "Checkpoint IO CapacityLedger 要求：热层 fio 聚合写入基线至少达到 required_ckpt_bw 的多少倍？（填数字）",
+        "accept": ["1.3", "1.3倍", "1.3 倍"],
+        "explain": "threshold 是 1.3 倍：`fio 聚合写入 baseline >= required_ckpt_bw * 1.3`。这与数据驻留容量账本的 1.3 倍余量相同，用于覆盖实际 IO 形状与 fio 基准之间的差异。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对象存储异步归档完成后，热层可以立刻删除该 checkpoint，因为对象存储已经保存了副本。",
+        "answer": false,
+        "explain": "热层清理必须只删除「已归档且超出保留窗口」的 checkpoint，且清理只能在归档 manifest 发布后触发，不能早于归档完成。原因：归档可能上传失败或超时；对象存储恢复时间远慢于热层恢复；至少需要保留最近 2-3 个已发布 checkpoint 供快速恢复。"
+      },
+      {
+        "type": "choice",
+        "prompt": "6 个大训练作业的 checkpoint 周期对齐，平台每半小时出现全局 step time 尖刺。以下哪种治理方案最能解决根因？",
+        "options": [
+          "增大所有作业的 checkpoint 间隔到 2 小时",
+          "升级热层文件系统到更高配置",
+          "为不同作业的 checkpoint 间隔加随机偏移（jitter），同时 rank group 分批写、归档 worker 限速错峰",
+          "禁止多个作业同时运行"
+        ],
+        "answer": 2,
+        "explain": "根因是 checkpoint storm：多作业周期对齐导致瞬时写入峰值远超热层容量。根本解决方案是消除对齐：jitter 使不同作业错峰；rank group 分批写降低单作业瞬时峰值；归档 worker 限速避免归档和训练网络争用。增大间隔不解决对齐问题；升级文件系统治标不治本；禁止并发不切实际。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DataLoader queue 为空，同时文件系统总读带宽不高，worker CPU 较低，但 MDS/MDT CPU 很高。下一步应该优先做什么？",
+        "options": [
+          "增加 num_workers 以加快数据读取",
+          "增大 batch size 减少读取次数",
+          "把数据集小文件打包成大 shard，降低 stat/open 请求数量",
+          "把数据迁移到对象存储以获得更大带宽"
+        ],
+        "answer": 2,
+        "explain": "症状明确指向元数据风暴：带宽不高（不是带宽瓶颈）、MDS CPU 高（是元数据瓶颈）。根本治理是 shard 化，把千万小文件合并为少量大文件，每个 shard 对应一次 open，大幅降低 stat/open/readdir 请求数量。增加 workers 只会放大元数据压力；迁移到对象存储对小文件随机读同样不友好。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,564 @@
+[
+ {
+  "title": "微调技术",
+  "subtitle": "把预训练模型迁移到下游任务：全参数微调、冻结策略、分层学习率与实战技巧",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "现代 NLP 已经不再「为每个任务从头训练一个模型」，而是先在海量无标注文本上预训练一个通用模型，再针对具体任务做微调（fine-tuning）。\n\n预训练阶段很贵：用 TB 级语料、数亿到数千亿参数、自监督目标（MLM、语言建模、去噪等），跑一次就够。微调阶段很轻：加一个任务特定的头（分类层、CRF 等），在几百到几万条标注数据上调一调就行。\n\n这一关要讲清楚四件事：为什么微调有效、全参数微调怎么做和它的风险、怎么用冻结策略保护预训练知识、以及学习率该怎么设。",
+    "tip": "一句话概括范式：预训练学「通用语言知识」，微调学「把这种理解套到你的具体任务上」。"
+   },
+   {
+    "title": "为什么微调能奏效",
+    "body": "根本原因是**表示的可迁移性**。预训练模型各层学到的特征可以分层理解：\n\n- 底层（约 1~4 层）：词形、词素、基础句法。可迁移性极高，几乎对所有任务通用。\n- 中层（约 5~8 层）：短语结构、实体信息、局部语义。对大多数理解类任务有用。\n- 高层（约 9~12 层）：长距离依赖、任务相关语义、推理。更偏向预训练任务本身。\n\n换个角度看：预训练把参数推进了一个「良好盆地」——这片区域更平坦、泛化更好。微调只是在盆地内做局部优化，所以比从随机初始化出发的从头训练更容易收敛到好解：\n\n$$\\theta^* = \\arg\\min_{\\theta} \\mathcal{L}_{\\text{finetune}}(\\theta) \\quad \\text{以 } \\theta_{\\text{pretrained}} \\text{ 为起点}$$\n\n底层通用、高层任务特定这一分层性，正是后面冻结策略的理论基础。"
+   },
+   {
+    "title": "四种微调类型",
+    "body": "按对预训练参数的处理方式，微调分成四类：\n\n1. **特征提取**：参数全冻结，只把隐层输出当特征喂给一个轻量分类器（线性层 / SVM）。成本极低、不会灾难性遗忘，但上限低。\n2. **全参数微调**：所有参数都更新。最常见、效果通常最好。\n3. **部分微调**：只更新顶部若干层 + 任务头，底层冻结，是前两者的折中。\n4. **参数高效微调（PEFT）**：参数基本冻结，只加少量可训练参数（LoRA、Adapter、Prefix）。下一关专讲。\n\n经验规则：数据越少，应该「动」的参数越少、学习率越小、epoch 越少。",
+    "tip": "数据量参考：< 100 条用特征提取或少样本；1000~10000 条可全参数微调但要谨慎调参；> 10000 条全参数微调最稳。"
+   },
+   {
+    "title": "全参数微调与灾难性遗忘",
+    "body": "全参数微调把所有参数都纳入梯度更新，对分类任务用交叉熵：\n\n$$\\mathcal{L} = -\\sum_{i=1}^{N} \\sum_{c=1}^{C} y_{i,c} \\log \\hat{y}_{i,c}$$\n\n其中 $N$ 是样本数，$C$ 是类别数，$y_{i,c}$ 是真实标签的 one-hot，$\\hat{y}_{i,c}$ 是预测概率。\n\n它最大的风险是**灾难性遗忘（catastrophic forgetting）**：模型适应新任务时把预训练学到的通用知识「忘掉」了，表现为过拟合训练集、在略微不同分布上性能骤降、多任务能力丧失。\n\n根本原因是：学习率过大或训练步数过多时，梯度更新会把参数推出那个「良好盆地」。可以用微调前后权重的 $L_2$ 距离 $\\Delta\\theta = \\lVert \\theta_{\\text{fine-tuned}} - \\theta_{\\text{pretrained}} \\rVert_2$ 来量化偏移，效果好的模型通常 $\\Delta\\theta$ 较小。"
+   },
+   {
+    "title": "为什么微调学习率要这么小",
+    "body": "为什么微调学习率通常比预训练小 1~2 个数量级（如 $2\\times10^{-5}$ 对 $1\\times10^{-4}$）？因为预训练权重已经在「良好盆地」里了，我们希望在盆地内小步移动，而不是大跨步跳出去。大学习率既会引发灾难性遗忘、破坏通用表示，又会在小数据集上很快过拟合。\n\n为什么微调也需要**学习率预热（warmup）**？因为任务头是随机初始化的，初期它的梯度可能远大于预训练层的梯度。如果一上来就用全量学习率，这个大梯度会在任务头还没稳住之前就把预训练权重大幅破坏掉。预热期让任务头先「稳定下来」，再以正常学习率更新整个模型。\n\n为什么不对 bias 和 LayerNorm 施加权重衰减？因为它们参数量小、对正则化不敏感，强行衰减反而可能损害已经校准好的归一化尺度。",
+    "tip": "典型配置：lr 在 1~5e-5、warmup 占总步数 6%~10%、weight_decay 0.01、训练 3~5 个 epoch。"
+   },
+   {
+    "title": "冻结策略与分层学习率",
+    "body": "**冻结底层、微调顶层**：底层学的是通用语言特征，对几乎所有任务都有用、不该被破坏；顶层更抽象、更任务相关，需要调整。数据越少，冻结越多（< 1000 条可冻结约 75% 的层）。\n\n**渐进式解冻（gradual unfreezing）**：从任务头开始，逐步解冻更深的层。这样解冻深层时，梯度来自已经适应任务的顶层，而非随机初始化的头，能大幅降低遗忘风险。\n\n**分层学习率衰减（LLRD）**：越靠近输入端的层用越小的学习率。若顶层学习率为 $\\eta$、衰减因子为 $\\alpha$（常取 0.8~0.95），从顶部数起第 $l$ 层的学习率为：\n\n$$\\eta_l = \\eta \\cdot \\alpha^{l}$$\n\n直觉：底层已经学得很好、不需要大改，所以学得「慢」；顶层要适应新任务，学得「快」。"
+   },
+   {
+    "title": "PyTorch：分层学习率参数组",
+    "body": "把任务头、各 Transformer 层、Embedding 层分别放进不同学习率的参数组：\n\n```python\ndef get_layerwise_lr_groups(model, base_lr, decay_factor=0.9):\n    num_layers = model.config.num_hidden_layers\n    param_groups = []\n    param_groups.append({\n        'params': model.classifier.parameters(),\n        'lr': base_lr * 10\n    })\n    for layer_idx in range(num_layers - 1, -1, -1):\n        distance = (num_layers - 1) - layer_idx\n        layer_lr = base_lr * (decay_factor ** distance)\n        param_groups.append({\n            'params': model.bert.encoder.layer[layer_idx].parameters(),\n            'lr': layer_lr\n        })\n    embedding_lr = base_lr * (decay_factor ** num_layers)\n    param_groups.append({\n        'params': model.bert.embeddings.parameters(),\n        'lr': embedding_lr\n    })\n    return param_groups\n```\n\n任务头是随机初始化的，所以学习率给到 base_lr 的 10 倍；Embedding 在最底层，学习率最小。",
+    "tip": "把参数组传给 AdamW(param_groups) 即可。实战中还会对 bias / LayerNorm.weight 单独关掉 weight_decay。"
+   },
+   {
+    "title": "PyTorch：混合精度训练",
+    "body": "混合精度用 FP16 做前向和梯度计算、用 FP32 保存主权重，显存更省、速度更快。由于小学习率下梯度很小、容易下溢，需要用梯度缩放（loss scaling）：\n\n```python\nfrom torch.cuda.amp import autocast, GradScaler\nscaler = GradScaler()\nfor batch in dataloader:\n    optimizer.zero_grad()\n    with autocast():\n        outputs = model(**batch)\n        loss = outputs.loss\n    scaler.scale(loss).backward()\n    scaler.unscale_(optimizer)\n    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n    scaler.step(optimizer)\n    scaler.update()\n    scheduler.step()\n```\n\nFP16 vs BF16：BF16 指数位和 FP32 一样多，动态范围大、不需要 loss scaling，在 A100/H100 上更稳，优先用 BF16。",
+    "tip": "梯度裁剪要在 unscale 之后做，否则裁的是被放大过的梯度。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **微调沿用预训练大学习率**：会灾难性遗忘，必须小 1~2 个数量级。\n- **用 SGD 微调 BERT**：实践中应该用 AdamW，SGD 收敛慢且不稳。\n- **忘记梯度裁剪**：微调初期梯度可能很大，应 clip_grad_norm 到 1.0 左右。\n- **直接用最后一个 checkpoint**：应配合早停保存验证集最佳 checkpoint，再加载它推理。\n- **对 bias / LayerNorm 也做 weight_decay**：通常应排除这两类参数。\n- **数据极少还硬上全参数微调**：< 100 条时特征提取往往反而更好。",
+    "tip": "小结：微调=站在「良好盆地」里小步走。小学习率 + 预热 + 早停 + 冻结/分层是保护预训练知识的四件套。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "微调之所以有效，最根本的原因是什么？",
+    "options": [
+     "微调数据通常比预训练数据质量更高",
+     "预训练学到的表示具有可迁移性，且预训练把参数推进了泛化更好的「良好盆地」",
+     "微调会重新初始化所有参数，相当于重新训练",
+     "任务头的参数量比预训练模型大得多"
+    ],
+    "answer": 1,
+    "explain": "底层特征通用、可迁移，微调只是在「良好盆地」内做局部优化，所以比从头训练更容易收敛到好解。"
+   },
+   {
+    "type": "judge",
+    "prompt": "微调的学习率通常应该比预训练学习率小 1~2 个数量级。",
+    "answer": true,
+    "explain": "预训练权重已经在良好盆地里，需要小步移动；大学习率会引发灾难性遗忘并在小数据上过拟合。典型微调 lr 为 1~5e-5。"
+   },
+   {
+    "type": "choice",
+    "prompt": "「灾难性遗忘」指的是什么？",
+    "options": [
+     "模型在适应新任务时丢失了预训练学到的通用知识",
+     "训练过程中显存溢出导致进程崩溃",
+     "梯度变为 NaN 无法继续训练",
+     "验证集准确率始终为零"
+    ],
+    "answer": 0,
+    "explain": "学习率过大或训练过久会把参数推出良好盆地，破坏通用表示，表现为泛化变差、多任务能力丧失。"
+   },
+   {
+    "type": "choice",
+    "prompt": "分层学习率衰减（LLRD）的核心思想是？",
+    "options": [
+     "所有层用同一个学习率，随训练逐步衰减",
+     "越靠近输入端（底层）的层用越小的学习率，越靠近输出端（顶层）用越大的学习率",
+     "越靠近输入端的层用越大的学习率",
+     "只给任务头设学习率，其余层全部冻结"
+    ],
+    "answer": 1,
+    "explain": "底层学的是通用特征、不需要大改所以学得慢；顶层要适应新任务所以学得快。公式为 $\\eta_l = \\eta \\cdot \\alpha^{l}$。"
+   },
+   {
+    "type": "judge",
+    "prompt": "微调时任务头是随机初始化的，预热（warmup）能让它先稳定下来，避免初期大梯度破坏预训练权重。",
+    "answer": true,
+    "explain": "随机初始化的任务头初期梯度可能远大于预训练层，预热让它先稳住，再以正常学习率更新整个模型。"
+   },
+   {
+    "type": "input",
+    "prompt": "12 层 BERT-base，顶层（从顶部数第 0 层，distance=0）学习率 $\\eta = 2\\times10^{-5}$，衰减因子 $\\alpha = 0.9$。请问从顶部数起 distance=2 的那一层学习率约是多少？（写出表达式或数值，单位 e-5）",
+    "accept": [
+     "1.62e-5",
+     "1.62×10^-5",
+     "2e-5*0.9^2",
+     "2e-5 * 0.81",
+     "1.62",
+     "约1.62e-5"
+    ],
+    "explain": "$\\eta_l = 2\\times10^{-5} \\cdot 0.9^{2} = 2\\times10^{-5} \\cdot 0.81 = 1.62\\times10^{-5}$。"
+   },
+   {
+    "type": "input",
+    "prompt": "在分层学习率代码里，随机初始化的任务头（classifier）通常给到 base_lr 的多少倍？",
+    "accept": [
+     "10",
+     "10倍",
+     "10x",
+     "十倍",
+     "×10"
+    ],
+    "explain": "任务头是随机初始化的、需要更快适应任务，通常设为 base_lr 的 10 倍。"
+   },
+   {
+    "type": "judge",
+    "prompt": "当标注数据只有几十条（< 100）时，全参数微调通常比特征提取效果更好。",
+    "answer": false,
+    "explain": "数据极少时全参数微调极易过拟合，反而是特征提取（冻结全部预训练参数）往往更稳、效果更好。"
+   },
+   {
+    "type": "choice",
+    "prompt": "关于混合精度训练，下列哪项说法正确？",
+    "options": [
+     "FP16 的动态范围比 BF16 大，所以更不容易溢出",
+     "BF16 指数位与 FP32 相同、动态范围大，通常不需要 loss scaling，在 A100 上更稳",
+     "混合精度必须把主权重也存成 FP16",
+     "梯度裁剪应该在 unscale 之前进行"
+    ],
+    "answer": 1,
+    "explain": "BF16 指数位 8 位、与 FP32 一致，动态范围大、无需 loss scaling；FP16 范围小需要梯度缩放；梯度裁剪应在 unscale 之后。"
+   },
+   {
+    "type": "choice",
+    "prompt": "「渐进式解冻」相比一上来就全参数微调，主要好处是？",
+    "options": [
+     "训练速度一定更快",
+     "不需要任何标注数据",
+     "解冻深层时梯度来自已适应任务的顶层而非随机头，能降低灾难性遗忘风险",
+     "可以完全避免使用学习率调度"
+    ],
+    "answer": 2,
+    "explain": "从任务头开始逐步解冻，解冻新层时梯度信号来自已经稳定的顶层，遗忘风险更低。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种微调类型与它的典型特点配对：",
+    "left": [
+     "特征提取",
+     "全参数微调",
+     "部分微调",
+     "PEFT（如 LoRA）"
+    ],
+    "right": [
+     "参数全冻结、只训练轻量分类器，无灾难性遗忘但上限低",
+     "所有参数都更新、效果通常最高但成本高、有遗忘风险",
+     "只更新顶部若干层 + 任务头、底层冻结的折中方案",
+     "参数基本冻结、只加 0.1%~1% 可训练参数、接近全参数效果"
+    ],
+    "explain": "特征提取最省但上限低；全参数最强但贵；部分微调折中；PEFT 用极少参数逼近全参数效果。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每个微调技巧与它要解决的问题配对：",
+    "left": [
+     "小学习率（1~5e-5）",
+     "学习率预热",
+     "早停",
+     "冻结底层"
+    ],
+    "right": [
+     "防止梯度把参数推出良好盆地、避免灾难性遗忘",
+     "让随机初始化的任务头先稳定、避免初期大梯度破坏预训练权重",
+     "在验证集开始过拟合前停止训练",
+     "保护通用语言特征不被下游梯度破坏"
+    ],
+    "explain": "四个技巧分别守住盆地、稳住任务头、防过拟合、保护底层通用特征。"
+   }
+  ]
+ },
+ {
+  "title": "参数高效微调（PEFT）",
+  "subtitle": "在大模型时代只训练极少量参数：LoRA 的低秩分解、Adapter、Prefix-Tuning 与方法选择",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "模型规模一路从 BERT 的 1.1 亿参数涨到 GPT-3 的 1750 亿、PaLM 的 5400 亿。在这种规模下，全参数微调有三个致命问题：\n\n1. **存储爆炸**：175B 参数即使用 float16 也要约 350GB；每个下游任务都得存一份完整副本，100 个任务就是几十 TB。\n2. **灾难性遗忘**：在特定任务上更新全部参数会侵蚀预训练通用知识。\n3. **算力门槛高**：多数机构没有训练千亿参数模型的硬件。\n\nPEFT（参数高效微调）的核心思想：**冻结预训练模型的绝大部分参数，只训练少量新增或选定的参数**，让模型适应下游任务。",
+    "tip": "全参数微调存储 = $N \\times T$；PEFT 存储 = $N + \\Delta\\theta \\times T$，其中 $\\lvert\\Delta\\theta\\rvert / N$ 常常 < 1%。"
+   },
+   {
+    "title": "为什么只调一点点参数就够",
+    "body": "理论依据是**内在维度假说（intrinsic dimensionality）**：预训练语言模型的微调其实发生在一个低维子空间里。也就是说，虽然参数空间维度极高，但真正需要改变的方向只有很少几个。\n\n形式化地，设原始参数 $\\theta_0 \\in \\mathbb{R}^d$，存在低维投影矩阵 $P \\in \\mathbb{R}^{d \\times k}$（$k \\ll d$），微调后参数可近似为：\n\n$$\\theta = \\theta_0 + P \\cdot \\phi$$\n\n其中 $\\phi \\in \\mathbb{R}^k$ 是在低维空间里学的参数，$k$ 比 $d$ 小好几个数量级。这就给 PEFT 提供了底气：**不必改全部参数，只需在一个合适的低维子空间里学增量更新。**"
+   },
+   {
+    "title": "LoRA 的低秩分解",
+    "body": "LoRA（Low-Rank Adaptation，低秩适配）由微软 Hu 等人 2021 年提出，是目前最常用的 PEFT 方法。\n\n核心洞察：预训练权重 $W_0$ 本身是满秩的，但在某个任务上微调时，**权重的变化量 $\\Delta W$ 具有低秩特性**。直觉上：你已经掌握了一门语言（预训练），现在只需学一个领域的专业词汇（微调），这种增量所需的知识维度远小于整门语言。\n\n于是 LoRA 把 $\\Delta W$ 分解成两个低秩矩阵的乘积：\n\n$$\\Delta W = B \\cdot A, \\quad B \\in \\mathbb{R}^{d \\times r},\\; A \\in \\mathbb{R}^{r \\times k},\\; r \\ll \\min(d, k)$$\n\n前向传播变成 $h = W_0 x + \\Delta W x = W_0 x + B A x$。引入缩放因子 $\\alpha$ 后，完整公式为：\n\n$$h = W_0 x + \\frac{\\alpha}{r} \\cdot B A x$$",
+    "formula": "h = W_0 x + \\frac{\\alpha}{r} \\, B A x"
+   },
+   {
+    "title": "为什么 LoRA 这样设计",
+    "body": "**为什么参数能省这么多？** 原矩阵参数量是 $d \\times k$，LoRA 只需 $r(d+k)$。压缩比为 $\\frac{r(d+k)}{dk} = r(\\frac{1}{k}+\\frac{1}{d})$。以 GPT-3 注意力层（$d=k=12288$，$r=4$）为例，压缩比约 $0.065\\%$。\n\n**为什么 $B$ 初始化为零、$A$ 用高斯随机？** 这样训练开始时 $\\Delta W = BA = 0$，模型从预训练权重出发、不引入随机扰动。但不能两个都置零：若 $A=B=0$，则 $\\partial\\mathcal{L}/\\partial A = B^T(\\cdots) = 0$、$\\partial\\mathcal{L}/\\partial B = (\\cdots)A^T = 0$，两个梯度都为零，训练直接卡死（梯度死区）。所以必须至少一个非零初始化。\n\n**为什么要缩放因子 $\\alpha/r$？** 改变 $r$ 时，可以靠调 $\\alpha$ 把更新量的尺度稳住，不用每次重新调学习率。通常取 $\\alpha = r$ 或 $\\alpha = 2r$。\n\n**为什么推理时无额外开销？** 训练完可以把 LoRA 合并回原权重 $W_{\\text{merged}} = W_0 + \\frac{\\alpha}{r}BA$，合并后架构和原模型完全一样，推理速度不受影响。这是 LoRA 相对 Adapter 的关键优势。",
+    "tip": "秩 r 是最重要的超参：r=4~8 是常用默认值，复杂生成任务可到 16~32。一般从 r=8 起调。"
+   },
+   {
+    "title": "PyTorch：从零实现 LoRA 线性层",
+    "body": "```python\nclass LoRALinear(nn.Module):\n    def __init__(self, in_features, out_features, r=8, lora_alpha=16.0):\n        super().__init__()\n        self.r = r\n        self.scaling = lora_alpha / r\n        self.weight = nn.Parameter(\n            torch.empty(out_features, in_features), requires_grad=False)\n        self.lora_A = nn.Parameter(torch.empty(r, in_features))\n        self.lora_B = nn.Parameter(torch.zeros(out_features, r))\n        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))\n        nn.init.zeros_(self.lora_B)\n    def forward(self, x):\n        result = F.linear(x, self.weight)\n        lora_update = x @ self.lora_A.T @ self.lora_B.T\n        return result + lora_update * self.scaling\n```\n\n原始 weight 设 requires_grad=False（冻结），只有 lora_A、lora_B 可训练。lora_B 初始化为零保证起点 $\\Delta W = 0$。",
+    "tip": "合并权重：merged = weight + scaling * (lora_B @ lora_A)，得到一个普通 Linear，推理零开销。"
+   },
+   {
+    "title": "Adapter：串行瓶颈网络",
+    "body": "Adapter（Houlsby 等，2019）是最早的 PEFT 方法之一：在每个 Transformer 层中插入小型瓶颈网络，只训练这些模块。\n\n标准结构（瓶颈）：下投影 $d \\to m$、非线性激活（GeLU/ReLU）、上投影 $m \\to d$、残差连接，其中 $m \\ll d$：\n\n$$\\text{Adapter}(x) = x + f\\!\\left(W_{\\text{up}} \\cdot \\text{GeLU}(W_{\\text{down}} \\cdot x + b_{\\text{down}}) + b_{\\text{up}}\\right)$$\n\n单个 Adapter 参数量约 $2md$，相对单个 $d \\times d$ 权重矩阵的压缩比是 $\\frac{2m}{d}$。\n\n初始化时用小值，让 Adapter 起步接近恒等变换，避免一开始就扰动预训练模型。Houlsby 版在注意力后和 FFN 后各插一个；Pfeiffer 版只在 FFN 后插一个，参数减半、效果相近。",
+    "tip": "Adapter 有非线性、表达力更强，但串行结构在推理时有不可避免的额外延迟（不像 LoRA 能合并）。"
+   },
+   {
+    "title": "Prefix-Tuning：每层注入软提示",
+    "body": "Prefix-Tuning（Li & Liang，2021）思路完全不同：**不改模型权重，而是在每层注意力里加一串可学习的连续向量（前缀）**。\n\n它不只在输入层加，而是在每一层的注意力计算中操控 Key 和 Value：\n\n$$K_l' = [P_k^l; K_l], \\quad V_l' = [P_v^l; V_l]$$\n\n其中 $P_k^l, P_v^l$ 是第 $l$ 层独立学习的前缀键值。这样每个输出 token 都能「关注」到前缀，相当于给每层注意力注入了「软性指令」。\n\n为什么每层都加比只在输入层加更有效？因为输入层的前缀经过多层处理后影响会被稀释，而每层直接注入能在对应抽象层次直接调整注意力模式。\n\n**Prompt Tuning** 是它的简化版：只在输入层加软 token、不改中间层，参数极少（仅 $k \\times d_{\\text{model}}$）；随着模型规模增大，它的性能逐渐逼近全参数微调。",
+    "tip": "P-Tuning v2 把「每层加前缀」用到 NLU 任务上，去掉重参数化 MLP、配分类头，在小模型上能与全参数微调持平。"
+   },
+   {
+    "title": "PEFT 方法对比与选择",
+    "body": "以 BERT-base（110M）为例的可训练参数比例：Adapter 约 1.6%~3.3%、LoRA(r=8) 约 0.8%、Prefix-Tuning 约 0.1%、Prompt Tuning 约 0.007%。性能上（相对全参数微调）大多在 95%~99%，差距比预期小。\n\n选择思路：\n\n- **推理不接受任何开销** → LoRA（训练后合并权重）。\n- **要服务上百个任务** → LoRA 不合并 + 动态加载（只存一份主模型，按需换 LoRA 权重）。\n- **生成任务** → LoRA 或 Prefix-Tuning。\n- **NLU/分类任务** → P-Tuning v2 或 Pfeiffer Adapter。\n- **超大模型（>30B）** → QLoRA：把基础模型量化成 4-bit，计算时反量化为 bf16，65B 模型可在 48GB 显存上训练。",
+    "tip": "推理效率关键点：LoRA 合并后零开销是生产最优解；Adapter 串行有延迟；Prefix-Tuning 会增大 KV 缓存。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **LoRA 把 A 和 B 都初始化为零**：会导致两个梯度都为零、训练卡死，必须至少一个非零。\n- **改了 r 却不调 $\\alpha$**：更新量尺度会变，应靠 $\\alpha/r$ 保持稳定（常设 $\\alpha=r$ 或 $2r$）。\n- **以为 Adapter 推理零开销**：Adapter 是串行插入的，推理有额外延迟；只有 LoRA 能合并到零开销。\n- **把 LoRA 当成「时间复杂度优化」**：它优化的是可训练参数量和存储，不是把推理算得更快。\n- **NLU 任务硬上 Prefix-Tuning**：分类任务上 P-Tuning v2 / Adapter 通常更合适。",
+    "tip": "小结：PEFT 的理论根基是内在维度假说；LoRA 用 $\\Delta W = BA$ 逼近权重更新，参数省、可零开销，是通用首选。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "PEFT 方法背后的理论依据是什么？",
+    "options": [
+     "彩票假说：大网络里存在可独立训练的子网络",
+     "内在维度假说：微调其实发生在一个低维子空间里，真正需要改变的方向很少",
+     "中心极限定理：参数分布趋于高斯",
+     "万能逼近定理：单隐层网络能逼近任意函数"
+    ],
+    "answer": 1,
+    "explain": "内在维度假说指出微调可在低维子空间完成（$\\theta = \\theta_0 + P\\phi$），所以不必改全部参数。"
+   },
+   {
+    "type": "judge",
+    "prompt": "LoRA 假设权重的变化量 $\\Delta W$ 具有低秩结构，并把它分解为 $\\Delta W = BA$，其中 $r \\ll \\min(d,k)$。",
+    "answer": true,
+    "explain": "LoRA 的核心就是用两个低秩矩阵 $B \\in \\mathbb{R}^{d\\times r}$、$A \\in \\mathbb{R}^{r\\times k}$ 的乘积逼近 $\\Delta W$。"
+   },
+   {
+    "type": "choice",
+    "prompt": "LoRA 为什么把 $B$ 初始化为零、$A$ 用高斯随机初始化？",
+    "options": [
+     "为了让训练开始时 $\\Delta W = BA = 0$，模型从预训练权重出发、不引入随机扰动",
+     "为了减少一半的可训练参数",
+     "为了让推理速度更快",
+     "因为零矩阵相乘的数值更稳定"
+    ],
+    "answer": 0,
+    "explain": "$B=0$ 时 $\\Delta W=0$，起点等于预训练模型；$A$ 非零保证梯度能流动、不卡死。"
+   },
+   {
+    "type": "judge",
+    "prompt": "如果把 LoRA 的 $A$ 和 $B$ 都初始化为零，训练依然能正常进行。",
+    "answer": false,
+    "explain": "$A=B=0$ 时 $\\partial\\mathcal{L}/\\partial A = B^T(\\cdots)=0$ 且 $\\partial\\mathcal{L}/\\partial B=(\\cdots)A^T=0$，两个梯度都为零，训练卡死（梯度死区）。"
+   },
+   {
+    "type": "choice",
+    "prompt": "LoRA 相对 Adapter 在推理上的关键优势是什么？",
+    "options": [
+     "LoRA 训练时占用显存更少",
+     "LoRA 可以把 $\\frac{\\alpha}{r}BA$ 合并回原权重，合并后推理零额外开销",
+     "LoRA 不需要冻结预训练参数",
+     "LoRA 的表达能力一定强于 Adapter"
+    ],
+    "answer": 1,
+    "explain": "$W_{\\text{merged}} = W_0 + \\frac{\\alpha}{r}BA$，合并后架构与原模型相同、推理无开销；Adapter 串行插入有不可避免的延迟。"
+   },
+   {
+    "type": "input",
+    "prompt": "对一个 $d \\times k$ 的权重矩阵用 LoRA（秩 $r$），引入的可训练参数量是多少？（用 d、k、r 表示）",
+    "accept": [
+     "r(d+k)",
+     "r*(d+k)",
+     "rd+rk",
+     "r*d+r*k",
+     "dr+rk",
+     "(d+k)r"
+    ],
+    "explain": "$B \\in \\mathbb{R}^{d\\times r}$ 有 $dr$ 个、$A \\in \\mathbb{R}^{r\\times k}$ 有 $rk$ 个，合计 $r(d+k)$。"
+   },
+   {
+    "type": "input",
+    "prompt": "BERT-large 单个投影矩阵 $1024\\times1024$，用 LoRA(r=8)。该矩阵引入多少可训练参数？（写数值）",
+    "accept": [
+     "16384",
+     "16,384",
+     "2*8*1024",
+     "2×8×1024",
+     "16384个"
+    ],
+    "explain": "$r(d+k) = 8 \\times (1024+1024) = 8 \\times 2048 = 16384$。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Prefix-Tuning 在每一层的注意力里都注入可学习的前缀 Key/Value，通常比只在输入层加软 token（Prompt Tuning）更有效。",
+    "answer": true,
+    "explain": "输入层前缀经多层处理后影响被稀释，每层直接注入能在对应抽象层次直接调整注意力模式，故更有效（尤其小模型）。"
+   },
+   {
+    "type": "choice",
+    "prompt": "缩放因子 $\\alpha/r$ 在 LoRA 中的主要作用是？",
+    "options": [
+     "让 $B$ 和 $A$ 的梯度相等",
+     "改变秩 $r$ 时可通过调 $\\alpha$ 保持更新量尺度稳定，不必每次重调学习率",
+     "把 $\\Delta W$ 强制变成满秩",
+     "在推理时禁用 LoRA 分支"
+    ],
+    "answer": 1,
+    "explain": "$\\alpha/r$ 用来稳定更新量的尺度；通常取 $\\alpha=r$ 或 $2r$，即缩放因子为 1 或 2。"
+   },
+   {
+    "type": "choice",
+    "prompt": "需要在同一个基础模型上服务上百个不同任务、且只想存一份主模型，最合适的方案是？",
+    "options": [
+     "为每个任务做一次全参数微调并各存一份完整副本",
+     "LoRA 不合并 + 动态加载：主模型常驻，按需切换各任务的小 LoRA 权重",
+     "Prompt Tuning，并把每个任务的软 token 合并进基础模型权重",
+     "对每个任务训练一个独立的 Adapter 并永久合并进主模型"
+    ],
+    "answer": 1,
+    "explain": "LoRA 不合并时只需一份主模型，每任务只存几 MB 的 LoRA 权重，切换是毫秒级 IO，存储和工程都最优。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种 PEFT 方法与它的核心机制配对：",
+    "left": [
+     "LoRA",
+     "Adapter",
+     "Prefix-Tuning",
+     "BitFit"
+    ],
+    "right": [
+     "用低秩矩阵 $\\Delta W = BA$ 逼近权重更新，可合并到零开销",
+     "在层内串行插入下投影-激活-上投影的瓶颈网络",
+     "在每层注意力的 Key/Value 前拼接可学习前缀向量",
+     "只更新模型中的偏置参数（约 0.1%）"
+    ],
+    "explain": "LoRA 低秩分解、Adapter 串行瓶颈、Prefix 注入前缀 KV、BitFit 只调 bias，机制各不相同。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每个使用场景与推荐的 PEFT 方案配对：",
+    "left": [
+     "推理时不接受任何额外开销",
+     "生成任务（对话、翻译、摘要）",
+     "NLU/分类任务、模型较小",
+     "超大模型（>30B）、显存极度受限"
+    ],
+    "right": [
+     "LoRA 并在训练后合并权重",
+     "LoRA 或 Prefix-Tuning",
+     "P-Tuning v2 或 Pfeiffer Adapter",
+     "QLoRA（4-bit 量化 + LoRA）"
+    ],
+    "explain": "合并 LoRA 零开销；生成任务用 LoRA/Prefix；小模型 NLU 用 P-Tuning v2/Adapter；超大模型用 QLoRA。"
+   }
+  ]
+ },
+ {
+  "title": "下游任务实战",
+  "subtitle": "把 NLP 问题转化成模型能处理的格式：分类、序列标注、问答、生成与架构选型",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "预训练模型的真正价值，在于对下游任务的适应能力。这一关把最重要的四类下游任务串起来：文本分类、序列标注、问答系统、文本生成。\n\n理解下游任务的关键，是理解**任务形式（task formulation）**——怎么把一个 NLP 问题转化成模型能处理的输入输出格式。同样是「文本分类」，情感分析、主题分类、自然语言推理在技术层面都归到一类；而 NER、问答、摘要则各有各的头部设计。\n\n选对预训练架构同样关键：Encoder-only（BERT）擅长理解，Decoder-only（GPT）擅长生成，Encoder-Decoder（T5/BART）擅长「读一段、写一段」。",
+    "tip": "「把任务转化成模型能处理的格式」这件事，是 NLP 工程师最核心的技能之一。"
+   },
+   {
+    "title": "文本分类：[CLS] + 分类头",
+    "body": "给定句子 $x$，预测类别 $y \\in \\{1,\\dots,K\\}$。对 BERT 类模型，标准做法是取 `[CLS]` token 最后一层的隐状态 $h_{\\text{[CLS]}} \\in \\mathbb{R}^d$，接一个线性分类头：\n\n$$\\hat{y} = \\text{softmax}(W \\cdot h_{\\text{[CLS]}} + b)$$\n\n其中 $W \\in \\mathbb{R}^{K \\times d}$、$b \\in \\mathbb{R}^K$。训练用交叉熵 $\\mathcal{L} = -\\sum_i \\log P(\\hat{y}_i = y_i)$。\n\n**为什么用 `[CLS]`？** 因为 BERT 预训练里有 NSP（下一句预测）任务，正是用 `[CLS]` 的表示判断两句是否相邻，所以它在预训练中就被优化成「聚合整句语义」的位置，天然适合分类。\n\n句子对分类（NLI、语义相似度）输入格式为 `[CLS] 句子A [SEP] 句子B [SEP]`，靠 token type id 区分两句。",
+    "tip": "除了 [CLS]，对所有 token 输出做均值池化（mean pooling）在语义相似度等任务上常常更好。"
+   },
+   {
+    "title": "为什么多标签分类要换成 Sigmoid",
+    "body": "普通单标签分类用 Softmax，因为类别互斥、概率之和为 1。但一篇新闻可能同时属于「经济」和「政治」——这是**多标签分类**，类别之间不互斥。\n\n为什么这时要把 Softmax 换成 $K$ 个独立的 Sigmoid？因为 Softmax 会强迫所有类别的概率竞争、加起来等于 1，一个类别概率高必然压低别的；而多标签需要每个类别**独立**判断「是 / 否」。所以输出层改成：\n\n$$\\hat{y}_k = \\sigma(W_k \\cdot h_{\\text{[CLS]}} + b_k), \\quad k = 1,\\dots,K$$\n\n损失也相应换成二元交叉熵（每个类别独立算）：\n\n$$\\mathcal{L} = -\\sum_{k=1}^{K} \\left[ y_k \\log \\hat{y}_k + (1-y_k)\\log(1-\\hat{y}_k) \\right]$$\n\n预测时对每个类别独立设阈值（通常 0.5），超过就预测为正例。"
+   },
+   {
+    "title": "序列标注：BIO 与 token 级分类",
+    "body": "序列标注对输入里**每个 token** 都预测一个标签，NER 和词性标注是典型代表。最常用的标注格式是 **BIO 体系**：\n\n- **B**（Begin）：实体起始 token\n- **I**（Inside）：实体内部 token\n- **O**（Outside）：非实体 token\n\n比如「北京大学位于北京市」：北/B-ORG 京/I-ORG 大/I-ORG 学/I-ORG 位/O 于/O 北/B-LOC 京/I-LOC 市/I-LOC。更精细的 BIOES 还有 E（结束）、S（单 token 实体）。\n\n做法是对 BERT 每个位置的隐状态接分类头：$P(y_i \\mid x) = \\text{softmax}(W h_i + b)$。\n\n要注意 subword 对齐：tokenizer 可能把一个词切成多个 subword，通常只保留每个原始词第一个 subword 的标签，其余位置标 -100（计算损失时忽略）。",
+    "tip": "中文常按字拆分（is_split_into_words=True），用 word_ids() 把 subword 对齐回原字。"
+   },
+   {
+    "title": "为什么序列标注要加 CRF",
+    "body": "独立地对每个位置做分类，问题在于**位置之间不通气**：$P(y_i \\mid x)$ 只看当前位置的 $h_i$，完全不考虑上一个标签。于是可能产生非法序列，比如「I-PER」出现在「B-ORG」之后。\n\n**CRF（条件随机场）** 对整个标签序列建模联合概率：\n\n$$P(y_1,\\dots,y_L \\mid x) = \\frac{1}{Z(x)} \\exp\\!\\left(\\sum_{i} s(x,i,y_i) + \\sum_{i} T(y_i, y_{i+1})\\right)$$\n\n其中 $s$ 是 BERT 输出的发射分数，$T(y_i, y_{i+1})$ 是 CRF 学到的**转移分数**，$Z(x)$ 是归一化常数。CRF 能把非法转移（如 B-ORG → I-PER）的转移分数学成极大负值，Viterbi 解码时这些路径永远不会被选中。\n\n实践经验：数据充足时 BERT + 线性头已经很好；数据稀少、领域专业时，CRF 用显式转移约束注入先验，更有帮助。"
+   },
+   {
+    "title": "抽取式问答：预测 span 起止",
+    "body": "抽取式 QA：给定问题 $q$ 和段落 $p$，在段落中找答案的起始位置 $s$ 和结束位置 $e$。输入格式 `[CLS] 问题 [SEP] 段落 [SEP]`，对每个 token 输出隐状态，再用两个线性层分别预测起止：\n\n$$P_{\\text{start}}(i) = \\text{softmax}_i(W_s \\cdot h_i), \\quad P_{\\text{end}}(i) = \\text{softmax}_i(W_e \\cdot h_i)$$\n\n答案 span $[s,e]$ 取联合得分最高的组合：\n\n$$(s^*, e^*) = \\arg\\max_{s \\le e}\\left[ P_{\\text{start}}(s) \\cdot P_{\\text{end}}(e) \\right]$$\n\n训练损失是起止两个交叉熵之和 $\\mathcal{L} = \\mathcal{L}_{\\text{start}} + \\mathcal{L}_{\\text{end}}$。实践中限制 $e - s \\le \\text{max\\_answer\\_length}$ 避免过长答案。\n\nBERT 最大输入 512，段落超长时用**滑动窗口**：切成多个重叠窗口分别预测再合并。生成式 QA 则用 T5 直接生成答案，能综合推理但易产生幻觉，RAG（检索增强生成）把检索与生成结合来缓解。",
+    "tip": "暴力枚举所有 (s,e) 是 $O(L^2)$；限制最大答案长度可降到 $O(L \\cdot \\text{max\\_len})$。"
+   },
+   {
+    "title": "文本生成：解码策略",
+    "body": "条件生成（摘要、翻译）用 Encoder-Decoder（BART、T5）：编码器读整段源文，解码器自回归生成目标文本。训练用 Teacher Forcing，损失为 $\\mathcal{L} = -\\sum_t \\log P(y_t \\mid y_{<t}, x)$。\n\n推理时的解码策略决定输出质量：\n\n- **贪心解码**：每步取概率最高的 token。快，但易重复、陷入局部最优。\n- **束搜索（Beam Search）**：同时维护 $B$ 条候选序列，每步保留得分最高的 $B$ 条。适合摘要/翻译这类「要准、要稳」的任务；可加长度惩罚 $\\frac{1}{T^\\alpha}\\sum_t \\log P(\\cdots)$ 缓解偏好短序列。\n- **采样**：从分布随机采样、引入多样性。温度采样 $P_T(v) \\propto \\exp(\\log P(v)/T)$，$T<1$ 更尖锐保守、$T>1$ 更平滑多样；Top-k 只从前 k 个采样，Top-p（核采样）从累积概率超过 p 的最小集合采样。\n\n摘要/翻译这类任务倾向束搜索；创意写作倾向 Top-p 采样。",
+    "tip": "束搜索重复严重时，no_repeat_ngram_size=3、repetition_penalty>1 是最直接的两个缓解手段。"
+   },
+   {
+    "title": "为什么不同任务要选不同架构",
+    "body": "为什么分类、NER 用 BERT 这类 **Encoder-only** 而不是 GPT？因为它们是双向注意力，每个 token 能看到完整上下文，理解类任务要的就是这种「全局看清楚」。但它没有自回归生成能力，不适合生成任务。\n\n为什么对话、代码生成用 **Decoder-only**（GPT、LLaMA）？因为它是单向（因果）注意力 + 语言建模目标，天生擅长一个 token 一个 token 地往下写，还能做少样本学习、指令跟随、思维链推理。但纯理解类任务（分类、NER）效果通常不如 Encoder。\n\n为什么摘要、翻译用 **Encoder-Decoder**（T5、BART）？因为它的编码器双向读懂源文、解码器自回归写出目标文，正好对应「读一段、写一段」的条件生成。纯理解任务它的编码器又不如专用 Encoder。\n\n一句话：理解选 Encoder，生成选 Decoder，「读一段写一段」选 Encoder-Decoder。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **多标签分类用了 Softmax**：类别不互斥时必须用 $K$ 个独立 Sigmoid + 二元交叉熵。\n- **序列标注忘了对齐 subword**：每个原始词只取第一个 subword 的标签，其余标 -100 忽略损失。\n- **以为加了 CRF 一定更好**：数据充足时 BERT+线性头已足够，CRF 的收益主要在小数据、专业领域。\n- **抽取式 QA 不约束 $s \\le e$**：独立取起止最大值可能得到非法 span，应在 $s \\le e$ 且限长内联合搜索。\n- **用 Encoder-only 做生成任务**：BERT 没有自回归生成能力，生成应选 Decoder 或 Encoder-Decoder。\n- **摘要任务硬用高温采样**：摘要要忠实稳定，更适合束搜索；高温采样适合创意写作。",
+    "tip": "小结：下游任务=任务形式 + 头部设计 + 架构选型。分类接 [CLS]、NER 接 token 级头(可加 CRF)、QA 预测 span、生成靠解码策略。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "BERT 做文本分类时，为什么常用 `[CLS]` token 的输出？",
+    "options": [
+     "因为它是序列里第一个 token，位置编码为零",
+     "因为预训练的 NSP 任务正是用 `[CLS]` 表示判断两句是否相邻，它被优化成聚合整句语义",
+     "因为它是唯一不参与自注意力的特殊 token",
+     "因为它的隐状态维度比其他 token 大"
+    ],
+    "answer": 1,
+    "explain": "NSP 任务用 `[CLS]` 判断句子关系，使其在预训练中就被优化为聚合全局语义，适合分类。"
+   },
+   {
+    "type": "judge",
+    "prompt": "多标签分类（一段文本可同时属于多个类别）应使用 K 个独立的 Sigmoid 而非 Softmax。",
+    "answer": true,
+    "explain": "Softmax 强迫类别互斥、概率和为 1；多标签需要每个类别独立判断是/否，故用独立 Sigmoid + 二元交叉熵。"
+   },
+   {
+    "type": "choice",
+    "prompt": "在 BIO 标注体系中，「I」代表什么？",
+    "options": [
+     "实体的起始 token",
+     "实体的内部（非起始）token",
+     "非实体 token",
+     "单 token 构成的实体"
+    ],
+    "answer": 1,
+    "explain": "B=Begin 起始、I=Inside 内部、O=Outside 非实体；单 token 实体用 BIOES 里的 S 表示。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么 BERT + 线性头的序列标注可能产生「I-PER 出现在 B-ORG 之后」这种非法序列？",
+    "options": [
+     "因为线性头的参数初始化有误",
+     "因为每个位置独立分类、只看当前 $h_i$，完全不考虑上一个标签",
+     "因为 BERT 的注意力是单向的",
+     "因为 BIO 体系本身允许这种转移"
+    ],
+    "answer": 1,
+    "explain": "独立分类 $P(y_i\\mid x)=\\text{softmax}(Wh_i)$ 不建模标签间依赖，所以挡不住非法转移；CRF 用转移分数解决。"
+   },
+   {
+    "type": "judge",
+    "prompt": "CRF 通过学习转移分数矩阵 $T$，可以把非法转移的分数学成极大负值，从而在 Viterbi 解码时避免非法标签序列。",
+    "answer": true,
+    "explain": "CRF 对整个序列建模联合概率，非法转移分数极低、对应路径永不被选中，这就是它优于独立分类之处。"
+   },
+   {
+    "type": "input",
+    "prompt": "抽取式问答中，暴力枚举所有满足 $s \\le e$ 的起止组合，时间复杂度是多少？（大 O，L 为序列长度）",
+    "accept": [
+     "O(L^2)",
+     "O(L²)",
+     "O(L*L)",
+     "平方",
+     "O(n^2)"
+    ],
+    "explain": "起始和结束各 L 个位置、约 $L^2/2$ 个合法组合，复杂度 $O(L^2)$；限制最大答案长度可降到 $O(L\\cdot\\text{max\\_len})$。"
+   },
+   {
+    "type": "input",
+    "prompt": "抽取式问答的训练损失由哪两部分相加构成？（写出两者，如「起始位置交叉熵」类似表达即可）",
+    "accept": [
+     "起始位置交叉熵 + 结束位置交叉熵",
+     "start loss + end loss",
+     "起始损失和结束损失",
+     "L_start + L_end",
+     "起始交叉熵和结束交叉熵"
+    ],
+    "explain": "$\\mathcal{L} = \\mathcal{L}_{\\text{start}} + \\mathcal{L}_{\\text{end}}$，分别是起始位置和结束位置的交叉熵。"
+   },
+   {
+    "type": "judge",
+    "prompt": "对于科技新闻摘要这类要求忠实、稳定的生成任务，束搜索通常比高温采样更合适。",
+    "answer": true,
+    "explain": "摘要要准确、信息密度高，束搜索倾向高概率、语法正确的序列；高温采样的多样性更适合创意写作。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下列任务与架构的匹配中，哪一项最合适？",
+    "options": [
+     "文本摘要 → Encoder-only（BERT）",
+     "开放域对话 → Encoder-only（BERT）",
+     "机器翻译 → Encoder-Decoder（T5、BART）",
+     "命名实体识别 → Decoder-only（GPT）"
+    ],
+    "answer": 2,
+    "explain": "翻译是「读一段写一段」的条件生成，最适合 Encoder-Decoder；摘要同理。分类/NER 用 Encoder，对话用 Decoder。"
+   },
+   {
+    "type": "choice",
+    "prompt": "束搜索生成的摘要出现严重重复，下列哪个手段最直接有效？",
+    "options": [
+     "增大 num_beams",
+     "设置 no_repeat_ngram_size=3，禁止 3-gram 重复",
+     "把 length_penalty 设为 0",
+     "关闭 early_stopping"
+    ],
+    "answer": 1,
+    "explain": "no_repeat_ngram_size 禁止 n-gram 重复，是缓解复读最直接的手段；repetition_penalty>1 也有效。增大 beam 反而可能强化相似路径。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每类下游任务与它的头部/输出设计配对：",
+    "left": [
+     "单句文本分类",
+     "命名实体识别（NER）",
+     "抽取式问答",
+     "文本摘要"
+    ],
+    "right": [
+     "取 [CLS] 向量接线性分类头、Softmax 输出类别",
+     "对每个 token 接分类头做 token 级分类（可加 CRF）",
+     "用两个线性层预测答案 span 的起始与结束位置",
+     "Encoder-Decoder 自回归生成，配束搜索/采样解码"
+    ],
+    "explain": "分类用 [CLS] 头、NER 用 token 级头、QA 预测起止位置、摘要靠编解码生成，头部设计各不相同。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种预训练架构与它最擅长的任务类型配对：",
+    "left": [
+     "Encoder-only（BERT、RoBERTa）",
+     "Decoder-only（GPT、LLaMA）",
+     "Encoder-Decoder（T5、BART）",
+     "Bi-Encoder（DPR）"
+    ],
+    "right": [
+     "双向理解类任务：分类、NER、抽取式问答",
+     "自回归生成：开放域对话、代码生成、少样本学习",
+     "条件生成：摘要、翻译、生成式问答",
+     "把问题与文档分别编码成稠密向量做检索"
+    ],
+    "explain": "Encoder 擅理解、Decoder 擅生成、Encoder-Decoder 擅「读一段写一段」、Bi-Encoder 用于稠密检索。"
+   }
+  ]
+ }
+]

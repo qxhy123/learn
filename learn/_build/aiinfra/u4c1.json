@@ -1,0 +1,141 @@
+[
+  {
+    "id": "u4c1",
+    "title": "单机训练基线",
+    "subtitle": "从 DataLoader 到 checkpoint 的完整闭环",
+    "intro": [
+      {
+        "title": "为什么单机训练是一切的原点",
+        "body": "单机训练不是「规模小的训练」，而是训练系统的**最小闭环**。上分布式之前，如果单机的数据路径、显存账本、精度策略、profiler 链条、checkpoint 协议没有建立，DDP/FSDP/TP 只会把问题复制到更多 rank 上。\n\n单机的价值在于**变量少**：没有跨节点网络，没有 collective 退化，也没有大规模 rank failure，因此因果链清晰可查。"
+      },
+      {
+        "title": "Training Step 的四条路径",
+        "body": "一个完整 training step 可按责任拆成四条路径：\n\n- **控制路径**：launcher、配置、precision policy、checkpoint interval、resume 逻辑\n- **数据路径**：`Storage → page cache → DataLoader worker → CPU 预处理 → pinned memory → H2D → GPU HBM`\n- **状态路径**：model params、gradients、optimizer states、scheduler、RNG、dataset cursor、`optimizer_step` / `microstep_idx`\n- **故障路径**：OOM、NaN、DataLoader hang、I/O stall、checkpoint stall\n\n很多「GPU 低利用率」实际是数据路径问题；很多「NaN」实际是 precision policy 问题。四条路径必须分开诊断。"
+      },
+      {
+        "title": "microstep_idx 与 optimizer_step 的区别",
+        "body": "这是最常被混淆的两个计数器：\n\n- `microstep_idx`：每执行一次 forward/backward 就递增，对应 DataLoader 进度和 gradient accumulation substep\n- `optimizer_step`：**只在** accumulation boundary、梯度检查通过、optimizer update **完成后**才递增\n\nFP16 `GradScaler` 检测到 overflow 时会跳过 `optimizer.step()`。此时 `microstep_idx` 可以增加，`optimizer_step` **不能增加**，否则 tokens/s 看起来正常但实际 update 数少了。\n\nCheckpoint 默认只在 `optimizer_step` 边界保存，这样不需要存储半累计梯度。",
+        "tip": "resume 时必须同时恢复 optimizer_step 和 microstep_idx，否则 LR schedule 和 dataset cursor 都会错位。"
+      },
+      {
+        "title": "显存账本：五项必填",
+        "body": "单机 OOM 只靠猜是最大反模式。完整显存预算公式：\n\n`M_peak = params + grads + optimizer_states + activations + temp + fragmentation`\n\n以 7B 模型 BF16 + AdamW FP32 m/v 为例（每张 80 GB H100）：\n\n| 项目 | 大小 |\n|---|---|\n| BF16 params | ~12.5 GiB |\n| BF16 grads | ~12.5 GiB |\n| FP32 Adam m/v | ~49.9 GiB |\n| 合计（含 activation 前）| ~74.9 GiB |\n\n已超 80 GB 额度，还没算 activation。这就是为什么 7B 必须用 `FSDP FULL_SHARD` 或 `ZeRO-3` 而不是朴素 DDP。\n\n生产准入规则：`M_peak_P95 ≤ 0.85 × HBM`，留 15% 给 allocator、shape 抖动和临时 kernel workspace。",
+        "tip": "Activation 是最容易被低估的一项，它随 microbatch × sequence_length × hidden_size × layers 增长。OOM 若与 batch/seq 线性相关，优先怀疑 activation。"
+      },
+      {
+        "title": "MFU、HFU、tokens/s 的关系",
+        "body": "这三个指标回答不同问题，不能互相替代：\n\n- **tokens/s**（`non_pad_tokens/s`）：有效训练数据吞吐，需区分 `raw_sequence_slots/s`、`compute_tokens/s`、`non_pad_tokens/s`、`loss_tokens/s`\n- **MFU**（Model FLOPs Utilization）= 有效模型 FLOPs/s ÷ 硬件峰值 FLOPs/s，衡量**有效训练进展**\n- **HFU**（Hardware FLOPs Utilization）= 实际执行 FLOPs/s ÷ 峰值，包含 padding 浪费和 activation checkpointing 重算\n\nDecoder-only Transformer 的 FLOPs/token 近似 `6 × N_params`。\n\nLLaMA-7B（6.7B 参数）on 8×H100 BF16 示例：若 `non_pad_tokens/s = 95,000`，则\n`MFU = 95,000 × 40.2B / (8 × 989 TFLOPS) ≈ 48.3%`\n\n**GPU utilization 98% 但 MFU 25%** 是非常常见的现象，说明硬件忙但没做有效模型计算。",
+        "tip": "Activation checkpointing 会增加重算 FLOPs，可能让 HFU 升高但 MFU 和 tokens/s 持平甚至下降。"
+      },
+      {
+        "title": "精度策略：BF16 / FP16 / FP8",
+        "body": "精度不是一个布尔开关，必须拆成四层记录：\n\n1. **Compute autocast**：matmul/linear 进入 BF16 Tensor Core；norm/softmax/reduction 可能保留 FP32\n2. **Parameters**：FSDP `param_dtype=bf16` 只说明 shard/通信工作集 dtype\n3. **Gradients**：gradient bucket 或 reduce dtype，clip/norm 统计可能需要 FP32 语义\n4. **Optimizer state**：AdamW `exp_avg`/`exp_avg_sq` 通常保持 FP32\n\n**BF16** 是大模型训练的稳健默认：exponent 范围接近 FP32，无需 loss scaling，训练稳定性优于 FP16。\n\n**FP16** 需要 `GradScaler`：scale 持续下降、`found_inf` 频繁出现是溢出信号；overflow 时跳过 optimizer step，但 `microstep_idx` 已递增。\n\n**FP8** 需要 H100 硬件 + Transformer Engine + amax/scale lifecycle，`amax history`、`scale`、`scale_inv` 都是训练状态，resume 时必须恢复，否则前几步会用错误 scale。"
+      },
+      {
+        "title": "DataLoader 数据路径的四个关键事实",
+        "body": "DataLoader 是一个**带预取的多进程 producer-consumer 系统**，解决 CPU 预处理异步化和批次预取，但无法解决远端存储慢、单样本 decode 太重和 padding 效率低。\n\n四个常被忽视的事实：\n\n- `num_workers` 增加并行 CPU 预处理能力，**不会提高磁盘 I/O 吞吐**\n- `pin_memory=True` 必须与 `non_blocking=True` 和 dedicated copy stream 配套才能真正 overlap H2D\n- `loss.item()`、`tensor.cpu()` 会触发 GPU→CPU 同步，散落在训练循环里会把异步执行变串行\n- NUMA 错配会让 CPU worker 在一个 socket 上备数据，却通过另一个 socket 连接的 PCIe 送 GPU，拉低吞吐",
+        "tip": "DataLoader visible wait 应低于 step time 的 5%。若超标，先用 torch.profiler 确认来自 read/preprocess/collate 哪段，再单变量调整。"
+      },
+      {
+        "title": "Profiler 工具链：逐层收窄",
+        "body": "诊断从症状到根因，推荐工具链顺序：\n\n1. `torch.profiler` → 定位 PyTorch 阶段（DataLoader wait、forward、backward、optimizer、checkpoint）\n2. `Nsight Systems` → 确认 CUDA stream 时间线和 H2D overlap\n3. `Nsight Compute` → 对坏 kernel 做 SM occupancy、Tensor Core、memory stall 分析\n4. `DCGM` → 验证 GPU health、SM active/tensor active、PCIe/NVLink、功耗\n5. `iostat` / `perf` / `pidstat` → 检查 host 侧数据路径\n\n**不要一开始就用 Nsight Compute 抓全量训练**。先用 torch.profiler 找到阶段，再针对具体 kernel 分析。",
+        "tip": "profile window 必须避开 warmup 和首步——首步含 CUDA context 初始化、kernel autotune、allocator 初始扩张等一次性开销，放入统计会误导 admission。"
+      },
+      {
+        "title": "单机 Baseline 准入 Checklist",
+        "body": "单机 baseline 不是「先跑一下」，而是**可审计的证据包**，必须包含：\n\n- HBM peak P95 < `0.85 × capacity`\n- DataLoader visible wait < 5%（稳态 step）\n- `raw_sequence_slots/s`、`compute_tokens/s`、`non_pad_tokens/s`、`loss_tokens/s` 四项齐全\n- MFU ≥ 45%，并注明 FLOPs 口径和 token 分母\n- checkpoint 可以 strict resume：loss、LR、`optimizer_step`、`microstep_idx`、dataset cursor 连续\n- step time P99 无未解释尖峰\n\n没有这份证据包，进入多节点扩展等于带着未知 bug 扩容。",
+        "reveal": {
+          "q": "为什么 LLaMA-7B 用朴素 DDP + AdamW 在 8×80 GB H100 上通常无法满足准入要求？",
+          "a": "DDP 每卡复制完整 params（12.5 GiB BF16）+ grads（12.5 GiB）+ Adam m/v（49.9 GiB FP32）= 74.9 GiB，还未算 activation。生产 usable HBM = 80 × 0.85 = 68 GiB，已超限。必须用 FSDP FULL_SHARD 或 ZeRO-3 做状态分片。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "LLaMA-7B（6.7B 参数）用 BF16 params + BF16 grads + FP32 AdamW m/v 训练，每卡的「参数+梯度+optimizer state」合计约多少 GiB？",
+        "options": ["约 26 GiB", "约 50 GiB", "约 75 GiB", "约 13 GiB"],
+        "answer": 2,
+        "explain": "BF16 params ≈ 12.5 GiB，BF16 grads ≈ 12.5 GiB，FP32 Adam m/v（每参数 8 bytes）≈ 49.9 GiB，合计约 74.9 GiB，超过 80 GB H100 的 0.85 准入线（68 GiB）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPU utilization 达到 98% 就说明 MFU 也很高，可以作为训练效率良好的充分证据。",
+        "answer": false,
+        "explain": "GPU utilization 只反映 GPU 是否忙，不说明忙的是有效模型 FLOPs 还是 kernel launch gap、padding 浪费、unfused optimizer 等无效计算。MFU = 有效模型 FLOPs / 峰值，需要单独计算。"
+      },
+      {
+        "type": "choice",
+        "prompt": "FP16 训练中 GradScaler 检测到 overflow，此时应如何处理 microstep_idx 和 optimizer_step？",
+        "options": [
+          "两个计数器都不递增",
+          "microstep_idx 可递增，optimizer_step 不递增",
+          "两个计数器都递增",
+          "optimizer_step 递增，microstep_idx 不递增"
+        ],
+        "answer": 1,
+        "explain": "microstep 已经消费了数据并执行了 forward/backward，所以 microstep_idx 可以递增；但 optimizer 实际 update 被跳过，optimizer_step 不应递增，否则 LR schedule 和 tokens/s 统计都会错误。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧工具与其主要回答的问题匹配",
+        "left": ["torch.profiler", "Nsight Systems", "Nsight Compute", "iostat"],
+        "right": [
+          "PyTorch 各 op 的 CPU/CUDA 时间和 memory 分配",
+          "CUDA stream 时间线、H2D DMA、kernel launch gap",
+          "单个 kernel 的 SM occupancy 和 Tensor Core 使用率",
+          "本地磁盘 I/O 队列深度和 await 延迟"
+        ],
+        "explain": "四个工具分层诊断：torch.profiler 对应 PyTorch 层，Nsight Systems 对应 CUDA stream/timeline 层，Nsight Compute 对应 kernel 内部性能计数器，iostat 对应 host 侧磁盘 I/O。"
+      },
+      {
+        "type": "input",
+        "prompt": "activation checkpointing 开启后，HFU 升高但 MFU 和 tokens/s 基本不变，原因是什么？（填核心原因，不超过 15 字）",
+        "accept": ["重算增加了硬件执行 FLOPs", "重算使硬件 FLOPs 增加", "backward 重算 forward 消耗更多 FLOPs", "增加了重算导致实际 FLOPs 增大"],
+        "explain": "activation checkpointing 用算力换显存：backward 时重算被 checkpoint 的 forward 激活，实际执行的硬件 FLOPs 增加（HFU 升），但有效训练进展（每 token 的模型 update）不变（MFU 不变）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪项不属于完整 checkpoint 状态协议必须保存的内容？",
+        "options": [
+          "model state_dict",
+          "optimizer state（Adam m/v）",
+          "GPU 驱动版本号",
+          "RNG state 和 dataset sampler cursor"
+        ],
+        "answer": 2,
+        "explain": "GPU 驱动版本是环境信息，不需要写入 checkpoint。checkpoint 必须保存 model、optimizer state（momentum）、scheduler、RNG（CPU+CUDA）、sampler cursor、optimizer_step 和 microstep_idx，才能保证 resume 后状态连续。"
+      },
+      {
+        "type": "judge",
+        "prompt": "增加 DataLoader 的 num_workers 可以解决远端对象存储读取速度慢导致的 DataLoader visible wait 问题。",
+        "answer": false,
+        "explain": "num_workers 增加的是并行 CPU preprocessing 和预取能力，不能提高远端存储的 I/O 吞吐。远端存储慢需要在存储侧解决（本地缓存、shard 预拉取、更换存储系统），盲目加 worker 只会加重 CPU 和内存压力。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对 LLaMA-7B 估算训练 FLOPs/token，`6N_p` 近似包含哪些部分？",
+        "options": [
+          "仅 forward pass 矩阵计算",
+          "forward 和 backward 的主要矩阵计算",
+          "forward、backward 加上 optimizer update 和 activation checkpointing 重算",
+          "所有 attention 二次项和 optimizer 更新"
+        ],
+        "answer": 1,
+        "explain": "`6N_p` 是 decoder-only Transformer 的常用近似，包含 forward 和 backward 的主要矩阵（GEMM）计算。不包含 attention 二次项（长序列需修正）、重算、optimizer update 和 padding 浪费等。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 token 口径与其正确定义匹配",
+        "left": ["raw_sequence_slots", "non_pad_tokens", "loss_tokens", "compute_tokens"],
+        "right": [
+          "固定 shape 中的 token 槽位数，等于 B × S × N_gpu",
+          "排除 padding 的真实 token 数，等于 attention_mask.sum()",
+          "进入 cross entropy 的 shifted labels 数，labels != -100",
+          "实际执行主要模型 FLOPs 的 token 数，无 unpadding 时等于 raw slots"
+        ],
+        "explain": "四种口径层层收窄：raw slots 是硬件执行的 dense shape，non_pad 排除 attention mask 的 pad，loss tokens 是真正有监督信号的位置，compute tokens 取决于是否做了 unpadding/compaction。"
+      }
+    ]
+  }
+]

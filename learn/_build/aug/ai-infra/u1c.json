@@ -1,0 +1,681 @@
+{
+  "u1-l15": [
+    {
+      "type": "choice",
+      "prompt": "以下哪个命令能实时观察某块 NVMe 设备的 IO 队列深度（`avgqu-sz`）和平均服务时间？",
+      "options": [
+        "`iostat -x 1`",
+        "`pidstat -d 1`",
+        "`df -ih`",
+        "`lsof +L1`"
+      ],
+      "answer": 0,
+      "explain": "`iostat -x 1` 输出每台设备的扩展统计，含 `avgqu-sz`（平均队列深度）、`await`（平均等待时间）和 `util`（利用率），是设备级 IO 瓶颈的首选工具。"
+    },
+    {
+      "type": "judge",
+      "prompt": "并行文件系统（如 Lustre）整体带宽很高，说明小文件 `stat` 操作也很快，不会成为训练 DataLoader 的瓶颈。",
+      "answer": false,
+      "explain": "并行文件系统将元数据路径（MDS）与数据路径（OSS/OST）分离。MDS 负责 lookup/stat/create 等元数据操作，面对海量小文件时 MDS CPU 可能先被打满，与 OST 带宽无关。高带宽 ≠ 元数据快。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练集群写 checkpoint 时，发现前 5GB 写速 5 GB/s，后续 45GB 只有 800 MB/s。最可能的原因是什么？",
+      "options": [
+        "NVMe SLC cache 被填满后退回 TLC/QLC 直写速度",
+        "Page Cache 写满后触发大量脏页回写",
+        "ext4 journal 切换到 `data=writeback` 模式",
+        "Block Layer 调度器从 `none` 切换到 `mq-deadline`"
+      ],
+      "answer": 0,
+      "explain": "消费级和部分企业级 NVMe 设备将空闲 NAND 虚拟为 SLC 区提供高速缓冲，SLC 区写满后直写 TLC/QLC 并进行 GC，吞吐断崖下跌。用 `fio --runtime=300` 或写满设备一半以上容量可暴露这一「SLC cache 悬崖」。"
+    },
+    {
+      "type": "input",
+      "prompt": "查看系统当前 Page Cache 占用量和脏页字节数，应读取哪个文件？（只写文件路径）",
+      "accept": ["/proc/meminfo"],
+      "explain": "`/proc/meminfo` 中的 `Cached`、`Dirty`、`Writeback` 字段分别反映 Page Cache 大小、未回写脏页和正在回写的字节数，是判断写是否被 Cache 吸收的直接依据。"
+    },
+    {
+      "type": "match",
+      "prompt": "将存储 workload 形状与其首要风险匹配：",
+      "left": [
+        "小图片散文件目录（百万级 JPEG）",
+        "checkpoint 大文件顺序写",
+        "safetensors 权重加载（mmap 方式）",
+        "WebDataset tar shard 顺序读"
+      ],
+      "right": [
+        "inode/dentry 耗尽、MDS 打满",
+        "半成品暴露、fsync 尾延迟",
+        "Page Cache 误判、NUMA 跨节点 fault",
+        "预读大小、worker 分片均匀度"
+      ],
+      "explain": "不同 IO 形状对存储栈的压力点完全不同：小文件打满元数据路径；大文件顺序写的风险在发布原子性；mmap 权重依赖 Page Cache 局部性和 NUMA 亲和；tar shard 顺序读的核心是带宽与预读。"
+    },
+    {
+      "type": "judge",
+      "prompt": "S3 自 2020 年底实现强一致性后，在对象数极多时用 LIST prefix 作为训练 job 的 dataset 发现方式已经可靠且高效。",
+      "answer": false,
+      "explain": "S3 的 strong list 解决了一致性问题，但 LIST 在对象数极多时依然昂贵（高延迟、高费用、控制面压力），且分页过程中有写入/删除时需要处理重复与遗漏。正确做法是生产时生成 manifest，训练时只读 manifest。"
+    },
+    {
+      "type": "choice",
+      "prompt": "用 `fio --direct=1 --runtime=300 --rw=write` 测出的吞吐比 `--direct=0` 低很多，说明了什么？",
+      "options": [
+        "`--direct=0` 的结果只反映 Page Cache 的写入速度，设备真实持续写能力由 `--direct=1` 反映",
+        "`--direct=1` 绕过了 RAID 缓存，比 `--direct=0` 多一次 checksum 计算",
+        "`--direct=0` 利用了预读，读放大使测量值偏高",
+        "两次测试的差异来自 blk-mq 调度器在直接 IO 下关闭了合并"
+      ],
+      "answer": 0,
+      "explain": "`fio --direct=0` 写入先进 Page Cache，只要内存未写满就能看到极高吞吐，无法反映设备真实持续写能力。`--direct=1` 绕过 Page Cache 直接落设备，才是设备真实写速的衡量标准。"
+    },
+    {
+      "type": "input",
+      "prompt": "观察进程（PID=12345）实时读写的字节速率，应使用哪个命令？（只写命令名）",
+      "accept": ["pidstat"],
+      "explain": "`pidstat -d -p 12345 1` 每秒显示该进程的 `kB_rd/s` 和 `kB_wr/s`，是进程级 IO 字节速率的标准观测工具，比 `iostat` 精确到单个进程。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练第一个 epoch 慢、第二个 epoch 快很多，最可能的原因是什么？",
+      "options": [
+        "Page Cache / 客户端 cache 命中，不代表 dataset 格式本身更优",
+        "第二个 epoch 触发了 XFS 延迟分配的物理块落盘，减少碎片",
+        "NVMe SLC cache 在第二 epoch 开始时重新填充完毕",
+        "内核预读（readahead）在第二 epoch 才开始生效"
+      ],
+      "answer": 0,
+      "explain": "第二个 epoch 加速的最常见原因是文件内容已被 Page Cache（或并行文件系统客户端缓存）缓存，不是数据集格式优化的功劳。若 benchmark 不做 cold-cache 测试，结论会严重偏乐观。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 `df -h` 显示磁盘空间充足、但创建新文件失败并报 「No space left on device」时，用 `df -ih` 检查 inode 使用率是合理的下一步。",
+      "answer": true,
+      "explain": "`df -ih` 显示的是 inode 使用比例而非块使用比例。当小文件极多时，块空间可能充足但 inode 已 100% 用尽，导致无法创建任何新文件，errno 仍为 `ENOSPC`。这是小文件集群的典型陷阱。"
+    }
+  ],
+  "u1-l16": [
+    {
+      "type": "choice",
+      "prompt": "进程调用 `open(\"/data/img.jpg\", O_RDONLY)` 时，内核需要逐级解析路径分量。以下哪个说法准确描述了 dentry cache miss 的后果？",
+      "options": [
+        "未命中时需要读取目录块（本地 FS）或发出远端 lookup RPC（NFS/FUSE），延迟大幅增加",
+        "未命中时内核直接返回 ENOENT，由用户态重试",
+        "未命中时退回到 VFS superblock 全量扫描",
+        "未命中时只影响 inode 缓存，不影响 open 延迟"
+      ],
+      "answer": 0,
+      "explain": "dentry cache 存储路径分量到 inode 的解析结果。cache miss 时，本地文件系统需读目录块获取子项，网络文件系统（NFS/FUSE）需发 lookup RPC，延迟可从纳秒级跳到毫秒级。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Linux VFS 中，`superblock` 对象代表一个挂载实例的全局状态，每个文件系统在 mount 时向 VFS 注册自己的 `superblock`，其中包含操作函数指针表。",
+      "answer": true,
+      "explain": "VFS 通过操作表（`super_operations`、`inode_operations`、`file_operations`）实现「虚函数 dispatch」。`superblock` 在 mount 时填入，指向具体文件系统（ext4、NFS、FUSE 等）的真实实现，同一套系统调用即可透明分发。"
+    },
+    {
+      "type": "input",
+      "prompt": "查看 dentry slab 的当前占用，应查看哪个文件？（只写文件路径，不含空格）",
+      "accept": ["/proc/slabinfo"],
+      "explain": "`/proc/slabinfo` 列出内核各 slab 对象的数量和内存占用。查找 `dentry` 行可得当前 dentry cache 条目数和内存使用，`slabtop` 是其交互式前端，也可接受。"
+    },
+    {
+      "type": "choice",
+      "prompt": "对 ext4 文件使用 `O_DIRECT` 但 buffer 地址未按设备扇区对齐，write() 会有什么结果？",
+      "options": [
+        "直接返回 `EINVAL`，不会自动退化为 buffered IO",
+        "自动退化为 buffered IO，数据仍正确写入",
+        "写入成功但内核会在后台重做对齐，有额外延迟",
+        "写入成功但数据落到对齐后的相邻扇区，内容可能错乱"
+      ],
+      "answer": 0,
+      "explain": "ext4 和 XFS 在 Linux 上对不对齐的 `O_DIRECT` 请求直接返回 `EINVAL`，不会自动退化为 buffered IO。这是一个高频误传，导致程序在对齐不满足时意外报错而非静默降级。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 VFS 对象的生命周期事件与其含义匹配：",
+      "left": [
+        "`inode` 的 `nlink` 降为 0 且 `i_count` 也为 0",
+        "dentry 转为 negative 状态",
+        "`file` 对象被分配",
+        "`superblock` 的 `s_op->put_super` 被调用"
+      ],
+      "right": [
+        "文件数据块被真正释放回文件系统",
+        "路径解析结果确认该路径不存在，可缓存以加速后续 ENOENT",
+        "进程成功打开一个 fd，内核开始追踪该 fd 的 offset 和状态",
+        "文件系统被 umount，释放全局状态"
+      ],
+      "explain": "VFS 四类对象有各自的析构时机：inode 在无路径引用（nlink=0）且无 fd 引用（i_count=0）时才释放块；negative dentry 缓存的是「不存在」结果；file 随 open 创建、close 销毁；superblock 随 umount 释放。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DataLoader 使用 8 个 worker 读取 1200 万张散文件，`iostat` 显示 `r/s` 极高但 `rkB/s` 不高。下一步最有价值的诊断命令是什么？",
+      "options": [
+        "`strace -c -p <worker_pid>` 统计各系统调用的次数和耗时",
+        "`iperf3 -c localhost` 测试本机环回带宽",
+        "`sync && echo 3 > /proc/sys/vm/drop_caches` 后重测",
+        "`blktrace -d /dev/nvme0n1` 捕获块层事件"
+      ],
+      "answer": 0,
+      "explain": "「高 r/s、低 rkB/s」说明 IO 很碎（每次 IO 字节数少），问题在 IO 形状而非设备本身。`strace -c` 可以统计是 `openat`/`stat` 次数远超 `read`，还是 `read` 本身阻塞，精确定位是元数据瓶颈还是数据瓶颈。"
+    },
+    {
+      "type": "judge",
+      "prompt": "RCU walk 路径解析在任何情况下都比 Ref walk 快，应始终优先使用。",
+      "answer": false,
+      "explain": "RCU walk 只在所有路径分量均命中 dentry cache 且无需 revalidate 的情况下有效。一旦遇到 dentry miss、需要 revalidate（NFS）、symlink 或权限变更，内核会降级到 Ref walk（需加锁、改引用计数）。这不是可以「选择」的选项，由内核自动判断。"
+    },
+    {
+      "type": "input",
+      "prompt": "NVMe 设备在 blk-mq 下推荐使用哪种 IO 调度器（scheduler）？（只写调度器名称）",
+      "accept": ["none", "none（mq-deadline 也可接受）"],
+      "explain": "NVMe 设备本身有内部队列和并行能力，操作系统调度器带来的合并和排序对 NVMe 意义不大，额外的软件合并会引入延迟。推荐使用 `none`（直接派发），跳过 IO 调度器。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一次 buffered read() 的 Page Cache 命中路径中，数据传输的最后一步是什么？",
+      "options": [
+        "从 Page Cache 的内存页 copy 到用户态 buffer（copy_to_user）",
+        "从 Page Cache 发 DMA 到用户 buffer，零拷贝",
+        "从 inode 的 block mapping 读取磁盘扇区到用户 buffer",
+        "将 bio 提交到 blk-mq 然后等待完成中断"
+      ],
+      "answer": 0,
+      "explain": "buffered IO 命中 Page Cache 时，内核直接将缓存页内容通过 `copy_to_user` 复制到用户缓冲区，不需要任何设备 IO。零拷贝（sendfile/mmap）是另一条路径，普通 `read()` 仍有一次内核到用户的内存拷贝。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`unlink()` 系统调用执行后，只要进程仍持有该文件的 fd，该文件就会继续占用磁盘空间，直到所有 fd 被关闭。",
+      "answer": true,
+      "explain": "Linux 用引用计数管理 inode 生命周期：`unlink` 仅减少 `nlink`（路径引用），而 `i_count`（打开引用）不为零时数据块不会释放。`df` 报告的空间不会立即恢复，`lsof +L1` 可列出这类「已删除但仍被持有」的文件。"
+    }
+  ],
+  "u1-l17": [
+    {
+      "type": "choice",
+      "prompt": "ext4 `data=ordered` 模式在 crash 后能保证什么？以下描述最准确的是？",
+      "options": [
+        "已出现在目录里的新文件不会指向未初始化的旧磁盘块",
+        "文件内容与 inode 元数据同时原子提交，不会看到半写状态",
+        "所有 write() 完成后数据已写入 NVMe 稳定存储",
+        "rename() 之后目录项一定持久化，无需额外 fsync"
+      ],
+      "answer": 0,
+      "explain": "`data=ordered` 保证：用户数据先于元数据落盘，crash 后不会有 inode 指向随机旧数据。但它不保证数据本身持久化（仍需 fsync），也不保证 rename 的目录项持久化（仍需 fsync parent dir）。"
+    },
+    {
+      "type": "judge",
+      "prompt": "ZFS 使用 Copy-on-Write 写策略，意味着正在覆盖写的文件在 crash 时可能同时失去新旧版本。",
+      "answer": false,
+      "explain": "CoW 的核心性质：写新块后更新指针树，旧块在指针被安全替换前不会释放。crash 只会使指针树停留在旧状态（旧版本完整），或停留在新状态（新版本完整），不会出现新旧都损坏的情况。这也是 ZFS 不需要 journal replay 的根本原因。"
+    },
+    {
+      "type": "choice",
+      "prompt": "XFS 相比 ext4 在多核并发大文件写入时有更高吞吐，根本原因是什么？",
+      "options": [
+        "XFS 将磁盘分为多个 Allocation Group（AG），各 AG 独立加锁，多核可以同时操作不同 AG",
+        "XFS 默认开启 Direct IO，绕过 Page Cache 减少拷贝",
+        "XFS 的 journal（xlog）粒度比 ext4 jbd2 更小，事务提交更快",
+        "XFS 使用 CoW 写策略，避免了 jbd2 的双写开销"
+      ],
+      "answer": 0,
+      "explain": "XFS 按 Allocation Group 分区，每个 AG 有独立的 B+tree 和锁，多核分配和写入可以在不同 AG 并行进行，大幅减少锁争用。ext4 的全局 group descriptor 锁在高并发时是瓶颈。"
+    },
+    {
+      "type": "input",
+      "prompt": "ZFS 自管内存缓存系统叫什么名字？（写出缩写）",
+      "accept": ["ARC"],
+      "explain": "ZFS 使用 ARC（Adaptive Replacement Cache）管理内存缓存，分 MRU 和 MFU 两个列表，对大顺序扫描的缓存污染有抵抗力。ARC 不显示在 `free -h` 的 available 里，必须显式设置 `zfs_arc_max`。"
+    },
+    {
+      "type": "match",
+      "prompt": "将文件系统机制与其对 checkpoint 写入协议的影响匹配：",
+      "left": [
+        "ext4 `data=ordered` journal",
+        "XFS 延迟分配（delayed allocation）",
+        "ZFS CoW + 指针树",
+        "所有三种文件系统"
+      ],
+      "right": [
+        "crash 后文件内容不指向旧块，但仍需 fsync 才能保证数据持久化",
+        "`write()` 返回时物理块可能未分配，crash 后文件可能为全零",
+        "每次写生成新块，快照强，但 sync 写延迟受 ZIL/SLOG 影响",
+        "都不能替代应用层的 fsync + rename 原子发布协议"
+      ],
+      "explain": "三种文件系统各有自己的 crash recovery 保证，但都不能在应用层跳过 fsync+rename 协议。ext4 ordered 不指向旧块但不保证持久；XFS 延迟分配可能导致 crash 后文件为零；ZFS CoW 保证指针树一致但 sync 写依赖 ZIL。"
+    },
+    {
+      "type": "judge",
+      "prompt": "ZFS 的 ARC 缓存会显示在 Linux `free -h` 命令的 `available` 列中，因此可以直接用 `free` 监控 ZFS 内存使用。",
+      "answer": false,
+      "explain": "ZFS ARC 是 ZFS 自管内存，不走 Linux Page Cache，因此不体现在 `free -h` 的 `available`、`buff/cache` 列里。监控 ZFS ARC 需用 `arc_summary`、`arcstat` 或读取 `/proc/spl/kstat/zfs/arcstats`，否则会误以为内存空闲而实际上 ARC 已吃满。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 ext4 上，以下哪个操作最可能触发 inode 耗尽（即使磁盘块空间仍充足）？",
+      "options": [
+        "在同一目录下写入 500 万个平均 1KB 的小文件",
+        "写入一个 500GB 的大文件",
+        "对同一文件重复覆盖写入，不创建新文件",
+        "使用 `O_DIRECT` 写入大块数据"
+      ],
+      "answer": 0,
+      "explain": "ext4 在 mkfs 时通过 `-i` 参数（每 N 字节预留一个 inode，默认 16384B）预先分配固定数量的 inode。创建大量小文件会消耗 inode，而数据块消耗极少，导致 inode 先于磁盘块耗尽。"
+    },
+    {
+      "type": "input",
+      "prompt": "XFS 延迟分配（delayed allocation）在用户角度的核心表现是：`write()` 返回成功时文件的 `st_size` 已更新，但物理块可能尚未分配。若此时发生 crash，文件内容是什么？",
+      "accept": ["全零", "zero", "zeros", "0"],
+      "explain": "XFS 延迟分配先在内存登记 delalloc reservation，物理块到 writeback 时才分配。crash 发生在 writeback 前，文件系统恢复后会为这段空间分配新的（零初始化的）块，文件长度不变但内容全为零。"
+    },
+    {
+      "type": "choice",
+      "prompt": "对「静默数据损坏」最敏感的 AI 场景（如模型权重或训练数据的位翻转），以下哪种文件系统提供最强的端到端检测能力？",
+      "options": [
+        "ZFS（对每个数据块和元数据块存储 checksum，读时校验）",
+        "ext4（jbd2 journal 覆盖所有数据路径）",
+        "XFS（xlog 提供完整的数据 redo 日志）",
+        "任何挂载了 `errors=remount-ro` 选项的文件系统"
+      ],
+      "answer": 0,
+      "explain": "ZFS 是唯一在 Merkle tree 结构中对每个数据块和元数据块存储 checksum 的主流本地文件系统。任何位翻转（磁盘、内存、控制器路径）在读取时都会被检测并报告，必要时从镜像副本自动恢复。ext4/XFS 的 journal 仅保护元数据一致性，对数据静默损坏无感知。"
+    },
+    {
+      "type": "judge",
+      "prompt": "关闭 ext4 的 `barrier`（写屏障）选项可以显著提升 fsync 的吞吐数字，在生产训练环境中是一个合理的性能优化。",
+      "answer": false,
+      "explain": "写屏障（barrier）保证 journal commit 块在磁盘上的顺序，关闭它相当于用 crash 恢复能力换取漂亮的 benchmark 数字。电源掉电后 journal replay 可能看到错误的顺序，导致文件系统损坏或数据丢失。生产环境绝对不能关闭 barrier。"
+    }
+  ],
+  "u1-l18": [
+    {
+      "type": "choice",
+      "prompt": "`write()` 系统调用可能发生「短写」（返回值小于请求长度）。以下哪种情况可能触发短写？",
+      "options": [
+        "写入过程中收到信号（signal）中断",
+        "Page Cache 容量不足，内核拒绝接受更多脏页",
+        "设备写满后内核自动分片重试",
+        "文件以 `O_DIRECT` 模式打开且对齐不满足"
+      ],
+      "answer": 0,
+      "explain": "短写的常见触发：信号中断、quota 限制、`ENOSPC`、网络文件系统链路异常。可靠写入必须在循环中检查返回值直到全部写完。`O_DIRECT` 对齐不满足直接返回 `EINVAL` 而非短写；设备满返回 `ENOSPC` 而非短写。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`fdatasync()` 与 `fsync()` 的唯一区别是：`fdatasync()` 不同步 mtime（最后修改时间），其余元数据（包括文件大小）同步行为完全相同。",
+      "answer": false,
+      "explain": "`fdatasync()` 同步文件内容和「恢复所需的必要元数据」（如文件大小变化）。不同步的是非必要元数据，如 `mtime`、`atime`、`ctime`。只要文件大小发生变化，`fdatasync()` 同样会同步 size，因为 crash 后 size 不一致会导致内容不可恢复。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在标准 checkpoint 发布协议中，完整的 7 步里第 6 步是对父目录调用 `fsync()`。以下哪个步骤的遗漏最容易被开发者忽视且后果最严重？",
+      "options": [
+        "对父目录的 `fsync()`（步骤 6）",
+        "对临时文件的 `write()` 循环（步骤 2）",
+        "`rename(tmp, final)`（步骤 5）",
+        "`close(tmp_fd)` 时检查返回值（步骤 4）"
+      ],
+      "answer": 0,
+      "explain": "大多数开发者记得 `fsync(tmp_fd)` 和 `rename()`，却忽略对父目录 `fsync()`。`rename()` 修改父目录的目录项，如果不对父目录 `fsync()`，crash 后目录项更新可能丢失，reader 找不到新文件名，导致恢复失败。"
+    },
+    {
+      "type": "input",
+      "prompt": "`O_SYNC` 标志让每次 `write()` 都等待数据和恢复元数据落盘。与之类似但只保证数据持久（不保证所有元数据）的标志是什么？（写出标志名）",
+      "accept": ["O_DSYNC"],
+      "explain": "`O_DSYNC` 语义等同于每次 write 之后自动调用 `fdatasync()`：保证文件数据和必要元数据（文件大小）持久，但不保证 mtime 等非必要元数据。适合需要逐条落盘但不想承担完整 `O_SYNC` 开销的场景。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 crash 发生时机与 reader 读取到的状态匹配（假设 reader 只相信 manifest）：",
+      "left": [
+        "crash 在 fsync(tmp_fd) 之前",
+        "crash 在 rename(tmp, final) 之前、fsync(tmp_fd) 之后",
+        "crash 在 fsync(parent_dir) 之前、rename 之后",
+        "crash 在 manifest 更新完成之后"
+      ],
+      "right": [
+        "tmp 文件内容可能不完整，manifest 不会引用它，reader 安全",
+        "tmp 文件内容完整但 rename 未发生，final 不存在，reader 读旧版本",
+        "rename 可能丢失（目录项未持久化），reader 可能找不到 final，读旧版本",
+        "新版本完整且可见，reader 安全读取新版本"
+      ],
+      "explain": "7 步协议的 crash matrix 展示了每个步骤的容忍性。manifest 是「发布入口」，reader 只信任 manifest 指向的文件，因此各失败点都能安全降级到「读旧版本」而不是「读损坏数据」。"
+    },
+    {
+      "type": "judge",
+      "prompt": "NVMe 设备上的 FUA（Force Unit Access）标志可以让单条写命令绕过 volatile write cache 直接落 NAND，其效果与先 write 再单独发 FLUSH 命令等价。",
+      "answer": true,
+      "explain": "FUA 让单条写命令直接写 NAND（或触发 NAND 写后确认），不进 volatile cache，效果与「write + FLUSH」等价，但可以节省一次额外的 FLUSH round-trip。Linux fsync 路径默认通过 FLUSH（或 FUA，视 FS 实现）保证持久化。"
+    },
+    {
+      "type": "choice",
+      "prompt": "有 PLP（Power Loss Protection 电容）的数据中心 NVMe 与消费级 NVMe 相比，`fsync()` 延迟差异的根本原因是什么？",
+      "options": [
+        "消费级设备 FLUSH 命令需要等待 volatile write cache 把数据写入 NAND，PLP 设备掉电时由电容保证 cache 内容，因此 FLUSH 延迟更低",
+        "PLP 设备的 NAND 写入速度更快，直接减少 fsync 时间",
+        "PLP 设备默认关闭 write cache，所有 write 直接落盘不用 FLUSH",
+        "消费级设备不支持 FUA 命令，只能用 FLUSH，速度更慢"
+      ],
+      "answer": 0,
+      "explain": "消费级 NVMe 的 FLUSH 命令必须把所有 volatile write cache 的内容推到 NAND 才能返回，耗时几百微秒到毫秒。PLP 设备用电容在掉电时保护 cache 内容，操作系统发 FLUSH 时设备只需确认（无需真正推到 NAND），fsync 延迟大幅下降。"
+    },
+    {
+      "type": "input",
+      "prompt": "io_uring 的 SQE 可以通过设置某个标志，强制要求本 SQE 必须等前一个 SQE 完成后才能开始执行（形成链式依赖）。该标志的名称是什么？",
+      "accept": ["IOSQE_IO_LINK", "IO_LINK"],
+      "explain": "`IOSQE_IO_LINK` 标志将当前 SQE 与前一个 SQE 链接：前者完成（无论成功失败）后当前 SQE 才能提交。常用于 write + fsync 的顺序保证，避免异步提交时 fsync 先于 write 执行。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种做法能最有效地验证 checkpoint 协议在掉电场景下的正确性？",
+      "options": [
+        "在虚拟机或容器中用 libvirtd/QEMU 的「故意掉电」测试，配合 crash 后文件系统检查和 checkpoint 加载验证",
+        "只测试 `kill -9` 进程，观察进程退出后 checkpoint 是否完整",
+        "用 `sync` 命令手动触发全局同步后立刻重启测试节点",
+        "在代码里加 assert 检查每次 fsync 的返回值"
+      ],
+      "answer": 0,
+      "explain": "`kill -9` 只测试「进程突然死亡」场景，文件系统和设备仍正常运行，Page Cache 会在之后由内核回写。真正的 crash 演练需要硬掉电（QEMU 模拟、PDU 断电等），才能暴露 volatile write cache、journal 顺序、FUA/FLUSH 配置的问题。"
+    },
+    {
+      "type": "judge",
+      "prompt": "`close(fd)` 总是成功返回 0，可以忽略其返回值。",
+      "answer": false,
+      "explain": "`close()` 可以暴露之前 writeback 的延迟错误。如果写入过程中发生 IO 错误，内核可能延迟到 `close()` 时才通过返回非 0 的 errno（如 `EIO`）通知应用。忽略 `close()` 返回值可能导致应用误以为 checkpoint 写入成功，实际数据已损坏。"
+    }
+  ],
+  "u1-l19": [
+    {
+      "type": "choice",
+      "prompt": "S3 Multipart Upload 的 `complete` 操作未被调用，已上传的 part 会如何处理？",
+      "options": [
+        "永久保留并持续计费，必须配置 lifecycle rule 才能自动清理",
+        "24 小时后自动删除，不产生存储费用",
+        "会在下次 `initiate` 时被自动关联到新的 upload",
+        "只在 upload 超过 7 天后才计费"
+      ],
+      "answer": 0,
+      "explain": "未完成的 multipart upload 的 part 永久保留在 S3 并按正常存储计费，不会自动清理。必须配置 S3 lifecycle rule（如 `AbortIncompleteMultipartUpload` 在 N 天后触发）才能回收这些孤儿 part，否则长期积累会产生意外账单。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 Lustre 中，多个训练 rank 同时写同一个大文件可以充分利用多个 OST 并行带宽，不会引起尾延迟抖动。",
+      "answer": false,
+      "explain": "多 rank 写同一文件时，LDLM（Lustre Distributed Lock Manager）锁竞争是核心问题：一个 client 持有 PW 锁时，另一个 client 请求 EX 锁会触发 BL_AST，强制前者先 flush dirty pages 再释放锁，形成序列化的尾延迟。推荐每个 rank 写自己独立的文件。"
+    },
+    {
+      "type": "choice",
+      "prompt": "用 Range GET 访问对象存储上的 tar shard 时，worker 根据 index 定位某样本的 byte range，最主要的好处是什么？",
+      "options": [
+        "只拉取该样本所在的字节段，不需要下载整个 shard，节省带宽和延迟",
+        "Range GET 绕过 S3 的 LIST quota，可以无限并发",
+        "Range GET 请求命中 S3 的内部 SSD 缓存层，延迟比完整 GET 低 10×",
+        "Range GET 自动触发 S3 的强一致性路径，结果更可靠"
+      ],
+      "answer": 0,
+      "explain": "Range GET 是对象存储支持的 HTTP 范围请求（`Range: bytes=offset-end`）。结合 sample-level index（记录每个样本在 shard 中的 offset 和 length），worker 只拉取该样本的字节段，大幅减少数据传输量，尤其对大 shard（GB 级）中随机访问的小样本效果显著。"
+    },
+    {
+      "type": "input",
+      "prompt": "Lustre 中记录文件数据分布到多少个 OST 上的参数称为什么？（只写参数名称）",
+      "accept": ["stripe count", "stripe_count", "stripecount"],
+      "explain": "`stripe count` 决定文件数据分布到几个 OSS/OST。count 越高，大文件并行带宽越大，但小文件会增加 RPC 和锁开销。可用 `lfs getstripe <file>` 查看，`lfs setstripe -c N` 设置。"
+    },
+    {
+      "type": "match",
+      "prompt": "将对象存储操作与其与 POSIX 文件系统的主要差异匹配：",
+      "left": [
+        "PUT object（单次完整上传）",
+        "LIST prefix",
+        "对象存储上的「rename」",
+        "Multipart upload complete"
+      ],
+      "right": [
+        "上传过程中对象不可见，原子可见性在 PUT 完成时",
+        "本质是按前缀扫描索引，成本高且历史上弱一致，与目录遍历不同",
+        "通常是 copy + delete 两步，非原子，中间有窗口",
+        "只有调用 complete 后最终对象才对外可见"
+      ],
+      "explain": "对象存储没有目录 inode、hard link 和原子 rename。每种操作都与 POSIX 语义有显著差异，混淆这些差异是对象存储使用中最常见的错误根源。"
+    },
+    {
+      "type": "choice",
+      "prompt": "Lustre PFL（Progressive File Layout）的主要用途是什么？",
+      "options": [
+        "让同一文件在不同 offset 区间使用不同 stripe 策略，小文件不浪费 OST，大文件自动展开并行",
+        "允许同一文件同时挂在多个 MDT 上，提高元数据吞吐",
+        "自动在 OST 之间 rebalance 数据，消除热点",
+        "为每个文件版本创建 CoW 快照，支持时间点恢复"
+      ],
+      "answer": 0,
+      "explain": "PFL 允许按文件大小动态调整 stripe 策略：例如 0~1MB 用 count=1，1MB~1GB 用 count=4，1GB+ 用 count=16。这样小文件不会因高 stripe count 产生过多 RPC，大文件又能自动展开到多个 OST 获得高带宽。"
+    },
+    {
+      "type": "judge",
+      "prompt": "将 2000 万张小图片通过 FUSE 挂载 S3 暴露为本地目录，然后让 PyTorch DataLoader 像读本地文件一样训练，是一种生产可用的方案。",
+      "answer": false,
+      "explain": "FUSE 挂载 S3（如 s3fs/goofys）每次 `open()` 触发一次 HEAD 请求（约 30ms），每个 syscall 都经历内核↔用户态 FUSE daemon 的上下文切换（2~5× 延迟惩罚），高频 GET 还会触发 S3 限流。实测 GPU 利用率 < 30%，batch wait 是本地 NVMe 的 10× 以上。正确方案是用 Range GET + 本地 NVMe cache。"
+    },
+    {
+      "type": "input",
+      "prompt": "对象存储 dataset 的推荐架构中，记录「样本 ID → shard 文件名 + 字节偏移 + 字节长度」映射关系的文件称为什么？（只写英文名称）",
+      "accept": ["index", "index file", "sample index"],
+      "explain": "index 文件（或 sample-level index）是 Dataset IO 架构的核心：生产时为每个样本记录其在 shard 中的位置，训练时 worker 根据 index 用 Range GET 只拉取所需字节段，实现高并发随机访问而不下载整个 shard。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 PyTorch DataLoader 中使用多 worker（`num_workers > 0`）通过 boto3 访问 S3，必须如何处理 S3 client？",
+      "options": [
+        "每个 worker 进程 fork 后必须重新创建 S3 client，不能共享父进程的 client",
+        "可以在主进程中创建 client 后通过 pickle 传给所有 worker",
+        "必须用 `multiprocessing.Manager().dict()` 共享同一个 client",
+        "只需在主进程创建一次，boto3 的连接池支持多进程安全访问"
+      ],
+      "answer": 0,
+      "explain": "boto3 的 S3 client 内部持有 TCP 连接、线程锁等资源，fork 后父子进程共享这些资源会导致连接状态错乱、死锁或认证失败。正确做法：在 DataLoader worker 的 `worker_init_fn` 中（或 Dataset 的 `__getitem__` 惰性初始化）为每个 worker 独立创建 client。"
+    },
+    {
+      "type": "judge",
+      "prompt": "并行文件系统（如 Lustre）的 MDS CPU 使用率高说明数据带宽也接近瓶颈，需要同时扩充 MDT 和 OST。",
+      "answer": false,
+      "explain": "MDS 和 OSS/OST 是独立的组件，职责完全不同。MDS CPU 高只说明元数据操作（stat、lookup、create、rename）频繁，而 OST 带宽可能很低（数据 IO 不多）。两者可以独立扩展：MDS 压力大加 MDT/MDS 节点，OST 带宽不足加 OST。"
+    }
+  ],
+  "u1-l20": [
+    {
+      "type": "choice",
+      "prompt": "AI Infra 网络问题被分为控制面和数据面两类。以下哪个场景属于控制面问题，与训练 AllReduce 数据面无关？",
+      "options": [
+        "训练 job rendezvous 超时，10 个 rank 中有 1 个无法加入通信组",
+        "AllReduce 平均带宽低于理论值的 50%",
+        "RoCE 训练出现 QP 超时和重传",
+        "节点间 iperf3 跑出 80 Gbit/s 而非 100 Gbit/s"
+      ],
+      "answer": 0,
+      "explain": "rendezvous 是训练 job 启动时的控制面协调过程（通常走 TCP 或 etcd），与 AllReduce 的 RDMA 数据面无关。控制面问题（防火墙、服务发现、超时配置）会让 job 无法启动，往往被误诊为「网络带宽问题」。"
+    },
+    {
+      "type": "judge",
+      "prompt": "只要主机侧的 `retrans`、`softirq`、`queue drop` 指标正常，就可以排除网络问题，不需要查看交换机的计数器。",
+      "answer": false,
+      "explain": "主机侧指标只描述本机到 NIC 出口的情况。共享链路上的交换机 discard、PFC pause、ECN mark、buffer occupancy 无法从主机侧观测到，必须同时看 fabric 侧指标。尤其 RoCE 训练的抖动，很多时候根因是交换机的 PFC/ECN 配置或端口拥塞。"
+    },
+    {
+      "type": "choice",
+      "prompt": "推理网关 P99 延迟抖动、CPU 总体使用率不高，以下哪个方向最应该优先排查？",
+      "options": [
+        "RSS 分配不均导致某 CPU 核软中断（softirq）过载",
+        "跨节点 TCP 拥塞窗口（cwnd）过小",
+        "NVMe 设备 IO 队列深度过高",
+        "NCCL AllReduce 路径上的 QP 错误"
+      ],
+      "answer": 0,
+      "explain": "推理服务是短流密集型：大量并发短连接，主要成本在连接建立和软中断处理。RSS 分配不均会导致所有连接都由同一个 CPU 核处理中断和 softirq，该核打满而其他核空闲，表现为「总 CPU 低但 P99 高」。`/proc/interrupts` 和 `cat /proc/softirqs` 是首选工具。"
+    },
+    {
+      "type": "input",
+      "prompt": "查看本机所有网络接口的 offload 开关状态（TSO、GSO、GRO 等），应使用什么命令？（只写命令名）",
+      "accept": ["ethtool"],
+      "explain": "`ethtool -k <iface>` 列出网卡的 offload 特性开关，如 `tx-checksumming`、`tcp-segmentation-offload`（TSO）、`generic-receive-offload`（GRO）等。这些开关对 AI Infra 性能有显著影响，是网络排障的基础工具。"
+    },
+    {
+      "type": "match",
+      "prompt": "将网络层次与其最典型的可观测对象匹配：",
+      "left": [
+        "Linux TCP/IP 拥塞控制层",
+        "NIC offload 与中断分配层",
+        "RDMA/RoCE verbs 层",
+        "NCCL collective 层"
+      ],
+      "right": [
+        "`ss -tinm` 中的 cwnd、rtt、retrans 字段",
+        "`/proc/interrupts` 中 NIC 中断的 CPU 分布",
+        "QP 错误计数器、PFC pause 帧统计",
+        "NCCL 日志中的 op latency 和 bus bandwidth"
+      ],
+      "explain": "每一层有自己的可观测对象：TCP 层看 ss 输出；NIC 层看中断和 softirq 分布；RDMA 层看 QP/CQ 错误和 PFC 状态；NCCL 层看集合通信日志。分层定位是正确排障的前提，不能跳层。"
+    },
+    {
+      "type": "choice",
+      "prompt": "跨节点 TCP 长流吞吐只有理论带宽的 20%，`ss -tinm` 显示 cwnd 很小且 retrans 持续增长，最可能的根因是什么？",
+      "options": [
+        "路径上存在拥塞或 PMTU 黑洞，丢包触发 TCP 拥塞控制不断缩减 cwnd",
+        "接收端 socket 缓冲区（SO_RCVBUF）太小，导致 rwnd 为零",
+        "发送端 NIC 的 TSO 未启用，CPU 需要手动切分 TCP 段",
+        "ECMP 哈希将该流分配到了最慢的链路"
+      ],
+      "answer": 0,
+      "explain": "cwnd 小且 retrans 持续增长，说明 TCP 检测到网络拥塞（丢包）并不断缩减发送窗口。常见原因：路径上设备丢包（交换机 buffer overflow、PFC 未配置的 RoCE 网络）或 PMTU 黑洞（大包被静默丢弃触发重传）。先用 `ip route` 确认路径，再检查交换机计数器。"
+    },
+    {
+      "type": "judge",
+      "prompt": "排障 RoCE 训练偶发超时时，首先应该从 NCCL 集合通信层开始，逐步向下追踪到 RDMA verbs 和网络 fabric 层。",
+      "answer": true,
+      "explain": "分层定位是网络排障的核心原则：先确认是 transport 问题（QP 超时/retry）、HCA 问题（固件/驱动）还是 fabric 问题（PFC/ECN、交换机 buffer），再深入对应层排障。从 NCCL 日志开始（最高层）向下追踪，避免跳层（如直接调 MTU 参数而不知道问题在哪层）。"
+    },
+    {
+      "type": "input",
+      "prompt": "查看某条 TCP 连接的当前拥塞窗口（cwnd）、RTT 估计和累计重传次数，应使用什么命令？（只写命令名）",
+      "accept": ["ss"],
+      "explain": "`ss -tinm dst <peer_ip>` 的输出含 `cwnd`、`rtt`、`retrans` 等 TCP 内部状态字段。`-t` 选 TCP，`-i` 显示内部信息，`-n` 不解析名称，`-m` 显示内存信息。这是长流排障的核心工具。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个说法正确描述了 TSO（TCP Segmentation Offload）对抓包的影响？",
+      "options": [
+        "本机抓包可能看到超过 MTU 的「大包」（如 64KB），这些大包在 NIC 出口才被切分为符合 MTU 的帧",
+        "TSO 开启后，抓包看到的包大小与链路上的真实帧大小完全一致",
+        "TSO 仅影响接收路径，对发送方向的抓包没有影响",
+        "TSO 关闭时 CPU 需要软件切包，此时抓包可能看到超过 MTU 的包"
+      ],
+      "answer": 0,
+      "explain": "TSO 允许 TCP 把大段数据（如 64KB）整体交给 NIC，由 NIC 硬件切分为符合 MTU 的以太帧。tcpdump 在 NIC 切分之前的路径上抓包，会看到「超大包」，但链路上真实传输的仍是 MTU 大小的帧。用本机抓包推断链路 MTU 会得到错误结论。"
+    },
+    {
+      "type": "judge",
+      "prompt": "网络排障应遵循「先复现，再修复」的原则：在记录触发条件、频率和影响范围之前不要贸然修改参数。",
+      "answer": true,
+      "explain": "网络问题很多是偶发的，改参数前如果不记录基线，修复后无法判断问题是否真正消失还是偶发未触发。盲目改参数还可能引入新问题或掩盖根因。正确流程：记录现象 → 复现 → 定位根因 → 制定修复方案 → 改动 → 验证。"
+    }
+  ],
+  "u1-l21": [
+    {
+      "type": "choice",
+      "prompt": "400 Gbit/s 网络，RTT = 90μs，BDP 约为多少？",
+      "options": [
+        "约 4.5 MB",
+        "约 450 KB",
+        "约 45 MB",
+        "约 0.45 MB"
+      ],
+      "answer": 0,
+      "explain": "BDP = 带宽 × RTT = 400 × 10⁹ bit/s × 90 × 10⁻⁶ s = 36 × 10⁶ bit = 4.5 MB。socket 窗口（min(rwnd, cwnd) × MSS）必须至少达到 BDP 才能填满管道。"
+    },
+    {
+      "type": "judge",
+      "prompt": "增大 SO_SNDBUF（发送缓冲区大小）可以解决因拥塞窗口（cwnd）过小导致的长流吞吐低问题。",
+      "answer": false,
+      "explain": "cwnd 是 TCP 根据网络反馈动态调整的，与 SO_SNDBUF 无关。SO_SNDBUF 影响的是 socket 发送缓冲区大小（防止应用被阻塞），而 cwnd 小说明 TCP 检测到网络拥塞，需要排查丢包/ECN/路径拥塞，而不是调整 socket buffer。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪个场景描述了 ECMP 引起「单流慢、多流快」的典型现象？",
+      "options": [
+        "单条 TCP 流被哈希到同一条链路，无法利用多条等价链路；多条流哈希分散，总带宽接近理论值",
+        "单流的 cwnd 受 SO_SNDBUF 限制无法增大；多流各有独立 cwnd，总量更大",
+        "单流只走一个 CPU 核处理 softirq；多流触发 RSS 散列到多核并行处理",
+        "单流的 MTU 被限制为 1500B；多流触发 jumbo frame 协商，MSS 扩大"
+      ],
+      "answer": 0,
+      "explain": "ECMP 按五元组哈希而非按字节做负载均衡。单条 TCP 流的五元组固定，始终被哈希到同一条链路，无法使用其他等价链路。增加并行流（如 `iperf3 -P 8`）让哈希分散到多条链路，总带宽接近理论值。这不是 ECMP 的 bug，而是其设计行为。"
+    },
+    {
+      "type": "input",
+      "prompt": "对端 IP 为 10.1.1.2，发送方 MTU 配置为 9000。用不分片 ping 探测路径是否支持 jumbo frame，payload 大小应为多少字节（IPv4）？",
+      "accept": ["8972", "8972字节", "8972 字节"],
+      "explain": "IPv4 MTU 9000 = IP 头（20B）+ ICMP 头（8B）+ payload。payload = 9000 - 20 - 8 = 8972 字节。命令示例：`ping -M do -s 8972 10.1.1.2`（Linux）。收到 `Frag needed` 说明路径某处 MTU 更小，收到超时说明可能是 PMTU 黑洞。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 `ss -tinm` 输出的 TCP 字段与其含义匹配：",
+      "left": [
+        "`cwnd:80`",
+        "`retrans:0/12`",
+        "`rtt:120/10`",
+        "`mss:8948`"
+      ],
+      "right": [
+        "发送端当前拥塞窗口为 80 个 MSS，in-flight 上限 ≈ 80 × MSS",
+        "当前无重传，累计重传 12 次（增长才是拥塞信号）",
+        "估计 RTT 为 120μs，RTT 抖动（方差）为 10μs",
+        "当前 TCP 最大段大小，对应 MTU 9000 的 jumbo frame 路径"
+      ],
+      "explain": "`ss -tinm` 的各字段含义：cwnd 是拥塞窗口；retrans:X/Y 中 X 是当前重传数、Y 是累计；rtt:均值/抖动；mss 由路径 MTU 协商得出（MTU 9000 → MSS ≈ 8948 = 9000 - 20 - 20 - 12字节选项）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "PMTU 黑洞的典型表现是哪一组症状？",
+      "options": [
+        "小包（如 ping）连通正常，大包（如大文件传输）卡住且 TCP 重传持续增长",
+        "所有包均丢失，`ping` 超时",
+        "丢包率约 1%，均匀分布在各种大小的包上",
+        "连接建立成功但立即被 RST 重置"
+      ],
+      "answer": 0,
+      "explain": "PMTU 黑洞：路径上某设备静默丢弃超过其 MTU 的大包（不发 ICMP Fragmentation Needed 消息）。小包（小于黑洞设备 MTU）正常通过，大包被丢弃后 TCP 以为网络拥塞，不断重传和缩减 cwnd，表现为「小包通、大包卡、重传增长」。"
+    },
+    {
+      "type": "judge",
+      "prompt": "TCP 的 `rwnd`（接收窗口）由接收端通告，用于防止发送端超过接收端的缓冲容量；`cwnd`（拥塞窗口）由发送端维护，用于防止超过网络容量。两者独立工作，实际发送速率受 min(rwnd, cwnd) × MSS 限制。",
+      "answer": true,
+      "explain": "这是 TCP 流量控制的核心机制：`rwnd` 保护接收端（接收队列满则缩小），`cwnd` 保护网络（检测到拥塞则缩小）。发送端实际的 in-flight 上限是两者取小：有效窗口 = min(rwnd, cwnd) × MSS。单独扩大任意一个都可能不起作用，需两者都够大才能填满高 BDP 管道。"
+    },
+    {
+      "type": "choice",
+      "prompt": "发现 `ss -tinm` 输出的 `send-q` 很高但 `cwnd` 也很大，应优先排查什么？",
+      "options": [
+        "接收端应用读取速度慢导致 `rwnd` 缩小，形成接收端流控",
+        "发送端 NIC 的 TX ring buffer 满导致 qdisc backlog 增长",
+        "ECMP 将该流哈希到拥塞的链路，导致频繁丢包和 cwnd 缩减",
+        "发送端 socket 的 SO_SNDBUF 配置过小限制了发送速率"
+      ],
+      "answer": 0,
+      "explain": "`send-q` 高说明数据在 socket 发送缓冲区中积压，但 `cwnd` 大说明 TCP 层面不是瓶颈（不是拥塞控制限制）。最可能原因是接收端应用来不及读取数据，`rwnd` 通告为小值，即使 `cwnd` 大，发送端也被 `rwnd` 流控。排查方向：接收端 CPU、应用吞吐、socket 接收缓冲。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 TCP 应用层，应用调用 `send()` 把字节放入 socket 发送缓冲区后，TCP 层从发送队列取数据构造 segment 时，这个描述 segment 的内核数据结构叫什么？（写出缩写）",
+      "accept": ["skb", "sk_buff"],
+      "explain": "`sk_buff`（socket buffer，简称 skb）是 Linux 网络栈的核心数据结构，贯穿从 socket 层到 NIC driver 的全路径。每个 skb 描述一个网络包的内存布局、协议头、校验和卸载等信息，跨层传递时通过调整 head/tail 指针而非复制数据。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 qdisc 统计中，`drops` 计数器增长说明本机已在发送侧丢包，TCP 会把这视为拥塞信号并缩减 cwnd。",
+      "answer": true,
+      "explain": "qdisc 的 `drops` 发生在 IP 层与 NIC driver 之间，属于本机发送侧丢包。TCP 无法区分「本机 qdisc drop」和「网络路径丢包」，都会触发拥塞控制（fast retransmit 或 RTO），导致 cwnd 缩减和吞吐下降。发现 qdisc drops 应检查 NIC 队列配置（`ethtool -g`）、qdisc 类型和参数（`tc -s qdisc`）。"
+    }
+  ]
+}

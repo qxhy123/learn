@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u3c14",
+    "title": "算子库、融合与 SM 资源边界",
+    "subtitle": "cuBLAS/cuDNN/FlashAttention/Triton 选择 + 为什么 fused kernel 可能更慢",
+    "intro": [
+      {
+        "title": "不可化简的问题",
+        "body": "模型 step 最终变成许多 kernel，每个 kernel 必须在有限的 SM、warp、register、shared memory、HBM 带宽和指令调度能力内完成工作。高性能来自把正确计算形状交给正确的库，并让 kernel 内部资源不互相踩踏。\n\n三层约束：\n\n1. **算子形状约束**：GEMM、attention、normalization、sampling 的计算密度和数据复用方式完全不同，不能用同一种性能直觉分析\n2. **实现质量约束**：高质量算子库在大量 dtype、layout、tile、pipeline、Tensor Core 指令上长期调优。在成熟库已覆盖的主路径上自研低质量 kernel，往往只是在追平别人多年优化\n3. **SM 资源约束**：融合多个算子可能减少 HBM 往返，也可能增加 register pressure、降低 occupancy、触发 spill——反而变慢\n\n**判断顺序**：先识别算子形状 → 选择成熟实现 → 用 profiler 看 kernel 内部资源 → 最后才决定是否自定义或加深融合"
+      },
+      {
+        "title": "算子库分工：cuBLAS、cuBLASLt、cuDNN、CUTLASS、FlashAttention、Triton",
+        "body": "| 库 | 解决什么层级 | 典型场景 | 注意 |\n|---|---|---|---|\n| `cuBLAS` | 标准 GEMM | 线性层、QKV projection、MLP | 保证 dtype、layout、shape 命中好 kernel |\n| `cuBLASLt` | 更灵活的 GEMM + epilogue | GEMM 后接 bias/activation/quantize | epilogue 太重会拖慢主 kernel |\n| `cuDNN` | 深度学习 primitive | Conv、BN、pooling、RNN | 视觉模型优先确认 layout（NHWC 更友好）|\n| `CUTLASS` | 高性能模板化 kernel 组件 | grouped GEMM、MoE expert、自定义 epilogue | 适合长期维护，模板复杂，编译慢 |\n| `FlashAttention` | 改变 attention 数据流 | Transformer attention（prefill） | decode 阶段瓶颈不同，不能只看有没有用 FA |\n| `Triton` | 高生产率 tile kernel | elementwise 融合、RMSNorm、sampling、routing | 仍需调 tile/warps/stages，不是自动快 |\n\n**选择优先级**：框架是否已调用成熟库 → dtype/layout/shape 是否命中好 kernel → 库提供的 fused epilogue → 只有主路径未覆盖才写自定义 kernel"
+      },
+      {
+        "title": "FlashAttention：融合不是把代码粘起来，而是改变数据流",
+        "body": "标准 attention 会显式 materialize `S = QK^T` 和 `P = softmax(S + mask)`。对长序列，`S` 和 `P` 是 `[batch, heads, seq, seq]`，产生巨大 HBM 读写。\n\nFlashAttention 的核心是**用 tile 化和在线 softmax 改变内存复杂度**：\n- 把 Q、K、V 分块读取，在 shared memory/register 内计算局部 score\n- 在线维护 softmax 的 max 和 sum，避免保存完整 attention matrix\n- 直接累加输出 O，只把必要结果写回 HBM\n\n| 维度 | 朴素 attention | FlashAttention |\n|---|---|---|\n| 中间矩阵 | 保存完整 QK^T 和 softmax | 不保存完整矩阵 |\n| HBM 流量 | 多次读写大矩阵 | 主要读 Q/K/V，写 O |\n| 长序列显存 | O(seq^2) 中间状态 | 显著降低 |\n\n**但 FlashAttention 不是万能答案**：极小序列下固定开销不划算；非标准 mask、paged KV、sliding window 需要专门变体；decode 阶段主要瓶颈是 KV Cache 读取和调度，而不是 prefill 的 seq^2 矩阵。"
+      },
+      {
+        "title": "SM 资源：block、warp、occupancy 的关系",
+        "body": "GPU 执行层次：`Grid → Blocks → Warps → Threads`\n\n一个 block 被完整调度到一个 SM，block 内线程可同步并共享 shared memory。warp（32 个线程）是硬件调度的基本执行单位。\n\n**occupancy** = active warps on SM / maximum resident warps on SM\n\nSM 能驻留多少 block，受多个上限共同限制：\n\n| 限制 | 后果 |\n|---|---|\n| 最大 blocks/warps per SM | 硬件上限 |\n| Register file 容量 | `registers_per_thread × threads_per_block` 越大，驻留 block 越少 |\n| Shared memory 容量 | 每 block 用得越多，SM 驻留 block 越少 |\n\n**occupancy 是诊断指标，不是优化目标**：\n- 低 occupancy + high memory stall → 延迟隐藏不足，可能需要优化\n- 低 occupancy + high Tensor Core utilization → 计算密度高，不一定需要改\n- 高 occupancy + low throughput → warp 多但都在等内存或分支，查 stall reason",
+        "tip": "block size 不是越大越好。大 block 有更多线程协作，但也消耗更多 register/shared memory，减少 SM 驻留 block 数，tail shape 浪费更多线程，负载均衡变差。"
+      },
+      {
+        "title": "Register Pressure 与 Spill：融合变慢的常见根因",
+        "body": "**Register pressure 的机制**：每个线程的临时变量、accumulator、中间结果都占 register。SM register file 总量有限，每线程用得越多，SM 驻留的 warp/block 越少。\n\n**简化关系**：`resident_blocks ≈ floor(registers_per_SM / (registers_per_thread × threads_per_block))`\n\n若融合后 `registers_per_thread` 从 48 增到 120，SM 驻留 block 数可能直接减半。\n\n**Spill 到 local memory**：register 不够时，编译器把临时值放到 local memory（名字很近，实际走 HBM 路径）。访问 local memory 比 register 慢得多。\n\n**`ncu` 里的 spill 信号**：`local memory load/store` 明显，`registers per thread` 很高\n\n**常见 spill 来源**：\n- 融合太多阶段（同时保存 norm、activation、residual、scale、mask）\n- accumulator 太多（每线程负责过大 tile）\n- 循环 unroll 过度（live variable 激增）\n\n**修复方向**：拆掉部分 fusion、缩小 tile、减少 live variable、把中间值改为重算",
+        "reveal": {
+          "q": "一个 Triton fused kernel 把 `residual add + RMSNorm + quantize` 合成一个 kernel，ncu 显示 registers per thread 从 48 涨到 112，local memory load/store 明显，achieved occupancy 从 62% 降到 28%。请解释为什么比拆开更慢，并给出两个修复方向。",
+          "a": "归一化的归约、quantization scale、clamp、packing 和 residual 中间值让每线程 live variable 增多，寄存器压力上升后：(1) SM 驻留 warp 减少（occupancy 下降，延迟隐藏能力下降），(2) 部分变量 spill 到 local memory（走 HBM 路径，比 register 慢得多），节省的一次中间 HBM 写回被 spill 和低 occupancy 吃掉。修复方向：① 从 kernel 中拆出 quantize，只保留 residual+RMSNorm；② 缩小 block size 降低每 program 的寄存器压力，让 occupancy 恢复。"
+        }
+      },
+      {
+        "title": "算子融合的收益与成本模型",
+        "body": "融合的本质是「减少不必要字节移动和固定调度成本」，而不是魔法。\n\n**融合减少**：\n1. HBM 中间写回（中间 tensor 留在 register/shared memory）\n2. HBM 中间读入（下步不用重新读）\n3. kernel 固定调度成本（多个小 kernel 变少）\n\n**融合增加**：register pressure、shared memory 占用、occupancy 下降、spill、指令数、coalescing 可能退化、warp divergence（mask/branch 多时）\n\n**简化判断公式**：\n```\nfusion_gain = saved_hbm_rw + saved_launch_cost\n            - extra_register_cost - extra_shared_mem_cost\n            - spill_cost - divergence_loss\n```\n\n**工程上线门槛**：\n- 若 saved_hbm + saved_launch ≤ resource_pressure_penalty → 不上线或缩小边界\n- 必须端到端 retest 超过 threshold（不能只看 microbenchmark 变快）\n- 若 fused kernel 只占 step time 1-2%，即使快也不值得增加维护复杂度"
+      },
+      {
+        "title": "Memory Coalescing 与 Layout：带宽不是自动给你的",
+        "body": "HBM 带宽很高，但前提是 warp 内线程访问规整。**warp 内相邻线程访问相邻、对齐、连续的地址，硬件能把多个访问合成较少的 memory transaction。**\n\n| 访问模式 | 场景 | 性能风险 |\n|---|---|---|\n| 连续读写 | elementwise、contiguous tensor | 高带宽 |\n| 固定 stride | transpose 后 tensor、列访问 | transaction 增多 |\n| gather/scatter | embedding、MoE dispatch、paged KV | 随机访问，cache 命中不稳 |\n| ragged sequence | varlen attention、packed batch | mask 和边界判断多 |\n\n**Layout 是性能契约**：layout 不是数据的附属信息，而是 kernel 和上游系统之间的性能约定。调 layout 的收益经常比改 kernel 更大，因为它让成熟库重新命中好路径。\n\n**常见 layout 问题**：训练时频繁 `transpose + contiguous`；quantized weight packing 与 kernel 预期不一致；MoE token 排列不连续，grouped GEMM 前后 dispatch 开销高。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪个场景最适合使用 FlashAttention 而不是朴素 softmax attention？",
+        "options": [
+          "decode 阶段每步只生成 1 个 token，batch size 很小",
+          "prefill 阶段处理 4096 token 的长 prompt，需要避免 seq^2 中间矩阵",
+          "embedding lookup 操作，需要随机访问 KV",
+          "MoE expert GEMM，token 分布不均匀"
+        ],
+        "answer": 1,
+        "explain": "FlashAttention 通过 tile 化和在线 softmax 避免 materialize seq×seq 的 QK^T 矩阵，对长 prompt prefill 收益巨大。decode 阶段每步 query 很少，主要瓶颈是 KV Cache 读取和调度，不是 seq^2 矩阵，FlashAttention 在 decode 的 attention 计算上收益有限。"
+      },
+      {
+        "type": "judge",
+        "prompt": "occupancy 越高，kernel 性能越好，因此优化 kernel 时应该把 occupancy 提升到 100% 作为首要目标。",
+        "answer": false,
+        "explain": "occupancy 是诊断延迟隐藏能力的指标，不是最终优化目标。低 occupancy 如果伴随高 memory stall，说明活跃 warp 不足；但低 occupancy 如果伴随高 Tensor Core 利用率，可能是正常的计算密集场景。高 occupancy 如果所有 warp 都在等内存或分支，也不代表高吞吐。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ncu 显示某 fused kernel 的 `local memory load/store` 明显增加，registers per thread 从 40 升到 128，但 achieved occupancy 下降。最可能的原因是？",
+        "options": [
+          "shared memory bank conflict 过多",
+          "register spill 导致临时值落到 local memory（走 HBM 路径）",
+          "kernel 被分配到太少的 SM",
+          "CUDA Graph replay 地址不稳定"
+        ],
+        "answer": 1,
+        "explain": "registers per thread 大幅上升说明融合后每线程 live variable 增多，SM register file 不足时编译器把部分变量 spill 到 local memory。local memory 名字误导，实际走 HBM 路径（有缓存），访问比 register 慢得多。这是 fused kernel 反而变慢的典型根因。"
+      },
+      {
+        "type": "input",
+        "prompt": "cuBLAS 和 cuBLASLt 的主要区别是什么？cuBLASLt 额外能做什么（提示：epilogue）？",
+        "accept": ["epilogue", "融合", "更灵活", "bias", "activation", "算法选择"],
+        "explain": "cuBLAS 提供标准 GEMM 接口。cuBLASLt 在此基础上支持更丰富的 algorithm search、layout 描述和 epilogue fusion（GEMM + bias + activation / quantize 等后处理直接合进 kernel，减少一次 HBM 读写），适合现代训练和推理框架的线性层优化。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 kernel 慢的症状与最可能的资源假设匹配：",
+        "left": [
+          "fused kernel 比拆开慢，local memory load 明显",
+          "Tensor Core utilization 很低",
+          "HBM bandwidth 低但 kernel 时间长",
+          "occupancy 低且 memory stall 高"
+        ],
+        "right": [
+          "register spill：fusion 后 registers/thread 过高",
+          "dtype/layout/shape 未命中 Tensor Core 路径",
+          "访存不合并（coalescing 差）或 stride 访问",
+          "shared memory/register 占用限制了 SM 驻留 warp"
+        ],
+        "explain": "local memory load 明显 → spill（register 不够落到 local memory）；Tensor Core 低 → dtype/layout/shape 问题；bandwidth 低但时间长 → coalescing 差，大量 transaction 被串行；低 occupancy + memory stall → 驻留 warp 不足以隐藏延迟，通常由 register/shared memory 占用过高引起。"
+      },
+      {
+        "type": "judge",
+        "prompt": "CUTLASS 和 Triton 都能写高性能 GPU kernel，两者的定位完全相同，选任意一个即可。",
+        "answer": false,
+        "explain": "CUTLASS 暴露 tile shape、warp shape、instruction shape、epilogue 等 C++ 模板组件，适合长期维护、接近库内部风格的 GEMM-like 自定义 kernel（如 grouped GEMM、复杂 epilogue）；Triton 提供 Python 风格的 tile 编程模型，更适合快速迭代的 elementwise/reduction 融合、RMSNorm、sampling 等。两者抽象层级和适用场景不同。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个 70B 推理服务使用 FlashAttention 后，prefill TTFT 明显下降，但 decode TPOT 几乎不变。以下哪项分析最准确？",
+        "options": [
+          "FlashAttention 未正确安装，decode 未生效",
+          "decode 阶段主要瓶颈是 KV Cache 读取和 batch 调度，不是 seq^2 attention 矩阵",
+          "decode 阶段 GPU 利用率太低，需要提高 occupancy",
+          "应该换用 cuDNN 来加速 decode"
+        ],
+        "answer": 1,
+        "explain": "decode 每步 query token 数很少，主要工作是读历史 KV Cache 和做小 batch attention。FlashAttention 对避免 materialize 大 attention matrix 收益巨大（主要是 prefill 的收益），decode 瓶颈通常在 KV Cache layout 连续性、paged block size、batch scheduler 提供的 token 数量、GQA/MQA 减少的 KV 读取量，而不在 seq^2 矩阵。"
+      },
+      {
+        "type": "choice",
+        "prompt": "关于算子融合的上线决策，以下哪项是正确的工程准则？",
+        "options": [
+          "只要 microbenchmark 显示融合 kernel 比拆开快，即可上线",
+          "融合后 kernel 数量减少就说明融合有效",
+          "必须通过端到端 retest 超过 threshold，且 ncu 显示资源指标没有明显劣化",
+          "register pressure 增加时，只要 occupancy 不降就可以上线"
+        ],
+        "answer": 2,
+        "explain": "fusion 的最终衡量标准是端到端吞吐/延迟的真实改善，不是 microbenchmark 或 kernel 数量。ncu 指标（register、shared memory、spill、occupancy、coalescing）是判断资源风险的工具，需要同时满足：端到端改善超阈值 + 资源指标没有解释不了的劣化。若 fused kernel 只占 step time 1-2%，即使快也不值得增加维护复杂度。"
+      }
+    ]
+  }
+]

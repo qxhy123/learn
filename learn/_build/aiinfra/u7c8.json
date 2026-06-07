@@ -1,0 +1,108 @@
+[
+  {
+    "id": "u7c8",
+    "title": "GPU 调度与拓扑感知",
+    "subtitle": "Device Plugin、gang scheduling、NUMA/NVLink/RDMA locality",
+    "intro": [
+      {
+        "title": "GPU 不是「更贵的 CPU」",
+        "body": "Kubernetes 默认调度器能处理 CPU 和内存数量，GPU 通过 `device plugin` 暴露为 `nvidia.com/gpu` 后，调度器知道「节点还有几个设备可分配」——但这个数量无法表达：\n\n- GPU 型号和显存大小（L4 vs H100 差异巨大）\n- MIG profile 与整卡的区别\n- GPU 之间是否有 NVLink / NVSwitch\n- GPU、CPU、NIC 是否在同一 NUMA locality\n- 跨节点是否有 RDMA，NCCL 是否走正确网卡\n- 节点驱动、container toolkit、CUDA 版本是否兼容\n\n因此 GPU 调度是**信号工程**：把硬件事实、软件基线、网络拓扑和组织策略变成调度器、准入系统都能理解的约束。"
+      },
+      {
+        "title": "Device Plugin、GPU Operator、NFD 的责任边界",
+        "body": "| 组件 | 做什么 | 不做什么 |\n|---|---|---|\n| `Device Plugin` | 向 kubelet 注册 GPU 为 extended resource；容器启动时返回设备注入信息 | 训练框架调优、NCCL 拓扑选择 |\n| `GPU Operator` | 持续管理节点 GPU 软件栈（driver、toolkit、device plugin、DCGM、MIG manager） | 容量规划、队列公平、调度策略 |\n| `NFD / GPU Feature Discovery` | 自动发现 GPU 型号、显存、MIG 状态、CUDA capability 并打节点标签 | 保证标签永远正确 |\n| `DCGM Exporter` | 暴露 GPU 利用率、显存、XID、ECC、温度等指标 | 判断任务是否应该重试 |\n\n**典型 GFD 打标签示例：**\n`nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3`\n`nvidia.com/gpu.memory=81920`\n`nvidia.com/cuda.driver.major=535`",
+        "tip": "GPU Operator 解决「节点基线一致」，不是调度策略。节点 GPU 栈正常，策略仍然可以错。"
+      },
+      {
+        "title": "MIG：硬件隔离与碎片问题",
+        "body": "MIG（Multi-Instance GPU）把支持的 GPU 切成多个硬件隔离实例，在 Kubernetes 中暴露为不同 extended resource，例如 `nvidia.com/mig-1g.10gb`。\n\n**MIG 适合**：小模型推理、Notebook、开发环境、强隔离多租户\n\n**MIG 不适合**：需要整卡显存的大模型、频繁通信的多卡训练\n\n**MIG 碎片问题**：资源形状不匹配，而不是简单容量不足。例如节点暴露了 `nvidia.com/mig-1g.10gb: 4` 和 `nvidia.com/mig-3g.40gb: 1`，一个需要 `nvidia.com/mig-7g.80gb: 1` 的 Pod 无法用 4 个小 profile 拼出来——这就是碎片。",
+        "reveal": {
+          "q": "集群 GPU 节点有 16 张 H100 空闲，但一个需要 8 卡的训练任务 Pending，最可能的原因是什么？",
+          "a": "16 张卡可能分布在多台节点上，每台只剩 2-4 张。8 卡 worker 需要单节点 8 张可用卡，无法跨节点拆分。「集群总空闲 GPU 数」不等于「满足任务形状的可用节点数」。"
+        }
+      },
+      {
+        "title": "taint/toleration、affinity 与拓扑分布",
+        "body": "**GPU 节点防止普通 Pod 入侵**：给 GPU 节点打 taint，GPU Pod 需要显式 toleration：\n- taint 示例：`ai.local/gpu=true:NoSchedule`\n- Pod toleration：`key: ai.local/gpu, operator: Equal, value: \"true\", effect: NoSchedule`\n\n**节点选择策略**：\n- `requiredDuringScheduling`（硬约束）：没有满足条件的节点就 Pending，只放「没有就不能跑」的约束\n- `preferredDuringScheduling`（软偏好）：有就优先，没有就放到次优节点，适合性能偏好\n\n**推理副本高可用**：用 `podAntiAffinity` 让副本分散到不同节点/机架，一台节点故障不影响全部服务。\n\n**反模式**：把所有偏好写成 `required`，资源紧张时大量 Pending。"
+      },
+      {
+        "title": "gang scheduling 原理：要么全上，要么都不上",
+        "body": "两种主流实现：\n\n**Volcano PodGroup**（独立 scheduler binary）：\n- 声明 `minMember: 8`，调度器在 Allocate 阶段尝试为所有 Pod 找节点\n- 能找到 minMember 个位置 → batch bind 全部；找不到 → 回滚，PodGroup 回到 Pending\n- 适合大规模批训练（>32 Pod gang）\n\n**scheduler-plugins CoScheduling**（default scheduler + plugin）：\n- 利用 Scheduling Framework 的 `Permit` 阶段：前 N-1 个 Pod 到达 Permit 时等待，第 N 个到达时一起 Allow\n- 等待超时（默认 60s）→ 全部 Reject，重新入队\n- 适合 K8s 原生场景加 gang 能力\n\n**关键工程区别**：Volcano 是独立 scheduler binary；CoScheduling 是扩展 default scheduler 的 plugin。同集群可以共存，但不要让同一批 Pod 同时被两者处理。"
+      },
+      {
+        "title": "NUMA、NVLink、RDMA locality 如何影响性能",
+        "body": "**训练能跑但吞吐只有预期 55% 的典型根因：**\n\n| Locality 问题 | 表现 | 诊断命令 |\n|---|---|---|\n| GPU/NIC 跨 NUMA socket | 数据路径变长，allreduce 慢 | `nvidia-smi topo -m`、`numactl --hardware` |\n| GPU 不在同一 NVSwitch domain | tensor parallel / FSDP 带宽下降 | `nvidia-smi topo -m`、`nccl-tests` |\n| NCCL 走 TCP 而非 RDMA | 跨节点通信退化 | `NCCL_DEBUG=INFO` 看 transport |\n| MTU 不一致 | RoCE 丢包，NCCL 超时 | `ibstat`、网络配置审计 |\n\n工程动作：把节点池按 HGX/NVSwitch、PCIe、整卡、MIG、RDMA 能力分类；调度约束区分「没有就不能跑」（硬 required）和「没有就跑慢」（软 preferred）。",
+        "tip": "开启 Topology Manager（`topologyManagerPolicy: single-numa-node`）可让 kubelet 在 admission 阶段把 CPU、内存、GPU、NIC 分配在同一 NUMA，但需要 CPU Manager static 策略和 Guaranteed QoS Pod 才生效。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "一个 Pod 的事件显示 `had untolerated taint: ai.local/gpu=true:NoSchedule`，应该如何修复？",
+        "options": [
+          "删除节点上的 taint",
+          "在 Pod spec 中加入对应的 toleration",
+          "把 Pod 改成 Deployment",
+          "增加节点 GPU 数量"
+        ],
+        "answer": 1,
+        "explain": "taint/toleration 的语义：taint 标记节点「不接受没有对应 toleration 的 Pod」，toleration 表示 Pod「允许」被调度到该类节点。修复方法是在 Pod spec 中加入匹配的 toleration，而不是移除生产节点的 taint。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPU Operator 部署完毕后，调度策略（如 gang scheduling、GPU 节点池）就自动生效了。",
+        "answer": false,
+        "explain": "GPU Operator 负责节点 GPU 软件栈的一致性（driver、toolkit、device plugin、DCGM），不负责调度策略。gang scheduling 需要独立的 Volcano 或 scheduler-plugins CoScheduling；节点池策略需要额外配置 taint/toleration 和 affinity。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于 MIG 碎片的描述，哪个是正确的？",
+        "options": [
+          "MIG 碎片是显存利用率不足 50% 时产生的",
+          "MIG 碎片指资源形状不匹配，大 profile 无法用多个小 profile 拼凑",
+          "MIG 碎片只在 A100 上出现，H100 不受影响",
+          "MIG 碎片可以通过 gang scheduling 完全解决"
+        ],
+        "answer": 1,
+        "explain": "MIG 碎片的本质是资源形状不匹配：profile 种类固定，Pod 请求的 profile 与节点已暴露的 profile 不一致，导致资源看似足够但实际无法分配。这与简单的容量不足不同，也无法通过 gang scheduling 解决。"
+      },
+      {
+        "type": "match",
+        "prompt": "将组件与其核心职责配对：",
+        "left": ["Device Plugin", "NFD / GPU Feature Discovery", "GPU Operator", "DCGM Exporter"],
+        "right": ["暴露 GPU 健康指标和利用率", "管理节点 GPU 软件栈一致性", "注册 GPU 为 extended resource，注入容器设备", "自动发现 GPU 型号并打节点标签"],
+        "explain": "Device Plugin 注册设备；NFD/GFD 自动打标签；GPU Operator 管理软件栈；DCGM Exporter 暴露 GPU 指标。四者协作但职责不重叠。"
+      },
+      {
+        "type": "judge",
+        "prompt": "gang scheduling 保证：所有 minMember 个 Pod 同时调度成功，或全部不调度，防止部分 Pod 占住 GPU 空等。",
+        "answer": true,
+        "explain": "这是 gang scheduling 的核心语义。无论是 Volcano PodGroup 还是 CoScheduling，都要么整体 admit（全部绑定节点），要么整体回滚，避免了「5 个 worker 跑起来占卡，等剩下 3 个永远等不到」的死锁。"
+      },
+      {
+        "type": "input",
+        "prompt": "训练任务日志显示 NCCL 退化到了 Socket 传输，排查时首先应打开哪个环境变量查看 NCCL 详细网络选择过程？（填变量名）",
+        "accept": ["NCCL_DEBUG", "NCCL_DEBUG=INFO"],
+        "explain": "设置 `NCCL_DEBUG=INFO`（可配合 `NCCL_DEBUG_SUBSYS=INIT,NET`）会让 NCCL 输出网卡选择、RDMA 设备发现、transport 协商等详细信息，帮助判断为什么 RDMA 未生效、走了哪张网卡。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理副本应该使用哪种亲和策略来降低单节点故障影响？",
+        "options": [
+          "podAffinity（让副本聚集在同一节点）",
+          "nodeAffinity requiredDuringScheduling（只调到特定节点）",
+          "podAntiAffinity（让副本分散到不同节点）",
+          "topologyKey: rack（让副本全部在同一机架）"
+        ],
+        "answer": 2,
+        "explain": "podAntiAffinity 让同一服务的副本分散到不同节点（topologyKey: kubernetes.io/hostname），单节点故障只影响部分副本，其余副本仍能接流量。聚集在同一节点会放大单点故障影响。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Topology Manager 是一个调度器，在 Pod 调度阶段决定 NUMA 亲和性。",
+        "answer": false,
+        "explain": "Topology Manager 工作在 kubelet 的 admission 阶段（节点已被 scheduler 选定之后），协调 CPU Manager、Memory Manager 和 Device Manager 的 hint，决定 CPU/内存/GPU/NIC 在同一 NUMA 内分配。它不是 scheduler，无法影响节点选择。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,129 @@
+[
+  {
+    "id": "u1c5",
+    "title": "SIMD：SSE / AVX / AVX-512",
+    "subtitle": "为什么宽 ALU 是数据并行的物理必然，以及 AI Infra host-side 的向量化机会",
+    "intro": [
+      {
+        "title": "为什么需要 SIMD？指令粒度比数据粒度粗的浪费",
+        "body": "**核心问题**：当一段代码对连续数组反复执行同一个简单操作（扫字节找非 ASCII、对 float 数组做 mask、temperature scaling），如果硬件把每个元素当成独立标量指令处理，绝大多数**前端带宽和译码资源都被浪费在重复的指令头部**，而不是数据计算上。\n\nSIMD（Single Instruction, Multiple Data）的答案：让**一条指令**在一个 cycle 内处理 N 个元素。收益不是「单个元素算得更快」，而是**前端开销摊薄**——取指、译码、rename、ROB 占用都按「一条指令」算，但有效工作是 N 倍。\n\n**对比**：处理 32 个 fp32 加法：\n- SISD 标量：32 条 `addss` 指令，32 次前端开销\n- AVX2 SIMD：4 条 `vaddps ymm`（每条 8 元素），4 次前端开销\n- AVX-512：2 条 `vaddps zmm`（每条 16 元素），2 次前端开销\n\n**判断第一条**：SIMD 只有在「同一操作批量处理连续数据」时才有意义。链表遍历、每元素走不同分支——SIMD 帮不上忙。",
+        "tip": "SIMD 是「约束最优化」：数据并行可识别 + 控制流规整 + 对齐与边界可接受 + ISA 可用，才能让宽 ALU 跑满。缺任何一项都应该先修那一项。"
+      },
+      {
+        "title": "x86 SIMD 演进：从 MMX 到 AVX-512",
+        "body": "x86 SIMD 的每一代都解决了上一代的具体限制：\n\n| 指令集 | 寄存器宽度 | 关键里程碑 | AI Infra 主要用途 |\n|---|---|---|---|\n| SSE2（2001） | 128-bit（xmm） | x86-64 必备，双精度整数 SIMD | baseline，任何场景无条件可用 |\n| SSE4.1/4.2（2008） | 128-bit | 字符串处理（`pcmpestri`）、CRC32、blend | URL 解析、tokenizer 字符分类 |\n| AVX（2011） | 256-bit（ymm） | 寄存器加宽，3 操作数 VEX 编码 | 主流 fp32 batch 处理 |\n| AVX2（2013） | 256-bit | **整数 SIMD 扩展到 256-bit**、gather load | tokenizer 扫描、UTF-8 validation 主力 |\n| AVX-512F（2016） | 512-bit（zmm） | 寄存器宽度翻倍、**mask 寄存器 k0–k7** | 高吞吐 preprocessing、bf16 decode |\n| AVX-512 VNNI（2019） | 512-bit | `vpdpbusd`：64 个 int8 乘加一条指令 | CPU int8 量化推理核心武器 |\n| AMX（2023+） | tile 矩阵 | 独立 tile 矩阵单元，专为 GEMM | CPU 端大模型推理 |\n\n**重要提醒**：不同云实例、不同代际服务器的 SIMD 支持差异极大。**生产代码必须 runtime dispatch**，用 `__builtin_cpu_supports(\"avx2\")` 或 `cpuid` 在初始化时选实现。"
+      },
+      {
+        "title": "AVX-512 频率降级：何时应该担心？",
+        "body": "AVX-512 在 Skylake 时代（2016–2019）有一个著名的「frequency drop」问题：\n\n**机制**：AVX-512 重指令（FMA、512-bit FP）功耗远超普通指令。CPU 用 power license 机制保护：执行 AVX-512 重指令时，整个 core 进入低频档位（License 2），**即使指令结束，也要等数百微秒到 ~2ms 才能升回最高频**。期间所有标量/SSE 代码也跑在降频频率。\n\n**代际差异**：\n\n| 硬件代际 | 降频幅度 | 升频时间 | 建议 |\n|---|---|---|---|\n| Skylake-SP / Cascade Lake | 10–25%，影响全 core | 数百 μs 到 2ms | 谨慎，保留 AVX2 路径 |\n| Ice Lake（2019+） | 5–10%，明显改善 | 几十 μs | 可以使用，但要测 |\n| Sapphire Rapids / Granite Rapids | 几乎无影响 | 微秒级 | 可以放心使用 |\n\n**工程原则**：用 `perf stat -e core_power.lvl2_turbo_license` 实测降频时间占比。不要在 cold path 里「顺手」用 AVX-512 helper；把 AVX-512 集中在长循环里跑满。",
+        "tip": "AVX-512 的 mask 寄存器（k0–k7）是被低估的特性：按位 enable/disable lane，写尾部处理不再需要单独的 scalar fallback，可以用 masked load/store 一次搞定。"
+      },
+      {
+        "title": "ARM NEON 与 SVE：跨架构 SIMD",
+        "body": "AWS Graviton、Apple Silicon 等 ARM 服务器越来越重要：\n\n| 特性 | x86 AVX2 | x86 AVX-512 | ARM NEON | ARM SVE |\n|---|---|---|---|---|\n| 寄存器宽度 | 256-bit 固定 | 512-bit 固定 | 128-bit 固定 | 128–2048-bit **可变** |\n| Mask 寄存器 | 无（靠 blend） | k0–k7 | 无 | predicate p0–p15 |\n| 编程模型 | 宽度感知 | 宽度感知 | 宽度感知 | **VLA（Vector Length Agnostic）** |\n\n**SVE 的革命性**：寄存器宽度由硬件决定（128–2048 bit），程序写一次能在任意宽度上跑。AWS Graviton 3 是 256-bit SVE，Fugaku 超算是 512-bit SVE，同一份代码可以不重编译直接利用更宽的硬件。\n\n**跨架构工程套路**：用 portable SIMD 抽象库（Google Highway、`std::experimental::simd`、Rust `portable_simd`），底层根据 target 特性 dispatch 到 NEON/SSE4/AVX2/AVX-512/SVE。手写多套 intrinsics 维护成本极高。"
+      },
+      {
+        "title": "自动向量化为什么经常失败？",
+        "body": "编译器（GCC、Clang）会尝试自动向量化循环，但有四类常见失败原因：\n\n| 失败类别 | 具体原因 | 解决方法 |\n|---|---|---|\n| 数据依赖 | 跨迭代依赖（`a[i] = a[i-1] + b[i]`） | 算法重写；用 scan 算法 |\n| 指针别名 | 无法确定 `float*` 参数是否重叠 | 加 `__restrict__` |\n| 控制流 | 循环内有 `if/else`、`break`、`continue` | 转 mask、用 select 模式 |\n| 对齐/边界 | 循环次数不是常量、对齐未知 | `__builtin_assume_aligned`、unroll hint |\n| 函数调用 | 循环内有未内联函数 | 强制 inline、用 intrinsic |\n\n**查看编译器报告**：\n- GCC：`-fopt-info-vec -fopt-info-vec-missed`\n- Clang：`-Rpass=loop-vectorize -Rpass-missed=loop-vectorize`\n\n**常见修复**：把 `float *out, const float *in` 改成 `float * __restrict__ out, const float * __restrict__ in`，通常就能让编译器成功向量化 scale-and-clip 这类循环。",
+        "steps": [
+          "先编译并查看向量化报告，确认哪些循环被向量化、哪些没有",
+          "找到 missed 的原因（alias / control flow / dependency）",
+          "最小化修改：加 restrict、拆分支为 select、提前计算 trip count",
+          "用 perf stat 确认 256b/512b SIMD counter 确实升高"
+        ]
+      },
+      {
+        "title": "手写 Intrinsics：值得手写的经典场景",
+        "body": "手写 intrinsics 成本高（可读性差、跨平台维护难），但有几类场景自动向量化做不到，手写能拿到 3–10x 加速：\n\n| 场景 | 为什么自动向量化做不到 | 典型加速 |\n|---|---|---|\n| Tokenizer ASCII 快速扫描 | 找「第一个非 ASCII byte」是状态依赖 + early exit | 3–5x |\n| UTF-8 Validation | 多状态字节模式匹配，需要 shuffle table | 5–10x |\n| JSON / Protobuf 解析 | 字符分类 + 位运算 + early exit 混合 | 2–4x |\n| bf16 / fp16 ↔ fp32 转换 | 位模式提取/拼接，标量代码无法表达 | 4–8x |\n| Int8 量化推理 dot product | 需要 VNNI 的 `vpdpbusd` 指令 | 5–15x |\n| Bit packing / unpacking | 字节级 shuffle + bit 操作 | 5–10x |\n\n**Worked Example（tokenizer ASCII 扫描）**：\n- 一条 `_mm256_movemask_epi8(chunk)` 把 32 个 byte 的最高位压缩成 32-bit mask\n- 一条 `__builtin_ctz(mask)` 找到第一个非 ASCII byte 的位置\n- 相比标量逐字节处理：AVX2 3.7x 加速，AVX-512 6.7x 加速（1MB 全 ASCII 输入）\n\n**重要原则**：永远保留 scalar fallback；优先用成熟库（simdjson、xxhash、Highway）；手写之前先确认没有现成实现。",
+        "reveal": {
+          "q": "为什么 `_mm256_movemask_epi8` 特别适合 ASCII 检测？",
+          "a": "ASCII 字节的最高位是 0，非 ASCII（≥ 0x80）的最高位是 1。`_mm256_movemask_epi8` 正好把 32 个 byte 的最高位各取一位，压缩成 32-bit 整数。如果整数为 0，说明全是 ASCII；否则用 `__builtin_ctz` 找最低置位位就能知道第一个非 ASCII 的位置。这个操作刚好对应 ASCII 判断的语义，是「为问题量身定制的指令」。"
+        }
+      },
+      {
+        "title": "GPU 时代 CPU SIMD 为什么仍然重要？",
+        "body": "很多人以为 GPU 时代 CPU SIMD 不再重要——这是**完全错误**的判断。\n\nLLM 推理服务从收到 HTTP 请求到第一个 token 输出，CPU 要做：`HTTP parse → JSON validate → tokenize → schedule → batch pack → H2D copy → GPU prefill → first token`。**前 5 步全在 CPU 上，全是 SIMD 高度适用的形态。**\n\n| AI Infra 场景 | SIMD 友好度 | 不向量化的代价 | 典型加速 |\n|---|---|---|---|\n| Tokenizer byte-level scan | 极友好 | prefill 多 5–10ms | 3–5x |\n| UTF-8 / JSON validation | 极友好 | input pipeline 瓶颈 | 5–10x |\n| bf16 / fp16 ↔ fp32 解码 | 极友好 | model load/save 慢 | 4–8x |\n| 采样后处理（top-k, temperature） | 友好 | 每 token 多 μs | 2–4x |\n| KV cache layout 转置 | 极友好 | H2D 拷贝慢 | 3–5x |\n| CPU-only 推理（边缘/cold start） | 极友好 | 推理慢 5–10x | 5–15x（VNNI/AMX）|\n\n**决策规则**：如果 host-side 占端到端延迟 > 20%，CPU SIMD 是高 ROI 的优化方向。GPU 利用率只能告诉你「GPU 在不在工作」，不能告诉你 host-side 瓶颈在哪。",
+        "tip": "在进行 SIMD 优化之前，先确认瓶颈不在 cache miss 或 branch miss。如果 LLC miss 或 topdown-be-bound 主导，先改数据布局，再做 SIMD；否则只是把闲置的标量流水线换成了同样闲置的宽流水线。"
+      },
+      {
+        "title": "用 perf 检查 SIMD 是否真正生效",
+        "body": "「我以为代码向量化了，到底向量化没有？」最直接的方法是看 SIMD retired counter。\n\n**Intel CPU 浮点 SIMD 计数**：\n`perf stat -e fp_arith_inst_retired.scalar_single,fp_arith_inst_retired.256b_packed_single,fp_arith_inst_retired.512b_packed_single -- ./workload`\n\n如果期望 AVX2 但 `256b_packed_single = 0`，说明 dispatch 选错路径或编译器没有向量化。\n\n**整数 SIMD（更适合 tokenizer）**：用 `perf record + perf annotate`，直接查看汇编中是否出现 `vpcmpeqb`、`vmovdqu`、`vpmovmskb` 等 SIMD 指令。\n\n| 检查项 | 命令 | 预期信号 |\n|---|---|---|\n| 浮点 SIMD 是否生效 | `fp_arith_inst_retired.256b/512b_*` | counter > 0 |\n| AVX-512 降频影响 | `core_power.lvl2_turbo_license` | 占比 < 5% |\n| 自动向量化是否成功 | `gcc -fopt-info-vec` | 热点循环 vectorized |\n| Runtime dispatch 选对没 | 加日志 + cpuid 检测 | 与预期 ISA 一致 |\n\n**CI 保护建议**：加「SIMD 路径未退化」的回归测试——断言 256b/512b counter 占比超过阈值。升级编译器或改 build flag 时，向量化路径可能 silently 退回 scalar，没人发现直到生产变慢。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "SIMD 指令的核心性能收益来自哪里？",
+        "options": [
+          "单条 SIMD 指令的执行速度比标量指令快 N 倍（N 为 lane 数）",
+          "SIMD 可以消除 cache miss，让数据访问更快",
+          "前端开销（取指、译码、rename）被摊薄：一条指令处理 N 个元素，但前端开销只算一次",
+          "SIMD 自动并行化控制流，消除了分支预测失败"
+        ],
+        "answer": 2,
+        "explain": "单条 SIMD 指令（如 `vaddps ymm`）的 latency 和 throughput 与标量指令接近，单个元素并没有「变快」。收益在于前端摊薄：取指、译码、ROB 占用都按「一条指令」算，但同时处理了 8 个（AVX2）或 16 个（AVX-512）元素。这就是「前端带宽利用率提升 N 倍」的来源。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种代码模式最适合 SIMD 向量化？",
+        "options": [
+          "链表遍历，每个节点做不同的条件处理",
+          "哈希表查找，每次查找的 key 不同",
+          "对连续 float 数组做 scale-and-clip：`out[i] = clamp(in[i] * scale, lo, hi)`",
+          "状态机字符串解析，每个字符可能跳转到不同状态"
+        ],
+        "answer": 2,
+        "explain": "SIMD 最适合「同一操作批量处理连续数据」：scale-and-clip 对每个元素执行相同操作（乘以 scale，再 clamp），数据连续，控制流可以转换为 `min/max` mask 操作，编译器通常能自动向量化（加 `__restrict__` 后）。链表遍历、哈希查找、状态机都有指针追逐或数据依赖，SIMD 帮不上忙。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 Skylake 时代的服务器上，偶尔调用一个使用 AVX-512 的 helper 函数，可能导致全程序的标量代码也跑在降频状态下。",
+        "answer": true,
+        "explain": "这正是 Skylake 的 power license 机制。执行 AVX-512 重指令后，整个 core 进入 License 2（低频档位）。即使 AVX-512 指令已经执行完，升回最高频率需要等数百微秒到 ~2ms。期间所有标量/SSE 代码也在低频运行，所以「偶尔调用」AVX-512 helper 可能反而拖慢了整体性能。Ice Lake 之后这个问题大幅缓解。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 SIMD 自动向量化失败的原因与对应解决方案配对：",
+        "left": ["函数参数指针可能 alias（重叠）", "循环体内有 if/else 分支", "跨迭代数据依赖（`a[i] = f(a[i-1])`）", "循环内调用了未内联的外部函数"],
+        "right": ["强制 inline 或改用 intrinsic 实现", "转换为 select/mask 操作，去掉控制流", "算法重写，改用 prefix scan 等并行算法", "加 `__restrict__` 关键字声明无重叠"],
+        "explain": "alias 问题加 `__restrict__` 解决；if/else 通过转 mask/select 模式解决；跨迭代依赖需要算法重写（如 scan）；函数调用阻止向量化需要 inline 或改用 intrinsic。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ARM SVE（Scalable Vector Extension）相比 ARM NEON 最大的创新是什么？",
+        "options": [
+          "SVE 支持更多种类的浮点数据类型，包括 bf16 和 fp8",
+          "SVE 寄存器宽度由硬件决定（128–2048 bit），程序可以不依赖具体宽度编写（VLA 模型）",
+          "SVE 有更多寄存器（32 个 vs NEON 的 16 个），减少 spill",
+          "SVE 自动向量化比 NEON 更智能，不需要手写 intrinsics"
+        ],
+        "answer": 1,
+        "explain": "SVE 的核心创新是 VLA（Vector Length Agnostic）编程模型：程序员写一套代码，硬件寄存器宽度可以是 128/256/512/2048 bit，程序用 predicate 寄存器（p0–p15）处理尾部，无需为不同宽度重新编译。同一份 SVE 代码在 Graviton 3（256-bit）和 Fugaku（512-bit）上都能跑，且自动利用更宽的硬件。"
+      },
+      {
+        "type": "input",
+        "prompt": "AVX-512 的 zmm 寄存器宽度是 512 bit。它一次能处理多少个 fp32 元素？（填数字）",
+        "accept": ["16", "16 个", "16 个 fp32"],
+        "explain": "fp32 是 32 bit，512 / 32 = 16。所以一条 `vaddps zmm` 指令可以同时做 16 个 fp32 加法。相比之下，AVX2 的 ymm（256 bit）每次处理 8 个，SSE（128 bit）每次处理 4 个。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 GPU 主导的 LLM 推理服务中，CPU 端的 SIMD 优化对端到端延迟的影响可以忽略不计。",
+        "answer": false,
+        "explain": "这是常见误解。LLM 推理从收到请求到输出第一个 token，host-side CPU 需要完成 HTTP 解析、JSON 验证、tokenize、schedule、batch packing 等步骤，通常占端到端延迟的 20–40%。tokenizer 没有 SIMD ASCII 快速路径时，长 prompt 可能额外增加 5–10ms，这对 TTFT（Time To First Token）有直接影响，也会影响 GPU 利用率（host 准备不及时则 GPU intermittently idle）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某 tokenizer 优化后 `perf stat` 显示 `fp_arith_inst_retired.256b_packed_single = 0`，但工程师以为已经开启了 AVX2 向量化。最可能的原因是什么？",
+        "options": [
+          "tokenizer 不处理浮点数，所以 fp 计数器为 0 是正常的，整数 SIMD 不在这个计数器里",
+          "256-bit SIMD 指令需要特殊 OS 权限才能使用",
+          "编译器向量化依赖 AVX-512 而非 AVX2",
+          "tokenizer 的数据量太小，SIMD 没有收益"
+        ],
+        "answer": 0,
+        "explain": "`fp_arith_inst_retired.*` 系列计数器只统计**浮点**运算（scalar/packed fp32/fp64）。tokenizer 主要做字节处理（byte 扫描、字符比较），使用的是**整数** SIMD 指令（`vpcmpeqb`、`vpmovmskb`、`vpshufb` 等）。整数 SIMD 不在 fp 计数器里，应该用 `perf annotate` 查看汇编是否有 `vp*` 指令，或者用 port 计数器（如 `uops_dispatched_port.port_5`）来验证。"
+      }
+    ]
+  }
+]

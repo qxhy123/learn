@@ -1,0 +1,147 @@
+[
+  {
+    "id": "u6c5",
+    "title": "vLLM 内部机制深入",
+    "subtitle": "PagedAttention 实现、调度循环、prefix cache 与多机并行的工程内核",
+    "intro": [
+      {
+        "title": "vLLM 究竟在解决什么问题",
+        "body": "很多人把 `vLLM` 当成「OpenAI API 的开源替代品」来用，但这会让很多参数显得像黑魔法。更准确的比喻是：**vLLM 是 GPU 上的操作系统**——它管理的不是 CPU 进程，而是「在共享 KV Cache 池上动态运行的推理请求」。\n\n它真正面对的不可化简问题只有一句话：**在显存有限的前提下，让动态长度、动态到达的请求在共享 KV Cache 池上达到最高 token 吞吐，并保持 TTFT/TPOT 可控。**\n\n每个限定词都对应一类工程约束：「显存有限」意味着权重、KV、激活、CUDA workspace 共用同一块 HBM；「动态长度」意味着无法用静态 batch 预分配；「共享 KV Cache 池」意味着相同 prefix 的 KV 必须被多请求复用。\n\nvLLM 的整体分层是：**调度内核（Scheduler + BlockManager）→ 模型执行（Worker + ModelRunner）→ 服务外壳（API Server + Metrics）**。理解这三层，才能解释为什么改一行参数会让吞吐差 2 倍。"
+      },
+      {
+        "title": "PagedAttention：Block Table 与物理 KV 映射",
+        "body": "`PagedAttention` 的本质不是新的注意力数学公式，而是 **KV Cache 的分页寻址方案**：把 KV Cache 切成固定大小的 `block`（默认 16 token），用 `block_table` 间接寻址，让请求按需申请、按需释放。\n\n每个 `Sequence` 持有一个 `block_table: List[int]`——逻辑 block id 到物理 block id 的映射。Attention kernel 在 forward 时「跳着读」KV 池，这就是 PagedAttention kernel 的核心循环。\n\n`BlockManager` 维护三个关键状态：\n- `free_block_list`：O(1) 分配和释放\n- `ref_count`：单独占有=1，prefix 共享=N，归零时回收\n- `block_hash → physical_block_id`：prefix cache 的查找表\n\n**CoW（写时复制）**：当一个共享 prefix block 需要分叉写新 token 时，从 free list 取新 block，原 block 的 ref_count 减 1。这是 prefix cache 安全性的核心保障。\n\n**block_size 为什么默认是 16？** 太小（4/8）则 block table 过长、kernel 跳读次数多；太大（32/64）则尾部碎片增大、prefix 命中粒度变粗。16 是当前主流 attention kernel 访存效率的最优点，**不要随意修改**。",
+        "tip": "把 block_size 改成 1「碎片为零」是反模式——block table 暴涨，attention 访存失效，吞吐可能掉 80%。"
+      },
+      {
+        "title": "Continuous Batching 调度循环：每一步的决策",
+        "body": "vLLM 的 step 循环是引擎心跳。**Scheduler 每 step 同时处理**：新请求 admission、正在 prefill 的 chunk 推进、正在 decode 的 token 推进、KV 不足时的 preemption、被抢占请求的 swap/recompute 恢复。\n\n**Token Budget 机制**：`max_num_batched_tokens` 是每 step 的 token 总上限。prefill chunk token 数 + decode token 数（每个 active sequence 算 1）之和不得超过这个 budget。\n\n| 工作模式 | token 组成示例（budget=8192） |\n|---|---|\n| 纯 decode 高并发 | 256 seqs × 1 = 256，远低于 budget |\n| 纯 prefill 冷启动 | 1 个 8K prompt = 8192，刚好填满 |\n| 典型混合 | prefill chunk 6144 + decode 2048 = 8192 |\n\n**Preemption 策略**：当 BlockManager 报告 block 不足，Scheduler 优先抢占最年轻的请求。先尝试 `swap`（KV 拷到 CPU，需要 `swap_space` 配置）；CPU 内存不足时做 `recompute`（丢弃 KV，重新 prefill，prefix cache 会救回大部分计算）。\n\n`preemption_count` 持续飙高通常意味着 `max_num_seqs` 或 `gpu_memory_utilization` 设得太激进。",
+        "reveal": {
+          "q": "active decode 有 200 个 sequence，max_num_batched_tokens=4096，新来一个 5000 token 的 prompt，这一步的 prefill chunk 最多多少 token？",
+          "a": "4096 - 200 = 3896 token。prefill chunk 大小 = budget - active_decode_count，剩余 budget 分配给 prefill。"
+        }
+      },
+      {
+        "title": "Hash-based Prefix Cache：命中条件与 Eviction",
+        "body": "vLLM 的 `prefix cache` 不需要请求显式声明前缀——**任何两个请求只要 token id 序列前缀相同，就能自动命中**。\n\n**Hash 算法**：每个 block 的 hash = `hash(前一个 block 的 hash, 当前 block 的 16 个 token id)`。这保证 hash 序列相同 ⟺ token id 前缀完全一致。\n\n**Eviction 策略**：ref_count 降到 0 的 block 不立刻释放，而是进入「evictable」状态，hash 仍然保留。只有 free list 耗尽时，才按 LRU 真正释放。这让「刚完成的请求」的 KV 仍可为后续相同 prefix 的请求所用。\n\n| 场景 | 典型命中率 |\n|---|---|\n| 多租户共享 system prompt | 80–95% |\n| 多轮对话 | 60–80% |\n| RAG 模板 | 50–80% |\n| 完全独立短问答 | < 5% |\n\n**命中失效的常见原因**：prompt 模板中插入了请求 id 或时间戳；tokenizer 版本升级；多副本随机路由（相同 prefix 打到不同副本）；多 LoRA 场景（LoRA id 也参与 hash）。\n\n生产必须把 **prompt 模板作为 versioned artifact 管理**，任何版本变更都会让 prefix cache 命中率归零。"
+      },
+      {
+        "title": "Chunked Prefill：长 prompt 切片与混合 batch",
+        "body": "`chunked prefill` 的核心思想：**不让任何单次 forward 被长 prompt 独占**。长 prompt 按调度器的剩余 token budget 切片，每片和当前活跃 decode 一起进 batch。\n\n注意：**vLLM 内部没有显式的 `chunk_size` 参数**。实际 chunk 大小由 Scheduler 动态计算：`chunk = max_num_batched_tokens - sum(active_decode_count)`。活跃 decode 越多，chunk 越小。\n\n| 指标 | Non-chunked | Chunked |\n|---|---|---|\n| 长 prompt prefill 期间 decode 请求 ITL | 被独占，可能停顿数秒 | 每步正常推进 |\n| 短 prompt 的 TTFT | 被长 prompt 阻塞 | 几乎不受影响 |\n| 长 prompt 自身 TTFT | 一次 forward 完成 | 略高（分多步）|\n| 整体 goodput | 长 prompt 拖累整池 | 显著提升 |\n\nchunked prefill 要求 attention backend 支持 variable-length prefill + decode 混合 batch kernel（即 FlashAttn-2 的 varlen 接口）。",
+        "tip": "如果服务全是短 prompt（< 1024 token）且 decode 很少，chunked prefill 反而引入额外 schedule 开销，可以关闭。"
+      },
+      {
+        "title": "Speculative Decoding：三种 Draft 实现路径",
+        "body": "`speculative decoding`（投机解码）的核心：用便宜的 draft 路径一次预测 k 个候选 token，再用目标模型一次 verify k 个——被接受的 token 都是「免费」的（共享同一次 target forward）。\n\nvLLM 通过 `SpecDecodeWorker` 支持三种 draft 实现：\n\n| 维度 | Draft Model | Medusa | EAGLE |\n|---|---|---|---|\n| 是否需要额外训练 | 通常用现成小模型 | 需训练 Medusa head | 需训练 EAGLE 小网络 |\n| 显存开销 | 较高（独立权重）| 中（多 head）| 低（小网络）|\n| Acceptance rate | 60–80% | 60–80% | 70–90% |\n| 成熟度 | 高 | 中 | 实验性 |\n\n**何时不适合**：高并发（batch > 32）时，target verify 使 batch 总 token 翻倍，会撑爆 token budget，可能导致吞吐反而下降。短输出（< 100 token）收益也很小。\n\n上线前必须监控 `acceptance_rate`、`draft_tokens_per_step`、`verify_tokens_per_step`。speculative decoding 与 `chunked prefill`、`prefix cache` 是正交机制，但与 `guided decoding` 有耦合——grammar 约束会让 draft 和 target 分布发散，acceptance rate 大幅下降。"
+      },
+      {
+        "title": "TP / PP / EP：vLLM 的多卡拓扑",
+        "body": "vLLM 通过 `--tensor-parallel-size`（TP）、`--pipeline-parallel-size`（PP）、`--expert-parallel-size`（EP）支持任意拓扑组合。Worker 进程数 = TP × PP（MoE 层还乘 EP）。\n\n| 拓扑 | 适用场景 | 通信开销 | 主要代价 |\n|---|---|---|---|\n| TP=2–8 单机 | 7B–200B | NVLink all-reduce，每层 1 次 | 受单机 GPU 数限制 |\n| PP=2 + TP=4 单机 | 单机 KV 装不下 | NVLink send/recv | 引入 pipeline bubble |\n| TP=8 跨机 | 200B+ | IB all-reduce，较慢 | 每层延迟放大 |\n| EP（MoE） | DeepSeek/Mixtral 等 | all-to-all token 路由 | all-to-all 是新瓶颈 |\n\n70B 模型 80 层 ≈ 每次 forward 160 次 all-reduce（每层 attention 后 1 次 + MLP 后 1 次）。NVLink 单次约 30 μs，跨机 IB 约 200 μs 起。**跨机 TP 通常不推荐**，除非模型实在装不下；优先 TP=8 单机 + PP 跨机。\n\nWorker 必须严格同步 step：任何一个 Worker 慢（如 NCCL 抖动），整个 step 都会卡。生产上要监控 TTFT/TPOT 的 **P99 分布**而非均值。",
+        "tip": "跨机 TP 把每层的 all-reduce 延迟放到 IB 级别，200 μs × 160 层 = 32 ms 纯通信开销，通常得不偿失。"
+      },
+      {
+        "title": "量化与 V1 引擎：机制正交与零 Python overhead",
+        "body": "**量化的集成方式**：vLLM 把量化封装成 Linear 层的不同实现，`QuantizationConfig` 在模型加载时决定每层走哪个 backend。Scheduler、BlockManager、Sampler 完全不感知量化，只有 `AttentionBackend` 在 KV 量化时有耦合（需要 kernel 支持 on-the-fly dequant）。\n\n这种「机制正交」设计让同一份调度代码可以同时服务 BF16、AWQ、GPTQ、FP8——只需切换 Linear backend。\n\n**V1 引擎**的核心目标是消除「Python overhead」：V0 每 step 的 Python 调度开销约 5–10 ms；当 decode step 本身只需 30 ms 时，Python 开销占了 20–30%。V1 通过异步 step + EngineCore 子进程 + `torch.compile` + CUDA graph 捕获，把 Python 开销压到 < 1 ms。\n\n| 维度 | V0 | V1 |\n|---|---|---|\n| Engine 循环 | 同步 step，Python 主导 | 异步 + EngineCore 子进程 |\n| Scheduler | 单文件大类，有 O(N) 操作 | 拆分队列，O(active) |\n| Block Manager | 多种实现 | 统一 + hash prefix |\n| Sampler | Python 循环 | torch.compile + CUDA graph |\n\n高并发场景下，V1 相对 V0 吞吐提升常达 30–80%，ITL P99 更稳定。"
+      },
+      {
+        "title": "调优决策与典型易错点",
+        "body": "**调优心法：一次只动一个参数，每次对比 6 个核心指标**：throughput tokens/s、TTFT P99、TPOT P99、prefix hit rate、preemption count、KV cache usage。\n\n| 现象 | 首先定位 | 常见原因 | 调整动作 |\n|---|---|---|---|\n| TTFT P99 突然升高 | prefill 或 admission | 长 prompt burst、prefix cache 失效 | 降 `max_num_batched_tokens`，prefix-aware routing |\n| TPOT P99 抖动 | decode iteration | `max_num_seqs` 过高、KV 逼近上限 | 降 `max_num_seqs`，增 KV 预算 |\n| preemption 持续增长 | BlockManager 容量 | admission 太激进，输出长度被低估 | 降并发，KV FP8/INT8，限 max output |\n| prefix hit rate 从 80% 掉到 5% | prefix cache | 模板插入了 request id，tokenizer 升级 | 模板版本化，固定 tokenizer，按 prefix 路由 |\n\n**典型反模式**：看到 preemption 就直接把 `gpu_memory_utilization` 调到 0.98——这会把「偶发抢占」变成「CUDA workspace OOM」。正确做法是先用 KV 预算算清楚，再决定是降并发、降上下文、压 KV 还是加副本。\n\n量化是调优的最后一步，因为它改变模型版本，影响发布、回滚和质量评估流程。前面的 runtime 参数调优都不改模型权重。",
+        "reveal": {
+          "q": "spec decode 开启后 throughput 反而下降 15%，但 acceptance_rate 显示 78%，为什么？",
+          "a": "高并发下，target verify 把 batch 总 token 数翻倍，撑爆了 token budget，导致其他请求等待时间上升，整体 goodput 下降。78% acceptance rate 本身不低，问题是并发规模让 verify 的 overhead 超过了多 token 的收益。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "`vLLM` 的 `PagedAttention` 解决的核心工程问题是什么？",
+        "options": [
+          "引入新的注意力数学公式，降低注意力计算的时间复杂度",
+          "将 KV Cache 切成固定大小的 block，用 block table 间接寻址，消除显存碎片并支持 prefix 复用",
+          "把 prefill 和 decode 阶段分离到不同 GPU，实现 P/D 解耦",
+          "用 INT4 压缩 KV Cache，降低显存占用"
+        ],
+        "answer": 1,
+        "explain": "PagedAttention 是 KV Cache 的分页寻址方案，不涉及注意力数学。它把 KV Cache 切成固定 block，用 block_table 间接寻址，解决显存碎片并支持 prefix 复用（多请求共享 ref_count > 1 的 block）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "vLLM 的 hash-based prefix cache 命中只需要两个请求的语义相似，不要求 token id 完全一致。",
+        "answer": false,
+        "explain": "prefix cache 是基于 token id 序列的 hash，要求 token id 完全一致才能命中。tokenizer 版本、add_special_tokens 设置、prompt 中插入时间戳/uuid 都会导致 hash 不同，命中率归零。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`max_num_batched_tokens=4096`，当前 active decode 有 3000 个 sequence，新到一个 6000 token 的 prompt。这一步 prefill chunk 最多多少 token？",
+        "options": [
+          "4096",
+          "3000",
+          "1096",
+          "6000"
+        ],
+        "answer": 2,
+        "explain": "每个 active decode sequence 占 1 个 token，3000 个 sequence 占 3000 token。剩余 budget = 4096 - 3000 = 1096，所以 prefill chunk 最多 1096 token。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 vLLM 的核心机制与其解决的问题匹配：",
+        "left": [
+          "PagedAttention block table",
+          "Chunked prefill",
+          "Hash-based prefix cache",
+          "Speculative decoding"
+        ],
+        "right": [
+          "相同 token id 前缀的 KV block 被多请求复用",
+          "长 prompt 切片与 decode 混合，避免独占 forward",
+          "draft 预测 k 个候选，target 一次 verify，低并发下降低延迟",
+          "KV Cache 分页寻址，消除显存碎片"
+        ],
+        "explain": "PagedAttention block table → KV 分页寻址消除碎片；Chunked prefill → 长 prompt 切片避免独占；Hash-based prefix cache → 相同前缀 KV 复用；Speculative decoding → draft+verify 低并发降延迟。"
+      },
+      {
+        "type": "choice",
+        "prompt": "vLLM 的 preemption（抢占）发生时，`swap` 和 `recompute` 两种策略分别适合什么场景？",
+        "options": [
+          "swap 适合长输出低 prefix 命中，recompute 适合长 prompt 高 prefix 命中",
+          "swap 适合高 prefix 命中，recompute 适合低 prefix 命中",
+          "两者效果相同，只是 swap 需要额外 CPU 内存",
+          "recompute 只能在 V1 引擎中使用"
+        ],
+        "answer": 0,
+        "explain": "swap 把 KV 拷到 CPU 内存，恢复代价是几十 ms PCIe 拷贝——适合短 prompt 长输出（重算成本高）且 CPU 内存够的场景。recompute 丢弃 KV 重新 prefill，适合长 prompt 短输出且 prefix cache 命中率高（能压缩重算成本）的场景。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 vLLM 中，开启 speculative decoding 后吞吐一定会提升，因为 acceptance rate 高意味着每步生成更多 token。",
+        "answer": false,
+        "explain": "高并发下，target verify 使 batch 总 token 数翻倍，可能撑爆 token budget，导致其他请求等待时间上升，整体 goodput 下降。speculative decoding 主要适合低并发长输出场景，高并发（batch > 32）时可能反效果。"
+      },
+      {
+        "type": "input",
+        "prompt": "vLLM `block_size` 的默认值是多少（token 数）？",
+        "accept": ["16"],
+        "explain": "vLLM 默认 block_size=16 token。16 是当前主流 attention kernel 访存效率的最优点：既不会让 block table 过长（4/8 的问题），也不会造成尾部碎片过大（32/64 的问题）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "vLLM V1 引擎相对 V0 最核心的改进是什么？",
+        "options": [
+          "引入了新的量化算法，支持更低精度的模型",
+          "把 Scheduler 改成了 FIFO 策略，简化了调度逻辑",
+          "通过异步 step + EngineCore 子进程 + CUDA graph 捕获，将 Python 调度开销从 5–10 ms 压到 < 1 ms",
+          "把 Worker 改成了 Ray Actor，支持跨机弹性扩缩容"
+        ],
+        "answer": 2,
+        "explain": "V1 的核心目标是消除 Python overhead。V0 每 step Python 开销约 5–10 ms，在 decode step 本身只需 30 ms 时占 20–30%。V1 通过异步 step + EngineCore 子进程 + torch.compile + CUDA graph 把这部分压到 < 1 ms，高并发下吞吐提升 30–80%。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 vLLM 中，量化（AWQ/GPTQ/FP8）会改变 Scheduler 的 token budget 计算逻辑，因为量化模型的 KV 大小不同。",
+        "answer": false,
+        "explain": "vLLM 的「机制正交」设计使 Scheduler 完全不感知量化。token budget 计算逻辑不变，量化只影响 Linear 层的实现（通过 QuantizationConfig 切换 backend）。KV Cache 量化（如 FP8 KV）影响的是 AttentionBackend，不影响 Scheduler。"
+      }
+    ]
+  }
+]

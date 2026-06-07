@@ -1,0 +1,128 @@
+[
+  {
+    "id": "u3c13",
+    "title": "Stream、同步与 CUDA Graph",
+    "subtitle": "命令排队、依赖表达、overlap 与回放",
+    "intro": [
+      {
+        "title": "不可化简的问题",
+        "body": "CPU、GPU copy engine、GPU compute engine 和通信引擎在不同时间尺度上工作。没有明确的命令排序和依赖表达机制，系统既无法保证数据正确，又无法让可并行的搬运、计算和通信真正重叠。\n\n三个硬约束：\n\n1. **命令不是立即完成**：`cudaMemcpyAsync`、kernel launch、NCCL collective 通常只是把工作提交到设备队列，CPU 很快返回，GPU 稍后执行。代码里的顺序不等于设备完成的顺序\n2. **数据依赖必须被表达**：H2D 未完成就读目标 buffer → 未定义行为；backward 未完成就 allreduce → 错误数据\n3. **正确性和性能天然冲突**：最安全的做法是每步 `cudaDeviceSynchronize()`，但会把所有并行拉成串行。高性能做法是只同步必要边界"
+      },
+      {
+        "title": "Stream：命令队列，而非 GPU 独占通道",
+        "body": "stream 是 GPU 侧的命令队列：**同一个 stream 内的命令按提交顺序执行，不同 stream 的命令在依赖和硬件允许时可以并发**。\n\n不同 stream 能否真正重叠，还取决于：\n- H2D 是否来自 pinned host memory\n- 是否用 async/non-blocking 语义提交\n- GPU 是否有可用 copy engine\n- 两个 stream 之间是否有默认 stream 或 event 依赖\n- 代码中是否有 `.item()`、`synchronize()`、D2H 同步点\n\n| 规则 | 含义 |\n|---|---|\n| 同一数据的生产者/消费者必须有依赖 | copy 完才能 compute |\n| 不相关工作才适合放不同 stream | 下个 batch H2D 与当前 batch compute 可重叠 |\n| 多 stream 不是越多越好 | 有调度和依赖管理成本 |\n| 必须用 profiler 验证 | 写成异步不代表真的重叠 |"
+      },
+      {
+        "title": "默认 Stream 与隐式同步",
+        "body": "默认 stream 的语义经常被低估：在 legacy 模式下，默认 stream 与其他 blocking stream 有较强顺序约束，容易把多 stream 工作意外串行化。框架通常封装了细节，但手写 CUDA、混用第三方库时要特别注意。\n\n**等待点的工程原则**：\n\n```\n1. side stream 提前搬 next_batch\n2. current stream 继续算 current_batch\n3. 到真正使用 next_batch 前，current stream 才 wait copy_stream\n```\n\n**等待要靠近消费点，而不是靠近生产点。**\n\n**隐式同步来源**：\n\n| 写法 | 为什么同步 |\n|---|---|\n| `loss.item()` | GPU 标量需要搬到 CPU |\n| `tensor.cpu()` / `tensor.numpy()` | D2H 需要等待前序写入 |\n| `print(gpu_tensor)` | 打印需要 CPU 读取内容 |\n| `if tensor_bool:` | Python 分支需要 CPU bool |\n| `torch.cuda.synchronize()` | 显式全设备等待 |\n| `CUDA_LAUNCH_BLOCKING=1` | 每个 launch 变成阻塞 |",
+        "tip": "训练日志里每 step `loss.item()` 可能让 CPU 等 backward、optimizer、所有已排队 kernel 完成，然后才继续提交下一 step。一行日志可能把流水完全拉平。"
+      },
+      {
+        "title": "Event：局部依赖替代全局等待",
+        "body": "event 是记录在某个 stream 上的完成标记。另一个 stream 等待这个 event，只等「记录 event 之前的工作完成」，不是等整个 GPU 空下来。\n\n| 同步方式 | 等待范围 | 适合场景 |\n|---|---|---|\n| `cudaEventRecord` + `cudaStreamWaitEvent` | 某个 stream 上 event 之前的工作 | 跨 stream 数据依赖 |\n| `stream.wait_stream(other)` | other stream 已提交的前序工作 | PyTorch 中简单跨 stream 等待 |\n| `cudaStreamSynchronize(stream)` | CPU 等某个 stream 完成 | 必须拿到该 stream 结果 |\n| `cudaDeviceSynchronize()` | CPU 等整个设备完成 | benchmark 边界、退出前清理 |\n\n**overlap 效率公式**：\n```\nserial_time = t_h2d + t_compute + t_comm\nideal_time = max(t_h2d, t_compute, t_comm)\noverlap_efficiency = (serial_time - measured_time) / (serial_time - ideal_time)\n```\n\noverlap_efficiency ≤ 0 说明仍接近串行，先查 pinned memory、non_blocking、copy stream 和等待点位置。"
+      },
+      {
+        "title": "H2D/compute/NCCL Overlap 的必要条件",
+        "body": "**H2D/compute overlap 的必要条件**：\n\n| 条件 | 失败表现 |\n|---|---|\n| host batch 在 pinned memory | `non_blocking=True` 但 H2D 仍阻塞 |\n| H2D 使用 async/non-blocking | CPU 期间卡住 |\n| copy 与 compute 不在同一串行队列 | 时间线上 H2D 和 kernel 轮流出现 |\n| 消费前有 event/wait | 偶发错误或脏数据 |\n| 等待点靠近消费点 | 过早 wait 导致串行 |\n| 没有隐式同步 | 每 step 固定空洞 |\n\n**NCCL/compute overlap**（DDP）：\n- backward 产生某 bucket 的 gradient 后，立即在 NCCL stream 上启动 allreduce\n- 同时 compute stream 继续算更早层的 backward\n- bucket 不合理影响 overlap：bucket 太大 → 通信启动太晚；太小 → NCCL launch 太碎\n\n**DDP 中全局 synchronize 的陷阱**：在 hook 里加 `torch.cuda.synchronize()` 会把所有 backward 等完才继续 NCCL，overlap 消失。应用 event/框架 hook 的 ready 语义表达局部依赖。"
+      },
+      {
+        "title": "CUDA Graph：把重复命令序列变成可回放 DAG",
+        "body": "CUDA Graph 主要解决**重复 launch 序列的 CPU 提交开销**，不改变单个 kernel 的数学实现：\n\n**工作流**：warmup → capture → instantiate → replay（循环）→ fallback/recapture\n\n**static buffer 是关键**：replay 复用捕获时的操作、依赖和内存地址。因此 kernel 参数指向的 tensor 地址必须稳定：\n\n```python\n# capture 前 warmup，确保 allocator、autotune 已稳定\ng = torch.cuda.CUDAGraph()\nwith torch.cuda.graph(g):\n    static_y = model(static_x)\n\ndef run(x):\n    static_x.copy_(x)  # 复制数据到固定地址\n    g.replay()          # 低开销回放\n    return static_y\n```\n\n**static buffer 的代价**：常驻显存更高，生命周期更复杂，调试栈不如 eager 直观。\n\n**动态 shape 的限制**：shape 变化意味着 kernel 参数、临时 buffer 大小、控制流路径都可能不同，Graph 无法直接复用。",
+        "tip": "CUDA Graph 不是「开关优化」。需要配合 shape bucket（为常见 shape 各 capture 一个 graph）、fallback 策略（长尾 shape 走 eager）和显存容量规划，才能在生产中稳定使用。"
+      },
+      {
+        "title": "动态 Shape、Fallback 与生产监控",
+        "body": "LLM 推理中 decode 阶段每步 token 很少，Graph 收益明显；但请求 shape 是动态的。常见折中：\n\n```\nbatch bucket: 1, 2, 4, 8, 16, 32\nseq bucket:   128, 256, 512, 1024\n请求 → 选最接近的 bucket → pad → replay 对应 graph\n```\n\n**生产必须监控的指标**：\n\n| 指标 | 异常信号 |\n|---|---|\n| Graph replay 命中率 | shape 长尾过多，bucket 不合理 |\n| Graph capture / recapture 次数 | 线上频繁 recapture |\n| fallback eager 比例 | 新模型路径未覆盖 |\n| static buffer 显存成本 | bucket 过多导致容量下降 |\n| per-step synchronize 次数 | debug 代码进入生产 |\n\n**最危险的场景**：线上遇到新 shape 时在请求线程里同步 recapture → P99 抖动。应事先设计 fallback 路径：少见 shape 走 eager，不在线 recapture，并告警。\n\n**debug/生产边界**：debug 可以关闭 Graph 用 eager，但必须有明确开关；生产使用 Graph 必须有可观测的回退边界。",
+        "reveal": {
+          "q": "某推理服务启用 CUDA Graph 后 P50 延迟下降 18%，但 P99 升高。从 shape bucket、static buffer、fallback/recapture 三个维度分析可能原因。",
+          "a": "1. shape bucket 命中率低：请求 shape 长尾多，大量请求未命中任何 bucket 而走 fallback，fallback 路径未优化导致 P99 高。2. static buffer 显存增加：为多个 bucket 常驻 buffer，显存压力上升，可能触发 allocator 碎片或 OOM，增大 P99 尾巴。3. recapture 抖动：遇到新 shape 时在请求线程触发 recapture（可能耗时百毫秒级），导致这些请求 P99 飙高。修复：只为高频 bucket 捕获 graph；长尾 shape 明确走 eager fallback，不在线 recapture；调度层把相近 shape 合批提高命中率。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "CUDA stream 的核心排序语义是？",
+        "options": [
+          "同一 stream 的命令并发执行，不同 stream 的命令串行执行",
+          "同一 stream 内命令按提交顺序执行，不同 stream 的命令在资源允许时可并发",
+          "stream 是 CPU 线程的别名，每个线程有一个专属 GPU 通道",
+          "stream 会阻止 GPU scheduler 并发调度多个 block"
+        ],
+        "answer": 1,
+        "explain": "stream 是命令队列：同 stream 内有序，跨 stream 在依赖和硬件资源允许时可重叠。它不是 CPU 线程，不保证独占 GPU，也不直接控制 SM 内部调度。能否真正并发还取决于 pinned memory、non_blocking、copy engine 可用性和是否有隐式同步。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 `torch.cuda.synchronize()` 在每个 train_step 结束时计时，可以准确测量 GPU 的执行时间而不影响训练 overlap。",
+        "answer": false,
+        "explain": "`torch.cuda.synchronize()` 等待整个设备完成，会破坏 H2D/compute/NCCL 之间的 overlap。它适合在 benchmark 边界（warmup 结束后、稳态采样前后）使用，不能插在生产训练循环里。正确测设备时间应使用 CUDA event（`torch.cuda.Event(enable_timing=True)`）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种写法最容易破坏 H2D/compute overlap？",
+        "options": [
+          "DataLoader 使用 `pin_memory=True`",
+          "H2D 使用 `.to(device, non_blocking=True)`",
+          "每 step `loss.item()` 并打印到日志",
+          "使用独立的 copy stream 预取下一批"
+        ],
+        "answer": 2,
+        "explain": "`.item()` 需要把 GPU 标量同步到 CPU，会等待前序所有相关 GPU 工作完成。每 step 执行一次会把 H2D/compute/NCCL 之间的异步流水拉成串行。其他三项都是提高 overlap 的正确做法。"
+      },
+      {
+        "type": "input",
+        "prompt": "H2D t=15ms，compute t=60ms，NCCL t=20ms。串行情况下 step 需要多长时间？理想 overlap 下的下界是多少？",
+        "accept": ["95", "60", "串行", "overlap", "max"],
+        "explain": "串行时间 = 15 + 60 + 20 = 95 ms。理想 overlap 时间 = max(15, 60, 20) = 60 ms。实际 measured 时间介于两者之间，overlap_efficiency = (95 - measured) / (95 - 60)。若 measured 接近 95 ms，说明 overlap 基本失败，需要排查 pinned memory、non_blocking、等待点位置。"
+      },
+      {
+        "type": "judge",
+        "prompt": "DDP 训练中，在自定义 hook 里加 `torch.cuda.synchronize()` 来「确保梯度 ready」，是一种安全且必要的做法。",
+        "answer": false,
+        "explain": "DDP 已通过 bucket ready 和 stream/event 表达梯度依赖。全局 synchronize 会把所有 backward compute 等完才继续 NCCL，overlap 消失，通信全部堆在 backward 之后。应使用 event 或框架 hook 的 ready 语义表达局部依赖，而不是全局同步。"
+      },
+      {
+        "type": "match",
+        "prompt": "将场景与最合适的同步/依赖机制匹配：",
+        "left": [
+          "benchmark 结束后采集端到端时间",
+          "copy stream 的 H2D 完成后通知 compute stream",
+          "debug 阶段定位 kernel 出错位置",
+          "检测 NCCL overlap 是否真的存在"
+        ],
+        "right": [
+          "torch.cuda.synchronize() 放在测量边界",
+          "cudaEventRecord + cudaStreamWaitEvent / stream.wait_stream",
+          "CUDA_LAUNCH_BLOCKING=1 强制同步",
+          "nsys 查看 NCCL row 与 backward compute row 是否交叠"
+        ],
+        "explain": "benchmark 边界用 synchronize；跨 stream 局部依赖用 event/wait；debug 定位错误用 CUDA_LAUNCH_BLOCKING（不能用于性能结论）；验证 overlap 用 nsys 时间线视觉确认，不能只靠代码形式判断。"
+      },
+      {
+        "type": "choice",
+        "prompt": "CUDA Graph replay 为什么要求 tensor 地址稳定（static buffer）？",
+        "options": [
+          "GPU 无法动态分配显存，必须使用固定地址",
+          "Graph 录制的 DAG 包含捕获时的设备地址，replay 时内核参数直接复用这些地址",
+          "static buffer 可以减少 kernel 内部的寄存器压力",
+          "CUDA driver 要求所有 tensor 地址必须 4KB 对齐"
+        ],
+        "answer": 1,
+        "explain": "CUDA Graph capture 把 CUDA 操作、依赖和内存地址录成 DAG。replay 时以低开销提交同一套命令，kernel 参数中的 tensor 指针直接复用捕获时的地址。若地址变化（如 allocator 分配了新块），replay 会访问错误内存。因此需要 static input/output buffer 保证地址稳定。"
+      },
+      {
+        "type": "choice",
+        "prompt": "LLM 推理服务启用 CUDA Graph 的 shape bucket 策略后，以下哪项指标应优先监控以确保 P99 不退化？",
+        "options": [
+          "单个 kernel 的 Tensor Core 利用率",
+          "Graph replay 命中率和 fallback eager 比例",
+          "每个 bucket 的 HBM 带宽利用率",
+          "NCCL allreduce 的 bucket 大小"
+        ],
+        "answer": 1,
+        "explain": "Graph replay 命中率低说明大量请求未命中 bucket 而走 fallback；fallback 比例高说明长尾 shape 未覆盖。两者直接影响 P99：命中的请求享受低 launch 开销，未命中的走未优化路径。static buffer 显存成本和 recapture 次数也要监控，但命中率是最直接的 P99 信号。"
+      }
+    ]
+  }
+]

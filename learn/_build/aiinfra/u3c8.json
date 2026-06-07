@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u3c8",
+    "title": "主机设备 IO、PCIe、NUMA 与 Overlap",
+    "subtitle": "GPU 空转往往不是算子慢，而是数据没送到",
+    "intro": [
+      {
+        "title": "核心问题：GPU 只能算设备侧数据",
+        "body": "GPU 只能计算已经进入设备侧地址空间的数据，但真实业务的数据、模型权重和预处理逻辑经常先停在 CPU、DRAM、NVMe 或远端存储里。如果这些字节不能按正确顺序、正确粒度、正确亲和性持续送到 GPU，GPU 就会空转。\n\n**第一性判断**：GPU 利用率低时，先不要改模型，先问「GPU 上一个 kernel 结束后，它在等什么」。如果在等下一个 batch 到达 HBM，问题就在本章。\n\n一条典型训练输入路径：`dataset shard → Page Cache → DataLoader worker 读取与解码 → CPU 预处理/tokenize/collate → pinned memory → H2D copy over PCIe → GPU HBM → kernel 消费`"
+      },
+      {
+        "title": "H2D 与 D2H：方向不同，工程含义也不同",
+        "body": "`H2D`（host to device）从主机内存到 GPU 显存，`D2H`（device to host）反向。它们走 PCIe，不走 HBM 内部带宽。\n\n| 方向 | 常见数据 | 典型风险 |\n|------|---------|--------|\n| H2D | 训练 batch、推理输入、模型权重 | 喂不满 GPU、冷启动慢 |\n| D2H | loss、metric、生成 token、debug tensor | 隐式同步切断流水线 |\n\n**最常见的 D2H 陷阱**不是大块回传，而是小同步：\n- `loss_value = loss.item()` → D2H + 同步\n- `print(tensor.mean())` → 可能触发同步\n- `assert torch.isfinite(loss)` → 转成 Python bool 时同步\n\n这些操作迫使 CPU 等待 GPU 完成之前的所有工作，把异步流水切断。"
+      },
+      {
+        "title": "PCIe：带宽数量级远低于 HBM",
+        "body": "PCIe 承载 H2D/D2H，但带宽数量级远低于 HBM：\n\n| PCIe 代际 | 理论单向带宽 | 直觉 |\n|-----------|------------|-----|\n| PCIe 3.0 x16 | ~16 GB/s | 旧节点，H2D 容易成瓶颈 |\n| PCIe 4.0 x16 | ~32 GB/s | A100/H100 PCIe 常见配置 |\n| PCIe 5.0 x16 | ~64 GB/s | 新一代，仍远低于 HBM TB/s 级 |\n| PCIe 4.0 x8 | ~16 GB/s | lane 降级后接近上一代 |\n\n**粗略估算**：`t_h2d_lower_bound ≈ batch_bytes / effective_pcie_bandwidth`\n\n若每 step 需要搬 1 GB 输入，PCIe 4.0 x16 理论下限约 31 ms；若 step compute 只有 40 ms，而 H2D 串行 30 ms，GPU 利用率自然上不去。\n\n检查 PCIe 协商速率：`lspci -vv`、`nvidia-smi -q`，确认 link speed/width 是否降级（x16 变 x8 或 Gen5 变 Gen4）。"
+      },
+      {
+        "title": "NUMA：物理距离决定实际带宽",
+        "body": "双路服务器中，GPU 可能挂在 socket 0 的 PCIe root complex 下，但 DataLoader worker 和 batch 内存分配在 socket 1 的 DRAM。此时 H2D 要先跨 CPU socket，再走 PCIe 到 GPU，有效带宽下降、延迟上升。\n\n**表现**：同一份代码，GPU0 和 GPU1 吞吐不一致；`pin_memory=True` 后收益不稳定；本地 NVMe 读速正常，但 batch 到达时间抖动。\n\n**排查工具**：\n- `nvidia-smi topo -m` → GPU/NIC/CPU/NUMA 距离矩阵（PIX < PXB < PHB < SYS 越来越远）\n- `numactl --hardware`、`lscpu` → socket 和内存节点分布\n- `numastat` → 远端内存页比例\n\n**修复**：用 `numactl --cpunodebind --membind` 把 worker 进程、内存分配和 NVMe 访问绑定到靠近目标 GPU 的 NUMA node。"
+      },
+      {
+        "title": "Pinned Memory：让 DMA 更稳定",
+        "body": "`pinned memory`（页锁定内存）把主机内存页固定，GPU copy engine 可以直接 DMA，不需要临时 staging buffer。PyTorch 常见写法：\n\n```python\nloader = DataLoader(dataset, pin_memory=True, ...)\nfor batch in loader:\n    batch = batch.to(\"cuda\", non_blocking=True)\n```\n\n两个条件缺一不可：1) DataLoader 输出 tensor 在 `pinned memory` 中；2) H2D 使用 `non_blocking=True`。只有前者，CPU 仍等待拷贝完成；只有后者而源不是 pinned，运行时可能退化成同步或内部 staging。\n\n**Pinned memory 不是越多越好**：锁页过多会挤压 Page Cache、其他进程，导致数据读取和系统稳定性变差。pinned memory 预算建议不超过主机 DRAM 的 20%。",
+        "tip": "8 个 GPU 进程如果每个预取 4 个 2GB batch，pinned staging 就可能锁住数十 GB DRAM，再叠加 page cache 和模型加载，很容易把主机侧拖慢。"
+      },
+      {
+        "title": "Prefetch 与 async copy：把串行改成流水线",
+        "body": "优化目标不只是缩短 `t_h2d`，而是让它与 `t_compute` 重叠。\n\n**串行训练步骤（有问题）**：CPU prepare batch N → H2D batch N → GPU compute batch N → CPU prepare batch N+1\n\n**理想流水线**：CPU prepare batch N+1 与 GPU compute batch N 并行；H2D batch N+1 与 compute batch N 晚期并行；GPU compute batch N+1 在 copy event 触发后开始。\n\n**async copy 真正生效的条件**：\n- 源 tensor 在 `pinned memory`\n- 使用 `non_blocking=True`\n- H2D 与 compute 在不同 stream 或合理排队\n- 后续 compute 等待 copy event（`stream.wait_stream()`）\n- 没有 `.item()`、`torch.cuda.synchronize()` 等隐式同步点\n- batch 足够大（太碎的小拷贝调度成本高）",
+        "reveal": {
+          "q": "某训练 t_compute=80ms，batch_bytes=1.6GB，有效 PCIe 带宽 28GB/s。串行时 step time 约为多少？开启 async overlap 后的理论下限是多少？",
+          "a": "串行时：80ms（compute）+ 约 57ms（H2D）= 约 137ms。开启 overlap 后，H2D 被 prefetch 和 copy stream 隐藏在上一个 batch 的 compute 后面，step time 可接近 max(t_compute, t_prepare, t_h2d) ≈ 80ms。"
+        }
+      },
+      {
+        "title": "GPU Direct Storage 与模型加载",
+        "body": "`GPU Direct Storage`（GDS）让 NVMe 数据更直接地进入 GPU 内存，减少 CPU bounce buffer 和多余复制。但它能帮助的前提是：数据已经是 GPU 可以消费的大块格式，且路径支持直接搬运。\n\n**GDS 不能自动解决**：JPEG/PNG/JSON 的解析和解码；tokenizer 和数据增强；小文件元数据风暴；对象存储的语义限制；模型格式需要大量 CPU 反序列化。\n\n**模型冷启动慢要分段拆**：远端下载 → 读盘/page cache → 反序列化 → CPU DRAM 形成 tensor → dtype/layout 转换 → H2D 到 HBM → runtime 初始化 → warmup 请求。不同阶段瓶颈和动作完全不同，不能笼统说\"加载慢\"。\n\n**避免把所有权重同时展开到 CPU DRAM**：大模型多副本滚动升级时，CPU DRAM 可能同时承载旧模型、新模型、page cache 和 pinned staging。分片流式加载、控制并发、复用本地缓存更稳妥。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪种代码写法会隐式触发 CPU/GPU 同步，切断异步流水线？",
+        "options": [
+          "`batch = batch.to(\"cuda\", non_blocking=True)`",
+          "`loss_value = loss.item()`",
+          "`with torch.cuda.stream(copy_stream): batch.to(device)`",
+          "`torch.cuda.current_stream().wait_stream(copy_stream)`"
+        ],
+        "answer": 1,
+        "explain": "`loss.item()` 会把 GPU tensor 的值转为 Python 标量，必须等待 GPU 完成之前的所有计算，触发同步。non_blocking=True 是异步拷贝；使用独立 stream 是正确的 overlap 做法；wait_stream 是正确的依赖表达。"
+      },
+      {
+        "type": "judge",
+        "prompt": "PCIe 4.0 x16 的理论单向带宽约为 32 GB/s，与 H100 HBM 的 TB/s 级带宽是同一个数量级。",
+        "answer": false,
+        "explain": "PCIe 4.0 x16 约 32 GB/s，而 HBM 带宽是 TB/s 级（如 H100 HBM3 约 3.35 TB/s），两者相差约 100 倍。这就是为什么 HBM 很快不能保证 H2D 也快，GPU 算力强不能保证 dataloader 能喂满。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DataLoader 开启 `pin_memory=True` 后，训练吞吐没有提升，主机内存反而紧张。最可能的原因是什么？",
+        "options": [
+          "GPU 不支持 pinned memory",
+          "pinned memory 队列过大挤压 DRAM 和 page cache，同时没有配合 non_blocking=True",
+          "H2D 带宽不够",
+          "batch size 太小"
+        ],
+        "answer": 1,
+        "explain": "pinned memory 需要与 non_blocking=True 配合才能真正异步；同时 prefetch_factor 过大会锁住大量 DRAM，挤压 page cache 和其他进程，导致数据读取变慢，主机内存紧张。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 DataLoader 参数与其控制的链路环节匹配：",
+        "left": [
+          "`num_workers`",
+          "`pin_memory`",
+          "`prefetch_factor`",
+          "`persistent_workers`"
+        ],
+        "right": [
+          "epoch 间是否保留 worker 进程，避免每轮重启开销",
+          "并行读取和预处理的进程数",
+          "每个 worker 提前准备的 batch 数量",
+          "输出 batch 是否进入锁页内存以支持异步 H2D"
+        ],
+        "explain": "num_workers 控制预处理并发；pin_memory 控制内存语义；prefetch_factor 控制队列深度；persistent_workers 控制 worker 生命周期。"
+      },
+      {
+        "type": "judge",
+        "prompt": "NUMA 错配不会让程序报错，但会导致同一份代码在不同 GPU 上吞吐不一致。",
+        "answer": true,
+        "explain": "NUMA 错配是静默的性能问题：DataLoader worker 在远端 socket 读取数据、分配 batch 内存，H2D 到近端 GPU 会先跨 socket 再走 PCIe，有效带宽降低、延迟增加，但不会报错。表现为 GPU0 和 GPU1 吞吐不同，或 pin_memory 收益不稳定。"
+      },
+      {
+        "type": "input",
+        "prompt": "H2D overlap CapacityLedger 要求：可见拷贝空洞不超过 step time 的百分之几？（填数字）",
+        "accept": ["10", "10%", "10 %"],
+        "explain": "threshold 是 `visible_copy_gap <= max(0.1 * t_step, 0.2 * t_compute)`，即 step time 的 10% 或 compute time 的 20%，取较大值。超过这个阈值说明 H2D 进入了计算关键路径。"
+      },
+      {
+        "type": "choice",
+        "prompt": "GPU Direct Storage（GDS）最适合以下哪种场景？",
+        "options": [
+          "从对象存储随机读取大量 JSON 格式小样本",
+          "训练时在线做 JPEG 解码和数据增强",
+          "读取已经打包好的大块 tensor 格式 shard，且 CPU 预处理已不是主瓶颈",
+          "替代 DataLoader 的 num_workers 优化"
+        ],
+        "answer": 2,
+        "explain": "GDS 适合数据已经是大块 tensor/block 格式、访问粒度大且顺序性好、GPU 确实在等 storage→HBM 这段路径的场景。JSON 解析、JPEG 解码、数据增强等仍需 CPU 处理；GDS 不能替代 DataLoader 优化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "模型冷启动分段拆解时，以下哪个阶段的优化方向是「分片流式加载、校验一片搬一片」？",
+        "options": [
+          "远端下载阶段",
+          "反序列化阶段",
+          "H2D 权重加载阶段",
+          "runtime warmup 阶段"
+        ],
+        "answer": 2,
+        "explain": "H2D 权重加载阶段的优化方向是：不要把所有权重同时展开到 CPU DRAM 再串行搬运，而是分片流式加载——读一片、校验一片、H2D 搬一片，让读/校验和 H2D 部分重叠，控制 CPU DRAM 峰值。"
+      }
+    ]
+  }
+]

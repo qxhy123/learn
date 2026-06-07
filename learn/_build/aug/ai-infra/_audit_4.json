@@ -1,0 +1,478 @@
+[
+ {
+  "id": "u3-l11-q12",
+  "prompt": "将执行栈层级与其典型性能问题匹配：",
+  "left": [
+   "Python / API 层",
+   "framework dispatcher 层",
+   "ATen / 算子选择层",
+   "CUDA runtime / driver 层"
+  ],
+  "right": [
+   "每次 launch 有固定 CPU 成本，小 kernel 多时积累显著",
+   "逐元素小循环、每步 .item() 同步、Python 对象创建开销",
+   "算子路由到 CPU fallback 或走非预期的低效实现路径",
+   "non-contiguous tensor 触发额外 transpose，或 workspace 过大"
+  ],
+  "explain": "Python层→小循环/同步；dispatcher层→fallback/路由错误；ATen层→layout/workspace问题；runtime/driver层→每次launch固定开销。"
+ },
+ {
+  "id": "u3-l12-q6",
+  "prompt": "将 ATen 算子实现选择的失败原因与后果匹配：",
+  "left": [
+   "dtype 不匹配",
+   "non-contiguous tensor",
+   "shape 太小",
+   "特殊 mask"
+  ],
+  "right": [
+   "需要额外 cast 或落到慢路径",
+   "需要隐式 copy 或使用低效 stride 访问路径",
+   "launch 开销主导，GPU 并行度不足",
+   "fused attention 后端不可用，退回多个分散 kernel"
+  ],
+  "explain": "dtype 不匹配导致 cast；non-contiguous 导致 copy 或 stride 慢路径；shape 太小导致 launch 主导；特殊 mask 让 fused attention kernel 无法使用，展开成普通 softmax/matmul 等多个 kernel。"
+ },
+ {
+  "id": "u3-l12-q13",
+  "prompt": "将框架层级职责与其主要产生的开销类型匹配：",
+  "left": [
+   "Autograd 包装层",
+   "framework dispatcher 层",
+   "ATen / native op 层",
+   "CUDA runtime / driver 层"
+  ],
+  "right": [
+   "每次 kernel 提交的固定 CPU 驱动路径成本",
+   "记录反向图、保存中间 tensor 引用，增加内存和引用管理开销",
+   "shape 检查、临时 workspace 分配、算法选择",
+   "每个 eager op 的固定路由和 dispatch key 匹配成本"
+  ],
+  "explain": "Autograd→反向图记录；dispatcher→每 op 路由成本；ATen→workspace/shape检查；runtime/driver→每 launch 固定驱动开销。"
+ },
+ {
+  "id": "u3-l13-q6",
+  "prompt": "将场景与最合适的同步/依赖机制匹配：",
+  "left": [
+   "benchmark 结束后采集端到端时间",
+   "copy stream 的 H2D 完成后通知 compute stream",
+   "debug 阶段定位 kernel 出错位置",
+   "检测 NCCL overlap 是否真的存在"
+  ],
+  "right": [
+   "torch.cuda.synchronize() 放在测量边界",
+   "cudaEventRecord + cudaStreamWaitEvent / stream.wait_stream",
+   "CUDA_LAUNCH_BLOCKING=1 强制同步",
+   "nsys 查看 NCCL row 与 backward compute row 是否交叠"
+  ],
+  "explain": "benchmark 边界用 synchronize；跨 stream 局部依赖用 event/wait；debug 定位错误用 CUDA_LAUNCH_BLOCKING（不能用于性能结论）；验证 overlap 用 nsys 时间线视觉确认，不能只靠代码形式判断。"
+ },
+ {
+  "id": "u3-l13-q12",
+  "prompt": "将同步/依赖机制与最适合的使用场景匹配：",
+  "left": [
+   "cudaEventRecord + cudaStreamWaitEvent",
+   "cudaDeviceSynchronize()",
+   "cudaStreamSynchronize(stream)",
+   "stream.wait_stream(other)"
+  ],
+  "right": [
+   "CPU 必须等某特定 stream 完成才能进行下一步处理",
+   "PyTorch 中跨 stream 简单等待，other 的已提交工作",
+   "跨 stream 局部数据依赖，避免等整个 GPU 空闲",
+   "等待所有 stream 完成，调试或作业结束时使用"
+  ],
+  "explain": "EventRecord+StreamWaitEvent→跨stream局部依赖；DeviceSynchronize→等所有stream（调试/结束）；StreamSynchronize→等特定stream完成；wait_stream→PyTorch跨stream简洁等待。"
+ },
+ {
+  "id": "u3-l14-q5",
+  "prompt": "将 kernel 慢的症状与最可能的资源假设匹配：",
+  "left": [
+   "fused kernel 比拆开慢，local memory load 明显",
+   "Tensor Core utilization 很低",
+   "HBM bandwidth 低但 kernel 时间长",
+   "occupancy 低且 memory stall 高"
+  ],
+  "right": [
+   "register spill：fusion 后 registers/thread 过高",
+   "dtype/layout/shape 未命中 Tensor Core 路径",
+   "访存不合并（coalescing 差）或 stride 访问",
+   "shared memory/register 占用限制了 SM 驻留 warp"
+  ],
+  "explain": "local memory load 明显 → spill（register 不够落到 local memory）；Tensor Core 低 → dtype/layout/shape 问题；bandwidth 低但时间长 → coalescing 差，大量 transaction 被串行；低 occupancy + memory stall → 驻留 warp 不足以隐藏延迟，通常由 register/shared memory 占用过高引起。"
+ },
+ {
+  "id": "u3-l14-q13",
+  "prompt": "将算子融合的收益或成本与其机制对应：",
+  "left": [
+   "减少 HBM 中间读写",
+   "增加 register pressure",
+   "降低 kernel 调度次数",
+   "可能触发 warp divergence"
+  ],
+  "right": [
+   "融合后包含 mask/branch 逻辑，同一 warp 内线程走不同分支",
+   "中间 tensor 留在 register/shared memory，不写回 HBM",
+   "多个小 kernel 合并，减少固定调度开销",
+   "融合后每线程需要更多临时变量，占用更多 register file"
+  ],
+  "explain": "减少HBM读写→中间tensor留在寄存器；register pressure增加→临时变量增多；降低调度次数→launch减少；warp divergence→mask/branch融合进来。"
+ },
+ {
+  "id": "u3-l15-q5",
+  "prompt": "将时间线病态症状与首要排查工具匹配：",
+  "left": [
+   "GPU HW 上短 kernel 之间大量空洞（launch 稀疏）",
+   "H2D 与 kernel 阶梯式轮流出现（串行）",
+   "少数 kernel 占 GPU time 大头（kernel 慢）",
+   "每 N step 固定出现 1-5 秒尖刺（周期抖动）"
+  ],
+  "right": [
+   "torch.profiler 按 CPU self time 排序，找小 op/同步/graph break",
+   "nsys 看 Memcpy row、DataLoader timing、检查 pinned memory/non_blocking/copy stream",
+   "ncu 看 Tensor Core、memory throughput、warp stall、register",
+   "日志时间戳 + NVTX range，逐一关闭 checkpoint/logger/eval 做 A/B"
+  ],
+  "explain": "launch 稀疏 → torch.profiler 找 CPU 侧小 op；H2D 串行 → nsys Memcpy row + DataLoader 检查；kernel 慢 → ncu 微结构；周期尖刺 → 日志时间戳 + NVTX 定位周期性任务。"
+ },
+ {
+  "id": "u3-l15-q12",
+  "prompt": "将性能问题病态时间线特征与首要排查方向匹配：",
+  "left": [
+   "CUDA HW 上 kernel 之间有大量空洞，kernel 本身很短",
+   "H2D 与 compute kernel 交替出现（阶梯式串行）",
+   "backward 后段有明显 NCCL 尾巴，持续时间不稳定",
+   "每 N step 出现一次 GPU 长空洞，其余 step 正常"
+  ],
+  "right": [
+   "多 rank nsys 对比，检查 NCCL 日志和 rank 计算均衡性",
+   "检查 checkpoint 写入时机、manifest flush 和文件系统 IO",
+   "检查 DataLoader pinned memory、non_blocking 设置、是否有默认 stream 依赖",
+   "torch.profiler 找小 op 热点，尝试 torch.compile 减少 dispatch 次数"
+  ],
+  "explain": "kernel间空洞→launch-bound→torch.profiler+compile；H2D串行→copy设置问题→pinned/async；NCCL尾巴→rank不均衡→多rank trace；周期空洞→checkpoint风暴→IO诊断。"
+ },
+ {
+  "id": "u4-l1-q4",
+  "prompt": "将左侧工具与其主要回答的问题匹配",
+  "left": [
+   "torch.profiler",
+   "Nsight Systems",
+   "Nsight Compute",
+   "iostat"
+  ],
+  "right": [
+   "PyTorch 各 op 的 CPU/CUDA 时间和 memory 分配",
+   "CUDA stream 时间线、H2D DMA、kernel launch gap",
+   "单个 kernel 的 SM occupancy 和 Tensor Core 使用率",
+   "本地磁盘 I/O 队列深度和 await 延迟"
+  ],
+  "explain": "四个工具分层诊断：torch.profiler 对应 PyTorch 层，Nsight Systems 对应 CUDA stream/timeline 层，Nsight Compute 对应 kernel 内部性能计数器，iostat 对应 host 侧磁盘 I/O。"
+ },
+ {
+  "id": "u4-l1-q9",
+  "prompt": "将左侧 token 口径与其正确定义匹配",
+  "left": [
+   "raw_sequence_slots",
+   "non_pad_tokens",
+   "loss_tokens",
+   "compute_tokens"
+  ],
+  "right": [
+   "固定 shape 中的 token 槽位数，等于 B × S × N_gpu",
+   "排除 padding 的真实 token 数，等于 attention_mask.sum()",
+   "进入 cross entropy 的 shifted labels 数，labels != -100",
+   "实际执行主要模型 FLOPs 的 token 数，无 unpadding 时等于 raw slots"
+  ],
+  "explain": "四种口径层层收窄：raw slots 是硬件执行的 dense shape，non_pad 排除 attention mask 的 pad，loss tokens 是真正有监督信号的位置，compute tokens 取决于是否做了 unpadding/compaction。"
+ },
+ {
+  "id": "u4-l1-q14",
+  "prompt": "将左侧单机训练「四条路径」与其典型故障症状匹配",
+  "left": [
+   "数据路径",
+   "状态路径",
+   "精度策略路径",
+   "故障路径"
+  ],
+  "right": [
+   "GPU 利用率低，DataLoader visible wait 超 step time 的 20%",
+   "resume 后 LR schedule 错位，loss 出现台阶式跳变",
+   "训练中途 loss 突然变 NaN，GradScaler found_inf 频繁出现",
+   "训练循环卡死，无日志输出，进程存活但无前进"
+  ],
+  "explain": "数据路径问题表现为 GPU 等数据（利用率低或 DataLoader wait 高）；状态路径问题在 resume 时暴露（LR/cursor 错位）；精度策略问题表现为 NaN 或 overflow；故障路径对应 OOM、hang、I/O stall 等。"
+ },
+ {
+  "id": "u4-l2-q3",
+  "prompt": "将左侧 FSDP FULL_SHARD 阶段与其发生的通信操作匹配",
+  "left": [
+   "forward 开始前",
+   "backward 结束后",
+   "optimizer step",
+   "backward 开始前（prefetch）"
+  ],
+  "right": [
+   "AllGather：拼出当前层完整参数",
+   "ReduceScatter：每 rank 保留自己的 grad shard",
+   "本地更新：只更新自己持有的 param/Adam shard",
+   "AllGather：预取下一层参数"
+  ],
+  "explain": "FSDP FULL_SHARD 的生命周期：forward 前 AllGather 完整参数，backward 后 ReduceScatter 梯度，optimizer 本地更新 shard，prefetch 在 backward 期间提前 AllGather 下一层参数。"
+ },
+ {
+  "id": "u4-l2-q8",
+  "prompt": "将左侧症状与最可能的根因匹配",
+  "left": [
+   "rank_step_skew 和 sample_token_skew 同时高",
+   "NCCL timeout，日志 NET/Socket",
+   "backward 后 180ms NCCL tail",
+   "OOM 只在多节点出现"
+  ],
+  "right": [
+   "dataset shard 按样本数均分，未按 token 数平衡",
+   "RDMA 未注入容器，NCCL fallback 到 socket",
+   "bucket 太大，最后一个 bucket 延迟高；或有 rank straggler 破坏 overlap",
+   "live AllGather 参数增多或 prefetch 导致 HBM 峰值超限"
+  ],
+  "explain": "四种典型 DP 故障的根因各不相同：data skew 表现为 token/rank skew 同时升，socket fallback 表现为 NCCL 日志和 busbw 低，bucket 问题表现为 backward 后 tail，多节点 OOM 常来自 AllGather 瞬时峰值。"
+ },
+ {
+  "id": "u4-l2-q14",
+  "prompt": "将左侧 ZeRO 阶段与其切分的训练状态匹配",
+  "left": [
+   "ZeRO-1",
+   "ZeRO-2",
+   "ZeRO-3 / FSDP FULL_SHARD",
+   "DDP（无 ZeRO）"
+  ],
+  "right": [
+   "只切 optimizer state（Adam m/v），params 和 grads 每卡完整复制",
+   "切 optimizer state + grads，params 每卡完整复制",
+   "params、grads、optimizer state 全部切分，forward 时 AllGather 临时拼出完整参数",
+   "params、grads、optimizer state 全部每卡完整复制，无切分"
+  ],
+  "explain": "ZeRO 三个阶段逐步扩大切分范围：ZeRO-1 仅切 optimizer state，ZeRO-2 再切 grads，ZeRO-3/FSDP FULL_SHARD 三者全切。DDP 无任何切分，每卡完整复制所有状态。"
+ },
+ {
+  "id": "u4-l2-q19",
+  "prompt": "将左侧 DP 弱扩展效率问题与其最合适的优化手段匹配",
+  "left": [
+   "暴露通信占 step time 25%，计算无法覆盖 AllReduce",
+   "某个 rank 持续比其他 rank 慢 30%，token skew 正常",
+   "dataset shard 按样本数均分，但某些 rank step time 随 seq length 波动大",
+   "FSDP 进入多节点后，OOM 频率上升"
+  ],
+  "right": [
+   "缩小 bucket size 或启用 gradient compression 减少通信量",
+   "检查 DCGM/nvidia-smi 排查 GPU 降频、ECC 错误或 NUMA 错配",
+   "改为按 non-pad token budget 均分 shard，而非按样本数均分",
+   "用 profiler 验证 AllGather 瞬时峰值并调整 limit_all_gathers 参数"
+  ],
+  "explain": "通信暴露靠减少通信或增加重叠；硬件 straggler 靠 DCGM/nvidia-smi 排查物理原因；data skew 靠 token budget 均分；多节点 OOM 通常来自 FSDP AllGather 瞬时峰值，可调 limit_all_gathers 降低。"
+ },
+ {
+  "id": "u4-l3-q4",
+  "prompt": "将左侧并行机制与其主要解决的问题匹配",
+  "left": [
+   "Tensor Parallel（TP）",
+   "Pipeline Parallel（PP）",
+   "Context Parallel（CP）",
+   "Sequence Parallel（SP）"
+  ],
+  "right": [
+   "单层矩阵/activation 超出单卡容量，切层内 hidden/heads",
+   "整网层数太多，每卡只承载一段层段，microbatch 像流水线流过",
+   "超长 attention context，每 rank 只持有 S/CP 的 token，ring 交换 KV",
+   "TP 组内非 attention activation 仍重复存储，按 sequence 分片减少冗余"
+  ],
+  "explain": "TP 切层内张量，PP 切层段，CP 切长上下文 attention，SP 切非 attention 的序列激活（通常在 TP 组内）。四个机制解决不同瓶颈，经常组合使用。"
+ },
+ {
+  "id": "u4-l3-q8",
+  "prompt": "将左侧 PP 调度策略与其 bubble overhead 公式匹配",
+  "left": [
+   "GPipe（全 F 再全 B）",
+   "1F1B（Megatron 默认）",
+   "Interleaved 1F1B（virtual stage=v）",
+   "Zero Bubble"
+  ],
+  "right": [
+   "约 2(p-1)/m",
+   "(p-1)/m",
+   "约 (p-1)/(v×m)",
+   "接近 0（W-pass 填空槽）"
+  ],
+  "explain": "GPipe 约 2(p-1)/m，因为完整 forward 后再完整 backward，空泡翻倍；1F1B 为 (p-1)/m；Interleaved 1F1B 引入 virtual stage 数 v 进一步降低；Zero Bubble 将 backward 拆成 B-pass 和 W-pass，W-pass 填充空槽，bubble 接近 0。"
+ },
+ {
+  "id": "u4-l3-q14",
+  "prompt": "将左侧 3D 并行通信类型与其覆盖（overlap）计算的对象匹配",
+  "left": [
+   "TP AllReduce",
+   "PP send/recv（1F1B 稳态）",
+   "FSDP AllGather（backward prefetch）",
+   "CP Ring KV exchange"
+  ],
+  "right": [
+   "同层下一个 ColumnParallel GEMM（需 CUDA_DEVICE_MAX_CONNECTIONS=1 + 独立 stream）",
+   "同 stage 下一个 microbatch 的 forward/backward compute（需 m ≥ PP）",
+   "前一 FSDP unit 的 backward compute（需 BACKWARD_PRE 模式）",
+   "本地 context block 的 attention 计算（Ring FlashAttention 实现）"
+  ],
+  "explain": "各并行通信的 overlap 对象：TP AllReduce 覆盖下一层 GEMM；PP isend/irecv 在 1F1B 稳态被下一 microbatch 计算覆盖；FSDP prefetch 覆盖前一 unit backward；CP ring exchange 在 Ring FA 中与本地 attention 并行。通信被 compute 覆盖的部分不影响 step time。"
+ },
+ {
+  "id": "u4-l3-q19",
+  "prompt": "将左侧问题场景与最适合引入的并行策略匹配",
+  "left": [
+   "FSDP 后单张 H100 仍 OOM，但同一层的 hidden 矩阵本身就超出单卡",
+   "模型层数极多，FSDP 后单卡 shard 的参数已经很小，但训练时间极长",
+   "训练 128K context 的长文档模型，attention workspace 占满 HBM",
+   "7B 模型 BF16+AdamW，单节点 optimizer state 无法放入单卡"
+  ],
+  "right": [
+   "Tensor Parallel（TP），在节点内 NVSwitch 切分层内 hidden/heads",
+   "Pipeline Parallel（PP），切层段减少每卡持有的层数",
+   "Context Parallel（CP），按 token 分片做 Ring FlashAttention",
+   "FSDP FULL_SHARD 或 ZeRO-3，切分训练状态"
+  ],
+  "explain": "TP 解决单层矩阵放不下；PP 解决层数过多；CP 解决超长序列 attention workspace 问题；FSDP/ZeRO-3 解决训练状态过大。按最小满足约束原则选组合。"
+ },
+ {
+  "id": "u4-l4-q4",
+  "prompt": "将左侧 MoE 负载均衡策略与其特点匹配",
+  "left": [
+   "Aux Loss（Switch/GShard）",
+   "Loss-Free Balancing（DeepSeek-V3）",
+   "Capacity Factor dropping",
+   "Dropless MoE"
+  ],
+  "right": [
+   "λ × Σ(f_i × P_i) 加入主 loss，但与主 loss 梯度方向可能冲突",
+   "动态 bias 调整 expert score，不污染主 loss 梯度，bias 须随 checkpoint 保存",
+   "预分配固定 token 槽，超出 token 被 drop，监控 drop_rate",
+   "按实际 token 数动态 dispatch，监控 max_load、buffer peak 和 straggler"
+  ],
+  "explain": "四种策略各有取舍：Aux loss 简单但有梯度污染；Loss-free balancing 无污染但需维护 bias 状态；Capacity factor 工程简单但有 token drop；Dropless 不丢 token 但 buffer 管理更复杂。"
+ },
+ {
+  "id": "u4-l4-q8",
+  "prompt": "将左侧 MoE 监控场景与最关键的监控指标匹配",
+  "left": [
+   "Dropping MoE 健康监控",
+   "Dropless MoE 健康监控",
+   "Expert 坍缩早期预警",
+   "EP 网络问题诊断"
+  ],
+  "right": [
+   "drop_rate（每层，告警阈值 >20% 持续 1k step）",
+   "p99 expert tokens、dispatch buffer peak、overflow fallback count",
+   "某几个 expert 的 f_i（实际选中频率）远高于均值",
+   "alltoallv bytes 的 send/recv rank skew，某些 rank 成为 incast 热点"
+  ],
+  "explain": "四种场景的监控重点不同：dropping MoE 看 drop rate，dropless 看 buffer 和 straggler，expert 坍缩看负载分布是否均匀，EP 网络问题看通信流量是否均匀。"
+ },
+ {
+  "id": "u4-l4-q15",
+  "prompt": "将左侧 MoE EP Reshape 步骤与其关键操作匹配",
+  "left": [
+   "确定每个 expert 在新 EP 配置下的目标 ep_rank",
+   "迁移 Loss-Free Balancing 的 bias",
+   "处理 ETP>1 时多个 TP rank 写出的相同 expert 副本",
+   "验证 reshape 后权重正确性"
+  ],
+  "right": [
+   "通过 expert_owner manifest 重映射，不能按 rank 索引直接计算",
+   "bias 必须随 expert 一起迁移到新 ep_rank，否则平衡状态丢失",
+   "checkpoint writer 选 canonical replica 或 checksum 去重，避免误认为独立 shard",
+   "比对 reshape 前后每个 expert 的权重 checksum，确认无静默错误"
+  ],
+  "explain": "EP Reshape 的四个关键步骤各有陷阱：manifest 重映射避免 rank 索引混淆；bias 随 expert 迁移保持均衡状态；ETP 去重避免把副本误当独立 shard；checksum 验证避免静默 corruption。"
+ },
+ {
+  "id": "u4-l4-q19",
+  "prompt": "将左侧 MoE 故障现象与其最可能的根因匹配",
+  "left": [
+   "大部分 GPU 计算利用率低，少数 GPU 持续 OOM 或慢步",
+   "All-to-All 延迟突增，IB 交换机监控显示丢包",
+   "loss 下降正常，但长时间后 expert 利用率分布极不均匀",
+   "EP Reshape 后推理 loss 比训练 loss 高出很多"
+  ],
+  "right": [
+   "Router 坍缩：无负载均衡约束导致 token 集中于少数热门 expert",
+   "All-to-All incast 打爆交换机 shared buffer，导致丢包和重传",
+   "Aux Loss 系数 α 过小，负载均衡约束不足，expert 逐渐分化",
+   "EP Reshape 未使用 expert manifest 重映射，expert 参数错位"
+  ],
+  "explain": "MoE 的四类典型故障：GPU 负载不均→router 坍缩；IB 丢包→incast；expert 利用率不均匀→aux loss 不足；reshape 后 loss 异常→expert 参数映射错误。"
+ },
+ {
+  "id": "u4-l5-q3",
+  "prompt": "将左侧显存优化手段与其主要收益匹配",
+  "left": [
+   "Activation checkpointing",
+   "Optimizer state sharding（ZeRO）",
+   "CPU offload（ZeRO-Offload）",
+   "Allocator expandable_segments"
+  ],
+  "right": [
+   "用重算 forward 换取 activation 显存降低 30-70%",
+   "降低 optimizer state 的单卡常驻量，端到端约 2.9×-N× reduction",
+   "将 optimizer state 移到 CPU DRAM，GPU 容量手段但可能大幅降低 GPU duty cycle",
+   "减少 CUDA allocator 的内存碎片，缓解 reserved >> allocated 问题"
+  ],
+  "explain": "四种手段解决不同问题：activation checkpointing 换算力换显存，ZeRO 分片状态，offload 把状态搬到慢设备，expandable_segments 减少 allocator 碎片。选择时必须考虑各自的代价。"
+ },
+ {
+  "id": "u4-l5-q7",
+  "prompt": "将左侧 async checkpoint 状态与其含义匹配",
+  "left": [
+   "SnapshotStaged",
+   "TrainMayAdvance",
+   "PublishCAS",
+   "PostPublishBarrier"
+  ],
+  "right": [
+   "GPU tensor 已转移到 staging buffer，但 flush 尚未完成",
+   "训练可进入下一 step，但 checkpoint 仍在后台 flush",
+   "manifest validated，latest.json 以 CAS/generation 原子更新",
+   "所有 rank 观察到同一 latest pointer，该 step 计入 last_validated_capture_step"
+  ],
+  "explain": "async checkpoint 的状态链要严格按顺序推进。SnapshotStaged 只是 staging 完成，PublishCAS 是发布，PostPublishBarrier 是所有 rank 确认可见。只有 PostPublishBarrier 后才能更新 last_validated_capture_step。"
+ },
+ {
+  "id": "u4-l5-q13",
+  "prompt": "将左侧 checkpoint 内容与「不保存的后果」匹配",
+  "left": [
+   "scheduler state",
+   "RNG state（CPU/CUDA）",
+   "dataset sampler cursor",
+   "GradScaler state（FP16 训练）"
+  ],
+  "right": [
+   "LR 重复 warmup 或提前 decay，收敛轨迹不可复现",
+   "dropout 掩码和数据增强随机顺序改变，训练结果不可复现",
+   "恢复后重复消费已训练样本或跳过部分样本",
+   "scale 重置为初始值，前几步可能因 scale 过高产生大量 overflow"
+  ],
+  "explain": "scheduler 不保存导致 LR 错位；RNG 不保存导致随机性不一致；dataset cursor 不保存导致样本重复或跳过；GradScaler 不保存导致 FP16 loss scale 重置，overflow 频繁。每项都有独立可观察的后果。"
+ },
+ {
+  "id": "u4-l5-q18",
+  "prompt": "将左侧 checkpoint 显存六项与其常被遗漏的原因匹配",
+  "left": [
+   "M_ckpt_buffer（async checkpoint staging）",
+   "M_frag（allocator fragmentation）",
+   "M_comm_buffers（NCCL/FSDP 通信缓冲）",
+   "M_activations（峰值 activation）"
+  ],
+  "right": [
+   "大规模作业 async staging 在 CPU DRAM 不够时会溢出到 GPU，但计算显存预算里常不计入",
+   "reserved >> allocated 时 nvidia-smi 显示空闲但大块 allocation 仍会 OOM",
+   "AllGather/ReduceScatter 的临时 buffer 在 profiler 里不直接显示为 peak",
+   "随 batch × seq × hidden × layers 增长最快，且在短序列 baseline 上很难被预估到长序列规模"
+  ],
+  "explain": "checkpoint staging buffer 常被遗漏（只计入了 params/grads/Adam）；fragmentation 导致理论足够实际 OOM；通信 buffer 在 profiler 里不直观；activation 随 batch/seq/layers 超线性增长，baseline 低估长序列场景。"
+ }
+]

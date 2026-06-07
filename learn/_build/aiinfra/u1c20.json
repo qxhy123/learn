@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u1c20",
+    "title": "网络协议栈基础导览",
+    "subtitle": "从 TCP 到 RDMA：AI Infra 网络问题地图",
+    "intro": [
+      {
+        "title": "为什么 AI Infra 要懂网络栈",
+        "body": "AI Infra 里的网络横跨两类完全不同的问题：\n\n- **控制面**：稳定处理短连接、RPC、Kubernetes API、对象存储请求、推理服务——核心是延迟稳定性（P99）\n- **训练数据面**：每个 step 搬运 GB 级梯度、激活或参数分片——核心是吞吐和尾延迟\n\n把这两类问题混成一个网络慢的标签，是 AI 系统排障最常见的失误。Linux TCP、NIC 多队列、RDMA fabric 和 NCCL collective 是四个层次不同的问题域，每一层有自己的可观测对象和排障工具。",
+        "tip": "先定位责任边界，再改参数。盲调 MTU、queue 数、ECN threshold 或 NCCL 变量，容易把可复现问题变成偶发问题。"
+      },
+      {
+        "title": "四层网络问题域",
+        "body": "| 层次 | 主问题 | 典型症状 | 优先工具 |\n|---|---|---|---|\n| Linux TCP/IP（0d1）| 收发包路径、TCP 拥塞控制、MTU/PMTU/ECMP | 跨节点吞吐上不去、重传多 | `ss -tinm`、`ip route`、`iperf3` |\n| NIC offload/队列（0d2）| offload、多队列、RSS/IRQ/softirq | 推理网关 P99 抖动、CPU 不满但延迟高 | `ethtool`、`/proc/interrupts`、`/proc/softirqs` |\n| RDMA/RoCE/IB（0d3）| verbs、MR/QP/CQ、RoCE v2、GPUDirect | RoCE 训练偶发 timeout/retry | verbs counter、PFC/ECN 状态 |\n| NCCL collective（0d4）| collective 算法、transport、rank/channel | AllReduce 慢或 fallback 到 socket | `NCCL_DEBUG=INFO` 日志、`nccl-tests` |"
+      },
+      {
+        "title": "从应用到网卡的责任边界",
+        "body": "一次网络数据的完整路径：\n\n`应用（PyTorch/gRPC）` → `fd + socket buffer` → `Linux TCP/IP 协议栈` → `skb + qdisc` → `NIC driver ring` → `网卡 TX queue` → `Ethernet/RoCE/IB fabric` → `对端网卡` → `GPU/对端应用`\n\n**每层的典型证据**：\n\n| 边界 | 主要对象 | 典型证据 |\n|---|---|---|\n| 应用到内核 | fd、socket buffer、epoll | `ss -tinm`、event loop lag |\n| 内核到 NIC | skb、qdisc、driver ring | `tc -s qdisc`、`ethtool -S` |\n| NIC 到交换机 | MTU、VLAN、PFC、ECN、ECMP | 端口 counter、drop、pause、ECN mark |\n| NIC 到 GPU | PCIe、NUMA、BAR、pinned memory | `nvidia-smi topo -m`、NCCL `NET/IB` 日志 |\n| collective 层 | ring/tree、rank、channel、transport | `NCCL_DEBUG=INFO`、per-rank time |"
+      },
+      {
+        "title": "短流与长流的不同排障逻辑",
+        "body": "**短流（推理服务、RPC、API）**：被握手延迟、连接池、队列调度支配。瓶颈常在：\n- TCP 握手 RTT（1-5ms）\n- 连接池耗尽等待\n- RSS 分配不均导致某 CPU 核过热\n- softirq 调度延迟\n\n**长流（训练 AllReduce、大文件传输）**：被带宽、拥塞控制、MTU、路径熵支配。瓶颈常在：\n- BDP（带宽延迟积）决定需要多大 receive window\n- PMTU 黑洞（路径上有设备静默丢弃大包）\n- ECMP 哈希不均导致单路拥塞\n- PFC/ECN 配置不当导致 RoCE 训练抖动\n\n**控制面与数据面也要分开**：NCCL AllReduce 走 RDMA 不代表 bootstrap、rendezvous、对象存储、日志和监控不会拖慢 job。"
+      },
+      {
+        "title": "全局排障原则",
+        "body": "1. **同时看主机和 fabric**：主机上的 retrans、softirq、queue drop 只描述一半事实；交换机上的 discard、pause、ECN mark、buffer occupancy 才说明共享链路发生了什么\n\n2. **分层定位，不跳层**：看到 NCCL 慢不要先调 MTU；先看 NCCL 日志确认是 transport 问题、HCA 问题还是 fabric 问题\n\n3. **先复现，再修复**：网络问题很多是偶发的，改参数前先记录问题的触发条件、频率和影响范围\n\n4. **快速入口——症状到工具的映射**：\n\n| 症状 | 首先看 |\n|---|---|\n| 推理网关 P99 抖动，CPU 总体不满 | RSS、IRQ affinity、softirq、连接分布 |\n| 跨节点 TCP 吞吐上不去或重传多 | BDP、cwnd、PMTU、qdisc、ECMP |\n| RoCE 训练偶发 timeout/retry | MR/QP/CQ、PFC、ECN、DCQCN、MTU |\n| NCCL AllReduce 慢或 fallback 到 socket | NCCL 日志、transport、GDRDMA、HCA、拓扑 |",
+        "tip": "训练节点的快速入口命令：`nvidia-smi topo -m`（GPU/NIC 拓扑）、`NCCL_DEBUG=INFO ... all_reduce_perf`（NCCL 日志）、`ethtool -S <iface>`（NIC 统计）。"
+      },
+      {
+        "title": "最小命令集与自测",
+        "body": "**网络基础观测**：\n- `ip -br addr`：查看本机网络接口\n- `ip route get <peer_ip>`：查看到对端的路由和出口\n- `ss -tinm dst <peer_ip>`：查看 TCP 连接状态（含 cwnd、rtt、retrans）\n- `tc -s qdisc show dev <iface>`：查看 qdisc 和 drop\n- `ethtool -k <iface>`：查看 offload 开关（TSO、GSO、GRO 等）\n- `ethtool -l <iface>`：查看队列数\n- `ethtool -S <iface>`：查看 NIC 统计（drop、error）\n- `cat /proc/softirqs`：查看软中断分布\n- `cat /proc/interrupts | grep mlx`：查看 NIC 中断分布\n- `nvidia-smi topo -m`：查看 GPU/NIC NUMA 拓扑\n\n**自测**（进入下一章前）：\n- 能画出 TCP send 从应用到 NIC TX queue 的路径\n- 能解释 receive window 与 congestion window 的区别\n- 能说明 RSS、IRQ affinity、NUMA 如何影响推理服务尾延迟\n- 能用 MR、QP、CQ、WR、WC 串起一次 RDMA Write",
+        "reveal": {
+          "q": "推理网关 CPU 总体使用率不高，但 P99 延迟很差，最可能的根因在哪个层次？",
+          "a": "CPU 总体不满但 P99 高，通常不是计算瓶颈而是调度/分配不均。最常见原因是：某几个 CPU 核因为 RSS（Receive Side Scaling）哈希不均导致中断集中，这几个核 softirq 负载极高而其他核空闲；或者 IRQ affinity 设置让所有网卡中断打到同一个 NUMA 节点的同一个核，造成排队。排障优先看 /proc/interrupts（中断分布）和 /proc/softirqs（NET_RX 分布），而不是 top 的整体 CPU 使用率。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "推理服务 P99 延迟高但 CPU 总体使用率不高，最可能的原因是什么？",
+        "options": [
+          "GPU 显存不足，请求被排队等待",
+          "RSS 哈希不均导致部分 CPU 核 softirq 过载，其他核空闲",
+          "TCP 拥塞窗口太小，限制了每个连接的吞吐",
+          "MTU 设置过小，导致大包被分片"
+        ],
+        "answer": 1,
+        "explain": "CPU 总体不满但 P99 高是典型的负载不均问题。RSS（Receive Side Scaling）把收到的包按哈希分配到不同 CPU 核，如果哈希不均，某些核 softirq 满载而其他核空闲，总体 CPU 看起来不高但瓶颈核已过载。应查 /proc/interrupts 和 /proc/softirqs 的 NET_RX 分布。"
+      },
+      {
+        "type": "match",
+        "prompt": "将网络层次与其典型排障工具匹配：",
+        "left": [
+          "应用到内核（socket/fd）",
+          "内核到 NIC（skb/qdisc）",
+          "NIC 到交换机（链路层）",
+          "NCCL collective 层"
+        ],
+        "right": [
+          "NCCL_DEBUG=INFO 日志、nccl-tests、per-rank time",
+          "ss -tinm、/proc/net/sockstat、event loop lag",
+          "tc -s qdisc、ethtool -S、/proc/softirqs",
+          "交换机端口 counter、pause frame 计数、ECN mark 统计"
+        ],
+        "explain": "socket/fd 层看 ss 和 socket 统计；skb/qdisc 层看 tc 和 ethtool；链路层看交换机 counter 和 PFC/ECN；NCCL 层看 NCCL 日志和 nccl-tests 结果。每层有独立的可观测对象。"
+      },
+      {
+        "type": "judge",
+        "prompt": "NCCL AllReduce 走 RDMA 数据面，说明 bootstrap、rendezvous 和对象存储等控制面操作不会影响训练 job 的整体速度。",
+        "answer": false,
+        "explain": "数据面和控制面是独立的。即使 AllReduce 本身走 RDMA 很快，如果 bootstrap（节点发现）、rendezvous（rank 协调）、对象存储（checkpoint 读写）或日志/监控出现延迟，也会拖慢整体 job。控制面和数据面必须分开分析。"
+      },
+      {
+        "type": "choice",
+        "prompt": "跨节点 TCP 长流吞吐上不去，首先应该检查什么？",
+        "options": [
+          "RSS 队列数量和 IRQ affinity 设置",
+          "BDP（带宽延迟积）、TCP receive window 大小和 PMTU 是否正确",
+          "NCCL 的 collective 算法选择",
+          "GPU 的 PCIe 带宽是否饱和"
+        ],
+        "answer": 1,
+        "explain": "长流吞吐由 BDP（带宽×RTT）决定需要多大 receive window。如果 window 过小，TCP 在等 ACK 时就停止发包（'receiver window limited'）。PMTU 黑洞（路径上设备静默丢弃超过其 MTU 的包）也是常见原因。`ss -tinm dst <peer>` 可以看 cwnd、rtt、snd_wnd、rcv_wnd。"
+      },
+      {
+        "type": "judge",
+        "prompt": "TSO（TCP Segmentation Offload）开启时，抓包可能看到超过 MTU 的大包，但这些大包在网卡出口会被自动切分为符合 MTU 的帧。",
+        "answer": true,
+        "explain": "TSO 让 CPU 把大块数据（如 64KB）一次性交给网卡，由网卡自动按 MTU 切分成多个 TCP segment 发出。tcpdump 在 raw socket 层抓包时看到的是切分前的大包；实际链路上的帧仍受 MTU（通常 1500B 或 9000B jumbo frame）限制。这是 TSO 减少 CPU 开销的核心机制。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RoCE 训练出现偶发 timeout 或 retry，首先应该排查哪个层次？",
+        "options": [
+          "NCCL collective 算法是否选择了正确的 ring topology",
+          "Linux TCP socket buffer 大小是否足够",
+          "MR/QP/CQ 配置、PFC pause frame、ECN/DCQCN 拥塞控制和 MTU 设置",
+          "GPU 显存是否不足导致梯度 overflow"
+        ],
+        "answer": 2,
+        "explain": "RoCE 是基于 Ethernet 的无损 RDMA，对网络丢包极其敏感（一次丢包可能触发 RDMA 连接 reset）。偶发 timeout/retry 常来自 PFC 配置错误导致的 HOL blocking、ECN/DCQCN 参数不当导致的 buffer 溢出，或 MTU 不一致导致的分片和丢包。应先看 NIC 和交换机的 pause frame 统计、ECN mark 和 port counter。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看 GPU 和 NIC 的 NUMA 拓扑关系，应使用什么命令？（只写命令名）",
+        "accept": [
+          "nvidia-smi"
+        ],
+        "explain": "`nvidia-smi topo -m` 显示每对 GPU 之间以及 GPU 与 NIC 之间的连接拓扑（NVLink、PCIe、NUMA node 等）。这是排查 GPUDirect RDMA 和 NCCL 拓扑问题的基础命令。"
+      },
+      {
+        "type": "choice",
+        "prompt": "查看 TCP 连接的当前拥塞窗口（cwnd）、RTT 和重传次数，应使用哪个命令？",
+        "options": [
+          "netstat -an | grep ESTABLISHED",
+          "ss -tinm dst <peer_ip>",
+          "ethtool -S <iface> | grep tx",
+          "tc -s qdisc show dev <iface>"
+        ],
+        "answer": 1,
+        "explain": "`ss -tinm` 显示 TCP 连接的详细状态，包括 cwnd（拥塞窗口）、rtt（往返时间）、retrans（重传次数）、snd_wnd/rcv_wnd（发送/接收窗口）等。这些信息对排查长流吞吐问题至关重要。`-t` TCP, `-i` 内部 TCP 信息, `-n` 数字格式, `-m` 内存缓冲区。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对训练网络的排障，只需要看训练节点上的指标（如 retrans、softirq、queue drop），不需要查看网络交换机上的计数器。",
+        "answer": false,
+        "explain": "主机上的指标只描述了一半事实。交换机上的 discard（丢包）、pause frame（PFC 暂停帧）、ECN mark（拥塞标记）、buffer occupancy（缓冲区占用）才能说明共享链路发生了什么。特别是对于 RoCE/InfiniBand 训练网络，PFC 风暴、ECMP 不均等问题在主机端几乎看不出来，必须查交换机端口计数器。"
+      }
+    ]
+  }
+]

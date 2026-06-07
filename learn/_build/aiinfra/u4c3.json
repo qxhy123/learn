@@ -1,0 +1,119 @@
+[
+  {
+    "id": "u4c3",
+    "title": "模型并行与流水并行",
+    "subtitle": "TP、PP、SP、CP 的机制、代价与组合",
+    "intro": [
+      {
+        "title": "五个维度的并行切分",
+        "body": "当单 GPU 无法承载训练所需的参数、activation 和计算量时，需要从五个维度做切分：\n\n| 维度 | 切什么 | 典型机制 | 主要收益 | 主要代价 |\n|---|---|---|---|---|\n| 样本 | batch/sample | DP | 提升样本吞吐 | 梯度同步、straggler |\n| 训练状态 | params/grads/Adam state | FSDP/ZeRO | 降低状态冗余 | AllGather/ReduceScatter |\n| 层内张量 | hidden/heads/矩阵行列 | TP | 降低单层峰值 | 高频 collective |\n| 层段 | Transformer blocks | PP | 降低每卡层数 | pipeline bubble |\n| 序列/上下文 | tokens/KV/context | SP/CP | 降低长序列 activation | 序列维度通信 |\n\n一句话总结：**DP 切样本，FSDP/ZeRO 切训练状态，TP 切层内张量，PP 切层段，SP/CP 切序列。**"
+      },
+      {
+        "title": "Rank Mesh：三维并行的坐标系",
+        "body": "混合并行的全局 rank 通过公式映射到各维度：\n\n`world_size = DP × PP × CP × TP`\n\n以 row-major 顺序（TP 最内层）：\n\n```\ntp_rank = global_rank % TP\ncp_rank = (global_rank // TP) % CP\npp_rank = (global_rank // (TP × CP)) % PP\ndp_rank = global_rank // (TP × CP × PP)\n```\n\n例如 `DP=2, PP=4, TP=4`（32 GPU）中，同一 PP stage、TP 组内的 rank 共同计算同一层，彼此通信走 NVSwitch；不同 DP 副本间通过 IB/RoCE 同步梯度；PP stage 之间通过 P2P send/recv 传 activation。\n\n**最危险的事故**：训练能跑、checkpoint 能写，但恢复时按另一套 rank order 解释 shard，导致 silent weight corruption。rank mesh 定义必须全局唯一。",
+        "tip": "每个 global_rank 必须能反查出 tp_rank、pp_rank、dp_rank。checkpoint metadata 如果缺少 parallel layout，reshape 恢复和推理转换都会失败。"
+      },
+      {
+        "title": "Tensor Parallel（TP）：切层内张量",
+        "body": "TP 把一层的权重矩阵按 hidden 维度或 head 维度分到多个 rank。标准 Megatron-style TP：\n\n- **Column Parallel Linear**：切输出 hidden，forward 不 AllGather，后续继续在分片上计算\n- **Row Parallel Linear**：切输入 hidden，局部 matmul 后 AllReduce（或 ReduceScatter if SP）\n\n一个 Transformer block 的 forward 通常有 2 次 AllReduce（attention output projection、MLP FC2），backward 再对称 2 次。\n\n**关键约束**：hidden size、Q heads 必须能被 TP 整除。GQA/MQA 的 KV heads 也通常需要能被 TP 整除（如 KV heads=8 则 TP ≤ 8）。\n\n**TP 优先放节点内 NVSwitch**：节点内 AllReduce bus bandwidth ≈ 600 GB/s，跨节点仅 ~50 GB/s（400G IB），跨节点 TP 每层通信延迟约扩大 12×，成为严重瓶颈。"
+      },
+      {
+        "title": "Pipeline Parallel（PP）：1F1B 调度与 bubble",
+        "body": "PP 把模型层段分配到不同 rank（stage），microbatch 依次流过各 stage，形成流水线。\n\n**1F1B 调度**（最常用）的两种 bubble 口径：\n\n- `bubble_overhead = (p-1)/m`：相对理想计算槽的额外成本\n- `bubble_elapsed_fraction = (p-1)/(m+p-1)`：端到端时间线中空槽占比\n\n`p=8 stage, m=16 microbatch` 时：overhead=43.8%，elapsed fraction=30.4%。**生产规则：m ≥ 4p 才能让稳态主导。**\n\n**Interleaved 1F1B**：一个物理 rank 持有多个 virtual stage，bubble 降为 `(p-1)/(v×m)`，但每个 microbatch 跨越更多 stage 边界，activation send/recv 通信量随 v 倍增。\n\n**Zero Bubble**：把 backward 拆成 B-pass（dL/dX）和 W-pass（dL/dW），W-pass 可推迟到空槽执行，bubble 接近 0，但 activation 驻留时间更长。",
+        "tip": "PP stage 边界的 activation payload 大小取决于 layout：Megatron shard layout 下 PP 传输 hidden/TP 宽度，比 full-hidden layout 小 TP 倍，显著影响跨节点带宽压力。"
+      },
+      {
+        "title": "Activation 显存：最容易被低估的项",
+        "body": "70B 模型（BF16，hidden=8192，seq=8192，80 层，micro_batch=1）：\n\n| AC 策略 | Per-block activation | 80 层合计 |\n|---|---|---|\n| 无 AC（标准 MHA）| hidden 项 + seq² attention score | ~784 GB（超出 8×80GB 节点）|\n| FlashAttention 替代 | ~hidden × 18 bytes/element | ~97 GB |\n| Selective AC + FlashAttention | ~hidden × 8 bytes/element | ~43 GB |\n| Full Recompute（只存 block 输入）| ~hidden × 2 bytes/element | ~11 GB |\n\n**标准 MHA 不开 FlashAttention，70B 训练 activation 约 784 GB，超出单节点总 HBM 640 GB。**\n\nZeRO/FSDP 不切 activation。TP=8 将 hidden 相关 activation 降到 1/8，但 seq² 项只降 num_heads/TP。CP 对 attention 的二次方项有最显著效果：CP=4 将 attention workspace 降到约 1/16。",
+        "tip": "生产 70B 训练必须开 FlashAttention + Selective AC。「显存够了」不代表 activation 没问题——activation 是随 batch、seq、layer 增长最快的项。"
+      },
+      {
+        "title": "Sequence/Context Parallel（SP/CP）",
+        "body": "**SP**（通常在 TP 组内）：把 TP 的 AllReduce 改成 ReduceScatter(seq)，非 attention activation（LayerNorm、Dropout、Residual）按 sequence 分片，每 rank 只保留 S/TP 的 token，再在下一个 ColumnParallel 前 AllGather(seq) 还原。总通信量与 TP AllReduce 近似，但 activation 常驻量降到约 1/TP。\n\n**CP**（Context Parallel）：面向超长 attention context。每 rank 持有 S/CP 的 token，通过 Ring FlashAttention 逐轮 send/recv K/V 块，用 online softmax 合并结果。\n\n64K context、CP=4、GQA（8 KV heads）时，每层 CP 通信约 201 MB，80 层×2 ≈ 32 GB/step，400G IB 上纯通信约 0.64 s——**必须靠 Ring FA 的 overlap（KV exchange 与本地 attention 同时进行）才能压到可接受范围**。\n\n**适用场景**：\n- 8K/16K context → SP 有收益，CP 未必值得\n- 64K/128K+ context → CP 必须进入候选\n\n**关键约束**：CP 下每个 rank 的 token 必须保留全局 position（RoPE 用 global_pos），否则 causal mask 在 CP 边界错位。"
+      },
+      {
+        "title": "Stage 负载均衡与 pipeline 效率",
+        "body": "pipeline bubble 公式假设所有 stage 计算时间相同。真实情况：\n\n- Stage 0 含 Embedding → 比普通 Transformer block 慢 10-30%\n- 最后 stage 含 LM Head + Loss → 更慢\n\n`stage_imbalance_ratio = max(stage_time_p50) / mean(stage_time_p50) - 1`\n- < 5%：可接受\n- 5-15%：显著，应重新分配层数\n- > 15%：强制修复，即使开 interleaved pipeline，最慢 stage 仍是瓶颈\n\n修复手段：\n- Embedding 单独放 stage 0（0 层 Transformer block）\n- Vocab parallel 切分 LM head\n- DeepSpeed `partition_method=\"parameters\"` 按参数量均分\n\n**注意**：先区分「stage 时间差来自 compute 不均」还是「来自 data skew（某些 rank 样本更长）」，两种修复方式完全不同。"
+      },
+      {
+        "title": "3D Parallel 通信的重叠原则",
+        "body": "通信能否被 compute 覆盖决定实际 step time。各类通信的重叠条件：\n\n| 通信类型 | 重叠对象 | 关键实现条件 |\n|---|---|---|\n| TP AllReduce | 下一层 ColumnParallel GEMM | `CUDA_DEVICE_MAX_CONNECTIONS=1` + 独立 CUDA stream |\n| PP send/recv | 同 stage 下一 microbatch 的 compute（1F1B 稳态）| 异步 `isend/irecv`；m ≥ PP |\n| DP gradient AllReduce | 后续 layer backward | DDP bucket 就绪即启动异步 AllReduce |\n| FSDP AllGather（backward prefetch）| 前一 unit backward | `backward_prefetch=BACKWARD_PRE` |\n| CP KV ring exchange | 本地 context block attention | Ring FlashAttention 实现 |\n\n**诊断顺序**：先确认 placement（TP 在节点内），再用 profiler 找是哪类通信暴露，最后才调 NCCL env。",
+        "reveal": {
+          "q": "为什么 70B 模型不开 FlashAttention 时，单节点 8×80GB 无法训练（即使有 TP/PP）？",
+          "a": "标准 MHA 的 attention score 矩阵是 O(batch×heads×seq²)，70B（64 heads, seq=8192）无 AC 时 attention scores 约 688 GB，加上 hidden 相关 activation 约 97 GB，合计约 784 GB，超出节点 640 GB HBM。ZeRO/FSDP 不切 activation；TP=8 只将 seq² 项按 num_heads 降到约 1/8，仍约 86 GB/层，不解决根本问题。必须用 FlashAttention 将 O(seq²) 降为 O(seq) 的 LSE 存储。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "70B 模型（hidden=8192, 64 heads, seq=8192）用标准 MHA 无 FlashAttention、无 AC 时，80 层的 attention score activation 约多少 GB？",
+        "options": ["约 97 GB", "约 43 GB", "约 688 GB", "约 11 GB"],
+        "answer": 2,
+        "explain": "Attention score 矩阵大小为 batch×heads×seq×seq×dtype_bytes = 1×64×8192×8192×2 bytes ≈ 8.6 GB/层，80 层合计约 688 GB。这超出了单节点 8×80GB 的总 HBM（640 GB），是生产必须开 FlashAttention 的根本原因。"
+      },
+      {
+        "type": "judge",
+        "prompt": "TP=16 可以应用于 KV heads=8 的 GQA 模型（如 LLaMA-3 70B），因为 Q heads=64 能整除 16。",
+        "answer": false,
+        "explain": "Megatron 常见 GQA layout 要求 num_kv_heads % TP == 0。KV heads=8 时，TP 上限为 8。TP=16 超出 KV heads 数量，需要框架支持 KV replication 或特殊 shard 规则，不能直接使用默认配置。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PP=8 stages, m=16 microbatches，1F1B 调度的 bubble_overhead（相对理想计算槽）是多少？",
+        "options": ["约 7%", "约 30%", "约 44%", "约 87%"],
+        "answer": 2,
+        "explain": "bubble_overhead = (p-1)/m = (8-1)/16 = 7/16 ≈ 43.8%。注意 elapsed_idle_fraction = (p-1)/(m+p-1) = 7/23 ≈ 30.4%，两个口径不同，不能混用。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧并行机制与其主要解决的问题匹配",
+        "left": ["Tensor Parallel（TP）", "Pipeline Parallel（PP）", "Context Parallel（CP）", "Sequence Parallel（SP）"],
+        "right": [
+          "单层矩阵/activation 超出单卡容量，切层内 hidden/heads",
+          "整网层数太多，每卡只承载一段层段，microbatch 像流水线流过",
+          "超长 attention context，每 rank 只持有 S/CP 的 token，ring 交换 KV",
+          "TP 组内非 attention activation 仍重复存储，按 sequence 分片减少冗余"
+        ],
+        "explain": "TP 切层内张量，PP 切层段，CP 切长上下文 attention，SP 切非 attention 的序列激活（通常在 TP 组内）。四个机制解决不同瓶颈，经常组合使用。"
+      },
+      {
+        "type": "input",
+        "prompt": "为什么 TP 应优先放在节点内 NVSwitch 而不是跨节点？（填核心原因，不超过 20 字）",
+        "accept": ["跨节点带宽远低于节点内 NVSwitch", "节点内 AllReduce 带宽远高于 IB/RoCE", "每层 AllReduce 跨节点延迟增大约 12 倍", "跨节点 TP 每层通信成为严重瓶颈"],
+        "explain": "节点内 NVSwitch AllReduce bus bandwidth ≈ 600 GB/s，跨节点 IB（400G）≈ 50 GB/s，差距约 12 倍。TP 每个 Transformer block 有 2 次 AllReduce，跨节点时每次通信延迟从 ~0.4 ms 变成 ~4.8 ms，160 次串行约 768 ms，远超计算时间。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Interleaved 1F1B 通过将一个物理 rank 分配多个 virtual stage 来降低 pipeline bubble，但增加了每个 microbatch 的 activation send/recv 通信次数。",
+        "answer": true,
+        "explain": "Interleaved 1F1B 将 bubble 降为 (p-1)/(v×m)，但 virtual stage 数量 v 越大，每个 microbatch 跨越的 stage 边界越多，activation send/recv 通信量随 v 倍增加。在带宽不足时，v 太大反而拖慢总吞吐。"
+      },
+      {
+        "type": "choice",
+        "prompt": "64K context、CP=4 的 Ring FlashAttention 中，每个 rank 的 Q token 需要参与多少轮 ring step？",
+        "options": ["1 轮（只看本地 K/V）", "CP 轮（每轮轮转一块 K/V）", "CP-1 轮（不包括本地那一轮）", "seq/CP 轮"],
+        "answer": 2,
+        "explain": "每个 rank 持有 S/CP 的 token 作为 Q，需要看到全部 S 的 K/V。本地 K/V 直接参与（第 0 轮），然后从相邻 rank 依次接收 CP-1 块 K/V，总共 CP-1 轮 ring exchange。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 PP 调度策略与其 bubble overhead 公式匹配",
+        "left": ["GPipe（全 F 再全 B）", "1F1B（Megatron 默认）", "Interleaved 1F1B（virtual stage=v）", "Zero Bubble"],
+        "right": [
+          "约 2(p-1)/m",
+          "(p-1)/m",
+          "约 (p-1)/(v×m)",
+          "接近 0（W-pass 填空槽）"
+        ],
+        "explain": "GPipe 约 2(p-1)/m，因为完整 forward 后再完整 backward，空泡翻倍；1F1B 为 (p-1)/m；Interleaved 1F1B 引入 virtual stage 数 v 进一步降低；Zero Bubble 将 backward 拆成 B-pass 和 W-pass，W-pass 填充空槽，bubble 接近 0。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Context Parallel（CP）中，每个 rank 持有的 token 可以用 local position index（从 0 开始）计算 RoPE，只要在合并时再加上 global offset 即可。",
+        "answer": false,
+        "explain": "CP 中每个 rank 的 token 必须在 RoPE 计算时就使用 global_pos（= cp_rank × S/CP + local_pos），causal mask 也必须基于全局 position。用 local position 计算后再加 offset 会导致 RoPE 相位错误和 causal mask 在 CP 边界错位，表现为 loss 下降但长上下文能力损坏。"
+      }
+    ]
+  }
+]

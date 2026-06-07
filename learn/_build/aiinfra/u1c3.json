@@ -1,0 +1,128 @@
+[
+  {
+    "id": "u1c3",
+    "title": "乱序执行与 ROB",
+    "subtitle": "OoO 引擎、寄存器重命名、ROB 顺序提交与 AI 服务代码性能",
+    "intro": [
+      {
+        "title": "顺序流水线为什么不够？",
+        "body": "顺序流水线遇到一次 L3 miss（约 80 cycle）时，后续所有指令都要排队等待，即使它们完全不依赖那次 miss 的结果。这相当于把一个工厂里所有工位都停下来，等一台机器修好。\n\n**OoO（Out-of-Order Execution）** 回答了一个更难的问题：当一条指令的 latency 远大于 1 cycle 时，怎样让「和正在等待的指令无关」的后续工作不要白白闲置？\n\n关键数据：现代服务器 CPU（Sapphire Rapids、Zen4）的 ROB 容量 320–512，每核同时维持 90–128 个 in-flight load。如果你的 host-side 代码让 ROB 平均只装 30–50 条 in-flight uop，CPU 算力会被结构性浪费 70% 以上，而 `top` 看到的还是 100% 利用率。",
+        "tip": "OoO 的价值不是「乱序」本身，而是「用乱序并行隐藏延迟」。关键看 MLP（Memory Level Parallelism）：能同时发起多少个 outstanding miss。"
+      },
+      {
+        "title": "寄存器重命名：消除 WAR/WAW 假依赖",
+        "body": "x86-64 架构只有 16 个通用整数寄存器，寄存器名字会被复用，产生「假依赖」：\n\n- **WAR（Write After Read）**：后一条先写，看似依赖前一条的读 → 假依赖\n- **WAW（Write After Write）**：两条都写同一寄存器 → 假依赖\n\n**寄存器重命名（Register Renaming）** 的做法：\n1. 用大得多的物理寄存器堆（PRF，200+ 个）代替架构寄存器\n2. Register Alias Table（RAT）维护「每个架构寄存器 → 哪个物理寄存器」的映射\n3. 每条写指令分配一个新物理寄存器，WAR/WAW 假依赖完全消除\n4. Free List 管理可用物理寄存器；retire 时把旧映射的物理寄存器还回 Free List\n\n| 依赖类型 | 是否真依赖 | 能否被 rename 消除 |\n|---|---|---|\n| RAW（Read After Write） | 是 | 否，语义上必须等 |\n| WAR（Write After Read） | 否，假依赖 | 是 |\n| WAW（Write After Write） | 否，假依赖 | 是 |",
+        "tip": "Free List 空了，rename stage 必须 stall。这是一个常被忽略的 backend 资源瓶颈，表现为 `resource_stalls.rob` 或 `resource_stalls.rs` 升高。"
+      },
+      {
+        "title": "ROB（Reorder Buffer）：乱序执行与精确异常的桥梁",
+        "body": "乱序执行带来新问题：如果一条除法指令在 5 cycle 后报溢出错误，但后面那些已经先执行完的指令已经把结果写进寄存器，OS 看到的是「错误的程序状态」——debug、page fault、信号处理全部乱掉。\n\n**ROB（Reorder Buffer）** 是解决方案：\n- **执行可以乱序**：就绪的 uop 立刻发射到执行端口\n- **提交必须顺序**：只有走到 ROB 队头且无异常时，才把结果写入架构状态（retire）\n- 分支误预测时，squash ROB 中所有 younger uop，回滚 RAT 映射\n\nROB 容量决定了「可覆盖的最大 in-flight 工作量」：\n\n| ROB size | 典型微架构 |\n|---|---|\n| 80 | 低功耗核（Cortex-A55 类）|\n| 224–256 | Zen3 / Cortex-X1 |\n| 320–352 | Zen4 / Apple M2 P-core |\n| 512 | Sapphire Rapids |",
+        "reveal": {
+          "q": "为什么 ROB 容量不做到 1000+？是技术上做不到吗？",
+          "a": "技术上可以，但面积和功耗会按 entry² 量级增长（多端口 CAM 结构），且边际收益递减。实际上 ROB 做到「刚好覆盖 LLC miss + 部分 DRAM miss 窗口」即可，再大只浪费功耗。retire width（4–8 uop/cycle）是更硬的 IPC 上限。"
+        }
+      },
+      {
+        "title": "OoO 引擎完整结构：Frontend → Backend → Retire",
+        "body": "现代 OoO 处理器内部分三大块：\n\n**In-Order Frontend**（按程序顺序处理）：\n- Branch Predict → Fetch → Pre-decode → Decode（4–6 wide）→ Rename/Allocate → Dispatch\n\n**Out-of-Order Backend**（允许乱序）：\n- Issue Queue（Scheduler / Reservation Station）：等所有源操作数 ready 且端口空闲时发射\n- Execute Units（ALU、FP、Vec、Branch、Load/Store）\n- Writeback 到物理寄存器堆（PRF）\n\n**In-Order Retire**（按程序顺序提交）：\n- ROB 队头 → Commit → 释放旧物理寄存器回 Free List\n\n关键资源容量（Sapphire Rapids / Zen4 量级）：\n\n| 资源 | 作用 | Sapphire Rapids | Zen4 |\n|---|---|---|---|\n| ROB | 顺序追踪 in-flight uop | 512 | 320 |\n| Integer PRF | 物理整数寄存器 | 280 | 224 |\n| Scheduler/RS | 等待发射的 uop | 97–205 | 100+ |\n| Load Buffer | 未完成 load | 192 | 136 |",
+        "tip": "Retire width（4–8 uop/cycle）是 IPC 的硬性上限。无论 ROB 多大，每周期最多 retire 8 条 uop，这是物理边界，无法突破。"
+      },
+      {
+        "title": "Memory Disambiguation 与 Load/Store Queue",
+        "body": "寄存器依赖在 rename 阶段就能精确分析。但内存依赖不行：`store [rax], r1; load r2, [rbx]` 是否冲突，取决于 `rax` 和 `rbx` 运行时是否相等，编译器无法静态判断。\n\n**Memory Disambiguation Predictor（内存消歧义预测器）**：根据历史预测「这条 load 大概率不和前面未解析的 store 冲突」，允许 load 投机执行。Load/Store Queue + Memory Order Buffer 事后检查：如果 store 地址解出后发现冲突，squash 该 load 及依赖链，重新执行。\n\n常见问题信号：\n\n| 现象 | 计数器 | 优化方向 |\n|---|---|---|\n| 内存排序机器清除 | `machine_clears.memory_ordering` | 降低 store/load 别名密度，加 `restrict` |\n| 4K 地址别名 | `ld_blocks_partial.address_alias` | 调整 buffer 间距、padding |\n| 部分 forwarding 失败 | `ld_blocks.store_forward` | 统一访问宽度、对齐 |\n| 跨 cache line 访问 | `mem_inst_retired.split_loads` | hot data 按 64B 对齐 |"
+      },
+      {
+        "title": "ROB 满了会怎样：从 cache miss 到 IPC 崩溃的路径",
+        "body": "最重要的工程理解：**一次 L3/DRAM miss 可以让 IPC 从 2.0 跌到 0.5**，不是因为 CPU 变慢了，而是因为 ROB 被填满后无法再发现新的并行工作。\n\n完整路径：\n1. 一次 L3 miss（~80 cycle）让 load uop 长时间占着 ROB 队头无法 retire\n2. 后续 200+ uop 不断进来填满 ROB\n3. Rename stage 被迫 stall（ROB 无空位可分配）\n4. Frontend 取指无法消化 → 整个流水线「冻结」\n5. 同时，无法再发起新的 prefetch 式 load → MLP 退化到 1\n6. 下次 miss 到来又重复这个过程\n\n**IPC 崩溃的核心诊断**：\n- `topdown-be-bound > 60%` 且 `cycle_activity.stalls_l3_miss / cycles > 30%` → 数据布局问题\n- 不是加线程能解决的，加线程只会让 cache 竞争更严重",
+        "tip": "当 `top` 显示 CPU 100% 但 IPC < 0.8 时，最先怀疑的是 ROB/PRF/LSQ 资源耗尽，而不是「CPU 不够用」。增加 CPU 资源（加线程、加 pod）在这种情况下无法解决问题。"
+      },
+      {
+        "title": "AI Infra 代码的 OoO 友好度",
+        "body": "AI 推理服务 host-side 代码的 OoO 友好度分析：\n\n| 代码模式 | OoO 友好度 | 原因 |\n|---|---|---|\n| 紧凑 SoA 数组 + 简单循环 | 高 | rename 出大量独立链，硬件 prefetcher 工作良好 |\n| 紧凑数组 + 复杂内层分支 | 中 | 分支预测决定好坏 |\n| 链表 / 树遍历（指针追逐） | 低 | 每步依赖前一步结果，MLP = 1 |\n| 哈希表随机查找 | 低 | cache miss + 分支双重打击 |\n| 字符串状态机 | 低 | 每 byte 强依赖前一个 byte |\n| 跨线程原子计数 | 极低 | coherence traffic + ROB 串行化 |\n\n**Worked Example**：把 `std::list<Request*>` 调度队列改成 SoA + 索引（status/prompt_len/lora_id 各一个连续数组），IPC 从 0.55 提升到 1.92，backend bound 从 0.61 降到 0.22，p99 scheduler 时间从 1.8ms 降到 0.5ms，GPU 利用率从 60% 回到 87%。",
+        "reveal": {
+          "q": "不用 SIMD、不改算法，只改数据布局，IPC 能提升 3 倍吗？",
+          "a": "可以。把「链表+指针追逐」改成「SoA 连续数组」后，硬件 prefetcher 能自动预取相邻元素，ROB 可以同时维持 30+ 个 in-flight load（而不是 1 个），OoO 的并行能力完全释放。这就是「零成本性能」的真实案例。"
+        }
+      },
+      {
+        "title": "诊断 OoO 健康度的关键 perf 指标",
+        "body": "OoO 健康检查的核心指标：\n\n| 指标 | 计算方式 | 健康范围 | 异常含义 |\n|---|---|---|---|\n| IPC | `instructions / cycles` | 1.5–3.0（host 服务） | < 1.0 = backend 严重 stall |\n| Retire slots 利用率 | `uops_retired / (cycles × 8)` | > 0.5 | < 0.3 = 大量 bubble |\n| Speculation 浪费率 | `(uops_issued - uops_retired) / uops_issued` | < 0.10 | > 0.20 = 分支误预测多 |\n| Backend bound | `stalls_total / cycles` | < 0.30 | > 0.50 = ROB/PRF/LSQ 满 |\n| L3-miss-bound | `stalls_l3_miss / cycles` | < 0.15 | > 0.30 = 数据布局问题 |\n\n快速命令：`perf stat -e cycles,instructions,uops_issued.any,uops_retired.retire_slots,cycle_activity.stalls_total,cycle_activity.stalls_l3_miss -- ./workload`"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "乱序执行（OoO）的核心价值是什么？",
+        "options": [
+          "让 CPU 以更高的时钟频率运行，从而提升性能",
+          "把顺序程序自动重写成并行程序，消除所有数据依赖",
+          "当一条长延迟指令在等待时，让与其无关的后续指令先执行，隐藏延迟",
+          "允许多个线程的指令交错执行，提升多线程程序的性能"
+        ],
+        "answer": 2,
+        "explain": "OoO 的目标是「隐藏延迟」：一条 load 在等 L3 miss（80 cycle）时，把 ROB 窗口内所有操作数已就绪的独立 uop 先发射执行，不让 CPU 白白空转。这不改变程序语义（ROB 保证顺序提交），也不改变频率，只是充分利用了 in-flight 的时间窗口。"
+      },
+      {
+        "type": "judge",
+        "prompt": "寄存器重命名（Register Renaming）可以消除所有三种数据依赖：RAW、WAR 和 WAW。",
+        "answer": false,
+        "explain": "Register Renaming 只能消除 WAR（Write After Read）和 WAW（Write After Write）这两种「假依赖」。RAW（Read After Write）是真实的语义依赖——后一条指令的输入确实依赖前一条指令的输出，无法消除，必须等。"
+      },
+      {
+        "type": "choice",
+        "prompt": "ROB（Reorder Buffer）的主要作用是什么？",
+        "options": [
+          "提升 CPU 时钟频率，让每条指令执行更快",
+          "在乱序执行下保证程序看起来像顺序执行，支持精确异常",
+          "增大一级 Cache 的容量，减少 cache miss",
+          "记录所有分支指令的历史，用于分支预测"
+        ],
+        "answer": 1,
+        "explain": "ROB 的关键作用是「执行可以乱序，提交必须顺序」。uop 在 ROB 队头且无异常时才 retire，把结果提交到架构状态。这样即使指令乱序完成，外界（OS、调试器）看到的状态仍然精确——page fault、中断处理都依赖这个保证。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`perf stat` 显示某服务 CPU 使用率 100%，但 Backend Bound = 72%（其中 Memory Bound 60%），IPC = 0.55。最合适的下一步是什么？",
+        "options": [
+          "增加 pod 的 CPU 核数，让更多线程并行处理请求",
+          "优化分支预测，使用 `__builtin_expect` 标注 cold path",
+          "查找数据布局问题，将链表/指针结构改为连续 SoA 数组",
+          "开启 AVX-512 SIMD 向量化，提升标量路径吞吐"
+        ],
+        "answer": 2,
+        "explain": "Memory Bound 60% 是主导瓶颈，说明 CPU 大量时间在等待内存（通常是 L3/DRAM miss）。这种情况下加 CPU 核数只会加剧 cache 竞争，使用 SIMD 也无法解决数据访问慢的问题。最直接的手段是改数据布局（SoA、连续内存、避免指针追逐），让硬件 prefetcher 工作，提高 MLP。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 OoO 引擎的组件与其功能配对：",
+        "left": ["Register Alias Table（RAT）", "Free List", "Reservation Station / Issue Queue", "ROB（Reorder Buffer）"],
+        "right": ["按程序顺序追踪 in-flight uop，保证顺序提交", "记录架构寄存器到物理寄存器的当前映射", "操作数就绪且端口空闲时把 uop 发射到执行单元", "管理可用物理寄存器的分配与回收"],
+        "explain": "RAT 维护「架构寄存器 → 物理寄存器」的映射；Free List 管理空闲物理寄存器的分配；Reservation Station 是 OoO 调度器，等操作数 ready 后发射；ROB 保证顺序提交和精确异常。"
+      },
+      {
+        "type": "input",
+        "prompt": "某 CPU retire 率平均 4 uop/cycle，希望完全隐藏一次 200-cycle DRAM miss。理论上至少需要多少个 ROB entry？（填数字）",
+        "accept": ["800", "800 个", "800 entries"],
+        "explain": "需要 in-flight uop 数 = miss_latency × retire_rate = 200 cycle × 4 uop/cycle = 800 uop。这解释了为什么现代高性能 CPU 的 ROB 做到 512（Sapphire Rapids）——实际上还不够隐藏一次 DRAM miss，但多个 miss 可以并发（MLP），且并非所有工作都在等同一次 miss。"
+      },
+      {
+        "type": "judge",
+        "prompt": "把「指针链表遍历」改为「SoA 连续数组遍历」后，即使不使用 SIMD，IPC 也可能提升 3 倍以上。",
+        "answer": true,
+        "explain": "这是真实的性能改进案例。链表遍历是「指针追逐」，每步 deref 依赖前一步结果，ROB 无法并行发起多个 load（MLP = 1）。改为 SoA 连续数组后，硬件 prefetcher 可以预取相邻元素，OoO 可在 ROB 窗口内同时维持 30+ 个 in-flight load，IPC 从 0.55 提升到 1.92 是实测结果。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`perf stat` 发现 `machine_clears.memory_ordering` 计数异常高。这最可能说明什么问题？",
+        "options": [
+          "L3 Cache 容量不足，working set 溢出到 DRAM",
+          "分支预测失败率过高，大量 speculative 工作被清除",
+          "store 和 load 的地址别名预测错误，投机执行的 load 被迫重新执行",
+          "SIMD 指令和标量指令混用导致执行端口冲突"
+        ],
+        "answer": 2,
+        "explain": "`machine_clears.memory_ordering` 是 memory disambiguation predictor 预测错误的信号：CPU 预测某条 load 和前面的 store 不冲突，允许其投机执行；但 store 地址解析后发现确实冲突，只好 squash 该 load 及依赖链重新执行。常见于 tokenizer/serializer 在同一 buffer 上做「小写 + 紧接小读」。加 `restrict` 关键字或重排访问顺序可以缓解。"
+      }
+    ]
+  }
+]

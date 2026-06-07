@@ -1,0 +1,528 @@
+[
+ {
+  "title": "序列建模基础",
+  "subtitle": "从 RNN/LSTM 的局限，看清注意力机制为什么会出现",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "在动手搭 Transformer 之前，先得想清楚：它到底是来替谁干活的。\n\n答案是序列建模里那套老办法——RNN 和 LSTM。文本、语音、时间序列这类数据有个共同点：**顺序本身就携带信息**。「我爱北京天安门」打乱成「天安门爱我北京」，意思就全变了。语言模型要学的，正是这种带顺序的条件概率 $P(x_1,\\ldots,x_T)=\\prod_{t=1}^{T}P(x_t\\mid x_1,\\ldots,x_{t-1})$。\n\nRNN/LSTM 处理这类数据曾是主流，但它们有几个改超参也救不回来的结构性毛病。这一关就把这些毛病一条条摆出来——正是这些毛病，逼出了注意力机制。"
+   },
+   {
+    "title": "RNN 的核心机制：隐藏状态逐步传信",
+    "body": "RNN（Recurrent Neural Network，循环神经网络）的想法很朴素：**用一个隐藏状态 $h_t$ 在时间步之间传递信息**。每一步把「上一步的记忆 $h_{t-1}$」和「这一步的新输入 $x_t$」揉到一起，得到新的记忆。\n\n隐藏状态更新公式：\n\n$$h_t=\\tanh(W_{hh}h_{t-1}+W_{xh}x_t+b_h)$$\n\n逐符号看：$x_t\\in\\mathbb{R}^{d_x}$ 是第 $t$ 步输入；$h_t\\in\\mathbb{R}^{d_h}$ 是该步隐藏状态；$h_0$ 通常初始化为零向量；$W_{hh}\\in\\mathbb{R}^{d_h\\times d_h}$ 把旧记忆映射到新记忆，$W_{xh}\\in\\mathbb{R}^{d_h\\times d_x}$ 把输入并入记忆；$\\tanh$ 把结果压到 $(-1,1)$。\n\n一个关键特点：**所有时间步共享同一组参数** $W_{hh},W_{xh},b_h$，所以参数量不随序列变长而增加。",
+    "formula": "h_t=\\tanh(W_{hh}h_{t-1}+W_{xh}x_t+b_h)"
+   },
+   {
+    "title": "为什么 RNN 会梯度消失",
+    "body": "为什么 RNN 学不会长距离依赖？因为训练它要用 BPTT（基于时间的反向传播），梯度得沿着所有时间步一路连乘传回去：\n\n$$\\frac{\\partial L}{\\partial h_1}=\\frac{\\partial L}{\\partial h_T}\\cdot\\prod_{t=2}^{T}\\frac{\\partial h_t}{\\partial h_{t-1}}$$\n\n每一项 Jacobian 是 $\\frac{\\partial h_t}{\\partial h_{t-1}}=\\text{diag}(\\tanh'(\\cdot))\\cdot W_{hh}$。连乘 $T-1$ 项后，结果由 $W_{hh}$ 的最大奇异值 $\\sigma_1$ 主导：\n\n- 若 $\\sigma_1<1$，连乘指数级趋零，梯度**消失**，早期时间步根本收不到有效信号；\n- 若 $\\sigma_1>1$，连乘指数级膨胀，梯度**爆炸**，训练数值崩掉。\n\n所以「连乘」这个结构本身，就注定了普通 RNN 难以把梯度稳定地传过几十上百步。"
+   },
+   {
+    "title": "LSTM 怎么缓解：把连乘换成加法",
+    "body": "LSTM（Long Short-Term Memory，长短期记忆网络）1997 年提出，专门治梯度消失。它的关键是新增一条**细胞状态 $c_t$**，当「信息高速公路」，再用三个门控制读写。\n\n三个门都是 $0$ 到 $1$ 的向量：遗忘门 $f_t=\\sigma(W_f[h_{t-1},x_t]+b_f)$ 决定丢掉多少旧记忆；输入门 $i_t$ 决定写入多少新信息（候选 $\\tilde{c}_t=\\tanh(\\cdot)$）；输出门 $o_t$ 决定读出多少。细胞状态这样更新：\n\n$$c_t=f_t\\odot c_{t-1}+i_t\\odot\\tilde{c}_t$$\n\n$\\odot$ 是逐元素乘。**为什么这能缓解梯度消失？因为这是加法更新，不是 RNN 那种乘法/激活嵌套。** 求偏导得 $\\frac{\\partial c_t}{\\partial c_{t-1}}=f_t$，当遗忘门接近 $1$ 时这一项约等于 $1$，梯度几乎无衰减地流过去，长期记忆才得以保留。",
+    "formula": "c_t=f_t\\odot c_{t-1}+i_t\\odot\\tilde{c}_t"
+   },
+   {
+    "title": "手写一个 RNN 单元（PyTorch）",
+    "body": "把更新公式直接翻成代码，最能看清 RNN 内部在算什么。注意 `forward` 里那个按时间步走的 `for` 循环——这正是 RNN 必须串行的根源。\n\n```python\nimport torch\nimport torch.nn as nn\nclass ManualRNN(nn.Module):\n    def __init__(self, input_size, hidden_size):\n        super().__init__()\n        self.hidden_size = hidden_size\n        self.W_hh = nn.Linear(hidden_size, hidden_size, bias=False)\n        self.W_xh = nn.Linear(input_size, hidden_size, bias=True)\n    def forward(self, x, h_0=None):\n        B, T, _ = x.shape\n        h_t = torch.zeros(B, self.hidden_size) if h_0 is None else h_0\n        outputs = []\n        for t in range(T):\n            x_t = x[:, t, :]\n            h_t = torch.tanh(self.W_hh(h_t) + self.W_xh(x_t))\n            outputs.append(h_t)\n        return torch.stack(outputs, dim=1), h_t\n```\n\n输入 `x` 形状 `(B, T, input_size)`，输出 `(B, T, hidden_size)` 和最后一步 `h_t`。`W_hh` 和 `W_xh` 在所有 `t` 上复用，这就是参数共享。",
+    "tip": "用 `nn.Linear` 实现 $W_{hh}h+W_{xh}x$ 是常见技巧：线性层自带权重，乘法和偏置都替你管好了。"
+   },
+   {
+    "title": "RNN/LSTM 的三个结构性限制",
+    "body": "即便 LSTM 缓解了梯度消失，序列建模仍有三个改超参也解决不了的硬伤：\n\n**限制 1：信息瓶颈。** 经典 Seq2Seq 要把整个输入序列压进一个固定维度的上下文向量 $c$，再由它生成输出。序列越长，这个「把一本书压成一句话」的压缩损失越大。\n\n**限制 2：无法并行。** RNN 的 $h_t=f(x_t,h_{t-1})$ 依赖 $h_{t-1}$，必须一步算完才能算下一步，是 $O(n)$ 串行。在有几千个并行核的 GPU 上，这是巨大浪费。\n\n**限制 3：距离惩罚。** 位置 $i$ 和 $j$ 的信息要逐步传递，路径长 $O(|i-j|)$；距离越远越难捕捉。\n\n这三条，恰好对应了注意力机制要解决的三个问题。"
+   },
+   {
+    "title": "注意力的直觉与公式",
+    "body": "注意力机制（Attention）的核心想法很自然：**生成输出时，别只盯着那个压缩向量，而是「看」整个输入序列，按相关程度决定每一刻关注哪些部分。** 就像人翻译「猫坐在垫子上」，译到 cat 时重点看「猫」，译到 mat 时重点看「垫子」。\n\n形式上，给定解码器在时刻 $t$ 的状态 $s_t$ 和编码器所有输出 $\\{h_1,\\ldots,h_n\\}$：\n\n第一步，打分（对齐）：$e_{t,i}=\\text{score}(s_t,h_i)$，常用点积 $s_t^\\top h_i$ 或加性打分。\n\n第二步，softmax 归一化成权重：$\\alpha_{t,i}=\\dfrac{\\exp(e_{t,i})}{\\sum_{j=1}^{n}\\exp(e_{t,j})}$。\n\n第三步，对编码器输出加权求和：$c_t=\\sum_{i=1}^{n}\\alpha_{t,i}h_i$。\n\n现在 $c_t$ 是**每一步都不同的动态上下文向量**，信息瓶颈就此打破。",
+    "formula": "c_t=\\sum_{i=1}^{n}\\alpha_{t,i}h_i"
+   },
+   {
+    "title": "为什么 Transformer 敢彻底抛弃循环",
+    "body": "注意力既然能直接建模任意两个位置的关系，一个大胆的问题就冒出来了：**还需要循环结构来传信吗？** 2017 年《Attention Is All You Need》给的答案是：不需要。\n\n为什么这么做可行？因为注意力一次性让所有位置互相「看」，天然解决了前面三条限制：\n\n| 维度 | RNN/LSTM | Transformer |\n|------|---------|------------|\n| 并行性 | $O(n)$ 串行 | $O(1)$ 并行 |\n| 最大路径长度 | $O(n)$ | $O(1)$ |\n| 每层计算复杂度 | $O(n\\cdot d^2)$ | $O(n^2\\cdot d)$ |\n| 长距离依赖 | 难捕捉 | 直接建模 |\n\n代价是注意力矩阵带来 $O(n^2)$ 的复杂度。但「抛弃循环、全用注意力」这一步，催生了 GPT、BERT、T5 等现代大模型。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **以为 LSTM 解决了所有问题**：它只缓解了梯度消失，**没解决并行化和信息瓶颈**，仍然是串行的。\n- **把梯度消失归咎于 $\\tanh$ 本身**：根源是 Jacobian 沿时间步**连乘**，$W_{hh}$ 奇异值小于 1 时才指数衰减。\n- **混淆梯度消失与梯度爆炸**：$\\sigma_1<1$ 消失，$\\sigma_1>1$ 爆炸，是连乘的两个方向。\n- **以为注意力是 RNN 的一个层**：早期注意力确实搭在 RNN 上（Seq2Seq），但 Transformer 是**用注意力完全取代**循环。\n- **忘了 Transformer 的代价**：并行和短路径是用 $O(n^2)$ 的注意力矩阵换来的，长序列时这是瓶颈。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "RNN 隐藏状态更新 $h_t=\\tanh(W_{hh}h_{t-1}+W_{xh}x_t+b_h)$ 中，参数 $W_{hh},W_{xh},b_h$ 在不同时间步之间是什么关系？",
+    "options": [
+     "每个时间步用一组独立的参数",
+     "所有时间步共享同一组参数",
+     "只有前一半时间步共享参数",
+     "参数量随序列长度线性增加"
+    ],
+    "answer": 1,
+    "explain": "RNN 在所有时间步复用同一组参数，这正是参数量不随序列变长而增加的原因。"
+   },
+   {
+    "type": "judge",
+    "prompt": "RNN 的梯度消失主要源于：反向传播时 Jacobian 矩阵沿所有时间步连乘，当 $W_{hh}$ 的最大奇异值小于 1 时连乘指数级趋零。",
+    "answer": true,
+    "explain": "梯度沿时间步连乘 $T-1$ 项，$\\sigma_1<1$ 导致指数衰减（消失），$\\sigma_1>1$ 导致指数膨胀（爆炸）。"
+   },
+   {
+    "type": "choice",
+    "prompt": "LSTM 缓解梯度消失的核心机制是什么？",
+    "options": [
+     "用 ReLU 替换 $\\tanh$ 激活",
+     "细胞状态采用加法更新 $c_t=f_t\\odot c_{t-1}+i_t\\odot\\tilde{c}_t$，使 $\\partial c_t/\\partial c_{t-1}\\approx f_t$",
+     "增大隐藏层维度 $d_h$",
+     "把序列反向输入一遍"
+    ],
+    "answer": 1,
+    "explain": "细胞状态是加法更新而非乘法嵌套，遗忘门接近 1 时 $\\partial c_t/\\partial c_{t-1}=f_t\\approx 1$，梯度几乎无衰减地流过长序列。"
+   },
+   {
+    "type": "judge",
+    "prompt": "LSTM 通过门控和细胞状态既解决了梯度消失，也解决了 RNN 无法并行的问题。",
+    "answer": false,
+    "explain": "LSTM 只缓解了梯度消失；它仍然按时间步串行计算，并未解决并行化，也没解决固定上下文向量的信息瓶颈。"
+   },
+   {
+    "type": "choice",
+    "prompt": "经典 Seq2Seq（无注意力）模型的「信息瓶颈」具体指什么？",
+    "options": [
+     "GPU 显存不足以容纳整个序列",
+     "整个输入序列被压缩进一个固定维度的上下文向量，序列越长压缩损失越大",
+     "softmax 计算太慢",
+     "词表太大导致嵌入层参数过多"
+    ],
+    "answer": 1,
+    "explain": "编码器把任意长输入压成一个固定维度向量 $c$，解码器只能依赖它，长序列时这是不可能完成的压缩任务。"
+   },
+   {
+    "type": "choice",
+    "prompt": "注意力机制相比固定上下文向量，最关键的改进是？",
+    "options": [
+     "上下文向量 $c_t$ 在每个解码步动态变化，按相关性加权使用编码器所有隐状态",
+     "把上下文向量的维度调大了",
+     "用 LSTM 替换了 RNN",
+     "去掉了编码器，只保留解码器"
+    ],
+    "answer": 0,
+    "explain": "$c_t=\\sum_i\\alpha_{t,i}h_i$ 每步都不同，让解码器动态查阅整个输入序列，从而打破信息瓶颈。"
+   },
+   {
+    "type": "input",
+    "prompt": "RNN 中位置 $i$ 和位置 $j$ 之间信息交互的路径长度是 $O(?)$？用含 $i,j$ 的大 O 表示。",
+    "accept": [
+     "O(|i-j|)",
+     "O(|i - j|)",
+     "O(|j-i|)",
+     "|i-j|"
+    ],
+    "explain": "RNN 靠逐步传递，位置 $i$ 和 $j$ 的交互要走 $|i-j|$ 步，路径长 $O(|i-j|)$；Transformer 中是 $O(1)$。"
+   },
+   {
+    "type": "input",
+    "prompt": "Transformer 中任意两个位置之间的最大交互路径长度是 $O(?)$？",
+    "accept": [
+     "O(1)",
+     "1",
+     "常数"
+    ],
+    "explain": "自注意力让任意两个位置直接交互，路径长度为 $O(1)$，这是它能直接建模长距离依赖的关键。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在没有位置编码等额外机制的前提下，注意力机制相比 RNN 的优势之一是可以让所有位置的计算完全并行。",
+    "answer": true,
+    "explain": "RNN 因 $h_t$ 依赖 $h_{t-1}$ 必须串行；注意力一次性计算所有位置的相互关系，可完全并行，把 $O(n)$ 串行步降为 $O(1)$。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每个模型/机制与其最有代表性的特征配对：",
+    "left": [
+     "简单 RNN",
+     "LSTM",
+     "带注意力的 Seq2Seq",
+     "Transformer"
+    ],
+    "right": [
+     "隐藏状态乘法嵌套更新，长序列上梯度消失",
+     "细胞状态加法更新，缓解梯度消失但仍串行",
+     "动态上下文向量解除信息瓶颈，但编码仍需顺序进行",
+     "完全基于注意力，并行计算且任意位置路径长度 O(1)"
+    ],
+    "explain": "RNN—梯度消失；LSTM—加法更新缓解但仍串行；带注意力 Seq2Seq—动态上下文但编码仍串行；Transformer—完全并行、O(1) 路径。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Transformer「抛弃循环、全用注意力」付出的主要代价是什么？",
+    "options": [
+     "参数量比 RNN 少很多导致欠拟合",
+     "注意力矩阵带来 $O(n^2)$ 的计算/空间复杂度，长序列时成为瓶颈",
+     "无法处理变长序列",
+     "完全无法捕捉长距离依赖"
+    ],
+    "answer": 1,
+    "explain": "并行性和 $O(1)$ 路径是用 $n\\times n$ 注意力矩阵换来的，复杂度 $O(n^2)$，这是长序列上的主要瓶颈。"
+   },
+   {
+    "type": "input",
+    "prompt": "语言模型把序列联合概率分解为 $P(x_1,\\ldots,x_T)=\\prod_{t=1}^{T}P(x_t\\mid ?)$。问号处（第 $t$ 步的条件）是什么？",
+    "accept": [
+     "x_1,...,x_{t-1}",
+     "x_1,x_2,...,x_{t-1}",
+     "前面所有词",
+     "x_<t",
+     "x1...x_{t-1}"
+    ],
+    "explain": "自回归分解中，每个词的条件是它前面的所有词 $x_1,\\ldots,x_{t-1}$，这就是顺序依赖的数学表达。"
+   }
+  ]
+ },
+ {
+  "title": "注意力机制原理",
+  "subtitle": "Query/Key/Value 与缩放点积注意力，搞懂为什么除以根号 d_k",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "上一关知道了注意力能解除信息瓶颈，但它具体怎么算？这一关把注意力机制拆到底：从「加权求和」这个核心操作出发，引入 Query、Key、Value 三个角色，推出**缩放点积注意力**——也就是 Transformer 的基础构件。\n\n重点会落在一个看似不起眼却很关键的细节上：**为什么打分后要除以 $\\sqrt{d_k}$**。这个缩放因子不是随手加的，背后是一段干净的方差推导。搞懂它，你就理解了 Transformer 注意力公式里每一个符号的来历。"
+   },
+   {
+    "title": "核心操作：加权求和（软选择）",
+    "body": "注意力的本质是**加权求和**。给一组信息向量 $v_1,\\ldots,v_n$ 和对应权重 $\\alpha_1,\\ldots,\\alpha_n$（满足 $\\sum_i\\alpha_i=1$），输出就是：\n\n$$\\text{output}=\\sum_{i=1}^{n}\\alpha_i v_i$$\n\n这叫**软选择**：不像 argmax 那样硬选一个，而是给每个元素一个连续权重，整个过程可微分，能用梯度训练。\n\n问题只剩一个：权重 $\\alpha_i$ 从哪来？答案是用「当前需求」和「每条信息」算相似度，再 softmax 归一化。这就引出了 Query / Key / Value。"
+   },
+   {
+    "title": "Query、Key、Value：借自信息检索",
+    "body": "注意力借用了**信息检索**的类比，把每个角色想成搜索引擎里的一环：\n\n- **Query（查询 $Q$）**：当前要找什么——好比搜索关键词；\n- **Key（键 $K$）**：每条记录的索引、能提供什么——好比网页标题；\n- **Value（值 $V$）**：记录的实际内容——好比网页正文。\n\n过程是：Query 和所有 Key 算相似度 → softmax 成概率分布 → 按概率加权对应的 Value 求和。\n\n在网络里，$Q,K,V$ 都是从同一输入 $X\\in\\mathbb{R}^{n\\times d_{model}}$ 经线性变换得到：$Q=XW^Q$，$K=XW^K$，$V=XW^V$，其中 $W^Q,W^K,W^V$ 是可学习的投影矩阵。"
+   },
+   {
+    "title": "点积打分与基础公式",
+    "body": "为什么用点积衡量 Query 和 Key 的相似度？因为点积反映方向一致性：两向量方向相近则点积大，正交则为零，反向则为负。对 $q,k_i\\in\\mathbb{R}^{d_k}$，$\\text{score}(q,k_i)=q\\cdot k_i=\\sum_{j=1}^{d_k}q_j k_{ij}$。\n\n写成矩阵一次算完所有 Query 对所有 Key 的得分：$\\text{Scores}=QK^\\top\\in\\mathbb{R}^{n_q\\times n_k}$。\n\n对每行（每个 Query）独立做 softmax 得到权重矩阵 $A$，再乘 $V$，就是**基础点积注意力**：\n\n$$\\text{Attention}(Q,K,V)=\\text{softmax}(QK^\\top)V$$\n\n例如 $S=\\begin{bmatrix}2&0&1\\\\0&2&1\\\\1&1&1\\end{bmatrix}$，第一行 $[2,0,1]$ 做 softmax 约为 $[0.665,0.090,0.245]$，再用这组权重去加权 $V$ 的各行。",
+    "formula": "\\text{Attention}(Q,K,V)=\\text{softmax}(QK^\\top)V"
+   },
+   {
+    "title": "为什么要除以根号 d_k（缩放的推导）",
+    "body": "为什么注意力分数要除以 $\\sqrt{d_k}$？因为当维度 $d_k$ 较大时，点积量级会随维度增大，softmax 被推进饱和区、梯度几乎为零。来看推导。\n\n设 $q,k$ 各分量独立采自 $\\mathcal{N}(0,1)$。点积 $q\\cdot k=\\sum_{j=1}^{d_k}q_j k_j$。因为各分量独立、均值为 0，由方差加法性：\n\n$$\\text{Var}(q\\cdot k)=\\sum_{j=1}^{d_k}\\text{Var}(q_j k_j)=d_k\\cdot\\text{Var}(q_j)\\text{Var}(k_j)=d_k$$\n\n所以标准差是 $\\sqrt{d_k}$。当 $d_k=64$ 时标准差达 8，得分可能到几十量级，softmax 输出接近 one-hot，除最大值外梯度全趋零。\n\n**怎么治？除以标准差 $\\sqrt{d_k}$ 即可把方差拉回 1：**\n\n$$\\text{Var}\\!\\left(\\frac{q\\cdot k}{\\sqrt{d_k}}\\right)=\\frac{d_k}{(\\sqrt{d_k})^2}=1$$\n\n这样无论 $d_k$ 多大，缩放后得分都是单位方差，softmax 稳定工作在敏感区间。注意：缩放改的是**方差**，不是均值（均值本来就是 0）。",
+    "formula": "\\text{Attention}(Q,K,V)=\\text{softmax}\\!\\left(\\frac{QK^\\top}{\\sqrt{d_k}}\\right)V"
+   },
+   {
+    "title": "缩放点积注意力（PyTorch）",
+    "body": "把公式四步直接翻成代码：算得分→（可选）加 mask→softmax→乘 V。\n\n```python\nimport torch\nimport torch.nn.functional as F\ndef scaled_dot_product_attention(query, key, value, mask=None):\n    d_k = query.size(-1)\n    scores = torch.matmul(query, key.transpose(-2, -1)) / (d_k ** 0.5)\n    if mask is not None:\n        scores = scores.masked_fill(mask, float('-inf'))\n    weights = F.softmax(scores, dim=-1)\n    weights = torch.nan_to_num(weights, nan=0.0)\n    output = torch.matmul(weights, value)\n    return output, weights\n```\n\n输入 `query (B,n_q,d_k)`、`key (B,n_k,d_k)`、`value (B,n_k,d_v)`，输出 `(B,n_q,d_v)` 和权重 `(B,n_q,n_k)`。`mask` 里为 `True` 的位置在 softmax 前被置 $-\\infty$。",
+    "tip": "`/ (d_k ** 0.5)` 就是除以 $\\sqrt{d_k}$；mask 必须加在 softmax **之前**，这样 $e^{-\\infty}=0$ 让那些位置权重恰好为 0。"
+   },
+   {
+    "title": "因果掩码：让解码器看不到未来",
+    "body": "自回归生成时，位置 $i$ 不能偷看未来位置 $j>i$ 的信息。做法是在 softmax **之前**，把未来位置的得分设为 $-\\infty$：\n\n$$\\text{score}_{ij}=\\begin{cases}\\dfrac{q_i\\cdot k_j}{\\sqrt{d_k}} & \\text{若 } j\\le i\\\\ -\\infty & \\text{若 } j>i\\end{cases}$$\n\n因为 $e^{-\\infty}=0$，这些位置经 softmax 后权重恰好为 0，于是实现了**因果掩码（Causal Mask）**。代码里用上三角布尔矩阵 `torch.triu(torch.ones(n,n,dtype=torch.bool), diagonal=1)` 标出要遮的位置。\n\n关键点：**mask 一定加在 softmax 之前**。若加在之后，被遮位置的权重已经参与了归一化，结果就错了。"
+   },
+   {
+    "title": "注意力的家谱：加性 → 乘性 → 缩放点积",
+    "body": "缩放点积不是凭空冒出来的，它是注意力打分函数一路演化的终点：\n\n| 机制 | 打分函数 | 额外参数 | 特点 |\n|------|---------|---------|------|\n| Bahdanau（加性，2014） | $v_a^\\top\\tanh(W_a s+U_a h)$ | 多（$W_a,U_a,v_a$） | 首创，用 $\\tanh$ 非线性 |\n| Luong dot（乘性，2015） | $s^\\top h$ | 无 | 最简，直接点积 |\n| Luong general | $s^\\top W_a h$ | 中（$W_a$） | 加一个变换矩阵 |\n| 缩放点积（2017） | $\\dfrac{q\\cdot k}{\\sqrt{d_k}}$ | 无 | 可并行，Transformer 标准 |\n\n演化主线：从需要额外神经网络（加性）→ 直接矩阵乘法（乘性）→ 并行化的缩放点积。参数更少、速度更快、对矩阵乘法友好，正是 Transformer 成功的关键。另外 Bahdanau 用**前一刻** $s_{t-1}$ 打分，Luong 用**当前** $s_t$。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **以为缩放改的是均值**：缩放改的是**方差**（$d_k\\to 1$）；当 $Q,K$ 均值为 0 时点积均值本就是 0，不需要改。\n- **mask 加错位置**：必须在 **softmax 之前**置 $-\\infty$；加在之后无法让权重归零。\n- **以为缩放改变复杂度**：缩放只多一个除法，时间复杂度仍是 $O(n^2 d_k)$。\n- **认为 Bahdanau 无参数**：它有三组可学习参数 $W_a,U_a,v_a$；真正无额外参数的是 Luong dot 和缩放点积。\n- **$d_k=1$ 时还纠结缩放**：$d_k=1$ 时 $\\sqrt{d_k}=1$，缩放点积与基础点积完全等价。\n- **忘记权重的两个性质**：softmax 后每行非负且和为 1，这是「软选择」的保证。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "在 Query/Key/Value 的信息检索类比中，三者分别对应什么？",
+    "options": [
+     "Query=网页正文，Key=搜索词，Value=网页标题",
+     "Query=搜索词，Key=网页标题（索引），Value=网页正文（内容）",
+     "Query=网页标题，Key=网页正文，Value=搜索词",
+     "三者完全等价，没有角色区分"
+    ],
+    "answer": 1,
+    "explain": "Query 是查询需求（搜索词），Key 是索引（标题），Value 是实际内容（正文）；Query 与 Key 算相似度，再加权 Value。"
+   },
+   {
+    "type": "input",
+    "prompt": "缩放点积注意力中，得分矩阵 $QK^\\top$ 要除以什么，才能把点积方差拉回 1？（写出该缩放因子）",
+    "accept": [
+     "sqrt(d_k)",
+     "√d_k",
+     "根号d_k",
+     "根号dk",
+     "sqrt(dk)",
+     "d_k^0.5",
+     "根号d_k"
+    ],
+    "explain": "$q\\cdot k$ 的方差是 $d_k$、标准差是 $\\sqrt{d_k}$，除以 $\\sqrt{d_k}$ 后方差变为 1。"
+   },
+   {
+    "type": "judge",
+    "prompt": "缩放因子 $\\sqrt{d_k}$ 调整的是点积的方差（从 $d_k$ 降到 1），而不是均值。",
+    "answer": true,
+    "explain": "当 $Q,K$ 各分量均值为 0 时，点积均值恒为 0；缩放真正改变的是方差，$d_k\\to 1$。"
+   },
+   {
+    "type": "choice",
+    "prompt": "假设 $q,k$ 各分量独立采自 $\\mathcal{N}(0,1)$，则点积 $q\\cdot k$ 的方差等于多少？",
+    "options": [
+     "1",
+     "$\\sqrt{d_k}$",
+     "$d_k$",
+     "$d_k^2$"
+    ],
+    "answer": 2,
+    "explain": "由方差加法性，$\\text{Var}(q\\cdot k)=\\sum_{j=1}^{d_k}\\text{Var}(q_j k_j)=d_k$，标准差为 $\\sqrt{d_k}$。"
+   },
+   {
+    "type": "judge",
+    "prompt": "因果掩码应在 softmax 之后，把未来位置的权重直接抹成 0。",
+    "answer": false,
+    "explain": "mask 必须加在 softmax **之前**，把未来位置得分设为 $-\\infty$；$e^{-\\infty}=0$ 使其权重在归一化后恰好为 0。若加在之后，归一化已被未来位置污染。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么不缩放时、$d_k$ 较大会让 softmax「饱和」、梯度消失？",
+    "options": [
+     "因为 softmax 的指数会溢出报错",
+     "因为点积量级随 $d_k$ 增大，softmax 输出接近 one-hot，除最大值外梯度趋近 0",
+     "因为 $V$ 的维度也跟着变大",
+     "因为 mask 把太多位置遮成了 $-\\infty$"
+    ],
+    "answer": 1,
+    "explain": "$d_k$ 大则点积标准差大、得分量级大，softmax 几乎成 one-hot，$\\partial\\text{softmax}_i/\\partial s_j$ 趋零，训练信号几乎消失。"
+   },
+   {
+    "type": "input",
+    "prompt": "标准缩放点积注意力，序列长度 $n$、维度 $d$ 时，时间复杂度是 $O(?)$？（写出含 $n,d$ 的大 O）",
+    "accept": [
+     "O(n^2 d)",
+     "O(n^2*d)",
+     "O(n^2 · d)",
+     "O(n²d)",
+     "n^2 d",
+     "O(n^2 d_k)"
+    ],
+    "explain": "$QK^\\top$ 与 $AV$ 各需 $n^2 d$ 次乘法，时间 $O(n^2 d)$；存完整注意力矩阵带来 $O(n^2)$ 空间。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下列关于各注意力机制的说法，哪个正确？",
+    "options": [
+     "Bahdanau（加性）注意力不需要任何可学习参数",
+     "缩放点积注意力比基础点积注意力的时间复杂度更高",
+     "Luong dot 注意力打分为 $s^\\top h$，无额外参数",
+     "当 $d_k=2$ 时缩放点积与基础点积等价"
+    ],
+    "answer": 2,
+    "explain": "Luong dot 直接用点积 $s^\\top h$，无额外参数。Bahdanau 有 $W_a,U_a,v_a$；缩放只多一个除法、复杂度不变；只有 $d_k=1$ 时两者等价。"
+   },
+   {
+    "type": "judge",
+    "prompt": "softmax 归一化后，注意力权重矩阵每一行都非负且和为 1，这是「软选择」可微分的体现。",
+    "answer": true,
+    "explain": "每个 Query 对所有 Key 的权重经 softmax 后非负、和为 1，是一个连续可微的概率分布，对应软选择。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种注意力机制与其打分函数配对：",
+    "left": [
+     "Bahdanau（加性）",
+     "Luong dot",
+     "Luong general",
+     "缩放点积（Transformer）"
+    ],
+    "right": [
+     "$v_a^\\top\\tanh(W_a s+U_a h)$",
+     "$s^\\top h$",
+     "$s^\\top W_a h$",
+     "$\\dfrac{q\\cdot k}{\\sqrt{d_k}}$"
+    ],
+    "explain": "Bahdanau 用 tanh 加性打分；Luong dot 是纯点积；Luong general 中间加变换矩阵 $W_a$；缩放点积在点积基础上除以 $\\sqrt{d_k}$。"
+   },
+   {
+    "type": "choice",
+    "prompt": "从 Bahdanau 到缩放点积，注意力打分函数演化的主线是什么？",
+    "options": [
+     "参数越来越多、计算越来越复杂",
+     "从需要额外神经网络（加性）→ 直接矩阵乘法（乘性）→ 并行化的缩放点积，参数更少、更适合并行",
+     "从可学习逐渐变为完全不可训练",
+     "打分函数始终不变，只是名字换了"
+    ],
+    "answer": 1,
+    "explain": "演化主线是减少额外参数、改用矩阵乘法、利于并行，缩放点积无额外参数且对 GPU 友好，是 Transformer 成功的关键。"
+   },
+   {
+    "type": "input",
+    "prompt": "Transformer 用什么把输入 $X$ 投影成 $Q$？写出形如 $Q=XW^?$ 的投影矩阵记号（只需写右侧权重符号）。",
+    "accept": [
+     "W^Q",
+     "WQ",
+     "W_Q",
+     "W^{Q}"
+    ],
+    "explain": "$Q=XW^Q$，$K=XW^K$，$V=XW^V$，三个可学习投影矩阵分别把同一输入映射成 Query、Key、Value。"
+   }
+  ]
+ },
+ {
+  "title": "位置编码",
+  "subtitle": "注意力对顺序无感，正弦编码为什么能补回位置信息",
+  "intro": [
+   {
+    "title": "这一关在解决什么",
+    "body": "上一关的注意力很强，但它藏着一个「副作用」：**它根本不在乎词的顺序**。给注意力「猫追狗」和「狗追猫」，除了词义，它看到的结构是对称的。\n\n为什么会这样？因为自注意力本质是个**集合操作**——它只算「哪些 token 之间有关联」，不带任何先后信息。可语言、代码、时间序列偏偏极度依赖顺序。\n\n这一关就来补这个洞：**位置编码（Positional Encoding）**。重点是搞懂原始 Transformer 为什么选**正弦函数**——它不是随便挑的，而是为了同时满足唯一性、有界性、可外推，还附带一个精妙的相对位置性质。"
+   },
+   {
+    "title": "排列不变性：注意力看不见顺序",
+    "body": "回顾注意力 $\\text{Attention}(Q,K,V)=\\text{softmax}\\!\\left(\\frac{QK^\\top}{\\sqrt{d_k}}\\right)V$，其中 $Q,K,V$ 都由 $X$ 线性变换而来。\n\n如果对输入施加任意置换矩阵 $P$（也就是打乱 token 顺序），可以证明：\n\n$$\\text{Attention}(PX)=P\\cdot\\text{Attention}(X)$$\n\n也就是说，打乱输入顺序，输出只是跟着打乱，**每个位置的值本身不变**。这正说明注意力是**集合操作**而非序列操作。\n\n后果有多严重？实验里，给 Transformer 翻译任务去掉位置编码，BLEU 会从约 28 直接掉到约 5，几乎等同于随机翻词序。所以位置信息必须想办法注入进去。"
+   },
+   {
+    "title": "位置编码怎么注入，以及好编码的标准",
+    "body": "做法很直接：给每个位置 $pos$ 配一个固定向量 $PE_{pos}\\in\\mathbb{R}^{d_{model}}$，**加到**对应 token 的嵌入上：\n\n$$\\tilde{x}_{pos}=x_{pos}+PE_{pos}$$\n\n这样位置信息和语义信息融进同一个向量空间，注意力算 $QK^\\top$ 时就能感知到位置关系。\n\n一个好的位置编码应满足四条：\n\n1. **唯一性**：每个位置编码不同，不能撞车；\n2. **平滑性**：相邻位置编码距离小，不突变；\n3. **有界性**：取值在固定范围内，不破坏嵌入的数值稳定；\n4. **可外推性**：能处理训练时没见过的更长序列。\n\n带着这四条标准，再看正弦编码就明白它为什么这么设计。"
+   },
+   {
+    "title": "正弦位置编码的公式",
+    "body": "原始 Transformer 用正弦/余弦构造固定位置编码。偶数维用 sin，奇数维用 cos：\n\n$$PE_{(pos,2i)}=\\sin\\!\\left(\\frac{pos}{10000^{2i/d_{model}}}\\right)$$\n\n$$PE_{(pos,2i+1)}=\\cos\\!\\left(\\frac{pos}{10000^{2i/d_{model}}}\\right)$$\n\n逐符号看：$pos\\in\\{0,1,\\ldots,n-1\\}$ 是位置；$i\\in\\{0,\\ldots,d_{model}/2-1\\}$ 是维度索引，每一对维度共用一个频率 $\\omega_i=\\dfrac{1}{10000^{2i/d_{model}}}$；$d_{model}$ 是嵌入维度（原论文 512）。\n\n所以位置 $pos$ 的编码向量，就是把各频率的 $(\\sin(\\omega_i\\cdot pos),\\cos(\\omega_i\\cdot pos))$ 一对对堆起来。",
+    "formula": "PE_{(pos,2i)}=\\sin\\!\\left(\\frac{pos}{10000^{2i/d_{model}}}\\right),\\quad PE_{(pos,2i+1)}=\\cos\\!\\left(\\frac{pos}{10000^{2i/d_{model}}}\\right)"
+   },
+   {
+    "title": "为什么用正弦，为什么 sin 和 cos 成对",
+    "body": "为什么偏要用正弦函数？三点设计动机：\n\n**为什么用多个频率？因为要多尺度。** $i=0$ 时 $\\omega_0=1$，周期约 $6.28$，最高频、感知相邻位置的细微变化；$i$ 越大频率越低，$i=d/2-1$ 时周期约 $62832$，最低频、感知全局位置。这像二进制计数：低位翻转快，高位变化慢，每个位置在不同「分辨率」下都有独一无二的指纹（满足唯一性）。\n\n**为什么 sin 和 cos 要成对？因为单独一个分不清位置。** 若只用 $\\sin$，可能 $\\sin(\\omega\\cdot pos)=\\sin(\\omega\\cdot pos')$ 撞车。配成 $(\\sin(\\omega\\cdot pos),\\cos(\\omega\\cdot pos))$ 后，它就是单位圆上的坐标，一个周期内对任意 $pos\\neq pos'$ 都唯一。\n\n**为什么值有界、能外推？** 正弦余弦天然落在 $[-1,1]$（满足有界性）；函数连续，对训练时没见过的 $pos$ 也有明确定义且数值有界（满足可外推性）。"
+   },
+   {
+    "title": "最精妙之处：相对位置是一个旋转",
+    "body": "正弦编码最巧的设计：对任意固定偏移 $k$，存在**线性变换矩阵** $M_k$ 使 $PE_{pos+k}=M_k\\cdot PE_{pos}$。推导只用到和角公式。\n\n对第 $i$ 对维度，令 $\\theta=\\omega_i$：\n\n$$\\sin(\\theta(pos+k))=\\sin(\\theta\\,pos)\\cos(\\theta k)+\\cos(\\theta\\,pos)\\sin(\\theta k)$$\n$$\\cos(\\theta(pos+k))=\\cos(\\theta\\,pos)\\cos(\\theta k)-\\sin(\\theta\\,pos)\\sin(\\theta k)$$\n\n写成矩阵：\n\n$$\\begin{pmatrix}\\sin(\\theta(pos+k))\\\\\\cos(\\theta(pos+k))\\end{pmatrix}=\\begin{pmatrix}\\cos(\\theta k)&\\sin(\\theta k)\\\\-\\sin(\\theta k)&\\cos(\\theta k)\\end{pmatrix}\\begin{pmatrix}\\sin(\\theta\\,pos)\\\\\\cos(\\theta\\,pos)\\end{pmatrix}$$\n\n中间那个矩阵正是**二维旋转矩阵**，只跟偏移 $k$ 有关、跟 $pos$ 无关。**这意味着什么？** 注意力算 $q_j^\\top k_i$ 时会出现 $PE_{pos_j}^\\top PE_{pos_i}$，它能被改写成只依赖相对距离 $|pos_j-pos_i|$ 的函数。于是注意力天然感知到了**相对距离**，而不仅是绝对位置。",
+    "formula": "PE_{pos+k}=M_k\\cdot PE_{pos}"
+   },
+   {
+    "title": "正弦位置编码（PyTorch）",
+    "body": "实现上用对数技巧算频率，避免大指数；编码矩阵注册成 buffer（随模型保存但不是可训练参数）。\n\n```python\nimport torch\nimport torch.nn as nn\nimport math\nclass SinusoidalPositionalEncoding(nn.Module):\n    def __init__(self, d_model, max_len=5000):\n        super().__init__()\n        pe = torch.zeros(max_len, d_model)\n        position = torch.arange(0, max_len).float().unsqueeze(1)\n        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))\n        pe[:, 0::2] = torch.sin(position * div_term)\n        pe[:, 1::2] = torch.cos(position * div_term)\n        self.register_buffer('pe', pe.unsqueeze(0))\n    def forward(self, x):\n        return x + self.pe[:, :x.size(1)]\n```\n\n`div_term` 用 `exp(arange*(-log(10000)/d_model))` 算出各频率 $\\omega_i$；偶数列填 sin、奇数列填 cos；`forward` 里按序列长度取前若干行加到嵌入上。",
+    "tip": "`register_buffer` 让 `pe` 随模型保存/加载、随设备迁移，但不参与梯度更新——正弦编码是固定的，没有可学习参数。"
+   },
+   {
+    "title": "正弦编码 vs 可学习编码，以及后来的方案",
+    "body": "另一条路是**可学习位置编码**：把 $PE$ 当参数，用一个 `nn.Embedding(max_len, d_model)` 让模型从数据里学（BERT 就这么干，512×768≈39.3 万参数）。BERT 论文实测两者效果「几乎没差别」，于是选了更简洁的可学习版。\n\n| 特性 | 正弦编码 | 可学习编码 |\n|------|---------|-----------|\n| 参数量 | 0 | $n_{max}\\times d_{model}$ |\n| 外推能力 | 较好（数学性质保证） | 差（超出 $n_{max}$ 不会泛化） |\n| 任务适应 | 固定 | 自适应 |\n| 典型模型 | 原始 Transformer | BERT、GPT-2 |\n\n后来还衍生出相对位置方案：T5 在分数上加可学习标量偏置 $b_{i-j}$；ALiBi 直接减一个与距离成正比的惩罚 $-m|i-j|$、零参数且外推很强；RoPE 用旋转矩阵变换 $Q,K$ 使内积只依赖相对位置，被 LLaMA/Qwen 广泛采用——它的频率 $\\theta_i=10000^{-2i/d}$ 和正弦编码完全一致。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **以为注意力自带顺序**：自注意力是**集合操作**，$\\text{Attention}(PX)=P\\cdot\\text{Attention}(X)$，不加位置编码就分不清「猫追狗」和「狗追猫」。\n- **位置编码是乘进去的**：不是，正弦编码是**加**到 token 嵌入上：$\\tilde{x}_{pos}=x_{pos}+PE_{pos}$。\n- **以为只用 sin 就够**：单独 sin 会因周期性撞车，必须 sin/cos **成对**才能在一个周期内唯一确定位置。\n- **搞反频率与维度**：低 $i$ 是**高频**（周期短、感知局部），高 $i$ 是**低频**（周期长、感知全局）。\n- **以为可学习编码外推更好**：恰恰相反，可学习编码对 $pos>n_{max}$ 从未训练、无法泛化；正弦编码靠连续函数能外推。\n- **忽视相对位置性质**：$PE_{pos+k}=M_k PE_{pos}$ 中 $M_k$ 是旋转矩阵，只依赖偏移 $k$，这才是注意力能感知相对距离的根源。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "judge",
+    "prompt": "不加位置编码时，自注意力是一个集合操作，满足 $\\text{Attention}(PX)=P\\cdot\\text{Attention}(X)$，因此分不清「猫追狗」和「狗追猫」的词序。",
+    "answer": true,
+    "explain": "置换输入只会同样置换输出，每个位置的值本身不变，说明注意力本质是集合操作、对顺序不敏感。"
+   },
+   {
+    "type": "choice",
+    "prompt": "正弦位置编码是如何注入到 token 表示中的？",
+    "options": [
+     "与 token 嵌入逐元素相乘",
+     "加到 token 嵌入上：$\\tilde{x}_{pos}=x_{pos}+PE_{pos}$",
+     "拼接在 token 嵌入之后，使维度翻倍",
+     "替换掉 token 嵌入"
+    ],
+    "answer": 1,
+    "explain": "原始 Transformer 把位置编码向量直接加到对应 token 的嵌入上，让位置信息与语义融入同一空间。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么位置编码要同时使用 sin 和 cos，而不是只用 sin？",
+    "options": [
+     "为了让取值范围扩大到 $[-2,2]$",
+     "因为单独 sin 会因周期性导致不同位置撞车，成对后等价单位圆坐标、在一个周期内唯一",
+     "为了减少参数量",
+     "因为 cos 比 sin 计算更快"
+    ],
+    "answer": 1,
+    "explain": "$(\\sin(\\omega\\,pos),\\cos(\\omega\\,pos))$ 是单位圆坐标，对一个周期内任意 $pos\\neq pos'$ 都唯一，避免了单用 sin 的撞车。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在正弦编码中，维度索引 $i$ 越小频率越高（周期短、感知局部位置），$i$ 越大频率越低（周期长、感知全局位置）。",
+    "answer": true,
+    "explain": "$\\omega_i=1/10000^{2i/d_{model}}$，$i=0$ 时 $\\omega_0=1$ 最高频；$i$ 增大频率递减，像二进制低位快翻、高位慢变。"
+   },
+   {
+    "type": "choice",
+    "prompt": "正弦编码最精妙的相对位置性质 $PE_{pos+k}=M_k\\cdot PE_{pos}$ 中，矩阵 $M_k$ 是什么、依赖什么？",
+    "options": [
+     "$M_k$ 是对角缩放矩阵，依赖绝对位置 $pos$",
+     "$M_k$ 是二维旋转矩阵，只依赖偏移 $k$、与 $pos$ 无关",
+     "$M_k$ 是随机投影矩阵，需要训练",
+     "$M_k$ 是单位矩阵，对任何 $k$ 都不变"
+    ],
+    "answer": 1,
+    "explain": "由和角公式推出 $M_k$ 是二维旋转矩阵，只依赖偏移 $k$，因此注意力能把绝对位置改写成相对距离的函数。"
+   },
+   {
+    "type": "input",
+    "prompt": "正弦编码第 $i$ 对维度的频率 $\\omega_i$ 的公式是 $\\omega_i=\\dfrac{1}{?}$。横线处分母是什么？（用 $i,d_{model}$ 表示）",
+    "accept": [
+     "10000^(2i/d_model)",
+     "10000^{2i/d_model}",
+     "10000^(2i/d)",
+     "10000的2i/d_model次方",
+     "10000^{2i/d_{model}}"
+    ],
+    "explain": "$\\omega_i=1/10000^{2i/d_{model}}$，$i$ 越大频率越低，对应越长的周期。"
+   },
+   {
+    "type": "judge",
+    "prompt": "相比可学习位置编码，正弦位置编码在处理训练时未见过的更长序列时外推能力更好。",
+    "answer": true,
+    "explain": "正弦编码是连续函数，对 $pos>n_{train}$ 仍有明确且有界的定义；可学习编码对超出 $n_{max}$ 的位置从未训练、无法泛化。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下列关于正弦编码与可学习编码的说法，哪个正确？",
+    "options": [
+     "正弦编码需要 $n_{max}\\times d_{model}$ 个可学习参数",
+     "可学习编码（如 BERT）外推能力强于正弦编码",
+     "正弦编码参数量为 0，BERT 使用可学习编码，二者效果实测接近",
+     "两者都无法感知相对位置"
+    ],
+    "answer": 2,
+    "explain": "正弦编码无参数；BERT 用可学习编码，论文实测两者效果几乎相同；外推上正弦编码更好。"
+   },
+   {
+    "type": "input",
+    "prompt": "在没有位置编码的 Transformer 翻译实验中，BLEU 大约从 28 骤降到约多少？（填一个数字）",
+    "accept": [
+     "5",
+     "约5",
+     "5左右"
+    ],
+    "explain": "去掉位置编码后 BLEU 从约 28 掉到约 5，几乎等同于随机翻转词序，说明位置信息不可或缺。"
+   },
+   {
+    "type": "match",
+    "prompt": "把每种位置编码方法与其核心机制配对：",
+    "left": [
+     "正弦绝对编码",
+     "可学习绝对编码（BERT）",
+     "ALiBi",
+     "RoPE"
+    ],
+    "right": [
+     "多频率 sin/cos 叠加，固定无参数，可外推",
+     "用 nn.Embedding 把位置当参数从数据中学",
+     "注意力分数上直接减去与距离成正比的线性惩罚，零参数",
+     "用旋转矩阵变换 Q/K，使内积只依赖相对位置"
+    ],
+    "explain": "正弦—多频率 sin/cos 固定编码；可学习—nn.Embedding；ALiBi—线性距离惩罚；RoPE—旋转 Q/K 得相对位置内积。"
+   },
+   {
+    "type": "choice",
+    "prompt": "一个好的位置编码通常需要满足的性质，不包括下列哪一项？",
+    "options": [
+     "唯一性：每个位置编码不同",
+     "有界性：取值在固定范围内，不破坏数值稳定",
+     "可外推性：能处理更长的未见序列",
+     "稀疏性：编码向量中大部分元素为 0"
+    ],
+    "answer": 3,
+    "explain": "好编码要求唯一性、平滑性、有界性、可外推性；稀疏性不在其列，正弦编码的元素也并非大多为 0。"
+   },
+   {
+    "type": "judge",
+    "prompt": "RoPE 中旋转所用的频率 $\\theta_i=10000^{-2i/d}$ 与正弦位置编码的频率选择完全一致。",
+    "answer": true,
+    "explain": "RoPE 的 $\\theta_i=10000^{-2i/d}$ 和正弦编码的 $\\omega_i=1/10000^{2i/d_{model}}$ 是同一套多频率设计，只是 RoPE 用旋转作用在 Q/K 上。"
+   }
+  ]
+ }
+]

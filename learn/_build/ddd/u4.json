@@ -1,0 +1,590 @@
+[
+  {
+    "title": "分层架构",
+    "subtitle": "用四层隔离业务与技术，让领域层永远保持纯粹",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "把订单取消逻辑写在 HTTP 路由里、在领域对象里直接调 SQLAlchemy、应用服务里裸写 SQL——这三种做法都很常见，也都会带来同一个后果：改数据库 schema 要动业务代码，跑单元测试要连真实数据库，业务规则被技术细节稀释得越来越难看懂。\n\n分层架构（Layered Architecture）要解决的就是这件事：把「做什么」（业务关注点）和「怎么实现」（技术关注点）放进不同的层，每层只做自己该做的事，层之间的依赖方向严格可控。"
+      },
+      {
+        "title": "经典四层结构",
+        "body": "DDD 推荐的四层从外到内依次是：\n\n**接口层（Interface / UI）**：REST API、GraphQL、CLI、消息监听器——负责协议转换、认证鉴权、请求路由。它只管「HTTP 说了什么」，不管「业务规则是什么」。\n\n**应用层（Application）**：应用服务、命令处理器、查询处理器——负责编排用例、管理事务、协调领域层和基础设施层。它只管「这个用例需要哪些步骤」，不管「规则细节」。\n\n**领域层（Domain）**：实体、值对象、聚合、领域服务、仓储接口、领域事件——负责表达所有业务规则。它是整个架构最重要的层，**不依赖任何框架或数据库**。\n\n**基础设施层（Infrastructure）**：数据库、消息队列、外部 API、缓存——负责实现技术细节，包括仓储实现、消息发布、第三方集成。"
+      },
+      {
+        "title": "依赖规则：领域层不依赖基础设施层",
+        "body": "依赖方向是：接口层 → 应用层 → 领域层 ← 基础设施层。\n\n注意最后这个箭头方向——是基础设施层依赖领域层，而不是反过来。领域层只定义接口（抽象仓储），基础设施层去实现它。这就是**依赖倒置原则（DIP）**的核心。\n\n验证自己有没有违规很简单：看领域层的 import 语句里有没有出现数据库框架或 Web 框架。\n\n```python\n# domain/model/order.py —— 领域层\n# 只允许出现标准库和领域对象\nfrom datetime import datetime\nfrom decimal import Decimal\nfrom enum import Enum\nfrom dataclasses import dataclass\n# 下面这些在领域层里不应该出现：\n# from sqlalchemy import ...   ← 数据库框架！\n# from django.db import ...    ← Web 框架！\n# import redis                 ← 缓存！\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么领域层不能依赖基础设施层？因为业务规则的生命周期比技术选型长得多。今天用 PostgreSQL，明天可能换 MongoDB；今天用 Kafka，明天可能换 RabbitMQ。如果领域层里有 SQLAlchemy 的 import，每次换数据库就要改业务代码——本来两件事，现在硬绑在一起了。\n\n为什么单元测试需要连真实数据库的问题很严重？因为「业务逻辑正确」和「数据库连通」是两回事，混在一起测，一旦失败你不知道是哪边出了问题，而且慢得多。领域层保持纯粹，才能在没有任何基础设施的情况下快速验证业务规则。\n\n为什么接口层不能有业务规则？因为同一条规则（如「已发货订单不可取消」）可能要在 REST API、消息队列消费者、命令行工具三个入口都执行——放在接口层就要重复三份，放在领域层就只有一份。"
+      },
+      {
+        "title": "依赖倒置的代码实现",
+        "body": "```python\n# 第一步：领域层定义接口\n# domain/repositories/order_repository.py\nfrom abc import ABC, abstractmethod\nclass OrderRepository(ABC):\n    @abstractmethod\n    def get(self, order_id: str): ...\n    @abstractmethod\n    def save(self, order): ...\n# 第二步：基础设施层实现接口\n# infrastructure/persistence/sqlalchemy_order_repository.py\nfrom domain.repositories.order_repository import OrderRepository\nclass SqlAlchemyOrderRepository(OrderRepository):\n    def get(self, order_id: str):\n        ...  # SQL 实现\n    def save(self, order):\n        ...  # SQL 实现\n# 第三步：应用层依赖接口而非具体实现\n# application/services/order_application_service.py\nclass OrderApplicationService:\n    def __init__(self, order_repo: OrderRepository):\n        self._repo = order_repo\n# 第四步：组合根（main.py）注入具体实现\ndef create_order_service():\n    repo = SqlAlchemyOrderRepository(create_db_session())\n    return OrderApplicationService(repo)\n```"
+      },
+      {
+        "title": "各层职责对照：同一个用例的三种代码",
+        "body": "以「取消订单」为例，看三层代码各自该做什么：\n\n```python\n# 接口层：只做协议转换，不写业务规则\n@router.post(\"/orders/{order_id}/cancel\")\nasync def cancel_order(order_id: str, body: CancelOrderRequest):\n    command = CancelOrderCommand(order_id=order_id, reason=body.reason)\n    order_service.cancel_order(command)\n    return Response(status_code=204)\n# 应用层：只做步骤编排，不写规则细节\nclass OrderApplicationService:\n    def cancel_order(self, command):\n        order = self._repo.get(command.order_id)   # 加载\n        order.cancel(command.reason)                # 领域操作\n        self._repo.save(order)                      # 持久化\n        self._publish_events(order)                 # 发事件\n# 领域层：只写业务规则，不碰数据库\nclass Order:\n    def cancel(self, reason: str):\n        if self._status == OrderStatus.SHIPPED:\n            raise OrderException(\"已发货订单不可取消\")\n        self._status = OrderStatus.CANCELLED\n        self._cancel_reason = reason\n```"
+      },
+      {
+        "title": "易错点",
+        "body": "- **领域层出现数据库操作**：在 `Order.cancel()` 里直接写 `db.execute(\"UPDATE ...\")`，是最典型的分层破坏。\n- **接口层包含业务规则**：在 FastAPI 路由里判断「已发货不可取消」——换一个入口（如消息队列）就又要写一遍。\n- **应用服务绕过聚合直接写 SQL**：用例编排变成了数据操作脚本，领域模型形同虚设。\n- **把仓储实现（ORM 类）放进领域层**：仓储的**接口**在领域层，**实现**在基础设施层——位置不能搞反。\n- **宽松分层用错场合**：查询时允许接口层直接访问数据库（跳过领域层），这是刻意的设计（与 CQRS 配合），不是「偷懒可以」——写操作仍然要经过领域层。"
+      },
+      {
+        "title": "小结",
+        "body": "分层架构的核心价值是：**领域层永远纯粹**——它不依赖任何技术框架，可以独立单元测试，业务规则集中在一处。依赖倒置是实现这一点的关键手法：领域层定义接口，基础设施层实现接口，应用层通过接口类型使用，组合根在启动时注入具体实现。四层的依赖方向是：接口层 → 应用层 → 领域层 ← 基础设施层。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "在 DDD 分层架构中，以下哪种依赖关系是正确的？",
+        "options": [
+          "领域层 → 基础设施层（领域层直接使用 SQLAlchemy）",
+          "基础设施层 → 领域层（基础设施层实现领域层定义的接口）",
+          "应用层 → 接口层（应用服务调用 HTTP 路由）",
+          "领域层 → 应用层（领域对象调用应用服务）"
+        ],
+        "answer": 1,
+        "explain": "依赖方向应该是基础设施层依赖领域层（实现其定义的仓储接口），而不是领域层依赖基础设施层。这是依赖倒置原则的核心体现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "仓储接口（如 `OrderRepository` 抽象类）应该定义在基础设施层，因为它和数据存储有关。",
+        "answer": false,
+        "explain": "仓储接口属于领域层，因为它表达的是「领域层需要什么能力」（加载和保存聚合）。具体的 SQL/ORM 实现才放在基础设施层。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面哪段代码违反了分层架构的依赖规则？",
+        "options": [
+          "应用服务调用 `order_repo.save(order)`，其中 `order_repo` 类型是 `OrderRepository`（抽象）",
+          "领域层 `Order.cancel()` 方法里执行 `db.execute(\"UPDATE orders SET status=...\")`",
+          "基础设施层 `SqlAlchemyOrderRepository` 实现 `OrderRepository` 接口",
+          "接口层 FastAPI 路由调用应用服务的 `cancel_order` 方法"
+        ],
+        "answer": 1,
+        "explain": "领域层的方法里出现数据库操作（`db.execute`），说明领域层依赖了基础设施层，违反了「领域层不依赖技术框架」的核心规则。"
+      },
+      {
+        "type": "input",
+        "prompt": "在分层架构中，「让领域层不依赖基础设施层、而是基础设施层依赖领域层」的设计原则叫什么？（中英文皆可）",
+        "accept": ["依赖倒置原则", "依赖倒置", "DIP", "Dependency Inversion Principle", "Dependency Inversion"],
+        "explain": "依赖倒置原则（DIP，Dependency Inversion Principle）：高层模块不依赖低层模块，两者都依赖抽象；抽象（接口）定义在领域层，具体实现在基础设施层。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下面关于接口层职责的描述，哪项是正确的？",
+        "options": [
+          "接口层可以直接判断业务规则（如已发货订单不可取消），只要同时也调用了应用服务",
+          "接口层只负责协议转换、认证路由，业务规则一律交给领域层",
+          "接口层可以直接读写数据库，因为这样性能更好",
+          "接口层负责编排用例的步骤顺序"
+        ],
+        "answer": 1,
+        "explain": "接口层只做协议转换（HTTP ↔ 命令对象）和认证鉴权，业务规则必须在领域层。把规则放进接口层，换一个入口就要重复一次，维护成本很高。"
+      },
+      {
+        "type": "match",
+        "prompt": "把四个层和它们的核心职责配对：",
+        "left": [
+          "接口层",
+          "应用层",
+          "领域层",
+          "基础设施层"
+        ],
+        "right": [
+          "协议转换、认证鉴权、请求路由",
+          "用例编排、事务管理、协调各层",
+          "业务规则与不变量（不依赖任何框架）",
+          "数据库、消息队列、外部 API 的技术实现"
+        ],
+        "explain": "接口层管「说什么」，应用层管「做什么步骤」，领域层管「规则是什么」，基础设施层管「技术怎么实现」。"
+      },
+      {
+        "type": "judge",
+        "prompt": "宽松分层（Relaxed Layering）允许查询场景下接口层直接访问数据库，这是一种刻意的设计选择，不是架构漏洞。",
+        "answer": true,
+        "explain": "宽松分层通常与 CQRS 配合：简单查询跳过应用层和领域层直接读数据库，可以减少不必要的复杂度。但写操作（命令）仍然要经过领域层保护业务规则。"
+      },
+      {
+        "type": "input",
+        "prompt": "应用服务中编排「取消订单」用例，正确步骤是：加载聚合 → 调用领域方法 → 保存聚合 → 发布事件。其中「发布事件」之前必须调用的是哪个层的对象方法？",
+        "accept": ["领域层", "domain", "聚合", "聚合根", "Order", "order.cancel"],
+        "explain": "必须先调用领域层聚合的 `cancel()` 方法，让聚合内部检查业务规则（已发货不可取消）并产生领域事件，之后才保存和发布。绕过这一步直接写数据库，领域规则就失效了。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么「在领域层写单元测试」比「在接口层写集成测试」更重要？",
+        "options": [
+          "因为接口层的代码通常没有 bug",
+          "因为领域层不依赖任何技术框架，可以快速运行，且直接验证业务规则是否正确",
+          "因为集成测试会消耗大量磁盘空间",
+          "因为 Python 不支持集成测试"
+        ],
+        "answer": 1,
+        "explain": "领域层没有数据库、没有 HTTP，测试运行极快，且测的是「业务规则对不对」这个最核心的问题。集成测试速度慢、依赖外部系统，不适合作为主要验证手段。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在组合根（Composition Root）里，`SqlAlchemyOrderRepository` 被作为 `OrderRepository` 接口类型注入给应用服务。这个设计的好处是什么？",
+        "options": [
+          "应用服务可以直接访问 SQLAlchemy session",
+          "可以在不改应用服务代码的情况下替换存储实现（比如换成内存仓储用于测试）",
+          "减少了数据库查询次数",
+          "让领域层可以直接调用 SQL"
+        ],
+        "answer": 1,
+        "explain": "依赖接口而非具体实现，意味着替换适配器时应用服务代码零改动——测试时换内存实现，生产时换 PostgreSQL 实现，这是依赖倒置带来的最直接收益。"
+      },
+      {
+        "type": "judge",
+        "prompt": "应用服务直接在方法内写 `self._db.execute(\"UPDATE orders SET status=...\")` 是合法的，因为应用层可以依赖基础设施层。",
+        "answer": false,
+        "explain": "虽然应用层可以依赖基础设施层（通过接口），但直接写 SQL 绕过了领域模型，业务规则（如「已发货不可取消」）就没有机会执行，领域层的存在意义完全丧失。"
+      }
+    ]
+  },
+  {
+    "title": "六边形架构",
+    "subtitle": "端口与适配器：让应用核心与外部世界彻底解耦",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "分层架构里，「UI 在上、数据库在下」是一种隐含假设，业务逻辑仍然会感知到「有一个 HTTP 请求从上面进来」「有一个数据库在下面」。换测试环境、换消息队列接入方式，还是要改不少胶水代码。\n\n六边形架构（Hexagonal Architecture）由 Alistair Cockburn 提出，也称为**端口与适配器架构（Ports and Adapters）**。它的核心思想只有一句话：**让应用核心（领域 + 应用逻辑）完全不知道外部世界长什么样，只通过定义良好的接口（端口）与外界交互**。HTTP、CLI、消息队列、数据库——对核心来说都只是「插上来的适配器」，核心本身保持完全的独立性。"
+      },
+      {
+        "title": "端口（Port）：核心与外界的契约",
+        "body": "**端口**是应用核心定义的接口，分两种方向：\n\n**驱动端口（Primary Port）**——核心对外提供的功能接口，被外部（HTTP、CLI、测试）调用。它描述「我能做什么」。\n\n**被驱动端口（Secondary Port）**——核心需要外部提供的能力接口，由基础设施适配器实现。它描述「我需要什么」。\n\n```python\n# 驱动端口：核心提供的用例接口\nfrom abc import ABC, abstractmethod\nclass OrderManagementPort(ABC):\n    @abstractmethod\n    def place_order(self, command) -> str: ...\n    @abstractmethod\n    def cancel_order(self, command) -> None: ...\n# 被驱动端口：核心需要的依赖能力\nclass OrderStoragePort(ABC):\n    @abstractmethod\n    def save(self, order) -> None: ...\n    @abstractmethod\n    def get(self, order_id) -> object: ...\nclass PaymentGatewayPort(ABC):\n    @abstractmethod\n    def charge(self, amount, method) -> object: ...\n```"
+      },
+      {
+        "title": "适配器（Adapter）：让各种技术对接端口",
+        "body": "**适配器**实现端口，把具体技术「适配」到核心需要的接口形状。\n\n驱动适配器把外部请求翻译成对核心的调用——HTTP 适配器把 `POST /orders` 翻译成 `place_order(command)`；CLI 适配器把命令行输入翻译成同一个调用；Kafka 适配器把消息翻译成同一个调用。核心完全不知道请求是从哪里来的。\n\n被驱动适配器把核心调用翻译成具体技术——PostgreSQL 适配器实现 `OrderStoragePort`，MongoDB 适配器也实现 `OrderStoragePort`，内存适配器同样实现 `OrderStoragePort`（专门用于测试）。核心完全不知道数据存在哪里。\n\n```python\n# 驱动适配器：HTTP\nclass FastAPIOrderAdapter:\n    def __init__(self, port: OrderManagementPort):\n        self._port = port\n    def register_routes(self, app):\n        @app.post(\"/orders\")\n        async def place_order(req):\n            return {\"order_id\": self._port.place_order(req.to_command())}\n# 被驱动适配器：内存存储（测试用）\nclass InMemoryOrderAdapter(OrderStoragePort):\n    def __init__(self):\n        self._store = {}\n    def save(self, order):\n        self._store[order.id] = order\n    def get(self, order_id):\n        return self._store[order_id]\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么要把「HTTP 进来」和「我的业务逻辑」彻底分开？因为同一套业务逻辑可能要同时被 REST API、定时任务、消息队列、命令行脚本触发。如果业务逻辑感知 HTTP，换一种触发方式就要重写。端口把这个契约固化，任何能实现端口的东西都能驱动核心。\n\n为什么被驱动端口（存储、支付网关）要由核心来定义，而不是由基础设施来定义？因为「我需要能存订单」是业务需求，「用 PostgreSQL 存」是技术选型。业务需求驱动接口形状，技术实现适配这个形状——方向不能反过来。\n\n为什么内存适配器对测试如此重要？因为有了内存适配器，完整的应用逻辑（下单 → 存储 → 通知）可以在没有任何真实基础设施的情况下跑完，测试极快、极可靠，且失败时一定是业务逻辑的问题。"
+      },
+      {
+        "title": "应用核心与组合根",
+        "body": "应用核心实现驱动端口、注入被驱动端口，对外只暴露接口：\n\n```python\nclass OrderApplicationService(OrderManagementPort):\n    def __init__(\n        self,\n        storage: OrderStoragePort,\n        payment: PaymentGatewayPort,\n        notification: object,\n    ):\n        self._storage = storage\n        self._payment = payment\n        self._notification = notification\n    def place_order(self, command) -> str:\n        order = Order.create(command.customer_id)\n        for item in command.items:\n            order.add_item(**item)\n        order.place()\n        self._storage.save(order)\n        self._notification.send_confirmation(order)\n        return str(order.id)\n    def cancel_order(self, command) -> None:\n        order = self._storage.get(command.order_id)\n        order.cancel(command.reason)\n        self._storage.save(order)\n```\n\n所有适配器在**组合根**（`main.py` 或 `container.py`）里装配，只有这一个地方知道「今天用的是 PostgreSQL 还是内存」。"
+      },
+      {
+        "title": "极致可测试性",
+        "body": "六边形架构最大的优势就是可测试性——所有应用逻辑可以不依赖任何真实基础设施来测试：\n\n```python\nclass TestOrderService:\n    def setup_method(self):\n        self.storage = InMemoryOrderAdapter()\n        self.payment = MockPaymentAdapter(should_succeed=True)\n        self.notification = MockNotificationAdapter()\n        self.service = OrderApplicationService(\n            storage=self.storage,\n            payment=self.payment,\n            notification=self.notification,\n        )\n    def test_place_order(self):\n        cmd = PlaceOrderCommand(customer_id=\"c001\", items=[...])\n        order_id = self.service.place_order(cmd)\n        saved = self.storage.get(order_id)\n        assert saved.status == OrderStatus.PLACED\n        assert self.notification.was_notified(order_id)\n    def test_payment_failure(self):\n        self.payment = MockPaymentAdapter(should_succeed=False)\n        # 重新装配，验证支付失败时的行为\n```"
+      },
+      {
+        "title": "六边形架构 vs 分层架构",
+        "body": "两者的区别不在于哪个更好，而在于侧重点不同：\n\n分层架构强调**层次化组织**——接口在上、数据库在下，依赖方向单一（上 → 下）。它对「外部是 HTTP 进来、数据库在下面」有隐含假设。\n\n六边形架构强调**核心居中、外界围绕**——没有上下之分，所有外部技术都对称地围绕应用核心，通过端口交互。它更强调可替换性：任何适配器都可以在不改核心代码的前提下替换。\n\n实践中两者经常结合：在限界上下文内部用六边形架构组织代码（核心居中 + 端口适配器），上下文之间用上下文映射定义关系。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **把适配器逻辑写进核心**：核心里出现 `if isinstance(port, PostgreSQLAdapter)` 这类判断，就破坏了核心对适配器的无知性。\n- **驱动端口太细**：为每一个方法都建一个单独的端口接口，造成接口爆炸——一个聚合对应的操作通常放在一个端口里。\n- **被驱动端口形状被技术细节污染**：比如端口方法签名里出现 `SQLAlchemy Session` 参数，这是把适配器的概念漏进了端口。\n- **组合根散落各处**：适配器装配应该集中在一个地方（组合根），分散在各模块里会让「换实现」变成噩梦。\n- **内存适配器不维护**：内存适配器和真实适配器实现同一个端口，功能要保持一致，否则测试和生产行为会有差异。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "六边形架构也被称为什么？",
+        "options": [
+          "洋葱架构（Onion Architecture）",
+          "端口与适配器架构（Ports and Adapters）",
+          "微核架构（Microkernel Architecture）",
+          "事件驱动架构（Event-Driven Architecture）"
+        ],
+        "answer": 1,
+        "explain": "六边形架构由 Alistair Cockburn 提出，另一个名字是「端口与适配器架构」，核心概念就是端口（接口）和适配器（技术实现）。"
+      },
+      {
+        "type": "match",
+        "prompt": "把端口/适配器的种类和它们的方向配对：",
+        "left": [
+          "驱动端口（Primary Port）",
+          "被驱动端口（Secondary Port）",
+          "驱动适配器（Driving Adapter）",
+          "被驱动适配器（Driven Adapter）"
+        ],
+        "right": [
+          "应用核心对外提供的功能接口，被 HTTP/CLI/测试调用",
+          "应用核心需要的外部能力接口，由基础设施实现",
+          "将外部请求（HTTP/CLI/消息）翻译成对核心的调用",
+          "将端口接口实现为具体技术（DB/支付网关）"
+        ],
+        "explain": "驱动端口是核心暴露的，驱动适配器调用它；被驱动端口是核心依赖的，被驱动适配器实现它。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在六边形架构中，应用核心可以直接 `import` 具体的数据库库（如 `psycopg2`），只要封装在一个方法里就行。",
+        "answer": false,
+        "explain": "应用核心必须完全不知道任何具体技术实现。数据库访问通过被驱动端口（接口）进行，具体实现在被驱动适配器里。核心 import 具体库会让它与技术耦合，破坏可替换性。"
+      },
+      {
+        "type": "input",
+        "prompt": "六边形架构里，所有端口和适配器在启动时被装配在一起的地方叫什么？（中英文皆可）",
+        "accept": ["组合根", "Composition Root", "composition root"],
+        "explain": "组合根（Composition Root）是唯一知道「用哪个具体适配器」的地方，通常是 `main.py` 或依赖注入容器。集中在此处装配，替换适配器只需改这一处。"
+      },
+      {
+        "type": "choice",
+        "prompt": "同一套业务逻辑要同时支持 REST API、CLI、Kafka 消息队列三种触发方式。六边形架构如何实现这一点？",
+        "options": [
+          "把三种逻辑分别写在应用核心的三个不同分支里",
+          "为每种触发方式写一个驱动适配器，它们都调用同一个驱动端口",
+          "在每个入口处各自写一份完整的业务逻辑",
+          "用继承让三种触发方式共享代码"
+        ],
+        "answer": 1,
+        "explain": "三个驱动适配器（HTTP、CLI、Kafka）各自把请求翻译成命令对象，然后调用同一个驱动端口方法。应用核心只实现一次，完全不感知请求来源。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么「被驱动端口（如存储接口）应该由应用核心来定义，而不是由基础设施层来定义」？",
+        "options": [
+          "因为基础设施层的代码通常比较复杂",
+          "因为「我需要存订单」是业务需求，接口形状应由业务需求决定，技术实现适配这个形状",
+          "因为 Python 的 ABC 只能在应用层使用",
+          "因为基础设施层不能定义抽象类"
+        ],
+        "answer": 1,
+        "explain": "被驱动端口描述的是核心「需要什么能力」，这是业务决定的。如果让基础设施来定义接口，业务就得迎合技术实现的形状，依赖方向就反了。"
+      },
+      {
+        "type": "judge",
+        "prompt": "内存适配器（`InMemoryOrderAdapter`）的主要用途是在没有真实数据库的情况下运行单元测试。",
+        "answer": true,
+        "explain": "内存适配器实现了与 PostgreSQL 适配器相同的端口接口，测试时注入内存适配器即可运行完整的应用逻辑，速度极快且不依赖任何真实基础设施。"
+      },
+      {
+        "type": "input",
+        "prompt": "在六边形架构里，HTTP 路由类（`FastAPIOrderAdapter`）属于哪种适配器？",
+        "accept": ["驱动适配器", "Driving Adapter", "Primary Adapter", "主适配器"],
+        "explain": "HTTP 路由从外部接收请求并调用应用核心，属于驱动适配器（Driving Adapter）。它「驱动」核心执行用例。"
+      },
+      {
+        "type": "choice",
+        "prompt": "分层架构和六边形架构最主要的区别是什么？",
+        "options": [
+          "分层架构不支持数据库，六边形架构支持",
+          "分层架构强调上下层级关系，六边形架构强调核心居中、外界对称围绕，更强调可替换性",
+          "六边形架构只能用于微服务，分层架构只能用于单体",
+          "分层架构没有接口抽象，六边形架构全部是接口"
+        ],
+        "answer": 1,
+        "explain": "分层架构隐含了「UI 在上、DB 在下」的位置假设；六边形架构里所有外部技术都对称地通过端口连接，没有高低之分，重点是核心对外界无感知、任意替换适配器。"
+      },
+      {
+        "type": "judge",
+        "prompt": "六边形架构要求每一个端口方法都必须对应一个独立的端口接口（一方法一接口），否则违反架构原则。",
+        "answer": false,
+        "explain": "端口接口的粒度没有硬性规定，通常按「一个聚合的所有操作」或「一种外部能力」来划分。过度细分反而造成接口爆炸，增加维护成本。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在测试时，`MockPaymentAdapter(should_succeed=False)` 的作用是什么？",
+        "options": [
+          "连接真实支付网关但屏蔽网络请求",
+          "模拟支付失败的场景，让测试能覆盖支付异常的业务处理路径",
+          "记录支付请求的日志",
+          "验证支付金额的计算是否正确"
+        ],
+        "answer": 1,
+        "explain": "模拟适配器可以按需配置返回结果，`should_succeed=False` 让测试能够验证「支付失败时业务逻辑是否正确回滚、抛出正确异常」——这是真实支付网关测试环境无法稳定覆盖的场景。"
+      }
+    ]
+  },
+  {
+    "title": "CQRS",
+    "subtitle": "读写职责分离：让查询和命令走各自最适合的路",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "传统的做法是「同一个对象既处理写（下单、取消）又处理读（列表查询、详情查询）」。这个做法在小系统里没问题，但随着业务增长，矛盾会越来越明显。\n\n写操作需要聚合的强一致性保护——订单不能凭空取消，状态机要严格执行；但读操作需要跨聚合的宽平铺数据——订单列表要把客户名、商品数量、总金额显示在一行里，而这些字段分布在多张表。让聚合同时承担这两件事，既让聚合变得臃肿，又让查询性能变差。\n\n**CQRS（命令查询职责分离，Command Query Responsibility Segregation）**的核心思路是：写操作（命令）走一套模型，读操作（查询）走另一套模型，两套模型各自优化，互不干扰。"
+      },
+      {
+        "title": "核心概念：命令模型 vs 查询模型",
+        "body": "**命令模型（Command Side / Write Model）**：包含聚合根、领域服务、写仓储。它保护业务规则和不变量，确保每次状态变更都是合法的。为了保持领域模型的表达力，它的数据结构是规范化的（有外键关联），不适合直接做复杂查询。\n\n**查询模型（Query Side / Read Model）**：包含针对特定视图优化的数据结构（DTO）和直接查询数据库的读服务。它可以 JOIN 多表、返回任意形状的扁平数据，不受聚合边界限制。\n\n两者最关键的分离点：**查询不走聚合，直接查数据库**。这让读操作可以用最高效的 SQL 或搜索引擎，而不用把一个聚合加载出来再转换。"
+      },
+      {
+        "title": "简单 CQRS：同一数据库，分离代码模型",
+        "body": "最轻量的形式：读写共用一个数据库，但代码层面严格分离：\n\n```python\n# 写侧：完整聚合，保护业务规则\nclass Order:\n    def place(self):\n        if not self._items:\n            raise OrderException(\"订单为空\")\n        self._status = OrderStatus.PLACED\n# 读侧：扁平 DTO，针对查询优化\nfrom dataclasses import dataclass\nfrom decimal import Decimal\nfrom datetime import datetime\n@dataclass\nclass OrderListItem:\n    order_id: str\n    customer_name: str   # 来自 JOIN\n    status: str\n    item_count: int\n    total: Decimal\n    created_at: datetime\nclass OrderQueryService:\n    def __init__(self, db_session):\n        self._db = db_session\n    def list_customer_orders(self, customer_id: str) -> list:\n        rows = self._db.execute(\"\"\"\n            SELECT o.id, c.name as customer_name,\n                   o.status, COUNT(oi.id) as item_count,\n                   o.total_amount, o.created_at\n            FROM orders o\n            JOIN customers c ON o.customer_id = c.id\n            LEFT JOIN order_items oi ON o.id = oi.order_id\n            WHERE o.customer_id = :cid\n            GROUP BY o.id, c.name, o.status, o.total_amount, o.created_at\n        \"\"\", {\"cid\": customer_id})\n        return [OrderListItem(**row) for row in rows]\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么不直接在聚合上加 `to_list_view()`、`to_detail_view()` 方法，而要单独建读模型？因为订单列表视图需要的字段（客户名、商品件数）分布在 Customer 和 OrderItem 表，聚合里没有这些数据。要么让 Order 聚合持有冗余字段，要么加载聚合后再做多次额外查询——两种方式都在为读操作破坏写模型的整洁性。\n\n为什么读服务可以「直接写 SQL、跳过聚合」？因为查询没有副作用，不需要业务规则保护。读模型只读数据，不改变系统状态，绕过聚合不会破坏任何不变量。\n\n为什么读操作往往比写操作多 10-100 倍？因为「改一次数据」之后，「查这条数据」的请求会来自列表页、详情页、报表、缓存刷新……独立的读模型才能针对高读量单独扩展，而不影响写模型的强一致性保证。"
+      },
+      {
+        "title": "完整 CQRS：读写分离的数据存储",
+        "body": "进阶形式：写端用规范化数据库（PostgreSQL），读端用专门优化过的读存储（Elasticsearch、Redis 缓存或非规范化只读库）。两者通过**投影器（Projector）**同步：\n\n```python\n# 投影器：监听领域事件，更新读模型\nclass OrderProjector:\n    def __init__(self, read_db):\n        self._read_db = read_db\n    def on_order_placed(self, event) -> None:\n        self._read_db.upsert(\"order_views\", {\n            \"order_id\": event.order_id,\n            \"customer_id\": event.customer_id,\n            \"status\": \"placed\",\n            \"total\": float(event.total_amount),\n            \"placed_at\": event.occurred_at.isoformat(),\n        })\n    def on_order_shipped(self, event) -> None:\n        self._read_db.update(\n            \"order_views\",\n            filter={\"order_id\": event.order_id},\n            update={\n                \"status\": \"shipped\",\n                \"tracking_number\": event.tracking_number,\n            }\n        )\n```"
+      },
+      {
+        "title": "最终一致性与读模型的时延",
+        "body": "完整 CQRS 里，写操作完成之后，读模型的更新是**异步的**——投影器监听事件，可能有几毫秒到几秒的时延。这就是最终一致性（Eventual Consistency）。\n\n处理时延有三种常见策略：\n\n1. **接受最终一致**：绝大多数业务场景下，用户在「下单后立刻看到订单列表」这件事上并不敏感——刷新一下就行。\n2. **命令后查写库**：对「刚刚创建的那条数据」走写库查询，其余仍走读库。\n3. **乐观 UI 更新**：前端在命令成功后立即在本地更新 UI 显示，不等读模型刷新。\n\n这三种不是互斥的，实际项目里往往组合使用。"
+      },
+      {
+        "title": "什么时候用 CQRS，什么时候不用",
+        "body": "适合 CQRS 的场景：\n\n- 读操作远多于写操作（10:1 以上），两者有明显不同的扩展需求\n- 查询需要复杂 JOIN 或聚合，领域模型不适合直接查询\n- 需要支持多种读视图（列表视图、详情视图、报表、搜索）\n- 与事件溯源（第 19 章）结合——事件本身就是投影器的天然输入\n\n不适合的场景：\n\n- 简单的 CRUD 应用，没有复杂查询需求\n- 团队规模小，CQRS 增加的维护成本得不偿失\n- 对最终一致性绝对无法接受（如金融核心账务系统中某些场景）\n- 没有读写性能瓶颈需要解决"
+      },
+      {
+        "title": "易错点",
+        "body": "- **查询也走聚合加载再转换**：CQRS 的核心收益之一就是「读操作不走聚合」，如果还是先 `repo.get()` 再 `order.to_dto()`，两套模型分离了也没意义。\n- **投影器直接改写存储里的规范化数据**：投影器只能写读模型，不能绕过命令侧直接修改写库，否则会绕过领域规则。\n- **命令里也用读模型查询**：命令处理时需要聚合的一致性状态，必须走写仓储，不能用读模型（读模型可能有时延）。\n- **过度分离**：简单的单表查询也建一套完整读模型，反而增加复杂度——简单查询直接走写库即可，CQRS 是在遇到真实需求时引入的。\n- **忽略投影失败的处理**：投影器是异步的，失败时要有重试机制，否则读模型会长期不一致。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "CQRS 中，「命令（Command）」和「查询（Query）」最核心的区别是什么？",
+        "options": [
+          "命令用 POST 请求，查询用 GET 请求",
+          "命令会改变系统状态并保护业务规则，查询只读数据不改变状态",
+          "命令走 SQL，查询走缓存",
+          "命令由领域层处理，查询由基础设施层处理"
+        ],
+        "answer": 1,
+        "explain": "命令（写操作）有副作用，需要聚合保护不变量；查询（读操作）没有副作用，可以绕过聚合直接查数据库，返回任意形状的视图数据。"
+      },
+      {
+        "type": "judge",
+        "prompt": "CQRS 中，读服务（`OrderQueryService`）可以直接写 SQL 查询数据库，不需要通过聚合加载。",
+        "answer": true,
+        "explain": "查询没有副作用，不需要业务规则保护，完全可以直接写 SQL 或使用搜索引擎，返回针对视图优化的扁平数据结构。这正是 CQRS 读写分离的核心价值。"
+      },
+      {
+        "type": "match",
+        "prompt": "把 CQRS 相关概念和其说明配对：",
+        "left": [
+          "命令模型（Write Model）",
+          "查询模型（Read Model）",
+          "投影器（Projector）",
+          "最终一致性"
+        ],
+        "right": [
+          "包含聚合根和业务规则，负责状态变更的强一致性",
+          "针对查询优化的扁平视图，不受聚合边界限制",
+          "监听领域事件，将写侧变更同步到读存储",
+          "读写模型之间存在短暂时延，最终会达到一致"
+        ],
+        "explain": "四个概念分别对应：写侧的强一致保证、读侧的查询优化、两侧的同步机制、以及因异步同步带来的时延特征。"
+      },
+      {
+        "type": "input",
+        "prompt": "完整 CQRS 中，将写侧领域事件同步到读存储的组件叫什么？",
+        "accept": ["投影器", "Projector", "projector"],
+        "explain": "投影器（Projector）监听写侧产生的领域事件，将变更投影（同步）到读模型的存储里，如 Elasticsearch 或非规范化数据库。"
+      },
+      {
+        "type": "choice",
+        "prompt": "简单 CQRS 和完整 CQRS 的主要区别是什么？",
+        "options": [
+          "简单 CQRS 没有查询模型，完整 CQRS 有",
+          "简单 CQRS 读写共用同一个数据库，完整 CQRS 读写使用不同的数据存储",
+          "简单 CQRS 不支持事务，完整 CQRS 支持",
+          "简单 CQRS 只能用 SQL，完整 CQRS 只能用 NoSQL"
+        ],
+        "answer": 1,
+        "explain": "简单 CQRS 是「代码层面」的读写分离，仍然共用一个数据库；完整 CQRS 进一步让读存储和写存储物理分离（比如写用 PostgreSQL、读用 Elasticsearch），通过投影器异步同步。"
+      },
+      {
+        "type": "judge",
+        "prompt": "命令处理时（如取消订单），可以使用读模型里的 `OrderListItem` 来获取订单当前状态，因为读模型通常是最新的。",
+        "answer": false,
+        "explain": "命令处理必须走写仓储加载完整聚合，不能用读模型。读模型可能有时延（最终一致），用它做命令决策可能基于过时状态，导致业务规则失效。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用户刚下单，立刻查询订单列表，但列表里看不到刚创建的订单。这是什么现象？",
+        "options": [
+          "系统 bug，下单应该是同步的",
+          "最终一致性：读模型尚未被投影器更新，短暂时延内读写模型不一致",
+          "分层架构违规，应用层没有调用读模型",
+          "聚合根保护了不变量，导致查询失败"
+        ],
+        "answer": 1,
+        "explain": "完整 CQRS 中，写操作完成后投影器异步更新读模型，存在短暂时延，这是最终一致性的正常表现。处理方式有接受时延、刷新页面、乐观 UI 更新等。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 CQRS 的应用服务里，处理「下单」命令时走聚合保护业务规则，处理「查询订单列表」时走读服务直接查数据库。这两种不同路径分别对应的是什么？（填一个词概括）",
+        "accept": ["命令", "查询", "读写分离", "CQRS"],
+        "explain": "「下单」是命令（Command），「查询列表」是查询（Query）。CQRS 的核心就是让命令和查询走不同的模型和路径，各自最优化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个场景最不适合引入 CQRS？",
+        "options": [
+          "电商平台的商品搜索，读操作比写操作多 50 倍",
+          "需要同时支持列表视图、详情视图、报表导出三种读视图",
+          "一个内部管理后台，只有 CRUD，没有复杂查询需求，团队 3 人",
+          "与事件溯源结合，需要多种读模型视图"
+        ],
+        "answer": 2,
+        "explain": "简单 CRUD、没有性能瓶颈、团队规模小的场景引入 CQRS 只会增加复杂度，得不偿失。CQRS 的价值在读写需求差异显著、查询复杂度高的场景下才能体现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "投影器（Projector）可以直接修改写存储（写库）里的聚合数据，只要它是为了同步读模型。",
+        "answer": false,
+        "explain": "投影器只负责写读模型，绝不能修改写库。如果投影器绕过命令侧直接改写库，就破坏了写侧的一致性保证，领域规则也会失效。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么聚合为「写」而优化，不适合直接做复杂查询（如跨聚合 JOIN）？",
+        "options": [
+          "因为聚合根不支持 Python 的 JOIN 语法",
+          "因为聚合边界限制了数据范围，且规范化结构需要多次额外查询才能拼出视图所需数据",
+          "因为聚合根没有 `to_dict()` 方法",
+          "因为聚合存的是事件，无法直接读取"
+        ],
+        "answer": 1,
+        "explain": "聚合边界是按「一致性边界」划定的，不是按「查询方便」划定的。一个订单列表视图往往需要来自 orders、customers、order_items 多张表的数据，加载聚合后再拼接效率很低。"
+      }
+    ]
+  },
+  {
+    "title": "事件溯源",
+    "subtitle": "把事件序列作为唯一的事实来源，当前状态由历史推导而来",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "传统数据库只保存当前状态。订单从「已创建 → 应用优惠券 → 已下单 → 已支付 → 已发货」走了五步，数据库里只有最后那行「已发货」的记录。原价多少？优惠券什么时候应用的？中间哪个步骤是谁触发的？——全部丢失了。\n\n事件溯源（Event Sourcing）换了一种思路：**不存当前状态，只存事件序列**。每次业务变更产生一个不可变的事件，追加到事件存储里，永不覆盖、永不删除。当前状态不是直接读出来的，而是从头把所有历史事件「重放」一遍得到的。\n\n这个思路天然地提供了完整历史、完整审计、时间旅行（重放到任意历史时刻）三种能力，也是 CQRS 里「投影器有源可依」的基础。"
+      },
+      {
+        "title": "核心原理：状态 = 事件的重放结果",
+        "body": "用一句话描述核心原理：**聚合的当前状态 = 从空状态开始，按顺序应用所有历史事件的结果**。\n\n以订单为例，事件序列是：\n- `OrderCreated(total=1000)` → status=DRAFT, total=1000\n- `CouponApplied(discount=100)` → total=900\n- `PaymentCompleted()` → status=PAID\n- `OrderShipped()` → status=SHIPPED\n\n任何时候要知道订单当前状态，就把这四个事件从头放一遍。事件是**只追加（Append-Only）**的，已经写入的事件永远不会被修改或删除——它们是系统的唯一真相。"
+      },
+      {
+        "title": "事件溯源聚合的代码结构",
+        "body": "事件溯源聚合和普通聚合的关键区别：每个命令方法**不直接修改状态**，而是产生事件；`_when_*` 方法负责根据事件**纯粹地修改状态**（无业务规则，无副作用）：\n\n```python\nclass Order(EventSourcedAggregate):\n    def __init__(self):\n        super().__init__()\n        self._status = OrderStatus.NONE\n        self._items = []\n        self._total = 0\n    # 命令方法：检查规则 → 产生事件\n    def place(self):\n        if not self._items:\n            raise ValueError(\"订单为空\")\n        from decimal import Decimal\n        total = sum(i[\"price\"] * i[\"qty\"] for i in self._items)\n        self._record_event(OrderPlaced(\n            aggregate_id=self._id,\n            total_amount=Decimal(str(total))\n        ))\n    def cancel(self, reason: str):\n        if self._status == OrderStatus.SHIPPED:\n            raise ValueError(\"已发货订单不可取消\")\n        self._record_event(OrderCancelled(\n            aggregate_id=self._id, reason=reason\n        ))\n    # 事件处理方法：只做状态变更，不做规则判断\n    def _when_OrderPlaced(self, event):\n        self._status = OrderStatus.PLACED\n        self._total = event.total_amount\n    def _when_OrderCancelled(self, event):\n        self._status = OrderStatus.CANCELLED\n```"
+      },
+      {
+        "title": "为什么这样做",
+        "body": "为什么命令方法不直接 `self._status = PLACED`，而是要「产生事件 → 事件处理方法改状态」这两步走？因为分开之后，重建聚合时只需要重放 `_when_*` 方法——它们是纯函数（只读事件数据、只改 self 状态），不会触发业务规则检查，不会产生新事件，不会有副作用。如果命令方法直接改状态，重建时就没办法区分「这是首次执行」还是「这是重放」。\n\n为什么事件要不可变（frozen dataclass）？因为事件是历史事实，「订单在 T1 时刻被取消」这件事一旦发生就无法反悔。允许修改事件，历史就失去了可信性，审计能力也随之消失。\n\n为什么事件存储是只追加的？因为「覆盖」等于销毁证据。事件溯源的整个价值体系（时间旅行、完整审计、多种读模型重建）都建立在「历史事件完整且不可篡改」这个前提上。"
+      },
+      {
+        "title": "事件存储与乐观锁",
+        "body": "事件存储（Event Store）本质上是一张只追加的日志表，每行是一个事件，带版本号：\n\n```python\nclass EventStore:\n    def append(self, aggregate_id: str, events: list,\n               expected_version: int) -> None:\n        current = self._get_current_version(aggregate_id)\n        if current != expected_version:\n            raise ConcurrencyException(\n                f\"乐观锁冲突：期望 {expected_version}，实际 {current}\"\n            )\n        for i, event in enumerate(events):\n            self._db.execute(\n                \"INSERT INTO event_store \"\n                \"(aggregate_id, event_type, event_data, version) \"\n                \"VALUES (:agg, :type, :data, :ver)\",\n                {\"agg\": aggregate_id,\n                 \"type\": type(event).__name__,\n                 \"data\": self._serialize(event),\n                 \"ver\": current + i + 1}\n            )\n    def load(self, aggregate_id: str, from_version: int = 0) -> list:\n        rows = self._db.execute(\n            \"SELECT event_type, event_data FROM event_store \"\n            \"WHERE aggregate_id = :agg AND version > :ver \"\n            \"ORDER BY version ASC\",\n            {\"agg\": aggregate_id, \"ver\": from_version}\n        )\n        return [self._deserialize(r[\"event_type\"], r[\"event_data\"])\n                for r in rows]\n```\n\n`expected_version` 是乐观锁——保存时检查版本号，如果不符说明并发修改，直接报错，让上层重试。"
+      },
+      {
+        "title": "快照（Snapshot）：优化大量事件的加载",
+        "body": "如果一个聚合有 5000 个历史事件，每次加载都要重放 5000 次——太慢了。解决方案是**快照（Snapshot）**：每隔 N 个事件保存一次聚合的完整状态，加载时先取快照，再只重放快照之后的增量事件。\n\n快照的本质是「加速索引」，和事件存储是互补的：事件存储记录完整历史，快照记录某个版本的聚合状态快照，两者都需要保留。\n\n快照策略：每 50 个事件保存一次是常见做法。加载时：先查快照（如有，从快照版本开始）→ 只加载快照版本之后的增量事件 → 应用增量事件。最坏情况下最多重放 50 个事件，性能可控。"
+      },
+      {
+        "title": "时间旅行与适用场景",
+        "body": "事件溯源最独特的能力——时间旅行：\n\n```python\ndef replay_order_at(order_id: str, target_time) -> Order:\n    all_events = event_store.load(order_id)\n    events_before = [\n        e for e in all_events if e.occurred_at <= target_time\n    ]\n    return Order.reconstitute(events_before)\n```\n\n只需过滤时间，重放目标时刻之前的事件，就能精确还原系统在那个时刻的状态。这对调试、审计、纠纷处理非常有价值。\n\n适合事件溯源的场景：审计需求强（金融、医疗、法律合规）、事件本身是核心业务概念（如交易记录、病历变更）、需要与 CQRS 结合支持多种读模型。\n\n不适合的场景：简单 CRUD（历史不重要）、聚合事件非常高频（IoT 传感器）、团队没有事件溯源经验且业务不需要。"
+      },
+      {
+        "title": "易错点",
+        "body": "- **`_when_*` 方法里写业务规则**：事件处理方法只做状态赋值，绝对不能有 `if` 条件判断业务规则——规则在命令方法里检查，重放时不应该再次触发。\n- **命令方法直接修改状态（不产生事件）**：这样的聚合无法重建，事件溯源也就没有意义了。\n- **事件设计太粗糙**：`OrderUpdated(all_fields)` 这种大而全的事件无法表达业务语义，也无法投影成有意义的读模型。每个事件应该对应一个具体的业务动作。\n- **事件结构随意变更**：事件是历史记录，旧事件永远存在。修改事件结构要向前兼容（版本化），否则重放历史事件时会反序列化失败。\n- **忽略并发控制**：不加乐观锁的事件存储在并发写入时会产生版本冲突，导致事件序列损坏。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "事件溯源中，聚合的当前状态是怎么得到的？",
+        "options": [
+          "直接从数据库表中读取最新的一行记录",
+          "从空状态开始，按顺序重放所有历史事件",
+          "读取最近一次快照，不需要事件",
+          "从缓存中读取，缓存失效时从备份恢复"
+        ],
+        "answer": 1,
+        "explain": "事件溯源的核心原理：状态 = 事件的重放结果。从空状态开始，依次应用每一个历史事件，最终得到当前状态。快照只是加速手段，原理不变。"
+      },
+      {
+        "type": "judge",
+        "prompt": "事件溯源中，`_when_OrderCancelled` 这类事件处理方法里应该检查「已发货订单不可取消」的业务规则。",
+        "answer": false,
+        "explain": "业务规则检查必须在命令方法（`cancel()`）里进行。`_when_*` 方法是纯状态变更，只赋值，不判断。因为重放历史事件时会调用 `_when_*`，如果它里面有规则判断，重放就可能失败。"
+      },
+      {
+        "type": "match",
+        "prompt": "把事件溯源的关键特性和其说明配对：",
+        "left": [
+          "只追加（Append-Only）",
+          "快照（Snapshot）",
+          "时间旅行",
+          "乐观锁（版本号）"
+        ],
+        "right": [
+          "事件一旦写入不可修改，确保历史不可篡改",
+          "定期保存聚合状态，避免重放大量历史事件",
+          "过滤特定时间之前的事件并重放，还原历史状态",
+          "保存时检查版本号，防止并发写入时的事件序列冲突"
+        ],
+        "explain": "四个特性分别解决：历史可信（只追加）、性能（快照）、历史查询（时间旅行）、并发安全（乐观锁）。"
+      },
+      {
+        "type": "input",
+        "prompt": "事件溯源中，「加速聚合加载」的优化机制叫什么？（填中文名）",
+        "accept": ["快照", "Snapshot", "snapshot"],
+        "explain": "快照（Snapshot）定期保存聚合在某个版本的完整状态。加载时先取快照，再只重放快照之后的增量事件，避免重放所有历史事件。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么事件溯源聚合里，命令方法要「产生事件」而不是「直接修改 `self._status`」？",
+        "options": [
+          "因为 Python dataclass 不允许直接修改属性",
+          "因为分开之后，重建聚合时只需要重放 `_when_*` 这些纯函数，不会触发业务规则或副作用",
+          "因为产生事件比直接赋值性能更好",
+          "因为事件对象的字段比 `self._status` 更安全"
+        ],
+        "answer": 1,
+        "explain": "命令方法产生事件、`_when_*` 方法纯粹地修改状态，这个分离让重放成为可能：重放只调用 `_when_*`，不会重新执行业务规则检查，也不会产生新事件或副作用。"
+      },
+      {
+        "type": "judge",
+        "prompt": "可以修改已经写入事件存储的历史事件来纠正错误，只要同时更新所有相关的读模型。",
+        "answer": false,
+        "explain": "事件是历史事实，不可修改。修改历史事件会破坏审计可信性，也可能导致从不同时间点重放得到不一致的结果。纠正错误的正确做法是产生新的补偿事件。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个场景最适合使用事件溯源？",
+        "options": [
+          "一个博客系统，只需要增删改查文章",
+          "IoT 设备每秒产生 1000 条传感器读数",
+          "银行转账系统，每笔变更都需要完整的审计追踪和历史回溯",
+          "一个前端静态网站的访问日志统计"
+        ],
+        "answer": 2,
+        "explain": "银行转账有强审计需求（谁在何时做了什么）、需要历史回溯（对账、纠纷处理），事件本身（转账事件、扣款事件）也是核心业务概念，非常适合事件溯源。"
+      },
+      {
+        "type": "input",
+        "prompt": "事件溯源中，「过滤目标时刻之前的事件并重放，精确还原历史状态」的能力通常叫什么？",
+        "accept": ["时间旅行", "Time Travel", "time travel", "历史回放", "事件回放"],
+        "explain": "时间旅行（Time Travel）：利用事件存储中带时间戳的完整历史，可以还原聚合在任意历史时刻的状态，常用于调试、审计、纠纷处理。"
+      },
+      {
+        "type": "choice",
+        "prompt": "事件溯源中，`expected_version` 参数用于什么目的？",
+        "options": [
+          "标记事件格式的 schema 版本，用于反序列化",
+          "乐观锁：保存时检查版本号，防止并发写入导致事件序列冲突",
+          "表示这是第几次重放",
+          "记录快照的版本，用于加载增量事件"
+        ],
+        "answer": 1,
+        "explain": "`expected_version` 是客户端认为的当前版本号。如果保存时发现实际版本不符，说明有其他并发修改，抛出 `ConcurrencyException`，上层重试——这是经典的乐观锁机制。"
+      },
+      {
+        "type": "judge",
+        "prompt": "事件溯源和 CQRS 通常结合使用：事件存储是写侧，投影器监听事件更新读模型，读侧用独立的读存储。",
+        "answer": true,
+        "explain": "这是两者的经典组合。事件溯源产生的领域事件天然就是投影器的输入，不需要额外的「监听状态变化」机制，让 CQRS 的读写同步变得非常自然。"
+      },
+      {
+        "type": "choice",
+        "prompt": "如果把「订单被取消」和「订单被修改了某个字段」都用同一个 `OrderUpdated(all_fields)` 事件表示，会有什么问题？",
+        "options": [
+          "没有问题，字段齐全就够了",
+          "事件缺乏业务语义，投影器无法区分「取消」和「修改字段」，读模型也无法准确反映业务事实",
+          "会导致事件存储磁盘占用过大",
+          "Python dataclass 不支持这么多字段"
+        ],
+        "answer": 1,
+        "explain": "事件应该表达具体的业务动作，而不是「某些字段变了」。`OrderCancelled` 和 `OrderShippingAddressUpdated` 有完全不同的业务含义，投影器需要分别处理，审计日志也需要能看出「发生了什么」。"
+      }
+    ]
+  }
+]

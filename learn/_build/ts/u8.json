@@ -1,0 +1,499 @@
+[
+  {
+    "title": "第22章 Node.js 后端开发",
+    "subtitle": "Express/Fastify + Zod + SSE，构建类型安全的 Node.js 后端",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "TypeScript 在编译期帮你检查类型，但 HTTP 请求在运行时才到达服务器——那时候编译器已经不在场了。这一章解决的核心问题就是：**如何让 Node.js 后端从路由参数、请求体到错误响应全程保持类型安全**，而不是到处写 `any`。\n\n具体涉及三件事：用 Express/Fastify 搭建类型化的 HTTP 服务、用 Zod 在运行时验证请求数据并自动推导 TS 类型、以及实现 SSE（Server-Sent Events）端点把 LLM 的流式输出实时推送给前端。"
+      },
+      {
+        "title": "Express 类型化路由",
+        "body": "Express 的 `Request` 泛型接受四个类型参数：`Request<Params, ResBody, ReqBody, Query>`，让你在路由处理器里获得精确的类型推断。\n\n```typescript\nimport { Request, Response } from \"express\";\ninterface UserParams { id: string }\ninterface UserQuery { include?: \"profile\" | \"posts\" }\nasync function getUserHandler(\n  req: Request<UserParams, unknown, unknown, UserQuery>,\n  res: Response\n): Promise<void> {\n  const userId = req.params.id;        // string\n  const include = req.query.include;   // \"profile\" | \"posts\" | undefined\n  res.json({ id: userId, include });\n}\n```\n\n如果需要在 `req` 上挂载自定义属性（比如认证中间件解析出的用户信息），可以用**声明合并**扩展 `Express.Request`：\n\n```typescript\n// src/types/express.d.ts\ndeclare global {\n  namespace Express {\n    interface Request {\n      user?: { id: string; email: string; role: \"admin\" | \"user\" };\n    }\n  }\n}\n```"
+      },
+      {
+        "title": "Fastify 与 Express 的类型设计差异",
+        "body": "Fastify 的泛型路由把 Schema 和类型绑定在一起，写法更内聚：\n\n```typescript\nfastify.get<{\n  Params: { id: string };\n  Querystring: { include?: string };\n}>(\"/users/:id\", {\n  schema: {\n    params: { type: \"object\", properties: { id: { type: \"string\" } }, required: [\"id\"] },\n  },\n}, async (request, reply) => {\n  const { id } = request.params;       // string，完全类型安全\n  return { id };\n});\n```\n\nExpress 需要手动标注泛型，Fastify 通过 Schema 同时完成运行时验证和类型推导——这也是 Fastify 更适合新项目的原因之一。"
+      },
+      {
+        "title": "为什么 TypeScript 类型检查不够，还需要 Zod？",
+        "body": "因为 TypeScript 的类型在**编译时**存在，运行时完全擦除。HTTP 请求体是字符串，经过 `JSON.parse` 后得到 `unknown`，编译器无法帮你检查它是否真的符合你期望的结构。\n\nZod 的价值在于「一个 Schema，两种保证」——既做运行时验证，又自动推导 TypeScript 类型，不用写两套：\n\n```typescript\nimport { z } from \"zod\";\nconst CreateUserSchema = z.object({\n  name: z.string().min(2).max(50),\n  email: z.string().email(),\n  role: z.enum([\"admin\", \"user\"]).default(\"user\"),\n  age: z.number().int().min(0).optional(),\n});\n// 自动推导，无需手写\ntype CreateUserInput = z.infer<typeof CreateUserSchema>;\n// 等价于 { name: string; email: string; role: \"admin\" | \"user\"; age?: number }\n```\n\n`safeParse` 不抛错，而是返回 `{ success: true, data }` 或 `{ success: false, error }`，便于统一处理验证失败。"
+      },
+      {
+        "title": "Zod 验证中间件工厂",
+        "body": "把 Zod 验证封装成可复用的工厂函数，是后端项目的标准做法：\n\n```typescript\nimport { Request, Response, NextFunction, RequestHandler } from \"express\";\nimport { ZodSchema } from \"zod\";\ntype ValidateTarget = \"body\" | \"query\" | \"params\";\nexport function validate<T>(\n  schema: ZodSchema<T>,\n  target: ValidateTarget = \"body\"\n): RequestHandler {\n  return (req, res, next) => {\n    const result = schema.safeParse(req[target]);\n    if (!result.success) {\n      const errors = result.error.errors.map((e) => ({\n        field: e.path.join(\".\"),\n        message: e.message,\n      }));\n      res.status(400).json({ success: false, error: { code: \"VALIDATION_ERROR\", details: errors } });\n      return;\n    }\n    (req as Request & Record<string, unknown>)[target] = result.data;\n    next();\n  };\n}\n```\n\n使用时直接在路由上串联：`usersRouter.post(\"/\", validate(CreateUserSchema, \"body\"), handler)`。注意 Zod 的 `z.coerce.number()` 会自动把查询参数里的字符串 `\"1\"` 转换为数字 `1`，处理 URL 参数时很实用。"
+      },
+      {
+        "title": "统一响应结构与错误类体系",
+        "body": "生产级 API 需要一致的响应格式，前端才能统一处理：\n\n```typescript\n// 成功\ninterface ApiSuccess<T> { success: true; data: T; meta?: { page?: number; total?: number } }\n// 错误\ninterface ApiError {\n  success: false;\n  error: { code: string; message: string; details?: Array<{ field: string; message: string }> };\n}\ntype ApiResponse<T> = ApiSuccess<T> | ApiError;\n```\n\n自定义错误类让「抛错」和「响应」解耦——路由里直接 `throw new NotFoundError(\"用户\", id)`，错误处理中间件统一转成 HTTP 响应：\n\n```typescript\nexport class AppError extends Error {\n  constructor(\n    public readonly code: string,\n    public readonly message: string,\n    public readonly statusCode: number,\n  ) {\n    super(message);\n    Object.setPrototypeOf(this, new.target.prototype); // 修复继承链\n  }\n}\nexport class NotFoundError extends AppError {\n  constructor(resource: string, id?: string) {\n    super(\"NOT_FOUND\", id ? `${resource} (id: ${id}) 不存在` : `${resource} 不存在`, 404);\n  }\n}\n```\n\nExpress 的错误处理中间件必须有**四个参数** `(err, req, res, next)` 才会被识别，少一个都不行。"
+      },
+      {
+        "title": "为什么 async 路由需要 asyncHandler 包装？",
+        "body": "Express 默认**不捕获** async 路由函数抛出的 Promise rejection。如果 `await someQuery()` 抛错，错误不会流向全局错误处理中间件，而是变成未处理的 Promise rejection，导致程序行为不可预期。\n\n解法是用一个包装函数把 Promise 错误显式传递给 `next`：\n\n```typescript\ntype AsyncRequestHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;\nexport function asyncHandler(fn: AsyncRequestHandler): RequestHandler {\n  return (req, res, next) => {\n    fn(req, res, next).catch(next); // 捕获后交给全局错误处理器\n  };\n}\n// 使用\nusersRouter.get(\"/:id\", asyncHandler(async (req, res) => {\n  const user = await userService.findById(req.params.id);\n  if (!user) throw new NotFoundError(\"用户\", req.params.id);\n  res.json({ success: true, data: user });\n}));\n```\n\nExpress 5.x 已原生支持 async 路由，但 4.x 仍需手动包装。"
+      },
+      {
+        "title": "SSE 端点：代理 LLM 流式输出",
+        "body": "SSE（Server-Sent Events）是服务器向客户端单向推流的标准协议，每个事件格式为 `data: <内容>\\n\\n`。在 Express 里，核心是设置正确的响应头并保持连接不关闭：\n\n```typescript\nimport { Response } from \"express\";\nexport class SSEWriter {\n  private isClosed = false;\n  constructor(private readonly res: Response) {\n    res.setHeader(\"Content-Type\", \"text/event-stream\");\n    res.setHeader(\"Cache-Control\", \"no-cache\");\n    res.setHeader(\"Connection\", \"keep-alive\");\n    res.setHeader(\"X-Accel-Buffering\", \"no\"); // 禁用 Nginx 缓冲\n    res.flushHeaders();\n  }\n  sendEvent(event: string, data: unknown): void {\n    if (this.isClosed) return;\n    this.res.write(`event: ${event}\\n`);\n    this.res.write(`data: ${JSON.stringify(data)}\\n\\n`);\n  }\n  close(): void {\n    if (this.isClosed) return;\n    this.isClosed = true;\n    this.res.end();\n  }\n}\n```\n\n代理 LLM 流式输出时，用 `for await (const chunk of stream)` 遍历 OpenAI 的流，每个增量 delta 用 `sendEvent(\"delta\", { content })` 转发给前端，完成后发送 `done` 事件并调用 `close()`。客户端断开时需要监听 `req.on(\"close\", ...)` 清理资源，避免泄漏。"
+      },
+      {
+        "title": "本章要记住的东西",
+        "body": "- Express 类型化路由用 `Request<P,R,B,Q>` 四泛型；扩展 `req` 自定义属性用声明合并（`namespace Express { interface Request }`）。\n- Fastify 泛型路由把 Schema 与类型绑定，推断更强，是新项目首选。\n- Zod 实现「运行时验证 + TS 类型自动推导」双保险；`z.coerce` 处理 URL 参数类型转换。\n- 错误类体系 + 四参数 `ErrorRequestHandler` + `asyncHandler` 三件套，构成完整错误处理链路。\n- SSE 端点核心：`text/event-stream` 头 + `flushHeaders()` + `write()` 推流 + 客户端断开清理。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Express 的 `Request` 类型接受四个泛型参数，顺序是什么？",
+        "options": [
+          "`<Body, Params, Query, ResBody>`",
+          "`<Params, ResBody, ReqBody, Query>`",
+          "`<Query, Params, Body, Response>`",
+          "`<Params, Query, Body, ResBody>`"
+        ],
+        "answer": 1,
+        "explain": "Express 的 `Request<Params, ResBody, ReqBody, Query>` 四个泛型依次是路径参数、响应体、请求体、查询参数。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么 TypeScript 的类型检查不足以保证 HTTP 请求体数据安全？",
+        "options": [
+          "因为 TypeScript 不支持对象类型",
+          "因为 TypeScript 类型在编译后被擦除，运行时请求体是 `unknown`，编译器无法检查",
+          "因为 Express 不支持泛型",
+          "因为 JSON.parse 返回 `string`"
+        ],
+        "answer": 1,
+        "explain": "TypeScript 类型在编译期存在、运行时擦除。HTTP 请求体到达时是字符串或 unknown，编译器已不在场，所以需要 Zod 做运行时验证。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于 Zod 的说法，哪一条是正确的？",
+        "options": [
+          "`z.infer<typeof Schema>` 只能在运行时使用，不是 TypeScript 类型",
+          "`safeParse` 验证失败时会直接抛出异常",
+          "`z.coerce.number()` 会把字符串 `\"42\"` 自动转换为数字 `42`",
+          "Zod Schema 只能验证对象，不能验证数组和联合类型"
+        ],
+        "answer": 2,
+        "explain": "`z.coerce.number()` 会在验证时自动做类型转换，处理 URL 查询参数很方便。`safeParse` 不抛异常，而是返回 `{ success, data/error }`。`z.infer` 是编译期类型工具。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Express 的错误处理中间件只要参数名字有 `err` 就会被识别为错误处理器，哪怕只写三个参数。",
+        "answer": false,
+        "explain": "Express 识别错误处理中间件依赖的是**参数数量**，必须是四个参数 `(err, req, res, next)`，少一个都不会被识别为错误处理器。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么 Express 4.x 的 async 路由处理器需要用 `asyncHandler` 包装？",
+        "options": [
+          "因为 async 函数的返回值类型不兼容 Express",
+          "因为 Express 4.x 默认不捕获 async 路由中 Promise rejection，错误不会流向错误处理中间件",
+          "因为 async/await 在 Node.js 中运行很慢",
+          "因为 TypeScript 编译器不支持 async 路由"
+        ],
+        "answer": 1,
+        "explain": "Express 4.x 不处理 async 路由中的 Promise rejection，错误会变成未处理的 rejection。`asyncHandler` 用 `.catch(next)` 把错误显式传给 `next`，从而触发全局错误处理中间件。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用声明合并扩展 `Express.Request` 后，任何路由处理器里的 `req.user` 都会自动有类型，无需额外标注。",
+        "answer": true,
+        "explain": "通过 `declare global { namespace Express { interface Request { user?: User } } }` 声明合并后，TypeScript 会在所有使用 `Request` 类型的地方自动合并这个字段，包括路由处理器。"
+      },
+      {
+        "type": "input",
+        "prompt": "SSE 端点响应的 `Content-Type` 头应该设为什么值？",
+        "accept": [
+          "text/event-stream",
+          "\"text/event-stream\""
+        ],
+        "explain": "SSE 协议要求 `Content-Type: text/event-stream`，这是让浏览器识别 SSE 连接的关键头。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Fastify 泛型路由相比 Express 手动标注泛型，最主要的优势是什么？",
+        "options": [
+          "Fastify 运行速度比 Express 慢，但类型更安全",
+          "Fastify 的 Schema 同时完成运行时验证和类型推导，Express 只有类型推导",
+          "Fastify 不需要安装额外的类型声明包",
+          "Fastify 的 Schema 只做类型推导，不做运行时验证"
+        ],
+        "answer": 1,
+        "explain": "Fastify 的泛型路由通过一份 Schema 同时完成运行时验证（JSON Schema）和 TypeScript 类型推导，而 Express 需要手动标注泛型，运行时验证还要额外接入 Zod 等工具。"
+      },
+      {
+        "type": "input",
+        "prompt": "Zod 从 Schema 自动推导 TypeScript 类型的语法是什么？（填写格式：`z.infer<...>`）",
+        "accept": [
+          "z.infer<typeof Schema>",
+          "z.infer<typeof YourSchema>"
+        ],
+        "explain": "`type Input = z.infer<typeof CreateUserSchema>` 可以从 Zod Schema 自动推导出对应的 TypeScript 类型，无需手写重复定义。"
+      },
+      {
+        "type": "match",
+        "prompt": "把后端开发中的工具/概念和它们的核心作用配对：",
+        "left": [
+          "`RequestHandler` 类型",
+          "`asyncHandler(fn)` 包装",
+          "`z.coerce.number()`",
+          "四参数 `ErrorRequestHandler`"
+        ],
+        "right": [
+          "Express 中间件函数的标准类型别名",
+          "把 async 路由的 Promise 错误传递给 `next`",
+          "自动把 URL 查询参数字符串转为数字",
+          "Express 识别全局错误处理中间件的标志"
+        ],
+        "explain": "四个工具各司其职：`RequestHandler` 统一中间件类型、`asyncHandler` 桥接异步错误、`coerce.number()` 处理 URL 参数类型转换、四参数签名标识错误处理器。"
+      },
+      {
+        "type": "judge",
+        "prompt": "SSE 连接中，如果客户端断开，服务端如果不清理定时器或中止流，会导致内存/资源泄漏。",
+        "answer": true,
+        "explain": "SSE 连接断开后，服务端的 `setInterval` 或 LLM 流请求不会自动停止。必须监听 `req.on('close', ...)` 事件，手动清理资源。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种 `AppError` 子类的继承写法能正确修复 TypeScript 中继承 `Error` 的 prototype 链问题？",
+        "options": [
+          "在构造函数里加 `this.__proto__ = AppError.prototype`",
+          "在 `super()` 之后加 `Object.setPrototypeOf(this, new.target.prototype)`",
+          "只需要加 `this.name = 'AppError'` 即可",
+          "使用 `Error.call(this, message)` 替代 `super(message)`"
+        ],
+        "answer": 1,
+        "explain": "TypeScript 编译成 ES5 时，继承内置 `Error` 的 prototype 链会断裂，导致 `instanceof` 失效。在 `super()` 后加 `Object.setPrototypeOf(this, new.target.prototype)` 是修复这个问题的标准做法。"
+      }
+    ]
+  },
+  {
+    "title": "第23章 React 前端集成",
+    "subtitle": "Props 类型、Hooks 泛型、Zustand 状态管理与类型安全 API 调用",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "React 本身是 JavaScript 库，Props 传错了、状态更新出错了，编译器默认不知道。TypeScript 集成 React 的目标是：**组件 Props 有明确约束、Hooks 状态有准确类型、API 调用有端到端的类型保障**，让整个前端代码在编译期就能暴露问题。\n\n这一章按照「项目配置 → 组件 Props → Hooks 类型 → 状态管理 → API 调用」的顺序展开，覆盖 React+TypeScript 项目中最高频的类型标注场景。"
+      },
+      {
+        "title": "Vite 项目配置与 JSX 设置",
+        "body": "用 Vite 创建 React+TypeScript 项目是目前最主流的方式：\n\n```typescript\n// vite.config.ts\nimport { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\nimport path from 'path';\nexport default defineConfig({\n  plugins: [react()],\n  resolve: { alias: { '@': path.resolve(__dirname, './src') } },\n  server: {\n    proxy: { '/api': { target: 'http://localhost:3000', changeOrigin: true } },\n  },\n});\n```\n\n`tsconfig.json` 里最关键的是 `\"jsx\": \"react-jsx\"`（不需要在每个文件 `import React`）和 `\"strict\": true`。环境变量类型用 `vite-env.d.ts` 扩展，让 `import.meta.env.VITE_XXX` 有自动补全：\n\n```typescript\ninterface ImportMetaEnv {\n  readonly VITE_API_BASE_URL: string;\n  readonly VITE_APP_TITLE: string;\n}\ninterface ImportMeta { readonly env: ImportMetaEnv }\n```"
+      },
+      {
+        "title": "组件 Props 类型定义",
+        "body": "推荐用 `interface` 定义 Props，因为它支持声明合并，更符合 React 生态惯例。继承原生 HTML 元素属性用 `React.ComponentPropsWithoutRef`，避免重复声明 `className`、`id` 等：\n\n```typescript\ninterface ButtonProps {\n  label: string;\n  onClick: () => void;\n  variant?: 'primary' | 'secondary' | 'danger';\n  size?: 'sm' | 'md' | 'lg';\n}\n// 扩展原生 input，排除已单独定义的属性\ninterface TextInputProps extends React.ComponentPropsWithoutRef<'input'> {\n  label: string;\n  error?: string;\n}\nconst TextInput: React.FC<TextInputProps> = ({ label, error, ...restProps }) => (\n  <div>\n    <label>{label}</label>\n    <input {...restProps} />\n    {error && <span>{error}</span>}\n  </div>\n);\n```\n\n泛型组件（render prop 模式）让列表组件可以复用于任意数据类型：\n\n```typescript\ninterface ListProps<T> {\n  items: T[];\n  renderItem: (item: T, index: number) => React.ReactNode;\n  keyExtractor: (item: T) => string;\n}\nfunction List<T>({ items, renderItem, keyExtractor }: ListProps<T>) {\n  return <ul>{items.map((item, i) => <li key={keyExtractor(item)}>{renderItem(item, i)}</li>)}</ul>;\n}\n```"
+      },
+      {
+        "title": "useState 与 useReducer 类型标注",
+        "body": "简单类型 TypeScript 自动推断；复杂对象和 `null` 初始值需要显式泛型：\n\n```typescript\nconst [user, setUser] = useState<User | null>(null);\nconst [messages, setMessages] = useState<Message[]>([]);\n```\n\n`useReducer` 配合可辨识联合类型，每个 `case` 里 `action` 类型会精确收窄：\n\n```typescript\ntype ChatAction =\n  | { type: 'ADD_MESSAGE'; payload: Message }\n  | { type: 'SET_LOADING'; payload: boolean }\n  | { type: 'CLEAR_MESSAGES' };\nfunction chatReducer(state: ChatState, action: ChatAction): ChatState {\n  switch (action.type) {\n    case 'ADD_MESSAGE':\n      return { ...state, messages: [...state.messages, action.payload] };\n    case 'SET_LOADING':\n      return { ...state, isLoading: action.payload }; // payload 类型为 boolean\n    case 'CLEAR_MESSAGES':\n      return { ...state, messages: [] };\n    default:\n      return state;\n  }\n}\n```"
+      },
+      {
+        "title": "useRef 的两种用途与类型差异",
+        "body": "`useRef` 有两种截然不同的用途，类型标注方式也不同：\n\n```typescript\n// 用途一：引用 DOM 元素 —— 初始值必须是 null\nconst inputRef = useRef<HTMLInputElement>(null);\nuseEffect(() => { inputRef.current?.focus(); }, []);\nreturn <input ref={inputRef} />;\n```\n\n```typescript\n// 用途二：存储可变值（不触发重渲染）—— 初始值是具体值\nconst fullTextRef = useRef<string>('');\nconst abortControllerRef = useRef<AbortController | null>(null);\nconst timerRef = useRef<ReturnType<typeof setInterval> | null>(null);\n```\n\n为什么 DOM 引用要用 `null` 初始值？因为组件渲染时 DOM 元素还不存在，`current` 是 `null`；挂载后才指向真实元素。存储可变值时，初始值就是你想存的值，不需要 `null`。"
+      },
+      {
+        "title": "为什么 Context 要用 undefined 默认值 + 自定义 Hook？",
+        "body": "如果把 Context 的默认值设为一个「空」实现，在 Provider 外部使用时不会报错，但行为是静默错误的——`toggle` 什么都不做。把默认值设为 `undefined`，再封装自定义 Hook 检查，可以在运行时第一时间发现使用错误：\n\n```typescript\nconst ThemeContext = React.createContext<ThemeContextType | undefined>(undefined);\nexport function useTheme(): ThemeContextType {\n  const context = React.useContext(ThemeContext);\n  if (context === undefined) {\n    throw new Error('useTheme 必须在 ThemeProvider 内部使用');\n  }\n  return context;\n}\n```\n\nZustand 是更轻量的替代方案，用 `create<StoreType>()` 一步定义状态和操作：\n\n```typescript\ninterface ChatStore {\n  messages: Message[];\n  isStreaming: boolean;\n  addMessage: (msg: Omit<Message, 'id' | 'timestamp'>) => void;\n  setStreaming: (v: boolean) => void;\n}\nexport const useChatStore = create<ChatStore>()((set) => ({\n  messages: [],\n  isStreaming: false,\n  addMessage: (msgData) => set((state) => ({ messages: [...state.messages, { ...msgData, id: crypto.randomUUID(), timestamp: Date.now() }] })),\n  setStreaming: (isStreaming) => set({ isStreaming }),\n}));\n```\n\n用选择器订阅避免不必要的重渲染：`const messages = useChatStore((state) => state.messages)`。"
+      },
+      {
+        "title": "类型安全的 API 调用层",
+        "body": "建立统一的 API 类型定义，是大型项目的最佳实践。封装 `ApiClient` 类，用泛型让每个接口的响应类型在调用点明确：\n\n```typescript\nclass ApiClient {\n  async get<T>(url: string, params?: Record<string, unknown>): Promise<T> {\n    const response = await this.client.get<ApiResponse<T>>(url, { params });\n    return response.data.data;\n  }\n  async post<TRequest, TResponse>(url: string, data: TRequest): Promise<TResponse> {\n    const response = await this.client.post<ApiResponse<TResponse>>(url, data);\n    return response.data.data;\n  }\n}\nexport const apiClient = new ApiClient(import.meta.env.VITE_API_BASE_URL);\n```\n\n`useAsync` Hook 用 `useReducer` 管理加载状态三元组，防止竞态条件：\n\n```typescript\nfunction useAsync<T>(asyncFn: () => Promise<T>, deps: React.DependencyList = []) {\n  const [state, dispatch] = useReducer(asyncReducer<T>, { data: null, isLoading: false, error: null });\n  useEffect(() => {\n    let cancelled = false;\n    dispatch({ type: 'LOADING' });\n    asyncFn()\n      .then((data) => { if (!cancelled) dispatch({ type: 'SUCCESS', payload: data }); })\n      .catch((error: unknown) => { if (!cancelled) dispatch({ type: 'ERROR', payload: error instanceof Error ? error : new Error(String(error)) }); });\n    return () => { cancelled = true; };\n  }, deps);\n  return state;\n}\n```"
+      },
+      {
+        "title": "本章要记住的东西",
+        "body": "- Props 用 `interface`，继承原生元素属性用 `React.ComponentPropsWithoutRef<'div'>`，Render Props 组件用泛型。\n- `useState<T | null>(null)` 处理可空初始值；`useReducer` + 可辨识联合类型让 action 精确收窄。\n- DOM 引用 `useRef<HTMLXxxElement>(null)`，可变值 `useRef<T>(初始值)`，两种用途类型不同。\n- Context 用 `undefined` 默认值 + 自定义 Hook 强制检查；Zustand 用 `create<StoreType>()` + 选择器订阅。\n- API 客户端封装泛型方法，`useAsync` Hook 用取消标志防竞态。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "想让自定义的 `TextInput` 组件继承所有原生 `<input>` 属性（如 `placeholder`、`disabled`、`onChange`），应该使用哪个工具类型？",
+        "options": [
+          "`React.HTMLAttributes<HTMLInputElement>`",
+          "`React.ComponentPropsWithoutRef<'input'>`",
+          "`React.ElementType<'input'>`",
+          "`React.InputHTMLAttributes<HTMLElement>`"
+        ],
+        "answer": 1,
+        "explain": "`React.ComponentPropsWithoutRef<'input'>` 会提取原生 `<input>` 元素的所有 Props 类型，是继承原生 HTML 元素属性的推荐方式。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`useRef<HTMLInputElement>(null)` 和 `useRef<string>('')` 的类型结果是一样的，区别只在于初始值。",
+        "answer": false,
+        "explain": "两者类型不同。DOM 引用 `useRef<HTMLInputElement>(null)` 得到 `RefObject<HTMLInputElement>`（current 只读），而存储可变值的 `useRef<string>('')` 得到 `MutableRefObject<string>`（current 可写）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 `useReducer` 中使用可辨识联合类型定义 `action`，核心好处是什么？",
+        "options": [
+          "减少了代码量，不用写 switch 语句",
+          "每个 case 分支里，TypeScript 能精确收窄 `action.payload` 的类型",
+          "让 reducer 函数不需要返回新的 state 对象",
+          "避免了 useReducer 的性能问题"
+        ],
+        "answer": 1,
+        "explain": "可辨识联合类型配合 switch，让 TypeScript 在每个 case 分支里把 action 收窄到对应的具体类型，比如 `case 'ADD_MESSAGE'` 里 `action.payload` 就是 `Message`，而不是 `Message | boolean | undefined`。"
+      },
+      {
+        "type": "input",
+        "prompt": "Vite 项目中，让 TypeScript 识别 `import.meta.env.VITE_API_URL` 有类型的做法是在哪个文件里扩展哪个接口？（填写接口名）",
+        "accept": [
+          "ImportMetaEnv",
+          "interface ImportMetaEnv"
+        ],
+        "explain": "在 `src/vite-env.d.ts` 中扩展 `ImportMetaEnv` 接口，添加 `readonly VITE_XXX: string` 字段，TypeScript 就能识别这些环境变量的类型。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Context 的默认值为什么推荐设为 `undefined`，而不是一个「空实现」对象？",
+        "options": [
+          "因为 `undefined` 性能更好",
+          "因为 React 不允许 Context 默认值为对象",
+          "因为空实现会导致在 Provider 外部使用时静默失败；`undefined` + Hook 检查能在第一时间报出明确错误",
+          "因为 TypeScript 无法推断对象字面量的类型"
+        ],
+        "answer": 2,
+        "explain": "空实现（比如 `toggleTheme: () => {}`）在 Provider 外部使用时不会报错，但什么都不做——静默失败很难排查。设为 `undefined` 后，自定义 Hook 检查到 `undefined` 就立即抛出明确错误，帮助开发者快速定位问题。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Zustand 中，用选择器订阅（`useChatStore((state) => state.messages)`）相比直接解构（`const { messages, isStreaming } = useChatStore()`）的优势是？",
+        "options": [
+          "选择器写法代码更短",
+          "只订阅需要的状态，其他状态变化不会触发当前组件重渲染",
+          "选择器可以修改 store 里的状态",
+          "解构写法会导致 TypeScript 类型错误"
+        ],
+        "answer": 1,
+        "explain": "Zustand 用选择器时，只有被选中的状态片段变化才会触发重渲染。解构整个 store 会订阅所有状态，任何字段变化都触发渲染，性能更差。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`useAsync` Hook 中，用 `cancelled` 标志来阻止已卸载组件设置状态，这是防止「在已卸载组件上调用 setState」警告的标准做法。",
+        "answer": true,
+        "explain": "当组件在异步操作完成前卸载，如果没有取消标志，回调里的 `dispatch` 仍会尝试更新状态。`cancelled` 标志配合 cleanup 函数 `return () => { cancelled = true }` 可以防止这种情况。"
+      },
+      {
+        "type": "match",
+        "prompt": "把 React 中的类型/工具和它们的用途配对：",
+        "left": [
+          "`React.ComponentPropsWithoutRef<'button'>`",
+          "`React.FC<ButtonProps>`",
+          "`React.PropsWithChildren`",
+          "`React.ChangeEventHandler<HTMLInputElement>`"
+        ],
+        "right": [
+          "提取原生 `<button>` 元素的全部 Props 类型",
+          "带 Props 泛型的函数组件类型",
+          "给 Props 接口自动加上 `children: React.ReactNode`",
+          "`onChange` 事件处理器的完整类型"
+        ],
+        "explain": "四个类型工具各有分工：`ComponentPropsWithoutRef` 提取原生属性、`FC` 是函数组件的泛型类型、`PropsWithChildren` 添加 children、`ChangeEventHandler` 标注事件处理器。"
+      },
+      {
+        "type": "input",
+        "prompt": "Zustand 创建一个带完整类型约束的 Store，语法的开头是什么？（填写到括号为止，如 `create<ChatStore>()(`）",
+        "accept": [
+          "create<ChatStore>()("],
+        "explain": "Zustand v4+ 的用法是 `create<StoreType>()(...)` ——外层括号是 TypeScript 的柯里化写法，用于绕过 TypeScript 无法同时推断泛型和参数的限制。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下泛型列表组件 `List<T>` 中，`renderItem` 的类型应该是？\n```typescript\ninterface ListProps<T> {\n  items: T[];\n  renderItem: ???;\n}\n```",
+        "options": [
+          "`(item: unknown) => React.ReactNode`",
+          "`(item: T, index: number) => React.ReactNode`",
+          "`React.FC<T>`",
+          "`(item: T) => string`"
+        ],
+        "answer": 1,
+        "explain": "`renderItem: (item: T, index: number) => React.ReactNode` 让调用方传入的渲染函数能正确推断 `item` 的类型，并返回任意可渲染内容。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`useState` 在初始值为 `null` 时，TypeScript 会自动推断状态类型为 `null`，后续无法存入其他类型的值。",
+        "answer": true,
+        "explain": "如果写 `useState(null)`，TypeScript 推断类型为 `null`，`setUser(someUser)` 会报错。应显式标注泛型：`useState<User | null>(null)`，让类型包含两种可能。"
+      },
+      {
+        "type": "choice",
+        "prompt": "封装 `ApiClient` 的 `get<T>` 方法时，用泛型参数 `T` 的主要目的是什么？",
+        "options": [
+          "让方法支持并发请求",
+          "让调用点能指定响应数据的具体类型，避免返回 `unknown` 或 `any`",
+          "减少网络请求次数",
+          "让 axios 自动解析 JSON"
+        ],
+        "answer": 1,
+        "explain": "泛型 `T` 让调用方写 `apiClient.get<User[]>('/users')` 时，返回类型就是 `Promise<User[]>`，而不是 `Promise<unknown>`，从而在使用返回值时获得完整的类型推断。"
+      }
+    ]
+  },
+  {
+    "title": "第24章 完整项目实战",
+    "subtitle": "Monorepo 架构、共享类型契约、Docker 部署与结构化日志——把全栈 AI 应用打通",
+    "intro": [
+      {
+        "title": "这一章在解决什么",
+        "body": "前两章分别讲了 Node.js 后端和 React 前端，但它们目前是两个独立的项目。现实中的全栈应用面临一个经典问题：**前后端类型如何保持一致？** 后端改了一个字段名，前端用旧字段名发请求，编译时没有任何报错，只有运行时才出问题。\n\n这一章用 Monorepo（单仓库多包）架构来解决这个问题——前后端共享一个 `@typechat/shared` 包，里面放类型、Zod Schema 和 API 路径常量，任何一方改了，另一方编译时立即报错。同时覆盖生产级部署（Docker 多阶段构建）、CI/CD（GitHub Actions）和结构化日志（Pino）。"
+      },
+      {
+        "title": "Monorepo 架构：为什么把前后端放一个仓库？",
+        "body": "Monorepo 不是把所有代码堆在一起，而是用工作空间（workspace）管理多个相互依赖的包。TypeChat 项目的结构是：\n\n```\ntypechat/\n├── packages/shared/    # 共享类型、Zod Schema、API 路径常量\n├── packages/config/    # 共享 tsconfig、eslint 配置\n├── apps/backend/       # Fastify 后端（依赖 @typechat/shared）\n└── apps/frontend/      # React 前端（依赖 @typechat/shared）\n```\n\n为什么这样做？因为 `packages/shared` 是**单一来源**——`Message`、`Conversation` 等核心类型只在这里定义一次，前后端都从这里导入。后端修改了 `Message.tokenCount` 字段类型，前端用到这个字段的地方会立即在编译期报错，而不是等到联调才发现。\n\npnpm workspace 用 `pnpm-workspace.yaml` 声明范围，Turborepo 的 `turbo.json` 管理构建依赖顺序（`build` 依赖 `^build`，意思是先构建所有依赖包，再构建当前包）。"
+      },
+      {
+        "title": "共享类型：前后端零漂移的关键",
+        "body": "shared 包里的核心类型定义（`packages/shared/src/types/chat.ts`）：\n\n```typescript\nexport type MessageRole = 'user' | 'assistant' | 'system';\nexport interface Message {\n  id: string;\n  conversationId: string;\n  role: MessageRole;\n  content: string;\n  createdAt: string;   // ISO 8601\n  tokenCount?: number;\n}\n// 列表页不需要 messages 字段，用 Omit 避免重复定义\nexport type ConversationSummary = Omit<Conversation, 'messages'>;\n// SSE 事件类型：可辨识联合，前后端共用\nexport type StreamEvent =\n  | { type: 'start'; messageId: string }\n  | { type: 'delta'; content: string }\n  | { type: 'done'; tokenCount: number; cost: number }\n  | { type: 'error'; code: string; message: string };\n```\n\nAPI 路径常量也放在 shared 里，避免前后端分别硬编码字符串：\n\n```typescript\nexport const API_ROUTES = {\n  CONVERSATIONS: {\n    STREAM: (id: string) => `/api/conversations/${id}/stream` as const,\n  },\n} as const;\n```\n\n这样前端调用 `API_ROUTES.CONVERSATIONS.STREAM(conversationId)` 时，路径和后端路由的 `as const` 类型完全对齐。"
+      },
+      {
+        "title": "Zod Schema 单一来源：一份 Schema，两端共用",
+        "body": "shared 包里的 Zod Schema（`packages/shared/src/schemas/chat.ts`）同时服务于后端验证和前端表单校验：\n\n```typescript\nimport { z } from 'zod';\nexport const CreateConversationSchema = z.object({\n  title: z.string().min(1).max(200).optional(),\n  modelId: ModelIdSchema,\n  systemPrompt: z.string().max(4000).optional(),\n});\nexport type CreateConversationInput = z.infer<typeof CreateConversationSchema>;\n```\n\n后端直接把这个 Schema 传给 Fastify 的路由验证；前端的表单组件也用同一个 Schema 做客户端校验。字段约束改了一处，前后端同时生效。\n\n错误码也统一定义为 `as const` 对象，避免前后端各自维护一套字符串：\n\n```typescript\nexport const ErrorCodes = {\n  AUTH_TOKEN_EXPIRED: 'AUTH_TOKEN_EXPIRED',\n  RESOURCE_NOT_FOUND: 'RESOURCE_NOT_FOUND',\n  AI_RATE_LIMIT_EXCEEDED: 'AI_RATE_LIMIT_EXCEEDED',\n} as const;\nexport type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];\n```"
+      },
+      {
+        "title": "为什么用 Zod 验证环境变量？",
+        "body": "环境变量全是字符串，而你的代码需要数字（端口号）、枚举值（NODE_ENV）、URL 格式。用 Zod 在启动时统一验证并转换，配置错误会在进程启动时立即崩溃（fail fast），而不是在运行到某个功能时才报错：\n\n```typescript\nconst EnvSchema = z.object({\n  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),\n  APP_PORT: z.coerce.number().default(3000),   // 字符串转数字\n  JWT_ACCESS_SECRET: z.string().min(32),        // 强制最小长度\n  OPENAI_API_KEY: z.string().startsWith('sk-').optional(),\n  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),\n});\nconst parsed = EnvSchema.safeParse(process.env);\nif (!parsed.success) {\n  console.error(parsed.error.flatten().fieldErrors);\n  process.exit(1);\n}\nexport const env = parsed.data; // 完全类型化，再也不用写 as string\n```\n\n`export const env = parsed.data` 之后，整个项目里用 `env.APP_PORT` 得到的就是 `number`，而不是 `string | undefined`。"
+      },
+      {
+        "title": "多模型路由：用可辨识联合驱动 Provider 选择",
+        "body": "`ChatService` 根据 `modelId` 前缀路由到不同的 AI Provider，`StreamEvent` 类型在前后端共享，保证 SSE 数据结构一致：\n\n```typescript\ntype StreamOptions = {\n  messages: Pick<Message, 'role' | 'content'>[];\n  modelId: ModelId;\n  systemPrompt?: string;\n  signal?: AbortSignal;\n  onEvent: (event: StreamEvent) => void | Promise<void>;\n};\nexport class ChatService {\n  async streamChat(options: StreamOptions): Promise<void> {\n    const { modelId, onEvent } = options;\n    if (modelId.startsWith('gpt-')) {\n      await this.streamOpenAI(options);\n    } else if (modelId.startsWith('claude-')) {\n      await this.streamAnthropic(options);\n    } else {\n      throw new AppError(ErrorCodes.AI_PROVIDER_UNAVAILABLE, `不支持的模型：${modelId}`);\n    }\n  }\n}\n```\n\n前端的 `useStreamChat` Hook 直接从 shared 包导入 `StreamEvent` 类型来解析 SSE 事件，类型和后端发送的完全对齐，不会出现字段名拼写错误。"
+      },
+      {
+        "title": "Docker 多阶段构建与结构化日志",
+        "body": "后端的 Dockerfile 用多阶段构建把镜像体积降到最小——构建阶段包含 TypeScript 编译器和所有 devDependencies，运行阶段只有编译产物和生产依赖：\n\n```dockerfile\nFROM node:20-alpine AS builder\nRUN corepack enable && corepack prepare pnpm@latest --activate\n# ... 安装依赖、编译\nRUN pnpm deploy --filter backend --prod /prod/backend\nFROM node:20-alpine AS runner\n# 只复制编译产物和精简依赖\nCOPY --from=builder /prod/backend ./\nCOPY --from=builder /app/apps/backend/dist ./dist\nUSER fastify\nEXPOSE 3000\nCMD [\"node\", \"dist/main.js\"]\n```\n\n结构化日志用 Pino，每条日志都是 JSON，便于 ELK/Loki 解析：\n\n```typescript\nexport const logger = pino({\n  level: env.LOG_LEVEL,\n  base: { service: 'typechat-backend', env: env.NODE_ENV },\n  timestamp: pino.stdTimeFunctions.isoTime,\n  serializers: { err: pino.stdSerializers.err },\n});\n// 每个请求创建带 requestId 的子 Logger，日志天然有请求追踪\nexport function createRequestLogger(context: LogContext): Logger {\n  return logger.child(context);\n}\n```\n\n健康检查端点区分 `/health`（简单存活）和 `/ready`（详细就绪，负载均衡器用这个决定是否接入流量）。"
+      },
+      {
+        "title": "本章要记住的东西",
+        "body": "- Monorepo 用 pnpm workspace + Turborepo，shared 包是前后端共享类型/Schema/常量的单一来源。\n- `ConversationSummary = Omit<Conversation, 'messages'>` 用工具类型避免重复定义；`StreamEvent` 可辨识联合前后端共用。\n- Zod 验证环境变量 + fail fast，`env.APP_PORT` 就是 `number`，不再是 `string | undefined`。\n- `ChatService.streamChat` 用 `modelId` 前缀路由到 OpenAI/Anthropic，`onEvent` 回调解耦流式输出与传输层。\n- Docker 多阶段构建分离编译和运行；Pino 结构化日志 + `requestId` 子 Logger 实现请求追踪；健康检查分 `/health` 和 `/ready`。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Monorepo 中把共享类型放在 `packages/shared` 包的最主要好处是什么？",
+        "options": [
+          "减少了 npm 包的数量",
+          "前后端类型有单一来源，任一端改了类型，另一端编译时立即报错",
+          "让前后端可以共享 CSS 样式",
+          "自动生成 API 文档"
+        ],
+        "answer": 1,
+        "explain": "单一来源原则是 Monorepo 共享类型的核心价值。后端修改了 `Message` 的字段，前端导入的是同一个类型，TypeScript 编译时就能发现不兼容的地方，而不是等到运行时联调才发现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`ConversationSummary = Omit<Conversation, 'messages'>` 这种写法的好处是：`Conversation` 字段有变化时，`ConversationSummary` 会自动跟着更新，不需要手动同步。",
+        "answer": true,
+        "explain": "用 `Omit` 从已有类型派生新类型，而不是手写两个独立的接口，这样 `Conversation` 增删字段时，`ConversationSummary` 自动跟着变化（只排除 `messages`），减少维护负担。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Turborepo 的 `turbo.json` 里，`build` 任务配置了 `\"dependsOn\": [\"^build\"]`，`^` 符号的含义是什么？",
+        "options": [
+          "表示当前包的构建必须在所有其他包之前完成",
+          "表示先运行所有依赖包的 `build` 任务，再运行当前包的 `build`",
+          "表示当前 `build` 任务是可选的",
+          "表示使用缓存的构建结果"
+        ],
+        "answer": 1,
+        "explain": "`^build` 中的 `^` 表示「依赖包」。`backend` 依赖 `@typechat/shared`，所以 `^build` 会确保先构建 `shared`，再构建 `backend`，保证类型声明文件在编译时已存在。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用 Zod 验证环境变量，并在启动时调用 `process.exit(1)` 退出，这种模式叫什么？它解决的核心问题是？",
+        "options": [
+          "懒加载；解决启动速度慢的问题",
+          "Fail Fast（快速失败）；让配置错误在启动时暴露，而不是在运行到相关功能时才报错",
+          "热重载；解决修改环境变量后不需要重启服务的问题",
+          "健康检查；替代 `/health` 端点"
+        ],
+        "answer": 1,
+        "explain": "Fail Fast 是指程序在检测到不可恢复的错误时立即终止，而不是带着错误配置继续运行。启动时验证环境变量，缺少 `JWT_ACCESS_SECRET` 这类关键配置就立即崩溃，比运行到登录接口才报错要好得多。"
+      },
+      {
+        "type": "input",
+        "prompt": "将 `as const` 对象的所有值类型提取为联合类型，语法是什么？（针对 `typeof ErrorCodes`，填写格式）",
+        "accept": [
+          "(typeof ErrorCodes)[keyof typeof ErrorCodes]",
+          "typeof ErrorCodes[keyof typeof ErrorCodes]"
+        ],
+        "explain": "`(typeof ErrorCodes)[keyof typeof ErrorCodes]` 先获取对象的所有键类型，再用键去索引对象类型，得到所有值的联合类型。配合 `as const` 可以得到精确的字符串字面量联合。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Docker 多阶段构建中，最终运行镜像只需要包含编译后的 `dist/` 文件和生产依赖，`typescript`、`ts-node` 等开发工具不需要。",
+        "answer": true,
+        "explain": "多阶段构建的价值正在于此：builder 阶段有完整的 TypeScript 工具链，runner 阶段只复制编译产物和生产依赖（`pnpm deploy --prod`），镜像更小、攻击面更小。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`/health` 和 `/ready` 两个端点的职责分别是什么？",
+        "options": [
+          "`/health` 检查数据库连接，`/ready` 检查进程是否存活",
+          "`/health` 是进程存活检查（只要进程在就返回 200），`/ready` 是详细就绪检查（数据库/Redis 连接正常才返回 200）",
+          "两者完全等价，任选其一即可",
+          "`/health` 供前端调用，`/ready` 供后端内部使用"
+        ],
+        "answer": 1,
+        "explain": "负载均衡器用 `/ready` 判断是否把流量切到该实例（启动中或数据库断连时返回 503，停止接流量）；`/health` 只判断进程还活着，用于容器编排的存活探针。"
+      },
+      {
+        "type": "match",
+        "prompt": "把 TypeChat 项目的各个目录/文件和它们的职责配对：",
+        "left": [
+          "`packages/shared/src/types/`",
+          "`packages/shared/src/schemas/`",
+          "`apps/backend/src/config/env.ts`",
+          "`apps/backend/Dockerfile`"
+        ],
+        "right": [
+          "核心领域类型（Message、Conversation、StreamEvent 等）",
+          "Zod 验证 Schema，前后端共用",
+          "用 Zod 解析并类型化的环境变量，启动失败即退出",
+          "多阶段构建：builder 阶段编译，runner 阶段只保留产物"
+        ],
+        "explain": "四个位置各司其职：types 定义核心类型、schemas 提供 Zod 验证、env.ts 在启动时强制验证配置、Dockerfile 用多阶段构建减小镜像体积。"
+      },
+      {
+        "type": "choice",
+        "prompt": "前端的 `useStreamChat` Hook 解析 SSE 事件时，下面哪种做法能保证类型安全？",
+        "options": [
+          "`const event = JSON.parse(data)` 后用 `event.type` 判断，不需要类型标注",
+          "`const event: StreamEvent = JSON.parse(data)` 从 shared 包导入 `StreamEvent` 类型来标注",
+          "用 `as any` 接收，再用可选链访问字段",
+          "只解析字符串，不做 JSON.parse，直接显示"
+        ],
+        "answer": 1,
+        "explain": "从 `@typechat/shared/types` 导入 `StreamEvent`，标注 `const event: StreamEvent = JSON.parse(data)`，TypeScript 就知道 `event.type` 是 `'start' | 'delta' | 'done' | 'error'`，在 switch 各分支里精确收窄 event 的类型。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Pino 的子 Logger（`logger.child(context)`）会把 `context` 里的字段合并到每条日志里，无需在每次 `log.info()` 时重复传。",
+        "answer": true,
+        "explain": "`logger.child({ requestId, userId })` 创建一个继承父 Logger 配置的子 Logger，此后用这个子 Logger 打的每条日志都自动带上 `requestId` 和 `userId`，是请求追踪的标准做法。"
+      },
+      {
+        "type": "input",
+        "prompt": "`ChatService.streamChat` 通过 `modelId` 前缀路由到不同 Provider。如果 `modelId` 是 `'claude-3-5-sonnet-20241022'`，会调用哪个私有方法？（填写方法名）",
+        "accept": [
+          "streamAnthropic",
+          "this.streamAnthropic"
+        ],
+        "explain": "代码逻辑是 `if (modelId.startsWith('gpt-'))` 调用 `streamOpenAI`，`else if (modelId.startsWith('claude-'))` 调用 `streamAnthropic`。`claude-` 前缀对应 Anthropic Provider。"
+      },
+      {
+        "type": "choice",
+        "prompt": "shared 包的 `package.json` 中配置了 `\"exports\"` 字段，设置 `\"./types\"` 和 `\"./schemas\"` 两个子路径入口，这样做的目的是？",
+        "options": [
+          "让包体积更小，按需加载",
+          "允许消费方精确导入，如 `import type { Message } from '@typechat/shared/types'`，同时为每个入口提供正确的类型声明路径",
+          "强制消费方只能导入整个包，不能单独导入某个文件",
+          "让 Node.js 自动选择 CommonJS 或 ESM 格式"
+        ],
+        "answer": 1,
+        "explain": "`exports` 字段定义包的子路径入口，消费方可以写 `import type { Message } from '@typechat/shared/types'` 而不用知道内部文件结构，TypeScript 也能通过 `types` 字段找到对应的 `.d.ts` 声明文件。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,111 @@
+[
+  {
+    "id": "u5c13",
+    "title": "特征、向量与缓存：四约束总览",
+    "subtitle": "为什么在线推理的「外部状态管理」是不可化简的系统问题",
+    "intro": [
+      {
+        "title": "动机：不只是存模型权重",
+        "body": "进入检索、推荐、RAG 场景后，平台管理的就不再只是模型权重，而是一整套\"特征 / embedding / 索引 / 缓存\"的**状态系统**。这套状态系统与模型一起决定线上输出，却常被当作旁路优化处理——直到一致性问题、权限泄露或延迟超标才被认真对待。\n\n不可化简的核心矛盾：**在线推理需要从海量历史数据/文档中找出与当前请求相关的少量上下文，且训练-推理一致性不能破。**"
+      },
+      {
+        "title": "四个同时成立的约束",
+        "body": "**约束一：外部状态比模型权重变化快得多。** 文档会更新、权限会变、商品会下架、用户行为每秒都在写入；而模型权重通常以周为单位迭代。平台必须在\"状态持续变化\"的前提下维持推理一致性。\n\n**约束二：模型只能消费有限上下文和有限延迟预算。** RAG 每次只能把少量 chunk 注入 prompt，推荐系统也不能对全量候选精排。这逼出了 ANN（近似最近邻）检索：用可控的召回损失换取可接受的 P95/P99 延迟。\n\n**约束三：相似性搜索不是等值查询。** Embedding 空间、chunk 规则、ANN 索引和 reranker 共同定义\"查到什么\"；其中任一版本变化——哪怕只是 tokenizer 更新——都会改变向量含义，继而使旧索引不可与新向量混用。\n\n**约束四：缓存会把历史结果带到未来。** 缓存能降低延迟，但也会把已删除、已越权、已过期的数据继续送进模型。缓存 key 必须覆盖版本、权限和上下文，否则命中率越高，泄露和过期风险越大。"
+      },
+      {
+        "title": "从第一性原理推导出每个机制",
+        "body": "从\"模型需要外部状态\"出发，推导链如下：\n\n- **特征** → 把业务世界压缩成模型可用字段，引出 `point-in-time correctness`：训练只能看到样本时间点之前的特征，否则产生 temporal leakage。\n- **Embedding** → 把非结构化对象映射到向量空间，但这个空间由模型版本 + tokenizer + 预处理共同定义，模型一换向量含义就变。\n- **向量索引（ANN）** → 全量比较千万向量延迟不可接受，必须用 `HNSW`/`IVF`/`PQ` 等算法，用召回损失换延迟。\n- **Chunking** → 文档太长不能整篇 embedding，切分策略成为版本化配置，一旦变化必须全量重建索引。\n- **增量更新 vs 全量重建** → 文档新增可增量；embedding 模型/chunk 规则/距离度量变化必须全量重建，否则得到不可解释的混合索引。\n- **缓存** → 多层缓存（Feature cache / Embedding cache / Retrieval cache / Prefix cache / KV Cache）共享同一工程问题：cache key 必须覆盖版本、权限和上下文。"
+      },
+      {
+        "title": "五个深挖章节导览",
+        "body": "| 章节 | 核心主题 | 何时优先读 |\n|------|---------|----------|\n| `13a` Feature Store | Registry / Offline-Online Parity / Point-in-Time / Materialization | 训练-线上特征不一致；想规范化特征定义 |\n| `13b` 向量索引算法 | `HNSW` / `IVF` / `PQ` / `DiskANN` / `ScaNN` 原理与取舍 | 召回率不达标、延迟超预算、内存超限 |\n| `13c` 向量数据库选型与运维 | Milvus / Qdrant / Weaviate / pgvector 选型；sharding；hybrid search；多租户 | 向量库选型决策；P99 抖动；多租户 ACL |\n| `13d` RAG 工程化 | chunking / hybrid search / reranker / 评测框架 Ragas | RAG 质量不稳定；离线评测与线上脱节 |\n| `13e` Embedding 工程与缓存层 | MTEB 选型；Matryoshka；ColBERT；多级缓存 key 设计与失效 | Embedding 成本过高；缓存命中率低；越权风险 |"
+      },
+      {
+        "title": "向量索引不是持久化文件，是有生命周期的平台对象",
+        "body": "最常见的认知误区：把向量索引理解为\"把 embedding 存起来的文件\"。\n\n实际上，向量索引是由以下四个维度**共同定义**的服务状态：\n1. **Embedding 模型版本**：换模型 → 向量含义变 → 旧索引不可用\n2. **Chunk 规则版本**：改切分方式 → 文档边界变 → 全量重建\n3. **距离度量**（cosine / L2 / inner product）：换度量 → 排序含义变 → 全量重建\n4. **索引算法参数**（HNSW 的 M / IVF 的 nlist）：改参数 → 索引结构变 → 全量重建\n\n因此，生产向量库必须维护索引的版本元数据，并使用**双索引蓝绿切换**，不能直接覆盖生产索引。",
+        "tip": "索引版本元数据至少包含：`embedding_model_version`、`tokenizer_version`、`chunk_policy_version`、`distance_metric`、`build_time`。"
+      },
+      {
+        "title": "缓存 key 设计：越激进越危险",
+        "body": "缓存层级从应用层到 LLM serving 层，至少有四类：\n\n| 缓存类型 | 缓存什么 | 最常见越权风险 |\n|---------|---------|---------------|\n| Feature cache | 用户/商品特征值 | 权限变更后旧缓存仍服务 |\n| Embedding cache | query 或 doc 的向量 | 模型升级后旧向量被复用 |\n| Retrieval / Semantic cache | RAG 检索结果或 LLM 答案 | 跨租户结果泄露 |\n| KV Prefix cache | LLM 的前缀 KV 状态 | 含检索结果的前缀被跨用户共享 |\n\n`Prefix cache` 如果包含检索结果、用户画像或 policy 条件，就不再是纯静态前缀，**这些维度都必须进入 key**；如果做不到，就宁可只缓存严格静态的公共前缀（如固定 system prompt），而不要做\"命中率高、越权风险高\"的共享缓存。",
+        "reveal": {
+          "q": "为什么检索缓存（Retrieval cache）的 key 必须包含 ACL/权限哈希，而不只是 query 文本？",
+          "a": "因为同一个 query 在不同用户权限下，向量库会返回不同的文档（pre-filter 按 ACL 过滤）。如果 key 只含 query 文本，不同权限用户可能命中同一缓存条目，把 A 用户的检索结果返回给 B 用户，产生数据泄露。正确的 key 至少包含：hash(query_text + tenant_id + user_acl_hash + index_version)。"
+        }
+      },
+      {
+        "title": "易错点汇总",
+        "body": "- **训练-推理特征不一致是 silent failure**：没有报错，只有模型悄悄变差；发现时往往已经过了几周迭代周期。\n- **增量更新不能替代全量重建**：embedding 模型或 chunk 规则变化后继续增量写入，会得到新旧向量混合的不可解释索引。\n- **ANN 参数调大不解决问题**：如果召回率低，先检查 chunk size 和 embedding 模型匹配度，再调 `ef`/`nprobe`；盲目调大参数只会提升延迟，未必能找回正确答案（如果根本没被索引到）。\n- **缓存命中率高不等于正确**：缓存越积极，过期/越权数据被服务的概率越高；要把 TTL 和 key 设计与文档更新频率对齐。\n- **向量索引不是 OLTP 数据库**：不要试图用向量库存业务状态；原始文档存 S3/数据库，向量库是可重建的索引层。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪项描述了\"向量索引必须全量重建\"的正确触发条件？",
+        "options": [
+          "新增了 5% 的文档",
+          "更换了 embedding 模型版本",
+          "调整了 HNSW 的 ef 参数",
+          "向量库节点内存使用率超过 80%"
+        ],
+        "answer": 1,
+        "explain": "embedding 模型版本变更意味着向量空间整体改变，新旧向量不可比较，必须全量重建索引。新增 5% 文档可增量写入；调整 ef 是运行时参数，不影响索引结构；内存压力不触发重建。"
+      },
+      {
+        "type": "judge",
+        "prompt": "向量索引本质上是\"embedding 的持久化文件\"，不需要单独进行版本管理。",
+        "answer": false,
+        "explain": "向量索引是由 embedding 模型版本、tokenizer 版本、chunk 规则、距离度量和索引参数共同定义的服务状态，任何一个维度变化都会使旧索引不可与新向量混用。必须把向量索引当作有版本、有生命周期的平台对象进行版本管理。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在 RAG 系统中，为什么不能仅凭 ANN 搜索做全量精确比较，而需要使用近似最近邻（ANN）算法？",
+        "options": [
+          "向量数据库不支持精确搜索",
+          "在高维空间中精确搜索的时间复杂度为 O(N×d)，在亿级向量规模下单次查询延迟不可接受",
+          "ANN 算法的召回率比精确搜索更高",
+          "精确搜索需要 GPU，而 ANN 只需 CPU"
+        ],
+        "answer": 1,
+        "explain": "精确 Top-K 搜索的时间复杂度是 O(N×d)。在 768 维、1 亿向量的库上，单次查询约需 768 亿次浮点运算，在 100 GFLOPS CPU 上需要约 768ms，远超 RAG 的 P99 延迟目标（通常 10-100ms）。ANN 通过可控的召回损失换取可接受的延迟。"
+      },
+      {
+        "type": "match",
+        "prompt": "将缓存类型与其最关键的 key 维度匹配：",
+        "left": ["Embedding cache", "Retrieval / Semantic cache", "KV Prefix cache"],
+        "right": ["必须包含 tenant_id + user_acl_hash + index_version", "必须包含 model_id + tokenizer_version + preprocess_version", "必须包含 prefix token hash + model_id + policy_version，且不跨租户共享"],
+        "explain": "Embedding cache 的命中只依赖输入文本和模型版本；Retrieval/Semantic cache 还需要包含权限维度，否则会跨租户泄露；KV Prefix cache 是 LLM serving 层状态，权限风险最高，必须严格隔离。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Prefix cache 如果包含 RAG 检索结果，仍然是纯静态前缀，可以跨用户安全共享。",
+        "answer": false,
+        "explain": "RAG 检索结果依赖用户权限和索引版本，是动态内容。包含检索结果的 prefix 不再是纯静态前缀，如果跨用户共享，会把 A 用户看到的文档内容暴露给 B 用户。正确做法是只缓存严格静态的公共前缀（如固定 system prompt），检索结果放入变化部分。"
+      },
+      {
+        "type": "input",
+        "prompt": "训练时使用样本事件时刻之后才存在的特征值，导致训练指标虚高、上线后性能大幅下降，这种问题叫做什么？（填英文术语）",
+        "accept": ["temporal leakage", "feature leakage", "data leakage"],
+        "explain": "temporal leakage（时序泄露）是指训练样本使用了样本事件时间点之后才有的特征值，相当于让模型\"看到了未来\"。这会使训练 AUC 虚高，但上线后性能大幅下降，且没有显式报错，是最常见的 silent failure 之一。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于四类约束的描述，哪项是正确的？",
+        "options": [
+          "外部状态变化频率与模型权重更新频率相同，可以统一管理",
+          "LLM 的上下文窗口可以无限扩大，所以 ANN 检索的必要性在下降",
+          "相似性搜索中，距离度量与 embedding 模型的训练目标必须对齐，否则召回质量会系统性下降",
+          "缓存命中率越高越好，说明系统效率越高"
+        ],
+        "answer": 2,
+        "explain": "距离度量是 embedding 模型训练目标在检索阶段的投影，必须对齐。例如：用对比学习训练的文本 embedding 应使用 cosine 或归一化内积；双塔推荐模型应使用 inner product。距离度量与模型不匹配会导致召回质量系统性下降，且很难从指标上直接发现。"
+      },
+      {
+        "type": "judge",
+        "prompt": "当 embedding 模型升级后，可以只对新增文档做增量 embedding，旧文档保留旧向量，不需要全量重建索引。",
+        "answer": false,
+        "explain": "不同 embedding 模型版本产生的向量处于不同的向量空间，无法放在同一个索引里做有意义的距离比较。混合新旧向量的索引是不可解释的——查询向量和文档向量来自不同空间，召回质量会急剧下降。模型升级必须全量重建索引。"
+      }
+    ]
+  }
+]

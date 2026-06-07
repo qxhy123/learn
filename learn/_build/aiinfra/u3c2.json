@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u3c2",
+    "title": "GPU 执行模型与 Tensor Core",
+    "subtitle": "SIMT、warp、occupancy 与低精度算力口径",
+    "intro": [
+      {
+        "title": "GPU 为什么适合 AI：控制开销被摊薄",
+        "body": "GPU 适合 AI 不是因为\"核心多\"，而是因为 AI 主干满足三个条件：**数据并行度巨大、算子形状规则、计算可以批处理转成矩阵乘法**。\n\nGPU 的取舍：少做复杂控制，多做同构计算。用海量线程共享一套指令，把取指、译码、调度开销摊薄到所有线程上。\n\n| 负载形态 | GPU 表现 | 原因 |\n|----------|----------|------|\n| 大 batch GEMM | 很强 | 高 arithmetic intensity，Tensor Core 可持续工作 |\n| 长序列 prefill | 通常强 | attention 和 MLP 有大量矩阵计算 |\n| batch=1 decode | 可能很低 | 每步计算小，权重读取和 launch 开销更突出 |\n| 大量小 tensor elementwise | 常见低效 | kernel 碎、launch 多、中间读写多 |",
+        "tip": "看到 GPU utilization 低，不能直接得出\"卡不够好\"。要问：SM 上是否有 warp？Tensor Core 是否被调用？是不是 decode 阶段的正常现象？"
+      },
+      {
+        "title": "SIMT：线程模型下的\"同指令多线程\"",
+        "body": "SIMT（Single Instruction, Multiple Threads）是 GPU 的核心执行模型：程序员写的是**标量线程**，硬件把线程按 **warp** 分组（通常 32 个线程一组），在大多数时候让一个 warp 内的线程一起执行同一条指令。\n\n这与 CPU SIMD 的关键差异：\n\n| 对比项 | CPU SIMD | GPU SIMT |\n|--------|----------|----------|\n| 程序员视角 | 向量寄存器和 lane | 标量线程 |\n| 分支处理 | mask/blend/scalar fallback | warp divergence + predicate |\n| 失败模式 | 编译器不向量化、对齐问题 | 分支发散、访存不合并、占用不足 |\n\n**warp divergence**：同一 warp 内线程走不同分支，硬件必须串行执行两条路径，未参与当前路径的线程被 mask 掉，有效吞吐下降。LLM 中 variable-length sequence mask、top-k 采样、MoE dispatch 都容易产生 divergence。",
+        "tip": "SIMT 希望 warp 内线程：同分支、同节奏、同方向访问数据。任何一个条件不满足，执行效率就会下降。"
+      },
+      {
+        "title": "SM：GPU 的基本执行岛",
+        "body": "SM（Streaming Multiprocessor）是 GPU 上的基本执行单元，重复排列。平台工程师先抓住这些资源：\n\n| SM 内资源 | 作用 | 常见瓶颈信号 |\n|-----------|------|---------------|\n| Warp scheduler | 选择 ready warp 发射指令 | eligible warps 少、stall 高 |\n| Register file | 保存每个线程的临时变量 | registers per thread 高，occupancy 被压低 |\n| CUDA cores | 通用 FP32/INT/地址计算 | 非矩阵小算子 |\n| Tensor Cores | 矩阵乘加专用路径 | GEMM/attention/MLP 未命中时吞吐大幅下降 |\n| Shared memory / L1 | block 内数据复用 | shared memory 用量限制 block 驻留 |\n\nGPU 隐藏延迟的方式：不是靠单线程乱序执行，而是让多个 warp 同时驻留 SM，某个 warp 等数据时切到另一个 ready warp。",
+        "tip": "一个 block 完整驻留在一个 SM 上；block size、shared memory 用量、register 用量共同决定每个 SM 能同时驻留几个 block。"
+      },
+      {
+        "title": "Occupancy：诊断指标，不是优化目标",
+        "body": "occupancy = 活跃 warp 数 / SM 最大 warp 数\n\n它回答的是\"SM 上驻留了多少 warp\"，不是\"这些 warp 做了多少有效工作\"。\n\n**三个典型误判**：\n\n| Profile 现象 | 不应直接下的结论 | 更合理的判断 |\n|-------------|-----------------|---------------|\n| occupancy 35%，Tensor Core 利用率高，kernel time 短 | \"occupancy 太低\" | 已经 compute-bound，先别动 |\n| occupancy 90%，SM busy 高，但 kernel time 长 | \"GPU 已跑满\" | 可能所有 warp 都在等内存 |\n| occupancy 20%，local memory load/store 明显 | \"加大 block size\" | 先怀疑 register spill |\n\n**限制 occupancy 的四类资源**：registers per thread 过高、shared memory per block 过大、block size 不合适、SM 最大 block 数限制。",
+        "tip": "遇到 occupancy 低，先查 register、shared memory、block size 和 spill，再决定是否改 kernel。高 occupancy 但慢，先查 warp stall 原因和 Tensor Core 利用率。"
+      },
+      {
+        "title": "Tensor Core：把矩阵乘加做成专用数据通路",
+        "body": "Tensor Core 的核心动机：AI 主干里最值钱的计算是小块矩阵乘加（形如 `D = A × B + C`），形态固定，可以用专用硬件做得比通用 CUDA core 更密集。\n\n**CUDA core vs Tensor Core**：\n\n| 执行路径 | 更适合 | 不适合 |\n|----------|--------|--------|\n| CUDA core | 标量/向量 FP32、地址计算、控制逻辑、小型 elementwise | 大规模低精度 GEMM 峰值吞吐 |\n| Tensor Core | FP16/BF16/TF32/FP8/INT8 等矩阵乘加 | 不规则分支、非矩阵化操作 |\n\n**影响 Tensor Core 命中的因素**：M/N/K 太小（tile 不够多）、维度不对齐（需要尾部处理）、layout 不匹配（额外 transpose）、自定义算子没走成熟库路径。\n\n**Hopper 的 WGMMA 和 TMA**：H100 上让 Tensor Core 真正兑现的关键机制——`wgmma.mma_async` 以 warp group（128 线程）为单位异步发射大 tile；`TMA` 由硬件接管全局↔共享内存的大块搬运，warp 专心做计算。FlashAttention-3 的主要加速就来自这两个机制。",
+        "tip": "同样的数学公式，vLLM、TensorRT-LLM、PyTorch eager 可能差几倍，差距来自 tile、layout、Tensor Core 指令，不是 FLOPs 不同。优先升级成熟库（cuBLASLt、FlashAttention、Triton），再考虑自研 kernel。"
+      },
+      {
+        "title": "低精度口径：训练、推理和 datasheet 不是一件事",
+        "body": "低精度至少有三层口径：①权重和输入用什么精度存储；②乘法用什么精度执行；③累加和输出用什么精度保存。\n\n| 格式 | 工程直觉 | 训练 | 推理 | 主要风险 |\n|------|----------|------|------|----------|\n| FP32 | 精度高、成本高 | 特殊算子/验证 | 少 | 吞吐低 |\n| BF16 | FP32 级动态范围 | **现代训练主力** | 常见 | 尾数粗 |\n| FP16 | 精度细、动态范围窄 | 需要 loss scaling | 常见 | overflow |\n| FP8 | E4M3/E5M2 两种格式 | Hopper+ 原生支持 | 增长快 | scale 管理、质量回归 |\n| INT8 | 整数量化、生态成熟 | 少 | 很常见（W8A8） | 校准、outlier |\n| INT4/FP4 | 4-bit，权重量化为主 | 少 | W4A16 非常常见 | kernel 路径、精度 |\n\nBF16 优于 FP16 用于训练：动态范围接近 FP32，梯度和激活的动态范围比尾数精细度更常成为稳定性问题。",
+        "tip": "读 datasheet 时必须统一：dense 还是 sparse？per-GPU 还是系统级？输入精度还是累加精度？Tensor Core 还是 CUDA core？不能统一时，不要用它做采购或容量承诺。"
+      },
+      {
+        "title": "执行排障：从 nsys 到 ncu 的证据链",
+        "body": "执行问题不要从 `nvidia-smi` utilization 下结论。最小 EvidenceBundle：\n\n| 层级 | 工具 | 关键证据 |\n|------|------|----------|\n| 端到端 | `nsys profile` | kernel 间隙、CPU launch、同步、memcpy 排列 |\n| Framework 映射 | `torch.profiler` + NVTX | PyTorch op → CUDA kernel 对应关系、shape、dtype |\n| 单 kernel | `ncu --set full` | tensor pipe、warp stall、occupancy、register、local memory |\n| 健康旁证 | DCGM / `dcgmi dmon` | clock throttle、power cap、Xid、ECC、温度 |\n\n**最小排障流程**：\n1. `nsys` 看 step/request 时间线\n2. 找最耗时的 3-5 个 GPU kernel\n3. `ncu` 下钻这些 kernel\n4. 判断：Tensor Core 未命中、occupancy 受限、warp 发散、spill，还是访存等待\n5. 优先换成熟库/调 layout/打开编译和 graph\n6. 涉及低精度，补质量回归后再看性能收益",
+        "reveal": {
+          "q": "某 kernel occupancy 85%，但 ncu 显示 Tensor Core utilization 很低、warp stall memory dependency 很高，如何解释？",
+          "a": "occupancy 高只说明 SM 上驻留了很多 warp，不说明它们在做有效计算。warp stall memory dependency 表明大量 warp 都在等内存数据返回，Tensor Core 空闲。这是 memory-bound 的典型表现——应优先减少内存读写、kernel fusion，而不是继续调 occupancy。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "GPU 适合 AI 计算的核心原因是？",
+        "options": [
+          "GPU 的单核频率比 CPU 高很多",
+          "GPU 控制开销被摊薄，且矩阵乘加被专用化",
+          "GPU 的缓存层级更多",
+          "GPU 支持更多并发线程调度"
+        ],
+        "answer": 1,
+        "explain": "GPU 适合 AI 因为：控制开销通过 SIMT 摊薄到海量线程，矩阵乘加通过 Tensor Core 专用化。不是因为单核频率高或缓存多。"
+      },
+      {
+        "type": "judge",
+        "prompt": "warp divergence 指 warp 内线程因走不同分支，导致两条路径都要串行执行，有效吞吐下降。",
+        "answer": true,
+        "explain": "warp divergence 时硬件会先执行满足条件的线程路径（mask 掉不满足的），再执行另一条路径（mask 掉已执行的），两条路径都占用时间，吞吐下降。"
+      },
+      {
+        "type": "choice",
+        "prompt": "occupancy 的定义是？",
+        "options": [
+          "GPU 上已分配显存占总 HBM 的比例",
+          "SM 上活跃 warp 数占该 SM 最大 warp 数的比例",
+          "Tensor Core 当前利用率",
+          "SM busy 时间占总时间的比例"
+        ],
+        "answer": 1,
+        "explain": "occupancy = active warps per SM / maximum warps per SM。它描述 SM 上的 warp 驻留密度，不是算力或显存利用率。"
+      },
+      {
+        "type": "match",
+        "prompt": "把 SM 内资源与其主要职责匹配：",
+        "left": [
+          "Warp scheduler",
+          "Register file",
+          "Tensor Core",
+          "Shared memory / L1"
+        ],
+        "right": [
+          "block 内线程数据复用和近端缓存",
+          "矩阵乘加专用路径（FP16/BF16/FP8 等）",
+          "选择 ready warp 发射指令",
+          "保存每个线程的临时变量"
+        ],
+        "explain": "Warp scheduler→调度；Register file→临时变量；Tensor Core→矩阵乘加；Shared memory→数据复用。"
+      },
+      {
+        "type": "judge",
+        "prompt": "occupancy 越高，GPU 性能一定越好。",
+        "answer": false,
+        "explain": "occupancy 是诊断指标，不是性能目标。高 occupancy 但 warp 都在等内存时仍然很慢；低 occupancy 但 Tensor Core 持续工作时可能已经 compute-bound。"
+      },
+      {
+        "type": "choice",
+        "prompt": "现代大模型训练偏爱 BF16 而不是 FP16 的主要原因是？",
+        "options": [
+          "BF16 有更多尾数位，精度更高",
+          "BF16 的动态范围接近 FP32，训练中梯度动态范围比尾数精细度更容易出问题",
+          "BF16 的硬件支持更早，兼容性更好",
+          "BF16 可以不做 loss scaling"
+        ],
+        "answer": 1,
+        "explain": "BF16 指数位和 FP32 相同（8位），动态范围宽；FP16 指数位只有 5 位，容易 overflow/underflow。训练中梯度稳定性更依赖动态范围，所以 BF16 更适合。"
+      },
+      {
+        "type": "input",
+        "prompt": "Hopper（H100）上让 Tensor Core 真正兑现算力的两个新机制分别叫什么？（回答英文缩写，用逗号分隔）",
+        "accept": ["WGMMA, TMA", "TMA, WGMMA", "wgmma, tma"],
+        "explain": "WGMMA（Warp Group MMA）以 warp group 为单位异步发射大 tile 矩阵乘加；TMA（Tensor Memory Accelerator）由硬件接管全局↔共享内存大块搬运，让 warp group 专心做计算。FlashAttention-3 的加速主要来自这两个机制。"
+      },
+      {
+        "type": "choice",
+        "prompt": "排查 GPU kernel 性能问题的推荐顺序是？",
+        "options": [
+          "先用 ncu 下钻每个 kernel，再看端到端 step time",
+          "先看 nvidia-smi utilization，再决定是否换 GPU",
+          "先用 nsys 看端到端时间线，找最慢的 kernel，再用 ncu 下钻",
+          "先调 occupancy，再看 Tensor Core 利用率"
+        ],
+        "answer": 2,
+        "explain": "正确排障顺序：先用 nsys 确认哪个 kernel 真的慢（排除 launch、同步、IO 问题），再用 ncu 对慢 kernel 下钻分析 Tensor Core、warp stall、spill 等细节。"
+      }
+    ]
+  }
+]

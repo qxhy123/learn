@@ -1,0 +1,129 @@
+[
+  {
+    "id": "u8c1",
+    "title": "可观测性与容量规划",
+    "subtitle": "三类信号 · SLI/SLO · 错误预算 · LLM 专属指标 · GPU 容量估算",
+    "intro": [
+      {
+        "title": "为什么可观测性不只是监控面板",
+        "body": "AI 系统的状态**不能被单个指标直接观察**：\n\n- 训练会被一个慢 worker 拖住整组 GPU\n- 推理会被少量超长 prompt 撑满 KV Cache\n- RAG 会因检索抖动让 LLM「看起来变慢」\n- 灰度可能因质量退化但延迟正常而误判成功\n\n真正的可观测性要能回答三类问题：\n1. **发生了什么**：哪个指标、哪个租户、哪个模型异常\n2. **为什么发生**：流量变化、资源饱和、调度问题还是版本变更\n3. **接下来怎么办**：扩容、回滚、限流、降级还是继续观察\n\n「看得见但解释不了的系统」和「看不见的系统」一样危险。",
+        "tip": "可观测性不是「把指标都采上来」，而是让系统证据足够支持诊断和决策。"
+      },
+      {
+        "title": "三类主要信号：Metrics / Logs / Traces",
+        "body": "三类信号回答不同问题，必须靠公共字段关联才能发挥价值：\n\n| 信号 | 回答什么 | 典型内容 |\n|---|---|---|\n| `metrics` | 趋势是否异常、是否触发告警 | GPU 利用率、P95 延迟、tokens/s、错误率 |\n| `logs` | 这次请求发生了什么 | 请求详情、模型版本、失败原因 |\n| `traces` | 时间花在链路哪一段 | 网关→embedding→检索→LLM→安全过滤 |\n\n三类信号的关联字段：`request_id`、`trace_id`、`tenant_id`、`model_version`、`job_id`。\n\n**没有这些关联字段**：只有 GPU utilization，看不出 queue wait；只有错误日志，看不出 SLO burn；只有 trace，看不出容量趋势。",
+        "tip": "AI 链路尾延迟问题经常被粗暴归到「模型太慢」，而真正慢的可能是检索或上游回源——trace 是区分的关键。"
+      },
+      {
+        "title": "Cardinality 治理：维度不是越细越好",
+        "body": "`metrics` 的时间序列数量约等于各标签维度取值数量的**乘积**。典型陷阱：\n\n| 指标设计 | 序列数量 | 风险 |\n|---|---|---|\n| `llm_latency{tenant, model, endpoint}` | 200×20×30 = 120,000 | 需评估 |\n| 再加 `status_code, region` | ×6×5 = 3,600,000 | 存储压力明显 |\n| 再加 `user_id` | ×1,000,000 | 请求级爆炸 |\n| 再加 `trace_id` | 每请求唯一 | `metrics` 退化成昂贵日志 |\n\n**分层治理原则**：\n- 低基数字段（如 `tenant_tier`、`model_family`、`region`）→ `metrics` label\n- 中高基数字段（如 `tenant_id`、`model_version`、`adapter_id`）→ logs/traces attribute\n- 请求唯一字段（`request_id`、`trace_id`）→ 仅用于关联，不进 metrics",
+        "reveal": {
+          "q": "为什么不能把 `user_id` 放进 `metrics` label？",
+          "a": "每个 user_id 唯一值都会创建一条新 time series，百万用户 = 百万序列。Prometheus TSDB 每条 series 占 1-2KB 内存，100 万 series ≈ 1-2GB，查询也会慢 10 倍以上。`user_id` 应放在 span attribute 里，通过 trace 下钻查询，而不是进入 metrics。"
+        }
+      },
+      {
+        "title": "采样策略：head-based vs tail-based",
+        "body": "全量 trace 最有解释力，但成本不可控。常见策略取舍：\n\n| 策略 | 决策时机 | 适合场景 | 代价/风险 |\n|---|---|---|---|\n| Head-based | 请求入口处决定 | 高吞吐稳定路径、成本敏感 | 成本可预测，但**可能漏掉慢请求和偶发错误** |\n| Tail-based | 链路结束后决定 | 错误请求、P99 慢请求、灰度窗口 | 诊断价值高，但 Collector 需缓冲完整链路，内存/CPU 成本更高 |\n\n**生产实践**：入口默认 1-5% head-based；`5xx`、超时、P99 以上和新版本灰度流量进入 tail-based 保留；审计/安全/计费日志不采样但做字段裁剪。\n\n**工程边界**：采样 trace 不能直接计算真实错误率或延迟分位数——真实 SLI 应来自请求计数器和 latency histogram。"
+      },
+      {
+        "title": "SLI/SLO 与错误预算：把可靠性变成可执行规则",
+        "body": "AI 服务的 SLO 必须同时覆盖**系统、质量和成本**三类指标，示例：\n\n- `availability_ratio: >= 99.9%`（successful_requests / total_requests）\n- `p95_latency_ms: <= 2500`（端到端 P95 延迟）\n- `answer_grounded_rate: >= 0.90`（grounded_answers / sampled_answers）\n- `cost_per_1k_tokens_usd: <= 0.35`（total_cost_usd / processed_tokens × 1000）\n\n**错误预算 burn-down**：30 天 99.9% SLO = 43.2 分钟不可用预算。6 小时内不可用 12 分钟 = 烧掉 27.8% 月预算。\n\n| 信号 | 含义 | 典型动作 |\n|---|---|---|\n| 30 天预算剩余 < 25% | 本月余量不足 | 冻结非必要发布 |\n| 6 小时 burn rate > 2x | 消耗过快 | 降低灰度比例 |\n| 1 小时 burn rate > 10x | 快速事故 | 回滚/限流/降级 |",
+        "tip": "只有系统 SLO 没有质量 SLO 的服务，很容易把「快速返回错误答案」误当成成功。"
+      },
+      {
+        "title": "LLM 专属指标：TTFT、TPOT 与 Goodput",
+        "body": "LLM 推理有三个普通服务没有的核心 SLI：\n\n**TTFT（Time To First Token）**：从请求进入系统到用户看到第一个 token 的端到端耗时。覆盖：网络 + queue wait + prefill 计算。\n- 交互式对话 P99 目标：< 2 秒\n- `queue_wait_time` 是 TTFT 升高的最直接先行信号\n\n**TPOT（Time Per Output Token）**：每生成一个 output token 的平均耗时（即 inter-token latency）。\n- Decode 阶段 memory-bandwidth-bound，下界由 HBM 带宽决定\n- 交互式流式输出 P99 目标：< 50ms/token（约 20 token/s）\n\n**Goodput vs Throughput**：\n- Throughput = 单位时间总 token 数（包含超时/失败请求）\n- Goodput = 仅统计满足 SLO 的请求产生的 token 数\n- `goodput / throughput < 0.85` → 至少 15% 算力在无效工作上",
+        "reveal": {
+          "q": "TTFT P99 从 800ms 升到 3s，应按什么顺序排查？",
+          "a": "先看 queue_wait_time（最常见原因是 KV Cache 满、新请求排队）；再看 prefill GPU 算力（prompt 是否变长）；再看 prefix cache 命中率（命中率下降会让 prefill 重新计算）；最后看网络往返（跨 AZ/跨国部署场景）。"
+        }
+      },
+      {
+        "title": "容量规划：GPU 数量估算与余量原则",
+        "body": "**基础估算公式**（仅用于数量级判断）：\n\n`GPU 数量 ≈ (QPS × 平均 token 数) / (单 GPU tokens/s × 目标利用率)`\n\n**示例**：平均 1200 token/请求、目标 20 QPS、单 GPU 12000 tokens/s、目标利用率 70%：\n→ GPU 数量 ≈ (20×1200)/(12000×0.7) ≈ 2.86，至少需要 3 张。\n\n**LLM 关键修正**：prefill（compute-bound）和 decode（memory-bandwidth-bound）的资源消耗特性完全不同，应分开建模。长输出（reasoning）场景单 R 公式可能**低估 70%** 以上。\n\n**必须留余量**：\n- 交互式服务稳态 GPU 利用率目标：55-75%\n- 稳态显存水位：70-85%\n- 关键发布窗口额外容量余量：20-30%\n\n不留余量时，上下文长度上升、大请求集中到来或副本故障都会让 P99 迅速失控。",
+        "tip": "容量规划最后必须落到成本归因：按 tenant、model、endpoint、region 拆分，才能知道该优化谁、限制谁。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "AI 服务 GPU 利用率持续 90%，P95 延迟却明显升高。最可能的原因是什么？",
+        "options": [
+          "GPU 算力完全耗尽，无法处理更多请求",
+          "请求队列积压，大量请求在等待 GPU 槽位，queue wait time 上升",
+          "模型权重文件损坏，计算出错",
+          "网络带宽不足导致 token 传输延迟"
+        ],
+        "answer": 1,
+        "explain": "GPU 利用率高（有 kernel 在执行）≠ 用户体验好。当 KV Cache 满或队列积压时，新请求等待 GPU 槽位，queue wait time 上升，TTFT 和整体延迟随之恶化——此时 GPU 显示「忙」，但用户已经在排队。应先看 queue_wait_time 和 KV Cache utilization。"
+      },
+      {
+        "type": "judge",
+        "prompt": "head-based sampling 能可靠捕捉到所有 P99 慢请求和偶发错误。",
+        "answer": false,
+        "explain": "head-based sampling 在请求入口处按比例（如 1%）随机决定是否采样，不考虑请求的最终结果。P99 慢请求和偶发 5xx 可能恰好落在未被采样的 99% 中，导致漏掉。tail-based sampling 在链路结束后根据实际 latency 和 status 决定是否保留，能覆盖错误和尾延迟请求，但需要 Collector 缓冲完整链路。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪个字段适合放进 `metrics` label？",
+        "options": [
+          "`user_id`（百万级用户）",
+          "`trace_id`（每请求唯一）",
+          "`tenant_tier`（premium / standard / free，3 种取值）",
+          "`request_id`（每请求唯一）"
+        ],
+        "answer": 2,
+        "explain": "`tenant_tier` 只有少数固定取值（低基数），适合作为 metrics label，用于告警和容量面板切片。`user_id`、`trace_id`、`request_id` 取值接近无限，放入 metrics label 会导致 cardinality 爆炸，让时间序列数量按请求级别增长，应放入 logs/traces attribute。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 LLM 推理指标与其物理含义配对：",
+        "left": ["TTFT", "TPOT", "Goodput", "KV Cache utilization"],
+        "right": [
+          "满足 SLO 的请求产生的 token 数，排除超时/失败",
+          "从请求进入系统到用户看到第一个 token 的端到端耗时",
+          "每生成一个 output token 的平均耗时（inter-token latency）",
+          "已用 KV block / 总 KV block，持续 > 90% 需扩容或限流"
+        ],
+        "explain": "TTFT 覆盖 queue wait + prefill；TPOT 反映 decode 阶段的内存带宽消耗；Goodput 是真正产生业务价值的吞吐；KV Cache utilization 是 TTFT 升高的先行信号。"
+      },
+      {
+        "type": "input",
+        "prompt": "30 天 availability SLO 为 99.9%，对应月错误预算约多少分钟？（填整数，允许±1）",
+        "accept": ["43", "44", "43.2"],
+        "explain": "30天 × 24小时 × 60分钟 = 43200 分钟。允许 0.1% 不可用 = 43200 × 0.001 ≈ 43.2 分钟。这是整个月的不可用时间预算，一次事故超过 43 分钟就耗尽整月预算。"
+      },
+      {
+        "type": "judge",
+        "prompt": "只要 P95 延迟和可用性指标正常，AI 服务就可以认为健康。",
+        "answer": false,
+        "explain": "AI 服务还必须监控质量指标（如 grounded rate、幻觉率）和成本指标（cost_per_1k_tokens）。服务可能 P95 达标、可用性 99.9%，但 grounded rate 从 0.92 降到 0.84，或 cost_per_1k_tokens 翻倍——这些都是业务失败。单纯的系统 SLO 无法发现模型行为退化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "容量规划时，长输出（reasoning）场景使用「单 R 公式」（平均 tokens/s）会导致什么问题？",
+        "options": [
+          "高估 GPU 需求，导致浪费",
+          "严重低估 GPU 需求，因为 decode 阶段 memory-bandwidth-bound 耗时远大于 prefill",
+          "结果准确，适用于所有场景",
+          "只影响成本计算，不影响容量"
+        ],
+        "answer": 1,
+        "explain": "prefill 是 compute-bound，可以高效批化处理长 prompt；decode 是 memory-bandwidth-bound，每个 token 都需要把全部模型权重扫一遍。对于 output 很长（如 reasoning 场景 8000 output tokens）的场景，decode 是真实瓶颈，单 R 公式无法体现这一差异，可能低估 GPU 需求 70% 以上。"
+      },
+      {
+        "type": "choice",
+        "prompt": "成本归因时，哪个维度最适合回答「哪个业务链路最贵」这个问题？",
+        "options": [
+          "`tenant_id`",
+          "`model_version`",
+          "`endpoint` / `workflow`（如 /chat、/summarize、/agent）",
+          "`region`"
+        ],
+        "answer": 2,
+        "explain": "`endpoint` / `workflow` 对应具体业务链路（RAG、agent、chat 分开看），最适合回答「哪条链路最贵」。`tenant_id` 回答「哪个团队烧钱最多」；`model_version` 回答「哪个版本成本异常」；`region` 回答「地域分布和碎片影响」。"
+      }
+    ]
+  }
+]

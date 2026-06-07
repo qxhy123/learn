@@ -1,0 +1,123 @@
+[
+  {
+    "id": "u5c6",
+    "title": "数据版本、血缘与谱系",
+    "subtitle": "不可变视图、CAS、Iceberg 快照与 GDPR 删除传播",
+    "intro": [
+      {
+        "title": "核心矛盾：数据可变 vs 训练需要精确复现",
+        "body": "**模型生产事故无法复现的根本原因，往往不是代码 bug，而是数据版本没有被固定。**\n\n一个真实事故剧本：线上模型质量退化 3%，工程师排查两周后确认——模型代码未变（git hash 证明），训练超参未变（mlflow 证明），但训练数据的 S3 路径对应的内容，在训练 run 结束后被静默覆盖，导致无法复现原始训练数据视图。\n\n数据版本管理要解决的不可化简问题：**在数据持续变化、训练需要精确复现、血缘必须可查询、合规必须可传播的四重约束下，如何设计一个让每次训练 run 都能精确指向一个不可变数据视图的系统。**\n\n三大根因：数据可变性（对象存储默认允许覆盖写）、版本意识缺失（习惯「原地更新」而非「发布新版本」）、版本粒度错误（日期路径不保证内容不变）。"
+      },
+      {
+        "title": "Content-Addressable Storage（CAS）：内容的 hash 就是地址",
+        "body": "**核心思想**：用文件内容的 SHA-256 哈希作为存储 key 和版本标识符。\n\n这个设计自动保证三个性质：\n- **不可变性**：同一 hash 永远指向同一内容，无法被覆盖\n- **去重**：相同内容只存一次（hash 相同 → 跳过写入）\n- **可验证性**：读出后重算 hash，与 key 比对，可检测静默损坏\n\n**Merkle Tree 扩展到数据集**：每个文件有 hash，目录的 hash = 所有子文件 hash 的哈希，整棵树的根 hash 代表整个数据集的精确版本。任何一个叶子节点（文件）变化，都会向上传播到根 hash。\n\n**工程价值**：版本迭代时只需存储 delta（新增/修改的文件），不需要完整复制。相同内容在多个版本间共享同一存储块。DVC、git-lfs 都是 Merkle Tree 的具体实现。"
+      },
+      {
+        "title": "三种数据版本化模式",
+        "body": "| 模式 | 代表工具 | 版本粒度 | 适用规模 | 适用场景 |\n|------|----------|----------|----------|----------|\n| **File-level** | DVC, git-lfs | 单文件或目录 | < 100GB | ML 实验文件、模型权重、中小数据集 |\n| **Commit-level** | lakeFS, Nessie | 整个数据湖的 commit | 100GB - PB | 多团队协作数据湖、数据分支开发 |\n| **Table-format** | Iceberg, Delta Lake, Hudi | 单张表的 snapshot | 100GB - PB | 生产 lakehouse、特征存储 |\n\n**DVC 工作原理**：把数据存在对象存储，代码仓库保存 `.dvc` 指针文件（记录内容 hash 和大小），通过 git commit 固定 `.dvc` 文件版本，实现代码和数据的双版本绑定。\n\n**Iceberg 三层元数据结构**：Catalog（表的当前指针）→ metadata JSON（snapshot 历史）→ manifest list（Avro）→ manifest（Avro，文件列表）→ Parquet 数据文件。任何一个 snapshot 都对应确定的、不可变的数据文件集合。",
+        "tip": "lakeFS 把「数据评审（data review）」变成可操作的工程流程：新清洗规则在分支上测试，验证通过后才合并主干，训练任务只消费主干上的稳定版本。"
+      },
+      {
+        "title": "Iceberg Time Travel：重现历史数据视图",
+        "body": "Time Travel 是 AI Infra 的必需功能，而不是锦上添花。用 6 个月前的数据重新训练、验证历史数据问题——没有 time travel 时，既无精确备份又无法撤销历史修改。\n\nIceberg 支持两种方式：\n- 按 snapshot id：`SELECT * FROM table FOR SYSTEM_VERSION AS OF 5432109876`\n- 按时间戳：`SELECT * FROM table FOR SYSTEM_TIME AS OF '2025-09-01 00:00:00'`\n\nDelta Lake 对应：`.option(\"versionAsOf\", 42)` 或 `.option(\"timestampAsOf\", \"2025-09-01\")`\n\n**三表格式对比（AI 训练场景）**：\n| 维度 | Iceberg | Delta Lake | Hudi |\n|------|---------|------------|------|\n| 元数据格式 | JSON + Avro manifest | JSON transaction log | Parquet + Avro timeline |\n| 批量查询性能 | 最强（manifest 裁剪） | 强（Z-Order） | 中 |\n| 流式写入 | 支持 | 支持 | 原生最强 |\n| AI 训练推荐 | **优先**（快照语义最清晰） | 次选（Databricks 生态） | 流式特征更新 |"
+      },
+      {
+        "title": "血缘追踪：从数据到模型的完整 DAG",
+        "body": "血缘（lineage）不是锦上添花，而是归因的最低配置。当线上质量退化时，没有血缘追踪，「数据版本被静默更新、清洗规则边界条件错误触发、训练集混入了错误时间段的数据」这些原因在事故发生后都无法区分，平均修复时间（MTTR）以天计。\n\n**血缘 DAG 最小必要结构**：\n```\n原始数据源 → 清洗后数据集 → 训练切分 → 训练 Run → Checkpoint → 评测结果 → 线上模型\n```\n每条边上记录 provenance metadata（处理规则版本、git hash、配置参数），是归因的关键。\n\n**OpenLineage**（CNCF 项目）：定义统一的血缘事件格式（`START/COMPLETE` 事件，包含 inputs/outputs 数据集引用）。兼容 Airflow、dbt、Spark、Flink。Marquez、OpenMetadata、DataHub 是收集和查询血缘的平台。"
+      },
+      {
+        "title": "训练任务的强绑定要求",
+        "body": "从 AI Infra 工程视角，以下绑定必须是**强绑定（hard binding）**，而不是软记录：\n\n`dataset_version → training_run → checkpoint → eval_result → deployed_model`\n\n**强绑定的含义**：\n1. 训练 Run 启动时，dataset_version 被固定并写入 run 的不可变元数据，此后不能修改\n2. checkpoint 必须记录生成它的 training_run，不存在「来源不明的 checkpoint」\n3. eval_result 必须记录 checkpoint 版本和 eval_dataset 版本\n4. deployed_model 必须指向具体的 checkpoint，不允许用 `latest` 指针\n\n**最小工程底线**：如果只能做一件事，在训练启动时计算训练数据目录的 SHA-256，写入 mlflow/wandb 的 run 元数据。这一步骤能让「数据是否发生过变化」变成可回答的问题。",
+        "tip": "Schema 演进最危险的操作是重命名列（如 click_label → purchase_label）——不会引发解析错误，但导致模型学习错误的标签语义，只在线上出现质量下降后才被发现。"
+      },
+      {
+        "title": "GDPR 删除传播与四大反模式",
+        "body": "**GDPR 删除请求的传播链路**：\n1. 发现：查询血缘图，找出 user_id=X 出现在哪些 dataset 版本\n2. 数据删除：Iceberg Row-level delete 或重新物化新 snapshot\n3. 模型评估：法务决定是否需要重训（依赖「删除 X 条样本影响哪些模型」的血缘查询）\n4. 审计日志：记录删除操作、时间、操作者、影响范围（append-only，不可篡改）\n5. 确认通知：向监管方提供删除确认证明\n\n**三大反模式**：\n- **「latest」指针**：`load_dataset(\"s3://bucket/train/latest/\")` — 路径内容随时可变\n- **mtime 推断版本**：文件修改时间在 rsync、时区变更后不可靠\n- **日期路径当版本**：`data/train_2026-03/` — 整月内文件都可被修改\n\n**正确做法**：用内容 hash 或 snapshot id 作为版本标识符，任何时刻都可以根据版本号精确重现数据内容。",
+        "reveal": {
+          "q": "一个训练 run 元数据中的 dataset 字段填写的是 `s3://ml-data/train/latest/`，这意味着什么风险？",
+          "a": "这意味着该 run 的训练数据无法被复现——路径指向的内容在训练结束后可能被覆盖，无法确认当时看到的是哪个版本的数据。GDPR 影响评估也无法完成，因为不知道该 run 用了哪批用户数据。正确做法是填写内容 hash 或 Iceberg snapshot id。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Content-Addressable Storage（CAS）使用内容的 SHA-256 hash 作为存储 key，这个设计自动实现了哪三个性质？",
+        "options": [
+          "高压缩比、快速查询、跨云存储",
+          "不可变性、去重、可验证性",
+          "加密传输、访问控制、审计日志",
+          "版本分支、合并冲突检测、回滚"
+        ],
+        "answer": 1,
+        "explain": "CAS 的三个自动性质：不可变性（同一 hash 永远指向同一内容，无法覆盖）、去重（相同内容 hash 相同，只存一份）、可验证性（读出内容重算 hash，可检测静默损坏）。这是 DVC、git-lfs 等版本化存储系统的物理基础。"
+      },
+      {
+        "type": "judge",
+        "prompt": "用 S3 路径（如 `s3://ml-data/train/2026-03/`）作为训练数据版本标识符是可接受的工程实践。",
+        "answer": false,
+        "explain": "S3 路径下的内容随时可以被覆盖——3月1日和3月31日运行的训练看到的数据可能完全不同，但路径相同。正确的版本标识符必须唯一标识内容（而非路径）、不可变、可寻址，例如内容 hash 或 Iceberg snapshot id。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Apache Iceberg 的 Merkle 元数据结构从上到下依次是？",
+        "options": [
+          "Parquet 数据文件 → Manifest → Manifest List → Metadata JSON → Catalog",
+          "Catalog → Metadata JSON → Manifest List → Manifest → Parquet 数据文件",
+          "Catalog → Parquet 数据文件 → Manifest → Metadata JSON",
+          "Manifest → Catalog → Metadata JSON → Parquet 数据文件"
+        ],
+        "answer": 1,
+        "explain": "Iceberg 三层元数据从上到下：Catalog（表的当前指针）→ Metadata JSON（snapshot 历史）→ Manifest List（Avro，列出 manifest 集合）→ Manifest（Avro，列出数据文件）→ Parquet 数据文件（不可变）。每个 snapshot 对应确定的、不可变的数据文件集合，支持 time travel。"
+      },
+      {
+        "type": "match",
+        "prompt": "将数据版本化工具与其最适合的场景匹配：",
+        "left": ["DVC", "lakeFS", "Apache Iceberg", "Apache Hudi"],
+        "right": [
+          "生产 lakehouse，批量分析查询，快照语义最清晰，AI 训练首选",
+          "个人/小团队 ML 实验，< 100GB 数据，与 git 代码仓库绑定",
+          "多团队协作数据湖，需要数据分支开发和 PR 评审流程",
+          "流批一体，高频流式写入，特征实时更新"
+        ],
+        "explain": "DVC 适合小团队 ML 实验和代码数据双版本绑定；lakeFS 把 git 语义引入数据湖支持多团队协作；Iceberg 快照语义最清晰适合 AI 训练；Hudi 原生流式写入适合特征实时更新。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GDPR 删除请求只需要从数据湖中删除用户数据即可，不需要评估已训练的模型是否受影响。",
+        "answer": false,
+        "explain": "GDPR 删除请求需要完整的传播链路评估：发现受影响数据集版本 → 找出使用这些版本的训练 run → 找出对应的 checkpoint 和部署的模型 → 法务决定是否需要重训或机器遗忘。没有血缘追踪，这些步骤无法自动化执行，公司面临监管风险。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Schema 演进中，哪种操作在 AI 训练场景下风险最高？",
+        "options": [
+          "新增可选列（旧数据该列为 null）",
+          "删除列（新 schema 不再使用该列）",
+          "重命名列（如 click_label → purchase_label）",
+          "将 INT 列扩展为 LONG 类型"
+        ],
+        "answer": 2,
+        "explain": "重命名列是最危险的操作——不会引发解析错误（Parquet 列存储会静默处理），但导致模型学习到错误的标签语义（click → purchase 的语义已完全不同）。这种错误通常只在线上出现质量下降后才被发现，是典型的「静默炸弹」。"
+      },
+      {
+        "type": "input",
+        "prompt": "OpenLineage 定义了与工具无关的血缘事件规范，其收集和查询的参考实现平台叫什么？",
+        "accept": ["Marquez", "marquez"],
+        "explain": "Marquez 是 OpenLineage 的参考实现平台，提供血缘图存储与查询 API。兼容 OpenLineage 的工具（Airflow、dbt、Spark、Flink）发送 START/COMPLETE 事件，Marquez 存储后支持追溯查询。更重型的替代品包括 OpenMetadata、DataHub（LinkedIn）、Unity Catalog（Databricks）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "训练平台的最低版本管理规范中，以下哪一项是「强绑定（hard binding）」而不是软记录？",
+        "options": [
+          "在 README 中注明本次训练使用的数据集路径",
+          "在 Slack 消息里记录本次训练的数据版本",
+          "训练 Run 启动时，将 dataset_version（内容 hash）写入 run 的不可变元数据",
+          "训练结束后手动将数据版本信息填入 Wiki"
+        ],
+        "answer": 2,
+        "explain": "强绑定要求：训练 Run 启动时，dataset_version 必须被系统自动捕获并写入 run 的不可变元数据（如 MLflow/Weights&Biases run metadata），此后不允许修改。Slack 消息、README、Wiki 都是软记录，无法保证版本固定不被覆盖。"
+      }
+    ]
+  }
+]

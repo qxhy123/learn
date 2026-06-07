@@ -1,0 +1,937 @@
+import type { Unit } from '../../src/types'
+
+export const UNIT: Unit = {
+  id: 'u7',
+  title: '特征值与特征向量',
+  color: '#00cd9c',
+  icon: '🔬',
+  blurb: '发现矩阵的"特殊方向"——特征向量在变换下只缩放、不转向；$\\det(A-\\lambda I)=0$ 求特征值；对角化让高次幂计算瞬间完成；实对称矩阵拥有最优美的正交对角化。',
+  lessons: [
+    // =====================================================================
+    // u7-l1  特征方程与求解
+    // =====================================================================
+    {
+      id: 'u7-l1',
+      title: '特征方程与求解',
+      subtitle: '方向不变的神奇向量',
+      intro: [
+        {
+          title: '为什么要学特征值？',
+          body: '对一般向量 $\\mathbf{x}$，矩阵 $A$ 会同时改变它的**方向**和**长度**。但有一类特殊向量——**特征向量**——在 $A$ 的作用下方向完全不变，只被拉伸或压缩了 $\\lambda$ 倍。\n\n这个 $\\lambda$ 就叫**特征值**。找到这些"不被旋转"的方向，是理解矩阵本质的核心钥匙。',
+          formula: 'A\\mathbf{v} = \\lambda\\mathbf{v} \\quad (\\mathbf{v} \\neq \\mathbf{0})',
+          tip: '特征向量必须是**非零**向量。零向量对任意 $\\lambda$ 都满足 $A\\mathbf{0}=\\lambda\\mathbf{0}$，没有意义。',
+        },
+        {
+          title: '几何直觉',
+          body: '想象矩阵 $A$ 是一个"变形机器"。对大多数向量，它既拉伸又旋转。但沿特征方向的向量只会被拉伸（$|\\lambda|>1$）、压缩（$|\\lambda|<1$）或翻转（$\\lambda<0$）——方向从不偏离。\n\n对角矩阵 $A=\\begin{pmatrix}2&0\\\\0&3\\end{pmatrix}$ 是最直观的例子：$A\\mathbf{e}_1=2\\mathbf{e}_1$，$A\\mathbf{e}_2=3\\mathbf{e}_2$，两条坐标轴就是特征方向，特征值正是对角元素。',
+          reveal: {
+            q: '如果 $\\lambda=0$，特征向量 $\\mathbf{v}$ 会被映射到哪里？这说明矩阵 $A$ 有什么性质？',
+            a: '$A\\mathbf{v}=0\\cdot\\mathbf{v}=\\mathbf{0}$，$\\mathbf{v}$ 被映射到零向量。这说明 $A$ 的零空间非平凡，即 $A$ **奇异（不可逆）**，$\\det(A)=0$。',
+          },
+        },
+        {
+          title: '特征方程的推导',
+          body: '从 $A\\mathbf{v}=\\lambda\\mathbf{v}$ 出发，移项得 $(A-\\lambda I)\\mathbf{v}=\\mathbf{0}$。\n\n这是关于 $\\mathbf{v}$ 的齐次方程组。它有**非零解**，当且仅当系数矩阵 $(A-\\lambda I)$ **奇异**，即行列式为零：',
+          formula: '\\det(A - \\lambda I) = 0',
+          tip: '这个方程叫**特征方程**，展开后是关于 $\\lambda$ 的多项式，$n$ 阶矩阵得到 $n$ 次多项式，有 $n$ 个根（含复数和重数）。',
+        },
+        {
+          title: '完整计算示例——求特征值',
+          body: '以 $A=\\begin{pmatrix}4&1\\\\2&3\\end{pmatrix}$ 为例，一步步走完全过程。\n\n对二阶矩阵，$p(\\lambda)=\\lambda^2-\\operatorname{tr}(A)\\cdot\\lambda+\\det(A)$，其中 $\\operatorname{tr}(A)=4+3=7$，$\\det(A)=12-2=10$，故：',
+          formula: 'p(\\lambda)=\\lambda^2 - 7\\lambda + 10 = (\\lambda-2)(\\lambda-5)',
+          steps: [
+            '令 $p(\\lambda)=0$，解得 $\\lambda_1=2$，$\\lambda_2=5$',
+            '**快速验算**：$\\lambda_1+\\lambda_2=7=\\operatorname{tr}(A)$，$\\lambda_1\\cdot\\lambda_2=10=\\det(A)$，两个条件都对！',
+          ],
+        },
+        {
+          title: '完整计算示例——求特征向量',
+          body: '接上例，对每个特征值解 $(A-\\lambda I)\\mathbf{v}=\\mathbf{0}$，取非零解。',
+          steps: [
+            '对 $\\lambda_1=2$：$A-2I=\\begin{pmatrix}2&1\\\\2&1\\end{pmatrix}\\to\\begin{pmatrix}2&1\\\\0&0\\end{pmatrix}$，方程 $2v_1+v_2=0$，取 $\\mathbf{v}_1=\\begin{pmatrix}1\\\\-2\\end{pmatrix}$',
+            '验证：$A\\mathbf{v}_1=\\begin{pmatrix}4-2\\\\2-6\\end{pmatrix}=\\begin{pmatrix}2\\\\-4\\end{pmatrix}=2\\begin{pmatrix}1\\\\-2\\end{pmatrix}$ ✓',
+            '对 $\\lambda_2=5$：$A-5I=\\begin{pmatrix}-1&1\\\\2&-2\\end{pmatrix}\\to\\begin{pmatrix}-1&1\\\\0&0\\end{pmatrix}$，方程 $-v_1+v_2=0$，取 $\\mathbf{v}_2=\\begin{pmatrix}1\\\\1\\end{pmatrix}$',
+            '验证：$A\\mathbf{v}_2=\\begin{pmatrix}5\\\\5\\end{pmatrix}=5\\begin{pmatrix}1\\\\1\\end{pmatrix}$ ✓',
+          ],
+          tip: '不同特征值的特征向量线性无关——这是后续对角化的基础！',
+        },
+        {
+          title: '三角矩阵特例',
+          body: '上三角或下三角矩阵（包括对角矩阵）的特征值直接读取**对角元素**，无须展开行列式。\n\n因为 $A-\\lambda I$ 也是三角矩阵，其行列式就是对角线元素的乘积：\n\n$p(\\lambda)=\\det(A-\\lambda I)=(a_{11}-\\lambda)(a_{22}-\\lambda)\\cdots(a_{nn}-\\lambda)$\n\n**例**：$A=\\begin{pmatrix}1&0&0\\\\1&2&0\\\\1&1&3\\end{pmatrix}$，特征值直接读出为 $\\lambda_1=1$，$\\lambda_2=2$，$\\lambda_3=3$。',
+          tip: '看到三角矩阵，立刻读对角元，不用行列式展开。这是节省时间的关键技巧。',
+        },
+        {
+          title: '特征向量性质——线性组合封闭',
+          body: '同一个特征值 $\\lambda_0$ 的两个特征向量 $\\mathbf{v}_1$ 和 $\\mathbf{v}_2$（非零），则它们的任意非零线性组合 $c_1\\mathbf{v}_1+c_2\\mathbf{v}_2$ 也是 $\\lambda_0$ 的特征向量。\n\n验证：$A(c_1\\mathbf{v}_1+c_2\\mathbf{v}_2)=c_1 A\\mathbf{v}_1+c_2 A\\mathbf{v}_2=c_1\\lambda_0\\mathbf{v}_1+c_2\\lambda_0\\mathbf{v}_2=\\lambda_0(c_1\\mathbf{v}_1+c_2\\mathbf{v}_2)$\n\n这说明特征空间 $E_{\\lambda_0}=\\ker(A-\\lambda_0 I)$ 是一个**子空间**，对线性运算封闭。',
+          reveal: {
+            q: '若 $\\mathbf{v}$ 是 $A$ 对应特征值 $\\lambda$ 的特征向量，$A$ 可逆，则 $A^{-1}\\mathbf{v}$ 等于多少？',
+            a: '$A^{-1}\\mathbf{v}=\\frac{1}{\\lambda}\\mathbf{v}$。由 $A\\mathbf{v}=\\lambda\\mathbf{v}$，两边乘 $A^{-1}$ 得 $\\mathbf{v}=\\lambda A^{-1}\\mathbf{v}$，所以 $A^{-1}\\mathbf{v}=\\frac{1}{\\lambda}\\mathbf{v}$。',
+          },
+        },
+        {
+          title: '求解标准四步法小结',
+          body: '**求特征值与特征向量的标准 4 步**：\n\n1. **写特征多项式**：$p(\\lambda)=\\det(A-\\lambda I)$\n2. **解特征方程** $p(\\lambda)=0$：得各 $\\lambda_k$（记代数重数）\n3. **对每个 $\\lambda_k$**，解 $(A-\\lambda_k I)\\mathbf{v}=\\mathbf{0}$，取非零解\n4. **代回验证**：$A\\mathbf{v}=\\lambda\\mathbf{v}$；用迹/行列式公式抽查',
+          tip: '**最常见错误**：取特征向量时忘记选**非零**解；以及三角矩阵忘记直接读对角元。$\\det(A-\\lambda I)$ 和 $\\det(\\lambda I-A)$ 根相同，但符号差 $(-1)^n$，统一用前者更安全。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l1-q1',
+          type: 'choice',
+          prompt: '矩阵 $A=\\begin{pmatrix}3&0\\\\0&-1\\end{pmatrix}$ 的特征值是什么？',
+          options: [
+            '$\\lambda_1=3,\\ \\lambda_2=-1$',
+            '$\\lambda_1=3,\\ \\lambda_2=1$',
+            '$\\lambda_1=-3,\\ \\lambda_2=1$',
+            '$\\lambda_1=2,\\ \\lambda_2=0$',
+          ],
+          answer: 0,
+          explain: '对角矩阵的特征值就是对角元素。验算：$\\operatorname{tr}=2=3+(-1)$，$\\det=-3=3\\times(-1)$，均正确。',
+        },
+        {
+          id: 'u7-l1-q2',
+          type: 'judge',
+          prompt: '若 $\\mathbf{v}$ 是矩阵 $A$ 对应特征值 $\\lambda$ 的特征向量，则 $3\\mathbf{v}$ 也是同一特征值 $\\lambda$ 的特征向量。',
+          answer: true,
+          explain: '$A(3\\mathbf{v})=3A\\mathbf{v}=3\\lambda\\mathbf{v}=\\lambda(3\\mathbf{v})$。$3\\mathbf{v}\\neq\\mathbf{0}$（因为 $\\mathbf{v}\\neq\\mathbf{0}$），所以 $3\\mathbf{v}$ 确实是特征值 $\\lambda$ 的特征向量。同一特征值的特征向量构成子空间，对数乘封闭。',
+        },
+        {
+          id: 'u7-l1-q3',
+          type: 'input',
+          prompt: '矩阵 $A=\\begin{pmatrix}1&2\\\\3&0\\end{pmatrix}$ 的特征值之积等于多少？（填整数）',
+          accept: ['-6', '−6'],
+          placeholder: '填整数，如 -6',
+          explain: '$\\det(A)=1\\times 0-2\\times 3=-6$。由"行列式 $=$ 特征值之积"，$\\lambda_1\\lambda_2=-6$。（验证：特征多项式 $\\lambda^2-\\lambda-6=(\\lambda-3)(\\lambda+2)=0$，特征值 $3$ 与 $-2$，积 $=-6$。）',
+        },
+        {
+          id: 'u7-l1-q4',
+          type: 'choice',
+          prompt: '$A=\\begin{pmatrix}5&-4\\\\2&-1\\end{pmatrix}$，$\\operatorname{tr}(A)=4$，$\\det(A)=3$。下列哪组是 $A$ 的特征值？',
+          options: [
+            '$\\lambda=1$ 和 $\\lambda=3$',
+            '$\\lambda=2$ 和 $\\lambda=2$',
+            '$\\lambda=-1$ 和 $\\lambda=3$',
+            '$\\lambda=4$ 和 $\\lambda=0$',
+          ],
+          answer: 0,
+          explain: '特征多项式 $\\lambda^2-4\\lambda+3=(\\lambda-1)(\\lambda-3)=0$，特征值为 $1$ 和 $3$。验证：$1+3=4=\\operatorname{tr}$，$1\\times 3=3=\\det$。✓',
+        },
+        {
+          id: 'u7-l1-q5',
+          type: 'judge',
+          prompt: '上三角矩阵 $A=\\begin{pmatrix}2&5&1\\\\0&-1&3\\\\0&0&4\\end{pmatrix}$ 的特征值为 $2,-1,4$。',
+          answer: true,
+          explain: '上三角矩阵（包括下三角和对角矩阵）的特征值直接读对角元素。$A-\\lambda I$ 也是上三角矩阵，行列式 $=(2-\\lambda)(-1-\\lambda)(4-\\lambda)$，根为 $\\lambda=2,-1,4$。✓',
+        },
+        {
+          id: 'u7-l1-q6',
+          type: 'choice',
+          prompt: '已知 $A\\mathbf{v}=3\\mathbf{v}$，则 $A^4\\mathbf{v}$ 等于：',
+          options: [
+            '$81\\mathbf{v}$',
+            '$12\\mathbf{v}$',
+            '$3\\mathbf{v}$',
+            '$4\\mathbf{v}$',
+          ],
+          answer: 0,
+          explain: '$A^2\\mathbf{v}=A(A\\mathbf{v})=A(3\\mathbf{v})=3A\\mathbf{v}=9\\mathbf{v}$。依此 $A^4\\mathbf{v}=3^4\\mathbf{v}=81\\mathbf{v}$。一般规律：$A^k\\mathbf{v}=\\lambda^k\\mathbf{v}$。',
+        },
+        {
+          id: 'u7-l1-q7',
+          type: 'input',
+          prompt: '$A=\\begin{pmatrix}4&1\\\\2&3\\end{pmatrix}$，特征值为 $2$ 和 $5$。对 $\\lambda=2$ 的特征向量，$v_2/v_1$（第二分量除以第一分量）等于多少？（填整数）',
+          accept: ['-2', '−2'],
+          placeholder: '填整数',
+          explain: '解 $(A-2I)\\mathbf{v}=\\mathbf{0}$：$\\begin{pmatrix}2&1\\\\2&1\\end{pmatrix}\\mathbf{v}=\\mathbf{0}$，方程 $2v_1+v_2=0$，故 $v_2=-2v_1$，$v_2/v_1=-2$。特征向量可取 $(1,-2)^T$，验证 $A\\begin{pmatrix}1\\\\-2\\end{pmatrix}=\\begin{pmatrix}2\\\\-4\\end{pmatrix}=2\\begin{pmatrix}1\\\\-2\\end{pmatrix}$。✓',
+        },
+        {
+          id: 'u7-l1-q8',
+          type: 'match',
+          prompt: '将矩阵类型与特征值性质正确配对：',
+          left: [
+            '对角矩阵 $\\operatorname{diag}(a_1,\\ldots,a_n)$',
+            '可逆矩阵（特征值 $\\lambda\\neq 0$）',
+            '$\\lambda=0$ 是某特征值',
+            '实对称矩阵',
+          ],
+          right: [
+            '特征值全为实数',
+            '$A^{-1}$ 的对应特征值为 $1/\\lambda$',
+            '$A$ 奇异，$\\det(A)=0$',
+            '特征值就是各对角元素 $a_i$',
+          ],
+        },
+        {
+          id: 'u7-l1-q9',
+          type: 'judge',
+          prompt: '若 $n\\times n$ 矩阵 $A$ 有 $n$ 个互不相同的特征值，则对应的 $n$ 个特征向量线性无关。',
+          answer: true,
+          explain: '这是线性代数中的重要定理：对应**不同特征值**的特征向量必然线性无关。若 $c_1\\mathbf{v}_1+\\cdots+c_n\\mathbf{v}_n=\\mathbf{0}$，两边依次用 $A$ 作用并利用不等性可推出所有系数为零。这也是矩阵可对角化的充分条件。',
+        },
+      ],
+    },
+
+    // =====================================================================
+    // u7-l2  重数、迹与行列式
+    // =====================================================================
+    {
+      id: 'u7-l2',
+      title: '重数、迹与行列式',
+      subtitle: '代数重数、几何重数与快速验算',
+      intro: [
+        {
+          title: '特征多项式的系数与迹、行列式',
+          body: '对 $n$ 阶矩阵，展开特征多项式 $p(\\lambda)=\\det(A-\\lambda I)$，比较系数可以得到两个漂亮等式：\n\n$\\operatorname{tr}(A)=\\sum_{i=1}^{n}\\lambda_i$（迹等于特征值之和）\n\n$\\det(A)=\\prod_{i=1}^{n}\\lambda_i$（行列式等于特征值之积）\n\n每次算完特征值，用这两个公式抽查，能立即发现计算错误。',
+          formula: '\\operatorname{tr}(A)=\\sum_{i=1}^{n}\\lambda_i,\\quad \\det(A)=\\prod_{i=1}^{n}\\lambda_i',
+          tip: '**推导**：令 $p(\\lambda)=(-1)^n(\\lambda-\\lambda_1)\\cdots(\\lambda-\\lambda_n)$，令 $\\lambda=0$ 得 $\\det(A)=\\lambda_1\\cdots\\lambda_n$；比较 $\\lambda^{n-1}$ 系数得 $\\operatorname{tr}(A)=\\sum\\lambda_i$。',
+        },
+        {
+          title: '用迹和行列式快速求二阶特征值',
+          body: '对 $2\\times 2$ 矩阵，特征多项式精确地是：\n\n$p(\\lambda)=\\lambda^2-\\operatorname{tr}(A)\\cdot\\lambda+\\det(A)=0$\n\n由韦达定理，特征值之和 $=\\operatorname{tr}(A)$，之积 $=\\det(A)$。\n\n很多时候可以**直接凑根**，而不必展开行列式：先猜两数之和 $=\\operatorname{tr}$、之积 $=\\det$，就找到特征值了。',
+          formula: '\\lambda = \\frac{\\operatorname{tr}(A)}{2} \\pm \\sqrt{\\left(\\frac{\\operatorname{tr}(A)}{2}\\right)^2 - \\det(A)}',
+          reveal: {
+            q: '$A$ 是 $3\\times 3$ 矩阵，已知特征值为 $1,2,3$。$\\operatorname{tr}(A)$ 和 $\\det(A)$ 各是多少？',
+            a: '$\\operatorname{tr}(A)=1+2+3=6$，$\\det(A)=1\\times 2\\times 3=6$。在这个例子中两者恰好相等，但这是巧合，不是一般规律。',
+          },
+        },
+        {
+          title: '代数重数',
+          body: '特征值 $\\lambda_0$ 在特征多项式 $p(\\lambda)$ 中出现的次数叫它的**代数重数**，记为 $m_a(\\lambda_0)$。\n\n例如，$p(\\lambda)=(\\lambda-2)^2(\\lambda-5)$ 中，$\\lambda=2$ 的代数重数为 $2$，$\\lambda=5$ 的代数重数为 $1$。\n\n所有特征值的代数重数之和等于矩阵阶数 $n$。',
+          tip: '代数重数是"多项式意义"上的重数，跟特征空间的维数（几何重数）是两件事——它们之间有约束关系，下一张卡介绍。',
+        },
+        {
+          title: '几何重数',
+          body: '特征值 $\\lambda_0$ 对应的**特征空间** $E_{\\lambda_0}=\\ker(A-\\lambda_0 I)$ 的维数叫它的**几何重数**，记为 $m_g(\\lambda_0)$。\n\n几何重数告诉我们：这个特征值有多少个"独立的特征方向"。\n\n**重要不等式**：\n\n$1\\leq m_g(\\lambda_0)\\leq m_a(\\lambda_0)$\n\n几何重数至少为 $1$（因为存在非零特征向量）；几何重数不超过代数重数（这是线性代数的深层定理）。',
+          formula: '1 \\leq m_g(\\lambda_0) \\leq m_a(\\lambda_0)',
+        },
+        {
+          title: '重数差异的具体例子',
+          body: '**例 1**（$m_g=m_a$）：$A=3I=\\begin{pmatrix}3&0\\\\0&3\\end{pmatrix}$，特征多项式 $(\\lambda-3)^2$，$m_a=2$。$A-3I=O$，零空间是整个 $\\mathbb{R}^2$，$m_g=2=m_a$。**可对角化**。\n\n**例 2**（$m_g<m_a$）：$B=\\begin{pmatrix}3&1\\\\0&3\\end{pmatrix}$，特征多项式 $(\\lambda-3)^2$，$m_a=2$。$B-3I=\\begin{pmatrix}0&1\\\\0&0\\end{pmatrix}$，零空间只有 $(1,0)^T$ 方向，$m_g=1<2=m_a$。**不可对角化**（Jordan 块）。',
+          reveal: {
+            q: '如何用 $m_g$ 快速判断矩阵能否对角化？',
+            a: '矩阵可对角化当且仅当**每一个**特征值的几何重数等于代数重数（$m_g=m_a$）。只要有一个特征值满足 $m_g<m_a$，矩阵就不可对角化。',
+          },
+        },
+        {
+          title: '特征值的常用性质汇总',
+          body: '设 $A\\mathbf{v}=\\lambda\\mathbf{v}$（$\\mathbf{v}\\neq\\mathbf{0}$），则：\n\n- $A^k\\mathbf{v}=\\lambda^k\\mathbf{v}$（矩阵幂直接用特征值的幂）\n- $A$ 可逆时，$A^{-1}\\mathbf{v}=\\frac{1}{\\lambda}\\mathbf{v}$\n- $(A-cI)\\mathbf{v}=(\\lambda-c)\\mathbf{v}$（平移特征值）\n- 实对称矩阵：特征值全实，正交矩阵：$|\\lambda|=1$，正定矩阵：$\\lambda>0$\n\n**Cayley-Hamilton 定理**：每个方阵都满足自身的特征多项式，即 $p(A)=O$。',
+          tip: '$n$ 个**不同**特征值是可对角化的充分条件（非必要）。遇到重特征值，必须检查 $m_g=\\dim\\ker(A-\\lambda I)$，不能直接宣告可对角化！',
+        },
+        {
+          title: '综合验算策略',
+          body: '计算完特征值后，务必做以下抽查：\n\n**抽查 1**（迹）：所有特征值之和应等于 $\\operatorname{tr}(A)$（对角线元素之和）。\n\n**抽查 2**（行列式）：所有特征值之积应等于 $\\det(A)$。\n\n**抽查 3**（代入）：取一个特征向量，代入 $A\\mathbf{v}=\\lambda\\mathbf{v}$ 逐分量验证。\n\n三重验算下，计算错误无处遁形。',
+          tip: '**常见陷阱**：已知部分特征值时，用迹/行列式公式推第四个特征值。若两个公式给出矛盾的结果，说明题目数据本身不自洽（陷阱题！），需两个公式都满足才行。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l2-q1',
+          type: 'input',
+          prompt: '$A=\\begin{pmatrix}2&0&0\\\\0&3&0\\\\0&0&5\\end{pmatrix}$，$\\operatorname{tr}(A)$ 等于多少？（填整数）',
+          accept: ['10'],
+          placeholder: '填整数',
+          explain: '对角矩阵的迹 $=$ 对角元素之和 $= 2+3+5=10$。同时特征值就是 $2,3,5$，其和 $=10=\\operatorname{tr}(A)$，两种方法一致。',
+        },
+        {
+          id: 'u7-l2-q2',
+          type: 'choice',
+          prompt: '$3\\times 3$ 矩阵 $A$ 的特征值为 $-1,2,4$。$\\det(A)$ 等于多少？',
+          options: [
+            '$-8$',
+            '$5$',
+            '$8$',
+            '$-5$',
+          ],
+          answer: 0,
+          explain: '$\\det(A)=(-1)\\times 2\\times 4=-8$。由行列式等于特征值之积。验算迹：$-1+2+4=5=\\operatorname{tr}(A)$。',
+        },
+        {
+          id: 'u7-l2-q3',
+          type: 'judge',
+          prompt: '矩阵 $B=\\begin{pmatrix}2&1\\\\0&2\\end{pmatrix}$ 的特征值 $\\lambda=2$ 的几何重数等于其代数重数 $2$。',
+          answer: false,
+          explain: '$B$ 的特征多项式为 $(\\lambda-2)^2$，代数重数 $m_a=2$。但 $B-2I=\\begin{pmatrix}0&1\\\\0&0\\end{pmatrix}$，其零空间仅由 $(1,0)^T$ 张成，几何重数 $m_g=1$。$m_g=1<2=m_a$，故命题为假。',
+        },
+        {
+          id: 'u7-l2-q4',
+          type: 'choice',
+          prompt: '下列哪个矩阵**不可**对角化？',
+          options: [
+            '$C=\\begin{pmatrix}3&1\\\\0&3\\end{pmatrix}$',
+            '$D=\\begin{pmatrix}3&0\\\\0&3\\end{pmatrix}$',
+            '$E=\\begin{pmatrix}1&0\\\\0&2\\end{pmatrix}$',
+            '$F=\\begin{pmatrix}1&2\\\\3&0\\end{pmatrix}$',
+          ],
+          answer: 0,
+          explain: '$C$ 的特征多项式 $(\\lambda-3)^2$，$m_a=2$。$C-3I=\\begin{pmatrix}0&1\\\\0&0\\end{pmatrix}$，零空间维数 $m_g=1<2$，**不可对角化**。$D=3I$：$m_g=m_a=2$，可对角化。$E$ 有两个不同特征值，可对角化。$F$ 有两个不同特征值，可对角化。',
+        },
+        {
+          id: 'u7-l2-q5',
+          type: 'input',
+          prompt: '$4\\times 4$ 矩阵 $A$ 的三个特征值为 $1,2,3$，$\\operatorname{tr}(A)=8$。第四个特征值是多少？（填整数）',
+          accept: ['2'],
+          placeholder: '填整数',
+          explain: '设第四个特征值为 $\\lambda_4$。由 $\\operatorname{tr}(A)=\\lambda_1+\\lambda_2+\\lambda_3+\\lambda_4$：$8=1+2+3+\\lambda_4$，$\\lambda_4=8-6=2$。',
+        },
+        {
+          id: 'u7-l2-q6',
+          type: 'judge',
+          prompt: '若矩阵 $A$ 的特征多项式为 $p(\\lambda)=(\\lambda-2)^3$，则 $A$ 必然不可对角化。',
+          answer: false,
+          explain: '代数重数 $m_a=3$ 并不意味着必然不可对角化。若 $A=2I$（$3\\times 3$ 数量矩阵），特征多项式也是 $(\\lambda-2)^3$，但 $A-2I=O$，几何重数 $m_g=3=m_a$，**完全可以对角化**。关键是看 $m_g$ 是否等于 $m_a$。',
+        },
+        {
+          id: 'u7-l2-q7',
+          type: 'choice',
+          prompt: '$A$ 是 $2\\times 2$ 矩阵，$\\operatorname{tr}(A)=5$，$\\det(A)=6$。则特征值为：',
+          options: [
+            '$\\lambda_1=2,\\ \\lambda_2=3$',
+            '$\\lambda_1=1,\\ \\lambda_2=6$',
+            '$\\lambda_1=-1,\\ \\lambda_2=6$',
+            '$\\lambda_1=5,\\ \\lambda_2=1$',
+          ],
+          answer: 0,
+          explain: '特征多项式 $\\lambda^2-5\\lambda+6=(\\lambda-2)(\\lambda-3)=0$，特征值 $2$ 和 $3$。验证：$2+3=5=\\operatorname{tr}$，$2\\times 3=6=\\det$。✓',
+        },
+        {
+          id: 'u7-l2-q8',
+          type: 'match',
+          prompt: '将重数相关概念与描述正确配对：',
+          left: [
+            '代数重数 $m_a(\\lambda_0)$',
+            '几何重数 $m_g(\\lambda_0)$',
+            '$m_g < m_a$ 的矩阵',
+            '$m_g = m_a$ 对所有特征值成立',
+          ],
+          right: [
+            '矩阵可对角化',
+            '$\\lambda_0$ 作为特征多项式根的重数',
+            '亏损矩阵，不可对角化',
+            '$\\dim\\ker(A-\\lambda_0 I)$',
+          ],
+        },
+        {
+          id: 'u7-l2-q9',
+          type: 'judge',
+          prompt: '矩阵 $A$ 的特征值为 $0,1,2$，则 $A$ 必然不可逆。',
+          answer: true,
+          explain: '$\\det(A)=0\\times 1\\times 2=0$（行列式等于特征值之积）。$\\det(A)=0$ 等价于 $A$ 奇异（不可逆）。此外，$\\lambda=0$ 是特征值说明存在非零向量 $\\mathbf{v}$ 使 $A\\mathbf{v}=\\mathbf{0}$，即 $A$ 的零空间非平凡，$A$ 不可逆。',
+        },
+      ],
+    },
+
+    // =====================================================================
+    // u7-l3  对角化原理与步骤
+    // =====================================================================
+    {
+      id: 'u7-l3',
+      title: '对角化原理与步骤',
+      subtitle: '找到最简坐标系，让矩阵变对角',
+      intro: [
+        {
+          title: '对角化的核心思想',
+          body: '同一个线性变换在不同坐标系下有不同的矩阵表示。**对角化**的问题是：能否找到一组特殊的基，使得矩阵表示变成**对角矩阵**？\n\n对角矩阵最简单——它只沿各轴缩放，没有旋转或剪切。如果找到了，很多计算（尤其是高次幂）将大幅简化。',
+          formula: 'A = P\\Lambda P^{-1}',
+          tip: '$P$ 的各列是 $A$ 的 $n$ 个**线性无关**特征向量；$\\Lambda$ 的对角线是对应的**特征值**（顺序必须一一对应！）。',
+        },
+        {
+          title: '为什么 $AP = P\\Lambda$？',
+          body: '将 $n$ 个特征方程 $A\\mathbf{p}_i=\\lambda_i\\mathbf{p}_i$ 合并成矩阵形式：',
+          formula: 'AP = P\\Lambda',
+          steps: [
+            '展开左边：$A[\\mathbf{p}_1\\mid\\cdots\\mid\\mathbf{p}_n]=[A\\mathbf{p}_1\\mid\\cdots\\mid A\\mathbf{p}_n]=[\\lambda_1\\mathbf{p}_1\\mid\\cdots\\mid\\lambda_n\\mathbf{p}_n]$',
+            '展开右边：$[\\mathbf{p}_1\\mid\\cdots\\mid\\mathbf{p}_n]\\operatorname{diag}(\\lambda_1,\\ldots,\\lambda_n)=[\\lambda_1\\mathbf{p}_1\\mid\\cdots\\mid\\lambda_n\\mathbf{p}_n]$',
+            '两边相等，故 $AP=P\\Lambda$',
+            '若 $P$ 可逆（特征向量线性无关），两边右乘 $P^{-1}$：$A=P\\Lambda P^{-1}$',
+          ],
+        },
+        {
+          title: '可对角化的充要条件',
+          body: '$n\\times n$ 矩阵 $A$ 可对角化，当且仅当 $A$ 有 $n$ 个**线性无关**的特征向量。\n\n等价地：**每个特征值的几何重数等于代数重数**（$m_g(\\lambda)=m_a(\\lambda)$ 对所有 $\\lambda$）。\n\n**充分条件（更易验证）**：若 $A$ 有 $n$ 个互不相同的特征值，则一定可对角化——不同特征值的特征向量线性无关，恰好凑齐 $n$ 个。',
+          tip: '注意充分条件不是必要条件。$A=\\lambda_0 I$（数量矩阵）有重特征值，但也可对角化（$P=I$，$\\Lambda=\\lambda_0 I$）。遇到重特征值，必须检查 $m_g$。',
+        },
+        {
+          title: '对角化完整算法——4步',
+          body: '以 $A=\\begin{pmatrix}4&1\\\\2&3\\end{pmatrix}$ 为例完整演算。',
+          steps: [
+            '**步骤1：求特征值。** $\\det(A-\\lambda I)=\\lambda^2-7\\lambda+10=(\\lambda-5)(\\lambda-2)=0$，$\\lambda_1=5$，$\\lambda_2=2$（两个不同实特征值，一定可对角化）',
+            '**步骤2：求特征向量。** 对 $\\lambda_1=5$：$A-5I=\\begin{pmatrix}-1&1\\\\2&-2\\end{pmatrix}\\to\\begin{pmatrix}1&-1\\\\0&0\\end{pmatrix}$，$v_1=v_2$，取 $\\mathbf{p}_1=\\begin{pmatrix}1\\\\1\\end{pmatrix}$',
+            '对 $\\lambda_2=2$：$A-2I=\\begin{pmatrix}2&1\\\\2&1\\end{pmatrix}\\to\\begin{pmatrix}2&1\\\\0&0\\end{pmatrix}$，$2v_1+v_2=0$，取 $\\mathbf{p}_2=\\begin{pmatrix}1\\\\-2\\end{pmatrix}$',
+            '**步骤3：构造 $P$ 和 $\\Lambda$。** $P=\\begin{pmatrix}1&1\\\\1&-2\\end{pmatrix}$，$\\Lambda=\\begin{pmatrix}5&0\\\\0&2\\end{pmatrix}$（列与对角元顺序必须一致！）',
+            '**步骤4：求 $P^{-1}$，验证。** $\\det(P)=-2-1=-3$，$P^{-1}=\\frac{1}{3}\\begin{pmatrix}2&1\\\\1&-1\\end{pmatrix}$，验证 $P^{-1}AP=\\Lambda$ ✓',
+          ],
+        },
+        {
+          title: '对角化的几何意义',
+          body: '$A=P\\Lambda P^{-1}$ 可以理解为三步复合变换：\n\n$P^{-1}$：将标准坐标转换为**特征向量基**下的坐标（"看懂"矩阵的自然语言）\n\n$\\Lambda$：在各特征方向上分别**缩放**（沿 $\\mathbf{p}_i$ 方向乘以 $\\lambda_i$，最简单的操作）\n\n$P$：将特征坐标**转换回标准坐标**\n\n**本质**：对角化将"复杂的线性变换"分解为"换坐标 + 简单缩放 + 换回来"。',
+          reveal: {
+            q: '对角化后为什么 $P^{-1}\\neq P^T$？在什么情况下才有 $P^{-1}=P^T$？',
+            a: '普通对角化中 $P$ 只是可逆矩阵，$P^{-1}\\neq P^T$。只有当 $P$ 是**正交矩阵**时才有 $P^{-1}=P^T$，即 $P$ 的列向量两两正交且单位长度。实对称矩阵的正交对角化（谱定理，第五关）正好满足这个条件。',
+          },
+        },
+        {
+          title: '不可对角化：亏损矩阵',
+          body: '若某个特征值的几何重数小于代数重数（$m_g<m_a$），则矩阵**不可对角化**（亏损矩阵）。\n\n**例**：$B=\\begin{pmatrix}4&1&0\\\\0&4&1\\\\0&0&4\\end{pmatrix}$，$p(\\lambda)=(4-\\lambda)^3$，$m_a=3$。\n\n$(B-4I)=\\begin{pmatrix}0&1&0\\\\0&0&1\\\\0&0&0\\end{pmatrix}$，秩为 $2$，$m_g=3-2=1<3$。\n\n不可对角化——这是 $3\\times 3$ Jordan 块的典型情形。',
+          tip: '可对角化充分条件（非必要）：$n$ 个**不同**特征值。有重特征值时必须检验 $m_g=\\dim\\ker(A-\\lambda I)$ 是否等于 $m_a$。',
+        },
+        {
+          title: '小结与易错清单',
+          body: '**对角化四步标准流程**：\n\n1. 求特征方程 $\\det(A-\\lambda I)=0$，得各 $\\lambda_k$ 及代数重数\n2. 对每个 $\\lambda_k$，解 $(A-\\lambda_k I)\\mathbf{v}=\\mathbf{0}$，取特征空间的基\n3. 若所有特征空间基向量总数 $=n$，则可对角化；否则不可\n4. 按列构造 $P$（列顺序与 $\\Lambda$ 对角线一一对应），求 $P^{-1}$，验证 $P^{-1}AP=\\Lambda$',
+          tip: '**两大易错点**：① $P$ 的列顺序必须与 $\\Lambda$ 对角线一一对应，错位则 $AP\\neq P\\Lambda$；② 重特征值时不能跳过"检查 $m_g$"这一步，看到重特征值一定要解特征方程算 $\\dim\\ker$。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l3-q1',
+          type: 'choice',
+          prompt: '矩阵 $A$ 可对角化为 $A=P\\Lambda P^{-1}$，则 $A^3$ 等于：',
+          options: [
+            '$P\\Lambda^3 P^{-1}$',
+            '$P^3\\Lambda P^{-3}$',
+            '$3P\\Lambda P^{-1}$',
+            '$P\\Lambda P^{-3}$',
+          ],
+          answer: 0,
+          explain: '$A^3=(P\\Lambda P^{-1})(P\\Lambda P^{-1})(P\\Lambda P^{-1})=P\\Lambda(P^{-1}P)\\Lambda(P^{-1}P)\\Lambda P^{-1}=P\\Lambda^3 P^{-1}$。关键：$P^{-1}P=I$，中间抵消。',
+        },
+        {
+          id: 'u7-l3-q2',
+          type: 'judge',
+          prompt: '若矩阵 $A$ 有 $n$ 个不同的特征值，则 $A$ 一定可对角化。',
+          answer: true,
+          explain: '$n$ 个不同特征值 $\\Rightarrow$ 对应的 $n$ 个特征向量线性无关（不同特征值的特征向量线性无关定理）$\\Rightarrow$ $P$ 可逆 $\\Rightarrow$ 可对角化。这是**充分条件**，不是必要条件（有重特征值也可能可对角化）。',
+        },
+        {
+          id: 'u7-l3-q3',
+          type: 'input',
+          prompt: '$A=\\begin{pmatrix}2&0\\\\0&3\\end{pmatrix}$（对角矩阵），则 $A^5$ 的 $(2,2)$ 元素等于多少？（填整数）',
+          accept: ['243'],
+          placeholder: '填整数',
+          explain: '对角矩阵已经对角化（$P=I$），$A^5=\\operatorname{diag}(2^5,3^5)=\\operatorname{diag}(32,243)$。$(2,2)$ 元素为 $3^5=243$。',
+        },
+        {
+          id: 'u7-l3-q4',
+          type: 'choice',
+          prompt: '$A=\\begin{pmatrix}1&2\\\\3&2\\end{pmatrix}$，$\\operatorname{tr}=3$，$\\det=-4$，特征值 $\\lambda_1=4$，$\\lambda_2=-1$。对 $\\lambda_1=4$ 的特征向量满足 $v_1:v_2=$？',
+          options: [
+            '$2:3$（即 $(2,3)^T$ 方向）',
+            '$1:1$（即 $(1,1)^T$ 方向）',
+            '$1:2$（即 $(1,2)^T$ 方向）',
+            '$1:-1$（即 $(1,-1)^T$ 方向）',
+          ],
+          answer: 0,
+          explain: '$(A-4I)=\\begin{pmatrix}-3&2\\\\3&-2\\end{pmatrix}\\to\\begin{pmatrix}3&-2\\\\0&0\\end{pmatrix}$，方程 $3v_1=2v_2$，故 $v_1:v_2=2:3$，特征向量取 $(2,3)^T$。验证：$A\\begin{pmatrix}2\\\\3\\end{pmatrix}=\\begin{pmatrix}2+6\\\\6+6\\end{pmatrix}=\\begin{pmatrix}8\\\\12\\end{pmatrix}=4\\begin{pmatrix}2\\\\3\\end{pmatrix}$。✓',
+        },
+        {
+          id: 'u7-l3-q5',
+          type: 'judge',
+          prompt: '矩阵 $C=\\begin{pmatrix}2&1\\\\0&2\\end{pmatrix}$ 可以对角化。',
+          answer: false,
+          explain: '$C$ 的特征多项式 $(\\lambda-2)^2=0$，特征值 $\\lambda=2$，代数重数 $m_a=2$。$C-2I=\\begin{pmatrix}0&1\\\\0&0\\end{pmatrix}$，零空间维数为 $1$，几何重数 $m_g=1<2=m_a$。因此 $C$ **不可对角化**（亏损矩阵）。',
+        },
+        {
+          id: 'u7-l3-q6',
+          type: 'choice',
+          prompt: '对角化中，若 $P$ 的列向量顺序与 $\\Lambda$ 不一致，会出现什么问题？',
+          options: [
+            '$AP=P\\Lambda$ 不成立，对角化结果错误',
+            '结果正确，顺序不影响对角化',
+            '$P^{-1}$ 不存在',
+            '$\\Lambda$ 不再是对角矩阵',
+          ],
+          answer: 0,
+          explain: '$AP=P\\Lambda$ 要求 $P$ 的第 $i$ 列 $\\mathbf{p}_i$ 与 $\\Lambda$ 的第 $(i,i)$ 元素 $\\lambda_i$ 满足 $A\\mathbf{p}_i=\\lambda_i\\mathbf{p}_i$。若顺序错位，例如 $P$ 第一列对应 $\\lambda_2$ 的特征向量，但 $\\Lambda$ 第 $(1,1)$ 元素是 $\\lambda_1$，则 $AP\\neq P\\Lambda$，对角化失败。',
+        },
+        {
+          id: 'u7-l3-q7',
+          type: 'judge',
+          prompt: '$A=P\\Lambda P^{-1}$ 中，若交换 $P$ 的两列（同时交换 $\\Lambda$ 对应的对角元素），对角化仍然正确。',
+          answer: true,
+          explain: '特征向量和特征值的配对是关键，只要 $P$ 的第 $i$ 列对应 $\\Lambda$ 的第 $(i,i)$ 元素，顺序任意调整后 $AP=P\\Lambda$ 仍成立，$A=P\\Lambda P^{-1}$ 依然正确。这说明对角化的表示不唯一（可以按任意顺序排列）。',
+        },
+        {
+          id: 'u7-l3-q8',
+          type: 'match',
+          prompt: '将对角化相关概念与描述配对：',
+          left: [
+            '矩阵 $P$',
+            '矩阵 $\\Lambda$',
+            '可对角化充要条件',
+            '亏损矩阵',
+          ],
+          right: [
+            '某特征值几何重数小于代数重数',
+            '对角线元素为对应特征值',
+            '$n$ 个线性无关的特征向量（列向量）',
+            '有 $n$ 个线性无关特征向量',
+          ],
+        },
+      ],
+    },
+
+    // =====================================================================
+    // u7-l4  矩阵幂与应用
+    // =====================================================================
+    {
+      id: 'u7-l4',
+      title: '矩阵幂与应用',
+      subtitle: '对角化让高次幂计算瞬间完成',
+      intro: [
+        {
+          title: '矩阵幂的对角化公式',
+          body: '由 $A=P\\Lambda P^{-1}$ 出发，反复相乘：\n\n$A^2=(P\\Lambda P^{-1})(P\\Lambda P^{-1})=P\\Lambda(P^{-1}P)\\Lambda P^{-1}=P\\Lambda^2 P^{-1}$\n\n归纳得出一般公式：',
+          formula: 'A^n = P\\Lambda^n P^{-1}, \\quad \\Lambda^n = \\begin{pmatrix}\\lambda_1^n & & \\\\ & \\ddots & \\\\ & & \\lambda_k^n\\end{pmatrix}',
+          tip: '计算 $A^n$ 只需做**标量幂** $\\lambda_i^n$，而不是反复矩阵相乘。计算代价从 $O(n^3)$ 降到 $O(n)$，大幅提速。',
+        },
+        {
+          title: '矩阵幂计算示例',
+          body: '以 $A=\\begin{pmatrix}4&1\\\\2&3\\end{pmatrix}$（已知 $P=\\begin{pmatrix}1&1\\\\1&-2\\end{pmatrix}$，$\\Lambda=\\begin{pmatrix}5&0\\\\0&2\\end{pmatrix}$，$P^{-1}=\\frac{1}{3}\\begin{pmatrix}2&1\\\\1&-1\\end{pmatrix}$）为例，计算 $A^{10}$：',
+          steps: [
+            '**第一步**：$\\Lambda^{10}=\\begin{pmatrix}5^{10}&0\\\\0&2^{10}\\end{pmatrix}=\\begin{pmatrix}9765625&0\\\\0&1024\\end{pmatrix}$（只需标量幂）',
+            '**第二步**：$A^{10}=P\\Lambda^{10}P^{-1}=\\begin{pmatrix}1&1\\\\1&-2\\end{pmatrix}\\begin{pmatrix}9765625&0\\\\0&1024\\end{pmatrix}\\frac{1}{3}\\begin{pmatrix}2&1\\\\1&-1\\end{pmatrix}$',
+            '**第三步**：逐步相乘，最终得到具体数值矩阵',
+            '若用直接矩阵乘法，需要 9 次 $2\\times 2$ 矩阵乘法，对角化方法只需 2 次标量幂，大幅节省。',
+          ],
+        },
+        {
+          title: '矩阵指数函数',
+          body: '对角化还可以处理**矩阵指数**：\n\n$e^A=\\sum_{k=0}^{\\infty}\\dfrac{A^k}{k!}=P\\left(\\sum_{k=0}^{\\infty}\\dfrac{\\Lambda^k}{k!}\\right)P^{-1}=Pe^{\\Lambda}P^{-1}$\n\n其中 $e^{\\Lambda}=\\operatorname{diag}(e^{\\lambda_1},\\ldots,e^{\\lambda_n})$，对角矩阵的指数就是对各对角元分别取指数。',
+          formula: 'e^A = P e^{\\Lambda} P^{-1}, \\quad e^{\\Lambda} = \\operatorname{diag}(e^{\\lambda_1},\\ldots,e^{\\lambda_n})',
+          tip: '矩阵指数用于求解线性常微分方程组 $\\dot{\\mathbf{x}}=A\\mathbf{x}$，解为 $\\mathbf{x}(t)=e^{At}\\mathbf{x}_0$。特征值的实部决定稳定性：$\\operatorname{Re}(\\lambda_i)<0$ 全部成立则解趋于零（渐近稳定）。',
+        },
+        {
+          title: '应用：Fibonacci 数列与黄金比例',
+          body: 'Fibonacci 矩阵 $F=\\begin{pmatrix}1&1\\\\1&0\\end{pmatrix}$，特征值 $\\phi=\\frac{1+\\sqrt{5}}{2}\\approx 1.618$（黄金比例）和 $\\psi=\\frac{1-\\sqrt{5}}{2}\\approx -0.618$。\n\n由于 $\\begin{pmatrix}F_{n+1}\\\\F_n\\end{pmatrix}=F^n\\begin{pmatrix}1\\\\0\\end{pmatrix}$，对角化后得到 **Binet 公式**：',
+          formula: 'F_n = \\frac{\\phi^n - \\psi^n}{\\sqrt{5}}',
+          reveal: {
+            q: '为什么对大 $n$ 可以用 $F_n\\approx\\phi^n/\\sqrt{5}$ 取整来计算 Fibonacci 数？',
+            a: '因为 $|\\psi|=|\\frac{1-\\sqrt{5}}{2}|\\approx 0.618<1$，所以 $\\psi^n\\to 0$（指数衰减）。当 $n$ 较大时，$F_n=\\frac{\\phi^n-\\psi^n}{\\sqrt{5}}\\approx\\frac{\\phi^n}{\\sqrt{5}}$，取最近整数即得精确的 Fibonacci 数。',
+          },
+        },
+        {
+          title: '应用：Markov 链收敛',
+          body: '正则 Markov 转移矩阵 $M$ 满足：主特征值 $\\lambda_1=1$，其余 $|\\lambda_i|<1$（Perron-Frobenius 定理）。\n\n对角化后，$M^k=P\\Lambda^k P^{-1}$，当 $k\\to\\infty$ 时，$\\lambda_i^k\\to 0$（$i>1$），链以指数速度收敛到**平稳分布**（$\\lambda=1$ 的特征向量）。\n\n**收敛速度**由第二大特征值 $|\\lambda_2|$ 决定：$|\\lambda_2|$ 越小，混合越快。',
+          reveal: {
+            q: '转移矩阵 $M=\\begin{pmatrix}0.7&0.4\\\\0.3&0.6\\end{pmatrix}$，特征值 $1$ 和 $0.3$。平稳分布是多少（比例）？',
+            a: '解 $(M-I)\\mathbf{v}=\\mathbf{0}$：$-0.3v_1+0.4v_2=0$，$v_1:v_2=4:3$，归一化得 $\\boldsymbol{\\pi}=(4/7,3/7)^T$。',
+          },
+        },
+        {
+          title: '谱半径与矩阵幂的增长',
+          body: '矩阵 $A$ 的**谱半径**定义为：\n\n$\\rho(A)=\\max_i|\\lambda_i|$\n\n谱半径决定了 $A^n$ 随 $n$ 增大的渐近行为：\n\n- $\\rho(A)<1$：$A^n\\to O$（矩阵幂趋于零，系统稳定）\n- $\\rho(A)>1$：$A^n$ 的元素趋于无穷（系统发散）\n- $\\rho(A)=1$：$A^n$ 有界（如旋转矩阵，Markov 矩阵的主特征值方向）',
+          tip: 'RNN（循环神经网络）的梯度消失/爆炸正与谱半径有关：权重矩阵 $W$ 的谱半径 $\\rho(W)<1$ 导致梯度消失，$\\rho(W)>1$ 导致梯度爆炸。正交初始化（$\\rho=1$）可以缓解这个问题。',
+        },
+        {
+          title: '小结',
+          body: '**核心公式**：$A^n=P\\Lambda^n P^{-1}$；$e^A=Pe^{\\Lambda}P^{-1}$；一般矩阵函数 $f(A)=P\\operatorname{diag}(f(\\lambda_i))P^{-1}$。\n\n**三步计算矩阵幂**：\n\n1. 对角化得 $P$ 和 $\\Lambda$\n2. 计算 $\\Lambda^n=\\operatorname{diag}(\\lambda_i^n)$（标量幂）\n3. $A^n=P\\Lambda^n P^{-1}$（三矩阵相乘）\n\n**应用场景**：Fibonacci 数列（Binet 公式）、Markov 链长期行为、线性微分方程组、RNN 梯度分析。',
+          tip: '**注意**：$e^{A+B}\\neq e^Ae^B$（一般情况），只有 $AB=BA$ 时才成立。矩阵乘法不交换，不能直接套标量指数法则。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l4-q1',
+          type: 'choice',
+          prompt: '可对角化矩阵 $A=P\\Lambda P^{-1}$，$\\Lambda=\\operatorname{diag}(2,-1)$。则 $A^{10}$ 的特征值是什么？',
+          options: [
+            '$2^{10}=1024$ 和 $(-1)^{10}=1$',
+            '$20$ 和 $-10$',
+            '$2$ 和 $-1$（特征值不变）',
+            '$10\\times 2$ 和 $10\\times(-1)$',
+          ],
+          answer: 0,
+          explain: '$A^{10}=P\\Lambda^{10}P^{-1}$，$\\Lambda^{10}=\\operatorname{diag}(2^{10},(-1)^{10})=\\operatorname{diag}(1024,1)$。$A^{10}$ 与 $A$ 有相同的特征向量（$P$ 不变），特征值变为原来的 $10$ 次方。',
+        },
+        {
+          id: 'u7-l4-q2',
+          type: 'input',
+          prompt: '$A$ 的对角化为 $\\Lambda=\\operatorname{diag}(3,1)$，则 $\\det(A^4)$ 等于多少？（填整数）',
+          accept: ['81'],
+          placeholder: '填整数',
+          explain: '$A^4$ 的特征值为 $3^4=81$ 和 $1^4=1$。$\\det(A^4)=81\\times 1=81$。也可用 $\\det(A^4)=(\\det A)^4=(3\\times 1)^4=81$。',
+        },
+        {
+          id: 'u7-l4-q3',
+          type: 'judge',
+          prompt: '若 $A=P\\Lambda P^{-1}$，则矩阵指数 $e^A = Pe^{\\Lambda}P^{-1}$，其中 $e^{\\Lambda}=\\operatorname{diag}(e^{\\lambda_1},\\ldots,e^{\\lambda_n})$。',
+          answer: true,
+          explain: '$e^A=\\sum_{k=0}^{\\infty}\\frac{A^k}{k!}=\\sum_{k=0}^{\\infty}\\frac{P\\Lambda^k P^{-1}}{k!}=P\\left(\\sum_{k=0}^{\\infty}\\frac{\\Lambda^k}{k!}\\right)P^{-1}=Pe^{\\Lambda}P^{-1}$。对角矩阵的指数就是对各对角元分别取指数：$e^{\\Lambda}=\\operatorname{diag}(e^{\\lambda_i})$。',
+        },
+        {
+          id: 'u7-l4-q4',
+          type: 'choice',
+          prompt: 'Fibonacci 矩阵 $F=\\begin{pmatrix}1&1\\\\1&0\\end{pmatrix}$ 的特征值为 $\\phi\\approx 1.618$ 和 $\\psi\\approx -0.618$。$\\det(F^{20})$ 等于多少？',
+          options: [
+            '$1$',
+            '$\\phi^{20}\\psi^{20}$',
+            '$0$',
+            '$\\phi^{20}$',
+          ],
+          answer: 0,
+          explain: '$\\det(F)=\\phi\\cdot\\psi=\\frac{1+\\sqrt{5}}{2}\\cdot\\frac{1-\\sqrt{5}}{2}=\\frac{1-5}{4}=-1$。$\\det(F^{20})=(\\det F)^{20}=(-1)^{20}=1$。也可用特征值之积：$\\det(F^{20})=(\\phi\\psi)^{20}=(-1)^{20}=1$。',
+        },
+        {
+          id: 'u7-l4-q5',
+          type: 'judge',
+          prompt: '对任意两个可对角化矩阵 $A$ 和 $B$，$e^{A+B}=e^Ae^B$ 都成立。',
+          answer: false,
+          explain: '$e^{A+B}=e^Ae^B$ 只在 $AB=BA$（$A,B$ 可交换）时成立。一般矩阵乘法不交换，指数函数的乘法规则不直接推广。例如取不同特征向量矩阵的对角化矩阵，$AB\\neq BA$，则 $e^{A+B}\\neq e^Ae^B$。',
+        },
+        {
+          id: 'u7-l4-q6',
+          type: 'choice',
+          prompt: 'Markov 转移矩阵 $M$ 的特征值为 $1$ 和 $0.5$，初始状态 $\\mathbf{x}_0$ 经过多步后收敛到平稳分布 $\\boldsymbol{\\pi}$。$M^{10}$ 中非主特征值分量的贡献大约是多少？',
+          options: [
+            '$0.5^{10}\\approx 0.001$（指数衰减）',
+            '$0.5\\times 10=5$',
+            '$1$（不衰减）',
+            '$0$（立即消失）',
+          ],
+          answer: 0,
+          explain: '非主特征值 $\\lambda_2=0.5$，经过 $10$ 步后，对应分量乘以 $0.5^{10}=1/1024\\approx 0.001$，以指数速度衰减趋于零。主特征值 $\\lambda_1=1$ 的分量保持不变，对应平稳分布。这就是 Markov 链收敛的机制。',
+        },
+        {
+          id: 'u7-l4-q7',
+          type: 'input',
+          prompt: '$A=\\begin{pmatrix}3&0\\\\0&2\\end{pmatrix}$，谱半径 $\\rho(A)=\\max_i|\\lambda_i|$ 等于多少？（填整数）',
+          accept: ['3'],
+          placeholder: '填整数',
+          explain: '$A$ 是对角矩阵，特征值为 $3$ 和 $2$，$\\rho(A)=\\max(|3|,|2|)=3$。谱半径是最大模特征值，决定了 $A^n$ 随 $n$ 增大的渐近增长率。',
+        },
+        {
+          id: 'u7-l4-q8',
+          type: 'match',
+          prompt: '将矩阵幂/指数相关概念与公式配对：',
+          left: [
+            '$A^n$（$A=P\\Lambda P^{-1}$）',
+            '$e^A$（$A=P\\Lambda P^{-1}$）',
+            '谱半径 $\\rho(A)$',
+            '$A^n\\to O$（$n\\to\\infty$）',
+          ],
+          right: [
+            '$\\rho(A)<1$',
+            '$\\max_i|\\lambda_i|$',
+            '$Pe^{\\Lambda}P^{-1}$',
+            '$P\\Lambda^n P^{-1}$',
+          ],
+        },
+        {
+          id: 'u7-l4-q9',
+          type: 'judge',
+          prompt: '对可对角化矩阵 $A=P\\Lambda P^{-1}$，$\\operatorname{tr}(A^n)=\\sum_i\\lambda_i^n$。',
+          answer: true,
+          explain: '$A^n=P\\Lambda^n P^{-1}$，$\\operatorname{tr}(A^n)=\\operatorname{tr}(P\\Lambda^n P^{-1})=\\operatorname{tr}(\\Lambda^n P^{-1}P)=\\operatorname{tr}(\\Lambda^n)=\\sum_i\\lambda_i^n$（利用迹的循环不变性 $\\operatorname{tr}(XYZ)=\\operatorname{tr}(YZX)$）。',
+        },
+      ],
+    },
+
+    // =====================================================================
+    // u7-l5  谱定理
+    // =====================================================================
+    {
+      id: 'u7-l5',
+      title: '谱定理',
+      subtitle: '实对称矩阵的正交对角化',
+      intro: [
+        {
+          title: '实对称矩阵的特殊地位',
+          body: '实对称矩阵（$A^T=A$）在数学与机器学习中无处不在：协方差矩阵、Hessian 矩阵、图拉普拉斯矩阵都是实对称矩阵。\n\n它们拥有普通矩阵不具备的两个优美性质：\n\n1. **特征值全为实数**（即使矩阵元素全为实数，一般矩阵也可能有复特征值）\n2. **不同特征值对应的特征向量相互正交**',
+          tip: '旋转矩阵 $\\begin{pmatrix}0&-1\\\\1&0\\end{pmatrix}$ 是实矩阵，但特征值是 $\\pm i$（虚数）。对称矩阵不会出现这种情况。',
+        },
+        {
+          title: '特征值为实数——证明思路',
+          body: '设 $A=A^T$，$A\\mathbf{v}=\\lambda\\mathbf{v}$，$\\mathbf{v}\\neq\\mathbf{0}$（暂时允许复数向量）。对内积 $\\bar{\\mathbf{v}}^T A\\mathbf{v}$ 做两种计算：\n\n**路径一**：直接代入 $A\\mathbf{v}=\\lambda\\mathbf{v}$，得 $\\lambda\\|\\mathbf{v}\\|^2$。\n\n**路径二**：利用 $A^T=A$，以及 $A\\bar{\\mathbf{v}}=\\bar{\\lambda}\\bar{\\mathbf{v}}$，得 $\\bar{\\lambda}\\|\\mathbf{v}\\|^2$。\n\n两路径结果相等且 $\\|\\mathbf{v}\\|^2>0$，故 $\\lambda=\\bar{\\lambda}$，即 $\\lambda$ 是实数。',
+          reveal: {
+            q: '不同特征值 $\\lambda_1\\neq\\lambda_2$ 的特征向量 $\\mathbf{v}_1,\\mathbf{v}_2$ 为什么正交？',
+            a: '计算 $\\lambda_1\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle=\\langle A\\mathbf{v}_1,\\mathbf{v}_2\\rangle=\\mathbf{v}_1^TA^T\\mathbf{v}_2=\\mathbf{v}_1^TA\\mathbf{v}_2=\\lambda_2\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle$（利用 $A^T=A$）。因 $\\lambda_1\\neq\\lambda_2$，故 $\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle=0$。',
+          },
+        },
+        {
+          title: '实谱定理',
+          body: '**实谱定理**：任意实对称矩阵 $A$ 都可被**正交对角化**，即存在正交矩阵 $Q$（$Q^TQ=I$）和实对角矩阵 $\\Lambda$，使得：',
+          formula: 'A = Q\\Lambda Q^T',
+          steps: [
+            '与普通对角化 $A=P\\Lambda P^{-1}$ 的区别：$Q^{-1}=Q^T$，计算逆矩阵只需转置！',
+            '$Q$ 的列是 $A$ 的标准正交特征向量 $\\mathbf{q}_1,\\ldots,\\mathbf{q}_n$（单位长度且两两正交）',
+            '**谱分解**：$A=\\sum_{i=1}^{n}\\lambda_i\\mathbf{q}_i\\mathbf{q}_i^T$，每项是秩 1 正交投影乘缩放系数',
+          ],
+        },
+        {
+          title: '正交对角化完整示例',
+          body: '以 $A=\\begin{pmatrix}3&1\\\\1&3\\end{pmatrix}$ 为例完整演算。',
+          steps: [
+            '**求特征值**：$\\operatorname{tr}=6$，$\\det=8$，$\\lambda^2-6\\lambda+8=(\\lambda-2)(\\lambda-4)=0$，$\\lambda_1=2$，$\\lambda_2=4$',
+            '**求特征向量**（$\\lambda_1=2$）：$(A-2I)\\mathbf{v}=0$，$\\begin{pmatrix}1&1\\\\1&1\\end{pmatrix}\\mathbf{v}=0$，$v_1+v_2=0$，取 $\\mathbf{v}_1=(1,-1)^T$',
+            '**归一化**：$\\|\\mathbf{v}_1\\|=\\sqrt{2}$，$\\mathbf{q}_1=\\frac{1}{\\sqrt{2}}\\begin{pmatrix}1\\\\-1\\end{pmatrix}$',
+            '**求特征向量**（$\\lambda_2=4$）：$(A-4I)\\mathbf{v}=0$，$(-1)v_1+v_2=0$，取 $\\mathbf{v}_2=(1,1)^T$，归一化 $\\mathbf{q}_2=\\frac{1}{\\sqrt{2}}\\begin{pmatrix}1\\\\1\\end{pmatrix}$',
+            '**验证正交**：$\\mathbf{q}_1^T\\mathbf{q}_2=\\frac{1}{2}(1\\cdot 1+(-1)\\cdot 1)=0$ ✓',
+            '**结果**：$Q=\\frac{1}{\\sqrt{2}}\\begin{pmatrix}1&1\\\\-1&1\\end{pmatrix}$，$\\Lambda=\\begin{pmatrix}2&0\\\\0&4\\end{pmatrix}$，$A=Q\\Lambda Q^T$',
+          ],
+        },
+        {
+          title: '谱分解的几何意义',
+          body: '将 $A=Q\\Lambda Q^T$ 展开为谱分解：\n\n$A=\\sum_{i=1}^{n}\\lambda_i\\mathbf{q}_i\\mathbf{q}_i^T$\n\n其中 $\\mathbf{q}_i\\mathbf{q}_i^T$ 是向 $\\mathbf{q}_i$ 方向的**正交投影矩阵**（秩 1），$\\lambda_i$ 是该方向上的**缩放因子**。\n\n$A$ 的整体效果 $=$ 在各主轴方向上独立拉伸之叠加，就像椭圆是沿各坐标轴方向独立拉伸的圆一样。',
+          reveal: {
+            q: '谱分解 $A=\\sum_i\\lambda_i\\mathbf{q}_i\\mathbf{q}_i^T$ 能如何推广到矩阵函数 $f(A)$？',
+            a: '$f(A)=\\sum_i f(\\lambda_i)\\mathbf{q}_i\\mathbf{q}_i^T$。例如 $A^{-1}=\\sum_i\\frac{1}{\\lambda_i}\\mathbf{q}_i\\mathbf{q}_i^T$，$A^{1/2}=\\sum_i\\sqrt{\\lambda_i}\\mathbf{q}_i\\mathbf{q}_i^T$（要求 $\\lambda_i\\geq 0$）。',
+          },
+        },
+        {
+          title: '重特征值下的正交对角化',
+          body: '当实对称矩阵有重特征值 $\\lambda_0$（$m_a>1$）时，特征空间 $E_{\\lambda_0}$ 维数也等于 $m_a$（因为实对称矩阵保证 $m_g=m_a$）。\n\n但从特征空间选出的多个特征向量**不一定正交**，需要对它们做 **Gram-Schmidt 正交化**，然后归一化，才能放入 $Q$。\n\n这一步绝对不能跳过，否则 $Q$ 不是正交矩阵！',
+          tip: '**易错**：重特征值时，直接取"任意两个"特征向量放入 $Q$ 而不正交化，导致 $Q^TQ\\neq I$。正交化是强制步骤。',
+        },
+        {
+          title: '小结与易错清单',
+          body: '**实对称矩阵核心结论**：特征值全实、不同特征值的特征向量正交、谱定理 $A=Q\\Lambda Q^T$、$Q^{-1}=Q^T$。\n\n**正交对角化三步**：\n\n1. 求实特征值\n2. 对每个 $\\lambda$ 求特征向量，同一特征值的多个特征向量需 Gram-Schmidt 正交化后归一化\n3. 列入 $Q$，写 $\\Lambda$，验证 $Q^TQ=I$\n\n**与普通对角化的区别**：普通对角化写 $A=P\\Lambda P^{-1}$；对称矩阵特有 $A=Q\\Lambda Q^T$，因为 $Q^{-1}=Q^T$。',
+          tip: '**最常见错误**：重特征值时选了两个向量但没有正交化，导致 $Q$ 不是正交矩阵。还有：对称矩阵的正交对角化是 $Q\\Lambda Q^T$（不是 $Q\\Lambda Q^{-1}$）——虽然等价，但用 $Q^T$ 体现了 $Q^{-1}=Q^T$ 这一特权。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l5-q1',
+          type: 'judge',
+          prompt: '实对称矩阵的特征值一定全是实数。',
+          answer: true,
+          explain: '这是实谱定理的基础性质。证明用共轭内积技巧：$\\lambda\\|\\mathbf{v}\\|^2=\\bar{\\mathbf{v}}^TA\\mathbf{v}=\\bar{\\lambda}\\|\\mathbf{v}\\|^2$，故 $\\lambda=\\bar{\\lambda}$（实数）。旋转矩阵等一般实矩阵可能有复特征值，但对称矩阵不会。',
+        },
+        {
+          id: 'u7-l5-q2',
+          type: 'choice',
+          prompt: '对称矩阵 $A=\\begin{pmatrix}3&1\\\\1&3\\end{pmatrix}$（特征值 $2$ 和 $4$）的正交对角化 $A=Q\\Lambda Q^T$ 中，$Q$ 满足什么条件？',
+          options: [
+            '$Q^TQ=I$（$Q$ 是正交矩阵，列向量两两正交且单位化）',
+            '$Q^2=I$（$Q$ 是对合矩阵）',
+            '$Q=Q^T$（$Q$ 也是对称矩阵）',
+            '$Q=\\Lambda^{-1}$',
+          ],
+          answer: 0,
+          explain: '正交矩阵满足 $Q^TQ=QQ^T=I$，即 $Q^{-1}=Q^T$。这比普通对角化省去了求逆的麻烦——对称矩阵"赠送"了一个正交变换矩阵。',
+        },
+        {
+          id: 'u7-l5-q3',
+          type: 'input',
+          prompt: '$A=\\begin{pmatrix}3&1\\\\1&3\\end{pmatrix}$，其特征值为 $\\lambda_1=2$ 和 $\\lambda_2=4$。$\\det(A)$ 等于多少？（填整数）',
+          accept: ['8'],
+          placeholder: '填整数',
+          explain: '$\\det(A)=\\lambda_1\\times\\lambda_2=2\\times 4=8$。也可直接算：$3\\times 3-1\\times 1=9-1=8$。两者一致。✓',
+        },
+        {
+          id: 'u7-l5-q4',
+          type: 'judge',
+          prompt: '若实对称矩阵 $A$ 的两个特征值 $\\lambda_1\\neq\\lambda_2$，则对应特征向量 $\\mathbf{v}_1$ 与 $\\mathbf{v}_2$ 必然正交。',
+          answer: true,
+          explain: '计算 $\\lambda_1\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle=\\langle A\\mathbf{v}_1,\\mathbf{v}_2\\rangle=\\mathbf{v}_1^TA^T\\mathbf{v}_2=\\mathbf{v}_1^TA\\mathbf{v}_2=\\lambda_2\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle$，因 $\\lambda_1\\neq\\lambda_2$，故内积为零，即正交。这是实对称矩阵的第二个核心性质。',
+        },
+        {
+          id: 'u7-l5-q5',
+          type: 'choice',
+          prompt: '实对称矩阵有重特征值 $\\lambda_0$（$m_a=2$），在对应的 $2$ 维特征空间中选出两个基向量 $\\mathbf{u}_1, \\mathbf{u}_2$。要保证 $Q$ 是正交矩阵，必须：',
+          options: [
+            '用 Gram-Schmidt 正交化 $\\mathbf{u}_1, \\mathbf{u}_2$，再归一化',
+            '直接归一化 $\\mathbf{u}_1, \\mathbf{u}_2$ 即可',
+            '取 $\\mathbf{u}_1+\\mathbf{u}_2$ 和 $\\mathbf{u}_1-\\mathbf{u}_2$',
+            '任选一个向量，另一个取零向量',
+          ],
+          answer: 0,
+          explain: '同一特征值的特征向量不一定正交（任取的两个特征向量可能有非零内积）。必须先用 Gram-Schmidt 方法，令 $\\mathbf{q}_1=\\mathbf{u}_1/\\|\\mathbf{u}_1\\|$，$\\mathbf{q}_2=(\\mathbf{u}_2-\\langle\\mathbf{u}_2,\\mathbf{q}_1\\rangle\\mathbf{q}_1)/\\|\\cdot\\|$，再归一化，才能保证 $Q^TQ=I$。',
+        },
+        {
+          id: 'u7-l5-q6',
+          type: 'input',
+          prompt: '对称矩阵 $A$ 的谱分解为 $A=2\\mathbf{q}_1\\mathbf{q}_1^T+4\\mathbf{q}_2\\mathbf{q}_2^T$，$\\mathbf{q}_1,\\mathbf{q}_2$ 是单位正交向量。$\\operatorname{tr}(A)$ 等于多少？（填整数）',
+          accept: ['6'],
+          placeholder: '填整数',
+          explain: '$\\operatorname{tr}(A)=\\sum_i\\lambda_i=2+4=6$。也可用 $\\operatorname{tr}(A)=\\operatorname{tr}(Q\\Lambda Q^T)=\\operatorname{tr}(\\Lambda)=2+4=6$（迹的循环不变性：$\\operatorname{tr}(Q\\Lambda Q^T)=\\operatorname{tr}(Q^TQ\\Lambda)=\\operatorname{tr}(\\Lambda)$）。',
+        },
+        {
+          id: 'u7-l5-q7',
+          type: 'judge',
+          prompt: '任意实矩阵都可以被正交对角化。',
+          answer: false,
+          explain: '正交对角化（$A=Q\\Lambda Q^T$，$Q$ 正交）只对**实对称矩阵**（以及实正规矩阵）成立。一般实矩阵可能有复特征值，或者特征向量不两两正交，无法实现正交对角化。例如旋转矩阵特征值为 $\\pm i$，无实特征向量。',
+        },
+        {
+          id: 'u7-l5-q8',
+          type: 'match',
+          prompt: '将实对称矩阵谱定理相关概念与描述配对：',
+          left: [
+            '$A=Q\\Lambda Q^T$',
+            '$Q^TQ=I$',
+            '$A=\\sum_i\\lambda_i\\mathbf{q}_i\\mathbf{q}_i^T$',
+            '不同特征值特征向量正交',
+          ],
+          right: [
+            '利用 $\\lambda_1\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle=\\lambda_2\\langle\\mathbf{v}_1,\\mathbf{v}_2\\rangle$ 推出',
+            '谱分解（秩 1 投影叠加）',
+            '正交矩阵，$Q^{-1}=Q^T$',
+            '正交对角化（谱定理）',
+          ],
+        },
+        {
+          id: 'u7-l5-q9',
+          type: 'judge',
+          prompt: 'Rayleigh 商 $R_A(\\mathbf{x})=\\mathbf{x}^TA\\mathbf{x}/\\|\\mathbf{x}\\|^2$ 的最大值等于实对称矩阵 $A$ 的最大特征值 $\\lambda_{\\max}$。',
+          answer: true,
+          explain: '令 $\\mathbf{y}=Q^T\\mathbf{x}$（$Q$ 是正交对角化矩阵），则 $R_A(\\mathbf{x})=\\mathbf{y}^T\\Lambda\\mathbf{y}/\\|\\mathbf{y}\\|^2=\\sum_i\\lambda_i y_i^2/\\sum_i y_i^2$。这是 $\\lambda_i$ 的加权平均，权重 $y_i^2\\geq 0$ 且归一化。最大值在 $y_k=1$（其余为 $0$，$\\lambda_k=\\lambda_{\\max}$）时取到，对应 $\\mathbf{x}=\\mathbf{q}_n$。',
+        },
+      ],
+    },
+
+    // =====================================================================
+    // u7-l6  正定性
+    // =====================================================================
+    {
+      id: 'u7-l6',
+      title: '正定性',
+      subtitle: '"碗形"二次型与优化中的核心工具',
+      intro: [
+        {
+          title: '正定矩阵的定义与直觉',
+          body: '实对称矩阵 $A$ 是**正定矩阵**（记 $A\\succ 0$），若对所有非零向量 $\\mathbf{x}$：\n\n$\\mathbf{x}^TA\\mathbf{x}>0$\n\n几何上，函数 $f(\\mathbf{x})=\\mathbf{x}^TA\\mathbf{x}$ 是朝上的"碗形"曲面，原点是唯一最低点，向任何方向移动都会使函数值增大。\n\n这正是二元函数 $f(x,y)=ax^2+bxy+cy^2$ 恒正的高维推广，是判断极小值的关键工具。',
+          formula: 'A\\succ 0 \\iff \\mathbf{x}^TA\\mathbf{x}>0 \\text{ 对所有 }\\mathbf{x}\\neq\\mathbf{0}',
+          tip: '半正定（$A\\succeq 0$）：允许 $\\mathbf{x}^TA\\mathbf{x}=0$；不定：有些方向正、有些方向负（鞍点）；负定：所有方向为负。',
+        },
+        {
+          title: '正定的等价条件',
+          body: '对实对称矩阵 $A$，以下四个条件等价（任选其一判断）：\n\n**条件 1（定义）**：$\\mathbf{x}^TA\\mathbf{x}>0$ 对所有 $\\mathbf{x}\\neq\\mathbf{0}$\n\n**条件 2（特征值）**：所有特征值 $\\lambda_i>0$\n\n**条件 3（Sylvester 准则）**：所有顺序主子式均正：$a_{11}>0$，$\\det\\begin{pmatrix}a_{11}&a_{12}\\\\a_{21}&a_{22}\\end{pmatrix}>0$，……，$\\det(A)>0$\n\n**条件 4（Cholesky 分解）**：存在下三角矩阵 $L$（对角元正），使 $A=LL^T$',
+          tip: '实际判断优先级：**特征值法**（最直接）；**顺序主子式**（手算友好，适合 $3\\times 3$）；**Cholesky 分解**（程序中最常用，失败即非正定）。',
+        },
+        {
+          title: '正定的直观理解——谱定理视角',
+          body: '利用谱定理 $A=Q\\Lambda Q^T$，令 $\\mathbf{y}=Q^T\\mathbf{x}$（$\\mathbf{y}\\neq\\mathbf{0}$ 当且仅当 $\\mathbf{x}\\neq\\mathbf{0}$），则：\n\n$\\mathbf{x}^TA\\mathbf{x}=\\mathbf{y}^T\\Lambda\\mathbf{y}=\\sum_{i=1}^n\\lambda_i y_i^2$\n\n因此 $\\mathbf{x}^TA\\mathbf{x}>0$ 对所有 $\\mathbf{x}\\neq\\mathbf{0}$，等价于所有 $\\lambda_i>0$（因为 $y_i^2\\geq 0$，只要有 $\\lambda_i\\leq 0$ 则取对应方向 $y_i=1$ 时结果非正）。',
+          reveal: {
+            q: '若 $A\\succ 0$，$A^{-1}$ 也是正定矩阵吗？',
+            a: '是的。$A$ 的特征值全为正数 $\\lambda_i>0$，$A^{-1}$ 的特征值为 $1/\\lambda_i>0$（也全正），故 $A^{-1}\\succ 0$。也可验证：$(A^{-1})^T=A^{-1}$（正定矩阵可逆，逆也是对称的），故 $A^{-1}$ 是实对称正定矩阵。',
+          },
+        },
+        {
+          title: '正定矩阵的具体例子',
+          body: '**例 1（正定）**：$A=\\begin{pmatrix}2&1\\\\1&2\\end{pmatrix}$。特征值 $\\lambda_1=1>0$，$\\lambda_2=3>0$，正定。顺序主子式：$2>0$，$\\det=3>0$，正定。✓\n\n**例 2（半正定，非正定）**：$B=\\begin{pmatrix}4&-2\\\\-2&1\\end{pmatrix}$。$\\det(B)=0$，特征值 $\\lambda_1=0,\\lambda_2=5$，**半正定**（$\\lambda_1=0$，取对应特征向量使 $\\mathbf{x}^TB\\mathbf{x}=0$）。\n\n**例 3（不定）**：$C=\\begin{pmatrix}1&2\\\\2&1\\end{pmatrix}$。$\\det(C)=-3<0$，特征值 $\\lambda_1=-1<0,\\lambda_2=3>0$，**不定**（鞍点）。',
+        },
+        {
+          title: 'Hessian 矩阵与优化',
+          body: '神经网络损失函数 $\\mathcal{L}(\\theta)$ 在临界点（$\\nabla\\mathcal{L}=0$）处，局部行为由 **Hessian 矩阵** $H$ 决定：\n\n$\\mathcal{L}(\\theta_0+\\Delta\\theta)-\\mathcal{L}(\\theta_0)\\approx\\frac{1}{2}\\Delta\\theta^TH\\Delta\\theta$\n\n由谱定理，$H$ 是实对称矩阵，其特征值决定临界点类型：\n\n- $H\\succ 0$（特征值全正）：**局部极小值**（碗形）\n- $H\\prec 0$（特征值全负）：**局部极大值**（倒碗形）\n- 特征值有正有负：**鞍点**（马鞍面）',
+          tip: '梯度下降的最优学习率 $\\eta^*=\\frac{2}{\\lambda_{\\min}+\\lambda_{\\max}}$，最坏收敛率 $\\rho^*=\\frac{\\kappa-1}{\\kappa+1}$，其中条件数 $\\kappa=\\lambda_{\\max}/\\lambda_{\\min}$。$\\kappa$ 越大（扁椭圆碗），收敛越慢。',
+        },
+        {
+          title: 'Rayleigh 商与特征值的变分刻画',
+          body: '对实对称矩阵 $A$，**Rayleigh 商** $R_A(\\mathbf{x})=\\frac{\\mathbf{x}^TA\\mathbf{x}}{\\|\\mathbf{x}\\|^2}$ 的极值恰好是最小/最大特征值：\n\n$\\lambda_{\\min}=\\min_{\\mathbf{x}\\neq\\mathbf{0}}R_A(\\mathbf{x})$，$\\lambda_{\\max}=\\max_{\\mathbf{x}\\neq\\mathbf{0}}R_A(\\mathbf{x})$\n\n**条件数** $\\kappa(A)=\\lambda_{\\max}/\\lambda_{\\min}$（$A\\succ 0$）：衡量矩阵"各向异性"程度。$\\kappa=1$ 为最优（圆形碗），$\\kappa\\gg 1$ 时梯度下降沿"扁椭圆碗"极慢收敛。',
+          formula: '\\lambda_{\\min} = \\min_{\\mathbf{x}\\neq\\mathbf{0}} R_A(\\mathbf{x}), \\quad \\lambda_{\\max} = \\max_{\\mathbf{x}\\neq\\mathbf{0}} R_A(\\mathbf{x})',
+        },
+        {
+          title: 'Gram 矩阵与协方差矩阵',
+          body: '设 $B\\in\\mathbb{R}^{m\\times n}$，令 $A=B^TB\\in\\mathbb{R}^{n\\times n}$，则 $A$ 必为**半正定矩阵**：\n\n$\\mathbf{x}^T(B^TB)\\mathbf{x}=(B\\mathbf{x})^T(B\\mathbf{x})=\\|B\\mathbf{x}\\|^2\\geq 0$\n\n且 $A$ 正定当且仅当 $B$ 列满秩（$\\ker(B)=\\{\\mathbf{0}\\}$）。\n\n**协方差矩阵** $\\Sigma=\\frac{1}{n-1}X^TX$（$X$ 为中心化数据矩阵）总是半正定的；样本数大于特征数且无线性相关时为正定。PCA 的主成分就是 $\\Sigma$ 的最大特征向量。',
+          reveal: {
+            q: '协方差矩阵 $\\Sigma$ 的特征值有什么实际含义？',
+            a: '特征值 $\\lambda_i$ 等于数据在第 $i$ 主成分方向（对应特征向量 $\\mathbf{q}_i$）上的**方差**。最大特征值对应方差最大的方向（PCA 第一主成分），方差解释率 $=\\lambda_i/\\sum_j\\lambda_j$。',
+          },
+        },
+        {
+          title: '小结与易错清单',
+          body: '**正定性核心结论**：$A\\succ 0\\iff$ 特征值全正 $\\iff$ 顺序主子式全正 $\\iff$ 存在 Cholesky 分解 $LL^T$。\n\n**Hessian 应用**：临界点类型由 $H$ 的谱决定；条件数 $\\kappa$ 决定梯度下降速度；Adam/AdaGrad 隐式降低有效条件数。',
+          tip: '**易错 1**：有零特征值的矩阵是**半正定**，不是正定。**易错 2**：顺序主子式（$1\\times 1,2\\times 2,\\ldots,n\\times n$）只需检验左上角子矩阵，不用检验所有子矩阵（那是半正定的条件，更复杂）。**易错 3**：$B^TB$ 是半正定的（允许零特征值），$B^TB$ 正定需要 $B$ 列满秩。',
+        },
+      ],
+      questions: [
+        {
+          id: 'u7-l6-q1',
+          type: 'choice',
+          prompt: '判断矩阵 $A=\\begin{pmatrix}2&1\\\\1&2\\end{pmatrix}$ 是否正定。',
+          options: [
+            '正定：$\\lambda_1=1>0$ 且 $\\lambda_2=3>0$',
+            '半正定：有零特征值',
+            '不定：特征值有正有负',
+            '负定：特征值全为负',
+          ],
+          answer: 0,
+          explain: '$\\operatorname{tr}=4$，$\\det=3$，特征多项式 $\\lambda^2-4\\lambda+3=(\\lambda-1)(\\lambda-3)=0$，特征值 $\\lambda_1=1>0$，$\\lambda_2=3>0$。所有特征值为正，$A$ **正定**。顺序主子式验证：$a_{11}=2>0$，$\\det(A)=3>0$。✓',
+        },
+        {
+          id: 'u7-l6-q2',
+          type: 'choice',
+          prompt: '$A=\\begin{pmatrix}4&-2\\\\-2&1\\end{pmatrix}$，$\\det(A)=0$，特征值 $\\lambda_1=0$ 和 $\\lambda_2=5$。$A$ 属于哪种类型？',
+          options: [
+            '半正定（有零特征值，非正定）',
+            '正定',
+            '不定',
+            '负定',
+          ],
+          answer: 0,
+          explain: '特征值 $\\lambda_1=0\\geq 0$，$\\lambda_2=5>0$，所有特征值非负，故 $A\\succeq 0$（半正定）。但 $\\lambda_1=0$，有非零向量使 $\\mathbf{x}^TA\\mathbf{x}=0$，故**不是正定**。$\\lambda_1=0$ 也说明 $\\det(A)=0$，即 $A$ 奇异。',
+        },
+        {
+          id: 'u7-l6-q3',
+          type: 'input',
+          prompt: '正定矩阵 $A$ 特征值为 $\\lambda_1=1$ 和 $\\lambda_2=9$，条件数 $\\kappa=\\lambda_{\\max}/\\lambda_{\\min}$ 等于多少？（填整数）',
+          accept: ['9'],
+          placeholder: '填整数',
+          explain: '$\\kappa=\\lambda_{\\max}/\\lambda_{\\min}=9/1=9$。条件数衡量"各方向曲率差距"：$\\kappa=1$ 意味各向同性（球形碗），$\\kappa=9$ 意味最陡方向比最缓方向陡 $9$ 倍，梯度下降沿"扁椭圆碗"收敛较慢。',
+        },
+        {
+          id: 'u7-l6-q4',
+          type: 'judge',
+          prompt: '矩阵 $C=\\begin{pmatrix}1&2\\\\2&1\\end{pmatrix}$ 是正定矩阵。',
+          answer: false,
+          explain: '$\\det(C)=1-4=-3<0$（顺序主子式不全正），特征多项式 $\\lambda^2-2\\lambda-3=(\\lambda-3)(\\lambda+1)=0$，特征值 $\\lambda_1=3>0$ 和 $\\lambda_2=-1<0$。有负特征值，$C$ **不定**（鞍点方向），不是正定矩阵。',
+        },
+        {
+          id: 'u7-l6-q5',
+          type: 'choice',
+          prompt: '神经网络损失函数在临界点处 Hessian 矩阵的特征值为 $2,3,5$（全正）。该临界点是：',
+          options: [
+            '局部极小值（碗形，$H\\succ 0$）',
+            '局部极大值（倒碗形，$H\\prec 0$）',
+            '鞍点（特征值有正有负）',
+            '无法判断',
+          ],
+          answer: 0,
+          explain: 'Hessian 特征值全正意味 $H\\succ 0$，二次型 $\\Delta\\theta^TH\\Delta\\theta>0$ 对所有非零 $\\Delta\\theta$，即向任何方向移动损失都增加，临界点是**局部极小值**。',
+        },
+        {
+          id: 'u7-l6-q6',
+          type: 'judge',
+          prompt: '对任意矩阵 $B$，$B^TB$ 一定是半正定矩阵。',
+          answer: true,
+          explain: '$\\mathbf{x}^T(B^TB)\\mathbf{x}=(B\\mathbf{x})^T(B\\mathbf{x})=\\|B\\mathbf{x}\\|^2\\geq 0$ 对所有 $\\mathbf{x}$ 成立。这说明 $B^TB$ 是半正定的（Gram 矩阵的基本性质）。$B^TB$ 正定当且仅当 $B$ 列满秩（即 $B\\mathbf{x}=\\mathbf{0}\\Rightarrow\\mathbf{x}=\\mathbf{0}$）。',
+        },
+        {
+          id: 'u7-l6-q7',
+          type: 'match',
+          prompt: '将矩阵性质与对应结论配对：',
+          left: [
+            '所有特征值 $>0$',
+            '所有特征值 $\\geq 0$',
+            '特征值有正有负',
+            '$A=Q\\Lambda Q^T$，$Q^TQ=I$',
+          ],
+          right: [
+            '正交对角化（谱定理）',
+            '不定矩阵，有鞍点',
+            '正定矩阵 $A\\succ 0$',
+            '半正定矩阵 $A\\succeq 0$',
+          ],
+        },
+        {
+          id: 'u7-l6-q8',
+          type: 'choice',
+          prompt: '协方差矩阵 $\\Sigma=\\begin{pmatrix}3&1\\\\1&3\\end{pmatrix}$（特征值 $2$ 和 $4$）。PCA 第一主成分方向（方差最大方向）对应的特征值是多少？',
+          options: [
+            '$\\lambda=4$（最大特征值）',
+            '$\\lambda=2$（最小特征值）',
+            '$\\lambda=3$（迹的一半）',
+            '$\\lambda=6$（迹）',
+          ],
+          answer: 0,
+          explain: 'PCA 第一主成分是数据方差最大的方向，对应 Rayleigh 商的最大值，即 $\\Sigma$ 的**最大特征值** $\\lambda_2=4$，对应的特征向量 $\\mathbf{q}_2=(1,1)^T/\\sqrt{2}$ 是第一主成分方向。方差解释率 $=4/(2+4)\\approx 66.7\\%$。',
+        },
+        {
+          id: 'u7-l6-q9',
+          type: 'judge',
+          prompt: '若正定矩阵 $A\\succ 0$，则 $\\operatorname{tr}(A)>0$ 且 $\\det(A)>0$。',
+          answer: true,
+          explain: '$\\operatorname{tr}(A)=\\sum\\lambda_i$，若所有 $\\lambda_i>0$ 则 $\\operatorname{tr}(A)>0$。$\\det(A)=\\prod\\lambda_i$，若所有 $\\lambda_i>0$ 则 $\\det(A)>0$。这两个条件都是正定的必要条件（但不充分，还需所有顺序主子式正才是完整的充要条件）。',
+        },
+      ],
+    },
+  ],
+}

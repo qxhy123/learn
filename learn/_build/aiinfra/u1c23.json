@@ -1,0 +1,120 @@
+[
+  {
+    "id": "u1c23",
+    "title": "RDMA、RoCE/IB 与 GPUDirect：三层导览",
+    "subtitle": "明确 RDMA verbs、网络 fabric、GPU 直连三者的责任边界",
+    "intro": [
+      {
+        "title": "为什么要区分三个层次",
+        "body": "AI Infra 里经常把 RDMA、RoCE/InfiniBand、GPUDirect RDMA 混为一谈，导致排障时层次不清。实际上三者解决的是**完全不同的问题**，必须先分清再合并看。\n\n- **RDMA**：应用如何把内存、安全权限和异步队列交给 NIC\n- **RoCE / InfiniBand**：RDMA packet 在什么网络 fabric 上传输\n- **GPUDirect RDMA**：RDMA 访问的内存从 host DRAM 扩展到 GPU HBM",
+        "tip": "排障时先问\"是哪一层的问题\"，不要把 verbs 错误和 fabric 配置问题混在一起追查。"
+      },
+      {
+        "title": "RDMA：让 NIC 直接读写注册内存",
+        "body": "普通 socket 里，应用把 bytes 交给内核，内核协议栈负责发送和接收。RDMA 的思路不同：应用先把内存注册给 NIC，拿到访问 key，然后把\"读哪里、写哪里、完成后怎么通知\"提交给 NIC。NIC 通过 DMA 执行数据搬运，**CPU 不再逐包处理 payload**。\n\nRDMA 关键词：`MR`（Memory Region）、`lkey/rkey`、`QP`（Queue Pair）、`CQ`（Completion Queue）、`WR/WC`（Work Request/Completion）、`Send/Recv`、`RDMA Write`、`RDMA Read`、`Atomic`。",
+        "reveal": {
+          "q": "RDMA 的 zero-copy 是否意味着整个通信路径完全没有数据拷贝？",
+          "a": "不是。zero-copy 指 payload 不需要经过内核 socket buffer；但应用层序列化、GPU staging、框架 buffer 拼接等仍可能产生额外拷贝。"
+        }
+      },
+      {
+        "title": "RoCE 与 InfiniBand：packet 跑在哪种 fabric 上",
+        "body": "RoCE 和 IB 不是另一套 RDMA API，而是**RDMA packet 的承载网络**。\n\n| 维度 | InfiniBand | RoCE v2 |\n|---|---|---|\n| 承载 | IB 专用链路/fabric | UDP/IP over Ethernet |\n| 寻址 | LID、GID | IP、GID/GID index |\n| 管理平面 | Subnet Manager (SM) | Linux netdev、IP route |\n| 拥塞控制 | IB credit、VL/SL | PFC、ECN、CNP、DCQCN |\n| 常见排障 | SM、LID、PKey、link width | GID index、MTU、DSCP、PFC/ECN |\n\nRoCE v2 把 RDMA 封装在 UDP/IP 上，能经过 L3 路由，更贴近现有以太网生态；代价是需要正确配置 PFC/ECN 才能达到近无损。"
+      },
+      {
+        "title": "GPUDirect RDMA：让 RDMA 访问 GPU 显存",
+        "body": "没有 GPUDirect RDMA 时，跨节点 GPU 通信需要 host staging：\n\n`GPU HBM → host pinned memory → NIC → network → peer NIC → host pinned memory → peer GPU HBM`\n\n启用 GPUDirect RDMA 后，理想路径变成：\n\n`GPU HBM ↔ NIC RDMA engine ↔ network ↔ peer NIC ↔ peer GPU HBM`\n\nGPUDirect RDMA 的关键词：`nvidia_peermem`、BAR/BAR1、PCIe P2P、IOMMU/ACS/ATS、GPU/NIC locality、CUDA buffer、NCCL/UCX/MPI fallback。\n\n**任何一层不成立，通信库仍可能接受 CUDA pointer，但实际退回 host staging 或 socket fallback。**",
+        "tip": "CUDA-aware NCCL 说明库能接受 CUDA pointer，不保证最终一定走 GPUDirect RDMA。"
+      },
+      {
+        "title": "三层责任边界：如何判断问题在哪里",
+        "body": "遇到通信问题时，按三层顺序提问：\n\n**第一层 — verbs 层是否正确**\n- MR、QP、CQ、access flag、rkey、WR/WC 是否合理？\n- 是否出现 `IBV_WC_RETRY_EXC_ERR`、`RNR_RETRY_EXC_ERR`、`REM_ACCESS_ERR`？\n\n**第二层 — fabric 层是否健康**\n- RoCE/IB 的 MTU、GID/LID、PFC、ECN、PKey、SM、端口 counter 是否合理？\n- 用 `ib_write_bw` 做基础链路验证\n\n**第三层 — GPU direct 层是否成立**\n- GPU/NIC topology、`nvidia_peermem`、容器设备、GDRDMA 日志和 CUDA buffer benchmark 是否合理？\n- `ib_write_bw --use_cuda` 是否成功？"
+      },
+      {
+        "title": "与相邻章节的关联",
+        "body": "这三个概念不是孤立的，它们和系统其他层深度依赖：\n\n- **PCIe/NUMA/DMA**（前置知识）：GPUDirect RDMA 中 NIC 直接访问 GPU memory，受 PCIe 拓扑、IOMMU、ACS 策略影响\n- **NIC queue/offload**（第 22 关）：RDMA 绕过部分内核路径，但 NIC 硬件 counter、IRQ 仍是排障入口\n- **NCCL**（第 27 关）：NCCL 的 `NET/IB`、GDRDMA、HCA/GID 选择都依赖本章的三层基础\n\n学习路径建议：先掌握 RDMA verbs 队列和内存模型（下一关），再理解 RoCE/IB fabric 无损与拥塞（第 25 关），最后把 GPU memory、NIC、容器权限串起来（第 26 关）。",
+        "tip": "排障时不要只问 NCCL 日志，要先定位是 verbs 层、fabric 层还是 GPU direct 层，再针对性地收证据。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "match",
+        "prompt": "将概念与其解决的核心问题配对：",
+        "left": ["RDMA", "RoCE v2", "GPUDirect RDMA", "InfiniBand"],
+        "right": [
+          "NIC 如何直接访问注册内存，绕过内核协议栈",
+          "RDMA 访问的内存扩展到 GPU HBM，避免 host staging",
+          "RDMA packet 封装在 UDP/IP 上，经以太网 L3 路由传输",
+          "专用 fabric 承载 RDMA，由 Subnet Manager 管理 LID 和路由"
+        ],
+        "explain": "RDMA 是机制，RoCE v2 和 InfiniBand 是 fabric 选择，GPUDirect RDMA 是 RDMA 访问 GPU memory 的扩展。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RoCE v2 相比 RoCE v1 最主要的改进是什么？",
+        "options": [
+          "支持更高带宽的链路",
+          "把 RDMA 封装在 UDP/IP 上，可以经过 L3 路由",
+          "取消了对 PFC 的依赖",
+          "使用 InfiniBand 的 Subnet Manager 管理"
+        ],
+        "answer": 1,
+        "explain": "RoCE v1 是 L2 以太网封装，只能在同一广播域；RoCE v2 封装在 UDP/IP 中，支持 L3 路由，可用于 spine-leaf 以太网。"
+      },
+      {
+        "type": "judge",
+        "prompt": "CUDA-aware NCCL 能接受 CUDA device pointer，这意味着跨节点通信一定走 GPUDirect RDMA。",
+        "answer": false,
+        "explain": "CUDA-aware 只说明库 API 层接受 CUDA pointer；实际是否走 GPUDirect RDMA 取决于 nvidia_peermem、HCA/GPU 拓扑、容器权限等多层条件，失败时会 fallback 到 host staging 或 socket。"
+      },
+      {
+        "type": "choice",
+        "prompt": "出现 `IBV_WC_RETRY_EXC_ERR` 时，应该优先从哪一层入手排查？",
+        "options": [
+          "第三层：检查 nvidia_peermem 是否加载",
+          "第一层：检查 MR、QP 参数、路径连通性和 fabric counter",
+          "直接重启 NIC 驱动",
+          "检查 CUDA driver 版本"
+        ],
+        "answer": 1,
+        "explain": "`IBV_WC_RETRY_EXC_ERR` 是 verbs 层错误，说明 RC QP 重试耗尽，优先查 QP 参数、路径 MTU、PSN、fabric drop/PFC/ECN，再向其他层延伸。"
+      },
+      {
+        "type": "choice",
+        "prompt": "InfiniBand 集群中，哪个组件负责分配 LID（Local Identifier）并维护路由表？",
+        "options": [
+          "CUDA driver",
+          "libibverbs",
+          "Subnet Manager (SM)",
+          "NCCL bootstrap"
+        ],
+        "answer": 2,
+        "explain": "InfiniBand 中，Subnet Manager 负责发现拓扑、分配 LID、建立转发表，没有 SM 或 SM 不稳定会导致 LID/路由异常。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPUDirect RDMA 启用后，NIC 直接写 GPU memory 等价于 GPU kernel 立刻看到最新数据，无需额外同步。",
+        "answer": false,
+        "explain": "NIC 写 GPU memory 不自动等价于 GPU kernel 的内存可见性；通信库仍需要 CUDA stream、event 或 memory ordering 保证 kernel 能正确看到数据。"
+      },
+      {
+        "type": "input",
+        "prompt": "验证基础 RDMA Write 带宽的命令工具名称是什么（填写工具名）？",
+        "accept": ["ib_write_bw"],
+        "explain": "`ib_write_bw` 是 perftest 套件中专门测试 RDMA Write 带宽的工具，配合 `--use_cuda` 参数可验证 GPUDirect RDMA 路径。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项是 RDMA zero-copy 准确覆盖的范围？",
+        "options": [
+          "所有数据传输完全没有任何内存拷贝",
+          "payload 不需要经过内核 socket buffer，由 NIC DMA 直接访问注册内存",
+          "GPU tensor 到网络的全程无拷贝",
+          "应用序列化过程也不产生拷贝"
+        ],
+        "answer": 1,
+        "explain": "RDMA zero-copy 准确含义是 payload 不需要先复制到内核 socket buffer；应用层序列化、GPU staging 等环节仍可能产生额外拷贝。"
+      }
+    ]
+  }
+]

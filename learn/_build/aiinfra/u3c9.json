@@ -1,0 +1,126 @@
+[
+  {
+    "id": "u3c9",
+    "title": "RDMA、Collective 与集群拓扑",
+    "subtitle": "多节点训练：通信图必须映射到物理图",
+    "intro": [
+      {
+        "title": "跨节点通信不是\"更快的 socket\"",
+        "body": "多节点训练把单次 step 的完成条件变成：**所有 rank 都完成通信**。只要某条路径慢、某个 rank 被放错位置、某个端口出现拥塞，整轮 collective 就会被最慢的一段拖住。\n\n训练通信有两个关键特征：\n1. **同步性强**：所有 rank 必须进入同一轮操作，慢 rank 拖住快 rank\n2. **通信频率高**：数据并行每 step 同步梯度；FSDP/ZeRO 可能每层前后都有 `AllGather`/`ReduceScatter`\n\n对比可以说明问题：一个 256 GPU 作业里，只有一条 leaf 上联拥塞，也可能让全作业吞吐下降；一台节点的 NIC 固件异常，也可能表现为所有 rank 在 `ncclAllReduce` 处等待。网络不是「机器之间能 ping 通」，而是训练主路径的一部分。"
+      },
+      {
+        "title": "RDMA、InfiniBand、RoCE、TCP 的边界",
+        "body": "`RDMA`（Remote Direct Memory Access）是能力：NIC 直接读写远端注册内存，绕过 CPU 拷贝和内核协议栈。`GPUDirect RDMA` 进一步让 NIC 直接访问 GPU memory，避免先拷到 host DRAM。\n\n**三种主流协议**的边界：\n\n| 协议 | 特点 | 适合 | 不适合 |\n|------|-----|------|------|\n| `InfiniBand` | RDMA 原生，低延迟，拥塞控制和诊断工具完整 | 大规模强同步训练 | 成本极敏感、无 IB 运维经验 |\n| `RoCE v2` | 以太网承载 RDMA，生态广、成本低 | 愿意投入 lossless 网络治理的集群 | 无法统一 PFC/ECN/QoS 配置 |\n| TCP | 通用可靠，运维门槛低 | 小规模、控制面、非主路径通信 | 大规模 AllReduce 主路径 |\n\nRoCE 的典型难点：低负载时正常，高并发时不稳。核心要求端到端配置一致：`PFC`（防丢包 pause）、`ECN`（拥塞前标记降速）、`DCQCN`（拥塞控制）、`QoS/DSCP`（优先级区分）、`MTU`（端到端一致）。任何一跳配错都会让大并发训练 timeout。",
+        "tip": "RoCE 的失败模式不是「完全不通」，而是「跑得起来但一到大 job 就抖」。没有交换机队列、PFC pause、ECN mark 的观测，很难靠应用日志定位。"
+      },
+      {
+        "title": "NCCL Collective 的数据路径",
+        "body": "NCCL 给框架提供 collective API，底层根据拓扑和消息大小选择算法：\n\n| Collective | 输入/输出 | 训练场景 |\n|-----------|---------|--------|\n| `AllReduce` | 每 rank 一份输入 → 所有 rank 得到 reduce 结果 | DDP 梯度同步 |\n| `ReduceScatter` | 每 rank 输入完整数据 → reduce 后每 rank 拿一片 | ZeRO/FSDP 梯度分片 |\n| `AllGather` | 每 rank 有一片 → 所有 rank 收集完整数据 | FSDP 参数重建、TP |\n| `Broadcast` | 一个 rank 发 → 其他 rank 收 | 初始化参数 |\n| `Send/Recv` | rank 间点对点 | Pipeline Parallel stage 通信 |\n\n**重要**：`AllReduce = ReduceScatter + AllGather`。现代框架把梯度、参数和 optimizer state 做分片，你看到的不是一次「全员求和」，而是一系列分片数据在 rank 之间重新分布。\n\nNVLink/NVSwitch 域内的 GPU 先做节点内 local reduce，每节点选代表数据通过 NIC 跨节点交换，远端返回后节点内再 all-gather。GDR 路径（NIC 直读 GPU memory）是理想路径；若不可用，退化为先 H2D 到 host DRAM 再 RDMA 的 host staging 路径。"
+      },
+      {
+        "title": "Rank Placement：把通信图放进物理图",
+        "body": "rank placement 的核心：哪些 rank 之间通信最频繁，应该放得最近。\n\n| 并行策略 | 高频通信 | 放置优先级 | 错放后表现 |\n|---------|---------|----------|----------|\n| Tensor Parallel | 每层 activation/partial result | 同一 NVSwitch 域优先 | 每层同步变慢，step time 明显上升 |\n| Pipeline Parallel | 相邻 stage activation | 相邻 stage 同节点或同 pod | pipeline bubble，stage 等待 |\n| Data Parallel | 每 step 梯度 collective | 跨节点可接受，但 rail 均衡 | AllReduce 时间升高，扩展效率下降 |\n| FSDP/ZeRO | 参数 AllGather、梯度 ReduceScatter | shard group 尽量局部 | 通信抖动，显存峰值与等待叠加 |\n\n**调度器至少要知道**：GPU 所属 NVSwitch 域、GPU 到 NIC locality、PCIe root/NUMA、NIC 端口速率与健康、Leaf/pod/rail 编号。只用 `gpu: 64` 无法区分「同一 pod 内 8 台完整 HGX」和「散落在 4 个 pod、端口降速、rail 不齐的 64 张卡」。"
+      },
+      {
+        "title": "三类集群拓扑的边界",
+        "body": "**Fat-tree / Clos**：追求任意节点间等价路径和均匀带宽。适合多租户训练。关键问题是 oversubscription：1:1 non-blocking 最理想但最贵；2:1、3:1 时多个大作业跨 pod 会互相影响。\n\n**Rail-optimized**：相同编号 NIC 接同一条 rail（如所有节点 NIC0 进 rail0）。NCCL 多 rail 并行更可控，GPU-NIC 对齐清晰。**风险**：rank 编号、容器设备、HCA 命名、NCCL 选择和物理布线有一处错位，性能下降可能很大且不直接报错。\n\n**DragonFly+**：group 内高带宽 + group 间 global links，支持更大规模。global links 是稀缺资源，作业碎片化到多个 group 会争抢全局链路。应让单个大 job 留在同 group；若必须跨 group，把低频 DP 边界放跨 group，不要把高频 TP/EP 的 all-to-all 放过去。",
+        "reveal": {
+          "q": "64 卡训练从 8 卡扩上来后只有 4.5 倍吞吐，NCCL 日志显示只使用了部分 HCA，网络遥测显示 rail0 接近线速而 rail1-7 利用率很低。根因是什么？",
+          "a": "容器只暴露了部分 RDMA device，或 NCCL_IB_HCA 配置写死了少数 HCA，导致所有跨节点流量走同一条 rail。修复方法：按节点设备拓扑暴露全部 RDMA device，调度器记录 GPU→NIC→rail 映射，作业启动前自动跑 all_reduce_perf。"
+        }
+      },
+      {
+        "title": "Pre-flight：作业启动前先证明路径可用",
+        "body": "Pre-flight 不是跑一个漂亮的峰值，而是在训练开始前确认「这组节点按这个 rank map 能稳定通信」：\n\n**节点级**：`nvidia-smi -L`（GPU 数量）、`nvidia-smi topo -m`（GPU/NIC 拓扑）、`lspci -vv`（PCIe 速率/宽度）、GPU Xid/ECC 状态\n\n**RDMA 级**：`ibv_devinfo`/`rdma link`（HCA 可见、端口状态）、`ibstat`（端口速率）、`ib_write_bw` 每条 rail 分别测（单 rail ≥ baseline 85%）\n\n**NCCL 级**：`all_reduce_perf` 覆盖**目标节点集合**（不是任意两台），关注 busbw ≥ baseline 80%、多次运行 CV ≤ 10%、NCCL 日志显示使用了预期 HCA 和 rail\n\n**训练 smoke test**：50-200 step，检查 step time 稳定性、`t_sync/t_step`、NCCL 重试/fallback 前兆、端口 ECN/PFC 是否随训练上升\n\n**关键**：retest 必须用同一组节点、同一 rank map 和同一容器环境。"
+      },
+      {
+        "title": "观测与故障模式",
+        "body": "训练通信故障最怕证据分散。要把训练框架、NCCL、GPU、NIC、交换机这五层时间线对齐：\n\n**故障模式辨别**：\n- **所有 rank 同步变慢** → 全局拥塞、共享 spine、checkpoint 同时写、集群级网络事件\n- **少数 rank 变慢** → 节点、NIC、端口、GPU-NIC locality、坏线、PCIe 降级\n- **周期性抖动** → checkpoint、数据加载、其他租户周期任务、网络遥测采集\n- **只在大消息慢** → 带宽、rail 均衡、端口速率、拥塞控制\n- **只在小消息慢** → 延迟、CPU 调度、NCCL 算法、树路径、跨 NUMA\n\n**NCCL timeout 排查顺序**：先确认所有 rank 是否进入同一 collective → 看 NCCL 日志中的网络选择 → 看端口错误和交换机计数。Timeout 是症状，不是根因；调大 timeout 不能解决慢路径或拥塞。",
+        "tip": "SHARP（交换机内做 reduce）可以让 AllReduce 绕过 ring 算法，在 Quantum 系列 IB 交换机上实现 in-network aggregation，集群越大优势越明显，配合 Adaptive Routing 是千卡以上 IB 集群标配。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下对 RDMA 的描述，哪一项最准确？",
+        "options": [
+          "RDMA 是 InfiniBand 的专有技术，只能在 IB 网络上使用",
+          "RDMA 是一种能力：NIC 直接读写远端注册内存，绕过 CPU 和内核协议栈开销",
+          "RDMA 等价于 GPUDirect，必须搭配 GPU 使用",
+          "RDMA 只能用于 checkpoint 写入，不适合训练梯度同步"
+        ],
+        "answer": 1,
+        "explain": "RDMA 是能力而非特定协议，InfiniBand 和 RoCE v2 都是承载 RDMA 的方式。GPUDirect RDMA 是 RDMA 的一种应用（NIC 直访 GPU memory），但 RDMA 本身可以访问 host memory。RDMA 最常用于训练梯度同步（NCCL collective）路径。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`AllReduce = ReduceScatter + AllGather` 这个拆分对于 FSDP/ZeRO 并行训练的实现非常重要。",
+        "answer": true,
+        "explain": "FSDP/ZeRO 把梯度 ReduceScatter 分片，每个 rank 持有一片梯度；参数 AllGather 重建完整参数进行前向计算。这两步是现代分布式训练的核心通信模式，不理解这个拆分就无法正确调优 bucket 大小和 overlap 策略。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Tensor Parallelism（张量并行）的高频通信组应该优先放在哪里？",
+        "options": [
+          "跨节点跨 pod，充分利用集群带宽",
+          "同一 NVSwitch / NVLink 域内（通常同一 8 卡 HGX 节点内）",
+          "随机放置，让 NCCL 自动选最优路径",
+          "跨 DragonFly group 以利用 global links"
+        ],
+        "answer": 1,
+        "explain": "TP 每层都有 activation/partial result 通信，延迟极敏感。NVLink/NVSwitch 提供节点内 TB/s 级带宽和极低延迟，远优于任何跨节点路径。错放到跨节点会让每层同步变慢，step time 明显上升。"
+      },
+      {
+        "type": "match",
+        "prompt": "将集群拓扑类型与其核心特征匹配：",
+        "left": [
+          "Fat-tree / Clos",
+          "Rail-optimized",
+          "DragonFly+"
+        ],
+        "right": [
+          "group 内高带宽连接 + group 间 global links，适合超大规模但调度复杂",
+          "相同编号 NIC 接同一 rail，GPU-NIC 对齐清晰，多 rail 并行可控",
+          "追求任意节点间等价路径和均匀带宽，适合多租户训练"
+        ],
+        "explain": "Fat-tree 追求均匀带宽和多租户友好；rail-optimized 追求 GPU-NIC-rail 对齐的多 rail 并行；DragonFly+ 追求大规模低成本但牺牲调度简单性。"
+      },
+      {
+        "type": "input",
+        "prompt": "`nccl-tests all_reduce_perf` 的 busbw 至少要达到同节点池 baseline 的百分之几才算通过 pre-flight 检查？（填数字）",
+        "accept": ["80", "80%", "80 %"],
+        "explain": "threshold 是 80%：busbw ≥ baseline 80%，多次运行 CV ≤ 10%。单 rail ib_write_bw 的 threshold 是 85%，两者不同。"
+      },
+      {
+        "type": "judge",
+        "prompt": "RoCE v2 集群低负载时稳定、高并发时抖动，调大 NCCL timeout 可以解决这个问题。",
+        "answer": false,
+        "explain": "调大 timeout 只是减少误杀，根因是 RoCE 拥塞控制或 QoS 配置问题：PFC 是否只作用在 RDMA 优先级、ECN 阈值是否合理、DSCP 端到端是否一致、MTU 是否统一。必须从网络配置层面解决，timeout 是保护机制，不是性能优化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某 64 卡 DDP 训练，梯度大小 8GB，跨节点有效 fabric 带宽约 350 GB/s。ring AllReduce 时间下限约为多少？",
+        "options": [
+          "约 5ms",
+          "约 23ms",
+          "约 46ms",
+          "约 100ms"
+        ],
+        "answer": 2,
+        "explain": "`t_ar ≈ 2 * (64-1)/64 * 8GB / 350GB/s ≈ 2 * 0.984 * 8/350 s ≈ 0.0449s ≈ 45ms`。若实测 P50 为 90ms 远超下限，说明存在 rail 不均、rank placement 错误或 RoCE/IB 端口问题，需排查而不是归因于模型。"
+      },
+      {
+        "type": "choice",
+        "prompt": "NCCL timeout 出现时，以下哪种排查顺序是正确的？",
+        "options": [
+          "直接调大 NCCL_IB_TIMEOUT 重试",
+          "先确认所有 rank 是否进入同一 collective，再看 NCCL 日志网络选择，最后下钻端口和交换机",
+          "重启训练作业，看问题是否消失",
+          "先换成 TCP 模式测试，排除 RDMA 配置问题"
+        ],
+        "answer": 1,
+        "explain": "正确排查顺序：1) 确认 rank 是否进入同一 collective（排除 rank 崩溃或顺序不一致）；2) NCCL 日志看网络路径选择（是否 fallback 到 socket、用了哪些 HCA）；3) 下钻端口错误和交换机计数（端口 flap、PFC pause、ECN mark）。"
+      }
+    ]
+  }
+]

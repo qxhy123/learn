@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u3c4",
+    "title": "GPU 互联与系统形态",
+    "subtitle": "PCIe、NVLink、NVSwitch、HGX 与拓扑感知调度",
+    "intro": [
+      {
+        "title": "互联的第一性原理：距离决定通信成本",
+        "body": "AI 系统里的\"距离\"不是地理距离，而是数据路径穿过的硬件边界数量。越靠近的通信越适合高频、细粒度、阻塞计算路径；越远的通信越应该低频、大块、可流水。\n\n```\n同一 GPU HBM\n  < 同一节点 NVLink / NVSwitch\n  < 同一 PCIe switch / root complex\n  < 跨 CPU socket / NUMA\n  < 同一节点 GPU 到 NIC\n  < 同一 rack / pod 网络\n  < 跨 rack / 跨 pod 网络\n```\n\n核心判断原则：**把高频通信放在近距离域，把低频通信放到远距离网络**。\n\n8 张 PCIe GPU、8 张 HGX H100 SXM GPU、72 张 GB200 NVL72 GPU，虽然都写作\"n × GPU\"，但给软件的通信形状完全不同。调度器如果只数 GPU 数量，会把 TP 作业放到错误形态的节点上。",
+        "tip": "看到性能问题，先问：这份字节在每一步走哪条路？走 HBM、NVLink、PCIe、IB/RoCE 还是跨 rack 网络？"
+      },
+      {
+        "title": "PCIe：职责是设备接入，不是 GPU-GPU 近距离互联",
+        "body": "PCIe 负责让 CPU、GPU、NIC、NVMe 和其他设备被枚举、管理、隔离并进行 DMA。它解决的是\"设备如何被主机发现和搬运数据\"，而不是为 GPU-GPU 高频模型并行设计的链路。\n\n**PCIe 的工程风险来自拓扑不均匀**：\n\n- GPU 与 NIC 在同一 PCIe switch 下 → GPUDirect RDMA 路径短，性能好\n- GPU 与 NIC 跨 root complex → 数据路径可能经过 CPU socket 间互连，延迟上升\n- GPU 虽标称 x16，但实际协商成 x8 或低一代速率 → H2D/D2H 带宽折损\n- ACS/IOMMU 配置影响 peer-to-peer 和 GPUDirect\n\n**结论**：两块同型号 GPU 如果挂在不同 root complex 下，它们到同一张 NIC 的路径成本可能完全不同。平台调度不能只给节点打 `h100=8` 标签，还要知道 rank 到 GPU、GPU 到 NIC、NIC 到 rail 的对应关系。",
+        "tip": "`lspci -tv` 和 `nvidia-smi topo -m` 用来查 PCIe 拓扑和 GPU-NIC NUMA 距离，是节点部署前的必查项。"
+      },
+      {
+        "title": "NVLink 与 NVSwitch：把 GPU-GPU 通信移到近距离路径",
+        "body": "**NVLink** 的第一性意义：减少 GPU-GPU 高频通信对 PCIe 和 CPU 路径的依赖，提供比 PCIe 更高的 GPU 间聚合带宽。主要服务四类场景：\n\n| 场景 | 通信模式 | 为什么需要近距离互联 |\n|------|----------|---------------------|\n| Tensor Parallel | 每层交换 activation / partial result | 高频且阻塞前向/反向 |\n| Pipeline Parallel | 相邻 stage 传 microbatch activation | 对 stage placement 敏感 |\n| Expert Parallel / MoE | token dispatch、expert combine | 小块多流量，容易受尾延迟影响 |\n| FSDP / ZeRO 局部通信 | reduce-scatter、all-gather | 每 step 周期性发生 |\n\n**NVSwitch** 把多条 NVLink 接入交换平面，让 HGX 8-GPU 系统中任意 GPU 对都能通过 fabric 通信，降低\"哪两张 GPU 直连\"的重要性。\n\n**注意口径**：NVLink \"900 GB/s\" 是 per-GPU 双向聚合数量级，不是任意两张 GPU 之间的单向带宽。不要用这个数字直接除以 tensor 大小估算单次通信时间。",
+        "tip": "TP=8 的作业，8 张 GPU 必须在同一 NVSwitch fabric 内，否则高频 TP 通信会走 IB/RoCE，TPOT 和尾延迟会被网络同步放大。"
+      },
+      {
+        "title": "HGX H100/H200 与 GB200 NVL72：系统形态的关键差异",
+        "body": "**HGX H100/H200**：8 张 SXM GPU 通过 NVSwitch 形成节点内 scale-up island。调度单元是完整的 8 卡节点，故障域也是整节点。\n\n| 维度 | HGX 的工程含义 | 平台要做什么 |\n|------|----------------|---------------|\n| GPU fabric | 8 张 SXM 通过 NVSwitch 形成近距离域 | TP=4/8 的作业优先放完整节点 |\n| Host path | CPU、DRAM、PCIe、NIC 在外围 | 绑定 rank、CPU set、NUMA、NIC rail |\n| 故障域 | 8 卡通常视作最小可用域 | 整节点隔离、整节点重试 |\n\n**GB200 NVL72**：把 scale-up 边界从\"8-GPU 主板\"推到\"72-GPU 液冷机柜\"。36 个 Grace CPU + 72 个 Blackwell GPU，通过 NVLink Switch System 形成 72-GPU NVLink domain，机柜内 NVLink 通信带宽数量级约 130 TB/s（rack-level aggregate，双向聚合口径，不是任意 GPU 对单向带宽）。\n\n**关键差异**：NVL72 需要软件栈理解多节点 NVLink domain、fabric manager、分区和作业编排；液冷、供电、机柜、维护窗口都进入容量管理。适合稳定的大模型平台，不适合快速探索期的小团队。",
+        "tip": "H200 相对 H100 的核心价值是 HBM3e 容量和带宽，不是 BF16 算力翻倍。显存升级不会消除拓扑错误。"
+      },
+      {
+        "title": "Scale-up vs Scale-out：把并行策略放到正确距离",
+        "body": "Scale-up 和 scale-out 是通信放置原则，不是营销词：\n\n- **Scale-up**：在低延迟、高带宽的近距离域内增加 GPU（HGX 8-GPU 或 NVL72 72-GPU）\n- **Scale-out**：通过跨节点网络增加更多节点和机柜（IB/RoCE leaf-spine、SuperPOD 集群）\n\n并行策略应该和这两类距离匹配：\n\n| 并行 / 通信 | 通信频率 | 延迟敏感度 | 优先放置 |\n|-------------|----------|------------|----------|\n| Tensor Parallel | 每层高频 | 很高 | 同一 NVSwitch / NVLink domain |\n| Expert Parallel | token routing 高频 | 高 | 同一节点或 NVL72 partition |\n| Pipeline Parallel | 每个 microbatch 传边界 activation | 中高 | 相邻 stage 尽量同节点 |\n| Data Parallel | 每 step 梯度同步 | 中 | 可跨节点，但要 rail 对齐 |\n| Checkpoint | 低频大块 | 低 | 可跨网络 |\n\n典型经验：1024 GPU 训练中，每个 HGX 节点内做 TP=8，节点之间做 DP。不要把 TP 跨多个 rack 展开——哪怕总 GPU 数更多，step time 也可能被每层同步拖垮。",
+        "tip": "把最热的通信放进 scale-up，把较冷、可批量化的通信交给 scale-out。"
+      },
+      {
+        "title": "拓扑感知调度与故障域：调的是形状，不是 GPU 数",
+        "body": "拓扑感知调度要表达四类信息：\n\n| 信息 | 例子 | 用途 |\n|------|------|------|\n| 设备形态 | `h100-sxm`、`h200-sxm`、`gb200-nvl72` | 避免把 TP 作业放到错误节点 |\n| 近距离域 | `nvlink-domain=node-a`、`nvswitch-fabric=healthy` | 保证多卡作业在同一 fabric |\n| 网络亲和 | `rail=0/1`、`nic0-near-gpu=0-3` | 让 rank/NIC/rail 对齐 |\n| 健康状态 | NVLink lane、Xid、ECC、温度、液冷状态 | 避免坏链路进入长作业 |\n\n**最小命令模板**：\n- `nvidia-smi topo -m` — 节点启动前确认 GPU-GPU、GPU-NIC、NUMA 距离\n- `NCCL_DEBUG=INFO NCCL_TOPO_DUMP_FILE=topo.xml` — 保留 NCCL 实际选择的路径\n- `./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8` — 快速验证 collective 基线\n- `dcgmi dmon` — 持续监控健康和设施降级\n\n**故障域**：NVLink lane 降级、NVSwitch 异常 → 整 HGX 节点隔离；NVL72 switch tray 异常 → rack partition drain。",
+        "reveal": {
+          "q": "64 卡训练只比 8 卡快 3 倍，GPU utilization 从 85% 降到 48%，NCCL 日志偶尔出现跨节点 all-reduce 尾延迟。根本原因是什么？",
+          "a": "节点内 NVSwitch（scale-up）成功，但 scale-out 出现了问题：rank 没有绑定 NIC rail，部分 rank 跨 NUMA 访问远端 NIC，多节点 all-reduce 没有均匀使用双 rail，作业被集中到同一拥塞域。修复：调度层要求节点跨 leaf 均衡、绑定 rank/GPU/CPU/NIC rail、pre-flight 用 nccl-tests 验证。修复后加速从 3x 提升到 5x。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "PCIe 和 NVLink 的根本职责差异是？",
+        "options": [
+          "PCIe 更快，NVLink 更便宜",
+          "PCIe 负责主机设备接入与管理，NVLink 负责 GPU-GPU 高频近距离通信",
+          "PCIe 用于 GPU 内部，NVLink 用于跨节点通信",
+          "PCIe 是数字接口，NVLink 是模拟接口"
+        ],
+        "answer": 1,
+        "explain": "PCIe 解决'设备如何被主机发现、管理、隔离和搬运数据'；NVLink 解决'GPU-GPU 之间的高频近距离通信'，主要服务模型并行。它们不是快慢版本，而是职责不同。"
+      },
+      {
+        "type": "judge",
+        "prompt": "NVLink 带宽标称的 900 GB/s 表示任意两张 GPU 之间的单向带宽。",
+        "answer": false,
+        "explain": "NVLink 带宽通常是 per-GPU 双向聚合数量级，不是任意两张 GPU 之间的单向带宽。实际还要看 NCCL 算法、消息大小、并发流、拓扑等因素。不能直接用这个数字除以 tensor 大小估算通信时间。"
+      },
+      {
+        "type": "match",
+        "prompt": "将并行策略与其最优先的放置位置匹配：",
+        "left": [
+          "Tensor Parallel（高频，阻塞前向）",
+          "Data Parallel（每 step 梯度同步）",
+          "Checkpoint（低频大块）",
+          "Expert Parallel（MoE token dispatch）"
+        ],
+        "right": [
+          "可跨节点，重点是网络 rail 对齐",
+          "同一 NVSwitch / NVLink domain",
+          "同一节点或同一 NVL72 partition",
+          "可跨网络，重点是削峰和恢复时间"
+        ],
+        "explain": "TP 最热→scale-up（NVSwitch/NVLink）；EP 热→同节点或 NVL72 partition；DP 中频→跨节点但 rail 对齐；Checkpoint 低频→可跨网络。"
+      },
+      {
+        "type": "choice",
+        "prompt": "HGX H100 节点内 TP=8 运行良好，扩到 8 节点后 GPU utilization 大幅下降。最先应该检查的是？",
+        "options": [
+          "换更高 TFLOPS 的 GPU",
+          "增大 batch size",
+          "检查跨节点 NIC rail 绑定、NCCL 路径和交换机拥塞",
+          "关闭 activation checkpointing"
+        ],
+        "answer": 2,
+        "explain": "节点内 TP=8 成功说明 scale-up 没问题；扩到多节点后下降，瓶颈转移到 scale-out——NIC rail 绑定、NCCL topology、交换机拥塞、rank/NIC/NUMA 亲和是最先要查的。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GB200 NVL72 把 72 张 GPU 放在同一机柜内，因此不再需要跨机柜的 IB/RoCE 网络。",
+        "answer": false,
+        "explain": "NVL72 把 scale-up 域扩大到 72 GPU 机柜级，但多个 NVL72 机柜组成更大集群时，跨 rack 仍然需要 IB/RoCE。数据并行、checkpoint 和容错扩展仍然依赖 scale-out 网络。"
+      },
+      {
+        "type": "choice",
+        "prompt": "集群还有 16 张 H100 空闲，但分散在 6 台节点，每台 1-3 张。某个需要 TP=8 的作业应该怎么处理？",
+        "options": [
+          "立即分配 8 张空闲卡拼起来跑，提高利用率",
+          "将作业拆成多个小作业分别跑",
+          "让作业 Pending，等待完整 8 卡节点，并向用户解释原因",
+          "降低 TP 到 4，凑合用"
+        ],
+        "answer": 2,
+        "explain": "TP=8 需要 8 张 GPU 在同一 NVSwitch domain 内，用碎卡跨节点拼起来会把高频 TP 通信推到 IB/RoCE，性能会很差。应让作业 Pending 等完整形状，并向用户解释是'拓扑不满足'而非'资源浪费'。"
+      },
+      {
+        "type": "input",
+        "prompt": "排查多节点 all-reduce 集合通信问题时，用于快速验证 collective 带宽基线的工具叫什么？",
+        "accept": ["nccl-tests", "nccl_tests", "nccl-test"],
+        "explain": "`nccl-tests` 是 NVIDIA 提供的 NCCL 性能基准测试工具，可以快速验证 all-reduce、all-gather、reduce-scatter 的带宽和延迟是否达到集群基线。"
+      },
+      {
+        "type": "choice",
+        "prompt": "NVSwitch 在 HGX 系统中的主要作用是？",
+        "options": [
+          "替代 PCIe 成为 CPU 和 GPU 的主要通信通道",
+          "作为 NVLink 的交换平面，让 8-GPU 节点中任意 GPU 对都能通过 fabric 通信",
+          "提供跨节点的 IB/RoCE 网络交换功能",
+          "管理 GPU 的电源和温度"
+        ],
+        "answer": 1,
+        "explain": "NVSwitch 把多条 GPU-GPU 点到点 NVLink 接入交换平面，降低'哪两张 GPU 直连'的重要性，让 HGX 8-GPU 中任意 GPU 对之间的通信更均匀，形成 scale-up island。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,117 @@
+[
+  {
+    "id": "u5c16",
+    "title": "向量数据库选型与运维",
+    "subtitle": "从 benchmark QPS 到生产 SLA：选型矩阵、分布式架构、多租户 ACL 与索引重建",
+    "intro": [
+      {
+        "title": "动机：只看 benchmark QPS 会选错",
+        "body": "厂商 benchmark 的测试条件：全内存、无 filter、固定维度、单 collection、无写入压力。而生产 RAG 里几乎所有查询都带 metadata filter（租户/权限/时间范围），高选择性 filter 下性能差距可达 10 倍以上。\n\n**五个同时成立的选型约束**：\n1. **向量召回是系统问题，不是纯计算问题**：filter 策略、分片拓扑、副本数共同决定 P99\n2. **数据规模与更新频率决定架构**：单机库在百万级优秀，亿级必须分布式，早期选错迁移成本极高\n3. **embedding 模型变更是最被忽视的运维事件**：全量 reindex 可能耗费 40+ GPU 小时\n4. **多租户 ACL 是安全边界，不是性能优化**：filter 绕过 ACL 意味着数据泄露，不只是召回质量下降\n5. **运维成本是隐性 TCO 的最大来源**：OOM、Raft 选举风暴、跨版本升级的工程成本往往超过 SaaS 费用差"
+      },
+      {
+        "title": "向量库五大分类与核心边界",
+        "body": "| 类别 | 代表 | 适用场景 | 核心限制 |\n|------|------|---------|----------|\n| **专用向量库** | Milvus、Qdrant、Weaviate | 亿级以上、完整 ANN + filter + 运维 | 运维复杂度高 |\n| **SaaS 托管** | Pinecone、Zilliz Cloud | 快速上线、无 SRE | 成本大规模下较高，调优空间有限 |\n| **关系型扩展** | pgvector | 已有 PG、中等规模（<千万向量）、需要事务 ACID | 超大规模需分区策略，纯向量 QPS 受主库限制 |\n| **搜索引擎扩展** | ES / OpenSearch kNN | 关键词+向量 hybrid 场景，BM25 是主力 | 纯向量搜索 ANN 调优不如专用库 |\n| **内存库** | FAISS、Chroma、LanceDB | 离线评测、原型、嵌入式 RAG | 无 WAL、无 HA、无副本 |\n\n**选型决策路径**：规模 <100 万 → FAISS/pgvector；100 万-1 亿 → 看 filter 重度与运维能力；>1 亿或多租户平台 → Milvus/Qdrant 或托管服务；已有 ES 且关键词是主力 → ES hybrid。"
+      },
+      {
+        "title": "分布式架构：Sharding、副本与一致性",
+        "body": "**Sharding 策略**：\n- `Hash 分片`：对 vector ID 哈希，负载均匀，适合随机读写高并发\n- `Range 分片`：按时间/ID 范围切分，适合时序数据按时间召回\n- `Collection/Partition 分片`：按租户切分，隔离彻底，小租户浪费资源；Milvus Partition Key 可在同一 collection 内按字段分区，兼顾隔离和资源效率\n\n**副本数计算公式**：目标副本数 = ceil(目标 QPS / 单副本峰值 QPS) × 1.5（余量因子），最少 3 副本（保证 Raft quorum，单节点故障不影响读取）。\n\n**一致性取舍**：Milvus/Qdrant 写入后不立即对所有查询节点可见（growing segment 未 flush）。权限变更、文档删除等要求立即生效的场景，需要显式 flush 或配置 consistency_level=Strong，代价是查询延迟增加 20-50ms。",
+        "tip": "向量库的 growing segment 是写入后未持久化索引的状态，可查询但索引未优化。长期 growing_segment_count >100 说明 flush 追不上写入速度，是内存和性能的隐患。"
+      },
+      {
+        "title": "Metadata Filter 深解：三种策略与性能影响",
+        "body": "Filter 能力是向量库之间差距最大的维度，也是 RAG 系统最常遇到性能问题的根源。\n\n| 策略 | 执行顺序 | 适用选择率 | 召回风险 |\n|------|---------|----------|----------|\n| `Pre-filter` | 先 filter，再 ANN | >10%（过滤后候选充足）| 高选择性时候选不足，召回差 |\n| `Post-filter` | 先 ANN topK×N，再 filter | >1%（结果覆盖率高）| 高选择性时有效结果远 < topK |\n| `Blocked filter` | ANN 与 filter bitmap 并行 | 中等（1%-50%）| 最稳定 |\n\n**有效 QPS 估算**：有效 QPS = 单副本 QPS × 副本数 / (1 + filter_overhead_factor)。低选择性（>10%）overhead 因子 0.1-0.3；高选择性（<1%）overhead 因子 2-10，延迟可能飙升 10 倍。\n\n**高选择性 filter 解决方案**：为高选择性字段建独立 collection/index；或在应用层先用 metadata 服务缩小候选 ID 集，再做向量搜索（两阶段召回）。"
+      },
+      {
+        "title": "Hybrid Search：RRF 融合与稀疏向量",
+        "body": "纯稠密向量搜索在精确关键词（产品 ID、专有名词、数字）召回率差；BM25 对语义理解弱。两路并联，用 `RRF`（Reciprocal Rank Fusion）合并最稳健。\n\n**RRF 公式**：`RRF_score(d) = Σ 1/(k + rank_i(d))`，k=60（防止 rank 1 文档分数过高）。RRF 只看排名不看绝对分数，无需归一化，天然鲁棒。\n\n**稀疏向量（SPLADE）**：把 BM25 的词汇信号编码进稀疏高维向量（维度=词表大小，通常 3-5 万维），使稀疏和稠密向量可以在同一向量库里检索。Milvus 2.4+ 和 Qdrant 0.19+ 均支持。\n\n**何时有收益**：精确词汇查询占 40%+ 时，hybrid 可将召回率提升 10-20 个百分点；80% 以上是自然语言语义查询时，hybrid 增益有限，勿盲目引入复杂度。"
+      },
+      {
+        "title": "索引重建与双索引灰度切换",
+        "body": "**必须全量重建的触发条件**：\n- Embedding 模型升级（向量空间整体变化）\n- Chunk 规则变更（文档边界变化）\n- 索引算法/距离度量变更\n- 大规模脏数据修复（>30%）\n\n**可以增量更新的场景**：少量文档新增/删除；metadata/ACL 字段更新（但 ACL 变更需立即生效，flush 优先）。\n\n**双索引灰度最小流程**（必须遵守）：\n1. 后台并行构建新索引（不影响线上）\n2. golden queries（≥50 条）回归：recall@10 / P95 延迟 / ACL 过滤准确率（零容忍）/ 已删除文档不出现\n3. 灰度切流：10%→50%→100%，每步观察 15-30 分钟\n4. 保留旧索引 7 天（回滚窗口）\n5. 回滚触发条件：recall 下降 >5% 或 P99 延迟增加 >50% 立即回滚",
+        "reveal": {
+          "q": "向量库的 P99 延迟从 200ms 抖动到 2000ms 时，会如何影响 vLLM 的 GPU 利用率？",
+          "a": "vLLM 的 continuous batching 需要稳定的前置 token 供给。向量库 P99 稳定 <200ms 时，vLLM batch 填充率高，GPU 利用率可达 85%+；P99 偶发 2000ms 时，vLLM 等待检索完成而无法填满 batch，GPU 利用率跌至 40-60%。因此向量库的 P99 稳定性直接决定 LLM serving 的成本效率，建议在向量库和 LLM 之间加检索缓存层（Redis/Valkey）来平滑抖动。"
+        }
+      },
+      {
+        "title": "多租户架构与运维反模式",
+        "body": "**三种隔离粒度**：\n- Collection 隔离：每租户独立 collection，隔离最彻底，租户数 >1000 时 Qdrant 性能下降\n- Partition/Namespace 隔离：同一 collection 内按 tenant_id 分区，兼顾隔离与资源效率，适合 100-10000 租户\n- Row-level Filter：只靠 metadata filter 区分租户，资源效率最高，但应用层忘记加 filter 会导致全量泄露\n\n**五种反模式**：\n1. 把向量库当 OLTP 数据库（不支持事务 ACID，业务状态必须放关系型数据库）\n2. 所有 metadata 字段都建索引（写放大、内存消耗、compaction 压力增大）\n3. 用全量 benchmark 数字做选型（必须用自己的数据和真实 filter 压测）\n4. 索引重建与在线查询争抢同一资源（必须资源隔离，Milvus 的 Index Node 专门隔离构建）\n5. 向量库作为唯一数据源（原始文档必须在 S3/数据库，向量库是可重建的索引层）"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "在选型向量数据库时，以下哪个维度是生产 RAG 中最容易被 benchmark 数字忽视、实际性能差距最大的因素？",
+        "options": [
+          "ANN 算法的召回率（无 filter 场景）",
+          "单机内存容量上限",
+          "Metadata filter 在高选择性场景下的性能",
+          "写入 QPS 上限"
+        ],
+        "answer": 2,
+        "explain": "厂商 benchmark 通常在无 filter 场景下测试，但生产 RAG 几乎所有查询都带 ACL/权限/时间 filter。高选择性 filter（<1% 候选）下不同向量库的性能差距可达 10 倍以上，而 benchmark 完全反映不出这个差距。Qdrant 的 payload index + HNSW 在高 filter 场景下表现最为成熟。"
+      },
+      {
+        "type": "judge",
+        "prompt": "向量库的多租户 ACL 过滤只是性能优化问题，不满足时只会降低召回质量，不会导致数据泄露。",
+        "answer": false,
+        "explain": "ACL 过滤是安全边界问题。如果向量库的 metadata filter 没有强制 ACL 字段，或缓存层命中了跨租户结果，会把 A 用户的文档返回给 B 用户，造成数据泄露。这是安全漏洞，不只是召回质量问题。企业 RAG 里权限字段必须进入 metadata filter 和 cache key。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Milvus 的 Partition Key 机制的主要用途是什么？",
+        "options": [
+          "提高单个向量的检索精度",
+          "在同一 collection 内按指定字段（如 tenant_id）将数据分到不同物理 shard，兼顾租户隔离和资源效率",
+          "自动压缩 embedding 向量以降低内存",
+          "支持 cross-encoder reranking"
+        ],
+        "answer": 1,
+        "explain": "Milvus Partition Key 允许在一个 collection 内按某字段（如 tenant_id）将数据分到不同物理 partition，查询时自动路由到对应分区，实现租户数据隔离，同时避免了\"每租户一个 collection\"带来的大量小 collection 资源浪费问题。"
+      },
+      {
+        "type": "match",
+        "prompt": "将向量库类别与其核心限制匹配：",
+        "left": ["FAISS/Chroma（内存库）", "pgvector（关系型扩展）", "Milvus（专用向量库）", "Pinecone（SaaS 托管）"],
+        "right": ["运维复杂度高（etcd + MinIO + 多组件）", "无 WAL、无 HA、无副本，仅适合原型/离线", "成本大规模下较高，调优空间有限", "超大规模需分区策略，纯向量 QPS 受主库限制"],
+        "explain": "内存库无持久化保证；pgvector 受 PostgreSQL 主库约束；Milvus 存算分离架构运维复杂但扩展性强；Pinecone 运维极简但成本在大规模下偏高，深度调优受限。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RRF（Reciprocal Rank Fusion）中 k=60 参数的作用是什么？",
+        "options": [
+          "限制 topK 的最大返回数量为 60",
+          "防止排名第 1 的文档分数过高，增加低排名文档的相对权重，使融合更稳健",
+          "控制稀疏向量的维度大小",
+          "设定 BM25 的词频权重系数"
+        ],
+        "answer": 1,
+        "explain": "RRF 公式 `1/(k + rank)` 中，k 作为平滑因子防止 rank=1 的文档分数过高（1/1=1.0 vs 1/61≈0.016，差距悬殊）。加入 k=60 后，rank=1 得 1/61≈0.016，rank=2 得 1/62≈0.016，差距缩小，使融合结果对两路检索的排名都不极端，更鲁棒。"
+      },
+      {
+        "type": "judge",
+        "prompt": "向量库的 growing segment 和 sealed segment 中，growing segment 已经构建了完整的 HNSW 索引，查询效率与 sealed segment 相同。",
+        "answer": false,
+        "explain": "growing segment 是新写入数据的临时状态，未构建优化的 ANN 索引（HNSW 等），只能做暴力扫描或简单线性搜索，查询效率远低于已构建索引的 sealed segment。达到大小阈值后，growing segment 变为 sealed 并异步构建索引，才进入完整查询可用状态。"
+      },
+      {
+        "type": "input",
+        "prompt": "在向量数据库中，为保证 Raft quorum（选举成功需要超过半数节点存活），副本数最少应设为几？",
+        "accept": ["3", "三"],
+        "explain": "Raft 协议需要超过半数节点同意才能完成写入确认和 leader 选举。最少 3 副本（2/3 存活即可维持 quorum），这样单节点故障时集群仍能正常工作。2 副本时任意一个故障都会使 quorum 失效，1 副本无法容错。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某企业 RAG 系统有 5000 个租户，每个租户平均 10 万个文档，总计 5 亿文档。以下多租户架构最合适的是？",
+        "options": [
+          "Collection 隔离：每个租户独立 collection（5000 个 collection）",
+          "Partition/Namespace 隔离：同一 collection 内按 tenant_id 分区",
+          "Row-level Filter：同一 collection，查询时加 tenant_id filter",
+          "三种方案均可，取决于文档大小"
+        ],
+        "answer": 1,
+        "explain": "5000 个租户 × 独立 collection = 5000 个 collection，Qdrant 等在 >1000 个 collection 时性能下降明显，运维成本极高。Row-level Filter 隔离最弱（应用层忘加 filter 就泄露）。Partition/Namespace 隔离兼顾隔离程度和资源效率，是 100-10000 租户规模的推荐方案。"
+      }
+    ]
+  }
+]

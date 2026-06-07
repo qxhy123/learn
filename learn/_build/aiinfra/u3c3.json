@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u3c3",
+    "title": "HBM 显存与 Roofline",
+    "subtitle": "容量账本、KV Cache、arithmetic intensity 与内存瓶颈判断",
+    "intro": [
+      {
+        "title": "两个硬约束：容量和带宽是不同问题",
+        "body": "GPU 显存有两个完全不同的约束，修复手段也不同：\n\n**容量约束**：权重、梯度、optimizer state、激活、KV Cache、workspace 必须真实占据 HBM 地址空间。单卡 80GB 不是\"差不多能跑 70B\"，而是要在特定并行策略、精度、batch、sequence length、并发和碎片下，把所有状态放下。\n\n**带宽约束**：就算放得下，如果每 token/每 step 反复扫过大块内存，性能上限由 HBM 每秒能搬多少字节决定，而不是 Tensor Core 每秒能做多少乘加。\n\nHBM（High Bandwidth Memory）的核心价值不是\"容量大\"，而是让 SM、Tensor Core 以 TB/s 级持续读写模型状态。\n\n| 维度 | HBM 的工程含义 | AI 负载里的表现 |\n|------|----------------|----------------|\n| 容量 | 单卡能常驻多少状态 | 模型权重、激活、KV Cache 是否放得下 |\n| 带宽 | 每秒能读写多少字节 | decode TPOT、LayerNorm、optimizer step 是否被内存限制 |",
+        "tip": "OOM 是容量失败；HBM 利用率打满但 SM 仍等数据是带宽失败。两类问题的修复方向不同。"
+      },
+      {
+        "title": "训练显存：Adam 为什么吃这么多",
+        "body": "BF16 Adam 训练中，参数状态的常用预算：\n\n| 状态 | 精度 | bytes/param | 说明 |\n|------|------|-------------|------|\n| 模型权重 | BF16 | 2 | forward/backward 主权重 |\n| 梯度 | BF16/FP32 | 2-4 | 取决于优化器配置 |\n| Adam 一阶矩 m | FP32 | 4 | optimizer state |\n| Adam 二阶矩 v | FP32 | 4 | optimizer state |\n| master weight | FP32 或无 | 0-4 | mixed precision 下可能有 |\n\n工程常用口径：**保守 16 bytes/param，较紧 12 bytes/param**。\n\n以 7B、70B 为例（仅参数状态）：\n\n| 模型规模 | 12 bytes/param | 16 bytes/param |\n|----------|----------------|----------------|\n| 7B | ~84 GB | ~112 GB |\n| 70B | ~840 GB | ~1.12 TB |\n\n这解释了\"70B 推理 2 张 80GB 卡能勉强放权重\"和\"70B 训练需要很多卡\"并不矛盾——推理主要放权重和 KV Cache；训练还要放梯度、optimizer state、激活和临时 buffer。",
+        "tip": "激活显存和 batch × seq_len × hidden_size 相关，sequence length 翻倍，显存可能不止翻倍（attention 中间状态放大）。开启 activation checkpointing 用计算换显存。"
+      },
+      {
+        "title": "KV Cache：推理中随并发动态增长的成本",
+        "body": "decode 阶段每生成一个 token，都要保存该 token 对应所有层的 Key 和 Value。KV Cache 公式：\n\n```\nKV Cache bytes = concurrent_sequences × total_tokens × layers × kv_heads × head_dim × 2(K和V) × bytes_per_element\n```\n\n以 70B 级模型（layers=80, kv_heads=8, head_dim=128, BF16）为例：\n\n**单 token KV Cache** = 80 × 8 × 128 × 2 × 2 bytes = 约 320 KB/token\n\n| 场景 | token 总量 | KV Cache |\n|------|------------|----------|\n| 1 个请求，8K tokens | 8,192 | ~2.5 GB |\n| 1 个请求，32K tokens | 32,768 | ~10 GB |\n| 32 个并发，各 8K | 262,144 | ~80 GB |\n\nGQA/MQA 把 kv_heads 降低（如从 64 降到 8），KV Cache 显著下降，是现代 LLM 架构节省推理显存的重要原因。Paged KV 不会让每 token 读写字节消失，而是让显存用得更满、碎片更少。",
+        "tip": "支持 128K 上下文不等于高并发下便宜。长上下文把显存从权重问题变成 KV Cache 问题，必须在上线前按最坏请求长度和目标并发测峰值。"
+      },
+      {
+        "title": "Prefill vs Decode：同一个模型的两个性能世界",
+        "body": "LLM 推理必须分成两个阶段分析：\n\n| 阶段 | 输入形态 | 主要计算 | 更常见瓶颈 | 典型优化 |\n|------|----------|----------|------------|----------|\n| Prefill | 一次处理 prompt 所有 token | 大矩阵乘法、attention | compute-bound 或混合 | 大 batch、FlashAttention、prefix cache |\n| Decode | 每轮生成 1 个或少量 token | 小 GEMM、读权重、读写 KV | memory-bound、调度开销 | continuous batching、量化、提高 HBM 带宽 |\n\ndecode 的粗暴下限估算：每 token 最低时间 ≥ 权重大小 / 有效 HBM 带宽\n\n示例：70B BF16 权重约 140GB，2 张 H100 聚合 HBM 带宽约 6.7 TB/s\n→ 仅权重扫描的理想下限 ≈ 140 GB / 6.7 TB/s ≈ 21 ms/token\n\n这个数字的价值不是预测延迟，而是告诉你：如果 decode 已经 memory-bound，追 TFLOPS 没意义；更高 HBM 带宽、更低量化、更好的 batching 才是方向。",
+        "tip": "不能用一次短 prompt benchmark 代表线上性能。prefill 和 decode 的瓶颈不同，必须分开测。"
+      },
+      {
+        "title": "Arithmetic Intensity 与 Roofline：判断内存还是计算瓶颈",
+        "body": "**Arithmetic intensity（AI）** = Ops / Bytes moved（每搬 1 byte 做多少计算）\n\n| 算子 / 场景 | 数据复用 | AI 直觉 | 更常见瓶颈 |\n|-------------|----------|---------|------------|\n| 大 GEMM | A/B tile 被多次复用 | 高 | Tensor Core / compute |\n| LayerNorm/RMSNorm | 每元素读写少量几次 | 低 | HBM 带宽 |\n| GELU/add/mul | 逐元素读写 | 低 | HBM 带宽 |\n| Attention decode | 每步读历史 KV | 低到中 | HBM 带宽 |\n| Optimizer step | 读写 weight/grad/m/v | 低 | HBM 带宽 |\n\n**Roofline**：性能 ≤ min(PeakCompute, AI × MemoryBandwidth)\n\n**Machine balance** = PeakCompute / MemoryBandwidth\n\n- AI < machine balance → 落在 roofline 左侧，memory-bound\n- AI > machine balance → 落在右侧，compute-bound\n\n示例：A100 的 machine balance ≈ 312 TFLOPS / 2.0 TB/s ≈ 156 ops/byte；H100 ≈ 989 TFLOPS / 3.35 TB/s ≈ 295 ops/byte。一个 AI=80 的 kernel 在两张卡上都是 memory-bound。",
+        "tip": "H100 compute roof 比 A100 高约 3.2x，但 HBM 带宽只高约 1.7x。LayerNorm 等 memory-bound kernel 从 A100 迁到 H100，提速只有 1.5-1.8x，不跟 TFLOPS 成比例。"
+      },
+      {
+        "title": "Roofline 排障：观测到什么，该做什么",
+        "body": "Roofline 不是精确预言，而是排障坐标系：\n\n| 观测 | Roofline 解读 | 优先动作 |\n|------|---------------|----------|\n| HBM 带宽高、SM/Tensor 利用低 | memory-bound | fusion、减少读写、量化、改善访问模式 |\n| SM/Tensor 利用高、HBM 未满 | compute-bound | Tensor Core shape、精度、tile、occupancy |\n| HBM 和 SM 都低 | launch、同步、shape 太小 | batch、CUDA graph、减少小 kernel |\n| 单 kernel 好，端到端差 | 阶段间同步、runtime、IO | trace 全链路，不只看 kernel |\n\n常见优化手段的分类：\n\n| 手段 | 主要解决 | 付出代价 |\n|------|----------|----------|\n| 量化（INT8/INT4） | 权重显存和权重读取带宽 | 精度风险 |\n| Activation checkpointing | 激活容量 | 重算，step 变慢 |\n| FlashAttention | attention 中间显存和带宽 | kernel/shape 约束 |\n| Fused kernels | 中间 tensor 和 HBM 往返 | 实现复杂 |\n| Paged KV | KV 碎片和预留 | block 管理开销 |",
+        "tip": "容量问题优先减少常驻字节或峰值生命周期；带宽问题优先减少每 token/每 step 搬运字节或提高访问复用；算力问题才优先追 Tensor Core 利用。"
+      },
+      {
+        "title": "训练 OOM 排查链：从\"偶发\"到根因",
+        "body": "现象：7B SFT 任务在 8×A100 80GB 上偶发 OOM，相同配置有时能跑几十 step，有时 warmup 后第一个长 batch OOM。\n\n排查步骤：\n1. 固定随机种子和输入长度，确认是否由变长 batch 触发\n2. 记录 `max_memory_allocated`、`max_memory_reserved` 和 `nvidia-smi` 峰值\n3. 分阶段打点：load model、first forward、backward、optimizer step、eval\n4. 关闭 eval 或 generation，确认是否训练中插入推理造成峰值\n5. 降 microbatch，观察是否线性缓解\n\n常见根因：\n\n| 根因 | 表现 | 修复 |\n|------|------|------|\n| 变长 batch 有极长样本 | 偶发 OOM | length bucketing、max length |\n| eval generation 混入 | 训练中段峰值突增 | 单独 eval、清理 cache |\n| 保存 tensor 未 detach | 显存逐 step 增长 | `.detach()`、只保存标量 |\n| allocator 碎片 | reserved 高但 allocated 不高 | 固定 shape、调整 allocator |",
+        "reveal": {
+          "q": "某 70B BF16 推理服务权重能放下，但长上下文并发一上来就 OOM，问题是算力、显存还是带宽？",
+          "a": "显存（容量）问题。权重固定约 140GB，OOM 时增长的是 KV Cache——并发越高或上下文越长，KV Cache 越大。应先按 KV Cache 公式算出最坏并发下的容量需求，再考虑 KV quantization、Paged KV、admission control 或换 H200（更大显存）。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "以下哪种现象是 HBM 容量失败（而不是带宽失败）？",
+        "options": [
+          "decode 阶段 TPOT 高，但 GPU 显存用量正常",
+          "LayerNorm kernel HBM 带宽打满，Tensor Core 利用低",
+          "高并发长上下文请求导致 CUDA OOM",
+          "optimizer step 耗时过长"
+        ],
+        "answer": 2,
+        "explain": "CUDA OOM 是容量失败——内存不够放所有状态。带宽失败是能放下但搬运速度跟不上，表现为延迟高而不是 OOM。"
+      },
+      {
+        "type": "input",
+        "prompt": "BF16 Adam 训练中，保守估算参数状态的常用口径是多少 bytes/param？",
+        "accept": ["16", "16 bytes/param", "16bytes"],
+        "explain": "保守口径 16 bytes/param：BF16 权重 2B + BF16 梯度 2B + FP32 Adam m 4B + FP32 Adam v 4B + FP32 master weight 4B = 16B/param。较紧时用 12 bytes/param。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 Roofline 模型中，如果某 kernel 的 arithmetic intensity 低于 machine balance，则该 kernel 是 compute-bound 的。",
+        "answer": false,
+        "explain": "arithmetic intensity < machine balance → 落在 roofline 左侧（带宽斜线限制区），是 memory-bound 的。只有 AI > machine balance 才是 compute-bound。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么 GQA/MQA 架构对推理显存有重要意义？",
+        "options": [
+          "减少了模型权重的大小",
+          "让 Tensor Core 可以用更低精度运算",
+          "减少了 kv_heads 数量，从而显著降低 KV Cache 占用",
+          "提高了 prefill 阶段的计算效率"
+        ],
+        "answer": 2,
+        "explain": "KV Cache 大小正比于 kv_heads 数量。GQA/MQA 把 kv_heads 从与 query heads 相同降低为少量共享头，显著减少 KV Cache 显存，对长上下文推理尤为重要。"
+      },
+      {
+        "type": "match",
+        "prompt": "将优化手段与其主要解决的问题匹配：",
+        "left": [
+          "Activation checkpointing",
+          "FlashAttention",
+          "INT8/INT4 权重量化",
+          "Paged KV"
+        ],
+        "right": [
+          "减少权重显存和 HBM 读取带宽",
+          "减少激活容量（用重算换显存）",
+          "减少 attention 中间显存和带宽",
+          "降低 KV Cache 碎片和预留浪费"
+        ],
+        "explain": "checkpointing→激活容量；FlashAttention→attention 中间显存/带宽；量化→权重显存/带宽；Paged KV→KV 碎片管理。"
+      },
+      {
+        "type": "choice",
+        "prompt": "H100 从 A100 的 BF16 算力约提升 3.2x，但 HBM 带宽只提升约 1.7x，LayerNorm 类 kernel 从 A100 迁到 H100，提速大约多少？",
+        "options": [
+          "约 3.2x（跟 TFLOPS 成比例）",
+          "不会有提速，因为 HBM 没变",
+          "约 1.5-1.8x（跟 HBM 带宽提升接近）",
+          "约 5x（两者叠加）"
+        ],
+        "answer": 2,
+        "explain": "LayerNorm 是 memory-bound kernel（AI 低），性能上限跟 HBM 带宽走，不跟 Tensor Core TFLOPS 走。H100 HBM 带宽提升约 1.7x，所以提速约 1.5-1.8x，远低于 3.2x 的算力提升。"
+      },
+      {
+        "type": "judge",
+        "prompt": "decode 阶段 GPU utilization 只有 5%，一定意味着 GPU 调优有问题，需要优化 kernel。",
+        "answer": false,
+        "explain": "decode 阶段每步计算量很小，低 GPU utilization 是正常现象。decode 常是 memory-bound，受限于 HBM 带宽（读权重和 KV Cache），而不是算力。应先用 Roofline 判断瓶颈所在。"
+      },
+      {
+        "type": "choice",
+        "prompt": "观察到训练任务 `max_memory_reserved` 远高于 `max_memory_allocated`，且发生 OOM，首先应该怀疑？",
+        "options": [
+          "模型权重太大，需要换更大显存的 GPU",
+          "gradient accumulation 步数设置错误",
+          "allocator fragmentation，大块分配失败",
+          "activation checkpointing 没有开启"
+        ],
+        "answer": 2,
+        "explain": "reserved >> allocated 且 OOM，通常是 allocator fragmentation：caching allocator 向 CUDA 申请了很多内存并保留在 pool，但 pool 内部碎片化，无法满足下一次大块连续分配。应先固定 shape、调整 allocator 配置，而不是直接采购更大 GPU。"
+      }
+    ]
+  }
+]

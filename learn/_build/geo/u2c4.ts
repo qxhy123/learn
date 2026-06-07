@@ -1,0 +1,153 @@
+export const LESSONS = [
+  {
+    id: 'u2c4',
+    title: '平行线的判定',
+    subtitle: '从角的数量关系推出两直线平行',
+    intro: [
+      {
+        title: '判定的核心思想',
+        body: '平行线判定研究的是：**"角的数量关系 $\\Rightarrow$ 两直线平行"**——这是从数量到位置的推理。\n\n上一章"三线八角"只描述了角的位置，本章给这些位置关系加上数量条件，就能断定两直线是否平行。\n\n**使用判定前必须先找清楚截线和被截直线**，否则所谓的"同位角""内错角"很可能根本不是这类角。',
+        image: 'thm-parallel-criteria.svg',
+        imageCaption: '三种平行判定示意：同位角相等 / 内错角相等 / 同旁内角互补',
+      },
+      {
+        title: '三大判定定理',
+        body: '设直线 $a, b$ 被第三条直线 $l$ 所截，则：',
+        steps: [
+          '**判定 1（同位角）**：同位角相等 $\\Rightarrow$ 两直线平行（$a \\parallel b$）',
+          '**判定 2（内错角）**：内错角相等 $\\Rightarrow$ 两直线平行（$a \\parallel b$）',
+          '**判定 3（同旁内角）**：同旁内角互补（和为 $180^\\circ$）$\\Rightarrow$ 两直线平行（$a \\parallel b$）',
+        ],
+        tip: '判定 1 通常作为基本事实（公理）直接使用，判定 2、3 都可以由判定 1 推出。',
+      },
+      {
+        title: '平行公理与两个推论',
+        body: '**平行公理**：过直线外一点，**有且只有**一条直线与已知直线平行。\n\n由此得到两个常用推论：\n\n- **推论 1**：如果两条直线都与**同一条直线**平行，那么这两条直线**也互相平行**。\n  即：$a \\parallel c$ 且 $b \\parallel c$ $\\Rightarrow$ $a \\parallel b$。\n- **推论 2**：在同一平面内，**垂直于同一条直线**的两条直线**互相平行**。\n  即：$a \\perp l$ 且 $b \\perp l$ $\\Rightarrow$ $a \\parallel b$。',
+        formula: 'a \\parallel c,\\; b \\parallel c \\;\\Rightarrow\\; a \\parallel b',
+        tip: '推论 2 本质是判定 1 的特殊情形：$a \\perp l$ 和 $b \\perp l$ 各自给出同位角为 $90^\\circ$，相等，由判定 1 得 $a \\parallel b$。',
+      },
+      {
+        title: '用判定 1 推出判定 2',
+        body: '**已知**：直线 $a, b$ 被直线 $l$ 所截，内错角 $\\angle 1 = \\angle 2$。**求证**：$a \\parallel b$。',
+        steps: [
+          '设 $\\angle 1$ 在截线 $l$ 与 $a$ 的交点处，$\\angle 2$ 在截线 $l$ 与 $b$ 的交点处，且 $\\angle 1, \\angle 2$ 是内错角',
+          '取 $\\angle 1$ 的对顶角 $\\angle 3$，由对顶角相等：$\\angle 3 = \\angle 1$',
+          '由已知 $\\angle 1 = \\angle 2$，故 $\\angle 3 = \\angle 2$',
+          '观察 $\\angle 3$ 与 $\\angle 2$ 的位置：$\\angle 3$ 与 $\\angle 1$ 是对顶角，$\\angle 1$ 与 $\\angle 2$ 是内错角，故 $\\angle 3$ 与 $\\angle 2$ 是**同位角**',
+          '由判定 1（同位角相等，两直线平行）：$a \\parallel b$。证毕。',
+        ],
+        tip: '"内错角相等 → 平行"的推导思路：内错角 → 对顶角 → 同位角 → 判定 1。记住这条推理链。',
+      },
+      {
+        title: '例 1：基础——用内错角判定平行',
+        body: '直线 $AB$、$CD$ 被直线 $EF$ 所截，已知 $\\angle AEF = \\angle EFD$。求证：$AB \\parallel CD$。',
+        steps: [
+          '识别角的类型：$\\angle AEF$ 与 $\\angle EFD$ 是以 $EF$ 为截线，$AB, CD$ 为被截直线时的**内错角**',
+          '由已知 $\\angle AEF = \\angle EFD$，即内错角相等',
+          '由判定 2（内错角相等，两直线平行）：$AB \\parallel CD$。证毕。',
+        ],
+      },
+      {
+        title: '例 2：用同旁内角互补判定平行',
+        body: '已知 $\\angle 1 = 110^\\circ$，$\\angle 2 = 70^\\circ$，且 $\\angle 1$ 与 $\\angle 2$ 是直线 $a, b$ 被截线 $l$ 所截形成的**同旁内角**，判断 $a, b$ 是否平行。',
+        steps: [
+          '计算两角之和：$\\angle 1 + \\angle 2 = 110^\\circ + 70^\\circ = 180^\\circ$',
+          '即 $\\angle 1$ 与 $\\angle 2$ 互补',
+          '由判定 3（同旁内角互补，两直线平行）：$a \\parallel b$。',
+        ],
+        tip: '看到同旁内角，立刻想"和是否为 $180^\\circ$"，而不是"是否相等"。同旁内角互补才平行，相等不平行！',
+      },
+      {
+        title: '例 3：两条垂线互相平行',
+        body: '已知 $a \\perp l$，$b \\perp l$（$a, b$ 都垂直于直线 $l$）。求证：$a \\parallel b$。',
+        steps: [
+          '设 $l$ 与 $a$ 交于 $P$，$l$ 与 $b$ 交于 $Q$',
+          '由 $a \\perp l$：$l$ 在 $P$ 处与 $a$ 所成的角 $\\angle 1 = 90^\\circ$',
+          '由 $b \\perp l$：$l$ 在 $Q$ 处与 $b$ 所成的对应角 $\\angle 2 = 90^\\circ$（$\\angle 1, \\angle 2$ 是同位角）',
+          '因为 $\\angle 1 = \\angle 2 = 90^\\circ$，同位角相等，由判定 1：$a \\parallel b$。证毕。',
+        ],
+        tip: '也可以直接引用推论 2："垂直于同一直线的两直线平行"——这是判定 1 的特殊情形，可以直接用。',
+      },
+      {
+        title: '易错点总结',
+        body: '学习平行线判定，以下几点是最高频的错误：\n\n1. **判定方向不能反**：判定是"角的关系 $\\Rightarrow$ 直线平行"；性质是"直线平行 $\\Rightarrow$ 角的关系"。两者方向相反，绝对不能混用。\n2. **截线必须找对**：使用判定前，先认清截线和被截直线，角的类型才正确。\n3. **同旁内角是互补不是相等**：判定 3 要求"和为 $180^\\circ$"，写成"相等"会导致错误的结论。\n4. **平行公理的"有且只有"**：保证平行线的存在性与唯一性，两者缺一不可。',
+        reveal: {
+          q: '已知 $\\angle 1 = 50^\\circ$，$\\angle 2 = 130^\\circ$，且是内错角，$a, b$ 是否平行？',
+          a: '内错角相等才平行，$50^\\circ \\ne 130^\\circ$，不满足判定 2。再检查判定 3（同旁内角互补）：内错角不是同旁内角，故判定 3 也不适用。**无法判定 $a \\parallel b$**。',
+        },
+      },
+    ],
+    questions: [
+      {
+        id: 'u2c4q1',
+        type: 'choice',
+        prompt: '直线 $a, b$ 被截线 $l$ 所截，若同位角 $\\angle 1 = \\angle 2$，则可以得到什么结论？',
+        options: ['$a \\perp b$', '$a \\parallel b$', '$a$ 与 $b$ 相交但不平行', '无法判断'],
+        answer: 1,
+        explain: '由判定 1（同位角相等，两直线平行）：$\\angle 1 = \\angle 2$ 且 $\\angle 1, \\angle 2$ 是同位角，则 $a \\parallel b$。',
+      },
+      {
+        id: 'u2c4q2',
+        type: 'judge',
+        prompt: '同旁内角相等，可以判定两直线平行。',
+        answer: false,
+        explain: '判定 3 要求同旁内角**互补**（和为 $180^\\circ$），而不是相等。同旁内角相等不能推出两直线平行（除非两角都是 $90^\\circ$，但那是特殊情形，不是通用判定）。',
+      },
+      {
+        id: 'u2c4q3',
+        type: 'input',
+        prompt: '已知 $\\angle 1 = 65^\\circ$，$\\angle 2 = 65^\\circ$，且 $\\angle 1, \\angle 2$ 是直线 $a, b$ 被截线 $l$ 所截形成的同位角，请写出能推出 $a \\parallel b$ 所用的判定序号（填数字 1、2 或 3）。',
+        accept: ['1', '判定1', '判定 1'],
+        explain: '同位角相等，由**判定 1**（同位角相等，两直线平行）推出 $a \\parallel b$。',
+      },
+      {
+        id: 'u2c4q4',
+        type: 'choice',
+        prompt: '已知 $\\angle 1 + \\angle 2 = 180^\\circ$，$\\angle 1, \\angle 2$ 是直线 $a, b$ 被截线 $l$ 所截形成的**同旁内角**，则：',
+        options: [
+          '$a, b$ 不平行',
+          '$a \\parallel b$',
+          '$a \\perp b$',
+          '无法判断',
+        ],
+        answer: 1,
+        explain: '同旁内角互补（$\\angle 1 + \\angle 2 = 180^\\circ$），由判定 3（同旁内角互补，两直线平行）：$a \\parallel b$。',
+      },
+      {
+        id: 'u2c4q5',
+        type: 'judge',
+        prompt: '已知 $a \\parallel c$，$b \\parallel c$，可以推出 $a \\parallel b$。',
+        answer: true,
+        explain: '由推论 1：如果两条直线都与同一条直线平行，则这两条直线平行。故 $a \\parallel c$ 且 $b \\parallel c$ $\\Rightarrow$ $a \\parallel b$。',
+      },
+      {
+        id: 'u2c4q6',
+        type: 'choice',
+        prompt: '以下哪个条件**不能**推出直线 $a \\parallel b$（$a, b$ 被截线 $l$ 所截）？',
+        options: [
+          '同位角相等',
+          '内错角相等',
+          '同旁内角互补',
+          '同旁内角相等',
+        ],
+        answer: 3,
+        explain: '判定平行的三种条件是：同位角相等（判定 1）、内错角相等（判定 2）、同旁内角**互补**（判定 3）。"同旁内角相等"不是判定平行的条件，故选 D。',
+      },
+      {
+        id: 'u2c4q7',
+        type: 'input',
+        prompt: '已知 $a \\perp l$，$b \\perp l$，则 $a$ 与 $b$ 的位置关系是什么？（填"平行"或"垂直"）',
+        accept: ['平行', 'a∥b', 'a ∥ b', '互相平行'],
+        explain: '由推论 2（垂直于同一直线的两直线平行）：$a \\perp l$ 且 $b \\perp l$ $\\Rightarrow$ $a \\parallel b$。本质是两直线与 $l$ 所成的同位角都为 $90^\\circ$，相等，由判定 1 推出平行。',
+      },
+      {
+        id: 'u2c4q8',
+        type: 'match',
+        prompt: '将判定方法与对应的条件配对。',
+        left: ['判定 1', '判定 2', '判定 3', '推论 2'],
+        right: ['同位角相等', '内错角相等', '同旁内角互补', '两直线都垂直于同一直线'],
+        explain: '判定 1：同位角相等 $\\Rightarrow$ 平行；判定 2：内错角相等 $\\Rightarrow$ 平行；判定 3：同旁内角互补 $\\Rightarrow$ 平行；推论 2：垂直于同一直线的两直线平行（判定 1 的特殊情形）。',
+      },
+    ],
+  },
+]

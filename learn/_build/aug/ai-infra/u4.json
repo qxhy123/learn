@@ -1,0 +1,773 @@
+{
+  "u4-l1": [
+    {
+      "type": "choice",
+      "prompt": "单机训练的「状态路径」包含以下哪些内容？",
+      "options": [
+        "model params、gradients、optimizer states、scheduler、RNG、dataset cursor",
+        "GPU 驱动版本、CUDA toolkit 版本、PyTorch 版本",
+        "DataLoader worker 数量、pin_memory 设置、collate_fn 实现",
+        "NCCL 版本、InfiniBand 固件、PCIe 拓扑"
+      ],
+      "answer": 0,
+      "explain": "状态路径负责记录训练的完整可恢复状态，包括 model params、gradients、optimizer states（Adam m/v）、scheduler、RNG（CPU/CUDA）、dataset cursor 以及 microstep_idx/optimizer_step 计数器。驱动版本属于环境，DataLoader 参数属于配置，NCCL 版本属于通信栈。",
+      "id": "u4-l1-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "FP8 训练中，`amax history`、`scale` 和 `scale_inv` 是普通的超参数，不需要写入 checkpoint，恢复后重新冷启动即可。",
+      "answer": false,
+      "explain": "FP8 的 amax history、scale 和 scale_inv 是训练精度状态（precision state），属于必须保存的 checkpoint 内容。冷启动这些值会导致恢复后前几步用错误的 scale，引发精度抖动甚至 NaN，与精确 resume 不等价。",
+      "id": "u4-l1-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "生产单机训练准入规则要求 HBM 峰值 P95 不超过单卡容量的多少比例？（填百分比数值，如 85）",
+      "accept": ["85", "85%", "0.85"],
+      "explain": "准入规则：M_peak_P95 ≤ 0.85 × HBM，留 15% 给 allocator 碎片、shape 抖动和临时 kernel workspace。超过 0.85 门槛的作业在规模化时 OOM 风险很高。",
+      "id": "u4-l1-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "单机训练循环中，以下哪种操作会把 GPU 的异步执行变成串行，拖慢训练步吞吐？",
+      "options": [
+        "使用 `pin_memory=True` 的 DataLoader",
+        "在训练循环内频繁调用 `loss.item()` 或 `tensor.cpu()`",
+        "开启 `non_blocking=True` 的 `.to(device)` 调用",
+        "启用 `torch.compile` 对模型做静态图优化"
+      ],
+      "answer": 1,
+      "explain": "`loss.item()` 和 `tensor.cpu()` 会触发 GPU→CPU 同步（host 等待 device 完成），把异步 CUDA 队列变成串行执行。pin_memory 和 non_blocking 相反——正确使用时可以提升异步度。",
+      "id": "u4-l1-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧单机训练「四条路径」与其典型故障症状匹配",
+      "left": ["数据路径", "状态路径", "精度策略路径", "故障路径"],
+      "right": [
+        "GPU 利用率低，DataLoader visible wait 超 step time 的 20%",
+        "resume 后 LR schedule 错位，loss 出现台阶式跳变",
+        "训练中途 loss 突然变 NaN，GradScaler found_inf 频繁出现",
+        "训练循环卡死，无日志输出，进程存活但无前进"
+      ],
+      "explain": "数据路径问题表现为 GPU 等数据（利用率低或 DataLoader wait 高）；状态路径问题在 resume 时暴露（LR/cursor 错位）；精度策略问题表现为 NaN 或 overflow；故障路径对应 OOM、hang、I/O stall 等。",
+      "id": "u4-l1-new-q5"
+    },
+    {
+      "type": "input",
+      "prompt": "LLaMA-7B（6.7B 参数）在 8 张 H100 BF16 训练，non_pad_tokens/s = 95,000，H100 BF16 峰值算力 989 TFLOPS，MFU 约等于多少？（保留一位小数，以百分比填写，如 48.3）",
+      "accept": ["48.3", "48.3%", "~48.3", "约48.3"],
+      "explain": "MFU = tokens/s × FLOPs/token ÷ (N_gpu × 峰值算力) = 95000 × (6 × 6.7×10⁹) ÷ (8 × 989×10¹²) = 95000 × 40.2×10⁹ ÷ 7.912×10¹⁵ ≈ 3.819×10¹⁵ ÷ 7.912×10¹⁵ ≈ 48.3%。",
+      "id": "u4-l1-new-q6"
+    },
+    {
+      "type": "judge",
+      "prompt": "NUMA 错配（CPU worker 在一个 socket 备数据，却通过另一个 socket 连接的 PCIe 送 GPU）主要影响模型训练的精度，而不是数据吞吐。",
+      "answer": false,
+      "explain": "NUMA 错配影响的是数据吞吐（H2D 带宽下降），不是训练精度。数据流通过错误 NUMA 节点的 PCIe 控制器，PCIe 带宽被跨 socket 互联（如 QPI/UPI）消耗，降低有效 H2D 带宽和 DataLoader 填充率。",
+      "id": "u4-l1-new-q7"
+    },
+    {
+      "type": "choice",
+      "prompt": "profiler 排查单机训练瓶颈时，下列工具使用顺序哪个是推荐的「逐层收窄」正确顺序？",
+      "options": [
+        "先 Nsight Compute 分析每个 kernel，再 torch.profiler 验证阶段",
+        "先 torch.profiler 定位 PyTorch 阶段，再 Nsight Systems 确认 CUDA stream，最后 Nsight Compute 分析坏 kernel",
+        "先 DCGM 看 GPU 健康，再 iostat 看磁盘，最后 torch.profiler 做应用层分析",
+        "直接用 Nsight Compute 抓全量训练，获取最完整数据"
+      ],
+      "answer": 1,
+      "explain": "推荐顺序：torch.profiler（PyTorch 阶段） → Nsight Systems（CUDA stream 时间线） → Nsight Compute（坏 kernel 内部指标）→ DCGM（GPU 健康）→ iostat/perf（host 侧 I/O）。先用轻量工具定位阶段，再针对具体 kernel 做重量级分析，避免 Nsight Compute 全量抓取产生 GB 级 trace 并扭曲 profiling 结果。",
+      "id": "u4-l1-new-q8"
+    },
+    {
+      "type": "judge",
+      "prompt": "BF16 训练不需要 GradScaler，是因为 BF16 的指数位宽（8 bit）与 FP32 相同，不存在梯度溢出问题。",
+      "answer": true,
+      "explain": "BF16 的指数（exponent）宽度为 8 bit，与 FP32 的 8 bit 指数相同，因此动态范围（数量级范围）接近 FP32。梯度不容易溢出到 Inf，无需 GradScaler 做 loss scaling。FP16 只有 5 bit 指数，动态范围窄，必须配 GradScaler。",
+      "id": "u4-l1-new-q9"
+    },
+    {
+      "type": "choice",
+      "prompt": "单机 baseline 准入 checklist 中，DataLoader visible wait 的合格阈值是多少？",
+      "options": [
+        "低于 step time 的 1%",
+        "低于 step time 的 5%",
+        "低于 step time 的 15%",
+        "低于 step time 的 50%"
+      ],
+      "answer": 1,
+      "explain": "准入要求 DataLoader visible wait < 5%（稳态 step）。超过 5% 说明 GPU 在等数据，是明显的数据路径瓶颈，需要先用 torch.profiler 确认来自 read/preprocess/collate 哪段，再单变量调整，不能直接上分布式扩容。",
+      "id": "u4-l1-new-q10"
+    }
+  ],
+  "u4-l2": [
+    {
+      "type": "choice",
+      "prompt": "ZeRO-3（N=16 DP，7B BF16+AdamW FP32）时，每参数单卡字节数约为多少？",
+      "options": [
+        "1 byte/param",
+        "2 bytes/param",
+        "4 bytes/param",
+        "8 bytes/param"
+      ],
+      "answer": 0,
+      "explain": "ZeRO-3 把全部状态（params 2B + grads 2B + Adam 12B = 16B/param）均匀切到 N=16 个 rank，每参数单卡 = 16/16 = 1 byte/param。这是 ZeRO-3 在大 world_size 下的理论最优，但 AllGather/ReduceScatter 通信量最大。",
+      "id": "u4-l2-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "FSDP FULL_SHARD 的显存峰值出现在稳态 shard 驻留阶段，可以用「总参数/world_size」简单估算。",
+      "answer": false,
+      "explain": "FSDP 的 HBM 峰值出现在「当前层完整参数 + prefetch 层完整参数 + activation」叠加的瞬间，而不是稳态 shard。峰值远高于 shard 大小 / world_size，必须用 profiler 或 memory snapshot 验证，不能静态心算。",
+      "id": "u4-l2-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "FSDP FULL_SHARD 中，`reshard_after_forward` 标志的作用是什么？（填核心功能，不超过 15 字）",
+      "accept": ["forward 后释放完整参数只保留 shard", "前向后释放完整参数", "forward 结束后丢弃完整参数保留 shard", "forward 后释放 AllGather 的临时完整参数"],
+      "explain": "`reshard_after_forward=True` 在每层 forward 结束后立即释放 AllGather 拼出的完整参数，恢复到稳态 shard，减少 HBM 峰值。代价是 backward 时需要重新 AllGather，增加通信次数。",
+      "id": "u4-l2-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "DDP 的 gradient bucket 默认大小是多少？",
+      "options": [
+        "1 MB",
+        "10 MB",
+        "25 MB",
+        "100 MB"
+      ],
+      "answer": 2,
+      "explain": "DDP 的默认 `bucket_cap_mb=25`（25 MB）。bucket 太小会产生大量小 NCCL collective，launch overhead 高；bucket 太大会导致 backward 结束后 tail NCCL 仍在运行，暴露通信。25 MB 是 PyTorch 的默认折中值，需要用 profiler 根据实际 step time 调优。",
+      "id": "u4-l2-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 ZeRO 阶段与其切分的训练状态匹配",
+      "left": ["ZeRO-1", "ZeRO-2", "ZeRO-3 / FSDP FULL_SHARD", "DDP（无 ZeRO）"],
+      "right": [
+        "只切 optimizer state（Adam m/v），params 和 grads 每卡完整复制",
+        "切 optimizer state + grads，params 每卡完整复制",
+        "params、grads、optimizer state 全部切分，forward 时 AllGather 临时拼出完整参数",
+        "params、grads、optimizer state 全部每卡完整复制，无切分"
+      ],
+      "explain": "ZeRO 三个阶段逐步扩大切分范围：ZeRO-1 仅切 optimizer state，ZeRO-2 再切 grads，ZeRO-3/FSDP FULL_SHARD 三者全切。DDP 无任何切分，每卡完整复制所有状态。",
+      "id": "u4-l2-new-q5"
+    },
+    {
+      "type": "judge",
+      "prompt": "FSDP 中 `backward_prefetch=BACKWARD_PRE` 可以减少 backward 阶段的暴露通信，原理是在前一 unit backward 执行时就提前 AllGather 下一 unit 的参数。",
+      "answer": true,
+      "explain": "`BACKWARD_PRE` 让 FSDP 在处理第 i 层 backward 时就发起第 i+1 层（下一个 FSDP unit）的 AllGather，使参数通信与前一层 backward 计算重叠，减少暴露通信，改善 HBM 吞吐利用率。",
+      "id": "u4-l2-new-q6"
+    },
+    {
+      "type": "input",
+      "prompt": "ZeRO-2 在 N=8、BF16+AdamW FP32（每参数 16 bytes）场景下，端到端显存 reduction 约为多少倍？（保留一位小数）",
+      "accept": ["4.3", "~4.3", "约4.3", "4.3x"],
+      "explain": "ZeRO-2 切 grads（2B）+ optimizer state（12B），每参数单卡 = params（2B）+ (grads+Adam)/8 = 2 + 14/8 = 3.75 bytes。reduction = 16 / 3.75 ≈ 4.27×，约 4.3×。ZeRO-2 不是整体 8 倍，因为 params 仍每卡完整复制。",
+      "id": "u4-l2-new-q7"
+    },
+    {
+      "type": "choice",
+      "prompt": "当「NCCL timeout」和「NET/Socket」字样同时出现在训练日志中时，最可能的根本原因是什么？",
+      "options": [
+        "某个 rank 因 data skew 处理时间过长，晚进入 collective",
+        "RDMA（InfiniBand/RoCE）未正确注入容器，NCCL fallback 到 TCP/Socket",
+        "bucket 太大，最后一个 bucket AllReduce 时间过长",
+        "GPU 降频导致 backward compute 变慢，其他 rank 超时等待"
+      ],
+      "answer": 1,
+      "explain": "NCCL 日志中 `NET/Socket` 说明 NCCL 选用了 socket backend（TCP/IP），而非 RDMA，这通常是 InfiniBand/RoCE 设备未正确映射到容器（缺少设备挂载或 RDMA 插件未安装）导致。socket transport 带宽和延迟比 RDMA 差一个数量级，频繁触发超时。",
+      "id": "u4-l2-new-q8"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 Tensor Parallel（TP）中，FSDP/ZeRO-3 可以直接用于切分单层 activation（如 attention score 矩阵），降低长序列带来的单层 OOM 风险。",
+      "answer": false,
+      "explain": "FSDP/ZeRO-3 只切分训练状态（params/grads/optimizer state），不切分 activation。长序列导致的单层 activation OOM 需要 FlashAttention（将 O(seq²) 降为 O(seq)）、Tensor Parallel（按 head 分片）或 Context Parallel（按 token 分片）来解决，FSDP 无法解决此问题。",
+      "id": "u4-l2-new-q9"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 DP 弱扩展效率问题与其最合适的优化手段匹配",
+      "left": [
+        "暴露通信占 step time 25%，计算无法覆盖 AllReduce",
+        "某个 rank 持续比其他 rank 慢 30%，token skew 正常",
+        "dataset shard 按样本数均分，但某些 rank step time 随 seq length 波动大",
+        "FSDP 进入多节点后，OOM 频率上升"
+      ],
+      "right": [
+        "缩小 bucket size 或启用 gradient compression 减少通信量",
+        "检查 DCGM/nvidia-smi 排查 GPU 降频、ECC 错误或 NUMA 错配",
+        "改为按 non-pad token budget 均分 shard，而非按样本数均分",
+        "用 profiler 验证 AllGather 瞬时峰值并调整 limit_all_gathers 参数"
+      ],
+      "explain": "通信暴露靠减少通信或增加重叠；硬件 straggler 靠 DCGM/nvidia-smi 排查物理原因；data skew 靠 token budget 均分；多节点 OOM 通常来自 FSDP AllGather 瞬时峰值，可调 limit_all_gathers 降低。",
+      "id": "u4-l2-new-q10"
+    }
+  ],
+  "u4-l3": [
+    {
+      "type": "choice",
+      "prompt": "Selective Activation Checkpointing（选择性 AC）+FlashAttention 相比无任何 AC 的标准 MHA，对 70B 模型 80 层的 activation 大小影响约是多少？",
+      "options": [
+        "从约 784 GB 降低到约 97 GB",
+        "从约 784 GB 降低到约 43 GB",
+        "从约 784 GB 降低到约 11 GB",
+        "从约 97 GB 降低到约 43 GB"
+      ],
+      "answer": 1,
+      "explain": "无 AC + 标准 MHA ≈ 784 GB；FlashAttention 替代（不存 seq² attention score）≈ 97 GB；Selective AC + FlashAttention ≈ 43 GB；Full Recompute（只存 block 输入）≈ 11 GB。Selective AC + FlashAttention 比纯 FlashAttention 再省约 50%。",
+      "id": "u4-l3-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "Sequence Parallel（SP）与 Tensor Parallel（TP）通常在同一个进程组内一起使用，SP 将 TP 的 AllReduce 替换为 ReduceScatter+AllGather，从而减少非 attention 激活的常驻显存。",
+      "answer": true,
+      "explain": "SP 通常在 TP 组内启用：把 TP AllReduce 改为 ReduceScatter(seq)，使 LayerNorm、Dropout 等非 attention activation 按 sequence 维度分片，每 rank 只保留 S/TP 的 activation，下一个 ColumnParallel 前再 AllGather(seq) 还原。总通信量与 TP AllReduce 近似，但 activation 常驻量降约 1/TP。",
+      "id": "u4-l3-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "32 GPU 的 3D 并行配置（DP=2, PP=4, TP=4），global_rank=17 的 tp_rank 是多少？",
+      "accept": ["1"],
+      "explain": "按 row-major 公式：tp_rank = global_rank % TP = 17 % 4 = 1。依次验证：cp_rank = (17 // 4) % 1 = 0；pp_rank = (17 // (4×1)) % 4 = 4 % 4 = 0；dp_rank = 17 // (4×1×4) = 17 // 16 = 1。所以 global_rank=17 属于 (dp=1, pp=0, tp=1)。",
+      "id": "u4-l3-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "PP=4 stage，stage 0 含 Embedding（比普通 block 慢 20%），stage 3 含 LM Head+Loss（比普通 block 慢 25%）。stage_imbalance_ratio 约为多少？该如何处置？",
+      "options": [
+        "约 5%，可接受，无需操作",
+        "约 25%，必须修复：将 Embedding 和 LM Head 单独放成独立 stage",
+        "约 12%，显著，应重新分配层数或单独处理首尾 stage",
+        "约 2%，在噪声范围内，继续观察"
+      ],
+      "answer": 1,
+      "explain": "stage_imbalance_ratio = max(stage_time) / mean(stage_time) - 1。若最慢 stage（LM Head，慢 25%）与均值之差约为 25%，超过 15% 门槛，必须强制修复：将 Embedding 单独放 stage 0（0 层 Transformer block），LM Head 用 Vocab Parallel 分担或单独放末 stage，重新平衡各 stage 层数。",
+      "id": "u4-l3-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 3D 并行通信类型与其覆盖（overlap）计算的对象匹配",
+      "left": [
+        "TP AllReduce",
+        "PP send/recv（1F1B 稳态）",
+        "FSDP AllGather（backward prefetch）",
+        "CP Ring KV exchange"
+      ],
+      "right": [
+        "同层下一个 ColumnParallel GEMM（需 CUDA_DEVICE_MAX_CONNECTIONS=1 + 独立 stream）",
+        "同 stage 下一个 microbatch 的 forward/backward compute（需 m ≥ PP）",
+        "前一 FSDP unit 的 backward compute（需 BACKWARD_PRE 模式）",
+        "本地 context block 的 attention 计算（Ring FlashAttention 实现）"
+      ],
+      "explain": "各并行通信的 overlap 对象：TP AllReduce 覆盖下一层 GEMM；PP isend/irecv 在 1F1B 稳态被下一 microbatch 计算覆盖；FSDP prefetch 覆盖前一 unit backward；CP ring exchange 在 Ring FA 中与本地 attention 并行。通信被 compute 覆盖的部分不影响 step time。",
+      "id": "u4-l3-new-q5"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下关于 Zero Bubble PP 的描述，哪项是正确的？",
+      "options": [
+        "Zero Bubble 通过增加 microbatch 数量到无穷大来消除 bubble",
+        "Zero Bubble 将 backward 拆分为 B-pass（dL/dX）和 W-pass（dL/dW），W-pass 推迟到空槽执行",
+        "Zero Bubble 要求每个 PP stage 持有相同数量的层，不支持非均匀切分",
+        "Zero Bubble 完全不需要 pipeline 预热（warmup）阶段"
+      ],
+      "answer": 1,
+      "explain": "Zero Bubble 的核心创新是把 backward 拆成两部分：B-pass 计算 dL/dX（传递给前一层），W-pass 计算 dL/dW（更新本层权重）。W-pass 不需要即时执行，可以推迟填充原本的 pipeline bubble 时间槽，使 bubble 接近 0。代价是 activation 驻留时间更长。",
+      "id": "u4-l3-new-q6"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 3D 并行中，rank mesh 的 parallel layout（DP/PP/TP/CP 维度大小及 global_rank 映射规则）只需要记录在代码注释里，不需要写入 checkpoint metadata。",
+      "answer": false,
+      "explain": "rank mesh 定义必须写入 checkpoint metadata，全局唯一。若 checkpoint metadata 缺少 parallel layout，恢复时按另一套 rank order 解释 shard 会导致静默 weight corruption——训练能跑、loss 下降，但权重已经错位。这是最危险的恢复错误之一。",
+      "id": "u4-l3-new-q7"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Megatron-style TP 中，一个 Transformer block 的 forward 有几次 AllReduce（不含 SP）？",
+      "accept": ["2", "两次", "2次"],
+      "explain": "标准 Megatron TP 每个 Transformer block 在 forward 时有 2 次 AllReduce：一次在 attention output projection（Row Parallel Linear 后），一次在 MLP FC2（Row Parallel Linear 后）。backward 再对称各 2 次，共 4 次。",
+      "id": "u4-l3-new-q8"
+    },
+    {
+      "type": "choice",
+      "prompt": "64K context、CP=4 时，每层 CP 通信约 201 MB（forward），80 层×forward+backward 约 32 GB/step，400G IB 纯通信约 0.64 s。若不使用 Ring FlashAttention 做 overlap，这 0.64 s 对 step time 的影响是什么？",
+      "options": [
+        "约 0.64 s 全部暴露，直接加到 step time 上，严重影响吞吐",
+        "约 0.64 s 被 backward 计算完全覆盖，对 step time 无影响",
+        "影响约 50%，因为 forward 和 backward 各一半通信",
+        "影响不到 1%，因为 IB 通信延迟与计算不在同一 CUDA stream"
+      ],
+      "answer": 0,
+      "explain": "若不用 Ring FlashAttention 做 overlap，0.64 s 的 CP 通信完全串行暴露，直接加到 step time 上。这是 CP 必须通过 Ring FA 实现 KV exchange 与本地 attention 并行的根本原因。CP 的「通信被覆盖」不是自动的，需要 Ring FlashAttention 的实现支持。",
+      "id": "u4-l3-new-q9"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧问题场景与最适合引入的并行策略匹配",
+      "left": [
+        "FSDP 后单张 H100 仍 OOM，但同一层的 hidden 矩阵本身就超出单卡",
+        "模型层数极多，FSDP 后单卡 shard 的参数已经很小，但训练时间极长",
+        "训练 128K context 的长文档模型，attention workspace 占满 HBM",
+        "7B 模型 BF16+AdamW，单节点 optimizer state 无法放入单卡"
+      ],
+      "right": [
+        "Tensor Parallel（TP），在节点内 NVSwitch 切分层内 hidden/heads",
+        "Pipeline Parallel（PP），切层段减少每卡持有的层数",
+        "Context Parallel（CP），按 token 分片做 Ring FlashAttention",
+        "FSDP FULL_SHARD 或 ZeRO-3，切分训练状态"
+      ],
+      "explain": "TP 解决单层矩阵放不下；PP 解决层数过多；CP 解决超长序列 attention workspace 问题；FSDP/ZeRO-3 解决训练状态过大。按最小满足约束原则选组合。",
+      "id": "u4-l3-new-q10"
+    }
+  ],
+  "u4-l4": [
+    {
+      "type": "choice",
+      "prompt": "DeepSeek-V3 有 671B 总参数，每 token 激活约 37B（256 routed expert，top-8）。Dense 等效模型若要达到同等每 token FLOPs，其总参数量约为多少？",
+      "options": [
+        "约 37B（与激活参数量相同）",
+        "约 671B（与总参数量相同，全部激活）",
+        "约 150B（折中估算）",
+        "约 74B（top-8 比例乘以 256）"
+      ],
+      "answer": 0,
+      "explain": "MoE 的每 token FLOPs 主要由激活参数量决定（约 37B），而不是总参数量（671B）。Dense 模型若要达到同等每 token 计算量，其参数量约等于 MoE 的激活参数量（37B）。MoE 的核心价值是参数容量（671B）与每 token FLOPs（~37B）解耦。",
+      "id": "u4-l4-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 MoE 的 Aux Loss 负载均衡（Switch/GShard 风格）中，辅助损失 L_aux 与主任务 loss 的梯度方向完全一致，因此不会对训练精度产生负面影响。",
+      "answer": false,
+      "explain": "Aux Loss 要求路由分配更均匀，而主 loss 要求选最有能力的 expert，两者梯度方向存在冲突。α 系数过大会过度干预 router，损害任务性能；过小则平衡效果不足。DeepSeek-V3 正是为了消除这种梯度冲突才引入 Loss-Free Balancing（动态 bias 调整）。",
+      "id": "u4-l4-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "MoE 的 Loss-Free Balancing 中，checkpoint 除了 model weights 和 optimizer state，还必须额外保存哪类状态？（填关键词）",
+      "accept": ["router bias", "bias", "动态 bias", "router_bias", "expert bias"],
+      "explain": "Loss-Free Balancing 通过动态调整每个 expert 的 bias（过载 expert 降 bias，欠载 expert 升 bias）来维持负载均衡，而不修改主 loss 梯度。这些 bias 是训练状态的一部分，必须随 checkpoint 保存，否则恢复后平衡状态被重置，可能引发短期 expert 坍缩。",
+      "id": "u4-l4-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "MoE 的 EP size 通常设置为一个 NVSwitch domain（8 或 16 卡）而非更大，主要原因是什么？",
+      "options": [
+        "EP size 超过 16 时 router 无法正确计算 top-K",
+        "EP size 越大，expert 参数量不变但 FLOPs 增加",
+        "EP size 超出单节点后需要跨 IB 做 All-to-All，incast 压力急剧上升",
+        "EP size 过大会导致 DP 维度的 AllReduce 通信量成指数增加"
+      ],
+      "answer": 2,
+      "explain": "节点内 All-to-All 走 NVSwitch（高带宽、低延迟、无 incast 问题）；跨节点需要走 IB/RoCE，All-to-All 的 incast 模式（N×N 全互联）在 IB 交换机上容易打爆 shared buffer。EP size 越大，incast 程度越严重，All-to-All 延迟随之上升，成为主要瓶颈。",
+      "id": "u4-l4-new-q4"
+    },
+    {
+      "type": "judge",
+      "prompt": "Dropless MoE 不设固定 capacity，因此不需要监控任何 overflow 相关指标，只需关注 drop_rate 即可。",
+      "answer": false,
+      "explain": "Dropless MoE 不设固定 capacity，无法用 drop_rate 指标。应重点监控 `max_load/avg_load`、`p99 expert tokens`、`dispatch buffer peak`、`straggler rank` 和 `overflow fallback count`。buffer 峰值不可静态锁死，动态 buffer OOM 需要 EP group 级事务处理。",
+      "id": "u4-l4-new-q5"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 MoE EP Reshape 步骤与其关键操作匹配",
+      "left": [
+        "确定每个 expert 在新 EP 配置下的目标 ep_rank",
+        "迁移 Loss-Free Balancing 的 bias",
+        "处理 ETP>1 时多个 TP rank 写出的相同 expert 副本",
+        "验证 reshape 后权重正确性"
+      ],
+      "right": [
+        "通过 expert_owner manifest 重映射，不能按 rank 索引直接计算",
+        "bias 必须随 expert 一起迁移到新 ep_rank，否则平衡状态丢失",
+        "checkpoint writer 选 canonical replica 或 checksum 去重，避免误认为独立 shard",
+        "比对 reshape 前后每个 expert 的权重 checksum，确认无静默错误"
+      ],
+      "explain": "EP Reshape 的四个关键步骤各有陷阱：manifest 重映射避免 rank 索引混淆；bias 随 expert 迁移保持均衡状态；ETP 去重避免把副本误当独立 shard；checksum 验证避免静默 corruption。",
+      "id": "u4-l4-new-q6"
+    },
+    {
+      "type": "choice",
+      "prompt": "Fixed-Capacity MoE 的 capacity_factor 设置从 1.0 增大到 2.0，对训练的主要影响是什么？",
+      "options": [
+        "token drop rate 降低，但每层 All-to-All 通信量翻倍",
+        "token drop rate 降低，expert 的 buffer 显存占用约翻倍，且通信 buffer 也随之增大",
+        "token drop rate 不变，仅 activation 显存增大",
+        "capacity_factor 只影响推理效率，对训练没有影响"
+      ],
+      "answer": 1,
+      "explain": "capacity_factor 增大时，每个 expert 预分配的 token 槽翻倍，buffer 显存随之增大约 2 倍，dispatch 通信 buffer 也增大。好处是 drop rate 降低（从高风险到基本不丢）；代价是显存和通信 buffer 成本翻倍。",
+      "id": "u4-l4-new-q7"
+    },
+    {
+      "type": "judge",
+      "prompt": "MoE 训练中，如果某个 EP group 中的一个 GPU 挂掉，只影响该 GPU 持有的 expert，其他 EP rank 的 All-to-All 仍可正常完成。",
+      "answer": false,
+      "explain": "All-to-All 是同步集合通信，要求 EP group 中所有 rank 参与。任一 rank 挂掉后，其他 rank 的 All-to-All 会无限等待（hang），整个 EP group 被阻塞，最终触发 NCCL timeout，整个训练作业失败。这是 MoE 比 dense 训练对单点故障更敏感的原因。",
+      "id": "u4-l4-new-q8"
+    },
+    {
+      "type": "input",
+      "prompt": "MoE 的 BF16 router 在不同 GPU 上可能产生不一致的 top-K 结果，推荐用什么 dtype 来保证 reproducibility？（填 dtype 名称）",
+      "accept": ["FP32", "fp32", "float32", "float"],
+      "explain": "BF16 的精度（尾数 7 bit）较低，softmax 在不同 GPU 上舍入方式不同，可能导致 top-K 边界样本的 expert 选择不一致（non-determinism）。用 FP32 router 计算 expert score 可以保证 reproducibility，代价是 router 计算开销略有增加（但 router 本身参数量极小）。",
+      "id": "u4-l4-new-q9"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 MoE 故障现象与其最可能的根因匹配",
+      "left": [
+        "大部分 GPU 计算利用率低，少数 GPU 持续 OOM 或慢步",
+        "All-to-All 延迟突增，IB 交换机监控显示丢包",
+        "loss 下降正常，但长时间后 expert 利用率分布极不均匀",
+        "EP Reshape 后推理 loss 比训练 loss 高出很多"
+      ],
+      "right": [
+        "Router 坍缩：无负载均衡约束导致 token 集中于少数热门 expert",
+        "All-to-All incast 打爆交换机 shared buffer，导致丢包和重传",
+        "Aux Loss 系数 α 过小，负载均衡约束不足，expert 逐渐分化",
+        "EP Reshape 未使用 expert manifest 重映射，expert 参数错位"
+      ],
+      "explain": "MoE 的四类典型故障：GPU 负载不均→router 坍缩；IB 丢包→incast；expert 利用率不均匀→aux loss 不足；reshape 后 loss 异常→expert 参数映射错误。",
+      "id": "u4-l4-new-q10"
+    }
+  ],
+  "u4-l5": [
+    {
+      "type": "choice",
+      "prompt": "True resume 与 warm start 的根本区别是什么？",
+      "options": [
+        "True resume 从 step 0 开始训练，warm start 从任意 step 开始",
+        "True resume 恢复全部训练状态（包括 optimizer、scheduler、RNG、dataset cursor 等），损失曲线与原轨迹连续；warm start 只恢复权重，损失曲线会跳变",
+        "True resume 使用更高精度的 checkpoint 文件，warm start 使用压缩版本",
+        "两者在工程上完全等价，区别只是营销说法"
+      ],
+      "answer": 1,
+      "explain": "True resume = 恢复所有训练状态（model params、optimizer states、scheduler、RNG、dataset cursor、global step、precision state）后，loss 曲线、LR 曲线、token 顺序与原运行完全连续。Warm start 只恢复模型权重，optimizer momentum、LR schedule 等重置，损失曲线会出现可见跳变。",
+      "id": "u4-l5-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "Async checkpoint 在 `TrainMayAdvance` 状态后，训练作业可以继续推进到下一步，此时即使 checkpoint 还在写磁盘，也是安全的。",
+      "answer": true,
+      "explain": "`TrainMayAdvance` 是 async checkpoint 状态机中的关键门槛：训练状态已完整 snapshot 到 CPU DRAM 或 NVMe staging 区，GPU 可以安全推进下一训练步，不会影响正在异步刷写的 checkpoint 内容。这是 async checkpoint 降低 I/O 停顿的核心机制。",
+      "id": "u4-l5-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "PyTorch CUDA allocator 碎片化诊断命令是哪个？（填核心 Python 调用，格式如 `xxx.yyy()`）",
+      "accept": ["torch.cuda.memory_summary()", "torch.cuda.memory_summary", "memory_summary()"],
+      "explain": "`torch.cuda.memory_summary(device=0, abbreviated=False)` 可显示 allocated vs reserved 的差距、block 大小分布、fragmentation ratio 等，是诊断「理论能放下但实际 OOM」的首选工具。当 reserved >> allocated 时说明碎片化严重。",
+      "id": "u4-l5-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种 checkpoint 原子性写入方案在对象存储（如 S3）上是正确的？",
+      "options": [
+        "直接覆盖写 `step_N/` 前缀下的所有文件，完成后更新 `latest.json`",
+        "写不可变 `step_N/` 前缀，所有 shard 完整后用 CAS/generation 条件更新 `latest.json`",
+        "先更新 `latest.json` 指向新 step，再异步完成剩余 shard 写入",
+        "每个 rank 独立更新 `latest.json`，最后写完的 rank 的版本胜出"
+      ],
+      "answer": 1,
+      "explain": "对象存储不支持 POSIX rename，原子性靠：写不可变 step prefix（所有 shard 幂等可重试），全部完成后用条件写（CAS 或 generation check）原子更新 `latest.json`。先更新 pointer 会暴露未完成的 checkpoint；多 rank 独立更新会造成竞争写，最终 pointer 值不确定。",
+      "id": "u4-l5-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 checkpoint 内容与「不保存的后果」匹配",
+      "left": [
+        "scheduler state",
+        "RNG state（CPU/CUDA）",
+        "dataset sampler cursor",
+        "GradScaler state（FP16 训练）"
+      ],
+      "right": [
+        "LR 重复 warmup 或提前 decay，收敛轨迹不可复现",
+        "dropout 掩码和数据增强随机顺序改变，训练结果不可复现",
+        "恢复后重复消费已训练样本或跳过部分样本",
+        "scale 重置为初始值，前几步可能因 scale 过高产生大量 overflow"
+      ],
+      "explain": "scheduler 不保存导致 LR 错位；RNG 不保存导致随机性不一致；dataset cursor 不保存导致样本重复或跳过；GradScaler 不保存导致 FP16 loss scale 重置，overflow 频繁。每项都有独立可观察的后果。",
+      "id": "u4-l5-new-q5"
+    },
+    {
+      "type": "choice",
+      "prompt": "DP degree 从 8 变为 16（TP/PP/FSDP 不变），训练 checkpoint 是否支持 true resume？",
+      "options": [
+        "不支持，DP 变化导致权重 shard 数量改变，无法加载",
+        "有条件支持：权重和 optimizer state 需要经过 reshard 工具处理才能 true resume",
+        "完全支持，DP 变化不影响任何 shard，直接加载",
+        "只支持 warm start，optimizer state 的 DP reshard 工具尚不存在"
+      ],
+      "answer": 1,
+      "explain": "DP degree 变化时，optimizer state 的 shard 需要重新分配（原 8 shard → 16 shard），权重本身也需要 reshard。平台的跨并行策略支持矩阵中，「DP degree 变化，TP/PP/FSDP 不变」为「有条件 true resume」，需要 optimizer reshard 工具处理。未经 reshard 直接加载会导致静默错位。",
+      "id": "u4-l5-new-q6"
+    },
+    {
+      "type": "judge",
+      "prompt": "Activation checkpointing 对所有训练场景都有收益，只要显存不够用就应该开启，不需要分析 step 是否被 compute 打满。",
+      "answer": false,
+      "explain": "Activation checkpointing 用算力换显存（step time 增加 5%-30%）。若 step 已经被 compute 打满（compute-bound），开启 AC 会直接拉长 step time，降低 tokens/s，而且可能破坏 kernel overlap。只有 activation 是峰值主因且 GPU compute 有余量时，AC 才真正划算。",
+      "id": "u4-l5-new-q7"
+    },
+    {
+      "type": "input",
+      "prompt": "PyTorch 中用于减少 allocator 碎片的关键环境变量（可配置 expandable_segments 和 max_split_size_mb）是哪个？",
+      "accept": ["PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF=", "pytorch_cuda_alloc_conf"],
+      "explain": "`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256` 可配置 PyTorch CUDA allocator 行为：expandable_segments 允许 segment 动态扩展，减少碎片；max_split_size_mb 限制单块最大分裂尺寸，降低大块 allocation 失败概率。",
+      "id": "u4-l5-new-q8"
+    },
+    {
+      "type": "choice",
+      "prompt": "checkpoint `post-publish barrier` 的作用是什么？",
+      "options": [
+        "让所有 rank 等待 I/O 写入完成后再 fsync",
+        "确保所有 rank 观察到同一个 latest pointer 后才能继续训练，避免部分 rank 基于旧 pointer 恢复",
+        "对 checkpoint 文件做 checksum 验证，确认无数据损坏",
+        "通知监控系统 checkpoint 已成功写入，触发告警清除"
+      ],
+      "answer": 1,
+      "explain": "post-publish barrier 是两阶段写入的最后一步：coordinator 更新 latest pointer 后，所有 rank 必须先观察到同一个（新的）latest pointer，才能安全继续训练。若某些 rank 仍读到旧 pointer，恢复时会基于不同 checkpoint 版本，导致状态不一致。",
+      "id": "u4-l5-new-q9"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 checkpoint 显存六项与其常被遗漏的原因匹配",
+      "left": [
+        "M_ckpt_buffer（async checkpoint staging）",
+        "M_frag（allocator fragmentation）",
+        "M_comm_buffers（NCCL/FSDP 通信缓冲）",
+        "M_activations（峰值 activation）"
+      ],
+      "right": [
+        "大规模作业 async staging 在 CPU DRAM 不够时会溢出到 GPU，但计算显存预算里常不计入",
+        "reserved >> allocated 时 nvidia-smi 显示空闲但大块 allocation 仍会 OOM",
+        "AllGather/ReduceScatter 的临时 buffer 在 profiler 里不直接显示为 peak",
+        "随 batch × seq × hidden × layers 增长最快，且在短序列 baseline 上很难被预估到长序列规模"
+      ],
+      "explain": "checkpoint staging buffer 常被遗漏（只计入了 params/grads/Adam）；fragmentation 导致理论足够实际 OOM；通信 buffer 在 profiler 里不直观；activation 随 batch/seq/layers 超线性增长，baseline 低估长序列场景。",
+      "id": "u4-l5-new-q10"
+    }
+  ],
+  "u4-l6": [
+    {
+      "type": "choice",
+      "prompt": "PPO 训练中，「actor too old expire」机制的目的是什么？",
+      "options": [
+        "防止 actor 模型文件在磁盘上占用过多空间",
+        "丢弃来自过旧 actor 版本生成的样本，维持 PPO 的 on-policy 假设",
+        "限制 actor 的最大训练步数，避免 over-fitting",
+        "触发 critic 自动更新，使 critic 与 actor 版本保持同步"
+      ],
+      "answer": 1,
+      "explain": "PPO 要求样本来自当前（或近似当前）policy（on-policy 假设），importance sampling clip 的有效性依赖此假设。若 buffer 中的样本来自过旧版本的 actor，old_logprobs 与当前 actor 差距过大，clip ratio 失效，训练不稳定。因此必须 expire 过旧 actor 版本的样本。",
+      "id": "u4-l6-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "DPO 训练中，reference logprob cache 的 key 不需要包含 chat_template_hash，因为 template 只影响 prompt 格式而不影响模型的 logprob 计算。",
+      "answer": false,
+      "explain": "chat template 决定了 prompt 被 tokenize 成什么 token 序列，直接影响 reference model 计算的 logprob 值。若 template 改变但 cache key 不含 template_hash，旧 cache 的 logprob 会在新 template 下被错误复用，导致 DPO 目标函数使用错误的 reference logprob，silently 破坏训练。",
+      "id": "u4-l6-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "GRPO 用于估计 baseline 的统计量是什么？（填核心描述，不超过 15 字）",
+      "accept": ["同组 response 的 reward 均值", "group reward 均值", "同 prompt 多条 response 的 reward 平均", "组内 reward 平均值", "同一 prompt 的 G 条 response reward 均值"],
+      "explain": "GRPO 去掉了 critic，改用同一 prompt 的 G 条 response 的 reward 均值作为 baseline 来估计 advantage：advantage_i = reward_i - mean(reward_1...reward_G)。这避免了 critic 网络的训练开销，但代价是需要 G 倍的 rollout 吞吐。",
+      "id": "u4-l6-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "PPO 训练系统中，以下哪个版本一致性问题会导致最严重的静默训练错误？",
+      "options": [
+        "actor checkpoint 版本与 critic checkpoint 版本相差 1 步",
+        "rollout 时使用 actor_v1，但打分的 RM 使用了与 actor_v1 不匹配的 prompt template",
+        "reference model 与 actor 使用了相同的 base checkpoint，而非 frozen 的单独副本",
+        "eval suite 使用了与训练集略有重叠的 benchmark"
+      ],
+      "answer": 1,
+      "explain": "RM 使用错误的 prompt template 打分时，分数不对应真实 response 质量，且这个错误无法从 loss 曲线上直接观察到（分数可以继续上升，但优化的是错误目标）。actor/critic 版本差 1 步在 PPO clip 允许范围内；reference 与 actor 共享 base 是正常做法；eval 重叠是数据质量问题，不是最严重的 silent 错误。",
+      "id": "u4-l6-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 PPO 组件与其 checkpoint 中必须记录的关键字段匹配",
+      "left": ["actor", "reward model", "buffer", "tokenizer"],
+      "right": [
+        "weight_version、optimizer state、distributed_state（strategy/shards）",
+        "artifact hash + prompt_template hash（frozen，不存 optimizer）",
+        "policy_version、accepted_policy_versions、sample 状态机当前阶段",
+        "artifact hash + chat_template hash（template 变化导致 logprob cache 失效）"
+      ],
+      "explain": "PPO manifest 必须精确记录每个组件的版本锁定字段：actor 需要 optimizer 以支持恢复；RM 是 frozen artifact，只记录 hash 和 template hash；buffer 记录版本依赖和状态机阶段；tokenizer 的 chat_template hash 决定 logprob 可复现性。",
+      "id": "u4-l6-new-q5"
+    },
+    {
+      "type": "judge",
+      "prompt": "SFT 训练的 checkpoint 只需保存 model weights 和 tokenizer，data_version 和 chat_template_hash 不需要记录，因为 SFT 不涉及在线 rollout。",
+      "answer": false,
+      "explain": "SFT checkpoint 必须包含 model + tokenizer + chat_template + data_version。data_version 用于追踪用哪批数据训练的，支持复现和回滚；chat_template 决定训练数据的 tokenize 方式。若缺少这些信息，当出现质量回退时，无法确定是数据问题还是模型问题。",
+      "id": "u4-l6-new-q6"
+    },
+    {
+      "type": "choice",
+      "prompt": "DPO 长度偏差（length bias）的根本原因和解决方向分别是什么？",
+      "options": [
+        "根本原因：chosen response 较长导致 sum_logprob margin 把长度差带入目标；解决：按 chosen/rejected token length 归一化 logprob 或按长度分层采样",
+        "根本原因：DPO 使用 sum 而非 mean 的 logprob，长 response 总绝对值更大；解决：改用 mean_logprob",
+        "根本原因：数据集标注者偏爱较长 response；解决：只使用长度相近的 pair",
+        "根本原因：reference model 对长 sequence 的 perplexity 更低；解决：用 per-token reference logprob 代替 reference model"
+      ],
+      "answer": 0,
+      "explain": "DPO 目标函数用 sum_logprob，若 chosen 系统性更长，sum_logprob margin 中包含长度差，模型会学习「变长」而非「变好」。平台修复方向：按 token length 归一化（per-token logprob ratio）或按 chosen/rejected 长度比分桶，确保 pair 内长度均衡。",
+      "id": "u4-l6-new-q7"
+    },
+    {
+      "type": "input",
+      "prompt": "PPO 多模型训练中，rollout 生成的样本在进入 trainer 消费前，buffer 中每个样本绑定的四个核心 hash 字段是哪些？（填以逗号分隔的关键词）",
+      "accept": ["actor_hash,rm_hash,template_hash,decoding_config_hash", "actor_hash, rm_hash, template_hash, decoding_config_hash", "actor hash, RM hash, template hash, decoding config hash"],
+      "explain": "trainer lease 谓词必须匹配 (actor_hash, rm_hash, template_hash, decoding_config_hash) 四个字段，确保 batch 内所有样本来自同一 actor 版本、同一 RM、同一 template 和同一解码配置。跨版本混 batch 会破坏 PPO 的训练语义。",
+      "id": "u4-l6-new-q8"
+    },
+    {
+      "type": "judge",
+      "prompt": "GRPO 因为去掉了 critic，所以 batch 内的不同 group 可以任意 shuffle，不需要保持 group 内样本的完整性。",
+      "answer": false,
+      "explain": "GRPO 的 advantage 计算依赖同一 prompt 的 G 条 response 的 reward 均值（group-level baseline），如果 batch shuffle 打散了 group 边界，使 advantage 跨 group 混算，baseline 失去统计意义，训练信号错误。GRPO batch 必须以 group 为单位组织，不能把 group 当普通样本 shuffle。",
+      "id": "u4-l6-new-q9"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧后训练故障现象与其最可能的根因匹配",
+      "left": [
+        "PPO 训练 loss 下降但 reward 持续不上升甚至下降",
+        "DPO 训练后 actor 生成内容系统性变长但质量未提升",
+        "GRPO rollout 吞吐下降，GPU 利用率低，rollout 成为瓶颈",
+        "PPO buffer 中 `actor too old expire` 比例持续上升"
+      ],
+      "right": [
+        "RM template 与 actor rollout template 不一致，RM 打分的是错误格式的 response",
+        "数据集中 chosen 系统性长于 rejected，DPO 学到了长度偏差",
+        "G 值过大（每 prompt 需采样 G 条 response），rollout engine 并发度不足",
+        "actor 更新速度过快而 rollout engine 并发度不足，样本产生慢于消费速度"
+      ],
+      "explain": "PPO reward 不升→打分异常（template mismatch）；DPO 变长不变好→长度偏差；GRPO 吞吐低→G 倍 rollout 需求超过 engine 能力；buffer expire 多→actor 更新比 rollout 快，on-policy window 过紧。",
+      "id": "u4-l6-new-q10"
+    }
+  ],
+  "u4-l7": [
+    {
+      "type": "choice",
+      "prompt": "rank=32 的 LoRA adapter 对 hidden_size=8192 的 q_proj 和 v_proj 各一个线性层（d_in=d_out=8192），参数量合计约为多少？",
+      "options": [
+        "约 262K（每层 r×d = 32×8192）",
+        "约 524K（每层 2×r×d = 2×32×8192，两层合计）",
+        "约 1.05M（每层 2×r×d，两层合计）",
+        "约 16.8M（每层 r×d_in×d_out/r = d_in×d_out）"
+      ],
+      "answer": 2,
+      "explain": "每个线性层的 LoRA 参数量 = r × d_in + r × d_out = 32×8192 + 32×8192 = 524,288 ≈ 0.52M。两个线性层（q_proj + v_proj）合计 ≈ 1.05M。典型大模型 LoRA adapter 只有几百 KB 到数十 MB，与完整模型参数量（8192²×2 bytes ≈ 128 GiB）相比极小。",
+      "id": "u4-l7-new-q1"
+    },
+    {
+      "type": "judge",
+      "prompt": "FTaaS 中，AdapterVersion 处于 `released` 状态意味着该 adapter 的流量路由已经切到 `production` 阶段，所有请求都使用这个新版本。",
+      "answer": false,
+      "explain": "`released`（AdapterVersion 状态机）指 artifact 已通过 eval 和 approval，可以发布，但还不意味着流量已切到 production。流量策略由独立的 ReleaseRevision 状态机控制（shadow → canary → ramp → production），released 只是发布的前置条件，而非终态。",
+      "id": "u4-l7-new-q2"
+    },
+    {
+      "type": "input",
+      "prompt": "Multi-LoRA serving 中，adapter 加载到 serving 副本后通过什么操作来校验 artifact 完整性（不是按文件名猜）？",
+      "accept": ["CAS digest 校验", "digest 校验", "checksum 校验", "sha256 校验", "CAS digest", "digest check"],
+      "explain": "serving loader 必须按 CAS digest（如 SHA256）校验 artifact，而不是按文件名或路径判断。这保证加载的是 registry 中精确记录的那份 artifact，防止文件被替换或在传输中损坏。Adapter registry 中的 `digest` 字段是不可变的（immutable）标识。",
+      "id": "u4-l7-new-q3"
+    },
+    {
+      "type": "choice",
+      "prompt": "QLoRA 相比 LoRA 的核心差异是什么？它引入了哪个额外的工程依赖？",
+      "options": [
+        "QLoRA 使用更高的 rank（r≥128），额外依赖更大的 GPU 显存",
+        "QLoRA 对 base model 做量化（如 NF4/INT4），用更少显存训练，额外依赖 bitsandbytes 等量化库，且 resume 对量化库版本极度敏感",
+        "QLoRA 对 adapter 本身做量化，base model 保持 BF16，额外依赖 GGUF 格式",
+        "QLoRA 是 LoRA 的推理优化版本，训练时与 LoRA 完全相同"
+      ],
+      "answer": 1,
+      "explain": "QLoRA = 量化 base model（NF4/INT4）+ LoRA adapter（BF16/FP16）。量化 base 大幅降低训练显存，使 70B 模型可在单卡 48 GB GPU 上微调。额外依赖：bitsandbytes（量化/反量化 kernel），且 resume 对 bitsandbytes 版本极度敏感——不同版本的量化元数据（quantization state）不兼容。",
+      "id": "u4-l7-new-q4"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧 FTaaS 数据准入检查项与其失通过的后果匹配",
+      "left": [
+        "PII/secret 未脱敏（高危）",
+        "dataset 与 eval benchmark 重叠",
+        "chat_template 版本与 trainer 不匹配（但 tokenization 成功）",
+        "数据许可与 base model 许可冲突"
+      ],
+      "right": [
+        "adapter 上线后泄露用户隐私数据，造成合规和法律风险",
+        "eval 指标虚高，无法准确衡量 adapter 的真实泛化能力",
+        "训练 loss 下降但 adapter 在 serving 时对话格式错误，可能无法生成预期格式的 response",
+        "adapter 无法商业部署，发布后面临法律风险"
+      ],
+      "explain": "各准入检查的失通过后果各有侧重：PII→隐私合规风险；eval 重叠→指标虚高，泛化能力被高估；template 不匹配→训练数据格式与 serving 格式不一致，推理时行为异常；许可冲突→商业法律风险。这些问题在提交阶段拒绝代价最小。",
+      "id": "u4-l7-new-q5"
+    },
+    {
+      "type": "judge",
+      "prompt": "Multi-LoRA serving 中，为同一 base model 加载更多 adapter 不影响 KV cache 的可用显存，因为 adapter 参数与 KV cache 在不同的显存区域。",
+      "answer": false,
+      "explain": "serving 峰值显存 = M_base + Σ(M_adapter_i × hot_replicas) + M_kv_cache，三者共享同一块 HBM。加载更多 hot adapter 直接挤压 M_kv_cache 可用空间，导致 KV cache 命中率下降，推理延迟上升。必须在 adapter 数量和 KV cache 大小之间做显式权衡，不是独立的资源。",
+      "id": "u4-l7-new-q6"
+    },
+    {
+      "type": "choice",
+      "prompt": "FTaaS 中，版本矩阵（trainer image digest、PyTorch、PEFT、bitsandbytes 版本）使用浮动 tag（如 `latest`）而非固定版本，最直接的工程后果是什么？",
+      "options": [
+        "训练速度会随依赖升级而提升，是优化而不是风险",
+        "同一配置两次训练结果不可复现，且 checkpoint 可能无法在不同时间点恢复",
+        "只影响 eval 指标，不影响 adapter 功能",
+        "只在 QLoRA 场景下有风险，普通 LoRA 不受影响"
+      ],
+      "answer": 1,
+      "explain": "浮动 tag 导致训练环境随依赖库版本漂移而变化，同一配置在不同时间提交可能得到不同结果（不可复现）。更危险的是 checkpoint resume：QLoRA 的 bitsandbytes quantization state 对版本极度敏感，跨版本 resume 可能加载到不兼容的量化元数据，导致静默精度错误。",
+      "id": "u4-l7-new-q7"
+    },
+    {
+      "type": "input",
+      "prompt": "FTaaS 中，TrainingJob 状态机从提交到完成的正常路径包含哪些主要状态？（按顺序填，以箭头分隔，如 A→B→C）",
+      "accept": ["submitted→admitted→queued→running→evaluating→completed", "submitted → admitted → queued → running → evaluating → completed"],
+      "explain": "TrainingJob 状态机的正常路径：submitted（用户提交）→ admitted（准入检查通过）→ queued（等待资源）→ running（训练执行中）→ evaluating（自动评测）→ completed（评测完成，结果写入 AdapterVersion）。异常分支：rejected（准入失败）、failed（训练失败）、retrying（自动重试）。",
+      "id": "u4-l7-new-q8"
+    },
+    {
+      "type": "match",
+      "prompt": "将左侧微调方法与其最主要的工程特征匹配",
+      "left": ["Full Fine-Tune", "LoRA", "QLoRA", "DoRA"],
+      "right": [
+        "训练全量或大部分 base 权重，制品接近完整模型，serving 需独立副本",
+        "冻结 base，只训练低秩矩阵，制品 MB 级，支持 dynamic attach",
+        "量化 base（NF4/INT4）+ LoRA adapter，显存最低，resume 对量化库版本极敏感",
+        "将权重拆为方向和幅度分别优化，需要 engine 特殊支持，schema 验证更严格"
+      ],
+      "explain": "Full Fine-Tune 最重但最通用；LoRA 轻量支持动态加载；QLoRA 显存最低但引入量化依赖；DoRA 精度更高但需要推理引擎支持方向+幅度分离的参数格式。",
+      "id": "u4-l7-new-q9"
+    },
+    {
+      "type": "judge",
+      "prompt": "Adapter registry 中的 `base_model_digest` 字段只是一个可选元数据，serving 层可以根据 `base_model_id`（如 `llama3-70b`）来判断兼容性，因为同一 model_id 的 base 参数不会改变。",
+      "answer": false,
+      "explain": "`base_model_digest`（SHA256）是不可变标识，比 `base_model_id` 更精确。同一 model_id 的 base 可能存在多个版本（量化版本、安全微调版本、不同精度版本），如果 serving 层只用 model_id 判断兼容性，可能把为 llama3-70b-BF16 训练的 adapter 加载到 llama3-70b-NF4 上，导致隐性精度错误或维度不匹配。",
+      "id": "u4-l7-new-q10"
+    }
+  ]
+}

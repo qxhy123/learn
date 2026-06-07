@@ -1,0 +1,133 @@
+[
+  {
+    "id": "u6c1",
+    "title": "在线推理架构",
+    "subtitle": "从请求链路到尾延迟治理",
+    "intro": [
+      {
+        "title": "在线推理不是「带 GPU 的 Flask 服务」",
+        "body": "**在线推理（online inference）** 是指模型服务在用户请求到达后立即完成计算并返回结果的系统形态。它和离线批推理的核心区别不是入口从文件变成 HTTP，而是多了三个硬约束：**用户正在等待、请求形态不可预知、系统必须在有限 SLO 内决定接收 / 排队 / 降级 / 拒绝**。\n\n第一次做模型服务的团队，最容易把它理解成「接 HTTP 请求 → 跑模型 → 返回结果」。这在 demo 里完全够用，但生产系统面对的物理现实更硬：一个 70B 模型的单个副本可能占用多张 GPU；一次长 prompt prefill 会吞掉大量算力；decode 阶段会把 KV Cache 留在显存里；RAG 链路还会调用 embedding、向量库、rerank、安全过滤。「模型推理」只是请求链路的一段，服务是否可用取决于这条链路里最慢、最抖、最不可控的那几跳。"
+      },
+      {
+        "title": "一次请求的时间构成",
+        "body": "可以把端到端延迟拆解为：\n\n`t_request = t_queue + t_preprocess + t_model + t_downstream + t_postprocess`\n\n其中 LLM 的 `t_model` 可以进一步拆成 `t_prefill + t_decode`。\n\n一个典型 RAG 服务的延迟构成大约是：\n\n| 阶段 | 占比 |\n|------|------|\n| 网关 + 鉴权 | ~0.3% |\n| embedding 调用 | ~5% |\n| 向量检索 | ~3% |\n| 重排模型 | ~8% |\n| LLM prefill | ~20% |\n| LLM decode | ~60% |\n| 后处理 + 返回 | ~4% |\n\n**工程启示**：LLM 确实占大头，但平均 1500 ms 的服务，P99 可能是 8000 ms，多出来的延迟大概率不在 LLM，而在 embedding 抖动或某租户的长 prompt 拖慢 decode。"
+      },
+      {
+        "title": "LLM 专属延迟指标：TTFT / TPOT / ITL / Goodput",
+        "body": "LLM 服务不能只看「总请求时间」，因为用户感知的是流式输出。核心指标：\n\n| 指标 | 含义 | 典型目标 |\n|------|------|----------|\n| `TTFT` | Time to First Token，请求到第一个 token 返回 | 聊天 < 500 ms |\n| `TPOT` | Time per Output Token，平均每个 token 耗时 | < 100 ms 流畅 |\n| `ITL` | Inter-Token Latency，相邻 token 时间间隔 | 比 TPOT 更细粒度，能抓到抖动 |\n| `E2EL` | End-to-End Latency，请求到最后一个 token | 由用例决定 |\n\n`TPOT` 是均值，`ITL` 是每步直方图。`Goodput` 把 SLO 纳入吞吐：只有满足 P90 TTFT 和 P90 TPOT 的请求才算有效产出。**扩容决策要看 goodput 曲线，不要只看 QPS 曲线**——加大 batch 可能同时提高 QPS 和降低 goodput。"
+      },
+      {
+        "title": "网关、路由层、模型副本各自的职责",
+        "body": "这三个词容易混用，生产上必须拆开：\n\n| 层 | 一句话定义 | 不该承担的职责 |\n|----|------------|----------------|\n| **Gateway** | 所有外部请求的统一边界 | 不应理解每个副本的 KV 状态 |\n| **Router** | 根据模型、版本、长度、租户和实时容量选择目标副本 | 不应做通用鉴权和 WAF |\n| **Model server** | 持有权重、KV Cache 和推理 runtime 的进程 | 不应直接暴露为公网入口 |\n\n分层的价值在故障时最明显：gateway 能快速拒绝非法流量；router 能把长上下文流量切到专用池；model server 能报告本地 queue、KV block、prefix hit 和 preemption。"
+      },
+      {
+        "title": "Prefix-aware 路由：被低估的优化点",
+        "body": "一个不起眼但收益很大的路由策略：**把带相同 system prompt 的请求尽量送到同一副本**。\n\n现代 serving 引擎（`vLLM`、`SGLang`）都支持 prefix cache——已经 prefill 过的 prefix 会留在 KV Cache 里，后续带相同 prefix 的请求可以跳过这部分 prefill，**高 prefix 命中时吞吐可以翻倍以上**。\n\n常见做法：\n- 对 system prompt（或其 hash）做一致性哈希路由\n- 多租户场景按租户亲和\n- 长对话场景按 session id 亲和\n\n**如果路由层只做 round-robin，prefix cache 基本形同虚设。**",
+        "tip": "prefix-aware 路由有两种实现：简单的一致性哈希（开源 router 常用）和更精确的副本 prefix tree summary 聚合（SGLang router 用法）。前者实现简单但副本失败容忍差；后者能命中「真正有」该 prefix 的副本。"
+      },
+      {
+        "title": "为什么在线推理的核心是尾延迟而非平均延迟",
+        "body": "用户感知的是自己这一次是否卡住，不是系统平均延迟。一个真实例子：某服务平均 TTFT = 200 ms，但实际分布是：\n\n| 分位数 | 值 |\n|--------|----|\n| P50 | 150 ms |\n| P90 | 350 ms |\n| P95 | 800 ms |\n| P99 | 3500 ms |\n| P99.9 | 15000 ms |\n\nP99 是 P50 的 23 倍——这在 LLM 服务里非常常见，因为输入长度差异可以轻易到 100 倍。\n\n**P99 的常见来源**：冷启动、长 prompt prefill、长 decode（max_tokens 被顶满）、下游抖动、队列堆积、noisy neighbor。遇到 P99 问题，先按长度 / 租户 / 版本分桶，而不是先去优化模型算子。"
+      },
+      {
+        "title": "Prefill / Decode 解耦与 Chunked Prefill",
+        "body": "Prefill 更偏 compute-bound（算力密集），decode 更偏 memory-bandwidth-bound（访存密集）。让两种负载共用同一副本池，长 prefill 会独占 GPU 并拖慢 decode 的 `ITL`。\n\n**两种解法**：\n\n1. **`chunked prefill`**（轻量）：在同一次 forward 里把大 prefill 切成小块，和 decode token 混在一起跑。长 prompt 不再「独占」一次 forward，实现代价远低于完整 P/D 解耦。`vLLM`、`TensorRT-LLM` 都支持。\n\n2. **Prefill/Decode Disaggregation**（重量）：把两个阶段拆到不同资源池（`DistServe`、`Mooncake`、`Splitwise`），资源池可独立扩缩，但需要 KV handoff、双队列背压和跨池容错。\n\n**选型建议**：先试 chunked prefill，再考虑完全解耦。大多数团队不需要上 DistServe。",
+        "tip": "判断是否值得完整解耦的三个信号：`t_prefill` 是否已显著挤压 decode token 吞吐；长上下文流量是否和短请求共享同一资源池；平台是否有能力管理远端 KV 状态与跨池排障。"
+      },
+      {
+        "title": "冷启动、熔断与降级控制面",
+        "body": "推理服务的冷启动通常是三段叠加：**权重加载 → 运行时初始化（CUDA context、allocator） → 首次执行优化（CUDA graph 捕获、kernel autotune、缓存填充）**。「副本已拉起」不等于「可以立即接流量」，需要预热请求让 tokenizer、算子和缓存路径先走一遍。\n\n**参考数量级**：7B-13B 模型冷启动 10–60 s；70B 级模型 30–180 s。\n\n**降级梯度**（破坏性从小到大）：\n1. 关闭非核心增强（rerank、工具调用、二次安全审查）\n2. 切小模型 / quantized 版本\n3. 截短上下文\n4. 减 max_tokens\n5. 返回缓存 / 模板回复\n6. 返回 429 / 503\n\n**关键原则**：熔断、排队上限和降级策略要写入控制面，而不是靠人工临时切换；降级策略要定期演练。",
+        "reveal": {
+          "q": "当一个 RAG 服务 P99 TTFT 飙到 10 秒但 P50 正常，你最优先看哪些指标和排查方向？",
+          "a": "优先查 TTFT P99 vs P50 分离、按输入长度分桶的 TTFT、prefix cache 命中率和 queue time。常见根因是：某租户批量上传长 prompt 拖慢了短请求；prefix-aware 路由失效导致 prefix cache 命中率骤降；长短请求共享了 admission 队列。修复方向：长短分流、恢复 prefix-aware 路由、对该租户设置长 prompt burst 上限。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "下列哪项最准确地描述了「在线推理」与「离线批推理」的核心区别？",
+        "options": [
+          "在线推理使用 HTTP 接口，离线推理使用文件接口",
+          "在线推理多了用户等待、请求形态不可预知、系统必须在有限 SLO 内决策等硬约束",
+          "在线推理只支持小模型，离线推理支持大模型",
+          "在线推理不需要 GPU，离线推理需要 GPU"
+        ],
+        "answer": 1,
+        "explain": "核心区别不是接口协议，而是在线推理多了三个硬约束：用户正在等待、请求形态不可提前完全知道、系统必须在有限 SLO 内决定接收 / 排队 / 降级 / 拒绝。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在一个典型 RAG 服务中，LLM 推理延迟（prefill + decode）通常占总延迟的约 80%，因此「只优化模型」就能解决大多数延迟问题。",
+        "answer": false,
+        "explain": "虽然 LLM 确实占大头（约 80%），但平均值会掩盖尾延迟。P99 多出来的延迟大概率不在 LLM，而在 embedding 抖动、向量库扫全表或某租户长 prompt 拖慢 decode。只优化模型往往漏掉检索、重排和预处理。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`TPOT` 和 `ITL` 的主要区别是什么？",
+        "options": [
+          "TPOT 是首 token 延迟，ITL 是平均 token 延迟",
+          "TPOT 是平均数，ITL 是相邻 token 的间隔直方图，更能抓到流式抖动",
+          "TPOT 只在 decode 阶段使用，ITL 只在 prefill 阶段使用",
+          "两者含义完全相同，只是不同引擎的命名差异"
+        ],
+        "answer": 1,
+        "explain": "TPOT 是总 decode 时间除以 output tokens 的平均值；ITL 衡量相邻 token 之间的真实间隔。一个请求可能 TPOT 合格但 ITL P99 很差（中间出现 800 ms 卡顿），用户感知会很糟。成熟监控要两个都看。"
+      },
+      {
+        "type": "input",
+        "prompt": "`Goodput` 与 `QPS` 相比，最关键的区别是 Goodput 把什么纳入了计算？（一个词或短语）",
+        "accept": ["SLO", "SLO 约束", "服务质量目标", "延迟约束"],
+        "explain": "Goodput 只统计满足所有 SLO（如 P90 TTFT < 500 ms 且 P90 TPOT < 100 ms）的请求，超时完成的 token 不算作有效产出。加大 batch 可能同时提高 QPS 和降低 goodput——多完成了请求，但都是慢的。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么 round-robin 负载均衡在 LLM 服务中效果差？",
+        "options": [
+          "round-robin 不支持 HTTPS 协议",
+          "round-robin 会把带相同 system prompt 的请求打散到不同副本，导致 prefix cache 命中率几乎归零",
+          "round-robin 无法处理并发请求",
+          "round-robin 会把所有流量都打到同一个副本"
+        ],
+        "answer": 1,
+        "explain": "prefix cache 的收益依赖「相同 prefix 的请求路由到同一副本」。round-robin 把请求均匀打散，同一 system prompt 的请求落在不同副本上，各自缓存各自的 KV，prefix cache 基本形同虚设。"
+      },
+      {
+        "type": "match",
+        "prompt": "将下列推理架构层与其核心职责匹配：",
+        "left": ["Gateway", "Router", "Model server", "Runtime / Engine"],
+        "right": [
+          "鉴权、限流、租户识别，不应理解每个副本的 KV 状态",
+          "根据模型版本、上下文长度、prefix 亲和和实时容量选择目标副本",
+          "持有权重、KV Cache 和推理 runtime 的进程",
+          "执行 batching、调度、kernel、KV 管理的内核"
+        ],
+        "explain": "四层各司其职：Gateway 是统一入口；Router 做 LLM 特有的路由策略；Model server 是承载状态的执行单元；Runtime/Engine 是进程内的高性能执行内核。把这些职责塞到一个服务里，灰度、限流、排障和容量规划会互相污染。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`chunked prefill` 和 Prefill/Decode Disaggregation 解决的是同一个问题，只是实现复杂度不同，效果相当。",
+        "answer": false,
+        "explain": "两者都解决 prefill 抢占 decode 资源的问题，但代价不同：chunked prefill 是轻量方案，在同一副本内将大 prefill 切片与 decode 混跑，不需要 KV 跨机传输；完整 P/D 解耦需要 KV handoff、双队列背压和跨池容错，吞吐上限更高但运维复杂度也更高。推荐先试 chunked prefill。"
+      },
+      {
+        "type": "choice",
+        "prompt": "下列哪种情况最适合考虑完整的 Prefill/Decode Disaggregation（P/D 解耦）？",
+        "options": [
+          "服务以短 prompt、短输出为主，请求形态较均匀",
+          "服务以 16K-128K 长上下文为主，prefill 尖峰与 decode 长尾明显错峰，且平台能管理远端 KV 状态",
+          "团队刚开始做 LLM serving，还没有稳定的 continuous batching",
+          "服务并发数很低，GPU 利用率不高"
+        ],
+        "answer": 1,
+        "explain": "P/D 解耦适合：长上下文（16K-128K+）、RAG 模板高度复用、prefill 尖峰与 decode 长尾明显错峰，且平台有能力管理 KV handoff、双队列背压和跨池排障。流量以短 prompt 为主或 chunked prefill 已够用时，解耦的额外复杂度不划算。"
+      },
+      {
+        "type": "input",
+        "prompt": "在线推理冷启动通常包含三个阶段：权重加载、运行时初始化和______（填写第三阶段的关键操作）。",
+        "accept": ["首次执行优化", "CUDA graph 捕获", "图捕获", "kernel autotune", "缓存预热", "warmup"],
+        "explain": "冷启动的第三段是首次执行优化，包括 CUDA graph 捕获、kernel autotune 和缓存填充。这也是为什么「副本已拉起」不等于「流量马上可接」——需要发送预热请求让各种路径先走一遍，再放入正式流量池。"
+      }
+    ]
+  }
+]

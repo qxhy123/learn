@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u5c2",
+    "title": "数据采集与摄入",
+    "subtitle": "队列解耦、Schema 演进、CDC 与合规摄入",
+    "intro": [
+      {
+        "title": "摄入的本质：填平原始数据与 AI 消费语义之间的鸿沟",
+        "body": "数据摄入不是「把文件搬进 S3」，也不是「在 Kafka 里发一条消息」。\n\n它要解决的核心问题：**现实世界产生数据的速度、格式、来源和边界条件，与 AI 系统消费数据所需的语义、结构、一致性和可追溯性之间，存在一条不可消除的鸿沟**。\n\n摄入系统必须同时应对四个约束：\n- 数据产生速度**高度不均匀**（大促 100× 平时）\n- Schema 是**活的**，上游随时会加字段、改枚举\n- 权限边界、PII、跨境合规**各不相同**\n- 训练数据、推理日志、评测集对摄入语义的需求**截然不同**"
+      },
+      {
+        "title": "四种摄入模式：选型由延迟 SLA 决定",
+        "body": "| 模式 | 触发方式 | 典型延迟 | 典型场景 |\n|------|----------|----------|----------|\n| 批摄入 Batch | 定时/手动 | 小时~天 | 历史回填、大文件导入 |\n| 微批 Micro-batch | 每几秒/分钟 | 秒~分钟 | 接近实时的训练数据更新 |\n| 流摄入 Streaming | 事件触发 | 毫秒~秒 | 推理日志、特征实时更新 |\n| 事件驱动 Event-driven | S3 上传/DB 变更 | 毫秒~秒 | CDC、对象存储触发处理 |\n\n**核心取舍**：批摄入能做全局排序、完整性保证和高效压缩；流摄入放弃这些「批次内全局视图」，换来低延迟。",
+        "tip": "微批不是免费的午餐——每次触发会产生小文件写入，对 HDFS/S3 有大量 IO 开销，运维成本可能比纯批或纯流更高。"
+      },
+      {
+        "title": "消息队列：摄入系统的核心解耦层",
+        "body": "消息队列让生产者和消费者速度解耦，峰值流量被队列吸收，不会直接击穿下游存储。\n\n主流选型对比（AI Infra 视角）：\n\n| 维度 | Kafka | Pulsar | RabbitMQ | Kinesis/Pub-Sub |\n|------|-------|--------|----------|------------------|\n| 消息保留 | 日志式，可配保留天数 | 日志式分层存储 | 消费即删 | 1-365 天 |\n| 吞吐峰值 | 极高 >1M msg/s | 极高 | 中 ~100K | 高，托管扩展 |\n| 多租户 | 手动（topic/ACL） | 原生 namespace/tenant | vhost | 项目隔离 |\n| 运维复杂度 | 中（KRaft 模式去除 ZK） | 高（Bookkeeper） | 低 | 低（托管） |\n\n**AI Infra 首选 Kafka**：生态最成熟，200+ Kafka Connect connector，与 Flink/Spark 深度集成。只有明确需要多租户命名空间隔离时才考虑 Pulsar。"
+      },
+      {
+        "title": "CDC：把数据库变更实时推给下游",
+        "body": "CDC（Change Data Capture）读取数据库的 WAL/binlog，把每条 INSERT/UPDATE/DELETE 变成结构化事件，发布到消息队列。\n\n**为什么比直接轮询数据库好**：\n- 不需要在业务表加 `updated_at` 索引，**无侵入**\n- 毫秒级延迟，轮询最快也是秒级\n- 能捕获 DELETE 事件，轮询做不到\n- Debezium 事件携带 `before`/`after` 完整快照\n\n**关键配置**：MySQL 需要 `binlog_row_image = FULL`，PostgreSQL 需要 `REPLICA IDENTITY FULL`，否则只有主键变更可见。这是需要 DBA 在设计阶段确认的基础设施配置。",
+        "tip": "CDC 工具主流选型：Debezium（最广泛，支持 MySQL/PostgreSQL/Oracle/MongoDB）、Maxwell（轻量 MySQL 专项）、Flink CDC（直接在 Flink 作业内消费）。"
+      },
+      {
+        "title": "Schema 演进：防止上游改字段导致训练静默失效",
+        "body": "Schema 是摄入系统的隐式契约。上游业务系统会在不通知下游的情况下**新增字段、废弃枚举值、改变日期格式**。\n\n没有 Schema Registry 的情况下，某天生产者删掉了一个字段，消费者（训练脚本）继续运行，但从该字段读到的全是 `None` 或默认值——**模型效果悄悄下降，没有任何报错**。\n\n**Confluent Schema Registry 四种兼容性模式**：\n- `BACKWARD`：旧消费者可读新数据（新增字段须有默认值）→ 适合训练数据摄入\n- `FORWARD`：新消费者可读旧数据 → 适合推理服务读取\n- `FULL`：双向兼容，最严格 → 关键业务 schema\n- `NONE`：不检查，不推荐生产使用\n\n**Avro vs Protobuf**：Avro 支持 schema 随消息携带，天然集成 Schema Registry；Protobuf 更紧凑，适合 gRPC 服务和 TensorFlow 生态。"
+      },
+      {
+        "title": "摄入 SLA 的五个维度",
+        "body": "AI Infra 摄入系统的 SLA 不能只用「数据有没有进来」衡量：\n\n| 维度 | 定义 | 典型目标 | 代价 |\n|------|------|----------|------|\n| 吞吐 | 单位时间摄入量 | 10TB/天 | 增加吞吐通常增加延迟 |\n| 延迟 | 数据产生到可消费的时间 | P99 < 5s（流） | 低延迟需要更多资源 |\n| 顺序 | 消息到达顺序保证 | 分区内有序 | 全局有序极难扩展 |\n| Exactly-once | 每条消息恰好处理一次 | 金融/审计必须 | 显著降低吞吐 20-40% |\n| 幂等性 | 重复摄入无副作用 | 所有场景推荐 | 需要额外去重存储 |\n\n**工程选择**：对于大多数 AI 训练数据摄入，**at-least-once + 幂等消费端**比 exactly-once 更实用，且成本低得多。用内容哈希或业务主键做去重键，让数据库用 `INSERT IGNORE` 或 `ON CONFLICT DO NOTHING` 处理重复。"
+      },
+      {
+        "title": "PII 合规与 GDPR 删除权：必须在摄入时完成",
+        "body": "合规不是法务部门的事，是摄入系统的工程约束。\n\n**PII 必须在数据进入存储之前识别和标记**，不能事后补救。常见 PII：邮箱、手机号、身份证、信用卡号（正则 + Luhn 校验）、人名（NER 模型）。\n\n**GDPR 第 17 条删除权工程含义**：\n1. 在 Kafka 发布 tombstone 消息：`user_id → null`\n2. 下游 Flink 消费 tombstone，标记该用户所有记录为待删除\n3. S3 重写文件删除对应行（代价是 O(文件大小) 不是 O(删除行数)）\n4. 检查 dataset_version 元数据，确认是否进入训练集；若进入，触发数据集重建或 Machine Unlearning\n5. 72 小时内完成，更新删除确认记录\n\n**关键原则**：摄入时标记 PII + 记录血缘，是后续系统性删除的前提。没有端到端数据血缘，GDPR 删除请求无法被完整执行，面临全球营业额 4% 的罚款上限。",
+        "tip": "S3 文件重写成本是 O(文件大小)，不是 O(删除行数)。建议在 S3 层按 user_id 分桶存储，使重写范围可控。"
+      },
+      {
+        "title": "死信队列 DLQ：摄入失败是常态",
+        "body": "摄入失败不应该让整条链路停止。不同失败类型需要不同处理策略：\n\n| 失败类型 | 重试策略 | 最终处理 |\n|----------|----------|----------|\n| 瞬态网络错误 | 指数退避重试 3-5 次 | 超次数进 DLQ |\n| Schema 不兼容 | 不重试（重试无效） | 立即进 DLQ + 告警 |\n| 内容校验失败（PII 未脱敏） | 不重试 | 进 DLQ + 人工审核 |\n| 下游存储不可用 | 指数退避限次重试 | 暂停消费等恢复 |\n\n**DLQ 必须有 SLA**：多长时间内必须被处理或归档？谁收到告警？谁有权限重放？没有 SLA 的 DLQ 最终会积累成 TB 级「等待排查」数据。",
+        "reveal": {
+          "q": "推理日志的采样策略为什么是不可逆决策？",
+          "a": "一旦某条日志被丢弃就无法在事后恢复。如果某个模型问题只在特定条件下触发（长尾输入），而恰好被采样率过滤掉，问题可能永远无法被发现。初期宁可多采样，存储成本远低于线上质量问题的代价。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "上游业务系统删除了一个 Avro 字段，但没有通过 Schema Registry 检查兼容性，会发生什么？",
+        "options": [
+          "消费者立即报错并停止，管道中断可见",
+          "消费者继续运行，从该字段读到 None 或默认值，模型效果悄悄下降",
+          "Kafka 自动回滚到旧 schema 版本",
+          "DataLoader 会跳过该字段并自动填充随机值"
+        ],
+        "answer": 1,
+        "explain": "这是 schema 不兼容的典型「静默炸弹」——数据「进来了」，但字段含义已经变了，消费者读到 None 或默认值，没有任何报错，模型效果悄悄下降。Schema Registry 的强制注册和兼容性检查是防止这类事故的最低基础设施。"
+      },
+      {
+        "type": "judge",
+        "prompt": "CDC（Change Data Capture）能捕获数据库的 DELETE 操作，而直接轮询数据库表无法做到这一点。",
+        "answer": true,
+        "explain": "CDC 读取 WAL/binlog，能捕获 INSERT/UPDATE/DELETE 全部变更事件。轮询数据库表只能看到当前快照，DELETE 后的记录已消失，无法感知。这是 CDC 相比轮询的核心优势之一。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Kafka Schema Registry 的 BACKWARD 兼容模式保证什么？",
+        "options": [
+          "新消费者可以读取旧数据，旧字段不能删除",
+          "旧消费者可以读取新数据，新增字段必须有默认值",
+          "生产者和消费者必须使用完全相同的 schema 版本",
+          "所有字段只能追加不能修改，保证历史数据完整性"
+        ],
+        "answer": 1,
+        "explain": "BACKWARD 兼容保证「旧读者能读新数据」，要求新增字段必须有默认值，这样旧消费者遇到新字段时能用默认值填充。适合训练数据摄入场景（消费者通常比生产者演进慢）。"
+      },
+      {
+        "type": "match",
+        "prompt": "将摄入模式与其对应的典型场景匹配：",
+        "left": ["批摄入 Batch", "流摄入 Streaming", "CDC 事件驱动"],
+        "right": [
+          "历史语料库回填，TB 级大文件导入",
+          "数据库用户表更新后实时同步到特征缓存",
+          "推理服务的实时日志收集，P99 延迟要求 < 5s"
+        ],
+        "explain": "批摄入适合大规模历史数据处理；CDC 专门捕获数据库变更事件（INSERT/UPDATE/DELETE）并推送下游；流摄入适合低延迟的实时日志场景。"
+      },
+      {
+        "type": "judge",
+        "prompt": "对于大多数 AI 训练数据摄入场景，在 Kafka 层实现 exactly-once 语义是最佳实践。",
+        "answer": false,
+        "explain": "Kafka exactly-once 需要幂等生产者 + 事务 + read_committed 隔离级别，会将吞吐降低 20-40%，延迟提升 50-100%。大多数 AI 训练数据摄入选择 at-least-once + 幂等消费端（用内容哈希做去重）更实用，成本低得多。"
+      },
+      {
+        "type": "choice",
+        "prompt": "GDPR 删除权要求用户数据已进入 S3 的 Parquet 文件时，删除操作的时间复杂度是？",
+        "options": [
+          "O(删除行数)，因为 Parquet 是列存可以直接定位",
+          "O(文件大小)，因为需要重写整个文件",
+          "O(1)，Parquet 支持原地删除",
+          "O(log N)，通过 Parquet footer 索引定位"
+        ],
+        "answer": 1,
+        "explain": "Parquet 不支持原地删除行，必须读取整个文件、过滤掉目标行、重写整个文件。因此删除代价是 O(文件大小)，与要删除的行数无关。这是 GDPR 删除在对象存储上的核心工程挑战，建议在 S3 层按 user_id 分桶存储以控制重写范围。"
+      },
+      {
+        "type": "input",
+        "prompt": "CDC 读取 MySQL 数据库变更时，需要将 binlog_row_image 配置为什么值，才能让 Debezium 捕获完整的 before/after 字段？",
+        "accept": ["FULL", "full"],
+        "explain": "MySQL 需要 `binlog_row_image = FULL`，否则只有主键变更可见，无法在 Debezium 事件中获取完整的 before/after 字段快照。PostgreSQL 对应的配置是 `REPLICA IDENTITY FULL`。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在大多数 AI Infra 团队中，消息队列的第一选择是哪个，主要原因是什么？",
+        "options": [
+          "RabbitMQ，因为延迟最低（< 1ms）",
+          "Pulsar，因为原生支持多租户命名空间",
+          "Kafka，因为生态最成熟、与 Flink/Spark 深度集成、有 200+ Kafka Connect connector",
+          "Kinesis，因为无需运维完全托管"
+        ],
+        "answer": 2,
+        "explain": "Kafka 是 AI Infra 数据摄入的主流首选：生态成熟（200+ connector）、社区活跃、与 Flink/Spark 深度集成。只有有明确多租户命名空间需求或分层存储需求时才考虑 Pulsar；云上只用一家云的团队可选对应的托管服务（Kinesis/Pub-Sub）。"
+      }
+    ]
+  }
+]

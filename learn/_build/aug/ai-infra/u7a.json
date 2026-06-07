@@ -1,0 +1,789 @@
+{
+  "u7-l1": [
+    {
+      "type": "choice",
+      "prompt": "在 AI 容器执行链路中，`NVIDIA Container Toolkit` 插在哪两个环节之间？",
+      "options": [
+        "镜像构建与镜像推送之间",
+        "containerd 生成 OCI spec 到 runc 创建容器进程之间",
+        "Kubernetes Scheduler 绑定节点到 kubelet 拉取镜像之间",
+        "PyTorch 初始化 CUDA 到发起 GPU 计算之间"
+      ],
+      "answer": 1,
+      "explain": "NVIDIA Container Toolkit 的 hook 在 OCI spec 生成后、runc 真正启动进程前执行，把 GPU device node 和 driver library 注入容器的 OCI spec。它不参与镜像构建或调度阶段。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「NCCL 多机通信成功」可以直接推断出容器内 RDMA 设备已正确注入且 verbs 可用。",
+      "answer": false,
+      "explain": "NCCL 在找不到 RDMA 时会自动降级为 TCP/IP socket 通信，通信仍然可能「成功」，但带宽严重缩水。NCCL 通信成功本身并不能证明 RDMA 设备已注入；需要通过 `ibv_devinfo` 和 `NCCL_DEBUG=INFO` 确认 RDMA 实际被使用。"
+    },
+    {
+      "type": "input",
+      "prompt": "AI 容器执行链路中，负责「把 GPU device node 和 driver library 注入容器」的组件缩写是？（填英文缩写，3个单词首字母）",
+      "accept": ["NCT", "nvidia container toolkit"],
+      "explain": "NVIDIA Container Toolkit（NCT）通过 runtime hook 或 CDI 机制，在容器创建时将 `/dev/nvidia*` 设备节点和宿主机 driver userspace library 注入容器的 OCI spec 中。"
+    },
+    {
+      "type": "match",
+      "prompt": "将每种故障现象与对应的「首先应排查的责任层」配对：",
+      "left": [
+        "漏洞扫描未覆盖某个 CVE",
+        "NCCL 成功但带宽只有期望的 30%",
+        "容器进程启动即崩溃找不到 `libcudart.so`",
+        "宿主机 `nvidia-smi` 正常但容器无 `/dev/nvidia*`"
+      ],
+      "right": [
+        "运行时层：runtime hook 或 CDI 未执行",
+        "供应链层：SBOM 未覆盖该组件或扫描配置缺失",
+        "镜像层：基础镜像类型错误或 CUDA userspace 未正确安装",
+        "网络/设备层：RDMA 未注入或 NCCL 退化为 TCP"
+      ],
+      "explain": "CVE 未被扫描是供应链/SBOM 问题；带宽低是 RDMA 或拓扑问题；libcudart 缺失是镜像 CUDA userspace 问题；无 /dev/nvidia* 是 runtime hook 问题。"
+    },
+    {
+      "type": "choice",
+      "prompt": "按照 AI 容器执行链路，以下哪个诊断结论是「从正确证据推出正确结论」？",
+      "options": [
+        "容器 Running → GPU 可用且 CUDA 初始化成功",
+        "宿主机 nvidia-smi 正常 → 容器内 GPU 设备一定已注入",
+        "容器内 nvidia-smi 成功 → Management Library 可访问，但不能说明 PyTorch 兼容",
+        "镜像扫描无 CVE → 镜像来源可信且签名合法"
+      ],
+      "answer": 2,
+      "explain": "容器内 `nvidia-smi` 成功只能说明 NVIDIA Management Library 和设备管理接口可访问，不能证明 CUDA userspace 与 Driver 版本兼容，也不能保证 PyTorch 的 wheel 能正确初始化。其他三个选项都存在逻辑跳跃。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「供应链层」负责的是：证明镜像来源、内容、版本、漏洞和发布状态，而不负责 GPU 设备的注入。",
+      "answer": true,
+      "explain": "按四条责任边界，供应链层负责 SBOM、签名、扫描、digest 发布、回滚、缓存预热等，属于制品可信链路。GPU 设备注入属于运行时层（NVIDIA Container Toolkit）。"
+    },
+    {
+      "type": "input",
+      "prompt": "AI 容器治理中，`排障证据链` 层需要把哪些维度串联到一起？请填写其中一个关键维度（中文）。",
+      "accept": ["image", "runtime", "driver", "node", "device", "app", "镜像", "运行时", "驱动", "节点", "设备", "应用"],
+      "explain": "排障证据链负责把 image（镜像版本）、runtime（运行时版本）、driver（驱动版本）、node（节点状态）、device（设备状态）、app（应用版本）六个维度串联，帮助事故定位快速缩小到具体层。"
+    },
+    {
+      "type": "choice",
+      "prompt": "AI 容器治理把「负责」与「不负责」分开。以下哪项属于「镜像层」不负责的内容？",
+      "options": [
+        "OS userspace（glibc）",
+        "CUDA runtime 动态库",
+        "推理引擎（vLLM）",
+        "真实 GPU 设备节点"
+      ],
+      "answer": 3,
+      "explain": "真实 GPU 设备节点（`/dev/nvidia*`）由宿主机提供，通过运行时 hook 注入容器，不属于镜像层的职责。镜像层只负责 OS userspace、CUDA runtime、框架、推理引擎、应用代码等 userspace 内容。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某团队发现同一个 AI 镜像在测试集群可以正常运行 GPU 作业，但在生产集群启动后 `torch.cuda.is_available()` 为 False。按「先定层」原则，第一步应做什么？",
+      "options": [
+        "立即重建镜像，使用更新版本的 PyTorch",
+        "把两个集群的宿主机 Driver、containerd、NVIDIA Container Toolkit 版本和 RuntimeClass 配置并排对比",
+        "给生产容器加 `privileged: true`",
+        "检查生产容器的 CPU limit 是否太低"
+      ],
+      "answer": 1,
+      "explain": "「同一镜像，不同集群表现不同」说明环境差异在节点或运行时层，应先并排对比两集群的宿主机 Driver 版本、containerd 版本、NVIDIA Container Toolkit 版本、RuntimeClass 配置、GPU 型号等，找到差异后再针对性修复。"
+    },
+    {
+      "type": "judge",
+      "prompt": "AI 容器执行链路中，制品供应链（Registry/SBOM/签名）处于框架初始化 CUDA 之前，因此签名验证失败会导致 `torch.cuda.is_available()` 返回 False。",
+      "answer": false,
+      "explain": "供应链环节（镜像拉取前的 digest/签名验证）若失败，会导致镜像无法拉取或容器无法启动，而不是让框架初始化返回 False。`torch.cuda.is_available()` 为 False 是容器已经启动后、CUDA userspace 或设备不可用的问题，与签名无关。"
+    }
+  ],
+  "u7-l2": [
+    {
+      "type": "choice",
+      "prompt": "将 GPU 节点从 A100（sm_80）扩展到 H100（sm_90）后，为什么自定义 CUDA extension 在 H100 上会出现 `no kernel image is available for execution on the device`？",
+      "options": [
+        "H100 不支持 CUDA",
+        "编译时 `TORCH_CUDA_ARCH_LIST` 未包含 sm_90，编译出的 PTX 未覆盖该 arch",
+        "宿主机 Driver 版本过旧",
+        "镜像使用了 base 而非 runtime 基础镜像"
+      ],
+      "answer": 1,
+      "explain": "CUDA extension 编译时需要通过 `TORCH_CUDA_ARCH_LIST` 指定目标 GPU arch。若没有包含 sm_90（H100），编译产物中没有对应的 kernel image，运行时会报 `no kernel image is available`。需在矩阵中把 H100 纳入验证并重新构建覆盖 sm_90 的 wheel。"
+    },
+    {
+      "type": "judge",
+      "prompt": "生产推理容器镜像中保留 nvcc 编译器和 CUDA 头文件是可接受的做法，因为这样方便线上热修复。",
+      "answer": false,
+      "explain": "nvcc 和 CUDA headers 来自 `devel` 类型基础镜像，会增大镜像体积和漏洞面，是安全风险而非便利。生产推理镜像应使用 `runtime` 基础镜像，编译产物通过多阶段构建的 `COPY --from` 引入，不保留编译工具链。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 AI 镜像兼容矩阵中，「CUDA userspace 需要的 Driver 能力比宿主机 Driver 新时」会发生什么？请填写两个字（中文）。",
+      "accept": ["失败", "报错", "崩溃"],
+      "explain": "CUDA userspace 调用 Driver 提供的接口，如果 userspace 依赖了比宿主机 Driver 更新的接口，初始化时就会失败。因此版本矩阵的核心规则是：较新 Driver 能运行较旧 CUDA userspace，反之通常失败。"
+    },
+    {
+      "type": "match",
+      "prompt": "将镜像构建阶段与它对应的基础镜像类型配对：",
+      "left": [
+        "编译 FlashAttention 自定义算子",
+        "生产 vLLM 推理服务最终镜像",
+        "内部开发调试环境，需要 nvcc",
+        "只需最小 CUDA 组件自行精确安装"
+      ],
+      "right": [
+        "nvidia/cuda:...-base",
+        "nvidia/cuda:...-devel",
+        "nvidia/cuda:...-runtime",
+        "nvidia/cuda:...-devel（builder 阶段）"
+      ],
+      "explain": "自定义算子编译需要 nvcc 和头文件，用 devel 阶段作为 builder；最终推理镜像用 runtime，只含运行依赖；开发环境需要 nvcc 用 devel；极简自定义安装用 base。"
+    },
+    {
+      "type": "choice",
+      "prompt": "版本矩阵中新增一个「canary baseline」而不是直接覆盖「stable baseline」，最主要的原因是什么？",
+      "options": [
+        "Registry 不支持同名覆盖",
+        "保证出问题时可以归因——如果直接覆盖，升级失败时无法区分是哪个组件变化造成的",
+        "减少 CI 运行时间",
+        "避免 SBOM 记录冲突"
+      ],
+      "answer": 1,
+      "explain": "若直接覆盖 stable baseline，同时升级 Driver、CUDA、PyTorch、推理引擎时发生故障，无法确定哪个变化是根因。新建 canary baseline 保持 stable 不变，出问题时可回滚并对比差异，做到精确归因。"
+    },
+    {
+      "type": "input",
+      "prompt": "AI 镜像冷启动拆成 7 个阶段，镜像体积治理只能优化其中哪个阶段？（填写阶段名称，3~4 个汉字）",
+      "accept": ["image pull", "镜像拉取", "镜像下载"],
+      "explain": "镜像体积治理（使用 runtime 基础镜像、合并清理层、裁剪依赖等）只能缩短 image pull 阶段耗时。模型下载、engine build、GPU warmup 等阶段与镜像体积无关，需要独立的优化策略。"
+    },
+    {
+      "type": "judge",
+      "prompt": "将 `pip install` 命令写在生产推理镜像的 ENTRYPOINT 或启动脚本里，会让依赖版本更灵活，是推荐做法。",
+      "answer": false,
+      "explain": "生产推理镜像的启动路径中禁止动态 `pip install`：这会引入不可控的外部依赖、破坏镜像的可复现性和冷启动时间、且镜像内容已经过供应链审计但运行时安装的包未经过扫描。所有依赖应在构建时固化进镜像层。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个推理镜像大小为 32 GB，团队决定「把模型权重也打包进镜像」。以下哪个分析最准确？",
+      "options": [
+        "好主意，这样可以完全消除冷启动中的模型下载阶段",
+        "不好，镜像过大会使 image pull 变慢，且同一套权重无法在不同服务间共享，回滚时也需要重新拉取 32 GB",
+        "可以接受，只要 Registry 空间够大",
+        "好主意，权重打包进镜像后 SBOM 会自动覆盖权重文件"
+      ],
+      "answer": 1,
+      "explain": "将大模型权重打包进镜像会导致：image pull 速度慢（每次扩容都拉取 32 GB）、权重更新必须重建镜像（降低发布灵活性）、多服务无法共享同一份权重缓存。推荐把权重存储在对象存储或共享 PVC，启动时挂载或下载，并建立本地缓存机制。"
+    },
+    {
+      "type": "choice",
+      "prompt": "推理镜像设计时，以下哪项属于「默认非 root」原则的正确理解？",
+      "options": [
+        "推理进程必须以 UID 0 运行才能访问 GPU 设备",
+        "生产推理容器应以非 root 用户运行，通过 Device Plugin + runtime hook 获得 GPU 访问权，不需要 root",
+        "只有在单节点场景下才能非 root",
+        "非 root 运行会使 NCCL 无法初始化"
+      ],
+      "answer": 1,
+      "explain": "GPU 访问通过 Device Plugin 资源声明和 NVIDIA Container Toolkit 注入设备节点实现，不依赖 root 权限。生产推理容器应以非 root 用户运行（`runAsNonRoot: true`），结合 `readOnlyRootFilesystem` 和 `allowPrivilegeEscalation: false`，实现最小权限。"
+    },
+    {
+      "type": "match",
+      "prompt": "将冷启动阶段与最有效的优化方向配对：",
+      "left": [
+        "模型下载阶段耗时 8 分钟",
+        "engine build（TensorRT）耗时 6 分钟",
+        "image pull 耗时 4 分钟",
+        "GPU warmup 耗时 2 分钟"
+      ],
+      "right": [
+        "显式 warmup 请求 + CUDA graph 预热",
+        "本地节点缓存权重文件 + 并行下载",
+        "预构建 TensorRT engine 并持久化缓存",
+        "缩小镜像体积 + registry mirror + DaemonSet 预拉取"
+      ],
+      "explain": "模型下载靠本地缓存；engine build 靠预构建+持久缓存；image pull 靠镜像瘦身和预热策略；GPU warmup 靠显式 warmup 和 CUDA graph 预热。"
+    }
+  ],
+  "u7-l3": [
+    {
+      "type": "choice",
+      "prompt": "在 containerd 配置中，是什么机制触发 NVIDIA Container Toolkit 介入容器创建流程？",
+      "options": [
+        "设置环境变量 `NVIDIA_VISIBLE_DEVICES=all`",
+        "Pod 的 `runtimeClassName: nvidia` 触发对应 RuntimeClass handler，containerd 选用 `nvidia-container-runtime` 而非默认 runc",
+        "Device Plugin 直接调用 libnvidia-container",
+        "kubelet 在调度阶段自动启用 NVIDIA 注入"
+      ],
+      "answer": 1,
+      "explain": "Pod 的 `runtimeClassName: nvidia` 让 kubelet 通过 CRI 告知 containerd 使用 `nvidia` runtime handler，containerd 使用 `nvidia-container-runtime`（对 runc 的薄 wrapper），从而触发 NVIDIA Container Toolkit 的 hook 或 CDI 注入。缺少 RuntimeClass 配置是「GPU Pod 启动后设备未注入」的常见根因之一。"
+    },
+    {
+      "type": "input",
+      "prompt": "NVIDIA Container Toolkit 中，负责「在节点启动时生成 CDI spec 文件」的命令行工具是哪个？（填写命令名）",
+      "accept": ["nvidia-ctk", "nvidia-ctk cdi generate"],
+      "explain": "`nvidia-ctk cdi generate` 在节点启动时（或 Driver 升级后）运行，把 GPU 设备信息生成为 `/etc/cdi/nvidia.yaml` 这个静态声明文件，容器创建时 containerd 直接读取该文件完成设备注入，无需每次跑外部程序。"
+    },
+    {
+      "type": "judge",
+      "prompt": "环境变量 `CUDA_VISIBLE_DEVICES` 和 `NVIDIA_VISIBLE_DEVICES` 作用完全相同，可以互相替代。",
+      "answer": false,
+      "explain": "`NVIDIA_VISIBLE_DEVICES` 由 NVIDIA Container Toolkit 在容器创建时读取，控制哪些设备被注入容器；`CUDA_VISIBLE_DEVICES` 是 CUDA 框架层的重映射，在设备已注入后进一步过滤进程可见的设备。若 `CUDA_VISIBLE_DEVICES` 被覆盖设置，容器内可见设备数量可能不符合预期，但改的是框架视角而非注入本身。"
+    },
+    {
+      "type": "choice",
+      "prompt": "MIG 实例在容器内通过 `cuda:0` 访问，生产日志记录「cuda:0」而不记录 MIG UUID，会导致什么问题？",
+      "options": [
+        "容器内无法访问 MIG 实例",
+        "`cuda:0` 代表容器内可见设备的序号，不与固定 MIG 实例绑定，Pod 重建后 `cuda:0` 可能映射到不同 MIG 实例，导致日志无法准确追踪资源使用",
+        "MIG UUID 只能在宿主机层面使用",
+        "记录 UUID 会暴露安全信息"
+      ],
+      "answer": 1,
+      "explain": "`cuda:0` 是容器内的设备序号，具体映射到哪个 MIG 实例取决于注入结果，Pod 重建后可能不同。生产日志应记录 MIG UUID，这样才能准确对应节点上的真实实例，便于排障和审计。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 NVIDIA Container Toolkit 的组件与其作用配对：",
+      "left": [
+        "libnvidia-container",
+        "nvidia-container-cli",
+        "nvidia-ctk",
+        "nvidia-container-runtime"
+      ],
+      "right": [
+        "runc 的薄 wrapper，通过 containerd runtime_handler 被选中",
+        "C 库，执行设备 mount、driver 库注入、cgroup 配置",
+        "生成 CDI spec、配置 containerd 的运维命令行工具",
+        "命令行入口，所有实际注入动作都通过它，可独立调用调试"
+      ],
+      "explain": "libnvidia-container 是底层 C 库；nvidia-container-cli 是可独立调用的命令行入口；nvidia-ctk 是运维工具（生成 CDI spec）；nvidia-container-runtime 是 runc wrapper，被 containerd 调用。"
+    },
+    {
+      "type": "choice",
+      "prompt": "多机分布式训练 Pod 在容器内执行 `ibv_devinfo` 报错「no InfiniBand/RDMA devices found」，下一步最应该检查什么？",
+      "options": [
+        "检查 NCCL 版本是否支持 RDMA",
+        "检查 Pod 是否声明了 RDMA 资源请求并确认 `/dev/infiniband/*` 是否已注入容器",
+        "检查网络插件（CNI）配置",
+        "重启节点"
+      ],
+      "answer": 1,
+      "explain": "`ibv_devinfo` 找不到设备说明 `/dev/infiniband/*` 设备节点未注入容器。应先确认 Pod 的 resource request 是否包含 RDMA 设备资源（通过 RDMA Device Plugin 暴露），以及 RDMA Device Plugin 是否工作正常。在 verbs 不可用时调 NCCL 参数是无效的。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Kubernetes Pod 的 `securityContext` 中，若要完全符合最小权限原则，应将哪个字段设置为 `true` 以禁止提权？（填写字段名）",
+      "accept": ["allowPrivilegeEscalation", "allowprivilegeescalation"],
+      "explain": "`allowPrivilegeEscalation: false` 禁止进程通过 setuid/setgid 获得比父进程更高的权限，是生产容器最小权限设计的核心字段之一，应与 `runAsNonRoot: true` 和 `readOnlyRootFilesystem: true` 一起使用。"
+    },
+    {
+      "type": "judge",
+      "prompt": "containerd 1.6 及更早版本的节点可以使用 CDI 路径进行 GPU 设备注入。",
+      "answer": false,
+      "explain": "CDI 原生支持需要 containerd 1.7+ 和 nvidia-container-toolkit 1.14+。containerd 1.6 及更早版本只能走旧的 OCI hook 路径（`nvidia-container-runtime-hook`）。混合集群需要验证不同版本节点的注入路径一致性。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种配置方式最符合 AI 推理容器的最小权限设计原则？",
+      "options": [
+        "`privileged: true`，所有能力都有，最省心",
+        "`capabilities: {drop: [ALL], add: [NET_ADMIN, SYS_PTRACE]}` + `runAsNonRoot: true`，按需添加",
+        "不设置 securityContext，使用默认值",
+        "`hostNetwork: true` + `hostPID: true`，方便网络和进程调试"
+      ],
+      "answer": 1,
+      "explain": "最小权限原则要求先 `drop ALL`，再只添加该工作负载明确需要的 capability（如推理服务通常不需要 NET_ADMIN 和 SYS_PTRACE，仅为示例说明按需添加的做法）。`privileged: true` 绕过几乎所有隔离机制；`hostNetwork/hostPID` 大幅扩大攻击面；不设置 securityContext 依赖不可控的默认值。"
+    },
+    {
+      "type": "judge",
+      "prompt": "OCI hook 路径中，每次容器创建都会重新运行 `nvidia-container-runtime-hook` 二进制来计算设备注入内容；而 CDI 路径则在节点启动时生成一次 spec 文件，容器创建时直接读取该文件。",
+      "answer": true,
+      "explain": "这是 CDI 与旧 hook 路径的核心区别：hook 路径每次容器创建都跑外部程序，调试需看 hook 日志；CDI 把设备信息静态化为 `/etc/cdi/nvidia.yaml`，可直接查看和审计，不需要每次运行程序。Driver 升级后必须重新生成 CDI spec。"
+    }
+  ],
+  "u7-l4": [
+    {
+      "type": "choice",
+      "prompt": "Attestation 与 SBOM 的核心区别是什么？",
+      "options": [
+        "Attestation 记录镜像内容，SBOM 记录构建过程",
+        "SBOM 记录镜像内部的组件和版本；Attestation 记录关于该 digest 的构建事实（源码、builder 身份、参数、测试结果）",
+        "两者相同，只是名称不同",
+        "Attestation 只用于签名验证，SBOM 只用于漏洞扫描"
+      ],
+      "answer": 1,
+      "explain": "SBOM（软件物料清单）回答「里面有什么组件」；Attestation 回答「关于这个 digest，构建系统声明了哪些事实」，包括源码 commit、builder identity、构建参数、测试结果。两者互补，分别降低不同类型的供应链风险。"
+    },
+    {
+      "type": "judge",
+      "prompt": "发布状态机中，`rollback_candidate` 状态的镜像可以被 Registry GC 清理，因为它已经不是「当前生产版本」。",
+      "answer": false,
+      "explain": "`rollback_candidate` 正是事故时需要快速拉取的版本，必须被「显式保护」防止 GC 清除。若事故时发现回滚候选已被 GC，回滚本身就会失败或极慢，加剧故障影响。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 AI 镜像供应链中，用于描述「镜像由哪个 CI 系统、哪个 git commit 构建、经过哪些测试」的机制叫什么？（填英文术语）",
+      "accept": ["attestation", "Attestation"],
+      "explain": "Attestation（声明/证明）由构建系统（如 CI）对 digest 签名附加，记录源码仓库、git commit、builder identity、构建参数、扫描结果等事实，是 SLSA 框架的核心机制，用于降低供应链篡改风险。"
+    },
+    {
+      "type": "match",
+      "prompt": "将发布状态机中的状态与进入该状态的关键条件配对：",
+      "left": [
+        "eligible_for_prod",
+        "rollback_candidate",
+        "deprecated",
+        "scanned"
+      ],
+      "right": [
+        "构建完成后自动触发漏洞扫描并记录结果",
+        "staging smoke test 通过且兼容矩阵通过",
+        "仍可拉取、仍在节点矩阵内、保留策略保护",
+        "已被新版本替代但仍需保留供审计"
+      ],
+      "explain": "eligible_for_prod 需要 staging 测试和矩阵验证；rollback_candidate 需要可拉取且受保留策略保护；deprecated 是生命周期末期但仍保留；scanned 是构建后第一步。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种 Registry 操作模式是「反模式」？",
+      "options": [
+        "生产 tag 设置为 immutable",
+        "回滚候选 digest 显式受保留策略保护",
+        "允许工程师从本地工作站直接 push 到生产 registry",
+        "以 digest 为单位做跨区域复制"
+      ],
+      "answer": 2,
+      "explain": "允许工程师从本地 push 生产镜像是严重的供应链反模式：这样的镜像绕过了 CI 构建、SBOM 生成、扫描、签名等全部门禁，无法追溯来源，无法验证内容，也不符合 SLSA 框架要求。生产镜像只应由受控 CI 系统构建和 push。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「持续重扫」（当 CVE 数据库更新时重新评估已发布 digest）是可选的，只对超高安全要求的场景才需要。",
+      "answer": false,
+      "explain": "CVE 数据库持续更新，构建时扫描通过的镜像在数周后可能因新披露漏洞变成高危。持续重扫是必要机制，不只是超高安全场景的选项。两种触发模式（构建时 + 持续重扫）缺一不可。"
+    },
+    {
+      "type": "input",
+      "prompt": "衡量「有多少比例的生产 digest 已生成 SBOM」的指标叫什么？（填英文，两个单词）",
+      "accept": ["SBOM coverage", "sbom coverage"],
+      "explain": "SBOM coverage（SBOM 覆盖率）衡量当前有 SBOM 的生产 digest 比例，是供应链健康度的关键指标。低覆盖率意味着 CVE 反查「哪些 digest 包含受影响组件」时无法准确匹配。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某团队发现上周发布的镜像 tag `prod-latest` 今天指向了与上周不同的 digest，最可能的原因是什么？",
+      "options": [
+        "Registry 自动进行了 GC 操作",
+        "有人重新构建并推送了新镜像，tag 发生了漂移",
+        "SBOM 记录更新导致内容变化",
+        "签名验证失败触发了自动回滚"
+      ],
+      "answer": 1,
+      "explain": "tag 是可变指针，任何有权限的人或 CI 系统推送新镜像并打同名 tag，都会导致 tag 漂移。这正是为什么部署和审计必须以 digest 为主键——digest 是内容哈希，内容不变则 digest 不变，不会漂移。"
+    },
+    {
+      "type": "choice",
+      "prompt": "「rollback readiness」指标衡量的是什么？",
+      "options": [
+        "回滚操作的平均耗时",
+        "回滚候选 digest 中「仍可拉取、签名可验证、兼容矩阵通过」的比例",
+        "生产中正在运行的 Pod 数量",
+        "最近一次回滚操作是否成功"
+      ],
+      "answer": 1,
+      "explain": "rollback readiness 是供应链健康度的关键指标，衡量回滚候选 digest 是否具备快速回滚的条件：可拉取（未被 GC）、签名可验证（凭据未失效）、兼容矩阵通过（与当前节点 Driver/GPU 兼容）。任何一项缺失都会导致事故时回滚失败。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「环境差异应通过重新构建镜像来表达」，这是多环境发布的推荐做法。",
+      "answer": false,
+      "explain": "环境差异（dev/staging/prod 的配置、secret、模型版本、feature flag 差异）应通过配置、secret 或 feature flag 来表达，而不是重新构建镜像。正确做法是 build once，promotion 同一个 digest，不同环境注入不同配置，保证 staging 测试的内容与 prod 部署的内容完全一致。"
+    }
+  ],
+  "u7-l5": [
+    {
+      "type": "choice",
+      "prompt": "排障 AI 容器时，以下哪种操作顺序符合「先定层，再定组件」原则？",
+      "options": [
+        "先改业务代码，再检查日志",
+        "先看 Pod event 和 describe，从调度层开始逐层往下，收集证据后再做解释",
+        "先重启容器，看问题是否消失",
+        "先给容器加 privileged: true，排除权限问题"
+      ],
+      "answer": 1,
+      "explain": "「先定层，再定组件」要求从调度层（Pod event、nodeName、资源请求）开始，逐层往下经过镜像拉取、设备分配、runtime hook、宿主机 Driver、容器内运行、框架初始化。先收证据，再做解释，不能跳步骤或未确认根因就盲目修改配置。"
+    },
+    {
+      "type": "judge",
+      "prompt": "排障时发现某 Pod 的 `NVIDIA_VISIBLE_DEVICES` 环境变量有值，可以断定容器内已经存在 `/dev/nvidia*` 设备节点。",
+      "answer": false,
+      "explain": "`NVIDIA_VISIBLE_DEVICES` 有值说明 Device Plugin 已在编排层分配了设备，但设备节点是否注入容器取决于 NVIDIA runtime hook 是否被执行。两者各自独立：分配成功不等于注入成功。如果 RuntimeClass 未正确配置，`NVIDIA_VISIBLE_DEVICES` 有值但 `/dev/nvidia*` 依然不存在。"
+    },
+    {
+      "type": "input",
+      "prompt": "用 `ldd path/to/module.so` 发现某个共享库的状态显示为「not found」，说明该库在当前容器的动态链接器搜索路径中找不到。可以用哪个命令查看当前动态链接器缓存中有哪些 CUDA 库？（填写命令及关键参数，格式：命令 参数）",
+      "accept": ["ldconfig -p", "ldconfig -p | grep cuda"],
+      "explain": "`ldconfig -p` 列出当前动态链接缓存中的所有共享库及其路径，配合 `grep cuda` 可以快速确认 CUDA 相关库是否在缓存中、是否解析到预期路径。这是诊断「库存在但加载失败」问题的第一步。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 NCCL/RDMA 故障排查的最小测试步骤与其目的配对：",
+      "left": [
+        "检查容器内 `ls -l /dev/infiniband`",
+        "执行 `ulimit -l`",
+        "运行 `ibv_devinfo`",
+        "设置 `NCCL_DEBUG=INFO` 后运行 all-reduce 测试"
+      ],
+      "right": [
+        "查看 NCCL 实际选择了哪种传输方式（RDMA/Socket）",
+        "确认 verbs userspace 接口是否可用",
+        "确认 RDMA 设备节点是否已注入容器",
+        "确认内存锁定限制是否足够支持 RDMA 内存注册"
+      ],
+      "explain": "RDMA 排障要按序：先确认设备存在、再确认 memlock 足够、再验证 verbs 可用、最后才看 NCCL 选了哪个传输。在上层不通时就调 NCCL 参数是无效的。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个多节点训练作业卡在 rendezvous，某 rank 日志最后一行是 OOM Killed。按「先修 rank 应用错误，再看通信」原则，下一步应该怎么做？",
+      "options": [
+        "增大 NCCL timeout 参数",
+        "先增大 OOM rank 的 memory limit 或减少 per-rank batch size，修复 rank 崩溃，再观察 rendezvous 是否恢复",
+        "重建所有 Pod",
+        "换用 TCP 传输替代 RDMA"
+      ],
+      "answer": 1,
+      "explain": "rendezvous 卡住的根因是某 rank OOM 退出，不再参与通信同步。增大 NCCL timeout 只是推迟发现问题，不能解决 rank 崩溃。应先修复 rank 崩溃（调整 memory limit 或 batch size），rank 成功运行后 rendezvous 通常自然恢复。"
+    },
+    {
+      "type": "input",
+      "prompt": "排障「节点差异」问题时，应对成功节点和失败节点做什么操作以快速找到差异？（填写三个字）",
+      "accept": ["并排对比", "并行对比", "对比", "差异对比"],
+      "explain": "「并排对比」是节点差异排障的最快路径：对比两节点的 image digest、OS/kernel、containerd/runc 版本、NVIDIA Driver 版本、NVIDIA Container Toolkit 版本、GPU 型号、MIG 状态、RDMA 设备、RuntimeClass 等字段，找到差异项后只改一项并验证。"
+    },
+    {
+      "type": "judge",
+      "prompt": "排障时为快速复现问题在 Pod 上添加了 `hostPID: true`，调试完成后可以保留该配置以便下次排障更快。",
+      "answer": false,
+      "explain": "`hostPID: true` 让容器可以看到宿主机所有进程，是高风险配置，只应在排障期间临时使用，调试完成后必须立即恢复到最小权限配置。保留临时权限是安全债务积累的典型路径。"
+    },
+    {
+      "type": "choice",
+      "prompt": "排障过程中发现根因是「镜像 CUDA userspace 与 GPU arch 不兼容」，修复完镜像后，最重要的后续动作是什么？",
+      "options": [
+        "把本次事故根因和修复方法记录到兼容矩阵，更新节点准入检查为自动化测试",
+        "在 Slack 群通知一下就好",
+        "给该节点贴上 NoSchedule taint",
+        "重启 Kubernetes API Server 使配置生效"
+      ],
+      "answer": 0,
+      "explain": "单次修复只解决了一个节点或一个 Pod 的问题，不能防止相同根因再次出现。应把根因（CUDA/GPU arch 不兼容）和修复方法（矩阵添加 H100 验证、重建覆盖 sm_90 的 wheel）写回兼容矩阵，并将节点准入检查更新为自动化测试，形成平台基线。"
+    },
+    {
+      "type": "choice",
+      "prompt": "启动路径中 `startupProbe` 超时，容器被 kubelet 杀掉并重建，形成 `CrashLoopBackOff`，但实际上是模型权重下载未完成。最合理的解决方案是什么？",
+      "options": [
+        "把模型权重打包进镜像",
+        "调整 `startupProbe` 的 `failureThreshold` 和 `periodSeconds`，给模型下载足够的时间；同时把下载进度记录到日志方便观测",
+        "改用 `livenessProbe` 替代 `startupProbe`",
+        "去掉所有 probe"
+      ],
+      "answer": 1,
+      "explain": "`startupProbe` 专门为慢启动设计：应设置足够大的 `failureThreshold × periodSeconds` 覆盖最坏情况下的模型下载时间。同时记录下载进度方便监控。去掉 probe 会导致流量过早发到未就绪副本；用 livenessProbe 替代 startupProbe 会在模型加载期间误杀容器。"
+    },
+    {
+      "type": "judge",
+      "prompt": "排障时，应该一边查证据、一边并发修改多个参数，这样能更快找到解法。",
+      "answer": false,
+      "explain": "并发修改多个参数会破坏证据链：不知道哪个修改解决了问题，也不知道哪个修改引入了新问题。正确做法是：先固定 digest（避免 tag 漂移），收集完整证据，找到差异后**每次只改一个变量**并验证，修复后把结论写回平台基线。"
+    }
+  ],
+  "u7-l6": [
+    {
+      "type": "choice",
+      "prompt": "以下哪项属于「AI control plane」而非「Kubernetes runtime plane」的职责？",
+      "options": [
+        "决定 Pod 调度到哪个节点",
+        "判断训练模型是否通过评测门禁，决定是否允许发布",
+        "维持 Deployment 的副本数等于期望值",
+        "重启崩溃的容器"
+      ],
+      "answer": 1,
+      "explain": "Kubernetes runtime plane 负责「怎么运行」：调度、副本维持、容器重启等。AI control plane 负责「为什么运行、是否该运行、运行是否合格」：使用哪个数据集版本、模型是否通过评测门禁、成本归因等。发布门禁属于 AI 语义，不是 Kubernetes 原生能力。"
+    },
+    {
+      "type": "judge",
+      "prompt": "直接提交 8 个普通 `Pod` 对象（不使用 gang scheduling）可以可靠地跑分布式训练，因为 Kubernetes 会自动协调它们同时启动。",
+      "answer": false,
+      "explain": "Kubernetes 默认调度器不感知训练任务的「all-or-nothing」语义。8 个 Pod 可能分批调度：前 5 个占住 GPU 等待其他 rank 加入 rendezvous，而剩余 3 个因 GPU 不足永远 Pending，导致训练卡死。必须使用 gang scheduling（Volcano PodGroup 或 CoScheduling）。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Kubernetes for AI 场景中，Volcano 实现 gang scheduling 时的核心调度语义声明对象叫什么？（填英文对象名）",
+      "accept": ["PodGroup", "podgroup"],
+      "explain": "Volcano 通过 `PodGroup` 声明一组 Pod 的 gang 约束（如 `minMember: 8`）。调度器在 Allocate 阶段检查是否能为 minMember 个 Pod 同时找到节点，能则 batch bind，否则全部 Pending，避免半空闲占用。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 Kubernetes 核心组件与其在 AI 场景中的正确定位配对：",
+      "left": [
+        "Device Plugin",
+        "Operator",
+        "Helm",
+        "scheduler-plugins CoScheduling"
+      ],
+      "right": [
+        "利用 Scheduling Framework 的 Permit 阶段实现 gang scheduling，是 default scheduler 的扩展插件",
+        "向 kubelet 注册 GPU 为 extended resource 并在容器启动时返回设备注入信息",
+        "持续 reconcile 运行时状态，把 AI 语义（TorchJob、MIG 管理）翻译成 K8s 对象",
+        "在提交前渲染 YAML 模板并应用，不感知运行时状态变化"
+      ],
+      "explain": "Device Plugin 管理设备发现和分配；Operator 持续 reconcile；Helm 是静态 YAML 渲染；CoScheduling 是 default scheduler 的 gang plugin，使用 Permit 阶段实现等待机制。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下对 `nvidia.com/gpu: 8` 的理解，哪个是正确的？",
+      "options": [
+        "8 张 GPU 一定在同一个 NVSwitch domain，可以高速互联",
+        "代表「8 个被 Device Plugin 暴露的设备」，但不表达 GPU 型号、NVLink 拓扑、NUMA 亲和性",
+        "8 张 GPU 的显存总量为 640 GB（按 H100 80GB 计算）",
+        "等同于申请整台 DGX 节点的全部 GPU"
+      ],
+      "answer": 1,
+      "explain": "`nvidia.com/gpu: 8` 只表达「需要 8 个 GPU 扩展资源」，不包含 GPU 型号、NVLink 拓扑、NUMA 亲和、显存大小等信息。要约束这些属性，需要通过节点标签（NFD/GFD 打标）+ nodeSelector/affinity 等机制。"
+    },
+    {
+      "type": "choice",
+      "prompt": "Operator 和 Helm 最本质的区别是什么？",
+      "options": [
+        "Operator 只能用 Go 编写，Helm 支持所有语言",
+        "Helm 在提交时渲染 YAML，不感知运行时变化；Operator 持续 reconcile 实际状态与期望状态的差距",
+        "Operator 体积比 Helm chart 更小",
+        "Helm 需要 root 权限，Operator 不需要"
+      ],
+      "answer": 1,
+      "explain": "Helm 是「apply 前渲染 YAML」的工具，提交后就不再干预运行时状态。Operator 实现了 reconcile loop：持续对比实际状态与期望状态（spec），发现差异时采取纠正动作——这才能实现 TorchJob、MIG Manager 等 AI 语义的自动管理。"
+    },
+    {
+      "type": "judge",
+      "prompt": "「集群总空闲 GPU 数量 = 16」意味着一定能调度一个请求 16 张 GPU 的 gang 训练作业。",
+      "answer": false,
+      "explain": "GPU 资源有「形状」。16 张空闲 GPU 可能分散在 4 个节点上，每节点 4 张，但训练作业要求 16 张在同一批可以形成 gang 的节点组内且满足 NVLink/RDMA 拓扑约束，可能无法调度。可调度性取决于资源分布、节点标签、亲和约束和 gang 完整性。"
+    },
+    {
+      "type": "input",
+      "prompt": "Kubernetes 中，`scheduler-plugins CoScheduling` 使用 Scheduling Framework 的哪个阶段实现 gang 等待语义？（填写阶段名）",
+      "accept": ["Permit", "permit"],
+      "explain": "CoScheduling 在 Scheduling Framework 的 `Permit` 阶段拦截：前 N-1 个 Pod 到达 Permit 时进入等待状态，第 N 个到达后一起 Allow，实现 all-or-nothing 语义。超时（默认 60s）则全部 Reject 重新入队。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪项是 Kubernetes runtime plane 无法自动处理、需要 AI control plane 介入的任务？",
+      "options": [
+        "重启崩溃的容器",
+        "把 Service 的流量路由到健康的 Pod",
+        "在训练完成后根据评测分数决定是否触发发布流程",
+        "根据 CPU 使用率自动扩容"
+      ],
+      "answer": 2,
+      "explain": "Kubernetes runtime plane 能处理容器重启、Service 路由、基于指标的 HPA 扩容。但「根据评测分数决定是否发布」涉及模型质量判断和发布门禁，属于 AI control plane 的职责，Kubernetes 没有原生的模型评测和发布门禁机制。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Volcano 是一个独立的 scheduler binary，与 Kubernetes default scheduler 完全分离；CoScheduling 是 default scheduler 的扩展 plugin，两者不能同时在集群中使用。",
+      "answer": false,
+      "explain": "Volcano 是独立 scheduler binary，CoScheduling 是 default scheduler 的 plugin，两者可以在同一集群共存。但关键工程约束是：**不要让同一批 Pod 同时被两个 scheduler 处理**，否则调度决策会冲突。不同 workload 可以分别使用 Volcano 或 CoScheduling。"
+    }
+  ],
+  "u7-l7": [
+    {
+      "type": "choice",
+      "prompt": "一个有状态分片推理服务（每个副本处理固定 shard 的 KV 缓存），应该使用哪种 Kubernetes 对象？",
+      "options": [
+        "Deployment，因为推理是长期服务",
+        "Job，因为处理完请求后就退出",
+        "StatefulSet，因为需要稳定的 ordinal 身份和固定的存储绑定",
+        "DaemonSet，保证每个节点都有一个副本"
+      ],
+      "answer": 2,
+      "explain": "有状态分片推理需要稳定的 Pod ordinal（`worker-0`, `worker-1`...对应固定 shard）和稳定的存储绑定（KV 缓存持久化到固定 PVC）。StatefulSet 提供稳定 hostname、有序生命周期和 PVC 绑定，是此场景的正确选择。Deployment 的 Pod 是可互换的，不适合有状态 shard。"
+    },
+    {
+      "type": "judge",
+      "prompt": "将 `livenessProbe` 设置为向推理服务发送一个真实的大模型推理请求，是检测服务「是否存活」的最准确方式。",
+      "answer": false,
+      "explain": "用真实推理请求做 liveness 检查会消耗 GPU 资源，在高负载时放大尾延迟，在长 prefill 阶段误触发重启。livenessProbe 应检查「进程是否不可恢复」（如主事件循环是否卡死），而不是业务请求。应使用轻量内部健康状态端点。"
+    },
+    {
+      "type": "input",
+      "prompt": "训练任务中 checkpoint 应该写到哪类存储，而不是容器本地文件系统？（填写 Kubernetes 存储对象类型，缩写）",
+      "accept": ["PVC", "pvc", "PersistentVolumeClaim"],
+      "explain": "容器本地文件系统在 Pod 重建后丢失。训练 checkpoint 应写到 PVC（PersistentVolumeClaim）或对象存储，这样 Pod 重建后可以从上次 checkpoint 继续，不会从头重训。"
+    },
+    {
+      "type": "match",
+      "prompt": "将配置类型与其最适合存放的内容配对：",
+      "left": [
+        "镜像层",
+        "ConfigMap",
+        "Secret",
+        "环境变量（平台注入）"
+      ],
+      "right": [
+        "rank、world size、rendezvous endpoint、少量开关",
+        "对象存储 token、registry 凭据、API key",
+        "超参数、模型名称、服务路由、feature flag",
+        "应用代码、CUDA userspace、启动入口"
+      ],
+      "explain": "镜像固定代码和依赖；ConfigMap 存中等频率变化的配置；Secret 存凭据（有访问控制和加密）；环境变量由平台注入少量运行时信息如 rank 和 world size。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种 probe 配置反模式会导致「模型未加载完成的副本开始接收真实流量」？",
+      "options": [
+        "startupProbe failureThreshold 设置过大",
+        "readinessProbe 只检查服务端口是否可连接，不检查模型是否加载完成",
+        "livenessProbe 检查轻量内部状态端点",
+        "readinessProbe 检查 /health/ready 端点"
+      ],
+      "answer": 1,
+      "explain": "readinessProbe 若只检查端口连通性（如 `tcpSocket` 或简单 HTTP 200），进程启动但模型未加载时端口已可访问，probe 通过后副本加入 Service endpoints，真实请求进来会因模型未就绪失败。readiness 应检查「模型已加载、warmup 完成、依赖可达」。"
+    },
+    {
+      "type": "judge",
+      "prompt": "将 API key 写进 `ConfigMap` 存储，是管理推理服务外部 API 凭据的可接受做法。",
+      "answer": false,
+      "explain": "ConfigMap 没有访问控制加密保护，其内容对有权读取该命名空间 ConfigMap 的人是明文可见的。凭据（API key、token、密码）应存放在 `Secret` 中，Secret 有独立的 RBAC 权限控制，且支持静态加密（etcd encryption）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "评测任务要求结果幂等（重试不覆盖前一次结果），以下哪种设计最符合这个要求？",
+      "options": [
+        "将结果写入容器的 `/tmp` 目录",
+        "将结果写入以任务 ID 或 git commit 为路径前缀的对象存储位置，路径唯一且不可覆盖",
+        "将结果打印到标准输出（stdout），由日志系统收集",
+        "结果写入共享 ConfigMap，所有评测共用同一个 key"
+      ],
+      "answer": 1,
+      "explain": "评测结果要「输出目录唯一（避免重试覆盖）、结果写入可审计位置」。以任务 ID 或 git commit 为路径前缀的对象存储路径，保证每次运行写入不同位置，重试不覆盖历史结果，且便于后续审计追溯。`/tmp` 在 Pod 重建后消失；stdout 不可审计；共享 ConfigMap key 会被覆盖。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Kubernetes 中，为工作负载授权访问特定资源（如读取某命名空间的 ConfigMap），正确的权限对象组合是 Role 和什么？（填写英文对象名）",
+      "accept": ["RoleBinding", "rolebinding"],
+      "explain": "Role 定义权限规则（可以对哪些资源执行哪些操作），RoleBinding 把 Role 与具体 Subject（ServiceAccount、User、Group）绑定，赋予该 Subject 相应权限。生产工作负载应使用最小权限 Role/RoleBinding，避免绑定 cluster-admin。"
+    },
+    {
+      "type": "choice",
+      "prompt": "StatefulSet `worker-0` Pod 因节点故障重建后，以下哪项描述是正确的？",
+      "options": [
+        "重建后 Pod 名称变为随机字符串",
+        "重建后 Pod 保持 `worker-0` 名称并重新绑定到同一个 PVC",
+        "重建后 PVC 被删除，必须手动重新创建",
+        "重建后 Pod 会绑定到新的不同 PVC"
+      ],
+      "answer": 1,
+      "explain": "StatefulSet 的核心语义是「稳定身份」：Pod 重建后保持同名（`worker-0`）、同一 hostname，并重新绑定到同名 PVC（由 volumeClaimTemplate 创建的 PVC 与 Pod 名称绑定）。这是 StatefulSet 与 Deployment 最本质的区别。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Deployment 中 Pod 的副本之间是完全可以互换的，没有稳定的身份标识，这是 Deployment 适合无状态推理服务的原因。",
+      "answer": true,
+      "explain": "Deployment 维持期望副本数，当 Pod 失败时创建新 Pod 替代，新 Pod 名称是随机的。副本间可互换意味着任意 Pod 都能处理任意请求，适合无状态推理服务。需要稳定身份（固定 ordinal、稳定 hostname、固定 PVC）时应使用 StatefulSet。"
+    }
+  ],
+  "u7-l8": [
+    {
+      "type": "choice",
+      "prompt": "NFD（Node Feature Discovery）和 GPU Feature Discovery 在 AI 调度中扮演的角色是什么？",
+      "options": [
+        "负责实际的 GPU 资源分配和设备注入",
+        "自动发现 GPU 型号、显存、MIG 状态、CUDA capability 并打节点标签，为调度约束提供数据基础",
+        "实现 gang scheduling 的核心逻辑",
+        "管理 GPU 驱动的安装和升级"
+      ],
+      "answer": 1,
+      "explain": "NFD/GFD 的职责是自动发现节点的硬件特性并打标签（如 `nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3`、`nvidia.com/gpu.memory=81920`），让调度器和用户可以通过 nodeSelector/affinity 引用这些标签进行精确调度。它们只「打标签」，不负责资源分配或设备注入。"
+    },
+    {
+      "type": "judge",
+      "prompt": "MIG 碎片问题是指：节点上总显存不足以满足 Pod 请求，因此 Pod 无法调度。",
+      "answer": false,
+      "explain": "MIG 碎片不是简单的容量不足，而是「资源形状不匹配」。例如节点有 `nvidia.com/mig-1g.10gb: 4` 和 `nvidia.com/mig-3g.40gb: 1`，但一个需要 `nvidia.com/mig-7g.80gb: 1` 的 Pod 无法用这些小 profile 拼出整卡（MIG profile 是硬件隔离，不能合并），这就是碎片。"
+    },
+    {
+      "type": "input",
+      "prompt": "在 Kubernetes 中，GPU Operator 的核心职责是「持续管理节点 GPU 软件栈」，其中「软件栈」至少包括哪四个组件？请填写其中一个（英文缩写或全称均可）。",
+      "accept": ["driver", "toolkit", "device plugin", "DCGM", "MIG manager", "nvidia driver", "container toolkit"],
+      "explain": "GPU Operator 持续管理节点上的：NVIDIA Driver（驱动安装/升级）、NVIDIA Container Toolkit（runtime 注入）、Device Plugin（设备发现和分配）、DCGM（遥测指标）、MIG Manager（MIG 切分策略）。这些组件有版本依赖关系，Operator 统一管理升级节奏。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 GPU 拓扑性能问题与对应的诊断命令配对：",
+      "left": [
+        "怀疑 GPU/NIC 跨 NUMA socket 导致 allreduce 慢",
+        "验证 NCCL 是否退化为 TCP 传输",
+        "检查节点 GPU-to-GPU 连接拓扑",
+        "检查 RoCE 网卡 MTU 和状态"
+      ],
+      "right": [
+        "`ibstat` 查看网卡状态和配置",
+        "`nvidia-smi topo -m` 查看 GPU 和 NIC 拓扑矩阵",
+        "`NCCL_DEBUG=INFO` 运行 all-reduce 查看 transport 选择",
+        "`numactl --hardware` 查看 NUMA 节点布局"
+      ],
+      "explain": "NUMA 跨 socket 用 numactl 诊断；NCCL transport 降级用 NCCL_DEBUG=INFO；GPU 互联拓扑用 nvidia-smi topo -m；RoCE 网卡问题用 ibstat。"
+    },
+    {
+      "type": "choice",
+      "prompt": "以下哪种亲和约束描述使用了「软偏好」（preferred），适合「有就优先但没有也能跑」的场景？",
+      "options": [
+        "`requiredDuringSchedulingIgnoredDuringExecution`，没有满足节点就 Pending",
+        "`preferredDuringSchedulingIgnoredDuringExecution`，有满足节点则优先，没有则放到次优节点",
+        "`Taints + NoExecute`，强制驱逐不满足条件的 Pod",
+        "`podAntiAffinity` 的 required 规则"
+      ],
+      "answer": 1,
+      "explain": "`preferredDuringSchedulingIgnoredDuringExecution` 是软偏好：调度器优先选择满足条件的节点，但不是硬性要求，资源紧张时可以放到次优节点。`requiredDuringScheduling` 是硬约束，没有满足节点则 Pod 一直 Pending。性能偏好（如 NVLink 亲和）应用软偏好，NVLink 没有就跑慢一点，而不是永远 Pending。"
+    },
+    {
+      "type": "choice",
+      "prompt": "训练任务需要 8 台节点各 8 张 H100 GPU（DGX H100），且节点间必须通过 InfiniBand RDMA 连接。以下哪种调度约束设计最正确？",
+      "options": [
+        "只声明 `nvidia.com/gpu: 8`，其他交给调度器自动处理",
+        "用 `requiredDuringScheduling` 约束 GPU 型号标签（nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3）和 RDMA 能力标签，同时配合 gang scheduling 保证 8 台节点同时调度",
+        "用 `preferredDuringScheduling` 约束 GPU 型号，不配 gang scheduling",
+        "只设置 `privileged: true`，让训练进程自行探测拓扑"
+      ],
+      "answer": 1,
+      "explain": "必须通过 RDMA 的大规模训练，GPU 型号和 RDMA 能力是「没有就不能跑」的硬约束，应使用 `requiredDuringScheduling`。同时需要 gang scheduling（如 Volcano PodGroup + minMember=8）保证 8 台节点同时调度，防止部分节点占用 GPU 等待其余节点导致死锁。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Topology Manager 是 Kubernetes 中的一个调度器组件，在 Pod 调度阶段（scheduling phase）决定 NUMA 亲和性。",
+      "answer": false,
+      "explain": "Topology Manager 是 kubelet 的一个组件（不是调度器），在 Pod 被调度到节点后的「准入阶段」（admission）协调 CPU Manager、Memory Manager 和 Device Plugin 的资源分配，确保同一 NUMA socket 的 CPU、内存和设备被一起分配。它不参与跨节点的 Pod 调度决策。"
+    },
+    {
+      "type": "input",
+      "prompt": "GPU 节点通常打上 taint 防止普通 Pod 占用 GPU 资源，GPU 训练 Pod 需要在 spec 里添加什么字段才能容忍该 taint？（填写字段名）",
+      "accept": ["tolerations", "toleration"],
+      "explain": "Pod 的 `tolerations` 字段声明对特定 taint 的容忍，格式为 `key/operator/value/effect` 组合。只有包含对应 toleration 的 Pod 才能被调度到带该 taint 的 GPU 节点。这是 GPU 节点防「被普通 Pod 入侵」的标准机制。"
+    },
+    {
+      "type": "choice",
+      "prompt": "DCGM Exporter 在 AI 集群观测中的核心价值是什么？",
+      "options": [
+        "替代 Device Plugin 完成 GPU 资源分配",
+        "暴露 GPU 利用率、显存使用、XID 错误、ECC、温度等硬件指标，为容量规划和故障预警提供数据",
+        "管理 GPU 驱动版本更新",
+        "实现 MIG 切分策略的动态调整"
+      ],
+      "answer": 1,
+      "explain": "DCGM Exporter（Data Center GPU Manager Exporter）通过 DCGM 采集 GPU 硬件层指标（利用率、显存、XID 错误码、ECC 错误、温度、功耗等）并以 Prometheus metrics 格式暴露，是 GPU 集群观测的基础数据源。它不负责资源分配、驱动管理或 MIG 切分。"
+    },
+    {
+      "type": "judge",
+      "prompt": "把所有调度偏好（如 NVLink 亲和、RDMA 亲和）都写成 `requiredDuringScheduling` 硬约束，可以保证训练任务在最优拓扑上运行。",
+      "answer": false,
+      "explain": "把所有偏好都写成 `required` 是反模式：资源紧张时（如 NVLink 节点全满），所有训练任务会 Pending 等待最优资源，而不是降级到次优节点继续运行，造成 GPU 利用率下降。正确做法是区分「没有就不能跑」（硬 required，如特定 GPU arch）和「没有就跑慢」（软 preferred，如 NVLink 拓扑偏好）。"
+    }
+  ]
+}

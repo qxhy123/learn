@@ -1,0 +1,929 @@
+[
+ {
+  "title": "第20章 可观测性 Harness",
+  "subtitle": "为什么「没有评估的 tracing 只是昂贵的日志」，以及怎么把质量看见",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "传统 Web 服务的可观测性很省心：请求进来，处理逻辑是确定的，结果要么对、要么报错，HTTP 返回 200 或 500，盯住延迟和错误率基本就够了。\n\nLLM 应用把这套假设打破了。处理逻辑是非确定的，结果常常「看起来对」，HTTP 照样返回 200，但内容可能完全错误。这时你即使记录了每一次 API 调用、每一个 prompt 版本、每一毫秒延迟，也回答不了最关键的那个问题——这次回答到底好不好。\n\n这就是本章反复强调的那句话：「没有评估的 tracing 只是昂贵的日志」（tracing 指调用链追踪）。你高价收集了一堆数据，却没把「判断好坏」这件事接进来。可观测性 Harness 要解决的，就是让 LLM 系统的「质量」本身变得可观测。"
+   },
+   {
+    "title": "可观测性的三层金字塔",
+    "body": "本章把 LLM 可观测性分成三层，从下往上价值递增：\n\n- 第 1 层「基础指标」：延迟（p50/p95/p99）、token 消耗、成本、错误率、限流。这一层和传统监控差不多。\n- 第 2 层「语义追踪」：prompt 版本、检索文档的相关性、embedding 漂移、模型行为。开始触及 LLM 特有的东西。\n- 第 3 层「评估」：回答质量分数、幻觉检测、用户满意度。最有价值，也最难做。\n\n大多数团队卡在第 1 层——指标很全，但答不上「质量怎么样」，这正是「昂贵的日志」问题的根源。真正的可观测性 Harness 必须把第 2、3 层补齐。",
+    "tip": "判断一个监控体系够不够，看它能不能回答「这次回答好不好」。只有延迟和 token 数，就还停在第 1 层。"
+   },
+   {
+    "title": "用 OpenTelemetry 给 LLM 调用插桩",
+    "body": "OpenTelemetry（OTel，厂商中立的可观测性标准）到 2026 年已经成了 LLM 可观测性的事实标准。它定义了一套 LLM 语义约定（Semantic Conventions），把该记录的字段标准化，比如 `gen_ai.system`（提供商）、`gen_ai.request.model`（模型）、`gen_ai.usage.input_tokens` 和 `gen_ai.usage.output_tokens`（输入/输出 token 数）、`gen_ai.response.finish_reason`（结束原因）。\n\n插桩（instrumentation）就是在代码里埋点，把每次调用包成一个 span（一段带属性的追踪记录），把这些字段填进去。除了模型自带的字段，Harness 还会塞进自己的关键属性——比如 `harness.prompt_version`（prompt 版本哈希）和 `harness.latency_ms`。检索阶段也要单独插桩，记下 query 长度、top_k、结果数、最高相似度分数。",
+    "tip": "用 OTel 而不是自定义格式，是为了厂商中立：换可观测性平台时，插桩代码不用重写。"
+   },
+   {
+    "title": "代码：带 OTel 插桩的 LLM 客户端",
+    "body": "一个 span 包住一次调用，请求属性、prompt 版本、用量、延迟全记下来，出错时也标记 error。注意那行「记录 prompt 版本」——它是后面定位回归的钥匙。\n\n```python\nclass InstrumentedLLMClient:\n    def __init__(self, client, model):\n        self.client = client\n        self.model = model\n    def generate(self, messages, **kwargs):\n        with tracer.start_as_current_span(\"llm.generate\") as span:\n            span.set_attribute(\"gen_ai.system\", \"anthropic\")\n            span.set_attribute(\"gen_ai.request.model\", self.model)\n            prompt_hash = self._hash_prompt(messages)\n            span.set_attribute(\"harness.prompt_version\", prompt_hash)\n            resp = self.client.messages.create(model=self.model, messages=messages, **kwargs)\n            span.set_attribute(\"gen_ai.usage.input_tokens\", resp.usage.input_tokens)\n            span.set_attribute(\"gen_ai.usage.output_tokens\", resp.usage.output_tokens)\n            return {\"content\": resp.content[0].text}\n    def _hash_prompt(self, messages):\n        import hashlib\n        system_msgs = [m[\"content\"] for m in messages if m[\"role\"] == \"system\"]\n        content = \"||\".join(system_msgs)\n        return hashlib.sha256(content.encode()).hexdigest()[:12]\n```"
+   },
+   {
+    "title": "Trace-to-Prompt-Version Linking：哪个版本导致了回归",
+    "body": "设想一条时间线：prompt v1.0 部署，质量 0.85；v1.1 部署，质量 0.90；v1.2 部署，质量掉到 0.72——出现回归了。如果你的 trace 里没把「这次调用用的是哪个 prompt 版本」记下来，你只能干瞪眼，不知道是哪次变更闯的祸。\n\nLangfuse 的做法（trace-to-prompt-version linking，把追踪关联到 prompt 版本）就是把每个 prompt 注册成一个带哈希的版本，再把每条 trace 关联到「prompt 版本 + 质量分数」。这样按版本聚合质量，就能立刻看出 v1.2 是问题版本，还能把 v1.1 和 v1.2 的模板做 diff，直接看到改了什么。把这件事自动化，就是 `detect_regression()`：按时间排序版本，相邻两版的平均质量掉超过阈值就报出来。",
+    "tip": "prompt 版本用「内容哈希」而不是手写版本号，是为了让「同一份 prompt = 同一个版本」自动成立，避免忘记升版本号。"
+   },
+   {
+    "title": "Embedding 语义漂移检测",
+    "body": "有一类故障特别隐蔽：你一行代码都没改，检索结果却悄悄变了。原因是 embedding 模型被提供商更新、或底层数据分布变了，于是同一个 query 的向量也变了——「如何重置密码」原来能检到「密码重置指南」，现在却检到「密码安全策略」。\n\n检测办法是部署时先采一批基准 embedding 当锚点，之后定期用同样的探针 query 重新算 embedding，和基准比余弦距离（cosine distance）。距离超过阈值就算这条 query 漂移了；漂移比例越高，处置越激进——轻微就继续监控，中度增量更新受影响文档，严重就重建整个向量索引。这套检测要由一个调度器定期跑，发现漂移就回调报警。",
+    "tip": "探针 query 要在部署时固定下来、并采好基准。基准本身漂了，后面的对比就失去意义。"
+   },
+   {
+    "title": "实时幻觉检测：MetaQA 与 CLAP",
+    "body": "本章给了两种在线判断「这条回答可不可信」的思路。\n\nMetaQA 走「一致性」：如果模型真的知道答案，换个问法应该得到一致结果。于是把原问题改写成几个变体（变形 prompt），分别再问一遍，看几个回答一致不一致——一致就高置信，不一致就可能是幻觉。\n\nCLAP（Confidence via Language model Attention Probing，借注意力探测推断置信度）走「证据」：高置信回答的注意力会集中在文档证据上，低置信回答的注意力则散落在无关 token 上。拿不到真实注意力权重时，就用代理指标近似——引用源文档的覆盖度、回答的具体性、是否避开了「也许/我猜」这类不确定表达，加权成一个置信度分数。",
+    "tip": "MetaQA 靠「多问几遍看一致性」，CLAP 靠「看注意力/证据落在哪」。一个查一致，一个查依据，角度不同。"
+   },
+   {
+    "title": "为什么这样设计",
+    "body": "为什么不能只盯延迟和 token 数？因为它们只能告诉你系统「在跑、跑得快不快」，告诉不了你「跑得对不对」。LLM 会用 200 状态码返回一段流畅但错误的回答，传统指标对此完全无感。质量必须被单独测量并接进可观测性，否则就是在高价收集垃圾数据。\n\n为什么要把 trace 关联到 prompt 版本？因为 LLM 系统的回归往往由一次 prompt 变更引起，而 prompt 变更可能不伴随明显的代码 diff。没有这层关联，你能看到「质量掉了」，却定位不到「谁让它掉的」，排查只能靠猜。\n\n为什么要做闭环而不止于看板？因为可观测性的终点不是「看到问题」，而是「修掉问题」。本章的闭环系统把生产 trace 接上评估，对失败做聚类、根因分析，最后回去更新 Harness——关键一条是「修 Harness，不是去人工改那一条输出」，这样同类失败才不会反复出现。",
+    "tip": "三个「为什么」共一条主线：可观测性的价值不在收集数据，而在让质量可被判断、可被定位、可被修复。"
+   },
+   {
+    "title": "易错点",
+    "body": "- 只做第 1 层：指标很全却答不出质量，就是「昂贵的日志」。\n- trace 不记 prompt 版本：回归发生时定位不到责任版本，只能靠猜。\n- 漂移检测不固定探针、不采基准：基准一旦跟着漂，对比就失去参照。\n- 把幻觉检测当一锤定音：MetaQA / CLAP 给的是置信度信号，不是绝对判决，低置信该转人工复核。\n- 评估本身有成本：用另一个 LLM 打分会增加开销和延迟，要靠采样率在「看得多」和「花得少」之间取平衡，不必每条都评。\n- 看到问题就手动改输出：绕过了根因，下次还会错；正确做法是回去修 Harness。"
+   },
+   {
+    "title": "小结",
+    "body": "可观测性 Harness 的核心是把「质量」变成可观测对象：用 OpenTelemetry 标准化插桩拿到基础和语义层，把 trace 关联到 prompt 版本以便定位回归，用 embedding 漂移检测发现「无代码变更的偷偷变化」，用 MetaQA / CLAP 在线估计回答可信度，最后用闭环把失败接回 Harness 改进。一句话：tracing 只是手段，能判断和改进质量才是目的。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "「没有评估的 tracing 只是昂贵的日志」这句话，针对的核心问题是什么？",
+    "options": [
+     "tracing 占用太多存储，成本高",
+     "记录了大量调用数据，却回答不了「这次回答好不好」",
+     "OpenTelemetry 的授权费太贵",
+     "日志格式不统一，难以检索"
+    ],
+    "answer": 1,
+    "explain": "重点不在存储成本，而在「质量没被测量」：LLM 会用 200 返回错误内容，只记延迟 token 答不出好坏，数据再多也是垃圾。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 LLM 可观测性三层金字塔的每一层，和它的代表性指标配对：",
+    "left": [
+     "基础指标层",
+     "语义追踪层",
+     "评估层"
+    ],
+    "right": [
+     "延迟、token 消耗、成本、错误率",
+     "prompt 版本、检索相关性、embedding 漂移",
+     "回答质量分数、幻觉检测、用户满意度"
+    ],
+    "explain": "从下到上价值递增：基础层是传统指标，语义层是 LLM 特有的中间信号，评估层直接回答质量，最有价值也最难做。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么本章建议用 OpenTelemetry，而不是自己发明一套插桩格式？",
+    "options": [
+     "OTel 运行速度比自定义格式快",
+     "OTel 厂商中立、有 LLM 语义约定，换可观测性平台时插桩代码不用重写",
+     "OTel 自带幻觉检测功能",
+     "OTel 可以免费存储无限数据"
+    ],
+    "answer": 1,
+    "explain": "OTel 是厂商中立标准并定义了 gen_ai.* 语义约定，好处是可移植——换平台不必重写埋点。"
+   },
+   {
+    "type": "input",
+    "prompt": "把一条 trace 关联到具体「prompt 版本」并附上质量分数，从而能定位是哪次变更导致回归——这种做法（Langfuse 模式）叫什么？（中文或英文关键词均可）",
+    "accept": [
+     "trace-to-prompt-version linking",
+     "prompt 版本关联",
+     "trace 关联 prompt 版本",
+     "prompt version linking",
+     "版本关联"
+    ],
+    "explain": "把追踪关联到 prompt 版本（trace-to-prompt-version linking），质量回归时就能立刻锁定责任版本，而不是干瞪眼。"
+   },
+   {
+    "type": "judge",
+    "prompt": "embedding 语义漂移的典型特征是：检索结果变了，但代码仓库里没有任何变更。",
+    "answer": true,
+    "explain": "对。漂移常由提供商静默更新 embedding 模型或数据分布变化引起，同一 query 的向量悄悄变了，代码一行没动，结果却不同了。"
+   },
+   {
+    "type": "choice",
+    "prompt": "MetaQA 检测幻觉的核心思路是什么？",
+    "options": [
+     "分析模型注意力是否集中在文档证据上",
+     "把问题改写成多个变体分别提问，看几个回答是否一致",
+     "统计回答里出现了多少不确定词",
+     "用正则匹配回答里的敏感信息"
+    ],
+    "answer": 1,
+    "explain": "MetaQA 走一致性：模型若真知道答案，换问法应当一致；多个变体回答不一致就提示可能是幻觉。注意力那条是 CLAP。"
+   },
+   {
+    "type": "match",
+    "prompt": "区分两种实时幻觉检测方法，把方法和它依据的信号配对：",
+    "left": [
+     "MetaQA",
+     "CLAP"
+    ],
+    "right": [
+     "变形 prompt 多次提问，比对回答一致性",
+     "注意力分布 / 引用证据覆盖度等代理指标"
+    ],
+    "explain": "MetaQA 查「换问法答案一不一致」，CLAP 查「注意力和证据落在哪」；一个查一致性，一个查依据。"
+   },
+   {
+    "type": "judge",
+    "prompt": "既然延迟和错误率都正常、没有报警，就可以认为 LLM 系统的回答质量也一定正常。",
+    "answer": false,
+    "explain": "错。这正是「部署成功≠持续正确」的盲区：传统指标全绿，质量却可能在悄悄下滑。质量必须被单独评估，不能从延迟错误率推断。"
+   },
+   {
+    "type": "input",
+    "prompt": "可观测性闭环里有一条关键原则：发现失败后，不要去人工修正那一条输出，而要回去修什么？（填两个字的核心对象，中文）",
+    "accept": [
+     "Harness",
+     "harness",
+     "护栏层",
+     "harness 配置",
+     "Harness 配置"
+    ],
+    "explain": "修 Harness 不修输出：人工改单条输出绕过了根因，下次还会错；把缺失的约束/检测补进 Harness，同类失败才不再出现。"
+   },
+   {
+    "type": "choice",
+    "prompt": "用「另一个 LLM 给回答打分」来做在线评估，最直接的工程代价是什么？",
+    "options": [
+     "会让原模型的输出变差",
+     "评估本身增加成本和延迟，需要用采样率来平衡",
+     "必须停机才能运行评估",
+     "会泄露用户隐私"
+    ],
+    "answer": 1,
+    "explain": "LLM-as-Judge 这类在线评估有额外开销和延迟，工程上靠设定采样率在「观测更多」和「开销更少」之间折中，不必每条都评。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下面哪个做法说明一个团队还卡在「昂贵的日志」阶段？",
+    "options": [
+     "为每次调用记录质量分数并接入报警",
+     "只采集延迟、token 数、错误率，从不评估回答质量",
+     "把 trace 关联到 prompt 版本做回归检测",
+     "定期运行 embedding 漂移探针"
+    ],
+    "answer": 1,
+    "explain": "只停在基础指标层、从不评估质量，正是「昂贵的日志」：数据齐全却答不出好坏。其余三项都已迈入语义/评估层。"
+   },
+   {
+    "type": "judge",
+    "prompt": "做 embedding 漂移检测时，探针 query 和它的基准 embedding 应当在系统部署时就固定采集好。",
+    "answer": true,
+    "explain": "对。基准是对比的锚点，必须先固定。若基准本身跟着一起漂，后续的余弦距离对比就失去参照，检测形同虚设。"
+   }
+  ]
+ },
+ {
+  "title": "第21章 部署 Harness 与流水线",
+  "subtitle": "当部署对象从「代码」变成「行为」，CI/CD 要怎么重新设计",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "传统 CI/CD 的世界观是确定性的：同样的代码加同样的配置，就得到同样的行为。所以「测试通过」基本等于「部署安全」。\n\nAI 系统把这条根基掀翻了：同样的 prompt 加同样的模型，并不等于同样的输出。更麻烦的是，模型可能被提供商静默更新，于是「代码一行没改，行为却变了」。当你的部署对象从「代码」变成「行为」，整条流水线都要重新设计。\n\n本章要解决的就是：传统 CI/CD 在非确定性系统上为什么崩、AI 部署该分成哪几层、怎么把评估和 Canary（金丝雀灰度）做进流水线，以及部署成功之后怎么靠持续评估盯住质量不退化。"
+   },
+   {
+    "title": "传统 CI/CD 的盲区",
+    "body": "本章逐条列了传统 CI/CD 的假设，以及它们在 AI 系统里如何失效：\n\n- 「代码变更 = 行为变更」：模型更新无代码变更也会改行为，于是漏检回归。\n- 「测试通过 = 安全部署」：10 次测试通过不代表第 11 次也对，给人假安全感。\n- 「回滚 = 恢复」：你把 prompt 回滚了，但底层模型已经更新，回滚可能无效。\n- 「构建是幂等的」：相同输入不同输出，构建不可重现。\n- 「依赖是固定的」：模型 API 随时可能调整行为，这是一种隐式依赖。\n\n所以 AI 的流水线不能止于 build + unit test + deploy，必须插进一段「评估套件 + 与上一版对比 + 灰度发布」，并在部署后挂上持续评估。",
+    "tip": "「测试通过 = 安全部署」在确定性系统成立，在 LLM 上不成立——通过的是抽样，不是全空间，所以需要持续评估兜底。"
+   },
+   {
+    "title": "AI 部署是一个六层栈",
+    "body": "AI 应用不是一个单一二进制，而是一个多层栈，每层可以独立变更，各自的变更频率和风险都不同：\n\n- Layer 1 应用代码：API 路由、业务逻辑。\n- Layer 2 推理引擎：模型选择、温度、采样参数。\n- Layer 3 Prompts：system prompt、few-shot 示例。\n- Layer 4 RAG / 上下文引擎：embedding 模型、向量索引、reranking。\n- Layer 5 Guardrails / 安全：输入输出过滤规则、话题边界。\n- Layer 6 Agents / 编排：Harness 配置、agent 拓扑、工具权限。\n\n按本章给的变更画像：prompt 和 RAG「每天」都可能改、风险高；agent 层改得没那么勤，但风险等级是 critical（因为状态依赖复杂，回滚最难）。",
+    "tip": "「变更频率」和「变更风险」是两回事：prompt 改得最勤，agent 改得风险最高、最难回滚。两个维度都要看。"
+   },
+   {
+    "title": "代码：各层的变更画像",
+    "body": "把六层栈的变更频率、风险、回滚难度、测试策略写成一张表，部署决策时按层查表。注意 agent 层是 critical、回滚最难。\n\n```python\nDEPLOYMENT_LAYERS = {\n    \"prompts\": {\n        \"change_frequency\": \"daily\",\n        \"risk_level\": \"high\",\n        \"rollback_ease\": \"easy\",\n        \"test_strategy\": \"eval suite + A/B testing\",\n    },\n    \"rag_context\": {\n        \"change_frequency\": \"daily\",\n        \"risk_level\": \"medium\",\n        \"rollback_ease\": \"medium\",\n        \"test_strategy\": \"retrieval eval + end-to-end\",\n    },\n    \"agents\": {\n        \"change_frequency\": \"weekly\",\n        \"risk_level\": \"critical\",\n        \"rollback_ease\": \"hard\",\n        \"test_strategy\": \"full pipeline eval + canary\",\n    },\n}\n```"
+   },
+   {
+    "title": "Agent 作为一等流水线步骤",
+    "body": "本章提到 Harness.io 在 2025-2026 推的一个思路：让 AI agent 从「被部署的对象」升格为「参与部署的主体」。流水线里可以放一个 AIAgent 步骤当代码评审员，过不过看「无安全漏洞、覆盖率 > 80%」这类标准；再放 AIEval 步骤跑 prompt 回归和安全对抗评估，设好质量阈值和回归容忍度；最后才进 Canary 部署。\n\n配套还有「从仓库扫描自动生成流水线」：扫描代码里有没有 prompt 模板、RAG 组件、agent、guardrail，按检测结果拼出对应的评估阶段——有 prompt 就加 prompt 回归阶段，有 guardrail 就加对抗测试阶段，最后统一接上 5%→25%→100% 的灰度发布。",
+    "tip": "「agent 参与部署」不是噱头：把评审/评估交给 agent 步骤，等于把质量门禁标准化、可复用，而不是每次靠人临时把关。"
+   },
+   {
+    "title": "持续评估：Sensor 跑在变更生命周期之外",
+    "body": "部署成功不等于持续正确。常见陷阱是：部署成功、监控错误率、没报警、以为一切正常——但质量在悄悄下滑，因为传统指标看不见它。\n\n对策是持续评估（Continuous Evaluation）：一个 Sensor（传感器，独立于部署周期常驻运行）每隔一段时间从生产流量采样、打分、和阈值比，低于阈值就报警；还要看趋势——攒够几个数据点就做一次线性回归，斜率为负说明在走下坡，即使还没破阈值也提前预警。关键词是「在变更生命周期之外运行」：它不依附某次部署，而是一直盯着。",
+    "tip": "持续评估盯的是「趋势」而不只是「当前值」。等掉破阈值才报警太迟，斜率向下时就该预警。"
+   },
+   {
+    "title": "代码：Canary 部署控制器",
+    "body": "Canary（金丝雀）按 Shadow → 5% → 25% → 50% → 100% 逐步放量，每个阶段评估错误率、质量、延迟、安全；任一不达标就回滚到 ROLLED_BACK，而不是继续放量。\n\n```python\nclass CanaryController:\n    def __init__(self, evaluator, min_observation_minutes=30):\n        self.evaluator = evaluator\n        self.min_observation = min_observation_minutes\n        self.current_phase = DeployPhase.SHADOW\n    def advance_phase(self):\n        phases = list(DeployPhase)\n        idx = phases.index(self.current_phase)\n        result = self._evaluate_current_phase()\n        if result[\"pass\"]:\n            self.current_phase = phases[idx + 1]\n            return {\"status\": \"advanced\", \"to\": self.current_phase.value}\n        self.current_phase = DeployPhase.ROLLED_BACK\n        return {\"status\": \"rolled_back\", \"reason\": result[\"reason\"]}\n    def _evaluate_current_phase(self):\n        m = self.evaluator.get_current_metrics()\n        checks = {\n            \"error_rate_ok\": m.get(\"error_rate\", 1.0) < 0.01,\n            \"quality_ok\": m.get(\"quality_score\", 0) > 0.8,\n            \"no_safety_issues\": m.get(\"safety_violations\", 1) == 0,\n        }\n        failed = [k for k, v in checks.items() if not v]\n        return {\"pass\": all(checks.values()), \"reason\": \",\".join(failed)}\n```"
+   },
+   {
+    "title": "为什么这样设计",
+    "body": "为什么要做 Shadow 和 Canary，不能直接全量切？因为 LLM 的「测试通过」只覆盖了抽样空间，不能保证生产全流量都对。Shadow（新版并行跑但不返回给用户）先零风险地比对新旧差异，Canary 再用 5% 真实流量小范围验证，每步至少观察 30 分钟、任一阶段质量下滑就自动回滚——用「逐步放量 + 随时回滚」把爆炸半径控制住。\n\n为什么部署后还要持续评估，CI 阶段评过不就够了？因为质量退化往往发生在部署之后：模型被静默更新、用户查询分布漂移、RAG 文档过时。CI 只是某一时刻的快照，持续评估才能盯住「快照之后」的退化。\n\n为什么按六层分别设回滚策略？因为各层回滚难度天差地别：切回旧模型很容易，重建 RAG 索引要时间，agent 层状态依赖复杂、最难回滚。而且 prompt、模型、RAG 索引三者的版本可能不同步——只回滚 prompt 但模型已更新，回滚可能根本无效。分层设计才能对症下药。",
+    "tip": "三个「为什么」围绕一件事：非确定性让「一次性验证」不可靠，所以要逐步放量、持续盯守、分层回滚，把风险摊薄到全过程。"
+   },
+   {
+    "title": "易错点",
+    "body": "- 把「测试通过」当「部署安全」：通过的是抽样，生产全流量未必都对。\n- 直接全量切新版：跳过 Shadow / Canary，等于把全部用户当小白鼠。\n- 部署后只看错误率：质量下滑时错误率可能依旧正常，要靠持续评估。\n- 只盯当前质量值、不看趋势：等破阈值才发现已经晚了。\n- 回滚只回 prompt 不管模型：模型已被静默更新时，回滚可能无效。\n- 以为 Shadow 万无一失：它对交互式对话和用户反馈循环有局限——影子流量拿不到真实用户的后续反应。"
+   },
+   {
+    "title": "小结",
+    "body": "AI 部署 Harness 的主线是「把一次性验证换成全过程守护」：先认清传统 CI/CD 的确定性假设全部失效，把系统看成可独立变更的六层栈；在流水线里插进评估套件、与上一版对比、把 agent 当一等步骤；用 Shadow → Canary 逐步放量并随时回滚；部署后用持续评估 Sensor 盯住趋势。模型不确定，所以验证不能只发生在一个点。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "传统 CI/CD「测试通过 = 安全部署」这条假设，在 AI 系统里为什么不成立？",
+    "options": [
+     "AI 系统的测试运行得太慢",
+     "测试通过的是抽样、是非确定输出的某几次，不保证生产全流量都对",
+     "AI 系统不能写单元测试",
+     "测试环境和生产环境的模型不一样"
+    ],
+    "answer": 1,
+    "explain": "LLM 输出非确定，10 次通过不代表第 11 次也对；测试只覆盖抽样空间，给的是假安全感，所以要靠持续评估和灰度兜底。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 AI 系统里，可能出现「代码仓库一行没改，但系统行为变了」的情况。",
+    "answer": true,
+    "explain": "对。模型被提供商静默更新就会改变行为，这正是传统 CI/CD「代码变更=行为变更」假设失效、容易漏检回归的原因。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 AI 部署六层栈里的层，和它的代表内容配对：",
+    "left": [
+     "Layer 2 推理引擎",
+     "Layer 3 Prompts",
+     "Layer 4 RAG / 上下文引擎",
+     "Layer 5 Guardrails / 安全"
+    ],
+    "right": [
+     "模型选择、温度、采样参数",
+     "system prompt、few-shot 示例",
+     "embedding 模型、向量索引、reranking",
+     "输入输出过滤规则、话题边界"
+    ],
+    "explain": "六层栈每层独立变更：推理引擎管模型与采样，Prompt 管提示词，RAG 管检索，Guardrails 管安全过滤。逐层对齐。"
+   },
+   {
+    "type": "choice",
+    "prompt": "按本章给的变更画像，下面哪一层「变更风险等级最高（critical）、回滚最难」？",
+    "options": [
+     "应用代码层",
+     "Prompt 层",
+     "Agents / 编排层",
+     "推理引擎层"
+    ],
+    "answer": 2,
+    "explain": "agent 层状态依赖复杂、回滚 hard、风险 critical。prompt 改得最勤但回滚容易；推理引擎切回旧模型也容易。频率高≠风险高。"
+   },
+   {
+    "type": "input",
+    "prompt": "新版本与旧版本并行运行、但「只记录、不把结果返回给用户」的灰度阶段，叫什么？（中文或英文均可）",
+    "accept": [
+     "Shadow",
+     "shadow",
+     "影子",
+     "影子部署",
+     "shadow deployment",
+     "影子流量"
+    ],
+    "explain": "Shadow（影子）阶段 0% 真实流量，新版只跑不返回，用来零风险地比对新旧差异，是 Canary 放量前的第一步。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Canary 部署「每步至少观察 30 分钟、任一阶段质量下滑就自动回滚」，这样设计的主要目的是什么？",
+    "options": [
+     "让部署过程显得更正式",
+     "控制爆炸半径：先小流量验证，出问题只影响少数用户且能立刻退回",
+     "节省服务器成本",
+     "满足合规审计的硬性要求"
+    ],
+    "answer": 1,
+    "explain": "逐步放量 + 随时回滚把风险摊薄、把爆炸半径压到最小；因为 LLM「测试通过」不保证全量正确，必须用真实小流量逐步验证。"
+   },
+   {
+    "type": "judge",
+    "prompt": "持续评估 Sensor 只需在「质量分数已经跌破阈值」时报警就够了，没必要关注趋势。",
+    "answer": false,
+    "explain": "错。等破阈值往往已经晚了。Sensor 还要看趋势——做线性回归，斜率为负即使没破阈值也预警，才能在退化早期介入。"
+   },
+   {
+    "type": "input",
+    "prompt": "一种独立于部署周期、常驻运行、定期从生产流量采样打分以盯住质量退化的机制，本章称之为「持续评估」。它在英文里叫什么？（两词，英文）",
+    "accept": [
+     "continuous evaluation",
+     "Continuous Evaluation",
+     "持续评估"
+    ],
+    "explain": "Continuous Evaluation（持续评估）跑在「变更生命周期之外」，专门对付「部署成功但质量悄悄下滑」这一盲区。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么 CI 阶段评估通过后，仍要在生产上挂持续评估？",
+    "options": [
+     "因为 CI 的评估结果会过期失效",
+     "因为质量退化常发生在部署之后：模型静默更新、查询分布漂移、RAG 文档过时",
+     "因为生产环境的硬件更快",
+     "因为合规要求每天都评估一次"
+    ],
+    "answer": 1,
+    "explain": "CI 只是某一时刻的快照。模型漂移、数据漂移、知识过时都发生在部署之后，只有持续评估能盯住「快照之后」的退化。"
+   },
+   {
+    "type": "judge",
+    "prompt": "为 AI 系统设计回滚策略时，只要把 prompt 回滚到上一版，就一定能恢复到之前的行为。",
+    "answer": false,
+    "explain": "错。prompt、模型、RAG 索引三者版本可能不同步：若模型已被静默更新，只回滚 prompt 可能无效。回滚要把三者一起考虑。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Shadow 部署看似零风险，但对哪类场景有明显局限？",
+    "options": [
+     "纯只读的批量数据处理",
+     "交互式多轮对话 / 依赖用户反馈循环的场景",
+     "单次问答的事实检索",
+     "离线报表生成"
+    ],
+    "answer": 1,
+    "explain": "Shadow 不把结果返回用户，拿不到真实的后续交互和反馈，对多轮对话、依赖用户反馈循环的场景验证不充分。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 Canary 控制器评估的检查项，和它要守住的底线配对：",
+    "left": [
+     "error_rate < 0.01",
+     "quality_score > 0.8",
+     "safety_violations == 0"
+    ],
+    "right": [
+     "错误率不能升高",
+     "回答质量不能下滑",
+     "不能出现安全违规"
+    ],
+    "explain": "每个阶段三项都达标才推进，任一不达标就回滚：分别守住「不更易出错、不更差、不更危险」。逐项对齐。"
+   }
+  ]
+ },
+ {
+  "title": "第22章 安全、护栏与合规 Harness",
+  "subtitle": "三道防线、合规自动化、RBAC 与人工审批门禁",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "AI 系统的安全不能是事后打补丁，而要像安全带一样从一开始就编织进系统。护栏（guardrail）Harness 的目标不是限制 AI 的能力，而是确保强大的能力始终跑在安全的轨道上。\n\n本章把安全拆成一整套基础设施：输入/输出护栏挡住注入和泄露，毒性与偏差检测作为常驻 Sensor 盯住生产，合规自动化对接 EU AI Act 和 NIST 2026.02 等框架，审计轨迹让每个动作可追溯可重放，RBAC 把 agent 的权限收到最小，人工审批门禁给高风险操作上一道人锁。一句话：让能力受控，而不是让能力消失。"
+   },
+   {
+    "title": "三道防线",
+    "body": "护栏不是一个点，而是三道防线，把请求从进到出包起来：\n\n- 第 1 道「输入护栏」：在请求进入模型前拦截，做 prompt 注入检测、毒性过滤、话题边界检查、长度/频率限制。\n- 第 2 道「执行护栏」：在模型生成、调用工具的过程中约束，做工具调用限制、资源访问控制、超时保护、成本上限。\n- 第 3 道「输出护栏」：在回答返回用户前清理，做敏感信息（PII）过滤、幻觉标记、格式校验、引用验证。\n\n每道防线给出的不是简单「过/不过」，而是四种判决：PASS（放行）、BLOCK（拦截）、WARN（放行但告警）、REWRITE（改写后放行，比如把 PII 打码）。",
+    "tip": "输入护栏防「坏东西进来」，输出护栏防「坏东西出去」，执行护栏防「过程中越权/失控」。三者职责不同，不能互相替代。"
+   },
+   {
+    "title": "代码：输入护栏与 prompt 注入检测",
+    "body": "输入护栏把多个检查串起来跑，命中 BLOCK / REWRITE 就立即返回。注入检测用一组正则匹配「忽略以上指令」「你现在是…」这类经典攻击话术（生产里还会叠加 LLM 分类器）。\n\n```python\nclass InputGuardrail:\n    def check(self, user_input):\n        checks = [self._check_prompt_injection, self._check_length, self._check_topic_boundary]\n        for check_fn in checks:\n            result = check_fn(user_input)\n            if result.verdict in (GuardrailVerdict.BLOCK, GuardrailVerdict.REWRITE):\n                return result\n        return GuardrailResult(GuardrailVerdict.PASS, \"所有检查通过\", user_input)\n    def _check_prompt_injection(self, text):\n        patterns = [\n            r\"ignore\\s+(previous|above|all)\\s+instructions\",\n            r\"you\\s+are\\s+now\\s+(?:a|an)\\s+\",\n            r\"forget\\s+(everything|what)\",\n            r\"new\\s+instructions?\\s*:\",\n        ]\n        for pattern in patterns:\n            if re.search(pattern, text, re.IGNORECASE):\n                return GuardrailResult(GuardrailVerdict.BLOCK, f\"检测到注入: {pattern}\", text)\n        return GuardrailResult(GuardrailVerdict.PASS, \"\", text)\n```"
+   },
+   {
+    "title": "毒性与偏差检测作为持续 Sensor",
+    "body": "安全不止于「单次请求过没过」，还要在生产流量上持续盯偏差。偏差检测 Sensor 从流量采样，在性别、种族、年龄、地域等维度上打分，整体超阈值就报警甚至自动限流。\n\n它测偏差的办法很巧妙：反事实测试（counterfactual）。把同一个问题里的人口统计特征替换掉——「他」换「她」、「年轻人」换「老年人」、「北京」换「农村」——再比较模型对原始版和替换版回答的差异。如果只因为换了个性别/年龄/地域，回答就明显不同，那就是偏差的信号。差异越大，偏差分越高。",
+    "tip": "反事实测试的精髓：只动一个受保护属性、其余不变，看输出该不该变。该一样却不一样，就暴露了偏差。"
+   },
+   {
+    "title": "合规自动化：EU AI Act 与 NIST 2026.02",
+    "body": "2026 年的合规框架主要有三块：EU AI Act（2024.08 生效，按不可接受/高/有限/最小四级做风险分级）、NIST AI Agent Standards（2026.02 发布，专门管 agent）、中国生成式 AI 管理办法（内容审核、标识、算法备案等）。\n\n其中 NIST 2026.02 对 AI Agent 提了 5 个核心要求，可以做成自动审计：行为边界（behavioral boundaries，明确定义允许/禁止行为且可验证）、自主性控制（autonomy controls，高风险操作要审批、有最大执行步数、可随时中断）、人工监督（human oversight，关键决策有人介入、异常自动升级、人可覆盖）、审计轨迹（audit trail，操作可日志、决策链可追溯、输入输出可重放）、故障安全（fail-safe，异常有降级、超时自动停、错误不外溢）。",
+    "tip": "把合规要求做成「逐条可检查的清单」，审计就能自动化——这正是 NIST 5 项被写成 REQUIREMENTS 字典的用意。"
+   },
+   {
+    "title": "代码：RBAC 范围控制",
+    "body": "Agent RBAC 把链路从「用户→角色→权限」延伸成「用户→agent→工具→权限」。给每个 agent 绑角色，角色声明它能碰哪些资源、用哪些工具、单会话最多几步、哪些操作需要人工审批。\n\n```python\nclass AgentRBAC:\n    def __init__(self):\n        self.roles = {}\n        self.agent_assignments = {}\n    def define_role(self, role_name, permissions):\n        self.roles[role_name] = permissions\n    def assign_role(self, agent_id, role_name):\n        if role_name not in self.roles:\n            raise ValueError(f\"角色 {role_name} 不存在\")\n        self.agent_assignments[agent_id] = role_name\n    def check_permission(self, agent_id, action, resource):\n        role_name = self.agent_assignments.get(agent_id)\n        if not role_name:\n            return False\n        role = self.roles.get(role_name, {})\n        resource_perms = role.get(\"permissions\", {}).get(resource, [])\n        return action in resource_perms\n```"
+   },
+   {
+    "title": "人工审批门禁与审计轨迹",
+    "body": "高风险操作（删库、改系统配置等）不该让 agent 自己拍板。人工审批门禁（human approval gate）把这类操作拦下，丢进审批队列、通知人，等批准或拒绝；带超时（如 30 分钟），超时就「默认拒绝」——这是 fail-safe 思路：拿不准时倒向安全的一侧，而不是放行。\n\n另一条腿是审计轨迹（audit trail）：每个事件都记 actor（谁，user 还是某个 agent）、action（做了什么）、input/output（输入输出，敏感字段脱敏、超长截断）。有了它就能还原决策链、生成合规报告，统计被拦请求数和人工升级数。",
+    "tip": "审批超时「默认拒绝」而非「默认放行」，是 fail-safe 的体现：不确定时选更安全的方向。"
+   },
+   {
+    "title": "为什么这样设计",
+    "body": "为什么要三道防线，只做输出护栏行不行？不行。输入护栏在请求进模型前就挡掉注入和越界话题，把风险消灭在源头；输出护栏只能在生成之后补救，注入可能已经诱导模型做了不该做的事。两道方向相反、互补，少一道就留一个口子。\n\n为什么 agent 权限要收到最小（最小权限原则）？因为 agent 会自主调用工具，一旦被注入或自身出错，权限有多大、破坏就有多大。让审查 agent 只读、让编码 agent 不能 drop table，是把「最坏情况」的上限提前压低。\n\n为什么护栏不是越多越好？因为护栏越多越容易误报，把正常请求当攻击拦掉，可用性下降。一个被频繁误拦的系统可能比没护栏的系统更糟——用户会想办法绕过它。安全和可用性要平衡，审批也要分级，否则 500 个/天的审批量会把 100 个/天的人工产能压垮，门禁反而成了瓶颈。",
+    "tip": "三个「为什么」共一条主线：安全是「分层纵深 + 最小权限 + 与可用性平衡」，不是「把护栏堆到最多」。"
+   },
+   {
+    "title": "易错点",
+    "body": "- 只做输出护栏、不做输入护栏：注入在进模型前没被拦，事后补救往往已晚。\n- 给 agent 过大权限：被注入或出错时破坏面随权限放大，违反最小权限。\n- 护栏只会 PASS / BLOCK：丢了 WARN 和 REWRITE，PII 本可打码放行却被一刀切掉，可用性受损。\n- 偏差检测只看绝对回答、不做反事实对比：发现不了「仅因属性不同就区别对待」。\n- 审批超时默认放行：违反 fail-safe，应当默认拒绝。\n- 护栏越多越安全的错觉：误报升高会把正常请求挡在外面，安全与可用性需要平衡。\n- 审批不分级：高低风险一锅端，人工产能被淹没，门禁变瓶颈。"
+   },
+   {
+    "title": "小结",
+    "body": "安全护栏 Harness 是一套纵深防御：输入/执行/输出三道防线把请求包起来，判决分 PASS/BLOCK/WARN/REWRITE 而非一刀切；毒性偏差检测用反事实测试常驻盯守；合规对接 EU AI Act 与 NIST 2026.02，把要求做成可自动审计的清单；RBAC 按最小权限收紧 agent 能力，审计轨迹让一切可追溯，人工门禁对高风险操作上锁且超时默认拒绝。核心一句：让强大的能力始终在安全轨道上，同时别把可用性挡死。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "match",
+    "prompt": "把护栏的三道防线，和它各自负责的检查配对：",
+    "left": [
+     "输入护栏",
+     "执行护栏",
+     "输出护栏"
+    ],
+    "right": [
+     "prompt 注入检测、话题边界、长度限制",
+     "工具调用限制、资源访问控制、成本上限",
+     "PII 过滤、幻觉标记、格式与引用校验"
+    ],
+    "explain": "三道防线方向不同：输入防坏东西进来，执行防过程中越权失控，输出防坏东西出去。逐项对齐。"
+   },
+   {
+    "type": "choice",
+    "prompt": "只做输出护栏、不做输入护栏，主要漏洞是什么？",
+    "options": [
+     "输出会变慢",
+     "prompt 注入在进入模型前没被拦截，可能已诱导模型做了不该做的事，事后补救往往已晚",
+     "无法记录日志",
+     "会增加 token 成本"
+    ],
+    "answer": 1,
+    "explain": "输入护栏把风险消灭在源头，输出护栏只能事后补救。两者方向相反、互补，少了输入这道就给注入留了口子。"
+   },
+   {
+    "type": "judge",
+    "prompt": "护栏的判决只有「通过」和「拦截」两种，不存在「改写后放行」这样的中间选项。",
+    "answer": false,
+    "explain": "错。判决有四种：PASS、BLOCK、WARN、REWRITE。比如输出里有 PII 可以 REWRITE 打码后放行，而不必整条 BLOCK，兼顾安全与可用性。"
+   },
+   {
+    "type": "choice",
+    "prompt": "偏差检测 Sensor 用「反事实测试」来测偏差，具体怎么做？",
+    "options": [
+     "统计回答里出现了多少负面词",
+     "只替换问题里的人口统计特征（如性别/年龄/地域），比较模型回答的差异",
+     "让用户给回答打分取平均",
+     "检查回答是否包含 PII"
+    ],
+    "answer": 1,
+    "explain": "反事实测试只动一个受保护属性、其余不变：若仅因换了性别/年龄就回答迥异，就是偏差信号。差异越大偏差分越高。"
+   },
+   {
+    "type": "input",
+    "prompt": "2026.02 发布、专门针对 AI Agent、提出行为边界/自主性控制/人工监督/审计轨迹/故障安全这 5 项核心要求的合规标准，是哪个机构发布的？（英文缩写）",
+    "accept": [
+     "NIST",
+     "nist"
+    ],
+    "explain": "NIST AI Agent Standards（2026.02）提出 agent 的 5 项核心要求，可被做成逐条可检查的自动审计清单。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Agent RBAC 与传统 RBAC 相比，权限链条多了哪一环？",
+    "options": [
+     "用户 → 角色 → 权限，没有变化",
+     "用户 → agent → 工具 → 权限，中间多了 agent 与工具",
+     "把权限直接绑定到 IP 地址",
+     "去掉了角色这一层"
+    ],
+    "answer": 1,
+    "explain": "Agent RBAC 把链路延伸为「用户→agent→工具→权限」：给 agent 绑角色，约束它能用哪些工具、碰哪些资源，体现最小权限。"
+   },
+   {
+    "type": "judge",
+    "prompt": "人工审批门禁等待超时后，应当「默认拒绝」该操作，而不是「默认放行」。",
+    "answer": true,
+    "explain": "对。这是 fail-safe（故障安全）：拿不准时倒向更安全的一侧。高风险操作超时无人批，默认拒绝才不会让危险操作蒙混执行。"
+   },
+   {
+    "type": "input",
+    "prompt": "给每个 agent 只授予完成任务所需的最小权限（审查 agent 只读、编码 agent 不能删库），这条安全原则叫什么？（中文或英文均可）",
+    "accept": [
+     "最小权限",
+     "最小权限原则",
+     "least privilege",
+     "principle of least privilege",
+     "最小特权"
+    ],
+    "explain": "最小权限原则（least privilege）压低「最坏情况」的破坏上限：agent 一旦被注入或出错，权限越小、能造成的破坏越小。"
+   },
+   {
+    "type": "choice",
+    "prompt": "本章为什么说「护栏不是越多越好」？",
+    "options": [
+     "护栏会拖慢服务器",
+     "护栏越多越容易误报，把正常请求当攻击拦掉，可用性下降，用户可能想办法绕过",
+     "护栏会增加合规风险",
+     "护栏越多越难写文档"
+    ],
+    "answer": 1,
+    "explain": "过度防护会推高误报率，一个被频繁误拦的系统可能比没护栏的更糟。安全和可用性要平衡，不能一味堆护栏。"
+   },
+   {
+    "type": "judge",
+    "prompt": "审计轨迹记录的每个事件，都应包含 actor（谁做的）、action（做了什么）、以及输入输出（敏感字段需脱敏）。",
+    "answer": true,
+    "explain": "对。审计事件记 actor/action/input/output（PII 脱敏、超长截断），才能还原决策链、生成合规报告、统计被拦与升级次数。"
+   },
+   {
+    "type": "choice",
+    "prompt": "系统每天产生 500 个审批请求，人工审批产能只有 100 个/天。最该采取的对策是什么？",
+    "options": [
+     "取消所有审批门禁，全部放行",
+     "做分级审批：只让真正高风险的操作走人工，低风险的自动放行或批量处理",
+     "把超时时间延长到 24 小时",
+     "让 agent 自己审批自己"
+    ],
+    "answer": 1,
+    "explain": "不分级会让人工产能被淹没、门禁变瓶颈。分级审批把人工产能留给高风险操作，低风险走自动路径，才能可持续。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 NIST 2026.02 对 AI Agent 的核心要求，和它的含义配对：",
+    "left": [
+     "行为边界",
+     "自主性控制",
+     "人工监督",
+     "故障安全"
+    ],
+    "right": [
+     "明确定义允许/禁止行为且可验证",
+     "高风险操作需审批、有最大步数、可随时中断",
+     "关键决策有人介入、异常自动升级、人可覆盖",
+     "异常时安全降级、超时自动停、错误不外溢"
+    ],
+    "explain": "四项要求各管一面：边界定清楚、自主性受限、人留在回路、出故障能兜底。逐项对齐。"
+   }
+  ]
+ },
+ {
+  "title": "第23章 熵管理与持续改进",
+  "subtitle": "对抗熵增：检测漂移、修 Harness 不修输出、把复发问题变成 Guide 或 Sensor",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "物理学里的熵增原理说，孤立系统会自发趋向混乱。AI agent 系统也一样：没有持续维护，输出质量会慢慢退化，直到某天用户突然抱怨「怎么不好用了」。Harness Engineering 的核心职责之一，就是对抗这种熵增。\n\n本章把这件事讲透：agent 输出为什么会退化、退化有哪六个根因、怎么检测「无代码变更的模型漂移」、怎么把遥测数据反馈进改进循环、怎么为非确定系统建回归测试集，以及怎么设计一条「复发问题自动升级处置」的持续改进循环。主题词只有一个：让质量不随时间衰减。"
+   },
+   {
+    "title": "熵增的六个根因",
+    "body": "本章把 agent 质量退化归因到六条，记住它们才能对症下药：\n\n- 模型漂移：提供商静默更新模型，行为改变，没有代码变更也会导致质量变化。\n- 数据漂移：用户查询分布变化，新话题、新术语、新场景不断出现，超出原分布。\n- 知识过时：RAG 里的文档过时，或问到模型知识截止日期之后的信息。\n- 上下文累积：长会话中错误上下文逐步累积，早期小错被后续步骤放大。\n- Prompt 腐化：prompt 与模型版本不匹配，为旧模型调优的 prompt 在新模型上不再最优。\n- 护栏滞后：新的攻击模式或偏差模式出现，但护栏没跟上。",
+    "tip": "六个根因里，模型漂移和 Prompt 腐化都源于「模型这一侧悄悄变了」，所以即便你的代码纹丝不动，质量也会动。"
+   },
+   {
+    "title": "量化熵增：算速率、估时间、抓突降",
+    "body": "光说「在退化」不够，得量化。本章的 EntropyMetrics 做三件事：\n\n- 熵增速率（entropy rate）：对质量历史做线性回归取斜率，负值表示退化、越负退得越快。\n- 触阈时间（time to threshold）：按当前分数和退化速率，外推大概多少天后质量会跌到阈值以下，给出干预倒计时。\n- 突降检测（sudden drop）：拿一个滑动窗口的均值和当前值比，若骤降超过阈值就标出来——这种突降往往对应一次模型或数据的剧变，要立刻查。\n\n报告会据此给建议：有突降就立即调查最近变更，触阈时间太短就赶紧启动 Harness 改进。",
+    "tip": "「缓慢退化」和「突然跳水」要分开看：前者靠斜率和触阈时间预警，后者靠窗口均值对比抓现行。"
+   },
+   {
+    "title": "代码：模型漂移探针",
+    "body": "模型漂移最隐蔽——你 git log 干干净净，提供商却把模型从一个版本换到了下一个。检测办法是部署时用一组固定探针请求采基线，之后定期重跑、和基线比长度漂移和属性是否还满足（比如该包含的关键词还在不在）。\n\n```python\nclass ModelDriftDetector:\n    def __init__(self, probe_suite, llm_client):\n        self.probes = probe_suite\n        self.llm = llm_client\n        self.baseline = {}\n    def capture_baseline(self, runs=5):\n        for probe in self.probes:\n            responses = [self.llm.generate([{\"role\": \"user\", \"content\": probe[\"input\"]}]) for _ in range(runs)]\n            self.baseline[probe[\"id\"]] = {\"avg_length\": sum(len(r) for r in responses) / len(responses)}\n        return self.baseline\n    def check_drift(self, runs=5):\n        drifts = []\n        for probe in self.probes:\n            base = self.baseline.get(probe[\"id\"])\n            current = [self.llm.generate([{\"role\": \"user\", \"content\": probe[\"input\"]}]) for _ in range(runs)]\n            cur_len = sum(len(r) for r in current) / len(current)\n            length_drift = abs(cur_len - base[\"avg_length\"]) / max(base[\"avg_length\"], 1)\n            if length_drift > 0.3:\n                drifts.append({\"probe_id\": probe[\"id\"], \"length_drift\": length_drift})\n        return {\"drifted_probes\": len(drifts), \"verdict\": \"DRIFT_DETECTED\" if drifts else \"STABLE\"}\n```"
+   },
+   {
+    "title": "把遥测反馈进改进循环：修 Harness，不修输出",
+    "body": "遥测不是看完就算，而要驱动改进。流程是：生产运行收集遥测 → 对失败做聚类 → 根因定位 → 修 Harness → 重新部署。比如发现「输出格式错误占失败的 40%」，根因是「system prompt 缺少格式约束」，那就去补格式约束、加一个格式验证 sensor。\n\n这里有一条铁律：修 Harness，不修输出。错误做法是「格式错了→人工把这条输出改对→下次还会错」，因为根因没动。正确做法是「格式错了→问为什么→system prompt 没有严格格式要求→在 prompt 里加 JSON schema、加输出格式验证 guardrail→同类错误不再出现」。本章的 TelemetryAnalyzer 就是把失败签名映射到「harness_fix + sensor_fix」的建议。",
+    "tip": "判断一个修复是对是错，看它治的是「这一条」还是「这一类」。手动改单条输出治标，修 Harness 才治本。"
+   },
+   {
+    "title": "AI 回归测试：检查属性，不是精确匹配",
+    "body": "传统回归测试是「固定输入 → 固定期望输出 → assertEqual」，因为输出确定。AI 输出是非确定的，没法 assertEqual，于是改成「固定输入 → 检查输出属性」。\n\n不问「答案是不是恰好等于某串」，而问「答案有没有该有的属性」：是否包含关键信息（contains）、是否避开了不该出现的内容（not_contains）、长度是否在范围内、格式是不是合法 JSON、有没有违反安全规则。测试用例的来源也有讲究——很多直接来自「生产失败」和「对抗样本」，把真实踩过的坑固化成回归项；测试集还要定期维护，清理过时用例、控制规模，避免无限膨胀。",
+    "tip": "AI 回归测试的判定从「相等」变成「满足属性」。这是非确定性逼出来的根本改变，不是偷懒。"
+   },
+   {
+    "title": "改进循环：复发 1 次 Guide，2 次 Sensor，3 次架构重设计",
+    "body": "本章给了一条很实用的升级规则，按问题复发次数加大处置力度：\n\n- 问题第一次出现：手动修复可以接受。\n- 同类问题第一次复发（recurrence 1）：加一个 Guide——在 system prompt 里写一条约束，把这类问题挡住。\n- 第二次复发（recurrence 2）：加一个 Sensor——自动检测这类问题，不再靠人盯。\n- 三次以上：说明前两招不够，要做架构级改动，重新设计相关的 Harness 组件。\n\n配套的 HarnessImprovementLoop 会跑完整周期：分析遥测 → 识别复发 → 按复发次数生成对应力度的改进 → 应用并加回归测试 → 验证通过率。每次改进都顺手补一条回归测试，把「这次的坑」永久固化。",
+    "tip": "「复发次数」是处置力度的旋钮：复发越多，越说明轻量手段失效，越该往架构级投入。"
+   },
+   {
+    "title": "为什么这样设计",
+    "body": "为什么非维护不可，让它跑着不行吗？因为熵增是默认趋势：模型会被静默更新、数据分布会漂移、文档会过时、护栏会被新攻击绕过。没有任何一行你的代码出问题，质量也会自己往下走。不主动对抗，就等于默许退化。\n\n为什么坚持「修 Harness 不修输出」？因为人工改单条输出只解决了眼前这一条，根因（缺失的约束）还在，同类错误必然复发；把约束补进 Harness，才是一次修复、永久免疫一整类问题。这也是 Harness Engineering 区别于「人工兜底」的关键。\n\n为什么改进力度要随复发次数升级，而不是一上来就重构？因为重构成本高、风险大。第一次复发用一条 prompt 约束就可能压住，没必要动架构；只有当 Guide、Sensor 都拦不住、问题反复出现，才说明它是结构性的，值得付出架构级改动的代价。这是把工程投入花在刀刃上。",
+    "tip": "三个「为什么」连成一条线：退化是必然的（所以要主动），治本优于治标（所以修 Harness），按复发分级投入（所以不滥用重构）。"
+   },
+   {
+    "title": "易错点",
+    "body": "- 以为「没改代码就不会退化」：模型漂移、数据漂移、知识过时都与你的代码无关。\n- 漂移探针不固定、基线不采好：失去对比锚点，检测无从谈起。\n- 发现失败就人工改输出：治标不治本，同类错误必复发。\n- 给 AI 回归测试写 assertEqual：非确定输出对不上，应改为属性检查。\n- 回归测试集只增不减：过时用例堆积、规模失控，要定期清理、控制上限。\n- 一遇问题就上架构重构：成本高风险大；该按复发次数从 Guide→Sensor→架构逐级升级。\n- 只盯缓慢趋势忽略突降：剧烈跳水往往对应模型/数据剧变，要用窗口对比单独抓。"
+   },
+   {
+    "title": "小结",
+    "body": "熵管理的主线是「主动对抗质量衰减」：认清六个根因，用 EntropyMetrics 量化速率/触阈时间/突降，用固定探针检测无代码变更的模型漂移，把遥测反馈进改进循环并坚守「修 Harness 不修输出」，用属性检查（而非精确匹配）建非确定系统的回归测试，最后按「复发 1 次 Guide、2 次 Sensor、3 次架构重设计」分级处置。质量不会自己变好，但可以被工程化地守住。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "match",
+    "prompt": "把 Agent 熵增的根因，和它的描述配对：",
+    "left": [
+     "模型漂移",
+     "数据漂移",
+     "知识过时",
+     "Prompt 腐化"
+    ],
+    "right": [
+     "提供商静默更新模型，行为改变",
+     "用户查询分布变化，超出原分布",
+     "RAG 文档过时或问到知识截止日期之后",
+     "prompt 与模型版本不匹配，旧 prompt 在新模型上不最优"
+    ],
+    "explain": "四个根因来源不同：模型侧变（漂移）、输入侧变（数据漂移）、知识侧旧（过时）、提示侧失配（腐化）。逐项对齐。"
+   },
+   {
+    "type": "judge",
+    "prompt": "只要代码仓库没有任何提交，agent 系统的输出质量就一定能保持稳定。",
+    "answer": false,
+    "explain": "错。熵增是默认趋势：模型被静默更新、数据分布漂移、RAG 文档过时都与你的代码无关。不主动维护，质量会自己往下走。"
+   },
+   {
+    "type": "choice",
+    "prompt": "检测「模型漂移」的核心做法是什么？",
+    "options": [
+     "每天读一遍提供商的更新公告",
+     "部署时用一组固定探针采基线，之后定期重跑、与基线比对长度和属性变化",
+     "统计用户投诉数量",
+     "给每条输出加时间戳"
+    ],
+    "answer": 1,
+    "explain": "漂移很隐蔽（代码没动行为却变）。用固定探针采好基线再定期对比，才能发现「无代码变更的偷偷变化」。基线必须先固定。"
+   },
+   {
+    "type": "input",
+    "prompt": "本章反复强调的闭环铁律：发现失败后不要去人工修正那一条输出，而要去修什么？（填核心对象，中文）",
+    "accept": [
+     "Harness",
+     "harness",
+     "护栏层",
+     "harness 配置",
+     "Harness 配置"
+    ],
+    "explain": "修 Harness 不修输出：改单条输出只治这一条，根因（缺失约束）还在；把约束补进 Harness 才一次修复、免疫一整类。"
+   },
+   {
+    "type": "choice",
+    "prompt": "AI 回归测试为什么不用传统的 assertEqual（精确匹配期望输出）？",
+    "options": [
+     "因为 assertEqual 运行太慢",
+     "因为 LLM 输出是非确定的，对不上固定答案，应改为检查输出属性",
+     "因为 assertEqual 不支持中文",
+     "因为期望输出无法存储"
+    ],
+    "answer": 1,
+    "explain": "非确定输出每次都可能不同，精确匹配会误判。改成属性检查——是否包含关键信息、格式是否合法、是否违反安全规则。"
+   },
+   {
+    "type": "judge",
+    "prompt": "AI 回归测试集的用例，很多可以直接从「生产失败」和「对抗样本」中提取并固化。",
+    "answer": true,
+    "explain": "对。把真实踩过的坑（生产失败）和攻击样本（对抗）固化成回归项，最能防止同类问题复发。测试集还需定期清理、控规模。"
+   },
+   {
+    "type": "choice",
+    "prompt": "按本章的改进循环，同一类问题「第二次复发」时，推荐采取哪种处置？",
+    "options": [
+     "继续手动修复就行",
+     "加一个 Sensor，自动检测这类问题，不再靠人盯",
+     "立刻把整个系统架构重写",
+     "忽略它，等第三次再说"
+    ],
+    "answer": 1,
+    "explain": "升级规则：复发 1 次加 Guide(prompt 约束)，2 次加 Sensor(自动检测)，3 次以上才做架构重设计。第二次复发对应加 Sensor。"
+   },
+   {
+    "type": "input",
+    "prompt": "本章用物理学里「孤立系统自发趋向混乱」来类比 agent 质量随时间退化，这个被借用的物理概念叫什么？（中文或英文均可）",
+    "accept": [
+     "熵",
+     "熵增",
+     "entropy",
+     "熵增原理"
+    ],
+    "explain": "用熵增（entropy）类比：没有持续维护，agent 输出质量会自发退化。Harness Engineering 的职责之一就是对抗熵增。"
+   },
+   {
+    "type": "match",
+    "prompt": "把改进循环里「问题复发的次数」和「对应的处置力度」配对：",
+    "left": [
+     "第一次复发",
+     "第二次复发",
+     "三次以上复发"
+    ],
+    "right": [
+     "加 Guide：在 system prompt 里写一条约束",
+     "加 Sensor：自动检测这类问题",
+     "架构级改动：重新设计相关 Harness 组件"
+    ],
+    "explain": "复发越多说明轻量手段越失效，处置越重：Guide→Sensor→架构重设计，把工程投入花在刀刃上。逐项对齐。"
+   },
+   {
+    "type": "judge",
+    "prompt": "缓慢的质量退化和突然的质量跳水，可以用同一个指标、同一种方式来检测。",
+    "answer": false,
+    "explain": "错。缓慢退化靠线性回归斜率和触阈时间预警；突然跳水靠滑动窗口均值与当前值对比来抓现行。两者要分开检测。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么改进力度要随复发次数逐级升级，而不是一发现问题就架构重构？",
+    "options": [
+     "为了让改进日志更好看",
+     "重构成本高、风险大；第一次复发往往一条 prompt 约束就能压住，只有反复拦不住才值得动架构",
+     "因为架构重构会违反合规要求",
+     "因为 Sensor 比 Guide 更难实现"
+    ],
+    "answer": 1,
+    "explain": "分级是为了把投入花在刀刃上：轻量手段能解决就不动架构；只有 Guide、Sensor 都拦不住、问题反复，才说明是结构性的。"
+   },
+   {
+    "type": "input",
+    "prompt": "EntropyMetrics 里，根据当前分数和退化速率外推「大约多少天后质量会跌破阈值」的那个量，叫什么？（中文或英文关键词均可）",
+    "accept": [
+     "触阈时间",
+     "time to threshold",
+     "time_to_threshold",
+     "触阈时间预测",
+     "到阈值的时间"
+    ],
+    "explain": "触阈时间（time to threshold）给出干预倒计时：剩余天数太短就该立即启动 Harness 改进，而不是等真跌破了才动。"
+   }
+  ]
+ },
+ {
+  "title": "第24章 Harness Engineering 的未来",
+  "subtitle": "模型漂移的解药、平台收敛、Managed Harness、AutoHarness 与开放问题",
+  "intro": [
+   {
+    "title": "这一章在展望什么",
+    "body": "模型会迭代，框架会更替，但约束、评估、编排的需求永远存在。本章的立场很明确：Harness Engineering 不是某个模型时代的产物，而是让 AI 在生产里可靠工作的「永恒工程学科」。\n\n作为收尾章，它偏展望而非实现：讲 Harness 为什么是「模型漂移的解药」而非补丁、编排/评估/可观测性为什么会向统一平台收敛、Managed Harness（托管护栏服务）会把「自己造轮子」变成「声明式配置」、为什么 Harness 比任何特定模型都长寿、AutoHarness（自动合成 Harness）能走多远又卡在哪，以及这门学科还剩哪些没解决的开放问题。"
+   },
+   {
+    "title": "Harness 是模型漂移的解药，不是补丁",
+    "body": "模型在不断换代：2024 是 GPT-4、Claude 3，2025 是 Claude 3.5/4、GPT-4o，2026 又往前走。你的系统必须在这种更迭中保持稳定，而唯一不变的就是约束、评估、编排——也就是 Harness。\n\n两种世界对照很说明问题。没有 Harness：模型更新 → 行为改变 → 事后发现质量下降 → 紧急改 prompt → 下次还会，全程被动、滞后、每次从头来。有 Harness：模型更新就自动跑 eval suite → 检测行为差异 → 自动标记回归，轻微回归自动调参、严重回归直接阻止切换并告警，全程主动、实时、系统化。所以 Harness 是「解药」（系统性地化解漂移），而不是哪里漏了补哪里的「补丁」。",
+    "tip": "「解药 vs 补丁」的差别在主动还是被动：补丁等坏了再补，解药让漂移一发生就被自动检测和处置。"
+   },
+   {
+    "title": "代码：模型无关的 Harness 设计",
+    "body": "关键设计是把「模型相关」收敛到唯一一层——适配器（adapter）。评估、护栏、编排、可观测性都不依赖具体模型；换模型时只改适配器，核心逻辑纹丝不动。\n\n```python\nclass ModelAgnosticHarness:\n    def __init__(self):\n        self.eval_suite = None\n        self.guardrails = None\n        self.orchestrator = None\n        self.observability = None\n    def set_model_adapter(self, adapter):\n        self.model_adapter = adapter\n    def execute(self, task):\n        cleaned_input = self.guardrails.check_input(task)\n        raw_output = self.orchestrator.run(cleaned_input, self.model_adapter)\n        safe_output = self.guardrails.check_output(raw_output)\n        quality = self.eval_suite.evaluate(task, safe_output)\n        self.observability.log(task, safe_output, quality)\n        return {\"output\": safe_output, \"quality\": quality}\n```"
+   },
+   {
+    "title": "趋势一：向统一平台收敛",
+    "body": "2025 年的工具链是碎片化的：编排有 LangGraph/CrewAI，评估有 DeepEval/Ragas，可观测性有 Langfuse/Arize，部署、护栏、Prompt 管理又各有一摊。每个环节工具不同、数据不互通、维护成本高。\n\n本章判断 2026-2027 会向一个统一平台收敛，并给了四个驱动力：数据引力（评估要 trace、可观测要评估结果、编排要评估反馈，数据天然想集中）、工作流耦合（编排结果要被评估、评估结果要被观测、观测告警要回到编排，跨工具接口成本高于平台内集成）、开发者疲劳（维护 6+ 工具的配置/认证/版本/兼容太累，团队倾向「够用的一体化」）、厂商扩张（每家都在向相邻功能扩张，Langfuse 加了 prompt 管理、LangSmith 加了评估）。",
+    "tip": "收敛的根本动因是「数据和工作流本就咬合在一起」：硬拆成多个工具，接口和维护成本迟早把它们重新拉到一起。"
+   },
+   {
+    "title": "趋势二：Managed Harness as a Service",
+    "body": "另一条趋势是从「自建 Harness」走向「Managed Harness（托管护栏服务）」。自建（2024-2025）要数周到数月、团队自己扛运维、可靠性看团队水平；托管（2026-2027）只要数小时到数天、平台扛运维、给 SLA，定制方式从「改代码」变成「改配置 + 插件」，模型切换也只是改配置。\n\n形态上，它是一份声明式 YAML：任务、主模型与回退模型（带级联和质量阈值）、编排方式、RAG 源、连续评估和回归容忍度、输入输出护栏清单、可观测性与告警、以及成本预算（日限额、单请求上限、用量告警）全写在一个文件里。你声明「要什么」，平台负责「怎么实现」。",
+    "tip": "Managed Harness 的本质是把 Harness 从「写出来的代码」变成「声明出来的配置」，门槛和运维负担都大幅下降。"
+   },
+   {
+    "title": "趋势三：Harness 比任何模型世代都长寿",
+    "body": "本章按持久性排了个序：Harness 设计模式 > 评估方法论 > 编排框架 > Prompt 技术 > 特定模型 > 模型版本。越靠近「约束」越长寿，越靠近「某个模型的具体用法」越短命。\n\n原因是约束比能力长寿。有些约束 2023 成立、2026 依然成立、2030 大概率还成立——「输出需要被验证」「错误需要被检测和恢复」「成本需要被控制」「安全边界需要强制执行」「行为需要可审计」。而很多技巧已经过期——Chain of Thought 在某些新模型上不再必要、特定 JSON mode 语法变了、各家 function calling 格式不一。结论落在投资回报上：评估数据集、Harness 编排逻辑、可观测性基础设施在换模型时几乎零返工、长期价值极高；而精心调优的 prompt 一换模型几乎全部作废。所以钱该投在约束层，而不是 prompt 技巧上。",
+    "tip": "一个判断「值不值得投入」的简单标准：换模型时它要不要重做？要重做的（如调好的 prompt）是短期资产，几乎不用动的（如评估集）才是长期资产。"
+   },
+   {
+    "title": "AutoHarness：能做什么，做不好什么",
+    "body": "AutoHarness 是「用 AI 来配 AI 的 Harness」的设想：你描述任务需求，元 LLM 自动合成 Harness 配置，人类再审核调优。原型会分析任务特征（复杂度、是否需要验证、是否安全敏感、输出类型、错误代价），据此选编排模式（简单任务单 agent、需要验证就上 Planner+Generator+Evaluator 三 agent）、生成评估方案、配置护栏。\n\n但它有清晰的边界。AutoHarness 擅长：基于任务特征推荐编排、生成标准化评估配置、配置通用护栏、搭可观测性基础设施、提供一个起步配置。它做不好：领域特定的约束发现、微妙的安全边界定义、基于失败经验的改进、成本-质量权衡的精细调优，以及替代人类的判断和审核。所以结论是——AutoHarness 是好的起点，但 Harness Engineering 仍然离不开人类专家。",
+    "tip": "AutoHarness 的定位是「起步脚手架」而非「成品」：把标准化的部分自动化掉，把需要判断和领域知识的部分留给人。"
+   },
+   {
+    "title": "为什么这样设计 / 开放问题",
+    "body": "为什么本章敢断言「约束比模型长寿」？因为约束源于工程现实而非某个模型的实现细节：只要不存在绝对可靠的系统，「输出要验证、错误要恢复、成本要控、安全要强制、行为要可审计」就一直成立——它们不随模型版本作废。模型是能力，Harness 是对能力的治理，治理需求比任何一代能力都持久。\n\n这门学科还留着一串硬骨头：评估的评估（用 LLM 评估 LLM，那谁评估评估者？无限递归问题）、非确定性测试到底「测到什么程度算够」、Harness 普遍带来 2-5 倍成本有没有更省的约束方式、通用 Harness 质量有限与定制化自动化的矛盾、实时安全里「事后检测 vs 事前阻止」的延迟-安全权衡、以及 agent 自主性「太自由会失控、太约束则无用」的动态边界。至于学科归属，本章给的现实答案是：短期独立发展（因为 AI 系统需要专门关注），长期融入软件工程（因为终将所有软件都含 AI）。",
+    "tip": "记住一句收束全书的话：Harness Engineering 的本质，是用确定性的工程方法去约束和引导非确定性的 AI 系统。"
+   },
+   {
+    "title": "小结",
+    "body": "本章展望 Harness 的长期价值与走向：它是模型漂移的解药（主动检测处置而非事后打补丁），靠模型无关设计把模型相关性收进适配器一层；趋势上编排/评估/可观测性会向统一平台收敛、Managed Harness 把自建变成声明式配置；它比任何模型世代都长寿，因为约束比能力持久，所以投资该投评估集和编排逻辑而非 prompt 技巧；AutoHarness 能自动化标准部分但替代不了人类专家；评估的评估、测试充分性、成本、自主性边界等仍是开放问题。模型会变，让 AI 可靠工作的需求不会变。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "本章说 Harness 是模型漂移的「解药」而不是「补丁」，这个区别的关键在于什么？",
+    "options": [
+     "解药更便宜",
+     "补丁是坏了再被动补救，解药让漂移一发生就被自动检测和系统化处置",
+     "解药不需要写代码",
+     "补丁只能用一次"
+    ],
+    "answer": 1,
+    "explain": "没有 Harness 是「模型更新→事后发现质量降→紧急改 prompt」的被动循环；有 Harness 则模型一更新就自动跑 eval、标记回归，主动而系统化。"
+   },
+   {
+    "type": "choice",
+    "prompt": "「模型无关的 Harness」设计中，唯一与具体模型相关、换模型时只需改动的是哪一层？",
+    "options": [
+     "评估套件",
+     "适配器（model adapter）",
+     "护栏",
+     "可观测性"
+    ],
+    "answer": 1,
+    "explain": "把模型相关性收敛到适配器一层：评估、护栏、编排、可观测性都模型无关，换模型只改适配器，核心逻辑不动。"
+   },
+   {
+    "type": "judge",
+    "prompt": "本章预测，编排、评估、可观测性这些目前分散的工具，未来会趋向收敛到一个统一平台。",
+    "answer": true,
+    "explain": "对。驱动力包括数据引力、工作流耦合、开发者疲劳、厂商扩张——数据和工作流本就咬合，硬拆成多个工具迟早被成本拉回到一起。"
+   },
+   {
+    "type": "match",
+    "prompt": "把「平台收敛」的四个驱动力，和它的含义配对：",
+    "left": [
+     "数据引力",
+     "工作流耦合",
+     "开发者疲劳",
+     "厂商扩张"
+    ],
+    "right": [
+     "评估要 trace、编排要评估反馈，数据天然想集中",
+     "编排结果要被评估、评估要被观测，跨工具接口成本高",
+     "维护 6+ 工具的配置认证版本太累，倾向一体化",
+     "每家厂商都向相邻功能扩张，能力互相覆盖"
+    ],
+    "explain": "四个动因共同把碎片化工具推向统一平台：数据想集中、工作流相扣、维护太累、厂商互相蚕食。逐项对齐。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Managed Harness（托管护栏服务）相比自建 Harness，最核心的转变是什么？",
+    "options": [
+     "从开源变成闭源",
+     "从「自己写代码造轮子」变成「声明式配置 + 平台托管运维」",
+     "从用 Python 变成用 Java",
+     "从单模型变成多模型"
+    ],
+    "answer": 1,
+    "explain": "Managed Harness 把 Harness 从「写出来的代码」变成「声明出来的 YAML 配置」，平台扛运维并给 SLA，模型切换也只是改配置。"
+   },
+   {
+    "type": "judge",
+    "prompt": "本章认为，精心调优的 prompt 和评估数据集相比，前者在换模型时的长期价值更高。",
+    "answer": false,
+    "explain": "错，恰好相反。调好的 prompt 一换模型几乎全部作废（短期资产）；评估数据集换模型时零返工、可完全复用，长期价值极高。"
+   },
+   {
+    "type": "input",
+    "prompt": "「用 AI 来配 AI 的 Harness」——由元 LLM 从任务描述自动合成 Harness 配置、再交人类审核调优的设想，本章叫它什么？（英文一词即可）",
+    "accept": [
+     "AutoHarness",
+     "autoharness",
+     "Auto Harness",
+     "自动合成 Harness",
+     "自动 Harness"
+    ],
+    "explain": "AutoHarness 自动化标准化的部分（推荐编排、生成评估配置、配通用护栏），是好的起步脚手架，但替代不了人类专家。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下面哪一项是 AutoHarness「做不好、仍需人类专家」的部分？",
+    "options": [
+     "搭建可观测性基础设施",
+     "生成标准化的评估配置",
+     "领域特定的约束发现与微妙的安全边界定义",
+     "基于任务特征推荐编排模式"
+    ],
+    "answer": 2,
+    "explain": "AutoHarness 擅长标准化、通用化的部分；领域特定约束、微妙安全边界、基于失败经验的改进、成本-质量精细权衡都需要人类判断。"
+   },
+   {
+    "type": "input",
+    "prompt": "「用 LLM 评估 LLM，那谁来评估评估者？」——本章把这个尚未解决的难题称作什么问题？（中文或英文均可）",
+    "accept": [
+     "无限递归",
+     "无限递归问题",
+     "评估的评估",
+     "infinite recursion",
+     "评估者的评估"
+    ],
+    "explain": "「评估的评估」是个无限递归问题：评判者本身也需要被评判。本章把它列为 Harness Engineering 尚未解决的开放难题之一。"
+   },
+   {
+    "type": "judge",
+    "prompt": "本章认为 Harness Engineering 会永远作为一门完全独立于软件工程的学科存在下去。",
+    "answer": false,
+    "explain": "错。本章给的现实答案是「短期独立、长期融合」：短期因 AI 系统需专门关注而独立，长期因所有软件都将含 AI 而融入软件工程。"
+   },
+   {
+    "type": "match",
+    "prompt": "按本章的持久性排序，把每类东西和它大致的「长寿程度」配对：",
+    "left": [
+     "Harness 设计模式 / 评估方法论",
+     "编排框架",
+     "Prompt 技术",
+     "具体模型版本"
+    ],
+    "right": [
+     "最长寿（约 8 年以上，约束层）",
+     "中等（约 5-8 年）",
+     "较短（约 3-5 年，随模型变）",
+     "最短命（约 3-12 个月）"
+    ],
+    "explain": "越靠近「约束」越长寿、越靠近「某模型具体用法」越短命：设计模式/评估法 > 编排框架 > prompt 技术 > 模型版本。逐项对齐。"
+   },
+   {
+    "type": "choice",
+    "prompt": "用一句话概括全书，Harness Engineering 的本质是什么？",
+    "options": [
+     "用最新的模型替换旧模型",
+     "用确定性的工程方法约束和引导非确定性的 AI 系统",
+     "把所有 prompt 调到最优",
+     "尽可能减少对模型的使用"
+    ],
+    "answer": 1,
+    "explain": "全书的收束句：用确定性的工程方法（评估、约束、监控、编排）去约束和引导非确定性的 AI 系统。模型会变，这个需求不变。"
+   }
+  ]
+ }
+]

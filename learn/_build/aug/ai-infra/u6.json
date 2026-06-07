@@ -1,0 +1,729 @@
+{
+  "u6-l1": [
+    {
+      "type": "input",
+      "prompt": "在典型 RAG 服务的端到端延迟公式 `t_request = t_queue + t_preprocess + t_model + t_downstream + t_postprocess` 中，`t_model` 可进一步拆成哪两个子阶段？（用加号连接两个英文缩写）",
+      "accept": ["t_prefill + t_decode", "t_prefill+t_decode", "prefill + decode", "prefill+decode"],
+      "explain": "LLM 推理分两个阶段：prefill（一次性处理整个 prompt，生成第一个 token 的 KV）和 decode（每步自回归生成一个 output token）。两者在计算特征和延迟构成上截然不同，拆分是做延迟归因的基础。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某 LLM 服务 TTFT P50=150ms、P99=3500ms。造成 P99 如此高于 P50 的最典型根因是什么？",
+      "options": [
+        "模型权重加载太慢，每次请求都需要重新从磁盘读取",
+        "输入长度分布高度不均匀，长 prompt 占据 prefill 资源，短请求在队列中等待",
+        "网络带宽不足，数据传输成为瓶颈",
+        "采样温度过高导致 decode 步骤变慢"
+      ],
+      "answer": 1,
+      "explain": "LLM 输入长度差异可轻易达到 100 倍。长 prompt prefill 会独占 GPU 数秒，队列中短请求的 TTFT 被大幅拖慢。P50 反映典型请求，P99 反映最坏情况，两者比值可达 20x 以上。遇到这类 P99 问题，应按输入长度分桶排查，而不是先优化模型算子。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在 Prefill/Decode Disaggregation 架构中，Prefill 节点完成后直接把 KV Cache 通过网络传给 Decode 节点，这要求推理系统支持跨机 KV 传输（KV handoff）。",
+      "answer": true,
+      "explain": "P/D 解耦把两个阶段放在不同机器的资源池上，Prefill 节点计算完成后必须通过网络把 KV Cache 传送给 Decode 节点，才能继续 decode。这个 KV handoff 是实现完整 P/D 解耦的核心工程难点，也是其运维复杂度远高于 chunked prefill 的主要原因。"
+    },
+    {
+      "type": "choice",
+      "prompt": "prefix-aware 路由中，「一致性哈希路由」和「副本 prefix tree summary 聚合」相比，主要劣势是什么？",
+      "options": [
+        "一致性哈希不支持 HTTPS 协议",
+        "一致性哈希实现复杂，通常比 prefix tree summary 更难维护",
+        "副本失败时一致性哈希容错差，且无法保证路由到「真正有该 prefix 缓存」的副本",
+        "一致性哈希只支持字符串 key，不能处理 token id 序列"
+      ],
+      "answer": 2,
+      "explain": "一致性哈希按 prefix hash 分桶路由，副本故障时命中率下降（该 hash 对应副本挂了），且哈希相同不代表副本一定有该 KV——比如副本重启后 cache 已清空。SGLang router 的 prefix tree summary 能精确知道每个副本当前持有哪些 prefix，命中更准确，但实现更复杂。"
+    },
+    {
+      "type": "match",
+      "prompt": "将下列降级措施与其「对服务质量的破坏程度」从小到大排序配对：",
+      "left": ["关闭 rerank 增强", "切换为 quantized 小模型", "截短用户上下文", "返回 429/503"],
+      "right": ["破坏程度最小：影响排序质量但不影响回答完整性", "破坏程度较小：质量有损但仍有完整回答", "破坏程度较大：可能截断对话历史，影响语义连贯性", "破坏程度最大：直接拒绝服务，用户无法获得任何回答"],
+      "explain": "降级梯度从小到大：关闭非核心增强（rerank）→ 切小/量化模型 → 截短上下文 → 拒绝请求。工程上应按破坏程度逐级触发，而不是直接跳到最后一级拒绝。降级顺序要提前写入控制面并定期演练。"
+    },
+    {
+      "type": "choice",
+      "prompt": "「扩容决策要看 Goodput 曲线，不要只看 QPS 曲线」的工程含义是什么？",
+      "options": [
+        "QPS 曲线会被 bot 流量污染，goodput 更准确",
+        "加大 batch size 可能同时提高 QPS 和降低 goodput，因为超 SLO 的请求不计入 goodput",
+        "QPS 曲线无法区分 prefill 和 decode 请求",
+        "goodput 曲线更容易被 Prometheus 采集"
+      ],
+      "answer": 1,
+      "explain": "Goodput 只统计在 SLO 内（如 P90 TTFT < 500ms 且 P90 TPOT < 100ms）完成的请求。加大 batch 后 QPS 可能上升，但如果 TTFT 变长、更多请求超时，goodput 反而下降。扩容和调优都应以 goodput 而非原始 QPS 为优化目标。"
+    },
+    {
+      "type": "input",
+      "prompt": "在线推理 70B 级别模型从副本拉起到可正式接受生产流量，冷启动通常需要多少秒（填典型范围下界，整数）？",
+      "accept": ["30", "30s"],
+      "explain": "70B 级模型冷启动三段叠加（权重加载 + 运行时初始化 + CUDA graph 捕获/kernel autotune/缓存预热）通常需要 30–180 秒。因此「副本已拉起」≠「可立刻放流量」，必须先发预热请求确认各路径跑通后再纳入服务池。"
+    },
+    {
+      "type": "judge",
+      "prompt": "对于 LLM 服务，只要 P50 TTFT 满足 SLO，就说明大部分用户体验达标，无需关注更高分位数。",
+      "answer": false,
+      "explain": "P50 反映中位数体验，但 LLM 服务的延迟分布极度右偏——P50=150ms、P99 可能高达 3500ms（23 倍差距）。超出 SLO 的是真实用户，不是统计异常。成熟监控必须同时看 P50/P90/P95/P99，goodput 定义里也明确把超 SLO 请求排除在外。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列哪个指标最能检测到 LLM 流式输出过程中的「中间卡顿」（某几步 token 间隔突然拉大）？",
+      "options": [
+        "E2EL（End-to-End Latency）",
+        "TTFT（Time to First Token）",
+        "TPOT（Time per Output Token）",
+        "ITL（Inter-Token Latency）的 P99 直方图"
+      ],
+      "answer": 3,
+      "explain": "ITL 记录每相邻两个 output token 之间的真实间隔，能精确定位某几步卡顿。TPOT 是均值，会把一次 800ms 卡顿摊薄到数百步中，用户体验到的抖动被掩盖。E2EL 和 TTFT 完全不包含 decode 阶段的步间信息。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某多租户 RAG 服务决定对所有租户统一使用 round-robin 路由，取消 prefix-aware 路由，理由是「公平分配负载」。以下哪项是该决策最主要的隐性代价？",
+      "options": [
+        "round-robin 会绕过 TLS 证书校验，带来安全风险",
+        "prefix cache 命中率会大幅下降，相同 system prompt 的 KV 在每个副本各算一遍，prefill 成本和 TTFT 同时升高",
+        "round-robin 无法处理 HTTP/2 长连接，必须切换为 HTTP/1.1",
+        "副本之间的负载会严重不均衡，导致某些副本过载"
+      ],
+      "answer": 1,
+      "explain": "prefix-aware 路由的核心价值是把带相同 system prompt 的请求引导到同一副本，利用其 KV Cache。改用 round-robin 后，相同 prefix 会被打散到不同副本，各自缓存各自的 KV，prefix cache 形同虚设，TTFT 和成本同时升高。负载均衡的「公平」以质量为代价。"
+    }
+  ],
+  "u6-l2": [
+    {
+      "type": "choice",
+      "prompt": "Static batching 与 Continuous batching 相比，在「短请求完成后」会发生什么导致 GPU 利用率骤降？",
+      "options": [
+        "static batching 会立即释放所有 KV Cache，导致其他请求重算",
+        "short 请求完成后槽位空着等整批其余请求跑完，GPU 利用率从 100% 迅速跌到仅剩长请求占用的比例",
+        "static batching 不支持 KV Cache，每步都重新计算所有历史 token",
+        "short 请求完成后 GPU 会进入节能模式，需要重新预热"
+      ],
+      "answer": 1,
+      "explain": "Static batching 以「一整批进、一整批出」为单位，最短请求完成后，它的槽位被锁死不能让给新请求，GPU 的有效负载缩减为剩余长请求的比例。这是 Orca 论文提出 continuous batching（iteration-level scheduling）的直接动机。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Prefill 阶段是 compute-bound，因此增加 GPU 数量（TP 并行度）对缩短 prefill 延迟的效果比增加 HBM 带宽更显著。",
+      "answer": true,
+      "explain": "Prefill 一次性处理整个 prompt，执行大矩阵乘法，瓶颈是算力（FLOPS）。增加 TP 并行度可以把计算分摊到更多 GPU，线性缩短 prefill 延迟。Decode 则相反，是 memory-bandwidth-bound，增加 HBM 带宽更有效。两阶段需要针对性优化。"
+    },
+    {
+      "type": "input",
+      "prompt": "PagedAttention 中，`block_size=16` 时，一个请求的 logical token 位置 100 映射到的物理 block id 是第几个 block（从 0 开始计数，整数）？",
+      "accept": ["6"],
+      "explain": "logical token 100 所在的 block = floor(100 / 16) = 6（即第 6 个 block，0-indexed）。slot 在块内的偏移 = 100 % 16 = 4。PagedAttention 用 block table 把逻辑 block id 映射到物理 block id，attention kernel 读 KV 时通过这张表间接寻址。"
+    },
+    {
+      "type": "choice",
+      "prompt": "7B 模型 batch=32 时 decode 吞吐约 900 tokens/s，batch=128 时约 2500 tokens/s。从 batch=32 扩到 batch=128（4x），吞吐约增加了多少倍？",
+      "options": [
+        "约 4x，完全线性扩展",
+        "约 2.8x，因为随 batch 增大逐渐从 memory-bound 向 compute-bound 过渡，扩展效率下降",
+        "约 1.1x，batch 增大对吞吐几乎没有影响",
+        "约 10x，batch 增大有超线性加速效果"
+      ],
+      "answer": 1,
+      "explain": "2500 / 900 ≈ 2.8x。Batch 从 1 到 32 时仍偏 memory-bound，扩展效率高；从 32 到 128 时计算量增加、GPU 逐渐饱和，边际收益下降，4x batch 只带来约 2.8x 吞吐，体现了 memory-bound 向 compute-bound 的过渡。"
+    },
+    {
+      "type": "match",
+      "prompt": "将下列 speculative decoding 变体与其草稿来源匹配：",
+      "left": ["Draft model", "n-gram", "EAGLE", "Medusa"],
+      "right": ["单独训练的小模型（如 1B 对 70B），独立推理后批量验证", "从请求自身 prompt 做 n-gram 匹配，不需要额外模型", "利用目标模型的 hidden state 预测下几个 token", "在目标模型上加多头输出层，并行预测多个候选 token"],
+      "explain": "四种变体草稿来源不同：Draft model 独立小模型最通用；n-gram 最轻量，对代码/结构化输出收益高；EAGLE 利用目标模型特征，精度更高；Medusa 在目标模型上加头，无需维护独立小模型。选型需结合服务并发和草稿接受率。"
+    },
+    {
+      "type": "judge",
+      "prompt": "对于 DeepSeek V3（使用 MLA 架构），用 MHA KV Cache 公式估算其显存占用时，结果会比实际值低很多。",
+      "answer": false,
+      "explain": "MLA 把 KV 压缩到低维 latent（没有 × n_heads 也没有 ×2），比 MHA 小得多。如果用 MHA 公式（2 × L × n_kv_heads × d_head × T × dtype_bytes）套算 MLA 模型，估算结果会远高于实际，高估 10–40 倍。即套 MHA 公式会「高估」，不是「低估」。"
+    },
+    {
+      "type": "choice",
+      "prompt": "Prefix cache 命中后，被命中的 block 引用计数如何变化？当命中的请求结束后，这些 block 立刻被释放吗？",
+      "options": [
+        "引用计数 +1；请求结束后引用计数 -1，降到 0 时立刻释放",
+        "引用计数 +1；请求结束后引用计数 -1，降到 0 后进入 evictable 列表，显存紧张时才驱逐",
+        "引用计数不变；block 被标记为只读，永久保留",
+        "引用计数 +1；请求结束后这些 block 不做任何处理，直到显存满为止"
+      ],
+      "answer": 1,
+      "explain": "Prefix cache 采用引用计数 + evictable LRU 设计：命中时 ref_count +1；请求结束 ref_count -1；降到 0 的 block 不立刻回收，进入 evictable 列表（LRU/FIFO）。下次相同 prefix 请求来时直接复用；显存紧张时才按 LRU 驱逐。这保证热 prefix 尽量留在显存。"
+    },
+    {
+      "type": "input",
+      "prompt": "LLaMA-70B，GQA 8 头，head_dim=128，80 层，BF16（2 字节），单请求 128K context，KV Cache 约占多少 GiB？（整数）",
+      "accept": ["40"],
+      "explain": "公式：2 × 80 × 8 × 128 × 131072 × 2 字节 = 2 × 80 × 8 × 128 × 131072 × 2 = 43,486,371,840 字节 ≈ 40.5 GiB ≈ 40 GiB。单请求 128K context 的 KV Cache 已接近整个权重大小（70B BF16 约 140 GiB，单张 H100 80GB 装不下），这说明长上下文时 KV 而非权重才是 admission 瓶颈。"
+    },
+    {
+      "type": "choice",
+      "prompt": "n-gram 投机解码（speculative decoding）最适合以下哪个场景，且实现成本最低？",
+      "options": [
+        "多轮开放域闲聊，每轮输出高度随机",
+        "代码补全或结构化输出（JSON/XML），输出中大量重复已有 token 序列",
+        "摘要生成，输出与输入完全不同",
+        "多语言翻译，草稿来自不同语言分布"
+      ],
+      "answer": 1,
+      "explain": "n-gram 从请求自身 prompt/已生成内容做匹配，不需要额外小模型，零额外显存开销。代码补全和结构化输出包含大量重复 pattern（关键字、括号、字段名），n-gram 命中率高，收益最大。开放域闲聊内容随机，n-gram 命中率低，收益几乎为零。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Chunked prefill 把长 prompt 切片后，每个 chunk 在 forward 中和当前 decode 请求混跑，这会使 decode 请求的 ITL 降低（抖动减小）。",
+      "answer": true,
+      "explain": "不加 chunked prefill 时，一个 8K-token 的 prefill 会独占一次完整 forward（可能 2 秒），在此期间所有 decode 请求被阻塞，ITL 出现 2 秒卡顿峰。Chunked prefill 把 prefill 切成 512-token 小块，每步和 decode 混跑，单步时间接近正常 decode 步长，decode 请求的 ITL 抖动大幅减小。"
+    }
+  ],
+  "u6-l3": [
+    {
+      "type": "choice",
+      "prompt": "FP8 量化（E4M3/E5M2）相比 INT8，最显著的优势是什么？",
+      "options": [
+        "FP8 比 INT8 压缩比更高，权重体积减少 4x",
+        "FP8 保留浮点动态范围，对大激活值的相对误差更小，且 H100/H200/B200 有原生 FP8 Tensor Core，精度损失极小",
+        "FP8 不需要校准数据集，可以免校准量化",
+        "FP8 在所有 NVIDIA GPU（包括 A100）上都有硬件加速"
+      ],
+      "answer": 1,
+      "explain": "FP8 相比 INT8 的优势是浮点动态范围——对于激活值分布宽的模型，FP8（尤其 E4M3）能更好地保留大激活。H100/H200/B200 有原生 FP8 Tensor Core 支持，精度接近 BF16，是 NVIDIA 下一代标准量化路径。A100 不支持 FP8 计算（只有存储），这是选型时的关键约束。"
+    },
+    {
+      "type": "judge",
+      "prompt": "AWQ 的 scale 可以融合（fuse）进前一层权重，使推理时几乎没有额外反量化开销，这是 vLLM AWQ 路径速度快的根本原因。",
+      "answer": true,
+      "explain": "AWQ 量化前对权重做 per-channel scale（scale 由 activation 引导），这个 scale 在推理前可以 fuse 进前一层的 matmul，避免独立的反量化算子。GPTQ 则是对权重内容本身做量化，反量化必须在 matmul 前显式执行（依赖 Marlin/Machete kernel）。这是两者在推理延迟上的关键差异。"
+    },
+    {
+      "type": "input",
+      "prompt": "Machete kernel 专为哪种 GPU 架构设计？（填架构代号，英文）",
+      "accept": ["Hopper", "hopper", "H100", "h100"],
+      "explain": "Machete 是 vLLM 为 Hopper（H100/H200）架构专门设计的 W4A16 GEMM kernel，利用了 Hopper 新指令集（如 wgmma）。相比 Marlin，Machete 在 H100 的中大 batch（decode + prefill）场景下吞吐高 30–50%。A100（Ampere）只能用 Marlin。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某服务对长上下文（128K）场景已经开了 INT4 权重量化，但测量发现 attention 计算前后各有一次大量 HBM 读写，使量化收益被部分抵消。最可能的根因是什么？",
+      "options": [
+        "INT4 权重量化对 attention 计算没有任何影响，此开销来自其他算子",
+        "FP8 KV Cache 量化开启了，但 attention backend 不支持 FP8 KV 原生计算，退化为「FP8 存储 + 反量化到 BF16 临时 buffer 再算 attention」",
+        "INT4 权重需要在每次 attention 前先反量化到 FP16，导致额外读写",
+        "显存带宽不足，任何量化都无法解决"
+      ],
+      "answer": 1,
+      "explain": "这是 FP8 KV Cache 的经典反模式：开了 `kv_cache_dtype=fp8` 但 attention backend 不支持原生 FP8 attention，导致每次 attention 前先把历史 KV 从 FP8 反量化到 BF16 临时 buffer（一次 HBM 读写），attention 结束再量化写回（一次 HBM 写），量化省的显存被多余的 IO 吃掉，P99 TPOT 反而升高。"
+    },
+    {
+      "type": "match",
+      "prompt": "将下列量化方法与其主要适用场景匹配：",
+      "left": ["FP8 W8A8", "AWQ（INT4 W4A16）", "SmoothQuant（INT8 W8A8）", "GPTQ（INT4 W4A16）"],
+      "right": ["H100/H200 大规模推理，精度接近 BF16，硬件原生支持", "decode memory-bound 场景，权重带宽减半，校准快（30 分钟内）", "A100 平衡推理，通过迁移激活异常值降低量化误差，精度好于纯 INT4", "长尾复杂任务追求更高精度，校准耗时但 Hessian 补偿效果好"],
+      "explain": "FP8 适合支持它的最新 GPU；AWQ 校准快、scale fuse 后推理快，适合快速迭代；SmoothQuant 解决激活异常值问题，INT8 A100 的好选择；GPTQ Hessian 补偿精度好但校准慢，适合稳定部署对质量要求高的场景。"
+    },
+    {
+      "type": "choice",
+      "prompt": "FlashAttention 相对朴素 attention 实现（Q×K^T → softmax → × V，三张独立矩阵）的核心优势是什么？",
+      "options": [
+        "FlashAttention 用近似 softmax 跳过了精确计算，速度更快",
+        "FlashAttention 把 Q/K/V 矩阵分块 tile 到 SRAM，融合成一个 kernel，避免写出 O(N²) 的中间矩阵 S 和 P，HBM 读写次数从 O(N²) 降到 O(N)",
+        "FlashAttention 把 attention 拆成多个小 kernel 并行执行",
+        "FlashAttention 只适合 causal attention，不支持双向 attention"
+      ],
+      "answer": 1,
+      "explain": "朴素 attention 需要把 N×N 的得分矩阵 S 和权重矩阵 P 写到 HBM（O(N²) 带宽），FlashAttention 把整个 attention 融为一个 kernel，分 tile 在 SRAM 内完成所有计算，只读 Q/K/V 各一遍，HBM 访问从 O(N²) 降到 O(N)，是 LLM 推理中最重要的算子融合案例。"
+    },
+    {
+      "type": "judge",
+      "prompt": "torch.compile 产生的 compiled 模块可以在不同 sequence length 的输入上自动复用，不会触发重新编译。",
+      "answer": false,
+      "explain": "torch.compile（TorchInductor）默认按遇到的 shape 编译专门版本。新的 sequence length 触发 recompile，首次遇到新 shape 有较大编译开销（可达数秒）。这是为什么 LLM serving 通常对 torch.compile 做 shape 分桶（bucketize）或采用 CUDA Graph 固定 shape，避免线上频繁触发 recompile。"
+    },
+    {
+      "type": "input",
+      "prompt": "TensorRT-LLM 使用的推理服务框架（提供 HTTP/gRPC 接口、ensemble、动态 batching）的名称是？（英文，两个词）",
+      "accept": ["Triton Inference Server", "NVIDIA Triton", "Triton", "triton inference server"],
+      "explain": "TRT-LLM 本身只是推理引擎库，不直接暴露 HTTP 接口。生产部署时通常通过 NVIDIA Triton Inference Server 包裹，Triton 提供 HTTP/gRPC 接口、多模型 ensemble、动态 batching 和 Prometheus metrics。Triton 也支持其他后端（如 ONNX Runtime、PyTorch）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "一个团队把量化校准集全部用英文维基百科，然后部署服务给中文用户使用。最可能出现什么问题？",
+      "options": [
+        "量化模型无法处理中文 token，直接报错",
+        "中文激活的动态范围没有被校准覆盖，scale/zero point 估计不准，中文输出质量明显下降",
+        "英文校准集会导致量化后英文能力下降，与中文无关",
+        "量化校准与语言无关，校准集语言不影响量化精度"
+      ],
+      "answer": 1,
+      "explain": "量化校准的目的是估计真实推理分布下的激活范围（scale/zero point）。英文和中文激活分布不同，用纯英文校准集的量化器对中文激活的 scale 估计偏差较大，量化误差更高，中文回答质量会明显下降。校准集必须覆盖目标流量的语言和任务分布。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 H100 上，`vLLM --quantization=marlin` 实际会使用哪个底层 kernel 后端？",
+      "options": [
+        "Marlin（针对 Ampere 优化）",
+        "Machete（针对 Hopper 优化），vLLM 在 H100 上自动切换",
+        "cuBLAS 的标准 INT4 路径",
+        "反量化到 FP16 后走普通 GEMM"
+      ],
+      "answer": 1,
+      "explain": "vLLM 在 H100 上使用 `--quantization=marlin` 时，会自动检测到 Hopper 架构并使用 Machete 后端（而非 Marlin），因为 Machete 在 H100 上利用了 wgmma 等新指令，中大 batch 场景下比 Marlin 快 30–50%。用户无需手动指定，vLLM 根据检测到的 GPU 型号自动选择最优 W4A16 kernel。"
+    }
+  ],
+  "u6-l4": [
+    {
+      "type": "choice",
+      "prompt": "mini-vLLM 中 `CacheEngine` 的 KV tensor shape 最后一维是 `block_size` 而非 `seq_len`，这样设计的主要原因是什么？",
+      "options": [
+        "block_size 比 seq_len 小，占用显存少",
+        "让同一 block 的所有 token 的 K（或 V）在内存中连续，attention kernel 可以一次 coalesced load 读完整个 block",
+        "方便 Python 的切片操作，提高可读性",
+        "block_size 固定，seq_len 可变，只有固定维度才能做成 tensor"
+      ],
+      "answer": 1,
+      "explain": "CacheEngine shape = (num_blocks, num_kv_heads, head_dim, block_size)，最后一维 block_size 使同一 block 内所有 token 的 K（或 V）在内存中连续存放。attention kernel 读一个 block 时只需一次 coalesced memory load，而不是散步 gather。这是 PagedAttention 的 layout 设计核心，也是 reference attention 实现比较慢但「架构对」的原因。"
+    },
+    {
+      "type": "judge",
+      "prompt": "mini-vLLM 中，当一个请求的 prompt 长度恰好等于 num_prompt_tokens，且所有 prompt blocks 全部命中 prefix cache，调度器会跳过这个请求的 forward，直接进入采样阶段。",
+      "answer": false,
+      "explain": "全命中的情况下没有 fresh token 走 forward，就没有 logit，无法采样下一个 token。mini-vLLM 的处理是：全命中时主动丢掉最后一个 cached block（「保留至少 1 个 fresh token」规则），让最后 block_size 个 token 重走 forward 得到 logit。这是 prefix caching 实现中容易遗漏的边角案例。"
+    },
+    {
+      "type": "input",
+      "prompt": "mini-vLLM prefix caching 中，`_hash_block(prev_hash, token_ids)` 的两个参数分别是什么？（用「前一个 block 的哈希值」和「当前 block 的 token id 列表」描述，填其中第一个参数的关键词）",
+      "accept": ["prev_hash", "前一个block的哈希值", "前一个 block 的哈希值", "上一个block的哈希", "chain hash"],
+      "explain": "hash chain 的设计是：当前 block 的 hash = f(prev_block_hash, current_block_token_ids)。这样，两个请求只要前缀 token 序列完全相同，chain hash 就完全相同，可以精确命中共享 block；一旦任一位置不同，后续所有 block hash 都不同，自动避免错误共享。prev_hash 是这条链的「锚」。"
+    },
+    {
+      "type": "choice",
+      "prompt": "mini-vLLM 的 `append_slot` 函数在什么情况下会返回 `(src_block_id, dst_block_id)` 而不是 `None`？",
+      "options": [
+        "显存不足，需要触发 swap",
+        "当前 block 的 `ref_count > 1`，即该 block 被多个 seq 共享，写入新 token 前需要 copy-on-write",
+        "当前 block 已满，需要分配下一个新 block",
+        "当前 block 是 prefix cache 中的 evictable block，需要先把它固定"
+      ],
+      "answer": 1,
+      "explain": "Copy-on-Write（CoW）触发条件：`ref_count > 1`，即该 block 被多个 seq 共享（典型场景：prefix cache 命中后同一 block 被多个请求引用）。decode 阶段写入新 token 时，若直接写共享 block 会污染其他 seq 的视图。`append_slot` 检测到这种情况返回 `(src, dst)`，让 model_runner 先把 KV 复制到私有 block 再写入。"
+    },
+    {
+      "type": "judge",
+      "prompt": "mini-vLLM 中，swap-to-CPU 后再 swap 回 GPU 的 block 内容（K/V 数据）与 swap 前完全一致（bit-identical），因为 swap 只移动数据，不改变其数值。",
+      "answer": true,
+      "explain": "swap 的正确性保证是：CPU pool 和 GPU pool 的 KV tensor layout 完全一致（只是 device 不同），swap out/in 是纯拷贝操作，不涉及任何精度转换或数值变换。`test_e2e_swap_matches_no_swap_baseline` 测试验证了这一点：swap 改变时序但不改变 K/V 数学内容，输出 token 与不 swap 的基线完全相同。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 mini-vLLM 中的调度状态与其含义匹配：",
+      "left": ["WAITING", "RUNNING", "SWAPPED"],
+      "right": ["请求已到达但 KV 显存不足或 token budget 用完，在队列中等待", "请求正在 GPU 上 decode，block table 在 GPU pool 中有效", "请求被抢占，KV block 已搬移到 CPU pool 暂存，等待 GPU 显存恢复"],
+      "explain": "三态机器是 mini-vLLM scheduler 的核心：WAITING 是入口；RUNNING 是正常 decode 状态；SWAPPED 是被抢占后 KV 在 CPU 的中间状态。SWAPPED 请求在 GPU 显存恢复后会重新进入 RUNNING，整个过程对输出结果没有影响（bit-identical）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "mini-vLLM 的 `model_runner.py` 在组 batch 时，为什么 `prefill_seq_lens` 是一个列表（数组），而不是单个整数？",
+      "options": [
+        "Python 的函数参数约定必须用列表",
+        "同一步 forward 可以同时包含多个 prefill 请求（混合 batch），每个 prefill 请求的 chunk 长度不同，需要数组分别记录",
+        "prefill_seq_lens 列表只包含一个元素，用列表是为了和 decode_seq_lens 格式统一",
+        "prefill_seq_lens 记录了每个 prefill 请求在每层的 seq length，是二维数组简化为一维"
+      ],
+      "answer": 1,
+      "explain": "continuous batching 允许同一步 forward 中同时有多个 prefill chunk 和多个 decode step 混跑。`prefill_seq_lens` 数组的长度等于这一步参与 prefill 的 seq 数量，每个元素是该 seq 当前 chunk 的长度。attention kernel 用这个数组来正确分隔各 seq 的 Q/K/V 范围和 causal mask 计算。"
+    },
+    {
+      "type": "input",
+      "prompt": "mini-vLLM 用哪个模型（英文名/HuggingFace model ID 中的架构名称）作为参考实现的测试模型？（填模型系列名）",
+      "accept": ["TinyLlama", "tinyllama", "TinyLlama-1.1B"],
+      "explain": "mini-vLLM 选用 TinyLlama-1.1B 作为测试模型，因为它足够小（可在消费级 GPU 甚至 CPU 上运行），且架构是标准 LLaMA（GQA、RoPE、SwiGLU），覆盖了 PagedAttention、prefix cache、swap 等所有核心路径的验证需求。验证方式是与 HuggingFace transformers 的参考实现对比输出一致性。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 mini-vLLM 中，chunked prefill 的 causal mask 公式 `mask[q, kv] = 0 if kv <= n_cached + q else -inf` 中，`n_cached` 代表什么？",
+      "options": [
+        "当前 GPU pool 中缓存的总 block 数量",
+        "该请求之前已缓存（通过 prefix cache 或上一轮 chunk 计算）的 token 数量",
+        "当前 batch 中所有请求的已缓存 token 之和",
+        "block_size 乘以已满 block 数量"
+      ],
+      "answer": 1,
+      "explain": "`n_cached` 是该 seq 在处理当前 chunk 之前，已经写入 KV cache 的 token 数量（来自 prefix cache 命中或上一个 chunk 的计算结果）。当前 chunk 的第 q 个 query token（绝对位置 n_cached+q）可以 attend 到位置 0..n_cached+q（即所有 prior token），mask 公式确保了这一正确性，也是 chunked prefill 和 prefix caching 共用同一数学基础的关键。"
+    },
+    {
+      "type": "judge",
+      "prompt": "mini-vLLM 的 reference attention（纯 PyTorch 实现）和真实 vLLM 的 FlashAttention kernel 在数学上等价，只是实现性能不同。",
+      "answer": true,
+      "explain": "mini-vLLM 使用标准 PyTorch scaled dot-product attention 作为 reference，数学语义与 FlashAttention 完全一致（只是 FlashAttention 做了 tiling 减少 HBM 访问，慢约 50–100x 但结果 bit-level 等价，在数值精度范围内）。这正是 mini-vLLM 的设计哲学：用「慢但绝对正确」的参考实现验证架构，再让真实引擎对应上去。"
+    }
+  ],
+  "u6-l5": [
+    {
+      "type": "choice",
+      "prompt": "vLLM 的 `LLMEngine` 在每个调度步骤（step）执行完 forward 后，立刻做的第一件事是什么？",
+      "options": [
+        "等待所有 tensor 都同步到 CPU 内存后再继续",
+        "调用 scheduler 的 `update_from_output` 更新每个 seq 的状态（已生成 token、完成标志、preemption 决策）",
+        "把所有输出 token 写入磁盘日志",
+        "触发下一轮 prefill 对所有 waiting 请求做批量处理"
+      ],
+      "answer": 1,
+      "explain": "vLLM 的调度循环是：schedule() → execute_model() → update_from_output()。update_from_output 解析 sampler 输出，把新 token append 到各 seq，标记完成 seq、释放其 block，记录 preemption 决策，才能进入下一轮 schedule。这是 continuous batching 的「每步重新决策」机制的实现基础。"
+    },
+    {
+      "type": "judge",
+      "prompt": "vLLM 的 Tensor Parallelism（TP）在每个 transformer 层的 GEMM 结束后都需要做一次 all-reduce，层数越多 all-reduce 次数越多。",
+      "answer": true,
+      "explain": "TP 把 attention heads 和 FFN 列切分到多卡，每个 attention 输出投影和每个 FFN down projection 之后需要 all-reduce 聚合各卡的部分和，才能得到正确的完整激活。一个 L 层 transformer 每层有 2 次 all-reduce（MHA output + FFN down），总共 2L 次。TP=4 时延迟开销取决于卡间带宽（NVLink vs PCIe）。"
+    },
+    {
+      "type": "input",
+      "prompt": "vLLM 通过 `--enable-prefix-caching` 启用 hash-based prefix caching 时，判断两个 block 内容是否相同的依据是什么？（填核心数据结构名称）",
+      "accept": ["block hash", "token hash", "hash", "block_hash", "prefix hash", "token sequence hash"],
+      "explain": "vLLM 对每个填满的 block 计算其 token id 序列的 hash（结合 prev_block_hash 形成 chain）。命中条件是：block hash 完全一致，而不是语义相似或字符串相似。只要 tokenizer、token id 或顺序有任何差异，hash 就不同，cache miss。这也是为什么动态 system prompt（含时间戳）会导致 prefix cache 失效。"
+    },
+    {
+      "type": "choice",
+      "prompt": "vLLM 的 Pipeline Parallelism（PP）与 Tensor Parallelism（TP）的主要区别是什么？",
+      "options": [
+        "PP 把模型权重按列切分，TP 把权重按行切分",
+        "PP 把模型层切分到不同 GPU（每卡负责若干层），TP 把单层内的计算切分到多卡（矩阵列/行切分）",
+        "PP 适合小模型，TP 适合大模型",
+        "PP 不需要 GPU 间通信，TP 需要 all-reduce"
+      ],
+      "answer": 1,
+      "explain": "TP 是层内并行：单层 GEMM 按列/行切开，每卡计算部分结果后 all-reduce 合并，通信发生在每层内部（2L 次）。PP 是层间并行：前 N/2 层在 GPU 0，后 N/2 层在 GPU 1，GPU 0 算完把激活传给 GPU 1，通信发生在层间（每个 micro-batch 2 次）。PP 适合单机多节点，TP 要求高带宽 NVLink。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 vLLM 的量化方案与其 kernel 路径匹配：",
+      "left": ["AWQ W4A16", "GPTQ W4A16（H100）", "FP8 W8A8（H100）", "INT8 SmoothQuant"],
+      "right": ["scale fuse 进前一层，推理时接近零反量化开销，走 Machete/Marlin kernel", "Hessian 补偿量化权重，走 Machete（H100）kernel 避免反量化 fallback", "H100 Tensor Core 原生 FP8 matmul，KV Cache 可同时用 FP8 存储", "激活迁移后 INT8 matmul，适合 A100 大规模部署"],
+      "explain": "四条量化路径在 kernel 层各有归宿：AWQ 靠 scale fuse；GPTQ 靠 Machete/Marlin；FP8 靠 H100 原生 TC；INT8 SmoothQuant 靠迁移激活异常值后的标准 INT8 matmul。每条路径的性能都依赖底层 kernel 支持，走 fallback 会慢甚至比 BF16 更慢。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 vLLM 的 `chunked prefill` 中，`max_num_batched_tokens=4096`，当前 decode 队列有 512 个 seq（每个占 1 token），新来一个 8000 token 的 prompt。这一步 prefill 最多处理多少 token？",
+      "options": [
+        "8000 token（整个 prompt 一次处理）",
+        "4096 token（decode 和 prefill 共享 budget，512 decode + 3584 prefill）",
+        "3584 token（4096 - 512 decode token）",
+        "512 token（chunked prefill 固定 chunk size）"
+      ],
+      "answer": 2,
+      "explain": "token budget = max_num_batched_tokens = 4096。512 个 decode seq 各占 1 token = 512 token。剩余 budget = 4096 - 512 = 3584 token 分配给 prefill chunk。prompt 8000 > 3584，本步只处理 3584 token，剩余 4416 token 在后续步骤继续处理。注意选项 B（4096）是总 budget，选项 C（3584）才是 prefill chunk 大小，答案是 C。",
+      "answer": 2
+    },
+    {
+      "type": "judge",
+      "prompt": "vLLM V1 引擎通过把 Python scheduler 的 per-step 开销降到接近零，使得小 batch 场景下的 GPU 利用率显著提升。",
+      "answer": true,
+      "explain": "vLLM V0 的 Python scheduler 在每个 decode step 都有较大 Python overhead（GIL、对象分配、日志等），在小 batch 或高 QPS 时成为瓶颈。V1 的核心目标是「零 Python overhead」：把 scheduling 热路径移出 Python GIL，用 shared memory 和 C++ 实现，让 GPU 连续执行而不被 Python 调度插入空隙。"
+    },
+    {
+      "type": "input",
+      "prompt": "vLLM 在多 GPU 场景下，Expert Parallelism（EP）主要用于哪类模型架构？（填架构类型的中文名或英文缩写）",
+      "accept": ["MoE", "Mixture of Experts", "混合专家", "moe"],
+      "explain": "Expert Parallelism（EP）把不同 Expert 切分到不同 GPU 上，每个请求只激活其中少数 Expert，由路由决定哪些 GPU 参与计算。EP 专为 MoE（Mixture of Experts）架构设计，如 Mixtral、DeepSeek-MoE 等。稠密模型（如 LLaMA）不需要 EP，用 TP/PP 切分权重矩阵即可。"
+    },
+    {
+      "type": "choice",
+      "prompt": "vLLM 的 `--gpu-memory-utilization` 参数（默认 0.90）控制什么？设置过高（如 0.99）会有什么风险？",
+      "options": [
+        "控制 GPU SM 的利用率上限，设置过高会导致 kernel 排队延迟",
+        "控制 vLLM 初始化时为 KV Cache 预留的显存比例，设置过高时 CUDA 框架本身（激活、图捕获等）可能 OOM",
+        "控制每个请求最大使用的显存量，超出后自动截断",
+        "控制 prefill 时允许的最大 batch size"
+      ],
+      "answer": 1,
+      "explain": "`--gpu-memory-utilization` 决定 vLLM 在初始化时用多少比例的 GPU 显存来分配 KV Cache block pool（模型权重之外的剩余）。设置过高（如 0.99）时，CUDA context、激活张量、CUDA Graph 捕获的临时 buffer 等系统用途没有足够空间，容易 OOM。默认 0.90 留 10% 给系统开销是经验值。"
+    },
+    {
+      "type": "judge",
+      "prompt": "vLLM 的 EAGLE speculative decoding 相比 Draft model 方案，不需要额外训练独立的小模型，因为它从目标模型的 hidden state 预测草稿 token。",
+      "answer": true,
+      "explain": "EAGLE（Extrapolation Algorithm for Greater Language-model Efficiency）利用目标模型自身的 hidden state 作为输入特征，用一个轻量的「预测头」生成草稿 token，不需要单独训练和维护独立的小模型。相比 Draft model 方案，EAGLE 减少了模型管理复杂度，且草稿质量通常更高（acceptance rate 更高），在 vLLM 中是推荐的 speculative decoding 路径之一。"
+    }
+  ],
+  "u6-l6": [
+    {
+      "type": "choice",
+      "prompt": "SGLang 的 `sgl.select(name, choices)` 和普通 LLM 自由生成的本质区别是什么？",
+      "options": [
+        "select 只能处理单字符选项，自由生成没有限制",
+        "select 在解码时用 constrained FSM 只允许合法选项的 token，首个分歧 token 即可决定分支，效率比逐 token 自由生成高",
+        "select 会并行生成所有 choices 再选概率最高的",
+        "select 调用的是不同的模型权重"
+      ],
+      "answer": 1,
+      "explain": "sgl.select 利用 constrained decoding：在 vocabulary 上屏蔽所有不属于任何合法 choice 前缀的 token，通常在第一个分歧 token 处就能确定选哪个 choice，无需生成整个 choice 字符串再判断。与 jump-forward 配合，结构化约束不仅不慢，反而更快（减少解码步数）。"
+    },
+    {
+      "type": "judge",
+      "prompt": "SGLang 的 RadixAttention 在内存紧张时，会优先驱逐 radix tree 中「树根附近」（共享前缀最长）的节点，因为这些节点最「热」。",
+      "answer": false,
+      "explain": "RadixAttention 的驱逐策略恰恰相反：优先驱逐「叶子节点」而非树根节点。叶子是最少被共享的部分（只被一个或少数 seq 引用），驱逐代价最小；树根的共享前缀被大量 seq 共享，驱逐会导致大量 cache miss，代价极高。这和 OS 分页的 working set 原则一致。"
+    },
+    {
+      "type": "input",
+      "prompt": "SGLang 的 `--chunked-prefill-size` 参数控制什么？（填核心作用的关键词，中文）",
+      "accept": ["每步prefill的最大token数", "每步 prefill 的最大 token 数", "prefill分块大小", "prefill 分块大小", "chunked prefill大小", "单次prefill块大小"],
+      "explain": "`--chunked-prefill-size`（默认 512 或 1024）控制每个调度步中，单个 prefill 请求最多处理多少 token。长 prompt 被切成多个 chunk，每步只处理 chunk_size 个 token，避免长 prefill 独占 forward 阻塞 decode 请求的 ITL。这和 vLLM 的 `max_num_batched_tokens` 类似，但具体语义略有差异。"
+    },
+    {
+      "type": "choice",
+      "prompt": "SGLang 的 `constrained_decoding` 使用 FSM（有限状态机）驱动 JSON schema 输出。当模型输出一个 `{` 字符后，FSM 的作用是什么？",
+      "options": [
+        "FSM 记录 `{` 的位置，用于最终输出格式化",
+        "FSM 转移到新状态，并动态更新 logit mask，只允许符合 JSON object 语法的后续 token（字段名、`}`、空白等）",
+        "FSM 触发一次 prefill 重新处理整个 prompt",
+        "FSM 把 `{` 从输出中删除，防止 JSON 格式错误"
+      ],
+      "answer": 1,
+      "explain": "FSM 的每个状态对应 JSON 语法的一个解析位置，输出一个 token 后 FSM 转移状态，新状态决定哪些 token 是合法下一步（logit mask 只允许合法 token 有非零概率）。这保证了输出在语法层面一定是合法 JSON，且减少了因格式错误而重试的概率，整体 token 数也因 jump-forward 而减少。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 SGLang 的场景与其相对 vLLM 的优势程度匹配：",
+      "left": ["Agent 多步 tool-use，共享 system prompt + tool schema", "单轮问答，每次请求 prompt 完全不同", "并行采样同一 prompt 的 5 个候选（fork）", "输出强制符合 JSON schema 的结构化生成"],
+      "right": ["优势最大：RadixAttention 复用共享前缀 KV，fork/join 减少重复计算", "优势最小：无共享前缀可复用，RadixAttention 无额外收益", "优势明显：fork 后所有分支共享公共 prefix KV，节省显存和 prefill", "有明显优势：jump-forward + FSM 减少实际解码步数，输出格式有保证"],
+      "explain": "SGLang 的优势集中在「高前缀复用 + 结构化输出 + 多分支并行」场景。单轮完全不同的 prompt 无前缀可复用，SGLang 和 vLLM 差异不大甚至不如后者简单。选型时优先看业务是否有这些特征。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 SGLang 中，`--mem-fraction-static` 参数的作用与 vLLM 的哪个参数最类似？",
+      "options": [
+        "vLLM 的 `--max-num-batched-tokens`",
+        "vLLM 的 `--gpu-memory-utilization`",
+        "vLLM 的 `--block-size`",
+        "vLLM 的 `--speculative-num-steps`"
+      ],
+      "answer": 1,
+      "explain": "SGLang 的 `--mem-fraction-static` 控制为 KV Cache 等静态分配预留多少比例 GPU 显存（默认 0.88），等价于 vLLM 的 `--gpu-memory-utilization`（默认 0.90）。两者都是「模型权重加载后，剩余显存中分多少给 KV pool」的控制旋钮，设置过高都可能导致 CUDA 系统开销 OOM。"
+    },
+    {
+      "type": "judge",
+      "prompt": "SGLang 的 `cache-aware scheduling`（Longest-Shared-Prefix-First）在高负载时可能让某些「无缓存前缀」的新请求等待时间变长，这是公平性与效率之间的权衡。",
+      "answer": true,
+      "explain": "Longest-Shared-Prefix-First 调度优先处理与当前缓存前缀匹配最长的请求，以最大化 prefix cache 命中率和吞吐。但完全没有匹配前缀的新请求会被反复跳过，导致饥饿（starvation）。实际部署中需要加入老化机制（aging factor）或超时保底，防止新请求无限等待，这是效率与公平性的经典权衡。"
+    },
+    {
+      "type": "choice",
+      "prompt": "下列哪个 SGLang 特性在使用 OpenAI 兼容的 `/v1/chat/completions` 接口时可以获得（即使用标准 API）？",
+      "options": [
+        "sgl.fork() 的多分支并行生成",
+        "jump-forward decoding 对结构化输出的加速（无需特殊 API）",
+        "sgl.gen() 的显式 pipeline 控制",
+        "sgl.join() 的分支聚合"
+      ],
+      "answer": 1,
+      "explain": "jump-forward decoding 是 SGLang runtime 在解码层面的内部优化——当 constrained decoding 的 FSM 确定某些 token 必然出现时，直接跳过这些步骤。这发生在 server 内部，客户端用标准 `/v1/chat/completions` 接口并指定 `response_format: {\"type\": \"json_object\"}` 即可享受这一加速。而 fork/join 是 frontend language 的概念，必须用 SGLang Python SDK。"
+    },
+    {
+      "type": "input",
+      "prompt": "SGLang 多副本部署时，router 需要感知每个副本当前持有哪些 prefix 的 KV cache，才能做 prefix-aware 路由。这种感知机制通常通过副本定期上报什么信息实现？（填关键术语）",
+      "accept": ["prefix tree", "radix tree", "prefix tree summary", "KV cache summary", "cache状态", "cache 状态"],
+      "explain": "SGLang router 实现的 prefix-aware 路由需要每个副本周期性上报自己当前 radix tree（prefix tree）的摘要（summary），router 根据新请求的 prefix 和各副本的 tree 状态匹配，选择「真正有该 prefix 缓存」的副本。这比一致性哈希更精确，但需要副本与 router 之间的心跳协议。"
+    },
+    {
+      "type": "choice",
+      "prompt": "SGLang 在结构化输出（如 JSON schema）场景下，相对直接 prompt 工程（prompt 中写「请输出合法 JSON」）的核心优势是什么？",
+      "options": [
+        "SGLang 能让模型理解 JSON 格式，而 prompt 工程做不到",
+        "SGLang 用 FSM 在解码层硬约束输出合法性，保证 100% 格式正确，而 prompt 工程依赖模型遵从指令，仍有格式错误概率",
+        "SGLang 的 JSON 输出速度比自由生成快 10x",
+        "SGLang 不需要额外的 JSON 校验步骤，而 prompt 工程需要"
+      ],
+      "answer": 1,
+      "explain": "Prompt 工程依赖模型能力（instructability），格式错误率在复杂 schema 下仍可达 5–20%，需要重试或后处理。SGLang 的 FSM constrained decoding 在 logit 层屏蔽非法 token，数学上保证输出是合法格式，格式错误率降到 0%（schema 层面），减少重试成本和下游解析失败。"
+    }
+  ],
+  "u6-l7": [
+    {
+      "type": "choice",
+      "prompt": "TRT-LLM 的 `trtllm-build` 命令在执行时需要绑定哪些关键参数？（选出包含最完整必要参数的选项）",
+      "options": [
+        "只需要模型路径和输出路径",
+        "模型路径、GPU 型号（通过运行环境自动检测）、max_batch_size、max_input_len、max_seq_len、dtype、量化配置",
+        "只需要 dtype 和量化方法，其他参数有默认值",
+        "模型路径和 TP degree，其他参数 TRT-LLM 会自动推断"
+      ],
+      "answer": 1,
+      "explain": "TRT-LLM 构建 engine 时需要明确指定所有影响计划的参数：shape range（max_batch_size、max_input_len、max_seq_len）、数据类型、TP/PP degree、量化配置等。这些参数会被「烧入」engine，运行时超出范围就需要重建。这也是 TRT-LLM 维护成本的主要来源。"
+    },
+    {
+      "type": "judge",
+      "prompt": "TRT-LLM 的 inflight batching 与 vLLM 的 continuous batching 在语义上等价——都是在每个 decode step 结束后立刻让完成的请求出队、新请求进队。",
+      "answer": true,
+      "explain": "两者的调度语义是等价的：每个 decode iteration 结束后重新组 batch，无需等整批完成。区别在于实现层：vLLM 是纯 Python scheduler + PagedAttention；TRT-LLM 的 inflight batching 由 C++ executor 管理，batch 管理在 engine 内部完成，Python GIL 开销更小，但灵活性也较低。"
+    },
+    {
+      "type": "input",
+      "prompt": "TRT-LLM 的 `KvCacheConfig` 中，控制是否允许不同请求共享相同前缀 KV block 的字段名是什么？（填英文字段名）",
+      "accept": ["enable_block_reuse", "block_reuse", "enable_kv_cache_reuse"],
+      "explain": "`enable_block_reuse=True` 开启 TRT-LLM 的 prefix KV cache 复用（类似 vLLM 的 prefix caching）。相同 token 前缀的 block 被多个请求共享，减少重复 prefill。这是 TRT-LLM KvCacheConfig 中最容易被遗漏的优化旋钮，默认不一定开启，需要显式配置。"
+    },
+    {
+      "type": "choice",
+      "prompt": "TRT-LLM 的 `gpt_attention_plugin` 相对纯 TensorRT 图的最核心优势是什么？",
+      "options": [
+        "gpt_attention_plugin 支持更多数据类型（如 INT2）",
+        "plugin 包含手写 CUDA kernel，支持 paged KV cache 的动态 block table 寻址，而纯 TRT 图无法在 static graph 内表达动态内存管理",
+        "plugin 可以在 CPU 上运行，节省 GPU 资源",
+        "plugin 比 TRT 图调度更快，因为少了一层抽象"
+      ],
+      "answer": 1,
+      "explain": "paged KV cache 的核心是动态 block table——每步 attention 需要通过 block table 间接寻址，这不是 TensorRT 的静态图可以直接表达的（TRT 图的 tensor 形状和内存布局在构建时就确定）。plugin 通过自定义 CUDA kernel 绕过 TRT 图的静态约束，在 kernel 内实现动态寻址、inflight batching 的变长 batch 处理等。"
+    },
+    {
+      "type": "match",
+      "prompt": "将 TRT-LLM 的并行策略与其适用场景匹配：",
+      "left": ["TP（Tensor Parallelism）", "PP（Pipeline Parallelism）", "EP（Expert Parallelism）"],
+      "right": ["单节点多 GPU，NVLink 带宽足够，追求单次请求最低延迟", "跨节点多机，通过 micro-batch 流水线隐藏层间通信延迟，适合吞吐优先场景", "MoE 模型，不同 Expert 分布在不同 GPU，每 token 只激活少数 Expert"],
+      "explain": "TP 每层内通信（all-reduce），要求高带宽 NVLink，适合单节点；PP 层间通信，可跨节点，延迟较高但适合超大模型；EP 专为 MoE 设计，减少每卡需要存储的 Expert 数量，提高 Expert 利用率。三种并行可以组合（如 TP+PP），形成 3D 并行。"
+    },
+    {
+      "type": "choice",
+      "prompt": "TRT-LLM 的 `ModelOpt` 工具在量化流程中的主要作用是什么？",
+      "options": [
+        "ModelOpt 是运行时的量化执行器，在 inference 时动态量化激活",
+        "ModelOpt 在 build 之前对模型做 PTQ 校准、量化并导出带量化信息的 checkpoint，再由 trtllm-build 生成专门化 engine",
+        "ModelOpt 只做模型格式转换（HuggingFace → TRT-LLM 格式），不涉及量化",
+        "ModelOpt 是 TRT-LLM 的 Python 调度器，管理 inflight batching"
+      ],
+      "answer": 1,
+      "explain": "TRT-LLM 量化是两阶段流程：ModelOpt 做 PTQ 校准（SmoothQuant/FP8/INT4 AWQ 等），生成带 scale/zero point 的量化 checkpoint；`trtllm-build` 读取这个 checkpoint，在编译 engine 时把量化配置烧入，生成利用硬件 FP8/INT8 Tensor Core 的专门化 engine。两阶段分离使得量化策略和 engine 构建可以独立迭代。"
+    },
+    {
+      "type": "judge",
+      "prompt": "TRT-LLM 的 `host_cache_size` 配置开启后，GPU 显存不足时 KV block 会自动 offload 到 CPU 内存，恢复时再拷回 GPU，整个过程对用户透明。",
+      "answer": true,
+      "explain": "`host_cache_size` 开启 KV Cache 的 CPU offload（类似 mini-vLLM 的 swap-to-CPU），GPU KV pool 满时自动把部分 block 搬到 CPU 内存，当 GPU 显存恢复时再拷回。整个过程对推理结果没有影响（KV 内容不变），对用户透明，但会引入 PCIe 传输延迟，影响相关请求的 TPOT。需要权衡 OOM 风险和 latency SLO。"
+    },
+    {
+      "type": "choice",
+      "prompt": "在 TRT-LLM 中，修改模型的 `max_input_len`（如从 4096 扩展到 8192）需要做什么操作？",
+      "options": [
+        "修改配置文件中的参数后重启服务即可生效",
+        "必须重新运行 `trtllm-build` 生成新的 engine，因为 shape range 是 build 期参数，烧入了 engine",
+        "只需要更新 Triton model config，不需要重新 build engine",
+        "通过 vLLM 兼容层可以动态调整，无需重新 build"
+      ],
+      "answer": 1,
+      "explain": "`max_input_len` 是 TRT-LLM build 期参数，决定了 engine 内部各算子的 shape range（TensorRT 会为每个 shape 编译专门的 kernel 实现）。改变这个参数必须重新 trtllm-build，生成新的 .engine 文件。这是 TRT-LLM 「灵活性低于 vLLM」的核心原因——模型或 shape 变化都触发重新编译。"
+    },
+    {
+      "type": "input",
+      "prompt": "TRT-LLM 的 `custom_all_reduce` plugin 在什么 GPU 互联条件下能带来显著收益？（填关键词）",
+      "accept": ["NVLink", "nvlink", "NVLink 高带宽", "高带宽 NVLink"],
+      "explain": "`custom_all_reduce` plugin 专为 NVLink 高带宽互联设计，通过 SM 直接访问对端显存（Peer-to-Peer）绕过传统 NCCL 的 ring/tree 路由开销，在 TP=2/4/8 的单节点 NVLink 拓扑下延迟更低。通过 PCIe 互联的多 GPU 或跨节点 InfiniBand 场景下，custom_all_reduce 不一定有优势，NCCL 可能反而更快。"
+    },
+    {
+      "type": "choice",
+      "prompt": "TRT-LLM 使用 Lookahead speculative decoding 在高并发（200 QPS）chatbot 场景下吞吐下降 9% 的根本原因是什么？",
+      "options": [
+        "Lookahead 的草稿 acceptance rate 太低，频繁回退增加了重算开销",
+        "高并发时 GPU batch 已经接近满载，Lookahead 增加的每步计算量让 batch 更拥挤，排队延迟反而升高，goodput 下降",
+        "Lookahead 不支持 inflight batching，两者冲突导致 GPU 效率下降",
+        "高并发时 Lookahead 需要额外的模型副本，显存不足触发 OOM"
+      ],
+      "answer": 1,
+      "explain": "Speculative decoding 的收益来自「减少 decode 步数」，但代价是「每步计算量更大（验证多个候选）」。高并发时 GPU 已经接近满算力，每步额外计算量导致单步时间变长、队列中等待请求增多，实际 goodput 反而下降。Speculative decoding 更适合低并发、decode 是明显瓶颈的场景（如单用户长输出），不适合高并发生产服务。"
+    }
+  ],
+  "u6-l8": [
+    {
+      "type": "choice",
+      "prompt": "多租户推理平台中，「reserved quota」和「burst quota」的主要区别是什么？",
+      "options": [
+        "reserved 按小时计费，burst 按分钟计费",
+        "reserved 是租户任意时刻都保证能用的基础配额，burst 是在平台有空余容量时可临时超用但无保证的额外配额",
+        "reserved 只适用于 prefill，burst 只适用于 decode",
+        "reserved 由租户自助申请，burst 需要平台管理员审批"
+      ],
+      "answer": 1,
+      "explain": "reserved quota 有资源保证（SLA 承诺的可用量），平台必须为其预留容量；burst quota 是「尽力而为」，只有平台整体有空余时才能用，高峰期会被其他租户的 reserved 请求抢走。正确理解二者差异是设计租户合同和容量规划的基础。"
+    },
+    {
+      "type": "judge",
+      "prompt": "在多租户平台中，对不同租户设置独立的「模型副本池」（硬隔离）是消除 noisy neighbor 问题最彻底的方案，但代价是 GPU 利用率通常下降。",
+      "answer": true,
+      "explain": "硬隔离（每租户独立副本）在物理层面消除了租户间的 KV Cache 争用、队列争用和 prefix cache 污染，noisy neighbor 影响归零。代价是：每个租户的副本必须为该租户的峰值预留，低谷期 GPU 空闲，整体利用率下降。这是隔离与资源效率的经典权衡，多租户设计本质上是在这两个目标之间找平衡点。"
+    },
+    {
+      "type": "input",
+      "prompt": "多租户成本治理中，「输入 token」计费通常低于「输出 token」，两者的合理单价比例大约是 1:X，X 约为多少？（填整数）",
+      "accept": ["4", "3", "5", "3到5"],
+      "explain": "输出 token（decode）是 memory-bandwidth-bound，每 token 需要一次完整的权重读取（约等于整个模型参数量的带宽消耗）；输入 token（prefill）因为批处理可以均摊权重读取，单 token 计算成本更低。实践中输出 token 单价通常是输入 token 的 3–5 倍（如 OpenAI GPT-4o: 输入 $2.5/M，输出 $10/M，比约 1:4）。"
+    },
+    {
+      "type": "choice",
+      "prompt": "某租户被识别为 noisy neighbor，表现为其批量长 prompt 请求导致同池其他租户 TTFT P99 升高 600ms。最先应该采取哪个控制面动作？",
+      "options": [
+        "立即下线该租户所有副本，等问题排查完再上线",
+        "对该租户的长 prompt 请求实施速率限制（rate limit）或队列优先级降级，短期控制影响；同时评估是否需要长短 prompt 分池",
+        "增加整体 GPU 副本数量，让长 prompt 有足够资源",
+        "要求该租户修改业务代码，不允许发送超过 1000 token 的 prompt"
+      ],
+      "answer": 1,
+      "explain": "正确的干预顺序是：先用控制面动作（rate limit、队列优先级降级）快速减少影响，不破坏服务可用性；同时收集数据评估是否需要结构性修复（长短 prompt 分池、专用副本池）。直接下线租户影响其 SLA；加副本是正确的但需要时间；要求修改代码不现实且不是平台侧能做的。"
+    },
+    {
+      "type": "match",
+      "prompt": "将下列 GPU 利用率相关指标与其含义匹配：",
+      "left": ["SM Active（GPU utilization）", "MFU（Model FLOP Utilization）", "KV Cache 利用率", "Goodput"],
+      "right": ["SM 在采样点是否有 warp 在执行，90% 不代表计算有效", "实际 TFLOPS / 硬件峰值 TFLOPS，衡量算力有效利用", "当前 KV block 使用量 / 总 KV block 数，过高说明接近 admission 上限", "满足 SLO 的请求吞吐，是成本治理的最终优化目标"],
+      "explain": "四个指标各测不同层次：SM Active 看 GPU 忙不忙（但空转也算 active）；MFU 看算力利用效率；KV Cache 利用率看显存压力；Goodput 看真正有价值的产出。成本治理要四个联合看，单看任何一个都可能误判。"
+    },
+    {
+      "type": "judge",
+      "prompt": "Spot 实例适合用来处理对延迟敏感、有用户等待的在线推理请求，因为其成本只有按需实例的 30–70%。",
+      "answer": false,
+      "explain": "Spot 实例随时可能被云厂商抢占（通常提前 2 分钟通知），服务中断概率较高。这对在线推理（用户正在等待、有 SLO 约束）是不可接受的。Spot 适合容错性强的离线批推理（可以 checkpoint 重启）或离线评测，不适合在线服务。按需实例或 committed use 合同才是在线推理的合理选择。"
+    },
+    {
+      "type": "choice",
+      "prompt": "多租户平台实施 chargeback 后，最常见的行为改变是什么？",
+      "options": [
+        "租户会申请更多配额，因为有了明确的预算依据",
+        "租户开始关注输出 token 数量，主动缩短 max_tokens、使用更小模型或压缩 system prompt，降低自身成本",
+        "租户会切换到竞争对手平台，因为成本透明后发现平台太贵",
+        "租户会增加请求并发，因为单价降低后总成本没有变化"
+      ],
+      "answer": 1,
+      "explain": "Chargeback 让成本变得可见并与团队预算挂钩，租户开始有动力优化使用方式：缩短输出（输出 token 比输入贵 3–5 倍）、使用更小/更便宜的模型、合并请求减少固定开销、压缩 system prompt。这是 chargeback 相比 showback 的额外价值——不只是展示成本，而是真正改变行为。"
+    },
+    {
+      "type": "input",
+      "prompt": "多租户平台中，防止某一租户独占大量 GPU 计算时间、影响其他租户的机制通常叫做什么？（填中文或英文关键词）",
+      "accept": ["速率限制", "rate limit", "rate limiting", "限流", "token bucket", "令牌桶", "quota", "配额"],
+      "explain": "速率限制（rate limiting）是多租户公平性的基础机制，通常用令牌桶（token bucket）或漏桶算法实现，对每个租户的 QPS、token/s 或 GPU 计算时间进行上限控制。超过速率的请求被排队或拒绝（429），防止单租户突发流量影响其他租户的 SLA。"
+    },
+    {
+      "type": "choice",
+      "prompt": "平台统计显示某时段 GPU SM Active 为 85%，但 Goodput 只有设计目标的 40%。最可能的解释是什么？",
+      "options": [
+        "GPU 驱动版本过旧，导致计算效率低下",
+        "大量请求在排队等待或因 SLO 超时而失效，GPU 在为「注定超时」的请求做无效计算；SM 忙碌但产出不是有效 token",
+        "模型量化精度太低，导致输出 token 质量不合格被过滤掉",
+        "网络带宽不足，token 无法及时传回客户端，积累在发送队列中"
+      ],
+      "answer": 1,
+      "explain": "SM Active 高说明 GPU 在做计算，但 goodput 低说明这些计算没有转化为有价值的输出。典型场景：高负载时队列积累，大量请求在等待时已经超过客户端超时，GPU 为这些「僵尸请求」继续计算（产出 token 但客户端已断连），goodput 为 0。需要 admission control 在入队时就估计能否在 deadline 前完成。"
+    },
+    {
+      "type": "choice",
+      "prompt": "TCO（总拥有成本）分析中，On-Prem GPU 集群相对云端 GPU 的主要优势在哪种利用率模式下最显著？",
+      "options": [
+        "利用率在 10–30% 波动，有大量空闲时间",
+        "利用率长期稳定在 70% 以上，能够持续分摊硬件折旧和人力运维成本",
+        "利用率极高（>95%），接近满载运行",
+        "利用率完全不可预测，每天波动在 5–90% 之间"
+      ],
+      "answer": 1,
+      "explain": "On-Prem 的成本是固定的（硬件折旧 + 人力 + 机房能耗），只有利用率长期稳定在足够高时（通常 >70%），单位 token 成本才低于云端按需计费。利用率低时，大量空闲硬件不产生收益但持续产生成本，TCO 反而比云端更高。On-Prem 的「优势区间」是持续高利用率场景，否则云端弹性扩缩的灵活性更划算。"
+    }
+  ]
+}

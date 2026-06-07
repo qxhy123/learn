@@ -1,0 +1,118 @@
+[
+  {
+    "id": "u6c4",
+    "title": "Mini-vLLM 实验：从零写推理引擎",
+    "subtitle": "把 PagedAttention 变成可读可跑的代码",
+    "intro": [
+      {
+        "title": "为什么要手写一个迷你推理引擎",
+        "body": "读文档和论文能建立概念，但「PagedAttention 把 KV Cache 切成 block」「continuous batching 每步重组 batch」这类描述，直到你亲手把代码跑通之前都是抽象的。Mini-vLLM 是一个几百行 Python 的**语义参考实现**：用纯 PyTorch reference attention（慢但绝对正确），在 TinyLlama-1.1B 上实现 PagedAttention、continuous batching、prefix caching、chunked prefill、swap 和 streaming，并通过 HF transformers parity check 验证正确性。\n\n它不追求性能——reference attention 比真实 CUDA kernel 慢 50–100x。它追求的是**架构对得上**：读完 mini-vLLM 后再去看真实 vLLM 源码，每个核心数据结构都能认出来。\n\n代码结构：`block_manager.py`（KV 块管理）、`scheduler.py`（调度器）、`cache_engine.py`（KV tensor 池）、`model_runner.py`（组 batch + forward）、`engine.py`（顶层 generate）、`sampler.py`（采样）。"
+      },
+      {
+        "title": "PagedAttention：像操作系统分页一样管理 KV Cache",
+        "body": "不用 PagedAttention 的朴素实现会立刻撞到三堵墙：\n1. **过度预留**：不知道请求会生成多长，按 max_seq_len 分配，99% 的空间永远闲置\n2. **碎片化**：多请求并发时，中间空间被锁住，新请求无法塞进来\n3. **共享前缀失效**：100 个请求用相同 system prompt，K/V 被算了 100 遍，存了 100 份\n\nPagedAttention 一句话：**把 KV Cache 切成固定大小的 block（默认 16 token），让 attention kernel 通过 block table 间接寻址，允许同一 logical sequence 的 K/V 散落在不连续的物理 block 上。**\n\n| OS 虚拟内存 | PagedAttention |\n|-------------|----------------|\n| 进程 | 一个生成请求（Sequence） |\n| 虚拟地址 | seq 内的 token 位置 |\n| 物理页 | 物理 block（PhysicalBlock） |\n| 页表 | BlockTable |\n| 页大小 | block_size（默认 16） |\n| CoW | 引用计数 + copy-on-write |\n| Swap | swap-to-CPU |",
+        "steps": [
+          "BlockManager 核心接口：can_allocate / allocate / append_slot / free",
+          "slot_mapping：把抽象 token 位置映射到物理写入地址（block_id × block_size + offset）",
+          "CacheEngine 持有大张量：shape = (num_blocks, num_kv_heads, head_dim, block_size)，最后一维是 block_size 以便 contiguous load",
+          "PhysicalBlock 有三个关键字段：block_id、ref_count、block_hash（prefix cache 用）"
+        ]
+      },
+      {
+        "title": "Continuous Batching 调度器：只改一个文件",
+        "body": "朴素调度在 running 非空时拒绝接新请求——一个 8K 长 prompt 占着不放，后到的短请求全都等。生产上 P99 TTFT 会直接爆。\n\n**Continuous batching 的改动**：`schedule()` 主循环在处理完 running 队列后，如果还有 token budget，立刻从 waiting 队首拉新请求加入这一步的 batch。Token budget（`max_num_batched_tokens`，默认 2048）控制每步能用多少 token：每个 decode 请求占 1，每个 prefill 请求占其 chunk_len。\n\n**关键洞察**：model_runner 和 attention kernel 在 Plan 1 就已经设计成支持混合 batch（`prefill_seq_lens` 是数组，可以同时容纳多条 seq）。这是为什么 continuous batching **只改 scheduler 一个文件**——Plan 1 接口已经为它准备好了。\n\n调度器还要处理边角案例：新请求进来但 KV 显存不够（admission control + preemption）；某 decode 请求显存告急（swap 或 recompute）；一个超长 prompt 进来（chunked prefill 切片）。"
+      },
+      {
+        "title": "Chunked Prefill：数学正确性的关键",
+        "body": "长 prompt 阻塞 decode 的场景：已有 4 个 seq 在 decode，来了一个 8000 token 的 prompt。如果 token budget 是 2048，8000 > 2048，这个 prompt 不被 admit，一直等到所有 running seq 跑完——TTFT = 已有 seq 全部完成的时间。\n\n解法：把长 prompt 切片，每步只算 `chunked_prefill_size`（默认 512）个 token + 当前 decode tokens，共享 budget。\n\n**数学正确性的关键**：切片之后的第二个 chunk 必须能 attend 到第一个 chunk 已写入 cache 的 K/V。prefill kernel 的 causal mask 计算：`mask[q, kv] = 0 if kv <= n_cached + q else -inf`，其中 `n_cached` 是之前已缓存的 token 数。\n\n- n_cached=0：普通的 causal triangular mask\n- n_cached>0：新 chunk 完全可见 prior 部分，自身仍 causal\n\n这一行 mask 计算就是 chunked prefill + prefix caching 共用的数学基础。",
+        "tip": "mini-vLLM 的测试 test_prefill_chunked_matches_unchunked 验证：把 length=8 的 prompt 分成任意 chunk（5+3、1+1+...+1），逐位置输出完全相同。这个测试是 chunked prefill 正确性的根基，也是整个 attention kernel 设计是否正确的核心检验。"
+      },
+      {
+        "title": "Prefix Caching + Copy-on-Write",
+        "body": "100 个请求用相同的 system prompt，朴素 vLLM 算 100 遍 K/V，显存里存 100 份。Prefix caching 共享这 100 份为 1 份。\n\n**实现：Block Hash Chain**\n```\n_hash_block(prev_hash, token_ids) = hash((prev_hash, token_ids))\n```\n每当一个 block 被填满（block_size 个 token 写入），计算 hash 入表；只对填满的 block 计 hash，部分填的最后一个 block 不参与共享（内容未定）。\n\n新请求来时，按前缀扫 hash table：命中的 block 引用计数 +1，只对剩余未命中部分分配新 block，`num_prefilled` 跳过已命中长度——这段不需要走 forward。\n\n**引用计数 + Evictable cache**：ref_count→0 的 block 不立刻回收，而是进入 evictable list（LRU/FIFO）。下次相同 prefix 来时直接复用；显存不够时才驱逐最老的 cached block。\n\n**「保留至少 1 个 fresh token」规则**：如果 prompt 完全是 cached prefix，`num_prefilled == num_prompt_tokens`，没有 token 走 forward，就没有 logit 用来 sample。解法：全命中时主动丢掉最后一个 cached block，保证至少 1 个 fresh token。\n\n**Copy-on-Write（CoW）**：`append_slot` 检测 `ref_count > 1` 时返回 `(src, dst)`，让 runner 复制 K/V 数据。这保证 decode 写入新 token 时不会污染共享的 prefix block。"
+      },
+      {
+        "title": "Swap to CPU：显存超订阅的安全网",
+        "body": "当 GPU pool 满了，有三个选择：\n1. **Reject**：直接拒绝，影响 SLA\n2. **Recompute**：把某 seq 的 KV 全丢掉，恢复时重走 prefill（短 prompt 最便宜）\n3. **Swap to CPU**：把 GPU block 拷到 CPU pool 暂存，腾出显存后再拷回\n\nMini-vLLM 实现 swap 路径（swap out/swap in）：CacheEngine 维护 GPU + CPU 两个 KV tensor pool，layout 完全一致（只是 device 不同）；BlockManager 在双池间追踪 PhysicalBlock.device 字段。\n\n**关键约束：共享 block 不能 swap**。如果 swap 共享 block，其他仍在 GPU 上 running 的 seq 会找不到自己的 K/V。`can_swap_out(seq)` 会检查 seq 的所有 GPU block 的 ref_count，有 ref_count > 1 的直接返回 False。\n\nScheduler 的 LRU 抢占：running 队尾（最近 admit 的）倒着走找 victim，跳过不满足条件的。LRU swap victim 的选择：「最久没产生 token 的 seq」。\n\n**正确性验证**：swap 改变的是时序（blocks 在 GPU/CPU 间搬运），不改变数学（K/V 内容 bit-identical 经过 round-trip）——`test_e2e_swap_matches_no_swap_baseline` 断言大 GPU pool（swap 关）和小 GPU + 大 CPU（swap 自动触发）输出 token 相同。",
+        "reveal": {
+          "q": "在 mini-vLLM 的 prefix caching 实现中，为什么「只对填满的 block 计 hash，部分填的最后一个 block 不参与共享」？",
+          "a": "部分填的最后一个 block 还没有确定全部内容——decode 阶段还会继续往里写新 token。如果提前共享这个 block，其他请求引用了它，decode 写入时就会污染共享内容。只对填满（内容不再改变）的 block 计 hash 并参与共享，是防止 race condition 和内容污染的关键设计。共享 block 被多个 seq 引用后，如果某个 seq 要向其写入（decode 继续），必须触发 copy-on-write，复制到私有 block 再写。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "PagedAttention 的 `slot_mapping` 的作用是什么？",
+        "options": [
+          "决定哪些请求先进入 running 队列",
+          "把抽象的 token 位置（如 token 第 35 个）映射到物理 KV tensor 的扁平索引（block_id × block_size + offset）",
+          "把 KV Cache 从 GPU 搬运到 CPU",
+          "计算 attention 的 causal mask"
+        ],
+        "answer": 1,
+        "explain": "slot_mapping 是 BlockManager 和 attention backend 之间的接口：给定 token 的逻辑位置，通过 block_table 找到对应的 physical block，再加上 block 内偏移，得到 KV tensor 的扁平索引（block_id × block_size + offset）。attention backend 只需要这个整数索引，完全不需要知道 BlockTable 的内部布局。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在 mini-vLLM 的 continuous batching 实现中，为了支持混合 batch（prefill + decode 同时跑），需要同时修改 scheduler 和 model_runner 两个文件。",
+        "answer": false,
+        "explain": "model_runner 和 attention kernel 在 Plan 1（朴素调度阶段）就已经设计成支持混合 batch（prefill_seq_lens 是数组，可以同时容纳多条 seq）。continuous batching 只需要改 scheduler 一个文件——Plan 1 接口已经为它准备好了。这是「先设计好接口，再添加 feature」的典型好处。"
+      },
+      {
+        "type": "input",
+        "prompt": "在 chunked prefill 的 prefill kernel 中，当 n_cached=500（前 500 个 token 已缓存），正在处理 chunk 的第 3 个 query token（索引 2，绝对位置 502）时，它可以 attend 到 KV 的哪个位置范围？（填「KV 位置 0 到 N」的形式，N 填数字）",
+        "accept": ["KV 位置 0 到 502", "0到502", "0 到 502"],
+        "explain": "causal mask 规则：query 第 i 个 token（绝对位置 = n_cached + i）可以看到 KV [0, n_cached + i]。n_cached=500，i=2，绝对位置 = 502，可以 attend 到 KV 位置 0 到 502。新 chunk 完全可见 prior 缓存的部分（0–499），自身内部仍是 causal（502 位只看 500–502，不能看 503）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Prefix caching 的 hash chain 实现中，为什么只对「填满的 block」计 hash，而不对部分填的最后一个 block 计 hash？",
+        "options": [
+          "最后一个 block 的 token 数量不是 block_size 的倍数，hash 算法无法处理",
+          "部分填的 block 内容未定（decode 还会继续写入），提前共享会导致写入时污染其他引用该 block 的请求",
+          "hash 计算成本太高，只对完整 block 计算可以节省时间",
+          "最后一个 block 的内容和前面的 block 总是不同，不可能被共享"
+        ],
+        "answer": 1,
+        "explain": "部分填的最后一个 block 在 decode 阶段还会继续往里写新 token。如果提前共享这个 block，其他请求引用了它，decode 写入时就会污染共享内容，破坏其他请求的 K/V 正确性。只有填满（内容不再改变）的 block 才能安全共享。如果某 seq 需要向共享 block 写入，必须先触发 copy-on-write（CoW）复制到私有 block。"
+      },
+      {
+        "type": "judge",
+        "prompt": "mini-vLLM 实现的 swap-to-CPU 机制中，共享 prefix 的 block（ref_count > 1）也可以被 swap 出去，只要目标 CPU pool 有足够空间。",
+        "answer": false,
+        "explain": "`can_swap_out(seq)` 会检查 seq 的所有 GPU block 的 ref_count，有任何 ref_count > 1 的 block 直接返回 False——这个 seq 不能被 swap 出。原因：如果 swap 共享 block，其他仍在 GPU 上 running 的 seq 会找不到自己的 K/V，破坏正确性。这是 prefix caching 与 swap 互动的关键不变量。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 mini-vLLM 的组件与它对应的真实 vLLM 组件匹配：",
+        "left": ["block_manager.BlockManager", "scheduler.Scheduler", "cache_engine.CacheEngine", "backends/reference.py"],
+        "right": [
+          "vllm.core.block_manager.BlockSpaceManager / vllm.v1.core.kv_cache_manager.KVCacheManager",
+          "vllm.core.scheduler.Scheduler / vllm.v1.core.scheduler.Scheduler",
+          "vllm.worker.cache_engine.CacheEngine",
+          "vllm.attention.backends.abstract.AttentionBackend（数学语义）"
+        ],
+        "explain": "mini-vLLM 与真实 vLLM 的核心抽象一一对应：BlockManager 管理 KV block 的分配/回收/共享；Scheduler 做 iteration-level scheduling；CacheEngine 持有 KV tensor 池；reference backend 提供 PagedAttention 的数学语义（真实 vLLM 用 CUDA/Triton 高性能 kernel 实现同样语义）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "mini-vLLM 的 CacheEngine KV tensor 的 shape 是 `(num_blocks, num_kv_heads, head_dim, block_size)`，而不是 `(num_blocks, block_size, num_kv_heads, head_dim)`。为什么最后一维是 `block_size`？",
+        "options": [
+          "这是 PyTorch 的默认 tensor layout 要求",
+          "这让「读一整个 block 的 K/V」变成 contiguous load，真实 vLLM 的 CUDA kernel 依赖这个布局做 cache-line 友好读取",
+          "block_size 放最后可以节省显存",
+          "这是为了兼容 FlashAttention 的接口格式"
+        ],
+        "answer": 1,
+        "explain": "把 block_size 放在最后一维，读取一个 block 内 16 个 token 的某个 head 的 head_dim 维度时，数据是连续的（contiguous）。真实 vLLM 的 CUDA paged attention kernel 在沿 block_table 加载 KV tile 时，依赖这个布局做 coalesced memory access。layout 选择直接影响 HBM 带宽利用率，可以差 2–3x。"
+      },
+      {
+        "type": "judge",
+        "prompt": "mini-vLLM 的 test_e2e_swap_matches_no_swap_baseline 测试断言：在「小 GPU pool + 大 CPU pool，swap 自动触发」和「大 GPU pool，swap 关闭」两种配置下，相同输入的输出 token 完全一致。",
+        "answer": true,
+        "explain": "正确。swap 改变的是执行时序（blocks 在 GPU/CPU 之间搬运），不改变 K/V 内容的数值（bit-identical round-trip）。因此无论 swap 是否触发，最终的 attention 计算都使用完全相同的 K/V 值，生成的 token 序列应该一致。这个测试是验证 swap 实现正确性的核心保证。"
+      }
+    ]
+  }
+]

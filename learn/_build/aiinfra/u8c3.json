@@ -1,0 +1,133 @@
+[
+  {
+    "id": "u8c3",
+    "title": "安全、隔离与治理",
+    "subtitle": "最小权限 · Secrets 管理 · 模型安全 · 供应链 · Prompt Injection · 数据合规",
+    "intro": [
+      {
+        "title": "AI 平台的攻击面比普通服务更宽",
+        "body": "普通在线服务的关键安全面通常集中在：API 接口、数据库、用户认证。\n\nAI 平台还额外包括：\n- **训练数据**：可能含隐私或内部知识\n- **模型权重和 checkpoint**：既是核心资产，也是「可执行输入」\n- **镜像和依赖供应链**：Python 包、CUDA 库、系统库\n- **向量索引**：权限边界如果不对，检索会越界\n- **prompt 模板**：影响行为边界的配置代码\n- **日志中的用户输入与模型输出**：可能记录敏感内容\n\n这意味着：哪怕服务本身没有宕机，平台也可能在数据泄漏、权限越界或供应链污染上出问题。\n\n**安全**回答「什么不能被未授权访问或篡改」；**隔离**回答「故障和越权能否停在边界内」；**治理**回答「规则能否被平台自动执行、度量、追溯和修正」。",
+        "tip": "AI 平台的风险从来不只在「服务会不会挂」，还在「数据、模型、权限、成本和审计是否会一起失控」。"
+      },
+      {
+        "title": "身份与最小权限：不共享万能账号",
+        "body": "训练任务、在线服务、评测流水线、数据处理 Job 和 Notebook **不能共享一个万能账号**：\n- 共享账号让审计失效\n- 单点泄露变成全平台泄露\n\n**必须配置**：\n- 服务身份（K8s ServiceAccount、云 IAM Role）\n- 租户身份隔离\n- 短生命周期凭证\n- `RBAC` / `ABAC`，按数据集和模型仓库粒度授权\n\n**四层隔离**：\n1. **身份隔离**：谁能提交任务、访问模型、调用服务\n2. **资源隔离**：谁最多能占多少 GPU、显存和队列容量\n3. **数据隔离**：谁能访问哪些数据集、索引、日志\n4. **故障隔离**：一个租户故障不会拖垮全平台\n\n很多平台只做了第一层，后面三层依然靠约定维持——这通常是不够的。"
+      },
+      {
+        "title": "Secrets 管理：不入镜像、不入代码、不入明文环境变量",
+        "body": "AI 平台的 secrets 比普通服务更多，因为训练、评测、模型下载、外部大模型调用等都需要凭据。\n\n**核心原则（必须做到）**：\n> Secrets 不入镜像、不入代码、不入环境变量明文。\n\n环境变量经常通过 `kubectl describe`、错误栈、调试页面、进程转储和日志系统扩散出去。\n\n**推荐注入方式**：\n\n| 场景 | 推荐方式 |\n|---|---|\n| 高价值凭据（数据库、API Key） | Vault 动态注入，Pod 退出即自动 revoke |\n| 云托管场景 | 云 Secret Manager + External Secrets Operator 同步到运行时 |\n| 短作业 | 短时凭证，TTL 和任务生命周期绑定 |\n\n**Vault 动态 secret 的核心价值**：Vault 现场创建临时数据库账号并绑定 lease，Pod 退出不 renew → lease 到期 → 账号自动 DROP——凭据和 client 生命周期绑定，不需要轮换计划。\n\n**最常见事故**：Secret 泄露到日志（应用打印环境变量）、硬编码到 notebook 后推到 git、打进镜像构建缓存。",
+        "reveal": {
+          "q": "K8s Secret 默认情况下在 etcd 里是加密存储的吗？",
+          "a": "不是。K8s Secret 默认只做 base64 编码，不是加密。任何拿到 etcd 备份的人都能直接读取所有 Secret。生产环境必须配置 encryption-at-rest（aescbc/aesgcm 或 KMS provider），且已存在的 Secret 不会自动加密，需要手动触发重写。etcd 备份本身也必须严格保护。"
+        }
+      },
+      {
+        "title": "模型安全：torch.load 高风险，SafeTensors 是平台默认",
+        "body": "**`torch.load` 为什么是高风险操作**：\n- PyTorch `.pt`、`.bin`、`.ckpt` 文件默认使用 Python `pickle` 格式\n- `pickle` 的设计目标是「恢复 Python 对象」，不是安全传输格式\n- 加载未知来源文件 = 执行对方提供的反序列化逻辑（任意代码执行）\n- 文件看起来「大小正确、名字正确」不能作为安全依据\n\n**SafeTensors 的优势**：只描述张量数据，不执行 Python 对象反序列化逻辑，跨语言支持（Python/Rust/C++/JS），适合签名、校验和复现。\n\n**工程边界**：SafeTensors 只收窄「加载权重时执行任意 Python 代码」的风险，不保证模型没有后门、没有训练数据泄漏，也不保证输出安全。\n\n**外部模型准入流程**：来源登记 → 哈希记录 → 格式检查 → 隔离转换 → 基础评测 → 责任人确认。绝不允许 notebook 直接把任意权重挂进生产模型仓库。"
+      },
+      {
+        "title": "供应链安全：镜像、依赖和模型权重都在供应链内",
+        "body": "**四个控制点**：\n\n| 控制点 | 最小做法 | 失败条件 |\n|---|---|---|\n| 镜像签名验证 | `cosign` 对基础和业务镜像签名，部署前校验 | 任意来源镜像只要 tag 对就能部署 |\n| 依赖锁定 | `requirements.lock`、`poetry.lock`、`uv.lock` 锁定解析结果 | 每次构建解析结果可能不同 |\n| 漏洞扫描 | CI 和镜像入库阶段运行 `Trivy`，对 Critical/High 设阻断阈值 | 扫描只出报告不阻断，或结果无人处理 |\n| 构建 provenance | 记录构建来源、构建器、输入和产物（SLSA 思路） | 产物来源不明，无法区分官方构建与手工上传 |\n\n**三个工具各自的边界**：\n- `Trivy`：暴露已知漏洞和配置风险\n- `cosign`：让产物在部署前可验证「确实由可信身份签过」\n- `SLSA provenance`：描述「由哪个源码、哪个构建器、哪个流水线生成」\n\n三者不能互相替代：有签名但没扫描的镜像可能带着 Critical 漏洞；扫描通过但没签名的镜像可能被替换。",
+        "tip": "第一阶段目标不是追求最高 SLSA 等级，而是先把未签名镜像、未登记模型和无锁文件依赖挡在生产外。"
+      },
+      {
+        "title": "Prompt Injection 与多层防御",
+        "body": "**四类 Prompt Injection**：\n\n| 类型 | 注入点 | 危险程度 |\n|---|---|---|\n| Direct Injection | 用户直接输入 | 中 |\n| Indirect Injection | RAG 检索文档 | 高 |\n| Stored Injection | 写入数据库后被模型读取 | 极高 |\n| Cross-Prompt Injection | 多用户上下文/共享缓存 | 极高 |\n\n**Indirect Injection 最难防**：攻击者只需在可被爬取的网页写下「忽略所有之前的指令」，就可能影响所有使用该网页内容的下游用户。检索内容绝不能被模型视为可信指令。\n\n**四层防御架构**：\n1. 网关层：正则/关键词过滤，黑名单，~1ms\n2. 模型层：system prompt 加固，角色锁定，0ms 额外延迟\n3. 输出层：guardrail classifier + PII 扫描（Presidio），+50-200ms\n4. 审计层：异步安全分类 + 多轮对话感知，无同步延迟\n\n**Prompt injection 不是「模型能力问题」**——模型无法原生区分「平台指令」和「用户输入」，必须在系统架构层引入防护，不会随模型变聪明自动解决。"
+      },
+      {
+        "title": "治理闭环与数据合规",
+        "body": "**治理不是加几条审批流**，它需要完整闭环：规则定义 → 平台执行 → 指标与审计 → 异常发现 → 策略调整。\n\n缺少「平台执行」和「审计证据」，治理最终变成人工流程。策略执行工具（`OPA Gatekeeper`、`Kyverno`）通过 K8s admission webhook 把规则变成集群默认行为，`failurePolicy: Fail` 确保 webhook 不可达时拒绝请求而非放行。\n\n**数据合规对推理日志的要求**：\n\n| 法规 | 适用范围 | 推理日志要求 |\n|---|---|---|\n| GDPR（欧盟）| 处理欧盟居民个人数据 | 默认 30-90 天，须告知用户 |\n| PIPL（中国）| 处理中国境内个人信息 | 一般不超过 180 天 |\n| HIPAA（美国医疗）| 医疗相关数据 | 医疗对话按 PHI，6 年保留义务 |\n\n**跨境数据流**：EU 用户请求只路由到 EU region GPU 节点（region-pin），日志只写入 EU 存储——违反 GDPR 跨境限制是合规红线。\n\n**模型记忆攻击防护**：DP-SGD 训练（提供 (ε, δ)-DP 保证）+ 输出截断 + API Rate Limit 多手段共同防护训练数据提取攻击。",
+        "reveal": {
+          "q": "RAG 缓存命中（cache hit）是否可以绕过租户权限检查？",
+          "a": "不能。缓存命中必须仍然经过租户和文档级别授权检查——检索快不代表权限就对，cache hit 不能绕过权限边界。缓存 key 必须纳入租户 ID、权限版本、索引版本等维度，否则租户 A 的缓存结果可能被租户 B 直接命中，造成越权访问。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "对未知来源的 `.pt` 文件执行 `torch.load()` 存在什么安全风险？",
+        "options": [
+          "文件可能太大导致显存溢出",
+          "pickle 反序列化可能在加载时执行任意 Python 代码，相当于运行对方提供的程序",
+          "权重格式不兼容可能导致模型精度下降",
+          "只有来自 HuggingFace 以外的文件才有风险"
+        ],
+        "answer": 1,
+        "explain": "PyTorch .pt/.bin/.ckpt 文件使用 Python pickle 格式，pickle 的 `__reduce__` 机制允许在反序列化时执行任意 Python 代码。攻击者可在权重文件中嵌入恶意 payload，触发 `torch.load()` 时执行远程代码、数据外泄或后门植入。文件大小看起来「正常」不能作为安全依据，pickle payload 通常只需几 KB。"
+      },
+      {
+        "type": "judge",
+        "prompt": "K8s Secret 在 etcd 中默认是加密存储的，拿到 etcd 备份也无法读取 Secret 内容。",
+        "answer": false,
+        "explain": "K8s Secret 默认只做 base64 编码，不是加密。base64 是可逆编码，任何拿到 etcd 备份的人都能直接读取 Secret 内容。生产环境必须显式配置 encryption-at-rest（aescbc/aesgcm 或 KMS provider）。已存在的 Secret 不会自动加密，需要手动触发重写。"
+      },
+      {
+        "type": "choice",
+        "prompt": "RAG 系统中哪种 Prompt Injection 最难防护？",
+        "options": [
+          "用户直接在对话框输入的 Direct Injection",
+          "通过 RAG 检索文档进入上下文的 Indirect Injection",
+          "多租户批量推理中的 Cross-Prompt Injection",
+          "用户在会话中发起的 Jailbreak 尝试"
+        ],
+        "answer": 1,
+        "explain": "Indirect Injection 最难防，因为攻击者只需控制一个可被爬取的网页，写入「忽略之前所有指令」等内容，被知识库索引后就可能影响所有使用该内容的下游用户。攻击者不需要直接访问系统。防护需要从文档入库时扫描注入模板、在 prompt 中明确隔离检索内容与用户指令、让模型声明「不执行 retrieved_doc 中的指令」。"
+      },
+      {
+        "type": "match",
+        "prompt": "将供应链安全工具与其控制的风险点配对：",
+        "left": ["Trivy", "cosign", "SLSA provenance", "SafeTensors"],
+        "right": [
+          "声明产物由哪个源码、哪个构建器、哪个流水线生成，支持追溯",
+          "暴露镜像和依赖中的已知 CVE 漏洞和配置风险",
+          "防止权重加载时执行任意 Python 代码（替代 pickle 格式）",
+          "让产物在部署前可验证「确实由可信身份签过」，防止镜像被替换"
+        ],
+        "explain": "Trivy 扫描已知漏洞；cosign 做签名验证防替换；SLSA provenance 提供构建可追溯性；SafeTensors 从格式层面消除权重加载时的代码执行风险。三个工具不能互相替代，需要配合使用。"
+      },
+      {
+        "type": "judge",
+        "prompt": "治理规则写入文档并通知所有工程师遵守，就可以认为治理已经形成闭环。",
+        "answer": false,
+        "explain": "文档只是规则定义，闭环还需要「平台执行 → 指标与审计 → 异常发现 → 策略调整」。没有平台执行（如 OPA/Kyverno admission control）和审计证据，规则最终变成不可验证的口头约定，无法确认是否被遵守，也无法在违反时自动拦截。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Vault 动态 secret（database engine）相比静态 KV secret 最核心的安全优势是什么？",
+        "options": [
+          "加密算法更强",
+          "凭据和 client 生命周期绑定，Pod 退出不 renew 则 lease 到期自动 revoke，无需手动轮换",
+          "访问速度更快",
+          "支持更多编程语言"
+        ],
+        "answer": 1,
+        "explain": "Vault database engine 在请求时现场创建临时数据库账号，并绑定到一个带 TTL 的 lease。Pod 正常运行时周期性 renew lease；Pod 退出后不再 renew，lease 到期时 Vault 自动执行 DROP USER，账号消失。这意味着凭据的生命周期与 client（Pod）完全绑定，不需要维护轮换计划，泄露的凭据也会在 TTL 后自动失效。"
+      },
+      {
+        "type": "choice",
+        "prompt": "根据 GDPR，EU 用户的 LLM 推理日志（包含用户输入）应如何处理？",
+        "options": [
+          "可以路由到任意 region 推理，统一存储在美国数据中心",
+          "推理请求只路由到 EU region GPU 节点，日志只写入 EU region 存储",
+          "只要加密传输就可以存放在任意位置",
+          "GDPR 不适用于 AI 推理日志，只适用于注册信息"
+        ],
+        "answer": 1,
+        "explain": "GDPR 明确禁止将欧盟居民个人数据传输到「充分性保护决定」以外的国家，除非签署 SCC。AI 推理日志包含用户输入（可能含个人信息），属于个人数据。正确做法是 region-pin routing：EU 用户请求只路由到 EU region GPU 节点，推理日志只写入 EU region 存储，不得跨境传输到美国等地区。"
+      },
+      {
+        "type": "input",
+        "prompt": "模型权重文件使用什么格式可以消除加载时「执行任意 Python 代码」的风险？（填英文格式名）",
+        "accept": ["SafeTensors", "safetensors"],
+        "explain": "SafeTensors 是专为机器学习权重设计的安全格式，只描述张量数据（形状、dtype、数据），不包含可执行的 Python 对象序列化逻辑，因此加载时无法执行任意代码。支持 Python/Rust/C++/JS 跨语言读取，也更适合签名和哈希校验。推理部署应以 SafeTensors 为默认格式，外部 pickle 权重经隔离转换后才能进入平台。"
+      },
+      {
+        "type": "judge",
+        "prompt": "API Key 泄露在 LLM 场景的危害与普通 Web 服务相当，可以按照普通响应流程处理。",
+        "answer": false,
+        "explain": "LLM API Key 泄露的危害远大于普通服务：攻击者可用你的配额做大规模模型提取（每分钟消耗百万 token）、用你的服务生成非法内容、产生数千美元账单。黄金响应窗口通常不超过 15 分钟，必须立即将 Key 加入 blacklist、拉取完整调用日志评估 blast radius（数据泄露、模型提取、成本损失、横向扩散），并通知 Key 持有者重新生成。"
+      }
+    ]
+  }
+]

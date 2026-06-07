@@ -1,0 +1,117 @@
+[
+  {
+    "id": "u7c10",
+    "title": "Kubernetes AI 排障 SOP",
+    "subtitle": "Pending、GPU 不可见、NCCL timeout、OOMKilled、readiness flapping",
+    "intro": [
+      {
+        "title": "AI on K8s 排障：建立证据链而非猜测",
+        "body": "Kubernetes AI 排障的核心挑战是**一个症状往往对应多个根因**：\n\n- `Pod Pending`：GPU 不足 / 节点标签不匹配 / 污点未容忍 / PVC 未绑定 / quota 超限 / gang 条件不满足\n- `NCCL timeout`：rank 未齐 / DNS 解析错 / NetworkPolicy 阻断 / RDMA 设备未注入 / MTU 不一致 / 某 rank OOM / GPU Xid\n\nAI 工作负载横跨多个平面：Kubernetes 控制面、节点运行时、加速器（GPU driver / CUDA / DCGM）、分布式通信（NCCL / RDMA）、存储路径、应用语义。\n\n**排障的目标不是「找一行看起来像原因的日志」，而是建立完整证据链。**",
+        "tip": "排障顺序错了会浪费大量时间。Pod 没调度成功，就不要去看 NCCL 日志；Service 没有 ready endpoint，就不要先改 Ingress 配置。"
+      },
+      {
+        "title": "最小证据包：先采集再修复",
+        "body": "遇到故障先采集证据，不要先删 Pod 或重启服务（否则 previous logs、events、现场全部消失）：\n\n**第一步（对象和事件）：**\n`kubectl get pod -n <ns> <pod> -o wide`\n`kubectl describe pod -n <ns> <pod>`\n`kubectl get events -n <ns> --sort-by=.lastTimestamp`\n\n**第二步（容器日志）：**\n`kubectl logs -n <ns> <pod> --all-containers --tail=300`\n`kubectl logs -n <ns> <pod> --all-containers --previous --tail=300`\n\n**第三步（已调度时）：**\n`kubectl describe node <node>`\n\n**第四步（CRD/Operator）：**\n`kubectl get <kind> -n <ns> <name> -o yaml`\n`kubectl logs -n <operator-ns> deploy/<operator> --tail=300`\n\n**第五步（服务流量）：**\n`kubectl get svc,endpointslice,ingress -n <ns>`"
+      },
+      {
+        "title": "Pod Pending：按证据排除根因",
+        "body": "Pod 长时间 Pending 时，先看 `kubectl describe pod` 中的 Events 关键字：\n\n| Event 关键字 | 根因 | 处理动作 |\n|---|---|---|\n| `Insufficient nvidia.com/gpu` | GPU 数量或形状不足 | 等队列、扩容、降请求、调节点池 |\n| `didn't match node affinity` | affinity 过窄或标签错误 | 修 Pod 约束或节点标签 |\n| `had untolerated taint` | 节点有 taint，Pod 无 toleration | 加 toleration |\n| `persistentvolumeclaim not bound` | PVC 未绑定 | 查 StorageClass、容量、accessMode |\n| `exceeded quota` | namespace/queue quota 不足 | 释放资源或调整 quota |\n\n**AI 特有陷阱**：「集群总空闲 GPU 数足够」不代表可调度。8 卡 worker 需要单节点 8 张可用卡，散布在多台节点的碎片 GPU 无效。多 worker 训练还需要 gang 准入。"
+      },
+      {
+        "title": "GPU 不可见：分层排查",
+        "body": "容器内看不到 GPU 或 `torch.cuda.is_available()` 为 `False`，按层排查：\n\n1. **Pod spec**：是否请求了 `nvidia.com/gpu`？只设置环境变量不算请求 GPU\n2. **调度**：Pod 是否真的调度到了 GPU 节点（`-o wide` 看 NODE 列）\n3. **节点 allocatable**：`kubectl describe node` 看 `allocatable.nvidia.com/gpu` 是否存在\n4. **Device Plugin**：DaemonSet 是否 Ready，日志是否报错\n5. **运行时**：NVIDIA container toolkit / runtimeClass 是否配置，设备是否注入容器\n6. **驱动/CUDA 兼容**：节点 driver 版本 vs 镜像 CUDA 版本是否兼容\n7. **MIG**：请求的 resource name 是否和节点暴露的 profile 名称一致\n\n定位到哪层，才能做对应的修复动作。",
+        "reveal": {
+          "q": "节点 `nvidia-smi` 正常，但容器内 `torch.cuda.is_available()` 为 `False`，最先应检查哪一层？",
+          "a": "检查运行时层：`/dev/nvidia*` 是否注入容器、NVIDIA Container Toolkit 是否正常工作、Pod spec 是否有 `nvidia.com/gpu` resource request、runtimeClass 是否配置。`nvidia-smi` 只证明宿主机 driver 和管理接口可用，不证明 runtime hook 把设备注入了容器。"
+        }
+      },
+      {
+        "title": "NCCL Timeout：对齐所有 rank 的证据",
+        "body": "NCCL timeout 绝不能只看一个 rank 的日志，必须：\n\n**第一步：确认所有 rank Running**\n`kubectl get pod -n <ns> -l <job-label> -o wide`\n一个 rank OOM 或 CrashLoop 会让其他 rank 等待超时。\n\n**第二步：开启 NCCL debug**\n环境变量：`NCCL_DEBUG=INFO`、`NCCL_DEBUG_SUBSYS=INIT,NET`\n\n**排查顺序**：\n1. 所有 rank 是否 Running → 不是则先修 Pod 问题\n2. `MASTER_ADDR`、world size、rank 是否一致\n3. Pod 间 DNS 和端口是否互通，NetworkPolicy 是否阻断\n4. NCCL 选择的网卡是否正确（防止走管理网 / docker bridge）\n5. RDMA 设备是否注入，库和驱动是否匹配\n6. MTU、PFC、ECN、GID index 是否一致\n7. DCGM 是否有 Xid、NVLink 错误\n\n**日志线索**：出现 `NET/IB: No device found` → RDMA 未注入；出现 `fallback to Socket` → RDMA 不可用；卡在 rendezvous → rank 未齐或 master DNS/端口错。"
+      },
+      {
+        "title": "OOMKilled、readiness flapping 与 Service 不通",
+        "body": "**OOMKilled 三种类型的区分**：\n\n| 类型 | 证据 | 处理 |\n|---|---|---|\n| cgroup memory OOM | `reason: OOMKilled`，exit code 137 | 提高 memory limit，减少 dataloader workers |\n| CUDA OOM | 应用日志 `CUDA out of memory` | 降 batch/context，gradient checkpointing |\n| Ephemeral storage 耗尽 | events 提到 `ephemeral-storage` | 挂载持久卷，设置清理策略 |\n\n**readiness flapping 根因**：\n- 没有 startupProbe，liveness 在模型加载中误杀 → 增加 startupProbe\n- readiness probe 太重（真实推理请求） → 改为轻量本地健康检查\n- 模型冷启动慢，warmup 期间 endpoint 清零 → 灰度发布保留旧 revision\n\n**Service 不通首先看 EndpointSlice**：Pod Running/Ready 但没有 endpoint → selector 不匹配或 readiness 失败 → 先修 endpoint，再查 Ingress/Gateway。"
+      },
+      {
+        "title": "值班排障核心原则",
+        "body": "**常见反模式（会让问题变更难排）：**\n\n- 先删除 Pod 再看证据 → previous logs、events 消失\n- Pod Pending 时看应用日志 → Pod 根本没启动，没有应用日志\n- NCCL timeout 只看一个 rank → 分布式问题需要多 rank 时间线对齐\n- OOMKilled 直接加 GPU → 可能是 CPU memory 或临时盘问题\n- Service 502 先改 Ingress → 应先确认是否有 ready endpoint\n\n**值班结论格式（可交接）：**\n- 症状：\n- 影响范围：\n- 关键证据：（具体日志摘要、事件、对象状态）\n- 排除项：\n- 根因判断：\n- 已执行动作：\n- 后续预防：\n\n「看起来像网络问题」不能作为事故结论——必须有具体证据支撑。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "推理服务 Pod 全部 Running，但用户访问出现 503。第一步应该检查什么？",
+        "options": [
+          "查看 Ingress controller 日志",
+          "查看 kubectl get endpointslice 是否有 ready endpoint",
+          "查看容器内模型日志",
+          "重启所有 Pod"
+        ],
+        "answer": 1,
+        "explain": "503 通常意味着没有可用后端。第一步应确认 Service 是否有 ready endpoint（`kubectl get endpointslice`）。没有 endpoint 时，修 Ingress 无效；有 endpoint 时再沿数据路径向上排查（端口、NetworkPolicy、后端应用）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "`OOMKilled`（exit code 137）一定意味着需要增加 GPU 显存。",
+        "answer": false,
+        "explain": "`OOMKilled` 是 Linux cgroup memory limit 触发的容器级内存超限，和 GPU 显存无关。CUDA OOM 出现在应用日志中，容器未必退出。两者处理方式完全不同：cgroup OOM 需要提高 memory limit 或优化 CPU 内存使用；CUDA OOM 才需要减少 batch size 或降低 KV cache。"
+      },
+      {
+        "type": "choice",
+        "prompt": "PyTorch 训练出现 NCCL timeout，`NCCL_DEBUG=INFO` 日志显示 `NET/IB : No device found`，最可能的根因是什么？",
+        "options": [
+          "MASTER_ADDR 环境变量配置错误",
+          "RDMA 设备未注入容器，或 OFED/UCX 库缺失",
+          "DNS 无法解析 master 地址",
+          "batch size 过大导致显存不足"
+        ],
+        "answer": 1,
+        "explain": "`NET/IB: No device found` 表示 NCCL 找不到 InfiniBand 或 RoCE 设备。原因通常是 RDMA device plugin 未注入设备到容器，或者镜像缺少 OFED/UCX 用户态库。需要检查 RDMA device plugin DaemonSet、Pod spec 中的 RDMA resource request、镜像中的 IB 库。"
+      },
+      {
+        "type": "match",
+        "prompt": "将排障症状与应优先检查的证据配对：",
+        "left": ["Pod Pending 很久", "ImagePullBackOff", "GPU 不可见（容器内）", "NCCL timeout"],
+        "right": ["所有 rank 状态 + NCCL DEBUG 日志", "device plugin DaemonSet + node allocatable + runtimeClass", "kubectl describe pod Events（GPU/taint/affinity/quota/PVC）", "Events 中的 tag 错误 / registry 凭据 / CA 问题"],
+        "explain": "Pending 先看调度 events；ImagePull 看镜像来源和凭据；GPU 不可见从设备插件到运行时逐层查；NCCL timeout 必须收集所有 rank 状态并对齐时间线。"
+      },
+      {
+        "type": "judge",
+        "prompt": "排障时应先删除故障 Pod，让 Kubernetes 重建，再分析新 Pod 的日志。",
+        "answer": false,
+        "explain": "删除 Pod 会让 `kubectl logs --previous`（崩溃前日志）、Events 现场消失，是排障中最危险的反模式。应先采集完整的最小证据包（get/describe/events/logs/previous logs），再决定是否需要删除重建。"
+      },
+      {
+        "type": "input",
+        "prompt": "查看容器上一次崩溃前的日志，应该在 `kubectl logs` 命令中加什么参数？（填完整参数，如 `--xxx`）",
+        "accept": ["--previous", "-p"],
+        "explain": "`kubectl logs <pod> --previous`（或 `-p`）查看 Pod 中上一次容器实例的日志。在 CrashLoopBackOff 场景下，当前容器可能还没输出有价值的错误，上一次崩溃前的日志才包含真正的错误信息。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个推理服务发布新模型后间歇出现 502，EndpointSlice 在 0 和 2 个 ready endpoint 之间反复切换。最可能的根因是什么？",
+        "options": [
+          "Ingress controller 版本太旧",
+          "readiness probe 太重或 timeout 太短，与模型 warmup 竞争资源",
+          "Service selector 配置错误",
+          "新模型的 GPU 显存需求超出节点容量"
+        ],
+        "answer": 1,
+        "explain": "EndpointSlice 反复抖动（0↔2）是 readiness probe 间歇失败的典型表现。新模型冷启动后 KV cache 预热和 GPU warmup 期间，probe 如果触发真实推理或 timeout 太短，会导致副本反复出入 endpoint，Ingress 看到 502。修复方向：改为轻量本地健康检查、增大 timeoutSeconds、增加 startupProbe。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪项是值班记录结论中「必须有」的内容，而不是可选的？",
+        "options": [
+          "涉及工程师的姓名和处理时长",
+          "猜测的「可能原因」",
+          "具体的关键证据（日志摘要、事件、对象状态）和根因判断",
+          "详细的业务背景介绍"
+        ],
+        "answer": 2,
+        "explain": "可交接的事故结论必须包含具体证据（能支撑结论的日志片段、事件时间线、对象状态）和根因判断。「看起来像网络问题」不能作为结论。没有证据链的结论无法被审计，也无法指导预防措施。"
+      }
+    ]
+  }
+]

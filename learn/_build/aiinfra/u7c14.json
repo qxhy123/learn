@@ -1,0 +1,121 @@
+[
+  {
+    "id": "u7c14",
+    "title": "推理 Autoscaling",
+    "subtitle": "SLO-aware 弹性：queue wait、KV cache、冷启动与降级协同",
+    "intro": [
+      {
+        "title": "为什么 LLM 推理不能用 CPU HPA",
+        "body": "普通 Web 服务扩容逻辑：CPU 高了加副本、QPS 低了缩副本。LLM 推理至少有六处不同：\n\n| 差异 | Web 常见假设 | LLM 推理现实 |\n|---|---|---|\n| 请求成本 | 单请求成本稳定 | 10 token 和 32K prompt 成本相差数量级 |\n| 执行阶段 | 一次性执行 | prefill 和 decode 瓶颈不同 |\n| 并发模型 | 线程/连接数代表压力 | active sequences、KV block 才接近真实状态 |\n| 资源瓶颈 | CPU/内存 | GPU compute、HBM、KV cache 都可能卡 |\n| 扩容生效 | Pod Ready 基本可用 | 权重、engine、warmup 可能还未完成 |\n| 用户体验 | 整体延迟 | TTFT、TPOT、goodput 要分开看 |\n\n本章关注如何构造一个 **SLO-aware 的推理容量控制系统**，而不是 `HPA` 或 `KEDA` 的语法细节。",
+        "tip": "autoscaling 的目标不是副本数更多，而是按 SLO 可交付的 token 容量更接近需求。"
+      },
+      {
+        "title": "五种容量：别把 Pod Running 当成扩容成功",
+        "body": "推理服务的容量分五层，每层代表不同的「能力就绪程度」：\n\n| 容量 | 含义 | 常见误判 |\n|---|---|---|\n| 调度容量 | 集群能否放下新 Pod | Pod 创建成功就代表扩容完成 |\n| 启动容量 | 新副本多久变成可服务 | 容器 Running 就能接请求 |\n| 执行容量 | 单位时间能处理多少 token | QPS 可以直接代表负载 |\n| KV 容量 | 能容纳多少活跃上下文 | 显存空闲就一定还能接更多请求 |\n| SLO 容量 | 按目标体验完成的有效吞吐 | GPU util 高就是容量健康 |\n\n每一层都可能单独成为瓶颈，只看 Pod 状态无法判断服务是否真的可用。",
+        "reveal": {
+          "q": "HPA 已经扩出了新副本且 Pod 是 Running 状态，为什么 P99 TTFT 可能仍然很差？",
+          "a": "Running 不等于 Ready，Ready 不等于真正可服务。新副本可能还在加载权重、构建推理 engine、执行 warmup，或者虽然通过了 readiness 探针但 router 还没把它加入流量池。这是「启动容量」和「执行容量」的延迟问题。"
+        }
+      },
+      {
+        "title": "关键指标：queue wait、active sequences、KV cache",
+        "body": "三个最接近推理瓶颈的运行时指标：\n\n**`queue_wait`**：请求被 admission 放行后到真正进入模型运行时之前的等待时间。是最接近用户痛感的容量信号。\n- queue wait 升 + active sequences 接近上限 → 副本执行槽不足\n- queue wait 升 + KV 接近满 → 继续塞请求会引发 preemption 或 OOM\n- queue wait 升 + GPU util 不高 → 可能是长请求阻塞或 KV 受限\n\n**`active_sequences`**：运行时正在处理的序列数。太高会让 decode 步进变慢、KV cache 被挤满。\n\n**KV cache 利用率**：决定一个副本能同时容纳多少活跃上下文。GPU 显存层面可能还显示「空闲」，但运行时的 KV block 已不可用——autoscaling 应优先信任运行时暴露的 KV 指标。"
+      },
+      {
+        "title": "TTFT、TPOT 与 Goodput",
+        "body": "三个 SLO 指标分别定位不同链路问题：\n\n| 指标 | 含义 | 主要反映 |\n|---|---|---|\n| `TTFT` | Time To First Token，请求到首 token | 排队、prefill、冷启动问题 |\n| `TPOT` | Time Per Output Token，后续 token 平均间隔 | decode 压力、active sequences、KV 读取 |\n| `goodput` | 按 SLO 成功完成的有效吞吐 | 真正可交付容量 |\n\nTTFT 差但 TPOT 正常 → 问题在排队或 prefill（或冷启动）。TPOT 差但 TTFT 正常 → 问题在 decode 阶段（并发过高或 KV 紧张）。\n\n生产系统至少要按 `model`、`version`、`tenant`、`prompt_length_bucket`、`output_length_bucket` 分桶，避免平均值掩盖真正问题。",
+        "tip": "只看平均 TPOT 或平均 TTFT 会掩盖租户、模型版本、prompt 长度和输出长度差异。"
+      },
+      {
+        "title": "HPA、KEDA 与 Custom Scaler 的适用边界",
+        "body": "`HPA`：Kubernetes 原生副本控制器，适合按 Prometheus Adapter 暴露的 custom metrics 调整 Deployment 副本。简单稳定，但对 LLM 运行时语义无感，难以表达 KV、token、warm pool 和降级动作。\n\n`KEDA`：事件驱动扩缩容，适合 Kafka、SQS、Redis Stream 等队列积压场景，支持 scale-to-zero。适合异步推理、embedding 队列、低频服务唤醒。但队列长度必须转成工作量——100 个短 embedding 请求和 100 个 32K 长上下文请求不应触发同样的扩容。\n\n**Custom scaler**：组合 queue wait、active sequences、tokens/s、KV、TTFT/TPOT，输出副本数、warm pool 规模、admission 开关和降级策略。\n\n推荐路径：先用 `HPA`/`KEDA` 建立闭环，再把确实需要业务语义的部分沉淀到 custom scaler。",
+        "reveal": {
+          "q": "scale-to-zero 适合 70B 在线聊天主链路吗？",
+          "a": "通常不适合。70B 模型权重加载可能需要 4-8 分钟，engine 构建还要几分钟，首请求等待时间完全不可接受。scale-to-zero 适合低频内部工具模型、异步 embedding 队列或夜间批推理，只要首请求等待可接受即可。"
+        }
+      },
+      {
+        "title": "冷启动时间线与 Warm Pool",
+        "body": "一次完整的扩容时间线（从决策到 SLO 恢复）：\n\n`指标触发 → 副本决策 → Pod 准入和调度 → 镜像拉取 → 权重加载 → engine 初始化 → KV/显存预分配 → warmup → readiness → 入路由池 → SLO 恢复`\n\n典型各阶段耗时（70B 模型）：\n- 镜像拉取：0-3 分钟（有缓存则秒级）\n- 权重加载：3-5 分钟（140GB 从对象存储）\n- engine 初始化：1-3 分钟（CUDA graph capture）\n- warmup + 入池：30-60 秒\n\n**控制路径的核心风险是滞后**：从指标超阈值到新副本真正可服务，可能需要 5-10 分钟。如果流量高峰只持续 2 分钟，盲目扩容会在流量退去后才增加成本。\n\nWarm pool 在不同层次截断这条路径，越热越贵，设计原则是让冷启动时间小于业务允许的扩容反应时间。"
+      },
+      {
+        "title": "保护动作：autoscaling 不能替代限流与降级",
+        "body": "autoscaling 只能增加容量，不能保证所有请求都值得被服务，也不能修复坏版本。生产系统必须把扩缩容和保护动作放在一起：\n\n| 保护动作 | 触发信号 | 目的 |\n|---|---|---|\n| canary 冻结 | 新版本 TTFT/TPOT 劣化 | 防止坏版本继续放量 |\n| 租户限流 | 单租户 burst 拉高全局 queue wait | 保护多租户公平 |\n| 长短分流 | 长 prompt 占比升高 | 保护短请求 TTFT |\n| 收紧 max_tokens | decode 压力过高 | 降低长尾输出成本 |\n| 模型降级 | 主模型容量不足 | 保持核心功能可用 |\n| 拒绝低优先级 | SLO burn 过快、KV 接近满 | 避免系统雪崩 |\n\n**只扩容不 admission**：长请求仍会拖垮短请求。**只限流不扩容**：用户看到稳定的 429。成熟策略应该同时考虑容量动作和体验保护动作。",
+        "tip": "KV cache 利用率接近上限时（如 92%），不能只靠扩副本解决——新副本进来之前，继续塞请求会引发 preemption 和 OOM。此时更合理的动作是收紧 admission、分流长上下文或限制低优先级 burst。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "推理服务 TTFT P99 突然升高，但 TPOT P95 基本正常。最可能的问题在哪个阶段？",
+        "options": [
+          "decode 并发过高，active sequences 超过上限",
+          "排队、prefill 瓶颈或新副本冷启动",
+          "KV cache OOM 导致频繁 preemption",
+          "输出 token 数超过 max_tokens 限制"
+        ],
+        "answer": 1,
+        "explain": "TTFT 反映请求进入到首 token 返回的时延，覆盖排队、prefill 和冷启动。TPOT 正常说明 decode 阶段没有问题。TTFT 差而 TPOT 正常，首先怀疑 queue wait 高、prefill 过载或冷启动副本接了真实流量。"
+      },
+      {
+        "type": "judge",
+        "prompt": "queue_wait 指标升高且 GPU utilization 不高，说明 GPU 资源充足，可以继续放行更多请求。",
+        "answer": false,
+        "explain": "queue wait 高而 GPU util 不高可能是长请求阻塞（长 prompt 占满 prefill 队列）、KV cache 满了无法接新序列、路由倾斜或下游依赖异常。不能用 GPU util 低来判断可以继续放量。"
+      },
+      {
+        "type": "match",
+        "prompt": "将三种扩缩容工具与其最适合的场景对应：",
+        "left": ["HPA", "KEDA", "Custom scaler"],
+        "right": [
+          "Kafka/SQS 队列积压触发，支持 scale-to-zero",
+          "组合 queue wait、KV cache、tokens/s 和 SLO burn 的业务感知决策",
+          "Prometheus Adapter 暴露 custom metrics 调整 Deployment 副本"
+        ],
+        "explain": "HPA 适合 Kubernetes 原生指标；KEDA 适合事件驱动和队列积压；Custom scaler 适合需要业务语义（KV、token、多信号组合）的复杂推理场景。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个动作是处理「KV cache 利用率达到 92%，preemption 开始增加」的正确首选保护动作？",
+        "options": [
+          "立即扩容更多副本，提高整体 KV 容量",
+          "降低 GPU utilization 目标，触发更积极的扩容",
+          "收紧 admission、分流长上下文、限制低优先级 burst",
+          "重启 KV cache 管理进程清空显存"
+        ],
+        "answer": 2,
+        "explain": "KV 接近上限时，继续塞入新请求会引发更多 preemption 和 OOM，扩容也需要时间才能生效。正确优先级是先保护：收紧 admission、把长上下文切到专用池、限制低优先级 burst，同时触发扩容准备新容量。"
+      },
+      {
+        "type": "input",
+        "prompt": "按 SLO 成功完成（未超时、未取消）的有效吞吐，在推理场景中用哪个英文指标词表达？",
+        "accept": ["goodput", "good_tokens/s"],
+        "explain": "goodput 是推理服务真正可交付容量的核心指标，区别于 QPS（不区分是否完成）或 GPU utilization（不区分有效/无效工作）。GPU 利用率高但 goodput 低，说明 GPU 在做大量超时后仍生成、重算或被取消的无效工作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "scale-to-zero 是 AI Infra 平台成熟度的标志，所有推理服务都应该启用它以节省成本。",
+        "answer": false,
+        "explain": "scale-to-zero 是产品和 SLO 决策，不是平台成熟度证明。只要首请求不能接受几十秒到几分钟等待，就不应启用。70B 模型冷启动可能需要 5-8 分钟，主链路在线服务禁止 scale-to-zero，低频内部工具或异步 embedding 队列才适合。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理服务发布新版本后，该版本的吞吐下降了 20%。此时 autoscaler 触发扩容，可能出现什么问题？",
+        "options": [
+          "扩容会自动修复新版本的性能问题",
+          "新版本副本扩容后占用更多 GPU，但单请求吞吐仍然差，成本反而升高",
+          "autoscaler 会检测到版本异常并自动回滚",
+          "扩容会提高 KV cache 总容量，补偿性能损失"
+        ],
+        "answer": 1,
+        "explain": "这是 canary 和 autoscaling 混看的典型反模式。坏版本吞吐下降，queue wait 上升，autoscaler 认为需要扩容，但扩出来的仍是性能差的新版本，成本升高而 SLO 不改善。正确做法是版本级独立指标监控和 canary 冻结门禁。"
+      },
+      {
+        "type": "judge",
+        "prompt": "扩容时间线中，「desired replicas 增加」意味着新的服务容量即将到来，可以停止限流措施。",
+        "answer": false,
+        "explain": "desired replicas 增加只是调度决策，后续还需要 scheduled、Running、Ready（含权重/engine/warmup）、入路由池等多个步骤，每步都可能花费数分钟。在所有步骤完成并且 goodput 实际回升之前，不应停止限流措施。"
+      }
+    ]
+  }
+]

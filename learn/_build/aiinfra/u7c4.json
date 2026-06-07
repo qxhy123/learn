@@ -1,0 +1,114 @@
+[
+  {
+    "id": "u7c4",
+    "title": "制品供应链与镜像治理",
+    "subtitle": "digest、SBOM、签名与 Promotion：让发布可证明、可回滚",
+    "intro": [
+      {
+        "title": "为什么「推到 registry」还不够",
+        "body": "制品供应链要解决的不是「镜像能不能 push 到 registry」，而是：**平台必须能证明线上运行的内容从哪里来、里面有什么、是否被篡改、风险是否已知且被接受、如何从测试环境 promotion 到生产、事故时能否按同一份内容回滚、扩容时能否快速分发到节点**。\n\n如果只记录 `registry/app:prod`，平台无法回答：这个 tag 昨天和今天是否指向同一个内容？是否由受控 CI 构建而非工程师本地 push？哪些服务受某个 CVE 影响？回滚 digest 是否还在 registry 中？扩容时 image pull 是否会拖慢冷启动？\n\n**tag、digest、version 的职责差异**：tag 可变，面向人类和流水线，适合作为可读别名；digest 是内容哈希，不可变，是部署、回滚、签名、扫描的主键；semantic version 是业务版本；生产可以保留 tag 方便阅读，但**部署和审计必须以 digest 为准**。"
+      },
+      {
+        "title": "SBOM、签名、attestation：各自回答什么问题",
+        "body": "这三个机制分别降低不同类型的风险，不能互相替代：\n\n**SBOM（软件物料清单）** 回答「这个 digest 里有什么」：记录 OS 包及版本（glibc、openssl）、Python 包（torch、vllm、transformers）、CUDA 相关组件（cuda-runtime、cuDNN、NCCL、TensorRT）、基础镜像 digest 和构建层级。当 CVE 数据库更新时，平台可反查「哪些 digest 包含受影响组件」。没有 SBOM，只能重新扫描所有镜像甚至靠名字猜。\n\n**签名** 回答「这个 digest 是否由可信身份背书」：CI 用 KMS key 或 OIDC keyless 方式对 digest 签名，部署前验证签名身份和策略。\n\n**Attestation** 回答「关于这个 digest，构建系统声明了哪些事实」：源码仓库和 git commit、builder identity、构建参数、基础镜像 digest、测试结果、扫描结果。SLSA 核心是降低供应链被篡改的可能性。\n\n**签名不能替代扫描；扫描不能替代签名；attestation 不能证明业务逻辑正确。**",
+        "tip": "镜像漏洞扫描有两种触发：构建时扫描（阻止已知高风险镜像进入候选集）和持续重扫（当 CVE 数据库更新时重新评估已发布 digest）。只做一次扫描不够。"
+      },
+      {
+        "title": "Promotion：为什么要推同一个 digest 而非重新 build",
+        "body": "很多团队习惯 dev、staging、prod 各 build 一次镜像。即使 Dockerfile 一样，**基础镜像 tag、包仓库、pip 解析、builder 版本**都可能变化，造成不确定性。\n\n正确做法：**build once → test digest → attest digest → promote same digest → deploy same digest**\n\n环境差异应通过配置、secret、模型版本或 feature flag 表达，而不是重新构建「看起来相同」的镜像。\n\n**发布状态机**：`built → scanned → signed → attested → eligible_for_staging → staging_running → eligible_for_prod → prod_canary → prod_stable → rollback_candidate → deprecated → retained_for_audit`\n\n每个状态都有进入条件。例如 `eligible_for_prod` 要求 staging smoke test 通过且兼容矩阵通过；`rollback_candidate` 要求仍可拉取、仍在节点矩阵内、保留策略保护。"
+      },
+      {
+        "title": "Registry 策略与保留：回滚候选不能被 GC 清掉",
+        "body": "Registry garbage collection 必须理解「引用」——只看 tag 是否存在不够。生产中 digest 可能被 Helm release、GitOps commit、回滚记录或审计策略引用。\n\n| 策略项 | 推荐做法 |\n|---|---|\n| 生产 tag | 尽量 immutable；如需 alias 必须同时记录 digest |\n| prod digest | 按合规周期保留，支持审计和回滚 |\n| 回滚候选 | **显式保护**，防止 GC 清掉事故所需镜像 |\n| 基础镜像 | 保留多代，支持旧服务紧急修复 |\n| 跨区域复制 | 复制 digest 和元数据，保证多地域一致性 |\n| 删除策略 | 先检查运行、灰度、回滚、审计引用 |\n\n**反模式**：回滚时只改 tag（tag 已经漂移）；只按 tag 预热（发布期间 tag 可能变化导致预热与实际部署不是同一份内容）；允许工程师从本地 push 生产镜像。"
+      },
+      {
+        "title": "缓存预热与分发性能",
+        "body": "AI 镜像冷启动的 image pull 阶段通常耗时最长，常见优化手段：\n\n| 策略 | 适合场景 | 注意 |\n|---|---|---|\n| 分层基础镜像 | 多服务共享 CUDA/framework 层 | 基础层 digest 要稳定 |\n| Registry mirror | 多节点高频拉取 | 监控命中率和同步延迟 |\n| 区域复制 | 多地域部署 | promotion 前确认 digest 已复制 |\n| DaemonSet pre-puller | Kubernetes 节点池预热 | 控制并发，避免打满网络 |\n| Lazy pulling / remote snapshotter | 超大镜像但只访问部分文件 | 需验证运行时和性能影响 |\n\n**预热要以 digest 为单位**，而不是 tag。关键服务的**回滚候选也应该预热**，否则事故时回滚也会慢。\n\n**观测指标**：SBOM coverage（有 SBOM 的生产 digest 比例）、scan freshness（扫描报告与当前 CVE 数据库的时间差）、rollback readiness（回滚候选可拉取、可验证、兼容矩阵通过比例）、runtime drift（运行中 imageID 与发布记录不一致次数）。",
+        "reveal": {
+          "q": "staging 部署通过，promotion 到 prod 时失败，发现 prod registry 没有目标 digest。是 promotion 流程缺少了哪个门禁？",
+          "a": "缺少「区域复制完成确认」门禁。promotion 到 prod 前，应检查目标 digest 是否已成功复制到 prod 所在区域的 registry。镜像只在 staging 区域存在，未同步到 prod 区域就尝试部署，kubelet 拉取时会得到 `manifest unknown`。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "生产部署和审计应该以什么为主键，而不是 tag？",
+        "options": [
+          "semantic version（如 v1.8.3）",
+          "构建时间戳",
+          "image digest（sha256 内容哈希）",
+          "镜像文件大小"
+        ],
+        "answer": 2,
+        "explain": "tag 是可变指针，可以随时被覆盖，同一 tag 昨天和今天指向的内容可能不同。digest 是对内容的哈希，内容不变 digest 不变，是唯一不可漂移的镜像身份标识，应作为部署、回滚、签名、扫描的主键。"
+      },
+      {
+        "type": "match",
+        "prompt": "将供应链工具与它回答的问题对应：",
+        "left": ["SBOM", "签名（Signature）", "Attestation", "漏洞扫描"],
+        "right": [
+          "关于这个 digest，构建系统声明了哪些事实（源码、builder、参数）",
+          "这个 digest 里有什么组件和依赖",
+          "镜像中是否包含已知 CVE 并按策略阻断",
+          "这个 digest 是否由可信身份背书"
+        ],
+        "explain": "SBOM 描述内容；签名证明身份；attestation 记录构建过程事实；漏洞扫描匹配 CVE 策略。四者互补，不能互相替代。"
+      },
+      {
+        "type": "judge",
+        "prompt": "「签名通过」说明这个镜像没有高危漏洞，可以安全上线。",
+        "answer": false,
+        "explain": "签名只证明「这个 digest 由可信身份背书」，不能说明镜像内容没有漏洞。同理，「扫描通过」也不能证明镜像来源可信。SBOM、签名、attestation、扫描分别降低不同类型的风险，必须组合使用。"
+      },
+      {
+        "type": "choice",
+        "prompt": "为什么生产镜像应该 promotion 同一个 digest，而不是每个环境重新 build？",
+        "options": [
+          "重新 build 会消耗更多 CI 资源",
+          "即使 Dockerfile 一样，基础镜像 tag、包仓库、pip 解析、builder 版本都可能变化，导致 staging 和 prod 内容不同",
+          "registry 不支持重复存储相同内容",
+          "重新 build 会丢失 SBOM 信息"
+        ],
+        "answer": 1,
+        "explain": "重新 build 的不确定性来自多个来源：基础镜像 tag 可能漂移、pip/apt 包仓库内容可能更新、builder 版本可能不同。这些变化会让「看起来相同的 Dockerfile」产出不同内容，破坏 staging/prod 一致性。正确做法是 build once，promotion 同一份 digest。"
+      },
+      {
+        "type": "input",
+        "prompt": "Registry 的 garbage collection 要避免误删回滚 digest，正确做法是对回滚候选 digest 做什么操作？（两字）",
+        "accept": ["显式保护", "保护"],
+        "explain": "回滚候选 digest 必须受到「显式保护」，在 retention 策略中标记为不可 GC 清理。只靠 tag 存在来防止 GC 是不可靠的，因为 tag 可能被删除，而 digest 引用未被正确追踪。"
+      },
+      {
+        "type": "choice",
+        "prompt": "缓存预热时，最安全的做法是以什么为单位预热？",
+        "options": [
+          "以 tag 为单位，这样最方便",
+          "以 digest 为单位，确保预热内容与实际部署内容完全一致",
+          "以镜像仓库名为单位，预热整个 repo",
+          "预热时间戳最新的镜像"
+        ],
+        "answer": 1,
+        "explain": "以 tag 为单位预热存在风险：发布期间 tag 可能被更新为新内容，导致预热的内容和实际部署的 digest 不一致，无法命中缓存。应以 digest 为单位预热，确保节点缓存的内容与发布记录完全匹配。"
+      },
+      {
+        "type": "judge",
+        "prompt": "漏洞扫描只需要在镜像构建时运行一次，通过之后就不需要再扫了。",
+        "answer": false,
+        "explain": "CVE 数据库和利用信息会持续更新。一个三个月前构建时扫描通过的 digest，今天可能因为新披露漏洞变成高风险。需要两种触发：构建时扫描（进入候选集门禁）和持续重扫（CVE 库更新时重新评估已发布和可回滚 digest）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一个风险接受（漏洞豁免）记录中，哪个字段是防止「永久债务」积累的关键？",
+        "options": [
+          "漏洞编号",
+          "负责人姓名",
+          "到期时间",
+          "受影响组件版本"
+        ],
+        "answer": 2,
+        "explain": "没有到期时间的豁免会变成永久债务，因为没有机制强制复查。平台应把即将到期和已经过期的豁免作为发布阻断或告警触发点，强制负责人在截止日前更新状态或重新评估风险。"
+      }
+    ]
+  }
+]

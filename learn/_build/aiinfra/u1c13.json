@@ -1,0 +1,138 @@
+[
+  {
+    "id": "u1c13",
+    "title": "NUMA、PCIe、DMA 与 Pinned Memory",
+    "subtitle": "H2D 上不去不只是 GPU 的问题——拓扑、NUMA 亲和与 DMA 路径",
+    "intro": [
+      {
+        "title": "单机 AI 服务器不是均匀的池子",
+        "body": "一台 8 GPU 训练机看起来是「一台机器插了多张 GPU」，但硬件真实形状是一棵树：多个 CPU socket、多个 NUMA node、多个 PCIe root complex、PCIe switch、GPU、NIC、NVMe……各有距离，不是均匀的带宽池。\n\n**不可化简的核心问题**：数据必须同时满足「离使用者近、物理页稳定、设备可寻址、拓扑路径不绕远」，才可能接近硬件标称带宽。任意一环错位，H2D、RDMA、GPU-NVMe 路径就会变成跨 socket 绕远、pageable staging、IOMMU miss 或同步拷贝。\n\n**常见误判**：GPU utilization 55%，直觉是「DataLoader 不够快，加 worker」——但实际根因可能是 batch 页 first-touch 到远端 NUMA node，GPU DMA 跨 socket 读数据，带宽上不去。",
+        "steps": [
+          "先用 `nvidia-smi topo -m` 采拓扑，记录 GPU/NIC/CPU 的 NUMA 亲和关系",
+          "用 `numastat -p <pid>` 查 batch 页落在哪个 NUMA node",
+          "用 Nsight Systems 看 H2D timeline，判断是否有 pageable staging 或串行化",
+          "用 CUDA event 测真实 copy 时间（不是 Python time.time()）",
+          "按「pinned + 正确 NUMA + copy stream overlap」三层依次修复"
+        ]
+      },
+      {
+        "title": "NUMA：内存不是均匀池，first-touch 决定页的位置",
+        "body": "NUMA（Non-Uniform Memory Access）指 CPU 访问不同内存 node 的成本不同。双路服务器中，socket 0 访问 node 0 是本地（~80ns），访问 node 1 要跨 UPI/Infinity Fabric（~150ns+），带宽也下降。\n\n**关键机制：first-touch**。Linux 默认策略——进程在哪个 CPU 上首次写入（触碰）匿名页，内核就倾向在该 CPU 所属 node 分配物理页。`malloc()` 只拿虚拟地址，写入才是真正的 first-touch。\n\n**DataLoader 中的 first-touch 陷阱**：\n- worker 在 socket 1 解码并写入 numpy array → 页 first-touch 到 node 1\n- GPU 0 在 socket 0 的 root complex 下 → GPU DMA 跨 socket 读 node 1 的 batch 页\n- 路径：node 1 DRAM → UPI → PCIe → GPU HBM，带宽折半\n\n**验证命令**：\n```\nnumastat -p <pid>        # 看匿名页/文件页在各 node 的分布\ngrep 'N0=|N1=' /proc/<pid>/numa_maps | head\nps -L -o pid,tid,psr,comm -p <pid>  # 看线程在哪个 CPU 上跑\n```",
+        "tip": "interleave 策略（`numactl --interleave=0,1`）把页分散到两个 node，可以提高顺序 CPU 带宽，但会让 H2D locality 变差——GPU 总有一半 batch 页是远端的。H2D 场景应优先 membind 到与 GPU 同 socket 的 node。"
+      },
+      {
+        "title": "PCIe 拓扑：设备挂在哪里决定路径，比设备型号更先",
+        "body": "PCIe 是点对点分层互连，CPU socket 内的 root complex → root port → PCIe switch → GPU/NIC/NVMe。树形结构决定两个 endpoint 之间的路径和带宽。\n\n**`nvidia-smi topo -m` 距离标记解读**：\n\n| 标记 | 含义 | H2D/RDMA 影响 |\n|---|---|---|\n| **PIX** | 经过最多一个 PCIe bridge，同 switch 近距离 | 最好，P2P/GDRDMA 更可能成立 |\n| **PXB** | 跨多个 PCIe bridge/switch | 中等，可能共享上行带宽 |\n| **PHB** | 跨 PCIe host bridge/root complex | 较远，P2P 可能受限 |\n| **SYS** | 跨 NUMA node/socket | 远，通信和 H2D 应避免 |\n| **NV#** | GPU 间有 NVLink | 只说明 GPU-GPU，不说明 GPU-NIC |\n\n**关键误区**：GPU 有 NVLink 就不用看 PCIe——NVLink 只解决 GPU-GPU fabric，H2D、NIC、NVMe 仍走 PCIe/root complex。\n\n**PCIe 链路状态检查**：\n```\nnvidia-smi -q | grep -i 'Link Gen\\|Link Width'\nlspci -vv -s <gpu-bdf> | grep -E 'LnkCap|LnkSta'\n```\n`LnkSta`（当前协商状态）可能低于 `LnkCap`（能力上限）——插槽/电缆/BIOS/设备降级都会导致 x16 降为 x8，Gen5 降为 Gen4。",
+        "tip": "PCIe 4.0 x16 的理论单向带宽约 31.5 GB/s，但实测 H2D 长期只有 10 GB/s 时，先查 pageable staging、远端 NUMA、小 copy、隐式同步，再怀疑硬件。"
+      },
+      {
+        "title": "DMA、IOMMU 与 Pinned Memory：设备访问内存的完整路径",
+        "body": "GPU 不应该让 CPU 逐字节把 batch 写进显存，而应由 DMA engine 直接在 host memory 与 device memory 之间搬运。\n\n**普通 pageable memory 的问题**：物理页可能换出、迁移或重新映射，DMA 无法接受「传到一半源页消失」。驱动必须：① 分配 pinned staging buffer，② CPU memcpy pageable → staging，③ DMA staging → GPU。多了一次 CPU 拷贝，且 `cudaMemcpyAsync` 可能因 staging 而阻塞。\n\n**Pinned memory 做了什么**：\n1. 分配/注册 host virtual address 范围\n2. fault in 对应物理页，确保页真实在 RAM\n3. 增加页 pin 引用，使其不能被换出或迁移\n4. 为设备建立 DMA 映射（可能经过 IOMMU 生成 IOVA）\n\n**副作用**：Pinned 页不可回收，会挤压 Page Cache。粗略估算：\n```\npinned footprint ≈ ranks × workers × prefetch_factor × batch_bytes × buffer_copies\n```\n\n过多 pinned memory 会让 dataset 第二轮读取变慢（Page Cache 被挤走）、让系统 OOM 风险上升、让同机其他 job 受影响。\n\n**检查 memlock 限制**：`ulimit -l`，容器中还要检查 `LimitMEMLOCK`、cgroup memory 和 K8s securityContext。",
+        "tip": "pin_memory=True 提升 DMA 条件，但不是越多越好。打开 pinning 后如果 dataset 第二轮变慢，要同时检查 `Mlocked/Unevictable` 和 `Cached` 是否被挤压。"
+      },
+      {
+        "title": "PyTorch H2D：pin_memory、non_blocking、stream 与 overlap",
+        "body": "`pin_memory=True` + `tensor.to('cuda', non_blocking=True)` 是最低门槛，要真正让 H2D 与计算 overlap，需要理解几个前提条件：\n\n**`non_blocking=True` 真正成立的条件**：\n- 源 tensor 在 pinned memory\n- copy 提交到独立 CUDA stream（不是 default stream）\n- 后续 kernel 有正确的 stream event 依赖\n- 没有 `.item()`、`torch.cuda.synchronize()`、同步 logging 等隐式同步\n- copy size 足够大（小 tensor 频繁提交 DMA 效率低）\n\n**常见破坏 overlap 的代码模式**：\n- `loss.item()` 在每个 step 同步 GPU 结果回 CPU\n- 早期调试的 `torch.cuda.synchronize()` 忘记删除\n- D2H metric copy 没有用独立 stream\n\n**正确的 copy stream prefetch 结构**：\n```\ncopy_stream = torch.cuda.Stream()\n# 用 copy_stream 提交 H2D，用 event 让 compute stream 等待\ntorch.cuda.current_stream().wait_stream(copy_stream)\n```\n\n这让「下一批 H2D」和「当前批计算」在不同 engine 上并行执行，GPU 的空洞明显减少。",
+        "tip": "用 Nsight Systems 看 timeline 而不是只用 Python time.time()——CPU 计时测的是「提交时间」，不是「DMA 完成时间」。只有 timeline 才能看到 H2D 是否真正被计算遮住。"
+      },
+      {
+        "title": "GPUDirect RDMA：GPU/NIC locality 与 fallback",
+        "body": "GPUDirect RDMA（GDRDMA）让 RDMA NIC 直接读写 GPU memory，减少「GPU HBM → host pinned buffer → NIC」的 bounce 路径，用于 NCCL over InfiniBand/RoCE、GPU-aware MPI 和 KV cache 传输。\n\n**GDRDMA 成立的前提**：GPU + NIC 都支持、`nvidia_peermem` 已加载、GPU/NIC PCIe 拓扑足够近（PIX 比 SYS 好得多）、IOMMU/ACS/BIOS 允许、应用真正使用 CUDA buffer 没有 fallback 到 host staging。\n\n**常见的 rail 错配问题**：\n- GPU 0-3 在 socket 0，NIC mlx5_0 在 socket 0（PIX）\n- GPU 4-7 在 socket 1，NIC mlx5_1 在 socket 1（PIX）\n- launcher 统一设置 `NCCL_IB_HCA=mlx5_1` → GPU 0-3 的 rank 跨 socket 使用远端 NIC（SYS）\n- 症状：跨节点 all-reduce 吞吐低，`ib_write_bw --use_cuda=0 -d mlx5_1` 明显低于 `mlx5_0`\n\n**验证命令**：\n```\nlsmod | grep nvidia_peermem\nnvidia-smi topo -m\nib_write_bw -d mlx5_0 --use_cuda=0 <server>  # near GPU/NIC\nib_write_bw -d mlx5_1 --use_cuda=0 <server>  # far GPU/NIC（应该更慢）\n```\n\n**修复**：按 local rank 动态选择 HCA，或在调度层生成 rankfile 把 rank/GPU/CPU/memory/NIC 作为一个资源组成组绑定。",
+        "reveal": {
+          "q": "一台双路 8 GPU 机器，GPU 0 在 socket 0，NCCL 统一配置 `NCCL_IB_HCA=mlx5_1`（mlx5_1 在 socket 1）。`nvidia-smi topo -m` 显示 GPU 0 到 mlx5_1 为 SYS。这会造成什么问题？如何修复？",
+          "a": "GPU 0 的 RDMA 数据路径变为：GPU 0 HBM → PCIe → socket 0 root complex → UPI → socket 1 → mlx5_1 → 网络。这条跨 socket 路径（SYS 距离）比本地路径（PIX，GPU 0 → mlx5_0）带宽低、延迟高，还可能 fallback 到 host staging（nvidia_peermem 无法直接 P2P 跨 socket）。修复：按 local_rank 动态设置 HCA，rank 0-3（GPU 0-3）使用 mlx5_0，rank 4-7（GPU 4-7）使用 mlx5_1，保证每个 rank 的 GPU 和 NIC 在同 socket（PIX 或 PHB 距离）。"
+        }
+      },
+      {
+        "title": "H2D 带宽上不去：端到端排障案例",
+        "body": "**现象**：双路 8×A100 PCIe 4.0 机器，理论 H2D 约 31.5 GB/s，实测 Nsight Systems 显示 H2D 只有 10.3 GB/s，GPU util 55-65%。\n\n**三轮修复**：\n\n**第一轮：开启 pin_memory**\n- 发现 `pin_memory=False`，batch 在 pageable memory 中，H2D 经过 driver staging\n- 修复：`pin_memory=True` + `persistent_workers=True`\n- 结果：H2D 带宽从 10.3 → 17.8 GB/s\n\n**第二轮：修复 NUMA first-touch 错位**\n- `numastat -p <pid>` 发现 GPU 0 的 rank，batch 页主要在 node 1（worker 运行在 socket 1）\n- 修复：`numactl --cpunodebind=0 --membind=0` 把 GPU 0-3 的进程绑到 node 0\n- 结果：H2D 带宽从 17.8 → 23-27 GB/s，GPU util 升至 82-88%\n\n**第三轮：移除隐式同步**\n- 发现训练循环中遗留了调试用的 `torch.cuda.synchronize()`，破坏了 copy/compute overlap\n- 修复：删除同步，引入 copy stream prefetch\n- 结果：step wall time 下降 12-18%，GPU 空洞明显减少\n\n**结论**：pin_memory 解决 pageable staging，NUMA 绑定解决远端 DRAM，stream 修复解决串行化。三层独立优化，缺一不可。",
+        "tip": "排查 H2D 慢的顺序：① 查 `LnkSta` 确认 PCIe 没有降级；② 查 timeline 看是否有 pageable staging；③ 查 `numastat` 看 first-touch 是否到位；④ 查 timeline 看是否有隐式同步破坏 overlap。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "一台双路服务器，GPU 0 在 NUMA node 0，DataLoader worker 在 NUMA node 1 上运行并写入 batch 数据。GPU 0 做 H2D copy 时，DMA 路径是：",
+        "options": [
+          "GPU 0 DMA 直接访问 node 1 的 DRAM，路径与 node 0 完全相同",
+          "GPU 0 DMA 必须跨 socket interconnect 访问 node 1 的 DRAM，带宽降低、延迟升高",
+          "OS 会自动把 node 1 的 batch 页迁移到 node 0，不影响 H2D",
+          "pinned memory 会把所有页自动放到与 GPU 同 socket 的 node"
+        ],
+        "answer": 1,
+        "explain": "DMA 读取 host DRAM 时，要经过物理路径：GPU PCIe → root complex → socket 互连（UPI/Infinity Fabric）→ 远端 socket → 远端 DRAM channel。跨 socket 路径的带宽约为本地的 50-70%，延迟增加约 2-3 倍。pinned memory 只锁定页不被换出，不会自动迁移页到近端 node。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPU 间显示 NVLink 连接（nvidia-smi topo -m 中标记 NV4），说明这两张 GPU 与 NIC 之间的 RDMA 路径也更短、带宽更高。",
+        "answer": false,
+        "explain": "NVLink 是专用的 GPU-GPU 互连 fabric，只影响 GPU-GPU 直接通信（如 all-reduce 的 intra-node 部分）。NIC 和 NVMe 仍然通过 PCIe 总线和 root complex 连接，与 NVLink 无关。GPU 0 到 NIC 的 RDMA 路径取决于 GPU 和 NIC 在 PCIe 树上的位置（PIX/SYS 等），与 GPU-GPU 之间有无 NVLink 无关。"
+      },
+      {
+        "type": "choice",
+        "prompt": "`tensor.to('cuda', non_blocking=True)` 在以下哪种情况下，H2D 仍然会阻塞主线程？",
+        "options": [
+          "源 tensor 在 pinned memory 中",
+          "使用了独立的 copy stream",
+          "源 tensor 在普通 pageable memory 中，驱动需要先把数据拷贝到临时 pinned staging buffer",
+          "batch size 很大（> 1 GB）"
+        ],
+        "answer": 2,
+        "explain": "non_blocking=True 只在 pinned memory 作为源时才能真正异步——DMA 可以直接读取 pinned 的物理页。若源是 pageable memory，CUDA 驱动需要先把数据同步拷贝到内部 pinned staging buffer，再提交 DMA，这个 staging 过程会阻塞主线程（或至少增加 copy 延迟），破坏了 non_blocking 的语义。"
+      },
+      {
+        "type": "input",
+        "prompt": "`nvidia-smi topo -m` 输出中，表示两个设备「跨 NUMA node/socket，距离最远」的拓扑标记是什么？（两字母或三字母缩写）",
+        "accept": ["SYS"],
+        "explain": "SYS 表示两个设备之间需要跨越 NUMA node 或 socket 边界，是 nvidia-smi topo 中距离最远的标记。对应的路径需要经过 socket 互连（UPI 或 Infinity Fabric），带宽最低。PIX 是最近的（同 switch），然后依次是 PXB、PHB、NODE、SYS。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 H2D 慢的症状与最可能的根因匹配：",
+        "left": [
+          "开启 pin_memory=True 后 H2D 从 10 GB/s 升至 18 GB/s，但仍低于 PCIe 链路合理值",
+          "Nsight Systems timeline 显示每步 H2D 和计算串行，没有重叠",
+          "GPU 0 的 H2D 带宽比 GPU 7 低 40%，代码相同",
+          "pin_memory=True 后 dataset 第二轮读取变慢"
+        ],
+        "right": [
+          "pinned footprint 过大，挤压了 Page Cache，dataset 文件页被驱逐",
+          "隐式同步（.item()、torch.cuda.synchronize()）破坏了 copy/compute overlap",
+          "GPU 0 的 DataLoader worker first-touch 到远端 NUMA node，DMA 跨 socket 读数据",
+          "pinned memory 解决了 pageable staging，但 batch 页 first-touch 到远端 node 仍拖慢 DMA"
+        ],
+        "explain": "开 pinning 后变快但未达标 → NUMA first-touch 问题仍在；串行 timeline → 隐式同步；GPU 间带宽差异 → NUMA first-touch 错位（worker 在不同 socket）；第二轮变慢 → pinned 挤走 Page Cache。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Linux 的 NUMA first-touch 策略是：进程调用 `malloc()` 时，内核立即在该进程当前运行的 CPU 所在 NUMA node 上分配物理页。",
+        "answer": false,
+        "explain": "Linux 的 first-touch 是「惰性分配」策略：`malloc()` 只分配虚拟地址范围（VMA），不立即分配物理页。真正的物理页分配发生在第一次写入该地址时（触发 minor page fault）。此时内核才在执行这次写入的 CPU 所在 NUMA node 上分配物理页。因此，是「第一次写入」决定了页的 NUMA 位置，而不是 `malloc()` 调用时。"
+      },
+      {
+        "type": "choice",
+        "prompt": "pinned memory 的核心副作用是什么？",
+        "options": [
+          "pinned 页的访问速度比普通页慢，因为需要经过 IOMMU 转换",
+          "pinned 页不能被内核回收或换出，会挤压 Page Cache 和其他进程的可用内存",
+          "pinned memory 会让 GPU copy engine 必须串行执行，降低并发度",
+          "pinned memory 需要额外的 CPU 核心专门维护页锁定状态"
+        ],
+        "answer": 1,
+        "explain": "pinned（page-locked）内存的定义就是「不可被内核换出或迁移」。这些物理页永久占用 DRAM，不能作为 Page Cache 被回收供其他文件或进程使用。过多的 pinned memory 会减少系统可用的 Page Cache，导致 dataset 文件页被更频繁地驱逐（增加 major fault），也会给同机其他 job 造成内存压力。这就是为什么需要按 ranks × workers × prefetch_factor × batch_size 做预算，而不是无限开 pin_memory。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对双路 8 GPU 机器（GPU 0-3 在 node 0，GPU 4-7 在 node 1），NCCL 统一设置 `NCCL_IB_HCA=mlx5_0`（mlx5_0 在 node 0）。GPU 4-7 的 rank 使用这个配置，会产生什么问题？",
+        "options": [
+          "不会有问题，NCCL 会自动路由到最优路径",
+          "GPU 4-7 的 RDMA 流量会跨 socket（SYS 距离）经过 mlx5_0，带宽下降，可能 fallback 到 host staging",
+          "mlx5_0 会 fallback 到 TCP 模式，需要重新配置",
+          "GPU 4-7 的 RDMA 流量会通过 NVLink 转到 GPU 0-3，再由 mlx5_0 发出"
+        ],
+        "answer": 1,
+        "explain": "GPU 4-7 在 node 1（与 mlx5_1 同 socket，PIX 距离），但被强制使用 mlx5_0（node 0，SYS 距离）。RDMA 路径：GPU 4 HBM → PCIe → socket 1 root complex → UPI → socket 0 → mlx5_0。这条跨 socket 路径带宽低、延迟高，且 nvidia_peermem 跨 socket P2P 可能 fallback 到 host staging（GPU memory 先拷贝到 host pinned buffer，再由 NIC 发送），进一步降低吞吐。正确做法是 GPU 4-7 的 rank 使用 mlx5_1。"
+      }
+    ]
+  }
+]

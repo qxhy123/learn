@@ -1,0 +1,662 @@
+[
+ {
+  "title": "Stable Diffusion 原理与实现",
+  "subtitle": "把扩散搬进 VAE 潜在空间，用 CLIP 文本编码 + Cross-Attention 实现文本到图像",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "前面我们已经知道扩散模型能生成高质量图像，也学过 Classifier-Free Guidance（CFG）做条件控制。但 DDPM 直接在像素空间一步步去噪，512x512x3 是 78 万维，每一步 U-Net 前向都要在这个巨大的张量上跑——消费级显卡根本扛不住。\n\nStable Diffusion（SD，Stability AI 2022 开源）解决的就是这个工程痛点：**把扩散过程从像素空间挪到 VAE 的低维潜在空间**。它由三大模块拼成——CLIP 文本编码器、KL-VAE 压缩器、U-Net 去噪网络，总共约 890M 参数。本关就把这三块拆开，讲清推理管线每一步的数据流，以及为什么这么设计能让文本生图跑在普通 GPU 上。"
+   },
+   {
+    "title": "三大模块与数据流",
+    "body": "先有个全局图。文本进来走一条路，噪声进来走另一条路，在 U-Net 里汇合：\n\n- **CLIP Text Encoder（约 123M）**：把 prompt 编码成文本嵌入 $h_{\\text{text}}$，形状 $[B,77,768]$。\n- **U-Net（约 860M）**：在潜在空间预测噪声 $\\epsilon_\\theta$，通过 Cross-Attention 把 $h_{\\text{text}}$ 注入。\n- **KL-VAE（约 84M）**：编码器把像素图压成潜在 $z$，解码器把去噪后的 $z_0$ 还原成图像。\n\n推理时随机噪声 $z_T$ 进 U-Net，U-Net 反复去噪得到 $z_0$，VAE Decoder 把 $z_0$ 解码成 512x512 的图。$z$ 的下标 $T$ 表示噪声最大、$0$ 表示干净。"
+   },
+   {
+    "title": "潜在空间的压缩比",
+    "body": "SD 的关键省钱手段是 VAE 的 $f=8$ 压缩比：\n\n$$x \\in \\mathbb{R}^{H \\times W \\times 3} \\xrightarrow{\\text{Encoder}} z \\in \\mathbb{R}^{H/8 \\times W/8 \\times 4}$$\n\n以 512x512 为例算一遍：像素空间是 $512 \\times 512 \\times 3 = 786432$ 维；潜在空间是 $64 \\times 64 \\times 4 = 16384$ 维，压缩比 $786432/16384 = 48$ 倍。\n\n注意空间边长缩了 8 倍（$512 \\to 64$），通道从 3 变成 4。整个扩散循环只在这 16K 维上做，而不是 78 万维，这就是 SD 能在普通显卡上跑的根本原因。",
+    "formula": "z \\in \\mathbb{R}^{H/8 \\times W/8 \\times 4}, \\quad 512\\times512\\times3 \\to 64\\times64\\times4 \\; (48\\times)"
+   },
+   {
+    "title": "为什么用 token 序列而不是单个池化向量",
+    "body": "CLIP 文本编码器其实能输出两种东西：一个池化后的单一向量 $\\in \\mathbb{R}^{768}$，或者每个 token 的 hidden states $\\in \\mathbb{R}^{77 \\times 768}$。SD 坚持用后者。\n\n**为什么？因为生成需要空间级的细粒度对应。** Cross-Attention 要让图像的每个空间位置去关注文本的不同 token：句子 \"a red car and a blue house\" 里，画面左边要 attend 到 \"red car\"，右边要 attend 到 \"blue house\"。如果只压成一个 768 维向量，这种「哪块区域对应哪个词」的对应关系就彻底丢了——单向量是全局的、压缩的，知道画里有什么，但不知道在哪。Imagen 论文的消融实验也证实 token 序列质量远好于池化向量。\n\n注意 SD v1.x 的 CLIP 有 77 token 上限，短文本 padding 到 77，长文本被截断。"
+   },
+   {
+    "title": "SpatialTransformer 与 Cross-Attention",
+    "body": "文本是怎么注入 U-Net 的？SD 在每个分辨率层级的 ResBlock 旁边插了 SpatialTransformer Block，核心是两个注意力：Self-Attention（图像内部空间交互）和 Cross-Attention（文本到图像）。\n\nCross-Attention 的关键在于 Query 来自图像、Key/Value 来自文本：\n\n$$Q = W_Q \\cdot x, \\quad K = W_K \\cdot h_{\\text{text}}, \\quad V = W_V \\cdot h_{\\text{text}}$$\n\n$$\\text{Attention}(Q,K,V) = \\text{softmax}\\!\\left(\\frac{QK^\\top}{\\sqrt{d_k}}\\right)V$$\n\n其中展平的图像特征 $x \\in \\mathbb{R}^{(H\\cdot W)\\times d}$，文本 $h_{\\text{text}} \\in \\mathbb{R}^{77 \\times 768}$。于是图像每个空间位置都能查询文本的每个 token，拿回对应的语义。时间步 $t$ 则通过正弦编码 + MLP 变成 $t_{\\text{emb}}$，以加法方式融进每个 ResBlock。"
+   },
+   {
+    "title": "推理管线四步走（含 CFG 批处理）",
+    "body": "txt2img 推理分四步：①CLIP 编码正面和负面提示；②采样初始噪声 $z_T \\sim \\mathcal{N}(0,I)$，形状 $[B,4,64,64]$；③DDIM 去噪循环（默认 50 步）；④VAE 解码。\n\n第三步里 CFG 的批处理技巧很关键：把 $z_t$ 复制一份、负面和正面嵌入拼成一个 batch，一次前向同时算出无条件和有条件预测，再 chunk 分开：\n\n```python\nz_input = torch.cat([z_t, z_t])\nh_input = torch.cat([h_neg, h_pos])\nnoise_pred = unet(z_input, t, h_input)\nnoise_uncond, noise_cond = noise_pred.chunk(2)\nnoise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)\n```\n\nDDIM 单步更新公式：\n\n$$z_{t-1} = \\sqrt{\\bar\\alpha_{t-1}}\\cdot \\frac{z_t - \\sqrt{1-\\bar\\alpha_t}\\,\\epsilon_\\theta}{\\sqrt{\\bar\\alpha_t}} + \\sqrt{1-\\bar\\alpha_{t-1}}\\cdot \\epsilon_\\theta$$\n\n解码前还要除以 SD 特有的缩放因子：$z_0 = z_0 / 0.18215$。"
+   },
+   {
+    "title": "Negative Prompt 与 img2img",
+    "body": "**Negative Prompt** 不是新机制，而是 CFG 的自然延伸。普通 CFG 里无条件嵌入 $\\varnothing$ 对应空文本 `\"\"`；负面提示只是把 $\\varnothing$ 换成负面词（如 \"blurry, low quality\"）的 CLIP 编码：\n\n$$\\hat\\epsilon_\\theta = \\epsilon_\\theta(z_t,t,c_{neg}) + w\\,[\\epsilon_\\theta(z_t,t,c_{pos}) - \\epsilon_\\theta(z_t,t,c_{neg})]$$\n\n于是生成同时朝正面靠拢、远离负面。\n\n**img2img** 则换了起点：不从纯噪声出发，而是把输入图编码成 $z_0^{input}$，按强度 $s \\in (0,1]$ 选起始时间步 $t^* = \\lfloor s\\cdot T \\rfloor$ 加噪到 $z_{t^*}$，再从 $t^*$（而非 $T$）开始去噪。$s=1.0$ 等价 txt2img，$s=0.5$ 保留大致结构改细节，$s=0.2$ 只做微调。"
+   },
+   {
+    "title": "生态：ControlNet / LoRA / SDXL",
+    "body": "SD 开源催生了庞大生态，三个最常用的扩展：\n\n- **ControlNet**：复制 U-Net 编码器作可训练副本，通过 zero convolution（初始权重为零的 1x1 卷积）注入 Canny 边缘、姿态、深度等控制信号。零初始化保证训练开始时不影响原模型。\n- **LoRA**：低秩适配 $W' = W + BA$，其中 $B \\in \\mathbb{R}^{d\\times r}$、$A \\in \\mathbb{R}^{r\\times k}$、$r \\ll \\min(d,k)$。通常加在 Cross-Attention 的 $W_Q,W_K,W_V,W_O$ 上，文件仅 2-50MB，远小于完整模型的 2GB。\n- **SDXL**：U-Net 升到约 2.6B，用 CLIP ViT-L + OpenCLIP ViT-bigG 双编码器（拼成 2048 维条件），默认 1024x1024，Base + Refiner 两阶段。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **VAE 缩放因子忘了用**：解码前必须 $z_0 / 0.18215$，漏掉颜色/对比度会整体偏掉。\n- **CFG batch 顺序搞反**：拼接时是 $[h_{neg}, h_{pos}]$，chunk 出来第一块是 uncond、第二块是 cond，反了 guidance 方向就错了。\n- **guidance_scale 过大**：$w$ 太高会过饱和、出伪影，常用 7.5 左右。\n- **以为 img2img 的 strength=0 就不改变图像**：即使不做任何去噪，VAE 编码-解码本身也有重建误差，$\\hat x \\neq x$。\n- **用了池化向量而非 token 序列**：会严重削弱多物体场景的属性绑定能力。\n- **77 token 上限**：长 prompt 被悄悄截断，超出部分不起作用。"
+   },
+   {
+    "title": "小结",
+    "body": "Stable Diffusion = CLIP 文本编码器（token 级嵌入）+ KL-VAE（$f=8$ 压缩到潜在空间）+ U-Net（SpatialTransformer 里用 Cross-Attention 注入文本）。把扩散搬进 16K 维潜在空间、配合 CFG 批处理，是它能在消费级 GPU 上跑文本生图的核心。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "Stable Diffusion 相对于在像素空间直接做扩散的 DDPM，最核心的工程创新是什么？",
+    "options": [
+     "用了更深的 U-Net 网络",
+     "把扩散过程从像素空间转移到 VAE 的低维潜在空间",
+     "去掉了 CFG，改用分类器引导",
+     "把采样步数从 1000 步降到 50 步"
+    ],
+    "answer": 1,
+    "explain": "SD 的关键洞察来自 LDM 论文：在 VAE 潜在空间（512x512 对应 64x64x4，约 16K 维）做扩散，比在 78 万维像素空间省得多，这才让它能在消费级 GPU 上运行。降步数是 DDIM 的功劳，不是 SD 独有。"
+   },
+   {
+    "type": "input",
+    "prompt": "SD 的 KL-VAE 压缩比 $f=8$，把 512x512 图像编码成 $64 \\times 64 \\times 4$。请问其空间边长缩小了几倍？（填数字）",
+    "accept": ["8", "8倍", "8x", "八", "八倍"],
+    "explain": "$f=8$ 指空间每条边缩小 8 倍：$512/8 = 64$。通道从 3 变成 4，但题问的是边长压缩比，是 8。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么 SD 使用 CLIP 文本编码器最后一层的 token 级 hidden states（$[B,77,768]$），而不是单个池化向量（$\\mathbb{R}^{768}$）？",
+    "options": [
+     "token 序列计算更快",
+     "Cross-Attention 需要让图像每个空间位置关注文本不同 token，单向量丢失了空间-语义对应",
+     "池化向量维度太低，无法做矩阵乘法",
+     "CLIP 不支持输出池化向量"
+    ],
+    "answer": 1,
+    "explain": "Cross-Attention 让图像每个位置 attend 到文本的不同 token，从而实现「左边对应 red car、右边对应 blue house」这种细粒度绑定。单一向量是全局压缩的，会丢掉这种空间对应。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 SD 的 Cross-Attention 中，Query 来自文本嵌入，Key 和 Value 来自图像特征。",
+    "answer": false,
+    "explain": "正好相反。Cross-Attention 中 $Q = W_Q x$ 来自图像特征，$K,V$ 来自文本 $h_{text}$。这样图像的每个空间位置（Query）去查询文本（Key/Value）以获取语义。"
+   },
+   {
+    "type": "choice",
+    "prompt": "CFG 在 SD 推理中用到的批处理技巧是什么？",
+    "options": [
+     "把 50 步采样并行成一个 batch",
+     "把 $z_t$ 复制一份、负面与正面嵌入拼成一个 batch，一次前向同时得到无条件和有条件预测",
+     "把多张图像拼成 batch 同时生成",
+     "把 U-Net 拆成两个分别预测"
+    ],
+    "answer": 1,
+    "explain": "为利用 GPU 并行，把 latent 复制成 $[2B,\\dots]$、嵌入拼成 $[h_{neg}, h_{pos}]$，一次前向得到两个预测，再 chunk 分开做 CFG 合并。这样只需一次前向而非两次。"
+   },
+   {
+    "type": "input",
+    "prompt": "SD 在 VAE 解码前需要把潜在表示除以一个特有的缩放因子。这个数值是多少？",
+    "accept": ["0.18215", ".18215"],
+    "explain": "SD 训练时潜在被乘了 0.18215 做归一化，解码前要除回去：$z_0 = z_0 / 0.18215$。忘记这步会导致颜色/对比度整体偏移。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Negative Prompt 本质上是把 CFG 公式里的「无条件嵌入 $\\varnothing$」从空文本编码替换为负面提示词的编码，不需要单独训练新模型。",
+    "answer": true,
+    "explain": "Negative Prompt 是 CFG 的自然延伸：普通 CFG 的 $\\varnothing$ 对应空文本，负面提示只是把它换成负面词的 CLIP 编码，生成时同时靠拢正面、远离负面，无需额外训练。"
+   },
+   {
+    "type": "choice",
+    "prompt": "img2img 中 strength 参数 $s$（取值 0~1）的作用是什么？",
+    "options": [
+     "控制 guidance_scale 的大小",
+     "决定加噪/去噪的起始时间步 $t^* = \\lfloor s\\cdot T\\rfloor$，$s$ 越大越接近从纯噪声重新生成",
+     "控制 VAE 的压缩比",
+     "控制 LoRA 的强度"
+    ],
+    "answer": 1,
+    "explain": "img2img 把输入图编码后加噪到 $t^* = \\lfloor s\\cdot T\\rfloor$ 再去噪。$s=1$ 等价 txt2img（完全重生成），$s=0.2$ 只做微调（保留原结构）。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 img2img 里只要把 strength 设为 0，输出图像就和输入图像完全一致、毫无变化。",
+    "answer": false,
+    "explain": "即使 strength=0 不做任何去噪步，输入图也经过了 VAE 编码-解码一个来回，VAE 不是完美自编码器（重建 PSNR 约 27-30dB），$\\hat x \\neq x$，在文字、纹理处会有可见差异。"
+   },
+   {
+    "type": "input",
+    "prompt": "LoRA 用低秩分解 $W' = W + BA$ 微调，其中 $B \\in \\mathbb{R}^{d\\times r}$、$A \\in \\mathbb{R}^{r\\times k}$。这里要求 $r$ 满足什么条件才能实现「参数高效」？（用不等式或文字描述 $r$ 与 $d,k$ 的关系）",
+    "accept": ["r远小于min(d,k)", "r << min(d,k)", "r很小", "r远小于d和k", "r远小于min", "r远小于d,k", "低秩"],
+    "explain": "LoRA 要求秩 $r \\ll \\min(d,k)$，这样 $BA$ 的参数量 $r(d+k)$ 远小于完整的 $dk$，文件可压到 2-50MB。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 SD 的每个模块/扩展和它的核心职责配对：",
+    "left": [
+     "CLIP Text Encoder",
+     "KL-VAE",
+     "U-Net 的 SpatialTransformer",
+     "ControlNet 的 zero convolution",
+     "SDXL"
+    ],
+    "right": [
+     "把 prompt 编码成 [B,77,768] 的 token 级文本嵌入",
+     "在像素空间与潜在空间之间编码/解码（f=8 压缩）",
+     "用 Cross-Attention 把文本语义注入图像特征",
+     "初始权重为零，保证训练开始时不扰动原模型",
+     "2.6B U-Net + 双文本编码器 + Base/Refiner 两阶段"
+    ],
+    "explain": "CLIP 负责文本编码、VAE 负责压缩/还原、SpatialTransformer 负责文本注入、zero conv 是 ControlNet 的零初始化注入、SDXL 是更大的双编码器两阶段升级版。"
+   },
+   {
+    "type": "choice",
+    "prompt": "把 guidance_scale 调得过大（如 20+），最可能出现什么问题？",
+    "options": [
+     "生成速度变慢",
+     "图像过饱和、出现伪影，细节失真",
+     "VAE 解码失败",
+     "文本被截断"
+    ],
+    "answer": 1,
+    "explain": "$w$ 太大会过度放大条件方向，导致颜色过饱和、出现伪影。常用值约 7.5，是质量与一致性的平衡点。"
+   }
+  ]
+ },
+ {
+  "title": "DALL-E 2 与层次式生成",
+  "subtitle": "unCLIP 两阶段：文本→CLIP 先验→CLIP 图像嵌入→解码器→图像",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "上一关的 SD 是「文本 token 序列 → Cross-Attention → 图像」一条龙。DALL-E 2（OpenAI 2022）走了完全不同的路：它先用 CLIP 把文本和图像映到同一个嵌入空间，再「反着用」CLIP——这就是 unCLIP。\n\n核心痛点是：同一段文本能对应无数种合理的图像，这是个一对多的分布问题。DALL-E 2 把生成拆成两阶段：先验（Prior）从文本嵌入预测一个 CLIP 图像嵌入，解码器（Decoder）再从图像嵌入生成像素。这种层次化设计不仅提质量，还顺手解锁了图像变体、语义插值、嵌入算术等独特能力。本关讲透为什么要两阶段、先验怎么设计、CLIP 嵌入怎么注入解码器。"
+   },
+   {
+    "title": "unCLIP 框架：反转 CLIP",
+    "body": "DALL-E 2 论文标题是「Hierarchical Text-Conditional Image Generation with CLIP Latents」，方法叫 unCLIP，因为它在概念上反转了 CLIP：\n\n- **CLIP**：图像 → CLIP 图像嵌入\n- **unCLIP**：CLIP 图像嵌入 → 图像\n\n完整流程：\n\n$$\\text{文本} \\xrightarrow{\\text{CLIP 文本编码}} z_t \\xrightarrow{\\text{Prior}} z_i \\xrightarrow{\\text{Decoder}} \\text{图像}$$\n\n其中 $z_t$ 是 CLIP 文本嵌入、$z_i$ 是 CLIP 图像嵌入（都是 768 维），Prior 负责从 $z_t$ 预测 $z_i$。注意这里嵌入都是 $\\mathbb{R}^{768}$ 的单个向量，跟 SD 的 77 token 序列是不同的条件形式。"
+   },
+   {
+    "title": "为什么需要先验？模态差异",
+    "body": "一个很自然的问题：CLIP 文本和图像本来就在同一空间，为什么不把 $z_t$ 直接喂给解码器，省掉先验？实验发现这样质量明显下降，原因有三：\n\n**为什么？因为存在模态差异（modality gap）。** ①CLIP 的文本嵌入和图像嵌入虽在同一空间，但分布有系统性偏移，中间隔着一个 gap；②文本 \"a dog\" 没指定品种、颜色、姿态、背景，先验的工作正是在条件分布里「填补」这些缺失的视觉信息；③一段文本对应多种风格构图，先验作为生成模型能采样出不同的 $z_i$，带来多样性。\n\n$$p(z_i \\mid z_t) \\neq \\delta(z_i - g(z_t))$$\n\n一句话：先验把「文本空间的一个点」映射成「图像空间的一个分布」。"
+   },
+   {
+    "title": "扩散先验与 x₀-prediction",
+    "body": "DALL-E 2 探索过自回归先验和扩散先验，最终选了**扩散先验**（质量和多样性都更好）。它在 768 维的 CLIP 图像嵌入空间里做扩散：\n\n前向加噪：$z_i^{(t)} = \\sqrt{\\bar\\alpha_t}\\,z_i + \\sqrt{1-\\bar\\alpha_t}\\,\\epsilon$\n\n训练目标用的是 $x_0$-prediction（直接预测干净的 $z_i$），而非 $\\epsilon$-prediction：\n\n$$\\mathcal{L}_{\\text{prior}} = \\mathbb{E}_{t,z_i,\\epsilon}\\big[\\,\\|z_i - f_\\theta(z_i^{(t)}, t, z_t)\\|^2\\,\\big]$$\n\n**为什么用 $x_0$-prediction 而非预测噪声？因为这是个低维空间。** 768 维远小于像素空间几十万维，在低维里直接预测目标方差更小、训练更稳；而且 CLIP 嵌入是归一化、结构化的，$\\epsilon$-prediction 的噪声方向可能破坏这种结构，$x_0$-prediction 始终落在有意义的嵌入空间里。",
+    "formula": "\\mathcal{L}_{\\text{prior}} = \\mathbb{E}_{t,z_i,\\epsilon}\\big[\\|z_i - f_\\theta(z_i^{(t)}, t, z_t)\\|^2\\big]"
+   },
+   {
+    "title": "解码器：两种注入方式 + 级联超分",
+    "body": "unCLIP 的解码器基于 GLIDE（像素空间扩散）。它用两种互补方式把 CLIP 图像嵌入 $z_i$ 注入：\n\n**方式 1：加到时间步嵌入**\n$$t_{emb}' = t_{emb} + \\text{Linear}(z_i)$$\n提供全局语义基调，影响整个网络。\n\n**方式 2：作为 Cross-Attention 额外 token**\n$$K' = [K_{text}; K_{clip}], \\quad V' = [V_{text}; V_{clip}]$$\n把 $z_i$ 投影成 4 个额外 token 拼到文本 token 后，让每个空间位置可选择性地 attend。\n\n生成完 64x64 后，用**级联超分**逐步放大：64→256→1024，每级是独立训练的扩散模型。超分时对低分输入做**噪声增强**（加少量噪声），防止超分模型过度依赖低分细节、避免放大伪影。"
+   },
+   {
+    "title": "CLIP 嵌入空间的操作（代码直觉）",
+    "body": "两阶段设计天然支持几种嵌入空间的玩法。先提取嵌入并归一化：\n\n```python\nimage_embeds = model.get_image_features(**inputs)\nimage_embeds = F.normalize(image_embeds, dim=-1)\n```\n\n**图像变体**：提取输入图的 $z_i$，跳过先验直接送解码器，靠扩散随机性产生语义相似但细节不同的图。\n\n**SLERP 插值**（球面线性插值，比线性更适合归一化向量）：\n\n```python\ndot = torch.dot(e1, e2).clamp(-1, 1)\nomega = torch.acos(dot)\nout = (torch.sin((1-lam)*omega)/torch.sin(omega))*e1 + (torch.sin(lam*omega)/torch.sin(omega))*e2\n```\n\n**文本-图像混合**：$z_{mix} = \\alpha z_t + (1-\\alpha)z_i$（需先归一化到同尺度）。**语义算术**：$z_{result} = z_{image} - z_{textA} + z_{textB}$，类似词向量算术。"
+   },
+   {
+    "title": "与 Stable Diffusion 的关键对比",
+    "body": "DALL-E 2 和 SD 在条件机制上是两种哲学：\n\n| 维度 | DALL-E 2 | Stable Diffusion |\n|------|----------|-----------------|\n| 生成空间 | 像素空间 + 级联超分 | VAE 潜在空间 |\n| 文本条件 | CLIP 图像嵌入（单向量 768） | CLIP 文本 token 序列（77x768） |\n| 条件机制 | CLIP 先验 + 嵌入注入 | Cross-Attention |\n| 分辨率 | 64→256→1024 级联 | 直接 512 |\n| 参数 | 约 3.5B | 约 890M |\n| 开源 | 否 | 是 |\n\n**后果**：SD 用 token 级 Cross-Attention，每个空间位置能选择性关注不同词，处理复杂构图（\"左猫右狗\"）通常更强；DALL-E 2 的单向量条件是全局压缩的，知道有什么但不精确知道在哪。而 SD 的开源催生了庞大生态，最终成了主流。"
+   },
+   {
+    "title": "层次化的一般化：Imagen 与 Parti",
+    "body": "级联是通用范式：$p(x) = p(x_{low})\\,p(x_{mid}|x_{low})\\,p(x_{high}|x_{mid})$。各级更易训练，但低分阶段的错误会传播放大、总耗时长。\n\n两个同期工作给出不同思路：\n\n- **Imagen（Google）**：用 T5-XXL（4.6B 纯语言模型）替代 CLIP 做文本编码，直接 Cross-Attention 无需 CLIP 先验。关键发现是：**更大的纯语言文本编码器比更大的图像模型更能提升质量**——质量瓶颈越来越多在「理解力」而非「绘画力」。这直接影响了 SDXL（双编码器）、SD3/FLUX（加 T5）。\n- **Parti（Google）**：走自回归路线，用 ViT-VQGAN 把图像编码成离散 token，再用 20B Transformer 自回归生成，可借语言模型的缩放经验，但速度慢。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **以为先验是确定性映射**：先验学的是分布 $p(z_i|z_t)$，一个文本点对应图像空间一个分布，不是一个点。\n- **先验用错预测目标**：768 维低维空间用 $x_0$-prediction 更稳，别照搬像素空间的 $\\epsilon$-prediction。\n- **混合嵌入忘了归一化**：$z_t$ 和 $z_i$ 的 norm 可能不同，混合前要归一化到同尺度。\n- **把 lerp 当 slerp**：线性插值中点模长会缩短，归一化后语义变化不均匀；归一化向量更适合 SLERP。\n- **超分阶段不做噪声增强**：会让超分模型死磕低分细节，把伪影一起放大。\n- **以为 DALL-E 2 也是潜在空间扩散**：它是像素空间 + 级联，跟 SD 的潜在空间是两回事。"
+   },
+   {
+    "title": "小结",
+    "body": "DALL-E 2 的 unCLIP 把生成拆成两阶段：扩散先验（768 维 CLIP 嵌入空间、$x_0$-prediction）从文本嵌入预测图像嵌入，弥合模态差异、把点映射成分布；解码器（GLIDE + 级联超分）从图像嵌入生成像素。它用单向量条件，空间控制不如 SD 的 token 级 Cross-Attention 精确，但天然支持图像变体与嵌入算术。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "DALL-E 2 的 unCLIP 框架，完整生成流程是哪一条？",
+    "options": [
+     "文本 → 图像（直接 Cross-Attention）",
+     "文本 → CLIP 文本嵌入 → 先验 → CLIP 图像嵌入 → 解码器 → 图像",
+     "图像 → CLIP 图像嵌入 → 文本",
+     "文本 → VAE 潜在 → U-Net → 图像"
+    ],
+    "answer": 1,
+    "explain": "unCLIP 是两阶段：先验从 CLIP 文本嵌入 $z_t$ 预测 CLIP 图像嵌入 $z_i$，解码器再从 $z_i$ 生成像素。「un」指它反转了 CLIP（图像→嵌入）的方向。"
+   },
+   {
+    "type": "judge",
+    "prompt": "既然 CLIP 文本嵌入和图像嵌入在同一空间，直接把文本嵌入喂给解码器、跳过先验，效果会和带先验一样好。",
+    "answer": false,
+    "explain": "实验发现跳过先验质量明显下降。原因是模态差异（文本嵌入和图像嵌入分布有系统性偏移）、文本信息缺失（需要先验填补视觉细节）、以及多模态分布（先验能采样多样的 $z_i$）。"
+   },
+   {
+    "type": "choice",
+    "prompt": "DALL-E 2 的扩散先验为什么用 $x_0$-prediction（直接预测干净的 $z_i$）而不是 $\\epsilon$-prediction？",
+    "options": [
+     "$\\epsilon$-prediction 在任何情况下都更差",
+     "先验在 768 维低维 CLIP 嵌入空间工作，$x_0$-prediction 方差更小、训练更稳，且不破坏归一化的嵌入结构",
+     "$x_0$-prediction 计算更快",
+     "因为没有噪声可以预测"
+    ],
+    "answer": 1,
+    "explain": "CLIP 嵌入只有 768 维（远小于像素空间），低维里直接预测目标方差小、更稳定；且嵌入是归一化结构化的，$\\epsilon$-prediction 的噪声方向可能破坏结构。"
+   },
+   {
+    "type": "input",
+    "prompt": "DALL-E 2 的扩散先验是在多少维的空间中做扩散的？（CLIP ViT-L/14 图像嵌入维度，填数字）",
+    "accept": ["768", "768维"],
+    "explain": "扩散先验在 CLIP ViT-L/14 的图像嵌入空间做扩散，该嵌入是 768 维的单个向量。"
+   },
+   {
+    "type": "choice",
+    "prompt": "DALL-E 2 解码器注入 CLIP 图像嵌入 $z_i$ 的两种方式分别是什么？",
+    "options": [
+     "VAE 编码 + VAE 解码",
+     "加到时间步嵌入（全局语义基调）+ 作为 Cross-Attention 的额外 token（空间可选关注）",
+     "拼接到噪声 + 乘到权重上",
+     "BatchNorm + LayerNorm"
+    ],
+    "answer": 1,
+    "explain": "方式 1 把 $z_i$ 投影加到 $t_{emb}$ 提供全局语义；方式 2 把 $z_i$ 投影成 4 个额外 token 拼到文本 token 后，让各空间位置可选择性 attend。两者互补。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在 CLIP 嵌入空间对归一化向量做插值时，SLERP（球面线性插值）通常比 lerp（线性插值）产生更平滑均匀的语义过渡。",
+    "answer": true,
+    "explain": "lerp 的中点模长会小于端点，归一化后语义变化不均匀；SLERP 在单位球面上等角速插值、保持模长恒定，对归一化嵌入更合理。"
+   },
+   {
+    "type": "input",
+    "prompt": "DALL-E 2 的解码器先生成 64x64，再用级联超分逐步放大。它的级联分辨率序列是 64 → 256 → ?（填最终分辨率）",
+    "accept": ["1024", "1024x1024", "1024*1024"],
+    "explain": "级联三阶段：base 出 64x64，超分 1 到 256x256，超分 2 到 1024x1024。每级是独立训练的扩散模型。"
+   },
+   {
+    "type": "choice",
+    "prompt": "对比 DALL-E 2 和 Stable Diffusion 的条件机制，下列说法正确的是？",
+    "options": [
+     "两者都在 VAE 潜在空间做扩散",
+     "DALL-E 2 用单个 CLIP 图像嵌入（全局），SD 用 token 序列 + Cross-Attention（空间细粒度），SD 在复杂构图上通常更强",
+     "DALL-E 2 的 Cross-Attention 比 SD 更精确",
+     "两者文本条件完全相同"
+    ],
+    "answer": 1,
+    "explain": "DALL-E 2 主条件是单个 768 维图像嵌入，全局压缩；SD 用 77 token 序列做 Cross-Attention，每个位置可关注不同词，因此处理「左猫右狗」这类复杂构图通常更好。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Imagen 的一个关键发现是：扩大纯语言文本编码器（如 T5-XXL）比扩大图像生成模型更能提升生成质量。",
+    "answer": true,
+    "explain": "Imagen 用 T5-XXL 替代 CLIP，发现文本编码器的缩放比图像模型缩放更能提质——质量瓶颈越来越在「理解力」而非「绘画力」，这影响了 SDXL、SD3/FLUX 的编码器设计。"
+   },
+   {
+    "type": "input",
+    "prompt": "CLIP 嵌入空间支持类似词向量的语义算术，公式形如 $z_{result} = z_{image} - z_{A} + z_{B}$。这种算术成立依赖于嵌入空间的什么性质？（填关键词）",
+    "accept": ["局部线性性", "线性性", "局部线性", "局部线性结构", "线性结构"],
+    "explain": "嵌入算术能成立依赖于 CLIP 嵌入空间的「局部线性性」——线性组合对应语义的线性组合。在跨类别、高曲率区域这种线性假设会失效。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 DALL-E 2 / 层次化生成的概念和其核心要点配对：",
+    "left": [
+     "扩散先验",
+     "图像变体",
+     "噪声增强（超分阶段）",
+     "文本-图像混合 z_mix",
+     "Parti"
+    ],
+    "right": [
+     "在 768 维 CLIP 图像嵌入空间扩散，用 x₀-prediction",
+     "提取图像的 CLIP 嵌入跳过先验直接解码，靠随机性产生语义相似的变体",
+     "对低分输入加少量噪声，防止超分模型过度依赖细节、放大伪影",
+     "αz_t + (1-α)z_i，需先归一化，混合文本与图像条件",
+     "ViT-VQGAN 离散 token + 20B Transformer 自回归生成"
+    ],
+    "explain": "扩散先验在低维嵌入空间用 x₀-pred；图像变体跳过先验直接解码；噪声增强防伪影放大；z_mix 混合两种条件；Parti 是自回归路线。逐项对齐无误。"
+   },
+   {
+    "type": "choice",
+    "prompt": "下面关于 DALL-E 2 先验的描述，哪个是错误的（需要纠正的常见误解）？",
+    "options": [
+     "先验学习的是条件分布 $p(z_i|z_t)$，一个文本对应图像空间的一个分布",
+     "先验是一个确定性映射，一个文本嵌入只能输出唯一的图像嵌入",
+     "扩散先验在质量和多样性上优于自回归先验，是最终采用的方案",
+     "先验的作用之一是弥合 CLIP 文本与图像嵌入之间的模态差异"
+    ],
+    "answer": 1,
+    "explain": "这是错误说法。先验恰恰不是确定性映射——它学的是分布 $p(z_i|z_t) \\neq \\delta(z_i - g(z_t))$，能为同一文本采样多种合理的图像嵌入，这正是多样性的来源。"
+   }
+  ]
+ },
+ {
+  "title": "DiT：扩散 Transformer",
+  "subtitle": "用纯 Transformer 替换 U-Net，patch 化 + adaLN-Zero，继承 Scaling Laws",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "U-Net 自 DDPM 以来一直是扩散模型的标准骨干，它有局部性、层次性、跳跃连接这些对图像友好的归纳偏置。但它也有硬伤：扩展方式（加通道、加层级）不系统，缺乏 LLM 那种可预测的 Scaling Laws，全局交互只在低分辨率层级有，组件还特别多（ResBlock、SpatialTransformer、上下采样、skip）难以系统优化。\n\nDiT（Diffusion Transformer，Peebles & Xie 2023）干了一件看似简单的事：**把骨干网络从 U-Net 换成纯 Transformer**。但影响深远——它证明了扩散模型也遵循 Transformer 的 Scaling Laws（模型越大持续越好），在 ImageNet 256x256 上 DiT-XL/2 拿到 SOTA FID=2.27，直接催生了 Sora、SD3/FLUX。本关讲透 patch 化、adaLN-Zero 条件机制和缩放特性。"
+   },
+   {
+    "title": "从图像到 token：Patch 化",
+    "body": "DiT 和 SD 一样在 VAE 潜在空间工作，输入已是压缩表示。Patch 化把 2D 特征切成小块、每块当一个 token：\n\n$$z \\in \\mathbb{R}^{h\\times w\\times c} \\xrightarrow{\\text{PatchEmbed}} \\text{tokens} \\in \\mathbb{R}^{N\\times D}, \\quad N = \\frac{hw}{p^2}$$\n\n其中 $h=H/8, w=W/8$（VAE 压缩），$c=4$（VAE 通道），$p$ 是 patch 大小，$D$ 是隐藏维度。\n\n以 ImageNet 256x256 为例，VAE 编码后是 $32\\times32\\times4$：\n- $p=2$（DiT 默认）：$N = 32\\times32/4 = 256$ 个 token\n- $p=4$：$N = 64$；$p=8$：$N = 16$\n\nPatch 越小 token 越多、保留空间信息越多、质量越好（$p=2$ FID=2.27 最优），但 Self-Attention 复杂度 $O(N^2)$ 计算量也最大。",
+    "formula": "N = \\frac{hw}{p^2}, \\quad 32\\times32, p=2 \\Rightarrow N = 256"
+   },
+   {
+    "title": "位置嵌入与 Unpatchify",
+    "body": "Transformer 本身对顺序无感，需要位置嵌入。DiT 用**固定正弦 2D 位置嵌入**（也可换成可学习的），对每个 patch 的行列坐标 $(i,j)$ 编码。固定正弦的好处是支持**分辨率外推**——256 上训练的模型可以通过插值位置嵌入在 512 上推理。\n\n输出端要做 **Unpatchify**：把 token 序列还原回 2D 特征图。每个 token 经线性层预测它对应 patch 区域的所有值：\n\n$$\\text{tokens} \\in \\mathbb{R}^{N\\times D} \\xrightarrow{\\text{Linear}} \\mathbb{R}^{N\\times(p^2 c)} \\xrightarrow{\\text{reshape}} \\mathbb{R}^{h\\times w\\times c}$$\n\n即一个 token 负责预测它那块 $p\\times p\\times c$ 的像素值。"
+   },
+   {
+    "title": "条件化的四种方案与 adaLN-Zero 的胜出",
+    "body": "DiT 要注入两种条件：时间步 $t$（标量）和类别标签 $y$。论文比了四种方案：\n\n1. **In-Context**：把条件当额外 token 拼到序列前。最简单但最差（只能间接影响）。\n2. **Cross-Attention**：像 SD 那样加 Cross-Attention 层，$K=V=[t_{emb}, y_{emb}]$。有效但增约 15% 参数。\n3. **adaLN**：用条件回归 LayerNorm 的缩放偏移 $\\gamma,\\beta$。效果好但训练初期不稳。\n4. **adaLN-Zero（最终选择）**：在 adaLN 基础上加**零初始化**和额外缩放 $\\alpha$。\n\n消融结果（DiT-XL/2, 400K 步）很说明问题：\n\n| 条件化 | FID↓ |\n|--------|------|\n| In-Context | 5.95 |\n| Cross-Attention | 3.75 |\n| adaLN | 3.15 |\n| adaLN-Zero | 2.27 |\n\nadaLN-Zero 显著最优，且不增加额外参数（不像 Cross-Attention 要额外 KV 投影）。"
+   },
+   {
+    "title": "为什么 adaLN-Zero 要零初始化",
+    "body": "adaLN-Zero 给每个 DiT Block 回归 6 个调制参数：$\\gamma_1,\\beta_1,\\alpha_1$（给 Attention）和 $\\gamma_2,\\beta_2,\\alpha_2$（给 FFN），其中 $\\alpha$ 是关键的额外缩放：\n\n$$h_1 = \\text{LayerNorm}(x)\\cdot(1+\\gamma_1) + \\beta_1, \\quad x = x + \\alpha_1\\cdot\\text{Attn}(h_1)$$\n$$h_2 = \\text{LayerNorm}(x)\\cdot(1+\\gamma_2) + \\beta_2, \\quad x = x + \\alpha_2\\cdot\\text{FFN}(h_2)$$\n\n回归这些参数的最后一个 Linear 层**权重和偏置都初始化为零**。\n\n**为什么这么做？因为它让训练从恒等映射起步。** 初始时所有调制参数为零，于是 $1+\\gamma=1$、$\\beta=0$、$\\alpha=0$，每个 Block 的输出 $x + 0\\cdot\\text{Attn} = x$，整个 DiT 一开始等价于「什么都不做」。这比随机初始化稳得多：随机调制可能产生极端缩放导致梯度爆炸、初始损失巨大；零初始化让条件影响从零逐渐长出来，思想和 ResNet 的 fixup 零初始化残差分支一致。"
+   },
+   {
+    "title": "PyTorch：DiT Block",
+    "body": "adaLN-Zero 的调制层和 DiT Block 的核心实现：\n\n```python\nclass AdaLNZeroModulation(nn.Module):\n    def __init__(self, hidden_size):\n        super().__init__()\n        self.silu = nn.SiLU()\n        self.linear = nn.Linear(hidden_size, 6 * hidden_size)\n        nn.init.zeros_(self.linear.weight)\n        nn.init.zeros_(self.linear.bias)\n    def forward(self, c):\n        params = self.linear(self.silu(c)).unsqueeze(1)\n        return params.chunk(6, dim=-1)\n```\n\nBlock 里用这 6 个参数调制 Self-Attention 和 FFN：\n\n```python\ndef forward(self, x, c):\n    g1, b1, a1, g2, b2, a2 = self.adaLN_modulation(c)\n    h = self.norm1(x) * (1 + g1) + b1\n    x = x + a1 * self.attn(h, h, h)[0]\n    h = self.norm2(x) * (1 + g2) + b2\n    x = x + a2 * self.mlp(h)\n    return x\n```\n\n注意 LayerNorm 用 `elementwise_affine=False`——缩放偏移交给 adaLN 的 $\\gamma,\\beta$ 动态生成。"
+   },
+   {
+    "title": "缩放：变体与 Scaling Laws",
+    "body": "DiT 沿用 ViT 命名定义了 4 个变体：\n\n| 变体 | 层数 | 隐藏维度 | 头数 | 参数量 |\n|------|------|---------|------|--------|\n| DiT-S | 12 | 384 | 6 | 33M |\n| DiT-B | 12 | 768 | 12 | 130M |\n| DiT-L | 24 | 1024 | 16 | 458M |\n| DiT-XL | 28 | 1152 | 16 | 675M |\n\n关键发现是 FID 随训练计算量 $C$（Gflops × 步数）呈幂律下降：$\\text{FID} \\propto C^{-\\alpha}$。含义：①更大模型始终更好；②即使小模型训练更久也难追上大模型；③可用小规模实验预测大模型性能。\n\n而且在相同 Gflops 下 DiT 比 U-Net 更高效——DiT-XL/2（119 Gflops, FID=2.27）打败 ADM-U（296 Gflops, FID=3.94），用不到一半计算量拿到更好结果。原因：全局注意力信息流动高效、统一架构优化一致、矩阵乘法对 GPU 更友好。"
+   },
+   {
+    "title": "影响：Sora、PixArt、MMDiT",
+    "body": "DiT 证明「Transformer 可扩展」后，后续突破接连而来：\n\n- **Sora（OpenAI 2024）**：Spacetime DiT，把视频当 3D 体积（帧×高×宽）做 3D patch 化（如 $p_t=p_h=p_w=2$），可变分辨率/时长，参数据传 3B-30B。\n- **PixArt-α**：高效训练（三阶段：像素→概念→高质量），仅用 SD 约 10.8% 训练成本达到同等质量。\n- **SD3 / FLUX 的 MMDiT（Multimodal DiT）**：文本 token 和图像 token 在**同一个 Transformer** 里联合处理，而非单向 Cross-Attention。把两种 token 拼接后做 Joint Self-Attention（所有 token 自由互相 attend），再用**独立的 FFN** 分别更新。这种双向交互比单向 Cross-Attention 更强——文本表示也能随生成过程动态调整。SD3 还用 Flow Matching（见下一关）+ 三个文本编码器（CLIP-L + CLIP-G + T5-XXL）。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **adaLN-Zero 漏了零初始化**：改成随机初始化会训练不稳、初始损失巨大、收敛变慢，零初始化是恒等起步的关键。\n- **以为 patch 越大越好**：$p$ 越大 token 越少计算越省，但空间信息丢失、质量下降（$p=8$ FID 高达 9.62）。\n- **LayerNorm 还带 affine**：DiT 的 LayerNorm 应 `elementwise_affine=False`，缩放偏移交给 adaLN 动态生成，否则重复。\n- **以为 DiT 在像素空间工作**：DiT 和 LDM 一样在 VAE 潜在空间工作。\n- **混淆 MMDiT 与 Cross-Attention**：MMDiT 是文本图像 token 在同一注意力里双向交互，不是单向的 Cross-Attention。\n- **忽略位置嵌入**：Transformer 对顺序无感，去掉位置嵌入空间结构就乱了。"
+   },
+   {
+    "title": "小结",
+    "body": "DiT 把扩散骨干从 U-Net 换成纯 Transformer：patch 化把潜在特征变 token 序列，adaLN-Zero（零初始化、恒等起步）做条件注入并打败了 Cross-Attention 等方案。它最大的价值是证明扩散模型遵循 Scaling Laws，相同计算下还比 U-Net 高效，直接催生了 Sora 的 Spacetime DiT 和 SD3/FLUX 的 MMDiT。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "DiT 把扩散模型的骨干网络从 U-Net 换成纯 Transformer，最重要的意义是什么？",
+    "options": [
+     "推理速度直接快 10 倍",
+     "证明扩散模型也遵循 Transformer 的 Scaling Laws，模型越大持续越好，可预测",
+     "不再需要 VAE",
+     "彻底去掉了注意力机制"
+    ],
+    "answer": 1,
+    "explain": "DiT 的核心贡献是证明扩散模型遵循幂律 Scaling Laws（FID 随计算量单调下降、可预测），这直接催生了 Sora、SD3/FLUX。架构替换本身简单，意义在于可扩展性。"
+   },
+   {
+    "type": "input",
+    "prompt": "DiT 在 ImageNet 256x256 上，VAE 编码后潜在为 $32\\times32\\times4$，patch 大小 $p=2$。Self-Attention 的 token 序列长度 $N$ 是多少？（填数字）",
+    "accept": ["256", "256个", "N=256"],
+    "explain": "$N = hw/p^2 = (32\\times32)/2^2 = 1024/4 = 256$ 个 token。"
+   },
+   {
+    "type": "choice",
+    "prompt": "DiT 论文比较的四种条件化方案中，最终选用且 FID 最优（2.27）的是哪个？",
+    "options": [
+     "In-Context Conditioning",
+     "Cross-Attention",
+     "adaLN",
+     "adaLN-Zero"
+    ],
+    "answer": 3,
+    "explain": "消融结果：In-Context(5.95) > Cross-Attention(3.75) > adaLN(3.15) > adaLN-Zero(2.27)。adaLN-Zero 最优，且不增加额外参数。"
+   },
+   {
+    "type": "judge",
+    "prompt": "adaLN-Zero 的零初始化让每个 DiT Block 在训练开始时等价于恒等映射（输出等于输入）。",
+    "answer": true,
+    "explain": "回归调制参数的最后 Linear 层权重和偏置初始化为零，于是初始时 $\\alpha=0$，$x + 0\\cdot\\text{Attn} = x$，整个 DiT 起步是恒等映射，训练更稳。"
+   },
+   {
+    "type": "choice",
+    "prompt": "如果把 adaLN-Zero 改成随机初始化（不再零初始化），训练最可能出现什么问题？",
+    "options": [
+     "完全无法运行",
+     "训练不稳定、初始损失很高、收敛变慢（极端调制值可能导致梯度爆炸）",
+     "参数量翻倍",
+     "推理变慢但训练没影响"
+    ],
+    "answer": 1,
+    "explain": "随机初始化的调制参数可能产生极端缩放/偏移，导致梯度爆炸、初始预测离真值很远、损失巨大，模型还得额外花步数学会「先别乱改输入」。零初始化（类似 fixup）避免了这些。"
+   },
+   {
+    "type": "judge",
+    "prompt": "DiT 中 patch 大小 $p$ 取得越大（如 $p=8$），生成质量越好，因为每个 token 覆盖更多信息。",
+    "answer": false,
+    "explain": "恰好相反。$p$ 越大 token 越少、计算越省，但空间信息丢失、质量下降——$p=8$ 时 FID 高达 9.62，$p=2$ 时 FID=2.27 最优。$p$ 是质量和计算量的权衡。"
+   },
+   {
+    "type": "input",
+    "prompt": "DiT 用固定正弦位置嵌入而非可学习嵌入，带来的一个重要好处是支持什么？（填关键词，提示：与不同尺寸推理有关）",
+    "accept": ["分辨率外推", "外推", "分辨率插值", "插值外推", "分辨率泛化"],
+    "explain": "固定正弦位置嵌入支持分辨率外推：256 上训练的模型可通过插值位置嵌入在 512 上推理，可学习嵌入则难以外推。"
+   },
+   {
+    "type": "choice",
+    "prompt": "在相同 Gflops 计算预算下，DiT 与 U-Net（ADM）比较，结论是？",
+    "options": [
+     "U-Net 始终更好",
+     "DiT 计算效率更高，用不到一半计算量就拿到更好的 FID",
+     "两者完全一样",
+     "DiT 只在小模型上更好"
+    ],
+    "answer": 1,
+    "explain": "DiT-XL/2（119 Gflops, FID=2.27）打败 ADM-U（296 Gflops, FID=3.94）。原因是全局注意力信息流动高效、统一架构、矩阵乘法对 GPU 友好。"
+   },
+   {
+    "type": "judge",
+    "prompt": "SD3/FLUX 用的 MMDiT 把文本 token 和图像 token 拼在同一个 Transformer 里做 Joint Self-Attention 双向交互，而不是单向的 Cross-Attention。",
+    "answer": true,
+    "explain": "MMDiT 的核心创新就是文本和图像 token 联合处理、双向 attend（再用独立 FFN 分别更新），比单向 Cross-Attention（图像 attend 文本但文本不更新）更强，文本表示也能随生成动态调整。"
+   },
+   {
+    "type": "input",
+    "prompt": "Sora 把 DiT 扩展到视频生成，把视频当作 3D 体积（帧×高×宽）做几维的 patch 化？（填数字）",
+    "accept": ["3", "3维", "三", "三维"],
+    "explain": "Sora 是 Spacetime DiT，对视频做 3D patch 化（时间和空间同时切块，如 $p_t=p_h=p_w=2$），是 DiT 的 patch 化思路向时间维度的泛化。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 DiT 相关的概念和它的核心要点配对：",
+    "left": [
+     "Patch 化",
+     "adaLN-Zero",
+     "固定正弦位置嵌入",
+     "Scaling Laws",
+     "MMDiT（SD3/FLUX）"
+    ],
+    "right": [
+     "把 2D 潜在特征切成小块，每块当一个 token（p=2 时 32x32→256 个）",
+     "零初始化的自适应 LayerNorm，6 个调制参数，训练初期为恒等映射",
+     "支持分辨率外推，训练分辨率外可通过插值推理",
+     "FID 随计算量呈幂律下降，更大模型持续更好且可预测",
+     "文本与图像 token 在同一 Transformer 里 Joint Attention 双向交互"
+    ],
+    "explain": "patch 化把图像变 token；adaLN-Zero 是恒等起步的条件机制；正弦嵌入支持外推；Scaling Laws 是幂律；MMDiT 是双向联合注意力。逐项对齐无误。"
+   },
+   {
+    "type": "choice",
+    "prompt": "关于 DiT 的工作空间，下列说法正确的是？",
+    "options": [
+     "DiT 直接在像素空间做扩散",
+     "DiT 和 LDM/SD 一样在 VAE 的潜在空间工作，先 patch 化潜在特征再过 Transformer",
+     "DiT 不需要 VAE，直接处理原始图像 token",
+     "DiT 在 CLIP 嵌入空间工作"
+    ],
+    "answer": 1,
+    "explain": "DiT 在 VAE 潜在空间工作（256 图像→32x32x4 潜在），把潜在 patch 化成 token 序列过 Transformer，去噪后 Unpatchify 再用 VAE 解码。这与 SD 的 LDM 思路一致。"
+   }
+  ]
+ },
+ {
+  "title": "Flow Matching 与一致性模型",
+  "subtitle": "学直线速度场让 ODE 更好解，或直接学轨迹终点实现一步生成",
+  "intro": [
+   {
+    "title": "这一章在解决什么",
+    "body": "扩散模型生成质量很好，但有个核心瓶颈：采样慢。生成一张图通常要 20-50 步 ODE/SDE 求解。为什么这么多步？因为扩散定义的概率流 ODE 轨迹是**弯曲的**，欧拉法得用很小步长才能精确积分。\n\n本关讲两种突破瓶颈的前沿方法：**Flow Matching** 通过学习更直的流轨迹让 ODE 更容易求解（少步采样）；**一致性模型** 更激进，直接学 ODE 轨迹到终点的映射，实现一步生成。这两者已深刻影响 SD3、FLUX 和各种实时生成系统。先看 Flow Matching 的核心直觉，再看一致性模型。"
+   },
+   {
+    "title": "Flow Matching 的核心直觉：直线路径",
+    "body": "Flow Matching 问了个简单问题：**能不能直接指定一条从噪声到数据的路径，然后训练网络学这条路径的速度场？**\n\n答案是肯定的，而且选最简单的路径——直线。给定噪声 $x_0 \\sim \\mathcal{N}(0,I)$ 和数据 $x_1 \\sim p_{data}$，定义线性插值路径：\n\n$$x_t = (1-t)x_0 + t x_1, \\quad t\\in[0,1]$$\n\n- $t=0$：纯噪声 $x_0$；$t=1$：数据 $x_1$；中间是直线插值。\n\n对路径求导得到速度，惊人地简单：\n\n$$\\frac{dx_t}{dt} = x_1 - x_0$$\n\n这是个**常数速度场**——不依赖 $t$，只取决于起终点。Flow Matching 就是训练网络 $v_\\theta(x_t, t)$ 去逼近这个真实速度 $x_1 - x_0$。注意这里时间方向约定与 DDPM 相反：$t=0$ 是噪声、$t=1$ 是数据。"
+   },
+   {
+    "title": "条件流匹配训练目标",
+    "body": "理想的边际速度场 $u_t(x)$ 需要知道 $p_t(x)$，难以直接算。但可以用**条件流匹配**（Conditional Flow Matching, CFM）目标替代——直接回归条件速度：\n\n$$\\mathcal{L}_{CFM} = \\mathbb{E}_{t\\sim U[0,1],\\,x_0\\sim\\mathcal{N}(0,I),\\,x_1\\sim p_{data}} \\big\\| v_\\theta\\big((1-t)x_0 + tx_1,\\, t\\big) - (x_1 - x_0)\\big\\|^2$$\n\n**为什么用条件目标能替代边际目标？因为两者梯度相同。** Lipman et al. 2022 的定理证明 $\\nabla_\\theta\\mathcal{L}_{CFM} = \\nabla_\\theta\\mathcal{L}_{FM}$——虽然 $\\mathcal{L}_{CFM}$ 方差更高，但减去的边际速度场不依赖 $\\theta$，不影响梯度方向。所以可以放心用这个简单的目标训练：采样 $t$、采样噪声 $x_0$、取数据 $x_1$，构造插值点，回归速度 $x_1 - x_0$，就这么直接。",
+    "formula": "\\mathcal{L}_{CFM} = \\mathbb{E}_{t,x_0,x_1}\\big\\| v_\\theta((1-t)x_0 + tx_1,\\, t) - (x_1 - x_0)\\big\\|^2"
+   },
+   {
+    "title": "为什么直线轨迹让 ODE 更好解",
+    "body": "训练好 $v_\\theta$ 后，采样就是从 $x_0$ 沿 ODE $\\frac{dx}{dt} = v_\\theta(x,t)$ 积分到 $x_1$。直线轨迹的好处来自数值积分的误差：\n\n- 一阶 Euler 法的局部截断误差是 $O(h^2)$，$h$ 是步长。\n- 对于**完全直线**的 ODE，Euler 法是**精确的**（误差为零）。\n- 对接近直线的 ODE，即使步长很大（如 $h=0.5$ 即 2 步），误差也很小。\n\n在条件层面（给定 $x_0,x_1$）路径是完全笔直的；边际层面（不同 $x_0$ 混合）可能略弯，但弯曲程度远小于 VP-SDE 对应的 ODE。这就是 Flow Matching 能用极少步数（1-5 步）生成高质量样本的理论基础。\n\n对比 DDPM：DDPM 前向是 $x_t = \\sqrt{\\bar\\alpha_t}x_0 + \\sqrt{1-\\bar\\alpha_t}\\epsilon$、预测噪声、轨迹弯曲；FM 前向是线性插值、预测速度 $x_1-x_0$、轨迹直。"
+   },
+   {
+    "title": "Rectified Flow 与 FM 对扩散的统一",
+    "body": "**Rectified Flow（Liu et al. 2022）** 进一步提出 Reflow 让轨迹更直：①训练第一轮 FM 模型 $v^{(1)}$；②用它从噪声 $x_0$ 生成 $\\hat x_1$，得到新配对 $(x_0, \\hat x_1)$；③用新配对重训 $v^{(2)}$。每轮 Reflow 用的是模型认为「对」的起终点配对而非随机配对，轨迹越来越直，理论上收敛到**最优传输（OT）路径**——高斯到数据的不相交直线。\n\nFlow Matching 还能用更一般的路径 $\\phi_t = \\alpha_t x_1 + \\sigma_t x_0$（满足 $\\alpha_0=0,\\alpha_1=1,\\sigma_0=1,\\sigma_1=0$）。不同 $(\\alpha_t,\\sigma_t)$ 对应不同调度：线性（Rectified Flow）、VP-type（$\\alpha_t=\\sqrt{\\bar\\alpha_t},\\sigma_t=\\sqrt{1-\\bar\\alpha_t}$，等价 DDPM 的 VP-SDE）、余弦。这揭示了深层统一：**扩散模型是 Flow Matching 在特定噪声调度下的特例。**"
+   },
+   {
+    "title": "PyTorch：Flow Matching 训练与采样",
+    "body": "FM 训练极其简洁——构造插值点、回归速度：\n\n```python\ndef compute_loss(self, x_1):\n    x_0 = torch.randn_like(x_1)\n    t = torch.rand(x_1.shape[0], 1, device=self.device)\n    x_t = (1 - t) * x_0 + t * x_1\n    target_v = x_1 - x_0\n    pred_v = self.model(x_t, t)\n    return F.mse_loss(pred_v, target_v)\n```\n\nEuler 法采样从 $t=0$（噪声）积分到 $t=1$（数据）：\n\n```python\ndt = 1.0 / num_steps\nx = torch.randn(num_samples, data_dim, device=device)\nfor step in range(num_steps):\n    t = torch.full((num_samples, 1), step * dt, device=device)\n    v = self.model(x, t)\n    x = x + dt * v\n```\n\n对比 DDPM 训练目标是 `F.mse_loss(noise_pred, noise)`，FM 只是把目标从噪声换成速度 $x_1-x_0$，结构几乎一样。"
+   },
+   {
+    "title": "Flow Matching 在 SD3/FLUX 中的应用",
+    "body": "SD3（Esser et al. 2024）是 FM 在大规模文生图中的成功应用，用 Rectified Flow 线性插值路径（注意时间约定 $t=0$ 噪声、$t=1$ 数据）：\n\n$$z_t = (1-t)\\epsilon + t z_0, \\quad \\mathcal{L} = \\mathbb{E}_{t,\\epsilon,z_0}\\big[\\|v_\\theta(z_t,t,c) - (z_0 - \\epsilon)\\|^2\\big]$$\n\nSD3 还发现训练时间步 $t$ 的采样分布很重要：它用 **logit-normal 分布**（$t = \\sigma(\\mathcal{N}(\\mu,s^2))$，$\\sigma$ 是 sigmoid）而非均匀分布，把更多训练资源集中在 $t\\approx 0.5$（噪声和信号混合最复杂的区域），减少对 $t\\approx 0$ 或 $1$ 的关注。\n\nSD3/FLUX 的骨干是上一关的 MMDiT，文本编码用 CLIP-L + CLIP-G + T5-XXL。FLUX.1 还有蒸馏版：[dev] 更快、[schnell] 仅 4 步。"
+   },
+   {
+    "title": "一致性模型：直接学轨迹终点",
+    "body": "Song et al. (2023) 想得更激进：既然 ODE 终点是 $x_0$，**何必一步步积分？直接学终点映射。**\n\n考虑概率流 ODE 轨迹上的任意两点 $x_s, x_t$，它们应映射到同一终点 $x_\\epsilon \\approx x_0$。一致性模型学函数 $f_\\theta(x_t,t)$ 满足**自一致性**：\n\n$$f_\\theta(x_s, s) = f_\\theta(x_t, t), \\quad \\forall s,t \\text{ 在同一 ODE 轨迹上}$$\n\n还需满足**边界条件** $f(x_\\epsilon, \\epsilon) = x_\\epsilon$（终点处是恒等映射）。实际参数化：\n\n$$f_\\theta(x,t) = c_{skip}(t)\\,x + c_{out}(t)\\,F_\\theta(x,t)$$\n\n其中 $c_{skip}(\\epsilon)=1, c_{out}(\\epsilon)=0$ 保证边界条件——这样在 $t=\\epsilon$ 时 $f = 1\\cdot x + 0\\cdot F = x$。**为什么边界条件必须满足？因为没有它，模型在 $t=\\epsilon$ 这个已经几乎干净的点上还会乱改，破坏「所有点映射到同一真实终点」的锚定。**"
+   },
+   {
+    "title": "CD vs CT，一步与多步生成",
+    "body": "训练一致性模型有两种范式：\n\n- **一致性蒸馏（CD）**：用预训练扩散模型（教师）。在教师 ODE 轨迹上取相邻两点 $x_{t_n}, \\hat x_{t_{n-1}}$（后者由教师走一步得到），要求学生对它们输出相同：$\\mathcal{L}_{CD} = \\mathbb{E}[d(f_\\theta(x_{t_n},t_n), f_{\\theta^-}(\\hat x_{t_{n-1}}, t_{n-1}))]$，$\\theta^-$ 是 EMA 参数。\n- **一致性训练（CT）**：不需要教师。用 $x_{t_n} = x_0 + t_n\\epsilon$、$x_{t_{n-1}} = x_0 + t_{n-1}\\epsilon$，**同一个 $x_0$ 和同一个 $\\epsilon$** 保证两点在同一轨迹上。无需预训练，但质量通常略低于 CD。\n\n**一步生成**：$\\hat x_0 = f_\\theta(x_T, T)$，一次前向出图。**多步细化**：一步粗预测→加噪到中间步→再预测，循环 2-4 步显著提质。因为每步都直接预测 $x_0$（而非预测噪声后走一小步），少步质量比普通扩散更好。ImageNet 64x64 上 CD 2 步 FID=3.55，已接近 256 步 DDPM（2.07）。"
+   },
+   {
+    "title": "易错点",
+    "body": "- **搞反时间方向**：FM/Rectified Flow 约定 $t=0$ 是噪声、$t=1$ 是数据，与 DDPM（$t=0$ 数据）相反。\n- **以为 FM 和扩散无关**：扩散是 FM 在特定 $(\\alpha_t,\\sigma_t)$ 调度（VP-type）下的特例，二者统一。\n- **CFM 目标值高就以为训练错了**：$\\mathcal{L}_{CFM}$ 方差比边际目标高是正常的，关键是梯度一致。\n- **一致性模型违反边界条件**：$c_{skip}(\\epsilon)=1, c_{out}(\\epsilon)=0$ 必须保证，否则终点锚定失效。\n- **CT 的两个噪声点用了不同 $\\epsilon$**：必须用同一个 $x_0$ 和同一个 $\\epsilon$，否则两点不在同一轨迹上，自一致性约束就错了。\n- **以为一致性模型只能一步**：它支持一步，但 2-4 步多步细化能明显提质。"
+   },
+   {
+    "title": "小结",
+    "body": "Flow Matching 用线性插值路径学常数速度场 $v=x_1-x_0$（$\\mathcal{L}_{CFM}$ 与边际目标梯度相同），直线轨迹让 ODE 用极少步就能精确求解；Rectified Flow 的 Reflow 进一步拉直、趋向最优传输；扩散是 FM 的特例。一致性模型则直接学 ODE 轨迹到终点的映射（自一致性 + 边界条件），CD 借教师、CT 从头训，实现一步或少步生成。SD3/FLUX 正是 FM + MMDiT 的产物。"
+   }
+  ],
+  "questions": [
+   {
+    "type": "choice",
+    "prompt": "Flow Matching 选用线性插值路径 $x_t = (1-t)x_0 + tx_1$，对应的条件速度场是什么？",
+    "options": [
+     "$\\sqrt{\\bar\\alpha_t}x_0$",
+     "$x_1 - x_0$（一个常数，不依赖 $t$）",
+     "$-\\epsilon$",
+     "$t(x_1 - x_0)$"
+    ],
+    "answer": 1,
+    "explain": "对 $x_t = (1-t)x_0 + tx_1$ 关于 $t$ 求导得 $\\frac{dx_t}{dt} = x_1 - x_0$，是个常数速度场，只取决于起终点、不依赖 $t$。FM 就是训练 $v_\\theta$ 逼近它。"
+   },
+   {
+    "type": "choice",
+    "prompt": "为什么 Flow Matching 的直线轨迹能用很少步数（1-5 步）就生成高质量样本？",
+    "options": [
+     "因为网络更小",
+     "因为对完全直线的 ODE，Euler 法是精确的（误差为零），接近直线时大步长误差也很小",
+     "因为不需要训练",
+     "因为跳过了 VAE"
+    ],
+    "answer": 1,
+    "explain": "Euler 法局部截断误差 $O(h^2)$，但对直线 ODE 误差为零。FM 轨迹接近直线，所以即使步长很大（少步）误差也很小，这是少步采样的理论基础。"
+   },
+   {
+    "type": "judge",
+    "prompt": "Flow Matching/Rectified Flow 的时间方向约定与 DDPM 相同：$t=0$ 对应数据，$t=1$ 对应噪声。",
+    "answer": false,
+    "explain": "正好相反。FM/Rectified Flow 约定 $t=0$ 是噪声、$t=1$ 是数据；DDPM 是 $t=0$ 数据、$t$ 增大噪声增大。搞反方向会导致采样积分方向错误。"
+   },
+   {
+    "type": "input",
+    "prompt": "Flow Matching 的训练目标 $\\mathcal{L}_{CFM}$ 让网络回归的「目标」是什么量？（用符号或文字描述）",
+    "accept": ["速度", "x_1 - x_0", "x1-x0", "x_1-x_0", "速度 x_1-x_0", "速度场", "(x_1 - x_0)", "x₁-x₀"],
+    "explain": "FM 回归的是条件速度场 $x_1 - x_0$（数据减噪声），而不是 DDPM 那样的噪声 $\\epsilon$ 或分数。"
+   },
+   {
+    "type": "judge",
+    "prompt": "条件流匹配目标 $\\mathcal{L}_{CFM}$ 虽然比边际目标 $\\mathcal{L}_{FM}$ 方差更高，但两者的梯度相同，所以可以安全地用 $\\mathcal{L}_{CFM}$ 训练。",
+    "answer": true,
+    "explain": "Lipman et al. 2022 的定理证明 $\\nabla_\\theta\\mathcal{L}_{CFM} = \\nabla_\\theta\\mathcal{L}_{FM}$——边际目标减去的速度场不依赖 $\\theta$，不影响梯度。所以用更简单可计算的 CFM 即可。"
+   },
+   {
+    "type": "choice",
+    "prompt": "Rectified Flow 的 Reflow 操作（用模型生成的 $(x_0,\\hat x_1)$ 配对重训）会让轨迹趋向于什么？",
+    "options": [
+     "随机游走",
+     "最优传输（OT）路径——不相交的直线",
+     "弯曲的 VP-SDE 轨迹",
+     "完全不变"
+    ],
+    "answer": 1,
+    "explain": "每轮 Reflow 用模型认为「对」的起终点配对替代随机配对，轨迹越来越直，理论上收敛到最优传输映射——高斯到数据的不相交直线，非常容易低步数求解。"
+   },
+   {
+    "type": "judge",
+    "prompt": "扩散模型（如 DDPM 的 VP-SDE）可以看作 Flow Matching 在特定噪声调度 $(\\alpha_t, \\sigma_t)$ 下的一个特例。",
+    "answer": true,
+    "explain": "FM 的一般路径 $\\phi_t = \\alpha_t x_1 + \\sigma_t x_0$ 中，取 $\\alpha_t=\\sqrt{\\bar\\alpha_t}, \\sigma_t=\\sqrt{1-\\bar\\alpha_t}$ 就得到 VP-type（等价 DDPM）。线性调度则是 Rectified Flow。这揭示了二者的统一。"
+   },
+   {
+    "type": "choice",
+    "prompt": "一致性模型的「自一致性」约束指的是什么？",
+    "options": [
+     "网络对同一输入两次输出相同",
+     "同一条 ODE 轨迹上的任意两点 $x_s, x_t$ 经 $f_\\theta$ 映射到同一个终点 $x_\\epsilon$",
+     "训练损失始终为零",
+     "速度场处处相等"
+    ],
+    "answer": 1,
+    "explain": "自一致性要求 $f_\\theta(x_s,s) = f_\\theta(x_t,t)$ 对同一 ODE 轨迹上的所有点成立——它们都该映射到同一终点 $x_\\epsilon\\approx x_0$，这样才能一步直达终点。"
+   },
+   {
+    "type": "choice",
+    "prompt": "一致性训练（CT）相比一致性蒸馏（CD）的关键区别是什么？",
+    "options": [
+     "CT 需要预训练教师模型，CD 不需要",
+     "CT 不需要预训练教师模型，直接从数据训练（用同一 $x_0$ 和同一 $\\epsilon$ 构造相邻两点），但质量通常略低于 CD",
+     "CT 只能一步生成，CD 只能多步",
+     "两者完全相同"
+    ],
+    "answer": 1,
+    "explain": "CD 用预训练扩散模型当教师在其 ODE 轨迹上取相邻点；CT 不需教师，靠同一 $x_0$、同一 $\\epsilon$ 构造 $x_{t_n}, x_{t_{n-1}}$ 保证同轨迹。CT 更省（无需教师）但质量通常略低。"
+   },
+   {
+    "type": "input",
+    "prompt": "一致性模型参数化 $f_\\theta(x,t) = c_{skip}(t)x + c_{out}(t)F_\\theta(x,t)$ 中，为保证边界条件 $f(x_\\epsilon,\\epsilon)=x_\\epsilon$，$c_{skip}(\\epsilon)$ 必须等于多少？（填数字）",
+    "accept": ["1", "1.0", "一"],
+    "explain": "要让 $f(x_\\epsilon,\\epsilon) = x_\\epsilon$，需 $c_{skip}(\\epsilon)=1$ 且 $c_{out}(\\epsilon)=0$，于是 $f = 1\\cdot x + 0\\cdot F = x$，终点处恒等。"
+   },
+   {
+    "type": "match",
+    "prompt": "把 Flow Matching / 一致性模型的概念和核心要点配对：",
+    "left": [
+     "条件流匹配 L_CFM",
+     "Reflow（Rectified Flow）",
+     "logit-normal 时间步采样（SD3）",
+     "一致性蒸馏 CD",
+     "多步细化生成"
+    ],
+    "right": [
+     "回归常数速度 x_1-x_0，梯度与边际目标相同",
+     "用模型生成的起终点配对重训，轨迹越来越直、趋向最优传输",
+     "把训练资源集中在 t≈0.5 噪声信号混合最复杂处",
+     "用预训练扩散模型当教师，在其 ODE 轨迹取相邻点训练学生",
+     "一步粗预测→加噪→精化，2-4 步显著提质"
+    ],
+    "explain": "L_CFM 回归速度且梯度对；Reflow 拉直轨迹；logit-normal 聚焦中间时间步；CD 借教师蒸馏；多步细化靠加噪-预测循环提质。逐项对齐无误。"
+   },
+   {
+    "type": "judge",
+    "prompt": "在一致性训练（CT）中，构造相邻两点 $x_{t_n} = x_0 + t_n\\epsilon$ 和 $x_{t_{n-1}} = x_0 + t_{n-1}\\epsilon$ 时，必须使用同一个 $x_0$ 和同一个 $\\epsilon$。",
+    "answer": true,
+    "explain": "只有用同一个 $x_0$ 和同一个 $\\epsilon$，两点才落在同一条 ODE 轨迹上，自一致性约束（两点映射到同一终点）才成立。换不同噪声会破坏「同一轨迹」的前提。"
+   }
+  ]
+ }
+]

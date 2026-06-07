@@ -1,0 +1,129 @@
+[
+  {
+    "id": "u4c4",
+    "title": "MoE 训练基础设施",
+    "subtitle": "Expert Parallelism、All-to-All、路由负载均衡与 Checkpoint",
+    "intro": [
+      {
+        "title": "MoE 的核心动机：参数容量与 FLOPs 解耦",
+        "body": "Dense 模型把「参数=容量=FLOPs」绑死——每加一个 layer 或加宽 hidden，所有 token 都走完所有权重，FLOPs 线性涨。\n\nMoE（Mixture of Experts）的核心思路：把 FFN 分裂成 N 个 expert，每个 token 由 router 只激活 K 个（top-K），参数容量随 N 扩张，但每 token 的 FLOPs 大致随 K 而不是 N 增长。\n\nDeepSeek-V3 的典型数字：671B 总参数，每 token 激活约 37B（256 个 routed expert + 1 shared expert，top-8）。\n\n**代价**：\n- 每个 MoE layer 必须 dispatch + combine 两次 All-to-All\n- 需要在数百个 expert 间维持 load balance\n- checkpoint 从「按层 shard」变成「按 expert shard」\n- 一个 expert GPU 挂了，全局 All-to-All 会 hang"
+      },
+      {
+        "title": "Routed Expert vs Shared Expert",
+        "body": "现代大 MoE（DeepSeek-V2/V3）同时使用两类 expert：\n\n| 维度 | Routed Expert | Shared Expert |\n|---|---|---|\n| 激活方式 | top-K 选择，每 token 只过 K 个 | 所有 token 都过 |\n| 数量 | 几十到几百 | 通常 1-4 |\n| 学习目标 | 专业化分工 | 公共基线能力 |\n| 是否参与 All-to-All | 是 | 否（与 dense 同路径）|\n| EP 放置 | 按 expert shard 分到不同 GPU | 与 dense 层一起处理 |\n\nShared expert 承担「公共基线」，让 routed expert 只学差异，减少 expert 之间的冗余学习。"
+      },
+      {
+        "title": "Expert Parallelism（EP）：把不同 expert 放不同 GPU",
+        "body": "以 DeepSeek-V3 为例，256 个 routed expert 每层约 11.3B 参数，58 个 MoE layer 合计约 650B routed expert 参数，加上 optimizer state 和 gradient，单卡或单 TP shard 完全放不下，必须引入 EP。\n\nEP rank mesh：\n`world_size = DP × PP × TP × EP × CP`\n- EP group：固定 (dp, pp, tp, cp)，跨 ep_rank\n- 每个 EP rank 持有 `N_experts / EP_size` 个 expert\n\nEP 与其他维度正交：\n- DP 切样本，每个 DP 副本内部独立 EP\n- TP 切 attention 和 shared FFN，EP 切 routed FFN\n- PP 切层段，EP 切每层内的 expert\n- CP 切序列，与 EP 完全独立\n\n**工程关键**：EP size 通常等于一个 NVSwitch domain（8 或 16 卡）。再大需要跨 IB，All-to-All 的 incast 压力急剧上升。"
+      },
+      {
+        "title": "All-to-All：MoE 的真正瓶颈",
+        "body": "EP 引入每个 MoE layer 两次 All-to-All：\n\n- **dispatch**：token owner 把 token 发到 expert owner GPU\n- **combine**：expert owner 把计算结果发回 token owner\n\nbackward 还有两次反向 All-to-All（reverse-combine + reverse-dispatch）。若开 activation checkpointing 还会重跑 dispatch/combine。\n\n**All-to-All vs Ring AllReduce 的关键区别**：\n- Ring AllReduce：环形点对点，网络压力均匀\n- All-to-All：N×N 全互联，产生 **incast**——多个 sender 同时打向同一 receiver，交换机 buffer 容易溢出\n\n**体积估算**（DeepSeek-V3 风格，EP=64，top-8，hidden=7168）：\n每个 EP rank 每层 forward 的 dispatch send+recv 约 1.8-2.4 GB，combine 再加同量，单层 EP 通信 send+recv 约 3.6-4.8 GB，58 层 × 4 microbatch 合计约 0.8-1.1 TB/rank/step。\n\n**必须用 DeepEP 等 overlap 技术**将 dispatch/combine 与 expert 计算重叠，否则 MFU 仅为 dense 模型的 0.6 倍。",
+        "tip": "MoE 网络规划必须把 EP size、rail 数、交换机 buffer 同时考虑。按 dense DP AllReduce 规划的 IB 拓扑上线 MoE 后，All-to-All incast 极易打爆交换机 buffer。"
+      },
+      {
+        "title": "Router 与负载均衡：避免 Expert 坍缩",
+        "body": "Router 是一个小线性层（hidden → N expert 得分），经 softmax 后 top-K 选 expert。\n\n**Top-K 的离散性**：\n- `topk_idx`（membership）是离散的，不可微——主 loss 不对「选了哪个 expert」求导\n- `gates`（selected gate weight）是连续的，主 loss 通过它回到 router logits\n- 未被选中的 expert 对这个 token 没有 expert-path gradient\n\n**坍缩风险**：无约束 router 会迅速把所有 token 喂给少数热门 expert（强者愈强），导致大部分 GPU 空转、少数 GPU OOM。\n\n**两种平衡策略**：\n1. **Aux Loss**（Switch/GShard 风格）：`L_aux = α × N × Σ_i (f_i × P_i)`，让 router 不把高概率给过载 expert。代价：aux loss 与主 loss 梯度方向冲突。\n2. **Loss-Free Balancing**（DeepSeek-V3）：用动态 bias 调整 expert score，过载 expert 降 bias，欠载 expert 升 bias，不污染主 loss 梯度。**bias 必须随 checkpoint 保存**。",
+        "tip": "Router 数值精度很重要：BF16 softmax 在不同 GPU 上可能产生不一致的 top-K 结果，建议用 FP32 router 保证 reproducibility。"
+      },
+      {
+        "title": "Capacity Factor 与 Dropless MoE",
+        "body": "**Fixed-Capacity（dropping）MoE**：\n- 每个 expert 预分配 `capacity = ceil(capacity_factor × avg_tokens)` 个 token 槽\n- 超过 capacity 的 token 被 drop 或 overflow\n- `capacity_factor=1.0`：高 drop 风险；`1.25`：常见起点；`2.0`：显存翻倍但基本不 drop\n\n**Dropless MoE**（DeepSeek-V3 风格）：\n- 不设固定 capacity，按真实 token 数用 alltoallv/flex dispatcher 动态搬运\n- 不默认丢 token，但 buffer 峰值不可静态锁死\n\n**监控指标的差异**：\n- Dropping MoE：重点看 `drop_rate`（每层，建议 < 5%；> 20% 持续 1k step 则告警）\n- Dropless MoE：重点看 `max_load/avg_load`、`p99 expert tokens`、`dispatch buffer peak`、`straggler rank`、`overflow fallback count`\n\n**Dropless 的异常处理**必须是 EP group 级事务：任一 rank buffer OOM 或通信超时，必须全 group 停在同一边界（fail closed），不允许部分 rank commit、部分 rank fallback——否则后续 PP/DP collective 会看到不一致 activation。"
+      },
+      {
+        "title": "MoE Checkpoint：Expert Shard 与 EP Reshape",
+        "body": "MoE 的 checkpoint 比 dense 模型多了一个 expert 维度：\n\n**最小 checkpoint manifest 结构**：\n```\n{\n  \"schema\": \"moe-v1\",\n  \"world_size\": {\"DP\":2, \"PP\":4, \"TP\":4, \"EP\":64, \"CP\":1},\n  \"num_experts_per_layer\": 256,\n  \"expert_owner\": {\"layer_id\": {\"expert_id\": \"ep_rank\"}},\n  \"router_bias_state\": {\"layer_id\": {\"expert_id\": bias_value}},\n  \"optimizer_state_schema\": \"expert shard\",\n  \"global_step\": 10000\n}\n```\n\n**EP Reshape（训练 EP=64 → 推理 EP=8）**：\n- 256 个 expert 从 64 个 GPU 重新分配到 8 个 GPU（每 GPU 从 4 个 expert 增加到 32 个）\n- 必须用 expert manifest 重映射，不能直接按 rank 索引\n- loss-free balancing 的 bias 也要随 expert 迁移\n\n**ETP 的去重问题**：若 `ETP=1` 且 dense TP rank 复制 expert 参数，多个 TP rank 写出相同 expert。checkpoint writer 必须选 canonical replica 或校验 checksum 后去重，否则 EP reshape 会把复制品误认为独立 shard。",
+        "reveal": {
+          "q": "为什么 MoE 的 All-to-All dispatch 在网络上比 DDP 的 AllReduce 更容易引发拥塞？",
+          "a": "AllReduce 是环形点对点通信，流量分布均匀，每个链路负载相似。All-to-All 是 N×N 全互联，多个 sender 同时打向同一 receiver（incast 模式），交换机的 shared buffer 容易被打满，ECMP 哈希不均匀时某些链路成为热点。加上 MoE 的 token 路由是动态的（不均匀），incast 程度比固定流量模式更难预测。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "MoE 中 router 的 top-K membership（topk_idx）和 gate weight（gates）分别是否可微？",
+        "options": [
+          "两者都可微",
+          "topk_idx 不可微，gates 可微",
+          "topk_idx 可微，gates 不可微",
+          "两者都不可微"
+        ],
+        "answer": 1,
+        "explain": "topk_idx 是离散选择，不可微——主 loss 不对「选了哪个 expert」求导。gates 是被选中 expert 的连续权重，主 loss 通过 ∂y/∂gates = Expert_i(x) 传回 router logits，是可微的。"
+      },
+      {
+        "type": "judge",
+        "prompt": "MoE 的 forward 在每个 MoE layer 有 2 次 All-to-All（dispatch + combine），backward 没有额外 All-to-All。",
+        "answer": false,
+        "explain": "backward 还有 2 次反向 All-to-All（reverse-combine + reverse-dispatch），完整 forward+backward = 4 次 All-to-All。若开 activation checkpointing 覆盖 MoE layer，还会重跑 dispatch/combine（额外 2 次）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "与 Ring AllReduce 相比，MoE All-to-All 最显著的网络挑战是什么？",
+        "options": [
+          "总通信字节数更大",
+          "N×N 全互联产生 incast，交换机 buffer 容易打爆",
+          "需要更多 CUDA stream",
+          "不支持 NVLink"
+        ],
+        "answer": 1,
+        "explain": "Ring AllReduce 是点对点环形，流量均匀。All-to-All 是 N×N 全互联，多个 sender 同时向同一 receiver 发送（incast），交换机 shared buffer 容易溢出，ECMP 哈希不均时某些链路成为热点。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 MoE 负载均衡策略与其特点匹配",
+        "left": ["Aux Loss（Switch/GShard）", "Loss-Free Balancing（DeepSeek-V3）", "Capacity Factor dropping", "Dropless MoE"],
+        "right": [
+          "λ × Σ(f_i × P_i) 加入主 loss，但与主 loss 梯度方向可能冲突",
+          "动态 bias 调整 expert score，不污染主 loss 梯度，bias 须随 checkpoint 保存",
+          "预分配固定 token 槽，超出 token 被 drop，监控 drop_rate",
+          "按实际 token 数动态 dispatch，监控 max_load、buffer peak 和 straggler"
+        ],
+        "explain": "四种策略各有取舍：Aux loss 简单但有梯度污染；Loss-free balancing 无污染但需维护 bias 状态；Capacity factor 工程简单但有 token drop；Dropless 不丢 token 但 buffer 管理更复杂。"
+      },
+      {
+        "type": "input",
+        "prompt": "DeepEP 等优化通过什么手段将 MoE 通信开销从 30-50% step time 大幅降低？（填核心机制，不超过 15 字）",
+        "accept": ["将 dispatch/combine 分 chunk 与 expert 计算重叠", "通信与计算 overlap（chunking）", "把 dispatch 与 expert GEMM 并行执行", "分块 dispatch 与 expert 计算并行"],
+        "explain": "DeepEP 将 dispatch/combine 拆成多个 chunk，每个 chunk 的通信与下一个 chunk 或当前 chunk 的 expert 计算并行执行，从而将 All-to-All 通信隐藏在 expert GEMM 计算中，大幅减少暴露通信。"
+      },
+      {
+        "type": "judge",
+        "prompt": "训练时 EP=64 的 MoE checkpoint，可以直接加载到 EP=8 的推理环境，因为 expert 参数不变。",
+        "answer": false,
+        "explain": "EP reshape 需要重新映射 expert 到新 rank。EP=64 时每 GPU 持有 4 个 expert（256/64），EP=8 时每 GPU 需持有 32 个（256/8）。必须通过 expert manifest（记录 expert_id → ep_rank 的映射）做 reshard，还要迁移 loss-free balancing 的 bias 状态。"
+      },
+      {
+        "type": "choice",
+        "prompt": "Dropless MoE 发生通信超时时，正确的处理方式是？",
+        "options": [
+          "每个 rank 各自判断是否 fallback，速度快",
+          "全 EP group 停在同一边界（fail closed），统一选择 fallback",
+          "忽略超时继续训练，下一步会自动修复",
+          "只需要通信方（expert owner）处理，token owner 继续"
+        ],
+        "answer": 1,
+        "explain": "dropless MoE 的异常处理必须是 EP group 级事务。若允许部分 rank commit、部分 rank fallback，后续 PP/DP collective 会看到不一致 activation，导致不可复现的 loss spike 或 hang。正确做法是全 group fail closed，再统一 replay。"
+      },
+      {
+        "type": "match",
+        "prompt": "将左侧 MoE 监控场景与最关键的监控指标匹配",
+        "left": ["Dropping MoE 健康监控", "Dropless MoE 健康监控", "Expert 坍缩早期预警", "EP 网络问题诊断"],
+        "right": [
+          "drop_rate（每层，告警阈值 >20% 持续 1k step）",
+          "p99 expert tokens、dispatch buffer peak、overflow fallback count",
+          "某几个 expert 的 f_i（实际选中频率）远高于均值",
+          "alltoallv bytes 的 send/recv rank skew，某些 rank 成为 incast 热点"
+        ],
+        "explain": "四种场景的监控重点不同：dropping MoE 看 drop rate，dropless 看 buffer 和 straggler，expert 坍缩看负载分布是否均匀，EP 网络问题看通信流量是否均匀。"
+      },
+      {
+        "type": "judge",
+        "prompt": "Shared expert 参与 Expert Parallelism 的 All-to-All dispatch，因为它也是 FFN 的一部分。",
+        "answer": false,
+        "explain": "Shared expert 不参与 All-to-All。每个 token 都过 shared expert，因此它与 dense 层一样放在相同的计算路径里，不需要按 expert 路由和 dispatch。只有 routed expert 才参与 All-to-All。"
+      }
+    ]
+  }
+]

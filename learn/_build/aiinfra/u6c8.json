@@ -1,0 +1,142 @@
+[
+  {
+    "id": "u6c8",
+    "title": "多租户与成本治理",
+    "subtitle": "GPU 时间的分配规则：quota、优先级、隔离、chargeback 与成本放大器",
+    "intro": [
+      {
+        "title": "多租户的核心问题：有限 GPU 时间的联合治理",
+        "body": "推理平台进入平台阶段的标志，往往不是 QPS 上去了，而是多个团队、多个模型、多个优先级同时进入同一个资源池后，系统还能保持可解释和可控。\n\n不能回答以下 5 个问题的平台，GPU 再多也会持续「又贵又紧张」：\n\n```\n1. 谁能用多少？     → quota\n2. 谁先用？         → priority\n3. 互相影响多大？   → isolation / noisy neighbor\n4. 谁付多少钱？     → chargeback\n5. 怎么改变行为？   → control-plane actions\n```\n\n**多租户治理要解决的不可化简问题**：有限且昂贵的 GPU 时间，必须在多个会互相影响、价值不同、风险不同的请求之间分配，并且分配结果要能被解释、约束和纠偏。\n\n从这个问题出发推导：没有配额 → 谁先占谁赢；仅有配额利用率低 → 需要 reserved + burst；允许 burst 则高峰争用 → 需要 priority + preemption；共享继续深入 → 需要 isolation；治理还需要行为激励 → 需要 chargeback。"
+      },
+      {
+        "title": "隔离与共享的权衡：分层资源池",
+        "body": "多租户的核心矛盾是「隔离」和「共享」的张力：\n\n| 维度 | 强隔离（独立集群）| 强共享（混部）|\n|---|---|---|\n| 利用率 | 低（按峰值留冗余）| 高（波峰波谷互补）|\n| 可预测性 | 高 | 低（noisy neighbor 风险）|\n| 成本 | 高（冗余多）| 低（复用好）|\n\n成熟平台通常**分层**，而非全隔离或全共享：\n\n| GPU Pool | 典型租户 | 成本特征 |\n|---|---|---|\n| `prod-reserved` | 核心产品、高 SLA | 单价高，idle tax 明确 |\n| `prod-shared` | 普通线上业务 | 利用率和尾延迟折中 |\n| `long-context` | 32K/128K 长上下文 | 防止长 prompt 拖垮主池 |\n| `batch-spot` | 批评测、离线 agent | 单价低，完成时间不稳定 |\n| `canary` | 新模型、新版本 | 容量小但避免污染主池 |\n\n**隔离的四层边界**：身份与权限隔离、数据隔离（缓存 key 必须含 tenant_id）、资源隔离（quota/MIG/独占池）、故障隔离（circuit breaker/bulkhead）。\n\n**缓存隔离尤其容易被低估**：prefix cache 的 key 必须含 tenant_id + model_version + policy_version，否则高命中率反而会把 A 租户的上下文或过期策略复用给 B 租户。",
+        "tip": "跨租户共享 system prompt 的 KV Cache 只有在 prompt 完全公共、没有租户私有工具、没有数据 ACL 差异时才安全。只要 tool schema 或安全策略按租户变化，就应做 per-tenant cache namespace。"
+      },
+      {
+        "title": "单位请求成本：成本放大器与非线性效应",
+        "body": "**单位 token 成本不是固定数字**，而是一组放大器的组合：\n\n```\n单请求成本 =\n  prefill 成本（受 input token 数和 prefix cache 命中率影响）\n+ decode 成本（受 output token 数影响，单价通常 3–5x 于 input）\n+ KV Cache 占用成本（GB·s）\n+ 下游依赖成本（检索、rerank、工具调用）\n+ 空闲冗余分摊（warm pool idle tax）\n+ SLA / 隔离溢价\n```\n\n**成本放大器**：\n\n| 放大器 | 为什么贵 | 平台动作 |\n|---|---|---|\n| 长上下文 prefill | 占用算力和带宽，未必 cache 命中 | 长上下文单独分层计费或限流 |\n| 长输出 decode | decode 槽位被持续占用 | 对 max output length 做档位治理 |\n| 低命中缓存 | 重复跑 prefix 计算 | 持续跟踪 prefix hit rate |\n| warm pool 空转 | 为 SLA 保留容量但低峰没有产出 | 用时段策略控制 idle tax |\n| 冷启动 | 副本起来的几十秒几乎没有产出 | 预热、延长副本生命周期 |\n\n**非线性效应**：prompt 从 2K 扩到 32K，prefill 时间可能从 20ms 变成 2s（100x），但 token 数只变 16x——单位 token 成本涨 6x。**不能用线性外推做成本规划**，上下文要做分档。\n\n**一个数字级**：假设 H100 云价约 3 美元/小时，稳态吞吐 4000 tokens/s，裸成本约 0.21 美元/M tokens。加上冷启动（5%）、warm pool（20%）、利用率折扣，真实成本可能是裸成本的 2–5 倍。"
+      },
+      {
+        "title": "GPU 利用率高 ≠ 有效产出高：四个指标联合看",
+        "body": "看到 `nvidia-smi` 上 SM Active 接近 90%，不代表 GPU 已被「榨干」——它可能在做大量不值钱的工作。\n\n| 指标 | 回答的问题 | 它不能回答什么 |\n|---|---|---|\n| GPU utilization / SM Active | 设备忙不忙 | 工作是否接近理论峰值 |\n| MFU（Model FLOPs Utilization）| 模型计算是否高效 | token 是否有用 |\n| useful tokens / GPU-hour | 每张卡产出了多少有效 token | 单个租户的尾延迟 |\n| goodput | 在 SLO 内完成的有效请求或 token | 资源是否被长期过载 |\n\n**MFU 粗估**：`MFU ≈ model_flops_per_token × tokens/s / GPU_peak_flops`。若模型理论每 token 需 140 TFLOPs，H100 BF16 峰值 989 TFLOPs/s，实测 2500 tokens/s，则 MFU ≈ 35%——但 SM Active 可能同时显示 85%，因为 GPU 一直在跑 kernel，只是受访存/同步/碎片化 batch 限制。\n\n**典型「忙但不值钱」场景**：小 batch 空转（kernel launch overhead 主导）、反复重算（prefix cache 命中 < 20%）、长上下文碾压（1–2 个 32K prompt 占满所有资源）、低价值批任务填满 warm pool。\n\n监控面板必须同时摆 4 个指标：GPU utilization（表面忙不忙）+ MFU（忙得值不值）+ useful tokens/GPU-hour（最终产出）+ goodput（产出是否满足 SLO）。**单看任何一个都会被骗**。",
+        "reveal": {
+          "q": "某团队把 GPU 利用率从 40% 提升到 75%，但单位 token 成本没降反而略涨，最可能的原因是什么？",
+          "a": "提升的 35% 利用率大部分来自低价值任务（如离线批评测），这些任务每天跑 8 小时占用大量 GPU，但产出对业务决策价值很低。GPU utilization 上升不等于平台价值上升。评测任务如果能接受跑得慢，应放 spot / 夜间低峰运行，而不是占用主池。"
+        }
+      },
+      {
+        "title": "Cloud vs On-Prem vs Spot：TCO 的本质是利用率曲线",
+        "body": "「Cloud 贵还是 On-Prem 贵」的答案本质上是：**你的利用率曲线长什么样**。\n\n| 路径 | 适合场景 | 工程边界 |\n|---|---|---|\n| Cloud 按需 | 利用率 10–50% 或波动极大 | 单价最高，空闲可关，风险低 |\n| Cloud 预留（1–3 年）| 利用率 50–75% 且需求较确定 | 折扣 30–60%，但灵活性下降 |\n| On-Prem | 利用率 70%+ 且能持续 2–4 年 | 摊销后有优势，但运维成本高 |\n| Spot / Preemptible | 离线训练、批评测、可恢复任务 | 折扣大，但实例可能被随时回收 |\n\n**Spot 的真实使用方式**：不是「全上 spot 省 80%」，而是 on-demand / 保底池兜底 + spot 池承接弹性和低优任务。在线推理主路径绝对不能完全建立在 spot 上，否则实例被回收会直接造成 SLA 事故。\n\n**On-Prem TCO 常被低估**：只盯采购单价会明显低估真实成本。完整 TCO 包括：硬件折旧（3–4 年摊销）+ 电力成本（GPU TDP × PUE）+ 网络/存储 + 运维人力（含值班、备件、机房能力）。\n\n**稳健迁移路径**：先 Cloud 按需建基线 → 稳定后转 Reserved → 进入稳态后评估 On-Prem。",
+        "tip": "「Spot 能降本 80%」是宣传口径，实际折扣高度依赖云厂商、地区、实例族和时间点。应把 spot 理解为「价格波动很大的第二池」，不是稳定的固定折扣。生产主路径不能依赖 spot。"
+      },
+      {
+        "title": "配额、限流与公平性：reserved + burst 模型",
+        "body": "**配额应该管多维度**，单一的「GPU 卡数」配额往往不够：\n\n| 配额维度 | 控制什么 |\n|---|---|\n| QPS / RPM | 每分钟请求数，防突发 |\n| 输入 token / 分钟 | 长上下文流量控制 |\n| 输出 token / 分钟 | decode 占用，长输出租户 |\n| 并发请求数 | 防占满 decode 槽位 |\n| 最大上下文长度 | 防极端长 prompt |\n| 预算（美元/月）| 成本上限 |\n\n**Rate limit vs Quota**：rate limit 管瞬时速率（秒/分钟），quota 管一段时间内能用多少（日/月）。两者都需要，入口检查顺序：`authn/authz → 请求形状检查 → rate limit → budget check → 预扣费 → admission`。**越早拒绝越便宜**——等请求进入 GPU prefill 后再拒绝，算力已经花掉了。\n\n**reserved + burst 公平模型**：每个租户一个保底（reserved），允许 burst 到全池空闲容量但有上限。搭配 starvation guard（超过等待阈值强制调度），防止长 prefix 大户饿死短请求。\n\n**SLO class**（服务等级档位）是多租户成本治理的连接点：\n\n| SLO class | P99 TTFT | 资源策略 | 降级规则 |\n|---|---|---|---|\n| Platinum | < 300ms | reserved pool + 强隔离 | 只在全局故障时降级 |\n| Gold | < 800ms | shared pool + reserved quota | 容量紧张时限制 burst |\n| Silver | P95 < 2s | shared pool + best effort burst | 可切小模型、截短输出 |\n| Batch | 小时级 | spot / batch pool | 可排队、可抢占 |"
+      },
+      {
+        "title": "Chargeback：让账单改变行为",
+        "body": "chargeback 的目的不是财务惩罚，而是**让租户看见「长输出、低 cache hit、过度保留容量」如何变成真实成本**，从而改变行为。\n\n**可落地的 chargeback 公式**：\n\n```\ntenant_bill =\n  reserved_gpu_hours × reserved_rate\n+ input_tokens_M × input_rate\n+ output_tokens_M × output_rate       # 通常是 input_rate 的 3–5x\n+ kv_gb_seconds × kv_rate\n+ downstream_calls × downstream_rate\n+ idle_tax_share                       # warm pool 分摊\n+ isolation_premium                    # 独占池 vs 共享池成本差\n```\n\n**不同计费模型的行为激励**：\n\n| 模型 | 会激励租户做什么 | 潜在问题 |\n|---|---|---|\n| 按 GPU·时 | 少申请、多复用 | 不鼓励优化模型本身 |\n| 按输入 token | 压缩 prompt | 不反映 decode 成本 |\n| 按输出 token | 控制 max_tokens | 不反映长上下文 prefill |\n| 输入+输出分别定价 | 更接近实际成本结构 | 对租户理解要求高 |\n\n**chargeback 的精度不能超过埋点精度**。早期先做 showback（展示不扣款），校准 1–2 个账期后再做 chargeback（硬预算扣减）。错误账单会迅速摧毁平台治理的可信度。\n\n**成本归因要覆盖全链路**：一条完整 RAG 请求涉及 embedding 模型、向量库、rerank 模型、LLM prefill/decode、safety filter、logging——只统计 LLM 那部分会低估 30–50% 的真实成本。"
+      },
+      {
+        "title": "Noisy Neighbor 检测与控制面动作",
+        "body": "Noisy neighbor 的典型表现不是把服务打挂，而是**持续把别人的尾延迟拉高**：\n\n| 干扰模式 | 典型表现 | 处置 |\n|---|---|---|\n| 长请求占满 decode 槽位 | 高优先级短请求 P99 恶化 | 时分调度、优先级抢占 |\n| 大上下文吃满显存 | 其他租户 admission 失败 | 显存配额、上下文长度分层 |\n| 新租户 prefix cache miss | 整体 cache 命中率下降 | prefix-aware 路由隔离 |\n\n**检测方法**：每 5 分钟计算 `ΔP99(T) = P99(其他租户, 含 T 流量) - P99(其他租户, 不含 T 流量)`。如果某租户持续 ΔP99 > 阈值（如 500ms），标记为 noisy neighbor candidate。\n\n**控制面动作**（让成本治理从「看账单」变成「塑造账单」）：\n\n| 控制动作 | 典型触发条件 |\n|---|---|\n| 长上下文单独路由 | 输入长度超过某个档位 |\n| 租户预算阈值 | 日/周/月预算到达 80%/95%/100% |\n| 自动切小模型 | 预算 > 80% 或 GPU 池 > 90% |\n| 截短上下文 | 单请求 > 租户 max 时自动截 |\n| 实验流量移入 batch 池 | 低价值任务进入主池影响 goodput |\n\n**多租户策略反模式**：只按 QPS 限流（长 prompt 租户用低 QPS 也能打满 GPU）、高优租户无限 burst（普通租户长期饿死）、所有租户共享一个 cache namespace（越权和污染风险）、把实验流量放主池（P99 被低价值任务拖高）。",
+        "reveal": {
+          "q": "某租户的月预算是 12 美元K，但实际账单达到 28 美元K，差距来自输入 token 暴增。用 chargeback 公式解释平台应该怎么「让账单改变租户行为」？",
+          "a": "通过 showback 报告让租户看到：成本上涨来自 input token 和 KV GB·s，而不是 QPS。具体说：把完整工具日志塞进 observation 让平均输入从 6K 变成 24K，input token 计费放大 4x，KV GB·s 也同步上升。chargeback 让租户把「压缩 observation」直接和账单挂钩，激励租户在服务端做 observation 摘要或分页。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "多租户推理平台治理要回答的 5 个核心问题中，「谁先用」对应的机制是什么？",
+        "options": [
+          "isolation（隔离）",
+          "quota（配额）",
+          "priority（优先级）",
+          "chargeback（成本归因）"
+        ],
+        "answer": 2,
+        "explain": "5 个核心问题：谁能用多少 → quota；谁先用 → priority；互相影响多大 → isolation / noisy neighbor；谁付多少 → chargeback；怎么改变行为 → control-plane actions。「谁先用」决定资源争用时的调度顺序，对应 priority + preemption 机制。"
+      },
+      {
+        "type": "judge",
+        "prompt": "GPU utilization（SM Active）达到 90%，说明平台的 GPU 资源已经被充分高效地利用了。",
+        "answer": false,
+        "explain": "GPU utilization（SM Active）只表示设备忙不忙，不表示工作是否接近理论峰值或是否有业务价值。SM Active 高但 MFU 只有 35% 是常见场景——GPU 在跑 kernel，但受访存、同步、碎片化 batch 限制，没有把理论 FLOPs 转化成有效模型计算。需要联合看 MFU、useful tokens/GPU-hour、goodput 才能判断有效产出。"
+      },
+      {
+        "type": "choice",
+        "prompt": "在推理平台的成本放大器中，为什么 decode 阶段的「输出 token」单价通常是「输入 token」单价的 3–5 倍？",
+        "options": [
+          "输出 token 需要更复杂的 safety filter，增加了处理成本",
+          "decode 是自回归串行生成，单位时间里能并行摊薄的工作少，长输出持续占用 decode 槽位",
+          "输出 token 需要额外的 embedding lookup，计算量更大",
+          "输出 token 需要在客户端进行 detokenize，占用更多 CPU 资源"
+        ],
+        "answer": 1,
+        "explain": "decode 是自回归生成，每次只产一个 token，串行性强，相比 prefill 阶段（可以并行处理整个输入）能摊薄的工作更少。长输出请求会持续占用 decode 槽位，让其他请求排队等待，推高整体成本。这是 OpenAI/Anthropic 等 API 定价中输出比输入贵的根本原因。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Cloud/On-Prem/Spot 的部署形式与其最适合的使用场景匹配：",
+        "left": [
+          "Cloud 按需",
+          "Cloud 3 年预留",
+          "On-Prem",
+          "Spot / Preemptible"
+        ],
+        "right": [
+          "离线批评测、回放、可结合 checkpoint 容忍中断的任务",
+          "规模波动大、利用率 10–50%、需求仍在探索",
+          "利用率 70%+ 且能持续 2–4 年的稳态大规模集群",
+          "利用率 50–75% 且需求较确定，接受 1–3 年承诺"
+        ],
+        "explain": "Cloud 按需 → 波动大/低利用率；Cloud 预留 → 稳定中等利用率接受承诺；On-Prem → 长期高利用率稳态；Spot → 可恢复的低优任务。"
+      },
+      {
+        "type": "choice",
+        "prompt": "平台发现某租户成为 noisy neighbor：每当该租户流量高峰时，其他租户的 P99 TTFT 升高 600ms。最可能的干扰机制是什么，应该采取什么处置动作？",
+        "options": [
+          "该租户 CPU 使用率过高，拖慢了 tokenizer；应限制 CPU quota",
+          "该租户长上下文请求（24K+）大量进入共享池，占满 KV Cache 和 decode 槽位；应将其路由到独立的 long-context 池",
+          "该租户使用了不同版本的 tokenizer，污染了 prefix cache；应重新部署 tokenizer",
+          "该租户的输出 token 数过多，消耗了过多网络带宽；应限制输出长度"
+        ],
+        "answer": 1,
+        "explain": "长上下文请求占满 KV Cache（导致其他请求 admission 失败）和占满 decode 槽位（导致高优先级短请求等待），是最典型的 noisy neighbor 机制。正确处置是把 8K+ 输入路由到独立的 long-context 池，禁止进入 prod-shared，同时对 observation 超长时触发摘要或返回 400。"
+      },
+      {
+        "type": "judge",
+        "prompt": "chargeback 的主要目的是对使用超额资源的租户进行财务惩罚，防止资源浪费。",
+        "answer": false,
+        "explain": "chargeback 的目的不是惩罚，而是让租户看见「长输出、低 cache hit、过度保留容量」如何变成真实成本，从而改变行为。不同计费模型会诱导不同的优化方向——这是政策设计，不是中性的财务工作。chargeback 是平台的「经济激励机制」而非「惩罚机制」。"
+      },
+      {
+        "type": "input",
+        "prompt": "多租户成本治理中，先展示成本数字但不真实扣款的阶段叫什么？（填英文）",
+        "accept": ["showback", "Showback"],
+        "explain": "showback 是成本归因的第一阶段：只展示租户用量、成本估算和异常原因，不扣预算。校准 1–2 个账期确认 tenant tag 覆盖率 > 95%、账单误差 < 10% 后，再进入 budget guardrail 和 chargeback 阶段。跳过 showback 直接上 chargeback，错误账单会摧毁平台治理的可信度。"
+      },
+      {
+        "type": "choice",
+        "prompt": "平台将 GPU 利用率从 40% 提升到 70%，但发现单位 token 成本没有下降。按照正确的诊断顺序，第一步应该看什么？",
+        "options": [
+          "立刻升级到更新版本的 vLLM，可能有性能 bug",
+          "先看总量：本月 GPU-hour 比上月多了多少，以及 cost/1M tokens 是否保持",
+          "立刻关掉所有 warm pool，只保留最低配置",
+          "直接把 gpu_memory_utilization 提高到 0.98 以获得更大的 KV pool"
+        ],
+        "answer": 1,
+        "explain": "正确诊断顺序：[1] 先看总量（GPU-hour 增长 vs cost/M tokens 变化）→ [2] 分租户看增长（哪个租户成本涨最多）→ [3] 分请求特征（输入/输出长度、cache 命中率变化）→ [4] 看利用率指标（GPU util、MFU、冷启动次数）。90% 的成本异常在前三步能定位，但需要按租户/时段/请求特征分桶的埋点能力。"
+      },
+      {
+        "type": "judge",
+        "prompt": "成本归因（chargeback）只需要统计 LLM 服务本身的 GPU 成本，因为下游依赖（检索、rerank）有独立账单。",
+        "answer": false,
+        "explain": "完整 RAG 请求涉及 embedding 模型、向量库、rerank 模型、LLM prefill/decode、safety filter、logging 等环节，只统计 LLM 部分会低估 30–50% 的真实成本。chargeback 要覆盖全链路依赖，否则优化 LLM 的钱可能漏到向量库账单里，无法正确指引租户的优化方向。"
+      }
+    ]
+  }
+]

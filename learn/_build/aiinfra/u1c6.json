@@ -1,0 +1,127 @@
+[
+  {
+    "id": "u1c6",
+    "title": "Cache 层级",
+    "subtitle": "L1/L2/L3/DRAM 延迟悬崖、Cache Line、关联度与 AI 数据路径优化",
+    "intro": [
+      {
+        "title": "为什么需要 Cache？延迟悬崖的物理约束",
+        "body": "**核心矛盾**：DRAM 比 CPU 核心慢约 200 倍。这不是工艺问题，是物理问题——DRAM 单元是电容，充放电需要时间；总线路由到内存控制器也需要传播时延。CPU 流水线每个 cycle 都需要数据，这个鸿沟无法消除。\n\n**解决方案**：用小而快的 SRAM 作为中间层，把「经常访问的数据」提前放在离核心更近的地方。这就是 Cache 层级。\n\n| 存储层级 | 典型延迟（cycle） | 容量量级 | 共享范围 |\n|---|---:|---|---|\n| 寄存器 | 0 | 数百 B | 单核私有 |\n| L1D | 4–5 | 32–64KB/核 | 单核私有 |\n| L2 | 12–15 | 0.5–2MB/核 | 单核私有 |\n| L3 / LLC | 35–80 | 数十–数百 MB/socket | 同 socket 多核共享 |\n| 本地 DRAM | 80–150ns | 数十 GB | 同 NUMA node |\n| 远端 NUMA DRAM | 130–300ns | 同上 | 跨 socket |\n\n**两条最值得守住的边界**：把工作集挤进 LLC（避免 DRAM 访问）；把 DRAM 访问绑在本地 NUMA（避免跨 socket 流量）。",
+        "tip": "OoO 的 ROB（~200–512 uop）能隐藏 L1/L2 延迟，但 DRAM 一次 miss ~300 cycle，远超 ROB 窗口，必然让流水线停顿。「减少 DRAM 访问次数」比「提高 IPC」更根本。"
+      },
+      {
+        "title": "Cache Line：为什么是 64B？",
+        "body": "Cache line 是 cache 与下层存储交换数据的最小单位。读 1 字节也会把它所在的整条 64B line 拉进来。\n\n**为什么是 64B？** 三个收敛因素：\n1. **空间局部性原理**：访问地址 a 后，很可能访问 a+1、a+2……粒度扩到 64B 时命中率显著提升，继续扩大边际收益递减但代价线性增长。\n2. **DDR 协议对齐**：DDR4/5 一次 burst = 8 beat × 8B = 64B，硬件天然对齐到 64B。\n3. **MESI 一致性粒度**：line 越大，伪共享风险越高。64B 是「局部性收益已饱和、伪共享代价未失控」的折中。\n\n**Apple Silicon（M 系列）用 128B**：定位「少核大带宽」，以更高流式吞吐换取更大伪共享风险。跨平台代码应用 `std::hardware_destructive_interference_size` 或常量 `kCacheLine = 128`。\n\n**关键推论**：对象随机分布在内存中时，访问 N 个对象 = 搬运 N 条 64B line，有效数据率取决于每条 line 中的「有用字节比例」。链表每节点 12B 但独占一条 64B line，带宽利用率 < 20%。",
+        "tip": "把热数据做成 SoA（结构体数组 → 数组结构体），让同一 cache line 内装满「同类型、同时被访问」的字段，是提升缓存带宽利用率最直接的手段。"
+      },
+      {
+        "title": "关联度：直接映射、组相联、全相联",
+        "body": "一条 cache line 在 cache 中能放在哪里？\n\n- **直接映射（1-way）**：地址 index 唯一决定 slot。查找最快，但两个地址映射到同一位置会反复「互相驱逐」（conflict miss）。\n- **N 路组相联**：cache 切成多个 set，每个 set 内 N 个 way，LRU 决定谁被踢。N 越大 conflict miss 越少，但比较电路越宽、功耗越大。\n- **全相联**：任意 line 可放在任意位置，无 conflict miss。但硬件成本只在小容量结构（TLB、victim cache）才划算。\n\n**地址三段式解码**（以 32KB/8-way/64B L1D 为例）：\n- Offset = 6 位（64B line，2^6 = 64）\n- Index = 6 位（set 数 = 32KB / 64B / 8 = 64，2^6 = 64）\n- Tag = 52 位（64 - 6 - 6）\n\n**工程警告**：若数组 row 长度恰好是「set 数 × line size」的整数倍（如 4096B），按列扫描时所有元素映射到同一 set，N 路关联度被直接映射打穿——这是 conflict miss 最常见的触发场景。",
+        "reveal": {
+          "q": "256KB / 8-way / 64B 的 L2，48-bit 地址，Index 占几位？",
+          "a": "set 数 = 256KB / (8 × 64B) = 512；Index = log2(512) = 9 位；Offset = 6 位；Tag = 48 - 9 - 6 = 33 位。"
+        }
+      },
+      {
+        "title": "三种 Miss 与替换策略",
+        "body": "**3C 分类——cache miss 的「病因诊断」**：\n\n| Miss 类型 | 病因 | 无穷大 cache 也发生？ | 全相联也发生？ | 优化手段 |\n|---|---|---|---|---|\n| **Compulsory（冷启动）** | 第一次访问该 line | 是 | 是 | prefetch、合并访问 |\n| **Capacity（容量）** | working set > cache 容量 | 否 | 是 | 分块（tiling）、热冷数据分层 |\n| **Conflict（冲突）** | 同一 set 内 line 数 > way 数 | 否 | 否 | 改 stride、padding 打破 2 的幂 |\n\n**替换策略**：\n- **Pseudo-LRU（PLRU）**：用二叉树近似 LRU，N-way 只需 N-1 bit，L1/L2 常用\n- **RRIP（Re-Reference Interval Prediction）**：每 line 带 2-bit「再次使用预测距离」，新 line 默认「远未来再用」，LLC 常用\n\n**为什么 LLC 用 RRIP 而不用 LRU？** LRU 会把「流式扫描一次就不再用」的数据（DataLoader 顺序读 batch）认为是「最近使用」，反复把真正高复用的工作集（tokenizer vocab 表）踢出去。RRIP 让流式数据快速被淘汰，保护高复用数据。"
+      },
+      {
+        "title": "写策略与 Non-temporal Store",
+        "body": "**写 hit 时**：\n- **Write-back**：先只写 cache，标记 dirty，被驱逐时才写回下层。带宽友好，现代 L1D 标准选择。\n- **Write-through**：写 cache 同时立即写下层。一致性简单，带宽消耗大（GPU 部分 cache 使用）。\n\n**写 miss 时**：\n- **Write-allocate**：先把 line 拉进 cache，再写。后续连续写命中率高，现代 L1D 标准配合 write-back 使用。\n- **No-write-allocate**：直接写下层，cache 不变。适合一次性流式写出。\n\n**Non-temporal Store（`_mm256_stream_si256`）**：告诉硬件「这块写不要 allocate 进 cache」，绕过 cache 直接写 DRAM。\n\n**AI Infra 应用场景**：DataLoader 把解码后的 tensor 写到 pinned memory 再 DMA 到 GPU，如果用普通 store 会污染 LLC；用 streaming store 可以让 LLC 留给真正的 working set（tokenizer 表、shuffle index）。注意：streaming store 是弱序的，后续 DMA 触发前需要 `sfence`。"
+      },
+      {
+        "title": "LLC 切片（Slice）与 NUMA 绑核",
+        "body": "现代 LLC 不是单块 SRAM，而是切成多个 slice，通过 mesh 或 ring 互连：\n- **Intel Skylake/Ice Lake**：每核绑一个 LLC slice，地址通过 CBoH hash 映射到 slice\n- **AMD EPYC**：LLC 按 CCX/CCD 切分，每 CCD 有独立 LLC\n\n**影响**：\n1. LLC 不再均匀——跨 slice 访问要多几跳延迟\n2. 某个 slice 成为热点时会放大延迟\n3. **跨 socket 更贵**：Intel UPI / AMD Infinity Fabric 的延迟和带宽都是片内 mesh 的几分之一\n\n**NUMA 绑核（AI Infra 关键操作）**：双 socket 节点上，DataLoader worker 没绑 NUMA 时，OS 调度可能把 worker 调到 socket 0 但其内存在 socket 1，每次 LLC miss 都要跨 UPI 访问远端 DRAM（延迟 2–3x）。\n\n绑核命令：`numactl --cpunodebind=0 --membind=0 python train.py`\n\n诊断命令：`numastat -p PID` 查看 remote/local 内存分配比例（PID 替换为 python 进程号）。",
+        "tip": "「first-touch」内存策略：Linux 默认在哪个 NUMA node 的 CPU 上首次访问某页，该页就分配到那个 node 的 DRAM。DataLoader worker 应该在本 socket 上初始化 buffer，避免第一次访问发生在另一个 socket 的 CPU 上。"
+      },
+      {
+        "title": "硬件 Prefetcher 与 AI 数据路径",
+        "body": "硬件 prefetcher 根据访问模式自动预取下一批数据：\n\n| Prefetcher 类型 | 触发条件 | 适合 | 不适合 |\n|---|---|---|---|\n| **Next-line** | 访问 line N → 预取 N+1 | 顺序扫描 | 随机访问 |\n| **Stride** | 检测到固定步长 | tensor 行/列扫描 | 步长不规则 |\n| **Stream** | 检测到长距离顺序流 | 大数组顺序处理 | 短对象、随机 |\n\n**何时帮你**：working set 大于 L1 但模式规则（顺序、固定步长），prefetcher 提前把 L2/L3 数据搬到 L1，隐藏大部分 miss 延迟。\n\n**何时害你**：\n- **随机访问**：prefetcher 误判模式，拉进无关 line 污染 cache\n- **多 worker 竞争**：每个 worker 的 prefetcher 都在「乐观预取」，多个加起来超过 LLC 带宽\n- **跨 4KB 页边界**：prefetcher 通常不跨页，边界附近预取失效\n\n**AI 训练数据场景**：先 shuffle 再顺序读 batch，shuffle 索引随机但 batch 内部顺序，prefetcher 在 batch 内有效；pure random sampling 则 prefetcher 持续踩空，应考虑软件预取或批量预取。"
+      },
+      {
+        "title": "AI Infra 的 Cache 优化：DataLoader、tensor stride 与 padding 陷阱",
+        "body": "**DataLoader working set 与 LLC 竞争**：单 worker 解码图像 working set ≈ 1–10MB；16 worker × 5MB = 80MB，已接近双路 Ice Lake 单 socket 60MB LLC 容量。继续加 worker 互相 evict 对方的热数据，LLC miss rate 断崖下降。\n\n**tensor stride：NHWC vs NCHW**：\n- **NCHW**（PyTorch 默认）：`[N, C, H, W]`，W 最内层连续。按 channel 内积时，跨 channel 步长 = H×W × 4B，远超 cache line，prefetcher 失效。\n- **NHWC**（TensorFlow 默认）：`[N, H, W, C]`，C 最内层连续。按 channel 内积时，C 维连续，cache 友好。**CPU inference 和 preprocessing 优先选 NHWC**（oneDNN、XNNPACK 默认）。\n\n**padding 的双刃剑**（重要反直觉）：\n- 加 padding 可以**降低** conflict miss（打破 2 的幂步长）\n- 但把 row size 从 224 「对齐」到 256（2 的幂），反而可能**引入** conflict miss\n\n**具体场景**：224×224 的 row stride = 224×3×4 = 2688B，在 8-way/64-set/64B L1D 上，每 64 行扫描全部映射到同一 set（因为 2688 和 4096 的最大公约数 = 64）。把 224 改成 225 或 226 就能打破这个规律。这就是为什么 oneDNN 内部为 conv 分配 buffer 时主动 pad 到**非 2 的幂**。",
+        "reveal": {
+          "q": "worker 数从 8 增加到 16，LLC miss rate 从 15% 升到 45%，IPC 从 1.4 降到 0.8，应该怎么做？",
+          "a": "不要继续加 worker。LLC miss rate 升到 45% 说明每个 worker 的 working set 总量已经超过 LLC 容量的承载极限。应该降低每 socket 的 worker 数（回到 8），或者：分块（tiling）缩小单次 working set；热冷数据分层（把常用 vocab 表、shuffle index 和大块 batch buffer 分开）；按 NUMA 绑核，减少跨 socket 访问。先让 LLC miss rate 降到 < 20%，再考虑是否继续加 worker。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "CPU 核心一次 L3 cache miss 需要访问本地 DRAM，典型延迟约为多少个 cycle（3GHz CPU）？",
+        "options": [
+          "4–5 cycle（和 L1D 命中差不多）",
+          "12–15 cycle（和 L2 命中差不多）",
+          "约 240–450 cycle（80–150ns × 3 cycle/ns）",
+          "超过 1000 cycle（因为需要通过操作系统处理）"
+        ],
+        "answer": 2,
+        "explain": "本地 DRAM 延迟约 80–150ns，3GHz CPU 每个 cycle 约 0.33ns，所以 80ns ÷ 0.33ns/cycle ≈ 240 cycle，150ns ≈ 450 cycle。相比 L1D 的 4–5 cycle，相差 50–100 倍。这就是 OoO 的 ROB（200–512 uop）为什么无法隐藏 DRAM 访问延迟——一次 DRAM miss 的 cycle 数比整个 ROB 窗口还大。"
+      },
+      {
+        "type": "choice",
+        "prompt": "对于一个 32KB、8-way、64B cache line 的 L1D cache，地址的 Index 域占几位？",
+        "options": [
+          "3 位",
+          "5 位",
+          "6 位",
+          "8 位"
+        ],
+        "answer": 2,
+        "explain": "set 数 = cache 容量 / (way 数 × line size) = 32 × 1024 / (8 × 64) = 32768 / 512 = 64 个 set。Index 位数 = log2(64) = 6 位。Offset 位数 = log2(64B) = 6 位。Tag = 剩余地址位（64 - 6 - 6 = 52 位，如果是 64-bit 物理地址）。"
+      },
+      {
+        "type": "judge",
+        "prompt": "把数组 row 长度从 224 改成 256（对齐到 2 的幂）总是能提升 cache 性能，因为对齐更有利于硬件。",
+        "answer": false,
+        "explain": "这是经典反直觉。row 长度对齐到 2 的幂（如 256）可能反而引入 conflict miss。当 row stride（= row size × element size）是「set 数 × line size」的整数倍时，跨行访问的所有地址会映射到同一个 cache set，N-way 关联度被直接映射打穿。工业库（oneDNN）实际上主动 pad 到非 2 的幂来打破这个规律。"
+      },
+      {
+        "type": "choice",
+        "prompt": "DataLoader 在 16 个 worker 运行时，LLC miss rate 从 10% 涨到 48%，IPC 从 1.5 降到 0.7。最可能的根因是什么？",
+        "options": [
+          "分支预测失败率升高，cold path 被触发更频繁",
+          "SIMD 指令没有生效，向量化路径退化到标量",
+          "16 个 worker 的总 working set 超过了 LLC 容量，互相 evict 对方数据",
+          "跨线程竞争导致 false sharing，coherence 流量增加"
+        ],
+        "answer": 2,
+        "explain": "LLC miss rate 从 10% 涨到 48% 是典型的「LLC 容量被打爆」信号。每个 worker 有约 5–10MB working set，16 个 worker × 8MB = 128MB，远超单 socket LLC（通常 30–60MB），导致互相 evict。应该降低 worker 数、分块处理或热冷数据分层，而不是继续加 worker 或优化分支。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 cache miss 类型与对应的优化手段配对：",
+        "left": ["Compulsory Miss（冷启动 miss）", "Capacity Miss（容量 miss）", "Conflict Miss（冲突 miss）", "Coherence Miss（一致性 miss）"],
+        "right": ["padding 打破 2 的幂 stride，或改变数据布局", "多核写操作 false sharing，用 alignas(64) 隔离", "分块（tiling）缩小 working set，或热冷数据分层", "prefetch 提前拉取，或合并访问减少首次 miss 次数"],
+        "explain": "Compulsory miss 靠预取和合并访问缓解；Capacity miss 靠分块和分层缓解；Conflict miss 靠打破规则步长（padding 到非 2 的幂）缓解；Coherence miss 是 false sharing 的来源，靠 cache line 隔离（alignas(64)）缓解。"
+      },
+      {
+        "type": "judge",
+        "prompt": "现代 CPU 的硬件 prefetcher 对随机内存访问模式同样有效，因为它会自动学习访问规律。",
+        "answer": false,
+        "explain": "硬件 prefetcher（next-line、stride、stream）只能处理规则的访问模式（顺序、固定步长）。对于随机访问（如哈希表查找、链表遍历、随机 shuffle 的 DataLoader），prefetcher 无法检测到有意义的模式，投机预取的 line 大概率不是真正需要的，反而污染 cache。随机访问场景应该考虑改变数据布局（SoA）或使用软件预取（`__builtin_prefetch`）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "CPU inference 的卷积算子需要按 channel 维度做内积。从 cache locality 角度，应该优先选择哪种 tensor 布局？",
+        "options": [
+          "NCHW（PyTorch 默认），因为 W 维连续对卷积最友好",
+          "NHWC，因为 C 维连续，按 channel 内积时 cache 友好",
+          "两者等价，cache 性能没有差别",
+          "应该使用 CHWN 布局，batch 维在最外层"
+        ],
+        "answer": 1,
+        "explain": "按 channel 内积时，NHWC（`[N, H, W, C]`，C 最内层）让相邻 channel 数据连续，每条 cache line 可以加载多个 channel 的值，prefetcher 也能有效工作。而 NCHW（`[N, C, H, W]`，C 不连续）在每个 pixel 位置需要跨越 H×W × element_size 的步长才能访问下一个 channel，步长可能高达几十 KB，完全超出 L1/L2 容量。"
+      },
+      {
+        "type": "input",
+        "prompt": "现代 x86（Intel/AMD）CPU 的 cache line 大小通常是多少字节？（填数字）",
+        "accept": ["64", "64B", "64 字节"],
+        "explain": "x86（Intel/AMD）的 cache line 是 64 字节。这是「空间局部性收益饱和、DDR burst 对齐、MESI 一致性粒度可接受」三者的折中点。Apple Silicon（M 系列）用 128B cache line 以换取更高流式吞吐，跨平台代码应使用较大的值。"
+      }
+    ]
+  }
+]

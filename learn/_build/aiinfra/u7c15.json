@@ -1,0 +1,134 @@
+[
+  {
+    "id": "u7c15",
+    "title": "容量与排障 SOP",
+    "subtitle": "分层排查「有 GPU 但跑不起来」，构建可解释的证据链",
+    "intro": [
+      {
+        "title": "为什么「空闲 GPU 数」不是容量承诺",
+        "body": "AI 平台最容易误导人的数字是**总空闲 GPU**。它隐藏了至少七类事实：\n\n| 被隐藏的事实 | 为什么重要 |\n|---|---|\n| GPU 型号 | H100、A100、L40S 不能随意替代 |\n| 显存和切分形状 | 80GB 整卡、40GB 卡、MIG profile 是不同资源 |\n| 拓扑 | 8 卡同节点、NVLink、RDMA、zone 会决定能否启动 |\n| 队列和配额 | 资源可能空闲，但不属于该队列或不可借用 |\n| 调度约束 | taint、affinity、PVC zone、runtime class 都可能阻塞 |\n| 冷启动 | Pod Running 不代表镜像、权重、engine 和 warmup 完成 |\n| 运行时容量 | Ready 不代表 TTFT、TPOT、KV 和 goodput 健康 |\n\nSOP 的价值不是把命令列成清单，而是固定一种**排障顺序**：先判断卡在哪一层，再收集对应证据，最后选择最小有效动作。",
+        "tip": "容量是带约束的可交付能力，不是一个总数。AI Infra 工程师的核心价值是把「Pending」这个模糊状态拆成可审计、可解释、可行动的原因。"
+      },
+      {
+        "title": "六种容量与五种「没容量」",
+        "body": "容量有六种，每种有不同的误判模式：\n\n| 容量类型 | 错误动作 |\n|---|---|\n| 账面容量（总 GPU 数）| 用总数承诺具体作业能启动 |\n| 可准入容量（队列/配额）| 被 quota 挡住时盲目加节点 |\n| 可调度容量（满足 Pod 约束）| 把所有 Pending 都归因给 GPU 不够 |\n| 可启动容量（Pod 能 Ready）| Running 就认为可服务 |\n| 可运行容量（运行时有效处理）| GPU util 高就认为健康 |\n| 可恢复容量（checkpoint 恢复）| 抢占后让用户从头重跑 |\n\n**五种「没容量」按层分类**：\n1. **队列没容量**：Workload 不被放行（配额、gang 不满足）\n2. **形状没容量**：有 GPU 但拼不出需求（SKU、MIG、拓扑不匹配）\n3. **调度没容量**：Pod Pending（scheduler 找不到满足约束的节点）\n4. **启动没容量**：Pod Running but not Ready（image/weight/engine/warmup 慢）\n5. **运行时没容量**：Ready 但 P99 差（queue、KV、batch、依赖异常）",
+        "reveal": {
+          "q": "「Pod Pending，insufficient nvidia.com/gpu」和「Workload quota blocked」的排查路径有什么本质区别？",
+          "a": "quota blocked 时 Pod 可能根本还不存在（Kueue/Volcano 把 Job suspend，不创建 Pod）。这时直接 describe pod 可能查不到原因，必须先看队列控制器的 event。insufficient GPU 是 scheduler 层的问题，Pod 已存在但找不到节点。两者处于不同的排障层次。"
+        }
+      },
+      {
+        "title": "排障八层顺序",
+        "body": "排障必须按层次，从上往下：\n\n1. **队列层**：Workload 是否被准入？查 ClusterQueue event、quota usage\n2. **配额层**：是否触达 nominal quota、borrowing limit 或 hard cap？\n3. **资源形状层**：是否存在正确 SKU、MIG profile、显存、拓扑？\n4. **调度层**：Pod 是否创建？scheduler 为什么不放置？\n5. **节点层**：节点是否扩出、Ready、GPU 暴露（device plugin 是否健康）？\n6. **启动层**：镜像、权重、engine、readiness 卡在哪一步？\n7. **运行时层**：服务 Ready 后 TTFT、TPOT、KV 是否恢复正常？\n8. **运营层**：用户解释、审计、成本和后续治理是否闭环？\n\n**反模式**：直接跑 `kubectl describe pod` 看 events，忽略队列层——quota blocked 时 Pod 可能根本不存在，describe 查不到真正原因。",
+        "steps": [
+          "先看队列控制器 event（Kueue Workload 或 Volcano PodGroup）",
+          "再看 scheduler event（Pod Pending reason）",
+          "再看 kubelet event（容器创建时发生了什么）",
+          "最后看运行时指标（TTFT、TPOT、KV）"
+        ]
+      },
+      {
+        "title": "冷启动五类与恢复路径",
+        "body": "冷启动必须分段，否则会把所有「启动慢」误归因给「扩容慢」：\n\n| 类型 | 第一证据 | 典型根因 | 处理动作 |\n|---|---|---|---|\n| Image cold start | `Pulling image` 事件时间长 | 镜像大、跨区拉取、认证慢 | 预拉、瘦身、就近 registry |\n| Weight cold start | 容器 Running 但日志显示加载权重 | 权重大、对象存储慢 | 权重缓存、热副本 |\n| Engine cold start | build engine / CUDA graph capture | runtime 编译、shape bucket 多 | 预构建 engine、固定 bucket |\n| Readiness 过早 | Ready 后首批请求 TTFT spike | probe 未覆盖 warmup | readiness 包含代表性 warmup |\n| Router 入池慢 | Ready 后无流量 | endpoint 更新或 health check 问题 | 修 router 发现和健康检查 |\n\n完整冷启动时间线（每段都要有 span）：\n`scale decision → pod created → scheduled → image pulled → container started → weights loaded → engine initialized → warmup completed → readiness true → router in pool → first successful request`",
+        "tip": "如果只有总启动时间，事故复盘只能猜。必须拆成每阶段的 span，才能定位哪一段是瓶颈。"
+      },
+      {
+        "title": "抢占恢复：四个必备契约",
+        "body": "没有恢复契约的抢占，会把平台利用率问题转化成用户信任问题。一次合格的抢占操作需要四个契约：\n\n| 契约 | 必须回答 |\n|---|---|\n| **Checkpoint 契约** | 最近 checkpoint 在哪里，多久前，是否完整可读 |\n| **Requeue 契约** | 被抢占后是否自动回队列，保留哪些参数和优先级 |\n| **Protection 契约** | 恢复后是否有保护窗口，避免刚恢复又被抢占 |\n| **Explanation 契约** | 用户能否看到被谁抢占、为什么、损失多少、预计何时恢复 |\n\n**抢占前必做检查**：\n1. 被抢占对象是否标记 preemptible\n2. checkpoint age 是否小于策略阈值\n3. 释放的资源形状是否真的满足高优先级需求\n4. 是否存在更低成本的 compact 或等待动作\n5. 抢占后是否会触发级联 Pending"
+      },
+      {
+        "title": "成本看板：区分 Busy 和 Useful",
+        "body": "成本看板最常见的错误是只展示**平均 GPU utilization**，把以下状态全部混在一起：\n\n| GPU 状态 | GPU 是否忙 | 是否有用 |\n|---|---|---|\n| 正常训练 step | 忙 | 有用 |\n| 推理按 SLO 返回 token | 忙 | 有用 |\n| 客户端取消后仍生成 | 忙 | **无用** |\n| KV preemption 重算 | 忙 | **部分无用** |\n| 被抢占后从头训练 | 忙 | **大量浪费** |\n| 热副本等待流量 | 不一定忙 | 业务上有用但成本高 |\n\n**最小看板集合**应该按以下维度分桶：\n- 库存：total / allocatable / idle by SKU、显存、MIG profile\n- 形状：可用 8 卡节点数、可用 H100 full 数、可用 MIG profile 数\n- 成本：allocated GPU-hour、idle GPU-hour、**useful token/GPU-hour**、wasted preempted GPU-hour\n\n成本治理应该优化 useful capacity，而不是简单追求 utilization 越高越好。",
+        "reveal": {
+          "q": "GPU utilization 长期 90%，但用户投诉越来越多。最可能的根因是什么？",
+          "a": "高 utilization 可能隐藏大量无效工作：客户端取消后仍在生成 token、KV preemption 导致重算、checkpoint 失败后从头训练。应该查 goodput 和 useful token/GPU-hour，区分 busy 和 truly useful，而不是只看 utilization。"
+        }
+      },
+      {
+        "title": "易错点：生产中八个常见反模式",
+        "body": "**值班工程师最容易犯的八个错误：**\n\n1. **用总空闲 GPU 做承诺** → 展示关键形状可用数（H100 full 可用数）\n2. **只给用户显示 Pending** → 展示 queue/quota/shape/scheduler 分层原因\n3. **扩容慢就加节点** → 先拆 image/weight/engine/router 时间线\n4. **抢占不检查 checkpoint** → 抢占前校验 checkpoint age\n5. **MIG profile 长期不复盘** → 定期按需求重切和分池\n6. **readiness 只看进程存活** → readiness 覆盖模型可服务状态（含 warmup）\n7. **看板只看平均利用率** → 引入 goodput、shape、队列、成本分桶\n8. **临时绕过 quota 无过期** → 审批、TTL、审计和回滚\n\n**所有 Pending 都必须有用户可读 reason**；所有抢占都必须有审计记录、恢复路径和损失估计；所有扩容事件都必须能拆出时间线。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "用户报告「集群空闲 10 张 GPU，但 8 卡训练作业一直 Pending」。排障的第一步应该是？",
+        "options": [
+          "立即加节点扩容集群",
+          "查看 kube-scheduler event，看 Pod 为什么找不到节点",
+          "先查队列控制器 event，确认 Workload 是否已被准入",
+          "查看 GPU utilization 曲线，确认是否过载"
+        ],
+        "answer": 2,
+        "explain": "排障必须从最上层开始：先确认 Workload 是否被队列准入。如果使用 Kueue/Volcano，quota blocked 时 Pod 可能根本不存在，直接看 scheduler event 或节点容量会查不到真正原因。"
+      },
+      {
+        "type": "match",
+        "prompt": "将五种「没容量」与其第一证据对应：",
+        "left": ["队列没容量", "形状没容量", "调度没容量", "启动没容量", "运行时没容量"],
+        "right": [
+          "container log 显示权重加载或 engine 初始化",
+          "scheduler event: insufficient nvidia.com/gpu 或 affinity mismatch",
+          "queue wait 高、KV 满、TTFT/TPOT 异常",
+          "ClusterQueue event 显示 quota blocked 或 gang not satisfied",
+          "ResourceFlavor 或节点空闲分布显示 SKU/拓扑不匹配"
+        ],
+        "explain": "五种没容量分别对应不同证据层：队列 → 准入 event；形状 → 资源分布；调度 → scheduler event；启动 → 容器日志；运行时 → runtime 指标。"
+      },
+      {
+        "type": "judge",
+        "prompt": "抢占前只需要确认被抢占作业标记了 preemptible: true，就可以安全执行抢占。",
+        "answer": false,
+        "explain": "标记 preemptible 只是必要条件，还需要验证：checkpoint age 是否在策略阈值内（否则作业恢复时会从头重跑浪费 GPU-hour）、释放的资源形状是否真的满足高优先级需求、是否存在更低侵入性的动作（compact 或等待），以及抢占后是否触发级联 Pending。"
+      },
+      {
+        "type": "choice",
+        "prompt": "推理服务 desired replicas 增加到 8，但 TTFT P99 仍然很差。排查时发现 ready replicas 只有 5，另外 3 个 Pod 是 Running 状态。下一步应该看什么？",
+        "options": [
+          "查看集群总空闲 GPU 数量",
+          "查看 HPA 的 scale 事件日志",
+          "查看 3 个 Running not Ready Pod 的容器日志，拆解冷启动时间线",
+          "检查 DRF 公平调度是否配置正确"
+        ],
+        "answer": 2,
+        "explain": "Running not Ready 说明容器在运行但还没通过 readiness 探针，最可能是权重加载、engine 初始化或 warmup 还未完成。应该查容器日志，拆解 weight load → engine init → warmup 各阶段耗时，找到具体瓶颈。"
+      },
+      {
+        "type": "input",
+        "prompt": "看板中用于衡量「GPU 真正用于有效工作」的指标，通常表达为每 GPU 每秒完成的有效 token 数，英文关键词是？",
+        "accept": ["useful token/GPU-hour", "goodput", "good_tokens/s", "useful_tokens"],
+        "explain": "useful token/GPU-hour 或 goodput 是区分 busy 和 truly useful 的核心指标。GPU utilization 高但 goodput 低，说明 GPU 在做超时后仍生成、KV 重算、客户端取消等无效工作。"
+      },
+      {
+        "type": "judge",
+        "prompt": "「临时提高某队列 quota 上限以解决紧急情况」是完全合理的运营动作，不需要额外记录。",
+        "answer": false,
+        "explain": "临时 quota override 必须有审批记录、过期时间（TTL）和成本归属。无 TTL 的临时绕过会导致配额失控：公平性被破坏、预算超支、其他队列资源被挤占，事后也无法解释为何某段时间某队列用了额外资源。"
+      },
+      {
+        "type": "choice",
+        "prompt": "用户投诉「GPU 利用率长期 90%，但推理服务越来越慢」。以下哪个根因最可能被平均 GPU utilization 掩盖？",
+        "options": [
+          "磁盘 I/O 成为瓶颈",
+          "客户端取消请求后推理副本仍在继续生成 token（无效工作）",
+          "推理框架版本过旧",
+          "队列系统配额设置不合理"
+        ],
+        "answer": 1,
+        "explain": "客户端取消后，如果服务端没有正确传播取消信号，推理副本会继续生成 token，GPU 一直很忙但产出都是没人消费的 token。这种无效工作会让 GPU 看起来很忙，但 goodput（有效 token）实际很低，用户体验持续恶化。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个排障动作违反了「先准入再调度」的 SOP 原则？",
+        "options": [
+          "先查 ClusterQueue event 确认 quota blocked，再决定是否调整 borrowing",
+          "先查 scheduler event 看 Pod Pending reason，但跳过检查 Workload admitted 状态",
+          "先查 Workload 状态确认 gang 条件是否满足，再看节点空闲分布",
+          "先确认 checkpoint age 再决定是否抢占某个借用任务"
+        ],
+        "answer": 1,
+        "explain": "直接看 scheduler event 而跳过队列层是典型反模式。如果 Workload 还没被 admitted（quota blocked、gang 不满足），Pod 可能根本没创建，scheduler event 里查不到真正根因。排障必须从队列层开始往下。"
+      }
+    ]
+  }
+]

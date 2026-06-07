@@ -1,0 +1,132 @@
+[
+  {
+    "id": "u1c12",
+    "title": "Page Cache、脏页回写与 Huge Pages",
+    "subtitle": "write() 返回不等于落盘，第二轮变快不等于变优秀",
+    "intro": [
+      {
+        "title": "Page Cache：空闲内存不是浪费",
+        "body": "Linux 会用空闲 DRAM 缓存文件页——`free -h` 里 `buff/cache` 不是浪费，而是可回收缓存。\n\n**关键边界**：Page Cache 缓存的是「文件内容对应的页」，不是 Python 对象、样本解码结果、token tensor 或 GPU tensor。它只能让「再读同一个文件 byte range」变快，不能替代 dataset index、tokenization cache 或业务版本控制。\n\n| 现象 | 可能原因 | 验证方式 |\n|---|---|---|\n| 第二轮 epoch 明显更快 | Page Cache 命中 | 看 major fault 和存储读带宽 |\n| 首次模型加载慢，重启进程后快 | 权重文件仍在 Page Cache | `vmtouch` / 读带宽对比 |\n| 多作业互相影响读性能 | Page Cache 被污染或回收 | `pgscan/pgsteal`、`workingset_refault_file` |\n\n**诊断命令**：\n```\nfree -h\ncat /proc/meminfo | grep -E 'Cached|Dirty|Writeback|Active.file'\nvmstat 1\n```",
+        "tip": "dataset 第二轮变快是 Page Cache 命中，不是 DataLoader、模型或 GPU 变快了。benchmark 必须分别报告 cold-cache 和 warm-cache，否则会误报性能。"
+      },
+      {
+        "title": "read 路径：cache hit、miss 与 readahead",
+        "body": "一次普通 `read(fd, buf, len)` 的路径：\n1. 内核按文件 offset 查 Page Cache\n2. **命中**：`copy_to_user()`，DRAM 速度返回\n3. **未命中**：提交 block IO，等待文件系统/NVMe 读取，填充 Page Cache，再返回给进程\n\n顺序读时，内核自动做 **readahead**——发现顺序访问时提前把后续页读入 Page Cache。DataLoader 读取 tar shard、Parquet row group、WebDataset shard 时，顺序访问能让 readahead 把存储吞吐打满；随机访问则 readahead 效果下降。\n\n应用可用 `posix_fadvise` 给内核提示：\n- `POSIX_FADV_SEQUENTIAL`：提升预读\n- `POSIX_FADV_RANDOM`：禁用错误预读\n- `POSIX_FADV_WILLNEED`：提前预热指定区域\n- `POSIX_FADV_DONTNEED`：大顺序扫描后降低 Page Cache 污染",
+        "tip": "多作业节点上，某个 job 做大顺序扫描可能把其他 job 的热文件页从 Page Cache 中挤走。对扫描性 job 在读完后加 `fadvise(DONTNEED)`，可以减少对共享 Page Cache 的污染。"
+      },
+      {
+        "title": "脏页回写：write() 快不等于落盘快",
+        "body": "`write()` 通常只把用户数据拷到 Page Cache 并标记 dirty，然后返回。后台 flusher 线程再把 dirty page 写入存储。这让写入看起来很快，但隐藏了落盘的真实代价。\n\n**关键区分**：\n- `write()` 返回 → 数据进入 Page Cache，**未必持久化**\n- `fsync()` 返回 → 文件数据和必要元数据持久化，**可以信任**\n- `rename()` 原子 → 目录项切换原子，但**不保证**新文件内容已落盘\n- 父目录 `fsync()` → 保证 rename 这个目录项更新在崩溃后可见\n\n**关键参数**：\n\n| 参数 | 含义 | 工程建议 |\n|---|---|---|\n| `vm.dirty_ratio` | 强制同步回写的内存比例 | 大内存机器上不要用比例，改用 bytes |\n| `vm.dirty_bytes` | 用字节指定强制阈值 | 控制最坏 dirty 积压 |\n| `vm.dirty_background_bytes` | 后台开始回写的字节阈值 | 与 dirty_bytes 配合设置 |\n\n**大内存机器的陷阱**：512 GiB 内存上 `dirty_ratio=20` 允许约 102 GiB 脏页。80 GiB checkpoint 写入时，前半段以 DRAM 速度写（看起来极快），当 dirty 接近阈值或 `fsync()` 到来时，进程突然被 throttle，等待真实存储吞吐——这就是「前半段很快、后半段突然卡住」的根因。",
+        "steps": [
+          "监控 `Dirty` 和 `Writeback` 的变化：`watch -n1 \"grep -E 'Dirty|Writeback' /proc/meminfo\"`",
+          "监控存储真实吞吐：`iostat -xz 1`，看 `await` 和 `util`",
+          "查看当前 dirty 参数：`sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes`",
+          "若 dirty 快速积压到阈值 → 前半段是写 Page Cache，后半段是真实落盘",
+          "用字节而非比例设置阈值：`sysctl vm.dirty_bytes=$((24*1024*1024*1024))`"
+        ]
+      },
+      {
+        "title": "Checkpoint 原子提交协议",
+        "body": "正确的 checkpoint 不只是「写完几个文件」，必须保证恢复逻辑不会读到半成品。\n\n**安全协议（每 rank）**：\n1. 写入 `rank-N.tmp`（临时文件）\n2. `fsync(rank-N.tmp)`\n3. `rename(rank-N.tmp, rank-N.bin)`\n4. coordinator 写 `manifest.tmp`（包含所有 rank shard 列表、size、checksum）\n5. `fsync(manifest.tmp)`\n6. `rename(manifest.tmp, manifest.json)`\n7. `fsync(checkpoint_directory)`\n8. 原子更新 `latest` 符号链接\n\n**manifest 必须包含**：step 号、rank 数量、每个 shard 的路径/size/checksum、模型版本。\n\n**崩溃后恢复原则**：只消费「已提交 manifest」，不从 `.tmp` 文件和目录猜测状态。`latest` 只指向已通过 manifest 校验的 step。\n\n**Checkpoint storm 缓解**：多 job 同时写会打爆文件系统。加 jitter（随机延迟启动时间）、token bucket 限速、rank 间错峰写入是最有效的缓解手段。",
+        "tip": "「checkpoint 前半段很快」是危险信号，不是好事——它说明你在以 DRAM 速度写 Page Cache，而不是以存储速度落盘。真实的 checkpoint 时间要用 fsync 完成时间计算。"
+      },
+      {
+        "title": "Huge Pages：降低地址转换压力",
+        "body": "4KB page 面对几十 GB 大数组会产生大量页表项和 TLB miss。2MB Huge Page 可以用 1/512 的 TLB 项覆盖同样内存范围。\n\n**两种实现**：\n\n| 方式 | 机制 | 优点 | 风险 |\n|---|---|---|---|\n| **THP（Transparent Huge Pages）** | 内核自动合并 4KB 页为 2MB 页 | 无需应用修改 | 合并/拆分可能产生延迟尖刺 |\n| **HugeTLB** | 管理员预留固定大页池 | 无运行时合并延迟 | 预留内存锁死，不可回收 |\n\n**THP 三种模式**：\n- `always`：激进自动合并，**不适合大内存 GPU 节点**（512GB+ 节点 THP always + compaction 会引发 100ms-1s 的 stall）\n- `madvise`：**推荐默认**，只对应用显式标记的区域使用\n- `never`：适合严格低延迟（< 1ms p99）场景\n\n**检测是否有 THP 引起的卡顿**：\n```\ngrep -E 'compact_stall|compact_fail|thp_split_page' /proc/vmstat\ncat /sys/kernel/mm/transparent_hugepage/enabled\n```\n\n如果 step 延迟 spike 与 `compact_stall` 增长强相关，立即将 THP 切换到 `madvise`。",
+        "tip": "不要因为「模型很大」就打开 Huge Pages。先用 `perf stat -e dTLB-loads,dTLB-load-misses` 确认 TLB miss 是真正瓶颈，再评估收益。若 dTLB miss 不高，Huge Pages 收益几乎为零。"
+      },
+      {
+        "title": "Page Cache 被多 job 污染：不是谁读得多谁就该赢",
+        "body": "Page Cache 是全机共享资源。两个训练 job 在同一台机器上运行时，大顺序扫描可能把另一个 job 的热 shard 或权重文件挤掉，症状是「明明数据在本地 NVMe，偶尔 batch latency 还是很高」。\n\n**诊断**：\n```\ngrep -E 'pgscan|pgsteal|workingset_refault_file|pgmajfault' /proc/vmstat\nsar -B 1\niostat -xz 1\n```\n\n- `workingset_refault_file` 增长快 → 刚回收的文件页又被访问，缓存工作集被挤压\n- `pgscan`/`pgsteal` 快速增长 → 内核正在回收页\n- 存储读带宽和 `await` 同时升高 → 回收到冷页后需要重新从 NVMe 读\n\n**治理手段**：\n- 顺序扫描 job 读完后加 `POSIX_FADV_DONTNEED` 降低污染\n- 调度层隔离热 job 和扫描 job\n- 限制同机并发 DataLoader worker 数\n\n**工程结论**：Page Cache 缺少作业级优先级和硬配额，不要把它当租户隔离机制。",
+        "reveal": {
+          "q": "一台 256 GB 内存的训练机，`vm.dirty_ratio=20`，存储稳定写吞吐 3 GB/s。写 80 GB checkpoint 时，为什么前 50 GB 很快，后 30 GB 突然卡？如何修复？",
+          "a": "dirty_ratio=20 允许约 51 GB 脏页。前 50 GB 以 DRAM 速度写入 Page Cache，当 Dirty 接近 51 GB 阈值时，内核通过 balance_dirty_pages 开始 throttle 写入进程，强制其等待 flusher 把脏页写入存储。存储吞吐 3 GB/s，剩余 30 GB 需要约 10 秒。fsync() 调用还会再等待剩余 dirty/writeback 全部落盘。修复：① 改用 `vm.dirty_bytes` 控制阈值（不超过 24 GB = 3 GB/s × 8s），让后台 flusher 持续跟进；② 每个 rank 的 shard 写入加并发限制，避免瞬时写入量超过存储处理能力；③ 监控 Dirty 曲线，使其稳定在阈值以下。"
+        }
+      },
+      {
+        "title": "THP 引入的 p99 劣化：实战案例",
+        "body": "**现象**：CPU serving 服务开启 THP `always`，平均吞吐提升 4%，但 p99 从 35ms 升到 120ms，偶尔出现 500ms 尖刺。\n\n**根因**：THP `always` + `defrag=always` 模式下，`khugepaged` 后台合并线程 + page fault 路径上的同步 compaction 会在内存碎片时触发 stall。服务请求路径触碰新分配的大内存区域时，compaction 在关键路径上等待。\n\n**诊断**：\n```\ngrep -E 'compact_stall|thp_collapse_alloc_failed|thp_split_page' /proc/vmstat\nperf stat -e dTLB-loads,dTLB-load-misses -p <pid> -- sleep 30\n```\n\n**修复步骤**：\n1. 把系统 THP 从 `always` 改为 `madvise`\n2. 服务启动阶段预分配并触碰大 arena（消除 fault-time compaction）\n3. 只对长期大数组（embedding table、索引）显式 `madvise(MADV_HUGEPAGE)`\n4. 验收：dTLB miss 不回升且 p99 低于 SLA 阈值\n\n**工程结论**：THP 是吞吐和尾延迟的权衡。训练批处理可以更激进；在线 serving 必须用 p99/p999 证明策略效果，不能只看平均吞吐。",
+        "tip": "生产 AI 平台推荐默认：`THP enabled=madvise` + `defrag=defer+madvise`。由应用对明确的大连续区域显式调用 `madvise(MADV_HUGEPAGE)`，而不是让内核自动决定所有区域。"
+      }
+    ],
+    "questions": [
+      {
+        "type": "judge",
+        "prompt": "Linux `write()` 系统调用成功返回，代表数据已经安全写入磁盘，checkpoint 可以信任。",
+        "answer": false,
+        "explain": "`write()` 成功只代表数据写入了 Page Cache（DRAM 中的文件缓存页），不代表落盘。后台 flusher 会异步把 dirty page 写入存储。只有 `fsync()` 成功返回后，文件数据和必要元数据才持久化。机器断电或内核崩溃时，未 fsync 的 dirty page 会丢失。"
+      },
+      {
+        "type": "choice",
+        "prompt": "一台 512 GB 内存的训练机，`vm.dirty_ratio=20`，写 120 GB checkpoint 时日志显示「前 80 GB 只用 5 秒，后 40 GB 卡了 60 秒」。最可能的根因是：",
+        "options": [
+          "NVMe 磁盘故障，后半段 IO 速度下降",
+          "前半段以 DRAM 速度写入 Page Cache，Dirty 接近阈值后进程被 throttle，被迫等待真实存储吞吐",
+          "checkpoint 代码中有 Python GIL 竞争导致后半段变慢",
+          "GPU 显存不足导致 checkpoint 后半段需要换出"
+        ],
+        "answer": 1,
+        "explain": "dirty_ratio=20 在 512 GB 内存机器上允许约 102 GB 脏页。前 80 GB 以接近 DRAM 写入速度进入 Page Cache（约 16 GB/s），当 Dirty 接近 100 GB 阈值时，内核的 balance_dirty_pages 机制开始 throttle 写入进程，强制其等待后台 flusher 追上。后 40 GB 以真实存储吞吐（如 3 GB/s）速度落盘，花约 13 秒。fsync() 还要等待剩余 writeback 完成。"
+      },
+      {
+        "type": "input",
+        "prompt": "用于观察内核是否正在回收文件页的 /proc/vmstat 指标叫什么？（填入能表示「刚回收的文件页又被访问」的指标名，答 refault 相关的指标名）",
+        "accept": ["workingset_refault_file", "workingset_refault", "pgmajfault"],
+        "explain": "workingset_refault_file 计数增长表示最近被回收的文件页（cold page）再次被访问，需要重新从存储读入，说明 Page Cache 工作集被挤压，有效缓存不够。这是多 job 污染 Page Cache 的关键信号，配合 pgscan/pgsteal 和存储读带宽升高一起判断。"
+      },
+      {
+        "type": "choice",
+        "prompt": "大内存训练节点（512 GB）的 dirty page 阈值控制，最推荐的做法是：",
+        "options": [
+          "保持默认的 `vm.dirty_ratio=20`，Linux 内核会自动优化",
+          "把 `vm.dirty_ratio` 调小到 5%，减少脏页积压",
+          "改用 `vm.dirty_bytes` 和 `vm.dirty_background_bytes`，以字节而非比例指定阈值",
+          "把 `vm.dirty_ratio` 调大到 50%，让更多数据先缓存在内存中"
+        ],
+        "answer": 2,
+        "explain": "dirty_ratio 是内存比例，在大内存机器上会把 dirty 积压放得极大。512 GB × 20% = 102 GB 脏页，这意味着 checkpoint 可能有 102 GB 的延迟债务在 fsync 时集中偿还，造成长达几十秒的卡顿。用 `vm.dirty_bytes` 直接以字节指定阈值（如 24 GB），与存储实际吞吐挂钩，行为更可预测。公式：dirty_bytes ≤ 存储稳态写吞吐 × 允许的额外等待秒数。"
+      },
+      {
+        "type": "judge",
+        "prompt": "在大内存 GPU 训练节点（512 GB）上，将 THP（Transparent Huge Pages）设置为 `always` 可以减少 TLB miss，同时不会引入额外的延迟问题。",
+        "answer": false,
+        "explain": "THP `always` 模式会让 khugepaged 后台线程持续尝试合并 4KB 页为 2MB 页，同时在 page fault 路径可能触发同步内存 compaction。在 512GB+ 大内存节点上，这些合并/compaction 操作可能引发 100ms 到 1s 量级的 stall，导致训练 step time 抖动和推理 p99 飙高。生产 AI 平台推荐默认 `madvise`，只对显式标记的大连续区域启用 THP。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 checkpoint 写入步骤与其作用匹配：",
+        "left": [
+          "写临时文件 rank-N.tmp 而非直接写目标文件",
+          "写完后调用 fsync(rank-N.tmp)",
+          "rename(rank-N.tmp, rank-N.bin)",
+          "coordinator 完成后 fsync(checkpoint_directory)"
+        ],
+        "right": [
+          "确保 rename 这个目录项更新在崩溃后对文件系统可见",
+          "保证写完的文件内容已经持久化到存储",
+          "保证目录项切换是原子操作，不会出现「看到一半」的文件名",
+          "保证崩溃时不影响上一个已提交的完整 checkpoint"
+        ],
+        "explain": "写 tmp 文件保护上一个完整 checkpoint；fsync 确保数据持久化；rename 是原子的目录项切换；父目录 fsync 保证 rename 操作本身在崩溃后可见（因为目录本身也有 dirty 元数据需要落盘）。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个命令最适合判断 「dataset 第二轮读取变快」是否来自 Page Cache 命中？",
+        "options": [
+          "top -p <pid>，查看 CPU 使用率是否下降",
+          "nvidia-smi，查看 GPU 利用率是否上升",
+          "iostat -xz 1，看存储读带宽是否在第二轮显著下降，配合 /proc/meminfo 看 Cached 是否升高",
+          "perf stat -e branch-misses，查看分支误预测是否减少"
+        ],
+        "answer": 2,
+        "explain": "Page Cache 命中的特征是：读带宽从存储（受 NVMe/NFS 速度限制）变为 DRAM 速度。用 iostat 看存储读带宽：若第二轮存储读带宽接近 0 而进程仍在运行，说明数据从 Page Cache 中读取。同时用 /proc/meminfo 验证 Cached 和 Active(file) 在第一轮后确实增长了。"
+      },
+      {
+        "type": "judge",
+        "prompt": "多个训练 job 在同一节点上运行时，某个 job 的大顺序 dataset 扫描可能把其他 job 的热文件页从 Page Cache 中驱逐，导致其他 job 的 batch latency 增高。",
+        "answer": true,
+        "explain": "Page Cache 是全机共享的，Linux 的 LRU 页回收算法不区分哪个 job 的页。大顺序扫描会把大量文件页读入 Page Cache，然后可能把其他 job 的热 shard 或权重文件页推入 Inactive 列表并最终回收，导致其他 job 再次访问这些数据时触发 major fault，需要重新从 NVMe 读入。监控 workingset_refault_file 的增长可以确认这种情况。"
+      }
+    ]
+  }
+]

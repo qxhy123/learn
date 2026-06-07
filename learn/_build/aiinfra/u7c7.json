@@ -1,0 +1,98 @@
+[
+  {
+    "id": "u7c7",
+    "title": "AI 工作负载对象建模",
+    "subtitle": "Job、Deployment、StatefulSet 的生命周期语义",
+    "intro": [
+      {
+        "title": "为什么「跑一个容器」不够",
+        "body": "AI 工作负载的成功条件远比「容器启动」复杂：\n\n- **训练成功** = 数据版本正确 + rank 能 rendezvous + GPU 可用 + checkpoint 可写 + 主进程按预期完成\n- **推理成功** = 模型加载完成 + warmup 完成 + 依赖可达 + Service 只把流量发给可服务副本\n- **评测成功** = 输入模型不可变 + benchmark 版本记录 + 输出幂等 + 结果写入可审计位置\n\n因此 Kubernetes 对象不是「YAML 模板」，而是**生命周期语义的声明**。选错对象，失败就变得不可解释。"
+      },
+      {
+        "title": "四类控制器的核心区别",
+        "body": "| 对象 | 核心语义 | 适合 AI 场景 | 不适合 |\n|---|---|---|---|\n| `Pod` | 最小调度单元，共享网络/卷/生命周期 | initContainer + sidecar 组合 | 生产副本管理（无重试、无滚动） |\n| `Job` | 运行到完成，有失败边界 | 训练、评测、批处理、embedding 生成 | 在线推理服务 |\n| `Deployment` | 长期服务、副本维持、滚动升级 | 无状态推理、embedding API | 需要稳定 ordinal 的 shard 推理 |\n| `StatefulSet` | 稳定 ordinal、hostname、存储绑定 | 参数服务器、固定 shard 推理、本地缓存 | 完全无状态的推理副本 |\n\n核心判断问题：**这个任务是「跑完退出」还是「持续接流量」？副本之间是否可以互换？**",
+        "tip": "用 Deployment 跑训练是危险的反模式——训练失败后 Deployment 会不断重启，完成语义缺失，checkpoint 可能被覆盖。"
+      },
+      {
+        "title": "三种 Probe 的职责分离",
+        "body": "AI 服务启动通常要加载大模型，这会让三种 probe 的区分变得格外重要：\n\n| Probe | 回答的问题 | 失败后动作 | AI 典型检查 |\n|---|---|---|---|\n| `startupProbe` | 慢启动阶段是否结束 | 超过阈值则杀容器 | 权重下载完成、CUDA context 初始化、engine build |\n| `readinessProbe` | 当前副本能否接流量 | 从 Service endpoint 移除 | 模型已加载、warmup 完成、依赖可达 |\n| `livenessProbe` | 进程是否不可恢复 | 重启容器 | 主事件循环卡死、fatal 内部状态 |\n\n**没有 `startupProbe` 时**：liveness 会在模型加载过程中误杀容器，形成 `CrashLoopBackOff`。**readiness 太宽松**：未加载模型的副本接流量，用户看到错误。**liveness 太激进**：长 prefill、checkpoint 保存时被误杀。"
+      },
+      {
+        "title": "配置分层：镜像、ConfigMap、Secret、PVC",
+        "body": "AI 平台合理的配置分层：\n\n| 层 | 内容 | 变更频率 |\n|---|---|---|\n| 镜像 | 代码、依赖、CUDA userspace、启动入口 | 低（发版时） |\n| `ConfigMap` | 超参、模型名、服务路由、feature flag | 中 |\n| `Secret` | 对象存储 token、registry 凭据、API key | 按安全策略 |\n| PVC / 对象存储 | 数据集、模型权重、checkpoint | 按任务 |\n| 环境变量 | rank、world size、endpoint、少量开关 | 平台注入 |\n\n把所有东西塞进镜像：每次配置变化都变成镜像发布，凭据泄漏在镜像层。把 `Secret` 写进 `ConfigMap`：凭据泄漏，轮换困难。",
+        "tip": "ConfigMap 内容变化不会自动重启已运行的 Pod。生产常用做法是把 ConfigMap hash 写进 Pod template annotation，触发 Deployment rollout。"
+      },
+      {
+        "title": "训练 vs 推理 vs 评测的对象选择",
+        "body": "**训练任务**：\n- 单机单/多卡 → `Job`（进程内管理多卡）\n- 多节点分布式 → `TorchJob` / `MPIJob` / `RayJob`（角色、rank、rendezvous 复杂）\n- 失败策略：区分可重试（节点故障）和不可重试（数据损坏、代码 bug）\n\n**推理服务**：\n- 无状态副本 → `Deployment + Service`（滚动升级、readiness 门禁）\n- 有状态 shard → `StatefulSet + Service`（稳定 ordinal、固定存储）\n\n**评测任务**：\n- 输出目录唯一（避免重试覆盖），结果写入可审计位置，不只在容器日志里",
+        "reveal": {
+          "q": "推理服务什么时候应该从 Deployment 改为 StatefulSet？",
+          "a": "当每个副本需要稳定 ordinal/hostname（如固定 shard 路由）、稳定本地缓存绑定，或者有序启动/关闭影响正确性时。完全可互换的无状态副本用 Deployment 更简单。"
+        }
+      },
+      {
+        "title": "易错点：容器本地存储会在 Pod 重建后消失",
+        "body": "**高频反模式汇总：**\n\n- checkpoint 写到容器本地层 → Pod 重建后丢失 → 应用 PVC 或对象存储\n- `readiness` 只检查端口 → 模型未加载也接流量 → 应检查模型加载状态和 warmup\n- `liveness` 发送真实大模型请求 → 健康检查消耗 GPU，压力下放大尾延迟 → 使用轻量内部状态\n- 所有配置用环境变量 → 大配置不可读不可审计 → 大配置用 ConfigMap 文件\n- 工作负载绑定 `cluster-admin` → 应用漏洞升级成集群级事故 → 最小权限 Role/RoleBinding\n- 不设置 `resources.requests` → 调度器无法正确放置，节点过载"
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "一个推理容器进程已启动，但模型权重还在加载，此时 `readinessProbe` 应该返回什么？",
+        "options": ["成功（200）——进程已经在运行", "失败——模型未加载完成不应接流量", "跳过——等 liveness 决定", "成功——Kubernetes 会等权重加载完"],
+        "answer": 1,
+        "explain": "readinessProbe 的语义是「当前副本能否接收真实流量」。模型未加载完成时服务无法正确响应，probe 应返回失败，让该 Pod 暂时脱离 Service endpoint，保护用户不受到错误响应。"
+      },
+      {
+        "type": "judge",
+        "prompt": "手动删除 Deployment 创建的 Pod 后，该 Pod 不会被重建。",
+        "answer": false,
+        "explain": "Deployment controller 持续 reconcile，期望状态是「有 N 个满足模板的 ready 副本」。删除一个 Pod 后，controller 会立即检测到差异并创建新 Pod 来补足副本数。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪个存储类型最适合保存分布式训练的 checkpoint？",
+        "options": ["容器本地文件系统", "emptyDir（临时卷）", "PVC 或对象存储", "宿主机 hostPath"],
+        "answer": 2,
+        "explain": "容器本地层和 emptyDir 在 Pod 删除后消失；hostPath 安全风险高且不跨节点共享。PVC（持久化卷声明）或对象存储能在 Pod 重建后保留 checkpoint，是推荐选择。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 probe 类型与其对应的失败动作配对：",
+        "left": ["startupProbe", "readinessProbe", "livenessProbe"],
+        "right": ["重启容器", "从 Service endpoint 移除", "超过阈值则杀容器"],
+        "explain": "startupProbe 保护慢启动，失败超过阈值杀容器；readinessProbe 控制流量门禁，失败时从 endpoint 移除；livenessProbe 检测不可恢复状态，失败时重启容器。"
+      },
+      {
+        "type": "judge",
+        "prompt": "ConfigMap 内容更新后，正在运行的 Pod 的环境变量会自动刷新。",
+        "answer": false,
+        "explain": "以环境变量方式注入的 ConfigMap 只在 Pod 启动时读取，Pod 运行期间不会自动刷新。如需配置生效，必须重启 Pod（例如通过 Deployment rollout）或使用文件挂载 + 应用热加载机制。"
+      },
+      {
+        "type": "input",
+        "prompt": "训练脚本访问对象存储需要 token，该 token 应放在哪种 Kubernetes 对象中？（填对象类型名）",
+        "accept": ["Secret", "secret"],
+        "explain": "Secret 专门存放敏感配置（凭据、token、私钥）。把 token 放进 ConfigMap 会导致凭据泄漏，也无法享受 etcd encryption at rest 和 RBAC 访问限制。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下哪种做法会导致「配置改了但推理服务不生效」？",
+        "options": [
+          "把配置 hash 写进 Pod template annotation，触发 rollout",
+          "使用 ConfigMap 挂载文件并支持热加载",
+          "直接更新 ConfigMap 内容，不重启 Pod",
+          "更新镜像 digest 触发滚动升级"
+        ],
+        "answer": 2,
+        "explain": "直接更新 ConfigMap 内容，已运行 Pod 不会自动感知变化（以 env 方式注入则肯定不会，以文件挂载方式可能延迟更新但进程也未必 reload）。需要通过 annotation checksum 或应用热加载机制来确保配置生效。"
+      },
+      {
+        "type": "judge",
+        "prompt": "StatefulSet 的 `worker-0` Pod 重建后，会重新绑定不同名字的 PVC。",
+        "answer": false,
+        "explain": "StatefulSet 通过稳定 ordinal 和 volumeClaimTemplates 保证每个副本绑定固定存储。`worker-0` 重建后仍然叫 `worker-0` 并绑定同一个 PVC，这是 StatefulSet 相比 Deployment 的核心语义差异。"
+      }
+    ]
+  }
+]

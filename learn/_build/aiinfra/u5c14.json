@@ -1,0 +1,117 @@
+[
+  {
+    "id": "u5c14",
+    "title": "Feature Store 体系",
+    "subtitle": "消除训练与推理之间的 silent failure：Online/Offline Parity 与 Point-in-Time Correctness",
+    "intro": [
+      {
+        "title": "动机：同名特征，不同计算，悄悄的系统性失效",
+        "body": "最经典的 silent failure：训练用 Spark 计算\"用户过去 7 天购买次数\"，推理从 Redis 读取\"同名字段\"——但两者窗口定义不同、缺失值填充不同、时区处理不同。上线后 AUC 从 0.82 跌到 0.74，团队花三周才发现是特征不一致。没有报错，只有模型悄悄变差。\n\n**Feature Store 要解决的根本问题**：让训练 pipeline 和推理 pipeline 共享同一套特征定义与计算逻辑，彻底消除 parity gap。"
+      },
+      {
+        "title": "五大核心组件与职责边界",
+        "body": "| 组件 | 核心职责 | 最常见失败模式 |\n|------|---------|---------------|\n| **Feature Registry** | 特征定义的唯一来源；存储名称/类型/聚合逻辑/owner/SLA/版本历史 | 不更新 Registry，特征定义与实现脱节 |\n| **Offline Store** | TB 级历史特征存储；支持 `point-in-time join`（Parquet/BigQuery/Iceberg） | 分区粒度设计不合理，time travel 查询极慢 |\n| **Online Store** | 亚毫秒级当前特征读取（Redis/DynamoDB/Cassandra/Aerospike） | P99 延迟不达标；批量 Get 未用 pipeline，串行查询 |\n| **Materialization** | Offline → Online 同步；批量 backfill / 增量 sync / 流式更新三种策略 | 增量 sync 非幂等，重跑产生重复或错误数据 |\n| **Serving Layer** | 训练时 point-in-time join；推理时低延迟在线读取 | 训练路径和推理路径共享同一套 SDK 接口 |"
+      },
+      {
+        "title": "Point-in-Time Correctness：防止 temporal leakage",
+        "body": "**定义**：训练时，每个样本只能看到该样本事件时间之前存在的特征版本。\n\n**典型漏洞**：训练\"用户是否会在 7 天内退货\"的模型，错误地用\"当前退货次数\"作为特征——包含了下单后才发生的退货，模型看到了未来，训练 AUC 虚高，上线后大幅下降。\n\n**防护机制：`point-in-time join`（Time Travel Join）**\n- 对每个训练样本的事件时间戳，从 Offline Store 查询\"该时间点存在的最近一次特征快照\"\n- 实现方式：带时间戳分区的 Parquet / Apache Iceberg `AS OF TIMESTAMP` / Delta Lake `VERSION AS OF`\n\n**工程代价**：对亿级样本做 point-in-time join 可能需要数小时，要合理设计 Offline Store 分区策略（按时间 + 实体），避免扫描过多分区。",
+        "tip": "如果你无法回答\"这个特征在训练时的计算逻辑\"和\"在推理时的计算逻辑\"是否相同，说明很可能已经存在 parity 问题。"
+      },
+      {
+        "title": "Online/Offline Parity：可量化的一致性契约",
+        "body": "**三个破坏层次**：\n\n| 破坏层次 | 示例 | 严重性 |\n|---------|------|-------|\n| 定义不一致 | 训练用 UTC 时区，推理用本地时区 | 最严重，全量特征偏差 |\n| 实现不一致 | 训练用 Spark sum，推理用 Redis 手写聚合有 off-by-one | 严重，部分样本偏差 |\n| 时效不一致 | 训练用 T-0 特征，推理用 T-30min 特征（Materialization 延迟） | 中等，统计可察觉 |\n\n**自动化 Parity 检测**：每次 Materialization 完成后触发检测作业——随机采样 1000 个 key，分别从 Offline/Online 读取同一时间戳特征，计算相对差异率。差异率超过阈值（如 0.1%）则告警并标记本次 Materialization 为 degraded。"
+      },
+      {
+        "title": "Materialization 三策略与幂等性",
+        "body": "| 策略 | Freshness | 适用场景 | 幂等性要求 |\n|------|----------|---------|----------|\n| **批量 Backfill** | 天级到小时级 | 初始化 Online Store；历史数据回填 | 简单（重跑即可）|\n| **增量 Sync** | 小时级到分钟级 | 绝大多数聚合特征的常规更新 | 必须 UPSERT 语义，重跑不产生重复数据 |\n| **流式更新** | 秒级到分钟级 | 实时特征（点击流、库存变化）| 需要 exactly-once 保证（Flink Checkpoint）|\n\n**实时特征工程陷阱**：Flink 计算的实时窗口聚合与 Spark Batch 的历史窗口聚合，在窗口对齐、late event 处理、Watermark 策略上存在根本差异。实时特征是最容易引入 silent failure 的特征类型，**必须专项做 parity 测试**。"
+      },
+      {
+        "title": "Online Store 选型：延迟 / 吞吐 / 成本三角",
+        "body": "| 存储 | P99 单 key 读取 | 数据量上限 | 核心优势 | 选型建议 |\n|------|----------------|----------|---------|----------|\n| Redis Cluster | <1ms | <1TB（内存受限）| 极低延迟，生态成熟 | P99 <2ms 且数据量可控首选 |\n| Aerospike | <1ms | 大规模（SSD+内存混合）| 内存效率高于 Redis | 数据量大但需低延迟 |\n| Cassandra / ScyllaDB | 1-5ms | 超大规模（PB 级）| 写入吞吐极高，线性扩展 | Materialization QPS >10 万/s |\n| DynamoDB | 1-20ms（P99）| 大规模，全托管 | AWS 生态全托管 | 无 SRE 能力，AWS 环境 |\n\n**压测要点**：Online Store 的 P99 延迟不能只在空载时测。推荐系统单次请求可能需要批量读取 50-200 个 key，批量 Get 的延迟曲线与单 key 差异极大，必须用真实业务负载压测。"
+      },
+      {
+        "title": "LLM 时代特征范式的边界",
+        "body": "LLM 系统引入了传统 Feature Store 没有考虑的新型信息：\n\n- **RAG 检索结果**：实时计算的上下文，生命周期是单次请求，**不适合 Feature Store**，也不应缓存（权限敏感）\n- **Tool 调用上下文**：动态变化，session 级别，**不适合 Feature Store**\n- **用户长期偏好摘要**：更新频率低，**可以用 Feature Store 管理**\n- **Embedding 特征**：预计算向量，可进 Feature Store，但需注意：每次 embedding 模型升级必须全量重算，且 Online Store 存储成本高（1000 万用户 × 1024 维 × 4B ≈ 40GB）\n\n关键边界：**不要强行把 LLM 的所有上下文都纳入 Feature Store**；只有可预计算、可物化、生命周期超过单次请求的信息才适合。",
+        "reveal": {
+          "q": "为什么\"特征计算逻辑写在两边\"（训练代码和推理代码各一份）必然导致 parity 问题？",
+          "a": "因为两套实现代码在细节上不可避免地会出现差异：时区处理、缺失值填充策略、窗口对齐方式、精度（float32 vs float64）、聚合函数语义等。这些差异不会触发任何显式错误，只会让模型\"悄悄\"在一个与训练时不同的特征分布上做推理——等价于用另一个特征集训练的模型上线。Feature Store 的核心价值就是强制两条路径共享同一套特征定义和 SDK，消除这类不可追溯的差异。"
+        }
+      }
+    ],
+    "questions": [
+      {
+        "type": "choice",
+        "prompt": "Point-in-Time Correctness 要解决的核心问题是什么？",
+        "options": [
+          "保证 Online Store 的读取延迟低于 1ms",
+          "防止训练样本使用了事件发生时间之后才存在的特征值",
+          "保证 Offline Store 和 Online Store 的数据格式完全一致",
+          "减少 Materialization 的计算成本"
+        ],
+        "answer": 1,
+        "explain": "Point-in-Time Correctness 是特征平台的时序契约：训练时，每个样本只能看到该样本事件时间之前存在的特征版本，防止 temporal leakage（时序泄露）。违反这个契约会让模型\"看到未来\"，训练指标虚高，上线后性能大幅下降。"
+      },
+      {
+        "type": "judge",
+        "prompt": "增量 Sync 是 Materialization 中幂等性要求最高的策略，必须使用 UPSERT 语义确保重跑不产生重复数据。",
+        "answer": true,
+        "explain": "增量 Sync 针对时间窗口内变更的特征做增量写入，如果使用 INSERT 而非 UPSERT 语义，重跑同一时间窗口会产生重复数据。幂等性是增量 Materialization 的基本要求，与批量 backfill（可以直接全量覆盖）不同。"
+      },
+      {
+        "type": "choice",
+        "prompt": "某推荐系统的 P99 延迟要求为 2ms，日均写入 QPS 约 5 万/s，数据量约 500GB。以下 Online Store 选型最合适的是？",
+        "options": [
+          "Cassandra（写入吞吐极高，线性扩展）",
+          "Redis Cluster（极低延迟，适合 500GB 以内的内存型场景）",
+          "DynamoDB（全托管，AWS 生态）",
+          "BigTable（GCP 生态，TB 级以上场景）"
+        ],
+        "answer": 1,
+        "explain": "P99 <2ms 是内存型存储的边界条件，Redis Cluster 的 P99 单 key 读取 <1ms，满足要求。500GB 数据量在 Redis Cluster 内存可承受范围内（高内存服务器集群），写入 QPS 5 万/s 也在 Redis 能力范围内。Cassandra 适合超大规模写入，DynamoDB P99 可能达 10-20ms。"
+      },
+      {
+        "type": "match",
+        "prompt": "将 Feature Store 组件与核心职责匹配：",
+        "left": ["Feature Registry", "Offline Store", "Materialization", "Online Store"],
+        "right": ["亚毫秒级在线特征读取", "特征定义的唯一来源与版本管理", "Offline 到 Online 的数据同步", "历史特征存储与 point-in-time join 支持"],
+        "explain": "Registry 是神经中枢，存储所有特征的元数据和版本历史。Offline Store 存储 TB 级历史数据，支持 time travel 查询用于训练。Materialization 负责把 Offline 数据同步到 Online Store。Online Store 提供推理时的亚毫秒级读取。"
+      },
+      {
+        "type": "choice",
+        "prompt": "以下关于 Online/Offline Parity 破坏层次的描述，哪项影响最严重？",
+        "options": [
+          "时效不一致：训练用 T-0 特征，推理用 T-30min 特征（Materialization 延迟）",
+          "实现不一致：训练用 Spark sum，推理用 Redis 手写聚合有 off-by-one",
+          "定义不一致：训练用 UTC 时区，推理用本地时区",
+          "三种破坏层次影响相同"
+        ],
+        "answer": 2,
+        "explain": "定义不一致是最严重的破坏层次，因为它导致全量特征偏差——所有使用该特征的样本都受影响，且差异系统性存在，无法通过修复少量数据解决，必须从特征定义层修正并重新训练。时效不一致通常只影响 freshness SLA，统计可察觉但通常可接受。"
+      },
+      {
+        "type": "judge",
+        "prompt": "RAG 检索到的文档片段是适合 Feature Store 管理的\"特征\"，可以预计算并物化到 Online Store 供推理使用。",
+        "answer": false,
+        "explain": "RAG 检索结果是每次请求实时计算的上下文，生命周期是单次请求，且权限敏感（不同用户看到的文档不同）。它不是\"预计算并物化的特征\"，不适合 Feature Store 的持久化语义。Feature Store 适合管理的是可预计算的用户偏好、历史行为统计等。"
+      },
+      {
+        "type": "input",
+        "prompt": "Feature Store 中防止训练时\"看到未来特征值\"的核心机制叫什么？（填英文技术术语，两个单词或短语）",
+        "accept": ["point-in-time join", "time travel join", "point-in-time correctness"],
+        "explain": "point-in-time join（也称 time travel join）是对每个训练样本的事件时间戳，从 Offline Store 查询该时间点之前最近一次存在的特征快照，防止 temporal leakage。"
+      },
+      {
+        "type": "choice",
+        "prompt": "关于实时特征工程（Flink 流式聚合），以下哪项描述了其最大的工程风险？",
+        "options": [
+          "实时特征的 P99 延迟通常超过 1 秒，不满足推荐系统需求",
+          "Flink 的运维复杂度比 Spark Batch 低，容易低估运维成本",
+          "Flink 实时窗口聚合与 Spark Batch 历史窗口聚合在窗口对齐、late event 处理上存在差异，容易引入 parity 问题",
+          "Flink 不支持 Redis 作为 Online Store 的写入目标"
+        ],
+        "answer": 2,
+        "explain": "实时特征的最大风险是：Flink 和 Spark Batch 在窗口语义（事件时间 vs 处理时间）、Watermark 策略、late event 处理上有根本差异，导致实时 Online Store 和 Offline 训练数据的聚合结果不一致。如果没有专项 parity 测试，实时特征是最容易引入 silent failure 的类型。"
+      }
+    ]
+  }
+]
